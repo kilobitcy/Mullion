@@ -1,0 +1,8 @@
+[package]
+name = "mullion-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 架构不变量:core 零依赖(零 UI/IO/async)。不得引 term/ssh/app,也不得引外部 UI 库。
+[dependencies]

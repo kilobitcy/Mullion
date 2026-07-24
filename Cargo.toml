@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mullion-core",
+    "crates/mullion-term",
+    "crates/mullion-ssh",
+    "crates/mullion-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# 版本锁定见 README「版本核对」/ ADR-001。升级单独开 PR(R1),不混功能。
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+vte = "0.15"
+# 加密后端用 ring(非默认 aws-lc-rs):避免 aws-lc-sys 的 C/汇编构建,
+# Linux→Windows 交叉编译干净、原生 Windows 编译也免装 NASM。RSA 密钥仍走独立的 rsa crate。
+russh = { version = "0.54", default-features = false, features = ["ring", "flate2", "rsa"] }
+winit = "0.30"
+wgpu = "23"
+glyphon = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }

@@ -1,0 +1,6 @@
+# Linux→Windows 交叉编译:windows-gnu 目标用 mingw-w64 链接器。
+# 仅在 `--target x86_64-pc-windows-gnu` 时生效,对本机(Linux)构建无影响。
+# 配合 workspace 里 russh 的 ring 后端(去 aws-lc-sys 的 C 构建),整棵树对交叉编译友好。
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"

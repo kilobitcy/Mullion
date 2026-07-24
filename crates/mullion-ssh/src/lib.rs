@@ -1,0 +1,8 @@
+//! mullion-ssh —— russh PTY channel。不认识「pane」「窗口」,只认字节流。
+//!
+//! 架构不变量:本 crate 不依赖 core/term/app。
+
+pub mod config;
+pub mod error;
+pub mod known_hosts;
+pub mod session;

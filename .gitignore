@@ -1,0 +1,6 @@
+# Rust
+/target
+
+# 编辑器 / OS
+*.swp
+.DS_Store

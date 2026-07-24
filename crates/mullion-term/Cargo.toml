@@ -1,0 +1,10 @@
+[package]
+name = "mullion-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 架构不变量:term 只依赖 alacritty_terminal / vte。不得引 core/ssh/app。
+[dependencies]
+alacritty_terminal.workspace = true
+vte.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "mullion-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mullion"
+path = "src/main.rs"
+
+# 架构不变量:app 是唯一允许知道 core/term/ssh 的地方。依赖方向 app → {core, term, ssh}。
+[dependencies]
+mullion-core = { path = "../mullion-core" }
+mullion-term = { path = "../mullion-term" }
+mullion-ssh = { path = "../mullion-ssh" }
+winit.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+tokio.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
