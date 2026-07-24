@@ -76,8 +76,9 @@ cargo run -p mullion-app -- user@host -p 22 -i /path/key   # 跑真实连接（G
 
 # Linux→Windows 交叉编译出可实测的 exe（详见 docs/cross-compile-windows.md）：
 cargo build --release --target x86_64-pc-windows-gnu -p mullion-app
-# 真机 SSH 验证（内网直连 192.0.2.10，验加密后端/协商，本机就能跑）：
-MULLION_LIVE=1 cargo test -p mullion-ssh --test live -- --ignored
+# 真机 SSH 验证（验加密后端/协商，本机就能跑；真机信息用 env 传，不写死在库）：
+MULLION_LIVE=1 MULLION_LIVE_HOST=<真机> MULLION_LIVE_USER=<用户> MULLION_LIVE_KEY=<私钥> \
+  cargo test -p mullion-ssh --test live -- --ignored
 ```
 
 **「绿」的定义**：`cargo test --workspace` 全过 **且** `clippy -D warnings` 无输出。
@@ -174,7 +175,7 @@ spec.md          需求，唯一真源
 ```
 
 `docs/` 关键非 ADR 文件：
-- `cross-compile-windows.md` —— Linux 交叉编译 Windows exe 的运行手册（代理/mingw/objdump/live 验证）
+- `cross-compile-windows.md` —— Linux 交叉编译 Windows exe 的运行手册（代理/mingw/objdump/live 验证/发布 Release）
 - `gui-render-gotchas.md` —— GUI/渲染/输入层「编译过跑起来才崩」的坑（动那几个文件前必读）
 - 最新 ADR：`adr-005`（SSH 加密后端切 ring）
 

@@ -54,14 +54,37 @@ Get-FileHash .\mullion.exe -Algorithm SHA256   # 与上面 sha256 一致
 - 私钥要在 Windows 本地，`-i` 传 Windows 路径。
 - 字体 `Google Sans Code` 需在 Windows 已安装，否则回退默认字体（不崩，但对齐可能差）。
 
-## 真机 SSH 验证（在本机就能做，验加密后端/协商）
+## 发布 Release（正式分发，推荐 CI）
+
+`.github/workflows/release.yml`：push `v*` tag 时，CI 在 ubuntu runner 上按同一条
+mingw + ring 路线交叉编译、objdump 验收，再用内置 `GITHUB_TOKEN` 发布 Release，
+附 `mullion.exe` + `mullion.exe.sha256`。**发版只需**：
 
 ```bash
-MULLION_LIVE=1 cargo test -p mullion-ssh --test live -- --ignored --nocapture
+git tag v0.1.1 && git push origin v0.1.1
 ```
-- 连 `user@192.0.2.10:22`（内网直连，不走代理），`/path/to/key.pem`。
+
+产物由 CI 从源码构建、可复现，不依赖某台开发机；零外部凭证（用 `GITHUB_TOKEN`）。
+
+手动兜底（CI 不可用时，如 GitHub Actions 额度/账单问题）——本机交叉编译后用 gh 发布：
+
+```bash
+sha256sum <exe> > mullion.exe.sha256
+gh release create v0.1.1 <exe> mullion.exe.sha256 -t v0.1.1 -F notes.md
+```
+
+## 真机 SSH 验证（在本机就能做，验加密后端/协商）
+
+真机信息经环境变量传入（脱敏后不写死在库里）：
+
+```bash
+MULLION_LIVE=1 \
+  MULLION_LIVE_HOST=<真机 IP/域名> MULLION_LIVE_USER=<用户> MULLION_LIVE_KEY=<本地私钥> \
+  cargo test -p mullion-ssh --test live -- --ignored --nocapture
+```
+- 未设这些 env 时用占位（`example.com`）连不通，属预期。
 - `pubkey_live` 应过（证明与真实 OpenSSH 的 KEX/cipher/hostkey 协商 OK）。
-- `agent_live` 在本容器**会失败**——没起 ssh-agent（`SSH_AUTH_SOCK` 未设），非 bug。
+- `agent_live` 在无 ssh-agent 环境**会失败**（`SSH_AUTH_SOCK` 未设），非 bug。
 
 ## 边界
 
