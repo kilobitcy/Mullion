@@ -1,0 +1,15 @@
+[package]
+name = "mullion-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 架构不变量:store 只做持久化,不认识 core/term/ssh/app。
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+chacha20poly1305.workspace = true
+keyring.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

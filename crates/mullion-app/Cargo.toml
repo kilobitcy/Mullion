@@ -8,13 +8,35 @@ license.workspace = true
 name = "mullion"
 path = "src/main.rs"
 
-# 架构不变量:app 是唯一允许知道 core/term/ssh 的地方。依赖方向 app → {core, term, ssh}。
+# 架构不变量:app 是唯一允许知道 core/term/ssh/store 的地方。依赖方向 app → {core, term, ssh, store}。
 [dependencies]
 mullion-core = { path = "../mullion-core" }
 mullion-term = { path = "../mullion-term" }
 mullion-ssh = { path = "../mullion-ssh" }
+mullion-store = { path = "../mullion-store" }
 winit.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
 tokio.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
+directories = "5"
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+rfd.workspace = true
+time.workspace = true
+log.workspace = true
+
+# AttachConsole:GUI 子系统下从终端启动仍能看 CLI 诊断。
+# ProcessStatus/SystemInformation/Threading:diag 的内存采样(卡死时判断是否内存
+# 压力)。windows-sys 已在依赖树里(winit/wgpu 带的),这里只多开几个 feature。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Console",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"

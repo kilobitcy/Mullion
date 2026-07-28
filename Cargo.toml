@@ -5,10 +5,11 @@ members = [
     "crates/mullion-term",
     "crates/mullion-ssh",
     "crates/mullion-app",
+    "crates/mullion-store",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.6"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -23,3 +24,18 @@ winit = "0.30"
 wgpu = "23"
 glyphon = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+# 切片 A:会话/凭据持久化(见 spec §3)
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+chacha20poly1305 = "0.10"                        # XChaCha20-Poly1305;稳定版 API(非 context7 的 bleeding-edge)
+keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust", "windows-native", "apple-native"] }
+# 切片 A2b:GUI 外壳。egui 0.30 已验证与 wgpu 23.0.1 / winit 0.30.13 统一(无重复版本)。
+egui = "0.30"
+egui-wgpu = "0.30"
+egui-winit = "0.30"
+rfd = "0.15"
+time = { version = "0.3", features = ["formatting"] }
+# 日志 facade(0 依赖)。接了它,wgpu/wgpu-hal/naga/winit/glyphon/russh 的内部诊断
+# 才会落进我们自己的 mullion.log —— GUI 子系统没控制台、Windows 事件日志又不记录
+# 进程挂起,这是唯一能拿到的现场。见 ADR-008。
+log = "0.4"

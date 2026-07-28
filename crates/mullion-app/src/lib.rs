@@ -6,12 +6,16 @@
 
 pub mod app;
 pub mod cli;
+pub mod diag;
 pub mod frame;
 pub mod gpu;
 pub mod grid;
 pub mod input;
+pub mod logx;
 pub mod pane;
 pub mod reflow;
 pub mod render;
 pub mod session_pump;
+pub mod shell;
 pub mod text;
+pub mod ui;

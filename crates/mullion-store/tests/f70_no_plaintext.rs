@@ -1,0 +1,53 @@
+//! F70 守护:写一条带密码/私钥口令的会话并落盘后,sessions.toml 与 secrets.enc 的
+//! 原始字节里都搜不到明文口令。用 InMemoryKey 保证确定性。
+
+use mullion_store::{AuthKind, InMemoryKey, Protocol, SecretEntry, SessionDraft, Vault};
+
+const PW: &str = "hunter2-VERY-secret-passphrase-xyz";
+
+#[test]
+fn plaintext_secret_never_hits_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut vault = Vault::open(dir.path().to_path_buf(), &InMemoryKey([42u8; 32])).unwrap();
+    vault.add(
+        SessionDraft {
+            name: "s".into(),
+            host: "h".into(),
+            port: 22,
+            protocol: Protocol::Ssh,
+            user: "u".into(),
+            note: String::new(),
+            auth: AuthKind::PublicKey {
+                path: "/k.pem".into(),
+                has_passphrase: true,
+            },
+            secret: Some(SecretEntry {
+                password: None,
+                passphrase: Some(PW.into()),
+            }),
+        },
+        "2026-07-25T00:00:00Z",
+    );
+    vault.save().unwrap();
+
+    let toml_bytes = std::fs::read(dir.path().join("sessions.toml")).unwrap();
+    let enc_bytes = std::fs::read(dir.path().join("secrets.enc")).unwrap();
+    let needle = PW.as_bytes();
+    assert!(
+        !contains(&toml_bytes, needle),
+        "sessions.toml 里出现了明文口令"
+    );
+    assert!(
+        !contains(&enc_bytes, needle),
+        "secrets.enc 里出现了明文口令"
+    );
+
+    // 反证:同一密钥能解回明文,确保不是「加密了但丢了数据」。
+    let reopened = Vault::open(dir.path().to_path_buf(), &InMemoryKey([42u8; 32])).unwrap();
+    let id = reopened.list()[0].id;
+    assert_eq!(reopened.secret(id).unwrap().passphrase.as_deref(), Some(PW));
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}

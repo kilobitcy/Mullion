@@ -56,6 +56,16 @@ impl FrameLimiter {
     }
 }
 
+/// 本帧有没有内容要画,即交给 [`FrameLimiter::plan`] 的 `dirty`。
+///
+/// **两个脏源必须都算上**。`terminal_dirty` 只反映「远端来了新字节」;egui 自己也会
+/// 要重绘(菜单展开、hover 高亮、弹窗动画、错误提示)。只看前者的话,终端态下远端
+/// 一安静,egui 的交互就全被 [`RedrawAction::Idle`] 吞掉——菜单点不开、弹窗不出现,
+/// 而 launcher 态(没有终端字节源)反倒正常,这个不一致极易被误判成 egui 的问题。
+pub fn frame_is_dirty(terminal_dirty: bool, ui_dirty: bool) -> bool {
+    terminal_dirty || ui_dirty
+}
+
 /// [`FrameLimiter::plan`] 的决策结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedrawAction {
@@ -70,6 +80,14 @@ pub enum RedrawAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egui_repaint_alone_is_dirty_enough() {
+        // 终端态远端安静时,egui 的重绘请求必须能自己撑起一帧,否则菜单/弹窗点不开。
+        assert!(frame_is_dirty(false, true), "egui 要重绘就得画");
+        assert!(frame_is_dirty(true, false), "终端来了字节就得画");
+        assert!(!frame_is_dirty(false, false), "两边都不脏才算空闲");
+    }
 
     #[test]
     fn not_dirty_is_idle() {

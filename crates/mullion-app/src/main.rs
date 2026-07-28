@@ -1,23 +1,44 @@
-//! mullion 入口:解析 CLI → 先建 EventLoop 拿 proxy → block_on 连接 → run_app。
-//! 顺序关键:connect 需要 wake=proxy.send_event,proxy 来自 EventLoop,故必须先建循环。
+//! mullion 入口:解析 CLI → 建 EventLoop 拿 proxy → 交给 App 统一异步 connect → run_app。
+//! CLI 直连(路径①,`mullion user@host`)与无参启动 launcher(路径②)共用同一条
+//! `session::connect` 通道,结果经 `UserEvent` 回送(App::spawn_connect,§5)。
+//!
+//! Windows 用 GUI 子系统,双击/启动时不附带黑控制台窗口;从终端启动时再附着父
+//! 控制台,让 CLI 直连的诊断(eprintln)与退出码仍可见。
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::sync::{Arc, Mutex};
 
 use mullion_app::app::{App, UserEvent};
 use mullion_app::cli;
 use mullion_ssh::known_hosts::{KnownHosts, TofuAccept};
-use mullion_ssh::session::connect;
 use winit::event_loop::EventLoop;
 
 fn main() {
+    // GUI 子系统下从终端启动时,附着父进程控制台;双击(无父控制台)则静默失败,
+    // 不弹黑框。须在任何 stdout/stderr 写入前调用。
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
+    // 文件日志 + panic 钩子:GUI 子系统下崩溃/卡死无声消失,靠这个取证。
+    // init 同时接管 `log` facade,wgpu/winit/russh 的内部诊断一并落进同一个文件。
+    mullion_app::logx::init(env!("CARGO_PKG_VERSION"));
+    // 环境快照 + 看门狗:卡死时靠它说出「卡在哪个阶段、卡了多久、内存多少」,
+    // 不必去翻 Windows 事件日志(它根本不记录 GUI 进程挂起)。
+    mullion_app::diag::log_startup_env(env!("CARGO_PKG_VERSION"));
+    mullion_app::diag::start_watchdog(mullion_app::diag::DEFAULT_STALL_MS);
+
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cfg = match cli::parse_args(&args) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("参数错误: {e}\n用法: mullion user@host [-p PORT] [-i KEYPATH]");
-            std::process::exit(2);
+    mullion_app::logx::line(&format!(
+        "启动模式: {}",
+        if args.is_empty() {
+            "无参 launcher"
+        } else {
+            "CLI 直连"
         }
-    };
+    ));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -28,19 +49,22 @@ fn main() {
         .build()
         .expect("建事件循环");
     let proxy = event_loop.create_proxy();
-    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        let _ = proxy.send_event(UserEvent::Wake);
-    });
+    let tofu = Arc::new(TofuAccept::new(Arc::new(Mutex::new(KnownHosts::new()))));
 
-    let policy = Arc::new(TofuAccept::new(Arc::new(Mutex::new(KnownHosts::new()))));
-    let (ssh, rx) = match runtime.block_on(connect(&cfg, policy, wake)) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("连接失败: {e}");
-            std::process::exit(1);
+    // 待定 F:CLI 直连(路径①)解析成功即视为「直连」,连接失败时 App 保留
+    // stderr + exit(1)(可脚本化);无参(路径②)进 launcher,失败走窗口内提示。
+    let (initial, cli_direct) = if args.is_empty() {
+        (None, false)
+    } else {
+        match cli::parse_args(&args) {
+            Ok(cfg) => (Some(cfg), true),
+            Err(e) => {
+                eprintln!("参数错误: {e}\n用法: mullion user@host [-p PORT] [-i KEYPATH]");
+                std::process::exit(2);
+            }
         }
     };
 
-    let mut app = App::new(runtime, ssh, rx);
+    let mut app = App::new(runtime, proxy, tofu, initial, cli_direct);
     event_loop.run_app(&mut app).expect("run_app");
 }

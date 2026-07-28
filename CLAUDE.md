@@ -27,10 +27,11 @@
 mullion-core     布局树。零 UI、零 IO、零 async。可纯单测。
 mullion-term     VT 仿真封装 + 输入编码。只依赖 alacritty_terminal / vte。
 mullion-ssh      russh。不认识「pane」「窗口」这些概念，只认字节流。
-mullion-app      winit + wgpu + glyphon。唯一允许知道其余三者的地方。
+mullion-store    会话/凭据持久化。TOML + keyring 加密。零 UI、零 async、仅同步 IO。可纯单测。
+mullion-app      winit + wgpu + glyphon(终端自绘)+ egui(外壳:菜单/状态栏/会话弹窗)。唯一允许知道其余四者的地方。
 ```
 
-**依赖方向严格单向**：`app → {core, term, ssh}`，其余互不依赖。
+**依赖方向严格单向**：`app → {core, term, ssh, store}`，其余互不依赖。
 
 这条约束的全部价值在于：**布局 bug 和键码 bug 能在没有窗口的情况下写测试复现**。
 这两类是本项目最费时间的 bug。任何「为了方便」把 UI 类型漏进 core/term 的改动，
@@ -53,6 +54,7 @@ mullion-app      winit + wgpu + glyphon。唯一允许知道其余三者的地�
 | T5 | 鼠标上报没有 Shift 逃生门 | `/tui fullscreen` 下用户永远无法划选复制 | `keymap::tests::shift_blocks_mouse_report_so_user_can_copy` |
 | T6 | Shift+Enter 编码错 | Claude Code 里无法插入换行，一按就提交 | `keymap::tests::shift_enter_without_kitty_is_esc_cr` |
 | T7 | 帧率节流后 `ControlFlow::WaitUntil` 不复位 | 首次节流后永久 100% CPU 忙转（T3/N3 红线） | `frame::tests`（`plan` 决策 4 条）；事件循环三分支须显式复位 control_flow |
+| T8 | 判给终端的键盘事件仍先喂 `egui_state.on_window_event` | egui 焦点系统吞掉 Tab → 焦点跳到菜单栏 → `wants_keyboard_input()` 恒 true → 终端**永久**收不到任何键（Tab 补全后回车/退格全废，鼠标仍灵） | `input_route::tests::terminal_keyboard_is_never_fed_to_egui_so_tab_cannot_steal_focus`；键盘先判后喂，指针先喂后判 |
 
 **T1 和 T3/T7 是最容易在重构中被悄悄破坏的。** 事件循环在 `app.rs`（`main.rs` 只做接线），
 动 `emulator.rs` 或 `app.rs` 事件循环时，先跑这几个测试，改完再跑一遍。
@@ -157,6 +159,33 @@ cargo doc -p russh --open   # 或直接读 ~/.cargo/registry/src/**/russh-*/src/
 
 ---
 
+## 交付约定（**不用每次再问我，默认执行**）
+
+只要本轮改动落到了 `mullion-app`（或任何影响 Windows 端行为的地方）并且我要拿去实机验，
+**一条龙做完，别停下来问「要不要 bump / 要不要发版」**：
+
+1. **升 patch 版本号** —— `Cargo.toml` 的 `workspace.package.version`，第三位 +1。单独一个
+   `chore: 版本 0.1.N(一句话说清这版修了什么)` 提交。
+2. **跑绿** —— `cargo test --workspace` + `clippy -D warnings` + `fmt --check`。不绿不发。
+3. **交叉编译** —— `cargo build --release --target x86_64-pc-windows-gnu -p mullion-app`，
+   并按 `docs/cross-compile-windows.md` 做 objdump 依赖验收（出现 `libgcc_s_seh-1.dll` /
+   `libwinpthread-1.dll` 即为不合格，必须修）。
+4. **发 GitHub Release** —— 我从 GitHub 下，不要只在本地留 exe、也不要让我手动 scp：
+   ```bash
+   sha256sum mullion.exe > mullion.exe.sha256
+   HTTPS_PROXY=http://127.0.0.1:7890 gh release create v0.1.N \
+     mullion.exe mullion.exe.sha256 -t "v0.1.N" -F notes.md --repo kilobitcy/Mullion
+   ```
+   **Release 标题只能是纯版本号 `v0.1.N`**，不带破折号、不带一句话摘要、不带 emoji ——
+   列表里要一眼扫清版本序列。想说的话全部写进 notes 正文。
+   notes 里写：修了什么 + **人工验收清单**（无头验不了的那些，见「你无法验证的东西」）+ sha256。
+5. **报给我** —— Release 链接 + sha256 + 验收清单。
+
+约束：**本机 DNS 解析不了 github**，`gh`/curl 必须带 `HTTPS_PROXY=http://127.0.0.1:7890`，
+SSH push 走 `socks5 127.0.0.1:7891` 的 ProxyCommand；GitHub Actions 因账单锁不可用，
+`release.yml` 虽然正确但发不出去，一律走上面的手动路线。私密信息（真机 IP / 用户名 /
+私钥路径 / 凭据）**永不进被跟踪文件、永不推送**，库里只留占位。
+
 ## 提交约定
 
 - 中文，一行摘要 + 必要时正文
@@ -167,7 +196,7 @@ cargo doc -p russh --open   # 或直接读 ~/.cargo/registry/src/**/russh-*/src/
 ## 目录约定
 
 ```
-crates/          四个 crate，见上
+crates/          五个 crate，见上
 scripts/         录制 fixture、打包等一次性脚本
 docs/            ADR（adr-NNN-*，一个决策一个文件）+ 运行手册/踩坑汇总
 docs/superpowers/ 各切片的设计 spec 与实现 plan（brainstorm/writing-plans 产物）
@@ -177,7 +206,9 @@ spec.md          需求，唯一真源
 `docs/` 关键非 ADR 文件：
 - `cross-compile-windows.md` —— Linux 交叉编译 Windows exe 的运行手册（代理/mingw/objdump/live 验证/发布 Release）
 - `gui-render-gotchas.md` —— GUI/渲染/输入层「编译过跑起来才崩」的坑（动那几个文件前必读）
-- 最新 ADR：`adr-005`（SSH 加密后端切 ring）
+- 最新 ADR：`adr-008`（自诊断日志：接 `log` facade 白拿 wgpu/winit/russh 内部诊断 + 阶段打点 +
+  看门狗；级别用 `MULLION_LOG` / `MULLION_LOG_DEPS`，默认 info/warn）；
+  `adr-007`（用 egui 做外壳：菜单/状态栏/会话弹窗；含与 wgpu23/winit0.30 同帧集成的坑）
 
 架构级决策（换 GUI 框架、换 SSH 库、改依赖方向）写进 `docs/adr-NNN-*.md`，
 写清「当时的备选是什么、为什么否掉」。半年后回头看，理由比结论值钱。

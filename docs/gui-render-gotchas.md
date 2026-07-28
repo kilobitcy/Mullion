@@ -14,6 +14,21 @@
   （present/idle→`Wait`；节流→`WaitUntil` 且记 `next_frame_at`）；被节流的帧靠
   `about_to_wait` 在 deadline 到点补**一次** `request_redraw`，**不要**在原地 `request_redraw`。
   决策抽成纯函数 `FrameLimiter::plan`（守护：`frame::tests` 的 4 条 plan 测试）。
+- **`dirty` 有两个独立脏源,漏一个就丢交互。** 终端态若只拿 `pacer.should_present()`
+  (=远端来了新字节)当 dirty,远端一安静,egui 自己的重绘需求(菜单展开、hover、弹窗、
+  错误提示)就全被 `RedrawAction::Idle` 吞掉——点菜单没反应;而 launcher 态因为硬编码
+  `dirty = true` 反倒正常,这个不一致极易被误判成 egui 的问题。**规则**:`frame_is_dirty`
+  取「终端字节」与「UI 待画」的并集;标脏与 `request_redraw` 必须成对(只请求不标脏那帧
+  照样被判 Idle,故统一走 `App::request_ui_redraw`);present 后清脏,`repaint_delay < MAX`
+  时重新标脏。**守护**:`frame::tests::egui_repaint_alone_is_dirty_enough`。
+- **攒帧(DEC 2026)必须跨 feed 边界匹配,还得有超时(T2)。** 一次 feed = 一个 SSH
+  `ChannelMsg::Data`,TCP 可以把 `\x1b[?2026l` 切成 `\x1b[?2026` + `l`。只在单段内
+  `starts_with` 的话这个 ESU 就检测不到,`in_sync` 永远为真,`should_present()` 恒 false,
+  **画面永久冻结**——字节其实一直在正常收发,用户看到的却是「键盘没有任何反应」。
+  **规则**:段尾若是 BSU/ESU 的真前缀就留到下段拼接后再扫;再加一道 ~150ms 超时,对端
+  发了 BSU 却再不发 ESU(TUI 被 kill / 链路截断)时强行出帧,宁可闪一下也不停在死画面。
+  **守护**:`render::tests::esu_split_across_feeds_is_still_detected`
+  / `unterminated_sync_block_times_out`。
 
 ## glyphon / 文字
 
@@ -36,6 +51,30 @@
   出 NaN,该帧几何全坏。`new()` 和 `resize()` **两处**都要用钳制后的值。
 - **`get_current_texture()` 分 `SurfaceError` 四变体处理**:`Timeout` 跳过本帧(别 reconfigure)、
   `Lost`/`Outdated` reconfigure、`OutOfMemory` 记录。别 `Err(_)` 一把吞(黑屏无日志难查)。
+- **最小化必须整帧跳过,不只是把尺寸 `max(1)`。** 上一条只挡住了 NaN,挡不住真正的伤害:
+  `Resized(0,0)` 若继续往下传,`grid_size_for(0,0)` 钳成 1×1 → ① `emulator.resize(1,1)` 让
+  alacritty 按 1 列 reflow 带 10000 行 scrollback 的 primary grid(tmux 在 alt screen 时
+  `Term::resize` 仍对 primary 传 `reflow=true`),末尾 `truncate(max_scroll_limit + lines)`
+  把历史**永久碾平,还原也回不来**;② `ssh.resize(1,1)` 把 `window_change 1×1` 发给远端,
+  tmux / Claude Code TUI 按 1 列重排版;③ 还在对 0 面积表面 configure/acquire/present。
+  **规则**:任一维为 0 → 不 configure、不重排网格、不发 `window_change`、不渲染;
+  **但 IO 泵必须照跑**(排空 rx → feed emulator → 回写 `PtyWrite`,T1),否则有界 rx(256)
+  灌满堵住 io_task、远端同步输出探测/光标查询永久无应答。最小化期间还未必收得到
+  `RedrawRequested`,所以泵要挂在 `UserEvent::Wake` 上,不能只挂重绘。
+  **守护**:`shell::window_state::tests`(`minimized_resize_touches_neither_gpu_nor_remote`
+  / `minimized_still_pumps_io`)。
+- **但 Minimized 不能是单向门。** 进去只需一次 `Resized(0,0)`,出来却完全指望对方补发
+  非零 `Resized`。0×0 不总是「用户最小化了」——驱动/合成器抖动、显卡崩溃重启外壳
+  (v0.1.4 真机日志最后一行正是 `Resized(0x0)`)也会送这一条,那些情况下**不会**有还原
+  事件,窗口就永久停在只泵 IO 不绘制:字节照收照发,屏幕再不更新,用户看到的是
+  「键盘没有任何反应」。**规则**:凡是「窗口本该看得见」的信号(`Focused(true)` /
+  `Occluded(false)` / `RedrawRequested`)都拿 `window.inner_size()` 复查一次,非零就自愈,
+  且要走与还原同一条路径(补 surface configure + grid 传播),不能只翻状态位。
+  **守护**:`window_state::tests::minimized_recovers_when_real_size_is_nonzero`。
+- **拿到 adapter 就记 `get_info()`,建完 device 就挂 `on_uncaptured_error` /
+  `set_device_lost_callback`。** GPU 子系统出事(TDR、驱动重置)时,Windows 事件日志只会
+  记下 Explorer/DWM 崩在 `amdxx64.dll` 之类,**不记录我们自己**;不自报就只能靠猜。见
+  [adr-008](adr-008-diagnostics.md)。
 
 ## 输入 / 键盘
 
@@ -65,6 +104,55 @@
 - **`AgentClient::connect_env()` 仅 Unix。** Windows 的 ssh-agent 走命名管道,无此函数,
   原样写会让 Windows 目标**编不过**。已按 `#[cfg(unix)]` 门控,Windows 上 agent 路径返回可操作
   F6 错误(用 `-i`)。改 agent 路径时注意别破坏这个门。
+
+## egui 外壳(切片 A2b,详见 [adr-007](adr-007-egui-chrome.md))
+
+- **egui `Renderer::render` 要 `RenderPass<'static>`(wgpu 23)。** 用 `pass.forget_lifetime()`
+  转 'static;它**消费** pass 自身,所以终端两趟(背景 quads / glyphon 文字)必须录在
+  `forget_lifetime()` **之前**,三者画进**同一个** render pass(不是两个 pass)。顺序错 →
+  借用检查器过不了或终端被 egui 覆盖。
+- **egui 默认字体不含 CJK → 中文全是 tofu 方框(编译过、跑起来才见)。** egui 只内嵌拉丁
+  字体(Ubuntu/Hack),菜单「对话/分屏…」、状态栏中文会渲染成缺字方框。**规则**:启动时
+  `ctx.set_fonts` 挂系统 CJK 字体作末位回退(`ui::install_cjk_font`:按序试
+  `msyh.ttc`/`simhei.ttf`/…,`FontData::from_owned` 用 face index 0)。找不到就静默用默认
+  (不崩)。终端层不受影响——glyphon/cosmic-text 会自动回退系统字体。
+- **GUI 程序默认 console 子系统 → 双击/启动附带黑控制台窗口。** Rust 默认 console 子系统,
+  一个 GUI app 会多弹一个黑框。**规则**:`main.rs` 顶 `#![cfg_attr(windows, windows_subsystem
+  = "windows")]`;但为保住 CLI 直连诊断,`main()` 开头 `AttachConsole(ATTACH_PARENT_PROCESS)`
+  (windows-sys,cfg(windows)),从终端启动时附着父控制台、双击时静默失败不弹框。
+  `objdump -p` 应显示 `Subsystem = Windows GUI`。
+- **输入分流别把整段 KeyboardInput 无条件喂 egui(T5/T6 红线)。** egui 只在
+  `wants_keyboard_input`/`wants_pointer_input` 或有模态弹窗时截获,否则落既有终端 keymap。
+  `modal` 判定要含**所有**开着的弹窗(session_manager / about / **editor**)——漏一个,
+  那个弹窗开着时点击会漏到终端。
+- **键盘要「先判后喂」,指针才是「先喂后判」——顺序反了 Tab 会废掉整个键盘(T8)。**
+  egui 的焦点系统在 `Memory::begin_pass` 里扫**原始事件**,看到 Tab 且当前无焦点,就把焦点
+  给第一个可聚焦控件——我们的菜单栏「对话」按钮
+  (egui 0.30 `memory/mod.rs`:"nothing has focus and the user pressed tab")。此后
+  `wants_keyboard_input()` 恒 true,`route` 把**每一个**按键都判给 egui,终端永久收不到键。
+  真机症状:`cd /tm` 按 Tab 补全成功(那个 Tab 已经发给远端了),之后回车/退格全无反应,
+  但鼠标点菜单还灵。所以键盘必须先过 `shell::input_route::egui_should_see`,判给终端就
+  **整段跳过 `on_window_event`**;指针相反,不喂 `CursorMoved` 就没有 hover 与
+  `wants_pointer_input()` 可言,菜单/弹窗全点不动。
+  逃生门:egui 收到 Escape 会清焦点,所以卡住时按一下 Esc 能自愈(可用于现场确诊)。
+  守护:`shell::input_route::tests::terminal_keyboard_is_never_fed_to_egui_so_tab_cannot_steal_focus`。
+- **egui 闭包里借不到 `&mut store`。** UI 构建在 `egui_ctx.run(|ctx| ...)` 里只有 `&mut UiState`。
+  改 store/发起连接一律写 intent 到 UiState,由 app.rs 在 `render_frame` 返回后统一施加
+  (delete/save 用 `&mut store`,connect 用 `&self` 调 spawn_connect,顺序执行不冲突)。
+- **`cli_direct` 的 exit(1) 只该对「初始 CLI 直连首次失败」生效。** 它是启动静态标志,若不
+  复位,断线后从会话管理器连别的会话失败会命中 `cli_direct && conn.is_none()` 把整个 GUI
+  `exit(1)`(GUI 子系统下无控制台,表现为「程序凭空消失」)。**规则**:ConnectOk 与用户主动
+  connect_request 两处清 `cli_direct=false`。
+- **原生文件对话框不能在 egui 闭包里同步开(表现为「卡死」)。** `rfd::FileDialog::pick_file()`
+  是阻塞调用,而 egui 闭包跑在 `RedrawRequested` 中间 —— 一阻塞就是整个 winit 事件循环停摆:
+  IO 泵不动(T1)、窗口不重绘、看门狗只能报「卡在 window_event」。**规则**:UI 只记意图
+  (`pick_key_request`),app.rs 在借用释放后另起线程跑,结果经 `EventLoopProxy` 以
+  `UserEvent` 回送;取消也要回送(否则 busy 标志永远清不掉,按钮再点就没反应)。
+  **还必须 `set_parent(&window)`** —— 无 owner 的对话框可能被排到主窗口后面,而主窗此时
+  已被 owner 关系禁用,用户看到的同样是「点不动的卡死窗口」。`rfd::FileDialog` 自身
+  `unsafe impl Send`(只存 raw handle),跨线程带 owner 正是 rfd `AsyncFileDialog` 的内部做法。
+- **egui repaint 不得绕过帧率闸(T3/T7)。** 取 `viewport_output[ROOT].repaint_delay` 并进
+  既有 `next_frame_at`/`WaitUntil` 排期,受 `FrameLimiter` 上限;别在渲染完原地 request_redraw。
 
 ## 字体
 

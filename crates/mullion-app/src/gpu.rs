@@ -80,9 +80,26 @@ impl Gpu {
                 force_fallback_adapter: false,
             }))
             .expect("无可用 GPU adapter");
+        // GPU/驱动身份写进自己的日志。上次真机卡死时是靠 Windows 事件日志里
+        // Explorer 崩在 amdxx64.dll 才知道驱动版本的——那条路不可靠,自己记。
+        let info = adapter.get_info();
+        log::info!(
+            target: "mullion",
+            "GPU: {} [{:?}] backend={:?} vendor=0x{:04x} device=0x{:04x} driver={} {}",
+            info.name, info.device_type, info.backend, info.vendor, info.device,
+            info.driver, info.driver_info,
+        );
         let (device, queue) = handle
             .block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
             .expect("request_device");
+        // 设备级故障自报:TDR / 驱动重置 / 校验层错误由 wgpu 直接告诉我们,
+        // 不用再从「Explorer 崩了」反推。回调在 wgpu 内部线程调用,只写日志。
+        device.on_uncaptured_error(Box::new(|e| {
+            log::error!(target: "mullion", "wgpu 未捕获错误: {e}");
+        }));
+        device.set_device_lost_callback(|reason, msg| {
+            log::error!(target: "mullion", "wgpu 设备丢失({reason:?}): {msg}");
+        });
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -102,6 +119,12 @@ impl Gpu {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        log::info!(
+            target: "mullion",
+            "surface: {}x{} format={:?} present={:?} alpha={:?} latency={}",
+            config.width, config.height, config.format, config.present_mode,
+            config.alpha_mode, config.desired_maximum_frame_latency,
+        );
 
         // resolution uniform(vec2<f32>,补齐到 16 字节)。用 config 同款 max(1) 裁剪值,
         // 避免窗口初始 0×0 时着色器里 px / resolution 除零出 NaN。
@@ -189,6 +212,7 @@ impl Gpu {
     pub fn resize(&mut self, w: u32, h: u32) {
         self.config.width = w.max(1);
         self.config.height = h.max(1);
+        log::debug!(target: "mullion", "surface configure {}x{}", self.config.width, self.config.height);
         self.surface.configure(&self.device, &self.config);
         // 用钳制后的 config 值(与 new() 一致),不是未钳制的 w/h——Windows 最小化会送
         // 一次 Resized(0,0),config 被钳到 1×1 但若这里写 (0,0) 进 uniform,着色器

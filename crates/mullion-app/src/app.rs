@@ -1,16 +1,20 @@
-//! App:winit ApplicationHandler<UserEvent>。拥有窗口/GPU/文字层/pane/SSH 会话/运行时,
-//! 每帧「排空 rx → feed emu → 回写 PtyWrite(T1)」,GPU present 受帧率(T3)与同步块(T2)双闸。
+//! App:winit ApplicationHandler<UserEvent>。持有窗口/GPU/文字层/运行时,以及一个
+//! `Option<Connection>`(launcher 态 None / 终端态 Some,§2.2)。每帧(conn 存在时)
+//! 「排空 rx → feed emu → 回写 PtyWrite(T1)」,GPU present 受帧率(T3)与同步块(T2)双闸。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use mullion_core::layout::PaneId;
+use mullion_ssh::config::SshConfig;
+use mullion_ssh::known_hosts::{HostKeyPolicy, TofuAccept};
 use mullion_ssh::session::SshSession;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Receiver;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
@@ -19,12 +23,23 @@ use crate::gpu::{quads_for, Gpu};
 use crate::pane::Pane;
 use crate::render::SyncFramePacer;
 use crate::text::TextLayer;
-use crate::{grid, input, session_pump};
+use crate::{diag, grid, input, session_pump, shell};
 
-/// 唤醒重绘的用户事件(ssh io_task 经注入的 wake 回调触发)。
-#[derive(Debug, Clone, Copy)]
+/// app 与「连接建立」异步任务之间的事件(ssh io_task / connect 的 wake、结果经此回送)。
+/// 携带 `SshSession`/`Receiver` 等非 `Copy` 负载,故不能派生 Copy/Clone;两者也未实现
+/// `Debug`,故 `UserEvent` 同样不派生 Debug(winit `ApplicationHandler<T>` 只要求 `T: 'static`)。
 pub enum UserEvent {
     Wake,
+    /// 异步 connect 成功:句柄 + 远端字节接收端(app 每帧 drain)。
+    ConnectOk {
+        ssh: SshSession,
+        rx: Receiver<Vec<u8>>,
+    },
+    /// 异步 connect 失败,已格式化的可操作错误(F6 分类由 `session::connect` 内部给)。
+    ConnectErr(String),
+    /// 私钥文件对话框结束。`None` = 用户取消/对话框失败——也要回送,否则
+    /// `key_picker_busy` 永远清不掉,以后再点「选择…」就没反应了。
+    KeyPathPicked(Option<PathBuf>),
 }
 
 /// 窗口出现后才建的 GPU 相关状态。
@@ -33,22 +48,59 @@ struct Active {
     gpu: Gpu,
     text: TextLayer,
     grid_dims: (u16, u16),
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
-pub struct App {
-    _runtime: Runtime,
+/// 一条活跃连接的全部状态。launcher 态时 `App::conn` 是 `None`。
+struct Connection {
     ssh: SshSession,
     rx: Receiver<Vec<u8>>,
     pane: Pane,
     pacer: SyncFramePacer,
-    limiter: FrameLimiter,
+}
+
+pub struct App {
+    _runtime: Runtime,
+    /// `None` = launcher 态(无终端字节可处理);`Some` = 终端态。
+    conn: Option<Connection>,
     start: Instant,
     mods: ModifiersState,
     kitty: bool,
     active: Option<Active>,
+    /// 帧率闸(T3,~60fps)。挂在 `App` 而非 `Connection`:egui 在 launcher 态
+    /// (`conn=None`)也要画占位 UI,两态必须共用同一个闸,否则切换态时节流状态丢失。
+    limiter: FrameLimiter,
     /// 被 `RedrawAction::Throttle` 挡住时记的到点时刻;`about_to_wait` 据此在
     /// deadline 到达后补一次 `request_redraw`,而不是靠陈旧 `WaitUntil` 忙转(T3/N3)。
     next_frame_at: Option<Instant>,
+    /// 唤醒/连接结果回送通道(注入 `session::connect` 的 wake,以及本身发 UserEvent)。
+    proxy: EventLoopProxy<UserEvent>,
+    /// TOFU 主机密钥策略,跨多次 connect 共用同一份内存记录(切片 A2 不做 F3 持久化)。
+    tofu: Arc<TofuAccept>,
+    /// CLI 直连(`mullion user@host`)携带的初始连接参数;`resumed` 里取走后即为 None。
+    initial: Option<SshConfig>,
+    /// 是否走 CLI 直连路径(路径①)。决定 `ConnectErr` 时是否保留 `exit(1)`(待定 F)。
+    /// 仅对「初始 CLI 直连的首次连接」生效:一旦连上(`ConnectOk`)或用户主动发起了
+    /// 另一次连接(会话管理器双击/点连接),就清为 `false`,进入交互态语义——
+    /// 否则断线后从会话管理器连别的会话失败会把整个 GUI 一并 exit(1)(复核 #1)。
+    cli_direct: bool,
+    /// egui UI 侧状态(菜单/状态栏/弹窗/中央区像素),与连接状态解耦(Task 4)。
+    ui: crate::ui::UiState,
+    /// 会话保险库(Task 6)。`resumed` 末尾打开;keyring/库打开失败时留 `None`,
+    /// 会话功能优雅禁用而非 panic/exit(待定 G),错误记 `ui.last_error`。
+    store: Option<crate::shell::store::SessionStore>,
+    /// 窗口可见性。Windows 最小化会送 `Resized(0,0)`,此时必须整帧跳过 GPU 与
+    /// grid 传播,只保留 IO 泵(见 `shell::window_state`)。
+    visible: shell::window_state::Visibility,
+    /// 文件对话框线程是否在跑。防止连点「选择…」开出多个对话框
+    /// (Windows 上主窗被 owner 关系禁用,Linux/XDG 未必)。
+    key_picker_busy: bool,
+    /// egui 侧有内容待画(菜单展开/hover/弹窗/错误提示)。与「终端来了新字节」是
+    /// 两个独立脏源,`frame::frame_is_dirty` 取并集——只看终端字节的话,远端一安静
+    /// egui 的交互就被 `RedrawAction::Idle` 吞掉,菜单点不开。
+    ui_dirty: bool,
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -56,24 +108,174 @@ pub struct App {
 const FONT_POINT_SIZE: f32 = 10.0;
 
 impl App {
-    pub fn new(runtime: Runtime, ssh: SshSession, rx: Receiver<Vec<u8>>) -> Self {
+    pub fn new(
+        runtime: Runtime,
+        proxy: EventLoopProxy<UserEvent>,
+        tofu: Arc<TofuAccept>,
+        initial: Option<SshConfig>,
+        cli_direct: bool,
+    ) -> Self {
         Self {
             _runtime: runtime,
-            ssh,
-            rx,
-            pane: Pane::new(PaneId(1), 80, 24),
-            pacer: SyncFramePacer::new(),
-            limiter: FrameLimiter::new(16), // ~60fps(T3)
+            conn: None,
             start: Instant::now(),
             mods: ModifiersState::empty(),
             kitty: false, // MVP 未协商 Kitty,走优雅退化(T6)
             active: None,
+            limiter: FrameLimiter::new(16), // ~60fps(T3)
             next_frame_at: None,
+            proxy,
+            tofu,
+            initial,
+            cli_direct,
+            ui: crate::ui::UiState::default(),
+            store: None,
+            visible: shell::window_state::Visibility::default(),
+            key_picker_busy: false,
+            ui_dirty: true, // 首帧必须画出来
         }
     }
 
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    /// UI 侧变了(或 egui 自己要重绘):标脏 + 请求一帧。**两件事必须一起做**——
+    /// 只 `request_redraw` 而不标脏,那一帧会在 `frame_is_dirty` 处被判 Idle 丢掉。
+    fn request_ui_redraw(&mut self) {
+        self.ui_dirty = true;
+        if let Some(a) = &self.active {
+            a.window.request_redraw();
+        }
+    }
+
+    /// 从 Minimized 自愈:凡是「窗口本该看得见」的信号都拿实测尺寸复查一次,
+    /// 别指望对方一定会补发非零 `Resized`(理由见 `shell::window_state`)。
+    fn recheck_visibility(&mut self) {
+        let Some(a) = &self.active else { return };
+        let size = a.window.inner_size();
+        let Some(vis) =
+            shell::window_state::recover_from_minimized(self.visible, size.width, size.height)
+        else {
+            return;
+        };
+        crate::logx::line(&format!(
+            "窗口可见性自愈 {:?} → {:?}({}x{})",
+            self.visible, vis, size.width, size.height
+        ));
+        // 走与还原同一条路径:最小化期间跳过的 surface configure 与 grid 传播都要补上。
+        self.apply_resize(size.width, size.height);
+    }
+
+    /// 应用一次窗口尺寸变化(`Resized` 事件与 Minimized 自愈共用)。
+    fn apply_resize(&mut self, width: u32, height: u32) {
+        let vis = shell::window_state::visibility_for(width, height);
+        if vis != self.visible {
+            crate::logx::line(&format!(
+                "窗口可见性 {:?} → {:?}({width}x{height})",
+                self.visible, vis
+            ));
+            self.visible = vis;
+        }
+        let plan = shell::window_state::plan_resize(vis);
+        let Some(a) = &mut self.active else { return };
+        // 最小化(0×0)时三件事全不做:configure 0 面积表面、按 1 列 reflow 碾平
+        // scrollback、把 window_change 1×1 发给远端。
+        if plan.reconfigure_surface {
+            a.gpu.resize(width, height);
+        }
+        if plan.propagate_grid {
+            let (cols, rows) = grid::grid_size_for(width, height, a.text.cell_w, a.text.cell_h);
+            if (cols, rows) != a.grid_dims {
+                a.grid_dims = (cols, rows);
+                // 单 pane MVP 直接 resize;多 pane 的 reflow(ResizeSink)留给 F4 分屏。
+                // launcher 态(conn=None)没有终端可 resize,跳过。
+                if let Some(conn) = self.conn.as_mut() {
+                    conn.pane.emulator.resize(cols, rows);
+                    let _ = conn.ssh.resize(cols, rows); // T4
+                }
+            }
+        }
+        if plan.request_redraw {
+            self.request_ui_redraw();
+        }
+    }
+
+    /// 排空 rx → feed emulator → 回写 `PtyWrite`(T1 红线)。
+    ///
+    /// 从 `RedrawRequested` 和(最小化时)`UserEvent::Wake` 两处调:最小化期间窗口
+    /// 未必还会被重绘,不能把这条通路挂在重绘上,否则有界 rx(256)灌满堵住 io_task,
+    /// 远端的同步输出探测/光标查询永久等不到应答。
+    fn pump_io(&mut self) {
+        // 须在 conn 借用之前取:now_ms() 借整个 &self,与 conn.as_mut() 冲突。
+        let now = self.now_ms();
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        diag::mark(diag::Stage::Pump);
+        let mut inbound = Vec::new();
+        while let Ok(bytes) = conn.rx.try_recv() {
+            diag::count_inbound(bytes.len());
+            inbound.push(bytes);
+        }
+        for b in &inbound {
+            conn.pacer.feed(b, now); // T2:探测同步块
+        }
+        let out = session_pump::pump(&mut conn.pane.emulator, &inbound);
+        if !out.is_empty() {
+            let _ = conn.ssh.write(out);
+        }
+    }
+
+    /// 在 `_runtime` 上异步连接;结果经 `proxy` 以 `UserEvent` 回送(§5)。
+    /// 不阻塞调用方(winit 事件循环线程)。
+    fn spawn_connect(&self, cfg: SshConfig) {
+        let proxy = self.proxy.clone();
+        let wake_proxy = self.proxy.clone();
+        let policy: Arc<dyn HostKeyPolicy> = self.tofu.clone();
+        self._runtime.spawn(async move {
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = wake_proxy.send_event(UserEvent::Wake);
+            });
+            match mullion_ssh::session::connect(&cfg, policy, wake).await {
+                Ok((ssh, rx)) => {
+                    let _ = proxy.send_event(UserEvent::ConnectOk { ssh, rx });
+                }
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::ConnectErr(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// 私钥文件对话框:另起线程跑,结果经 `proxy` 回送。
+    ///
+    /// 两点都是必需的:
+    /// 1. **不在事件回调里同步调 `pick_file()`**。egui 闭包跑在 `RedrawRequested`
+    ///    中间,一阻塞就是整个事件循环停摆——IO 泵不动(T1)、窗口不重绘、
+    ///    看门狗只能报「卡在 window_event」。用户看到的就是「卡死」。
+    /// 2. **`set_parent`**。不给 owner 的对话框在 Windows 上可能被排到主窗口
+    ///    后面,前台还是那个不响应的主窗(它已被 owner 关系禁用)——同样表现为卡死。
+    ///
+    /// `rfd::FileDialog` 自身 `unsafe impl Send`(内部只存 raw handle),
+    /// 跨线程用 owner 句柄正是 rfd `AsyncFileDialog` 内部的做法。
+    fn spawn_key_picker(&self) {
+        let mut dialog = rfd::FileDialog::new().set_title("选择私钥文件");
+        if let Some(a) = &self.active {
+            dialog = dialog.set_parent(a.window.as_ref());
+        }
+        let proxy = self.proxy.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mullion-file-dialog".into())
+            .spawn(move || {
+                let picked = dialog.pick_file();
+                let _ = proxy.send_event(UserEvent::KeyPathPicked(picked));
+            });
+        if let Err(e) = spawned {
+            // 起不了线程就退回「没选中」,让 busy 标志复位,UI 不会卡在按不动。
+            log::warn!(target: "mullion", "文件对话框线程创建失败: {e}");
+            let _ = self.proxy.send_event(UserEvent::KeyPathPicked(None));
+        }
     }
 }
 
@@ -82,11 +284,21 @@ impl ApplicationHandler<UserEvent> for App {
         if self.active.is_some() {
             return;
         }
+        // adapter 枚举 / request_device 是阻塞调用,显卡驱动出问题时会卡死在这里——
+        // 打上阶段标记,看门狗才说得出「卡在 startup」而不是一片空白。
+        diag::mark(diag::Stage::Startup);
         let window = Arc::new(
             event_loop
                 .create_window(Window::default_attributes().with_title("mullion"))
                 .expect("create_window"),
         );
+        let init_size = window.inner_size();
+        crate::logx::line(&format!(
+            "resumed: 窗口创建 {}x{} scale={}",
+            init_size.width,
+            init_size.height,
+            window.scale_factor()
+        ));
         let gpu = Gpu::new(window.clone(), self._runtime.handle());
         // 字号 10pt,按窗口 DPI 缩放成物理像素(inner_size 是物理像素,须一致):
         // px = pt * (96*scale/72)。Windows 常见 125%/150% 缩放下才不会过小。
@@ -96,39 +308,204 @@ impl ApplicationHandler<UserEvent> for App {
         let text = TextLayer::new(&gpu.device, &gpu.queue, gpu.config.format, font_px);
         let size = window.inner_size();
         let (cols, rows) = grid::grid_size_for(size.width, size.height, text.cell_w, text.cell_h);
-        self.pane.emulator.resize(cols, rows);
-        let _ = self.ssh.resize(cols, rows); // 初始 window_change 校正到真实尺寸(T4)
+        // egui 0.30 同帧集成(§4.1):本 Task 只画一个占位 `egui::Window` 证明管线通;
+        // 菜单/状态栏/session UI 在后续 Task 接线。
+        let egui_ctx = egui::Context::default();
+        // egui 内嵌字体不含中文;挂系统 CJK 字体,否则菜单/状态栏中文全是 tofu 方框。
+        crate::ui::install_cjk_font(&egui_ctx);
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_renderer =
+            egui_wgpu::Renderer::new(&gpu.device, gpu.config.format, None, 1, false);
         self.active = Some(Active {
             window,
             gpu,
             text,
             grid_dims: (cols, rows),
+            egui_ctx,
+            egui_state,
+            egui_renderer,
         });
+
+        // 打开会话保险库(Task 6)。失败(keyring 不可用/无法定位配置目录等)不
+        // panic/exit——记 ui.last_error,会话管理功能优雅禁用,菜单/关于仍能用
+        // (待定 G)。
+        let dir = crate::shell::store::config_dir();
+        self.store = match dir {
+            Some(d) => match crate::shell::store::SessionStore::open(
+                d,
+                &mullion_store::KeyringSource::new(),
+            ) {
+                Ok(s) => {
+                    crate::logx::line(&format!("会话库已打开,{} 个会话", s.list().len()));
+                    Some(s)
+                }
+                Err(e) => {
+                    crate::logx::line(&format!("会话库打开失败: {e}"));
+                    self.ui.last_error = Some(format!("会话库打开失败:{e}"));
+                    None
+                }
+            },
+            None => {
+                crate::logx::line("无法定位配置目录,会话功能禁用");
+                self.ui.last_error = Some("无法定位配置目录".into());
+                None
+            }
+        };
+
+        // CLI 直连(路径①)→ 立刻发起连接,进终端态;无参启动(路径②)→ 留在
+        // launcher(conn 仍 None)并自动弹出会话管理器,让用户选/建会话(§2/Task7)。
+        if let Some(cfg) = self.initial.take() {
+            self.spawn_connect(cfg);
+        } else {
+            self.ui.session_manager_open = true;
+        }
+        diag::mark(diag::Stage::Idle);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
-        if let Some(a) = &self.active {
-            a.window.request_redraw();
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        diag::mark(diag::Stage::UserEvent);
+        match event {
+            UserEvent::Wake => {
+                // 最小化时不请求重绘(也不该指望还能收到 RedrawRequested),但 IO 泵
+                // 必须继续跑,否则 T1 红线:rx 灌满 + 远端探测无应答。
+                if matches!(
+                    shell::window_state::redraw_scope(self.visible),
+                    shell::window_state::RedrawScope::PumpOnly
+                ) {
+                    self.pump_io();
+                } else if let Some(a) = &self.active {
+                    a.window.request_redraw();
+                }
+            }
+            UserEvent::ConnectOk { ssh, rx } => {
+                crate::logx::line("连接成功,进入终端态");
+                // 一旦连上就进入交互态:后续(哪怕是本次会话断开后)的连接失败
+                // 不再是「CLI 直连首次失败」,不该导致整个 GUI exit(1)(复核 #1)。
+                self.cli_direct = false;
+                let (cols, rows) = self.active.as_ref().map_or((80, 24), |a| a.grid_dims);
+                let pane = Pane::new(PaneId(1), cols, rows);
+                let _ = ssh.resize(cols, rows); // 初始 window_change 校正到真实尺寸(T4)
+                self.conn = Some(Connection {
+                    ssh,
+                    rx,
+                    pane,
+                    pacer: SyncFramePacer::new(),
+                });
+                // 连上后关掉会话管理弹窗/编辑表单,别让它盖在新终端上方(复核 #4)。
+                self.ui.session_manager_open = false;
+                self.ui.editor_open = false;
+                self.request_ui_redraw();
+            }
+            UserEvent::KeyPathPicked(picked) => {
+                self.key_picker_busy = false;
+                if let Some(p) = picked {
+                    self.ui.editor.key_path = p.display().to_string();
+                }
+                self.request_ui_redraw();
+            }
+            UserEvent::ConnectErr(msg) => {
+                // 待定 F:CLI 直连从未成功连过时,保留可脚本化的 exit(1) 语义;
+                // launcher 态(或已连过又断开)只记错误,交 UI 展示(ui.last_error)。
+                crate::logx::line(&format!("连接失败: {msg}"));
+                if self.cli_direct && self.conn.is_none() {
+                    std::process::exit(1);
+                }
+                self.ui.last_error = Some(msg);
+                self.request_ui_redraw();
+            }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        diag::mark(diag::Stage::WindowEvent);
+        // 输入分流(§4.5)。**键盘与指针的顺序是反的,不是笔误**:
+        // - 指针:先喂 egui 再判。egui 要靠 `CursorMoved` 维护 hover,不喂就没有
+        //   `wants_pointer_input()` 可言。
+        // - 键盘:先判再决定喂不喂(T8)。喂给 egui 的键会先经它的焦点系统——Tab 会被
+        //   拿去把焦点给菜单栏第一个按钮,此后 `wants_keyboard_input()` 恒 true,
+        //   下面的 route 把每个按键都判给 egui,终端永久收不到键。
+        if let Some(active) = &mut self.active {
+            let is_kbd = matches!(event, WindowEvent::KeyboardInput { .. });
+            let is_ptr = matches!(
+                event,
+                WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::CursorMoved { .. }
+            );
+            let modal = self.ui.session_manager_open || self.ui.about_open || self.ui.editor_open;
+            // 键盘归终端时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
+            if is_kbd
+                && !shell::input_route::egui_should_see(
+                    shell::input_route::InputKind::Keyboard,
+                    modal,
+                    active.egui_ctx.wants_keyboard_input(),
+                )
+            {
+                // Route::Terminal → 直落下面 UNCHANGED 的 KeyboardInput 分支(守 T5/T6)。
+            } else {
+                let resp = active.egui_state.on_window_event(&active.window, &event);
+                if resp.repaint {
+                    // 标脏与请求重绘必须成对:只请求不标脏,那帧会被 frame_is_dirty
+                    // 判 Idle 丢掉(终端态尤其明显:远端一安静菜单就点不开)。
+                    self.ui_dirty = true;
+                    active.window.request_redraw();
+                }
+                if is_kbd {
+                    return; // 上面已判定归 egui(模态/表单聚焦)
+                }
+                if is_ptr {
+                    let wants_ptr = active.egui_ctx.wants_pointer_input();
+                    if matches!(
+                        shell::input_route::route(
+                            modal,
+                            false,
+                            wants_ptr,
+                            shell::input_route::InputKind::Pointer,
+                        ),
+                        shell::input_route::Route::Egui
+                    ) {
+                        return; // egui 已收下,不转终端
+                    }
+                }
+            }
+        }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                crate::logx::line("CloseRequested → 退出");
+                event_loop.exit();
+            }
+            // 焦点/遮挡:记录以便定位「失焦后无法回到前台/黑屏」;回到前台时补一次
+            // 重绘,避免停在陈旧/空白帧(此前这些事件落 `_ => {}`,不重绘也不留痕)。
+            WindowEvent::Focused(focused) => {
+                crate::logx::line(&format!("Focused({focused})"));
+                if focused {
+                    self.recheck_visibility();
+                    self.request_ui_redraw();
+                }
+            }
+            WindowEvent::Occluded(occluded) => {
+                crate::logx::line(&format!("Occluded({occluded})"));
+                if !occluded {
+                    self.recheck_visibility();
+                    self.request_ui_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // DPI 跟随是 F21,这里暂不重建字体,仅记录(跨屏 DPI 变化时字号不更新)。
+                crate::logx::line(&format!("ScaleFactorChanged({scale_factor})"));
+            }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::Resized(size) => {
-                if let Some(a) = &mut self.active {
-                    a.gpu.resize(size.width, size.height);
-                    let (cols, rows) =
-                        grid::grid_size_for(size.width, size.height, a.text.cell_w, a.text.cell_h);
-                    if (cols, rows) != a.grid_dims {
-                        a.grid_dims = (cols, rows);
-                        // 单 pane MVP 直接 resize;多 pane 的 reflow(ResizeSink)留给 F4 分屏。
-                        self.pane.emulator.resize(cols, rows);
-                        let _ = self.ssh.resize(cols, rows); // T4
-                    }
-                    a.window.request_redraw();
-                }
+                diag::mark(diag::Stage::Resize);
+                log::debug!(target: "mullion", "Resized({}x{})", size.width, size.height);
+                self.apply_resize(size.width, size.height);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
@@ -136,39 +513,127 @@ impl ApplicationHandler<UserEvent> for App {
                         let bytes = mullion_term::keymap::encode_key(key, mods, self.kitty);
                         // `let _` 全文件都这样:写/resize 失败(断线等)没有用户提示、
                         // 无重连。断线感知与重连是 S3,后续 spec,这里不做。
-                        let _ = self.ssh.write(bytes);
+                        // launcher 态(conn=None)没有终端可写,按键静默丢弃。
+                        if let Some(conn) = self.conn.as_mut() {
+                            let _ = conn.ssh.write(bytes);
+                        }
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
-                // 1. 排空 rx(永远做:保 T1 应答流动 + T3 解耦)
-                let mut inbound = Vec::new();
-                while let Ok(bytes) = self.rx.try_recv() {
-                    inbound.push(bytes);
-                }
-                for b in &inbound {
-                    self.pacer.feed(b); // T2:探测同步块
-                }
-                // 2. feed emu + 回写 PtyWrite(T1 红线)
-                let out = session_pump::pump(&mut self.pane.emulator, &inbound);
-                if !out.is_empty() {
-                    let _ = self.ssh.write(out);
-                }
-                // 3. present 受帧率(T3)与同步块(T2)双闸。`plan` 是纯决策,
-                // 三支都显式复位 control_flow——Throttle 靠 about_to_wait 到点补画,
-                // 不在这里 request_redraw,否则陈旧 WaitUntil 过期后每轮零延迟
-                // ResumeTimeReached 会忙转空转满 CPU(T3/N3 红线)。
-                let dirty = self.pacer.should_present();
+                // 计算须在 conn 借用之前:conn.as_mut() 只借 self.conn 这一字段,
+                // 但 self.now_ms() 需要整个 &self,与仍存活的 conn 借用冲突。
                 let now = self.now_ms();
+                // 1+2. 排空 rx→feed emu→回写 PtyWrite(T1 红线)——仅终端态有字节可
+                // 处理;launcher 态(conn=None)没有终端,跳过,但下面的帧率闸 + egui
+                // 渲染仍要跑(egui 在 launcher 也要画占位 UI)。
+                self.pump_io();
+                // 2.2 自愈:能收到重绘请求本身就说明窗口大概率看得见。若还挂在
+                // Minimized 且实测尺寸非零,就地恢复(否则一次异常的 Resized(0,0)
+                // 之后再没有非零 Resized,窗口永久停在 PumpOnly:字节照收,画面
+                // 再不更新——用户看到的就是「键盘没有任何反应」)。
+                self.recheck_visibility();
+                // 2.5 最小化:泵完就收工。不 present、不重排网格——此时窗口面积为 0,
+                // 继续 acquire/present 只是对着 0 面积表面空转,而 egui 也不可能被交互
+                // (故下面那段弹窗 intent 施加一并跳过是安全的)。
+                if matches!(
+                    shell::window_state::redraw_scope(self.visible),
+                    shell::window_state::RedrawScope::PumpOnly
+                ) {
+                    diag::count_skipped();
+                    self.next_frame_at = None;
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                    diag::mark(diag::Stage::Idle);
+                    return;
+                }
+                // 3. present 受帧率(T3)与同步块(T2)双闸。`plan` 是纯决策,三支都
+                // 显式复位 control_flow——Throttle 靠 about_to_wait 到点补画,不在
+                // 这里 request_redraw,否则陈旧 WaitUntil 过期后每轮零延迟
+                // ResumeTimeReached 会忙转空转满 CPU(T3/N3 红线)。
+                //
+                // dirty:终端态取「远端来了新字节(pacer,含同步块探测)」与「egui 要
+                // 重绘」的并集——只看前者的话,远端一安静菜单就点不开(见
+                // `frame::frame_is_dirty`)。launcher 态本 Task 没有持续数据源,把
+                // 「确实触发了一次 RedrawRequested」当作脏——这不是无条件轮询:
+                // ControlFlow::Wait 下 winit 不会凭空生成 RedrawRequested,真正的重绘
+                // 频率由触发它的事件(resize/connect/wake/OS 重绘)决定。
+                let dirty = match &self.conn {
+                    Some(conn) => {
+                        crate::frame::frame_is_dirty(conn.pacer.should_present(now), self.ui_dirty)
+                    }
+                    None => true,
+                };
                 match self.limiter.plan(dirty, now) {
                     RedrawAction::Present => {
                         if let Some(a) = &mut self.active {
-                            render_frame(a, &self.pane);
+                            let pane = self.conn.as_ref().map(|c| &c.pane);
+                            let connected = self.conn.is_some();
+                            let status = if connected {
+                                "● 已连接".to_string()
+                            } else {
+                                "● 未连接".to_string()
+                            };
+                            let sessions: &[mullion_store::SessionRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.list());
+                            let store_available = self.store.is_some();
+                            let repaint_delay = render_frame(
+                                a,
+                                pane,
+                                &mut self.ui,
+                                sessions,
+                                store_available,
+                                connected,
+                                &status,
+                            );
+                            self.limiter.record_present(now);
+                            // egui 侧已画出;下面若 egui 又要一帧会重新置脏。
+                            self.ui_dirty = false;
+                            if let Some(conn) = self.conn.as_mut() {
+                                conn.pacer.mark_presented();
+                                // 中央区(窗口减去 egui 菜单/状态栏)→ 终端网格(F34/T4)。
+                                // central_px 由本帧 build_ui 在 egui 布局后写入 self.ui,
+                                // 天然滞后一帧(首帧/未连接时用 resumed 里整窗口尺寸兜底)——
+                                // 可接受,不为此再跑一次 egui(见 Task 说明)。
+                                let (cols, rows) = shell::viewport::grid_dims(
+                                    self.ui.central_px,
+                                    (a.text.cell_w as u32, a.text.cell_h as u32),
+                                    (1, 1),
+                                );
+                                if (cols, rows) != a.grid_dims {
+                                    a.grid_dims = (cols, rows);
+                                    conn.pane.emulator.resize(cols, rows);
+                                    let _ = conn.ssh.resize(cols, rows); // T4
+                                }
+                            }
+                            // 菜单动作(§4.2):断开回到 launcher 态 / 退出整个事件循环。
+                            if self.ui.request_disconnect {
+                                self.ui.request_disconnect = false;
+                                self.conn = None;
+                            }
+                            if self.ui.request_quit {
+                                self.ui.request_quit = false;
+                                event_loop.exit();
+                            }
+                            // T3/T7:egui 若自己请求了下次重绘(动画/交互),按 Throttle
+                            // 的方式经 next_frame_at/WaitUntil 排期,不在这里无条件
+                            // request_redraw——否则一旦某帧 repaint_delay 很小,就会绕开
+                            // FrameLimiter 忙转,重演 T3/T7 红线。占位 UI 静态,通常拿到
+                            // Duration::MAX(不需要);仍按此路径处理以防将来 UI 变复杂。
+                            if repaint_delay < std::time::Duration::MAX {
+                                // 排期的那一帧必须同时标脏,否则到点重绘时
+                                // `frame_is_dirty` 判 Idle,动画/交互反馈直接丢帧。
+                                self.ui_dirty = true;
+                                let at = Instant::now() + repaint_delay;
+                                self.next_frame_at = Some(at);
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+                            } else {
+                                self.next_frame_at = None;
+                                event_loop.set_control_flow(ControlFlow::Wait);
+                            }
+                        } else {
+                            self.next_frame_at = None;
+                            event_loop.set_control_flow(ControlFlow::Wait);
                         }
-                        self.limiter.record_present(now);
-                        self.pacer.mark_presented();
-                        self.next_frame_at = None;
-                        event_loop.set_control_flow(ControlFlow::Wait);
                     }
                     RedrawAction::Throttle { wait_ms } => {
                         let at = Instant::now() + std::time::Duration::from_millis(wait_ms);
@@ -178,6 +643,61 @@ impl ApplicationHandler<UserEvent> for App {
                     RedrawAction::Idle => {
                         self.next_frame_at = None;
                         event_loop.set_control_flow(ControlFlow::Wait);
+                    }
+                }
+
+                // Task 6:会话管理弹窗的 intent 施加点。放在 `plan` 整块之后——此处
+                // self.active/self.conn/self.ui 的借用都已释放,才能拿 `&mut
+                // self.store`(egui 闭包里借不到它,只能在这里事后统一施加)。
+                if self.ui.delete_request.is_some() || self.ui.save_request.is_some() {
+                    // keyring/TOML 是同步 IO,在事件回调里可能阻塞(Windows 凭据管理器
+                    // 偶发几百 ms),打点让看门狗能指认。
+                    diag::mark(diag::Stage::StoreIo);
+                }
+                if let Some(id) = self.ui.delete_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        if let Err(e) = store.delete(id).and_then(|_| store.save()) {
+                            self.ui.last_error = Some(format!("删除失败:{e}"));
+                        }
+                    }
+                }
+                if let Some(save) = self.ui.save_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        let now = time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default();
+                        let r = match save.editing_id {
+                            Some(id) => store
+                                .update(id, save.draft, &now)
+                                .and_then(|_| store.save()),
+                            None => {
+                                store.add(save.draft, &now);
+                                store.save()
+                            }
+                        };
+                        if let Err(e) = r {
+                            self.ui.last_error = Some(format!("保存失败:{e}"));
+                        }
+                    }
+                }
+                // 「选择…」私钥文件:同样是 egui 闭包只记意图、这里才施加。
+                if std::mem::take(&mut self.ui.pick_key_request) && !self.key_picker_busy {
+                    self.key_picker_busy = true;
+                    self.spawn_key_picker();
+                }
+                // 连接:双击行 / 点「连接」。spawn_connect 是 &self 方法,必须在
+                // store 的 &mut 借用结束后调(下面 `self.store.as_ref()` 的临时借
+                // 用在 match 表达式求值完就释放,故可紧接着调 self.spawn_connect)。
+                if let Some(id) = self.ui.connect_request.take() {
+                    match self.store.as_ref().map(|s| s.ssh_config_for(id)) {
+                        Some(Ok(cfg)) => {
+                            // 用户主动发起的连接是交互态,不该继承 CLI 直连的
+                            // exit(1) 语义(复核 #1)。
+                            self.cli_direct = false;
+                            self.spawn_connect(cfg);
+                        }
+                        Some(Err(e)) => self.ui.last_error = Some(e.to_string()),
+                        None => {}
                     }
                 }
             }
@@ -196,11 +716,46 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+        // 即将阻塞等事件 = 正常空闲。看门狗据此不误报(等事件本来就可以等很久)。
+        diag::mark(diag::Stage::Idle);
     }
 }
 
-/// 一帧渲染:背景色块趟 + 文字前景趟。GPU 胶水,无单测。
-fn render_frame(a: &mut Active, pane: &Pane) {
+/// 一帧渲染:先跑 egui(菜单栏 + 状态栏,§4.2),再(终端态时)叠加背景色块 + 文字
+/// 前景趟。返回 egui 想要的下次重绘时间(`Duration::MAX` = 不需要);调用方据此走
+/// T3/T7 的 `next_frame_at`/`WaitUntil`,不会无条件 `request_redraw`。GPU 胶水,无单测。
+fn render_frame(
+    a: &mut Active,
+    pane: Option<&Pane>,
+    ui_state: &mut crate::ui::UiState,
+    sessions: &[mullion_store::SessionRecord],
+    store_available: bool,
+    connected: bool,
+    status: &str,
+) -> std::time::Duration {
+    diag::count_frame();
+    // --- egui:每帧都跑,launcher 态(pane=None)也要画菜单/状态栏。---
+    diag::mark(diag::Stage::EguiRun);
+    let raw_input = a.egui_state.take_egui_input(&a.window);
+    let full_output = a.egui_ctx.run(raw_input, |ctx| {
+        crate::ui::build_ui(ctx, ui_state, sessions, store_available, connected, status);
+    });
+    a.egui_state
+        .handle_platform_output(&a.window, full_output.platform_output);
+    let paint_jobs = a
+        .egui_ctx
+        .tessellate(full_output.shapes, full_output.pixels_per_point);
+    let screen = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [a.gpu.config.width, a.gpu.config.height],
+        pixels_per_point: full_output.pixels_per_point,
+    };
+    // ROOT 是唯一 viewport(未用 egui 多窗口)。取它的 repaint_delay 交回调用方
+    // 按 Throttle 语义排期(T3/T7)。
+    let repaint_delay = full_output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+
     // 每帧先 trim:清掉上一帧的 glyphs_in_use,让本帧 prepare 能按需淘汰旧字形。
     // 必须在 prepare/get_current_texture 的 early-return 之前——挪到函数末尾会导致
     // 一旦 AtlasFull 触发提前 return,trim 永远到不了,图集永远不被清理,
@@ -208,41 +763,56 @@ fn render_frame(a: &mut Active, pane: &Pane) {
     // trim 只清 in_use 标记不删纹理,首帧对空图集是 no-op,正常帧语义不变。
     a.text.trim();
 
-    let snap = pane.emulator.snapshot();
-    let res = glyphon::Resolution {
-        width: a.gpu.config.width,
-        height: a.gpu.config.height,
+    // --- 终端趟:仅 pane 存在(终端态)才生成 quads/prepare 文字;launcher 态
+    // (pane=None)没有终端可画,跳过,只画上面的 egui。---
+    let terminal_draw = match pane {
+        Some(pane) => {
+            diag::mark(diag::Stage::TextPrepare);
+            let snap = pane.emulator.snapshot();
+            let res = glyphon::Resolution {
+                width: a.gpu.config.width,
+                height: a.gpu.config.height,
+            };
+            let quads = quads_for(
+                &snap,
+                a.text.cell_w,
+                a.text.cell_h,
+                mullion_term::palette::DEFAULT_BG,
+            );
+            // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
+            // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。
+            if let Err(e) = a.text.prepare(&a.gpu.device, &a.gpu.queue, &snap, res) {
+                log::warn!(target: "mullion", "glyphon prepare 失败,跳过本帧: {e:?}");
+                diag::count_skipped();
+                return std::time::Duration::MAX;
+            }
+            let inst = a.gpu.quad_instances(&quads);
+            Some((inst, quads.len() as u32))
+        }
+        None => None,
     };
-    let quads = quads_for(
-        &snap,
-        a.text.cell_w,
-        a.text.cell_h,
-        mullion_term::palette::DEFAULT_BG,
-    );
-    let inst = a.gpu.quad_instances(&quads);
-    // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并跳过本帧,
-    // 不拖垮整个 GUI。
-    if let Err(e) = a.text.prepare(&a.gpu.device, &a.gpu.queue, &snap, res) {
-        eprintln!("glyphon prepare 失败,跳过本帧: {e:?}");
-        return;
-    }
 
+    diag::mark(diag::Stage::Acquire);
     let frame = match a.gpu.surface.get_current_texture() {
         Ok(f) => f,
         Err(wgpu::SurfaceError::Timeout) => {
-            eprintln!("wgpu get_current_texture 超时,跳过本帧");
-            return;
+            log::warn!(target: "mullion", "wgpu get_current_texture 超时,跳过本帧");
+            diag::count_skipped();
+            return std::time::Duration::MAX;
         }
         Err(e @ (wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)) => {
-            eprintln!("wgpu surface {e:?},重新 configure 后跳过本帧");
+            log::warn!(target: "mullion", "wgpu surface {e:?},重新 configure 后跳过本帧");
             a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
-            return;
+            diag::count_skipped();
+            return std::time::Duration::MAX;
         }
         Err(wgpu::SurfaceError::OutOfMemory) => {
-            eprintln!("wgpu get_current_texture OutOfMemory,跳过本帧");
-            return;
+            log::error!(target: "mullion", "wgpu get_current_texture OutOfMemory,跳过本帧");
+            diag::count_skipped();
+            return std::time::Duration::MAX;
         }
     };
+    diag::mark(diag::Stage::Encode);
     let view = frame
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
@@ -252,6 +822,17 @@ fn render_frame(a: &mut Active, pane: &Pane) {
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+
+    // egui 纹理上传/顶点缓冲更新须在 begin_render_pass 之前:update_buffers 要
+    // `&mut enc` 记录拷贝命令,而 render pass 开始后 `enc` 会被 pass 借用/锁定。
+    for (id, delta) in &full_output.textures_delta.set {
+        a.egui_renderer
+            .update_texture(&a.gpu.device, &a.gpu.queue, *id, delta);
+    }
+    let egui_cmds =
+        a.egui_renderer
+            .update_buffers(&a.gpu.device, &a.gpu.queue, &mut enc, &paint_jobs, &screen);
+
     {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("main"),
@@ -272,15 +853,36 @@ fn render_frame(a: &mut Active, pane: &Pane) {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        a.gpu.draw_quads(&mut pass, &inst, quads.len() as u32); // 背景趟
-                                                                // 前景趟:失败(如条目在 prepare 之后被图集淘汰)不 panic,记录并跳过文字层,
-                                                                // 背景色块这帧仍照常提交。
-        if let Err(e) = a.text.render(&mut pass) {
-            eprintln!("glyphon render 失败,跳过本帧文字层: {e:?}");
+        if let Some((inst, n)) = &terminal_draw {
+            a.gpu.draw_quads(&mut pass, inst, *n); // 背景趟
+                                                   // 前景趟:失败(如条目在 prepare 之后被图集淘汰)不 panic,记录并跳过文字层,
+                                                   // 背景色块这帧仍照常提交。
+            if let Err(e) = a.text.render(&mut pass) {
+                log::warn!(target: "mullion", "glyphon render 失败,跳过本帧文字层: {e:?}");
+            }
         }
+        // egui 需要 `&mut RenderPass<'static>`。单 pass 方案:终端趟先在 `pass` 上
+        // 录完命令,再 `forget_lifetime` 转 'static 给 egui——forget_lifetime 消费
+        // `pass` 自身,之后不能再用原 `pass`,故终端趟必须写在它之前(两趟画进
+        // 同一个 render pass,而非两个 pass,借用检查器可行,顺利编译)。
+        let mut static_pass = pass.forget_lifetime();
+        a.egui_renderer
+            .render(&mut static_pass, &paint_jobs, &screen);
     }
-    a.gpu.queue.submit(Some(enc.finish()));
+
+    a.gpu
+        .queue
+        .submit(egui_cmds.into_iter().chain(std::iter::once(enc.finish())));
+    // present 在 Fifo 下会等 vsync;它和上面的 acquire 是最可能长阻塞的两步,
+    // 分开打点才能区分「等交换链」和「等驱动」。
+    diag::mark(diag::Stage::Present);
     frame.present();
+    diag::count_present();
+    for id in &full_output.textures_delta.free {
+        a.egui_renderer.free_texture(id);
+    }
+
+    repaint_delay
 }
 
 #[cfg(test)]
