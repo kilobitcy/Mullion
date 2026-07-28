@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use mullion_app::app::{App, UserEvent};
 use mullion_app::cli;
-use mullion_ssh::known_hosts::{KnownHosts, TofuAccept};
+use mullion_store::KnownHostsFile;
 use winit::event_loop::EventLoop;
 
 fn main() {
@@ -49,7 +49,20 @@ fn main() {
         .build()
         .expect("建事件循环");
     let proxy = event_loop.create_proxy();
-    let tofu = Arc::new(TofuAccept::new(Arc::new(Mutex::new(KnownHosts::new()))));
+    // F3:主机密钥指纹表,跨进程持久化。拿不到配置目录(极罕见,如无 HOME)时
+    // 退化成纯内存表——每次启动都会重新问一遍,但绝不静默放行。
+    let known_hosts = Arc::new(Mutex::new(match mullion_app::shell::store::config_dir() {
+        Some(dir) => KnownHostsFile::load(&dir),
+        None => KnownHostsFile::default(),
+    }));
+    if known_hosts
+        .lock()
+        .expect("known-hosts poisoned")
+        .is_corrupt()
+    {
+        // 不是致命错误(当空表继续跑),但必须留痕:用户会奇怪「为什么又让我确认指纹」。
+        mullion_app::logx::line("known_hosts.toml 解析失败,当空表处理;首次保存时会备份为 .bak");
+    }
 
     // 待定 F:CLI 直连(路径①)解析成功即视为「直连」,连接失败时 App 保留
     // stderr + exit(1)(可脚本化);无参(路径②)进 launcher,失败走窗口内提示。
@@ -65,6 +78,6 @@ fn main() {
         }
     };
 
-    let mut app = App::new(runtime, proxy, tofu, initial, cli_direct);
+    let mut app = App::new(runtime, proxy, known_hosts, initial, cli_direct);
     event_loop.run_app(&mut app).expect("run_app");
 }

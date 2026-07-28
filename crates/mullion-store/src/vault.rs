@@ -186,7 +186,8 @@ impl Vault {
 }
 
 /// tmp + rename 原子写:防写到一半崩溃导致两文件 desync。
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+/// `known_hosts` 模块复用同一实现,故 `pub(crate)`。
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes)?;
     if let Err(e) = fs::rename(&tmp, path) {

@@ -153,6 +153,23 @@
   `unsafe impl Send`(只存 raw handle),跨线程带 owner 正是 rfd `AsyncFileDialog` 的内部做法。
 - **egui repaint 不得绕过帧率闸(T3/T7)。** 取 `viewport_output[ROOT].repaint_delay` 并进
   既有 `next_frame_at`/`WaitUntil` 排期,受 `FrameLimiter` 上限;别在渲染完原地 request_redraw。
+- **`EventLoopProxy` 只有 `Send`,没有 `Sync`。** 把 `EventLoopProxy<UserEvent>` 直接放进要做成
+  `Arc<dyn Trait>` 的结构体,编译报 `EventLoopProxy<UserEvent> cannot be shared between threads
+  safely`。**规则**:winit 0.30 的 `platform_impl::EventLoopProxy` 内部是个 `Sender`,只
+  `unsafe impl<T: Send> Send`,没有 `Sync`。要跨线程共享就包一层 `std::sync::Mutex`
+  (`Mutex<T>: Sync where T: Send`),锁只在 `send_event` 那一瞬持有,**绝不跨 `.await`**。
+  守护:`host_key::PromptingPolicy`(它必须满足 `HostKeyPolicy: Send + Sync`,bound 写在
+  `mullion-ssh/src/known_hosts.rs` 的 trait 定义上)。
+- **弹窗承载「安全决策」时不要给关闭按钮。** F3 主机密钥确认弹窗背后是握手线程正挂在
+  `oneshot::Receiver` 上等回答;若窗口能被"什么都不做"地关掉,用户会以为「关掉 = 什么都没
+  发生」,而握手会一直挂到 sshd 的 `LoginGraceTime`(默认 120s)才被对端掐断,期间 UI 看起来
+  毫无反应。**规则**:`ui::host_key::show` 用 `egui::Modal`(而非 `egui::Window`)—— `Modal`
+  本身不提供 `.open()`/关闭按钮这一构造,阻塞下层点击(点遮罩、按 Esc 都不会关闭它),只有
+  两个显式动作按钮会给 `reply` 赋值;即便如此,`PromptingPolicy::decide` 侧仍按 fail-closed
+  兜底 —— sender 被丢弃(GUI 退出/旧弹窗被新弹窗顶掉)或事件发送失败,`rx.await` 都返回非
+  `Ok(true)`,一律判 `HostKeyDecision::Reject`,绝不「送不到就放行」。
+  守护:`ui::host_key::show` 不带 `.open()`;`host_key::tests::dropped_sender_is_rejected`、
+  `host_key::tests::send_event_failure_is_rejected`。
 
 ## 字体
 

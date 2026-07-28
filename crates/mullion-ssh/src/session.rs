@@ -10,6 +10,8 @@ use tokio::sync::mpsc;
 
 use crate::config::{AuthMethod, SshConfig};
 use crate::error::{classify_tcp, ConnectError};
+#[cfg(test)]
+use crate::known_hosts::HostKeyFuture;
 use crate::known_hosts::{Fingerprint, HostKeyDecision, HostKeyOutcome, HostKeyPolicy};
 
 /// russh 客户端 Handler:只负责主机密钥校验(TOFU,F3)。
@@ -27,10 +29,16 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
         let fp = Fingerprint::from_public_key(key);
-        match self.policy.decide(&self.host, &fp) {
+        // 算法名给上层弹窗展示;只承诺指纹与 `ssh-keygen -lf` 第二列同格式可核对——
+        // algo 是协议 wire 名(如 "ssh-ed25519"),`ssh-keygen -lf` 展示的是括号里的
+        // 短名(如 "(ED25519)"),两者不同,不该让用户逐字比对 algo。
+        let algo = key.algorithm().to_string();
+        // 弹窗策略会在这里挂起,等用户回答——sshd 的 LoginGraceTime(默认 120s)
+        // 是这里能等多久的上限,超时对端会直接断开。
+        match self.policy.decide(&self.host, &algo, &fp).await {
             HostKeyDecision::Accept => Ok(true),
             HostKeyDecision::Reject(o) => {
-                *self.outcome.lock().expect("outcome poisoned") = Some(o);
+                *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
                 Ok(false) // russh 据此中止握手
             }
         }
@@ -309,5 +317,132 @@ mod tests {
             "rsa-sha2-512",
             "RSA 公钥退化成了废弃算法(SHA-1),现代 sshd 会拒(F1)"
         );
+    }
+
+    struct AlwaysAccept;
+    impl HostKeyPolicy for AlwaysAccept {
+        fn decide<'a>(
+            &'a self,
+            _host: &'a str,
+            _algo: &'a str,
+            _fp: &'a Fingerprint,
+        ) -> HostKeyFuture<'a> {
+            Box::pin(std::future::ready(HostKeyDecision::Accept))
+        }
+    }
+
+    /// 故意在回答前 yield 一次:证明 `check_server_key` 真的 await 得下去,
+    /// 而不是只在「策略立刻就绪」的情况下碰巧能跑(弹窗版一定不是立刻就绪)。
+    struct RejectAfterYield;
+    impl HostKeyPolicy for RejectAfterYield {
+        fn decide<'a>(
+            &'a self,
+            host: &'a str,
+            _algo: &'a str,
+            fp: &'a Fingerprint,
+        ) -> HostKeyFuture<'a> {
+            let outcome = HostKeyOutcome::Unknown {
+                host: host.to_owned(),
+                got: fp.clone(),
+            };
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                HostKeyDecision::Reject(outcome)
+            })
+        }
+    }
+
+    use russh::client::Handler as _;
+
+    fn handler(
+        policy: Arc<dyn HostKeyPolicy>,
+    ) -> (ClientHandler, Arc<Mutex<Option<HostKeyOutcome>>>) {
+        let outcome = Arc::new(Mutex::new(None));
+        (
+            ClientHandler {
+                host: "h".into(),
+                policy,
+                outcome: outcome.clone(),
+            },
+            outcome,
+        )
+    }
+
+    fn test_pubkey() -> ssh_key::PublicKey {
+        russh::keys::load_secret_key("tests/fixtures/client_key", None)
+            .unwrap()
+            .public_key()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn policy_accept_completes_handshake() {
+        let (mut h, outcome) = handler(Arc::new(AlwaysAccept));
+        assert!(h.check_server_key(&test_pubkey()).await.unwrap());
+        assert!(outcome.lock().unwrap().is_none(), "放行不该记拒绝原因");
+    }
+
+    #[tokio::test]
+    async fn policy_reject_aborts_handshake_and_records_reason() {
+        // F3:策略拒绝必须让 russh 中止握手(Ok(false)),并把原因留给 establish
+        // 翻译成可操作错误——否则用户只看到一句无从下手的传输错误。
+        let (mut h, outcome) = handler(Arc::new(RejectAfterYield));
+        assert!(!h.check_server_key(&test_pubkey()).await.unwrap());
+        assert!(matches!(
+            outcome.lock().unwrap().take(),
+            Some(HostKeyOutcome::Unknown { .. })
+        ));
+    }
+
+    /// 记下策略实际收到的 algo:参数顺序写反 / 误传 host 都会在这里暴露。
+    /// 这个字符串将来要显示在 F3 确认弹窗上给用户核对,不能是错的。
+    struct RecordAlgo(Arc<Mutex<Option<String>>>);
+    impl HostKeyPolicy for RecordAlgo {
+        fn decide<'a>(
+            &'a self,
+            _host: &'a str,
+            algo: &'a str,
+            _fp: &'a Fingerprint,
+        ) -> HostKeyFuture<'a> {
+            *self.0.lock().unwrap() = Some(algo.to_owned());
+            Box::pin(std::future::ready(HostKeyDecision::Accept))
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_receives_the_real_key_algorithm_name() {
+        let seen = Arc::new(Mutex::new(None));
+        let (mut h, _) = handler(Arc::new(RecordAlgo(seen.clone())));
+        h.check_server_key(&test_pubkey()).await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("ssh-ed25519"));
+    }
+
+    struct AlwaysChanged;
+    impl HostKeyPolicy for AlwaysChanged {
+        fn decide<'a>(
+            &'a self,
+            host: &'a str,
+            _algo: &'a str,
+            fp: &'a Fingerprint,
+        ) -> HostKeyFuture<'a> {
+            let outcome = HostKeyOutcome::Changed {
+                host: host.to_owned(),
+                expected: fp.clone(),
+                got: fp.clone(),
+            };
+            Box::pin(std::future::ready(HostKeyDecision::Reject(outcome)))
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_reject_changed_also_aborts_and_records_changed() {
+        // F3 红线:指纹变更这条路径必须与 Unknown 一样中止握手并留下原因,
+        // 否则 establish 翻译不出「疑似中间人」那句可操作的错误。
+        let (mut h, outcome) = handler(Arc::new(AlwaysChanged));
+        assert!(!h.check_server_key(&test_pubkey()).await.unwrap());
+        assert!(matches!(
+            outcome.lock().unwrap().take(),
+            Some(HostKeyOutcome::Changed { .. })
+        ));
     }
 }

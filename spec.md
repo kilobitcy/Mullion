@@ -74,6 +74,7 @@ Mullion 的赌注是：**这个交集市场没人做，而它正在快速变大*
 | F1 | SSH 密码 / 公钥 / ssh-agent 认证 | P0 | 三种方式各有一个针对真实 sshd 容器的集成测试 |
 | F2 | 导入 `~/.ssh/config`（Host / HostName / Port / User / IdentityFile / ProxyJump） | P0 | 给定 fixture config，解析结果与预期 struct 相等 |
 | F3 | TOFU 主机密钥校验：首次记录指纹，变更时拦截并弹窗 | P0 | 指纹不匹配时连接必须失败；单测断言 `verify()` 返回 false |
+| F3-a | `known_hosts` 的 key 采用 OpenSSH 的 `[host]:port` 形式（端口为 22 时省略方括号只写 `host`） | P2 | 单测：同主机名不同端口是两条独立记录；旧的裸 `host` 记录仍能读出（迁移兼容）。**现状（v0.1.7）key 只用主机名，同主机换端口会误报「密钥已变更」** |
 | F4 | SOCKS5 / HTTP CONNECT 代理，含带认证的 | P0 | 对本地 mock 代理的集成测试 |
 | F5 | 跳板机（ProxyJump），支持跳板机本身在代理后面 | P1 | 两跳链路集成测试 |
 | F6 | 连接失败时给出**可操作**的错误（区分 DNS 失败 / 拒绝连接 / 认证失败 / 主机密钥变更） | P0 | 每类错误对应一条独立的错误枚举，不允许统一 "connection failed" |

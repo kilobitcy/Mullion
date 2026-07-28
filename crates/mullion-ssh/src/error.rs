@@ -36,10 +36,6 @@ pub(crate) fn classify_tcp(e: std::io::Error) -> ConnectError {
     }
 }
 
-fn hex(fp: &Fingerprint) -> String {
-    fp.0.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -55,11 +51,15 @@ impl fmt::Display for ConnectError {
             } => write!(
                 f,
                 "主机 {host} 的密钥已变更(疑似中间人,已拦截):记录 {} → 收到 {}",
-                hex(expected),
-                hex(got)
+                expected.to_ssh_string(),
+                got.to_ssh_string()
             ),
             ConnectError::HostKeyUnknown { host, got } => {
-                write!(f, "首次连接 {host},指纹 {} 未记录,需确认(TOFU)", hex(got))
+                write!(
+                    f,
+                    "首次连接 {host},指纹 {} 未记录,需确认(TOFU)",
+                    got.to_ssh_string()
+                )
             }
             ConnectError::Io(e) => write!(f, "网络 IO 错误:{e}"),
             ConnectError::PtyRequest => write!(f, "开 PTY 失败 —— 对端可能不允许 PTY"),

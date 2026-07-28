@@ -3,11 +3,13 @@
 
 pub mod crypto;
 pub mod error;
+pub mod known_hosts;
 pub mod master_key;
 pub mod model;
 pub mod vault;
 
 pub use error::StoreError;
+pub use known_hosts::{HostKeyEntry, KnownHostsFile};
 pub use master_key::{InMemoryKey, KeyringSource, MasterKeySource};
 pub use model::{AuthKind, Protocol, SecretEntry, SessionId, SessionRecord};
 pub use vault::{SessionDraft, Vault};

@@ -4,6 +4,8 @@
 //! - T5/F15:按住 Shift 强制走本地划选(鼠标不上报),否则 `/tui fullscreen` 下无法复制。
 //! - T6/F14:Shift+Enter 两套编码(Kitty → CSI-u;否则 → `ESC CR`);Ctrl+J 恒 `\n`。
 
+use alacritty_terminal::term::TermMode;
+
 /// 修饰键状态。骨架只覆盖编码用得到的四个。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Mods {
@@ -15,7 +17,7 @@ pub struct Mods {
 }
 
 /// 可编码的按键。覆盖 shell/tmux/Claude Code 日常所需的常用键;
-/// 功能键(F1..)、Home/End/PageUp/Down 等后续再扩。
+/// 功能键(F1..)、Home/End 等后续再扩。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Enter,
@@ -32,6 +34,9 @@ pub enum Key {
     Down,
     Left,
     Right,
+    /// 翻页键。裸键转发对端;Shift+PageUp/Down 由 app 截住做本地回溯(F17)。
+    PageUp,
+    PageDown,
 }
 
 /// 把一次按键编码成发往对端的字节。
@@ -56,6 +61,8 @@ pub fn encode_key(key: Key, mods: Mods, kitty: bool) -> Vec<u8> {
         Key::Down => b"\x1b[B".to_vec(),
         Key::Right => b"\x1b[C".to_vec(),
         Key::Left => b"\x1b[D".to_vec(),
+        Key::PageUp => b"\x1b[5~".to_vec(),
+        Key::PageDown => b"\x1b[6~".to_vec(),
     }
 }
 
@@ -105,9 +112,139 @@ pub fn mouse_should_report(mods: Mods, capture_on: bool) -> bool {
     capture_on
 }
 
+/// 一次滚轮滚动的处置(F17 §3.2 三档分流)。
+///
+/// 之所以要分档:alt screen(tmux/vim)在 alacritty 里恒 0 行本地历史,
+/// 本地回溯拿不到任何东西,只能把滚轮转成对端认识的东西。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelAction {
+    /// 本地回溯 scrollback。`lines` 正数 = 往历史(向上)。
+    LocalScroll { lines: i32 },
+    /// 上报给对端。`col`/`row` 是 1-based 单元格坐标。
+    Report {
+        button: u8,
+        col: u16,
+        row: u16,
+        sgr: bool,
+        /// 连发次数(一次滚轮可能等于多行)。
+        count: u16,
+    },
+    /// 退化成方向键连发(DECSET 1007 / ALTERNATE_SCROLL)。
+    ArrowKeys { up: bool, count: u16 },
+    /// 什么都不做。
+    None,
+}
+
+/// 单次滚轮事件允许上报/退化成方向键的最大连发次数。
+///
+/// `WheelAction::Report`/`ArrowKeys` 的 `count` 字段是 `u16`;修改前这里直接用
+/// `lines.unsigned_abs().min(u16::MAX as u32)` 夹到 `u16::MAX`(65535)——类型上限
+/// 够不出错,但语义上离谱:一次物理滚轮/触控板动作正常也就是个位数到几十行,
+/// 高延迟链路上一次异常大的增量(如触控板惯性滚动被系统放大,或未来接入更高
+/// 精度设备)若真顶到 6 万多,app 层会据此重复发送同一段字节六万多遍,瞬间把
+/// 对端刷爆。这个常量把上限收紧到贴近真实物理动作的量级。`LocalScroll` 不受
+/// 此限——本地回溯不发字节,无害,而且用户可能用惯性滚动一次翻很远,不该被夹。
+const MAX_WHEEL_REPORTS: u16 = 64;
+
+/// 滚轮分流决策(F17)。纯函数,可脱离窗口单测。
+///
+/// `lines` 正数 = 向上(往历史);`cell` 是鼠标所在的 1-based 单元格 `(col, row)`。
+///
+/// 顺序不能换:Shift 恒优先(T5 同源逃生门,用户必须永远能读历史),
+/// 然后才轮到 alt screen 判定。
+///
+/// 与上游 alacritty 的两处刻意偏离(读代码前先看,别拿"对齐上游"当理由改掉):
+///
+/// - **Shift 逃生门是本项目自己扩的,上游没有。** 上游 `scroll_terminal`
+///   (`alacritty/src/input/mod.rs:760-825`)在进入鼠标上报分支之前完全不看 Shift,
+///   `shift_key()` 只出现在更下面的方向键退化分支里——也就是说真实 alacritty 的
+///   滚轮上报不受 Shift 影响。这里的 `shift ||` 是我们为 T5 刻意加的:让用户只需
+///   记住一条规则「按住 Shift 就能读历史」。**不要**以「和 alacritty 对齐」为由
+///   删掉它,那会让全屏 TUI 下永远读不到历史。
+/// - **Ctrl/Alt 修饰位不透传,是有意简化,不是漏写。** 上游 `mouse_report`
+///   (`alacritty/src/input/mod.rs:541-568`)会把 `shift→+4 / alt→+8 / ctrl→+16`
+///   叠加到 button 上;这里的 `Report.button` 永远不含修饰位(签名只收
+///   `shift: bool`,且 Shift 已被逃生门吃掉,不会走到这一步)。设计文档 §3.2
+///   的签名就是这样定的,后果是 Ctrl+滚轮加速翻页这类用法在对端不可见。
+pub fn wheel_action(mode: TermMode, shift: bool, lines: i32, cell: (u16, u16)) -> WheelAction {
+    if lines == 0 {
+        return WheelAction::None;
+    }
+    if shift || !mode.contains(TermMode::ALT_SCREEN) {
+        return WheelAction::LocalScroll { lines };
+    }
+    let up = lines > 0;
+    let count = lines.unsigned_abs().min(MAX_WHEEL_REPORTS as u32) as u16;
+    if mode.intersects(TermMode::MOUSE_MODE) {
+        return WheelAction::Report {
+            // SGR/X10 通用:滚轮上=64,下=65。
+            button: if up { 64 } else { 65 },
+            col: cell.0,
+            row: cell.1,
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+            count,
+        };
+    }
+    if mode.contains(TermMode::ALTERNATE_SCROLL) {
+        return WheelAction::ArrowKeys { up, count };
+    }
+    WheelAction::None
+}
+
+/// 把一次滚轮上报编码成字节。
+///
+/// SGR(DECSET 1006):`CSI < b ; col ; row M`,坐标无上限。
+/// X10(传统):`CSI M (b+32) (col+32) (row+32)`,每字段一字节,故最大 223;
+/// 超出必须夹紧,否则加 32 后溢出成完全不同的坐标。
+///
+/// 与上游不同的取舍:上游 `normal_mouse_report`
+/// (`alacritty/src/input/mod.rs:572-580`)在坐标 `>= 223` 时是 `return;`——
+/// 整帧丢弃,什么都不发。这里选择夹紧到边界继续发,是有意取舍:宁可给对端一个
+/// 近似(错误)的位置,也不让这次滚动完全消失。代价是远处的滚轮事件会被
+/// 对端误判成落在边界单元格上。
+pub fn encode_wheel_report(button: u8, col: u16, row: u16, sgr: bool) -> Vec<u8> {
+    if sgr {
+        format!("\x1b[<{button};{col};{row}M").into_bytes()
+    } else {
+        let clamp = |v: u16| (v.min(223) as u8) + 32;
+        vec![
+            0x1b,
+            b'[',
+            b'M',
+            button.saturating_add(32),
+            clamp(col),
+            clamp(row),
+        ]
+    }
+}
+
+/// 把 `WheelAction::ArrowKeys` 的一次方向退化编码成字节。
+///
+/// **故意是 SS3(`ESC O A`/`ESC O B`),不是 `encode_key(Key::Up/Down, ..)` 的
+/// CSI(`ESC [ A`/`ESC [ B`)。** 依据三点:
+/// 1. 上游 alacritty 的同一分支(`alacritty/src/input/mod.rs` `scroll_terminal`,
+///    `ALT_SCREEN | ALTERNATE_SCROLL` 且无鼠标模式时的退化)无条件写
+///    `0x1b, b'O', line_cmd`,不查 `APP_CURSOR`/DECCKM——`fn scroll_terminal`
+///    在第 760 行,`ALTERNATE_SCROLL` 分支在 799-819 行,`push(b'O')` 在 810/816 行
+///    (2026-07 对照 alacritty/alacritty master 分支核实)。
+/// 2. 标准 xterm terminfo 的 `kcuu1=\EOA`(应用光标键 SS3),`less`/`man` 等按
+///    terminfo 认键;发 CSI 形式它们不认得,滚轮在这些程序里会静默失效。
+/// 3. 与 `encode_key` 里普通方向键的 CSI 编码**刻意不共用**——那条路径服务
+///    「裸方向键转发给对端自己处理」,这里服务「滚轮退化成方向键给不认鼠标协议
+///    的全屏程序」,语义不同,场景不同,不应该因为字节像就合并。
+///
+/// 和 `encode_key` 一样,这条路径也不追踪 DECCKM(与上游一致,上游本就不查)。
+pub fn encode_wheel_arrow(up: bool) -> Vec<u8> {
+    vec![0x1b, b'O', if up { b'A' } else { b'B' }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alt(extra: TermMode) -> TermMode {
+        TermMode::ALT_SCREEN | extra
+    }
 
     fn shift() -> Mods {
         Mods {
@@ -183,6 +320,15 @@ mod tests {
     }
 
     #[test]
+    fn page_keys_are_csi_tilde_sequences() {
+        // F17:裸 PageUp/PageDown 照旧转发给对端(tmux/less 自己有翻页);
+        // Shift+PageUp 由 app 层截住做本地回溯,不走编码。
+        let m = Mods::default();
+        assert_eq!(encode_key(Key::PageUp, m, false), b"\x1b[5~".to_vec());
+        assert_eq!(encode_key(Key::PageDown, m, false), b"\x1b[6~".to_vec());
+    }
+
+    #[test]
     fn shift_blocks_mouse_report_so_user_can_copy() {
         // T5/F15:捕获开启时按住 Shift 也不上报,用户才能划选复制。
         assert!(!mouse_should_report(shift(), true));
@@ -196,5 +342,171 @@ mod tests {
     #[test]
     fn mouse_silent_when_capture_off() {
         assert!(!mouse_should_report(Mods::default(), false));
+    }
+
+    #[test]
+    fn shift_forces_local_scroll_so_user_can_read_history() {
+        // T5 同源逃生门:即便对端开了鼠标上报,按住 Shift 也必须走本地回溯,
+        // 否则 tmux/Claude Code 全屏下用户永远看不到刷过去的历史。
+        let m = alt(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE);
+        assert_eq!(
+            wheel_action(m, true, 3, (10, 5)),
+            WheelAction::LocalScroll { lines: 3 }
+        );
+    }
+
+    #[test]
+    fn primary_screen_wheel_scrolls_locally() {
+        // 非 alt screen(普通 shell):滚轮永远是本地回溯。
+        assert_eq!(
+            wheel_action(TermMode::default(), false, -3, (1, 1)),
+            WheelAction::LocalScroll { lines: -3 }
+        );
+    }
+
+    #[test]
+    fn alt_screen_with_mouse_mode_reports_sgr() {
+        let m = alt(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE);
+        assert_eq!(
+            wheel_action(m, false, 2, (12, 34)),
+            WheelAction::Report {
+                button: 64,
+                col: 12,
+                row: 34,
+                sgr: true,
+                count: 2
+            }
+        );
+        // 向下滚 → button 65。
+        assert_eq!(
+            wheel_action(m, false, -1, (12, 34)),
+            WheelAction::Report {
+                button: 65,
+                col: 12,
+                row: 34,
+                sgr: true,
+                count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn alt_screen_without_mouse_falls_back_to_arrow_keys() {
+        // tmux 不开鼠标模式时的常见场景:DECSET 1007 允许把滚轮当方向键,
+        // 这样 less/man 之类还能翻页,而不是滚轮完全没反应。
+        let m = alt(TermMode::ALTERNATE_SCROLL);
+        assert_eq!(
+            wheel_action(m, false, 3, (1, 1)),
+            WheelAction::ArrowKeys { up: true, count: 3 }
+        );
+    }
+
+    #[test]
+    fn alt_screen_without_alternate_scroll_does_nothing() {
+        // 对端明确关了 1007 且不收鼠标 → 什么都别发,乱发方向键会误操作。
+        assert_eq!(
+            wheel_action(alt(TermMode::NONE), false, 3, (1, 1)),
+            WheelAction::None
+        );
+        // 零增量恒 None。
+        assert_eq!(
+            wheel_action(TermMode::default(), false, 0, (1, 1)),
+            WheelAction::None
+        );
+    }
+
+    #[test]
+    fn wheel_report_encoding_matches_sgr_and_x10() {
+        assert_eq!(
+            encode_wheel_report(64, 12, 34, true),
+            b"\x1b[<64;12;34M".to_vec()
+        );
+        assert_eq!(
+            encode_wheel_report(64, 12, 34, false),
+            vec![0x1b, b'[', b'M', 96, 44, 66]
+        );
+        // X10 每个字段最多 223(255-32),超出必须夹紧,否则字节溢出成乱码。
+        assert_eq!(
+            encode_wheel_report(64, 500, 500, false),
+            vec![0x1b, b'[', b'M', 96, 255, 255]
+        );
+    }
+
+    #[test]
+    fn alt_screen_without_sgr_reports_x10() {
+        // 只开 MOUSE_REPORT_CLICK、不开 SGR_MOUSE 是真实存在的组合(老式终端/
+        // 未协商 1006 的对端)。sgr 字段必须如实置 false,否则调用方会按 SGR
+        // 语法编码,发出的字节协议对端根本认不出来。
+        let m = alt(TermMode::MOUSE_REPORT_CLICK);
+        assert_eq!(
+            wheel_action(m, false, 2, (12, 34)),
+            WheelAction::Report {
+                button: 64,
+                col: 12,
+                row: 34,
+                sgr: false,
+                count: 2
+            }
+        );
+    }
+
+    #[test]
+    fn huge_wheel_delta_is_clamped_to_max_reports() {
+        // 异常大的 lines(如系统放大过的触控板增量)不能原样透传成 count——
+        // 那会让 app 层把同一段字节重复几万遍,瞬间把对端刷爆(附加项复核)。
+        let m = alt(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE);
+        assert_eq!(
+            wheel_action(m, false, 50_000, (1, 1)),
+            WheelAction::Report {
+                button: 64,
+                col: 1,
+                row: 1,
+                sgr: true,
+                count: MAX_WHEEL_REPORTS,
+            }
+        );
+        let arrow_mode = alt(TermMode::ALTERNATE_SCROLL);
+        assert_eq!(
+            wheel_action(arrow_mode, false, -50_000, (1, 1)),
+            WheelAction::ArrowKeys {
+                up: false,
+                count: MAX_WHEEL_REPORTS,
+            }
+        );
+    }
+
+    #[test]
+    fn max_wheel_reports_is_a_sane_small_number() {
+        // 这个常量的用途是防止「一次异常大的滚轮增量」把对端刷爆——它必须钉在
+        // 「一次物理滚轮/触控板动作的合理量级」(个位数到几十行),而不能被悄悄
+        // 改成一个形同虚设的大数(比如把 64 改成 640,上面 clamp 机制的测试
+        // 照样绿,但防刷爆的实际效果就没了)。clippy 认为对 const 值断言是
+        // 「值恒定,断言无意义」,用 const 块把它变成编译期检查,意图不变。
+        const { assert!(MAX_WHEEL_REPORTS <= 100) };
+    }
+
+    #[test]
+    fn encode_wheel_arrow_is_ss3_not_csi() {
+        // SS3(ESC O A/B),不是 encode_key(Key::Up/Down,..) 的 CSI(ESC [ A/B)——
+        // 依据见 encode_wheel_arrow 文档注释(上游 alacritty scroll_terminal 无条件
+        // 写 0x1b,b'O',line_cmd;xterm terminfo kcuu1=\EOA;less/man 只认 SS3)。
+        // 期望值直接从这两条协议依据推导,不是跑一遍实现拿回填值。
+        assert_eq!(encode_wheel_arrow(true), vec![0x1b, b'O', b'A']);
+        assert_eq!(encode_wheel_arrow(false), vec![0x1b, b'O', b'B']);
+    }
+
+    #[test]
+    fn alt_screen_arrow_keys_handles_scroll_down() {
+        // 上面的 alt_screen_without_mouse_falls_back_to_arrow_keys 只测了向上
+        // (up: true);向下滚是同样常见的真实路径,若 up 字段的取值逻辑被
+        // 悄悄改坏(例如符号判断反了),这条分支之前完全没有测试能抓到。
+        let m = alt(TermMode::ALTERNATE_SCROLL);
+        assert_eq!(
+            wheel_action(m, false, -2, (1, 1)),
+            WheelAction::ArrowKeys {
+                up: false,
+                count: 2
+            }
+        );
     }
 }

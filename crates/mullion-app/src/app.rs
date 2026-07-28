@@ -3,13 +3,16 @@
 //! 「排空 rx → feed emu → 回写 PtyWrite(T1)」,GPU present 受帧率(T3)与同步块(T2)双闸。
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use mullion_core::layout::PaneId;
 use mullion_ssh::config::SshConfig;
-use mullion_ssh::known_hosts::{HostKeyPolicy, TofuAccept};
+use mullion_ssh::known_hosts::HostKeyPolicy;
 use mullion_ssh::session::SshSession;
+use mullion_store::known_hosts::{HostKeyEntry, KnownHostsFile};
+use mullion_term::keymap::{Key, WheelAction};
+use mullion_term::Scroll;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Receiver;
 use winit::application::ApplicationHandler;
@@ -40,6 +43,10 @@ pub enum UserEvent {
     /// 私钥文件对话框结束。`None` = 用户取消/对话框失败——也要回送,否则
     /// `key_picker_busy` 永远清不掉,以后再点「选择…」就没反应了。
     KeyPathPicked(Option<PathBuf>),
+    /// 主机密钥需要用户确认(F3)。握手线程正挂在 `reply` 上等回答,
+    /// **必须**最终发一个 bool 回去或丢弃 sender(丢弃 = 拒绝,fail-closed)。
+    /// `Box` 是因为 `HostKeyPrompt` 比其余变体大得多,不装箱会撑大整个枚举。
+    HostKeyPrompt(Box<crate::host_key::HostKeyPrompt>),
 }
 
 /// 窗口出现后才建的 GPU 相关状态。
@@ -77,8 +84,15 @@ pub struct App {
     next_frame_at: Option<Instant>,
     /// 唤醒/连接结果回送通道(注入 `session::connect` 的 wake,以及本身发 UserEvent)。
     proxy: EventLoopProxy<UserEvent>,
-    /// TOFU 主机密钥策略,跨多次 connect 共用同一份内存记录(切片 A2 不做 F3 持久化)。
-    tofu: Arc<TofuAccept>,
+    /// 已知主机指纹表(F3),对应磁盘 `known_hosts.toml`。SSH 线程只读它做判断;
+    /// **写入与落盘只在 GUI 线程的意图施加点做**——store 是同步 IO,不该压在
+    /// tokio 线程上,而且失败要能落进 `ui.last_error` 给用户看。
+    known_hosts: Arc<Mutex<KnownHostsFile>>,
+    /// 正在等用户回答的主机密钥弹窗。`Some` = 弹窗开着、SSH 握手挂起中,
+    /// 同时也计入 `window_event` 里的 `modal`(T8:弹窗开着时键盘归 egui)。
+    pending_host_key: Option<Box<crate::host_key::HostKeyPrompt>>,
+    /// 弹窗弹出的时刻,用于展示 sshd `LoginGraceTime`(默认 120s)倒计时。
+    host_key_since: Option<Instant>,
     /// CLI 直连(`mullion user@host`)携带的初始连接参数;`resumed` 里取走后即为 None。
     initial: Option<SshConfig>,
     /// 是否走 CLI 直连路径(路径①)。决定 `ConnectErr` 时是否保留 `exit(1)`(待定 F)。
@@ -101,6 +115,9 @@ pub struct App {
     /// 两个独立脏源,`frame::frame_is_dirty` 取并集——只看终端字节的话,远端一安静
     /// egui 的交互就被 `RedrawAction::Idle` 吞掉,菜单点不开。
     ui_dirty: bool,
+    /// 指针最近一次的物理像素坐标。`MouseWheel` 事件本身不带坐标,鼠标上报
+    /// (F17 alt screen 档)要的 (col,row) 只能靠 `CursorMoved` 记着。
+    cursor_px: (f32, f32),
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -111,7 +128,7 @@ impl App {
     pub fn new(
         runtime: Runtime,
         proxy: EventLoopProxy<UserEvent>,
-        tofu: Arc<TofuAccept>,
+        known_hosts: Arc<Mutex<KnownHostsFile>>,
         initial: Option<SshConfig>,
         cli_direct: bool,
     ) -> Self {
@@ -125,7 +142,9 @@ impl App {
             limiter: FrameLimiter::new(16), // ~60fps(T3)
             next_frame_at: None,
             proxy,
-            tofu,
+            known_hosts,
+            pending_host_key: None,
+            host_key_since: None,
             initial,
             cli_direct,
             ui: crate::ui::UiState::default(),
@@ -133,6 +152,7 @@ impl App {
             visible: shell::window_state::Visibility::default(),
             key_picker_busy: false,
             ui_dirty: true, // 首帧必须画出来
+            cursor_px: (0.0, 0.0),
         }
     }
 
@@ -232,7 +252,12 @@ impl App {
     fn spawn_connect(&self, cfg: SshConfig) {
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
-        let policy: Arc<dyn HostKeyPolicy> = self.tofu.clone();
+        // 每次连接现建一个策略:它只持有两个 Arc/Sender 的克隆,构造成本可忽略,
+        // 换来 App 不必长期持有一个 dyn 对象。
+        let policy: Arc<dyn HostKeyPolicy> = Arc::new(crate::host_key::PromptingPolicy::new(
+            self.known_hosts.clone(),
+            self.proxy.clone(),
+        ));
         self._runtime.spawn(async move {
             let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 let _ = wake_proxy.send_event(UserEvent::Wake);
@@ -410,6 +435,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.request_ui_redraw();
             }
+            UserEvent::HostKeyPrompt(prompt) => {
+                crate::logx::line(&format!(
+                    "主机密钥待确认: {} ({}), 变更={}",
+                    prompt.host,
+                    prompt.algo,
+                    prompt.previous.is_some()
+                ));
+                // 前一个弹窗还没回答就又来一个(用户连点两次连接):丢掉旧 prompt,
+                // 它的 sender 随之析构 → 旧那条握手被拒(fail-closed),不会有
+                // 两个窗叠在一起、也不会有连接偷偷放行。
+                self.host_key_since = Some(Instant::now());
+                self.pending_host_key = Some(prompt);
+                self.request_ui_redraw();
+            }
             UserEvent::ConnectErr(msg) => {
                 // 待定 F:CLI 直连从未成功连过时,保留可脚本化的 exit(1) 语义;
                 // launcher 态(或已连过又断开)只记错误,交 UI 展示(ui.last_error)。
@@ -439,7 +478,10 @@ impl ApplicationHandler<UserEvent> for App {
                     | WindowEvent::MouseWheel { .. }
                     | WindowEvent::CursorMoved { .. }
             );
-            let modal = self.ui.session_manager_open || self.ui.about_open || self.ui.editor_open;
+            let modal = self.ui.session_manager_open
+                || self.ui.about_open
+                || self.ui.editor_open
+                || self.pending_host_key.is_some();
             // 键盘归终端时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
             if is_kbd
                 && !shell::input_route::egui_should_see(
@@ -502,6 +544,60 @@ impl ApplicationHandler<UserEvent> for App {
                 crate::logx::line(&format!("ScaleFactorChanged({scale_factor})"));
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            // 指针坐标只在这里更新;滚轮上报要用(F17)。
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_px = (position.x as f32, position.y as f32);
+            }
+            // F17 滚轮三档分流。决策在 `mullion_term::keymap::wheel_action`(纯函数,
+            // 已单测),这里只做 winit 增量→行数、像素→单元格的换算与发送。
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let (Some(a), Some(conn)) = (self.active.as_ref(), self.conn.as_mut()) {
+                    let cell_px = (a.text.cell_w, a.text.cell_h);
+                    let lines = input::wheel_lines(delta, cell_px.1);
+                    let cell = input::cell_at(self.cursor_px, cell_px, a.grid_dims);
+                    let action = mullion_term::keymap::wheel_action(
+                        conn.pane.emulator.mode(),
+                        self.mods.shift_key(),
+                        lines,
+                        cell,
+                    );
+                    match action {
+                        WheelAction::LocalScroll { lines } => {
+                            conn.pane.emulator.scroll(Scroll::Delta(lines));
+                        }
+                        WheelAction::Report {
+                            button,
+                            col,
+                            row,
+                            sgr,
+                            count,
+                        } => {
+                            let one =
+                                mullion_term::keymap::encode_wheel_report(button, col, row, sgr);
+                            let mut bytes = Vec::with_capacity(one.len() * count as usize);
+                            for _ in 0..count {
+                                bytes.extend_from_slice(&one);
+                            }
+                            let _ = conn.ssh.write(bytes);
+                        }
+                        WheelAction::ArrowKeys { up, count } => {
+                            // SS3(`ESC O A/B`),不是 `encode_key` 的 CSI——见
+                            // `keymap::encode_wheel_arrow` 文档注释(对齐上游 alacritty
+                            // + xterm terminfo kcuu1,否则 less/man 认不出滚轮退化键)。
+                            let one = mullion_term::keymap::encode_wheel_arrow(up);
+                            let mut bytes = Vec::with_capacity(one.len() * count as usize);
+                            for _ in 0..count {
+                                bytes.extend_from_slice(&one);
+                            }
+                            let _ = conn.ssh.write(bytes);
+                        }
+                        WheelAction::None => {}
+                    }
+                }
+                // 本地回溯不产生新的终端字节,不标脏这一帧会被 frame_is_dirty 判 Idle
+                // 丢掉——滚了但画面不动。
+                self.request_ui_redraw();
+            }
             WindowEvent::Resized(size) => {
                 diag::mark(diag::Stage::Resize);
                 log::debug!(target: "mullion", "Resized({}x{})", size.width, size.height);
@@ -510,11 +606,27 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     if let Some((key, mods)) = input::translate_key(&event, self.mods) {
+                        // F17:Shift+PageUp/PageDown 是本地翻页,截住不转发对端
+                        // (裸 PageUp/PageDown 照旧转发,tmux/less 自己会翻)。
+                        if mods.shift && matches!(key, Key::PageUp | Key::PageDown) {
+                            let scroll = if matches!(key, Key::PageUp) {
+                                Scroll::PageUp
+                            } else {
+                                Scroll::PageDown
+                            };
+                            if let Some(conn) = self.conn.as_mut() {
+                                conn.pane.emulator.scroll(scroll);
+                            }
+                            self.request_ui_redraw();
+                            return;
+                        }
                         let bytes = mullion_term::keymap::encode_key(key, mods, self.kitty);
                         // `let _` 全文件都这样:写/resize 失败(断线等)没有用户提示、
                         // 无重连。断线感知与重连是 S3,后续 spec,这里不做。
                         // launcher 态(conn=None)没有终端可写,按键静默丢弃。
                         if let Some(conn) = self.conn.as_mut() {
+                            // F17:一按普通键就贴回底部,否则「打字了但看不到自己输入」。
+                            conn.pane.emulator.scroll_to_bottom();
                             let _ = conn.ssh.write(bytes);
                         }
                     }
@@ -576,6 +688,19 @@ impl ApplicationHandler<UserEvent> for App {
                             let sessions: &[mullion_store::SessionRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.list());
                             let store_available = self.store.is_some();
+                            // 借 self.pending_host_key / self.host_key_since 与下面
+                            // `&mut self.ui` 是不相干字段,可同时借出。
+                            let host_key_view = self.pending_host_key.as_deref().map(|p| {
+                                crate::ui::host_key::HostKeyView {
+                                    host: &p.host,
+                                    algo: &p.algo,
+                                    fingerprint: &p.fingerprint,
+                                    previous: p.previous.as_ref().map(|e| e.fingerprint.as_str()),
+                                    elapsed_secs: self
+                                        .host_key_since
+                                        .map_or(0, |t| t.elapsed().as_secs()),
+                                }
+                            });
                             let repaint_delay = render_frame(
                                 a,
                                 pane,
@@ -584,6 +709,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 store_available,
                                 connected,
                                 &status,
+                                host_key_view,
                             );
                             self.limiter.record_present(now);
                             // egui 侧已画出;下面若 egui 又要一帧会重新置脏。
@@ -700,6 +826,37 @@ impl ApplicationHandler<UserEvent> for App {
                         None => {}
                     }
                 }
+                // F3:主机密钥弹窗的回答。record + save 必须在 GUI 线程做——
+                // store 是同步 IO,而且失败要能落进 last_error 让用户看见。
+                if let Some(accept) = self.ui.host_key_reply.take() {
+                    if let Some(prompt) = self.pending_host_key.take() {
+                        self.host_key_since = None;
+                        if accept {
+                            diag::mark(diag::Stage::StoreIo);
+                            // 与 host_key.rs 同源:GUI 线程 panic 比 tokio 线程更糟
+                            // (直接崩窗口),锁中毒时恢复而不是 expect。
+                            let mut kh = self.known_hosts.lock().unwrap_or_else(|e| e.into_inner());
+                            kh.record(
+                                &prompt.host,
+                                HostKeyEntry {
+                                    algo: prompt.algo.clone(),
+                                    fingerprint: prompt.fingerprint.clone(),
+                                },
+                            );
+                            // 落盘失败不阻断本次连接:指纹已在内存表里,连接照常;
+                            // 代价只是下次启动会再问一遍。last_error 的展示位可能
+                            // 随后被别的事件(如 ConnectOk 关掉会话管理器)挪走,
+                            // 磁盘日志(ADR-008)是这类静默失败的兜底取证手段。
+                            if let Err(e) = kh.save() {
+                                crate::logx::line(&format!("主机指纹落盘失败:{e}"));
+                                self.ui.last_error =
+                                    Some(format!("主机指纹未能保存:{e}(本次连接不受影响)"));
+                            }
+                        }
+                        // 送回握手线程。Err = 对端已走(超时/断开),没什么可做的。
+                        let _ = prompt.reply.send(accept);
+                    }
+                }
             }
             _ => {}
         }
@@ -724,6 +881,7 @@ impl ApplicationHandler<UserEvent> for App {
 /// 一帧渲染:先跑 egui(菜单栏 + 状态栏,§4.2),再(终端态时)叠加背景色块 + 文字
 /// 前景趟。返回 egui 想要的下次重绘时间(`Duration::MAX` = 不需要);调用方据此走
 /// T3/T7 的 `next_frame_at`/`WaitUntil`,不会无条件 `request_redraw`。GPU 胶水,无单测。
+#[allow(clippy::too_many_arguments)] // 计划(Task 9)明确要求的签名;拆结构体属于范围外重构。
 fn render_frame(
     a: &mut Active,
     pane: Option<&Pane>,
@@ -732,13 +890,22 @@ fn render_frame(
     store_available: bool,
     connected: bool,
     status: &str,
+    host_key: Option<crate::ui::host_key::HostKeyView<'_>>,
 ) -> std::time::Duration {
     diag::count_frame();
     // --- egui:每帧都跑,launcher 态(pane=None)也要画菜单/状态栏。---
     diag::mark(diag::Stage::EguiRun);
     let raw_input = a.egui_state.take_egui_input(&a.window);
     let full_output = a.egui_ctx.run(raw_input, |ctx| {
-        crate::ui::build_ui(ctx, ui_state, sessions, store_available, connected, status);
+        crate::ui::build_ui(
+            ctx,
+            ui_state,
+            sessions,
+            store_available,
+            connected,
+            status,
+            host_key,
+        );
     });
     a.egui_state
         .handle_platform_output(&a.window, full_output.platform_output);

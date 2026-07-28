@@ -1,5 +1,6 @@
 //! egui UI 构建,与 app 事件循环解耦。build_ui 每帧在 egui ctx.run 闭包里调。
 pub mod chrome;
+pub mod host_key;
 pub mod session_manager;
 
 use std::sync::Arc;
@@ -69,6 +70,10 @@ pub struct UiState {
     /// 点了「选择…」私钥文件 → app 事后另起线程开系统文件对话框(不能在
     /// egui 闭包里同步阻塞,那是在 winit 事件回调中间停掉整个事件循环)。
     pub pick_key_request: bool,
+
+    /// 主机密钥弹窗的回答(F3)。`Some(true)` = 接受;`Some(false)` = 取消连接。
+    /// 同样只承载意图:record + save + 回送 oneshot 都在 app.rs 施加点做。
+    pub host_key_reply: Option<bool>,
 }
 
 /// 每帧构建 UI:菜单栏(顶)+ 状态栏(底)+ 会话管理弹窗,之后把中央区剩余尺寸写回
@@ -81,9 +86,14 @@ pub fn build_ui(
     store_available: bool,
     connected: bool,
     status: &str,
+    host_key: Option<host_key::HostKeyView<'_>>,
 ) {
+    // 主机密钥确认最先画:它是安全关口,任何时候都该盖在最上层(F3)。
+    if let Some(view) = &host_key {
+        host_key::show(ctx, view, &mut ui_state.host_key_reply);
+    }
     chrome::top_menu(ctx, ui_state, connected);
-    chrome::status_bar(ctx, status);
+    chrome::status_bar(ctx, status, ui_state.last_error.as_deref());
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
         let mut open = ui_state.about_open;
