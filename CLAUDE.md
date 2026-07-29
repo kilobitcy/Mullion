@@ -178,7 +178,9 @@ cargo doc -p russh --open   # 或直接读 ~/.cargo/registry/src/**/russh-*/src/
    ```
    **Release 标题只能是纯版本号 `v0.1.N`**，不带破折号、不带一句话摘要、不带 emoji ——
    列表里要一眼扫清版本序列。想说的话全部写进 notes 正文。
-   notes 里写：修了什么 + **人工验收清单**（无头验不了的那些，见「你无法验证的东西」）+ sha256。
+   notes 里写：修了什么 + **人工验收清单**（无头验不了的那些，见「你无法验证的东西」）+ sha256
+   + **首次运行提示**（未签名 exe 每版都会被 SmartScreen 拦，`Unblock-File .\mullion.exe`，
+   详见 `docs/cross-compile-windows.md`）。
 5. **报给我** —— Release 链接 + sha256 + 验收清单。
 
 约束：**本机 DNS 解析不了 github**，`gh`/curl 必须带 `HTTPS_PROXY=http://127.0.0.1:7890`，

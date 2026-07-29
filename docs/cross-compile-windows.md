@@ -54,6 +54,35 @@ Get-FileHash .\mullion.exe -Algorithm SHA256   # 与上面 sha256 一致
 - 私钥要在 Windows 本地，`-i` 传 Windows 路径。
 - 字体 `Google Sans Code` 需在 Windows 已安装，否则回退默认字体（不崩，但对齐可能差）。
 
+### 首次运行被 SmartScreen 拦（**每个新版本都会**，不是缺陷）
+
+现象：弹「Windows 已保护你的电脑 / Microsoft Defender SmartScreen 阻止了无法识别的
+应用启动 / 发布者：发布者未知」。
+
+原因：我们的 exe **没有代码签名证书**，且下载量不足以积累 SmartScreen 声誉。触发这个
+弹窗的是浏览器下载时打在文件上的 Mark-of-the-Web（`Zone.Identifier` 备用数据流）。
+**与 mingw / 交叉编译无关**——用 MSVC 工具链编出的未签名 exe 一样弹。
+
+解法（PowerShell，在 exe 所在目录）：
+
+```powershell
+Unblock-File .\mullion.exe    # 移除 MotW,之后双击不再弹
+```
+
+图形等价操作：右键 exe → 属性 → 常规页最底部勾「解除锁定」。也可以在弹窗上点
+「更多信息」→「仍要运行」。**三种做法都是一次性的**：SmartScreen 按文件 hash 记声誉，
+下一版 exe hash 一变，照样弹，得再来一次。
+
+长期方案（**现阶段不做**）：
+
+| 方案 | 效果 | 代价 |
+|---|---|---|
+| EV 代码签名证书 | 签名后**立即**通过，无需积累声誉 | ~$300–500/年 + 硬件令牌/云 HSM |
+| OV/标准代码签名证书 | 消掉「发布者未知」，但仍要靠下载量攒声誉，短期照弹 | ~$100–200/年 |
+| 自签名证书 | **无效**。SmartScreen 不认不受信任的根 CA | 白折腾 |
+
+当前是单人在自有机器上做实机验收，`Unblock-File` 足够；等真要对外分发再上 EV。
+
 ## 发布 Release（正式分发，推荐 CI）
 
 `.github/workflows/release.yml`：push `v*` tag 时，CI 在 ubuntu runner 上按同一条
