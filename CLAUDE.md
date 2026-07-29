@@ -208,7 +208,9 @@ spec.md          需求，唯一真源
 `docs/` 关键非 ADR 文件：
 - `cross-compile-windows.md` —— Linux 交叉编译 Windows exe 的运行手册（代理/mingw/objdump/live 验证/发布 Release）
 - `gui-render-gotchas.md` —— GUI/渲染/输入层「编译过跑起来才崩」的坑（动那几个文件前必读）
-- 最新 ADR：`adr-008`（自诊断日志：接 `log` facade 白拿 wgpu/winit/russh 内部诊断 + 阶段打点 +
+- 最新 ADR：`adr-009`（一条 SSH 连接开多 channel 承载多分屏；含它引入的四条新失效模式：
+  channel 泄漏、T1 升级为 per-pane、迟到的 `PaneOpened` 要查树成员 + Workspace 世代）；
+  `adr-008`（自诊断日志：接 `log` facade 白拿 wgpu/winit/russh 内部诊断 + 阶段打点 +
   看门狗；级别用 `MULLION_LOG` / `MULLION_LOG_DEPS`，默认 info/warn）；
   `adr-007`（用 egui 做外壳：菜单/状态栏/会话弹窗；含与 wgpu23/winit0.30 同帧集成的坑）
 

@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-app"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -2272,6 +2272,7 @@ dependencies = [
  "mullion-store",
  "mullion-term",
  "rfd",
+ "russh",
  "tempfile",
  "time",
  "tokio",
@@ -2282,11 +2283,11 @@ dependencies = [
 
 [[package]]
 name = "mullion-core"
-version = "0.1.11"
+version = "0.1.12"
 
 [[package]]
 name = "mullion-ssh"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "russh",
  "tokio",
@@ -2294,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-store"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "chacha20poly1305",
  "keyring",
@@ -2305,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-term"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "alacritty_terminal",
  "vte",

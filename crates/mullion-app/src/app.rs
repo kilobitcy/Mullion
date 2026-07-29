@@ -1,6 +1,7 @@
 //! App:winit ApplicationHandler<UserEvent>。持有窗口/GPU/文字层/运行时,以及一个
-//! `Option<Connection>`(launcher 态 None / 终端态 Some,§2.2)。每帧(conn 存在时)
-//! 「排空 rx → feed emu → 回写 PtyWrite(T1)」,GPU present 受帧率(T3)与同步块(T2)双闸。
+//! `Option<Workspace>`(launcher 态 None / 终端态 Some,§2.2;F30 起一个 Workspace
+//! 可装多个 pane)。每帧(ws 存在时)对每个 pane「排空 rx → feed emu → 回写
+//! PtyWrite(T1)」,GPU present 受帧率(T3)与同步块(T2)双闸。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,10 +10,11 @@ use std::time::Instant;
 use mullion_core::layout::PaneId;
 use mullion_ssh::config::SshConfig;
 use mullion_ssh::known_hosts::HostKeyPolicy;
-use mullion_ssh::session::SshSession;
+use mullion_ssh::session::{ClientHandler, SshSession};
 use mullion_store::known_hosts::{HostKeyEntry, KnownHostsFile};
 use mullion_term::keymap::{Key, WheelAction};
 use mullion_term::Scroll;
+use russh::client::Handle;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Receiver;
 use winit::application::ApplicationHandler;
@@ -22,22 +24,26 @@ use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
 use crate::frame::{FrameLimiter, RedrawAction};
-use crate::gpu::{quads_for, Gpu};
-use crate::pane::Pane;
+use crate::gpu::{quads_for_panes, Gpu};
 use crate::render::SyncFramePacer;
+use crate::shell::workspace::{PaneGeom, PaneState, Preset, Workspace};
 use crate::text::TextLayer;
 use crate::theme::{self, MULLION_DARK};
-use crate::{diag, grid, input, session_pump, shell};
+use crate::{diag, input, shell};
 
 /// app 与「连接建立」异步任务之间的事件(ssh io_task / connect 的 wake、结果经此回送)。
 /// 携带 `SshSession`/`Receiver` 等非 `Copy` 负载,故不能派生 Copy/Clone;两者也未实现
 /// `Debug`,故 `UserEvent` 同样不派生 Debug(winit `ApplicationHandler<T>` 只要求 `T: 'static`)。
 pub enum UserEvent {
     Wake,
-    /// 异步 connect 成功:句柄 + 远端字节接收端(app 每帧 drain)。
+    /// 异步 connect 成功:第一条 channel 的句柄 + 远端字节接收端(app 每帧 drain),
+    /// 以及**已建立连接**本身的 `Handle`(F35:同一条连接上后续分屏另开 channel
+    /// 要复用它)。`Arc` 是因为 russh 的 `Handle` 没实现 `Clone`,只有 `Drop`
+    /// (释放即断连)。
     ConnectOk {
         ssh: SshSession,
         rx: Receiver<Vec<u8>>,
+        handle: Arc<Handle<ClientHandler>>,
     },
     /// 异步 connect 失败,已格式化的可操作错误(F6 分类由 `session::connect` 内部给)。
     ConnectErr(String),
@@ -48,6 +54,26 @@ pub enum UserEvent {
     /// **必须**最终发一个 bool 回去或丢弃 sender(丢弃 = 拒绝,fail-closed)。
     /// `Box` 是因为 `HostKeyPrompt` 比其余变体大得多,不装箱会撑大整个枚举。
     HostKeyPrompt(Box<crate::host_key::HostKeyPrompt>),
+    /// 分屏(F82→F30)多出来的 pane 在同一条连接上另开的 channel 开好了(F35)。
+    PaneOpened {
+        id: PaneId,
+        ssh: SshSession,
+        rx: Receiver<Vec<u8>>,
+        /// C1:发出这个异步任务时,`Workspace::generation()` 是多少。开 channel
+        /// 是真实网络往返,可能在用户断开又重连(=新 `Workspace`,`next_id`
+        /// 重新从 2 计数)之后才回来——这时 `id` 在新世代的树上完全可能被
+        /// **复用**,只查 id/树成员会误判为"还需要",顶掉新世代刚建好的
+        /// `PaneState`。世代号是唯一能分辨"这事件到底是哪一代发出的"的信息。
+        generation: u64,
+    },
+    /// 分屏 channel 开失败。树上的叶子位留着,标题条显示错误,用户可以再切布局。
+    PaneOpenErr {
+        id: PaneId,
+        msg: String,
+        /// C1:同 `PaneOpened::generation`——旧世代的失败提示落到新世代头上,
+        /// 会给用户弹一条跟当前连接毫不相干的错误 toast,必须按世代过滤。
+        generation: u64,
+    },
 }
 
 /// 窗口出现后才建的 GPU 相关状态。
@@ -55,24 +81,26 @@ struct Active {
     window: Arc<Window>,
     gpu: Gpu,
     text: TextLayer,
-    grid_dims: (u16, u16),
+    /// 本帧算出的每 pane 几何。渲染、鼠标命中、window_change 三条路径读同一份 ——
+    /// 各算各的是这类布局 bug 的经典成因(算出来差一个标题条高度,肉眼看不出来,
+    /// 但鼠标点击整体偏 32px)。
+    geoms: Vec<PaneGeom>,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
 }
 
-/// 一条活跃连接的全部状态。launcher 态时 `App::conn` 是 `None`。
-struct Connection {
-    ssh: SshSession,
-    rx: Receiver<Vec<u8>>,
-    pane: Pane,
-    pacer: SyncFramePacer,
-}
-
 pub struct App {
     _runtime: Runtime,
-    /// `None` = launcher 态(无终端字节可处理);`Some` = 终端态。
-    conn: Option<Connection>,
+    /// `None` = launcher 态(无终端可画);`Some` = 终端态。取代原来的
+    /// `Connection`:后者只能装一条连接 + 一个 pane。
+    ws: Option<Workspace>,
+    /// C1:下一个 `Workspace` 世代号。只在 `ConnectOk`(唯一新建 `Workspace`
+    /// 的地方)读取并自增——不能挂在 `Workspace` 自己身上,它每次都是全新
+    /// 对象,内部生成的话新世代又从同一个值起步,等于没有世代区分。挂在
+    /// `App` 上而非进程级 atomic:只有 `App` 知道"发生了一次重连",且只在
+    /// winit 事件循环这一个线程上递增,不需要跨线程原子操作。
+    next_ws_generation: u64,
     start: Instant,
     mods: ModifiersState,
     kitty: bool,
@@ -101,6 +129,12 @@ pub struct App {
     /// 另一次连接(会话管理器双击/点连接),就清为 `false`,进入交互态语义——
     /// 否则断线后从会话管理器连别的会话失败会把整个 GUI 一并 exit(1)(复核 #1)。
     cli_direct: bool,
+    /// 当前生效的布局预设(工具栏画选中态用)。手动关 pane 之后置 `None`
+    /// (布局不再对应任何预设)。
+    current_preset: Option<Preset>,
+    /// 最近一次发起连接用的配置。`open_pty`(F35 分屏复用连接)要它的
+    /// `term`/`cols`/`rows`,标题条要 `user`/`host`/`port`。
+    last_cfg: Option<SshConfig>,
     /// egui UI 侧状态(菜单/状态栏/弹窗/中央区像素),与连接状态解耦(Task 4)。
     ui: crate::ui::UiState,
     /// 会话保险库(Task 6)。`resumed` 末尾打开;keyring/库打开失败时留 `None`,
@@ -149,7 +183,8 @@ impl App {
     ) -> Self {
         Self {
             _runtime: runtime,
-            conn: None,
+            ws: None,
+            next_ws_generation: 0,
             start: Instant::now(),
             mods: ModifiersState::empty(),
             kitty: false, // MVP 未协商 Kitty,走优雅退化(T6)
@@ -160,8 +195,10 @@ impl App {
             known_hosts,
             pending_host_key: None,
             host_key_since: None,
+            last_cfg: initial.clone(),
             initial,
             cli_direct,
+            current_preset: Some(Preset::Single),
             ui: crate::ui::UiState::default(),
             store: None,
             visible: shell::window_state::Visibility::default(),
@@ -181,6 +218,24 @@ impl App {
         self.start.elapsed().as_millis() as u64
     }
 
+    /// Important #2 / T2:若有 pane 卡在未超时的同步块里,返回该在什么时刻醒来
+    /// 重新判定 dirty。`SYNC_TIMEOUT_MS` 只是「过了这个点该出帧」的判定阈值——
+    /// 不主动在那个时刻挂一次 `WaitUntil` 的话,冻住的画面只能靠下一个不相关
+    /// 事件(鼠标移动/别的 pane 来字节)顺带救回来,T2 点名的「远端发了 BSU、
+    /// 链路/TUI 在 ESU 前就死了」场景不保证 ~150ms 自愈。
+    ///
+    /// 用 `self.start`(与 `now_ms` 同一时钟基准)把绝对的 `deadline_ms` 换算
+    /// 成 `Instant`,不是拿 `Instant::now() + (deadline_ms - now_ms)` 这种会
+    /// 因两次取时刻之间的间隙而漂移的算法。复用的是 `about_to_wait` 现成的
+    /// 「到点重新判定」机制(`RedrawAction::Throttle`/egui repaint_delay 已经
+    /// 在用),不是新开一条唤醒路径:一次性、非忙转(T3/T7)——只有严格
+    /// `deadline_ms > now_ms` 时才返回 `Some`;到点后该 pane 要么已经不再
+    /// holding(正常出帧),要么仍在 holding 但 `sync_since_ms` 不变、
+    /// `holding_deadline_ms` 天然不再返回同一个过去的时刻,不会重复排期。
+    fn sync_timeout_wake(&self, now_ms: u64) -> Option<Instant> {
+        sync_timeout_wake_at(self.start, self.ws.as_ref(), now_ms)
+    }
+
     /// UI 侧变了(或 egui 自己要重绘):标脏 + 请求一帧。**两件事必须一起做**——
     /// 只 `request_redraw` 而不标脏,那一帧会在 `frame_is_dirty` 处被判 Idle 丢掉。
     fn request_ui_redraw(&mut self) {
@@ -190,15 +245,61 @@ impl App {
         }
     }
 
-    /// 指针位置换算成**终端区局部**像素坐标(窗口坐标减去 egui 中央区原点)。
-    ///
-    /// 终端自绘层整体平移到了菜单栏之下(`ui::UiState::central_origin_px`),
-    /// 所有「像素 → 单元格」的换算都必须用同一个原点,否则鼠标点到的格子与
-    /// 眼睛看到的差一个菜单栏的高度。平移**只在这一个函数里做**。
-    /// 负数(指针在菜单栏/状态栏上)交给 `cell_at`/`cell_side` 各自夹紧。
+    /// 本帧的 pane 几何。中央区 = egui 布局后剩下的矩形(`central_origin_px` +
+    /// `central_px`),布局树按像素切分它。渲染、鼠标命中、window_change 三条
+    /// 路径都读这一份结果——各算各的是这类布局 bug 的经典成因。
+    fn compute_geoms(&self) -> Vec<PaneGeom> {
+        let (Some(a), Some(ws)) = (self.active.as_ref(), self.ws.as_ref()) else {
+            return Vec::new();
+        };
+        let origin = self.ui.central_origin_px;
+        let area = crate::shell::workspace::PxRect {
+            x: origin.0.max(0.0) as u32,
+            y: origin.1.max(0.0) as u32,
+            w: self.ui.central_px.0,
+            h: self.ui.central_px.1,
+        };
+        crate::shell::workspace::layout_geometry(
+            ws.tree(),
+            area,
+            (a.text.cell_w, a.text.cell_h),
+            ws.title_bars,
+        )
+    }
+
+    /// 指针落在哪个 pane 上。命中判定用 `PaneGeom.px`(含标题条),
+    /// 与渲染同源 —— 用别的矩形算就会出现"点得到但画不着"的错位。
+    fn pane_at(&self, px: (f32, f32)) -> Option<PaneId> {
+        let a = self.active.as_ref()?;
+        a.geoms
+            .iter()
+            .find(|g| {
+                let r = g.px;
+                px.0 >= r.x as f32
+                    && px.0 < (r.x + r.w) as f32
+                    && px.1 >= r.y as f32
+                    && px.1 < (r.y + r.h) as f32
+            })
+            .map(|g| g.id)
+    }
+
+    /// 焦点 pane 的几何。鼠标格换算、划选都基于它。
+    fn focused_geom(&self) -> Option<PaneGeom> {
+        let a = self.active.as_ref()?;
+        let f = self.ws.as_ref()?.focus();
+        a.geoms.iter().find(|g| g.id == f).copied()
+    }
+
+    /// 指针相对**焦点 pane 终端区**左上角的像素。原点用 `term_px` 而不是中央区:
+    /// 分屏后 pane 2 的第 0 列不在窗口左边,用中央区原点算会整体偏一个 pane 宽。
     fn cursor_in_grid(&self) -> (f32, f32) {
-        let (ox, oy) = self.ui.central_origin_px;
-        (self.cursor_px.0 - ox, self.cursor_px.1 - oy)
+        let Some(g) = self.focused_geom() else {
+            return (0.0, 0.0);
+        };
+        (
+            self.cursor_px.0 - g.term_px.x as f32,
+            self.cursor_px.1 - g.term_px.y as f32,
+        )
     }
 
     /// 指针当前位置对应的 **0-based** viewport 单元格与格内左右半。
@@ -207,11 +308,12 @@ impl App {
     /// 而选区 API 收 0-based。两套口径并存是既有事实,换算**只在这一个函数里做**,
     /// 别让 0/1 混进事件循环——那是 off-by-one 最容易长出来的地方。
     fn selection_cursor(&self) -> Option<(u16, u16, mullion_term::selection::CellSide)> {
+        let g = self.focused_geom()?;
         let a = self.active.as_ref()?;
         let cell_px = (a.text.cell_w, a.text.cell_h);
         let local = self.cursor_in_grid();
-        let (col1, row1) = input::cell_at(local, cell_px, a.grid_dims);
-        let side = input::cell_side(local.0, cell_px.0, a.grid_dims.0);
+        let (col1, row1) = input::cell_at(local, cell_px, g.grid);
+        let side = input::cell_side(local.0, cell_px.0, g.grid.0);
         Some((col1.saturating_sub(1), row1.saturating_sub(1), side))
     }
 
@@ -219,20 +321,23 @@ impl App {
     fn selection_press(&mut self) {
         // 没有连接就没有终端可选,别让 `dragging` 在 launcher 态被置起来——
         // 那会让后续每次 `CursorMoved` 都白跑一遍划选和重绘。
-        if self.conn.is_none() {
+        if self.ws.is_none() {
             return;
         }
+        let Some(g) = self.focused_geom() else {
+            return;
+        };
         let Some(a) = self.active.as_ref() else {
             return;
         };
         let cell_px = (a.text.cell_w, a.text.cell_h);
-        let pos1 = input::cell_at(self.cursor_in_grid(), cell_px, a.grid_dims);
+        let pos1 = input::cell_at(self.cursor_in_grid(), cell_px, g.grid);
         let (kind, prev) = input::click_kind(self.prev_click, Instant::now(), pos1);
         self.prev_click = Some(prev);
         if let Some((col, row, side)) = self.selection_cursor() {
             self.press_anchor = Some(((col, row), kind));
-            if let Some(conn) = self.conn.as_mut() {
-                conn.pane.emulator.selection_start(col, row, kind, side);
+            if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                pane.emulator.selection_start(col, row, kind, side);
             }
         }
         self.dragging = true;
@@ -250,8 +355,8 @@ impl App {
         let cell_h = a.text.cell_h;
         self.autoscroll = input::autoscroll_lines(self.cursor_px.1, win_h, cell_h);
         if let Some((col, row, side)) = self.selection_cursor() {
-            if let Some(conn) = self.conn.as_mut() {
-                conn.pane.emulator.selection_update(col, row, side);
+            if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                pane.emulator.selection_update(col, row, side);
             }
         }
     }
@@ -280,8 +385,8 @@ impl App {
         {
             if cell == (col, row) {
                 // 点一下 = 取消选择,别在屏幕上留一个孤零零的高亮字符。
-                if let Some(conn) = self.conn.as_mut() {
-                    conn.pane.emulator.selection_clear();
+                if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                    pane.emulator.selection_clear();
                 }
                 self.request_ui_redraw();
                 return;
@@ -294,9 +399,10 @@ impl App {
     /// `None`),不能写空串——那会清掉用户剪贴板里原有的内容。
     fn copy_selection(&mut self) {
         let Some(text) = self
-            .conn
+            .ws
             .as_ref()
-            .and_then(|c| c.pane.emulator.selection_text())
+            .and_then(Workspace::focused)
+            .and_then(|p| p.emulator.selection_text())
         else {
             return;
         };
@@ -307,8 +413,8 @@ impl App {
     fn request_paste(&mut self) {
         // 没有连接就没有地方可贴。不早退的话,launcher 态右键会读剪贴板、
         // 多行内容还会弹出一个「确认粘贴」窗——点了「粘贴」却什么都不会发生
-        // (`send_paste` 拿不到 conn 直接返回)。与 `selection_press` 同一道门。
-        if self.conn.is_none() {
+        // (`send_paste` 拿不到焦点 pane 直接返回)。与 `selection_press` 同一道门。
+        if self.ws.is_none() {
             return;
         }
         let Some(text) = self.clipboard.get() else {
@@ -317,12 +423,15 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let bracketed = self.conn.as_ref().is_some_and(|c| {
-            c.pane
-                .emulator
-                .mode()
-                .contains(mullion_term::TermMode::BRACKETED_PASTE)
-        });
+        let bracketed = self
+            .ws
+            .as_ref()
+            .and_then(Workspace::focused)
+            .is_some_and(|p| {
+                p.emulator
+                    .mode()
+                    .contains(mullion_term::TermMode::BRACKETED_PASTE)
+            });
         // 判定与预览、与实际发送三者同源(`paste_line_count` 的 doc 说明了为什么):
         // `contains('\n')` 会把带尾随换行的单行命令(浏览器/IDE 复制的常态)
         // 误判成多行,而裸 `\r` 又会被漏掉。> 1 而非 != 0:单行也算「1 行」。
@@ -334,20 +443,20 @@ impl App {
         self.send_paste(&text);
     }
 
-    /// 真正发送。到这里要么不需要确认,要么用户已经点了「粘贴」。
+    /// 真正发送。到这里要么不需要确认,要么用户已经点了「粘贴」。粘贴目标
+    /// 是**焦点 pane**——分屏后粘贴永远只进当前正在操作的那一块。
     fn send_paste(&mut self, text: &str) {
-        let Some(conn) = self.conn.as_mut() else {
+        let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) else {
             return;
         };
-        let bracketed = conn
-            .pane
+        let bracketed = pane
             .emulator
             .mode()
             .contains(mullion_term::TermMode::BRACKETED_PASTE);
         let bytes = mullion_term::keymap::encode_paste(text, bracketed);
         // 与按键同理(F17):贴之前先回底部,否则「贴了但看不到」。
-        conn.pane.emulator.scroll_to_bottom();
-        let _ = conn.ssh.write(bytes);
+        pane.emulator.scroll_to_bottom();
+        let _ = pane.pty.write(bytes);
     }
 
     /// 从 Minimized 自愈:凡是「窗口本该看得见」的信号都拿实测尺寸复查一次,
@@ -364,11 +473,19 @@ impl App {
             "窗口可见性自愈 {:?} → {:?}({}x{})",
             self.visible, vis, size.width, size.height
         ));
-        // 走与还原同一条路径:最小化期间跳过的 surface configure 与 grid 传播都要补上。
+        // 走与还原同一条路径:最小化期间跳过的 surface configure 都要补上。
         self.apply_resize(size.width, size.height);
     }
 
     /// 应用一次窗口尺寸变化(`Resized` 事件与 Minimized 自愈共用)。
+    ///
+    /// 每 pane 的列/行数**不在这里算**:统一由 `RedrawRequested` 里的
+    /// `Present` 分支每帧 `compute_geoms()` + `Workspace::apply_geometry`
+    /// 施加(F34/T4 唯一出口,三条触发路径——resize/切预设/关 pane/标题条开关
+    /// 都收敛到那一个函数)。这里只需要保证 present 分支能跑到最小化态之外的
+    /// 尺寸变化都会被下一帧的 compute_geoms 自动捕捉,不需要 resize 事件
+    /// 单独再推一次;最小化(0×0)时 `RedrawScope::PumpOnly` 已经在
+    /// `RedrawRequested` 里更早的地方整帧跳过,不会走到 compute_geoms。
     fn apply_resize(&mut self, width: u32, height: u32) {
         let vis = shell::window_state::visibility_for(width, height);
         if vis != self.visible {
@@ -380,57 +497,36 @@ impl App {
         }
         let plan = shell::window_state::plan_resize(vis);
         let Some(a) = &mut self.active else { return };
-        // 最小化(0×0)时三件事全不做:configure 0 面积表面、按 1 列 reflow 碾平
-        // scrollback、把 window_change 1×1 发给远端。
+        // 最小化(0×0)不 configure 0 面积表面。
         if plan.reconfigure_surface {
             a.gpu.resize(width, height);
-        }
-        if plan.propagate_grid {
-            let (cols, rows) = grid::grid_size_for(width, height, a.text.cell_w, a.text.cell_h);
-            if (cols, rows) != a.grid_dims {
-                a.grid_dims = (cols, rows);
-                // 单 pane MVP 直接 resize;多 pane 的 reflow(ResizeSink)留给 F4 分屏。
-                // launcher 态(conn=None)没有终端可 resize,跳过。
-                if let Some(conn) = self.conn.as_mut() {
-                    conn.pane.emulator.resize(cols, rows);
-                    let _ = conn.ssh.resize(cols, rows); // T4
-                }
-            }
         }
         if plan.request_redraw {
             self.request_ui_redraw();
         }
     }
 
-    /// 排空 rx → feed emulator → 回写 `PtyWrite`(T1 红线)。
+    /// 排空每个 pane 的 rx → feed 各自的 emulator → 回写各自的 `PtyWrite`(T1 红线)。
     ///
     /// 从 `RedrawRequested` 和(最小化时)`UserEvent::Wake` 两处调:最小化期间窗口
     /// 未必还会被重绘,不能把这条通路挂在重绘上,否则有界 rx(256)灌满堵住 io_task,
     /// 远端的同步输出探测/光标查询永久等不到应答。
     fn pump_io(&mut self) {
-        // 须在 conn 借用之前取:now_ms() 借整个 &self,与 conn.as_mut() 冲突。
         let now = self.now_ms();
-        let Some(conn) = self.conn.as_mut() else {
-            return;
-        };
-        diag::mark(diag::Stage::Pump);
-        let mut inbound = Vec::new();
-        while let Ok(bytes) = conn.rx.try_recv() {
-            diag::count_inbound(bytes.len());
-            inbound.push(bytes);
-        }
-        for b in &inbound {
-            conn.pacer.feed(b, now); // T2:探测同步块
-        }
-        let out = session_pump::pump(&mut conn.pane.emulator, &inbound);
-        if !out.is_empty() {
-            let _ = conn.ssh.write(out);
+        if let Some(ws) = self.ws.as_mut() {
+            ws.pump(now);
         }
     }
 
     /// 在 `_runtime` 上异步连接;结果经 `proxy` 以 `UserEvent` 回送(§5)。
-    /// 不阻塞调用方(winit 事件循环线程)。
-    fn spawn_connect(&self, cfg: SshConfig) {
+    /// 不阻塞调用方(winit 事件循环线程)。拆成 `establish` + `open_pty` 两步
+    /// (而不是直接调更省事的 `session::connect`):分屏(F35)要在同一条连接上
+    /// 另开 channel,必须拿到 `establish` 返回的 `Handle` 本身——`connect` 内部
+    /// 会把它吞掉不外露。
+    fn spawn_connect(&mut self, cfg: SshConfig) {
+        // 会话管理器发起的连接也要记下,否则第二次连接后开分屏会用上一台
+        // 主机的 term/尺寸(F35 的 open_pty 靠它)。
+        self.last_cfg = Some(cfg.clone());
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
         // 每次连接现建一个策略:它只持有两个 Arc/Sender 的克隆,构造成本可忽略,
@@ -443,15 +539,72 @@ impl App {
             let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 let _ = wake_proxy.send_event(UserEvent::Wake);
             });
-            match mullion_ssh::session::connect(&cfg, policy, wake).await {
+            let handle = match mullion_ssh::session::establish(&cfg, policy).await {
+                Ok(h) => Arc::new(h),
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::ConnectErr(e.to_string()));
+                    return;
+                }
+            };
+            match mullion_ssh::session::open_pty(handle.clone(), &cfg, wake).await {
                 Ok((ssh, rx)) => {
-                    let _ = proxy.send_event(UserEvent::ConnectOk { ssh, rx });
+                    let _ = proxy.send_event(UserEvent::ConnectOk { ssh, rx, handle });
                 }
                 Err(e) => {
                     let _ = proxy.send_event(UserEvent::ConnectErr(e.to_string()));
                 }
             }
         });
+    }
+
+    /// F35 分屏复用连接:给 `fresh`(树上已占好叶子位、还没有 `PaneState`)里的
+    /// 每个 id,在同一条 SSH 连接上另开一条 channel。真正决定"该不该开、开
+    /// 哪些"的路由逻辑在自由函数 `apply_layout_actions`(可脱离 runtime/proxy
+    /// 单测,见其文档注释);这里只管执行,天然依赖 `self._runtime`/`self.proxy`,
+    /// 无头环境测不了,只能人工验收(F35 的实际 channel 复用效果)。
+    fn spawn_fresh_panes(&mut self, fresh: Vec<PaneId>) {
+        if fresh.is_empty() {
+            return;
+        }
+        let Some(ws) = self.ws.as_ref() else { return };
+        let Some(host) = ws.hosts.first() else { return };
+        // C1:开 channel 是异步的,回来时用户可能已经断开重连、换了一个新
+        // `Workspace`(`next_id` 重新从 2 计数,`id` 会撞号)。把发起时刻的
+        // 世代一起带走,`PaneOpened`/`PaneOpenErr` 抵达时据此判断"这事件还
+        // 是不是当前这个 Workspace 发出的"。
+        let generation = ws.generation();
+        let handle = host.handle.clone();
+        let Some(cfg) = self.last_cfg.clone() else {
+            return;
+        };
+        for id in fresh {
+            let handle = handle.clone();
+            let cfg = cfg.clone();
+            let proxy = self.proxy.clone();
+            let wake_proxy = self.proxy.clone();
+            self._runtime.spawn(async move {
+                let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    let _ = wake_proxy.send_event(UserEvent::Wake);
+                });
+                match mullion_ssh::session::open_pty(handle, &cfg, wake).await {
+                    Ok((ssh, rx)) => {
+                        let _ = proxy.send_event(UserEvent::PaneOpened {
+                            id,
+                            ssh,
+                            rx,
+                            generation,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::PaneOpenErr {
+                            id,
+                            msg: format!("开分屏失败: {e}"),
+                            generation,
+                        });
+                    }
+                }
+            });
+        }
     }
 
     /// 私钥文件对话框:另起线程跑,结果经 `proxy` 回送。
@@ -518,8 +671,6 @@ impl ApplicationHandler<UserEvent> for App {
             font_px,
             MULLION_DARK.term_fg,
         );
-        let size = window.inner_size();
-        let (cols, rows) = grid::grid_size_for(size.width, size.height, text.cell_w, text.cell_h);
         // egui 0.30 同帧集成(§4.1):本 Task 只画一个占位 `egui::Window` 证明管线通;
         // 菜单/状态栏/session UI 在后续 Task 接线。
         let egui_ctx = egui::Context::default();
@@ -540,7 +691,7 @@ impl ApplicationHandler<UserEvent> for App {
             window,
             gpu,
             text,
-            grid_dims: (cols, rows),
+            geoms: Vec::new(),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -597,29 +748,114 @@ impl ApplicationHandler<UserEvent> for App {
                     a.window.request_redraw();
                 }
             }
-            UserEvent::ConnectOk { ssh, rx } => {
+            UserEvent::ConnectOk { ssh, rx, handle } => {
                 crate::logx::line("连接成功,进入终端态");
                 // 一旦连上就进入交互态:后续(哪怕是本次会话断开后)的连接失败
                 // 不再是「CLI 直连首次失败」,不该导致整个 GUI exit(1)(复核 #1)。
                 self.cli_direct = false;
-                let (cols, rows) = self.active.as_ref().map_or((80, 24), |a| a.grid_dims);
-                let pane = Pane::new(
-                    PaneId(1),
-                    cols,
-                    rows,
-                    theme::term_default_colors(&MULLION_DARK),
+                let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
+                let d = theme::term_default_colors(&MULLION_DARK);
+                emulator.set_default_colors(d.fg, d.bg);
+                // C1:每次连接都是全新世代——`next_ws_generation` 取值后自增,
+                // 保证跟上一次(如果有)断开的那个 Workspace 的世代号不同,
+                // 哪怕 PaneId 因为 next_id 重新计数而撞号,也能靠这个分辨。
+                let generation = self.next_ws_generation;
+                self.next_ws_generation += 1;
+                let mut ws = crate::shell::workspace::Workspace::new(
+                    PaneState {
+                        id: PaneId(1),
+                        host_ix: 0,
+                        emulator,
+                        pty: Box::new(ssh),
+                        rx,
+                        pacer: SyncFramePacer::new(),
+                        status: crate::shell::workspace::PaneStatus::Live,
+                        // 故意给一个不可能的初值:下一帧 apply_geometry 必然发一次
+                        // window_change,真实列/行数才知道(T4)。
+                        last_grid: (0, 0),
+                    },
+                    generation,
                 );
-                let _ = ssh.resize(cols, rows); // 初始 window_change 校正到真实尺寸(T4)
-                self.conn = Some(Connection {
-                    ssh,
-                    rx,
-                    pane,
-                    pacer: SyncFramePacer::new(),
+                ws.hosts.push(crate::shell::workspace::HostConn {
+                    label: self
+                        .last_cfg
+                        .as_ref()
+                        .map_or_else(|| "远端".to_string(), |c| format!("{}@{}", c.user, c.host)),
+                    addr: self
+                        .last_cfg
+                        .as_ref()
+                        .map_or_else(String::new, |c| format!("{}:{}", c.host, c.port)),
+                    handle,
                 });
+                self.ws = Some(ws);
+                self.current_preset = Some(Preset::Single);
                 // 连上后关掉会话管理弹窗/编辑表单,别让它盖在新终端上方(复核 #4)。
                 self.ui.session_manager_open = false;
                 self.ui.editor_open = false;
+                self.ui_dirty = true;
                 self.request_ui_redraw();
+            }
+            UserEvent::PaneOpened {
+                id,
+                ssh,
+                rx,
+                generation,
+            } => {
+                // 初始网格给 80x24 占位,真实尺寸由下一帧 apply_geometry 校准
+                // (last_grid 给 (0,0),保证那一帧必然发一次 window_change)。
+                if let Some(ws) = self.ws.as_mut() {
+                    // 开 channel 是真实网络往返(高延迟代理链路下可能要几百 ms 到
+                    // 几秒),这期间用户完全可能又切了预设,甚至断开重连出了一个
+                    // 全新的 Workspace(C1:`next_id` 重新计数,`id` 会跟旧世代
+                    // 撞号)——不查树成员 + 世代直接 attach_pane 的后果:轻则是
+                    // 孤儿 pane(不出现在 compute_geoms/渲染/标题条里,`pump`
+                    // 却仍在每帧驱动它,SSH channel 永远占着不关),重则是顶掉
+                    // 新世代刚建好、正常工作的 PaneState(输入从此写进一条已经
+                    // 不存在意义的旧连接)。
+                    if pane_still_wanted(ws, id, generation) {
+                        let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
+                        let d = theme::term_default_colors(&MULLION_DARK);
+                        emulator.set_default_colors(d.fg, d.bg);
+                        ws.attach_pane(PaneState {
+                            id,
+                            host_ix: 0,
+                            emulator,
+                            pty: Box::new(ssh),
+                            rx,
+                            pacer: SyncFramePacer::new(),
+                            status: crate::shell::workspace::PaneStatus::Live,
+                            last_grid: (0, 0),
+                        });
+                    } else {
+                        // 让 ssh/rx 在这个分支结束时自然 Drop——Drop 会关掉这条
+                        // SSH channel,不留孤儿、也不会顶掉新世代的 PaneState。
+                        log::warn!(
+                            target: "mullion",
+                            "pane {} 的 channel 开好时已经不属于当前世代了(世代 {generation},用户已切走/重连),丢弃",
+                            id.0
+                        );
+                    }
+                }
+                self.ui_dirty = true;
+                self.request_ui_redraw();
+            }
+            UserEvent::PaneOpenErr {
+                id,
+                msg,
+                generation,
+            } => {
+                log::warn!(target: "mullion", "pane {} 开启失败: {msg}", id.0);
+                // C1:旧世代的失败提示落到新世代头上,会给用户弹一条跟当前连接
+                // 毫不相干的错误 toast——按世代过滤,只有当前世代的失败才展示。
+                if self
+                    .ws
+                    .as_ref()
+                    .is_some_and(|ws| generation_matches(ws, generation))
+                {
+                    self.ui.last_error = Some(msg);
+                    self.ui_dirty = true;
+                    self.request_ui_redraw();
+                }
             }
             UserEvent::KeyPathPicked(picked) => {
                 self.key_picker_busy = false;
@@ -646,7 +882,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 待定 F:CLI 直连从未成功连过时,保留可脚本化的 exit(1) 语义;
                 // launcher 态(或已连过又断开)只记错误,交 UI 展示(ui.last_error)。
                 crate::logx::line(&format!("连接失败: {msg}"));
-                if self.cli_direct && self.conn.is_none() {
+                if self.cli_direct && self.ws.is_none() {
                     std::process::exit(1);
                 }
                 self.ui.last_error = Some(msg);
@@ -755,21 +991,26 @@ impl ApplicationHandler<UserEvent> for App {
             // F17 滚轮三档分流。决策在 `mullion_term::keymap::wheel_action`(纯函数,
             // 已单测),这里只做 winit 增量→行数、像素→单元格的换算与发送。
             WindowEvent::MouseWheel { delta, .. } => {
-                // 先算,下面 `self.conn.as_mut()` 一借出去就没法再调 `&self` 方法了。
+                // 先算,下面 `self.ws.as_mut()` 一借出去就没法再调 `&self` 方法了。
                 let local = self.cursor_in_grid();
-                if let (Some(a), Some(conn)) = (self.active.as_ref(), self.conn.as_mut()) {
+                let geom = self.focused_geom();
+                if let (Some(a), Some(g), Some(pane)) = (
+                    self.active.as_ref(),
+                    geom,
+                    self.ws.as_mut().and_then(Workspace::focused_mut),
+                ) {
                     let cell_px = (a.text.cell_w, a.text.cell_h);
                     let lines = input::wheel_lines(delta, cell_px.1);
-                    let cell = input::cell_at(local, cell_px, a.grid_dims);
+                    let cell = input::cell_at(local, cell_px, g.grid);
                     let action = mullion_term::keymap::wheel_action(
-                        conn.pane.emulator.mode(),
+                        pane.emulator.mode(),
                         self.mods.shift_key(),
                         lines,
                         cell,
                     );
                     match action {
                         WheelAction::LocalScroll { lines } => {
-                            conn.pane.emulator.scroll(Scroll::Delta(lines));
+                            pane.emulator.scroll(Scroll::Delta(lines));
                         }
                         WheelAction::Report {
                             button,
@@ -784,7 +1025,7 @@ impl ApplicationHandler<UserEvent> for App {
                             for _ in 0..count {
                                 bytes.extend_from_slice(&one);
                             }
-                            let _ = conn.ssh.write(bytes);
+                            let _ = pane.pty.write(bytes);
                         }
                         WheelAction::ArrowKeys { up, count } => {
                             // SS3(`ESC O A/B`),不是 `encode_key` 的 CSI——见
@@ -795,7 +1036,7 @@ impl ApplicationHandler<UserEvent> for App {
                             for _ in 0..count {
                                 bytes.extend_from_slice(&one);
                             }
-                            let _ = conn.ssh.write(bytes);
+                            let _ = pane.pty.write(bytes);
                         }
                         WheelAction::None => {}
                     }
@@ -810,7 +1051,19 @@ impl ApplicationHandler<UserEvent> for App {
             // T5 的 Shift 逃生门分流;将来加按键上报时,分流点就在这里
             // (与上面 MouseWheel 的 `wheel_action` 同构)。
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
-                (MouseButton::Left, ElementState::Pressed) => self.selection_press(),
+                (MouseButton::Left, ElementState::Pressed) => {
+                    // 点哪块就切到哪块(F33)。必须在 selection_press 之前:
+                    // 划选的锚点要落在新焦点 pane 的坐标系里。
+                    if let Some(id) = self.pane_at(self.cursor_px) {
+                        if let Some(ws) = self.ws.as_mut() {
+                            if ws.focus() != id {
+                                ws.set_focus(id);
+                                self.ui_dirty = true;
+                            }
+                        }
+                    }
+                    self.selection_press();
+                }
                 (MouseButton::Left, ElementState::Released) => self.selection_release(),
                 // 右键直接贴,不弹菜单(Windows 终端习惯,F18 交互口径)。
                 (MouseButton::Right, ElementState::Pressed) => self.request_paste(),
@@ -853,8 +1106,8 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 Scroll::PageDown
                             };
-                            if let Some(conn) = self.conn.as_mut() {
-                                conn.pane.emulator.scroll(scroll);
+                            if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                                pane.emulator.scroll(scroll);
                             }
                             self.request_ui_redraw();
                             return;
@@ -862,24 +1115,23 @@ impl ApplicationHandler<UserEvent> for App {
                         let bytes = mullion_term::keymap::encode_key(key, mods, self.kitty);
                         // `let _` 全文件都这样:写/resize 失败(断线等)没有用户提示、
                         // 无重连。断线感知与重连是 S3,后续 spec,这里不做。
-                        // launcher 态(conn=None)没有终端可写,按键静默丢弃。
-                        if let Some(conn) = self.conn.as_mut() {
+                        // launcher 态(ws=None)没有终端可写,按键静默丢弃。按键永远发给
+                        // **焦点** pane(F33)——分屏后不该出现「按了 A 屏的键跑进 B 屏」。
+                        if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
                             // F18:一按普通键就清选区。留着的话高亮会挂在屏幕上,
                             // 而底下的内容早被新输出冲掉了——高亮的是别的字。
-                            conn.pane.emulator.selection_clear();
+                            pane.emulator.selection_clear();
                             // F17:一按普通键就贴回底部,否则「打字了但看不到自己输入」。
-                            conn.pane.emulator.scroll_to_bottom();
-                            let _ = conn.ssh.write(bytes);
+                            pane.emulator.scroll_to_bottom();
+                            let _ = pane.pty.write(bytes);
                         }
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
-                // 计算须在 conn 借用之前:conn.as_mut() 只借 self.conn 这一字段,
-                // 但 self.now_ms() 需要整个 &self,与仍存活的 conn 借用冲突。
                 let now = self.now_ms();
-                // 1+2. 排空 rx→feed emu→回写 PtyWrite(T1 红线)——仅终端态有字节可
-                // 处理;launcher 态(conn=None)没有终端,跳过,但下面的帧率闸 + egui
+                // 1+2. 排空每个 pane 的 rx→feed emu→回写各自的 PtyWrite(T1 红线)——
+                // 仅终端态有字节可处理;launcher 态(ws=None)没有终端,跳过,但下面的帧率闸 + egui
                 // 渲染仍要跑(egui 在 launcher 也要画占位 UI)。
                 self.pump_io();
                 // 2.2 自愈:能收到重绘请求本身就说明窗口大概率看得见。若还挂在
@@ -911,10 +1163,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // 「确实触发了一次 RedrawRequested」当作脏——这不是无条件轮询:
                 // ControlFlow::Wait 下 winit 不会凭空生成 RedrawRequested,真正的重绘
                 // 频率由触发它的事件(resize/connect/wake/OS 重绘)决定。
-                let dirty = match &self.conn {
-                    Some(conn) => {
-                        crate::frame::frame_is_dirty(conn.pacer.should_present(now), self.ui_dirty)
-                    }
+                let dirty = match &self.ws {
+                    Some(ws) => crate::frame::frame_is_dirty(
+                        crate::render::panes_ready_to_present(
+                            ws.panes().iter().map(|p| &p.pacer),
+                            now,
+                        ),
+                        self.ui_dirty,
+                    ),
                     None => true,
                 };
                 let action = self.limiter.plan(dirty, now);
@@ -922,9 +1178,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let presented = matches!(action, RedrawAction::Present);
                 match action {
                     RedrawAction::Present => {
-                        if let Some(a) = &mut self.active {
-                            let pane = self.conn.as_ref().map(|c| &c.pane);
-                            let connected = self.conn.is_some();
+                        if self.active.is_some() {
+                            // 几何先算:渲染、标题条、鼠标命中、window_change 全用这一份。
+                            let geoms = self.compute_geoms();
+                            if let Some(a) = self.active.as_mut() {
+                                a.geoms = geoms.clone();
+                            }
                             let sessions: &[mullion_store::SessionRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.list());
                             let store_available = self.store.is_some();
@@ -947,41 +1206,106 @@ impl ApplicationHandler<UserEvent> for App {
                                 .pending_paste
                                 .as_deref()
                                 .map(|text| crate::ui::paste::PasteView { text });
-                            let repaint_delay = render_frame(
-                                a,
-                                pane,
-                                &mut self.ui,
+
+                            // 快照要先全部取出来:PaneRender 借着它们,而 render_frame
+                            // 同时要 &mut self.ui。
+                            let snaps: Vec<_> = self
+                                .ws
+                                .as_ref()
+                                .map(|ws| {
+                                    geoms
+                                        .iter()
+                                        .filter_map(|g| {
+                                            ws.pane(g.id).map(|p| (*g, p.emulator.snapshot()))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let focus = self.ws.as_ref().map(Workspace::focus);
+                            let renders: Vec<crate::gpu::PaneRender<'_>> = snaps
+                                .iter()
+                                .map(|(g, s)| crate::gpu::PaneRender {
+                                    geom: *g,
+                                    snap: s,
+                                    focused: Some(g.id) == focus,
+                                })
+                                .collect();
+                            let titles: Vec<crate::ui::pane_title::TitleView<'_>> = self
+                                .ws
+                                .as_ref()
+                                .map(|ws| {
+                                    geoms
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, g)| crate::ui::pane_title::TitleView {
+                                            geom: *g,
+                                            index: i + 1,
+                                            host: ws.pane(g.id).and_then(|p| {
+                                                ws.hosts.get(p.host_ix).map(|h| h.label.as_str())
+                                            }),
+                                            status: ws.pane(g.id).map_or(
+                                                crate::shell::workspace::PaneStatus::Live,
+                                                |p| p.status,
+                                            ),
+                                            focused: Some(g.id) == focus,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let frame = crate::ui::UiFrame {
                                 sessions,
                                 store_available,
-                                connected,
-                                1, // 分屏(F30)未落地,恒 1 屏;F30 落地时这里要接真实 pane 数
-                                host_key_view,
-                                paste_view,
-                            );
+                                connected: self.ws.is_some(),
+                                panes: self.ws.as_ref().map_or(1, Workspace::pane_count),
+                                preset: self.current_preset,
+                                titles: &titles,
+                                host_key: host_key_view,
+                                paste: paste_view,
+                            };
+                            let a = self.active.as_mut().expect("上面刚判过 is_some");
+                            let (repaint_delay, actions) =
+                                render_frame(a, &renders, &mut self.ui, frame);
+                            drop(renders);
+                            drop(titles);
+                            drop(snaps);
+
                             self.limiter.record_present(now);
                             // egui 侧已画出;下面若 egui 又要一帧会重新置脏。
                             self.ui_dirty = false;
-                            if let Some(conn) = self.conn.as_mut() {
-                                conn.pacer.mark_presented();
-                                // 中央区(窗口减去 egui 菜单/状态栏)→ 终端网格(F34/T4)。
-                                // central_px 由本帧 build_ui 在 egui 布局后写入 self.ui,
-                                // 天然滞后一帧(首帧/未连接时用 resumed 里整窗口尺寸兜底)——
-                                // 可接受,不为此再跑一次 egui(见 Task 说明)。
-                                let (cols, rows) = shell::viewport::grid_dims(
-                                    self.ui.central_px,
-                                    (a.text.cell_w as u32, a.text.cell_h as u32),
-                                    (1, 1),
-                                );
-                                if (cols, rows) != a.grid_dims {
-                                    a.grid_dims = (cols, rows);
-                                    conn.pane.emulator.resize(cols, rows);
-                                    let _ = conn.ssh.resize(cols, rows); // T4
+                            // 施加几何:F34/T4 的唯一出口。本帧 build_ui 刚写入的
+                            // central_px 要下一帧才生效(与 B0 起就是这个语义)。
+                            if let Some(ws) = self.ws.as_mut() {
+                                for p in ws.panes_mut_iter() {
+                                    p.pacer.mark_presented();
                                 }
+                                ws.apply_geometry(&geoms);
+                            }
+                            // 布局动作:点了预设 / 点了标题条的 ×。路由逻辑在自由函数
+                            // `apply_layout_actions`(只碰 &mut Workspace,可脱离
+                            // runtime/proxy 单测);真正开新 channel 需要 runtime/proxy,
+                            // 落在 `spawn_fresh_panes`。
+                            if let Some(ws) = self.ws.as_mut() {
+                                if let Some((fresh, preset_out)) =
+                                    apply_layout_actions(ws, &actions)
+                                {
+                                    self.current_preset = preset_out;
+                                    self.ui_dirty = true;
+                                    self.spawn_fresh_panes(fresh);
+                                }
+                            }
+                            // F83 标题条开关:改的是行数,下一帧 compute_geoms
+                            // 算出新 grid,再由 apply_geometry 发 window_change。
+                            if self.ui.toggle_title_bars {
+                                self.ui.toggle_title_bars = false;
+                                if let Some(ws) = self.ws.as_mut() {
+                                    ws.title_bars = !ws.title_bars;
+                                }
+                                self.ui_dirty = true;
                             }
                             // 菜单动作(§4.2):断开回到 launcher 态 / 退出整个事件循环。
                             if self.ui.request_disconnect {
                                 self.ui.request_disconnect = false;
-                                self.conn = None;
+                                self.ws = None;
                             }
                             if self.ui.request_quit {
                                 self.ui.request_quit = false;
@@ -999,6 +1323,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 let at = Instant::now() + repaint_delay;
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+                            } else if let Some(at) = self.sync_timeout_wake(now) {
+                                // Important #2/T2:egui 这帧不需要重绘,但有 pane 卡在
+                                // 未超时的同步块里——主动排一次到超时点的唤醒,而不是
+                                // 无条件 Wait 等下一个不相关事件顺带救回冻住的画面。
+                                self.next_frame_at = Some(at);
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                             } else {
                                 self.next_frame_at = None;
                                 event_loop.set_control_flow(ControlFlow::Wait);
@@ -1014,8 +1344,14 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                     }
                     RedrawAction::Idle => {
-                        self.next_frame_at = None;
-                        event_loop.set_control_flow(ControlFlow::Wait);
+                        // Important #2/T2:同上——没有脏帧不代表没有 pane 卡在同步块里。
+                        if let Some(at) = self.sync_timeout_wake(now) {
+                            self.next_frame_at = Some(at);
+                            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+                        } else {
+                            self.next_frame_at = None;
+                            event_loop.set_control_flow(ControlFlow::Wait);
+                        }
                     }
                 }
 
@@ -1032,8 +1368,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // 经 next_frame_at/WaitUntil 排期,由 `about_to_wait` 到点补画。
                 if presented && self.dragging && self.autoscroll != 0 {
                     let lines = self.autoscroll;
-                    if let Some(conn) = self.conn.as_mut() {
-                        conn.pane.emulator.scroll(Scroll::Delta(lines));
+                    if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                        pane.emulator.scroll(Scroll::Delta(lines));
                     }
                     // 滚动改了 display_offset,选区终点要按新视口重新落点,
                     // 否则拖到边缘后画面在滚、选区却停在原地不长。
@@ -1045,7 +1381,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Task 6:会话管理弹窗的 intent 施加点。放在 `plan` 整块之后——此处
-                // self.active/self.conn/self.ui 的借用都已释放,才能拿 `&mut
+                // self.active/self.ws/self.ui 的借用都已释放,才能拿 `&mut
                 // self.store`(egui 闭包里借不到它,只能在这里事后统一施加)。
                 if self.ui.delete_request.is_some() || self.ui.save_request.is_some() {
                     // keyring/TOML 是同步 IO,在事件回调里可能阻塞(Windows 凭据管理器
@@ -1083,9 +1419,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.key_picker_busy = true;
                     self.spawn_key_picker();
                 }
-                // 连接:双击行 / 点「连接」。spawn_connect 是 &self 方法,必须在
-                // store 的 &mut 借用结束后调(下面 `self.store.as_ref()` 的临时借
-                // 用在 match 表达式求值完就释放,故可紧接着调 self.spawn_connect)。
+                // 连接:双击行 / 点「连接」。必须在 store 的 &mut 借用结束后调
+                // (下面 `self.store.as_ref()` 的临时借用在 match 表达式求值完就
+                // 释放,故可紧接着调 self.spawn_connect)。
                 if let Some(id) = self.ui.connect_request.take() {
                     match self.store.as_ref().map(|s| s.ssh_config_for(id)) {
                         Some(Ok(cfg)) => {
@@ -1130,7 +1466,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 // F18:粘贴确认弹窗的回答。放在这里而不是 egui 闭包里——发送要
-                // `&mut self.conn`,闭包里借不到(与会话管理器/主机密钥同构)。
+                // `&mut self.ws`,闭包里借不到(与会话管理器/主机密钥同构)。
                 if let Some(accept) = self.ui.paste_reply.take() {
                     if let Some(text) = self.pending_paste.take() {
                         if accept {
@@ -1159,37 +1495,121 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-/// 一帧渲染:先跑 egui(菜单栏 + 状态栏,§4.2),再(终端态时)叠加背景色块 + 文字
-/// 前景趟。返回 egui 想要的下次重绘时间(`Duration::MAX` = 不需要);调用方据此走
-/// T3/T7 的 `next_frame_at`/`WaitUntil`,不会无条件 `request_redraw`。GPU 胶水,无单测。
-#[allow(clippy::too_many_arguments)] // 计划(Task 9)明确要求的签名;拆结构体属于范围外重构。
+/// 本帧 UI 产生的布局动作(点了工具栏的预设按钮 / 点了某个 pane 标题条的 ×)
+/// 路由到 `Workspace` 上。只碰 `&mut Workspace`,不碰 `App` 的 `_runtime`/
+/// `proxy` 字段 —— 这是刻意的:`EventLoopProxy` 在本仓库的无头测试容器里
+/// 造不出来(经验证实,见 `host_key.rs:131` 附近同样绕开它的先例),把"点了
+/// 哪个预设就该切到哪棵树""关了哪个 pane 就该少哪个 id"这两条真正的路由
+/// 逻辑摘出来单独放在这个自由函数里,才能拿一个真实构造的 `Workspace` 直接
+/// 单测,而不必伪造一个绕开被测代码的假测试。
+///
+/// 返回 `None` 表示这一帧没有布局动作,调用方不需要动 `current_preset`/标脏/
+/// 开新 channel。返回 `Some((新增待开 channel 的 pane id, 新的 current_preset))`——
+/// 后者在只点了预设时是 `Some(preset)`,在点了关闭(不论是否同帧还点了预设)时
+/// 是 `None`:手动关掉一个 pane 后,布局不再对应任何预设。真正开 channel 需要
+/// `_runtime`/`proxy`,留给调用方的 `App::spawn_fresh_panes`。
+fn apply_layout_actions(
+    ws: &mut Workspace,
+    actions: &crate::ui::UiActions,
+) -> Option<(Vec<PaneId>, Option<Preset>)> {
+    if actions.preset.is_none() && actions.close_pane.is_none() {
+        return None;
+    }
+    let mut fresh = Vec::new();
+    let mut preset_out = None;
+    let mut changed = false;
+    if let Some(preset) = actions.preset {
+        fresh = ws.apply_preset(preset);
+        preset_out = Some(preset);
+        changed = true;
+    }
+    if let Some(id) = actions.close_pane {
+        // close_pane 在「只剩最后一个 pane」时会拒绝并返回 false、树不变——这种
+        // 情况下不该清掉 preset_out,否则工具栏的当前预设高亮会被平白抹掉,
+        // 而树其实什么都没变。
+        if ws.close_pane(id) {
+            preset_out = None;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some((fresh, preset_out))
+}
+
+/// C1:事件携带的世代号是否与当前 `Workspace` 一致——`PaneOpened` 与
+/// `PaneOpenErr` 共用同一条判断,避免两处各写一遍、将来改一处漏改另一处。
+fn generation_matches(ws: &Workspace, generation: u64) -> bool {
+    ws.generation() == generation
+}
+
+/// 晚到的 `PaneOpened` 是否还该被 attach。两个独立的理由都会让答案是"不该":
+///
+/// 1. 用户又切了一次预设——`apply_preset` 把等待中的叶子从树上摘掉了,`id`
+///    已经不在树上;attach 上去是一个渲染/标题条都看不见、但 `Workspace::pump`
+///    仍在每帧驱动的孤儿 pane,SSH channel 永远不关,直到整条连接断开。
+/// 2. 用户断开又重连(C1)——`id` 还在树上,甚至已经被新世代自己的
+///    `PaneOpened` 正常 attach 过,但这是**旧世代**的事件(`next_id` 每次
+///    重连都从 2 重新计数,两代的 `id` 必然会撞号);只看 id/树成员会误判为
+///    "还需要",实际 attach 上去会顶掉新世代刚建好、正常工作的 `PaneState`。
+///
+/// 纯函数(只读 `&Workspace`),不碰 `EventLoopProxy`,可脱离真实事件循环单测。
+fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
+    generation_matches(ws, generation) && mullion_core::layout::leaves(ws.tree()).contains(&id)
+}
+
+/// Important #2:`App::sync_timeout_wake` 的核心决策抽成自由函数——只吃
+/// `start`(`App::now_ms` 的同一时钟基准)/`Option<&Workspace>`/`now_ms`,
+/// 不碰 `&App` 本身,因此不需要能构造 `EventLoopProxy`(本容器里构造不出来,
+/// 见 `apply_layout_actions` 同样的理由)就能单测「该不该唤醒、唤醒到哪个
+/// 时刻」这条决策路径。真正判断"哪个 pane、超时到几点"的逻辑在
+/// `render::earliest_sync_timeout_ms`(已单测),这里只做时钟基准换算。
+fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> Option<Instant> {
+    let ws = ws?;
+    let deadline_ms =
+        crate::render::earliest_sync_timeout_ms(ws.panes().iter().map(|p| &p.pacer), now_ms)?;
+    Some(start + std::time::Duration::from_millis(deadline_ms))
+}
+
+/// 一帧渲染:先跑 egui(菜单栏 + 工具栏 + 状态栏 + 标题条,§4.2),再(终端态时)
+/// 叠加背景色块 + 文字前景趟。返回 (egui 想要的下次重绘时间, 本帧的布局动作)——
+/// 前者 `Duration::MAX` = 不需要,调用方据此走 T3/T7 的 `next_frame_at`/
+/// `WaitUntil`,不会无条件 `request_redraw`;后者由调用方在借用释放后统一施加。
+/// GPU 胶水,无单测。
 fn render_frame(
     a: &mut Active,
-    pane: Option<&Pane>,
+    panes: &[crate::gpu::PaneRender<'_>],
     ui_state: &mut crate::ui::UiState,
-    sessions: &[mullion_store::SessionRecord],
-    store_available: bool,
-    connected: bool,
-    panes: usize,
-    host_key: Option<crate::ui::host_key::HostKeyView<'_>>,
-    paste: Option<crate::ui::paste::PasteView<'_>>,
-) -> std::time::Duration {
+    frame: crate::ui::UiFrame<'_>,
+) -> (std::time::Duration, crate::ui::UiActions) {
     diag::count_frame();
-    // --- egui:每帧都跑,launcher 态(pane=None)也要画菜单/状态栏。---
+    // --- egui:每帧都跑,launcher 态(panes 为空)也要画菜单/状态栏。---
     diag::mark(diag::Stage::EguiRun);
     let raw_input = a.egui_state.take_egui_input(&a.window);
+    let mut actions = crate::ui::UiActions::default();
+    // egui::Context::run 内部是个 loop(egui 0.30 context.rs:802-841):首趟跑完
+    // 若 `platform_output.requested_discard()`(例如某些部件首次展示时调用
+    // `request_discard`,如 Grid 首帧)且未超 `max_passes`(默认 2),会整帧重画
+    // 一次 —— 而重画前 `RawInput` 已被 `mem::take()`(egui 0.30
+    // `data/input.rs:116`,`Context::run` 在两趟之间把上一趟的输入拿走清空),
+    // 所以 discard 趟里 `ctx` 收到的是一份空事件的 `RawInput`,`build_ui` 在
+    // 那一趟必然拿不到真实点击,只能产出 `UiActions::default()`。`UiFrame`
+    // 因此按值收(`derive(Copy)`,见其定义处注释),但 `actions` **不能**每趟
+    // 无条件整体覆盖:若 discard 趟排在真实点击那趟之后,无条件覆盖会用这份
+    // default 悄悄吃掉第一趟已经拿到的真实点击(例如点了预设按钮的那一帧,
+    // 因为某个部件首次展示触发了 discard,预设切换的 `actions.preset` 就会被
+    // 静默清空)。改成"仅当本趟产出非默认值时才覆盖":真实点击总能被记住,
+    // discard 趟的空结果不会覆盖掉它;若两趟都没有真实点击,`actions` 保持
+    // 默认值,语义不变。
     let full_output = a.egui_ctx.run(raw_input, |ctx| {
-        crate::ui::build_ui(
-            ctx,
-            &MULLION_DARK,
-            ui_state,
-            sessions,
-            store_available,
-            connected,
-            panes,
-            host_key,
-            paste,
-        );
+        let this_pass = crate::ui::build_ui(ctx, &MULLION_DARK, ui_state, frame);
+        // `UiActions` 没有 derive `PartialEq`,这里是逐字段手写的"是否有真实动作"——
+        // 给 `UiActions` 加新字段时必须在这里补上对应的 `.is_some()`(或等价判断),
+        // 否则新动作会在上面文档注释说的 discard 趟里被静默丢弃。
+        if this_pass.preset.is_some() || this_pass.close_pane.is_some() {
+            actions = this_pass;
+        }
     });
     a.egui_state
         .handle_platform_output(&a.window, full_output.platform_output);
@@ -1214,41 +1634,37 @@ fn render_frame(
     // trim 只清 in_use 标记不删纹理,首帧对空图集是 no-op,正常帧语义不变。
     a.text.trim();
 
-    // --- 终端趟:仅 pane 存在(终端态)才生成 quads/prepare 文字;launcher 态
-    // (pane=None)没有终端可画,跳过,只画上面的 egui。---
-    let terminal_draw = match pane {
-        Some(pane) => {
-            diag::mark(diag::Stage::TextPrepare);
-            let snap = pane.emulator.snapshot();
-            let res = glyphon::Resolution {
-                width: a.gpu.config.width,
-                height: a.gpu.config.height,
-            };
-            // 终端整体平移到 egui 中央区(菜单栏之下)。origin 由本帧上面的
-            // `build_ui` 刚写入,是**同帧**新鲜值(不像 central_px 要等到 present
-            // 之后才被 grid_dims 消费而滞后一帧)。
-            let origin = ui_state.central_origin_px;
-            let quads = quads_for(
-                &snap,
-                origin,
-                a.text.cell_w,
-                a.text.cell_h,
-                theme::term_default_colors(&MULLION_DARK),
-            );
-            // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
-            // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。
-            if let Err(e) = a
-                .text
-                .prepare(&a.gpu.device, &a.gpu.queue, &snap, origin, res)
-            {
-                log::warn!(target: "mullion", "glyphon prepare 失败,跳过本帧: {e:?}");
-                diag::count_skipped();
-                return std::time::Duration::MAX;
-            }
-            let inst = a.gpu.quad_instances(&quads);
-            Some((inst, quads.len() as u32))
+    // --- 终端趟:仅 panes 非空(终端态)才生成 quads/prepare 文字;launcher 态
+    // (panes 为空)没有终端可画,跳过,只画上面的 egui。每个 pane 自带 term_px
+    // (来自调用方 `App::compute_geoms` 的 `layout_geometry`),色块层与文字层
+    // 吃同一份 panes——这正是 gpu.rs:44 那条「文字层必须用同一个 origin」
+    // 不变量要求的。
+    let terminal_draw = if panes.is_empty() {
+        None
+    } else {
+        diag::mark(diag::Stage::TextPrepare);
+        let res = glyphon::Resolution {
+            width: a.gpu.config.width,
+            height: a.gpu.config.height,
+        };
+        let quads = quads_for_panes(
+            panes,
+            a.text.cell_w,
+            a.text.cell_h,
+            theme::term_default_colors(&MULLION_DARK),
+        );
+        // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
+        // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。
+        if let Err(e) = a
+            .text
+            .prepare_panes(&a.gpu.device, &a.gpu.queue, panes, res)
+        {
+            log::warn!(target: "mullion", "glyphon prepare 失败,跳过本帧: {e:?}");
+            diag::count_skipped();
+            return (std::time::Duration::MAX, actions);
         }
-        None => None,
+        let inst = a.gpu.quad_instances(&quads);
+        Some((inst, quads.len() as u32))
     };
 
     diag::mark(diag::Stage::Acquire);
@@ -1257,18 +1673,18 @@ fn render_frame(
         Err(wgpu::SurfaceError::Timeout) => {
             log::warn!(target: "mullion", "wgpu get_current_texture 超时,跳过本帧");
             diag::count_skipped();
-            return std::time::Duration::MAX;
+            return (std::time::Duration::MAX, actions);
         }
         Err(e @ (wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)) => {
             log::warn!(target: "mullion", "wgpu surface {e:?},重新 configure 后跳过本帧");
             a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
             diag::count_skipped();
-            return std::time::Duration::MAX;
+            return (std::time::Duration::MAX, actions);
         }
         Err(wgpu::SurfaceError::OutOfMemory) => {
             log::error!(target: "mullion", "wgpu get_current_texture OutOfMemory,跳过本帧");
             diag::count_skipped();
-            return std::time::Duration::MAX;
+            return (std::time::Duration::MAX, actions);
         }
     };
     diag::mark(diag::Stage::Encode);
@@ -1336,13 +1752,17 @@ fn render_frame(
         a.egui_renderer.free_texture(id);
     }
 
-    repaint_delay
+    (repaint_delay, actions)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        apply_layout_actions, generation_matches, pane_still_wanted, sync_timeout_wake_at,
+    };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
+    use crate::shell::workspace::{Preset, Workspace};
     use mullion_core::layout::{Dir, Node, PaneId, Rect};
 
     #[test]
@@ -1388,6 +1808,387 @@ mod tests {
             sink.calls,
             vec![(PaneId(1), 40, 24), (PaneId(2), 40, 24)],
             "resize 列数必须与新矩形一致(F34)"
+        );
+    }
+
+    /// F34/T4:窗口 resize 的几何必须经 `layout_geometry` 算,再由
+    /// `Workspace::apply_geometry` 施加。这里锁住"整窗尺寸 → 每 pane 网格"
+    /// 这一段换算 —— 接线写错的典型症状是分屏后远端按整窗列数排版。
+    #[test]
+    fn window_resize_maps_to_per_pane_grids_f34() {
+        use crate::shell::workspace::{layout_geometry, PxRect};
+        use mullion_core::layout::{Dir, Node, PaneId};
+
+        let tree = Node::Split {
+            dir: Dir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(PaneId(1))),
+            b: Box::new(Node::Leaf(PaneId(2))),
+        };
+        let area = PxRect {
+            x: 0,
+            y: 100,
+            w: 1600,
+            h: 900,
+        };
+        let geoms = layout_geometry(&tree, area, (10.0, 20.0), true);
+        assert_eq!(geoms.len(), 2);
+        for g in &geoms {
+            assert!(
+                g.grid.0 < 160,
+                "每 pane 的列数必须小于整窗列数,否则是没分屏就发了 window_change"
+            );
+            assert!(g.grid.0 >= 1 && g.grid.1 >= 1);
+        }
+    }
+
+    /// 状态栏的屏数取自布局树,不是硬编码。B1 遗留技术债 1 的兜底。
+    #[test]
+    fn status_bar_pane_count_comes_from_the_tree() {
+        use mullion_core::layout::{leaves, Dir, Node, PaneId};
+        let tree = Node::Split {
+            dir: Dir::Vertical,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(PaneId(1))),
+            b: Box::new(Node::Leaf(PaneId(7))),
+        };
+        assert_eq!(leaves(&tree).len(), 2);
+        let (left, _) = crate::ui::chrome::status_text(leaves(&tree).len(), true);
+        assert_eq!(left, "2 屏 · 已连接");
+    }
+
+    /// `apply_layout_actions` 之下没有 runtime/proxy,可以拿真实构造的
+    /// `Workspace` 直接单测——这几个测试专门堵 handoff 4.6 点名的两个坑:
+    /// "点了预设 X,是不是真的切到了 X"、"点了关闭 pane Y,是不是真的关掉了 Y"。
+    struct NullPty;
+    impl crate::shell::workspace::PtyWriter for NullPty {
+        fn write(&self, _bytes: Vec<u8>) -> Result<(), mullion_ssh::session::TrySendErr> {
+            Ok(())
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), mullion_ssh::session::TrySendErr> {
+            Ok(())
+        }
+    }
+
+    fn test_pane(id: u32) -> crate::shell::workspace::PaneState {
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        crate::shell::workspace::PaneState {
+            id: PaneId(id),
+            host_ix: 0,
+            emulator: mullion_term::emulator::Emulator::new(80, 24),
+            pty: Box::new(NullPty),
+            rx,
+            pacer: crate::render::SyncFramePacer::new(),
+            status: crate::shell::workspace::PaneStatus::Live,
+            last_grid: (80, 24),
+        }
+    }
+
+    /// 点工具栏上的预设按钮 X,树必须真的变成 X 对应的形状,不是停在原地、
+    /// 也不是无条件切到某个写死的预设。两次切不同的预设,确认路由跟着点击
+    /// 的值走(如果实现里硬编码了一个预设,第二个断言必挂)。
+    #[test]
+    fn preset_click_switches_to_the_specific_preset_clicked() {
+        let mut ws = Workspace::new(test_pane(1), 0);
+        let (fresh, preset_out) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: Some(Preset::ThreeColumns),
+                close_pane: None,
+            },
+        )
+        .expect("点了预设,动作不该是 None");
+        assert_eq!(
+            preset_out,
+            Some(Preset::ThreeColumns),
+            "必须切到点击的那个预设,不是别的"
+        );
+        assert_eq!(
+            fresh.len(),
+            2,
+            "ThreeColumns 比原来的 1 屏多 2 个新叶子等着上线"
+        );
+        assert_eq!(
+            mullion_core::layout::leaves(ws.tree()).len(),
+            3,
+            "树上必须真的变成 3 个叶子,不是停在原来的 Single"
+        );
+        for id in &fresh {
+            ws.attach_pane(test_pane(id.0));
+        }
+
+        // 再点一个不同的预设,确认不是写死指向 ThreeColumns。
+        let (_, preset_out2) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: Some(Preset::TwoTopBottom),
+                close_pane: None,
+            },
+        )
+        .expect("点了预设,动作不该是 None");
+        assert_eq!(preset_out2, Some(Preset::TwoTopBottom));
+        assert_eq!(mullion_core::layout::leaves(ws.tree()).len(), 2);
+    }
+
+    /// 点某个 pane 标题条上的 ×,必须真的只关掉**那一个** pane——不是关掉焦点
+    /// pane、也不是关掉第一个 pane。特意选一个不等于当前焦点的目标,堵死
+    /// "实现里其实关的是 ws.focus() 而不是传入的 id"这类巧合过关的 bug。
+    #[test]
+    fn close_pane_click_closes_the_specific_pane_clicked() {
+        let mut ws = Workspace::new(test_pane(1), 0);
+        let (fresh, _) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: Some(Preset::ThreeColumns),
+                close_pane: None,
+            },
+        )
+        .unwrap();
+        for id in &fresh {
+            ws.attach_pane(test_pane(id.0));
+        }
+        let all_ids = mullion_core::layout::leaves(ws.tree());
+        assert_eq!(all_ids.len(), 3);
+        let focus = ws.focus();
+        let target = *all_ids
+            .iter()
+            .find(|&&id| id != focus)
+            .expect("三个 pane 里总有一个不是焦点");
+        let others: Vec<PaneId> = all_ids.iter().copied().filter(|&id| id != target).collect();
+
+        let (fresh2, preset_out2) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: None,
+                close_pane: Some(target),
+            },
+        )
+        .expect("点了关闭,动作不该是 None");
+        assert!(fresh2.is_empty(), "关 pane 不该产生待开的新 channel");
+        assert_eq!(preset_out2, None, "手动关闭后不再对应任何预设");
+        assert!(
+            ws.pane(target).is_none(),
+            "点击关闭的那个 pane 必须真的没了"
+        );
+        for id in others {
+            assert!(ws.pane(id).is_some(), "没点的 pane 不该被殃及(id={id:?})");
+        }
+    }
+
+    /// 没有任何动作的一帧:不该无中生有地改 current_preset / 触发重绘。
+    #[test]
+    fn no_ui_action_means_no_layout_change() {
+        let mut ws = Workspace::new(test_pane(1), 0);
+        let result = apply_layout_actions(&mut ws, &crate::ui::UiActions::default());
+        assert!(result.is_none(), "什么都没点,不该有布局动作");
+        assert_eq!(mullion_core::layout::leaves(ws.tree()).len(), 1);
+    }
+
+    /// 复核 Important #1:开 channel 是真实网络往返,`PaneOpened` 可能在用户
+    /// 又切了一次预设之后才回来——此时 `id` 已经不在树上了。`pane_still_wanted`
+    /// 必须能识破这种"晚到的、树上已经没有对应叶子"的 id,不然
+    /// `attach_pane` 会攒出一个渲染/标题条都看不见、但仍被 `pump` 每帧驱动的
+    /// 孤儿 pane(SSH channel 泄漏,直到整条连接断开才关)。
+    #[test]
+    fn pane_still_wanted_rejects_a_leaf_dropped_by_a_later_preset_switch() {
+        let mut ws = Workspace::new(test_pane(1), 0);
+        // 切到 ThreeColumns:多出 2 个待开的新叶子。特意不 attach——模拟它们的
+        // SSH channel 还在网络上跑,尚未收到 PaneOpened。
+        let (fresh, _) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: Some(Preset::ThreeColumns),
+                close_pane: None,
+            },
+        )
+        .expect("点了预设,动作不该是 None");
+        assert_eq!(fresh.len(), 2, "ThreeColumns 比原来的 1 屏多 2 个新叶子");
+
+        // 在那 2 个 channel 回来之前,用户又切回 Single——把刚才的叶子从树上摘掉。
+        let (fresh2, _) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: Some(Preset::Single),
+                close_pane: None,
+            },
+        )
+        .expect("点了预设,动作不该是 None");
+        assert!(fresh2.is_empty(), "切回 Single 不会产生待开的新 channel");
+
+        let remaining = mullion_core::layout::leaves(ws.tree());
+        assert_eq!(remaining.len(), 1, "Single 下树上只剩 1 个叶子");
+
+        // fresh 里必有至少一个 id 已经不在树上了——这就是"晚到"的那个 PaneOpened。
+        let late_id = *fresh
+            .iter()
+            .find(|id| !remaining.contains(id))
+            .expect("ThreeColumns 的 2 个新叶子里,Single 下必有至少一个被摘掉");
+        assert!(
+            !pane_still_wanted(&ws, late_id, ws.generation()),
+            "id={late_id:?} 已经不在树上了,晚到的 PaneOpened 必须被拒绝,\
+             不能 attach 成孤儿 pane"
+        );
+
+        // 正例:树上仍然存在的叶子、世代号也对得上,不该被误杀。
+        let still_here = remaining[0];
+        assert!(
+            pane_still_wanted(&ws, still_here, ws.generation()),
+            "id={still_here:?} 还在树上、世代也匹配,正常到达的 PaneOpened 不该被拒绝"
+        );
+    }
+
+    /// 复核 Minor #3:`close_pane` 在"只剩最后一个 pane"时会拒绝并返回
+    /// false、树不变。这种情况下 `apply_layout_actions` 不该无脑清掉
+    /// `preset_out`,否则工具栏的当前预设高亮被平白抹掉,但树其实什么都
+    /// 没变——对用户来说是一次"点了没反应,但高亮还消失了"的诡异体验。
+    #[test]
+    fn closing_the_last_pane_is_a_noop_and_does_not_clear_current_preset() {
+        let mut ws = Workspace::new(test_pane(1), 0);
+        let (_, preset_out) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: Some(Preset::Single),
+                close_pane: None,
+            },
+        )
+        .expect("点了预设,动作不该是 None");
+        assert_eq!(preset_out, Some(Preset::Single));
+
+        let only_id = mullion_core::layout::leaves(ws.tree())[0];
+        let result = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: None,
+                close_pane: Some(only_id),
+            },
+        );
+        assert!(
+            result.is_none(),
+            "关最后一个 pane 应该是纯粹的 noop(close_pane 返回 false),\
+             不该报告出一个「布局变了」的动作"
+        );
+        assert!(ws.pane(only_id).is_some(), "最后一个 pane 不该被真的关掉");
+    }
+
+    /// 复核 Important #2/T2:没有 pane 卡在同步块里时,不该无中生有排一个
+    /// `WaitUntil`(否则就是新开了一条会忙转的唤醒路径,踩 T3/T7)。
+    #[test]
+    fn sync_timeout_wake_is_none_when_no_pane_is_holding() {
+        let start = std::time::Instant::now();
+        assert_eq!(
+            sync_timeout_wake_at(start, None, 0),
+            None,
+            "launcher 态(没有 Workspace)不该排任何唤醒"
+        );
+
+        let ws = Workspace::new(test_pane(1), 0);
+        assert_eq!(
+            sync_timeout_wake_at(start, Some(&ws), 0),
+            None,
+            "刚建好、没进过同步块的 pane 不该产生一个假的唤醒时刻"
+        );
+    }
+
+    /// 复核 Important #2/T2:有 pane 卡在未超时的同步块里(远端发了 BSU 但还
+    /// 没发 ESU)时,必须换算出一个绝对的唤醒 `Instant`——而不是让事件循环
+    /// 无条件 `ControlFlow::Wait`,把「~150ms 自愈」的保证退化成「等下一个不
+    /// 相关事件顺带救回来」。
+    #[test]
+    fn sync_timeout_wake_targets_the_holding_panes_deadline() {
+        let start = std::time::Instant::now();
+        let mut ws = Workspace::new(test_pane(1), 0);
+        ws.pane_mut(PaneId(1))
+            .unwrap()
+            .pacer
+            .feed(b"\x1b[?2026h", 0); // BSU 于 t=0,超时于 t=150
+
+        let at = sync_timeout_wake_at(start, Some(&ws), 60)
+            .expect("有 pane 卡在未超时的同步块里,必须返回一个唤醒时刻");
+        let deadline_ms = at.duration_since(start).as_millis() as u64;
+        assert_eq!(
+            deadline_ms, 150,
+            "唤醒时刻必须对齐 SYNC_TIMEOUT_MS(150ms),不是任意提前/推迟的时刻"
+        );
+
+        // 过了超时点:该 pane 不再算「卡住」(T2 的逃生门——过时就照常出帧,
+        // 不再为它排唤醒),不该再排一次。
+        assert_eq!(
+            sync_timeout_wake_at(start, Some(&ws), 150),
+            None,
+            "超时已过,不该再为同一个 pane 排一次唤醒(否则是忙转)"
+        );
+    }
+
+    /// 复核 C1(终审):跨「断开→重连」世代的 PaneId 碰撞。`Workspace::new` 每
+    /// 次都从 `next_id = id.0 + 1` 起步(生产代码里首 pane 恒 `PaneId(1)`),
+    /// 所以每建一个新 Workspace,分屏分配出的 id 都从 2 重新计数——旧世代
+    /// 飞行中的 `PaneOpened` 抵达时,`id` 在新世代的树上完全可能被复用、甚至
+    /// 已经被新世代自己正常 attach 过。只查 id/树成员(上一轮 Important #1
+    /// 的 `pane_still_wanted`)会误判为"还需要",实际 attach 会顶掉新世代刚
+    /// 建好、正常工作的 `PaneState`——连同它干净的 SSH channel 一起被 Drop,
+    /// 该 pane 此后的输入全部写进一条已经没有意义的旧连接。
+    #[test]
+    fn pane_still_wanted_rejects_a_stale_generations_pane_even_if_the_id_is_reused() {
+        // 新世代(重连后的第二个 Workspace,世代号 1)。
+        let mut ws = Workspace::new(test_pane(1), 1);
+        let (fresh, _) = apply_layout_actions(
+            &mut ws,
+            &crate::ui::UiActions {
+                preset: Some(Preset::TwoLeftRight),
+                close_pane: None,
+            },
+        )
+        .expect("点了预设,动作不该是 None");
+        assert_eq!(
+            fresh,
+            vec![PaneId(2)],
+            "新世代的 next_id 同样从 2 起步——这就是撞号的根源"
+        );
+
+        // 新世代自己的 open_pty 正常回来,attach 上去。last_grid 用一个哨兵值
+        // 标记"这是新世代亲手建的 PaneState",后面拿它验证有没有被顶掉。
+        let mut new_pane = test_pane(2);
+        new_pane.last_grid = (99, 99);
+        ws.attach_pane(new_pane);
+
+        // 旧世代(世代号 0,已经被断开)当时也分配过 PaneId(2)、也在飞行中,
+        // 现在才迟到抵达。
+        assert!(
+            !pane_still_wanted(&ws, PaneId(2), 0),
+            "id=2 在树上、甚至已经 attach——单看 id/树成员会误判为「还需要」;\
+             但这是旧世代(0)的事件,当前 Workspace 已经是世代 1,必须拒绝"
+        );
+        // 正例:同一世代(1)的事件应该照常被接受。
+        assert!(
+            pane_still_wanted(&ws, PaneId(2), 1),
+            "世代匹配、id 也在树上,不该被误杀"
+        );
+
+        // 核心断言:生产代码在 pane_still_wanted 返回 false 时不会调
+        // attach_pane,新世代的 PaneState 必须原封不动——没有被旧世代的迟到
+        // 事件顶掉。
+        assert_eq!(
+            ws.pane(PaneId(2)).map(|p| p.last_grid),
+            Some((99, 99)),
+            "新世代刚建好的 PaneState 不该被旧世代的迟到事件顶掉"
+        );
+    }
+
+    /// 复核 C1:`PaneOpenErr` 直接调 `generation_matches`(不经过
+    /// `pane_still_wanted`,因为它不关心 id/树成员,只关心"这条失败提示还是
+    /// 不是当前世代的")——单独锁住这条判断,不依赖 `pane_still_wanted` 的
+    /// 组合行为碰巧带出覆盖。旧世代的失败提示如果不过滤,会给用户弹一条跟
+    /// 当前连接毫不相干的错误 toast。
+    #[test]
+    fn generation_matches_only_accepts_the_current_workspaces_generation() {
+        let ws = Workspace::new(test_pane(1), 3);
+        assert!(
+            generation_matches(&ws, 3),
+            "世代号一致,该事件属于当前 Workspace"
+        );
+        assert!(
+            !generation_matches(&ws, 2),
+            "世代号不一致(旧世代迟到的事件),不该被当成当前世代的"
         );
     }
 }

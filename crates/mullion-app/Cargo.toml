@@ -18,6 +18,7 @@ winit.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
 tokio.workspace = true
+russh.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 directories = "5"
 egui.workspace = true

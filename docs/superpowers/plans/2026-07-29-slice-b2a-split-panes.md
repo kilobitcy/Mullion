@@ -2600,15 +2600,16 @@ title_area_covers_only_the_title_strip"
 
 ---
 
-## Task 11: `UiFrame` 聚参 + 状态栏接真实屏数（收技术债 2 与 3）
+## Task 11: `UiFrame` 聚参 + 状态栏接真实屏数（收技术债 3 + 屏数恒传 1 的兜底）
 
 **Files:**
 - Modify: `crates/mullion-app/src/ui/mod.rs:88-114`（`build_ui` 签名）
 - Modify: `crates/mullion-app/src/app.rs:1165-1193`（`render_frame` 签名与调用）
 - Modify: `crates/mullion-app/src/app.rs:950-960`（调用点）
 
-B1 遗留的两笔技术债在这里收掉：`build_ui` 已 9 参并带
-`#[allow(clippy::too_many_arguments)]`；`render_frame` 的 `panes` 恒传 `1`
+B1 遗留的技术债 3 在这里收掉：`build_ui` 已 9 参并带
+`#[allow(clippy::too_many_arguments)]`。同时收掉 B1 备忘「How to apply」段落里
+点名的另一笔欠账（不是编号项）：`render_frame` 的 `panes` 恒传 `1`
 （该行有注释提醒，但没有任何编译/测试兜底）。B2-a 还要再加工具栏和标题条的
 参数，不收就要变 12 参。
 
@@ -2852,7 +2853,8 @@ egui 闭包借不到 &mut Workspace。
         }
     }
 
-    /// 状态栏的屏数取自布局树,不是硬编码。B1 遗留技术债 1 的兜底。
+    /// 状态栏的屏数取自布局树,不是硬编码。B1 遗留欠账(屏数恒传 1)的兜底,
+    /// 不是编号技术债——见 slice-b1 备忘的「How to apply」段落。
     #[test]
     fn status_bar_pane_count_comes_from_the_tree() {
         use mullion_core::layout::{leaves, Dir, Node, PaneId};

@@ -32,7 +32,14 @@ pub fn top_menu(ctx: &egui::Context, t: &Theme, ui_state: &mut UiState, connecte
                     }
                 });
                 ui.menu_button("分屏", |ui| {
-                    ui.add_enabled(false, egui::Button::new("(F30 分屏 · 后续切片)"));
+                    ui.add_enabled(false, egui::Button::new("用工具栏的布局按钮切换"));
+                    // F83:标题条占 32px,关掉能换回一行终端。切换后行数会变,
+                    // 必须走 apply_geometry 发 window_change(T4),故只置意图。
+                    if ui.button("显示 / 隐藏 pane 标题条").clicked() {
+                        ui_state.toggle_title_bars = true;
+                        ui.close_menu();
+                    }
+                    ui.add_enabled(false, egui::Button::new("(快捷键 · 后续切片)"));
                 });
                 ui.menu_button("配置", |ui| {
                     ui.add_enabled(false, egui::Button::new("(F84 设置 · 后续切片)"));

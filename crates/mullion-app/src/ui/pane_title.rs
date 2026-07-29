@@ -1,0 +1,319 @@
+//! pane 标题条(F83)。每个 pane 顶部 32px:序号 + 主机名 + 连接状态点 + 关闭按钮。
+//!
+//! 用 egui `Area::fixed_pos` 按绝对像素定位,只覆盖标题条那 32px,**不能**盖住
+//! 整个 pane —— egui 在它覆盖的区域会吃掉指针事件(T8 的指针路由是"先喂 egui
+//! 后判"),盖大了终端就再也划不了选。
+
+use mullion_core::layout::PaneId;
+
+use crate::shell::workspace::{PaneGeom, PaneStatus};
+use crate::theme::{self, Theme};
+
+/// 一个标题条要显示的东西。
+pub struct TitleView<'a> {
+    pub geom: PaneGeom,
+    /// 该 pane 在几何顺序中的序号,从 1 起。
+    pub index: usize,
+    /// 主机标签(会话名或 user@host)。尚未连上时给 `None`。
+    pub host: Option<&'a str>,
+    pub status: PaneStatus,
+    pub focused: bool,
+}
+
+/// 标题条上的文字。抽成纯函数是因为格式会被人反复调,而它是唯一能自动验的部分。
+pub fn title_text(index: usize, host: Option<&str>, status: PaneStatus) -> String {
+    match (host, status) {
+        (Some(h), PaneStatus::Live) => format!("{index} · {h}"),
+        (Some(h), PaneStatus::Disconnected) => format!("{index} · {h} (已断开)"),
+        // (None, Disconnected) 并进这条通配分支是安全的,不是漏判:状态机里
+        // host == None 当且仅当 PaneState 还没挂上(见 Workspace::apply_preset),
+        // 此时 status 走默认的 Live;一旦 PaneState 存在,host_ix 必指向真实的
+        // HostConn,host 必为 Some。这个组合在当前状态机下不可达。
+        (None, _) => format!("{index} · 连接中…"),
+    }
+}
+
+/// 画一批标题条,返回被点了 × 的 pane(每帧至多一个)。
+///
+/// 用 `Area` 而非 `Panel`:标题条要跟着 pane 的绝对像素走,`Panel` 只会
+/// 从窗口边缘往里堆。`fixed_pos` 收 point,所以像素要先除 `pixels_per_point`。
+///
+/// **两处越界坑**(headless 实测坐实过,别再踩,详见函数体内注释):
+/// 1. `egui::Frame` 的占用尺寸(进而 `Area` 的可交互矩形,即
+///    `ctx.memory(|m| m.area_rect(id))`)取的是 `content_ui.min_rect() + margin`——
+///    只要内容(哪怕只有一个"●")的自然尺寸超过预留空间,`min_rect` 就会带着
+///    margin 一起把 `Area` 的实际矩形撑到 `title_px` 之外:横向侵入右边邻居 pane、
+///    纵向盖住终端第一行,吃掉本该属于终端的指针事件(T8 变体)。极端情形(高
+///    DPI + 窄标题条 + 长主机名)哪怕加了下面第 2 条的截断,单个状态点在被压得
+///    很矮的行高下仍可能比预留高度还高一丝——**不能**依赖"内容自己不超",必须
+///    在几何上钉死。
+/// 2. `ui.set_min_size` 只设下限、不设上限,`Label` 不截断的话 `horizontal` 布局
+///    会把行撑宽,顶出 `×` 按钮。
+///
+/// 因此这里不用 `Frame::show`(它会把内容的 `min_rect` 折回父 ui,内容一旦超出
+/// 预算,父 ui 跟着超),而是手动摆:背景用 `painter` 按 `full` 直接画死;内容摆进
+/// 一个**不参与父 ui 尺寸折算**的 `new_child`(`set_clip_rect` 保证画多了也只是被
+/// 裁掉,不会向外泄漏);最后显式 `allocate_rect(full, ..)`——`Area` 的占用尺寸永远
+/// 等于 `full`,不多不少,内容长成什么样都不影响这个几何承诺。
+/// `Area` 的 id,`show` 和测试都从这里取,别在两处各写一遍字面量。
+fn area_id(id: PaneId) -> egui::Id {
+    egui::Id::new(("pane_title", id.0))
+}
+
+pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<PaneId> {
+    let ppp = ctx.pixels_per_point();
+    let mut closed = None;
+    for v in views {
+        let tp = v.geom.title_px;
+        if tp.h == 0 {
+            continue; // 标题条关掉了(F83 开关)
+        }
+        let id = area_id(v.geom.id);
+        let pos = egui::pos2(tp.x as f32 / ppp, tp.y as f32 / ppp);
+        let size = egui::vec2(tp.w as f32 / ppp, tp.h as f32 / ppp);
+        let full = egui::Rect::from_min_size(pos, size);
+        egui::Area::new(id)
+            .fixed_pos(pos)
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                ui.painter().rect(
+                    full,
+                    0.0,
+                    theme::c32(if v.focused { t.panel_head } else { t.panel_bg }),
+                    theme::stroke(t),
+                );
+                let inner = full.shrink2(egui::vec2(8.0, 4.0));
+                let mut content = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                content.set_clip_rect(inner);
+                content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("×").on_hover_text("关闭此分屏").clicked() {
+                        closed = Some(v.geom.id);
+                    }
+                    // 剩下的空间(已扣掉 × 按钮)左对齐摆状态点 + 主机名;主机名
+                    // 排版用的 available_width 到这里已经是扣掉 × 之后的余量。
+                    // × 不被顶出条外,靠的是 right_to_left 先占位 + 外层 set_clip_rect
+                    // 裁剪(clip 同时裁交互,见 egui `Ui::interact`,egui-0.30 `ui.rs:1057`
+                    // 的 `interact_rect: self.clip_rect().intersect(rect)`);
+                    // Area 的外部几何已被
+                    // `allocate_rect(full, ..)` 硬钉死,与内容截不截断完全解耦。
+                    // `.truncate()` 现在唯一的作用是视觉观感(省略号 vs 硬裁切),
+                    // 不是防止 × 被顶出条外的兜底——删掉它 12 条测试仍全绿。
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let dot = match v.status {
+                            PaneStatus::Live => t.ok,
+                            PaneStatus::Disconnected => t.fg_dim,
+                        };
+                        ui.colored_label(theme::c32(dot), "●");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(title_text(v.index, v.host, v.status)).color(
+                                    theme::c32(if v.focused { t.fg_strong } else { t.fg_muted }),
+                                ),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
+                // 不把 content 的占用尺寸折回 ui——见函数文档注释第 1 条。
+                ui.allocate_rect(full, egui::Sense::hover());
+            });
+    }
+    closed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_shows_index_and_host() {
+        assert_eq!(
+            title_text(2, Some("dev@build-01"), PaneStatus::Live),
+            "2 · dev@build-01"
+        );
+    }
+
+    /// §6.3:断开的 pane 内容留着可滚可复制,但状态必须写在脸上 ——
+    /// 不然用户会对着一块不响应的终端反复敲键。
+    #[test]
+    fn disconnected_pane_says_so() {
+        let s = title_text(1, Some("h"), PaneStatus::Disconnected);
+        assert!(s.contains("已断开"), "断开状态没写进标题: {s}");
+    }
+
+    /// 预分配了叶子位但 channel 还没开好的空窗期(见 Workspace::apply_preset)。
+    #[test]
+    fn pane_without_a_host_yet_says_connecting() {
+        assert_eq!(title_text(3, None, PaneStatus::Live), "3 · 连接中…");
+    }
+
+    fn geom_800x600_title32(id: u32) -> PaneGeom {
+        use crate::shell::workspace::{PxRect, TITLE_BAR_PX};
+        PaneGeom {
+            id: PaneId(id),
+            px: PxRect {
+                x: 0,
+                y: 100,
+                w: 800,
+                h: 600,
+            },
+            title_px: PxRect {
+                x: 0,
+                y: 100,
+                w: 800,
+                h: TITLE_BAR_PX,
+            },
+            term_px: PxRect {
+                x: 0,
+                y: 132,
+                w: 800,
+                h: 568,
+            },
+            grid: (80, 28),
+        }
+    }
+
+    /// 真正驱动 egui 跑一帧,用 `Memory::area_rect` 取回 `show()` 画出来的
+    /// `Area` 的**实际**占用矩形——这是本函数唯一能自动验证「标题条到底占了
+    /// 多大地方」的手段。egui 面板层是逻辑点,`title_px` 是物理像素,断言前
+    /// 先按 `ppp` 换算。
+    ///
+    /// 这条测试同时守两件事:
+    /// 1. 不多占(Critical 1):`Frame` 的 `inner_margin` 双向外扩 + 长文本不截断,
+    ///    实测过会把 `Area` 撑出 `title_px` 之外,盖住终端首行或侵入邻居 pane。
+    /// 2. 用的是 `title_px` 不是 `px`(Critical 2):`px.h`=600 与 `title_px.h`=32
+    ///    差一个数量级,`show()` 里如果手滑把 `v.geom.title_px` 换成
+    ///    `v.geom.px`,这里的期望值会被打得面目全非,测试必红。
+    ///
+    /// ppp 覆盖 100% / 125% / 150%——Windows 最常见的三档缩放。
+    #[test]
+    fn area_rect_matches_title_px_exactly_across_dpi_scales() {
+        use crate::shell::workspace::TITLE_BAR_PX;
+        for ppp in [1.0f32, 1.25, 1.5] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let views = [TitleView {
+                geom: geom_800x600_title32(1),
+                index: 1,
+                host: Some("dev@build-01"),
+                status: PaneStatus::Live,
+                focused: true,
+            }];
+            let _ = ctx.run(Default::default(), |ctx| {
+                show(ctx, &crate::theme::MULLION_DARK, &views);
+            });
+            let rect = ctx
+                .memory(|m| m.area_rect(area_id(PaneId(1))))
+                .unwrap_or_else(|| panic!("ppp={ppp}: 标题条没画出任何 Area"));
+            let want_w = 800.0 / ppp;
+            let want_h = TITLE_BAR_PX as f32 / ppp;
+            assert!(
+                (rect.width() - want_w).abs() < 0.5,
+                "ppp={ppp}: Area 宽 {} 应约等于 title_px 换算值 {want_w},差太多说明撑出了标题条",
+                rect.width()
+            );
+            assert!(
+                (rect.height() - want_h).abs() < 0.5,
+                "ppp={ppp}: Area 高 {} 应约等于 title_px 换算值 {want_h},差太多说明撑出了标题条",
+                rect.height()
+            );
+        }
+    }
+
+    /// 极端情形:标题条本身很窄、主机名又很长。不截断的话 `×` 会被文字顶出
+    /// `title_px` 右边界,侵入邻居 pane 的地盘。
+    #[test]
+    fn long_host_name_does_not_push_area_past_title_px() {
+        use crate::shell::workspace::{PxRect, TITLE_BAR_PX};
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let geom = PaneGeom {
+            id: PaneId(2),
+            px: PxRect {
+                x: 0,
+                y: 0,
+                w: 160,
+                h: 600,
+            },
+            title_px: PxRect {
+                x: 0,
+                y: 0,
+                w: 160,
+                h: TITLE_BAR_PX,
+            },
+            term_px: PxRect {
+                x: 0,
+                y: 32,
+                w: 160,
+                h: 568,
+            },
+            grid: (16, 28),
+        };
+        let views = [TitleView {
+            geom,
+            index: 1,
+            host: Some("this-is-a-ridiculously-long-hostname-that-will-never-fit.example.com"),
+            status: PaneStatus::Live,
+            focused: true,
+        }];
+        let _ = ctx.run(Default::default(), |ctx| {
+            show(ctx, &crate::theme::MULLION_DARK, &views);
+        });
+        let rect = ctx
+            .memory(|m| m.area_rect(area_id(PaneId(2))))
+            .expect("标题条没画出任何 Area");
+        assert!(
+            (rect.width() - 160.0).abs() < 0.5,
+            "长主机名把 Area 撑宽到 {},应截断在 160 逻辑点以内",
+            rect.width()
+        );
+    }
+
+    /// F83 标题条开关关闭(`title_px.h == 0`)时,这个 pane 不该画出任何 `Area`——
+    /// 删掉 `show()` 里 `if tp.h == 0 { continue }` 这段此前仍然全绿,是测试盲区。
+    #[test]
+    fn title_bar_off_draws_no_area() {
+        use crate::shell::workspace::PxRect;
+        let ctx = egui::Context::default();
+        let geom = PaneGeom {
+            id: PaneId(3),
+            px: PxRect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+            },
+            title_px: PxRect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 0,
+            },
+            term_px: PxRect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+            },
+            grid: (80, 30),
+        };
+        let views = [TitleView {
+            geom,
+            index: 1,
+            host: Some("h"),
+            status: PaneStatus::Live,
+            focused: true,
+        }];
+        let _ = ctx.run(Default::default(), |ctx| {
+            show(ctx, &crate::theme::MULLION_DARK, &views);
+        });
+        assert!(
+            ctx.memory(|m| m.area_rect(area_id(PaneId(3)))).is_none(),
+            "title_px.h == 0(标题条关闭)时不该为这个 pane 画 Area"
+        );
+    }
+}

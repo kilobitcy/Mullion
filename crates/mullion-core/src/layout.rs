@@ -9,7 +9,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub u32);
 
-/// 终端网格坐标系里的矩形(单位:格)。左上角 `(col, row)`,尺寸 `cols × rows`。
+/// 布局矩形。左上角 `(col, row)`,尺寸 `cols × rows`。
+///
+/// **单位由调用方定义**:纯网格场景传格数;app 的分屏(B2-a)传**像素**,因为
+/// 32px 标题条和 1px 分隔线都不是格的整数倍。二分几何与单位无关,`u16` 的
+/// 上限 65535 对 4K 宽度(3840)绰绰有余。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub col: u16,
@@ -114,6 +118,49 @@ fn split_area(dir: Dir, ratio: f32, area: Rect) -> (Rect, Rect) {
 fn split_len(total: u16, ratio: f32) -> u16 {
     let a = (f32::from(total) * ratio).round();
     a.clamp(0.0, f32::from(total)) as u16
+}
+
+/// 把 `target` 叶子换成一个 Split:原 pane 落在 `a`,新 pane `new_id` 落在 `b`(F30)。
+///
+/// 返回是否成功;`target` 不在树中时返回 `false` 且树不变。
+/// `ratio` 由调用方给定(预设布局用固定值),这里**不夹紧** —— 夹紧是拖分隔条(F32)
+/// 的事,预设的 0.333/0.5/0.667 本来就是合法值,在这儿夹一道只会让预设几何变形。
+pub fn split_pane(root: &mut Node, target: PaneId, new_id: PaneId, dir: Dir, ratio: f32) -> bool {
+    match root {
+        Node::Leaf(id) if *id == target => {
+            *root = Node::Split {
+                dir,
+                ratio,
+                a: Box::new(Node::Leaf(target)),
+                b: Box::new(Node::Leaf(new_id)),
+            };
+            true
+        }
+        Node::Leaf(_) => false,
+        Node::Split { a, b, .. } => {
+            split_pane(a, target, new_id, dir, ratio) || split_pane(b, target, new_id, dir, ratio)
+        }
+    }
+}
+
+/// 按几何顺序(DFS,`a` 先 `b` 后)列出所有叶子 pane。
+///
+/// 与 [`compute_rects`] 的返回顺序**保证一致**,但不需要 `area`:预设重排只关心
+/// 「谁在前谁在后」,不关心具体像素(§5.2)。
+pub fn leaves(root: &Node) -> Vec<PaneId> {
+    let mut out = Vec::new();
+    collect_leaves(root, &mut out);
+    out
+}
+
+fn collect_leaves(node: &Node, out: &mut Vec<PaneId>) {
+    match node {
+        Node::Leaf(id) => out.push(*id),
+        Node::Split { a, b, .. } => {
+            collect_leaves(a, out);
+            collect_leaves(b, out);
+        }
+    }
 }
 
 /// 关闭 `target` pane:其父 Split 由兄弟节点顶替(F31)。
@@ -415,6 +462,67 @@ mod tests {
         assert_eq!(
             focus_neighbor(&g, AREA, PaneId(4), FocusDir::Left),
             Some(PaneId(3))
+        );
+    }
+
+    #[test]
+    fn split_pane_replaces_leaf_f30() {
+        let mut tree = leaf(1);
+        assert!(split_pane(
+            &mut tree,
+            PaneId(1),
+            PaneId(2),
+            Dir::Horizontal,
+            0.5
+        ));
+        assert_eq!(tree, hsplit(0.5, leaf(1), leaf(2)));
+        let rects = compute_rects(&tree, AREA);
+        assert_eq!(rects.len(), 2);
+        assert_tiles_exactly(&rects, AREA);
+    }
+
+    #[test]
+    fn split_pane_targets_nested_leaf_f30() {
+        // 深层叶子也要能切,否则 2 屏切成 3 屏时只能动最外层。
+        let mut tree = hsplit(0.5, leaf(1), leaf(2));
+        assert!(split_pane(
+            &mut tree,
+            PaneId(2),
+            PaneId(3),
+            Dir::Vertical,
+            0.5
+        ));
+        assert_eq!(tree, hsplit(0.5, leaf(1), vsplit(0.5, leaf(2), leaf(3))));
+        assert_tiles_exactly(&compute_rects(&tree, AREA), AREA);
+    }
+
+    #[test]
+    fn split_pane_unknown_target_is_noop_f30() {
+        let mut tree = hsplit(0.5, leaf(1), leaf(2));
+        let before = tree.clone();
+        assert!(!split_pane(
+            &mut tree,
+            PaneId(9),
+            PaneId(3),
+            Dir::Vertical,
+            0.5
+        ));
+        assert_eq!(tree, before);
+    }
+
+    /// `leaves` 的顺序必须和 `compute_rects` 一致 —— 预设重排(§5.2)靠这个顺序
+    /// 把现有 pane 填进新树的叶子位;两者不一致,套预设后 pane 会互相换位。
+    #[test]
+    fn leaves_order_matches_compute_rects() {
+        let tree = grid_2x2();
+        let from_rects: Vec<PaneId> = compute_rects(&tree, AREA)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(leaves(&tree), from_rects);
+        assert_eq!(
+            leaves(&tree),
+            vec![PaneId(1), PaneId(2), PaneId(3), PaneId(4)]
         );
     }
 }

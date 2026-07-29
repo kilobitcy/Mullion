@@ -17,6 +17,9 @@ use mullion_term::snapshot::Rgb;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     // --- 结构色(§2.1) ---
+    /// 窗口最外层背景。设计文档 §2.1 标为「窗口底」,但当前代码没有路径绘它——
+    /// F85 自绘标题栏已否决,窗口装饰交给 OS 原生标题栏,没有自绘的窗口底可暴露。
+    /// 零引用;若 F85 未来带 `WM_NCHITTEST` 方案重提,会用在这里。
     pub window_bg: Rgb,
     /// 标题栏色。F85 自绘标题栏已否决,保留 token 备将来重提。
     pub bar_title: Rgb,
@@ -34,18 +37,27 @@ pub struct Theme {
 
     // --- 前景灰阶(§2.2) ---
     pub fg: Rgb,
+    /// pane 标题条聚焦态的主机名颜色(F83,`ui/pane_title.rs::show`)。
     pub fg_strong: Rgb,
+    /// 预留给 F50 SFTP 侧栏头文字 / F84 设置弹窗快捷键动作名
+    /// (设计文档 §4.3/§4.4)。零引用。
     pub fg_mid: Rgb,
     pub fg_muted: Rgb,
+    /// pane 标题条断开状态的圆点颜色(F83,`ui/pane_title.rs::show`)。
     pub fg_dim: Rgb,
+    /// 预留给 F84 设置弹窗的快捷键位徽标(设计文档 §4.4)。零引用。
     pub fg_dimmer: Rgb,
     pub fg_faint: Rgb,
+    /// 预留给 F50 SFTP 侧栏列表表头(设计文档 §4.3)。零引用。
     pub fg_ghost: Rgb,
 
     // --- 语义色(§2.3) ---
     pub accent: Rgb,
     pub accent_fg: Rgb,
     pub ok: Rgb,
+    /// 预留给「高负载」状态指示:F83 pane 标题条冻结规格(设计文档 §4.2)原定
+    /// 「已连接/已断开/高负载」三态圆点,本切片只落地了前两态;F81 状态栏
+    /// (§3.4)同样只留 ok/fg_faint 两态。高负载判定条件待定。零引用。
     pub warn: Rgb,
     pub info: Rgb,
     pub danger: Rgb,

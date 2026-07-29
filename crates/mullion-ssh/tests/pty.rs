@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use mullion_ssh::config::{AuthMethod, SshConfig};
 use mullion_ssh::known_hosts::{KnownHosts, TofuAccept};
-use mullion_ssh::session::connect;
+use mullion_ssh::session::{connect, establish, open_pty};
 
 fn cfg(addr: std::net::SocketAddr) -> SshConfig {
     SshConfig {
@@ -50,4 +50,59 @@ async fn resize_then_still_pumps() {
         .expect("未超时")
         .expect("收到回显");
     assert_eq!(&got, b"pong", "resize 后仍应能 echo 往返");
+}
+
+/// F35:一次握手、多条 channel。分屏的全部价值都压在这条上 —— 每开一个 pane
+/// 就重新 TCP + 认证一次的话,高延迟代理链路下开 4 屏要等好几秒。
+#[tokio::test(flavor = "multi_thread")]
+async fn one_handshake_serves_many_ptys_f35() {
+    let addr = common::spawn_echo_server().await;
+    let policy = Arc::new(TofuAccept::new(Arc::new(Mutex::new(KnownHosts::new()))));
+    let handle = Arc::new(establish(&cfg(addr), policy).await.expect("establish"));
+
+    let mut sessions = Vec::new();
+    for _ in 0..4 {
+        let (s, rx) = open_pty(handle.clone(), &cfg(addr), Arc::new(|| {}))
+            .await
+            .expect("open_pty");
+        sessions.push((s, rx));
+    }
+
+    for (i, (s, rx)) in sessions.iter_mut().enumerate() {
+        let msg = format!("pane{i}");
+        s.write(msg.as_bytes().to_vec()).expect("write");
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("未超时")
+            .expect("收到回显");
+        assert_eq!(
+            got,
+            msg.as_bytes(),
+            "第 {i} 条 channel 的回显串到别的 channel 了"
+        );
+    }
+}
+
+/// 关掉一个 pane 不能拖垮别的 pane:`Handle` 用 Arc 共享,最后一个引用释放才断连。
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_one_pty_keeps_the_others_alive_f35() {
+    let addr = common::spawn_echo_server().await;
+    let policy = Arc::new(TofuAccept::new(Arc::new(Mutex::new(KnownHosts::new()))));
+    let handle = Arc::new(establish(&cfg(addr), policy).await.expect("establish"));
+
+    let (doomed, doomed_rx) = open_pty(handle.clone(), &cfg(addr), Arc::new(|| {}))
+        .await
+        .expect("open_pty 1");
+    let (survivor, mut survivor_rx) = open_pty(handle.clone(), &cfg(addr), Arc::new(|| {}))
+        .await
+        .expect("open_pty 2");
+    drop(doomed);
+    drop(doomed_rx);
+
+    survivor.write(b"still here".to_vec()).expect("write");
+    let got = tokio::time::timeout(Duration::from_secs(5), survivor_rx.recv())
+        .await
+        .expect("未超时")
+        .expect("收到回显");
+    assert_eq!(&got, b"still here", "关掉一个 pane 把整条连接带走了");
 }

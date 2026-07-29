@@ -4,5 +4,5 @@
 pub mod input_route;
 pub mod session_map;
 pub mod store;
-pub mod viewport;
 pub mod window_state;
+pub mod workspace;

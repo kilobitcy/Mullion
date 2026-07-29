@@ -28,11 +28,12 @@ pub fn row_to_spans(cells: &[SnapCell]) -> Vec<(String, Color)> {
     spans
 }
 
+use crate::gpu::PaneRender;
+use crate::shell::workspace::PxRect;
 use glyphon::{
     Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
     TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-use mullion_term::snapshot::GridSnapshot;
 
 /// 显示字体族名。须在系统里已安装;未装则 cosmic-text 回退到默认字体(不崩,
 /// 但等宽/对齐可能变差)。TODO:做成可配置(见 spec F21)。
@@ -51,6 +52,17 @@ pub struct TextLayer {
     /// F80:glyphon 的兜底文字色(span 未带显式色时用)。当前每个 span 都带色,
     /// 取不到;留着是为了主题一换就整体跟走,不留一处旧灰的潜伏陷阱。
     default_fg: Rgb,
+}
+
+/// 一个 pane 的文字裁剪矩形,`(left, top, right, bottom)`。
+///
+/// 返回裸元组而不是 `glyphon::TextBounds`,是为了能不依赖 glyphon 类型是否
+/// derive `PartialEq` 就把这段几何单测掉 —— 裁错的症状(分屏边界上冒出半行
+/// 别人的字)只在滚动时偶发,靠肉眼盯几乎抓不住。
+pub fn pane_bounds_ltrb(term: PxRect) -> (i32, i32, i32, i32) {
+    let l = term.x as i32;
+    let t = term.y as i32;
+    (l, t, l + term.w as i32, t + term.h as i32)
 }
 
 impl TextLayer {
@@ -84,60 +96,71 @@ impl TextLayer {
         }
     }
 
-    /// 每帧:按快照重建各行 Buffer 文本,prepare 上传。
+    /// 为所有 pane 准备文字。每个 pane 用自己的 `term_px` 作原点**和**裁剪框。
     ///
-    /// 每帧全量重建/重新 shape 所有行;差分渲染是 F12,后续 spec,这里不做。
-    /// 失败(如 `AtlasFull`)时不 panic,交调用方决定跳过本帧(渲染路径不许 panic)。
-    /// `origin`:终端区左上角的窗口像素坐标(见 `gpu::quads_for` 的同名参数)。
-    /// 两处必须同源,否则背景色块与字错位。
-    pub fn prepare(
+    /// buffers 按 `pane_ix` 分段线性存放,与 `areas` 的顺序一一对应 —— glyphon
+    /// 的 `prepare` 要求 buffer 借用活到 `render`,所以不能边建边丢。
+    pub fn prepare_panes(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        snap: &GridSnapshot,
-        origin: (f32, f32),
+        panes: &[PaneRender<'_>],
         res: Resolution,
     ) -> Result<(), glyphon::PrepareError> {
         self.viewport.update(queue, res);
         let metrics = Metrics::new(self.cell_h * 0.8, self.cell_h);
         self.buffers.clear();
-        for row in 0..snap.rows {
-            let spans = row_to_spans(snap.row(row));
-            let mut buf = Buffer::new(&mut self.font_system, metrics);
-            buf.set_size(
-                &mut self.font_system,
-                Some(res.width as f32),
-                Some(self.cell_h),
-            );
-            let attrs = Attrs::new().family(Family::Name(FONT_FAMILY));
-            let iter = spans.iter().map(|(s, c)| (s.as_str(), attrs.color(*c)));
-            buf.set_rich_text(&mut self.font_system, iter, attrs, Shaping::Advanced);
-            buf.shape_until_scroll(&mut self.font_system, false);
-            self.buffers.push(buf);
+
+        // 第一遍:建 buffer(要先全部建完,才能借它们建 TextArea)。
+        // 逐行富文本这段与原 `prepare` 一字不差,只是 `res.width` 换成了该 pane
+        // 的宽度 —— 属性切段逻辑有 VT 快照测试兜着,改它会连带 fixture 一起红。
+        let mut rows_per_pane: Vec<usize> = Vec::with_capacity(panes.len());
+        let attrs = Attrs::new().family(Family::Name(FONT_FAMILY));
+        for p in panes {
+            rows_per_pane.push(p.snap.rows as usize);
+            for row in 0..p.snap.rows {
+                let spans = row_to_spans(p.snap.row(row));
+                let mut buf = Buffer::new(&mut self.font_system, metrics);
+                buf.set_size(
+                    &mut self.font_system,
+                    Some(p.geom.term_px.w.max(1) as f32),
+                    Some(self.cell_h),
+                );
+                let iter = spans.iter().map(|(s, c)| (s.as_str(), attrs.color(*c)));
+                buf.set_rich_text(&mut self.font_system, iter, attrs, Shaping::Advanced);
+                buf.shape_until_scroll(&mut self.font_system, false);
+                self.buffers.push(buf);
+            }
         }
-        let cell_h = self.cell_h;
-        let default_fg = self.default_fg;
-        let areas: Vec<TextArea> = self
-            .buffers
-            .iter()
-            .enumerate()
-            .map(|(row, buf)| TextArea {
-                buffer: buf,
-                left: origin.0,
-                top: origin.1 + row as f32 * cell_h,
-                scale: 1.0,
-                // 上边界收到 origin:行数虽已按中央区算,但字形可能有上伸部
-                // (accent/CJK),不裁就会有像素溢进菜单栏、在菜单栏底下露出一截。
-                bounds: TextBounds {
-                    left: origin.0 as i32,
-                    top: origin.1 as i32,
-                    right: res.width as i32,
-                    bottom: res.height as i32,
-                },
-                default_color: glyphon::Color::rgb(default_fg.r, default_fg.g, default_fg.b),
-                custom_glyphs: &[],
-            })
-            .collect();
+
+        // 第二遍:建 TextArea,bounds 用**该 pane 的**矩形而不是整窗。
+        let mut areas: Vec<TextArea> = Vec::with_capacity(self.buffers.len());
+        let mut base = 0usize;
+        for (pi, p) in panes.iter().enumerate() {
+            let (left, top, right, bottom) = pane_bounds_ltrb(p.geom.term_px);
+            for row in 0..rows_per_pane[pi] {
+                areas.push(TextArea {
+                    buffer: &self.buffers[base + row],
+                    left: p.geom.term_px.x as f32,
+                    top: p.geom.term_px.y as f32 + row as f32 * self.cell_h,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    },
+                    default_color: glyphon::Color::rgb(
+                        self.default_fg.r,
+                        self.default_fg.g,
+                        self.default_fg.b,
+                    ),
+                    custom_glyphs: &[],
+                });
+            }
+            base += rows_per_pane[pi];
+        }
+
         self.renderer.prepare(
             device,
             queue,
@@ -186,6 +209,7 @@ fn measure_cell_w(fs: &mut FontSystem, font_px: f32, line_h: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::workspace::PxRect;
 
     fn cell(ch: char, fg: Rgb, spacer: bool) -> SnapCell {
         SnapCell {
@@ -275,5 +299,31 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].0, "a");
         assert_eq!(spans[1].0, "b");
+    }
+
+    /// §7.1:每个 pane 的 TextArea 必须裁到**自己的** term_px。
+    /// 沿用单 pane 时代的整窗 bounds,pane 1 最后一行的字会溢出到 pane 2 上 ——
+    /// 症状是"分屏边界附近有半行别人的字",且滚动时才出现,极难复现定位。
+    #[test]
+    fn pane_bounds_clip_to_the_pane_not_the_window() {
+        let term = PxRect {
+            x: 400,
+            y: 132,
+            w: 399,
+            h: 568,
+        };
+        assert_eq!(pane_bounds_ltrb(term), (400, 132, 799, 700));
+    }
+
+    /// 零尺寸 pane(窗口被拖到极小)不能算出反向矩形,glyphon 会画出诡异结果。
+    #[test]
+    fn zero_sized_pane_yields_a_degenerate_but_ordered_rect() {
+        let (l, t, r, b) = pane_bounds_ltrb(PxRect {
+            x: 10,
+            y: 20,
+            w: 0,
+            h: 0,
+        });
+        assert!(r >= l && b >= t, "left/top 必须不大于 right/bottom");
     }
 }

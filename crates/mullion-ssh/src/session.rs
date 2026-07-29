@@ -67,7 +67,7 @@ fn host_key_or(outcome: &Arc<Mutex<Option<HostKeyOutcome>>>, e: russh::Error) ->
     }
 }
 
-/// 连接 + 认证 + 主机校验。成功返回存活的 russh Handle(PTY 由 connect 接)。
+/// 连接 + 认证 + 主机校验。成功返回存活的 russh Handle(PTY 由 open_pty 接)。
 pub async fn establish(
     cfg: &SshConfig,
     policy: Arc<dyn HostKeyPolicy>,
@@ -227,7 +227,8 @@ impl SshSession {
     }
 }
 
-/// 连接 + 认证 + 开 PTY + 起 io task。返回句柄与「远端字节」接收端(app 每帧 drain)。
+/// 握手 + 开 PTY channel 的一站式入口。CLI 直连与会话管理器都走这里(单 pane 路径)。
+///
 /// `wake` 由 app 注入(EventLoopProxy.send_event);ssh 不认识 winit。
 pub async fn connect(
     cfg: &SshConfig,
@@ -235,19 +236,43 @@ pub async fn connect(
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(SshSession, mpsc::Receiver<Vec<u8>>), ConnectError> {
     let handle = establish(cfg, policy).await?;
+    open_pty(Arc::new(handle), cfg, wake).await
+}
 
+/// 在**已建立**的连接上再开一条 PTY channel(F35 分屏复用连接)。
+///
+/// 签名里刻意**没有任何网络参数**(host/port/auth/policy 一个都不收):
+/// 想在这里偷偷重连一次都做不到,是结构性的防呆。主机密钥确认(F3/TOFU)只在
+/// [`establish`] 触发一次,新开分屏不会再弹窗(§6.2)。
+///
+/// `handle` 必须是 `Arc`:russh 0.54.5 的 `Handle` 没有实现 `Clone`,只有 `Drop`
+/// (释放即断连)。每条 channel 的 io_task 各持一份 Arc,最后一个释放才真正断连 ——
+/// 这就是「关掉一个 pane 不影响其余 pane」的实现机制(§6.1)。
+pub async fn open_pty(
+    handle: Arc<Handle<ClientHandler>>,
+    cfg: &SshConfig,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(SshSession, mpsc::Receiver<Vec<u8>>), ConnectError> {
     let channel = handle
         .channel_open_session()
         .await
         .map_err(|_| ConnectError::PtyRequest)?;
-    channel
+    if channel
         .request_pty(true, &cfg.term, cfg.cols as u32, cfg.rows as u32, 0, 0, &[])
         .await
-        .map_err(|_| ConnectError::PtyRequest)?;
-    channel
-        .request_shell(true)
-        .await
-        .map_err(|_| ConnectError::PtyRequest)?;
+        .is_err()
+    {
+        // `Channel<Msg>` 没有自动发 CHANNEL_CLOSE 的 Drop(只有 into_stream() 的
+        // ChannelCloseOnDrop 才有),不显式关就是泄漏一个 channel slot;多 pane 下
+        // handle 是共享 Arc,某个 pane 开失败不会关掉整条连接,泄漏会一直累积到
+        // sshd 的 MaxSessions 上限,导致后续 pane 再也开不出来。
+        let _ = channel.close().await;
+        return Err(ConnectError::PtyRequest);
+    }
+    if channel.request_shell(true).await.is_err() {
+        let _ = channel.close().await;
+        return Err(ConnectError::PtyRequest);
+    }
 
     // 拆读写半:read.wait()(&mut) 与 write.data()(&) 同任务 select! 不冲突。
     let (read, write) = channel.split();
@@ -266,7 +291,9 @@ async fn io_task(
     mut cmd_rx: mpsc::Receiver<SshCmd>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     wake: Arc<dyn Fn() + Send + Sync>,
-    _handle: Handle<ClientHandler>, // 持有以保活连接;drop 即断连
+    // 持有一份 Arc 只为保活:Handle 一 Drop 整条 SSH 连接就断。多 pane 下每条
+    // channel 的 io_task 各持一份,最后一个 io_task 结束时连接才关(§6.1)。
+    _handle: Arc<Handle<ClientHandler>>,
 ) {
     loop {
         // 单任务顺序 select:inbound send().await 期间不处理 cmd(大 burst 下键入有延迟,非死锁)。

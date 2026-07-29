@@ -72,16 +72,93 @@ impl SyncFramePacer {
         self.tail = buf[buf.len() - keep..].to_vec();
     }
 
+    /// 是否有新数据要画。多 pane 聚合时这是「任一」(OR)条件 —— 只要某个 pane
+    /// 有新内容,整帧就值得画;不能因为另一个 pane 静止(长期不脏)就永远不出帧。
+    ///
+    /// 目前只在本文件内被 [`panes_ready_to_present`] 调用,`pub` 是为将来按
+    /// pane 粒度查询留的口子(例如给 pane 标题条加同步中/高负载徽标),
+    /// 不是已有外部调用方。
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// 是否卡在**未超时**的同步块内(T2/F11)。多 pane 聚合时这是「任一」(AND
+    /// 取反,即"没有一个"pane 在按住)条件 —— 只要某个 pane 还在攒帧,画出来
+    /// 就是半更新的同步块,也就是撕裂,不能因为它本身不脏就放过。
+    ///
+    /// 之所以要跟 [`is_dirty`](Self::is_dirty) 分开查询:同步门控与"有没有新数据"
+    /// 是两件独立的事 —— 一个 pane 可以在同步区间内被上一帧 present 过(脏标记
+    /// 已清)但仍未收到 ESU,这时它依然在按住整帧,即使自己不脏。
+    ///
+    /// 同 [`is_dirty`](Self::is_dirty):目前只在本文件内被调用(`should_present`、
+    /// `panes_ready_to_present`、`holding_deadline_ms`),`pub` 是预留的按 pane
+    /// 查询口子,不是已有外部调用方。
+    pub fn is_holding_frame(&self, now_ms: u64) -> bool {
+        self.in_sync && now_ms.saturating_sub(self.sync_since_ms) < SYNC_TIMEOUT_MS
+    }
+
+    /// 若正卡在未超时的同步块内,返回它的超时时刻(ms,与传入的 `now_ms` 同一
+    /// 时钟基准)。事件循环拿它去主动排一次 `WaitUntil`——`SYNC_TIMEOUT_MS`
+    /// 本身只是「过了这个点该出帧」的判定阈值,没有代码在那个时刻真的把事件
+    /// 循环叫醒的话,冻住的画面只能等下一个不相关事件(鼠标移动/别的 pane
+    /// 来字节)顺带救回来,不是保证 150ms 左右自愈。
+    fn holding_deadline_ms(&self, now_ms: u64) -> Option<u64> {
+        self.is_holding_frame(now_ms)
+            .then_some(self.sync_since_ms + SYNC_TIMEOUT_MS)
+    }
+
     /// 是否应立即提交一帧:有脏数据,且不在同步块内(T2/F11)或同步块已超时。
     pub fn should_present(&self, now_ms: u64) -> bool {
-        self.dirty
-            && (!self.in_sync || now_ms.saturating_sub(self.sync_since_ms) >= SYNC_TIMEOUT_MS)
+        self.is_dirty() && !self.is_holding_frame(now_ms)
     }
 
     /// 记录已提交一帧,清除脏标记。
     pub fn mark_presented(&mut self) {
         self.dirty = false;
     }
+}
+
+/// 多 pane 的攒帧聚合(T2/§7.2):**任一** pane 有新数据要画(OR),**且没有任何**
+/// pane 卡在未超时的同步区间内(AND)。
+///
+/// 这两个子条件不能像单 pane 的 [`SyncFramePacer::should_present`] 那样合并成一个
+/// `all(should_present)`:`dirty` 描述的是"这个 pane 自己有没有东西要画",跨 pane
+/// 语义天然是 OR —— 一个长期静止的 pane(没人在敲的 shell)`dirty` 恒为 `false`,
+/// 若跟着一起被 AND 进去,活跃 pane 的新内容就永远出不来,而且不会随时间自愈
+/// (静止 pane 根本没进同步区,`SYNC_TIMEOUT_MS` 逃生门救不了它)。反过来,同步
+/// 门控描述的是"是不是有人正在半更新一块画面",跨 pane 语义必须是 AND —— 只要
+/// 有一个 pane 还在攒帧,把其它 pane 的新内容画出来也会让这个 pane 露出半张
+/// 撕裂的画面,所以哪怕这个 pane 自己不脏也必须按住整帧。
+///
+/// **空集合返回 `true`** —— 没有 pane 的时候(launcher 界面)整个 UI 靠 egui 画,
+/// 聚合若返回 false,窗口一帧都出不来。
+pub fn panes_ready_to_present<'a>(
+    pacers: impl Iterator<Item = &'a SyncFramePacer>,
+    now_ms: u64,
+) -> bool {
+    let mut saw_any_pane = false;
+    let mut any_dirty = false;
+    let mut none_holding = true;
+    for p in pacers {
+        saw_any_pane = true;
+        any_dirty |= p.is_dirty();
+        none_holding &= !p.is_holding_frame(now_ms);
+    }
+    !saw_any_pane || (any_dirty && none_holding)
+}
+
+/// 多 pane 里最早会因同步块超时而需要重新判定的时刻(ms)。`None` = 没有 pane
+/// 卡在同步块里,事件循环这一轮不需要为此特意安排唤醒。
+///
+/// 事件循环据此在「本帧不出帧」的分支上主动排一次 `WaitUntil`(而不是无脑
+/// `ControlFlow::Wait` 一直等下一个不相关事件)——错峰超时(不同 pane 各自
+/// 何时进入同步块不同)靠的不是排 N 个定时器,而是每次都只盯最早到期的那个,
+/// 到点重新判定后自然级联到下一个。
+pub fn earliest_sync_timeout_ms<'a>(
+    pacers: impl Iterator<Item = &'a SyncFramePacer>,
+    now_ms: u64,
+) -> Option<u64> {
+    pacers.filter_map(|p| p.holding_deadline_ms(now_ms)).min()
 }
 
 /// 渲染接口(ADR-001):上层只依赖它,glyphon 只是一个实现。
@@ -186,5 +263,150 @@ mod tests {
             pacer.feed(b"chunk", t * 20);
         }
         assert!(pacer.should_present(SYNC_TIMEOUT_MS), "计时须从 BSU 起算");
+    }
+
+    /// T2/§7.2:任一 pane 处在 DEC 2026 同步区间内,整帧都不 present。
+    ///
+    /// 只看焦点 pane 的话,后台 pane 会被画成半张更新过的画面 —— 撕裂正是
+    /// 这个项目要消灭的东西,不能因为"它不是焦点"就放过去。
+    #[test]
+    fn any_pane_in_sync_defers_present() {
+        let mut a = SyncFramePacer::new();
+        let mut b = SyncFramePacer::new();
+        a.feed(b"hello", 0);
+        b.feed(b"\x1b[?2026h", 0); // b 进入同步区间
+        assert!(a.should_present(0), "单看 a 是可以出帧的");
+        assert!(
+            !panes_ready_to_present([&a, &b].into_iter(), 0),
+            "b 还在攒帧,整帧就该等"
+        );
+        b.feed(b"\x1b[?2026l", 0); // b 退出
+        assert!(panes_ready_to_present([&a, &b].into_iter(), 0));
+    }
+
+    /// 空集合必须返回 true。launcher 界面(还没连上、一个 pane 都没有)靠 egui
+    /// 画,聚合返回 false 的话它一帧都出不来 —— 表现为启动后白屏/黑屏。
+    #[test]
+    fn no_panes_is_ready_so_the_launcher_can_draw() {
+        let empty: [&SyncFramePacer; 0] = [];
+        assert!(panes_ready_to_present(empty.into_iter(), 0));
+    }
+
+    /// 卡死保护也要能穿透聚合:超时后即使还没收到 ESU 也必须出帧,
+    /// 否则一个坏掉的远端能把整个窗口冻住。
+    #[test]
+    fn timeout_releases_the_aggregate_too() {
+        let mut a = SyncFramePacer::new();
+        a.feed(b"\x1b[?2026h", 0);
+        assert!(!panes_ready_to_present([&a].into_iter(), 0));
+        assert!(
+            panes_ready_to_present([&a].into_iter(), SYNC_TIMEOUT_MS + 1),
+            "超时后必须放行"
+        );
+    }
+
+    /// bug 复现:一个 pane 有新内容(a),另一个 pane 从未收到过任何字节、长期静止
+    /// (b,典型场景是普通 shell 没人在敲)。旧实现对 `should_present` 整体取 `all()`,
+    /// 把"有没有新数据"也 AND 了进去 —— b.dirty 恒为 false 导致 all() 恒 false,
+    /// 活跃 pane a 的新内容永远出不来,且不会随时间自愈(b 根本没进同步区,
+    /// SYNC_TIMEOUT_MS 逃生门救不了)。
+    #[test]
+    fn idle_pane_never_dirty_must_not_starve_active_pane() {
+        let mut a = SyncFramePacer::new();
+        a.feed(b"new output", 0);
+        let b = SyncFramePacer::new();
+        assert!(
+            panes_ready_to_present([&a, &b].into_iter(), 0),
+            "a 有新数据、b 只是静止,应该出帧"
+        );
+        assert!(
+            panes_ready_to_present([&a, &b].into_iter(), 10_000),
+            "过多久都不该自愈成 false —— 应该从一开始就是 true"
+        );
+    }
+
+    /// 两个交替活跃的 pane 不该互相饿死:这一帧 A 脏、B 不脏 → 出帧 → A 被
+    /// `mark_presented` 清脏;下一帧只有 B 脏 → 仍应出帧。旧的 `all()` 语义下,
+    /// 每一帧都恰好有一个 pane 不脏,永远出不了帧。
+    #[test]
+    fn alternating_dirty_panes_do_not_starve_each_other() {
+        let mut a = SyncFramePacer::new();
+        let mut b = SyncFramePacer::new();
+        a.feed(b"a output", 0);
+        assert!(panes_ready_to_present([&a, &b].into_iter(), 0));
+        a.mark_presented();
+        b.mark_presented();
+
+        b.feed(b"b output", 1);
+        assert!(
+            panes_ready_to_present([&a, &b].into_iter(), 1),
+            "A 已清脏、B 刚变脏,仍应出帧,不能被 A 拖死"
+        );
+    }
+
+    /// 同步门控不能依赖 dirty:即使卡在同步区间的那个 pane 本身并不脏
+    /// (例如 BSU 之后立刻被上一帧 present 过、`dirty` 已被 `mark_presented` 清掉,
+    /// 但仍未收到 ESU),只要别的 pane 有新数据,整帧也必须继续等,否则会把
+    /// 半更新的同步块画出来 —— 撕裂。
+    #[test]
+    fn sync_gate_holds_even_when_the_syncing_pane_is_not_dirty() {
+        let mut a = SyncFramePacer::new();
+        let mut b = SyncFramePacer::new();
+        b.feed(BSU, 0); // b 进入同步区间(顺带标脏)
+        b.mark_presented(); // 清掉 b 的 dirty,但 in_sync 仍为 true
+        assert!(!b.should_present(0), "b 自己没有新数据,理应不出帧");
+
+        a.feed(b"content", 0); // a 有新数据要画
+        assert!(
+            !panes_ready_to_present([&a, &b].into_iter(), 0),
+            "b 仍卡在未超时的同步区间,即使 b 不脏,整帧也该等"
+        );
+    }
+
+    /// 所有 pane 都不脏(没有新内容)时不该出帧 —— 这是 T3「喂数据和重绘解耦」
+    /// 的要求,不能退化成无条件每帧都出。
+    #[test]
+    fn no_dirty_panes_means_no_present() {
+        let a = SyncFramePacer::new();
+        let b = SyncFramePacer::new();
+        assert!(
+            !panes_ready_to_present([&a, &b].into_iter(), 0),
+            "两个 pane 都没有新数据,不该出帧"
+        );
+    }
+
+    /// 事件循环靠这个决定「本帧不出帧」时要不要主动排一次 `WaitUntil`——错峰
+    /// 超时(不同 pane 各自何时进同步块不同)必须拿**最早**到期的那个,拿错
+    /// (比如拿最晚的,或者干脆固定拿第一个 pane)就会让先到期的 pane 多等,
+    /// 150ms 逃生门名不副实。
+    #[test]
+    fn earliest_sync_timeout_picks_the_soonest_deadline_across_panes() {
+        let mut a = SyncFramePacer::new();
+        a.feed(BSU, 0); // 进入同步块于 t=0,超时于 150
+        let mut b = SyncFramePacer::new();
+        b.feed(BSU, 50); // 进入同步块于 t=50,超时于 200
+
+        assert_eq!(
+            earliest_sync_timeout_ms([&a, &b].into_iter(), 60),
+            Some(150),
+            "两个都还没超时:必须报最早到期的 a(150),不是 b(200)或任意一个"
+        );
+        assert_eq!(
+            earliest_sync_timeout_ms([&a, &b].into_iter(), 150),
+            Some(200),
+            "a 已超时(不再算「卡住」),该改口报仍在卡的 b"
+        );
+        assert_eq!(
+            earliest_sync_timeout_ms([&a, &b].into_iter(), 300),
+            None,
+            "两个都超时/都不在同步块内:没有 pane 需要为此被特意唤醒"
+        );
+
+        let empty = SyncFramePacer::new();
+        assert_eq!(
+            earliest_sync_timeout_ms(std::iter::once(&empty), 0),
+            None,
+            "从没进过同步块的 pane 不该产生一个假的唤醒时刻"
+        );
     }
 }
