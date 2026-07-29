@@ -51,6 +51,17 @@
   出 NaN,该帧几何全坏。`new()` 和 `resize()` **两处**都要用钳制后的值。
 - **`get_current_texture()` 分 `SurfaceError` 四变体处理**:`Timeout` 跳过本帧(别 reconfigure)、
   `Lost`/`Outdated` reconfigure、`OutOfMemory` 记录。别 `Err(_)` 一把吞(黑屏无日志难查)。
+- **挑了 sRGB surface 格式(`.find(|f| f.is_srgb())`),自己的着色器和 `LoadOp::Clear` 就必须手动转线性,否则外壳与终端两套颜色。**
+  选中 sRGB 格式后,硬件会把着色器输出色值、`Clear` 的值都当**线性值**再编码成 sRGB——写进去的
+  必须是线性值,不是设计稿上那个 sRGB 十六进制。`egui`(`linear_from_gamma_rgb`)和
+  `glyphon`(`srgb_to_linear`)各自都做了这层转换,本项目自绘的 `QUAD_WGSL` 原先没做,原样透传。
+  底色纯黑时两个色彩空间都是 0,看不出差别;底色一旦非黑,同一个 token 在 egui 外壳和终端里
+  就渲染成两个颜色——这正是 F80「外壳与终端是一个世界」验收失败的根因。**规则**:`QUAD_WGSL`
+  顶点色、`theme::clear_color` 都要过 `srgb_to_linear`;**新开一条 quad/渲染路径(如 F82 工具栏、
+  F83 pane 标题条)时照抄这条**——现有守护测试只查 `QUAD_WGSL` 字符串里还有转换调用,挡不住
+  新路径漏转换。数值正确性本身无法在无头环境验证,最终靠人眼截图取色核对。
+  守护:`gpu::tests::quad_shader_converts_srgb_to_linear`、`theme::tests::clear_color_is_linear_not_raw_srgb`
+  / `theme::tests::srgb_to_linear_endpoints_and_cutoff`。
 - **最小化必须整帧跳过,不只是把尺寸 `max(1)`。** 上一条只挡住了 NaN,挡不住真正的伤害:
   `Resized(0,0)` 若继续往下传,`grid_size_for(0,0)` 钳成 1×1 → ① `emulator.resize(1,1)` 让
   alacritty 按 1 列 reflow 带 10000 行 scrollback 的 primary grid(tmux 在 alt screen 时
@@ -88,6 +99,22 @@
   `translate_key` 只转调;测试测 `translate_logical`。
 - **方向键 DECCKM 未处理**:现发普通光标键 `ESC[A/B/C/D`;应用光标键模式(DECCKM,部分全屏 TUI 开)
   下应发 `ESC O A`。当前不追踪该模式 → 某些 TUI 里方向键可能不对。补法:app 从仿真器取模式传给编码。
+- **`f32::fract()` 在负数区间与 `floor()` 不是同一套取整,拿它算「格内位置」会抖(F18)。**
+  `fract()` = `x - x.trunc()`(**向零**截断),而列号换算 `cell_at` 用的是 `floor()`。拖拽划选时
+  指针会移出窗口,winit 给负坐标:用 `fract()` 判半格得到的是
+  `-1.0→Left  -3.0→Left  -4.0→Right  -5.0→Right  -9.0→Left  -13.0→Right` —— **非单调**,
+  而列号已被夹在首格不动,于是选区边界在窗外来回抖。**规则**:格内分数一律
+  `let cell = q.floor(); q - cell`,并与 `cell_at` **同源地**把越界坐标夹到首/末格
+  (窗左外恒 Left、窗右外恒 Right),而不是让半格标志继续随指针翻转。
+  守护:`input::tests::cell_side_clamps_out_of_bounds_pointer_like_cell_at`。
+- **winit 失焦不补发 `MouseInput{Released}` → 按住左键 Alt-Tab 会让拖拽状态永久卡住(F18)。**
+  Windows 的 `WM_CAPTURECHANGED` 不合成一次释放事件,别的窗口抢走捕获后我们只会收到
+  `Focused(false)`。`dragging` 卡住 = 边界自动滚动停不下来(表现为「列表自己一直滚」)。
+  **规则**:`Focused(false)` 里显式收尾(`dragging=false`、`autoscroll=0`);同时松手路径
+  `selection_release` 必须先看「本地是否真的配对过一次按下」再决定动不动剪贴板 —— 指针事件按
+  T8 是「先喂 egui 再判」,**按下与释放各自独立判路由**,在菜单上按下、拖到终端里松开就会走到
+  释放分支而没有本地锚点;此时若无条件复制,会把仿真器里的**残留旧选区**静默写进剪贴板,
+  用户毫无察觉、原有内容就没了。
 
 ## alacritty_terminal / 快照
 
@@ -151,6 +178,18 @@
   **还必须 `set_parent(&window)`** —— 无 owner 的对话框可能被排到主窗口后面,而主窗此时
   已被 owner 关系禁用,用户看到的同样是「点不动的卡死窗口」。`rfd::FileDialog` 自身
   `unsafe impl Send`(只存 raw handle),跨线程带 owner 正是 rfd `AsyncFileDialog` 的内部做法。
+- **给终端算行列数时扣了 chrome 高度,画的时候也得平移——只做一半 = 首行被菜单栏吃掉。**
+  行数走 `shell::viewport::grid_dims(central_px)`(已扣菜单栏+状态栏),但 `gpu::quads_for` /
+  `text::prepare` 的绘制原点若仍是窗口 `(0,0)`,第 0 行就画在窗口最顶端;egui 在**同一个**
+  render pass 里后画,直接盖上去。真机症状:登录横幅第一行看不见,同时**底部多出一段等高的
+  空白**(行数少了、起点没动,让出来的空间跑到下面去了)。**规则**:`build_ui` 在两个
+  `TopBottomPanel` 都 `show()` 完之后同时记 `available_rect()` 的**尺寸和原点**
+  (`central_px` / `central_origin_px`),绘制两趟都平移到原点,glyphon 的 `TextBounds` 上边界
+  也收到原点(挡住字形上伸部溢进菜单栏)。**鼠标换算必须同源减去这个原点**,否则点到的格子与
+  看到的差一个菜单栏高度——平移只在 `App::cursor_in_grid` 一处做。
+  注意 `central_origin_px` 在渲染点是**同帧**新鲜的(`build_ui` 在终端绘制之前跑),
+  而 `central_px` 的消费点在 present 之后,滞后一帧;两者别混着推理。
+  守护:`gpu::tests::origin_shifts_every_quad_so_first_row_clears_the_menu_bar`。
 - **egui repaint 不得绕过帧率闸(T3/T7)。** 取 `viewport_output[ROOT].repaint_delay` 并进
   既有 `next_frame_at`/`WaitUntil` 排期,受 `FrameLimiter` 上限;别在渲染完原地 request_redraw。
 - **`EventLoopProxy` 只有 `Send`,没有 `Sync`。** 把 `EventLoopProxy<UserEvent>` 直接放进要做成
@@ -170,6 +209,16 @@
   `Ok(true)`,一律判 `HostKeyDecision::Reject`,绝不「送不到就放行」。
   守护:`ui::host_key::show` 不带 `.open()`;`host_key::tests::dropped_sender_is_rejected`、
   `host_key::tests::send_event_failure_is_rejected`。
+- **可取消的 `Modal` 要用 `ModalResponse::should_close()`,别手写 `key_pressed(Escape)`(F18)。**
+  `egui::Modal::show` 的返回值不是 `()`,丢掉它就丢掉了唯一的关闭出口:`should_close()` 同时
+  覆盖「按 Esc」与「点遮罩(backdrop)」两条路径,且它用 `consume_key` **消费**掉 Esc(仅在本
+  modal 是最顶层、且没有 popup 打开时),不会让同一次 Esc 再被下层看见。手写 `key_pressed`
+  只补了 Esc 半边、还不消费按键,而**点弹窗外面完全没有反应**——用户以为窗卡死了。
+  **规则**:`let resp = Modal::new(..).show(..); if resp.should_close() { /* 等价于取消 */ }`。
+  注意这与上一条不矛盾:承载**安全决策**的弹窗(主机密钥)故意**不**接 `should_close`,让它无法
+  被"什么都不做"地关掉;粘贴确认这类「取消 = 不做事」的弹窗才该接,因为取消本身就是安全默认。
+  另:`ScrollArea` 放进弹窗要给 `id_salt`(egui 0.30 已把 `id_source` 改名),否则同一帧里多个
+  滚动区会撞 id。守护:`ui::paste::tests`(纯函数部分)+ 人工验收「Esc / 点背景都能取消」。
 
 ## 字体
 

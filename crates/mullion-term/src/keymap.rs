@@ -66,6 +66,61 @@ pub fn encode_key(key: Key, mods: Mods, kitty: bool) -> Vec<u8> {
     }
 }
 
+/// bracketed paste 的起止标记(DEC 2004)。
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &str = "\x1b[201~";
+
+/// 把一段粘贴文本编码成发往对端的字节(F18)。
+///
+/// `bracketed` = 远端置了 `TermMode::BRACKETED_PASTE`。开启时用
+/// `ESC[200~` / `ESC[201~` 包裹,远端(bash/zsh/Claude Code)据此知道这是
+/// 粘贴而非逐键输入,不会把多行内容逐行执行。
+///
+/// 两件净化:
+/// 1. **剔除所有裸 `ESC`(0x1b) 与 `ETX`(0x03) 字节**。只剔完整的
+///    `ESC[201~` 挡不住:`str::replace` 是单趟非重叠扫描,剔掉中间那个之后
+///    左右残片会贴合成新的完整标记溜出去(见
+///    `paste_cannot_reassemble_end_marker_from_leftovers`)。剔光 ESC 之后
+///    这个序列根本无从构成。`ETX` 一并剔是因为有些 shell 收到它会错误地
+///    终止 bracketed paste(alacritty 上游同此)。
+/// 2. **`\r\n` 与 `\n` 统一成 `\r`**。终端里 Enter 是 CR 不是 LF。
+///
+/// 两步顺序无关:第 1 步只动 ESC/ETX 字节,第 2 步只动 `\r`/`\n` 字节,
+/// 字符集不相交,谁先谁后结果一样。
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    let body = text
+        .replace("\r\n", "\r")
+        .replace('\n', "\r")
+        .replace(['\x1b', '\x03'], "");
+    if !bracketed {
+        return body.into_bytes();
+    }
+    let mut out = Vec::with_capacity(body.len() + PASTE_START.len() + PASTE_END.len());
+    out.extend_from_slice(PASTE_START);
+    out.extend_from_slice(body.as_bytes());
+    out.extend_from_slice(PASTE_END.as_bytes());
+    out
+}
+
+/// 这段粘贴内容会在远端产生几次「回车执行」(F18)。
+///
+/// 必须与 [`encode_paste`] 同源:那边把 `\r\n` 与 `\n` 都归一成 `\r`,而裸 `\r`
+/// 原样保留——三种写法在远端都是一次回车。用 `str::lines()` 数会漏掉裸 `\r`,
+/// 让确认弹窗**低估**风险,而这个弹窗存在的唯一理由就是准确告知风险。
+///
+/// 尾随的那一个换行不计:`"ls -la\n"` 只执行一条命令。不这样处理的话,
+/// 从浏览器/IDE 复制的单行命令(普遍带尾随换行)每次都会触发多行确认。
+pub fn paste_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    // 与 encode_paste 一致地归一,再剥掉**最后一个**换行(不是全部尾随换行:
+    // 中间和末尾的空行都是实打实的回车)。
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    let body = normalized.strip_suffix('\r').unwrap_or(&normalized);
+    body.split('\r').count()
+}
+
 fn encode_enter(mods: Mods, kitty: bool) -> Vec<u8> {
     if mods.shift {
         if kitty {
@@ -493,6 +548,91 @@ mod tests {
         // 期望值直接从这两条协议依据推导,不是跑一遍实现拿回填值。
         assert_eq!(encode_wheel_arrow(true), vec![0x1b, b'O', b'A']);
         assert_eq!(encode_wheel_arrow(false), vec![0x1b, b'O', b'B']);
+    }
+
+    #[test]
+    fn paste_is_bracketed_when_remote_enabled_it() {
+        // F18 验收口径(spec.md):开启 bracketed paste 时内容被 ESC[200~ 包裹。
+        assert_eq!(encode_paste("ls", true), b"\x1b[200~ls\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn paste_is_raw_when_remote_did_not_enable_bracketed() {
+        assert_eq!(encode_paste("ls", false), b"ls".to_vec());
+    }
+
+    #[test]
+    fn paste_strips_embedded_end_marker_so_it_cannot_break_out() {
+        // 剔除的是裸 ESC(和 ETX),而不是剔除完整标记——只剔完整标记的话
+        // 残片会重新拼出一个(见 paste_cannot_reassemble_end_marker_from_leftovers)。
+        // 剔光 ESC 后 "\x1b[201~" 里的 ESC 没了,残留的 "[201~" 是纯文本,
+        // 没有前导 ESC,终端不会当 CSI 解析,无害。
+        let evil = "safe\x1b[201~rm -rf /";
+        assert_eq!(
+            encode_paste(evil, true),
+            b"\x1b[200~safe[201~rm -rf /\x1b[201~".to_vec()
+        );
+        // 未开 bracketed 时同样剔除:裸 ESC 留在流里对远端也是危险字节。
+        assert_eq!(encode_paste(evil, false), b"safe[201~rm -rf /".to_vec());
+    }
+
+    #[test]
+    fn paste_cannot_reassemble_end_marker_from_leftovers() {
+        // 只剔除完整的 ESC[201~ 是不够的:str::replace 单趟非重叠扫描,
+        // 剔掉中间那个之后左右残片会贴合成一个新的完整标记溜出去。
+        // 剔掉所有裸 ESC 才是真正封死的做法(alacritty 上游同此)。
+        let out = encode_paste("\x1b[20\x1b[201~1~", true);
+        let body = &out[PASTE_START.len()..out.len() - PASTE_END.len()];
+        assert!(
+            !body
+                .windows(PASTE_END.len())
+                .any(|w| w == PASTE_END.as_bytes()),
+            "净化后的正文里重新出现了结束标记 → 粘贴内容可提前脱离 paste 模式"
+        );
+    }
+
+    #[test]
+    fn paste_strips_etx_because_some_shells_mistake_it_for_paste_end() {
+        // 上游注释:有些 shell 收到 \x03(ETX / Ctrl-C)会错误地终止 bracketed paste。
+        assert_eq!(encode_paste("a\x03b", false), b"ab".to_vec());
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_to_cr() {
+        // 终端里 Enter 是 CR 不是 LF;发 LF 远端 readline 行为会怪
+        // (多出空行 / 不执行)。CRLF 也要折成单个 CR,否则每行执行两次。
+        assert_eq!(encode_paste("a\r\nb\nc", false), b"a\rb\rc".to_vec());
+    }
+
+    #[test]
+    fn paste_line_count_ignores_trailing_newline() {
+        // 从浏览器/IDE 复制一条命令通常带尾随换行。它只执行一条命令,
+        // 不该被当成「多行粘贴」报警——这是 F18 弹窗最高频的误报来源。
+        assert_eq!(paste_line_count("ls -la"), 1);
+        assert_eq!(paste_line_count("ls -la\n"), 1);
+        assert_eq!(paste_line_count("ls -la\r\n"), 1);
+    }
+
+    #[test]
+    fn paste_line_count_counts_bare_cr_like_encode_paste_does() {
+        // `encode_paste` 把 \r\n / \n 都归一成 \r,而裸 \r 原样保留——
+        // 三者在远端都是一次回车。用 `str::lines()` 数会漏掉裸 \r,
+        // 让弹窗**低估**风险(显示 2 行、实际执行 3 次回车)。
+        assert_eq!("a\rb\rc\nd".lines().count(), 2, "lines() 的口径(反例基线)");
+        assert_eq!(paste_line_count("a\rb\rc\nd"), 4);
+    }
+
+    #[test]
+    fn paste_line_count_counts_blank_lines_in_the_middle() {
+        // 中间的空行是实打实的一次回车,不能跟尾随换行一样被吃掉。
+        assert_eq!(paste_line_count("a\n\nb"), 3);
+        // 末尾连续换行只吃掉最后一个:"a\n\n" = 贴完 a、回车、再回车一次空行。
+        assert_eq!(paste_line_count("a\n\n"), 2);
+    }
+
+    #[test]
+    fn paste_line_count_of_empty_is_zero() {
+        assert_eq!(paste_line_count(""), 0);
     }
 
     #[test]

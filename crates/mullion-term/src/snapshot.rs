@@ -24,6 +24,9 @@ pub struct SnapCell {
     pub width: u8,
     /// 宽字符右半的占位格:渲染时跳过,不重复画。
     pub spacer: bool,
+    /// 是否落在当前选区内(F18)。渲染层据此做反色:背景改用 fg 色、
+    /// 文字改用 bg 色。宽字符右半的 spacer 与左半同步标记。
+    pub selected: bool,
 }
 
 /// 光标快照。

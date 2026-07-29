@@ -26,6 +26,7 @@ egui-winit.workspace = true
 rfd.workspace = true
 time.workspace = true
 log.workspace = true
+arboard.workspace = true
 
 # AttachConsole:GUI 子系统下从终端启动仍能看 CLI 诊断。
 # ProcessStatus/SystemInformation/Threading:diag 的内存采样(卡死时判断是否内存

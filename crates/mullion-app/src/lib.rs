@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod clipboard;
 pub mod diag;
 pub mod frame;
 pub mod gpu;
@@ -19,4 +20,5 @@ pub mod render;
 pub mod session_pump;
 pub mod shell;
 pub mod text;
+pub mod theme;
 pub mod ui;

@@ -5,6 +5,7 @@
 pub mod emulator;
 pub mod keymap;
 pub mod palette;
+pub mod selection;
 pub mod snapshot;
 
 /// alacritty 的终端模式位与滚动指令。app 层做滚轮分流要用,经这里重导出,

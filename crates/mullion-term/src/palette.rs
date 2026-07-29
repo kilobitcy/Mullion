@@ -29,9 +29,29 @@ const ANSI16: [Rgb; 16] = [
     Rgb::new(255, 255, 255), // 15 bright white
 ];
 
-/// 默认前景 / 背景(无 OSC 覆盖时)。
+/// 默认前景 / 背景的**出厂值**(无注入、无 OSC 覆盖时)。
 pub const DEFAULT_FG: Rgb = Rgb::new(0xcc, 0xcc, 0xcc);
 pub const DEFAULT_BG: Rgb = Rgb::new(0x00, 0x00, 0x00);
+
+/// 一对可注入的默认前景/背景色(F80)。
+///
+/// 「默认前景/背景」本就是 VT 协议概念——SGR 39/49 说的是它,OSC 10/11 改的也是它,
+/// 所以它归 term 所有。app 层的主题只是**注入**一组值进来,方向仍是 app → term:
+/// 这里只出现 term 自己的 `Rgb`,没有任何 UI 类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultColors {
+    pub fg: Rgb,
+    pub bg: Rgb,
+}
+
+impl Default for DefaultColors {
+    fn default() -> Self {
+        Self {
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+        }
+    }
+}
 
 /// 256 色索引 → 默认 RGB(0..16 ANSI;16..232 6×6×6 立方;232..256 灰阶)。
 pub fn indexed_default(i: u8) -> Rgb {
@@ -59,17 +79,24 @@ fn from_ansi(rgb: AnsiRgb) -> Rgb {
     Rgb::new(rgb.r, rgb.g, rgb.b)
 }
 
-fn named_default(named: NamedColor) -> Rgb {
+fn named_default(named: NamedColor, d: DefaultColors) -> Rgb {
     match named as usize {
         i @ 0..=15 => ANSI16[i],
-        256 => DEFAULT_FG, // Foreground
-        257 => DEFAULT_BG, // Background
-        _ => DEFAULT_FG,   // Bright*/Dim*/Cursor 等 MVP 先落默认前景
+        256 => d.fg, // Foreground
+        257 => d.bg, // Background
+        // Cursor/Dim*/BrightForeground/DimForeground 等 MVP 先落默认前景
+        // (SGR 90-97 的 8 个 Bright 基色走的是上面 0..=15 的 ANSI16 分支,
+        // 不受这里影响)。注意:注入之后这些会**跟着**变成主题前景色
+        // (本轮正是想要的,光标与文本同色系)。将来若要单独调光标色,
+        // 源头是这一行,不是 Theme。
+        _ => d.fg,
     }
 }
 
 /// 把一个单元格颜色解析成具体 RGB:OSC 覆盖优先,否则用默认表。
-pub fn resolve(color: AnsiColor, colors: &Colors) -> Rgb {
+///
+/// `d` 是可注入的默认前景/背景(F80 主题色)。不传主题时用 `DefaultColors::default()`。
+pub fn resolve(color: AnsiColor, colors: &Colors, d: DefaultColors) -> Rgb {
     match color {
         AnsiColor::Spec(rgb) => from_ansi(rgb),
         AnsiColor::Indexed(i) => match colors[i as usize] {
@@ -78,7 +105,7 @@ pub fn resolve(color: AnsiColor, colors: &Colors) -> Rgb {
         },
         AnsiColor::Named(named) => match colors[named] {
             Some(over) => from_ansi(over),
-            None => named_default(named),
+            None => named_default(named, d),
         },
     }
 }
@@ -91,7 +118,11 @@ mod tests {
     fn named_red_resolves_to_ansi_red() {
         let colors = Colors::default();
         assert_eq!(
-            resolve(AnsiColor::Named(NamedColor::Red), &colors),
+            resolve(
+                AnsiColor::Named(NamedColor::Red),
+                &colors,
+                DefaultColors::default()
+            ),
             Rgb::new(205, 0, 0)
         );
     }
@@ -99,7 +130,10 @@ mod tests {
     #[test]
     fn indexed_matches_named_for_first_16() {
         let colors = Colors::default();
-        assert_eq!(resolve(AnsiColor::Indexed(1), &colors), Rgb::new(205, 0, 0));
+        assert_eq!(
+            resolve(AnsiColor::Indexed(1), &colors, DefaultColors::default()),
+            Rgb::new(205, 0, 0)
+        );
     }
 
     #[test]
@@ -116,7 +150,11 @@ mod tests {
     fn spec_passes_through() {
         let colors = Colors::default();
         assert_eq!(
-            resolve(AnsiColor::Spec(AnsiRgb { r: 1, g: 2, b: 3 }), &colors),
+            resolve(
+                AnsiColor::Spec(AnsiRgb { r: 1, g: 2, b: 3 }),
+                &colors,
+                DefaultColors::default()
+            ),
             Rgb::new(1, 2, 3)
         );
     }
@@ -130,7 +168,11 @@ mod tests {
             b: 30,
         });
         assert_eq!(
-            resolve(AnsiColor::Named(NamedColor::Red), &colors),
+            resolve(
+                AnsiColor::Named(NamedColor::Red),
+                &colors,
+                DefaultColors::default()
+            ),
             Rgb::new(10, 20, 30)
         );
     }
@@ -139,12 +181,66 @@ mod tests {
     fn default_fg_bg_are_distinct() {
         let colors = Colors::default();
         assert_eq!(
-            resolve(AnsiColor::Named(NamedColor::Background), &colors),
+            resolve(
+                AnsiColor::Named(NamedColor::Background),
+                &colors,
+                DefaultColors::default()
+            ),
             DEFAULT_BG
         );
         assert_eq!(
-            resolve(AnsiColor::Named(NamedColor::Foreground), &colors),
+            resolve(
+                AnsiColor::Named(NamedColor::Foreground),
+                &colors,
+                DefaultColors::default()
+            ),
             DEFAULT_FG
+        );
+    }
+
+    #[test]
+    fn injected_defaults_replace_factory_values() {
+        let colors = Colors::default();
+        let d = DefaultColors {
+            fg: Rgb::new(0xe4, 0xe6, 0xf0),
+            bg: Rgb::new(0x14, 0x16, 0x1f),
+        };
+        assert_eq!(
+            resolve(AnsiColor::Named(NamedColor::Background), &colors, d),
+            Rgb::new(0x14, 0x16, 0x1f)
+        );
+        assert_eq!(
+            resolve(AnsiColor::Named(NamedColor::Foreground), &colors, d),
+            Rgb::new(0xe4, 0xe6, 0xf0)
+        );
+    }
+
+    /// 注入只该动默认前景/背景,不该动 ANSI 16 色(那是另一套,F84 才可配)。
+    #[test]
+    fn injection_does_not_touch_ansi16() {
+        let colors = Colors::default();
+        let d = DefaultColors {
+            fg: Rgb::new(0xe4, 0xe6, 0xf0),
+            bg: Rgb::new(0x14, 0x16, 0x1f),
+        };
+        assert_eq!(
+            resolve(AnsiColor::Named(NamedColor::Red), &colors, d),
+            Rgb::new(205, 0, 0)
+        );
+    }
+
+    /// OSC 覆盖(将来的 OSC 10/11)优先级仍高于注入的默认色。
+    #[test]
+    fn osc_override_still_wins_over_injected_defaults() {
+        let mut colors = Colors::default();
+        colors[NamedColor::Background] = Some(AnsiRgb { r: 1, g: 2, b: 3 });
+        let d = DefaultColors {
+            fg: Rgb::new(0xe4, 0xe6, 0xf0),
+            bg: Rgb::new(0x14, 0x16, 0x1f),
+        };
+        assert_eq!(
+            resolve(AnsiColor::Named(NamedColor::Background), &colors, d),
+            Rgb::new(1, 2, 3)
         );
     }
 }

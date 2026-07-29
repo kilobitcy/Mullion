@@ -1,6 +1,7 @@
 //! GPU 层:背景/光标色块生成(纯,可测)+ wgpu 表面与色块管线(GPU 胶水,见 Task 8)。
 
-use mullion_term::snapshot::{GridSnapshot, Rgb};
+use mullion_term::palette::DefaultColors;
+use mullion_term::snapshot::GridSnapshot;
 
 /// 一个实心色块(背景 / 光标),像素坐标(左上原点)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12,30 +13,57 @@ pub struct Quad {
     pub color: [u8; 3],
 }
 
-/// 从快照生成需要画的色块:bg ≠ 默认 的格 + 可见光标(块状)。纯函数,可单测。
-pub fn quads_for(snap: &GridSnapshot, cell_w: f32, cell_h: f32, default_bg: Rgb) -> Vec<Quad> {
+/// 从快照生成需要画的色块:bg ≠ 默认 的格 + 选中格(反色,F18)+ 可见光标(块状)。
+/// 纯函数,可单测。
+///
+/// `origin` 是终端区左上角的窗口像素坐标(egui 菜单栏/状态栏之间的中央区)。
+/// 网格坐标一律相对该原点:传 `(0.0, 0.0)` 得到纯网格坐标(测试用),实际渲染
+/// 传中央区原点,否则第 0 行画在窗口顶端、被菜单栏盖住。文字层
+/// (`text::TextLayer::prepare`)必须用**同一个** origin,不然底色和字会错位。
+///
+/// `defaults` 必须来自 `theme::term_default_colors`(F80 三处同源),不要直接传
+/// `palette::DEFAULT_*`——那样主题一换就和 clear 色失配。
+pub fn quads_for(
+    snap: &GridSnapshot,
+    origin: (f32, f32),
+    cell_w: f32,
+    cell_h: f32,
+    defaults: DefaultColors,
+) -> Vec<Quad> {
     let mut quads = Vec::new();
     for row in 0..snap.rows {
         for (col, cell) in snap.row(row).iter().enumerate() {
-            if cell.spacer || cell.bg == default_bg {
+            if cell.spacer {
                 continue;
             }
+            // F18:选中格画反色底——用前景色当底,文字那趟同步改用 bg 色
+            // (见 `text::row_to_spans`)。反色优先于下面「bg 是默认色就不画」
+            // 的短路,否则选区在默认背景上完全看不见。
+            let color = if cell.selected {
+                cell.fg
+            } else if cell.bg == defaults.bg {
+                continue;
+            } else {
+                cell.bg
+            };
             quads.push(Quad {
-                x: col as f32 * cell_w,
-                y: row as f32 * cell_h,
+                x: origin.0 + col as f32 * cell_w,
+                y: origin.1 + row as f32 * cell_h,
                 w: cell.width.max(1) as f32 * cell_w,
                 h: cell_h,
-                color: [cell.bg.r, cell.bg.g, cell.bg.b],
+                color: [color.r, color.g, color.b],
             });
         }
     }
     if snap.cursor.visible {
         quads.push(Quad {
-            x: snap.cursor.col as f32 * cell_w,
-            y: snap.cursor.row as f32 * cell_h,
+            x: origin.0 + snap.cursor.col as f32 * cell_w,
+            y: origin.1 + snap.cursor.row as f32 * cell_h,
             w: cell_w,
             h: cell_h,
-            color: [0xcc, 0xcc, 0xcc], // MVP 块状光标用默认前景色
+            // MVP 块状光标用默认前景色。原本硬编码 0xcc,主题化后必须跟着走,
+            // 否则新前景下光标是一块突兀的旧灰。
+            color: [defaults.fg.r, defaults.fg.g, defaults.fg.b],
         });
     }
     quads
@@ -273,6 +301,18 @@ const QUAD_WGSL: &str = r#"
 
 struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
 
+// surface 格式是 sRGB(见 Gpu::new 的 is_srgb 挑选),硬件会把着色器输出当**线性**
+// 值再编码成 sRGB。所以这里必须先把 sRGB 分量转成线性,否则画出来比实际亮一截。
+// egui(egui.wgsl 的 linear_from_gamma_rgb)与 glyphon(shader.wgsl 的
+// srgb_to_linear)都这么做;我们不做就会和它们对不上。放顶点着色器:每个
+// quad 4 次,比逐像素便宜。
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let cutoff = c < vec3<f32>(0.04045);
+    let lower = c / vec3<f32>(12.92);
+    let higher = pow((c + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+    return select(higher, lower, cutoff);
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32,
            @location(0) rect: vec4<f32>,
@@ -286,7 +326,7 @@ fn vs_main(@builtin(vertex_index) vi: u32,
     );
     var out: VsOut;
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
-    out.color = color;
+    out.color = vec4<f32>(srgb_to_linear(color.rgb), color.a);
     return out;
 }
 
@@ -297,7 +337,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> { return in.color; }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mullion_term::snapshot::{Cursor, SnapCell};
+    use mullion_term::palette::DefaultColors;
+    use mullion_term::snapshot::{Cursor, Rgb, SnapCell};
 
     fn snap_1x1(bg: Rgb) -> GridSnapshot {
         GridSnapshot {
@@ -309,6 +350,7 @@ mod tests {
                 bg,
                 width: 1,
                 spacer: false,
+                selected: false,
             }],
             cursor: Cursor {
                 row: 0,
@@ -319,16 +361,31 @@ mod tests {
     }
 
     #[test]
+    fn origin_shifts_every_quad_so_first_row_clears_the_menu_bar() {
+        // 真机症状:第 0 行画在窗口顶端(y=0),被 egui 顶部菜单栏整条盖住,
+        // 用户看不到登录横幅第一行。行数已按中央区算过,漏的是这一下平移。
+        let mut snap = snap_1x1(Rgb::new(205, 0, 0));
+        snap.cursor.visible = true;
+        let quads = quads_for(&snap, (0.0, 24.0), 10.0, 20.0, DefaultColors::default());
+        assert_eq!(quads.len(), 2, "一个背景块 + 一个光标块");
+        for q in &quads {
+            assert_eq!(q.y, 24.0, "第 0 行必须落在中央区顶端,不是窗口顶端");
+        }
+        // 尺寸不跟着平移变——平移只动位置。
+        assert_eq!(quads[0].h, 20.0);
+    }
+
+    #[test]
     fn default_bg_cell_makes_no_quad() {
         let snap = snap_1x1(Rgb::new(0, 0, 0)); // == DEFAULT_BG
-        let quads = quads_for(&snap, 10.0, 20.0, Rgb::new(0, 0, 0));
+        let quads = quads_for(&snap, (0.0, 0.0), 10.0, 20.0, DefaultColors::default());
         assert!(quads.is_empty(), "默认背景不该产生色块(省 GPU)");
     }
 
     #[test]
     fn colored_bg_cell_makes_quad_at_pixel() {
         let snap = snap_1x1(Rgb::new(205, 0, 0));
-        let quads = quads_for(&snap, 10.0, 20.0, Rgb::new(0, 0, 0));
+        let quads = quads_for(&snap, (0.0, 0.0), 10.0, 20.0, DefaultColors::default());
         assert_eq!(quads.len(), 1);
         assert_eq!(
             quads[0],
@@ -346,8 +403,93 @@ mod tests {
     fn visible_cursor_adds_block_quad() {
         let mut snap = snap_1x1(Rgb::new(0, 0, 0));
         snap.cursor.visible = true;
-        let quads = quads_for(&snap, 10.0, 20.0, Rgb::new(0, 0, 0));
+        let quads = quads_for(&snap, (0.0, 0.0), 10.0, 20.0, DefaultColors::default());
         assert_eq!(quads.len(), 1, "仅光标块(默认背景无块)");
         assert_eq!(quads[0].w, 10.0);
+    }
+
+    fn snap_selected_1x1(fg: Rgb, bg: Rgb) -> GridSnapshot {
+        GridSnapshot {
+            cols: 1,
+            rows: 1,
+            cells: vec![SnapCell {
+                ch: 'a',
+                fg,
+                bg,
+                width: 1,
+                spacer: false,
+                selected: true,
+            }],
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: false,
+            },
+        }
+    }
+
+    #[test]
+    fn selected_cell_is_inverted_even_on_default_background() {
+        // 反色必须优先于「bg 是默认色就不画」这条既有短路,否则在默认背景上
+        // (也就是绝大多数情况)选区完全看不见。
+        let fg = Rgb::new(0xcc, 0xcc, 0xcc);
+        let snap = snap_selected_1x1(fg, Rgb::new(0, 0, 0));
+        let quads = quads_for(&snap, (0.0, 0.0), 10.0, 20.0, DefaultColors::default());
+        assert_eq!(quads.len(), 1, "选中格必须画底色块");
+        assert_eq!(quads[0].color, [0xcc, 0xcc, 0xcc], "底色应换成前景色");
+    }
+
+    /// 守 F80 前置:surface 是 sRGB 格式(`is_srgb()` 挑的),着色器输出会被硬件
+    /// 当线性值再编码。不转换的话,同一个 token 在 egui(自己转了)和终端色块
+    /// (没转)里会画成两个颜色——底色非黑之后肉眼可见。
+    /// 数值正确性只能人眼验;这里守的是「转换没被后来的重构删掉」。
+    #[test]
+    fn quad_shader_converts_srgb_to_linear() {
+        assert!(
+            QUAD_WGSL.contains("fn srgb_to_linear"),
+            "quad 着色器缺 sRGB→线性 转换,终端色块会比 egui 外壳亮一截"
+        );
+        assert!(
+            QUAD_WGSL.contains("srgb_to_linear(color.rgb)"),
+            "srgb_to_linear 定义了但没用在顶点色上"
+        );
+    }
+
+    /// 计划期发现:光标色原本硬编码 [0xcc,0xcc,0xcc],不引用任何常量,
+    /// 改主题前景后会留一块旧灰。必须跟着 DefaultColors.fg 走。
+    #[test]
+    fn cursor_uses_injected_default_fg() {
+        let fg = Rgb::new(0xe4, 0xe6, 0xf0);
+        let bg = Rgb::new(0x14, 0x16, 0x1f);
+        let mut snap = snap_1x1(bg);
+        snap.cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        };
+        let quads = quads_for(&snap, (0.0, 0.0), 10.0, 20.0, DefaultColors { fg, bg });
+        let cursor = quads.last().expect("光标可见时应有一个 quad");
+        assert_eq!(cursor.color, [0xe4, 0xe6, 0xf0], "光标色应取注入的默认前景");
+    }
+
+    /// 非黑主题底色下,默认背景格同样不画 quad(靠 clear 色透出)。
+    #[test]
+    fn default_bg_cell_makes_no_quad_on_themed_bg() {
+        let bg = Rgb::new(0x14, 0x16, 0x1f);
+        let snap = snap_1x1(bg);
+        let quads = quads_for(
+            &snap,
+            (0.0, 0.0),
+            10.0,
+            20.0,
+            DefaultColors {
+                fg: Rgb::new(0xe4, 0xe6, 0xf0),
+                bg,
+            },
+        );
+        assert!(
+            quads.is_empty(),
+            "背景 == 主题默认背景 的格子不该画 quad,否则白扔一块画面"
+        );
     }
 }

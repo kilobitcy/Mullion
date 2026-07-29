@@ -1,7 +1,10 @@
 //! winit 键盘事件 → term keymap 的 (Key, Mods)。纯映射,可脱离窗口单测。
 //! 编码本身(含 T6 Shift+Enter)在 `mullion_term::keymap::encode_key`,这里只做翻译。
 
+use std::time::Instant;
+
 use mullion_term::keymap::{Key, Mods};
+use mullion_term::selection::{CellSide, SelectionKind};
 use winit::event::{KeyEvent, MouseScrollDelta};
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 
@@ -75,8 +78,9 @@ pub fn wheel_lines(delta: MouseScrollDelta, cell_h: f32) -> i32 {
 
 /// 指针物理像素坐标 → 1-based 终端单元格 `(col, row)`,夹紧在 `dims` 内。
 ///
-/// 不减菜单栏高度:终端文字层就是从窗口原点开始画的(`text.rs` 的
-/// `top: row * cell_h`),这里必须用同一套坐标系,否则上报的行号会整体偏移。
+/// **收的是「终端区局部坐标」,不是窗口坐标**:终端自绘层整体平移到了 egui
+/// 中央区(菜单栏之下),所以调用方必须先减去中央区原点。换算只在
+/// `App::cursor_in_grid` 一处做——两边原点不同源,上报的行号就整体偏移。
 pub fn cell_at(px: (f32, f32), cell: (f32, f32), dims: (u16, u16)) -> (u16, u16) {
     let cw = if cell.0 > 0.0 { cell.0 } else { 1.0 };
     let ch = if cell.1 > 0.0 { cell.1 } else { 1.0 };
@@ -88,9 +92,116 @@ pub fn cell_at(px: (f32, f32), cell: (f32, f32), dims: (u16, u16)) -> (u16, u16)
     )
 }
 
+/// 连击时间窗(ms)。Windows 双击间隔默认 500ms,取同量级——太长会把两次
+/// 不相干的单击粘成双击,太短则连击选词经常判不出来。
+const MULTI_CLICK_MS: u128 = 400;
+/// 连击的位置容差(单元格)。手在按键瞬间会抖 1 格,不给容差双击很难触发。
+const MULTI_CLICK_SLOP: u16 = 1;
+/// 自动滚动每帧上限(行)。不封顶的话把指针甩到屏幕外一帧就冲到 scrollback
+/// 顶端,选区直接失控。
+const AUTOSCROLL_MAX_LINES: i32 = 5;
+
+/// 一次左键按下的连击状态。由 [`click_kind`] 产出,调用方存着下次传回来。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrevClick {
+    pub at: Instant,
+    pub pos: (u16, u16),
+    /// 连击序号:1 = 单击,2 = 双击,3 = 三击(第 4 击回到 1)。
+    pub count: u8,
+}
+
+/// 指针在单元格内落在左半还是右半(F18)。
+///
+/// 决定该格算不算进选区,直接影响"跟手"——只按格号取整的话,选区边界会
+/// 比视觉滞后半格。
+///
+/// `cols` 是网格列数,用来把越界指针夹进网格:拖拽时指针会移出窗口,
+/// [`cell_at`] 已经把列号夹到首/末格,半格判定必须**同源**地夹,否则指针在
+/// 窗外继续移动时列号不动、半格标志却在翻转,选区边界会抖
+/// (见 `cell_side_clamps_out_of_bounds_pointer_like_cell_at`)。
+///
+/// 格内分数用 `floor` 而不是 `f32::fract()`:后者是向零截断,负数区间与
+/// [`cell_at`] 的 `floor` 取整不是同一套规则。
+pub fn cell_side(px_x: f32, cell_w: f32, cols: u16) -> CellSide {
+    // cell_w 为 0(字体测量失败)时除零得 NaN,而 NaN 的比较恒 false,
+    // 会一路判成 Right —— 选区整体偏一格。兜底成 1.0。
+    let w = if cell_w > 0.0 { cell_w } else { 1.0 };
+    let q = px_x / w;
+    let cell = q.floor();
+    if cell < 0.0 {
+        CellSide::Left
+    } else if cell > cols.saturating_sub(1) as f32 {
+        CellSide::Right
+    } else if q - cell < 0.5 {
+        CellSide::Left
+    } else {
+        CellSide::Right
+    }
+}
+
+/// 判定本次左键按下是单击 / 双击 / 三击,并给出更新后的连击状态。
+///
+/// winit 不提供连击判定,得自己做。`now` 作为参数传入而不是函数内取当前时间,
+/// 否则没法测。第 4 击回到单击,与主流终端一致。
+pub fn click_kind(
+    prev: Option<PrevClick>,
+    now: Instant,
+    pos: (u16, u16),
+) -> (SelectionKind, PrevClick) {
+    let count = match prev {
+        Some(p)
+            if now.duration_since(p.at).as_millis() <= MULTI_CLICK_MS
+                && p.pos.0.abs_diff(pos.0) <= MULTI_CLICK_SLOP
+                && p.pos.1.abs_diff(pos.1) <= MULTI_CLICK_SLOP =>
+        {
+            if p.count >= 3 {
+                1
+            } else {
+                p.count + 1
+            }
+        }
+        _ => 1,
+    };
+    let kind = match count {
+        2 => SelectionKind::Semantic,
+        3 => SelectionKind::Lines,
+        _ => SelectionKind::Simple,
+    };
+    (
+        kind,
+        PrevClick {
+            at: now,
+            pos,
+            count,
+        },
+    )
+}
+
+/// 拖拽时指针越出窗口上/下边界要滚几行(F18:选区跨多屏 scrollback)。
+///
+/// 正数 = 往历史(向上),与 `mullion_term::emulator::Emulator::scroll` 的
+/// `Scroll::Delta` 语义一致。边界内返回 0。越界越远滚越快,封顶
+/// [`AUTOSCROLL_MAX_LINES`]。
+pub fn autoscroll_lines(px_y: f32, win_h: f32, cell_h: f32) -> i32 {
+    // 窗口最小化时 win_h 可能是 0,那时任何正的 px_y 都会落进「越出下边界」
+    // 分支、无端往下滚。最小化本就不该有划选,直接不滚。
+    if win_h <= 0.0 {
+        return 0;
+    }
+    let h = if cell_h > 0.0 { cell_h } else { 1.0 };
+    if px_y < 0.0 {
+        (((-px_y) / h).ceil() as i32).clamp(1, AUTOSCROLL_MAX_LINES)
+    } else if px_y > win_h {
+        -((((px_y - win_h) / h).ceil() as i32).clamp(1, AUTOSCROLL_MAX_LINES))
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use winit::dpi::PhysicalPosition;
     use winit::event::MouseScrollDelta;
 
@@ -176,5 +287,123 @@ mod tests {
             (80, 24)
         );
         assert_eq!(cell_at((-5.0, -5.0), (8.0, 16.0), (80, 24)), (1, 1));
+    }
+
+    #[test]
+    fn cell_side_splits_at_half_cell() {
+        // 落在格左半 → 该格不算进选区;右半 → 算进去。半格判定直接影响"跟手"。
+        assert_eq!(cell_side(0.0, 8.0, 80), CellSide::Left);
+        assert_eq!(cell_side(3.9, 8.0, 80), CellSide::Left);
+        assert_eq!(cell_side(4.0, 8.0, 80), CellSide::Right);
+        assert_eq!(cell_side(7.9, 8.0, 80), CellSide::Right);
+        // 下一格重新从左半开始。
+        assert_eq!(cell_side(8.0, 8.0, 80), CellSide::Left);
+    }
+
+    #[test]
+    fn cell_side_survives_zero_cell_width() {
+        // cell_w 在字体测量失败时可能是 0;除零会得到 NaN,NaN 比较恒 false,
+        // 结果是永远判 Right —— 选区整体偏一格。这里兜底成 Left。
+        assert_eq!(cell_side(3.0, 0.0, 80), CellSide::Left);
+    }
+
+    #[test]
+    fn cell_side_clamps_out_of_bounds_pointer_like_cell_at() {
+        // 拖拽时指针会移出窗口(winit 给负坐标 / 超窗口宽的坐标)。cell_at 会把
+        // 列号夹到首/末格,半格判定必须同源地夹——否则列号不动、半格标志却随
+        // 指针继续移动而翻转,选区边界在窗外抖。
+        // 曾经的实现用 f32::fract()(向零截断),负数区间给出的是:
+        //   -1.0→Left  -3.0→Left  -4.0→Right  -5.0→Right  -9.0→Left  -13.0→Right
+        // 非单调,正是抖动的来源。
+        for px in [-1.0, -3.0, -4.0, -5.0, -9.0, -13.0, -1000.0] {
+            assert_eq!(
+                cell_side(px, 8.0, 80),
+                CellSide::Left,
+                "px={px} 窗口左外侧应恒为 Left"
+            );
+        }
+        // 右侧越界:列号夹在末格,半格应恒为 Right,否则拖到右边界外选不到行尾。
+        for px in [640.0, 700.0, 10_000.0] {
+            assert_eq!(
+                cell_side(px, 8.0, 80),
+                CellSide::Right,
+                "px={px} 窗口右外侧应恒为 Right"
+            );
+        }
+        // 末格内部仍正常二分(80 列 × 8px:第 79 格是 632.0..640.0)。
+        assert_eq!(cell_side(632.0, 8.0, 80), CellSide::Left);
+        assert_eq!(cell_side(636.0, 8.0, 80), CellSide::Right);
+    }
+
+    #[test]
+    fn double_and_triple_click_are_detected_then_wrap() {
+        // winit 不提供连击判定,自己做。第 4 击回到单击(与主流终端一致)。
+        let t0 = Instant::now();
+        let (k1, p1) = click_kind(None, t0, (5, 5));
+        assert_eq!(k1, SelectionKind::Simple);
+        let (k2, p2) = click_kind(Some(p1), t0 + Duration::from_millis(100), (5, 5));
+        assert_eq!(k2, SelectionKind::Semantic);
+        let (k3, p3) = click_kind(Some(p2), t0 + Duration::from_millis(200), (5, 5));
+        assert_eq!(k3, SelectionKind::Lines);
+        let (k4, _) = click_kind(Some(p3), t0 + Duration::from_millis(300), (5, 5));
+        assert_eq!(k4, SelectionKind::Simple, "第 4 击应回到单击");
+    }
+
+    #[test]
+    fn slow_second_click_is_a_fresh_single_click() {
+        let t0 = Instant::now();
+        let (_, p1) = click_kind(None, t0, (5, 5));
+        let (k2, _) = click_kind(Some(p1), t0 + Duration::from_millis(5_000), (5, 5));
+        assert_eq!(k2, SelectionKind::Simple, "超时后不该判成双击");
+    }
+
+    #[test]
+    fn click_far_away_restarts_the_count() {
+        // 位置容差 1 格:手抖挪一格仍算连击,挪远了就是新的一次单击——
+        // 否则在文档里点两个不相干的位置会莫名其妙选中一个词。
+        let t0 = Instant::now();
+        let (_, p1) = click_kind(None, t0, (5, 5));
+        let (k_near, _) = click_kind(Some(p1), t0 + Duration::from_millis(100), (6, 5));
+        assert_eq!(k_near, SelectionKind::Semantic, "漂移 1 格仍算连击");
+        let (k_far, _) = click_kind(Some(p1), t0 + Duration::from_millis(100), (20, 5));
+        assert_eq!(k_far, SelectionKind::Simple, "漂移超过 1 格应重新计数");
+    }
+
+    #[test]
+    fn autoscroll_is_zero_inside_the_window() {
+        assert_eq!(autoscroll_lines(0.0, 480.0, 16.0), 0);
+        assert_eq!(autoscroll_lines(240.0, 480.0, 16.0), 0);
+        assert_eq!(autoscroll_lines(480.0, 480.0, 16.0), 0);
+    }
+
+    #[test]
+    fn autoscroll_direction_matches_emulator_scroll_semantics() {
+        // Emulator::scroll(Scroll::Delta(正数)) = 往历史(向上)。拖出上边界要看
+        // 更旧的内容 → 正数;拖出下边界 → 负数。符号搞反在无头环境只能靠测试钉住。
+        assert!(autoscroll_lines(-1.0, 480.0, 16.0) > 0);
+        assert!(autoscroll_lines(481.0, 480.0, 16.0) < 0);
+    }
+
+    #[test]
+    fn autoscroll_speeds_up_with_distance_but_is_capped() {
+        // 越界越多滚越快,但要封顶:不封的话把指针甩到屏幕外一帧就冲到
+        // scrollback 顶端,选区直接失控。
+        let near = autoscroll_lines(-16.0, 480.0, 16.0);
+        let far = autoscroll_lines(-160.0, 480.0, 16.0);
+        assert!(far > near, "越界越远应滚得越快");
+        assert_eq!(
+            autoscroll_lines(-10_000.0, 480.0, 16.0),
+            5,
+            "必须封顶在 5 行"
+        );
+    }
+
+    #[test]
+    fn autoscroll_is_zero_when_window_or_cell_is_degenerate() {
+        // 窗口最小化(win_h = 0)时不该滚:否则任何正的 px_y 都被当成越出下边界。
+        assert_eq!(autoscroll_lines(100.0, 0.0, 16.0), 0);
+        // cell_h = 0(字体测量失败)走 1.0 兜底,不能除零得 NaN 后 as i32 变成 0 或乱数。
+        assert_eq!(autoscroll_lines(-3.0, 480.0, 0.0), 3);
+        assert_eq!(autoscroll_lines(240.0, 480.0, 0.0), 0);
     }
 }

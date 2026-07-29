@@ -16,7 +16,7 @@ use mullion_term::Scroll;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Receiver;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -26,6 +26,7 @@ use crate::gpu::{quads_for, Gpu};
 use crate::pane::Pane;
 use crate::render::SyncFramePacer;
 use crate::text::TextLayer;
+use crate::theme::{self, MULLION_DARK};
 use crate::{diag, grid, input, session_pump, shell};
 
 /// app 与「连接建立」异步任务之间的事件(ssh io_task / connect 的 wake、结果经此回送)。
@@ -118,6 +119,20 @@ pub struct App {
     /// 指针最近一次的物理像素坐标。`MouseWheel` 事件本身不带坐标,鼠标上报
     /// (F17 alt screen 档)要的 (col,row) 只能靠 `CursorMoved` 记着。
     cursor_px: (f32, f32),
+    /// 系统剪贴板(F18)。打不开时内部退化为 no-op(见 `crate::clipboard`)。
+    clipboard: crate::clipboard::Clipboard,
+    /// 左键是否按住(划选进行中)。松开即结束,不跨 focus 保留。
+    dragging: bool,
+    /// 上一次左键按下的连击状态,喂 `input::click_kind` 判双击/三击。
+    prev_click: Option<input::PrevClick>,
+    /// 左键按下时的 0-based 锚点格与选区类型(F18)。松开时用来识别
+    /// 「只是点了一下、指针从未离开这一格」——那种情况不该复制。
+    press_anchor: Option<((u16, u16), mullion_term::selection::SelectionKind)>,
+    /// 拖拽出界时每帧要滚的行数;0 = 不自动滚。**只在真正 present 的那一帧施加**
+    /// (见 `RedrawRequested` 里的说明),否则重演 T3/T7。
+    autoscroll: i32,
+    /// 待用户确认的多行粘贴(F18)。`Some` = 弹窗开着,计入 `modal`(T8)。
+    pending_paste: Option<String>,
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -153,6 +168,12 @@ impl App {
             key_picker_busy: false,
             ui_dirty: true, // 首帧必须画出来
             cursor_px: (0.0, 0.0),
+            clipboard: crate::clipboard::Clipboard::new(),
+            dragging: false,
+            prev_click: None,
+            press_anchor: None,
+            autoscroll: 0,
+            pending_paste: None,
         }
     }
 
@@ -167,6 +188,166 @@ impl App {
         if let Some(a) = &self.active {
             a.window.request_redraw();
         }
+    }
+
+    /// 指针位置换算成**终端区局部**像素坐标(窗口坐标减去 egui 中央区原点)。
+    ///
+    /// 终端自绘层整体平移到了菜单栏之下(`ui::UiState::central_origin_px`),
+    /// 所有「像素 → 单元格」的换算都必须用同一个原点,否则鼠标点到的格子与
+    /// 眼睛看到的差一个菜单栏的高度。平移**只在这一个函数里做**。
+    /// 负数(指针在菜单栏/状态栏上)交给 `cell_at`/`cell_side` 各自夹紧。
+    fn cursor_in_grid(&self) -> (f32, f32) {
+        let (ox, oy) = self.ui.central_origin_px;
+        (self.cursor_px.0 - ox, self.cursor_px.1 - oy)
+    }
+
+    /// 指针当前位置对应的 **0-based** viewport 单元格与格内左右半。
+    ///
+    /// `input::cell_at` 给的是 **1-based**(F17 鼠标上报的口径,SGR 协议要求),
+    /// 而选区 API 收 0-based。两套口径并存是既有事实,换算**只在这一个函数里做**,
+    /// 别让 0/1 混进事件循环——那是 off-by-one 最容易长出来的地方。
+    fn selection_cursor(&self) -> Option<(u16, u16, mullion_term::selection::CellSide)> {
+        let a = self.active.as_ref()?;
+        let cell_px = (a.text.cell_w, a.text.cell_h);
+        let local = self.cursor_in_grid();
+        let (col1, row1) = input::cell_at(local, cell_px, a.grid_dims);
+        let side = input::cell_side(local.0, cell_px.0, a.grid_dims.0);
+        Some((col1.saturating_sub(1), row1.saturating_sub(1), side))
+    }
+
+    /// 左键按下:判连击类型 → 开新选区(旧选区被覆盖)。
+    fn selection_press(&mut self) {
+        // 没有连接就没有终端可选,别让 `dragging` 在 launcher 态被置起来——
+        // 那会让后续每次 `CursorMoved` 都白跑一遍划选和重绘。
+        if self.conn.is_none() {
+            return;
+        }
+        let Some(a) = self.active.as_ref() else {
+            return;
+        };
+        let cell_px = (a.text.cell_w, a.text.cell_h);
+        let pos1 = input::cell_at(self.cursor_in_grid(), cell_px, a.grid_dims);
+        let (kind, prev) = input::click_kind(self.prev_click, Instant::now(), pos1);
+        self.prev_click = Some(prev);
+        if let Some((col, row, side)) = self.selection_cursor() {
+            self.press_anchor = Some(((col, row), kind));
+            if let Some(conn) = self.conn.as_mut() {
+                conn.pane.emulator.selection_start(col, row, kind, side);
+            }
+        }
+        self.dragging = true;
+        self.request_ui_redraw();
+    }
+
+    /// 更新选区终点 + 重算出界滚动量。**不请求重绘**:自动滚动那条路径要在
+    /// present 之后调它,在那里 `request_redraw` 会与 `RedrawRequested` 互相触发,
+    /// 绕开帧闸忙转(T3/T7)。需要重绘的调用方自己调 `request_ui_redraw`。
+    fn update_selection_endpoint(&mut self) {
+        let Some(a) = self.active.as_ref() else {
+            return;
+        };
+        let win_h = a.gpu.config.height as f32;
+        let cell_h = a.text.cell_h;
+        self.autoscroll = input::autoscroll_lines(self.cursor_px.1, win_h, cell_h);
+        if let Some((col, row, side)) = self.selection_cursor() {
+            if let Some(conn) = self.conn.as_mut() {
+                conn.pane.emulator.selection_update(col, row, side);
+            }
+        }
+    }
+
+    /// 左键松开:选中即复制(PuTTY / Xshell 习惯,F18 交互口径)。
+    ///
+    /// 例外是「只是点了一下」:Simple 选区且指针从未离开按下的那一格。
+    /// alacritty 的 `is_empty` 只在起止 **side** 也相同时才判空,手在按压瞬间
+    /// 抖 1px 跨过半格线就会选出一个字符——点一下终端就把剪贴板覆盖掉,
+    /// 是会真实困扰人的。双击选词 / 三击选行不受影响(kind 不是 Simple)。
+    fn selection_release(&mut self) {
+        // 只有配对过一次本地 `selection_press` 的释放才有资格动剪贴板。
+        // 指针事件按 T8 的规则「先喂 egui 再判」,按下与释放是**各自独立**判路由的:
+        // 在菜单上按下(判给 egui)、拖到终端区域松开(判给终端),就会走到这里而
+        // `press_anchor` 是空的。那种情况下若无条件 `copy_selection`,会把仿真器里
+        // 早先残留的选区静默写进剪贴板——用户毫无察觉,原有内容就没了。
+        let was_dragging = self.dragging;
+        self.dragging = false;
+        self.autoscroll = 0;
+        let anchor = self.press_anchor.take();
+        if !was_dragging {
+            return;
+        }
+        if let (Some((cell, mullion_term::selection::SelectionKind::Simple)), Some((col, row, _))) =
+            (anchor, self.selection_cursor())
+        {
+            if cell == (col, row) {
+                // 点一下 = 取消选择,别在屏幕上留一个孤零零的高亮字符。
+                if let Some(conn) = self.conn.as_mut() {
+                    conn.pane.emulator.selection_clear();
+                }
+                self.request_ui_redraw();
+                return;
+            }
+        }
+        self.copy_selection();
+    }
+
+    /// 把当前选区写进系统剪贴板。无选区 = 什么都不做(`selection_text` 返回
+    /// `None`),不能写空串——那会清掉用户剪贴板里原有的内容。
+    fn copy_selection(&mut self) {
+        let Some(text) = self
+            .conn
+            .as_ref()
+            .and_then(|c| c.pane.emulator.selection_text())
+        else {
+            return;
+        };
+        self.clipboard.set(&text);
+    }
+
+    /// 右键 / `Ctrl+Shift+V`:读剪贴板 → 判断要不要先确认 → 发送。
+    fn request_paste(&mut self) {
+        // 没有连接就没有地方可贴。不早退的话,launcher 态右键会读剪贴板、
+        // 多行内容还会弹出一个「确认粘贴」窗——点了「粘贴」却什么都不会发生
+        // (`send_paste` 拿不到 conn 直接返回)。与 `selection_press` 同一道门。
+        if self.conn.is_none() {
+            return;
+        }
+        let Some(text) = self.clipboard.get() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = self.conn.as_ref().is_some_and(|c| {
+            c.pane
+                .emulator
+                .mode()
+                .contains(mullion_term::TermMode::BRACKETED_PASTE)
+        });
+        // 判定与预览、与实际发送三者同源(`paste_line_count` 的 doc 说明了为什么):
+        // `contains('\n')` 会把带尾随换行的单行命令(浏览器/IDE 复制的常态)
+        // 误判成多行,而裸 `\r` 又会被漏掉。> 1 而非 != 0:单行也算「1 行」。
+        if !bracketed && mullion_term::keymap::paste_line_count(&text) > 1 {
+            self.pending_paste = Some(text);
+            self.request_ui_redraw();
+            return;
+        }
+        self.send_paste(&text);
+    }
+
+    /// 真正发送。到这里要么不需要确认,要么用户已经点了「粘贴」。
+    fn send_paste(&mut self, text: &str) {
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let bracketed = conn
+            .pane
+            .emulator
+            .mode()
+            .contains(mullion_term::TermMode::BRACKETED_PASTE);
+        let bytes = mullion_term::keymap::encode_paste(text, bracketed);
+        // 与按键同理(F17):贴之前先回底部,否则「贴了但看不到」。
+        conn.pane.emulator.scroll_to_bottom();
+        let _ = conn.ssh.write(bytes);
     }
 
     /// 从 Minimized 自愈:凡是「窗口本该看得见」的信号都拿实测尺寸复查一次,
@@ -330,7 +511,13 @@ impl ApplicationHandler<UserEvent> for App {
         // TODO:字体/字号做成可配置 + 跟随 ScaleFactorChanged 动态更新(见 spec F21)。
         let scale = window.scale_factor() as f32;
         let font_px = FONT_POINT_SIZE * scale * 96.0 / 72.0;
-        let text = TextLayer::new(&gpu.device, &gpu.queue, gpu.config.format, font_px);
+        let text = TextLayer::new(
+            &gpu.device,
+            &gpu.queue,
+            gpu.config.format,
+            font_px,
+            MULLION_DARK.term_fg,
+        );
         let size = window.inner_size();
         let (cols, rows) = grid::grid_size_for(size.width, size.height, text.cell_w, text.cell_h);
         // egui 0.30 同帧集成(§4.1):本 Task 只画一个占位 `egui::Window` 证明管线通;
@@ -338,6 +525,7 @@ impl ApplicationHandler<UserEvent> for App {
         let egui_ctx = egui::Context::default();
         // egui 内嵌字体不含中文;挂系统 CJK 字体,否则菜单/状态栏中文全是 tofu 方框。
         crate::ui::install_cjk_font(&egui_ctx);
+        theme::apply_egui(&egui_ctx, &MULLION_DARK);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -415,7 +603,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // 不再是「CLI 直连首次失败」,不该导致整个 GUI exit(1)(复核 #1)。
                 self.cli_direct = false;
                 let (cols, rows) = self.active.as_ref().map_or((80, 24), |a| a.grid_dims);
-                let pane = Pane::new(PaneId(1), cols, rows);
+                let pane = Pane::new(
+                    PaneId(1),
+                    cols,
+                    rows,
+                    theme::term_default_colors(&MULLION_DARK),
+                );
                 let _ = ssh.resize(cols, rows); // 初始 window_change 校正到真实尺寸(T4)
                 self.conn = Some(Connection {
                     ssh,
@@ -481,7 +674,8 @@ impl ApplicationHandler<UserEvent> for App {
             let modal = self.ui.session_manager_open
                 || self.ui.about_open
                 || self.ui.editor_open
-                || self.pending_host_key.is_some();
+                || self.pending_host_key.is_some()
+                || self.pending_paste.is_some();
             // 键盘归终端时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
             if is_kbd
                 && !shell::input_route::egui_should_see(
@@ -530,6 +724,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if focused {
                     self.recheck_visibility();
                     self.request_ui_redraw();
+                } else {
+                    // F18:捕获被别的窗口抢走时(按住左键时 Alt-Tab / 系统弹窗
+                    // 跳出来),winit 不会补发 `MouseInput{Released}`,`dragging`
+                    // 会永久卡住、自动滚动停不下来。失焦就当拖拽结束。
+                    self.dragging = false;
+                    self.autoscroll = 0;
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -544,17 +744,23 @@ impl ApplicationHandler<UserEvent> for App {
                 crate::logx::line(&format!("ScaleFactorChanged({scale_factor})"));
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            // 指针坐标只在这里更新;滚轮上报要用(F17)。
+            // 指针坐标只在这里更新;滚轮上报要用(F17),划选要用(F18)。
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x as f32, position.y as f32);
+                if self.dragging {
+                    self.update_selection_endpoint();
+                    self.request_ui_redraw();
+                }
             }
             // F17 滚轮三档分流。决策在 `mullion_term::keymap::wheel_action`(纯函数,
             // 已单测),这里只做 winit 增量→行数、像素→单元格的换算与发送。
             WindowEvent::MouseWheel { delta, .. } => {
+                // 先算,下面 `self.conn.as_mut()` 一借出去就没法再调 `&self` 方法了。
+                let local = self.cursor_in_grid();
                 if let (Some(a), Some(conn)) = (self.active.as_ref(), self.conn.as_mut()) {
                     let cell_px = (a.text.cell_w, a.text.cell_h);
                     let lines = input::wheel_lines(delta, cell_px.1);
-                    let cell = input::cell_at(self.cursor_px, cell_px, a.grid_dims);
+                    let cell = input::cell_at(local, cell_px, a.grid_dims);
                     let action = mullion_term::keymap::wheel_action(
                         conn.pane.emulator.mode(),
                         self.mods.shift_key(),
@@ -598,6 +804,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // 丢掉——滚了但画面不动。
                 self.request_ui_redraw();
             }
+            // F18 划选 / 右键粘贴。
+            //
+            // 鼠标**按键**上报(F15)本片不做,所以左键无条件走本地划选,不需要
+            // T5 的 Shift 逃生门分流;将来加按键上报时,分流点就在这里
+            // (与上面 MouseWheel 的 `wheel_action` 同构)。
+            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+                (MouseButton::Left, ElementState::Pressed) => self.selection_press(),
+                (MouseButton::Left, ElementState::Released) => self.selection_release(),
+                // 右键直接贴,不弹菜单(Windows 终端习惯,F18 交互口径)。
+                (MouseButton::Right, ElementState::Pressed) => self.request_paste(),
+                _ => {}
+            },
             WindowEvent::Resized(size) => {
                 diag::mark(diag::Stage::Resize);
                 log::debug!(target: "mullion", "Resized({}x{})", size.width, size.height);
@@ -606,6 +824,27 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     if let Some((key, mods)) = input::translate_key(&event, self.mods) {
+                        // F18:`Ctrl+Shift+C/V` 必须在 `encode_key` 之前截住。
+                        // Ctrl+C 会被编码成 `0x03`(SIGINT)——漏下去就是「想复制
+                        // 结果把远端进程杀了」。Shift 让它与裸 Ctrl+C 明确区分,
+                        // 裸 Ctrl+C 照旧转发。
+                        if mods.ctrl && mods.shift {
+                            if let Key::Char(c) = key {
+                                match c.to_ascii_lowercase() {
+                                    'c' => {
+                                        self.copy_selection();
+                                        self.request_ui_redraw();
+                                        return;
+                                    }
+                                    'v' => {
+                                        self.request_paste();
+                                        self.request_ui_redraw();
+                                        return;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         // F17:Shift+PageUp/PageDown 是本地翻页,截住不转发对端
                         // (裸 PageUp/PageDown 照旧转发,tmux/less 自己会翻)。
                         if mods.shift && matches!(key, Key::PageUp | Key::PageDown) {
@@ -625,6 +864,9 @@ impl ApplicationHandler<UserEvent> for App {
                         // 无重连。断线感知与重连是 S3,后续 spec,这里不做。
                         // launcher 态(conn=None)没有终端可写,按键静默丢弃。
                         if let Some(conn) = self.conn.as_mut() {
+                            // F18:一按普通键就清选区。留着的话高亮会挂在屏幕上,
+                            // 而底下的内容早被新输出冲掉了——高亮的是别的字。
+                            conn.pane.emulator.selection_clear();
                             // F17:一按普通键就贴回底部,否则「打字了但看不到自己输入」。
                             conn.pane.emulator.scroll_to_bottom();
                             let _ = conn.ssh.write(bytes);
@@ -675,16 +917,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     None => true,
                 };
-                match self.limiter.plan(dirty, now) {
+                let action = self.limiter.plan(dirty, now);
+                // F18 自动滚动只在**真正出帧**的那一轮施加,见 match 之后的说明。
+                let presented = matches!(action, RedrawAction::Present);
+                match action {
                     RedrawAction::Present => {
                         if let Some(a) = &mut self.active {
                             let pane = self.conn.as_ref().map(|c| &c.pane);
                             let connected = self.conn.is_some();
-                            let status = if connected {
-                                "● 已连接".to_string()
-                            } else {
-                                "● 未连接".to_string()
-                            };
                             let sessions: &[mullion_store::SessionRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.list());
                             let store_available = self.store.is_some();
@@ -701,6 +941,12 @@ impl ApplicationHandler<UserEvent> for App {
                                         .map_or(0, |t| t.elapsed().as_secs()),
                                 }
                             });
+                            // 与 host_key_view 同理:`self.pending_paste` 与
+                            // `&mut self.ui` 是不相干字段,可同时借出。
+                            let paste_view = self
+                                .pending_paste
+                                .as_deref()
+                                .map(|text| crate::ui::paste::PasteView { text });
                             let repaint_delay = render_frame(
                                 a,
                                 pane,
@@ -708,8 +954,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 sessions,
                                 store_available,
                                 connected,
-                                &status,
+                                1, // 分屏(F30)未落地,恒 1 屏;F30 落地时这里要接真实 pane 数
                                 host_key_view,
+                                paste_view,
                             );
                             self.limiter.record_present(now);
                             // egui 侧已画出;下面若 egui 又要一帧会重新置脏。
@@ -770,6 +1017,31 @@ impl ApplicationHandler<UserEvent> for App {
                         self.next_frame_at = None;
                         event_loop.set_control_flow(ControlFlow::Wait);
                     }
+                }
+
+                // F18:拖拽出界时的自动滚动,让选区能跨越多屏 scrollback。
+                //
+                // 位置很讲究,三个都不能选:
+                // - 挂在 `CursorMoved` 上 → 频率是鼠标事件频率,一甩就滚飞;
+                // - 挂在 match 之后但不判 `presented` → Throttle 轮也会滚,而下面的
+                //   排期又会唤醒下一轮,变成「一轮滚一次」的忙转(T3/T7 红线);
+                // - 在这里调 `request_ui_redraw` → 它内含 `request_redraw`,同样会与
+                //   `RedrawRequested` 互相触发绕开帧闸。
+                //
+                // 所以:只在 present 过的那一轮滚一次(频率 = 帧率 ~60fps),只标脏 +
+                // 经 next_frame_at/WaitUntil 排期,由 `about_to_wait` 到点补画。
+                if presented && self.dragging && self.autoscroll != 0 {
+                    let lines = self.autoscroll;
+                    if let Some(conn) = self.conn.as_mut() {
+                        conn.pane.emulator.scroll(Scroll::Delta(lines));
+                    }
+                    // 滚动改了 display_offset,选区终点要按新视口重新落点,
+                    // 否则拖到边缘后画面在滚、选区却停在原地不长。
+                    self.update_selection_endpoint();
+                    self.ui_dirty = true;
+                    let at = Instant::now() + std::time::Duration::from_millis(16);
+                    self.next_frame_at = Some(at);
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                 }
 
                 // Task 6:会话管理弹窗的 intent 施加点。放在 `plan` 整块之后——此处
@@ -857,6 +1129,15 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = prompt.reply.send(accept);
                     }
                 }
+                // F18:粘贴确认弹窗的回答。放在这里而不是 egui 闭包里——发送要
+                // `&mut self.conn`,闭包里借不到(与会话管理器/主机密钥同构)。
+                if let Some(accept) = self.ui.paste_reply.take() {
+                    if let Some(text) = self.pending_paste.take() {
+                        if accept {
+                            self.send_paste(&text);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -889,8 +1170,9 @@ fn render_frame(
     sessions: &[mullion_store::SessionRecord],
     store_available: bool,
     connected: bool,
-    status: &str,
+    panes: usize,
     host_key: Option<crate::ui::host_key::HostKeyView<'_>>,
+    paste: Option<crate::ui::paste::PasteView<'_>>,
 ) -> std::time::Duration {
     diag::count_frame();
     // --- egui:每帧都跑,launcher 态(pane=None)也要画菜单/状态栏。---
@@ -899,12 +1181,14 @@ fn render_frame(
     let full_output = a.egui_ctx.run(raw_input, |ctx| {
         crate::ui::build_ui(
             ctx,
+            &MULLION_DARK,
             ui_state,
             sessions,
             store_available,
             connected,
-            status,
+            panes,
             host_key,
+            paste,
         );
     });
     a.egui_state
@@ -940,15 +1224,23 @@ fn render_frame(
                 width: a.gpu.config.width,
                 height: a.gpu.config.height,
             };
+            // 终端整体平移到 egui 中央区(菜单栏之下)。origin 由本帧上面的
+            // `build_ui` 刚写入,是**同帧**新鲜值(不像 central_px 要等到 present
+            // 之后才被 grid_dims 消费而滞后一帧)。
+            let origin = ui_state.central_origin_px;
             let quads = quads_for(
                 &snap,
+                origin,
                 a.text.cell_w,
                 a.text.cell_h,
-                mullion_term::palette::DEFAULT_BG,
+                theme::term_default_colors(&MULLION_DARK),
             );
             // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
             // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。
-            if let Err(e) = a.text.prepare(&a.gpu.device, &a.gpu.queue, &snap, res) {
+            if let Err(e) = a
+                .text
+                .prepare(&a.gpu.device, &a.gpu.queue, &snap, origin, res)
+            {
                 log::warn!(target: "mullion", "glyphon prepare 失败,跳过本帧: {e:?}");
                 diag::count_skipped();
                 return std::time::Duration::MAX;
@@ -1007,12 +1299,7 @@ fn render_frame(
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(theme::clear_color(&MULLION_DARK)),
                     store: wgpu::StoreOp::Store,
                 },
             })],

@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.11"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -39,3 +39,7 @@ time = { version = "0.3", features = ["formatting"] }
 # 才会落进我们自己的 mullion.log —— GUI 子系统没控制台、Windows 事件日志又不记录
 # 进程挂起,这是唯一能拿到的现场。见 ADR-008。
 log = "0.4"
+# 切片 B1(F18):系统剪贴板。已作为 egui-winit 的传递依赖在 Cargo.lock 里
+# (3.6.1),加直接依赖不引入新版本。关掉默认 features:image-data 会拉进
+# image crate(N6 的 exe 体积已超标),我们只要文本。
+arboard = { version = "3.6", default-features = false }

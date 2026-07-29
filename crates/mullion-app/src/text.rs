@@ -17,7 +17,9 @@ pub fn row_to_spans(cells: &[SnapCell]) -> Vec<(String, Color)> {
         if cell.spacer {
             continue; // 宽字符右半:字形已由左格承载
         }
-        let color = to_color(cell.fg);
+        // F18:选中格反色——底色那趟已用 fg 画底(`gpu::quads_for`),
+        // 文字这趟必须同步换成 bg,否则就是同色底同色字,选中后文字消失。
+        let color = to_color(if cell.selected { cell.bg } else { cell.fg });
         match spans.last_mut() {
             Some((s, c)) if *c == color => s.push(cell.ch),
             _ => spans.push((cell.ch.to_string(), color)),
@@ -46,6 +48,9 @@ pub struct TextLayer {
     buffers: Vec<Buffer>, // 每屏面行一个
     pub cell_w: f32,
     pub cell_h: f32,
+    /// F80:glyphon 的兜底文字色(span 未带显式色时用)。当前每个 span 都带色,
+    /// 取不到;留着是为了主题一换就整体跟走,不留一处旧灰的潜伏陷阱。
+    default_fg: Rgb,
 }
 
 impl TextLayer {
@@ -54,6 +59,7 @@ impl TextLayer {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         font_px: f32,
+        default_fg: Rgb,
     ) -> Self {
         let mut font_system = FontSystem::new();
         let swash = SwashCache::new();
@@ -74,6 +80,7 @@ impl TextLayer {
             buffers: Vec::new(),
             cell_w,
             cell_h: line_h,
+            default_fg,
         }
     }
 
@@ -81,11 +88,14 @@ impl TextLayer {
     ///
     /// 每帧全量重建/重新 shape 所有行;差分渲染是 F12,后续 spec,这里不做。
     /// 失败(如 `AtlasFull`)时不 panic,交调用方决定跳过本帧(渲染路径不许 panic)。
+    /// `origin`:终端区左上角的窗口像素坐标(见 `gpu::quads_for` 的同名参数)。
+    /// 两处必须同源,否则背景色块与字错位。
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         snap: &GridSnapshot,
+        origin: (f32, f32),
         res: Resolution,
     ) -> Result<(), glyphon::PrepareError> {
         self.viewport.update(queue, res);
@@ -106,22 +116,25 @@ impl TextLayer {
             self.buffers.push(buf);
         }
         let cell_h = self.cell_h;
+        let default_fg = self.default_fg;
         let areas: Vec<TextArea> = self
             .buffers
             .iter()
             .enumerate()
             .map(|(row, buf)| TextArea {
                 buffer: buf,
-                left: 0.0,
-                top: row as f32 * cell_h,
+                left: origin.0,
+                top: origin.1 + row as f32 * cell_h,
                 scale: 1.0,
+                // 上边界收到 origin:行数虽已按中央区算,但字形可能有上伸部
+                // (accent/CJK),不裁就会有像素溢进菜单栏、在菜单栏底下露出一截。
                 bounds: TextBounds {
-                    left: 0,
-                    top: 0,
+                    left: origin.0 as i32,
+                    top: origin.1 as i32,
                     right: res.width as i32,
                     bottom: res.height as i32,
                 },
-                default_color: glyphon::Color::rgb(0xcc, 0xcc, 0xcc),
+                default_color: glyphon::Color::rgb(default_fg.r, default_fg.g, default_fg.b),
                 custom_glyphs: &[],
             })
             .collect();
@@ -181,6 +194,7 @@ mod tests {
             bg: Rgb::new(0, 0, 0),
             width: if ch == '中' { 2 } else { 1 },
             spacer,
+            selected: false,
         }
     }
 
@@ -222,5 +236,44 @@ mod tests {
         let spans = row_to_spans(&row);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].0, "中x");
+    }
+
+    #[test]
+    fn selected_cell_draws_text_in_background_color() {
+        // 与 gpu::quads_for 的反色底配套:底用 fg、字用 bg,两边必须同时改,
+        // 只改一边就是「白底白字」或「黑底黑字」——选中后文字直接消失。
+        let fg = Rgb::new(0xcc, 0xcc, 0xcc);
+        let bg = Rgb::new(0, 0, 0);
+        let row = [SnapCell {
+            ch: 'a',
+            fg,
+            bg,
+            width: 1,
+            spacer: false,
+            selected: true,
+        }];
+        let spans = row_to_spans(&row);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1, to_color(bg));
+    }
+
+    #[test]
+    fn selection_boundary_splits_spans() {
+        // 选中与未选中相邻时颜色不同,必须切成两段,否则整段用同一个颜色画,
+        // 高亮边界会错位。
+        let fg = Rgb::new(0xcc, 0xcc, 0xcc);
+        let bg = Rgb::new(0, 0, 0);
+        let mk = |ch, selected| SnapCell {
+            ch,
+            fg,
+            bg,
+            width: 1,
+            spacer: false,
+            selected,
+        };
+        let spans = row_to_spans(&[mk('a', true), mk('b', false)]);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].0, "a");
+        assert_eq!(spans[1].0, "b");
     }
 }
