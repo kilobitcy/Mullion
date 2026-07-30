@@ -1,15 +1,40 @@
-//! 菜单栏 + 状态栏。
+//! 菜单栏(含居中的布局预设按钮组)+ 状态栏。
+use super::toolbar;
 use super::UiState;
+use crate::shell::workspace::Preset;
 use crate::theme::{self, Theme};
 
-pub fn top_menu(ctx: &egui::Context, t: &Theme, ui_state: &mut UiState, connected: bool) {
+/// 菜单栏上下内边距。
+const MENU_MARGIN_Y: f32 = 3.0;
+
+/// 菜单栏高度(逻辑点)。
+///
+/// 由 `toolbar::group_size` 推出来、**不写死**:布局按钮组画在这一行里,两处
+/// 各写一个数的话,改了按钮尺寸菜单栏就会把按钮组裁掉半截。
+///
+/// 固定高度而不是由内容撑开,是因为按钮组只在已连接时画 —— 让 egui 自己撑
+/// 会让菜单栏在连接成功那一刻从 30px 跳到 34px,中央区跟着抖一下。
+fn menu_px() -> f32 {
+    toolbar::group_size(Preset::ALL.len()).y + MENU_MARGIN_Y * 2.0
+}
+
+/// 画菜单栏。返回用户这一帧在居中按钮组上点中的布局预设(F82)。
+pub fn top_menu(
+    ctx: &egui::Context,
+    t: &Theme,
+    ui_state: &mut UiState,
+    connected: bool,
+    preset: Option<Preset>,
+) -> Option<Preset> {
     // 菜单栏与状态栏底色不同(§2.1),Visuals::panel_fill 只有一个值,
-    // 所以各自带 Frame。栏高由 inner_margin 决定(目标 30px),精确值人眼验。
+    // 所以各自带 Frame。
+    let mut clicked = None;
     egui::TopBottomPanel::top("menu")
+        .exact_height(menu_px())
         .frame(
             egui::Frame::none()
                 .fill(theme::c32(t.bar_menu))
-                .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                .inner_margin(egui::Margin::symmetric(6.0, MENU_MARGIN_Y))
                 .stroke(theme::stroke(t)),
         )
         .show(ctx, |ui| {
@@ -31,18 +56,17 @@ pub fn top_menu(ctx: &egui::Context, t: &Theme, ui_state: &mut UiState, connecte
                         ui.close_menu();
                     }
                 });
-                ui.menu_button("分屏", |ui| {
-                    ui.add_enabled(false, egui::Button::new("用工具栏的布局按钮切换"));
+                ui.menu_button("配置", |ui| {
                     // F83:标题条占 32px,关掉能换回一行终端。切换后行数会变,
                     // 必须走 apply_geometry 发 window_change(T4),故只置意图。
+                    // 原先挂在「分屏」菜单下,该菜单已撤(布局改由同一行的按钮组
+                    // 控制),这项是它下面唯一的真功能,挪到「配置」。
                     if ui.button("显示 / 隐藏 pane 标题条").clicked() {
                         ui_state.toggle_title_bars = true;
                         ui.close_menu();
                     }
-                    ui.add_enabled(false, egui::Button::new("(快捷键 · 后续切片)"));
-                });
-                ui.menu_button("配置", |ui| {
                     ui.add_enabled(false, egui::Button::new("(F84 设置 · 后续切片)"));
+                    ui.add_enabled(false, egui::Button::new("(快捷键 · 后续切片)"));
                 });
                 ui.menu_button("关于", |ui| {
                     if ui.button("关于 Mullion").clicked() {
@@ -50,8 +74,14 @@ pub fn top_menu(ctx: &egui::Context, t: &Theme, ui_state: &mut UiState, connecte
                         ui.close_menu();
                     }
                 });
+                // 布局按钮组:菜单项之后画,自己算居中留白(见 `centering_space`)。
+                // 只在已连接时画 —— launcher 态没有 pane 可切布局。
+                if connected {
+                    clicked = toolbar::show_in(ui, t, preset);
+                }
             });
         });
+    clicked
 }
 
 /// F81 状态栏两栏文案。纯函数,可单测。

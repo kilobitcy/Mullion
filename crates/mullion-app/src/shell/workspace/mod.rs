@@ -7,7 +7,7 @@ pub mod geom;
 pub mod preset;
 
 pub use geom::{layout_geometry, PaneGeom, PxRect, GAP_PX, TITLE_BAR_PX};
-pub use preset::{next_focus, plan_preset, preset_tree, Preset, PresetPlan};
+pub use preset::{icon_cells, next_focus, plan_preset, preset_tree, Preset, PresetPlan};
 
 /// pane 的连接状态(§6.3)。断开的 pane 内容保留、可滚可复制,只是不再收发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

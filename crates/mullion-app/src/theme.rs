@@ -24,7 +24,9 @@ pub struct Theme {
     /// 标题栏色。F85 自绘标题栏已否决,保留 token 备将来重提。
     pub bar_title: Rgb,
     pub bar_menu: Rgb,
-    /// 工具栏(F82,随分屏切片)。
+    /// 独立工具栏底色(设计文档 §4.1 的 48px 栏)。F82 的布局按钮改画在菜单栏
+    /// 同一行、按钮组底用 `sunken_bg`,那一栏没了,故当前零引用;保留 token 备
+    /// 将来真需要一条工具栏(如 F50 SFTP 的操作栏)时用。
     pub bar_tool: Rgb,
     pub bar_status: Rgb,
     pub panel_bg: Rgb,

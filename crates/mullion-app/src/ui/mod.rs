@@ -129,8 +129,9 @@ pub struct UiActions {
     pub close_pane: Option<mullion_core::layout::PaneId>,
 }
 
-/// 每帧构建 UI:菜单栏(顶)+ 工具栏(F82)+ 状态栏(底)+ 各 pane 标题条(F83)
-/// + 弹窗,之后把中央区剩余尺寸写回 `central_px`。返回本帧的布局动作。
+/// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
+/// 各 pane 标题条(F83)、弹窗,之后把中央区剩余尺寸写回 `central_px`。
+/// 返回本帧的布局动作。
 pub fn build_ui(
     ctx: &egui::Context,
     t: &crate::theme::Theme,
@@ -146,12 +147,8 @@ pub fn build_ui(
     if let Some(view) = &frame.paste {
         paste::show(ctx, view, &mut ui_state.paste_reply);
     }
-    chrome::top_menu(ctx, t, ui_state, frame.connected);
-    // 工具栏在菜单栏之下、状态栏之上:三个 Panel 的 show 顺序决定它们
-    // 从窗口边缘往里堆的次序,换顺序会让工具栏跑到状态栏上面去。
-    if frame.connected {
-        actions.preset = toolbar::show(ctx, t, frame.preset);
-    }
+    // 布局按钮组画在菜单栏那一行里(F82),所以点中的预设由 top_menu 返回。
+    actions.preset = chrome::top_menu(ctx, t, ui_state, frame.connected, frame.preset);
     chrome::status_bar(
         ctx,
         t,
@@ -178,8 +175,8 @@ pub fn build_ui(
         session_manager::show(ctx, ui_state, frame.sessions, frame.store_available);
     }
     // 中央区剩余像素:available_rect 是 point,× pixels_per_point 换像素。
-    // 必须在所有 TopBottomPanel 都 show 完之后取(现在多了工具栏),拿到的才是
-    // 扣掉菜单栏+工具栏+状态栏的中央区。原点与尺寸一起记:尺寸决定几行几列,
+    // 必须在菜单栏和状态栏两个 TopBottomPanel 都 show 完之后取,拿到的才是
+    // 扣掉这两栏的中央区。原点与尺寸一起记:尺寸决定几行几列,
     // 原点决定这几行画在哪儿——只记尺寸就是 B0 那次遮挡 bug 的成因。
     let ppp = ctx.pixels_per_point();
     let rect = ctx.available_rect();
@@ -215,6 +212,21 @@ mod tests {
         }
     }
 
+    /// 真跑一帧 `build_ui`,复用调用方给的 `ctx`(才能跨帧读上一帧的 widget)
+    /// 和 `input`(才能塞指针事件模拟点击)。
+    fn run_frame(
+        ctx: &egui::Context,
+        ui_state: &mut UiState,
+        frame: UiFrame<'_>,
+        input: egui::RawInput,
+    ) -> (egui::FullOutput, UiActions) {
+        let mut actions = UiActions::default();
+        let out = ctx.run(input, |ctx| {
+            actions = build_ui(ctx, &crate::theme::MULLION_DARK, ui_state, frame);
+        });
+        (out, actions)
+    }
+
     /// 真跑一帧 `build_ui`,把返回的形状树递归展平成纯文本,用来断言某段文案
     /// 确实被画了出来(而不是像上一版那样只构造结构体、从不调用 `build_ui`)。
     ///
@@ -229,13 +241,8 @@ mod tests {
     fn rendered_text(frame: UiFrame<'_>) -> (String, UiActions) {
         let ctx = egui::Context::default();
         let mut ui_state = UiState::default();
-        let mut actions = UiActions::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let _ = build_ui(ctx, &crate::theme::MULLION_DARK, &mut ui_state, frame);
-        });
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
-            actions = build_ui(ctx, &crate::theme::MULLION_DARK, &mut ui_state, frame);
-        });
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+        let (out, actions) = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
         fn walk(shape: &egui::Shape, out: &mut String) {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
@@ -284,27 +291,63 @@ mod tests {
         }
     }
 
-    /// F82:工具栏只在已连接时露出(launcher 态没有 pane 可切布局)。
-    /// 破坏性验证:把 `build_ui` 里 `if frame.connected` 改成 `if !frame.connected`,
-    /// 本测试的 `connected: true` 分支断言(应该出现 Single 预设的按钮文案)会红。
+    /// 跑两帧(`rendered_text` 里解释了为什么要两帧)后,数一数工具栏上到底
+    /// 画出了几个布局按钮。按钮是**纯图标**,没有任何文字可查(F82),所以探针
+    /// 从「文案出现在 shapes 里」换成「按 `toolbar::button_id(i)` 能读到
+    /// widget」—— 这也是 `button_id` 存在的理由。
+    fn drawn_preset_buttons(frame: UiFrame<'_>) -> usize {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+        (0..crate::shell::workspace::Preset::ALL.len())
+            .filter(|&i| ctx.read_response(toolbar::button_id(i)).is_some())
+            .count()
+    }
+
+    /// F82:布局按钮只在已连接时露出(launcher 态没有 pane 可切布局),
+    /// 且一次画出全部 7 个(一排平铺、始终全可见)。
+    ///
+    /// 破坏性验证:把 `chrome::top_menu` 里 `if connected` 改成 `if !connected`,
+    /// 两条断言都红。
     #[test]
-    fn build_ui_toolbar_shows_only_when_connected_f82() {
-        let (connected_text, _) = rendered_text(UiFrame {
+    fn build_ui_preset_buttons_show_only_when_connected_f82() {
+        let n = crate::shell::workspace::Preset::ALL.len();
+        assert_eq!(
+            drawn_preset_buttons(UiFrame {
+                connected: true,
+                ..base_frame()
+            }),
+            n,
+            "已连接时应画出全部 {n} 个布局按钮"
+        );
+        assert_eq!(
+            drawn_preset_buttons(UiFrame {
+                connected: false,
+                ..base_frame()
+            }),
+            0,
+            "未连接(launcher 态)不该画布局按钮"
+        );
+    }
+
+    /// 菜单栏顶层只剩「会话 / 配置 / 关于」——「分屏」菜单已撤(布局改由同一行
+    /// 的按钮组控制),F83 的标题条开关搬进了「配置」。
+    ///
+    /// 破坏性验证:把 `chrome.rs` 里的 `ui.menu_button("分屏", …)` 加回去,
+    /// 最后一条断言红。
+    #[test]
+    fn menu_bar_no_longer_has_a_split_menu() {
+        let (text, _) = rendered_text(UiFrame {
             connected: true,
             ..base_frame()
         });
+        for item in ["会话", "配置", "关于"] {
+            assert!(text.contains(item), "菜单栏缺了「{item}」: {text:?}");
+        }
         assert!(
-            connected_text.contains(crate::shell::workspace::Preset::Single.label()),
-            "已连接时工具栏应该画出预设按钮,实际文本: {connected_text:?}"
-        );
-
-        let (disconnected_text, _) = rendered_text(UiFrame {
-            connected: false,
-            ..base_frame()
-        });
-        assert!(
-            !disconnected_text.contains(crate::shell::workspace::Preset::Single.label()),
-            "未连接(launcher 态)不该画工具栏,实际文本: {disconnected_text:?}"
+            !text.contains("分屏"),
+            "菜单栏不该再有「分屏」菜单: {text:?}"
         );
     }
 
@@ -357,13 +400,8 @@ mod tests {
         );
     }
 
-    /// 已知盲区:`actions.preset`/`actions.close_pane` 是否真的来自
-    /// `toolbar::show`/`pane_title::show` 的返回值(而非被硬编码成恒 `None`),
-    /// 在无头环境下无法验证——不模拟点击时,真实调用链和硬编码 `None` 从外部
-    /// 观察不出区别(两者结果都是 `None`)。这里只能断言"没点击时确实是
-    /// `None`",不能证明"点击后会变成 Some"这条链路真的接通。要补全这段需要
-    /// 模拟指针点击(需要拿到按钮的精确布局矩形,当前 egui 版本没有稳定的
-    /// 无头手段拿到未显式命名 id 的按钮矩形),留给后续切片按需处理。
+    /// 没点任何东西时两个动作都必须是 `None` —— 否则 app 会在每一帧被动重排
+    /// 布局(每次重排都发 window_change,T4)。
     #[test]
     fn build_ui_actions_are_none_when_nothing_clicked() {
         let view = title_view("h");
@@ -375,5 +413,51 @@ mod tests {
         });
         assert_eq!(actions.preset, None);
         assert_eq!(actions.close_pane, None);
+    }
+
+    /// F82 接线:点第 i 个按钮,`actions.preset` 就得是 `Preset::ALL[i]`。
+    ///
+    /// 这条关掉了上一版留下的盲区(「无头环境拿不到按钮矩形,证不了点击链路
+    /// 真的接通」)—— `toolbar::button_id` 给了显式 id,`Context::read_response`
+    /// 就能拿到精确矩形,往它中心发一次真实的指针按下/抬起即可。
+    ///
+    /// 破坏性验证:把 `toolbar::show_in` 结尾的 `clicked` 改成恒 `None`,
+    /// 或把 `build_ui` 里 `actions.preset = chrome::top_menu(…)` 的返回值丢掉,
+    /// 本测试红。**逐个索引都点一遍**是必须的:只点第一个的话,
+    /// `button_rect`/`button_id` 的索引错位(比如全都返回第 0 个)不会被发现。
+    #[test]
+    fn build_ui_clicking_a_preset_button_wires_through_to_actions_f82() {
+        let frame = UiFrame {
+            connected: true,
+            ..base_frame()
+        };
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+
+        for (i, expected) in crate::shell::workspace::Preset::ALL.into_iter().enumerate() {
+            let pos = ctx
+                .read_response(toolbar::button_id(i))
+                .unwrap_or_else(|| panic!("第 {i} 个布局按钮没画出来"))
+                .rect
+                .center();
+            let click = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            let input = egui::RawInput {
+                events: vec![egui::Event::PointerMoved(pos), click(true), click(false)],
+                ..Default::default()
+            };
+            let (_, actions) = run_frame(&ctx, &mut ui_state, frame, input);
+            assert_eq!(
+                actions.preset,
+                Some(expected),
+                "点第 {i} 个按钮(位置 {pos:?})应得到 {expected:?}"
+            );
+        }
     }
 }

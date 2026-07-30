@@ -3,20 +3,22 @@
 //! 「套用预设」是**声明式**的:结果只取决于目标预设和当前 pane 的几何顺序,
 //! 与用户点按钮的历史路径无关。1→4→2 和 1→2 落到同一棵树。
 
-use mullion_core::layout::{Dir, Node, PaneId};
+use mullion_core::layout::{compute_rects, Dir, Node, PaneId, Rect};
 
 use super::PaneStatus;
 
-/// 工具栏上的布局预设。分两段:先选屏数,再选该屏数下的子布局(§3)。
+/// 工具栏上的布局预设。一排平铺,全部可见(§3)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
-    /// 1 屏满窗。**原型没有这个按钮**(分屏后回不到单屏),我们补上。
+    /// 1 屏满窗。工具栏第一个按钮,也是「刚连上、只有一个 pane」这个状态的
+    /// `current_preset` 初始值。
     Single,
     TwoLeftRight,
     TwoTopBottom,
-    /// 左边一大块,右边上下分。
+    /// 左边一块通高,右边上下分。左右**等宽**——「大」指的是高度
+    /// (面积因此是右侧两块各自的两倍)。
     ThreeBigLeft,
-    /// 右边一大块,左边上下分。
+    /// 右边一块通高,左边上下分。左右**等宽**,同 `ThreeBigLeft`。
     ThreeBigRight,
     /// 三个等宽竖条。
     ThreeColumns,
@@ -24,7 +26,13 @@ pub enum Preset {
 }
 
 impl Preset {
-    /// 工具栏按钮的绘制顺序(§3):先 1/2/3/4 屏,再是各屏数下的子布局。
+    /// 全部变体,**同时就是工具栏按钮的绘制顺序**(F82):7 个布局一排平铺、
+    /// 始终全部可见,第一个是单屏。
+    ///
+    /// 一个常量兼两职是有意的:工具栏要覆盖所有布局,「全部变体」与「按钮列表」
+    /// 内容必然相同,拆成两个常量只会让它们悄悄漂移。顺序稳定是硬要求 ——
+    /// 用户靠肌肉记忆点按钮位置,顺序一变就会点错布局,而点错的代价是真的
+    /// 关掉一个 pane。
     pub const ALL: [Preset; 7] = [
         Preset::Single,
         Preset::TwoLeftRight,
@@ -45,37 +53,52 @@ impl Preset {
         }
     }
 
-    /// 按钮所属的屏数分组。当前与 `pane_count` 同值,分开写是因为语义不同:
-    /// 一个是 UI 分组,一个是要开几条 channel。
-    pub fn group(self) -> usize {
-        self.pane_count()
-    }
-
-    /// 按钮上的字形 + 文字(F82)。字形用几何方块,不依赖字体的图标集。
-    pub fn label(self) -> &'static str {
-        match self {
-            Preset::Single => "▢ 1 屏",
-            Preset::TwoLeftRight => "▥ 左右分",
-            Preset::TwoTopBottom => "▤ 上下分",
-            Preset::ThreeBigLeft => "⊟ 左大",
-            Preset::ThreeBigRight => "⊞ 右大",
-            Preset::ThreeColumns => "▦ 三等分",
-            Preset::FourGrid => "▩ 2×2",
-        }
-    }
-
-    /// 鼠标悬停提示。
+    /// 鼠标悬停提示。按钮是**纯图标**(F82,按钮上没有任何文字),所以这是每个
+    /// 布局唯一的文字说明 —— 必须自己把几何讲清楚,不能只写个名字。
     pub fn tooltip(self) -> &'static str {
         match self {
-            Preset::Single => "单屏满窗",
+            Preset::Single => "单屏,一块占满窗口",
             Preset::TwoLeftRight => "两屏,左右并排",
             Preset::TwoTopBottom => "两屏,上下堆叠",
-            Preset::ThreeBigLeft => "三屏,左边一大块,右边上下分",
-            Preset::ThreeBigRight => "三屏,右边一大块,左边上下分",
+            Preset::ThreeBigLeft => "三屏,左右等宽;左边一块通高,右边上下分",
+            Preset::ThreeBigRight => "三屏,左右等宽;右边一块通高,左边上下分",
             Preset::ThreeColumns => "三屏,三个等宽竖条",
             Preset::FourGrid => "四屏,2×2 网格",
         }
     }
+}
+
+/// 按钮图标里那几个小方块的位置,归一化成 `0.0..=1.0` 的 `[x, y, w, h]`,
+/// 按几何顺序排(与 `preset_tree` 的叶子顺序一致)。
+///
+/// **复用 `preset_tree` + `compute_rects` 算出来,不另立一张图标几何表**:图标
+/// 画的就是这个预设的真实布局。另写一份的话,改了实际几何(比如三屏刚从
+/// 2/3 : 1/3 改成等宽)图标会继续骗人 —— 而纯图标按钮的图标是用户判断
+/// 「点哪个」的全部依据,骗人的代价是点错布局、真的关掉一个 pane。
+///
+/// 基数取 1200:所有预设的切分比例(1/2、1/3)在 1200 上都是整数,
+/// `compute_rects` 的整数运算不引入偏差(否则「三等分」的图标会有一格差 1px)。
+pub fn icon_cells(preset: Preset) -> Vec<[f32; 4]> {
+    const BASE: u16 = 1200;
+    let ids: Vec<PaneId> = (1..=preset.pane_count() as u32).map(PaneId).collect();
+    let area = Rect {
+        col: 0,
+        row: 0,
+        cols: BASE,
+        rows: BASE,
+    };
+    let n = f32::from(BASE);
+    compute_rects(&preset_tree(preset, &ids), area)
+        .into_iter()
+        .map(|(_, r)| {
+            [
+                f32::from(r.col) / n,
+                f32::from(r.row) / n,
+                f32::from(r.cols) / n,
+                f32::from(r.rows) / n,
+            ]
+        })
+        .collect()
 }
 
 fn split(dir: Dir, ratio: f32, a: Node, b: Node) -> Node {
@@ -108,8 +131,9 @@ pub fn preset_tree(preset: Preset, ids: &[PaneId]) -> Node {
         Preset::Single => l(0),
         Preset::TwoLeftRight => split(h, 0.5, l(0), l(1)),
         Preset::TwoTopBottom => split(v, 0.5, l(0), l(1)),
-        Preset::ThreeBigLeft => split(h, 2.0 / 3.0, l(0), split(v, 0.5, l(1), l(2))),
-        Preset::ThreeBigRight => split(h, 1.0 / 3.0, split(v, 0.5, l(0), l(1)), l(2)),
+        // 左右等宽,「大」只体现在高度:大块通高,另一侧对半切上下两块。
+        Preset::ThreeBigLeft => split(h, 0.5, l(0), split(v, 0.5, l(1), l(2))),
+        Preset::ThreeBigRight => split(h, 0.5, split(v, 0.5, l(0), l(1)), l(2)),
         // 先切掉左边 1/3,剩下的 2/3 再对半 → 三个等宽竖条。
         Preset::ThreeColumns => split(h, 1.0 / 3.0, l(0), split(h, 0.5, l(1), l(2))),
         Preset::FourGrid => split(v, 0.5, split(h, 0.5, l(0), l(1)), split(h, 0.5, l(2), l(3))),
@@ -181,7 +205,7 @@ pub fn next_focus(focus: PaneId, survivors: &[PaneId]) -> PaneId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mullion_core::layout::{compute_rects, leaves, Rect};
+    use mullion_core::layout::leaves;
 
     const AREA: Rect = Rect {
         col: 0,
@@ -216,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn preset_pane_counts_match_their_group() {
+    fn preset_pane_counts_are_what_the_names_say() {
         assert_eq!(Preset::Single.pane_count(), 1);
         assert_eq!(Preset::TwoLeftRight.pane_count(), 2);
         assert_eq!(Preset::TwoTopBottom.pane_count(), 2);
@@ -224,8 +248,64 @@ mod tests {
         assert_eq!(Preset::ThreeBigRight.pane_count(), 3);
         assert_eq!(Preset::ThreeColumns.pane_count(), 3);
         assert_eq!(Preset::FourGrid.pane_count(), 4);
+    }
+
+    /// 工具栏就是 7 个按钮、第一个是单屏(实机验收定的形态)。
+    ///
+    /// 破坏性验证:从 `Preset::ALL` 里去掉 `Single`(顺带把长度改成 6),
+    /// 两条断言都红。
+    #[test]
+    fn toolbar_is_seven_buttons_starting_with_single() {
+        assert_eq!(Preset::ALL.len(), 7, "工具栏平铺 7 个布局按钮");
+        assert_eq!(Preset::ALL[0], Preset::Single, "第一个按钮是单屏");
+    }
+
+    /// 图标格子必须是**真实布局的投影**:数量对、拼满整个图标框、无零尺寸格。
+    /// 图标是纯图标按钮的全部视觉信息,画错等于骗用户点错布局。
+    ///
+    /// 破坏性验证:把 `compute_rects` 的结果换成「每格都占满整框」(偷懒画法),
+    /// 实测 `TwoLeftRight 图标格子未拼满,合计 2` 红。
+    ///
+    /// 注意这条守不住「比例自洽但画错」——照设计稿手写一张 `1.6fr 1fr` 的表
+    /// 也能拼满(实测这条仍绿)。那种情况由
+    /// `icon_cells_show_every_three_pane_preset_as_equal_width` 兜。
+    #[test]
+    fn icon_cells_are_a_projection_of_the_real_layout() {
         for p in Preset::ALL {
-            assert_eq!(p.group(), p.pane_count(), "按钮分组就是屏数");
+            let cells = icon_cells(p);
+            assert_eq!(cells.len(), p.pane_count(), "{p:?} 图标格子数应等于屏数");
+            let area: f32 = cells.iter().map(|c| c[2] * c[3]).sum();
+            assert!(
+                (area - 1.0).abs() < 1e-4,
+                "{p:?} 图标格子未拼满,合计 {area}"
+            );
+            for c in &cells {
+                assert!(c[2] > 0.0 && c[3] > 0.0, "{p:?} 有零尺寸格子: {c:?}");
+            }
+        }
+    }
+
+    /// 三屏的三个预设在图标里也必须**每格等宽** —— 用户就是因为图标/文案暗示
+    /// 「左边更宽」才提的那个偏差(v0.1.12)。图标几何复用 `preset_tree`,
+    /// 所以这条同时守着「图标没有绕过布局树自己画一套」。
+    ///
+    /// 破坏性验证:把 `preset_tree` 里 `ThreeBigLeft` 的 `split(h, 0.5, ...)`
+    /// 改回 `2.0 / 3.0`,本测试红(图标层)+ `three_big_left_...` 红(布局层)。
+    #[test]
+    fn icon_cells_show_every_three_pane_preset_as_equal_width() {
+        for p in [
+            Preset::ThreeBigLeft,
+            Preset::ThreeBigRight,
+            Preset::ThreeColumns,
+        ] {
+            let widths: Vec<f32> = icon_cells(p).iter().map(|c| c[2]).collect();
+            let first = widths[0];
+            for w in &widths {
+                assert!(
+                    (w - first).abs() < 1e-4,
+                    "{p:?} 图标格子宽度不一致: {widths:?}"
+                );
+            }
         }
     }
 
@@ -237,14 +317,31 @@ mod tests {
         assert_eq!(widths, vec![400, 400, 400]);
     }
 
-    /// 左大右上下:左边一整条,右边被横向切两块。
+    /// 左满高:左右**等宽**,左边那块通高,右边对半切上下两块。
+    ///
+    /// 等宽这条是实机验收提的(v0.1.12 是 2/3 : 1/3,用户要的「大」只指高度)。
+    /// 破坏性验证:把 `preset_tree` 里的 `split(h, 0.5, ...)` 改回 `2.0 / 3.0`,
+    /// 第一条等宽断言变红。
     #[test]
-    fn three_big_left_geometry() {
+    fn three_big_left_is_equal_width_with_a_full_height_left_block() {
         let rects = compute_rects(&preset_tree(Preset::ThreeBigLeft, &ids(3)), AREA);
-        assert_eq!(rects[0].1.cols, 800, "左块占 2/3 宽");
+        let widths: Vec<u16> = rects.iter().map(|(_, r)| r.cols).collect();
+        assert_eq!(widths, vec![600, 600, 600], "三块等宽:大只在高度上");
         assert_eq!(rects[0].1.rows, 600, "左块通高");
         assert_eq!(rects[1].1.rows, 300);
         assert_eq!(rects[2].1.rows, 300);
+    }
+
+    /// 右满高:`ThreeBigLeft` 的镜像。单独一条是因为两者的树形不是简单对称
+    /// (通高的那块在 `split` 的另一侧),改一个漏改另一个不会被上面那条抓到。
+    #[test]
+    fn three_big_right_is_equal_width_with_a_full_height_right_block() {
+        let rects = compute_rects(&preset_tree(Preset::ThreeBigRight, &ids(3)), AREA);
+        let widths: Vec<u16> = rects.iter().map(|(_, r)| r.cols).collect();
+        assert_eq!(widths, vec![600, 600, 600], "三块等宽:大只在高度上");
+        assert_eq!(rects[0].1.rows, 300);
+        assert_eq!(rects[1].1.rows, 300);
+        assert_eq!(rects[2].1.rows, 600, "右块通高");
     }
 
     #[test]
