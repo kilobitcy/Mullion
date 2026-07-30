@@ -3,13 +3,22 @@
 
 pub mod crypto;
 pub mod error;
+pub mod group;
+pub mod inherit;
 pub mod known_hosts;
 pub mod master_key;
+pub mod migrate;
 pub mod model;
 pub mod vault;
 
 pub use error::StoreError;
+pub use group::GroupRecord;
+pub use inherit::{resolve, PrefsLayer, ResolvedConfig, DEFAULT_SCROLLBACK};
 pub use known_hosts::{HostKeyEntry, KnownHostsFile};
 pub use master_key::{InMemoryKey, KeyringSource, MasterKeySource};
-pub use model::{AuthKind, Protocol, SecretEntry, SessionId, SessionRecord};
+pub use migrate::{migrate_v1, SchemaProbe};
+pub use model::{
+    AppearancePrefs, Auth, AuthKind, ColorSpec, ColorTarget, Connection, GroupId, IconKind,
+    IconSpec, Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
+};
 pub use vault::{SessionDraft, Vault};

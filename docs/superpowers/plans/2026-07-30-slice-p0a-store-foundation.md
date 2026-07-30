@@ -1512,3 +1512,76 @@ git commit --allow-empty -m "chore: 切片 P0-a 全绿 —— store 分节地基
 - `automation` / `safety` 分节 → 各自在 P1 / P2-b 引入。
   P0-a 不建空结构体（那是死代码）；新增顶层分节 key 不改已有类型，
   配合 `#[serde(default)]` 旧文件仍可读，不违反 D3。
+
+---
+
+## 实现偏差记录（执行完成后补记）
+
+**上文各任务的正文保持原样，是计划当时的产物。以下是实现过程中与之不一致的地方，
+以实际代码为准。**未来读这份计划时，先看这一节。
+
+### 1. Task 5（第 746–747 行）：`icon`/`color` 的示例代码类型不通
+
+计划写的 `resolve_override(layers.iter().map(|l| l.appearance().icon.clone()), None)`
+会把 `T` 推成 `IconSpec`，与 `default: None` 类型对不上，编译不过。
+
+实际实现（`crates/mullion-store/src/inherit.rs:103-112`）多加一层 `.map(Some)`，
+让 `T = Option<IconSpec>`：
+
+```rust
+icon: resolve_override(
+    layers.iter().map(|l| l.appearance().icon.clone().map(Some)),
+    None,
+),
+```
+
+关键机制：`Option::map` 遇 `None` 不执行闭包，该层在 `flatten()` 后贡献 **0 个元素**、
+被整体跳过，而不是贡献一个参与比较的 `None`——这样才能保留「本层未设则看下一层」的语义。
+代码里配了完整注释说明前提与将来的限制。**不要照着计划把它「改回去」。**
+
+### 2. Task 6/7：新增了「拒绝未来版本 schema」，计划与设计 spec 都没写
+
+实现加了 `StoreError::UnsupportedSchema(u32)`：`probe.schema_version > CURRENT_SCHEMA`
+时直接报错返回，不按旧结构解析。防止旧客户端打开新版写出的文件后，用旧结构把新字段
+覆盖掉（静默丢数据）。守护测试 `opening_future_schema_is_rejected_not_silently_mangled`。
+
+这一条应补进设计 spec §4.3 的验收清单。
+
+### 3. Task 7：`impl Debug for Vault` 刻意不实现
+
+实现过程中一度为了 `unwrap_err()` 能编译而手写了脱敏 Debug（实测确认不泄漏密钥），
+最终**撤掉**，测试改用 let-else 解构。理由：「根本没有 `Debug`」是编译期强制的安全默认，
+优于「有一个靠人工守护正确性的实现」。断言强度一条未降。
+
+同任务另一处：`migrate.rs` 解析 `V1File` 显式 `.map_err(|e| StoreError::Migration(e.to_string()))`，
+不借 `From<toml::de::Error>` 自动转 `TomlDe`——否则用户看到的是
+「会话文件迁移失败:TOML 解析失败(文件可能被手改坏):…」的双重包裹，
+会把人引去查语法，而这里失败大多是结构/版本不兼容。
+
+### 4. Task 9（第 1397–1420 行）：`build_draft` 的两处与计划不同
+
+**（a）`note` 不 trim。** 计划模板写的是 `note: buf.note.trim().to_string()`，
+但旧代码是 `buf.note.clone()`。本提交承诺「纯字段路径迁移，不改行为」，
+trim 会吃掉用户备注里刻意保留的缩进/尾随空格，属于计划引入的行为变化，已还原。
+`name`/`host`/`user` 的 trim 是既有行为，保留。守护测试 `note_is_not_trimmed_when_building_draft`。
+
+**（b）`EditorBuffer` 增加四个 `preserved_*` 透传字段（计划里完全没有）。**
+这是**计划本身的缺陷**：计划模板让 `build_draft` 给 `identity.group_id` / `identity.tags` /
+`terminal` / `appearance` 填占位默认值（`None` / `Vec::new()` / `default()`），
+而 `Vault::update()` 对这五个分节是**整体替换而非合并**——两者叠加的结果是
+**编辑任意一个会话都会静默清空这四项**。
+
+P0-a 阶段 UI 还没有设置分组/tags 的入口，所以暂时没有真实数据会丢；
+但 P0-b 一接分组 UI 就立刻引爆。修法是让这四项**穿过**编辑器而不被破坏：
+`from_record` 读入 `preserved_*`，`build_draft` 原样写回，UI 不提供修改入口。
+守护测试 `editing_a_session_preserves_fields_the_form_cannot_edit`
+（已做 mutation test 验证：把任一 `preserved_*` 改回占位默认值，该测试立即变红）。
+
+### 5. Task 10 Step 4「人工确认迁移安全性」：**未在真实用户数据上执行**
+
+`~/.config/mullion` 在开发机上不存在（无头容器从未跑过 GUI），计划里那条
+「在真实配置目录的副本上验证」**无法执行**。替代做法是在构造的 v1 文件上做了一次
+端到端演练（走真实 `Vault::open` 路径），确认：`.bak` 与原 v1 逐字节相同、
+新文件含 `schema_version = 2`、会话条数不变、重入幂等不污染备份。
+
+**真实 Windows 用户数据的迁移仍是人工验收项**，未完成。

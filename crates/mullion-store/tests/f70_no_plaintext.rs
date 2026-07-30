@@ -1,7 +1,10 @@
 //! F70 守护:写一条带密码/私钥口令的会话并落盘后,sessions.toml 与 secrets.enc 的
 //! 原始字节里都搜不到明文口令。用 InMemoryKey 保证确定性。
 
-use mullion_store::{AuthKind, InMemoryKey, Protocol, SecretEntry, SessionDraft, Vault};
+use mullion_store::{
+    AppearancePrefs, Auth, AuthKind, Connection, Identity, InMemoryKey, Protocol, SecretEntry,
+    SessionDraft, TerminalPrefs, Vault,
+};
 
 const PW: &str = "hunter2-VERY-secret-passphrase-xyz";
 
@@ -11,16 +14,26 @@ fn plaintext_secret_never_hits_disk() {
     let mut vault = Vault::open(dir.path().to_path_buf(), &InMemoryKey([42u8; 32])).unwrap();
     vault.add(
         SessionDraft {
-            name: "s".into(),
-            host: "h".into(),
-            port: 22,
-            protocol: Protocol::Ssh,
-            user: "u".into(),
-            note: String::new(),
-            auth: AuthKind::PublicKey {
-                path: "/k.pem".into(),
-                has_passphrase: true,
+            identity: Identity {
+                name: "s".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
             },
+            connection: Connection {
+                host: "h".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "u".into(),
+                kind: AuthKind::PublicKey {
+                    path: "/k.pem".into(),
+                    has_passphrase: true,
+                },
+            },
+            terminal: TerminalPrefs::default(),
+            appearance: AppearancePrefs::default(),
             secret: Some(SecretEntry {
                 password: None,
                 passphrase: Some(PW.into()),

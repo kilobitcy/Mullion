@@ -93,17 +93,29 @@ impl SessionStore {
 mod tests {
     use super::*;
     use mullion_ssh::config::AuthMethod;
-    use mullion_store::{AuthKind, InMemoryKey, Protocol, SecretEntry, SessionDraft};
+    use mullion_store::{
+        Auth, AuthKind, Connection, Identity, InMemoryKey, Protocol, SecretEntry, SessionDraft,
+    };
 
     fn draft() -> SessionDraft {
         SessionDraft {
-            name: "dev".into(),
-            host: "192.0.2.10".into(),
-            port: 22,
-            protocol: Protocol::Ssh,
-            user: "user".into(),
-            note: String::new(),
-            auth: AuthKind::Password,
+            identity: Identity {
+                name: "dev".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: "192.0.2.10".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "user".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
             secret: Some(SecretEntry {
                 password: Some("pw".into()),
                 passphrase: None,

@@ -8,7 +8,10 @@
 
 use std::path::PathBuf;
 
-use mullion_store::{AuthKind, Protocol, SecretEntry, SessionDraft, SessionId, SessionRecord};
+use mullion_store::{
+    AppearancePrefs, Auth, AuthKind, Connection, GroupId, Identity, Protocol, SecretEntry,
+    SessionDraft, SessionId, SessionRecord, TerminalPrefs,
+};
 
 use super::UiState;
 
@@ -34,6 +37,16 @@ pub struct EditorBuffer {
     pub password: String,
     pub key_path: String,
     pub passphrase: String,
+
+    // ↓↓↓ 透传字段:UI 目前没有编辑分组/标签/终端偏好/外观偏好的入口(那是
+    // P0-b/P2 的事),但 `Vault::update` 对 `identity`/`terminal`/`appearance`
+    // 是整体字段替换而非合并(见 vault.rs)。所以编辑表单必须把这些字段原样
+    // 存下来再原样写回,否则「编辑会话」会静默清空它们。新建会话时没有
+    // `SessionRecord` 可读,保持默认值(未分组/无标签/默认偏好)。
+    pub preserved_group_id: Option<GroupId>,
+    pub preserved_tags: Vec<String>,
+    pub preserved_terminal: TerminalPrefs,
+    pub preserved_appearance: AppearancePrefs,
 }
 
 impl Default for EditorBuffer {
@@ -49,6 +62,10 @@ impl Default for EditorBuffer {
             password: String::new(),
             key_path: String::new(),
             passphrase: String::new(),
+            preserved_group_id: None,
+            preserved_tags: Vec::new(),
+            preserved_terminal: TerminalPrefs::default(),
+            preserved_appearance: AppearancePrefs::default(),
         }
     }
 }
@@ -58,15 +75,19 @@ impl EditorBuffer {
     /// 编辑时留空 = 不改;见 `build_draft` 的说明)。
     fn from_record(rec: &SessionRecord) -> Self {
         let mut buf = Self {
-            name: rec.name.clone(),
-            host: rec.host.clone(),
-            port: rec.port.to_string(),
-            protocol: rec.protocol,
-            user: rec.user.clone(),
-            note: rec.note.clone(),
+            name: rec.identity.name.clone(),
+            host: rec.connection.host.clone(),
+            port: rec.connection.port.to_string(),
+            protocol: rec.connection.protocol,
+            user: rec.auth.user.clone(),
+            note: rec.identity.note.clone(),
+            preserved_group_id: rec.identity.group_id,
+            preserved_tags: rec.identity.tags.clone(),
+            preserved_terminal: rec.terminal.clone(),
+            preserved_appearance: rec.appearance.clone(),
             ..Self::default()
         };
-        match &rec.auth {
+        match &rec.auth.kind {
             AuthKind::Password => buf.auth_kind = AuthKindUi::Password,
             AuthKind::PublicKey { path, .. } => {
                 buf.auth_kind = AuthKindUi::PublicKey;
@@ -126,13 +147,24 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
         }
     };
     Ok(SessionDraft {
-        name: buf.name.trim().to_string(),
-        host: buf.host.trim().to_string(),
-        port,
-        protocol: buf.protocol,
-        user: buf.user.trim().to_string(),
-        note: buf.note.clone(),
-        auth,
+        identity: Identity {
+            name: buf.name.trim().to_string(),
+            // note 不 trim:用户备注里的前后空格属于用户数据(既有行为)。
+            note: buf.note.clone(),
+            group_id: buf.preserved_group_id,
+            tags: buf.preserved_tags.clone(),
+        },
+        connection: Connection {
+            host: buf.host.trim().to_string(),
+            port,
+            protocol: buf.protocol,
+        },
+        auth: Auth {
+            user: buf.user.trim().to_string(),
+            kind: auth,
+        },
+        terminal: buf.preserved_terminal.clone(),
+        appearance: buf.preserved_appearance.clone(),
         secret,
     })
 }
@@ -171,19 +203,19 @@ pub fn show(
                     ui.end_row();
                     for rec in sessions {
                         let is_selected = ui_state.selected == Some(rec.id);
-                        let name_resp = ui.selectable_label(is_selected, &rec.name);
+                        let name_resp = ui.selectable_label(is_selected, &rec.identity.name);
                         if name_resp.clicked() {
                             ui_state.selected = Some(rec.id);
                         }
                         if name_resp.double_clicked() {
                             ui_state.connect_request = Some(rec.id);
                         }
-                        ui.label(format!("{}:{}", rec.host, rec.port));
-                        ui.label(match rec.protocol {
+                        ui.label(format!("{}:{}", rec.connection.host, rec.connection.port));
+                        ui.label(match rec.connection.protocol {
                             Protocol::Ssh => "ssh",
                             Protocol::Sftp => "sftp",
                         });
-                        ui.label(&rec.user);
+                        ui.label(&rec.auth.user);
                         ui.label(&rec.modified_at);
                         ui.end_row();
                     }
@@ -234,7 +266,7 @@ pub fn show(
                 let name = sessions
                     .iter()
                     .find(|s| s.id == id)
-                    .map(|s| s.name.clone())
+                    .map(|s| s.identity.name.clone())
                     .unwrap_or_default();
                 egui::Window::new("确认删除")
                     .collapsible(false)
@@ -403,6 +435,7 @@ fn show_editor(ctx: &egui::Context, ui_state: &mut UiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mullion_store::{ColorSpec, ColorTarget, IconKind, IconSpec};
 
     fn buf() -> EditorBuffer {
         EditorBuffer {
@@ -416,6 +449,7 @@ mod tests {
             password: String::new(),
             key_path: String::new(),
             passphrase: String::new(),
+            ..EditorBuffer::default()
         }
     }
 
@@ -424,10 +458,10 @@ mod tests {
         let mut b = buf();
         b.password = "pw".into();
         let draft = build_draft(&b).unwrap();
-        assert_eq!(draft.name, "dev");
-        assert_eq!(draft.host, "192.0.2.10");
-        assert_eq!(draft.port, 22);
-        assert!(matches!(draft.auth, AuthKind::Password));
+        assert_eq!(draft.identity.name, "dev");
+        assert_eq!(draft.connection.host, "192.0.2.10");
+        assert_eq!(draft.connection.port, 22);
+        assert!(matches!(draft.auth.kind, AuthKind::Password));
         assert_eq!(
             draft.secret.as_ref().and_then(|s| s.password.clone()),
             Some("pw".to_string())
@@ -448,7 +482,7 @@ mod tests {
         b.key_path = "/home/me/id_ed25519".into();
         b.passphrase = "ph".into();
         let draft = build_draft(&b).unwrap();
-        match draft.auth {
+        match draft.auth.kind {
             AuthKind::PublicKey {
                 path,
                 has_passphrase,
@@ -470,7 +504,7 @@ mod tests {
         b.auth_kind = AuthKindUi::PublicKey;
         b.key_path = "/home/me/id_ed25519".into();
         let draft = build_draft(&b).unwrap();
-        match draft.auth {
+        match draft.auth.kind {
             AuthKind::PublicKey { has_passphrase, .. } => assert!(!has_passphrase),
             _ => panic!("应为 PublicKey"),
         }
@@ -486,5 +520,90 @@ mod tests {
         let mut b2 = buf();
         b2.port = "99999999".into(); // 超出 u16 范围
         assert!(build_draft(&b2).is_err());
+    }
+
+    /// 回归测试(critical):编辑表单编辑不到的字段(分组/标签/终端偏好/外观偏好)
+    /// 在「读入表单 → 写回 draft」这趟往返里必须原样保留,不能被表单的占位默认值
+    /// 悄悄清空。`Vault::update` 对这四项是整体替换而非合并,一旦 build_draft 填了
+    /// 默认值,保存就会真的把用户数据清空。
+    #[test]
+    fn editing_a_session_preserves_fields_the_form_cannot_edit() {
+        let rec = SessionRecord {
+            id: SessionId(7),
+            modified_at: "2026-07-25T00:00:00Z".into(),
+            identity: Identity {
+                name: "dev".into(),
+                note: "跳板后".into(),
+                group_id: Some(GroupId(1)),
+                tags: vec!["web01".into()],
+            },
+            connection: Connection {
+                host: "192.0.2.10".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "user".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: TerminalPrefs {
+                scrollback: Some(12345),
+            },
+            appearance: AppearancePrefs {
+                icon: Some(IconSpec {
+                    kind: IconKind::Emoji,
+                    value: "🚀".into(),
+                }),
+                color: Some(ColorSpec {
+                    hex: "#ff0000".into(),
+                    apply_to: vec![ColorTarget::Tab],
+                }),
+            },
+        };
+
+        let editor_buf = EditorBuffer::from_record(&rec);
+        let draft = build_draft(&editor_buf).unwrap();
+
+        assert_eq!(
+            draft.identity.group_id, rec.identity.group_id,
+            "编辑不该清空 UI 编辑不到的字段:group_id"
+        );
+        assert_eq!(
+            draft.identity.tags, rec.identity.tags,
+            "编辑不该清空 UI 编辑不到的字段:tags"
+        );
+        assert_eq!(
+            draft.terminal, rec.terminal,
+            "编辑不该清空 UI 编辑不到的字段:terminal"
+        );
+        assert_eq!(
+            draft.appearance, rec.appearance,
+            "编辑不该清空 UI 编辑不到的字段:appearance"
+        );
+    }
+
+    /// 钉死 note 不被 trim(既有行为:旧代码是 `buf.note.clone()`,迁移不该顺手改成
+    /// `trim()`——用户备注里的前后空格属于用户数据,不该被悄悄吃掉)。
+    #[test]
+    fn note_is_not_trimmed_when_building_draft() {
+        let mut b = buf();
+        b.note = "  缩进备注  ".into();
+        let draft = build_draft(&b).unwrap();
+        assert_eq!(
+            draft.identity.note, "  缩进备注  ",
+            "note 不应被 trim,前后空格属于用户数据"
+        );
+    }
+
+    /// 新建会话(没有 SessionRecord 可读)时,这四项仍应是默认值——确认
+    /// `EditorBuffer::default()` 的新建路径没被这次修复带偏。
+    #[test]
+    fn new_session_defaults_have_no_preserved_fields() {
+        let b = EditorBuffer::default();
+        let draft = build_draft(&b).unwrap();
+        assert_eq!(draft.identity.group_id, None);
+        assert_eq!(draft.identity.tags, Vec::<String>::new());
+        assert_eq!(draft.terminal, TerminalPrefs::default());
+        assert_eq!(draft.appearance, AppearancePrefs::default());
     }
 }

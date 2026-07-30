@@ -32,10 +32,10 @@ pub fn to_ssh_config(
     rec: &SessionRecord,
     secret: Option<&SecretEntry>,
 ) -> Result<SshConfig, MapError> {
-    if rec.protocol == Protocol::Sftp {
+    if rec.connection.protocol == Protocol::Sftp {
         return Err(MapError::SftpNotSupported);
     }
-    let auth = match &rec.auth {
+    let auth = match &rec.auth.kind {
         AuthKind::Password => {
             let pw = secret
                 .and_then(|s| s.password.clone())
@@ -62,9 +62,9 @@ pub fn to_ssh_config(
         }
     };
     Ok(SshConfig {
-        host: rec.host.clone(),
-        port: rec.port,
-        user: rec.user.clone(),
+        host: rec.connection.host.clone(),
+        port: rec.connection.port,
+        user: rec.auth.user.clone(),
         auth,
         cols: 80,
         rows: 24,
@@ -76,19 +76,31 @@ pub fn to_ssh_config(
 mod tests {
     use super::*;
     use mullion_ssh::config::AuthMethod;
-    use mullion_store::{AuthKind, Protocol, SecretEntry, SessionId, SessionRecord};
+    use mullion_store::{
+        Auth, AuthKind, Connection, Identity, Protocol, SecretEntry, SessionId, SessionRecord,
+    };
 
     fn rec(auth: AuthKind, proto: Protocol) -> SessionRecord {
         SessionRecord {
             id: SessionId(1),
-            name: "s".into(),
-            host: "h".into(),
-            port: 2222,
-            protocol: proto,
-            user: "u".into(),
-            note: String::new(),
             modified_at: "t".into(),
-            auth,
+            identity: Identity {
+                name: "s".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: "h".into(),
+                port: 2222,
+                protocol: proto,
+            },
+            auth: Auth {
+                user: "u".into(),
+                kind: auth,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
         }
     }
 

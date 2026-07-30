@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::model::SessionId;
+use crate::model::{GroupId, SessionId};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -22,6 +22,12 @@ pub enum StoreError {
     Utf8,
     /// 目标会话不存在。
     NotFound(SessionId),
+    /// 目标分组不存在。
+    GroupNotFound(GroupId),
+    /// 文件由更新版本的客户端写出,本版本读不了。
+    UnsupportedSchema(u32),
+    /// v1 → v2 迁移失败(结构不兼容,非语法问题)。
+    Migration(String),
 }
 
 impl fmt::Display for StoreError {
@@ -37,6 +43,12 @@ impl fmt::Display for StoreError {
             }
             StoreError::Utf8 => write!(f, "secrets.enc 解密后非法 UTF-8"),
             StoreError::NotFound(id) => write!(f, "会话不存在:{id:?}"),
+            StoreError::GroupNotFound(id) => write!(f, "分组不存在:{id:?}"),
+            StoreError::UnsupportedSchema(v) => write!(
+                f,
+                "会话文件的 schema 版本 {v} 高于本客户端支持的上限 —— 请升级 Mullion"
+            ),
+            StoreError::Migration(e) => write!(f, "会话文件迁移失败:{e}"),
         }
     }
 }
