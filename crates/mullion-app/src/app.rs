@@ -788,9 +788,8 @@ impl ApplicationHandler<UserEvent> for App {
                 });
                 self.ws = Some(ws);
                 self.current_preset = Some(Preset::Single);
-                // 连上后关掉会话管理弹窗/编辑表单,别让它盖在新终端上方(复核 #4)。
+                // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
                 self.ui.session_manager_open = false;
-                self.ui.editor_open = false;
                 self.ui_dirty = true;
                 self.request_ui_redraw();
             }
@@ -908,7 +907,6 @@ impl ApplicationHandler<UserEvent> for App {
             );
             let modal = self.ui.session_manager_open
                 || self.ui.about_open
-                || self.ui.editor_open
                 || self.pending_host_key.is_some()
                 || self.pending_paste.is_some();
             // 键盘归终端时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。

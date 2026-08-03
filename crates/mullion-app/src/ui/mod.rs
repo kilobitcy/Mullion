@@ -70,8 +70,6 @@ pub struct UiState {
     pub delete_request: Option<SessionId>,
     /// 编辑表单点「保存」→ app 事后据此调 `store.add`/`store.update`。
     pub save_request: Option<session_manager::SaveIntent>,
-    /// 编辑子表单是否展示。
-    pub editor_open: bool,
     /// 正在编辑的会话 id;`None` = 新建。
     pub editor_id: Option<SessionId>,
     /// 编辑表单的跨帧字段缓冲。
@@ -183,9 +181,10 @@ pub fn build_ui(
             });
         ui_state.about_open = open;
     }
-    if ui_state.session_manager_open || ui_state.editor_open {
+    if ui_state.session_manager_open {
         session_manager::show(
             ctx,
+            t,
             ui_state,
             frame.sessions,
             frame.groups,
@@ -481,5 +480,48 @@ mod tests {
                 "点第 {i} 个按钮(位置 {pos:?})应得到 {expected:?}"
             );
         }
+    }
+
+    /// F90:会话管理器必须是**单窗**。设计稿把「列表 / 编辑器 / 删除确认」三个弹窗
+    /// 合成一个 880×560 双栏窗口,再冒出第二个顶层 `egui::Window` 就是回归。
+    ///
+    /// 计数机制:`Areas::order()` 是 `pub(crate)`,拿不到;改用公开的
+    /// `Areas::visible_layer_ids()`(`egui-0.30.0/src/memory/mod.rs`),同样不带
+    /// `UiKind` 标签,没法按「是不是 Window」过滤。但 `egui::Window` 默认落在
+    /// `Order::Middle`,而 `ComboBox` / `Popup` / tooltip 走 `Order::Foreground`,
+    /// 菜单栏与状态栏是 `TopBottomPanel`(`Order::Background`)——按
+    /// `Order::Middle` 过滤即等价于数窗口。
+    ///
+    /// 自证会变红:把 `session_manager::editor::show` 的内容重新包一层
+    /// `egui::Window::new("编辑会话").show(ctx, ..)`(即本切片要消灭的那个窗口),
+    /// 这条断言立刻报 `2 != 1`。
+    #[test]
+    fn session_manager_is_a_single_window_so_the_editor_cannot_pop_out_again() {
+        let ctx = egui::Context::default();
+        crate::theme::apply_egui(&ctx, &crate::theme::MULLION_DARK);
+        let mut st = UiState {
+            session_manager_open: true,
+            ..Default::default()
+        };
+        let frame = UiFrame {
+            store_available: true,
+            ..base_frame()
+        };
+        // 跑两遍:egui 的 Area 首帧是不可见的 sizing pass,第二帧才落进 areas order。
+        for _ in 0..2 {
+            run_frame(&ctx, &mut st, frame, egui::RawInput::default());
+        }
+
+        let windows = ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .iter()
+                .filter(|l| l.order == egui::Order::Middle)
+                .count()
+        });
+        assert_eq!(
+            windows, 1,
+            "会话管理器必须是单窗;新增任何顶层 egui::Window 都会让这条变红"
+        );
     }
 }

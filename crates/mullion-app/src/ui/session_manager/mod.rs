@@ -7,13 +7,25 @@
 //! `request_quit` 完全同构。
 
 mod buffer;
+mod editor;
+mod list;
 
 pub(crate) use buffer::{build_draft, AuthKindUi, ProxyModeUi};
 pub use buffer::{EditorBuffer, SaveIntent};
 
-use mullion_store::{GroupId, GroupRecord, Protocol, SessionRecord};
+use mullion_store::{GroupId, GroupRecord, SessionRecord};
+
+use crate::theme::{self, Theme};
 
 use super::UiState;
+
+/// 设计稿 §3:880×560 单窗,左栏定宽 300。
+pub(crate) const WINDOW_W: f32 = 880.0;
+pub(crate) const WINDOW_H: f32 = 560.0;
+pub(crate) const LIST_W: f32 = 300.0;
+/// 内容区最小高度。egui 的 `Window` 高度默认跟内容走,不撑到 `default_size` 给的
+/// 高度;靠这一行把双栏撑满,否则会话少时窗口会缩成一条。见 §3 的待验证假设。
+pub(crate) const CONTENT_MIN_HEIGHT: f32 = 480.0;
 
 /// 每个分组桶对应的 `CollapsingHeader` 构造。抽成独立函数**只为了能在测试里
 /// 直接调它**:`CollapsingHeader::new` 默认把标题文本本身当 id 源(见 egui 0.30
@@ -29,420 +41,66 @@ fn group_header(title: &str, gid: Option<GroupId>, count: usize) -> egui::Collap
         .default_open(true)
 }
 
-/// 会话管理器弹窗:列表 + CRUD 按钮(+ 内嵌二次确认)。`store_available=false`
-/// 时(待定 G:keyring/库打开失败)不崩,只展示 `last_error` 或兜底提示。
+/// 会话管理器弹窗:双栏(左列表 300px + 右编辑表单)合成单窗(F90)。
+/// `store_available=false` 时(待定 G:keyring/库打开失败)不崩,只展示兜底提示。
 pub fn show(
     ctx: &egui::Context,
+    t: &Theme,
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
     store_available: bool,
 ) {
-    let mut open = ui_state.session_manager_open;
+    if !ui_state.session_manager_open {
+        return;
+    }
+
+    let mut open = true;
     egui::Window::new("会话管理器")
         .open(&mut open)
-        .default_width(560.0)
+        .collapsible(false)
+        .resizable(true)
+        .default_size([WINDOW_W, WINDOW_H])
+        .min_width(720.0)
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(theme::c32(t.bar_status))
+                .rounding(12.0),
+        )
         .show(ctx, |ui| {
+            ui.set_min_height(CONTENT_MIN_HEIGHT);
+
+            // §3.1 降级:没有会话库时不画双栏,只给一句话,避免用户对着空表单填半天。
             if !store_available {
-                let msg = ui_state
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "会话功能不可用".to_string());
-                ui.colored_label(egui::Color32::RED, msg);
+                ui.colored_label(
+                    theme::c32(t.danger),
+                    "会话库不可用,无法读写会话(详见状态栏错误)。",
+                );
                 return;
             }
 
-            for (gid, bucket) in crate::ui::group_manager::group_sessions(groups, sessions) {
-                let title = match gid {
-                    Some(id) => groups
-                        .iter()
-                        .find(|g| g.id == id)
-                        .map(|g| g.name.clone())
-                        .unwrap_or_else(|| "未分组".to_string()),
-                    None => "未分组".to_string(),
-                };
-                group_header(&title, gid, bucket.len()).show(ui, |ui| {
-                    egui::Grid::new(format!("session_list_grid_{gid:?}"))
-                        .num_columns(5)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("名称");
-                            ui.strong("主机:端口");
-                            ui.strong("协议");
-                            ui.strong("用户");
-                            ui.strong("修改时间");
-                            ui.end_row();
-                            for rec in &bucket {
-                                let is_selected = ui_state.selected == Some(rec.id);
-                                let name_resp =
-                                    ui.selectable_label(is_selected, &rec.identity.name);
-                                if name_resp.clicked() {
-                                    ui_state.selected = Some(rec.id);
-                                }
-                                if name_resp.double_clicked() {
-                                    ui_state.connect_request = Some(rec.id);
-                                }
-                                ui.label(format!(
-                                    "{}:{}",
-                                    rec.connection.host, rec.connection.port
-                                ));
-                                ui.label(match rec.connection.protocol {
-                                    Protocol::Ssh => "ssh",
-                                    Protocol::Sftp => "sftp",
-                                });
-                                ui.label(&rec.auth.user);
-                                ui.label(&rec.modified_at);
-                                ui.end_row();
-                            }
-                        });
-                });
-            }
+            egui::SidePanel::left(ui.id().with("sm_list"))
+                .exact_width(LIST_W)
+                .resizable(false)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::c32(t.panel_bg))
+                        .inner_margin(10.0),
+                )
+                .show_inside(ui, |ui| list::show(ui, t, ui_state, sessions, groups));
 
-            ui.separator();
-            // 双击/点连接失败(如 sftp 会话映射拒绝)、保存/删除失败都写
-            // ui_state.last_error;这里必须总是渲染,否则「点了没反应」(复核 #2)。
-            if let Some(err) = &ui_state.last_error {
-                ui.colored_label(egui::Color32::RED, err);
-            }
-            ui.horizontal(|ui| {
-                if ui.button("新建").clicked() {
-                    ui_state.editor_id = None;
-                    ui_state.editor = EditorBuffer::default();
-                    ui_state.editor_open = true;
-                }
-                let has_selection = ui_state.selected.is_some();
-                if ui
-                    .add_enabled(has_selection, egui::Button::new("编辑"))
-                    .clicked()
-                {
-                    if let Some(rec) = ui_state
-                        .selected
-                        .and_then(|id| sessions.iter().find(|s| s.id == id))
-                    {
-                        ui_state.editor_id = Some(rec.id);
-                        ui_state.editor = EditorBuffer::from_record(rec);
-                        ui_state.editor_open = true;
-                    }
-                }
-                if ui
-                    .add_enabled(has_selection, egui::Button::new("删除"))
-                    .clicked()
-                {
-                    ui_state.pending_delete = ui_state.selected;
-                }
-                if ui
-                    .add_enabled(has_selection, egui::Button::new("连接"))
-                    .clicked()
-                {
-                    ui_state.connect_request = ui_state.selected;
-                }
-            });
-
-            // 删除二次确认:内嵌一个独立小窗口,确认/取消都不直接碰 store。
-            if let Some(id) = ui_state.pending_delete {
-                let name = sessions
-                    .iter()
-                    .find(|s| s.id == id)
-                    .map(|s| s.identity.name.clone())
-                    .unwrap_or_default();
-                egui::Window::new("确认删除")
-                    .collapsible(false)
-                    .resizable(false)
-                    .show(ui.ctx(), |ui| {
-                        ui.label(format!("确定删除会话「{name}」?此操作不可撤销。"));
-                        ui.horizontal(|ui| {
-                            if ui.button("确认删除").clicked() {
-                                ui_state.delete_request = Some(id);
-                                ui_state.pending_delete = None;
-                                if ui_state.selected == Some(id) {
-                                    ui_state.selected = None;
-                                }
-                            }
-                            if ui.button("取消").clicked() {
-                                ui_state.pending_delete = None;
-                            }
-                        });
-                    });
-            }
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::c32(t.bar_status))
+                        .inner_margin(14.0),
+                )
+                .show_inside(ui, |ui| editor::show(ui, t, ui_state, sessions, groups));
         });
-    ui_state.session_manager_open = open;
+
     if !open {
-        // 列表主窗被关掉:编辑子表单不该变成没有父窗的孤儿窗(复核 #5)。
-        ui_state.editor_open = false;
+        ui_state.session_manager_open = false;
     }
-
-    if ui_state.editor_open {
-        show_editor(ctx, ui_state, sessions, groups);
-    }
-}
-
-/// 新建/编辑子表单。保存时把缓冲组装成 `SaveIntent` 写进 `ui_state.save_request`,
-/// 不在这里直接碰 store。
-fn show_editor(
-    ctx: &egui::Context,
-    ui_state: &mut UiState,
-    sessions: &[SessionRecord],
-    groups: &[GroupRecord],
-) {
-    let editing_id = ui_state.editor_id;
-    let mut open = ui_state.editor_open;
-    let title = if ui_state.editor_id.is_some() {
-        "编辑会话"
-    } else {
-        "新建会话"
-    };
-    egui::Window::new(title)
-        .open(&mut open)
-        .collapsible(false)
-        .show(ctx, |ui| {
-            // 在 `buf` 的可变借用块里碰不到 ui_state,先记在局部,出块后再写意图。
-            let mut pick_key = false;
-            {
-                let buf = &mut ui_state.editor;
-                egui::Grid::new("editor_form_grid")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        ui.label("名称");
-                        ui.text_edit_singleline(&mut buf.name);
-                        ui.end_row();
-
-                        ui.label("主机");
-                        ui.text_edit_singleline(&mut buf.host);
-                        ui.end_row();
-
-                        ui.label("端口");
-                        ui.text_edit_singleline(&mut buf.port);
-                        ui.end_row();
-
-                        ui.label("协议");
-                        egui::ComboBox::from_id_salt("session_editor_protocol")
-                            .selected_text(match buf.protocol {
-                                Protocol::Ssh => "ssh",
-                                Protocol::Sftp => "sftp",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut buf.protocol, Protocol::Ssh, "ssh");
-                                ui.selectable_value(&mut buf.protocol, Protocol::Sftp, "sftp");
-                            });
-                        ui.end_row();
-
-                        ui.label("用户名");
-                        ui.text_edit_singleline(&mut buf.user);
-                        ui.end_row();
-
-                        ui.label("备注");
-                        ui.text_edit_singleline(&mut buf.note);
-                        ui.end_row();
-
-                        ui.label("分组");
-                        egui::ComboBox::from_id_salt("editor_group")
-                            .selected_text(
-                                buf.preserved_group_id
-                                    .and_then(|id| groups.iter().find(|g| g.id == id))
-                                    .map(|g| g.name.as_str())
-                                    .unwrap_or("未分组"),
-                            )
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut buf.preserved_group_id, None, "未分组");
-                                for g in groups {
-                                    ui.selectable_value(
-                                        &mut buf.preserved_group_id,
-                                        Some(g.id),
-                                        &g.name,
-                                    );
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label("认证方式");
-                        egui::ComboBox::from_id_salt("session_editor_auth_kind")
-                            .selected_text(match buf.auth_kind {
-                                AuthKindUi::Password => "密码",
-                                AuthKindUi::PublicKey => "公钥",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut buf.auth_kind,
-                                    AuthKindUi::Password,
-                                    "密码",
-                                );
-                                ui.selectable_value(
-                                    &mut buf.auth_kind,
-                                    AuthKindUi::PublicKey,
-                                    "公钥",
-                                );
-                            });
-                        ui.end_row();
-
-                        match buf.auth_kind {
-                            AuthKindUi::Password => {
-                                ui.label("密码");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut buf.password).password(true),
-                                );
-                                ui.end_row();
-                            }
-                            AuthKindUi::PublicKey => {
-                                ui.label("私钥路径");
-                                ui.horizontal(|ui| {
-                                    ui.text_edit_singleline(&mut buf.key_path);
-                                    if ui.button("选择…").clicked() {
-                                        pick_key = true;
-                                    }
-                                });
-                                ui.end_row();
-
-                                ui.label("私钥口令");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut buf.passphrase).password(true),
-                                );
-                                ui.end_row();
-                            }
-                        }
-
-                        ui.label("代理");
-                        egui::ComboBox::from_id_salt("editor_proxy_mode")
-                            .selected_text(match buf.proxy_mode {
-                                ProxyModeUi::Inherit => "跟随分组",
-                                ProxyModeUi::Direct => "不使用代理",
-                                ProxyModeUi::Socks5 => "SOCKS5",
-                                ProxyModeUi::HttpConnect => "HTTP CONNECT",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut buf.proxy_mode,
-                                    ProxyModeUi::Inherit,
-                                    "跟随分组",
-                                );
-                                ui.selectable_value(
-                                    &mut buf.proxy_mode,
-                                    ProxyModeUi::Direct,
-                                    "不使用代理",
-                                );
-                                ui.selectable_value(
-                                    &mut buf.proxy_mode,
-                                    ProxyModeUi::Socks5,
-                                    "SOCKS5",
-                                );
-                                ui.selectable_value(
-                                    &mut buf.proxy_mode,
-                                    ProxyModeUi::HttpConnect,
-                                    "HTTP CONNECT",
-                                );
-                            });
-                        ui.end_row();
-
-                        if matches!(
-                            buf.proxy_mode,
-                            ProxyModeUi::Socks5 | ProxyModeUi::HttpConnect
-                        ) {
-                            ui.label("代理地址");
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut buf.proxy_host)
-                                        .desired_width(160.0),
-                                );
-                                ui.label(":");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut buf.proxy_port)
-                                        .desired_width(60.0),
-                                );
-                            });
-                            ui.end_row();
-
-                            ui.label("代理用户名");
-                            ui.text_edit_singleline(&mut buf.proxy_user);
-                            ui.end_row();
-
-                            ui.label("代理口令");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut buf.proxy_password).password(true),
-                            );
-                            ui.end_row();
-                        }
-
-                        ui.label("跳板");
-                        ui.vertical(|ui| {
-                            if !buf.jump_set {
-                                ui.horizontal(|ui| {
-                                    ui.label("跟随分组");
-                                    if ui.button("改为自定义").clicked() {
-                                        buf.jump_set = true;
-                                    }
-                                });
-                            } else {
-                                let mut remove_at = None;
-                                for (i, id) in buf.jump_chain.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        let name = sessions
-                                            .iter()
-                                            .find(|r| r.id == *id)
-                                            .map(|r| r.identity.name.clone())
-                                            // 悬空引用在 UI 上就点出来,不要等到连接时才报错。
-                                            .unwrap_or_else(|| format!("<已删除的会话 {:?}>", id));
-                                        ui.label(format!("{}. {name}", i + 1));
-                                        if ui.button("移除").clicked() {
-                                            remove_at = Some(i);
-                                        }
-                                    });
-                                }
-                                if let Some(i) = remove_at {
-                                    buf.jump_chain.remove(i);
-                                }
-                                egui::ComboBox::from_id_salt("editor_jump_add")
-                                    .selected_text("添加跳板…")
-                                    .show_ui(ui, |ui| {
-                                        for rec in sessions {
-                                            // 不能把自己当自己的跳板(那是环)。
-                                            if Some(rec.id) == editing_id {
-                                                continue;
-                                            }
-                                            if ui.button(&rec.identity.name).clicked() {
-                                                buf.jump_chain.push(rec.id);
-                                            }
-                                        }
-                                    });
-                                if ui.button("恢复为跟随分组").clicked() {
-                                    buf.jump_set = false;
-                                    buf.jump_chain.clear();
-                                }
-                            }
-                        });
-                        ui.end_row();
-                    });
-            }
-            if pick_key {
-                ui_state.pick_key_request = true;
-            }
-            ui.label("留空密码 / 私钥口令 = 清除已存凭据(不是「保持不变」)。");
-
-            if let Some(err) = &ui_state.last_error {
-                ui.colored_label(egui::Color32::RED, err);
-            }
-
-            ui.horizontal(|ui| {
-                if ui.button("保存").clicked() {
-                    match build_draft(&ui_state.editor) {
-                        Ok(draft) => {
-                            ui_state.last_error = None;
-                            ui_state.save_request = Some(SaveIntent {
-                                editing_id: ui_state.editor_id,
-                                draft,
-                            });
-                            ui_state.editor_open = false;
-                            // 别让刚输入的明文密码/口令原样滞留在 UiState 内存里(复核 #6)。
-                            ui_state.editor = EditorBuffer::default();
-                        }
-                        Err(e) => ui_state.last_error = Some(e),
-                    }
-                }
-                if ui.button("取消").clicked() {
-                    ui_state.editor_open = false;
-                    ui_state.editor = EditorBuffer::default();
-                }
-            });
-        });
-    ui_state.editor_open = ui_state.editor_open && open;
 }
 
 #[cfg(test)]
