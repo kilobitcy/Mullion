@@ -1,6 +1,7 @@
 # 会话管理器 UI 重构设计（F90）
 
 日期：2026-08-03
+编号：F90（UI 形态）+ F73（凭据三态）
 输入：`/tmp/design-export/Mullion.dc.html`（Claude Design 导出的设计稿，会话管理器模态在第 162–311 行）
 产出：把现有「会话管理器 + 编辑器 + 删除确认」三个 `egui::Window` 合并成单窗双栏
 
@@ -37,12 +38,18 @@
 | 左侧「已连接会话」侧栏 | 未排期 |
 | 图标 / 语义色 / 标签 / 收藏 / 排序 | F61~F63（P2-a） |
 
-**持久化数据模型一个字段不加**：`SessionRecord`、`SessionDraft`、`GroupRecord`
-全部保持原样，`mullion-store` 零改动。
+**持久化数据模型一个字段不加**：`SessionRecord`、`SessionDraft`、`SecretEntry`、
+`GroupRecord` 全部保持原样，`mullion-store` 零改动。
 
-UI 传输态按重构需要改动：`EditorBuffer` 重排字段顺序并加 `#[derive(PartialEq)]`，
-`UiState` 增删若干字段（§7.1），`SaveIntent` 增 `then_connect`。
+UI 传输态按重构需要改动：`EditorBuffer` 重排字段顺序、加 `#[derive(PartialEq)]`、
+增三个 `*_touched: bool`（§5.4），`UiState` 增删若干字段（§7.1），
+`SaveIntent` 增 `then_connect` 与三个 `SecretField`，`UiFrame` 增 `secret_presence`。
 这两类是不同性质的东西，不要混谈。
+
+**一处经用户批准的行为改动**：凭据保存语义从二态（覆盖 / 清除）升级为三态
+（保持 / 覆盖 / 清除），见 §5.4。它修的是一个真实的数据损坏风险（改备注顺手把
+已存密码清空），实现上仍不碰持久化模型——三态在 app 层合成后交给 store 的仍是
+原样的 `Option<SecretEntry>`。
 
 ### 1.3 编号
 
@@ -55,6 +62,13 @@ spec.md 现有号段（F1-6 / F10-21 / F30-38 / F50-57 / F60-69 / F70-72 / F80-8
 | ID | 需求 | 优先级 | 验收标准 |
 |---|---|---|---|
 | F90 | 会话管理器单窗双栏：左栏搜索+分组列表，右栏三 Tab 编辑器，删除确认内联，不再弹独立窗口 | P1 | 单测断言一帧内 `Order::Middle` 层只有一个 Area；搜索匹配与脏检查为纯函数、可无窗口单测 |
+
+§5.4 的凭据三态是**行为需求**，不是 UI 形态，单独编号 **F73**（已核对零命中），
+往 `spec.md` §4.5「凭据」加一行：
+
+| ID | 需求 | 优先级 | 验收标准 |
+|---|---|---|---|
+| F73 | 编辑会话时凭据三态：未触碰保持原值（UI 显示 6 位黑点）/ 触碰后留空清除 / 输入新值覆盖。三个密码字段各自独立 | P1 | `merge_secret` 纯函数单测；红队注入「Keep 走 None 分支」必须变红 |
 
 ---
 
@@ -257,7 +271,8 @@ Tab 状态存 `UiState::editor_tab: EditorTab`（`Connection` / `Auth` / `Advanc
 
 ### 5.1 三个 Tab 的字段分配
 
-**严格只重排 `EditorBuffer` 的现有 21 个字段，不增不减**（已逐字段核对）。
+在 `EditorBuffer` 现有 21 个字段的基础上重排。**唯一的字段增补是 §5.4 的三个
+`*_touched: bool`**，它们不显示在表单上，只记录「用户是否碰过对应的密码框」。
 
 | Tab | 行 | 字段（左 / 右） |
 |---|---|---|
@@ -267,11 +282,10 @@ Tab 状态存 `UiState::editor_tab: EditorTab`（`Connection` / `Auth` / `Advanc
 | | 4 | 备注 `note`（整行 `TextEdit::multiline`） |
 | | 5 | 只读文本「最后修改 {rec.modified_at}」，新建时不显示 |
 | 认证 | 1 | 认证方式下拉 `auth_kind`（密码 / 公钥） |
-| | 2 | `Password` → 密码框；`PublicKey` → 私钥路径 `key_path` + `[选择…]`（触发 `pick_key_request`） |
-| | 3 | `PublicKey` 时追加私钥口令 `passphrase` |
-| | 4 | 提示文案（见 §5.4） |
+| | 2 | `Password` → 密码框（§5.4 的三态控件）；`PublicKey` → 私钥路径 `key_path` + `[选择…]`（触发 `pick_key_request`） |
+| | 3 | `PublicKey` 时追加私钥口令 `passphrase`（同为三态控件） |
 | 高级 | 1 | 代理模式下拉 `proxy_mode`（跟随分组 / 不使用代理 / SOCKS5 / HTTP CONNECT） |
-| | 2 | 选中 SOCKS5 或 HTTP CONNECT 时展开 `proxy_host` / `proxy_port` / `proxy_user` / `proxy_password` |
+| | 2 | 选中 SOCKS5 或 HTTP CONNECT 时展开 `proxy_host` / `proxy_port` / `proxy_user` / `proxy_password`（后者同为三态控件） |
 | | 3 | 跳板链 `jump_chain`：已选条目列表（每条一个「移除」）+ 「添加跳板」下拉（候选 = 其余会话）；`jump_set == false` 时显示「跟随分组」与 `[改为自定义]` |
 
 余下 5 个字段（`preserved_tags` / `preserved_terminal` / `preserved_appearance`
@@ -382,24 +396,140 @@ pub pending_switch: Option<SwitchTarget>,
 右栏 Tab 条下方显示内联确认「有未保存的修改，放弃吗？[放弃] [继续编辑]」。
 选「放弃」才真正执行切换并清空 `pending_switch`；选「继续编辑」只清空 `pending_switch`。
 
-### 5.4 已知缺陷（本轮不修，登记为遗留）
+### 5.4 凭据三态（本轮修复，用户 2026-08-03 拍板）
 
-编辑既有会话时密码框恒为空——密码在加密侧车，UI 层拿不到明文。而
+**现状即缺陷**：编辑既有会话时密码框恒为空——密码在加密侧车，UI 层拿不到明文。而
 `build_draft` 把空密码当作「清除凭据」（守护测试
 `password_session_with_empty_password_clears_secret` 正是这个行为）。
-右栏常驻后「保存」按钮更显眼，用户「改个备注 → 随手保存 → 已存密码被清空」的概率上升。
+右栏常驻后「保存」按钮更显眼，「改个备注 → 随手保存 → 已存密码被清空」的概率上升。
 
-（注意：用户**主动重设密码**的路径没问题——往密码框敲字符会让
-`buf != baseline` 成立，保存按钮启用，新密码正常写入。有风险的只是
-「改了别的字段、无意中连带清空密码」。）
+**目标语义**（用户原话）：默认显示 6 位黑点；没改动 → 密码不变；清空 → 清除凭据；
+改了 → 保存新密码。即把当前的**二态**（覆盖 / 清除）升级为**三态**。
 
-修它需要给 `EditorBuffer` 加 `password_touched: bool`，并让 store 支持
-「本次保存不改动凭据」的语义——**这超出「本轮不扩数据模型」的边界，故不做**。
+#### 5.4.1 store 侧不改
 
-本轮的缓解措施只有一条：认证 Tab 顶部**加粗**显示
-「留空并保存将清除已存凭据，不会保留原值。」
+已核对 `SessionDraft.secret: Option<SecretEntry>`（`vault.rs:38`）只有二态：
+`Some(e)` 覆盖、`None` 删除（`vault.rs:125` 与 :165 两处 `match`）。
+`SecretEntry`（`model.rs:83`）有 `password` / `passphrase` / `proxy_password` 三个
+`Option<String>`。
 
-> **此项需用户确认**：接受作为遗留，还是本轮一并修（会突破范围）。
+**不给 store 加第三态**。三态是 UI 概念，落地为 app 层的一次合成：保存前把
+「store 里的现值」与「表单的三态意图」合成一个最终 `SecretEntry`，再照旧交给
+`update`/`add`。`mullion-store` 因此仍是零改动（§1.2 的承诺不破）。
+
+#### 5.4.2 三态类型与合成函数
+
+放 `buffer.rs`：
+
+```rust
+/// 一个密码字段的保存意图。纯 UI 概念，不进 store。
+#[derive(Clone, PartialEq, Eq)]
+pub enum SecretField {
+    /// 用户没碰过 → 保留 store 里的现值。
+    Keep,
+    /// 用户碰过并留下非空值 → 覆盖。
+    Set(String),
+    /// 用户碰过且最终为空 → 清除。
+    Clear,
+}
+
+// 手写 Debug 打码——Set(String) 的 derive Debug 会把明文口令打进日志/panic 消息，
+// 与 SecretEntry(model.rs:93) 同一模式。守护测试见 §9.1。
+impl std::fmt::Debug for SecretField { /* Keep / Set(<已设置>) / Clear */ }
+
+/// 把「store 里的现值」与「表单三态」合成最终 SecretEntry。
+/// 三个字段合成后全为 None 时返回 None——保持 store 现有的
+/// `update_to_no_secret_removes_it` 行为（不写空 SecretEntry）。
+pub(crate) fn merge_secret(
+    existing: Option<&SecretEntry>,
+    password: &SecretField,
+    passphrase: &SecretField,
+    proxy_password: &SecretField,
+) -> Option<SecretEntry>
+```
+
+纯函数、零 IO，可直接单测——这是本节能被无窗口验证的核心。
+
+新建路径（`editor_id.is_none()`）时 `existing` 恒为 `None`，`Keep` 与 `Clear` 等价，
+语义自洽，不需要给新建单独开分支。
+
+#### 5.4.3 `has_passphrase` 必须与合成结果一致
+
+`AuthKind::PublicKey { path, has_passphrase }`（`model.rs:26`）是**持久化**的布尔。
+改造后它必须等于「**合成后**的 `passphrase.is_some()`」，而不是「口令框当前非空」——
+否则「编辑一条有口令的公钥会话、只改了主机名」会写出
+`has_passphrase: false` + 侧车里口令还在的不一致状态。
+现有守护测试 `pubkey_with_passphrase_sets_has_passphrase_and_secret` 钉着这一点，
+实现时它必须继续绿。
+
+#### 5.4.4 UI 控件行为
+
+`EditorBuffer` 增三个字段：`password_touched` / `passphrase_touched` /
+`proxy_password_touched`（均 `bool`，默认 `false`）。
+
+单个密码框的状态机：
+
+| 条件 | 渲染 | 保存意图 |
+|---|---|---|
+| `!touched && 有已存值` | 内容为 6 个占位字符、`TextEdit::password(true)`（显示为 6 个黑点）；右侧 `[撤销]` 不显示 | `Keep` |
+| `!touched && 无已存值` | 空框 + hint「未设置」 | `Keep`（等价 `Clear`） |
+| `touched` | 真实内容，可编辑；右侧显示 `[撤销]` | 非空 → `Set(值)`；空 → `Clear` + 框下方 `danger_soft` 小字「保存后将清除已存凭据」 |
+
+**从「未触碰」到「触碰」的迁移点是 `response.gained_focus()`**：一聚焦就
+把 buffer 清空并置 `touched = true`。
+
+这个时机是**刻意选的**，不是图省事。若改成「内容可编辑 + 在 `changed()` 时才置
+touched」，用户按一次退格会得到 5 个占位字符残留，`Set("•••••")` 会把占位符当成新密码
+写进侧车——这是一个静默且不可逆的凭据损坏。聚焦即清空则保证占位字符**永远不可能**
+流入 `Set`。
+
+代价是「Tab 键路过密码框」也算触碰。`[撤销]` 按钮兜底：点它 → `touched = false`、
+buffer 恢复占位字符、恢复黑点显示 → 回到 `Keep`。
+
+占位字符本身用什么无关紧要（它永不流入 `Set`），取 6 个 ASCII `*`，
+debug 输出里一眼可辨。
+
+**与 §5.3 脏检查的交叉**（实现时容易搞乱，这里写死）：占位字符**存在
+`EditorBuffer` 里**，因此载入时 `editor` 与 `editor_baseline` 两边都是占位，
+初始不脏 ✓；聚焦后 `editor` 变空 + `touched = true`，与 baseline 不等 → 脏，
+保存按钮启用 ✓（用户点了密码框即视为有改动意图）；点 `[撤销]` 后两边又相等
+→ 回到不脏 ✓。三态与脏检查天然自洽，不需要为密码字段开特例。
+
+#### 5.4.5 「有已存值」这个信息怎么来
+
+`SessionRecord` 里**没有** password / proxy_password 的存在性标记（已核对
+`model.rs:62`，只有 `AuthKind::PublicKey` 带一个 `has_passphrase`）。
+UI 层拿到的 `&[SessionRecord]` 因此无法自行判断。
+
+**不给 `SessionRecord` 加标记**（那是持久化改动 + 迁移）。改为在 `UiFrame` 上带一个
+只针对当前 `editor_id` 那一条会话的存在性快照：
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecretPresence {
+    pub password: bool,
+    pub passphrase: bool,
+    pub proxy_password: bool,
+}
+// UiFrame 增字段：pub secret_presence: SecretPresence,
+```
+
+`app.rs` 构造 `UiFrame` 时按 `editor_id` 查一次 `store.secret(id)`（`Vault::secret`
+已 pub，见 `vault.rs:112`；`SessionStore` 转发一个只返回三个 bool 的方法）填好。
+**只传三个 bool，不传明文**——沿用「明文不越过 UI 边界」的既有约束。
+
+`editor_id` 为 `None`（新建/复制）时 `SecretPresence::default()`，三个全 `false`。
+
+#### 5.4.6 对现有测试的影响
+
+12 个 `build_draft` 系列测试里，凡是构造 `EditorBuffer` 时**设了密码/口令**的，
+迁移时需补上对应的 `*_touched: true`，否则新逻辑判为 `Keep`、`existing` 为 `None`、
+合成出 `None`，断言会红。
+
+**这不是削弱测试**：断言一律不动，改的只是「构造输入时多设一个新字段」。
+`password_session_with_empty_password_clears_secret` 需要显式设
+`password_touched: true`（因为它测的正是「用户主动清空」这条路径）——
+恰好也说明了新语义下「空 + 未触碰」与「空 + 已触碰」确实是两件不同的事。
 
 ---
 
@@ -448,7 +578,13 @@ egui 的借用约束不变：`egui_ctx.run(|ctx| ...)` 闭包内只有 `&mut UiS
 `pending_delete` / `selected` / `editor_id` / `connect_request` / `delete_request` /
 `save_request` / `pick_key_request` 全部保留，语义不变。
 
-`SaveIntent` 增 `then_connect: bool`（§5.3 的「保存并连接」）。
+`SaveIntent` 增 `then_connect: bool`（§5.3 的「保存并连接」）与三个
+`SecretField`（§5.4）。`draft.secret` 在 `build_draft` 阶段先置 `None` 占位，
+由 `apply_save` 合成后填入——**`build_draft` 自己算不出它**，因为合成需要
+store 里的现值。
+
+`UiFrame` 增 `secret_presence: SecretPresence`（§5.4.5）与
+`connected_session: Option<SessionId>`（§6）。
 
 ### 7.2 `app.rs` 的 `save_request` 施加逻辑抽成纯函数
 
@@ -461,9 +597,18 @@ fn apply_save(store: &mut SessionStore, save: SaveIntent, now: &str)
     -> Result<SessionId, String>
 ```
 
-已核对 `store.add(draft, now) -> SessionId`（`vault.rs:117`）返回新分配的 id，
-而**当前调用点丢弃了这个返回值**。新建路径改为接住它；编辑路径返回 `save.editing_id`
-里的 id。
+职责有三：
+
+1. **合成凭据**——按 `save.editing_id` 读 `store.secret(id)` 拿现值（新建时为 `None`），
+   调 `merge_secret`（§5.4.2）算出最终 `Option<SecretEntry>` 填进 `draft.secret`，
+   并据此修正 `AuthKind::PublicKey.has_passphrase`（§5.4.3）。
+2. **写盘**——新建走 `add`、编辑走 `update`。
+3. **回传 id**——已核对 `store.add(draft, now) -> SessionId`（`vault.rs:117`）返回新分配的
+   id，而**当前调用点丢弃了这个返回值**。新建路径改为接住它；编辑路径返回
+   `save.editing_id` 里的 id。
+
+`merge_secret` 是纯函数、可脱离 store 单测；`apply_save` 只负责取现值与调 store，
+它的测试用 tempdir 起一个真 `SessionStore`（`mullion-store` 的 vault 测试已是这个模式）。
 
 调用方在 `then_connect` 为真时把返回的 id 塞进 `connect_request`，
 下一帧走既有的连接施加路径（不复制连接逻辑）。
@@ -479,9 +624,9 @@ fn apply_save(store: &mut SessionStore, save: SaveIntent, now: &str)
 | `mod.rs` | 窗口壳、`store_available` 降级、双栏骨架、`is_dirty`、`SwitchTarget` 与切换确认、`pub use` 重导出 | 200 |
 | `list.rs` | 左栏全部：搜索框、`matches()`、分组树、`session_row`、删除确认条、底部三按钮 | 300 |
 | `editor.rs` | 右栏全部：标题、Tab 条、错误卡片、三 Tab 字段、底部按钮 | 380 |
-| `buffer.rs` | `EditorBuffer` / `build_draft` / `SaveIntent` / `AuthKindUi` / `ProxyModeUi` + 现有纯逻辑单测 | 360 |
+| `buffer.rs` | `EditorBuffer` / `build_draft` / `SaveIntent` / `AuthKindUi` / `ProxyModeUi` / `SecretField` / `merge_secret` + 现有纯逻辑单测 | 420 |
 
-`mod.rs` 用 `pub use buffer::{EditorBuffer, SaveIntent};` 重导出，
+`mod.rs` 用 `pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence};` 重导出，
 `ui/mod.rs` 与 `app.rs` 里的 `session_manager::SaveIntent` / `session_manager::EditorBuffer`
 **引用路径完全不变**，本次拆分对调用方不可见。
 
@@ -508,6 +653,9 @@ CLAUDE.md 与 P0-b 的教训要求：**每条守护测试都要自证「破坏�
 
 迁移后 `cargo test -p mullion-app` 的测试**总数只增不减**。
 
+§5.4.6 已说明：`build_draft` 系列里设了密码/口令的用例，构造输入时需补
+`*_touched: true`；**断言一律不动**。
+
 ### 9.1 新增纯逻辑测试（无窗口、无 GPU）
 
 | 测试 | 位置 | 红队注入点 |
@@ -521,6 +669,19 @@ CLAUDE.md 与 P0-b 的教训要求：**每条守护测试都要自证「破坏�
 | `set_error_resets_dismissed` | `ui/mod.rs` | 从 `set_error` 里删掉 `error_dismissed = false` |
 | `apply_save_new_returns_id_allocated_by_store` | `app.rs` | 让新建路径丢弃 `store.add` 的返回值、改返回 `SessionId::default()`（即当前代码的行为） |
 | `apply_save_edit_returns_editing_id` | `app.rs` | 让编辑路径也走 `store.add`（等于每次保存都新建一条） |
+
+凭据三态（§5.4）的守护测试，全部打在 `merge_secret` 这个纯函数上——
+**这正是「本轮修的那个 bug」的真实注入点**：
+
+| 测试 | 位置 | 红队注入点 |
+|---|---|---|
+| `keep_preserves_existing_password` | `buffer.rs` | 让 `Keep` 走 `None` 分支（**这就是当前代码的行为**，也是本轮要修的 bug 本身） |
+| `clear_removes_existing_password` | `buffer.rs` | 让 `Clear` 与 `Keep` 同分支（修过头：变成永远清不掉） |
+| `set_overwrites_existing_password` | `buffer.rs` | 让 `Set` 在 existing 非空时跳过覆盖 |
+| `keep_and_set_are_independent_per_field` | `buffer.rs` | 用整体 `Option<SecretEntry>` 二态替代 per-field 三态（即「只改代理密码，主密码被连带清空」） |
+| `all_three_cleared_yields_none_not_empty_entry` | `buffer.rs` | 返回 `Some(SecretEntry::default())`（会在侧车里留一条空记录，破坏 `assert_no_orphan_secrets` 的邻近不变量） |
+| `has_passphrase_follows_merged_secret_not_form` | `buffer.rs` | 让 `has_passphrase` 取「口令框当前非空」（§5.4.3 的不一致状态） |
+| `debug_never_leaks_secret_field` | `buffer.rs` | 给 `SecretField` 加 `#[derive(Debug)]`（明文口令进日志） |
 
 ### 9.2 跑真 UI
 
@@ -537,6 +698,8 @@ CLAUDE.md 与 P0-b 的教训要求：**每条守护测试都要自证「破坏�
 | `save_and_connect_carries_then_connect` | 点「保存并连接」→ `save_request.then_connect == true` | 让该按钮走与「保存」相同的分支 |
 | `switching_tab_changes_visible_fields` | 切到「高级」后代理下拉可见、主机输入框不可见 | 三个 Tab 都无条件绘制全部字段 |
 | `double_click_on_row_requests_connect` | 双击行 → `connect_request == Some(id)` | 手绘 row 只处理 `clicked()`（§4.1 点名的易漏项） |
+| `untouched_password_box_saves_keep` | 载入一条有已存密码的会话、只改备注、点保存 → `save_request.password == SecretField::Keep` | 让 `build_draft` 无视 `touched` 直接按框内容出 `Set`/`Clear`（即当前行为） |
+| `focusing_password_box_clears_placeholder` | 给密码框发聚焦事件后，`editor.password` 为空且 `password_touched == true` | 把清空时机从 `gained_focus()` 挪到 `changed()`（§5.4.4 点名的占位符残留路径） |
 
 **`session_manager_draws_exactly_one_window` 的实现说明**（复核指出的坑）：
 egui 0.30 里 `UiKind::Window` 只存在于构建期的 `UiStackInfo`，
@@ -581,6 +744,14 @@ T8 尤其相关——§3.2 要改 `app.rs:911` 的模态判断，那正是输入
 9. 「保存并连接」是否真的先落盘再发起连接（改字段 → 点它 → 断开后重开管理器，字段仍在）
 10. 脏检查：改一半字段点另一条会话，是否弹确认而非静默丢弃
 11. 删除确认从独立窗口改成内联条后是否仍然醒目（不会被误点）
+12. **凭据三态端到端**（§5.4，本轮唯一的行为改动，必须实机走一遍）：
+    - 有密码的会话 → 只改备注 → 保存 → 断开重连，**密码仍能登录**（Keep 生效）
+    - 同一条 → 点密码框（黑点应消失变空框）→ 什么都不打 → 点 `[撤销]` → 保存 →
+      **密码仍能登录**（撤销回到 Keep）
+    - 同一条 → 点密码框 → 输入新密码 → 保存 → **新密码能登录、旧密码不能**（Set 生效）
+    - 同一条 → 点密码框 → 留空 → 保存 → **提示已清除，重连会要求输入密码**（Clear 生效）
+    - 公钥 + 口令的会话 → 只改主机名 → 保存 → 重开管理器，口令框仍显示 6 个黑点
+      （§5.4.3 的 `has_passphrase` 未被写坏）
 
 ---
 
@@ -588,17 +759,25 @@ T8 尤其相关——§3.2 要改 `app.rs:911` 的模态判断，那正是输入
 
 - 本轮改动全部落在 `mullion-app`，不新增任何 crate 间依赖，依赖方向
   `app → {core, term, ssh, store}` 不变。
-- `matches` / `is_dirty` / `build_draft` / `apply_save` 均为纯函数，可无窗口单测——
+- `matches` / `is_dirty` / `build_draft` / `merge_secret` 均为纯函数，可无窗口单测——
   这正是 CLAUDE.md 强调的「布局 bug 和键码 bug 能在没有窗口的情况下写测试复现」的同类收益。
-- `mullion-store` 零改动。
+  `apply_save` 需要一个真 store，用 tempdir 测。
+- `mullion-store` 零改动。凭据三态（§5.4）**没有**下沉到 store：store 收到的仍是
+  原样的 `Option<SecretEntry>` 二态，三态在 app 层合成完就消失了。
+  这条边界要守住——把 `Keep` 泄进 `mullion-store` 等于让存储层去理解 UI 的编辑状态。
+- 明文口令仍不越过 UI 边界：`UiFrame` 只带三个 bool 的 `SecretPresence`（§5.4.5），
+  不带任何密文/明文。
 - 不触碰 `emulator.rs`、`keymap.rs`、`text.rs`、`gpu.rs`，T1/T4/T5/T6 不受影响；
   T3/T7/T8 因 `app.rs` 有改动需回归（§9.3）。
 - `host_key_reply`（TOFU 确认）与 `paste_reply`（多行粘贴确认）是 `ui/mod.rs` 里
   独立于 `session_manager` 之外的模态，本轮不涉及。但它们也是顶层 `Window`——
   §9.2 的单窗断言测试必须在**不触发这两个模态**的状态下运行。
 
-## 12. 开放问题
+## 12. 已拍板的决策（2026-08-03）
 
-1. §5.4 的密码清空缺陷：接受为遗留，还是本轮一并修（需扩 `EditorBuffer` + store 语义）？
-2. §3 的 `set_min_height` 能否让 `SidePanel` 撑满——实现时首个任务就应验证，
-   不成立则走文中给的退路。
+1. **凭据三态本轮一并修**（§5.4）。不是遗留。语义：默认显示 6 位黑点 / 没改动则
+   密码不变 / 清空即清除凭据 / 改了则保存新密码。实现上 store 零改动。
+2. **`set_min_height` 的验证排成实现的第一个任务**（§3）。它是无头环境验证不了的
+   GUI 假设，先做一个最小骨架交叉编译上机看一眼，不成立立刻换
+   `fixed_size` + `set_min_size` 的退路，再往下做。这样避免整个右栏做完才发现
+   高度模型不对、需要返工。
