@@ -4315,10 +4315,15 @@ cd /tmp/rel-0115 && sha256sum mullion.exe > mullion.exe.sha256 && cat mullion.ex
 - [ ] 代理填错端口 → 错误消息**点名是代理连不上**，而不是说目标主机连不上
 - [ ] 代理要认证但没填口令 → 错误消息说的是**代理认证失败**，不是 SSH 认证失败
 
-### 2. 跳板（自动测试未覆盖，务必人工验）
+### 2. 跳板（自动测试只覆盖了一小块，务必人工验）
 
-**这一项没有自动化测试覆盖**（进程内假 sshd 成本过高，见计划 Task 19），
-完全依赖你这次实测：
+Task 19b 补了一个进程内两跳集成测试（假跳板 sshd → 假目标 sshd），但它覆盖的范围
+比听起来窄，**下面每一项仍然依赖你实测**：
+
+- 自动测试**能**保证：跳板 Handle 被 `SshConnection` 持有（结构断言）；隧道确实通到了
+  目标而不是停在跳板上（两跳凭据结构性互斥）；连接空闲 3 秒后仍可复用
+- 自动测试**不能**保证：真实 sshd 行为、真实链路上的长时保活（3 秒的空闲窗口
+  已用红队实验证明对「忘记保活」这个 bug 零检测力）、channel 泄漏、多于一跳的链
 
 - [ ] 单跳：A 会话经堡垒机 B 连到内网 C，能连上、能正常敲命令
 - [ ] 两跳：经 B → D 再到 C，能连上
@@ -4383,8 +4388,9 @@ Expected: 输出 Release URL
 
 给用户：Release 链接 + sha256 + 上面的人工验收清单，并**明确说明**：
 
-- 代理握手已有进程内端到端测试覆盖
-- **SSH 跳板路径没有自动化测试**，两跳、保活、channel 泄漏三项完全依赖实机验收
+- 代理握手已有进程内端到端测试覆盖（三种 SOCKS5 BND 地址类型 + HTTP 407）
+- SSH 跳板有一个进程内两跳测试，**但只钉住「Handle 被持有」这个结构属性**；
+  真实链路上的长时保活、channel 泄漏、多跳链完全依赖实机验收
 - 渲染/不闪/输入法/手感一如既往无法自动验证
 
 - [ ] **Step 9: 收尾**
@@ -4437,3 +4443,106 @@ Run: `superpowers:finishing-a-development-branch`（分支 `feat/p0b-proxy-jump`
 
 §11「留给后续期的问题」三项（P3-a 自动重连的拨号链重放、P2-a 图标/配色接上后
 `preserved_*` 退休、代理口令的分组级共享）本计划**不涉及**，与 spec 一致。
+
+---
+
+## 实现偏差记录
+
+按 Task 编号列出计划与实际代码不一致之处。**计划文档正文不回改**——保留原样是为了让
+下次写计划时能看到哪类描述容易写错。
+
+### Task 1 / Task 4：「先跑测试看它失败」那步在当时跑不出预期的失败
+
+- **计划说**：模块还没挂进 `lib.rs` 时（挂载在后面的 Step），预期 `cargo test -p mullion-store --lib network` 报「编译失败，`cannot find type NetworkPrefs`」。
+- **实际是**：没挂载的模块根本不参与编译，实际输出更可能是「0 个匹配测试」。Task 4 的 `expand_chain` 同一模式。
+- **为什么**：低置信度（最终是整体提交，没留下当时的分步终端输出），但属于「Step 顺序缺陷」这一类，值得记。
+
+### Task 2 / Task 3：Files 清单漏了 app 侧的构造点
+
+- **计划说**：Files 只列 `mullion-store` 内的文件，验证命令只有 `cargo test -p mullion-store`。
+- **实际是**：`SessionRecord`/`SecretEntry` 加必填字段是破坏性改动，实际还要改 `shell/session_map.rs`、`shell/store.rs`、`ui/session_manager.rs`（各补 `network: Default::default()` / `proxy_password: None`）。只跑单 crate 发现不了。
+- **为什么**：计划把验证范围限定在单 crate，实际必须跑 workspace 才能收敛。
+
+### Task 3：schema 升 v3 漏判了对存量数据的破坏性影响（本切片最重要的一处计划错误）
+
+- **计划说**：把 `CURRENT_SCHEMA` 2→3 当成「只改产出侧常量」的收尾动作。
+- **实际是**：`load_sessions` 原有的 `schema_version < CURRENT_SCHEMA` 一律走 `migrate_v1`，升到 3 后会把**真实 v2 文件**也送进只认 v1 扁平结构的 `migrate_v1`——所有 0.1.13/0.1.14 用户升级后打不开会话列表。`9e0495c` 把判断拆成 `<=1` 走 `migrate_v1`、`==2` 直接反序列化，并补回归测试 `open_upgrades_real_v2_file_without_going_through_migrate_v1`（`crates/mullion-store/src/vault.rs`）。
+- **为什么**：不是漏了个别构造点，是计划对升级影响范围的判断本身有事实错误。
+
+### Task 4：测试计数自相矛盾，实现多补两条边界测试
+
+- **计划说**：Step 1 给 11 个测试，Step 6 却预期「8 passed」。
+- **实际是**：`crates/mullion-store/src/jump.rs` 最终 13 个测试，多出 `chain_of_exactly_max_depth_succeeds_with_full_length` 与 `chain_of_max_depth_plus_one_is_rejected`，钉住 `on_stack.len() > MAX_JUMP_DEPTH` 的 off-by-one。
+- **为什么**：8/11 是计划文本的算术错误；两条边界测试是实现阶段主动补的。
+
+### Task 5：计划指定「直接复用」的辅助函数不存在
+
+- **计划说**：「`key()` 与 `draft()` 是 `vault.rs` 的 `mod tests` 里已有的辅助函数，直接复用，不要新造。」
+- **实际是**：改动前只有 `draft_pw(name, pw)`，没有 `draft()`；`draft()` 是 `c17f215` 新增的。
+- **为什么**：`key()` 判断正确，`draft()` 是事实性错误——「已核实的签名」只核实了一半。
+
+### Task 8 / Task 9：漏了中间态的 clippy 问题，多出一个测试
+
+- **计划说**：Step 3 的 `base64_encode` 没有任何 dead-code 标注（生产调用点要到 Task 9 才有）；Task 9 预期「13 passed」。
+- **实际是**：Task 8 提交给 `base64_encode` 加了 `#[allow(dead_code)]`，Task 9 接入后删掉；proxy 模块最终 14 个测试，多出 `http_reply_is_drained_exactly_so_ssh_banner_survives`。
+- **为什么**：项目要求 `clippy -D warnings` 才算绿，Task 8 单独提交时不加 allow 会先炸；那个多出的测试钉的是「响应头之后紧跟的 SSH banner 字节不被多读吞掉」。
+
+### Task 10：计划把一个未被实证的假设当成既定事实
+
+- **计划说**：开篇断言「这是本切片最危险的一处……`Handle` 一 Drop，整条 SSH 连接**立刻**断」，并以此驱动整个类型设计。
+- **实际是**：`crates/mullion-ssh/src/session.rs` 的 `_jumps` 字段注释已改为如实描述——这段来自设计 §5.2，**尚未被本仓库的测试实证**：红队实验把 `dial.rs` 的 `jumps.push(handle)` 换成 `drop(handle)` 后，隧道在 3 秒空闲窗口内依然可用（russh 0.54.5 + 进程内假 sshd）。保活字段仍然保留（成本为零，而真实链路下代价可能极大），注释里明确禁止因为「实验没复现」就删掉它。
+- **为什么**：计划与实现之间认知差距最大的一处。实现没盲目采信，做了实验并如实记录。
+- **附带**：Files 清单漏了 `cli.rs`、`shell/session_map.rs`、`tests/{auth,live,pty}.rs`——`SshConfig` 加非 `Option` 的 `hops` 后所有字面量构造点都要补一行。
+
+### Task 11：新增计划外的错误归因逻辑；删掉计划要求保留的死代码壳
+
+- **计划说**：DNS/TCP 失败直接透传底层 `ConnectError`，没有「这一跳是代理还是跳板」的再包装；明确要求保留 `authenticate(handle, cfg)` 薄壳。
+- **实际是**：`crates/mullion-ssh/src/dial.rs` 新增 `blame_first_hop` 与 `raw_cause`（计划里完全没有），把首跳失败重映射成 `ProxyUnreachable`/`JumpFailed`；`session.rs` 里没有那个薄壳——`establish` 改走 `handshake_and_auth` 后它没了调用方，留着就是死代码，`6b23c48` 直接删了。
+- **为什么**：前者补的是 F6（错误必须点名失败方）在这个场景下的空白；后者是「计划给的代码在 `-D warnings` 下会产生 dead code」。russh API 假设（`channel_open_direct_tcpip`/`connect_stream`/`Channel::into_stream`）本身核实无误，无漂移。
+
+### Task 13：计划安排的一步执行时已是空操作
+
+- **计划说**：在 Task 13 里改 `session_map.rs`，给 `to_ssh_config` 补 `hops: Vec::new()`。
+- **实际是**：`69c9141` 只碰了 `store.rs`；那行在更早的 Task 10（`f5c2172`）就加上了。
+- **为什么**：不是缺陷，但说明计划对「执行到某一步时代码库是什么状态」的假设与实际实现顺序不符。
+
+### Task 14：引用了不存在的测试辅助函数
+
+- **计划说**：新测试用 `record_for_test()` 构造 `SessionRecord`，并强调「不要新造一套构造器」。
+- **实际是**：全仓零命中。实现内联写了 `SessionRecord { .. }` 字面量；既有守护测试用的构造函数其实叫 `buf() -> EditorBuffer`。
+- **为什么**：计划的事实性错误——引用了当时并不存在的函数名。
+
+### Task 16：计划代码块里潜藏一个运行时 bug
+
+- **计划说**：直接 `egui::CollapsingHeader::new(format!("{title}({})", bucket.len()))`，未设 `id_salt`。计划只提醒了紧邻的 `Grid` 要防 id 碰撞，没类推到 `CollapsingHeader`。
+- **实际是**：`crates/mullion-app/src/ui/session_manager.rs` 把这段抽成 `group_header` 并显式 `.id_salt(gid)`——两个分组同名且会话数相同时标题完全一致，会共享同一份展开/收起状态。补了回归测试 `collapsing_header_id_salt_disambiguates_same_titled_groups`，并把这条坑记进 `docs/gui-render-gotchas.md`。
+- **为什么**：计划给的代码能编译，但有一个编译期查不出、跑起来才看得到的 bug。
+
+### Task 17：目标文件写错了
+
+- **计划说**：「Modify: `crates/mullion-app/src/ui/mod.rs`（菜单栏）」。
+- **实际是**：菜单栏在 `crates/mullion-app/src/ui/chrome.rs` 的 `top_menu` 里；文案也从计划的「分组管理…」改成「分组管理器」。
+- **为什么**：计划把 `ui/mod.rs` 的统一入口误当成了菜单栏实现位置。
+
+### Task 18：多补了一个计划没写的 app 侧测试
+
+- **计划说**：Task 18 全部内容只是新建 `crates/mullion-ssh/tests/no_store_dependency.rs`。
+- **实际是**：`d89b6f9` 还在 `crates/mullion-app/src/shell/store.rs` 新增了 `ssh_config_carries_hops_from_configured_jump_chain`，钉住「配了跳板但 `ssh_config_for` 没把它物化进 `cfg.hops`」这种静默直连——此前完全无覆盖。
+- **为什么**：计划没预见到需要这个 app 侧测试。这正是本切片最严重的事故模型，漏了它等于红线没人守。
+
+### Task 19：预期数字错误；实现顺带修了生产代码
+
+- **计划说**：Step 3 预期「6 passed」；全文没出现 `raw_cause`/`blame_first_hop`，隐含假设 `dial.rs` 不用改。
+- **实际是**：实际 5 个测试函数（与 Step 1 代码块里的函数数一致，「6 passed」是算术错误）。生产代码新增 `raw_cause`：写测试时发现真实错误消息会同时出现「检查代理」和「检查 sshd」两句互相矛盾的引导语（内层 `Display` 的引导语被原样拼进外层），`raw_cause` 就是为剥掉内层引导语加的。
+- **为什么**：写测试写出了生产 bug，是这类端到端测试该有的效果。
+
+### Task 19b：`is_alive()` 不存在；「keepalive 周期」在本项目无对应物；测试设计本身检测力不足
+
+- **计划说**：用 `assert!(conn.is_alive(), ...)`，注释称「等待明显超过一次 keepalive 周期」。
+- **实际是**：全仓无 `fn is_alive`，实现按计划自留的退路走了「再开一条 PTY channel 并正常收发」。本项目**没有任何 keepalive 机制**（`russh::client::Config::default()` 的 `keepalive_interval`/`inactivity_timeout` 均为 `None`；F7-F9 排在 P3-a），3 秒是人为选的冗余值，`b728092` 把测试名 `..._survives_keepalive_window` 改成 `..._survives_idle_wait`。
+- **进一步发现（计划完全没预见）**：红队实验把 `dial.rs` 的 `jumps.push(handle)` 换成 `drop(handle)`（「忘记保活」的真实注入点）后，断言 2（隧道到达目标）与断言 3（空闲后仍可用）**依然全绿**——对目标 bug 零检测力，唯一防线是断言 1（`jump_handle_count() == 1`）。原注释却暗示三条都在守护保活，`b728092` 已全部改成如实描述。
+- **为什么**：不只是方法名不存在，而是测试设计对它声称要防的 bug 检测力不足。这与本切片另一处教训（测试复刻生产代码的表达式来断言，改坏了照样全绿）是同一类问题：**注释描述了测试实际没做的事**。
+
+### 未列出的 Task
+
+Task 6、7、12、15、20 与计划逐条一致，未发现有信息量的差异。

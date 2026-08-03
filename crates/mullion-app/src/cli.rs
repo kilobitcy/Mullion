@@ -54,6 +54,7 @@ pub fn parse_args(args: &[String]) -> Result<SshConfig, String> {
         cols: 80,
         rows: 24,
         term: "xterm-256color".to_string(),
+        hops: Vec::new(),
     })
 }
 

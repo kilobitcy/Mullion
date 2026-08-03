@@ -10,11 +10,10 @@ use std::time::Instant;
 use mullion_core::layout::PaneId;
 use mullion_ssh::config::SshConfig;
 use mullion_ssh::known_hosts::HostKeyPolicy;
-use mullion_ssh::session::{ClientHandler, SshSession};
+use mullion_ssh::session::{SshConnection, SshSession};
 use mullion_store::known_hosts::{HostKeyEntry, KnownHostsFile};
 use mullion_term::keymap::{Key, WheelAction};
 use mullion_term::Scroll;
-use russh::client::Handle;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Receiver;
 use winit::application::ApplicationHandler;
@@ -43,7 +42,7 @@ pub enum UserEvent {
     ConnectOk {
         ssh: SshSession,
         rx: Receiver<Vec<u8>>,
-        handle: Arc<Handle<ClientHandler>>,
+        handle: Arc<SshConnection>,
     },
     /// 异步 connect 失败,已格式化的可操作错误(F6 分类由 `session::connect` 内部给)。
     ConnectErr(String),
@@ -1252,8 +1251,11 @@ impl ApplicationHandler<UserEvent> for App {
                                         .collect()
                                 })
                                 .unwrap_or_default();
+                            let groups: &[mullion_store::GroupRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.groups());
                             let frame = crate::ui::UiFrame {
                                 sessions,
+                                groups,
                                 store_available,
                                 connected: self.ws.is_some(),
                                 panes: self.ws.as_ref().map_or(1, Workspace::pane_count),
@@ -1411,6 +1413,30 @@ impl ApplicationHandler<UserEvent> for App {
                         };
                         if let Err(e) = r {
                             self.ui.last_error = Some(format!("保存失败:{e}"));
+                        }
+                    }
+                }
+                // Task 16:分组管理弹窗的 intent 施加点(F60)。`delete_group` 已在
+                // store 层把仍引用该分组的会话 group_id 置 None(vault.rs 的
+                // `delete_group` 文档:「分组是组织手段,不是会话的所有者」)、不删会话,
+                // 所以这里不需要额外处理悬空引用。
+                if let Some(intent) = self.ui.group_intent.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match intent {
+                            crate::ui::group_manager::GroupIntent::Add(name) => {
+                                store.add_group(name);
+                            }
+                            crate::ui::group_manager::GroupIntent::Rename(id, name) => {
+                                store.rename_group(id, name);
+                            }
+                            crate::ui::group_manager::GroupIntent::Delete(id) => {
+                                if let Err(e) = store.delete_group(id) {
+                                    self.ui.last_error = Some(e.to_string());
+                                }
+                            }
+                        }
+                        if let Err(e) = store.save() {
+                            self.ui.last_error = Some(e.to_string());
                         }
                     }
                 }

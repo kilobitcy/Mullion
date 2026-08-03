@@ -28,4 +28,7 @@ pub struct SshConfig {
     pub rows: u16,
     /// TERM 名,固定 "xterm-256color"。
     pub term: String,
+    /// 拨号链(F4/F5)。**空 = 直连**。顺序即拨号顺序:`hops[0]` 最先建立。
+    /// 由 app 从会话配置物化而来;本 crate 不认识「会话」「分组」。
+    pub hops: Vec<crate::hop::Hop>,
 }

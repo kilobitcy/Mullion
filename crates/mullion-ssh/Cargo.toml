@@ -8,3 +8,8 @@ license.workspace = true
 [dependencies]
 russh.workspace = true
 tokio.workspace = true
+
+# 假代理服务器要 accept 连接并读写字节。tokio 的 workspace features
+# 已含 net/io-util/rt-multi-thread/macros,这里只是让 test target 能用上。
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }

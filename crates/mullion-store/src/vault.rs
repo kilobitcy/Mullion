@@ -33,6 +33,7 @@ pub struct SessionDraft {
     pub auth: Auth,
     pub terminal: TerminalPrefs,
     pub appearance: AppearancePrefs,
+    pub network: crate::network::NetworkPrefs,
     /// 敏感部分(密码/口令);无则 None。
     pub secret: Option<SecretEntry>,
 }
@@ -137,6 +138,7 @@ impl Vault {
             auth: draft.auth,
             terminal: draft.terminal,
             appearance: draft.appearance,
+            network: draft.network,
         });
         id
     }
@@ -158,6 +160,7 @@ impl Vault {
         rec.auth = draft.auth;
         rec.terminal = draft.terminal;
         rec.appearance = draft.appearance;
+        rec.network = draft.network;
         rec.modified_at = now_rfc3339.to_string();
         match draft.secret {
             Some(sec) => {
@@ -215,6 +218,7 @@ impl Vault {
             tags: Vec::new(),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
+            network: crate::network::NetworkPrefs::default(),
         });
         id
     }
@@ -256,6 +260,22 @@ impl Vault {
         })
     }
 
+    /// 展开一条会话的完整跳板链(F5)。返回按拨号顺序排列的**跳板会话记录**。
+    ///
+    /// 返回记录而非 id:调用方(app)接下来要拿每一跳的 host/user/认证去物化 `Hop`,
+    /// 让它再查一遍索引没有意义。
+    pub fn expand_jump_chain(&self, id: SessionId) -> Result<Vec<SessionRecord>, StoreError> {
+        let sessions: std::collections::BTreeMap<SessionId, SessionRecord> =
+            self.list().iter().map(|r| (r.id, r.clone())).collect();
+        let groups: std::collections::BTreeMap<crate::model::GroupId, crate::group::GroupRecord> =
+            self.groups().iter().map(|g| (g.id, g.clone())).collect();
+        if !sessions.contains_key(&id) {
+            return Err(StoreError::NotFound(id));
+        }
+        let ids = crate::jump::expand_chain(id, &sessions, &groups)?;
+        Ok(ids.into_iter().map(|i| sessions[&i].clone()).collect())
+    }
+
     #[cfg(test)]
     pub(crate) fn secrets_keys_for_test(&self) -> Vec<String> {
         self.secrets.keys().cloned().collect()
@@ -278,16 +298,24 @@ fn load_sessions(
         return Err(StoreError::UnsupportedSchema(probe.schema_version));
     }
     if probe.schema_version < CURRENT_SCHEMA {
-        // 迁移前留备份:这是唯一会改写用户既有数据的地方。
-        // 备份必须在 migrate_v1 之前做 —— 迁移失败时用户手里
-        // 还得有一份原始数据。
+        // 升级前留备份:这是唯一会改写用户既有数据的地方。
+        // 备份必须在解析/迁移之前做 —— 失败时用户手里还得有一份原始数据。
         // 会覆盖用户目录里可能已存在的旧 .bak(上次迁移失败重试留下的);
-        // 刻意接受,因为两者同源于当前这份 v1 文件,覆盖是幂等的。
+        // 刻意接受,因为两者同源于当前这份文件,覆盖是幂等的。
         fs::copy(sessions_path, sessions_path.with_extension("toml.bak"))?;
-        // migrate_v1 已产出语义正确的 StoreError::Migration,直接 `?` 透传,
-        // 不再在这里额外包一层 —— 避免文案被二次格式化后自相矛盾。
-        let file = migrate_v1(&text)?;
-        Ok((file.group, file.session, true))
+        if probe.schema_version <= 1 {
+            // 真 v1:扁平结构,必须先经 migrate_v1 转成分节结构。
+            // migrate_v1 已产出语义正确的 StoreError::Migration,直接 `?` 透传,
+            // 不再在这里额外包一层 —— 避免文案被二次格式化后自相矛盾。
+            let file = migrate_v1(&text)?;
+            Ok((file.group, file.session, true))
+        } else {
+            // v2:结构已经和当前一致(分节嵌套),只是版本号落后 ——
+            // 新分节(如 network)全带 serde(default) 能直接补齐,
+            // 绝不能走 migrate_v1(它只认 v1 的扁平结构,喂 v2 会解析失败)。
+            let file: SessionsFile = toml::from_str(&text)?;
+            Ok((file.group, file.session, true))
+        }
     } else {
         let file: SessionsFile = toml::from_str(&text)?;
         Ok((file.group, file.session, false))
@@ -335,9 +363,11 @@ mod tests {
             },
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
+            network: crate::network::NetworkPrefs::default(),
             secret: Some(SecretEntry {
                 password: Some(pw.into()),
                 passphrase: None,
+                proxy_password: None,
             }),
         }
     }
@@ -504,7 +534,63 @@ kind = "password"
         assert!(bak.contains("name = \"old\""), "备份应是原始 v1 内容");
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 2"), "磁盘上应已是 v2");
+        assert!(now.contains("schema_version = 3"), "磁盘上应已是 v3");
+    }
+
+    /// 真实 v2(已是分节嵌套结构,非 v1 扁平结构)的 `sessions.toml`。
+    /// `schema_version = 2` 但结构已经和当前一致,只是缺 `[session.network]`。
+    const V2_ON_DISK: &str = r#"
+schema_version = 2
+
+[[session]]
+id = 1
+modified_at = "2026-07-25T00:00:00Z"
+
+[session.identity]
+name = "v2sess"
+
+[session.connection]
+host = "192.0.2.20"
+port = 2222
+protocol = "ssh"
+
+[session.auth]
+user = "u2"
+kind = "password"
+"#;
+
+    /// v2 结构已经是嵌套分节,不是 v1 的扁平结构——不能走 `migrate_v1`
+    /// (它只认扁平结构,喂给它会因缺 `name`/`host` 等顶层字段而解析失败)。
+    /// 升级到 v3 后,`schema_version == 2` 的真实文件必须仍能被
+    /// `Vault::open` 直接读出来,只是版本号被带到 CURRENT_SCHEMA。
+    #[test]
+    fn open_upgrades_real_v2_file_without_going_through_migrate_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sessions.toml"), V2_ON_DISK).unwrap();
+
+        let vault = Vault::open(dir.path().to_path_buf(), &key())
+            .expect("真实 v2 文件必须能被 Vault::open 直接读出来,不能报错");
+
+        assert_eq!(vault.list().len(), 1, "v2 会话不能丢");
+        let s = &vault.list()[0];
+        assert_eq!(s.identity.name, "v2sess");
+        assert_eq!(s.connection.host, "192.0.2.20");
+        assert_eq!(s.connection.port, 2222);
+        assert_eq!(s.auth.user, "u2");
+
+        assert!(
+            dir.path().join("sessions.toml.bak").exists(),
+            "升级前必须留备份"
+        );
+        let bak = std::fs::read_to_string(dir.path().join("sessions.toml.bak")).unwrap();
+        assert!(bak.contains("name = \"v2sess\""), "备份应是原始 v2 内容");
+        assert!(
+            bak.contains("schema_version = 2"),
+            "备份应是升级前的原文,而非已升级的内容"
+        );
+
+        let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
+        assert!(now.contains("schema_version = 3"), "磁盘上应已升到 v3");
     }
 
     #[test]
@@ -616,6 +702,72 @@ kind = "password"
         let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
         assert_eq!(v.groups().len(), 1);
         assert_eq!(v.groups()[0].terminal.scrollback, Some(1234));
+    }
+
+    /// 最小合法 draft:不带密钥、不分组。计划文档假定本文件已有同名辅助函数,
+    /// 实际只有 `draft_pw`;这里补上,风格与 `draft_pw` 保持一致。
+    fn draft() -> SessionDraft {
+        SessionDraft {
+            identity: Identity {
+                name: "a".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: "h".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "u".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: TerminalPrefs::default(),
+            appearance: AppearancePrefs::default(),
+            network: crate::network::NetworkPrefs::default(),
+            secret: None,
+        }
+    }
+
+    #[test]
+    fn resolve_for_carries_network_from_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let gid = v.add_group("生产".into());
+        v.group_mut(gid).unwrap().network = crate::network::NetworkPrefs {
+            proxy: Some(crate::network::ProxyChoice::Socks5(
+                crate::network::ProxyEndpoint {
+                    host: "127.0.0.1".into(),
+                    port: 7891,
+                    user: None,
+                },
+            )),
+            jump: None,
+        };
+        let mut d = draft();
+        d.identity.group_id = Some(gid);
+        let id = v.add(d, "2026-07-31T00:00:00Z");
+
+        let got = v.resolve_for(id).unwrap();
+        assert!(
+            matches!(got.proxy, Some(crate::network::ProxyChoice::Socks5(_))),
+            "分组代理应经 resolve_for 透出"
+        );
+    }
+
+    #[test]
+    fn expand_jump_chain_reports_dangling_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let mut d = draft();
+        d.network = crate::network::NetworkPrefs {
+            proxy: None,
+            jump: Some(vec![crate::network::JumpRef(SessionId(999))]),
+        };
+        let id = v.add(d, "2026-07-31T00:00:00Z");
+        let err = v.expand_jump_chain(id).unwrap_err();
+        assert!(matches!(err, StoreError::JumpDangling(SessionId(999))));
     }
 
     #[test]

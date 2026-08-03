@@ -28,6 +28,13 @@ pub enum StoreError {
     UnsupportedSchema(u32),
     /// v1 → v2 迁移失败(结构不兼容,非语法问题)。
     Migration(String),
+    /// 跳板链存在环(F5)。带上参与环的会话 id 便于定位。
+    JumpCycle(SessionId),
+    /// 跳板链超过 `jump::MAX_JUMP_DEPTH`。
+    JumpTooDeep(SessionId),
+    /// 跳板引用了不存在的会话。**不静默降级为直连**:那会让用户
+    /// 以为流量过了堡垒机而实际没有 —— 这是安全属性,必须硬失败。
+    JumpDangling(SessionId),
 }
 
 impl fmt::Display for StoreError {
@@ -49,6 +56,18 @@ impl fmt::Display for StoreError {
                 "会话文件的 schema 版本 {v} 高于本客户端支持的上限 —— 请升级 Mullion"
             ),
             StoreError::Migration(e) => write!(f, "会话文件迁移失败:{e}"),
+            StoreError::JumpCycle(id) => {
+                write!(f, "跳板链存在环,经过会话 {id:?} —— 检查该会话的跳板设置")
+            }
+            StoreError::JumpTooDeep(id) => write!(
+                f,
+                "跳板链过深(上限 {}),从会话 {id:?} 展开 —— 检查是否配错",
+                crate::jump::MAX_JUMP_DEPTH
+            ),
+            StoreError::JumpDangling(id) => write!(
+                f,
+                "跳板指向的会话 {id:?} 不存在 —— 它可能已被删除,请重新指定跳板"
+            ),
         }
     }
 }

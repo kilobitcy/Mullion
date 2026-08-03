@@ -219,6 +219,20 @@
   被"什么都不做"地关掉;粘贴确认这类「取消 = 不做事」的弹窗才该接,因为取消本身就是安全默认。
   另:`ScrollArea` 放进弹窗要给 `id_salt`(egui 0.30 已把 `id_source` 改名),否则同一帧里多个
   滚动区会撞 id。守护:`ui::paste::tests`(纯函数部分)+ 人工验收「Esc / 点背景都能取消」。
+- **循环里渲染 `CollapsingHeader` 用动态标题当 id,同标题的两个实例会共享展开状态(F60)。**
+  `CollapsingHeader::new(text)` 默认把 `text` 本身当 id 源(`egui-0.30.0/src/containers/
+  collapsing_header.rs::new`:`id_salt = Id::new(text.text())`)。会话列表按分组折叠、循环里
+  给每个桶建一个 header,若两个分组恰好同名**且**当前展示的会话数也相同(标题因此完全一致,
+  如两个都叫「生产(1)」),`ui.make_persistent_id` 算出同一个 `Id`,两个 header 就共享同一份
+  `CollapsingState`——编译不报错,点开其中一个,另一个下一帧跟着展开/收起。这是
+  `ScrollArea`/上一条同类坑的变体:**任何在循环里用「内容拼出来的字符串」当 egui 部件默认
+  id 源的写法都有此风险**,不限于 `CollapsingHeader`。**规则**:循环体内建的部件,只要标题/
+  文案可能重复,一律显式 `.id_salt(稳定主键)`(优先用领域 id 如 `GroupId`,而不是文本或数组
+  下标——下标在增删排序后会错位指向别的项)。**守护**:
+  `session_manager::tests::collapsing_header_id_salt_disambiguates_same_titled_groups`——
+  该测试直接调用 `show()` 内部实际使用的 `group_header` 函数(不是重抄一遍表达式),删掉
+  `.id_salt(gid)` 这一行测试立即变红(已实测)。无头容器里这条能测,因为撞的是 egui 的
+  `Id` 值本身(可用 `header_response.id` 读出来比较),不需要真的截图或判断像素。
 
 ## 字体
 

@@ -3,6 +3,9 @@
 //! 架构不变量:本 crate 不依赖 core/term/app。
 
 pub mod config;
+pub mod dial;
 pub mod error;
+pub mod hop;
 pub mod known_hosts;
+pub mod proxy;
 pub mod session;

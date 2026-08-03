@@ -26,6 +26,14 @@ pub enum ConnectError {
     Io(String),
     /// 开 channel / request_pty 失败。
     PtyRequest,
+    /// 连不上代理本身(F4)。区别于「连上了代理但代理连不上目标」。
+    ProxyUnreachable { proxy: String, cause: String },
+    /// 代理拒绝了我们的认证凭据(F4)。
+    ProxyAuthFailed { proxy: String },
+    /// 代理接受了连接,但拒绝转发到目标(F4)。
+    ProxyRejected { proxy: String, reason: String },
+    /// 跳板链上某一跳失败(F5)。`hop` 是 "host:port"。
+    JumpFailed { hop: String, cause: String },
 }
 
 /// 把 TCP 连接阶段的 io 错误分类到精确变体(F6)。
@@ -63,6 +71,20 @@ impl fmt::Display for ConnectError {
             }
             ConnectError::Io(e) => write!(f, "网络 IO 错误:{e}"),
             ConnectError::PtyRequest => write!(f, "开 PTY 失败 —— 对端可能不允许 PTY"),
+            ConnectError::ProxyUnreachable { proxy, cause } => write!(
+                f,
+                "连不上代理 {proxy}:{cause} —— 检查代理是否在跑/地址端口是否写对"
+            ),
+            ConnectError::ProxyAuthFailed { proxy } => {
+                write!(f, "代理 {proxy} 认证失败 —— 检查代理的用户名/口令")
+            }
+            ConnectError::ProxyRejected { proxy, reason } => write!(
+                f,
+                "代理 {proxy} 拒绝转发到目标:{reason} —— 目标地址可能不可达或被代理策略禁止"
+            ),
+            ConnectError::JumpFailed { hop, cause } => {
+                write!(f, "跳板 {hop} 连接失败:{cause} —— 先单独连一下这台跳板")
+            }
         }
     }
 }
@@ -102,6 +124,21 @@ mod tests {
             },
             ConnectError::Io("io".into()),
             ConnectError::PtyRequest,
+            ConnectError::ProxyUnreachable {
+                proxy: "127.0.0.1:7891".into(),
+                cause: "connection refused".into(),
+            },
+            ConnectError::ProxyAuthFailed {
+                proxy: "127.0.0.1:7891".into(),
+            },
+            ConnectError::ProxyRejected {
+                proxy: "127.0.0.1:7891".into(),
+                reason: "host unreachable".into(),
+            },
+            ConnectError::JumpFailed {
+                hop: "bastion:22".into(),
+                cause: "认证失败".into(),
+            },
         ];
         let msgs: Vec<String> = variants.iter().map(|e| e.to_string()).collect();
         for m in &msgs {
@@ -111,5 +148,30 @@ mod tests {
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), msgs.len(), "错误消息必须两两不同(F6)");
+    }
+
+    /// F6 的延伸:代理失败和目标失败必须能一眼分开,否则用户会去查目标主机的
+    /// sshd 而问题其实在本机代理上。
+    #[test]
+    fn proxy_errors_name_the_proxy_not_the_target() {
+        let e = ConnectError::ProxyUnreachable {
+            proxy: "127.0.0.1:7891".into(),
+            cause: "refused".into(),
+        }
+        .to_string();
+        assert!(e.contains("127.0.0.1:7891"), "消息里必须点名代理: {e}");
+        assert!(e.contains("代理"), "消息里必须说明这是代理侧失败: {e}");
+    }
+
+    /// 跳板失败要说清是**哪一跳**——五跳链路里不说明等于没说。
+    #[test]
+    fn jump_error_names_the_failing_hop() {
+        let e = ConnectError::JumpFailed {
+            hop: "bastion:22".into(),
+            cause: "认证失败".into(),
+        }
+        .to_string();
+        assert!(e.contains("bastion:22"), "必须点名失败的那一跳: {e}");
+        assert!(e.contains("认证失败"), "必须带上根因: {e}");
     }
 }

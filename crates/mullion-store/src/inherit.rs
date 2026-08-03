@@ -4,6 +4,7 @@
 //! `resolve_merge_list` 内部负责反转,以产出「上游在前」的结果顺序。
 
 use crate::model::{AppearancePrefs, TerminalPrefs};
+use crate::network::{NetworkPrefs, ProxyChoice};
 
 /// 滚动回溯的内置默认(F17,spec 写的 10000)。
 pub const DEFAULT_SCROLLBACK: u32 = 10_000;
@@ -40,6 +41,7 @@ pub trait PrefsLayer {
     fn tags(&self) -> &[String];
     fn terminal(&self) -> &TerminalPrefs;
     fn appearance(&self) -> &AppearancePrefs;
+    fn network(&self) -> &NetworkPrefs;
 }
 
 impl PrefsLayer for crate::model::SessionRecord {
@@ -51,6 +53,9 @@ impl PrefsLayer for crate::model::SessionRecord {
     }
     fn appearance(&self) -> &AppearancePrefs {
         &self.appearance
+    }
+    fn network(&self) -> &NetworkPrefs {
+        &self.network
     }
 }
 
@@ -64,6 +69,9 @@ impl PrefsLayer for crate::group::GroupRecord {
     fn appearance(&self) -> &AppearancePrefs {
         &self.appearance
     }
+    fn network(&self) -> &NetworkPrefs {
+        &self.network
+    }
 }
 
 /// 继承解析后的最终配置。
@@ -76,6 +84,10 @@ pub struct ResolvedConfig {
     pub tags: Vec<String>,
     pub icon: Option<crate::model::IconSpec>,
     pub color: Option<crate::model::ColorSpec>,
+    /// 解析后的代理。`None` = 全链路都没设 → 直连;`Some(Direct)` 亦为直连。
+    pub proxy: Option<ProxyChoice>,
+    /// 解析后的跳板链。空 = 直连。
+    pub jump: Vec<crate::network::JumpRef>,
 }
 
 /// 沿 `layers`(优先级从高到低)解析出最终配置。
@@ -110,6 +122,17 @@ pub fn resolve(layers: &[&dyn PrefsLayer]) -> ResolvedConfig {
                 .map(|l| l.appearance().color.clone().map(Some)),
             None,
         ),
+        // 与 icon/color 同理:`.map(Some)` 让「本层未设」贡献 0 个元素、继续看下一层,
+        // 而「本层显式设为 Direct / 空链」贡献一个 Some(...) 从而整体覆盖上游。
+        proxy: resolve_override(
+            layers.iter().map(|l| l.network().proxy.clone().map(Some)),
+            None,
+        ),
+        jump: resolve_override(
+            layers.iter().map(|l| l.network().jump.clone().map(Some)),
+            None,
+        )
+        .unwrap_or_default(),
     }
 }
 
@@ -121,11 +144,21 @@ mod tests {
         AppearancePrefs, Auth, AuthKind, ColorSpec, ColorTarget, Connection, GroupId, IconKind,
         IconSpec, Identity, Protocol, SessionId, SessionRecord, TerminalPrefs,
     };
+    use crate::network::{NetworkPrefs, ProxyChoice, ProxyEndpoint};
 
     fn session(
         tags: Vec<String>,
         terminal: TerminalPrefs,
         appearance: AppearancePrefs,
+    ) -> SessionRecord {
+        session_with_network(tags, terminal, appearance, NetworkPrefs::default())
+    }
+
+    fn session_with_network(
+        tags: Vec<String>,
+        terminal: TerminalPrefs,
+        appearance: AppearancePrefs,
+        network: NetworkPrefs,
     ) -> SessionRecord {
         SessionRecord {
             id: SessionId(1),
@@ -147,6 +180,7 @@ mod tests {
             },
             terminal,
             appearance,
+            network,
         }
     }
 
@@ -155,12 +189,22 @@ mod tests {
         terminal: TerminalPrefs,
         appearance: AppearancePrefs,
     ) -> GroupRecord {
+        group_with_network(tags, terminal, appearance, NetworkPrefs::default())
+    }
+
+    fn group_with_network(
+        tags: Vec<String>,
+        terminal: TerminalPrefs,
+        appearance: AppearancePrefs,
+        network: NetworkPrefs,
+    ) -> GroupRecord {
         GroupRecord {
             id: GroupId(1),
             name: "g".into(),
             tags,
             terminal,
             appearance,
+            network,
         }
     }
 
@@ -302,5 +346,115 @@ mod tests {
             vec!["b".to_string(), "a".to_string()],
             "层内顺序不排序"
         );
+    }
+
+    fn socks(port: u16) -> ProxyChoice {
+        ProxyChoice::Socks5(ProxyEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+            user: None,
+        })
+    }
+
+    #[test]
+    fn network_inherits_proxy_from_group() {
+        let s = session(vec![], TerminalPrefs::default(), AppearancePrefs::default());
+        let g = group_with_network(
+            vec![],
+            TerminalPrefs::default(),
+            AppearancePrefs::default(),
+            NetworkPrefs {
+                proxy: Some(socks(7891)),
+                jump: None,
+            },
+        );
+        let got = resolve(&[&s, &g]);
+        assert_eq!(got.proxy, Some(socks(7891)), "会话未设代理时应取分组的");
+    }
+
+    /// 设计 §3.2:显式 `Direct` 必须**覆盖**分组代理,而不是被当成「未设」继续继承。
+    #[test]
+    fn explicit_direct_overrides_group_proxy_instead_of_inheriting() {
+        let s = session_with_network(
+            vec![],
+            TerminalPrefs::default(),
+            AppearancePrefs::default(),
+            NetworkPrefs {
+                proxy: Some(ProxyChoice::Direct),
+                jump: None,
+            },
+        );
+        let g = group_with_network(
+            vec![],
+            TerminalPrefs::default(),
+            AppearancePrefs::default(),
+            NetworkPrefs {
+                proxy: Some(socks(7891)),
+                jump: None,
+            },
+        );
+        let got = resolve(&[&s, &g]);
+        assert_eq!(
+            got.proxy,
+            Some(ProxyChoice::Direct),
+            "会话显式直连必须胜出,绝不能回落到分组代理"
+        );
+    }
+
+    /// 跳板链是**复合对象**,走 Override 整体覆盖,不做 Merge 列表拼接(设计 §4.1)。
+    #[test]
+    fn jump_chain_is_overridden_wholesale_never_concatenated() {
+        let s = session_with_network(
+            vec![],
+            TerminalPrefs::default(),
+            AppearancePrefs::default(),
+            NetworkPrefs {
+                proxy: None,
+                jump: Some(vec![crate::network::JumpRef(SessionId(9))]),
+            },
+        );
+        let g = group_with_network(
+            vec![],
+            TerminalPrefs::default(),
+            AppearancePrefs::default(),
+            NetworkPrefs {
+                proxy: None,
+                jump: Some(vec![
+                    crate::network::JumpRef(SessionId(1)),
+                    crate::network::JumpRef(SessionId(2)),
+                ]),
+            },
+        );
+        let got = resolve(&[&s, &g]);
+        assert_eq!(
+            got.jump,
+            vec![crate::network::JumpRef(SessionId(9))],
+            "会话的链整体胜出,不得与分组的链拼接"
+        );
+    }
+
+    /// 显式空链同样是覆盖:分组配了跳板,会话说「我直连」。
+    #[test]
+    fn explicit_empty_jump_chain_overrides_group_chain() {
+        let s = session_with_network(
+            vec![],
+            TerminalPrefs::default(),
+            AppearancePrefs::default(),
+            NetworkPrefs {
+                proxy: None,
+                jump: Some(Vec::new()),
+            },
+        );
+        let g = group_with_network(
+            vec![],
+            TerminalPrefs::default(),
+            AppearancePrefs::default(),
+            NetworkPrefs {
+                proxy: None,
+                jump: Some(vec![crate::network::JumpRef(SessionId(1))]),
+            },
+        );
+        let got = resolve(&[&s, &g]);
+        assert!(got.jump.is_empty(), "会话显式空链必须覆盖分组的跳板链");
     }
 }

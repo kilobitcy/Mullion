@@ -5,10 +5,12 @@ pub mod crypto;
 pub mod error;
 pub mod group;
 pub mod inherit;
+pub mod jump;
 pub mod known_hosts;
 pub mod master_key;
 pub mod migrate;
 pub mod model;
+pub mod network;
 pub mod vault;
 
 pub use error::StoreError;
@@ -21,4 +23,5 @@ pub use model::{
     AppearancePrefs, Auth, AuthKind, ColorSpec, ColorTarget, Connection, GroupId, IconKind,
     IconSpec, Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
+pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
 pub use vault::{SessionDraft, Vault};

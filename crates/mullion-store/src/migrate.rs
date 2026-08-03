@@ -74,6 +74,7 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
             },
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
+            network: crate::network::NetworkPrefs::default(),
         })
         .collect();
     Ok(SessionsFile {
@@ -164,5 +165,43 @@ has_passphrase = false
         let out = migrate_v1("").unwrap();
         assert!(out.session.is_empty());
         assert_eq!(out.schema_version, CURRENT_SCHEMA);
+    }
+
+    /// v2 文件不含 network 分节,新字段全带 `#[serde(default)]`,应能直接读成 v3 结构。
+    #[test]
+    fn v2_file_reads_into_current_structs_without_network_section() {
+        let text = r#"
+schema_version = 2
+
+[[session]]
+id = 1
+modified_at = "t"
+
+[session.identity]
+name = "a"
+
+[session.connection]
+host = "h"
+port = 22
+protocol = "ssh"
+
+[session.auth]
+user = "u"
+kind = "password"
+"#;
+        let file: crate::model::SessionsFile = toml::from_str(text).unwrap();
+        assert_eq!(file.session.len(), 1);
+        assert_eq!(
+            file.session[0].network,
+            crate::network::NetworkPrefs::default(),
+            "缺 network 分节应落默认(全继承)"
+        );
+    }
+
+    /// 升 v3 的真正理由不是迁移,而是让 v0.1.14 那样的旧客户端**明确拒绝**——
+    /// 否则旧客户端读到 `[session.network]` 会静默丢弃再写回,用户的代理配置无声消失。
+    #[test]
+    fn current_schema_is_three() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 3);
     }
 }

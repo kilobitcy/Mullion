@@ -81,11 +81,62 @@ impl SessionStore {
         self.vault.save()
     }
 
+    pub fn groups(&self) -> &[mullion_store::GroupRecord] {
+        self.vault.groups()
+    }
+
+    pub fn add_group(&mut self, name: String) -> mullion_store::GroupId {
+        self.vault.add_group(name)
+    }
+
+    pub fn rename_group(&mut self, id: mullion_store::GroupId, name: String) -> bool {
+        match self.vault.group_mut(id) {
+            Some(g) => {
+                g.name = name;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 设置分组代理(F4)。分组只持有可继承字段,代理正是其中之一。
+    pub fn set_group_proxy(
+        &mut self,
+        id: mullion_store::GroupId,
+        proxy: Option<mullion_store::ProxyChoice>,
+    ) {
+        if let Some(g) = self.vault.group_mut(id) {
+            g.network.proxy = proxy;
+        }
+    }
+
+    pub fn delete_group(&mut self, id: mullion_store::GroupId) -> Result<(), StoreError> {
+        self.vault.delete_group(id)
+    }
+
+    /// 解析后的配置(含继承来的代理/跳板)。
+    pub fn resolved(&self, id: SessionId) -> Result<mullion_store::ResolvedConfig, StoreError> {
+        self.vault.resolve_for(id)
+    }
+
     /// 取会话 → 用其(已解密的)secret 组 SshConfig(双击连接用)。
+    ///
+    /// 拨号链在这里物化:代理来自继承解析,跳板来自引用图展开。
+    /// 跳板悬空/成环会在此**硬失败**——静默直连会让用户以为流量过了堡垒机(设计 §6)。
     pub fn ssh_config_for(&self, id: SessionId) -> Result<SshConfig, StoreOpenError> {
         let rec = self.vault.get(id).ok_or(StoreOpenError::NotFound(id))?;
         let secret = self.vault.secret(id);
-        Ok(to_ssh_config(rec, secret)?)
+        let mut cfg = to_ssh_config(rec, secret)?;
+
+        let resolved = self.vault.resolve_for(id)?;
+        let jumps = self.vault.expand_jump_chain(id)?;
+        cfg.hops = super::dial_plan::build_hops_with_proxy_secret(
+            resolved.proxy.as_ref(),
+            &jumps,
+            &|jid| self.vault.secret(jid).cloned(),
+            secret,
+        );
+        Ok(cfg)
     }
 }
 
@@ -116,9 +167,11 @@ mod tests {
             },
             terminal: Default::default(),
             appearance: Default::default(),
+            network: Default::default(),
             secret: Some(SecretEntry {
                 password: Some("pw".into()),
                 passphrase: None,
+                proxy_password: None,
             }),
         }
     }
@@ -142,5 +195,96 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
         assert!(store.ssh_config_for(mullion_store::SessionId(999)).is_err());
+    }
+
+    #[test]
+    fn group_crud_is_reachable_from_app_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+        let gid = store.add_group("生产".into());
+        assert_eq!(store.groups().len(), 1);
+        assert_eq!(store.groups()[0].name, "生产");
+        store.delete_group(gid).unwrap();
+        assert!(store.groups().is_empty());
+    }
+
+    /// 会话经分组继承来的代理,必须一路落到 `SshConfig.hops`。
+    #[test]
+    fn ssh_config_carries_hops_from_inherited_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+        let gid = store.add_group("生产".into());
+        store.set_group_proxy(
+            gid,
+            Some(mullion_store::ProxyChoice::Socks5(
+                mullion_store::ProxyEndpoint {
+                    host: "127.0.0.1".into(),
+                    port: 7891,
+                    user: None,
+                },
+            )),
+        );
+        let mut d = draft();
+        d.identity.group_id = Some(gid);
+        let id = store.add(d, "2026-07-31T00:00:00Z");
+
+        let cfg = store.ssh_config_for(id).unwrap();
+        assert_eq!(cfg.hops.len(), 1, "继承来的代理应成为一跳");
+        assert!(matches!(cfg.hops[0], mullion_ssh::hop::Hop::Socks5 { .. }));
+    }
+
+    /// 配了跳板的会话,`ssh_config_for` 产出的拨号链必须真的带上跳板——这是本切片
+    /// 最严重的事故模型(用户以为流量过了堡垒机,实际直连目标)的兜底。
+    /// `ssh_config_carries_hops_from_inherited_proxy` 只覆盖了「代理继承」这条路径,
+    /// 跳板走的是另一条(`expand_jump_chain` + `jump_auth`),两条路径都要被
+    /// `ssh_config_for` 这个唯一生产入口正确覆盖,缺一不可。
+    #[test]
+    fn ssh_config_carries_hops_from_configured_jump_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+
+        let mut bastion = draft();
+        bastion.identity.name = "bastion".into();
+        bastion.connection.host = "203.0.113.1".into();
+        let bastion_id = store.add(bastion, "2026-07-31T00:00:00Z");
+
+        let mut d = draft();
+        d.network = mullion_store::NetworkPrefs {
+            proxy: None,
+            jump: Some(vec![mullion_store::JumpRef(bastion_id)]),
+        };
+        let id = store.add(d, "2026-07-31T00:00:00Z");
+
+        let cfg = store.ssh_config_for(id).unwrap();
+        assert_eq!(
+            cfg.hops.len(),
+            1,
+            "配置了跳板就必须体现在拨号链里,绝不能静默直连"
+        );
+        match &cfg.hops[0] {
+            mullion_ssh::hop::Hop::SshJump { host, .. } => assert_eq!(host, "203.0.113.1"),
+            other => panic!("跳板应物化成 SshJump,实际: {other:?}"),
+        }
+    }
+
+    /// 跳板悬空必须硬失败,不许静默直连(安全属性,设计 §6)。
+    #[test]
+    fn dangling_jump_makes_connect_fail_instead_of_going_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+        let mut d = draft();
+        d.network = mullion_store::NetworkPrefs {
+            proxy: None,
+            jump: Some(vec![mullion_store::JumpRef(mullion_store::SessionId(999))]),
+        };
+        let id = store.add(d, "2026-07-31T00:00:00Z");
+        assert!(
+            store.ssh_config_for(id).is_err(),
+            "悬空跳板必须报错,绝不能悄悄直连"
+        );
     }
 }

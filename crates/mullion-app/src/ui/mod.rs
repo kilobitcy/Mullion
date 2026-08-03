@@ -1,5 +1,6 @@
 //! egui UI 构建,与 app 事件循环解耦。build_ui 每帧在 egui ctx.run 闭包里调。
 pub mod chrome;
+pub mod group_manager;
 pub mod host_key;
 pub mod pane_title;
 pub mod paste;
@@ -8,7 +9,7 @@ pub mod toolbar;
 
 use std::sync::Arc;
 
-use mullion_store::{SessionId, SessionRecord};
+use mullion_store::{GroupRecord, SessionId, SessionRecord};
 
 /// 给 egui 挂上系统 CJK 字体作回退。egui 只内嵌拉丁字体,中文菜单/状态栏否则
 /// 全渲染成 tofu 方框。按存在顺序取第一个系统字体(Windows 一等公民);非 Windows
@@ -90,6 +91,15 @@ pub struct UiState {
     /// 「分屏 → 显示/隐藏 pane 标题条」被点了(F83)。app.rs 消费后复位,
     /// 翻转 `Workspace::title_bars` 并重算几何(会改行数 → 必发 window_change)。
     pub toggle_title_bars: bool,
+
+    // --- Task 16:分组管理弹窗(F60)。与会话管理弹窗同构:只写意图,
+    // app.rs 在借用释放后统一施加。---
+    /// 分组管理弹窗是否展示。
+    pub group_manager_open: bool,
+    /// 「新建分组」输入框的跨帧缓冲。
+    pub group_name_buf: String,
+    /// 分组管理弹窗里点了新建/改名/删除 → app 事后据此调 `store` 对应方法。
+    pub group_intent: Option<crate::ui::group_manager::GroupIntent>,
 }
 
 /// 一帧 UI 的全部输入。聚成结构体是为了让新增 UI 元素(F82 工具栏、F83 标题条)
@@ -103,6 +113,8 @@ pub struct UiState {
 #[derive(Clone, Copy)]
 pub struct UiFrame<'a> {
     pub sessions: &'a [SessionRecord],
+    /// 分组列表(F60)。列表分组折叠 + 编辑器分组下拉都读这个。store 不可用时传 `&[]`。
+    pub groups: &'a [GroupRecord],
     pub store_available: bool,
     pub connected: bool,
     /// 状态栏左栏的屏数。必须来自 `Workspace::pane_count()`。
@@ -172,7 +184,16 @@ pub fn build_ui(
         ui_state.about_open = open;
     }
     if ui_state.session_manager_open || ui_state.editor_open {
-        session_manager::show(ctx, ui_state, frame.sessions, frame.store_available);
+        session_manager::show(
+            ctx,
+            ui_state,
+            frame.sessions,
+            frame.groups,
+            frame.store_available,
+        );
+    }
+    if ui_state.group_manager_open {
+        group_manager::show(ctx, ui_state, frame.groups);
     }
     // 中央区剩余像素:available_rect 是 point,× pixels_per_point 换像素。
     // 必须在菜单栏和状态栏两个 TopBottomPanel 都 show 完之后取,拿到的才是
@@ -202,6 +223,7 @@ mod tests {
     fn base_frame() -> UiFrame<'static> {
         UiFrame {
             sessions: &[],
+            groups: &[],
             store_available: false,
             connected: true,
             panes: 1,

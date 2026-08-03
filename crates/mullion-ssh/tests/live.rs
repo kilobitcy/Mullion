@@ -23,6 +23,7 @@ fn base(auth: AuthMethod) -> SshConfig {
         cols: 80,
         rows: 24,
         term: "xterm-256color".into(),
+        hops: Vec::new(),
     }
 }
 

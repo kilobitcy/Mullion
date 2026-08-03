@@ -17,6 +17,8 @@ pub struct GroupRecord {
     pub terminal: TerminalPrefs,
     #[serde(default)]
     pub appearance: AppearancePrefs,
+    #[serde(default)]
+    pub network: crate::network::NetworkPrefs,
 }
 
 #[cfg(test)]
@@ -40,6 +42,7 @@ mod tests {
                     apply_to: vec![ColorTarget::Tab],
                 }),
             },
+            network: crate::network::NetworkPrefs::default(),
         };
         let s = toml::to_string_pretty(&g).unwrap();
         let back: GroupRecord = toml::from_str(&s).unwrap();

@@ -70,15 +70,41 @@ pub struct SessionRecord {
     pub terminal: TerminalPrefs,
     #[serde(default)]
     pub appearance: AppearancePrefs,
+    #[serde(default)]
+    pub network: crate::network::NetworkPrefs,
 }
 
 /// 一条会话的**敏感**部分,加密后存 secrets.enc。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **不 derive Debug**:三个字段全是明文口令,`{:?}` 一打就把它们写进日志/panic
+/// 消息,加密存储的意义当场归零。手写打码实现(与 `mullion_ssh::hop` 同一模式),
+/// 只报告「有没有设置」,连长度都不泄漏。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretEntry {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub passphrase: Option<String>,
+    /// F4:代理认证口令。与 SSH 口令分开存,避免误用。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub proxy_password: Option<String>,
+}
+
+impl std::fmt::Debug for SecretEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redacted(v: &Option<String>) -> &'static str {
+            if v.is_some() {
+                "<已设置>"
+            } else {
+                "<无>"
+            }
+        }
+        f.debug_struct("SecretEntry")
+            .field("password", &redacted(&self.password))
+            .field("passphrase", &redacted(&self.passphrase))
+            .field("proxy_password", &redacted(&self.proxy_password))
+            .finish()
+    }
 }
 
 /// 分组稳定主键。新建时取现有 max+1(见 vault)。
@@ -141,7 +167,11 @@ pub struct AppearancePrefs {
 }
 
 /// 当前 TOML 结构版本。缺失该键的文件视为 v1(见 `migrate`)。
-pub const CURRENT_SCHEMA: u32 = 2;
+///
+/// v3 = v2 + `[session.network]` / `[group.network]`。结构上 v3 能直接读 v2
+/// (新字段全带 `serde(default)`),升版本号是为了让**旧客户端明确拒绝**,
+/// 而不是静默丢弃 network 分节再写回。
+pub const CURRENT_SCHEMA: u32 = 3;
 
 fn schema_v1() -> u32 {
     1
@@ -190,6 +220,7 @@ mod tests {
                 scrollback: Some(5000),
             },
             appearance: AppearancePrefs::default(),
+            network: crate::network::NetworkPrefs::default(),
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,
@@ -223,6 +254,7 @@ mod tests {
             },
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
+            network: crate::network::NetworkPrefs::default(),
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,
@@ -278,5 +310,39 @@ mod tests {
         let s = toml::to_string_pretty(&c).unwrap();
         let back: ColorSpec = toml::from_str(&s).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn secret_entry_carries_proxy_password() {
+        let s = SecretEntry {
+            password: None,
+            passphrase: None,
+            proxy_password: Some("p".into()),
+        };
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: SecretEntry = toml::from_str(&text).unwrap();
+        assert_eq!(back, s);
+
+        let empty = toml::to_string_pretty(&SecretEntry::default()).unwrap();
+        assert_eq!(empty.trim(), "", "全 None 的 SecretEntry 不写出任何键");
+    }
+
+    /// 加密存储的口令绝不能被 `{:?}` 顺手打进日志/panic 消息。
+    #[test]
+    fn debug_never_leaks_secret_entry_plaintext() {
+        let e = SecretEntry {
+            password: Some("hunter2".into()),
+            passphrase: Some("keyphrase".into()),
+            proxy_password: Some("proxypw".into()),
+        };
+        let s = format!("{e:?}");
+        for leaked in ["hunter2", "keyphrase", "proxypw"] {
+            assert!(!s.contains(leaked), "Debug 泄漏了明文口令: {s}");
+        }
+        assert!(s.contains("<已设置>"), "应报告字段已设置: {s}");
+        assert!(
+            format!("{:?}", SecretEntry::default()).contains("<无>"),
+            "未设置的字段应报告 <无>"
+        );
     }
 }

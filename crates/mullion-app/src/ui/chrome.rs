@@ -44,6 +44,10 @@ pub fn top_menu(
                         ui_state.session_manager_open = true;
                         ui.close_menu();
                     }
+                    if ui.button("分组管理器").clicked() {
+                        ui_state.group_manager_open = true;
+                        ui.close_menu();
+                    }
                     if ui
                         .add_enabled(connected, egui::Button::new("断开"))
                         .clicked()

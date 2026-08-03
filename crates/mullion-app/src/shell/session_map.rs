@@ -69,6 +69,7 @@ pub fn to_ssh_config(
         cols: 80,
         rows: 24,
         term: "xterm-256color".to_string(),
+        hops: Vec::new(),
     })
 }
 
@@ -101,6 +102,7 @@ mod tests {
             },
             terminal: Default::default(),
             appearance: Default::default(),
+            network: Default::default(),
         }
     }
 
@@ -110,6 +112,7 @@ mod tests {
         let sec = SecretEntry {
             password: Some("pw".into()),
             passphrase: None,
+            proxy_password: None,
         };
         let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
         assert_eq!(cfg.host, "h");
@@ -140,6 +143,7 @@ mod tests {
         let sec = SecretEntry {
             password: None,
             passphrase: Some("ph".into()),
+            proxy_password: None,
         };
         let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
         match cfg.auth {
@@ -176,6 +180,7 @@ mod tests {
         let sec = SecretEntry {
             password: Some("pw".into()),
             passphrase: None,
+            proxy_password: None,
         };
         assert!(matches!(
             to_ssh_config(&r, Some(&sec)),

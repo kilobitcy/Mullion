@@ -19,9 +19,8 @@ pub enum PaneStatus {
 use std::sync::Arc;
 
 use mullion_core::layout::{close_pane, leaves, split_pane, Dir, Node, PaneId};
-use mullion_ssh::session::{ClientHandler, SshSession, TrySendErr};
+use mullion_ssh::session::{SshConnection, SshSession, TrySendErr};
 use mullion_term::emulator::Emulator;
-use russh::client::Handle;
 use tokio::sync::mpsc::{error::TryRecvError, Receiver};
 
 use crate::render::SyncFramePacer;
@@ -54,8 +53,9 @@ pub struct HostConn {
     pub label: String,
     /// `user@host:port`,标题条副标题用。
     pub addr: String,
-    /// `Arc` 是必须的:russh 的 `Handle` 没实现 `Clone`,只有 `Drop`(释放即断连)。
-    pub handle: Arc<Handle<ClientHandler>>,
+    /// 目标主机连接(含跳板保活)。**必须整条持有**:Drop 即断连。`Arc` 是必须的:
+    /// russh 的 `Handle` 没实现 `Clone`,只有 `Drop`(释放即断连)。
+    pub handle: Arc<SshConnection>,
 }
 
 /// 一个分屏的全部运行时状态。

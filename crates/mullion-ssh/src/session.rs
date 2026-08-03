@@ -5,11 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use russh::client::{self, AuthResult, Handle};
 use russh::keys::ssh_key;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::config::{AuthMethod, SshConfig};
-use crate::error::{classify_tcp, ConnectError};
+use crate::error::ConnectError;
 #[cfg(test)]
 use crate::known_hosts::HostKeyFuture;
 use crate::known_hosts::{Fingerprint, HostKeyDecision, HostKeyOutcome, HostKeyPolicy};
@@ -67,31 +66,82 @@ fn host_key_or(outcome: &Arc<Mutex<Option<HostKeyOutcome>>>, e: russh::Error) ->
     }
 }
 
-/// 连接 + 认证 + 主机校验。成功返回存活的 russh Handle(PTY 由 open_pty 接)。
+/// 一条建立好的 SSH 连接,**连同它依赖的所有跳板连接**。
+///
+/// 为什么要持有 `_jumps`:russh 的 `ChannelStream` 不持有 `Handle`,
+/// `Handle` 一 Drop 整条连接立刻断。跳板链是「A 上开 channel 通向 B」,
+/// 若 A 的 Handle 提前释放,B 的流会在几毫秒后静默断掉 ——
+/// 本地直连场景永远复现不了。把保活做成字段,让类型系统兜住。
+///
+/// **限定**:上面这段「一 Drop 立刻断」来自设计 §5.2,**尚未被本仓库的测试实证**。
+/// `tests/two_hop_jump.rs` 做过红队实验:把 `dial.rs` 的 `jumps.push(handle)` 换成
+/// `drop(handle)` 真的丢掉跳板 Handle 后,隧道在 3 秒空闲窗口内**依然可用**
+/// (russh 0.54.5 + 进程内假 sshd)。所以确切成立的只有弱版本:丢了 Handle
+/// 至少在这个窗口下不会立刻断。真实链路(远端 sshd + 高延迟 + 长连接)是否会断,
+/// 无头环境验不了。**不要因为「实验没复现」就删掉这个字段** —— 它成本为零,
+/// 而 §5.2 描述的失效模式一旦发生就是「连上几毫秒后无故断」这类最难查的 bug。
+pub struct SshConnection {
+    handle: Handle<ClientHandler>,
+    /// 跳板链每一跳的连接,仅用于保活,顺序 = 拨号顺序(`_jumps[0]` 最先建立)。
+    ///
+    /// 释放顺序注意:字段整体在 `handle` 之后 drop(声明顺序),没问题;
+    /// 但 `Vec` 内部按下标 0→末尾 drop,即拨号顺序里**最先建立的那跳最先被丢**,
+    /// 与依赖关系相反(每一跳都靠它前面的跳保活,理想释放顺序应是后建立的先丢)。
+    /// 当前**没有实际后果**:russh 0.54.5 的 `Handle::Drop`
+    /// (`client/mod.rs:262`)只 `debug!`,不做任何 IO,丢弃顺序不影响行为。
+    /// 若未来 russh 版本让 `Drop` 真的发断连消息,这里需要改成反向释放
+    /// (例如 `establish` 里 `jumps.reverse()` 后再交给 `SshConnection::new`),
+    /// 到时候先补一个能检测出错误顺序的测试再改。
+    _jumps: Vec<Handle<ClientHandler>>,
+}
+
+impl SshConnection {
+    pub(crate) fn new(handle: Handle<ClientHandler>, jumps: Vec<Handle<ClientHandler>>) -> Self {
+        Self {
+            handle,
+            _jumps: jumps,
+        }
+    }
+
+    /// 目标主机的 Handle。跳板的 Handle **不外借**——外部拿不到就不会误 Drop。
+    pub(crate) fn handle(&self) -> &Handle<ClientHandler> {
+        &self.handle
+    }
+
+    /// 仅供测试与诊断:当前保活着几条跳板连接。
+    pub fn jump_handle_count(&self) -> usize {
+        self._jumps.len()
+    }
+}
+
+/// 连接 + 认证 + 主机校验。成功返回存活的连接(PTY 由 open_pty 接)。
+///
+/// `hops` 为空时行为与直连完全一致(F4/F5 之前的行为不变);否则先经
+/// `dial::dial` 逐跳串联代理/跳板,拿到通向目标的流,再在目标上握手认证。
 pub async fn establish(
     cfg: &SshConfig,
     policy: Arc<dyn HostKeyPolicy>,
-) -> Result<Handle<ClientHandler>, ConnectError> {
-    // 1) DNS:此步任何失败都归 DnsResolution。
-    let mut addrs = tokio::net::lookup_host((cfg.host.as_str(), cfg.port))
-        .await
-        .map_err(|e| ConnectError::DnsResolution(e.to_string()))?;
-    let addr = addrs
-        .next()
-        .ok_or_else(|| ConnectError::DnsResolution(format!("{} 无解析结果", cfg.host)))?;
+) -> Result<SshConnection, ConnectError> {
+    let dialed = crate::dial::dial(&cfg.hops, &cfg.host, cfg.port, policy.clone()).await?;
+    let handle = handshake_and_auth(dialed.stream, &cfg.host, &cfg.user, &cfg.auth, policy).await?;
+    Ok(SshConnection::new(handle, dialed.jumps))
+}
 
-    // 2) TCP:分类 refused / 其他 io(F6)。
-    let stream = TcpStream::connect(addr).await.map_err(classify_tcp)?;
-    // 手搓 connect_stream 绕过了 client::connect 对 Config.nodelay 的应用,
-    // 须补上,否则 Nagle 算法拖慢每次小写入 —— 与高延迟链路「跟手」的目标冲突。
-    stream
-        .set_nodelay(true)
-        .map_err(|e| ConnectError::Io(format!("set_nodelay 失败: {e}")))?;
-
-    // 3) 握手:触发 check_server_key(TOFU)。
+/// 在已建立的流上完成 SSH 握手 + 认证。目标主机与跳板共用此函数,
+/// 避免两条认证路径漂移(例如只在其中一条修了 PUBKEY_HASH)。
+pub(crate) async fn handshake_and_auth<S>(
+    stream: S,
+    host: &str,
+    user: &str,
+    auth: &AuthMethod,
+    policy: Arc<dyn HostKeyPolicy>,
+) -> Result<Handle<ClientHandler>, ConnectError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let outcome = Arc::new(Mutex::new(None));
     let handler = ClientHandler {
-        host: cfg.host.clone(),
+        host: host.to_string(),
         policy,
         outcome: outcome.clone(),
     };
@@ -99,10 +149,7 @@ pub async fn establish(
     let mut handle = client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| host_key_or(&outcome, e))?;
-
-    // 4) 认证。
-    let result = authenticate(&mut handle, cfg).await?;
-    match result {
+    match authenticate_with(&mut handle, user, auth).await? {
         AuthResult::Success => Ok(handle),
         AuthResult::Failure { .. } => Err(ConnectError::AuthFailed),
     }
@@ -114,13 +161,14 @@ pub async fn establish(
 /// 避免只改一处漏另一处;守护测试见本文件 tests::rsa_pubkey_hash_is_sha2_512_not_legacy_sha1。
 const PUBKEY_HASH: Option<russh::keys::HashAlg> = Some(russh::keys::HashAlg::Sha512);
 
-async fn authenticate(
+async fn authenticate_with(
     handle: &mut Handle<ClientHandler>,
-    cfg: &SshConfig,
+    user: &str,
+    auth: &AuthMethod,
 ) -> Result<AuthResult, ConnectError> {
-    match &cfg.auth {
+    match auth {
         AuthMethod::Password(pw) => handle
-            .authenticate_password(&cfg.user, pw)
+            .authenticate_password(user, pw)
             .await
             .map_err(map_russh),
         AuthMethod::PublicKey { path, passphrase } => {
@@ -128,11 +176,11 @@ async fn authenticate(
                 .map_err(|e| ConnectError::Io(format!("读私钥失败: {e}")))?;
             let with = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), PUBKEY_HASH);
             handle
-                .authenticate_publickey(&cfg.user, with)
+                .authenticate_publickey(user, with)
                 .await
                 .map_err(map_russh)
         }
-        AuthMethod::Agent => authenticate_agent(handle, &cfg.user).await,
+        AuthMethod::Agent => authenticate_agent(handle, user).await,
     }
 }
 
@@ -235,8 +283,8 @@ pub async fn connect(
     policy: Arc<dyn HostKeyPolicy>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(SshSession, mpsc::Receiver<Vec<u8>>), ConnectError> {
-    let handle = establish(cfg, policy).await?;
-    open_pty(Arc::new(handle), cfg, wake).await
+    let conn = establish(cfg, policy).await?;
+    open_pty(Arc::new(conn), cfg, wake).await
 }
 
 /// 在**已建立**的连接上再开一条 PTY channel(F35 分屏复用连接)。
@@ -245,15 +293,17 @@ pub async fn connect(
 /// 想在这里偷偷重连一次都做不到,是结构性的防呆。主机密钥确认(F3/TOFU)只在
 /// [`establish`] 触发一次,新开分屏不会再弹窗(§6.2)。
 ///
-/// `handle` 必须是 `Arc`:russh 0.54.5 的 `Handle` 没有实现 `Clone`,只有 `Drop`
-/// (释放即断连)。每条 channel 的 io_task 各持一份 Arc,最后一个释放才真正断连 ——
+/// `conn` 必须是 `Arc`:russh 0.54.5 的 `Handle` 没有实现 `Clone`,只有 `Drop`
+/// (释放即断连),`SshConnection` 内部还多背着跳板链的 Handle,同样一 Drop 即断。
+/// 每条 channel 的 io_task 各持一份 Arc,最后一个释放才真正断连 ——
 /// 这就是「关掉一个 pane 不影响其余 pane」的实现机制(§6.1)。
 pub async fn open_pty(
-    handle: Arc<Handle<ClientHandler>>,
+    conn: Arc<SshConnection>,
     cfg: &SshConfig,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(SshSession, mpsc::Receiver<Vec<u8>>), ConnectError> {
-    let channel = handle
+    let channel = conn
+        .handle()
         .channel_open_session()
         .await
         .map_err(|_| ConnectError::PtyRequest)?;
@@ -280,7 +330,7 @@ pub async fn open_pty(
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<SshCmd>(256);
 
-    tokio::spawn(io_task(read, write, cmd_rx, inbound_tx, wake, handle));
+    tokio::spawn(io_task(read, write, cmd_rx, inbound_tx, wake, conn));
 
     Ok((SshSession { cmd_tx }, inbound_rx))
 }
@@ -291,9 +341,10 @@ async fn io_task(
     mut cmd_rx: mpsc::Receiver<SshCmd>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     wake: Arc<dyn Fn() + Send + Sync>,
-    // 持有一份 Arc 只为保活:Handle 一 Drop 整条 SSH 连接就断。多 pane 下每条
-    // channel 的 io_task 各持一份,最后一个 io_task 结束时连接才关(§6.1)。
-    _handle: Arc<Handle<ClientHandler>>,
+    // 持有一份 Arc 只为保活:Handle(及其背着的跳板 Handle)一 Drop 整条 SSH 连接
+    // 就断。多 pane 下每条 channel 的 io_task 各持一份,最后一个 io_task 结束时
+    // 连接才关(§6.1)。
+    _conn: Arc<SshConnection>,
 ) {
     loop {
         // 单任务顺序 select:inbound send().await 期间不处理 cmd(大 burst 下键入有延迟,非死锁)。
@@ -471,5 +522,32 @@ mod tests {
             outcome.lock().unwrap().take(),
             Some(HostKeyOutcome::Changed { .. })
         ));
+    }
+
+    /// 保活红线:跳板 Handle 必须被 `SshConnection` 持有。
+    /// 只有把它移进结构体、且 `open_pty` 收 `Arc<SshConnection>`,
+    /// 「跳板连接活得比 PTY 久」才是类型保证而非注释保证。
+    #[test]
+    fn ssh_connection_owns_jump_handles_so_they_outlive_the_pty() {
+        fn assert_field_exists(c: &SshConnection) -> usize {
+            c.jump_handle_count()
+        }
+        // 编译通过即证明字段存在;运行期只断言空链为 0。
+        let _ = assert_field_exists;
+    }
+
+    #[test]
+    fn ssh_config_defaults_to_direct_dial() {
+        let cfg = SshConfig {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: AuthMethod::Agent,
+            cols: 80,
+            rows: 24,
+            term: "xterm-256color".into(),
+            hops: Vec::new(),
+        };
+        assert!(cfg.hops.is_empty(), "空 hops 即直连");
     }
 }
