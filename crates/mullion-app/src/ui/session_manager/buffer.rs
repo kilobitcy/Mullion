@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use mullion_store::{
-    AppearancePrefs, Auth, AuthKind, Connection, GroupId, Identity, Protocol, SecretEntry,
-    SessionDraft, SessionId, SessionRecord, TerminalPrefs,
+    AppearancePrefs, Auth, AuthKind, Connection, GroupId, Identity, NetworkPrefs, Protocol,
+    SecretEntry, SessionDraft, SessionId, SessionRecord, TerminalPrefs,
 };
 
 /// 编辑表单里认证方式的选择。不复用 `AuthKind` 本身,因为 UI 在密码/公钥两种模式
@@ -308,7 +308,7 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
         },
         terminal: buf.preserved_terminal.clone(),
         appearance: buf.preserved_appearance.clone(),
-        network: mullion_store::NetworkPrefs { proxy, jump },
+        network: NetworkPrefs { proxy, jump },
         secret,
     })
 }
@@ -317,8 +317,7 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
 mod tests {
     use super::*;
     use mullion_store::{
-        ColorSpec, ColorTarget, IconKind, IconSpec, JumpRef, NetworkPrefs, ProxyChoice,
-        ProxyEndpoint,
+        ColorSpec, ColorTarget, IconKind, IconSpec, JumpRef, ProxyChoice, ProxyEndpoint,
     };
 
     /// 红线:`EditorBuffer` 携带三个明文口令缓冲。若 derive(Debug),`{:?}` 会把
