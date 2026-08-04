@@ -1752,7 +1752,7 @@ pub(super) fn show(
     );
     ui.add_space(8.0);
 
-    // 底部按钮先占位,列表用剩下的高度滚动。
+    // ⚠️ 这段写法已在实机上被证伪,**不要照抄**。见下方注记与 Task 11 的正确写法。
     let bottom = 40.0;
     let list_h = (ui.available_height() - bottom).max(0.0);
 
@@ -1890,7 +1890,64 @@ session_row 手绘(状态点 + 名称 + user@host + 选中态强调条),selectab
 ## Task 11: 右栏 `editor.rs` 骨架 —— 标题条 / 三 Tab / 错误卡片 / 底部按钮
 
 **Files:**
+- Modify: `crates/mullion-app/src/ui/mod.rs`(`editor` 字段改 `Option`;`show` 调用点传 presence)
+- Modify: `crates/mullion-app/src/app.rs:868`(私钥回填适配 `Option`)
+- Modify: `crates/mullion-app/src/ui/session_manager/mod.rs`(`show` 加 presence 参数)
 - Modify: `crates/mullion-app/src/ui/session_manager/editor.rs`
+
+- [ ] **Step 0: 把 `UiState::editor` 改成 `Option<EditorBuffer>`,并把 presence 接到右栏**
+
+> **这一步是计划的补漏,写计划时漏掉了。** Task 11 往后(11/12/13/14)全部按
+> `ui_state.editor.as_mut()` / `= Some(...)` / `= None` 写,但 Task 1–10 没有
+> 任何一步改过这个字段的类型 —— 它至今仍是非 `Option` 的
+> `pub editor: session_manager::EditorBuffer`。不先改,Step 1 的代码一行都编译不过。
+>
+> 为什么必须是 `Option`:右栏要区分「新建中(空表单)」和「什么都没选(空态提示)」。
+> 两者的 `editor_id` 都是 `None`,非 `Option` 的 `editor` 表达不了这个区别。
+
+`ui/mod.rs`:
+
+```rust
+    /// 编辑表单的跨帧字段缓冲。`None` = 右栏未在编辑任何会话(画空态提示)。
+    pub editor: Option<session_manager::EditorBuffer>,
+```
+
+`UiState` 是 `#[derive(Default)]`,`Option` 的默认值就是 `None`,无需另改初值;
+`close_session_manager` 目前也不碰 `editor`,同样不用动。
+
+`app.rs:868` 的私钥路径回填(现在是 `self.ui.editor.key_path = ...`):
+
+```rust
+                    if let Some(buf) = self.ui.editor.as_mut() {
+                        buf.key_path = p.display().to_string();
+                    }
+```
+
+`session_manager::show` 加一个参数(右栏画密码占位要知道库里有没有值):
+
+```rust
+pub fn show(
+    ctx: &egui::Context,
+    t: &Theme,
+    ui_state: &mut UiState,
+    sessions: &[SessionRecord],
+    groups: &[GroupRecord],
+    store_available: bool,
+    connected: Option<SessionId>,
+    presence: SecretPresence,
+) {
+```
+
+`ui/mod.rs` 的调用点(约 220 行)补最后一个实参 `frame.secret_presence,`。
+`CentralPanel` 里的调用改成
+`editor::show(ui, t, ui_state, groups, presence)` —— 去掉 `sessions`:
+Task 12 把跳板链退化成「勾选 + 只读跳数」,右栏不再需要会话全表。
+
+> **已知中间态,不是回归**:`editor` 改成 `Option` 后,在 Task 14 接上
+> 「消费 `pending_switch` → 载入 `editor`」之前,右栏会一直显示空态提示,
+> 点左栏的行和「+ 新建」都不会打开表单。这不是本步引入的缺陷 —— Task 10
+> 之后 `list.rs` 就只写 `pending_switch` 而没人消费,原先那个非 `Option`
+> 的空表单本来也载不进任何已有会话。Task 14 接上即恢复。**这几步之间不发版。**
 
 - [ ] **Step 1: 写右栏骨架**
 
@@ -1960,11 +2017,36 @@ pub(super) fn show(
     });
     ui.separator();
 
-    // Tab 内容用剩余高度滚动,底部按钮固定。
-    let bottom = 44.0;
-    let body_h = (ui.available_height() - bottom).max(0.0);
+    // 底部按钮条用 TopBottomPanel 先占位,Tab 内容吃剩余高度。
+    //
+    // **不要写成 `let bottom = 44.0; let body_h = ui.available_height() - bottom;`**
+    // 再喂给 `ScrollArea::max_height` —— 左栏原本就是这么写的,在 Windows 11
+    // 实机上把「+ 新建」按钮顶出了可见区(见 c4eb7f1)。两个原因:
+    // `ui.available_height()` 在 panel 内返回的是 `Window` 的**布局高度**而非
+    // 真实可见高度;硬编码的 44.0 必须与底栏实际渲染高度保持同步,一旦界面缩放
+    // 或字号变大就失同步,且没有任何编译错误或测试会提示。
+    // panel 布局天然保证「panel 先分配、中央区吃剩余」,不需要猜数字。
+    //
+    // 「取消」只置意图,不在这里改 `ui_state.editor` —— 见代码块后的借用说明。
+    let mut cancel = false;
+    egui::TopBottomPanel::bottom(ui.id().with("sm_editor_bottom"))
+        .frame(egui::Frame::none())
+        .show_separator_line(false)
+        .show_inside(ui, |ui| {
+            ui.separator();
+            ui.horizontal(|ui| {
+                let save = ui.button("保存").clicked();
+                let save_connect = ui.button("保存并连接").clicked();
+                if save || save_connect {
+                    ui_state.save_click = Some(save_connect);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    cancel |= ui.button("取消").clicked();
+                });
+            });
+        });
+
     egui::ScrollArea::vertical()
-        .max_height(body_h)
         .auto_shrink([false, false])
         .show(ui, |ui| match ui_state.editor_tab {
             0 => super::fields::basic(ui, t, buf, groups),
@@ -1972,23 +2054,25 @@ pub(super) fn show(
             _ => super::fields::network(ui, t, buf, presence),
         });
 
-    ui.separator();
-    ui.horizontal(|ui| {
-        let save = ui.button("保存").clicked();
-        let save_connect = ui.button("保存并连接").clicked();
-        if save || save_connect {
-            ui_state.save_click = Some(save_connect);
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("取消").clicked() {
-                ui_state.editor = None;
-                ui_state.editor_baseline = None;
-                ui_state.editor_id = None;
-            }
-        });
-    });
+    // `buf` 的借用到此结束,现在才能动 `ui_state.editor`。
+    if cancel {
+        ui_state.editor = None;
+        ui_state.editor_baseline = None;
+        ui_state.editor_id = None;
+    }
 }
 ```
+
+> **注意这里有个借用冲突,是把底栏挪到前面才出现的。** `buf` 是函数开头从
+> `ui_state.editor.as_mut()` 解出来的 `&mut`。底栏里 `ui_state.save_click = ...`
+> 没问题(Rust 2021 的闭包按字段捕获,`save_click` 与 `editor` 是不相交的字段),
+> 但「取消」的 `ui_state.editor = None` 借的正是 `buf` 借着的那个字段,而此时
+> `buf` 后面还要给 `ScrollArea` 用 —— NLL 救不了,编译期直接报错。
+> (原先的顺序里底栏在 `ScrollArea` **之后**,`buf` 已经死了,所以没暴露。)
+>
+> 上面代码块用的就是本项目一贯的「写意图、事后施加」:底栏只置局部
+> `cancel` 标志,函数末尾 `buf` 借用结束后再执行清空。**别用 `clone()` 或
+> 提前 `drop(buf)` 绕。**
 
 `editor.rs` 顶部 `use` 补:`use crate::theme::{self, Theme};`、
 `use crate::ui::session_manager::SecretPresence;`。

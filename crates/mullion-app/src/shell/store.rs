@@ -8,6 +8,7 @@ use mullion_ssh::config::SshConfig;
 use mullion_store::{MasterKeySource, SessionDraft, SessionId, SessionRecord, StoreError, Vault};
 
 use super::session_map::{to_ssh_config, MapError};
+use crate::ui::session_manager::SecretPresence;
 
 /// mullion 的配置目录(Windows `%APPDATA%\mullion\`、Linux `~/.config/mullion/`)。
 /// 无法确定时返回 None(极少见,如无 HOME)。
@@ -117,6 +118,26 @@ impl SessionStore {
     /// 解析后的配置(含继承来的代理/跳板)。
     pub fn resolved(&self, id: SessionId) -> Result<mullion_store::ResolvedConfig, StoreError> {
         self.vault.resolve_for(id)
+    }
+
+    /// 读一条会话的已存凭据。**返回明文**,只给保存路径的三态合成用
+    /// (`app::apply_save`)——不要把它塞进 `UiFrame`,UI 层只该知道
+    /// 「有没有设置」,那是 `secret_presence` 的职责。
+    pub fn secret(&self, id: SessionId) -> Option<&mullion_store::model::SecretEntry> {
+        self.vault.secret(id)
+    }
+
+    /// 只报告三个凭据槽位「有没有值」,不泄漏任何明文。UI 靠它决定密码框
+    /// 显示「6 位黑点」还是「未设置」。
+    pub fn secret_presence(&self, id: SessionId) -> SecretPresence {
+        match self.vault.secret(id) {
+            None => SecretPresence::default(),
+            Some(s) => SecretPresence {
+                password: s.password.is_some(),
+                passphrase: s.passphrase.is_some(),
+                proxy_password: s.proxy_password.is_some(),
+            },
+        }
     }
 
     /// 取会话 → 用其(已解密的)secret 组 SshConfig(双击连接用)。

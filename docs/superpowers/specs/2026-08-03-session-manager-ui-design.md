@@ -139,6 +139,25 @@ egui::Window::new("会话管理器")
 必须在实机验收里目视确认（进 §10 清单）。若不成立，退路是改用
 `Window::fixed_size([880.0, 560.0])` + 闭包首行 `ui.set_min_size(ui.available_size())`。
 
+**实机验证结论（v0.1.17，Windows 11，2026-08-04）：假设成立，退路方案作废。**
+`set_min_height` 确实让 `SidePanel` 撑满 —— 4 条会话时左右两栏等高到底，右栏未塌陷。
+
+但验证同时暴露了它的一个副作用，退路方案解决不了、反而会放大：
+
+- `set_min_height` 是**硬地板**而非「最多撑到」。主窗口可用高度小于它时，`Window`
+  不收缩，而是溢出可见区，底部内容被裁掉。
+- `ui.available_height()` 在 `SidePanel` 内返回的是 `Window` 的**布局高度**
+  （`default_size` 给的 560，或被 clamp 后的 480），**不是真实可见高度**。任何
+  「`available_height()` 减去底栏高度」式的手算都会偏大，把底栏推出可见区。
+
+headless 复现（screen_rect 高 400 时）：`avail_h=480`，`Window` 底部算到 `524.7`
+溢出 124.7，左栏「+ 新建」按钮 rect `y=480.7..498.7` 整个落在可见区外。
+
+退路方案 `fixed_size` 把高度钉死 560 且禁用 resize，小主窗口下溢出更多、还拖不大，
+**是把问题放大**。改按两条修：`CONTENT_MIN_HEIGHT` 取「480 与实际可用高度的较小值」；
+左栏底栏改用 `TopBottomPanel::bottom` 在 `SidePanel` 内先占位、ScrollArea 吃剩余，
+不再手算高度（同时消掉 `BOTTOM_BAR_H` 这个必须与实际渲染高度保持同步的魔法数字）。
+
 ### 3.1 `store_available == false` 的降级
 
 现有实现在 `show()` 首行短路（:349）：整个窗口只显示一行错误文案。

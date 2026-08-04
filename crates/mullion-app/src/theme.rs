@@ -63,6 +63,9 @@ pub struct Theme {
     pub warn: Rgb,
     pub info: Rgb,
     pub danger: Rgb,
+    /// 错误**卡片/横幅**底纹用的柔和红(F90 会话管理器 §5.2)。`danger` 是
+    /// Windows 系统红 #e81123,用作大面积底色太刺眼;两者不互相替代。
+    pub danger_soft: Rgb,
 
     // --- 终端色(§2.4) ---
     pub term_bg: Rgb,
@@ -96,6 +99,7 @@ pub const MULLION_DARK: Theme = Theme {
     warn: Rgb::new(0xe0, 0xb7, 0x67),
     info: Rgb::new(0x7c, 0x9e, 0xff),
     danger: Rgb::new(0xe8, 0x11, 0x23),
+    danger_soft: Rgb::new(0xe0, 0x67, 0x67),
 
     // 与 panel_bg 同值:终端就是最大的那块 panel。
     term_bg: Rgb::new(0x14, 0x16, 0x1f),

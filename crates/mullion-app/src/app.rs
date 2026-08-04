@@ -166,6 +166,9 @@ pub struct App {
     autoscroll: i32,
     /// 待用户确认的多行粘贴(F18)。`Some` = 弹窗开着,计入 `modal`(T8)。
     pending_paste: Option<String>,
+    /// 当前已连接的会话(状态点用)。`ConnectOk` 时从 `ui.connect_request_last`
+    /// 记下来,`UserEvent::ConnectOk` 本身不带 SessionId。
+    connected_session: Option<mullion_store::SessionId>,
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -210,6 +213,7 @@ impl App {
             press_anchor: None,
             autoscroll: 0,
             pending_paste: None,
+            connected_session: None,
         }
     }
 
@@ -711,13 +715,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 Err(e) => {
                     crate::logx::line(&format!("会话库打开失败: {e}"));
-                    self.ui.last_error = Some(format!("会话库打开失败:{e}"));
+                    self.ui.set_error(format!("会话库打开失败:{e}"));
                     None
                 }
             },
             None => {
                 crate::logx::line("无法定位配置目录,会话功能禁用");
-                self.ui.last_error = Some("无法定位配置目录".into());
+                self.ui.set_error("无法定位配置目录".into());
                 None
             }
         };
@@ -788,9 +792,11 @@ impl ApplicationHandler<UserEvent> for App {
                 });
                 self.ws = Some(ws);
                 self.current_preset = Some(Preset::Single);
-                // 连上后关掉会话管理弹窗/编辑表单,别让它盖在新终端上方(复核 #4)。
-                self.ui.session_manager_open = false;
-                self.ui.editor_open = false;
+                // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
+                self.ui.close_session_manager();
+                // ConnectOk 不带 SessionId(见 UserEvent 定义),用发起连接时
+                // 记下的那条。状态点只区分「这条连上了 / 没连上」两态。
+                self.connected_session = self.ui.connect_request_last;
                 self.ui_dirty = true;
                 self.request_ui_redraw();
             }
@@ -851,7 +857,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .as_ref()
                     .is_some_and(|ws| generation_matches(ws, generation))
                 {
-                    self.ui.last_error = Some(msg);
+                    self.ui.set_error(msg);
                     self.ui_dirty = true;
                     self.request_ui_redraw();
                 }
@@ -859,7 +865,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::KeyPathPicked(picked) => {
                 self.key_picker_busy = false;
                 if let Some(p) = picked {
-                    self.ui.editor.key_path = p.display().to_string();
+                    if let Some(buf) = self.ui.editor.as_mut() {
+                        buf.key_path = p.display().to_string();
+                    }
                 }
                 self.request_ui_redraw();
             }
@@ -884,7 +892,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.cli_direct && self.ws.is_none() {
                     std::process::exit(1);
                 }
-                self.ui.last_error = Some(msg);
+                self.ui.set_error(msg);
                 self.request_ui_redraw();
             }
         }
@@ -908,7 +916,6 @@ impl ApplicationHandler<UserEvent> for App {
             );
             let modal = self.ui.session_manager_open
                 || self.ui.about_open
-                || self.ui.editor_open
                 || self.pending_host_key.is_some()
                 || self.pending_paste.is_some();
             // 键盘归终端时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
@@ -1263,6 +1270,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 titles: &titles,
                                 host_key: host_key_view,
                                 paste: paste_view,
+                                secret_presence: match (self.store.as_ref(), self.ui.editor_id) {
+                                    (Some(s), Some(id)) => s.secret_presence(id),
+                                    _ => crate::ui::session_manager::SecretPresence::default(),
+                                },
+                                connected_session: self.connected_session,
                             };
                             let a = self.active.as_mut().expect("上面刚判过 is_some");
                             let (repaint_delay, actions) =
@@ -1308,6 +1320,9 @@ impl ApplicationHandler<UserEvent> for App {
                             if self.ui.request_disconnect {
                                 self.ui.request_disconnect = false;
                                 self.ws = None;
+                                // 与 self.ws 成对维护:断开后不清会一直显示
+                                // 「已连接」的陈旧状态点。
+                                self.connected_session = None;
                             }
                             if self.ui.request_quit {
                                 self.ui.request_quit = false;
@@ -1393,7 +1408,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(id) = self.ui.delete_request.take() {
                     if let Some(store) = self.store.as_mut() {
                         if let Err(e) = store.delete(id).and_then(|_| store.save()) {
-                            self.ui.last_error = Some(format!("删除失败:{e}"));
+                            self.ui.set_error(format!("删除失败:{e}"));
                         }
                     }
                 }
@@ -1402,17 +1417,14 @@ impl ApplicationHandler<UserEvent> for App {
                         let now = time::OffsetDateTime::now_utc()
                             .format(&time::format_description::well_known::Rfc3339)
                             .unwrap_or_default();
-                        let r = match save.editing_id {
-                            Some(id) => store
-                                .update(id, save.draft, &now)
-                                .and_then(|_| store.save()),
-                            None => {
-                                store.add(save.draft, &now);
-                                store.save()
+                        let then_connect = save.then_connect;
+                        match apply_save(store, save, &now) {
+                            Ok(id) => {
+                                if then_connect {
+                                    self.ui.connect_request = Some(id);
+                                }
                             }
-                        };
-                        if let Err(e) = r {
-                            self.ui.last_error = Some(format!("保存失败:{e}"));
+                            Err(msg) => self.ui.set_error(msg),
                         }
                     }
                 }
@@ -1431,12 +1443,12 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             crate::ui::group_manager::GroupIntent::Delete(id) => {
                                 if let Err(e) = store.delete_group(id) {
-                                    self.ui.last_error = Some(e.to_string());
+                                    self.ui.set_error(e.to_string());
                                 }
                             }
                         }
                         if let Err(e) = store.save() {
-                            self.ui.last_error = Some(e.to_string());
+                            self.ui.set_error(e.to_string());
                         }
                     }
                 }
@@ -1449,6 +1461,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // (下面 `self.store.as_ref()` 的临时借用在 match 表达式求值完就
                 // 释放,故可紧接着调 self.spawn_connect)。
                 if let Some(id) = self.ui.connect_request.take() {
+                    self.ui.connect_request_last = Some(id);
                     match self.store.as_ref().map(|s| s.ssh_config_for(id)) {
                         Some(Ok(cfg)) => {
                             // 用户主动发起的连接是交互态,不该继承 CLI 直连的
@@ -1456,7 +1469,7 @@ impl ApplicationHandler<UserEvent> for App {
                             self.cli_direct = false;
                             self.spawn_connect(cfg);
                         }
-                        Some(Err(e)) => self.ui.last_error = Some(e.to_string()),
+                        Some(Err(e)) => self.ui.set_error(e.to_string()),
                         None => {}
                     }
                 }
@@ -1483,8 +1496,8 @@ impl ApplicationHandler<UserEvent> for App {
                             // 磁盘日志(ADR-008)是这类静默失败的兜底取证手段。
                             if let Err(e) = kh.save() {
                                 crate::logx::line(&format!("主机指纹落盘失败:{e}"));
-                                self.ui.last_error =
-                                    Some(format!("主机指纹未能保存:{e}(本次连接不受影响)"));
+                                self.ui
+                                    .set_error(format!("主机指纹未能保存:{e}(本次连接不受影响)"));
                             }
                         }
                         // 送回握手线程。Err = 对端已走(超时/断开),没什么可做的。
@@ -1596,6 +1609,48 @@ fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> 
     let deadline_ms =
         crate::render::earliest_sync_timeout_ms(ws.panes().iter().map(|p| &p.pacer), now_ms)?;
     Some(start + std::time::Duration::from_millis(deadline_ms))
+}
+
+/// 施加一次保存意图。抽成纯函数是为了能在没有窗口的情况下测「编辑已有会话
+/// 不会把凭据清掉」(F73)——这条路径以前埋在事件循环里,只能靠上机手点。
+///
+/// 返回被写入的会话 id:新建时是 store 分配的那个,「保存并连接」要用。
+fn apply_save(
+    store: &mut crate::shell::store::SessionStore,
+    save: crate::ui::session_manager::SaveIntent,
+    now: &str,
+) -> Result<mullion_store::SessionId, String> {
+    use crate::ui::session_manager::{merge_secret, sync_has_passphrase};
+
+    let crate::ui::session_manager::SaveIntent {
+        editing_id,
+        mut draft,
+        password,
+        passphrase,
+        proxy_password,
+        then_connect: _,
+    } = save;
+
+    // 先把已存凭据 clone 出来,释放对 store 的不可变借用,下面才能 &mut。
+    let existing = editing_id.and_then(|id| store.secret(id)).cloned();
+    let merged = merge_secret(existing.as_ref(), &password, &passphrase, &proxy_password);
+    sync_has_passphrase(&mut draft, merged.as_ref());
+    draft.secret = merged;
+
+    match editing_id {
+        Some(id) => {
+            store
+                .update(id, draft, now)
+                .map_err(|e| format!("保存失败:{e}"))?;
+            store.save().map_err(|e| format!("保存失败:{e}"))?;
+            Ok(id)
+        }
+        None => {
+            let id = store.add(draft, now);
+            store.save().map_err(|e| format!("保存失败:{e}"))?;
+            Ok(id)
+        }
+    }
 }
 
 /// 一帧渲染:先跑 egui(菜单栏 + 工具栏 + 状态栏 + 标题条,§4.2),再(终端态时)
@@ -1784,7 +1839,8 @@ fn render_frame(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_layout_actions, generation_matches, pane_still_wanted, sync_timeout_wake_at,
+        apply_layout_actions, apply_save, generation_matches, pane_still_wanted,
+        sync_timeout_wake_at,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -2216,5 +2272,224 @@ mod tests {
             !generation_matches(&ws, 2),
             "世代号不一致(旧世代迟到的事件),不该被当成当前世代的"
         );
+    }
+
+    use mullion_store::MasterKeySource;
+
+    /// 测试用主密钥源:不碰 keyring(CI/无头环境没有钥匙串守护进程)。
+    struct FixedKey;
+    impl MasterKeySource for FixedKey {
+        fn load_or_create(&self) -> Result<[u8; 32], mullion_store::StoreError> {
+            Ok([7u8; 32])
+        }
+    }
+
+    fn tmp_store() -> (tempfile::TempDir, crate::shell::store::SessionStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::shell::store::SessionStore::open(dir.path().to_path_buf(), &FixedKey)
+            .expect("open store");
+        (dir, store)
+    }
+
+    /// F73 端到端红线:**先存一个带密码的会话,再原样保存一次(密码框没碰过),
+    /// 密码必须还在。** 这是用户实际会走的路径,也是改前会丢密码的那条。
+    ///
+    /// 自证会变红:把 `apply_save` 里的 `store.secret(id)` 换成 `None`
+    /// (即改前「看不到已存凭据」的状态),这条报 None != Some("pw")。
+    #[test]
+    fn editing_a_session_without_touching_password_keeps_it() {
+        let (_dir, mut store) = tmp_store();
+
+        let mut first = crate::ui::session_manager::EditorBuffer {
+            name: "dev".into(),
+            host: "192.0.2.10".into(),
+            user: "user".into(),
+            ..Default::default()
+        };
+        first.password = "pw".into();
+        first.password_touched = true;
+        let id = apply_save(
+            &mut store,
+            crate::ui::session_manager::SaveIntent {
+                editing_id: None,
+                draft: crate::ui::session_manager::build_draft(&first).expect("build"),
+                password: crate::ui::session_manager::SecretField::Set("pw".into()),
+                passphrase: crate::ui::session_manager::SecretField::Clear,
+                proxy_password: crate::ui::session_manager::SecretField::Keep,
+                then_connect: false,
+            },
+            "2026-08-03T00:00:00Z",
+        )
+        .expect("首次保存应成功");
+        assert_eq!(
+            store.secret(id).and_then(|s| s.password.clone()).as_deref(),
+            Some("pw")
+        );
+
+        // 第二次:只改备注,密码框一次都没碰过(触碰位全 false)
+        let mut again = first.clone();
+        again.note = "改了备注".into();
+        again.password = String::new();
+        again.password_touched = false;
+        apply_save(
+            &mut store,
+            crate::ui::session_manager::SaveIntent {
+                editing_id: Some(id),
+                draft: crate::ui::session_manager::build_draft(&again).expect("build"),
+                password: crate::ui::session_manager::SecretField::Keep,
+                passphrase: crate::ui::session_manager::SecretField::Clear,
+                proxy_password: crate::ui::session_manager::SecretField::Keep,
+                then_connect: false,
+            },
+            "2026-08-03T00:01:00Z",
+        )
+        .expect("二次保存应成功");
+
+        assert_eq!(
+            store.secret(id).and_then(|s| s.password.clone()).as_deref(),
+            Some("pw"),
+            "没碰密码框就保存,已存密码必须原样留着(F73)"
+        );
+    }
+
+    /// 新建路径必须把 store 分配的 `SessionId` 交回去 ——「保存并连接」要用它。
+    /// 改前 `app.rs` 是 `None => { store.add(draft, &now); store.save() }`,
+    /// 返回值直接丢弃。
+    /// 自证会变红:把 `apply_save` 新建分支改成 `Ok(SessionId(0))`,
+    /// 这条报「新 id 应能在 store 里查到」。
+    #[test]
+    fn apply_save_new_returns_id_allocated_by_store() {
+        let (_dir, mut store) = tmp_store();
+        let buf = crate::ui::session_manager::EditorBuffer {
+            name: "dev".into(),
+            host: "192.0.2.10".into(),
+            user: "user".into(),
+            ..Default::default()
+        };
+        let id = apply_save(
+            &mut store,
+            crate::ui::session_manager::SaveIntent {
+                editing_id: None,
+                draft: crate::ui::session_manager::build_draft(&buf).expect("build"),
+                password: crate::ui::session_manager::SecretField::Clear,
+                passphrase: crate::ui::session_manager::SecretField::Clear,
+                proxy_password: crate::ui::session_manager::SecretField::Clear,
+                then_connect: false,
+            },
+            "2026-08-03T00:00:00Z",
+        )
+        .expect("保存应成功");
+        assert!(
+            store.list().iter().any(|r| r.id == id),
+            "apply_save 返回的 id 必须是 store 真正分配的那个"
+        );
+    }
+
+    /// F73 参数错位红线:`merge_secret(existing, &password, &passphrase,
+    /// &proxy_password)` 后三个参数同类型(`&SecretField`),顺序写反不会编译
+    /// 失败。用公钥认证 + 三个槽位各占三态之一(`Set`/`Keep`/`Clear`)、已存值
+    /// 也互不相同,才能让"顺序写反"产生可观察的错误结果——三个槽位结果若趋同,
+    /// 参数对调不会被任何断言抓到。同时覆盖 `sync_has_passphrase` 走
+    /// `apply_save` 真实路径的效果(F73 附带项,之前只在 `merge_secret`/
+    /// `sync_has_passphrase` 单元层测过,没测过它们在 `apply_save` 里接线对不对)。
+    ///
+    /// 自证会变红(两次,见提交说明):
+    /// 1. 把 `apply_save` 里 `merge_secret(..., &passphrase, &proxy_password)`
+    ///    两个参数对调——passphrase/proxy_password 的最终值会互相串,断言报错。
+    /// 2. 注释掉 `sync_has_passphrase(&mut draft, merged.as_ref())`——
+    ///    has_passphrase 不再跟随合成结果,读回的记录里 has_passphrase 与预期不符。
+    #[test]
+    fn apply_save_merges_three_secret_slots_independently_and_syncs_has_passphrase() {
+        let (_dir, mut store) = tmp_store();
+
+        // 先存一条公钥认证会话,三个槽位都有互不相同的已存值。
+        let mut first = crate::ui::session_manager::EditorBuffer {
+            name: "dev".into(),
+            host: "192.0.2.10".into(),
+            user: "user".into(),
+            auth_kind: crate::ui::session_manager::AuthKindUi::PublicKey,
+            key_path: "/home/user/.ssh/id_ed25519".into(),
+            ..Default::default()
+        };
+        first.password = "old-pw".into();
+        first.password_touched = true;
+        first.passphrase = "old-ph".into();
+        first.passphrase_touched = true;
+        first.proxy_password = "old-proxy".into();
+        first.proxy_password_touched = true;
+        let id = apply_save(
+            &mut store,
+            crate::ui::session_manager::SaveIntent {
+                editing_id: None,
+                draft: crate::ui::session_manager::build_draft(&first).expect("build"),
+                password: crate::ui::session_manager::SecretField::Set("old-pw".into()),
+                passphrase: crate::ui::session_manager::SecretField::Set("old-ph".into()),
+                proxy_password: crate::ui::session_manager::SecretField::Set("old-proxy".into()),
+                then_connect: false,
+            },
+            "2026-08-03T00:00:00Z",
+        )
+        .expect("首次保存应成功");
+
+        // 第二次保存:password=Set(覆盖新值)、passphrase=Keep(原样留着)、
+        // proxy_password=Clear(真的清除)——三态各占一个槽位,已存值互不相同,
+        // 足以抓住任意两个参数写反。passphrase 框显式清成"没碰过"(触碰位
+        // false、内容清空),模拟真实场景(store 不回吐明文,编辑已有会话时
+        // 口令框恒为空)——这样 `build_draft(&second)` 自己算出来的
+        // `has_passphrase` 是 false(它看不到 store 的已存值),必须靠
+        // `apply_save` 里真正的 `sync_has_passphrase` 用合成结果校正回 true;
+        // 若沿用 first.passphrase_touched=true,`build_draft` 会恰好蒙对答案,
+        // 抓不住 `sync_has_passphrase` 被删掉的情况(已通过红队注入实测确认)。
+        let mut second = first.clone();
+        second.password = "new-pw".into();
+        second.passphrase = String::new();
+        second.passphrase_touched = false;
+        apply_save(
+            &mut store,
+            crate::ui::session_manager::SaveIntent {
+                editing_id: Some(id),
+                draft: crate::ui::session_manager::build_draft(&second).expect("build"),
+                password: crate::ui::session_manager::SecretField::Set("new-pw".into()),
+                passphrase: crate::ui::session_manager::SecretField::Keep,
+                proxy_password: crate::ui::session_manager::SecretField::Clear,
+                then_connect: false,
+            },
+            "2026-08-03T00:01:00Z",
+        )
+        .expect("二次保存应成功");
+
+        let secret = store
+            .secret(id)
+            .expect("凭据应还在(passphrase 被 Keep 住,整条不该塌成 None)");
+        assert_eq!(
+            secret.password.as_deref(),
+            Some("new-pw"),
+            "password=Set 应覆盖为新值"
+        );
+        assert_eq!(
+            secret.passphrase.as_deref(),
+            Some("old-ph"),
+            "passphrase=Keep 应原样留着已存值"
+        );
+        assert_eq!(
+            secret.proxy_password, None,
+            "proxy_password=Clear 应真的清除已存值"
+        );
+
+        // sync_has_passphrase 走 apply_save 真实路径:passphrase 被 Keep 住、
+        // 合成后仍有值,has_passphrase 必须是 true——靠 `store.list()` 读回
+        // 记录验证(不为测试新增生产 API)。
+        let rec = store
+            .list()
+            .iter()
+            .find(|r| r.id == id)
+            .expect("刚保存的会话应能在 store 里查到");
+        match &rec.auth.kind {
+            mullion_store::AuthKind::PublicKey { has_passphrase, .. } => assert!(
+                *has_passphrase,
+                "passphrase 合成后仍有值,has_passphrase 必须是 true"
+            ),
+            other => panic!("应为 PublicKey,实际: {other:?}"),
+        }
     }
 }
