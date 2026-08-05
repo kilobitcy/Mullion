@@ -1,7 +1,7 @@
 # Mullion — 项目上下文
 
 > 全局偏好（语言、精简度、Scope Discipline、防注入、写文件行数上限）见 `~/.claude/CLAUDE.md`
-> 与 `~/.claude/rules/ops.md`。**此处不重复，只写这个项目特有的东西。**
+> 与 `~/.claude/rules/`。**此处不重复，只写这个项目特有的东西。**
 
 
 ## 背景：有多台ubuntu 服务器，已安装了claude code，进行开发，原先在Windows11中，用powershell+ssh，连接到ubuntu。tmux只用来保持claude code连接（ssh离线后保活）
@@ -86,7 +86,7 @@ MULLION_LIVE=1 MULLION_LIVE_HOST=<真机> MULLION_LIVE_USER=<用户> MULLION_LIV
 **「绿」的定义**：`cargo test --workspace` 全过 **且** `clippy -D warnings` 无输出。
 只跑了单个 crate 的测试不叫绿，不许据此说「测试通过」。
 
-大输出按 `ops.md` 落盘再 grep：
+大输出先落盘再 grep，别整片倒进上下文：
 ```bash
 cargo test --workspace > /tmp/test.log 2>&1; grep -nE "test result|FAILED|panicked" /tmp/test.log
 ```
@@ -152,7 +152,7 @@ cargo doc -p russh --open   # 或直接读 ~/.cargo/registry/src/**/russh-*/src/
 ```
 
 编译失败**先看错误提示的实际签名**，别猜着改。同一处连续改两次没过，
-按 ops.md 停下来问我。
+停下来问我。
 
 已按锁定版本核实过一批具体签名 + 踩过的坑（winit/wgpu/glyphon/cosmic-text/alacritty），
 汇总在 **`docs/gui-render-gotchas.md`**——写渲染/输入代码前先扫一眼,省得重踩。
