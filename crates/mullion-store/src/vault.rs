@@ -250,14 +250,21 @@ impl Vault {
     /// 本 crate 不接 `log`,排查这类问题目前唯一的线索就是这段文档。
     pub fn resolve_for(&self, id: SessionId) -> Result<crate::inherit::ResolvedConfig, StoreError> {
         let s = self.get(id).ok_or(StoreError::NotFound(id))?;
-        let g = s
-            .identity
-            .group_id
-            .and_then(|gid| self.groups.iter().find(|g| g.id == gid));
-        Ok(match g {
-            Some(g) => crate::inherit::resolve(&[s as &dyn crate::inherit::PrefsLayer, g]),
-            None => crate::inherit::resolve(&[s as &dyn crate::inherit::PrefsLayer]),
-        })
+        Ok(self.resolve_layer(s, s.identity.group_id))
+    }
+
+    /// `resolve_for` 的参数化内核:直接吃一层 prefs + 它所属的分组 id,
+    /// 不要求该层已经入库 —— F92「测试连接」解析的是尚未保存的草稿。
+    /// 悬空 `group_id` 的静默降级语义与 `resolve_for` 完全一致(见上)。
+    pub fn resolve_layer(
+        &self,
+        layer: &dyn crate::inherit::PrefsLayer,
+        group_id: Option<crate::model::GroupId>,
+    ) -> crate::inherit::ResolvedConfig {
+        match group_id.and_then(|gid| self.groups.iter().find(|g| g.id == gid)) {
+            Some(g) => crate::inherit::resolve(&[layer, g]),
+            None => crate::inherit::resolve(&[layer]),
+        }
     }
 
     /// 展开一条会话的完整跳板链(F5)。返回按拨号顺序排列的**跳板会话记录**。
@@ -265,15 +272,37 @@ impl Vault {
     /// 返回记录而非 id:调用方(app)接下来要拿每一跳的 host/user/认证去物化 `Hop`,
     /// 让它再查一遍索引没有意义。
     pub fn expand_jump_chain(&self, id: SessionId) -> Result<Vec<SessionRecord>, StoreError> {
-        let sessions: std::collections::BTreeMap<SessionId, SessionRecord> =
-            self.list().iter().map(|r| (r.id, r.clone())).collect();
-        let groups: std::collections::BTreeMap<crate::model::GroupId, crate::group::GroupRecord> =
-            self.groups().iter().map(|g| (g.id, g.clone())).collect();
+        let (sessions, groups) = self.jump_index();
         if !sessions.contains_key(&id) {
             return Err(StoreError::NotFound(id));
         }
         let ids = crate::jump::expand_chain(id, &sessions, &groups)?;
         Ok(ids.into_iter().map(|i| sessions[&i].clone()).collect())
+    }
+
+    /// `expand_jump_chain` 的参数化内核:直接吃一条跳板链(通常来自
+    /// `resolve_layer(..).jump`),发起方不必已入库 —— F92 拨的是草稿。
+    pub fn expand_jump_chain_of(
+        &self,
+        chain: &[crate::network::JumpRef],
+    ) -> Result<Vec<SessionRecord>, StoreError> {
+        let (sessions, groups) = self.jump_index();
+        let ids = crate::jump::expand_chain_of(chain, &sessions, &groups)?;
+        Ok(ids.into_iter().map(|i| sessions[&i].clone()).collect())
+    }
+
+    /// 建两张全量索引。展开跳板要读每个跳板会话自身(含继承)的链,
+    /// 只传目标那一条不够。
+    fn jump_index(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<SessionId, SessionRecord>,
+        std::collections::BTreeMap<crate::model::GroupId, crate::group::GroupRecord>,
+    ) {
+        (
+            self.list().iter().map(|r| (r.id, r.clone())).collect(),
+            self.groups().iter().map(|g| (g.id, g.clone())).collect(),
+        )
     }
 
     #[cfg(test)]

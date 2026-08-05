@@ -22,9 +22,49 @@ pub fn expand_chain(
     sessions: &BTreeMap<SessionId, SessionRecord>,
     groups: &BTreeMap<crate::model::GroupId, crate::group::GroupRecord>,
 ) -> Result<Vec<SessionId>, StoreError> {
+    let rec = sessions
+        .get(&target)
+        .ok_or(StoreError::JumpDangling(target))?;
+    let chain = resolve(&layers_for(rec, groups)).jump;
+    expand_from(Some(target), &chain, sessions, groups)
+}
+
+/// 从一条**已给定**的跳板链展开(F92)。发起方是尚未保存的草稿:它还没有
+/// id,不可能被任何已存记录引用,因此不参与环检测。
+///
+/// 除入口外,与 `expand_chain` 共用同一个内核 —— 草稿路径和已保存路径
+/// 的展开语义(递归、去重、环/悬空/超深判定)必须完全一致,否则「测试通过
+/// 但保存后连不上」。
+pub fn expand_chain_of(
+    chain: &[crate::network::JumpRef],
+    sessions: &BTreeMap<SessionId, SessionRecord>,
+    groups: &BTreeMap<crate::model::GroupId, crate::group::GroupRecord>,
+) -> Result<Vec<SessionId>, StoreError> {
+    expand_from(None, chain, sessions, groups)
+}
+
+/// 两个入口共用的内核。`origin` 只用于环检测入栈与错误定位;
+/// `None` = 发起方尚未入库。
+fn expand_from(
+    origin: Option<SessionId>,
+    chain: &[crate::network::JumpRef],
+    sessions: &BTreeMap<SessionId, SessionRecord>,
+    groups: &BTreeMap<crate::model::GroupId, crate::group::GroupRecord>,
+) -> Result<Vec<SessionId>, StoreError> {
     let mut out = Vec::new();
-    let mut on_stack = Vec::new();
-    visit(target, sessions, groups, &mut out, &mut on_stack)?;
+    let mut on_stack: Vec<SessionId> = origin.into_iter().collect();
+    for hop in chain {
+        visit(hop.0, sessions, groups, &mut out, &mut on_stack)?;
+        if !out.contains(&hop.0) {
+            out.push(hop.0);
+        }
+    }
+    if out.len() > MAX_JUMP_DEPTH {
+        // out 非空(len > MAX),`last()` 必有值。
+        return Err(StoreError::JumpTooDeep(origin.unwrap_or_else(|| {
+            *out.last().expect("out.len() > MAX_JUMP_DEPTH 时必非空")
+        })));
+    }
     Ok(out)
 }
 
@@ -301,5 +341,41 @@ mod tests {
         let idx = index(vec![rec(1, vec![2]), b]);
         let got = expand_chain(SessionId(1), &idx, &no_groups()).unwrap();
         assert_eq!(got, vec![SessionId(2)], "链里只有会话 id,代理不参与");
+    }
+
+    /// F92:从一条**给定的**跳板链展开,发起方不必存在于索引里 ——
+    /// 「测试连接」拨的是还没保存、还没有 id 的草稿。
+    ///
+    /// 自证变红的方式:把 `expand_chain_of` 改成忽略 `chain` 参数、
+    /// 直接返回空 vec。
+    #[test]
+    fn chain_of_expands_without_an_existing_origin_session() {
+        // 草稿要经 2,而 2 自己要经 3 —— 拨号顺序必须是 3 → 2。
+        let idx = index(vec![rec(2, vec![3]), rec(3, vec![])]);
+        let chain = vec![JumpRef(SessionId(2))];
+        let got = expand_chain_of(&chain, &idx, &no_groups()).unwrap();
+        assert_eq!(got, vec![SessionId(3), SessionId(2)]);
+    }
+
+    /// F92:草稿路径的安全属性一个都不能少 —— 悬空跳板照样硬失败,
+    /// 绝不静默降级成直连(用户会以为流量过了堡垒机)。
+    ///
+    /// 自证变红的方式:把 `visit` 里的 `.ok_or(StoreError::JumpDangling(id))?`
+    /// 改成 `else { return Ok(()) }`。
+    #[test]
+    fn chain_of_still_rejects_dangling_and_cyclic_hops() {
+        let idx = index(vec![rec(2, vec![])]);
+        let err = expand_chain_of(&[JumpRef(SessionId(42))], &idx, &no_groups()).unwrap_err();
+        assert!(
+            matches!(err, StoreError::JumpDangling(SessionId(42))),
+            "悬空引用必须报错,实际: {err:?}"
+        );
+
+        let cyc = index(vec![rec(1, vec![2]), rec(2, vec![1])]);
+        let err = expand_chain_of(&[JumpRef(SessionId(1))], &cyc, &no_groups()).unwrap_err();
+        assert!(
+            matches!(err, StoreError::JumpCycle(_)),
+            "环必须报错,实际: {err:?}"
+        );
     }
 }

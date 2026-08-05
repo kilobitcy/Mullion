@@ -73,6 +73,25 @@ fn session_row(
             theme::c32(t.fg_ghost)
         },
     );
+    // §6.3:状态点加 tooltip。它是手绘的,没有 Response,只能补一次
+    // interact —— 否则用户只能靠猜「这个绿点是什么意思」。
+    //
+    // 这一层 hover-only interact 会不会抢走 `resp.hovered()`(整行高亮背景
+    // 依赖它)?不会:egui-0.30.0 `interaction.rs::interact()` 里,当前没有
+    // 点击/拖拽发生时,`hovered` 集合 = `hits.click ∪ hits.drag` 再加上「所有
+    // 注册顺序不早于 `top_interactive_order`(即最上层可点击/拖拽部件)的
+    // `contains_pointer` 部件」(见该函数 243-284 行的注释与实现)。`dot_rect`
+    // 只 sense `hover()`,不参与 `hits.click` 的判定,`hits.click` 仍然是这一行
+    // 本身(`allocate_exact_size` 用 `Sense::click()` 注册,是当前唯一的
+    // 可点击命中);而 dot 的 `interact()` 调用在这一行之后才发生,注册顺序
+    // 更靠后(更「上层」),所以会被上述规则一并并入 `hovered` 集合 —— 行和
+    // 点会同时 hovered,不是互斥关系。
+    let dot_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        egui::vec2(12.0, 12.0),
+    );
+    ui.interact(dot_rect, resp.id.with("dot"), egui::Sense::hover())
+        .on_hover_text(if connected { "已连接" } else { "未连接" });
     p.text(
         egui::pos2(rect.left() + 30.0, rect.top() + 7.0),
         egui::Align2::LEFT_TOP,
@@ -85,7 +104,10 @@ fn session_row(
         egui::Align2::LEFT_TOP,
         format!("{}@{}", rec.auth.user, rec.connection.host),
         egui::FontId::proportional(11.0),
-        theme::c32(t.fg_faint),
+        // WCAG AA:fg_faint(#565b70) on panel_bg(#14161f) 只有 2.69:1,
+        // fg_dimmer(#8a90a8) 是 5.71:1。不动 token 本身 —— 它在别处
+        // (禁用态、装饰线)是对的。
+        theme::c32(t.fg_dimmer),
     );
     resp
 }

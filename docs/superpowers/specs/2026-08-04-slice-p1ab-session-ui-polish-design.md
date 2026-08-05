@@ -641,7 +641,7 @@ assert!(editor_rect.right() <= window_rect.right() + SLACK);
 | `mullion-core` | 无 | — |
 | `mullion-term` | 无 | — |
 | `mullion-ssh` | **有**：`SshConnection::disconnect()` 一个薄方法（§9.1） | 否，仍是被 app 单向依赖 |
-| `mullion-store` | 无 | — |
+| `mullion-store` | **有**：`resolve_for` / `expand_jump_chain` 各抽一个参数化内核（`resolve_layer` / `expand_jump_chain_of`），已保存路径改调同一内核；`SessionDraft` 实现 `PrefsLayer`。**只加不改语义**，13 条 `jump.rs` 既有测试一行未动仍全绿 | 否，仍是被 app 单向依赖；本 crate 仍零 UI、零 async |
 | `mullion-app` | 其余全部改动 | 否，`app → {…}` 方向不变 |
 
 `validate.rs` / `keyscan.rs` 虽在 `mullion-app` 内，但零 egui 依赖、可无窗口单测 ——

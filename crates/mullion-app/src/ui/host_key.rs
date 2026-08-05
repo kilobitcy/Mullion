@@ -37,6 +37,8 @@ pub struct HostKeyView<'a> {
     pub previous: Option<&'a str>,
     /// 弹窗已开的秒数。
     pub elapsed_secs: u64,
+    /// `false` = 这次接受只对本次连接有效,不写 known_hosts(F92 拨测)。
+    pub persist: bool,
 }
 
 impl HostKeyView<'_> {
@@ -124,6 +126,13 @@ pub fn show(ctx: &egui::Context, view: &HostKeyView<'_>, reply: &mut Option<bool
         } else {
             ui.label(format!("远端约 {left} 秒后会因超时断开握手。"));
         }
+        if !view.persist {
+            ui.add_space(6.0);
+            ui.colored_label(
+                crate::theme::c32(crate::theme::MULLION_DARK.fg_dim),
+                "本次测试不会记住此指纹,正式连接时会再次询问。",
+            );
+        }
         ui.separator();
         ui.horizontal(|ui| {
             // 变更态把「取消连接」放在最左(默认位),接受要多走一步。
@@ -160,6 +169,7 @@ mod tests {
             fingerprint: "SHA256:BBBB",
             previous: Some("SHA256:AAAA"),
             elapsed_secs: 0,
+            persist: true,
         };
         let first = HostKeyView {
             previous: None,
@@ -178,6 +188,7 @@ mod tests {
             fingerprint: "SHA256:BBBB",
             previous: None,
             elapsed_secs: 999,
+            persist: true,
         };
         // 不能出现负数/回绕的「剩余 18446744073709551615 秒」。
         assert_eq!(v.grace_left_secs(), 0);

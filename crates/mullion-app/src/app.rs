@@ -11,7 +11,7 @@ use mullion_core::layout::PaneId;
 use mullion_ssh::config::SshConfig;
 use mullion_ssh::known_hosts::HostKeyPolicy;
 use mullion_ssh::session::{SshConnection, SshSession};
-use mullion_store::known_hosts::{HostKeyEntry, KnownHostsFile};
+use mullion_store::known_hosts::KnownHostsFile;
 use mullion_term::keymap::{Key, WheelAction};
 use mullion_term::Scroll;
 use tokio::runtime::Runtime;
@@ -73,6 +73,10 @@ pub enum UserEvent {
         /// 会给用户弹一条跟当前连接毫不相干的错误 toast,必须按世代过滤。
         generation: u64,
     },
+    /// F92:一次拨测成功。`u64` 是发起时的世代号,过期的直接丢。
+    ProbeOk(u64),
+    /// F92:一次拨测失败(含超时)。
+    ProbeErr(u64, String),
 }
 
 /// 窗口出现后才建的 GPU 相关状态。
@@ -169,6 +173,12 @@ pub struct App {
     /// 当前已连接的会话(状态点用)。`ConnectOk` 时从 `ui.connect_request_last`
     /// 记下来,`UserEvent::ConnectOk` 本身不带 SessionId。
     connected_session: Option<mullion_store::SessionId>,
+    /// F92 拨测世代号。切会话 / 关编辑器 / 关会话管理器时 +1,
+    /// 迟到的结果据此丢弃(见 `accept_probe`)。
+    probe_epoch: u64,
+    /// 在途拨测任务。退出或取消时 abort —— 20 秒的 timeout 悬着不管,
+    /// 关窗后进程还要多活 20 秒。
+    probe_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -214,6 +224,8 @@ impl App {
             autoscroll: 0,
             pending_paste: None,
             connected_session: None,
+            probe_epoch: 0,
+            probe_task: None,
         }
     }
 
@@ -537,6 +549,7 @@ impl App {
         let policy: Arc<dyn HostKeyPolicy> = Arc::new(crate::host_key::PromptingPolicy::new(
             self.known_hosts.clone(),
             self.proxy.clone(),
+            true,
         ));
         self._runtime.spawn(async move {
             let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -608,6 +621,70 @@ impl App {
                 }
             });
         }
+    }
+
+    /// F92:拨一次完整认证后立刻断开。**不开 channel、不起 pty** ——
+    /// 拨测只回答「这条链路加上这份凭据能不能登上去」。
+    fn spawn_probe(&mut self, cfg: SshConfig) {
+        /// 拨测超时。比正常连接短:用户是站在弹窗前等结果的,
+        /// 超过这个数就该告诉他「不通」,而不是继续转圈。
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+        self.probe_epoch = self.probe_epoch.wrapping_add(1);
+        let epoch = self.probe_epoch;
+        let proxy = self.proxy.clone();
+        // persist=false:拨测遇到未知指纹只信任本次,绝不写 known_hosts。
+        let policy: Arc<dyn HostKeyPolicy> = Arc::new(crate::host_key::PromptingPolicy::new(
+            self.known_hosts.clone(),
+            self.proxy.clone(),
+            false,
+        ));
+        let h = self._runtime.spawn(async move {
+            let ev = match tokio::time::timeout(
+                PROBE_TIMEOUT,
+                mullion_ssh::session::establish(&cfg, policy),
+            )
+            .await
+            {
+                Err(_) => UserEvent::ProbeErr(epoch, "超时(20s):链路不通或对端无响应".to_owned()),
+                Ok(Err(e)) => UserEvent::ProbeErr(epoch, e.to_string()),
+                Ok(Ok(c)) => {
+                    // russh 的 Drop 不发 disconnect,必须显式断(见 SshConnection::disconnect)。
+                    c.disconnect().await;
+                    UserEvent::ProbeOk(epoch)
+                }
+            };
+            let _ = proxy.send_event(ev);
+        });
+        // 覆盖前先 abort 上一个:用户连点两次「测试连接」不该留下孤儿任务。
+        if let Some(old) = self.probe_task.replace(h) {
+            old.abort();
+        }
+    }
+
+    /// 按当前表单(含未保存改动)组拨测用的 SshConfig。
+    ///
+    /// 凭据三态合成必须带上库里的旧值 —— 编辑已有会话时用户多半没重输
+    /// 密码,`build_draft` 自己看不到 store,合成出来是 None,拨测会误报
+    /// 「缺少凭据」。这一步和 `apply_save` 做的是同一件事。
+    fn build_probe_config(&self) -> Result<SshConfig, String> {
+        let buf = self.ui.editor.as_ref().ok_or("没有正在编辑的会话")?;
+        let mut draft = crate::ui::session_manager::build_draft(buf)?;
+        let existing = self
+            .ui
+            .editor_id
+            .and_then(|id| self.store.as_ref().and_then(|s| s.secret(id)));
+        let (pw, pp, proxy) = crate::ui::session_manager::secret_fields(buf);
+        draft.secret = crate::ui::session_manager::merge_secret(existing, &pw, &pp, &proxy);
+        // 复用既有的 `sync_has_passphrase`(`apply_save` 用的是同一个),
+        // 不要在这里手写第二份 `AuthKind::PublicKey { has_passphrase }` 同步逻辑 ——
+        // 两份迟早漂移,而漂移的后果是「测试通过、保存后要不到口令」。
+        let merged = draft.secret.clone();
+        crate::ui::session_manager::sync_has_passphrase(&mut draft, merged.as_ref());
+        let store = self.store.as_ref().ok_or("会话库不可用")?;
+        store
+            .ssh_config_for_draft(&draft)
+            .map_err(|e| e.to_string())
     }
 
     /// 私钥文件对话框:另起线程跑,结果经 `proxy` 回送。
@@ -895,6 +972,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.ui.set_error(msg);
                 self.request_ui_redraw();
             }
+            UserEvent::ProbeOk(epoch) => {
+                crate::app::accept_probe(epoch, self.probe_epoch, &mut self.ui.probe, Ok(()));
+                self.request_ui_redraw();
+            }
+            UserEvent::ProbeErr(epoch, msg) => {
+                crate::app::accept_probe(epoch, self.probe_epoch, &mut self.ui.probe, Err(msg));
+                self.request_ui_redraw();
+            }
         }
     }
 
@@ -957,6 +1042,10 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 crate::logx::line("CloseRequested → 退出");
+                // F92:进程要走了,20 秒的 timeout 别悬着。
+                if let Some(h) = self.probe_task.take() {
+                    h.abort();
+                }
                 event_loop.exit();
             }
             // 焦点/遮挡:记录以便定位「失焦后无法回到前台/黑屏」;回到前台时补一次
@@ -1204,6 +1293,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     elapsed_secs: self
                                         .host_key_since
                                         .map_or(0, |t| t.elapsed().as_secs()),
+                                    persist: p.persist,
                                 }
                             });
                             // 与 host_key_view 同理:`self.pending_paste` 与
@@ -1478,27 +1568,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(accept) = self.ui.host_key_reply.take() {
                     if let Some(prompt) = self.pending_host_key.take() {
                         self.host_key_since = None;
-                        if accept {
-                            diag::mark(diag::Stage::StoreIo);
-                            // 与 host_key.rs 同源:GUI 线程 panic 比 tokio 线程更糟
-                            // (直接崩窗口),锁中毒时恢复而不是 expect。
-                            let mut kh = self.known_hosts.lock().unwrap_or_else(|e| e.into_inner());
-                            kh.record(
-                                &prompt.host,
-                                HostKeyEntry {
-                                    algo: prompt.algo.clone(),
-                                    fingerprint: prompt.fingerprint.clone(),
-                                },
-                            );
-                            // 落盘失败不阻断本次连接:指纹已在内存表里,连接照常;
-                            // 代价只是下次启动会再问一遍。last_error 的展示位可能
-                            // 随后被别的事件(如 ConnectOk 关掉会话管理器)挪走,
-                            // 磁盘日志(ADR-008)是这类静默失败的兜底取证手段。
-                            if let Err(e) = kh.save() {
-                                crate::logx::line(&format!("主机指纹落盘失败:{e}"));
-                                self.ui
-                                    .set_error(format!("主机指纹未能保存:{e}(本次连接不受影响)"));
-                            }
+                        // 落盘失败不阻断本次连接:指纹已在内存表里,连接照常;
+                        // 代价只是下次启动会再问一遍。last_error 的展示位可能
+                        // 随后被别的事件(如 ConnectOk 关掉会话管理器)挪走,
+                        // 磁盘日志(ADR-008)是这类静默失败的兜底取证手段。
+                        if let Err(e) =
+                            crate::host_key::persist_if_allowed(&self.known_hosts, &prompt, accept)
+                        {
+                            crate::logx::line(&format!("主机指纹落盘失败:{e}"));
+                            self.ui
+                                .set_error(format!("主机指纹未能保存:{e}(本次连接不受影响)"));
                         }
                         // 送回握手线程。Err = 对端已走(超时/断开),没什么可做的。
                         let _ = prompt.reply.send(accept);
@@ -1510,6 +1589,25 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(text) = self.pending_paste.take() {
                         if accept {
                             self.send_paste(&text);
+                        }
+                    }
+                }
+                // F92:「测试连接」。取消优先于发起 —— 同一帧里既取消又点测试的
+                // 唯一可能是切换会话时手抖,那也该以新表单为准。
+                if std::mem::take(&mut self.ui.probe_cancel) {
+                    crate::app::cancel_probe(&mut self.probe_epoch, &mut self.ui.probe);
+                    if let Some(h) = self.probe_task.take() {
+                        h.abort();
+                    }
+                }
+                if std::mem::take(&mut self.ui.probe_click) {
+                    match self.build_probe_config() {
+                        Ok(cfg) => {
+                            self.ui.probe = crate::ui::session_manager::ProbeState::Running;
+                            self.spawn_probe(cfg);
+                        }
+                        Err(msg) => {
+                            self.ui.probe = crate::ui::session_manager::ProbeState::Err(msg);
                         }
                     }
                 }
@@ -1596,6 +1694,38 @@ fn generation_matches(ws: &Workspace, generation: u64) -> bool {
 /// 纯函数(只读 `&Workspace`),不碰 `EventLoopProxy`,可脱离真实事件循环单测。
 fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
     generation_matches(ws, generation) && mullion_core::layout::leaves(ws.tree()).contains(&id)
+}
+
+/// 采纳一次拨测结果:世代号对得上才写状态。返回是否采纳。
+///
+/// 抽成自由函数是为了能脱离窗口/运行时单测 —— 事件循环里那一大坨
+/// 是本项目最难测的地方,判定逻辑绝不能埋在里面。
+pub(crate) fn accept_probe(
+    epoch: u64,
+    current: u64,
+    state: &mut crate::ui::session_manager::ProbeState,
+    outcome: Result<(), String>,
+) -> bool {
+    use crate::ui::session_manager::ProbeState;
+    if epoch != current {
+        return false;
+    }
+    *state = match outcome {
+        Ok(()) => ProbeState::Ok,
+        Err(msg) => ProbeState::Err(msg),
+    };
+    true
+}
+
+/// 取消在途拨测:自增世代号让迟到的结果失效,并清掉已作废的结论。
+///
+/// 两件事缺一不可。只自增世代号的话,在「切会话」与「施加取消意图」之间
+/// 到达的结果仍会被 `accept_probe` 采纳(那一刻世代号还没变),把一个已经
+/// 不对应任何表单的「连接成功」永久留在 `ui.probe` 上 —— 用户下次编辑
+/// 无关会话时会看到凭空冒出的绿色成功卡片。
+pub(crate) fn cancel_probe(epoch: &mut u64, state: &mut crate::ui::session_manager::ProbeState) {
+    *epoch = epoch.wrapping_add(1);
+    *state = crate::ui::session_manager::ProbeState::Idle;
 }
 
 /// Important #2:`App::sync_timeout_wake` 的核心决策抽成自由函数——只吃
@@ -2491,5 +2621,64 @@ mod tests {
             ),
             other => panic!("应为 PublicKey,实际: {other:?}"),
         }
+    }
+
+    /// F92:世代号变了就必须丢弃迟到的拨测结果。
+    ///
+    /// 场景:对 A 点了「测试连接」,20 秒超时未到就切到了 B。若不校验世代,
+    /// A 的结果会写到 B 的表单上 —— 用户看到「连接成功」,其实测的是别人。
+    ///
+    /// 自证变红的方式:把 `accept_probe` 里 `epoch == current` 的守卫去掉,
+    /// 而不是改测试里传的 epoch 值。
+    #[test]
+    fn stale_probe_result_is_discarded_after_epoch_bump() {
+        use crate::ui::session_manager::ProbeState;
+
+        let mut state = ProbeState::Running;
+        // 当前世代 7,回来的是 6 —— 期间切过一次会话。
+        assert!(!crate::app::accept_probe(6, 7, &mut state, Ok(())));
+        assert_eq!(state, ProbeState::Running, "过期结果不许改动状态");
+
+        // 同世代的结果照常采纳。
+        assert!(crate::app::accept_probe(7, 7, &mut state, Ok(())));
+        assert_eq!(state, ProbeState::Ok);
+
+        let mut state = ProbeState::Running;
+        assert!(crate::app::accept_probe(
+            3,
+            3,
+            &mut state,
+            Err("超时".to_owned())
+        ));
+        assert_eq!(state, ProbeState::Err("超时".to_owned()));
+    }
+
+    /// F92:取消拨测必须**同时**自增世代号和清掉旧结论。
+    ///
+    /// 只做前者会漏掉一个窗口期:`close_session_manager` 设 `probe_cancel`
+    /// 是在 UI/事件回调里,真正施加要等到下一次重绘。这中间到达的结果
+    /// 世代号还是旧的、会被采纳,于是一个作废的「连接成功」留在状态里,
+    /// 下次编辑无关会话时凭空出现。
+    ///
+    /// 自证变红的方式:把 `cancel_probe` 里的 `*state = ProbeState::Idle;`
+    /// 删掉(第二条断言变红),或把 `wrapping_add(1)` 改成不自增
+    /// (第一、三条变红)。都要改**产品代码**,不是改测试里的初值。
+    #[test]
+    fn cancelling_a_probe_bumps_the_epoch_and_clears_the_stale_verdict() {
+        use crate::ui::session_manager::ProbeState;
+
+        let mut epoch = 7u64;
+        // 窗口期内被采纳的、已经作废的结论。
+        let mut state = ProbeState::Ok;
+
+        crate::app::cancel_probe(&mut epoch, &mut state);
+
+        assert_eq!(epoch, 8, "取消必须自增世代,否则在途结果还会被采纳");
+        assert_eq!(state, ProbeState::Idle, "作废的结论不许留在表单上");
+
+        // 自增之后,旧世代的结果确实进不来了。
+        let mut later = ProbeState::Running;
+        assert!(!crate::app::accept_probe(7, epoch, &mut later, Ok(())));
+        assert_eq!(later, ProbeState::Running);
     }
 }

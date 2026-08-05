@@ -74,6 +74,23 @@ impl PrefsLayer for crate::group::GroupRecord {
     }
 }
 
+/// 草稿也是一层可继承偏好 —— F92「测试连接」要按尚未保存的表单解析
+/// 代理与跳板,而解析入口只认 `PrefsLayer`。
+impl PrefsLayer for crate::vault::SessionDraft {
+    fn tags(&self) -> &[String] {
+        &self.identity.tags
+    }
+    fn terminal(&self) -> &TerminalPrefs {
+        &self.terminal
+    }
+    fn appearance(&self) -> &AppearancePrefs {
+        &self.appearance
+    }
+    fn network(&self) -> &NetworkPrefs {
+        &self.network
+    }
+}
+
 /// 继承解析后的最终配置。
 ///
 /// 「无会话」时的默认值请调用 `resolve(&[])` 取,**不要给本结构派生 `Default`**——

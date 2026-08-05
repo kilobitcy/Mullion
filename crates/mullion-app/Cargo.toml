@@ -17,7 +17,10 @@ mullion-store = { path = "../mullion-store" }
 winit.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
-tokio.workspace = true
+# 拨测(F92)要 tokio::time::timeout。现在不写也能编过,是因为 russh 0.54.5
+# 打开了 tokio 的 time —— feature 是并集,靠别人的依赖泄漏过来是运气,
+# 哪天 russh 收窄就整片编不过。显式声明。
+tokio = { workspace = true, features = ["time"] }
 russh.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 directories = "5"

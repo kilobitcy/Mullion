@@ -112,6 +112,21 @@ impl SshConnection {
     pub fn jump_handle_count(&self) -> usize {
         self._jumps.len()
     }
+
+    /// 主动断开:先断目标主机,再逐个断跳板。
+    ///
+    /// 不能只靠 Drop —— russh 0.54.5 的 `impl Drop for Handle` 只
+    /// `debug!("drop handle")`,既不发 disconnect 也不 abort 后台任务。
+    /// 拨测(F92)一秒钟能点好几次,漏断就是在对端堆半开连接。
+    pub async fn disconnect(&self) {
+        let _ = self
+            .handle
+            .disconnect(russh::Disconnect::ByApplication, "", "")
+            .await;
+        for h in &self._jumps {
+            let _ = h.disconnect(russh::Disconnect::ByApplication, "", "").await;
+        }
+    }
 }
 
 /// 连接 + 认证 + 主机校验。成功返回存活的连接(PTY 由 open_pty 接)。

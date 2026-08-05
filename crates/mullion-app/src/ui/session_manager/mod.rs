@@ -9,7 +9,9 @@
 mod buffer;
 mod editor;
 mod fields;
+mod keyscan;
 mod list;
+mod validate;
 
 pub(crate) use buffer::{
     build_draft, connect_string, is_dirty, merge_secret, secret_fields, sync_has_passphrase,
@@ -17,6 +19,7 @@ pub(crate) use buffer::{
 pub(crate) use buffer::{AuthKindUi, ProxyModeUi};
 pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget};
 
+use egui::NumExt as _;
 use mullion_store::{GroupId, GroupRecord, SessionId, SessionRecord};
 
 use crate::theme::{self, Theme};
@@ -27,6 +30,19 @@ use super::UiState;
 pub(crate) const WINDOW_W: f32 = 880.0;
 pub(crate) const WINDOW_H: f32 = 560.0;
 pub(crate) const LIST_W: f32 = 300.0;
+/// 左栏拖拽下限。再窄「user@host」副文本就没法读了。
+pub(crate) const LIST_MIN_W: f32 = 220.0;
+/// 左栏拖拽上限。与 `WINDOW_W` 联立,但**别信纸面公式**——两栏
+/// `inner_margin` 各 14、两侧共 28,「880 - 440 - 28 = 412」看着像右栏
+/// 内容宽,但 egui 的 `Window` 内容区实际取 `default_size`(880),不是
+/// 「`WINDOW_W` 减两侧 `window_margin`」,公式口径本就对不上实现。
+/// 唯一可信的是实测:用真实指针事件把分隔条拖到 `LIST_MAX_W`=440,读回
+/// `editor_root_id()` 矩形,右栏内容宽约 412px,相对 400px 的最小可用宽
+/// 只有 12px 余量——不是纸面算出来的 16px。
+/// 改这几个常量任意一个,都必须重跑
+/// `dragging_the_split_does_not_widen_the_window`(它的判定表达式比这里更
+/// 保守,仍然安全,但别再据这段注释的算术去调整 `LIST_MAX_W`)。
+pub(crate) const LIST_MAX_W: f32 = 440.0;
 /// 内容区高度。egui 的 `Window` 高度默认跟内容走,不撑到 `default_size` 给的
 /// 高度;靠这个值把双栏撑满,否则会话少时窗口会缩成一条。见 §3 的待验证假设。
 /// `show()` 里会先跟实际可用高度(减去 `window_chrome_reserve`)取较小值,
@@ -42,6 +58,13 @@ pub(crate) const LIST_W: f32 = 300.0;
 /// only_at_screen_edge` 实测坐实)。现在的天花板只在
 /// `ui.max_rect().height()` 真的超过可用高度那一帧才出手。
 pub(crate) const CONTENT_MIN_HEIGHT: f32 = 480.0;
+
+/// 右栏 Tab 的下标。`editor_tab: usize` 是既有技术债(换 enum 会波及
+/// 所有 Tab 相关代码,不在本切片范围),但至少让「哪个数字是哪个 Tab」
+/// 只有一处真源 —— 否则重排 `editor::TABS` 时编译器不会报错,
+/// `validate::tab()` 会静默把用户导向错误的 Tab。
+pub(crate) const TAB_CONNECT: usize = 0;
+pub(crate) const TAB_AUTH: usize = 1;
 
 /// 计算给 `Window` 自身 chrome(标题栏 + `Frame::window` 的 `inner_margin`)留的
 /// 余量——**不是硬编码常量,是按 egui-0.30.0 实际渲染公式当场算出来的**。
@@ -87,6 +110,17 @@ pub(crate) const CONTENT_MIN_HEIGHT: f32 = 480.0;
 /// 不到的零头。
 const SLACK: f32 = 8.0;
 
+/// 「测试连接」(F92)的四态。存在 `UiState` 里跨帧;真正的拨测在 app.rs
+/// 的 tokio 运行时上跑,靠 `App::probe_epoch` 世代号丢弃过期结果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProbeState {
+    #[default]
+    Idle,
+    Running,
+    Ok,
+    Err(String),
+}
+
 fn window_chrome_reserve(ctx: &egui::Context) -> f32 {
     let style = ctx.style();
     let title_font_height =
@@ -112,6 +146,104 @@ fn group_header(title: &str, gid: Option<GroupId>, count: usize) -> egui::Collap
     egui::CollapsingHeader::new(format!("{title}({count})"))
         .id_salt(gid)
         .default_open(true)
+}
+
+/// 右栏编辑器根 `Ui` 的显式 id。跟 `list::new_button_id()` 同一个理由:
+/// egui 的自动 id 由 `next_auto_id_salt` 计数器派生,外部测试代码算不出来,
+/// 只能挂一个不依赖父 id 栈的全局 id,测试侧用 `Context::read_response`
+/// 读回真实 `Response::rect` 来判定溢出。全程序只出现一次,不会撞 id。
+pub(crate) fn editor_root_id() -> egui::Id {
+    egui::Id::new("mullion_sm_editor_root")
+}
+
+/// 「保存」按钮的显式 id,理由同 `editor_root_id()`:测试要读回它的
+/// `Response::enabled()`,自动 id 外部算不出来。
+pub(crate) fn save_button_id() -> egui::Id {
+    egui::Id::new("mullion_sm_save_button")
+}
+
+/// 「测试连接」按钮的显式 id,理由同 `save_button_id()`。
+pub(crate) fn probe_button_id() -> egui::Id {
+    egui::Id::new("mullion_sm_probe_button")
+}
+
+/// 「复制连接串」按钮的显式 id,理由同 `save_button_id()`。
+pub(crate) fn copy_button_id() -> egui::Id {
+    egui::Id::new("mullion_sm_copy_button")
+}
+
+/// 画一个挂着显式 id 的按钮,并在禁用时附 tooltip。
+///
+/// egui 0.30 的 `Button` 不支持自定义 id,而守护测试必须能
+/// `Context::read_response(id)` 读回 `enabled()` —— 只能自己分配空间、
+/// 用显式 id `interact`、再手绘。这跟 `list.rs::new_button` 是**同一类问题、
+/// 同一套解法**——绘制内核直接照抄它,不要另起一套算法:两者以后要跟
+/// `Button::ui()`(egui-0.30.0 `widgets/button.rs`)的视觉规则保持一致,
+/// 抄同一份实现能保证改一处两边一起改,不会像本函数复核前那样,字号/高度
+/// 地板/底色/圆角/hover 扩张五处悄悄跟原生按钮和 `new_button` 分道扬镳。
+///
+/// 具体对齐点(均见 `button.rs::ui`,行号按锁定版本 egui-0.30.0):
+/// - 字号用 `into_galley(.., TextStyle::Button)` 而非硬编码字号——项目
+///   `theme.rs` 没覆写 `text_styles`,`TextStyle::Button` 是 egui 默认的
+///   12.5,跟旁边原生 `Button`(内部同样用 `TextStyle::Button`)才能对上。
+/// - 高度地板 `.at_least(vec2(0.0, interact_size.y))`(对应 `button.rs:279`
+///   `desired_size.y.at_least(interact_size.y)`),否则矮按钮跟原生按钮
+///   高度对不上。
+/// - 底色用 `visuals.weak_bg_fill`(对应 `button.rs:308`),不是
+///   `visuals.bg_fill`——原生按钮实际就是拿这个字段画底色。
+/// - 圆角用 `visuals.rounding`(当前样式实际值),不硬编码常量——硬编码值
+///   今天凑巧等于 `theme.rs` 里设的值,以后调 theme 这里不会跟着变。
+/// - `rect.expand(visuals.expansion)`:hover/active 时原生按钮会微微扩张,
+///   照抄才有同样的反馈。
+/// - 用 `ui.allocate_space` 占位、`interact` 时才挂显式 id 注册交互,不用
+///   `allocate_exact_size`——后者会顺带用自动 id 注册一次
+///   `Sense::hover` 部件,同一块矩形被注册成两个部件(理由同
+///   `list.rs::new_button` 文档注释,那里已经写过一次,这里不重复整段)。
+///
+/// 外面套 `add_enabled_ui`:`Response::enabled` 取的正是这一层的
+/// `Ui::is_enabled`,不套的话读回来永远是 true——这是 `labeled_button`
+/// 相对 `new_button` 独有的一层,`new_button` 不需要(它没有「禁用」态)。
+pub(super) fn labeled_button(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    text: &str,
+    enabled: bool,
+    on_disabled: Option<&str>,
+) -> bool {
+    let mut clicked = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        let galley = egui::WidgetText::from(text).into_galley(
+            ui,
+            None,
+            ui.available_width(),
+            egui::TextStyle::Button,
+        );
+        let padding = ui.spacing().button_padding;
+        let size =
+            (galley.size() + padding * 2.0).at_least(egui::vec2(0.0, ui.spacing().interact_size.y));
+        let (_auto_id, rect) = ui.allocate_space(size);
+        let resp = ui.interact(rect, id, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let visuals = ui.style().interact(&resp);
+            ui.painter().rect(
+                rect.expand(visuals.expansion),
+                visuals.rounding,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+            );
+            let text_pos = ui
+                .layout()
+                .align_size_within_rect(galley.size(), rect.shrink2(padding))
+                .min;
+            ui.painter().galley(text_pos, galley, visuals.text_color());
+        }
+        if enabled {
+            clicked = resp.clicked();
+        } else if let Some(msg) = on_disabled {
+            resp.on_disabled_hover_text(msg.to_owned());
+        }
+    });
+    clicked
 }
 
 /// 会话管理器弹窗:双栏(左列表 300px + 右编辑表单)合成单窗(F90)。
@@ -158,7 +290,7 @@ pub fn show(
         .collapsible(false)
         .resizable(true)
         .default_size([WINDOW_W, WINDOW_H])
-        .min_width(720.0)
+        .min_width(WINDOW_W)
         .frame(
             egui::Frame::window(&ctx.style())
                 .fill(theme::c32(t.bar_status))
@@ -219,6 +351,32 @@ pub fn show(
                 ui.set_max_height(avail);
             }
 
+            // 地板:让 Window 至少给出容得下「左栏 + 右栏」的宽度。
+            // 不能靠 `Window::min_width` —— 它只约束 Resize 的下限,
+            // 约束不到 CentralPanel 的绘制。
+            let wm = ctx.style().spacing.window_margin;
+            ui.set_min_width(WINDOW_W - (wm.left + wm.right));
+
+            // 天花板:横向可用量另算 —— `window_chrome_reserve` 是纵向量
+            // (标题栏高 + 上下 margin),横向套用是量纲错误。
+            let avail_w = (ctx.available_rect().width() - (wm.left + wm.right) - SLACK).max(0.0);
+            // 必须条件式。`Placer::set_max_width` 是无条件覆写 region.max_rect,
+            // 无脑设会作废 Resize 当帧从拖拽算出的候选尺寸,resize 手柄就拖不动了。
+            if ui.max_rect().width() > avail_w {
+                ui.set_max_width(avail_w);
+            }
+
+            // F94:把这一帧的实际内容宽度报告回外层,否则窗口外框不跟手。
+            // `Window` 内部 `resize.resizable(false)`(「We resize it manually」),
+            // 于是 `Resize::end` 走「Probably a window」分支,用 `last_content_size`
+            // (= content ui 的 `min_rect`)去 `advance_cursor_after_rect`,外框
+            // `outer_rect` 由它算出;而拖拽结果只写进 `desired_size`,只体现在
+            // `max_rect` 上。高度方向靠 `SidePanel` 那条「只增不减」棘轮把两者
+            // 对上了,宽度方向没有任何对应机制——不补这一句,外框宽度就永远停在
+            // 上面那个常量地板,而 `CentralPanel` 按 `max_rect` 铺满画到框外。
+            // 必须放在天花板 clamp **之后**:要报告的是被削过的宽度,不是削之前的。
+            ui.set_min_width(ui.max_rect().width());
+
             // §3.1 降级:没有会话库时不画双栏,只给一句话,避免用户对着空表单填半天。
             if !store_available {
                 ui.colored_label(
@@ -229,12 +387,13 @@ pub fn show(
             }
 
             egui::SidePanel::left(ui.id().with("sm_list"))
-                .exact_width(LIST_W)
-                .resizable(false)
+                .resizable(true)
+                .default_width(LIST_W)
+                .width_range(LIST_MIN_W..=LIST_MAX_W)
                 .frame(
                     egui::Frame::none()
                         .fill(theme::c32(t.panel_bg))
-                        .inner_margin(10.0),
+                        .inner_margin(14.0),
                 )
                 .show_inside(ui, |ui| {
                     list::show(ui, t, ui_state, sessions, groups, connected)
@@ -246,7 +405,12 @@ pub fn show(
                         .fill(theme::c32(t.bar_status))
                         .inner_margin(14.0),
                 )
-                .show_inside(ui, |ui| editor::show(ui, t, ui_state, groups, presence));
+                .show_inside(ui, |ui| {
+                    // 挂显式 id 供守护测试读回真实矩形,见 `editor_root_id()`。
+                    let rect = ui.max_rect();
+                    ui.interact(rect, editor_root_id(), egui::Sense::hover());
+                    editor::show(ui, t, ui_state, groups, presence)
+                });
         });
 
     // 借用已随 `Window::show` 闭包结束而释放,这里才能安全地整体读写
@@ -338,13 +502,22 @@ fn apply_switch(ui_state: &mut UiState, sessions: &[SessionRecord]) {
     // 下一次切换就会弹一个莫名其妙的确认。
     ui_state.editor_baseline = ui_state.editor.clone();
     ui_state.editor_tab = 0;
+
+    // F92:换了会话,上一条的拨测结果不再有意义;快照(`probe_form`)里
+    // 还揣着三个明文凭据字段,一并清掉以缩短明文在内存里的驻留窗口。
+    ui_state.probe = ProbeState::Idle;
+    ui_state.probe_form = None;
+    ui_state.probe_cancel = true;
+    // F93:上一条会话的拖拽提示(如「已取第一个文件,忽略其余 2 个」)不能
+    // 跟着漂到下一条表单上 —— 用户会以为刚才对新会话做了什么。
+    ui_state.key_drop_note = None;
 }
 
 /// 密码框的三态控件(F73)。
 ///
 /// 三个显示状态:
 ///   1. 没碰过 + 库里有值 → 6 个 `*` 占位 + `password(true)`,只读观感;
-///   2. 没碰过 + 库里没值 → 空框 + hint「未设置」;
+///   2. 没碰过 + 库里没值 → 空框 + hint `empty_hint`(由调用方传入,见该参数文档);
 ///   3. 碰过        → 正常可编辑 + 右侧「撤销」按钮。
 ///
 /// **占位符永远不会流进 `SecretField::Set`**:状态 1/2 下 `touched` 是 false,
@@ -354,6 +527,11 @@ fn apply_switch(ui_state: &mut UiState, sessions: &[SessionRecord]) {
 /// 新密码一起存进去。
 ///
 /// 位数固定 6 位:黑点数量若跟真实长度走,就把密码长度泄漏给了肩窥者。
+/// `empty_hint`:状态 2(没碰过 + 库里没值)下显示的占位提示文案。
+///
+/// 不能写死一个文案:本函数被密码、私钥口令、代理口令三处调用,语义并不相同——
+/// 「留空表示无口令」只对私钥口令成立(它确实可选),对密码/代理口令这两个
+/// 字段留空并不等于「无密码」,写死会误导用户,所以由调用方按各自语义传入。
 pub(super) fn secret_edit(
     ui: &mut egui::Ui,
     t: &Theme,
@@ -361,6 +539,7 @@ pub(super) fn secret_edit(
     value: &mut String,
     touched: &mut bool,
     has_stored: bool,
+    empty_hint: &str,
 ) {
     ui.horizontal(|ui| {
         if *touched {
@@ -368,7 +547,7 @@ pub(super) fn secret_edit(
                 egui::TextEdit::singleline(value)
                     .id_salt(id)
                     .password(true)
-                    .desired_width(200.0),
+                    .desired_width(f32::INFINITY),
             );
             if ui.small_button("撤销").clicked() {
                 *touched = false;
@@ -383,21 +562,21 @@ pub(super) fn secret_edit(
                 egui::TextEdit::singleline(&mut placeholder)
                     .id_salt(id)
                     .password(true)
-                    .desired_width(200.0),
+                    .desired_width(f32::INFINITY),
             );
             if resp.gained_focus() {
                 // 一聚焦就翻面:框清空、进入可编辑态。占位符本身从不外流。
                 *touched = true;
                 value.clear();
             }
-            ui.colored_label(theme::c32(t.fg_faint), "已设置(不修改则保持不变)");
+            ui.colored_label(theme::c32(t.fg_dimmer), "已设置(不修改则保持不变)");
         } else {
             let resp = ui.add(
                 egui::TextEdit::singleline(value)
                     .id_salt(id)
                     .password(true)
-                    .hint_text("未设置")
-                    .desired_width(200.0),
+                    .hint_text(empty_hint)
+                    .desired_width(f32::INFINITY),
             );
             if resp.gained_focus() {
                 *touched = true;
@@ -496,7 +675,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = egui::Context::default();
-        // 屏幕宽 1000(超过 `.min_width(720.0)`,不触发宽度相关的约束),
+        // 屏幕宽 1000(超过 `.min_width(WINDOW_W)`(880),不触发宽度相关的约束),
         // 高只有 400 —— 明显小于 `CONTENT_MIN_HEIGHT`(480)。
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 400.0));
         let input = || egui::RawInput {
@@ -541,6 +720,68 @@ mod tests {
              或列表撑满了偏大的可用高度,把底栏顶出了可见区(rect={rect:?})",
             rect.max.y,
             screen_rect.max.y
+        );
+    }
+
+    /// F90:右栏(编辑器)不许画到窗口矩形之外。
+    ///
+    /// 根因是 `SidePanel::show_inside` 用 `expand_to_include_rect` 只增不减地
+    /// 回报尺寸,而 `CentralPanel::show_inside` 吃掉 `available_rect_before_wrap()`
+    /// 却**不回报**——窗口自身没被撑宽,右栏就直接画到窗口外被裁掉。
+    ///
+    /// 自证变红的方式:注释掉 `show()` 里 `ui.set_min_width(...)` 那一行。
+    #[test]
+    fn editor_panel_stays_within_window_rect() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState {
+            session_manager_open: true,
+            editor: Some(EditorBuffer::default()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        // 屏幕给得很宽,窗口本身却只有 default_size 那么大 —— 正是溢出的场景。
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            show(
+                ctx,
+                &t,
+                &mut ui_state,
+                &sessions,
+                &groups,
+                true,
+                None,
+                SecretPresence::default(),
+            );
+        });
+        let mut rects = None;
+        let _ = ctx.run(input(), |ctx| {
+            let window_rect = show(
+                ctx,
+                &t,
+                &mut ui_state,
+                &sessions,
+                &groups,
+                true,
+                None,
+                SecretPresence::default(),
+            );
+            let editor_rect = ctx.read_response(editor_root_id()).map(|r| r.rect);
+            rects = Some((window_rect, editor_rect));
+        });
+        let (window_rect, editor_rect) = rects.expect("闭包必须跑到底,写回两个矩形");
+        let window_rect = window_rect.expect("会话管理器窗口应该已经画出来了");
+        let editor_rect = editor_rect.expect("右栏编辑器应该已经画出来了");
+        assert!(
+            editor_rect.right() <= window_rect.right() + SLACK,
+            "右栏溢出窗口:editor.right={} > window.right={}",
+            editor_rect.right(),
+            window_rect.right()
         );
     }
 
@@ -825,6 +1066,366 @@ mod tests {
              缩小后底边 {}(resize 疑似被永久钉死)",
             clamped.max.y,
             shrunk.max.y
+        );
+    }
+
+    /// F94:横向拖 resize 手柄时,**窗口边框/标题栏必须跟着变宽**,内容不许
+    /// 画到边框外面去。
+    ///
+    /// 症状(Windows 11 实机录屏):往右下拖手柄,右栏内容、底部按钮条确实
+    /// 跟着变宽了,但窗口的圆角边框、标题栏「会话管理器」那一条、右上角的
+    /// 关闭按钮、右下角的 resize 手柄**全部停在原宽度**,内容溢出边框、直接
+    /// 画在窗口外的主背景上。
+    ///
+    /// 根因在 egui 0.30 的两条口径差:
+    /// - `Window` 内部 `resize.resizable(false)`(`window.rs:474`,「We resize
+    ///   it manually」),于是 `Resize::end`(`resize.rs:317-332`)走的是
+    ///   「Probably a window」那条分支——`advance_cursor_after_rect` 用的是
+    ///   `last_content_size`(内容**实际**占用),不是 `desired_size`。窗口
+    ///   外框 `outer_rect` 由 `frame.end()` 从这个 `min_rect` 算出来。
+    /// - 而拖拽结果是写进 `desired_size` 的,它只体现在 content ui 的
+    ///   `max_rect` 上。
+    ///
+    /// 高度方向上两者能对上,是因为 `SidePanel::show_inside_dyn` 有一条
+    /// 「只增不减」的棘轮把自己的高度报回外层 `ui`(见 `CONTENT_MIN_HEIGHT`
+    /// 文档注释);**宽度方向没有任何对应机制**(这一点
+    /// `dragging_the_split_does_not_widen_the_window` 的文档注释里早就写下
+    /// 过,只是当时是当作「分隔条撑不宽窗口」的好事来记的)。于是横向上
+    /// `min_rect` 一直停在我们 `ui.set_min_width(...)` 给的那个常量地板,
+    /// 外框永远 880 宽,而 `CentralPanel` 按 `max_rect` 铺满、画到 1500+。
+    ///
+    /// 拖的是**右边缘中点**,不是右下角:egui 的 hit-test 在这个无头环境里
+    /// 会把角落的拖拽判给覆盖面更大的「bottom」边 widget(已实测:同一次
+    /// 按下,`edge_drag/bottom` 的 `dragged()` 为 true,而
+    /// `edge_drag/right_bottom` 与 `edge_drag/right` 全是 false),于是只有
+    /// 纵向 resize 被驱动,横向那条路径根本走不到。真机上角拖两个方向都生效
+    /// (录屏为证),这里换成右边缘只是为了在测试里可靠地驱动横向那条路径。
+    ///
+    /// 自证会变红:删掉 `show()` 里 `ui.set_min_width(ui.max_rect().width())`
+    /// 那一行(把宽度报告回外层的那句),两条断言都会炸——已实测输出:外框右边
+    /// 全程钉在 896,而右栏内容右边缘一路涨到 936,内容确实画到了框外。
+    #[test]
+    fn dragging_the_resize_handle_widens_the_window_frame_not_just_its_contents() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState {
+            session_manager_open: true,
+            editor: Some(EditorBuffer::default()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        // 屏幕给得足够宽(1600),横向天花板(`avail_w`)在这几步拖拽里不会触发,
+        // 单独考察「跟手」这一件事。
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let base_input = || egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        let mut run = |ctx: &egui::Context, input: egui::RawInput| -> egui::Rect {
+            let mut outer = None;
+            let _ = ctx.run(input, |ctx| {
+                outer = show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    true,
+                    None,
+                    SecretPresence::default(),
+                );
+            });
+            outer.expect("会话管理器窗口应已渲染并返回外层矩形")
+        };
+
+        let mut initial_outer = egui::Rect::NAN;
+        for _ in 0..3 {
+            initial_outer = run(&ctx, base_input());
+        }
+
+        let grab = egui::pos2(initial_outer.max.x, initial_outer.center().y);
+        run(
+            &ctx,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(grab)],
+                ..base_input()
+            },
+        );
+        run(
+            &ctx,
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: grab,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..base_input()
+            },
+        );
+
+        // 阶段 1:分 3 步、每步往右拖 20px,窗口右边缘要跟手前进。
+        let mut prev_right = grab.x;
+        let mut outer = initial_outer;
+        for step in 1..=3 {
+            let pos = grab + egui::vec2(20.0 * step as f32, 0.0);
+            outer = run(
+                &ctx,
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(pos)],
+                    ..base_input()
+                },
+            );
+            let advanced = outer.max.x - prev_right;
+            assert!(
+                (advanced - 20.0).abs() < 1.0,
+                "第 {step} 步:窗口右边缘应跟随拖拽前进约 20px,实际前进 {advanced}\
+                 (前一帧右边缘 {prev_right},这一帧 outer={outer:?})——外框没跟手,\
+                 标题栏/关闭按钮/resize 手柄会停在原宽度,内容却画到框外"
+            );
+            prev_right = outer.max.x;
+        }
+
+        // 阶段 2:内容必须留在外框以内 —— 这是录屏里肉眼可见的那个症状本身。
+        let editor = ctx
+            .read_response(editor_root_id())
+            .expect("右栏编辑器根 Ui 应已注册")
+            .rect;
+        assert!(
+            editor.max.x <= outer.max.x + 1.0,
+            "右栏内容右边缘 {} 超出了窗口外框右边缘 {}(editor={editor:?}, outer={outer:?})\
+             ——内容被画到窗口边框外面",
+            editor.max.x,
+            outer.max.x
+        );
+    }
+
+    /// F90:分隔条上限(440)与窗口宽(880)的联立关系不能被改坏。
+    ///
+    /// 这条测试实际有两层效力,强度不一样,别混为一谈:
+    ///
+    /// 1. **头两条 `const { assert!(..) }` 是常量联立检查**,这是本测试真正
+    ///    的效力所在,改坏 `LIST_MAX_W`/`WINDOW_W`/`LIST_W` 任何一个导致联立
+    ///    关系不成立,**编译期**(不用等到跑测试)就会炸。跟
+    ///    `mullion-term/src/keymap.rs::max_wheel_reports_is_a_sane_small_number`
+    ///    是同一个先例:比较双方全是 `const`,clippy 的
+    ///    `assertions_on_constants` 会认为普通 `assert!` 写这种断言是笔误,
+    ///    用 `const { .. }` 把它变成编译期检查,不需要 `#[allow]`,而且比运行
+    ///    时断言更早炸、检查随 `cargo test` 一样能跑到。代价是 `const` 块里
+    ///    不能用 `format!` 风格的插值拼 panic 消息(`{LIST_MAX_W}` 这种),只能
+    ///    写静态字符串——常量值本身在源码定义处就看得到,不需要 panic 消息
+    ///    复述一遍。
+    /// 2. **第三条渲染断言(`window_rect.width() <= screen_rect.width() +
+    ///    SLACK`)维持运行时 `assert!`**,它比的不是常量(左边是渲染出的真实
+    ///    矩形宽度),是粗粒度回归网,只对「`WINDOW_W` 本身被改得比屏幕还宽」
+    ///    这类改动有效——已实测验证:把 `WINDOW_W` 临时改成 2000
+    ///    (`LIST_MAX_W` 不动)会让这条断言真的红:
+    ///    `窗口被撑得比屏幕还宽:2000 > 900`。
+    ///
+    /// **本测试不覆盖、也测不出「拖拽分隔条把窗口撑宽」这条路径**——这里的
+    /// `RawInput` 全程没有任何指针/拖拽事件,`SidePanel` 因此全程停在
+    /// `default_width`(=`LIST_W`=300),从未被拖到过 `LIST_MAX_W`。文档标题
+    /// 说的「分隔条拖到上限」只是常量层面的推导前提,不是这条测试实际驱动
+    /// 到的运行时状态。
+    ///
+    /// 即便真的补上拖拽事件把分隔条拖到 440,也复现不出「窗口被撑宽」——
+    /// 已用真实指针事件实测确认过:egui 0.30 在这条路径上有双重钳制兜底,
+    /// 我们的代码根本插不进去:`egui-0.30.0/src/containers/window.rs:496-501`
+    /// 把 `resize.max_size.x` 钳到 `constrain_rect.width()`(屏幕宽度),在
+    /// 我们的闭包代码跑之前就生效;`egui-0.30.0/src/containers/panel.rs:243`
+    /// 把 `SidePanel` 自己的宽度 `.at_most(available_rect.width())`,天生不会
+    /// 把外层撑宽(不同于高度方向那条「只增不减棘轮」,宽度没有对应机制)。
+    /// 所以 Task 1 里那段条件式天花板(`if ui.max_rect().width() > avail_w
+    /// { ui.set_max_width(avail_w); }`)删不删,对这条测试的结果毫无影响
+    /// (已实测确认)——不要指望删它能自证这条测试,自证请改 `LIST_MAX_W`
+    /// 到违反联立关系的值(见上面第 1 点)。
+    #[test]
+    fn dragging_the_split_does_not_widen_the_window() {
+        const { assert!(LIST_MAX_W <= WINDOW_W - 400.0 - 24.0) };
+        const { assert!(LIST_MIN_W <= LIST_W && LIST_W <= LIST_MAX_W) };
+
+        let t = crate::theme::MULLION_DARK;
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState {
+            session_manager_open: true,
+            editor: Some(EditorBuffer::default()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        // 屏幕只比最窄窗口宽一点点 —— 拖到上限也不许把窗口顶出屏幕。
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    true,
+                    None,
+                    SecretPresence::default(),
+                );
+            });
+        }
+        let mut window_rect = None;
+        let _ = ctx.run(input(), |ctx| {
+            window_rect = show(
+                ctx,
+                &t,
+                &mut ui_state,
+                &sessions,
+                &groups,
+                true,
+                None,
+                SecretPresence::default(),
+            );
+        });
+        let window_rect = window_rect.expect("会话管理器窗口应该已经画出来了");
+        assert!(
+            window_rect.width() <= screen_rect.width() + SLACK,
+            "窗口被撑得比屏幕还宽:{} > {}",
+            window_rect.width(),
+            screen_rect.width()
+        );
+    }
+
+    /// F91:必填项没填齐时,「保存」/「保存并连接」必须点不动 ——
+    /// 否则存进去一条连不上的记录,用户还以为存好了。
+    ///
+    /// 自证变红的方式:把 `editor.rs` 里传给 `super::labeled_button(ui,
+    /// super::save_button_id(), "保存", !disable_save, save_tip.as_deref())`
+    /// 这一处调用的第四个实参 `!disable_save` 临时改成 `true`(即拆掉「保存」
+    /// 按钮的禁用本身),而不是改测试里的 buffer 内容。`ui.add_enabled(
+    /// !disable_connect, ...)` 是「保存并连接」按钮的代码,跟 `disable_save`
+    /// 无关,改那里自证不了这条测试。
+    #[test]
+    fn save_buttons_are_disabled_when_required_fields_are_empty() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let groups: Vec<GroupRecord> = Vec::new();
+        // 名称/主机/用户名全空 —— 正是「新建」刚打开时的样子。
+        let mut ui_state = UiState {
+            session_manager_open: true,
+            editor: Some(EditorBuffer::default()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        let mut enabled = None;
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    true,
+                    None,
+                    SecretPresence::default(),
+                );
+                enabled = ctx.read_response(save_button_id()).map(|r| r.enabled());
+            });
+        }
+        assert_eq!(enabled, Some(false), "必填项全空时「保存」按钮必须是禁用态");
+
+        // 填齐后必须重新可点。
+        if let Some(buf) = ui_state.editor.as_mut() {
+            buf.name = "web01".into();
+            buf.host = "10.0.0.1".into();
+            buf.user = "root".into();
+        }
+        let mut enabled_after = None;
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    true,
+                    None,
+                    SecretPresence::default(),
+                );
+                enabled_after = ctx.read_response(save_button_id()).map(|r| r.enabled());
+            });
+        }
+        assert_eq!(enabled_after, Some(true), "必填项填齐后「保存」必须可点");
+    }
+
+    /// F92:`disable_save` 与 `disable_connect` 是两个刻意不同的语义——保存
+    /// 只被「必填未齐」挡(拨测只读表单、不改),保存并连接/测试连接被
+    /// 「必填未齐」和「拨测进行中」两个原因都挡。上一条测试只覆盖了
+    /// `disable_save` 那一半;这条覆盖 `disable_connect` 独有的那一半:
+    /// 必填项已填齐、但 `ProbeState::Running` 时,「测试连接」必须是禁用态,
+    /// 而同一时刻「保存」必须仍然可点——这正是两个语义的分水岭。
+    ///
+    /// 自证变红的方式:把 `editor.rs` 里传给「测试连接」的
+    /// `super::labeled_button(ui, super::probe_button_id(), "测试连接",
+    /// !disable_connect, ..)` 这一处调用的第四个实参 `!disable_connect`
+    /// 临时改成 `true`,而不是改这里的 `probe` 字段。
+    #[test]
+    fn probe_button_is_disabled_while_probing_even_though_required_fields_are_filled() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let groups: Vec<GroupRecord> = Vec::new();
+        let buf = EditorBuffer {
+            name: "web01".into(),
+            host: "10.0.0.1".into(),
+            user: "root".into(),
+            ..Default::default()
+        };
+        let mut ui_state = UiState {
+            session_manager_open: true,
+            editor: Some(buf),
+            probe: ProbeState::Running,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen_rect),
+            ..Default::default()
+        };
+        let mut probe_enabled = None;
+        let mut save_enabled = None;
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    true,
+                    None,
+                    SecretPresence::default(),
+                );
+                probe_enabled = ctx.read_response(probe_button_id()).map(|r| r.enabled());
+                save_enabled = ctx.read_response(save_button_id()).map(|r| r.enabled());
+            });
+        }
+        assert_eq!(
+            probe_enabled,
+            Some(false),
+            "必填项已填齐但拨测在途时,「测试连接」必须是禁用态"
+        );
+        assert_eq!(
+            save_enabled,
+            Some(true),
+            "拨测在途不该挡「保存」——它只读表单、不改"
         );
     }
 }

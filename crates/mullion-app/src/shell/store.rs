@@ -159,6 +159,46 @@ impl SessionStore {
         );
         Ok(cfg)
     }
+
+    /// 按**草稿**(含未保存改动)组 SshConfig。「测试连接」(F92)用。
+    ///
+    /// 与 `ssh_config_for` 走同一套解析内核(`resolve_layer` /
+    /// `expand_jump_chain_of`),只是入口从「库里的 id」换成「手上的草稿」。
+    /// 不是第二条解析路径 —— 否则「测试通过、保存后连不上」这种最伤
+    /// 信任的 bug 迟早出现。
+    ///
+    /// 跳板悬空/成环同样**硬失败**:拨测的价值就在于提前把这些问题炸出来。
+    pub fn ssh_config_for_draft(&self, draft: &SessionDraft) -> Result<SshConfig, StoreOpenError> {
+        let rec = draft_to_record(draft);
+        let secret = draft.secret.as_ref();
+        let mut cfg = to_ssh_config(&rec, secret)?;
+
+        let resolved = self.vault.resolve_layer(draft, draft.identity.group_id);
+        let jumps = self.vault.expand_jump_chain_of(&resolved.jump)?;
+        cfg.hops = super::dial_plan::build_hops_with_proxy_secret(
+            resolved.proxy.as_ref(),
+            &jumps,
+            &|jid| self.vault.secret(jid).cloned(),
+            secret,
+        );
+        Ok(cfg)
+    }
+}
+
+/// 草稿 → 临时 `SessionRecord`,只为喂给 `to_ssh_config`。
+/// 它只读 `connection` / `auth`,`id` 与 `modified_at` 是占位,
+/// 不入库、不外泄 —— 草稿本来就还没有 id。
+fn draft_to_record(d: &SessionDraft) -> SessionRecord {
+    SessionRecord {
+        id: SessionId(0),
+        modified_at: String::new(),
+        identity: d.identity.clone(),
+        connection: d.connection.clone(),
+        auth: d.auth.clone(),
+        terminal: d.terminal.clone(),
+        appearance: d.appearance.clone(),
+        network: d.network.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +346,60 @@ mod tests {
         assert!(
             store.ssh_config_for(id).is_err(),
             "悬空跳板必须报错,绝不能悄悄直连"
+        );
+    }
+
+    /// F92:拨测组的是**手上这份草稿**,不是库里存着的旧值。
+    ///
+    /// 场景:用户打开已存会话、把 host 改成新地址、还没点保存就点「测试连接」。
+    /// 若实现退化成按 id 去库里查(`ssh_config_for`),测的就是老机器 ——
+    /// 用户会得到一个与他眼前表单无关的结论。
+    ///
+    /// 自证变红的方式:把 `ssh_config_for_draft` 的函数体改成
+    /// `self.ssh_config_for(SessionId(1))`(即按库里的记录组),
+    /// 而不是改测试里传的 host。
+    #[test]
+    fn draft_config_uses_unsaved_edits_not_the_stored_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+        store.add(draft(), "2026-08-04T00:00:00Z");
+
+        // 表单上把 host 改了,但没保存。
+        let mut edited = draft();
+        edited.connection.host = "198.51.100.7".into();
+
+        let cfg = store.ssh_config_for_draft(&edited).unwrap();
+        assert_eq!(cfg.host, "198.51.100.7", "拨测必须用草稿里的新 host");
+        // 库里那条一点没动 —— 拨测是只读的。
+        assert_eq!(store.list()[0].connection.host, "192.0.2.10");
+    }
+
+    /// F92 + 安全:草稿里的跳板引用悬空时必须**硬失败**。
+    ///
+    /// 静默降级成直连是安全事故:用户配了堡垒机、拨测报「成功」,
+    /// 他会以为流量过了堡垒机,实际是裸连到目标机。
+    ///
+    /// 自证变红的方式:把 `ssh_config_for_draft` 里 `expand_jump_chain_of(..)?`
+    /// 的 `?` 换成 `.unwrap_or_default()`,而不是改测试里的 SessionId。
+    #[test]
+    fn draft_config_hard_fails_on_dangling_jump_instead_of_silently_going_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+
+        let mut d = draft();
+        d.network = mullion_store::NetworkPrefs {
+            proxy: None,
+            jump: Some(vec![mullion_store::JumpRef(mullion_store::SessionId(999))]),
+        };
+
+        let err = store.ssh_config_for_draft(&d).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreOpenError::Store(mullion_store::StoreError::JumpDangling(_))
+            ),
+            "悬空跳板必须硬失败,实际:{err:?}"
         );
     }
 }

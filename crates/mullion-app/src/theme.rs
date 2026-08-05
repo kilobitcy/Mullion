@@ -47,7 +47,11 @@ pub struct Theme {
     pub fg_muted: Rgb,
     /// pane 标题条断开状态的圆点颜色(F83,`ui/pane_title.rs::show`)。
     pub fg_dim: Rgb,
-    /// 预留给 F84 设置弹窗的快捷键位徽标(设计文档 §4.4)。零引用。
+    /// 会话管理器里的副文本(F80/F90:列表 user@host、跳板提示、「已设置」、
+    /// 空态占位)。
+    /// 选它而不是 `fg_faint`,是因为 `fg_faint` on `panel_bg` 只有 2.69:1,
+    /// 达不到 WCAG AA 的 4.5:1;本色是 5.71:1。
+    /// 也仍预留给 F84 设置弹窗的快捷键位徽标(设计文档 §4.4)。
     pub fg_dimmer: Rgb,
     pub fg_faint: Rgb,
     /// 预留给 F50 SFTP 侧栏列表表头(设计文档 §4.3)。零引用。

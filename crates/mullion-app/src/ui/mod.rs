@@ -122,6 +122,43 @@ pub struct UiState {
     pub group_name_buf: String,
     /// 分组管理弹窗里点了新建/改名/删除 → app 事后据此调 `store` 对应方法。
     pub group_intent: Option<crate::ui::group_manager::GroupIntent>,
+
+    // --- P1-b:测试连接(F92)。与 save_click 同构 —— UI 只写意图,
+    // 拨测在 app.rs 的施加点起 tokio 任务。---
+    /// 「测试连接」被点了。app.rs 消费后复位,按当前表单起一次拨测。
+    pub probe_click: bool,
+    /// 拨测的四态,由 app.rs 在收到 `UserEvent::ProbeOk/ProbeErr` 时写。
+    pub probe: crate::ui::session_manager::ProbeState,
+    /// 请求取消在途拨测(切会话 / 关编辑器 / 关会话管理器)。app.rs 消费后
+    /// 自增 `probe_epoch` 并 abort 任务。放意图标志而非直接持有世代号:
+    /// 世代号和 JoinHandle 都在 App 上,UiState 够不着。
+    pub probe_cancel: bool,
+    /// 发起拨测那一刻的表单快照。结论(`Ok`/`Err`)只对这份表单有效 ——
+    /// 一改字段就不再可信,清掉。
+    ///
+    /// **不能拿 `editor_baseline` 当这个基线**:那是「上次保存」的基线,
+    /// 表达的是「相对保存是否脏」这个持久状态。新建会话时表单天然是脏的,
+    /// 用它判定会让拨测结论在产生的下一帧就被清掉,成功卡片一帧都看不见 ——
+    /// 而「新建会话、填完、先测一下再保存」正是「测试连接」的主场景。
+    ///
+    /// **持有的是整份表单的克隆,里面含 `password`/`passphrase`/
+    /// `proxy_password` 三个明文字段**——凡是「编辑这条会话结束」的地方
+    /// (切会话/新建、关闭会话管理器、点「取消」)都必须把它清成 `None`,
+    /// 否则这份明文副本会一直留在进程堆内存里,直到用户对**另一份**表单
+    /// 再点一次「测试连接」才被覆盖,驻留窗口可能横跨整个应用生命周期。
+    pub probe_form: Option<session_manager::EditorBuffer>,
+
+    // --- P1-b:~/.ssh 私钥候选(F93)。---
+    /// 扫描 `~/.ssh` 得到的私钥候选路径。打开编辑器 / 切到认证 Tab 时刷一次,
+    /// 之后缓存 —— `read_dir` 是同步 IO,不能每帧调(陷阱 T3)。
+    pub key_candidates: Vec<std::path::PathBuf>,
+    /// 候选是否已扫过。扫描动作在 `session_manager::editor::
+    /// ensure_key_candidates_scanned`——渲染编辑器时调用,`false` 就扫一次
+    /// 并把这里置 `true`;`close_session_manager` 关闭会话管理器时会把它
+    /// 复位回 `false`,下次打开重新扫(用户可能刚 `ssh-keygen` 生成了新密钥)。
+    pub key_candidates_ready: bool,
+    /// 拖拽私钥文件时给用户的一次性提示(如「已忽略其余 2 个文件」)。
+    pub key_drop_note: Option<String>,
 }
 
 impl UiState {
@@ -135,9 +172,22 @@ impl UiState {
     /// `session_manager_open = false`:关闭时要顺带清空只属于它的、可能残留
     /// 的临时状态(目前是 `pending_delete`)——否则下次打开时,待确认删除的
     /// 确认框会带着上次的意图凭空重新出现(复核 F90 Task 10 发现的 bug)。
+    ///
+    /// F92:在途拨测也必须一并取消 —— 否则窗口关了,20 秒后回来的
+    /// ProbeOk 还会把结果卡片写回一个已经不属于任何表单的状态上。
     pub fn close_session_manager(&mut self) {
         self.session_manager_open = false;
         self.pending_delete = None;
+        self.probe = crate::ui::session_manager::ProbeState::Idle;
+        // `probe_form` 揣着三个明文凭据字段的表单副本(见字段文档注释),
+        // 窗口一关,编辑这件事就结束了,不该让它继续留在内存里。
+        self.probe_form = None;
+        self.probe_cancel = true;
+        self.key_candidates_ready = false;
+        // F93:上一次打开时留下的拖拽提示(如「已取第一个文件,忽略其余
+        // 2 个」)不能跟着漂到下次打开、甚至下一条完全不同的会话上——
+        // 用户会以为刚才对当前表单做了什么。
+        self.key_drop_note = None;
     }
 }
 
@@ -305,6 +355,67 @@ mod tests {
         assert_eq!(
             st.pending_delete, None,
             "关闭会话管理器必须清空待确认删除,否则下次打开会凭空复现确认框"
+        );
+    }
+
+    /// 复核 Important 1:`probe_form` 是发起拨测那一刻整份表单的克隆,里面
+    /// 揣着 `password`/`passphrase`/`proxy_password` 三个明文字段(见字段
+    /// 文档注释)。原先只在点「测试连接」时被覆盖写入,从来没有任何地方
+    /// 清空过——用户点一次后,这份明文副本会一直留在进程堆内存里,直到
+    /// 对**另一份**表单再点一次「测试连接」才被覆盖,驻留窗口可能横跨
+    /// 整个应用生命周期。`close_session_manager` 是**所有**关闭点的唯一
+    /// 入口,必须把它一并清空,缩短明文驻留窗口。
+    ///
+    /// 断言刻意不用 `assert_eq!`/`{:?}` 直接比对整个 `EditorBuffer`——它
+    /// 刻意没有 `derive(Debug)`(`buffer.rs` 顶部注释:避免 `{:?}` 把三个
+    /// 明文字段打印出来),只能用 `is_none()` 这种不需要 `Debug` 的判定。
+    ///
+    /// 自证会变红:把 `close_session_manager` 里 `self.probe_form = None;`
+    /// 这一行删掉,断言立刻报 `probe_form` 仍是 `Some(..)`。
+    #[test]
+    fn close_session_manager_clears_probe_form_so_plaintext_credentials_do_not_linger() {
+        let mut st = UiState {
+            session_manager_open: true,
+            probe_form: Some(session_manager::EditorBuffer::default()),
+            ..Default::default()
+        };
+        st.close_session_manager();
+        assert!(
+            st.probe_form.is_none(),
+            "关闭会话管理器必须清空 probe_form,否则含明文凭据的表单副本会滞留内存"
+        );
+    }
+
+    /// F93:关闭会话管理器必须把私钥候选相关的两处临时状态一并清空——
+    /// `key_candidates_ready` 复位成 `false`,下次打开时 `editor.rs` 才会
+    /// 重新扫 `~/.ssh`(用户可能刚 `ssh-keygen` 生成了新密钥,缓存的候选
+    /// 已经过时);`key_drop_note` 清空,否则上一次打开(甚至上一条完全
+    /// 不同的会话)留下的拖拽提示会凭空出现在下一次打开的表单上,让用户
+    /// 误以为刚才对当前表单做了什么。
+    ///
+    /// 前一半(`key_candidates_ready = false`)在 Task 5 就已经加了,这条
+    /// 测试同时钉住这两个属性,避免以后有人只改了其中一个。
+    ///
+    /// 自证会变红:把 `close_session_manager` 里新加的
+    /// `self.key_drop_note = None;` 这一行删掉,`key_drop_note` 断言会报
+    /// 仍是 `Some("已忽略其余 2 个文件".into())`。
+    #[test]
+    fn close_session_manager_resets_key_candidates_ready_and_clears_drop_note() {
+        let mut st = UiState {
+            session_manager_open: true,
+            key_candidates_ready: true,
+            key_candidates: vec![std::path::PathBuf::from("/home/u/.ssh/id_ed25519")],
+            key_drop_note: Some("已忽略其余 2 个文件".to_owned()),
+            ..Default::default()
+        };
+        st.close_session_manager();
+        assert!(
+            !st.key_candidates_ready,
+            "关闭后必须复位 ready,否则下次打开不会重新扫描,漏掉刚生成的新密钥"
+        );
+        assert_eq!(
+            st.key_drop_note, None,
+            "关闭后必须清空拖拽提示,否则会凭空出现在下一次打开的表单上"
         );
     }
 

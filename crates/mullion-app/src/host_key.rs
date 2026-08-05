@@ -24,6 +24,9 @@ pub struct HostKeyPrompt {
     pub fingerprint: String,
     /// 存档里的旧记录;`Some` = 指纹变更(高危,UI 走警告态)。
     pub previous: Option<HostKeyEntry>,
+    /// 用户接受后是否写 known_hosts。正式连接 `true`;
+    /// 「测试连接」(F92)一律 `false` —— 探路不是承诺。
+    pub persist: bool,
     pub reply: oneshot::Sender<bool>,
 }
 
@@ -56,13 +59,20 @@ pub fn check(known: &KnownHostsFile, host: &str, fingerprint: &str) -> HostKeyCh
 pub struct PromptingPolicy {
     known: Arc<Mutex<KnownHostsFile>>,
     proxy: Mutex<EventLoopProxy<UserEvent>>,
+    /// 透传给 `HostKeyPrompt::persist`,决定用户接受后是否落盘。
+    persist: bool,
 }
 
 impl PromptingPolicy {
-    pub fn new(known: Arc<Mutex<KnownHostsFile>>, proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn new(
+        known: Arc<Mutex<KnownHostsFile>>,
+        proxy: EventLoopProxy<UserEvent>,
+        persist: bool,
+    ) -> Self {
         Self {
             known,
             proxy: Mutex::new(proxy),
+            persist,
         }
     }
 }
@@ -119,6 +129,7 @@ impl HostKeyPolicy for PromptingPolicy {
                 algo: algo.to_owned(),
                 fingerprint: text,
                 previous,
+                persist: self.persist,
                 reply: tx,
             })))
             .is_ok();
@@ -146,6 +157,34 @@ async fn await_reply(
         Ok(true) => HostKeyDecision::Accept,
         _ => HostKeyDecision::Reject(rejection),
     }
+}
+
+/// 用户回答完主机密钥弹窗后,决定是否把指纹落盘。
+///
+/// 抽成独立函数是为了能单测:真正的施加点在 `app.rs` 的 `render_frame`
+/// 深处,无窗口环境根本调不到,写在那里的门控等于零覆盖。
+///
+/// `persist == false`(F92 拨测)时**什么都不做**——拨测是探路,不是承诺。
+pub fn persist_if_allowed(
+    known: &Mutex<KnownHostsFile>,
+    prompt: &HostKeyPrompt,
+    accept: bool,
+) -> Result<(), mullion_store::StoreError> {
+    if !(accept && prompt.persist) {
+        return Ok(());
+    }
+    crate::diag::mark(crate::diag::Stage::StoreIo);
+    // 与既有施加点同源:GUI 线程 panic 比 tokio 线程更糟(直接崩窗口),
+    // 锁中毒时恢复而不是 expect。
+    let mut kh = known.lock().unwrap_or_else(|e| e.into_inner());
+    kh.record(
+        &prompt.host,
+        HostKeyEntry {
+            algo: prompt.algo.clone(),
+            fingerprint: prompt.fingerprint.clone(),
+        },
+    );
+    kh.save()
 }
 
 #[cfg(test)]
@@ -244,5 +283,73 @@ mod tests {
             matches!(decision, HostKeyDecision::Accept),
             "用户明确接受才能 Accept"
         );
+    }
+
+    /// 造一个可用的 `HostKeyPrompt`;`reply` 的接收端本次用例用不上,直接丢弃。
+    fn sample_prompt(persist: bool) -> HostKeyPrompt {
+        HostKeyPrompt {
+            host: "h".into(),
+            algo: "ssh-ed25519".into(),
+            fingerprint: "SHA256:AAAA".into(),
+            previous: None,
+            persist,
+            reply: oneshot::channel().0,
+        }
+    }
+
+    #[test]
+    fn probing_accept_never_persists() {
+        // 本任务的核心守护:F92 拨测(persist=false)即使用户点了接受,
+        // 也绝不能落盘——探路不是承诺,写盘 = 把陌生指纹永久钉死。
+        let dir = tempfile::tempdir().unwrap();
+        let known = Mutex::new(KnownHostsFile::load(dir.path()));
+        let prompt = sample_prompt(false);
+
+        persist_if_allowed(&known, &prompt, true).expect("persist=false 时不该报错");
+
+        assert!(
+            known.lock().unwrap().get("h").is_none(),
+            "拨测确认后指纹不该进内存表"
+        );
+        assert!(
+            !dir.path().join("known_hosts.toml").exists(),
+            "拨测确认后不该生成 known_hosts.toml"
+        );
+    }
+
+    #[test]
+    fn normal_connection_accept_persists() {
+        // 正向:persist=true(正式连接)+ 用户接受 → 必须真的落盘,
+        // 否则无法区分「门控生效」和「函数整个坏掉」。
+        let dir = tempfile::tempdir().unwrap();
+        let known = Mutex::new(KnownHostsFile::load(dir.path()));
+        let prompt = sample_prompt(true);
+
+        persist_if_allowed(&known, &prompt, true).expect("落盘应成功");
+
+        let entry = known
+            .lock()
+            .unwrap()
+            .get("h")
+            .cloned()
+            .expect("正式连接接受后指纹应已记录");
+        assert_eq!(entry.fingerprint, "SHA256:AAAA");
+        assert!(
+            dir.path().join("known_hosts.toml").exists(),
+            "正式连接接受后应生成 known_hosts.toml"
+        );
+    }
+
+    #[test]
+    fn normal_connection_decline_does_not_persist() {
+        // persist=true 但用户点了拒绝 → 同样不该落盘。
+        let dir = tempfile::tempdir().unwrap();
+        let known = Mutex::new(KnownHostsFile::load(dir.path()));
+        let prompt = sample_prompt(true);
+
+        persist_if_allowed(&known, &prompt, false).expect("accept=false 时不该报错");
+
+        assert!(known.lock().unwrap().get("h").is_none());
+        assert!(!dir.path().join("known_hosts.toml").exists());
     }
 }
