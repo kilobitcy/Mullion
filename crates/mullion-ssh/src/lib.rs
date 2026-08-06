@@ -8,4 +8,5 @@ pub mod error;
 pub mod hop;
 pub mod known_hosts;
 pub mod proxy;
+pub mod schedule;
 pub mod session;

@@ -19,6 +19,8 @@ pub struct GroupRecord {
     pub appearance: AppearancePrefs,
     #[serde(default)]
     pub network: crate::network::NetworkPrefs,
+    #[serde(default)]
+    pub automation: crate::automation::AutomationPrefs,
 }
 
 #[cfg(test)]
@@ -43,6 +45,7 @@ mod tests {
                 }),
             },
             network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
         };
         let s = toml::to_string_pretty(&g).unwrap();
         let back: GroupRecord = toml::from_str(&s).unwrap();

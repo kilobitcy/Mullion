@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use mullion_store::{
-    AppearancePrefs, Auth, AuthKind, Connection, GroupId, Identity, NetworkPrefs, Protocol,
-    SecretEntry, SessionDraft, SessionId, SessionRecord, TerminalPrefs,
+    AppearancePrefs, Auth, AuthKind, AutomationPrefs, Connection, GroupId, Identity, NetworkPrefs,
+    Protocol, SecretEntry, SessionDraft, SessionId, SessionRecord, TerminalPrefs,
 };
 
 /// 编辑表单里认证方式的选择。不复用 `AuthKind` 本身,因为 UI 在密码/公钥两种模式
@@ -77,6 +77,7 @@ pub struct EditorBuffer {
     pub preserved_tags: Vec<String>,
     pub preserved_terminal: TerminalPrefs,
     pub preserved_appearance: AppearancePrefs,
+    pub preserved_automation: AutomationPrefs,
 
     /// 「浏览…」按钮本帧被点了。`mod.rs` 在借用释放后转成
     /// `UiState::pick_key_request`,随即复位。
@@ -110,6 +111,7 @@ impl Default for EditorBuffer {
             preserved_tags: Vec::new(),
             preserved_terminal: TerminalPrefs::default(),
             preserved_appearance: AppearancePrefs::default(),
+            preserved_automation: AutomationPrefs::default(),
             pick_key_clicked: false,
         }
     }
@@ -168,6 +170,7 @@ impl std::fmt::Debug for EditorBuffer {
             .field("preserved_tags", &self.preserved_tags)
             .field("preserved_terminal", &self.preserved_terminal)
             .field("preserved_appearance", &self.preserved_appearance)
+            .field("preserved_automation", &self.preserved_automation)
             .finish()
     }
 }
@@ -187,6 +190,7 @@ impl EditorBuffer {
             preserved_tags: rec.identity.tags.clone(),
             preserved_terminal: rec.terminal.clone(),
             preserved_appearance: rec.appearance.clone(),
+            preserved_automation: rec.automation.clone(),
             ..Self::default()
         };
         match &rec.network.proxy {
@@ -424,6 +428,7 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
         terminal: buf.preserved_terminal.clone(),
         appearance: buf.preserved_appearance.clone(),
         network: NetworkPrefs { proxy, jump },
+        automation: buf.preserved_automation.clone(),
         secret: None,
     };
     sync_has_passphrase(&mut draft, secret.as_ref());
@@ -603,6 +608,12 @@ mod tests {
                 })),
                 jump: None,
             },
+            // 同上:表单也还没有编辑自动化配置的入口,必须原样透传,
+            // 值须区别于 `AutomationPrefs::default()` 才能抓住被静默清空的情况。
+            automation: AutomationPrefs {
+                enabled: Some(false),
+                ..Default::default()
+            },
         };
 
         let editor_buf = EditorBuffer::from_record(&rec);
@@ -627,6 +638,10 @@ mod tests {
         assert_eq!(
             draft.network, rec.network,
             "编辑不该清空 UI 编辑不到的字段:network(代理/跳板)"
+        );
+        assert_eq!(
+            draft.automation, rec.automation,
+            "编辑不该清空 UI 编辑不到的字段:automation"
         );
     }
 
@@ -661,6 +676,7 @@ mod tests {
                 })),
                 jump: Some(vec![JumpRef(SessionId(2))]),
             },
+            automation: AutomationPrefs::default(),
         };
         let buf = EditorBuffer::from_record(&rec);
         let draft = build_draft(&buf).unwrap();

@@ -36,6 +36,7 @@ fn plaintext_secret_never_hits_disk() {
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: Default::default(),
+            automation: Default::default(),
             secret: Some(SecretEntry {
                 password: None,
                 passphrase: Some(PW.into()),

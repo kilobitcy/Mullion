@@ -3,6 +3,10 @@
 //! **层序约定**:所有 `sources` 一律按**优先级从高到低**传入(会话在前、分组在后)。
 //! `resolve_merge_list` 内部负责反转,以产出「上游在前」的结果顺序。
 
+use crate::automation::{
+    AutomationPrefs, ResolvedAutomation, DEFAULT_AUTOMATION_ENABLED, DEFAULT_INITIAL_DELAY_MS,
+    DEFAULT_INTER_DELAY_MS, DEFAULT_READY_TIMEOUT_MS,
+};
 use crate::model::{AppearancePrefs, TerminalPrefs};
 use crate::network::{NetworkPrefs, ProxyChoice};
 
@@ -42,6 +46,7 @@ pub trait PrefsLayer {
     fn terminal(&self) -> &TerminalPrefs;
     fn appearance(&self) -> &AppearancePrefs;
     fn network(&self) -> &NetworkPrefs;
+    fn automation(&self) -> &AutomationPrefs;
 }
 
 impl PrefsLayer for crate::model::SessionRecord {
@@ -57,6 +62,9 @@ impl PrefsLayer for crate::model::SessionRecord {
     fn network(&self) -> &NetworkPrefs {
         &self.network
     }
+    fn automation(&self) -> &AutomationPrefs {
+        &self.automation
+    }
 }
 
 impl PrefsLayer for crate::group::GroupRecord {
@@ -71,6 +79,9 @@ impl PrefsLayer for crate::group::GroupRecord {
     }
     fn network(&self) -> &NetworkPrefs {
         &self.network
+    }
+    fn automation(&self) -> &AutomationPrefs {
+        &self.automation
     }
 }
 
@@ -89,6 +100,9 @@ impl PrefsLayer for crate::vault::SessionDraft {
     fn network(&self) -> &NetworkPrefs {
         &self.network
     }
+    fn automation(&self) -> &AutomationPrefs {
+        &self.automation
+    }
 }
 
 /// 继承解析后的最终配置。
@@ -105,6 +119,8 @@ pub struct ResolvedConfig {
     pub proxy: Option<ProxyChoice>,
     /// 解析后的跳板链。空 = 直连。
     pub jump: Vec<crate::network::JumpRef>,
+    /// 解析后的登录后自动化(F40~F44)。
+    pub automation: ResolvedAutomation,
 }
 
 /// 沿 `layers`(优先级从高到低)解析出最终配置。
@@ -150,12 +166,56 @@ pub fn resolve(layers: &[&dyn PrefsLayer]) -> ResolvedConfig {
             None,
         )
         .unwrap_or_default(),
+        automation: ResolvedAutomation {
+            enabled: resolve_override(
+                layers.iter().map(|l| l.automation().enabled),
+                DEFAULT_AUTOMATION_ENABLED,
+            ),
+            // 与 icon/color/proxy 同款的 `.map(Some)` 技巧:让「本层未设」贡献
+            // 0 个元素、继续看下一层,而「本层显式设为 Off / 空列表」贡献一个
+            // Some(...) 从而整体覆盖上游。
+            tmux: resolve_override(
+                layers.iter().map(|l| l.automation().tmux.clone().map(Some)),
+                None,
+            ),
+            commands: resolve_override(
+                layers
+                    .iter()
+                    .map(|l| l.automation().commands.clone().map(Some)),
+                None,
+            )
+            .unwrap_or_default(),
+            work_dir: resolve_override(
+                layers
+                    .iter()
+                    .map(|l| l.automation().work_dir.clone().map(Some)),
+                None,
+            ),
+            env: resolve_override(
+                layers.iter().map(|l| l.automation().env.clone().map(Some)),
+                None,
+            )
+            .unwrap_or_default(),
+            initial_delay_ms: resolve_override(
+                layers.iter().map(|l| l.automation().initial_delay_ms),
+                DEFAULT_INITIAL_DELAY_MS,
+            ),
+            inter_delay_ms: resolve_override(
+                layers.iter().map(|l| l.automation().inter_delay_ms),
+                DEFAULT_INTER_DELAY_MS,
+            ),
+            ready_timeout_ms: resolve_override(
+                layers.iter().map(|l| l.automation().ready_timeout_ms),
+                DEFAULT_READY_TIMEOUT_MS,
+            ),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automation::{AutomationCommand, AutomationPrefs, EnvVar, TmuxChoice};
     use crate::group::GroupRecord;
     use crate::model::{
         AppearancePrefs, Auth, AuthKind, ColorSpec, ColorTarget, Connection, GroupId, IconKind,
@@ -198,6 +258,7 @@ mod tests {
             terminal,
             appearance,
             network,
+            automation: crate::automation::AutomationPrefs::default(),
         }
     }
 
@@ -222,6 +283,7 @@ mod tests {
             terminal,
             appearance,
             network,
+            automation: crate::automation::AutomationPrefs::default(),
         }
     }
 
@@ -473,5 +535,218 @@ mod tests {
         );
         let got = resolve(&[&s, &g]);
         assert!(got.jump.is_empty(), "会话显式空链必须覆盖分组的跳板链");
+    }
+
+    fn session_with_automation(a: AutomationPrefs) -> SessionRecord {
+        let mut s = session(vec![], TerminalPrefs::default(), AppearancePrefs::default());
+        s.automation = a;
+        s
+    }
+
+    fn group_with_automation(a: AutomationPrefs) -> GroupRecord {
+        let mut g = group(vec![], TerminalPrefs::default(), AppearancePrefs::default());
+        g.automation = a;
+        g
+    }
+
+    #[test]
+    fn automation_none_inherits_group() {
+        let s = session_with_automation(AutomationPrefs::default());
+        let g = group_with_automation(AutomationPrefs {
+            tmux: Some(TmuxChoice::Attach {
+                session_name: Some("shared".into()),
+            }),
+            initial_delay_ms: Some(1234),
+            ..Default::default()
+        });
+        let got = resolve(&[&s, &g]);
+        assert_eq!(
+            got.automation.tmux,
+            Some(TmuxChoice::Attach {
+                session_name: Some("shared".into())
+            }),
+            "会话未设时应取分组的"
+        );
+        assert_eq!(got.automation.initial_delay_ms, 1234);
+    }
+
+    /// 与 `explicit_direct_overrides_group_proxy_instead_of_inheriting` 同款:
+    /// 显式 `Off` 必须**覆盖**分组的 tmux,而不是被当成「未设」继续继承。
+    #[test]
+    fn tmux_off_is_not_inherit() {
+        let s = session_with_automation(AutomationPrefs {
+            tmux: Some(TmuxChoice::Off),
+            ..Default::default()
+        });
+        let g = group_with_automation(AutomationPrefs {
+            tmux: Some(TmuxChoice::Attach {
+                session_name: Some("shared".into()),
+            }),
+            ..Default::default()
+        });
+        let got = resolve(&[&s, &g]);
+        assert_eq!(
+            got.automation.tmux,
+            Some(TmuxChoice::Off),
+            "会话显式关闭 tmux 必须胜出,绝不能回落到分组的 attach"
+        );
+    }
+
+    /// 命令列表是 Override,不是 Merge —— 拼接会产生「为什么多跑了一条命令」
+    /// 这类极难排查的问题(路线图 §4.2)。
+    #[test]
+    fn commands_are_overridden_wholesale_never_concatenated() {
+        let s = session_with_automation(AutomationPrefs {
+            commands: Some(vec![AutomationCommand {
+                text: "session-cmd".into(),
+                delay_ms: None,
+            }]),
+            ..Default::default()
+        });
+        let g = group_with_automation(AutomationPrefs {
+            commands: Some(vec![AutomationCommand {
+                text: "group-cmd".into(),
+                delay_ms: None,
+            }]),
+            ..Default::default()
+        });
+        let got = resolve(&[&s, &g]);
+        assert_eq!(got.automation.commands.len(), 1, "不得拼接两层的命令");
+        assert_eq!(got.automation.commands[0].text, "session-cmd");
+    }
+
+    /// 显式空列表同样是覆盖:分组配了命令,会话说「我什么都不跑」。
+    #[test]
+    fn explicit_empty_command_list_overrides_group() {
+        let s = session_with_automation(AutomationPrefs {
+            commands: Some(Vec::new()),
+            ..Default::default()
+        });
+        let g = group_with_automation(AutomationPrefs {
+            commands: Some(vec![AutomationCommand {
+                text: "group-cmd".into(),
+                delay_ms: None,
+            }]),
+            ..Default::default()
+        });
+        let got = resolve(&[&s, &g]);
+        assert!(
+            got.automation.commands.is_empty(),
+            "会话显式空列表必须覆盖分组"
+        );
+    }
+
+    /// `env` 与 `commands` 走同一条 `.map(Some)` + `.unwrap_or_default()` 路径
+    /// (见 `resolve` 里 `commands`/`env` 两段实现完全对称)。两者必须同时被钉住,
+    /// 否则将来改动其中一个的实现时,另一个会静默退化而没有测试报警。
+    #[test]
+    fn explicit_empty_env_list_overrides_group() {
+        let s = session_with_automation(AutomationPrefs {
+            env: Some(Vec::new()),
+            ..Default::default()
+        });
+        let g = group_with_automation(AutomationPrefs {
+            env: Some(vec![EnvVar {
+                key: "FOO".into(),
+                value: "bar".into(),
+            }]),
+            ..Default::default()
+        });
+        let got = resolve(&[&s, &g]);
+        assert!(got.automation.env.is_empty(), "会话显式空列表必须覆盖分组");
+    }
+
+    /// `work_dir` 与 `tmux` 走同一条 `.map(Some)` 路径(无 `.unwrap_or_default()`,
+    /// 结果本身就是 `Option<String>`)。与 `TmuxChoice::Off` 同一类坑:
+    /// 「未设(继承)」和「显式设为空字符串(覆盖)」必须能区分,
+    /// 否则显式清空 work_dir 会被错误地合并成分组的值。
+    #[test]
+    fn work_dir_distinguishes_unset_from_explicit_empty() {
+        let g = group_with_automation(AutomationPrefs {
+            work_dir: Some("/srv".into()),
+            ..Default::default()
+        });
+
+        // 会话未设 → 继承分组。
+        let s_unset = session_with_automation(AutomationPrefs {
+            work_dir: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve(&[&s_unset, &g]).automation.work_dir,
+            Some("/srv".to_string()),
+            "会话未设时应取分组的"
+        );
+
+        // 会话显式设非空值 → 覆盖分组。
+        let s_set = session_with_automation(AutomationPrefs {
+            work_dir: Some("/app".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve(&[&s_set, &g]).automation.work_dir,
+            Some("/app".to_string()),
+            "会话显式设值应胜出"
+        );
+
+        // 会话显式设为空字符串 → 覆盖分组,而不是被当成「未设」继续继承。
+        let s_empty = session_with_automation(AutomationPrefs {
+            work_dir: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(
+            resolve(&[&s_empty, &g]).automation.work_dir,
+            Some(String::new()),
+            "会话显式空字符串必须覆盖分组,绝不能回落到分组的 /srv"
+        );
+    }
+
+    #[test]
+    fn automation_falls_back_to_builtin_defaults() {
+        let s = session_with_automation(AutomationPrefs::default());
+        let got = resolve(&[&s]);
+        assert!(got.automation.enabled, "默认开(没配东西时计划自然为空)");
+        assert_eq!(
+            got.automation.initial_delay_ms,
+            crate::automation::DEFAULT_INITIAL_DELAY_MS
+        );
+        assert_eq!(
+            got.automation.inter_delay_ms,
+            crate::automation::DEFAULT_INTER_DELAY_MS
+        );
+        assert_eq!(
+            got.automation.ready_timeout_ms,
+            crate::automation::DEFAULT_READY_TIMEOUT_MS
+        );
+        assert!(got.automation.tmux.is_none());
+        assert!(got.automation.commands.is_empty());
+        assert!(got.automation.env.is_empty());
+        assert!(got.automation.work_dir.is_none());
+    }
+
+    /// F44 关闭必须能从分组继承下来。
+    #[test]
+    fn group_can_disable_automation_for_whole_group() {
+        let s = session_with_automation(AutomationPrefs::default());
+        let g = group_with_automation(AutomationPrefs {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        assert!(!resolve(&[&s, &g]).automation.enabled);
+    }
+
+    /// 解析结果直接喂给 build_plan,是 P1-b 的实际用法,这里钉住这条链路。
+    #[test]
+    fn resolved_automation_feeds_build_plan_end_to_end() {
+        let s = session_with_automation(AutomationPrefs {
+            tmux: Some(TmuxChoice::Attach { session_name: None }),
+            ..Default::default()
+        });
+        let cfg = resolve(&[&s]);
+        let plan = crate::automation::build_plan(&cfg.automation, "web01");
+        assert_eq!(plan.len(), 1);
+        assert!(String::from_utf8(plan[0].bytes.clone())
+            .unwrap()
+            .contains("tmux has-session -t 'web01'"));
     }
 }

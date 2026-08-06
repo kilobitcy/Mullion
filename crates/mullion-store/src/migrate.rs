@@ -75,6 +75,7 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
         })
         .collect();
     Ok(SessionsFile {
@@ -139,6 +140,11 @@ has_passphrase = false
             "迁移不得凭空写入偏好值"
         );
         assert_eq!(s.appearance, AppearancePrefs::default());
+        assert_eq!(
+            s.automation,
+            crate::automation::AutomationPrefs::default(),
+            "迁移不得凭空写入自动化配置"
+        );
         assert!(s.identity.group_id.is_none());
         assert!(s.identity.tags.is_empty());
         assert!(out.group.is_empty());
@@ -198,10 +204,11 @@ kind = "password"
         );
     }
 
-    /// 升 v3 的真正理由不是迁移,而是让 v0.1.14 那样的旧客户端**明确拒绝**——
-    /// 否则旧客户端读到 `[session.network]` 会静默丢弃再写回,用户的代理配置无声消失。
+    /// 升 v4 的理由与 v3 一样,不是迁移而是让旧客户端**明确拒绝** ——
+    /// 否则旧客户端读到 `[session.automation]` 会静默丢弃再写回,
+    /// 用户配好的登录自动化无声消失。
     #[test]
-    fn current_schema_is_three() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 3);
+    fn current_schema_is_four() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 4);
     }
 }

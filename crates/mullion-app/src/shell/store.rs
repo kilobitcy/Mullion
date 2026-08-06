@@ -198,6 +198,7 @@ fn draft_to_record(d: &SessionDraft) -> SessionRecord {
         terminal: d.terminal.clone(),
         appearance: d.appearance.clone(),
         network: d.network.clone(),
+        automation: d.automation.clone(),
     }
 }
 
@@ -229,6 +230,7 @@ mod tests {
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
+            automation: Default::default(),
             secret: Some(SecretEntry {
                 password: Some("pw".into()),
                 passphrase: None,

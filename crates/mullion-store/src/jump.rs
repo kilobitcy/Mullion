@@ -152,6 +152,7 @@ mod tests {
                 proxy: None,
                 jump: Some(jump.into_iter().map(|i| JumpRef(SessionId(i))).collect()),
             },
+            automation: crate::automation::AutomationPrefs::default(),
         }
     }
 
@@ -313,6 +314,7 @@ mod tests {
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
         };
         g.network.jump = Some(vec![JumpRef(SessionId(3))]);
         let groups: BTreeMap<GroupId, GroupRecord> = [(GroupId(7), g)].into_iter().collect();

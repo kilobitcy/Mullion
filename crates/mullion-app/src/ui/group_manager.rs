@@ -105,6 +105,7 @@ mod tests {
             terminal: Default::default(),
             appearance: Default::default(),
             network: NetworkPrefs::default(),
+            automation: Default::default(),
         }
     }
 
@@ -116,6 +117,7 @@ mod tests {
             terminal: Default::default(),
             appearance: Default::default(),
             network: NetworkPrefs::default(),
+            automation: Default::default(),
         }
     }
 

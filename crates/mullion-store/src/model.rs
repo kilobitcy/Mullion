@@ -72,6 +72,8 @@ pub struct SessionRecord {
     pub appearance: AppearancePrefs,
     #[serde(default)]
     pub network: crate::network::NetworkPrefs,
+    #[serde(default)]
+    pub automation: crate::automation::AutomationPrefs,
 }
 
 /// 一条会话的**敏感**部分,加密后存 secrets.enc。
@@ -168,10 +170,15 @@ pub struct AppearancePrefs {
 
 /// 当前 TOML 结构版本。缺失该键的文件视为 v1(见 `migrate`)。
 ///
-/// v3 = v2 + `[session.network]` / `[group.network]`。结构上 v3 能直接读 v2
-/// (新字段全带 `serde(default)`),升版本号是为了让**旧客户端明确拒绝**,
-/// 而不是静默丢弃 network 分节再写回。
-pub const CURRENT_SCHEMA: u32 = 3;
+/// v3 = v2 + `[session.network]` / `[group.network]`。
+/// v4 = v3 + `[session.automation]` / `[group.automation]`(F40~F44)。
+///
+/// 结构上新版本能直接读旧版本(新字段全带 `serde(default)`),升版本号是为了让
+/// **旧客户端明确拒绝**,而不是静默丢弃新分节再写回。
+///
+/// **号段归属**:F74(凭据实体)原定 v3→v4,被本切片先落地拿走了 4,顺延为
+/// v4→v5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
+pub const CURRENT_SCHEMA: u32 = 4;
 
 fn schema_v1() -> u32 {
     1
@@ -221,6 +228,7 @@ mod tests {
             },
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,
@@ -255,6 +263,7 @@ mod tests {
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,

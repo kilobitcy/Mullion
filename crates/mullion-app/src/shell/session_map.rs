@@ -103,6 +103,7 @@ mod tests {
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
+            automation: Default::default(),
         }
     }
 

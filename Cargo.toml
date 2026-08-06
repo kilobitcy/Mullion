@@ -23,7 +23,7 @@ russh = { version = "0.54", default-features = false, features = ["ring", "flate
 winit = "0.30"
 wgpu = "23"
 glyphon = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 # 切片 A:会话/凭据持久化(见 spec §3)
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

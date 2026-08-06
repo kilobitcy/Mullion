@@ -34,6 +34,7 @@ pub struct SessionDraft {
     pub terminal: TerminalPrefs,
     pub appearance: AppearancePrefs,
     pub network: crate::network::NetworkPrefs,
+    pub automation: crate::automation::AutomationPrefs,
     /// 敏感部分(密码/口令);无则 None。
     pub secret: Option<SecretEntry>,
 }
@@ -139,6 +140,7 @@ impl Vault {
             terminal: draft.terminal,
             appearance: draft.appearance,
             network: draft.network,
+            automation: draft.automation,
         });
         id
     }
@@ -161,6 +163,7 @@ impl Vault {
         rec.terminal = draft.terminal;
         rec.appearance = draft.appearance;
         rec.network = draft.network;
+        rec.automation = draft.automation;
         rec.modified_at = now_rfc3339.to_string();
         match draft.secret {
             Some(sec) => {
@@ -219,6 +222,7 @@ impl Vault {
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
         });
         id
     }
@@ -393,6 +397,7 @@ mod tests {
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
             secret: Some(SecretEntry {
                 password: Some(pw.into()),
                 passphrase: None,
@@ -563,7 +568,7 @@ kind = "password"
         assert!(bak.contains("name = \"old\""), "备份应是原始 v1 内容");
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 3"), "磁盘上应已是 v3");
+        assert!(now.contains("schema_version = 4"), "磁盘上应已是 v4");
     }
 
     /// 真实 v2(已是分节嵌套结构,非 v1 扁平结构)的 `sessions.toml`。
@@ -619,7 +624,7 @@ kind = "password"
         );
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 3"), "磁盘上应已升到 v3");
+        assert!(now.contains("schema_version = 4"), "磁盘上应已升到 v4");
     }
 
     #[test]
@@ -636,6 +641,154 @@ kind = "password"
             !dir.path().join("sessions.toml.bak").exists(),
             "已是 v2 不应重复备份"
         );
+    }
+
+    /// `opening_v2_file_does_not_create_backup` 是按当年 `CURRENT_SCHEMA == 2` 写的,
+    /// 版本升到 v4 后没有补一条钉住「当前版本」的用例——这里补上。
+    ///
+    /// 为什么这条重要:`.bak` 只有一份,如果 `Vault::open` 在文件已经是当前 schema
+    /// 时仍然调用 `save()` 重写,就会用「刚打开时的内容」去覆盖 `.bak`,用户唯一的
+    /// 升级前快照就没了。这里同时钉住「不产生/不覆盖 `.bak`」与「磁盘字节原样不变」
+    /// 两件事,并顺带验证 v4 相对 v3 新增的 `automation` 分节在打开过程中没有丢失。
+    ///
+    /// 构造真实 v4 文件的方式选了「Vault::add + save() → 读回磁盘字节」而不是像
+    /// `V3_ON_DISK`/`V2_ON_DISK` 那样手写 TOML 常量:手写常量必须跟实际序列化格式
+    /// (字段顺序、`skip_serializing_if` 产生的省略)保持同步,一旦 serde 输出格式变了
+    /// 常量就可能悄悄失真;而这条测试关心的正是「打开前后字节要完全相等」,用
+    /// 序列化器自己产出的内容做基准,才是最贴近真实用户文件的做法。
+    #[test]
+    fn opening_v4_file_does_not_rewrite_or_touch_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let mut d = draft();
+            d.automation = crate::automation::AutomationPrefs {
+                enabled: Some(true),
+                tmux: Some(crate::automation::TmuxChoice::Attach {
+                    session_name: Some("claude".into()),
+                }),
+                commands: Some(vec![crate::automation::AutomationCommand {
+                    text: "echo 'hi'".into(),
+                    delay_ms: Some(500),
+                }]),
+                work_dir: Some("/srv".into()),
+                env: Some(vec![crate::automation::EnvVar {
+                    key: "RUST_LOG".into(),
+                    value: "debug".into(),
+                }]),
+                initial_delay_ms: Some(300),
+                inter_delay_ms: None,
+                ready_timeout_ms: None,
+            };
+            v.add(d, "2026-08-06T00:00:00Z");
+            v.save().unwrap();
+        }
+
+        let sessions_path = dir.path().join("sessions.toml");
+        let bak_path = dir.path().join("sessions.toml.bak");
+        let before = std::fs::read(&sessions_path).unwrap();
+        let before_text = String::from_utf8(before.clone()).unwrap();
+        assert!(
+            before_text.contains("schema_version = 4"),
+            "前提条件:这份文件必须真的是 v4,否则没测到点子上"
+        );
+        assert!(
+            before_text.contains("[session.automation]"),
+            "前提条件:必须含 v4 新增的 automation 分节"
+        );
+        assert!(!bak_path.exists(), "首次 save 不该凭空产生 .bak");
+
+        let vault = Vault::open(dir.path().to_path_buf(), &key())
+            .expect("已是 CURRENT_SCHEMA 的文件必须能正常打开");
+
+        assert!(
+            !bak_path.exists(),
+            ".bak 只有一份;打开已是当前版本的文件绝不该产生/覆盖备份"
+        );
+        let after = std::fs::read(&sessions_path).unwrap();
+        assert_eq!(
+            before, after,
+            "打开已是当前版本的文件不该重写磁盘字节 —— 否则每次打开都会覆盖用户唯一的升级前快照"
+        );
+
+        let a = &vault.list()[0].automation;
+        assert_eq!(
+            a.tmux,
+            Some(crate::automation::TmuxChoice::Attach {
+                session_name: Some("claude".into())
+            }),
+            "v4 新增的 automation 分节不能在打开过程中丢失"
+        );
+        assert_eq!(a.commands.as_ref().unwrap()[0].text, "echo 'hi'");
+        assert_eq!(a.commands.as_ref().unwrap()[0].delay_ms, Some(500));
+        assert_eq!(a.work_dir.as_deref(), Some("/srv"));
+        assert_eq!(a.env.as_ref().unwrap()[0].key, "RUST_LOG");
+        assert_eq!(a.env.as_ref().unwrap()[0].value, "debug");
+        assert_eq!(a.initial_delay_ms, Some(300));
+    }
+
+    /// 真实 v3 文件:结构已含 `[session.network]`,但没有 `[session.automation]`。
+    const V3_ON_DISK: &str = r#"
+schema_version = 3
+
+[[session]]
+id = 1
+modified_at = "2026-08-01T00:00:00Z"
+
+[session.identity]
+name = "v3sess"
+
+[session.connection]
+host = "192.0.2.30"
+port = 22
+protocol = "ssh"
+
+[session.auth]
+user = "u3"
+kind = "password"
+
+[session.network]
+
+[session.network.proxy]
+kind = "socks5"
+host = "127.0.0.1"
+port = 7891
+"#;
+
+    #[test]
+    fn open_upgrades_v3_file_and_adds_empty_automation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sessions.toml"), V3_ON_DISK).unwrap();
+
+        let vault =
+            Vault::open(dir.path().to_path_buf(), &key()).expect("真实 v3 文件必须能被直接读出来");
+
+        assert_eq!(vault.list().len(), 1, "v3 会话不能丢");
+        let s = &vault.list()[0];
+        assert_eq!(s.identity.name, "v3sess");
+        assert_eq!(s.connection.host, "192.0.2.30");
+        assert!(
+            matches!(
+                s.network.proxy,
+                Some(crate::network::ProxyChoice::Socks5(_))
+            ),
+            "v3 已有的代理配置不能在升级中丢掉"
+        );
+        assert_eq!(
+            s.automation,
+            crate::automation::AutomationPrefs::default(),
+            "缺 automation 分节应落默认(全继承),迁移不得凭空写值"
+        );
+
+        assert!(
+            dir.path().join("sessions.toml.bak").exists(),
+            "升级前必须留备份"
+        );
+        let bak = std::fs::read_to_string(dir.path().join("sessions.toml.bak")).unwrap();
+        assert!(bak.contains("schema_version = 3"), "备份应是升级前的原文");
+
+        let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
+        assert!(now.contains("schema_version = 4"), "磁盘上应已升到 v4");
     }
 
     #[test]
@@ -755,6 +908,7 @@ kind = "password"
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
             secret: None,
         }
     }
@@ -824,6 +978,110 @@ kind = "password"
         assert!(
             dir.path().join("sessions.toml.bak").exists(),
             "迁移失败也要保住备份 —— 用户数据不能只剩一份坏的"
+        );
+    }
+
+    #[test]
+    fn automation_survives_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let mut d = draft();
+            d.automation = crate::automation::AutomationPrefs {
+                enabled: Some(true),
+                tmux: Some(crate::automation::TmuxChoice::Attach {
+                    session_name: Some("claude".into()),
+                }),
+                commands: Some(vec![crate::automation::AutomationCommand {
+                    text: "echo 'hi'".into(),
+                    delay_ms: Some(500),
+                }]),
+                work_dir: Some("/srv".into()),
+                env: Some(vec![crate::automation::EnvVar {
+                    key: "RUST_LOG".into(),
+                    value: "debug".into(),
+                }]),
+                initial_delay_ms: Some(300),
+                inter_delay_ms: None,
+                ready_timeout_ms: None,
+            };
+            id = v.add(d, "2026-08-06T00:00:00Z");
+            v.save().unwrap();
+        }
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let a = &v.get(id).unwrap().automation;
+        assert_eq!(
+            a.tmux,
+            Some(crate::automation::TmuxChoice::Attach {
+                session_name: Some("claude".into())
+            })
+        );
+        assert_eq!(a.commands.as_ref().unwrap()[0].text, "echo 'hi'");
+        assert_eq!(a.commands.as_ref().unwrap()[0].delay_ms, Some(500));
+        assert_eq!(a.work_dir.as_deref(), Some("/srv"));
+        assert_eq!(a.env.as_ref().unwrap()[0].key, "RUST_LOG");
+        assert_eq!(a.inter_delay_ms, None, "未设的字段不能被写成 0");
+    }
+
+    #[test]
+    fn group_automation_survives_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let g;
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            g = v.add_group("生产".into());
+            v.group_mut(g).unwrap().automation.tmux = Some(crate::automation::TmuxChoice::Off);
+            v.save().unwrap();
+        }
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(
+            v.groups()[0].automation.tmux,
+            Some(crate::automation::TmuxChoice::Off),
+            "显式 Off 必须能落盘再读回,不能被当成未设写没"
+        );
+    }
+
+    #[test]
+    fn resolve_for_carries_automation_from_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let gid = v.add_group("生产".into());
+        v.group_mut(gid).unwrap().automation.tmux = Some(crate::automation::TmuxChoice::Attach {
+            session_name: Some("shared".into()),
+        });
+        let mut d = draft();
+        d.identity.group_id = Some(gid);
+        let id = v.add(d, "2026-08-06T00:00:00Z");
+
+        let got = v.resolve_for(id).unwrap();
+        assert_eq!(
+            got.automation.tmux,
+            Some(crate::automation::TmuxChoice::Attach {
+                session_name: Some("shared".into())
+            }),
+            "分组的 tmux 设置应经 resolve_for 透出"
+        );
+    }
+
+    #[test]
+    fn update_replaces_automation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let mut d = draft();
+        d.automation.tmux = Some(crate::automation::TmuxChoice::Attach {
+            session_name: Some("old".into()),
+        });
+        let id = v.add(d, "t");
+
+        let mut d2 = draft();
+        d2.automation.tmux = Some(crate::automation::TmuxChoice::Off);
+        v.update(id, d2, "t2").unwrap();
+
+        assert_eq!(
+            v.get(id).unwrap().automation.tmux,
+            Some(crate::automation::TmuxChoice::Off),
+            "update 必须把 automation 一起替换掉"
         );
     }
 }

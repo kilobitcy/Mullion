@@ -1,6 +1,7 @@
 //! mullion-store —— 会话与凭据持久化。无头、可纯单测,零 UI/GPU/async。
 //! 依赖方向:app → store;store 不依赖 core/term/ssh。
 
+pub mod automation;
 pub mod crypto;
 pub mod error;
 pub mod group;
@@ -13,6 +14,9 @@ pub mod model;
 pub mod network;
 pub mod vault;
 
+pub use automation::{
+    build_plan, AutomationCommand, AutomationPrefs, EnvVar, ResolvedAutomation, Step, TmuxChoice,
+};
 pub use error::StoreError;
 pub use group::GroupRecord;
 pub use inherit::{resolve, PrefsLayer, ResolvedConfig, DEFAULT_SCROLLBACK};
