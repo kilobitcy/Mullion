@@ -98,10 +98,15 @@ struct AutomationHandle {
 ## 3. 数据流与四条触发边
 
 ```
-ConnectOk 抵达(winit 线程)
- └ Vault::resolve_for(session_id) → ResolvedConfig.automation
-   build_plan(&automation, 会话名) → Vec<Step>
-   decide_start(&plan, skip_flag) == true ⟹
+spawn_connect(cfg) 时(winit 线程,此刻才确定是哪条会话)
+ └ session_id = ui.connect_request_last
+   Some(id) ⟹ store.resolved(id)?.automation + store 里那条记录的 name
+              build_plan(&automation, name) → Vec<Step>
+   None     ⟹ 空计划(CLI 直连,见下)
+   App.pending_automation = Some(PendingAutomation{ steps, ready_timeout_ms })
+
+ConnectOk 抵达
+ └ 取走 pending_automation;decide_start(&steps, skip_flag) == true ⟹
      ssh = Arc::new(ssh);  pane 拿 Box::new(ssh.clone())
      建 ready/cancel 两条 oneshot
      spawn automation::run(ssh as Arc<dyn ByteSink>, steps, ready_rx, cancel_rx, timeout)
@@ -115,14 +120,48 @@ run 内:
   → proxy.send_event(UserEvent::AutomationDone(generation, outcome))
 ```
 
+### 为什么在 `spawn_connect` 算，而不是 `ConnectOk` 里算
+
+两个理由。其一，`ConnectOk` 事件不携带 `SessionId`（见 `UserEvent` 定义），到那时只能
+读 `ui.connect_request_last`，而连接在途期间用户完全可能在会话管理器里改了配置甚至
+删了这条会话——发出去的字节就跟用户当初点「连接」时看到的配置对不上了。其二，
+`store.resolved()` 是同步 IO 边界内的查库，放在 `spawn_connect`（用户点击的那一帧）
+比放在 `ConnectOk`（可能几秒后、代理链路下更久）语义清楚。
+
+### CLI 直连没有会话记录
+
+`mullion user@host -p 22 -i key` 这条路径（`App.initial`）压根没有 `SessionId`，
+`connect_request_last` 为 `None`。**此时计划为空，不跑自动化**——没有配置来源，
+凭空猜一个 tmux 会话名去 attach 是最坏的行为。这不是退化：CLI 直连本来就是调试
+入口，要自动化就存成会话。配一条守护测试。
+
+### 数据入口用 `SessionStore::resolved`，不是 `Vault::resolve_for`
+
+App 持有的是 `crate::shell::store::SessionStore`（`app.rs:145`），它已经封好了
+`resolved(id) -> Result<ResolvedConfig, StoreError>`（`shell/store.rs:119`），内部就是
+`Vault::resolve_for`。app 不该越过这层门面直接够 `Vault`。
+
+`build_plan` 还需要会话名做 tmux 的 `fallback_name`，而 `ResolvedConfig` 不含它——
+从 `store.list()` 里按 id 找那条记录取 `identity.name`。若要新增一个
+`SessionStore::automation_plan_for(id)` 把两步合起来，属实现计划的自由。
+
 四条边：
 
 | 边 | 触发点 | 动作 |
 |---|---|---|
-| 首字节到达 | `Workspace::pump` 改为返回本帧收到入站字节的 `PaneId` 列表 | 含 handle.pane ⟹ `ready.take().send(())` |
+| 首字节到达 | `PaneState` 新增 `saw_first_byte: bool`，`Workspace::pump` 收到非空入站字节时置位 | App 每帧查 handle.pane 的这个标志 ⟹ `ready.take().send(())` |
 | ready 超时 | `run` 内 `sleep` | `Outcome::SkippedTimeout` |
-| 用户接管 | app.rs 的 **4 个用户输入写入点**：`:474` 粘贴、`:1123`/`:1134` 键盘、`:1221` 鼠标 | `cancel.take()` 后 drop |
-| 断线 / 关窗 / 重连 | pane 转 `Disconnected`、新 `ConnectOk`、`suspended` | 整个 handle 置 `None`，drop 即取消 |
+| 用户接管 | app.rs 中**所有用户意图的 PTY 写入点**（当前四处：粘贴 `:474`、滚轮上报 `:1123`/`:1134`、键盘 `:1221`） | `cancel.take()` 后 drop |
+| 断线 | `Workspace::pump` 把 pane 置 `PaneStatus::Disconnected`，App 每帧查 | 同上，`cancel.take()` 后 drop |
+| 关窗 / 重连 | 新 `ConnectOk`、`suspended` | 整个 handle 置 `None`，drop 即取消 |
+
+**首字节检测不要让 `pump` 返回 `Vec<PaneId>`**：`pump` 每帧必调，返回 `Vec` 等于每帧
+一次堆分配，而本项目对帧路径上的无谓开销一向敏感（T3）。挂个 `bool` 在 `PaneState`
+上零分配，而且「这个 pane 收到过字节没有」本来就是 pane 自己的状态。
+
+**四处写入点的行号会漂**，实现时以 `grep 'pty.write'` 为准：`app.rs` 里全部命中都是
+用户意图，`shell/workspace/mod.rs` 里那一处是 T1 应答（见下），唯一要排除的就是它。
+将来新增用户输入路径（如鼠标按钮上报）也必须一并接上 cancel。
 
 ### 必须点名的陷阱：cancel 绝不能挂在 `PtyWriter::write` 上
 
@@ -168,6 +207,15 @@ session 会内容镜像，且 `window-size` 取 `latest` 会反复 reflow、取 
 
 `Completed` 也显示，沿总设计 §8「已完成 N 步」——用户看不见发生了什么，就无法判断
 自动化是没跑还是跑了没效果。
+
+**文案的生命周期**：`AutomationDone` 抵达时写进 `App.automation_status: Option<String>`，
+**一直显示到下一次 `spawn_connect`**（那时清空）。不做定时淡出——状态栏本来就是常驻
+信息区，而定时清除需要再引一个 deadline 进帧循环，正是修订一要避免的东西。
+
+**`AutomationDone` 必须按世代过滤**（`AutomationHandle.generation` 就是为此存在）：
+高延迟链路下，用户完全可能在自动化还在跑的时候断开重连，旧世代的「自动化已中止：
+连接已断开」落到新连接的状态栏上，是一条与当前连接毫不相干的误导信息。判据同
+`PaneOpenErr` 的 `generation_matches`。
 
 ### F44 的一次性跳过入口
 
@@ -252,8 +300,11 @@ env 表 + 三个延时会长到必须滚动才能找到东西。自动化也是�
 | app 异步 | `cancel_before_ready_aborts` | 等待期取消 |
 | app 异步 | `cancel_during_run_stops_remaining_steps` | 执行期取消 |
 | **app 守护** | `pty_write_echo_does_not_cancel_automation` | **T1 回写不得被当成用户输入** |
-| app | `pump_reports_panes_that_received_bytes` | `Workspace::pump` 新返回值 |
+| app | `pump_marks_saw_first_byte_only_for_panes_with_inbound` | 首字节标志置位时机 |
 | app | `automation_is_only_armed_for_the_first_pane` | `PaneOpened` 不带自动化 |
+| app | `cli_direct_connect_has_no_plan` | 无 `SessionId` ⟹ 空计划（不猜 tmux 名） |
+| app | `automation_done_from_a_stale_generation_is_ignored` | 世代过滤，同 `PaneOpenErr` |
+| app | `status_is_cleared_when_a_new_connect_starts` | 文案生命周期 |
 | app | `frame::tests` 既有用例 | T7 —— 本切片不动 `ControlFlow`，这些必须原样绿 |
 | app | `app::tests::reflow_emits_resize` | T4 |
 
