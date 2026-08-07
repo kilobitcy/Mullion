@@ -152,6 +152,67 @@ pub fn clear_color(t: &Theme) -> wgpu::Color {
     }
 }
 
+/// F62 会话语义色的 8 个预设:`(显示名, hex, 建议用途)`。
+///
+/// **按颜色命名而不是按环境命名**(不叫「生产色」「测试色」):环境语义是 F64
+/// 的地盘,两处都定义「什么是生产」必然会漂移。第三列只作为 tooltip 出现,
+/// 是建议,不产生任何语义。
+///
+/// **不放进 `Theme`**:`Theme` 的字段是「UI 自己用的语义色」,F84 主题切换时
+/// 整套换;而这 8 个是用户挑选的标识色,存进 `ColorSpec.hex` 后就与主题脱钩了。
+/// 换个主题不该让用户标的红变成另一种红。
+///
+/// 红/黄/绿/蓝/灰刻意复用 `danger_soft`/`warn`/`ok`/`info`/`fg_dimmer` 的同一组
+/// 色值(同一套调色逻辑,不引入第二种审美);**紫故意不取 `accent` 的 #8b95ff**,
+/// 理由见 `palette_purple_differs_from_accent_so_the_two_edge_bars_stay_distinguishable`。
+pub const LABEL_PALETTE: [(&str, &str, &str); 8] = [
+    ("红", "#e06767", "生产 / 高危"),
+    ("橙", "#e0955f", "预发 / 待处理"),
+    ("黄", "#e0b767", "测试"),
+    ("绿", "#7fd99b", "开发 / 安全"),
+    ("青", "#67d0d9", "数据库 / 存储"),
+    ("蓝", "#7c9eff", "内网 / 常用"),
+    ("紫", "#b98bff", "个人 / 实验"),
+    ("灰", "#8a90a8", "归档 / 弃用"),
+];
+
+/// `#rrggbb` → `Rgb`。**解析失败返回 `None`,不报错**——`ColorSpec.hex` 是自由
+/// 文本(用户可自定义 hex,配置文件也可能被手改),一个坏值不该让整张会话列表
+/// 画不出来。调用方一律把 `None` 当作「没设色」。
+///
+/// 只认 6 位十六进制、必须带 `#`、大小写不敏感。
+pub fn parse_hex(s: &str) -> Option<Rgb> {
+    let h = s.strip_prefix('#')?;
+    // ASCII 判定必须挡在切片之前:`h.len()` 是**字节**数,"中文" 是 6 字节但只有
+    // 2 个 char,直接 `&h[0..2]` 会在字符边界内切开而 panic。
+    // `&&` 短路 + `is_ascii_hexdigit` 保证走到切片时每个字节都是单字节字符。
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(Rgb::new(
+        u8::from_str_radix(&h[0..2], 16).ok()?,
+        u8::from_str_radix(&h[2..4], 16).ok()?,
+        u8::from_str_radix(&h[4..6], 16).ok()?,
+    ))
+}
+
+/// WCAG 相对亮度。分量先转线性再加权——直接拿 sRGB 分量算会得到偏亮的结果
+/// (同 `clear_color` 那个坑,见 `clear_color_is_linear_not_raw_srgb`)。
+fn relative_luminance(c: Rgb) -> f64 {
+    0.2126 * srgb_to_linear(c.r) + 0.7152 * srgb_to_linear(c.g) + 0.0722 * srgb_to_linear(c.b)
+}
+
+/// WCAG 对比度,1.0(同色)~ 21.0(纯黑对纯白)。
+///
+/// 用来在测试里**实算**预设色的可见性,而不是靠眼睛和感觉调色。
+/// 文本要 4.5:1(WCAG 1.4.3),非文本图形要 3:1(WCAG 1.4.11)——
+/// 3px 竖条属后者。
+pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// `Rgb` → egui 颜色。
 pub fn c32(c: Rgb) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
@@ -290,5 +351,76 @@ mod tests {
             c32(MULLION_DARK.accent),
             "按下态背景应取自 theme.accent"
         );
+    }
+
+    /// F62:`#rrggbb` 是唯一认的写法。**解析失败返回 `None` 而不是报错**——
+    /// 配置文件被手改坏不该让会话列表画不出来(设计 §3)。
+    ///
+    /// 不认 3 位缩写 / 8 位带 alpha / 不带 `#` 的裸串:多一种写法就多一种
+    /// 「存进去是这个、读出来是那个」的可能。
+    #[test]
+    fn parse_hex_accepts_six_digits_and_rejects_everything_else() {
+        assert_eq!(parse_hex("#e06767"), Some(Rgb::new(0xe0, 0x67, 0x67)));
+        assert_eq!(
+            parse_hex("#E06767"),
+            Some(Rgb::new(0xe0, 0x67, 0x67)),
+            "大小写不敏感"
+        );
+        assert_eq!(parse_hex("e06767"), None, "缺 # 不认");
+        assert_eq!(parse_hex("#e067"), None, "位数不足不认");
+        assert_eq!(parse_hex("#e0676777"), None, "8 位带 alpha 不认");
+        assert_eq!(parse_hex("#gghhii"), None, "非十六进制不认");
+        assert_eq!(parse_hex(""), None);
+        // 「中文」= 6 个**字节**但只有 2 个 char。先按字节长度过滤再切片会 panic,
+        // 这条钉死实现必须靠 ASCII 判定挡在切片之前。
+        assert_eq!(parse_hex("#中文"), None, "多字节字符不能让切片 panic");
+    }
+
+    /// F62:8 个预设色是画在 `panel_bg` 上的 3px 竖条。竖条是**非文本**元素,
+    /// WCAG 1.4.11 的阈值是 3:1(不是文字的 4.5:1)。低于这个数,用户在真实
+    /// 显示器上根本分不出这条会话有没有标色 —— 整个特性就白做了。
+    #[test]
+    fn label_palette_contrasts_at_least_3_to_1_against_panel_bg() {
+        for (name, hex, _) in LABEL_PALETTE {
+            let c =
+                parse_hex(hex).unwrap_or_else(|| panic!("预设色「{name}」的 hex {hex} 解析不了"));
+            let ratio = contrast_ratio(c, MULLION_DARK.panel_bg);
+            assert!(
+                ratio >= 3.0,
+                "预设色「{name}」({hex})与 panel_bg 的对比度只有 {ratio:.2}:1,\
+                 达不到 WCAG 1.4.11 非文本元素要求的 3:1"
+            );
+        }
+    }
+
+    /// 紫**必须**跟 `accent` 不同色。会话列表行的左 3px 是选中态 accent 条、
+    /// 右 3px 是这里的语义色条 —— 两者同色时,选中一条标了紫的会话,左右两条
+    /// 边看起来一模一样,用户分不出哪条是「选中」哪条是「标色」。
+    ///
+    /// 这条专门防「顺手统一一下」:accent(#8b95ff)和紫(#b98bff)长得很像,
+    /// 后来的人很容易觉得是重复定义而把它们合并。
+    #[test]
+    fn palette_purple_differs_from_accent_so_the_two_edge_bars_stay_distinguishable() {
+        let (_, hex, _) = LABEL_PALETTE
+            .iter()
+            .find(|(name, _, _)| *name == "紫")
+            .expect("色板里应该有「紫」");
+        let purple = parse_hex(hex).expect("紫的 hex 应可解析");
+        assert_ne!(
+            purple, MULLION_DARK.accent,
+            "紫与 accent 同色会让列表行左右两条边分不出「选中」和「标色」"
+        );
+    }
+
+    /// 对比度公式自身的锚点:纯黑对纯白必须正好是 21:1(WCAG 定义的上界),
+    /// 同色必须是 1:1。没有这条,上面那条 3:1 断言可能是在用一个算错的公式
+    /// 「验证通过」。
+    #[test]
+    fn contrast_ratio_matches_wcag_endpoints() {
+        let black = Rgb::new(0, 0, 0);
+        let white = Rgb::new(255, 255, 255);
+        assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(white, black) - 21.0).abs() < 0.01, "对称");
+        assert!((contrast_ratio(white, white) - 1.0).abs() < 1e-9);
     }
 }

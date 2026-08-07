@@ -1,11 +1,11 @@
-//! 会话管理器**右栏**:标题条 + 错误卡片 + 四个 Tab + 底部按钮条(F90 Task 11)。
+//! 会话管理器**右栏**:标题条 + 错误卡片 + 五个 Tab + 底部按钮条(F90 Task 11)。
 //!
 //! 原来是一个独立的 `egui::Window`(F90 前),现在是主窗右侧的 `CentralPanel`,
 //! 每帧都渲染——「关闭」表单这个概念不复存在,「取消」只是把
 //! `ui_state.editor`/`editor_id`/`editor_baseline` 重置回空(等价于回到
 //! 「未编辑任何会话」态,画空态提示)。
 //!
-//! 字段本身的布局是 Task 12 的事,这里只挂四个 Tab 的占位调用点
+//! 字段本身的布局是 Task 12 的事,这里只挂五个 Tab 的占位调用点
 //! (`super::fields::{basic,auth,network,automation}`)。
 
 use egui::Ui;
@@ -15,8 +15,8 @@ use crate::ui::session_manager::SecretPresence;
 use crate::ui::UiState;
 use mullion_store::{GroupRecord, SessionRecord};
 
-/// 四个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
-const TABS: [&str; 4] = ["连接", "认证", "高级", "登录后"];
+/// 五个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
+const TABS: [&str; 5] = ["连接", "认证", "高级", "登录后", "图标"];
 
 /// 底部按钮为什么点不动。两个原因是并集,`Missing` 优先 ——
 /// 表单都没填齐,就没必要提「测试连接进行中」。
@@ -390,6 +390,7 @@ pub(super) fn show(
             super::TAB_AUTH => super::fields::auth(ui, t, buf, presence, &ui_state.key_candidates),
             super::TAB_AUTOMATION => super::fields::automation(ui, t, buf),
             super::TAB_ADVANCED => super::fields::network(ui, t, buf, presence),
+            super::TAB_APPEARANCE => super::fields::appearance(ui, t, buf),
             // 「越界值兜底」:`editor_tab` 是既有的裸 usize 技术债,越界值
             // 落到这里比 panic 好。
             _ => super::fields::network(ui, t, buf, presence),
@@ -547,6 +548,27 @@ mod tests {
     use crate::ui::session_manager::validate::Missing;
     use crate::ui::session_manager::{AuthKindUi, EditorBuffer, ProbeState, TAB_AUTH, TAB_CONNECT};
     use crate::ui::UiState;
+
+    /// Tab 标题与 `TAB_*` 下标常量一一对应。
+    ///
+    /// `editor_tab: usize` 是既有技术债(见 `mod.rs` 的常量注释):重排 `TABS`
+    /// 而忘了改常量,**编译器一声不吭**,后果是 `validate::tab()` 把缺项红点
+    /// 标在错误的页上、`show()` 的 match 把用户导到错误的页。这条是那个静默
+    /// 失效的唯一自动守护。
+    ///
+    /// 覆盖不到的:`show()` 里 match 是否给每个下标都接了对应的 `fields::*`
+    /// (漏接会落到 `_ =>` 兜底渲染「高级」页)。那要端到端跑 `show()`,
+    /// 参数面太宽,留在人工验收清单里。
+    #[test]
+    fn tab_titles_line_up_with_the_tab_index_constants() {
+        use crate::ui::session_manager::{TAB_ADVANCED, TAB_APPEARANCE, TAB_AUTOMATION};
+        assert_eq!(super::TABS.len(), 5, "加减 Tab 要同步更新这条");
+        assert_eq!(super::TABS[TAB_CONNECT], "连接");
+        assert_eq!(super::TABS[TAB_AUTH], "认证");
+        assert_eq!(super::TABS[TAB_ADVANCED], "高级");
+        assert_eq!(super::TABS[TAB_AUTOMATION], "登录后");
+        assert_eq!(super::TABS[TAB_APPEARANCE], "图标");
+    }
 
     /// 都没缺、也没在拨测 → 按钮可点。
     #[test]

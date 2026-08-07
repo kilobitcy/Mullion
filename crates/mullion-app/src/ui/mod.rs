@@ -1,4 +1,5 @@
 //! egui UI 构建,与 app 事件循环解耦。build_ui 每帧在 egui ctx.run 闭包里调。
+pub mod badge;
 pub mod chrome;
 pub mod group_manager;
 pub mod host_key;
@@ -225,6 +226,9 @@ pub struct UiFrame<'a> {
     /// F40~F44:自动化状态一句话。`None` = 这条连接没跑过自动化。
     /// 生命周期由 `App` 管:一直显示到下一次 `spawn_connect`(那时清空)。
     pub automation: Option<&'a str>,
+    /// F61/F62:已解析的会话外观。**必须是缓存**——`inherit::resolve` 不得进
+    /// 渲染热路径(陷阱 T3),见 `badge::AppearanceCache` 的文档注释。
+    pub appearance: &'a badge::AppearanceCache,
 }
 
 /// 用户这一帧在 UI 上做的、需要 app 事后施加的布局动作。
@@ -268,6 +272,15 @@ pub fn build_ui(
         frame.connected,
         ui_state.last_error.as_deref(),
         frame.automation,
+        // F62:状态栏取**当前聚焦 pane**所属会话的色。多 pane 时状态栏该显示
+        // 谁的色没有确定答案,所以这个落点默认不勾;勾了就按聚焦那个走 ——
+        // 焦点是用户当下正在操作的那个 pane,这是唯一有意义的选择。
+        frame
+            .titles
+            .iter()
+            .find(|v| v.focused)
+            .and_then(|v| v.appearance)
+            .and_then(|a| badge::should_paint(a, mullion_store::ColorTarget::StatusBar)),
     );
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
@@ -294,6 +307,7 @@ pub fn build_ui(
             frame.store_available,
             frame.connected_session,
             frame.secret_presence,
+            frame.appearance,
         );
     }
     if ui_state.group_manager_open {
@@ -441,6 +455,9 @@ mod tests {
             secret_presence: session_manager::SecretPresence::default(),
             connected_session: None,
             automation: None,
+            // 测试专用:`AppearanceCache` 没有 const 构造,借 `Box::leak` 换一个
+            // `'static` 引用——只在测试进程里泄漏一次,不是生产路径。
+            appearance: Box::leak(Box::new(badge::AppearanceCache::default())),
         }
     }
 
@@ -528,6 +545,7 @@ mod tests {
             host: Some(host),
             status: PaneStatus::Live,
             focused: true,
+            appearance: None,
         }
     }
 

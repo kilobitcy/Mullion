@@ -190,6 +190,9 @@ pub struct App {
     /// 当前已连接的会话(状态点用)。`ConnectOk` 时从 `ui.connect_request_last`
     /// 记下来,`UserEvent::ConnectOk` 本身不带 SessionId。
     connected_session: Option<mullion_store::SessionId>,
+    /// F61/F62:会话外观的解析缓存。**只在会话/分组变更后 rebuild**,
+    /// 绝不在渲染里现算(陷阱 T3,见 `ui::badge::AppearanceCache`)。
+    appearance: crate::ui::badge::AppearanceCache,
     /// F92 拨测世代号。切会话 / 关编辑器 / 关会话管理器时 +1,
     /// 迟到的结果据此丢弃(见 `accept_probe`)。
     probe_epoch: u64,
@@ -255,6 +258,7 @@ impl App {
             autoscroll: 0,
             pending_paste: None,
             connected_session: None,
+            appearance: Default::default(),
             probe_epoch: 0,
             probe_task: None,
             automation: None,
@@ -620,6 +624,24 @@ impl App {
         }
     }
 
+    /// 重算会话外观缓存(F61/F62)。
+    ///
+    /// **每一处改动了会话或分组的地方都必须调它。** 漏掉一处的症状是:用户改了
+    /// 颜色、保存,列表和 pane 标题条却还是旧色,直到重启才更新——一个没有报错、
+    /// 只是「看起来没生效」的 bug,最难查。
+    ///
+    /// 反过来也不能图省事每帧调:`inherit::resolve` 的文档注释点名了陷阱 T3
+    /// (喂数据和重绘没解耦),会话列表每帧几十行,逐行解析就是每秒几千次。
+    fn refresh_appearance(&mut self) {
+        match self.store.as_ref() {
+            Some(s) => {
+                // `list()` 而不是 `sessions()`——store 的会话访问器叫 `list`。
+                self.appearance.rebuild(s.list(), s.groups());
+            }
+            None => self.appearance.rebuild(&[], &[]),
+        }
+    }
+
     /// 在 `_runtime` 上异步连接;结果经 `proxy` 以 `UserEvent` 回送(§5)。
     /// 不阻塞调用方(winit 事件循环线程)。拆成 `establish` + `open_pty` 两步
     /// (而不是直接调更省事的 `session::connect`):分屏(F35)要在同一条连接上
@@ -927,6 +949,8 @@ impl ApplicationHandler<UserEvent> for App {
                 None
             }
         };
+        // 启动时先算一次,否则第一次打开会话管理器全是无色。
+        self.refresh_appearance();
 
         // CLI 直连(路径①)→ 立刻发起连接,进终端态;无参启动(路径②)→ 留在
         // launcher(conn 仍 None)并自动弹出会话管理器,让用户选/建会话(§2/Task7)。
@@ -996,6 +1020,9 @@ impl ApplicationHandler<UserEvent> for App {
                         .last_cfg
                         .as_ref()
                         .map_or_else(String::new, |c| format!("{}:{}", c.host, c.port)),
+                    // 与紧邻的 `self.connected_session` 同源:都取发起这次连接时
+                    // 记下的那条会话(`ConnectOk` 事件本身不带 SessionId)。
+                    session_id: self.ui.connect_request_last,
                     handle,
                 });
                 self.ws = Some(ws);
@@ -1530,6 +1557,13 @@ impl ApplicationHandler<UserEvent> for App {
                                                 |p| p.status,
                                             ),
                                             focused: Some(g.id) == focus,
+                                            // 一条连接一个会话(ADR-009:多 pane
+                                            // 共用一条 SSH 连接,`host_ix` 目前恒 0)。
+                                            appearance: ws
+                                                .pane(g.id)
+                                                .and_then(|p| ws.hosts.get(p.host_ix))
+                                                .and_then(|h| h.session_id)
+                                                .and_then(|sid| self.appearance.get(sid)),
                                         })
                                         .collect()
                                 })
@@ -1559,6 +1593,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.automation.is_some(),
                                     self.automation_status.as_deref(),
                                 ),
+                                appearance: &self.appearance,
                             };
                             let a = self.active.as_mut().expect("上面刚判过 is_some");
                             let (repaint_delay, actions) =
@@ -1694,6 +1729,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // Task 6:会话管理弹窗的 intent 施加点。放在 `plan` 整块之后——此处
                 // self.active/self.ws/self.ui 的借用都已释放,才能拿 `&mut
                 // self.store`(egui 闭包里借不到它,只能在这里事后统一施加)。
+                // `touched_store` 必须在三个 `take()` 之前算:`take()` 之后就
+                // 问不出「刚才有没有意图」了。F61/F62 的外观缓存要在会话/分组
+                // 变更后重算。
+                let touched_store = self.ui.delete_request.is_some()
+                    || self.ui.save_request.is_some()
+                    || self.ui.group_intent.is_some();
                 if self.ui.delete_request.is_some() || self.ui.save_request.is_some() {
                     // keyring/TOML 是同步 IO,在事件回调里可能阻塞(Windows 凭据管理器
                     // 偶发几百 ms),打点让看门狗能指认。
@@ -1745,6 +1786,18 @@ impl ApplicationHandler<UserEvent> for App {
                             self.ui.set_error(e.to_string());
                         }
                     }
+                }
+                // F61/F62:会话增删改、分组增删改名都可能改变外观继承链
+                // (删掉分组 → 会话回落到自己那一层),缓存跟着重算。
+                //
+                // **必须门控在 `touched_store` 后面**:这段每帧都跑,无条件调
+                // `refresh_appearance` 就是每帧对所有会话重跑 `inherit::resolve`
+                // —— 正是这个缓存要防的陷阱 T3。
+                //
+                // 不管成功还是失败都重算:失败路径上 store 可能已经改了一半
+                // (比如 `delete` 成功但 `save` 失败),按实际状态重算才是对的。
+                if touched_store {
+                    self.refresh_appearance();
                 }
                 // 「选择…」私钥文件:同样是 egui 闭包只记意图、这里才施加。
                 if std::mem::take(&mut self.ui.pick_key_request) && !self.key_picker_busy {

@@ -14,6 +14,13 @@ use crate::ui::UiState;
 /// 一行会话的高度(设计稿 §4.1:两行文字 + 上下 8px)。
 const ROW_H: f32 = 44.0;
 
+/// 图标槽位中心距行左边缘(逻辑点)。状态点在 16,图标紧随其后。
+const ICON_SLOT_X: f32 = 38.0;
+/// 图标边长。
+const ICON_PX: f32 = 16.0;
+/// 文字左边界。= 图标槽位右沿 + 8px 间距,**恒定**(见 `session_row` 注释)。
+const TEXT_X: f32 = ICON_SLOT_X + ICON_PX / 2.0 + 8.0;
+
 /// 会话是否命中搜索。空查询放行全部。名称 / 主机 / 标签三处都查,
 /// 大小写不敏感 —— 用户记得住的常是 IP 尾数或标签,不是当初起的名字。
 pub(crate) fn matches(rec: &SessionRecord, query: &str) -> bool {
@@ -32,12 +39,17 @@ pub(crate) fn matches(rec: &SessionRecord, query: &str) -> bool {
 
 /// 手绘一行会话。不用 `selectable_label`:设计稿要「状态点 + 名称 + user@host
 /// 两行 + 选中态左侧强调条」,`selectable_label` 只画得出单行文本。
+///
+/// F61/F62 加了两样东西:**右**边缘的语义色竖条(左 3px 已被选中态 accent 占了,
+/// 两者各占一边才不打架)、状态点与文字之间的 16px 图标槽位。
+/// **槽位恒占**——没设图标的行也留白,否则有图标和没图标的行文字左边界参差。
 fn session_row(
     ui: &mut Ui,
     t: &Theme,
     rec: &SessionRecord,
     selected: bool,
     connected: bool,
+    appearance: &crate::ui::badge::Appearance,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_H),
@@ -59,6 +71,13 @@ fn session_row(
             egui::Rounding::same(2.0),
             theme::c32(t.accent),
         );
+    }
+
+    // F62:语义色竖条走**右**边缘 —— 左 3px 归选中态 accent,两者各占一边。
+    if let Some(c) =
+        crate::ui::badge::should_paint(appearance, mullion_store::ColorTarget::ListItem)
+    {
+        crate::ui::badge::paint_edge_bar(p, rect, crate::ui::badge::Side::Right, c);
     }
 
     // §6:状态点只有两态 —— 已连接(ok 绿)/ 未连接(fg_ghost 灰)。
@@ -92,15 +111,29 @@ fn session_row(
     );
     ui.interact(dot_rect, resp.id.with("dot"), egui::Sense::hover())
         .on_hover_text(if connected { "已连接" } else { "未连接" });
+
+    // F61:图标槽位。**恒占**,画不画都留这 16px —— 有图标的行和没图标的行
+    // 文字左边界必须对齐,否则列表看起来像坏了。
+    if let Some(icon) = &appearance.icon {
+        crate::ui::badge::paint_icon(
+            p,
+            egui::Rect::from_center_size(
+                egui::pos2(rect.left() + ICON_SLOT_X, rect.center().y),
+                egui::vec2(ICON_PX, ICON_PX),
+            ),
+            icon,
+            t,
+        );
+    }
     p.text(
-        egui::pos2(rect.left() + 30.0, rect.top() + 7.0),
+        egui::pos2(rect.left() + TEXT_X, rect.top() + 7.0),
         egui::Align2::LEFT_TOP,
         &rec.identity.name,
         egui::FontId::proportional(14.0),
         theme::c32(t.fg),
     );
     p.text(
-        egui::pos2(rect.left() + 30.0, rect.top() + 25.0),
+        egui::pos2(rect.left() + TEXT_X, rect.top() + 25.0),
         egui::Align2::LEFT_TOP,
         format!("{}@{}", rec.auth.user, rec.connection.host),
         egui::FontId::proportional(11.0),
@@ -173,6 +206,7 @@ pub(super) fn show(
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
     connected: Option<SessionId>,
+    appearance: &crate::ui::badge::AppearanceCache,
 ) {
     // 搜索框
     ui.add(
@@ -264,6 +298,7 @@ pub(super) fn show(
                                 connected,
                                 pending_delete_target,
                                 &mut pending_delete_rendered,
+                                appearance,
                             );
                         }
                     });
@@ -293,6 +328,7 @@ pub(super) fn show(
 /// 待确认删除的目标行」的事后判定标志,见调用侧 `show()` 里的说明——
 /// 只在 `rec.id == pending_delete_target` 时置位,不直接读 `ui_state.pending_delete`,
 /// 避免本帧内刚发生的新右键覆盖被误当成「旧目标已渲染」。
+#[allow(clippy::too_many_arguments)]
 fn row(
     ui: &mut Ui,
     t: &Theme,
@@ -301,13 +337,17 @@ fn row(
     connected: Option<SessionId>,
     pending_delete_target: Option<SessionId>,
     pending_delete_rendered: &mut bool,
+    appearance: &crate::ui::badge::AppearanceCache,
 ) {
     if pending_delete_target == Some(rec.id) {
         *pending_delete_rendered = true;
     }
 
     let selected = ui_state.editor_id == Some(rec.id);
-    let resp = session_row(ui, t, rec, selected, connected == Some(rec.id));
+    // 缓存里没有这条(store 刚删掉、或还没 rebuild)就按「没设外观」画。
+    let default_appearance = crate::ui::badge::Appearance::default();
+    let a = appearance.get(rec.id).unwrap_or(&default_appearance);
+    let resp = session_row(ui, t, rec, selected, connected == Some(rec.id), a);
     if resp.clicked() {
         ui_state.pending_switch = Some(SwitchTarget::Session(rec.id));
     }
@@ -423,7 +463,15 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &t, &mut ui_state, &sessions, &groups, None);
+                show(
+                    ui,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    None,
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
             });
         });
         assert_eq!(
@@ -489,7 +537,15 @@ mod tests {
                 state.set_open(false);
                 state.store(ui.ctx());
 
-                show(ui, &t, &mut ui_state, &sessions, &groups, None);
+                show(
+                    ui,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    None,
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
             });
         });
         assert_eq!(
@@ -542,7 +598,15 @@ mod tests {
         let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, ui_state, &sessions, &groups, None);
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
                 });
             })
         };
@@ -631,7 +695,15 @@ mod tests {
         let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, ui_state, &sessions, &groups, None);
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
                 });
             })
         };
@@ -738,7 +810,15 @@ mod tests {
         let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, ui_state, &sessions, &groups, None);
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
                 });
             })
         };
@@ -805,6 +885,78 @@ mod tests {
             Some(SessionId(1)),
             "session-b(X)这一帧没有渲染、同时 session-a(Z)在这同一帧被右键\
              确认删除——Z 刚写下的新值不该被『X 未渲染』的清空逻辑误删"
+        );
+    }
+
+    /// 数一帧里画出来的图形总数。同 `badge.rs::tests::count_shapes` 的手法:
+    /// 竖条和图标都是 painter 直接画的,没有 widget、没有 Response 可以反查。
+    fn count_shapes(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                egui::Shape::Noop => 0,
+                _ => 1,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    fn cache_with(
+        color: Option<(&str, Vec<mullion_store::ColorTarget>)>,
+    ) -> crate::ui::badge::AppearanceCache {
+        let mut sessions = vec![rec(1, "dev-box", "192.0.2.10", &[])];
+        if let Some((hex, apply_to)) = color {
+            sessions[0].appearance = mullion_store::AppearancePrefs {
+                icon: None,
+                color: Some(mullion_store::ColorSpec {
+                    hex: hex.to_string(),
+                    apply_to,
+                }),
+            };
+        }
+        let mut c = crate::ui::badge::AppearanceCache::default();
+        c.rebuild(&sessions, &[]);
+        c
+    }
+
+    fn run_list(appearance: &crate::ui::badge::AppearanceCache) -> usize {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![rec(1, "dev-box", "192.0.2.10", &[])];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &t, &mut ui_state, &sessions, &groups, None, appearance);
+            });
+        });
+        count_shapes(&out.shapes)
+    }
+
+    /// F62:勾了「会话列表」的会话,行上要多画一条竖色条。
+    #[test]
+    fn list_row_paints_an_edge_bar_when_apply_to_includes_list_item() {
+        use mullion_store::ColorTarget;
+        let none = run_list(&cache_with(None));
+        let with = run_list(&cache_with(Some(("#e06767", vec![ColorTarget::ListItem]))));
+        assert!(
+            with > none,
+            "勾了「会话列表」的会话应该多画一条竖色条(无色 {none} 个图形,有色 {with} 个)"
+        );
+    }
+
+    /// 没勾「会话列表」就不画——`apply_to` 说了算,不是「设了色就到处画」。
+    #[test]
+    fn list_row_paints_nothing_when_apply_to_excludes_list_item() {
+        use mullion_store::ColorTarget;
+        let none = run_list(&cache_with(None));
+        let other = run_list(&cache_with(Some((
+            "#e06767",
+            vec![ColorTarget::PaneTitle, ColorTarget::StatusBar],
+        ))));
+        assert_eq!(
+            other, none,
+            "只勾了 pane 标题条/状态栏的会话,不该在列表行上画竖色条"
         );
     }
 }

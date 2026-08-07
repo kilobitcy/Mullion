@@ -70,6 +70,9 @@ pub struct HostConn {
     pub label: String,
     /// `user@host:port`,标题条副标题用。
     pub addr: String,
+    /// 这条连接来自哪条会话记录(F61/F62 外观要按它查缓存)。
+    /// `None` = 快速连接或 store 不可用。
+    pub session_id: Option<mullion_store::SessionId>,
     /// 目标主机连接(含跳板保活)。**必须整条持有**:Drop 即断连。`Arc` 是必须的:
     /// russh 的 `Handle` 没实现 `Clone`,只有 `Drop`(释放即断连)。
     pub handle: Arc<SshConnection>,

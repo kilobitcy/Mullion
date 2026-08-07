@@ -116,6 +116,9 @@ pub fn status_bar(
     connected: bool,
     last_error: Option<&str>,
     automation: Option<&str>,
+    // F62:当前聚焦 pane 所属会话的语义色。**只有勾了「状态栏」落点才是
+    // `Some`**(过滤在 `badge::should_paint` 里做,这里只负责画)。
+    session_color: Option<egui::Color32>,
 ) {
     let (left, right) = status_text(panes, connected);
     egui::TopBottomPanel::bottom("status")
@@ -127,6 +130,16 @@ pub fn status_bar(
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // F62:会话语义色是**画**出来的一个小竖块,不是拼进 `status_text`
+                // 的字形 —— 那条纯函数有 `status_text_carries_no_dot_glyph` 守着
+                // 「字形不进字符串」,而它是对的:塞进文本就只能是一个颜色。
+                if let Some(c) = session_color {
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(crate::ui::badge::EDGE_BAR_W, 12.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(r, egui::Rounding::same(1.5), c);
+                }
                 let dot = if connected { t.ok } else { t.fg_faint };
                 ui.colored_label(theme::c32(dot), "●");
                 ui.colored_label(theme::c32(t.fg_faint), left);
@@ -180,5 +193,57 @@ mod tests {
         let (left, right) = status_text(1, true);
         assert!(!left.contains('●'), "色点应由调用方单独上色绘制");
         assert!(!right.contains('●'));
+    }
+
+    fn count_shapes(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                egui::Shape::Noop => 0,
+                _ => 1,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    fn run_status(session_color: Option<egui::Color32>) -> usize {
+        let ctx = egui::Context::default();
+        // 跑两帧:egui 的面板/Area 默认 `fade_in`,第一帧 opacity=0 会让
+        // `Painter::add` 把所有形状记成 `Shape::Noop`,数出来全是 0。
+        // 同 `ui/mod.rs::rendered_text` 的做法。
+        let _ = ctx.run(Default::default(), |ctx| {
+            status_bar(
+                ctx,
+                &crate::theme::MULLION_DARK,
+                1,
+                true,
+                None,
+                None,
+                session_color,
+            );
+        });
+        let out = ctx.run(Default::default(), |ctx| {
+            status_bar(
+                ctx,
+                &crate::theme::MULLION_DARK,
+                1,
+                true,
+                None,
+                None,
+                session_color,
+            );
+        });
+        count_shapes(&out.shapes)
+    }
+
+    /// F62:状态栏的会话色是**画**出来的一个小色块,不是拼进文本的字形。
+    #[test]
+    fn status_bar_paints_a_session_color_block_when_given_one() {
+        let none = run_status(None);
+        let with = run_status(Some(egui::Color32::from_rgb(0xe0, 0x67, 0x67)));
+        assert!(
+            with > none,
+            "给了会话色就该多画一个色块(无 {none} 个图形,有 {with} 个)"
+        );
     }
 }

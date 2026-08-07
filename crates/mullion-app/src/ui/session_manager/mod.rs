@@ -15,7 +15,7 @@ mod validate;
 
 pub(crate) use buffer::{
     build_draft, clear_key, connect_string, import_key_file, is_dirty, merge_secret, secret_fields,
-    sync_has_passphrase,
+    set_color_target, sync_has_passphrase,
 };
 pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
 pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget};
@@ -68,6 +68,7 @@ pub(crate) const TAB_CONNECT: usize = 0;
 pub(crate) const TAB_AUTH: usize = 1;
 pub(crate) const TAB_ADVANCED: usize = 2;
 pub(crate) const TAB_AUTOMATION: usize = 3;
+pub(crate) const TAB_APPEARANCE: usize = 4;
 
 /// 计算给 `Window` 自身 chrome(标题栏 + `Frame::window` 的 `inner_margin`)留的
 /// 余量——**不是硬编码常量,是按 egui-0.30.0 实际渲染公式当场算出来的**。
@@ -265,6 +266,7 @@ pub fn show(
     store_available: bool,
     connected: Option<SessionId>,
     presence: SecretPresence,
+    appearance: &crate::ui::badge::AppearanceCache,
 ) -> Option<egui::Rect> {
     if !ui_state.session_manager_open {
         return None;
@@ -399,7 +401,7 @@ pub fn show(
                         .inner_margin(14.0),
                 )
                 .show_inside(ui, |ui| {
-                    list::show(ui, t, ui_state, sessions, groups, connected)
+                    list::show(ui, t, ui_state, sessions, groups, connected, appearance)
                 });
 
             egui::CentralPanel::default()
@@ -710,6 +712,7 @@ mod tests {
                 true,
                 None,
                 SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
             );
         });
         let mut rect = None;
@@ -723,6 +726,7 @@ mod tests {
                 true,
                 None,
                 SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
             );
             rect = Some(new_button_rect(ctx));
         });
@@ -770,6 +774,7 @@ mod tests {
                 true,
                 None,
                 SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
             );
         });
         let mut rects = None;
@@ -783,6 +788,7 @@ mod tests {
                 true,
                 None,
                 SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
             );
             let editor_rect = ctx.read_response(editor_root_id()).map(|r| r.rect);
             rects = Some((window_rect, editor_rect));
@@ -868,6 +874,7 @@ mod tests {
                 true,
                 None,
                 SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
             );
         });
         let mut rect = None;
@@ -881,6 +888,7 @@ mod tests {
                 true,
                 None,
                 SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
             );
             rect = Some(new_button_rect(ctx));
         });
@@ -948,6 +956,7 @@ mod tests {
                     true,
                     None,
                     SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
                 );
             });
             outer.expect("会话管理器窗口应已渲染并返回外层矩形")
@@ -1147,6 +1156,7 @@ mod tests {
                     true,
                     None,
                     SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
                 );
             });
             outer.expect("会话管理器窗口应已渲染并返回外层矩形")
@@ -1284,6 +1294,7 @@ mod tests {
                     true,
                     None,
                     SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
                 );
             });
         }
@@ -1298,6 +1309,7 @@ mod tests {
                 true,
                 None,
                 SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
             );
         });
         let window_rect = window_rect.expect("会话管理器窗口应该已经画出来了");
@@ -1347,6 +1359,7 @@ mod tests {
                     true,
                     None,
                     SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
                 );
                 enabled = ctx.read_response(save_button_id()).map(|r| r.enabled());
             });
@@ -1371,6 +1384,7 @@ mod tests {
                     true,
                     None,
                     SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
                 );
                 enabled_after = ctx.read_response(save_button_id()).map(|r| r.enabled());
             });
@@ -1425,6 +1439,7 @@ mod tests {
                     true,
                     None,
                     SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
                 );
                 probe_enabled = ctx.read_response(probe_button_id()).map(|r| r.enabled());
                 save_enabled = ctx.read_response(save_button_id()).map(|r| r.enabled());

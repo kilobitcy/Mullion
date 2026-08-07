@@ -103,6 +103,16 @@ pub struct EditorBuffer {
     pub preserved_appearance: AppearancePrefs,
     pub preserved_automation: AutomationPrefs,
 
+    /// 图标是不是「emoji」模式。**必须是独立的持久状态，不能从
+    /// `preserved_appearance.icon` 反推**——反推的话，用户刚点上「emoji」时缓冲
+    /// 还是空的，写回是 `None`，下一帧又反推成「无」，UI 当场弹回去、输入框根本
+    /// 出不来。这正是 v0.1.23 实机验收报的「点 emoji 没有内容」。
+    /// 守护测试:`fields::tests::emoji_mode_survives_the_next_frame_with_an_empty_buffer`。
+    pub icon_emoji_mode: bool,
+    /// 「emoji」模式下输入的 emoji。切到「无」再切回来不清空——同 `jump_chain`
+    /// 的缓冲逻辑：用户切回来应该看到自己刚才填的，而不是从头再输。
+    pub icon_emoji_buf: String,
+
     /// 「浏览…」按钮本帧被点了。`mod.rs` 在借用释放后转成
     /// `UiState::pick_key_request`,随即复位。
     pub pick_key_clicked: bool,
@@ -138,6 +148,8 @@ impl Default for EditorBuffer {
             preserved_terminal: TerminalPrefs::default(),
             preserved_appearance: AppearancePrefs::default(),
             preserved_automation: AutomationPrefs::default(),
+            icon_emoji_mode: false,
+            icon_emoji_buf: String::new(),
             pick_key_clicked: false,
         }
     }
@@ -151,6 +163,24 @@ impl Default for EditorBuffer {
 /// 「点进密码框再清空」文本上看不出差别,意图上却是「清除凭据」。
 pub(crate) fn is_dirty(buf: &EditorBuffer, baseline: &EditorBuffer) -> bool {
     buf != baseline
+}
+
+/// 勾选 / 取消一个颜色落点。
+///
+/// **只增删指定的那一个**：编辑器只展示会话列表 / pane 标题条 / 状态栏三个
+/// 勾选框，而 `apply_to` 里可能还有 `ColorTarget::Tab`（F36 标签页排在 v0.5，
+/// UI 上没有对应勾选框）。按「勾了什么存什么」重建整个列表会把它静默剥掉。
+pub(crate) fn set_color_target(
+    spec: &mut mullion_store::ColorSpec,
+    target: mullion_store::ColorTarget,
+    on: bool,
+) {
+    let has = spec.apply_to.contains(&target);
+    if on && !has {
+        spec.apply_to.push(target);
+    } else if !on && has {
+        spec.apply_to.retain(|t| *t != target);
+    }
 }
 
 /// 左栏点击想切到哪里。切换前若表单是脏的,先弹确认,确认后再消费它。
@@ -198,6 +228,8 @@ impl std::fmt::Debug for EditorBuffer {
             .field("preserved_terminal", &self.preserved_terminal)
             .field("preserved_appearance", &self.preserved_appearance)
             .field("preserved_automation", &self.preserved_automation)
+            .field("icon_emoji_mode", &self.icon_emoji_mode)
+            .field("icon_emoji_buf", &self.icon_emoji_buf)
             .finish()
     }
 }
@@ -251,6 +283,19 @@ impl EditorBuffer {
         match &rec.auth.kind {
             AuthKind::Password => buf.auth_kind = AuthKindUi::Password,
             AuthKind::PublicKey { .. } => buf.auth_kind = AuthKindUi::PublicKey,
+        }
+        // 已存的 emoji 回填进缓冲并置上模式位，打开编辑器就直接是 emoji 态。
+        if let Some(icon) = &rec.appearance.icon {
+            match icon.kind {
+                mullion_store::IconKind::Emoji => {
+                    buf.icon_emoji_mode = true;
+                    buf.icon_emoji_buf = icon.value.clone();
+                }
+                // Builtin(内置形状,UI 已撤)和 Custom(要引 image 解码器,本期
+                // 不做)都不支持编辑:模式位保持 false，UI 上显示「无」，但
+                // `preserved_appearance` 原样透传——不支持编辑不等于允许静默删除。
+                mullion_store::IconKind::Builtin | mullion_store::IconKind::Custom => {}
+            }
         }
         buf
     }
@@ -1377,6 +1422,78 @@ mod tests {
             secret_fields(&b).0,
             SecretField::Keep,
             "未碰过的框无论里面装着什么,都必须是 Keep"
+        );
+    }
+
+    /// F62:勾选框只增删**指定的那一个**落点。
+    ///
+    /// 编辑器只展示会话列表 / pane 标题条 / 状态栏三个勾选框,但 `apply_to`
+    /// 里可能还有 `ColorTarget::Tab`(F36 标签页,排在 v0.5,UI 上没有对应
+    /// 勾选框)。如果按「勾了什么存什么」重建整个 `apply_to`,用户随便改一下
+    /// 勾选、保存,那个 `Tab` 就被静默剥掉了 —— 而且用户完全看不出发生了什么。
+    #[test]
+    fn set_color_target_preserves_targets_the_ui_does_not_show() {
+        let mut spec = ColorSpec {
+            hex: "#e06767".into(),
+            apply_to: vec![ColorTarget::Tab, ColorTarget::ListItem],
+        };
+        // 用户取消勾选「会话列表」、勾上「状态栏」
+        set_color_target(&mut spec, ColorTarget::ListItem, false);
+        set_color_target(&mut spec, ColorTarget::StatusBar, true);
+        assert!(
+            spec.apply_to.contains(&ColorTarget::Tab),
+            "UI 上没有勾选框的 Tab 必须原样保留,不能被静默剥掉"
+        );
+        assert!(!spec.apply_to.contains(&ColorTarget::ListItem));
+        assert!(spec.apply_to.contains(&ColorTarget::StatusBar));
+    }
+
+    /// 重复勾选不产生重复项 —— `apply_to` 是集合语义,存成 `Vec` 只是因为
+    /// toml 没有集合类型。
+    #[test]
+    fn set_color_target_is_idempotent() {
+        let mut spec = ColorSpec {
+            hex: "#e06767".into(),
+            apply_to: vec![],
+        };
+        set_color_target(&mut spec, ColorTarget::ListItem, true);
+        set_color_target(&mut spec, ColorTarget::ListItem, true);
+        assert_eq!(spec.apply_to, vec![ColorTarget::ListItem]);
+        set_color_target(&mut spec, ColorTarget::ListItem, false);
+        set_color_target(&mut spec, ColorTarget::ListItem, false);
+        assert!(spec.apply_to.is_empty());
+    }
+
+    /// 取消勾选所有落点**不清除颜色**。`ColorSpec { hex, apply_to: [] }` 是
+    /// 合法状态 =「色留着,暂时哪都不显示」——与跳板「切到无/继承时链条缓冲
+    /// 不清空」同一条原则:用户切走再切回,配的东西还在。
+    #[test]
+    fn clearing_all_targets_keeps_the_color_itself() {
+        let mut spec = ColorSpec {
+            hex: "#e06767".into(),
+            apply_to: vec![ColorTarget::ListItem],
+        };
+        set_color_target(&mut spec, ColorTarget::ListItem, false);
+        assert!(spec.apply_to.is_empty());
+        assert_eq!(spec.hex, "#e06767", "颜色本身必须留着");
+    }
+
+    /// 编辑外观必须让表单变脏 —— 否则用户改完颜色直接切到别的会话,改动
+    /// 被静默丢弃,连确认框都不弹。`EditorBuffer` derive 了 `PartialEq`,
+    /// `preserved_appearance` 是它的字段,所以这是白拿的;这条测试钉死
+    /// 「白拿」这件事不会在将来某次重构里被拿走(比如把 appearance 挪进
+    /// 一个不参与比对的旁路结构)。
+    #[test]
+    fn editing_appearance_makes_the_form_dirty() {
+        let baseline = EditorBuffer::default();
+        let mut buf = baseline.clone();
+        buf.preserved_appearance.color = Some(ColorSpec {
+            hex: "#e06767".into(),
+            apply_to: vec![ColorTarget::ListItem],
+        });
+        assert!(
+            is_dirty(&buf, &baseline),
+            "改了外观表单必须判脏,否则切换会话时改动被静默丢弃"
         );
     }
 }

@@ -18,6 +18,10 @@ pub struct TitleView<'a> {
     pub host: Option<&'a str>,
     pub status: PaneStatus,
     pub focused: bool,
+    /// F61/F62:这个 pane 所属会话的已解析外观。`None` = 没有对应会话记录
+    /// (快速连接、或 store 不可用)。**必须来自 `badge::AppearanceCache`**,
+    /// 不许在这里现解析(陷阱 T3)。
+    pub appearance: Option<&'a crate::ui::badge::Appearance>,
 }
 
 /// 标题条上的文字。抽成纯函数是因为格式会被人反复调,而它是唯一能自动验的部分。
@@ -82,6 +86,22 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<P
                     theme::c32(if v.focused { t.panel_head } else { t.panel_bg }),
                     theme::stroke(t),
                 );
+                // F62:语义色竖条走左边缘。**用 painter 直接画在 `full` 里**,
+                // 不新增任何 widget、不参与布局计算 —— 这是绕开本文件顶部
+                // 那两个越界坑的做法(`Frame` 的 min_rect+margin 撑破 Area、
+                // `set_min_size` 只设下限)。守护:
+                // `area_rect_stays_exact_even_with_appearance_bar_and_icon`。
+                let bar_color = v.appearance.and_then(|a| {
+                    crate::ui::badge::should_paint(a, mullion_store::ColorTarget::PaneTitle)
+                });
+                if let Some(c) = bar_color {
+                    crate::ui::badge::paint_edge_bar(
+                        ui.painter(),
+                        full,
+                        crate::ui::badge::Side::Left,
+                        c,
+                    );
+                }
                 let inner = full.shrink2(egui::vec2(8.0, 4.0));
                 let mut content = ui.new_child(
                     egui::UiBuilder::new()
@@ -103,6 +123,13 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<P
                     // `.truncate()` 现在唯一的作用是视觉观感(省略号 vs 硬裁切),
                     // 不是防止 × 被顶出条外的兜底——删掉它 12 条测试仍全绿。
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // F61:图标画在状态点之前。`content` 是个 `new_child` +
+                        // `set_clip_rect`,画多了只会被裁掉,不会把 `Area` 撑大。
+                        if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
+                            let (r, _) = ui
+                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            crate::ui::badge::paint_icon(ui.painter(), r, icon, t);
+                        }
                         let dot = match v.status {
                             PaneStatus::Live => t.ok,
                             PaneStatus::Disconnected => t.fg_dim,
@@ -202,6 +229,7 @@ mod tests {
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
+                appearance: None,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -259,6 +287,7 @@ mod tests {
             host: Some("this-is-a-ridiculously-long-hostname-that-will-never-fit.example.com"),
             status: PaneStatus::Live,
             focused: true,
+            appearance: None,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -307,6 +336,7 @@ mod tests {
             host: Some("h"),
             status: PaneStatus::Live,
             focused: true,
+            appearance: None,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -315,5 +345,123 @@ mod tests {
             ctx.memory(|m| m.area_rect(area_id(PaneId(3)))).is_none(),
             "title_px.h == 0(标题条关闭)时不该为这个 pane 画 Area"
         );
+    }
+
+    fn count_shapes(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                egui::Shape::Noop => 0,
+                _ => 1,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    fn appearance_with(targets: Vec<mullion_store::ColorTarget>) -> crate::ui::badge::Appearance {
+        crate::ui::badge::Appearance {
+            icon: None,
+            color: Some(mullion_store::ColorSpec {
+                hex: "#e06767".into(),
+                apply_to: targets,
+            }),
+        }
+    }
+
+    fn run_title(appearance: Option<&crate::ui::badge::Appearance>) -> usize {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let views = [TitleView {
+            geom: geom_800x600_title32(1),
+            index: 1,
+            host: Some("dev@build-01"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance,
+        }];
+        // 跑两帧:`Area` 默认 `fade_in`,第一帧 opacity 是 0,画的图形会被
+        // painter 记成 `Shape::Noop`(egui-0.30 `painter.rs::Painter::add`),
+        // 数不出来。跟 `ui/mod.rs::rendered_text` 同一个理由、同一个套路。
+        let _ = ctx.run(Default::default(), |ctx| {
+            show(ctx, &crate::theme::MULLION_DARK, &views);
+        });
+        let out = ctx.run(Default::default(), |ctx| {
+            show(ctx, &crate::theme::MULLION_DARK, &views);
+        });
+        count_shapes(&out.shapes)
+    }
+
+    /// F62:勾了「pane 标题条」的会话,标题条左边缘要多一条竖条。
+    #[test]
+    fn pane_title_paints_an_edge_bar_when_apply_to_includes_pane_title() {
+        use mullion_store::ColorTarget;
+        let none = run_title(None);
+        let with = run_title(Some(&appearance_with(vec![ColorTarget::PaneTitle])));
+        assert!(
+            with > none,
+            "勾了「pane 标题条」的会话应该多画一条竖条(无 {none} 个图形,有 {with} 个)"
+        );
+    }
+
+    /// 没勾就不画。
+    #[test]
+    fn pane_title_paints_nothing_when_apply_to_excludes_pane_title() {
+        use mullion_store::ColorTarget;
+        let none = run_title(None);
+        let other = run_title(Some(&appearance_with(vec![ColorTarget::ListItem])));
+        assert_eq!(other, none, "只勾了会话列表的会话不该在 pane 标题条上画");
+    }
+
+    /// **本任务最关键的回归**:加了竖条和图标之后,`Area` 的几何承诺不能变。
+    ///
+    /// 本文件顶部注释警告过两个越界坑(`Frame` 的 `min_rect + margin` 撑破
+    /// `Area`、`set_min_size` 只设下限)。竖条用 painter 直接画在已经
+    /// `allocate_rect(full, ..)` 的矩形里、不新增任何 widget,就是为了绕开
+    /// 它们 —— 这条测试钉死这个前提在有外观的情况下依然成立。
+    #[test]
+    fn area_rect_stays_exact_even_with_appearance_bar_and_icon() {
+        use crate::shell::workspace::TITLE_BAR_PX;
+        use mullion_store::{ColorTarget, IconKind, IconSpec};
+        let a = crate::ui::badge::Appearance {
+            // 必须用**真能画出来**的图标。用 `IconKind::Builtin` 的话
+            // `paint_icon` 直接走降级不画(内置形状 v0.1.24 已撤),这条
+            // 「加了图标几何也不变」的断言就变成了空跑。
+            icon: Some(IconSpec {
+                kind: IconKind::Emoji,
+                value: "🔥".into(),
+            }),
+            color: Some(mullion_store::ColorSpec {
+                hex: "#e06767".into(),
+                apply_to: vec![ColorTarget::PaneTitle],
+            }),
+        };
+        for ppp in [1.0f32, 1.25, 1.5] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let views = [TitleView {
+                geom: geom_800x600_title32(1),
+                index: 1,
+                host: Some("dev@build-01"),
+                status: PaneStatus::Live,
+                focused: true,
+                appearance: Some(&a),
+            }];
+            let _ = ctx.run(Default::default(), |ctx| {
+                show(ctx, &crate::theme::MULLION_DARK, &views);
+            });
+            let rect = ctx
+                .memory(|m| m.area_rect(area_id(PaneId(1))))
+                .unwrap_or_else(|| panic!("ppp={ppp}: 标题条没画出任何 Area"));
+            assert!(
+                (rect.width() - 800.0 / ppp).abs() < 0.5,
+                "ppp={ppp}: 加了外观后 Area 宽 {} 撑出了 title_px",
+                rect.width()
+            );
+            assert!(
+                (rect.height() - TITLE_BAR_PX as f32 / ppp).abs() < 0.5,
+                "ppp={ppp}: 加了外观后 Area 高 {} 撑出了 title_px",
+                rect.height()
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! 右栏三个 Tab 的字段布局。从 `editor.rs` 切出来是因为字段多、改动频繁,
+//! 右栏五个 Tab 的字段布局。从 `editor.rs` 切出来是因为字段多、改动频繁,
 //! 混在窗口骨架里会让 `editor.rs` 涨到读不动。
 
 use egui::Ui;
@@ -182,6 +182,159 @@ pub(super) fn basic(
     });
 
     jump(ui, t, buf, groups, sessions, editing);
+}
+
+/// F61/F62 外观。独占一个 Tab(`TAB_APPEARANCE`,排在「登录后」之后)。
+///
+/// 原先塞在「连接」页「归类」之后,实机验收时用户要求单开一页 —— 图标和颜色
+/// 是一组独立的视觉设置,跟主机/端口不是同一个决策。
+pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
+    use mullion_store::{ColorSpec, ColorTarget, IconKind, IconSpec};
+
+    section(ui, t, "外观");
+    grid(ui, "sm_basic_appearance", |ui| {
+        ui.label("图标");
+        ui.vertical(|ui| {
+            // **模式是 `buf.icon_emoji_mode` 这个持久位,不从 `preserved_appearance
+            // .icon` 反推。** 反推的写法(v0.1.23)有个当场可见的 bug:刚点上
+            // 「emoji」时缓冲是空的 → 写回 `None` → 下一帧反推成「无」→ UI 弹回
+            // 去,输入框根本出不来。用户报的「点 emoji 没有内容」就是这个。
+            let prev = buf.icon_emoji_mode;
+            let mut on = prev;
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut on, false, "无");
+                ui.selectable_value(&mut on, true, "emoji");
+            });
+            buf.icon_emoji_mode = on;
+
+            if on {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut buf.icon_emoji_buf)
+                            .desired_width(60.0)
+                            .hint_text("🔥"),
+                    );
+                    for e in ["🔥", "🐧", "🗄", "⚙", "🌐", "🔒", "🧪", "📦"] {
+                        if ui.small_button(e).clicked() {
+                            buf.icon_emoji_buf = e.to_string();
+                        }
+                    }
+                });
+                if !buf.icon_emoji_buf.is_empty()
+                    && !crate::ui::badge::emoji_is_paintable(&buf.icon_emoji_buf)
+                {
+                    ui.colored_label(
+                        crate::theme::c32(t.warn),
+                        format!(
+                            "太长了(最多 {} 个字符),这样不会显示",
+                            crate::ui::badge::MAX_EMOJI_CHARS
+                        ),
+                    );
+                }
+                ui.colored_label(
+                    crate::theme::c32(t.fg_dimmer),
+                    "emoji 显示为黑白剪影(egui 不支持彩色字形)",
+                );
+
+                // 缓冲空时写 `None` 但**模式位留着** —— 这正是上面那个 bug 的
+                // 修法:真值可以是「暂时没有」,模式不能跟着丢。
+                buf.preserved_appearance.icon = if buf.icon_emoji_buf.is_empty() {
+                    None
+                } else {
+                    Some(IconSpec {
+                        kind: IconKind::Emoji,
+                        value: buf.icon_emoji_buf.clone(),
+                    })
+                };
+            } else if prev {
+                // 这一帧刚从 emoji 切到「无」= 用户明确要求清掉。
+                buf.preserved_appearance.icon = None;
+            }
+            // else(始终「无」):`preserved_appearance.icon` 原样透传。可能是
+            // 不可编辑的 `Builtin`(内置形状,UI 已撤)或 `Custom` —— 不支持
+            // 编辑不等于允许静默删除用户数据。
+        });
+        ui.end_row();
+
+        ui.label("颜色");
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (name, hex, usage) in crate::theme::LABEL_PALETTE {
+                    let selected = buf
+                        .preserved_appearance
+                        .color
+                        .as_ref()
+                        .is_some_and(|c| c.hex.eq_ignore_ascii_case(hex));
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                    if selected {
+                        ui.painter().rect_stroke(
+                            rect,
+                            egui::Rounding::same(6.0),
+                            egui::Stroke::new(2.0, crate::theme::c32(t.fg)),
+                        );
+                    }
+                    if let Some(rgb) = crate::theme::parse_hex(hex) {
+                        ui.painter()
+                            .circle_filled(rect.center(), 7.0, crate::theme::c32(rgb));
+                    }
+                    if resp.clicked() {
+                        match &mut buf.preserved_appearance.color {
+                            Some(c) => c.hex = hex.to_string(),
+                            // 新设色时的默认落点:会话列表 + pane 标题条。
+                            // 状态栏不默认勾 —— 多 pane 时它该显示谁的色没有
+                            // 确定答案。
+                            None => {
+                                buf.preserved_appearance.color = Some(ColorSpec {
+                                    hex: hex.to_string(),
+                                    apply_to: vec![ColorTarget::ListItem, ColorTarget::PaneTitle],
+                                })
+                            }
+                        }
+                    }
+                    resp.on_hover_text(format!("{name} · {usage}"));
+                }
+                if ui.button("清除").clicked() {
+                    buf.preserved_appearance.color = None;
+                }
+            });
+
+            if let Some(c) = &mut buf.preserved_appearance.color {
+                ui.horizontal(|ui| {
+                    ui.label("自定义");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut c.hex)
+                            .desired_width(90.0)
+                            .hint_text("#rrggbb"),
+                    );
+                    if crate::theme::parse_hex(&c.hex).is_none() {
+                        ui.colored_label(crate::theme::c32(t.warn), "不是 #rrggbb,不会显示");
+                    }
+                });
+            }
+        });
+        ui.end_row();
+
+        ui.label("作用于");
+        ui.vertical(|ui| match &mut buf.preserved_appearance.color {
+            Some(spec) => {
+                for (target, label) in [
+                    (ColorTarget::ListItem, "会话列表"),
+                    (ColorTarget::PaneTitle, "pane 标题条"),
+                    (ColorTarget::StatusBar, "状态栏"),
+                ] {
+                    let mut on = spec.apply_to.contains(&target);
+                    if ui.checkbox(&mut on, label).changed() {
+                        crate::ui::session_manager::set_color_target(spec, target, on);
+                    }
+                }
+            }
+            None => {
+                ui.colored_label(crate::theme::c32(t.fg_dimmer), "先选一个颜色");
+            }
+        });
+        ui.end_row();
+    });
 }
 
 /// F5 跳板链。放在**「连接」页**而不是「高级」页:跳板回答的是「怎么走到这台
@@ -1412,6 +1565,191 @@ mod tests {
         };
         let _ = run(buf);
         run(buf)
+    }
+
+    /// 跑「图标」页两帧,返回**第二帧**的输出。
+    ///
+    /// 必须跑两帧:本页所有 bug 都是「第一帧看着对、第二帧弹回去」这一类
+    /// (状态写回 → 下一帧重新读)。只跑一帧的测试对它们全盲。
+    fn run_appearance(buf: &mut EditorBuffer) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::appearance(ui, &t, buf);
+                });
+            })
+        };
+        let _ = run(buf);
+        run(buf)
+    }
+
+    /// **v0.1.23 实机验收报的「点 emoji 没有内容」的守护测试。**
+    ///
+    /// 旧实现把模式从 `preserved_appearance.icon` 反推:刚点上「emoji」时缓冲
+    /// 还是空的 → 写回 `None` → 下一帧反推回「无」→ 输入框当场消失。用户看到
+    /// 的就是「点了没反应」。
+    ///
+    /// 自证会变红的方式:把 `appearance()` 里的
+    /// `let mut on = buf.icon_emoji_mode;` 换回反推写法
+    /// `let mut on = buf.preserved_appearance.icon.is_some();`。
+    #[test]
+    fn emoji_mode_survives_the_next_frame_with_an_empty_buffer() {
+        let mut buf = EditorBuffer {
+            icon_emoji_mode: true,
+            ..Default::default()
+        };
+        let out = run_appearance(&mut buf);
+        assert!(
+            find_text_pos(&out.shapes, "黑白剪影").is_some(),
+            "选了 emoji 模式但还没填内容时,输入区必须留在页面上;\
+             消失了就是用户报的「点 emoji 没有内容」"
+        );
+        assert!(buf.icon_emoji_mode, "模式位不该被自己的写回逻辑抹掉");
+        assert!(
+            buf.preserved_appearance.icon.is_none(),
+            "缓冲是空的,不该凭空造出一个空 emoji 图标"
+        );
+    }
+
+    /// 填了内容就要真写进 `preserved_appearance`(保存路径取的是它)。
+    /// 这是上一条的对照组:少了它,把写回整段删掉也能让上一条全绿。
+    #[test]
+    fn a_filled_emoji_buffer_is_written_back_to_the_record() {
+        let mut buf = EditorBuffer {
+            icon_emoji_mode: true,
+            icon_emoji_buf: "🔥".into(),
+            ..Default::default()
+        };
+        run_appearance(&mut buf);
+        let icon = buf
+            .preserved_appearance
+            .icon
+            .as_ref()
+            .expect("填了 emoji 就该写出图标");
+        assert_eq!(icon.kind, mullion_store::IconKind::Emoji);
+        assert_eq!(icon.value, "🔥");
+    }
+
+    /// 用户主动点「无」→ 真清掉图标,但**缓冲留着**。
+    ///
+    /// 端到端指针事件驱动,不手改 `icon_emoji_mode` —— 手改等于把「上一帧是
+    /// 什么模式」这个信息一起抹掉,而那正是这条分支的判据。
+    ///
+    /// 自证会变红的方式:删掉 `appearance()` 里的 `else if prev { ... = None }`
+    /// 整个分支——切到「无」后图标还在,用户以为删掉了,保存下去却纹丝不动。
+    #[test]
+    fn clicking_none_actually_clears_the_icon_but_keeps_the_buffer() {
+        let t = crate::theme::MULLION_DARK;
+        let mut buf = EditorBuffer {
+            icon_emoji_mode: true,
+            icon_emoji_buf: "🔥".into(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let run = |ctx: &egui::Context, buf: &mut EditorBuffer, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::appearance(ui, &t, buf);
+                });
+            })
+        };
+        let click = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        let out = run(&ctx, &mut buf, Default::default());
+        assert!(
+            buf.preserved_appearance.icon.is_some(),
+            "前提没成立:点「无」之前得先有一个图标,否则这条测试恒过"
+        );
+        let none_pos = find_text_pos(&out.shapes, "无").expect("图标区应该有个「无」可点");
+
+        let _ = run(
+            &ctx,
+            &mut buf,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(none_pos),
+                    click(none_pos, true),
+                    click(none_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert!(!buf.icon_emoji_mode, "点了「无」模式位必须跟着落下来");
+        assert!(
+            buf.preserved_appearance.icon.is_none(),
+            "从 emoji 切到「无」必须真把图标清掉"
+        );
+        assert_eq!(buf.icon_emoji_buf, "🔥", "缓冲要留着,用户切回来还能看到");
+    }
+
+    /// UI 上编辑不了的图标种类(`Builtin` 内置形状 v0.1.24 撤掉、`Custom` 不做)
+    /// **不该被静默抹掉**。这两个变体还在 store schema 里,旧配置可能有值。
+    ///
+    /// 自证会变红的方式:把 `appearance()` 里的 `else if prev` 改成裸 `else`
+    /// —— 只要用户翻到这一页,不认识的图标就被清空了,而且没有任何提示。
+    #[test]
+    fn an_uneditable_icon_is_preserved_instead_of_being_wiped() {
+        for kind in [
+            mullion_store::IconKind::Builtin,
+            mullion_store::IconKind::Custom,
+        ] {
+            let mut buf = EditorBuffer::default();
+            buf.preserved_appearance.icon = Some(mullion_store::IconSpec {
+                kind,
+                value: "hexagon".into(),
+            });
+            run_appearance(&mut buf);
+            assert_eq!(
+                buf.preserved_appearance.icon.as_ref().map(|i| i.kind),
+                Some(kind),
+                "UI 编辑不了的 {kind:?} 图标不该因为翻了一下这一页就消失"
+            );
+        }
+    }
+
+    /// 「形状」按用户要求撤掉,图标只剩「无 / emoji」两态。
+    #[test]
+    fn the_appearance_page_no_longer_offers_builtin_shapes() {
+        let mut buf = EditorBuffer::default();
+        let out = run_appearance(&mut buf);
+        assert!(
+            find_text_pos(&out.shapes, "形状").is_none(),
+            "「形状」模式已撤,不该还画在页面上"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "emoji").is_some(),
+            "「emoji」模式必须还在——它现在是唯一的图标载体"
+        );
+    }
+
+    /// 外观搬去了独立的「图标」页,「连接」页上不能还留一份。
+    ///
+    /// **两侧都要断言**:只断言「图标页有」的话,搬运时忘了从「连接」页删掉
+    /// 就会两处都有,而两处各写各的 `preserved_appearance`,后画的那处每帧
+    /// 覆盖前一处 —— 同跳板那条测试的姿态(`jump_lives_on_the_connect_page`)。
+    #[test]
+    fn the_appearance_section_moved_off_the_connect_page() {
+        let mut buf = EditorBuffer::default();
+        let out = run_basic(&mut buf, &[]);
+        assert!(
+            find_text_pos(&out.shapes, "外观").is_none(),
+            "「连接」页不该还有外观分节"
+        );
+
+        let mut buf2 = EditorBuffer::default();
+        let out2 = run_appearance(&mut buf2);
+        assert!(
+            find_text_pos(&out2.shapes, "外观").is_some(),
+            "「图标」页必须有外观分节"
+        );
     }
 
     fn run_auth(buf: &mut EditorBuffer, presence: SecretPresence) -> egui::FullOutput {
