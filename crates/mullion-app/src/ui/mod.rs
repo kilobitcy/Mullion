@@ -70,6 +70,9 @@ pub struct UiState {
     /// 最后一次发起连接的会话 id。`UserEvent::ConnectOk` 不带 SessionId,
     /// 状态点要知道「是哪条连上了」,只能在发起时记下来。
     pub connect_request_last: Option<SessionId>,
+    /// F44:本次连接一次性跳过自动化(右键菜单)。app.rs 消费后立即清零 ——
+    /// 右键跳过一次之后,普通双击连接若还静默跳过,用户会以为自动化坏了。
+    pub connect_skip_automation: bool,
     /// 二次确认后的删除意图 → app 事后据此调 `store.delete`。
     pub delete_request: Option<SessionId>,
     /// 编辑表单点「保存」→ app 事后据此调 `store.add`/`store.update`。
@@ -219,6 +222,9 @@ pub struct UiFrame<'a> {
     /// 当前已连接的会话(状态点用)。`UserEvent::ConnectOk` 不带 SessionId,
     /// 所以这里追踪的是「最后一次成功连上的那条」,不是全量连接集合。
     pub connected_session: Option<SessionId>,
+    /// F40~F44:自动化状态一句话。`None` = 这条连接没跑过自动化。
+    /// 生命周期由 `App` 管:一直显示到下一次 `spawn_connect`(那时清空)。
+    pub automation: Option<&'a str>,
 }
 
 /// 用户这一帧在 UI 上做的、需要 app 事后施加的布局动作。
@@ -261,6 +267,7 @@ pub fn build_ui(
         frame.panes,
         frame.connected,
         ui_state.last_error.as_deref(),
+        frame.automation,
     );
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
@@ -433,6 +440,7 @@ mod tests {
             paste: None,
             secret_presence: session_manager::SecretPresence::default(),
             connected_session: None,
+            automation: None,
         }
     }
 
@@ -604,6 +612,31 @@ mod tests {
         assert!(
             text3.contains("3 屏") && !text3.contains("4 屏"),
             "panes=3 时状态栏应显示 3 屏(不是残留的 4 屏),实际文本: {text3:?}"
+        );
+    }
+
+    /// F40~F44:自动化状态必须真的流到状态栏,不能被 `build_ui` 吃掉。
+    ///
+    /// 破坏性验证:把 `build_ui` 里传给 `status_bar` 的 `frame.automation`
+    /// 改成硬编码 `None`,第一条断言会红。
+    #[test]
+    fn build_ui_status_bar_shows_automation_status() {
+        let (with_status, _) = rendered_text(UiFrame {
+            automation: Some("自动化:进行中"),
+            ..base_frame()
+        });
+        assert!(
+            with_status.contains("自动化:进行中"),
+            "自动化状态没画进状态栏,实际文本: {with_status:?}"
+        );
+
+        let (without, _) = rendered_text(UiFrame {
+            automation: None,
+            ..base_frame()
+        });
+        assert!(
+            !without.contains("自动化"),
+            "没有自动化状态时不该凭空出现文案,实际文本: {without:?}"
         );
     }
 

@@ -77,6 +77,23 @@ pub enum UserEvent {
     ProbeOk(u64),
     /// F92:一次拨测失败(含超时)。
     ProbeErr(u64, String),
+    /// F40~F44:一次自动化结束。`u64` 是发起时的 `Workspace` 世代号,
+    /// 过期的直接丢(同 `PaneOpenErr::generation`)。
+    AutomationDone(u64, crate::automation::Outcome),
+}
+
+/// 一次在途自动化的把手。三条通道都是 `Option`,因为每一条都是**一次性边**:
+/// `take()` 天然保证不会重复触发,也省掉一个「是否已触发」的布尔标志。
+struct AutomationHandle {
+    /// 只认这一个 pane 的首字节。总设计 §7 前提②:分屏新开的 pane 是干净
+    /// shell,不重复跑自动化(所有 pane attach 同一个 tmux session 会内容
+    /// 镜像,且 `window-size` 取 `latest` 会反复 reflow、取 `smallest` 会留白)。
+    pane: PaneId,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    disconnect: Option<tokio::sync::oneshot::Sender<()>>,
+    /// 换新连接时 abort:旧那次的结论对新连接没有意义。
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// 窗口出现后才建的 GPU 相关状态。
@@ -179,6 +196,20 @@ pub struct App {
     /// 在途拨测任务。退出或取消时 abort —— 20 秒的 timeout 悬着不管,
     /// 关窗后进程还要多活 20 秒。
     probe_task: Option<tokio::task::JoinHandle<()>>,
+    /// F40~F44:正在跑的那一次自动化。`None` = 没在跑。
+    automation: Option<AutomationHandle>,
+    /// `spawn_connect` 算好、等 `ConnectOk` 抵达时启用的计划。
+    ///
+    /// 在 `spawn_connect`(用户点击那一帧)算而不是 `ConnectOk` 里算:
+    /// `ConnectOk` 不携带 `SessionId`,到那时只能读 `ui.connect_request_last`,
+    /// 而连接在途期间用户完全可能改了配置甚至删了这条会话。
+    pending_automation: Option<crate::automation::PendingAutomation>,
+    /// F44 右键「连接(跳过自动化)」的一次性标志。`ConnectOk` 消费后立即清零。
+    pending_skip_automation: bool,
+    /// 上一次自动化的结论文案。一直显示到下一次 `spawn_connect` 才清空 ——
+    /// 不做定时淡出:状态栏本来就是常驻信息区,而定时清除需要再引一个
+    /// deadline 进帧循环,正是 spec §1 修订一要避免的东西。
+    automation_status: Option<String>,
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -226,6 +257,10 @@ impl App {
             connected_session: None,
             probe_epoch: 0,
             probe_task: None,
+            automation: None,
+            pending_automation: None,
+            pending_skip_automation: false,
+            automation_status: None,
         }
     }
 
@@ -458,6 +493,24 @@ impl App {
         self.send_paste(&text);
     }
 
+    /// 用户开始输入 ⟹ 自动化让位(设计 §2 的「用户接管优先」)。
+    ///
+    /// **只能从 `app.rs` 里用户意图的 PTY 写入点调。** `Workspace::pump` 里
+    /// 那处 `p.pty.write(out)` 是 T1 的 PtyWrite 应答(DSR 光标查询、同步输出
+    /// 探测的回应),不是用户输入——把取消挂在 `PtyWriter::write` 上,远端一发
+    /// 同步输出探测自动化就自杀,而且现象是「有时候能跑有时候跑不了」。
+    ///
+    /// 将来新增用户输入路径(如鼠标按钮上报 F15)也必须一并接上这里。
+    /// 当前的四处以 `grep -n "pty.write" crates/mullion-app/src/app.rs` 为准
+    /// (行号会漂,别钉死)。
+    fn user_took_over(&mut self) {
+        if let Some(h) = self.automation.as_mut() {
+            // drop 发送端即取消(`write_scheduled` 的 doc:收到值**或**发送端
+            // 被 drop 都算取消)。
+            h.cancel.take();
+        }
+    }
+
     /// 真正发送。到这里要么不需要确认,要么用户已经点了「粘贴」。粘贴目标
     /// 是**焦点 pane**——分屏后粘贴永远只进当前正在操作的那一块。
     fn send_paste(&mut self, text: &str) {
@@ -472,6 +525,8 @@ impl App {
         // 与按键同理(F17):贴之前先回底部,否则「贴了但看不到」。
         pane.emulator.scroll_to_bottom();
         let _ = pane.pty.write(bytes);
+        // `pane` 的借用到此结束,才能再借 `&mut self`。
+        self.user_took_over();
     }
 
     /// 从 Minimized 自愈:凡是「窗口本该看得见」的信号都拿实测尺寸复查一次,
@@ -531,6 +586,38 @@ impl App {
         if let Some(ws) = self.ws.as_mut() {
             ws.pump(now);
         }
+        self.drive_automation();
+    }
+
+    /// 首字节 / 断线两条边。挂在 `pump_io` 上而不是重绘上:最小化期间窗口
+    /// 未必还会被重绘,但 `Wake` 仍会驱动 `pump_io`——否则用户最小化着连上,
+    /// 自动化会一直等到超时。
+    ///
+    /// 每帧调,所以**零分配**:只读两个 bool、`take()` 两个 `Option`。
+    fn drive_automation(&mut self) {
+        let Some(h) = self.automation.as_mut() else {
+            return;
+        };
+        let Some(ws) = self.ws.as_ref() else {
+            return;
+        };
+        // pane 不在了(被关掉/换世代):让 task 自然结束,别让它挂到超时。
+        let Some(pane) = ws.pane(h.pane) else {
+            h.disconnect.take();
+            return;
+        };
+        if pane.status == crate::shell::workspace::PaneStatus::Disconnected {
+            // send 的 Err(接收端已走)无所谓:task 已经结束了。
+            if let Some(tx) = h.disconnect.take() {
+                let _ = tx.send(());
+            }
+            return;
+        }
+        if pane.saw_first_byte {
+            if let Some(tx) = h.ready.take() {
+                let _ = tx.send(());
+            }
+        }
     }
 
     /// 在 `_runtime` 上异步连接;结果经 `proxy` 以 `UserEvent` 回送(§5)。
@@ -539,6 +626,25 @@ impl App {
     /// 另开 channel,必须拿到 `establish` 返回的 `Handle` 本身——`connect` 内部
     /// 会把它吞掉不外露。
     fn spawn_connect(&mut self, cfg: SshConfig) {
+        // F40~F44:此刻才确定「是哪条会话」。连接在途期间用户可能改配置甚至
+        // 删会话,所以计划必须在用户点击的这一帧定死。
+        // 上一次的结论到此为止:新连接开始了,旧结论就是误导信息。
+        self.automation_status = None;
+        self.pending_automation =
+            crate::automation::pending_for(self.ui.connect_request_last, |id| {
+                let store = self.store.as_ref()?;
+                let resolved = store.resolved(id).ok()?;
+                // `ResolvedConfig` 不含会话名,而 `build_plan` 要它做 tmux 的
+                // fallback_name(用户没填 tmux 会话名时按会话名推导)。
+                let name = store
+                    .list()
+                    .iter()
+                    .find(|r| r.id == id)?
+                    .identity
+                    .name
+                    .clone();
+                Some((resolved.automation, name))
+            });
         // 会话管理器发起的连接也要记下,否则第二次连接后开分屏会用上一台
         // 主机的 term/尺寸(F35 的 open_pty 靠它)。
         self.last_cfg = Some(cfg.clone());
@@ -716,6 +822,25 @@ impl App {
             let _ = self.proxy.send_event(UserEvent::KeyPathPicked(None));
         }
     }
+
+    /// 自动化结束。**必须按世代过滤**:高延迟链路下用户完全可能在自动化还在
+    /// 跑的时候断开重连,旧世代的「自动化已中止:连接已断开」落到新连接的
+    /// 状态栏上,是一条与当前连接毫不相干的误导信息(判据同 `PaneOpenErr`)。
+    fn accept_automation_done(&mut self, generation: u64, outcome: crate::automation::Outcome) {
+        if !self
+            .ws
+            .as_ref()
+            .is_some_and(|ws| generation_matches(ws, generation))
+        {
+            log::debug!(target: "mullion", "丢弃过期世代 {generation} 的自动化结论");
+            return;
+        }
+        log::info!(target: "mullion", "自动化结束: {outcome:?}");
+        self.automation_status = Some(crate::automation::status_text(outcome));
+        self.automation = None;
+        self.ui_dirty = true;
+        self.request_ui_redraw();
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -841,15 +966,21 @@ impl ApplicationHandler<UserEvent> for App {
                 // 哪怕 PaneId 因为 next_id 重新计数而撞号,也能靠这个分辨。
                 let generation = self.next_ws_generation;
                 self.next_ws_generation += 1;
+                // pane 和自动化 task 要共享同一条 channel(spec §1 修订二):
+                // `PaneState.pty` 本来就是 `Box<dyn PtyWriter>`,`SshSession`
+                // 内部只有一个 mpsc Sender、本身 Send+Sync,`Arc` 只是共享
+                // 所有权,不引入锁。既有调用点零改动。
+                let ssh = Arc::new(ssh);
                 let mut ws = crate::shell::workspace::Workspace::new(
                     PaneState {
                         id: PaneId(1),
                         host_ix: 0,
                         emulator,
-                        pty: Box::new(ssh),
+                        pty: Box::new(ssh.clone()),
                         rx,
                         pacer: SyncFramePacer::new(),
                         status: crate::shell::workspace::PaneStatus::Live,
+                        saw_first_byte: false,
                         // 故意给一个不可能的初值:下一帧 apply_geometry 必然发一次
                         // window_change,真实列/行数才知道(T4)。
                         last_grid: (0, 0),
@@ -875,6 +1006,41 @@ impl ApplicationHandler<UserEvent> for App {
                 // 记下的那条。状态点只区分「这条连上了 / 没连上」两态。
                 self.connected_session = self.ui.connect_request_last;
                 self.ui_dirty = true;
+                // F40~F44:起自动化。旧那次(如果有)的结论对新连接没有意义。
+                if let Some(old) = self.automation.take() {
+                    old.task.abort();
+                }
+                if let Some(plan) = crate::automation::take_pending(
+                    &mut self.pending_automation,
+                    &mut self.pending_skip_automation,
+                ) {
+                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                    let (disc_tx, disc_rx) = tokio::sync::oneshot::channel();
+                    let sink: Arc<dyn mullion_ssh::schedule::ByteSink> = ssh;
+                    let proxy = self.proxy.clone();
+                    let steps = plan.steps.len();
+                    let timeout_ms = plan.ready_timeout_ms;
+                    log::info!(
+                        target: "mullion",
+                        "自动化:{steps} 步待发,就绪超时 {timeout_ms}ms"
+                    );
+                    let task = self._runtime.spawn(async move {
+                        let outcome = crate::automation::run(
+                            sink, plan.steps, ready_rx, cancel_rx, disc_rx, timeout_ms,
+                        )
+                        .await;
+                        let _ = proxy.send_event(UserEvent::AutomationDone(generation, outcome));
+                    });
+                    self.automation = Some(AutomationHandle {
+                        // 只有第一个 pane 跑自动化(总设计 §7 前提②)。
+                        pane: PaneId(1),
+                        ready: Some(ready_tx),
+                        cancel: Some(cancel_tx),
+                        disconnect: Some(disc_tx),
+                        task,
+                    });
+                }
                 self.request_ui_redraw();
             }
             UserEvent::PaneOpened {
@@ -906,6 +1072,7 @@ impl ApplicationHandler<UserEvent> for App {
                             rx,
                             pacer: SyncFramePacer::new(),
                             status: crate::shell::workspace::PaneStatus::Live,
+                            saw_first_byte: false,
                             last_grid: (0, 0),
                         });
                     } else {
@@ -979,6 +1146,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ProbeErr(epoch, msg) => {
                 crate::app::accept_probe(epoch, self.probe_epoch, &mut self.ui.probe, Err(msg));
                 self.request_ui_redraw();
+            }
+            UserEvent::AutomationDone(generation, outcome) => {
+                self.accept_automation_done(generation, outcome);
             }
         }
     }
@@ -1086,6 +1256,9 @@ impl ApplicationHandler<UserEvent> for App {
             // F17 滚轮三档分流。决策在 `mullion_term::keymap::wheel_action`(纯函数,
             // 已单测),这里只做 winit 增量→行数、像素→单元格的换算与发送。
             WindowEvent::MouseWheel { delta, .. } => {
+                // 滚轮上报是发给远端的字节 = 用户意图。本地回溯
+                // (`WheelAction::LocalScroll`)不发字节,不算接管。
+                let mut took_over = false;
                 // 先算,下面 `self.ws.as_mut()` 一借出去就没法再调 `&self` 方法了。
                 let local = self.cursor_in_grid();
                 let geom = self.focused_geom();
@@ -1121,6 +1294,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 bytes.extend_from_slice(&one);
                             }
                             let _ = pane.pty.write(bytes);
+                            took_over = true;
                         }
                         WheelAction::ArrowKeys { up, count } => {
                             // SS3(`ESC O A/B`),不是 `encode_key` 的 CSI——见
@@ -1132,9 +1306,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 bytes.extend_from_slice(&one);
                             }
                             let _ = pane.pty.write(bytes);
+                            took_over = true;
                         }
                         WheelAction::None => {}
                     }
+                }
+                if took_over {
+                    self.user_took_over();
                 }
                 // 本地回溯不产生新的终端字节,不标脏这一帧会被 frame_is_dirty 判 Idle
                 // 丢掉——滚了但画面不动。
@@ -1219,6 +1397,8 @@ impl ApplicationHandler<UserEvent> for App {
                             // F17:一按普通键就贴回底部,否则「打字了但看不到自己输入」。
                             pane.emulator.scroll_to_bottom();
                             let _ = pane.pty.write(bytes);
+                            // F40:用户接管,自动化让位(借用已释放)。
+                            self.user_took_over();
                         }
                     }
                 }
@@ -1365,6 +1545,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     _ => crate::ui::session_manager::SecretPresence::default(),
                                 },
                                 connected_session: self.connected_session,
+                                // 「跑着的时候盖住上一次的结论」这条规则放在
+                                // `automation::status_line` 里,不在这儿手写
+                                // if/else —— 写反的现象是新连接的状态栏挂着上
+                                // 一条连接的结论,而它有单测钉着。
+                                automation: crate::automation::status_line(
+                                    self.automation.is_some(),
+                                    self.automation_status.as_deref(),
+                                ),
                             };
                             let a = self.active.as_mut().expect("上面刚判过 is_some");
                             let (repaint_delay, actions) =
@@ -1413,6 +1601,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 与 self.ws 成对维护:断开后不清会一直显示
                                 // 「已连接」的陈旧状态点。
                                 self.connected_session = None;
+                                // F40:自动化 task 也持有一份 `Arc<SshSession>`。
+                                // 不 abort 的话,`self.ws = None` 只 drop 掉 pane 那
+                                // 一份,`io_task` 因 cmd_tx 仍有克隆而不会收口 ——
+                                // 用户点了「断开」、UI 回到 launcher 态,预配置的命令
+                                // 却还在往一条没真正断开的 channel 上发。
+                                // `drive_automation` 补不了这条边:它在 ws 为 None 时
+                                // 直接 return。
+                                if let Some(h) = self.automation.take() {
+                                    h.task.abort();
+                                }
                             }
                             if self.ui.request_quit {
                                 self.ui.request_quit = false;
@@ -1550,6 +1748,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // 连接:双击行 / 点「连接」。必须在 store 的 &mut 借用结束后调
                 // (下面 `self.store.as_ref()` 的临时借用在 match 表达式求值完就
                 // 释放,故可紧接着调 self.spawn_connect)。
+                // F44:**无条件**取走跳过标志 —— 哪怕这一帧没有连接意图(右键
+                // 点了又关掉菜单),也不能让它漂到下一次连接上。
+                let skip_automation = std::mem::take(&mut self.ui.connect_skip_automation);
                 if let Some(id) = self.ui.connect_request.take() {
                     self.ui.connect_request_last = Some(id);
                     match self.store.as_ref().map(|s| s.ssh_config_for(id)) {
@@ -1557,6 +1758,12 @@ impl ApplicationHandler<UserEvent> for App {
                             // 用户主动发起的连接是交互态,不该继承 CLI 直连的
                             // exit(1) 语义(复核 #1)。
                             self.cli_direct = false;
+                            // 跳过标志必须跟 `pending_automation` 同进同退 ——
+                            // 后者只在 `spawn_connect` 里写。写在 match 外面的话,
+                            // 一次**失败**的连接尝试(配置坏了走 Err 支)会把标志
+                            // 留给另一条还在途的连接:用户没点过跳过,那条连接的
+                            // 自动化却被 `take_pending` 静默丢掉。
+                            self.pending_skip_automation = skip_automation;
                             self.spawn_connect(cfg);
                         }
                         Some(Err(e)) => self.ui.set_error(e.to_string()),
@@ -2092,6 +2299,7 @@ mod tests {
             rx,
             pacer: crate::render::SyncFramePacer::new(),
             status: crate::shell::workspace::PaneStatus::Live,
+            saw_first_byte: false,
             last_grid: (80, 24),
         }
     }
@@ -2401,6 +2609,155 @@ mod tests {
         assert!(
             !generation_matches(&ws, 2),
             "世代号不一致(旧世代迟到的事件),不该被当成当前世代的"
+        );
+    }
+
+    /// **接线守护**:`accept_automation_done` 必须真的调 `generation_matches`。
+    ///
+    /// 上面那条测试只锁住了 `generation_matches` 这个 helper 本身;把
+    /// `accept_automation_done` 里的过滤整段删掉,全量测试依然全绿 —— 说明
+    /// 「这个函数有没有用上那个判据」是无人守护的。而这正是它存在的全部理由:
+    /// 高延迟链路下用户完全可能在自动化还在跑时断开重连,旧世代的
+    /// 「自动化已中止:连接已断开」落到新连接的状态栏上,是一条与当前连接
+    /// 毫不相干的误导信息。
+    ///
+    /// **扎的是源码结构而非运行时行为**,这是刻意的:`App` 要
+    /// `EventLoopProxy` 才能构造,单测里造不出来。验证边界:它只挡得住
+    /// 「函数体里没有 generation_matches」这一种写法,挡不住有人换个同义
+    /// 判据或把过滤写成永真。
+    ///
+    /// 自证会变红:把 `accept_automation_done` 里的世代校验整段删掉。
+    #[test]
+    fn automation_done_is_filtered_by_generation() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn accept_automation_done")
+            .nth(1)
+            .expect("找不到 accept_automation_done 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 accept_automation_done 的函数结尾")];
+        assert!(
+            body.contains("generation_matches"),
+            "accept_automation_done 里没有世代过滤 —— 旧连接迟到的自动化结论\
+             会覆盖新连接的状态栏,给用户看一条与当前连接毫不相干的信息"
+        );
+    }
+
+    /// **接线守护**:`pump_io` 必须驱动 `drive_automation`。
+    ///
+    /// 首字节与断线两条边挂在 `pump_io` 上而不是重绘上,是刻意的:最小化期间
+    /// 窗口未必还会被重绘,但 `Wake` 仍会驱动 `pump_io` —— 否则用户最小化着
+    /// 连上,自动化会一直等到超时。这条调用一旦在重构 `pump_io` 时被漏掉,
+    /// 自动化就永远等不到就绪,而且没有任何报错。
+    ///
+    /// **扎的是源码结构而非运行时行为**:`App` 要 `EventLoopProxy` 才能构造,
+    /// 单测里造不出来。这里只钉「两个函数之间的接线」——`drive_automation`
+    /// 函数体内部的逻辑不在这条测试的射程内(那样断言等于把代码抄一遍)。
+    ///
+    /// 自证会变红:把 `pump_io` 里的 `self.drive_automation();` 删掉。
+    #[test]
+    fn pump_io_drives_automation() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn pump_io(&mut self) {")
+            .nth(1)
+            .expect("找不到 pump_io 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到 pump_io 的函数结尾")];
+        assert!(
+            body.contains("self.drive_automation()"),
+            "pump_io 没有驱动 drive_automation —— 首字节/断线两条边就断了,\
+             用户最小化着连上时自动化会一直等到超时,且不会有任何报错"
+        );
+    }
+
+    /// **接线守护**:用户意图写入点的数量。
+    ///
+    /// `user_took_over` 的文档说「当前的四处以 grep 为准」——这条测试把那句话
+    /// 变成可执行断言。四个写入点里滚轮的两处(`Report`/`ArrowKeys`)共用分支
+    /// 末尾一次调用,所以调用点是三处。
+    ///
+    /// 挡两个方向:
+    /// - **少了**:重构时删掉一处,自动化在用户已经开始打字后仍继续发命令,
+    ///   两股输入交织,用户看到的是自己的字被打散;
+    /// - **多了**:新增了用户输入路径(如鼠标按钮上报 F15)却没人回头看这条
+    ///   不变量。数字对不上时请连同 `user_took_over` 的文档一起更新。
+    ///
+    /// 注意它**不**保证挂对了地方:`Workspace::pump` 那处 T1 应答不能挂,由
+    /// `pty_write_echo_does_not_cancel_automation` 单独把守。
+    ///
+    /// 自证会变红:删掉产品代码里任意一处取消调用。
+    #[test]
+    fn user_intent_write_points_all_yield_to_the_user() {
+        let src = include_str!("app.rs");
+        // 只数产品代码:测试模块里(包括本测试的注释)也会出现同样的字面量。
+        let prod = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split 至少有一段");
+        let calls = prod.matches("self.user_took_over();").count();
+        assert_eq!(
+            calls, 3,
+            "用户意图写入点的取消调用应为 3 处(粘贴/滚轮/键盘,滚轮两个分支\
+             共用一次),实际 {calls} 处 —— 少了会让自动化在用户打字时继续发\
+             命令,多了说明新增了输入路径但没复核这条不变量"
+        );
+    }
+
+    /// **接线守护**:「断开连接」必须把自动化 task abort 掉。
+    ///
+    /// 自动化 task 也持有一份 `Arc<SshSession>`。只把 `self.ws` 置 `None`
+    /// 的话,`SshSession` 的 `cmd_tx` 仍有活着的克隆,`io_task` 不会收口 ——
+    /// 用户点了「断开」、UI 回到 launcher 态,预配置的命令却还在往一条没真正
+    /// 断开的 channel 上发,用户既看不到也拦不住。`drive_automation` 补不了
+    /// 这条边:它在 `self.ws` 为 `None` 时直接 return。
+    ///
+    /// **扎的是源码结构而非运行时行为**:`App` 要 `EventLoopProxy` 才能构造,
+    /// 单测里造不出来。验证边界:只挡得住「断开分支里没有 abort」这一种写法,
+    /// 挡不住有人把 abort 写在够不到的分支里。
+    ///
+    /// 自证会变红:把断开分支里的 `h.task.abort()` 那三行删掉。
+    #[test]
+    fn disconnect_aborts_the_automation_task() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("if self.ui.request_disconnect {")
+            .nth(1)
+            .expect("找不到断开连接的分支");
+        let body = &after[..after
+            .find("\n                            }\n")
+            .expect("找不到断开连接分支的结尾")];
+        assert!(
+            body.contains("self.automation.take()") && body.contains("abort()"),
+            "断开连接时没有 abort 自动化 task —— 它持有的那份 Arc<SshSession> \
+             会让底层 io_task 不收口,断开后预配置的命令还在继续发"
+        );
+    }
+
+    /// **T1 守护**:取消边绝不能挂在 `PtyWriter::write` 上。
+    ///
+    /// `Workspace::pump` 内部也调 `p.pty.write(out)` —— 那是 T1 的 PtyWrite
+    /// 应答(DSR 光标位置查询、同步输出探测的回应),**不是用户输入**。若把
+    /// 「有人往 PTY 写字节」当成用户接管的判据,远端一发同步输出探测,自动化
+    /// 立刻自杀,而且现象是「有时候能跑有时候跑不了」,极难定位。
+    ///
+    /// **这条测试扎的是源码结构而不是运行时行为**,这是刻意的:取消边是
+    /// `App` 的私有方法,`Workspace` 根本够不着它,运行时构造不出「pump 触发
+    /// 取消」的场景;真正的风险是将来有人为了图省事把取消挪进
+    /// `PtyWriter::write` 或 `Workspace::pump`。验证边界:它只挡得住「调用了
+    /// `user_took_over`」这一种写法,挡不住有人另起一个同义的新函数。
+    ///
+    /// 自证会变红:在 `shell/workspace/mod.rs` 里随便加一行注释提到
+    /// `user_took_over`。
+    #[test]
+    fn pty_write_echo_does_not_cancel_automation() {
+        let src = include_str!("shell/workspace/mod.rs");
+        assert!(
+            !src.contains("user_took_over"),
+            "workspace 里出现了 user_took_over —— `Workspace::pump` 的 pty.write \
+             是 T1 的 PtyWrite 应答(DSR/同步输出探测的回应),不是用户输入。\
+             把取消挂上去,远端一发探测自动化就自杀,现象是「有时候能跑有时候不能」。\
+             取消边只能挂在 app.rs 里的用户意图写入点上。"
         );
     }
 

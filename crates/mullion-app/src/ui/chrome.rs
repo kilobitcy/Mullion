@@ -115,6 +115,7 @@ pub fn status_bar(
     panes: usize,
     connected: bool,
     last_error: Option<&str>,
+    automation: Option<&str>,
 ) {
     let (left, right) = status_text(panes, connected);
     egui::TopBottomPanel::bottom("status")
@@ -133,6 +134,13 @@ pub fn status_bar(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(err) = last_error {
                         ui.colored_label(theme::c32(t.danger), err);
+                        ui.separator();
+                    }
+                    // F40~F44:自动化状态排在错误之后、常规右栏之前。
+                    // 它是「这次连接发生了什么」的唯一可见证据——用户看不见,
+                    // 就无法判断自动化是没跑还是跑了没效果。
+                    if let Some(a) = automation {
+                        ui.colored_label(theme::c32(t.fg_muted), a);
                         ui.separator();
                     }
                     ui.colored_label(theme::c32(t.fg_faint), right);

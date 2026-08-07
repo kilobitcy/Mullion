@@ -46,6 +46,23 @@ impl PtyWriter for SshSession {
     }
 }
 
+/// 同一条 SSH channel 同时被 pane(同步写按键)和自动化 task(异步按时间表写)
+/// 持有,所以要有一个可共享的写口。`SshSession` 内部只有一个
+/// `mpsc::Sender<SshCmd>`,本身就是 `Send + Sync`,`Arc` 只是共享所有权,
+/// 不引入任何锁。
+///
+/// 转发而不是 `impl<T: PtyWriter> PtyWriter for Arc<T>`:后者会跟
+/// `Box<dyn PtyWriter>` 的既有用法产生一堆 trait 求解歧义,而本项目只需要
+/// `Arc<SshSession>` 这一种。
+impl PtyWriter for Arc<SshSession> {
+    fn write(&self, bytes: Vec<u8>) -> Result<(), TrySendErr> {
+        SshSession::write(self, bytes)
+    }
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), TrySendErr> {
+        SshSession::resize(self, cols, rows)
+    }
+}
+
 /// 一条**已建立**的 SSH 连接。B2-a 里恒只有一个;数据模型按 N host × M channel
 /// 设计,是为了 B2-b 的"换主机"能原地加而不用推翻结构(§4.2)。
 pub struct HostConn {
@@ -68,6 +85,12 @@ pub struct PaneState {
     pub rx: Receiver<Vec<u8>>,
     pub pacer: SyncFramePacer,
     pub status: PaneStatus,
+    /// 这个 pane 收到过任何入站字节没有。**粘性**:一旦为真就不再变回假。
+    ///
+    /// 自动化的「就绪」判据(设计 §2):远端已经在说话,才说明我们拿到的是
+    /// 一个活着的 login shell。`App` 每帧查它,不让 `pump` 返回 `Vec<PaneId>`
+    /// ——`pump` 每帧必调,返回 Vec 等于每帧一次堆分配(T3)。
+    pub saw_first_byte: bool,
     /// 上次发出去的 (cols, rows)。F34 只在这个值变化时才发 window_change ——
     /// 每帧无脑发会把远端 SIGWINCH 刷爆,tmux 里的 TUI 不停重排。
     pub last_grid: (u16, u16),
@@ -247,6 +270,9 @@ impl Workspace {
             if inbound.is_empty() {
                 continue;
             }
+            // 粘性置位。必须在 `continue` **之后** —— 放前面的话每个 pane 每帧
+            // 都会被置位,自动化会在一条还没说过话的 channel 上开跑。
+            p.saw_first_byte = true;
             let out = session_pump::pump(&mut p.emulator, &inbound);
             if !out.is_empty() {
                 let _ = p.pty.write(out);
@@ -355,6 +381,7 @@ mod tests {
                 rx,
                 pacer: crate::render::SyncFramePacer::new(),
                 status: PaneStatus::Live,
+                saw_first_byte: false,
                 last_grid: (80, 24),
             },
             Probe {
@@ -397,6 +424,59 @@ mod tests {
             probes[1].writes.lock().unwrap().as_slice(),
             &[b"\x1b[1;1R".to_vec()],
             "2 号 pane 的 CPR 应答没回到自己的 channel(T1)"
+        );
+    }
+
+    /// 首字节检测:只有真的收到过入站字节的 pane 才置位。
+    ///
+    /// 不让 `pump` 返回 `Vec<PaneId>`:`pump` 每帧必调,返回 Vec 等于每帧一次
+    /// 堆分配,本项目对帧路径上的无谓开销一向敏感(T3)。挂个 bool 在
+    /// `PaneState` 上零分配,而且「这个 pane 收到过字节没有」本来就是
+    /// pane 自己的状态。
+    ///
+    /// 自证会变红:把 `pump` 里 `p.saw_first_byte = true;` 挪到
+    /// `if inbound.is_empty() { continue; }` **之前**(1 号 pane 会被误置位)。
+    #[tokio::test]
+    async fn pump_marks_saw_first_byte_only_for_panes_with_inbound() {
+        let (mut ws, probes) = ws_with(2);
+        assert!(
+            !ws.pane(PaneId(1)).unwrap().saw_first_byte,
+            "初值必须是 false"
+        );
+        assert!(!ws.pane(PaneId(2)).unwrap().saw_first_byte);
+
+        // 只给 2 号 pane 喂字节。
+        probes[1].tx.send(b"hello".to_vec()).await.unwrap();
+        tokio::task::yield_now().await;
+        ws.pump(0);
+
+        assert!(
+            !ws.pane(PaneId(1)).unwrap().saw_first_byte,
+            "1 号 pane 什么都没收到,不该置位 —— 置位了就会让自动化在一条还没
+             说话的 channel 上开跑"
+        );
+        assert!(
+            ws.pane(PaneId(2)).unwrap().saw_first_byte,
+            "2 号 pane 收到了字节却没置位 —— 自动化会一直等到超时"
+        );
+    }
+
+    /// 置位之后不会被后续的空帧清掉:它是「历史上收到过」而不是「这一帧收到了」。
+    ///
+    /// 自证会变红:把 `p.saw_first_byte = true;` 改成
+    /// `p.saw_first_byte = !inbound.is_empty();` 并挪到 `continue` 之前。
+    #[tokio::test]
+    async fn saw_first_byte_is_sticky_across_idle_frames() {
+        let (mut ws, probes) = ws_with(1);
+        probes[0].tx.send(b"hello".to_vec()).await.unwrap();
+        tokio::task::yield_now().await;
+        ws.pump(0);
+        assert!(ws.pane(PaneId(1)).unwrap().saw_first_byte);
+
+        ws.pump(16); // 空帧
+        assert!(
+            ws.pane(PaneId(1)).unwrap().saw_first_byte,
+            "首字节标志必须是粘的,否则空帧会把它清掉、自动化永远等不到就绪"
         );
     }
 

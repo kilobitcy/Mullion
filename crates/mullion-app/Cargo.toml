@@ -45,3 +45,6 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# 自动化的假时钟测试(`#[tokio::test(start_paused = true)]`)要 test-util。
+# feature 是并集,这里只是在 test target 上多开一个,不影响正式构建。
+tokio = { workspace = true, features = ["test-util"] }

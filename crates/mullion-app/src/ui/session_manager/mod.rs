@@ -65,6 +65,8 @@ pub(crate) const CONTENT_MIN_HEIGHT: f32 = 480.0;
 /// `validate::tab()` 会静默把用户导向错误的 Tab。
 pub(crate) const TAB_CONNECT: usize = 0;
 pub(crate) const TAB_AUTH: usize = 1;
+pub(crate) const TAB_ADVANCED: usize = 2;
+pub(crate) const TAB_AUTOMATION: usize = 3;
 
 /// 计算给 `Window` 自身 chrome(标题栏 + `Frame::window` 的 `inner_margin`)留的
 /// 余量——**不是硬编码常量,是按 egui-0.30.0 实际渲染公式当场算出来的**。

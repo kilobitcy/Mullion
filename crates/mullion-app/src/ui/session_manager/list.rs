@@ -321,6 +321,13 @@ fn row(
         ui_state.connect_request = Some(rec.id);
     }
     resp.context_menu(|ui| {
+        // F44:一次性逃生门。远端 tmux 里正跑着 Claude Code 时,用户可能只想
+        // 连上去看一眼,不想让自动化再发一遍 attach。
+        if ui.button("连接(跳过自动化)").clicked() {
+            ui_state.connect_request = Some(rec.id);
+            ui_state.connect_skip_automation = true;
+            ui.close_menu();
+        }
         if ui.button("删除").clicked() {
             ui_state.pending_delete = Some(rec.id);
             ui.close_menu();
@@ -605,6 +612,91 @@ mod tests {
             "点「删除」这一帧刚写下的 pending_delete 不该被同一帧末尾的清空逻辑\
              当场抹掉——它是本帧渲染前复制的旧值(None)对比出来的,不该影响\
              本帧新写入的值"
+        );
+    }
+
+    /// F44:右键菜单「连接(跳过自动化)」必须**同时**设对两个字段——
+    /// `connect_request`(要连哪一条)和 `connect_skip_automation`(跳过自动化
+    /// 这个意图)。手法照抄上面 `pending_delete_set_this_frame_by_context_menu_is_not_erased_in_the_same_frame`:
+    /// 真实指针事件右键打开菜单,下一帧用 `find_text_pos` 反推「连接(跳过自动化)」
+    /// 按钮矩形再点下去,不直接手动赋值 `ui_state` 字段。
+    #[test]
+    fn context_menu_skip_automation_sets_both_connect_request_and_skip_flag() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![rec(1, "session-a-unique-name", "192.0.2.10", &[])];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(ui, &t, ui_state, &sessions, &groups, None);
+                });
+            })
+        };
+
+        // 前两帧只是让布局稳定下来,不带任何指针事件。
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+
+        let row_pos = find_text_pos(&out.shapes, "session-a-unique-name")
+            .expect("session-a 这一行应该已经画出来了");
+        let row_click_pos = egui::pos2(row_pos.x - 20.0, row_pos.y + 15.0);
+
+        let secondary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(row_click_pos),
+                    secondary_click(row_click_pos, true),
+                    secondary_click(row_click_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+
+        // 菜单弹出用的是 `Area`,首次遇到某个 id 先做一趟不可见的 sizing pass,
+        // 真正把内容画出来要等下一帧,所以再空跑一帧(不带任何指针事件)。
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let skip_btn_pos = find_text_pos(&out.shapes, "连接(跳过自动化)")
+            .expect("右键打开的菜单里应该画出了「连接(跳过自动化)」按钮");
+        let primary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(skip_btn_pos),
+                    primary_click(skip_btn_pos, true),
+                    primary_click(skip_btn_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            ui_state.connect_request,
+            Some(SessionId(1)),
+            "点「连接(跳过自动化)」必须设 connect_request,否则点了没反应,\
+             用户会以为菜单项是坏的"
+        );
+        assert!(
+            ui_state.connect_skip_automation,
+            "点「连接(跳过自动化)」必须设 connect_skip_automation,否则只是\
+             普通连接——用户点了跳过自动化,自动化却照样跑了"
         );
     }
 

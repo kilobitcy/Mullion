@@ -5,6 +5,7 @@
 //! 无法在无头容器自动验证,需人工确认。
 
 pub mod app;
+pub mod automation;
 pub mod cli;
 pub mod clipboard;
 pub mod diag;

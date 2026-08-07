@@ -1,12 +1,12 @@
-//! 会话管理器**右栏**:标题条 + 错误卡片 + 三个 Tab + 底部按钮条(F90 Task 11)。
+//! 会话管理器**右栏**:标题条 + 错误卡片 + 四个 Tab + 底部按钮条(F90 Task 11)。
 //!
 //! 原来是一个独立的 `egui::Window`(F90 前),现在是主窗右侧的 `CentralPanel`,
 //! 每帧都渲染——「关闭」表单这个概念不复存在,「取消」只是把
 //! `ui_state.editor`/`editor_id`/`editor_baseline` 重置回空(等价于回到
 //! 「未编辑任何会话」态,画空态提示)。
 //!
-//! 字段本身的布局是 Task 12 的事,这里只挂三个 Tab 的占位调用点
-//! (`super::fields::{basic,auth,network}`)。
+//! 字段本身的布局是 Task 12 的事,这里只挂四个 Tab 的占位调用点
+//! (`super::fields::{basic,auth,network,automation}`)。
 
 use egui::Ui;
 
@@ -15,8 +15,8 @@ use crate::ui::session_manager::SecretPresence;
 use crate::ui::UiState;
 use mullion_store::GroupRecord;
 
-/// 三个 Tab 的标题。索引即 `UiState::editor_tab`。
-const TABS: [&str; 3] = ["连接", "认证", "高级"];
+/// 四个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
+const TABS: [&str; 4] = ["连接", "认证", "高级", "登录后"];
 
 /// 底部按钮为什么点不动。两个原因是并集,`Missing` 优先 ——
 /// 表单都没填齐,就没必要提「测试连接进行中」。
@@ -375,6 +375,10 @@ pub(super) fn show(
         .show(ui, |ui| match ui_state.editor_tab {
             super::TAB_CONNECT => super::fields::basic(ui, t, buf, groups),
             super::TAB_AUTH => super::fields::auth(ui, t, buf, presence, &ui_state.key_candidates),
+            super::TAB_AUTOMATION => super::fields::automation(ui, t, buf),
+            super::TAB_ADVANCED => super::fields::network(ui, t, buf, presence),
+            // 「越界值兜底」:`editor_tab` 是既有的裸 usize 技术债,越界值
+            // 落到这里比 panic 好。
             _ => super::fields::network(ui, t, buf, presence),
         });
 
