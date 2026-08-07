@@ -1,7 +1,5 @@
 //! 会话数据模型。只放数据类型,零 IO。非敏感字段落明文 TOML;密码/口令走加密侧车(vault)。
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 /// 会话稳定主键。新建时取现有 max+1(见 vault)。
@@ -22,8 +20,13 @@ pub enum Protocol {
 pub enum AuthKind {
     /// 密码认证:密码串存加密侧车。
     Password,
-    /// 公钥认证:私钥 path 明文;口令(若有)存加密侧车。
-    PublicKey { path: PathBuf, has_passphrase: bool },
+    /// 公钥认证。**私钥内容本身**和口令都在加密侧车(`SecretEntry::private_key` /
+    /// `passphrase`),这里只留「要不要口令」这一位。
+    ///
+    /// v5 起不再存私钥**路径**:路径既不是凭据也不是身份,却让会话跟一台机器上的
+    /// 一个文件绑死 —— 换机器、挪目录、导出配置全部失效。旧文件里的路径由
+    /// `Vault::open` 的 v<5 迁移读成内容后丢弃(见 `migrate::legacy_key_paths`)。
+    PublicKey { has_passphrase: bool },
 }
 
 /// 身份与组织(分节)。`name` 不可继承(设计 §4.2)。
@@ -78,7 +81,7 @@ pub struct SessionRecord {
 
 /// 一条会话的**敏感**部分,加密后存 secrets.enc。
 ///
-/// **不 derive Debug**:三个字段全是明文口令,`{:?}` 一打就把它们写进日志/panic
+/// **不 derive Debug**:四个字段全是明文凭据,`{:?}` 一打就把它们写进日志/panic
 /// 消息,加密存储的意义当场归零。手写打码实现(与 `mullion_ssh::hop` 同一模式),
 /// 只报告「有没有设置」,连长度都不泄漏。
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +93,10 @@ pub struct SecretEntry {
     /// F4:代理认证口令。与 SSH 口令分开存,避免误用。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub proxy_password: Option<String>,
+    /// 私钥**内容**(PEM / OpenSSH 文本),v5 起取代原来的明文路径。
+    /// 未加密的私钥即等同于密码,必须与口令一样走加密侧车。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub private_key: Option<String>,
 }
 
 impl std::fmt::Debug for SecretEntry {
@@ -105,6 +112,7 @@ impl std::fmt::Debug for SecretEntry {
             .field("password", &redacted(&self.password))
             .field("passphrase", &redacted(&self.passphrase))
             .field("proxy_password", &redacted(&self.proxy_password))
+            .field("private_key", &redacted(&self.private_key))
             .finish()
     }
 }
@@ -172,13 +180,15 @@ pub struct AppearancePrefs {
 ///
 /// v3 = v2 + `[session.network]` / `[group.network]`。
 /// v4 = v3 + `[session.automation]` / `[group.automation]`(F40~F44)。
+/// v5 = v4 - `[session.auth].path`:私钥改存**内容**到加密侧车。
 ///
 /// 结构上新版本能直接读旧版本(新字段全带 `serde(default)`),升版本号是为了让
-/// **旧客户端明确拒绝**,而不是静默丢弃新分节再写回。
+/// **旧客户端明确拒绝**,而不是静默丢弃新分节再写回。v5 还多一层理由:旧客户端
+/// 读 v5 会发现 `path` 没了,公钥会话直接连不上,拒绝比装作能用好。
 ///
-/// **号段归属**:F74(凭据实体)原定 v3→v4,被本切片先落地拿走了 4,顺延为
-/// v4→v5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
-pub const CURRENT_SCHEMA: u32 = 4;
+/// **号段归属**:F74(凭据实体)原定 v3→v4,被 F40~F44 先落地拿走了 4,再被本次
+/// 「私钥入库」拿走了 5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
+pub const CURRENT_SCHEMA: u32 = 5;
 
 fn schema_v1() -> u32 {
     1
@@ -219,7 +229,6 @@ mod tests {
             auth: Auth {
                 user: "user".into(),
                 kind: AuthKind::PublicKey {
-                    path: "/path/to/key.pem".into(),
                     has_passphrase: false,
                 },
             },
@@ -327,6 +336,7 @@ mod tests {
             password: None,
             passphrase: None,
             proxy_password: Some("p".into()),
+            private_key: None,
         };
         let text = toml::to_string_pretty(&s).unwrap();
         let back: SecretEntry = toml::from_str(&text).unwrap();
@@ -343,6 +353,7 @@ mod tests {
             password: Some("hunter2".into()),
             passphrase: Some("keyphrase".into()),
             proxy_password: Some("proxypw".into()),
+            private_key: None,
         };
         let s = format!("{e:?}");
         for leaked in ["hunter2", "keyphrase", "proxypw"] {

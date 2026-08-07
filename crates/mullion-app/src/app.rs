@@ -780,8 +780,8 @@ impl App {
             .ui
             .editor_id
             .and_then(|id| self.store.as_ref().and_then(|s| s.secret(id)));
-        let (pw, pp, proxy) = crate::ui::session_manager::secret_fields(buf);
-        draft.secret = crate::ui::session_manager::merge_secret(existing, &pw, &pp, &proxy);
+        let (pw, pp, proxy, key) = crate::ui::session_manager::secret_fields(buf);
+        draft.secret = crate::ui::session_manager::merge_secret(existing, &pw, &pp, &proxy, &key);
         // 复用既有的 `sync_has_passphrase`(`apply_save` 用的是同一个),
         // 不要在这里手写第二份 `AuthKind::PublicKey { has_passphrase }` 同步逻辑 ——
         // 两份迟早漂移,而漂移的后果是「测试通过、保存后要不到口令」。
@@ -1110,7 +1110,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.key_picker_busy = false;
                 if let Some(p) = picked {
                     if let Some(buf) = self.ui.editor.as_mut() {
-                        buf.key_path = p.display().to_string();
+                        // v5:选中的文件当场读成正文存进缓冲,路径不留。
+                        crate::ui::session_manager::import_key_file(buf, &p, |p| {
+                            std::fs::read_to_string(p)
+                        });
+                        if let Some(note) = buf.key_note.take() {
+                            self.ui.key_drop_note = Some(note);
+                        }
                     }
                 }
                 self.request_ui_redraw();
@@ -1965,12 +1971,19 @@ fn apply_save(
         password,
         passphrase,
         proxy_password,
+        private_key,
         then_connect: _,
     } = save;
 
     // 先把已存凭据 clone 出来,释放对 store 的不可变借用,下面才能 &mut。
     let existing = editing_id.and_then(|id| store.secret(id)).cloned();
-    let merged = merge_secret(existing.as_ref(), &password, &passphrase, &proxy_password);
+    let merged = merge_secret(
+        existing.as_ref(),
+        &password,
+        &passphrase,
+        &proxy_password,
+        &private_key,
+    );
     sync_has_passphrase(&mut draft, merged.as_ref());
     draft.secret = merged;
 
@@ -2803,6 +2816,7 @@ mod tests {
                 password: crate::ui::session_manager::SecretField::Set("pw".into()),
                 passphrase: crate::ui::session_manager::SecretField::Clear,
                 proxy_password: crate::ui::session_manager::SecretField::Keep,
+                private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
             },
             "2026-08-03T00:00:00Z",
@@ -2826,6 +2840,7 @@ mod tests {
                 password: crate::ui::session_manager::SecretField::Keep,
                 passphrase: crate::ui::session_manager::SecretField::Clear,
                 proxy_password: crate::ui::session_manager::SecretField::Keep,
+                private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
             },
             "2026-08-03T00:01:00Z",
@@ -2861,6 +2876,7 @@ mod tests {
                 password: crate::ui::session_manager::SecretField::Clear,
                 passphrase: crate::ui::session_manager::SecretField::Clear,
                 proxy_password: crate::ui::session_manager::SecretField::Clear,
+                private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
             },
             "2026-08-03T00:00:00Z",
@@ -2895,7 +2911,6 @@ mod tests {
             host: "192.0.2.10".into(),
             user: "user".into(),
             auth_kind: crate::ui::session_manager::AuthKindUi::PublicKey,
-            key_path: "/home/user/.ssh/id_ed25519".into(),
             ..Default::default()
         };
         first.password = "old-pw".into();
@@ -2912,6 +2927,7 @@ mod tests {
                 password: crate::ui::session_manager::SecretField::Set("old-pw".into()),
                 passphrase: crate::ui::session_manager::SecretField::Set("old-ph".into()),
                 proxy_password: crate::ui::session_manager::SecretField::Set("old-proxy".into()),
+                private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
             },
             "2026-08-03T00:00:00Z",
@@ -2939,6 +2955,7 @@ mod tests {
                 password: crate::ui::session_manager::SecretField::Set("new-pw".into()),
                 passphrase: crate::ui::session_manager::SecretField::Keep,
                 proxy_password: crate::ui::session_manager::SecretField::Clear,
+                private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
             },
             "2026-08-03T00:01:00Z",

@@ -11,6 +11,10 @@ use mullion_store::{AuthKind, Protocol, SecretEntry, SessionRecord};
 pub enum MapError {
     /// 需要密码/口令但没提供(会话配置不完整或解密缺失)。
     MissingSecret,
+    /// 公钥会话但侧车里没有私钥正文。**与 `MissingSecret` 分开**:v4→v5 迁移
+    /// 时若旧路径指向的文件已被删/挪走,会话就落在这个状态,用户要做的是
+    /// 「重新导入私钥」而不是「填口令」,文案指错地方等于没提示。
+    MissingPrivateKey,
     /// SFTP 连接属切片 D,本片不支持。
     SftpNotSupported,
 }
@@ -19,6 +23,9 @@ impl fmt::Display for MapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MapError::MissingSecret => write!(f, "缺少密码/私钥口令 —— 请在会话里重新配置认证"),
+            MapError::MissingPrivateKey => {
+                write!(f, "私钥未导入 —— 请在会话的「认证」页重新导入私钥文件")
+            }
             MapError::SftpNotSupported => write!(f, "SFTP 连接尚未实现(切片 D)"),
         }
     }
@@ -42,10 +49,7 @@ pub fn to_ssh_config(
                 .ok_or(MapError::MissingSecret)?;
             AuthMethod::Password(pw)
         }
-        AuthKind::PublicKey {
-            path,
-            has_passphrase,
-        } => {
+        AuthKind::PublicKey { has_passphrase } => {
             let passphrase = if *has_passphrase {
                 Some(
                     secret
@@ -55,8 +59,12 @@ pub fn to_ssh_config(
             } else {
                 None
             };
+            // v5 起私钥正文在侧车里,不再是磁盘路径。
+            let key_data = secret
+                .and_then(|s| s.private_key.clone())
+                .ok_or(MapError::MissingPrivateKey)?;
             AuthMethod::PublicKey {
-                path: path.clone(),
+                key_data,
                 passphrase,
             }
         }
@@ -114,6 +122,7 @@ mod tests {
             password: Some("pw".into()),
             passphrase: None,
             proxy_password: None,
+            private_key: None,
         };
         let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
         assert_eq!(cfg.host, "h");
@@ -132,11 +141,11 @@ mod tests {
         ));
     }
 
+    /// 私钥正文取自侧车而不是磁盘 —— 这正是 v5 的改动点。
     #[test]
-    fn pubkey_with_passphrase_maps() {
+    fn pubkey_takes_the_key_body_from_the_secret_sidecar() {
         let r = rec(
             AuthKind::PublicKey {
-                path: "/k".into(),
                 has_passphrase: true,
             },
             Protocol::Ssh,
@@ -145,11 +154,15 @@ mod tests {
             password: None,
             passphrase: Some("ph".into()),
             proxy_password: None,
+            private_key: Some("KEYBODY".into()),
         };
         let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
         match cfg.auth {
-            AuthMethod::PublicKey { path, passphrase } => {
-                assert_eq!(path, std::path::PathBuf::from("/k"));
+            AuthMethod::PublicKey {
+                key_data,
+                passphrase,
+            } => {
+                assert_eq!(key_data, "KEYBODY");
                 assert_eq!(passphrase.as_deref(), Some("ph"));
             }
             _ => panic!("应为 PublicKey"),
@@ -160,12 +173,17 @@ mod tests {
     fn pubkey_no_passphrase_maps_none() {
         let r = rec(
             AuthKind::PublicKey {
-                path: "/k".into(),
                 has_passphrase: false,
             },
             Protocol::Ssh,
         );
-        let cfg = to_ssh_config(&r, None).unwrap();
+        let sec = SecretEntry {
+            password: None,
+            passphrase: None,
+            proxy_password: None,
+            private_key: Some("KEYBODY".into()),
+        };
+        let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
         assert!(matches!(
             cfg.auth,
             AuthMethod::PublicKey {
@@ -175,6 +193,27 @@ mod tests {
         ));
     }
 
+    /// 迁移时私钥文件读不到的会话会落在「没有私钥正文」上。这时报的必须是
+    /// 「重新导入私钥」而不是「缺少密码/口令」—— 后者会把用户引到口令输入框,
+    /// 而那里怎么填都连不上。
+    #[test]
+    fn pubkey_without_key_body_says_reimport_not_missing_password() {
+        let r = rec(
+            AuthKind::PublicKey {
+                has_passphrase: false,
+            },
+            Protocol::Ssh,
+        );
+        assert!(matches!(
+            to_ssh_config(&r, None),
+            Err(MapError::MissingPrivateKey)
+        ));
+        assert!(
+            MapError::MissingPrivateKey.to_string().contains("导入"),
+            "文案要指向重新导入私钥"
+        );
+    }
+
     #[test]
     fn sftp_is_rejected_in_a2() {
         let r = rec(AuthKind::Password, Protocol::Sftp);
@@ -182,6 +221,7 @@ mod tests {
             password: Some("pw".into()),
             passphrase: None,
             proxy_password: None,
+            private_key: None,
         };
         assert!(matches!(
             to_ssh_config(&r, Some(&sec)),
@@ -194,7 +234,6 @@ mod tests {
         // has_passphrase=true 但没提供 secret → MissingSecret(与 Password 路径对称)
         let r = rec(
             AuthKind::PublicKey {
-                path: "/k".into(),
                 has_passphrase: true,
             },
             Protocol::Ssh,

@@ -53,7 +53,12 @@ impl Vault {
         let key = key_source.load_or_create()?;
 
         let sessions_path = dir.join("sessions.toml");
-        let (groups, sessions, migrated) = load_sessions(&sessions_path)?;
+        let Loaded {
+            groups,
+            sessions,
+            migrated,
+            legacy_key_paths,
+        } = load_sessions(&sessions_path)?;
 
         let secrets_path = dir.join("secrets.enc");
         let mut secrets = if secrets_path.exists() {
@@ -71,6 +76,22 @@ impl Vault {
         let live: std::collections::BTreeSet<String> =
             sessions.iter().map(|s| s.id.0.to_string()).collect();
         secrets.retain(|k, _| live.contains(k));
+
+        // v<5 迁移:旧文件里公钥会话只存了私钥**路径**,把路径指向的内容读进来
+        // 存进加密侧车,路径本身就此丢弃。
+        //
+        // 读不到(文件被删/挪走/权限不足)时**跳过**,不报错:整个库因为一个私钥
+        // 文件不在了就打不开,用户连进去改都改不了。降级后的表现是「该会话没有
+        // 私钥」,UI 会红字提示重新导入(见 app 侧 `SecretPresence`)。
+        for (id, path) in legacy_key_paths {
+            let key = id.0.to_string();
+            if !live.contains(&key) || secrets.get(&key).is_some_and(|s| s.private_key.is_some()) {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(&path) {
+                secrets.entry(key).or_default().private_key = Some(text);
+            }
+        }
 
         let vault = Self {
             dir,
@@ -315,13 +336,28 @@ impl Vault {
     }
 }
 
+/// `load_sessions` 的产物。
+struct Loaded {
+    groups: Vec<GroupRecord>,
+    sessions: Vec<SessionRecord>,
+    /// 版本落后、已就地升级 → 必须立刻 `save()` 写回,否则下次打开重复迁移
+    /// 并覆盖掉备份。
+    migrated: bool,
+    /// v<5 文件里的「会话 id → 私钥路径」。私钥内容的导入必须在
+    /// `Vault::open` 里做 —— 那里才同时拿得到 `secrets`(本函数够不着)。
+    legacy_key_paths: BTreeMap<SessionId, PathBuf>,
+}
+
 /// 读 `sessions.toml` 并按 schema 版本决定:直读 / 迁移 / 拒绝。
-/// 返回 `(分组, 会话, 是否发生了迁移)`;文件不存在时返回空 vec、`migrated=false`。
-fn load_sessions(
-    sessions_path: &Path,
-) -> Result<(Vec<GroupRecord>, Vec<SessionRecord>, bool), StoreError> {
+/// 文件不存在时返回空库、`migrated=false`。
+fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
     if !sessions_path.exists() {
-        return Ok((Vec::new(), Vec::new(), false));
+        return Ok(Loaded {
+            groups: Vec::new(),
+            sessions: Vec::new(),
+            migrated: false,
+            legacy_key_paths: BTreeMap::new(),
+        });
     }
     let text = fs::read_to_string(sessions_path)?;
     let probe: SchemaProbe = toml::from_str(&text)?;
@@ -336,22 +372,34 @@ fn load_sessions(
         // 会覆盖用户目录里可能已存在的旧 .bak(上次迁移失败重试留下的);
         // 刻意接受,因为两者同源于当前这份文件,覆盖是幂等的。
         fs::copy(sessions_path, sessions_path.with_extension("toml.bak"))?;
-        if probe.schema_version <= 1 {
+        // 私钥路径必须在**这里**从原始文本里挑出来:解析成 v5 的 `AuthKind`
+        // 之后 `path` 已经被 serde 当未知字段丢掉了,再也捞不回来。
+        let legacy_key_paths = crate::migrate::legacy_key_paths(&text);
+        let file = if probe.schema_version <= 1 {
             // 真 v1:扁平结构,必须先经 migrate_v1 转成分节结构。
             // migrate_v1 已产出语义正确的 StoreError::Migration,直接 `?` 透传,
             // 不再在这里额外包一层 —— 避免文案被二次格式化后自相矛盾。
-            let file = migrate_v1(&text)?;
-            Ok((file.group, file.session, true))
+            migrate_v1(&text)?
         } else {
-            // v2:结构已经和当前一致(分节嵌套),只是版本号落后 ——
+            // v2~v4:结构已经和当前一致(分节嵌套),只是版本号落后 ——
             // 新分节(如 network)全带 serde(default) 能直接补齐,
             // 绝不能走 migrate_v1(它只认 v1 的扁平结构,喂 v2 会解析失败)。
-            let file: SessionsFile = toml::from_str(&text)?;
-            Ok((file.group, file.session, true))
-        }
+            toml::from_str::<SessionsFile>(&text)?
+        };
+        Ok(Loaded {
+            groups: file.group,
+            sessions: file.session,
+            migrated: true,
+            legacy_key_paths,
+        })
     } else {
         let file: SessionsFile = toml::from_str(&text)?;
-        Ok((file.group, file.session, false))
+        Ok(Loaded {
+            groups: file.group,
+            sessions: file.session,
+            migrated: false,
+            legacy_key_paths: BTreeMap::new(),
+        })
     }
 }
 
@@ -402,6 +450,7 @@ mod tests {
                 password: Some(pw.into()),
                 passphrase: None,
                 proxy_password: None,
+                private_key: None,
             }),
         }
     }
@@ -499,7 +548,6 @@ mod tests {
         // 新建一个无密钥会话(会复用 id=1),绝不能继承旧密码
         let mut d = draft_pw("new", "x");
         d.auth.kind = AuthKind::PublicKey {
-            path: "/k".into(),
             has_passphrase: false,
         };
         d.secret = None;
@@ -568,7 +616,7 @@ kind = "password"
         assert!(bak.contains("name = \"old\""), "备份应是原始 v1 内容");
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 4"), "磁盘上应已是 v4");
+        assert!(now.contains("schema_version = 5"), "磁盘上应已是 v5");
     }
 
     /// 真实 v2(已是分节嵌套结构,非 v1 扁平结构)的 `sessions.toml`。
@@ -624,7 +672,7 @@ kind = "password"
         );
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 4"), "磁盘上应已升到 v4");
+        assert!(now.contains("schema_version = 5"), "磁盘上应已升到 v5");
     }
 
     #[test]
@@ -644,20 +692,21 @@ kind = "password"
     }
 
     /// `opening_v2_file_does_not_create_backup` 是按当年 `CURRENT_SCHEMA == 2` 写的,
-    /// 版本升到 v4 后没有补一条钉住「当前版本」的用例——这里补上。
+    /// 钉住「打开已是当前 schema 的文件」这条路径。文件由 `save()` 自己产出,
+    /// 所以它天然就是当前版本 —— 版本号再升也不用改这条测试。
     ///
     /// 为什么这条重要:`.bak` 只有一份,如果 `Vault::open` 在文件已经是当前 schema
     /// 时仍然调用 `save()` 重写,就会用「刚打开时的内容」去覆盖 `.bak`,用户唯一的
     /// 升级前快照就没了。这里同时钉住「不产生/不覆盖 `.bak`」与「磁盘字节原样不变」
-    /// 两件事,并顺带验证 v4 相对 v3 新增的 `automation` 分节在打开过程中没有丢失。
+    /// 两件事,并顺带验证 `automation` 分节在打开过程中没有丢失。
     ///
-    /// 构造真实 v4 文件的方式选了「Vault::add + save() → 读回磁盘字节」而不是像
+    /// 构造文件的方式选了「Vault::add + save() → 读回磁盘字节」而不是像
     /// `V3_ON_DISK`/`V2_ON_DISK` 那样手写 TOML 常量:手写常量必须跟实际序列化格式
     /// (字段顺序、`skip_serializing_if` 产生的省略)保持同步,一旦 serde 输出格式变了
     /// 常量就可能悄悄失真;而这条测试关心的正是「打开前后字节要完全相等」,用
     /// 序列化器自己产出的内容做基准,才是最贴近真实用户文件的做法。
     #[test]
-    fn opening_v4_file_does_not_rewrite_or_touch_backup() {
+    fn opening_a_current_schema_file_does_not_rewrite_or_touch_backup() {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
@@ -689,12 +738,12 @@ kind = "password"
         let before = std::fs::read(&sessions_path).unwrap();
         let before_text = String::from_utf8(before.clone()).unwrap();
         assert!(
-            before_text.contains("schema_version = 4"),
-            "前提条件:这份文件必须真的是 v4,否则没测到点子上"
+            before_text.contains(&format!("schema_version = {CURRENT_SCHEMA}")),
+            "前提条件:这份文件必须真的是当前版本,否则没测到点子上"
         );
         assert!(
             before_text.contains("[session.automation]"),
-            "前提条件:必须含 v4 新增的 automation 分节"
+            "前提条件:必须含 automation 分节"
         );
         assert!(!bak_path.exists(), "首次 save 不该凭空产生 .bak");
 
@@ -717,7 +766,7 @@ kind = "password"
             Some(crate::automation::TmuxChoice::Attach {
                 session_name: Some("claude".into())
             }),
-            "v4 新增的 automation 分节不能在打开过程中丢失"
+            "automation 分节不能在打开过程中丢失"
         );
         assert_eq!(a.commands.as_ref().unwrap()[0].text, "echo 'hi'");
         assert_eq!(a.commands.as_ref().unwrap()[0].delay_ms, Some(500));
@@ -788,7 +837,7 @@ port = 7891
         assert!(bak.contains("schema_version = 3"), "备份应是升级前的原文");
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 4"), "磁盘上应已升到 v4");
+        assert!(now.contains("schema_version = 5"), "磁盘上应已升到 v5");
     }
 
     #[test]
@@ -1082,6 +1131,138 @@ port = 7891
             v.get(id).unwrap().automation.tmux,
             Some(crate::automation::TmuxChoice::Off),
             "update 必须把 automation 一起替换掉"
+        );
+    }
+
+    /// v<5 的真实文件:私钥只有一个**路径**。
+    fn v4_with_key_path(path: &str) -> String {
+        format!(
+            r#"
+schema_version = 4
+
+[[session]]
+id = 1
+modified_at = "t"
+
+[session.identity]
+name = "a"
+
+[session.connection]
+host = "h"
+port = 22
+protocol = "ssh"
+
+[session.auth]
+user = "u"
+kind = "public_key"
+path = "{path}"
+has_passphrase = false
+"#
+        )
+    }
+
+    /// v4→v5 迁移的主路径:打开时把路径指向的**私钥内容**读进加密侧车,
+    /// 并把路径本身从 sessions.toml 里抹掉。
+    ///
+    /// 三条断言缺一不可:内容进了侧车(否则公钥会话直接连不上)、路径不再落盘
+    /// (这是本次改动的全部目的)、私钥内容没跟着落进明文 TOML(那比留路径更糟)。
+    #[test]
+    fn opening_a_v4_file_imports_the_key_file_content_and_drops_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("id_ed25519");
+        let body = "-----BEGIN OPENSSH PRIVATE KEY-----\nMIGRATED-BODY\n-----END OPENSSH PRIVATE KEY-----\n";
+        std::fs::write(&key_file, body).unwrap();
+        std::fs::write(
+            dir.path().join("sessions.toml"),
+            v4_with_key_path(&key_file.display().to_string()),
+        )
+        .unwrap();
+
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(
+            v.secret(SessionId(1))
+                .and_then(|s| s.private_key.as_deref()),
+            Some(body),
+            "私钥内容必须被读进加密侧车"
+        );
+
+        let on_disk = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
+        assert!(
+            !on_disk.contains("id_ed25519"),
+            "迁移后 sessions.toml 里不该再有私钥路径: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains("MIGRATED-BODY"),
+            "私钥内容绝不能落进明文 sessions.toml: {on_disk}"
+        );
+        assert!(on_disk.contains("schema_version = 5"));
+    }
+
+    /// 私钥文件已经不在了(被删/挪走/权限不足)时,库仍必须能打开 —— 整个
+    /// 会话库因为一个私钥文件没了就打不开,用户连进去改都改不了。
+    /// 降级后的表现是「这条会话没有私钥」,由 UI 提示重新导入。
+    #[test]
+    fn an_unreadable_legacy_key_file_degrades_to_no_key_instead_of_failing_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sessions.toml"),
+            v4_with_key_path("/definitely/not/here/id_rsa"),
+        )
+        .unwrap();
+
+        let v = Vault::open(dir.path().to_path_buf(), &key())
+            .expect("私钥文件读不到不该让整个库打不开");
+        assert!(
+            v.secret(SessionId(1))
+                .and_then(|s| s.private_key.as_ref())
+                .is_none(),
+            "读不到就该是「没有私钥」,不能塞一个假值进去"
+        );
+        assert_eq!(v.list().len(), 1, "会话本身必须保留下来供用户重新导入");
+    }
+
+    /// 已经在侧车里的私钥**不能**被旧路径覆盖。用户有可能先用新版导入过一次
+    /// 私钥、之后又打开了一份还带 path 的旧文件(比如从备份恢复 sessions.toml);
+    /// 让路径赢会把用户刚导入的、可能已经轮换过的私钥换成一把旧钥匙。
+    #[test]
+    fn an_already_imported_private_key_is_not_overwritten_by_the_legacy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("id_ed25519");
+        std::fs::write(&key_file, "OLD-KEY-FROM-FILE").unwrap();
+        std::fs::write(
+            dir.path().join("sessions.toml"),
+            v4_with_key_path(&key_file.display().to_string()),
+        )
+        .unwrap();
+        // 先造出一份「侧车里已有私钥」的状态:直接写 secrets.enc 太绕,
+        // 借一次正常的 open+update 把新私钥存进去,再把 sessions.toml 换回 v4。
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let mut d = draft();
+            d.auth.kind = AuthKind::PublicKey {
+                has_passphrase: false,
+            };
+            d.secret = Some(SecretEntry {
+                password: None,
+                passphrase: None,
+                proxy_password: None,
+                private_key: Some("NEW-KEY-ALREADY-IMPORTED".into()),
+            });
+            v.update(SessionId(1), d, "t2").unwrap();
+            v.save().unwrap();
+        }
+        std::fs::write(
+            dir.path().join("sessions.toml"),
+            v4_with_key_path(&key_file.display().to_string()),
+        )
+        .unwrap();
+
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(
+            v.secret(SessionId(1))
+                .and_then(|s| s.private_key.as_deref()),
+            Some("NEW-KEY-ALREADY-IMPORTED"),
+            "侧车里已有的私钥不该被旧路径里的内容覆盖"
         );
     }
 }

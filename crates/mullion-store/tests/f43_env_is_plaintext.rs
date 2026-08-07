@@ -37,7 +37,6 @@ fn automation_env_is_plaintext_in_sessions_toml_and_absent_from_secrets_enc() {
             auth: Auth {
                 user: "u".into(),
                 kind: AuthKind::PublicKey {
-                    path: "/k.pem".into(),
                     has_passphrase: false,
                 },
             },

@@ -14,6 +14,16 @@ fn live_enabled() -> bool {
     std::env::var("MULLION_LIVE").as_deref() == Ok("1")
 }
 
+/// 从 `MULLION_LIVE_KEY` 指向的文件读私钥**正文**(v5 起 `AuthMethod` 收内容)。
+/// 读不到时返回空串,让连接以「解析私钥失败」告终而不是 panic 掉整个 live 套件。
+fn live_key() -> AuthMethod {
+    let path = std::env::var("MULLION_LIVE_KEY").unwrap_or_else(|_| "/path/to/key.pem".into());
+    AuthMethod::PublicKey {
+        key_data: std::fs::read_to_string(path).unwrap_or_default(),
+        passphrase: None,
+    }
+}
+
 fn base(auth: AuthMethod) -> SshConfig {
     SshConfig {
         host: std::env::var("MULLION_LIVE_HOST").unwrap_or_else(|_| "example.com".into()),
@@ -61,13 +71,7 @@ async fn pubkey_live() {
         eprintln!("跳过:未设 MULLION_LIVE=1");
         return;
     }
-    run_echo(AuthMethod::PublicKey {
-        path: std::env::var("MULLION_LIVE_KEY")
-            .unwrap_or_else(|_| "/path/to/key.pem".into())
-            .into(),
-        passphrase: None,
-    })
-    .await;
+    run_echo(live_key()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -106,12 +110,7 @@ async fn multi_pty_live_f35() {
         eprintln!("跳过:未设 MULLION_LIVE=1");
         return;
     }
-    let cfg = base(AuthMethod::PublicKey {
-        path: std::env::var("MULLION_LIVE_KEY")
-            .unwrap_or_else(|_| "/path/to/key.pem".into())
-            .into(),
-        passphrase: None,
-    });
+    let cfg = base(live_key());
     let policy = Arc::new(TofuAccept::new(Arc::new(Mutex::new(KnownHosts::new()))));
     let handle = Arc::new(establish(&cfg, policy).await.expect("真机握手"));
 

@@ -186,9 +186,13 @@ async fn authenticate_with(
             .authenticate_password(user, pw)
             .await
             .map_err(map_russh),
-        AuthMethod::PublicKey { path, passphrase } => {
-            let key = russh::keys::load_secret_key(path, passphrase.as_deref())
-                .map_err(|e| ConnectError::Io(format!("读私钥失败: {e}")))?;
+        AuthMethod::PublicKey {
+            key_data,
+            passphrase,
+        } => {
+            // 解析的是**内容**而不是路径:私钥来自加密侧车,本 crate 不碰文件系统。
+            let key = russh::keys::decode_secret_key(key_data, passphrase.as_deref())
+                .map_err(|e| ConnectError::Io(format!("解析私钥失败: {e}")))?;
             let with = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), PUBKEY_HASH);
             handle
                 .authenticate_publickey(user, with)

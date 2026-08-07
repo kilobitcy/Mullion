@@ -3,7 +3,7 @@
 //! **本文件不许 `use egui`**。会话表单的 bug(端口解析、代理三态、凭据被静默清除)
 //! 全部能在没有窗口的情况下单测复现——这是把它从 UI 代码里切出来的全部理由。
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use mullion_store::{
     AppearancePrefs, Auth, AuthKind, AutomationPrefs, Connection, GroupId, Identity, NetworkPrefs,
@@ -29,6 +29,19 @@ pub enum ProxyModeUi {
     HttpConnect,
 }
 
+/// 编辑表单里的跳板选择。**三态**,与 `NetworkPrefs::jump` 的三态一一对应:
+/// 无 = `Some(vec![])`(显式直连,覆盖分组)/ 继承分组 = `None` / 自定义 = `Some(chain)`。
+///
+/// 与 `ProxyModeUi` 同一个坑:「继承」与「显式不走跳板」必须分开,否则分组配了
+/// 跳板时,用户没法单独让某一条会话直连。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JumpModeUi {
+    /// 不走跳板(显式覆盖分组)。**新建会话的默认**。
+    None,
+    Inherit,
+    Custom,
+}
+
 /// 编辑表单的跨帧字段缓冲。端口用 `String`(保存时才 `parse`),密码/口令是明文
 /// 缓冲(仅存在于本进程内存,保存后随 `SaveIntent` 一次性转移给 store 加密)。
 ///
@@ -49,7 +62,17 @@ pub struct EditorBuffer {
     /// 编辑已有会话时密码框恒为空(store 不回吐明文),没有这一位就区分不了
     /// 「没动」和「清空了」——见 `SecretField` 的说明。
     pub password_touched: bool,
-    pub key_path: String,
+    /// 私钥**正文**的明文缓冲(v5)。只在「导入」那一刻被填满;编辑已有会话时
+    /// 恒为空 —— store 不回吐明文,UI 只从 `SecretPresence::private_key` 知道
+    /// 「已经有一把钥匙」。路径不再进表单:它既不是凭据也不是身份,却让会话跟
+    /// 一台机器上的一个文件绑死。
+    pub key_data: String,
+    /// 用户这一轮是否导入/清除过私钥。语义同 `password_touched`。
+    pub key_touched: bool,
+    /// 导入操作的一行提示(「已导入 id_ed25519」/「这看起来是公钥」)。
+    /// **瞬态**:`mod.rs` 每帧把它抽走转成 `UiState::key_drop_note`,
+    /// 不能留在缓冲里参与 `is_dirty` 比对 —— 导入失败不该把表单判成脏。
+    pub key_note: Option<String>,
     pub passphrase: String,
     pub passphrase_touched: bool,
 
@@ -59,10 +82,11 @@ pub struct EditorBuffer {
     pub proxy_user: String,
     pub proxy_password: String,
     pub proxy_password_touched: bool,
-    /// 跳板链,按拨号顺序。UI 用下拉逐个添加/删除。
+    /// 跳板链,按拨号顺序。仅在 `jump_mode == Custom` 时写回。
+    /// 切到「无」/「继承」时**不清空**:同 `AuthKindUi` 的缓冲逻辑,
+    /// 用户切回「自定义」应看到自己刚才配的链,而不是从头再点一遍。
     pub jump_chain: Vec<SessionId>,
-    /// 跳板链是否被用户显式设过。`false` = 沿用继承(写回 `None`)。
-    pub jump_set: bool,
+    pub jump_mode: JumpModeUi,
 
     // ↓↓↓ 透传字段:UI 目前没有编辑标签/终端偏好/外观偏好的入口(分组自
     // P0-b 起已可编辑,见下方 preserved_group_id 的注),但
@@ -96,7 +120,9 @@ impl Default for EditorBuffer {
             auth_kind: AuthKindUi::Password,
             password: String::new(),
             password_touched: false,
-            key_path: String::new(),
+            key_data: String::new(),
+            key_touched: false,
+            key_note: None,
             passphrase: String::new(),
             passphrase_touched: false,
             proxy_mode: ProxyModeUi::Inherit,
@@ -106,7 +132,7 @@ impl Default for EditorBuffer {
             proxy_password: String::new(),
             proxy_password_touched: false,
             jump_chain: Vec::new(),
-            jump_set: false,
+            jump_mode: JumpModeUi::None,
             preserved_group_id: None,
             preserved_tags: Vec::new(),
             preserved_terminal: TerminalPrefs::default(),
@@ -155,7 +181,8 @@ impl std::fmt::Debug for EditorBuffer {
             .field("auth_kind", &self.auth_kind)
             .field("password", &redacted(&self.password))
             .field("password_touched", &self.password_touched)
-            .field("key_path", &self.key_path)
+            .field("key_data", &redacted(&self.key_data))
+            .field("key_touched", &self.key_touched)
             .field("passphrase", &redacted(&self.passphrase))
             .field("passphrase_touched", &self.passphrase_touched)
             .field("proxy_mode", &self.proxy_mode)
@@ -165,7 +192,7 @@ impl std::fmt::Debug for EditorBuffer {
             .field("proxy_password", &redacted(&self.proxy_password))
             .field("proxy_password_touched", &self.proxy_password_touched)
             .field("jump_chain", &self.jump_chain)
-            .field("jump_set", &self.jump_set)
+            .field("jump_mode", &self.jump_mode)
             .field("preserved_group_id", &self.preserved_group_id)
             .field("preserved_tags", &self.preserved_tags)
             .field("preserved_terminal", &self.preserved_terminal)
@@ -209,16 +236,21 @@ impl EditorBuffer {
                 buf.proxy_user = ep.user.clone().unwrap_or_default();
             }
         }
-        if let Some(chain) = &rec.network.jump {
-            buf.jump_set = true;
-            buf.jump_chain = chain.iter().map(|j| j.0).collect();
-        }
+        // 三态回填。注意 `Some(vec![])` → 「无」而不是「自定义 + 空链」:
+        // 二者写回时等价,但 UI 上「自定义但一跳都没配」是个说不清的中间态。
+        buf.jump_mode = match &rec.network.jump {
+            None => JumpModeUi::Inherit,
+            Some(chain) if chain.is_empty() => JumpModeUi::None,
+            Some(chain) => {
+                buf.jump_chain = chain.iter().map(|j| j.0).collect();
+                JumpModeUi::Custom
+            }
+        };
+        // 公钥会话不回填任何私钥信息:正文是明文凭据,store 不回吐;路径 v5 起
+        // 已不存在。UI 靠 `SecretPresence::private_key` 显示「已导入 / 未设置」。
         match &rec.auth.kind {
             AuthKind::Password => buf.auth_kind = AuthKindUi::Password,
-            AuthKind::PublicKey { path, .. } => {
-                buf.auth_kind = AuthKindUi::PublicKey;
-                buf.key_path = path.display().to_string();
-            }
+            AuthKind::PublicKey { .. } => buf.auth_kind = AuthKindUi::PublicKey,
         }
         buf
     }
@@ -253,13 +285,14 @@ impl std::fmt::Debug for SecretField {
 
 /// 把三态意图落回 store 的二态 `Option<SecretEntry>`。纯函数。
 ///
-/// 三个字段各自独立合成;全为 `None` 时整条收成 `None`,不在 secrets.enc 里
-/// 留三字段全空的壳。
+/// 四个字段各自独立合成;全为 `None` 时整条收成 `None`,不在 secrets.enc 里
+/// 留全空的壳。
 pub(crate) fn merge_secret(
     existing: Option<&SecretEntry>,
     password: &SecretField,
     passphrase: &SecretField,
     proxy_password: &SecretField,
+    private_key: &SecretField,
 ) -> Option<SecretEntry> {
     fn one(existing: Option<&String>, f: &SecretField) -> Option<String> {
         match f {
@@ -275,8 +308,13 @@ pub(crate) fn merge_secret(
             existing.and_then(|e| e.proxy_password.as_ref()),
             proxy_password,
         ),
+        private_key: one(existing.and_then(|e| e.private_key.as_ref()), private_key),
     };
-    if merged.password.is_none() && merged.passphrase.is_none() && merged.proxy_password.is_none() {
+    if merged.password.is_none()
+        && merged.passphrase.is_none()
+        && merged.proxy_password.is_none()
+        && merged.private_key.is_none()
+    {
         None
     } else {
         Some(merged)
@@ -294,11 +332,13 @@ pub(crate) fn sync_has_passphrase(draft: &mut SessionDraft, merged: Option<&Secr
     }
 }
 
-/// 表单缓冲 → 三个密码框各自的三态意图。纯函数。
+/// 表单缓冲 → 四个凭据槽位各自的三态意图。纯函数。
 ///
 /// 当前认证方式用不到的那一支走 `Clear` 而不是 `Keep`:密码认证的会话不该在
-/// secrets.enc 里留一条孤儿私钥口令(这也与改造前 `build_draft` 的行为一致)。
-pub(crate) fn secret_fields(buf: &EditorBuffer) -> (SecretField, SecretField, SecretField) {
+/// secrets.enc 里留一条孤儿私钥口令/私钥(这也与改造前 `build_draft` 的行为一致)。
+pub(crate) fn secret_fields(
+    buf: &EditorBuffer,
+) -> (SecretField, SecretField, SecretField, SecretField) {
     fn field(touched: bool, v: &str) -> SecretField {
         if !touched {
             SecretField::Keep
@@ -308,24 +348,70 @@ pub(crate) fn secret_fields(buf: &EditorBuffer) -> (SecretField, SecretField, Se
             SecretField::Set(v.to_string())
         }
     }
-    let (password, passphrase) = match buf.auth_kind {
+    let (password, passphrase, private_key) = match buf.auth_kind {
         AuthKindUi::Password => (
             field(buf.password_touched, &buf.password),
+            SecretField::Clear,
             SecretField::Clear,
         ),
         AuthKindUi::PublicKey => (
             SecretField::Clear,
             field(buf.passphrase_touched, &buf.passphrase),
+            field(buf.key_touched, &buf.key_data),
         ),
     };
     (
         password,
         passphrase,
         field(buf.proxy_password_touched, &buf.proxy_password),
+        private_key,
     )
 }
 
-/// 三个凭据槽位「有没有值」。**只有 bool,不含任何明文** —— 它要穿过
+/// 导入一个私钥文件:读正文填进缓冲,并留一行提示给用户看。
+///
+/// IO 由调用方注入(生产是 `std::fs::read_to_string`),「读不了 / 选成了公钥 /
+/// 正常导入」三条分支因此都能脱离 GUI 单测。
+pub(crate) fn import_key_file(
+    buf: &mut EditorBuffer,
+    path: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    match read(path) {
+        Err(e) => buf.key_note = Some(format!("读不了 {name}:{e}")),
+        Ok(text) if !looks_like_private_key(&text) => {
+            buf.key_note = Some(format!(
+                "{name} 不像私钥 —— 要选的是私钥本体,不是 .pub 公钥"
+            ));
+        }
+        Ok(text) => {
+            buf.key_data = text;
+            buf.key_touched = true;
+            buf.key_note = Some(format!("已导入 {name}"));
+        }
+    }
+}
+
+/// 只认 PEM / OpenSSH 私钥的起始标记。**故意不做真解析**:带口令的私钥要先
+/// 有口令才解得开,用 `decode_secret_key` 去验会把正常的加密私钥判成坏文件。
+/// 这里只拦最常见的一种误操作 —— 选成了 `id_xxx.pub`。
+fn looks_like_private_key(text: &str) -> bool {
+    text.contains("PRIVATE KEY")
+}
+
+/// 清除表单里的私钥(「清除」按钮)。保存后 `SecretField::Clear` 会把侧车里
+/// 那把钥匙一起删掉。
+pub(crate) fn clear_key(buf: &mut EditorBuffer) {
+    buf.key_data.clear();
+    buf.key_touched = true;
+    buf.key_note = Some("已清除私钥(保存后生效)".to_string());
+}
+
+/// 四个凭据槽位「有没有值」。**只有 bool,不含任何明文** —— 它要穿过
 /// `UiFrame` 进 egui 闭包,明文绝不能走这条路。
 /// 必须 `Copy`:`UiFrame` 整体 `Copy`(`egui::Context::run` 内部是个 loop)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -333,6 +419,9 @@ pub struct SecretPresence {
     pub password: bool,
     pub passphrase: bool,
     pub proxy_password: bool,
+    /// 库里有没有一把已导入的私钥(v5)。为 false 的公钥会话要在 UI 上标红:
+    /// v4→v5 迁移时读不到旧路径的会话就落在这里,不提示用户就只剩连接时报错。
+    pub private_key: bool,
 }
 
 /// 一次「保存」的意图:app 事后据此调用 `store.add`(`editing_id=None`)或
@@ -346,6 +435,7 @@ pub struct SaveIntent {
     pub password: SecretField,
     pub passphrase: SecretField,
     pub proxy_password: SecretField,
+    pub private_key: SecretField,
     /// 保存成功后立刻连接(右栏底部的「保存并连接」)。
     pub then_connect: bool,
 }
@@ -363,7 +453,6 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
     let kind = match buf.auth_kind {
         AuthKindUi::Password => AuthKind::Password,
         AuthKindUi::PublicKey => AuthKind::PublicKey {
-            path: PathBuf::from(buf.key_path.trim()),
             // 占位;下面用合成结果统一修正,避免两处各算一遍算歪。
             has_passphrase: false,
         },
@@ -371,8 +460,8 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
     // 这里传 `existing = None`:`build_draft` 看不到 store,它产出的是「若库里
     // 原本没有凭据时的合成结果」。真正的合成在 `app::apply_save` 里用真实
     // existing 重算一遍并覆盖 —— 编辑已有会话时以那一次为准。
-    let (pw_f, pp_f, proxy_f) = secret_fields(buf);
-    let secret = merge_secret(None, &pw_f, &pp_f, &proxy_f);
+    let (pw_f, pp_f, proxy_f, key_f) = secret_fields(buf);
+    let secret = merge_secret(None, &pw_f, &pp_f, &proxy_f, &key_f);
     let proxy = match buf.proxy_mode {
         ProxyModeUi::Inherit => None,
         ProxyModeUi::Direct => Some(mullion_store::ProxyChoice::Direct),
@@ -398,15 +487,17 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
             })
         }
     };
-    let jump = if buf.jump_set {
-        Some(
+    // 「无」写 `Some(vec![])` 而不是 `None`:后者是继承,分组一旦配了跳板就会
+    // 被拉回去走跳板 —— 用户选的明明是「无」。
+    let jump = match buf.jump_mode {
+        JumpModeUi::None => Some(Vec::new()),
+        JumpModeUi::Inherit => None,
+        JumpModeUi::Custom => Some(
             buf.jump_chain
                 .iter()
                 .map(|id| mullion_store::JumpRef(*id))
                 .collect(),
-        )
-    } else {
-        None
+        ),
     };
     let mut draft = SessionDraft {
         identity: Identity {
@@ -470,6 +561,33 @@ mod tests {
         assert!(s.contains("192.0.2.10"), "非敏感字段应保留以便排障: {s}");
     }
 
+    /// 一条只有 `network.jump` 有意义的最小会话记录,给回填方向的测试用。
+    fn rec_with_jump(jump: Option<Vec<JumpRef>>) -> SessionRecord {
+        SessionRecord {
+            id: SessionId(1),
+            modified_at: "t".into(),
+            identity: Identity {
+                name: "dev".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: "h".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "u".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: TerminalPrefs::default(),
+            appearance: AppearancePrefs::default(),
+            network: NetworkPrefs { proxy: None, jump },
+            automation: AutomationPrefs::default(),
+        }
+    }
+
     fn buf() -> EditorBuffer {
         EditorBuffer {
             name: "dev".into(),
@@ -480,7 +598,6 @@ mod tests {
             note: "跳板后".into(),
             auth_kind: AuthKindUi::Password,
             password: String::new(),
-            key_path: String::new(),
             passphrase: String::new(),
             ..EditorBuffer::default()
         }
@@ -516,18 +633,13 @@ mod tests {
     fn pubkey_with_passphrase_sets_has_passphrase_and_secret() {
         let mut b = buf();
         b.auth_kind = AuthKindUi::PublicKey;
-        b.key_path = "/home/me/id_ed25519".into();
+        b.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----".into();
+        b.key_touched = true;
         b.passphrase = "ph".into();
         b.passphrase_touched = true; // ← 新增这一行,模拟用户真的输入过
         let draft = build_draft(&b).unwrap();
         match draft.auth.kind {
-            AuthKind::PublicKey {
-                path,
-                has_passphrase,
-            } => {
-                assert_eq!(path, PathBuf::from("/home/me/id_ed25519"));
-                assert!(has_passphrase);
-            }
+            AuthKind::PublicKey { has_passphrase } => assert!(has_passphrase),
             _ => panic!("应为 PublicKey"),
         }
         assert_eq!(
@@ -540,7 +652,6 @@ mod tests {
     fn pubkey_without_passphrase_has_no_secret() {
         let mut b = buf();
         b.auth_kind = AuthKindUi::PublicKey;
-        b.key_path = "/home/me/id_ed25519".into();
         let draft = build_draft(&b).unwrap();
         match draft.auth.kind {
             AuthKind::PublicKey { has_passphrase, .. } => assert!(!has_passphrase),
@@ -711,6 +822,93 @@ mod tests {
         assert_eq!(draft.network.proxy, None, "「跟随分组」= 不设置");
     }
 
+    /// 跳板三态 → `NetworkPrefs::jump` 的完整映射。三条必须**互不相同**:
+    /// 「无」写 `None` 会被分组的跳板拉回去走跳板,与用户所选相反;
+    /// 「继承分组」写 `Some(vec![])` 则永远继承不到分组的跳板。
+    #[test]
+    fn jump_mode_maps_onto_all_three_states_of_network_jump() {
+        let mk = |mode| {
+            build_draft(&EditorBuffer {
+                port: "22".into(),
+                jump_mode: mode,
+                jump_chain: vec![SessionId(2), SessionId(3)],
+                ..EditorBuffer::default()
+            })
+            .unwrap()
+            .network
+            .jump
+        };
+        assert_eq!(
+            mk(JumpModeUi::None),
+            Some(Vec::new()),
+            "「无」是显式覆盖成不走跳板,不是不设置"
+        );
+        assert_eq!(mk(JumpModeUi::Inherit), None, "「继承分组」= 不设置");
+        assert_eq!(
+            mk(JumpModeUi::Custom),
+            Some(vec![JumpRef(SessionId(2)), JumpRef(SessionId(3))]),
+            "「自定义」按拨号顺序原样写出"
+        );
+    }
+
+    /// 回填方向的三态。`Some(vec![])` 必须回成「无」而不是「自定义 + 空链」——
+    /// 后者在 UI 上是个说不清的中间态。
+    #[test]
+    fn from_record_restores_all_three_jump_modes() {
+        let mut rec = rec_with_jump(None);
+        assert_eq!(
+            EditorBuffer::from_record(&rec).jump_mode,
+            JumpModeUi::Inherit
+        );
+
+        rec.network.jump = Some(Vec::new());
+        assert_eq!(EditorBuffer::from_record(&rec).jump_mode, JumpModeUi::None);
+
+        rec.network.jump = Some(vec![JumpRef(SessionId(9))]);
+        let b = EditorBuffer::from_record(&rec);
+        assert_eq!(b.jump_mode, JumpModeUi::Custom);
+        assert_eq!(b.jump_chain, vec![SessionId(9)]);
+    }
+
+    /// 新建会话的默认是「无」(用户明确要求)。默认成「继承分组」会让新建的
+    /// 会话在有分组跳板时悄悄走跳板,而用户什么都没配。
+    #[test]
+    fn new_session_defaults_to_no_jump_host() {
+        assert_eq!(EditorBuffer::default().jump_mode, JumpModeUi::None);
+        assert_eq!(
+            build_draft(&EditorBuffer {
+                port: "22".into(),
+                ..EditorBuffer::default()
+            })
+            .unwrap()
+            .network
+            .jump,
+            Some(Vec::new())
+        );
+    }
+
+    /// 切到「无」/「继承」不清空已配的链:用户切回「自定义」应看到自己刚才
+    /// 配的那几跳,而不是从头再点一遍。
+    #[test]
+    fn switching_away_from_custom_keeps_the_chain_buffer() {
+        let mut b = EditorBuffer {
+            port: "22".into(),
+            jump_mode: JumpModeUi::Custom,
+            jump_chain: vec![SessionId(2)],
+            ..EditorBuffer::default()
+        };
+        b.jump_mode = JumpModeUi::None;
+        assert_eq!(build_draft(&b).unwrap().network.jump, Some(Vec::new()));
+        assert_eq!(b.jump_chain, vec![SessionId(2)], "缓冲不该被写回逻辑清掉");
+
+        b.jump_mode = JumpModeUi::Custom;
+        assert_eq!(
+            build_draft(&b).unwrap().network.jump,
+            Some(vec![JumpRef(SessionId(2))]),
+            "切回「自定义」应原样恢复"
+        );
+    }
+
     #[test]
     fn proxy_port_must_be_a_valid_number() {
         let buf = EditorBuffer {
@@ -757,6 +955,7 @@ mod tests {
             password: pw.map(String::from),
             passphrase: pp.map(String::from),
             proxy_password: proxy.map(String::from),
+            private_key: None,
         }
     }
 
@@ -773,6 +972,7 @@ mod tests {
             &SecretField::Keep,
             &SecretField::Keep,
             &SecretField::Keep,
+            &SecretField::Keep,
         );
         assert_eq!(got.unwrap().password.as_deref(), Some("old-pw"));
     }
@@ -783,6 +983,7 @@ mod tests {
         let got = merge_secret(
             Some(&existing),
             &SecretField::Set("new-pw".into()),
+            &SecretField::Keep,
             &SecretField::Keep,
             &SecretField::Keep,
         );
@@ -797,6 +998,7 @@ mod tests {
         let got = merge_secret(
             Some(&existing),
             &SecretField::Clear,
+            &SecretField::Keep,
             &SecretField::Keep,
             &SecretField::Keep,
         )
@@ -815,6 +1017,7 @@ mod tests {
             &SecretField::Clear,
             &SecretField::Clear,
             &SecretField::Clear,
+            &SecretField::Keep,
         );
         assert!(got.is_none(), "全清后不该留空壳 SecretEntry");
     }
@@ -824,6 +1027,7 @@ mod tests {
     fn keep_on_empty_existing_stays_none() {
         let got = merge_secret(
             None,
+            &SecretField::Keep,
             &SecretField::Keep,
             &SecretField::Keep,
             &SecretField::Keep,
@@ -838,6 +1042,7 @@ mod tests {
         let got = merge_secret(
             Some(&existing),
             &SecretField::Clear,
+            &SecretField::Keep,
             &SecretField::Keep,
             &SecretField::Keep,
         )
@@ -864,7 +1069,6 @@ mod tests {
     fn has_passphrase_follows_merged_secret_not_form() {
         let mut buf = buf();
         buf.auth_kind = AuthKindUi::PublicKey;
-        buf.key_path = "/k".into();
         // 用户没碰口令框 → 表单是空的
         let mut draft = build_draft(&buf).expect("build");
         assert!(
@@ -929,6 +1133,153 @@ mod tests {
             SecretField::Clear,
             "公钥模式下密码应清除"
         );
+    }
+
+    /// 密码认证的会话不该在侧车里留一把用不到的私钥(与口令同理)。
+    #[test]
+    fn switching_to_password_auth_clears_the_stored_private_key() {
+        let mut b = buf();
+        b.auth_kind = AuthKindUi::Password;
+        assert_eq!(
+            secret_fields(&b).3,
+            SecretField::Clear,
+            "密码模式下私钥应清除"
+        );
+    }
+
+    /// 公钥模式没导入过 → `Keep`,不能变成 `Clear`:编辑一条已有公钥会话
+    /// 只改个备注就保存,库里那把钥匙必须还在(F73 同一条红线)。
+    #[test]
+    fn editing_a_pubkey_session_without_reimporting_keeps_the_stored_key() {
+        let mut b = buf();
+        b.auth_kind = AuthKindUi::PublicKey;
+        assert_eq!(
+            secret_fields(&b).3,
+            SecretField::Keep,
+            "没重新导入就该原样保留已存私钥"
+        );
+
+        b.key_touched = true;
+        b.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----".into();
+        assert_eq!(
+            secret_fields(&b).3,
+            SecretField::Set("-----BEGIN OPENSSH PRIVATE KEY-----".into())
+        );
+
+        b.key_data.clear();
+        assert_eq!(secret_fields(&b).3, SecretField::Clear, "清除后应为 Clear");
+    }
+
+    /// 导入正常私钥:正文进缓冲、触碰位置起、给一行带文件名的提示。
+    #[test]
+    fn importing_a_private_key_stores_the_body_not_the_path() {
+        let mut b = buf();
+        import_key_file(&mut b, Path::new("/home/u/.ssh/id_ed25519"), |_| {
+            Ok("-----BEGIN OPENSSH PRIVATE KEY-----\nBODY\n".to_string())
+        });
+        assert_eq!(b.key_data, "-----BEGIN OPENSSH PRIVATE KEY-----\nBODY\n");
+        assert!(b.key_touched);
+        let note = b.key_note.expect("应给一行提示");
+        assert!(
+            note.contains("id_ed25519"),
+            "提示要点名导入了哪个文件: {note}"
+        );
+    }
+
+    /// 选成了 `.pub` 公钥 —— 最常见的一种误操作。必须当场拒收:存进去的话
+    /// 用户要等到下次连接才会看到一条「解析私钥失败」,而且不知道错在哪。
+    #[test]
+    fn importing_a_public_key_is_rejected_and_leaves_the_buffer_untouched() {
+        let mut b = buf();
+        import_key_file(&mut b, Path::new("/home/u/.ssh/id_ed25519.pub"), |_| {
+            Ok("ssh-ed25519 AAAAC3Nza... u@h\n".to_string())
+        });
+        assert_eq!(b.key_data, "", "公钥不该被存进私钥缓冲");
+        assert!(
+            !b.key_touched,
+            "被拒的导入不该置触碰位 —— 否则保存时会当成「清除」"
+        );
+        assert!(b.key_note.is_some(), "要告诉用户为什么没导进去");
+    }
+
+    /// 文件读不了(权限/被删)→ 只给提示,不动缓冲。
+    #[test]
+    fn an_unreadable_key_file_leaves_the_buffer_untouched() {
+        let mut b = buf();
+        b.key_data = "已有内容".into();
+        import_key_file(&mut b, Path::new("/no/such/key"), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "没有这个文件",
+            ))
+        });
+        assert_eq!(b.key_data, "已有内容", "读失败不该清掉已导入的内容");
+        assert!(!b.key_touched);
+        assert!(b.key_note.is_some());
+    }
+
+    /// 「清除」按钮:置空 + 触碰位,保存时才会真的把侧车里那把钥匙删掉。
+    #[test]
+    fn clearing_the_key_marks_it_touched_so_save_actually_removes_it() {
+        let mut b = buf();
+        b.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----".into();
+        b.key_touched = true;
+        clear_key(&mut b);
+        assert_eq!(b.key_data, "");
+        assert!(b.key_touched, "不置触碰位的话保存时会走 Keep,钥匙删不掉");
+        b.auth_kind = AuthKindUi::PublicKey;
+        assert_eq!(secret_fields(&b).3, SecretField::Clear);
+    }
+
+    /// 私钥槽位与其余三个互不干扰。四个同类型参数并排,写反一个就串味 ——
+    /// 这是 F73 参数错位红线在第四个槽位上的延伸。
+    #[test]
+    fn private_key_slot_is_independent_of_the_other_three() {
+        let existing = SecretEntry {
+            password: Some("pw".into()),
+            passphrase: Some("ph".into()),
+            proxy_password: Some("proxy".into()),
+            private_key: Some("old-key".into()),
+        };
+        let got = merge_secret(
+            Some(&existing),
+            &SecretField::Keep,
+            &SecretField::Keep,
+            &SecretField::Keep,
+            &SecretField::Set("new-key".into()),
+        )
+        .unwrap();
+        assert_eq!(got.private_key.as_deref(), Some("new-key"));
+        assert_eq!(got.password.as_deref(), Some("pw"));
+        assert_eq!(got.passphrase.as_deref(), Some("ph"));
+        assert_eq!(got.proxy_password.as_deref(), Some("proxy"));
+    }
+
+    /// 只剩一把私钥时整条 `SecretEntry` 不能塌成 `None` —— 塌了就等于保存
+    /// 时把刚导入的钥匙丢了(无口令的公钥会话正是这种形状)。
+    #[test]
+    fn a_lone_private_key_does_not_collapse_to_none() {
+        let got = merge_secret(
+            None,
+            &SecretField::Clear,
+            &SecretField::Clear,
+            &SecretField::Clear,
+            &SecretField::Set("key".into()),
+        );
+        assert_eq!(
+            got.and_then(|s| s.private_key),
+            Some("key".to_string()),
+            "只有私钥的 secret 也必须保留"
+        );
+    }
+
+    /// 私钥正文是明文凭据,`{:?}` 一打就写进日志。与 password 同一条红线。
+    #[test]
+    fn editor_buffer_debug_never_leaks_the_key_body() {
+        let mut b = buf();
+        b.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETBODY\n".into();
+        let s = format!("{b:?}");
+        assert!(!s.contains("SECRETBODY"), "Debug 泄漏了私钥正文: {s}");
     }
 
     /// `.0` 那条只覆盖了 password;`.1`/`.2` 目前共用同一个 `field()`,

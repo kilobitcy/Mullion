@@ -70,7 +70,7 @@ impl std::fmt::Debug for Hop {
                 .field("host", host)
                 .field("port", port)
                 .field("user", user)
-                .field("auth", &DebugAuth(auth))
+                .field("auth", auth)
                 .finish(),
         }
     }
@@ -81,23 +81,6 @@ fn redacted(present: bool) -> &'static str {
         "<已设置>"
     } else {
         "<无>"
-    }
-}
-
-/// `AuthMethod` 自身 derive 了 Debug(会打印口令),所以这里包一层只输出安全摘要。
-struct DebugAuth<'a>(&'a AuthMethod);
-
-impl std::fmt::Debug for DebugAuth<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            AuthMethod::Password(_) => write!(f, "Password(<已设置>)"),
-            AuthMethod::PublicKey { path, passphrase } => write!(
-                f,
-                "PublicKey {{ path: {path:?}, passphrase: {} }}",
-                redacted(passphrase.is_some())
-            ),
-            AuthMethod::Agent => write!(f, "Agent"),
-        }
     }
 }
 
@@ -144,21 +127,23 @@ mod tests {
         assert!(s.contains("bastion"), "主机名保留以便排障: {s}");
     }
 
-    /// 私钥 passphrase 同样敏感。
+    /// 私钥内容与 passphrase 同样敏感 —— v5 起 `AuthMethod` 携带的是私钥
+    /// **正文**而不是路径,一旦被 `{:?}` 打进日志就是裸钥匙落盘。
     #[test]
-    fn debug_never_leaks_key_passphrase() {
+    fn debug_never_leaks_key_material_or_passphrase() {
         let h = Hop::SshJump {
             host: "bastion".into(),
             port: 22,
             user: "ops".into(),
             auth: AuthMethod::PublicKey {
-                path: "/home/u/.ssh/id_ed25519".into(),
+                key_data: "-----BEGIN OPENSSH PRIVATE KEY-----\nKEYBODY\n".into(),
                 passphrase: Some("keypw".into()),
             },
         };
         let s = format!("{h:?}");
         assert!(!s.contains("keypw"), "私钥口令不能泄漏: {s}");
-        assert!(s.contains("id_ed25519"), "私钥路径非敏感,保留以便排障: {s}");
+        assert!(!s.contains("KEYBODY"), "私钥正文不能泄漏: {s}");
+        assert!(s.contains("bastion"), "主机名保留以便排障: {s}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use egui::Ui;
 use crate::theme::{self, Theme};
 use crate::ui::session_manager::SecretPresence;
 use crate::ui::UiState;
-use mullion_store::GroupRecord;
+use mullion_store::{GroupRecord, SessionRecord};
 
 /// 四个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
 const TABS: [&str; 4] = ["连接", "认证", "高级", "登录后"];
@@ -45,11 +45,14 @@ fn tip(d: &Disabled) -> Option<String> {
     }
 }
 
+/// `sessions` 只被「连接」页的跳板链编辑器用到:自定义跳板是**对另一条会话的
+/// 引用**(设计 D2),要列出候选、要把 id 显示成人看得懂的名字。
 pub(super) fn show(
     ui: &mut Ui,
     t: &Theme,
     ui_state: &mut UiState,
     groups: &[GroupRecord],
+    sessions: &[SessionRecord],
     presence: SecretPresence,
 ) {
     // F93:候选只在编辑器打开后、且还没扫过时扫一次,不依赖是否选中了
@@ -171,7 +174,7 @@ pub(super) fn show(
     }
 
     // 复核修正 1:认证方式一旦不是公钥,先前那条讲私钥的拖拽提示就清空——
-    // 它挂在一个已经没有 key_path 字段的表单上,用户看不懂在说什么。
+    // 它挂在一个已经没有私钥字段的表单上,用户看不懂在说什么。
     //
     // 判据**只看 `auth_kind`,不看 `editor_tab`**:切 Tab 只改变「这一帧
     // 看不看得见」,提示本身依旧有意义,与同文件 `last_error`/F92 拨测结果
@@ -181,7 +184,7 @@ pub(super) fn show(
     // 单独判、不与 Tab 判据混在一起。
     //
     // 复核者还提到「拖目录被拒后,用户手动在路径框改对了,提示仍挂着」——
-    // 这里刻意不修:要检测「手动改对了」得监听 `key_path` 变化,那是
+    // 这里刻意不修:要检测「手动改对了」得监听私钥缓冲的变化,那是
     // `expire_verdict_if_form_changed` 那套的活(拨测结论与表单强绑定,
     // 必须联动);这条提示只是一次性通知,少点一次 × 换不来监听变化的代价。
     if buf.auth_kind != super::AuthKindUi::PublicKey {
@@ -198,7 +201,7 @@ pub(super) fn show(
     // `buf`(借的是 `ui_state.editor`)存活期间,Rust 允许读写
     // `ui_state` 的其他字段(下面 `ui_state.editor_tab` 的既有代码就是
     // 活证据),所以能同时读 `ui_state.editor_tab`、写
-    // `ui_state.key_drop_note`、通过 `buf.key_path`/`buf.auth_kind` 读写。
+    // `ui_state.key_drop_note`、通过 `buf.key_data`/`buf.auth_kind` 读写。
     if ui_state.editor_tab == super::TAB_AUTH && buf.auth_kind == super::AuthKindUi::PublicKey {
         let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         if hovering {
@@ -237,8 +240,16 @@ pub(super) fn show(
                 ui_state.key_drop_note = Some(note);
             }
             KeyDrop::Accepted { path, note } => {
-                buf.key_path = path;
-                ui_state.key_drop_note = note;
+                // v5:拖进来的文件当场读成正文存进缓冲,路径不留。
+                super::import_key_file(buf, std::path::Path::new(&path), |p| {
+                    std::fs::read_to_string(p)
+                });
+                // 导入自己的提示(「已导入 x」/「不像私钥」)优先;
+                // `note` 只在「拖了多个、只取第一个」时才有内容,补在后面。
+                ui_state.key_drop_note = match (buf.key_note.take(), note) {
+                    (Some(a), Some(b)) => Some(format!("{a};{b}")),
+                    (a, b) => a.or(b),
+                };
             }
         }
     }
@@ -373,7 +384,9 @@ pub(super) fn show(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| match ui_state.editor_tab {
-            super::TAB_CONNECT => super::fields::basic(ui, t, buf, groups),
+            super::TAB_CONNECT => {
+                super::fields::basic(ui, t, buf, groups, sessions, ui_state.editor_id)
+            }
             super::TAB_AUTH => super::fields::auth(ui, t, buf, presence, &ui_state.key_candidates),
             super::TAB_AUTOMATION => super::fields::automation(ui, t, buf),
             super::TAB_ADVANCED => super::fields::network(ui, t, buf, presence),
@@ -958,7 +971,7 @@ mod tests {
     }
 
     /// 第一个是目录 → 拒绝,且**不写路径**(调用方不该在 `Rejected` 分支
-    /// 里碰 `buf.key_path`)。
+    /// 里碰 `buf.key_data`)。
     ///
     /// 自证变红方式:把 `if is_dir(first) { return KeyDrop::Rejected(..) }`
     /// 这一整段判断删掉——目录会被当成普通文件接受,断言
@@ -1003,7 +1016,7 @@ mod tests {
     /// 本身零测试覆盖——前面所有 `decide_key_drop_*` 测试都直接调纯函数,
     /// 根本不经过这个 `if`,删掉整个门控块也不会让它们变红。这里灌一份真实
     /// `RawInput`(带 `dropped_files`)跑一整帧 `show()`,把断言钉在
-    /// `buf.key_path` 上,注入点就是这个门控 `if` 本身。
+    /// `buf.key_data` 上,注入点就是这个门控 `if` 本身。
     ///
     /// `ui::mod.rs` 里的 `run_frame`/`UiFrame` 是那个文件 `tests` 模块的私有
     /// 项,跨模块用不了(`editor::tests` 是 `editor` 的子模块,够不着
@@ -1026,26 +1039,32 @@ mod tests {
                     &crate::theme::MULLION_DARK,
                     ui_state,
                     &[],
+                    &[],
                     super::SecretPresence::default(),
                 );
             });
         });
     }
 
-    /// 认证 Tab + 公钥模式 → 拖进的文件路径必须被填进 `buf.key_path`。这条
+    /// 拖放测试共用的假私钥。必须带 `PRIVATE KEY` 标记 —— `import_key_file`
+    /// 会把不带标记的文件当成误选的 `.pub` 公钥拒收。
+    const PEM: &str =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nBODY\n-----END OPENSSH PRIVATE KEY-----\n";
+
+    /// 认证 Tab + 公钥模式 → 拖进的文件**正文**必须被读进 `buf.key_data`。这条
     /// 是「双向断言」里正的一半——只有它在,才能防止有人把整个门控块删光
     /// 后仍然全绿(下面两条「原样不变」的断言,门控块删光后照样通过)。
     ///
     /// 自证会变红方式:把 `show()` 里整个门控 `if ui_state.editor_tab ==
     /// super::TAB_AUTH && buf.auth_kind == super::AuthKindUi::PublicKey { .. }`
-    /// 删掉(或者把条件强改成 `false`),`decide_key_drop`/`buf.key_path = path`
-    /// 都不会再执行,`buf.key_path` 仍是初始的空字符串,断言报
+    /// 删掉(或者把条件强改成 `false`),`decide_key_drop`/`import_key_file`
+    /// 都不会再执行,`buf.key_data` 仍是初始的空字符串,断言报
     /// `left: "" right: ".../id_ed25519"`(方向:实际空、期望非空)。
     #[test]
-    fn dropping_a_key_file_in_auth_tab_public_key_mode_fills_key_path() {
+    fn dropping_a_key_file_in_auth_tab_public_key_mode_imports_the_key_body() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let key_path = dir.path().join("id_ed25519");
-        std::fs::write(&key_path, b"fake private key").expect("写测试私钥文件");
+        std::fs::write(&key_path, PEM).expect("写测试私钥文件");
 
         let mut st = UiState {
             editor_tab: TAB_AUTH,
@@ -1059,27 +1078,27 @@ mod tests {
         run_show_with_drop(&mut st, &key_path);
 
         assert_eq!(
-            st.editor.expect("编辑器不该被清空").key_path,
-            key_path.display().to_string(),
-            "认证 Tab + 公钥模式下拖入文件应该填进 key_path"
+            st.editor.expect("编辑器不该被清空").key_data,
+            PEM,
+            "认证 Tab + 公钥模式下拖入文件应该把**正文**读进 key_data"
         );
     }
 
-    /// 认证 Tab、但密码模式 → 门控必须整块不执行,`key_path` 原样不变。
+    /// 认证 Tab、但密码模式 → 门控必须整块不执行,`key_data` 原样不变。
     /// 这是门控 `&& buf.auth_kind == AuthKindUi::PublicKey` 那半条判据的
     /// 真实注入点:如果这半条被删掉或改错,密码模式下拖文件也会被静默
     /// 接受,写进一个用户在密码模式下根本看不到的字段。
     ///
     /// 自证会变红方式:把门控 `if` 里 `&& buf.auth_kind ==
     /// super::AuthKindUi::PublicKey` 这半句删掉,只留 `ui_state.editor_tab
-    /// == super::TAB_AUTH`——密码模式下拖入的文件会被接受,`key_path` 从
-    /// 空字符串变成真实路径,`assert_eq!(.., "")` 失败,报
+    /// == super::TAB_AUTH`——密码模式下拖入的文件会被接受,`key_data` 从
+    /// 空字符串变成私钥正文,`assert_eq!(.., "")` 失败,报
     /// `left: "" right: ".../id_ed25519"` 的方向反过来(实际非空)。
     #[test]
-    fn dropping_a_key_file_in_password_mode_leaves_key_path_untouched() {
+    fn dropping_a_key_file_in_password_mode_leaves_key_data_untouched() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let key_path = dir.path().join("id_ed25519");
-        std::fs::write(&key_path, b"fake private key").expect("写测试私钥文件");
+        std::fs::write(&key_path, PEM).expect("写测试私钥文件");
 
         let mut st = UiState {
             editor_tab: TAB_AUTH,
@@ -1093,25 +1112,25 @@ mod tests {
         run_show_with_drop(&mut st, &key_path);
 
         assert_eq!(
-            st.editor.expect("编辑器不该被清空").key_path,
+            st.editor.expect("编辑器不该被清空").key_data,
             "",
-            "密码模式下拖文件必须被静默忽略,key_path 不该被写"
+            "密码模式下拖文件必须被静默忽略,key_data 不该被写"
         );
     }
 
     /// 公钥模式、但不在认证 Tab(比如「连接」Tab)→ 门控同样必须整块不
-    /// 执行,`key_path` 原样不变。这是门控 `ui_state.editor_tab ==
+    /// 执行,`key_data` 原样不变。这是门控 `ui_state.editor_tab ==
     /// super::TAB_AUTH` 那半条判据的真实注入点。
     ///
     /// 自证会变红方式:把门控 `if` 里 `ui_state.editor_tab ==
     /// super::TAB_AUTH &&` 这半句删掉,只留 `buf.auth_kind ==
     /// super::AuthKindUi::PublicKey`——「连接」Tab 下拖入的文件也会被接受,
-    /// `key_path` 从空字符串变成真实路径,断言失败。
+    /// `key_data` 从空字符串变成私钥正文,断言失败。
     #[test]
-    fn dropping_a_key_file_outside_auth_tab_leaves_key_path_untouched() {
+    fn dropping_a_key_file_outside_auth_tab_leaves_key_data_untouched() {
         let dir = tempfile::tempdir().expect("建临时目录");
         let key_path = dir.path().join("id_ed25519");
-        std::fs::write(&key_path, b"fake private key").expect("写测试私钥文件");
+        std::fs::write(&key_path, PEM).expect("写测试私钥文件");
 
         let mut st = UiState {
             editor_tab: TAB_CONNECT,
@@ -1125,9 +1144,41 @@ mod tests {
         run_show_with_drop(&mut st, &key_path);
 
         assert_eq!(
-            st.editor.expect("编辑器不该被清空").key_path,
+            st.editor.expect("编辑器不该被清空").key_data,
             "",
-            "不在认证 Tab 时拖文件必须被静默忽略,key_path 不该被写"
+            "不在认证 Tab 时拖文件必须被静默忽略,key_data 不该被写"
+        );
+    }
+
+    /// 拖进来的是 `.pub` 公钥 —— 必须当场拒收并解释,而不是存进去等到连接
+    /// 时才报一句「解析私钥失败」。这条同时钉住「有提示」:静默丢弃的话,
+    /// 用户会以为导入成功了。
+    #[test]
+    fn dropping_a_public_key_is_rejected_with_an_explanation() {
+        let dir = tempfile::tempdir().expect("建临时目录");
+        let pub_path = dir.path().join("id_ed25519.pub");
+        std::fs::write(&pub_path, b"ssh-ed25519 AAAAC3Nza... u@h\n").expect("写测试公钥文件");
+
+        let mut st = UiState {
+            editor_tab: TAB_AUTH,
+            editor: Some(EditorBuffer {
+                auth_kind: AuthKindUi::PublicKey,
+                ..EditorBuffer::default()
+            }),
+            ..Default::default()
+        };
+
+        run_show_with_drop(&mut st, &pub_path);
+
+        assert_eq!(
+            st.editor.expect("编辑器不该被清空").key_data,
+            "",
+            "公钥不该被当成私钥收下"
+        );
+        let note = st.key_drop_note.expect("被拒时必须给用户一行解释");
+        assert!(
+            note.contains("id_ed25519.pub"),
+            "提示要点名是哪个文件: {note}"
         );
     }
 }

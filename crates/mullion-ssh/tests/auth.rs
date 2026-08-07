@@ -48,7 +48,8 @@ async fn pubkey_auth_succeeds() {
     let c = cfg(
         addr,
         AuthMethod::PublicKey {
-            path: "tests/fixtures/client_key".into(),
+            // v5 起 `AuthMethod` 收私钥**正文**,读文件是调用方的事。
+            key_data: std::fs::read_to_string("tests/fixtures/client_key").unwrap(),
             passphrase: None,
         },
     );

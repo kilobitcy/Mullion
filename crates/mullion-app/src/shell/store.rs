@@ -136,6 +136,7 @@ impl SessionStore {
                 password: s.password.is_some(),
                 passphrase: s.passphrase.is_some(),
                 proxy_password: s.proxy_password.is_some(),
+                private_key: s.private_key.is_some(),
             },
         }
     }
@@ -235,6 +236,7 @@ mod tests {
                 password: Some("pw".into()),
                 passphrase: None,
                 proxy_password: None,
+                private_key: None,
             }),
         }
     }

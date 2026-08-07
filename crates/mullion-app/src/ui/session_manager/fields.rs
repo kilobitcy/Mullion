@@ -2,10 +2,12 @@
 //! 混在窗口骨架里会让 `editor.rs` 涨到读不动。
 
 use egui::Ui;
-use mullion_store::{GroupRecord, Protocol, TmuxChoice};
+use mullion_store::{GroupRecord, Protocol, SessionId, SessionRecord, TmuxChoice};
 
 use crate::theme::Theme;
-use crate::ui::session_manager::{AuthKindUi, EditorBuffer, ProxyModeUi, SecretPresence};
+use crate::ui::session_manager::{
+    AuthKindUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
+};
 
 /// 两列表单的统一样式:左列标签定宽,右列输入撑满。
 fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
@@ -117,7 +119,14 @@ const DELAY_WARNING: &str = "配了延时的命令会拆成多步发送。第二
 const ENV_WARNING: &str = "环境变量不是存密码的地方 —— 值以明文存进 sessions.toml,\
 并会以 export 行发到远端,落进 shell 历史与 /proc/<pid>/environ。要存密码请用凭据。";
 
-pub(super) fn basic(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups: &[GroupRecord]) {
+pub(super) fn basic(
+    ui: &mut Ui,
+    t: &Theme,
+    buf: &mut EditorBuffer,
+    groups: &[GroupRecord],
+    sessions: &[SessionRecord],
+    editing: Option<SessionId>,
+) {
     section(ui, t, "基本");
     grid(ui, "sm_basic", |ui| {
         required(ui, t, "名称");
@@ -171,6 +180,161 @@ pub(super) fn basic(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups: &[Gr
         );
         ui.end_row();
     });
+
+    jump(ui, t, buf, groups, sessions, editing);
+}
+
+/// F5 跳板链。放在**「连接」页**而不是「高级」页:跳板回答的是「怎么走到这台
+/// 机器」,和主机/端口是同一个决策,配完主机紧接着就要配它;埋进「高级」里
+/// 用户根本找不到。
+///
+/// 三态与 `NetworkPrefs::jump` 一一对应,见 `JumpModeUi` 的说明。
+fn jump(
+    ui: &mut Ui,
+    t: &Theme,
+    buf: &mut EditorBuffer,
+    groups: &[GroupRecord],
+    sessions: &[SessionRecord],
+    editing: Option<SessionId>,
+) {
+    section(ui, t, "跳板");
+    grid(ui, "sm_basic_jump", |ui| {
+        ui.label("跳板");
+        ui.horizontal(|ui| {
+            // 与「认证方式」同样的选中态处理:egui 默认的 gamma_multiply 底色
+            // 在深色面板上偏暗,分不出选中态。见 `auth()` 里那段注释。
+            let vis = &mut ui.visuals_mut().selection;
+            vis.bg_fill = crate::theme::c32(t.accent).linear_multiply(0.35);
+            ui.selectable_value(&mut buf.jump_mode, JumpModeUi::None, "无");
+            ui.selectable_value(&mut buf.jump_mode, JumpModeUi::Inherit, "继承分组");
+            ui.selectable_value(&mut buf.jump_mode, JumpModeUi::Custom, "自定义");
+        });
+        ui.end_row();
+
+        match buf.jump_mode {
+            // 「无」是默认态,不需要任何解释性文字。
+            JumpModeUi::None => {}
+            JumpModeUi::Inherit => {
+                ui.label("");
+                ui.colored_label(
+                    crate::theme::c32(t.fg_dimmer),
+                    inherit_hint(buf.preserved_group_id, groups),
+                );
+                ui.end_row();
+            }
+            JumpModeUi::Custom => {
+                ui.label("跳板链");
+                ui.vertical(|ui| chain_editor(ui, t, buf, sessions, editing));
+                ui.end_row();
+            }
+        }
+    });
+}
+
+/// 「继承分组」下的说明文字。分组是**单层**的(设计 D1),所以上游只有一级,
+/// 这里能把继承结果算准,不必含糊地说「跟随上游」。
+fn inherit_hint(group_id: Option<mullion_store::GroupId>, groups: &[GroupRecord]) -> String {
+    let Some(g) = group_id.and_then(|gid| groups.iter().find(|g| g.id == gid)) else {
+        return "当前未分组,没有上游可继承 —— 实际等同于「无」。".to_string();
+    };
+    match &g.network.jump {
+        Some(chain) if !chain.is_empty() => format!("跟随分组「{}」:{} 跳。", g.name, chain.len()),
+        // 分组自己也没配(`None` 或显式空链)→ 继承下来还是不走跳板。
+        _ => format!("分组「{}」未配跳板 —— 实际等同于「无」。", g.name),
+    }
+}
+
+/// 自定义跳板链的逐跳编辑。按拨号顺序,`[0]` 最先连。
+fn chain_editor(
+    ui: &mut Ui,
+    t: &Theme,
+    buf: &mut EditorBuffer,
+    sessions: &[SessionRecord],
+    editing: Option<SessionId>,
+) {
+    // 本帧的结构变更先记下来,循环结束后统一施加 —— 循环里正持着
+    // `buf.jump_chain` 的不可变借用。
+    let mut remove: Option<usize> = None;
+    let mut swap: Option<(usize, usize)> = None;
+    let mut add: Option<SessionId> = None;
+
+    let len = buf.jump_chain.len();
+    for (i, id) in buf.jump_chain.iter().enumerate() {
+        // salt 用 `(位置, 会话 id)`:上移/下移会让同一个 id 换位置,salt 跟着变,
+        // egui 的按钮状态不会留在原位对上另一跳(同「登录后」页命令列表那个坑)。
+        ui.push_id((i, id.0), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}.", i + 1));
+                match sessions.iter().find(|s| s.id == *id) {
+                    Some(s) => {
+                        ui.label(&s.identity.name);
+                        ui.colored_label(
+                            crate::theme::c32(t.fg_dimmer),
+                            format!("{}@{}", s.auth.user, s.connection.host),
+                        );
+                    }
+                    // 悬空引用不能悄悄不显示:拨号时 `expand_jump_chain` 会
+                    // **硬失败**(设计 §6),用户得先看见是哪一跳没了。
+                    None => {
+                        ui.colored_label(
+                            crate::theme::c32(t.danger),
+                            format!("#{} 会话已删除", id.0),
+                        );
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✕").clicked() {
+                        remove = Some(i);
+                    }
+                    if ui
+                        .add_enabled(i + 1 < len, egui::Button::new("↓"))
+                        .clicked()
+                    {
+                        swap = Some((i, i + 1));
+                    }
+                    if ui.add_enabled(i > 0, egui::Button::new("↑")).clicked() {
+                        swap = Some((i - 1, i));
+                    }
+                });
+            });
+        });
+    }
+
+    if buf.jump_chain.is_empty() {
+        ui.colored_label(
+            crate::theme::c32(t.fg_dimmer),
+            "还没加跳板 —— 保存后等同于「无」。",
+        );
+    }
+
+    // 候选里剔掉**自己**和已在链里的:前者会被 `expand_chain` 判成成环而硬失败,
+    // 后者会被去重成空操作,点了没反应比灰掉更让人困惑。
+    egui::ComboBox::from_id_salt("sm_jump_add")
+        .selected_text("+ 添加跳板")
+        .show_ui(ui, |ui| {
+            for s in sessions
+                .iter()
+                .filter(|s| Some(s.id) != editing && !buf.jump_chain.contains(&s.id))
+            {
+                let label = format!(
+                    "{} ({}@{})",
+                    s.identity.name, s.auth.user, s.connection.host
+                );
+                if ui.selectable_label(false, label).clicked() {
+                    add = Some(s.id);
+                }
+            }
+        });
+
+    if let Some((a, b)) = swap {
+        buf.jump_chain.swap(a, b);
+    }
+    if let Some(i) = remove {
+        buf.jump_chain.remove(i);
+    }
+    if let Some(id) = add {
+        buf.jump_chain.push(id);
+    }
 }
 
 pub(super) fn auth(
@@ -218,26 +382,44 @@ pub(super) fn auth(
         AuthKindUi::PublicKey => {
             ui.label("私钥");
             ui.horizontal(|ui| {
-                // 三段 [输入框][候选▾][浏览…] 要在一行内伸缩,且不能引入
+                // 三段 [状态文本][候选▾][导入…] 要在一行内伸缩,且不能引入
                 // 硬编码的整行宽度(项目里没有 FIELD_W 这类常量)。用
                 // right_to_left 布局:先摆两个按钮(它们的宽度由自身内容
                 // 决定),摆完之后 `ui.available_width()` 就是右栏拖宽/
-                // 缩窄后剩下的真实空间,喂给输入框——这样输入框自然吃满
-                // 剩余宽度,不用猜一个像素数。
+                // 缩窄后剩下的真实空间,留给状态文本。
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 「浏览…」原样保留:它已经接好原生文件对话框(另起线程
-                    // 开 rfd,见 app.rs::spawn_key_picker),本任务只在它左边
-                    // 插入候选下拉,不改这一按钮的行为。
-                    if ui.button("浏览…").clicked() {
+                    // v5 起路径不再进表单,这个按钮的语义从「选一个路径」变成
+                    // 「把这个文件的内容读进来存库」。接线仍是老那套(另起线程
+                    // 开 rfd,见 app.rs::spawn_key_picker),只是回调改成读正文。
+                    if ui.button("导入…").clicked() {
                         buf.pick_key_clicked = true;
                     }
 
-                    key_candidate_combo(ui, key_candidates, &mut buf.key_path);
+                    if let Some(p) = key_candidate_combo(ui, key_candidates).1 {
+                        super::import_key_file(buf, &p, |p| std::fs::read_to_string(p));
+                    }
 
-                    ui.add(
-                        egui::TextEdit::singleline(&mut buf.key_path)
-                            .desired_width(ui.available_width()),
-                    );
+                    // 已有钥匙时给个「清除」——否则用户没有任何办法把一把
+                    // 存错的钥匙从库里弄掉(改认证方式再改回来也不会清)。
+                    let has_key =
+                        presence.private_key || (buf.key_touched && !buf.key_data.is_empty());
+                    if has_key && ui.button("清除").clicked() {
+                        super::clear_key(buf);
+                    }
+
+                    // 只报状态,不显示正文也不显示路径。「未设置」标红:v4→v5
+                    // 迁移读不到旧文件的会话就是这个样子,不标红用户只会在
+                    // 连接失败时才发现。
+                    let (text, color) = if buf.key_touched && !buf.key_data.is_empty() {
+                        ("已导入(未保存)", t.fg)
+                    } else if buf.key_touched {
+                        ("已清除(未保存)", t.danger)
+                    } else if presence.private_key {
+                        ("已导入", t.fg)
+                    } else {
+                        ("未设置 —— 请导入私钥文件", t.danger)
+                    };
+                    ui.colored_label(crate::theme::c32(color), text);
                 });
             });
             ui.end_row();
@@ -261,40 +443,45 @@ pub(super) fn auth(
 /// 真实生产代码上 —— 原先测试自己复制一份同构的 ComboBox 去断言,`auth()` 里
 /// 的接线(`has_cand` 算反、`on_disabled_hover_text` 挂错 response、漏掉
 /// `add_enabled_ui` 包装)坏掉时测试不会变红,等于没有保护。
+///
+/// 返回 `(Response, 本帧被点中的候选)`。**不自己读文件**:导入是调用方的事,
+/// 这样这个函数仍是零 IO 的,守护测试不用去铺一棵假的 `~/.ssh`。
 pub(super) fn key_candidate_combo(
     ui: &mut Ui,
     key_candidates: &[std::path::PathBuf],
-    key_path: &mut String,
-) -> egui::Response {
+) -> (egui::Response, Option<std::path::PathBuf>) {
     // 候选下拉。为空时禁用并说明原因——一个点了没反应的
     // 按钮比一个明说「没找到」的灰按钮更让人困惑。
+    let mut picked = None;
     let has_cand = !key_candidates.is_empty();
-    ui.add_enabled_ui(has_cand, |ui| {
-        egui::ComboBox::from_id_salt("key_candidates")
-            // 默认 combo_width(100.0)是给正常下拉配的,对一个只画内置箭头图标
-            // 的按钮太宽;28.0 把 combo_width 下限降下来,让按钮不占多余空间——
-            // 实际宽度取 `文字+图标间距+图标` 与 `width-2*padding` 的较大者
-            // (egui-0.30.0 combo_box.rs:353,366),不是「固定尺寸」。
-            .width(28.0)
-            // 留空,不要填 "▾":ComboBox 按钮无条件会画一个内置向下三角图标
-            // (combo_box.rs:373-383,`paint_default_icon`),跟 selected_text
-            // 的文字是两处独立绘制、互不排斥。填 "▾" 会变成「文字 ▾ + 内置
-            // 三角」两个箭头叠在一起,看起来像画重了。
-            .selected_text("")
-            .show_ui(ui, |ui| {
-                for p in key_candidates {
-                    let label = p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| p.display().to_string());
-                    if ui.selectable_label(false, label).clicked() {
-                        *key_path = p.display().to_string();
+    let resp = ui
+        .add_enabled_ui(has_cand, |ui| {
+            egui::ComboBox::from_id_salt("key_candidates")
+                // 默认 combo_width(100.0)是给正常下拉配的,对一个只画内置箭头图标
+                // 的按钮太宽;28.0 把 combo_width 下限降下来,让按钮不占多余空间——
+                // 实际宽度取 `文字+图标间距+图标` 与 `width-2*padding` 的较大者
+                // (egui-0.30.0 combo_box.rs:353,366),不是「固定尺寸」。
+                .width(28.0)
+                // 留空,不要填 "▾":ComboBox 按钮无条件会画一个内置向下三角图标
+                // (combo_box.rs:373-383,`paint_default_icon`),跟 selected_text
+                // 的文字是两处独立绘制、互不排斥。填 "▾" 会变成「文字 ▾ + 内置
+                // 三角」两个箭头叠在一起,看起来像画重了。
+                .selected_text("")
+                .show_ui(ui, |ui| {
+                    for p in key_candidates {
+                        let label = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string());
+                        if ui.selectable_label(false, label).clicked() {
+                            picked = Some(p.clone());
+                        }
                     }
-                }
-            });
-    })
-    .response
-    .on_disabled_hover_text("未在 ~/.ssh 找到私钥")
+                });
+        })
+        .response
+        .on_disabled_hover_text("未在 ~/.ssh 找到私钥");
+    (resp, picked)
 }
 
 pub(super) fn network(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, presence: SecretPresence) {
@@ -338,21 +525,6 @@ pub(super) fn network(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, presence: 
             );
             ui.end_row();
         }
-    });
-
-    section(ui, t, "跳板");
-    grid(ui, "sm_net_jump", |ui| {
-        ui.label("跳板链");
-        ui.vertical(|ui| {
-            ui.checkbox(&mut buf.jump_set, "启用跳板");
-            if buf.jump_set {
-                ui.colored_label(
-                    crate::theme::c32(t.fg_dimmer),
-                    format!("已配置 {} 跳(在分组管理里编辑)", buf.jump_chain.len()),
-                );
-            }
-        });
-        ui.end_row();
     });
 }
 
@@ -690,8 +862,9 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
 
 #[cfg(test)]
 mod tests {
-    use super::{automation, key_candidate_combo, tri_state};
-    use crate::ui::session_manager::EditorBuffer;
+    use super::{auth, automation, basic, key_candidate_combo, network, tri_state};
+    use crate::ui::session_manager::{AuthKindUi, EditorBuffer, JumpModeUi, SecretPresence};
+    use mullion_store::{Auth, AuthKind, Connection, Identity, Protocol, SessionId, SessionRecord};
 
     /// 在渲染结果的形状树里找**第一处**含 `needle` 的文字位置。抄自
     /// `list.rs` 同名测试辅助(那边是私有的,没有跨文件复用的路子,所以
@@ -749,13 +922,11 @@ mod tests {
     /// 是否正确。
     #[test]
     fn key_candidate_combo_enabled_state_tracks_whether_candidates_exist() {
-        let mut key_path = String::new();
-
         let ctx_empty = egui::Context::default();
         let mut enabled_when_empty = true;
         let _ = ctx_empty.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let resp = key_candidate_combo(ui, &[], &mut key_path);
+                let resp = key_candidate_combo(ui, &[]).0;
                 enabled_when_empty = resp.enabled();
             });
         });
@@ -772,7 +943,7 @@ mod tests {
         let mut enabled_when_nonempty = false;
         let _ = ctx_nonempty.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let resp = key_candidate_combo(ui, &candidates, &mut key_path);
+                let resp = key_candidate_combo(ui, &candidates).0;
                 enabled_when_nonempty = resp.enabled();
             });
         });
@@ -1198,6 +1369,355 @@ mod tests {
             Some(mullion_store::automation::DEFAULT_READY_TIMEOUT_MS),
             "勾选「就绪超时」应写入 DEFAULT_READY_TIMEOUT_MS(15000);实际 {:?}",
             buf.preserved_automation.ready_timeout_ms
+        );
+    }
+
+    /// 跳板测试用的最小会话记录。名字/用户/主机都取得互不相同,便于在形状树里
+    /// 按文字区分是哪一条。
+    fn sess(id: u64, name: &str, host: &str) -> SessionRecord {
+        SessionRecord {
+            id: SessionId(id),
+            modified_at: "t".into(),
+            identity: Identity {
+                name: name.into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: host.into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "ops".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        }
+    }
+
+    fn run_basic(buf: &mut EditorBuffer, sessions: &[SessionRecord]) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    basic(ui, &t, buf, &[], sessions, Some(SessionId(1)));
+                });
+            })
+        };
+        let _ = run(buf);
+        run(buf)
+    }
+
+    fn run_auth(buf: &mut EditorBuffer, presence: SecretPresence) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    auth(ui, &t, buf, presence, &[]);
+                });
+            })
+        };
+        let _ = run(buf);
+        run(buf)
+    }
+
+    /// 用户明确要求:私钥**路径不保存也不显示**。认证页只报「已导入 / 未设置」。
+    /// 顺带钉死「未设置」这条 —— v4→v5 迁移读不到旧文件的会话就落在这个状态,
+    /// 界面上不提示的话,用户只会在下次连接失败时才发现钥匙没了。
+    #[test]
+    fn the_auth_page_reports_key_presence_instead_of_a_path() {
+        let mut buf = EditorBuffer {
+            auth_kind: AuthKindUi::PublicKey,
+            ..Default::default()
+        };
+
+        let out = run_auth(&mut buf, SecretPresence::default());
+        assert!(
+            find_text_pos(&out.shapes, "未设置").is_some(),
+            "没有私钥时要明说「未设置」"
+        );
+
+        let mut buf2 = EditorBuffer {
+            auth_kind: AuthKindUi::PublicKey,
+            ..Default::default()
+        };
+        let out = run_auth(
+            &mut buf2,
+            SecretPresence {
+                private_key: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            find_text_pos(&out.shapes, "已导入").is_some(),
+            "库里有私钥时要显示「已导入」"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "未设置").is_none(),
+            "已导入的会话不该同时显示「未设置」"
+        );
+    }
+
+    /// 私钥正文绝不能画到屏幕上 —— 截图、录屏、旁人一眼就拿走了。
+    #[test]
+    fn the_auth_page_never_renders_the_key_body() {
+        let mut buf = EditorBuffer {
+            auth_kind: AuthKindUi::PublicKey,
+            key_touched: true,
+            key_data: "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETBODY\n".into(),
+            ..Default::default()
+        };
+        let out = run_auth(&mut buf, SecretPresence::default());
+        assert!(
+            find_text_pos(&out.shapes, "SECRETBODY").is_none(),
+            "私钥正文被画到界面上了"
+        );
+    }
+
+    /// 用户明确要求:跳板配在**「连接」页**,不在「高级」页。这条同时钉死两侧
+    /// —— 只断言「连接页有」的话,搬运时忘了从「高级」页删掉就会两处都有,
+    /// 用户改了一处以为生效、另一处显示的还是旧值。
+    #[test]
+    fn jump_section_lives_on_the_connect_page_and_not_on_the_advanced_page() {
+        let mut buf = EditorBuffer::default();
+        let out = run_basic(&mut buf, &[]);
+        assert!(
+            find_text_pos(&out.shapes, "跳板").is_some(),
+            "「连接」页必须有跳板分节"
+        );
+        for opt in ["无", "继承分组", "自定义"] {
+            assert!(
+                find_text_pos(&out.shapes, opt).is_some(),
+                "「连接」页的跳板应给出三个选项,缺了「{opt}」"
+            );
+        }
+
+        let t = crate::theme::MULLION_DARK;
+        let mut buf = EditorBuffer::default();
+        let ctx = egui::Context::default();
+        let run_net = |buf: &mut EditorBuffer| {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    network(ui, &t, buf, SecretPresence::default());
+                });
+            })
+        };
+        let _ = run_net(&mut buf);
+        let out = run_net(&mut buf);
+        assert!(
+            find_text_pos(&out.shapes, "跳板").is_none(),
+            "「高级」页不该再有跳板分节 —— 两处都有会让用户改了一处以为生效"
+        );
+    }
+
+    /// 「继承分组」下不该冒出跳板链编辑器,「自定义」下必须冒出来。选了继承却
+    /// 还能编辑一条只在「自定义」时才写回的链,是纯粹的假编辑框。
+    #[test]
+    fn the_chain_editor_appears_only_in_custom_mode() {
+        let sessions = [
+            sess(1, "self-session", "10.0.0.1"),
+            sess(2, "hop-alpha", "10.0.0.2"),
+        ];
+
+        let mut inherit = EditorBuffer {
+            jump_mode: JumpModeUi::Inherit,
+            jump_chain: vec![SessionId(2)],
+            ..EditorBuffer::default()
+        };
+        let out = run_basic(&mut inherit, &sessions);
+        assert!(
+            find_text_pos(&out.shapes, "hop-alpha").is_none(),
+            "「继承分组」下不该画出跳板链"
+        );
+
+        let mut custom = EditorBuffer {
+            jump_mode: JumpModeUi::Custom,
+            jump_chain: vec![SessionId(2)],
+            ..EditorBuffer::default()
+        };
+        let out = run_basic(&mut custom, &sessions);
+        assert!(
+            find_text_pos(&out.shapes, "hop-alpha").is_some(),
+            "「自定义」下必须把链里的跳板显示出来"
+        );
+    }
+
+    /// 候选下拉必须剔掉**正在编辑的这条会话自己**:自引用会被
+    /// `jump::expand_chain` 判成 `JumpCycle` 而**硬失败**(设计 §6),用户点得到
+    /// 就等于给了他一个点完必然连不上的选项。
+    #[test]
+    fn the_hop_picker_excludes_the_session_being_edited_so_it_cannot_reference_itself() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = [
+            sess(1, "self-session", "10.0.0.1"),
+            sess(2, "hop-alpha", "10.0.0.2"),
+        ];
+        let mut buf = EditorBuffer {
+            jump_mode: JumpModeUi::Custom,
+            ..EditorBuffer::default()
+        };
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    basic(ui, &t, buf, &[], &sessions, Some(SessionId(1)));
+                });
+            })
+        };
+        let click = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let _ = run(&mut buf, egui::RawInput::default());
+        let out = run(&mut buf, egui::RawInput::default());
+        let add_pos =
+            find_text_pos(&out.shapes, "添加跳板").expect("自定义模式下应有「+ 添加跳板」");
+        let _ = run(
+            &mut buf,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(add_pos),
+                    click(add_pos, true),
+                    click(add_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+        let out = run(&mut buf, egui::RawInput::default());
+
+        assert!(
+            find_text_pos(&out.shapes, "hop-alpha").is_some(),
+            "别的会话应出现在候选里 —— 下拉没打开的话这条测试什么也没验到"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "self-session").is_none(),
+            "正在编辑的这条会话不该出现在候选里:选中它会让拨号时成环硬失败"
+        );
+    }
+
+    /// 点第二跳的「↑」必须真的与第一跳互换,不能原地不动。跳板顺序决定实际
+    /// 拨号路径,静默不生效比报错更危险 —— 同「登录后」页命令列表那条靶子。
+    #[test]
+    fn clicking_move_up_on_second_hop_swaps_it_with_the_first_not_a_noop() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = [
+            sess(1, "self-session", "10.0.0.1"),
+            sess(2, "hop-alpha", "10.0.0.2"),
+            sess(3, "hop-beta", "10.0.0.3"),
+            sess(4, "hop-gamma", "10.0.0.4"),
+        ];
+        let mut buf = EditorBuffer {
+            jump_mode: JumpModeUi::Custom,
+            jump_chain: vec![SessionId(2), SessionId(3), SessionId(4)],
+            ..EditorBuffer::default()
+        };
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    basic(ui, &t, buf, &[], &sessions, Some(SessionId(1)));
+                });
+            })
+        };
+        let click = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let _ = run(&mut buf, egui::RawInput::default());
+        let out = run(&mut buf, egui::RawInput::default());
+
+        let mut ups = find_all_text_pos(&out.shapes, "↑");
+        ups.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
+        assert_eq!(ups.len(), 3, "三跳应该各有一个「↑」按钮");
+        let second = ups[1];
+
+        let _ = run(
+            &mut buf,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(second),
+                    click(second, true),
+                    click(second, false),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            buf.jump_chain,
+            vec![SessionId(3), SessionId(2), SessionId(4)],
+            "点第二跳的「↑」应让它与第一跳互换;实际 {:?}",
+            buf.jump_chain
+        );
+    }
+
+    /// 点某一跳的「✕」必须删掉**被点的那一跳**,不能恒删第一跳。两跳以内两种
+    /// 实现表现一样,必须三跳、点中间那跳才能区分开。
+    #[test]
+    fn clicking_remove_on_middle_hop_deletes_that_hop_not_always_the_first() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = [
+            sess(1, "self-session", "10.0.0.1"),
+            sess(2, "hop-alpha", "10.0.0.2"),
+            sess(3, "hop-beta", "10.0.0.3"),
+            sess(4, "hop-gamma", "10.0.0.4"),
+        ];
+        let mut buf = EditorBuffer {
+            jump_mode: JumpModeUi::Custom,
+            jump_chain: vec![SessionId(2), SessionId(3), SessionId(4)],
+            ..EditorBuffer::default()
+        };
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    basic(ui, &t, buf, &[], &sessions, Some(SessionId(1)));
+                });
+            })
+        };
+        let click = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let _ = run(&mut buf, egui::RawInput::default());
+        let out = run(&mut buf, egui::RawInput::default());
+
+        let mut xs = find_all_text_pos(&out.shapes, "✕");
+        xs.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
+        assert_eq!(xs.len(), 3, "三跳应该各有一个「✕」按钮");
+        let middle = xs[1];
+
+        let _ = run(
+            &mut buf,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(middle),
+                    click(middle, true),
+                    click(middle, false),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            buf.jump_chain,
+            vec![SessionId(2), SessionId(4)],
+            "点第二跳的「✕」应只删掉第二跳;实际 {:?}",
+            buf.jump_chain
         );
     }
 }

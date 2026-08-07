@@ -39,9 +39,12 @@ pub fn parse_args(args: &[String]) -> Result<SshConfig, String> {
     if user.is_empty() || host.is_empty() {
         return Err("user 和 host 都不能为空".into());
     }
+    // `-i` 仍收路径(命令行的既有语义),但读成正文再交给 ssh 层 ——
+    // `AuthMethod` v5 起只认私钥内容,读文件是调用方的事。
     let auth = match key {
         Some(path) => AuthMethod::PublicKey {
-            path,
+            key_data: std::fs::read_to_string(&path)
+                .map_err(|e| format!("读私钥失败 {}: {e}", path.display()))?,
             passphrase: None,
         },
         None => AuthMethod::Agent,
@@ -68,12 +71,15 @@ mod tests {
 
     #[test]
     fn parses_full_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id_test");
+        std::fs::write(&key, "KEYBODY").unwrap();
         let cfg = parse_args(&v(&[
             "user@example.com",
             "-p",
             "22",
             "-i",
-            "/path/to/key.pem",
+            key.to_str().unwrap(),
         ]))
         .unwrap();
         assert_eq!(cfg.user, "user");
@@ -81,12 +87,24 @@ mod tests {
         assert_eq!(cfg.port, 22);
         assert_eq!(cfg.term, "xterm-256color");
         match cfg.auth {
-            AuthMethod::PublicKey { path, passphrase } => {
-                assert_eq!(path, PathBuf::from("/path/to/key.pem"));
+            AuthMethod::PublicKey {
+                key_data,
+                passphrase,
+            } => {
+                // 传给 ssh 层的必须是私钥**正文**,不是路径。
+                assert_eq!(key_data, "KEYBODY");
                 assert!(passphrase.is_none());
             }
             _ => panic!("给了 -i 应走 PublicKey"),
         }
+    }
+
+    /// `-i` 指了个不存在的文件时要当场报错,而不是揣着空私钥去连、
+    /// 最后在 ssh 层给出「解析私钥失败」这种指不到原因的报错。
+    #[test]
+    fn unreadable_key_file_fails_at_parse_time_naming_the_path() {
+        let err = parse_args(&v(&["u@h", "-i", "/no/such/key"])).unwrap_err();
+        assert!(err.contains("/no/such/key"), "报错要点名路径: {err}");
     }
 
     #[test]

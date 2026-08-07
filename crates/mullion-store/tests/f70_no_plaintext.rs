@@ -8,6 +8,10 @@ use mullion_store::{
 
 const PW: &str = "hunter2-VERY-secret-passphrase-xyz";
 const PROXY_PW: &str = "hunter2-VERY-secret-proxy-password-abc";
+/// v5 起私钥**内容**也进侧车。未加密的私钥就是一把裸钥匙,落进明文 TOML
+/// 比密码落进去还严重 —— 拿到即可直接登录,且用户无从察觉。
+const KEY: &str =
+    "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET-KEY-BODY-zzz\n-----END OPENSSH PRIVATE KEY-----\n";
 
 #[test]
 fn plaintext_secret_never_hits_disk() {
@@ -29,7 +33,6 @@ fn plaintext_secret_never_hits_disk() {
             auth: Auth {
                 user: "u".into(),
                 kind: AuthKind::PublicKey {
-                    path: "/k.pem".into(),
                     has_passphrase: true,
                 },
             },
@@ -41,6 +44,7 @@ fn plaintext_secret_never_hits_disk() {
                 password: None,
                 passphrase: Some(PW.into()),
                 proxy_password: Some(PROXY_PW.into()),
+                private_key: Some(KEY.into()),
             }),
         },
         "2026-07-25T00:00:00Z",
@@ -49,7 +53,11 @@ fn plaintext_secret_never_hits_disk() {
 
     let toml_bytes = std::fs::read(dir.path().join("sessions.toml")).unwrap();
     let enc_bytes = std::fs::read(dir.path().join("secrets.enc")).unwrap();
-    for (label, needle) in [("口令", PW.as_bytes()), ("代理口令", PROXY_PW.as_bytes())] {
+    for (label, needle) in [
+        ("口令", PW.as_bytes()),
+        ("代理口令", PROXY_PW.as_bytes()),
+        ("私钥", KEY.as_bytes()),
+    ] {
         assert!(
             !contains(&toml_bytes, needle),
             "sessions.toml 里出现了明文{label}"
@@ -67,6 +75,10 @@ fn plaintext_secret_never_hits_disk() {
     assert_eq!(
         reopened.secret(id).unwrap().proxy_password.as_deref(),
         Some(PROXY_PW)
+    );
+    assert_eq!(
+        reopened.secret(id).unwrap().private_key.as_deref(),
+        Some(KEY)
     );
 }
 

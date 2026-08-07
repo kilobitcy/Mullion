@@ -75,9 +75,17 @@ fn jump_auth(rec: &SessionRecord, secret: Option<SecretEntry>) -> AuthMethod {
             // 没存密码就退回 agent:拿空串去认证只会得到一条误导性的 AuthFailed。
             None => AuthMethod::Agent,
         },
-        AuthKind::PublicKey { path, .. } => AuthMethod::PublicKey {
-            path: path.clone(),
-            passphrase: secret.and_then(|s| s.passphrase),
+        // v5 起私钥正文在跳板自己那条会话的侧车里。没导入私钥就退回 agent,
+        // 理由同上:拿空私钥去谈只会得到一条指不到原因的 AuthFailed。
+        AuthKind::PublicKey { .. } => match secret {
+            Some(s) => match s.private_key {
+                Some(key_data) => AuthMethod::PublicKey {
+                    key_data,
+                    passphrase: s.passphrase,
+                },
+                None => AuthMethod::Agent,
+            },
+            None => AuthMethod::Agent,
         },
     }
 }
@@ -120,6 +128,7 @@ mod tests {
             password: Some(p.into()),
             passphrase: None,
             proxy_password: None,
+            private_key: None,
         }
     }
 
@@ -179,6 +188,62 @@ mod tests {
         }
     }
 
+    /// 公钥跳板的私钥正文取自**跳板会话自己的侧车**(v5)。
+    #[test]
+    fn pubkey_jump_carries_the_key_body_from_its_own_secret() {
+        let mut r = rec(2, "bastion");
+        r.auth.kind = AuthKind::PublicKey {
+            has_passphrase: true,
+        };
+        let hops = build_hops(None, &[r], &|_| {
+            Some(SecretEntry {
+                password: None,
+                passphrase: Some("ph".into()),
+                proxy_password: None,
+                private_key: Some("KEYBODY".into()),
+            })
+        });
+        match &hops[0] {
+            Hop::SshJump {
+                auth:
+                    AuthMethod::PublicKey {
+                        key_data,
+                        passphrase,
+                    },
+                ..
+            } => {
+                assert_eq!(key_data, "KEYBODY");
+                assert_eq!(passphrase.as_deref(), Some("ph"));
+            }
+            other => panic!("实际: {other:?}"),
+        }
+    }
+
+    /// 公钥跳板没导入私钥 → 退回 agent。理由与密码路径同:拿空私钥去谈会得到
+    /// 一条指不到原因的 AuthFailed。
+    #[test]
+    fn pubkey_jump_without_imported_key_falls_back_to_agent() {
+        let mut r = rec(2, "bastion");
+        r.auth.kind = AuthKind::PublicKey {
+            has_passphrase: false,
+        };
+        let hops = build_hops(None, &[r], &|_| {
+            Some(SecretEntry {
+                password: None,
+                passphrase: None,
+                proxy_password: None,
+                private_key: None,
+            })
+        });
+        match &hops[0] {
+            Hop::SshJump { auth, .. } => assert!(
+                matches!(auth, AuthMethod::Agent),
+                "没导入私钥应退回 agent,实际 {auth:?}"
+            ),
+            other => panic!("实际: {other:?}"),
+        }
+    }
+
     /// 跳板会话没存密码 → 退回 agent,而不是拿空串去认证(那必然 AuthFailed 且信息误导)。
     #[test]
     fn jump_without_stored_password_falls_back_to_agent() {
@@ -201,6 +266,7 @@ mod tests {
             password: None,
             passphrase: None,
             proxy_password: Some("ppw".into()),
+            private_key: None,
         };
         let hops = build_hops_with_proxy_secret(Some(&proxy), &[], &|_| None, Some(&secret));
         match &hops[0] {

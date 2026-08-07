@@ -14,9 +14,10 @@ mod list;
 mod validate;
 
 pub(crate) use buffer::{
-    build_draft, connect_string, is_dirty, merge_secret, secret_fields, sync_has_passphrase,
+    build_draft, clear_key, connect_string, import_key_file, is_dirty, merge_secret, secret_fields,
+    sync_has_passphrase,
 };
-pub(crate) use buffer::{AuthKindUi, ProxyModeUi};
+pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
 pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget};
 
 use egui::NumExt as _;
@@ -411,7 +412,7 @@ pub fn show(
                     // 挂显式 id 供守护测试读回真实矩形,见 `editor_root_id()`。
                     let rect = ui.max_rect();
                     ui.interact(rect, editor_root_id(), egui::Sense::hover());
-                    editor::show(ui, t, ui_state, groups, presence)
+                    editor::show(ui, t, ui_state, groups, sessions, presence)
                 });
         });
 
@@ -419,17 +420,27 @@ pub fn show(
     // `ui_state.editor`。`build_draft` 要读整个 `EditorBuffer`,`editor::show`
     // 内部正持着它的 `&mut`,所以「保存」只在那边置一个 `save_click` 标志,
     // 真正的施加挪到这里。
+    // 「认证」Tab 里导入/清除私钥留下的一行提示 → 转成编辑器顶部那条通知。
+    // 必须在下面判脏**之前**抽走:它是瞬态的,留在缓冲里会让「导入失败」也
+    // 把表单判成脏,切会话时凭空弹一个确认。
+    if let Some(buf) = ui_state.editor.as_mut() {
+        if let Some(note) = buf.key_note.take() {
+            ui_state.key_drop_note = Some(note);
+        }
+    }
+
     if let Some(then_connect) = ui_state.save_click.take() {
         if let Some(buf) = ui_state.editor.as_ref() {
             match build_draft(buf) {
                 Ok(draft) => {
-                    let (password, passphrase, proxy_password) = secret_fields(buf);
+                    let (password, passphrase, proxy_password, private_key) = secret_fields(buf);
                     ui_state.save_request = Some(SaveIntent {
                         editing_id: ui_state.editor_id,
                         draft,
                         password,
                         passphrase,
                         proxy_password,
+                        private_key,
                         then_connect,
                     });
                     // 保存成功后基线要跟上,否则刚存完就被判成脏。
