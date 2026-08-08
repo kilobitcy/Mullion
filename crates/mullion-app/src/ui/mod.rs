@@ -3,6 +3,7 @@ pub mod badge;
 pub mod chrome;
 pub mod group_manager;
 pub mod host_key;
+pub mod ico;
 pub mod icon;
 pub mod metrics;
 pub mod pane_title;
