@@ -21,6 +21,96 @@ const ICON_PX: f32 = 16.0;
 /// 文字左边界。= 图标槽位右沿 + 8px 间距,**恒定**(见 `session_row` 注释)。
 const TEXT_X: f32 = ICON_SLOT_X + ICON_PX / 2.0 + 8.0;
 
+/// 会话行左侧状态点的四态(走查 4)。原来只有「已连接 / 未连接」两态、
+/// 且两态都是同一个形状,颜色一变用户就分不出来了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Status {
+    Connected,
+    Connecting,
+    Failed,
+    Idle,
+}
+
+/// 状态点画成什么**形状**。走查 4 要求「颜色 + 形状双编码(色盲友好)」——
+/// 红绿色盲分不出 `ok` 绿和 `danger` 红,但实心圆 / 空心圆 / 方块永远分得出。
+/// 抽成独立枚举是为了能**直接断言四态互不相同**,而不是去数画出来的图元。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Marker {
+    /// 实心圆,半径 4 —— 已连接。
+    Dot,
+    /// 空心圆(只描边)—— 连接中。
+    Ring,
+    /// 实心方块 —— 失败。
+    Square,
+    /// 实心圆,半径 3 —— 未连接。比 `Dot` 小一号,不抢眼。
+    SmallDot,
+}
+
+/// 四态判定。优先级 `Connected > Connecting > Failed > Idle`:
+/// 已经连上了就不该再显示上一次的失败,否则那条红标记会一直挂到重启。
+pub(crate) fn status_of(
+    id: SessionId,
+    connected: Option<SessionId>,
+    connecting: Option<SessionId>,
+    failed: Option<SessionId>,
+) -> Status {
+    if connected == Some(id) {
+        Status::Connected
+    } else if connecting == Some(id) {
+        Status::Connecting
+    } else if failed == Some(id) {
+        Status::Failed
+    } else {
+        Status::Idle
+    }
+}
+
+pub(crate) fn marker_of(s: Status) -> Marker {
+    match s {
+        Status::Connected => Marker::Dot,
+        Status::Connecting => Marker::Ring,
+        Status::Failed => Marker::Square,
+        Status::Idle => Marker::SmallDot,
+    }
+}
+
+/// 走查 4:「圆点(连接状态?)全是同一个灰色」—— 用户只能靠猜。每一态都要
+/// 说出自己是什么。
+pub(crate) fn status_tooltip(s: Status) -> &'static str {
+    match s {
+        Status::Connected => "已连接",
+        Status::Connecting => "连接中…",
+        Status::Failed => "上次连接失败",
+        Status::Idle => "未连接",
+    }
+}
+
+fn status_color(s: Status, t: &Theme) -> egui::Color32 {
+    theme::c32(match s {
+        Status::Connected => t.ok,
+        Status::Connecting => t.info,
+        Status::Failed => t.danger,
+        Status::Idle => t.fg_ghost,
+    })
+}
+
+/// 按 `Marker` 画。形状与颜色分两步取,是为了让「形状」这一半能脱离主题单测。
+fn paint_status(p: &egui::Painter, center: egui::Pos2, s: Status, t: &Theme) {
+    let c = status_color(s, t);
+    // 每个分支都返回一个 `ShapeIdx`(画完之后还能回头改那个图元),这里用不上。
+    let _ = match marker_of(s) {
+        Marker::Dot => p.circle_filled(center, 4.0, c),
+        Marker::SmallDot => p.circle_filled(center, 3.0, c),
+        // 描边 1.5px:1.0 在 100% 缩放下会被反走样抹淡到跟实心圆难分。
+        Marker::Ring => p.circle_stroke(center, 4.0, egui::Stroke::new(1.5, c)),
+        Marker::Square => p.rect_filled(
+            egui::Rect::from_center_size(center, egui::vec2(7.0, 7.0)),
+            egui::Rounding::same(1.0),
+            c,
+        ),
+    };
+}
+
 /// 会话是否命中搜索。空查询放行全部。名称 / 主机 / 标签三处都查,
 /// 大小写不敏感 —— 用户记得住的常是 IP 尾数或标签,不是当初起的名字。
 pub(crate) fn matches(rec: &SessionRecord, query: &str) -> bool {
@@ -43,13 +133,16 @@ pub(crate) fn matches(rec: &SessionRecord, query: &str) -> bool {
 /// F61/F62 加了两样东西:**右**边缘的语义色竖条(左 3px 已被选中态 accent 占了,
 /// 两者各占一边才不打架)、状态点与文字之间的 16px 图标槽位。
 /// **槽位恒占**——没设图标的行也留白,否则有图标和没图标的行文字左边界参差。
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     ui: &mut Ui,
     t: &Theme,
     rec: &SessionRecord,
+    sub: &str,
     selected: bool,
-    connected: bool,
+    status: Status,
     appearance: &crate::ui::badge::Appearance,
+    query: &str,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_H),
@@ -73,24 +166,16 @@ fn session_row(
         );
     }
 
-    // F62:语义色竖条走**右**边缘 —— 左 3px 归选中态 accent,两者各占一边。
-    if let Some(c) =
-        crate::ui::badge::should_paint(appearance, mullion_store::ColorTarget::ListItem)
-    {
-        crate::ui::badge::paint_edge_bar(p, rect, crate::ui::badge::Side::Right, c);
-    }
-
-    // §6:状态点只有两态 —— 已连接(ok 绿)/ 未连接(fg_ghost 灰)。
-    // 「连接中」态做不出来:UserEvent::ConnectOk/ConnectErr 都不带 SessionId,
-    // 无法把在途连接归到某一行上。
-    p.circle_filled(
-        egui::pos2(rect.left() + 16.0, rect.center().y),
-        4.0,
-        if connected {
-            theme::c32(t.ok)
-        } else {
-            theme::c32(t.fg_ghost)
-        },
+    paint_row_body(
+        p,
+        rect,
+        t,
+        &rec.identity.name,
+        sub,
+        status,
+        rec.connection.protocol,
+        appearance,
+        query,
     );
     // §6.3:状态点加 tooltip。它是手绘的,没有 Response,只能补一次
     // interact —— 否则用户只能靠猜「这个绿点是什么意思」。
@@ -110,7 +195,72 @@ fn session_row(
         egui::vec2(12.0, 12.0),
     );
     ui.interact(dot_rect, resp.id.with("dot"), egui::Sense::hover())
-        .on_hover_text(if connected { "已连接" } else { "未连接" });
+        .on_hover_text(status_tooltip(status));
+
+    resp
+}
+
+/// 会话名后面要不要挂一个协议标签。**ssh 不挂** —— 列表里 99% 的行都是 ssh,
+/// 全挂等于没挂,还把名字挤窄了。
+///
+/// 走查没提这条,是决策树里补的:`Protocol` 已经是 schema 的一部分、编辑器
+/// 也让用户选,但列表上看不出来,存了一条 sftp 会话跟 ssh 长得一模一样。
+pub(crate) fn protocol_pill(p: mullion_store::Protocol) -> Option<&'static str> {
+    match p {
+        mullion_store::Protocol::Ssh => None,
+        mullion_store::Protocol::Sftp => Some("SFTP"),
+    }
+}
+
+/// 画协议标签。**中性灰**(`sunken_bg` 底 + `fg_muted` 字),不碰 F62 的语义
+/// 配色 —— 那套色是用户自己赋的含义,协议是客观事实,混一起两边都读不准。
+fn paint_pill(p: &egui::Painter, t: &Theme, left_top: egui::Pos2, text: &str) {
+    let font = egui::FontId::proportional(10.0);
+    let galley = p.layout_no_wrap(text.to_string(), font, theme::c32(t.fg_muted));
+    let pad = egui::vec2(5.0, 1.0);
+    let rect = egui::Rect::from_min_size(left_top, galley.size() + pad * 2.0);
+    p.rect_filled(rect, egui::Rounding::same(4.0), theme::c32(t.sunken_bg));
+    p.galley(rect.min + pad, galley, theme::c32(t.fg_muted));
+}
+
+/// 一行会话的**内容**:语义色竖条 + 状态点 + 图标 + 两行文字。背景与选中条不在
+/// 这里(那两样只对真列表行有意义)。
+///
+/// 抽出来是给「图标」页的实时预览复用的(走查 4 后半)。预览要是另写一套绘制,
+/// 两边迟早漂移 —— 那时候预览就是在骗人,比没有预览更糟。
+///
+/// 参数多是因为它**不认识 `SessionRecord`** —— 预览页手上只有一份还没保存的
+/// 表单缓冲,拿不出记录来。收散装数据是让两边共用同一份绘制的代价。
+#[allow(clippy::too_many_arguments)]
+fn paint_row_body(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    t: &Theme,
+    name: &str,
+    sub: &str,
+    status: Status,
+    protocol: mullion_store::Protocol,
+    appearance: &crate::ui::badge::Appearance,
+    query: &str,
+) {
+    // F62:语义色竖条走**右**边缘 —— 左 3px 归选中态 accent,两者各占一边。
+    if let Some(c) =
+        crate::ui::badge::should_paint(appearance, mullion_store::ColorTarget::ListItem)
+    {
+        crate::ui::badge::paint_edge_bar(p, rect, crate::ui::badge::Side::Right, c);
+    }
+
+    // 走查 4:四态 + 色形双编码。原来只有两态,注释里写着「『连接中』态做不出来:
+    // UserEvent::ConnectOk/ConnectErr 都不带 SessionId」—— 那个论断只对事件本身
+    // 成立:发起连接的**那一刻**我们是知道 SessionId 的(`connect_request_last`
+    // 就是这么来的),把它记进 `UiState::connecting`,收到事件时清掉即可,不需要
+    // 事件携带 id。
+    paint_status(
+        p,
+        egui::pos2(rect.left() + 16.0, rect.center().y),
+        status,
+        t,
+    );
 
     // F61:图标槽位。**恒占**,画不画都留这 16px —— 有图标的行和没图标的行
     // 文字左边界必须对齐,否则列表看起来像坏了。
@@ -125,24 +275,102 @@ fn session_row(
             t,
         );
     }
-    p.text(
+    let name_rect = paint_highlighted(
+        p,
         egui::pos2(rect.left() + TEXT_X, rect.top() + 7.0),
-        egui::Align2::LEFT_TOP,
-        &rec.identity.name,
+        name,
+        query,
         egui::FontId::proportional(14.0),
         theme::c32(t.fg),
+        t,
     );
-    p.text(
+    if let Some(tag) = protocol_pill(protocol) {
+        paint_pill(p, t, name_rect.right_top() + egui::vec2(6.0, 1.0), tag);
+    }
+    paint_highlighted(
+        p,
         egui::pos2(rect.left() + TEXT_X, rect.top() + 25.0),
-        egui::Align2::LEFT_TOP,
-        format!("{}@{}", rec.auth.user, rec.connection.host),
+        sub,
+        query,
         egui::FontId::proportional(11.0),
         // WCAG AA:fg_faint(#565b70) on panel_bg(#14161f) 只有 2.69:1,
         // fg_dimmer(#8a90a8) 是 5.71:1。不动 token 本身 —— 它在别处
         // (禁用态、装饰线)是对的。
         theme::c32(t.fg_dimmer),
+        t,
     );
-    resp
+}
+
+/// 画一行文字,命中搜索的那几段染成 accent(走查 22)。返回它占的矩形
+/// (协议 pill 要挂在名字右边)。
+///
+/// 用一个 `LayoutJob` 分段着色而不是画好几次 `p.text`:后者要自己算每段的
+/// 宽度再累加,一遇到连字/CJK 混排就对不齐。
+#[allow(clippy::too_many_arguments)]
+fn paint_highlighted(
+    p: &egui::Painter,
+    pos: egui::Pos2,
+    text: &str,
+    query: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    t: &Theme,
+) -> egui::Rect {
+    let segs = super::highlight::segments(text, query);
+    // 一段且没命中 = 绝大多数情况(没在搜索),走最短的路,不建 LayoutJob。
+    if segs.len() == 1 && !segs[0].1 {
+        return p.text(pos, egui::Align2::LEFT_TOP, text, font, color);
+    }
+    let mut job = egui::text::LayoutJob::default();
+    for (piece, hit) in &segs {
+        job.append(
+            piece,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: if *hit { theme::c32(t.accent) } else { color },
+                ..Default::default()
+            },
+        );
+    }
+    let galley = p.layout_job(job);
+    let rect = egui::Rect::from_min_size(pos, galley.size());
+    p.galley(pos, galley, color);
+    rect
+}
+
+/// 「图标」页的实时预览(走查 4 后半):画一行**假的**会话行,让用户当场看到
+/// 自己配的图标和颜色在列表里长什么样。
+///
+/// 状态点固定画 `Idle` —— 预览的是外观,不是连接状态;画成绿色会让人以为
+/// 这里能看出连没连上。
+pub(crate) fn preview_row(
+    ui: &mut Ui,
+    t: &Theme,
+    name: &str,
+    sub: &str,
+    protocol: mullion_store::Protocol,
+    appearance: &crate::ui::badge::Appearance,
+) {
+    // 宽度取 `LIST_W` 一档(280),不吃满右栏 —— 预览要像左边那条列表,
+    // 拉成整页宽反而不像。
+    let w = ui.available_width().min(280.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
+    // 铺 `panel_bg`:真列表行的底色来自左栏 `SidePanel` 的填充,不铺的话
+    // 预览行浮在 `bar_status` 上,颜色对比跟实际不一样。
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(6.0), theme::c32(t.panel_bg));
+    paint_row_body(
+        ui.painter(),
+        rect,
+        t,
+        name,
+        sub,
+        Status::Idle,
+        protocol,
+        appearance,
+        "",
+    );
 }
 
 /// 「+ 新建」按钮的显式 id。原来用 `ui.button(...)`,egui 给它分配的是自动 id
@@ -199,6 +427,27 @@ fn new_button(ui: &mut Ui) -> egui::Response {
     resp
 }
 
+/// 列表里从上到下的会话顺序,搜索过滤后的那一份(走查 16 的 ↑↓ 要照着它走)。
+///
+/// 跟 `show()` 一样先用 `group_manager::group_sessions` 归桶再按 `matches`
+/// 过滤 —— 顺序必须跟眼睛看到的一致,自己另写一套排序迟早跟渲染那边分叉。
+///
+/// **不看分组的折叠状态**:折叠状态存在 `ctx.data()` 里,拿它要 `&Context`,
+/// 而这是个纯函数。代价是方向键会走进折叠着的分组(选中了但那一行看不见);
+/// 收益是这段顺序逻辑能脱离 egui 单测。折叠+键盘导航是小众组合,先记在这儿。
+pub(crate) fn visible_order(
+    sessions: &[SessionRecord],
+    groups: &[GroupRecord],
+    query: &str,
+) -> Vec<SessionId> {
+    crate::ui::group_manager::group_sessions(groups, sessions)
+        .into_iter()
+        .flat_map(|(_, bucket)| bucket)
+        .filter(|r| matches(r, query))
+        .map(|r| r.id)
+        .collect()
+}
+
 pub(super) fn show(
     ui: &mut Ui,
     t: &Theme,
@@ -211,7 +460,7 @@ pub(super) fn show(
     // 搜索框
     ui.add(
         egui::TextEdit::singleline(&mut ui_state.search)
-            .hint_text("搜索名称 / 主机 / 标签")
+            .hint_text(theme::hint_text(t, "搜索名称 / 主机 / 标签"))
             .desired_width(f32::INFINITY),
     );
     ui.add_space(8.0);
@@ -259,6 +508,15 @@ pub(super) fn show(
         });
 
     let searching = !ui_state.search.trim().is_empty();
+    // 走查 22:搜不到任何东西时,列表是一整片空白 —— 用户分不清「没有匹配」
+    // 和「会话都没了」。给一句话 + 一个回到全部列表的出口。
+    if searching && !sessions.iter().any(|r| matches(r, &ui_state.search)) {
+        ui.add_space(4.0);
+        ui.colored_label(theme::c32(t.fg_dimmer), "没有匹配的会话");
+        if ui.button("清空搜索").clicked() {
+            ui_state.search.clear();
+        }
+    }
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -295,6 +553,8 @@ pub(super) fn show(
                                 t,
                                 ui_state,
                                 r,
+                                sessions,
+                                groups,
                                 connected,
                                 pending_delete_target,
                                 &mut pending_delete_rendered,
@@ -334,6 +594,8 @@ fn row(
     t: &Theme,
     ui_state: &mut UiState,
     rec: &SessionRecord,
+    sessions: &[SessionRecord],
+    groups: &[GroupRecord],
     connected: Option<SessionId>,
     pending_delete_target: Option<SessionId>,
     pending_delete_rendered: &mut bool,
@@ -347,7 +609,20 @@ fn row(
     // 缓存里没有这条(store 刚删掉、或还没 rebuild)就按「没设外观」画。
     let default_appearance = crate::ui::badge::Appearance::default();
     let a = appearance.get(rec.id).unwrap_or(&default_appearance);
-    let resp = session_row(ui, t, rec, selected, connected == Some(rec.id), a);
+    let status = status_of(
+        rec.id,
+        connected,
+        ui_state.connecting,
+        ui_state.connect_failed,
+    );
+    // 走查 3:列表上有另一行长得一模一样时,副标题后面追加一段区分信息
+    // (分组名 / 端口 / 备注首句)。没有重名时 `disambiguate` 返回 `None`,
+    // 副标题保持原样 —— 不给每行平白加尾巴。
+    let sub = match super::dedupe::disambiguate(rec, sessions, groups) {
+        Some(extra) => format!("{}@{} · {}", rec.auth.user, rec.connection.host, extra),
+        None => format!("{}@{}", rec.auth.user, rec.connection.host),
+    };
+    let resp = session_row(ui, t, rec, &sub, selected, status, a, &ui_state.search);
     if resp.clicked() {
         ui_state.pending_switch = Some(SwitchTarget::Session(rec.id));
     }
@@ -361,6 +636,12 @@ fn row(
         ui_state.connect_request = Some(rec.id);
     }
     resp.context_menu(|ui| {
+        // 走查 3:菜单里原本只有「跳过自动化」这一条连接项 —— 右键一打开,
+        // 主操作(直接连)反而不在,用户只能关掉菜单再双击。普通连接排第一。
+        if ui.button("连接").clicked() {
+            ui_state.connect_request = Some(rec.id);
+            ui.close_menu();
+        }
         // F44:一次性逃生门。远端 tmux 里正跑着 Claude Code 时,用户可能只想
         // 连上去看一眼,不想让自动化再发一遍 attach。
         if ui.button("连接(跳过自动化)").clicked() {
@@ -368,6 +649,29 @@ fn row(
             ui_state.connect_skip_automation = true;
             ui.close_menu();
         }
+        ui.separator();
+        // 走查 3:改分组原本只能进右栏编辑器改下拉再保存。这里给一条直路。
+        ui.menu_button("移动到分组", |ui| {
+            // 当前所在的那一项也列出来但禁掉 —— 直接不列的话,用户会以为
+            // 「这个分组不存在了」。
+            let cur = rec.identity.group_id;
+            if ui
+                .add_enabled(cur.is_some(), egui::Button::new("未分组"))
+                .clicked()
+            {
+                ui_state.move_to_group = Some((rec.id, None));
+                ui.close_menu();
+            }
+            for g in groups {
+                if ui
+                    .add_enabled(cur != Some(g.id), egui::Button::new(&g.name))
+                    .clicked()
+                {
+                    ui_state.move_to_group = Some((rec.id, Some(g.id)));
+                    ui.close_menu();
+                }
+            }
+        });
         if ui.button("删除").clicked() {
             ui_state.pending_delete = Some(rec.id);
             ui.close_menu();
@@ -428,6 +732,95 @@ mod tests {
             network: Default::default(),
             automation: Default::default(),
         }
+    }
+
+    /// 走查 4:一条会话刚连上,却因为二十分钟前失败过一次而顶着红标记 ——
+    /// 用户会以为它现在是坏的。优先级必须是「当下的事实压过历史」。
+    #[test]
+    fn status_prefers_connected_over_a_stale_failure() {
+        let id = SessionId(1);
+        assert_eq!(
+            status_of(id, Some(id), None, Some(id)),
+            Status::Connected,
+            "已连接必须压过陈旧的失败标记"
+        );
+        assert_eq!(
+            status_of(id, None, Some(id), Some(id)),
+            Status::Connecting,
+            "正在重拨时不该还显示上次的失败"
+        );
+        assert_eq!(status_of(id, None, None, Some(id)), Status::Failed);
+        assert_eq!(status_of(id, None, None, None), Status::Idle);
+        // 别人的状态不该染到这一行上。
+        let other = SessionId(2);
+        assert_eq!(
+            status_of(id, Some(other), Some(other), Some(other)),
+            Status::Idle
+        );
+    }
+
+    /// 走查 4 的核心诉求是**色形双编码(色盲友好)**。只换颜色不换形状的话,
+    /// 红绿色盲用户看到的四态是同一个灰点。
+    ///
+    /// 自证会变红:把 `marker_of` 里 `Status::Failed` 的 `Marker::Square`
+    /// 改成 `Marker::Dot`。
+    #[test]
+    fn each_status_has_a_distinct_shape_not_just_a_distinct_color() {
+        let all = [
+            Status::Connected,
+            Status::Connecting,
+            Status::Failed,
+            Status::Idle,
+        ];
+        let markers: Vec<Marker> = all.iter().copied().map(marker_of).collect();
+        for (i, a) in markers.iter().enumerate() {
+            for (j, b) in markers.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "{:?} 与 {:?} 画成了同一个形状", all[i], all[j]);
+                }
+            }
+        }
+    }
+
+    /// 走查 4:「圆点全是同一个灰色,也没有 tooltip」—— 每一态都要能说出自己
+    /// 是什么,而且四句话不能重样(重样等于没说)。
+    #[test]
+    fn status_tooltip_names_the_state() {
+        let all = [
+            Status::Connected,
+            Status::Connecting,
+            Status::Failed,
+            Status::Idle,
+        ];
+        let tips: Vec<&str> = all.iter().copied().map(status_tooltip).collect();
+        for t in &tips {
+            assert!(!t.is_empty(), "每一态都得有 tooltip");
+        }
+        let uniq: std::collections::BTreeSet<&&str> = tips.iter().collect();
+        assert_eq!(uniq.len(), tips.len(), "四态的 tooltip 不能重样:{tips:?}");
+    }
+
+    /// 协议标签只给非 ssh 的行挂。列表里 99% 都是 ssh,全挂等于没挂,还把
+    /// 名字挤窄了 —— 但存了一条 sftp 会话时必须一眼看得出来。
+    ///
+    /// 自证会变红:把 `protocol_pill` 的 `Protocol::Ssh` 分支改成 `Some("SSH")`。
+    #[test]
+    fn only_non_ssh_rows_get_a_protocol_pill() {
+        use mullion_store::Protocol;
+        assert_eq!(protocol_pill(Protocol::Ssh), None, "ssh 是默认,不该挂标签");
+        assert_eq!(protocol_pill(Protocol::Sftp), Some("SFTP"));
+
+        // 渲染层:一行 sftp 会话应该比同样的 ssh 行多画东西(底 + 字)。
+        let mut ssh = rec(1, "dev-box", "192.0.2.10", &[]);
+        let mut sftp = ssh.clone();
+        sftp.connection.protocol = Protocol::Sftp;
+        ssh.connection.protocol = Protocol::Ssh;
+        let n_ssh = count_shapes(&run_list_with(&[ssh]).shapes);
+        let n_sftp = count_shapes(&run_list_with(&[sftp]).shapes);
+        assert!(
+            n_sftp > n_ssh,
+            "sftp 行应多画出协议标签(ssh {n_ssh} 个图形,sftp {n_sftp} 个)"
+        );
     }
 
     /// 搜索要覆盖名称 / 主机 / 标签三处,且大小写不敏感 —— 用户记得住的往往是
@@ -772,6 +1165,336 @@ mod tests {
         );
     }
 
+    /// 按文字内容找到它的 `LayoutJob`(要看分段着色,`find_text_pos` 只回位置)。
+    /// `editor.rs` 的测试里有同名辅助,但那边是私有的,按项目既有做法各留一份。
+    fn find_galley_job(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Option<egui::text::LayoutJob> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::text::LayoutJob> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text() == needle => {
+                    Some((*ts.galley.job).clone())
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// 走查 22 的接线守护:命中的那几个字必须真的被染成 accent。
+    /// `highlight::segments` 的单测只证切分对,证不了它被接上了。
+    ///
+    /// 自证会变红:把 `paint_highlighted` 换回 `p.text(...)` → 名字变成
+    /// 单段、没有 accent 色的段。
+    #[test]
+    fn the_matching_part_of_a_name_is_painted_in_the_accent_color() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![rec(1, "web01", "10.0.0.1", &[])];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState {
+            search: "eb0".into(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut run = || {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        &mut ui_state,
+                        &sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
+                });
+            })
+        };
+        let _ = run();
+        let out = run();
+
+        let job = find_galley_job(&out.shapes, "web01").expect("会话名该画出来了");
+        let hit: Vec<&str> = job
+            .sections
+            .iter()
+            .filter(|s| s.format.color == crate::theme::c32(t.accent))
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(hit, vec!["eb0"], "命中的那一段该是 accent 色,其余不该是");
+    }
+
+    /// 走查 22:搜不到东西时给一句话和一个出口。一整片空白分不清
+    /// 「没有匹配」和「会话都没了」。
+    #[test]
+    fn an_empty_search_result_says_so_and_offers_a_way_back() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![rec(1, "web01", "10.0.0.1", &[])];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState {
+            search: "zzz-nothing".into(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let run = |ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
+                });
+            })
+        };
+        let _ = run(&mut ui_state, egui::RawInput::default());
+        let out = run(&mut ui_state, egui::RawInput::default());
+        assert!(
+            find_text_pos(&out.shapes, "没有匹配的会话").is_some(),
+            "搜不到东西时该明说"
+        );
+
+        let pos = find_text_pos(&out.shapes, "清空搜索").expect("该有「清空搜索」按钮");
+        let click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = run(
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    click(pos, true),
+                    click(pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(
+            ui_state.search.is_empty(),
+            "点「清空搜索」该真的把搜索框清空"
+        );
+    }
+
+    /// 走查 22 的「记住上次选中」:`close_session_manager` **不碰**
+    /// `editor`/`editor_id`/`search`,所以重新打开时上次选的那条还在。
+    ///
+    /// 这条属性今天是靠「没写清空代码」成立的,没有任何东西钉住它 ——
+    /// 以后谁往 `close_session_manager` 里顺手加一句 `self.editor = None`
+    /// (它已经清了 5 个字段,看起来很像该一起清),这个体验就没了,而且
+    /// 不会有任何编译错误或别的测试报警。
+    #[test]
+    fn closing_the_manager_keeps_the_selected_session_so_reopening_lands_where_you_left() {
+        let mut st = UiState {
+            session_manager_open: true,
+            editor_id: Some(SessionId(7)),
+            editor: Some(crate::ui::session_manager::EditorBuffer::default()),
+            search: "web".into(),
+            ..Default::default()
+        };
+        st.close_session_manager();
+        assert_eq!(
+            st.editor_id,
+            Some(SessionId(7)),
+            "关窗不该丢掉上次选中的会话"
+        );
+        assert!(st.editor.is_some(), "表单缓冲也该留着,否则重开是一片空态");
+        assert_eq!(st.search, "web", "搜索词也该留着");
+    }
+
+    /// 走查 3 的接线守护:`disambiguate` 算出来的区分信息必须真的画进副标题。
+    /// 纯函数测试(`dedupe::tests`)只证判据对,证不了它被接上了 —— 把
+    /// `row()` 里那句 `match disambiguate(..)` 改回无条件 `format!("{user}@{host}")`,
+    /// 所有 dedupe 单测照样绿,只有这条会红。
+    #[test]
+    fn two_rows_that_look_identical_get_the_group_name_appended() {
+        let groups = vec![
+            GroupRecord {
+                id: mullion_store::GroupId(1),
+                name: "生产环境".into(),
+                tags: Vec::new(),
+                terminal: Default::default(),
+                appearance: Default::default(),
+                network: Default::default(),
+                automation: Default::default(),
+            },
+            GroupRecord {
+                id: mullion_store::GroupId(2),
+                name: "测试环境".into(),
+                tags: Vec::new(),
+                terminal: Default::default(),
+                appearance: Default::default(),
+                network: Default::default(),
+                automation: Default::default(),
+            },
+        ];
+        let mut a = rec(1, "web01", "10.0.0.1", &[]);
+        let mut b = rec(2, "web01", "10.0.0.1", &[]);
+        a.identity.group_id = Some(mullion_store::GroupId(1));
+        b.identity.group_id = Some(mullion_store::GroupId(2));
+
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![a, b];
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+        let mut run = || {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        &mut ui_state,
+                        &sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
+                });
+            })
+        };
+        let _ = run();
+        let out = run();
+
+        assert!(
+            find_text_pos(&out.shapes, "user@10.0.0.1 · 生产环境").is_some(),
+            "两行长得一样时,副标题该带上分组名"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "user@10.0.0.1 · 测试环境").is_some(),
+            "另一行也要带 —— 只标一行的话,没标的那行看起来像「正常的那条」"
+        );
+    }
+
+    /// 走查 3:右键菜单要给出**普通连接**和**移动到分组**两条直路。
+    /// 原来菜单里只有「连接(跳过自动化)」,主操作反而不在;改分组只能进右栏
+    /// 编辑器改下拉再保存。手法同上:真实指针事件走完整条路径,不手动赋值。
+    ///
+    /// 自证会变红:把「连接」按钮那个分支删掉 → `find_text_pos` 找不到该按钮,
+    /// `expect` 直接 panic;把 `move_to_group = Some(...)` 改成不赋值 → 末尾
+    /// 断言失败。
+    #[test]
+    fn right_click_offers_connect_and_move_to_group() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![rec(1, "session-ctx-menu-target", "192.0.2.11", &[])];
+        let groups = vec![GroupRecord {
+            id: mullion_store::GroupId(7),
+            name: "生产环境".into(),
+            tags: Vec::new(),
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        }];
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
+                });
+            })
+        };
+        let secondary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let primary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let click_at = |ctx: &egui::Context, ui_state: &mut UiState, pos| {
+            run(
+                ctx,
+                ui_state,
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        primary_click(pos, true),
+                        primary_click(pos, false),
+                    ],
+                    ..Default::default()
+                },
+            )
+        };
+
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let row_pos =
+            find_text_pos(&out.shapes, "session-ctx-menu-target").expect("这一行应该已经画出来了");
+        let row_click_pos = egui::pos2(row_pos.x - 20.0, row_pos.y + 15.0);
+        let open_menu = |ctx: &egui::Context, ui_state: &mut UiState| {
+            let _ = run(
+                ctx,
+                ui_state,
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(row_click_pos),
+                        secondary_click(row_click_pos, true),
+                        secondary_click(row_click_pos, false),
+                    ],
+                    ..Default::default()
+                },
+            );
+            // 菜单是 `Area`,首帧先做一趟不可见的 sizing pass。
+            run(ctx, ui_state, egui::RawInput::default())
+        };
+
+        // ---- 「移动到分组 ▸ 生产环境」----
+        let out = open_menu(&ctx, &mut ui_state);
+        let move_pos =
+            find_text_pos(&out.shapes, "移动到分组").expect("菜单里应该有「移动到分组」");
+        let _ = click_at(&ctx, &mut ui_state, move_pos);
+        // 子菜单同样要多跑一帧才画得出来。
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let group_pos =
+            find_text_pos(&out.shapes, "生产环境").expect("子菜单里应该列出了「生产环境」");
+        let _ = click_at(&ctx, &mut ui_state, group_pos);
+        assert_eq!(
+            ui_state.move_to_group,
+            Some((SessionId(1), Some(mullion_store::GroupId(7)))),
+            "点子菜单里的分组名必须落下移动意图,否则点了没反应"
+        );
+        assert!(
+            ui_state.connect_request.is_none(),
+            "移动分组不该顺带发起连接"
+        );
+
+        // ---- 「连接」----
+        let out = open_menu(&ctx, &mut ui_state);
+        let connect_pos = find_text_pos(&out.shapes, "连接").expect("菜单里应该有「连接」");
+        let _ = click_at(&ctx, &mut ui_state, connect_pos);
+        assert_eq!(
+            ui_state.connect_request,
+            Some(SessionId(1)),
+            "点「连接」必须设 connect_request"
+        );
+        assert!(
+            !ui_state.connect_skip_automation,
+            "普通「连接」不该跳过自动化——那是另一条菜单项的语义"
+        );
+    }
+
     /// 复核指出的边界洞:「旧目标 X 这一帧没渲染」+「同一帧内另一行 Z 被
     /// 右键新设了 `pending_delete`」同时发生时,不能把 Z 刚写下的新值当成
     /// 「目标未渲染」误删。构造方法:搜索词从头到尾固定成只命中 session-a,
@@ -917,6 +1640,27 @@ mod tests {
         let mut c = crate::ui::badge::AppearanceCache::default();
         c.rebuild(&sessions, &[]);
         c
+    }
+
+    /// 用给定的会话集渲染一次左栏。`run_list` 只能换外观缓存,换不了会话本身。
+    fn run_list_with(sessions: &[SessionRecord]) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    &t,
+                    &mut ui_state,
+                    sessions,
+                    &groups,
+                    None,
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            });
+        })
     }
 
     fn run_list(appearance: &crate::ui::badge::AppearanceCache) -> usize {

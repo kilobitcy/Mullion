@@ -4,3 +4,12 @@
 # 编辑器 / OS
 *.swp
 .DS_Store
+
+# 交叉编译产物与发版草稿:体积大、每版都变,只走 GitHub Release 不入库
+/mullion.exe
+/mullion.exe.sha256
+/notes.md
+
+# 本地待办与工具落盘,跟代码无关
+/todo.md
+/.playwright-mcp/

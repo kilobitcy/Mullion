@@ -208,6 +208,24 @@ impl Vault {
         Ok(())
     }
 
+    /// 只把会话挪到另一个分组(`None` = 未分组),别的字段一律不动。
+    ///
+    /// 不走 `update`:那个要一份完整 `SessionDraft`,而调用方(右键菜单)手上
+    /// 只有一个 id。为改一个 `group_id` 去凭空重建 draft,漏填任何一个字段都是
+    /// 静默把用户的配置改掉。
+    ///
+    /// **不重打 `modified_at`**:换分组是组织动作,不是内容变更;把它算成「修改」
+    /// 会让按修改时间排序/审阅的人看到一堆没改过内容的会话浮到最前面。
+    pub fn set_group(&mut self, id: SessionId, group: Option<GroupId>) -> Result<(), StoreError> {
+        let rec = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(StoreError::NotFound(id))?;
+        rec.identity.group_id = group;
+        Ok(())
+    }
+
     pub fn groups(&self) -> &[GroupRecord] {
         &self.groups
     }
@@ -466,6 +484,39 @@ mod tests {
         assert_eq!(vault.list().len(), 2);
         assert_eq!(vault.get(id1).unwrap().modified_at, "2026-07-25T00:00:00Z");
         assert_eq!(vault.secret(id1).unwrap().password.as_deref(), Some("p1"));
+    }
+
+    /// 换分组只动 `group_id`:密码、时间戳、其余字段都不许被顺手改掉
+    /// (走查 3 的右键「移动到分组」用它)。
+    #[test]
+    fn set_group_moves_the_session_without_touching_anything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = vault.add(draft_pw("a", "p1"), "2026-07-25T00:00:00Z");
+        let gid = vault.add_group("生产".into());
+
+        vault.set_group(id, Some(gid)).unwrap();
+        assert_eq!(vault.get(id).unwrap().identity.group_id, Some(gid));
+        assert_eq!(
+            vault.get(id).unwrap().modified_at,
+            "2026-07-25T00:00:00Z",
+            "换分组是组织动作,不该重打修改时间"
+        );
+        assert_eq!(
+            vault.secret(id).unwrap().password.as_deref(),
+            Some("p1"),
+            "换分组不该动密文"
+        );
+        assert_eq!(vault.get(id).unwrap().identity.name, "a");
+
+        // 移回未分组。
+        vault.set_group(id, None).unwrap();
+        assert_eq!(vault.get(id).unwrap().identity.group_id, None);
+
+        assert!(matches!(
+            vault.set_group(SessionId(999), None),
+            Err(StoreError::NotFound(_))
+        ));
     }
 
     #[test]

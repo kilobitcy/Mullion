@@ -652,6 +652,10 @@ impl App {
         // 删会话,所以计划必须在用户点击的这一帧定死。
         // 上一次的结论到此为止:新连接开始了,旧结论就是误导信息。
         self.automation_status = None;
+        // 走查 4:状态点进「连接中」。失败标记一并清掉 —— 上一次失败的是哪条
+        // 都不重要,用户已经在重新拨了,旧的红标记只会误导。
+        self.ui.connecting = self.ui.connect_request_last;
+        self.ui.connect_failed = None;
         self.pending_automation =
             crate::automation::pending_for(self.ui.connect_request_last, |id| {
                 let store = self.store.as_ref()?;
@@ -1030,8 +1034,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
                 self.ui.close_session_manager();
                 // ConnectOk 不带 SessionId(见 UserEvent 定义),用发起连接时
-                // 记下的那条。状态点只区分「这条连上了 / 没连上」两态。
+                // 记下的那条。
                 self.connected_session = self.ui.connect_request_last;
+                // 走查 4:拨号结束,「连接中」态收工。
+                self.ui.connecting = None;
                 self.ui_dirty = true;
                 // F40~F44:起自动化。旧那次(如果有)的结论对新连接没有意义。
                 if let Some(old) = self.automation.take() {
@@ -1170,6 +1176,11 @@ impl ApplicationHandler<UserEvent> for App {
                     std::process::exit(1);
                 }
                 self.ui.set_error(msg);
+                // 走查 4:把失败落到发起连接的那条会话上。`connect_request_last`
+                // 在整个拨号期间不会变(下一次 `spawn_connect` 才重写),所以
+                // 这里读到的一定是刚失败的那条。
+                self.ui.connect_failed = self.ui.connect_request_last;
+                self.ui.connecting = None;
                 self.request_ui_redraw();
             }
             UserEvent::ProbeOk(epoch) => {
@@ -1734,16 +1745,34 @@ impl ApplicationHandler<UserEvent> for App {
                 // 变更后重算。
                 let touched_store = self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
-                    || self.ui.group_intent.is_some();
-                if self.ui.delete_request.is_some() || self.ui.save_request.is_some() {
+                    || self.ui.group_intent.is_some()
+                    || self.ui.move_to_group.is_some();
+                if self.ui.delete_request.is_some()
+                    || self.ui.save_request.is_some()
+                    || self.ui.move_to_group.is_some()
+                {
                     // keyring/TOML 是同步 IO,在事件回调里可能阻塞(Windows 凭据管理器
                     // 偶发几百 ms),打点让看门狗能指认。
                     diag::mark(diag::Stage::StoreIo);
                 }
                 if let Some(id) = self.ui.delete_request.take() {
                     if let Some(store) = self.store.as_mut() {
-                        if let Err(e) = store.delete(id).and_then(|_| store.save()) {
-                            self.ui.set_error(format!("删除失败:{e}"));
+                        match store.delete(id).and_then(|_| store.save()) {
+                            // 走查 13:落盘成功要有一句反馈。删除尤其需要 ——
+                            // 那一行从列表里消失了,但「是真删了还是我看花眼」
+                            // 只有这句话能回答。
+                            Ok(()) => self.ui.set_toast("已删除会话"),
+                            Err(e) => self.ui.set_error(format!("删除失败:{e}")),
+                        }
+                    }
+                }
+                // 走查 3:右键「移动到分组」。它改的是继承链的上一层,所以下面
+                // `touched_store` 触发的 `refresh_appearance` 必须把它算进去。
+                if let Some((id, gid)) = self.ui.move_to_group.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match store.set_group(id, gid).and_then(|_| store.save()) {
+                            Ok(()) => self.ui.set_toast("已移动到分组"),
+                            Err(e) => self.ui.set_error(format!("移动分组失败:{e}")),
                         }
                     }
                 }
@@ -1755,8 +1784,12 @@ impl ApplicationHandler<UserEvent> for App {
                         let then_connect = save.then_connect;
                         match apply_save(store, save, &now) {
                             Ok(id) => {
+                                // 「保存并连接」下一秒就开始拨号,状态栏自己会说话,
+                                // 再飘一条「已保存」是噪音。
                                 if then_connect {
                                     self.ui.connect_request = Some(id);
+                                } else {
+                                    self.ui.set_toast("已保存");
                                 }
                             }
                             Err(msg) => self.ui.set_error(msg),

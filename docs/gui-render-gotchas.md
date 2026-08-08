@@ -234,6 +234,35 @@
   `.id_salt(gid)` 这一行测试立即变红(已实测)。无头容器里这条能测,因为撞的是 egui 的
   `Id` 值本身(可用 `header_response.id` 读出来比较),不需要真的截图或判断像素。
 
+- **测试里用 `ctx.set_pixels_per_point()` 设 DPI,会把画布悄悄变成 8000×8000。**
+  它是 `Context::set_zoom_factor` 的包装,只在**下一帧**生效(`egui-0.30.0/src/context.rs`
+  1953-1957 是包装、1994-2004 是延迟);生效那一帧会把「上一帧的 screen_rect」按新旧
+  ppp 之比重新缩放后**盖掉本帧显式传入的 screen_rect**(同文件 462-475,注释自称是给
+  「zoom 抖动」擦屁股)。对全新 `Context`,「上一帧」是 egui 内置的默认占位符
+  10_000×10_000(`input_state/mod.rs:247`),ppp=1.25 缩出 8000×8000 —— 热身帧里的
+  `Grid` 就在这块虚假巨宽画布上把列宽记忆定成 8000,而列宽记忆是跨帧累积在同一份
+  `ctx.memory` 里的,第二帧即使 screen_rect 已正确回落到 300×600,分区分隔线照样被撑到
+  x=8000。表现是「布局测试报了一个荒谬的越界数字」,极易被误判成生产代码 bug。
+  **规则**:测试里设 DPI 一律走 `RawInput.viewports[&viewport_id].native_pixels_per_point
+  = Some(ppp)`,它直接作用于当前帧,不经过 `set_zoom_factor`/抖动规避那条路径。
+  **守护**:`session_manager::fields::tests::run_page_at`(所有页级越界测试的唯一入口,
+  那里有同样的注释)。
+- **量「有没有画出面板」必须先 `ui.set_clip_rect(Rect::EVERYTHING)`。** `CentralPanel`
+  把 `ui` 的 clip_rect 钉死在面板矩形上(`panel.rs:1109`,注释「If we overflow, don't do
+  so visibly (#4475)」),而控件 paint 前会查 `ui.is_rect_visible(rect)` —— **完全**越界的
+  控件压根不产生 Shape,扫 `FullOutput::shapes` 找最右边界的测量对它失明(对**部分**
+  越界、只被削掉半个字的仍有效)。撑大 clip_rect 只是为了让测量拿到「控件本该画在哪」,
+  不代表生产代码的裁剪被关掉。
+- **`TextEdit` 的内容和 hint 都会画到框外,`desired_width`/`clip_text` 拦不住。**
+  singleline 走 `LayoutJob::simple_singleline`(`widgets/text_edit/builder.rs:514-521`),
+  **忽略 `wrap_width`**,galley 永远按完整文本宽排版;再由 `builder.rs:726-734` 的
+  `extra_size = galley.size() - rect.size()` 触发一次 `ui.allocate_rect`,把**父 `Ui`**
+  的 min_rect/max_rect 一起撑宽(上游是为了让 ScrollArea 能滚到光标)。后果是同一个 `Ui`
+  里跟在后面的所有兄弟控件都按撑宽后的 `available_width` 重算,越界「到处都是」而不是
+  一处。`Grid::max_col_width` 同样拦不住(`allocate_rect` 直接打在父 `Ui` 上,不过 Grid
+  的宽度计算)。**规则**:hint 文案有硬长度预算(300px 面板下框内容区约 192pt ≈ 12 个
+  汉字),超了就是画到面板外;用户数据那一支管不住,只能靠 clip 裁剪。
+
 ## 字体
 
 - **字号按 DPI 缩放**:`window.inner_size()` 是物理像素,字号也须物理像素:

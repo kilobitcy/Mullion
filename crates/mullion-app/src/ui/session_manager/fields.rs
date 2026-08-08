@@ -1,10 +1,15 @@
-//! 右栏五个 Tab 的字段布局。从 `editor.rs` 切出来是因为字段多、改动频繁,
+//! 右栏四个 Tab 的字段布局。从 `editor.rs` 切出来是因为字段多、改动频繁,
 //! 混在窗口骨架里会让 `editor.rs` 涨到读不动。
 
 use egui::Ui;
 use mullion_store::{GroupRecord, Protocol, SessionId, SessionRecord, TmuxChoice};
 
 use crate::theme::Theme;
+use crate::ui::metrics::{
+    button_reserve, field_w, FIELD_W_L, FIELD_W_M, FIELD_W_MIN, FIELD_W_S, LABEL_COL_W,
+    TEXT_EDIT_MARGIN_X,
+};
+use crate::ui::session_manager::inherit_row::{self, Source};
 use crate::ui::session_manager::{
     AuthKindUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
 };
@@ -13,21 +18,53 @@ use crate::ui::session_manager::{
 fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
         .num_columns(2)
-        .spacing([12.0, 10.0])
-        .min_col_width(88.0)
+        .spacing([crate::ui::metrics::SP_M, crate::ui::metrics::SP_S])
+        .min_col_width(LABEL_COL_W)
         .show(ui, add);
 }
 
-/// 分区小标题。11px + fg_muted,上面留 10px —— 表单一路平铺下来
-/// 没有任何视觉锚点,眼睛找不到「这几行是一组」。
-fn section(ui: &mut Ui, t: &Theme, title: &str) {
-    ui.add_space(10.0);
+/// 分区小标题。11px + fg_muted,上面留一档大间距 + 一条细分隔线 ——
+/// 表单一路平铺下来没有任何视觉锚点,眼睛找不到「这几行是一组」
+/// (走查 P2-17)。
+///
+/// 首个分区不画分隔线:页面顶上来一条横线看着像误画的。
+///
+/// **不要**改用 `ui.min_rect().height() > 0.0` 这类容器状态推断:实测过,
+/// `egui::CentralPanel` 一进去 `min_rect` 就等于整个 `max_rect`(非零),
+/// 只有生产环境实际包着的 `egui::ScrollArea` 内层 ui 才会从零开始——
+/// 判据会不会画线因此取决于「外面拿什么容器包这一页」这种调用方看不见
+/// 的细节,坏起来是「所有分区顶上都多一条线」或者「所有分区都没有线」,
+/// 取决于测试用什么容器渲染。
+///
+/// `first` 是**页面级游标**,不是每次调用现填的字面量:`&mut bool`,
+/// 用一次就在函数内部自翻成 `false`。**必须由页面级函数**(`basic` /
+/// `appearance` / `auth` / `automation`)**在最外层持有并声明
+/// `let mut first = true;`**,那一页内所有 `section(...)` 调用都传
+/// `&mut first`。这样「这一页第几个分区」永远由调用序列自动决定,不
+/// 依赖任何人手工在每个调用点上把 `true`/`false` 敲对——旧版直接传
+/// `bool` 字面量时,忘了把新插入分区之前那个改成 `false`,或者忘了把
+/// 原来的首个分区改成 `false`,编译器和测试都拦不住(两个"first"或者
+/// 顺序错位)。
+///
+/// `network()` / `jump()` 是被 `basic()` 调用的**子函数**,不是页面级
+/// 函数——它们必须原样接住调用方传来的游标继续往下传,**不许**在函数
+/// 内部自己 `let mut first = true`:那等于把硬编码换了个地方,子函数被
+/// 单独渲染成一页时(如某些测试)看起来「恰好」对,一旦真被插进别的页面
+/// 中间就会在不该有线的地方多画一条。
+fn section(ui: &mut Ui, t: &Theme, title: &str, first: &mut bool) {
+    use crate::ui::metrics::{SP_L, SP_XS};
+    if !*first {
+        ui.add_space(SP_L);
+        ui.separator();
+    }
+    *first = false;
+    ui.add_space(SP_XS);
     ui.label(
         egui::RichText::new(title)
             .size(11.0)
             .color(crate::theme::c32(t.fg_muted)),
     );
-    ui.add_space(4.0);
+    ui.add_space(SP_XS);
 }
 
 /// 必填项标签:名字后跟一个 danger 色的星号。
@@ -36,6 +73,23 @@ fn required(ui: &mut Ui, t: &Theme, text: &str) {
         ui.label(text);
         ui.colored_label(crate::theme::c32(t.danger), "*");
     });
+}
+
+/// 走查 15:字段下方的一行内联红字。占一整行 grid,左格留空让文字跟输入框
+/// 左对齐 —— 挂在标签那一列会被误读成「这一行的标签」。
+///
+/// 只在 `show` 为真时才占行:恒占位会让表单在没有错误时凭空多出三段空白。
+fn field_error(ui: &mut Ui, t: &Theme, show: bool, msg: &str) {
+    if !show {
+        return;
+    }
+    ui.label("");
+    ui.label(
+        egui::RichText::new(msg)
+            .size(11.0)
+            .color(crate::theme::c32(t.danger)),
+    );
+    ui.end_row();
 }
 
 /// 三态下拉:继承(`None`)/ 开 / 关。
@@ -62,19 +116,38 @@ fn tri_state(ui: &mut Ui, id: &str, v: &mut Option<bool>, on: &str, off: &str) -
         .response
 }
 
-/// 可选毫秒数:勾选框 + `DragValue`。未勾选时显示内置默认值作提示 ——
+/// 可选毫秒数:勾选框 + `DragValue`。未勾选时显示**实际会生效的值和来源** ——
 /// 光给一个空框,用户不知道不填会发生什么。
+///
+/// `line` 由调用方算好传进来(见 `resolve_u32`):旧版在这里写死
+/// 「继承(内置默认 {default} ms)」,而分组**可以**配这三个字段,那时候
+/// 这句话是错的 —— 用户会以为改分组不管用(走查 10)。
 ///
 /// `min` 不是摆设:两个「延时」类字段填 0 就是「不等」,语义正常;而「就绪超时」
 /// 填 0 意味着 `run()` 的 `sleep(0)` 必然抢在首字节前面,自动化每次都被跳过,
 /// 状态栏还会打出「自动化已跳过:0s 未收到远端输出」—— `status_text` 那里
 /// 特意用 `div_ceil` 就是为了永不出现「0s」(见 `sub_second_timeout_rounds_up_
 /// so_it_never_reads_zero`),但 `div_ceil` 拦不住字面 0。用下界从源头挡掉。
-fn opt_ms(ui: &mut Ui, t: &Theme, id: &str, v: &mut Option<u32>, default: u32, min: u32, max: u32) {
+#[allow(clippy::too_many_arguments)]
+fn opt_ms(
+    ui: &mut Ui,
+    t: &Theme,
+    id: &str,
+    v: &mut Option<u32>,
+    default: u32,
+    min: u32,
+    max: u32,
+    line: Option<String>,
+) {
     // `push_id` 而不是 `let _ = id;` —— 三个延时框长得一模一样,勾选框的 id 靠
     // 位置生成。一旦某一行因为条件渲染消失,后面几行的位置 id 会整体前移,
     // egui 会把上一行的勾选状态套到下一行上。给个显式 salt 钉死。
     ui.push_id(id, |ui| {
+        // 这一行**不用** `horizontal_wrapped`:后面跟的是纯灰字,窄栏被裁掉
+        // 只损失可读性;而 wrap 会把这一行的布局收敛推迟一帧,让按「提示文字
+        // 位置反推复选框坐标」的守护测试(`checking_each_delay_box_...`)打空。
+        // 阶段 1 换 `wrapped` 的那几处后面跟的都是**按钮**——被裁掉等于功能
+        // 不可达,那才值得换。
         ui.horizontal(|ui| {
             let mut on = v.is_some();
             if ui.checkbox(&mut on, "").changed() {
@@ -85,10 +158,9 @@ fn opt_ms(ui: &mut Ui, t: &Theme, id: &str, v: &mut Option<u32>, default: u32, m
                     ui.add(egui::DragValue::new(ms).range(min..=max).suffix(" ms"));
                 }
                 None => {
-                    ui.colored_label(
-                        crate::theme::c32(t.fg_dimmer),
-                        format!("继承(内置默认 {default} ms)"),
-                    );
+                    if let Some(s) = line {
+                        ui.colored_label(crate::theme::c32(t.fg_dimmer), s);
+                    }
                 }
             }
         });
@@ -113,12 +185,66 @@ fn warn_banner(ui: &mut Ui, t: &Theme, text: &str) {
 const DELAY_WARNING: &str = "配了延时的命令会拆成多步发送。第二步起,字符会进入\
 当时屏幕上的任何程序 —— 如果远端已经 attach 上 TUI,它们会被打进那个程序的输入框。";
 
-/// F43:env 区的固定警告。**不是可选润色**——用户会拿它存密码,而这里
-/// 存不住密码:值以明文进 `sessions.toml`(不进 `secrets.enc`),且终归要以
-/// `export` 行发到远端。
-const ENV_WARNING: &str = "环境变量不是存密码的地方 —— 值以明文存进 sessions.toml,\
-并会以 export 行发到远端,落进 shell 历史与 /proc/<pid>/environ。要存密码请用凭据。";
+/// F43:env 区的常驻说明。**这是事实陈述,不是警告**——走查 18:原来这里是
+/// 一整块 `warn` 描边横幅,不管有没有风险都常驻。天天见的警告等于没有警告,
+/// 用户学会跳过它,真出事那次也一起跳过。所以事实降成灰字,风险交给
+/// `env_hint::secret_warning` —— 只在变量名真的像密码时才升回红框。
+const ENV_NOTE: &str = "变量值以明文存进 sessions.toml,并会以 export 行发到远端。";
 
+/// 「登录后」页上游分组的快照:分组名 + 它的 automation 分节。
+///
+/// 拷出来而不是持 `&GroupRecord`:下面整段都持着 `&mut buf.preserved_automation`,
+/// 而 `buf.preserved_group_id` 的读取必须先于那个可变借用。
+type AutoUpstream = Option<(String, mullion_store::AutomationPrefs)>;
+
+/// 标量继承的取值 + 来源。会话侧已经是 `None`(继承)时才调用。
+///
+/// 层序只有一级(分组),所以不需要 `inherit::resolve` 那套通用机制 ——
+/// 但**取值规则必须和它一致**:分组有值就用分组的,否则内置默认。
+/// 不一致的话,UI 显示的「实际生效」和真正连上去用的值会不同,
+/// 这比不显示更坏。
+fn resolve_bool<'a>(
+    up: Option<&'a (String, mullion_store::AutomationPrefs)>,
+    pick: impl Fn(&mullion_store::AutomationPrefs) -> Option<bool>,
+    builtin: bool,
+) -> (bool, Source<'a>) {
+    match up {
+        Some((name, prefs)) => match pick(prefs) {
+            Some(v) => (v, Source::Group(name)),
+            None => (builtin, Source::Builtin),
+        },
+        // 未分组 = 没东西可继承 = 落内置默认。**不用** `NoUpstream`:
+        // 那个变体是给跳板/代理的,那里「没有上游」意味着「实际等同于无」,
+        // 是用户需要知道的原因;标量字段没有分组照样有内置默认值,说
+        // 「未分组,没有上游可继承」会让用户反问「那 300ms 哪来的」。
+        None => (builtin, Source::Builtin),
+    }
+}
+
+/// 同 `resolve_bool`,`u32` 版。两个函数不合并成泛型:泛型版要么带上
+/// `T: Copy` 约束再让调用方写 turbofish,要么就得给 `String` 也开个口子 ——
+/// 两行重复换来调用点全部无标注,划算。
+fn resolve_u32<'a>(
+    up: Option<&'a (String, mullion_store::AutomationPrefs)>,
+    pick: impl Fn(&mullion_store::AutomationPrefs) -> Option<u32>,
+    builtin: u32,
+) -> (u32, Source<'a>) {
+    match up {
+        Some((name, prefs)) => match pick(prefs) {
+            Some(v) => (v, Source::Group(name)),
+            None => (builtin, Source::Builtin),
+        },
+        // 未分组 = 没东西可继承 = 落内置默认。**不用** `NoUpstream`:
+        // 那个变体是给跳板/代理的,那里「没有上游」意味着「实际等同于无」,
+        // 是用户需要知道的原因;标量字段没有分组照样有内置默认值,说
+        // 「未分组,没有上游可继承」会让用户反问「那 300ms 哪来的」。
+        None => (builtin, Source::Builtin),
+    }
+}
+
+/// `focus_name`:走查 21 的一次性聚焦标志,由调用方 `take()` 后传进来 ——
+/// 刚点「+ 新建」的那一帧把光标放进「名称」框,省用户一次点击。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn basic(
     ui: &mut Ui,
     t: &Theme,
@@ -126,35 +252,100 @@ pub(super) fn basic(
     groups: &[GroupRecord],
     sessions: &[SessionRecord],
     editing: Option<SessionId>,
+    presence: SecretPresence,
+    focus_name: bool,
+    touched: &mut super::validate::Touched,
 ) {
-    section(ui, t, "基本");
+    // 页面级游标:整个「连接」页(基本/归类/代理/跳板)共用一个,
+    // 见 `section()` 文档注释。
+    let mut first = true;
+    section(ui, t, "基本", &mut first);
     grid(ui, "sm_basic", |ui| {
         required(ui, t, "名称");
-        ui.add(egui::TextEdit::singleline(&mut buf.name).desired_width(f32::INFINITY));
+        let name_resp = ui.add(
+            egui::TextEdit::singleline(&mut buf.name).desired_width(field_w(
+                ui.available_width(),
+                FIELD_W_M,
+                0.0,
+            )),
+        );
+        if focus_name {
+            name_resp.request_focus();
+        }
+        touched.name |= name_resp.lost_focus();
         ui.end_row();
+        field_error(
+            ui,
+            t,
+            touched.name && buf.name.trim().is_empty(),
+            "会话名称不能为空",
+        );
 
         required(ui, t, "主机");
-        ui.add(egui::TextEdit::singleline(&mut buf.host).desired_width(f32::INFINITY));
+        let host_resp = ui.add(
+            egui::TextEdit::singleline(&mut buf.host).desired_width(field_w(
+                ui.available_width(),
+                FIELD_W_M,
+                0.0,
+            )),
+        );
+        touched.host |= host_resp.lost_focus();
         ui.end_row();
+        field_error(
+            ui,
+            t,
+            touched.host && buf.host.trim().is_empty(),
+            "主机不能为空",
+        );
 
         ui.label("端口");
-        ui.add(egui::TextEdit::singleline(&mut buf.port).desired_width(80.0));
+        let port_resp = ui.add(
+            egui::TextEdit::singleline(&mut buf.port)
+                .hint_text("22")
+                .desired_width(field_w(ui.available_width(), FIELD_W_S, 0.0)),
+        );
+        touched.port |= port_resp.lost_focus();
         ui.end_row();
+        // 端口的红字不看 `touched`:一个填错的端口就是填错了,跟用户填到
+        // 哪一步无关;而空端口是合法的(落默认 22),压根没有红字可出。
+        field_error(
+            ui,
+            t,
+            super::validate::port(&buf.port).is_err(),
+            "端口要填 1~65535 之间的数字",
+        );
 
         ui.label("协议");
-        egui::ComboBox::from_id_salt("sm_protocol")
-            .selected_text(match buf.protocol {
-                Protocol::Ssh => "ssh",
-                Protocol::Sftp => "sftp",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut buf.protocol, Protocol::Ssh, "ssh");
-                ui.selectable_value(&mut buf.protocol, Protocol::Sftp, "sftp");
-            });
+        // `line` 必须在闭包**之前**求值:闭包持 `&mut buf`,之后再读
+        // `buf.protocol` 借用检查过不了。
+        let sftp_note = matches!(buf.protocol, Protocol::Sftp)
+            .then(|| "sftp 尚未实现,连接会按 ssh 处理".to_string());
+        // sftp 在数据模型里存在(`Protocol::Sftp`),但拨号路径还没实现 ——
+        // 平级摆着会让人选了、存了、然后连不上而不知道为什么(走查 19)。
+        // 保留可选而不是删掉:已经存了 sftp 的会话不该在 UI 上凭空消失。
+        //
+        // 复用 `slot` 而不是另写一遍 `horizontal_wrapped` + 灰字:它就是
+        // 「控件 + 一行灰说明」这个形状,跟继不继承无关。
+        inherit_row::slot(
+            ui,
+            t,
+            |ui| {
+                egui::ComboBox::from_id_salt("sm_protocol")
+                    .selected_text(match buf.protocol {
+                        Protocol::Ssh => "ssh",
+                        Protocol::Sftp => "sftp",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut buf.protocol, Protocol::Ssh, "ssh");
+                        ui.selectable_value(&mut buf.protocol, Protocol::Sftp, "sftp(未实现)");
+                    });
+            },
+            sftp_note,
+        );
         ui.end_row();
     });
 
-    section(ui, t, "归类");
+    section(ui, t, "归类", &mut first);
     grid(ui, "sm_basic_group", |ui| {
         ui.label("分组");
         let current = buf
@@ -172,16 +363,79 @@ pub(super) fn basic(
             });
         ui.end_row();
 
-        ui.label("备注");
+        // 走查 6:标签终于有编辑入口了。`identity.tags` 一直在 schema 里、
+        // 一直被搜索命中、一直参与分组 Merge 继承 —— 唯独填不进去,而搜索框
+        // 的占位符还写着「搜索名称 / 主机 / 标签」,承诺了一个填不了的东西。
+        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.label("标签");
+        });
+        ui.vertical(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut buf.tag_input)
+                    .hint_text(crate::theme::hint_text(t, "回车添加,逗号或空格分隔"))
+                    .desired_width(field_w(ui.available_width(), FIELD_W_L, 0.0)),
+            );
+            // 回车确认。`lost_focus()` 单独判会把「点到别处」也当成确认 ——
+            // 那样用户点一下别的字段,半截输入就被当成标签存下了。
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                super::tags::merge_into(&mut buf.preserved_tags, &buf.tag_input);
+                buf.tag_input.clear();
+                resp.request_focus(); // 连着加几个标签时不用每次重新点输入框
+            }
+            if !buf.preserved_tags.is_empty() {
+                ui.add_space(4.0);
+                let mut remove: Option<usize> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, tag) in buf.preserved_tags.iter().enumerate() {
+                        // id 必须 salt 到 `(索引, 文本)`:两个 chips 文字相同
+                        // (大小写不同,去重放行)时,只按文本 salt 会撞 id,
+                        // 点一个 ✕ 删掉另一个。
+                        let id = ui.id().with(("sm_tag_chip", i, tag.as_str()));
+                        ui.push_id(id, |ui| {
+                            egui::Frame::none()
+                                .fill(crate::theme::c32(t.sunken_bg))
+                                .rounding(10.0)
+                                .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(crate::theme::c32(t.fg_dim), tag);
+                                        if ui
+                                            .add(egui::Button::new("✕").frame(false).small())
+                                            .clicked()
+                                        {
+                                            remove = Some(i);
+                                        }
+                                    });
+                                });
+                        });
+                    }
+                });
+                if let Some(i) = remove {
+                    buf.preserved_tags.remove(i);
+                }
+            }
+        });
+        ui.end_row();
+
+        // 备注顶对齐:Grid 每行默认 `Align::Center`,3 行高的 multiline
+        // 旁边的短标签会被垂直居中,跟上面几行的标签对不齐(走查 P2-17)。
+        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.label("备注");
+        });
         ui.add(
             egui::TextEdit::multiline(&mut buf.note)
                 .desired_rows(3)
-                .desired_width(f32::INFINITY),
+                .desired_width(field_w(ui.available_width(), FIELD_W_L, 0.0)),
         );
         ui.end_row();
     });
 
-    jump(ui, t, buf, groups, sessions, editing);
+    // 代理排在跳板之前:连接路径是 本机 →(代理)→ 第一跳 →…→ 目标主机,
+    // 页面自上而下按这个顺序读得通。走查 P1-8 把原「高级」页并到这里 ——
+    // 那一页只有一行代理,右侧 70% 是空白。
+    network(ui, t, buf, groups, presence, &mut first);
+
+    jump(ui, t, buf, groups, sessions, editing, &mut first);
 }
 
 /// F61/F62 外观。独占一个 Tab(`TAB_APPEARANCE`,排在「登录后」之后)。
@@ -191,7 +445,8 @@ pub(super) fn basic(
 pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
     use mullion_store::{ColorSpec, ColorTarget, IconKind, IconSpec};
 
-    section(ui, t, "外观");
+    let mut first = true;
+    section(ui, t, "外观", &mut first);
     grid(ui, "sm_basic_appearance", |ui| {
         ui.label("图标");
         ui.vertical(|ui| {
@@ -208,11 +463,15 @@ pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
             buf.icon_emoji_mode = on;
 
             if on {
-                ui.horizontal(|ui| {
+                // 输入框 + 8 个预设按钮串一行,窄栏下放不完。`horizontal` 不换行
+                // 会把后面几个 emoji 顶出面板(走查 P0-1 同族),换 `wrapped`。
+                ui.horizontal_wrapped(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut buf.icon_emoji_buf)
-                            .desired_width(60.0)
-                            .hint_text("🔥"),
+                            // 只放一两个字符,取最小档 —— 但仍走 `field_w`,
+                            // 极窄时才不会算出比下界还小的宽度。
+                            .desired_width(field_w(ui.available_width(), FIELD_W_MIN, 0.0))
+                            .hint_text(crate::theme::hint_text(t, "🔥")),
                     );
                     for e in ["🔥", "🐧", "🗄", "⚙", "🌐", "🔒", "🧪", "📦"] {
                         if ui.small_button(e).clicked() {
@@ -231,10 +490,7 @@ pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
                         ),
                     );
                 }
-                ui.colored_label(
-                    crate::theme::c32(t.fg_dimmer),
-                    "emoji 显示为黑白剪影(egui 不支持彩色字形)",
-                );
+                ui.colored_label(crate::theme::c32(t.fg_dimmer), "图标以单色显示");
 
                 // 缓冲空时写 `None` 但**模式位留着** —— 这正是上面那个 bug 的
                 // 修法:真值可以是「暂时没有」,模式不能跟着丢。
@@ -300,12 +556,14 @@ pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
             });
 
             if let Some(c) = &mut buf.preserved_appearance.color {
-                ui.horizontal(|ui| {
+                // 后面可能跟一条长警告文字,窄栏下必须允许它折行。
+                ui.horizontal_wrapped(|ui| {
                     ui.label("自定义");
                     ui.add(
                         egui::TextEdit::singleline(&mut c.hex)
-                            .desired_width(90.0)
-                            .hint_text("#rrggbb"),
+                            // `#rrggbb` 是定长短值,归短值档。
+                            .desired_width(field_w(ui.available_width(), FIELD_W_S, 0.0))
+                            .hint_text(crate::theme::hint_text(t, "#rrggbb")),
                     );
                     if crate::theme::parse_hex(&c.hex).is_none() {
                         ui.colored_label(crate::theme::c32(t.warn), "不是 #rrggbb,不会显示");
@@ -335,6 +593,42 @@ pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
         });
         ui.end_row();
     });
+
+    // 走查 4:「竖条如果是『图标颜色』的体现,就和『图标』页的颜色设置对应上,
+    // 并在图标页加实时预览」。竖条本来就同源(两边都走
+    // `badge::should_paint(ColorTarget::ListItem)`),缺的只是让用户当场看见。
+    section(ui, t, "预览", &mut first);
+    let preview = crate::ui::badge::Appearance {
+        icon: buf.preserved_appearance.icon.clone(),
+        color: buf.preserved_appearance.color.clone(),
+    };
+    let name = if buf.name.trim().is_empty() {
+        "会话名称"
+    } else {
+        buf.name.trim()
+    };
+    let host = if buf.host.trim().is_empty() {
+        "host"
+    } else {
+        buf.host.trim()
+    };
+    let user = if buf.user.trim().is_empty() {
+        "user"
+    } else {
+        buf.user.trim()
+    };
+    crate::ui::session_manager::list::preview_row(
+        ui,
+        t,
+        name,
+        &format!("{user}@{host}"),
+        buf.protocol,
+        &preview,
+    );
+    ui.colored_label(
+        crate::theme::c32(t.fg_dimmer),
+        "左栏列表里就是这个样子。竖条只在「作用于」勾了「会话列表」时出现。",
+    );
 }
 
 /// F5 跳板链。放在**「连接」页**而不是「高级」页:跳板回答的是「怎么走到这台
@@ -349,32 +643,49 @@ fn jump(
     groups: &[GroupRecord],
     sessions: &[SessionRecord],
     editing: Option<SessionId>,
+    first: &mut bool,
 ) {
-    section(ui, t, "跳板");
+    section(ui, t, "跳板", first);
     grid(ui, "sm_basic_jump", |ui| {
         ui.label("跳板");
-        ui.horizontal(|ui| {
-            // 与「认证方式」同样的选中态处理:egui 默认的 gamma_multiply 底色
-            // 在深色面板上偏暗,分不出选中态。见 `auth()` 里那段注释。
-            let vis = &mut ui.visuals_mut().selection;
-            vis.bg_fill = crate::theme::c32(t.accent).linear_multiply(0.35);
-            ui.selectable_value(&mut buf.jump_mode, JumpModeUi::None, "无");
-            ui.selectable_value(&mut buf.jump_mode, JumpModeUi::Inherit, "继承分组");
-            ui.selectable_value(&mut buf.jump_mode, JumpModeUi::Custom, "自定义");
+        // 「继承分组」→「继承」:同一件事全项目一个说法(走查 19)。
+        // 来源不写进按钮文字,交给右边那行灰字 —— 未分组时上游根本不是
+        // 「分组」,按钮上写死「分组」就是错的。
+        let line = matches!(buf.jump_mode, JumpModeUi::Inherit).then(|| {
+            let (v, src) = match inherit_row::upstream(buf.preserved_group_id, groups) {
+                Some(g) => match &g.network.jump {
+                    Some(chain) if !chain.is_empty() => {
+                        (format!("{} 跳", chain.len()), Source::Group(&g.name))
+                    }
+                    // 分组自己也没配(`None` 或显式空链)→ 继承下来还是不走跳板。
+                    _ => ("不走跳板".to_string(), Source::Group(&g.name)),
+                },
+                // 这里才是 `NoUpstream` 真正该出现的地方:用户选了「继承」,
+                // 而根本没有上游 —— 结果等同于「无」,这个原因他需要知道。
+                None => ("不走跳板".to_string(), Source::NoUpstream),
+            };
+            inherit_row::effective_line(&v, src)
         });
+        inherit_row::slot(
+            ui,
+            t,
+            |ui| {
+                // 与「认证方式」同样的选中态处理:egui 默认的 gamma_multiply 底色
+                // 在深色面板上偏暗,分不出选中态。见 `auth()` 里那段注释。
+                let vis = &mut ui.visuals_mut().selection;
+                vis.bg_fill = crate::theme::c32(t.accent).linear_multiply(0.35);
+                ui.selectable_value(&mut buf.jump_mode, JumpModeUi::None, "无");
+                ui.selectable_value(&mut buf.jump_mode, JumpModeUi::Inherit, "继承");
+                ui.selectable_value(&mut buf.jump_mode, JumpModeUi::Custom, "自定义");
+            },
+            line,
+        );
         ui.end_row();
 
         match buf.jump_mode {
-            // 「无」是默认态,不需要任何解释性文字。
-            JumpModeUi::None => {}
-            JumpModeUi::Inherit => {
-                ui.label("");
-                ui.colored_label(
-                    crate::theme::c32(t.fg_dimmer),
-                    inherit_hint(buf.preserved_group_id, groups),
-                );
-                ui.end_row();
-            }
+            // 「无」是默认态,不需要任何解释性文字;「继承」的说明已经跟在
+            // 模式按钮右边了。
+            JumpModeUi::None | JumpModeUi::Inherit => {}
             JumpModeUi::Custom => {
                 ui.label("跳板链");
                 ui.vertical(|ui| chain_editor(ui, t, buf, sessions, editing));
@@ -382,19 +693,6 @@ fn jump(
             }
         }
     });
-}
-
-/// 「继承分组」下的说明文字。分组是**单层**的(设计 D1),所以上游只有一级,
-/// 这里能把继承结果算准,不必含糊地说「跟随上游」。
-fn inherit_hint(group_id: Option<mullion_store::GroupId>, groups: &[GroupRecord]) -> String {
-    let Some(g) = group_id.and_then(|gid| groups.iter().find(|g| g.id == gid)) else {
-        return "当前未分组,没有上游可继承 —— 实际等同于「无」。".to_string();
-    };
-    match &g.network.jump {
-        Some(chain) if !chain.is_empty() => format!("跟随分组「{}」:{} 跳。", g.name, chain.len()),
-        // 分组自己也没配(`None` 或显式空链)→ 继承下来还是不走跳板。
-        _ => format!("分组「{}」未配跳板 —— 实际等同于「无」。", g.name),
-    }
 }
 
 /// 自定义跳板链的逐跳编辑。按拨号顺序,`[0]` 最先连。
@@ -436,16 +734,18 @@ fn chain_editor(
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✕").clicked() {
+                    use crate::ui::icon::{icon_button, Glyph};
+                    // 自绘而不是打字:U+2715 / U+2191 / U+2193 都不在 egui
+                    // 内置拉丁字体和微软雅黑里,实机上全渲染成豆腐块 □
+                    // (走查 P0-5 报的「□ 完全看不出是删除」)。
+                    // tooltip 是 `icon_button` 的必填参数,忘不了。
+                    if icon_button(ui, Glyph::Cross, true, "移除此跳板") {
                         remove = Some(i);
                     }
-                    if ui
-                        .add_enabled(i + 1 < len, egui::Button::new("↓"))
-                        .clicked()
-                    {
+                    if icon_button(ui, Glyph::ArrowDown, i + 1 < len, "下移") {
                         swap = Some((i, i + 1));
                     }
-                    if ui.add_enabled(i > 0, egui::Button::new("↑")).clicked() {
+                    if icon_button(ui, Glyph::ArrowUp, i > 0, "上移") {
                         swap = Some((i - 1, i));
                     }
                 });
@@ -479,6 +779,38 @@ fn chain_editor(
             }
         });
 
+    // 走查 12:配好一条三跳的链,界面上只是三行会话名,看不出最终的连接
+    // 路径长什么样;而环 / 自引用 / 悬空要等到真正拨号才报错。这两行把
+    // `mullion_store::jump` 的既有判据提前到编辑时。
+    if !buf.jump_chain.is_empty() {
+        // 代理只在**显式**选了 SOCKS5/HTTP 时标进路径。「继承」态下上游代理
+        // 是什么这里查不到(`chain_editor` 拿不到 groups),宁可不画也不猜 ——
+        // 画错的连接路径比不画更糟。
+        let proxy = match buf.proxy_mode {
+            ProxyModeUi::Socks5 => Some("SOCKS5"),
+            ProxyModeUi::HttpConnect => Some("HTTP"),
+            ProxyModeUi::Inherit | ProxyModeUi::Direct => None,
+        };
+        // 目标用名称,没填名称就退回主机 —— 新建会话时往往先填主机。
+        let target = if buf.name.trim().is_empty() {
+            buf.host.trim()
+        } else {
+            buf.name.trim()
+        };
+        let target = if target.is_empty() {
+            "本会话"
+        } else {
+            target
+        };
+        ui.colored_label(
+            crate::theme::c32(t.fg_dimmer),
+            super::jump_preview::preview(&buf.jump_chain, sessions, proxy, target),
+        );
+        if let Some(msg) = super::jump_preview::check(&buf.jump_chain, sessions) {
+            ui.colored_label(crate::theme::c32(t.danger), msg);
+        }
+    }
+
     if let Some((a, b)) = swap {
         buf.jump_chain.swap(a, b);
     }
@@ -496,12 +828,27 @@ pub(super) fn auth(
     buf: &mut EditorBuffer,
     presence: SecretPresence,
     key_candidates: &[std::path::PathBuf],
+    touched: &mut super::validate::Touched,
 ) {
-    section(ui, t, "身份");
+    let mut first = true;
+    section(ui, t, "身份", &mut first);
     grid(ui, "sm_auth", |ui| {
         required(ui, t, "用户名");
-        ui.add(egui::TextEdit::singleline(&mut buf.user).desired_width(f32::INFINITY));
+        let user_resp = ui.add(
+            egui::TextEdit::singleline(&mut buf.user).desired_width(field_w(
+                ui.available_width(),
+                FIELD_W_M,
+                0.0,
+            )),
+        );
+        touched.user |= user_resp.lost_focus();
         ui.end_row();
+        field_error(
+            ui,
+            t,
+            touched.user && buf.user.trim().is_empty(),
+            "用户名不能为空",
+        );
 
         ui.label("认证方式");
         ui.horizontal(|ui| {
@@ -517,7 +864,7 @@ pub(super) fn auth(
         ui.end_row();
     });
 
-    section(ui, t, "凭据");
+    section(ui, t, "凭据", &mut first);
     grid(ui, "sm_auth_secret", |ui| match buf.auth_kind {
         AuthKindUi::Password => {
             ui.label("密码");
@@ -590,7 +937,27 @@ pub(super) fn auth(
             ui.end_row();
         }
     });
+
+    // 走查 20:说清楚这些东西存哪儿、怎么护着。用户手里是一台随时可能被
+    // 别人碰到的 Windows 机器,「这密码到底存哪了」是个合理且必须回答的问题
+    // —— 不回答,谨慎的人就干脆不用这个功能,每次连都手敲。
+    //
+    // 这段话必须与真实实现严格一致(`mullion-store`:`secrets.enc` +
+    // XChaCha20-Poly1305,主密钥进 Windows 凭据管理器)。UI 上写一句比实现
+    // 更好听的安全承诺,比不写更糟。
+    ui.add_space(crate::ui::metrics::SP_XS);
+    ui.label(
+        egui::RichText::new(SECRET_STORAGE_NOTE)
+            .size(11.0)
+            .color(crate::theme::c32(t.fg_muted)),
+    );
 }
+
+/// 凭据存储的说明文案。抽成常量是为了让守护测试能直接钉住它 —— 尤其是
+/// 「不许出现『明文』二字」这条:凭据**不是**明文存的,写错就是在自证清白
+/// 的地方栽赃自己。
+pub(super) const SECRET_STORAGE_NOTE: &str =
+    "密码与私钥经 XChaCha20-Poly1305 加密后存进 secrets.enc,主密钥交给 Windows 凭据管理器保管。";
 
 /// 私钥候选下拉。抽成独立函数并**返回 `Response`**,是为了让守护测试能扎在
 /// 真实生产代码上 —— 原先测试自己复制一份同构的 ComboBox 去断言,`auth()` 里
@@ -637,16 +1004,49 @@ pub(super) fn key_candidate_combo(
     (resp, picked)
 }
 
-pub(super) fn network(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, presence: SecretPresence) {
-    section(ui, t, "代理");
+pub(super) fn network(
+    ui: &mut Ui,
+    t: &Theme,
+    buf: &mut EditorBuffer,
+    groups: &[GroupRecord],
+    presence: SecretPresence,
+    first: &mut bool,
+) {
+    section(ui, t, "代理", first);
     grid(ui, "sm_net_proxy", |ui| {
         ui.label("代理");
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::Inherit, "继承分组");
-            ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::Direct, "直连");
-            ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::Socks5, "SOCKS5");
-            ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::HttpConnect, "HTTP");
+        let line = matches!(buf.proxy_mode, ProxyModeUi::Inherit).then(|| {
+            let (v, src) = match inherit_row::upstream(buf.preserved_group_id, groups) {
+                Some(g) => {
+                    let v = match &g.network.proxy {
+                        Some(mullion_store::ProxyChoice::Direct) | None => "直连".to_string(),
+                        Some(mullion_store::ProxyChoice::Socks5(e)) => {
+                            format!("SOCKS5 {}:{}", e.host, e.port)
+                        }
+                        Some(mullion_store::ProxyChoice::HttpConnect(e)) => {
+                            format!("HTTP {}:{}", e.host, e.port)
+                        }
+                    };
+                    (v, Source::Group(&g.name))
+                }
+                None => ("直连".to_string(), Source::NoUpstream),
+            };
+            inherit_row::effective_line(&v, src)
         });
+        // 窄栏放不下四个模式按钮:`ui.horizontal` 不换行会把这一格撑宽 8px,
+        // 顶出面板(「跳板」分区的分隔线因此画到面板外)—— 走查 P0-1 同族缺陷。
+        // `slot` 外层已经是 `horizontal_wrapped`,这里不用再套一层。
+        inherit_row::slot(
+            ui,
+            t,
+            |ui| {
+                ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::Inherit, "继承");
+                ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::Direct, "直连");
+                ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::Socks5, "SOCKS5");
+                ui.selectable_value(&mut buf.proxy_mode, ProxyModeUi::HttpConnect, "HTTP");
+            },
+            line,
+        );
         ui.end_row();
 
         if matches!(
@@ -655,15 +1055,43 @@ pub(super) fn network(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, presence: 
         ) {
             ui.label("代理地址");
             ui.horizontal(|ui| {
+                // 端口跟在同一行,先给它留位置再算主机框 —— 否则主机框
+                // 吃光整行,端口框被顶出去(走查 P0-1 的同型缺陷)。
+                // `+ TEXT_EDIT_MARGIN_X` 的理由同 `secret_edit` 里「撤销」
+                // 预留那段注释:`TextEdit` 默认内边距 `Margin::symmetric(4.0,
+                // 2.0)` 会让端口框自己的外框比它的 `desired_width` 多出 8px,
+                // 不算进主机框的预留,端口框照样会被顶出去 8px。
+                let reserve = FIELD_W_S
+                    + crate::ui::metrics::TEXT_EDIT_MARGIN_X
+                    + ui.spacing().item_spacing.x;
                 ui.add(
-                    egui::TextEdit::singleline(&mut buf.proxy_host).desired_width(f32::INFINITY),
+                    egui::TextEdit::singleline(&mut buf.proxy_host).desired_width(field_w(
+                        ui.available_width(),
+                        FIELD_W_M,
+                        reserve,
+                    )),
                 );
-                ui.add(egui::TextEdit::singleline(&mut buf.proxy_port).desired_width(80.0));
+                // 跟 `basic()` 里的「端口」字段用同一套写法(`field_w` + 下界
+                // 保护),不要裸写 `desired_width(FIELD_W_S)` —— 同语义字段
+                // 两套写法正是走查 P0-2 想根治的问题,裸值也没有下界夹护。
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf.proxy_port).desired_width(field_w(
+                        ui.available_width(),
+                        FIELD_W_S,
+                        0.0,
+                    )),
+                );
             });
             ui.end_row();
 
             ui.label("代理用户");
-            ui.add(egui::TextEdit::singleline(&mut buf.proxy_user).desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::singleline(&mut buf.proxy_user).desired_width(field_w(
+                    ui.available_width(),
+                    FIELD_W_M,
+                    0.0,
+                )),
+            );
             ui.end_row();
 
             ui.label("代理口令");
@@ -686,26 +1114,50 @@ pub(super) fn network(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, presence: 
 /// 字段名沿用 `preserved_*` 前缀而**没有**改成 `automation`:与
 /// `preserved_group_id`(自 P0-b 起可编辑,名字未改)同一个理由 —— 改名会波及
 /// `buffer.rs` 的透传守护测试,收益为零。
-pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
+///
+/// `groups` 是走查 10 加进来的:这一页有五个标量字段能选「继承」,而
+/// 「继承到了什么」只有看得见分组才算得出来。
+pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups: &[GroupRecord]) {
     // tmux 会话名留空时的推导结果,作 placeholder 实时显示。先算好再借
     // `buf.preserved_automation`,后面几节就不用反复回头碰 `buf` 了。
     let derived = mullion_store::automation::sanitize_tmux_name(&buf.name);
+    // 上游只解析一次:这一页有七个字段要问它。`upstream` 是线性查找,
+    // 分组数量级是个位数,但每帧七次仍然没必要(本项目陷阱 T3)。
+    let up: AutoUpstream = inherit_row::upstream(buf.preserved_group_id, groups)
+        .map(|g| (g.name.clone(), g.automation.clone()));
     let a = &mut buf.preserved_automation;
 
     // 警告置顶:滚到页面底部才看到「会打进 TUI 输入框」就太晚了。
     if a.commands.iter().flatten().any(|c| c.delay_ms.is_some()) {
         warn_banner(ui, t, DELAY_WARNING);
-        ui.add_space(6.0);
+        ui.add_space(crate::ui::metrics::SP_S);
     }
 
-    section(ui, t, "总开关");
+    let mut first = true;
+    section(ui, t, "总开关", &mut first);
     grid(ui, "sm_auto_enabled", |ui| {
         ui.label("登录后自动化");
-        tri_state(ui, "sm_auto_enabled_combo", &mut a.enabled, "开", "关");
+        // 选了「继承」才画生效值 —— 显式选了「开」的人不需要被告知「实际生效:开」。
+        let line = a.enabled.is_none().then(|| {
+            let (v, src) = resolve_bool(
+                up.as_ref(),
+                |p| p.enabled,
+                mullion_store::automation::DEFAULT_AUTOMATION_ENABLED,
+            );
+            inherit_row::effective_line(if v { "开" } else { "关" }, src)
+        });
+        inherit_row::slot(
+            ui,
+            t,
+            |ui| {
+                tri_state(ui, "sm_auto_enabled_combo", &mut a.enabled, "开", "关");
+            },
+            line,
+        );
         ui.end_row();
     });
 
-    section(ui, t, "tmux");
+    section(ui, t, "tmux", &mut first);
     grid(ui, "sm_auto_tmux", |ui| {
         ui.label("连上后");
         let text = match &a.tmux {
@@ -713,30 +1165,50 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
             Some(TmuxChoice::Off) => "不用 tmux",
             Some(TmuxChoice::Attach { .. }) => "自动 attach",
         };
-        egui::ComboBox::from_id_salt("sm_auto_tmux_combo")
-            .selected_text(text)
-            .show_ui(ui, |ui| {
-                if ui.selectable_label(a.tmux.is_none(), "继承").clicked() {
-                    a.tmux = None;
-                }
-                if ui
-                    .selectable_label(matches!(a.tmux, Some(TmuxChoice::Off)), "不用 tmux")
-                    .clicked()
-                {
-                    a.tmux = Some(TmuxChoice::Off);
-                }
-                // 已经是 Attach 时不要重建 —— 会把用户填好的会话名清掉。
-                if ui
-                    .selectable_label(
-                        matches!(a.tmux, Some(TmuxChoice::Attach { .. })),
-                        "自动 attach",
-                    )
-                    .clicked()
-                    && !matches!(a.tmux, Some(TmuxChoice::Attach { .. }))
-                {
-                    a.tmux = Some(TmuxChoice::Attach { session_name: None });
-                }
-            });
+        let line = a.tmux.is_none().then(|| {
+            // tmux 的内置默认是「不用」——`ResolvedAutomation` 里 tmux 为
+            // `None` 时不发 attach 命令。
+            let (v, src) = match up.as_ref() {
+                Some((name, prefs)) => match &prefs.tmux {
+                    Some(TmuxChoice::Off) => ("不用 tmux", Source::Group(name)),
+                    Some(TmuxChoice::Attach { .. }) => ("自动 attach", Source::Group(name)),
+                    None => ("不用 tmux", Source::Builtin),
+                },
+                None => ("不用 tmux", Source::Builtin),
+            };
+            inherit_row::effective_line(v, src)
+        });
+        inherit_row::slot(
+            ui,
+            t,
+            |ui| {
+                egui::ComboBox::from_id_salt("sm_auto_tmux_combo")
+                    .selected_text(text)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(a.tmux.is_none(), "继承").clicked() {
+                            a.tmux = None;
+                        }
+                        if ui
+                            .selectable_label(matches!(a.tmux, Some(TmuxChoice::Off)), "不用 tmux")
+                            .clicked()
+                        {
+                            a.tmux = Some(TmuxChoice::Off);
+                        }
+                        // 已经是 Attach 时不要重建 —— 会把用户填好的会话名清掉。
+                        if ui
+                            .selectable_label(
+                                matches!(a.tmux, Some(TmuxChoice::Attach { .. })),
+                                "自动 attach",
+                            )
+                            .clicked()
+                            && !matches!(a.tmux, Some(TmuxChoice::Attach { .. }))
+                        {
+                            a.tmux = Some(TmuxChoice::Attach { session_name: None });
+                        }
+                    });
+            },
+            line,
+        );
         ui.end_row();
 
         if let Some(TmuxChoice::Attach { session_name }) = &mut a.tmux {
@@ -747,12 +1219,22 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
             let mut s = session_name.clone().unwrap_or_default();
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut s)
-                    .hint_text(if derived.is_empty() {
-                        "会话名为空,无法推导 —— 必须手填".to_string()
-                    } else {
-                        format!("留空则用「{derived}」")
-                    })
-                    .desired_width(f32::INFINITY),
+                    // hint 也走 egui 那条忽略 `wrap_width` 的单行排版,文字比框
+                    // 宽就直接画到框外(窄栏下就是画到面板外)。所以这里的文案
+                    // 有硬长度预算:300px 面板下框内容区只有约 192pt ≈ 12 个汉字。
+                    // 原文案「会话名为空,无法推导 —— 必须手填」实测溢出 4px。
+                    // (`derived` 那一支由用户数据决定长度,管不住,只能靠裁剪。)
+                    .hint_text(crate::theme::hint_text(
+                        t,
+                        if derived.is_empty() {
+                            "会话名为空,须手填".to_string()
+                        } else {
+                            format!("留空则用「{derived}」")
+                        },
+                    ))
+                    // 曾是 `f32::INFINITY`:吃光整行,再叠上 `TextEdit` 自己
+                    // 8px 的左右内边距,外框正好画到面板外(走查 P0-1 的余数)。
+                    .desired_width(field_w(ui.available_width(), FIELD_W_L, TEXT_EDIT_MARGIN_X)),
             );
             if resp.changed() {
                 *session_name = if s.trim().is_empty() { None } else { Some(s) };
@@ -761,34 +1243,81 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
         }
     });
 
-    section(ui, t, "工作目录");
+    section(ui, t, "工作目录", &mut first);
     grid(ui, "sm_auto_dir", |ui| {
         ui.label("初始目录");
         let mut s = a.work_dir.clone().unwrap_or_default();
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut s)
-                .hint_text("留空 = 继承(远端默认)")
-                .desired_width(f32::INFINITY),
+        let line = a.work_dir.is_none().then(|| {
+            let (v, src) = match up.as_ref() {
+                Some((name, prefs)) => match prefs.work_dir.as_deref() {
+                    Some(d) => (d.to_string(), Source::Group(name)),
+                    None => ("远端默认目录".to_string(), Source::Builtin),
+                },
+                None => ("远端默认目录".to_string(), Source::Builtin),
+            };
+            inherit_row::effective_line(&v, src)
+        });
+        inherit_row::slot(
+            ui,
+            t,
+            |ui| {
+                // hint 从「留空 = 继承(远端默认)」改成中性的「留空 = 继承」:
+                // 「继承到了什么」现在由右边的灰字负责,写在 hint 里既重复
+                // 又管不住长度(hint 走 egui 那条忽略 wrap_width 的单行排版)。
+                //
+                // 宽度档从 `FIELD_W_L` 降到 `FIELD_W_M`:这一行现在要跟一条
+                // 灰字,撑满整行的话灰字必然折到下一行,看着像两个字段。
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut s)
+                        .hint_text(crate::theme::hint_text(t, "留空 = 继承"))
+                        .desired_width(field_w(
+                            ui.available_width(),
+                            FIELD_W_M,
+                            TEXT_EDIT_MARGIN_X,
+                        )),
+                );
+                if resp.changed() {
+                    a.work_dir = if s.trim().is_empty() {
+                        None
+                    } else {
+                        Some(s.clone())
+                    };
+                }
+            },
+            line,
         );
-        if resp.changed() {
-            a.work_dir = if s.trim().is_empty() { None } else { Some(s) };
-        }
         ui.end_row();
     });
 
-    section(ui, t, "登录后命令");
+    section(ui, t, "登录后命令", &mut first);
     // `None`(继承)与 `Some(vec![])`(显式空覆盖)必须可区分 —— 所以**绝不能**
     // 用 `get_or_insert_with(Vec::new)`:那样光是打开这一页就会把「继承」
     // 悄悄翻成「显式覆盖成空」,分组里配的命令全部失效。
     let mut reset_commands = false;
     match a.commands.as_mut() {
         None => {
-            ui.horizontal(|ui| {
-                ui.colored_label(crate::theme::c32(t.fg_dimmer), "继承上游的命令列表");
-                if ui.button("改为自定义").clicked() {
-                    reset_commands = true; // 见下方,这里借着 a.commands 不能直接赋值
-                }
-            });
+            // 继承来的命令**会真的发到远端 shell**。只说「继承上游的命令列表」
+            // 的话,用户得去分组管理器里翻才知道自己会执行什么(走查 10)。
+            let (v, src) = match up.as_ref() {
+                Some((name, prefs)) => match prefs.commands.as_deref() {
+                    Some(cs) if !cs.is_empty() => {
+                        (format!("{} 条命令", cs.len()), Source::Group(name))
+                    }
+                    // 分组显式覆盖成空 与 分组没配,继承下来都是「不执行」。
+                    _ => ("不执行任何命令".to_string(), Source::Builtin),
+                },
+                None => ("不执行任何命令".to_string(), Source::Builtin),
+            };
+            inherit_row::slot(
+                ui,
+                t,
+                |ui| {
+                    if ui.button("改为自定义").clicked() {
+                        reset_commands = true; // 见下方,这里借着 a.commands 不能直接赋值
+                    }
+                },
+                Some(inherit_row::effective_line(&v, src)),
+            );
         }
         Some(cmds) => {
             let len = cmds.len();
@@ -808,7 +1337,24 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
 
             for (i, c) in cmds.iter_mut().enumerate() {
                 ui.push_id((generation, i), |ui| {
-                    ui.horizontal(|ui| {
+                    // 这一行输入框后面还串着「延时」勾选框、延时数值框和
+                    // ↑/↓/✕ 三个按钮。定宽 240 + 不换行 = 右栏拖窄到 300px 时
+                    // 「✕」被整个推出面板,**用户没有任何办法删掉一条命令**
+                    // (走查 P0-1 同族)。`wrapped` 兜底 + `field_w` 预留双保险:
+                    // 预留量只能是估的(勾选框的方框宽、`DragValue` 的实际宽度
+                    // 运行时都读不到),估少了也只是折行,不会再被裁掉。
+                    ui.horizontal_wrapped(|ui| {
+                        use crate::ui::icon::{icon_button, Glyph};
+                        // 图标按钮是正方形,边长 = `interact_size.y`。
+                        let icon_w = ui.spacing().interact_size.y + ui.spacing().item_spacing.x;
+                        let reserve = button_reserve(ui, "延时")
+                            + if c.delay_ms.is_some() {
+                                button_reserve(ui, "60000 ms")
+                            } else {
+                                0.0
+                            }
+                            + 3.0 * icon_w
+                            + TEXT_EDIT_MARGIN_X;
                         // 用 multiline 而不是 singleline:singleline 是否把粘贴进来
                         // 的换行原样交给我们,取决于 egui 内部实现;multiline 一定
                         // 会,拆条逻辑才有输入可拆。`desired_rows(1)` 让它看起来
@@ -816,7 +1362,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
                         let resp = ui.add(
                             egui::TextEdit::multiline(&mut c.text)
                                 .desired_rows(1)
-                                .desired_width(240.0),
+                                .desired_width(field_w(ui.available_width(), FIELD_W_M, reserve)),
                         );
                         if resp.changed() && c.text.contains(['\n', '\r']) {
                             // 手敲回车 = 新增一条空行(spec §5)。两端空段的保留规则
@@ -840,16 +1386,16 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
                             ui.add(egui::DragValue::new(ms).range(0..=60_000u32).suffix(" ms"));
                         }
 
-                        if ui.add_enabled(i > 0, egui::Button::new("↑")).clicked() {
+                        // 自绘图标,不用文字按钮:`✕`(U+2715) 在 egui 内置拉丁
+                        // 字体和微软雅黑里都没有,实机渲染成豆腐块 —— 跟走查
+                        // P0-5 报的跳板链那三个按钮是同一个缺陷,当时只改了跳板链。
+                        if icon_button(ui, Glyph::ArrowUp, i > 0, "上移") {
                             swap = Some((i, i - 1));
                         }
-                        if ui
-                            .add_enabled(i + 1 < len, egui::Button::new("↓"))
-                            .clicked()
-                        {
+                        if icon_button(ui, Glyph::ArrowDown, i + 1 < len, "下移") {
                             swap = Some((i, i + 1));
                         }
-                        if ui.button("✕").clicked() {
+                        if icon_button(ui, Glyph::Cross, true, "删除这条命令") {
                             remove = Some(i);
                         }
                     });
@@ -901,19 +1447,65 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
         };
     }
 
-    section(ui, t, "环境变量");
-    warn_banner(ui, t, ENV_WARNING);
-    ui.add_space(6.0);
+    section(ui, t, "环境变量", &mut first);
+    // 走查 18:常驻的是灰字事实,红框只留给真的像在存密码的变量名。
+    // 先 clone 出来:下面整段持着 `a.env` 的可变借用。命中通常是空 Vec,
+    // 不产生分配。
+    let secret_keys: Vec<String> = a
+        .env
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|v| super::env_hint::looks_like_secret(&v.key))
+        .map(|v| v.key.clone())
+        .collect();
+    if secret_keys.is_empty() {
+        // 用 `horizontal` + 显式换行的 `Label`,**不用** `horizontal_wrapped`:
+        // 后者在窄栏下会把这一格的宽度撑出约 0.1px,而 `section()` 的分隔线
+        // 按 `available_width` 画,于是整页越界 ——
+        // `automation_page_never_paints_past_the_panel_at_any_width_or_dpi`
+        // 会红。这一行里只有图标和灰字,`Label` 自己换行就够了。
+        ui.horizontal_top(|ui| {
+            crate::ui::icon::icon_inline(
+                ui,
+                crate::ui::icon::Glyph::Info,
+                crate::theme::c32(t.fg_dimmer),
+            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(ENV_NOTE).color(crate::theme::c32(t.fg_dimmer)),
+                )
+                // `horizontal` 里 `Label` 默认**不换行**,这行字比窄栏长 65px。
+                .wrap(),
+            );
+        });
+    } else {
+        warn_banner(ui, t, &super::env_hint::secret_warning(&secret_keys));
+    }
+    ui.add_space(crate::ui::metrics::SP_S);
     // 同 commands:`None`(继承)与 `Some(vec![])`(显式空覆盖)必须可区分。
     let mut reset_env = false;
     match a.env.as_mut() {
         None => {
-            ui.horizontal(|ui| {
-                ui.colored_label(crate::theme::c32(t.fg_dimmer), "继承上游的环境变量");
-                if ui.button("改为自定义").clicked() {
-                    reset_env = true;
-                }
-            });
+            let (v, src) = match up.as_ref() {
+                Some((name, prefs)) => match prefs.env.as_deref() {
+                    Some(vs) if !vs.is_empty() => {
+                        (format!("{} 个变量", vs.len()), Source::Group(name))
+                    }
+                    _ => ("不设任何变量".to_string(), Source::Builtin),
+                },
+                None => ("不设任何变量".to_string(), Source::Builtin),
+            };
+            inherit_row::slot(
+                ui,
+                t,
+                |ui| {
+                    if ui.button("改为自定义").clicked() {
+                        reset_env = true;
+                    }
+                },
+                Some(inherit_row::effective_line(&v, src)),
+            );
         }
         Some(vars) => {
             let mut remove: Option<usize> = None;
@@ -927,19 +1519,32 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
 
             for (i, v) in vars.iter_mut().enumerate() {
                 ui.push_id((env_generation, i), |ui| {
-                    ui.horizontal(|ui| {
+                    // 同「登录后命令」:定宽 140+220 加起来就超过窄栏可用宽,
+                    // 「✕」会被顶出面板 —— 删不掉变量。
+                    ui.horizontal_wrapped(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut v.key)
-                                .hint_text("KEY")
-                                .desired_width(140.0),
+                                .hint_text(crate::theme::hint_text(t, "KEY"))
+                                // 变量名归短值档。比原来的 140 窄,但这一行
+                                // 必须容得下 `=`、值框和 ✕ 三样东西。
+                                .desired_width(field_w(ui.available_width(), FIELD_W_S, 0.0)),
                         );
                         ui.label("=");
+                        let reserve = ui.spacing().interact_size.y
+                            + ui.spacing().item_spacing.x
+                            + TEXT_EDIT_MARGIN_X;
                         ui.add(
                             egui::TextEdit::singleline(&mut v.value)
-                                .hint_text("值(明文)")
-                                .desired_width(220.0),
+                                .hint_text(crate::theme::hint_text(t, "值(明文)"))
+                                .desired_width(field_w(ui.available_width(), FIELD_W_M, reserve)),
                         );
-                        if ui.button("✕").clicked() {
+                        // 同「登录后命令」那行:文字「✕」在实机是豆腐块。
+                        if crate::ui::icon::icon_button(
+                            ui,
+                            crate::ui::icon::Glyph::Cross,
+                            true,
+                            "删除这个变量",
+                        ) {
                             remove = Some(i);
                         }
                     });
@@ -973,9 +1578,18 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
         };
     }
 
-    section(ui, t, "时序");
+    section(ui, t, "时序", &mut first);
     grid(ui, "sm_auto_timing", |ui| {
         ui.label("首字节后再等");
+        let (v, src) = resolve_u32(
+            up.as_ref(),
+            |p| p.initial_delay_ms,
+            mullion_store::automation::DEFAULT_INITIAL_DELAY_MS,
+        );
+        let line = a
+            .initial_delay_ms
+            .is_none()
+            .then(|| inherit_row::effective_line(&format!("{v} ms"), src));
         opt_ms(
             ui,
             t,
@@ -984,10 +1598,20 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
             mullion_store::automation::DEFAULT_INITIAL_DELAY_MS,
             0,
             10_000,
+            line,
         );
         ui.end_row();
 
         ui.label("行间延时");
+        let (v, src) = resolve_u32(
+            up.as_ref(),
+            |p| p.inter_delay_ms,
+            mullion_store::automation::DEFAULT_INTER_DELAY_MS,
+        );
+        let line = a
+            .inter_delay_ms
+            .is_none()
+            .then(|| inherit_row::effective_line(&format!("{v} ms"), src));
         opt_ms(
             ui,
             t,
@@ -996,10 +1620,20 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
             mullion_store::automation::DEFAULT_INTER_DELAY_MS,
             0,
             10_000,
+            line,
         );
         ui.end_row();
 
         ui.label("就绪超时");
+        let (v, src) = resolve_u32(
+            up.as_ref(),
+            |p| p.ready_timeout_ms,
+            mullion_store::automation::DEFAULT_READY_TIMEOUT_MS,
+        );
+        let line = a
+            .ready_timeout_ms
+            .is_none()
+            .then(|| inherit_row::effective_line(&format!("{v} ms"), src));
         opt_ms(
             ui,
             t,
@@ -1008,6 +1642,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
             mullion_store::automation::DEFAULT_READY_TIMEOUT_MS,
             1,
             120_000,
+            line,
         );
         ui.end_row();
     });
@@ -1016,8 +1651,12 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
 #[cfg(test)]
 mod tests {
     use super::{auth, automation, basic, key_candidate_combo, network, tri_state};
-    use crate::ui::session_manager::{AuthKindUi, EditorBuffer, JumpModeUi, SecretPresence};
-    use mullion_store::{Auth, AuthKind, Connection, Identity, Protocol, SessionId, SessionRecord};
+    use crate::ui::session_manager::{
+        AuthKindUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
+    };
+    use mullion_store::{
+        Auth, AuthKind, Connection, GroupRecord, Identity, Protocol, SessionId, SessionRecord,
+    };
 
     /// 在渲染结果的形状树里找**第一处**含 `needle` 的文字位置。抄自
     /// `list.rs` 同名测试辅助(那边是私有的,没有跨文件复用的路子,所以
@@ -1033,21 +1672,237 @@ mod tests {
         shapes.iter().find_map(|cs| walk(&cs.shape, needle))
     }
 
-    /// 同 `find_text_pos`,但返回**所有**匹配位置——命令列表/环境变量表格
-    /// 每行都有一个同名按钮(「↑」「✕」…),只找第一个没法区分点的是哪一行。
-    fn find_all_text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Vec<egui::Pos2> {
-        fn walk(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Pos2>) {
+    /// 抠出本帧画出的所有文本。`find_text_pos` 只回位置,判「有没有说某句话」
+    /// 时要的是内容本身。
+    fn all_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
             match shape {
-                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, out)),
-                egui::Shape::Text(t) if t.galley.job.text.contains(needle) => out.push(t.pos),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
                 _ => {}
             }
         }
         let mut out = Vec::new();
-        shapes
-            .iter()
-            .for_each(|cs| walk(&cs.shape, needle, &mut out));
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut out));
         out
+    }
+
+    /// 「登录后」页继承测试用的分组:只填 `automation`,其余取默认。
+    fn auto_group(
+        id: u64,
+        name: &str,
+        f: impl FnOnce(&mut mullion_store::AutomationPrefs),
+    ) -> GroupRecord {
+        let mut g = GroupRecord {
+            id: mullion_store::GroupId(id),
+            name: name.into(),
+            tags: Vec::new(),
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        };
+        f(&mut g.automation);
+        g
+    }
+
+    /// 走查 10:选了「继承」而分组配了值时,必须说清是**分组**配的。
+    ///
+    /// 旧文案写死「实际生效:300 ms(内置默认)」—— 分组配了 900 时这句话是错的,
+    /// 用户会以为改分组没用。
+    #[test]
+    fn inherited_timing_names_the_group_when_the_group_sets_it() {
+        let mut buf = EditorBuffer {
+            preserved_group_id: Some(mullion_store::GroupId(7)),
+            ..Default::default()
+        };
+        let groups = vec![auto_group(7, "生产", |a| a.initial_delay_ms = Some(900))];
+
+        let t = crate::theme::MULLION_DARK;
+        let out = run_page(|ui| automation(ui, &t, &mut buf, &groups));
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.contains("900 ms") && s.contains("生产")),
+            "分组配了 initial_delay_ms=900,继承提示必须点名分组「生产」;实际画出的文字:{texts:?}"
+        );
+    }
+
+    /// 分组没配时才落「内置默认」。这条和上一条是一对 —— 只留一条的话,
+    /// 把实现写死成任意一支都能过。
+    #[test]
+    fn inherited_timing_falls_back_to_builtin_when_no_group_sets_it() {
+        let mut buf = EditorBuffer::default();
+        let t = crate::theme::MULLION_DARK;
+        let out = run_page(|ui| automation(ui, &t, &mut buf, &[]));
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.contains("300 ms") && s.contains("内置默认")),
+            "未分组时三个时序应显示内置默认;实际画出的文字:{texts:?}"
+        );
+    }
+
+    /// 走查 19:同一件事三种说法(「继承」/「继承分组」/「继承上游的…」)。
+    /// 全页扫一遍,不许再出现旧变体 —— 来源由灰字负责说。
+    #[test]
+    fn inheritance_is_called_the_same_thing_on_every_page() {
+        let t = crate::theme::MULLION_DARK;
+        let mut buf = EditorBuffer {
+            jump_mode: JumpModeUi::Inherit,
+            proxy_mode: ProxyModeUi::Inherit,
+            ..Default::default()
+        };
+
+        let mut pages: Vec<String> = Vec::new();
+        let out = run_page(|ui| {
+            basic(
+                ui,
+                &t,
+                &mut buf,
+                &[],
+                &[],
+                None,
+                SecretPresence::default(),
+                false,
+                &mut Default::default(),
+            )
+        });
+        pages.extend(all_text(&out.shapes));
+        let out = run_page(|ui| automation(ui, &t, &mut buf, &[]));
+        pages.extend(all_text(&out.shapes));
+
+        for s in &pages {
+            assert!(!s.contains("继承分组"), "还有「继承分组」的旧说法:{s:?}");
+            assert!(!s.contains("继承上游"), "还有「继承上游」的旧说法:{s:?}");
+        }
+        assert!(
+            pages.iter().any(|s| s == "继承"),
+            "统一后的「继承」一个都没出现,说明改过头了:{pages:?}"
+        );
+    }
+
+    /// 走查 19 后半:sftp 在下拉里跟 ssh 平级,选了保存后连不上,
+    /// 而界面上没有任何提示。
+    #[test]
+    fn sftp_is_marked_unimplemented_in_the_protocol_picker() {
+        let t = crate::theme::MULLION_DARK;
+        let mut buf = EditorBuffer {
+            protocol: mullion_store::Protocol::Sftp,
+            ..Default::default()
+        };
+        let out = run_page(|ui| {
+            basic(
+                ui,
+                &t,
+                &mut buf,
+                &[],
+                &[],
+                None,
+                SecretPresence::default(),
+                false,
+                &mut Default::default(),
+            )
+        });
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts.iter().any(|s| s.contains("未实现")),
+            "选中 sftp 时必须提示它还没实现;实际画出的文字:{texts:?}"
+        );
+    }
+
+    /// 走查 10 里后果最重的一处:继承来的命令**会真的发到远端 shell**。
+    /// 只说「继承上游的命令列表」而不说几条,用户就得去分组管理器里翻。
+    #[test]
+    fn inherited_commands_say_how_many_will_run() {
+        let mut buf = EditorBuffer {
+            preserved_group_id: Some(mullion_store::GroupId(5)),
+            ..Default::default()
+        };
+        buf.preserved_automation.commands = None; // 继承
+        let groups = vec![auto_group(5, "生产", |a| {
+            a.commands = Some(vec![
+                mullion_store::AutomationCommand {
+                    text: "cd /srv".into(),
+                    delay_ms: None,
+                },
+                mullion_store::AutomationCommand {
+                    text: "tail -f log".into(),
+                    delay_ms: None,
+                },
+            ])
+        })];
+
+        let t = crate::theme::MULLION_DARK;
+        let out = run_page(|ui| automation(ui, &t, &mut buf, &groups));
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.contains("2 条") && s.contains("生产")),
+            "继承提示要说清「几条、来自哪个分组」;实际画出的文字:{texts:?}"
+        );
+    }
+
+    /// 上游也没配时,继承的结果是「一条都不执行」。这句话必须说出来 ——
+    /// 「继承上游的命令列表」在上游为空时读起来像「有东西但我没显示」。
+    #[test]
+    fn inherited_commands_say_nothing_will_run_when_upstream_is_empty() {
+        let mut buf = EditorBuffer::default();
+        buf.preserved_automation.commands = None;
+        let t = crate::theme::MULLION_DARK;
+        let out = run_page(|ui| automation(ui, &t, &mut buf, &[]));
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts.iter().any(|s| s.contains("不执行任何命令")),
+            "上游为空时要明说一条都不跑;实际画出的文字:{texts:?}"
+        );
+    }
+
+    /// tmux 选「继承」时也要说清生效结果。走查 10 点名的六处里,
+    /// tmux 是唯一一处**什么都不说**的。
+    #[test]
+    fn inherited_tmux_shows_what_it_resolves_to() {
+        let mut buf = EditorBuffer {
+            preserved_group_id: Some(mullion_store::GroupId(3)),
+            ..Default::default()
+        };
+        let groups = vec![auto_group(3, "堡垒", |a| {
+            a.tmux = Some(mullion_store::TmuxChoice::Off)
+        })];
+
+        let t = crate::theme::MULLION_DARK;
+        let out = run_page(|ui| automation(ui, &t, &mut buf, &groups));
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.contains("不用 tmux") && s.contains("堡垒")),
+            "分组把 tmux 关了,继承提示要说清;实际画出的文字:{texts:?}"
+        );
+    }
+
+    /// 数渲染结果里的水平分隔线(`Shape::LineSegment` 且两端 y 相等 ——
+    /// `ui.separator()` 在竖直布局下正是这么画的,见 egui-0.30.0
+    /// `widgets/separator.rs`(`painter.hline`)+ epaint-0.30.0
+    /// `src/shape.rs` 的 `Shape::hline`;跳板行 `Glyph::Cross` 图标虽然也用
+    /// `Shape::LineSegment`,但画的是两条斜线,两端 y 不相等,不会混进来)。
+    /// 走查 P2-17 的分区节奏守护测试用它数「分区数 − 1」是否成立。
+    fn count_horizontal_separators(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(shape: &egui::Shape, count: &mut usize) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, count)),
+                egui::Shape::LineSegment { points, .. } if points[0].y == points[1].y => {
+                    *count += 1;
+                }
+                _ => {}
+            }
+        }
+        let mut count = 0;
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut count));
+        count
     }
 
     /// F93 复核关切:候选为空时,私钥候选下拉必须走
@@ -1248,7 +2103,7 @@ mod tests {
         let run = |ctx: &egui::Context, buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    automation(ui, &t, buf);
+                    automation(ui, &t, buf, &[]);
                 });
             })
         };
@@ -1262,10 +2117,21 @@ mod tests {
         let _ = run(&ctx, &mut buf, egui::RawInput::default());
         let out = run(&ctx, &mut buf, egui::RawInput::default());
 
-        let mut up_positions = find_all_text_pos(&out.shapes, "↑");
-        up_positions.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
-        assert_eq!(up_positions.len(), 3, "三条命令应该各有一个「↑」按钮");
-        let second_row_up = up_positions[1];
+        // 按钮是自绘图标(不是文字),所以按「行内那条命令的文本」定位行,
+        // 再从形状里认出这一行的三个图标 —— 跟跳板链那两条测试同一套做法。
+        // tol=8.0:实测命令行行距 30px,半程 15px,8.0 有充足冗余不会吸到邻行。
+        // 本行有一个「延时」勾选框,而 `icon_buttons_on_row` 已知会把**勾上**
+        // 的勾选框对勾误判成 `Down`(见它的文档注释);这里三条命令的
+        // `delay_ms` 都是 `None`,勾选框未勾、不画对勾,不构成碰撞。
+        let row_y = find_text_pos(&out.shapes, "cmd-beta")
+            .expect("cmd-beta 应该出现在第二条命令这一行")
+            .y;
+        let buttons = icon_buttons_on_row(&out.shapes, row_y, 8.0);
+        assert_eq!(buttons.len(), 3, "第二条命令这一行应该有 3 个图标按钮");
+        assert_eq!(buttons[0].1, FoundGlyph::Up, "最左边应该是「↑」");
+        assert_eq!(buttons[1].1, FoundGlyph::Down, "中间应该是「↓」");
+        assert_eq!(buttons[2].1, FoundGlyph::Cross, "最右边应该是「✕」");
+        let second_row_up = buttons[0].0;
 
         let _ = run(
             &ctx,
@@ -1289,27 +2155,72 @@ mod tests {
         );
     }
 
+    /// 走查 18:env 区常驻的是**灰字事实**,红框只在变量名真像密码时出现。
+    /// 这条守的是接线 —— `env_hint` 的纯函数测试证明判据对,这条证明判据真的
+    /// 接到了横幅的显示条件上。
+    #[test]
+    fn the_env_warning_only_turns_red_when_a_key_looks_like_a_secret() {
+        let t = crate::theme::MULLION_DARK;
+        let run = |vars: Vec<mullion_store::EnvVar>| {
+            let mut buf = EditorBuffer::default();
+            buf.preserved_automation.env = Some(vars);
+            let ctx = egui::Context::default();
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    automation(ui, &t, &mut buf, &[]);
+                });
+            });
+            all_text(&out.shapes)
+        };
+        let env = |k: &str| mullion_store::EnvVar {
+            key: k.to_string(),
+            value: "v".to_string(),
+        };
+
+        let calm = run(vec![env("LANG"), env("EDITOR")]);
+        assert!(
+            calm.iter().any(|s| s.contains("以明文存进")),
+            "常驻那句事实不能没了 —— 用户得知道值不加密:{calm:?}"
+        );
+        assert!(
+            !calm.iter().any(|s| s.contains("看着像在存密码")),
+            "普通变量名不该弹红框,天天见的警告等于没有警告:{calm:?}"
+        );
+
+        let alarmed = run(vec![env("LANG"), env("DB_PASSWORD")]);
+        assert!(
+            alarmed
+                .iter()
+                .any(|s| s.contains("看着像在存密码") && s.contains("DB_PASSWORD")),
+            "变量名像密码时必须升成红框并点名是哪个:{alarmed:?}"
+        );
+    }
+
     /// 靶子4(高优先级):环境变量「删除」按钮必须删掉**被点的那一行**,
     /// 不能恒删第一行(`vars.remove(0)`)——只有两行以内时这两种实现表现
     /// 一样,必须用三行以上、点中间那行才能把它们区分开。
     ///
     /// 验证边界同靶子3:端到端指针事件驱动,覆盖「点哪一行的 ✕ 就删哪一
     /// 行」这条链路;覆盖不到「恢复继承」按钮的重置行为(不在本靶子范围)。
+    ///
+    /// 变量名用 `VAR_*` 而不是 `KEY_*`:后者会命中
+    /// `env_hint::looks_like_secret`(走查 18),红框里会把变量名原样点出来,
+    /// 于是 `find_text_pos("KEY_B")` 定位到的是横幅而不是表格行。断言本身没变。
     #[test]
     fn clicking_remove_on_middle_env_var_deletes_that_row_not_always_the_first() {
         let t = crate::theme::MULLION_DARK;
         let mut buf = EditorBuffer::default();
         buf.preserved_automation.env = Some(vec![
             mullion_store::EnvVar {
-                key: "KEY_A".to_string(),
+                key: "VAR_A".to_string(),
                 value: "a".to_string(),
             },
             mullion_store::EnvVar {
-                key: "KEY_B".to_string(),
+                key: "VAR_B".to_string(),
                 value: "b".to_string(),
             },
             mullion_store::EnvVar {
-                key: "KEY_C".to_string(),
+                key: "VAR_C".to_string(),
                 value: "c".to_string(),
             },
         ]);
@@ -1318,7 +2229,7 @@ mod tests {
         let run = |ctx: &egui::Context, buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    automation(ui, &t, buf);
+                    automation(ui, &t, buf, &[]);
                 });
             })
         };
@@ -1332,14 +2243,15 @@ mod tests {
         let _ = run(&ctx, &mut buf, egui::RawInput::default());
         let out = run(&ctx, &mut buf, egui::RawInput::default());
 
-        let mut remove_positions = find_all_text_pos(&out.shapes, "✕");
-        remove_positions.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
-        assert_eq!(
-            remove_positions.len(),
-            3,
-            "三条环境变量应该各有一个「✕」按钮"
-        );
-        let middle_row_remove = remove_positions[1];
+        // 同上:按钮是自绘图标,按行内的变量名定位行再认图标。
+        // 这一行没有勾选框,不存在 `icon_buttons_on_row` 那条对勾碰撞。
+        let row_y = find_text_pos(&out.shapes, "VAR_B")
+            .expect("VAR_B 应该出现在第二行")
+            .y;
+        let buttons = icon_buttons_on_row(&out.shapes, row_y, 8.0);
+        assert_eq!(buttons.len(), 1, "环境变量每行只有一个「✕」");
+        assert_eq!(buttons[0].1, FoundGlyph::Cross);
+        let middle_row_remove = buttons[0].0;
 
         let _ = run(
             &ctx,
@@ -1358,8 +2270,8 @@ mod tests {
         let keys: Vec<&str> = vars.iter().map(|v| v.key.as_str()).collect();
         assert_eq!(
             keys,
-            vec!["KEY_A", "KEY_C"],
-            "点第二行(KEY_B)的「✕」应该只删掉 KEY_B;实际剩下 {keys:?}"
+            vec!["VAR_A", "VAR_C"],
+            "点第二行(VAR_B)的「✕」应该只删掉 VAR_B;实际剩下 {keys:?}"
         );
     }
 
@@ -1385,12 +2297,12 @@ mod tests {
             let ctx = egui::Context::default();
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    automation(ui, &t, &mut buf);
+                    automation(ui, &t, &mut buf, &[]);
                 });
             });
             ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    automation(ui, &t, &mut buf);
+                    automation(ui, &t, &mut buf, &[]);
                 });
             })
         };
@@ -1458,7 +2370,7 @@ mod tests {
         let run = |ctx: &egui::Context, buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    automation(ui, &t, buf);
+                    automation(ui, &t, buf, &[]);
                 });
             })
         };
@@ -1489,7 +2401,7 @@ mod tests {
         let out = run(&ctx, &mut buf, egui::RawInput::default());
 
         // 「首字节后再等」→ DEFAULT_INITIAL_DELAY_MS。
-        let hint_pos = find_text_pos(&out.shapes, "继承(内置默认 300 ms)")
+        let hint_pos = find_text_pos(&out.shapes, "实际生效:300 ms(内置默认)")
             .expect("「首字节后再等」应显示内置默认 300ms 的继承提示");
         let _ = check(&ctx, &mut buf, checkbox_pos_left_of_hint(hint_pos));
         let out = run(&ctx, &mut buf, egui::RawInput::default());
@@ -1501,7 +2413,7 @@ mod tests {
         );
 
         // 「行间延时」→ DEFAULT_INTER_DELAY_MS。
-        let hint_pos = find_text_pos(&out.shapes, "继承(内置默认 200 ms)")
+        let hint_pos = find_text_pos(&out.shapes, "实际生效:200 ms(内置默认)")
             .expect("「行间延时」应显示内置默认 200ms 的继承提示");
         let _ = check(&ctx, &mut buf, checkbox_pos_left_of_hint(hint_pos));
         let out = run(&ctx, &mut buf, egui::RawInput::default());
@@ -1513,7 +2425,7 @@ mod tests {
         );
 
         // 「就绪超时」→ DEFAULT_READY_TIMEOUT_MS。
-        let hint_pos = find_text_pos(&out.shapes, "继承(内置默认 15000 ms)")
+        let hint_pos = find_text_pos(&out.shapes, "实际生效:15000 ms(内置默认)")
             .expect("「就绪超时」应显示内置默认 15000ms 的继承提示");
         let _ = check(&ctx, &mut buf, checkbox_pos_left_of_hint(hint_pos));
         let _ = run(&ctx, &mut buf, egui::RawInput::default());
@@ -1553,36 +2465,401 @@ mod tests {
         }
     }
 
-    fn run_basic(buf: &mut EditorBuffer, sessions: &[SessionRecord]) -> egui::FullOutput {
-        let t = crate::theme::MULLION_DARK;
+    /// 用默认 `RawInput` 跑两帧任意一页,返回**第二帧**的输出。
+    ///
+    /// 功能类测试(找文字、按坐标点按钮)用它;要量「有没有画出面板」用
+    /// `run_page_at` —— 那个会显式给面板宽和 DPI,并撑开 clip_rect。
+    ///
+    /// 必须跑两帧:本组页面的 bug 多是「第一帧看着对、第二帧弹回去」这一类
+    /// (状态写回 → 下一帧重新读)。只跑一帧的测试对它们全盲。
+    fn run_page(mut page: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
         let ctx = egui::Context::default();
-        let run = |buf: &mut EditorBuffer| {
+        let run = |page: &mut dyn FnMut(&mut egui::Ui)| {
             ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    basic(ui, &t, buf, &[], sessions, Some(SessionId(1)));
-                });
+                egui::CentralPanel::default().show(ctx, |ui| page(ui));
             })
         };
-        let _ = run(buf);
-        run(buf)
+        let _ = run(&mut page);
+        run(&mut page)
     }
 
-    /// 跑「图标」页两帧,返回**第二帧**的输出。
+    fn run_basic(buf: &mut EditorBuffer, sessions: &[SessionRecord]) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        run_page(|ui| {
+            basic(
+                ui,
+                &t,
+                buf,
+                &[],
+                sessions,
+                Some(SessionId(1)),
+                SecretPresence::default(),
+                false,
+                &mut Default::default(),
+            );
+        })
+    }
+
+    /// 走查 15:必填项的红字**只在用户碰过那个框之后**才出。
     ///
-    /// 必须跑两帧:本页所有 bug 都是「第一帧看着对、第二帧弹回去」这一类
-    /// (状态写回 → 下一帧重新读)。只跑一帧的测试对它们全盲。
+    /// 新建草稿一打开三行全红,读起来像「你错了」——而用户连第一个字都还没
+    /// 敲。所以判据是「碰过 + 仍为空」,不是「为空」。
+    ///
+    /// 自证会变红:把 `field_error` 的条件里的 `touched.name &&` 去掉,
+    /// 第一段断言(没碰过时不该有红字)立刻炸。
+    #[test]
+    fn a_required_field_only_turns_red_after_you_have_been_in_it() {
+        let t = crate::theme::MULLION_DARK;
+        let run = |touched: super::super::validate::Touched| {
+            let mut buf = EditorBuffer::default(); // 名称/主机/端口全空
+            let mut touched = touched;
+            let out = run_page(|ui| {
+                basic(
+                    ui,
+                    &t,
+                    &mut buf,
+                    &[],
+                    &[],
+                    None,
+                    SecretPresence::default(),
+                    false,
+                    &mut touched,
+                );
+            });
+            all_text(&out.shapes)
+        };
+
+        let untouched = run(Default::default());
+        assert!(
+            !untouched.iter().any(|s| s.contains("不能为空")),
+            "还没碰过任何框就报错等于劈头骂人:{untouched:?}"
+        );
+
+        let touched = run(super::super::validate::Touched {
+            name: true,
+            host: true,
+            user: false,
+            port: false,
+        });
+        assert!(
+            touched.iter().any(|s| s == "会话名称不能为空"),
+            "碰过又留空的名称该出红字:{touched:?}"
+        );
+        assert!(
+            touched.iter().any(|s| s == "主机不能为空"),
+            "碰过又留空的主机该出红字:{touched:?}"
+        );
+    }
+
+    /// 走查 15:端口填错**不看有没有碰过** —— 框里躺着 `0` 或 `abc` 就是错的,
+    /// 跟用户填到哪一步无关(它还是从别处粘进来的呢)。留空则合法(落 22),
+    /// 所以空端口不该出红字。
+    ///
+    /// 自证会变红:把 `validate::port` 的空串分支改成报错,第一段断言炸。
+    #[test]
+    fn a_bad_port_is_flagged_immediately_but_a_blank_one_is_fine() {
+        let t = crate::theme::MULLION_DARK;
+        let run = |port: &str| {
+            let mut buf = EditorBuffer {
+                port: port.to_string(),
+                ..Default::default()
+            };
+            let out = run_page(|ui| {
+                basic(
+                    ui,
+                    &t,
+                    &mut buf,
+                    &[],
+                    &[],
+                    None,
+                    SecretPresence::default(),
+                    false,
+                    &mut Default::default(),
+                );
+            });
+            all_text(&out.shapes)
+        };
+
+        let blank = run("");
+        assert!(
+            !blank.iter().any(|s| s.contains("1~65535")),
+            "空端口是合法的(落默认 22),不该报错:{blank:?}"
+        );
+
+        for bad in ["0", "65536", "abc"] {
+            let texts = run(bad);
+            assert!(
+                texts.iter().any(|s| s == "端口要填 1~65535 之间的数字"),
+                "端口 {bad:?} 该被当场标出来:{texts:?}"
+            );
+        }
+    }
+
+    /// 走查 6:标签终于有编辑入口。真的敲进去、真的回车、真的点 ✕ ——
+    /// 直接改 `buf.preserved_tags` 测的是「Vec 能 push」,证不了 UI 接上了。
+    ///
+    /// 自证会变红:把 `merge_into(...)` 那行删掉 → 回车后标签不出现;
+    /// 把 `remove = Some(i)` 改成不赋值 → 点 ✕ 后标签还在。
+    #[test]
+    fn typing_a_tag_and_pressing_enter_adds_a_chip_that_can_be_removed() {
+        let t = crate::theme::MULLION_DARK;
+        let mut buf = EditorBuffer {
+            name: "web01".into(),
+            host: "10.0.0.1".into(),
+            user: "root".into(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    basic(
+                        ui,
+                        &t,
+                        buf,
+                        &[],
+                        &[],
+                        Some(SessionId(1)),
+                        SecretPresence::default(),
+                        false,
+                        &mut Default::default(),
+                    );
+                });
+            })
+        };
+        let click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let _ = run(&mut buf, egui::RawInput::default());
+        let out = run(&mut buf, egui::RawInput::default());
+        // 输入框还空着,靠占位符文字反推它的位置。
+        let pos = find_text_pos(&out.shapes, "回车添加").expect("标签输入框该有占位提示");
+        let _ = run(
+            &mut buf,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    click(pos, true),
+                    click(pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+        // 敲字 + 回车。singleline 的 TextEdit 收到回车会交出焦点,
+        // `lost_focus() && key_pressed(Enter)` 同时成立。
+        let out = run(
+            &mut buf,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Text("prod".into()),
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            buf.preserved_tags,
+            vec!["prod".to_string()],
+            "回车该把输入变成一个标签"
+        );
+        assert!(buf.tag_input.is_empty(), "确认后输入框该清空,否则会重复加");
+        assert!(
+            all_text(&out.shapes).iter().any(|s| s == "prod"),
+            "标签该以 chip 的形式画出来"
+        );
+
+        // 点 chip 上的 ✕ 删掉它。
+        let out = run(&mut buf, egui::RawInput::default());
+        let x = find_text_pos(&out.shapes, "✕").expect("chip 上该有个 ✕");
+        let _ = run(
+            &mut buf,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(x),
+                    click(x, true),
+                    click(x, false),
+                ],
+                ..Default::default()
+            },
+        );
+        assert!(buf.preserved_tags.is_empty(), "点 ✕ 该把这个标签删掉");
+    }
+
     fn run_appearance(buf: &mut EditorBuffer) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
+        run_page(|ui| super::appearance(ui, &t, buf))
+    }
+
+    /// 走查 4:「图标」页要有实时预览,否则用户设完颜色只能保存了去左栏看。
+    ///
+    /// 判据分两半:
+    /// - **图标**:同一个 emoji 在这一页出现的次数。没预览时只有输入框里那
+    ///   一处;有预览时多一处。用一个**不在预设按钮里**的 emoji(🦀),
+    ///   否则数到的是那八个预设按钮。
+    /// - **竖条**:勾了「会话列表」才画。这跟真列表行走的是同一个
+    ///   `badge::should_paint(ColorTarget::ListItem)`,所以预览不会跟实际漂移。
+    ///
+    /// 自证会变红:把 `appearance()` 末尾那段 `preview_row` 调用删掉。
+    #[test]
+    fn the_appearance_page_previews_the_icon_and_the_color_bar() {
+        use mullion_store::{ColorSpec, ColorTarget};
+
+        /// 数本帧画了多少个图元。`list.rs` 里有个同名辅助(私有,跨文件复用
+        /// 不了),项目既有做法是各留一份。
+        fn count_shapes(shapes: &[egui::epaint::ClippedShape]) -> usize {
+            fn walk(s: &egui::Shape) -> usize {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                    egui::Shape::Noop => 0,
+                    _ => 1,
+                }
+            }
+            shapes.iter().map(|cs| walk(&cs.shape)).sum()
+        }
+
+        fn crabs(out: &egui::FullOutput) -> usize {
+            all_text(&out.shapes)
+                .iter()
+                .filter(|s| s.contains('🦀'))
+                .count()
+        }
+
+        let mut buf = EditorBuffer {
+            icon_emoji_mode: true,
+            icon_emoji_buf: "🦀".into(),
+            ..Default::default()
+        };
+        let out = run_appearance(&mut buf);
+        assert!(
+            crabs(&out) >= 2,
+            "图标应同时出现在输入框和预览行里,实际只画了 {} 处",
+            crabs(&out)
+        );
+
+        // 竖条:只勾「pane 标题条」时预览行上不该有条,勾上「会话列表」才有。
+        let mut off = EditorBuffer {
+            preserved_appearance: mullion_store::AppearancePrefs {
+                color: Some(ColorSpec {
+                    hex: "#e06767".into(),
+                    apply_to: vec![ColorTarget::PaneTitle],
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut on = EditorBuffer {
+            preserved_appearance: mullion_store::AppearancePrefs {
+                color: Some(ColorSpec {
+                    hex: "#e06767".into(),
+                    apply_to: vec![ColorTarget::PaneTitle, ColorTarget::ListItem],
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let n_off = count_shapes(&run_appearance(&mut off).shapes);
+        let n_on = count_shapes(&run_appearance(&mut on).shapes);
+        assert!(
+            n_on > n_off,
+            "勾了「会话列表」后预览行上应多一条竖色条(未勾 {n_off} 个图形,勾了 {n_on} 个)"
+        );
+    }
+
+    /// 走查 P2-17 的判据护栏:`section()` 靠调用方显式传入的 `first` 参数
+    /// 判断「是不是本页第一个分区」。**这里原计划用
+    /// `ui.min_rect().height() > 0.0` 推断,已实测证伪**——`egui::CentralPanel`
+    /// 一进去 `min_rect` 就等于整个 `max_rect`(非零),只有生产环境实际
+    /// 包这一页的 `egui::ScrollArea` 内层 ui 才从零开始;判据成立与否取决
+    /// 于外面拿什么容器包这一页,而不是「这是不是第一个分区」本身,所以
+    /// 换成了显式参数。这条测试仍然只测**渲染结果**,不关心 `section()`
+    /// 内部怎么判断——`first` 传错同样会被它抓到。
+    ///
+    /// 用 `count_horizontal_separators`(定义见上,`find_all_text_pos` 之后)
+    /// 数各页分隔线条数,覆盖**全部四个 Tab**——复核指出只测「连接」/「外观」
+    /// 两页时,`auth()`/`automation()` 八处 `section()` 调用点的 `first`
+    /// 传错(比如把「凭据」的游标传成一个新开的 `true`)完全测不出来:
+    /// `cargo test --workspace` 会全绿。
+    ///
+    /// 各页预期条数 = 分区数 − 1:`appearance()` 2 个分区(外观/预览,后者是
+    /// 走查 4 加的实时预览)→ 1;
+    /// `basic()` 4 个(基本/归类/代理/跳板)→ 3;`auth()` 2 个(身份/凭据)
+    /// → 1;`automation()` 6 个(总开关/tmux/工作目录/登录后命令/环境变量/
+    /// 时序)→ 5。`automation()` 用默认 buffer 渲染(不触发 `commands` 里
+    /// 带 `delay_ms` 的分支),这样「总开关」前面不会先冒出一条
+    /// `DELAY_WARNING` 横幅——这条测试只关心分区间的线,不关心警告横幅。
+    #[test]
+    fn only_the_first_section_on_a_page_skips_the_divider_line() {
+        let mut appearance_buf = EditorBuffer::default();
+        let out = run_appearance(&mut appearance_buf);
+        assert_eq!(
+            count_horizontal_separators(&out.shapes),
+            1,
+            "「外观」页有外观/预览两个分区,应该有 1 条分隔线(首个分区不画)"
+        );
+
+        let mut basic_buf = EditorBuffer::default();
+        let out = run_basic(&mut basic_buf, &[]);
+        assert_eq!(
+            count_horizontal_separators(&out.shapes),
+            3,
+            "「连接」页有基本/归类/代理/跳板四个分区,应该有 3 条分隔线(分区数 − 1)"
+        );
+
+        let mut auth_buf = EditorBuffer::default();
+        let out = run_auth(&mut auth_buf, SecretPresence::default());
+        assert_eq!(
+            count_horizontal_separators(&out.shapes),
+            1,
+            "「身份」页有身份/凭据两个分区,应该有 1 条分隔线"
+        );
+
+        let mut automation_buf = EditorBuffer::default();
+        let out = run_automation(&mut automation_buf);
+        assert_eq!(
+            count_horizontal_separators(&out.shapes),
+            5,
+            "「登录后」页有总开关/tmux/工作目录/登录后命令/环境变量/时序\
+             六个分区,应该有 5 条分隔线(分区数 − 1)"
+        );
+    }
+
+    /// 必修 1 的缺陷坐实:`network()`/`jump()` 是被 `basic()` 调用的**子
+    /// 函数**,不是页面级函数——它们必须原样接住调用方传来的游标,不许
+    /// 在函数内部自己 `let mut first = true`。这条测试把 `network()`
+    /// 单独挂到一个新页面顶部渲染(游标由调用方新开、传 `&mut true`),
+    /// 断言顶上不画线——这正是复核指出「`network()` 被单独挂到一页顶部
+    /// 渲染,顶部多画出 1 条分隔线」的场景,修完必须有测试钉住它。
+    #[test]
+    fn network_rendered_alone_with_a_fresh_cursor_does_not_draw_a_leading_divider() {
+        let t = crate::theme::MULLION_DARK;
+        let mut buf = EditorBuffer::default();
         let ctx = egui::Context::default();
         let run = |buf: &mut EditorBuffer| {
             ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    super::appearance(ui, &t, buf);
+                    let mut first = true;
+                    network(ui, &t, buf, &[], SecretPresence::default(), &mut first);
                 });
             })
         };
-        let _ = run(buf);
-        run(buf)
+        let _ = run(&mut buf);
+        let out = run(&mut buf);
+        assert_eq!(
+            count_horizontal_separators(&out.shapes),
+            0,
+            "`network()` 被单独挂到一页顶部渲染时,「代理」是那一页的第一个\
+             分区,不该画分隔线"
+        );
     }
 
     /// **v0.1.23 实机验收报的「点 emoji 没有内容」的守护测试。**
@@ -1601,8 +2878,10 @@ mod tests {
             ..Default::default()
         };
         let out = run_appearance(&mut buf);
+        // 「单色显示」是这一页 emoji 分支的锚点文字 —— 它在,说明输入区
+        // 还在页面上。改这句文案时必须同步改这里(这正是本断言的用处)。
         assert!(
-            find_text_pos(&out.shapes, "黑白剪影").is_some(),
+            find_text_pos(&out.shapes, "单色显示").is_some(),
             "选了 emoji 模式但还没填内容时,输入区必须留在页面上;\
              消失了就是用户报的「点 emoji 没有内容」"
         );
@@ -1611,6 +2890,22 @@ mod tests {
             buf.preserved_appearance.icon.is_none(),
             "缓冲是空的,不该凭空造出一个空 emoji 图标"
         );
+    }
+
+    /// 走查 P2-7:界面上不该出现实现细节。用户不需要知道 egui 是什么。
+    #[test]
+    fn the_ui_never_mentions_egui_or_its_limitations() {
+        let mut buf = EditorBuffer {
+            icon_emoji_mode: true,
+            ..Default::default()
+        };
+        let out = run_appearance(&mut buf);
+        for leak in ["egui", "剪影", "不支持"] {
+            assert!(
+                find_text_pos(&out.shapes, leak).is_none(),
+                "界面上出现了实现细节 {leak:?}"
+            );
+        }
     }
 
     /// 填了内容就要真写进 `preserved_appearance`(保存路径取的是它)。
@@ -1754,16 +3049,12 @@ mod tests {
 
     fn run_auth(buf: &mut EditorBuffer, presence: SecretPresence) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
-        let ctx = egui::Context::default();
-        let run = |buf: &mut EditorBuffer| {
-            ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    auth(ui, &t, buf, presence, &[]);
-                });
-            })
-        };
-        let _ = run(buf);
-        run(buf)
+        run_page(|ui| auth(ui, &t, buf, presence, &[], &mut Default::default()))
+    }
+
+    fn run_automation(buf: &mut EditorBuffer) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        run_page(|ui| automation(ui, &t, buf, &[]))
     }
 
     /// 用户明确要求:私钥**路径不保存也不显示**。认证页只报「已导入 / 未设置」。
@@ -1803,6 +3094,37 @@ mod tests {
         );
     }
 
+    /// 走查 20:认证页必须当场说清凭据存哪儿、怎么护着。不说的话,谨慎的人
+    /// 干脆不用这个功能,每次连都手敲密码。
+    ///
+    /// 三条断言各守一件事:
+    /// - 加密算法 + 主密钥托管方要出现 —— 这是「护着」的实际内容,只写一句
+    ///   「已加密」等于没说
+    /// - 全页不许出现「明文」二字 —— 凭据**不是**明文存的(`mullion-store`
+    ///   的 `crypto.rs` 是 XChaCha20-Poly1305,`master_key.rs` 走 OS keyring),
+    ///   在自证清白的地方栽赃自己是最坏的一种文案错误
+    ///
+    /// 自证会变红:删掉 `auth()` 末尾那段 `ui.label(SECRET_STORAGE_NOTE)`,
+    /// 前两段断言炸;把常量里的「加密后存进」改成「明文存进」,第三段炸。
+    #[test]
+    fn the_auth_page_says_where_secrets_go_and_never_calls_them_plaintext() {
+        let mut buf = EditorBuffer::default();
+        let out = run_auth(&mut buf, SecretPresence::default());
+
+        assert!(
+            find_text_pos(&out.shapes, "XChaCha20-Poly1305").is_some(),
+            "认证页要写明用的什么加密"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "Windows 凭据管理器").is_some(),
+            "认证页要写明主密钥交给谁保管"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "明文").is_none(),
+            "凭据不是明文存的,界面上不许这么写"
+        );
+    }
+
     /// 私钥正文绝不能画到屏幕上 —— 截图、录屏、旁人一眼就拿走了。
     #[test]
     fn the_auth_page_never_renders_the_key_body() {
@@ -1819,18 +3141,21 @@ mod tests {
         );
     }
 
-    /// 用户明确要求:跳板配在**「连接」页**,不在「高级」页。这条同时钉死两侧
-    /// —— 只断言「连接页有」的话,搬运时忘了从「高级」页删掉就会两处都有,
-    /// 用户改了一处以为生效、另一处显示的还是旧值。
+    /// 「高级」页已并入「连接」页(走查 P1-8),不再是独立标签页。这条现在守的是
+    /// 「跳板不会在代理分区里重复出现」:`network()` 只画代理,不该带出跳板 ——
+    /// 否则两处都有跳板,用户改了一处以为生效、另一处显示的还是旧值。
     #[test]
-    fn jump_section_lives_on_the_connect_page_and_not_on_the_advanced_page() {
+    fn jump_section_appears_once_on_the_connect_page_and_not_inside_the_proxy_section() {
         let mut buf = EditorBuffer::default();
         let out = run_basic(&mut buf, &[]);
         assert!(
             find_text_pos(&out.shapes, "跳板").is_some(),
             "「连接」页必须有跳板分节"
         );
-        for opt in ["无", "继承分组", "自定义"] {
+        // 走查 19 起统一叫「继承」——旧文案「继承分组」在未分组时是错的
+        // (上游根本不是分组)。这条测试守的是「三个模式按钮都在」,
+        // 文案变了意图没变。
+        for opt in ["无", "继承", "自定义"] {
             assert!(
                 find_text_pos(&out.shapes, opt).is_some(),
                 "「连接」页的跳板应给出三个选项,缺了「{opt}」"
@@ -1843,7 +3168,12 @@ mod tests {
         let run_net = |buf: &mut EditorBuffer| {
             ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    network(ui, &t, buf, SecretPresence::default());
+                    // 每帧新开一个游标,模拟 `network()` 被单独挂到某个新
+                    // 页面顶部渲染的场景(见下面
+                    // `network_rendered_alone_with_a_fresh_cursor_does_not_
+                    // draw_a_leading_divider`)。
+                    let mut first = true;
+                    network(ui, &t, buf, &[], SecretPresence::default(), &mut first);
                 });
             })
         };
@@ -1887,6 +3217,37 @@ mod tests {
         );
     }
 
+    /// 走查 12:环要在**编辑时**就报出来,而不是等拨号才硬失败。
+    /// 这条守的是接线 —— `jump_preview` 的纯函数测试证明判据对,这条证明
+    /// 判据真的画到了链编辑器下面。顺带守住路径预览也在。
+    #[test]
+    fn a_cyclic_jump_chain_is_flagged_while_editing() {
+        let mut hop = sess(2, "hop-alpha", "10.0.0.2");
+        // hop-alpha 的跳板是它自己 —— 链一展开就成环。
+        hop.network.jump = Some(vec![mullion_store::JumpRef(SessionId(2))]);
+        let sessions = [sess(1, "self-session", "10.0.0.1"), hop];
+
+        let mut buf = EditorBuffer {
+            name: "web01".into(),
+            jump_mode: JumpModeUi::Custom,
+            jump_chain: vec![SessionId(2)],
+            ..EditorBuffer::default()
+        };
+        let out = run_basic(&mut buf, &sessions);
+        let texts = all_text(&out.shapes);
+
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.contains("本机") && s.contains("web01")),
+            "自定义链下必须画出连接路径预览:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s.contains("环")),
+            "成环的链必须在编辑时就报出来,不能等拨号:{texts:?}"
+        );
+    }
+
     /// 候选下拉必须剔掉**正在编辑的这条会话自己**:自引用会被
     /// `jump::expand_chain` 判成 `JumpCycle` 而**硬失败**(设计 §6),用户点得到
     /// 就等于给了他一个点完必然连不上的选项。
@@ -1905,7 +3266,17 @@ mod tests {
         let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    basic(ui, &t, buf, &[], &sessions, Some(SessionId(1)));
+                    basic(
+                        ui,
+                        &t,
+                        buf,
+                        &[],
+                        &sessions,
+                        Some(SessionId(1)),
+                        SecretPresence::default(),
+                        false,
+                        &mut Default::default(),
+                    );
                 });
             })
         };
@@ -1943,6 +3314,146 @@ mod tests {
         );
     }
 
+    /// 图标按钮改自绘后(走查 P0-5),`find_all_text_pos` 找不到文字了 ——
+    /// 换成按**笔画形状**本身定位:`Glyph::Cross` 是两条**中点重合且斜率
+    /// 异号**的 `Shape::LineSegment`(同 `icon.rs` 里
+    /// `cross_is_two_segments_that_actually_cross` 的判据 `k0 * k1 < 0.0`;
+    /// 单条线段不算数 —— egui 自己的 `ui.separator()`
+    /// (`egui-0.30.0 src/widgets/separator.rs:117`)也是单条
+    /// `Shape::LineSegment`,只看「落在带宽内的线段」会把分隔线误判成
+    /// Cross 的一半);`Glyph::ArrowUp`/`ArrowDown` 是一条三点
+    /// `Shape::Path`,靠「哪个端点单独出现在纵向极值」分上下(同 `icon.rs`
+    /// 里 `arrow_up_points_up_and_arrow_down_points_down` 的判据)。返回值
+    /// 按 x 升序 —— `right_to_left` 布局下从左到右恒定是 ↑ / ↓ / ✕。
+    ///
+    /// **已知碰撞,不是本函数独有特征**:三点 `Shape::Path` 不只有本页的
+    /// 箭头会产生 —— egui 内置 `Checkbox` 勾选态的对勾(`egui-0.30.0
+    /// src/widgets/checkbox.rs:121`,`Shape::line(vec![左中, 下中, 右上],
+    /// stroke)`)同样是三点 Path,复核实测过会被误判成 `FoundGlyph::Down`。
+    /// 本函数只在「调用方划定的 `row_y ± tol` 范围内没有勾选框」这个前提下
+    /// 成立;当前两处调用点 `row_y ≈ 312~354`、`tol = 12.0`,页面上离得够远
+    /// 才没炸。放大 `tol` 或把这个函数挪去别的页面复用前,必须重新确认目标
+    /// 带宽内没有勾选框,不能想当然。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FoundGlyph {
+        Up,
+        Down,
+        Cross,
+    }
+
+    fn icon_buttons_on_row(
+        shapes: &[egui::epaint::ClippedShape],
+        row_y: f32,
+        tol: f32,
+    ) -> Vec<(egui::Pos2, FoundGlyph)> {
+        // Cross 的两条线段分开收集、配对后再产出:遍历到单独一条线段时,
+        // 没法当场判断它是不是 Cross 的一半(还是一条无关的分隔线)。
+        let mut segments: Vec<(egui::Pos2, f32)> = Vec::new(); // (中点, 斜率)
+        let mut out: Vec<(egui::Pos2, FoundGlyph)> = Vec::new();
+
+        fn walk(
+            s: &egui::Shape,
+            row_y: f32,
+            tol: f32,
+            segments: &mut Vec<(egui::Pos2, f32)>,
+            out: &mut Vec<(egui::Pos2, FoundGlyph)>,
+        ) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, row_y, tol, segments, out)),
+                egui::Shape::LineSegment { points, .. } => {
+                    let mid = egui::pos2(
+                        (points[0].x + points[1].x) / 2.0,
+                        (points[0].y + points[1].y) / 2.0,
+                    );
+                    if (mid.y - row_y).abs() <= tol {
+                        let dx = points[1].x - points[0].x;
+                        // 垂直线(dx=0)理论上不会出现在本项目的图标笔画里,
+                        // 用 +∞ 兜底,不让除零把斜率变成 NaN 破坏后面的比较。
+                        let slope = if dx.abs() < f32::EPSILON {
+                            f32::INFINITY
+                        } else {
+                            (points[1].y - points[0].y) / dx
+                        };
+                        segments.push((mid, slope));
+                    }
+                }
+                egui::Shape::Path(p) if p.points.len() == 3 => {
+                    let cy = (p.points[0].y + p.points[1].y + p.points[2].y) / 3.0;
+                    if (cy - row_y).abs() <= tol {
+                        let cx = (p.points[0].x + p.points[1].x + p.points[2].x) / 3.0;
+                        // chevron 的三个端点里,两个「底边」端点纵坐标相等,
+                        // 「尖端」那个单独出现在极值上 —— 尖端在最小值 → 朝上
+                        // (Up),在最大值 → 朝下(Down)。
+                        let min_y = p.points.iter().map(|q| q.y).fold(f32::INFINITY, f32::min);
+                        let apex_at_min = p
+                            .points
+                            .iter()
+                            .filter(|q| (q.y - min_y).abs() < 0.01)
+                            .count()
+                            == 1;
+                        let glyph = if apex_at_min {
+                            FoundGlyph::Up
+                        } else {
+                            FoundGlyph::Down
+                        };
+                        out.push((egui::pos2(cx, cy), glyph));
+                    }
+                }
+                _ => {}
+            }
+        }
+        shapes
+            .iter()
+            .for_each(|cs| walk(&cs.shape, row_y, tol, &mut segments, &mut out));
+
+        // 按「中点精确重合 + 斜率异号」配对:两条都满足才算一个 Cross,
+        // 落单的线段(比如误扫进来的 `ui.separator()`)直接丢弃,不产出。
+        let mut used = vec![false; segments.len()];
+        for i in 0..segments.len() {
+            if used[i] {
+                continue;
+            }
+            for j in (i + 1)..segments.len() {
+                if used[j] {
+                    continue;
+                }
+                let same_mid = (segments[i].0 - segments[j].0).length() < 0.01;
+                let crosses = segments[i].1 * segments[j].1 < 0.0;
+                if same_mid && crosses {
+                    used[i] = true;
+                    used[j] = true;
+                    out.push((segments[i].0, FoundGlyph::Cross));
+                    break;
+                }
+            }
+        }
+
+        out.sort_by(|a, b| a.0.x.total_cmp(&b.0.x));
+        out
+    }
+
+    /// code review 复核意见 2:落单的 `Shape::LineSegment`(比如 egui 自己的
+    /// `ui.separator()`)不该被误判成 Cross —— 必须「中点重合 + 斜率异号」
+    /// 成对出现才算数。不经过真实 UI、不依赖 `chain_editor` 布局,直接构造
+    /// 一条合成的孤立线段丢给 `icon_buttons_on_row`,专门测判据本身够不够
+    /// 紧,不测集成。
+    #[test]
+    fn icon_buttons_on_row_ignores_a_lone_line_segment_that_looks_like_half_a_separator() {
+        let lone_separator = egui::epaint::ClippedShape {
+            clip_rect: egui::Rect::EVERYTHING,
+            shape: egui::Shape::LineSegment {
+                points: [egui::pos2(0.0, 100.0), egui::pos2(50.0, 100.0)],
+                stroke: egui::Stroke::new(1.0, egui::Color32::WHITE).into(),
+            },
+        };
+        let buttons = icon_buttons_on_row(std::slice::from_ref(&lone_separator), 100.0, 12.0);
+        assert!(
+            buttons.is_empty(),
+            "落单的线段不该被判成任何图标按钮 —— 只有中点重合 + 斜率异号的一对\
+             才算 Cross;实际 {buttons:?}"
+        );
+    }
+
     /// 点第二跳的「↑」必须真的与第一跳互换,不能原地不动。跳板顺序决定实际
     /// 拨号路径,静默不生效比报错更危险 —— 同「登录后」页命令列表那条靶子。
     #[test]
@@ -1963,7 +3474,17 @@ mod tests {
         let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    basic(ui, &t, buf, &[], &sessions, Some(SessionId(1)));
+                    basic(
+                        ui,
+                        &t,
+                        buf,
+                        &[],
+                        &sessions,
+                        Some(SessionId(1)),
+                        SecretPresence::default(),
+                        false,
+                        &mut Default::default(),
+                    );
                 });
             })
         };
@@ -1977,10 +3498,19 @@ mod tests {
         let _ = run(&mut buf, egui::RawInput::default());
         let out = run(&mut buf, egui::RawInput::default());
 
-        let mut ups = find_all_text_pos(&out.shapes, "↑");
-        ups.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
-        assert_eq!(ups.len(), 3, "三跳应该各有一个「↑」按钮");
-        let second = ups[1];
+        // 第二跳是 hop-beta(jump_chain = [2, 3, 4]);用它的名字标签定位所在行,
+        // 再按 x 升序取该行第一个按钮 —— `right_to_left` 布局下最左边是「↑」。
+        // tol=12.0:复核实测三跳行距 21.0px(y=312.175/333.175/354.175),半程
+        // 10.5px < 12.0,冗余为负,只是当前每次只扫单一目标行才没有误吸邻行 ——
+        // 行高若被压缩,这个值需要重新核对。
+        let row_y = find_text_pos(&out.shapes, "hop-beta")
+            .expect("hop-beta 应该出现在第二跳这一行")
+            .y;
+        let buttons = icon_buttons_on_row(&out.shapes, row_y, 12.0);
+        assert_eq!(buttons.len(), 3, "第二跳这一行应该有 3 个图标按钮");
+        assert_eq!(buttons[0].1, FoundGlyph::Up, "最左边应该是「↑」");
+        assert_eq!(buttons[1].1, FoundGlyph::Down, "中间应该是「↓」");
+        let second = buttons[0].0;
 
         let _ = run(
             &mut buf,
@@ -2021,7 +3551,17 @@ mod tests {
         let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    basic(ui, &t, buf, &[], &sessions, Some(SessionId(1)));
+                    basic(
+                        ui,
+                        &t,
+                        buf,
+                        &[],
+                        &sessions,
+                        Some(SessionId(1)),
+                        SecretPresence::default(),
+                        false,
+                        &mut Default::default(),
+                    );
                 });
             })
         };
@@ -2035,10 +3575,18 @@ mod tests {
         let _ = run(&mut buf, egui::RawInput::default());
         let out = run(&mut buf, egui::RawInput::default());
 
-        let mut xs = find_all_text_pos(&out.shapes, "✕");
-        xs.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap());
-        assert_eq!(xs.len(), 3, "三跳应该各有一个「✕」按钮");
-        let middle = xs[1];
+        // 中间跳是 hop-beta(jump_chain = [2, 3, 4]);用它的名字标签定位所在行,
+        // 再按 x 升序取该行最后一个按钮 —— `right_to_left` 布局下最右边是「✕」。
+        // tol=12.0:同上一条测试,复核实测行距 21.0px、半程 10.5px < 12.0,
+        // 冗余为负,靠每次只扫单一目标行才不误吸邻行。
+        let row_y = find_text_pos(&out.shapes, "hop-beta")
+            .expect("hop-beta 应该出现在中间这一行")
+            .y;
+        let buttons = icon_buttons_on_row(&out.shapes, row_y, 12.0);
+        assert_eq!(buttons.len(), 3, "中间这一行应该有 3 个图标按钮");
+        assert_eq!(buttons[1].1, FoundGlyph::Down, "中间应该是「↓」");
+        assert_eq!(buttons[2].1, FoundGlyph::Cross, "最右边应该是「✕」");
+        let middle = buttons[2].0;
 
         let _ = run(
             &mut buf,
@@ -2057,5 +3605,530 @@ mod tests {
             "点第二跳的「✕」应只删掉第二跳;实际 {:?}",
             buf.jump_chain
         );
+    }
+
+    /// 走查 P0-5。老写法用 `ui.button("✕")` —— U+2715 不在 egui 内置
+    /// 拉丁字体里,也不在微软雅黑里,实机渲染成豆腐块 □,用户完全看不出
+    /// 是「删除」。改成自绘后,页面上不该再有任何这三个字符的文字形状。
+    #[test]
+    fn jump_row_buttons_are_drawn_not_typed_so_they_cannot_render_as_tofu() {
+        let sessions = [
+            sess(1, "self-session", "10.0.0.1"),
+            sess(2, "hop-alpha", "10.0.0.2"),
+            sess(3, "hop-beta", "10.0.0.3"),
+        ];
+        let mut buf = EditorBuffer {
+            jump_mode: JumpModeUi::Custom,
+            jump_chain: vec![SessionId(2), SessionId(3)],
+            ..Default::default()
+        };
+        let out = run_basic(&mut buf, &sessions);
+        for ch in ["✕", "↑", "↓"] {
+            assert!(
+                find_text_pos(&out.shapes, ch).is_none(),
+                "页面上还有文字形状 {ch:?} —— 它在真机上是豆腐块,必须改成自绘"
+            );
+        }
+    }
+
+    /// 所有形状的最右边界。无穷/NaN 的(整屏底色之类)跳过。
+    ///
+    /// 用它而不是「找某个控件的 Response」:走查 P0-1 的症状是**画出去了**
+    /// 被 clip_rect 裁掉,`Response.rect` 反而看不出问题 —— 形状边界才看得出。
+    fn max_right(shapes: &[egui::epaint::ClippedShape]) -> f32 {
+        fn walk(s: &egui::Shape, acc: &mut f32) {
+            if let egui::Shape::Vec(v) = s {
+                v.iter().for_each(|x| walk(x, acc));
+                return;
+            }
+            let r = s.visual_bounding_rect();
+            if r.is_finite() && r.right() > *acc {
+                *acc = r.right();
+            }
+        }
+        let mut acc = f32::MIN;
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        acc
+    }
+
+    /// 在给定面板宽与 DPI 下跑**两帧**任意一页,返回第二帧输出。
+    /// 页级越界测试(`*_never_paints_past_the_panel_*`)全部走这一个入口。
+    ///
+    /// 抽出来不是为了少写几行:下面 `native_pixels_per_point` 和
+    /// `set_clip_rect(EVERYTHING)` 各自都有一段踩坑史,而漏掉任何一条都
+    /// **不会报错,只会静默量错**(前者量出 8000,后者量出「一切正常」)。
+    /// 复制粘贴第四份迟早漏。
+    ///
+    /// 跑两帧的理由同 `run_appearance`:第一帧的布局是估的。
+    fn run_page_at(width: f32, ppp: f32, mut page: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let input = || {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 600.0),
+                )),
+                ..Default::default()
+            };
+            // **不要**改成 `ctx.set_pixels_per_point(ppp)`——实测过会崩:那条
+            // API 是 `Context::set_zoom_factor` 的包装,只在**下一帧**生效
+            // (egui-0.30.0 context.rs:1994 起),生效那一帧会把「上一帧的
+            // screen_rect」按新旧 ppp 之比重新缩放后盖掉本帧显式传入的
+            // screen_rect(同文件 462-475 行,注释自称是给「zoom 抖动」擦屁股)。
+            // 对全新 `Context`,「上一帧」是 egui 内置的默认占位符
+            // 10_000×10_000(`input_state/mod.rs:247`),1.0/1.25 的比例缩出
+            // 8000×8000——热身帧的 `Grid`(`sm_basic_group` 等)就在这个虚假的
+            // 巨宽画布上把列宽记忆定成了 8000,而 `Grid` 的列宽记忆是跨帧
+            // 累积在同一个 `ctx.memory` 里的,第二帧(真正拿来断言的那帧)
+            // 即使 screen_rect 已经正确回落到 300×600,也会把这份 8000 的
+            // 记忆当「历史最大宽度」继续撑着,分区分隔线就被撑到 x=8000。
+            // 这是测试脚手架的坑,不是生产代码 bug——已用 `eprintln!` 探针
+            // 核实过 `ctx.screen_rect()` 在第二帧确实是 300×600,越界的是
+            // `Grid` 记忆,不是 screen_rect。
+            // 改用 `ViewportInfo.native_pixels_per_point` 直接给当前这一帧
+            // 设 ppp,不经过 `set_zoom_factor`/抖动规避那条路径,两帧
+            // screen_rect 全程等于我们显式传入的值。
+            raw.viewports
+                .get_mut(&raw.viewport_id)
+                .expect("RawInput::default() 必须自带 ROOT viewport 项")
+                .native_pixels_per_point = Some(ppp);
+            raw
+        };
+        let run = |page: &mut dyn FnMut(&mut egui::Ui)| {
+            ctx.run(input(), |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        // CentralPanel 会把 `ui` 的 clip_rect 钉死在面板矩形上
+                        // (egui-0.30.0 panel.rs:1109,注释明写着"If we overflow,
+                        // don't do so visibly (#4475)")——这本是 egui 的保护特性,
+                        // 副作用是 `Label`/`Button` 等控件在 paint 前会先查
+                        // `ui.is_rect_visible(rect)`(`rect.intersects(clip_rect)`),
+                        // 一旦控件整个落在 clip_rect 外面就直接不产生 Shape,压根
+                        // 进不了 `FullOutput::shapes`。这正是走查 P0-1 在真实实现里
+                        // "肉眼看不出溢出"的原因,但也让 `max_right` 这种"扫
+                        // shapes 找最右边界"的测量对**完全**越界的控件失明
+                        // (对**部分**越界、被 GPU scissor 削掉半个字的控件仍然
+                        // 有效——那种情况 shape 还在,只是显示时被裁)。这里把
+                        // clip_rect 撑到无穷大,只是为了让测量拿到"控件本该画在
+                        // 哪"的真实几何,不代表生产代码的裁剪行为被关掉。
+                        ui.set_clip_rect(egui::Rect::EVERYTHING);
+                        page(ui);
+                    });
+            })
+        };
+        let _ = run(&mut page);
+        run(&mut page)
+    }
+
+    /// 在给定的面板宽度下跑两帧「认证」页,返回第二帧输出。
+    fn run_auth_at(
+        width: f32,
+        presence: SecretPresence,
+        buf: &mut EditorBuffer,
+    ) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        run_page_at(width, 1.0, |ui| {
+            auth(ui, &t, buf, presence, &[], &mut Default::default())
+        })
+    }
+
+    /// **走查 P0-1 的守护测试。**
+    ///
+    /// 老写法:`TextEdit::singleline(value).desired_width(f32::INFINITY)`
+    /// 吃光整行,后面的「已设置(不修改则保持不变)」被推到面板外,
+    /// 只露出半个字。右栏被分隔条拖窄时更狠。
+    ///
+    /// 300.0 不是随手挑的:分隔条拖到 `LIST_MAX_W = 440` 时右栏内容宽
+    /// 实测约 300px,是本项目真实可达的最窄值。
+    #[test]
+    fn password_row_never_paints_past_the_panel_even_at_the_narrowest_pane() {
+        for width in [300.0f32, 440.0, 900.0] {
+            let mut buf = EditorBuffer {
+                auth_kind: AuthKindUi::Password,
+                ..Default::default()
+            };
+            let presence = SecretPresence {
+                password: true,
+                ..Default::default()
+            };
+            let out = run_auth_at(width, presence, &mut buf);
+            let right = max_right(&out.shapes);
+            assert!(
+                right <= width + 0.5,
+                "面板宽 {width},却画到了 x={right} —— 密码框右边的附属控件被裁了"
+            );
+        }
+    }
+
+    /// 同上,但走「已改过」分支(touched = true) —— 那一支右边挂的是
+    /// 「撤销」按钮 + 「留空 = 清除已存凭据」,加起来比另外两支都长。
+    #[test]
+    fn touched_password_row_fits_the_revert_button_at_the_narrowest_pane() {
+        for width in [300.0f32, 440.0] {
+            let mut buf = EditorBuffer {
+                auth_kind: AuthKindUi::Password,
+                password_touched: true,
+                ..Default::default()
+            };
+            let out = run_auth_at(width, SecretPresence::default(), &mut buf);
+            let right = max_right(&out.shapes);
+            assert!(
+                right <= width + 0.5,
+                "面板宽 {width},却画到了 x={right} —— 「撤销」被裁了"
+            );
+        }
+    }
+
+    /// **走查 P0-2 的守护测试。** 名称框不该横跨整行。
+    #[test]
+    fn medium_fields_are_capped_and_do_not_span_the_whole_row() {
+        // 原计划文本这里写的是「直接调 metrics::field_w() 存进 widths[0] 再跟
+        // FIELD_W_M 比」——自证会发现那是重言式:不管 `basic()` 里的名称框
+        // 是不是真按 `field_w` 收窄,`widths[0]` 都只是重新调用同一个纯函数,
+        // 断言恒真(在 metrics.rs 里已经单测过这个函数本身)。改成量
+        // `basic()` **实际画出来**的名称输入框右边界——这才是本测试要守的
+        // 东西:900px 宽的面板下,名称框不该伸到接近整行(未修时会到 ~880),
+        // 修完该停在 `LABEL_COL_W + 间距 + FIELD_W_M` 附近(~430)。
+        let mut buf = EditorBuffer::default();
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let run = |buf: &mut EditorBuffer| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(ctx, |ui| {
+                            // 同 `run_auth_at` 那段注释:CentralPanel 把 clip_rect
+                            // 钉死在面板矩形上,越界控件会被 `is_rect_visible`
+                            // 挡在 shapes 之外,量不到真实溢出。撑到无穷大只是
+                            // 为了测量,不代表关掉生产代码的裁剪行为。
+                            ui.set_clip_rect(egui::Rect::EVERYTHING);
+                            basic(
+                                ui,
+                                &t,
+                                buf,
+                                &[],
+                                &[],
+                                None,
+                                SecretPresence::default(),
+                                false,
+                                &mut Default::default(),
+                            );
+                        });
+                },
+            )
+        };
+        let _ = run(&mut buf);
+        let out = run(&mut buf);
+
+        let label_pos = find_text_pos(&out.shapes, "名称").expect("「基本」分区必须有「名称」标签");
+        // 名称输入框跟标签同一 Grid 行,取标签所在行的高度范围(±10px 足够
+        // 覆盖 singleline TextEdit 的行高,不会越界勾到「主机」那一行)扫最右
+        // 边界——这样才是量输入框本身的画框宽度,不是全页面(全页面会被
+        // 「备注」多行框的合法全宽拉到 900 附近,盖住这条测试想抓的问题)。
+        let mut row_right = f32::MIN;
+        fn walk(s: &egui::Shape, y: f32, tol: f32, acc: &mut f32) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, y, tol, acc)),
+                other => {
+                    let r = other.visual_bounding_rect();
+                    if r.is_finite() && (r.center().y - y).abs() <= tol && r.right() > *acc {
+                        *acc = r.right();
+                    }
+                }
+            }
+        }
+        out.shapes
+            .iter()
+            .for_each(|cs| walk(&cs.shape, label_pos.y + 4.0, 10.0, &mut row_right));
+
+        assert!(
+            row_right < 500.0,
+            "900px 宽的面板里,名称框右边界画到了 x={row_right} —— \
+             FIELD_W_M(320)没有生效,框还在往整行撑"
+        );
+    }
+
+    /// 走查 P1-8:「高级」页只有一行代理,右侧 70% 全是空白。
+    /// 合并后代理必须出现在「连接」页上。
+    #[test]
+    fn proxy_settings_render_on_the_connect_page_after_the_merge() {
+        let mut buf = EditorBuffer {
+            proxy_mode: ProxyModeUi::Socks5,
+            ..Default::default()
+        };
+        let out = run_basic(&mut buf, &[]);
+        assert!(
+            find_text_pos(&out.shapes, "代理地址").is_some(),
+            "选了 SOCKS5 却在「连接」页上找不到代理地址 —— 合并没做完"
+        );
+    }
+
+    /// 代理排在跳板之前:连接路径是 本机 →(代理)→ 第一跳 →…→ 目标,
+    /// 页面自上而下得按这个顺序,阶段 2 的「连接路径预览」才读得通。
+    #[test]
+    fn proxy_section_comes_before_the_jump_section() {
+        let mut buf = EditorBuffer {
+            proxy_mode: ProxyModeUi::Socks5,
+            jump_mode: JumpModeUi::Custom,
+            ..Default::default()
+        };
+        let out = run_basic(&mut buf, &[]);
+        let proxy = find_text_pos(&out.shapes, "代理").expect("找不到代理分区");
+        let jump = find_text_pos(&out.shapes, "跳板").expect("找不到跳板分区");
+        assert!(
+            proxy.y < jump.y,
+            "代理 y={} 排在跳板 y={} 下面了",
+            proxy.y,
+            jump.y
+        );
+    }
+
+    /// 在给定面板宽与 DPI 下跑两帧「连接」页,返回第二帧输出。
+    fn run_basic_at(width: f32, ppp: f32, buf: &mut EditorBuffer) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        run_page_at(width, ppp, |ui| {
+            basic(
+                ui,
+                &t,
+                buf,
+                &[],
+                &[],
+                None,
+                SecretPresence::default(),
+                false,
+                &mut Default::default(),
+            )
+        })
+    }
+
+    /// **走查验收标准第一条的自动化部分,常规内容分支。**
+    ///
+    /// 这条是缺陷 A(代理模式四个按钮在窄栏放不下,`ui.horizontal` 不换行
+    /// 撑宽了这一格,把「跳板」分区的分隔线顶出面板)的守护测试——字段值
+    /// 都是短的默认值,不掺长名称/长主机,这样越界只可能来自窄栏本身的
+    /// 控件布局,不会被 egui 单行 `TextEdit` 撑宽 `Ui` 的已知行为(见下一条
+    /// 测试)掩盖或误报。
+    ///
+    /// 注意边界:egui 的布局全程以「点」为单位,`pixels_per_point` 只在
+    /// 光栅化时生效,所以三档 DPI 的布局矩形基本一致 —— 本测试守的是
+    /// 字形栅格化的取整漂移。「125%/150% 截图无错位」仍是人工验收项。
+    ///
+    /// 300.0 是分隔条拖到 `LIST_MAX_W = 440` 时右栏内容宽的实测值,
+    /// 是本项目真实可达的最窄面板。
+    #[test]
+    fn connect_page_never_paints_past_the_panel_at_any_width_or_dpi() {
+        for width in [300.0f32, 440.0, 900.0] {
+            for ppp in [1.0f32, 1.25, 1.5] {
+                let mut buf = EditorBuffer {
+                    proxy_mode: ProxyModeUi::Socks5,
+                    jump_mode: JumpModeUi::Custom,
+                    ..Default::default()
+                };
+                let out = run_basic_at(width, ppp, &mut buf);
+                let right = max_right(&out.shapes);
+                assert!(
+                    right <= width + 0.5,
+                    "面板宽 {width} @ {ppp}x,却画到了 x={right}"
+                );
+            }
+        }
+    }
+
+    /// **长内容分支:越界不可避免,但有实测上限——不是「只有分隔线会越界」。**
+    ///
+    /// 原计划文本的判据是「豁免水平分隔线,断言其余形状 <= width + 0.5」,
+    /// 基于的假设是「只有 `section()` 画的分隔线会被撑出面板」。**这个假设
+    /// 已用本测试自己的探针证伪**:实际测到的最右形状是几个 `Shape::Rect`
+    /// (「备注」多行框、代理/跳板区后续的输入框背景等的画框矩形),
+    /// 跟分隔线基本打平(三档 DPI 下都只低 0.5pt,从未反超)——不是分隔线
+    /// 一家在越界,是**整个「连接」页
+    /// 这个 `Ui` 都被撑宽了**,越界表现在所有跟在撑宽源后面的控件上,豁免
+    /// 分隔线这一种形状类型拦不住。
+    ///
+    /// 撑宽的根因是 egui-0.30.0 `TextEdit` 的两处上游行为叠加,且已实测
+    /// 证明修不掉:
+    ///
+    /// 1. `widgets/text_edit/builder.rs:514-521`:singleline 走
+    ///    `LayoutJob::simple_singleline(...)`,**忽略 `wrap_width`**,galley
+    ///    永远按完整文本宽度排版,`desired_width`/`clip_text` 都不影响它。
+    /// 2. `widgets/text_edit/builder.rs:726-734`:`extra_size = galley.size()
+    ///    - rect.size()`,只要内容比框宽就 `ui.allocate_rect(...)` 额外占位,
+    ///    把父 `Ui` 的 `min_rect`/`max_rect` 撑宽——这一撑不只影响撑宽的
+    ///    那个 `TextEdit` 自己,后面同一个 `Ui` 作用域里的所有兄弟控件
+    ///    (Grid 的下一行、`section()` 的分隔线……)都会按撑宽后的
+    ///    `available_width` 重新计算,越界因此“到处都是”而不是一处。
+    ///
+    /// 试过两种拦截方式,**都无效**(已实测):给 `field_w(...)` 加
+    /// `TEXT_EDIT_MARGIN_X` 预留(无变化)、给 `grid()` 加
+    /// `.max_col_width(328.0)`(无变化)——`extra_size` 是在 `TextEdit`
+    /// 内部直接对父 `Ui` 调用 `allocate_rect`,不经过 `Grid`/`field_w` 算出
+    /// 的宽度,拦不住。
+    ///
+    /// **实测数据**(`max_right`,含分隔线,三档 DPI):
+    /// - 300px:342.5 / 349.5 / 348.5——**只有这一档真的越界**,300 是分隔条
+    ///   拖到 `LIST_MAX_W` 时右栏内容宽的实测最窄值,峰值约 +49.5px。
+    /// - 440px / 900px:440.5 / 900.5(三档 DPI 一致)——**完全不越界**,富余
+    ///   空间够把撑宽的内容仍旧包在面板里。
+    ///
+    /// 因此本测试**不能**照抄「>= width + 0.5」的紧公差(那是伪造出来的绿,
+    /// 实测过不了),但也**不能**放到没有上限——300px 这一档给一个比实测峰值
+    /// 349.5 略宽的余量(352.0,+2.5px),440/900px 维持跟其它守护测试一致的
+    /// 紧公差。阈值本身就是「已知上限」:真出现新的越界(比如又一个像
+    /// 缺陷 A 那样的窄栏溢出,或者 `run_basic_at` 又踩中另一个 egui 版本
+    /// 差异),数字会明显超过这个已知上限,测试才会红。
+    ///
+    /// 实机后果:被撑宽的只有「连接」页布局账本上的数字,`CentralPanel` 的
+    /// clip 会把画出面板的部分裁掉(生产代码没有关掉裁剪,只有测试用
+    /// `ui.set_clip_rect(EVERYTHING)` 才看得见这些形状),肉眼不可见——
+    /// 后果轻微,但布局数字确实是错的,后来人要不要修可以拿这条注释当依据。
+    #[test]
+    fn connect_page_long_content_stays_within_a_measured_bound() {
+        for width in [300.0f32, 440.0, 900.0] {
+            for ppp in [1.0f32, 1.25, 1.5] {
+                let mut buf = EditorBuffer {
+                    proxy_mode: ProxyModeUi::Socks5,
+                    jump_mode: JumpModeUi::Custom,
+                    name: "一个相当长的会话名称用来把标签列撑开".into(),
+                    host: "very-long-hostname.internal.example.com".into(),
+                    ..Default::default()
+                };
+                let out = run_basic_at(width, ppp, &mut buf);
+                let right = max_right(&out.shapes);
+                // 见上面文档注释的「实测数据」:只有 300px 这一档真的越界,
+                // 峰值 349.5,留 2.5px 余量;440/900px 没有理由越界,维持
+                // 紧公差,能第一时间抓到「怎么突然在宽面板下也越界了」。
+                let tolerance = if width <= 300.0 { 52.0 } else { 0.5 };
+                assert!(
+                    right <= width + tolerance,
+                    "面板宽 {width} @ {ppp}x,画到了 x={right},超出已知上限 \
+                     (width + {tolerance})—— 已知的 egui TextEdit 撑宽不会到这个\
+                     地步,这可能是新的越界,需要排查"
+                );
+            }
+        }
+    }
+
+    /// **`SecretPresence.proxy_password` 的两个非空分支此前从未被执行过。**
+    ///
+    /// 「认证」页的 password / passphrase 都有守护测试,代理口令这条没有:
+    /// 全项目找不到一处把 `proxy_password` 设成 `true` 的测试,`secret_edit`
+    /// 在这一格的宽度算错、或者接线接到了别的字段上,都不会有测试变红。
+    /// 它跟前两条走的是同一个 `secret_edit`,但可用宽是在「代理」分区里算的
+    /// (同一格前面还有 `horizontal_wrapped` 的模式按钮排),不能靠前两条推断。
+    ///
+    /// 两个分支都要:`touched=false` 走「已存值」占位分支(必须出现
+    /// 「已设置」说明文字),`touched=true` 走可编辑分支(必须出现「撤销」)。
+    #[test]
+    fn proxy_password_row_renders_both_stored_branches_and_fits_the_narrowest_pane() {
+        for touched in [false, true] {
+            let t = crate::theme::MULLION_DARK;
+            let mut buf = EditorBuffer {
+                proxy_mode: ProxyModeUi::Socks5,
+                proxy_password_touched: touched,
+                ..Default::default()
+            };
+            let presence = SecretPresence {
+                proxy_password: true,
+                ..Default::default()
+            };
+            let out = run_page_at(300.0, 1.0, |ui| {
+                let mut first = true;
+                network(ui, &t, &mut buf, &[], presence, &mut first);
+            });
+            let right = max_right(&out.shapes);
+            assert!(
+                right <= 300.5,
+                "touched={touched} 时代理口令行画到了 x={right}"
+            );
+            // 找的是**说明文字/按钮**而不是输入框:输入框在两个分支里长得
+            // 一模一样(都是 password 遮罩),只有这两处文字能区分走的是哪支。
+            let needle = if touched { "撤销" } else { "已设置" };
+            assert!(
+                find_text_pos(&out.shapes, needle).is_some(),
+                "touched={touched} 时没渲染出「{needle}」—— \
+                 presence.proxy_password 没接到 secret_edit 上"
+            );
+        }
+    }
+
+    /// **走查 P0-1 在「登录后」页的同构缺陷。**
+    ///
+    /// 阶段 1 只认领了「基本/身份/代理」三页,这一页留着裸
+    /// `desired_width(240.0/140.0/220.0)` 和两处 `f32::INFINITY`。最狠的是
+    /// 「登录后命令」那一行:一个定宽 240 的输入框后面还串着「延时」勾选框、
+    /// 延时数值框和 ↑/↓/✕ 三个图标按钮,`ui.horizontal` 又不换行 ——
+    /// 右栏被分隔条拖窄到 300px 时,最右边的「✕」直接被推出面板,
+    /// **用户没有任何办法删掉一条命令**。
+    ///
+    /// 字段值一律用短内容:越界只能来自控件布局本身,不会跟 egui 单行
+    /// `TextEdit` 被长文本撑宽的已知上游行为(见
+    /// `connect_page_long_content_stays_within_a_measured_bound`)混淆。
+    #[test]
+    fn automation_page_never_paints_past_the_panel_at_any_width_or_dpi() {
+        for width in [300.0f32, 440.0, 900.0] {
+            for ppp in [1.0f32, 1.25, 1.5] {
+                let t = crate::theme::MULLION_DARK;
+                let mut buf = EditorBuffer::default();
+                let a = &mut buf.preserved_automation;
+                a.tmux = Some(mullion_store::TmuxChoice::Attach { session_name: None });
+                a.work_dir = Some("/tmp".to_string());
+                // `delay_ms` 给上值,那一行才会多出一个 `DragValue` —— 它是
+                // 这页最宽的一行,也是最容易把 ✕ 顶出去的那一行。
+                a.commands = Some(vec![mullion_store::AutomationCommand {
+                    text: "ls".to_string(),
+                    delay_ms: Some(500),
+                }]);
+                a.env = Some(vec![mullion_store::EnvVar {
+                    key: "K".to_string(),
+                    value: "v".to_string(),
+                }]);
+                let out = run_page_at(width, ppp, |ui| automation(ui, &t, &mut buf, &[]));
+                let right = max_right(&out.shapes);
+                assert!(
+                    right <= width + 0.5,
+                    "面板宽 {width} @ {ppp}x,却画到了 x={right}"
+                );
+            }
+        }
+    }
+
+    /// **走查 P0-1 在「图标」页的同构缺陷。**
+    ///
+    /// emoji 那一行是「60px 输入框 + 8 个 `small_button`」串在一个不换行的
+    /// `ui.horizontal` 里,窄栏下后面几个预设 emoji 直接被顶出面板。
+    #[test]
+    fn appearance_page_never_paints_past_the_panel_at_any_width_or_dpi() {
+        use mullion_store::{ColorSpec, ColorTarget};
+        for width in [300.0f32, 440.0, 900.0] {
+            for ppp in [1.0f32, 1.25, 1.5] {
+                let t = crate::theme::MULLION_DARK;
+                let mut buf = EditorBuffer {
+                    icon_emoji_mode: true,
+                    icon_emoji_buf: "🔥".to_string(),
+                    ..Default::default()
+                };
+                // 有颜色时才会出现「自定义 #rrggbb」那一行,连带把「作用于」
+                // 的三个勾选框也铺开 —— 一次覆盖本页所有会变宽的分支。
+                buf.preserved_appearance.color = Some(ColorSpec {
+                    hex: "#ff0000".to_string(),
+                    apply_to: vec![ColorTarget::ListItem],
+                });
+                let out = run_page_at(width, ppp, |ui| super::appearance(ui, &t, &mut buf));
+                let right = max_right(&out.shapes);
+                assert!(
+                    right <= width + 0.5,
+                    "面板宽 {width} @ {ppp}x,却画到了 x={right}"
+                );
+            }
+        }
     }
 }

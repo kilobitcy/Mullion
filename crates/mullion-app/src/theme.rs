@@ -213,6 +213,21 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+/// 输入框占位符文字。**所有 `hint_text` 都必须走这里。**
+///
+/// egui 画 hint 用的是 `Visuals::weak_text_color()`
+/// (`widgets/text_edit/builder.rs:693`),而它 =
+/// `tint_color_towards(fg_muted, widgets.noninteractive.weak_bg_fill)`
+/// —— 也就是 `fg_muted` 与 `panel_bg` 的中间色,在深色面板上达不到
+/// WCAG AA 的 4.5:1(走查 P2-17)。
+///
+/// egui 没有设置 `weak_text_color` 的入口(它是派生量),但
+/// `Painter::galley` 的第三参只是 **fallback** ——galley 自带颜色时
+/// 不生效。所以给 `hint_text()` 传一个带显式颜色的 `RichText` 就能盖掉。
+pub fn hint_text(t: &Theme, s: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(s.into()).color(c32(t.fg_dimmer))
+}
+
 /// `Rgb` → egui 颜色。
 pub fn c32(c: Rgb) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
@@ -422,5 +437,62 @@ mod tests {
         assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01);
         assert!((contrast_ratio(white, black) - 21.0).abs() < 0.01, "对称");
         assert!((contrast_ratio(white, white) - 1.0).abs() < 1e-9);
+    }
+
+    /// 走查 P2-17:占位符文字要达 WCAG AA 的 4.5:1。
+    /// 底色取 `sunken_bg`(`extreme_bg_color`,即输入框内部的底),
+    /// 不是 `panel_bg` —— 占位符画在输入框里,不是画在面板上。
+    #[test]
+    fn hint_text_color_meets_aa_against_the_input_background() {
+        let ratio = contrast_ratio(MULLION_DARK.fg_dimmer, MULLION_DARK.sunken_bg);
+        assert!(
+            ratio >= 4.5,
+            "占位符 fg_dimmer on sunken_bg 只有 {ratio:.2}:1,达不到 AA"
+        );
+    }
+
+    /// 这条测试的作用是**记录 `hint_text()` 这层包装为什么存在**:
+    /// egui 自己算的 hint 颜色达不到 AA。哪天 egui 改了默认取色、
+    /// 这条测试变红,说明包装可以删了 —— 那时应当删掉它,而不是
+    /// 放宽这里的断言。
+    #[test]
+    fn egui_default_hint_color_would_fail_aa_which_is_why_hint_text_exists() {
+        let ctx = egui::Context::default();
+        apply_egui(&ctx, &MULLION_DARK);
+        let weak = ctx.style().visuals.weak_text_color();
+        let ratio = contrast_ratio(
+            Rgb::new(weak.r(), weak.g(), weak.b()),
+            MULLION_DARK.sunken_bg,
+        );
+        assert!(
+            ratio < 4.5,
+            "egui 的默认 hint 颜色现在有 {ratio:.2}:1,已经够用了 —— \
+             请删掉 theme::hint_text() 这层包装及本测试"
+        );
+    }
+
+    /// `hint_text()` 必须真的把颜色写进 `RichText`,否则
+    /// `Painter::galley` 会回落到 egui 的 `weak_text_color()`,包装白做。
+    ///
+    /// 用 `append_to` 把它摊成 `LayoutJob` 再看 section 的颜色:egui 内部
+    /// 就是这么做的 —— `RichText` 没带颜色时,`into_text_and_format` 会填
+    /// `Color32::PLACEHOLDER`,而 `PLACEHOLDER` 正是「让 `Painter::galley`
+    /// 用 fallback 色」的哨兵值。断言它不是 PLACEHOLDER,才真的守住了行为。
+    #[test]
+    fn hint_text_carries_an_explicit_color_so_the_fallback_never_applies() {
+        let mut job = egui::text::LayoutJob::default();
+        hint_text(&MULLION_DARK, "留空 = 继承(远端默认)").append_to(
+            &mut job,
+            &egui::Style::default(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+        let color = job.sections[0].format.color;
+        assert_ne!(
+            color,
+            egui::Color32::PLACEHOLDER,
+            "RichText 没带颜色 = 走 egui fallback = 对比度原样偏低"
+        );
+        assert_eq!(color, c32(MULLION_DARK.fg_dimmer));
     }
 }

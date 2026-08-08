@@ -1,11 +1,11 @@
-//! 会话管理器**右栏**:标题条 + 错误卡片 + 五个 Tab + 底部按钮条(F90 Task 11)。
+//! 会话管理器**右栏**:标题条 + 错误卡片 + 四个 Tab + 底部按钮条(F90 Task 11)。
 //!
 //! 原来是一个独立的 `egui::Window`(F90 前),现在是主窗右侧的 `CentralPanel`,
 //! 每帧都渲染——「关闭」表单这个概念不复存在,「取消」只是把
 //! `ui_state.editor`/`editor_id`/`editor_baseline` 重置回空(等价于回到
 //! 「未编辑任何会话」态,画空态提示)。
 //!
-//! 字段本身的布局是 Task 12 的事,这里只挂五个 Tab 的占位调用点
+//! 字段本身的布局是 Task 12 的事,这里只挂四个 Tab 的占位调用点
 //! (`super::fields::{basic,auth,network,automation}`)。
 
 use egui::Ui;
@@ -15,8 +15,10 @@ use crate::ui::session_manager::SecretPresence;
 use crate::ui::UiState;
 use mullion_store::{GroupRecord, SessionRecord};
 
-/// 五个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
-const TABS: [&str; 5] = ["连接", "认证", "高级", "登录后", "图标"];
+/// 四个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
+/// 「高级」已并入「连接」(走查 P1-8):那一页只有一行代理,右侧 70% 是空白,
+/// 而代理跟主机/端口/跳板本来就是同一个「怎么连上去」的决策。
+const TABS: [&str; 4] = ["连接", "认证", "登录后", "图标"];
 
 /// 底部按钮为什么点不动。两个原因是并集,`Missing` 优先 ——
 /// 表单都没填齐,就没必要提「测试连接进行中」。
@@ -33,6 +35,27 @@ fn why(missing: super::validate::Missing, probe: &super::ProbeState) -> Disabled
         Disabled::Probing
     } else {
         Disabled::No
+    }
+}
+
+/// 错误卡片上那一行摘要最多几个字。
+const SUMMARY_CHARS: usize = 72;
+
+/// 错误摘要:取首行,超长就截断。返回 `(摘要, 还有没有更多内容)`——
+/// 后者决定要不要给「详情」按钮。
+///
+/// **按 `char` 截,不按字节**:错误信息里几乎必然有中文,`&s[..72]` 切在
+/// 多字节字符中间会当场 panic —— 而这是一条「报错时才走到」的路径,
+/// 崩在这儿等于把真正的错误信息永远埋掉。
+fn summarize(msg: &str) -> (String, bool) {
+    let first = msg.lines().next().unwrap_or("").trim();
+    let more_lines = msg.trim_end().lines().count() > 1;
+    let chars: Vec<char> = first.chars().collect();
+    if chars.len() > SUMMARY_CHARS {
+        let head: String = chars[..SUMMARY_CHARS].iter().collect();
+        (format!("{head}…"), true)
+    } else {
+        (first.to_string(), more_lines)
     }
 }
 
@@ -65,17 +88,60 @@ pub(super) fn show(
     });
 
     // 没选中任何会话 → 空态提示,不画一张什么都填不进去的空表单。
+    //
+    // 走查 21:一条会话都没有时,「从左侧选一条」是句废话 —— 左侧空的。
+    // 分成两句话,第一次打开的人才知道下一步该干什么。**只说这里真能做到
+    // 的事**:不提「导入 ~/.ssh/config」之类还没实现的路(那是 F2)。
     let Some(buf) = ui_state.editor.as_mut() else {
         ui.centered_and_justified(|ui| {
-            ui.colored_label(theme::c32(t.fg_dimmer), "从左侧选一条会话,或点「+ 新建」");
+            ui.vertical_centered(|ui| {
+                if sessions.is_empty() {
+                    ui.colored_label(theme::c32(t.fg_dim), "还没有任何会话");
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        theme::c32(t.fg_dimmer),
+                        "点左下角「+ 新建」建第一条:填名称、主机、用户名就能连。",
+                    );
+                } else {
+                    ui.colored_label(theme::c32(t.fg_dimmer), "从左侧选一条会话,或点「+ 新建」");
+                }
+            });
         });
         return;
     };
 
+    // 走查 21:一次性聚焦标志。在这里 `take()` 而不是让 `fields::basic` 自己
+    // 复位:那边只拿得到 `&mut EditorBuffer`,够不着 `UiState`。
+    let focus_name = std::mem::take(&mut ui_state.focus_name_request);
+    // 走查 14:表单相对「上次保存/刚载入」的基线有没有动过。字段级不相交借用:
+    // `buf` 借的是 `ui_state.editor`,这里读的是 `editor_baseline`,互不冲突。
+    let dirty = ui_state
+        .editor_baseline
+        .as_ref()
+        .is_some_and(|base| super::is_dirty(buf, base));
     let missing = super::validate::check(&buf.name, &buf.host, &buf.user);
+    // 走查 3:名称 + user@host + 端口 + 协议全撞上另一条已存在的会话时提醒一句。
+    // **只提醒,不禁用保存** —— 「先存一条一样的、回头改其中一条」是合理用法,
+    // 拦下来只会逼用户去改一个假名字再改回来。
+    let duplicate = super::dedupe::duplicate_of(
+        &buf.name,
+        &buf.user,
+        &buf.host,
+        buf.port.trim().parse().unwrap_or(22),
+        buf.protocol,
+        ui_state.editor_id,
+        sessions,
+    )
+    .is_some();
     let reason = why(missing, &ui_state.probe);
-    // 保存只被「必填未齐」挡;拨测在途时仍可保存(它只读表单,不改)。
-    let disable_save = missing.any();
+    // 走查 14:表单跟基线一模一样时,「保存」是个空动作 —— 亮着它只会让用户
+    // 反复按、反复怀疑自己有没有存上。
+    //
+    // **新建草稿例外**(`editor_id.is_none()`):草稿的基线就是它自己刚生成的
+    // 那份,永远「不脏」,按 `dirty` 判会把新建这条路整个堵死。
+    let unchanged = !dirty && ui_state.editor_id.is_some();
+    // 保存被「必填未齐」和「没有改动」挡;拨测在途时仍可保存(它只读表单,不改)。
+    let disable_save = missing.any() || unchanged;
     // 保存并连接 / 测试连接 两个原因都挡。
     let disable_connect = !matches!(reason, Disabled::No);
 
@@ -91,6 +157,17 @@ pub(super) fn show(
                 .size(16.0)
                 .color(theme::c32(t.fg)),
         );
+        // 走查 14:有未保存改动时标题后跟一个圆点。**不改窗口标题** ——
+        // `egui::Window::new(title)` 拿标题文本当 id 源,标题一变窗口位置和
+        // 尺寸就整个重置。而且脏的是这张表单,不是整个管理器。
+        if dirty {
+            ui.label(
+                egui::RichText::new("•")
+                    .size(16.0)
+                    .color(theme::c32(t.accent)),
+            )
+            .on_hover_text("有未保存的更改");
+        }
     });
     ui.add_space(6.0);
 
@@ -124,6 +201,11 @@ pub(super) fn show(
     // §5.2 错误卡片:比状态栏那行显眼,且可关闭。关闭后下一个新错误会由
     // `UiState::set_error` 重新展开(它复位 error_dismissed)。
     if let (Some(msg), false) = (ui_state.last_error.clone(), ui_state.error_dismissed) {
+        // 走查 13:卡片上只放摘要,全文藏在「详情」后面,另给一个「复制」——
+        // russh / keyring 的错误动辄好几行带堆栈,整片糊在卡片上会把按钮条
+        // 顶出屏幕;而这些字恰恰是用户唯一能拿去搜或者贴给我看的东西,
+        // 截断了就等于丢了。
+        let (summary, has_more) = summarize(&msg);
         egui::Frame::none()
             .fill(theme::c32(t.sunken_bg))
             .stroke(egui::Stroke::new(1.0, theme::c32(t.danger_soft)))
@@ -131,13 +213,40 @@ pub(super) fn show(
             .inner_margin(10.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::c32(t.danger_soft), msg);
+                    ui.colored_label(theme::c32(t.danger_soft), &summary);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").clicked() {
                             ui_state.error_dismissed = true;
                         }
+                        if ui.small_button("复制").clicked() {
+                            ui.ctx().copy_text(msg.clone());
+                            // 直接写字段而不是 `set_toast()`:方法调用要 `&mut`
+                            // 整个 `UiState`,而这里 `buf` 正借着 `editor` 字段
+                            // (字段级不相交借用只对字段访问成立)。
+                            ui_state.pending_toast = Some("错误信息已复制".to_string());
+                        }
+                        if has_more {
+                            let label = if ui_state.error_expanded {
+                                "收起"
+                            } else {
+                                "详情"
+                            };
+                            if ui.small_button(label).clicked() {
+                                ui_state.error_expanded = !ui_state.error_expanded;
+                            }
+                        }
                     });
                 });
+                if has_more && ui_state.error_expanded {
+                    ui.add_space(6.0);
+                    // 只读的多行 `TextEdit` 而不是 `Label`:用户要能划选其中
+                    // 一段去搜,`Label` 选不中。
+                    ui.add(
+                        egui::TextEdit::multiline(&mut msg.as_str())
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                }
             });
         ui.add_space(8.0);
     }
@@ -269,16 +378,44 @@ pub(super) fn show(
     ui.horizontal(|ui| {
         for (i, name) in TABS.iter().enumerate() {
             // F91:缺项所在的 Tab 标一个红点,否则用户看到按钮灰着
-            // 却不知道该翻哪一页。
-            let label = if missing.tab() == Some(i) {
-                format!("{name} ●")
-            } else {
-                (*name).to_string()
-            };
-            if ui
-                .selectable_label(ui_state.editor_tab == i, label)
-                .clicked()
-            {
+            // 却不知道该翻哪一页。走查 9 把它扩成三态(单一状态位):
+            // 缺项红● > 已配置灰· > 无,判据在 `tab_badge`。
+            //
+            // 用 `LayoutJob` 而不是 `format!("{name} ●")` + `RichText::color`:
+            // 后者只能给整条 label 一个颜色,选中的那一页会连 Tab 名一起变红。
+            // `LayoutJob` 能分段着色,而 Tab 名那段给 `Color32::PLACEHOLDER`
+            // 就还能保留 egui 的选中态/hover 配色 —— `SelectableLabel` 最后
+            // 是 `painter().galley(pos, galley, visuals.text_color())`,第三参
+            // 是 **fallback**,epaint 只替换 PLACEHOLDER 的部分(egui-0.30.0
+            // `widgets/selected_label.rs` / epaint-0.30.0 `tessellator.rs`)。
+            let badge = super::tab_badge::badge_of(i, missing, buf);
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                name,
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: egui::Color32::PLACEHOLDER,
+                    ..Default::default()
+                },
+            );
+            if let Some((sym, color)) = match badge {
+                super::tab_badge::Badge::Missing => Some(("●", theme::c32(t.danger))),
+                super::tab_badge::Badge::Configured => Some(("·", theme::c32(t.fg_dimmer))),
+                super::tab_badge::Badge::None => None,
+            } {
+                job.append(
+                    sym,
+                    4.0,
+                    egui::TextFormat {
+                        font_id: font,
+                        color,
+                        ..Default::default()
+                    },
+                );
+            }
+            if ui.selectable_label(ui_state.editor_tab == i, job).clicked() {
                 ui_state.editor_tab = i;
             }
         }
@@ -295,22 +432,28 @@ pub(super) fn show(
     // 或字号变大就失同步,且没有任何编译错误或测试会提示。
     // panel 布局天然保证「panel 先分配、中央区吃剩余」,不需要猜数字。
     //
-    // 「取消」只置意图,不在这里改 `ui_state.editor` —— 见代码块后的借用说明。
-    let mut cancel = false;
     // `why()` 里已经构造过同一份文本,别每个按钮再各建一次 String——
-    // `disable_save == missing.any()`,而 `reason` 是 `Disabled::Missing`
-    // 当且仅当 `missing.any()` 为真(`why()` 的分支顺序保证了这一点),
-    // 所以下面 `Disabled::Missing(h) => Some(h.as_str())` 与原来
-    // `if disable_save { Some(missing.hint()) } else { None }` 完全等价。
+    // `reason` 是 `Disabled::Missing` 当且仅当 `missing.any()` 为真
+    // (`why()` 的分支顺序保证了这一点)。
     let missing_tip = match &reason {
         Disabled::Missing(h) => Some(h.as_str()),
         _ => None,
     };
+    // 走查 14:「保存」比其它按钮多一个禁用原因。缺项优先 —— 表单都没填齐时
+    // 说「没有需要保存的改动」是在误导。
+    let save_tip = missing_tip.or(unchanged.then_some("没有需要保存的改动"));
     egui::TopBottomPanel::bottom(ui.id().with("sm_editor_bottom"))
         .frame(egui::Frame::none())
         .show_separator_line(false)
         .show_inside(ui, |ui| {
             ui.separator();
+            // 走查 3:重名提醒贴在按钮条上方 —— 决定要不要按「保存」就在这一眼里。
+            if duplicate {
+                ui.colored_label(
+                    theme::c32(t.warn),
+                    "已有一条名称、用户、主机、端口、协议都相同的会话",
+                );
+            }
             // 布局:[测试连接] [复制连接串] ……… [取消] [保存] [保存并连接]
             // 唯一的实心主按钮是最右的「保存并连接」——按钮全一个样,
             // 用户就只能靠读字来找主操作。
@@ -337,7 +480,10 @@ pub(super) fn show(
                     ui,
                     super::copy_button_id(),
                     "复制连接串",
-                    !disable_save,
+                    // 走查 14:这里判的是 `missing.any()` 而**不是** `disable_save` ——
+                    // 「表单没改过」跟「能不能拼出一条连接串」毫无关系,跟着保存
+                    // 一起灰掉会让「打开会话、复制连接串」这条最常见的路走不通。
+                    !missing.any(),
                     missing_tip,
                 ) {
                     ui.ctx().copy_text(super::connect_string(buf));
@@ -369,11 +515,12 @@ pub(super) fn show(
                         super::save_button_id(),
                         "保存",
                         !disable_save,
-                        missing_tip,
+                        save_tip,
                     );
 
-                    cancel |= ui.button("取消").clicked();
-
+                    // 走查 16:底部「取消」按钮已删。它做的事(把右栏退回空态)
+                    // 跟「关掉管理器」高度重合,而后者现在有 Esc、标题栏 × 两条
+                    // 路;留着两个语义相近的出口只会让人犹豫按哪个。
                     if save || save_connect {
                         ui_state.save_click = Some(save_connect);
                     }
@@ -384,53 +531,35 @@ pub(super) fn show(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| match ui_state.editor_tab {
-            super::TAB_CONNECT => {
-                super::fields::basic(ui, t, buf, groups, sessions, ui_state.editor_id)
-            }
-            super::TAB_AUTH => super::fields::auth(ui, t, buf, presence, &ui_state.key_candidates),
-            super::TAB_AUTOMATION => super::fields::automation(ui, t, buf),
-            super::TAB_ADVANCED => super::fields::network(ui, t, buf, presence),
+            super::TAB_AUTH => super::fields::auth(
+                ui,
+                t,
+                buf,
+                presence,
+                &ui_state.key_candidates,
+                &mut ui_state.touched,
+            ),
+            super::TAB_AUTOMATION => super::fields::automation(ui, t, buf, groups),
             super::TAB_APPEARANCE => super::fields::appearance(ui, t, buf),
-            // 「越界值兜底」:`editor_tab` 是既有的裸 usize 技术债,越界值
-            // 落到这里比 panic 好。
-            _ => super::fields::network(ui, t, buf, presence),
+            // `TAB_CONNECT` 与「越界值兜底」合并成同一个分支:`editor_tab`
+            // 是既有的裸 usize 技术债,越界值落回首页比 panic 好。
+            _ => super::fields::basic(
+                ui,
+                t,
+                buf,
+                groups,
+                sessions,
+                ui_state.editor_id,
+                presence,
+                focus_name,
+                &mut ui_state.touched,
+            ),
         });
-
-    // `buf` 的借用到此结束,现在才能动 `ui_state.editor`。
-    if cancel {
-        apply_cancel(ui_state);
-    }
 
     // F92:表单一改,上一次的成功/失败结论就不再可信 —— 但**不动世代号**:
     // 在途那次仍是针对这份表单发起的,让它跑完;世代号只在切会话/关窗时才变
     //(`cancel_probe`,app.rs)。这里够不着世代号,也不该够得着。
     expire_verdict_if_form_changed(ui_state);
-}
-
-/// 点「取消」之后的清理:回到「未编辑任何会话」态。抽成纯函数(而不是
-/// 内联在 `show()` 的 `if cancel` 块里),是为了让测试能直接扎在这段清理
-/// 逻辑上——`show()` 整体要驱动一次 egui 按钮点击才能触发,而这里只是
-/// 一段状态赋值,不需要经过 egui。
-///
-/// 终审发现:这里原先漏了 `probe_cancel = true`。`close_session_manager`
-/// (`ui/mod.rs`)和 `apply_switch`(同目录 `mod.rs`)清理同一组字段时都会
-/// 置这个标志,唯独「取消」分支没有——后果是点「取消」时,若拨测仍在
-/// `Running`,`app.rs` 收不到取消意图,`probe_epoch` 不会自增、`probe_task`
-/// 也不会被 `abort()`,那个 tokio 任务会一直跑到自己的超时(最长 20 秒)
-/// 才结束,期间还占着一份对已经不存在的表单的引用。`probe_cancel` 只是
-/// 「意图标志」而非世代号本身——世代号和 `JoinHandle` 都在 `App` 上,
-/// `UiState` 够不着,只能靠 app.rs 消费这个标志后自增世代号并 abort。
-fn apply_cancel(ui_state: &mut UiState) {
-    ui_state.editor = None;
-    ui_state.editor_baseline = None;
-    ui_state.editor_id = None;
-    // F92:编辑器都关了,一个属于已关闭表单的拨测结论没有任何意义,
-    // 不该留到下次打开;`probe_form` 还揣着明文凭据,一并清空
-    // (与 `apply_switch`/`close_session_manager` 对齐,同构改动)。
-    ui_state.probe = super::ProbeState::Idle;
-    ui_state.probe_form = None;
-    // 与上面两处对齐补的一条:取消也要取消在途拨测,见本函数文档。
-    ui_state.probe_cancel = true;
 }
 
 /// F93:确保 `~/.ssh` 私钥候选已经扫过。**不能每帧扫**——那是每秒几十次
@@ -542,32 +671,666 @@ fn decide_key_drop(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cancel, decide_key_drop, ensure_key_candidates_scanned,
-        expire_verdict_if_form_changed, tip, why, Disabled, KeyDrop,
+        decide_key_drop, ensure_key_candidates_scanned, expire_verdict_if_form_changed, summarize,
+        tip, why, Disabled, KeyDrop, SUMMARY_CHARS,
     };
     use crate::ui::session_manager::validate::Missing;
     use crate::ui::session_manager::{AuthKindUi, EditorBuffer, ProbeState, TAB_AUTH, TAB_CONNECT};
     use crate::ui::UiState;
+    use mullion_store::SessionRecord;
 
-    /// Tab 标题与 `TAB_*` 下标常量一一对应。
+    /// 按 Tab 名找到那个 galley 的 `LayoutJob`。
+    fn find_galley_job(
+        shapes: &[egui::epaint::ClippedShape],
+        starts_with: &str,
+    ) -> Option<egui::text::LayoutJob> {
+        fn walk(shape: &egui::Shape, starts_with: &str, out: &mut Option<egui::text::LayoutJob>) {
+            match shape {
+                egui::Shape::Text(ts) => {
+                    if out.is_none() && ts.galley.text().starts_with(starts_with) {
+                        *out = Some((*ts.galley.job).clone());
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, starts_with, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        shapes
+            .iter()
+            .for_each(|cs| walk(&cs.shape, starts_with, &mut out));
+        out
+    }
+
+    /// 把这一帧画出来的所有文字摊平成一串,用来断言某句话出现/没出现。
+    fn all_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        acc
+    }
+
+    /// 按**完整相等**的文字找到它的绘制锚点。`find_galley_job` 用的是
+    /// `starts_with`,分不出「保存」和「保存并连接」——要点中前者只能用全等。
+    fn find_text_pos_exact(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text() == needle => Some(ts.pos),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// 跑两帧 `editor::show`,返回第二帧输出。
+    fn run_editor(buf: EditorBuffer) -> egui::FullOutput {
+        run_editor_with(buf, &[], None)
+    }
+
+    /// 同上,但带一份已存在的会话表(重名检测要它)和「正在编辑哪一条」。
+    fn run_editor_with(
+        buf: EditorBuffer,
+        sessions: &[SessionRecord],
+        editor_id: Option<mullion_store::SessionId>,
+    ) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        let mut ui_state = UiState {
+            editor: Some(buf),
+            editor_id,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut run = || {
+            ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::show(
+                        ui,
+                        &t,
+                        &mut ui_state,
+                        &[],
+                        sessions,
+                        crate::ui::session_manager::SecretPresence::default(),
+                    );
+                });
+            })
+        };
+        let _ = run();
+        run()
+    }
+
+    /// 走查 21:一条会话都没有时,「从左侧选一条会话」是句废话 —— 左侧空的。
+    /// 而且空态**不许承诺做不到的事**(`~/.ssh/config` 导入是 F2,还没做)。
     ///
-    /// `editor_tab: usize` 是既有技术债(见 `mod.rs` 的常量注释):重排 `TABS`
-    /// 而忘了改常量,**编译器一声不吭**,后果是 `validate::tab()` 把缺项红点
-    /// 标在错误的页上、`show()` 的 match 把用户导到错误的页。这条是那个静默
-    /// 失效的唯一自动守护。
-    ///
-    /// 覆盖不到的:`show()` 里 match 是否给每个下标都接了对应的 `fields::*`
-    /// (漏接会落到 `_ =>` 兜底渲染「高级」页)。那要端到端跑 `show()`,
-    /// 参数面太宽,留在人工验收清单里。
+    /// 自证会变红:把 `sessions.is_empty()` 分支删掉 → 空库时画的还是那句
+    /// 「从左侧选一条会话」。
     #[test]
-    fn tab_titles_line_up_with_the_tab_index_constants() {
-        use crate::ui::session_manager::{TAB_ADVANCED, TAB_APPEARANCE, TAB_AUTOMATION};
-        assert_eq!(super::TABS.len(), 5, "加减 Tab 要同步更新这条");
+    fn the_empty_state_tells_a_first_time_user_what_to_do_without_promising_an_import() {
+        fn texts(sessions: &[SessionRecord]) -> Vec<String> {
+            let t = crate::theme::MULLION_DARK;
+            let mut ui_state = UiState::default(); // editor = None
+            let ctx = egui::Context::default();
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::show(
+                        ui,
+                        &t,
+                        &mut ui_state,
+                        &[],
+                        sessions,
+                        crate::ui::session_manager::SecretPresence::default(),
+                    );
+                });
+            });
+            fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                    _ => {}
+                }
+            }
+            let mut acc = Vec::new();
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+            acc
+        }
+
+        let empty = texts(&[]);
+        assert!(
+            empty.iter().any(|s| s.contains("还没有任何会话")),
+            "空库时该说清楚现在是什么状况:{empty:?}"
+        );
+        assert!(
+            empty.iter().any(|s| s.contains("+ 新建")),
+            "空库时该指出下一步该点哪儿:{empty:?}"
+        );
+        assert!(
+            !empty
+                .iter()
+                .any(|s| s.contains("导入") || s.contains("ssh/config")),
+            "不许承诺还没实现的 ~/.ssh/config 导入(那是 F2):{empty:?}"
+        );
+
+        // 库里有会话、只是没选中 → 还是原来那句。
+        let one = texts(std::slice::from_ref(&sample_record()));
+        assert!(
+            one.iter().any(|s| s.contains("从左侧选一条会话")),
+            "有会话时该引导去左边选:{one:?}"
+        );
+    }
+
+    /// 走查 21:点完「+ 新建」,光标必须已经在「名称」框里 —— 不然用户得先
+    /// 拿鼠标点一下才能打字,新建这条路上白多一次交互。
+    ///
+    /// 断言方式是**真的敲一个字**看它落在哪儿,而不是去比对 `focused()` 的
+    /// 内部 id:后者要复刻 egui 的 id 生成规则,规则一变测试就假绿。
+    ///
+    /// 自证会变红:把 `name_resp.request_focus()` 删掉 → 字符没有落点,
+    /// `name` 仍是空的。
+    #[test]
+    fn clicking_new_puts_the_caret_in_the_name_field_so_you_can_just_type() {
+        let t = crate::theme::MULLION_DARK;
+        let mut ui_state = UiState {
+            editor: Some(EditorBuffer::new_draft()),
+            editor_id: None,
+            focus_name_request: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut run = |input: egui::RawInput| {
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::show(
+                        ui,
+                        &t,
+                        &mut ui_state,
+                        &[],
+                        &[],
+                        crate::ui::session_manager::SecretPresence::default(),
+                    );
+                });
+            });
+        };
+        // 第一帧:表单建出来并请求聚焦。
+        run(egui::RawInput::default());
+        // 第二帧:直接敲字,不点任何东西。
+        run(egui::RawInput {
+            events: vec![egui::Event::Text("w".into())],
+            ..Default::default()
+        });
+        assert_eq!(
+            ui_state.editor.as_ref().unwrap().name,
+            "w",
+            "新建后直接打字该落进「名称」框"
+        );
+        assert!(
+            !ui_state.focus_name_request,
+            "聚焦请求是一次性的,用完必须清掉,否则光标每帧被拽回名称框"
+        );
+    }
+
+    /// 走查 14:有未保存改动时,右栏标题后面跟一个圆点;存过/没动过就没有。
+    ///
+    /// 圆点挂在**右栏标题**上而不是窗口标题上:`egui::Window::new(title)` 拿
+    /// 标题文本当 id 源,标题一变窗口位置尺寸整个重置。
+    ///
+    /// 自证会变红:把 `if dirty` 改成 `if true`,第一段断言(没改动时不该有
+    /// 圆点)立刻炸。
+    #[test]
+    fn an_unsaved_form_marks_its_title_with_a_dot() {
+        let base = EditorBuffer {
+            name: "web01".into(),
+            host: "10.0.0.1".into(),
+            port: "22".into(),
+            user: "root".into(),
+            ..Default::default()
+        };
+        let has_dot = |buf: EditorBuffer, baseline: EditorBuffer| {
+            let t = crate::theme::MULLION_DARK;
+            let mut ui_state = UiState {
+                editor: Some(buf),
+                editor_baseline: Some(baseline),
+                editor_id: Some(mullion_store::SessionId(1)),
+                ..Default::default()
+            };
+            let ctx = egui::Context::default();
+            let mut run = || {
+                ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        super::show(
+                            ui,
+                            &t,
+                            &mut ui_state,
+                            &[],
+                            &[],
+                            crate::ui::session_manager::SecretPresence::default(),
+                        );
+                    });
+                })
+            };
+            let _ = run();
+            find_text_pos_exact(&run().shapes, "•").is_some()
+        };
+
+        assert!(
+            !has_dot(base.clone(), base.clone()),
+            "跟基线一模一样时不该有圆点 —— 那会让用户永远以为自己没存上"
+        );
+        let mut edited = base.clone();
+        edited.note = "改了一句".into();
+        assert!(has_dot(edited, base), "改过没存该有圆点");
+    }
+
+    /// 走查 14:没改过就没什么可存的,「保存」置灰。**新建草稿例外** ——
+    /// 草稿的基线就是它自己刚生成的那份,永远「不脏」,按 `dirty` 判会把
+    /// 新建这条路整个堵死。
+    ///
+    /// 自证会变红:把 `unchanged` 里的 `&& ui_state.editor_id.is_some()`
+    /// 去掉,第三段断言(新建草稿必须能存)立刻炸;把整个 `|| unchanged`
+    /// 去掉,第一段炸。
+    #[test]
+    fn save_is_greyed_out_until_something_actually_changes() {
+        let filled = EditorBuffer {
+            name: "web01".into(),
+            host: "10.0.0.1".into(),
+            port: "22".into(),
+            user: "root".into(),
+            ..Default::default()
+        };
+        // 真的点一下「保存」,看意图有没有落下来 —— 按钮禁用时
+        // `labeled_button` 根本不报 click,这是唯一能分辨禁用与否的判据。
+        let clicks_through =
+            |buf: EditorBuffer,
+             baseline: EditorBuffer,
+             editor_id: Option<mullion_store::SessionId>| {
+                let t = crate::theme::MULLION_DARK;
+                let mut ui_state = UiState {
+                    editor: Some(buf),
+                    editor_baseline: Some(baseline),
+                    editor_id,
+                    ..Default::default()
+                };
+                let ctx = egui::Context::default();
+                let run = |ui_state: &mut UiState, input: egui::RawInput| {
+                    ctx.run(input, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            super::show(
+                                ui,
+                                &t,
+                                ui_state,
+                                &[],
+                                &[],
+                                crate::ui::session_manager::SecretPresence::default(),
+                            );
+                        });
+                    })
+                };
+                let _ = run(&mut ui_state, egui::RawInput::default());
+                let out = run(&mut ui_state, egui::RawInput::default());
+                let pos = find_text_pos_exact(&out.shapes, "保存").expect("「保存」按钮该画出来了");
+                let click = |pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                };
+                let _ = run(
+                    &mut ui_state,
+                    egui::RawInput {
+                        events: vec![egui::Event::PointerMoved(pos), click(true), click(false)],
+                        ..Default::default()
+                    },
+                );
+                ui_state.save_click.is_some()
+            };
+
+        let id = Some(mullion_store::SessionId(1));
+        assert!(
+            !clicks_through(filled.clone(), filled.clone(), id),
+            "一个字都没改,「保存」该是灰的"
+        );
+
+        let mut edited = filled.clone();
+        edited.note = "改了一句".into();
+        assert!(
+            clicks_through(edited, filled.clone(), id),
+            "改过之后「保存」必须能按"
+        );
+
+        assert!(
+            clicks_through(filled.clone(), filled, None),
+            "新建草稿的基线就是它自己,按 dirty 判会把新建这条路整个堵死"
+        );
+    }
+
+    /// 走查 13:错误摘要按 **char** 截。错误信息里几乎必然有中文,按字节切
+    /// 会切在多字节字符中间当场 panic —— 而这是「已经出错了」才走到的路径,
+    /// 崩在这儿等于把真正的错误信息永远埋掉。
+    ///
+    /// 自证会变红:把 `summarize` 里的 `chars[..SUMMARY_CHARS]` 换成
+    /// `&first[..SUMMARY_CHARS]`,第三段直接 panic。
+    #[test]
+    fn a_long_multibyte_error_is_summarised_on_char_boundaries() {
+        let (s, more) = summarize("连接被拒绝");
+        assert_eq!(s, "连接被拒绝");
+        assert!(!more, "单行短消息没有更多内容可展开");
+
+        let (s, more) = summarize("保存失败\n堆栈第二行\n第三行");
+        assert_eq!(s, "保存失败", "摘要只取首行");
+        assert!(more, "还有别的行 → 该给「详情」");
+
+        let long = "认证失败".repeat(40); // 160 个中文字符,单行
+        let (s, more) = summarize(&long);
+        assert!(more, "超长首行也该能展开看全文");
+        assert_eq!(
+            s.chars().count(),
+            SUMMARY_CHARS + 1,
+            "截断后应是 {SUMMARY_CHARS} 个字加一个省略号"
+        );
+        assert!(s.ends_with('…'));
+    }
+
+    /// 走查 13:多行错误的卡片上给「详情」和「复制」;点「详情」才展开全文。
+    /// 全文是用户唯一能拿去搜、能贴给别人看的东西,埋掉就等于没报错。
+    ///
+    /// 自证会变红:把「复制」按钮删掉,第二段断言炸。
+    #[test]
+    fn a_multiline_error_offers_details_and_a_way_to_copy_it() {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState {
+            editor: Some(EditorBuffer::default()),
+            ..Default::default()
+        };
+        ui_state.set_error("保存失败:keyring 拒绝写入\n第二行细节\n第三行细节".into());
+        let run = |ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &[],
+                        &[],
+                        crate::ui::session_manager::SecretPresence::default(),
+                    );
+                });
+            })
+        };
+        let _ = run(&mut ui_state, egui::RawInput::default());
+        let out = run(&mut ui_state, egui::RawInput::default());
+        let texts = all_text(&out.shapes);
+
+        assert!(
+            texts.iter().any(|s| s == "保存失败:keyring 拒绝写入"),
+            "卡片上该是首行摘要:{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|s| s.contains("第三行细节")),
+            "没展开时不该把整片堆栈糊在卡片上:{texts:?}"
+        );
+        assert!(texts.iter().any(|s| s == "复制"), "该给复制按钮:{texts:?}");
+
+        // 点「详情」→ 全文出来。
+        let pos = find_text_pos_exact(&out.shapes, "详情").expect("多行错误该给「详情」按钮");
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = run(
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(pos), click(true), click(false)],
+                ..Default::default()
+            },
+        );
+        assert!(ui_state.error_expanded, "点「详情」该展开");
+        let out = run(&mut ui_state, egui::RawInput::default());
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts.iter().any(|s| s.contains("第三行细节")),
+            "展开后必须能看到全文:{texts:?}"
+        );
+    }
+
+    /// 上面那条测试用的一条最小会话记录。
+    fn sample_record() -> SessionRecord {
+        use mullion_store::model::{Auth, AuthKind, Connection, Identity, Protocol};
+        SessionRecord {
+            id: mullion_store::SessionId(1),
+            modified_at: "t".into(),
+            identity: Identity {
+                name: "web01".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: "10.0.0.1".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "root".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        }
+    }
+
+    /// 走查 3:表单跟一条已存在的会话完全撞上时,按钮条上方出一句提醒;
+    /// 没撞上时不出。**提醒不禁用保存** —— 「先存一条一样的、回头改其中一条」
+    /// 是合理用法,拦下来只会逼用户去改个假名字再改回来。
+    #[test]
+    fn a_form_that_duplicates_an_existing_session_gets_a_warning_but_can_still_be_saved() {
+        use mullion_store::model::{
+            Auth, AuthKind, Connection, Identity, Protocol, SessionRecord as Rec,
+        };
+        let existing = Rec {
+            id: mullion_store::SessionId(1),
+            modified_at: "t".into(),
+            identity: Identity {
+                name: "web01".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: "10.0.0.1".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "root".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        };
+        let same = EditorBuffer {
+            name: "web01".into(),
+            host: "10.0.0.1".into(),
+            port: "22".into(),
+            user: "root".into(),
+            ..Default::default()
+        };
+
+        const WARN: &str = "已有一条名称、用户、主机、端口、协议都相同的会话";
+
+        // 新建一条一模一样的 → 提醒。
+        let out = run_editor_with(same.clone(), std::slice::from_ref(&existing), None);
+        assert!(
+            find_galley_job(&out.shapes, WARN).is_some(),
+            "撞上已有会话时应该给一句提醒"
+        );
+        // 提醒归提醒,「保存」不许被禁掉:真的点一下,意图必须落下来。
+        // (不看按钮文字颜色 —— 那分不出「保存」和「保存并连接」,而且主按钮
+        // 本来就显式染色,禁用与否颜色都一样。)
+        {
+            let t = crate::theme::MULLION_DARK;
+            let mut ui_state = UiState {
+                editor: Some(same.clone()),
+                ..Default::default()
+            };
+            let ctx = egui::Context::default();
+            let sessions = std::slice::from_ref(&existing);
+            let run = |ui_state: &mut UiState, input: egui::RawInput| {
+                ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        super::show(
+                            ui,
+                            &t,
+                            ui_state,
+                            &[],
+                            sessions,
+                            crate::ui::session_manager::SecretPresence::default(),
+                        );
+                    });
+                })
+            };
+            let _ = run(&mut ui_state, egui::RawInput::default());
+            let out = run(&mut ui_state, egui::RawInput::default());
+            let pos = find_text_pos_exact(&out.shapes, "保存").expect("「保存」按钮该画出来了");
+            let click = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            let _ = run(
+                &mut ui_state,
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        click(pos, true),
+                        click(pos, false),
+                    ],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                ui_state.save_click,
+                Some(false),
+                "重名只是提醒,不该把「保存」禁掉"
+            );
+        }
+
+        // 改一个字段(主机)→ 不再是重复,提醒消失。
+        let mut other = same.clone();
+        other.host = "10.0.0.2".into();
+        let out = run_editor_with(other, std::slice::from_ref(&existing), None);
+        assert!(
+            find_galley_job(&out.shapes, WARN).is_none(),
+            "主机不同就不是重复,不该提醒"
+        );
+
+        // 编辑**这一条**自己 → 不该提醒自己跟自己重复。
+        let out = run_editor_with(
+            same,
+            std::slice::from_ref(&existing),
+            Some(mullion_store::SessionId(1)),
+        );
+        assert!(
+            find_galley_job(&out.shapes, WARN).is_none(),
+            "编辑自己不该被判成重复,否则改一个字就弹一次"
+        );
+    }
+
+    /// 走查 9:角标必须是**两段不同颜色**的一个 galley —— Tab 名保留 egui 的
+    /// 选中态配色(`Color32::PLACEHOLDER`,由 `SelectableLabel` 用
+    /// `visuals.text_color()` 填),角标自己是显式的红/灰。
+    ///
+    /// 整条 label 染成一色的话,选中的那一页文字会跟着角标变红 —— 那是渲染
+    /// 出来才看得见的 bug,编译器和普通文字断言都拦不住。
+    #[test]
+    fn tab_badge_colors_only_the_dot_not_the_tab_name() {
+        let t = crate::theme::MULLION_DARK;
+        // 「登录后」页配过东西 → 灰点;必填齐全 → 没有红点。
+        let mut buf = EditorBuffer {
+            name: "web01".into(),
+            host: "10.0.0.1".into(),
+            user: "root".into(),
+            ..Default::default()
+        };
+        buf.preserved_automation.enabled = Some(false);
+
+        let out = run_editor(buf);
+        let job = find_galley_job(&out.shapes, "登录后").expect("没找到「登录后」这个 Tab");
+        assert!(
+            job.sections.len() >= 2,
+            "Tab 名和角标必须分段,否则没法各自着色:{:?}",
+            job.text
+        );
+        assert_eq!(
+            job.sections[0].format.color,
+            egui::Color32::PLACEHOLDER,
+            "Tab 名必须留给 SelectableLabel 填色,否则选中态高亮会失效"
+        );
+        assert_eq!(
+            job.sections[1].format.color,
+            crate::theme::c32(t.fg_dimmer),
+            "「已配置」角标应该是 fg_dimmer 灰"
+        );
+    }
+
+    /// 缺必填时角标是 danger 红,且压过「已配置」。
+    #[test]
+    fn missing_badge_is_danger_red_and_wins() {
+        let t = crate::theme::MULLION_DARK;
+        // 名称空 → 「连接」页缺项;同时给「连接」页配上代理 → 也满足「已配置」。
+        let buf = EditorBuffer {
+            host: "10.0.0.1".into(),
+            user: "root".into(),
+            proxy_mode: crate::ui::session_manager::ProxyModeUi::Socks5,
+            ..Default::default()
+        };
+
+        let out = run_editor(buf);
+        let job = find_galley_job(&out.shapes, "连接").expect("没找到「连接」这个 Tab");
+        assert_eq!(
+            job.sections[1].format.color,
+            crate::theme::c32(t.danger),
+            "缺项角标应该是 danger 红,且压过灰点"
+        );
+    }
+
+    /// Tab 常量必须与 `TABS` 一一对应。合并「高级」后只剩 4 页。
+    ///
+    /// `TAB_AUTH` 的下标不能变:`editor.rs` 里拖入私钥文件的门控写的是
+    /// `editor_tab == TAB_AUTH && auth_kind == PublicKey`,而
+    /// `validate::Missing::tab()` 也返回 `TAB_AUTH`。下标一漂,这两处
+    /// 全部悄悄失准,没有任何编译错误。
+    ///
+    /// 覆盖不到的:`show()` 里 match 是否给每个下标都接了对应的 `fields::*`。
+    /// 合并「高级」后 `_ =>` 兜底分支已经和 `TAB_CONNECT` 合成同一支,渲染的是
+    /// 「连接」页(不再是已经不存在的「高级」页)——但漏接其他下标(比如忘了给
+    /// 某个新增 Tab 接 `fields::*`)照样会静默落到这个兜底,把用户导向「连接」页
+    /// 而不是它本该去的页面。这条要端到端跑 `show()`,参数面太宽,留在人工验收
+    /// 清单里。
+    #[test]
+    fn tab_constants_match_the_table_and_auth_keeps_index_one() {
+        use crate::ui::session_manager::{TAB_APPEARANCE, TAB_AUTOMATION};
+        assert_eq!(super::TABS.len(), 4, "「高级」已并入「连接」,不该还有 5 页");
         assert_eq!(super::TABS[TAB_CONNECT], "连接");
         assert_eq!(super::TABS[TAB_AUTH], "认证");
-        assert_eq!(super::TABS[TAB_ADVANCED], "高级");
         assert_eq!(super::TABS[TAB_AUTOMATION], "登录后");
         assert_eq!(super::TABS[TAB_APPEARANCE], "图标");
+        assert_eq!(TAB_AUTH, 1, "私钥拖入门控与必填校验都钉在这个下标上");
     }
 
     /// 都没缺、也没在拨测 → 按钮可点。
@@ -833,36 +1596,6 @@ mod tests {
         assert!(
             st.probe_form.is_some(),
             "在途拨测仍需要 probe_form 当基线,不该被提前清空"
-        );
-    }
-
-    /// 终审修正:点「取消」必须一并置 `probe_cancel = true`,否则若拨测
-    /// 仍在 `Running`,app.rs 收不到取消意图,那个 tokio 任务会一直跑到
-    /// 自己的超时(最长 20 秒)才结束。这条断言扎在真实注入点
-    /// `apply_cancel` 本身,而不是经由 `show()` 驱动一次按钮点击——后者
-    /// 在无头 egui 测试里需要合成指针事件,构造成本高且离题。
-    ///
-    /// 自证会变红方式:把 `apply_cancel` 里 `ui_state.probe_cancel = true;`
-    /// 这一行删掉。删掉后 `probe_cancel` 仍是 `UiState::default()` 的初始值
-    /// `false`,断言 `assert!(st.probe_cancel)` 失败。
-    #[test]
-    fn apply_cancel_requests_cancelling_an_in_flight_probe() {
-        let mut st = UiState {
-            editor: Some(EditorBuffer::default()),
-            editor_baseline: Some(EditorBuffer::default()),
-            editor_id: None,
-            probe: ProbeState::Running,
-            probe_form: Some(EditorBuffer::default()),
-            probe_cancel: false,
-            ..Default::default()
-        };
-        apply_cancel(&mut st);
-        assert!(st.editor.is_none(), "取消后应回到『未编辑任何会话』态");
-        assert_eq!(st.probe, ProbeState::Idle, "取消后拨测结论应复位");
-        assert!(st.probe_form.is_none(), "取消后明文快照应清空");
-        assert!(
-            st.probe_cancel,
-            "取消编辑必须一并请求取消在途拨测,否则任务会跑满超时才结束"
         );
     }
 

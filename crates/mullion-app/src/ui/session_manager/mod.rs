@@ -7,11 +7,19 @@
 //! `request_quit` 完全同构。
 
 mod buffer;
+mod dedupe;
 mod editor;
+mod env_hint;
 mod fields;
+mod highlight;
+mod inherit_row;
+mod jump_preview;
+mod keys;
 mod keyscan;
-mod list;
-mod validate;
+pub(crate) mod list;
+mod tab_badge;
+mod tags;
+pub(crate) mod validate;
 
 pub(crate) use buffer::{
     build_draft, clear_key, connect_string, import_key_file, is_dirty, merge_secret, secret_fields,
@@ -66,9 +74,8 @@ pub(crate) const CONTENT_MIN_HEIGHT: f32 = 480.0;
 /// `validate::tab()` 会静默把用户导向错误的 Tab。
 pub(crate) const TAB_CONNECT: usize = 0;
 pub(crate) const TAB_AUTH: usize = 1;
-pub(crate) const TAB_ADVANCED: usize = 2;
-pub(crate) const TAB_AUTOMATION: usize = 3;
-pub(crate) const TAB_APPEARANCE: usize = 4;
+pub(crate) const TAB_AUTOMATION: usize = 2;
+pub(crate) const TAB_APPEARANCE: usize = 3;
 
 /// 计算给 `Window` 自身 chrome(标题栏 + `Frame::window` 的 `inner_margin`)留的
 /// 余量——**不是硬编码常量,是按 egui-0.30.0 实际渲染公式当场算出来的**。
@@ -273,6 +280,47 @@ pub fn show(
     }
 
     let mut open = true;
+    // 走查 16:键盘快捷键。在画任何东西**之前**解:`Action::Close` 要能在这一帧
+    // 就把窗口关掉,而 `egui::Window::open(&mut open)` 只在 show 之前读一次
+    // `open`。判定本身是纯函数,见 `keys::scan` 的文档(以及它为什么不碰
+    // `app.rs` 的键盘路由 —— 陷阱 T8)。
+    let typing = ctx.memory(|m| m.focused().is_some());
+    for action in ctx.input(|i| keys::scan(i, typing)) {
+        match action {
+            keys::Action::Close => {
+                // 有确认框挂着时,Esc 先撤确认框 —— 那一下十有八九是「我不想
+                // 删了 / 我不想丢改动」,连窗口一起关掉会顺手把编辑丢了。
+                if ui_state.confirm_switch {
+                    ui_state.confirm_switch = false;
+                    ui_state.pending_switch = None;
+                } else if ui_state.pending_delete.is_some() {
+                    ui_state.pending_delete = None;
+                } else {
+                    open = false;
+                }
+            }
+            keys::Action::Prev | keys::Action::Next => {
+                let order = list::visible_order(sessions, groups, &ui_state.search);
+                let forward = action == keys::Action::Next;
+                if let Some(id) = keys::step(&order, ui_state.editor_id, forward) {
+                    // 走 `pending_switch` 而不是直接换 `editor`:表单脏的时候
+                    // 要弹确认,这套机制已经在那条路上了(见本文件下方的消费点)。
+                    ui_state.pending_switch = Some(SwitchTarget::Session(id));
+                }
+            }
+            keys::Action::Open => {
+                if let Some(id) = ui_state.editor_id {
+                    ui_state.connect_request = Some(id);
+                }
+            }
+            keys::Action::Tab(n) => {
+                // 没在编辑任何会话时右栏是空态,切页没有意义。
+                if ui_state.editor.is_some() {
+                    ui_state.editor_tab = n;
+                }
+            }
+        }
+    }
     // 修复(F90 初版):`ui.set_min_height(CONTENT_MIN_HEIGHT)` 曾经是硬地板——
     // 主窗口可用高度小于它时 `Window` 不收缩,而是整体溢出可见区,底部的分隔线/
     // 「+ 新建」按钮被顶到屏幕外(Windows 11 实机截图确认)。这里先改成
@@ -502,8 +550,10 @@ fn apply_switch(ui_state: &mut UiState, sessions: &[SessionRecord]) {
     ui_state.confirm_switch = false;
     match target {
         SwitchTarget::NewDraft => {
-            ui_state.editor = Some(EditorBuffer::default());
+            // 走查 21:用户名预填成当前系统账号,光标落到「名称」上。
+            ui_state.editor = Some(EditorBuffer::new_draft());
             ui_state.editor_id = None;
+            ui_state.focus_name_request = true;
         }
         SwitchTarget::Session(id) => {
             let Some(rec) = sessions.iter().find(|r| r.id == id) else {
@@ -517,6 +567,9 @@ fn apply_switch(ui_state: &mut UiState, sessions: &[SessionRecord]) {
     // 下一次切换就会弹一个莫名其妙的确认。
     ui_state.editor_baseline = ui_state.editor.clone();
     ui_state.editor_tab = 0;
+    // 走查 15:触碰位跟着表单一起归零。上一条会话上留下的「碰过」会让新表单
+    // 一打开就带红字 —— 用户根本没碰过这几个框。
+    ui_state.touched = Default::default();
 
     // F92:换了会话,上一条的拨测结果不再有意义;快照(`probe_form`)里
     // 还揣着三个明文凭据字段,一并清掉以缩短明文在内存里的驻留窗口。
@@ -556,46 +609,79 @@ pub(super) fn secret_edit(
     has_stored: bool,
     empty_hint: &str,
 ) {
-    ui.horizontal(|ui| {
-        if *touched {
-            ui.add(
-                egui::TextEdit::singleline(value)
-                    .id_salt(id)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            );
-            if ui.small_button("撤销").clicked() {
-                *touched = false;
-                value.clear();
+    // 走查 P0-1:`secret_edit` 被 `grid()` 的单元格调用——egui 的 `Grid` 把
+    // 闭包里**每一次顶层调用**都当成「下一个单元格」放进当前行(不是
+    // 「同一单元格里继续往下叠」),`ui.horizontal(..)` 后面紧跟一次
+    // `ui.colored_label(..)` 会被摆成本行的第三个格子,跟输入框挤在
+    // 同一行右边,不会像期望的那样另起一行(同 `jump()` 里
+    // `ui.vertical(|ui| chain_editor(..))` 的写法:要让多个控件挤进
+    // **同一个格子**并在格子内部纵向排布,必须用一个 `ui.vertical` 包起来
+    // 作为唯一的顶层调用)。
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            use crate::ui::metrics::{button_reserve, field_w, FIELD_W_M};
+            if *touched {
+                // 走查 P0-1:老写法 `desired_width(f32::INFINITY)` 让输入框吃光
+                // 整行,「撤销」和后面的警告被推出面板只露半个字。改成先量出
+                // 「撤销」实际要多宽、从可用宽里扣掉,再取 FIELD_W_M 上限。
+                // 量而不是写常量:按钮宽随字号/DPI 变,写死的值会悄悄失同步。
+                // `+ TEXT_EDIT_MARGIN_X`:`TextEdit` 自己的默认内边距是
+                // `Margin::symmetric(4.0, 2.0)`(egui-0.30.0
+                // text_edit/builder.rs:129),`desired_width` 只圈住内容区,
+                // 实际画出来的外框会再多出 `margin.sum().x = 8.0`。这个 8px
+                // 只有在 `desired_width` 严格小于「真实可用宽」时才会显形
+                // (即本分支这种「预留了空间给后面按钮」的情况)——不加的话,
+                // 预留的空间被内边距吃掉一部分,「撤销」照样被顶出面板,只是
+                // 从整行溢出变成溢出 8px,肉眼几乎看不出但仍会被裁。用专门的
+                // 常量而不是借 `SP_S`:两者数值恰好都是 8.0 但语义无关,间距
+                // 刻度调整时会静默带崩这里。
+                let reserve = button_reserve(ui, "撤销") + crate::ui::metrics::TEXT_EDIT_MARGIN_X;
+                let w = field_w(ui.available_width(), FIELD_W_M, reserve);
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .id_salt(id)
+                        .password(true)
+                        .desired_width(w),
+                );
+                if ui.small_button("撤销").clicked() {
+                    *touched = false;
+                    value.clear();
+                }
+            } else if has_stored {
+                let mut placeholder = "******".to_string();
+                let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut placeholder)
+                        .id_salt(id)
+                        .password(true)
+                        .desired_width(w),
+                );
+                if resp.gained_focus() {
+                    // 一聚焦就翻面:框清空、进入可编辑态。占位符本身从不外流。
+                    *touched = true;
+                    value.clear();
+                }
+            } else {
+                let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(value)
+                        .id_salt(id)
+                        .password(true)
+                        .hint_text(theme::hint_text(t, empty_hint))
+                        .desired_width(w),
+                );
+                if resp.gained_focus() {
+                    *touched = true;
+                }
             }
-            if value.is_empty() {
-                ui.colored_label(theme::c32(t.warn), "留空 = 清除已存凭据");
-            }
-        } else if has_stored {
-            let mut placeholder = "******".to_string();
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut placeholder)
-                    .id_salt(id)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            );
-            if resp.gained_focus() {
-                // 一聚焦就翻面:框清空、进入可编辑态。占位符本身从不外流。
-                *touched = true;
-                value.clear();
-            }
+        });
+        // 说明文字另起一行。它们是**句子**,挤在输入框右边时无论怎么算宽度
+        // 都放不下(「留空 = 清除已存凭据」在 14px 下就要约 180px,而最窄
+        // 右栏扣掉输入框下界后只剩不到 100px)。这是走查 P0-1 的另一半。
+        if *touched && value.is_empty() {
+            ui.colored_label(theme::c32(t.warn), "留空 = 清除已存凭据");
+        } else if !*touched && has_stored {
             ui.colored_label(theme::c32(t.fg_dimmer), "已设置(不修改则保持不变)");
-        } else {
-            let resp = ui.add(
-                egui::TextEdit::singleline(value)
-                    .id_salt(id)
-                    .password(true)
-                    .hint_text(empty_hint)
-                    .desired_width(f32::INFINITY),
-            );
-            if resp.gained_focus() {
-                *touched = true;
-            }
         }
     });
 }
@@ -603,6 +689,144 @@ pub(super) fn secret_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 走查 16:快捷键真的接到 `show()` 上了 —— `keys::scan` 单测只证明「按键
+    /// 被解成了动作」,证不了那个动作有人消费。这条从 `show()` 驱动:Esc 关窗、
+    /// ↓ 落一个切换意图、Ctrl+2 换 Tab。
+    ///
+    /// 自证会变红:把 `show()` 顶部那个 `for action in ...` 循环整段删掉,
+    /// 三段断言全炸。
+    #[test]
+    fn keyboard_shortcuts_are_actually_wired_into_the_manager() {
+        use mullion_store::model::{Auth, AuthKind, Connection, Identity, Protocol};
+        let t = crate::theme::MULLION_DARK;
+        let rec = |id: u64, name: &str| SessionRecord {
+            id: SessionId(id),
+            modified_at: "t".into(),
+            identity: Identity {
+                name: name.into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: "10.0.0.1".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "root".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        };
+        let sessions = vec![rec(1, "a"), rec(2, "b")];
+        let key = |k: egui::Key, modifiers: egui::Modifiers| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let drive = |ui_state: &mut UiState, events: Vec<egui::Event>, modifiers| {
+            let ctx = egui::Context::default();
+            let mut run = |events: Vec<egui::Event>| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        show(
+                            ctx,
+                            &t,
+                            ui_state,
+                            &sessions,
+                            &[],
+                            true,
+                            None,
+                            SecretPresence::default(),
+                            &crate::ui::badge::AppearanceCache::default(),
+                        );
+                    },
+                );
+            };
+            run(Vec::new()); // 布局稳定一帧再送按键
+            run(events);
+        };
+
+        // ↓ → 落一个切到下一条会话的意图。
+        let mut st = UiState {
+            session_manager_open: true,
+            editor_id: Some(SessionId(1)),
+            ..Default::default()
+        };
+        drive(
+            &mut st,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::default())],
+            egui::Modifiers::default(),
+        );
+        assert!(
+            st.editor_id == Some(SessionId(2)) || st.confirm_switch,
+            "↓ 该切到下一条会话(或因表单脏而弹确认),实得 editor_id={:?}",
+            st.editor_id
+        );
+
+        // Ctrl+2 → 换到第二个 Tab。
+        let cmd = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        let mut st = UiState {
+            session_manager_open: true,
+            editor: Some(EditorBuffer::default()),
+            editor_tab: 0,
+            ..Default::default()
+        };
+        drive(&mut st, vec![key(egui::Key::Num2, cmd)], cmd);
+        assert_eq!(st.editor_tab, 1, "Ctrl+2 该切到第二个 Tab");
+
+        // Esc → 关窗。
+        let mut st = UiState {
+            session_manager_open: true,
+            ..Default::default()
+        };
+        drive(
+            &mut st,
+            vec![key(egui::Key::Escape, egui::Modifiers::default())],
+            egui::Modifiers::default(),
+        );
+        assert!(!st.session_manager_open, "Esc 该关掉会话管理器");
+    }
+
+    /// 走查 15:切换表单时触碰位必须归零。上一条会话上留下的「碰过主机」
+    /// 会让下一条表单一打开就顶着红字 —— 用户还没碰过那个框。
+    ///
+    /// 自证会变红:把 `apply_switch` 里的 `ui_state.touched = Default::default();`
+    /// 删掉,这条报「切换后不该还留着触碰位」。(已实测确认变红。)
+    #[test]
+    fn switching_forms_clears_which_fields_you_have_been_in() {
+        let mut ui_state = UiState {
+            touched: validate::Touched {
+                name: true,
+                host: true,
+                user: true,
+                port: true,
+            },
+            pending_switch: Some(SwitchTarget::NewDraft),
+            ..Default::default()
+        };
+        apply_switch(&mut ui_state, &[]);
+        assert_eq!(
+            ui_state.touched,
+            validate::Touched::default(),
+            "换了张表单,上一张上「碰过哪些框」不该跟着过来"
+        );
+    }
 
     /// 复审坑:`egui::CollapsingHeader::new(text)` 默认把标题文本本身当 id 源
     /// (`egui-0.30.0/src/containers/collapsing_header.rs::new`)。两个分组

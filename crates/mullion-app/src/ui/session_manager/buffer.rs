@@ -99,6 +99,12 @@ pub struct EditorBuffer {
     // 注:`preserved_group_id` 自 P0-b 起可由编辑器下拉修改,名字沿用未改以免波及守护测试。
     pub preserved_group_id: Option<GroupId>,
     pub preserved_tags: Vec<String>,
+    /// 标签输入框里还没敲回车的那一截(走查 6)。
+    ///
+    /// 参与 `is_dirty` 比对是**有意的**:用户输了一半就切走,那半截会丢,
+    /// 该弹确认。反过来把它排除掉要手写 `PartialEq`,为一个字段推翻整个
+    /// derive,代价大得多。回车确认后这里会被清空,不会一直挂着让表单显脏。
+    pub tag_input: String,
     pub preserved_terminal: TerminalPrefs,
     pub preserved_appearance: AppearancePrefs,
     pub preserved_automation: AutomationPrefs,
@@ -145,6 +151,7 @@ impl Default for EditorBuffer {
             jump_mode: JumpModeUi::None,
             preserved_group_id: None,
             preserved_tags: Vec::new(),
+            tag_input: String::new(),
             preserved_terminal: TerminalPrefs::default(),
             preserved_appearance: AppearancePrefs::default(),
             preserved_automation: AutomationPrefs::default(),
@@ -234,7 +241,38 @@ impl std::fmt::Debug for EditorBuffer {
     }
 }
 
+/// 新建会话时预填的用户名(走查 21)。
+///
+/// Windows 用 `USERNAME`,类 Unix 用 `USER` —— 顺序不能反:Git Bash / WSL
+/// 之类的环境两个都设,而这个项目的一等公民是 Windows,那里 `USERNAME` 才
+/// 是权威的那个。
+///
+/// 取一个 `getenv` 闭包而不是直接读进程环境,是为了让这条判据可以单测 ——
+/// 测试进程里 `USER` 是跑 CI 的那个账号,断不出什么来。
+pub(crate) fn default_user(getenv: impl Fn(&str) -> Option<String>) -> String {
+    for key in ["USERNAME", "USER"] {
+        if let Some(v) = getenv(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 impl EditorBuffer {
+    /// 空白新建表单,用户名预填成当前系统账号(走查 21)。
+    ///
+    /// 「新建会话」十有八九是连自己常用的那个账号;预填省一次输入,填错了
+    /// 也就是改两个字 —— 比每次都从空开始划算。
+    pub(crate) fn new_draft() -> Self {
+        Self {
+            user: default_user(|k| std::env::var(k).ok()),
+            ..Self::default()
+        }
+    }
+
     /// 把已有会话的非敏感字段填入表单(密码/口令 store 不会明文回吐,留空 ——
     /// 编辑时留空 = 不改;见 `build_draft` 的说明)。
     pub(crate) fn from_record(rec: &SessionRecord) -> Self {
@@ -490,11 +528,9 @@ pub struct SaveIntent {
 /// 密码认证:密码框留空 → `secret=None`(= 清除已存凭据,留空的语义在 UI 上有提示)。
 /// 公钥认证:`has_passphrase` 由口令框是否非空决定;口令非空才带 `secret`。
 pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
-    let port: u16 = buf
-        .port
-        .trim()
-        .parse()
-        .map_err(|_| "端口非法,须为 1-65535 的整数".to_string())?;
+    // 走查 15:端口校验只有一处真源(`validate::port`),UI 上的红字和这里的
+    // 保存拦截判的是同一个函数——否则会出现「红字说没问题、保存又失败」。
+    let port: u16 = super::validate::port(&buf.port).map_err(str::to_string)?;
     let kind = match buf.auth_kind {
         AuthKindUi::Password => AuthKind::Password,
         AuthKindUi::PublicKey => AuthKind::PublicKey {
@@ -1347,6 +1383,27 @@ mod tests {
         assert_eq!(secret_fields(&b).2, SecretField::Set("pp".into()));
         b.proxy_password = String::new();
         assert_eq!(secret_fields(&b).2, SecretField::Clear);
+    }
+
+    /// 走查 21:新建会话预填系统用户名。**`USERNAME` 优先于 `USER`** ——
+    /// Git Bash / WSL 之类的环境两个都设,而这个项目的一等公民是 Windows,
+    /// 那里 `USERNAME` 才是权威的那个。
+    #[test]
+    fn a_new_draft_prefills_the_system_user_preferring_windows_username() {
+        let both = |k: &str| match k {
+            "USERNAME" => Some("win-me".to_string()),
+            "USER" => Some("unix-me".to_string()),
+            _ => None,
+        };
+        assert_eq!(default_user(both), "win-me", "两个都在时该取 USERNAME");
+
+        let only_unix = |k: &str| (k == "USER").then(|| "unix-me".to_string());
+        assert_eq!(default_user(only_unix), "unix-me");
+
+        // 设了但是空的 = 没设。填一串空格进「用户」框比留空更烦人。
+        let blank = |k: &str| (k == "USERNAME").then(|| "   ".to_string());
+        assert_eq!(default_user(blank), "");
+        assert_eq!(default_user(|_| None), "");
     }
 
     /// 脏检查用「与基线快照逐字段比对」,不是「有没有按过键」——用户改完又

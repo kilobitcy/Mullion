@@ -15,8 +15,10 @@ impl Missing {
         self.name || self.host || self.user
     }
 
-    /// 第一个缺项所在的 Tab 索引(与 `UiState::editor_tab` 同义:
-    /// 0 连接 / 1 认证 / 2 高级)。
+    /// 第一个缺项所在的 Tab 索引(与 `UiState::editor_tab` 同义)。
+    /// 「高级」页已并入「连接」页(走查 P1-8),必填项只落在这两页上,
+    /// 所以本函数实际只会返回 `TAB_CONNECT`(名称/主机缺)、
+    /// `TAB_AUTH`(用户名缺)或 `None`(都不缺)——不会返回其余下标。
     ///
     /// 用 `usize` 而非新枚举:`editor_tab: usize` 是既有技术债,
     /// 换 enum 会波及所有 Tab 相关代码,不在本切片范围内。
@@ -43,6 +45,38 @@ impl Missing {
             parts.push("用户名");
         }
         format!("还缺:{}", parts.join("、"))
+    }
+}
+
+/// 哪些必填框已经被用户碰过(聚焦过又离开)。**只有碰过的框才配红字**——
+/// 新建草稿一打开就三行全红,等于在骂用户「你还没填」,而他连第一个字都
+/// 还没敲。碰过 = 用户认为自己填完了,这时候才该指出问题。
+///
+/// 放在 `UiState` 而不是 `EditorBuffer`:后者整体参与 `is_dirty` 比对,
+/// 点进框里再点出来什么都没改也会被判成脏,切会话时白弹一次确认。
+/// (`password_touched` 那几位留在 buffer 里是**有意的** —— 它们真的改变
+/// 保存意图,见 `SecretField`。)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Touched {
+    pub name: bool,
+    pub host: bool,
+    pub user: bool,
+    pub port: bool,
+}
+
+/// 端口:**留空 = 默认 22**(标签上没有 `*`,它本来就不是必填项),
+/// 其余必须落在 1~65535。
+///
+/// `0` 曾经能存进去:老代码直接 `parse::<u16>()`,`"0"` 是合法 `u16`,
+/// 于是拨号时对着 0 端口连,报一句看不懂的系统错误。
+pub fn port(s: &str) -> Result<u16, &'static str> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(22);
+    }
+    match s.parse::<u32>() {
+        Ok(p) if (1..=65535).contains(&p) => Ok(p as u16),
+        _ => Err("端口要填 1~65535 之间的数字"),
     }
 }
 
@@ -97,5 +131,25 @@ mod tests {
 
         assert_eq!(check("web01", "", "").hint(), "还缺:主机、用户名");
         assert_eq!(check("", "10.0.0.1", "root").hint(), "还缺:会话名称");
+    }
+
+    /// 走查 15:端口。留空落默认 22;`0` 和 65536 都不是能连的端口,
+    /// 必须拦在保存之前 —— 老代码 `parse::<u16>()` 会把 `"0"` 当成合法值
+    /// 存进去,拨号时才炸,那时候用户已经忘了自己填过什么。
+    ///
+    /// 自证会变红:把范围判断改回 `parse::<u16>()`,`"0"` 这条报「应拒绝」。
+    #[test]
+    fn port_defaults_to_22_when_blank_and_rejects_out_of_range() {
+        assert_eq!(port(""), Ok(22));
+        assert_eq!(port("   "), Ok(22));
+        assert_eq!(port("22"), Ok(22));
+        assert_eq!(port(" 2222 "), Ok(2222));
+        assert_eq!(port("65535"), Ok(65535));
+
+        assert!(port("0").is_err(), "0 不是能连的端口");
+        assert!(port("65536").is_err());
+        assert!(port("-1").is_err());
+        assert!(port("22x").is_err());
+        assert!(port("二十二").is_err());
     }
 }

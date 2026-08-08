@@ -3,14 +3,17 @@ pub mod badge;
 pub mod chrome;
 pub mod group_manager;
 pub mod host_key;
+pub mod icon;
+pub mod metrics;
 pub mod pane_title;
 pub mod paste;
 pub mod session_manager;
+pub mod toast;
 pub mod toolbar;
 
 use std::sync::Arc;
 
-use mullion_store::{GroupRecord, SessionId, SessionRecord};
+use mullion_store::{GroupId, GroupRecord, SessionId, SessionRecord};
 
 /// 给 egui 挂上系统 CJK 字体作回退。egui 只内嵌拉丁字体,中文菜单/状态栏否则
 /// 全渲染成 tofu 方框。按存在顺序取第一个系统字体(Windows 一等公民);非 Windows
@@ -51,6 +54,10 @@ pub struct UiState {
     /// 用户是否关掉了当前这条错误卡片。**只该由 `set_error` 复位** ——
     /// 各处直接写 `last_error` 会绕过复位,导致关掉一次后再也看不到错误。
     pub error_dismissed: bool,
+    /// 走查 13:错误卡片的「详情」是不是展开着。同 `error_dismissed`,
+    /// **只该由 `set_error` 复位** —— 上一条错误展开着,不代表下一条也要
+    /// 劈头甩一屏堆栈。
+    pub error_expanded: bool,
     /// 中央区可用像素(egui 布局后写入,喂 `App::compute_geoms` → `shell::workspace::geom::layout_geometry`,
     /// 按像素切分布局树)。
     pub central_px: (u32, u32),
@@ -71,11 +78,25 @@ pub struct UiState {
     /// 最后一次发起连接的会话 id。`UserEvent::ConnectOk` 不带 SessionId,
     /// 状态点要知道「是哪条连上了」,只能在发起时记下来。
     pub connect_request_last: Option<SessionId>,
+    /// 正在拨号中的会话(走查 4)。`spawn_connect` 置位,`ConnectOk`/`ConnectErr`
+    /// 清位。**不能从 `connect_request_last` 反推**:那个字段在连接成功之后
+    /// 仍然留着(状态点靠它认「是哪条连上了」),反推的话每条连上的会话都会
+    /// 永远显示「连接中」。
+    pub connecting: Option<SessionId>,
+    /// 最近一次拨号失败的会话(走查 4)。下一次对**任何**会话发起连接时清空 ——
+    /// 一条陈旧的失败标记挂上几个小时,用户会以为那条会话现在是坏的。
+    pub connect_failed: Option<SessionId>,
     /// F44:本次连接一次性跳过自动化(右键菜单)。app.rs 消费后立即清零 ——
     /// 右键跳过一次之后,普通双击连接若还静默跳过,用户会以为自动化坏了。
     pub connect_skip_automation: bool,
     /// 二次确认后的删除意图 → app 事后据此调 `store.delete`。
     pub delete_request: Option<SessionId>,
+    /// 右键「移动到分组」(走查 3)。`None` 的 `GroupId` = 移到「未分组」。
+    ///
+    /// 不复用 `save_request`:那条通道要一份完整的 draft(整个表单的所有字段),
+    /// 右键菜单手上只有一个 id,为了改一个 `group_id` 去凭空造一份 draft,一旦
+    /// 哪个字段填漏就是静默地把用户的配置改掉。
+    pub move_to_group: Option<(SessionId, Option<GroupId>)>,
     /// 编辑表单点「保存」→ app 事后据此调 `store.add`/`store.update`。
     pub save_request: Option<session_manager::SaveIntent>,
     /// 正在编辑的会话 id;`None` = 新建。
@@ -96,6 +117,15 @@ pub struct UiState {
     pub discard_and_switch: bool,
     /// 左栏搜索框内容。
     pub search: String,
+    /// 走查 21:刚点了「+ 新建」,下一帧把光标放进「名称」框。
+    ///
+    /// **一次性**:`fields::basic` 消费后立即复位。不复位的话每帧都抢焦点,
+    /// 用户按 Tab 走到别的字段会被当场弹回来。
+    pub focus_name_request: bool,
+    /// 走查 15:哪些必填框已经被用户碰过 —— 只有碰过的才亮红字。
+    /// 放这儿而不是 `EditorBuffer` 里的理由见 `validate::Touched`。
+    /// 切换会话时随表单一起重置。
+    pub touched: session_manager::validate::Touched,
     /// 右栏当前 Tab(0=基础 1=认证 2=网络)。
     pub editor_tab: usize,
     /// 点了「选择…」私钥文件 → app 事后另起线程开系统文件对话框(不能在
@@ -163,13 +193,26 @@ pub struct UiState {
     pub key_candidates_ready: bool,
     /// 拖拽私钥文件时给用户的一次性提示(如「已忽略其余 2 个文件」)。
     pub key_drop_note: Option<String>,
+    /// 走查 13:等着进场的 toast 文本。生产端(`app.rs` 施加意图那一段)拿不到
+    /// `egui::Context`,也就拿不到帧时间,所以只放文本,时间戳由
+    /// `toast::show` 盖。
+    pub pending_toast: Option<String>,
+    /// 当前正在飘着的那条 toast。
+    pub toast: Option<toast::Toast>,
 }
 
 impl UiState {
     /// 报告一条错误。**所有**错误写入都必须走这里,不要直接赋值 `last_error`。
+    /// 报一条「刚才那一下生效了」的短提示(走查 13)。三秒自散,不占位置。
+    /// **失败一律走 `set_error`**:那是要用户处理的,不能飘一下就没了。
+    pub fn set_toast(&mut self, msg: impl Into<String>) {
+        self.pending_toast = Some(msg.into());
+    }
+
     pub fn set_error(&mut self, msg: String) {
         self.last_error = Some(msg);
         self.error_dismissed = false;
+        self.error_expanded = false;
     }
 
     /// 关闭会话管理器。**所有**关闭点都必须走这里,不要直接赋值
@@ -313,6 +356,9 @@ pub fn build_ui(
     if ui_state.group_manager_open {
         group_manager::show(ctx, ui_state, frame.groups);
     }
+    // 走查 13:操作反馈飘在所有弹窗之上 —— 保存成功的那条 toast 要在会话
+    // 管理器还开着的时候就能看见,不然用户根本不知道刚才那一下有没有生效。
+    toast::show(ctx, t, &mut ui_state.pending_toast, &mut ui_state.toast);
     // 中央区剩余像素:available_rect 是 point,× pixels_per_point 换像素。
     // 必须在菜单栏和状态栏两个 TopBottomPanel 都 show 完之后取,拿到的才是
     // 扣掉这两栏的中央区。原点与尺寸一起记:尺寸决定几行几列,
@@ -816,7 +862,9 @@ mod tests {
         assert!(!st.confirm_switch, "刚打开不该弹未保存确认");
     }
 
-    /// 没选中会话时,右栏给空态提示而不是一张填不进去的空表单。
+    /// 没选中会话时,右栏给空态提示而不是一张填不进去的空表单。这里 `sessions`
+    /// 是空的,所以走的是走查 21 的首次使用引导那一支(两支文案的分流由
+    /// `session_manager::editor` 自己的测试守)。
     #[test]
     fn editor_shows_empty_state_when_nothing_is_selected() {
         let frame = UiFrame {
@@ -835,7 +883,7 @@ mod tests {
             text = collect_text(&out);
         }
         assert!(
-            text.contains("从左侧选一条会话"),
+            text.contains("还没有任何会话"),
             "应显示空态提示,实得:{text}"
         );
     }

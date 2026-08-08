@@ -78,6 +78,15 @@ impl SessionStore {
         self.vault.delete(id)
     }
 
+    /// 走查 3:右键「移动到分组」。只改 `group_id`,见 `Vault::set_group`。
+    pub fn set_group(
+        &mut self,
+        id: SessionId,
+        group: Option<mullion_store::GroupId>,
+    ) -> Result<(), StoreError> {
+        self.vault.set_group(id, group)
+    }
+
     pub fn save(&self) -> Result<(), StoreError> {
         self.vault.save()
     }
