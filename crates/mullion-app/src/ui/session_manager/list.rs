@@ -11,15 +11,63 @@ use crate::theme::{self, Theme};
 use crate::ui::session_manager::{group_header, SwitchTarget};
 use crate::ui::UiState;
 
-/// 一行会话的高度(设计稿 §4.1:两行文字 + 上下 8px)。
-const ROW_H: f32 = 44.0;
+/// 左栏的三档密度(F61)。**宽度是唯一输入** —— 用户拖分隔条就是在选档。
+///
+/// 为什么按宽度自动切、而不是加一个「视图」菜单:菜单要占位置、要存状态、
+/// 还要教用户去哪儿找;而「我想让左栏占多少地方」这个意图,拖分隔条本身
+/// 已经表达完了,再问一遍是多余的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Density {
+    /// 状态点 + 16px 图标 + 名称/副标题两行。默认档。
+    Full,
+    /// 状态点 + 32px 图标 + 名称单行。副标题(user@host)让位给图标。
+    Compact,
+    /// 只有 64px 图标(外加角上那颗状态点)。**没设图标的行整条隐藏** ——
+    /// 这一档认图标不认字,留一行空白比不留更糟。
+    Icons,
+}
+
+/// 切档阈值。`Compact` 的上限踩的是「名称 + 副标题两行还读得出东西」的下界;
+/// `Icons` 的上限踩的是「32px 图标右边还剩得下几个字」的下界。
+const COMPACT_BELOW: f32 = 208.0;
+const ICONS_BELOW: f32 = 132.0;
+
+pub(crate) fn density_for(width: f32) -> Density {
+    if width < ICONS_BELOW {
+        Density::Icons
+    } else if width < COMPACT_BELOW {
+        Density::Compact
+    } else {
+        Density::Full
+    }
+}
+
+/// 一行会话的高度。`Full` 是设计稿 §4.1(两行文字 + 上下 8px);另两档由
+/// 图标边长决定 —— 图标是这两档唯一的内容,行高小于它就会被裁掉。
+pub(crate) fn row_h(d: Density) -> f32 {
+    match d {
+        Density::Full => 44.0,
+        Density::Compact => 40.0,
+        Density::Icons => 72.0,
+    }
+}
+
+/// 图标边长。三档分别是 16 / 32 / 64 —— 后两档正是用户导入 .ico 时归一化
+/// 出来的那两帧尺寸(`ui::ico::{SMALL, LARGE}`),不多不少。
+fn icon_px(d: Density) -> f32 {
+    match d {
+        Density::Full => 16.0,
+        Density::Compact => crate::ui::ico::SMALL as f32,
+        Density::Icons => crate::ui::ico::LARGE as f32,
+    }
+}
 
 /// 图标槽位中心距行左边缘(逻辑点)。状态点在 16,图标紧随其后。
 const ICON_SLOT_X: f32 = 38.0;
-/// 图标边长。
-const ICON_PX: f32 = 16.0;
 /// 文字左边界。= 图标槽位右沿 + 8px 间距,**恒定**(见 `session_row` 注释)。
-const TEXT_X: f32 = ICON_SLOT_X + ICON_PX / 2.0 + 8.0;
+fn text_x(d: Density) -> f32 {
+    ICON_SLOT_X + icon_px(d) / 2.0 + 8.0
+}
 
 /// 会话行左侧状态点的四态(走查 4)。原来只有「已连接 / 未连接」两态、
 /// 且两态都是同一个形状,颜色一变用户就分不出来了。
@@ -143,9 +191,10 @@ fn session_row(
     status: Status,
     appearance: &crate::ui::badge::Appearance,
     query: &str,
+    d: Density,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), ROW_H),
+        egui::vec2(ui.available_width(), row_h(d)),
         egui::Sense::click(),
     );
     let p = ui.painter();
@@ -160,7 +209,7 @@ fn session_row(
     p.rect_filled(rect, egui::Rounding::same(6.0), bg);
     if selected {
         p.rect_filled(
-            egui::Rect::from_min_size(rect.min, egui::vec2(3.0, ROW_H)),
+            egui::Rect::from_min_size(rect.min, egui::vec2(3.0, row_h(d))),
             egui::Rounding::same(2.0),
             theme::c32(t.accent),
         );
@@ -176,6 +225,7 @@ fn session_row(
         rec.connection.protocol,
         appearance,
         query,
+        d,
     );
     // §6.3:状态点加 tooltip。它是手绘的,没有 Response,只能补一次
     // interact —— 否则用户只能靠猜「这个绿点是什么意思」。
@@ -197,7 +247,14 @@ fn session_row(
     ui.interact(dot_rect, resp.id.with("dot"), egui::Sense::hover())
         .on_hover_text(status_tooltip(status));
 
-    resp
+    // 窄档把名字(以及 `Icons` 档连副标题)全藏了 —— 不补 tooltip,用户就只
+    // 剩「挨个点开看」这一条路。`Full` 档不补:那里字都在,再挂一层重复的
+    // 悬浮框只会挡住下一行。
+    match d {
+        Density::Full => resp,
+        Density::Compact => resp.on_hover_text(sub),
+        Density::Icons => resp.on_hover_text(format!("{name}\n{sub}", name = rec.identity.name)),
+    }
 }
 
 /// 会话名后面要不要挂一个协议标签。**ssh 不挂** —— 列表里 99% 的行都是 ssh,
@@ -242,6 +299,7 @@ fn paint_row_body(
     protocol: mullion_store::Protocol,
     appearance: &crate::ui::badge::Appearance,
     query: &str,
+    d: Density,
 ) {
     // F62:语义色竖条走**右**边缘 —— 左 3px 归选中态 accent,两者各占一边。
     if let Some(c) =
@@ -262,21 +320,35 @@ fn paint_row_body(
         t,
     );
 
-    // F61:图标槽位。**恒占**,画不画都留这 16px —— 有图标的行和没图标的行
-    // 文字左边界必须对齐,否则列表看起来像坏了。
+    // F61:图标槽位。`Full`/`Compact` 档**恒占**,画不画都留着 —— 有图标的行
+    // 和没图标的行文字左边界必须对齐,否则列表看起来像坏了。
+    // `Icons` 档没有文字要对齐,图标居中摆,而且没图标的行压根不会走到这里
+    // (`show()` 已经把它们滤掉了)。
+    let px = icon_px(d);
+    let icon_center = match d {
+        Density::Icons => rect.center(),
+        _ => egui::pos2(rect.left() + ICON_SLOT_X, rect.center().y),
+    };
     if let Some(icon) = &appearance.icon {
         crate::ui::badge::paint_icon(
             p,
-            egui::Rect::from_center_size(
-                egui::pos2(rect.left() + ICON_SLOT_X, rect.center().y),
-                egui::vec2(ICON_PX, ICON_PX),
-            ),
+            egui::Rect::from_center_size(icon_center, egui::vec2(px, px)),
             icon,
         );
     }
+    // `Icons` 档到此为止:名称、副标题、协议 pill 全部让位给那张 64px 图。
+    if d == Density::Icons {
+        return;
+    }
+
+    // `Compact` 档只有名称一行,竖直居中;`Full` 档名称在上、副标题在下。
+    let name_y = match d {
+        Density::Compact => rect.center().y - 9.0,
+        _ => rect.top() + 7.0,
+    };
     let name_rect = paint_highlighted(
         p,
-        egui::pos2(rect.left() + TEXT_X, rect.top() + 7.0),
+        egui::pos2(rect.left() + text_x(d), name_y),
         name,
         query,
         egui::FontId::proportional(14.0),
@@ -286,9 +358,12 @@ fn paint_row_body(
     if let Some(tag) = protocol_pill(protocol) {
         paint_pill(p, t, name_rect.right_top() + egui::vec2(6.0, 1.0), tag);
     }
+    if d == Density::Compact {
+        return;
+    }
     paint_highlighted(
         p,
-        egui::pos2(rect.left() + TEXT_X, rect.top() + 25.0),
+        egui::pos2(rect.left() + text_x(d), rect.top() + 25.0),
         sub,
         query,
         egui::FontId::proportional(11.0),
@@ -354,7 +429,8 @@ pub(crate) fn preview_row(
     // 宽度取 `LIST_W` 一档(280),不吃满右栏 —— 预览要像左边那条列表,
     // 拉成整页宽反而不像。
     let w = ui.available_width().min(280.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(w, row_h(Density::Full)), egui::Sense::hover());
     // 铺 `panel_bg`:真列表行的底色来自左栏 `SidePanel` 的填充,不铺的话
     // 预览行浮在 `bar_status` 上,颜色对比跟实际不一样。
     ui.painter()
@@ -369,6 +445,7 @@ pub(crate) fn preview_row(
         protocol,
         appearance,
         "",
+        Density::Full,
     );
 }
 
@@ -481,6 +558,10 @@ pub(super) fn show(
     let pending_delete_target = ui_state.pending_delete;
     let mut pending_delete_rendered = false;
 
+    // 三档密度只看左栏这一刻有多宽。在 `ScrollArea` **之前**取:进了滚动区
+    // 之后 `available_width` 已经扣掉滚动条,会在阈值附近来回抖档。
+    let d = density_for(ui.available_width());
+
     // 底部「分隔线 + 新建按钮」用 `TopBottomPanel::bottom` 先占位:egui 的面板
     // 布局保证面板先分配自己的高度,再把外层 `ui` 的可用区底边收缩到面板上沿
     // (见 egui-0.30.0 `containers/panel.rs::show_inside` 里 `TopBottomSide::Bottom`
@@ -517,6 +598,7 @@ pub(super) fn show(
         }
     }
 
+    let mut hidden = 0usize;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -525,12 +607,25 @@ pub(super) fn show(
             // 既有保证(见 `group_manager::tests::session_with_dangling_group_id_falls_into_ungrouped_not_dropped`),
             // 自己重写一遍分组逻辑会悄悄丢掉这条回归保护。
             for (gid, bucket) in crate::ui::group_manager::group_sessions(groups, sessions) {
-                let members: Vec<&SessionRecord> = bucket
+                let matched: Vec<&SessionRecord> = bucket
                     .into_iter()
                     .filter(|r| matches(r, &ui_state.search))
                     .collect();
-                if members.is_empty() && searching {
-                    continue; // 搜索时不显示空分组
+                // `Icons` 档只认图标:没设图标的行画出来是一格空白,既点不
+                // 明白也占地方,整条藏掉。藏了多少条在列表末尾如实说一声 ——
+                // 悄悄少几条会被当成「会话丢了」。
+                let members: Vec<&SessionRecord> = if d == Density::Icons {
+                    matched
+                        .iter()
+                        .copied()
+                        .filter(|r| appearance.get(r.id).is_some_and(|a| a.icon.is_some()))
+                        .collect()
+                } else {
+                    matched.clone()
+                };
+                hidden += matched.len() - members.len();
+                if members.is_empty() && (searching || d == Density::Icons) {
+                    continue; // 搜索时 / 图标档下不显示空分组
                 }
                 let title = match gid {
                     Some(id) => groups
@@ -558,9 +653,17 @@ pub(super) fn show(
                                 pending_delete_target,
                                 &mut pending_delete_rendered,
                                 appearance,
+                                d,
                             );
                         }
                     });
+            }
+            if hidden > 0 {
+                ui.add_space(4.0);
+                ui.colored_label(theme::c32(t.fg_dimmer), format!("+{hidden} 无图标"))
+                    .on_hover_text(format!(
+                        "这一档只显示设了图标的会话,另有 {hidden} 条被藏起来了。\n把左栏拖宽一点就能看到它们。"
+                    ));
             }
         });
 
@@ -599,6 +702,7 @@ fn row(
     pending_delete_target: Option<SessionId>,
     pending_delete_rendered: &mut bool,
     appearance: &crate::ui::badge::AppearanceCache,
+    d: Density,
 ) {
     if pending_delete_target == Some(rec.id) {
         *pending_delete_rendered = true;
@@ -621,7 +725,7 @@ fn row(
         Some(extra) => format!("{}@{} · {}", rec.auth.user, rec.connection.host, extra),
         None => format!("{}@{}", rec.auth.user, rec.connection.host),
     };
-    let resp = session_row(ui, t, rec, &sub, selected, status, a, &ui_state.search);
+    let resp = session_row(ui, t, rec, &sub, selected, status, a, &ui_state.search, d);
     if resp.clicked() {
         ui_state.pending_switch = Some(SwitchTarget::Session(rec.id));
     }
@@ -1700,6 +1804,193 @@ mod tests {
         assert_eq!(
             other, none,
             "只勾了 pane 标题条/状态栏的会话,不该在列表行上画竖色条"
+        );
+    }
+
+    /// 收集本帧画出来的所有文本。`find_text_pos` 只答「有没有」,这里要的是
+    /// 「有哪些」—— 断言失败时能把实际画了什么一并打出来。
+    fn drawn_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(t) => out.push(t.galley.job.text.clone()),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut out));
+        out
+    }
+
+    /// 按指定的左栏宽度渲染一次列表。`Frame::none()` 是必需的:`CentralPanel`
+    /// 默认带 8px 内边距,不清掉的话 `available_width` 比给的宽度小一圈,
+    /// 测出来的档位跟 `density_for(width)` 对不上。
+    fn run_list_at(
+        width: f32,
+        sessions: &[SessionRecord],
+        appearance: &crate::ui::badge::AppearanceCache,
+    ) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        show(ui, &t, &mut ui_state, sessions, &groups, None, appearance);
+                    });
+            },
+        )
+    }
+
+    /// 给一条会话挂上真图标(走生产代码那条归一化路径)。
+    fn with_icon(mut r: SessionRecord) -> SessionRecord {
+        let px: Vec<u8> = std::iter::repeat_n([7u8, 8, 9, 255], 32 * 32)
+            .flatten()
+            .collect();
+        let img = ico::IconImage::from_rgba_data(32, 32, px);
+        let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+        dir.add_entry(ico::IconDirEntry::encode_as_png(&img).unwrap());
+        let mut raw = Vec::new();
+        dir.write(&mut raw).unwrap();
+        r.appearance.icon = Some(mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: crate::ui::ico::import(&raw).unwrap(),
+            bg: None,
+        });
+        r
+    }
+
+    fn cache_of(sessions: &[SessionRecord]) -> crate::ui::badge::AppearanceCache {
+        let mut c = crate::ui::badge::AppearanceCache::default();
+        c.rebuild(sessions, &[]);
+        c
+    }
+
+    /// 三档必须**单调**:越拖越窄只能越走越简,不能来回跳。
+    ///
+    /// 顺带钉死两件事:拖到下限 `LIST_MIN_W` 落在 `Icons` 档(否则最窄那一档
+    /// 根本拖不到,白做),默认宽 `LIST_W` 落在 `Full` 档(否则一打开会话
+    /// 管理器就是残缺的样子)。
+    #[test]
+    fn narrowing_the_list_only_ever_simplifies_it() {
+        use super::super::{LIST_MIN_W, LIST_W};
+        let rank = |d| match d {
+            Density::Icons => 0,
+            Density::Compact => 1,
+            Density::Full => 2,
+        };
+        let mut prev = rank(density_for(LIST_MIN_W));
+        let mut w = LIST_MIN_W;
+        while w <= 480.0 {
+            let cur = rank(density_for(w));
+            assert!(cur >= prev, "宽度涨到 {w} 反而退了一档");
+            prev = cur;
+            w += 1.0;
+        }
+        assert_eq!(
+            density_for(LIST_MIN_W),
+            Density::Icons,
+            "拖到下限也进不了纯图标档的话,那一档等于不存在"
+        );
+        assert_eq!(
+            density_for(LIST_W),
+            Density::Full,
+            "默认宽度必须是完整档 —— 一打开就是残缺样子,谁也不会去拖它"
+        );
+        // 三档都要真的能拖到:阈值之间至少各留一格。
+        assert_eq!(density_for(ICONS_BELOW), Density::Compact);
+        assert_eq!(density_for(COMPACT_BELOW), Density::Full);
+    }
+
+    /// 下限必须真的装得下最窄那一档的内容,否则拖到底图标会被裁掉一半。
+    #[test]
+    fn the_narrowest_width_actually_fits_a_64px_icon() {
+        use super::super::LIST_MIN_W;
+        let px = icon_px(Density::Icons);
+        assert!(
+            LIST_MIN_W >= px && row_h(Density::Icons) >= px,
+            "左栏下限 {LIST_MIN_W}×{} 装不下 {px}px 的图标",
+            row_h(Density::Icons)
+        );
+        assert_eq!(px, crate::ui::ico::LARGE as f32, "纯图标档要用大那一帧");
+        assert_eq!(
+            icon_px(Density::Compact),
+            crate::ui::ico::SMALL as f32,
+            "紧凑档要用小那一帧"
+        );
+    }
+
+    /// 纯图标档只认图标:没设图标的会话整条藏掉,**并且当场说清藏了几条**。
+    ///
+    /// 少画几行而不吭声,用户看到的是「我的会话没了」—— 那比不做这个档更糟。
+    ///
+    /// 自证会变红:把 `show()` 里那个 `d == Density::Icons` 的过滤删掉
+    /// (第一段炸);把末尾 `if hidden > 0` 那块删掉(第二段炸)。
+    #[test]
+    fn the_icon_only_step_hides_iconless_rows_but_says_how_many() {
+        let sessions = vec![
+            with_icon(rec(1, "有图标", "192.0.2.10", &[])),
+            rec(2, "没图标", "192.0.2.11", &[]),
+            rec(3, "也没有", "192.0.2.12", &[]),
+        ];
+        let cache = cache_of(&sessions);
+        let out = run_list_at(super::super::LIST_MIN_W, &sessions, &cache);
+        let texts = drawn_text(&out.shapes);
+        assert!(
+            !texts.iter().any(|s| s.contains("没图标")),
+            "纯图标档不该画没设图标的行,实际画了:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s.contains("+2")),
+            "藏了 2 条必须如实说一声,实际画的是:{texts:?}"
+        );
+
+        // 完整档下一条都不藏,也就没有那句提示。
+        let wide = drawn_text(&run_list_at(super::super::LIST_W, &sessions, &cache).shapes);
+        assert!(
+            wide.iter().any(|s| s.contains("没图标")),
+            "完整档下不该藏任何行"
+        );
+        assert!(
+            !wide.iter().any(|s| s.contains("+2")),
+            "完整档下什么都没藏,不该冒出「藏了几条」的提示"
+        );
+    }
+
+    /// 窄档把文字换成图标,不是把文字换成空白:`Compact` 还留着名字、
+    /// `Icons` 一个字都不留(名字改由 tooltip 兜底)。
+    ///
+    /// 自证会变红:把 `paint_row_body` 里 `d == Density::Icons` 那个提前
+    /// return 删掉 —— 名字会重新画出来,第二段断言炸。
+    #[test]
+    fn each_step_drops_exactly_one_layer_of_text() {
+        let sessions = vec![with_icon(rec(1, "dev-box", "192.0.2.10", &[]))];
+        let cache = cache_of(&sessions);
+        let has = |w: f32, needle: &str| {
+            drawn_text(&run_list_at(w, &sessions, &cache).shapes)
+                .iter()
+                .any(|s| s.contains(needle))
+        };
+        // 完整档:名称 + user@host 都在。
+        assert!(has(super::super::LIST_W, "dev-box"), "完整档要有名称");
+        assert!(has(super::super::LIST_W, "192.0.2.10"), "完整档要有副标题");
+        // 紧凑档:只剩名称。
+        assert!(has(ICONS_BELOW, "dev-box"), "紧凑档要保住名称");
+        assert!(!has(ICONS_BELOW, "192.0.2.10"), "紧凑档该把副标题让给图标");
+        // 纯图标档:一个字都不留。
+        assert!(
+            !has(super::super::LIST_MIN_W, "dev-box"),
+            "纯图标档不该有名称"
         );
     }
 }

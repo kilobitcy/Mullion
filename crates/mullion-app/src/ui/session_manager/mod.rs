@@ -39,8 +39,12 @@ use super::UiState;
 pub(crate) const WINDOW_W: f32 = 880.0;
 pub(crate) const WINDOW_H: f32 = 560.0;
 pub(crate) const LIST_W: f32 = 300.0;
-/// 左栏拖拽下限。再窄「user@host」副文本就没法读了。
-pub(crate) const LIST_MIN_W: f32 = 220.0;
+/// 左栏拖拽下限。= 64px 图标 + 两侧 12 内边距,正好容得下最窄那一档
+/// (`list::Density::Icons`)。
+///
+/// 原来是 220(「再窄 user@host 副文本就没法读了」)。F61 加了三档密度之后
+/// 这条理由不成立了:副文本读不了就换一档不画它,而不是不让用户拖窄。
+pub(crate) const LIST_MIN_W: f32 = 88.0;
 /// 左栏拖拽上限。与 `WINDOW_W` 联立,但**别信纸面公式**——两栏
 /// `inner_margin` 各 14、两侧共 28,「880 - 440 - 28 = 412」看着像右栏
 /// 内容宽,但 egui 的 `Window` 内容区实际取 `default_size`(880),不是
