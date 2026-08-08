@@ -122,15 +122,28 @@ impl std::fmt::Debug for SecretEntry {
 pub struct GroupId(pub u64);
 
 /// 图标来源。
+///
+/// **只有 `Ico` 是活的**,另外三个变体一律是历史数据的容身之处 —— 删掉任何
+/// 一个,含该 `kind` 的老 `sessions.toml` 会直接反序列化失败,用户丢的不是
+/// 一个图标而是整个会话库。UI 上不再产出它们,不等于可以从类型里抹掉。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IconKind {
-    /// 内置图标库中的名字(如 "ubuntu")。
+    /// 内置图标库中的名字(如 "ubuntu")。**历史遗留**,UI 早已撤掉。
     Builtin,
-    /// 单个 emoji 字符。
+    /// 单个 emoji 字符。**历史遗留**:epaint 不支持 COLR/CPAL 彩色字形,
+    /// emoji 在界面上只能画成黑白剪影,在 64px 的纯图标档下根本认不出是哪台机器
+    /// (见 `mullion-app` 的 `badge.rs`)。v6 起改用 `Ico`。
     Emoji,
-    /// 用户提供的图片路径。
+    /// 用户提供的图片路径。**历史遗留**,从未有 UI 产出过。
     Custom,
+    /// 用户导入的 `.ico`,`value` 是**归一化后的文件正文的 base64**
+    /// (只含 32×32 与 64×64 两帧,见 `mullion-app` 的 `ui::ico`)。
+    ///
+    /// 存正文而不是路径:图标要跟着配置走。用户把配置拷到另一台机器、或者
+    /// 把当初那个 .ico 删了,图标都不该跟着消失 —— 这与私钥「路径不入库」
+    /// 是同一条思路(v5)。
+    Ico,
 }
 
 /// 图标规格。**复合对象:只能整体继承或整体覆盖**(设计 §4.1)。
@@ -138,6 +151,16 @@ pub enum IconKind {
 pub struct IconSpec {
     pub kind: IconKind,
     pub value: String,
+    /// 图标底色(`#rrggbb`)。`None` = 不垫底色,直接画在面板上。
+    ///
+    /// 存在的理由:用户导入的 .ico 大多是给浅色资源管理器画的,深色主题下
+    /// 一张深色图标糊在深色面板上等于看不见。垫一块底色是唯一不改图本身
+    /// 就能救回来的办法。
+    ///
+    /// 带 `default` + `skip_serializing_if`:v5 的文件里没有这个键,没垫底色的
+    /// 图标也不该往 TOML 里写一行 `bg = ""`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
 }
 
 /// 颜色的作用范围。
@@ -181,6 +204,8 @@ pub struct AppearancePrefs {
 /// v3 = v2 + `[session.network]` / `[group.network]`。
 /// v4 = v3 + `[session.automation]` / `[group.automation]`(F40~F44)。
 /// v5 = v4 - `[session.auth].path`:私钥改存**内容**到加密侧车。
+/// v6 = v5 + `IconKind::Ico` 与 `IconSpec.bg`:会话图标改成用户导入的 .ico
+///      (正文 base64 内嵌),并可配底色。
 ///
 /// 结构上新版本能直接读旧版本(新字段全带 `serde(default)`),升版本号是为了让
 /// **旧客户端明确拒绝**,而不是静默丢弃新分节再写回。v5 还多一层理由:旧客户端
@@ -188,7 +213,7 @@ pub struct AppearancePrefs {
 ///
 /// **号段归属**:F74(凭据实体)原定 v3→v4,被 F40~F44 先落地拿走了 4,再被本次
 /// 「私钥入库」拿走了 5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
-pub const CURRENT_SCHEMA: u32 = 5;
+pub const CURRENT_SCHEMA: u32 = 6;
 
 fn schema_v1() -> u32 {
     1
@@ -309,6 +334,7 @@ mod tests {
             icon: Some(IconSpec {
                 kind: IconKind::Emoji,
                 value: "🐧".into(),
+                bg: None,
             }),
             color: None,
         };

@@ -22,8 +22,8 @@ mod tags;
 pub(crate) mod validate;
 
 pub(crate) use buffer::{
-    build_draft, clear_key, connect_string, import_key_file, is_dirty, merge_secret, secret_fields,
-    set_color_target, sync_has_passphrase,
+    build_draft, clear_key, connect_string, import_icon_file, import_key_file, is_dirty,
+    merge_secret, secret_fields, set_color_target, sync_has_passphrase,
 };
 pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
 pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget};
@@ -528,6 +528,9 @@ pub fn show(
     if let Some(buf) = ui_state.editor.as_mut() {
         if std::mem::take(&mut buf.pick_key_clicked) {
             ui_state.pick_key_request = true;
+        }
+        if std::mem::take(&mut buf.pick_icon_clicked) {
+            ui_state.pick_icon_request = true;
         }
     }
 

@@ -6,8 +6,7 @@ use mullion_store::{GroupRecord, Protocol, SessionId, SessionRecord, TmuxChoice}
 
 use crate::theme::Theme;
 use crate::ui::metrics::{
-    button_reserve, field_w, FIELD_W_L, FIELD_W_M, FIELD_W_MIN, FIELD_W_S, LABEL_COL_W,
-    TEXT_EDIT_MARGIN_X,
+    button_reserve, field_w, FIELD_W_L, FIELD_W_M, FIELD_W_S, LABEL_COL_W, TEXT_EDIT_MARGIN_X,
 };
 use crate::ui::session_manager::inherit_row::{self, Source};
 use crate::ui::session_manager::{
@@ -438,77 +437,129 @@ pub(super) fn basic(
     jump(ui, t, buf, groups, sessions, editing, &mut first);
 }
 
+/// 勾上「底色」时的落点。取一个中性浅灰:用户导入的 .ico 十有八九是给浅色
+/// 资源管理器画的深色图标,浅底立刻能看见 —— 一上来就给个鲜艳色反而要多点
+/// 一次去改。
+pub(super) const DEFAULT_ICON_BG: &str = "#e8e8e8";
+
+/// `Color32` → `#rrggbb`。色盘吐的是 `Color32`,库里存的是 hex 文本,
+/// 两个方向都只有一份实现(反方向是 `theme::parse_hex`)。
+pub(super) fn hex_of(c: egui::Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+/// 图标在两个尺寸档下的实时预览。
+///
+/// 列表拖窄之后是按 32 / 64 取图的,不当场画出来,用户得先保存、再去拖列表
+/// 才知道自己选的图标在小尺寸下还认不认得出 —— 而「认不认得出」正是选图标
+/// 时唯一要判断的事。
+fn icon_preview(ui: &mut Ui, t: &Theme, icon: Option<&mullion_store::IconSpec>) {
+    let Some(icon) = icon else { return };
+    ui.horizontal(|ui| {
+        for size in [crate::ui::ico::SMALL, crate::ui::ico::LARGE] {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(size as f32, size as f32), egui::Sense::hover());
+            crate::ui::badge::paint_icon(ui.painter(), rect, icon);
+            ui.label(
+                egui::RichText::new(format!("{size}px"))
+                    .size(11.0)
+                    .color(crate::theme::c32(t.fg_muted)),
+            );
+        }
+    });
+}
+
 /// F61/F62 外观。独占一个 Tab(`TAB_APPEARANCE`,排在「登录后」之后)。
 ///
 /// 原先塞在「连接」页「归类」之后,实机验收时用户要求单开一页 —— 图标和颜色
 /// 是一组独立的视觉设置,跟主机/端口不是同一个决策。
-pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
-    use mullion_store::{ColorSpec, ColorTarget, IconKind, IconSpec};
+pub(crate) fn appearance(
+    ui: &mut Ui,
+    t: &Theme,
+    buf: &mut EditorBuffer,
+    icon_error: &mut Option<String>,
+) {
+    use mullion_store::{ColorSpec, ColorTarget, IconKind};
 
     let mut first = true;
     section(ui, t, "外观", &mut first);
     grid(ui, "sm_basic_appearance", |ui| {
         ui.label("图标");
         ui.vertical(|ui| {
-            // **模式是 `buf.icon_emoji_mode` 这个持久位,不从 `preserved_appearance
-            // .icon` 反推。** 反推的写法(v0.1.23)有个当场可见的 bug:刚点上
-            // 「emoji」时缓冲是空的 → 写回 `None` → 下一帧反推成「无」→ UI 弹回
-            // 去,输入框根本出不来。用户报的「点 emoji 没有内容」就是这个。
-            let prev = buf.icon_emoji_mode;
-            let mut on = prev;
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut on, false, "无");
-                ui.selectable_value(&mut on, true, "emoji");
-            });
-            buf.icon_emoji_mode = on;
+            // 状态直接读 `preserved_appearance.icon`,**没有独立的模式位**。
+            // v0.1.23~v0.1.25 那个模式位是 emoji 边打边存逼出来的(缓冲空的
+            // 那一瞬会被反推成「没图标」,UI 当场弹回去);导入 .ico 没有中间态,
+            // 选完就有值,不需要它。
+            //
+            // 先把要看的几件事**取成 owned 的局部量**再动手改:后面几段都要
+            // `as_mut()`,留着一份 `as_ref()` 会直接撞借用检查。
+            let kind = buf.preserved_appearance.icon.as_ref().map(|i| i.kind);
+            let has_ico = kind == Some(IconKind::Ico);
 
-            if on {
-                // 输入框 + 8 个预设按钮串一行,窄栏下放不完。`horizontal` 不换行
-                // 会把后面几个 emoji 顶出面板(走查 P0-1 同族),换 `wrapped`。
-                ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut buf.icon_emoji_buf)
-                            // 只放一两个字符,取最小档 —— 但仍走 `field_w`,
-                            // 极窄时才不会算出比下界还小的宽度。
-                            .desired_width(field_w(ui.available_width(), FIELD_W_MIN, 0.0))
-                            .hint_text(crate::theme::hint_text(t, "🔥")),
-                    );
-                    for e in ["🔥", "🐧", "🗄", "⚙", "🌐", "🔒", "🧪", "📦"] {
-                        if ui.small_button(e).clicked() {
-                            buf.icon_emoji_buf = e.to_string();
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("导入 .ico…").clicked() {
+                    buf.pick_icon_clicked = true;
+                }
+                if kind.is_some() && ui.button("清除").clicked() {
+                    buf.preserved_appearance.icon = None;
+                    *icon_error = None;
+                }
+            });
+
+            // 老库里的 emoji/内置图标:UI 不再支持编辑,但**数据原样留着** ——
+            // 清掉是用户的决定,不是我们的。只是得说清它为什么不显示了,
+            // 否则看起来就是个 bug。
+            if let Some(old) = kind.filter(|k| *k != IconKind::Ico) {
+                ui.colored_label(
+                    crate::theme::c32(t.warn),
+                    match old {
+                        // emoji 不是「不想支持」,是 epaint 画不了彩色字形 ——
+                        // 画出来是黑白剪影,64px 纯图标档下认不出哪台是哪台。
+                        IconKind::Emoji => {
+                            "这条会话存的还是旧的 emoji 图标,已不再显示 —— 导入一个 .ico 换掉它"
+                        }
+                        _ => "这条会话存的是旧版本的图标,已不再显示 —— 导入一个 .ico 换掉它",
+                    },
+                );
+            }
+
+            if let Some(err) = icon_error.as_ref() {
+                ui.colored_label(crate::theme::c32(t.danger), err);
+            }
+
+            if has_ico {
+                ui.horizontal(|ui| {
+                    ui.label("底色");
+                    // 底色是**可选**的:大多数 .ico 自带透明背景、在深色面板上
+                    // 就挺好。只有深色图标才需要垫一块。
+                    let Some(icon) = buf.preserved_appearance.icon.as_mut() else {
+                        return;
+                    };
+                    let mut on = icon.bg.is_some();
+                    if ui.checkbox(&mut on, "").changed() {
+                        icon.bg = on.then(|| DEFAULT_ICON_BG.to_string());
+                    }
+                    if let Some(hex) = icon.bg.clone() {
+                        let mut c = crate::theme::parse_hex(&hex)
+                            .map_or(egui::Color32::WHITE, crate::theme::c32);
+                        // egui 自带的色盘:点开是 HSV 面板 + hex 输入,比摆一排
+                        // 固定色块能选的多得多。`Alpha::Opaque` —— 垫底就是为了
+                        // 盖住面板色,半透明没有意义。
+                        if egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut c,
+                            egui::color_picker::Alpha::Opaque,
+                        )
+                        .changed()
+                        {
+                            icon.bg = Some(hex_of(c));
                         }
                     }
                 });
-                if !buf.icon_emoji_buf.is_empty()
-                    && !crate::ui::badge::emoji_is_paintable(&buf.icon_emoji_buf)
-                {
-                    ui.colored_label(
-                        crate::theme::c32(t.warn),
-                        format!(
-                            "太长了(最多 {} 个字符),这样不会显示",
-                            crate::ui::badge::MAX_EMOJI_CHARS
-                        ),
-                    );
-                }
-                ui.colored_label(crate::theme::c32(t.fg_dimmer), "图标以单色显示");
-
-                // 缓冲空时写 `None` 但**模式位留着** —— 这正是上面那个 bug 的
-                // 修法:真值可以是「暂时没有」,模式不能跟着丢。
-                buf.preserved_appearance.icon = if buf.icon_emoji_buf.is_empty() {
-                    None
-                } else {
-                    Some(IconSpec {
-                        kind: IconKind::Emoji,
-                        value: buf.icon_emoji_buf.clone(),
-                    })
-                };
-            } else if prev {
-                // 这一帧刚从 emoji 切到「无」= 用户明确要求清掉。
-                buf.preserved_appearance.icon = None;
+                // 预览:32 和 64 两档并排画一次。列表在窄档下就是按这两个尺寸
+                // 取图的,不当场给看,用户得先存、再拖窄列表才知道效果。
+                icon_preview(ui, t, buf.preserved_appearance.icon.as_ref());
             }
-            // else(始终「无」):`preserved_appearance.icon` 原样透传。可能是
-            // 不可编辑的 `Builtin`(内置形状,UI 已撤)或 `Custom` —— 不支持
-            // 编辑不等于允许静默删除用户数据。
         });
         ui.end_row();
 
@@ -550,6 +601,37 @@ pub(crate) fn appearance(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer) {
                     }
                     resp.on_hover_text(format!("{name} · {usage}"));
                 }
+
+                // 预设之外还要能自由取色(用户要求)。预设**留着**:常用的
+                // 几个语义色一键就点到,进色盘里再调一次是白费事。
+                let mut picked = buf
+                    .preserved_appearance
+                    .color
+                    .as_ref()
+                    .and_then(|c| crate::theme::parse_hex(&c.hex))
+                    .map_or(egui::Color32::WHITE, crate::theme::c32);
+                if egui::color_picker::color_edit_button_srgba(
+                    ui,
+                    &mut picked,
+                    egui::color_picker::Alpha::Opaque,
+                )
+                .changed()
+                {
+                    let hex = hex_of(picked);
+                    match &mut buf.preserved_appearance.color {
+                        Some(c) => c.hex = hex,
+                        // 从色盘首次设色,落点与点预设色块时一致 —— 两条路
+                        // 设出来的东西必须是同一个,否则「点色块有效、用色盘
+                        // 没效果」。
+                        None => {
+                            buf.preserved_appearance.color = Some(ColorSpec {
+                                hex,
+                                apply_to: vec![ColorTarget::ListItem, ColorTarget::PaneTitle],
+                            })
+                        }
+                    }
+                }
+
                 if ui.button("清除").clicked() {
                     buf.preserved_appearance.color = None;
                 }
@@ -2697,21 +2779,20 @@ mod tests {
 
     fn run_appearance(buf: &mut EditorBuffer) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
-        run_page(|ui| super::appearance(ui, &t, buf))
+        run_page(|ui| super::appearance(ui, &t, buf, &mut None))
     }
 
     /// 走查 4:「图标」页要有实时预览,否则用户设完颜色只能保存了去左栏看。
     ///
-    /// 判据分两半:
-    /// - **图标**:同一个 emoji 在这一页出现的次数。没预览时只有输入框里那
-    ///   一处;有预览时多一处。用一个**不在预设按钮里**的 emoji(🦀),
-    ///   否则数到的是那八个预设按钮。
-    /// - **竖条**:勾了「会话列表」才画。这跟真列表行走的是同一个
-    ///   `badge::should_paint(ColorTarget::ListItem)`,所以预览不会跟实际漂移。
+    /// 判据:勾了「会话列表」才画那条竖色条。这跟真列表行走的是同一个
+    /// `badge::should_paint(ColorTarget::ListItem)`,所以预览不会跟实际漂移。
+    ///
+    /// (图标那一半的预览由 `the_icon_page_previews_both_size_steps` 守,
+    /// 那是 v0.1.26 换成 .ico 之后的形态。)
     ///
     /// 自证会变红:把 `appearance()` 末尾那段 `preview_row` 调用删掉。
     #[test]
-    fn the_appearance_page_previews_the_icon_and_the_color_bar() {
+    fn the_appearance_page_previews_the_color_bar() {
         use mullion_store::{ColorSpec, ColorTarget};
 
         /// 数本帧画了多少个图元。`list.rs` 里有个同名辅助(私有,跨文件复用
@@ -2726,25 +2807,6 @@ mod tests {
             }
             shapes.iter().map(|cs| walk(&cs.shape)).sum()
         }
-
-        fn crabs(out: &egui::FullOutput) -> usize {
-            all_text(&out.shapes)
-                .iter()
-                .filter(|s| s.contains('🦀'))
-                .count()
-        }
-
-        let mut buf = EditorBuffer {
-            icon_emoji_mode: true,
-            icon_emoji_buf: "🦀".into(),
-            ..Default::default()
-        };
-        let out = run_appearance(&mut buf);
-        assert!(
-            crabs(&out) >= 2,
-            "图标应同时出现在输入框和预览行里,实际只画了 {} 处",
-            crabs(&out)
-        );
 
         // 竖条:只勾「pane 标题条」时预览行上不该有条,勾上「会话列表」才有。
         let mut off = EditorBuffer {
@@ -2862,45 +2924,41 @@ mod tests {
         );
     }
 
-    /// **v0.1.23 实机验收报的「点 emoji 没有内容」的守护测试。**
-    ///
-    /// 旧实现把模式从 `preserved_appearance.icon` 反推:刚点上「emoji」时缓冲
-    /// 还是空的 → 写回 `None` → 下一帧反推回「无」→ 输入框当场消失。用户看到
-    /// 的就是「点了没反应」。
-    ///
-    /// 自证会变红的方式:把 `appearance()` 里的
-    /// `let mut on = buf.icon_emoji_mode;` 换回反推写法
-    /// `let mut on = buf.preserved_appearance.icon.is_some();`。
-    #[test]
-    fn emoji_mode_survives_the_next_frame_with_an_empty_buffer() {
-        let mut buf = EditorBuffer {
-            icon_emoji_mode: true,
-            ..Default::default()
-        };
-        let out = run_appearance(&mut buf);
-        // 「单色显示」是这一页 emoji 分支的锚点文字 —— 它在,说明输入区
-        // 还在页面上。改这句文案时必须同步改这里(这正是本断言的用处)。
-        assert!(
-            find_text_pos(&out.shapes, "单色显示").is_some(),
-            "选了 emoji 模式但还没填内容时,输入区必须留在页面上;\
-             消失了就是用户报的「点 emoji 没有内容」"
-        );
-        assert!(buf.icon_emoji_mode, "模式位不该被自己的写回逻辑抹掉");
-        assert!(
-            buf.preserved_appearance.icon.is_none(),
-            "缓冲是空的,不该凭空造出一个空 emoji 图标"
-        );
+    /// 造一张真图标的 base64,走的是生产代码那条归一化路径。
+    fn real_ico() -> String {
+        let px: Vec<u8> = std::iter::repeat_n([7u8, 8, 9, 255], 32 * 32)
+            .flatten()
+            .collect();
+        let img = ico::IconImage::from_rgba_data(32, 32, px);
+        let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+        dir.add_entry(ico::IconDirEntry::encode_as_png(&img).unwrap());
+        let mut raw = Vec::new();
+        dir.write(&mut raw).unwrap();
+        crate::ui::ico::import(&raw).unwrap()
     }
 
-    /// 走查 P2-7:界面上不该出现实现细节。用户不需要知道 egui 是什么。
+    fn ico_buf() -> EditorBuffer {
+        let mut buf = EditorBuffer::default();
+        buf.preserved_appearance.icon = Some(mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: real_ico(),
+            bg: None,
+        });
+        buf
+    }
+
+    /// 走查 P2-7:界面上不该出现实现细节。用户不需要知道 egui 是什么,也不
+    /// 需要知道「彩色字形」是什么 —— 提示里只该说「导入一个 .ico 换掉它」。
     #[test]
     fn the_ui_never_mentions_egui_or_its_limitations() {
-        let mut buf = EditorBuffer {
-            icon_emoji_mode: true,
-            ..Default::default()
-        };
+        let mut buf = EditorBuffer::default();
+        buf.preserved_appearance.icon = Some(mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Emoji,
+            value: "🔥".into(),
+            bg: None,
+        });
         let out = run_appearance(&mut buf);
-        for leak in ["egui", "剪影", "不支持"] {
+        for leak in ["egui", "剪影", "字形", "epaint"] {
             assert!(
                 find_text_pos(&out.shapes, leak).is_none(),
                 "界面上出现了实现细节 {leak:?}"
@@ -2908,45 +2966,75 @@ mod tests {
         }
     }
 
-    /// 填了内容就要真写进 `preserved_appearance`(保存路径取的是它)。
-    /// 这是上一条的对照组:少了它,把写回整段删掉也能让上一条全绿。
+    /// 老库里的 emoji 图标:**数据留着,但要当场告诉用户它不显示了**。
+    ///
+    /// 两半缺一不可。只留数据不提示,用户看到的是「我明明设过图标,列表里
+    /// 却什么都没有」——那就是个 bug;只提示不留数据,等于我们替用户决定
+    /// 删掉他存过的东西。
+    ///
+    /// 自证会变红:删掉 `appearance()` 里那段 `if let Some(old) = kind.filter(...)`,
+    /// 第一段断言炸;把那段改成顺手 `icon = None`,第二段炸。
     #[test]
-    fn a_filled_emoji_buffer_is_written_back_to_the_record() {
-        let mut buf = EditorBuffer {
-            icon_emoji_mode: true,
-            icon_emoji_buf: "🔥".into(),
-            ..Default::default()
-        };
-        run_appearance(&mut buf);
-        let icon = buf
-            .preserved_appearance
-            .icon
-            .as_ref()
-            .expect("填了 emoji 就该写出图标");
-        assert_eq!(icon.kind, mullion_store::IconKind::Emoji);
-        assert_eq!(icon.value, "🔥");
+    fn an_old_emoji_icon_is_kept_but_the_user_is_told_it_no_longer_shows() {
+        let mut buf = EditorBuffer::default();
+        buf.preserved_appearance.icon = Some(mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Emoji,
+            value: "🔥".into(),
+            bg: None,
+        });
+        let out = run_appearance(&mut buf);
+        assert!(
+            find_text_pos(&out.shapes, "不再显示").is_some(),
+            "旧图标不显示了,得当场说一声,否则看起来就是个 bug"
+        );
+        assert_eq!(
+            buf.preserved_appearance.icon.as_ref().map(|i| i.kind),
+            Some(mullion_store::IconKind::Emoji),
+            "翻一下这一页不该把用户存过的图标抹掉"
+        );
     }
 
-    /// 用户主动点「无」→ 真清掉图标,但**缓冲留着**。
-    ///
-    /// 端到端指针事件驱动,不手改 `icon_emoji_mode` —— 手改等于把「上一帧是
-    /// 什么模式」这个信息一起抹掉,而那正是这条分支的判据。
-    ///
-    /// 自证会变红的方式:删掉 `appearance()` 里的 `else if prev { ... = None }`
-    /// 整个分支——切到「无」后图标还在,用户以为删掉了,保存下去却纹丝不动。
+    /// UI 上编辑不了的图标种类(`Builtin` 内置形状 v0.1.24 撤掉、`Custom` 从未
+    /// 有 UI 产出过)**不该被静默抹掉**。这两个变体还在 store schema 里,
+    /// 旧配置可能有值。
     #[test]
-    fn clicking_none_actually_clears_the_icon_but_keeps_the_buffer() {
+    fn an_uneditable_icon_is_preserved_instead_of_being_wiped() {
+        for kind in [
+            mullion_store::IconKind::Builtin,
+            mullion_store::IconKind::Custom,
+        ] {
+            let mut buf = EditorBuffer::default();
+            buf.preserved_appearance.icon = Some(mullion_store::IconSpec {
+                kind,
+                value: "hexagon".into(),
+                bg: None,
+            });
+            run_appearance(&mut buf);
+            assert_eq!(
+                buf.preserved_appearance.icon.as_ref().map(|i| i.kind),
+                Some(kind),
+                "UI 编辑不了的 {kind:?} 图标不该因为翻了一下这一页就消失"
+            );
+        }
+    }
+
+    /// 点「导入 .ico…」只是**举手**,真正开对话框是 app 的事。
+    ///
+    /// 这条钉的是接线的存在性:标志位不置,按钮点了就没有任何反应。
+    /// (不在 egui 闭包里同步开文件对话框的理由见 `app.rs::spawn_key_picker`
+    /// ——那会把整个事件循环堵死,表现为「点一下窗口就卡住」。)
+    ///
+    /// 自证会变红:把 `buf.pick_icon_clicked = true` 那行删掉。
+    #[test]
+    fn clicking_import_raises_a_request_instead_of_opening_a_dialog_inline() {
         let t = crate::theme::MULLION_DARK;
-        let mut buf = EditorBuffer {
-            icon_emoji_mode: true,
-            icon_emoji_buf: "🔥".into(),
-            ..Default::default()
-        };
+        let mut buf = EditorBuffer::default();
+        let mut err = None;
         let ctx = egui::Context::default();
-        let run = |ctx: &egui::Context, buf: &mut EditorBuffer, input: egui::RawInput| {
+        let mut run = |ctx: &egui::Context, buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    super::appearance(ui, &t, buf);
+                    super::appearance(ui, &t, buf, &mut err);
                 });
             })
         };
@@ -2958,70 +3046,95 @@ mod tests {
         };
 
         let out = run(&ctx, &mut buf, Default::default());
-        assert!(
-            buf.preserved_appearance.icon.is_some(),
-            "前提没成立:点「无」之前得先有一个图标,否则这条测试恒过"
-        );
-        let none_pos = find_text_pos(&out.shapes, "无").expect("图标区应该有个「无」可点");
+        let pos = find_text_pos(&out.shapes, "导入").expect("图标页要有导入按钮");
+        assert!(!buf.pick_icon_clicked, "前提:还没点之前不该是 true");
 
         let _ = run(
             &ctx,
             &mut buf,
             egui::RawInput {
                 events: vec![
-                    egui::Event::PointerMoved(none_pos),
-                    click(none_pos, true),
-                    click(none_pos, false),
+                    egui::Event::PointerMoved(pos),
+                    click(pos, true),
+                    click(pos, false),
                 ],
                 ..Default::default()
             },
         );
-
-        assert!(!buf.icon_emoji_mode, "点了「无」模式位必须跟着落下来");
         assert!(
-            buf.preserved_appearance.icon.is_none(),
-            "从 emoji 切到「无」必须真把图标清掉"
+            buf.pick_icon_clicked,
+            "点了「导入」必须举手让 app 去开对话框"
         );
-        assert_eq!(buf.icon_emoji_buf, "🔥", "缓冲要留着,用户切回来还能看到");
     }
 
-    /// UI 上编辑不了的图标种类(`Builtin` 内置形状 v0.1.24 撤掉、`Custom` 不做)
-    /// **不该被静默抹掉**。这两个变体还在 store schema 里,旧配置可能有值。
+    /// 底色开关关着的时候**不该**往库里写一个底色 —— 大多数 .ico 自带透明
+    /// 背景,在深色面板上本来就好看,凭空垫一块浅灰反而毁了。
     ///
-    /// 自证会变红的方式:把 `appearance()` 里的 `else if prev` 改成裸 `else`
-    /// —— 只要用户翻到这一页,不认识的图标就被清空了,而且没有任何提示。
+    /// 顺带钉住:没有图标时整段底色 UI 都不该出现(没图标垫什么底)。
     #[test]
-    fn an_uneditable_icon_is_preserved_instead_of_being_wiped() {
-        for kind in [
-            mullion_store::IconKind::Builtin,
-            mullion_store::IconKind::Custom,
-        ] {
-            let mut buf = EditorBuffer::default();
-            buf.preserved_appearance.icon = Some(mullion_store::IconSpec {
-                kind,
-                value: "hexagon".into(),
-            });
-            run_appearance(&mut buf);
-            assert_eq!(
-                buf.preserved_appearance.icon.as_ref().map(|i| i.kind),
-                Some(kind),
-                "UI 编辑不了的 {kind:?} 图标不该因为翻了一下这一页就消失"
+    fn the_background_colour_stays_unset_until_you_ask_for_it() {
+        let mut buf = ico_buf();
+        run_appearance(&mut buf);
+        assert_eq!(
+            buf.preserved_appearance
+                .icon
+                .as_ref()
+                .and_then(|i| i.bg.as_ref()),
+            None,
+            "没勾底色就不该凭空写一个"
+        );
+
+        let mut empty = EditorBuffer::default();
+        let out = run_appearance(&mut empty);
+        assert!(
+            find_text_pos(&out.shapes, "底色").is_none(),
+            "还没有图标时不该出现底色设置"
+        );
+    }
+
+    /// 图标页要能当场看到 32 和 64 两个尺寸。列表窄档取的就是这两张图,
+    /// 不当场画出来,用户得先保存、再去拖列表才知道小尺寸下认不认得出 ——
+    /// 而「认不认得出」正是选图标时唯一要判断的事。
+    ///
+    /// 自证会变红:把 `appearance()` 里的 `icon_preview(...)` 调用删掉。
+    #[test]
+    fn the_icon_page_previews_both_size_steps() {
+        let mut buf = ico_buf();
+        let out = run_appearance(&mut buf);
+        for label in ["32px", "64px"] {
+            assert!(
+                find_text_pos(&out.shapes, label).is_some(),
+                "图标页应当预览 {label} 这一档"
             );
         }
     }
 
-    /// 「形状」按用户要求撤掉,图标只剩「无 / emoji」两态。
+    /// hex 与 `Color32` 的往返必须闭合:色盘吐 `Color32`、库里存 `#rrggbb`,
+    /// 中间转错一次,用户选的颜色和显示出来的就不是同一个。
     #[test]
-    fn the_appearance_page_no_longer_offers_builtin_shapes() {
+    fn a_colour_survives_the_round_trip_between_the_picker_and_the_hex_text() {
+        for hex in ["#000000", "#ffffff", "#1e88e5", "#0a0b0c"] {
+            let c = crate::theme::c32(crate::theme::parse_hex(hex).unwrap());
+            assert_eq!(super::hex_of(c), hex, "{hex} 转回来变了样");
+        }
+    }
+
+    /// 「形状」(v0.1.24 撤)和「emoji」(v0.1.26 撤)都已经不是图标载体了,
+    /// 页面上不该还留着它们的入口 —— 留着的话用户会去点,点完什么也画不出来。
+    /// 唯一的入口是「导入 .ico…」。
+    #[test]
+    fn the_appearance_page_only_offers_importing_an_ico() {
         let mut buf = EditorBuffer::default();
         let out = run_appearance(&mut buf);
+        for gone in ["形状", "emoji"] {
+            assert!(
+                find_text_pos(&out.shapes, gone).is_none(),
+                "「{gone}」模式已撤,不该还画在页面上"
+            );
+        }
         assert!(
-            find_text_pos(&out.shapes, "形状").is_none(),
-            "「形状」模式已撤,不该还画在页面上"
-        );
-        assert!(
-            find_text_pos(&out.shapes, "emoji").is_some(),
-            "「emoji」模式必须还在——它现在是唯一的图标载体"
+            find_text_pos(&out.shapes, ".ico").is_some(),
+            "「导入 .ico…」是现在唯一的图标入口"
         );
     }
 
@@ -4111,18 +4224,21 @@ mod tests {
         for width in [300.0f32, 440.0, 900.0] {
             for ppp in [1.0f32, 1.25, 1.5] {
                 let t = crate::theme::MULLION_DARK;
-                let mut buf = EditorBuffer {
-                    icon_emoji_mode: true,
-                    icon_emoji_buf: "🔥".to_string(),
-                    ..Default::default()
-                };
-                // 有颜色时才会出现「自定义 #rrggbb」那一行,连带把「作用于」
-                // 的三个勾选框也铺开 —— 一次覆盖本页所有会变宽的分支。
+                // 有图标时才会出现「底色」那一行和两档预览;有颜色时才会出现
+                // 「自定义 #rrggbb」那一行,连带把「作用于」的三个勾选框也铺开
+                // —— 一次覆盖本页所有会变宽的分支。
+                let mut buf = ico_buf();
+                buf.preserved_appearance.icon.as_mut().unwrap().bg =
+                    Some(super::DEFAULT_ICON_BG.into());
                 buf.preserved_appearance.color = Some(ColorSpec {
                     hex: "#ff0000".to_string(),
                     apply_to: vec![ColorTarget::ListItem],
                 });
-                let out = run_page_at(width, ppp, |ui| super::appearance(ui, &t, &mut buf));
+                // 导入失败的红字是本页最长的一行文本,一并覆盖。
+                let mut err = Some(crate::ui::ico::ImportError::NotIco.message());
+                let out = run_page_at(width, ppp, |ui| {
+                    super::appearance(ui, &t, &mut buf, &mut err)
+                });
                 let right = max_right(&out.shapes);
                 assert!(
                     right <= width + 0.5,

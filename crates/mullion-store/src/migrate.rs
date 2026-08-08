@@ -248,11 +248,80 @@ kind = "password"
     }
 
     /// 版本号是**故意**钉死的:动它就意味着用户的库要迁移一次,不该被
-    /// 顺手改掉。v5 的理由见 `CURRENT_SCHEMA` 文档 —— 私钥路径从
-    /// `[session.auth]` 移除,旧客户端读 v5 会连不上,拒绝比装作能用好。
+    /// 顺手改掉。v6 的理由见 `CURRENT_SCHEMA` 文档 —— 图标改成导入的 .ico
+    /// (正文内嵌)并多了底色,旧客户端不认识 `kind = "ico"`,拒绝比读出一半好。
     #[test]
-    fn current_schema_is_five() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 5);
+    fn current_schema_is_six() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 6);
+    }
+
+    /// v5 的库里存的 emoji 图标**必须原样读得出来**。
+    ///
+    /// v6 的 UI 不再产出 emoji(epaint 画不了彩色字形,64px 纯图标档下认不出
+    /// 是哪台机器),但那是「不再提供这个功能」,不是「可以把用户已经存下的
+    /// 数据吃掉」。`IconKind::Emoji` 变体因此必须留在类型里 —— 删掉它,这份
+    /// TOML 会整片反序列化失败,用户丢的是**整个会话库**而不是一个图标。
+    ///
+    /// 自证会变红:把 `IconKind` 里的 `Emoji` 变体删掉,这条编译不过。
+    #[test]
+    fn a_v5_library_with_emoji_icons_still_loads_on_v6() {
+        let v5 = r#"
+schema_version = 5
+
+[[session]]
+id = 1
+modified_at = "t"
+
+[session.identity]
+name = "a"
+
+[session.connection]
+host = "h"
+port = 22
+protocol = "ssh"
+
+[session.auth]
+user = "u"
+kind = "password"
+
+[session.appearance.icon]
+kind = "emoji"
+value = "🔥"
+"#;
+        let file: crate::model::SessionsFile = toml::from_str(v5).unwrap();
+        let icon = file.session[0]
+            .appearance
+            .icon
+            .as_ref()
+            .expect("图标不该丢");
+        assert_eq!(icon.kind, crate::model::IconKind::Emoji);
+        assert_eq!(icon.value, "🔥");
+        assert_eq!(icon.bg, None, "v5 没有底色这个键,应落 None 而不是解析失败");
+    }
+
+    /// 反过来:v6 存的 .ico 图标要能完整往返,底色跟着走。
+    #[test]
+    fn an_ico_icon_and_its_background_colour_round_trip() {
+        let spec = crate::model::IconSpec {
+            kind: crate::model::IconKind::Ico,
+            value: "QUJD".into(),
+            bg: Some("#1e88e5".into()),
+        };
+        let text = toml::to_string(&spec).unwrap();
+        assert_eq!(
+            toml::from_str::<crate::model::IconSpec>(&text).unwrap(),
+            spec
+        );
+
+        // 没垫底色时不该往 TOML 里写一行空的 `bg`。
+        let plain = crate::model::IconSpec {
+            bg: None,
+            ..spec.clone()
+        };
+        assert!(
+            !toml::to_string(&plain).unwrap().contains("bg"),
+            "没设底色就不该写这个键"
+        );
     }
 
     /// 私钥路径必须能从 **v1(扁平)和 v2~v4(分节)两种布局**里都挑出来 ——

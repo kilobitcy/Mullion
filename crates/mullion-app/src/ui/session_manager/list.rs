@@ -272,7 +272,6 @@ fn paint_row_body(
                 egui::vec2(ICON_PX, ICON_PX),
             ),
             icon,
-            t,
         );
     }
     let name_rect = paint_highlighted(

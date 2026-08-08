@@ -353,6 +353,7 @@ mod tests {
                 icon: Some(IconSpec {
                     kind: IconKind::Builtin,
                     value: "ubuntu".into(),
+                    bg: None,
                 }),
                 color: Some(ColorSpec {
                     hex: "#E5484D".into(),

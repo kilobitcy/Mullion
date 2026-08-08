@@ -109,19 +109,17 @@ pub struct EditorBuffer {
     pub preserved_appearance: AppearancePrefs,
     pub preserved_automation: AutomationPrefs,
 
-    /// 图标是不是「emoji」模式。**必须是独立的持久状态，不能从
-    /// `preserved_appearance.icon` 反推**——反推的话，用户刚点上「emoji」时缓冲
-    /// 还是空的，写回是 `None`，下一帧又反推成「无」，UI 当场弹回去、输入框根本
-    /// 出不来。这正是 v0.1.23 实机验收报的「点 emoji 没有内容」。
-    /// 守护测试:`fields::tests::emoji_mode_survives_the_next_frame_with_an_empty_buffer`。
-    pub icon_emoji_mode: bool,
-    /// 「emoji」模式下输入的 emoji。切到「无」再切回来不清空——同 `jump_chain`
-    /// 的缓冲逻辑：用户切回来应该看到自己刚才填的，而不是从头再输。
-    pub icon_emoji_buf: String,
-
     /// 「浏览…」按钮本帧被点了。`mod.rs` 在借用释放后转成
     /// `UiState::pick_key_request`,随即复位。
     pub pick_key_clicked: bool,
+    /// 图标页的「导入…」本帧被点了。同上,由 `mod.rs` 转交给 app 去开文件
+    /// 对话框 —— 不在 egui 闭包里同步开对话框(会把整个事件循环堵死,
+    /// 理由见 `app.rs::spawn_key_picker`)。
+    ///
+    /// 导入**失败**的原因不放这里,放 `UiState::icon_error`:这个结构整体参与
+    /// `is_dirty` 比对,一条错误提示会让「什么都没改成」的表单显示成脏的、
+    /// 切走时白弹一次确认(触碰位当初也是为了这个搬去 `UiState` 的)。
+    pub pick_icon_clicked: bool,
 }
 
 impl Default for EditorBuffer {
@@ -155,9 +153,8 @@ impl Default for EditorBuffer {
             preserved_terminal: TerminalPrefs::default(),
             preserved_appearance: AppearancePrefs::default(),
             preserved_automation: AutomationPrefs::default(),
-            icon_emoji_mode: false,
-            icon_emoji_buf: String::new(),
             pick_key_clicked: false,
+            pick_icon_clicked: false,
         }
     }
 }
@@ -235,8 +232,6 @@ impl std::fmt::Debug for EditorBuffer {
             .field("preserved_terminal", &self.preserved_terminal)
             .field("preserved_appearance", &self.preserved_appearance)
             .field("preserved_automation", &self.preserved_automation)
-            .field("icon_emoji_mode", &self.icon_emoji_mode)
-            .field("icon_emoji_buf", &self.icon_emoji_buf)
             .finish()
     }
 }
@@ -322,19 +317,13 @@ impl EditorBuffer {
             AuthKind::Password => buf.auth_kind = AuthKindUi::Password,
             AuthKind::PublicKey { .. } => buf.auth_kind = AuthKindUi::PublicKey,
         }
-        // 已存的 emoji 回填进缓冲并置上模式位，打开编辑器就直接是 emoji 态。
-        if let Some(icon) = &rec.appearance.icon {
-            match icon.kind {
-                mullion_store::IconKind::Emoji => {
-                    buf.icon_emoji_mode = true;
-                    buf.icon_emoji_buf = icon.value.clone();
-                }
-                // Builtin(内置形状,UI 已撤)和 Custom(要引 image 解码器,本期
-                // 不做)都不支持编辑:模式位保持 false，UI 上显示「无」，但
-                // `preserved_appearance` 原样透传——不支持编辑不等于允许静默删除。
-                mullion_store::IconKind::Builtin | mullion_store::IconKind::Custom => {}
-            }
-        }
+        // 图标不需要任何回填:它整个躺在 `preserved_appearance` 里(第 289 行
+        // 已经 clone 过来了),图标页直接读写那份。
+        //
+        // v0.1.23~v0.1.25 这里有一个「模式位」要回填,因为 emoji 是边打边存的
+        // ——缓冲空的那一瞬间会被反推成「没图标」,UI 当场弹回去(实机报的
+        // 「点 emoji 没有内容」)。改成导入 .ico 之后不存在中间态:文件选完
+        // 图标就有值,没选就没有,模式位没有存在的理由了。
         buf
     }
 }
@@ -477,6 +466,38 @@ pub(crate) fn import_key_file(
             buf.key_note = Some(format!("已导入 {name}"));
         }
     }
+}
+
+/// 把选中的 .ico 读进表单(F61)。跟 `import_key_file` 同一形状:IO 由调用方
+/// 注入,函数本身可纯单测。
+///
+/// 返回 `Err(提示文案)`,由调用方落进 `UiState::icon_error` —— **不放
+/// `EditorBuffer`**,那个结构整体参与 `is_dirty` 比对,一条错误提示会让
+/// 「什么都没改成」的表单显示成脏的、切走时白弹一次确认。
+///
+/// 已设的底色跨导入保留:换一张图不意味着要重挑一次底色。
+pub(crate) fn import_icon_file(
+    buf: &mut EditorBuffer,
+    path: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let bytes = read(path).map_err(|e| format!("读不了 {name}:{e}"))?;
+    let value = crate::ui::ico::import(&bytes).map_err(|e| e.message())?;
+    let bg = buf
+        .preserved_appearance
+        .icon
+        .as_ref()
+        .and_then(|i| i.bg.clone());
+    buf.preserved_appearance.icon = Some(mullion_store::IconSpec {
+        kind: mullion_store::IconKind::Ico,
+        value,
+        bg,
+    });
+    Ok(())
 }
 
 /// 只认 PEM / OpenSSH 私钥的起始标记。**故意不做真解析**:带口令的私钥要先
@@ -783,6 +804,7 @@ mod tests {
                 icon: Some(IconSpec {
                     kind: IconKind::Emoji,
                     value: "🚀".into(),
+                    bg: None,
                 }),
                 color: Some(ColorSpec {
                     hex: "#ff0000".into(),
@@ -1552,5 +1574,78 @@ mod tests {
             is_dirty(&buf, &baseline),
             "改了外观表单必须判脏,否则切换会话时改动被静默丢弃"
         );
+    }
+
+    /// 造一张真 .ico 的原始字节。
+    fn ico_bytes() -> Vec<u8> {
+        let px: Vec<u8> = std::iter::repeat_n([7u8, 8, 9, 255], 32 * 32)
+            .flatten()
+            .collect();
+        let img = ico::IconImage::from_rgba_data(32, 32, px);
+        let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+        dir.add_entry(ico::IconDirEntry::encode_as_png(&img).unwrap());
+        let mut raw = Vec::new();
+        dir.write(&mut raw).unwrap();
+        raw
+    }
+
+    /// 导入成功要写成 `Ico`,并且**保住已挑好的底色** —— 换一张图不等于要
+    /// 重挑一次底色。
+    #[test]
+    fn importing_an_icon_keeps_the_background_colour_you_already_picked() {
+        let mut buf = EditorBuffer {
+            preserved_appearance: AppearancePrefs {
+                icon: Some(IconSpec {
+                    kind: IconKind::Ico,
+                    value: "旧的".into(),
+                    bg: Some("#123456".into()),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let raw = ico_bytes();
+        import_icon_file(&mut buf, Path::new("a.ico"), |_| Ok(raw)).expect("这是一张真图标");
+        let icon = buf.preserved_appearance.icon.as_ref().unwrap();
+        assert_eq!(icon.kind, IconKind::Ico);
+        assert_ne!(icon.value, "旧的", "新图标没写进去");
+        assert_eq!(icon.bg.as_deref(), Some("#123456"), "底色被导入顺手清掉了");
+    }
+
+    /// 导入**失败**不能动已有的图标。选错文件的代价应该只是一条提示,
+    /// 不能顺手把用户之前设好的图标弄没了。
+    #[test]
+    fn a_failed_import_leaves_the_existing_icon_alone() {
+        for (label, read) in [
+            (
+                "读不了文件",
+                Box::new(|_: &Path| Err(std::io::Error::other("坏了")))
+                    as Box<dyn FnOnce(&Path) -> std::io::Result<Vec<u8>>>,
+            ),
+            ("不是 ico", Box::new(|_: &Path| Ok(b"not an icon".to_vec()))),
+        ] {
+            let mut buf = EditorBuffer {
+                preserved_appearance: AppearancePrefs {
+                    icon: Some(IconSpec {
+                        kind: IconKind::Ico,
+                        value: "旧的".into(),
+                        bg: None,
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let err = import_icon_file(&mut buf, Path::new("a.ico"), read)
+                .expect_err("{label} 这条本该失败");
+            assert!(!err.is_empty(), "{label}:失败必须给一句能看懂的话");
+            assert_eq!(
+                buf.preserved_appearance
+                    .icon
+                    .as_ref()
+                    .map(|i| i.value.as_str()),
+                Some("旧的"),
+                "{label}:导入失败不该把原来的图标弄没"
+            );
+        }
     }
 }

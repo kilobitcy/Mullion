@@ -17,7 +17,7 @@ use mullion_store::{
     ColorSpec, ColorTarget, GroupRecord, IconKind, IconSpec, PrefsLayer, SessionId, SessionRecord,
 };
 
-use crate::theme::{self, Theme};
+use crate::theme;
 
 /// 从 `ResolvedConfig` 摘出来的外观部分。
 ///
@@ -97,20 +97,8 @@ impl AppearanceCache {
     }
 }
 
-/// emoji 值的 `char` 上限。ZWJ 家庭序列(👨‍👩‍👧 是 5 个 char)和旗帜要放得下,
-/// 同时挡住用户把一整段文字粘进来撑爆行高。
-///
-/// 刻意不引 `unicode-segmentation` 做真字素分割:为一个上限校验加一个依赖
-/// 不划算,而这个上限本来就是个粗筛。
-pub const MAX_EMOJI_CHARS: usize = 8;
-
 /// 边缘竖条宽度(逻辑点)。
 pub const EDGE_BAR_W: f32 = 3.0;
-
-/// emoji 值能不能画。空值和超长值都不画(走同一条降级路径)。
-pub fn emoji_is_paintable(v: &str) -> bool {
-    !v.is_empty() && v.chars().count() <= MAX_EMOJI_CHARS
-}
 
 /// 竖条画在 `rect` 的哪一边。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,35 +124,105 @@ pub fn paint_edge_bar(p: &egui::Painter, rect: egui::Rect, side: Side, color: eg
     p.rect_filled(edge_bar_rect(rect, side), egui::Rounding::same(2.0), color);
 }
 
-/// 画一个图标(F61)。emoji 是唯一的图标载体。
+/// 图标底色的圆角。跟着列表行的 6px 走,视觉上是同一套语言。
+const ICON_BG_ROUNDING: f32 = 4.0;
+
+/// 纹理缓存的条数上限。超了整片丢弃,下一帧重新解码。
 ///
-/// 两条规则:
-/// 1. **认不出的一律不画** —— `IconKind::Builtin`(内置形状,v0.1.24 按用户
-///    要求撤掉)、`IconKind::Custom`(要引 image 解码器,顶爆 N6 的 25MB
-///    体积线)、超长/空 emoji 共用这一条降级路径。两个枚举变体保留是因为
-///    它们是 store schema 的一部分,旧配置里可能存在,读到不该崩。
-/// 2. epaint **不支持 COLR/CPAL 彩色字形**,emoji 在界面上是**黑白剪影**。
-///    这不是 bug,是 egui 的既有限制(内置字体 `NotoEmoji-Regular` /
-///    `emoji-icon-font` 全是黑白轮廓,即使系统装了 Segoe UI Emoji 也一样)。
+/// 上限存在的理由:缓存挂在 `egui::Context` 的 temp data 上,**没有 GC**——
+/// 用户每换一次图标就是一个新的 key,旧纹理会一直占着显存。真实上限本该是
+/// 「会话数 × 2 档」,64 已经宽出一大截;够不着这个数的人永远不会触发清空,
+/// 天天换图标的人也只是偶尔多解一次码。
+const TEX_CACHE_MAX: usize = 64;
+
+/// base64 → 已上传的纹理。
 ///
-/// **不收会话语义色**:emoji 一律用 `fg` 原色画。内置形状撤掉之后没有任何
-/// 可染色的图标载体了,留一个用不上的 `tint` 参数只会让调用方误以为它有效。
-pub fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: &IconSpec, t: &Theme) {
-    match icon.kind {
-        IconKind::Emoji => {
-            if !emoji_is_paintable(&icon.value) {
-                return;
-            }
-            p.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                &icon.value,
-                egui::FontId::proportional(rect.height().min(rect.width()) * 0.85),
-                theme::c32(t.fg),
-            );
-        }
-        IconKind::Builtin | IconKind::Custom => {}
+/// 放在 `Context` 的 temp data 里而不是 `UiState`:图标要在会话列表、Tab 条、
+/// pane 标题条三处画,走 `UiState` 就得给这三条路径全部加一个参数,而它们中
+/// 有两条现在只拿得到 `Painter`。`Painter::ctx()` 是现成的。
+#[derive(Clone, Default)]
+struct TexCache {
+    map: HashMap<(u64, u32), egui::TextureHandle>,
+}
+
+/// 图标正文的指纹。`DefaultHasher` 够用 —— 这不是安全场景,碰撞的后果是
+/// 两个图标串味,而不是越权。
+fn fingerprint(b64: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    b64.hash(&mut h);
+    h.finish()
+}
+
+/// 取(必要时解码并上传)一张图标纹理。
+///
+/// **解码只在缓存未命中时发生**。每帧解一次 base64 + PNG 就是陷阱 T3 的
+/// 教科书案例:会话列表几十行,一行一张图,GPU 没事干、CPU 先烧起来。
+fn texture(ctx: &egui::Context, b64: &str, want: u32) -> Option<egui::TextureHandle> {
+    let key = (fingerprint(b64), want);
+    if let Some(h) = ctx.data(|d| {
+        d.get_temp::<TexCache>(egui::Id::NULL)?
+            .map
+            .get(&key)
+            .cloned()
+    }) {
+        return Some(h);
     }
+
+    let frames = crate::ui::ico::decode(b64)?;
+    let f = frames.pick(want);
+    let img = egui::ColorImage::from_rgba_unmultiplied([f.size as usize, f.size as usize], &f.px);
+    // LINEAR:32/64 两档之间还要被 GPU 拉伸到实际槽位大小,最近邻会让边缘
+    // 出锯齿。图标本来就是给人看轮廓的,糊一点好过毛刺。
+    let handle = ctx.load_texture(
+        format!("mullion_ico_{}_{want}", key.0),
+        img,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| {
+        let cache = d.get_temp_mut_or_default::<TexCache>(egui::Id::NULL);
+        if cache.map.len() >= TEX_CACHE_MAX {
+            cache.map.clear();
+        }
+        cache.map.insert(key, handle.clone());
+    });
+    Some(handle)
+}
+
+/// 画一个图标(F61)。**用户导入的 `.ico` 是唯一的图标载体。**
+///
+/// 三条规则:
+/// 1. **认不出的一律不画** —— `Builtin`(内置形状,v0.1.24 按用户要求撤掉)、
+///    `Custom`(从未有 UI 产出过)、`Emoji`(v0.1.26 撤掉,理由见下)共用这条
+///    降级路径。三个变体保留是因为它们是 store schema 的一部分,旧配置里
+///    可能存在,读到不该崩 —— 但**也不该画**:emoji 在 epaint 下只能是黑白
+///    剪影(不支持 COLR/CPAL 彩色字形),而列表新增的 64px 纯图标档里,一屏
+///    黑白剪影根本认不出哪台是哪台。
+/// 2. **底色垫在图标下面**。用户导入的 .ico 多半是给浅色资源管理器画的,
+///    深色图标糊在深色面板上等于没有;垫一块底色是不改图本身就能救回来的
+///    唯一办法。没设底色就直接画在面板上。
+/// 3. **不收会话语义色**:图标是用户自己的图,染色只会把它毁掉。语义色走
+///    边缘竖条(`paint_edge_bar`)。
+pub fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: &IconSpec) {
+    if icon.kind != IconKind::Ico {
+        return;
+    }
+    if let Some(bg) = icon.bg.as_ref().and_then(|h| theme::parse_hex(h)) {
+        p.rect_filled(rect, egui::Rounding::same(ICON_BG_ROUNDING), theme::c32(bg));
+    }
+    let side = rect.width().min(rect.height());
+    let Some(tex) = texture(p.ctx(), &icon.value, if side <= 32.0 { 32 } else { 64 }) else {
+        return;
+    };
+    // 正方形居中:槽位可能是长方形(列表行的图标槽),按短边取正方形画,
+    // 拉伸变形比留白难看得多。
+    let square = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+    p.image(
+        tex.id(),
+        square,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 }
 
 #[cfg(test)]
@@ -239,7 +297,19 @@ mod tests {
         IconSpec {
             kind,
             value: value.to_string(),
+            bg: None,
         }
+    }
+
+    /// 造一张真图标(纯色 `rgba`)的 base64,走的是生产代码那条归一化路径。
+    fn real_ico(rgba: [u8; 4]) -> String {
+        let px: Vec<u8> = std::iter::repeat_n(rgba, 32 * 32).flatten().collect();
+        let img = ico::IconImage::from_rgba_data(32, 32, px);
+        let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+        dir.add_entry(ico::IconDirEntry::encode_as_png(&img).unwrap());
+        let mut raw = Vec::new();
+        dir.write(&mut raw).unwrap();
+        crate::ui::ico::import(&raw).unwrap()
     }
 
     /// 数一帧里画出来的图形总数(递归展开 `Shape::Vec`)。
@@ -266,37 +336,65 @@ mod tests {
                 if let Some(i) = icon {
                     let rect =
                         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(16.0, 16.0));
-                    paint_icon(ui.painter(), rect, i, &crate::theme::MULLION_DARK);
+                    paint_icon(ui.painter(), rect, i);
                 }
             });
         });
         count_shapes(&out.shapes)
     }
 
-    /// 能画的 emoji 必须真往 painter 里放东西 —— 这是
+    /// 一张真图标必须真往 painter 里放东西 —— 这是
     /// `unrecognized_icons_paint_nothing` 的**对照组**。少了它,把 `paint_icon`
     /// 整个函数体删空也能让那条「不画」的测试全绿(恒真),等于没测。
     #[test]
-    fn a_paintable_emoji_actually_paints_something() {
+    fn a_real_ico_actually_paints_something() {
         let base = shapes_with(None);
-        let n = shapes_with(Some(&icon(IconKind::Emoji, "🔥")));
-        assert!(n > base, "能画的 emoji 必须画出图形(基线 {base},实际 {n})");
+        let n = shapes_with(Some(&icon(IconKind::Ico, &real_ico([9, 9, 9, 255]))));
+        assert!(n > base, "导入的 .ico 必须画出图形(基线 {base},实际 {n})");
     }
 
-    /// 认不出的值一律**不画**,与「没设图标」表现一致。五种情况共用这一条
-    /// 降级路径,向前向后都不会崩:`IconKind::Builtin`(内置形状 v0.1.24 撤掉,
-    /// 但 schema 变体还在、旧配置里可能有值)、`IconKind::Custom`(不做)、
-    /// 空 emoji、emoji 超过 8 个 char。
+    /// 底色是**垫在图标下面**多画的一层,不是替代图标。没设底色的同一张图
+    /// 必须比设了底色的少画一个图形 —— 否则「配了底色但没生效」这种事在
+    /// 深色主题下正好看不出来(深图标 + 没垫底 = 一片黑,和没图标一样)。
+    ///
+    /// 自证会变红:把 `paint_icon` 里那句 `rect_filled` 删掉,两边相等,断言炸。
+    #[test]
+    fn a_background_colour_is_painted_underneath_the_icon() {
+        let b64 = real_ico([9, 9, 9, 255]);
+        let plain = shapes_with(Some(&icon(IconKind::Ico, &b64)));
+        let with_bg = shapes_with(Some(&IconSpec {
+            kind: IconKind::Ico,
+            value: b64.clone(),
+            bg: Some("#1e88e5".into()),
+        }));
+        assert!(
+            with_bg > plain,
+            "底色应当多画一层(无底色 {plain},有底色 {with_bg})"
+        );
+
+        // 坏 hex 走降级:不垫底色,但图标照画。配置被手改坏不该让图标消失。
+        let bad_bg = shapes_with(Some(&IconSpec {
+            kind: IconKind::Ico,
+            value: b64,
+            bg: Some("不是颜色".into()),
+        }));
+        assert_eq!(bad_bg, plain, "认不出的底色应当降级成不垫,而不是不画图标");
+    }
+
+    /// 认不出的值一律**不画**,与「没设图标」表现一致。四种情况共用这一条
+    /// 降级路径:三个历史 `IconKind`(schema 里还在、旧配置里可能有值)和
+    /// 一段解不开的 base64。
+    ///
+    /// emoji 尤其要**不画**:epaint 不支持彩色字形,画出来是黑白剪影,而列表
+    /// 的 64px 纯图标档下一屏剪影根本认不出哪台是哪台(v0.1.26 据此撤掉)。
     #[test]
     fn unrecognized_icons_paint_nothing() {
         let base = shapes_with(None);
         for bad in [
             icon(IconKind::Builtin, "circle"),
-            icon(IconKind::Builtin, ""),
             icon(IconKind::Custom, "/path/to/some.png"),
-            icon(IconKind::Emoji, ""),
-            // 9 个 char > MAX_EMOJI_CHARS:用户把一整段文字粘进来会撑爆行高
-            icon(IconKind::Emoji, "一二三四五六七八九"),
+            icon(IconKind::Emoji, "🔥"),
+            icon(IconKind::Ico, "这不是 base64"),
         ] {
             assert_eq!(
                 shapes_with(Some(&bad)),
@@ -304,21 +402,6 @@ mod tests {
                 "认不出的图标 {bad:?} 不该画任何东西"
             );
         }
-    }
-
-    /// emoji 长度上限:ZWJ 家庭序列(👨‍👩‍👧 是 5 个 char)和旗帜要放得下,
-    /// 同时挡住把一整段文字粘进来。刻意不引 `unicode-segmentation` 做真
-    /// 字素分割 —— 为一个上限校验加依赖不划算。
-    #[test]
-    fn emoji_length_limit_admits_zwj_sequences_and_rejects_prose() {
-        assert!(emoji_is_paintable("🔥"));
-        assert_eq!("👨‍👩‍👧".chars().count(), 5, "ZWJ 家庭序列确实是 5 个 char");
-        assert!(emoji_is_paintable("👨‍👩‍👧"), "ZWJ 家庭序列必须放得下");
-        assert!(!emoji_is_paintable(""), "空值不画");
-        assert!(
-            !emoji_is_paintable("这是一整段被粘贴进来的说明文字"),
-            "超过上限的长文本必须挡住,否则会撑爆列表行高"
-        );
     }
 
     /// 竖条画在指定的那一边,且宽度恒为 `EDGE_BAR_W`。

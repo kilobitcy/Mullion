@@ -128,7 +128,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<P
                         if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
                             let (r, _) = ui
                                 .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                            crate::ui::badge::paint_icon(ui.painter(), r, icon, t);
+                            crate::ui::badge::paint_icon(ui.painter(), r, icon);
                         }
                         let dot = match v.status {
                             PaneStatus::Live => t.ok,
@@ -412,6 +412,19 @@ mod tests {
         assert_eq!(other, none, "只勾了会话列表的会话不该在 pane 标题条上画");
     }
 
+    /// 造一张真能解出来的 .ico(走的是生产代码那条归一化路径)。
+    fn real_ico() -> String {
+        let px: Vec<u8> = std::iter::repeat_n([7u8, 8, 9, 255], 32 * 32)
+            .flatten()
+            .collect();
+        let img = ico::IconImage::from_rgba_data(32, 32, px);
+        let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+        dir.add_entry(ico::IconDirEntry::encode_as_png(&img).unwrap());
+        let mut raw = Vec::new();
+        dir.write(&mut raw).unwrap();
+        crate::ui::ico::import(&raw).unwrap()
+    }
+
     /// **本任务最关键的回归**:加了竖条和图标之后,`Area` 的几何承诺不能变。
     ///
     /// 本文件顶部注释警告过两个越界坑(`Frame` 的 `min_rect + margin` 撑破
@@ -423,12 +436,13 @@ mod tests {
         use crate::shell::workspace::TITLE_BAR_PX;
         use mullion_store::{ColorTarget, IconKind, IconSpec};
         let a = crate::ui::badge::Appearance {
-            // 必须用**真能画出来**的图标。用 `IconKind::Builtin` 的话
-            // `paint_icon` 直接走降级不画(内置形状 v0.1.24 已撤),这条
-            // 「加了图标几何也不变」的断言就变成了空跑。
+            // 必须用**真能画出来**的图标。用 `IconKind::Builtin`/`Emoji` 的话
+            // `paint_icon` 直接走降级不画(内置形状 v0.1.24 已撤、emoji
+            // v0.1.26 已撤),这条「加了图标几何也不变」的断言就变成了空跑。
             icon: Some(IconSpec {
-                kind: IconKind::Emoji,
-                value: "🔥".into(),
+                kind: IconKind::Ico,
+                value: real_ico(),
+                bg: None,
             }),
             color: Some(mullion_store::ColorSpec {
                 hex: "#e06767".into(),

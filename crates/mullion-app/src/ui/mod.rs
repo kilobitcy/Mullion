@@ -200,6 +200,17 @@ pub struct UiState {
     pub pending_toast: Option<String>,
     /// 当前正在飘着的那条 toast。
     pub toast: Option<toast::Toast>,
+
+    // --- F61:导入 .ico。---
+    /// 图标页的「导入…」等着 app 去开文件对话框。与 `pick_key_request` 同一
+    /// 模式:对话框是阻塞调用,只能在 egui 闭包之外另起线程开。
+    pub pick_icon_request: bool,
+    /// 上一次导入图标失败的原因(已是给用户看的文案)。
+    ///
+    /// **不放 `EditorBuffer`**:那个结构整体参与 `is_dirty` 比对,一条错误提示
+    /// 会让「什么都没改成」的表单显示成脏的、切走时白弹一次确认 —— 触碰位
+    /// (`touched`)当初也是为了这个搬到这里的。
+    pub icon_error: Option<String>,
 }
 
 impl UiState {

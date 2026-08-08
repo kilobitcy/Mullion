@@ -667,7 +667,10 @@ kind = "password"
         assert!(bak.contains("name = \"old\""), "备份应是原始 v1 内容");
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 5"), "磁盘上应已是 v5");
+        assert!(
+            now.contains(&format!("schema_version = {CURRENT_SCHEMA}")),
+            "磁盘上应已升到当前版本"
+        );
     }
 
     /// 真实 v2(已是分节嵌套结构,非 v1 扁平结构)的 `sessions.toml`。
@@ -723,7 +726,10 @@ kind = "password"
         );
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 5"), "磁盘上应已升到 v5");
+        assert!(
+            now.contains(&format!("schema_version = {CURRENT_SCHEMA}")),
+            "磁盘上应已升到当前版本"
+        );
     }
 
     #[test]
@@ -888,7 +894,10 @@ port = 7891
         assert!(bak.contains("schema_version = 3"), "备份应是升级前的原文");
 
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 5"), "磁盘上应已升到 v5");
+        assert!(
+            now.contains(&format!("schema_version = {CURRENT_SCHEMA}")),
+            "磁盘上应已升到当前版本"
+        );
     }
 
     #[test]
@@ -1246,7 +1255,7 @@ has_passphrase = false
             !on_disk.contains("MIGRATED-BODY"),
             "私钥内容绝不能落进明文 sessions.toml: {on_disk}"
         );
-        assert!(on_disk.contains("schema_version = 5"));
+        assert!(on_disk.contains(&format!("schema_version = {CURRENT_SCHEMA}")));
     }
 
     /// 私钥文件已经不在了(被删/挪走/权限不足)时,库仍必须能打开 —— 整个

@@ -49,6 +49,8 @@ pub enum UserEvent {
     /// 私钥文件对话框结束。`None` = 用户取消/对话框失败——也要回送,否则
     /// `key_picker_busy` 永远清不掉,以后再点「选择…」就没反应了。
     KeyPathPicked(Option<PathBuf>),
+    /// F61:「导入 .ico…」的结果。`None` = 用户取消 / 对话框起不来。
+    IconPathPicked(Option<PathBuf>),
     /// 主机密钥需要用户确认(F3)。握手线程正挂在 `reply` 上等回答,
     /// **必须**最终发一个 bool 回去或丢弃 sender(丢弃 = 拒绝,fail-closed)。
     /// `Box` 是因为 `HostKeyPrompt` 比其余变体大得多,不装箱会撑大整个枚举。
@@ -166,6 +168,9 @@ pub struct App {
     /// 文件对话框线程是否在跑。防止连点「选择…」开出多个对话框
     /// (Windows 上主窗被 owner 关系禁用,Linux/XDG 未必)。
     key_picker_busy: bool,
+    /// 图标文件对话框是否在跑。跟 `key_picker_busy` 分开 —— 两个按钮在不同
+    /// Tab 上,共用一个标志会让「刚选完私钥」把图标按钮也按不动。
+    icon_picker_busy: bool,
     /// egui 侧有内容待画(菜单展开/hover/弹窗/错误提示)。与「终端来了新字节」是
     /// 两个独立脏源,`frame::frame_is_dirty` 取并集——只看终端字节的话,远端一安静
     /// egui 的交互就被 `RedrawAction::Idle` 吞掉,菜单点不开。
@@ -249,6 +254,7 @@ impl App {
             store: None,
             visible: shell::window_state::Visibility::default(),
             key_picker_busy: false,
+            icon_picker_busy: false,
             ui_dirty: true, // 首帧必须画出来
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
@@ -819,7 +825,7 @@ impl App {
             .map_err(|e| e.to_string())
     }
 
-    /// 私钥文件对话框:另起线程跑,结果经 `proxy` 回送。
+    /// 文件对话框(私钥 / 图标共用):另起线程跑,结果经 `proxy` 回送。
     ///
     /// 两点都是必需的:
     /// 1. **不在事件回调里同步调 `pick_file()`**。egui 闭包跑在 `RedrawRequested`
@@ -830,8 +836,16 @@ impl App {
     ///
     /// `rfd::FileDialog` 自身 `unsafe impl Send`(内部只存 raw handle),
     /// 跨线程用 owner 句柄正是 rfd `AsyncFileDialog` 内部的做法。
-    fn spawn_key_picker(&self) {
-        let mut dialog = rfd::FileDialog::new().set_title("选择私钥文件");
+    fn spawn_file_picker(
+        &self,
+        title: &str,
+        filter: Option<(&str, &[&str])>,
+        done: fn(Option<PathBuf>) -> UserEvent,
+    ) {
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        if let Some((name, exts)) = filter {
+            dialog = dialog.add_filter(name, exts);
+        }
         if let Some(a) = &self.active {
             dialog = dialog.set_parent(a.window.as_ref());
         }
@@ -839,13 +853,12 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("mullion-file-dialog".into())
             .spawn(move || {
-                let picked = dialog.pick_file();
-                let _ = proxy.send_event(UserEvent::KeyPathPicked(picked));
+                let _ = proxy.send_event(done(dialog.pick_file()));
             });
         if let Err(e) = spawned {
             // 起不了线程就退回「没选中」,让 busy 标志复位,UI 不会卡在按不动。
             log::warn!(target: "mullion", "文件对话框线程创建失败: {e}");
-            let _ = self.proxy.send_event(UserEvent::KeyPathPicked(None));
+            let _ = self.proxy.send_event(done(None));
         }
     }
 
@@ -1150,6 +1163,19 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(note) = buf.key_note.take() {
                             self.ui.key_drop_note = Some(note);
                         }
+                    }
+                }
+                self.request_ui_redraw();
+            }
+            UserEvent::IconPathPicked(picked) => {
+                self.icon_picker_busy = false;
+                if let Some(p) = picked {
+                    if let Some(buf) = self.ui.editor.as_mut() {
+                        self.ui.icon_error =
+                            crate::ui::session_manager::import_icon_file(buf, &p, |p| {
+                                std::fs::read(p)
+                            })
+                            .err();
                     }
                 }
                 self.request_ui_redraw();
@@ -1835,7 +1861,17 @@ impl ApplicationHandler<UserEvent> for App {
                 // 「选择…」私钥文件:同样是 egui 闭包只记意图、这里才施加。
                 if std::mem::take(&mut self.ui.pick_key_request) && !self.key_picker_busy {
                     self.key_picker_busy = true;
-                    self.spawn_key_picker();
+                    self.spawn_file_picker("选择私钥文件", None, UserEvent::KeyPathPicked);
+                }
+                // 「导入 .ico…」:同上。加扩展名过滤,免得用户选中 .png 才被
+                // 告知不行 —— 归一化只吃 .ico 容器。
+                if std::mem::take(&mut self.ui.pick_icon_request) && !self.icon_picker_busy {
+                    self.icon_picker_busy = true;
+                    self.spawn_file_picker(
+                        "选择图标文件",
+                        Some(("图标", &["ico"])),
+                        UserEvent::IconPathPicked,
+                    );
                 }
                 // 连接:双击行 / 点「连接」。必须在 store 的 &mut 借用结束后调
                 // (下面 `self.store.as_ref()` 的临时借用在 match 表达式求值完就

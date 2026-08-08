@@ -540,7 +540,9 @@ pub(super) fn show(
                 &mut ui_state.touched,
             ),
             super::TAB_AUTOMATION => super::fields::automation(ui, t, buf, groups),
-            super::TAB_APPEARANCE => super::fields::appearance(ui, t, buf),
+            super::TAB_APPEARANCE => {
+                super::fields::appearance(ui, t, buf, &mut ui_state.icon_error)
+            }
             // `TAB_CONNECT` 与「越界值兜底」合并成同一个分支:`editor_tab`
             // 是既有的裸 usize 技术债,越界值落回首页比 panic 好。
             _ => super::fields::basic(
