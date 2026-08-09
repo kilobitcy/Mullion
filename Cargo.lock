@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-app"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "arboard",
  "base64",
@@ -2524,11 +2524,11 @@ dependencies = [
 
 [[package]]
 name = "mullion-core"
-version = "0.1.26"
+version = "0.1.27"
 
 [[package]]
 name = "mullion-ssh"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "russh",
  "tokio",
@@ -2536,7 +2536,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-store"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "chacha20poly1305",
  "keyring",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-term"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "alacritty_terminal",
  "vte",
