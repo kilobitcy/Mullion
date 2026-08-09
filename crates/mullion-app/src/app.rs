@@ -298,6 +298,59 @@ impl App {
 
     /// UI 侧变了(或 egui 自己要重绘):标脏 + 请求一帧。**两件事必须一起做**——
     /// 只 `request_redraw` 而不标脏,那一帧会在 `frame_is_dirty` 处被判 Idle 丢掉。
+    /// F100 标注模式的事件前置处理。返回 `true` = 这个事件已被标注模式吃掉,
+    /// 调用方不要再往下分流。
+    fn annotate_event(&mut self, event: &WindowEvent) -> bool {
+        use crate::ui::annotate::{self, Hotkey};
+        // `egui::Context` 是 `Arc` 内部可变,clone 是加一次引用计数 —— 这里 clone
+        // 是为了先放掉对 `self.active` 的借用,下面才能改 `self.ui`。
+        let Some(ctx) = self.active.as_ref().map(|a| a.egui_ctx.clone()) else {
+            return false;
+        };
+        let on = annotate::is_on(&ctx);
+        match event {
+            WindowEvent::KeyboardInput { event: ke, .. } => {
+                if ke.state != ElementState::Pressed {
+                    return false;
+                }
+                let Some((key, mods)) = input::translate_key(ke, self.mods) else {
+                    return false;
+                };
+                let Some(hk) = annotate::hotkey(key, mods, on) else {
+                    return false;
+                };
+                match hk {
+                    Hotkey::Toggle => {
+                        let now = annotate::toggle(&ctx);
+                        self.ui.set_toast(if now {
+                            "标注模式:点选位置,Ctrl+Shift+E 导出"
+                        } else {
+                            "已退出标注模式"
+                        });
+                    }
+                    Hotkey::Export => annotate::request_export(&ctx),
+                    Hotkey::CycleDetail => {
+                        annotate::cycle_detail(&ctx);
+                    }
+                    Hotkey::Exit => {
+                        annotate::exit(&ctx);
+                        self.ui.set_toast("已退出标注模式");
+                    }
+                }
+                self.request_ui_redraw();
+                true
+            }
+            // 悬停描边是我们自己画在 overlay 上的,不赌 egui 会替它请求重绘 ——
+            // 不标脏的话描边会卡在上一帧的位置,看着像「鼠标不跟手」。
+            // **不消费**:这个事件还要照旧喂给 egui 维护 hover。
+            WindowEvent::CursorMoved { .. } if on => {
+                self.ui_dirty = true;
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn request_ui_redraw(&mut self) {
         self.ui_dirty = true;
         if let Some(a) = &self.active {
@@ -1225,6 +1278,13 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         diag::mark(diag::Stage::WindowEvent);
+        // F100:标注模式的快捷键必须在下面那段输入分流**之前**截。会话管理器
+        // 开着时 `modal` 为真,键盘整段判给 egui 并直接 `return`,走不到
+        // `KeyboardInput` 分支里 `Ctrl+Shift+C/V` 那个位置 —— 而标注模式最主要的
+        // 用处恰好就是标注会话管理器,放在下面等于「在最需要它的界面里按不出来」。
+        if self.annotate_event(&event) {
+            return;
+        }
         // 输入分流(§4.5)。**键盘与指针的顺序是反的,不是笔误**:
         // - 指针:先喂 egui 再判。egui 要靠 `CursorMoved` 维护 hover,不喂就没有
         //   `wants_pointer_input()` 可言。
@@ -1662,6 +1722,13 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui_dirty = true;
                                     self.spawn_fresh_panes(fresh);
                                 }
+                            }
+                            // F100:导出的 Markdown 送剪贴板。写剪贴板是 IO,`ui/`
+                            // 那一层只画不做 IO,所以在这里发起(同 F18 的复制路径)。
+                            if let Some(md) = actions.annotate_export {
+                                self.clipboard.set(&md);
+                                self.ui.set_toast("标注已复制,粘进 Claude Code");
+                                self.ui_dirty = true;
                             }
                             // F83 标题条开关:改的是行数,下一帧 compute_geoms
                             // 算出新 grid,再由 apply_geometry 发 window_change。
@@ -2160,7 +2227,10 @@ fn render_frame(
         // `UiActions` 没有 derive `PartialEq`,这里是逐字段手写的"是否有真实动作"——
         // 给 `UiActions` 加新字段时必须在这里补上对应的 `.is_some()`(或等价判断),
         // 否则新动作会在上面文档注释说的 discard 趟里被静默丢弃。
-        if this_pass.preset.is_some() || this_pass.close_pane.is_some() {
+        if this_pass.preset.is_some()
+            || this_pass.close_pane.is_some()
+            || this_pass.annotate_export.is_some()
+        {
             actions = this_pass;
         }
     });
@@ -2450,6 +2520,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
                 close_pane: None,
+                ..Default::default()
             },
         )
         .expect("点了预设,动作不该是 None");
@@ -2478,6 +2549,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoTopBottom),
                 close_pane: None,
+                ..Default::default()
             },
         )
         .expect("点了预设,动作不该是 None");
@@ -2496,6 +2568,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
                 close_pane: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2516,6 +2589,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: None,
                 close_pane: Some(target),
+                ..Default::default()
             },
         )
         .expect("点了关闭,动作不该是 None");
@@ -2554,6 +2628,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
                 close_pane: None,
+                ..Default::default()
             },
         )
         .expect("点了预设,动作不该是 None");
@@ -2565,6 +2640,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: Some(Preset::Single),
                 close_pane: None,
+                ..Default::default()
             },
         )
         .expect("点了预设,动作不该是 None");
@@ -2604,6 +2680,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: Some(Preset::Single),
                 close_pane: None,
+                ..Default::default()
             },
         )
         .expect("点了预设,动作不该是 None");
@@ -2615,6 +2692,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: None,
                 close_pane: Some(only_id),
+                ..Default::default()
             },
         );
         assert!(
@@ -2691,6 +2769,7 @@ mod tests {
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoLeftRight),
                 close_pane: None,
+                ..Default::default()
             },
         )
         .expect("点了预设,动作不该是 None");

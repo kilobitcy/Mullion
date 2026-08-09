@@ -35,6 +35,12 @@ use crate::theme::{self, Theme};
 
 use super::UiState;
 
+/// 第 `i` 个编辑器 Tab 的标题(F100 导出要写「当下在看哪一页」)。
+/// 名字只有 `editor::TABS` 一处真源,别在调用方重起一份。
+pub(crate) fn tab_title(i: usize) -> &'static str {
+    editor::TABS.get(i).copied().unwrap_or("?")
+}
+
 /// 设计稿 §3:880×560 单窗,左栏定宽 300。
 pub(crate) const WINDOW_W: f32 = 880.0;
 pub(crate) const WINDOW_H: f32 = 560.0;

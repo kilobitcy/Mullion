@@ -1,4 +1,5 @@
 //! egui UI 构建,与 app 事件循环解耦。build_ui 每帧在 egui ctx.run 闭包里调。
+pub mod annotate;
 pub mod badge;
 pub mod chrome;
 pub mod group_manager;
@@ -298,6 +299,12 @@ pub struct UiActions {
     pub preset: Option<crate::shell::workspace::Preset>,
     /// 点了某个 pane 标题条上的 ×。
     pub close_pane: Option<mullion_core::layout::PaneId>,
+    /// F100:标注模式导出的 Markdown,等着送剪贴板。
+    ///
+    /// 走 `UiActions` 而不是让 `annotate` 自己写剪贴板:剪贴板是 IO,而
+    /// `ui/` 下这一层是纯 egui 绘制,IO 一律由 `app.rs` 统一发起(同 F18 的
+    /// 复制路径)。
+    pub annotate_export: Option<String>,
 }
 
 /// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
@@ -386,7 +393,46 @@ pub fn build_ui(
     // 标题条最后画:它用绝对坐标,而坐标依赖上面几个 Panel 定完的中央区。
     // Area 不参与 Panel 的空间分配,所以放在 available_rect 之后不影响换算。
     actions.close_pane = pane_title::show(ctx, t, frame.titles);
+
+    // F100 标注模式:**必须是最后一步**。它要读的是本帧所有 `annotate::mark()`
+    // 登记完之后的候选表,而且铺的那层「吃指针」Area 得盖在包括 toast 在内的
+    // 所有东西上面。
+    annotate::overlay(ctx, t, &annotate_env(ctx, ui_state, &frame));
+    actions.annotate_export = annotate::take_export(ctx);
     actions
+}
+
+/// 攒出 F100 导出时写在开头那行的全局上下文。
+///
+/// **只放「Claude 从代码里看不出来的运行时事实」**:窗口多大、缩放多少、当下
+/// 在看哪个界面、开了几个 pane。逐 widget 的样式值一律不进(共识第 3 条)——
+/// 那些读代码更准,写进来只会让人以为它是权威。
+fn annotate_env(ctx: &egui::Context, ui_state: &UiState, frame: &UiFrame<'_>) -> annotate::Env {
+    let screen = if ui_state.session_manager_open {
+        match ui_state.editor_id {
+            // Tab 名跟 `session_manager::editor` 那边的顺序同源,别在这儿重新起名。
+            Some(_) => format!(
+                "会话管理器(编辑器「{}」页)",
+                session_manager::tab_title(ui_state.editor_tab)
+            ),
+            None => "会话管理器(未选中会话)".to_string(),
+        }
+    } else if ui_state.group_manager_open {
+        "分组管理器".to_string()
+    } else {
+        "主界面(终端)".to_string()
+    };
+    let mut extra = vec![format!("{} 个 pane", frame.panes.max(1))];
+    if frame.connected {
+        extra.push("已连接".into());
+    }
+    annotate::Env {
+        size: ctx.screen_rect().size(),
+        ppp: ctx.pixels_per_point(),
+        theme: "mullion-dark".into(),
+        screen,
+        extra,
+    }
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use mullion_store::{GroupRecord, SessionRecord};
 /// 四个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
 /// 「高级」已并入「连接」(走查 P1-8):那一页只有一行代理,右侧 70% 是空白,
 /// 而代理跟主机/端口/跳板本来就是同一个「怎么连上去」的决策。
-const TABS: [&str; 4] = ["连接", "认证", "登录后", "图标"];
+pub(super) const TABS: [&str; 4] = ["连接", "认证", "登录后", "图标"];
 
 /// 底部按钮为什么点不动。两个原因是并集,`Missing` 优先 ——
 /// 表单都没填齐,就没必要提「测试连接进行中」。
