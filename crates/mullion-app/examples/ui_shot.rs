@@ -167,6 +167,13 @@ fn shoot(opts: &Opts) -> Result<String, String> {
             );
         });
 
+    // 跟产品同一条路(`app.rs` 里 egui ctx 建好之后就调这一句)。**漏了它图就在
+    // 骗人**:`session_manager` 里手绘的部分自带主题色,但 egui 自己的部件
+    // (按钮、`TextEdit`、`CollapsingHeader` 的三角、滚动条)全走 `Style`,不调
+    // 就是 egui 出厂的默认深色,不是这个应用真正长的样子。第一版 harness 漏了
+    // 这句,于是滚动条按 egui 默认样式画(静止态 alpha 0),图上完全看不见。
+    mullion_app::theme::apply_egui(&harness.ctx, &theme);
+
     // 字体必须在跑帧之前装:`set_fonts` 只影响之后的帧,第一帧已经按内嵌拉丁
     // 字体排完版了。
     let font = install_dev_cjk_font(&harness.ctx);

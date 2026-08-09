@@ -70,6 +70,19 @@ MULLION_UI_SHOT_FONT=/path/to/msyh.ttc         # 或显式指定
 从 Windows 拷来即可（**不入库、不推送**）。没装到时程序会在输出里显式警告，
 那种图上**不要**对中文文本下任何结论。
 
+## 坑：必须调 `theme::apply_egui`，否则图在骗人
+
+`session_manager` 里**手绘**的部分（会话行、状态点、色条）自带主题色，看着像对的；
+但 egui 自己的部件——按钮、`TextEdit`、`CollapsingHeader` 的三角、**滚动条**——
+全部走全局 `Style`。不调 `apply_egui` 就是 egui 出厂的默认深色，跟实机不是一套。
+
+harness 第一版漏了这一句，代价是：滚动条按 egui 默认样式画（静止态 alpha = 0），
+图上完全看不见，我据此报了一个「列表溢出且没有滚动条」的错误结论——实际滚动一直
+是好的，只是那条滚动条在静止时被画成了全透明。
+
+**任何新增的 harness 场景都要走同一条初始化路径**（`apply_egui` + 中文字体），
+顺序是「建 `Harness` → `apply_egui` → 装字体 → `run()`」：后两者都只影响之后的帧。
+
 ## 坑：`egui` 与 `egui-winit` 的 `accesskit` feature 必须同步
 
 `egui_kittest` 给 `egui` 开 `accesskit`，于是 `egui::PlatformOutput` 多出
