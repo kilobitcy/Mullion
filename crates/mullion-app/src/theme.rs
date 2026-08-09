@@ -238,10 +238,13 @@ pub fn stroke(t: &Theme) -> egui::Stroke {
     egui::Stroke::new(1.0, egui::Color32::from_white_alpha(t.stroke_alpha))
 }
 
-/// 把主题写进 egui 的 `Visuals`。启动时对 egui ctx 调一次。
+/// 把主题写进 egui 的 `Visuals`(外加一处 `Spacing::scroll`,见下)。启动时对
+/// egui ctx 调一次。
 ///
-/// 只设 `Visuals`,不碰 `Spacing`——栏高由各 panel 自己的 `Frame` 内边距决定
-/// (见 `ui::chrome`),混在一起改会让两边互相打架。
+/// **不碰 `Spacing` 里跟尺寸/间距有关的任何一项**——栏高由各 panel 自己的
+/// `Frame` 内边距决定(见 `ui::chrome`),混在一起改会让两边互相打架。
+/// 唯一的例外是 `Spacing::scroll`:它不参与任何布局尺寸的推导,且 egui 的默认
+/// 值有个必须纠正的行为,见 `scroll_style` 的注释。
 pub fn apply_egui(ctx: &egui::Context, t: &Theme) {
     let mut v = egui::Visuals::dark();
 
@@ -291,6 +294,33 @@ pub fn apply_egui(ctx: &egui::Context, t: &Theme) {
     v.widgets.open.rounding = round;
 
     ctx.set_visuals(v);
+    ctx.style_mut(|s| s.spacing.scroll = scroll_style());
+}
+
+/// 滚动条样式。**唯一改动是让静止状态的滑块可见**。
+///
+/// egui 的默认是 `ScrollStyle::floating()`,其中 `dormant_handle_opacity = 0.0`
+/// ——指针不在滚动区里时,滑块的 alpha 是 **0**,整条滚动条彻底不存在
+/// (见 egui-0.30.0 `containers/scroll_area.rs` 里 `handle_opacity` 的
+/// `lerp(dormant..=active, is_hovering_outer_rect_t)`)。后果:会话列表底下还压着
+/// 几条会话时,屏幕上**没有任何提示**——用户以为列表就这么长。离屏截图 harness
+/// (`examples/ui_shot.rs`)的第一批产出就是这么发现的:12 条会话只看得见 9 条,
+/// 而滚动本身是好的。
+///
+/// 为什么不换成 `ScrollStyle::solid()`:solid 的 `foreground_color = false`,滑块色取
+/// `widgets.inactive.bg_fill` = `sunken_bg`,而轨道底色取 `extreme_bg_color`
+/// ——本主题里这两个 token **同值**(都是 `sunken_bg`),滑块会跟轨道糊成一片,
+/// 换了个方式继续隐形。而且 solid 恒占 10px 宽,列表行跟着变窄,已冻结的尺寸
+/// 规格(F80/F81)和三档密度阈值都得跟着重算。
+///
+/// 所以保留 floating(不占宽度、悬停自动变粗),只把静止态的透明度从 0 抬起来。
+/// 0.45 是「看得出有一条,但不抢视线」——具体数值只有人眼能定,harness 出的图
+/// 只能证明它非零可见。
+fn scroll_style() -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        dormant_handle_opacity: 0.45,
+        ..egui::style::ScrollStyle::floating()
+    }
 }
 
 #[cfg(test)]

@@ -269,16 +269,42 @@ pub(crate) fn protocol_pill(p: mullion_store::Protocol) -> Option<&'static str> 
     }
 }
 
+/// 协议标签的内边距、与名字之间的间距。抽成常量是因为算「名字还剩多少宽度」
+/// 时要用同一组数 —— 两处写死同一个数字迟早分叉,那时名字会把 pill 挤出行外。
+const PILL_PAD: egui::Vec2 = egui::vec2(5.0, 1.0);
+const PILL_GAP: f32 = 6.0;
+
+/// 先把协议标签的文字排好版但不画。分两步是为了在画名字**之前**就知道 pill
+/// 要占多宽(名字的截断宽度得先扣掉它)。
+fn pill_galley(p: &egui::Painter, t: &Theme, text: &str) -> std::sync::Arc<egui::Galley> {
+    p.layout_no_wrap(
+        text.to_string(),
+        egui::FontId::proportional(10.0),
+        theme::c32(t.fg_muted),
+    )
+}
+
+/// pill 的整体占宽(含内边距和左侧间距)。
+fn pill_w(g: &egui::Galley) -> f32 {
+    PILL_GAP + g.size().x + PILL_PAD.x * 2.0
+}
+
 /// 画协议标签。**中性灰**(`sunken_bg` 底 + `fg_muted` 字),不碰 F62 的语义
 /// 配色 —— 那套色是用户自己赋的含义,协议是客观事实,混一起两边都读不准。
-fn paint_pill(p: &egui::Painter, t: &Theme, left_top: egui::Pos2, text: &str) {
-    let font = egui::FontId::proportional(10.0);
-    let galley = p.layout_no_wrap(text.to_string(), font, theme::c32(t.fg_muted));
-    let pad = egui::vec2(5.0, 1.0);
-    let rect = egui::Rect::from_min_size(left_top, galley.size() + pad * 2.0);
+fn paint_pill(
+    p: &egui::Painter,
+    t: &Theme,
+    left_top: egui::Pos2,
+    galley: std::sync::Arc<egui::Galley>,
+) {
+    let rect = egui::Rect::from_min_size(left_top, galley.size() + PILL_PAD * 2.0);
     p.rect_filled(rect, egui::Rounding::same(4.0), theme::c32(t.sunken_bg));
-    p.galley(rect.min + pad, galley, theme::c32(t.fg_muted));
+    p.galley(rect.min + PILL_PAD, galley, theme::c32(t.fg_muted));
 }
+
+/// 文字右侧必须留出的空白:F62 语义色竖条 3px + 5px 呼吸。名称和副标题的可用
+/// 宽度都要先扣掉它 —— 不扣的话字会压在竖条上。
+const TEXT_RIGHT_PAD: f32 = crate::ui::badge::EDGE_BAR_W + 5.0;
 
 /// 一行会话的**内容**:语义色竖条 + 状态点 + 图标 + 两行文字。背景与选中条不在
 /// 这里(那两样只对真列表行有意义)。
@@ -346,24 +372,36 @@ fn paint_row_body(
         Density::Compact => rect.center().y - 9.0,
         _ => rect.top() + 7.0,
     };
+    let text_left = rect.left() + text_x(d);
+    // 两行文字共同的可用宽度。行本身是 `allocate_exact_size` 给的固定矩形,
+    // 超出去的部分被 `ScrollArea` 的 clip **硬裁**(没有省略号),用户看到的是
+    // 一个从中间断掉的 host —— 这正是要修的。
+    let text_avail = (rect.right() - TEXT_RIGHT_PAD - text_left).max(0.0);
+
+    // 协议 pill 挂在名字右边,所以名字的可用宽度要**先**扣掉它。不扣的话名字
+    // 会一路截断到右边缘,pill 100% 被挤到行外(整条看不见)。
+    let pill = protocol_pill(protocol).map(|tag| pill_galley(p, t, tag));
+    let name_avail = (text_avail - pill.as_ref().map_or(0.0, |g| pill_w(g))).max(0.0);
+
     let name_rect = paint_highlighted(
         p,
-        egui::pos2(rect.left() + text_x(d), name_y),
+        egui::pos2(text_left, name_y),
         name,
         query,
         egui::FontId::proportional(14.0),
         theme::c32(t.fg),
         t,
+        name_avail,
     );
-    if let Some(tag) = protocol_pill(protocol) {
-        paint_pill(p, t, name_rect.right_top() + egui::vec2(6.0, 1.0), tag);
+    if let Some(g) = pill {
+        paint_pill(p, t, name_rect.right_top() + egui::vec2(PILL_GAP, 1.0), g);
     }
     if d == Density::Compact {
         return;
     }
     paint_highlighted(
         p,
-        egui::pos2(rect.left() + text_x(d), rect.top() + 25.0),
+        egui::pos2(text_left, rect.top() + 25.0),
         sub,
         query,
         egui::FontId::proportional(11.0),
@@ -372,14 +410,24 @@ fn paint_row_body(
         // (禁用态、装饰线)是对的。
         theme::c32(t.fg_dimmer),
         t,
+        text_avail,
     );
 }
 
-/// 画一行文字,命中搜索的那几段染成 accent(走查 22)。返回它占的矩形
-/// (协议 pill 要挂在名字右边)。
+/// 画一行文字,命中搜索的那几段染成 accent(走查 22),**超过 `max_width` 的部分
+/// 用省略号收掉**。返回它占的矩形(协议 pill 要挂在名字右边)。
 ///
 /// 用一个 `LayoutJob` 分段着色而不是画好几次 `p.text`:后者要自己算每段的
 /// 宽度再累加,一遇到连字/CJK 混排就对不齐。
+///
+/// 原来还有一条「没在搜索就走 `p.text`」的快路径,已经删掉:`Painter::text`
+/// 内部走 `layout_no_wrap`(`max_width = INFINITY`),文字想画多长画多长,超出
+/// 行矩形的部分被外层 clip 硬裁 —— 于是长 host 显示成从中间断掉的
+/// `ubuntu@very-long-hostname.internal.examp`,既没有省略号也没有任何「后面还有」
+/// 的提示。省一次 `LayoutJob` 分配换来这个,不值。
+///
+/// `TextWrapping::truncate_at_width` 带 `break_anywhere: true` —— 对 hostname 和
+/// CJK 都对:不该为了凑词边界而把断点提前一大截。
 #[allow(clippy::too_many_arguments)]
 fn paint_highlighted(
     p: &egui::Painter,
@@ -389,13 +437,13 @@ fn paint_highlighted(
     font: egui::FontId,
     color: egui::Color32,
     t: &Theme,
+    max_width: f32,
 ) -> egui::Rect {
     let segs = super::highlight::segments(text, query);
-    // 一段且没命中 = 绝大多数情况(没在搜索),走最短的路,不建 LayoutJob。
-    if segs.len() == 1 && !segs[0].1 {
-        return p.text(pos, egui::Align2::LEFT_TOP, text, font, color);
-    }
-    let mut job = egui::text::LayoutJob::default();
+    let mut job = egui::text::LayoutJob {
+        wrap: egui::text::TextWrapping::truncate_at_width(max_width),
+        ..Default::default()
+    };
     for (piece, hit) in &segs {
         job.append(
             piece,
@@ -1265,6 +1313,154 @@ mod tests {
             ui_state.connect_skip_automation,
             "点「连接(跳过自动化)」必须设 connect_skip_automation,否则只是\
              普通连接——用户点了跳过自动化,自动化却照样跑了"
+        );
+    }
+
+    /// 找到含 `needle` 的那个 `TextShape`,连它所在的 clip 矩形一起回。
+    /// 判「有没有被硬裁」必须两样都有:光有 galley 只知道文字多宽,不知道
+    /// 容器允许它多宽。
+    fn find_clipped_text(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Option<(std::sync::Arc<egui::Galley>, egui::Pos2, egui::Rect)> {
+        fn walk(
+            shape: &egui::Shape,
+            clip: egui::Rect,
+            needle: &str,
+        ) -> Option<(std::sync::Arc<egui::Galley>, egui::Pos2, egui::Rect)> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, clip, needle)),
+                egui::Shape::Text(ts) if ts.galley.job.text.contains(needle) => {
+                    Some((ts.galley.clone(), ts.pos, clip))
+                }
+                _ => None,
+            }
+        }
+        shapes
+            .iter()
+            .find_map(|cs| walk(&cs.shape, cs.clip_rect, needle))
+    }
+
+    /// 用给定宽度渲染一次左栏。**宽度必须显式给**:它同时决定密度档和文字的
+    /// 截断宽度,而 `RawInput::default()` 不带 `screen_rect`,egui 会兜底成一个
+    /// 极宽的矩形,再长的 host 也撑不满,截断类的测试会恒绿。
+    ///
+    /// 也调 `apply_egui`:滚动条样式挂在全局 `Style` 上,不调的话测的是 egui
+    /// 的默认样式,不是这个应用真正跑的那套。
+    fn run_list_sized(sessions: &[SessionRecord], size: egui::Vec2) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+        crate::theme::apply_egui(&ctx, &t);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let mut out = None;
+        // `ScrollArea` 第一帧还不知道内容有多高,滚动条要到下一帧才决定画不画
+        // (`show_scroll_this_frame` 取自上一帧存下的 `State`)。跑三帧取最后一帧。
+        for _ in 0..3 {
+            out = Some(ctx.run(input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        &mut ui_state,
+                        sessions,
+                        &groups,
+                        None,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
+                });
+            }));
+        }
+        out.unwrap()
+    }
+
+    /// 长 `user@host` 必须用省略号收掉,不能画出行外让 clip 硬裁。
+    ///
+    /// 离屏截图 harness 的第一批产出就是撞在这儿:副标题显示成
+    /// `ubuntu@very-long-hostname.internal.examp` —— 从中间断掉、没有省略号、
+    /// 也没有任何「后面还有」的提示,用户没法判断自己看到的是完整主机名还是
+    /// 半截。根因是 `Painter::text` 走 `layout_no_wrap`(`max_width = INFINITY`)。
+    ///
+    /// 自证会变红:把 `paint_highlighted` 里的
+    /// `TextWrapping::truncate_at_width(max_width)` 换成 `TextWrapping::default()`
+    /// (= `no_max_width`),这条立刻报「文字右边缘超出 clip」。
+    #[test]
+    fn a_long_host_is_elided_with_an_ellipsis_instead_of_being_hard_clipped() {
+        let mut r = rec(1, "短名", "very-long-hostname.internal.example.com", &[]);
+        r.auth.user = "ubuntu".into();
+        // 280 = `LIST_W`,左栏的默认宽度,也就是用户实际看到的那一档。
+        let out = run_list_sized(&[r], egui::vec2(280.0, 400.0));
+        let (galley, pos, clip) =
+            find_clipped_text(&out.shapes, "ubuntu@").expect("副标题应该已经画出来了");
+
+        assert!(
+            pos.x + galley.size().x <= clip.max.x + 0.5,
+            "副标题右边缘 {} 超出了 clip 右边缘 {} —— 超出的字被硬裁,用户看到\
+             一个从中间断掉的主机名",
+            pos.x + galley.size().x,
+            clip.max.x
+        );
+        // 只测「没超出」还不够:宽度足够时它天然不超,断言会恒绿。必须同时
+        // 证明**截断真的发生了**,而且是以省略号收尾。
+        let last = galley
+            .rows
+            .last()
+            .and_then(|row| row.glyphs.last())
+            .map(|g| g.chr);
+        assert_eq!(
+            last,
+            Some('…'),
+            "这么长的 host 在 280 宽的左栏里必须被截断并以省略号收尾,实际末\
+             字符是 {last:?}"
+        );
+    }
+
+    /// 内容比视口高时,滚动条的滑块在**指针不在列表里**的时候也必须看得见。
+    ///
+    /// egui 默认 `ScrollStyle::floating()` 的 `dormant_handle_opacity = 0.0`
+    /// ——静止时整条滚动条 alpha 为 0。后果:12 条会话只看得见 9 条,屏幕上
+    /// 没有任何提示,用户以为列表就这么长(滚动本身一直是好的,这也是离屏
+    /// 截图 harness 的产出之一)。
+    ///
+    /// 判据取「画出来的那个窄竖条 alpha 非零」而不是去读 `Style` 里的数字:
+    /// 后者只证明配置写对了,证不到 egui 真的按它画。宽度上界取 2.5 是为了跟
+    /// 行内其它 3px 竖条区分开(选中态 accent 条、F62 语义色条)——本测试
+    /// 既不选中任何行、也不给任何语义色,那两条压根不会画。
+    ///
+    /// 自证会变红:把 `theme::scroll_style` 里的 `dormant_handle_opacity: 0.45`
+    /// 删掉(退回 `floating()` 的 0.0),这条立刻报找不到可见的滑块。
+    #[test]
+    fn scrollbar_handle_stays_visible_when_the_pointer_is_not_over_the_list() {
+        let sessions: Vec<SessionRecord> = (1..=12)
+            .map(|i| rec(i, &format!("节点 {i:02}"), "192.0.2.10", &[]))
+            .collect();
+        // 300 高装不下 12 行(每行 44 + 分组头),必然溢出。整个渲染过程不喂
+        // 任何指针事件,所以滚动条全程处于 dormant 态。
+        let out = run_list_sized(&sessions, egui::vec2(280.0, 300.0));
+
+        fn find_thin_bar(shape: &egui::Shape) -> Option<egui::Color32> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(find_thin_bar),
+                egui::Shape::Rect(r)
+                    if r.rect.width() > 0.0
+                        && r.rect.width() <= 2.5
+                        && r.rect.height() >= 20.0
+                        && r.fill.a() > 0 =>
+                {
+                    Some(r.fill)
+                }
+                _ => None,
+            }
+        }
+        let handle = out.shapes.iter().find_map(|cs| find_thin_bar(&cs.shape));
+        assert!(
+            handle.is_some(),
+            "列表内容溢出,但静止状态下画不出一条可见的滚动条滑块 —— 用户看\
+             不出下面还压着几条会话"
         );
     }
 
