@@ -8,6 +8,7 @@ use mullion_store::model::SessionRecord;
 use mullion_store::{GroupRecord, SessionId};
 
 use crate::theme::{self, Theme};
+use crate::ui::annotate;
 use crate::ui::session_manager::{group_header, SwitchTarget};
 use crate::ui::UiState;
 
@@ -582,11 +583,12 @@ pub(super) fn show(
     appearance: &crate::ui::badge::AppearanceCache,
 ) {
     // 搜索框
-    ui.add(
+    let search_resp = ui.add(
         egui::TextEdit::singleline(&mut ui_state.search)
             .hint_text(theme::hint_text(t, "搜索名称 / 主机 / 标签"))
             .desired_width(f32::INFINITY),
     );
+    annotate::mark(ui.ctx(), "会话管理器/左栏/搜索框", search_resp.rect);
     ui.add_space(8.0);
 
     // 待确认删除的目标一旦这一帧没被真正渲染出来 —— 原因可能是搜索词把它
@@ -629,7 +631,9 @@ pub(super) fn show(
         .show_inside(ui, |ui| {
             ui.separator();
             ui.horizontal(|ui| {
-                if new_button(ui).clicked() {
+                let b = new_button(ui);
+                annotate::mark(ui.ctx(), "会话管理器/左栏/新建按钮", b.rect);
+                if b.clicked() {
                     ui_state.pending_switch = Some(SwitchTarget::NewDraft);
                 }
             });
@@ -686,7 +690,7 @@ pub(super) fn show(
                 // 搜索期间强制展开:`default_open` 只在 CollapsingState 首次
                 // 加载时生效,用户手动折叠过就被持久化进 ctx.data(),再也展不开。
                 let force = if searching { Some(true) } else { None };
-                group_header(&title, gid, members.len())
+                let header = group_header(&title, gid, members.len())
                     .open(force)
                     .show(ui, |ui| {
                         for r in &members {
@@ -705,6 +709,13 @@ pub(super) fn show(
                             );
                         }
                     });
+                // 只标表头那一条,不标展开后的整块:整块必然包含每一行,而 hit test
+                // 取面积最小者,标了也只会在「点到行与行之间的空隙」时才命中。
+                annotate::mark(
+                    ui.ctx(),
+                    format!("会话管理器/左栏/分组头「{title}」"),
+                    header.header_response.rect,
+                );
             }
             if hidden > 0 {
                 ui.add_space(4.0);
@@ -774,6 +785,13 @@ fn row(
         None => format!("{}@{}", rec.auth.user, rec.connection.host),
     };
     let resp = session_row(ui, t, rec, &sub, selected, status, a, &ui_state.search, d);
+    // 带上会话名:同一个插桩点会登记出十几行,只写「会话行」的话导出里全是
+    // 一模一样的路径,读的人分不出说的是哪一行。
+    annotate::mark(
+        ui.ctx(),
+        format!("会话管理器/左栏/会话行「{}」", rec.identity.name),
+        resp.rect,
+    );
     if resp.clicked() {
         ui_state.pending_switch = Some(SwitchTarget::Session(rec.id));
     }

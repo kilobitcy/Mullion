@@ -5,6 +5,7 @@ use egui::Ui;
 use mullion_store::{GroupRecord, Protocol, SessionId, SessionRecord, TmuxChoice};
 
 use crate::theme::Theme;
+use crate::ui::annotate;
 use crate::ui::metrics::{
     button_reserve, field_w, FIELD_W_L, FIELD_W_M, FIELD_W_S, LABEL_COL_W, TEXT_EDIT_MARGIN_X,
 };
@@ -58,10 +59,18 @@ fn section(ui: &mut Ui, t: &Theme, title: &str, first: &mut bool) {
     }
     *first = false;
     ui.add_space(SP_XS);
-    ui.label(
+    let head = ui.label(
         egui::RichText::new(title)
             .size(11.0)
             .color(crate::theme::c32(t.fg_muted)),
+    );
+    // F100:标的是**分节标题这一行**,不是分节整块 —— `section` 只画标题、不
+    // 持有内容闭包,拿不到整块的 rect。要标整块得把这个函数改成包住内容的
+    // 容器,那是另一回事。指标题够用:人说的是「『代理』这一节太挤」。
+    annotate::mark(
+        ui.ctx(),
+        format!("会话管理器/右栏/分节「{title}」"),
+        head.rect,
     );
     ui.add_space(SP_XS);
 }

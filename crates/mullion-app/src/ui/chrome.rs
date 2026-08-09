@@ -1,4 +1,5 @@
 //! 菜单栏(含居中的布局预设按钮组)+ 状态栏。
+use super::annotate;
 use super::toolbar;
 use super::UiState;
 use crate::shell::workspace::Preset;
@@ -29,7 +30,7 @@ pub fn top_menu(
     // 菜单栏与状态栏底色不同(§2.1),Visuals::panel_fill 只有一个值,
     // 所以各自带 Frame。
     let mut clicked = None;
-    egui::TopBottomPanel::top("menu")
+    let bar = egui::TopBottomPanel::top("menu")
         .exact_height(menu_px())
         .frame(
             egui::Frame::none()
@@ -85,6 +86,7 @@ pub fn top_menu(
                 }
             });
         });
+    annotate::mark(ctx, "菜单栏", bar.response.rect);
     clicked
 }
 
@@ -121,7 +123,7 @@ pub fn status_bar(
     session_color: Option<egui::Color32>,
 ) {
     let (left, right) = status_text(panes, connected);
-    egui::TopBottomPanel::bottom("status")
+    let bar = egui::TopBottomPanel::bottom("status")
         .frame(
             egui::Frame::none()
                 .fill(theme::c32(t.bar_status))
@@ -160,6 +162,7 @@ pub fn status_bar(
                 });
             });
         });
+    annotate::mark(ctx, "状态栏", bar.response.rect);
 }
 
 #[cfg(test)]
@@ -234,6 +237,34 @@ mod tests {
             );
         });
         count_shapes(&out.shapes)
+    }
+
+    /// F100:菜单栏与状态栏也要登记 —— 走查里「状态栏那行字太靠边」这类反馈
+    /// 很常见,标不到它就得回到「用嘴描述」。
+    ///
+    /// 自证会变红:注释掉 `top_menu` / `status_bar` 末尾任一句 `annotate::mark`。
+    #[test]
+    fn annotate_mode_registers_the_menu_and_status_bars() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        annotate::toggle(&ctx);
+        let mut paths = Vec::new();
+        // 同 `run_status`:面板首帧 `fade_in`,跑两帧再取。
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                top_menu(ctx, &crate::theme::MULLION_DARK, &mut ui_state, true, None);
+                status_bar(ctx, &crate::theme::MULLION_DARK, 1, true, None, None, None);
+                paths = annotate::spot_paths(ctx);
+            });
+        }
+        assert!(
+            paths.iter().any(|p| p == "菜单栏"),
+            "菜单栏没登记:{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "状态栏"),
+            "状态栏没登记:{paths:?}"
+        );
     }
 
     /// F62:状态栏的会话色是**画**出来的一个小色块,不是拼进文本的字形。

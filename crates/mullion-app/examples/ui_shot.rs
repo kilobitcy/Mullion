@@ -24,6 +24,7 @@
 use egui_kittest::wgpu::TestRenderer;
 use egui_kittest::Harness;
 use mullion_app::theme::MULLION_DARK;
+use mullion_app::ui::annotate;
 use mullion_app::ui::badge::AppearanceCache;
 use mullion_app::ui::session_manager::{self, EditorBuffer, SecretPresence};
 use mullion_app::ui::UiState;
@@ -40,6 +41,10 @@ const SCENES: &[(&str, &str)] = &[
     ("list-12", "12 条会话 / 3 分组,默认密度档"),
     ("long-names", "超长中文会话名 + 长 host:验截断与换行"),
     ("editor-basic", "选中一条并打开编辑器,停在「基础」页"),
+    (
+        "annotate",
+        "F100 标注模式:开着 + 已选中两处(看编号徽标与描边的位置)",
+    ),
 ];
 
 /// 一个场景摊平后的全部入参。`session_manager::show` 是纯数据入参(零 `App`、
@@ -150,6 +155,9 @@ fn shoot(opts: &Opts) -> Result<String, String> {
     appearance.rebuild(&sessions, &groups);
     let theme = MULLION_DARK;
 
+    // F100 场景:标注模式的 overlay 在产品里由 `build_ui` 末尾调,这里的闭包只画
+    // 会话管理器,所以得自己补上那一句 —— 顺序也必须一样(所有 `mark()` 之后)。
+    let annotate_scene = opts.scene == "annotate";
     let mut harness = Harness::builder()
         .with_size(opts.size)
         .with_pixels_per_point(opts.ppp)
@@ -165,7 +173,28 @@ fn shoot(opts: &Opts) -> Result<String, String> {
                 presence,
                 &appearance,
             );
+            if annotate_scene {
+                // 摆出「已选中两处」。按**语义路径**选,不去猜像素坐标:
+                // 坐标一改布局就失效,而且图错了分不清是坐标错还是 UI 错。
+                // 幂等,可以每帧无脑调;必须在 `overlay` 之前(它会清 spots)。
+                annotate::ensure_picked(ctx, "左栏/搜索框");
+                annotate::ensure_picked(ctx, "会话行「节点 03」");
+                annotate::overlay(
+                    ctx,
+                    &theme,
+                    &annotate::Env {
+                        size: ctx.screen_rect().size(),
+                        ppp: ctx.pixels_per_point(),
+                        theme: "mullion-dark".into(),
+                        screen: "会话管理器".into(),
+                        extra: vec!["ui_shot 离屏出图".into()],
+                    },
+                );
+            }
         });
+    if annotate_scene {
+        annotate::toggle(&harness.ctx);
+    }
 
     // 跟产品同一条路(`app.rs` 里 egui ctx 建好之后就调这一句)。**漏了它图就在
     // 骗人**:`session_manager` 里手绘的部分自带主题色,但 egui 自己的部件

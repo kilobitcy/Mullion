@@ -32,6 +32,7 @@ use egui::NumExt as _;
 use mullion_store::{GroupId, GroupRecord, SessionId, SessionRecord};
 
 use crate::theme::{self, Theme};
+use crate::ui::annotate;
 
 use super::UiState;
 
@@ -449,7 +450,11 @@ pub fn show(
                 return;
             }
 
-            egui::SidePanel::left(ui.id().with("sm_list"))
+            // F100:整个内容区。**先标外层再标内层**只是可读性,hit test 与登记
+            // 顺序无关(取面积最小者)。
+            annotate::mark(ui.ctx(), "会话管理器", ui.max_rect());
+
+            let list_panel = egui::SidePanel::left(ui.id().with("sm_list"))
                 .resizable(true)
                 .default_width(LIST_W)
                 .width_range(LIST_MIN_W..=LIST_MAX_W)
@@ -461,6 +466,7 @@ pub fn show(
                 .show_inside(ui, |ui| {
                     list::show(ui, t, ui_state, sessions, groups, connected, appearance)
                 });
+            annotate::mark(ui.ctx(), "会话管理器/左栏", list_panel.response.rect);
 
             egui::CentralPanel::default()
                 .frame(
@@ -472,6 +478,7 @@ pub fn show(
                     // 挂显式 id 供守护测试读回真实矩形,见 `editor_root_id()`。
                     let rect = ui.max_rect();
                     ui.interact(rect, editor_root_id(), egui::Sense::hover());
+                    annotate::mark(ui.ctx(), "会话管理器/右栏", rect);
                     editor::show(ui, t, ui_state, groups, sessions, presence)
                 });
         });
@@ -1691,6 +1698,107 @@ mod tests {
             save_enabled,
             Some(true),
             "拨测在途不该挡「保存」——它只读表单、不改"
+        );
+    }
+
+    /// F100:标注模式开着时,会话管理器的**每一层容器**都得登记出来。
+    ///
+    /// 这条测试的必要性:插桩是散落在五个文件里的一行行 `annotate::mark`,
+    /// 删掉任何一行都编译得过、跑得起来、界面看着一模一样 —— 唯一的症状是
+    /// 用户点那个位置时描不出框,而这在无头环境里看不见。
+    ///
+    /// 自证会变红:注释掉任意一行被断言的 `annotate::mark`。
+    #[test]
+    fn annotate_mode_registers_every_container_of_the_session_manager() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![SessionRecord {
+            id: SessionId(1),
+            modified_at: "2026-08-09T00:00:00Z".into(),
+            identity: mullion_store::model::Identity {
+                name: "web01".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: mullion_store::model::Connection {
+                host: "10.0.0.1".into(),
+                port: 22,
+                protocol: mullion_store::Protocol::Ssh,
+            },
+            auth: mullion_store::model::Auth {
+                user: "root".into(),
+                kind: mullion_store::model::AuthKind::Password,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        }];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState {
+            session_manager_open: true,
+            // 右栏必须在「正在编辑」态,否则画的是空态提示,Tab 条/分节/底栏
+            // 一个都不会出现,这条测试就只覆盖了左栏。
+            editor: Some(EditorBuffer {
+                name: "web01".into(),
+                host: "10.0.0.1".into(),
+                user: "root".into(),
+                ..Default::default()
+            }),
+            editor_id: Some(SessionId(1)),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        annotate::toggle(&ctx);
+        let mut paths = Vec::new();
+        // 跑两帧:面板/`CollapsingHeader` 的持久化状态要第二帧才稳定,第一帧
+        // 分组可能还是折叠的、会话行不会进 body 闭包。
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    true,
+                    None,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+                paths = annotate::spot_paths(ctx);
+            });
+        }
+        for want in [
+            "会话管理器",
+            "会话管理器/左栏",
+            "会话管理器/左栏/搜索框",
+            "会话管理器/左栏/新建按钮",
+            "会话管理器/左栏/分组头「未分组」",
+            "会话管理器/左栏/会话行「web01」",
+            "会话管理器/右栏",
+            "会话管理器/右栏/Tab 条",
+            "会话管理器/右栏/Tab「连接」",
+            "会话管理器/右栏/底部按钮条",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == want),
+                "缺插桩:{want}\n本帧登记的是:{paths:#?}"
+            );
+        }
+        // 分节标题是 `fields.rs` 里那一处公共插桩,「连接」页至少有一节。
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.starts_with("会话管理器/右栏/分节「")),
+            "「连接」页一节都没登记,`fields::section` 的插桩掉了\n{paths:#?}"
         );
     }
 }

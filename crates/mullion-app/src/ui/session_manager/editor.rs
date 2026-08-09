@@ -11,6 +11,7 @@
 use egui::Ui;
 
 use crate::theme::{self, Theme};
+use crate::ui::annotate;
 use crate::ui::session_manager::SecretPresence;
 use crate::ui::UiState;
 use mullion_store::{GroupRecord, SessionRecord};
@@ -375,7 +376,7 @@ pub(super) fn show(
     }
 
     // Tab 条
-    ui.horizontal(|ui| {
+    let tab_bar = ui.horizontal(|ui| {
         for (i, name) in TABS.iter().enumerate() {
             // F91:缺项所在的 Tab 标一个红点,否则用户看到按钮灰着
             // 却不知道该翻哪一页。走查 9 把它扩成三态(单一状态位):
@@ -415,11 +416,14 @@ pub(super) fn show(
                     },
                 );
             }
-            if ui.selectable_label(ui_state.editor_tab == i, job).clicked() {
+            let tab = ui.selectable_label(ui_state.editor_tab == i, job);
+            annotate::mark(ui.ctx(), format!("会话管理器/右栏/Tab「{name}」"), tab.rect);
+            if tab.clicked() {
                 ui_state.editor_tab = i;
             }
         }
     });
+    annotate::mark(ui.ctx(), "会话管理器/右栏/Tab 条", tab_bar.response.rect);
     ui.separator();
 
     // 底部按钮条用 TopBottomPanel 先占位,Tab 内容吃剩余高度。
@@ -442,7 +446,7 @@ pub(super) fn show(
     // 走查 14:「保存」比其它按钮多一个禁用原因。缺项优先 —— 表单都没填齐时
     // 说「没有需要保存的改动」是在误导。
     let save_tip = missing_tip.or(unchanged.then_some("没有需要保存的改动"));
-    egui::TopBottomPanel::bottom(ui.id().with("sm_editor_bottom"))
+    let bottom_bar = egui::TopBottomPanel::bottom(ui.id().with("sm_editor_bottom"))
         .frame(egui::Frame::none())
         .show_separator_line(false)
         .show_inside(ui, |ui| {
@@ -527,6 +531,11 @@ pub(super) fn show(
                 });
             });
         });
+    annotate::mark(
+        ui.ctx(),
+        "会话管理器/右栏/底部按钮条",
+        bottom_bar.response.rect,
+    );
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])

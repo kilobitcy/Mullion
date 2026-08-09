@@ -229,6 +229,35 @@ pub fn take_export(ctx: &egui::Context) -> Option<String> {
     with_state(ctx, |st| st.export_ready.take())
 }
 
+/// 读回本帧登记的语义路径。**给测试与 `examples/ui_shot.rs` 用** —— 插桩铺没铺、
+/// 铺在哪儿,在无头环境里没有别的办法看见。
+pub fn spot_paths(ctx: &egui::Context) -> Vec<String> {
+    with_state(ctx, |st| st.spots.iter().map(|s| s.path.clone()).collect())
+}
+
+/// 确保「路径里含 `needle` 的第一处」处于选中态,返回是否找到。
+///
+/// **给 `examples/ui_shot.rs` 用**:出图脚本要摆出「已选中两处」的样子,不该
+/// 去猜某个控件落在哪个像素上再合成一次点击 —— 那种坐标一改布局就失效,而且
+/// 图错了看不出是坐标错了还是 UI 错了。
+///
+/// 幂等:已经选中就什么都不做,所以可以在每帧的闭包里无脑调(不像 `pick`,
+/// 那是「再点一次就取消」的用户语义)。
+///
+/// **必须在同一帧的 `overlay()` 之前调** —— `overlay` 末尾会清空 `spots`。
+pub fn ensure_picked(ctx: &egui::Context, needle: &str) -> bool {
+    with_state(ctx, |st| {
+        let Some(sp) = st.spots.iter().find(|s| s.path.contains(needle)).cloned() else {
+            return false;
+        };
+        let p = picked_of(&sp);
+        if !st.picked.contains(&p) {
+            st.picked.push(p);
+        }
+        true
+    })
+}
+
 /// 登记一处可标注的目标。**模式关着时只有一次 bool 读的开销。**
 ///
 /// `#[track_caller]` 让 `Location::caller()` 拿到的是**调用这个函数的那一行**,
@@ -386,6 +415,11 @@ pub fn overlay(ctx: &egui::Context, t: &Theme, env: &Env) {
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .interactable(true)
+        // `Area` 默认 `fade_in(true)`,头几帧整层 opacity 接近 0 —— 描边、徽标、
+        // 提示条会一起淡到看不见。淡入对一个调试工具没有价值,而按下
+        // `Ctrl+Shift+F` 之后「立刻看清自己进了标注模式」正是它要给的反馈。
+        // (`ui_shot` 的 annotate 场景第一版就是被这个默认值淡掉的。)
+        .fade_in(false)
         .show(ctx, |ui| {
             let resp = ui.allocate_rect(screen, egui::Sense::click());
             let p = ui.painter();
@@ -433,10 +467,13 @@ pub fn overlay(ctx: &egui::Context, t: &Theme, env: &Env) {
                 picked.len(),
                 detail.name()
             );
+            // **不贴屏幕最底边**:那儿是状态栏,而状态栏自己也是要标的对象 ——
+            // 提示条压在上面,用户就永远标不到它。往上抬一截,落在中央终端区上;
+            // 终端网格没有 widget、本来就不可标注(共识第 1 条),挡住它无代价。
             label(
                 p,
                 t,
-                egui::pos2(screen.left() + 8.0, screen.bottom() - 8.0),
+                egui::pos2(screen.left() + 8.0, screen.bottom() - 56.0),
                 egui::Align2::LEFT_BOTTOM,
                 &tip,
             );

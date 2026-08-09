@@ -83,6 +83,28 @@ harness 第一版漏了这一句，代价是：滚动条按 egui 默认样式画
 **任何新增的 harness 场景都要走同一条初始化路径**（`apply_egui` + 中文字体），
 顺序是「建 `Harness` → `apply_egui` → 装字体 → `run()`」：后两者都只影响之后的帧。
 
+## `annotate` 场景（F100）
+
+`annotate` 场景把标注模式摆到「开着 + 已选中两处」的样子出图，用来看描边、编号
+徽标、提示条的位置对不对：
+
+```bash
+cargo run -p mullion-app --example ui_shot -- annotate
+```
+
+两点跟别的场景不一样：
+
+- **闭包里要自己补 `annotate::overlay`**。产品里那一句在 `ui/mod.rs::build_ui` 的
+  末尾，而 harness 的闭包只画会话管理器。顺序也得一样：所有 `mark()` 之后。
+- **选中项按语义路径指定**（`annotate::ensure_picked(ctx, "会话行「节点 03」")`），
+  不合成鼠标点击。猜像素坐标的写法一改布局就失效，而且图错了分不清是坐标错了
+  还是 UI 错了。`ensure_picked` 是幂等的，可以在每帧闭包里无脑调。
+
+**这个场景抓出过一个真 bug**：`egui::Area` 默认 `fade_in(true)`，头几帧整层
+opacity 接近 0 —— 描边、徽标、提示条会一起淡到几乎看不见（第一张图就是这样）。
+产品里的表现是「按下 `Ctrl+Shift+F` 后有一瞬间什么都没有」，正好毁掉标注模式
+最需要给的那个反馈。现在 overlay 显式 `.fade_in(false)`。
+
 ## 坑：`egui` 与 `egui-winit` 的 `accesskit` feature 必须同步
 
 `egui_kittest` 给 `egui` 开 `accesskit`，于是 `egui::PlatformOutput` 多出
