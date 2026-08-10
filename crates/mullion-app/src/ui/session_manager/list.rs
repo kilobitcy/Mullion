@@ -19,19 +19,22 @@ use crate::ui::UiState;
 /// 已经表达完了,再问一遍是多余的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Density {
-    /// 状态点 + 16px 图标 + 名称/副标题两行。默认档。
+    /// 32px 图标 + 名称/副标题两行。默认档。
     Full,
-    /// 状态点 + 32px 图标 + 名称单行。副标题(user@host)让位给图标。
+    /// 32px 图标 + 名称单行。副标题(user@host)让位。
     Compact,
-    /// 只有 64px 图标(外加角上那颗状态点)。**没设图标的行整条隐藏** ——
-    /// 这一档认图标不认字,留一行空白比不留更糟。
+    /// 只有 32px 图标。**没设图标的行整条隐藏** —— 这一档认图标不认字,
+    /// 留一行空白比不留更糟。
     Icons,
 }
 
 /// 切档阈值。`Compact` 的上限踩的是「名称 + 副标题两行还读得出东西」的下界;
 /// `Icons` 的上限踩的是「32px 图标右边还剩得下几个字」的下界。
+///
+/// `ICONS_BELOW` 必须**严格大于** `LIST_MIN_W`,否则 `density_for` 永远落不到
+/// `Icons`,那一档等于不存在(`narrowing_the_list_only_ever_simplifies_it` 钉着)。
 const COMPACT_BELOW: f32 = 208.0;
-const ICONS_BELOW: f32 = 132.0;
+const ICONS_BELOW: f32 = 88.0;
 
 pub(crate) fn density_for(width: f32) -> Density {
     if width < ICONS_BELOW {
@@ -47,117 +50,84 @@ pub(crate) fn density_for(width: f32) -> Density {
 /// 图标边长决定 —— 图标是这两档唯一的内容,行高小于它就会被裁掉。
 pub(crate) fn row_h(d: Density) -> f32 {
     match d {
-        Density::Full => 44.0,
+        Density::Full => 48.0,
         Density::Compact => 40.0,
-        Density::Icons => 72.0,
+        Density::Icons => 48.0,
     }
 }
 
-/// 图标边长。三档分别是 16 / 32 / 64 —— 后两档正是用户导入 .ico 时归一化
-/// 出来的那两帧尺寸(`ui::ico::{SMALL, LARGE}`),不多不少。
-fn icon_px(d: Density) -> f32 {
-    match d {
-        Density::Full => 16.0,
-        Density::Compact => crate::ui::ico::SMALL as f32,
-        Density::Icons => crate::ui::ico::LARGE as f32,
-    }
+/// 图标边长。三档统一 32 —— 正是用户导入 .ico 时归一化出来的小那一帧
+/// (`ui::ico::SMALL`)。64 那一帧从此没有绘制点在用,但归一化仍产出它
+/// (那是存储格式的一部分,改它要迁移已有配置,收益为零)。
+fn icon_px(_d: Density) -> f32 {
+    crate::ui::ico::SMALL as f32
 }
 
-/// 图标槽位中心距行左边缘(逻辑点)。状态点在 16,图标紧随其后。
-const ICON_SLOT_X: f32 = 38.0;
+/// 图标槽位中心距行左边缘(逻辑点)。= 左边距 8 + 半个图标。状态点已下线,
+/// 图标直接贴左边缘,不再给点留位置。
+const ICON_SLOT_X: f32 = 24.0;
 /// 文字左边界。= 图标槽位右沿 + 8px 间距,**恒定**(见 `session_row` 注释)。
 fn text_x(d: Density) -> f32 {
     ICON_SLOT_X + icon_px(d) / 2.0 + 8.0
 }
 
-/// 会话行左侧状态点的四态(走查 4)。原来只有「已连接 / 未连接」两态、
-/// 且两态都是同一个形状,颜色一变用户就分不出来了。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Status {
-    Connected,
-    Connecting,
-    Failed,
-    Idle,
-}
+/// `Full` 档名称文字的上沿距行顶。
+const NAME_TOP: f32 = 9.0;
+/// `Full` 档副标题文字的上沿距行顶。
+const SUB_TOP: f32 = 27.0;
+/// 副标题字号。基线居中的断言要用它算下留白,所以不能只写在
+/// `FontId::proportional(11.0)` 那一处 —— 两处写同一个数迟早分叉。
+const SUB_FONT_PX: f32 = 11.0;
 
-/// 状态点画成什么**形状**。走查 4 要求「颜色 + 形状双编码(色盲友好)」——
-/// 红绿色盲分不出 `ok` 绿和 `danger` 红,但实心圆 / 空心圆 / 方块永远分得出。
-/// 抽成独立枚举是为了能**直接断言四态互不相同**,而不是去数画出来的图元。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Marker {
-    /// 实心圆,半径 4 —— 已连接。
-    Dot,
-    /// 空心圆(只描边)—— 连接中。
-    Ring,
-    /// 实心方块 —— 失败。
-    Square,
-    /// 实心圆,半径 3 —— 未连接。比 `Dot` 小一号,不抢眼。
-    SmallDot,
-}
+/// 选中态节点色的混合比例。低透明度而不是纯色铺满:8 个预设里有浅色(黄),
+/// 纯色铺满时 `fg` 白字会掉到不可读;混合后底色始终由 `panel_bg` 主导,
+/// 文字对比度不随用户选的颜色漂移(`every_preset_colour_keeps_the_row_text_readable_when_selected` 钉着)。
+const SELECTED_ALPHA: f32 = 0.28;
+/// 悬停态的混合比例。必须小于 `SELECTED_ALPHA`,否则两态分不出来。
+const HOVER_ALPHA: f32 = 0.14;
 
-/// 四态判定。优先级 `Connected > Connecting > Failed > Idle`:
-/// 已经连上了就不该再显示上一次的失败,否则那条红标记会一直挂到重启。
-pub(crate) fn status_of(
-    id: SessionId,
-    connected: Option<SessionId>,
-    connecting: Option<SessionId>,
-    failed: Option<SessionId>,
-) -> Status {
-    if connected == Some(id) {
-        Status::Connected
-    } else if connecting == Some(id) {
-        Status::Connecting
-    } else if failed == Some(id) {
-        Status::Failed
-    } else {
-        Status::Idle
-    }
-}
-
-pub(crate) fn marker_of(s: Status) -> Marker {
-    match s {
-        Status::Connected => Marker::Dot,
-        Status::Connecting => Marker::Ring,
-        Status::Failed => Marker::Square,
-        Status::Idle => Marker::SmallDot,
-    }
-}
-
-/// 走查 4:「圆点(连接状态?)全是同一个灰色」—— 用户只能靠猜。每一态都要
-/// 说出自己是什么。
-pub(crate) fn status_tooltip(s: Status) -> &'static str {
-    match s {
-        Status::Connected => "已连接",
-        Status::Connecting => "连接中…",
-        Status::Failed => "上次连接失败",
-        Status::Idle => "未连接",
-    }
-}
-
-fn status_color(s: Status, t: &Theme) -> egui::Color32 {
-    theme::c32(match s {
-        Status::Connected => t.ok,
-        Status::Connecting => t.info,
-        Status::Failed => t.danger,
-        Status::Idle => t.fg_ghost,
-    })
-}
-
-/// 按 `Marker` 画。形状与颜色分两步取,是为了让「形状」这一半能脱离主题单测。
-fn paint_status(p: &egui::Painter, center: egui::Pos2, s: Status, t: &Theme) {
-    let c = status_color(s, t);
-    // 每个分支都返回一个 `ShapeIdx`(画完之后还能回头改那个图元),这里用不上。
-    let _ = match marker_of(s) {
-        Marker::Dot => p.circle_filled(center, 4.0, c),
-        Marker::SmallDot => p.circle_filled(center, 3.0, c),
-        // 描边 1.5px:1.0 在 100% 缩放下会被反走样抹淡到跟实心圆难分。
-        Marker::Ring => p.circle_stroke(center, 4.0, egui::Stroke::new(1.5, c)),
-        Marker::Square => p.rect_filled(
-            egui::Rect::from_center_size(center, egui::vec2(7.0, 7.0)),
-            egui::Rounding::same(1.0),
-            c,
-        ),
+/// 把 `top` 按 `a` 的比例混到 `base` 上,得到一个**不透明**的结果色。
+///
+/// 不用 `Color32::from_rgba_unmultiplied` 交给 GPU 混:那样算出来的最终像素
+/// 依赖底下画了什么,测不了。这里显式跟 `panel_bg` 混,结果是确定的一个色值。
+fn blend(base: egui::Color32, top: egui::Color32, a: f32) -> egui::Color32 {
+    let mix = |b: u8, t: u8| {
+        (b as f32 + (t as f32 - b as f32) * a)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
+    egui::Color32::from_rgb(
+        mix(base.r(), top.r()),
+        mix(base.g(), top.g()),
+        mix(base.b(), top.b()),
+    )
+}
+
+/// 一行会话的背景色。`None` = 不铺(普通态)。
+///
+/// 抽成纯函数(不收 `Ui`/`Painter`)是这一整块能被测的前提:混在 `session_row`
+/// 里的话,「选中背景到底是什么色」只能靠数图元反推。
+///
+/// `node` 已经过了 `apply_to` 闸门(调用方传 `badge::color_rgb(..., ListItem)`)——
+/// 用户明确取消勾选「会话列表」之后,颜色不该还从背景里冒出来。
+pub(crate) fn row_bg(
+    selected: bool,
+    hovered: bool,
+    node: Option<mullion_term::snapshot::Rgb>,
+    t: &Theme,
+) -> Option<egui::Color32> {
+    let alpha = if selected {
+        SELECTED_ALPHA
+    } else if hovered {
+        HOVER_ALPHA
+    } else {
+        return None;
+    };
+    Some(match node {
+        Some(c) => blend(theme::c32(t.panel_bg), theme::c32(c), alpha),
+        None if selected => theme::c32(t.sunken_bg),
+        None => theme::c32(t.panel_head),
+    })
 }
 
 /// 会话是否命中搜索。空查询放行全部。名称 / 主机 / 标签三处都查,
@@ -176,11 +146,11 @@ pub(crate) fn matches(rec: &SessionRecord, query: &str) -> bool {
             .any(|t| t.to_lowercase().contains(&q))
 }
 
-/// 手绘一行会话。不用 `selectable_label`:设计稿要「状态点 + 名称 + user@host
-/// 两行 + 选中态左侧强调条」,`selectable_label` 只画得出单行文本。
+/// 手绘一行会话。不用 `selectable_label`:设计稿要「图标 + 名称 + user@host
+/// 两行 + 选中态节点色背景」,`selectable_label` 只画得出单行文本。
 ///
-/// F61/F62 加了两样东西:**右**边缘的语义色竖条(左 3px 已被选中态 accent 占了,
-/// 两者各占一边才不打架)、状态点与文字之间的 16px 图标槽位。
+/// F61/F62 加了两样东西:**右**边缘的语义色竖条(未选中行认色全靠它 ——
+/// 选中行有背景色,未选中行只有这条竖条)、贴左边缘的 32px 图标槽位。
 /// **槽位恒占**——没设图标的行也留白,否则有图标和没图标的行文字左边界参差。
 #[allow(clippy::too_many_arguments)]
 fn session_row(
@@ -189,7 +159,6 @@ fn session_row(
     rec: &SessionRecord,
     sub: &str,
     selected: bool,
-    status: Status,
     appearance: &crate::ui::badge::Appearance,
     query: &str,
     d: Density,
@@ -200,20 +169,15 @@ fn session_row(
     );
     let p = ui.painter();
 
-    let bg = if selected {
-        theme::c32(t.sunken_bg)
-    } else if resp.hovered() {
-        theme::c32(t.panel_head)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    p.rect_filled(rect, egui::Rounding::same(6.0), bg);
-    if selected {
-        p.rect_filled(
-            egui::Rect::from_min_size(rect.min, egui::vec2(3.0, row_h(d))),
-            egui::Rounding::same(2.0),
-            theme::c32(t.accent),
-        );
+    // F62:选中/悬停背景由会话自己的节点色主导(过 `ListItem` 闸门)。原来的
+    // 「左 3px accent 竖条」已删 —— 整行都是节点色之后,再压一条固定色的竖条
+    // 是两套颜色语言在同一行里打架。
+    let node = crate::ui::badge::color_rgb(
+        appearance.color.as_ref(),
+        mullion_store::ColorTarget::ListItem,
+    );
+    if let Some(bg) = row_bg(selected, resp.hovered(), node, t) {
+        p.rect_filled(rect, egui::Rounding::same(6.0), bg);
     }
 
     paint_row_body(
@@ -222,31 +186,11 @@ fn session_row(
         t,
         &rec.identity.name,
         sub,
-        status,
         rec.connection.protocol,
         appearance,
         query,
         d,
     );
-    // §6.3:状态点加 tooltip。它是手绘的,没有 Response,只能补一次
-    // interact —— 否则用户只能靠猜「这个绿点是什么意思」。
-    //
-    // 这一层 hover-only interact 会不会抢走 `resp.hovered()`(整行高亮背景
-    // 依赖它)?不会:egui-0.30.0 `interaction.rs::interact()` 里,当前没有
-    // 点击/拖拽发生时,`hovered` 集合 = `hits.click ∪ hits.drag` 再加上「所有
-    // 注册顺序不早于 `top_interactive_order`(即最上层可点击/拖拽部件)的
-    // `contains_pointer` 部件」(见该函数 243-284 行的注释与实现)。`dot_rect`
-    // 只 sense `hover()`,不参与 `hits.click` 的判定,`hits.click` 仍然是这一行
-    // 本身(`allocate_exact_size` 用 `Sense::click()` 注册,是当前唯一的
-    // 可点击命中);而 dot 的 `interact()` 调用在这一行之后才发生,注册顺序
-    // 更靠后(更「上层」),所以会被上述规则一并并入 `hovered` 集合 —— 行和
-    // 点会同时 hovered,不是互斥关系。
-    let dot_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 16.0, rect.center().y),
-        egui::vec2(12.0, 12.0),
-    );
-    ui.interact(dot_rect, resp.id.with("dot"), egui::Sense::hover())
-        .on_hover_text(status_tooltip(status));
 
     // 窄档把名字(以及 `Icons` 档连副标题)全藏了 —— 不补 tooltip,用户就只
     // 剩「挨个点开看」这一条路。`Full` 档不补:那里字都在,再挂一层重复的
@@ -307,7 +251,7 @@ fn paint_pill(
 /// 宽度都要先扣掉它 —— 不扣的话字会压在竖条上。
 const TEXT_RIGHT_PAD: f32 = crate::ui::badge::EDGE_BAR_W + 5.0;
 
-/// 一行会话的**内容**:语义色竖条 + 状态点 + 图标 + 两行文字。背景与选中条不在
+/// 一行会话的**内容**:语义色竖条 + 图标 + 两行文字。背景与选中条不在
 /// 这里(那两样只对真列表行有意义)。
 ///
 /// 抽出来是给「图标」页的实时预览复用的(走查 4 后半)。预览要是另写一套绘制,
@@ -322,7 +266,6 @@ fn paint_row_body(
     t: &Theme,
     name: &str,
     sub: &str,
-    status: Status,
     protocol: mullion_store::Protocol,
     appearance: &crate::ui::badge::Appearance,
     query: &str,
@@ -334,18 +277,6 @@ fn paint_row_body(
     {
         crate::ui::badge::paint_edge_bar(p, rect, crate::ui::badge::Side::Right, c);
     }
-
-    // 走查 4:四态 + 色形双编码。原来只有两态,注释里写着「『连接中』态做不出来:
-    // UserEvent::ConnectOk/ConnectErr 都不带 SessionId」—— 那个论断只对事件本身
-    // 成立:发起连接的**那一刻**我们是知道 SessionId 的(`connect_request_last`
-    // 就是这么来的),把它记进 `UiState::connecting`,收到事件时清掉即可,不需要
-    // 事件携带 id。
-    paint_status(
-        p,
-        egui::pos2(rect.left() + 16.0, rect.center().y),
-        status,
-        t,
-    );
 
     // F61:图标槽位。`Full`/`Compact` 档**恒占**,画不画都留着 —— 有图标的行
     // 和没图标的行文字左边界必须对齐,否则列表看起来像坏了。
@@ -361,9 +292,10 @@ fn paint_row_body(
             p,
             egui::Rect::from_center_size(icon_center, egui::vec2(px, px)),
             icon,
+            crate::ui::badge::should_paint(appearance, mullion_store::ColorTarget::ListItem),
         );
     }
-    // `Icons` 档到此为止:名称、副标题、协议 pill 全部让位给那张 64px 图。
+    // `Icons` 档到此为止:名称、副标题、协议 pill 全部让位给那张 32px 图。
     if d == Density::Icons {
         return;
     }
@@ -371,7 +303,7 @@ fn paint_row_body(
     // `Compact` 档只有名称一行,竖直居中;`Full` 档名称在上、副标题在下。
     let name_y = match d {
         Density::Compact => rect.center().y - 9.0,
-        _ => rect.top() + 7.0,
+        _ => rect.top() + NAME_TOP,
     };
     let text_left = rect.left() + text_x(d);
     // 两行文字共同的可用宽度。行本身是 `allocate_exact_size` 给的固定矩形,
@@ -402,10 +334,10 @@ fn paint_row_body(
     }
     paint_highlighted(
         p,
-        egui::pos2(text_left, rect.top() + 25.0),
+        egui::pos2(text_left, rect.top() + SUB_TOP),
         sub,
         query,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(SUB_FONT_PX),
         // WCAG AA:fg_faint(#565b70) on panel_bg(#14161f) 只有 2.69:1,
         // fg_dimmer(#8a90a8) 是 5.71:1。不动 token 本身 —— 它在别处
         // (禁用态、装饰线)是对的。
@@ -464,9 +396,6 @@ fn paint_highlighted(
 
 /// 「图标」页的实时预览(走查 4 后半):画一行**假的**会话行,让用户当场看到
 /// 自己配的图标和颜色在列表里长什么样。
-///
-/// 状态点固定画 `Idle` —— 预览的是外观,不是连接状态;画成绿色会让人以为
-/// 这里能看出连没连上。
 pub(crate) fn preview_row(
     ui: &mut Ui,
     t: &Theme,
@@ -490,7 +419,6 @@ pub(crate) fn preview_row(
         t,
         name,
         sub,
-        Status::Idle,
         protocol,
         appearance,
         "",
@@ -579,7 +507,6 @@ pub(super) fn show(
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
-    connected: Option<SessionId>,
     appearance: &crate::ui::badge::AppearanceCache,
 ) {
     // 搜索框
@@ -701,7 +628,6 @@ pub(super) fn show(
                                 r,
                                 sessions,
                                 groups,
-                                connected,
                                 pending_delete_target,
                                 &mut pending_delete_rendered,
                                 appearance,
@@ -757,7 +683,6 @@ fn row(
     rec: &SessionRecord,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
-    connected: Option<SessionId>,
     pending_delete_target: Option<SessionId>,
     pending_delete_rendered: &mut bool,
     appearance: &crate::ui::badge::AppearanceCache,
@@ -771,12 +696,6 @@ fn row(
     // 缓存里没有这条(store 刚删掉、或还没 rebuild)就按「没设外观」画。
     let default_appearance = crate::ui::badge::Appearance::default();
     let a = appearance.get(rec.id).unwrap_or(&default_appearance);
-    let status = status_of(
-        rec.id,
-        connected,
-        ui_state.connecting,
-        ui_state.connect_failed,
-    );
     // 走查 3:列表上有另一行长得一模一样时,副标题后面追加一段区分信息
     // (分组名 / 端口 / 备注首句)。没有重名时 `disambiguate` 返回 `None`,
     // 副标题保持原样 —— 不给每行平白加尾巴。
@@ -784,7 +703,7 @@ fn row(
         Some(extra) => format!("{}@{} · {}", rec.auth.user, rec.connection.host, extra),
         None => format!("{}@{}", rec.auth.user, rec.connection.host),
     };
-    let resp = session_row(ui, t, rec, &sub, selected, status, a, &ui_state.search, d);
+    let resp = session_row(ui, t, rec, &sub, selected, a, &ui_state.search, d);
     // 带上会话名:同一个插桩点会登记出十几行,只写「会话行」的话导出里全是
     // 一模一样的路径,读的人分不出说的是哪一行。
     annotate::mark(
@@ -903,72 +822,6 @@ mod tests {
         }
     }
 
-    /// 走查 4:一条会话刚连上,却因为二十分钟前失败过一次而顶着红标记 ——
-    /// 用户会以为它现在是坏的。优先级必须是「当下的事实压过历史」。
-    #[test]
-    fn status_prefers_connected_over_a_stale_failure() {
-        let id = SessionId(1);
-        assert_eq!(
-            status_of(id, Some(id), None, Some(id)),
-            Status::Connected,
-            "已连接必须压过陈旧的失败标记"
-        );
-        assert_eq!(
-            status_of(id, None, Some(id), Some(id)),
-            Status::Connecting,
-            "正在重拨时不该还显示上次的失败"
-        );
-        assert_eq!(status_of(id, None, None, Some(id)), Status::Failed);
-        assert_eq!(status_of(id, None, None, None), Status::Idle);
-        // 别人的状态不该染到这一行上。
-        let other = SessionId(2);
-        assert_eq!(
-            status_of(id, Some(other), Some(other), Some(other)),
-            Status::Idle
-        );
-    }
-
-    /// 走查 4 的核心诉求是**色形双编码(色盲友好)**。只换颜色不换形状的话,
-    /// 红绿色盲用户看到的四态是同一个灰点。
-    ///
-    /// 自证会变红:把 `marker_of` 里 `Status::Failed` 的 `Marker::Square`
-    /// 改成 `Marker::Dot`。
-    #[test]
-    fn each_status_has_a_distinct_shape_not_just_a_distinct_color() {
-        let all = [
-            Status::Connected,
-            Status::Connecting,
-            Status::Failed,
-            Status::Idle,
-        ];
-        let markers: Vec<Marker> = all.iter().copied().map(marker_of).collect();
-        for (i, a) in markers.iter().enumerate() {
-            for (j, b) in markers.iter().enumerate() {
-                if i != j {
-                    assert_ne!(a, b, "{:?} 与 {:?} 画成了同一个形状", all[i], all[j]);
-                }
-            }
-        }
-    }
-
-    /// 走查 4:「圆点全是同一个灰色,也没有 tooltip」—— 每一态都要能说出自己
-    /// 是什么,而且四句话不能重样(重样等于没说)。
-    #[test]
-    fn status_tooltip_names_the_state() {
-        let all = [
-            Status::Connected,
-            Status::Connecting,
-            Status::Failed,
-            Status::Idle,
-        ];
-        let tips: Vec<&str> = all.iter().copied().map(status_tooltip).collect();
-        for t in &tips {
-            assert!(!t.is_empty(), "每一态都得有 tooltip");
-        }
-        let uniq: std::collections::BTreeSet<&&str> = tips.iter().collect();
-        assert_eq!(uniq.len(), tips.len(), "四态的 tooltip 不能重样:{tips:?}");
-    }
-
     /// 协议标签只给非 ssh 的行挂。列表里 99% 都是 ssh,全挂等于没挂,还把
     /// 名字挤窄了 —— 但存了一条 sftp 会话时必须一眼看得出来。
     ///
@@ -1031,7 +884,6 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
-                    None,
                     &crate::ui::badge::AppearanceCache::default(),
                 );
             });
@@ -1105,7 +957,6 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
-                    None,
                     &crate::ui::badge::AppearanceCache::default(),
                 );
             });
@@ -1166,7 +1017,6 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1263,7 +1113,6 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1387,7 +1236,6 @@ mod tests {
                         &mut ui_state,
                         sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1524,7 +1372,6 @@ mod tests {
                         &mut ui_state,
                         &sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1564,7 +1411,6 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1671,7 +1517,6 @@ mod tests {
                         &mut ui_state,
                         &sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1722,7 +1567,6 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1856,7 +1700,6 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
-                        None,
                         &crate::ui::badge::AppearanceCache::default(),
                     );
                 });
@@ -1973,7 +1816,6 @@ mod tests {
                     &mut ui_state,
                     sessions,
                     &groups,
-                    None,
                     &crate::ui::badge::AppearanceCache::default(),
                 );
             });
@@ -1988,7 +1830,7 @@ mod tests {
         let ctx = egui::Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &t, &mut ui_state, &sessions, &groups, None, appearance);
+                show(ui, &t, &mut ui_state, &sessions, &groups, appearance);
             });
         });
         count_shapes(&out.shapes)
@@ -2036,6 +1878,20 @@ mod tests {
         out
     }
 
+    /// 数一帧里画了几个圆。状态点是左栏唯一的圆形图元 —— 图标走
+    /// `Shape::Image`、背景/竖条/按钮走 `Shape::Rect`、文字走 `Shape::Text`、
+    /// 分组头的三角走 `Shape::Path`。所以「圆的个数」就是「状态点的个数」。
+    fn circle_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                egui::Shape::Circle(_) => 1,
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
     /// 按指定的左栏宽度渲染一次列表。`Frame::none()` 是必需的:`CentralPanel`
     /// 默认带 8px 内边距,不清掉的话 `available_width` 比给的宽度小一圈,
     /// 测出来的档位跟 `density_for(width)` 对不上。
@@ -2044,9 +1900,22 @@ mod tests {
         sessions: &[SessionRecord],
         appearance: &crate::ui::badge::AppearanceCache,
     ) -> egui::FullOutput {
+        run_list_selecting(width, sessions, appearance, None)
+    }
+
+    /// 同上,但可以指定哪一条处于选中态(`UiState::editor_id`)。
+    fn run_list_selecting(
+        width: f32,
+        sessions: &[SessionRecord],
+        appearance: &crate::ui::badge::AppearanceCache,
+        selected: Option<SessionId>,
+    ) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
         let groups: Vec<GroupRecord> = Vec::new();
-        let mut ui_state = UiState::default();
+        let mut ui_state = UiState {
+            editor_id: selected,
+            ..Default::default()
+        };
         let ctx = egui::Context::default();
         ctx.run(
             egui::RawInput {
@@ -2060,10 +1929,139 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                        show(ui, &t, &mut ui_state, sessions, &groups, None, appearance);
+                        show(ui, &t, &mut ui_state, sessions, &groups, appearance);
                     });
             },
         )
+    }
+
+    /// 数一帧里画了几个矩形。
+    fn rect_count(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                egui::Shape::Rect(_) => 1,
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    /// 行背景的四条规矩,一次钉死:
+    /// 1. 普通态透明(`None`)
+    /// 2. 有节点色时,选中/悬停都由它主导
+    /// 3. 选中比悬停**更靠近**节点色(否则两态分不出来)
+    /// 4. 没节点色时回落到改动前的 `sunken_bg` / `panel_head`
+    ///
+    /// 抽成纯函数才测得了:混在 `session_row` 里的话,「选中背景到底是什么色」
+    /// 只能靠数图元反推,测了也不知道测的是不是那一块。
+    ///
+    /// 自证会变红:让 `row_bg` 忽略 `node` 直接返回 `sunken_bg`(第 2、3 段炸)。
+    #[test]
+    fn row_background_is_driven_by_the_node_colour_with_a_theme_fallback() {
+        let t = &crate::theme::MULLION_DARK;
+        let node = crate::theme::parse_hex("#e06767").unwrap();
+
+        assert_eq!(row_bg(false, false, None, t), None, "普通态必须透明");
+        assert_eq!(
+            row_bg(false, false, Some(node), t),
+            None,
+            "没选中也没悬停时,配了颜色也不铺背景"
+        );
+
+        let sel = row_bg(true, false, Some(node), t).expect("选中态要有背景");
+        let hov = row_bg(false, true, Some(node), t).expect("悬停态要有背景");
+        assert_ne!(sel, crate::theme::c32(t.sunken_bg), "配了色就不该还是灰底");
+
+        // 选中比悬停更靠近节点色:用「与 panel_bg 的距离」当单调性代理。
+        let dist = |c: egui::Color32| {
+            let b = crate::theme::c32(t.panel_bg);
+            (c.r() as i32 - b.r() as i32).abs()
+                + (c.g() as i32 - b.g() as i32).abs()
+                + (c.b() as i32 - b.b() as i32).abs()
+        };
+        assert!(
+            dist(sel) > dist(hov),
+            "选中({sel:?})必须比悬停({hov:?})更浓"
+        );
+
+        assert_eq!(
+            row_bg(true, false, None, t),
+            Some(crate::theme::c32(t.sunken_bg)),
+            "没配色的选中行保持改动前的样子"
+        );
+        assert_eq!(
+            row_bg(false, true, None, t),
+            Some(crate::theme::c32(t.panel_head)),
+            "没配色的悬停行保持改动前的样子"
+        );
+    }
+
+    /// 8 个预设色板铺成选中背景之后,`fg` 白字仍要读得出来。这正是选低透明度
+    /// 混色而不是纯色铺满的理由 —— 纯色铺满时「黄」上的白字会掉到 1.5:1。
+    ///
+    /// 阈值取 WCAG AA 正文 4.5:1。
+    ///
+    /// 自证会变红:把 `SELECTED_ALPHA` 提到 0.9。
+    #[test]
+    fn every_preset_colour_keeps_the_row_text_readable_when_selected() {
+        let t = &crate::theme::MULLION_DARK;
+        for (name, hex, _) in crate::theme::LABEL_PALETTE {
+            let node = crate::theme::parse_hex(hex).unwrap();
+            let bg = row_bg(true, false, Some(node), t).unwrap();
+            let bg_rgb = mullion_term::snapshot::Rgb::new(bg.r(), bg.g(), bg.b());
+            let ratio = crate::theme::contrast_ratio(t.fg, bg_rgb);
+            assert!(
+                ratio >= 4.5,
+                "预设色「{name}」({hex})铺成选中底后,fg 对比度只有 {ratio:.2}:1"
+            );
+        }
+    }
+
+    /// 选中态只多画**一块**背景 —— 那条左侧 3px 强调条已经删了。
+    ///
+    /// 数矩形而不是比颜色:强调条和背景都是 `Shape::Rect`,差值为 1 说明只多了
+    /// 背景那一块,为 2 说明强调条还在。`row_bg` 的单测管不到这件事(它只回答
+    /// 「背景是什么色」,回答不了「除了背景还画了什么」)。
+    ///
+    /// 自证会变红:把 `session_row` 里那段 accent `rect_filled` 加回去。
+    #[test]
+    fn selecting_a_row_adds_only_a_background_no_accent_bar() {
+        let sessions = vec![with_icon(rec(1, "dev-box", "192.0.2.10", &[]))];
+        let cache = cache_of(&sessions);
+        let id = sessions[0].id;
+        let plain =
+            rect_count(&run_list_selecting(super::super::LIST_W, &sessions, &cache, None).shapes);
+        let sel = rect_count(
+            &run_list_selecting(super::super::LIST_W, &sessions, &cache, Some(id)).shapes,
+        );
+        assert_eq!(
+            sel - plain,
+            1,
+            "选中只该多画背景一块,实际多了 {}",
+            sel - plain
+        );
+    }
+
+    /// 会话行不再画连接状态点(v0.1.28)。连带那块 12×12 的 hover 热区也没了 ——
+    /// 点没了还留着浮层,等于在空白处埋一个看不见的提示。
+    ///
+    /// 代价是明确接受的:列表从此看不出哪台连上了,连接状态归 pane 标题条管。
+    ///
+    /// 自证会变红:把 `paint_status` 那次调用加回 `paint_row_body`。
+    #[test]
+    fn session_rows_no_longer_paint_a_connection_status_dot() {
+        let sessions = vec![
+            with_icon(rec(1, "dev-box", "192.0.2.10", &[])),
+            rec(2, "prod-box", "192.0.2.11", &[]),
+        ];
+        let cache = cache_of(&sessions);
+        let out = run_list_at(super::super::LIST_W, &sessions, &cache);
+        assert_eq!(
+            circle_count(&out.shapes),
+            0,
+            "左栏里不该再有圆形图元(状态点是这里唯一会画圆的东西)"
+        );
     }
 
     /// 给一条会话挂上真图标(走生产代码那条归一化路径)。
@@ -2088,6 +2086,91 @@ mod tests {
         let mut c = crate::ui::badge::AppearanceCache::default();
         c.rebuild(sessions, &[]);
         c
+    }
+
+    /// 给 `with_icon` 的会话再叠一层节点色,`apply_to` 由调用方给。
+    ///
+    /// 图标底色这条路径复核前**从没有测试同时设过 icon 和 color**——`cache_with`
+    /// 只设 color、`with_icon` 只设 icon,图标那次 `should_paint(appearance,
+    /// ColorTarget::ListItem)` 调用永远拿到 `appearance.icon.is_some() == false`
+    /// 或 `appearance.color.is_none()` 的组合,根本走不到「垫底色」分支。
+    fn with_icon_and_color(
+        r: SessionRecord,
+        hex: &str,
+        apply_to: Vec<mullion_store::ColorTarget>,
+    ) -> SessionRecord {
+        let mut r = with_icon(r);
+        r.appearance.color = Some(mullion_store::ColorSpec {
+            hex: hex.to_string(),
+            apply_to,
+        });
+        r
+    }
+
+    /// 数一帧里「填了指定颜色、且宽高相等(方形)」的矩形个数。
+    ///
+    /// 图标底色和右侧 edge bar 用的是**同一个** `should_paint(appearance,
+    /// ColorTarget::ListItem)` 调用结果,颜色完全一样,数总数分不清谁多画了
+    /// 谁——但形状不一样:edge bar 是 `EDGE_BAR_W`(3px)宽、行高那么高的
+    /// 竖条,图标底色是 `icon_px` x `icon_px` 的正方形。按「方形」过滤就把
+    /// 两者拆开了。
+    fn square_fill_count(shapes: &[egui::epaint::ClippedShape], color: egui::Color32) -> usize {
+        fn walk(s: &egui::Shape, color: egui::Color32) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(|s| walk(s, color)).sum(),
+                egui::Shape::Rect(r)
+                    if r.fill == color && (r.rect.width() - r.rect.height()).abs() < 0.5 =>
+                {
+                    1
+                }
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape, color)).sum()
+    }
+
+    /// F61/F62 复核挖出的真缺口:图标底色必须过 `ColorTarget::ListItem` 这道
+    /// 闸门,而不是随手用了别的落点——`list_row_paints_an_edge_bar_...` 只
+    /// 覆盖了 edge bar 那次 `should_paint` 调用,`paint_row_body` 里画图标的
+    /// 那次调用此前完全没有测试盯着(复核实测:把它改成 `ColorTarget::
+    /// PaneTitle`,544 个测试全绿无一变红)。
+    ///
+    /// 自证会变红:把 `paint_row_body` 里画图标那次 `should_paint` 调用的
+    /// `ColorTarget::ListItem` 改成 `ColorTarget::PaneTitle`(edge bar 那次不动)。
+    #[test]
+    fn icon_backdrop_uses_the_list_item_target_not_pane_title() {
+        use mullion_store::ColorTarget;
+        let color = egui::Color32::from_rgb(0x1e, 0x88, 0xe5);
+
+        let pane_title_only = vec![with_icon_and_color(
+            rec(1, "dev-box", "192.0.2.10", &[]),
+            "#1e88e5",
+            vec![ColorTarget::PaneTitle],
+        )];
+        let cache_pt = cache_of(&pane_title_only);
+        let baseline = square_fill_count(
+            &run_list_at(super::super::LIST_W, &pane_title_only, &cache_pt).shapes,
+            color,
+        );
+        assert_eq!(
+            baseline, 0,
+            "只勾了「pane 标题条」的会话,不该在列表行的图标下垫这个颜色的方块"
+        );
+
+        let list_item = vec![with_icon_and_color(
+            rec(1, "dev-box", "192.0.2.10", &[]),
+            "#1e88e5",
+            vec![ColorTarget::ListItem],
+        )];
+        let cache_li = cache_of(&list_item);
+        let with_bg = square_fill_count(
+            &run_list_at(super::super::LIST_W, &list_item, &cache_li).shapes,
+            color,
+        );
+        assert_eq!(
+            with_bg, 1,
+            "勾了「会话列表」的会话,图标下应该恰好垫一块这个颜色的方块"
+        );
     }
 
     /// 三档必须**单调**:越拖越窄只能越走越简,不能来回跳。
@@ -2126,21 +2209,82 @@ mod tests {
         assert_eq!(density_for(COMPACT_BELOW), Density::Full);
     }
 
-    /// 下限必须真的装得下最窄那一档的内容,否则拖到底图标会被裁掉一半。
+    /// 三档图标统一 32px。行高必须真的装得下它,而且上下留白要够 ——
+    /// 只断言 `row_h >= icon_px` 是不够的:`Full` 行高退回 44 时 44 > 32 仍然
+    /// 过,而那正是要防的(32px 图标在 44 行高里上下只剩 6px,挤得发闷)。
+    ///
+    /// `Compact` 的留白阈值故意更松(4px):它就是「省地方」的那一档,
+    /// 单行文字 + 40 行高是它存在的意义。
+    ///
+    /// 自证会变红:把 `icon_px` 任意一档改回 16 或 `ico::LARGE`(第一段炸);
+    /// 把 `row_h(Full)` 改回 44(第三段炸)。
     #[test]
-    fn the_narrowest_width_actually_fits_a_64px_icon() {
+    fn every_step_uses_the_32px_frame_and_the_row_fits_it() {
         use super::super::LIST_MIN_W;
-        let px = icon_px(Density::Icons);
+        // `Icons` 档存在的前提:阈值必须严格大于左栏能拖到的下限,否则
+        // `density_for` 永远落不到它。编译期钉死 —— 这两个数分处两个文件,
+        // 靠人记住迟早出事。(写法与 `mod.rs` 里那条宽度联立断言同源。)
+        const { assert!(LIST_MIN_W < ICONS_BELOW) };
+        for d in [Density::Full, Density::Compact, Density::Icons] {
+            assert_eq!(
+                icon_px(d),
+                crate::ui::ico::SMALL as f32,
+                "{d:?} 档该用 32px 那一帧"
+            );
+        }
         assert!(
-            LIST_MIN_W >= px && row_h(Density::Icons) >= px,
-            "左栏下限 {LIST_MIN_W}×{} 装不下 {px}px 的图标",
-            row_h(Density::Icons)
+            LIST_MIN_W >= icon_px(Density::Icons),
+            "左栏下限 {LIST_MIN_W} 横着装不下 {}px 图标",
+            icon_px(Density::Icons)
         );
-        assert_eq!(px, crate::ui::ico::LARGE as f32, "纯图标档要用大那一帧");
+        for (d, min_pad) in [
+            (Density::Full, 8.0f32),
+            (Density::Icons, 8.0),
+            (Density::Compact, 4.0),
+        ] {
+            let pad = (row_h(d) - icon_px(d)) / 2.0;
+            assert!(
+                pad >= min_pad,
+                "{d:?} 档行高 {} 减掉 {}px 图标后上下各只剩 {pad}px",
+                row_h(d),
+                icon_px(d)
+            );
+        }
+    }
+
+    /// 状态点下线后图标左移贴边。三档共用同一个槽位中心,文字左界才不会
+    /// 随档位跳 —— 那是 `text_x` 这个函数存在的全部理由。
+    ///
+    /// 自证会变红:把 `ICON_SLOT_X` 改回 38。
+    #[test]
+    fn the_icon_hugs_the_left_edge_now_that_the_status_dot_is_gone() {
         assert_eq!(
-            icon_px(Density::Compact),
-            crate::ui::ico::SMALL as f32,
-            "紧凑档要用小那一帧"
+            ICON_SLOT_X - icon_px(Density::Full) / 2.0,
+            8.0,
+            "图标左边距应当是 8px,与行高上下留白同数"
+        );
+        assert_eq!(text_x(Density::Full), 48.0);
+        assert_eq!(
+            text_x(Density::Compact),
+            text_x(Density::Full),
+            "两个有文字的档必须共用同一条文字左界"
+        );
+    }
+
+    /// `Full` 档两行文字要在 48 行高里上下居中。行高从 44 涨到 48 时最容易
+    /// 漏改这两个基线常量,漏了的现象是两行字整体贴在行的上半部分。
+    ///
+    /// 这是个**代理断言**:真正的文字包围盒要排版才知道,这里用「名称上沿到
+    /// 行顶」对「副标题下沿到行底」的差值当近似,±1px 以内算居中。
+    ///
+    /// 自证会变红:把 `NAME_TOP` 改回 7.0。
+    #[test]
+    fn the_two_text_lines_sit_vertically_centred_in_the_full_row() {
+        let top_gap = NAME_TOP;
+        let bottom_gap = row_h(Density::Full) - (SUB_TOP + SUB_FONT_PX);
+        assert!(
+            (top_gap - bottom_gap).abs() <= 1.0,
+            "上留白 {top_gap} 与下留白 {bottom_gap} 差太多"
         );
     }
 

@@ -77,17 +77,10 @@ pub struct UiState {
     pub pending_delete: Option<SessionId>,
     /// 双击行 / 点「连接」→ app 事后据此 `ssh_config_for` + `spawn_connect`。
     pub connect_request: Option<SessionId>,
-    /// 最后一次发起连接的会话 id。`UserEvent::ConnectOk` 不带 SessionId,
-    /// 状态点要知道「是哪条连上了」,只能在发起时记下来。
+    /// 最后一次发起连接的会话 id。`UserEvent::ConnectOk`/`ConnectErr` 都不带
+    /// SessionId,自动化计划和 pane 的 `session_id` 要知道「是哪条连上了」,
+    /// 只能在发起时记下来。
     pub connect_request_last: Option<SessionId>,
-    /// 正在拨号中的会话(走查 4)。`spawn_connect` 置位,`ConnectOk`/`ConnectErr`
-    /// 清位。**不能从 `connect_request_last` 反推**:那个字段在连接成功之后
-    /// 仍然留着(状态点靠它认「是哪条连上了」),反推的话每条连上的会话都会
-    /// 永远显示「连接中」。
-    pub connecting: Option<SessionId>,
-    /// 最近一次拨号失败的会话(走查 4)。下一次对**任何**会话发起连接时清空 ——
-    /// 一条陈旧的失败标记挂上几个小时,用户会以为那条会话现在是坏的。
-    pub connect_failed: Option<SessionId>,
     /// F44:本次连接一次性跳过自动化(右键菜单)。app.rs 消费后立即清零 ——
     /// 右键跳过一次之后,普通双击连接若还静默跳过,用户会以为自动化坏了。
     pub connect_skip_automation: bool,
@@ -276,9 +269,6 @@ pub struct UiFrame<'a> {
     pub paste: Option<paste::PasteView<'a>>,
     /// 当前被编辑会话的三个凭据槽位「有没有值」。**只有 bool,无明文**。
     pub secret_presence: session_manager::SecretPresence,
-    /// 当前已连接的会话(状态点用)。`UserEvent::ConnectOk` 不带 SessionId,
-    /// 所以这里追踪的是「最后一次成功连上的那条」,不是全量连接集合。
-    pub connected_session: Option<SessionId>,
     /// F40~F44:自动化状态一句话。`None` = 这条连接没跑过自动化。
     /// 生命周期由 `App` 管:一直显示到下一次 `spawn_connect`(那时清空)。
     pub automation: Option<&'a str>,
@@ -367,7 +357,6 @@ pub fn build_ui(
             frame.sessions,
             frame.groups,
             frame.store_available,
-            frame.connected_session,
             frame.secret_presence,
             frame.appearance,
         );
@@ -557,7 +546,6 @@ mod tests {
             host_key: None,
             paste: None,
             secret_presence: session_manager::SecretPresence::default(),
-            connected_session: None,
             automation: None,
             // 测试专用:`AppearanceCache` 没有 const 构造,借 `Box::leak` 换一个
             // `'static` 引用——只在测试进程里泄漏一次,不是生产路径。

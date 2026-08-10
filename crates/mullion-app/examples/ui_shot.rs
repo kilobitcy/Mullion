@@ -53,7 +53,6 @@ struct Fixture {
     sessions: Vec<SessionRecord>,
     groups: Vec<GroupRecord>,
     ui: UiState,
-    connected: Option<SessionId>,
     presence: SecretPresence,
     store_available: bool,
 }
@@ -147,7 +146,6 @@ fn shoot(opts: &Opts) -> Result<String, String> {
         sessions,
         groups,
         mut ui,
-        connected,
         presence,
         store_available,
     } = fixture(&opts.scene);
@@ -169,7 +167,6 @@ fn shoot(opts: &Opts) -> Result<String, String> {
                 &sessions,
                 &groups,
                 store_available,
-                connected,
                 presence,
                 &appearance,
             );
@@ -332,7 +329,6 @@ fn fixture(scene: &str) -> Fixture {
             sessions: Vec::new(),
             groups: Vec::new(),
             ui,
-            connected: None,
             presence: SecretPresence::default(),
             store_available: true,
         },
@@ -354,7 +350,6 @@ fn fixture(scene: &str) -> Fixture {
             ],
             groups,
             ui,
-            connected: Some(SessionId(1)),
             presence: SecretPresence::default(),
             store_available: true,
         },
@@ -374,7 +369,6 @@ fn fixture(scene: &str) -> Fixture {
                 sessions,
                 groups,
                 ui,
-                connected: Some(SessionId(1)),
                 presence: SecretPresence {
                     password: true,
                     ..Default::default()
@@ -387,7 +381,6 @@ fn fixture(scene: &str) -> Fixture {
             sessions: many_sessions(12),
             groups,
             ui,
-            connected: Some(SessionId(3)),
             presence: SecretPresence::default(),
             store_available: true,
         },

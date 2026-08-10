@@ -128,7 +128,17 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<P
                         if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
                             let (r, _) = ui
                                 .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                            crate::ui::badge::paint_icon(ui.painter(), r, icon);
+                            crate::ui::badge::paint_icon(
+                                ui.painter(),
+                                r,
+                                icon,
+                                v.appearance.and_then(|a| {
+                                    crate::ui::badge::should_paint(
+                                        a,
+                                        mullion_store::ColorTarget::PaneTitle,
+                                    )
+                                }),
+                            );
                         }
                         let dot = match v.status {
                             PaneStatus::Live => t.ok,
@@ -477,5 +487,104 @@ mod tests {
                 rect.height()
             );
         }
+    }
+
+    /// F61/F62 复核挖出的真缺口,与 `list.rs` 的
+    /// `icon_backdrop_uses_the_list_item_target_not_pane_title` 互为镜像:
+    /// 标题条画图标底色时必须钉死用的是 `ColorTarget::PaneTitle`,不是随手
+    /// 传了别的落点。`area_rect_stays_exact_even_with_appearance_bar_and_icon`
+    /// 虽然同时设了 icon 和 color,但只查 `Area` 几何,查不出底色到底有没有
+    /// 垫、垫没垫对颜色——复核之前这条调用完全没有安全网。
+    ///
+    /// 用「填色 + 方形」而不是数图形总数区分图标底色和边缘竖条:两者用的是
+    /// 同一次 `should_paint` 系调用结果,颜色一样,但边缘竖条是 `EDGE_BAR_W`
+    /// 宽、标题条高的细长条,图标底色是 14x14 的正方形。
+    ///
+    /// 自证会变红:把画图标那次 `should_paint` 调用的 `ColorTarget::PaneTitle`
+    /// 改成 `ColorTarget::ListItem`(边缘竖条那次不动)。
+    #[test]
+    fn icon_backdrop_uses_the_pane_title_target_not_list_item() {
+        use mullion_store::{ColorTarget, IconKind, IconSpec};
+        let color = egui::Color32::from_rgb(0x1e, 0x88, 0xe5);
+
+        fn appearance_with_icon(targets: Vec<ColorTarget>) -> crate::ui::badge::Appearance {
+            crate::ui::badge::Appearance {
+                icon: Some(IconSpec {
+                    kind: IconKind::Ico,
+                    value: real_ico(),
+                    bg: None,
+                }),
+                color: Some(mullion_store::ColorSpec {
+                    hex: "#1e88e5".into(),
+                    apply_to: targets,
+                }),
+            }
+        }
+
+        fn run_title_shapes(appearance: Option<&crate::ui::badge::Appearance>) -> egui::FullOutput {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(1.0);
+            let views = [TitleView {
+                geom: geom_800x600_title32(1),
+                index: 1,
+                host: Some("dev@build-01"),
+                status: PaneStatus::Live,
+                focused: true,
+                appearance,
+            }];
+            // 显式推进时间,而不是像 `run_title` 那样跑两帧靠墙钟走时间:
+            // 这条测试要比较**颜色**,`fade_in` 半路上的不透明度会把 RGB
+            // 也跟着缩放(premultiplied),两帧之间墙钟走了多久是不确定的,
+            // 缩放比例就对不上、颜色比不出来。显式把第二帧的时间戳推到远
+            // 超过 `animation_time`(默认 1/12s)之后,拿到的就是稳定的
+            // 满不透明度颜色。
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(0.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &crate::theme::MULLION_DARK, &views);
+                },
+            );
+            ctx.run(
+                egui::RawInput {
+                    time: Some(1.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &crate::theme::MULLION_DARK, &views);
+                },
+            )
+        }
+
+        fn square_fill_count(shapes: &[egui::epaint::ClippedShape], color: egui::Color32) -> usize {
+            fn walk(s: &egui::Shape, color: egui::Color32) -> usize {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().map(|s| walk(s, color)).sum(),
+                    egui::Shape::Rect(r)
+                        if r.fill == color && (r.rect.width() - r.rect.height()).abs() < 0.5 =>
+                    {
+                        1
+                    }
+                    _ => 0,
+                }
+            }
+            shapes.iter().map(|cs| walk(&cs.shape, color)).sum()
+        }
+
+        let list_item_only = appearance_with_icon(vec![ColorTarget::ListItem]);
+        let baseline = square_fill_count(&run_title_shapes(Some(&list_item_only)).shapes, color);
+        assert_eq!(
+            baseline, 0,
+            "只勾了「会话列表」的会话,不该在标题条的图标下垫这个颜色的方块"
+        );
+
+        let pane_title_only = appearance_with_icon(vec![ColorTarget::PaneTitle]);
+        let with_bg = square_fill_count(&run_title_shapes(Some(&pane_title_only)).shapes, color);
+        assert_eq!(
+            with_bg, 1,
+            "勾了「pane 标题条」的会话,图标下应该恰好垫一块这个颜色的方块"
+        );
     }
 }

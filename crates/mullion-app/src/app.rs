@@ -192,9 +192,6 @@ pub struct App {
     autoscroll: i32,
     /// 待用户确认的多行粘贴(F18)。`Some` = 弹窗开着,计入 `modal`(T8)。
     pending_paste: Option<String>,
-    /// 当前已连接的会话(状态点用)。`ConnectOk` 时从 `ui.connect_request_last`
-    /// 记下来,`UserEvent::ConnectOk` 本身不带 SessionId。
-    connected_session: Option<mullion_store::SessionId>,
     /// F61/F62:会话外观的解析缓存。**只在会话/分组变更后 rebuild**,
     /// 绝不在渲染里现算(陷阱 T3,见 `ui::badge::AppearanceCache`)。
     appearance: crate::ui::badge::AppearanceCache,
@@ -263,7 +260,6 @@ impl App {
             press_anchor: None,
             autoscroll: 0,
             pending_paste: None,
-            connected_session: None,
             appearance: Default::default(),
             probe_epoch: 0,
             probe_task: None,
@@ -711,10 +707,6 @@ impl App {
         // 删会话,所以计划必须在用户点击的这一帧定死。
         // 上一次的结论到此为止:新连接开始了,旧结论就是误导信息。
         self.automation_status = None;
-        // 走查 4:状态点进「连接中」。失败标记一并清掉 —— 上一次失败的是哪条
-        // 都不重要,用户已经在重新拨了,旧的红标记只会误导。
-        self.ui.connecting = self.ui.connect_request_last;
-        self.ui.connect_failed = None;
         self.pending_automation =
             crate::automation::pending_for(self.ui.connect_request_last, |id| {
                 let store = self.store.as_ref()?;
@@ -1090,8 +1082,8 @@ impl ApplicationHandler<UserEvent> for App {
                         .last_cfg
                         .as_ref()
                         .map_or_else(String::new, |c| format!("{}:{}", c.host, c.port)),
-                    // 与紧邻的 `self.connected_session` 同源:都取发起这次连接时
-                    // 记下的那条会话(`ConnectOk` 事件本身不带 SessionId)。
+                    // 取发起这次连接时记下的那条会话
+                    // (`ConnectOk` 事件本身不带 SessionId)。
                     session_id: self.ui.connect_request_last,
                     handle,
                 });
@@ -1099,11 +1091,6 @@ impl ApplicationHandler<UserEvent> for App {
                 self.current_preset = Some(Preset::Single);
                 // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
                 self.ui.close_session_manager();
-                // ConnectOk 不带 SessionId(见 UserEvent 定义),用发起连接时
-                // 记下的那条。
-                self.connected_session = self.ui.connect_request_last;
-                // 走查 4:拨号结束,「连接中」态收工。
-                self.ui.connecting = None;
                 self.ui_dirty = true;
                 // F40~F44:起自动化。旧那次(如果有)的结论对新连接没有意义。
                 if let Some(old) = self.automation.take() {
@@ -1255,11 +1242,6 @@ impl ApplicationHandler<UserEvent> for App {
                     std::process::exit(1);
                 }
                 self.ui.set_error(msg);
-                // 走查 4:把失败落到发起连接的那条会话上。`connect_request_last`
-                // 在整个拨号期间不会变(下一次 `spawn_connect` 才重写),所以
-                // 这里读到的一定是刚失败的那条。
-                self.ui.connect_failed = self.ui.connect_request_last;
-                self.ui.connecting = None;
                 self.request_ui_redraw();
             }
             UserEvent::ProbeOk(epoch) => {
@@ -1681,7 +1663,6 @@ impl ApplicationHandler<UserEvent> for App {
                                     (Some(s), Some(id)) => s.secret_presence(id),
                                     _ => crate::ui::session_manager::SecretPresence::default(),
                                 },
-                                connected_session: self.connected_session,
                                 // 「跑着的时候盖住上一次的结论」这条规则放在
                                 // `automation::status_line` 里,不在这儿手写
                                 // if/else —— 写反的现象是新连接的状态栏挂着上
@@ -1743,9 +1724,6 @@ impl ApplicationHandler<UserEvent> for App {
                             if self.ui.request_disconnect {
                                 self.ui.request_disconnect = false;
                                 self.ws = None;
-                                // 与 self.ws 成对维护:断开后不清会一直显示
-                                // 「已连接」的陈旧状态点。
-                                self.connected_session = None;
                                 // F40:自动化 task 也持有一份 `Arc<SshSession>`。
                                 // 不 abort 的话,`self.ws = None` 只 drop 掉 pane 那
                                 // 一份,`io_task` 因 cmd_tx 仍有克隆而不会收口 ——

@@ -29,7 +29,7 @@ pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
 pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget};
 
 use egui::NumExt as _;
-use mullion_store::{GroupId, GroupRecord, SessionId, SessionRecord};
+use mullion_store::{GroupId, GroupRecord, SessionRecord};
 
 use crate::theme::{self, Theme};
 use crate::ui::annotate;
@@ -46,12 +46,9 @@ pub(crate) fn tab_title(i: usize) -> &'static str {
 pub(crate) const WINDOW_W: f32 = 880.0;
 pub(crate) const WINDOW_H: f32 = 560.0;
 pub(crate) const LIST_W: f32 = 300.0;
-/// 左栏拖拽下限。= 64px 图标 + 两侧 12 内边距,正好容得下最窄那一档
-/// (`list::Density::Icons`)。
-///
-/// 原来是 220(「再窄 user@host 副文本就没法读了」)。F61 加了三档密度之后
-/// 这条理由不成立了:副文本读不了就换一档不画它,而不是不让用户拖窄。
-pub(crate) const LIST_MIN_W: f32 = 88.0;
+/// 左栏能拖到的最窄宽度。= 32px 图标 + 左右各 12px 呼吸。必须**严格小于**
+/// `list::ICONS_BELOW`(88),否则纯图标档永远拖不出来。
+pub(crate) const LIST_MIN_W: f32 = 56.0;
 /// 左栏拖拽上限。与 `WINDOW_W` 联立,但**别信纸面公式**——两栏
 /// `inner_margin` 各 14、两侧共 28,「880 - 440 - 28 = 412」看着像右栏
 /// 内容宽,但 egui 的 `Window` 内容区实际取 `default_size`(880),不是
@@ -282,7 +279,6 @@ pub fn show(
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
     store_available: bool,
-    connected: Option<SessionId>,
     presence: SecretPresence,
     appearance: &crate::ui::badge::AppearanceCache,
 ) -> Option<egui::Rect> {
@@ -464,7 +460,7 @@ pub fn show(
                         .inner_margin(14.0),
                 )
                 .show_inside(ui, |ui| {
-                    list::show(ui, t, ui_state, sessions, groups, connected, appearance)
+                    list::show(ui, t, ui_state, sessions, groups, appearance)
                 });
             annotate::mark(ui.ctx(), "会话管理器/左栏", list_panel.response.rect);
 
@@ -709,6 +705,7 @@ pub(super) fn secret_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mullion_store::SessionId;
 
     /// 走查 16:快捷键真的接到 `show()` 上了 —— `keys::scan` 单测只证明「按键
     /// 被解成了动作」,证不了那个动作有人消费。这条从 `show()` 驱动:Esc 关窗、
@@ -768,7 +765,6 @@ mod tests {
                             &sessions,
                             &[],
                             true,
-                            None,
                             SecretPresence::default(),
                             &crate::ui::badge::AppearanceCache::default(),
                         );
@@ -954,7 +950,6 @@ mod tests {
                 &sessions,
                 &groups,
                 true,
-                None,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -968,7 +963,6 @@ mod tests {
                 &sessions,
                 &groups,
                 true,
-                None,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -1016,7 +1010,6 @@ mod tests {
                 &sessions,
                 &groups,
                 true,
-                None,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -1030,7 +1023,6 @@ mod tests {
                 &sessions,
                 &groups,
                 true,
-                None,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -1116,7 +1108,6 @@ mod tests {
                 &sessions,
                 &groups,
                 true,
-                None,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -1130,7 +1121,6 @@ mod tests {
                 &sessions,
                 &groups,
                 true,
-                None,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -1198,7 +1188,6 @@ mod tests {
                     &sessions,
                     &groups,
                     true,
-                    None,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1398,7 +1387,6 @@ mod tests {
                     &sessions,
                     &groups,
                     true,
-                    None,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1536,7 +1524,6 @@ mod tests {
                     &sessions,
                     &groups,
                     true,
-                    None,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1551,7 +1538,6 @@ mod tests {
                 &sessions,
                 &groups,
                 true,
-                None,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -1601,7 +1587,6 @@ mod tests {
                     &sessions,
                     &groups,
                     true,
-                    None,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1626,7 +1611,6 @@ mod tests {
                     &sessions,
                     &groups,
                     true,
-                    None,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1681,7 +1665,6 @@ mod tests {
                     &sessions,
                     &groups,
                     true,
-                    None,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1769,7 +1752,6 @@ mod tests {
                     &sessions,
                     &groups,
                     true,
-                    None,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );

@@ -151,14 +151,14 @@ pub enum IconKind {
 pub struct IconSpec {
     pub kind: IconKind,
     pub value: String,
-    /// 图标底色(`#rrggbb`)。`None` = 不垫底色,直接画在面板上。
+    /// **已停用(v0.1.28)。** 图标底色改为跟随会话的节点色(`ColorSpec`),
+    /// 不再单独配置;绘制侧 `badge::paint_icon` 不再读这个字段。
     ///
-    /// 存在的理由:用户导入的 .ico 大多是给浅色资源管理器画的,深色主题下
-    /// 一张深色图标糊在深色面板上等于看不见。垫一块底色是唯一不改图本身
-    /// 就能救回来的办法。
+    /// 字段保留而非删除:v6 的文件里可能存着值,读到不该崩、也不该丢用户数据。
+    /// 不做迁移 —— 迁移要动 `SCHEMA_VERSION`,而这里没有任何东西需要转换。
     ///
-    /// 带 `default` + `skip_serializing_if`:v5 的文件里没有这个键,没垫底色的
-    /// 图标也不该往 TOML 里写一行 `bg = ""`。
+    /// 带 `default` + `skip_serializing_if`:没垫底色的图标不该往 TOML 里
+    /// 写一行 `bg = ""`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
 }

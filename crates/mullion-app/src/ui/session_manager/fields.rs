@@ -446,35 +446,33 @@ pub(super) fn basic(
     jump(ui, t, buf, groups, sessions, editing, &mut first);
 }
 
-/// 勾上「底色」时的落点。取一个中性浅灰:用户导入的 .ico 十有八九是给浅色
-/// 资源管理器画的深色图标,浅底立刻能看见 —— 一上来就给个鲜艳色反而要多点
-/// 一次去改。
-pub(super) const DEFAULT_ICON_BG: &str = "#e8e8e8";
-
 /// `Color32` → `#rrggbb`。色盘吐的是 `Color32`,库里存的是 hex 文本,
 /// 两个方向都只有一份实现(反方向是 `theme::parse_hex`)。
 pub(super) fn hex_of(c: egui::Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }
 
-/// 图标在两个尺寸档下的实时预览。
+/// 图标在列表实际取图尺寸下的实时预览。
 ///
-/// 列表拖窄之后是按 32 / 64 取图的,不当场画出来,用户得先保存、再去拖列表
-/// 才知道自己选的图标在小尺寸下还认不认得出 —— 而「认不认得出」正是选图标
-/// 时唯一要判断的事。
-fn icon_preview(ui: &mut Ui, t: &Theme, icon: Option<&mullion_store::IconSpec>) {
+/// 只画 32px 一档:三档列表现在都按 32 取图,继续预览 64 是在骗人 ——
+/// 而「小尺寸下还认不认得出」正是选图标时唯一要判断的事。
+fn icon_preview(
+    ui: &mut Ui,
+    t: &Theme,
+    icon: Option<&mullion_store::IconSpec>,
+    bg: Option<egui::Color32>,
+) {
     let Some(icon) = icon else { return };
+    let size = crate::ui::ico::SMALL;
     ui.horizontal(|ui| {
-        for size in [crate::ui::ico::SMALL, crate::ui::ico::LARGE] {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(size as f32, size as f32), egui::Sense::hover());
-            crate::ui::badge::paint_icon(ui.painter(), rect, icon);
-            ui.label(
-                egui::RichText::new(format!("{size}px"))
-                    .size(11.0)
-                    .color(crate::theme::c32(t.fg_muted)),
-            );
-        }
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(size as f32, size as f32), egui::Sense::hover());
+        crate::ui::badge::paint_icon(ui.painter(), rect, icon, bg);
+        ui.label(
+            egui::RichText::new(format!("{size}px"))
+                .size(11.0)
+                .color(crate::theme::c32(t.fg_muted)),
+        );
     });
 }
 
@@ -537,37 +535,22 @@ pub(crate) fn appearance(
             }
 
             if has_ico {
-                ui.horizontal(|ui| {
-                    ui.label("底色");
-                    // 底色是**可选**的:大多数 .ico 自带透明背景、在深色面板上
-                    // 就挺好。只有深色图标才需要垫一块。
-                    let Some(icon) = buf.preserved_appearance.icon.as_mut() else {
-                        return;
-                    };
-                    let mut on = icon.bg.is_some();
-                    if ui.checkbox(&mut on, "").changed() {
-                        icon.bg = on.then(|| DEFAULT_ICON_BG.to_string());
-                    }
-                    if let Some(hex) = icon.bg.clone() {
-                        let mut c = crate::theme::parse_hex(&hex)
-                            .map_or(egui::Color32::WHITE, crate::theme::c32);
-                        // egui 自带的色盘:点开是 HSV 面板 + hex 输入,比摆一排
-                        // 固定色块能选的多得多。`Alpha::Opaque` —— 垫底就是为了
-                        // 盖住面板色,半透明没有意义。
-                        if egui::color_picker::color_edit_button_srgba(
-                            ui,
-                            &mut c,
-                            egui::color_picker::Alpha::Opaque,
-                        )
-                        .changed()
-                        {
-                            icon.bg = Some(hex_of(c));
-                        }
-                    }
-                });
-                // 预览:32 和 64 两档并排画一次。列表在窄档下就是按这两个尺寸
-                // 取图的,不当场给看,用户得先存、再拖窄列表才知道效果。
-                icon_preview(ui, t, buf.preserved_appearance.icon.as_ref());
+                // 预览:按列表真实取图的尺寸画一次。不当场给看,用户得先存、
+                // 再去拖列表才知道自己选的图标在小尺寸下还认不认得出。
+                //
+                // 底色跟节点色走(过 `ListItem` 闸门),与列表行同源 —— 只勾了
+                // 「pane 标题条」时预览也不垫底,预览的是列表里的真实效果,
+                // 不是理想效果。
+                icon_preview(
+                    ui,
+                    t,
+                    buf.preserved_appearance.icon.as_ref(),
+                    crate::ui::badge::color_rgb(
+                        buf.preserved_appearance.color.as_ref(),
+                        ColorTarget::ListItem,
+                    )
+                    .map(crate::theme::c32),
+                );
             }
         });
         ui.end_row();
@@ -718,7 +701,7 @@ pub(crate) fn appearance(
     );
     ui.colored_label(
         crate::theme::c32(t.fg_dimmer),
-        "左栏列表里就是这个样子。竖条只在「作用于」勾了「会话列表」时出现。",
+        "左栏列表里就是这个样子。选中时的背景色和右侧竖条,只在「作用于」勾了「会话列表」时出现;图标背景色则跟各个落点各自的勾选走 —— 勾「会话列表」在左栏垫底,勾「pane 标题条」在终端标题栏垫底。",
     );
 }
 
@@ -3076,46 +3059,135 @@ mod tests {
         );
     }
 
-    /// 底色开关关着的时候**不该**往库里写一个底色 —— 大多数 .ico 自带透明
-    /// 背景,在深色面板上本来就好看,凭空垫一块浅灰反而毁了。
+    /// 「底色」那一行已下线(v0.1.28):图标底色跟节点色走,不再单独配。
     ///
-    /// 顺带钉住:没有图标时整段底色 UI 都不该出现(没图标垫什么底)。
+    /// 第二段钉住「不再往库里写」:UI 没了但代码若还在某处塞 `DEFAULT_ICON_BG`,
+    /// 用户看不见却被写进了配置文件,那是最难查的一类脏数据。
+    ///
+    /// 自证会变红:把那段底色 `ui.horizontal` 加回 `appearance()`。
     #[test]
-    fn the_background_colour_stays_unset_until_you_ask_for_it() {
+    fn the_appearance_page_no_longer_offers_a_separate_icon_background() {
         let mut buf = ico_buf();
-        run_appearance(&mut buf);
+        let out = run_appearance(&mut buf);
+        assert!(
+            find_text_pos(&out.shapes, "底色").is_none(),
+            "「底色」那一行该没了"
+        );
         assert_eq!(
             buf.preserved_appearance
                 .icon
                 .as_ref()
                 .and_then(|i| i.bg.as_ref()),
             None,
-            "没勾底色就不该凭空写一个"
-        );
-
-        let mut empty = EditorBuffer::default();
-        let out = run_appearance(&mut empty);
-        assert!(
-            find_text_pos(&out.shapes, "底色").is_none(),
-            "还没有图标时不该出现底色设置"
+            "UI 下线后不该还有代码往库里写底色"
         );
     }
 
-    /// 图标页要能当场看到 32 和 64 两个尺寸。列表窄档取的就是这两张图,
-    /// 不当场画出来,用户得先保存、再去拖列表才知道小尺寸下认不认得出 ——
-    /// 而「认不认得出」正是选图标时唯一要判断的事。
+    /// 预览只剩 32px 一档 —— 列表三档现在都按 32 取图,继续预览 64 是在骗人。
+    /// 「小尺寸下还认不认得出」正是选图标时唯一要判断的事,预览尺寸必须与列表
+    /// 真实取图的尺寸一致。
     ///
-    /// 自证会变红:把 `appearance()` 里的 `icon_preview(...)` 调用删掉。
+    /// 自证会变红:把 `icon_preview` 的循环改回 `[SMALL, LARGE]`。
     #[test]
-    fn the_icon_page_previews_both_size_steps() {
+    fn the_icon_preview_shows_only_the_size_the_list_actually_uses() {
         let mut buf = ico_buf();
         let out = run_appearance(&mut buf);
-        for label in ["32px", "64px"] {
-            assert!(
-                find_text_pos(&out.shapes, label).is_some(),
-                "图标页应当预览 {label} 这一档"
-            );
+        assert!(
+            find_text_pos(&out.shapes, "32px").is_some(),
+            "该有 32px 那一档"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "64px").is_none(),
+            "64px 那一档该没了"
+        );
+    }
+
+    /// 按「填色 + 正方形 + 边长等于给定值 + 在某条 y 分界线以上」过滤
+    /// `Shape::Rect`。与 `list.rs` 的 `square_fill_count` 同一个填色/正方形
+    /// 判据,这里多加两道:
+    ///
+    /// - 边长:图标预览页上色盘按钮(`interact_size` 40x18,非正方形)、
+    ///   色板圆点(`circle_filled`,根本不是 `Shape::Rect`)都过不了前两重
+    ///   筛选,但留着这道门槛以防将来页面上出现别的正方形色块。
+    /// - y 分界线:本页下方「预览」分节(`preview_row`)另画了一份图标 ——
+    ///   同样受 `ColorTarget::ListItem` 门控,但那是另一个早已存在、未被
+    ///   本次改动触及的调用点。原始版本没有这道分界线,直接数全页方块
+    ///   得到 2(顶部字段一块 + 底部「预览」一块),混进了不该数的那个,
+    ///   导致断言写错。用「预览」这个分节标题的渲染位置(`section()` 精确
+    ///   画出的那一行文字)当分界线,只数分界线以上——也就是「图标」字段
+    ///   那一行——的方块,才是本 Task 真正要钉住的那次调用。
+    fn square_fill_count_above(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+        side: f32,
+        below_y: f32,
+    ) -> usize {
+        fn walk(s: &egui::Shape, color: egui::Color32, side: f32, below_y: f32) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(|s| walk(s, color, side, below_y)).sum(),
+                egui::Shape::Rect(r)
+                    if r.fill == color
+                        && (r.rect.width() - r.rect.height()).abs() < 0.5
+                        && (r.rect.width() - side).abs() < 0.5
+                        && r.rect.min.y < below_y =>
+                {
+                    1
+                }
+                _ => 0,
+            }
         }
+        shapes
+            .iter()
+            .map(|cs| walk(&cs.shape, color, side, below_y))
+            .sum()
+    }
+
+    /// 复核挖出的真缺口:编辑器「图标」字段那一行预览的底色必须过
+    /// `ColorTarget::ListItem` 这道闸门,不能随手用了别的落点 —— 复核实测:
+    /// 把 `icon_preview` 调用处传入的 `ColorTarget::ListItem` 改成
+    /// `ColorTarget::PaneTitle`,`cargo test --workspace` 546 项全过、
+    /// 0 失败,没有任何测试会变红。与 `list.rs` 侧的
+    /// `icon_backdrop_uses_the_list_item_target_not_pane_title` 同源:
+    /// 「预览的是列表里的真实效果,不是理想效果」这条设计需要一张安全网。
+    ///
+    /// 自证会变红:把 `appearance()` 里 `icon_preview(...)` 调用传入的
+    /// `ColorTarget::ListItem` 改成 `ColorTarget::PaneTitle`。
+    #[test]
+    fn the_icon_preview_backdrop_uses_the_list_item_target_not_pane_title() {
+        use mullion_store::ColorTarget;
+        // #1e88e5 不在项目调色板(`theme::LABEL_PALETTE`)里,避免跟主题色/
+        // 背景色碰撞出假阳性——与 `list.rs` 同一条测试用的标记色一致。
+        let marker = egui::Color32::from_rgb(0x1e, 0x88, 0xe5);
+        let side = crate::ui::ico::SMALL as f32;
+
+        let run_with = |apply_to: Vec<ColorTarget>| {
+            let mut buf = ico_buf();
+            buf.preserved_appearance.color = Some(mullion_store::ColorSpec {
+                hex: "#1e88e5".to_string(),
+                apply_to,
+            });
+            run_appearance(&mut buf)
+        };
+
+        let out_pt = run_with(vec![ColorTarget::PaneTitle]);
+        let boundary_pt = find_text_pos(&out_pt.shapes, "预览")
+            .expect("「预览」分节标题必须画出来,否则分界线本身就是假的")
+            .y;
+        assert_eq!(
+            square_fill_count_above(&out_pt.shapes, marker, side, boundary_pt),
+            0,
+            "只勾了「pane 标题条」时,「图标」字段那行预览不该垫这个颜色的底"
+        );
+
+        let out_li = run_with(vec![ColorTarget::ListItem]);
+        let boundary_li = find_text_pos(&out_li.shapes, "预览")
+            .expect("「预览」分节标题必须画出来,否则分界线本身就是假的")
+            .y;
+        assert_eq!(
+            square_fill_count_above(&out_li.shapes, marker, side, boundary_li),
+            1,
+            "勾了「会话列表」时,「图标」字段那行预览该恰好垫一块这个颜色的底"
+        );
     }
 
     /// hex 与 `Color32` 的往返必须闭合:色盘吐 `Color32`、库里存 `#rrggbb`,
@@ -4233,12 +4305,10 @@ mod tests {
         for width in [300.0f32, 440.0, 900.0] {
             for ppp in [1.0f32, 1.25, 1.5] {
                 let t = crate::theme::MULLION_DARK;
-                // 有图标时才会出现「底色」那一行和两档预览;有颜色时才会出现
+                // 有图标时才会出现预览那一档;有颜色时才会出现
                 // 「自定义 #rrggbb」那一行,连带把「作用于」的三个勾选框也铺开
                 // —— 一次覆盖本页所有会变宽的分支。
                 let mut buf = ico_buf();
-                buf.preserved_appearance.icon.as_mut().unwrap().bg =
-                    Some(super::DEFAULT_ICON_BG.into());
                 buf.preserved_appearance.color = Some(ColorSpec {
                     hex: "#ff0000".to_string(),
                     apply_to: vec![ColorTarget::ListItem],

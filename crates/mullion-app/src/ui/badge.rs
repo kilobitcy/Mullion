@@ -29,16 +29,31 @@ pub struct Appearance {
     pub color: Option<ColorSpec>,
 }
 
-/// 这个落点该用什么颜色画。`None` = 不画。
+/// 这个落点该用什么颜色画,**未转成 `Color32`**。
+///
+/// 收 `Option<&ColorSpec>` 而不是 `&Appearance`:编辑器手上是一份还没保存的
+/// `AppearancePrefs`,构造不出 `Appearance`。收最小的那个东西,三处调用方
+/// (列表 / pane 标题条 / 编辑器预览)才能共用同一份 `apply_to` 过滤。
+///
+/// 返回 `Rgb` 而不是 `Color32`:对比度实算(`theme::contrast_ratio`)只吃 `Rgb`,
+/// 而会话行背景要跟 `fg` 算对比度。
+pub fn color_rgb(
+    color: Option<&ColorSpec>,
+    target: ColorTarget,
+) -> Option<mullion_term::snapshot::Rgb> {
+    let c = color?;
+    if !c.apply_to.contains(&target) {
+        return None;
+    }
+    theme::parse_hex(&c.hex)
+}
+
+/// 这个落点该用什么颜色画。`None` = 不画。`color_rgb` 的 `Color32` 包装。
 ///
 /// 三处落点共用,所以「`apply_to` 过滤 + hex 解析失败降级」这两件事
 /// 只有一份实现、只能错一次。
 pub fn should_paint(a: &Appearance, target: ColorTarget) -> Option<egui::Color32> {
-    let c = a.color.as_ref()?;
-    if !c.apply_to.contains(&target) {
-        return None;
-    }
-    theme::parse_hex(&c.hex).map(theme::c32)
+    color_rgb(a.color.as_ref(), target).map(theme::c32)
 }
 
 /// 会话外观的解析缓存。
@@ -198,17 +213,18 @@ fn texture(ctx: &egui::Context, b64: &str, want: u32) -> Option<egui::TextureHan
 ///    可能存在,读到不该崩 —— 但**也不该画**:emoji 在 epaint 下只能是黑白
 ///    剪影(不支持 COLR/CPAL 彩色字形),而列表新增的 64px 纯图标档里,一屏
 ///    黑白剪影根本认不出哪台是哪台。
-/// 2. **底色垫在图标下面**。用户导入的 .ico 多半是给浅色资源管理器画的,
-///    深色图标糊在深色面板上等于没有;垫一块底色是不改图本身就能救回来的
-///    唯一办法。没设底色就直接画在面板上。
+/// 2. **底色垫在图标下面,由调用方给**。用户导入的 .ico 多半是给浅色资源
+///    管理器画的,深色图标糊在深色面板上等于没有;垫一块底色是不改图本身就能
+///    救回来的唯一办法。底色 = 会话的节点色(过该落点的 `apply_to` 闸门),
+///    传 `None` 就直接画在面板上。`IconSpec.bg` 那个独立可配字段已停用。
 /// 3. **不收会话语义色**:图标是用户自己的图,染色只会把它毁掉。语义色走
 ///    边缘竖条(`paint_edge_bar`)。
-pub fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: &IconSpec) {
+pub fn paint_icon(p: &egui::Painter, rect: egui::Rect, icon: &IconSpec, bg: Option<egui::Color32>) {
     if icon.kind != IconKind::Ico {
         return;
     }
-    if let Some(bg) = icon.bg.as_ref().and_then(|h| theme::parse_hex(h)) {
-        p.rect_filled(rect, egui::Rounding::same(ICON_BG_ROUNDING), theme::c32(bg));
+    if let Some(bg) = bg {
+        p.rect_filled(rect, egui::Rounding::same(ICON_BG_ROUNDING), bg);
     }
     let side = rect.width().min(rect.height());
     let Some(tex) = texture(p.ctx(), &icon.value, if side <= 32.0 { 32 } else { 64 }) else {
@@ -327,20 +343,25 @@ mod tests {
         shapes.iter().map(|cs| walk(&cs.shape)).sum()
     }
 
-    /// 跑一帧,返回「画了 `icon` 时的图形数」。传 `None` 得到不画任何图标的
-    /// 基线 —— `CentralPanel` 自己也会画背景,不能拿绝对数字当断言。
-    fn shapes_with(icon: Option<&IconSpec>) -> usize {
+    /// 跑一帧,返回「画了 `icon`(底色 `bg`)时的图形数」。传 `None` 得到不画
+    /// 任何图标的基线 —— `CentralPanel` 自己也会画背景,不能拿绝对数字当断言。
+    fn shapes_with_bg(icon: Option<&IconSpec>, bg: Option<egui::Color32>) -> usize {
         let ctx = egui::Context::default();
         let out = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 if let Some(i) = icon {
                     let rect =
                         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(16.0, 16.0));
-                    paint_icon(ui.painter(), rect, i);
+                    paint_icon(ui.painter(), rect, i, bg);
                 }
             });
         });
         count_shapes(&out.shapes)
+    }
+
+    /// 不带底色的简写。现有几条测试只关心「画没画图标」。
+    fn shapes_with(icon: Option<&IconSpec>) -> usize {
+        shapes_with_bg(icon, None)
     }
 
     /// 一张真图标必须真往 painter 里放东西 —— 这是
@@ -353,32 +374,37 @@ mod tests {
         assert!(n > base, "导入的 .ico 必须画出图形(基线 {base},实际 {n})");
     }
 
-    /// 底色是**垫在图标下面**多画的一层,不是替代图标。没设底色的同一张图
-    /// 必须比设了底色的少画一个图形 —— 否则「配了底色但没生效」这种事在
-    /// 深色主题下正好看不出来(深图标 + 没垫底 = 一片黑,和没图标一样)。
+    /// 底色现在由**调用方**传:图标画在哪个落点,就用哪个落点的 `apply_to`
+    /// 判定,而 `paint_icon` 自己拿不到 `target`(同一张图在列表和标题条上
+    /// 该不该有底色,答案可能不同)。
     ///
-    /// 自证会变红:把 `paint_icon` 里那句 `rect_filled` 删掉,两边相等,断言炸。
+    /// 第二段钉死 `IconSpec.bg` 真的停用了:schema 里还留着这个字段(旧配置
+    /// 里可能有值,读到不该崩),但**不该再影响绘制**。
+    ///
+    /// 自证会变红:让 `paint_icon` 回头去读 `icon.bg`(第二段炸);
+    /// 把那句 `rect_filled` 删掉(第一段炸)。
     #[test]
-    fn a_background_colour_is_painted_underneath_the_icon() {
+    fn the_backdrop_comes_from_the_caller_not_from_the_stored_bg_field() {
         let b64 = real_ico([9, 9, 9, 255]);
-        let plain = shapes_with(Some(&icon(IconKind::Ico, &b64)));
-        let with_bg = shapes_with(Some(&IconSpec {
-            kind: IconKind::Ico,
-            value: b64.clone(),
-            bg: Some("#1e88e5".into()),
-        }));
+        let plain = shapes_with_bg(Some(&icon(IconKind::Ico, &b64)), None);
+        let with_bg = shapes_with_bg(
+            Some(&icon(IconKind::Ico, &b64)),
+            Some(egui::Color32::from_rgb(0x1e, 0x88, 0xe5)),
+        );
         assert!(
             with_bg > plain,
-            "底色应当多画一层(无底色 {plain},有底色 {with_bg})"
+            "传了底色应当多画一层(没传 {plain},传了 {with_bg})"
         );
 
-        // 坏 hex 走降级:不垫底色,但图标照画。配置被手改坏不该让图标消失。
-        let bad_bg = shapes_with(Some(&IconSpec {
-            kind: IconKind::Ico,
-            value: b64,
-            bg: Some("不是颜色".into()),
-        }));
-        assert_eq!(bad_bg, plain, "认不出的底色应当降级成不垫,而不是不画图标");
+        let legacy = shapes_with_bg(
+            Some(&IconSpec {
+                kind: IconKind::Ico,
+                value: b64,
+                bg: Some("#1e88e5".into()),
+            }),
+            None,
+        );
+        assert_eq!(legacy, plain, "已停用的 IconSpec.bg 不该再影响绘制");
     }
 
     /// 认不出的值一律**不画**,与「没设图标」表现一致。四种情况共用这一条
@@ -565,5 +591,31 @@ mod tests {
     fn unknown_session_id_returns_none() {
         let c = AppearanceCache::default();
         assert!(c.get(SessionId(999)).is_none());
+    }
+
+    /// 闸门只有一份实现:`should_paint` 是 `color_rgb` 的 `Color32` 包装。
+    /// 拆两层是因为对比度实算(`theme::contrast_ratio`)只吃 `Rgb`,而会话行
+    /// 背景要跟 `fg` 算对比度;两处各写一遍 `apply_to` 过滤迟早分叉。
+    #[test]
+    fn should_paint_is_just_the_color32_wrapper_over_color_rgb() {
+        let a = colored("#e06767", &[ColorTarget::ListItem]);
+        assert_eq!(
+            color_rgb(a.color.as_ref(), ColorTarget::ListItem),
+            theme::parse_hex("#e06767")
+        );
+        assert_eq!(
+            color_rgb(a.color.as_ref(), ColorTarget::PaneTitle),
+            None,
+            "没勾的落点一律 None"
+        );
+        assert_eq!(
+            should_paint(&a, ColorTarget::ListItem),
+            color_rgb(a.color.as_ref(), ColorTarget::ListItem).map(theme::c32)
+        );
+        assert_eq!(
+            color_rgb(None, ColorTarget::ListItem),
+            None,
+            "没设色 → None"
+        );
     }
 }
