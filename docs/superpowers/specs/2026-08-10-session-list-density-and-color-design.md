@@ -67,9 +67,18 @@ v0.1.27 的 F100 标注模式导出了当前左栏的实际布局，据此提出
 - `Status`、`Marker` 两个枚举
 - `status_of`、`marker_of`、`status_color`、`status_tooltip`、`paint_status`
 - 三条守护测试：`status_of` 四态优先级、四态 marker 互不相同、四态 tooltip 各不相同
-- `session_row` / `paint_row_body` 的 `status: Status` 参数
-- `UiState` 里 `connecting` / `failed` 两个字段——**仅当 grep 确认再无其它消费者**。
-  有别的消费者就只删列表这一侧，字段留着。
+- `session_row` / `paint_row_body` 的 `status: Status` 参数，以及 `preview_row`
+  里写死的 `Status::Idle` 实参（连同它「预览固定画 Idle」的注释）
+- `UiState.connecting` / `UiState.connect_failed` 两个字段。**grep 已确认**：唯一
+  读者就是 `list.rs::status_of`，写点只有 `app.rs` 三处（`spawn_connect` 置位并清
+  失败标记、`ConnectOk` 清位、`ConnectErr` 落失败）。读者一删，字段变 write-only，
+  rustc 报 `field is never read`——字段与三处写点一并删除。
+- **`connected` 整条传递链**：`app.connected_session` 字段（写点 `app.rs:1104` /
+  `1748`）→ `UiFrame.connected_session` → `session_manager::show` 的 `connected`
+  参数 → `list::show` 的 `connected` 参数 → `status_of`。grep 确认这条链的唯一
+  终点就是状态点，整链删除。
+- **保留**：`connect_request_last` 有 automation（`automation.rs:66`）和
+  `ConnectOk` 处理等别的消费者，不动。
 
 **承认代价：会话列表从此看不出哪台连上了。** 现存的其它状态出口只有 pane 标题条那颗点
 （`PaneStatus::Live/Disconnected`）与状态栏，两者都只反映当前 pane，不是列表全局。
@@ -112,7 +121,7 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: &IconSpec, bg: Option<Color32>)
 |---|---|
 | 会话列表行 `list.rs` | `should_paint(appearance, ColorTarget::ListItem)` |
 | pane 标题条 `pane_title.rs` | `should_paint(appearance, ColorTarget::PaneTitle)` |
-| 编辑器图标预览 `fields.rs` | 表单缓冲里当前选中的节点色 |
+| 编辑器图标预览 `fields.rs` | `should_paint(表单缓冲的外观, ColorTarget::ListItem)` ——和 `preview_row` 同一条闸门路径。只勾了「pane 标题条」落点时预览**不**垫底色，预览的是列表里的真实效果，不是理想效果 |
 
 **闸门判断为什么不塞进 `paint_icon` 内部**：它拿不到 `target`，而同一张图在列表和
 标题条上该不该有底色，答案可能不同（用户可以只勾其中一个落点）。
