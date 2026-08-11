@@ -111,6 +111,9 @@ pub fn status_text(panes: usize, connected: bool) -> (String, String) {
 /// 都已关闭之后才产生的(如主机密钥确认后 `ConnectOk` 顺手关掉了会话管理器),
 /// 那两处的 `last_error` 渲染此时根本不会被调用到(复核 A4)。状态栏常驻,
 /// 不受那两个弹窗开关状态影响,兜底展示。
+// 状态栏就是「一格一个参数」的东西,聚成结构体只是把同样的字段换个地方写
+// (理由同 `session_manager::show`:内部叶子函数,压参数数没有实际收益)。
+#[allow(clippy::too_many_arguments)]
 pub fn status_bar(
     ctx: &egui::Context,
     t: &Theme,
@@ -118,6 +121,9 @@ pub fn status_bar(
     connected: bool,
     last_error: Option<&str>,
     automation: Option<&str>,
+    // F115:隧道指示器。`None` = 一条都没启动,那就**不占格** ——
+    // 状态栏每多常驻一格,别的信息就少一分被看见的机会。
+    tunnel: Option<&crate::tunnels::Indicator>,
     // F62:当前聚焦 pane 所属会话的语义色。**只有勾了「状态栏」落点才是
     // `Some`**(过滤在 `badge::should_paint` 里做,这里只负责画)。
     session_color: Option<egui::Color32>,
@@ -156,6 +162,19 @@ pub fn status_bar(
                     // 就无法判断自动化是没跑还是跑了没效果。
                     if let Some(a) = automation {
                         ui.colored_label(theme::c32(t.fg_muted), a);
+                        ui.separator();
+                    }
+                    // F115:隧道排在自动化之后。颜色跟着**最坏**那条走
+                    // (见 `tunnels::indicator`)—— 一律画成灰的,等于把
+                    // 「有一条挂了」这条唯一需要被看见的信息藏起来。
+                    if let Some(ind) = tunnel {
+                        let color = match ind.severity {
+                            crate::tunnels::Severity::Calm => t.fg_muted,
+                            crate::tunnels::Severity::Warn => t.warn,
+                            crate::tunnels::Severity::Danger => t.danger,
+                        };
+                        let r = ui.colored_label(theme::c32(color), &ind.text);
+                        annotate::mark(ui.ctx(), "状态栏/隧道指示器", r.rect);
                         ui.separator();
                     }
                     ui.colored_label(theme::c32(t.fg_faint), right);
@@ -222,6 +241,7 @@ mod tests {
                 true,
                 None,
                 None,
+                None,
                 session_color,
             );
         });
@@ -233,10 +253,79 @@ mod tests {
                 true,
                 None,
                 None,
+                None,
                 session_color,
             );
         });
         count_shapes(&out.shapes)
+    }
+
+    /// 状态栏文字的**绘制顺序**。`right_to_left` 布局里先画的在最右,
+    /// 所以这个顺序就是视觉上从右往左。
+    fn status_texts(
+        automation: Option<&str>,
+        tunnel: Option<&crate::tunnels::Indicator>,
+    ) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut acc = Vec::new();
+        // 同 `run_status`:面板首帧 `fade_in`,形状全被记成 Noop,必须跑两帧。
+        for _ in 0..2 {
+            let out = ctx.run(Default::default(), |ctx| {
+                status_bar(
+                    ctx,
+                    &crate::theme::MULLION_DARK,
+                    1,
+                    true,
+                    None,
+                    automation,
+                    tunnel,
+                    None,
+                );
+            });
+            acc.clear();
+            fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        }
+        acc
+    }
+
+    /// F115:隧道那一格排在自动化和编码之间。三条信息挤在同一个右对齐区里,
+    /// 顺序一变用户就得每次重新找 —— 而这一格恰恰是「有没有出事」的那一格。
+    #[test]
+    fn status_bar_shows_the_tunnel_indicator_between_automation_and_encoding() {
+        let ind = crate::tunnels::Indicator {
+            text: "隧道 1/2 ↻".to_string(),
+            severity: crate::tunnels::Severity::Warn,
+        };
+        let texts = status_texts(Some("自动化已就绪"), Some(&ind));
+        let pos = |needle: &str| {
+            texts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("状态栏没画出「{needle}」:{texts:?}"))
+        };
+        assert!(
+            pos("自动化") < pos("隧道"),
+            "隧道要排在自动化之后:{texts:?}"
+        );
+        assert!(pos("隧道") < pos("UTF-8"), "隧道要排在编码之前:{texts:?}");
+    }
+
+    /// 一条都没启动时**不占格**。状态栏每多常驻一格,别的信息就少一分被
+    /// 看见的机会;而「你配了但没开」这件事在会话管理器里看就够了。
+    #[test]
+    fn status_bar_has_no_tunnel_indicator_when_none_configured() {
+        let texts = status_texts(None, None);
+        assert!(
+            !texts.iter().any(|s| s.contains("隧道")),
+            "没有在跑的隧道时不该占一格:{texts:?}"
+        );
     }
 
     /// F100:菜单栏与状态栏也要登记 —— 走查里「状态栏那行字太靠边」这类反馈
@@ -253,7 +342,16 @@ mod tests {
         for _ in 0..2 {
             let _ = ctx.run(Default::default(), |ctx| {
                 top_menu(ctx, &crate::theme::MULLION_DARK, &mut ui_state, true, None);
-                status_bar(ctx, &crate::theme::MULLION_DARK, 1, true, None, None, None);
+                status_bar(
+                    ctx,
+                    &crate::theme::MULLION_DARK,
+                    1,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
                 paths = annotate::spot_paths(ctx);
             });
         }

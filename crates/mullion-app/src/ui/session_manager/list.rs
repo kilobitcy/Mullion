@@ -492,23 +492,45 @@ pub(crate) fn visible_order(
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
     query: &str,
+    protocol: mullion_store::Protocol,
 ) -> Vec<SessionId> {
     crate::ui::group_manager::group_sessions(groups, sessions)
         .into_iter()
         .flat_map(|(_, bucket)| bucket)
-        .filter(|r| matches(r, query))
+        .filter(|r| on_page(r, query, protocol))
         .map(|r| r.id)
         .collect()
 }
 
+/// 这条记录在当前页可见吗 —— 协议 + 搜索词,两个判据成对出现。
+///
+/// 只判搜索会让另一档协议的记录漏进来;只判协议会让搜索失效。
+/// `visible_order`(键盘顺序)与 `show`(渲染)都走这一个函数,
+/// 是「方向键跳到看不见的行」那条失效模式的唯一防线 —— 谁再加一个
+/// 过滤点,也必须调它,不许在别处重写这个条件。
+fn on_page(rec: &SessionRecord, query: &str, protocol: mullion_store::Protocol) -> bool {
+    rec.connection.protocol == protocol && matches(rec, query)
+}
+
+// 同 `session_manager::show`:内部叶子函数,为压参数数引一个专用结构体
+// 没有实际收益(`row` 更早就是这个情况,见它头上的同款 allow)。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn show(
     ui: &mut Ui,
     t: &Theme,
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
+    tunnels: &[mullion_store::TunnelRecord],
+    tunnel_states: &[(mullion_store::TunnelId, mullion_ssh::tunnel::TunnelState)],
     appearance: &crate::ui::badge::AppearanceCache,
+    protocol: mullion_store::Protocol,
 ) {
+    // D3:待确认删除的那条会话,引用它的隧道里有几条正在跑。整个列表只有
+    // 这一行用得上,所以在这里算一次。
+    let running_note = ui_state
+        .pending_delete
+        .and_then(|id| super::tunnel_list::running_note(id, tunnels, tunnel_states));
     // 搜索框
     let search_resp = ui.add(
         egui::TextEdit::singleline(&mut ui_state.search)
@@ -516,7 +538,7 @@ pub(super) fn show(
             .desired_width(f32::INFINITY),
     );
     annotate::mark(ui.ctx(), "会话管理器/左栏/搜索框", search_resp.rect);
-    ui.add_space(8.0);
+    ui.add_space(crate::ui::metrics::SP_S);
 
     // 待确认删除的目标一旦这一帧没被真正渲染出来 —— 原因可能是搜索词把它
     // 滤掉、所在分组被手动折叠(`CollapsingHeader` 折叠时根本不会执行 body
@@ -538,6 +560,10 @@ pub(super) fn show(
     // 三档密度只看左栏这一刻有多宽。在 `ScrollArea` **之前**取:进了滚动区
     // 之后 `available_width` 已经扣掉滚动条,会在阈值附近来回抖档。
     let d = density_for(ui.available_width());
+
+    // SFTP 节点连不上(F50)。行为由 mod.rs 的统一闸门保证;这里管的是
+    // 「让用户看得出来为什么点不动」。
+    let connectable = protocol == mullion_store::Protocol::Ssh;
 
     // 底部「分隔线 + 新建按钮」用 `TopBottomPanel::bottom` 先占位:egui 的面板
     // 布局保证面板先分配自己的高度,再把外层 `ui` 的可用区底边收缩到面板上沿
@@ -569,8 +595,12 @@ pub(super) fn show(
     let searching = !ui_state.search.trim().is_empty();
     // 走查 22:搜不到任何东西时,列表是一整片空白 —— 用户分不清「没有匹配」
     // 和「会话都没了」。给一句话 + 一个回到全部列表的出口。
-    if searching && !sessions.iter().any(|r| matches(r, &ui_state.search)) {
-        ui.add_space(4.0);
+    if searching
+        && !sessions
+            .iter()
+            .any(|r| on_page(r, &ui_state.search, protocol))
+    {
+        ui.add_space(crate::ui::metrics::SP_XS);
         ui.colored_label(theme::c32(t.fg_dimmer), "没有匹配的会话");
         if ui.button("清空搜索").clicked() {
             ui_state.search.clear();
@@ -588,7 +618,7 @@ pub(super) fn show(
             for (gid, bucket) in crate::ui::group_manager::group_sessions(groups, sessions) {
                 let matched: Vec<&SessionRecord> = bucket
                     .into_iter()
-                    .filter(|r| matches(r, &ui_state.search))
+                    .filter(|r| on_page(r, &ui_state.search, protocol))
                     .collect();
                 // `Icons` 档只认图标:没设图标的行画出来是一格空白,既点不
                 // 明白也占地方,整条藏掉。藏了多少条在列表末尾如实说一声 ——
@@ -628,10 +658,13 @@ pub(super) fn show(
                                 r,
                                 sessions,
                                 groups,
+                                tunnels,
+                                running_note.as_deref(),
                                 pending_delete_target,
                                 &mut pending_delete_rendered,
                                 appearance,
                                 d,
+                                connectable,
                             );
                         }
                     });
@@ -644,7 +677,7 @@ pub(super) fn show(
                 );
             }
             if hidden > 0 {
-                ui.add_space(4.0);
+                ui.add_space(crate::ui::metrics::SP_XS);
                 ui.colored_label(theme::c32(t.fg_dimmer), format!("+{hidden} 无图标"))
                     .on_hover_text(format!(
                         "这一档只显示设了图标的会话,另有 {hidden} 条被藏起来了。\n把左栏拖宽一点就能看到它们。"
@@ -683,10 +716,15 @@ fn row(
     rec: &SessionRecord,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
+    tunnels: &[mullion_store::TunnelRecord],
+    // 删除确认里那句「其中 N 条正在运行」。只有待确认的那一行用得上,
+    // 所以在 `show` 里算一次传下来,不是每行都去查一遍运行时表。
+    running_note: Option<&str>,
     pending_delete_target: Option<SessionId>,
     pending_delete_rendered: &mut bool,
     appearance: &crate::ui::badge::AppearanceCache,
     d: Density,
+    connectable: bool,
 ) {
     if pending_delete_target == Some(rec.id) {
         *pending_delete_rendered = true;
@@ -720,19 +758,27 @@ fn row(
     // `pending_switch` 和 `connect_request` 都写下。目前无害(`pending_switch`
     // 还没有消费点),但 Task 14 接脏检查确认时,需要决定 `connect_request`
     // 是否也要走那道确认门。
-    if resp.double_clicked() {
+    if connectable && resp.double_clicked() {
         ui_state.connect_request = Some(rec.id);
     }
     resp.context_menu(|ui| {
         // 走查 3:菜单里原本只有「跳过自动化」这一条连接项 —— 右键一打开,
         // 主操作(直接连)反而不在,用户只能关掉菜单再双击。普通连接排第一。
-        if ui.button("连接").clicked() {
+        if ui
+            .add_enabled(connectable, egui::Button::new("连接"))
+            .on_disabled_hover_text(super::editor::SFTP_NOT_YET)
+            .clicked()
+        {
             ui_state.connect_request = Some(rec.id);
             ui.close_menu();
         }
         // F44:一次性逃生门。远端 tmux 里正跑着 Claude Code 时,用户可能只想
         // 连上去看一眼,不想让自动化再发一遍 attach。
-        if ui.button("连接(跳过自动化)").clicked() {
+        if ui
+            .add_enabled(connectable, egui::Button::new("连接(跳过自动化)"))
+            .on_disabled_hover_text(super::editor::SFTP_NOT_YET)
+            .clicked()
+        {
             ui_state.connect_request = Some(rec.id);
             ui_state.connect_skip_automation = true;
             ui.close_menu();
@@ -777,6 +823,21 @@ fn row(
                     theme::c32(t.danger_soft),
                     format!("删除「{}」?", rec.identity.name),
                 );
+                // F110:这条会话被删掉后,引用它的隧道会变成悬垂。删之前
+                // 就说清楚影响面 —— 事后才发现「有条端口转发不动了」,
+                // 排查起点离原因太远。没有隧道引用时**一行都不多画**。
+                let affected = super::tunnel_list::affected_lines(rec.id, tunnels);
+                if !affected.is_empty() {
+                    ui.colored_label(theme::c32(t.warn), "以下隧道会失去引用:");
+                    for line in affected {
+                        ui.colored_label(theme::c32(t.fg_dimmer), format!("· {line}"));
+                    }
+                    // D3:正在跑的那些是**此刻**要被切断的连接,比「配置悬垂」
+                    // 分量重,单独一行、用告警色说。
+                    if let Some(note) = running_note {
+                        ui.colored_label(theme::c32(t.danger_soft), note);
+                    }
+                }
                 ui.horizontal(|ui| {
                     if ui.button("删除").clicked() {
                         ui_state.delete_request = Some(rec.id);
@@ -837,8 +898,8 @@ mod tests {
         let mut sftp = ssh.clone();
         sftp.connection.protocol = Protocol::Sftp;
         ssh.connection.protocol = Protocol::Ssh;
-        let n_ssh = count_shapes(&run_list_with(&[ssh]).shapes);
-        let n_sftp = count_shapes(&run_list_with(&[sftp]).shapes);
+        let n_ssh = count_shapes(&run_list_with(&[ssh], Protocol::Ssh).shapes);
+        let n_sftp = count_shapes(&run_list_with(&[sftp], Protocol::Sftp).shapes);
         assert!(
             n_sftp > n_ssh,
             "sftp 行应多画出协议标签(ssh {n_ssh} 个图形,sftp {n_sftp} 个)"
@@ -884,7 +945,10 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     &crate::ui::badge::AppearanceCache::default(),
+                    mullion_store::Protocol::Ssh,
                 );
             });
         });
@@ -957,7 +1021,10 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     &crate::ui::badge::AppearanceCache::default(),
+                    mullion_store::Protocol::Ssh,
                 );
             });
         });
@@ -1017,7 +1084,10 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             })
@@ -1113,7 +1183,10 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             })
@@ -1183,6 +1256,118 @@ mod tests {
         );
     }
 
+    /// D4:SFTP 档(F50 未实现)右键菜单里的「连接」必须是真的按不动,不只是
+    /// 看起来灰——`add_enabled(false, ..)` 让 egui 在 `enabled=false` 时把
+    /// `Response::clicked` 钉死为 `false`(见 egui-0.30.0 `context.rs::get_response`
+    /// 里 `res.clicked = true` 的赋值必须 `enabled && ...` 同时成立)。
+    ///
+    /// 这条测试专测**视觉层**(list.rs 的 `add_enabled`),不是 mod.rs 的兜底
+    /// 闸门——闸门测的是「万一某条入口漏挡,出了 `show()` 也会被清空」;这里
+    /// 测的是「入口本身一开始就不该被点动」,两层分别有测试,任何一层被削弱
+    /// 都要变红。手法照抄上面 `context_menu_skip_automation_sets_both_connect_request_and_skip_flag`:
+    /// 真实指针事件右键打开菜单、`find_text_pos` 反推「连接」按钮矩形再点下去,
+    /// 不直接手动赋值 `ui_state.connect_request`。
+    ///
+    /// 自证会变红:把 `row()` 里两处 `ui.add_enabled(connectable, egui::Button::new(..))`
+    /// 改回 `ui.button(..)`,`connect_request` 就会被设上。
+    #[test]
+    fn sftp_row_context_menu_connect_button_is_truly_unclickable_not_just_grey() {
+        let t = crate::theme::MULLION_DARK;
+        let mut sftp = rec(1, "sftp-node-unique-name", "192.0.2.30", &[]);
+        sftp.connection.protocol = Protocol::Sftp;
+        let sessions = vec![sftp];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        &[],
+                        &[],
+                        &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Sftp,
+                    );
+                });
+            })
+        };
+
+        // 前两帧只是让布局稳定下来,不带任何指针事件。
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+
+        let row_pos = find_text_pos(&out.shapes, "sftp-node-unique-name")
+            .expect("sftp 节点这一行应该已经画出来了");
+        let row_click_pos = egui::pos2(row_pos.x - 20.0, row_pos.y + 15.0);
+
+        let secondary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(row_click_pos),
+                    secondary_click(row_click_pos, true),
+                    secondary_click(row_click_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+
+        // 菜单弹出用的是 `Area`,首次遇到某个 id 先做一趟不可见的 sizing pass,
+        // 真正把内容画出来要等下一帧,所以再空跑一帧(不带任何指针事件)。
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        // `find_text_pos` 是子串匹配(见本文件 `walk` 里的 `.contains(needle)`),
+        // "连接" 在这个菜单里同时命中「连接」和「连接(跳过自动化)」两个按钮
+        // (右栏 Tab 条第一个页签也叫「连接」)。这里子串匹配是安全的,前提有二:
+        // 1. 两个菜单按钮的 `add_enabled(connectable, ..)` 门控完全一样 —— 命中
+        //    哪一个,点击后 `connect_request` 的断言结果都相同;
+        // 2. 本测试全程只发 secondary(右键)事件,从未 `PointerButton::Primary`
+        //    点过会话行本身,`ui_state.editor` 恒为 `None`,右栏画的是空态提示
+        //    而不是 Tab 条,撞不上同名页签。
+        // 谁要是往这条测试里加一次左键点击(哪怕只是顺便验证选中态),第 2 条
+        // 前提就破了,子串匹配可能悄悄定位到页签而不是菜单按钮 —— 测试会变成
+        // 恒绿却依旧通过,加左键点击前必须换成唯一锚点(比如带上「(跳过自动化)」
+        // 排除歧义,或直接测右栏 Tab 条隐藏)。
+        let connect_btn_pos = find_text_pos(&out.shapes, "连接")
+            .expect("右键打开的菜单里应该画出了「连接」按钮(即便是禁用状态,文字也照常画)");
+        let primary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(connect_btn_pos),
+                    primary_click(connect_btn_pos, true),
+                    primary_click(connect_btn_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            ui_state.connect_request, None,
+            "SFTP 档「连接」按钮必须真的点不动——egui 的 `enabled=false` \
+             应该在按钮层面就拦下点击,不能指望 mod.rs 的兜底闸门兜底"
+        );
+    }
+
     /// 找到含 `needle` 的那个 `TextShape`,连它所在的 clip 矩形一起回。
     /// 判「有没有被硬裁」必须两样都有:光有 galley 只知道文字多宽,不知道
     /// 容器允许它多宽。
@@ -1236,7 +1421,10 @@ mod tests {
                         &mut ui_state,
                         sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             }));
@@ -1372,7 +1560,10 @@ mod tests {
                         &mut ui_state,
                         &sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             })
@@ -1411,7 +1602,10 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             })
@@ -1517,7 +1711,10 @@ mod tests {
                         &mut ui_state,
                         &sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             })
@@ -1567,7 +1764,10 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             })
@@ -1700,7 +1900,10 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
                     );
                 });
             })
@@ -1803,7 +2006,13 @@ mod tests {
     }
 
     /// 用给定的会话集渲染一次左栏。`run_list` 只能换外观缓存,换不了会话本身。
-    fn run_list_with(sessions: &[SessionRecord]) -> egui::FullOutput {
+    ///
+    /// F118 之后左栏按 `protocol` 分页,调用方必须传入跟 `sessions` 里记录
+    /// 相符的协议 —— 否则记录会被 `on_page` 判定为不在这一页,渲染不出来。
+    fn run_list_with(
+        sessions: &[SessionRecord],
+        protocol: mullion_store::Protocol,
+    ) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
         let groups: Vec<GroupRecord> = Vec::new();
         let mut ui_state = UiState::default();
@@ -1816,7 +2025,10 @@ mod tests {
                     &mut ui_state,
                     sessions,
                     &groups,
+                    &[],
+                    &[],
                     &crate::ui::badge::AppearanceCache::default(),
+                    protocol,
                 );
             });
         })
@@ -1830,7 +2042,17 @@ mod tests {
         let ctx = egui::Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &t, &mut ui_state, &sessions, &groups, appearance);
+                show(
+                    ui,
+                    &t,
+                    &mut ui_state,
+                    &sessions,
+                    &groups,
+                    &[],
+                    &[],
+                    appearance,
+                    mullion_store::Protocol::Ssh,
+                );
             });
         });
         count_shapes(&out.shapes)
@@ -1929,7 +2151,17 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                        show(ui, &t, &mut ui_state, sessions, &groups, appearance);
+                        show(
+                            ui,
+                            &t,
+                            &mut ui_state,
+                            sessions,
+                            &groups,
+                            &[],
+                            &[],
+                            appearance,
+                            mullion_store::Protocol::Ssh,
+                        );
                     });
             },
         )

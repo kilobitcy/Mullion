@@ -182,12 +182,12 @@ async fn advance(
             // 跳板自己的 SSH 握手 + 认证。主机密钥同样过 policy(F3)。
             let handle = match stream {
                 DialStream::Tcp(s) => {
-                    crate::session::handshake_and_auth(s, host, user, auth, policy.clone())
+                    crate::session::handshake_and_auth(s, host, user, auth, policy.clone(), None)
                         .await
                         .map_err(|e| fail(e.to_string()))?
                 }
                 DialStream::Channel(s) => {
-                    crate::session::handshake_and_auth(s, host, user, auth, policy.clone())
+                    crate::session::handshake_and_auth(s, host, user, auth, policy.clone(), None)
                         .await
                         .map_err(|e| fail(e.to_string()))?
                 }

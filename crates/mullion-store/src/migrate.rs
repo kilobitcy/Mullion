@@ -125,6 +125,8 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
         schema_version: CURRENT_SCHEMA,
         group: Vec::new(),
         session,
+        // v1 文件里不存在隧道概念,空数组是**永久**正确的。
+        tunnel: Vec::new(),
     })
 }
 
@@ -248,11 +250,11 @@ kind = "password"
     }
 
     /// 版本号是**故意**钉死的:动它就意味着用户的库要迁移一次,不该被
-    /// 顺手改掉。v6 的理由见 `CURRENT_SCHEMA` 文档 —— 图标改成导入的 .ico
-    /// (正文内嵌)并多了底色,旧客户端不认识 `kind = "ico"`,拒绝比读出一半好。
+    /// 顺手改掉。v7 的理由见 `CURRENT_SCHEMA` 文档 —— 新增 `[[tunnel]]`,
+    /// 旧客户端读 v7 会把整个隧道数组丢掉再写回,拒绝比静默吃掉好。
     #[test]
-    fn current_schema_is_six() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 6);
+    fn current_schema_is_seven() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 7);
     }
 
     /// v5 的库里存的 emoji 图标**必须原样读得出来**。
@@ -297,6 +299,100 @@ value = "🔥"
         assert_eq!(icon.kind, crate::model::IconKind::Emoji);
         assert_eq!(icon.value, "🔥");
         assert_eq!(icon.bg, None, "v5 没有底色这个键,应落 None 而不是解析失败");
+    }
+
+    /// v6 的库升 v7 **不需要任何迁移代码** —— 这条是来证明它确实自动成立的,
+    /// 不是在测某个迁移函数。
+    ///
+    /// 机制:`SessionsFile.tunnel` 带 `#[serde(default)]`,缺键补空数组;
+    /// `load_sessions` 见 `probe.schema_version < CURRENT_SCHEMA` 会先备份
+    /// `.toml.bak` 再按新结构解析。风险不在「隧道读不出来」(v6 本就没有),
+    /// 而在**既有字段被顺手弄丢** —— 所以这里逐一断言。
+    #[test]
+    fn v6_file_without_tunnel_key_loads_as_empty_and_keeps_everything_else() {
+        let v6 = r#"
+schema_version = 6
+
+[[group]]
+id = 2
+name = "生产"
+
+[[session]]
+id = 7
+modified_at = "2026-08-01T00:00:00Z"
+
+[session.identity]
+name = "db"
+note = "主库"
+group_id = 2
+tags = ["prod"]
+
+[session.connection]
+host = "192.0.2.10"
+port = 2222
+protocol = "ssh"
+
+[session.auth]
+user = "ops"
+kind = "public_key"
+has_passphrase = true
+
+[session.terminal]
+scrollback = 5000
+
+[session.network.proxy]
+kind = "socks5"
+host = "127.0.0.1"
+port = 7891
+
+[session.automation.tmux]
+kind = "attach"
+session_name = "claude"
+"#;
+        let file: crate::model::SessionsFile = toml::from_str(v6).unwrap();
+
+        assert!(
+            file.tunnel.is_empty(),
+            "v6 没有隧道,应补成空数组而非解析失败"
+        );
+
+        let s = &file.session[0];
+        assert_eq!(s.id, crate::model::SessionId(7));
+        assert_eq!(s.modified_at, "2026-08-01T00:00:00Z");
+        assert_eq!(s.identity.name, "db");
+        assert_eq!(s.identity.note, "主库");
+        assert_eq!(s.identity.group_id, Some(crate::model::GroupId(2)));
+        assert_eq!(s.identity.tags, vec!["prod".to_string()]);
+        assert_eq!(s.connection.host, "192.0.2.10");
+        assert_eq!(s.connection.port, 2222);
+        assert_eq!(s.auth.user, "ops");
+        assert_eq!(
+            s.auth.kind,
+            crate::model::AuthKind::PublicKey {
+                has_passphrase: true
+            }
+        );
+        assert_eq!(s.terminal.scrollback, Some(5000));
+        assert_eq!(
+            s.network.proxy,
+            Some(crate::network::ProxyChoice::Socks5(
+                crate::network::ProxyEndpoint {
+                    host: "127.0.0.1".into(),
+                    port: 7891,
+                    user: None,
+                }
+            )),
+            "代理分节不该在升版本时丢掉"
+        );
+        assert_eq!(
+            s.automation.tmux,
+            Some(crate::automation::TmuxChoice::Attach {
+                session_name: Some("claude".into())
+            }),
+            "自动化分节不该在升版本时丢掉"
+        );
+        assert_eq!(file.group.len(), 1, "分组不该在升版本时丢掉");
+        assert_eq!(file.group[0].name, "生产");
     }
 
     /// 反过来:v6 存的 .ico 图标要能完整往返,底色跟着走。

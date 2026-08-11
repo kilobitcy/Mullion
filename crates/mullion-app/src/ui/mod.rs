@@ -15,7 +15,7 @@ pub mod toolbar;
 
 use std::sync::Arc;
 
-use mullion_store::{GroupId, GroupRecord, SessionId, SessionRecord};
+use mullion_store::{GroupId, GroupRecord, SessionId, SessionRecord, TunnelId};
 
 /// 给 egui 挂上系统 CJK 字体作回退。egui 只内嵌拉丁字体,中文菜单/状态栏否则
 /// 全渲染成 tofu 方框。按存在顺序取第一个系统字体(Windows 一等公民);非 Windows
@@ -130,6 +130,31 @@ pub struct UiState {
     /// 中转一层是因为 `build_draft` 要读整个 `EditorBuffer`,而这里正持着
     /// 它的 `&mut`。
     pub save_click: Option<bool>,
+
+    // --- F116 隧道模式。与上面的会话侧字段**各自独立**:两套 editor/baseline
+    // 不能共用,否则切一次模式就把另一边未保存的改动静默丢了(守护测试
+    // `switching_manager_mode_does_not_clobber_the_other_editors_dirty_state`)。---
+    /// 会话管理器当前在「会话」还是「隧道」页。
+    pub manager_mode: session_manager::ManagerMode,
+    /// 正在编辑的隧道 id;`None` = 新建。
+    pub tunnel_editor_id: Option<TunnelId>,
+    /// 隧道表单的跨帧缓冲。`None` = 右栏未在编辑任何隧道(画空态提示)。
+    pub tunnel_editor: Option<session_manager::TunnelEditorBuffer>,
+    /// 隧道表单的基线快照,用于脏检查。与 `tunnel_editor` 同时设置、同时清空。
+    pub tunnel_editor_baseline: Option<session_manager::TunnelEditorBuffer>,
+    /// 隧道表单点「保存」→ app 事后据此调 `store.add_tunnel`/`update_tunnel`。
+    pub tunnel_save_request: Option<session_manager::TunnelSaveIntent>,
+    /// 二次确认后的删除意图 → app 事后据此调 `store.delete_tunnel`。
+    pub tunnel_delete_request: Option<TunnelId>,
+    /// 点了删隧道但还没二次确认;确认后转成 `tunnel_delete_request`。
+    pub pending_tunnel_delete: Option<TunnelId>,
+    /// 隧道右栏「保存」被点了。中转一层的理由同 `save_click`。
+    pub tunnel_save_click: bool,
+    /// F111:点了某条隧道的「启动」→ app 事后组 `SshConfig`、bind 端口、
+    /// 起监管任务。UI 闭包里做不了这些(要 store、要 runtime、要网络)。
+    pub tunnel_start_request: Option<TunnelId>,
+    /// F111:点了「停止」。
+    pub tunnel_stop_request: Option<TunnelId>,
 
     /// 主机密钥弹窗的回答(F3)。`Some(true)` = 接受;`Some(false)` = 取消连接。
     /// 同样只承载意图:record + save + 回送 oneshot 都在 app.rs 施加点做。
@@ -257,6 +282,12 @@ pub struct UiFrame<'a> {
     pub sessions: &'a [SessionRecord],
     /// 分组列表(F60)。列表分组折叠 + 编辑器分组下拉都读这个。store 不可用时传 `&[]`。
     pub groups: &'a [GroupRecord],
+    /// 隧道列表(F110)。会话管理器「隧道」页的左栏读它;删会话的确认框也读它
+    /// 来列受影响的隧道。store 不可用时传 `&[]`。
+    pub tunnels: &'a [mullion_store::TunnelRecord],
+    /// F111/F114:**已启动**的隧道各自的运行态。没启动的不在这里 ——
+    /// 「不在表里」就是「没跑」,不额外造一个 `NotStarted` 变体。
+    pub tunnel_states: &'a [(TunnelId, mullion_ssh::tunnel::TunnelState)],
     pub store_available: bool,
     pub connected: bool,
     /// 状态栏左栏的屏数。必须来自 `Workspace::pane_count()`。
@@ -317,6 +348,14 @@ pub fn build_ui(
     }
     // 布局按钮组画在菜单栏那一行里(F82),所以点中的预设由 top_menu 返回。
     actions.preset = chrome::top_menu(ctx, t, ui_state, frame.connected, frame.preset);
+    // F115:分母是**配置了多少条**,不是启动了多少条 —— 见
+    // `tunnels::indicator`。这里现算而不是再往 `UiFrame` 加一个字段:
+    // 输入就在手边、纯函数、隧道条数是个位数,不构成陷阱 T3 那类每帧重算。
+    let tunnel_indicator = {
+        let states: Vec<mullion_ssh::tunnel::TunnelState> =
+            frame.tunnel_states.iter().map(|(_, s)| s.clone()).collect();
+        crate::tunnels::indicator(&states, frame.tunnels.len())
+    };
     chrome::status_bar(
         ctx,
         t,
@@ -324,6 +363,7 @@ pub fn build_ui(
         frame.connected,
         ui_state.last_error.as_deref(),
         frame.automation,
+        tunnel_indicator.as_ref(),
         // F62:状态栏取**当前聚焦 pane**所属会话的色。多 pane 时状态栏该显示
         // 谁的色没有确定答案,所以这个落点默认不勾;勾了就按聚焦那个走 ——
         // 焦点是用户当下正在操作的那个 pane,这是唯一有意义的选择。
@@ -356,6 +396,8 @@ pub fn build_ui(
             ui_state,
             frame.sessions,
             frame.groups,
+            frame.tunnels,
+            frame.tunnel_states,
             frame.store_available,
             frame.secret_presence,
             frame.appearance,
@@ -538,6 +580,8 @@ mod tests {
         UiFrame {
             sessions: &[],
             groups: &[],
+            tunnels: &[],
+            tunnel_states: &[],
             store_available: false,
             connected: true,
             panes: 1,

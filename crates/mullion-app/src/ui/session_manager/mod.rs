@@ -11,6 +11,7 @@ mod dedupe;
 mod editor;
 mod env_hint;
 mod fields;
+mod form;
 mod highlight;
 mod inherit_row;
 mod jump_preview;
@@ -19,6 +20,8 @@ mod keyscan;
 pub(crate) mod list;
 mod tab_badge;
 mod tags;
+pub(crate) mod tunnel_editor;
+pub(crate) mod tunnel_list;
 pub(crate) mod validate;
 
 pub(crate) use buffer::{
@@ -27,9 +30,38 @@ pub(crate) use buffer::{
 };
 pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
 pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget};
+pub use tunnel_editor::{TunnelEditorBuffer, TunnelKindUi, TunnelSaveIntent};
+
+/// 会话管理器的顶层模式(F116/F118)。三类对象左右栏整体切换,不共用列表 ——
+/// 混在一个列表里会让「这一行是什么」需要读图标才知道。
+///
+/// `Sftp` 档列的是 `protocol == Sftp` 的**会话记录**(D1:数据层不分家,
+/// schema 仍是 v7)。放在会话与隧道中间:它跟会话是同一类东西的两种协议,
+/// 跟隧道不是。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManagerMode {
+    #[default]
+    Sessions,
+    Sftp,
+    Tunnels,
+}
+
+/// 这一档该列哪种协议的会话记录。`Tunnels` 不列会话,故为 `None`。
+///
+/// **这是分流的唯一真源。** 列表渲染(`list::show`)与键盘顺序
+/// (`list::visible_order`)必须都走它 —— 只过滤其中一侧,方向键会把选中态
+/// 跳到当前页根本看不见的记录上。
+pub(crate) fn protocol_of(mode: ManagerMode) -> Option<mullion_store::Protocol> {
+    use mullion_store::Protocol;
+    match mode {
+        ManagerMode::Sessions => Some(Protocol::Ssh),
+        ManagerMode::Sftp => Some(Protocol::Sftp),
+        ManagerMode::Tunnels => None,
+    }
+}
 
 use egui::NumExt as _;
-use mullion_store::{GroupId, GroupRecord, SessionRecord};
+use mullion_store::{GroupId, GroupRecord, SessionRecord, TunnelId, TunnelRecord};
 
 use crate::theme::{self, Theme};
 use crate::ui::annotate;
@@ -84,6 +116,22 @@ pub(crate) const TAB_CONNECT: usize = 0;
 pub(crate) const TAB_AUTH: usize = 1;
 pub(crate) const TAB_AUTOMATION: usize = 2;
 pub(crate) const TAB_APPEARANCE: usize = 3;
+
+/// 这个模式下右栏画哪几页,元素是 `editor::TABS` 的**原始下标**。
+///
+/// SFTP 节点不画「登录后」(F40~F44 是发 shell 命令与 tmux 附着,对 SFTP
+/// 没有落点)。隧道档不走这里 —— 它的右栏根本不是 Tab 编辑器。
+///
+/// **必须返回原始下标。** `TAB_CONNECT..TAB_APPEARANCE` 是下标常量
+/// (`editor.rs` 头上写明这是既有技术债),隐藏中间一页之后若用
+/// `TABS.iter().enumerate()` 的位置序号去写 `editor_tab`,第三个画出来的是
+/// 「图标」但下标是 2,点下去打开的是「登录后」。
+pub(crate) fn visible_tabs(mode: ManagerMode) -> &'static [usize] {
+    match mode {
+        ManagerMode::Sftp => &[TAB_CONNECT, TAB_AUTH, TAB_APPEARANCE],
+        _ => &[TAB_CONNECT, TAB_AUTH, TAB_AUTOMATION, TAB_APPEARANCE],
+    }
+}
 
 /// 计算给 `Window` 自身 chrome(标题栏 + `Frame::window` 的 `inner_margin`)留的
 /// 余量——**不是硬编码常量,是按 egui-0.30.0 实际渲染公式当场算出来的**。
@@ -265,6 +313,57 @@ pub(super) fn labeled_button(
     clicked
 }
 
+/// F116 模式条。返回自身矩形供 F100 登记。
+///
+/// **只写 `manager_mode`,绝不碰任何 editor/baseline 字段**:两个模式各持一套
+/// 表单缓冲,在这里顺手清一下就等于「切一次页,另一边填到一半的东西没了」。
+/// 守护测试 `switching_manager_mode_does_not_clobber_the_other_editors_dirty_state`
+/// 正是从这个函数驱动的。
+fn mode_bar(ui: &mut egui::Ui, ui_state: &mut UiState) -> egui::Rect {
+    let mut rect = egui::Rect::NOTHING;
+    ui.horizontal(|ui| {
+        for (mode, label) in [
+            (ManagerMode::Sessions, "会话"),
+            (ManagerMode::Sftp, "SFTP"),
+            (ManagerMode::Tunnels, "隧道"),
+        ] {
+            let on = ui_state.manager_mode == mode;
+            if ui.add(egui::SelectableLabel::new(on, label)).clicked() {
+                ui_state.manager_mode = mode;
+            }
+        }
+        rect = ui.min_rect();
+    });
+    rect
+}
+
+/// 删隧道的二次确认。独立小窗:隧道的删除按钮在右栏表单上,把确认内联进表单
+/// 会把下面的字段整体顶下去,用户点「取消」后视线还得再找一遍原来的位置。
+fn tunnel_delete_confirm(
+    ctx: &egui::Context,
+    t: &Theme,
+    ui_state: &mut UiState,
+    id: mullion_store::TunnelId,
+    title: &str,
+) {
+    egui::Window::new("删除隧道")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.colored_label(theme::c32(t.danger_soft), format!("删除「{title}」?"));
+            ui.horizontal(|ui| {
+                if ui.button("删除").clicked() {
+                    ui_state.tunnel_delete_request = Some(id);
+                    ui_state.pending_tunnel_delete = None;
+                }
+                if ui.button("取消").clicked() {
+                    ui_state.pending_tunnel_delete = None;
+                }
+            });
+        });
+}
+
 /// 会话管理器弹窗:双栏(左列表 300px + 右编辑表单)合成单窗(F90)。
 /// `store_available=false` 时(待定 G:keyring/库打开失败)不崩,只展示兜底提示。
 ///
@@ -278,6 +377,8 @@ pub fn show(
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
+    tunnels: &[TunnelRecord],
+    tunnel_states: &[(TunnelId, mullion_ssh::tunnel::TunnelState)],
     store_available: bool,
     presence: SecretPresence,
     appearance: &crate::ui::badge::AppearanceCache,
@@ -307,7 +408,13 @@ pub fn show(
                 }
             }
             keys::Action::Prev | keys::Action::Next => {
-                let order = list::visible_order(sessions, groups, &ui_state.search);
+                // 隧道页没有会话列表可走。不判模式的话,站在隧道页按 ↑↓ 会对
+                // 一条看不见的会话发 pending_switch —— 会话表单脏着时还会凭空
+                // 弹出「有未保存的更改」确认框,用户完全不知道自己动了什么。
+                let Some(protocol) = protocol_of(ui_state.manager_mode) else {
+                    continue;
+                };
+                let order = list::visible_order(sessions, groups, &ui_state.search, protocol);
                 let forward = action == keys::Action::Next;
                 if let Some(id) = keys::step(&order, ui_state.editor_id, forward) {
                     // 走 `pending_switch` 而不是直接换 `editor`:表单脏的时候
@@ -316,14 +423,35 @@ pub fn show(
                 }
             }
             keys::Action::Open => {
-                if let Some(id) = ui_state.editor_id {
-                    ui_state.connect_request = Some(id);
+                // 只有会话档能连。SFTP 节点连不了(F50 未实现,见 D4 的统一
+                // 闸门),隧道档压根没有会话可连。
+                if ui_state.manager_mode == ManagerMode::Sessions {
+                    if let Some(id) = ui_state.editor_id {
+                        ui_state.connect_request = Some(id);
+                    }
                 }
             }
             keys::Action::Tab(n) => {
-                // 没在编辑任何会话时右栏是空态,切页没有意义。
-                if ui_state.editor.is_some() {
-                    ui_state.editor_tab = n;
+                // 隧道档的右栏不是 Tab 编辑器,切页没有意义。
+                //
+                // `!= ManagerMode::Tunnels` 这个判断**不是**跟下面
+                // `editor.is_some()` 重叠的冗余条件,不能因为看起来多余就删掉:
+                // `mode_bar`(上面)切模式时只写 `ui_state.manager_mode`,
+                // 刻意不碰 `editor`/`editor_baseline`(保留另一档表单的脏状态,
+                // 见 `mode_bar` 文档注释)。全文件搜 `ui_state.editor = ` 只有
+                // `apply_switch` 里两处赋 `Some(...)`,没有任何地方把它清成
+                // `None`。所以在会话页开着编辑器、切到隧道档之后,
+                // `ui_state.editor` 依然是 `Some`——没有这个模式判断,站在
+                // 隧道档按 Ctrl+3 会悄悄改掉背后那个看不见的会话编辑器的
+                // `editor_tab`。跟 Task 4 修的是同一类漏洞。
+                //
+                // SFTP 档少一页(D5),`n` 是**位置序号**不是 Tab 下标,
+                // 必须过 `visible_tabs` 映射 —— 直接写 `editor_tab = n`
+                // 会让 Ctrl+3 打开「登录后」而 Tab 条上高亮的是「图标」。
+                if ui_state.manager_mode != ManagerMode::Tunnels && ui_state.editor.is_some() {
+                    if let Some(&tab) = visible_tabs(ui_state.manager_mode).get(n) {
+                        ui_state.editor_tab = tab;
+                    }
                 }
             }
         }
@@ -450,6 +578,12 @@ pub fn show(
             // 顺序无关(取面积最小者)。
             annotate::mark(ui.ctx(), "会话管理器", ui.max_rect());
 
+            // F116 模式条:会话 / 隧道。放在双栏**之上**,因为它切的是
+            // 左右栏整体,画在左栏里会让人以为只换列表。
+            let mode_rect = mode_bar(ui, ui_state);
+            annotate::mark(ui.ctx(), "会话管理器/模式条", mode_rect);
+            ui.add_space(6.0);
+
             let list_panel = egui::SidePanel::left(ui.id().with("sm_list"))
                 .resizable(true)
                 .default_width(LIST_W)
@@ -459,8 +593,22 @@ pub fn show(
                         .fill(theme::c32(t.panel_bg))
                         .inner_margin(14.0),
                 )
-                .show_inside(ui, |ui| {
-                    list::show(ui, t, ui_state, sessions, groups, appearance)
+                .show_inside(ui, |ui| match ui_state.manager_mode {
+                    ManagerMode::Sessions | ManagerMode::Sftp => list::show(
+                        ui,
+                        t,
+                        ui_state,
+                        sessions,
+                        groups,
+                        tunnels,
+                        tunnel_states,
+                        appearance,
+                        // 上面 `match` 的两个分支都保证 `protocol_of` 有值。
+                        protocol_of(ui_state.manager_mode).expect("会话/SFTP 档必有协议"),
+                    ),
+                    ManagerMode::Tunnels => {
+                        tunnel_list::show(ui, t, ui_state, tunnels, tunnel_states, sessions)
+                    }
                 });
             annotate::mark(ui.ctx(), "会话管理器/左栏", list_panel.response.rect);
 
@@ -475,7 +623,16 @@ pub fn show(
                     let rect = ui.max_rect();
                     ui.interact(rect, editor_root_id(), egui::Sense::hover());
                     annotate::mark(ui.ctx(), "会话管理器/右栏", rect);
-                    editor::show(ui, t, ui_state, groups, sessions, presence)
+                    // 借用冲突:`ui_state` 下面要整个可变借给 `editor::show`,
+                    // 不能在同一次调用表达式里再读 `ui_state.manager_mode`——
+                    // 先拷出来(`ManagerMode` 是 `Copy`),再传这份拷贝。
+                    let mode = ui_state.manager_mode;
+                    match mode {
+                        ManagerMode::Sessions | ManagerMode::Sftp => {
+                            editor::show(ui, t, ui_state, groups, sessions, presence, mode)
+                        }
+                        ManagerMode::Tunnels => tunnel_editor::show(ui, t, ui_state, sessions),
+                    }
                 });
         });
 
@@ -489,6 +646,37 @@ pub fn show(
     if let Some(buf) = ui_state.editor.as_mut() {
         if let Some(note) = buf.key_note.take() {
             ui_state.key_drop_note = Some(note);
+        }
+    }
+
+    // 隧道侧的同一套:`tunnel_editor::show` 正持着 `tunnel_editor` 的 `&mut`,
+    // 那里只置一个标志,`build_tunnel_draft` 要整体读缓冲,所以挪到这里。
+    if std::mem::take(&mut ui_state.tunnel_save_click) {
+        if let Some(buf) = ui_state.tunnel_editor.as_ref() {
+            match tunnel_editor::build_tunnel_draft(buf) {
+                Ok(draft) => {
+                    ui_state.tunnel_save_request = Some(TunnelSaveIntent {
+                        editing_id: ui_state.tunnel_editor_id,
+                        draft,
+                    });
+                }
+                Err(msg) => ui_state.set_error(msg),
+            }
+        }
+    }
+    // 删隧道的二次确认。会话侧的确认框内联在列表行下面(那里一行就是一个
+    // 会话),隧道侧的删除按钮在右栏表单上,确认也就画在表单区域 —— 见
+    // `tunnel_delete_confirm`。
+    if let Some(id) = ui_state.pending_tunnel_delete {
+        let title = tunnels
+            .iter()
+            .find(|x| x.id == id)
+            .map(tunnel_list::row_title);
+        match title {
+            Some(title) => tunnel_delete_confirm(ctx, t, ui_state, id, &title),
+            // 目标已经不在库里(别处删掉了)→ 撤掉挂着的确认,
+            // 不能留一个指向空气的确认框等用户去点。
+            None => ui_state.pending_tunnel_delete = None,
         }
     }
 
@@ -547,6 +735,16 @@ pub fn show(
         }
     }
 
+    // D4 统一闸门。SFTP 节点连不上(F50 未实现)、隧道档压根没有会话可连。
+    // 入口有四条(左栏双击、右键菜单、右栏按钮、Enter),逐条挡必然漏 ——
+    // 这里做唯一一道兜底,各入口再各自置灰(那是给人看的,这一道是保证行为)。
+    // `connect_skip_automation` 必须一起清:留着它会漂到下一次真正的连接上,
+    // 用户会莫名其妙地跳过一次自动化。
+    if ui_state.manager_mode != ManagerMode::Sessions {
+        ui_state.connect_request = None;
+        ui_state.connect_skip_automation = false;
+    }
+
     if !open {
         ui_state.close_session_manager();
     }
@@ -567,7 +765,13 @@ fn apply_switch(ui_state: &mut UiState, sessions: &[SessionRecord]) {
     match target {
         SwitchTarget::NewDraft => {
             // 走查 21:用户名预填成当前系统账号,光标落到「名称」上。
-            ui_state.editor = Some(EditorBuffer::new_draft());
+            let mut draft = EditorBuffer::new_draft();
+            // D1/D3:在哪一档按「+ 新建」,建出来的就是哪一类节点。协议此后
+            // 只读,所以这是它唯一的决定点。
+            if let Some(p) = protocol_of(ui_state.manager_mode) {
+                draft.protocol = p;
+            }
+            ui_state.editor = Some(draft);
             ui_state.editor_id = None;
             ui_state.focus_name_request = true;
         }
@@ -703,6 +907,846 @@ pub(super) fn secret_edit(
 }
 
 #[cfg(test)]
+mod tunnel_ui_tests {
+    use super::*;
+    use mullion_store::{SessionId, TunnelId, TunnelKind, TunnelRecord};
+
+    fn sess(id: u64, name: &str) -> SessionRecord {
+        use mullion_store::model::{Auth, AuthKind, Connection, Identity, Protocol};
+        SessionRecord {
+            id: SessionId(id),
+            modified_at: "t".into(),
+            identity: Identity {
+                name: name.into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: Connection {
+                host: format!("10.0.0.{id}"),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth {
+                user: "root".into(),
+                kind: AuthKind::Password,
+            },
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+        }
+    }
+
+    fn sftp_sess(id: u64, name: &str) -> SessionRecord {
+        let mut s = sess(id, name);
+        s.connection.protocol = mullion_store::Protocol::Sftp;
+        s
+    }
+
+    fn tun(id: u64, session: u64, kind: TunnelKind) -> TunnelRecord {
+        TunnelRecord {
+            id: TunnelId(id),
+            session_id: SessionId(session),
+            listen_port: 3306,
+            note: String::new(),
+            autostart: false,
+            kind,
+        }
+    }
+
+    fn local() -> TunnelKind {
+        TunnelKind::Local {
+            target_host: "db.internal".into(),
+            target_port: 3306,
+            expose: false,
+        }
+    }
+
+    /// 跑两帧(第一帧让布局稳定),返回第二帧输出。
+    fn run(
+        ui_state: &mut UiState,
+        sessions: &[SessionRecord],
+        tunnels: &[TunnelRecord],
+    ) -> (egui::Context, egui::FullOutput) {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let once = |st: &mut UiState| {
+            ctx.run(Default::default(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    st,
+                    sessions,
+                    &[],
+                    tunnels,
+                    &[],
+                    true,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            })
+        };
+        once(ui_state);
+        let out = once(ui_state);
+        (ctx, out)
+    }
+
+    fn all_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        acc
+    }
+
+    fn has(texts: &[String], needle: &str) -> bool {
+        texts.iter().any(|s| s.contains(needle))
+    }
+
+    fn open(mode: ManagerMode) -> UiState {
+        UiState {
+            session_manager_open: true,
+            manager_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    /// 分流的唯一真源。列表渲染和键盘顺序都走它,两边分叉就会出现
+    /// 「按了下箭头,右栏换了一条陌生会话,左栏却没有任何行高亮」。
+    #[test]
+    fn each_mode_maps_to_exactly_one_protocol_or_none() {
+        use mullion_store::Protocol;
+        assert_eq!(protocol_of(ManagerMode::Sessions), Some(Protocol::Ssh));
+        assert_eq!(protocol_of(ManagerMode::Sftp), Some(Protocol::Sftp));
+        assert_eq!(
+            protocol_of(ManagerMode::Tunnels),
+            None,
+            "隧道档不列会话,必须是 None——给它编一个协议会让键盘顺序走进会话列表"
+        );
+    }
+
+    /// SFTP 档列 SFTP 节点,会话档列 SSH 会话,互不串台。
+    ///
+    /// 自证会变红:把 `list::show`/`visible_order` 里的协议 filter 去掉,
+    /// 两个方向的断言各红一条。
+    #[test]
+    fn each_page_lists_only_its_own_protocol() {
+        let sessions = vec![sess(1, "生产主控"), sftp_sess(2, "文件中转")];
+
+        let (_c, out) = run(&mut open(ManagerMode::Sessions), &sessions, &[]);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "生产主控"), "会话页没画 SSH 会话: {texts:?}");
+        assert!(
+            !has(&texts, "文件中转"),
+            "会话页混进了 SFTP 节点: {texts:?}"
+        );
+
+        let (_c, out) = run(&mut open(ManagerMode::Sftp), &sessions, &[]);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "文件中转"), "SFTP 页没画 SFTP 节点: {texts:?}");
+        assert!(
+            !has(&texts, "生产主控"),
+            "SFTP 页混进了 SSH 会话: {texts:?}"
+        );
+    }
+
+    /// 键盘顺序与渲染必须是**同一份**集合。这条钉的是「按 ↓ 跳到看不见的行」
+    /// ——症状是右栏表单换了一条陌生会话,左栏却没有任何一行高亮。
+    ///
+    /// 自证会变红:只给 `list::show` 加 filter、不给 `visible_order` 加。
+    #[test]
+    fn keyboard_order_never_contains_a_row_the_page_does_not_render() {
+        use mullion_store::Protocol;
+        let sessions = vec![sess(1, "生产主控"), sftp_sess(2, "文件中转")];
+        let order = list::visible_order(&sessions, &[], "", Protocol::Ssh);
+        assert_eq!(
+            order,
+            vec![SessionId(1)],
+            "SSH 页的键盘顺序里不该有 SFTP 节点"
+        );
+        let order = list::visible_order(&sessions, &[], "", Protocol::Sftp);
+        assert_eq!(order, vec![SessionId(2)]);
+    }
+
+    /// SFTP 节点不画「登录后」:那一页是发 shell 命令与 tmux 附着(F40~F44),
+    /// 对 SFTP 没有落点,画出来等于让用户配一堆永远不会执行的东西。
+    ///
+    /// 返回的是 **`TABS` 的原始下标**而不是重新编号。`TAB_*` 是下标常量:
+    /// 用 `enumerate()` 的位置序号去写 `editor_tab`,点「图标」会打开「登录后」。
+    #[test]
+    fn sftp_hides_the_automation_tab_and_keeps_original_indices() {
+        assert_eq!(
+            visible_tabs(ManagerMode::Sftp),
+            &[TAB_CONNECT, TAB_AUTH, TAB_APPEARANCE],
+            "SFTP 档必须是这三页,且用的是原始下标"
+        );
+        assert_eq!(
+            visible_tabs(ManagerMode::Sessions),
+            &[TAB_CONNECT, TAB_AUTH, TAB_AUTOMATION, TAB_APPEARANCE]
+        );
+    }
+
+    /// D5 防漂移:必填项只落在「连接」「认证」两页,两页在 SFTP 档都在。
+    /// 将来有人给「登录后」加必填项时,这条会先红 —— 那时才需要处理
+    /// 「校验要把用户导向一页看不见的 Tab」。
+    #[test]
+    fn every_reachable_validation_target_is_visible_in_sftp_mode() {
+        let all_missing = super::validate::Missing {
+            name: true,
+            host: true,
+            user: true,
+        };
+        let visible = visible_tabs(ManagerMode::Sftp);
+        for m in [
+            all_missing,
+            super::validate::Missing {
+                name: false,
+                host: false,
+                user: true,
+            },
+        ] {
+            if let Some(tab) = m.tab() {
+                assert!(
+                    visible.contains(&tab),
+                    "校验会把用户导向 SFTP 档看不见的 Tab {tab}"
+                );
+            }
+        }
+    }
+
+    /// D3:协议只读。可改的话,一条记录会在保存那一刻从当前列表消失、跑到
+    /// 另一页去(用户看到的是「我点了保存,会话没了」),而引用它的隧道会
+    /// 当场变成「经由一个 SFTP 节点」。要换协议就新建一条。
+    ///
+    /// 光看「画面上没出现『sftp(未实现)』」测不出什么 —— `ComboBox` 关着的
+    /// 时候候选项本来就不画,这条断言在协议还是下拉的旧实现下也会恒绿。
+    /// 所以这里**真的点一下协议控件**:旧实现是 `ComboBox`,点它的按钮部分
+    /// 就会在下一帧弹出候选(`sftp(未实现)` 会出现);新实现是纯
+    /// `ui.label`,点哪里都不会有任何响应。
+    ///
+    /// 只跑了 `ManagerMode::Sessions` 一种场景,名字不承诺覆盖 SFTP 档:
+    /// `fields::basic` 根本不接收 `ManagerMode`,协议只读对两个模式是同一份
+    /// 代码同一条路径,SFTP 场景不会带来新分支,补一组只是重复跑一遍同样的
+    /// 断言,不构成新的覆盖。
+    #[test]
+    fn the_protocol_row_is_plain_text_with_no_dropdown_to_open() {
+        let sessions = vec![sess(1, "生产主控")];
+        let mut st = open(ManagerMode::Sessions);
+        st.editor_id = Some(SessionId(1));
+        st.editor = Some(EditorBuffer::from_record(&sessions[0]));
+        st.editor_baseline = st.editor.clone();
+        let (ctx, out) = run(&mut st, &sessions, &[]);
+        let texts = all_text(&out.shapes);
+        // 精确匹配,不用 `has`(子串):"ssh" 这么短的串很容易被别的文案
+        // (主机名、`ssh-rsa`、`~/.ssh/config` 之类)子串误命中。协议这一行
+        // 画的就是单独一个 `ssh` 文本节点,精确相等才对得上「协议值显示出来
+        // 了」这件事。
+        assert!(
+            texts.iter().any(|s| s == "ssh"),
+            "协议值该显示出来: {texts:?}"
+        );
+
+        let pos = find_text_pos(&out.shapes, "ssh").expect("协议值「ssh」没画出来");
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let t = crate::theme::MULLION_DARK;
+        let mut draw = |input: egui::RawInput| {
+            ctx.run(input, |c| {
+                show(
+                    c,
+                    &t,
+                    &mut st,
+                    &sessions,
+                    &[],
+                    &[],
+                    &[],
+                    true,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            })
+        };
+        let _ = draw(input);
+        // `ComboBox` 点击后要再多跑一帧,弹出的候选才会画出来(同
+        // `tri_state_combo_keeps_on_off_labels_and_written_values_paired_not_
+        // swapped` 里的手法:点击那一帧只切换打开状态,候选内容在下一帧才
+        // 真正画出来)。少这一帧,这条断言无论协议是不是只读都会恒绿。
+        let clicked_out = draw(egui::RawInput::default());
+        let texts_after_click = all_text(&clicked_out.shapes);
+        assert!(
+            !has(&texts_after_click, "sftp(未实现)"),
+            "点一下协议控件就弹出了候选项,说明它还是个能改的下拉: {texts_after_click:?}"
+        );
+        assert_eq!(
+            st.editor.as_ref().map(|b| b.protocol),
+            Some(mullion_store::Protocol::Ssh),
+            "点一下协议控件,值不该变"
+        );
+    }
+
+    /// 在哪一档按「+ 新建」,建出来的就是哪一类节点。协议此后只读(D3),
+    /// 所以这是它唯一的决定点 —— 漏了这里,SFTP 页新建的节点会是 ssh,
+    /// 保存后当场从 SFTP 页消失。
+    #[test]
+    fn new_draft_takes_its_protocol_from_the_current_mode() {
+        use mullion_store::Protocol;
+        for (mode, want) in [
+            (ManagerMode::Sessions, Protocol::Ssh),
+            (ManagerMode::Sftp, Protocol::Sftp),
+        ] {
+            let mut st = open(mode);
+            st.pending_switch = Some(SwitchTarget::NewDraft);
+            apply_switch(&mut st, &[]);
+            assert_eq!(
+                st.editor.as_ref().map(|b| b.protocol),
+                Some(want),
+                "{mode:?} 档新建的草稿协议不对"
+            );
+        }
+    }
+
+    /// D5 的下标陷阱。SFTP 档 Tab 条上第三个是「图标」,点它必须打开「图标」。
+    ///
+    /// 自证会变红:把 `editor.rs` 的 Tab 循环改回 `TABS.iter().enumerate()`,
+    /// 这条立刻红(`editor_tab` 会变成 2 = 登录后)。
+    #[test]
+    fn clicking_the_third_tab_in_sftp_mode_opens_appearance_not_automation() {
+        let sessions = vec![sftp_sess(1, "文件中转")];
+        let mut st = open(ManagerMode::Sftp);
+        st.editor_id = Some(SessionId(1));
+        st.editor = Some(EditorBuffer::from_record(&sessions[0]));
+        st.editor_baseline = st.editor.clone();
+
+        // 先跑两帧把 Tab 画出来,再用真实指针事件点「图标」那一格
+        // (位置从渲染出的文字锚点反查)。
+        let (ctx, out) = run(&mut st, &sessions, &[]);
+        let pos = find_text_pos(&out.shapes, "图标").expect("Tab「图标」没画出来");
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let t = crate::theme::MULLION_DARK;
+        let _ = ctx.run(input, |c| {
+            show(
+                c,
+                &t,
+                &mut st,
+                &sessions,
+                &[],
+                &[],
+                &[],
+                true,
+                SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
+            );
+        });
+
+        assert_eq!(
+            st.editor_tab, TAB_APPEARANCE,
+            "点 SFTP 档第三个 Tab「图标」,打开的却是下标 {} 那一页",
+            st.editor_tab
+        );
+    }
+
+    /// 反查一段文字画在哪儿,用来给点击事件定位。**没有用 `ctx.graphics(...)`**
+    /// (egui-0.30.0 的 `GraphicLayers` 没有公开的 `iter()`,编译不过)——改用
+    /// `run()` 已经拿到的 `FullOutput::shapes`,同 `editor.rs::tests` 里
+    /// `find_text_pos_exact` 的做法(那边按**完整相等**,这里按**子串**——
+    /// Tab 标题后面可能跟着 F91 的缺项徽标,不能要求完全相等)。
+    fn find_text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                    Some(ts.pos + ts.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// 切到隧道页,左栏画的必须是隧道,不是会话。
+    ///
+    /// 自证会变红:把 `show()` 里 `SidePanel` 的 `match manager_mode` 改回
+    /// 无条件 `list::show`,这条立刻炸。
+    #[test]
+    fn tunnel_mode_renders_tunnel_list_not_session_list() {
+        let sessions = vec![sess(1, "生产主控")];
+        let tunnels = vec![tun(1, 1, local())];
+
+        let (_c, out) = run(&mut open(ManagerMode::Tunnels), &sessions, &tunnels);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "本地 3306"), "隧道行没画出来: {texts:?}");
+        assert!(
+            !has(&texts, "生产主控") || has(&texts, "经 生产主控"),
+            "隧道页不该画会话列表行(只允许作为「经由」出现): {texts:?}"
+        );
+
+        // 反面:会话模式下画的是会话,不是隧道。
+        let (_c, out) = run(&mut open(ManagerMode::Sessions), &sessions, &tunnels);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "生产主控"), "会话行没画出来: {texts:?}");
+        assert!(!has(&texts, "本地 3306"), "会话页不该画隧道行: {texts:?}");
+    }
+
+    /// F100:新 UI 元素必须登记,否则标注模式导不出它 —— 用户就是靠导出的
+    /// 标注来提需求的,漏登记等于这块界面在对话里没有名字。
+    #[test]
+    fn mode_bar_is_annotated_for_f100() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![sess(1, "a")];
+        let mut st = open(ManagerMode::Sessions);
+        let ctx = egui::Context::default();
+        // `mark` 在模式关着时是空操作(只读一个 bool),所以必须先打开。
+        assert!(crate::ui::annotate::toggle(&ctx), "标注模式没打开,后面白测");
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut st,
+                    &sessions,
+                    &[],
+                    &[],
+                    &[],
+                    true,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            });
+        }
+        let paths = crate::ui::annotate::spot_paths(&ctx);
+        assert!(
+            paths.iter().any(|p| p == "会话管理器/模式条"),
+            "模式条没登记进 F100,实际有: {paths:?}"
+        );
+    }
+
+    /// 切模式**只能**换页,不许碰另一边的表单缓冲。
+    ///
+    /// 症状很隐蔽:会话表单填到一半 → 好奇点一下「隧道」→ 切回来,刚才打的
+    /// 字没了,而且没有任何提示。两套 editor/baseline 共用一个清空点就会这样。
+    #[test]
+    fn switching_manager_mode_does_not_clobber_the_other_editors_dirty_state() {
+        let sessions = vec![sess(1, "a")];
+        let mut st = open(ManagerMode::Sessions);
+        // 会话表单编辑到一半:缓冲与基线不同 = 脏。
+        let buf = EditorBuffer {
+            name: "填了一半".into(),
+            ..Default::default()
+        };
+        st.editor_id = Some(SessionId(1));
+        st.editor_baseline = Some(EditorBuffer::default());
+        st.editor = Some(buf.clone());
+
+        st.manager_mode = ManagerMode::Tunnels;
+        let _ = run(&mut st, &sessions, &[]);
+        st.manager_mode = ManagerMode::Sessions;
+        let _ = run(&mut st, &sessions, &[]);
+
+        assert_eq!(
+            st.editor.as_ref().map(|b| b.name.clone()),
+            Some("填了一半".to_string()),
+            "切一趟隧道页回来,会话表单的未保存改动被丢掉了"
+        );
+        assert_eq!(
+            st.editor_baseline,
+            Some(EditorBuffer::default()),
+            "基线也必须原样保留,否则脏检查会误判成「没改过」"
+        );
+    }
+
+    /// 「能不能点」必须**真的**体现在 `Response::enabled` 上,不能只是画成灰的。
+    /// 这条同时钉两头:三种转发都实现了 → 都能点;引用悬垂 → 真禁用。
+    ///
+    /// 它是 T-a 那条 `start_button_is_really_disabled_not_just_greyed` 与 T-b 那条
+    /// `local_start_button_is_clickable_and_unimplemented_kinds_stay_disabled` 的
+    /// 接班 —— 前两条守的前提(「转发还没实现」/「只有 `-L` 实现了」)都已经
+    /// 不成立,但「按钮该不该能点」这件事必须一直有测试钉着。
+    ///
+    /// **必须在 `ctx.run` 的闭包内部读 response。** `run` 返回之后
+    /// `read_response` 落到 `prev_pass`,拿到的是更早的一帧;而首帧
+    /// 布局还没量出底部面板高度,整个滚动区不可见 → egui 把那层 `Ui`
+    /// 记成 `enabled=false`。在外面读,「本地转发能点」这半条即使
+    /// 实现正确也照样红、「远端禁用」那半条即使删掉 `ui.disable()`
+    /// 也照样绿 —— 已实测确认过。
+    #[test]
+    fn every_kind_is_clickable_and_only_dangling_references_stay_disabled() {
+        fn enabled_of(tunnels: &[TunnelRecord], id: TunnelId) -> bool {
+            let t = crate::theme::MULLION_DARK;
+            let sessions = vec![sess(1, "a")];
+            let mut st = open(ManagerMode::Tunnels);
+            let ctx = egui::Context::default();
+            let mut seen: Option<egui::Response> = None;
+            for _ in 0..3 {
+                let _ = ctx.run(Default::default(), |c| {
+                    show(
+                        c,
+                        &t,
+                        &mut st,
+                        &sessions,
+                        &[],
+                        tunnels,
+                        &[],
+                        true,
+                        SecretPresence::default(),
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
+                    seen = c.read_response(tunnel_list::start_button_id(id));
+                });
+            }
+            seen.expect("启动按钮该被渲染出来").enabled
+        }
+
+        for (id, kind) in [
+            (1u64, local()),
+            (
+                2,
+                TunnelKind::Remote {
+                    target_host: "127.0.0.1".into(),
+                    target_port: 3000,
+                    expose: false,
+                },
+            ),
+            (3, TunnelKind::Dynamic),
+        ] {
+            assert!(
+                enabled_of(&[tun(id, 1, kind)], TunnelId(id)),
+                "三种转发都实现了,启动按钮都必须可点(隧道 {id})"
+            );
+        }
+        // 唯一还剩的禁用理由:引用的会话已经删了。必须是**真禁用** ——
+        // 画成灰的但仍能点,用户点了没反应会以为是隧道配错了。
+        assert!(
+            !enabled_of(&[tun(9, 999, local())], TunnelId(9)),
+            "引用悬垂时按钮必须是真禁用而不是画成灰的"
+        );
+    }
+
+    /// 悬垂引用:列表和编辑器都要**说出来**,并且不许静默改指向。
+    #[test]
+    fn a_dangling_tunnel_says_so_instead_of_snapping_to_another_session() {
+        let sessions = vec![sess(1, "还在的会话")];
+        let tunnels = vec![tun(1, 999, local())];
+        let mut st = open(ManagerMode::Tunnels);
+        st.tunnel_editor_id = Some(TunnelId(1));
+        st.tunnel_editor = Some(TunnelEditorBuffer::from_record(&tunnels[0]));
+        st.tunnel_editor_baseline = st.tunnel_editor.clone();
+
+        let (_c, out) = run(&mut st, &sessions, &tunnels);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "引用的会话已删除"), "没有提示悬垂: {texts:?}");
+        assert!(
+            has(&texts, "已删除的会话 (id=999)"),
+            "下拉必须保持显示原来的 id,而不是跳到第一条: {texts:?}"
+        );
+        assert_eq!(
+            st.tunnel_editor.as_ref().and_then(|b| b.session_id),
+            Some(SessionId(999)),
+            "渲染一帧不该把悬垂引用悄悄改成别的会话"
+        );
+    }
+
+    /// 标签必须随类型翻转,且**不能同时出现** —— 两套方向词一起摆在屏幕上
+    /// 比不写还糟。
+    #[test]
+    fn local_and_remote_use_different_captions_and_never_both() {
+        let sessions = vec![sess(1, "a")];
+        let probe = |kind: TunnelKindUi| {
+            let mut st = open(ManagerMode::Tunnels);
+            st.tunnel_editor = Some(TunnelEditorBuffer {
+                session_id: Some(SessionId(1)),
+                kind,
+                listen_port: "3306".into(),
+                target_host: "db.internal".into(),
+                target_port: "3306".into(),
+                ..Default::default()
+            });
+            let (_c, out) = run(&mut st, &sessions, &[]);
+            all_text(&out.shapes)
+        };
+
+        let l = probe(TunnelKindUi::Local);
+        assert!(has(&l, "本机侦听端口"), "{l:?}");
+        assert!(!has(&l, "远端侦听端口"), "两种方向词同时出现: {l:?}");
+        assert!(
+            has(&l, "由远端主机解析"),
+            "-L 的目标名由远端解析,这句必须写出来: {l:?}"
+        );
+
+        let r = probe(TunnelKindUi::Remote);
+        assert!(has(&r, "远端侦听端口"), "{r:?}");
+        assert!(!has(&r, "本机侦听端口"), "两种方向词同时出现: {r:?}");
+        assert!(
+            has(&r, "由本机解析"),
+            "-R 的目标名由本机解析,这句必须写出来: {r:?}"
+        );
+    }
+
+    /// `-D` 没有目标,也没有暴露开关 —— 后者在类型上就不存在(见
+    /// `TunnelKind::Dynamic`),UI 若还画一个,就是画了个写不进数据的控件。
+    #[test]
+    fn dynamic_renders_neither_target_nor_expose_checkbox() {
+        let sessions = vec![sess(1, "a")];
+        let mut st = open(ManagerMode::Tunnels);
+        st.tunnel_editor = Some(TunnelEditorBuffer {
+            session_id: Some(SessionId(1)),
+            kind: TunnelKindUi::Dynamic,
+            listen_port: "1080".into(),
+            ..Default::default()
+        });
+        let (_c, out) = run(&mut st, &sessions, &[]);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "本机 SOCKS5 端口"), "{texts:?}");
+        assert!(!has(&texts, "目标"), "动态转发不该有目标区: {texts:?}");
+        assert!(!has(&texts, "允许"), "动态转发不该有暴露勾选框: {texts:?}");
+    }
+
+    /// F117:勾上暴露要给**带具体目标**的警告。泛泛一句「有风险」没法让用户
+    /// 判断该不该勾。
+    #[test]
+    fn checking_expose_warns_with_the_concrete_target() {
+        let sessions = vec![sess(1, "a")];
+        let mut st = open(ManagerMode::Tunnels);
+        st.tunnel_editor = Some(TunnelEditorBuffer {
+            session_id: Some(SessionId(1)),
+            kind: TunnelKindUi::Local,
+            listen_port: "3306".into(),
+            target_host: "db.internal".into(),
+            target_port: "3306".into(),
+            expose: true,
+            ..Default::default()
+        });
+        let (_c, out) = run(&mut st, &sessions, &[]);
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|s| s.contains("db.internal:3306") && s.contains("不做任何认证")),
+            "暴露警告要带具体目标: {texts:?}"
+        );
+
+        // 不勾就不该有这句 —— 常驻的红字等于没有红字。
+        let mut st2 = open(ManagerMode::Tunnels);
+        st2.tunnel_editor = Some(TunnelEditorBuffer {
+            session_id: Some(SessionId(1)),
+            kind: TunnelKindUi::Local,
+            listen_port: "3306".into(),
+            target_host: "db.internal".into(),
+            target_port: "3306".into(),
+            expose: false,
+            ..Default::default()
+        });
+        let (_c, out) = run(&mut st2, &sessions, &[]);
+        assert!(!has(&all_text(&out.shapes), "不做任何认证"));
+    }
+
+    /// Task 7:删会话前列出受影响的隧道;没有引用时**不多画一块空区域**。
+    #[test]
+    fn deleting_a_referenced_session_lists_the_affected_tunnels() {
+        let sessions = vec![sess(7, "要删的")];
+        let tunnels = vec![tun(1, 7, local()), tun(2, 7, TunnelKind::Dynamic)];
+        let mut st = open(ManagerMode::Sessions);
+        st.pending_delete = Some(SessionId(7));
+        let (_c, out) = run(&mut st, &sessions, &tunnels);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "以下隧道会失去引用"), "{texts:?}");
+        assert!(has(&texts, "本地 3306"), "{texts:?}");
+        assert!(has(&texts, "动态 3306"), "{texts:?}");
+
+        // 无引用:确认框保持原样。
+        let mut st2 = open(ManagerMode::Sessions);
+        st2.pending_delete = Some(SessionId(7));
+        let (_c, out) = run(&mut st2, &sessions, &[]);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "删除「要删的」?"), "确认框本身要在: {texts:?}");
+        assert!(
+            !has(&texts, "以下隧道会失去引用"),
+            "没有隧道引用时不该多出一块空区域: {texts:?}"
+        );
+    }
+
+    /// D3:确认框里必须把「正在跑的会被停掉」单独说出来。跟「会失去引用」
+    /// 混为一句的话,用户按下删除时不知道自己此刻会切断什么。
+    #[test]
+    fn delete_confirm_says_how_many_of_them_are_running() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![sess(7, "要删的")];
+        let tunnels = vec![tun(1, 7, local()), tun(2, 7, TunnelKind::Dynamic)];
+        let states = vec![(TunnelId(1), mullion_ssh::tunnel::TunnelState::Running)];
+        let mut st = open(ManagerMode::Sessions);
+        st.pending_delete = Some(SessionId(7));
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(Default::default(), |c| {
+                show(
+                    c,
+                    &t,
+                    &mut st,
+                    &sessions,
+                    &[],
+                    &tunnels,
+                    &states,
+                    true,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            }));
+        }
+        let texts = all_text(&out.unwrap().shapes);
+        assert!(
+            texts.iter().any(|s| s.contains("正在运行")),
+            "没说清有几条正在跑: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s.contains("其中 1 条")),
+            "两条引用里只有一条在跑,不该报 2: {texts:?}"
+        );
+    }
+
+    /// 隧道页没有会话可切、可连。不加这道门的话,站在隧道页按 ↑↓ 会对一条
+    /// **看不见**的会话发 `pending_switch`(会话表单脏着时还会凭空弹出
+    /// 「有未保存的更改」确认框),按 Enter 会连接一条看不见的会话。
+    ///
+    /// 这是 F116 引入模式条时漏的门,本测试在修复前必须先红。
+    #[test]
+    fn tunnel_mode_ignores_session_keyboard_actions() {
+        let sessions = vec![sess(1, "生产主控")];
+        let t = crate::theme::MULLION_DARK;
+        let key = |k: egui::Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+
+        // ↓:`pending_switch` 会在同一帧内被消费掉(不脏就立即
+        // `apply_switch`,见该函数文档),帧结束后它本来就是 `None`——不管有
+        // 没有这道门都一样,单独查它测不出漏洞。真正的症状是 `editor_id`
+        // 被悄悄换成了一条隧道页上看不见的会话,所以查它。
+        let mut st = open(ManagerMode::Tunnels);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key(egui::Key::ArrowDown)],
+                ..Default::default()
+            },
+            |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut st,
+                    &sessions,
+                    &[],
+                    &[],
+                    &[],
+                    true,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            },
+        );
+        assert!(
+            st.editor_id.is_none(),
+            "隧道页按 ↓ 不该把右栏换成看不见的会话,实际: {:?}",
+            st.editor_id
+        );
+
+        // Enter:`editor_id` 若是从会话页切过来时残留的(`mode_bar` 明确不清
+        // editor 字段,见该函数文档),隧道页按 Enter 不该拿它去发连接请求。
+        let mut st2 = open(ManagerMode::Tunnels);
+        st2.editor_id = Some(SessionId(1));
+        let ctx2 = egui::Context::default();
+        let _ = ctx2.run(
+            egui::RawInput {
+                events: vec![key(egui::Key::Enter)],
+                ..Default::default()
+            },
+            |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut st2,
+                    &sessions,
+                    &[],
+                    &[],
+                    &[],
+                    true,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            },
+        );
+        assert!(
+            st2.connect_request.is_none(),
+            "隧道页按 Enter 不该发起连接,实际: {:?}",
+            st2.connect_request
+        );
+    }
+
+    /// D4:SFTP 传输还没实现(F50),点了也连不上。四条入口(左栏双击、
+    /// 右键菜单、右栏按钮、Enter)都要挡住 —— 这里测的是兜底闸门:
+    /// 无论哪条路把 connect_request 写了进来,出了 show() 都必须是 None。
+    ///
+    /// 自证会变红:把 mod.rs 里那段闸门删掉。
+    #[test]
+    fn no_connect_request_survives_outside_session_mode() {
+        let sessions = vec![sess(1, "生产主控"), sftp_sess(2, "文件中转")];
+        for mode in [ManagerMode::Sftp, ManagerMode::Tunnels] {
+            let mut st = open(mode);
+            // 模拟「某条入口已经把意图写了进来」。
+            st.connect_request = Some(SessionId(2));
+            st.connect_skip_automation = true;
+            let _ = run(&mut st, &sessions, &[]);
+            assert!(st.connect_request.is_none(), "{mode:?} 档不该放行连接意图");
+            assert!(
+                !st.connect_skip_automation,
+                "{mode:?} 档的跳过自动化标志也要一并清掉,否则它会漂到下一次真连接上"
+            );
+        }
+
+        // 反面:会话档必须照常放行,否则这道闸门就把正常功能一起挡了。
+        let mut st = open(ManagerMode::Sessions);
+        st.connect_request = Some(SessionId(1));
+        let _ = run(&mut st, &sessions, &[]);
+        assert_eq!(
+            st.connect_request,
+            Some(SessionId(1)),
+            "会话档的连接意图被误挡了"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mullion_store::SessionId;
@@ -763,6 +1807,8 @@ mod tests {
                             &t,
                             ui_state,
                             &sessions,
+                            &[],
+                            &[],
                             &[],
                             true,
                             SecretPresence::default(),
@@ -949,6 +1995,8 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
@@ -962,6 +2010,8 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
@@ -1009,6 +2059,8 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
@@ -1022,6 +2074,8 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
@@ -1107,6 +2161,8 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
@@ -1120,6 +2176,8 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
@@ -1187,6 +2245,8 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
@@ -1386,6 +2446,8 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
@@ -1523,6 +2585,8 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
@@ -1537,6 +2601,8 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
@@ -1586,6 +2652,8 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
@@ -1610,6 +2678,8 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
@@ -1664,6 +2734,8 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
@@ -1751,6 +2823,8 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),

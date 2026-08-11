@@ -82,6 +82,14 @@ pub enum UserEvent {
     /// F40~F44:一次自动化结束。`u64` 是发起时的 `Workspace` 世代号,
     /// 过期的直接丢(同 `PaneOpenErr::generation`)。
     AutomationDone(u64, crate::automation::Outcome),
+    /// F111/F114:某条隧道的监管任务报了一次状态。**不带世代号** ——
+    /// 隧道不属于 `Workspace`(ADR-010:它有自己的连接),重连一次终端不会
+    /// 让 `TunnelId` 被复用;「还在不在运行时表里」就是唯一需要的过期判据
+    /// (见 `tunnels::TunnelRuntime::set_state`)。
+    TunnelState {
+        id: mullion_store::TunnelId,
+        state: mullion_ssh::tunnel::TunnelState,
+    },
 }
 
 /// 一次在途自动化的把手。三条通道都是 `Option`,因为每一条都是**一次性边**:
@@ -211,6 +219,9 @@ pub struct App {
     pending_automation: Option<crate::automation::PendingAutomation>,
     /// F44 右键「连接(跳过自动化)」的一次性标志。`ConnectOk` 消费后立即清零。
     pending_skip_automation: bool,
+    /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
+    /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
+    tunnels: crate::tunnels::TunnelRuntime,
     /// 上一次自动化的结论文案。一直显示到下一次 `spawn_connect` 才清空 ——
     /// 不做定时淡出:状态栏本来就是常驻信息区,而定时清除需要再引一个
     /// deadline 进帧循环,正是 spec §1 修订一要避免的东西。
@@ -266,6 +277,7 @@ impl App {
             automation: None,
             pending_automation: None,
             pending_skip_automation: false,
+            tunnels: Default::default(),
             automation_status: None,
         }
     }
@@ -925,6 +937,139 @@ impl App {
         self.ui_dirty = true;
         self.request_ui_redraw();
     }
+
+    /// F111/F112/F113:按一条隧道记录起一条转发。
+    ///
+    /// `-L`/`-D` 的顺序是**先占本机端口、再建 SSH**(设计 S1):端口被占用
+    /// 0ms 就能发现,先烧一次完整建链(高延迟代理链路上好几秒)才告诉用户
+    /// 「端口被占了」是纯粹的浪费;而且 listener 归监管任务持有、跨重连不
+    /// 释放,重连期间端口不会被别的程序抢走。
+    ///
+    /// `-R` 占的是**远端**的端口,S1 在那类上无从谈起 —— 冲突只能等服务端
+    /// 拒绝(`RemoteForwardDenied`,同样是致命错误,不进退避)。
+    fn start_tunnel(&mut self, id: mullion_store::TunnelId) {
+        use mullion_store::TunnelKind;
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Some(rec) = store.tunnels().iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        // 隧道**独占**自己的 SSH 连接(ADR-010),所以这里跟点「连接」走的是
+        // 同一个 `ssh_config_for` —— 代理、跳板链一并解析,悬垂引用直接报错。
+        let cfg = match store.ssh_config_for(rec.session_id) {
+            Ok(c) => c,
+            Err(e) => {
+                self.ui.set_error(e.to_string());
+                return;
+            }
+        };
+        // 本机 listener 只有 `-L`/`-D` 要。`block_on` 一次 bind:目标是
+        // `SocketAddr`,没有 DNS 往返,微秒级返回,换来的是「端口占用」这条
+        // 错误能当场落进 `last_error`,而不是变成一条需要用户回头去状态栏
+        // 找的异步失败。
+        let bind_local = |expose: bool| {
+            self._runtime.block_on(mullion_ssh::tunnel::bind_listener(
+                mullion_ssh::tunnel::bind_addr(expose, rec.listen_port),
+            ))
+        };
+        let forward = match rec.kind.clone() {
+            TunnelKind::Local {
+                target_host,
+                target_port,
+                expose,
+            } => match bind_local(expose) {
+                Ok(listener) => mullion_ssh::tunnel::Forward::Local {
+                    listener,
+                    target: (target_host, target_port),
+                },
+                Err(e) => {
+                    self.ui.set_error(e.to_string());
+                    return;
+                }
+            },
+            // `-D` **恒绑回环**(设计 D5):开放的无认证 SOCKS5 代理与
+            // 「暴露一个已知目标」是两类风险,`TunnelKind::Dynamic` 在类型上
+            // 就没有 `expose` 字段。
+            TunnelKind::Dynamic => match bind_local(false) {
+                Ok(listener) => mullion_ssh::tunnel::Forward::Dynamic { listener },
+                Err(e) => {
+                    self.ui.set_error(e.to_string());
+                    return;
+                }
+            },
+            TunnelKind::Remote {
+                target_host,
+                target_port,
+                expose,
+            } => mullion_ssh::tunnel::Forward::Remote {
+                bind: mullion_ssh::tunnel::remote_bind_address(expose),
+                port: rec.listen_port,
+                target: (target_host, target_port),
+            },
+        };
+        // 首连允许弹 TOFU 窗;重连只信已知主机(设计 S3)。后者用的
+        // `TrustedOnlyPolicy` **在类型上**就没有 `EventLoopProxy`,不可能弹窗
+        // —— 半夜自动重连时弹一个没人看的模态框,等于隧道静默死掉。
+        let first: Arc<dyn mullion_ssh::known_hosts::HostKeyPolicy> =
+            Arc::new(crate::host_key::PromptingPolicy::new(
+                self.known_hosts.clone(),
+                self.proxy.clone(),
+                true,
+            ));
+        let retry: Arc<dyn mullion_ssh::known_hosts::HostKeyPolicy> = Arc::new(
+            crate::host_key::TrustedOnlyPolicy::new(self.known_hosts.clone()),
+        );
+        let proxy = self.proxy.clone();
+        let sink: mullion_ssh::tunnel::StateSink = Arc::new(move |state| {
+            let _ = proxy.send_event(UserEvent::TunnelState { id, state });
+        });
+        let handle = {
+            // `spawn_tunnel` 内部是 `tokio::spawn`,要 runtime 上下文;
+            // GUI 线程不在 runtime 里,得显式进去一趟。
+            let _guard = self._runtime.enter();
+            mullion_ssh::tunnel::spawn_tunnel(
+                forward,
+                mullion_ssh::tunnel::TunnelDial {
+                    cfg,
+                    first_policy: first,
+                    retry_policy: retry,
+                },
+                sink,
+            )
+        };
+        self.tunnels.insert(id, handle);
+        self.ui.set_toast("隧道启动中…");
+    }
+
+    /// F114/F115:收下一次隧道状态上报。
+    ///
+    /// toast **只在跃迁到失败时弹一次**,不是「只要当前是失败就弹」——
+    /// 后者会在此后每一次状态上报(2 秒一次的健康探测也会走这条路)时
+    /// 重新弹一遍,把用户正在看的东西一直盖住。跃迁判据来自
+    /// `TunnelRuntime::set_state` 返回的**前一个**状态。
+    fn accept_tunnel_state(
+        &mut self,
+        id: mullion_store::TunnelId,
+        state: mullion_ssh::tunnel::TunnelState,
+    ) {
+        let Some(prev) = self.tunnels.set_state(id, state.clone()) else {
+            // 已经被停掉/删掉了,这是一条在途旧消息。
+            return;
+        };
+        // 播不播由纯函数定(它有自己的守护测试),这里只负责组文案。
+        if let Some(cause) = crate::tunnels::failure_announcement(&prev, &state) {
+            let title = self
+                .store
+                .as_ref()
+                .and_then(|s| s.tunnels().iter().find(|t| t.id == id))
+                .map(crate::ui::session_manager::tunnel_list::row_title)
+                .unwrap_or_else(|| format!("隧道 {}", id.0));
+            self.ui.set_toast(format!("{title} 已停止:{cause}"));
+        }
+        self.ui_dirty = true;
+        self.request_ui_redraw();
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1255,6 +1400,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AutomationDone(generation, outcome) => {
                 self.accept_automation_done(generation, outcome);
             }
+            UserEvent::TunnelState { id, state } => self.accept_tunnel_state(id, state),
         }
     }
 
@@ -1649,9 +1795,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 .unwrap_or_default();
                             let groups: &[mullion_store::GroupRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.groups());
+                            let tunnels: &[mullion_store::TunnelRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.tunnels());
+                            let tunnel_states = self.tunnels.snapshot();
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
+                                tunnels,
+                                tunnel_states: &tunnel_states,
                                 store_available,
                                 connected: self.ws.is_some(),
                                 panes: self.ws.as_ref().map_or(1, Workspace::pane_count),
@@ -1827,6 +1978,20 @@ impl ApplicationHandler<UserEvent> for App {
                     diag::mark(diag::Stage::StoreIo);
                 }
                 if let Some(id) = self.ui.delete_request.take() {
+                    // D3(安全属性,不是体验):先停掉引用这条会话的、**正在跑**
+                    // 的隧道。会话一删,那些隧道在界面上就再也找不到了,而它们
+                    // 的本机端口还 listen 着 —— 用户以为已经关掉的通路仍然开着,
+                    // 且没有任何办法从界面上关掉它。
+                    let stop: Vec<_> = self.store.as_ref().map_or_else(Vec::new, |s| {
+                        crate::tunnels::tunnels_to_stop_on_session_delete(
+                            id,
+                            s.tunnels(),
+                            &self.tunnels.snapshot(),
+                        )
+                    });
+                    for tid in stop {
+                        self.tunnels.stop(tid);
+                    }
                     if let Some(store) = self.store.as_mut() {
                         match store.delete(id).and_then(|_| store.save()) {
                             // 走查 13:落盘成功要有一句反馈。删除尤其需要 ——
@@ -1864,6 +2029,55 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                             Err(msg) => self.ui.set_error(msg),
+                        }
+                    }
+                }
+                // F110 隧道 CRUD 的施加点。与会话侧同构:UI 只写意图,这里才碰
+                // store。**不复用** `save_request`/`delete_request` 那两条通道 ——
+                // 它们带的是 `SessionDraft`/`SessionId`,类型不同,挤在一起只能靠
+                // 运行时判别,而两类对象删错了的后果并不一样。
+                if let Some(id) = self.ui.tunnel_delete_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match store.delete_tunnel(id).and_then(|_| store.save()) {
+                            Ok(()) => {
+                                // 删掉的正好是右栏正在编辑的那条 → 清空表单,
+                                // 否则表单还留着一条已经不存在的隧道,再点保存
+                                // 会以「更新」的语义去改一个不存在的 id。
+                                if self.ui.tunnel_editor_id == Some(id) {
+                                    self.ui.tunnel_editor_id = None;
+                                    self.ui.tunnel_editor = None;
+                                    self.ui.tunnel_editor_baseline = None;
+                                }
+                                self.ui.set_toast("已删除隧道");
+                            }
+                            Err(e) => self.ui.set_error(format!("删除隧道失败:{e}")),
+                        }
+                    }
+                }
+                // F111 启停。**必须在这里、不能在 egui 闭包里**:要 store、要
+                // tokio runtime、要 bind 端口,三样在闭包里都够不着。
+                if let Some(id) = self.ui.tunnel_stop_request.take() {
+                    self.tunnels.stop(id);
+                    self.ui.set_toast("已停止隧道");
+                }
+                if let Some(id) = self.ui.tunnel_start_request.take() {
+                    self.start_tunnel(id);
+                }
+                if let Some(intent) = self.ui.tunnel_save_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        let result = match intent.editing_id {
+                            Some(id) => store.update_tunnel(id, intent.draft).map(|_| id),
+                            None => Ok(store.add_tunnel(intent.draft)),
+                        };
+                        match result.and_then(|id| store.save().map(|_| id)) {
+                            Ok(id) => {
+                                // 新建保存后把编辑器切到刚分配的 id,否则再点一次
+                                // 「保存」会**又新建一条**。
+                                self.ui.tunnel_editor_id = Some(id);
+                                self.ui.tunnel_editor_baseline = self.ui.tunnel_editor.clone();
+                                self.ui.set_toast("已保存隧道");
+                            }
+                            Err(e) => self.ui.set_error(format!("保存隧道失败:{e}")),
                         }
                     }
                 }

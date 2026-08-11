@@ -99,6 +99,28 @@ impl SessionStore {
         self.vault.add_group(name)
     }
 
+    pub fn tunnels(&self) -> &[mullion_store::TunnelRecord] {
+        self.vault.tunnels()
+    }
+
+    /// F110 隧道 CRUD。与会话侧一样,写完由调用方 `save()` 落盘 ——
+    /// 不在这里自动存,否则一次编辑会话的多步修改要写好几遍磁盘。
+    pub fn add_tunnel(&mut self, draft: mullion_store::TunnelDraft) -> mullion_store::TunnelId {
+        self.vault.add_tunnel(draft)
+    }
+
+    pub fn update_tunnel(
+        &mut self,
+        id: mullion_store::TunnelId,
+        draft: mullion_store::TunnelDraft,
+    ) -> Result<(), StoreError> {
+        self.vault.update_tunnel(id, draft)
+    }
+
+    pub fn delete_tunnel(&mut self, id: mullion_store::TunnelId) -> Result<(), StoreError> {
+        self.vault.delete_tunnel(id)
+    }
+
     pub fn rename_group(&mut self, id: mullion_store::GroupId, name: String) -> bool {
         match self.vault.group_mut(id) {
             Some(g) => {

@@ -22,4 +22,5 @@ pub mod session_pump;
 pub mod shell;
 pub mod text;
 pub mod theme;
+pub mod tunnels;
 pub mod ui;

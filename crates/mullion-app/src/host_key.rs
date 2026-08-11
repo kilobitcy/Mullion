@@ -137,6 +137,65 @@ impl HostKeyPolicy for PromptingPolicy {
     }
 }
 
+/// 后台重连专用的主机密钥策略(F114):**只信已记录且一致的主机**,
+/// 未知与变更一律拒绝,不弹任何窗。
+///
+/// 这不是「更严格一点」的 `PromptingPolicy`,而是设计 D7 那两条硬约束的
+/// 结构性兑现 —— 注意本类型**根本没有 `proxy` 字段**:
+///
+/// 1. 「需要交互的凭据不自动重连」:发不出 `HostKeyPrompt` 事件,
+///    后台隧道在类型上就不可能在用户面前糊一屏模态框。
+/// 2. 「指纹变更立即停止、绝不重试」:变更走 `Reject(Changed)`,
+///    `establish` 会翻成 `ConnectError::HostKeyChanged`,而
+///    `tunnel::is_fatal` 认它是致命错误 —— 一次都不会重试。
+///
+/// 首次启动隧道用的仍然是 `PromptingPolicy`:那时用户刚点完「启动」,
+/// 人就在屏幕前,TOFU 确认是有意义的。
+pub struct TrustedOnlyPolicy {
+    known: Arc<Mutex<KnownHostsFile>>,
+}
+
+impl TrustedOnlyPolicy {
+    pub fn new(known: Arc<Mutex<KnownHostsFile>>) -> Self {
+        Self { known }
+    }
+}
+
+impl HostKeyPolicy for TrustedOnlyPolicy {
+    fn decide<'a>(
+        &'a self,
+        host: &'a str,
+        _algo: &'a str,
+        fp: &'a Fingerprint,
+    ) -> HostKeyFuture<'a> {
+        let text = fp.to_ssh_string();
+        // 锁只在读表那一瞬持有,不跨 await(同 `PromptingPolicy` 的理由);
+        // 中毒后继续用也只是 `BTreeMap::get`,panic-safe。
+        let outcome = {
+            let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+            check(&known, host, &text)
+        };
+        let decision = match outcome {
+            HostKeyCheck::Trusted => HostKeyDecision::Accept,
+            HostKeyCheck::NeedsPrompt {
+                previous: Some(e), ..
+            } => HostKeyDecision::Reject(HostKeyOutcome::Changed {
+                host: host.to_owned(),
+                expected: Fingerprint::parse_ssh(&e.fingerprint)
+                    .unwrap_or_else(|| Fingerprint(Vec::new())),
+                got: fp.clone(),
+            }),
+            HostKeyCheck::NeedsPrompt { previous: None } => {
+                HostKeyDecision::Reject(HostKeyOutcome::Unknown {
+                    host: host.to_owned(),
+                    got: fp.clone(),
+                })
+            }
+        };
+        Box::pin(std::future::ready(decision))
+    }
+}
+
 /// fail-closed 的全部判定:只有用户明确点「接受」才放行。
 ///
 /// 抽成独立函数是为了能单测——`decide` 依赖 `EventLoopProxy`,而它只能由
@@ -226,6 +285,51 @@ mod tests {
             HostKeyCheck::NeedsPrompt {
                 previous: Some(entry("SHA256:AAAA"))
             }
+        );
+    }
+
+    /// 拿一份真公钥算出的 `Fingerprint` 太重(要读 fixture),而
+    /// `to_ssh_string()` 对非 32 字节的输入会退化成十六进制 —— 这里只需要
+    /// 「同一份字节 → 同一个字符串」这一条性质,所以直接造字节。
+    fn fp(bytes: &[u8]) -> Fingerprint {
+        Fingerprint(bytes.to_vec())
+    }
+
+    /// F114 的安全闸门。三条状态都要断言:
+    /// - 已记录且一致 → 放行(否则重连功能整个不存在,断一次网就永久停)
+    /// - 未记录 → 拒绝(需要人确认,后台不能替用户答应)
+    /// - 已变更 → 拒绝且带上 `Changed`(`tunnel::is_fatal` 靠这个变体
+    ///   把它判成致命,一次都不重试)
+    ///
+    /// 「不弹窗」这件事**由类型保证**:`TrustedOnlyPolicy` 没有
+    /// `EventLoopProxy` 字段,想发 `HostKeyPrompt` 都发不出去。
+    #[tokio::test]
+    async fn trusted_only_policy_rejects_unknown_and_changed_hosts_without_prompting() {
+        let mut file = KnownHostsFile::default();
+        let good = fp(b"AAAA");
+        file.record("h", entry(&good.to_ssh_string()));
+        let policy = TrustedOnlyPolicy::new(Arc::new(Mutex::new(file)));
+
+        assert!(
+            matches!(
+                policy.decide("h", "ssh-ed25519", &good).await,
+                HostKeyDecision::Accept
+            ),
+            "已记录且一致必须放行,否则隧道断一次网就再也回不来"
+        );
+        assert!(
+            matches!(
+                policy.decide("h", "ssh-ed25519", &fp(b"BBBB")).await,
+                HostKeyDecision::Reject(HostKeyOutcome::Changed { .. })
+            ),
+            "指纹变更必须拒且标成 Changed —— tunnel::is_fatal 靠它判致命"
+        );
+        assert!(
+            matches!(
+                policy.decide("newhost", "ssh-ed25519", &good).await,
+                HostKeyDecision::Reject(HostKeyOutcome::Unknown { .. })
+            ),
+            "没记录过的主机后台不能替用户答应"
         );
     }
 

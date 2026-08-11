@@ -21,16 +21,28 @@ use mullion_store::{GroupRecord, SessionRecord};
 /// 而代理跟主机/端口/跳板本来就是同一个「怎么连上去」的决策。
 pub(super) const TABS: [&str; 4] = ["连接", "认证", "登录后", "图标"];
 
-/// 底部按钮为什么点不动。两个原因是并集,`Missing` 优先 ——
-/// 表单都没填齐,就没必要提「测试连接进行中」。
+/// 底部按钮为什么点不动。原因是并集,顺序即优先级 ——
+/// `Sftp` 排最前:节点填齐了也连不了,这时说「还缺主机」是误导。
 enum Disabled {
     No,
+    /// SFTP 传输还没实现(F50),节点管理可用但连不上。
+    Sftp,
     Missing(String),
     Probing,
 }
 
-fn why(missing: super::validate::Missing, probe: &super::ProbeState) -> Disabled {
-    if missing.any() {
+/// SFTP 节点为什么连不上。两处要用同一份文案(右栏按钮、左栏右键菜单),
+/// 所以留一个常量,别各写各的。
+pub(super) const SFTP_NOT_YET: &str = "SFTP 传输尚未实现(F50)";
+
+fn why(
+    mode: super::ManagerMode,
+    missing: super::validate::Missing,
+    probe: &super::ProbeState,
+) -> Disabled {
+    if matches!(mode, super::ManagerMode::Sftp) {
+        Disabled::Sftp
+    } else if missing.any() {
         Disabled::Missing(missing.hint())
     } else if matches!(probe, super::ProbeState::Running) {
         Disabled::Probing
@@ -64,6 +76,7 @@ fn summarize(msg: &str) -> (String, bool) {
 fn tip(d: &Disabled) -> Option<String> {
     match d {
         Disabled::No => None,
+        Disabled::Sftp => Some(SFTP_NOT_YET.to_owned()),
         Disabled::Missing(h) => Some(h.clone()),
         Disabled::Probing => Some("测试连接进行中…".to_owned()),
     }
@@ -78,6 +91,7 @@ pub(super) fn show(
     groups: &[GroupRecord],
     sessions: &[SessionRecord],
     presence: SecretPresence,
+    mode: super::ManagerMode,
 ) {
     // F93:候选只在编辑器打开后、且还没扫过时扫一次,不依赖是否选中了
     // 会话——不放在下面 `let Some(buf) = ..` 之后是因为它跟当前编辑的是
@@ -98,7 +112,7 @@ pub(super) fn show(
             ui.vertical_centered(|ui| {
                 if sessions.is_empty() {
                     ui.colored_label(theme::c32(t.fg_dim), "还没有任何会话");
-                    ui.add_space(4.0);
+                    ui.add_space(crate::ui::metrics::SP_XS);
                     ui.colored_label(
                         theme::c32(t.fg_dimmer),
                         "点左下角「+ 新建」建第一条:填名称、主机、用户名就能连。",
@@ -110,6 +124,13 @@ pub(super) fn show(
         });
         return;
     };
+
+    // 切到 SFTP 档时若还停在「登录后」,把它拉回「连接」——那一页在这个模式下
+    // 不画 Tab,留着会让内容区画着一页、而 Tab 条上没有任何一个高亮。
+    let tabs = super::visible_tabs(mode);
+    if !tabs.contains(&ui_state.editor_tab) {
+        ui_state.editor_tab = super::TAB_CONNECT;
+    }
 
     // 走查 21:一次性聚焦标志。在这里 `take()` 而不是让 `fields::basic` 自己
     // 复位:那边只拿得到 `&mut EditorBuffer`,够不着 `UiState`。
@@ -134,7 +155,7 @@ pub(super) fn show(
         sessions,
     )
     .is_some();
-    let reason = why(missing, &ui_state.probe);
+    let reason = why(mode, missing, &ui_state.probe);
     // 走查 14:表单跟基线一模一样时,「保存」是个空动作 —— 亮着它只会让用户
     // 反复按、反复怀疑自己有没有存上。
     //
@@ -196,7 +217,7 @@ pub(super) fn show(
                     }
                 });
             });
-        ui.add_space(8.0);
+        ui.add_space(crate::ui::metrics::SP_S);
     }
 
     // §5.2 错误卡片:比状态栏那行显眼,且可关闭。关闭后下一个新错误会由
@@ -249,7 +270,7 @@ pub(super) fn show(
                     );
                 }
             });
-        ui.add_space(8.0);
+        ui.add_space(crate::ui::metrics::SP_S);
     }
 
     // F92:拨测结果卡片。与 last_error 卡片互斥 —— 两张同款卡片叠在一起
@@ -279,7 +300,7 @@ pub(super) fn show(
                         });
                     });
                 });
-            ui.add_space(8.0);
+            ui.add_space(crate::ui::metrics::SP_S);
         }
     }
 
@@ -372,12 +393,13 @@ pub(super) fn show(
                 ui_state.key_drop_note = None;
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(crate::ui::metrics::SP_S);
     }
 
     // Tab 条
     let tab_bar = ui.horizontal(|ui| {
-        for (i, name) in TABS.iter().enumerate() {
+        for &i in tabs {
+            let name = TABS[i];
             // F91:缺项所在的 Tab 标一个红点,否则用户看到按钮灰着
             // 却不知道该翻哪一页。走查 9 把它扩成三态(单一状态位):
             // 缺项红● > 已配置灰· > 无,判据在 `tab_badge`。
@@ -683,10 +705,12 @@ fn decide_key_drop(
 mod tests {
     use super::{
         decide_key_drop, ensure_key_candidates_scanned, expire_verdict_if_form_changed, summarize,
-        tip, why, Disabled, KeyDrop, SUMMARY_CHARS,
+        tip, why, Disabled, KeyDrop, SFTP_NOT_YET, SUMMARY_CHARS,
     };
     use crate::ui::session_manager::validate::Missing;
-    use crate::ui::session_manager::{AuthKindUi, EditorBuffer, ProbeState, TAB_AUTH, TAB_CONNECT};
+    use crate::ui::session_manager::{
+        AuthKindUi, EditorBuffer, ManagerMode, ProbeState, TAB_AUTH, TAB_CONNECT,
+    };
     use crate::ui::UiState;
     use mullion_store::SessionRecord;
 
@@ -771,6 +795,7 @@ mod tests {
                         &[],
                         sessions,
                         crate::ui::session_manager::SecretPresence::default(),
+                        crate::ui::session_manager::ManagerMode::Sessions,
                     );
                 });
             })
@@ -799,6 +824,7 @@ mod tests {
                         &[],
                         sessions,
                         crate::ui::session_manager::SecretPresence::default(),
+                        crate::ui::session_manager::ManagerMode::Sessions,
                     );
                 });
             });
@@ -866,6 +892,7 @@ mod tests {
                         &[],
                         &[],
                         crate::ui::session_manager::SecretPresence::default(),
+                        crate::ui::session_manager::ManagerMode::Sessions,
                     );
                 });
             });
@@ -923,6 +950,7 @@ mod tests {
                             &[],
                             &[],
                             crate::ui::session_manager::SecretPresence::default(),
+                            crate::ui::session_manager::ManagerMode::Sessions,
                         );
                     });
                 })
@@ -980,6 +1008,7 @@ mod tests {
                                 &[],
                                 &[],
                                 crate::ui::session_manager::SecretPresence::default(),
+                                crate::ui::session_manager::ManagerMode::Sessions,
                             );
                         });
                     })
@@ -1072,6 +1101,7 @@ mod tests {
                         &[],
                         &[],
                         crate::ui::session_manager::SecretPresence::default(),
+                        crate::ui::session_manager::ManagerMode::Sessions,
                     );
                 });
             })
@@ -1210,6 +1240,7 @@ mod tests {
                             &[],
                             sessions,
                             crate::ui::session_manager::SecretPresence::default(),
+                            crate::ui::session_manager::ManagerMode::Sessions,
                         );
                     });
                 })
@@ -1347,7 +1378,7 @@ mod tests {
     /// 都没缺、也没在拨测 → 按钮可点。
     #[test]
     fn why_is_no_when_nothing_missing_and_probe_idle() {
-        let d = why(Missing::default(), &ProbeState::Idle);
+        let d = why(ManagerMode::Sessions, Missing::default(), &ProbeState::Idle);
         assert!(matches!(d, Disabled::No), "无缺项且未拨测时应可点");
         assert_eq!(tip(&d), None, "可点态不该有 tooltip");
     }
@@ -1367,7 +1398,7 @@ mod tests {
             host: true,
             user: false,
         };
-        let d = why(missing, &ProbeState::Running);
+        let d = why(ManagerMode::Sessions, missing, &ProbeState::Running);
         match &d {
             Disabled::Missing(hint) => {
                 assert_eq!(hint, "还缺:主机", "禁用原因应该是缺项提示,而不是拨测中")
@@ -1379,7 +1410,11 @@ mod tests {
     /// 缺项已填齐、但拨测仍在跑 → 报 `Probing`。
     #[test]
     fn why_is_probing_when_nothing_missing_but_probe_is_running() {
-        let d = why(Missing::default(), &ProbeState::Running);
+        let d = why(
+            ManagerMode::Sessions,
+            Missing::default(),
+            &ProbeState::Running,
+        );
         assert!(
             matches!(d, Disabled::Probing),
             "缺项已填齐、拨测在途时应报 Probing"
@@ -1400,8 +1435,20 @@ mod tests {
             host: false,
             user: true,
         };
-        let d = why(missing, &ProbeState::Idle);
+        let d = why(ManagerMode::Sessions, missing, &ProbeState::Idle);
         assert_eq!(tip(&d), Some("还缺:会话名称、用户名".to_owned()));
+    }
+
+    /// SFTP 优先于其它原因:节点填齐了也连不上,说「还缺主机」是在指错方向。
+    #[test]
+    fn sftp_outranks_every_other_disabled_reason() {
+        let missing = Missing {
+            name: true,
+            host: true,
+            user: true,
+        };
+        let d = why(ManagerMode::Sftp, missing, &ProbeState::Running);
+        assert_eq!(tip(&d).as_deref(), Some(SFTP_NOT_YET));
     }
 
     /// `ProbeState::Err`/`Ok` 都不该影响 `why()`——按钮禁用只看
@@ -1410,11 +1457,15 @@ mod tests {
     #[test]
     fn why_is_no_when_probe_already_finished_ok_or_err() {
         assert!(matches!(
-            why(Missing::default(), &ProbeState::Ok),
+            why(ManagerMode::Sessions, Missing::default(), &ProbeState::Ok),
             Disabled::No
         ));
         assert!(matches!(
-            why(Missing::default(), &ProbeState::Err("boom".into())),
+            why(
+                ManagerMode::Sessions,
+                Missing::default(),
+                &ProbeState::Err("boom".into())
+            ),
             Disabled::No
         ));
     }
@@ -1807,6 +1858,7 @@ mod tests {
                     &[],
                     &[],
                     super::SecretPresence::default(),
+                    crate::ui::session_manager::ManagerMode::Sessions,
                 );
             });
         });

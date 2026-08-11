@@ -21,10 +21,49 @@ pub struct ClientHandler {
     host: String,
     policy: Arc<dyn HostKeyPolicy>,
     outcome: Arc<Mutex<Option<HostKeyOutcome>>>,
+    /// `-R` 的回连出口(F112)。`None` = 这条连接没请求过远端转发。
+    forwarded: Option<mpsc::Sender<ForwardedTcpip>>,
+}
+
+/// 服务端主动开过来的一条 `forwarded-tcpip` channel(`-R` 的入站连接)。
+///
+/// `pub(crate)`:里面裹着 `russh::Channel<Msg>`,理由同
+/// [`SshConnection::open_direct_tcpip`] —— 外部拿不到 `Channel` 就漏不了
+/// CHANNEL_CLOSE。
+pub(crate) struct ForwardedTcpip {
+    pub channel: russh::Channel<client::Msg>,
 }
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
+
+    /// `-R` 的入站连接(F112)。
+    ///
+    /// **默认实现是 `async { Ok(()) }`,即把 `Channel` 直接丢掉** ——
+    /// 而 `russh` 的 `Channel<Msg>` 没有会发 CHANNEL_CLOSE 的 `Drop`
+    /// (只有 `into_stream()` 包出来的 `ChannelCloseOnDrop` 才有)。
+    /// 所以这里**每一条提前返回的路径都要显式 `close()`**,否则就是
+    /// ADR-009 不变量 3「channel 泄漏」:对端每来一次回连就占掉一个
+    /// channel slot,攒到 `MaxSessions` 之后整条连接再也开不出新 channel。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(tx) = self.forwarded.as_ref() else {
+            let _ = channel.close().await;
+            return Ok(());
+        };
+        // 接收端没了(隧道已停止或正在重连)→ 同样要显式关。
+        if let Err(e) = tx.send(ForwardedTcpip { channel }).await {
+            let _ = e.0.channel.close().await;
+        }
+        Ok(())
+    }
 
     async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
         let fp = Fingerprint::from_public_key(key);
@@ -113,6 +152,73 @@ impl SshConnection {
         self._jumps.len()
     }
 
+    /// 这条连接的传输任务是否已经死了。
+    ///
+    /// 隧道监管循环(`tunnel.rs`)靠它发现「空闲隧道的 SSH 已经断了」——
+    /// 没人连 3306 的时候 accept 循环不会有任何动静,不主动探的话用户要等到
+    /// 下次用 DBeaver 才发现已经断了半小时。`russh 0.54.5` 的实现
+    /// (`client/mod.rs:269`)是「发给会话任务的 mpsc sender 是否已关」,
+    /// 传输任务一结束即为真。
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+
+    /// 开一条 `direct-tcpip` channel(`-L` / `-D` 用)。
+    ///
+    /// 保持 `pub(crate)`,理由同 [`handle`](Self::handle):外部拿不到
+    /// `Channel` 就不会漏关 —— `russh` 的 `Channel<Msg>` 没有自动发
+    /// CHANNEL_CLOSE 的 `Drop`(只有 `into_stream()` 包出来的
+    /// `ChannelCloseOnDrop` 才有),漏一条就在对端占一个 channel slot。
+    ///
+    /// `originator` 按 RFC 4254 是「谁发起的这次转发」,这里恒为本机;
+    /// 端口填 0 —— 服务端只把它记进日志,填真实的临时端口号没有额外意义。
+    pub(crate) async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<russh::Channel<client::Msg>, ConnectError> {
+        self.handle
+            .channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", 0)
+            .await
+            .map_err(map_russh)
+    }
+
+    /// 请求远端在 `bind:port` 上侦听(`-R`,F112)。
+    ///
+    /// **要 `&mut self`**(`russh 0.54.5` `client/mod.rs:696`)—— 这正是
+    /// ADR-010「隧道独占自己的连接」的硬约束来源:会话那条 handle 以
+    /// `Arc<Handle>` 在多 pane 间共享,给不出 `&mut`,复用会话连接的方案
+    /// 在这一行就编译不过。所以隧道必须在把连接包进 `Arc` **之前**调它。
+    ///
+    /// 返回值刻意丢弃:russh 只在请求端口为 0 时回填服务端实际分配的端口,
+    /// 其余情况恒为 0(见该函数文档)。我们在编辑器里就拒绝了 0 号端口,
+    /// 所以这个数没有任何信息量,**不能拿它当"实际生效端口"展示**。
+    pub(crate) async fn request_remote_forward(
+        &mut self,
+        bind: &str,
+        port: u16,
+    ) -> Result<(), ConnectError> {
+        match self
+            .handle
+            .tcpip_forward(bind.to_string(), port as u32)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // 协议层的"拒绝"不带原因,不许在这里编一个具体理由出来。
+            Err(russh::Error::RequestDenied) => Err(ConnectError::RemoteForwardDenied { port }),
+            Err(e) => Err(map_russh(e)),
+        }
+    }
+
+    /// 撤销远端侦听。**不能只丢连接**:同一条 SSH 上如果还有别的用途,
+    /// 远端会一直占着那个端口;而且下次重连请求同一端口时会撞上自己。
+    pub(crate) async fn cancel_remote_forward(&self, bind: &str, port: u16) {
+        let _ = self
+            .handle
+            .cancel_tcpip_forward(bind.to_string(), port as u32)
+            .await;
+    }
+
     /// 主动断开:先断目标主机,再逐个断跳板。
     ///
     /// 不能只靠 Drop —— russh 0.54.5 的 `impl Drop for Handle` 只
@@ -138,18 +244,49 @@ pub async fn establish(
     policy: Arc<dyn HostKeyPolicy>,
 ) -> Result<SshConnection, ConnectError> {
     let dialed = crate::dial::dial(&cfg.hops, &cfg.host, cfg.port, policy.clone()).await?;
-    let handle = handshake_and_auth(dialed.stream, &cfg.host, &cfg.user, &cfg.auth, policy).await?;
+    let handle =
+        handshake_and_auth(dialed.stream, &cfg.host, &cfg.user, &cfg.auth, policy, None).await?;
     Ok(SshConnection::new(handle, dialed.jumps))
+}
+
+/// `-R` 专用的建链(F112):除了连接,还带回**服务端回连 channel 的接收端**。
+///
+/// 与 `establish` 分开而不是给它加参数:回连接收端只有远程转发用得上,
+/// 而拿着一个没人 drain 的接收端反而有害 —— 缓冲填满会卡住 `russh` 的
+/// 会话任务(sender 在 `ClientHandler` 里,跑在那个任务上)。
+pub(crate) async fn establish_forwarding(
+    cfg: &SshConfig,
+    policy: Arc<dyn HostKeyPolicy>,
+) -> Result<(SshConnection, mpsc::Receiver<ForwardedTcpip>), ConnectError> {
+    // 32:回连来得再密,接收端也是「收一条 spawn 一个任务」立刻返回,
+    // 不会长期占着缓冲。给个有界值而不是 unbounded,是不想让一个疯狂
+    // 回连的远端把内存吃光。
+    let (tx, rx) = mpsc::channel(32);
+    let dialed = crate::dial::dial(&cfg.hops, &cfg.host, cfg.port, policy.clone()).await?;
+    let handle = handshake_and_auth(
+        dialed.stream,
+        &cfg.host,
+        &cfg.user,
+        &cfg.auth,
+        policy,
+        Some(tx),
+    )
+    .await?;
+    Ok((SshConnection::new(handle, dialed.jumps), rx))
 }
 
 /// 在已建立的流上完成 SSH 握手 + 认证。目标主机与跳板共用此函数,
 /// 避免两条认证路径漂移(例如只在其中一条修了 PUBKEY_HASH)。
+///
+/// `forwarded` 只有 `-R` 会给。跳板一律传 `None` —— 跳板上不该有回连,
+/// 万一来了,`ClientHandler` 会显式 `close()` 掉。
 pub(crate) async fn handshake_and_auth<S>(
     stream: S,
     host: &str,
     user: &str,
     auth: &AuthMethod,
     policy: Arc<dyn HostKeyPolicy>,
+    forwarded: Option<mpsc::Sender<ForwardedTcpip>>,
 ) -> Result<Handle<ClientHandler>, ConnectError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -159,6 +296,7 @@ where
         host: host.to_string(),
         policy,
         outcome: outcome.clone(),
+        forwarded,
     };
     let config = Arc::new(client::Config::default());
     let mut handle = client::connect_stream(config, stream, handler)
@@ -460,6 +598,7 @@ mod tests {
                 host: "h".into(),
                 policy,
                 outcome: outcome.clone(),
+                forwarded: None,
             },
             outcome,
         )

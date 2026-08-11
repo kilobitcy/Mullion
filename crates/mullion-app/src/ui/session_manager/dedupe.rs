@@ -14,11 +14,15 @@
 
 use mullion_store::{GroupRecord, SessionId, SessionRecord};
 
-/// 在列表上会不会被看成同一行。列表只显示名称 + `user@host`,所以只比这三样。
+/// 在列表上会不会被看成同一行。列表只显示名称 + `user@host`,所以只比这三样
+/// ——**外加协议**:列表按协议分页(F118)之后,两个协议的记录永远不会同框
+/// 出现,把它们判成同形等于给一个不存在的视觉冲突加噪音。而「同一台机器
+/// 建一条 SSH + 一条 SFTP」是 D1 明确接受的正常用法。
 fn looks_same(a: &SessionRecord, b: &SessionRecord) -> bool {
     a.identity.name == b.identity.name
         && a.auth.user == b.auth.user
         && a.connection.host == b.connection.host
+        && a.connection.protocol == b.connection.protocol
 }
 
 /// 这份表单是不是跟某条**已存在**的会话重了。返回那条会话的 id。
@@ -293,5 +297,35 @@ mod tests {
         let got = first_sentence(&long);
         assert_eq!(got.chars().count(), 24);
         assert!(long.starts_with(&got));
+    }
+
+    /// 列表按协议分页之后，两个协议的记录永远不同框出现 —— 给它们互相追加
+    /// 「区分信息」是纯噪音。而按 D1 的推荐做法，同一台机器建一条 SSH 会话
+    /// + 一条 SFTP 节点正是**正常用法**，每行都挂个后缀会让人以为配错了。
+    #[test]
+    fn records_of_different_protocols_are_never_twins() {
+        let mut a = rec(1, "web01", "10.0.0.1", 22);
+        // 端口特意跟 a 不同:如果 looks_same 漏看协议,旧逻辑会把 a/b 判成
+        // 同形、再靠端口互相追加区分信息(返回 Some(":22")/Some(":2222")),
+        // 这条断言就能真的抓到"漏看协议"的回归 —— 若端口跟 a 一样,三项
+        // 区分信息(分组/端口/备注)会碰巧全部相同,判成"真重复"返回
+        // None,跟协议判据是否生效无关,断言就成了恒绿的假测试。
+        let mut b = rec(2, "web01", "10.0.0.1", 2222);
+        a.connection.protocol = mullion_store::Protocol::Ssh;
+        b.connection.protocol = mullion_store::Protocol::Sftp;
+        let all = vec![a.clone(), b.clone()];
+        assert_eq!(
+            disambiguate(&a, &all, &[]),
+            None,
+            "跨协议的两条不该被判成同形"
+        );
+        assert_eq!(disambiguate(&b, &all, &[]), None);
+
+        // 反面：同协议、其它都一样时仍然要追加区分信息，否则这条改动
+        // 把原有保护一起弄没了。
+        let mut c = rec(3, "web01", "10.0.0.1", 2222);
+        c.connection.protocol = mullion_store::Protocol::Ssh;
+        let all = vec![a.clone(), c];
+        assert_eq!(disambiguate(&a, &all, &[]), Some(":22".into()));
     }
 }

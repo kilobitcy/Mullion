@@ -42,6 +42,10 @@ const SCENES: &[(&str, &str)] = &[
     ("long-names", "超长中文会话名 + 长 host:验截断与换行"),
     ("editor-basic", "选中一条并打开编辑器,停在「基础」页"),
     (
+        "tunnels",
+        "隧道页:三种转发各一条 + 一条悬垂引用(左栏切到「隧道」)",
+    ),
+    (
         "annotate",
         "F100 标注模式:开着 + 已选中两处(看编号徽标与描边的位置)",
     ),
@@ -52,9 +56,18 @@ const SCENES: &[(&str, &str)] = &[
 struct Fixture {
     sessions: Vec<SessionRecord>,
     groups: Vec<GroupRecord>,
+    tunnels: Vec<mullion_store::TunnelRecord>,
     ui: UiState,
     presence: SecretPresence,
     store_available: bool,
+}
+
+impl Fixture {
+    /// 绝大多数场景不关心隧道。给个 `Default` 兜住,免得每个场景都写一行
+    /// `tunnels: Vec::new()`。
+    fn no_tunnels() -> Vec<mullion_store::TunnelRecord> {
+        Vec::new()
+    }
 }
 
 fn main() -> ExitCode {
@@ -145,6 +158,7 @@ fn shoot(opts: &Opts) -> Result<String, String> {
     let Fixture {
         sessions,
         groups,
+        tunnels,
         mut ui,
         presence,
         store_available,
@@ -166,6 +180,8 @@ fn shoot(opts: &Opts) -> Result<String, String> {
                 &mut ui,
                 &sessions,
                 &groups,
+                &tunnels,
+                &[],
                 store_available,
                 presence,
                 &appearance,
@@ -328,6 +344,7 @@ fn fixture(scene: &str) -> Fixture {
         "empty" => Fixture {
             sessions: Vec::new(),
             groups: Vec::new(),
+            tunnels: Fixture::no_tunnels(),
             ui,
             presence: SecretPresence::default(),
             store_available: true,
@@ -349,6 +366,7 @@ fn fixture(scene: &str) -> Fixture {
                 sess(3, "短名", "h", None),
             ],
             groups,
+            tunnels: Fixture::no_tunnels(),
             ui,
             presence: SecretPresence::default(),
             store_available: true,
@@ -368,6 +386,7 @@ fn fixture(scene: &str) -> Fixture {
             Fixture {
                 sessions,
                 groups,
+                tunnels: Fixture::no_tunnels(),
                 ui,
                 presence: SecretPresence {
                     password: true,
@@ -376,10 +395,64 @@ fn fixture(scene: &str) -> Fixture {
                 store_available: true,
             }
         }
+        "tunnels" => {
+            use mullion_store::{TunnelId, TunnelKind, TunnelRecord};
+            let t = |id: u64, session: u64, listen: u16, kind: TunnelKind| TunnelRecord {
+                id: TunnelId(id),
+                session_id: SessionId(session),
+                listen_port: listen,
+                note: String::new(),
+                autostart: false,
+                kind,
+            };
+            ui.manager_mode = mullion_app::ui::session_manager::ManagerMode::Tunnels;
+            Fixture {
+                sessions: many_sessions(12),
+                groups,
+                tunnels: vec![
+                    t(
+                        1,
+                        1,
+                        3306,
+                        TunnelKind::Local {
+                            target_host: "db.internal".into(),
+                            target_port: 3306,
+                            expose: false,
+                        },
+                    ),
+                    t(
+                        2,
+                        2,
+                        8080,
+                        TunnelKind::Remote {
+                            target_host: "127.0.0.1".into(),
+                            target_port: 3000,
+                            expose: true,
+                        },
+                    ),
+                    t(3, 1, 1080, TunnelKind::Dynamic),
+                    // 悬垂:引用一条不存在的会话,看副标题的 danger 态。
+                    t(
+                        4,
+                        999,
+                        5432,
+                        TunnelKind::Local {
+                            target_host: "pg.internal".into(),
+                            target_port: 5432,
+                            expose: false,
+                        },
+                    ),
+                ],
+                ui,
+                presence: SecretPresence::default(),
+                store_available: true,
+            }
+        }
         // "list-12" 以及任何漏网的名字(main 已挡过未知场景)都落到这里。
         _ => Fixture {
             sessions: many_sessions(12),
             groups,
+            tunnels: Fixture::no_tunnels(),
             ui,
             presence: SecretPresence::default(),
             store_available: true,

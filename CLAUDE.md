@@ -208,7 +208,12 @@ spec.md          需求，唯一真源
 `docs/` 关键非 ADR 文件：
 - `cross-compile-windows.md` —— Linux 交叉编译 Windows exe 的运行手册（代理/mingw/objdump/live 验证/发布 Release）
 - `gui-render-gotchas.md` —— GUI/渲染/输入层「编译过跑起来才崩」的坑（动那几个文件前必读）
-- 最新 ADR：`adr-009`（一条 SSH 连接开多 channel 承载多分屏；含它引入的四条新失效模式：
+- `ui-form-guidelines.md` —— 表单布局规范（分节/宽度三档/间距五档/危险措辞/空态文案），
+  写任何 egui 表单前先扫一眼；机械守护在 `crates/mullion-app/tests/form_guidelines.rs`
+- 最新 ADR：`adr-010`（隧道是与会话平级的一等对象，**独占**自己的 SSH 连接——不复用会话那条；
+  刻意偏离 PuTTY 的「隧道属于会话」与 adr-009 的「一条连接承载多单元」，两处理由都在里面；
+  硬约束是 `russh` 的 `tcpip_forward` 要 `&mut self`，`Arc<Handle>` 给不出，`-R` 复用连接编译不过）；
+  `adr-009`（一条 SSH 连接开多 channel 承载多分屏；含它引入的四条新失效模式：
   channel 泄漏、T1 升级为 per-pane、迟到的 `PaneOpened` 要查树成员 + Workspace 世代）；
   `adr-008`（自诊断日志：接 `log` facade 白拿 wgpu/winit/russh 内部诊断 + 阶段打点 +
   看门狗；级别用 `MULLION_LOG` / `MULLION_LOG_DEPS`，默认 info/warn）；

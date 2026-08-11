@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 russh.workspace = true
 tokio.workspace = true
+# ADR-008 的日志 facade(0 依赖)。SOCKS5 服务端(F113)里每条被拒的本地连接
+# **没有任何 UI 出口** —— 隧道本身还好好跑着,挂掉的只是那一条连接。
+# 不落日志的话「浏览器连不上 1080」就是个黑洞。
+log.workspace = true
 
 # 假代理服务器要 accept 连接并读写字节。tokio 的 workspace features
 # 已含 net/io-util/rt-multi-thread/macros,这里只是让 test target 能用上。

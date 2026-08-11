@@ -206,6 +206,7 @@ pub struct AppearancePrefs {
 /// v5 = v4 - `[session.auth].path`:私钥改存**内容**到加密侧车。
 /// v6 = v5 + `IconKind::Ico` 与 `IconSpec.bg`:会话图标改成用户导入的 .ico
 ///      (正文 base64 内嵌),并可配底色。
+/// v7 = v6 + `[[tunnel]]`:隧道成为引用会话的一等对象(F110~F117)。
 ///
 /// 结构上新版本能直接读旧版本(新字段全带 `serde(default)`),升版本号是为了让
 /// **旧客户端明确拒绝**,而不是静默丢弃新分节再写回。v5 还多一层理由:旧客户端
@@ -213,7 +214,7 @@ pub struct AppearancePrefs {
 ///
 /// **号段归属**:F74(凭据实体)原定 v3→v4,被 F40~F44 先落地拿走了 4,再被本次
 /// 「私钥入库」拿走了 5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
-pub const CURRENT_SCHEMA: u32 = 6;
+pub const CURRENT_SCHEMA: u32 = 7;
 
 fn schema_v1() -> u32 {
     1
@@ -229,6 +230,9 @@ pub struct SessionsFile {
     pub group: Vec<crate::group::GroupRecord>,
     #[serde(default)]
     pub session: Vec<SessionRecord>,
+    /// v7 新增。旧文件没有这个键 → `default` 补空数组,无需迁移代码。
+    #[serde(default)]
+    pub tunnel: Vec<crate::tunnel::TunnelRecord>,
 }
 
 #[cfg(test)]
@@ -268,6 +272,7 @@ mod tests {
             schema_version: CURRENT_SCHEMA,
             group: Vec::new(),
             session: vec![rec.clone()],
+            tunnel: Vec::new(),
         };
         let s = toml::to_string_pretty(&file).unwrap();
         let back: SessionsFile = toml::from_str(&s).unwrap();
@@ -303,6 +308,7 @@ mod tests {
             schema_version: CURRENT_SCHEMA,
             group: Vec::new(),
             session: vec![rec],
+            tunnel: Vec::new(),
         };
         let s = toml::to_string_pretty(&file).unwrap();
         assert!(s.contains("[session.auth]"), "应有 auth 分节: {s}");

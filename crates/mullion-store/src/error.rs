@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::model::{GroupId, SessionId};
+use crate::tunnel::TunnelId;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -24,6 +25,8 @@ pub enum StoreError {
     NotFound(SessionId),
     /// 目标分组不存在。
     GroupNotFound(GroupId),
+    /// 目标隧道不存在。
+    TunnelNotFound(TunnelId),
     /// 文件由更新版本的客户端写出,本版本读不了。
     UnsupportedSchema(u32),
     /// v1 → v2 迁移失败(结构不兼容,非语法问题)。
@@ -35,6 +38,9 @@ pub enum StoreError {
     /// 跳板引用了不存在的会话。**不静默降级为直连**:那会让用户
     /// 以为流量过了堡垒机而实际没有 —— 这是安全属性,必须硬失败。
     JumpDangling(SessionId),
+    /// 隧道引用了不存在的会话。同 `JumpDangling` 的道理:静默回落到
+    /// 任何一个「别的会话」都等于把端口悄悄接到另一台机器上。
+    TunnelDangling(SessionId),
 }
 
 impl fmt::Display for StoreError {
@@ -51,6 +57,7 @@ impl fmt::Display for StoreError {
             StoreError::Utf8 => write!(f, "secrets.enc 解密后非法 UTF-8"),
             StoreError::NotFound(id) => write!(f, "会话不存在:{id:?}"),
             StoreError::GroupNotFound(id) => write!(f, "分组不存在:{id:?}"),
+            StoreError::TunnelNotFound(id) => write!(f, "隧道不存在:{id:?}"),
             StoreError::UnsupportedSchema(v) => write!(
                 f,
                 "会话文件的 schema 版本 {v} 高于本客户端支持的上限 —— 请升级 Mullion"
@@ -67,6 +74,10 @@ impl fmt::Display for StoreError {
             StoreError::JumpDangling(id) => write!(
                 f,
                 "跳板指向的会话 {id:?} 不存在 —— 它可能已被删除,请重新指定跳板"
+            ),
+            StoreError::TunnelDangling(id) => write!(
+                f,
+                "隧道引用的会话 {id:?} 不存在 —— 它可能已被删除,请重新指定或删除此隧道"
             ),
         }
     }

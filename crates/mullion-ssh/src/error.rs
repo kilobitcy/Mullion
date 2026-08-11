@@ -34,6 +34,16 @@ pub enum ConnectError {
     ProxyRejected { proxy: String, reason: String },
     /// 跳板链上某一跳失败(F5)。`hop` 是 "host:port"。
     JumpFailed { hop: String, cause: String },
+    /// 本机侦听端口绑不上(F111)。**与 `Io` 分开**:用户要做的是去关掉占用
+    /// 该端口的程序或换一个端口,而不是查网络 —— 而且它是**致命**的,
+    /// 退避重试 8 次不会让端口变得没被占用(见 `tunnel::is_fatal`)。
+    ListenFailed { port: u16, cause: String },
+    /// 远端拒绝了 `tcpip-forward` 请求(F112)。**与 `Io` 分开**,理由同
+    /// `ListenFailed`:能被拒的原因只有「远端那个端口已被占」和
+    /// 「sshd 配了 `AllowTcpForwarding no`/`GatewayPorts` 不放行」,
+    /// 两种都不会因为重试 8 次而改变,所以它是**致命**的。
+    /// 协议层只回一个「拒绝」,不带原因 —— 这里不许编一个具体理由出来。
+    RemoteForwardDenied { port: u16 },
 }
 
 /// 把 TCP 连接阶段的 io 错误分类到精确变体(F6)。
@@ -84,6 +94,18 @@ impl fmt::Display for ConnectError {
             ),
             ConnectError::JumpFailed { hop, cause } => {
                 write!(f, "跳板 {hop} 连接失败:{cause} —— 先单独连一下这台跳板")
+            }
+            ConnectError::ListenFailed { port, cause } => {
+                write!(
+                    f,
+                    "本机端口 {port} 侦听失败:{cause} —— 换个端口或关掉占用它的程序"
+                )
+            }
+            ConnectError::RemoteForwardDenied { port } => {
+                write!(
+                    f,
+                    "远端拒绝在端口 {port} 上侦听 —— 该端口可能已被占用,或 sshd 的 AllowTcpForwarding/GatewayPorts 不允许"
+                )
             }
         }
     }
@@ -139,6 +161,11 @@ mod tests {
                 hop: "bastion:22".into(),
                 cause: "认证失败".into(),
             },
+            ConnectError::ListenFailed {
+                port: 3306,
+                cause: "地址已被占用".into(),
+            },
+            ConnectError::RemoteForwardDenied { port: 8080 },
         ];
         let msgs: Vec<String> = variants.iter().map(|e| e.to_string()).collect();
         for m in &msgs {

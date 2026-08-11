@@ -14,6 +14,7 @@ use crate::model::{
     AppearancePrefs, Auth, Connection, GroupId, Identity, SecretEntry, SessionId, SessionRecord,
     SessionsFile, TerminalPrefs, CURRENT_SCHEMA,
 };
+use crate::tunnel::{TunnelId, TunnelKind, TunnelRecord};
 
 /// id.to_string() → 敏感条目。
 type SecretMap = BTreeMap<String, SecretEntry>;
@@ -22,6 +23,7 @@ pub struct Vault {
     dir: PathBuf,
     groups: Vec<GroupRecord>,
     sessions: Vec<SessionRecord>,
+    tunnels: Vec<TunnelRecord>,
     secrets: SecretMap,
     key: [u8; 32],
 }
@@ -37,6 +39,19 @@ pub struct SessionDraft {
     pub automation: crate::automation::AutomationPrefs,
     /// 敏感部分(密码/口令);无则 None。
     pub secret: Option<SecretEntry>,
+}
+
+/// 新建/编辑隧道的输入(不含 id,由 vault 分配)。
+///
+/// 与 `SessionDraft` 同构,理由也相同:id 由 vault 统一分配,调用方造不出
+/// 一个「已经带 id」的草稿,也就不会撞号。**没有 `secret` 字段** —— 隧道是
+/// 纯引用,凭据一律来自 `session_id` 指向的会话(设计 D2)。
+pub struct TunnelDraft {
+    pub session_id: SessionId,
+    pub listen_port: u16,
+    pub note: String,
+    pub autostart: bool,
+    pub kind: TunnelKind,
 }
 
 impl Vault {
@@ -56,6 +71,7 @@ impl Vault {
         let Loaded {
             groups,
             sessions,
+            tunnels,
             migrated,
             legacy_key_paths,
         } = load_sessions(&sessions_path)?;
@@ -97,6 +113,7 @@ impl Vault {
             dir,
             groups,
             sessions,
+            tunnels,
             secrets,
             key,
         };
@@ -113,6 +130,7 @@ impl Vault {
             schema_version: CURRENT_SCHEMA,
             group: self.groups.clone(),
             session: self.sessions.clone(),
+            tunnel: self.tunnels.clone(),
         };
         let toml_text = toml::to_string_pretty(&file)?;
         write_atomic(&self.sessions_path(), toml_text.as_bytes())?;
@@ -282,6 +300,61 @@ impl Vault {
         Ok(())
     }
 
+    pub fn tunnels(&self) -> &[TunnelRecord] {
+        &self.tunnels
+    }
+
+    pub fn tunnel(&self, id: TunnelId) -> Option<&TunnelRecord> {
+        self.tunnels.iter().find(|t| t.id == id)
+    }
+
+    /// 新增隧道。id 取现有 max+1(空库从 1 起),**与会话号池互不影响**。
+    ///
+    /// 与 `add` 不同,这里不碰 `secrets`:隧道没有自己的凭据(设计 D2)。
+    /// 也不注入 `modified_at` —— 隧道不进「按修改时间排序」的视图,
+    /// 存一个没人读的时间戳只会让人以为它有语义。
+    pub fn add_tunnel(&mut self, draft: TunnelDraft) -> TunnelId {
+        let id = TunnelId(
+            self.tunnels
+                .iter()
+                .map(|t| t.id.0)
+                .max()
+                .map_or(1, |m| m + 1),
+        );
+        self.tunnels.push(TunnelRecord {
+            id,
+            session_id: draft.session_id,
+            listen_port: draft.listen_port,
+            note: draft.note,
+            autostart: draft.autostart,
+            kind: draft.kind,
+        });
+        id
+    }
+
+    pub fn update_tunnel(&mut self, id: TunnelId, draft: TunnelDraft) -> Result<(), StoreError> {
+        let rec = self
+            .tunnels
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or(StoreError::TunnelNotFound(id))?;
+        rec.session_id = draft.session_id;
+        rec.listen_port = draft.listen_port;
+        rec.note = draft.note;
+        rec.autostart = draft.autostart;
+        rec.kind = draft.kind;
+        Ok(())
+    }
+
+    pub fn delete_tunnel(&mut self, id: TunnelId) -> Result<(), StoreError> {
+        let before = self.tunnels.len();
+        self.tunnels.retain(|t| t.id != id);
+        if self.tunnels.len() == before {
+            return Err(StoreError::TunnelNotFound(id));
+        }
+        Ok(())
+    }
+
     /// 沿 `[会话, 分组]` 层序解析出最终配置。
     ///
     /// 结果应由调用方缓存,**不要在渲染热路径 / 每帧里重新调用**(本项目陷阱 T3:
@@ -358,6 +431,7 @@ impl Vault {
 struct Loaded {
     groups: Vec<GroupRecord>,
     sessions: Vec<SessionRecord>,
+    tunnels: Vec<TunnelRecord>,
     /// 版本落后、已就地升级 → 必须立刻 `save()` 写回,否则下次打开重复迁移
     /// 并覆盖掉备份。
     migrated: bool,
@@ -373,6 +447,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
         return Ok(Loaded {
             groups: Vec::new(),
             sessions: Vec::new(),
+            tunnels: Vec::new(),
             migrated: false,
             legacy_key_paths: BTreeMap::new(),
         });
@@ -407,6 +482,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
         Ok(Loaded {
             groups: file.group,
             sessions: file.session,
+            tunnels: file.tunnel,
             migrated: true,
             legacy_key_paths,
         })
@@ -415,6 +491,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
         Ok(Loaded {
             groups: file.group,
             sessions: file.session,
+            tunnels: file.tunnel,
             migrated: false,
             legacy_key_paths: BTreeMap::new(),
         })
@@ -471,6 +548,88 @@ mod tests {
                 private_key: None,
             }),
         }
+    }
+
+    fn tunnel_draft(session: SessionId, port: u16) -> TunnelDraft {
+        TunnelDraft {
+            session_id: session,
+            listen_port: port,
+            note: String::new(),
+            autostart: false,
+            kind: crate::tunnel::TunnelKind::Local {
+                target_host: "db.internal".into(),
+                target_port: 3306,
+                expose: false,
+            },
+        }
+    }
+
+    /// 隧道 id 与会话 id **各自独立编号**。挤在一个号池里会让「隧道 7」和
+    /// 「会话 7」在日志/错误文案里长得一样,排查时误判成同一个对象。
+    #[test]
+    fn tunnel_ids_are_max_plus_one_and_independent_of_session_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        // 先把会话 id 推到 7,证明隧道编号不受它影响。
+        for i in 0..7 {
+            vault.add(draft_pw(&format!("s{i}"), "p"), "t");
+        }
+        assert_eq!(vault.list().last().unwrap().id, SessionId(7));
+
+        let t1 = vault.add_tunnel(tunnel_draft(SessionId(7), 3306));
+        let t2 = vault.add_tunnel(tunnel_draft(SessionId(7), 5432));
+        assert_eq!(t1, TunnelId(1));
+        assert_eq!(t2, TunnelId(2));
+    }
+
+    #[test]
+    fn tunnels_survive_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let sid = vault.add(draft_pw("a", "p1"), "t");
+            let tid = vault.add_tunnel(tunnel_draft(sid, 3306));
+            vault.save().unwrap();
+            tid
+        };
+        let vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(vault.tunnels().len(), 1);
+        let t = vault.tunnel(id).expect("隧道应原样读回");
+        assert_eq!(t.listen_port, 3306);
+        assert_eq!(
+            t.kind,
+            crate::tunnel::TunnelKind::Local {
+                target_host: "db.internal".into(),
+                target_port: 3306,
+                expose: false,
+            }
+        );
+    }
+
+    /// 守设计 D2「隧道无独立密文条目」。
+    ///
+    /// `Vault::open` 里的 `secrets.retain(|k, _| live.contains(k))` 是按
+    /// **`SessionId`** 裁剪的。哪天有人给隧道加了密文条目又沿用这套 GC,
+    /// 隧道的密文会在每次 open 时被当成孤儿静默删掉。这条钉住当前契约:
+    /// 增删隧道一律不碰 secrets。
+    #[test]
+    fn deleting_a_tunnel_does_not_touch_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let sid = vault.add(draft_pw("a", "p1"), "t");
+        let tid = vault.add_tunnel(tunnel_draft(sid, 3306));
+
+        vault.delete_tunnel(tid).unwrap();
+        assert!(vault.tunnel(tid).is_none());
+        assert_eq!(
+            vault.secret(sid).unwrap().password.as_deref(),
+            Some("p1"),
+            "删隧道不该动会话密文"
+        );
+        assert!(
+            matches!(vault.delete_tunnel(tid), Err(StoreError::TunnelNotFound(_))),
+            "删不存在的隧道要报错,不能静默成功"
+        );
     }
 
     #[test]
