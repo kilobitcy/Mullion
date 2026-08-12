@@ -1,4 +1,4 @@
-//! 菜单栏(含居中的布局预设按钮组)+ 状态栏。
+//! 菜单栏(含居中的布局预设按钮组)+ 标签栏(F36)+ 状态栏。
 use super::annotate;
 use super::toolbar;
 use super::UiState;
@@ -88,6 +88,175 @@ pub fn top_menu(
         });
     annotate::mark(ctx, "菜单栏", bar.response.rect);
     clicked
+}
+
+/// 标签栏上下内边距。
+const TAB_MARGIN_Y: f32 = 3.0;
+
+/// 单个标签的高度与固定宽度(逻辑点)。
+///
+/// 宽度固定而不是按标题长短自适应:自适应会让「切一下标签,别的标签跟着左右
+/// 挪位」——用户点第 3 个标签的手势记忆每次都得重建。
+const TAB_H: f32 = 24.0;
+const TAB_W: f32 = 160.0;
+
+/// 活动标签底部那条节点色横杠的厚度。
+const TAB_UNDERLINE_H: f32 = 2.0;
+
+/// 标签内的图标边长。走 F61 那套 32px 纹理(`paint_icon` 按 `side <= 32` 选档),
+/// 只是画小一点 —— 标签栏是常驻横条,每多 1px 高就少一行终端。
+const TAB_ICON: f32 = 16.0;
+
+/// 标签栏高度(逻辑点)。由 `TAB_H` 推出来,**不写死**:两处各写一个数的话,
+/// 改了标签高度标签栏就会把标签裁掉半截(同 `menu_px` 的理由)。
+pub fn tab_bar_px() -> f32 {
+    TAB_H + TAB_MARGIN_Y * 2.0
+}
+
+/// 标签栏上一个标签要显示的东西。
+pub struct TabView<'a> {
+    pub title: &'a str,
+    pub active: bool,
+    /// F61/F62:这个标签所属会话的已解析外观。`None` = 没有对应会话记录
+    /// (快速连接、或 store 不可用)。**必须来自 `badge::AppearanceCache`**,
+    /// 不许在这里现解析(陷阱 T3)。
+    pub appearance: Option<&'a crate::ui::badge::Appearance>,
+}
+
+/// 用户这一帧在标签栏上做了什么。每帧至多一个。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabAction {
+    Switch(usize),
+    Close(usize),
+    /// 右侧 `+`:打开会话管理器。**不是「新建空标签」**——没连接的标签在本项目
+    /// 里什么都画不了,建出来只是一个空壳。
+    NewSession,
+}
+
+/// 画标签栏(F36)。返回用户这一帧的动作。
+///
+/// **常驻,不自动隐藏**(spec F36 验收):标签栏的显隐是一次高度跳变,整幅终端
+/// 要跟着 reflow 发 `window_change`(T4)。只剩一个标签就藏起来,等于把这条最
+/// 昂贵的重排绑在「用户关掉倒数第二个标签」这个高频动作上。launcher 态(零个
+/// 标签)同样画,只是里面只有一个 `+` —— 否则「连上第一台机」会多一次高度跳变。
+///
+/// 固定高度而不是由内容撑开,理由同 `menu_px`。
+pub fn tab_bar(ctx: &egui::Context, t: &Theme, views: &[TabView<'_>]) -> Option<TabAction> {
+    let mut action = None;
+    let bar = egui::TopBottomPanel::top("tabs")
+        .exact_height(tab_bar_px())
+        .frame(
+            egui::Frame::none()
+                .fill(theme::c32(t.bar_tool))
+                .inner_margin(egui::Margin::symmetric(4.0, TAB_MARGIN_Y))
+                .stroke(theme::stroke(t)),
+        )
+        .show(ctx, |ui| {
+            // `+` 先用 right_to_left 占住右端,它**不进滚动区** —— 标签多到要
+            // 横滚时,新建入口跟着滚出视野是最不该发生的事。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let plus = ui.add(egui::Button::new("+").frame(false));
+                if plus.clicked() {
+                    action = Some(TabAction::NewSession);
+                }
+                annotate::mark(ctx, "标签栏/新建", plus.rect);
+                plus.on_hover_text("打开会话管理器");
+                // 剩下的宽度(已扣掉 `+`)给标签本身。排不下就横向滚动,
+                // 不做溢出下拉菜单:下拉里的标签点不到、也看不出哪个是活动的。
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (ix, v) in views.iter().enumerate() {
+                                    if let Some(a) = one_tab(ui, t, ix, v) {
+                                        action = Some(a);
+                                    }
+                                }
+                            });
+                        });
+                });
+            });
+        });
+    annotate::mark(ctx, "标签栏", bar.response.rect);
+    action
+}
+
+/// 画一个标签。返回它这一帧被点出来的动作。
+///
+/// 几何上先 `allocate_exact_size` 把地盘钉死,再用 painter 画底/横杠、用一个
+/// **不折回父 ui 尺寸**的 `new_child` 摆内容 —— 同 `pane_title::show` 的两处
+/// 越界坑(`Frame` 的 `min_rect + margin` 撑破预算、`set_min_size` 只设下限)。
+/// 标签宽度一旦被长标题撑开,固定宽度这条承诺就没了。
+fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<TabAction> {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(TAB_W, TAB_H),
+        egui::Sense::click().union(egui::Sense::hover()),
+    );
+    // F62:节点色只做**底部那条横杠**,不做整块底色 —— 用户配的是任意
+    // #rrggbb,拿它当底色会让标题文字的对比度落到不可读区,而 F80 的色板
+    // 纪律管不到用户自己挑的颜色。没配节点色就退回 accent。
+    let node = v
+        .appearance
+        .and_then(|a| crate::ui::badge::should_paint(a, mullion_store::ColorTarget::Tab));
+    let bg = if v.active { t.panel_head } else { t.bar_tool };
+    let p = ui.painter();
+    p.rect_filled(rect, egui::Rounding::same(4.0), theme::c32(bg));
+    if v.active {
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.min.x, rect.max.y - TAB_UNDERLINE_H),
+                rect.max,
+            ),
+            egui::Rounding::same(1.0),
+            node.unwrap_or(theme::c32(t.accent)),
+        );
+    }
+    let inner = rect.shrink2(egui::vec2(6.0, 2.0));
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    content.set_clip_rect(inner);
+    let mut closed = false;
+    content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let x = ui.small_button("×");
+        if x.clicked() {
+            closed = true;
+        }
+        annotate::mark(ui.ctx(), format!("标签栏/标签 {}/关闭", ix + 1), x.rect);
+        x.on_hover_text("关闭此标签");
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
+                let (r, _) =
+                    ui.allocate_exact_size(egui::vec2(TAB_ICON, TAB_ICON), egui::Sense::hover());
+                crate::ui::badge::paint_icon(ui.painter(), r, icon, node);
+            }
+            ui.add(
+                egui::Label::new(egui::RichText::new(v.title).color(theme::c32(if v.active {
+                    t.fg_strong
+                } else {
+                    t.fg_muted
+                })))
+                .truncate(),
+            );
+        });
+    });
+    annotate::mark(ui.ctx(), format!("标签栏/标签 {}", ix + 1), rect);
+    // 标题在固定宽度里多半是截断的,tooltip 给全名 —— 不然用户分不清
+    // 「同一台机的两个标签」谁是谁。
+    let clicked = resp.clicked();
+    resp.on_hover_text(v.title);
+    // × 的判定排在整块之前:它压在标签矩形上面,点它同时也落在标签里,
+    // 先判关闭才不会变成「点 × 只是切过去」。
+    if closed {
+        Some(TabAction::Close(ix))
+    } else if clicked {
+        Some(TabAction::Switch(ix))
+    } else {
+        None
+    }
 }
 
 /// F81 状态栏两栏文案。纯函数,可单测。
@@ -363,6 +532,228 @@ mod tests {
             paths.iter().any(|p| p == "状态栏"),
             "状态栏没登记:{paths:?}"
         );
+    }
+
+    fn tab_titles(views: &[TabView<'_>]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut acc = Vec::new();
+        // 同 `run_status`:面板首帧 `fade_in`,形状全被记成 Noop,必须跑两帧。
+        for _ in 0..2 {
+            let out = ctx.run(Default::default(), |ctx| {
+                tab_bar(ctx, &crate::theme::MULLION_DARK, views);
+            });
+            acc.clear();
+            fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        }
+        acc
+    }
+
+    /// S3 / spec F36 验收:**只剩一个标签也画标签栏**。
+    ///
+    /// 标签栏的显隐是一次高度跳变,整幅终端要跟着 reflow 发 `window_change`
+    /// (T4)。「只剩一个就自动隐藏」等于把这条最昂贵的重排绑在「关掉倒数第二个
+    /// 标签」这个高频动作上,而用户看到的是整屏 TUI 抖一下。
+    ///
+    /// 自证会变红:在 `tab_bar` 开头加 `if views.len() < 2 { return None; }`。
+    #[test]
+    fn tab_bar_is_shown_even_with_a_single_tab() {
+        let views = [TabView {
+            title: "build-01",
+            active: true,
+            appearance: None,
+        }];
+        let texts = tab_titles(&views);
+        assert!(
+            texts.iter().any(|s| s.contains("build-01")),
+            "只剩一个标签时标签栏消失了:{texts:?}"
+        );
+    }
+
+    /// F62:活动标签底部那条横杠用会话的节点色 —— 且必须过 `ColorTarget::Tab`
+    /// 这道闸门。没勾「标签页」的会话不该在这儿上色(用它自己的颜色画,等于
+    /// 绕过用户在编辑器里做的选择)。
+    ///
+    /// 数「这个颜色的填充矩形」而不是数图形总数:活动标签无论有没有节点色都会
+    /// 画一条横杠(退回 `accent`),总数不变,数总数这条断言会恒绿。
+    ///
+    /// 自证会变红:把 `one_tab` 里 `should_paint` 的 `ColorTarget::Tab` 换成
+    /// `ColorTarget::ListItem`,或把 `node.unwrap_or(...)` 改成只用 `accent`。
+    #[test]
+    fn active_tab_uses_the_session_color() {
+        use mullion_store::{ColorSpec, ColorTarget};
+        let color = egui::Color32::from_rgb(0x1e, 0x88, 0xe5);
+
+        fn appearance(targets: Vec<ColorTarget>) -> crate::ui::badge::Appearance {
+            crate::ui::badge::Appearance {
+                icon: None,
+                color: Some(ColorSpec {
+                    hex: "#1e88e5".into(),
+                    apply_to: targets,
+                }),
+            }
+        }
+
+        fn fills_of(views: &[TabView<'_>], want: egui::Color32) -> usize {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(1.0);
+            // 显式推进时间而不是跑两帧靠墙钟:这条测试比的是**颜色**,
+            // `fade_in` 半路上的不透明度会把 RGB 一起缩放(premultiplied),
+            // 颜色就对不上了。同 `pane_title` 里
+            // `icon_backdrop_uses_the_pane_title_target_not_list_item` 的做法。
+            let mut out = None;
+            for time in [0.0f64, 1.0] {
+                out = Some(ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        tab_bar(ctx, &crate::theme::MULLION_DARK, views);
+                    },
+                ));
+            }
+            fn walk(s: &egui::Shape, want: egui::Color32) -> usize {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().map(|s| walk(s, want)).sum(),
+                    egui::Shape::Rect(r) if r.fill == want => 1,
+                    _ => 0,
+                }
+            }
+            out.unwrap()
+                .shapes
+                .iter()
+                .map(|cs| walk(&cs.shape, want))
+                .sum()
+        }
+
+        let not_tab = appearance(vec![ColorTarget::ListItem]);
+        let views = [TabView {
+            title: "build-01",
+            active: true,
+            appearance: Some(&not_tab),
+        }];
+        assert_eq!(
+            fills_of(&views, color),
+            0,
+            "只勾了「会话列表」的会话,不该把这个颜色画到标签上"
+        );
+
+        let tab = appearance(vec![ColorTarget::Tab]);
+        let views = [TabView {
+            title: "build-01",
+            active: true,
+            appearance: Some(&tab),
+        }];
+        assert_eq!(
+            fills_of(&views, color),
+            1,
+            "勾了「标签页」的活动标签,底部横杠应该恰好用这个颜色画一次"
+        );
+    }
+
+    /// 标签栏占了中央区多少高度。`None` = 这一帧根本没画标签栏。
+    fn bar_height(tabs: usize) -> f32 {
+        let views: Vec<TabView<'_>> = (0..tabs)
+            .map(|i| TabView {
+                title: "build-01",
+                active: i == 0,
+                appearance: None,
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut h = 0.0;
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                tab_bar(ctx, &crate::theme::MULLION_DARK, &views);
+                h = ctx.screen_rect().height() - ctx.available_rect().height();
+            });
+        }
+        h
+    }
+
+    /// **T4 链路的入口**:标签栏一旦出现就吃掉中央区的高度,而且**高度恒定**。
+    ///
+    /// 两条断言各挡一件事:
+    /// 1. **占位**:`central_px` 是 `compute_geoms` → `apply_geometry` →
+    ///    `window_change` 这条链的源头。标签栏不占位就意味着它画在终端上面 ——
+    ///    遮住第一行,还吃掉那一行的指针事件(T8 变体)。
+    /// 2. **恒高**:launcher 态(零标签,栏里只有 `+`)与有标签时必须一样高。
+    ///    实测过 `exact_height` 在 egui 0.30 只是**下限**、内容更高会把面板撑开
+    ///    (零标签时内容自然高 24 < 30,靠 `exact_height` 顶到 30;有标签时恰好
+    ///    30)。也就是说这条承诺全靠 `exact_height` 那个数比内容大——标签内容
+    ///    哪天长高一点(加个状态点、换个字号),有标签时会撑高而 launcher 态不会,
+    ///    于是「连上第一台机」凭空多一次高度跳变 = 整幅终端 reflow。
+    ///
+    /// 自证会变红:把 `exact_height(tab_bar_px())` 改成 `exact_height(0.0)`
+    /// (第 2 条红),或把 `TopBottomPanel` 换成不参与面板空间分配的 `Area`
+    /// (第 1 条红)。
+    #[test]
+    fn tab_bar_takes_a_constant_slice_of_the_central_rect() {
+        let one = bar_height(1);
+        assert!(
+            one >= tab_bar_px(),
+            "标签栏只占了 {one} 点,至少该占 {}(没占位 = 它盖在终端上面)",
+            tab_bar_px()
+        );
+        for tabs in [0usize, 2, 8] {
+            let h = bar_height(tabs);
+            assert!(
+                (h - one).abs() < 0.5,
+                "{tabs} 个标签时标签栏高 {h},1 个标签时高 {one} —— 高度一变\
+                 整幅终端就要 reflow 发 window_change(T4)"
+            );
+        }
+    }
+
+    /// F100:标签栏、每个标签、每个关闭按钮、`+` 都要登记 —— 走查里
+    /// 「第 2 个标签的 × 太小」这类反馈标不到就只能用嘴描述。
+    ///
+    /// 自证会变红:注释掉 `tab_bar` / `one_tab` 里任一句 `annotate::mark`。
+    #[test]
+    fn annotate_mode_registers_the_tab_bar_and_each_tab() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        annotate::toggle(&ctx);
+        let views = [
+            TabView {
+                title: "build-01",
+                active: true,
+                appearance: None,
+            },
+            TabView {
+                title: "build-02",
+                active: false,
+                appearance: None,
+            },
+        ];
+        let mut paths = Vec::new();
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                tab_bar(ctx, &crate::theme::MULLION_DARK, &views);
+                paths = annotate::spot_paths(ctx);
+            });
+        }
+        for want in [
+            "标签栏",
+            "标签栏/新建",
+            "标签栏/标签 1",
+            "标签栏/标签 2",
+            "标签栏/标签 2/关闭",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == want),
+                "「{want}」没登记:{paths:?}"
+            );
+        }
     }
 
     /// F62:状态栏的会话色是**画**出来的一个小色块,不是拼进文本的字形。

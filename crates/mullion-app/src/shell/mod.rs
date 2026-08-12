@@ -5,5 +5,6 @@ pub mod dial_plan;
 pub mod input_route;
 pub mod session_map;
 pub mod store;
+pub mod tabs;
 pub mod window_state;
 pub mod workspace;

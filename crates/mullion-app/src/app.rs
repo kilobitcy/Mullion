@@ -1,6 +1,6 @@
-//! App:winit ApplicationHandler<UserEvent>。持有窗口/GPU/文字层/运行时,以及一个
-//! `Option<Workspace>`(launcher 态 None / 终端态 Some,§2.2;F30 起一个 Workspace
-//! 可装多个 pane)。每帧(ws 存在时)对每个 pane「排空 rx → feed emu → 回写
+//! App:winit ApplicationHandler<UserEvent>。持有窗口/GPU/文字层/运行时,以及一列
+//! 标签(F36:空 = launcher 态 / 非空 = 终端态,§2.2;每个标签一棵布局树,一棵树
+//! 可装多个 pane)。每帧(有活动标签时)对每个 pane「排空 rx → feed emu → 回写
 //! PtyWrite(T1)」,GPU present 受帧率(T3)与同步块(T2)双闸。
 
 use std::path::PathBuf;
@@ -25,6 +25,7 @@ use winit::window::{Window, WindowId};
 use crate::frame::{FrameLimiter, RedrawAction};
 use crate::gpu::{quads_for_panes, Gpu};
 use crate::render::SyncFramePacer;
+use crate::shell::tabs::{Tab, TabPayload, Tabs};
 use crate::shell::workspace::{PaneGeom, PaneState, Preset, Workspace};
 use crate::text::TextLayer;
 use crate::theme::{self, MULLION_DARK};
@@ -106,6 +107,97 @@ struct AutomationHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// 一个终端标签的全部 **per-connection** 状态(D0 决策 S2)。
+///
+/// 这五项过去都平摊在 `App` 上,单标签时看不出问题;多标签时它们会串味 ——
+/// 在标签 A 跑着自动化,去标签 B 连一个新会话,`ConnectOk` 里那句
+/// 「abort 上一次的自动化」就会把 A 的掐了。判据是「它属于这条连接还是属于
+/// 这个进程」:属于连接的进这里,属于进程的(在途连接、隧道、store、外观缓存)
+/// 留在 `App`。
+struct TerminalTab {
+    ws: Workspace,
+    /// 当前生效的布局预设(预设按钮组画选中态用)。手动关 pane 之后置 `None`
+    /// (布局不再对应任何预设)。
+    current_preset: Option<Preset>,
+    /// 这个标签是用什么配置连上的。`open_pty`(F35 分屏复用连接)要它的
+    /// `term`/`cols`/`rows`,标题条要 `user`/`host`/`port`。
+    ///
+    /// **按标签存而不是按 App 存**:否则在标签 A 上分屏,会拿标签 B(最近一次
+    /// 连接)的 term/尺寸去开 channel。
+    last_cfg: Option<SshConfig>,
+    /// F40~F44:这个标签上正在跑的那一次自动化。`None` = 没在跑。
+    automation: Option<AutomationHandle>,
+    /// 上一次自动化的结论文案。一直显示到这个标签被替换/关闭 —— 不做定时淡出:
+    /// 状态栏本来就是常驻信息区,而定时清除要再引一个 deadline 进帧循环,
+    /// 正是 spec §1 修订一要避免的东西。
+    automation_status: Option<String>,
+}
+
+/// 标签装的东西。D1 会加 `Files(FilesTab)` 变体(SFTP 文件视图)。
+enum TabContent {
+    Terminal(TerminalTab),
+}
+
+impl TabPayload for TabContent {
+    fn generation(&self) -> u64 {
+        match self {
+            TabContent::Terminal(t) => t.ws.generation(),
+        }
+    }
+}
+
+impl TabContent {
+    fn as_terminal(&self) -> Option<&TerminalTab> {
+        match self {
+            TabContent::Terminal(t) => Some(t),
+        }
+    }
+
+    fn as_terminal_mut(&mut self) -> Option<&mut TerminalTab> {
+        match self {
+            TabContent::Terminal(t) => Some(t),
+        }
+    }
+}
+
+/// 活动标签的 workspace。
+///
+/// 写成**自由函数而不是 `App` 的方法**是被借用检查器逼的:`App` 的方法借的是
+/// 整个 `self`,而事件循环里有好几处要同时拿 `self.active`(GPU)/`self.mods` /
+/// `self.ui` 和焦点 pane。原先 `self.ws.as_mut()` 是字段级借用,天然不冲突;
+/// 换成方法就会整片飘红。参数收窄到 `&mut Tabs` 就还原了那份粒度。
+fn active_term_of(tabs: &Tabs<TabContent>) -> Option<&TerminalTab> {
+    tabs.active().and_then(|t| t.content.as_terminal())
+}
+
+fn active_ws_of(tabs: &Tabs<TabContent>) -> Option<&Workspace> {
+    active_term_of(tabs).map(|t| &t.ws)
+}
+
+fn active_ws_mut_of(tabs: &mut Tabs<TabContent>) -> Option<&mut Workspace> {
+    tabs.active_mut()
+        .and_then(|t| t.content.as_terminal_mut())
+        .map(|t| &mut t.ws)
+}
+
+/// 关掉一个标签时的收口。**顺序是这条函数存在的全部理由**:
+///
+/// 自动化 task 也持有一份 `Arc<SshSession>`。只 drop 掉 `Workspace`(即 pane 那
+/// 一份)的话,`SshSession` 的 `cmd_tx` 仍有活着的克隆,`io_task` 不会收口 ——
+/// 用户关了标签、UI 上它已经消失,预配置的命令却还在往一条没真正断开的 channel
+/// 上发,用户既看不到也拦不住。`drive_automation` 补不了这条边:标签一旦从
+/// `self.tabs` 里摘掉,它就再也遍历不到了。
+fn wind_down(tab: Tab<TabContent>) {
+    match tab.content {
+        TabContent::Terminal(t) => {
+            if let Some(h) = t.automation {
+                h.task.abort();
+            }
+            // `t.ws` 在这里 drop —— 每个 `PaneState` 随之 drop,关掉它那条 SSH channel。
+        }
+    }
+}
+
 /// 窗口出现后才建的 GPU 相关状态。
 struct Active {
     window: Arc<Window>,
@@ -122,9 +214,9 @@ struct Active {
 
 pub struct App {
     _runtime: Runtime,
-    /// `None` = launcher 态(无终端可画);`Some` = 终端态。取代原来的
-    /// `Connection`:后者只能装一条连接 + 一个 pane。
-    ws: Option<Workspace>,
+    /// F36:一列标签。**空 = launcher 态**(无终端可画);非空 = 终端态。
+    /// 焦点转移/世代路由等纯逻辑在 `shell::tabs`,这里只做接线。
+    tabs: Tabs<TabContent>,
     /// C1:下一个 `Workspace` 世代号。只在 `ConnectOk`(唯一新建 `Workspace`
     /// 的地方)读取并自增——不能挂在 `Workspace` 自己身上,它每次都是全新
     /// 对象,内部生成的话新世代又从同一个值起步,等于没有世代区分。挂在
@@ -159,12 +251,10 @@ pub struct App {
     /// 另一次连接(会话管理器双击/点连接),就清为 `false`,进入交互态语义——
     /// 否则断线后从会话管理器连别的会话失败会把整个 GUI 一并 exit(1)(复核 #1)。
     cli_direct: bool,
-    /// 当前生效的布局预设(工具栏画选中态用)。手动关 pane 之后置 `None`
-    /// (布局不再对应任何预设)。
-    current_preset: Option<Preset>,
-    /// 最近一次发起连接用的配置。`open_pty`(F35 分屏复用连接)要它的
-    /// `term`/`cols`/`rows`,标题条要 `user`/`host`/`port`。
-    last_cfg: Option<SshConfig>,
+    /// **在途**那一次连接用的配置。`ConnectOk` 抵达时移交给新建的标签
+    /// (`TerminalTab::last_cfg`)。留在 `App` 上是因为发起连接的那一刻还没有
+    /// 标签可放 —— 与 `pending_automation` 同理,一次只连一个。
+    pending_cfg: Option<SshConfig>,
     /// egui UI 侧状态(菜单/状态栏/弹窗/中央区像素),与连接状态解耦(Task 4)。
     ui: crate::ui::UiState,
     /// 会话保险库(Task 6)。`resumed` 末尾打开;keyring/库打开失败时留 `None`,
@@ -209,8 +299,6 @@ pub struct App {
     /// 在途拨测任务。退出或取消时 abort —— 20 秒的 timeout 悬着不管,
     /// 关窗后进程还要多活 20 秒。
     probe_task: Option<tokio::task::JoinHandle<()>>,
-    /// F40~F44:正在跑的那一次自动化。`None` = 没在跑。
-    automation: Option<AutomationHandle>,
     /// `spawn_connect` 算好、等 `ConnectOk` 抵达时启用的计划。
     ///
     /// 在 `spawn_connect`(用户点击那一帧)算而不是 `ConnectOk` 里算:
@@ -222,10 +310,6 @@ pub struct App {
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
     /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
     tunnels: crate::tunnels::TunnelRuntime,
-    /// 上一次自动化的结论文案。一直显示到下一次 `spawn_connect` 才清空 ——
-    /// 不做定时淡出:状态栏本来就是常驻信息区,而定时清除需要再引一个
-    /// deadline 进帧循环,正是 spec §1 修订一要避免的东西。
-    automation_status: Option<String>,
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -242,7 +326,7 @@ impl App {
     ) -> Self {
         Self {
             _runtime: runtime,
-            ws: None,
+            tabs: Tabs::default(),
             next_ws_generation: 0,
             start: Instant::now(),
             mods: ModifiersState::empty(),
@@ -254,10 +338,9 @@ impl App {
             known_hosts,
             pending_host_key: None,
             host_key_since: None,
-            last_cfg: initial.clone(),
+            pending_cfg: initial.clone(),
             initial,
             cli_direct,
-            current_preset: Some(Preset::Single),
             ui: crate::ui::UiState::default(),
             store: None,
             visible: shell::window_state::Visibility::default(),
@@ -274,11 +357,35 @@ impl App {
             appearance: Default::default(),
             probe_epoch: 0,
             probe_task: None,
-            automation: None,
             pending_automation: None,
             pending_skip_automation: false,
             tunnels: Default::default(),
-            automation_status: None,
+        }
+    }
+
+    /// 活动标签的终端状态。D1 加了 `Files` 变体后,活动标签是文件视图时返回 `None`。
+    fn active_term(&self) -> Option<&TerminalTab> {
+        active_term_of(&self.tabs)
+    }
+
+    fn active_term_mut(&mut self) -> Option<&mut TerminalTab> {
+        self.tabs
+            .active_mut()
+            .and_then(|t| t.content.as_terminal_mut())
+    }
+
+    fn active_ws(&self) -> Option<&Workspace> {
+        active_ws_of(&self.tabs)
+    }
+
+    fn active_ws_mut(&mut self) -> Option<&mut Workspace> {
+        active_ws_mut_of(&mut self.tabs)
+    }
+
+    /// 关掉活动标签并收口。关空即回 launcher 态。
+    fn close_active_tab(&mut self) {
+        if let Some(tab) = self.tabs.close_active() {
+            wind_down(tab);
         }
     }
 
@@ -301,7 +408,46 @@ impl App {
     /// holding(正常出帧),要么仍在 holding 但 `sync_since_ms` 不变、
     /// `holding_deadline_ms` 天然不再返回同一个过去的时刻,不会重复排期。
     fn sync_timeout_wake(&self, now_ms: u64) -> Option<Instant> {
-        sync_timeout_wake_at(self.start, self.ws.as_ref(), now_ms)
+        sync_timeout_wake_at(self.start, self.active_ws(), now_ms)
+    }
+
+    /// 有没有模态盖着。分流(§4.5)与标签快捷键共用同一个判据 —— 两处各写一遍
+    /// 的话,新增一种弹窗时漏改一处,现象是「弹窗开着按 Ctrl+W 把背后的标签关了」。
+    /// **与抽出来之前逐字等价**。`ui.group_manager_open` 不在这张表里,是既有
+    /// 行为(它也是个 `egui::Window`、里面有输入框,看着像该算模态)—— 但那是
+    /// 分流层的既有缺口,不在 F36 的射程内,改它要单独一笔。
+    fn modal_open(&self) -> bool {
+        self.ui.session_manager_open
+            || self.ui.about_open
+            || self.pending_host_key.is_some()
+            || self.pending_paste.is_some()
+    }
+
+    /// F36/S4:标签快捷键的事件前置处理。返回 `true` = 这个键已被吃掉,
+    /// 调用方不要再往下分流(既不喂 egui,也不编码进 PTY)。
+    ///
+    /// 判定(含模态闸门)全在 `shell::tabs::hotkey` 那个纯函数里,这里只接线。
+    fn tab_hotkey_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
+            return false;
+        };
+        if ke.state != ElementState::Pressed {
+            return false;
+        }
+        let Some((key, mods)) = input::translate_key(ke, self.mods) else {
+            return false;
+        };
+        let Some(intent) = shell::tabs::hotkey(key, mods, self.modal_open()) else {
+            return false;
+        };
+        match intent {
+            shell::tabs::Intent::Next => self.tabs.switch_next(),
+            shell::tabs::Intent::Prev => self.tabs.switch_prev(),
+            shell::tabs::Intent::CloseActive => self.close_active_tab(),
+            shell::tabs::Intent::Nth(n) => self.tabs.switch_to_nth(n),
+        }
+        self.request_ui_redraw();
+        true
     }
 
     /// UI 侧变了(或 egui 自己要重绘):标脏 + 请求一帧。**两件事必须一起做**——
@@ -370,7 +516,7 @@ impl App {
     /// `central_px`),布局树按像素切分它。渲染、鼠标命中、window_change 三条
     /// 路径都读这一份结果——各算各的是这类布局 bug 的经典成因。
     fn compute_geoms(&self) -> Vec<PaneGeom> {
-        let (Some(a), Some(ws)) = (self.active.as_ref(), self.ws.as_ref()) else {
+        let (Some(a), Some(ws)) = (self.active.as_ref(), self.active_ws()) else {
             return Vec::new();
         };
         let origin = self.ui.central_origin_px;
@@ -407,7 +553,7 @@ impl App {
     /// 焦点 pane 的几何。鼠标格换算、划选都基于它。
     fn focused_geom(&self) -> Option<PaneGeom> {
         let a = self.active.as_ref()?;
-        let f = self.ws.as_ref()?.focus();
+        let f = self.active_ws()?.focus();
         a.geoms.iter().find(|g| g.id == f).copied()
     }
 
@@ -442,7 +588,7 @@ impl App {
     fn selection_press(&mut self) {
         // 没有连接就没有终端可选,别让 `dragging` 在 launcher 态被置起来——
         // 那会让后续每次 `CursorMoved` 都白跑一遍划选和重绘。
-        if self.ws.is_none() {
+        if self.active_ws().is_none() {
             return;
         }
         let Some(g) = self.focused_geom() else {
@@ -457,7 +603,7 @@ impl App {
         self.prev_click = Some(prev);
         if let Some((col, row, side)) = self.selection_cursor() {
             self.press_anchor = Some(((col, row), kind));
-            if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+            if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                 pane.emulator.selection_start(col, row, kind, side);
             }
         }
@@ -476,7 +622,7 @@ impl App {
         let cell_h = a.text.cell_h;
         self.autoscroll = input::autoscroll_lines(self.cursor_px.1, win_h, cell_h);
         if let Some((col, row, side)) = self.selection_cursor() {
-            if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+            if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                 pane.emulator.selection_update(col, row, side);
             }
         }
@@ -506,7 +652,7 @@ impl App {
         {
             if cell == (col, row) {
                 // 点一下 = 取消选择,别在屏幕上留一个孤零零的高亮字符。
-                if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                     pane.emulator.selection_clear();
                 }
                 self.request_ui_redraw();
@@ -520,8 +666,7 @@ impl App {
     /// `None`),不能写空串——那会清掉用户剪贴板里原有的内容。
     fn copy_selection(&mut self) {
         let Some(text) = self
-            .ws
-            .as_ref()
+            .active_ws()
             .and_then(Workspace::focused)
             .and_then(|p| p.emulator.selection_text())
         else {
@@ -535,7 +680,7 @@ impl App {
         // 没有连接就没有地方可贴。不早退的话,launcher 态右键会读剪贴板、
         // 多行内容还会弹出一个「确认粘贴」窗——点了「粘贴」却什么都不会发生
         // (`send_paste` 拿不到焦点 pane 直接返回)。与 `selection_press` 同一道门。
-        if self.ws.is_none() {
+        if self.active_ws().is_none() {
             return;
         }
         let Some(text) = self.clipboard.get() else {
@@ -545,8 +690,7 @@ impl App {
             return;
         }
         let bracketed = self
-            .ws
-            .as_ref()
+            .active_ws()
             .and_then(Workspace::focused)
             .is_some_and(|p| {
                 p.emulator
@@ -575,7 +719,7 @@ impl App {
     /// 当前的四处以 `grep -n "pty.write" crates/mullion-app/src/app.rs` 为准
     /// (行号会漂,别钉死)。
     fn user_took_over(&mut self) {
-        if let Some(h) = self.automation.as_mut() {
+        if let Some(h) = self.active_term_mut().and_then(|t| t.automation.as_mut()) {
             // drop 发送端即取消(`write_scheduled` 的 doc:收到值**或**发送端
             // 被 drop 都算取消)。
             h.cancel.take();
@@ -585,7 +729,7 @@ impl App {
     /// 真正发送。到这里要么不需要确认,要么用户已经点了「粘贴」。粘贴目标
     /// 是**焦点 pane**——分屏后粘贴永远只进当前正在操作的那一块。
     fn send_paste(&mut self, text: &str) {
-        let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) else {
+        let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) else {
             return;
         };
         let bracketed = pane
@@ -654,7 +798,7 @@ impl App {
     /// 远端的同步输出探测/光标查询永久等不到应答。
     fn pump_io(&mut self) {
         let now = self.now_ms();
-        if let Some(ws) = self.ws.as_mut() {
+        if let Some(ws) = self.active_ws_mut() {
             ws.pump(now);
         }
         self.drive_automation();
@@ -666,27 +810,35 @@ impl App {
     ///
     /// 每帧调,所以**零分配**:只读两个 bool、`take()` 两个 `Option`。
     fn drive_automation(&mut self) {
-        let Some(h) = self.automation.as_mut() else {
-            return;
-        };
-        let Some(ws) = self.ws.as_ref() else {
-            return;
-        };
-        // pane 不在了(被关掉/换世代):让 task 自然结束,别让它挂到超时。
-        let Some(pane) = ws.pane(h.pane) else {
-            h.disconnect.take();
-            return;
-        };
-        if pane.status == crate::shell::workspace::PaneStatus::Disconnected {
-            // send 的 Err(接收端已走)无所谓:task 已经结束了。
-            if let Some(tx) = h.disconnect.take() {
-                let _ = tx.send(());
+        // **遍历所有标签,不只是活动标签**:用户完全可能连上标签 A(自动化正在
+        // 等首字节)就切到标签 B 去,只驱动活动标签的话 A 那次会一直等到超时。
+        // 单标签时与原先逐帧等价。
+        //
+        // 两条边都读**自己 workspace 里的** pane —— `TerminalTab` 把 handle 和
+        // workspace 绑在一起,结构上拿不错对。
+        for tab in self.tabs.iter_mut() {
+            let Some(t) = tab.content.as_terminal_mut() else {
+                continue;
+            };
+            let Some(h) = t.automation.as_mut() else {
+                continue;
+            };
+            // pane 不在了(被关掉/换世代):让 task 自然结束,别让它挂到超时。
+            let Some(pane) = t.ws.pane(h.pane) else {
+                h.disconnect.take();
+                continue;
+            };
+            if pane.status == crate::shell::workspace::PaneStatus::Disconnected {
+                // send 的 Err(接收端已走)无所谓:task 已经结束了。
+                if let Some(tx) = h.disconnect.take() {
+                    let _ = tx.send(());
+                }
+                continue;
             }
-            return;
-        }
-        if pane.saw_first_byte {
-            if let Some(tx) = h.ready.take() {
-                let _ = tx.send(());
+            if pane.saw_first_byte {
+                if let Some(tx) = h.ready.take() {
+                    let _ = tx.send(());
+                }
             }
         }
     }
@@ -718,7 +870,10 @@ impl App {
         // F40~F44:此刻才确定「是哪条会话」。连接在途期间用户可能改配置甚至
         // 删会话,所以计划必须在用户点击的这一帧定死。
         // 上一次的结论到此为止:新连接开始了,旧结论就是误导信息。
-        self.automation_status = None;
+        // (Task 2 保持替换语义,清的就是马上要被替换掉的那个标签。)
+        if let Some(t) = self.active_term_mut() {
+            t.automation_status = None;
+        }
         self.pending_automation =
             crate::automation::pending_for(self.ui.connect_request_last, |id| {
                 let store = self.store.as_ref()?;
@@ -735,8 +890,9 @@ impl App {
                 Some((resolved.automation, name))
             });
         // 会话管理器发起的连接也要记下,否则第二次连接后开分屏会用上一台
-        // 主机的 term/尺寸(F35 的 open_pty 靠它)。
-        self.last_cfg = Some(cfg.clone());
+        // 主机的 term/尺寸(F35 的 open_pty 靠它)。`ConnectOk` 抵达时移交给
+        // 新建的标签。
+        self.pending_cfg = Some(cfg.clone());
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
         // 每次连接现建一个策略:它只持有两个 Arc/Sender 的克隆,构造成本可忽略,
@@ -777,7 +933,10 @@ impl App {
         if fresh.is_empty() {
             return;
         }
-        let Some(ws) = self.ws.as_ref() else { return };
+        // **取活动标签自己的 cfg**,不是「最近一次连接的」—— 否则在标签 A 上
+        // 分屏会拿标签 B 的 term/尺寸去开 channel(S2 把 last_cfg 搬进标签的理由)。
+        let Some(t) = self.active_term() else { return };
+        let ws = &t.ws;
         let Some(host) = ws.hosts.first() else { return };
         // C1:开 channel 是异步的,回来时用户可能已经断开重连、换了一个新
         // `Workspace`(`next_id` 重新从 2 计数,`id` 会撞号)。把发起时刻的
@@ -785,7 +944,7 @@ impl App {
         // 是不是当前这个 Workspace 发出的"。
         let generation = ws.generation();
         let handle = host.handle.clone();
-        let Some(cfg) = self.last_cfg.clone() else {
+        let Some(cfg) = t.last_cfg.clone() else {
             return;
         };
         for id in fresh {
@@ -923,17 +1082,19 @@ impl App {
     /// 跑的时候断开重连,旧世代的「自动化已中止:连接已断开」落到新连接的
     /// 状态栏上,是一条与当前连接毫不相干的误导信息(判据同 `PaneOpenErr`)。
     fn accept_automation_done(&mut self, generation: u64, outcome: crate::automation::Outcome) {
-        if !self
-            .ws
-            .as_ref()
-            .is_some_and(|ws| generation_matches(ws, generation))
-        {
+        // S1:结论回给**属主标签**,不是活动标签 —— 后者会让「在 A 上跑的自动化
+        // 结论」显示成 B 的状态。
+        let Some(t) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|tab| tab.content.as_terminal_mut())
+        else {
             log::debug!(target: "mullion", "丢弃过期世代 {generation} 的自动化结论");
             return;
-        }
+        };
         log::info!(target: "mullion", "自动化结束: {outcome:?}");
-        self.automation_status = Some(crate::automation::status_text(outcome));
-        self.automation = None;
+        t.automation_status = Some(crate::automation::status_text(outcome));
+        t.automation = None;
         self.ui_dirty = true;
         self.request_ui_redraw();
     }
@@ -1218,29 +1379,46 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                     generation,
                 );
+                let cfg = self.pending_cfg.clone();
+                let session_id = self.ui.connect_request_last;
                 ws.hosts.push(crate::shell::workspace::HostConn {
-                    label: self
-                        .last_cfg
+                    label: cfg
                         .as_ref()
                         .map_or_else(|| "远端".to_string(), |c| format!("{}@{}", c.user, c.host)),
-                    addr: self
-                        .last_cfg
+                    addr: cfg
                         .as_ref()
                         .map_or_else(String::new, |c| format!("{}:{}", c.host, c.port)),
                     // 取发起这次连接时记下的那条会话
                     // (`ConnectOk` 事件本身不带 SessionId)。
-                    session_id: self.ui.connect_request_last,
+                    session_id,
                     handle,
                 });
-                self.ws = Some(ws);
-                self.current_preset = Some(Preset::Single);
+                let title = ws
+                    .hosts
+                    .first()
+                    .map_or_else(String::new, |h| h.label.clone());
+                // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
+                // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
+                // `switching_tabs_does_not_touch_the_ssh_connections`)。
+                // launcher 态(`tabs` 为空)时这就是第一个标签,CLI 直连同理。
+                //
+                // **同一条会话可以开多个标签,不去重、标题也不加序号**:序号会让
+                // 「关掉中间那个」之后编号整体跳变,反而更难认;区分靠节点色和
+                // hover 出来的 `user@host`。
+                self.tabs.open(
+                    title,
+                    session_id,
+                    TabContent::Terminal(TerminalTab {
+                        ws,
+                        current_preset: Some(Preset::Single),
+                        last_cfg: cfg,
+                        automation: None,
+                        automation_status: None,
+                    }),
+                );
                 // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
                 self.ui.close_session_manager();
                 self.ui_dirty = true;
-                // F40~F44:起自动化。旧那次(如果有)的结论对新连接没有意义。
-                if let Some(old) = self.automation.take() {
-                    old.task.abort();
-                }
                 if let Some(plan) = crate::automation::take_pending(
                     &mut self.pending_automation,
                     &mut self.pending_skip_automation,
@@ -1263,14 +1441,23 @@ impl ApplicationHandler<UserEvent> for App {
                         .await;
                         let _ = proxy.send_event(UserEvent::AutomationDone(generation, outcome));
                     });
-                    self.automation = Some(AutomationHandle {
-                        // 只有第一个 pane 跑自动化(总设计 §7 前提②)。
-                        pane: PaneId(1),
-                        ready: Some(ready_tx),
-                        cancel: Some(cancel_tx),
-                        disconnect: Some(disc_tx),
-                        task,
-                    });
+                    // S1:挂回**属主标签**(按世代号查),不用「活动标签」——
+                    // `open` 刚把新标签设为活动,今天两者等价,但那是巧合:
+                    // 哪天连接成功不再顺带切换焦点,这里就会把 handle 挂错标签。
+                    if let Some(t) = self
+                        .tabs
+                        .by_generation_mut(generation)
+                        .and_then(|tab| tab.content.as_terminal_mut())
+                    {
+                        t.automation = Some(AutomationHandle {
+                            // 只有第一个 pane 跑自动化(总设计 §7 前提②)。
+                            pane: PaneId(1),
+                            ready: Some(ready_tx),
+                            cancel: Some(cancel_tx),
+                            disconnect: Some(disc_tx),
+                            task,
+                        });
+                    }
                 }
                 self.request_ui_redraw();
             }
@@ -1282,7 +1469,15 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 // 初始网格给 80x24 占位,真实尺寸由下一帧 apply_geometry 校准
                 // (last_grid 给 (0,0),保证那一帧必然发一次 window_change)。
-                if let Some(ws) = self.ws.as_mut() {
+                // S1:按**世代号**找属主标签,绝不用「活动标签」去接 —— 用户在
+                // 标签 A 发起分屏、切到标签 B 的这几百毫秒里事件抵达,拿活动标签
+                // 接就会把 A 的 pane 挂到 B 上。
+                if let Some(ws) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.as_terminal_mut())
+                    .map(|t| &mut t.ws)
+                {
                     // 开 channel 是真实网络往返(高延迟代理链路下可能要几百 ms 到
                     // 几秒),这期间用户完全可能又切了预设,甚至断开重连出了一个
                     // 全新的 Workspace(C1:`next_id` 重新计数,`id` 会跟旧世代
@@ -1291,6 +1486,10 @@ impl ApplicationHandler<UserEvent> for App {
                     // 却仍在每帧驱动它,SSH channel 永远占着不关),重则是顶掉
                     // 新世代刚建好、正常工作的 PaneState(输入从此写进一条已经
                     // 不存在意义的旧连接)。
+                    //
+                    // 这里的世代比对**在按世代路由之后是恒真的**,刻意留着:它是
+                    // 深度防御,挡的正是「将来有人把上面那句改回活动标签」这类回退,
+                    // 而代价只是一次整数比较(每开一条 channel 一次)。
                     if pane_still_wanted(ws, id, generation) {
                         let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
                         let d = theme::term_default_colors(&MULLION_DARK);
@@ -1327,11 +1526,8 @@ impl ApplicationHandler<UserEvent> for App {
                 log::warn!(target: "mullion", "pane {} 开启失败: {msg}", id.0);
                 // C1:旧世代的失败提示落到新世代头上,会给用户弹一条跟当前连接
                 // 毫不相干的错误 toast——按世代过滤,只有当前世代的失败才展示。
-                if self
-                    .ws
-                    .as_ref()
-                    .is_some_and(|ws| generation_matches(ws, generation))
-                {
+                // S1:世代号即路由键,查得到属主标签才说明这条失败还有意义。
+                if self.tabs.by_generation(generation).is_some() {
                     self.ui.set_error(msg);
                     self.ui_dirty = true;
                     self.request_ui_redraw();
@@ -1383,7 +1579,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 待定 F:CLI 直连从未成功连过时,保留可脚本化的 exit(1) 语义;
                 // launcher 态(或已连过又断开)只记错误,交 UI 展示(ui.last_error)。
                 crate::logx::line(&format!("连接失败: {msg}"));
-                if self.cli_direct && self.ws.is_none() {
+                if self.cli_direct && self.active_ws().is_none() {
                     std::process::exit(1);
                 }
                 self.ui.set_error(msg);
@@ -1413,12 +1609,22 @@ impl ApplicationHandler<UserEvent> for App {
         if self.annotate_event(&event) {
             return;
         }
+        // F36/S4:标签快捷键同样必须在分流**之前**截,理由同上面的标注模式:
+        // 走到下面的 `KeyboardInput` 分支就已经晚了(那里会把键编码进 PTY,
+        // `Ctrl+W` 会在切标签的同时把远端 shell 的前一个词删掉)。
+        // 判定在 `shell::tabs::hotkey`(纯函数),这里只做接线。
+        if self.tab_hotkey_event(&event) {
+            return;
+        }
         // 输入分流(§4.5)。**键盘与指针的顺序是反的,不是笔误**:
         // - 指针:先喂 egui 再判。egui 要靠 `CursorMoved` 维护 hover,不喂就没有
         //   `wants_pointer_input()` 可言。
         // - 键盘:先判再决定喂不喂(T8)。喂给 egui 的键会先经它的焦点系统——Tab 会被
         //   拿去把焦点给菜单栏第一个按钮,此后 `wants_keyboard_input()` 恒 true,
         //   下面的 route 把每个按键都判给 egui,终端永久收不到键。
+        // `modal` 在借出 `self.active` 之前算好:`modal_open()` 要 `&self`,
+        // 放进下面那个 `&mut self.active` 的作用域里借用检查过不去。
+        let modal = self.modal_open();
         if let Some(active) = &mut self.active {
             let is_kbd = matches!(event, WindowEvent::KeyboardInput { .. });
             let is_ptr = matches!(
@@ -1427,10 +1633,6 @@ impl ApplicationHandler<UserEvent> for App {
                     | WindowEvent::MouseWheel { .. }
                     | WindowEvent::CursorMoved { .. }
             );
-            let modal = self.ui.session_manager_open
-                || self.ui.about_open
-                || self.pending_host_key.is_some()
-                || self.pending_paste.is_some();
             // 键盘归终端时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
             if is_kbd
                 && !shell::input_route::egui_should_see(
@@ -1517,13 +1719,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // 滚轮上报是发给远端的字节 = 用户意图。本地回溯
                 // (`WheelAction::LocalScroll`)不发字节,不算接管。
                 let mut took_over = false;
-                // 先算,下面 `self.ws.as_mut()` 一借出去就没法再调 `&self` 方法了。
+                // 先算,下面借出焦点 pane 之后就没法再调 `&self` 方法了。
                 let local = self.cursor_in_grid();
                 let geom = self.focused_geom();
+                // 走 `active_ws_mut_of(&mut self.tabs)` 而不是 `self.active_ws_mut()`:
+                // 后者借的是整个 `self`,与同一元组里的 `self.active` 和下面的
+                // `self.mods` 冲突(见 `active_ws_of` 的说明)。
                 if let (Some(a), Some(g), Some(pane)) = (
                     self.active.as_ref(),
                     geom,
-                    self.ws.as_mut().and_then(Workspace::focused_mut),
+                    active_ws_mut_of(&mut self.tabs).and_then(Workspace::focused_mut),
                 ) {
                     let cell_px = (a.text.cell_w, a.text.cell_h);
                     let lines = input::wheel_lines(delta, cell_px.1);
@@ -1586,7 +1791,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // 点哪块就切到哪块(F33)。必须在 selection_press 之前:
                     // 划选的锚点要落在新焦点 pane 的坐标系里。
                     if let Some(id) = self.pane_at(self.cursor_px) {
-                        if let Some(ws) = self.ws.as_mut() {
+                        if let Some(ws) = self.active_ws_mut() {
                             if ws.focus() != id {
                                 ws.set_focus(id);
                                 self.ui_dirty = true;
@@ -1637,7 +1842,9 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 Scroll::PageDown
                             };
-                            if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                            if let Some(pane) =
+                                self.active_ws_mut().and_then(Workspace::focused_mut)
+                            {
                                 pane.emulator.scroll(scroll);
                             }
                             self.request_ui_redraw();
@@ -1648,7 +1855,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // 无重连。断线感知与重连是 S3,后续 spec,这里不做。
                         // launcher 态(ws=None)没有终端可写,按键静默丢弃。按键永远发给
                         // **焦点** pane(F33)——分屏后不该出现「按了 A 屏的键跑进 B 屏」。
-                        if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                        if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                             // F18:一按普通键就清选区。留着的话高亮会挂在屏幕上,
                             // 而底下的内容早被新输出冲掉了——高亮的是别的字。
                             pane.emulator.selection_clear();
@@ -1696,7 +1903,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 「确实触发了一次 RedrawRequested」当作脏——这不是无条件轮询:
                 // ControlFlow::Wait 下 winit 不会凭空生成 RedrawRequested,真正的重绘
                 // 频率由触发它的事件(resize/connect/wake/OS 重绘)决定。
-                let dirty = match &self.ws {
+                let dirty = match self.active_ws() {
                     Some(ws) => crate::frame::frame_is_dirty(
                         crate::render::panes_ready_to_present(
                             ws.panes().iter().map(|p| &p.pacer),
@@ -1744,8 +1951,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // 快照要先全部取出来:PaneRender 借着它们,而 render_frame
                             // 同时要 &mut self.ui。
                             let snaps: Vec<_> = self
-                                .ws
-                                .as_ref()
+                                .active_ws()
                                 .map(|ws| {
                                     geoms
                                         .iter()
@@ -1755,7 +1961,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            let focus = self.ws.as_ref().map(Workspace::focus);
+                            let focus = self.active_ws().map(Workspace::focus);
                             let renders: Vec<crate::gpu::PaneRender<'_>> = snaps
                                 .iter()
                                 .map(|(g, s)| crate::gpu::PaneRender {
@@ -1764,35 +1970,54 @@ impl ApplicationHandler<UserEvent> for App {
                                     focused: Some(g.id) == focus,
                                 })
                                 .collect();
-                            let titles: Vec<crate::ui::pane_title::TitleView<'_>> = self
-                                .ws
-                                .as_ref()
-                                .map(|ws| {
-                                    geoms
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, g)| crate::ui::pane_title::TitleView {
-                                            geom: *g,
-                                            index: i + 1,
-                                            host: ws.pane(g.id).and_then(|p| {
-                                                ws.hosts.get(p.host_ix).map(|h| h.label.as_str())
-                                            }),
-                                            status: ws.pane(g.id).map_or(
-                                                crate::shell::workspace::PaneStatus::Live,
-                                                |p| p.status,
-                                            ),
-                                            focused: Some(g.id) == focus,
-                                            // 一条连接一个会话(ADR-009:多 pane
-                                            // 共用一条 SSH 连接,`host_ix` 目前恒 0)。
-                                            appearance: ws
-                                                .pane(g.id)
-                                                .and_then(|p| ws.hosts.get(p.host_ix))
-                                                .and_then(|h| h.session_id)
-                                                .and_then(|sid| self.appearance.get(sid)),
-                                        })
-                                        .collect()
+                            // 同 `active_ws_of` 的说明:这里借出去的 `titles` 一直
+                            // 活到下面 `render_frame`,走方法会连 `self.active` /
+                            // `self.ui` 一起锁住。
+                            let titles: Vec<crate::ui::pane_title::TitleView<'_>> =
+                                active_ws_of(&self.tabs)
+                                    .map(|ws| {
+                                        geoms
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, g)| crate::ui::pane_title::TitleView {
+                                                geom: *g,
+                                                index: i + 1,
+                                                host: ws.pane(g.id).and_then(|p| {
+                                                    ws.hosts
+                                                        .get(p.host_ix)
+                                                        .map(|h| h.label.as_str())
+                                                }),
+                                                status: ws.pane(g.id).map_or(
+                                                    crate::shell::workspace::PaneStatus::Live,
+                                                    |p| p.status,
+                                                ),
+                                                focused: Some(g.id) == focus,
+                                                // 一条连接一个会话(ADR-009:多 pane
+                                                // 共用一条 SSH 连接,`host_ix` 目前恒 0)。
+                                                appearance: ws
+                                                    .pane(g.id)
+                                                    .and_then(|p| ws.hosts.get(p.host_ix))
+                                                    .and_then(|h| h.session_id)
+                                                    .and_then(|sid| self.appearance.get(sid)),
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                            // F36:同 `titles`,借用要一直活到 `render_frame`,
+                            // 所以走自由函数取 `self.tabs`、不走 `&self` 方法。
+                            let active_ix = self.tabs.active_index();
+                            let tab_views: Vec<crate::ui::chrome::TabView<'_>> = self
+                                .tabs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, tab)| crate::ui::chrome::TabView {
+                                    title: tab.title.as_str(),
+                                    active: i == active_ix,
+                                    appearance: tab
+                                        .session_id
+                                        .and_then(|sid| self.appearance.get(sid)),
                                 })
-                                .unwrap_or_default();
+                                .collect();
                             let groups: &[mullion_store::GroupRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.groups());
                             let tunnels: &[mullion_store::TunnelRecord] =
@@ -1804,10 +2029,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 tunnels,
                                 tunnel_states: &tunnel_states,
                                 store_available,
-                                connected: self.ws.is_some(),
-                                panes: self.ws.as_ref().map_or(1, Workspace::pane_count),
-                                preset: self.current_preset,
+                                connected: !self.tabs.is_empty(),
+                                panes: self.active_ws().map_or(1, Workspace::pane_count),
+                                preset: self.active_term().and_then(|t| t.current_preset),
                                 titles: &titles,
+                                tabs: &tab_views,
                                 host_key: host_key_view,
                                 paste: paste_view,
                                 secret_presence: match (self.store.as_ref(), self.ui.editor_id) {
@@ -1818,9 +2044,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 // `automation::status_line` 里,不在这儿手写
                                 // if/else —— 写反的现象是新连接的状态栏挂着上
                                 // 一条连接的结论,而它有单测钉着。
+                                // 同 `active_ws_of`:`automation_status` 借出的 `&str`
+                                // 活到 `render_frame`,走 `&self` 方法会锁住整个 self。
                                 automation: crate::automation::status_line(
-                                    self.automation.is_some(),
-                                    self.automation_status.as_deref(),
+                                    active_term_of(&self.tabs)
+                                        .is_some_and(|t| t.automation.is_some()),
+                                    active_term_of(&self.tabs)
+                                        .and_then(|t| t.automation_status.as_deref()),
                                 ),
                                 appearance: &self.appearance,
                             };
@@ -1836,7 +2066,7 @@ impl ApplicationHandler<UserEvent> for App {
                             self.ui_dirty = false;
                             // 施加几何:F34/T4 的唯一出口。本帧 build_ui 刚写入的
                             // central_px 要下一帧才生效(与 B0 起就是这个语义)。
-                            if let Some(ws) = self.ws.as_mut() {
+                            if let Some(ws) = self.active_ws_mut() {
                                 for p in ws.panes_mut_iter() {
                                     p.pacer.mark_presented();
                                 }
@@ -1846,14 +2076,35 @@ impl ApplicationHandler<UserEvent> for App {
                             // `apply_layout_actions`(只碰 &mut Workspace,可脱离
                             // runtime/proxy 单测);真正开新 channel 需要 runtime/proxy,
                             // 落在 `spawn_fresh_panes`。
-                            if let Some(ws) = self.ws.as_mut() {
+                            if let Some(t) = self.active_term_mut() {
                                 if let Some((fresh, preset_out)) =
-                                    apply_layout_actions(ws, &actions)
+                                    apply_layout_actions(&mut t.ws, &actions)
                                 {
-                                    self.current_preset = preset_out;
+                                    t.current_preset = preset_out;
                                     self.ui_dirty = true;
                                     self.spawn_fresh_panes(fresh);
                                 }
+                            }
+                            // F36:标签栏动作。切换只动 `active`(不碰任何 SSH
+                            // 连接——守护测试
+                            // `switching_tabs_does_not_touch_the_ssh_connections`);
+                            // 关闭走 `wind_down` 收口;`+` 打开会话管理器。
+                            match actions.tab {
+                                Some(crate::ui::chrome::TabAction::Switch(ix)) => {
+                                    self.tabs.switch_to_index(ix);
+                                    self.ui_dirty = true;
+                                }
+                                Some(crate::ui::chrome::TabAction::Close(ix)) => {
+                                    if let Some(tab) = self.tabs.close(ix) {
+                                        wind_down(tab);
+                                    }
+                                    self.ui_dirty = true;
+                                }
+                                Some(crate::ui::chrome::TabAction::NewSession) => {
+                                    self.ui.session_manager_open = true;
+                                    self.ui_dirty = true;
+                                }
+                                None => {}
                             }
                             // F100:导出的 Markdown 送剪贴板。写剪贴板是 IO,`ui/`
                             // 那一层只画不做 IO,所以在这里发起(同 F18 的复制路径)。
@@ -1866,28 +2117,29 @@ impl ApplicationHandler<UserEvent> for App {
                             // 算出新 grid,再由 apply_geometry 发 window_change。
                             if self.ui.toggle_title_bars {
                                 self.ui.toggle_title_bars = false;
-                                if let Some(ws) = self.ws.as_mut() {
+                                if let Some(ws) = self.active_ws_mut() {
                                     ws.title_bars = !ws.title_bars;
                                 }
                                 self.ui_dirty = true;
                             }
-                            // 菜单动作(§4.2):断开回到 launcher 态 / 退出整个事件循环。
+                            // 菜单动作(§4.2):断开 = 关掉活动标签(单标签时即回
+                            // launcher 态,与 Task 2 之前逐帧等价);退出整个事件循环。
+                            // 收口顺序(先 abort 自动化再 drop workspace)在
+                            // `wind_down` 里,理由见它的文档注释。
                             if self.ui.request_disconnect {
                                 self.ui.request_disconnect = false;
-                                self.ws = None;
-                                // F40:自动化 task 也持有一份 `Arc<SshSession>`。
-                                // 不 abort 的话,`self.ws = None` 只 drop 掉 pane 那
-                                // 一份,`io_task` 因 cmd_tx 仍有克隆而不会收口 ——
-                                // 用户点了「断开」、UI 回到 launcher 态,预配置的命令
-                                // 却还在往一条没真正断开的 channel 上发。
-                                // `drive_automation` 补不了这条边:它在 ws 为 None 时
-                                // 直接 return。
-                                if let Some(h) = self.automation.take() {
-                                    h.task.abort();
-                                }
+                                self.close_active_tab();
                             }
                             if self.ui.request_quit {
                                 self.ui.request_quit = false;
+                                // F36:逐个走同一条收口,不靠进程退出兜底。
+                                // `event_loop.exit()` 之后还要跑完本轮事件、
+                                // 析构顺序也不由我们定;自动化 task 持着
+                                // `Arc<SshSession>`,不显式 abort 就可能在退出
+                                // 途中再往一条正在拆的 channel 上发命令。
+                                for tab in self.tabs.drain() {
+                                    wind_down(tab);
+                                }
                                 event_loop.exit();
                             }
                             // T3/T7:egui 若自己请求了下次重绘(动画/交互),按 Throttle
@@ -1947,7 +2199,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 经 next_frame_at/WaitUntil 排期,由 `about_to_wait` 到点补画。
                 if presented && self.dragging && self.autoscroll != 0 {
                     let lines = self.autoscroll;
-                    if let Some(pane) = self.ws.as_mut().and_then(Workspace::focused_mut) {
+                    if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                         pane.emulator.scroll(Scroll::Delta(lines));
                     }
                     // 滚动改了 display_offset,选区终点要按新视口重新落点,
@@ -2269,12 +2521,6 @@ fn apply_layout_actions(
     Some((fresh, preset_out))
 }
 
-/// C1:事件携带的世代号是否与当前 `Workspace` 一致——`PaneOpened` 与
-/// `PaneOpenErr` 共用同一条判断,避免两处各写一遍、将来改一处漏改另一处。
-fn generation_matches(ws: &Workspace, generation: u64) -> bool {
-    ws.generation() == generation
-}
-
 /// 晚到的 `PaneOpened` 是否还该被 attach。两个独立的理由都会让答案是"不该":
 ///
 /// 1. 用户又切了一次预设——`apply_preset` 把等待中的叶子从树上摘掉了,`id`
@@ -2285,9 +2531,13 @@ fn generation_matches(ws: &Workspace, generation: u64) -> bool {
 ///    重连都从 2 重新计数,两代的 `id` 必然会撞号);只看 id/树成员会误判为
 ///    "还需要",实际 attach 上去会顶掉新世代刚建好、正常工作的 `PaneState`。
 ///
+/// F36 之后理由 2 已经**先**被 `Tabs::by_generation_mut` 挡了一道(查不到属主
+/// 标签就根本走不到这里),这里的世代比对成了深度防御:它挡的是「将来有人把
+/// 路由改回活动标签」这类回退,代价是每开一条 channel 一次整数比较。
+///
 /// 纯函数(只读 `&Workspace`),不碰 `EventLoopProxy`,可脱离真实事件循环单测。
 fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
-    generation_matches(ws, generation) && mullion_core::layout::leaves(ws.tree()).contains(&id)
+    ws.generation() == generation && mullion_core::layout::leaves(ws.tree()).contains(&id)
 }
 
 /// 采纳一次拨测结果:世代号对得上才写状态。返回是否采纳。
@@ -2421,6 +2671,7 @@ fn render_frame(
         // 否则新动作会在上面文档注释说的 discard 趟里被静默丢弃。
         if this_pass.preset.is_some()
             || this_pass.close_pane.is_some()
+            || this_pass.tab.is_some()
             || this_pass.annotate_export.is_some()
         {
             actions = this_pass;
@@ -2572,10 +2823,7 @@ fn render_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_layout_actions, apply_save, generation_matches, pane_still_wanted,
-        sync_timeout_wake_at,
-    };
+    use super::{apply_layout_actions, apply_save, pane_still_wanted, sync_timeout_wake_at};
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
     use crate::shell::workspace::{Preset, Workspace};
@@ -3000,37 +3248,53 @@ mod tests {
         );
     }
 
-    /// 复核 C1:`PaneOpenErr` 直接调 `generation_matches`(不经过
+    /// **接线守护**:`PaneOpenErr` 分支必须按世代过滤(不经过
     /// `pane_still_wanted`,因为它不关心 id/树成员,只关心"这条失败提示还是
-    /// 不是当前世代的")——单独锁住这条判断,不依赖 `pane_still_wanted` 的
-    /// 组合行为碰巧带出覆盖。旧世代的失败提示如果不过滤,会给用户弹一条跟
-    /// 当前连接毫不相干的错误 toast。
+    /// 不是当前世代的")。旧世代的失败提示如果不过滤,会给用户弹一条跟当前
+    /// 连接毫不相干的错误 toast。
+    ///
+    /// S1(D0):世代号升格为**标签路由键**——过滤判据从"跟活动 ws 的世代比"
+    /// 换成"`self.tabs` 里查不查得到这个世代的属主标签"。多标签下前者是错的:
+    /// 后台标签开 pane 失败,拿活动标签的世代去比会把它误判成过期而静默吞掉。
+    ///
+    /// **扎的是源码结构而非运行时行为**,这是刻意的:`App` 要 `EventLoopProxy`
+    /// 才能构造,单测里造不出来。验证边界:它只挡得住「分支里没有按标签查世代」
+    /// 这一种写法,挡不住有人把查询结果的判断写成永真。
+    ///
+    /// 自证会变红:把这个分支里的 `if self.tabs.by_generation(...)` 整段删掉。
     #[test]
-    fn generation_matches_only_accepts_the_current_workspaces_generation() {
-        let ws = Workspace::new(test_pane(1), 3);
+    fn pane_open_err_is_routed_by_generation_not_by_the_active_tab() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n            UserEvent::PaneOpenErr {")
+            .nth(1)
+            .expect("找不到 PaneOpenErr 的事件分支");
+        let body = &after[..after
+            .find("\n            }\n")
+            .expect("找不到 PaneOpenErr 分支的结尾")];
         assert!(
-            generation_matches(&ws, 3),
-            "世代号一致,该事件属于当前 Workspace"
-        );
-        assert!(
-            !generation_matches(&ws, 2),
-            "世代号不一致(旧世代迟到的事件),不该被当成当前世代的"
+            body.contains("self.tabs.by_generation("),
+            "PaneOpenErr 分支没按世代查属主标签 —— 要么旧世代的失败提示会弹到\
+             当前连接头上,要么后台标签的失败会被活动标签的世代误判成过期吞掉"
         );
     }
 
-    /// **接线守护**:`accept_automation_done` 必须真的调 `generation_matches`。
+    /// **接线守护**:`accept_automation_done` 必须真的按世代过滤。
     ///
-    /// 上面那条测试只锁住了 `generation_matches` 这个 helper 本身;把
-    /// `accept_automation_done` 里的过滤整段删掉,全量测试依然全绿 —— 说明
-    /// 「这个函数有没有用上那个判据」是无人守护的。而这正是它存在的全部理由:
-    /// 高延迟链路下用户完全可能在自动化还在跑时断开重连,旧世代的
+    /// 把 `accept_automation_done` 里的过滤整段删掉,全量测试依然全绿 ——
+    /// 说明「这个函数有没有用上世代判据」是无人守护的。而这正是它存在的全部
+    /// 理由:高延迟链路下用户完全可能在自动化还在跑时断开重连,旧世代的
     /// 「自动化已中止:连接已断开」落到新连接的状态栏上,是一条与当前连接
     /// 毫不相干的误导信息。
     ///
+    /// S1(D0):判据同 `PaneOpenErr`,从"跟活动 ws 的世代比"换成"按世代查
+    /// 属主标签"——后台标签的自动化结论要落回**它自己那个标签**的状态栏,
+    /// 拿活动标签去比会把它丢掉。
+    ///
     /// **扎的是源码结构而非运行时行为**,这是刻意的:`App` 要
     /// `EventLoopProxy` 才能构造,单测里造不出来。验证边界:它只挡得住
-    /// 「函数体里没有 generation_matches」这一种写法,挡不住有人换个同义
-    /// 判据或把过滤写成永真。
+    /// 「函数体里没按世代查标签」这一种写法,挡不住有人换个同义判据或把过滤
+    /// 写成永真。
     ///
     /// 自证会变红:把 `accept_automation_done` 里的世代校验整段删掉。
     #[test]
@@ -3044,7 +3308,7 @@ mod tests {
             .find("\n    }\n")
             .expect("找不到 accept_automation_done 的函数结尾")];
         assert!(
-            body.contains("generation_matches"),
+            body.contains(".by_generation_mut(generation)"),
             "accept_automation_done 里没有世代过滤 —— 旧连接迟到的自动化结论\
              会覆盖新连接的状态栏,给用户看一条与当前连接毫不相干的信息"
         );
@@ -3110,21 +3374,228 @@ mod tests {
         );
     }
 
-    /// **接线守护**:「断开连接」必须把自动化 task abort 掉。
+    /// **接线守护 / T8**:标签快捷键必须在输入分流**之前**被截走。
     ///
-    /// 自动化 task 也持有一份 `Arc<SshSession>`。只把 `self.ws` 置 `None`
-    /// 的话,`SshSession` 的 `cmd_tx` 仍有活着的克隆,`io_task` 不会收口 ——
-    /// 用户点了「断开」、UI 回到 launcher 态,预配置的命令却还在往一条没真正
-    /// 断开的 channel 上发,用户既看不到也拦不住。`drive_automation` 补不了
-    /// 这条边:它在 `self.ws` 为 `None` 时直接 return。
+    /// 两条失效模式各挡一半,都得靠「在分流之前」这一个位置:
+    /// 1. **别喂 egui**(T8):`Ctrl+Tab` 里带着 Tab,egui 的焦点系统在
+    ///    `begin_pass` 里扫原始事件,看到 Tab 就把焦点给菜单栏第一个按钮,此后
+    ///    `wants_keyboard_input()` 恒 true,终端**永久**收不到任何键。
+    /// 2. **别编码进 PTY**:下面那个 `KeyboardInput` 分支会 `encode_key` 往
+    ///    channel 写,`Ctrl+W` 就会在切标签的同时把远端 shell 的前一个词删掉。
+    ///
+    /// 判定本身(含模态闸门)在 `shell::tabs::hotkey`,有真行为测试;这里扎的是
+    /// **调用位置**,只有源码结构能表达 —— `App` 要 `EventLoopProxy` 才能构造。
+    /// 验证边界:只挡得住「调用点跑到分流之后 / 整个没调」,挡不住有人在
+    /// `tab_hotkey_event` 里返回恒 false。
+    ///
+    /// 自证会变红:把 `window_event` 开头那句 `if self.tab_hotkey_event(&event)`
+    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
+    #[test]
+    fn tab_shortcuts_are_swallowed_before_the_input_routing() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn window_event(")
+            .nth(1)
+            .expect("找不到 window_event 的定义");
+        let hotkey = after
+            .find("self.tab_hotkey_event(&event)")
+            .expect("window_event 里没调 tab_hotkey_event —— 标签快捷键会被喂给 egui(Tab 抢焦点,T8),还会被编码进 PTY(Ctrl+W 删远端的词)");
+        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
+        assert!(
+            hotkey < routing,
+            "tab_hotkey_event 排在了输入分流之后 —— 排在后面等于没截:\
+             Ctrl+Tab 里的 Tab 已经被喂给 egui 的焦点系统了"
+        );
+    }
+
+    /// **T4 / S3**:标签栏吃掉的那点高度必须一路走到 `window_change`。
+    ///
+    /// 标签栏是 F36 引入的第三条常驻横条,中央区因此矮了 `tab_bar_px()` 逻辑点。
+    /// 这条链是 `central_px` → `layout_geometry` → `apply_geometry` →
+    /// `pty.resize`。**断在任何一环的现象都一样**:tmux 里的 TUI 按旧行数排版,
+    /// 全屏应用最后一行被标签栏盖住、或者整屏错位(T4)。
+    ///
+    /// 这里跑的是真 `Workspace` + 记录型 PTY,不是源码结构守护。
+    ///
+    /// 自证会变红:把 `tab_bar_px()` 改成返回 0.0(中央区不变矮 → 行数不变 →
+    /// 不发 window_change)。
+    #[test]
+    fn tab_bar_height_reaches_the_remote_as_a_window_change() {
+        use crate::shell::workspace::{layout_geometry, PtyWriter, PxRect};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingPty(Arc<Mutex<Vec<(u16, u16)>>>);
+        impl PtyWriter for RecordingPty {
+            fn write(&self, _bytes: Vec<u8>) -> Result<(), mullion_ssh::session::TrySendErr> {
+                Ok(())
+            }
+            fn resize(&self, cols: u16, rows: u16) -> Result<(), mullion_ssh::session::TrySendErr> {
+                self.0.lock().unwrap().push((cols, rows));
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut ws = Workspace::new(
+            crate::shell::workspace::PaneState {
+                id: PaneId(1),
+                host_ix: 0,
+                emulator: mullion_term::emulator::Emulator::new(80, 24),
+                pty: Box::new(RecordingPty(seen.clone())),
+                rx,
+                pacer: crate::render::SyncFramePacer::new(),
+                status: crate::shell::workspace::PaneStatus::Live,
+                saw_first_byte: false,
+                // 不可能的初值:第一次 apply_geometry 必然发一次,基线由它建立。
+                last_grid: (0, 0),
+            },
+            0,
+        );
+        let cell = (10.0f32, 20.0f32);
+        // ppp = 1,所以逻辑点即像素。
+        let full = PxRect {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 900,
+        };
+        let shrunk = PxRect {
+            h: full.h - crate::ui::chrome::tab_bar_px() as u32,
+            ..full
+        };
+        let tree = ws.tree().clone();
+
+        ws.apply_geometry(&layout_geometry(&tree, full, cell, false));
+        let before = *seen.lock().unwrap().last().expect("第一次必然发一次");
+        seen.lock().unwrap().clear();
+
+        ws.apply_geometry(&layout_geometry(&tree, shrunk, cell, false));
+        let after = seen.lock().unwrap().clone();
+        assert_eq!(
+            after.len(),
+            1,
+            "标签栏出现后中央区矮了 {} 点,必须恰好发一次 window_change(发 0 次 = \
+             远端仍按旧行数排版,最后一行被标签栏盖住;发多次 = 每帧都在发)",
+            crate::ui::chrome::tab_bar_px()
+        );
+        assert!(
+            after[0].1 < before.1,
+            "标签栏占了高度,新行数 {} 却没比原来的 {} 少",
+            after[0].1,
+            before.1
+        );
+    }
+
+    /// **spec F36 验收标准的另一半**:切换标签的代码路径里不许有任何建连调用。
+    ///
+    /// 行为那一半在 `shell::tabs::tests::switching_tabs_does_not_touch_the_ssh_connections`
+    /// (切换只动下标、`Arc` 计数与指针都不变)。这条守的是**接线**:切换分支
+    /// 里但凡混进一句 `spawn_connect`,高延迟代理链路上每切一次标签就要重新握手
+    /// 好几秒 —— F36 的产品价值当场归零,而且只有真机才看得出来。
+    ///
+    /// **扎的是源码结构而非运行时行为**:`App` 要 `EventLoopProxy` 才能构造。
+    /// 验证边界:只挡得住「切换分支里出现 `spawn_connect`」这一种写法。
+    ///
+    /// 自证会变红:在 `TabAction::Switch` 或 `tab_hotkey_event` 的
+    /// `Intent::Next` 分支里加一句 `self.spawn_connect(...)`。
+    #[test]
+    fn tab_switching_never_reconnects() {
+        let src = include_str!("app.rs");
+        // 快捷键那条路:`tab_hotkey_event` 整个函数体。
+        let hot = src
+            .split("fn tab_hotkey_event")
+            .nth(1)
+            .expect("找不到 tab_hotkey_event");
+        let hot_body = &hot[..hot
+            .find("\n    }\n")
+            .expect("找不到 tab_hotkey_event 的函数结尾")];
+        assert!(
+            !hot_body.contains("spawn_connect"),
+            "标签快捷键路径里出现了建连调用 —— 切一下标签就重连一次"
+        );
+        // 鼠标那条路:`actions.tab` 那个 match。
+        let click = src
+            .split("match actions.tab {")
+            .nth(1)
+            .expect("找不到标签栏动作的 match");
+        let click_body = &click[..click
+            .find("\n                            }\n")
+            .expect("找不到标签栏动作 match 的结尾")];
+        assert!(
+            !click_body.contains("spawn_connect"),
+            "标签栏点击路径里出现了建连调用 —— 切一下标签就重连一次"
+        );
+        assert!(
+            click_body.contains("switch_to_index"),
+            "标签栏点击路径里没有切换调用,上面那条断言是空跑"
+        );
+    }
+
+    /// **接线守护 / Task 5**:`ConnectOk` 必须**开新标签**,不许再顶掉活动标签。
+    ///
+    /// Task 2 的过渡实现是 `close_active()` + `open()`(单标签下与迁移前逐帧
+    /// 等价)。留着它的后果是「在 A 上连 B,A 那条连接被静默掐掉」—— 而用户
+    /// 的心智模型是「多开一个」。
+    ///
+    /// 自证会变红:在 `ConnectOk` 的 `self.tabs.open(` 之前加回
+    /// `let replaced = self.tabs.close_active();`。
+    #[test]
+    fn connecting_opens_a_new_tab_instead_of_replacing_the_active_one() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("UserEvent::ConnectOk { ssh, rx, handle } => {")
+            .nth(1)
+            .expect("找不到 ConnectOk 的事件分支");
+        let body = &after[..after
+            .find("\n            }\n")
+            .expect("找不到 ConnectOk 分支的结尾")];
+        assert!(body.contains("self.tabs.open("), "ConnectOk 里没有开新标签");
+        assert!(
+            !body.contains("close_active"),
+            "ConnectOk 里还在顶掉活动标签 —— 在 A 上连 B 会把 A 那条连接静默掐掉"
+        );
+    }
+
+    /// **接线守护 / Task 6**:「退出」必须逐个走收口,不靠进程退出兜底。
+    ///
+    /// `event_loop.exit()` 之后还要跑完本轮事件,析构顺序也不由我们定;自动化
+    /// task 持着 `Arc<SshSession>`,不显式 abort 就可能在退出途中继续往一条
+    /// 正在拆的 channel 上发命令。
+    ///
+    /// 自证会变红:把退出分支里的 `for tab in self.tabs.drain()` 那三行删掉。
+    #[test]
+    fn quitting_winds_down_every_tab() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("if self.ui.request_quit {")
+            .nth(1)
+            .expect("找不到退出的分支");
+        let body = &after[..after
+            .find("\n                            }\n")
+            .expect("找不到退出分支的结尾")];
+        assert!(
+            body.contains("self.tabs.drain()") && body.contains("wind_down("),
+            "退出时没有逐个收口 —— 自动化 task 会在退出途中继续往正在拆的 \
+             channel 上发命令"
+        );
+    }
+
+    /// **接线守护(上半)**:「断开连接」必须走关标签的收口路径。
+    ///
+    /// D0 之前这条守护直接盯断开分支里的 `abort()`;标签化之后收口挪进了
+    /// `wind_down`,所以拆成两条:这条钉「断开分支确实调了收口入口」,下一条
+    /// 钉「那个收口入口确实 abort」。两条都在,断开→abort 这条链才算无缺口。
     ///
     /// **扎的是源码结构而非运行时行为**:`App` 要 `EventLoopProxy` 才能构造,
-    /// 单测里造不出来。验证边界:只挡得住「断开分支里没有 abort」这一种写法,
-    /// 挡不住有人把 abort 写在够不到的分支里。
+    /// 单测里造不出来。验证边界:只挡得住「断开分支里没调 close_active_tab」
+    /// 这一种写法,挡不住有人另写一个不收口的同义函数。
     ///
-    /// 自证会变红:把断开分支里的 `h.task.abort()` 那三行删掉。
+    /// 自证会变红:把断开分支里的 `self.close_active_tab();` 换成
+    /// `self.tabs.close_active();`(丢弃返回值 = 不收口)。
     #[test]
-    fn disconnect_aborts_the_automation_task() {
+    fn disconnect_goes_through_the_tab_wind_down_path() {
         let src = include_str!("app.rs");
         let after = src
             .split("if self.ui.request_disconnect {")
@@ -3134,9 +3605,36 @@ mod tests {
             .find("\n                            }\n")
             .expect("找不到断开连接分支的结尾")];
         assert!(
-            body.contains("self.automation.take()") && body.contains("abort()"),
-            "断开连接时没有 abort 自动化 task —— 它持有的那份 Arc<SshSession> \
-             会让底层 io_task 不收口,断开后预配置的命令还在继续发"
+            body.contains("self.close_active_tab();"),
+            "断开连接没走 close_active_tab —— 收口(abort 自动化 + drop pane)\
+             全在那条路径上,绕过它等于断开后 io_task 不收口"
+        );
+    }
+
+    /// **接线守护(下半)**:关标签的收口必须把自动化 task abort 掉。
+    ///
+    /// 自动化 task 也持有一份 `Arc<SshSession>`。只 drop 掉 `Workspace` 的话,
+    /// `SshSession` 的 `cmd_tx` 仍有活着的克隆,`io_task` 不会收口 —— 用户点了
+    /// 「断开」、标签已从 UI 上消失,预配置的命令却还在往一条没真正断开的
+    /// channel 上发,用户既看不到也拦不住。`drive_automation` 补不了这条边:
+    /// 标签一旦从 `self.tabs` 里摘掉,它就再也遍历不到了。
+    ///
+    /// **扎的是源码结构而非运行时行为**,理由同上半条。验证边界:只挡得住
+    /// 「`wind_down` 里没有 abort」这一种写法。
+    ///
+    /// 自证会变红:把 `wind_down` 里的 `h.task.abort();` 删掉。
+    #[test]
+    fn closing_a_tab_aborts_its_automation_task() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn wind_down(")
+            .nth(1)
+            .expect("找不到 wind_down 的定义");
+        let body = &after[..after.find("\n}\n").expect("找不到 wind_down 的函数结尾")];
+        assert!(
+            body.contains("abort()"),
+            "wind_down 没 abort 自动化 task —— 它持有的那份 Arc<SshSession> \
+             会让底层 io_task 不收口,关掉标签后预配置的命令还在继续发"
         );
     }
 

@@ -551,6 +551,7 @@ pub(crate) fn appearance(
             Some(spec) => {
                 for (target, label) in [
                     (ColorTarget::ListItem, "会话列表"),
+                    (ColorTarget::Tab, "标签页"),
                     (ColorTarget::PaneTitle, "pane 标题条"),
                     (ColorTarget::StatusBar, "状态栏"),
                 ] {

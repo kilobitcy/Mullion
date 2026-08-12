@@ -171,9 +171,10 @@ pub(crate) fn is_dirty(buf: &EditorBuffer, baseline: &EditorBuffer) -> bool {
 
 /// 勾选 / 取消一个颜色落点。
 ///
-/// **只增删指定的那一个**：编辑器只展示会话列表 / pane 标题条 / 状态栏三个
-/// 勾选框，而 `apply_to` 里可能还有 `ColorTarget::Tab`（F36 标签页排在 v0.5，
-/// UI 上没有对应勾选框）。按「勾了什么存什么」重建整个列表会把它静默剥掉。
+/// **只增删指定的那一个**：`apply_to` 里可能有编辑器当下没展示勾选框的落点
+/// （`ColorTarget` 是 store schema 的一部分，加落点和加勾选框是两笔改动，中间
+/// 必然存在只有前者的版本；旧配置文件里也可能存着更新版本写下的落点）。按
+/// 「勾了什么存什么」重建整个列表，会把这些落点静默剥掉，而用户完全看不出。
 pub(crate) fn set_color_target(
     spec: &mut mullion_store::ColorSpec,
     target: mullion_store::ColorTarget,
@@ -1506,10 +1507,13 @@ mod tests {
 
     /// F62:勾选框只增删**指定的那一个**落点。
     ///
-    /// 编辑器只展示会话列表 / pane 标题条 / 状态栏三个勾选框,但 `apply_to`
-    /// 里可能还有 `ColorTarget::Tab`(F36 标签页,排在 v0.5,UI 上没有对应
-    /// 勾选框)。如果按「勾了什么存什么」重建整个 `apply_to`,用户随便改一下
-    /// 勾选、保存,那个 `Tab` 就被静默剥掉了 —— 而且用户完全看不出发生了什么。
+    /// `apply_to` 里可能有编辑器当下没展示勾选框的落点(`ColorTarget` 是 store
+    /// schema 的一部分,加落点和加勾选框是两笔改动;旧配置文件里也可能存着更新
+    /// 版本写下的落点)。如果按「勾了什么存什么」重建整个 `apply_to`,用户随便
+    /// 改一下勾选、保存,那些落点就被静默剥掉了 —— 而且用户完全看不出。
+    ///
+    /// 这里拿 `Tab` 当样本(F36 落地后它已经有勾选框了,但这条测试**不动别的
+    /// 落点**,断言的是「操作 A 不该影响 B」这条不变量,与 UI 展示了哪几个无关)。
     #[test]
     fn set_color_target_preserves_targets_the_ui_does_not_show() {
         let mut spec = ColorSpec {

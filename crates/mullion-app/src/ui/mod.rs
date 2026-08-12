@@ -306,6 +306,8 @@ pub struct UiFrame<'a> {
     /// F61/F62:已解析的会话外观。**必须是缓存**——`inherit::resolve` 不得进
     /// 渲染热路径(陷阱 T3),见 `badge::AppearanceCache` 的文档注释。
     pub appearance: &'a badge::AppearanceCache,
+    /// F36:标签栏这一帧要画的标签。空 = launcher 态(栏还是画,只有 `+`)。
+    pub tabs: &'a [chrome::TabView<'a>],
 }
 
 /// 用户这一帧在 UI 上做的、需要 app 事后施加的布局动作。
@@ -320,6 +322,8 @@ pub struct UiActions {
     pub preset: Option<crate::shell::workspace::Preset>,
     /// 点了某个 pane 标题条上的 ×。
     pub close_pane: Option<mullion_core::layout::PaneId>,
+    /// F36:点了标签栏(切换 / 关闭 / `+`)。
+    pub tab: Option<chrome::TabAction>,
     /// F100:标注模式导出的 Markdown,等着送剪贴板。
     ///
     /// 走 `UiActions` 而不是让 `annotate` 自己写剪贴板:剪贴板是 IO,而
@@ -348,6 +352,9 @@ pub fn build_ui(
     }
     // 布局按钮组画在菜单栏那一行里(F82),所以点中的预设由 top_menu 返回。
     actions.preset = chrome::top_menu(ctx, t, ui_state, frame.connected, frame.preset);
+    // S3:标签栏排在菜单栏之后、状态栏之前 show —— `TopBottomPanel` 按 show 的
+    // 先后从窗口边缘往里堆,顺序就是视觉上的上下顺序。
+    actions.tab = chrome::tab_bar(ctx, t, frame.tabs);
     // F115:分母是**配置了多少条**,不是启动了多少条 —— 见
     // `tunnels::indicator`。这里现算而不是再往 `UiFrame` 加一个字段:
     // 输入就在手边、纯函数、隧道条数是个位数,不构成陷阱 T3 那类每帧重算。
@@ -587,6 +594,7 @@ mod tests {
             panes: 1,
             preset: None,
             titles: &[],
+            tabs: &[],
             host_key: None,
             paste: None,
             secret_presence: session_manager::SecretPresence::default(),
