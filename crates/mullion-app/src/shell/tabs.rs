@@ -132,6 +132,27 @@ impl<C> Tabs<C> {
         Some(gone)
     }
 
+    /// F37:**就地**把 `id` 那个标签换成新内容,把旧的交还给调用方收口。
+    /// `None` = 没有这个 id(它在拨号期间被关掉了)。
+    ///
+    /// 位置与活动下标都不动 —— 「重连」的语义是「这个标签活过来了」,
+    /// 不是「关掉它再开一个新的」:后者会让标签跳到最右边,而用户可能
+    /// 正在别的标签上工作,焦点被抢走。
+    ///
+    /// `id` 不变:任何缓存了这个 `TabId` 的地方(比如同一帧里的
+    /// `UiActions::reconnect_tab`)仍然指得对。
+    pub fn replace(&mut self, id: TabId, title: String, content: C) -> Option<Tab<C>> {
+        let ix = self.tabs.iter().position(|t| t.id == id)?;
+        let session_id = self.tabs[ix].session_id;
+        let fresh = Tab {
+            id,
+            title,
+            session_id,
+            content,
+        };
+        Some(std::mem::replace(&mut self.tabs[ix], fresh))
+    }
+
     pub fn close_active(&mut self) -> Option<Tab<C>> {
         if self.tabs.is_empty() {
             return None;
@@ -265,6 +286,48 @@ mod tests {
         fn generation(&self) -> u64 {
             self.0
         }
+    }
+
+    /// F37:`replace` 就地换内容 —— 位置、身份、活动下标全不动。
+    ///
+    /// 故意**不在活动标签上**做替换(活动是 2,替换的是 0):
+    /// 「换掉的正好是活动那个」会让一份「其实是关掉再新开」的错误实现
+    /// 也看起来正常(新开的会成为活动标签,恰好还是它)。
+    ///
+    /// 自证会变红:把 `replace` 改成 `close(ix)` + `open(..)`。
+    #[test]
+    fn replace_swaps_the_content_in_place_without_moving_anything() {
+        let mut t = tabs_of(3);
+        t.switch_to_index(2);
+        let target = t.get(0).expect("有三个标签").id;
+        let old = t
+            .replace(target, "重连后".into(), Fake(999))
+            .expect("这个 id 在表里");
+        assert_eq!(
+            old.content.generation(),
+            100,
+            "交还的应该是被换掉的那个旧内容"
+        );
+        assert_eq!(t.len(), 3, "标签数不该变");
+        assert_eq!(t.active_index(), 2, "活动标签被抢走了 —— 用户正在看的那个");
+        let now = t.get(0).expect("还在原位");
+        assert_eq!(
+            now.id, target,
+            "身份变了 —— 缓存了这个 TabId 的地方全会指错"
+        );
+        assert_eq!(now.title, "重连后");
+        assert_eq!(now.content.generation(), 999);
+    }
+
+    /// 拨号期间用户把这个标签关掉了 —— `replace` 必须报 `None`,不能顺手
+    /// 开一个新的:用户明确关掉了它,连上之后又自己冒出来是最糟的表现。
+    #[test]
+    fn replacing_a_tab_that_is_already_gone_creates_nothing() {
+        let mut t = tabs_of(2);
+        let gone = t.get(1).expect("有两个").id;
+        t.close(1);
+        assert!(t.replace(gone, "x".into(), Fake(999)).is_none());
+        assert_eq!(t.len(), 1, "replace 不该凭空造出标签");
     }
 
     /// 开 `n` 个标签,世代号依次为 `100, 101, …`(与下标错开,免得测试里

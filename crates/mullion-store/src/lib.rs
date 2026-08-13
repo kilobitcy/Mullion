@@ -8,6 +8,7 @@ pub mod group;
 pub mod inherit;
 pub mod jump;
 pub mod known_hosts;
+pub mod layout;
 pub mod master_key;
 pub mod migrate;
 pub mod model;
@@ -23,6 +24,10 @@ pub use error::StoreError;
 pub use group::GroupRecord;
 pub use inherit::{resolve, PrefsLayer, ResolvedConfig, DEFAULT_SCROLLBACK};
 pub use known_hosts::{HostKeyEntry, KnownHostsFile};
+pub use layout::{
+    SavedDir, SavedLayout, SavedNodeEntry, SavedTab, SavedTabKind, SavedWindow,
+    CURRENT_LAYOUT_SCHEMA,
+};
 pub use master_key::{InMemoryKey, KeyringSource, MasterKeySource};
 pub use migrate::{migrate_v1, SchemaProbe};
 pub use model::{

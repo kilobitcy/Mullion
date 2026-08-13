@@ -20,12 +20,15 @@ fn menu_px() -> f32 {
 }
 
 /// 画菜单栏。返回用户这一帧在居中按钮组上点中的布局预设(F82)。
+/// `restored` = 当前有几个恢复出来的占位标签(F37)。0 时「全部重连」禁用 ——
+/// 灰着比藏起来好:菜单项时有时无,用户下次找不到它在哪一条下面。
 pub fn top_menu(
     ctx: &egui::Context,
     t: &Theme,
     ui_state: &mut UiState,
     connected: bool,
     preset: Option<Preset>,
+    restored: usize,
 ) -> Option<Preset> {
     // 菜单栏与状态栏底色不同(§2.1),Visuals::panel_fill 只有一个值,
     // 所以各自带 Frame。
@@ -54,6 +57,17 @@ pub fn top_menu(
                         .clicked()
                     {
                         ui_state.request_disconnect = true;
+                        ui.close_menu();
+                    }
+                    // F37:恢复出来的占位标签是「一个一个点重连」的(设计 §1
+                    // 否掉了启动即自动重连)。这条是给「确实想把上次那摊全捡
+                    // 回来」的用户的批量入口 —— 由用户主动按下,不是开机就跑,
+                    // 所以不违背那三条理由。
+                    if ui
+                        .add_enabled(restored > 0, egui::Button::new("全部重连"))
+                        .clicked()
+                    {
+                        ui_state.reconnect_all_request = true;
                         ui.close_menu();
                     }
                     if ui.button("退出").clicked() {
@@ -516,7 +530,14 @@ mod tests {
         // 同 `run_status`:面板首帧 `fade_in`,跑两帧再取。
         for _ in 0..2 {
             let _ = ctx.run(Default::default(), |ctx| {
-                top_menu(ctx, &crate::theme::MULLION_DARK, &mut ui_state, true, None);
+                top_menu(
+                    ctx,
+                    &crate::theme::MULLION_DARK,
+                    &mut ui_state,
+                    true,
+                    None,
+                    0,
+                );
                 status_bar(
                     ctx,
                     &crate::theme::MULLION_DARK,

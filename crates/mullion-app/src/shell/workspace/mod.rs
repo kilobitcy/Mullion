@@ -217,6 +217,41 @@ impl Workspace {
         fresh
     }
 
+    /// 按 `layout.toml` 里存的树形状恢复分屏(F37,设计 E10)。语义与
+    /// [`Workspace::apply_preset`] 完全一致:返回**待新建**的 pane id,
+    /// 调用方为每个 id 发起 `open_pty`,完成后调 [`Workspace::attach_pane`]。
+    ///
+    /// 恢复的是**形状与比例**,pane 里的内容一律是新的 —— 终端 scrollback
+    /// 从不落盘(设计 E2)。
+    ///
+    /// `None` = 树编码损坏,**什么都不动**。校验放在任何 mutation 之前:
+    /// 中途失败会留下一个树与 `panes` 对不上的工作区,那比不恢复糟得多。
+    pub fn apply_saved_tree(
+        &mut self,
+        entries: &[mullion_store::SavedNodeEntry],
+        focus_leaf: usize,
+    ) -> Option<Vec<PaneId>> {
+        use crate::shell::layout_snapshot as snap;
+        // 先验后改。`leaf_count` 通过就意味着下面的 `from_entries` 一定能拼出来
+        // (结构完整 + id 数与叶子数相等,是它仅有的两个失败条件)。
+        let want = snap::leaf_count(entries)?;
+        let plan = preset::plan_for_count(want, &self.statuses());
+        for id in &plan.close {
+            self.panes.retain(|p| p.id != *id);
+        }
+        let mut ids = plan.keep;
+        let mut fresh = Vec::new();
+        for _ in 0..plan.spawn {
+            let id = self.alloc_id();
+            ids.push(id);
+            fresh.push(id);
+        }
+        self.tree = snap::from_entries(entries, &ids)
+            .expect("leaf_count 已经验过结构,这里拼不出来说明两者的判据走样了");
+        self.focus = ids[snap::sane_focus_leaf(focus_leaf, ids.len())];
+        Some(fresh)
+    }
+
     /// 异步 `open_pty` 完成后把 pane 挂进来(id 由 [`Workspace::apply_preset`] 预分配)。
     pub fn attach_pane(&mut self, pane: PaneState) {
         self.next_id = self.next_id.max(pane.id.0 + 1);
@@ -654,6 +689,78 @@ mod tests {
             "树上必须先有 4 个叶子,新 pane 还在连的时候画占位"
         );
         assert!(!fresh.contains(&PaneId(1)), "已有 pane 不该被重开");
+    }
+
+    /// F37/E10:刚连上的工作区只有 1 个 pane,按存下来的树恢复出 3 屏。
+    ///
+    /// 断言的是「形状与比例逐字段回来」,不是「叶子数对」—— 叶子数对而
+    /// 方向/比例错,用户看到的是一个他从没摆过的布局,却又说不上哪里不对。
+    #[test]
+    fn apply_saved_tree_rebuilds_the_exact_shape_and_reports_the_ids_to_open() {
+        use mullion_store::{SavedDir, SavedNodeEntry};
+        let (mut ws, _p) = ws_with(1);
+        // H0.25(L, V0.75(L, L))
+        let entries = [
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.25),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::split(SavedDir::Vertical, 0.75),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::leaf(),
+        ];
+        let fresh = ws.apply_saved_tree(&entries, 2).expect("编码是好的");
+        assert_eq!(fresh.len(), 2, "1 屏 → 3 屏要新开 2 条 channel");
+        assert!(!fresh.contains(&PaneId(1)), "已有 pane 不该被重开");
+
+        let leaves = mullion_core::layout::leaves(ws.tree());
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0], PaneId(1), "已有 pane 填第一个叶子位");
+        let Node::Split { dir, ratio, b, .. } = ws.tree() else {
+            panic!("根该是一个分割节点");
+        };
+        assert_eq!(*dir, Dir::Horizontal);
+        assert_eq!(*ratio, 0.25, "比例是用户拖出来的,不能回落成 0.5");
+        let Node::Split {
+            dir: inner_dir,
+            ratio: inner_ratio,
+            ..
+        } = b.as_ref()
+        else {
+            panic!("右子树该是一个分割节点");
+        };
+        assert_eq!(*inner_dir, Dir::Vertical, "嵌套那层的方向也得对");
+        assert_eq!(*inner_ratio, 0.75);
+
+        assert_eq!(ws.focus(), leaves[2], "焦点该落在存下来的那个叶子上");
+    }
+
+    /// 树编码坏了 → **什么都不动**。中途失败会留下一个树与 `panes` 对不上的
+    /// 工作区,那比不恢复糟得多(渲染层按树画,画到一个没有 `PaneState` 的
+    /// 叶子上就是一块永远空着的 pane)。
+    #[test]
+    fn apply_saved_tree_leaves_the_workspace_untouched_when_the_encoding_is_corrupt() {
+        use mullion_store::{SavedDir, SavedNodeEntry};
+        let (mut ws, _p) = ws_with(2);
+        ws.set_focus(PaneId(2));
+        let before = ws.tree().clone();
+        // 分割节点少了一棵子树。
+        let broken = [
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf(),
+        ];
+        assert!(ws.apply_saved_tree(&broken, 0).is_none());
+        assert_eq!(ws.tree(), &before, "树被动过了");
+        assert_eq!(ws.pane_count(), 2, "pane 被动过了");
+        assert_eq!(ws.focus(), PaneId(2), "焦点被动过了");
+    }
+
+    /// 焦点叶子序号越界(文件被手改、或树被改小了)→ 落回第一个叶子,
+    /// 不 panic、不留在一个不存在的 pane 上。
+    #[test]
+    fn apply_saved_tree_clamps_an_out_of_range_focus_leaf() {
+        use mullion_store::SavedNodeEntry;
+        let (mut ws, _p) = ws_with(1);
+        ws.apply_saved_tree(&[SavedNodeEntry::leaf()], 7).unwrap();
+        assert_eq!(ws.focus(), PaneId(1));
     }
 
     #[test]

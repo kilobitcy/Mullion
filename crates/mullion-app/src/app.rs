@@ -12,6 +12,7 @@ use mullion_ssh::config::SshConfig;
 use mullion_ssh::known_hosts::HostKeyPolicy;
 use mullion_ssh::session::{SshConnection, SshSession};
 use mullion_store::known_hosts::KnownHostsFile;
+use mullion_store::SessionId;
 use mullion_term::keymap::{Key, WheelAction};
 use mullion_term::Scroll;
 use tokio::runtime::Runtime;
@@ -313,6 +314,48 @@ struct FilesTab {
     sftp_default_remote: Option<String>,
 }
 
+/// F37:从 `layout.toml` 恢复出来的**占位标签** —— 一条连接都没建。
+///
+/// 上次关窗时开着的标签,这次启动只摆回骨架(设计 §1 拍板:恢复骨架 + 手动
+/// 重连)。它没有 `Workspace`、没有 sftp channel、没有自动化,所以
+/// `wind_down` 对它无事可做 —— 但那条 match **仍必须给它一条具名分支**,
+/// 见 `wind_down` 的文档。
+///
+/// 用户按「重连」后走 `spawn_connect`(与会话管理器双击同一条路径),
+/// `ConnectOk` 抵达时**就地**把这个标签替换成真的 `Terminal`/`Files`。
+struct RestoredTab {
+    /// 上次这个标签连的是哪条会话。重连时拿它去 `ssh_config_for`。
+    session_id: SessionId,
+    /// 上次的分屏树(扁平前序编码,见 `mullion_store::layout`)。重连成功后
+    /// 交给 `Workspace::apply_saved_tree` 摆回形状。
+    tree: Vec<mullion_store::SavedNodeEntry>,
+    /// 上次的焦点落在第几个叶子(前序序号)。
+    focus_leaf: usize,
+    /// S1 路由键。号段同 `FilesTab::generation` —— 来自
+    /// `App::next_ws_generation`,与所有标签共用一个计数器保证全局唯一。
+    ///
+    /// **占位标签也要有世代号**:它是 `Tabs<TabContent>` 的成员,
+    /// `TabPayload::generation` 是全表遍历比对的,给它一个撞号的值(比如恒 0)
+    /// 会让迟到事件路由到错误的标签上。
+    generation: u64,
+    /// 上次它是个 SFTP 节点标签(`SavedTabKind::Files`)。重连时据此决定
+    /// 建 `Files` 标签还是 `Terminal` 标签。
+    wants_sftp: bool,
+    /// 已经点过重连、正在拨号。按钮据此禁用(见 `ui::restored`)。
+    dialing: bool,
+}
+
+/// F37:一次「占位标签重连」在途期间要记住的东西(E9)。
+struct PendingRestore {
+    /// 连上之后**就地替换**的是这个标签,不是「当前活动标签」——
+    /// 拨号要几百毫秒,期间用户完全可能切到别的标签去。
+    tab_id: shell::tabs::TabId,
+    /// 上次的分屏树(扁平前序编码)。
+    tree: Vec<mullion_store::SavedNodeEntry>,
+    /// 上次焦点落在第几个叶子。
+    focus_leaf: usize,
+}
+
 /// 标签装的东西。
 ///
 /// `Terminal` 装箱(`Box<TerminalTab>`)是 clippy `large_enum_variant` 逼的:
@@ -326,6 +369,9 @@ enum TabContent {
     /// `FilesTab` 比裸大小差一截,两个变体都不装箱时枚举按最大的算,
     /// 只装一个又会让另一个变成新的「最大」,clippy 还是会响。
     Files(Box<FilesTab>),
+    /// F37:恢复出来的占位标签。**不装箱** —— `RestoredTab` 只有几个标量加
+    /// 一个 `Vec`,比另外两个变体小得多,装箱只会多一次堆分配。
+    Restored(RestoredTab),
 }
 
 impl TabPayload for TabContent {
@@ -333,6 +379,7 @@ impl TabPayload for TabContent {
         match self {
             TabContent::Terminal(t) => t.ws.generation(),
             TabContent::Files(f) => f.generation,
+            TabContent::Restored(r) => r.generation,
         }
     }
 }
@@ -341,30 +388,36 @@ impl TabContent {
     fn as_terminal(&self) -> Option<&TerminalTab> {
         match self {
             TabContent::Terminal(t) => Some(t.as_ref()),
-            TabContent::Files(_) => None,
+            TabContent::Files(_) | TabContent::Restored(_) => None,
         }
     }
 
     fn as_terminal_mut(&mut self) -> Option<&mut TerminalTab> {
         match self {
             TabContent::Terminal(t) => Some(t.as_mut()),
-            TabContent::Files(_) => None,
+            TabContent::Files(_) | TabContent::Restored(_) => None,
         }
     }
 
-    /// D1:两个变体都恒有一份面板运行态,不像 `as_terminal` 那样要 `Option`——
-    /// 调用方(F50 的文件动作路由)不必再判一次「这个标签到底是哪种」。
-    fn files_panel(&self) -> &crate::ui::files_panel::PanelFrame {
+    /// D1:连着的两个变体各有一份面板运行态。
+    ///
+    /// F37 起要 `Option` —— 占位标签(`Restored`)连都没连,给它一份面板
+    /// 运行态就是凭空造一个「远端目录」出来。**不给它一个空 `PanelFrame`
+    /// 兜底**:那样的话「对着没连接的标签发起了一次文件操作」会静默变成
+    /// 「对着一份空状态操作」,现象是点了没反应,没有任何地方报错。
+    fn files_panel(&self) -> Option<&crate::ui::files_panel::PanelFrame> {
         match self {
-            TabContent::Terminal(t) => &t.files,
-            TabContent::Files(f) => &f.files,
+            TabContent::Terminal(t) => Some(&t.files),
+            TabContent::Files(f) => Some(&f.files),
+            TabContent::Restored(_) => None,
         }
     }
 
-    fn files_panel_mut(&mut self) -> &mut crate::ui::files_panel::PanelFrame {
+    fn files_panel_mut(&mut self) -> Option<&mut crate::ui::files_panel::PanelFrame> {
         match self {
-            TabContent::Terminal(t) => &mut t.files,
-            TabContent::Files(f) => &mut f.files,
+            TabContent::Terminal(t) => Some(&mut t.files),
+            TabContent::Files(f) => Some(&mut f.files),
+            TabContent::Restored(_) => None,
         }
     }
 
@@ -373,20 +426,25 @@ impl TabContent {
         match self {
             TabContent::Terminal(t) => t.sftp.clone(),
             TabContent::Files(f) => f.sftp.clone(),
+            TabContent::Restored(_) => None,
         }
     }
 
-    fn sftp_mut(&mut self) -> &mut Option<Arc<mullion_ssh::sftp::SftpClient>> {
+    /// `None` = 占位标签(F37),它没有连接,也就没有 sftp 槽位可写。
+    fn sftp_mut(&mut self) -> Option<&mut Option<Arc<mullion_ssh::sftp::SftpClient>>> {
         match self {
-            TabContent::Terminal(t) => &mut t.sftp,
-            TabContent::Files(f) => &mut f.sftp,
+            TabContent::Terminal(t) => Some(&mut t.sftp),
+            TabContent::Files(f) => Some(&mut f.sftp),
+            TabContent::Restored(_) => None,
         }
     }
 
-    fn sftp_tasks_mut(&mut self) -> &mut Vec<tokio::task::JoinHandle<()>> {
+    /// `None` = 占位标签(F37):没有连接就没有在途任务,也就没有要收口的东西。
+    fn sftp_tasks_mut(&mut self) -> Option<&mut Vec<tokio::task::JoinHandle<()>>> {
         match self {
-            TabContent::Terminal(t) => &mut t.sftp_tasks,
-            TabContent::Files(f) => &mut f.sftp_tasks,
+            TabContent::Terminal(t) => Some(&mut t.sftp_tasks),
+            TabContent::Files(f) => Some(&mut f.sftp_tasks),
+            TabContent::Restored(_) => None,
         }
     }
 
@@ -396,6 +454,7 @@ impl TabContent {
         match self {
             TabContent::Terminal(t) => t.sftp_default_remote.clone(),
             TabContent::Files(f) => f.sftp_default_remote.clone(),
+            TabContent::Restored(_) => None,
         }
     }
 
@@ -408,6 +467,7 @@ impl TabContent {
         match self {
             TabContent::Terminal(t) => t.ws.hosts.first().map(|h| h.handle.clone()),
             TabContent::Files(f) => Some(f.conn.clone()),
+            TabContent::Restored(_) => None,
         }
     }
 }
@@ -868,6 +928,78 @@ fn next_panel_selection_index(
     })
 }
 
+/// `App::snapshot_layout` 的纯逻辑核心:标签栏 → 磁盘格式,外加活动标签的
+/// **过滤后**序号。
+///
+/// 写成自由函数的理由同 `active_ws_of` 那几个:`App` 要一个 `EventLoopProxy`
+/// 才能构造,留在方法里的话「哪些标签该跳过」「跳过之后 active 该指哪儿」
+/// 这两条真正的判据就只能靠源码结构那种弱断言守着。
+fn snapshot_tabs_of(tabs: &Tabs<TabContent>) -> (Vec<mullion_store::SavedTab>, usize) {
+    use crate::shell::layout_snapshot as snap;
+    use mullion_store::{SavedNodeEntry, SavedTab, SavedTabKind};
+    let mut out = Vec::new();
+    let mut active_tab = 0usize;
+    for (ix, tab) in tabs.iter().enumerate() {
+        let saved = match (&tab.content, tab.session_id) {
+            (TabContent::Terminal(t), Some(session_id)) => SavedTab {
+                kind: SavedTabKind::Terminal,
+                session_id,
+                title: tab.title.clone(),
+                focus_leaf: snap::focus_leaf_index(t.ws.tree(), t.ws.focus()),
+                tree: snap::to_entries(t.ws.tree()),
+            },
+            // D1:SFTP 节点标签没有分屏树 —— 恒一个叶子。
+            (TabContent::Files(_), Some(session_id)) => SavedTab {
+                kind: SavedTabKind::Files,
+                session_id,
+                title: tab.title.clone(),
+                focus_leaf: 0,
+                tree: vec![SavedNodeEntry::leaf()],
+            },
+            // 占位标签按原样写回去:用户这次没重连它,不代表他想把它丢掉 ——
+            // 悄悄丢掉的话,关一次窗口就永久少一个标签。
+            (TabContent::Restored(r), _) => SavedTab {
+                kind: if r.wants_sftp {
+                    SavedTabKind::Files
+                } else {
+                    SavedTabKind::Terminal
+                },
+                session_id: r.session_id,
+                title: tab.title.clone(),
+                focus_leaf: r.focus_leaf,
+                tree: r.tree.clone(),
+            },
+            // 快速连接(命令行 `user@host`):没有会话记录可查,记下来只会
+            // 给出一个点了必然失败的「重连」(设计 E2/E6)。
+            (TabContent::Terminal(_) | TabContent::Files(_), None) => continue,
+        };
+        if ix == tabs.active_index() {
+            // 前面可能已经跳过了几个快速连接标签,所以取的是**已写进 `out`
+            // 的条数**,不是 `ix` —— 用 `ix` 的话,跳过一个之后活动标签就
+            // 整体错位一格,恢复时打开的是旁边那个。
+            active_tab = out.len();
+        }
+        out.push(saved);
+    }
+    (out, active_tab)
+}
+
+/// F37:`ConnectOk` 抵达时该**顶替第几个标签**,`None` = 开一个新的。
+///
+/// 抽成自由函数是因为 `App` 要 `EventLoopProxy`、单测里造不出来,而这里
+/// 恰恰是本条路径上唯一有判断的地方:
+/// - 不是重连(`pending` 为 `None`)→ 照旧开新标签(F36 的「连接不顶掉已有标签」);
+/// - 重连、但那个占位标签在拨号途中被关掉了 → 也开新标签,**不能把连接丢掉**;
+/// - 重连且标签还在 → 顶替**它指名的那个**,与「活动标签」无关(活动标签
+///   压根不是入参)。
+fn replace_target(
+    pending: Option<shell::tabs::TabId>,
+    ids: &[shell::tabs::TabId],
+) -> Option<usize> {
+    let want = pending?;
+    ids.iter().position(|id| *id == want)
+}
+
 /// 关掉一个标签时的收口。**顺序是这条函数存在的全部理由**:
 ///
 /// 自动化 task 也持有一份 `Arc<SshSession>`。只 drop 掉 `Workspace`(即 pane 那
@@ -902,6 +1034,11 @@ fn wind_down(tab: Tab<TabContent>) {
             }
             // `f.sftp`/`f.conn` 在这里 drop —— 独占连接随之释放。
         }
+        // F37:占位标签没连接、没 channel、没在途任务 —— 真的无事可收。
+        // **仍然写一条具名分支**:落到通配上的话,以后给 `RestoredTab` 加了
+        // 需要收口的东西(比如重连在途的那个 task 句柄),这里不会有任何
+        // 编译错误提醒,连接就静默泄漏了。
+        TabContent::Restored(_) => {}
     }
 }
 
@@ -985,6 +1122,32 @@ pub struct App {
     cursor_px: (f32, f32),
     /// 系统剪贴板(F18)。打不开时内部退化为 no-op(见 `crate::clipboard`)。
     clipboard: crate::clipboard::Clipboard,
+    /// F37:**上一次真的写进 `layout.toml` 的那份快照**。`None` = 这个进程
+    /// 还没写过。
+    ///
+    /// **不是一个 `layout_dirty: bool`**,这是刻意偏离设计 E7 的写法:脏标记
+    /// 要在每一个改变布局的地方(开/关/切标签、分屏、关 pane、切预设、
+    /// 窗口 Resized/Moved…)手工打一次点,漏掉任何一处的后果是「那种改动
+    /// 从来不会被保存」,而且**没有任何测试会红** —— 这正是 `has_real_action`
+    /// 踩过的那个坑(D4b)。改成「每 2 秒现算一份快照,跟上次存的比一比,
+    /// 不一样才写」之后,「哪些操作算改动」这件事不再需要有人记得,
+    /// 全部由 `snapshot_layout` 的取值范围决定。
+    ///
+    /// 代价是每 2 秒一次的快照构造(几个 `String` 克隆),对 60fps 的帧预算
+    /// 可以忽略;收益是这一类漏接线的 bug 结构上不存在。
+    last_saved_layout: Option<mullion_store::SavedLayout>,
+    /// F37:上一次比对快照的时刻。节流窗口见 `layout_snapshot::should_flush`。
+    layout_checked_at: Instant,
+    /// F37:正在为哪个占位标签拨号,以及连上之后要摆回什么形状(E9)。
+    ///
+    /// **`ConnectOk` 事件本身不带 `TabId`**(它是从 tokio task 发回来的,
+    /// 发起那一刻还没有标签概念),所以「这次连接是一次重连、要替换的是
+    /// 哪个标签」只能在发起时记在这儿。
+    ///
+    /// **至多一个**:占位标签上的「重连」按钮在拨号期间是禁用的
+    /// (`RestoredTab::dialing`),「全部重连」也是一个一个来 —— 高延迟代理
+    /// 链路上同时拉 N 条连接正是设计 §1 否掉自动重连的理由之一。
+    pending_restore: Option<PendingRestore>,
     /// 左键是否按住(划选进行中)。松开即结束,不跨 focus 保留。
     dragging: bool,
     /// 上一次左键按下的连击状态,喂 `input::click_kind` 判双击/三击。
@@ -1101,6 +1264,9 @@ impl App {
             ui_dirty: true, // 首帧必须画出来
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
+            last_saved_layout: None,
+            layout_checked_at: Instant::now(),
+            pending_restore: None,
             dragging: false,
             prev_click: None,
             press_anchor: None,
@@ -1152,6 +1318,222 @@ impl App {
             self.cancel_transfers_of(tab.content.generation());
             wind_down(tab);
         }
+    }
+
+    // ------------------------------------------------ F37 布局持久化(E7/E8)
+
+    /// 把当前的标签栏 + 分屏形状 + 窗口几何拍成一份可落盘的快照。
+    ///
+    /// **`session_id == None` 的标签跳过**(设计 E2/E6):快速连接(命令行
+    /// `user@host`)没有会话记录,恢复出来的占位标签点「重连」时无从查配置,
+    /// 只会给出一个必然失败的按钮。
+    ///
+    /// 占位标签(`Restored`)**按原样写回去**:用户这次没重连它,不代表他
+    /// 想把它丢掉 —— 悄悄丢掉的话,关一次窗口就永久少一个标签。
+    fn snapshot_layout(&self) -> mullion_store::SavedLayout {
+        let (tabs, active_tab) = snapshot_tabs_of(&self.tabs);
+        mullion_store::SavedLayout {
+            schema_version: mullion_store::CURRENT_LAYOUT_SCHEMA,
+            active_tab,
+            window: self.window_geometry(),
+            tabs,
+        }
+    }
+
+    /// 当前窗口几何。**物理像素**,与 winit 的 `outer_position` /
+    /// `inner_size` / `MonitorHandle::position` 三者同一套单位 —— 混用逻辑点
+    /// 会让高 DPI 屏上恢复出来的窗口大小差一个缩放系数。
+    ///
+    /// 最大化时**仍然记尺寸**(记的是 winit 报的当前尺寸)+ `maximized: true`:
+    /// 取消最大化后窗口要有个还原尺寸可用。
+    fn window_geometry(&self) -> Option<mullion_store::SavedWindow> {
+        let a = self.active.as_ref()?;
+        let size = a.window.inner_size();
+        let pos = a.window.outer_position().ok();
+        Some(mullion_store::SavedWindow {
+            width: size.width as f32,
+            height: size.height as f32,
+            x: pos.map(|p| p.x as f32),
+            y: pos.map(|p| p.y as f32),
+            maximized: a.window.is_maximized(),
+        })
+    }
+
+    /// 到点了就比一比、不一样就写盘。`about_to_wait` 每次空闲都会调。
+    ///
+    /// 节流判据走 `layout_snapshot::should_flush`(有自己的守护测试),
+    /// 这里只做接线。
+    fn flush_layout_if_due(&mut self) {
+        use crate::shell::layout_snapshot as snap;
+        let since = self.layout_checked_at.elapsed().as_millis() as u64;
+        // 第一个参数恒 `true`:「有没有改动」由下面的快照比对回答,不靠
+        // 手工打的脏点(见 `last_saved_layout` 的文档)。
+        if !snap::should_flush(true, since) {
+            return;
+        }
+        self.layout_checked_at = Instant::now();
+        self.save_layout_if_changed();
+    }
+
+    /// 现算一份快照,跟上次写盘的那份不同才写。
+    ///
+    /// 写盘失败**只记日志**,不弹错误卡片:布局是「上次的场景」,不是用户
+    /// 资产(设计 E1),为它打断用户不成比例。
+    fn save_layout_if_changed(&mut self) {
+        let now = self.snapshot_layout();
+        if self.last_saved_layout.as_ref() == Some(&now) {
+            return;
+        }
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        match mullion_store::layout::save(&dir, &now) {
+            Ok(()) => self.last_saved_layout = Some(now),
+            Err(e) => log::debug!(target: "mullion", "布局落盘失败: {e}"),
+        }
+    }
+
+    /// F37:把刚连上的内容摆进标签栏。
+    ///
+    /// `pending` 命中(且那个占位标签还在)→ **就地**替换它,标签在栏里
+    /// 的位置不动;否则照旧开一个新标签。返回「是不是就地替换的」——
+    /// 终端分支据此决定要不要按存下来的树重建分屏。
+    ///
+    /// 占位标签在拨号途中被用户关掉了也**不能把连接丢掉**:那是「点了重连,
+    /// 什么都没发生」,跟 `ConnectErr`/host_key 那些故意不静默失败的路径
+    /// 不一致。此时退回开新标签。
+    fn place_tab(
+        &mut self,
+        pending: Option<&PendingRestore>,
+        title: String,
+        session_id: Option<SessionId>,
+        content: TabContent,
+    ) -> bool {
+        let ids: Vec<_> = self.tabs.iter().map(|t| t.id).collect();
+        let target = replace_target(pending.map(|p| p.tab_id), &ids).map(|ix| (ids[ix], ix));
+        let Some((id, ix)) = target else {
+            self.tabs.open(title, session_id, content);
+            return false;
+        };
+        if let Some(old) = self.tabs.replace(id, title, content) {
+            // 占位标签没有连接、没有 sftp task,`wind_down` 对它是空操作;
+            // 照样调是为了「所有被丢弃的标签都过收口」这条不留缺口。
+            wind_down(old);
+        }
+        // 跟 `open` 对齐:连上之后焦点落到这个标签。`spawn_fresh_panes`
+        // 取的是**活动标签**的 cfg,不切过去的话恢复分屏会开到别的标签上。
+        self.tabs.switch_to_index(ix);
+        true
+    }
+
+    /// F37:占位标签上按了「重连」(或菜单里「全部重连」轮到它)。
+    ///
+    /// 走的是**会话管理器双击连接同一条路径**(`dial_plan_for` +
+    /// `spawn_connect`),不分叉:分叉出第二条拨号路径意味着代理链/跳板/
+    /// 主机密钥/自动化那一整套要维护两份,而它们都已经在那条路上验过。
+    ///
+    /// 已经有一次重连在途时**直接不理**:同时拉多条连接正是设计 §1 否掉
+    /// 自动重连的理由之一。按钮此时本来也是禁用的,这里是第二道闸
+    /// (菜单的「全部重连」够得着同一个入口)。
+    fn reconnect_tab(&mut self, tab_id: shell::tabs::TabId) {
+        if self.pending_restore.is_some() {
+            return;
+        }
+        let Some((session_id, tree, focus_leaf)) =
+            self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| {
+                match &t.content {
+                    TabContent::Restored(r) => Some((r.session_id, r.tree.clone(), r.focus_leaf)),
+                    // 已经连上了(或者本来就不是占位标签)—— 没什么可重连的。
+                    TabContent::Terminal(_) | TabContent::Files(_) => None,
+                }
+            })
+        else {
+            return;
+        };
+        let plan = match self.store.as_ref().map(|s| s.dial_plan_for(session_id)) {
+            Some(Ok(plan)) => plan,
+            Some(Err(e)) => {
+                self.ui.set_error(e.to_string());
+                self.ui_dirty = true;
+                return;
+            }
+            None => return,
+        };
+        let (cfg, wants_sftp) = plan;
+        self.pending_restore = Some(PendingRestore {
+            tab_id,
+            tree,
+            focus_leaf,
+        });
+        // 按钮禁用靠它(见 `ui::restored`)—— 不置的话用户连点会绕过上面
+        // 那道 `pending_restore` 闸之前先弹一堆密码框。
+        if let Some(TabContent::Restored(r)) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab_id)
+            .map(|t| &mut t.content)
+        {
+            r.dialing = true;
+        }
+        // `connect_request_last` 是 `ConnectOk` 认「是哪条会话连上了」的唯一
+        // 依据(事件本身不带 SessionId),跟双击连接那条路径一样要设。
+        self.ui.connect_request_last = Some(session_id);
+        self.cli_direct = false;
+        self.ui_dirty = true;
+        self.spawn_connect(cfg, wants_sftp);
+    }
+
+    /// F37:菜单里的「全部重连」。**一个一个来** —— `reconnect_tab` 里那道
+    /// `pending_restore` 闸保证同时只有一条在拨号,这里只是把第一个还没连
+    /// 的占位标签交给它;剩下的等这条连上之后用户再按一次。
+    ///
+    /// 「排队自动连完」是刻意没做的:那等于把设计 §1 否掉的「启动即自动重连
+    /// 全部」换个触发时机又做了一遍(N 条握手互相拖慢、缺凭据时连弹 N 个框)。
+    fn reconnect_next_restored(&mut self) {
+        let Some(id) = self.tabs.iter().find_map(|t| match &t.content {
+            TabContent::Restored(r) if !r.dialing => Some(t.id),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.reconnect_tab(id);
+    }
+
+    /// F37:把读出来的布局摆成占位标签。**必须在 `self.store` 打开之后调**
+    /// —— 「这条会话还在不在库里」这条丢弃规则要查库(设计 E6)。
+    ///
+    /// 判据全在 `layout_snapshot::usable` 里(它有自己的守护测试),这里
+    /// 只负责把过滤后的结果开成标签。
+    fn restore_tabs(&mut self, saved: mullion_store::SavedLayout) {
+        let known: Vec<SessionId> = self
+            .store
+            .as_ref()
+            .map_or(Vec::new(), |s| s.list().iter().map(|r| r.id).collect());
+        let usable = crate::shell::layout_snapshot::usable(saved, &|id| known.contains(&id));
+        if usable.tabs.is_empty() {
+            return;
+        }
+        let count = usable.tabs.len();
+        for t in usable.tabs {
+            let generation = self.next_ws_generation;
+            self.next_ws_generation += 1;
+            self.tabs.open(
+                t.title,
+                Some(t.session_id),
+                TabContent::Restored(RestoredTab {
+                    session_id: t.session_id,
+                    tree: t.tree,
+                    focus_leaf: t.focus_leaf,
+                    generation,
+                    wants_sftp: matches!(t.kind, mullion_store::SavedTabKind::Files),
+                    dialing: false,
+                }),
+            );
+        }
+        // `open` 每开一个都会把它设成活动标签,所以最后再切回存的那一个。
+        self.tabs.switch_to_index(usable.active_tab);
+        crate::logx::line(&format!("F37:恢复了 {count} 个占位标签"));
+        self.ui_dirty = true;
     }
 
     /// F55:作废属于某个标签的全部传输。扳旗标(让在跑的 worker 立刻停)
@@ -1371,7 +1753,11 @@ impl App {
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
-        let files = tab.content.files_panel_mut();
+        // F37:占位标签没有面板运行态。走到这儿说明动作的世代号指向了一个
+        // 没连接的标签(理论上到不了 —— 占位标签画不出文件面板),丢掉。
+        let Some(files) = tab.content.files_panel_mut() else {
+            return;
+        };
         let target = match &action {
             FileAction::Goto(target) => target.clone(),
             FileAction::Up => local::parent_local(&files.local.cwd),
@@ -1475,7 +1861,11 @@ impl App {
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
-        let files = tab.content.files_panel_mut();
+        // F37:占位标签没有面板运行态。走到这儿说明动作的世代号指向了一个
+        // 没连接的标签(理论上到不了 —— 占位标签画不出文件面板),丢掉。
+        let Some(files) = tab.content.files_panel_mut() else {
+            return;
+        };
         let target = match &action {
             FileAction::Goto(target) => target.clone(),
             // **`RemotePath::parent()`,不是 `local::parent_local`**——那是
@@ -1536,7 +1926,11 @@ impl App {
                 let Some(tab) = self.tabs.by_generation(generation) else {
                     return;
                 };
-                let (column, state) = tab.content.files_panel().active_state();
+                // F37:`None` = 占位标签,没有面板可翻 —— 直接不响应。
+                let Some((column, state)) = tab.content.files_panel().map(|f| f.active_state())
+                else {
+                    return;
+                };
                 // 「进去」是**单目标**动作,认光标行而不是选择集 ——
                 // 多选了 5 条时「进哪一个」没有答案。
                 let Some(target) = state
@@ -1556,8 +1950,11 @@ impl App {
                 self.dispatch_panel_action(generation, FileAction::Refresh);
             }
             WinitKey::Named(NamedKey::Tab) => {
-                if let Some(tab) = self.tabs.by_generation_mut(generation) {
-                    let files = tab.content.files_panel_mut();
+                if let Some(files) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.files_panel_mut())
+                {
                     files.active_column = files.active_column.flipped();
                     self.ui_dirty = true;
                 }
@@ -1569,7 +1966,8 @@ impl App {
                 let column = self
                     .tabs
                     .by_generation(generation)
-                    .map(|t| t.content.files_panel().active_column);
+                    .and_then(|t| t.content.files_panel())
+                    .map(|f| f.active_column);
                 if column != Some(crate::ui::files_panel::PanelColumn::Remote) {
                     return;
                 }
@@ -1600,7 +1998,8 @@ impl App {
         let Some(column) = self
             .tabs
             .by_generation(generation)
-            .map(|t| t.content.files_panel().active_column)
+            .and_then(|t| t.content.files_panel())
+            .map(|f| f.active_column)
         else {
             return;
         };
@@ -1619,7 +2018,9 @@ impl App {
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
         };
-        let state = &tab.content.files_panel().remote;
+        let Some(state) = tab.content.files_panel().map(|f| &f.remote) else {
+            return;
+        };
         let dialog = match ask {
             FileAsk::NewDir => Some(FilesDialog::NewDir {
                 parent: state.cwd.clone(),
@@ -1759,7 +2160,9 @@ impl App {
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
         };
-        let files = tab.content.files_panel();
+        let Some(files) = tab.content.files_panel() else {
+            return;
+        };
         let src = match dir {
             Direction::Download => &files.remote,
             Direction::Upload => &files.local,
@@ -1822,7 +2225,9 @@ impl App {
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
         };
-        let remote_cwd = tab.content.files_panel().remote.cwd.clone();
+        let Some(remote_cwd) = tab.content.files_panel().map(|f| f.remote.cwd.clone()) else {
+            return;
+        };
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
@@ -1875,7 +2280,10 @@ impl App {
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
         };
-        let (items, skipped_dirs) = crate::dragout::items_for(&tab.content.files_panel().remote);
+        let Some(files) = tab.content.files_panel() else {
+            return;
+        };
+        let (items, skipped_dirs) = crate::dragout::items_for(&files.remote);
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
@@ -1913,7 +2321,9 @@ impl App {
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
         };
-        let state = &tab.content.files_panel().remote;
+        let Some(state) = tab.content.files_panel().map(|f| &f.remote) else {
+            return;
+        };
         let Some(cur) = state.cursor.clone() else {
             return;
         };
@@ -2361,7 +2771,9 @@ impl App {
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
-        let state = tab.content.files_panel_mut().active_state_mut();
+        let Some(state) = tab.content.files_panel_mut().map(|f| f.active_state_mut()) else {
+            return;
+        };
         let rows = state.rows();
         let Some(next) = next_panel_selection_index(&rows, state.cursor.as_ref(), delta) else {
             return;
@@ -2387,8 +2799,13 @@ impl App {
     /// 两种标签都走这一条,`TabContent::sftp_tasks_mut` 已经把「该记到哪个
     /// 字段」这件事收掉了。
     fn track_sftp_task(&mut self, generation: u64, task: tokio::task::JoinHandle<()>) {
-        if let Some(tab) = self.tabs.by_generation_mut(generation) {
-            let tasks = tab.content.sftp_tasks_mut();
+        // F37:`sftp_tasks_mut()` 对占位标签是 `None` —— 它压根不会发起
+        // sftp 请求,真走到这儿说明世代号错了,同样按「无人收留」处理。
+        if let Some(tasks) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.sftp_tasks_mut())
+        {
             tasks.retain(|h| !h.is_finished());
             tasks.push(task);
         } else {
@@ -2412,10 +2829,11 @@ impl App {
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
-        let already_loading = matches!(
-            tab.content.files_panel().remote.load,
-            crate::files::state::Load::Loading
-        );
+        // F37:占位标签没有面板,也就没有「远端目录」要加载 —— 直接不开。
+        let Some(files) = tab.content.files_panel() else {
+            return;
+        };
+        let already_loading = matches!(files.remote.load, crate::files::state::Load::Loading);
         if tab.content.sftp_client().is_some() || already_loading {
             // 已经开好了,或者已经在开的路上——别在下一帧/下一次点击重复触发。
             return;
@@ -2424,7 +2842,9 @@ impl App {
             return;
         };
         let default_remote = tab.content.sftp_default_remote();
-        tab.content.files_panel_mut().remote.load = crate::files::state::Load::Loading;
+        if let Some(files) = tab.content.files_panel_mut() {
+            files.remote.load = crate::files::state::Load::Loading;
+        }
         let task = spawn_sftp_open(
             &self._runtime,
             &self.proxy,
@@ -2456,11 +2876,15 @@ impl App {
                         log::debug!(target: "mullion", "丢弃过期世代 {generation} 的 SFTP 打开结果");
                         return;
                     };
-                    *tab.content.sftp_mut() = Some(client.clone());
-                    tab.content
-                        .files_panel_mut()
-                        .remote
-                        .begin_load(home.clone())
+                    let Some(slot) = tab.content.sftp_mut() else {
+                        log::debug!(target: "mullion", "世代 {generation} 是占位标签,丢弃 SFTP 打开结果");
+                        return;
+                    };
+                    *slot = Some(client.clone());
+                    let Some(files) = tab.content.files_panel_mut() else {
+                        return;
+                    };
+                    files.remote.begin_load(home.clone())
                 };
                 let task =
                     spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, home, seq);
@@ -2468,8 +2892,9 @@ impl App {
             }
             Err(msg) => {
                 if let Some(tab) = self.tabs.by_generation_mut(generation) {
-                    tab.content.files_panel_mut().remote.load =
-                        crate::files::state::Load::Failed(msg);
+                    if let Some(files) = tab.content.files_panel_mut() {
+                        files.remote.load = crate::files::state::Load::Failed(msg);
+                    }
                 } else {
                     log::debug!(target: "mullion", "丢弃过期世代 {generation} 的 SFTP 打开结果");
                 }
@@ -2488,7 +2913,9 @@ impl App {
         result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
     ) {
         if let Some(tab) = self.tabs.by_generation_mut(generation) {
-            tab.content.files_panel_mut().remote.accept(seq, result);
+            if let Some(files) = tab.content.files_panel_mut() {
+                files.remote.accept(seq, result);
+            }
         } else {
             log::debug!(target: "mullion", "丢弃过期世代 {generation} 的目录列表(seq={seq})");
         }
@@ -3304,11 +3731,49 @@ impl ApplicationHandler<UserEvent> for App {
         // adapter 枚举 / request_device 是阻塞调用,显卡驱动出问题时会卡死在这里——
         // 打上阶段标记,看门狗才说得出「卡在 startup」而不是一片空白。
         diag::mark(diag::Stage::Startup);
-        let window = Arc::new(
-            event_loop
-                .create_window(Window::default_attributes().with_title("mullion"))
-                .expect("create_window"),
-        );
+        // F37:**建窗口之前**就把上次的布局读出来 —— 几何要写进
+        // `WindowAttributes`,建完再 `set_outer_position` 会让用户看见窗口
+        // 先在默认位置闪一下再跳过去。
+        //
+        // `layout::load` 没有 `Result`(设计 E6):布局文件坏了的正确表现是
+        // 「这次没恢复」,而不是「打不开客户端」。这里的 `unwrap_or_else`
+        // 只对付「连配置目录都定位不到」。
+        let saved_layout = crate::shell::store::config_dir()
+            .map(|d| mullion_store::layout::load(&d))
+            .map(|l| {
+                if let Some(note) = l.note {
+                    crate::logx::line(&format!("F37:{note}"));
+                }
+                l.layout
+            })
+            .unwrap_or_else(mullion_store::SavedLayout::empty);
+        let mut attrs = Window::default_attributes().with_title("mullion");
+        if let Some(w) = saved_layout.window {
+            // 夹紧判据全在 `layout_snapshot::clamp_to_monitors` 里(纯函数,
+            // 有守护测试)—— 拔掉一块显示器之后,上次那个位置可能已经在
+            // 所有屏幕之外,窗口会恢复到用户根本看不见的地方。
+            let monitors: Vec<crate::shell::layout_snapshot::MonitorRect> = event_loop
+                .available_monitors()
+                .map(|m| {
+                    let p = m.position();
+                    let s = m.size();
+                    crate::shell::layout_snapshot::MonitorRect {
+                        x: p.x as f32,
+                        y: p.y as f32,
+                        width: s.width as f32,
+                        height: s.height as f32,
+                    }
+                })
+                .collect();
+            let r = crate::shell::layout_snapshot::clamp_to_monitors(w, &monitors);
+            attrs = attrs
+                .with_inner_size(winit::dpi::PhysicalSize::new(r.width, r.height))
+                .with_maximized(r.maximized);
+            if let Some((x, y)) = r.pos {
+                attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+        }
+        let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
         let init_size = window.inner_size();
         crate::logx::line(&format!(
             "resumed: 窗口创建 {}x{} scale={}",
@@ -3382,13 +3847,18 @@ impl ApplicationHandler<UserEvent> for App {
         };
         // 启动时先算一次,否则第一次打开会话管理器全是无色。
         self.refresh_appearance();
+        // F37:上次那几个标签摆回来(占位,一条连接都不建 —— 设计 §1)。
+        // **必须在 store 打开之后**:「这条会话还在不在库里」是丢弃规则之一。
+        self.restore_tabs(saved_layout);
 
         // CLI 直连(路径①)→ 立刻发起连接,进终端态;无参启动(路径②)→ 留在
         // launcher(conn 仍 None)并自动弹出会话管理器,让用户选/建会话(§2/Task7)。
         if let Some(cfg) = self.initial.take() {
             // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
             self.spawn_connect(cfg, false);
-        } else {
+        } else if self.tabs.is_empty() {
+            // F37:恢复出了占位标签就别再弹会话管理器 —— 用户看到的第一屏
+            // 该是上次那几个标签,不是一个盖住它们的弹窗。
             self.ui.session_manager_open = true;
         }
         diag::mark(diag::Stage::Idle);
@@ -3423,6 +3893,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // 标签同样要一个世代号(S1 路由键),两种标签共用这一个计数器。
                 let generation = self.next_ws_generation;
                 self.next_ws_generation += 1;
+                // F37:这次连接是不是某个占位标签按「重连」发起的。**取出即
+                // 消费**:留着的话下一次正常连接会跑去顶替一个早就连上的标签。
+                let pending = self.pending_restore.take();
                 let cfg = self.pending_cfg.clone();
                 let session_id = self.ui.connect_request_last;
                 let title = cfg
@@ -3447,7 +3920,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // (跟侧栏共用同一条路径),这里只管把标签立起来、触发
                     // 首次打开。
                     crate::logx::line("连接成功,进入 SFTP 标签");
-                    self.tabs.open(
+                    self.place_tab(
+                        pending.as_ref(),
                         title,
                         session_id,
                         TabContent::Files(Box::new(FilesTab {
@@ -3527,7 +4001,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // **同一条会话可以开多个标签,不去重、标题也不加序号**:序号会让
                 // 「关掉中间那个」之后编号整体跳变,反而更难认;区分靠节点色和
                 // hover 出来的 `user@host`。
-                self.tabs.open(
+                let replaced = self.place_tab(
+                    pending.as_ref(),
                     title,
                     session_id,
                     TabContent::Terminal(Box::new(TerminalTab {
@@ -3546,6 +4021,27 @@ impl ApplicationHandler<UserEvent> for App {
                         sftp_default_remote: sftp_prefs.default_remote,
                     })),
                 );
+                // F37:是重连一个占位标签 → 把上次的分屏形状搭回来,并给新长
+                // 出来的叶子在这条连接上另开 channel(与 F35 预设分屏同一条路)。
+                // 树坏了(`apply_saved_tree` 返回 `None`)就保持单屏,不阻断连接。
+                if replaced {
+                    if let Some(p) = pending.as_ref() {
+                        let fresh = self
+                            .tabs
+                            .by_generation_mut(generation)
+                            .and_then(|tab| tab.content.as_terminal_mut())
+                            .and_then(|t| {
+                                let fresh = t.ws.apply_saved_tree(&p.tree, p.focus_leaf)?;
+                                // 恢复出来的形状一般不对应任何预设按钮;单叶子
+                                // 例外(它就是 Single)。
+                                t.current_preset = (p.tree.len() == 1).then_some(Preset::Single);
+                                Some(fresh)
+                            });
+                        if let Some(fresh) = fresh {
+                            self.spawn_fresh_panes(fresh);
+                        }
+                    }
+                }
                 // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
                 self.ui.close_session_manager();
                 self.ui_dirty = true;
@@ -3981,6 +4477,11 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 crate::logx::line("CloseRequested → 退出");
+                // F37:**无条件写一次**,不看节流窗口(E7)。用户最后那几下
+                // 操作(切了标签、拖了窗口)大概率落在上一次落盘之后的 2 秒
+                // 窗口里,不在这里补一次就永远丢了 —— 而"关窗口前那一刻的
+                // 样子"正是这个功能唯一要还原的东西。
+                self.save_layout_if_changed();
                 // F92:进程要走了,20 秒的 timeout 别悬着。
                 if let Some(h) = self.probe_task.take() {
                     h.abort();
@@ -4294,10 +4795,9 @@ impl ApplicationHandler<UserEvent> for App {
                             let files_owner_generation = self.files_owner_generation();
                             if let Some(gen) = files_owner_generation {
                                 if self.tabs.active().is_some_and(|t| {
-                                    matches!(
-                                        t.content.files_panel().local.load,
-                                        crate::files::state::Load::Idle
-                                    )
+                                    t.content.files_panel().is_some_and(|f| {
+                                        matches!(f.local.load, crate::files::state::Load::Idle)
+                                    })
                                 }) {
                                     self.apply_local_file_action(
                                         gen,
@@ -4314,10 +4814,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 判重,双保险不冲突)。
                                 if self.tabs.active().is_some_and(|t| {
                                     t.content.sftp_client().is_none()
-                                        && matches!(
-                                            t.content.files_panel().remote.load,
-                                            crate::files::state::Load::Idle
-                                        )
+                                        && t.content.files_panel().is_some_and(|f| {
+                                            matches!(f.remote.load, crate::files::state::Load::Idle)
+                                        })
                                 }) {
                                     self.trigger_sftp_open(gen);
                                 }
@@ -4334,7 +4833,8 @@ impl ApplicationHandler<UserEvent> for App {
                             let mut taken_files = files_owner_generation.and_then(|gen| {
                                 self.tabs
                                     .by_generation_mut(gen)
-                                    .map(|tab| std::mem::take(tab.content.files_panel_mut()))
+                                    .and_then(|tab| tab.content.files_panel_mut())
+                                    .map(std::mem::take)
                             });
                             let sessions: &[mullion_store::SessionRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.list());
@@ -4430,6 +4930,32 @@ impl ApplicationHandler<UserEvent> for App {
                                         .and_then(|sid| self.appearance.get(sid)),
                                 })
                                 .collect();
+                            // F37:活动标签是占位标签时,中央区画的东西。同
+                            // `tab_views`,借用要一直活到 `render_frame`,所以
+                            // 在这儿现算、不走 `&self` 方法。
+                            let restored_view = self.tabs.active().and_then(|tab| {
+                                match &tab.content {
+                                    TabContent::Restored(r) => {
+                                        Some(crate::ui::restored::RestoredView {
+                                            tab_id: tab.id,
+                                            title: tab.title.as_str(),
+                                            // 树坏了就当 1 屏 —— 这里只是一句
+                                            // 文案,不值得为它把标签判废。
+                                            panes: crate::shell::layout_snapshot::leaf_count(
+                                                &r.tree,
+                                            )
+                                            .unwrap_or(1),
+                                            dialing: r.dialing,
+                                        })
+                                    }
+                                    TabContent::Terminal(_) | TabContent::Files(_) => None,
+                                }
+                            });
+                            let restored_count = self
+                                .tabs
+                                .iter()
+                                .filter(|t| matches!(t.content, TabContent::Restored(_)))
+                                .count();
                             let groups: &[mullion_store::GroupRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.groups());
                             let tunnels: &[mullion_store::TunnelRecord] =
@@ -4441,7 +4967,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 tunnels,
                                 tunnel_states: &tunnel_states,
                                 store_available,
-                                connected: !self.tabs.is_empty(),
+                                // F37:占位标签**不算已连接** —— 它一条连接都
+                                // 没建。判据从「有没有标签」收紧成「活动标签
+                                // 真的连着」之后,状态栏会照实说「未连接」,
+                                // 布局预设按钮组也不会画在一个没有 pane 可切的
+                                // 标签上(点了只会静默无反应)。
+                                connected: self
+                                    .tabs
+                                    .active()
+                                    .is_some_and(|t| !matches!(t.content, TabContent::Restored(_))),
                                 panes: self.active_ws().map_or(1, Workspace::pane_count),
                                 preset: self.active_term().and_then(|t| t.current_preset),
                                 titles: &titles,
@@ -4470,6 +5004,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 // (已按上下文夹紧,不是裸 `self.focus`)算出的判据
                                 // 原样转发,`files_panel::sidebar`/`content` 据此
                                 // 决定画不画焦点边框。
+                                restored: restored_view,
+                                restored_count,
                                 files_focused: self.effective_focus()
                                     == shell::input_route::Focus::FilesPanel,
                             };
@@ -4504,8 +5040,12 @@ impl ApplicationHandler<UserEvent> for App {
                             // 文件面板状态不需要留着。`files_panel_mut` 两个
                             // 变体都有,不用再判一次种类。
                             if let (Some(gen), Some(pf)) = (files_owner_generation, taken_files) {
-                                if let Some(tab) = self.tabs.by_generation_mut(gen) {
-                                    *tab.content.files_panel_mut() = pf;
+                                if let Some(files) = self
+                                    .tabs
+                                    .by_generation_mut(gen)
+                                    .and_then(|tab| tab.content.files_panel_mut())
+                                {
+                                    *files = pf;
                                 }
                             }
 
@@ -4556,6 +5096,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui_dirty = true;
                                 }
                                 None => {}
+                            }
+                            // F37:占位标签上按了「重连」/菜单里按了「全部
+                            // 重连」。两条走同一个 `reconnect_tab`,不分叉。
+                            if let Some(id) = actions.reconnect_tab {
+                                self.reconnect_tab(id);
+                            }
+                            if actions.reconnect_all {
+                                self.reconnect_next_restored();
                             }
                             // F50:本地栏动作同步施加,远端栏动作走 D6 的 sftp
                             // 打开/加载链路(见 `apply_local_file_action`/
@@ -5046,6 +5594,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+        // F37:到点就比一比布局有没有变、变了就写盘(E7)。放在这里而不是
+        // 帧循环里 —— 它跟渲染无关,而 `about_to_wait` 是「已经闲下来了」
+        // 这个语义唯一准确的位置。
+        self.flush_layout_if_due();
         // 即将阻塞等事件 = 正常空闲。看门狗据此不误报(等事件本来就可以等很久)。
         diag::mark(diag::Stage::Idle);
     }
@@ -5406,6 +5958,8 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.edit.is_some()
         || a.editor.is_some()
         || a.exit.is_some()
+        || a.reconnect_tab.is_some()
+        || a.reconnect_all
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -5624,13 +6178,15 @@ mod tests {
     use super::{
         apply_layout_actions, apply_save, download_job, effective_focus_of,
         files_owner_generation_of, has_real_action, next_panel_selection_index, pane_still_wanted,
-        sync_timeout_wake_at, upload_job, wind_down, Tab, TabContent, TerminalTab,
+        snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down, RestoredTab, Tab,
+        TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
     use crate::shell::tabs::{TabId, Tabs};
     use crate::shell::workspace::{Preset, Workspace};
     use mullion_core::layout::{Dir, Node, PaneId, Rect};
+    use mullion_store::SessionId;
     use std::sync::Arc;
 
     #[test]
@@ -6519,6 +7075,190 @@ mod tests {
             "files_drag_out 单独一个真实动作时必须被 has_real_action 认成\
              「有真实动作」,否则这一拖会在 discard 趟被静默丢掉"
         );
+    }
+
+    /// F37:同上,`reconnect_tab` 那一条。漏掉的后果是「占位标签上按重连
+    /// 毫无反应」——而恢复出来的标签除了重连没有第二条出路,用户只能关掉
+    /// 它重新去会话管理器找。
+    #[test]
+    fn a_reconnect_click_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let a = crate::ui::UiActions {
+            reconnect_tab: Some(crate::shell::tabs::TabId(3)),
+            ..Default::default()
+        };
+        assert!(
+            has_real_action(&a),
+            "reconnect_tab 单独一个真实动作时必须被 has_real_action 认成\
+             「有真实动作」,否则「重连」按下去会在 discard 趟被静默吃掉"
+        );
+    }
+
+    /// F37:同上,菜单里那条「全部重连」。
+    #[test]
+    fn reconnect_all_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let a = crate::ui::UiActions {
+            reconnect_all: true,
+            ..Default::default()
+        };
+        assert!(
+            has_real_action(&a),
+            "reconnect_all 单独一个真实动作时必须被 has_real_action 认成\
+             「有真实动作」,否则菜单里点「全部重连」毫无反应"
+        );
+    }
+
+    /// **接线守护 / F37**:关窗口那一刻必须**无条件**补写一次布局,而且要在
+    /// `event_loop.exit()` 之前。
+    ///
+    /// 用户最后那几下操作(切标签、拖窗口)大概率落在上一次落盘之后的 2 秒
+    /// 节流窗口里;不在这里补一次,「关窗前那一刻的样子」——这个功能唯一要
+    /// 还原的东西——就永远丢了。
+    ///
+    /// **扎源码结构**:走到这条路要 `EventLoopProxy` + 真窗口,单测造不出来。
+    /// 自证会变红:删掉 `CloseRequested` 里那句 `self.save_layout_if_changed();`,
+    /// 或把它挪到 `event_loop.exit()` 后面。
+    #[test]
+    fn closing_the_window_writes_the_layout_even_inside_the_throttle_window() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("WindowEvent::CloseRequested => {")
+            .nth(1)
+            .expect("找不到 CloseRequested 分支");
+        let body = &after[..after.find("event_loop.exit();").expect("找不到 exit()")];
+        assert!(
+            body.contains("self.save_layout_if_changed();"),
+            "关窗口没补写布局 —— 最后 2 秒内的改动会永久丢失"
+        );
+    }
+
+    /// **接线守护 / F37**:空闲路径要定期落盘。只靠关窗口那一次的话,进程被
+    /// 杀/崩溃时整场布局全丢。
+    ///
+    /// 自证会变红:删掉 `about_to_wait` 里那句 `self.flush_layout_if_due();`。
+    #[test]
+    fn the_idle_path_flushes_the_layout_periodically() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn about_to_wait(")
+            .nth(1)
+            .expect("找不到 about_to_wait");
+        assert!(
+            after[..2000].contains("self.flush_layout_if_due();"),
+            "about_to_wait 不再定期落盘布局 —— 进程被杀时整场布局全丢"
+        );
+    }
+
+    /// **接线守护 / F37**:恢复必须先过 `layout_snapshot::usable` 的筛子
+    /// (会话已被删 / 树坏了 / active_tab 越界的条目要丢掉)。
+    ///
+    /// 判据本身有自己的测试;这里守的是「筛子真的接在路上」——绕过它的话,
+    /// 删掉一条会话之后启动会摆出一个点了必然失败的占位标签(设计 E6)。
+    ///
+    /// 自证会变红:把 `restore_tabs` 里那句 `usable(..)` 换成直接用 `saved`。
+    #[test]
+    fn restoring_a_layout_goes_through_the_usability_filter() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn restore_tabs(")
+            .nth(1)
+            .expect("找不到 restore_tabs");
+        let body = &after[..after.find("\n    }\n").expect("找不到 restore_tabs 的结尾")];
+        assert!(
+            body.contains("layout_snapshot::usable("),
+            "恢复路径绕过了可用性筛子 —— 会摆出点了必然失败的占位标签"
+        );
+    }
+
+    /// **接线守护 / F37**:存下来的窗口几何必须过 `clamp_to_monitors` 再交给
+    /// winit。不夹的话,拔掉副屏之后窗口会开在一块不存在的屏幕上——用户看到
+    /// 的是「程序启动了但没有窗口」,而且**没有任何办法**把它弄回来。
+    ///
+    /// 自证会变红:把 `resumed` 里 `clamp_to_monitors(..)` 的结果换成原样的
+    /// `SavedWindow`。
+    #[test]
+    fn the_restored_window_geometry_is_clamped_to_the_real_monitors() {
+        let src = include_str!("app.rs");
+        let after = src.split("fn resumed(").nth(1).expect("找不到 resumed");
+        assert!(
+            after.contains("layout_snapshot::clamp_to_monitors("),
+            "启动时没夹紧窗口几何 —— 副屏拔掉后窗口会开在看不见的地方"
+        );
+    }
+
+    /// `snapshot_tabs_of` 的脚手架:一个占位标签。`leaves` = 上次的分屏数,
+    /// 用**左右均分的扁平前序编码**摆出来(跟真实存盘同一套编码)。
+    fn restored_tab(session_id: u64, leaves: usize) -> TabContent {
+        use mullion_store::SavedNodeEntry;
+        let mut tree = Vec::new();
+        for _ in 1..leaves {
+            tree.push(SavedNodeEntry::split(
+                mullion_store::SavedDir::Horizontal,
+                0.5,
+            ));
+        }
+        for _ in 0..leaves {
+            tree.push(SavedNodeEntry::leaf());
+        }
+        TabContent::Restored(RestoredTab {
+            session_id: SessionId(session_id),
+            tree,
+            focus_leaf: leaves.saturating_sub(1),
+            generation: 0,
+            wants_sftp: false,
+            dialing: false,
+        })
+    }
+
+    /// F37:命令行 `user@host` 起的快速连接**不进 layout.toml**——它没有会话
+    /// 记录,存下来只会在下次启动时给出一个点了必然失败的「重连」(设计 E2)。
+    ///
+    /// 自证会变红:把 `snapshot_tabs_of` 里那条 `=> continue` 改成写一个
+    /// `SessionId(0)` 进去。
+    #[test]
+    fn a_quick_connect_tab_is_not_written_to_the_layout_file() {
+        let tabs = tabs_with_one_terminal_tab(); // session_id: None
+        let (saved, _) = snapshot_tabs_of(&tabs);
+        assert!(saved.is_empty(), "快速连接标签被写进了布局:{saved:?}");
+    }
+
+    /// F37:跳过快速连接标签之后,活动标签的下标**不能整体错位**。
+    ///
+    /// 这条是 `active_tab = out.len()` 而不是 `= ix` 的全部理由:用 `ix` 的话,
+    /// 前面每跳过一个快速连接标签,下次启动就打开旁边那个标签(或直接越界)。
+    ///
+    /// 自证会变红:把 `active_tab = out.len()` 改回 `active_tab = ix`。
+    #[test]
+    fn the_active_index_does_not_drift_after_skipping_a_quick_connect_tab() {
+        let mut tabs = tabs_with_one_terminal_tab(); // 下标 0,不会被存
+        tabs.open("留下的".into(), Some(SessionId(9)), restored_tab(9, 1));
+        assert_eq!(tabs.active_index(), 1, "脚手架前提:活动的是第二个标签");
+        let (saved, active) = snapshot_tabs_of(&tabs);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            active, 0,
+            "活动下标没跟着「跳过了一个标签」往前收,下次启动会打开错的标签"
+        );
+    }
+
+    /// F37:这次没重连的占位标签,**原样写回去**。悄悄丢掉的话,用户关一次
+    /// 窗口就永久少一个标签——而他什么都没做。
+    ///
+    /// 自证会变红:把 `TabContent::Restored(r)` 那条分支也改成 `continue`,
+    /// 或把 `tree: r.tree.clone()` 换成 `vec![SavedNodeEntry::leaf()]`。
+    #[test]
+    fn an_untouched_placeholder_tab_survives_another_round_trip() {
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("生产机".into(), Some(SessionId(4)), restored_tab(4, 3));
+        let (saved, _) = snapshot_tabs_of(&tabs);
+        assert_eq!(saved.len(), 1, "占位标签被丢掉了");
+        assert_eq!(saved[0].session_id, SessionId(4));
+        assert_eq!(
+            saved[0].tree.len(),
+            5,
+            "3 分屏的树应该是 2 个 split + 3 个叶子,存回去的却是 {:?}",
+            saved[0].tree
+        );
+        assert_eq!(saved[0].focus_leaf, 2, "焦点叶子没原样存回去");
     }
 
     /// `effective_focus_of`/`files_owner_generation_of` 的测试脚手架:一个
@@ -7418,18 +8158,53 @@ mod tests {
         let body = &after[..after
             .find("\n            }\n")
             .expect("找不到 ConnectOk 分支的结尾")];
-        // D1:`ConnectOk` 现在两条分支各开一次 —— SFTP 那条(`wants_sftp`)
-        // 开 `TabContent::Files`,终端那条开 `TabContent::Terminal`,断言两次
-        // 都要出现 `self.tabs.open(`。
+        // D1:`ConnectOk` 两条分支各摆一次标签 —— SFTP 那条(`wants_sftp`)
+        // 摆 `TabContent::Files`,终端那条摆 `TabContent::Terminal`。
+        // F37:两处都改走 `place_tab`(它在没有 `pending_restore` 时**就是**
+        // `self.tabs.open`,见 `replace_target` 的三条测试),断言两处都在。
         assert_eq!(
-            body.matches("self.tabs.open(").count(),
+            body.matches("self.place_tab(").count(),
             2,
-            "ConnectOk 里应该有两条 self.tabs.open(——SFTP 分支一条,终端分支一条"
+            "ConnectOk 里应该有两条 self.place_tab(——SFTP 分支一条,终端分支一条"
+        );
+        assert!(
+            !body.contains("self.tabs.open("),
+            "ConnectOk 里还有绕过 place_tab 直接开标签的分支 —— 那条路上重连会开出第二个标签,占位标签留在原地"
         );
         assert!(
             !body.contains("close_active"),
             "ConnectOk 里还在顶掉活动标签 —— 在 A 上连 B 会把 A 那条连接静默掐掉"
         );
+    }
+
+    /// F37:重连顶替的是**发起重连的那个标签**,不是活动标签。
+    ///
+    /// 自证会变红:把 `replace_target` 改成 `Some(0)` 或返回活动下标。
+    #[test]
+    fn a_reconnect_replaces_the_tab_that_asked_for_it_not_the_active_one() {
+        use super::replace_target;
+        use crate::shell::tabs::TabId;
+        let ids = [TabId(10), TabId(20), TabId(30)];
+        assert_eq!(replace_target(Some(TabId(10)), &ids), Some(0));
+        assert_eq!(replace_target(Some(TabId(30)), &ids), Some(2));
+    }
+
+    /// F36 不许被 F37 破坏:**普通连接**(没有在途的重连)照旧开新标签,
+    /// 不顶掉任何已有标签——顶掉的话在标签 A 上连 B 会把 A 那条连接掐掉。
+    #[test]
+    fn connecting_without_a_pending_restore_still_opens_a_new_tab() {
+        use super::replace_target;
+        use crate::shell::tabs::TabId;
+        assert_eq!(replace_target(None, &[TabId(10), TabId(20)]), None);
+    }
+
+    /// 占位标签在拨号途中被用户关掉了:退回开新标签,**不能把连上的东西丢掉**
+    /// (那就成了「点了重连,什么都没发生」)。
+    #[test]
+    fn a_pending_restore_whose_tab_was_closed_falls_back_to_a_new_tab() {
+        use super::replace_target;
+        use crate::shell::tabs::TabId;
+        assert_eq!(replace_target(Some(TabId(99)), &[TabId(10)]), None);
     }
 
     /// **接线守护 / F120**:`ConnectOk` 建标签时必须用 `PanelFrame::new(..)`
@@ -7765,8 +8540,10 @@ mod tests {
              这里会静默漏掉收口,连接/任务缓慢泄漏,且没有任何编译错误提示"
         );
         assert!(
-            body.contains("TabContent::Terminal(t) =>") && body.contains("TabContent::Files(f) =>"),
-            "wind_down 必须对 Terminal/Files 各有一条具名分支,不能少写"
+            body.contains("TabContent::Terminal(t) =>")
+                && body.contains("TabContent::Files(f) =>")
+                && body.contains("TabContent::Restored(_) =>"),
+            "wind_down 必须对 Terminal/Files/Restored 各有一条具名分支,不能少写"
         );
         assert!(
             body.matches("task.abort()").count() >= 2,

@@ -13,6 +13,7 @@ pub mod icon;
 pub mod metrics;
 pub mod pane_title;
 pub mod paste;
+pub mod restored;
 pub mod session_manager;
 pub mod toast;
 pub mod toolbar;
@@ -172,6 +173,10 @@ pub struct UiState {
     /// 「分屏 → 显示/隐藏 pane 标题条」被点了(F83)。app.rs 消费后复位,
     /// 翻转 `Workspace::title_bars` 并重算几何(会改行数 → 必发 window_change)。
     pub toggle_title_bars: bool,
+    /// F37:菜单里点了「全部重连」。**一次性** —— `build_ui` 每帧 take 走转成
+    /// `UiActions::reconnect_all`。中转一层的理由同 `request_disconnect`:
+    /// egui 闭包里借不到 `&mut Tabs`。
+    pub reconnect_all_request: bool,
 
     // --- Task 16:分组管理弹窗(F60)。与会话管理弹窗同构:只写意图,
     // app.rs 在借用释放后统一施加。---
@@ -346,6 +351,13 @@ pub struct UiFrame<'a> {
     /// `files_panel::sidebar`/`content`,由它们再跟各自的 `active_column`
     /// 相与决定具体画在哪一栏。
     pub files_focused: bool,
+    /// F37:活动标签是**恢复出来的占位标签**时,它这一帧要画的东西。
+    /// `None` = 活动标签是真连着的(或 launcher 态)。与 `files_content`
+    /// 互斥 —— 占位标签既没有终端也没有 sftp channel。
+    pub restored: Option<restored::RestoredView<'a>>,
+    /// F37:这一帧一共有几个占位标签(不只活动那个)。菜单里「全部重连」
+    /// 是否可点看它。
+    pub restored_count: usize,
 }
 
 /// 用户这一帧在 UI 上做的、需要 app 事后施加的布局动作。
@@ -409,6 +421,14 @@ pub struct UiActions {
     /// 平台层的类型。同样受上面那条约束:`app.rs::has_real_action` 里有
     /// 对应的一条。
     pub files_drag_out: bool,
+    /// F37:占位标签上按了「重连」,值是**画那一帧时那个标签的身份**。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按钮按下去
+    /// 毫无反应,而恢复出来的标签除了重连没有第二条出路。
+    pub reconnect_tab: Option<crate::shell::tabs::TabId>,
+    /// F37:菜单里按了「全部重连」。逐个占位标签走同一条 `reconnect_tab`
+    /// 的处置路径,不分叉。同样受上面那条约束。
+    pub reconnect_all: bool,
 }
 
 /// 指针此刻还在窗口里没有(F59 / 设计 N1 的判据)。
@@ -512,7 +532,17 @@ pub fn build_ui(
         paste::show(ctx, view, &mut ui_state.paste_reply);
     }
     // 布局按钮组画在菜单栏那一行里(F82),所以点中的预设由 top_menu 返回。
-    actions.preset = chrome::top_menu(ctx, t, ui_state, frame.connected, frame.preset);
+    actions.preset = chrome::top_menu(
+        ctx,
+        t,
+        ui_state,
+        frame.connected,
+        frame.preset,
+        frame.restored_count,
+    );
+    // F37:菜单里那条「全部重连」。take 而不是读 —— 留着的话下一帧会再触发
+    // 一次,用户点一下拉起两轮拨号。
+    actions.reconnect_all = std::mem::take(&mut ui_state.reconnect_all_request);
     // S3:标签栏排在菜单栏之后、状态栏之前 show —— `TopBottomPanel` 按 show 的
     // 先后从窗口边缘往里堆,顺序就是视觉上的上下顺序。
     actions.tab = chrome::tab_bar(ctx, t, frame.tabs);
@@ -624,6 +654,12 @@ pub fn build_ui(
     // D1:标签宿主的文件面板——`CentralPanel`,egui 的 Panel 空间分配规则
     // 决定了它必须是本帧**最后一个** panel 类部件(见 `files_panel::content`
     // 文档),所以放在这里:菜单栏/标签栏/状态栏/各弹窗都已经 show 完。
+    // F37:占位标签的中央区。与上面的 `files_content` 互斥(占位标签没有
+    // sftp channel),同样必须排在所有别的 panel 之后 —— `CentralPanel`
+    // 铺满剩余空间。
+    if let Some(v) = frame.restored {
+        actions.reconnect_tab = restored::show(ctx, t, v);
+    }
     if let Some(files) = files_content {
         let (r, l) = files_panel::content(
             ctx,
@@ -823,6 +859,8 @@ mod tests {
             // `'static` 引用——只在测试进程里泄漏一次,不是生产路径。
             appearance: Box::leak(Box::new(badge::AppearanceCache::default())),
             files_focused: false,
+            restored: None,
+            restored_count: 0,
         }
     }
 
@@ -1688,6 +1726,102 @@ mod tests {
             (closed_w, closed_h),
             "标签宿主应铺满跟终端一样的中央区,不该被额外挤窄:关闭态 {closed_w}x{closed_h}px,标签宿主 {content_w}x{content_h}px"
         );
+    }
+
+    /// F37:`build_ui` 收了 `frame.restored` 却忘了调 `restored::show`,是
+    /// 一种**编译期完全无感**的漏接 —— 中央区什么都不画、什么都不返回,
+    /// `central_px` 也一模一样(`CentralPanel` 只是铺满剩余区,不产生新的
+    /// 边界),没有任何既有断言会红。恢复出来的标签就是一片空白,用户
+    /// 除了关掉它没有别的出路。
+    ///
+    /// 破坏性验证:把 `build_ui` 里 `if let Some(v) = frame.restored { .. }`
+    /// 整段删掉 —— 会话名画不出来,断言变红。
+    #[test]
+    fn build_ui_actually_draws_the_restored_placeholder_when_given_one() {
+        let frame = UiFrame {
+            restored: Some(restored::RestoredView {
+                tab_id: crate::shell::tabs::TabId(3),
+                title: "占位会话名",
+                panes: 2,
+                dialing: false,
+            }),
+            restored_count: 1,
+            ..base_frame()
+        };
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut text = String::new();
+        for _ in 0..2 {
+            let (out, _) = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
+            text = collect_text(&out);
+        }
+        assert!(
+            text.contains("占位会话名"),
+            "占位中央区没画出来 —— build_ui 收了 frame.restored 却没接上 \
+             restored::show,实际画出来的文本: {text}"
+        );
+        assert!(
+            text.contains("重连"),
+            "占位中央区没有「重连」按钮 —— 恢复出来的标签就没有出路了,\
+             实际画出来的文本: {text}"
+        );
+    }
+
+    /// F37:点「重连」必须一路穿到 `UiActions::reconnect_tab`。上一条只证明
+    /// 「画出来了」,这条证明「按下去有人接」—— 两者缺一,现象都是「按钮
+    /// 在那儿,按了没反应」。
+    ///
+    /// 破坏性验证:把 `actions.reconnect_tab = restored::show(..)` 改成
+    /// `let _ = restored::show(..)`。
+    #[test]
+    fn build_ui_clicking_reconnect_wires_through_to_actions_f37() {
+        let frame = UiFrame {
+            restored: Some(restored::RestoredView {
+                tab_id: crate::shell::tabs::TabId(3),
+                title: "占位会话名",
+                panes: 2,
+                dialing: false,
+            }),
+            restored_count: 1,
+            ..base_frame()
+        };
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut out = None;
+        for _ in 0..2 {
+            let (o, _) = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
+            out = Some(o);
+        }
+        let pos = text_pos(&out.expect("至少跑过一帧"), "重连").expect("中央区里没有「重连」按钮");
+        let mut input = egui::RawInput::default();
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let (_, actions) = run_frame(&ctx, &mut ui_state, frame, input, None);
+        assert_eq!(
+            actions.reconnect_tab,
+            Some(crate::shell::tabs::TabId(3)),
+            "点了「重连」却没落进 UiActions —— app.rs 那侧永远收不到"
+        );
+    }
+
+    /// 本帧画出来的、内容恰好等于 `label` 的那段文字的中心点。点按钮用。
+    fn text_pos(out: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, label)),
+                egui::Shape::Text(ts) if ts.galley.text() == label => {
+                    Some(ts.pos + ts.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|cs| find(&cs.shape, label))
     }
 
     /// D1:光比对 `central_px` 的「不变」测不出「`build_ui` 干脆没调

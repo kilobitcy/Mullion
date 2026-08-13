@@ -158,7 +158,15 @@ pub struct PresetPlan {
 /// 还必须互不重复 —— `keep` 是用 `!close.contains(id)` 过滤出来的,重复 id 会
 /// 让这条过滤行为不可预测。
 pub fn plan_preset(preset: Preset, current: &[(PaneId, PaneStatus)]) -> PresetPlan {
-    let want = preset.pane_count();
+    plan_for_count(preset.pane_count(), current)
+}
+
+/// [`plan_preset`] 的按数量版本。F37 恢复任意树形状时用得到 —— 恢复出来的
+/// 叶子数是**文件里存的**,不对应任何一个 `Preset`。
+///
+/// 保留/新建/关闭的取舍逻辑与预设完全一致,故意共用一份:两处各写一遍的话,
+/// 「减屏时先关已断开的」这类取舍迟早会在其中一处走样。
+pub fn plan_for_count(want: usize, current: &[(PaneId, PaneStatus)]) -> PresetPlan {
     if current.len() <= want {
         return PresetPlan {
             keep: current.iter().map(|(id, _)| *id).collect(),
