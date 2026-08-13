@@ -243,8 +243,8 @@ pub(super) fn basic(
         // 昨天还是好的。要换协议就新建一条(同 D1 接受的代价)。
         //
         // 原来这里是个能选 sftp 的下拉 + 一句「sftp 尚未实现,连接会按 ssh
-        // 处理」。那条路本来就通向 `SftpNotSupported`,现在 SFTP 节点有自己
-        // 的一档(F118),这个下拉连同那句话一起下线。
+        // 处理」。SFTP 节点有了自己的一档(F118),D1 起同一套映射会给它算出
+        // 拨号参数(带 `wants_sftp`),这个下拉连同那句话一起下线。
         ui.label(match buf.protocol {
             Protocol::Ssh => "ssh",
             Protocol::Sftp => "sftp",
@@ -1622,9 +1622,94 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
     });
 }
 
+/// F120:SFTP 默认目录 + 书签。`SftpPrefs` 不参与分组继承(D15)——不需要
+/// `inherit_row`/三态那一整套,是全页面最简单的一张纯字段表单。
+///
+/// `first` 由调用方(`editor.rs` 的 Tab 分发)传进来而不是像 `auth`/
+/// `automation`/`appearance` 那样自己 `let mut first = true`:这一页目前
+/// 只有两节,让调用方持有游标,将来要跟别的内容拼一页也不用改签名。
+pub(super) fn sftp(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, first: &mut bool) {
+    section(ui, t, "默认目录", first);
+    grid(ui, "sm_sftp_dirs", |ui| {
+        ui.label("默认远端目录");
+        ui.add(
+            egui::TextEdit::singleline(&mut buf.sftp_default_remote)
+                .hint_text(crate::theme::hint_text(t, "留空 = 登录目录"))
+                .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0)),
+        );
+        ui.end_row();
+
+        ui.label("默认本地目录");
+        ui.add(
+            egui::TextEdit::singleline(&mut buf.sftp_default_local)
+                .hint_text(crate::theme::hint_text(t, "留空 = 用户主目录(USERPROFILE)"))
+                .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0)),
+        );
+        ui.end_row();
+    });
+
+    section(ui, t, "书签", first);
+    grid(ui, "sm_sftp_bookmarks", |ui| {
+        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.label("书签");
+        });
+        ui.vertical(|ui| bookmark_editor(ui, t, &mut buf.sftp_bookmarks));
+        ui.end_row();
+    });
+}
+
+/// 书签列表的逐条编辑:名称 + 路径 + 删除。不支持拖拽排序(D1 明确排除)。
+///
+/// 名称允许留空 —— 那时界面(书签栏)回退显示路径本身,`Bookmark` 的文档
+/// 注释里已经写明这是有意的合法状态,这里的 hint 只是把话说给填表的人听。
+fn bookmark_editor(ui: &mut Ui, t: &Theme, bookmarks: &mut Vec<(String, String)>) {
+    // 同「登录后」页命令列表那个坑(见 `sm_auto_cmds_gen` 处的长注释):`TextEdit`
+    // 的光标/选区/撤销栈按**位置 id** 跨帧存活,删掉中间一条会让后面的行整体
+    // 上移一格、套上前一行遗留的状态。这里没有天然稳定 key 可用(书签就是两个
+    // 可编辑字符串,拿内容当 salt 会导致每敲一个字就换 id、状态每帧丢),所以
+    // 照搬那边的做法:只在结构变化时 +1 的世代号当 salt,删完全体换 id。
+    let gen_id = egui::Id::new("sm_sftp_bookmarks_gen");
+    let generation: u64 = ui.data(|d| d.get_temp(gen_id).unwrap_or(0));
+
+    let mut remove: Option<usize> = None;
+    for (i, (name, path)) in bookmarks.iter_mut().enumerate() {
+        ui.push_id((generation, i), |ui| {
+            ui.horizontal(|ui| {
+                use crate::ui::icon::{icon_button, Glyph};
+                // 自绘图标,不用 "✕" 文字:同 `chain_editor`——U+2715 在 egui
+                // 内置拉丁字体和微软雅黑里都没有,实机上渲染成豆腐块。
+                if icon_button(ui, Glyph::Cross, true, "删除书签") {
+                    remove = Some(i);
+                }
+                ui.add(
+                    egui::TextEdit::singleline(name)
+                        .hint_text("名称(留空则显示路径)")
+                        .desired_width(field_w(ui.available_width(), FIELD_W_S, 0.0)),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(path)
+                        .hint_text("远端路径")
+                        .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0)),
+                );
+            });
+        });
+    }
+    if bookmarks.is_empty() {
+        ui.colored_label(crate::theme::c32(t.fg_dimmer), "还没加书签。");
+    }
+    if let Some(i) = remove {
+        bookmarks.remove(i);
+        ui.data_mut(|d| d.insert_temp(gen_id, generation.wrapping_add(1)));
+    }
+    if ui.button("+ 添加书签").clicked() {
+        bookmarks.push((String::new(), String::new()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{auth, automation, basic, key_candidate_combo, network, tri_state};
+    use crate::theme::Theme;
     use crate::ui::session_manager::{
         AuthKindUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
     };
@@ -1659,6 +1744,58 @@ mod tests {
         let mut out = Vec::new();
         shapes.iter().for_each(|cs| walk(&cs.shape, &mut out));
         out
+    }
+
+    /// SFTP 页测试用的最小样本缓冲。
+    fn sample_buffer() -> EditorBuffer {
+        EditorBuffer::default()
+    }
+
+    /// 跑两帧(第一帧只让布局稳定,egui `Panel`/`Area` 首帧 fade_in 只记
+    /// `Shape::Noop`),把第二帧画出的所有文字收集起来。`run_page`/`all_text`
+    /// 已经是这套两帧手法,这里只是包一层把 `Theme` 也递给 `page`。
+    fn render_texts(mut page: impl FnMut(&mut egui::Ui, &Theme)) -> Vec<String> {
+        let t = crate::theme::MULLION_DARK;
+        let out = run_page(|ui| page(ui, &t));
+        all_text(&out.shapes)
+    }
+
+    /// F120:两个默认目录 + 书签列表都要在「SFTP」页上画得出来。
+    /// 判据是画出来的文本 —— 只断言函数存在等于什么都没测。
+    #[test]
+    fn the_sftp_section_shows_both_default_directories_and_the_bookmarks() {
+        let mut buf = sample_buffer();
+        buf.sftp_default_remote = "/srv/app".into();
+        buf.sftp_default_local = r"D:\work".into();
+        buf.sftp_bookmarks = vec![("日志".into(), "/var/log".into())];
+
+        let texts = render_texts(|ui, t| {
+            let mut first = true;
+            super::sftp(ui, t, &mut buf, &mut first);
+        });
+        assert!(texts.iter().any(|s| s.contains("默认远端目录")));
+        assert!(texts.iter().any(|s| s.contains("默认本地目录")));
+        assert!(texts.iter().any(|s| s.contains("日志")));
+        assert!(texts.iter().any(|s| s.contains("/var/log")));
+    }
+
+    /// 留空要说清缺省是什么 —— 否则用户不知道「不填」会发生什么,
+    /// 只能试(F119 的空态文案规范)。
+    #[test]
+    fn empty_default_directories_explain_what_happens_instead() {
+        let mut buf = sample_buffer();
+        buf.sftp_default_remote.clear();
+        buf.sftp_default_local.clear();
+        let texts = render_texts(|ui, t| {
+            let mut first = true;
+            super::sftp(ui, t, &mut buf, &mut first);
+        });
+        let all = texts.join(" ");
+        assert!(all.contains("登录目录"), "远端留空的缺省要写出来: {all}");
+        assert!(
+            all.contains("用户主目录") || all.contains("USERPROFILE"),
+            "本地留空的缺省要写出来: {all}"
+        );
     }
 
     /// 「登录后」页继承测试用的分组:只填 `automation`,其余取默认。
@@ -1759,7 +1896,8 @@ mod tests {
     }
 
     /// 走查 19 后半原本测的是「sftp 在下拉里跟 ssh 平级,选了保存后连不上,
-    /// 界面上要有提示」——那条路本来就通向 `SftpNotSupported`。F118 给了
+    /// 界面上要有提示」——D1 起 SFTP 节点走同一条映射,只是多带
+    /// `wants_sftp`,不再有「连不上」这回事。F118 给了
     /// SFTP 节点自己的一档,拨号路径已经实现,协议此后只读(D3),那个下拉
     /// 连同「未实现」提示一起下线。这条测试改测 D3 实际留下的行为:
     /// `Protocol::Sftp` 就该显示成纯文本「sftp」,不再提未实现,也不再是
@@ -2445,6 +2583,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use mullion_ssh::config::SshConfig;
 use mullion_store::{MasterKeySource, SessionDraft, SessionId, SessionRecord, StoreError, Vault};
 
-use super::session_map::{to_ssh_config, MapError};
+use super::session_map::{to_dial_plan, DialPlan, MapError};
 use crate::ui::session_manager::SecretPresence;
 
 /// mullion 的配置目录(Windows `%APPDATA%\mullion\`、Linux `~/.config/mullion/`)。
@@ -176,10 +176,24 @@ impl SessionStore {
     ///
     /// 拨号链在这里物化:代理来自继承解析,跳板来自引用图展开。
     /// 跳板悬空/成环会在此**硬失败**——静默直连会让用户以为流量过了堡垒机(设计 §6)。
+    ///
+    /// 丢弃 `wants_sftp`——隧道那条调用(`start_tunnel`)永远只连 SSH 会话
+    /// (D7:SFTP 不参与隧道),这一位对它没有意义。点「连接」需要这一位来
+    /// 决定开终端标签还是文件标签,走 `dial_plan_for`(Task 10)。
     pub fn ssh_config_for(&self, id: SessionId) -> Result<SshConfig, StoreOpenError> {
+        self.dial_plan_for(id).map(|(cfg, _)| cfg)
+    }
+
+    /// 同 `ssh_config_for`,多带回 `wants_sftp`(D24/F50:SFTP 节点连上后开
+    /// sftp subsystem 而不是 PTY)。两者共用同一套解析内核,不是分叉的第二条
+    /// 拨号逻辑——否则「哪条会正确映射」这类偏差迟早出现。
+    pub fn dial_plan_for(&self, id: SessionId) -> Result<(SshConfig, bool), StoreOpenError> {
         let rec = self.vault.get(id).ok_or(StoreOpenError::NotFound(id))?;
         let secret = self.vault.secret(id);
-        let mut cfg = to_ssh_config(rec, secret)?;
+        let DialPlan {
+            mut cfg,
+            wants_sftp,
+        } = to_dial_plan(rec, secret)?;
 
         let resolved = self.vault.resolve_for(id)?;
         let jumps = self.vault.expand_jump_chain(id)?;
@@ -189,7 +203,7 @@ impl SessionStore {
             &|jid| self.vault.secret(jid).cloned(),
             secret,
         );
-        Ok(cfg)
+        Ok((cfg, wants_sftp))
     }
 
     /// 按**草稿**(含未保存改动)组 SshConfig。「测试连接」(F92)用。
@@ -203,7 +217,8 @@ impl SessionStore {
     pub fn ssh_config_for_draft(&self, draft: &SessionDraft) -> Result<SshConfig, StoreOpenError> {
         let rec = draft_to_record(draft);
         let secret = draft.secret.as_ref();
-        let mut cfg = to_ssh_config(&rec, secret)?;
+        // 同上:`wants_sftp` 先丢弃,Task 10 才真正接线。
+        let DialPlan { mut cfg, .. } = to_dial_plan(&rec, secret)?;
 
         let resolved = self.vault.resolve_layer(draft, draft.identity.group_id);
         let jumps = self.vault.expand_jump_chain_of(&resolved.jump)?;
@@ -217,7 +232,7 @@ impl SessionStore {
     }
 }
 
-/// 草稿 → 临时 `SessionRecord`,只为喂给 `to_ssh_config`。
+/// 草稿 → 临时 `SessionRecord`,只为喂给 `to_dial_plan`。
 /// 它只读 `connection` / `auth`,`id` 与 `modified_at` 是占位,
 /// 不入库、不外泄 —— 草稿本来就还没有 id。
 fn draft_to_record(d: &SessionDraft) -> SessionRecord {
@@ -231,6 +246,7 @@ fn draft_to_record(d: &SessionDraft) -> SessionRecord {
         appearance: d.appearance.clone(),
         network: d.network.clone(),
         automation: d.automation.clone(),
+        sftp: Default::default(),
     }
 }
 
@@ -263,6 +279,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
             secret: Some(SecretEntry {
                 password: Some("pw".into()),
                 passphrase: None,

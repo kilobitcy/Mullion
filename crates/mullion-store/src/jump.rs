@@ -153,6 +153,7 @@ mod tests {
                 jump: Some(jump.into_iter().map(|i| JumpRef(SessionId(i))).collect()),
             },
             automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
         }
     }
 

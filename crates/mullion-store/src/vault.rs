@@ -37,6 +37,8 @@ pub struct SessionDraft {
     pub appearance: AppearancePrefs,
     pub network: crate::network::NetworkPrefs,
     pub automation: crate::automation::AutomationPrefs,
+    /// F120:SFTP 默认目录 + 书签(D15:纯会话字段,不参与分组继承)。
+    pub sftp: crate::sftp::SftpPrefs,
     /// 敏感部分(密码/口令);无则 None。
     pub secret: Option<SecretEntry>,
 }
@@ -180,6 +182,7 @@ impl Vault {
             appearance: draft.appearance,
             network: draft.network,
             automation: draft.automation,
+            sftp: draft.sftp,
         });
         id
     }
@@ -203,6 +206,7 @@ impl Vault {
         rec.appearance = draft.appearance;
         rec.network = draft.network;
         rec.automation = draft.automation;
+        rec.sftp = draft.sftp;
         rec.modified_at = now_rfc3339.to_string();
         match draft.secret {
             Some(sec) => {
@@ -541,6 +545,7 @@ mod tests {
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
             secret: Some(SecretEntry {
                 password: Some(pw.into()),
                 passphrase: None,
@@ -1139,6 +1144,65 @@ port = 7891
         assert_eq!(v.resolve_for(sid2).unwrap().scrollback, DEFAULT_SCROLLBACK);
     }
 
+    /// F120:SFTP 偏好必须**存得进盘、也改得动**。
+    ///
+    /// 这条补的是一个真实缺口:schema v8 只给 `SessionRecord` 加了 `sftp`,
+    /// `SessionDraft` 上没有对应字段 —— `add` 硬写 `SftpPrefs::default()`、
+    /// `update` 压根不碰它。症状是**编辑器里填了、点保存、重开全没了**,
+    /// 且没有任何报错。补上字段之后仍然零守护:实测把 `update` 里
+    /// `rec.sftp = draft.sftp;` 整行删掉、或把 `add` 里 `sftp: draft.sftp`
+    /// 改回 `SftpPrefs::default()`,全 workspace 测试**一条都不红**。
+    ///
+    /// 所以这里两条路径都要走到:`add`(新建)与 `update`(改已有),
+    /// 而且都要**存盘再重开**,不能只查内存里那份 —— 只查内存的话,
+    /// 序列化漏字段(比如 `skip_serializing_if` 写错)照样测不出来。
+    #[test]
+    fn sftp_prefs_survive_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let mut d = draft();
+            d.sftp = crate::sftp::SftpPrefs {
+                default_remote: Some("/srv/app".into()),
+                default_local: None,
+                bookmarks: vec![crate::sftp::Bookmark {
+                    name: "日志".into(),
+                    path: "/var/log".into(),
+                }],
+            };
+            id = v.add(d, "2026-08-13T00:00:00Z");
+            v.save().unwrap();
+        }
+        {
+            let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let rec = v.get(id).unwrap();
+            assert_eq!(rec.sftp.default_remote.as_deref(), Some("/srv/app"));
+            assert_eq!(rec.sftp.bookmarks.len(), 1, "书签在新建这条路径上丢了");
+            assert_eq!(rec.sftp.bookmarks[0].path, "/var/log");
+        }
+        // 再走一遍 `update`:新建存得住不代表改得动,两条是分开的写入口。
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let mut d = draft();
+            d.sftp.default_remote = Some("/opt/data".into());
+            v.update(id, d, "2026-08-13T01:00:00Z").unwrap();
+            v.save().unwrap();
+        }
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let rec = v.get(id).unwrap();
+        assert_eq!(
+            rec.sftp.default_remote.as_deref(),
+            Some("/opt/data"),
+            "update 没把 SFTP 偏好写回去 —— 用户改了保存,下次打开还是旧值"
+        );
+        assert!(
+            rec.sftp.bookmarks.is_empty(),
+            "update 是整体覆盖语义(与 terminal/network 那几节一致):\
+             这一版 draft 没带书签,存回去就该是空的"
+        );
+    }
+
     #[test]
     fn groups_survive_save_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -1177,6 +1241,7 @@ port = 7891
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
             secret: None,
         }
     }

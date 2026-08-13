@@ -119,6 +119,7 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
         })
         .collect();
     Ok(SessionsFile {
@@ -250,11 +251,11 @@ kind = "password"
     }
 
     /// 版本号是**故意**钉死的:动它就意味着用户的库要迁移一次,不该被
-    /// 顺手改掉。v7 的理由见 `CURRENT_SCHEMA` 文档 —— 新增 `[[tunnel]]`,
-    /// 旧客户端读 v7 会把整个隧道数组丢掉再写回,拒绝比静默吃掉好。
+    /// 顺手改掉。v8 的理由见 `CURRENT_SCHEMA` 文档 —— 新增 `session.sftp`,
+    /// 旧客户端读 v8 会把整个分节丢掉再写回,拒绝比静默吃掉好。
     #[test]
-    fn current_schema_is_seven() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 7);
+    fn current_schema_is_eight() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 8);
     }
 
     /// v5 的库里存的 emoji 图标**必须原样读得出来**。
@@ -393,6 +394,67 @@ session_name = "claude"
         );
         assert_eq!(file.group.len(), 1, "分组不该在升版本时丢掉");
         assert_eq!(file.group[0].name, "生产");
+    }
+
+    /// v7 的库升 v8 **不需要任何迁移代码** —— 新字段全部 `#[serde(default)]`。
+    /// 这条是来证明它确实自动成立的:v7 文件读进来 → 新字段是缺省 → 其余
+    /// 逐字段等价。写不出这条断言就说明某个新字段忘了加 `default`,那时
+    /// 用户的 v7 库会直接反序列化失败。
+    #[test]
+    fn a_v7_library_without_the_sftp_key_loads_with_defaults_and_keeps_everything_else() {
+        let v7 = r#"
+schema_version = 7
+
+[[session]]
+id = 7
+modified_at = "2026-08-01T00:00:00Z"
+
+[session.identity]
+name = "机器 A"
+
+[session.connection]
+host = "10.0.0.1"
+port = 22
+protocol = "ssh"
+
+[session.auth]
+user = "ubuntu"
+kind = "password"
+"#;
+        let file: crate::model::SessionsFile = toml::from_str(v7).unwrap();
+        let rec = &file.session[0];
+        assert_eq!(rec.identity.name, "机器 A");
+        assert_eq!(rec.connection.host, "10.0.0.1");
+        assert_eq!(rec.auth.user, "ubuntu");
+        // 新分节整体缺省。
+        assert_eq!(rec.sftp, crate::sftp::SftpPrefs::default());
+        assert!(rec.sftp.default_remote.is_none());
+        assert!(rec.sftp.default_local.is_none());
+        assert!(rec.sftp.bookmarks.is_empty());
+    }
+
+    /// 反过来:带 sftp 分节的 v8 存一遍读一遍要**等价**,书签顺序不许变
+    /// (用户是按自己的顺序排的,重排一次就再也信不过这个列表)。
+    #[test]
+    fn sftp_prefs_survive_a_save_load_round_trip_with_bookmark_order_intact() {
+        let prefs = crate::sftp::SftpPrefs {
+            default_remote: Some("/srv/app".into()),
+            default_local: Some(r"D:\work".into()),
+            bookmarks: vec![
+                crate::sftp::Bookmark {
+                    name: "日志".into(),
+                    path: "/var/log".into(),
+                },
+                crate::sftp::Bookmark {
+                    name: "配置".into(),
+                    path: "/etc/nginx".into(),
+                },
+            ],
+        };
+        let text = toml::to_string(&prefs).unwrap();
+        let back: crate::sftp::SftpPrefs = toml::from_str(&text).unwrap();
+        assert_eq!(back, prefs);
+        assert_eq!(back.bookmarks[0].name, "日志", "书签顺序不许变");
     }
 
     /// 反过来:v6 存的 .ico 图标要能完整往返,底色跟着走。

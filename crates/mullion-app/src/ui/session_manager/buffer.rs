@@ -120,6 +120,13 @@ pub struct EditorBuffer {
     /// `is_dirty` 比对,一条错误提示会让「什么都没改成」的表单显示成脏的、
     /// 切走时白弹一次确认(触碰位当初也是为了这个搬去 `UiState` 的)。
     pub pick_icon_clicked: bool,
+
+    /// F120:SFTP 默认远端目录。空 = 用登录目录。
+    pub sftp_default_remote: String,
+    /// F120:SFTP 默认本地目录。空 = 用用户主目录。
+    pub sftp_default_local: String,
+    /// F120:远端书签 `(名称, 路径)`。顺序即用户排的顺序,保存时不许重排。
+    pub sftp_bookmarks: Vec<(String, String)>,
 }
 
 impl Default for EditorBuffer {
@@ -155,6 +162,9 @@ impl Default for EditorBuffer {
             preserved_automation: AutomationPrefs::default(),
             pick_key_clicked: false,
             pick_icon_clicked: false,
+            sftp_default_remote: String::new(),
+            sftp_default_local: String::new(),
+            sftp_bookmarks: Vec::new(),
         }
     }
 }
@@ -233,6 +243,9 @@ impl std::fmt::Debug for EditorBuffer {
             .field("preserved_terminal", &self.preserved_terminal)
             .field("preserved_appearance", &self.preserved_appearance)
             .field("preserved_automation", &self.preserved_automation)
+            .field("sftp_default_remote", &self.sftp_default_remote)
+            .field("sftp_default_local", &self.sftp_default_local)
+            .field("sftp_bookmarks", &self.sftp_bookmarks)
             .finish()
     }
 }
@@ -284,6 +297,14 @@ impl EditorBuffer {
             preserved_terminal: rec.terminal.clone(),
             preserved_appearance: rec.appearance.clone(),
             preserved_automation: rec.automation.clone(),
+            sftp_default_remote: rec.sftp.default_remote.clone().unwrap_or_default(),
+            sftp_default_local: rec.sftp.default_local.clone().unwrap_or_default(),
+            sftp_bookmarks: rec
+                .sftp
+                .bookmarks
+                .iter()
+                .map(|b| (b.name.clone(), b.path.clone()))
+                .collect(),
             ..Self::default()
         };
         match &rec.network.proxy {
@@ -623,6 +644,25 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
         appearance: buf.preserved_appearance.clone(),
         network: NetworkPrefs { proxy, jump },
         automation: buf.preserved_automation.clone(),
+        sftp: mullion_store::SftpPrefs {
+            default_remote: {
+                let v = buf.sftp_default_remote.trim();
+                (!v.is_empty()).then(|| v.to_string())
+            },
+            default_local: {
+                let v = buf.sftp_default_local.trim();
+                (!v.is_empty()).then(|| v.to_string())
+            },
+            bookmarks: buf
+                .sftp_bookmarks
+                .iter()
+                .filter(|(_, path)| !path.trim().is_empty())
+                .map(|(name, path)| mullion_store::Bookmark {
+                    name: name.clone(),
+                    path: path.clone(),
+                })
+                .collect(),
+        },
         secret: None,
     };
     sync_has_passphrase(&mut draft, secret.as_ref());
@@ -688,6 +728,7 @@ mod tests {
             appearance: AppearancePrefs::default(),
             network: NetworkPrefs { proxy: None, jump },
             automation: AutomationPrefs::default(),
+            sftp: Default::default(),
         }
     }
 
@@ -829,6 +870,7 @@ mod tests {
                 enabled: Some(false),
                 ..Default::default()
             },
+            sftp: Default::default(),
         };
 
         let editor_buf = EditorBuffer::from_record(&rec);
@@ -892,10 +934,68 @@ mod tests {
                 jump: Some(vec![JumpRef(SessionId(2))]),
             },
             automation: AutomationPrefs::default(),
+            sftp: Default::default(),
         };
         let buf = EditorBuffer::from_record(&rec);
         let draft = build_draft(&buf).unwrap();
         assert_eq!(draft.network, rec.network, "代理与跳板必须原样往返");
+    }
+
+    /// F120:SFTP 默认目录 + 书签必须原样往返,不能被 `build_draft` 悄悄丢掉
+    /// —— 这是 Task 11 的核心断言,`build_draft` 的 `SessionDraft` 字面量里
+    /// 若漏掉 `sftp: ...` 这一支,这条测试要能抓到。
+    #[test]
+    fn sftp_prefs_survive_the_editor_round_trip() {
+        let mut rec = rec_with_jump(None);
+        rec.sftp = mullion_store::SftpPrefs {
+            default_remote: Some("/srv/app".into()),
+            default_local: Some(r"D:\work".into()),
+            bookmarks: vec![mullion_store::Bookmark {
+                name: "日志".into(),
+                path: "/var/log".into(),
+            }],
+        };
+        let buf = EditorBuffer::from_record(&rec);
+        let draft = build_draft(&buf).unwrap();
+        assert_eq!(draft.sftp, rec.sftp, "SFTP 默认目录与书签必须原样往返");
+    }
+
+    /// **F120 记录一处刻意保留的超范围行为**:路径是纯空白的书签行会在
+    /// `build_draft` 里被**静默丢弃**(`.filter(|(_, path)| !path.trim().is_empty())`)。
+    /// 计划原文没要求这个过滤,是实现时顺手加的——复核判定「超范围」。
+    ///
+    /// **决定保留,不改成报错**:一条路径是空白的书签本来就点了也去不了
+    /// 哪里,存一条这样的书签比静默清掉它更糟——用户会在文件面板里点开一个
+    /// 无法解释的空路径。改成报错又会让「书签名填了、路径没顾上填」这种
+    /// 半成品编辑状态挡住整张表单保存,惩罚过重。丢弃是两害相权的选择,这
+    /// 条测试把它钉死,不许在未来的重构里退化成「原样存下去」或「报错」。
+    ///
+    /// 自证会变红:把 `build_draft` 里的
+    /// `.filter(|(_, path)| !path.trim().is_empty())` 删掉——两条书签都会被
+    /// 存下来,第一条 `assert_eq!`(长度必须是 1)会失败。
+    #[test]
+    fn build_draft_silently_drops_bookmarks_with_a_blank_path() {
+        let buf = EditorBuffer {
+            sftp_bookmarks: vec![
+                ("日志".into(), "/var/log".into()),
+                ("空白".into(), "   ".into()),
+            ],
+            ..buf()
+        };
+        let draft = build_draft(&buf).unwrap();
+        assert_eq!(
+            draft.sftp.bookmarks.len(),
+            1,
+            "路径是纯空白的书签必须被丢弃,不能原样存进去"
+        );
+        assert_eq!(
+            draft.sftp.bookmarks[0],
+            mullion_store::Bookmark {
+                name: "日志".into(),
+                path: "/var/log".into(),
+            },
+            "留下来的那一条必须是路径非空的那条,内容不能走样"
+        );
     }
 
     /// 分组代理下,会话选「不使用代理」必须落成显式 `Direct` 而非 `None`——
@@ -1577,6 +1677,43 @@ mod tests {
         assert!(
             is_dirty(&buf, &baseline),
             "改了外观表单必须判脏,否则切换会话时改动被静默丢弃"
+        );
+    }
+
+    /// **F120 补零覆盖**:`is_dirty` 靠 `EditorBuffer` 整体 derive 的
+    /// `PartialEq` 白拿到了 SFTP 三个字段(`sftp_default_remote`/
+    /// `sftp_default_local`/`sftp_bookmarks`)的比对,这件事本身没有任何断言
+    /// 撑着。复核实测:把这三个字段从比对里剔除,全 workspace 零变红。
+    ///
+    /// 逐字段验:三个字段各改一次都要单独判脏,不能只改一个就收工——否则
+    /// 挡不住「漏了其中一个字段」这种局部退化。
+    ///
+    /// 自证会变红:给 `EditorBuffer` 手写一份跳过这三个字段的 `PartialEq`
+    /// (或者把它们挪进一个不参与 derive 比对的旁路结构),同 `preserved_appearance`
+    /// 那条测试文档里提到的风险。
+    #[test]
+    fn editing_sftp_prefs_makes_the_form_dirty_field_by_field() {
+        let baseline = EditorBuffer::default();
+
+        let mut remote_changed = baseline.clone();
+        remote_changed.sftp_default_remote = "/srv/app".into();
+        assert!(
+            is_dirty(&remote_changed, &baseline),
+            "改了默认远端目录必须判脏"
+        );
+
+        let mut local_changed = baseline.clone();
+        local_changed.sftp_default_local = r"D:\work".into();
+        assert!(
+            is_dirty(&local_changed, &baseline),
+            "改了默认本地目录必须判脏"
+        );
+
+        let mut bookmarks_changed = baseline.clone();
+        bookmarks_changed.sftp_bookmarks = vec![("日志".into(), "/var/log".into())];
+        assert!(
+            is_dirty(&bookmarks_changed, &baseline),
+            "改了书签列表必须判脏"
         );
     }
 

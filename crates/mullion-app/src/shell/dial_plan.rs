@@ -120,6 +120,7 @@ mod tests {
             appearance: Default::default(),
             network: NetworkPrefs::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 

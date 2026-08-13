@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.32"
+version = "0.1.33"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -20,6 +20,10 @@ vte = "0.15"
 # 加密后端用 ring(非默认 aws-lc-rs):避免 aws-lc-sys 的 C/汇编构建,
 # Linux→Windows 交叉编译干净、原生 Windows 编译也免装 NASM。RSA 密钥仍走独立的 rsa crate。
 russh = { version = "0.54", default-features = false, features = ["ring", "flate2", "rsa"] }
+# SFTP v3 协议层(F50)。**不依赖 russh 本身**(已核实 2.4.0 的依赖只有 bytes/chrono/
+# dashmap/serde/serde_bytes/thiserror/bitflags/log/tokio/tokio-util),吃任意
+# AsyncRead+AsyncWrite,与锁定的 russh 0.54 不会版本打架。
+russh-sftp = "2.4.0"
 winit = "0.30"
 wgpu = "23"
 glyphon = "0.7"

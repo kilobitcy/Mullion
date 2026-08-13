@@ -109,6 +109,7 @@ mod tests {
                 jump: jump.map(|v| v.into_iter().map(|i| JumpRef(SessionId(i))).collect()),
             },
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 

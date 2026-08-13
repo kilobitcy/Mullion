@@ -154,6 +154,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 

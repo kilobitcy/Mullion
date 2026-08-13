@@ -15,6 +15,28 @@ pub enum Route {
     Egui,
     /// 交给终端原路:键盘走 keymap+PtyWrite、鼠标走 SGR 上报(Shift 逃生门 T5)。
     Terminal,
+    /// 交给文件面板(F50)。只有键盘会走到这里,指针照旧先喂 egui 后判。
+    FilesPanel,
+}
+
+/// 键盘焦点在哪一侧(F6 / 设计 D23)。文件面板不存在 / 没开时恒为 `Terminal`——
+/// 见 `crate::app::App::effective_focus` 按上下文夹紧的说明。
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum Focus {
+    #[default]
+    Terminal,
+    FilesPanel,
+}
+
+impl Focus {
+    /// F6 在两侧之间来回(设计 D23)。**不用 `Ctrl+Tab`**——D0 已经把它给了
+    /// 标签切换;面板内的 `Tab` 另有用处(远端栏↔本地栏)。
+    pub fn toggled(self) -> Self {
+        match self {
+            Focus::Terminal => Focus::FilesPanel,
+            Focus::FilesPanel => Focus::Terminal,
+        }
+    }
 }
 
 /// egui 是否应该看到这个事件(即是否喂给 `egui_winit::State::on_window_event`)。
@@ -56,6 +78,45 @@ pub fn route(
         Route::Egui
     } else {
         Route::Terminal
+    }
+}
+
+/// [`route`] 的带焦点版本。面板不存在时传 `Focus::Terminal`,行为与 [`route`]
+/// 完全一致。
+///
+/// 优先级:模态 > 面板焦点 > egui 想不想要。模态排最前是因为会话管理器开着时
+/// 按 Enter 必须是「保存」而不是「进目录」。
+pub fn route_focused(
+    focus: Focus,
+    modal_open: bool,
+    egui_wants_keyboard: bool,
+    egui_wants_pointer: bool,
+    kind: InputKind,
+) -> Route {
+    if modal_open {
+        return Route::Egui;
+    }
+    if kind == InputKind::Keyboard && focus == Focus::FilesPanel {
+        return Route::FilesPanel;
+    }
+    route(modal_open, egui_wants_keyboard, egui_wants_pointer, kind)
+}
+
+/// [`egui_should_see`] 的带焦点版本。**T8 的注入点就是这个函数**——判给面板
+/// 的键在这里返回 `false`,于是它根本进不了 `egui_state.on_window_event`,
+/// egui 的焦点系统也就无从吞掉 Tab。
+pub fn egui_should_see_focused(
+    focus: Focus,
+    kind: InputKind,
+    modal_open: bool,
+    egui_wants_keyboard: bool,
+) -> bool {
+    match kind {
+        InputKind::Pointer => true,
+        InputKind::Keyboard => matches!(
+            route_focused(focus, modal_open, egui_wants_keyboard, false, kind),
+            Route::Egui
+        ),
     }
 }
 
@@ -110,5 +171,71 @@ mod tests {
             route(false, false, false, InputKind::Pointer),
             Route::Terminal
         );
+    }
+
+    /// T8 / 设计 D23:文件面板拿到焦点时,键盘事件走面板这条路,
+    /// **绝不先喂 egui**。喂了的后果与 T8 原案一模一样:egui 的焦点系统
+    /// 在 `begin_pass` 里看到 Tab 就把焦点给菜单栏,`wants_keyboard_input()`
+    /// 从此恒真,终端和面板**双双**收不到任何键。
+    ///
+    /// 注意第三个参数给 `true`(假装 egui 想要键盘)—— 这正是坏掉时的现场,
+    /// 给 `false` 的话实现写错了也能蒙对。
+    #[test]
+    fn panel_keyboard_is_never_fed_to_egui_so_tab_cannot_steal_focus() {
+        assert!(!egui_should_see_focused(
+            Focus::FilesPanel,
+            InputKind::Keyboard,
+            false,
+            true
+        ));
+        assert_eq!(
+            route_focused(Focus::FilesPanel, false, true, false, InputKind::Keyboard),
+            Route::FilesPanel
+        );
+    }
+
+    /// 模态弹窗压过面板焦点 —— 会话管理器开着的时候按 Enter 必须是
+    /// 「保存」,不是「进目录」。
+    #[test]
+    fn a_modal_outranks_panel_focus() {
+        assert_eq!(
+            route_focused(Focus::FilesPanel, true, false, false, InputKind::Keyboard),
+            Route::Egui
+        );
+        assert!(egui_should_see_focused(
+            Focus::FilesPanel,
+            InputKind::Keyboard,
+            true,
+            false
+        ));
+    }
+
+    /// 焦点在终端时,面板一个键都不截 —— 否则在 tmux 里按 F5 会莫名其妙
+    /// 刷新文件列表。这条是上面那条的反面,少了它「恒返回 FilesPanel」
+    /// 的实现也能全绿。
+    #[test]
+    fn terminal_focus_leaves_every_key_to_the_terminal() {
+        assert_eq!(
+            route_focused(Focus::Terminal, false, false, false, InputKind::Keyboard),
+            Route::Terminal
+        );
+    }
+
+    /// 指针不受面板焦点影响:仍是「先喂后判」,否则菜单/弹窗点不动。
+    #[test]
+    fn pointer_events_still_reach_egui_regardless_of_panel_focus() {
+        assert!(egui_should_see_focused(
+            Focus::FilesPanel,
+            InputKind::Pointer,
+            false,
+            false
+        ));
+    }
+
+    /// F6 换焦点。**不用 `Ctrl+Tab`** —— 那个是标签页的(D0 已占)。
+    #[test]
+    fn f6_toggles_focus_between_terminal_and_panel() {
+        assert_eq!(Focus::Terminal.toggled(), Focus::FilesPanel);
+        assert_eq!(Focus::FilesPanel.toggled(), Focus::Terminal);
     }
 }

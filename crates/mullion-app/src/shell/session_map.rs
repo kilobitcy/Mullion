@@ -1,5 +1,6 @@
 //! 把 store 的 `SessionRecord`(+ 解密后的 `SecretEntry`)映射成 `mullion_ssh` 的连接参数。
-//! SFTP 连接是切片 D,本片双击 sftp 会话在映射层直接拒绝(app 侧应更早禁用,这里兜底)。
+//! SFTP 节点在 D1 起也走这里:映射出**同样的**拨号参数,只是多带一位
+//! `wants_sftp` —— 连上之后开 sftp subsystem 而不是 PTY(设计 D24)。
 
 use std::fmt;
 
@@ -15,8 +16,6 @@ pub enum MapError {
     /// 时若旧路径指向的文件已被删/挪走,会话就落在这个状态,用户要做的是
     /// 「重新导入私钥」而不是「填口令」,文案指错地方等于没提示。
     MissingPrivateKey,
-    /// SFTP 连接属切片 D,本片不支持。
-    SftpNotSupported,
 }
 
 impl fmt::Display for MapError {
@@ -26,7 +25,6 @@ impl fmt::Display for MapError {
             MapError::MissingPrivateKey => {
                 write!(f, "私钥未导入 —— 请在会话的「认证」页重新导入私钥文件")
             }
-            MapError::SftpNotSupported => write!(f, "SFTP 连接尚未实现(切片 D)"),
         }
     }
 }
@@ -35,13 +33,11 @@ impl std::error::Error for MapError {}
 
 /// `SessionRecord` + 解密后的敏感部分 → `SshConfig`。cols/rows 先给占位默认,
 /// 窗口出来后由 window_change 校正到真实尺寸(与既有 `cli::parse_args` 一致)。
-pub fn to_ssh_config(
-    rec: &SessionRecord,
-    secret: Option<&SecretEntry>,
-) -> Result<SshConfig, MapError> {
-    if rec.connection.protocol == Protocol::Sftp {
-        return Err(MapError::SftpNotSupported);
-    }
+///
+/// **模块私有,对外只留 [`to_dial_plan`]。** 公开两个入口的话,后来者顺手
+/// 拿了这个就悄悄丢掉 `wants_sftp` —— 那正是 D24 要堵的坑,没道理自己再
+/// 挖一遍。
+fn to_ssh_config(rec: &SessionRecord, secret: Option<&SecretEntry>) -> Result<SshConfig, MapError> {
     let auth = match &rec.auth.kind {
         AuthKind::Password => {
             let pw = secret
@@ -81,6 +77,29 @@ pub fn to_ssh_config(
     })
 }
 
+/// 一次连接意图:拨号参数 + 连上之后开什么。
+///
+/// **不把 `wants_sftp` 塞进 `SshConfig`**:那是 `mullion-ssh` 的类型,
+/// 而「开 PTY 还是开 sftp」是 app 的编排决策,ssh 层只认字节流
+/// (架构不变量)。
+#[derive(Debug, Clone)]
+pub struct DialPlan {
+    pub cfg: SshConfig,
+    /// true = 连上后开 sftp subsystem(SFTP 节点),false = 开 PTY(SSH 会话)。
+    pub wants_sftp: bool,
+}
+
+/// `SessionRecord` + 解密后的敏感部分 → 一次完整的连接意图。
+pub fn to_dial_plan(
+    rec: &SessionRecord,
+    secret: Option<&SecretEntry>,
+) -> Result<DialPlan, MapError> {
+    Ok(DialPlan {
+        cfg: to_ssh_config(rec, secret)?,
+        wants_sftp: rec.connection.protocol == Protocol::Sftp,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +131,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 
@@ -214,8 +234,14 @@ mod tests {
         );
     }
 
+    /// D24:SFTP 记录不再被映射层拒绝,而是映射成**合法的拨号参数**。
+    /// 判据是「参数对得上」+「`wants_sftp` 为真」——后者是 app 侧
+    /// 「连上后开 sftp subsystem 而不是 PTY」的开关。
+    ///
+    /// 这条替代了 F118 时期的 `SftpNotSupported` 断言:那时拒绝是对的
+    /// (无处可去),D1 给了 SFTP 节点自己的标签页,再拒绝就是功能残缺。
     #[test]
-    fn sftp_is_rejected_in_a2() {
+    fn an_sftp_record_maps_to_real_dial_parameters_and_asks_for_the_sftp_subsystem() {
         let r = rec(AuthKind::Password, Protocol::Sftp);
         let sec = SecretEntry {
             password: Some("pw".into()),
@@ -223,10 +249,26 @@ mod tests {
             proxy_password: None,
             private_key: None,
         };
-        assert!(matches!(
-            to_ssh_config(&r, Some(&sec)),
-            Err(MapError::SftpNotSupported)
-        ));
+
+        let plan = to_dial_plan(&r, Some(&sec)).expect("SFTP 节点必须能映射出拨号参数");
+        assert_eq!(plan.cfg.host, "h");
+        assert_eq!(plan.cfg.port, 2222);
+        assert!(plan.wants_sftp, "SFTP 节点连上后开的是 sftp subsystem");
+    }
+
+    /// 反面:SSH 会话不得被标成要 sftp。搞反了的症状是「双击普通会话
+    /// 开出一个文件面板、终端再也出不来」。
+    #[test]
+    fn an_ssh_record_does_not_ask_for_the_sftp_subsystem() {
+        let r = rec(AuthKind::Password, Protocol::Ssh);
+        let sec = SecretEntry {
+            password: Some("pw".into()),
+            passphrase: None,
+            proxy_password: None,
+            private_key: None,
+        };
+        let plan = to_dial_plan(&r, Some(&sec)).expect("SSH 会话映射");
+        assert!(!plan.wants_sftp);
     }
 
     #[test]

@@ -10,5 +10,6 @@ pub mod known_hosts;
 pub mod proxy;
 pub mod schedule;
 pub mod session;
+pub mod sftp;
 mod socks5_server;
 pub mod tunnel;

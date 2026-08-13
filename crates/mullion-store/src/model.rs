@@ -77,6 +77,10 @@ pub struct SessionRecord {
     pub network: crate::network::NetworkPrefs,
     #[serde(default)]
     pub automation: crate::automation::AutomationPrefs,
+    /// F120:SFTP 书签与默认目录。v8 新增,旧文件没有这个键 → `default`
+    /// 补空,无需迁移代码。
+    #[serde(default)]
+    pub sftp: crate::sftp::SftpPrefs,
 }
 
 /// 一条会话的**敏感**部分,加密后存 secrets.enc。
@@ -207,14 +211,17 @@ pub struct AppearancePrefs {
 /// v6 = v5 + `IconKind::Ico` 与 `IconSpec.bg`:会话图标改成用户导入的 .ico
 ///      (正文 base64 内嵌),并可配底色。
 /// v7 = v6 + `[[tunnel]]`:隧道成为引用会话的一等对象(F110~F117)。
+/// v8 = v7 + `session.sftp`:SFTP 书签与默认远端/本地目录(F120)。
 ///
 /// 结构上新版本能直接读旧版本(新字段全带 `serde(default)`),升版本号是为了让
 /// **旧客户端明确拒绝**,而不是静默丢弃新分节再写回。v5 还多一层理由:旧客户端
-/// 读 v5 会发现 `path` 没了,公钥会话直接连不上,拒绝比装作能用好。
+/// 读 v5 会发现 `path` 没了,公钥会话直接连不上,拒绝比装作能用好。新增
+/// `session.sftp` 是同一条理由:旧客户端读 v8 会把整个分节丢掉再写回,拒绝
+/// 比静默吃掉好。
 ///
 /// **号段归属**:F74(凭据实体)原定 v3→v4,被 F40~F44 先落地拿走了 4,再被本次
 /// 「私钥入库」拿走了 5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
-pub const CURRENT_SCHEMA: u32 = 7;
+pub const CURRENT_SCHEMA: u32 = 8;
 
 fn schema_v1() -> u32 {
     1
@@ -267,6 +274,7 @@ mod tests {
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,
@@ -303,6 +311,7 @@ mod tests {
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,

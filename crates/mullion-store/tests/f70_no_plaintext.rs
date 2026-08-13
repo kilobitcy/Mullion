@@ -40,6 +40,7 @@ fn plaintext_secret_never_hits_disk() {
             appearance: AppearancePrefs::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
             secret: Some(SecretEntry {
                 password: None,
                 passphrase: Some(PW.into()),

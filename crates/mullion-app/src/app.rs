@@ -36,14 +36,19 @@ use crate::{diag, input, shell};
 /// `Debug`,故 `UserEvent` 同样不派生 Debug(winit `ApplicationHandler<T>` 只要求 `T: 'static`)。
 pub enum UserEvent {
     Wake,
-    /// 异步 connect 成功:第一条 channel 的句柄 + 远端字节接收端(app 每帧 drain),
-    /// 以及**已建立连接**本身的 `Handle`(F35:同一条连接上后续分屏另开 channel
-    /// 要复用它)。`Arc` 是因为 russh 的 `Handle` 没实现 `Clone`,只有 `Drop`
-    /// (释放即断连)。
+    /// 异步 connect 成功:**已建立连接**本身的 `Handle`(F35:同一条连接上后续
+    /// 分屏另开 channel 要复用它)。`Arc` 是因为 russh 的 `Handle` 没实现
+    /// `Clone`,只有 `Drop`(释放即断连)。
+    ///
+    /// D1/F50:`wants_sftp` 是点击那一刻(`spawn_connect` 调用点)就算好的 ——
+    /// 这个事件本身不带 `SessionId`,没法在这里回头再查一次协议字段。为 `true`
+    /// 时 `pty` 恒 `None`(SFTP 节点不开 PTY,`spawn_connect` 内部直接跳过
+    /// `open_pty`);为 `false` 时 `pty` 恒 `Some`(`open_pty` 失败会走
+    /// `ConnectErr`,不会发一个「两者皆无」的 `ConnectOk`)。
     ConnectOk {
-        ssh: SshSession,
-        rx: Receiver<Vec<u8>>,
         handle: Arc<SshConnection>,
+        wants_sftp: bool,
+        pty: Option<(SshSession, Receiver<Vec<u8>>)>,
     },
     /// 异步 connect 失败,已格式化的可操作错误(F6 分类由 `session::connect` 内部给)。
     ConnectErr(String),
@@ -91,6 +96,29 @@ pub enum UserEvent {
         id: mullion_store::TunnelId,
         state: mullion_ssh::tunnel::TunnelState,
     },
+    /// F50/D6:侧栏的 sftp channel 开好了(或者没开成)——蹭会话已建立的连接
+    /// (`SftpClient::open` 签名里没有网络参数),登录目录已 `canonicalize(".")`
+    /// 过。`generation` 是 S1 路由键:按它找属主标签,不用活动标签接
+    /// (用户在标签 A 开侧栏、切到标签 B 的几百毫秒里这条抵达,拿活动标签接
+    /// 就会把 A 的 client 挂到 B 上)。`Err` 已经是格式化好的中文原因,
+    /// 不是 `SftpError` 的 Debug。
+    SftpOpened {
+        generation: u64,
+        result: Result<
+            (
+                Arc<mullion_ssh::sftp::SftpClient>,
+                mullion_ssh::sftp::RemotePath,
+            ),
+            String,
+        >,
+    },
+    /// F50:一次列目录的结果。`seq` 与 `PaneState::request_seq` 对齐,对不上
+    /// 就丢(用户点得比网络快时的后发先至)。`generation` 同上,S1 路由键。
+    SftpListed {
+        generation: u64,
+        seq: u64,
+        result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
+    },
 }
 
 /// 一次在途自动化的把手。三条通道都是 `Option`,因为每一条都是**一次性边**:
@@ -131,17 +159,88 @@ struct TerminalTab {
     /// 状态栏本来就是常驻信息区,而定时清除要再引一个 deadline 进帧循环,
     /// 正是 spec §1 修订一要避免的东西。
     automation_status: Option<String>,
+    /// F50:这个标签自己的侧栏两栏运行态(设计 D1:侧栏「按会话记住」)。
+    ///
+    /// **不能挂在 `App` 上**——那是 Task 9 的权宜实现:那时远端栏恒
+    /// `Load::Idle`,全局一份看不出问题。一旦接上真实数据,不同标签连着
+    /// 不同主机,共享一份 `remote` 状态就是标签 B 的侧栏显示标签 A 主机
+    /// 目录的 bug,用户看不出异常,直到对着错误的主机操作。
+    files: crate::ui::files_panel::PanelFrame,
+    /// F50/D6:这个标签的 sftp channel。`None` = 还没开,或者上次没开成
+    /// (`accept_sftp_opened` 收到 `Err` 时不写这个字段,留着 `None` 让下次
+    /// 用户点击时能重试)。蹭 `ws.hosts[0].handle` 已建立的连接开,不重新握手。
+    sftp: Option<Arc<mullion_ssh::sftp::SftpClient>>,
+    /// F50/D6:这个标签在途的 sftp 后台任务(`spawn_sftp_open`/
+    /// `spawn_sftp_list_dir` 各开一个,句柄经调用方存回这里)。**必须在
+    /// `wind_down` 里一并 abort**——理由和上面 `automation` 那条一模一样:
+    /// 每个任务经 `Arc<SftpClient>`(内部 `_conn: Arc<SshConnection>`,见其
+    /// 文档)持有一份连接保活引用,只 drop `TerminalTab`(=只 drop
+    /// `t.sftp`/`t.ws`)收不了口——用户在一次网络往返期间关掉标签,task 手里
+    /// 那份 Arc 会撑住底层连接直到这次 RPC 自然结束。`list_dir`/
+    /// `canonicalize` 好歹有 russh-sftp 默认 10s 请求超时兜底,但
+    /// `SftpClient::open` 内部裸的 `channel_open_session`/`request_subsystem`
+    /// 完全没有超时包裹,链路黑洞时可能无限期挂着(见 `spawn_sftp_open` 的
+    /// 文档)——这正是本项目高延迟代理链路那个头号场景,`wind_down` 是唯一的
+    /// 收口点。
+    ///
+    /// `Vec` 不是单个 `Option`:一次侧栏交互可能同时有不止一条在途请求(open
+    /// 接着首次 list、或者用户连点了几个目录)。每次 `push` 前先 `retain`
+    /// 掉已经跑完的,稳态下不会无界增长。**新请求不会中途 abort 旧请求**——
+    /// `russh-sftp` 的请求/应答是按请求 id 配对的,没有把握验证「正等着应答
+    /// 时被 abort」是否会让它的内部状态错乱,不冒这个险;旧请求靠 `seq` 校验
+    /// 在结果层面被丢弃(`PaneState::accept`),不靠中途取消。
+    sftp_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// F120:这个标签对应会话在编辑器「SFTP」分节里配置的默认远端目录。
+    /// `None` = 没配置,`trigger_sftp_open` 落回登录目录(`.`)。`ConnectOk`
+    /// 建标签时从 `store` 读一次存进来,之后不再变——跟 `last_cfg` 同理,
+    /// 不随会话记录后续被编辑而变化(那是下一次连接才会生效的东西)。
+    sftp_default_remote: Option<String>,
 }
 
-/// 标签装的东西。D1 会加 `Files(FilesTab)` 变体(SFTP 文件视图)。
+/// D1/D6:一个「SFTP 节点」标签的全部状态——**独占**自己的连接(跟隧道同一个
+/// 理由,ADR-010:establish 一条新的,不蹭会话那条)。没有 `ws`,所以没有
+/// PTY、没有自动化、没有分屏——这些概念对这种标签不存在。
+struct FilesTab {
+    /// 面板运行态(两栏)。字段名故意跟 `TerminalTab::files` 保持一致 ——
+    /// `TabContent::files_panel`/`files_panel_mut` 两个变体各取自己那份,
+    /// 靠的就是字段名对得上,少一次「这个方法到底该读哪个字段」的心智负担。
+    files: crate::ui::files_panel::PanelFrame,
+    /// 这个标签独占的连接。`establish` 单独建的一条,不是会话侧栏那种蹭
+    /// `ws.hosts[0]` 的连接(D6)。
+    conn: Arc<SshConnection>,
+    /// S1 路由键。没有 `ws.generation()` 可用——号段来自
+    /// `App::next_ws_generation`,与 Terminal 标签共用同一个计数器,保证全局
+    /// 唯一(不会跟任何标签的世代号撞)。
+    generation: u64,
+    /// F50/D6:sftp channel。`None` = 还没开好(标签一开出来就会
+    /// `trigger_sftp_open` 起一次;开失败保留 `None` 让用户能重试)。
+    sftp: Option<Arc<mullion_ssh::sftp::SftpClient>>,
+    /// 同 `TerminalTab::sftp_tasks`——收口纪律一模一样,见该字段文档。
+    sftp_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// F120:同 `TerminalTab::sftp_default_remote`,文档见那边。
+    sftp_default_remote: Option<String>,
+}
+
+/// 标签装的东西。
+///
+/// `Terminal` 装箱(`Box<TerminalTab>`)是 clippy `large_enum_variant` 逼的:
+/// `TerminalTab` 比 `FilesTab` 大出一大截(前者挂着整棵 `Workspace`),两个
+/// 变体不装箱会让整个枚举按最大变体算大小,`Files` 那份也要陪绑一份从不用
+/// 到的填充。字段访问(`t.ws`/`t.files`/…)不受影响——`.` 运算符自动穿透
+/// `Box` 的 `Deref`。
 enum TabContent {
-    Terminal(TerminalTab),
+    Terminal(Box<TerminalTab>),
+    /// D1:SFTP 节点连接后开的独占标签(F50/F120)。装箱理由同上——
+    /// `FilesTab` 比裸大小差一截,两个变体都不装箱时枚举按最大的算,
+    /// 只装一个又会让另一个变成新的「最大」,clippy 还是会响。
+    Files(Box<FilesTab>),
 }
 
 impl TabPayload for TabContent {
     fn generation(&self) -> u64 {
         match self {
             TabContent::Terminal(t) => t.ws.generation(),
+            TabContent::Files(f) => f.generation,
         }
     }
 }
@@ -149,13 +248,74 @@ impl TabPayload for TabContent {
 impl TabContent {
     fn as_terminal(&self) -> Option<&TerminalTab> {
         match self {
-            TabContent::Terminal(t) => Some(t),
+            TabContent::Terminal(t) => Some(t.as_ref()),
+            TabContent::Files(_) => None,
         }
     }
 
     fn as_terminal_mut(&mut self) -> Option<&mut TerminalTab> {
         match self {
-            TabContent::Terminal(t) => Some(t),
+            TabContent::Terminal(t) => Some(t.as_mut()),
+            TabContent::Files(_) => None,
+        }
+    }
+
+    /// D1:两个变体都恒有一份面板运行态,不像 `as_terminal` 那样要 `Option`——
+    /// 调用方(F50 的文件动作路由)不必再判一次「这个标签到底是哪种」。
+    fn files_panel(&self) -> &crate::ui::files_panel::PanelFrame {
+        match self {
+            TabContent::Terminal(t) => &t.files,
+            TabContent::Files(f) => &f.files,
+        }
+    }
+
+    fn files_panel_mut(&mut self) -> &mut crate::ui::files_panel::PanelFrame {
+        match self {
+            TabContent::Terminal(t) => &mut t.files,
+            TabContent::Files(f) => &mut f.files,
+        }
+    }
+
+    /// 两个变体都有一份 sftp client 槽位;读时克隆(`Arc`,廉价)。
+    fn sftp_client(&self) -> Option<Arc<mullion_ssh::sftp::SftpClient>> {
+        match self {
+            TabContent::Terminal(t) => t.sftp.clone(),
+            TabContent::Files(f) => f.sftp.clone(),
+        }
+    }
+
+    fn sftp_mut(&mut self) -> &mut Option<Arc<mullion_ssh::sftp::SftpClient>> {
+        match self {
+            TabContent::Terminal(t) => &mut t.sftp,
+            TabContent::Files(f) => &mut f.sftp,
+        }
+    }
+
+    fn sftp_tasks_mut(&mut self) -> &mut Vec<tokio::task::JoinHandle<()>> {
+        match self {
+            TabContent::Terminal(t) => &mut t.sftp_tasks,
+            TabContent::Files(f) => &mut f.sftp_tasks,
+        }
+    }
+
+    /// F120:这个标签配置的默认远端目录(`None` = 没配置,落回登录目录)。
+    /// 读时克隆——两个变体都只是 `Option<String>`,没必要为一次读取拆出借用。
+    fn sftp_default_remote(&self) -> Option<String> {
+        match self {
+            TabContent::Terminal(t) => t.sftp_default_remote.clone(),
+            TabContent::Files(f) => f.sftp_default_remote.clone(),
+        }
+    }
+
+    /// D6:这个标签的 sftp 该蹭哪条连接。`Terminal` 蹭会话已建立的连接
+    /// (`ws.hosts.first()`,ADR-009 下今天恒为其一);`Files` 独占自己的
+    /// (`establish` 来的那条,ADR-010 同款理由)。`Terminal` 分支理论上可能是
+    /// `None`(连接尚未真正建立完成的极短窗口;测试脚手架也会构造出空
+    /// `hosts` 的 `Workspace`)。
+    fn sftp_connection(&self) -> Option<Arc<SshConnection>> {
+        match self {
+            TabContent::Terminal(t) => t.ws.hosts.first().map(|h| h.handle.clone()),
+            TabContent::Files(f) => Some(f.conn.clone()),
         }
     }
 }
@@ -180,6 +340,77 @@ fn active_ws_mut_of(tabs: &mut Tabs<TabContent>) -> Option<&mut Workspace> {
         .map(|t| &mut t.ws)
 }
 
+/// `App::active_is_files_tab` 的纯逻辑核心。抽成自由函数是为了能在无头测试
+/// 容器里拿真实构造的 `Tabs<TabContent>` 单测——理由与上面几个 `_of` 函数
+/// 一样:`App` 本身需要一个 `EventLoopProxy`,测试里造不出来。
+fn active_is_files_tab_of(tabs: &Tabs<TabContent>) -> bool {
+    tabs.active()
+        .is_some_and(|t| matches!(t.content, TabContent::Files(_)))
+}
+
+/// `App::files_owner_generation` 的纯逻辑核心,理由同上。
+fn files_owner_generation_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> Option<u64> {
+    if active_is_files_tab_of(tabs) {
+        tabs.active().map(|t| t.content.generation())
+    } else if sidebar_open {
+        active_ws_of(tabs).map(Workspace::generation)
+    } else {
+        None
+    }
+}
+
+/// `App::effective_focus` 的纯逻辑核心,理由同上。三条分支里前两条(活动标签
+/// 是 Terminal、侧栏开/关)能用真实构造的 `TerminalTab` 单测;第三条(活动
+/// 标签是 Files)测不到——`FilesTab::conn` 是 `Arc<SshConnection>`,
+/// `SshConnection::new` 对 `mullion-app` 不可见(`pub(crate)` 到
+/// `mullion-ssh`),测试里造不出真的 `FilesTab`(与 `wind_down_has_no_catch_all_arm_`
+/// 那组测试面对的限制一样)——那条分支靠结构自检测试钉住
+/// (`effective_focus_treats_a_files_tab_as_always_focused_on_the_panel`)。
+fn effective_focus_of(
+    tabs: &Tabs<TabContent>,
+    sidebar_open: bool,
+    focus: shell::input_route::Focus,
+) -> shell::input_route::Focus {
+    use crate::shell::input_route::Focus;
+    if active_is_files_tab_of(tabs) {
+        Focus::FilesPanel
+    } else if sidebar_open {
+        focus
+    } else {
+        Focus::Terminal
+    }
+}
+
+/// `App::move_panel_selection` 的下标数学核心。抽成不依赖 `App`/`Tabs` 的
+/// 自由函数,理由同上面几个 `_of` 函数——这段是这次改动里唯一有算法复杂度
+/// 的部分(代码复核 #3),此前只有靠 generation 路由的结构守护测试,边界
+/// 情况(空列表/单条/首行再 `↑`/末行再 `↓`/选中项已不在当前行里)一次
+/// 都没直接测过。
+///
+/// `rows`:当前显示的那些条目(已经过滤/排序过,顺序即用户看到的顺序)。
+/// `selected`:当前选中项的身份(`PaneState::selected` 存的是身份不是下标,
+/// 见该字段文档——过滤/排序一变下标就跟着错位,所以这里也按身份找,不按
+/// 下标找;选中项已经不在 `rows` 里时,`position` 找不到,按未选中处理)。
+/// `delta`:方向,`< 0` 是 `↑`、`> 0` 是 `↓`。
+///
+/// 返回下一个选中项在 `rows` 里的下标;`rows` 为空时没有"选第几个"这个
+/// 概念,返回 `None`(空列表若走进 `Some(rows.len() - 1)` 那支会直接下溢)。
+fn next_panel_selection_index(
+    rows: &[&mullion_ssh::sftp::Entry],
+    selected: Option<&mullion_ssh::sftp::RemotePath>,
+    delta: i32,
+) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let cur = selected.and_then(|name| rows.iter().position(|e| &e.name == name));
+    Some(match cur {
+        None if delta > 0 => 0,
+        None => rows.len() - 1,
+        Some(i) => (i as i32 + delta).clamp(0, rows.len() as i32 - 1) as usize,
+    })
+}
+
 /// 关掉一个标签时的收口。**顺序是这条函数存在的全部理由**:
 ///
 /// 自动化 task 也持有一份 `Arc<SshSession>`。只 drop 掉 `Workspace`(即 pane 那
@@ -193,7 +424,26 @@ fn wind_down(tab: Tab<TabContent>) {
             if let Some(h) = t.automation {
                 h.task.abort();
             }
+            // F50/D6:sftp 后台任务同理——见 `TerminalTab::sftp_tasks` 的文档。
+            // 不 abort 的话,用户关标签这一刻若正巧有一次 open/list 在途,
+            // 那个任务手里的 `Arc<SshConnection>` 会继续撑着底层连接,直到
+            // 它自己的网络往返结束(`SftpClient::open` 那两步还完全没有
+            // 超时包裹,链路黑洞时可能永远不结束)。
+            for task in t.sftp_tasks {
+                task.abort();
+            }
             // `t.ws` 在这里 drop —— 每个 `PaneState` 随之 drop,关掉它那条 SSH channel。
+        }
+        // D1:文件标签没有自动化、没有 PTY——只有 sftp 后台任务需要收口,
+        // 理由与上面 `Terminal` 分支那段一模一样(见 `FilesTab::sftp_tasks`
+        // 的文档)。**不能漏这一臂**:落到 `_ => {}` 上会让新变体的连接静默泄漏
+        // (这条 match 之所以不写成带通配符的形式,就是为了让编译器在将来再加
+        // 变体时强制回来看一眼这里)。
+        TabContent::Files(f) => {
+            for task in f.sftp_tasks {
+                task.abort();
+            }
+            // `f.sftp`/`f.conn` 在这里 drop —— 独占连接随之释放。
         }
     }
 }
@@ -310,6 +560,10 @@ pub struct App {
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
     /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
     tunnels: crate::tunnels::TunnelRuntime,
+    /// F6/设计 D23:用户想把键盘焦点放在哪一侧(终端 / 文件面板)。**只是意愿,
+    /// 不是这一帧的真实生效值**——能否兑现取决于面板此刻在不在(见
+    /// `effective_focus` 按上下文夹紧的说明)。默认终端,与迁移前行为一致。
+    focus: shell::input_route::Focus,
 }
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
@@ -360,6 +614,7 @@ impl App {
             pending_automation: None,
             pending_skip_automation: false,
             tunnels: Default::default(),
+            focus: shell::input_route::Focus::default(),
         }
     }
 
@@ -423,6 +678,35 @@ impl App {
             || self.pending_paste.is_some()
     }
 
+    /// 活动标签本身是不是 `TabContent::Files`(D1 的标签宿主)。`files_owner_generation`
+    /// 与 `effective_focus` 共用这一个判据的原子部分——两处各写一遍的话,以后
+    /// 加第三种宿主形态时必然有一处漏改。
+    fn active_is_files_tab(&self) -> bool {
+        active_is_files_tab_of(&self.tabs)
+    }
+
+    /// 这一帧文件面板实际要画的标签的世代号(D1:两种宿主互斥)。`None` =
+    /// 面板这一刻根本不可见(既不是标签宿主,侧栏也没开)。
+    ///
+    /// **`Present` 分支与 `effective_focus`/F6 共用这一份判断**(协调者修订
+    /// 1)——原先只有 `Present` 分支内联算了一遍,F6 的生效条件如果照抄一份
+    /// 判据,两处必然迟早漂移(比如以后侧栏加一种"半开"状态,只改了一处)。
+    fn files_owner_generation(&self) -> Option<u64> {
+        files_owner_generation_of(&self.tabs, self.ui.files_sidebar_open)
+    }
+
+    /// 这一帧真正生效的键盘焦点(协调者修订 2)。裸的 `self.focus` 只是用户
+    /// 用 F6 表达的意愿,能不能兑现取决于面板此刻在不在、有没有终端可回:
+    ///
+    /// - 活动标签是 Files → 恒 `FilesPanel`——那种标签没有终端可回,按
+    ///   `Terminal` 路由的话方向键/回车会去找一个不存在的 pane,静默无反应。
+    /// - 活动标签是 Terminal 且侧栏关着 → 恒 `Terminal`——面板不可见,焦点
+    ///   不能留在看不见的地方,否则键盘表现得像是死了。
+    /// - 活动标签是 Terminal 且侧栏开着 → 用 `self.focus`(用户的 F6 意愿生效)。
+    fn effective_focus(&self) -> shell::input_route::Focus {
+        effective_focus_of(&self.tabs, self.ui.files_sidebar_open, self.focus)
+    }
+
     /// F36/S4:标签快捷键的事件前置处理。返回 `true` = 这个键已被吃掉,
     /// 调用方不要再往下分流(既不喂 egui,也不编码进 PTY)。
     ///
@@ -448,6 +732,404 @@ impl App {
         }
         self.request_ui_redraw();
         true
+    }
+
+    /// F50 / 设计 D23:`Ctrl+Shift+B` 开关文件侧栏。**独立于** `tab_hotkey_event`
+    /// ——一个函数一件事,而且 tab 那个已经有守护测试钉着它的行为,不该把不
+    /// 相关的快捷键塞进同一个函数改变它的判定表面。
+    ///
+    /// 选 `Ctrl+Shift+*` 系是因为它在终端里不产生控制字符,不和远端
+    /// tmux / Claude Code 抢键(T5/T6 类冲突)。**不能用 `Ctrl+Shift+F`**
+    /// —— 它已被 F100 标注模式占用,先到先得。
+    ///
+    /// 同 `tab_hotkey_event`:必须在 `window_event` 里输入分流**之前**调用
+    /// (T8 纪律)——不然 `Ctrl+Shift+B` 会先被喂给 egui 的焦点系统,`B` 也会
+    /// 被编码进 PTY 写给远端。
+    fn files_hotkey_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
+            return false;
+        };
+        if ke.state != ElementState::Pressed {
+            return false;
+        }
+        let Some((key, mods)) = input::translate_key(ke, self.mods) else {
+            return false;
+        };
+        if self.modal_open() || !mods.ctrl || !mods.shift || mods.alt || mods.sup {
+            return false;
+        }
+        if !matches!(key, Key::Char('b' | 'B')) {
+            return false;
+        }
+        self.ui.files_sidebar_open = !self.ui.files_sidebar_open;
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F6/设计 D23:在终端与文件面板之间切换键盘焦点。**独立于**
+    /// `files_hotkey_event`——同一个理由,一个函数一件事。
+    ///
+    /// **不用 `Ctrl+Tab`**——D0 已经把它给了标签切换(`shell::tabs::hotkey`);
+    /// `F6` 不是 `mullion_term::keymap::Key` 认识的键(那是发给远端的编码
+    /// 词表,F 键不在其中),今天本就到不了终端,截在这里只是让语义显式。
+    ///
+    /// 同 `tab_hotkey_event`/`files_hotkey_event`:必须在 `window_event` 里
+    /// 输入分流**之前**调用(T8 纪律)。
+    ///
+    /// 协调者修订 1:**不吃**面板不在场时按下的 F6——见函数体内
+    /// `files_owner_generation` 那句判断的说明。理由:F6 是纯终端场景里
+    /// 也可能被远端 TUI/工具用到的普通功能键,面板不在场时若仍无条件截走,
+    /// 会静默偷走这个键(用户按了没反应,还查不出原因)。
+    fn focus_hotkey_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
+            return false;
+        };
+        if ke.state != ElementState::Pressed {
+            return false;
+        }
+        if self.modal_open() {
+            return false;
+        }
+        if !matches!(
+            ke.logical_key,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::F6)
+        ) {
+            return false;
+        }
+        // 协调者修订 1:F6 的生效条件是"面板此刻在场"——与 `Present` 分支
+        // 判断要不要画侧栏共用同一份 `files_owner_generation` 判据(不重复写
+        // 一遍逻辑)。面板不在场时**不吃这个键**:直接返回 `false` 让它照旧
+        // 走终端编码,否则用户在纯终端场景按 F6(某些远端 TUI/tmux 配置会用
+        // 到)会被无声吞掉,表现为"这个键突然没用了"。
+        if self.files_owner_generation().is_none() {
+            return false;
+        }
+        self.focus = self.focus.toggled();
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F50/D5:本地栏的一次同步导航。**本地 SSD 上的普通目录**读盘是微秒级,
+    /// 不值得像远端那样 spawn 异步任务(远端那条归 Task 10)。四个 `FileAction`
+    /// 里只有 `ToggleHidden` 不碰磁盘。
+    ///
+    /// **已知限制(未根治)**:这个前提在几类目录上不成立 —— 映射的网络盘
+    /// (`Z:\`)、断连的 SMB 挂载、未联机的 OneDrive 文件夹、几万项的目录。
+    /// `list_dir` 还要对每一项各调一次 `symlink_metadata`,是 N 次 syscall 不是
+    /// 一次。而这里跑在 winit 事件循环线程上,一卡就是**整个窗口**没反应
+    /// (终端也不刷新),直到系统级超时返回。真要根治得挪去 `spawn_blocking`。
+    /// 现在不做:本切片是只读浏览,先把路走通;真机上遇到再说。
+    ///
+    /// `generation` 是**目标标签**(不是"活动标签")——调用方要么是刚渲染完
+    /// 侧栏那一刻的属主标签(见 `Present` 分支里 `files_owner_generation` 的
+    /// 说明),要么是首次打开侧栏的触发点,两处都已经知道具体是哪个标签,
+    /// 没有必要(也不该)在这里再假设"就是当前活动的那个"。
+    fn apply_local_file_action(
+        &mut self,
+        generation: u64,
+        action: crate::ui::files_panel::FileAction,
+    ) {
+        use crate::files::local;
+        use crate::ui::files_panel::FileAction;
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
+            return;
+        };
+        let files = tab.content.files_panel_mut();
+        let target = match &action {
+            FileAction::Goto(target) => target.clone(),
+            FileAction::Up => local::parent_local(&files.local.cwd),
+            FileAction::Refresh => files.local.cwd.clone(),
+            FileAction::ToggleHidden => {
+                files.local.show_hidden = !files.local.show_hidden;
+                self.ui_dirty = true;
+                return;
+            }
+        };
+        let seq = files.local.begin_load(target.clone());
+        let result = local::list_dir(&local::to_path(&target));
+        files.local.accept(seq, result);
+        self.ui_dirty = true;
+    }
+
+    /// F50/D6:远端栏的一次动作。sftp 还没开好时(`sftp.is_none()`,含"上次
+    /// 没开成"的情形),不管点的是哪个具体动作,先把 channel 开起来——打开
+    /// 成功后固定用登录目录起步(默认远端目录读配置归 Task 11)。
+    ///
+    /// **绝不在这里 `block_on`**:开 channel/列目录都是真实网络往返,
+    /// 在事件循环线程上等它,会把整个窗口卡在 RTT 上。两步都 spawn 到
+    /// `self._runtime`,结果经 `UserEvent` 回送。
+    fn apply_remote_file_action(
+        &mut self,
+        generation: u64,
+        action: crate::ui::files_panel::FileAction,
+    ) {
+        use crate::ui::files_panel::FileAction;
+        let client = {
+            let Some(tab) = self.tabs.by_generation_mut(generation) else {
+                return;
+            };
+            tab.content.sftp_client()
+        };
+        let Some(client) = client else {
+            self.trigger_sftp_open(generation);
+            return;
+        };
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
+            return;
+        };
+        let files = tab.content.files_panel_mut();
+        let target = match &action {
+            FileAction::Goto(target) => target.clone(),
+            // **`RemotePath::parent()`,不是 `local::parent_local`**——那是
+            // 本地栏用的,两套路径语义不通用(POSIX vs 本机)。
+            FileAction::Up => files.remote.cwd.parent(),
+            FileAction::Refresh => files.remote.cwd.clone(),
+            FileAction::ToggleHidden => {
+                files.remote.show_hidden = !files.remote.show_hidden;
+                self.ui_dirty = true;
+                return;
+            }
+        };
+        let seq = files.remote.begin_load(target.clone());
+        let task =
+            spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, target, seq);
+        self.track_sftp_task(generation, task);
+        self.ui_dirty = true;
+    }
+
+    /// F50/设计 D23:文件面板拥有键盘焦点时的按键处理。只有
+    /// `shell::input_route::Route::FilesPanel` 到达时才会调用(见
+    /// `window_event` 里的输入分流,守 T8)。
+    ///
+    /// `generation` 是**属主标签**(不是"活动标签")——跟 `apply_local_file_action`/
+    /// `apply_remote_file_action` 的既有约定一致(S1 路由纪律),调用方
+    /// (`window_event`)已经用 `files_owner_generation()` 算好了传进来,这里
+    /// 不再假设"就是当前活动的那个"。
+    ///
+    /// **只读浏览(D1)**:`Delete`/`F2` 本切片不接——那是 D2 的写操作,现在
+    /// 接了是给一个按下去没反应的键。
+    fn handle_panel_key(
+        &mut self,
+        generation: u64,
+        key: &winit::keyboard::Key,
+        mods: ModifiersState,
+    ) {
+        use crate::ui::files_panel::FileAction;
+        use winit::keyboard::{Key as WinitKey, NamedKey};
+
+        // Ctrl+H:切隐藏文件。得先判——它落进 `WinitKey::Character("h")` 分支,
+        // 与下面按具名键的 match 互斥(具名键不受这条影响)。
+        if mods.control_key() {
+            if let WinitKey::Character(s) = key {
+                if s.as_str() == "h" {
+                    self.dispatch_panel_action(generation, FileAction::ToggleHidden);
+                    return;
+                }
+            }
+        }
+        match key {
+            WinitKey::Named(NamedKey::Enter) => {
+                let Some(tab) = self.tabs.by_generation(generation) else {
+                    return;
+                };
+                let (column, state) = tab.content.files_panel().active_state();
+                let Some(target) = state
+                    .selected
+                    .as_ref()
+                    .and_then(|name| state.entries.iter().find(|e| &e.name == name))
+                    .and_then(|e| state.enter_target(e))
+                else {
+                    return;
+                };
+                self.dispatch_panel_action_for(generation, column, FileAction::Goto(target));
+            }
+            WinitKey::Named(NamedKey::Backspace) => {
+                self.dispatch_panel_action(generation, FileAction::Up);
+            }
+            WinitKey::Named(NamedKey::F5) => {
+                self.dispatch_panel_action(generation, FileAction::Refresh);
+            }
+            WinitKey::Named(NamedKey::Tab) => {
+                if let Some(tab) = self.tabs.by_generation_mut(generation) {
+                    let files = tab.content.files_panel_mut();
+                    files.active_column = files.active_column.flipped();
+                    self.ui_dirty = true;
+                }
+            }
+            WinitKey::Named(NamedKey::ArrowUp) => self.move_panel_selection(generation, -1),
+            WinitKey::Named(NamedKey::ArrowDown) => self.move_panel_selection(generation, 1),
+            _ => {}
+        }
+    }
+
+    /// `handle_panel_key` 的小工具:按当前有焦点的那一栏(`active_column`)
+    /// 把 `action` 路由到对应的 `apply_*_file_action`。
+    fn dispatch_panel_action(
+        &mut self,
+        generation: u64,
+        action: crate::ui::files_panel::FileAction,
+    ) {
+        let Some(column) = self
+            .tabs
+            .by_generation(generation)
+            .map(|t| t.content.files_panel().active_column)
+        else {
+            return;
+        };
+        self.dispatch_panel_action_for(generation, column, action);
+    }
+
+    fn dispatch_panel_action_for(
+        &mut self,
+        generation: u64,
+        column: crate::ui::files_panel::PanelColumn,
+        action: crate::ui::files_panel::FileAction,
+    ) {
+        use crate::ui::files_panel::PanelColumn;
+        match column {
+            PanelColumn::Remote => self.apply_remote_file_action(generation, action),
+            PanelColumn::Local => self.apply_local_file_action(generation, action),
+        }
+    }
+
+    /// `↑`/`↓`:在有焦点的那一栏里移动 `selected`。纯 UI 状态,不经过
+    /// `apply_*_file_action` 那条异步链路(不触发网络请求),直接改
+    /// `PaneState::selected`。没有选中项时,`↓` 从第一行开始、`↑` 从最后一
+    /// 行开始——用户第一下按方向键该落在看得见的那一头,而不是无反应。
+    fn move_panel_selection(&mut self, generation: u64, delta: i32) {
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
+            return;
+        };
+        let state = tab.content.files_panel_mut().active_state_mut();
+        let rows = state.rows();
+        let Some(next) = next_panel_selection_index(&rows, state.selected.as_ref(), delta) else {
+            return;
+        };
+        let name = rows[next].name.clone();
+        state.selected = Some(name);
+        self.ui_dirty = true;
+    }
+
+    /// F50/D6:sftp 任务开出去之后,把它的句柄存回属主标签的 `sftp_tasks`
+    /// (`wind_down` 靠这个收口,见该字段的文档)。三处 spawn 点
+    /// (`trigger_sftp_open`/`apply_remote_file_action`/`accept_sftp_opened`
+    /// 的 `Ok` 分支)都要在拿到 `JoinHandle` 之后调用一次——抽成公共方法是
+    /// 因为三处逻辑完全一样:先清掉已经跑完的旧句柄(避免无界增长),再把
+    /// 新句柄推进去。
+    ///
+    /// 找不到属主标签(理论上不会发生:调用链上没有 `.await`,标签不可能在
+    /// `spawn_*` 和这一步之间被摘掉)时直接 abort 这一个——没有标签收留它,
+    /// 留着不管就是它自己文档里说的那种「无人收口」。D1:`Terminal`/`Files`
+    /// 两种标签都走这一条,`TabContent::sftp_tasks_mut` 已经把「该记到哪个
+    /// 字段」这件事收掉了。
+    fn track_sftp_task(&mut self, generation: u64, task: tokio::task::JoinHandle<()>) {
+        if let Some(tab) = self.tabs.by_generation_mut(generation) {
+            let tasks = tab.content.sftp_tasks_mut();
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(task);
+        } else {
+            task.abort();
+        }
+    }
+
+    /// F50/D6:首次要远端数据(或者上一次开失败、用户又点了一下)时,开一条
+    /// sftp channel。结果经 `UserEvent::SftpOpened` 回来(`accept_sftp_opened`
+    /// 接)。两种宿主取连接的来源不同(`TabContent::sftp_connection` 已经把
+    /// 差异收掉):
+    /// - `Terminal`(侧栏,D1 之前就有):蹭会话已建立的连接
+    ///   (`SftpClient::open` 的签名里刻意没有网络参数),不重新握手。取
+    ///   `hosts.first()` 而不是「聚焦 pane 那台」,前提是 ADR-009 下
+    ///   `PaneState::host_ix` 目前**恒为 0**(一个 workspace 事实上只挂一条
+    ///   连接),二者今天等价。等多主机分屏真落地,这里要跟着改成按聚焦 pane
+    ///   取——否则侧栏会连到另一台机器上,而用户看不出来。
+    /// - `Files`(D1 标签宿主):独占的连接(`establish` 单独建的那条,
+    ///   ADR-010 同款理由),`sftp_connection` 恒 `Some`。
+    fn trigger_sftp_open(&mut self, generation: u64) {
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
+            return;
+        };
+        let already_loading = matches!(
+            tab.content.files_panel().remote.load,
+            crate::files::state::Load::Loading
+        );
+        if tab.content.sftp_client().is_some() || already_loading {
+            // 已经开好了,或者已经在开的路上——别在下一帧/下一次点击重复触发。
+            return;
+        }
+        let Some(conn) = tab.content.sftp_connection() else {
+            return;
+        };
+        let default_remote = tab.content.sftp_default_remote();
+        tab.content.files_panel_mut().remote.load = crate::files::state::Load::Loading;
+        let task = spawn_sftp_open(
+            &self._runtime,
+            &self.proxy,
+            generation,
+            conn,
+            default_remote,
+        );
+        self.track_sftp_task(generation, task);
+    }
+
+    /// S1:`UserEvent::SftpOpened` 按世代查属主标签,不用活动标签接——用户在
+    /// 标签 A 开了侧栏、切到标签 B 的几百毫秒里这条抵达,拿活动标签接就会把
+    /// A 的 client 挂到 B 上。
+    fn accept_sftp_opened(
+        &mut self,
+        generation: u64,
+        result: Result<
+            (
+                Arc<mullion_ssh::sftp::SftpClient>,
+                mullion_ssh::sftp::RemotePath,
+            ),
+            String,
+        >,
+    ) {
+        match result {
+            Ok((client, home)) => {
+                let seq = {
+                    let Some(tab) = self.tabs.by_generation_mut(generation) else {
+                        log::debug!(target: "mullion", "丢弃过期世代 {generation} 的 SFTP 打开结果");
+                        return;
+                    };
+                    *tab.content.sftp_mut() = Some(client.clone());
+                    tab.content
+                        .files_panel_mut()
+                        .remote
+                        .begin_load(home.clone())
+                };
+                let task =
+                    spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, home, seq);
+                self.track_sftp_task(generation, task);
+            }
+            Err(msg) => {
+                if let Some(tab) = self.tabs.by_generation_mut(generation) {
+                    tab.content.files_panel_mut().remote.load =
+                        crate::files::state::Load::Failed(msg);
+                } else {
+                    log::debug!(target: "mullion", "丢弃过期世代 {generation} 的 SFTP 打开结果");
+                }
+            }
+        }
+        self.ui_dirty = true;
+        self.request_ui_redraw();
+    }
+
+    /// S1:`UserEvent::SftpListed` 同样按世代查属主标签。`seq` 对不上
+    /// (用户点得比网络快时的后发先至)由 `PaneState::accept` 内部丢弃。
+    fn accept_sftp_listed(
+        &mut self,
+        generation: u64,
+        seq: u64,
+        result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
+    ) {
+        if let Some(tab) = self.tabs.by_generation_mut(generation) {
+            tab.content.files_panel_mut().remote.accept(seq, result);
+        } else {
+            log::debug!(target: "mullion", "丢弃过期世代 {generation} 的目录列表(seq={seq})");
+        }
+        self.ui_dirty = true;
+        self.request_ui_redraw();
     }
 
     /// UI 侧变了(或 egui 自己要重绘):标脏 + 请求一帧。**两件事必须一起做**——
@@ -866,7 +1548,12 @@ impl App {
     /// (而不是直接调更省事的 `session::connect`):分屏(F35)要在同一条连接上
     /// 另开 channel,必须拿到 `establish` 返回的 `Handle` 本身——`connect` 内部
     /// 会把它吞掉不外露。
-    fn spawn_connect(&mut self, cfg: SshConfig) {
+    ///
+    /// D1/F50:`wants_sftp` 由调用方(点击那一刻)算好传入——`ConnectOk` 不带
+    /// `SessionId`,没法在收到结果时回头再查协议字段。为 `true` 时**跳过
+    /// `open_pty`**:SFTP 节点没有 PTY 这个概念,`establish` 一成功就直接
+    /// 回送(`pty: None`),不做那趟本来就用不上的 shell 握手。
+    fn spawn_connect(&mut self, cfg: SshConfig, wants_sftp: bool) {
         // F40~F44:此刻才确定「是哪条会话」。连接在途期间用户可能改配置甚至
         // 删会话,所以计划必须在用户点击的这一帧定死。
         // 上一次的结论到此为止:新连接开始了,旧结论就是误导信息。
@@ -913,9 +1600,21 @@ impl App {
                     return;
                 }
             };
+            if wants_sftp {
+                let _ = proxy.send_event(UserEvent::ConnectOk {
+                    handle,
+                    wants_sftp: true,
+                    pty: None,
+                });
+                return;
+            }
             match mullion_ssh::session::open_pty(handle.clone(), &cfg, wake).await {
                 Ok((ssh, rx)) => {
-                    let _ = proxy.send_event(UserEvent::ConnectOk { ssh, rx, handle });
+                    let _ = proxy.send_event(UserEvent::ConnectOk {
+                        handle,
+                        wants_sftp: false,
+                        pty: Some((ssh, rx)),
+                    });
                 }
                 Err(e) => {
                     let _ = proxy.send_event(UserEvent::ConnectErr(e.to_string()));
@@ -1323,7 +2022,8 @@ impl ApplicationHandler<UserEvent> for App {
         // CLI 直连(路径①)→ 立刻发起连接,进终端态;无参启动(路径②)→ 留在
         // launcher(conn 仍 None)并自动弹出会话管理器,让用户选/建会话(§2/Task7)。
         if let Some(cfg) = self.initial.take() {
-            self.spawn_connect(cfg);
+            // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
+            self.spawn_connect(cfg, false);
         } else {
             self.ui.session_manager_open = true;
         }
@@ -1345,19 +2045,85 @@ impl ApplicationHandler<UserEvent> for App {
                     a.window.request_redraw();
                 }
             }
-            UserEvent::ConnectOk { ssh, rx, handle } => {
-                crate::logx::line("连接成功,进入终端态");
+            UserEvent::ConnectOk {
+                handle,
+                wants_sftp,
+                pty,
+            } => {
                 // 一旦连上就进入交互态:后续(哪怕是本次会话断开后)的连接失败
                 // 不再是「CLI 直连首次失败」,不该导致整个 GUI exit(1)(复核 #1)。
                 self.cli_direct = false;
+                // C1:每次连接都是全新世代——`next_ws_generation` 取值后自增,
+                // 保证跟上一次(如果有)断开的那个世代号不同,哪怕 `PaneId`
+                // 因为 `next_id` 重新计数而撞号,也能靠这个分辨。D1:`Files`
+                // 标签同样要一个世代号(S1 路由键),两种标签共用这一个计数器。
+                let generation = self.next_ws_generation;
+                self.next_ws_generation += 1;
+                let cfg = self.pending_cfg.clone();
+                let session_id = self.ui.connect_request_last;
+                let title = cfg
+                    .as_ref()
+                    .map_or_else(|| "远端".to_string(), |c| format!("{}@{}", c.user, c.host));
+                // F120:这个标签对应会话在编辑器「SFTP」分节配置的默认目录/书签。
+                // 没有 `session_id`(理论上不可达,`connect_request_last` 由发起
+                // 连接那一刻设好)或 store 里查不到(会话已被删)都落回全空默认——
+                // 跟「没配置」等价,不阻断连接本身。
+                let sftp_prefs = session_id
+                    .and_then(|id| {
+                        self.store
+                            .as_ref()
+                            .and_then(|s| s.list().iter().find(|r| r.id == id))
+                    })
+                    .map(|rec| rec.sftp.clone())
+                    .unwrap_or_default();
+
+                if wants_sftp {
+                    // D1/D6:SFTP 节点——独占标签、独占连接(`handle`),不开
+                    // PTY。真正开 sftp channel 挪到 `trigger_sftp_open`
+                    // (跟侧栏共用同一条路径),这里只管把标签立起来、触发
+                    // 首次打开。
+                    crate::logx::line("连接成功,进入 SFTP 标签");
+                    self.tabs.open(
+                        title,
+                        session_id,
+                        TabContent::Files(Box::new(FilesTab {
+                            files: crate::ui::files_panel::PanelFrame::new(
+                                sftp_prefs.default_local.as_deref(),
+                                sftp_prefs.bookmarks,
+                            ),
+                            conn: handle,
+                            generation,
+                            sftp: None,
+                            sftp_tasks: Vec::new(),
+                            sftp_default_remote: sftp_prefs.default_remote,
+                        })),
+                    );
+                    self.ui.close_session_manager();
+                    self.ui_dirty = true;
+                    self.trigger_sftp_open(generation);
+                    self.request_ui_redraw();
+                    return;
+                }
+
+                let Some((ssh, rx)) = pty else {
+                    // `spawn_connect` 保证 `wants_sftp=false` 时 `pty` 恒
+                    // `Some`(`open_pty` 失败走 `ConnectErr`,不会发一个
+                    // 「两者皆无」的 `ConnectOk`)。到这里说明违反了这个前提——
+                    // 目前唯一的生产者(`spawn_connect`)维持着这个不变量,
+                    // 这条分支实际不可达;但如果哪天真的走到这里,不能只记
+                    // 日志静默丢弃——用户会看到「点了连接,什么都没发生」,
+                    // 跟 `ConnectErr`/host_key 弹窗那些故意不做静默失败的路径
+                    // 不一致。复用已有的错误展示通道,不新开概念。
+                    log::error!(target: "mullion", "ConnectOk 缺少 pty 且未标记 wants_sftp,忽略");
+                    self.ui
+                        .set_error("连接内部状态异常,请重试(缺少终端通道)".to_string());
+                    self.request_ui_redraw();
+                    return;
+                };
+                crate::logx::line("连接成功,进入终端态");
                 let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
                 let d = theme::term_default_colors(&MULLION_DARK);
                 emulator.set_default_colors(d.fg, d.bg);
-                // C1:每次连接都是全新世代——`next_ws_generation` 取值后自增,
-                // 保证跟上一次(如果有)断开的那个 Workspace 的世代号不同,
-                // 哪怕 PaneId 因为 next_id 重新计数而撞号,也能靠这个分辨。
-                let generation = self.next_ws_generation;
-                self.next_ws_generation += 1;
                 // pane 和自动化 task 要共享同一条 channel(spec §1 修订二):
                 // `PaneState.pty` 本来就是 `Box<dyn PtyWriter>`,`SshSession`
                 // 内部只有一个 mpsc Sender、本身 Send+Sync,`Arc` 只是共享
@@ -1379,12 +2145,8 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                     generation,
                 );
-                let cfg = self.pending_cfg.clone();
-                let session_id = self.ui.connect_request_last;
                 ws.hosts.push(crate::shell::workspace::HostConn {
-                    label: cfg
-                        .as_ref()
-                        .map_or_else(|| "远端".to_string(), |c| format!("{}@{}", c.user, c.host)),
+                    label: title.clone(),
                     addr: cfg
                         .as_ref()
                         .map_or_else(String::new, |c| format!("{}:{}", c.host, c.port)),
@@ -1393,10 +2155,6 @@ impl ApplicationHandler<UserEvent> for App {
                     session_id,
                     handle,
                 });
-                let title = ws
-                    .hosts
-                    .first()
-                    .map_or_else(String::new, |h| h.label.clone());
                 // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
                 // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
                 // `switching_tabs_does_not_touch_the_ssh_connections`)。
@@ -1408,13 +2166,21 @@ impl ApplicationHandler<UserEvent> for App {
                 self.tabs.open(
                     title,
                     session_id,
-                    TabContent::Terminal(TerminalTab {
+                    TabContent::Terminal(Box::new(TerminalTab {
                         ws,
                         current_preset: Some(Preset::Single),
                         last_cfg: cfg,
                         automation: None,
                         automation_status: None,
-                    }),
+                        // F50:每个标签自己的一份侧栏状态(D1:侧栏按会话记住)。
+                        files: crate::ui::files_panel::PanelFrame::new(
+                            sftp_prefs.default_local.as_deref(),
+                            sftp_prefs.bookmarks,
+                        ),
+                        sftp: None,
+                        sftp_tasks: Vec::new(),
+                        sftp_default_remote: sftp_prefs.default_remote,
+                    })),
                 );
                 // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
                 self.ui.close_session_manager();
@@ -1597,6 +2363,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.accept_automation_done(generation, outcome);
             }
             UserEvent::TunnelState { id, state } => self.accept_tunnel_state(id, state),
+            UserEvent::SftpOpened { generation, result } => {
+                self.accept_sftp_opened(generation, result);
+            }
+            UserEvent::SftpListed {
+                generation,
+                seq,
+                result,
+            } => {
+                self.accept_sftp_listed(generation, seq, result);
+            }
         }
     }
 
@@ -1616,15 +2392,29 @@ impl ApplicationHandler<UserEvent> for App {
         if self.tab_hotkey_event(&event) {
             return;
         }
+        // F50/T8:文件侧栏快捷键同样必须在分流之前截,理由同标签快捷键 ——
+        // `Ctrl+Shift+B` 里的 `B` 走到下面会被编码进 PTY,写给远端一个字母。
+        if self.files_hotkey_event(&event) {
+            return;
+        }
+        // F6/T8:换焦点同样必须在分流之前截,理由同上。
+        if self.focus_hotkey_event(&event) {
+            return;
+        }
         // 输入分流(§4.5)。**键盘与指针的顺序是反的,不是笔误**:
         // - 指针:先喂 egui 再判。egui 要靠 `CursorMoved` 维护 hover,不喂就没有
         //   `wants_pointer_input()` 可言。
         // - 键盘:先判再决定喂不喂(T8)。喂给 egui 的键会先经它的焦点系统——Tab 会被
         //   拿去把焦点给菜单栏第一个按钮,此后 `wants_keyboard_input()` 恒 true,
         //   下面的 route 把每个按键都判给 egui,终端永久收不到键。
-        // `modal` 在借出 `self.active` 之前算好:`modal_open()` 要 `&self`,
+        // `modal`/`focus` 在借出 `self.active` 之前算好:两者都要 `&self`,
         // 放进下面那个 `&mut self.active` 的作用域里借用检查过不去。
         let modal = self.modal_open();
+        let focus = self.effective_focus();
+        // Route::FilesPanel 判给面板的键记在这里,借用 `active` 的作用域结束
+        // 之后再处理(`handle_panel_key` 要 `&mut self`,不能跟 `&mut self.active`
+        // 同时活着)。
+        let mut panel_key_pending = false;
         if let Some(active) = &mut self.active {
             let is_kbd = matches!(event, WindowEvent::KeyboardInput { .. });
             let is_ptr = matches!(
@@ -1633,15 +2423,29 @@ impl ApplicationHandler<UserEvent> for App {
                     | WindowEvent::MouseWheel { .. }
                     | WindowEvent::CursorMoved { .. }
             );
-            // 键盘归终端时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
+            let wants_kbd = active.egui_ctx.wants_keyboard_input();
+            // 键盘归终端/面板时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
             if is_kbd
-                && !shell::input_route::egui_should_see(
+                && !shell::input_route::egui_should_see_focused(
+                    focus,
                     shell::input_route::InputKind::Keyboard,
                     modal,
-                    active.egui_ctx.wants_keyboard_input(),
+                    wants_kbd,
                 )
             {
                 // Route::Terminal → 直落下面 UNCHANGED 的 KeyboardInput 分支(守 T5/T6)。
+                // Route::FilesPanel → 面板截走(D23):既不喂 egui,也不落终端
+                // 写入分支——记一个标记,借用 `active` 结束后再处理。
+                panel_key_pending = matches!(
+                    shell::input_route::route_focused(
+                        focus,
+                        modal,
+                        wants_kbd,
+                        false,
+                        shell::input_route::InputKind::Keyboard,
+                    ),
+                    shell::input_route::Route::FilesPanel
+                );
             } else {
                 let resp = active.egui_state.on_window_event(&active.window, &event);
                 if resp.repaint {
@@ -1668,6 +2472,38 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+        }
+        // F50/D23/T8:面板截走的键在这里落地——`self.active` 的可变借用已经
+        // 结束,`handle_panel_key` 才能再拿 `&mut self`。不落到下面的 `match
+        // event { .. WindowEvent::KeyboardInput .. }`:那段是终端写入路径,
+        // Files 标签根本没有 pane 可写,落进去也只是静默无反应,但语义上这个键
+        // 已经被面板处理过一次,不该再走一遍分流判断。
+        if panel_key_pending {
+            if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+                if ke.state == ElementState::Pressed {
+                    if let Some(gen) = self.files_owner_generation() {
+                        let mods = self.mods;
+                        self.handle_panel_key(gen, &ke.logical_key, mods);
+                        // 代码复核挖出的真 bug:`handle_panel_key`(经
+                        // `dispatch_panel_action`/`move_panel_selection`)只标
+                        // `self.ui_dirty = true`,从不请求重绘。事件循环整个跑在
+                        // `ControlFlow::Wait`/`WaitUntil` 上(T3/T7),没有别的事件
+                        // 兜底重绘的话,键盘单独触发的这一路(Tab 换栏/↑↓选中/
+                        // Enter/Backspace/F5/Ctrl+H)画面会一直停在按键前那一帧,
+                        // 直到鼠标挪一下之类的无关事件顺带触发重绘。
+                        //
+                        // 补在这个单一落点,而不是 `apply_local_file_action`/
+                        // `apply_remote_file_action` 内部:那两个函数同时也被
+                        // 鼠标点击路径调用,鼠标点击是在一次已经在飞的 `Present`
+                        // 帧内部触发的,若在函数内部无条件补 `request_redraw`
+                        // 会让鼠标路径每次点击都多请求一帧,违反 T3/T7 的
+                        // 「标脏与请求重绘必须成对、不无条件每帧重绘」。这里是
+                        // 键盘专属分支,补一次不会波及鼠标路径。
+                        self.request_ui_redraw();
+                    }
+                }
+            }
+            return;
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -1924,6 +2760,83 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Some(a) = self.active.as_mut() {
                                 a.geoms = geoms.clone();
                             }
+                            // F50:侧栏首次打开(或者还没读过)时,本地栏同步、
+                            // 远端栏异步各触发一次数据加载。判据是「开着 且
+                            // 还没读过」(`Load::Idle`)而不是「这一帧刚被打开」
+                            // ——快捷键和菜单两条打开路径都要覆盖到,而后者是在
+                            // `build_ui` 内部直接改的 `ui_state`,这里判不出
+                            // "刚刚才开"。之后 `Refresh`/`Goto` 等动作会把
+                            // `load` 推离 `Idle`,这段自然只跑一次。**必须在
+                            // 下面借出 `self.store`/`self.ui`/`self.tabs`(给
+                            // `titles`/`frame.automation`)之前做**——这几处都要
+                            // `&mut self` 或 `&self.tabs`,借用检查过不去
+                            // (E0502/E0499)。
+                            //
+                            // 顺带记下这一帧文件面板实际要画的标签的**世代号**
+                            // (`files_owner_generation`)——它是本地/远端触发的
+                            // 目标,也是下面 `render_frame` 结束后把 `PanelFrame`
+                            // 放回原处、以及 `actions.files_local`/`files_remote`
+                            // 落回哪个标签的唯一依据。用世代号而不是"现在活动的
+                            // 标签":`render_frame` 期间用户切换/关闭标签的话,
+                            // 这些动作仍要落回**画出它们的那个标签**(S1 同款
+                            // 纪律)。
+                            //
+                            // D1:两种互斥的宿主(D4)——活动标签本身就是
+                            // `TabContent::Files`(标签宿主,占满内容区),或者
+                            // 活动标签是 `Terminal` 且侧栏开着(侧栏宿主)。侧栏
+                            // 只在终端标签上有意义,不会跟标签宿主同帧成立。
+                            //
+                            // 判断逻辑抽成了 `active_is_files_tab`/`files_owner_generation`
+                            // 两个 `&self` 方法(F6 的 `effective_focus` 与
+                            // `handle_panel_key` 也要用同一份判据,不能各写一遍——
+                            // 协调者修订 1)。`active_is_files` 这个局部变量仍然
+                            // 留着,下面 `sidebar_arg`/`content_arg` 那段要用。
+                            let active_is_files = self.active_is_files_tab();
+                            let files_owner_generation = self.files_owner_generation();
+                            if let Some(gen) = files_owner_generation {
+                                if self.tabs.active().is_some_and(|t| {
+                                    matches!(
+                                        t.content.files_panel().local.load,
+                                        crate::files::state::Load::Idle
+                                    )
+                                }) {
+                                    self.apply_local_file_action(
+                                        gen,
+                                        crate::ui::files_panel::FileAction::Refresh,
+                                    );
+                                }
+                                // F50/D6:远端栏同理,但走异步的 sftp 打开链路
+                                // (`trigger_sftp_open` → `UserEvent::SftpOpened` →
+                                // 首次 `list_dir` → `UserEvent::SftpListed`),
+                                // 不像本地栏那样能同步读盘。D1:标签宿主一开出来
+                                // 就已经在 `ConnectOk` 里触发过一次
+                                // `trigger_sftp_open`,这里的 `sftp_client().is_none()`
+                                // 判据保证不会重复触发(该函数内部本身也有这层
+                                // 判重,双保险不冲突)。
+                                if self.tabs.active().is_some_and(|t| {
+                                    t.content.sftp_client().is_none()
+                                        && matches!(
+                                            t.content.files_panel().remote.load,
+                                            crate::files::state::Load::Idle
+                                        )
+                                }) {
+                                    self.trigger_sftp_open(gen);
+                                }
+                            }
+                            // 把 `PanelFrame` 挪出来变成不再借用 `self.tabs` 的
+                            // 本地值:下面 `frame.automation` 是从同一个标签借出
+                            // 的 `&str`(`active_term_of(&self.tabs)...`),跟这里
+                            // 要的 `&mut PanelFrame` 同源,一个可变一个不可变,
+                            // `self.tabs` 借不出这两份。`render_frame` 调用、
+                            // `titles`/`snaps` 那几份不可变借用 `drop` 之后,
+                            // 按世代号放回去——期间哪怕用户切换/关闭了标签也不会
+                            // 错放(S1)。`files_panel_mut` 两个变体都有,不用再
+                            // `and_then(as_terminal_mut)` 判一次种类。
+                            let mut taken_files = files_owner_generation.and_then(|gen| {
+                                self.tabs
+                                    .by_generation_mut(gen)
+                                    .map(|tab| std::mem::take(tab.content.files_panel_mut()))
+                            });
                             let sessions: &[mullion_store::SessionRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.list());
                             let store_available = self.store.is_some();
@@ -2053,13 +2966,46 @@ impl ApplicationHandler<UserEvent> for App {
                                         .and_then(|t| t.automation_status.as_deref()),
                                 ),
                                 appearance: &self.appearance,
+                                // 协调者复核 #2:焦点在哪一侧此前完全没有视觉反馈,
+                                // F6/Tab 键盘可达性等于形同虚设。`effective_focus`
+                                // (已按上下文夹紧,不是裸 `self.focus`)算出的判据
+                                // 原样转发,`files_panel::sidebar`/`content` 据此
+                                // 决定画不画焦点边框。
+                                files_focused: self.effective_focus()
+                                    == shell::input_route::Focus::FilesPanel,
                             };
                             let a = self.active.as_mut().expect("上面刚判过 is_some");
-                            let (repaint_delay, actions) =
-                                render_frame(a, &renders, &mut self.ui, frame);
+                            // D1:两种宿主互斥(见上面 `files_owner_generation`
+                            // 的说明),`taken_files` 只会有其中一份非空数据 ——
+                            // 按 `active_is_files` 决定它该走 `render_frame` 的
+                            // 哪一个参数槽。
+                            let (sidebar_arg, content_arg) = if active_is_files {
+                                (None, taken_files.as_mut())
+                            } else {
+                                (taken_files.as_mut(), None)
+                            };
+                            let (repaint_delay, actions) = render_frame(
+                                a,
+                                &renders,
+                                &mut self.ui,
+                                frame,
+                                sidebar_arg,
+                                content_arg,
+                                files_owner_generation.unwrap_or(0),
+                            );
                             drop(renders);
                             drop(titles);
                             drop(snaps);
+                            // 放回去(见上面 `taken_files` 的说明)。找不到属主
+                            // 标签——这一帧同时把它关掉的极端情形——数据随
+                            // `taken_files` 一起丢弃就是对的:标签都没了,它的
+                            // 文件面板状态不需要留着。`files_panel_mut` 两个
+                            // 变体都有,不用再判一次种类。
+                            if let (Some(gen), Some(pf)) = (files_owner_generation, taken_files) {
+                                if let Some(tab) = self.tabs.by_generation_mut(gen) {
+                                    *tab.content.files_panel_mut() = pf;
+                                }
+                            }
 
                             self.limiter.record_present(now);
                             // egui 侧已画出;下面若 egui 又要一帧会重新置脏。
@@ -2105,6 +3051,19 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui_dirty = true;
                                 }
                                 None => {}
+                            }
+                            // F50:本地栏动作同步施加,远端栏动作走 D6 的 sftp
+                            // 打开/加载链路(见 `apply_local_file_action`/
+                            // `apply_remote_file_action` 的文档注释)。两者都按
+                            // `files_owner_generation` 路由,不是「当前活动
+                            // 标签」——理由同上面 `taken_files` 那段。
+                            if let Some(gen) = files_owner_generation {
+                                if let Some(action) = actions.files_local {
+                                    self.apply_local_file_action(gen, action);
+                                }
+                                if let Some(action) = actions.files_remote {
+                                    self.apply_remote_file_action(gen, action);
+                                }
                             }
                             // F100:导出的 Markdown 送剪贴板。写剪贴板是 IO,`ui/`
                             // 那一层只画不做 IO,所以在这里发起(同 F18 的复制路径)。
@@ -2392,8 +3351,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let skip_automation = std::mem::take(&mut self.ui.connect_skip_automation);
                 if let Some(id) = self.ui.connect_request.take() {
                     self.ui.connect_request_last = Some(id);
-                    match self.store.as_ref().map(|s| s.ssh_config_for(id)) {
-                        Some(Ok(cfg)) => {
+                    // D1/F50:`dial_plan_for` 多带回 `wants_sftp`——点「连接」
+                    // 要靠它决定 `ConnectOk` 抵达时开终端标签还是文件标签。
+                    match self.store.as_ref().map(|s| s.dial_plan_for(id)) {
+                        Some(Ok((cfg, wants_sftp))) => {
                             // 用户主动发起的连接是交互态,不该继承 CLI 直连的
                             // exit(1) 语义(复核 #1)。
                             self.cli_direct = false;
@@ -2403,7 +3364,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // 留给另一条还在途的连接:用户没点过跳过,那条连接的
                             // 自动化却被 `take_pending` 静默丢掉。
                             self.pending_skip_automation = skip_automation;
-                            self.spawn_connect(cfg);
+                            self.spawn_connect(cfg, wants_sftp);
                         }
                         Some(Err(e)) => self.ui.set_error(e.to_string()),
                         None => {}
@@ -2540,6 +3501,92 @@ fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
     ws.generation() == generation && mullion_core::layout::leaves(ws.tree()).contains(&id)
 }
 
+/// F120:`spawn_sftp_open` 该从哪个目录起步——配置了默认远端目录(编辑器
+/// 「SFTP」分节)就用它,没配置(`None`)落回登录目录(`.`)。
+///
+/// 抽成纯函数是为了能脱离 `Runtime`/`EventLoopProxy` 单测这条判定
+/// (`tests::configured_remote_dir_falls_back_to_login_directory_when_unset`)——
+/// `spawn_sftp_open` 本身两者都要,单测里造不出来。
+fn configured_remote_dir(configured: Option<&str>) -> mullion_ssh::sftp::RemotePath {
+    let dir = configured.unwrap_or(".");
+    mullion_ssh::sftp::RemotePath::from_bytes(dir.as_bytes().to_vec())
+}
+
+/// F50/D6:异步开一条 sftp channel + 取登录目录。结果经 `UserEvent::SftpOpened`
+/// 回送(`App::accept_sftp_opened` 接,按世代路由,S1)。
+///
+/// **写成自由函数,只取 `runtime`/`proxy`,不取 `&mut App`**:调用点
+/// (`App::trigger_sftp_open`)常常还攥着 `self.tabs.by_generation_mut(..)`
+/// 拿到的 `&mut TerminalTab`——若这里是 `&mut self` 的方法,借用检查器会把
+/// 两者锁在一起过不了(同 `apply_layout_actions`/`pane_still_wanted` 拆成自由
+/// 函数的理由)。错误在这里就转成用户看得懂的中文,不把 `SftpError` 的
+/// Debug 输出丢给用户。
+///
+/// **返回 `JoinHandle`,调用方必须存进 `TerminalTab::sftp_tasks`**——这里面
+/// `SftpClient::open` 的 `channel_open_session()`/`request_subsystem()` 两步
+/// 是裸的 russh 调用,**没有任何超时包裹**(不像 `list_dir`/`canonicalize`
+/// 那样受 russh-sftp 默认 10s 请求超时约束),链路黑洞(本项目高延迟代理链路
+/// 的头号场景)时可能无限期挂着。丢弃这个句柄 = 关标签时收不了口,任务会继续
+/// 攥着 `Arc<SshConnection>` 撑住本该断开的连接(见 `wind_down`)。
+///
+/// `default_remote`(F120):会话编辑器「SFTP」分节配置的默认远端目录,
+/// `None` 时落回登录目录 —— 判定逻辑在 `configured_remote_dir`。
+fn spawn_sftp_open(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    handle: Arc<SshConnection>,
+    default_remote: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    let proxy = proxy.clone();
+    runtime.spawn(async move {
+        let result = match mullion_ssh::sftp::SftpClient::open(handle).await {
+            Ok(client) => {
+                let login_dir = configured_remote_dir(default_remote.as_deref());
+                match client.canonicalize(&login_dir).await {
+                    Ok(home) => Ok((Arc::new(client), home)),
+                    // 这一步失败时 channel **已经开成功了**,只是取不到登录
+                    // 目录。跟上面那条共用「打开 SFTP 失败」会把排查方向带偏
+                    // 到连接/认证层,而真实原因通常在权限或远端 `.` 不可 stat。
+                    Err(e) => Err(format!("SFTP 已连上,但取不到登录目录:{e}")),
+                }
+            }
+            Err(e) => Err(format!("打开 SFTP 失败:{e}")),
+        };
+        let _ = proxy.send_event(UserEvent::SftpOpened { generation, result });
+    })
+}
+
+/// F50:异步列一次目录。结果经 `UserEvent::SftpListed` 回送(`App::accept_sftp_listed`
+/// 接)。`seq` 原样带上,回来时对着 `PaneState::request_seq` 校验——用户点得
+/// 比网络快时,后发先至的旧结果据此被丢弃。自由函数的理由同 `spawn_sftp_open`。
+///
+/// 同样**返回 `JoinHandle`,调用方必须存进 `TerminalTab::sftp_tasks`**——理由
+/// 同 `spawn_sftp_open`(这里的 `list_dir` 本身受 russh-sftp 默认 10s 请求超时
+/// 约束,但收口仍然要靠 `wind_down`:用户可能就是想在这 10s 窗口内立刻关掉
+/// 标签、立刻断开连接,而不是等超时)。
+fn spawn_sftp_list_dir(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    client: Arc<mullion_ssh::sftp::SftpClient>,
+    dir: mullion_ssh::sftp::RemotePath,
+    seq: u64,
+) -> tokio::task::JoinHandle<()> {
+    let proxy = proxy.clone();
+    runtime.spawn(async move {
+        let result = client
+            .list_dir(&dir)
+            .await
+            .map_err(|e| format!("读取目录失败:{e}"));
+        let _ = proxy.send_event(UserEvent::SftpListed {
+            generation,
+            seq,
+            result,
+        });
+    })
+}
+
 /// 采纳一次拨测结果:世代号对得上才写状态。返回是否采纳。
 ///
 /// 抽成自由函数是为了能脱离窗口/运行时单测 —— 事件循环里那一大坨
@@ -2639,11 +3686,43 @@ fn apply_save(
 /// 前者 `Duration::MAX` = 不需要,调用方据此走 T3/T7 的 `next_frame_at`/
 /// `WaitUntil`,不会无条件 `request_redraw`;后者由调用方在借用释放后统一施加。
 /// GPU 胶水,无单测。
+/// `this_pass` 里是否有一个"真实动作"——即这一趟 egui 输出 `actions` 要不要
+/// 拿去覆盖调用方手里那份(见 `render_frame` 内 `a.egui_ctx.run` 闭包上方的
+/// 长注释:discard 趟收到的是空输入,产出的 `UiActions::default()` 绝不能
+/// 覆盖掉真实点击那趟)。
+///
+/// `UiActions` 没有 derive `PartialEq`,这里是逐字段手写的判断——**给
+/// `UiActions` 加新字段时必须在这里补上对应的 `.is_some()`(或等价判断),
+/// 否则新动作会在 discard 趟里被静默丢弃**。这不是假设性风险:一次代码评审
+/// 曾发现删掉 `files_remote` 这一条,662 个既有测试全绿——没有任何测试构造过
+/// "`files_remote` 是唯一真实动作"的一帧。守护测试见
+/// `files_remote_alone_counts_as_a_real_action_for_the_discard_guard`。
+fn has_real_action(a: &crate::ui::UiActions) -> bool {
+    a.preset.is_some()
+        || a.close_pane.is_some()
+        || a.tab.is_some()
+        || a.annotate_export.is_some()
+        || a.files_remote.is_some()
+        || a.files_local.is_some()
+}
+
 fn render_frame(
     a: &mut Active,
     panes: &[crate::gpu::PaneRender<'_>],
     ui_state: &mut crate::ui::UiState,
     frame: crate::ui::UiFrame<'_>,
+    // F50:文件侧栏这一帧的两栏状态,`None` = 面板关着。不是 `UiFrame` 的字段——
+    // 见 `crate::ui::build_ui` 的同名参数注释(`UiFrame` 必须保持 `Copy`)。
+    mut files: Option<&mut crate::ui::files_panel::PanelFrame>,
+    // D1:标签宿主(活动标签本身是 `Files`)那一帧的两栏状态。与上面的
+    // `files`(侧栏宿主)互斥——调用方 `App::window_event` 的 `Present` 分支
+    // 按活动标签是哪种只填其中一个。
+    mut files_content: Option<&mut crate::ui::files_panel::PanelFrame>,
+    // 代码复核挖出的真 bug 的修法:`files`/`files_content` 所属标签的世代号,
+    // 原样转给 `build_ui`(见其同名参数的文档)。`files`/`files_content` 都是
+    // `None` 时不会被用到——调用方传的是 `files_owner_generation.unwrap_or(0)`,
+    // 那种情况下这个 0 只是个从不会被读取的占位值。
+    files_generation: u64,
 ) -> (std::time::Duration, crate::ui::UiActions) {
     diag::count_frame();
     // --- egui:每帧都跑,launcher 态(panes 为空)也要画菜单/状态栏。---
@@ -2665,15 +3744,22 @@ fn render_frame(
     // discard 趟的空结果不会覆盖掉它;若两趟都没有真实点击,`actions` 保持
     // 默认值,语义不变。
     let full_output = a.egui_ctx.run(raw_input, |ctx| {
-        let this_pass = crate::ui::build_ui(ctx, &MULLION_DARK, ui_state, frame);
-        // `UiActions` 没有 derive `PartialEq`,这里是逐字段手写的"是否有真实动作"——
-        // 给 `UiActions` 加新字段时必须在这里补上对应的 `.is_some()`(或等价判断),
-        // 否则新动作会在上面文档注释说的 discard 趟里被静默丢弃。
-        if this_pass.preset.is_some()
-            || this_pass.close_pane.is_some()
-            || this_pass.tab.is_some()
-            || this_pass.annotate_export.is_some()
-        {
+        // `files` 是 `Option<&mut PanelFrame>`:`ctx.run` 的闭包是 `FnMut`、
+        // 内部是个多趟 loop(见上面注释),不能把它按值 move 进来(第二趟就没了)。
+        // `as_deref_mut()` 每趟从 `&mut Option<&mut PanelFrame>` 里取一个新的
+        // reborrow ——`Option<&mut T>: DerefMut<Target = T>` 对任意 `T` 恒成立
+        // (标准库给 `&mut T` 实现的 `DerefMut`),不需要 `PanelFrame` 自己是
+        // `DerefMut`。
+        let this_pass = crate::ui::build_ui(
+            ctx,
+            &MULLION_DARK,
+            ui_state,
+            frame,
+            files.as_deref_mut(),
+            files_content.as_deref_mut(),
+            files_generation,
+        );
+        if has_real_action(&this_pass) {
             actions = this_pass;
         }
     });
@@ -2823,11 +3909,17 @@ fn render_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_layout_actions, apply_save, pane_still_wanted, sync_timeout_wake_at};
+    use super::{
+        apply_layout_actions, apply_save, effective_focus_of, files_owner_generation_of,
+        has_real_action, next_panel_selection_index, pane_still_wanted, sync_timeout_wake_at,
+        wind_down, Tab, TabContent, TerminalTab,
+    };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
+    use crate::shell::tabs::{TabId, Tabs};
     use crate::shell::workspace::{Preset, Workspace};
     use mullion_core::layout::{Dir, Node, PaneId, Rect};
+    use std::sync::Arc;
 
     #[test]
     fn redraw_is_frame_capped() {
@@ -3314,6 +4406,505 @@ mod tests {
         );
     }
 
+    /// **接线守护**:`accept_sftp_opened` 必须按世代查属主标签,不是"当前
+    /// 活动标签"。用户在标签 A 开侧栏、切到标签 B 的几百毫秒里 sftp 打开结果
+    /// 抵达,拿活动标签接会把 A 的 client 挂到 B 上 —— B 的侧栏此后就在
+    /// A 的主机上操作,用户看不出来,直到删错文件。
+    ///
+    /// **扎的是源码结构而非运行时行为**:`App` 要 `EventLoopProxy` 才能构造,
+    /// 单测里造不出来。验证边界:只挡得住「函数体里没按世代查标签」这一种
+    /// 写法。
+    ///
+    /// 自证会变红:把 `accept_sftp_opened` 里的 `.by_generation_mut(generation)`
+    /// 全部换成 `self.tabs.active_mut()`(即"接到活动标签"而非"按世代查")。
+    #[test]
+    fn sftp_opened_is_routed_by_generation_not_by_the_active_tab() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn accept_sftp_opened(")
+            .nth(1)
+            .expect("找不到 accept_sftp_opened 的定义");
+        let body = &after[..after
+            .find("\n    fn accept_sftp_listed(")
+            .expect("找不到 accept_sftp_opened 的函数结尾")];
+        assert!(
+            body.contains(".by_generation_mut(generation)"),
+            "accept_sftp_opened 没按世代查属主标签 —— 迟到的 sftp client 会\
+             挂到当前活动标签而不是真正发起打开请求的那个标签上"
+        );
+    }
+
+    /// **接线守护**:F50 的六条文件动作路径都必须走 `TabContent` 的**通用**
+    /// 访问器(`files_panel_mut`/`sftp_tasks_mut`/`sftp_mut`/`sftp_connection`),
+    /// 不许退回 `as_terminal_mut()`。
+    ///
+    /// 退回去的症状**全都是静默的**,而且一个比一个难查:
+    /// - `track_sftp_task`:找不到「终端标签」时它会 `task.abort()` 兜底 ——
+    ///   对文件标签就是**刚 spawn 的 open 请求被自己 abort 掉**,标签永远卡在
+    ///   「正在读取目录…」,没有任何报错。
+    /// - `accept_sftp_opened` / `accept_sftp_listed`:结果被当成「过期世代」丢掉,
+    ///   只在 debug 日志里留一行。
+    /// - `trigger_sftp_open` / `apply_*_file_action`:文件标签压根找不到入口。
+    ///
+    /// **扎的是源码结构**(`App` 要 `EventLoopProxy`,单测里造不出来;`FilesTab`
+    /// 还要 `Arc<SshConnection>`,而 `SshConnection::new` 是 `pub(crate)`,
+    /// `mullion-app` 这边根本构造不出来)。验证边界:只挡得住「函数体里直接写
+    /// `as_terminal_mut`」这一种退化,挡不住「换个名字的等价单路径写法」。
+    ///
+    /// 自证会变红:把其中任意一个函数体里的通用访问器换回
+    /// `.and_then(|tab| tab.content.as_terminal_mut())`。
+    /// (复核实测:补这条之前,六处**全部**换回去,677 条测试一条都不红。)
+    #[test]
+    fn file_actions_never_narrow_to_terminal_tabs_only() {
+        let src = include_str!("app.rs");
+        for name in [
+            "fn apply_local_file_action",
+            "fn apply_remote_file_action",
+            "fn track_sftp_task",
+            "fn trigger_sftp_open",
+            "fn accept_sftp_opened",
+            "fn accept_sftp_listed",
+        ] {
+            let after = src
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("找不到 {name} 的定义"));
+            // 这几个都是 `impl App` 里的方法,函数体止于第一个 4 空格缩进的
+            // 右花括号;更深的嵌套块收在 8 空格及以上,不会提前截断。
+            let body = &after[..after
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("找不到 {name} 的函数结尾"))];
+            // 先证明切出来的确实是个函数体:切歪成空串的话下面那条否定断言
+            // 会空过,这条测试就成了摆设(本项目吃过「探针读在被测路径之外」
+            // 的亏)。每个函数体都必然提到 generation —— 六条全是按世代路由的。
+            assert!(
+                body.contains("generation"),
+                "{name} 的函数体切歪了(切出来 {} 字节,没提到 generation)——\
+                 下面那条断言会空过",
+                body.len()
+            );
+            assert!(
+                !body.contains("as_terminal_mut"),
+                "{name} 收窄成了只认终端标签 —— SFTP 节点开的文件标签会被静默\
+                 跳过(track_sftp_task 那处更狠:在途的 open 请求会被自己 abort,\
+                 标签永远停在「正在读取目录…」且不报错)"
+            );
+        }
+    }
+
+    /// 协调者修订 3:`handle_panel_key`(及其内部工具 `dispatch_panel_action`/
+    /// `dispatch_panel_action_for`/`move_panel_selection`)必须按**属主标签**
+    /// (`generation` 参数)操作,不能落回"活动标签"——跟
+    /// `apply_remote_file_action`/`apply_local_file_action` 的既有约定一致
+    /// (S1 路由纪律)。理由跟 F50 那六条路径一样:`window_event` 判定阶段
+    /// 算出的属主标签,和这次按键真正处理时的活动标签,理论上可能不是同一个
+    /// (异步 dispatch 的间隙里活动标签可能已经切走)——落回活动标签会让
+    /// 按键作用在错误的标签上。
+    ///
+    /// **扎的是源码结构**,理由同 `file_actions_never_narrow_to_terminal_tabs_only`
+    /// ——`App` 单测里造不出来(`EventLoopProxy`)。验证边界:只挡得住这四个
+    /// 函数体里直接出现 `self.tabs.active()`/`self.tabs.active_mut()` 这种
+    /// 写法,挡不住换个等价说法的更隐蔽退化。
+    ///
+    /// 自证会变红:把 `move_panel_selection` 里的
+    /// `self.tabs.by_generation_mut(generation)` 换成 `self.tabs.active_mut()`。
+    #[test]
+    fn panel_key_handling_is_routed_by_generation_not_by_the_active_tab() {
+        let src = include_str!("app.rs");
+        for name in [
+            "fn handle_panel_key(",
+            "fn dispatch_panel_action(",
+            "fn dispatch_panel_action_for(",
+            "fn move_panel_selection(",
+        ] {
+            let after = src
+                .split(name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("找不到 {name} 的定义"));
+            let body = &after[..after
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("找不到 {name} 的函数结尾"))];
+            assert!(
+                body.contains("generation"),
+                "{name} 的函数体切歪了(切出来 {} 字节,没提到 generation)——\
+                 下面那条断言会空过",
+                body.len()
+            );
+            assert!(
+                !body.contains("self.tabs.active()") && !body.contains("self.tabs.active_mut()"),
+                "{name} 落回了「活动标签」,而不是按 generation 路由的属主标签"
+            );
+        }
+    }
+
+    /// 代码复核挖出的真 bug:F6/Tab 切到面板焦点之后,`panel_key_pending`
+    /// 这条分支只经 `handle_panel_key` 标脏(`self.ui_dirty = true`),从不
+    /// 请求重绘。事件循环整个跑在 `ControlFlow::Wait`/`WaitUntil` 上
+    /// (T3/T7),纯键盘交互不产生任何异步 `UserEvent`,画面会一直停在
+    /// 按键前那一帧,直到鼠标挪一下之类的无关事件顺带触发重绘才刷新。
+    ///
+    /// **扎的是源码结构**:`App`/`Window` 在无头单测里都造不出来
+    /// (`Window` 需要真实事件循环),没法写行为测试。验证边界:只挡得住
+    /// `panel_key_pending` 这个分支里字面上缺 `request_ui_redraw()` 调用
+    /// 的退化,挡不住换个等价说法(比如另起一个不生效的重绘函数)的更隐蔽
+    /// 走样。
+    ///
+    /// 自证会变红:把补的那行 `self.request_ui_redraw();` 删掉。
+    #[test]
+    fn panel_key_pending_requests_a_redraw_so_keyboard_only_input_is_not_stuck_on_a_stale_frame() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("if panel_key_pending {")
+            .nth(1)
+            .expect("找不到 panel_key_pending 分支");
+        let body = &after[..after
+            .find("\n        match event {")
+            .expect("找不到 panel_key_pending 分支的结尾(下一个 match event)")];
+        assert!(
+            body.contains("self.handle_panel_key(gen"),
+            "切歪了,没切到 handle_panel_key 调用——下面那条断言会空过"
+        );
+        let after_call = body
+            .split("self.handle_panel_key(gen")
+            .nth(1)
+            .expect("上面已断言 contains,这里不该找不到");
+        assert!(
+            after_call.contains("self.request_ui_redraw()"),
+            "panel_key_pending 分支处理完键之后没有请求重绘——键盘单独触发\
+             的 Tab 换栏/↑↓选中/Enter/Backspace/F5/Ctrl+H 会卡在按键前的\
+             那一帧,直到无关事件顺带重绘才刷新"
+        );
+    }
+
+    /// 空列表没有"选第几个"这个概念——`move_panel_selection` 里原本靠
+    /// `rows.is_empty()` 提前 `return` 挡住,抽出来之后这条边界只有纯函数
+    /// 自己能直接测(`App`/`Window` 在无头单测里造不出来)。
+    #[test]
+    fn panel_selection_with_an_empty_row_list_has_no_answer() {
+        let rows: [&mullion_ssh::sftp::Entry; 0] = [];
+        assert_eq!(next_panel_selection_index(&rows, None, 1), None);
+        assert_eq!(next_panel_selection_index(&rows, None, -1), None);
+    }
+
+    /// `next_panel_selection_index` 的边界:没有选中项时,`↓`(`delta > 0`)
+    /// 落到第一行。
+    #[test]
+    fn panel_selection_with_nothing_selected_and_arrow_down_lands_on_first_row() {
+        let a = panel_selection_test_entry(b"a.txt");
+        let b = panel_selection_test_entry(b"b.txt");
+        let rows = [&a, &b];
+        assert_eq!(next_panel_selection_index(&rows, None, 1), Some(0));
+    }
+
+    /// 没有选中项时,`↑`(`delta < 0`)落到最后一行——用户第一下按方向键该
+    /// 落在看得见的那一头。
+    #[test]
+    fn panel_selection_with_nothing_selected_and_arrow_up_lands_on_last_row() {
+        let a = panel_selection_test_entry(b"a.txt");
+        let b = panel_selection_test_entry(b"b.txt");
+        let c = panel_selection_test_entry(b"c.txt");
+        let rows = [&a, &b, &c];
+        assert_eq!(next_panel_selection_index(&rows, None, -1), Some(2));
+    }
+
+    /// 只有一行时,不管选没选、往哪个方向按,都只能停在那一行(下标 0)。
+    #[test]
+    fn panel_selection_with_a_single_row_stays_on_it_either_direction() {
+        let a = panel_selection_test_entry(b"only.txt");
+        let rows = [&a];
+        assert_eq!(next_panel_selection_index(&rows, None, 1), Some(0));
+        assert_eq!(next_panel_selection_index(&rows, None, -1), Some(0));
+        assert_eq!(
+            next_panel_selection_index(&rows, Some(&a.name), 1),
+            Some(0),
+            "已经是唯一一行,↓ 不该越界"
+        );
+        assert_eq!(
+            next_panel_selection_index(&rows, Some(&a.name), -1),
+            Some(0),
+            "已经是唯一一行,↑ 不该越界"
+        );
+    }
+
+    /// 选中第一行再按 `↑`:必须夹在 0,不能下溢成一个巨大的 `usize`
+    /// (`(0i32 - 1).clamp(0, ..)` 算对了才行,这条钉的正是这个夹紧)。
+    #[test]
+    fn panel_selection_on_the_first_row_pressing_up_clamps_to_zero() {
+        let a = panel_selection_test_entry(b"a.txt");
+        let b = panel_selection_test_entry(b"b.txt");
+        let rows = [&a, &b];
+        assert_eq!(
+            next_panel_selection_index(&rows, Some(&a.name), -1),
+            Some(0)
+        );
+    }
+
+    /// 选中最后一行再按 `↓`:必须夹在 `rows.len() - 1`,不能越界出去。
+    #[test]
+    fn panel_selection_on_the_last_row_pressing_down_clamps_to_the_end() {
+        let a = panel_selection_test_entry(b"a.txt");
+        let b = panel_selection_test_entry(b"b.txt");
+        let rows = [&a, &b];
+        assert_eq!(next_panel_selection_index(&rows, Some(&b.name), 1), Some(1));
+    }
+
+    /// 选中项按**身份**(名字)定位,不是恒定的某个下标——3 行里选中中间那
+    /// 行再按 `↓`,必须落到第三行。挑中间行是故意的:两端的边界测试哪怕
+    /// `position` 查找被错误地退化成"恒当作第 0 行",算出来的结果也可能
+    /// 跟正确答案凑巧撞上(比如选中第一行时两者都是 0)——只有选中中间行
+    /// 才能把这类退化跟正确实现的结果分开。
+    #[test]
+    fn panel_selection_finds_the_selected_row_by_identity_not_a_fixed_index() {
+        let a = panel_selection_test_entry(b"a.txt");
+        let b = panel_selection_test_entry(b"b.txt");
+        let c = panel_selection_test_entry(b"c.txt");
+        let rows = [&a, &b, &c];
+        assert_eq!(next_panel_selection_index(&rows, Some(&b.name), 1), Some(2));
+    }
+
+    /// 选中项已经不在当前 `rows` 里(比如切隐藏文件显示、或换目录之后旧的
+    /// `selected` 还没来得及清)——`position` 找不到,必须按"未选中"处理,
+    /// 不能 panic 也不能悄悄选中一个不相关的行。
+    #[test]
+    fn panel_selection_of_a_row_no_longer_present_falls_back_to_the_unselected_case() {
+        let a = panel_selection_test_entry(b"a.txt");
+        let stale = mullion_ssh::sftp::RemotePath::from_bytes(b"gone.txt".to_vec());
+        let rows = [&a];
+        assert_eq!(
+            next_panel_selection_index(&rows, Some(&stale), 1),
+            Some(0),
+            "落不到的选中项,↓ 应该退回「未选中」那一支,落到第一行"
+        );
+    }
+
+    fn panel_selection_test_entry(name: &[u8]) -> mullion_ssh::sftp::Entry {
+        mullion_ssh::sftp::Entry {
+            name: mullion_ssh::sftp::RemotePath::from_bytes(name.to_vec()),
+            kind: mullion_ssh::sftp::EntryKind::File,
+            size: 1024,
+            mtime: 1_700_000_000,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            link_target: None,
+        }
+    }
+
+    /// **接线守护**:`accept_sftp_listed` 同样必须按世代查属主标签。
+    ///
+    /// 验证边界与自证方式同上一条。
+    #[test]
+    fn sftp_listed_is_routed_by_generation_not_by_the_active_tab() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn accept_sftp_listed(")
+            .nth(1)
+            .expect("找不到 accept_sftp_listed 的定义");
+        let body = &after[..after
+            .find("\n    /// UI 侧变了")
+            .expect("找不到 accept_sftp_listed 的函数结尾")];
+        assert!(
+            body.contains(".by_generation_mut(generation)"),
+            "accept_sftp_listed 没按世代查属主标签 —— 迟到的目录列表会落到\
+             当前活动标签而不是真正发起这次列目录的那个标签上"
+        );
+    }
+
+    /// **接线守护**:`PanelFrame`(侧栏两栏运行态)必须挂在 `TerminalTab` 上,
+    /// 不能挂回 `App`。
+    ///
+    /// 背景:Task 9 时远端栏恒 `Load::Idle`,挂在 `App` 上是权宜实现,单标签
+    /// 看不出问题。Task 10a 接上真实 sftp 数据之后,若退回挂到 `App` 级
+    /// 全局一份,标签 A 连主机甲、标签 B 连主机乙,侧栏会把甲的目录内容显示
+    /// 在乙的标签下 —— 用户在不知情的情况下对着错误的主机操作(删除/上传,
+    /// 虽然本切片只读,但下一片 D2 就会加写操作,这个地基现在不钉死以后更难改)。
+    ///
+    /// **扎的是源码结构**:直接断言两个 struct 定义体里 `PanelFrame` 这个
+    /// 类型名出现在哪个 struct。验证边界:挡得住"整个字段搬回 App"这种写法,
+    /// 挡不住"两边都留一份、只是没人用 App 那份"这类更隐蔽的走样。
+    ///
+    /// 自证会变红:把 `files: crate::ui::files_panel::PanelFrame` 那行从
+    /// `TerminalTab` 挪回 `struct App { ... }` 里。
+    #[test]
+    fn files_sidebar_state_lives_on_the_tab_not_on_app() {
+        let src = include_str!("app.rs");
+
+        let app_after = src
+            .split("pub struct App {")
+            .nth(1)
+            .expect("找不到 struct App 的定义");
+        let app_body = &app_after[..app_after.find("\n}\n").expect("找不到 struct App 的结尾")];
+        assert!(
+            !app_body.contains("PanelFrame"),
+            "PanelFrame 不该再挂在 App 上 —— 会导致多标签共享一份侧栏状态,\
+             标签 B 显示标签 A 主机的目录内容"
+        );
+
+        let tab_after = src
+            .split("struct TerminalTab {")
+            .nth(1)
+            .expect("找不到 struct TerminalTab 的定义");
+        let tab_body = &tab_after[..tab_after
+            .find("\n}\n")
+            .expect("找不到 struct TerminalTab 的结尾")];
+        assert!(
+            tab_body.contains("PanelFrame"),
+            "PanelFrame 没有挂在 TerminalTab 上 —— 侧栏状态就无处安放了"
+        );
+    }
+
+    /// **前置 A(补测回归)**:`files_remote` 单独一个真实动作时,必须能穿过
+    /// `render_frame` 内部的 discard 趟保护(`has_real_action`),不能被静默
+    /// 吃掉。
+    ///
+    /// 背景:一次代码评审发现,`this_pass.preset.is_some() || ... ||
+    /// this_pass.files_remote.is_some() || ...` 这条判断链里,`files_remote`
+    /// 那一句即使被删掉,`cargo test --workspace`(662 个既有测试)依然全绿
+    /// —— 因为没有任何测试构造过"`files_remote` 是这一帧唯一真实动作"的
+    /// `UiActions`。这条测试直接测 `has_real_action`(`render_frame` 内部
+    /// discard 趟真正调用的那个函数,不是重新抄一遍判断逻辑),把这个缺口钉死。
+    #[test]
+    fn files_remote_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let a = crate::ui::UiActions {
+            files_remote: Some(crate::ui::files_panel::FileAction::Refresh),
+            ..Default::default()
+        };
+        assert!(
+            has_real_action(&a),
+            "files_remote 单独一个真实动作时必须被 has_real_action 认成\
+             「有真实动作」,否则 egui 的 discard 趟会把它静默吃掉(见\
+             render_frame 内部长注释)"
+        );
+    }
+
+    /// `effective_focus_of`/`files_owner_generation_of` 的测试脚手架:一个
+    /// 只有一条 Terminal 标签的 `Tabs<TabContent>`。世代号故意用一个非零的
+    /// 哨兵值(7)——用 0 的话,一条「压根没读 `ws.generation()`、随手返回
+    /// 默认值」的错误实现也能蒙混过去。
+    fn tabs_with_one_terminal_tab() -> Tabs<TabContent> {
+        let mut tabs = Tabs::default();
+        tabs.open(
+            "t".into(),
+            None,
+            TabContent::Terminal(Box::new(TerminalTab {
+                ws: Workspace::new(test_pane(1), 7),
+                current_preset: None,
+                last_cfg: None,
+                automation: None,
+                automation_status: None,
+                files: Default::default(),
+                sftp: None,
+                sftp_tasks: Vec::new(),
+                sftp_default_remote: None,
+            })),
+        );
+        tabs
+    }
+
+    /// `effective_focus` 三条规则(协调者修订 2)里的第一条:活动标签是
+    /// Terminal 且侧栏关着 → 恒 `Terminal`。
+    ///
+    /// 故意把 `focus` 参数传成 `FilesPanel`(装作用户按过 F6、意愿是面板)——
+    /// 面板压根不在场,这个意愿必须被夹掉,否则键盘会打进一个不可见的面板,
+    /// 表现为「按什么键都没反应」。传 `Terminal` 的话,一份"直接原样返回
+    /// focus 参数"的错误实现也能蒙混过去。
+    #[test]
+    fn effective_focus_of_terminal_tab_without_sidebar_is_always_terminal() {
+        use crate::shell::input_route::Focus;
+        let tabs = tabs_with_one_terminal_tab();
+        assert_eq!(
+            effective_focus_of(&tabs, false, Focus::FilesPanel),
+            Focus::Terminal
+        );
+    }
+
+    /// 第二条规则:活动标签是 Terminal 且侧栏开着 → 用 `self.focus`(用户的
+    /// F6 意愿生效)。两个方向都断言——只测一个方向的话,一份「恒返回
+    /// Terminal」或「恒返回 FilesPanel」的错误实现有一半概率蒙混过去。
+    #[test]
+    fn effective_focus_of_terminal_tab_with_sidebar_open_follows_user_choice() {
+        use crate::shell::input_route::Focus;
+        let tabs = tabs_with_one_terminal_tab();
+        assert_eq!(
+            effective_focus_of(&tabs, true, Focus::Terminal),
+            Focus::Terminal
+        );
+        assert_eq!(
+            effective_focus_of(&tabs, true, Focus::FilesPanel),
+            Focus::FilesPanel
+        );
+    }
+
+    /// 第三条规则:活动标签是 Files → 恒 `FilesPanel`。构造不出真实的
+    /// `FilesTab`(`FilesTab::conn` 是 `Arc<SshConnection>`,`SshConnection::new`
+    /// 对 `mullion-app` 不可见——同 `wind_down_has_no_catch_all_arm_...` 那条
+    /// 测试面对的限制),只能扎源码结构。
+    ///
+    /// 自证会变红:把 `active_is_files_tab_of(tabs)` 为真时返回的
+    /// `Focus::FilesPanel` 改成 `Focus::Terminal`。
+    #[test]
+    fn effective_focus_treats_a_files_tab_as_always_focused_on_the_panel() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn effective_focus_of(")
+            .nth(1)
+            .expect("找不到 effective_focus_of 的定义");
+        let body = &after[..after
+            .find("\n}\n")
+            .expect("找不到 effective_focus_of 的函数结尾")];
+        let files_branch = body
+            .split("if active_is_files_tab_of(tabs) {")
+            .nth(1)
+            .expect("找不到 active_is_files_tab_of 分支体");
+        let files_branch_body =
+            &files_branch[..files_branch.find("} else").unwrap_or(files_branch.len())];
+        assert!(
+            files_branch_body.contains("Focus::FilesPanel"),
+            "effective_focus_of 在活动标签是 Files 时必须恒返回 \
+             Focus::FilesPanel —— 那种标签没有终端可回,按 Terminal 路由的话\
+             方向键/回车会去找一个不存在的 pane,静默无反应"
+        );
+    }
+
+    /// 修订 1:`files_owner_generation` 侧栏关着时不该有属主——面板这一刻
+    /// 根本不可见。
+    #[test]
+    fn files_owner_generation_of_terminal_tab_without_sidebar_is_none() {
+        let tabs = tabs_with_one_terminal_tab();
+        assert_eq!(files_owner_generation_of(&tabs, false), None);
+    }
+
+    /// 修订 1 的反面:侧栏开着时属主是活动标签自己的世代号,不是随便一个值。
+    #[test]
+    fn files_owner_generation_of_terminal_tab_with_sidebar_open_is_the_workspace_generation() {
+        let tabs = tabs_with_one_terminal_tab();
+        assert_eq!(files_owner_generation_of(&tabs, true), Some(7));
+    }
+
+    /// 前置 A 的**另一半**:`files_local` 与 `files_remote` 是同构的缺口,
+    /// 上一条只钉死了远端那半。复核实测:删掉 `has_real_action` 里
+    /// `a.files_local.is_some()` 那一行,补测之前全仓库照样全绿——因为没有
+    /// 任何测试构造过「`files_local` 是这一帧唯一真实动作」的 `UiActions`。
+    #[test]
+    fn files_local_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let a = crate::ui::UiActions {
+            files_local: Some(crate::ui::files_panel::FileAction::Refresh),
+            ..Default::default()
+        };
+        assert!(
+            has_real_action(&a),
+            "files_local 单独一个真实动作时必须被 has_real_action 认成\
+             「有真实动作」,否则本地栏的点击会在 discard 趟被静默吃掉"
+        );
+    }
+
+    /// 陪跑:全默认的 `UiActions`(什么都没点)不该被判成「有真实动作」——
+    /// 否则上面两条测试就是靠 `has_real_action` 恒真通过的,没有测到东西。
+    #[test]
+    fn no_actions_is_not_a_real_action() {
+        assert!(!has_real_action(&crate::ui::UiActions::default()));
+    }
+
     /// **接线守护**:`pump_io` 必须驱动 `drive_automation`。
     ///
     /// 首字节与断线两条边挂在 `pump_io` 上而不是重绘上,是刻意的:最小化期间
@@ -3408,6 +4999,159 @@ mod tests {
         );
     }
 
+    /// **接线守护 / T8**:文件侧栏快捷键(`Ctrl+Shift+B`)必须同样在输入分流
+    /// **之前**被截走。与 `tab_shortcuts_are_swallowed_before_the_input_routing`
+    /// 同构,理由同上:不截的话,`Ctrl+Shift+B` 里的 `B` 会先被喂给 egui 的
+    /// 焦点系统,也会被 `KeyboardInput` 分支编码进 PTY,写给远端一个字母。
+    ///
+    /// 验证边界同 `tab_hotkey_event` 那条:只挡得住「调用点跑到分流之后 /
+    /// 整个没调」,挡不住有人在 `files_hotkey_event` 里返回恒 false。
+    ///
+    /// 自证会变红:把 `window_event` 里那句 `if self.files_hotkey_event(&event)`
+    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
+    #[test]
+    fn files_shortcut_is_swallowed_before_the_input_routing() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn window_event(")
+            .nth(1)
+            .expect("找不到 window_event 的定义");
+        let hotkey = after
+            .find("self.files_hotkey_event(&event)")
+            .expect("window_event 里没调 files_hotkey_event —— Ctrl+Shift+B 会被喂给 egui(T8),还会被编码进 PTY 写给远端");
+        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
+        assert!(
+            hotkey < routing,
+            "files_hotkey_event 排在了输入分流之后 —— 排在后面等于没截:\
+             Ctrl+Shift+B 里的 B 已经被喂给 egui 的焦点系统了"
+        );
+    }
+
+    /// **接线守护 / T8**:F6 换焦点同样必须在输入分流**之前**被截走。与前两条
+    /// 同构——不截的话,F6 会先被喂给 egui 的焦点系统(虽然 F6 本身不是 Tab,
+    /// 但一旦这套判定被误挪到分流之后,连带一起挪错的风险跟前两条一样大)。
+    ///
+    /// 验证边界同前两条:只挡得住「调用点跑到分流之后 / 整个没调」,挡不住
+    /// 有人在 `focus_hotkey_event` 里返回恒 false。
+    ///
+    /// 自证会变红:把 `window_event` 里那句 `if self.focus_hotkey_event(&event)`
+    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
+    #[test]
+    fn focus_shortcut_is_swallowed_before_the_input_routing() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn window_event(")
+            .nth(1)
+            .expect("找不到 window_event 的定义");
+        let hotkey = after
+            .find("self.focus_hotkey_event(&event)")
+            .expect("window_event 里没调 focus_hotkey_event —— F6 会被喂给 egui(T8),还会被编码进 PTY 写给远端");
+        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
+        assert!(
+            hotkey < routing,
+            "focus_hotkey_event 排在了输入分流之后 —— 排在后面等于没截"
+        );
+    }
+
+    /// 协调者修订 1:F6 的生效条件是「面板此刻在场」——判据必须复用
+    /// `files_owner_generation`(与 `Present` 分支判断要不要画侧栏共用同一份
+    /// 判据),不能自己另写一份等价逻辑。理由:面板不在场时若仍吞掉 F6,
+    /// 用户在纯终端场景按 F6(某些远端 TUI/工具会用到功能键)会被无声吃掉,
+    /// 表现为「这个键突然没反应」——恰是本项目最忌的静默失效。
+    ///
+    /// **扎的是源码结构**——`focus_hotkey_event` 是 `App` 的私有方法,`App`
+    /// 单测里造不出来(`EventLoopProxy`)。验证边界:只挡得住「函数体里压根
+    /// 没调 `files_owner_generation()`」这一种退化,挡不住换个不共用判据的
+    /// 等价写法(比如自己重新拼一遍 `active_is_files_tab() || files_sidebar_open`)。
+    ///
+    /// 自证会变红:把 `focus_hotkey_event` 里
+    /// `if self.files_owner_generation().is_none() { return false; }` 那两行删掉。
+    #[test]
+    fn f6_is_gated_on_the_panel_actually_being_visible() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn focus_hotkey_event(")
+            .nth(1)
+            .expect("找不到 focus_hotkey_event 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 focus_hotkey_event 的函数结尾")];
+        assert!(
+            body.contains("self.files_owner_generation().is_none()"),
+            "focus_hotkey_event 没有拿 files_owner_generation 判断面板在不在场 \
+             —— F6 会在没有面板的纯终端场景里被无声吞掉"
+        );
+    }
+
+    /// 协调者修订 2 的**接入点**守护:`window_event` 里喂给分流的 `focus`
+    /// 必须是夹紧过的 `effective_focus()`,不能是裸的 `self.focus`。
+    ///
+    /// `self.focus` 只记「用户按 F6 表达的意愿」,兑不兑现要看上下文。裸着用
+    /// 的症状有两个方向,都是静默的:
+    /// - Files 标签(那里没有终端)焦点仍标成 `Terminal` → 方向键/回车全落到
+    ///   一个不存在的 pane 上,用户以为键盘死了,只能改用鼠标;
+    /// - 侧栏关掉后焦点还留在 `FilesPanel` → 键送给一个看不见的面板。
+    ///
+    /// `effective_focus_of` 那三条夹紧规则**各自都有行为测试钉着**,但「分流
+    /// 处到底调没调它」这一环没人管:实测把这行换成 `let focus = self.focus;`,
+    /// 全 709 条测试一条都不红。这条补的就是这一环。
+    ///
+    /// **扎的是源码结构**(`window_event` 要真 `App` + `EventLoopProxy` 才能跑)。
+    /// 验证边界:只挡得住「换回裸字段 / 整个不调」,挡不住有人把夹紧逻辑
+    /// 从 `effective_focus_of` 内部掏空——那一侧由上述三条行为测试守。
+    ///
+    /// 自证会变红:把 `window_event` 里 `let focus = self.effective_focus();`
+    /// 换成 `let focus = self.focus;`。
+    #[test]
+    fn the_input_routing_uses_the_clamped_focus_not_the_raw_field() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn window_event(")
+            .nth(1)
+            .expect("找不到 window_event 的定义");
+        // 只看到分流那一段为止:`self.focus` 在别处(比如 F6 的 toggled 赋值)
+        // 出现是合法的,把整个函数体一起扫会误判。
+        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
+        let before_routing = &after[..routing];
+        assert!(
+            before_routing.contains("let focus = self.effective_focus();"),
+            "分流之前没有算夹紧后的焦点 —— 见本测试文档注释里那两种静默症状"
+        );
+        assert!(
+            !before_routing.contains("let focus = self.focus;"),
+            "分流拿的是裸 self.focus,没经过 effective_focus 的上下文夹紧"
+        );
+    }
+
+    /// 文件侧栏的快捷键必须**带 Shift**。
+    ///
+    /// 少了 Shift 就成了 `Ctrl+B`,而那是 tmux 出厂默认的 prefix 键 ——
+    /// 本项目的核心场景恰恰是「操作跑在远端 tmux 里的 Claude Code」,
+    /// 抢掉 `Ctrl+B` 等于让用户在自己的 tmux 里寸步难行,而且症状极隐蔽:
+    /// 按 `Ctrl+B` 弹出个文件面板,用户只会以为 tmux 坏了。
+    /// `Ctrl+Shift+*` 系在终端里不产生控制字符,才是安全的取键区间。
+    ///
+    /// **扎的是源码结构而非运行时行为**(`App` 要 `EventLoopProxy` 才能构造)。
+    /// 验证边界:只挡得住「`mods.shift` 那个判断被删掉」这一种写法。
+    ///
+    /// 自证会变红:把 `files_hotkey_event` 里的 `!mods.shift` 去掉。
+    #[test]
+    fn the_files_shortcut_requires_shift_so_it_cannot_steal_tmux_prefix() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("fn files_hotkey_event")
+            .nth(1)
+            .expect("找不到 files_hotkey_event");
+        let body = &body[..body
+            .find("\n    }\n")
+            .expect("找不到 files_hotkey_event 的函数结尾")];
+        assert!(
+            body.contains("!mods.shift"),
+            "files_hotkey_event 不再要求 Shift —— Ctrl+B 是 tmux 的 prefix 键,\
+             抢了它用户在远端 tmux 里寸步难行"
+        );
+    }
+
     /// **T4 / S3**:标签栏吃掉的那点高度必须一路走到 `window_change`。
     ///
     /// 标签栏是 F36 引入的第三条常驻横条,中央区因此矮了 `tab_bar_px()` 逻辑点。
@@ -3488,6 +5232,96 @@ mod tests {
         );
     }
 
+    /// **T4 / 设计 D2 的后半段**:中央区被文件侧栏挤窄之后,必须恰好发一次
+    /// `window_change`,且列数变少。
+    ///
+    /// 这条守的是「变窄之后」那一段(`layout_geometry` → `apply_geometry` →
+    /// `pty.resize`),跟 `tab_bar_height_reaches_the_remote_as_a_window_change`
+    /// 是同一条链路的另一实例,写法直接照抄那条,变窄的维度从「高度」换成
+    /// 「宽度」。**这条对「侧栏用 `SidePanel` 还是 `Area`」完全无感**——它
+    /// 直接喂两个写死的 `PxRect`,根本不经过 egui,不构成端到端证据。真正
+    /// 扎在「侧栏是不是真的让 egui 的中央区变窄」这一步的是
+    /// `ui::tests::opening_the_files_sidebar_shrinks_the_central_area`;
+    /// 两条各守半段,合起来才是完整的 T4 链路。
+    ///
+    /// 自证会变红:把下面的 `narrowed`(`w`)算法改成与 `full` 相同的宽度
+    /// (中央区不再变窄 → 不发 window_change)。
+    #[test]
+    fn opening_the_files_sidebar_reaches_the_remote_as_a_window_change() {
+        use crate::shell::workspace::{layout_geometry, PtyWriter, PxRect};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingPty(Arc<Mutex<Vec<(u16, u16)>>>);
+        impl PtyWriter for RecordingPty {
+            fn write(&self, _bytes: Vec<u8>) -> Result<(), mullion_ssh::session::TrySendErr> {
+                Ok(())
+            }
+            fn resize(&self, cols: u16, rows: u16) -> Result<(), mullion_ssh::session::TrySendErr> {
+                self.0.lock().unwrap().push((cols, rows));
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut ws = Workspace::new(
+            crate::shell::workspace::PaneState {
+                id: PaneId(1),
+                host_ix: 0,
+                emulator: mullion_term::emulator::Emulator::new(80, 24),
+                pty: Box::new(RecordingPty(seen.clone())),
+                rx,
+                pacer: crate::render::SyncFramePacer::new(),
+                status: crate::shell::workspace::PaneStatus::Live,
+                saw_first_byte: false,
+                last_grid: (0, 0),
+            },
+            0,
+        );
+        let cell = (10.0f32, 20.0f32);
+        let full = PxRect {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 900,
+        };
+        // 侧栏 360px(`files_panel::DEFAULT_SIDEBAR_W`):中央区右边被吃掉这么多。
+        let narrowed = PxRect {
+            w: full.w - 360,
+            ..full
+        };
+        let tree = ws.tree().clone();
+
+        ws.apply_geometry(&layout_geometry(&tree, full, cell, false));
+        let before = *seen.lock().unwrap().last().expect("第一次必然发一次");
+        seen.lock().unwrap().clear();
+
+        ws.apply_geometry(&layout_geometry(&tree, narrowed, cell, false));
+        let after = seen.lock().unwrap().clone();
+        assert_eq!(
+            after.len(),
+            1,
+            "开侧栏必须恰好发一次 window_change(发 0 次 = 远端仍按旧列数排版;\
+             发多次 = 每帧都在发)"
+        );
+        assert!(
+            after[0].0 < before.0,
+            "列数必须变少:{} → {}",
+            before.0,
+            after[0].0
+        );
+
+        // 反方向同样得走通:**关**侧栏中央区变宽,也必须发一次。只测「变窄」
+        // 的话,一个只在变窄时发 resize 的实现照样绿 —— 而它的症状是关掉侧栏
+        // 后远端 TUI 仍按窄列数排版,右边空一条,直到下次拖窗口才恢复。
+        seen.lock().unwrap().clear();
+        ws.apply_geometry(&layout_geometry(&tree, full, cell, false));
+        let back = seen.lock().unwrap().clone();
+        assert_eq!(back.len(), 1, "关侧栏也必须恰好发一次 window_change");
+        assert_eq!(back[0].0, before.0, "列数要回到开侧栏之前那个值");
+    }
+
     /// **spec F36 验收标准的另一半**:切换标签的代码路径里不许有任何建连调用。
     ///
     /// 行为那一半在 `shell::tabs::tests::switching_tabs_does_not_touch_the_ssh_connections`
@@ -3545,16 +5379,149 @@ mod tests {
     fn connecting_opens_a_new_tab_instead_of_replacing_the_active_one() {
         let src = include_str!("app.rs");
         let after = src
-            .split("UserEvent::ConnectOk { ssh, rx, handle } => {")
+            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
             .nth(1)
             .expect("找不到 ConnectOk 的事件分支");
         let body = &after[..after
             .find("\n            }\n")
             .expect("找不到 ConnectOk 分支的结尾")];
-        assert!(body.contains("self.tabs.open("), "ConnectOk 里没有开新标签");
+        // D1:`ConnectOk` 现在两条分支各开一次 —— SFTP 那条(`wants_sftp`)
+        // 开 `TabContent::Files`,终端那条开 `TabContent::Terminal`,断言两次
+        // 都要出现 `self.tabs.open(`。
+        assert_eq!(
+            body.matches("self.tabs.open(").count(),
+            2,
+            "ConnectOk 里应该有两条 self.tabs.open(——SFTP 分支一条,终端分支一条"
+        );
         assert!(
             !body.contains("close_active"),
             "ConnectOk 里还在顶掉活动标签 —— 在 A 上连 B 会把 A 那条连接静默掐掉"
+        );
+    }
+
+    /// **接线守护 / F120**:`ConnectOk` 建标签时必须用 `PanelFrame::new(..)`
+    /// 接配置的默认本地目录/书签,并把 `sftp_default_remote` 填成
+    /// `sftp_prefs.default_remote`——不许有任何一条分支退回
+    /// `PanelFrame::default()`(那样配置了也白配,新标签永远是空白默认态)。
+    ///
+    /// **扎的是源码结构**,理由同 `connecting_opens_a_new_tab_instead_of_replacing_the_active_one`:
+    /// `ConnectOk` 里两条分支各建一次标签,单测里跑不动真实连接/`EventLoopProxy`,
+    /// 只能扫源码确认两处都接上了配置读出来的 `sftp_prefs`。
+    ///
+    /// 自证会变红:把两处 `files: crate::ui::files_panel::PanelFrame::new(..)`
+    /// 中的任意一处改回 `PanelFrame::default()`,或把 `sftp_default_remote:`
+    /// 那一行删掉。
+    #[test]
+    fn connect_ok_wires_configured_sftp_prefs_into_both_new_tabs() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
+            .nth(1)
+            .expect("找不到 ConnectOk 的事件分支");
+        let body = &after[..after
+            .find("\n            }\n")
+            .expect("找不到 ConnectOk 分支的结尾")];
+        assert!(
+            body.contains("let sftp_prefs ="),
+            "ConnectOk 没有从 store 读配置的 SFTP 偏好"
+        );
+        assert_eq!(
+            body.matches("crate::ui::files_panel::PanelFrame::new(")
+                .count(),
+            2,
+            "两条分支(Files/Terminal)都该用 PanelFrame::new 接配置,不是 default()"
+        );
+        assert!(
+            !body.contains("crate::ui::files_panel::PanelFrame::default()"),
+            "ConnectOk 里还有分支在用 PanelFrame::default()——配置的默认本地目录/书签会被丢掉"
+        );
+        assert_eq!(
+            body.matches("sftp_default_remote: sftp_prefs.default_remote")
+                .count(),
+            2,
+            "两条分支都该把 sftp_prefs.default_remote 填进 sftp_default_remote 字段"
+        );
+    }
+
+    /// **接线守护 / D1**:`spawn_connect` 里 `wants_sftp` 为真时,必须在
+    /// `open_pty` 之前就 `return`——SFTP 节点没有 PTY 这个概念,握手一趟
+    /// shell 既浪费一次网络往返,也会让远端多一条不需要的 channel。
+    ///
+    /// **扎的是源码结构**:异步任务体是 `self._runtime.spawn(async move { .. })`
+    /// 里的自由代码,`App` 要 `EventLoopProxy` 才能构造,单测里跑不动真实
+    /// 连接。验证边界:挡得住「`if wants_sftp` 分支里没有 `return`」这一种
+    /// 写法(即分支后仍会往下掉到 `open_pty` 调用),挡不住把判断条件写反
+    /// 之类更隐蔽的走样。
+    ///
+    /// 自证会变红:把 `if wants_sftp { .. return; }` 那个 `return;` 删掉。
+    #[test]
+    fn spawn_connect_skips_open_pty_when_the_target_wants_sftp() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn spawn_connect(&mut self, cfg: SshConfig, wants_sftp: bool) {")
+            .nth(1)
+            .expect("找不到 spawn_connect 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 spawn_connect 的函数结尾")];
+
+        let after_if = body
+            .split("if wants_sftp {")
+            .nth(1)
+            .expect("找不到 spawn_connect 里的 wants_sftp 分支");
+        let wants_sftp_branch = &after_if[..after_if
+            .find("\n            }\n")
+            .expect("找不到 wants_sftp 分支的结尾(if 块本身的闭括号)")];
+        assert!(
+            wants_sftp_branch.contains("return;"),
+            "spawn_connect 的 wants_sftp 分支没有 return —— 会继续往下掉到 \
+             open_pty,给 SFTP 节点多开一趟根本用不上的 shell 握手"
+        );
+        assert!(
+            !wants_sftp_branch.contains("open_pty"),
+            "spawn_connect 的 wants_sftp 分支不该出现 open_pty 调用"
+        );
+        assert!(
+            !body.contains("block_on"),
+            "spawn_connect 绝不能 block_on —— 它跑在事件循环唤起的异步任务里, \
+             阻塞会连累整个窗口卡在网络往返上(T1/T3 同类问题)"
+        );
+    }
+
+    /// **接线守护 / D1**:`ConnectOk` 收到 `wants_sftp: true` 那条分支,不许
+    /// 走「先建 `Workspace`/`open_pty`」的终端建标签路径——它是靠早 `return`
+    /// 跟终端分支分开的(见 `spawn_connect` 那条守护里的 `return;`),这里补
+    /// 反过来的一半:SFTP 分支自己也不能碰 `open_pty`/`Workspace::new`。
+    ///
+    /// 自证会变红:把 `if wants_sftp { .. }` 分支里的 `return;` 删掉,让代码
+    /// 掉进下面 `let Some((ssh, rx)) = pty else { .. }`——`pty` 恒 `None` 会
+    /// 直接走进那条错误分支,SFTP 标签建不出来。
+    #[test]
+    fn connect_ok_wants_sftp_branch_never_touches_open_pty_or_workspace() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
+            .nth(1)
+            .expect("找不到 ConnectOk 的事件分支");
+        let full_body = &after[..after
+            .find("\n            }\n")
+            .expect("找不到 ConnectOk 分支的结尾")];
+        let sftp_branch = full_body
+            .split("if wants_sftp {")
+            .nth(1)
+            .expect("找不到 ConnectOk 里的 wants_sftp 分支")
+            .split("\n                }\n")
+            .next()
+            .expect("找不到 ConnectOk 里 wants_sftp 分支的结尾");
+        assert!(
+            sftp_branch.contains("return;"),
+            "ConnectOk 的 wants_sftp 分支没有及时 return —— 会继续往下掉进 \
+             终端建标签的逻辑"
+        );
+        assert!(
+            !sftp_branch.contains("open_pty") && !sftp_branch.contains("Workspace::new"),
+            "ConnectOk 的 wants_sftp 分支不该碰 open_pty/Workspace::new —— \
+             SFTP 节点没有 PTY,这些是终端标签专属的建立步骤"
         );
     }
 
@@ -3635,6 +5602,144 @@ mod tests {
             body.contains("abort()"),
             "wind_down 没 abort 自动化 task —— 它持有的那份 Arc<SshSession> \
              会让底层 io_task 不收口,关掉标签后预配置的命令还在继续发"
+        );
+    }
+
+    /// **接线守护(SFTP 版,真实行为而非源码文本)**:关标签必须 abort 掉在途
+    /// 的 sftp 后台任务(`spawn_sftp_open`/`spawn_sftp_list_dir`)。
+    ///
+    /// 与上面自动化那条同一类问题的重演:任务经 `Arc<SftpClient>`(内部
+    /// `_conn: Arc<SshConnection>`)持有一份连接保活引用,只 drop
+    /// `TerminalTab` 收不了口——用户在一次网络往返期间关掉标签,任务会继续
+    /// 撑住底层连接,直到它自己的 RPC 结束(而 `SftpClient::open` 内部那两步
+    /// 完全没有超时包裹,链路黑洞时可能永远不结束)。
+    ///
+    /// **这条不落成 `include_str!` 源码守护,而是真实构造 `TerminalTab` 跑
+    /// `wind_down`**:`TerminalTab` 的字段全部可以脱离真实 SSH 连接/GPU/
+    /// `EventLoopProxy` 直接造出来(`Workspace::new(test_pane(..), ..)` 用的
+    /// 是 `NullPty`),不需要退回源码文本匹配。用一个「唯一能被 abort 掉、
+    /// 不会自然结束」的哑任务占住 `sftp_tasks`,靠它退出时是否执行了 `Drop`
+    /// 来判断有没有被真的 abort——比匹配 `.abort()` 这个字符串更接近「行为
+    /// 是否正确」,不会被「换个不生效的写法但字符串上仍含 abort()」这种变体
+    /// 蒙混过去。
+    ///
+    /// 自证会变红:把 `wind_down` 里 `for task in t.sftp_tasks { task.abort(); }`
+    /// 那一段删掉。
+    #[tokio::test]
+    async fn wind_down_aborts_outstanding_sftp_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_flag = started.clone();
+        let guard_flag = dropped.clone();
+        let task = tokio::spawn(async move {
+            let _guard = SetOnDrop(guard_flag);
+            started_flag.store(true, Ordering::SeqCst);
+            // 永不自然结束——唯一能让这个任务收尾的方式是被 abort。
+            // `std::future::pending` 是标准库里"永远 Pending"的 future,
+            // 不占 CPU,不是忙等。
+            std::future::pending::<()>().await;
+        });
+
+        // 先让哑任务真正跑起来、挂在 `.await` 上,再 abort——否则 abort 打在
+        // 一个**从未被 poll 过**的任务上:它的函数体压根没执行过,`_guard`
+        // 也就没被构造过,`Drop` 自然不会触发,测的是"取消一个还没开始跑的
+        // 任务"而不是"取消一个卡在网络 RTT 里的任务"(真实 sftp 场景),
+        // 两者对 tokio 运行时是不同的路径,不能替代。
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "测试用的哑任务没能跑起来 —— 测试脚手架本身有问题,不是被测代码的锅"
+        );
+
+        let tab = Tab {
+            id: TabId(1),
+            title: "test".into(),
+            session_id: None,
+            content: TabContent::Terminal(Box::new(TerminalTab {
+                ws: Workspace::new(test_pane(1), 0),
+                current_preset: None,
+                last_cfg: None,
+                automation: None,
+                automation_status: None,
+                files: Default::default(),
+                sftp: None,
+                sftp_tasks: vec![task],
+                sftp_default_remote: None,
+            })),
+        };
+
+        wind_down(tab);
+
+        // abort 是协作式的:runtime 要真正调度一次才会把 future drop 掉,
+        // 不是调用 `abort()` 那一刻就同步发生。
+        for _ in 0..200 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "wind_down 没有 abort 掉在途的 sftp 任务 —— 任务会继续攥着 \
+             Arc<SshConnection>,撑住本该随标签一起断开的连接"
+        );
+    }
+
+    /// **接线守护(D1「最隐蔽」那条的反面)**:`wind_down` 对 `TabContent`
+    /// 的 match **不许**落到通配臂 `_ => { .. }` 上。
+    ///
+    /// 上面 `wind_down_aborts_outstanding_sftp_tasks` 只能真跑 `Terminal`
+    /// 分支——`FilesTab::conn` 是 `Arc<SshConnection>`,`SshConnection::new`
+    /// 对 `mullion-app` 不可见(`pub(crate)` 到 `mullion-ssh`),测试里造不出
+    /// 一个真的 `FilesTab`。这条转而扎源码结构,专门堵一种编译期完全无感的
+    /// 走样:如果 `TabContent` 以后加了第三个变体,而 `wind_down` 的 match
+    /// 写成了带 `_ => {}` 兜底的形式,编译器不会报任何错——新变体的
+    /// `sftp_tasks`/连接会静默泄漏,现象是内存/连接数缓慢增长,没有任何
+    /// panic 或测试失败能提示到这里。要求两个变体各有一条具名分支,
+    /// 逼着以后加变体的人回来把这条 match 补全。
+    ///
+    /// 自证会变红:把 `wind_down` 的 match 尾部两条分支合并成
+    /// `_ => {}`(或者只删掉 `TabContent::Files` 那一臂换成通配)。
+    #[test]
+    fn wind_down_has_no_catch_all_arm_so_new_tab_kinds_cannot_leak_silently() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn wind_down(")
+            .nth(1)
+            .expect("找不到 wind_down 的定义");
+        let body = &after[..after.find("\n}\n").expect("找不到 wind_down 的函数结尾")];
+        // 按行取 trim 后的实际代码,不匹配文档注释里提到的 `_ => {}` 这串文字
+        // (上面就有一行注释专门提醒"不能写成通配"——它本身含这串子串)。
+        assert!(
+            !body
+                .lines()
+                .any(|l| !l.trim_start().starts_with("//") && l.trim_start().starts_with("_ =>")),
+            "wind_down 的 match 出现了通配臂 —— 以后 TabContent 再加变体,\
+             这里会静默漏掉收口,连接/任务缓慢泄漏,且没有任何编译错误提示"
+        );
+        assert!(
+            body.contains("TabContent::Terminal(t) =>") && body.contains("TabContent::Files(f) =>"),
+            "wind_down 必须对 Terminal/Files 各有一条具名分支,不能少写"
+        );
+        assert!(
+            body.matches("task.abort()").count() >= 2,
+            "Terminal 和 Files 两条分支都该 abort 各自的 sftp_tasks,\
+             实际只找到 {} 处 abort()",
+            body.matches("task.abort()").count()
         );
     }
 
@@ -3945,5 +6050,132 @@ mod tests {
         let mut later = ProbeState::Running;
         assert!(!crate::app::accept_probe(7, epoch, &mut later, Ok(())));
         assert_eq!(later, ProbeState::Running);
+    }
+
+    /// F120:`spawn_sftp_open` 该用哪个目录做起点——配置了默认远端目录就用它,
+    /// 没配置(`None`)落回登录目录(`.`)。
+    ///
+    /// 抽成纯函数单测,理由同 `sync_timeout_wake_at`:`spawn_sftp_open` 本身
+    /// 要 `Runtime`/`EventLoopProxy`,单测里构造不出来,判定逻辑不能只靠它
+    /// 兜底。
+    ///
+    /// 自证变红的方式:把 `configured_remote_dir` 改成恒返回登录目录
+    /// (第一条断言变红),或者恒返回传入的 `configured`(`None` 分支编译
+    /// 不过,或者第二条断言变红)。
+    #[test]
+    fn configured_remote_dir_falls_back_to_login_directory_when_unset() {
+        let configured = crate::app::configured_remote_dir(Some("/srv/app"));
+        assert_eq!(
+            configured,
+            mullion_ssh::sftp::RemotePath::from_bytes(b"/srv/app".to_vec())
+        );
+
+        let default = crate::app::configured_remote_dir(None);
+        assert_eq!(
+            default,
+            mullion_ssh::sftp::RemotePath::from_bytes(b".".to_vec())
+        );
+    }
+
+    /// **F120 补链路覆盖(读取半程)**:`trigger_sftp_open` 传给
+    /// `spawn_sftp_open` 的 `default_remote` 靠 `TabContent::sftp_default_remote()`
+    /// 从标签字段里取。复核实测:把 `trigger_sftp_open` 里这个取值硬改成
+    /// `None`,689 条测试零变红——`connect_ok_wires_configured_sftp_prefs_into_both_new_tabs`
+    /// 只守「配置值写进字段」,`configured_remote_dir_falls_back_to_login_directory_when_unset`
+    /// 只守「拿到值之后怎么判定回退」,中间「字段真的被读出来」没人守。
+    ///
+    /// 这条钉死取值器本身:配了就原样吐出来,没配就是 `None`——不能是硬编码
+    /// 的常量(无论配没配都返回同一个值,这条测试也会挡住)。
+    ///
+    /// `TabContent::Files` 变体因为 `FilesTab::conn` 是 `Arc<SshConnection>`
+    /// (`SshConnection::new` 对 `mullion-app` 不可见)在这个测试容器里造不出来,
+    /// 这条只覆盖 `Terminal` 变体——`Files` 分支(`f.sftp_default_remote.clone()`)
+    /// 是与 `Terminal` 分支同构的一行代码,下面
+    /// `trigger_sftp_open_passes_the_tabs_default_remote_into_spawn_sftp_open`
+    /// 补两个变体共用的调用点覆盖。
+    ///
+    /// 自证会变红:把 `TabContent::sftp_default_remote` 里 `Terminal` 分支的
+    /// `t.sftp_default_remote.clone()` 改成 `None`(第一条断言红);改成恒
+    /// `Some("...".into())`(第二条断言红)。
+    #[test]
+    fn tab_content_sftp_default_remote_reflects_the_configured_value_not_hardcoded() {
+        fn make_tab(configured: Option<&str>) -> TabContent {
+            TabContent::Terminal(Box::new(TerminalTab {
+                ws: Workspace::new(test_pane(1), 0),
+                current_preset: None,
+                last_cfg: None,
+                automation: None,
+                automation_status: None,
+                files: Default::default(),
+                sftp: None,
+                sftp_tasks: Vec::new(),
+                sftp_default_remote: configured.map(|s| s.to_string()),
+            }))
+        }
+
+        let configured = make_tab(Some("/srv/configured-app"));
+        assert_eq!(
+            configured.sftp_default_remote(),
+            Some("/srv/configured-app".to_string()),
+            "配了默认远端目录时,取值器必须原样吐出来"
+        );
+
+        let unset = make_tab(None);
+        assert_eq!(
+            unset.sftp_default_remote(),
+            None,
+            "没配置时必须是 None——区别于恒返回某个写死值的实现"
+        );
+    }
+
+    /// **F120 补链路覆盖(调用点半程)**:`trigger_sftp_open` 必须把上面那条
+    /// 测试钉住的取值结果**原样传给** `spawn_sftp_open`,不能读了却在调用处
+    /// 换成别的值——复核实测的原始变异点就是把这个调用参数硬改成 `None`。
+    ///
+    /// **扎的是源码结构而非运行时行为**:`trigger_sftp_open` 只有在
+    /// `tab.content.sftp_connection()` 返回 `Some` 时才会走到 `spawn_sftp_open`
+    /// 那一步,而 `Terminal` 变体的连接来自 `ws.hosts` 里的 `Arc<SshConnection>`、
+    /// `Files` 变体的 `conn` 字段本身就是 `Arc<SshConnection>`——`SshConnection::new`
+    /// 对 `mullion-app` 不可见,这个测试容器里两个变体都造不出「连接已就绪」的
+    /// 状态,真实调用路径无法用真实对象触发(同 `file_actions_never_narrow_to_terminal_tabs_only`
+    /// 等一批「要 Arc<SshConnection>」的接线守护面对的限制)。上面那条测试已经
+    /// 覆盖了「读」的正确性,这条只补「读到的值有没有被原样传下去」这一环。
+    ///
+    /// 自证会变红:把 `spawn_sftp_open(` 调用里的 `default_remote,` 改成
+    /// `None,`(复核实测的原始变异点)。
+    #[test]
+    fn trigger_sftp_open_passes_the_tabs_default_remote_into_spawn_sftp_open() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn trigger_sftp_open(&mut self, generation: u64) {")
+            .nth(1)
+            .expect("找不到 trigger_sftp_open 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 trigger_sftp_open 的函数结尾")];
+
+        assert!(
+            body.contains("let default_remote = tab.content.sftp_default_remote();"),
+            "trigger_sftp_open 没有从 tab 读 default_remote"
+        );
+
+        let call_after = body
+            .split("spawn_sftp_open(")
+            .nth(1)
+            .expect("找不到 spawn_sftp_open 调用");
+        let call_args = &call_after[..call_after
+            .find(");")
+            .expect("找不到 spawn_sftp_open 调用的结尾")];
+        assert!(
+            call_args.contains("default_remote"),
+            "spawn_sftp_open 的调用没有把 default_remote 传下去——配置的\
+             默认远端目录会在这一步被静默丢弃,验收清单第 7 条(登录后落到\
+             配置的默认目录)会失效"
+        );
+        assert!(
+            !call_args.trim_end().ends_with("None,") && !call_args.trim_end().ends_with("None"),
+            "spawn_sftp_open 调用的最后一个参数是字面量 None,不是从 tab 里\
+             读出来的 default_remote"
+        );
     }
 }

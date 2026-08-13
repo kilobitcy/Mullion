@@ -8,7 +8,7 @@
 use crate::ui::session_manager::validate::Missing;
 use crate::ui::session_manager::{
     AuthKindUi, EditorBuffer, JumpModeUi, ProxyModeUi, TAB_APPEARANCE, TAB_AUTH, TAB_AUTOMATION,
-    TAB_CONNECT,
+    TAB_CONNECT, TAB_SFTP,
 };
 
 /// 一个 Tab 的角标状态。
@@ -47,6 +47,15 @@ pub(super) fn badge_of(tab: usize, missing: Missing, buf: &EditorBuffer) -> Badg
         TAB_APPEARANCE => {
             buf.preserved_appearance.icon.is_some() || buf.preserved_appearance.color.is_some()
         }
+        // trim 判据跟 `build_draft` 里落回 `SftpPrefs` 的判据对齐:那边空白
+        // 也会被判成「未设置」而写 `None`,角标不能说「配置过」而保存后又
+        // 变回没配置的默认态。书签同理 —— `build_draft` 会把路径纯空白的整条
+        // 丢掉,所以点一次「+ 添加书签」但没填内容**不算**配置过。
+        TAB_SFTP => {
+            !buf.sftp_default_remote.trim().is_empty()
+                || !buf.sftp_default_local.trim().is_empty()
+                || buf.sftp_bookmarks.iter().any(|(_, p)| !p.trim().is_empty())
+        }
         _ => false,
     };
     if configured {
@@ -66,7 +75,13 @@ mod tests {
     fn a_fresh_buffer_has_no_badges_at_all() {
         let buf = EditorBuffer::default();
         let none = Missing::default();
-        for tab in [TAB_CONNECT, TAB_AUTH, TAB_AUTOMATION, TAB_APPEARANCE] {
+        for tab in [
+            TAB_CONNECT,
+            TAB_AUTH,
+            TAB_AUTOMATION,
+            TAB_SFTP,
+            TAB_APPEARANCE,
+        ] {
             assert_eq!(
                 badge_of(tab, none, &buf),
                 Badge::None,
@@ -165,5 +180,80 @@ mod tests {
             apply_to: vec![mullion_store::ColorTarget::ListItem],
         });
         assert_eq!(badge_of(TAB_APPEARANCE, none, &look), Badge::Configured);
+    }
+
+    /// F120:「SFTP」页的已配置判据 —— 两个默认目录或书签列表任一非空。
+    /// 三种触发方式分开断言,避免只测出「或」链的一支就误判整个判据是对的。
+    #[test]
+    fn sftp_badge_fires_on_default_remote_default_local_or_bookmarks() {
+        let none = Missing::default();
+        assert_eq!(
+            badge_of(TAB_SFTP, none, &EditorBuffer::default()),
+            Badge::None,
+            "空表单不该有角标"
+        );
+
+        let remote = EditorBuffer {
+            sftp_default_remote: "/srv/app".into(),
+            ..Default::default()
+        };
+        assert_eq!(badge_of(TAB_SFTP, none, &remote), Badge::Configured);
+
+        let local = EditorBuffer {
+            sftp_default_local: r"D:\work".into(),
+            ..Default::default()
+        };
+        assert_eq!(badge_of(TAB_SFTP, none, &local), Badge::Configured);
+
+        let mut marks = EditorBuffer::default();
+        marks
+            .sftp_bookmarks
+            .push(("日志".into(), "/var/log".into()));
+        assert_eq!(badge_of(TAB_SFTP, none, &marks), Badge::Configured);
+    }
+
+    /// 只填了空白字符不算配置过 —— 跟保存时 `build_draft` 的 trim 判据对齐,
+    /// 否则会出现「角标说配置过,保存后又变回默认」的不一致。
+    #[test]
+    fn whitespace_only_sftp_fields_do_not_count_as_configured() {
+        let none = Missing::default();
+        let buf = EditorBuffer {
+            sftp_default_remote: "   ".into(),
+            sftp_default_local: "\t".into(),
+            ..Default::default()
+        };
+        assert_eq!(badge_of(TAB_SFTP, none, &buf), Badge::None);
+    }
+
+    /// 书签这一支也得跟 `build_draft` 的过滤对齐:那边把**路径**纯空白的整条
+    /// 丢掉,所以「点了一次『+ 添加书签』但什么都没填」不算配置过。
+    ///
+    /// 不对齐的症状很具体:点一下加号,角标立刻亮;保存 → 空书签被过滤掉 →
+    /// 重开编辑器角标又灭了。用户会以为是保存丢了东西。
+    #[test]
+    fn a_blank_bookmark_row_does_not_count_as_configured() {
+        let none = Missing::default();
+
+        let mut blank = EditorBuffer::default();
+        blank.sftp_bookmarks.push((String::new(), String::new()));
+        assert_eq!(
+            badge_of(TAB_SFTP, none, &blank),
+            Badge::None,
+            "刚点出来的空书签行不算配置过 —— 它保存时会被丢掉"
+        );
+
+        // 只填了名称、路径还空着,同样不算:没有路径的书签点了也去不了哪里,
+        // `build_draft` 一样会丢。
+        let mut named_only = EditorBuffer::default();
+        named_only.sftp_bookmarks.push(("日志".into(), "  ".into()));
+        assert_eq!(badge_of(TAB_SFTP, none, &named_only), Badge::None);
+
+        // 混着来:有一条路径是真的,就算配置过。
+        let mut mixed = EditorBuffer::default();
+        mixed.sftp_bookmarks.push((String::new(), String::new()));
+        mixed
+            .sftp_bookmarks
+            .push(("日志".into(), "/var/log".into()));
+        assert_eq!(badge_of(TAB_SFTP, none, &mixed), Badge::Configured);
     }
 }

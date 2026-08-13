@@ -234,6 +234,25 @@
   `.id_salt(gid)` 这一行测试立即变红(已实测)。无头容器里这条能测,因为撞的是 egui 的
   `Id` 值本身(可用 `header_response.id` 读出来比较),不需要真的截图或判断像素。
 
+- **多标签页场景下,`ScrollArea::id_salt` 只拼「栏位名」不拼「标签」,会跨标签继承滚动
+  位置(F50/F36,与上一条 F60 同根)。** `files_panel.rs` 的 `sidebar()`/`content()` 原来
+  给远端/本地两栏各自的 `ScrollArea` 用 `format!("files-{id}")` 当 salt,`id` 只有
+  `"远端"`/`"本地"` 两个取值,跟哪个标签在显示无关。`egui::CentralPanel`/`SidePanel::
+  right("files")` 的根 `ui.id` 在单 viewport 下是常量,`egui::Context` 又是整窗口只建
+  一次、跨标签切换复用的同一个对象——两个 SFTP 节点标签的同一栏因此撞出同一个持久化
+  `Id`。**症状**:开两个 SFTP 标签,在标签 A 的远端栏滚动过,切到目录完全不同的标签
+  B,滚动条却停在 A 滚到的位置。**规则**:凡是「同一种面板会在多个标签间重复渲染」的
+  egui 部件,持久化 id salt 必须掺进标签的路由键(本项目是 S1 的 `generation`,
+  `App::next_ws_generation` 单调递增、标签一多必然互不相同),不能只拼「这一份数据在
+  UI 上叫什么」——这类字符串（"远端"/"本地"这种角色名）天然会在标签间重复,是 F60 那条
+  「循环里用内容拼出来的字符串当 id 源」的同一根因,只是这里的「循环」是「标签切换」而不
+  是「一帧内的循环体」。落地上倾向让编译器把关而不是靠测试兜底:`show()`/`sidebar()`/
+  `content()` 都把 `generation: u64` 做成必填参数(不是 `Option`),调用链一路捅到
+  `app.rs` 里已经算好 `files_owner_generation` 的地方,漏传一个环节就编译不过。
+  **守护**:`ui::files_panel::tests::scroll_id_salt_differs_by_generation`——salt 拼装
+  抽成纯函数 `scroll_id_salt(id, generation)`,测试直接比较两次调用的返回值;把
+  `generation` 从格式串里删掉这条测试立即变红(已实测)。
+
 - **测试里用 `ctx.set_pixels_per_point()` 设 DPI,会把画布悄悄变成 8000×8000。**
   它是 `Context::set_zoom_factor` 的包装,只在**下一帧**生效(`egui-0.30.0/src/context.rs`
   1953-1957 是包装、1994-2004 是延迟);生效那一帧会把「上一帧的 screen_rect」按新旧

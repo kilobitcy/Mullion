@@ -478,6 +478,7 @@ mod tests {
             appearance,
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 

@@ -2,6 +2,7 @@
 pub mod annotate;
 pub mod badge;
 pub mod chrome;
+pub mod files_panel;
 pub mod group_manager;
 pub mod host_key;
 pub mod ico;
@@ -230,6 +231,16 @@ pub struct UiState {
     /// 会让「什么都没改成」的表单显示成脏的、切走时白弹一次确认 —— 触碰位
     /// (`touched`)当初也是为了这个搬到这里的。
     pub icon_error: Option<String>,
+
+    // --- F50:文件侧栏(D1)。---
+    /// 文件侧栏开着没有。**按会话记住**是 D1 的承诺,但记忆落在 `App` 那边
+    /// (它才知道当前是哪条会话),这里只有「这一帧开没开」。
+    pub files_sidebar_open: bool,
+    /// 侧栏宽度(point)。可拖。`UiState` 走 `#[derive(Default)]`,这个字段的
+    /// 「默认 360」因此没法写进结构体字面量 —— `0.0`(derive 给的初值)当
+    /// 「还没拖过」的哨兵,真正的默认宽度由 `files_panel::sidebar` 在
+    /// `0.0` 时代入,见那里的注释。
+    pub files_sidebar_w: f32,
 }
 
 impl UiState {
@@ -308,6 +319,13 @@ pub struct UiFrame<'a> {
     pub appearance: &'a badge::AppearanceCache,
     /// F36:标签栏这一帧要画的标签。空 = launcher 态(栏还是画,只有 `+`)。
     pub tabs: &'a [chrome::TabView<'a>],
+    /// F6/设计 D23(代码复核挖出的可达性缺口):键盘焦点这一帧是不是落在
+    /// 文件面板上(`App::effective_focus() == Focus::FilesPanel`)。**不放
+    /// `shell::input_route::Focus` 本身**——`ui/` 这一层只需要一个 bool 就够
+    /// 表达"画不画焦点边框",没必要多绑一个枚举类型的依赖。传给
+    /// `files_panel::sidebar`/`content`,由它们再跟各自的 `active_column`
+    /// 相与决定具体画在哪一栏。
+    pub files_focused: bool,
 }
 
 /// 用户这一帧在 UI 上做的、需要 app 事后施加的布局动作。
@@ -330,6 +348,15 @@ pub struct UiActions {
     /// `ui/` 下这一层是纯 egui 绘制,IO 一律由 `app.rs` 统一发起(同 F18 的
     /// 复制路径)。
     pub annotate_export: Option<String>,
+    /// F50:文件面板这一帧的动作(远端栏 / 本地栏各至多一个)。两者都在
+    /// `app.rs` 里落地:本地栏走同步读盘(`apply_local_file_action`),远端栏
+    /// 走异步 sftp(`apply_remote_file_action`),都按侧栏属主标签的世代号
+    /// 路由,不是投给「当前活动标签」(S1)。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话新动作会在
+    /// egui 的 discard 趟被静默吃掉,而且默认没有任何测试会变红。
+    pub files_remote: Option<files_panel::FileAction>,
+    pub files_local: Option<files_panel::FileAction>,
 }
 
 /// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
@@ -340,6 +367,25 @@ pub fn build_ui(
     t: &crate::theme::Theme,
     ui_state: &mut UiState,
     frame: UiFrame<'_>,
+    // F50:文件侧栏这一帧的两栏状态。`None` = 面板关着 / launcher 态。**不是**
+    // `UiFrame` 的字段 —— `UiFrame` 必须保持 `Copy`(见其文档注释),
+    // `&mut PanelFrame` 做不到,所以单独作为一个参数。
+    files: Option<&mut files_panel::PanelFrame>,
+    // D1:SFTP 节点标签的两栏状态(标签宿主,占满内容区)。与上面的 `files`
+    // (侧栏宿主)互斥——调用方(`render_frame`)按活动标签是哪种来源只传其中
+    // 一个,两个同时 `Some` 不是一个有意义的状态,这里不做互斥校验(调用方
+    // 唯一,校验没有实际保护面)。
+    files_content: Option<&mut files_panel::PanelFrame>,
+    // 代码复核挖出的真 bug 的修法:`files`/`files_content` 挂的是哪个标签,
+    // 决定 `ScrollArea` 持久化 id 该掺哪个世代号(见 `files_panel::
+    // scroll_id_salt` 的文档——只用 `id`「远端」/「本地」拼 salt 时,两个
+    // 标签的同一栏会撞出同一个 egui `Id`,标签 A 滚过的偏移量被标签 B
+    // 继承)。`files`/`files_content` 互斥,只需要一份而不是各配一份:
+    // 调用方(`App` present 分支)的 `files_owner_generation` 本来就是同一个
+    // 值。两个 Option 都是 `None` 时这个参数不会被用到,但仍是必填的
+    // `u64` 而不是 `Option<u64>`——靠类型系统强制每个调用点都得算好它,
+    // 不是靠测试兜底。
+    files_generation: u64,
 ) -> UiActions {
     let mut actions = UiActions::default();
     // 主机密钥确认最先画:它是安全关口,任何时候都该盖在最上层(F3)。
@@ -355,6 +401,31 @@ pub fn build_ui(
     // S3:标签栏排在菜单栏之后、状态栏之前 show —— `TopBottomPanel` 按 show 的
     // 先后从窗口边缘往里堆,顺序就是视觉上的上下顺序。
     actions.tab = chrome::tab_bar(ctx, t, frame.tabs);
+    // F50/T4:侧栏排在菜单栏、标签栏之后 show —— `SidePanel` 与
+    // `TopBottomPanel` 按 show 的先后从窗口边缘往里堆,排在这两条之后,侧栏
+    // 才不会顶到菜单栏上面去。
+    //
+    // **状态栏是排在侧栏之后 show 的**,所以侧栏拿到的可用高度还包含状态栏
+    // 那一行:视觉上侧栏一直铺到窗口底部,状态栏止于侧栏左缘。两次裁切互相
+    // 正交,`central_px` 的宽高不受这个先后影响 —— 纯视觉取舍,要改成「状态栏
+    // 贯穿到底」就把 `status_bar` 挪到这之前 show。
+    //
+    // 这是 T4 链路里唯一经过 egui 的一步:
+    // `SidePanel::show` 参与 egui 的 Panel 空间分配,本函数末尾
+    // `ctx.available_rect()` 取到的中央区因此变窄 —— 换成 `egui::Area` 就
+    // 不参与分配,链路会在这里断掉(见 `files_panel::sidebar` 的文档注释)。
+    if let Some(files) = files {
+        let (r, l) = files_panel::sidebar(
+            ctx,
+            t,
+            ui_state,
+            files_generation,
+            frame.files_focused,
+            files,
+        );
+        actions.files_remote = r;
+        actions.files_local = l;
+    }
     // F115:分母是**配置了多少条**,不是启动了多少条 —— 见
     // `tunnels::indicator`。这里现算而不是再往 `UiFrame` 加一个字段:
     // 输入就在手边、纯函数、隧道条数是个位数,不构成陷阱 T3 那类每帧重算。
@@ -416,6 +487,14 @@ pub fn build_ui(
     // 走查 13:操作反馈飘在所有弹窗之上 —— 保存成功的那条 toast 要在会话
     // 管理器还开着的时候就能看见,不然用户根本不知道刚才那一下有没有生效。
     toast::show(ctx, t, &mut ui_state.pending_toast, &mut ui_state.toast);
+    // D1:标签宿主的文件面板——`CentralPanel`,egui 的 Panel 空间分配规则
+    // 决定了它必须是本帧**最后一个** panel 类部件(见 `files_panel::content`
+    // 文档),所以放在这里:菜单栏/标签栏/状态栏/各弹窗都已经 show 完。
+    if let Some(files) = files_content {
+        let (r, l) = files_panel::content(ctx, t, files_generation, frame.files_focused, files);
+        actions.files_remote = r;
+        actions.files_local = l;
+    }
     // 中央区剩余像素:available_rect 是 point,× pixels_per_point 换像素。
     // 必须在菜单栏和状态栏两个 TopBottomPanel 都 show 完之后取,拿到的才是
     // 扣掉这两栏的中央区。原点与尺寸一起记:尺寸决定几行几列,
@@ -602,20 +681,69 @@ mod tests {
             // 测试专用:`AppearanceCache` 没有 const 构造,借 `Box::leak` 换一个
             // `'static` 引用——只在测试进程里泄漏一次,不是生产路径。
             appearance: Box::leak(Box::new(badge::AppearanceCache::default())),
+            files_focused: false,
         }
     }
 
     /// 真跑一帧 `build_ui`,复用调用方给的 `ctx`(才能跨帧读上一帧的 widget)
     /// 和 `input`(才能塞指针事件模拟点击)。
+    ///
+    /// `files` 同 `render_frame`(`app.rs`):`ctx.run` 的闭包是 `FnMut`、内部
+    /// 是个多趟 loop,不能按值把一个 `&mut` 移进去,用 `as_deref_mut()` 每趟
+    /// 取一个新的 reborrow(`Option<&mut T>: DerefMut` 恒成立,见 `render_frame`
+    /// 的注释)。
     fn run_frame(
         ctx: &egui::Context,
         ui_state: &mut UiState,
         frame: UiFrame<'_>,
         input: egui::RawInput,
+        mut files: Option<&mut files_panel::PanelFrame>,
     ) -> (egui::FullOutput, UiActions) {
         let mut actions = UiActions::default();
         let out = ctx.run(input, |ctx| {
-            actions = build_ui(ctx, &crate::theme::MULLION_DARK, ui_state, frame);
+            actions = build_ui(
+                ctx,
+                &crate::theme::MULLION_DARK,
+                ui_state,
+                frame,
+                files.as_deref_mut(),
+                // D1:标签宿主参数留给专门测这条路径的 `run_frame_content`——
+                // 这里保持 `run_frame` 的既有签名/调用点不变(改了会牵动一大片
+                // 既有测试)。
+                None,
+                // 世代号(`ScrollArea` id salt 用)对这批既有测试全都无关——
+                // 它们测的是布局/文案有没有画出来,不测滚动位置跨标签隔离
+                // (那条专门的行为测试落在 `files_panel::
+                // scroll_id_salt_differs_by_generation`,直接测抽出来的纯
+                // 函数,不需要走这整条 `build_ui` 管线)。随便给一个固定值。
+                0,
+            );
+        });
+        (out, actions)
+    }
+
+    /// D1:同 `run_frame`,测标签宿主(`files_content`)那条路径。拆成单独
+    /// 一个函数而不是给 `run_frame` 加参数——后者已有一大片调用点,改签名
+    /// 牵连过广;两条路径(侧栏 vs 标签宿主)本来就互斥,分开测更直接。
+    fn run_frame_content(
+        ctx: &egui::Context,
+        ui_state: &mut UiState,
+        frame: UiFrame<'_>,
+        input: egui::RawInput,
+        mut files_content: Option<&mut files_panel::PanelFrame>,
+    ) -> (egui::FullOutput, UiActions) {
+        let mut actions = UiActions::default();
+        let out = ctx.run(input, |ctx| {
+            actions = build_ui(
+                ctx,
+                &crate::theme::MULLION_DARK,
+                ui_state,
+                frame,
+                None,
+                files_content.as_deref_mut(),
+                // 同 `run_frame`:这批测试不关心具体世代号。
+                0,
+            );
         });
         (out, actions)
     }
@@ -634,8 +762,8 @@ mod tests {
     fn rendered_text(frame: UiFrame<'_>) -> (String, UiActions) {
         let ctx = egui::Context::default();
         let mut ui_state = UiState::default();
-        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
-        let (out, actions) = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
+        let (out, actions) = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
         (collect_text(&out), actions)
     }
 
@@ -700,8 +828,8 @@ mod tests {
     fn drawn_preset_buttons(frame: UiFrame<'_>) -> usize {
         let ctx = egui::Context::default();
         let mut ui_state = UiState::default();
-        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
-        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
         (0..crate::shell::workspace::Preset::ALL.len())
             .filter(|&i| ctx.read_response(toolbar::button_id(i)).is_some())
             .count()
@@ -860,8 +988,8 @@ mod tests {
         };
         let ctx = egui::Context::default();
         let mut ui_state = UiState::default();
-        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
-        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default());
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
+        let _ = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
 
         for (i, expected) in crate::shell::workspace::Preset::ALL.into_iter().enumerate() {
             let pos = ctx
@@ -879,7 +1007,7 @@ mod tests {
                 events: vec![egui::Event::PointerMoved(pos), click(true), click(false)],
                 ..Default::default()
             };
-            let (_, actions) = run_frame(&ctx, &mut ui_state, frame, input);
+            let (_, actions) = run_frame(&ctx, &mut ui_state, frame, input, None);
             assert_eq!(
                 actions.preset,
                 Some(expected),
@@ -915,7 +1043,7 @@ mod tests {
         };
         // 跑两遍:egui 的 Area 首帧是不可见的 sizing pass,第二帧才落进 areas order。
         for _ in 0..2 {
-            run_frame(&ctx, &mut st, frame, egui::RawInput::default());
+            run_frame(&ctx, &mut st, frame, egui::RawInput::default(), None);
         }
 
         let windows = ctx.memory(|m| {
@@ -949,7 +1077,7 @@ mod tests {
             ..base_frame()
         };
         for _ in 0..2 {
-            run_frame(&ctx, &mut st, frame, egui::RawInput::default());
+            run_frame(&ctx, &mut st, frame, egui::RawInput::default(), None);
         }
 
         assert!(st.editor.is_some(), "新建草稿应已切入编辑区");
@@ -977,7 +1105,7 @@ mod tests {
         crate::theme::apply_egui(&ctx, &crate::theme::MULLION_DARK);
         let mut text = String::new();
         for _ in 0..2 {
-            let (out, _) = run_frame(&ctx, &mut st, frame, egui::RawInput::default());
+            let (out, _) = run_frame(&ctx, &mut st, frame, egui::RawInput::default(), None);
             text = collect_text(&out);
         }
         assert!(
@@ -1002,7 +1130,7 @@ mod tests {
         crate::theme::apply_egui(&ctx, &crate::theme::MULLION_DARK);
         let mut text = String::new();
         for _ in 0..2 {
-            let (out, _) = run_frame(&ctx, &mut st, frame, egui::RawInput::default());
+            let (out, _) = run_frame(&ctx, &mut st, frame, egui::RawInput::default(), None);
             text = collect_text(&out);
         }
         assert!(text.contains("会话库不可用"), "应给降级提示,实得:{text}");
@@ -1036,7 +1164,7 @@ mod tests {
 
         let mut text = String::new();
         for _ in 0..2 {
-            let (out, _) = run_frame(&ctx, &mut st, frame, egui::RawInput::default());
+            let (out, _) = run_frame(&ctx, &mut st, frame, egui::RawInput::default(), None);
             text = collect_text(&out);
         }
 
@@ -1049,6 +1177,206 @@ mod tests {
             st.editor.as_ref().map(|b| b.name.as_str()),
             Some(edited.name.as_str()),
             "确认之前不能静默应用切换,用户刚打的字必须还在"
+        );
+    }
+
+    /// T4 / 设计 D2 的前半段:开侧栏后,`build_ui` 拿 `ctx.available_rect()`
+    /// 算出的中央区必须变窄。这是 T4 整条链路里**唯一经过 egui** 的一步——
+    /// 后半段(中央区变窄之后要不要发一次 `window_change`、列数是否真的变少)
+    /// 不经过 egui,由 `app.rs` 的
+    /// `opening_the_files_sidebar_reaches_the_remote_as_a_window_change` 守;
+    /// 那条测试对「侧栏用 `SidePanel` 还是 `Area`」完全无感,这条才是。
+    ///
+    /// 破坏性验证:把 `files_panel::sidebar` 里的 `egui::SidePanel` 换成
+    /// `egui::Area`(Area 不参与 Panel 的空间分配,`available_rect()` 不会
+    /// 变)—— 这条必须变红。
+    #[test]
+    fn opening_the_files_sidebar_shrinks_the_central_area() {
+        let frame = UiFrame {
+            connected: true,
+            ..base_frame()
+        };
+
+        // 侧栏关:两帧(sizing pass 的坑,见 `rendered_text` 的注释)。
+        let closed_ctx = egui::Context::default();
+        let mut closed_state = UiState::default();
+        for _ in 0..2 {
+            run_frame(
+                &closed_ctx,
+                &mut closed_state,
+                frame,
+                egui::RawInput::default(),
+                None,
+            );
+        }
+        let closed_w = closed_state.central_px.0;
+
+        // 侧栏开:同一套输入,换一个全新的 ctx/ui_state(两边不能共用同一个
+        // `ui_state`——`files_sidebar_w` 会跨场景污染宽度)。
+        let open_ctx = egui::Context::default();
+        let mut open_state = UiState {
+            files_sidebar_open: true,
+            ..Default::default()
+        };
+        let mut panel = files_panel::PanelFrame {
+            remote: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+                b"/".to_vec(),
+            )),
+            local: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+                b"/".to_vec(),
+            )),
+            show_owner: false,
+            bookmarks: Vec::new(),
+            active_column: files_panel::PanelColumn::default(),
+        };
+        for _ in 0..2 {
+            run_frame(
+                &open_ctx,
+                &mut open_state,
+                frame,
+                egui::RawInput::default(),
+                Some(&mut panel),
+            );
+        }
+        let open_w = open_state.central_px.0;
+
+        assert!(
+            open_w + 200 < closed_w,
+            "开侧栏后中央区应明显变窄:关 {closed_w}px → 开 {open_w}px"
+        );
+    }
+
+    /// D1/D4:标签宿主(`files_content`)跟侧栏是两种不同的占位方式。侧栏是
+    /// `SidePanel`,会挤占 egui 的 Panel 空间分配,让 `central_px` 变窄
+    /// (见上一条测试);标签宿主画的是 `CentralPanel`,天然铺满**已经**
+    /// 让出来的中央区,不会、也不该再把这块区域进一步挤压——它取代的是
+    /// 终端自绘(wgpu)那次填充,而不是在中央区里再切一刀。所以这里断言的
+    /// 是「不变」:同一份 `frame`,开不开 `files_content`,`central_px`
+    /// 应该一致 —— 标签宿主确实吃满了整个中央区,而不是只占一部分。
+    ///
+    /// 破坏性验证:把 `files_panel::content` 误包一层 `SidePanel`(比如手滑
+    /// 加个预览栏)——`central_px` 会跟着变窄,断言必须变红。
+    #[test]
+    fn opening_a_files_tab_fills_the_same_central_area_as_the_terminal_would() {
+        let frame = UiFrame {
+            connected: true,
+            ..base_frame()
+        };
+
+        let closed_ctx = egui::Context::default();
+        let mut closed_state = UiState::default();
+        for _ in 0..2 {
+            run_frame(
+                &closed_ctx,
+                &mut closed_state,
+                frame,
+                egui::RawInput::default(),
+                None,
+            );
+        }
+        let closed_w = closed_state.central_px.0;
+        let closed_h = closed_state.central_px.1;
+
+        let content_ctx = egui::Context::default();
+        let mut content_state = UiState::default();
+        let mut panel = files_panel::PanelFrame {
+            remote: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+                b"/".to_vec(),
+            )),
+            local: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+                b"/".to_vec(),
+            )),
+            show_owner: false,
+            bookmarks: Vec::new(),
+            active_column: files_panel::PanelColumn::default(),
+        };
+        for _ in 0..2 {
+            run_frame_content(
+                &content_ctx,
+                &mut content_state,
+                frame,
+                egui::RawInput::default(),
+                Some(&mut panel),
+            );
+        }
+        let content_w = content_state.central_px.0;
+        let content_h = content_state.central_px.1;
+
+        assert_eq!(
+            (content_w, content_h),
+            (closed_w, closed_h),
+            "标签宿主应铺满跟终端一样的中央区,不该被额外挤窄:关闭态 {closed_w}x{closed_h}px,标签宿主 {content_w}x{content_h}px"
+        );
+    }
+
+    /// D1:光比对 `central_px` 的「不变」测不出「`build_ui` 干脆没调
+    /// `files_panel::content`」这种漏接——不画东西的话,`available_rect()`
+    /// 一样等于关闭态那个值(`CentralPanel` 只是铺满剩余区,不产生新的边界),
+    /// 上一条测试反而会误判「通过」。这条走 `collect_text` 真的把
+    /// `run_frame_content` 这一帧的形状树展平,断言两栏各自的文件名都被画
+    /// 了出来——`Some(files_content)` 传进去之后,标签宿主那条渲染路径必须
+    /// 真的被触达,而不只是「参数存在但没人用」。
+    ///
+    /// 破坏性验证:把 `build_ui` 里 `if let Some(files) = files_content { .. }`
+    /// 整段删掉(等价于「接了参数但忘了接线」)——两个文件名都不会出现在
+    /// 画出来的文本里,断言必须变红。
+    #[test]
+    fn build_ui_actually_draws_files_content_when_given_one() {
+        let frame = UiFrame {
+            connected: true,
+            ..base_frame()
+        };
+        let mut panel = files_panel::PanelFrame {
+            remote: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+                b"/".to_vec(),
+            )),
+            local: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+                b"/".to_vec(),
+            )),
+            show_owner: false,
+            bookmarks: Vec::new(),
+            active_column: files_panel::PanelColumn::default(),
+        };
+        fn entry(name: &[u8]) -> mullion_ssh::sftp::Entry {
+            mullion_ssh::sftp::Entry {
+                name: mullion_ssh::sftp::RemotePath::from_bytes(name.to_vec()),
+                kind: mullion_ssh::sftp::EntryKind::File,
+                size: 1024,
+                mtime: 1_700_000_000,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                link_target: None,
+            }
+        }
+        panel.remote.entries = vec![entry(b"remote-tab-only.txt")];
+        panel.remote.load = crate::files::state::Load::Ready;
+        panel.local.entries = vec![entry(b"local-tab-only.txt")];
+        panel.local.load = crate::files::state::Load::Ready;
+
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut text = String::new();
+        for _ in 0..2 {
+            let (out, _) = run_frame_content(
+                &ctx,
+                &mut ui_state,
+                frame,
+                egui::RawInput::default(),
+                Some(&mut panel),
+            );
+            text = collect_text(&out);
+        }
+
+        assert!(
+            text.contains("remote-tab-only.txt"),
+            "远端栏没画出来 —— build_ui 传了 files_content 却没真的接上 \
+             files_panel::content,实际画出来的文本: {text}"
+        );
+        assert!(
+            text.contains("local-tab-only.txt"),
+            "本地栏没画出来 —— build_ui 传了 files_content 却没真的接上 \
+             files_panel::content,实际画出来的文本: {text}"
         );
     }
 }

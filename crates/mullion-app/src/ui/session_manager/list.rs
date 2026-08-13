@@ -561,10 +561,6 @@ pub(super) fn show(
     // 之后 `available_width` 已经扣掉滚动条,会在阈值附近来回抖档。
     let d = density_for(ui.available_width());
 
-    // SFTP 节点连不上(F50)。行为由 mod.rs 的统一闸门保证;这里管的是
-    // 「让用户看得出来为什么点不动」。
-    let connectable = protocol == mullion_store::Protocol::Ssh;
-
     // 底部「分隔线 + 新建按钮」用 `TopBottomPanel::bottom` 先占位:egui 的面板
     // 布局保证面板先分配自己的高度,再把外层 `ui` 的可用区底边收缩到面板上沿
     // (见 egui-0.30.0 `containers/panel.rs::show_inside` 里 `TopBottomSide::Bottom`
@@ -664,7 +660,6 @@ pub(super) fn show(
                                 &mut pending_delete_rendered,
                                 appearance,
                                 d,
-                                connectable,
                             );
                         }
                     });
@@ -724,7 +719,6 @@ fn row(
     pending_delete_rendered: &mut bool,
     appearance: &crate::ui::badge::AppearanceCache,
     d: Density,
-    connectable: bool,
 ) {
     if pending_delete_target == Some(rec.id) {
         *pending_delete_rendered = true;
@@ -758,27 +752,22 @@ fn row(
     // `pending_switch` 和 `connect_request` 都写下。目前无害(`pending_switch`
     // 还没有消费点),但 Task 14 接脏检查确认时,需要决定 `connect_request`
     // 是否也要走那道确认门。
-    if connectable && resp.double_clicked() {
+    // D24:双击不再挑协议。原先这里有个 `connectable`(只放行 SSH),
+    // 右键那两个按钮解禁后它就落了单 —— 右键能连、双击没反应,同一行
+    // 两种脾气。行为兜底仍在 mod.rs 的统一闸门那一道。
+    if resp.double_clicked() {
         ui_state.connect_request = Some(rec.id);
     }
     resp.context_menu(|ui| {
         // 走查 3:菜单里原本只有「跳过自动化」这一条连接项 —— 右键一打开,
         // 主操作(直接连)反而不在,用户只能关掉菜单再双击。普通连接排第一。
-        if ui
-            .add_enabled(connectable, egui::Button::new("连接"))
-            .on_disabled_hover_text(super::editor::SFTP_NOT_YET)
-            .clicked()
-        {
+        if ui.button("连接").clicked() {
             ui_state.connect_request = Some(rec.id);
             ui.close_menu();
         }
         // F44:一次性逃生门。远端 tmux 里正跑着 Claude Code 时,用户可能只想
         // 连上去看一眼,不想让自动化再发一遍 attach。
-        if ui
-            .add_enabled(connectable, egui::Button::new("连接(跳过自动化)"))
-            .on_disabled_hover_text(super::editor::SFTP_NOT_YET)
-            .clicked()
-        {
+        if ui.button("连接(跳过自动化)").clicked() {
             ui_state.connect_request = Some(rec.id);
             ui_state.connect_skip_automation = true;
             ui.close_menu();
@@ -880,6 +869,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 
@@ -1256,22 +1246,22 @@ mod tests {
         );
     }
 
-    /// D4:SFTP 档(F50 未实现)右键菜单里的「连接」必须是真的按不动,不只是
-    /// 看起来灰——`add_enabled(false, ..)` 让 egui 在 `enabled=false` 时把
-    /// `Response::clicked` 钉死为 `false`(见 egui-0.30.0 `context.rs::get_response`
-    /// 里 `res.clicked = true` 的赋值必须 `enabled && ...` 同时成立)。
+    /// D24:SFTP 档右键菜单里的「连接」不再置灰、也不再是摆设——点了必须真的
+    /// 设上 `connect_request`。这条替代了 F118 时期的
+    /// `sftp_row_context_menu_connect_button_is_truly_unclickable_not_just_grey`:
+    /// 那时按钮要**真的按不动**(`add_enabled(false, ..)`),现在 D1 给了 SFTP
+    /// 节点自己的标签页,再挡着就是功能残缺,判据翻转成「点了必须有反应」。
     ///
-    /// 这条测试专测**视觉层**(list.rs 的 `add_enabled`),不是 mod.rs 的兜底
-    /// 闸门——闸门测的是「万一某条入口漏挡,出了 `show()` 也会被清空」;这里
-    /// 测的是「入口本身一开始就不该被点动」,两层分别有测试,任何一层被削弱
-    /// 都要变红。手法照抄上面 `context_menu_skip_automation_sets_both_connect_request_and_skip_flag`:
-    /// 真实指针事件右键打开菜单、`find_text_pos` 反推「连接」按钮矩形再点下去,
-    /// 不直接手动赋值 `ui_state.connect_request`。
+    /// 手法照抄原测试:真实指针事件右键打开菜单、`find_text_pos` 反推
+    /// 「连接」按钮矩形再点下去,不直接手动赋值 `ui_state.connect_request`——
+    /// 否则测不出按钮是不是真的能点。
     ///
-    /// 自证会变红:把 `row()` 里两处 `ui.add_enabled(connectable, egui::Button::new(..))`
-    /// 改回 `ui.button(..)`,`connect_request` 就会被设上。
+    /// **只测到 `list::show` 这一层。** `mod.rs` 那道 D4 统一兜底闸门
+    /// (非 Sessions 档一律清空 `connect_request`)此刻**还在挡着**,所以
+    /// 完整链路上 SFTP 档点「连接」目前仍然没反应。解那道闸门是 Task 10
+    /// 的事(与 `wants_sftp` 分流同一提交),别看到这条绿就以为端到端通了。
     #[test]
-    fn sftp_row_context_menu_connect_button_is_truly_unclickable_not_just_grey() {
+    fn sftp_row_context_menu_connect_button_now_sets_connect_request() {
         let t = crate::theme::MULLION_DARK;
         let mut sftp = rec(1, "sftp-node-unique-name", "192.0.2.30", &[]);
         sftp.connection.protocol = Protocol::Sftp;
@@ -1331,8 +1321,9 @@ mod tests {
         // `find_text_pos` 是子串匹配(见本文件 `walk` 里的 `.contains(needle)`),
         // "连接" 在这个菜单里同时命中「连接」和「连接(跳过自动化)」两个按钮
         // (右栏 Tab 条第一个页签也叫「连接」)。这里子串匹配是安全的,前提有二:
-        // 1. 两个菜单按钮的 `add_enabled(connectable, ..)` 门控完全一样 —— 命中
-        //    哪一个,点击后 `connect_request` 的断言结果都相同;
+        // 1. 两个菜单按钮点击后都会设 `connect_request`(区别只在
+        //    `connect_skip_automation`)—— 命中哪一个,`connect_request` 的
+        //    断言结果都相同;
         // 2. 本测试全程只发 secondary(右键)事件,从未 `PointerButton::Primary`
         //    点过会话行本身,`ui_state.editor` 恒为 `None`,右栏画的是空态提示
         //    而不是 Tab 条,撞不上同名页签。
@@ -1340,8 +1331,8 @@ mod tests {
         // 前提就破了,子串匹配可能悄悄定位到页签而不是菜单按钮 —— 测试会变成
         // 恒绿却依旧通过,加左键点击前必须换成唯一锚点(比如带上「(跳过自动化)」
         // 排除歧义,或直接测右栏 Tab 条隐藏)。
-        let connect_btn_pos = find_text_pos(&out.shapes, "连接")
-            .expect("右键打开的菜单里应该画出了「连接」按钮(即便是禁用状态,文字也照常画)");
+        let connect_btn_pos =
+            find_text_pos(&out.shapes, "连接").expect("右键打开的菜单里应该画出了「连接」按钮");
         let primary_click = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -1362,9 +1353,86 @@ mod tests {
         );
 
         assert_eq!(
-            ui_state.connect_request, None,
-            "SFTP 档「连接」按钮必须真的点不动——egui 的 `enabled=false` \
-             应该在按钮层面就拦下点击,不能指望 mod.rs 的兜底闸门兜底"
+            ui_state.connect_request,
+            Some(SessionId(1)),
+            "D24:SFTP 档「连接」按钮点了必须有反应——不该再被置灰挡住"
+        );
+    }
+
+    /// D24:**双击**这条入口也要跟着解开。原先 `row()` 里有个
+    /// `connectable`(只放行 `Protocol::Ssh`)卡着双击,右键那两个按钮解禁后
+    /// 它就落了单 —— 右键能连、双击毫无反应,同一行两种脾气,还没有任何东西
+    /// 告诉用户「这行得右键」。
+    ///
+    /// 与上一条同样**只测到 `list::show` 这一层**,mod.rs 的 D4 兜底闸门
+    /// 还在挡着(Task 10 才解)。
+    #[test]
+    fn double_clicking_an_sftp_row_sets_connect_request_just_like_the_menu_does() {
+        let t = crate::theme::MULLION_DARK;
+        let mut sftp = rec(1, "sftp-node-unique-name", "192.0.2.30", &[]);
+        sftp.connection.protocol = Protocol::Sftp;
+        let sessions = vec![sftp];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        &[],
+                        &[],
+                        &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Sftp,
+                    );
+                });
+            })
+        };
+
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let row_pos = find_text_pos(&out.shapes, "sftp-node-unique-name")
+            .expect("sftp 节点这一行应该已经画出来了");
+        let pos = egui::pos2(row_pos.x - 20.0, row_pos.y + 15.0);
+
+        let primary = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        // 两次点击分两帧发:帧间隔(~16ms)远小于 egui 的双击阈值 0.3s,
+        // 一帧塞四个事件反而要赌 `PointerState` 的帧内处理细节。
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    primary(pos, true),
+                    primary(pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![primary(pos, true), primary(pos, false)],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            ui_state.connect_request,
+            Some(SessionId(1)),
+            "D24:双击 SFTP 行也要发起连接,不能只有右键菜单能用"
         );
     }
 

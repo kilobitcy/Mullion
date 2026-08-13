@@ -9,6 +9,7 @@ pub mod automation;
 pub mod cli;
 pub mod clipboard;
 pub mod diag;
+pub mod files;
 pub mod frame;
 pub mod gpu;
 pub mod grid;

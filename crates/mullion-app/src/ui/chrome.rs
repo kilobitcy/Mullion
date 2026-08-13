@@ -70,6 +70,12 @@ pub fn top_menu(
                         ui_state.toggle_title_bars = true;
                         ui.close_menu();
                     }
+                    // F50:开关文件侧栏。快捷键 `Ctrl+Shift+B` 的接线在
+                    // `app.rs::files_hotkey_event`,这里只是菜单入口。
+                    if ui.button("文件面板\tCtrl+Shift+B").clicked() {
+                        ui_state.files_sidebar_open = !ui_state.files_sidebar_open;
+                        ui.close_menu();
+                    }
                     ui.add_enabled(false, egui::Button::new("(F84 设置 · 后续切片)"));
                     ui.add_enabled(false, egui::Button::new("(快捷键 · 后续切片)"));
                 });

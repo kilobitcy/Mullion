@@ -50,6 +50,7 @@ fn automation_env_is_plaintext_in_sessions_toml_and_absent_from_secrets_enc() {
                 }]),
                 ..Default::default()
             },
+            sftp: Default::default(),
             secret: None,
         },
         "2026-08-06T00:00:00Z",

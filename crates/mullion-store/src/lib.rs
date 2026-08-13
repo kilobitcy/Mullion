@@ -12,6 +12,7 @@ pub mod master_key;
 pub mod migrate;
 pub mod model;
 pub mod network;
+pub mod sftp;
 pub mod tunnel;
 pub mod vault;
 
@@ -29,5 +30,6 @@ pub use model::{
     IconSpec, Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
+pub use sftp::{Bookmark, SftpPrefs};
 pub use tunnel::{TunnelId, TunnelKind, TunnelRecord};
 pub use vault::{SessionDraft, TunnelDraft, Vault};

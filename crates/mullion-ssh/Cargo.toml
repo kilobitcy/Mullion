@@ -7,6 +7,7 @@ license.workspace = true
 # 架构不变量:ssh 不认识「pane」「窗口」,只认字节流。不得引 core/term/app。
 [dependencies]
 russh.workspace = true
+russh-sftp.workspace = true
 tokio.workspace = true
 # ADR-008 的日志 facade(0 依赖)。SOCKS5 服务端(F113)里每条被拒的本地连接
 # **没有任何 UI 出口** —— 隧道本身还好好跑着,挂掉的只是那一条连接。

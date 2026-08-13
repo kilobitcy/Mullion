@@ -19,30 +19,21 @@ use mullion_store::{GroupRecord, SessionRecord};
 /// 四个 Tab 的标题。索引即 `UiState::editor_tab`,与 `super::TAB_*` 一一对应。
 /// 「高级」已并入「连接」(走查 P1-8):那一页只有一行代理,右侧 70% 是空白,
 /// 而代理跟主机/端口/跳板本来就是同一个「怎么连上去」的决策。
-pub(super) const TABS: [&str; 4] = ["连接", "认证", "登录后", "图标"];
+pub(super) const TABS: [&str; 5] = ["连接", "认证", "登录后", "图标", "SFTP"];
 
-/// 底部按钮为什么点不动。原因是并集,顺序即优先级 ——
-/// `Sftp` 排最前:节点填齐了也连不了,这时说「还缺主机」是误导。
+/// 底部按钮为什么点不动。原因是并集,顺序即优先级。
 enum Disabled {
     No,
-    /// SFTP 传输还没实现(F50),节点管理可用但连不上。
-    Sftp,
     Missing(String),
     Probing,
 }
 
-/// SFTP 节点为什么连不上。两处要用同一份文案(右栏按钮、左栏右键菜单),
-/// 所以留一个常量,别各写各的。
-pub(super) const SFTP_NOT_YET: &str = "SFTP 传输尚未实现(F50)";
-
 fn why(
-    mode: super::ManagerMode,
+    _mode: super::ManagerMode,
     missing: super::validate::Missing,
     probe: &super::ProbeState,
 ) -> Disabled {
-    if matches!(mode, super::ManagerMode::Sftp) {
-        Disabled::Sftp
-    } else if missing.any() {
+    if missing.any() {
         Disabled::Missing(missing.hint())
     } else if matches!(probe, super::ProbeState::Running) {
         Disabled::Probing
@@ -76,7 +67,6 @@ fn summarize(msg: &str) -> (String, bool) {
 fn tip(d: &Disabled) -> Option<String> {
     match d {
         Disabled::No => None,
-        Disabled::Sftp => Some(SFTP_NOT_YET.to_owned()),
         Disabled::Missing(h) => Some(h.clone()),
         Disabled::Probing => Some("测试连接进行中…".to_owned()),
     }
@@ -571,6 +561,10 @@ pub(super) fn show(
                 &mut ui_state.touched,
             ),
             super::TAB_AUTOMATION => super::fields::automation(ui, t, buf, groups),
+            super::TAB_SFTP => {
+                let mut first = true;
+                super::fields::sftp(ui, t, buf, &mut first)
+            }
             super::TAB_APPEARANCE => {
                 super::fields::appearance(ui, t, buf, &mut ui_state.icon_error)
             }
@@ -705,7 +699,7 @@ fn decide_key_drop(
 mod tests {
     use super::{
         decide_key_drop, ensure_key_candidates_scanned, expire_verdict_if_form_changed, summarize,
-        tip, why, Disabled, KeyDrop, SFTP_NOT_YET, SUMMARY_CHARS,
+        tip, why, Disabled, KeyDrop, SUMMARY_CHARS,
     };
     use crate::ui::session_manager::validate::Missing;
     use crate::ui::session_manager::{
@@ -1169,6 +1163,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 
@@ -1202,6 +1197,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         };
         let same = EditorBuffer {
             name: "web01".into(),
@@ -1351,7 +1347,7 @@ mod tests {
         );
     }
 
-    /// Tab 常量必须与 `TABS` 一一对应。合并「高级」后只剩 4 页。
+    /// Tab 常量必须与 `TABS` 一一对应。合并「高级」+ F120 加「SFTP」后共 5 页。
     ///
     /// `TAB_AUTH` 的下标不能变:`editor.rs` 里拖入私钥文件的门控写的是
     /// `editor_tab == TAB_AUTH && auth_kind == PublicKey`,而
@@ -1366,12 +1362,13 @@ mod tests {
     /// 清单里。
     #[test]
     fn tab_constants_match_the_table_and_auth_keeps_index_one() {
-        use crate::ui::session_manager::{TAB_APPEARANCE, TAB_AUTOMATION};
-        assert_eq!(super::TABS.len(), 4, "「高级」已并入「连接」,不该还有 5 页");
+        use crate::ui::session_manager::{TAB_APPEARANCE, TAB_AUTOMATION, TAB_SFTP};
+        assert_eq!(super::TABS.len(), 5, "F120 加了「SFTP」页,应有 5 页");
         assert_eq!(super::TABS[TAB_CONNECT], "连接");
         assert_eq!(super::TABS[TAB_AUTH], "认证");
         assert_eq!(super::TABS[TAB_AUTOMATION], "登录后");
         assert_eq!(super::TABS[TAB_APPEARANCE], "图标");
+        assert_eq!(super::TABS[TAB_SFTP], "SFTP");
         assert_eq!(TAB_AUTH, 1, "私钥拖入门控与必填校验都钉在这个下标上");
     }
 
@@ -1439,16 +1436,12 @@ mod tests {
         assert_eq!(tip(&d), Some("还缺:会话名称、用户名".to_owned()));
     }
 
-    /// SFTP 优先于其它原因:节点填齐了也连不上,说「还缺主机」是在指错方向。
+    /// D24:SFTP 档下「连接」按钮不再被置灰。这条替代了原来断言
+    /// 「置灰理由是 SFTP_NOT_YET」的测试 —— 那个理由本身没了。
     #[test]
-    fn sftp_outranks_every_other_disabled_reason() {
-        let missing = Missing {
-            name: true,
-            host: true,
-            user: true,
-        };
-        let d = why(ManagerMode::Sftp, missing, &ProbeState::Running);
-        assert_eq!(tip(&d).as_deref(), Some(SFTP_NOT_YET));
+    fn the_sftp_mode_no_longer_disables_the_connect_button() {
+        let d = why(ManagerMode::Sftp, Missing::default(), &ProbeState::Idle);
+        assert!(tip(&d).is_none(), "填齐了的 SFTP 节点必须能连");
     }
 
     /// `ProbeState::Err`/`Ok` 都不该影响 `why()`——按钮禁用只看

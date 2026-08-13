@@ -259,6 +259,7 @@ mod tests {
             appearance,
             network,
             automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
         }
     }
 

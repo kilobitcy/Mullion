@@ -502,6 +502,7 @@ fn sess(id: u64, name: &str, host: &str, group: Option<GroupId>) -> SessionRecor
         appearance: Default::default(),
         network: Default::default(),
         automation: Default::default(),
+        sftp: Default::default(),
     }
 }
 

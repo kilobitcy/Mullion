@@ -116,6 +116,9 @@ pub(crate) const TAB_CONNECT: usize = 0;
 pub(crate) const TAB_AUTH: usize = 1;
 pub(crate) const TAB_AUTOMATION: usize = 2;
 pub(crate) const TAB_APPEARANCE: usize = 3;
+/// F120:SFTP 默认目录 + 书签。加在最后一个下标之后 —— 别的下标(尤其
+/// `TAB_AUTH`,见 `editor.rs` 的门控/校验)不能因为插了新页而漂移。
+pub(crate) const TAB_SFTP: usize = 4;
 
 /// 这个模式下右栏画哪几页,元素是 `editor::TABS` 的**原始下标**。
 ///
@@ -128,8 +131,14 @@ pub(crate) const TAB_APPEARANCE: usize = 3;
 /// 「图标」但下标是 2,点下去打开的是「登录后」。
 pub(crate) fn visible_tabs(mode: ManagerMode) -> &'static [usize] {
     match mode {
-        ManagerMode::Sftp => &[TAB_CONNECT, TAB_AUTH, TAB_APPEARANCE],
-        _ => &[TAB_CONNECT, TAB_AUTH, TAB_AUTOMATION, TAB_APPEARANCE],
+        ManagerMode::Sftp => &[TAB_CONNECT, TAB_AUTH, TAB_SFTP, TAB_APPEARANCE],
+        _ => &[
+            TAB_CONNECT,
+            TAB_AUTH,
+            TAB_AUTOMATION,
+            TAB_SFTP,
+            TAB_APPEARANCE,
+        ],
     }
 }
 
@@ -423,9 +432,15 @@ pub fn show(
                 }
             }
             keys::Action::Open => {
-                // 只有会话档能连。SFTP 节点连不了(F50 未实现,见 D4 的统一
-                // 闸门),隧道档压根没有会话可连。
-                if ui_state.manager_mode == ManagerMode::Sessions {
+                // 隧道档压根没有会话可连;会话档与 SFTP 档都能连(SFTP 节点连上
+                // 开的是独占文件标签,不是终端)。
+                //
+                // 判据写成 `!= Tunnels` 而不是列举 `Sessions || Sftp`:这条跟
+                // 下面 D4 那道兜底闸门是同一个判据,列举式在加档时必然漏 ——
+                // 本来就漏过一次,D1 让 SFTP 节点可连之后,双击/右键/右栏按钮
+                // 三条入口都改了,唯独这条键盘路径的注释和逻辑停在
+                // 「F50 未实现」,纯键盘用户按 Enter 完全没反应。
+                if ui_state.manager_mode != ManagerMode::Tunnels {
                     if let Some(id) = ui_state.editor_id {
                         ui_state.connect_request = Some(id);
                     }
@@ -735,12 +750,14 @@ pub fn show(
         }
     }
 
-    // D4 统一闸门。SFTP 节点连不上(F50 未实现)、隧道档压根没有会话可连。
-    // 入口有四条(左栏双击、右键菜单、右栏按钮、Enter),逐条挡必然漏 ——
-    // 这里做唯一一道兜底,各入口再各自置灰(那是给人看的,这一道是保证行为)。
+    // D4 统一闸门。隧道档压根没有会话可连;SFTP 节点(D1 起)是可以连的 ——
+    // 连上开的是独占的文件标签,不是终端(`App::spawn_connect` 的
+    // `wants_sftp` 分支)。入口有四条(左栏双击、右键菜单、右栏按钮、
+    // Enter),逐条挡必然漏——这里做唯一一道兜底,各入口再各自置灰
+    // (那是给人看的,这一道是保证行为)。
     // `connect_skip_automation` 必须一起清:留着它会漂到下一次真正的连接上,
     // 用户会莫名其妙地跳过一次自动化。
-    if ui_state.manager_mode != ManagerMode::Sessions {
+    if ui_state.manager_mode == ManagerMode::Tunnels {
         ui_state.connect_request = None;
         ui_state.connect_skip_automation = false;
     }
@@ -935,6 +952,7 @@ mod tunnel_ui_tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 
@@ -1083,12 +1101,18 @@ mod tunnel_ui_tests {
     fn sftp_hides_the_automation_tab_and_keeps_original_indices() {
         assert_eq!(
             visible_tabs(ManagerMode::Sftp),
-            &[TAB_CONNECT, TAB_AUTH, TAB_APPEARANCE],
-            "SFTP 档必须是这三页,且用的是原始下标"
+            &[TAB_CONNECT, TAB_AUTH, TAB_SFTP, TAB_APPEARANCE],
+            "SFTP 档必须是这四页,且用的是原始下标"
         );
         assert_eq!(
             visible_tabs(ManagerMode::Sessions),
-            &[TAB_CONNECT, TAB_AUTH, TAB_AUTOMATION, TAB_APPEARANCE]
+            &[
+                TAB_CONNECT,
+                TAB_AUTH,
+                TAB_AUTOMATION,
+                TAB_SFTP,
+                TAB_APPEARANCE
+            ]
         );
     }
 
@@ -1222,12 +1246,13 @@ mod tunnel_ui_tests {
         }
     }
 
-    /// D5 的下标陷阱。SFTP 档 Tab 条上第三个是「图标」,点它必须打开「图标」。
+    /// D5 的下标陷阱。SFTP 档 Tab 条上第四个是「图标」(F120 加了「SFTP」页后
+    /// 从第三个挪到第四个),点它必须打开「图标」。
     ///
     /// 自证会变红:把 `editor.rs` 的 Tab 循环改回 `TABS.iter().enumerate()`,
     /// 这条立刻红(`editor_tab` 会变成 2 = 登录后)。
     #[test]
-    fn clicking_the_third_tab_in_sftp_mode_opens_appearance_not_automation() {
+    fn clicking_the_fourth_tab_in_sftp_mode_opens_appearance_not_automation() {
         let sessions = vec![sftp_sess(1, "文件中转")];
         let mut st = open(ManagerMode::Sftp);
         st.editor_id = Some(SessionId(1));
@@ -1713,26 +1738,76 @@ mod tunnel_ui_tests {
         );
     }
 
-    /// D4:SFTP 传输还没实现(F50),点了也连不上。四条入口(左栏双击、
-    /// 右键菜单、右栏按钮、Enter)都要挡住 —— 这里测的是兜底闸门:
-    /// 无论哪条路把 connect_request 写了进来,出了 show() 都必须是 None。
+    /// D1/D4:SFTP 档按 Enter 必须能连(连上开的是独占文件标签)。
     ///
-    /// 自证会变红:把 mod.rs 里那段闸门删掉。
+    /// 这条补的是一个真 bug:`Action::Open` 的判据一直写着
+    /// `== ManagerMode::Sessions`,注释还停在「SFTP 节点连不了(F50 未实现)」。
+    /// D1 让 SFTP 节点可连之后,左栏双击、右键菜单、右栏按钮三条入口都改了,
+    /// **唯独键盘这条没跟上** —— 纯键盘用户(本项目的目标场景之一)在 SFTP
+    /// 列表里选中一条按 Enter,完全没反应,而且不报任何错。
+    ///
+    /// 反面(隧道档按 Enter 不放行)由 `keyboard_navigation_is_inert_in_tunnels_mode`
+    /// 和下面那条兜底闸门测试守着,这里不重复。
     #[test]
-    fn no_connect_request_survives_outside_session_mode() {
+    fn enter_connects_an_sftp_node_because_d1_made_them_connectable() {
+        let t = crate::theme::MULLION_DARK;
+        let key = |k: egui::Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
         let sessions = vec![sess(1, "生产主控"), sftp_sess(2, "文件中转")];
-        for mode in [ManagerMode::Sftp, ManagerMode::Tunnels] {
-            let mut st = open(mode);
-            // 模拟「某条入口已经把意图写了进来」。
-            st.connect_request = Some(SessionId(2));
-            st.connect_skip_automation = true;
-            let _ = run(&mut st, &sessions, &[]);
-            assert!(st.connect_request.is_none(), "{mode:?} 档不该放行连接意图");
-            assert!(
-                !st.connect_skip_automation,
-                "{mode:?} 档的跳过自动化标志也要一并清掉,否则它会漂到下一次真连接上"
-            );
-        }
+        let mut st = open(ManagerMode::Sftp);
+        st.editor_id = Some(SessionId(2));
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key(egui::Key::Enter)],
+                ..Default::default()
+            },
+            |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut st,
+                    &sessions,
+                    &[],
+                    &[],
+                    &[],
+                    true,
+                    SecretPresence::default(),
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            },
+        );
+        assert_eq!(
+            st.connect_request,
+            Some(SessionId(2)),
+            "SFTP 档按 Enter 没发出连接意图 —— 键盘用户唯一走不通的入口"
+        );
+    }
+
+    /// D4:隧道档压根没有会话可连——四条入口(左栏双击、右键菜单、右栏
+    /// 按钮、Enter)都要挡住。这里测的是兜底闸门:无论哪条路把
+    /// `connect_request` 写了进来,出了 `show()` 都必须是 `None`。
+    ///
+    /// 自证会变红:把 mod.rs 里那段闸门条件从 `== Tunnels` 改回
+    /// `!= Sessions`(或者干脆删掉)。
+    #[test]
+    fn no_connect_request_survives_the_tunnels_mode() {
+        let sessions = vec![sess(1, "生产主控"), sftp_sess(2, "文件中转")];
+        let mut st = open(ManagerMode::Tunnels);
+        // 模拟「某条入口已经把意图写了进来」。
+        st.connect_request = Some(SessionId(2));
+        st.connect_skip_automation = true;
+        let _ = run(&mut st, &sessions, &[]);
+        assert!(st.connect_request.is_none(), "隧道档不该放行连接意图");
+        assert!(
+            !st.connect_skip_automation,
+            "隧道档的跳过自动化标志也要一并清掉,否则它会漂到下一次真连接上"
+        );
 
         // 反面:会话档必须照常放行,否则这道闸门就把正常功能一起挡了。
         let mut st = open(ManagerMode::Sessions);
@@ -1742,6 +1817,28 @@ mod tunnel_ui_tests {
             st.connect_request,
             Some(SessionId(1)),
             "会话档的连接意图被误挡了"
+        );
+    }
+
+    /// D1/D24:SFTP 节点现在**可以**连了(连上开的是独占的文件标签,见
+    /// `App::spawn_connect` 的 `wants_sftp` 分支)——闸门不该再挡 SFTP 档。
+    /// 这条与上面那条 `Tunnels` 分别测,不是从循环里删掉 `Sftp` 分支了事:
+    /// 删掉就丢了「SFTP 档要放行」这个新增的正面断言,是在假装它无关紧要。
+    #[test]
+    fn connect_request_passes_through_the_sftp_mode_now() {
+        let sessions = vec![sess(1, "生产主控"), sftp_sess(2, "文件中转")];
+        let mut st = open(ManagerMode::Sftp);
+        st.connect_request = Some(SessionId(2));
+        st.connect_skip_automation = true;
+        let _ = run(&mut st, &sessions, &[]);
+        assert_eq!(
+            st.connect_request,
+            Some(SessionId(2)),
+            "SFTP 档的连接意图不该再被挡(D1:连上开文件标签)"
+        );
+        assert!(
+            st.connect_skip_automation,
+            "放行路径不该动 connect_skip_automation"
         );
     }
 }
@@ -1783,6 +1880,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         };
         let sessions = vec![rec(1, "a"), rec(2, "b")];
         let key = |k: egui::Key, modifiers: egui::Modifiers| egui::Event::Key {
@@ -2788,6 +2886,7 @@ mod tests {
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }];
         let groups: Vec<GroupRecord> = Vec::new();
         let mut ui_state = UiState {

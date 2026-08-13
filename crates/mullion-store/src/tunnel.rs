@@ -205,6 +205,7 @@ target_port = 3306
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
+            sftp: Default::default(),
         }
     }
 
