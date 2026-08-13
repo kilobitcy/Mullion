@@ -101,20 +101,20 @@ fn perm_bits(md: &std::fs::Metadata) -> u32 {
 }
 
 #[cfg(unix)]
-fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     s.as_bytes().to_vec()
 }
 
 #[cfg(not(unix))]
-fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
     // Windows 的 `OsStr` 是 UTF-16;`to_string_lossy` 是有损投影,
     // 孤儿代理项会变成 U+FFFD —— 与远端非 UTF-8 名走同一条
     // 「显示得出、操作不了」的路(D16 修订)。
     s.to_string_lossy().into_owned().into_bytes()
 }
 
-fn path_bytes(p: &Path) -> Vec<u8> {
+pub(crate) fn path_bytes(p: &Path) -> Vec<u8> {
     os_bytes(p.as_os_str())
 }
 

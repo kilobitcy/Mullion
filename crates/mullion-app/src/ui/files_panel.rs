@@ -41,6 +41,12 @@ pub enum FileAction {
     EditExternal,
     /// F53:在内置编辑器里编辑光标行。
     EditInline,
+    /// F58:**另一栏**的东西拖过来松手了,收进来。
+    ///
+    /// 方向由收到这条动作的栏决定,跟 `Transfer` 正好相反 —— `Transfer` 是
+    /// 「把我这栏选中的送出去」,`Drop` 是「把对面栏选中的收进来」。源永远是
+    /// 另一栏的选中集(载荷里只带栏,见 `drag::DragFrom`)。
+    Drop(crate::files::drag::Landing),
 }
 
 /// 要打开哪个对话框。
@@ -224,6 +230,10 @@ fn scroll_id_salt(id: &str, generation: u64) -> String {
 /// 此刻是不是键盘真正落点的那一栏。`true` 才画边框,调用方(`sidebar`/
 /// `content`)已经把「面板本身有没有键盘焦点」与「`active_column` 是不是
 /// 这一栏」两个条件都算进去了,这里不用再判。
+///
+/// `drop_in`:F52 —— 此刻从资源管理器往窗口里拖着几个文件。调用方只给
+/// **远端栏**传非零值(本地栏恒 `0`):拖进来的东西一律上传,本地栏收下
+/// 只会是「把本地文件复制到本地」,那是资源管理器自己的事(D5)。
 #[allow(clippy::too_many_arguments)] // 跟 session_manager 那批 egui 渲染函数同款,一帧要画的东西天然多
 pub fn show(
     ui: &mut Ui,
@@ -235,6 +245,7 @@ pub fn show(
     show_owner: bool,
     focused: bool,
     bookmarks: &[mullion_store::Bookmark],
+    drop_in: usize,
 ) -> Option<FileAction> {
     let mut action = None;
     annotate::mark(ui.ctx(), format!("文件面板/{id}"), ui.max_rect());
@@ -260,12 +271,43 @@ pub fn show(
         .as_ref()
         .and_then(|c| state.entries.iter().find(|e| e.name == *c))
         .map(menu_target);
-    ui.interact(
+    let bg = ui.interact(
         ui.max_rect(),
         ui.id().with(("files-bg-menu", id, generation)),
         egui::Sense::click(),
-    )
-    .context_menu(|ui| menu_body(ui, id, column, bg_target, &mut menu_hit));
+    );
+    bg.context_menu(|ui| menu_body(ui, id, column, bg_target, &mut menu_hit));
+    // F58:对面栏正拖着东西过来 —— 整栏描边,让「松手会传到这儿」在松手
+    // **之前**就看得见。判据是「载荷来自另一栏」而不是「有载荷」:同栏内
+    // 拖不成立(`drag::drop_target`),给它描边等于承诺一个不会发生的动作。
+    let incoming = egui::DragAndDrop::payload::<crate::files::drag::DragFrom>(ui.ctx())
+        .filter(|f| f.0 != column)
+        .is_some();
+    if incoming && bg.contains_pointer() {
+        ui.painter().rect_stroke(
+            ui.max_rect(),
+            egui::Rounding::same(4.0),
+            egui::Stroke::new(2.0, theme::c32(t.accent)),
+        );
+    }
+    // F52:资源管理器里正拖着文件悬在窗口上。整栏描边 + **明写落点**。
+    //
+    // 落点不看指针在哪:winit 0.30 的 `HoveredFile`/`DroppedFile` 不带坐标,
+    // Windows 在 OLE 拖放期间也不发 `CursorMoved`,「指针压在哪一栏/哪一行」
+    // 这一帧根本判不出来。于是规则定死为「扔在窗口哪儿都上传到远端当前
+    // 目录」。规则反直觉,就必须在用户**松手之前**写在屏幕上(设计 D9:
+    // 规则先于动作可见),而不是松手之后用一条 toast 告诉他传到别处去了。
+    if drop_in > 0 {
+        ui.painter().rect_stroke(
+            ui.max_rect(),
+            egui::Rounding::same(4.0),
+            egui::Stroke::new(2.0, theme::c32(t.accent)),
+        );
+        ui.colored_label(
+            theme::c32(t.accent),
+            crate::files::drag::drop_in_hint(&state.cwd, drop_in),
+        );
+    }
     // 就地收口,不留到函数末尾 —— 下面 `Load` 不是 `Ready` 时会提前 return,
     // 挂在末尾的话「正在读取目录…」时右键点刷新没反应。
     if let Some(item) = menu_hit.take() {
@@ -341,13 +383,48 @@ pub fn show(
     let mut clicked: Option<Click> = None;
     let mut goto = None;
     let mut edit = false;
+    // F58:起拖的那一条如果还没选中,要先让它成为唯一选中项(同右键那条约定)。
+    // 借用规则同 `clicked` —— 闭包里改不了 `state`,出了闭包再落。
+    let mut drag_start: Option<mullion_ssh::sftp::RemotePath> = None;
+    let mut landing: Option<crate::files::drag::Landing> = None;
     egui::ScrollArea::vertical()
         .id_salt(scroll_id_salt(id, generation))
+        // F58:**必须关掉**。`drag_to_scroll` 默认开着,它在视口上注册一个
+        // 吃 drag 的部件,把按在行上的那一下抢去当滚动手势 —— 行的
+        // `drag_started()` 永远为假,拖拽整个功能安静地不存在。桌面端本来
+        // 也没人用鼠标拖内容滚动(滚轮 + 滚动条都在),关掉不损失什么。
+        .drag_to_scroll(false)
         .auto_shrink([false, false])
         .show_rows(ui, ROW_H, rows.len(), |ui, range| {
             for ix in range {
                 let e = rows[ix];
                 let resp = row(ui, t, e, show_owner, selected.contains(&e.name));
+                // F58:行既是拖源也是落点。
+                if resp.drag_started() {
+                    // 拖一条**没选中**的行:先让它成为唯一选中项。不这么做的话
+                    // 用户拖的是这一条、传走的却是别处那批选中项 —— 与右键菜单
+                    // 那条已知陷阱同源(见上面 `secondary_clicked` 的说明)。
+                    if !selected.contains(&e.name) {
+                        drag_start = Some(e.name.clone());
+                    }
+                    resp.dnd_set_drag_payload(crate::files::drag::DragFrom(column));
+                }
+                if incoming && resp.contains_pointer() && e.kind == EntryKind::Dir {
+                    // 悬停在目录行上:高亮这一行,预告「松手会传进这个目录」。
+                    ui.painter().rect_stroke(
+                        resp.rect,
+                        egui::Rounding::same(2.0),
+                        egui::Stroke::new(1.0, theme::c32(t.accent)),
+                    );
+                }
+                if let Some(from) = resp.dnd_release_payload::<crate::files::drag::DragFrom>() {
+                    // 目录行 → 传进那个子目录;文件行 → 落到当前目录(不解释成
+                    // 「覆盖那个文件」,理由见 `drag::drop_target`)。名字送不上线
+                    // 的目录当没这一行 —— 拼出来的路径请求发不出去。
+                    let over = (e.kind == EntryKind::Dir && e.name.is_operable())
+                        .then(|| e.name.as_bytes().to_vec());
+                    landing = crate::files::drag::drop_target(from.0, column, over);
+                }
                 if resp.clicked() {
                     // `command` 而不是 `ctrl`:egui 已经把 macOS 的 ⌘ 归一化
                     // 到这一位上,写 `ctrl` 会让 macOS 用户点不出多选。
@@ -383,8 +460,22 @@ pub fn show(
                 }
             }
         });
+    // F58:落在空白处(行与行之间、列头下方的空白)。**必须排在行之后** ——
+    // `dnd_release_payload` 会把载荷取走,背景先问的话落在目录行上的那一下
+    // 会被背景吃掉,「传进子目录」永远走不到。
+    if landing.is_none() {
+        if let Some(from) = bg.dnd_release_payload::<crate::files::drag::DragFrom>() {
+            landing = crate::files::drag::drop_target(from.0, column, None);
+        }
+    }
+    if let Some(name) = drag_start {
+        state.select_only(&name);
+    }
     if let Some((name, ctrl, shift)) = clicked {
         state.click_row(&name, ctrl, shift);
+    }
+    if let Some(l) = landing {
+        action = Some(FileAction::Drop(l));
     }
     if let Some(g) = goto {
         action = Some(FileAction::Goto(g));
@@ -442,9 +533,12 @@ fn row(
     show_owner: bool,
     selected: bool,
 ) -> egui::Response {
+    // `click_and_drag` 而不是 `click`(F58):行要能起拖。`clicked()` /
+    // `double_clicked()` 在这个 Sense 下照旧 —— egui 只有在指针真的移出
+    // 拖拽阈值之后才把这一下判成拖,原地按松仍然是点击。
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_H),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     if selected {
         ui.painter().rect_filled(rect, 2.0, theme::c32(t.sunken_bg));
@@ -512,24 +606,9 @@ fn row(
     resp
 }
 
-/// 面板内当前哪一栏拥有键盘焦点(F6/Tab 换焦点,设计 D23)。远端为默认——
-/// 打开一个 SFTP 标签,用户第一件事多半是看远端目录。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PanelColumn {
-    #[default]
-    Remote,
-    Local,
-}
-
-impl PanelColumn {
-    /// `Tab` 在两栏之间来回。
-    pub fn flipped(self) -> Self {
-        match self {
-            PanelColumn::Remote => PanelColumn::Local,
-            PanelColumn::Local => PanelColumn::Remote,
-        }
-    }
-}
+/// 两栏之一。定义搬去了 `crate::files`(纯逻辑层,`drag.rs` 的落点判据要
+/// 拿它当参数),这里重导出让老的引用路径继续可用。
+pub use crate::files::PanelColumn;
 
 /// 一帧要画的两栏 + 列选项(F50)。
 pub struct PanelFrame {
@@ -627,6 +706,9 @@ const DEFAULT_SIDEBAR_W: f32 = 360.0;
 /// `panel_focused`:F6(设计 D23)——键盘焦点此刻是不是在这个面板上(不区分
 /// 远端/本地,那是 `frame.active_column` 的事)。传下去给 `show()` 各自跟
 /// `active_column` 相与,决定画不画焦点边框。
+///
+/// `drop_in`:F52 —— 此刻从资源管理器拖着几个文件悬在窗口上,只转给远端栏
+/// (理由见 `show` 的同名参数)。
 pub fn sidebar(
     ctx: &egui::Context,
     t: &Theme,
@@ -634,6 +716,7 @@ pub fn sidebar(
     generation: u64,
     panel_focused: bool,
     frame: &mut PanelFrame,
+    drop_in: usize,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     let default_w = if ui_state.files_sidebar_w > 0.0 {
@@ -664,6 +747,7 @@ pub fn sidebar(
                     frame.show_owner,
                     panel_focused && frame.active_column == PanelColumn::Remote,
                     &frame.bookmarks,
+                    drop_in,
                 );
             });
             ui.separator();
@@ -677,6 +761,7 @@ pub fn sidebar(
                 false,
                 panel_focused && frame.active_column == PanelColumn::Local,
                 &[],
+                0,
             );
         });
     // 把这一帧的实际宽度读回来。**注意它只是个镜像,驱动不了任何东西**:
@@ -713,12 +798,15 @@ pub fn sidebar(
 /// 的第三条规则理论上恒为 `true`(活动标签是 Files → 焦点恒在面板上),但
 /// 判据只留在 `effective_focus_of` 一处——这里原样转发调用方算好的值,不在
 /// `files_panel.rs` 里重新假设一遍。
+///
+/// `drop_in`:同 `sidebar` 的同名参数。
 pub fn content(
     ctx: &egui::Context,
     t: &Theme,
     generation: u64,
     panel_focused: bool,
     frame: &mut PanelFrame,
+    drop_in: usize,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     egui::CentralPanel::default()
@@ -729,37 +817,46 @@ pub fn content(
         )
         .show(ctx, |ui| {
             annotate::mark(ui.ctx(), "文件标签", ui.max_rect());
-            let half = ui.available_width() * 0.5;
-            ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(half, ui.available_height()), |ui| {
-                    out.0 = show(
-                        ui,
-                        t,
-                        "远端",
-                        generation,
-                        PanelColumn::Remote,
-                        &mut frame.remote,
-                        frame.show_owner,
-                        panel_focused && frame.active_column == PanelColumn::Remote,
-                        &frame.bookmarks,
-                    );
-                });
-                ui.separator();
-                ui.allocate_ui(
-                    egui::vec2(ui.available_width(), ui.available_height()),
-                    |ui| {
-                        out.1 = show(
-                            ui,
-                            t,
-                            "本地",
-                            generation,
-                            PanelColumn::Local,
-                            &mut frame.local,
-                            false,
-                            panel_focused && frame.active_column == PanelColumn::Local,
-                            &[],
-                        );
-                    },
+            // **两栏的矩形自己切,不走 `ui.horizontal` + `allocate_ui`**:
+            // 在 `horizontal` 布局里 `ui.available_height()` 给的是**当前这一行**
+            // 的高度(这里是 18pt),不是整块内容区。照它分配的话两栏各只有一行
+            // 高,`ScrollArea` 视口被压扁、行的交互 rect 宽度塌成 0 ——
+            // 画面上文字照旧(`painter` 直接按坐标画),但整个标签宿主里
+            // **一行都点不中**。这是 D4a 做拖拽时才暴露出来的既存 bug。
+            let full = ui.max_rect();
+            let gap = 8.0;
+            let half = ((full.width() - gap) * 0.5).max(0.0);
+            let left = egui::Rect::from_min_size(full.min, egui::vec2(half, full.height()));
+            let right =
+                egui::Rect::from_min_max(egui::pos2(full.max.x - half, full.min.y), full.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
+                out.0 = show(
+                    ui,
+                    t,
+                    "远端",
+                    generation,
+                    PanelColumn::Remote,
+                    &mut frame.remote,
+                    frame.show_owner,
+                    panel_focused && frame.active_column == PanelColumn::Remote,
+                    &frame.bookmarks,
+                    drop_in,
+                );
+            });
+            ui.painter()
+                .vline(full.center().x, full.y_range(), theme::stroke(t));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
+                out.1 = show(
+                    ui,
+                    t,
+                    "本地",
+                    generation,
+                    PanelColumn::Local,
+                    &mut frame.local,
+                    false,
+                    panel_focused && frame.active_column == PanelColumn::Local,
+                    &[],
+                    0,
                 );
             });
         });
@@ -904,6 +1001,7 @@ mod tests {
                         false,
                         false,
                         &[],
+                        0,
                     );
                 });
             });
@@ -989,7 +1087,7 @@ mod tests {
         for _ in 0..2 {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame);
+                content(ctx, &t, 1, false, &mut frame, 0);
             });
             for shape in out.shapes.iter() {
                 if let egui::epaint::Shape::Text(ts) = &shape.shape {
@@ -1066,6 +1164,7 @@ mod tests {
                             false,
                             focused,
                             &[],
+                            0,
                         );
                     });
                 });
@@ -1178,6 +1277,7 @@ mod tests {
                     false,
                     false,
                     &bookmarks,
+                    0,
                 );
             });
         });
@@ -1193,6 +1293,7 @@ mod tests {
                     false,
                     false,
                     &bookmarks,
+                    0,
                 );
             });
         });
@@ -1224,6 +1325,7 @@ mod tests {
                     false,
                     false,
                     &bookmarks,
+                    0,
                 );
             });
         });
@@ -1263,6 +1365,7 @@ mod tests {
                         false,
                         false,
                         &bookmarks,
+                        0,
                     );
                 });
             });
@@ -1302,7 +1405,7 @@ mod tests {
         for _ in 0..2 {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame);
+                content(ctx, &t, 1, false, &mut frame, 0);
             });
             for shape in out.shapes.iter() {
                 if let egui::epaint::Shape::Text(ts) = &shape.shape {
@@ -1359,6 +1462,241 @@ mod tests {
             .any(|e| e.item == MenuItem::Ask(FileAsk::NewDir)));
     }
 
+    /// 摆一份「远端有个 logs 目录 + 一个 b.txt,本地有个 a.txt」的两栏。
+    fn two_columns() -> PanelFrame {
+        let mut frame = PanelFrame::default();
+        frame.remote.cwd = RemotePath::from_bytes(b"/srv".to_vec());
+        frame.remote.entries = vec![
+            entry(b"logs", EntryKind::Dir),
+            entry(b"b.txt", EntryKind::File),
+        ];
+        frame.remote.load = Load::Ready;
+        frame.local.entries = vec![entry(b"a.txt", EntryKind::File)];
+        frame.local.load = Load::Ready;
+        frame
+    }
+
+    /// 拖拽测试统一用一块 1200x800 的「窗口」。**必须显式给 `screen_rect`**:
+    /// `RawInput::default()` 不给的话 egui 退回到一块上万像素的默认区域,
+    /// 两栏各占五千多,`find_text_pos` 算出来的坐标落在那块区域之外,指针
+    /// 命中不了任何一行 —— 拖拽测试会安静地什么都测不到。
+    fn raw(time: Option<f64>) -> egui::RawInput {
+        egui::RawInput {
+            time,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn press(pos: egui::Pos2, time: f64, pressed: bool) -> egui::RawInput {
+        let mut input = raw(Some(time));
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        input
+    }
+
+    fn moved(pos: egui::Pos2, time: f64) -> egui::RawInput {
+        let mut input = raw(Some(time));
+        input.events.push(egui::Event::PointerMoved(pos));
+        input
+    }
+
+    /// F58:栏间拖拽。**这是拖拽唯一的无头守护** —— `drag.rs` 那几条纯函数
+    /// 可以全绿而 payload 根本没挂上去 / 落点根本没读回来。
+    #[test]
+    fn dragging_from_the_local_column_onto_a_remote_directory_row_drops_into_that_directory() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        frame
+            .local
+            .selected
+            .insert(RemotePath::from_bytes(b"a.txt".to_vec()));
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            let mut acts = (None, None);
+            let out = ctx.run(input, |ctx| {
+                acts = content(ctx, &t, 1, true, frame, 0);
+            });
+            (acts, out)
+        };
+        // 两帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop)。
+        let _ = render(raw(None), &mut frame);
+        let (_, out) = render(raw(None), &mut frame);
+        let src = find_text_pos(&out.shapes, "a.txt").expect("本地栏该画出 a.txt");
+        let dst = find_text_pos(&out.shapes, "logs").expect("远端栏该画出 logs");
+
+        // 按下 →(移开超过点击阈值,egui 才判成拖)→ 在目标行松手。
+        let _ = render(press(src, 1.0, true), &mut frame);
+        let _ = render(moved(dst, 1.1), &mut frame);
+        let (acts, _) = render(press(dst, 1.2, false), &mut frame);
+
+        assert_eq!(
+            acts.0,
+            Some(FileAction::Drop(crate::files::drag::Landing::Sub(
+                b"logs".to_vec()
+            ))),
+            "落在远端的 logs 目录行上,该发出「传进 logs」"
+        );
+        assert_eq!(acts.1, None, "本地栏不该同时也收到一份");
+    }
+
+    /// 落在行与行之间的空白上 → 传到当前目录,而不是「什么也没发生」。
+    #[test]
+    fn dropping_on_the_blank_part_of_a_column_targets_its_current_directory() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        frame
+            .local
+            .selected
+            .insert(RemotePath::from_bytes(b"a.txt".to_vec()));
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            let mut acts = (None, None);
+            let out = ctx.run(input, |ctx| {
+                acts = content(ctx, &t, 1, true, frame, 0);
+            });
+            (acts, out)
+        };
+        let _ = render(raw(None), &mut frame);
+        let (_, out) = render(raw(None), &mut frame);
+        let src = find_text_pos(&out.shapes, "a.txt").expect("本地栏该画出 a.txt");
+        let logs = find_text_pos(&out.shapes, "logs").expect("远端栏该画出 logs");
+        // 远端栏里、所有行下面很远的空白处。
+        let blank = egui::pos2(logs.x, logs.y + 400.0);
+
+        let _ = render(press(src, 1.0, true), &mut frame);
+        let _ = render(moved(blank, 1.1), &mut frame);
+        let (acts, _) = render(press(blank, 1.2, false), &mut frame);
+
+        assert_eq!(
+            acts.0,
+            Some(FileAction::Drop(crate::files::drag::Landing::Cwd)),
+            "落在空白处该传到远端栏当前目录"
+        );
+    }
+
+    /// 拖一条**没选中**的行:先让它成为唯一选中项。不这么做的话用户拖的是
+    /// 这一条、传走的却是别处那批选中项 —— 与右键菜单那条陷阱同源。
+    #[test]
+    fn dragging_an_unselected_row_makes_it_the_only_selection_so_it_is_what_gets_transferred() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        // 远端栏里选中的是 b.txt,而用户去拖 logs。
+        frame.remote.entries.push(entry(b"c.txt", EntryKind::File));
+        frame
+            .remote
+            .selected
+            .insert(RemotePath::from_bytes(b"b.txt".to_vec()));
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            let mut acts = (None, None);
+            let out = ctx.run(input, |ctx| {
+                acts = content(ctx, &t, 1, true, frame, 0);
+            });
+            (acts, out)
+        };
+        let _ = render(raw(None), &mut frame);
+        let (_, out) = render(raw(None), &mut frame);
+        let src = find_text_pos(&out.shapes, "c.txt").expect("远端栏该画出 c.txt");
+        let dst = find_text_pos(&out.shapes, "a.txt").expect("本地栏该画出 a.txt");
+
+        let _ = render(press(src, 1.0, true), &mut frame);
+        let _ = render(moved(dst, 1.1), &mut frame);
+        let _ = render(press(dst, 1.2, false), &mut frame);
+
+        let only: Vec<String> = frame
+            .remote
+            .selected
+            .iter()
+            .map(|p| p.display().into_owned())
+            .collect();
+        assert_eq!(
+            only,
+            vec!["c.txt".to_string()],
+            "拖了 c.txt,选中集却还是别的 —— 传走的会是用户没拖的那条"
+        );
+    }
+
+    /// 同一栏内部拖 = 移动/改名,本切片不做。放过去的话「把远端文件上传到
+    /// 它自己」会先截断再读,文件直接清零。
+    #[test]
+    fn dragging_inside_one_column_dispatches_nothing() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        frame
+            .remote
+            .selected
+            .insert(RemotePath::from_bytes(b"b.txt".to_vec()));
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            let mut acts = (None, None);
+            let out = ctx.run(input, |ctx| {
+                acts = content(ctx, &t, 1, true, frame, 0);
+            });
+            (acts, out)
+        };
+        let _ = render(raw(None), &mut frame);
+        let (_, out) = render(raw(None), &mut frame);
+        let src = find_text_pos(&out.shapes, "b.txt").expect("远端栏该画出 b.txt");
+        let dst = find_text_pos(&out.shapes, "logs").expect("远端栏该画出 logs");
+
+        let _ = render(press(src, 1.0, true), &mut frame);
+        let _ = render(moved(dst, 1.1), &mut frame);
+        // 先自证「这一拖真的发生了」—— 少了这句,哪天拖拽整个不工作了,
+        // 下面那两条 `None` 照样全绿。
+        assert!(
+            egui::DragAndDrop::has_any_payload(&ctx),
+            "拖都没拖起来,下面的断言就什么也证明不了"
+        );
+        let (acts, _) = render(press(dst, 1.2, false), &mut frame);
+
+        assert_eq!(acts.0, None, "同栏内拖不该发出任何传输");
+        assert_eq!(acts.1, None);
+    }
+
+    /// 标签宿主里两栏各占**整块**高度。曾经用 `ui.horizontal` +
+    /// `allocate_ui(vec2(half, ui.available_height()))` 分配 —— 在 horizontal
+    /// 布局里那个高度是「当前这一行」的 18pt,于是两栏被压成一行高,
+    /// `ScrollArea` 视口塌了、行的交互 rect 宽度变成 0:文字照画(painter
+    /// 按坐标画,不看 rect),但**一行都点不中**。D4a 做拖拽时才暴露出来。
+    #[test]
+    fn a_row_in_the_tab_host_can_actually_be_clicked() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            let mut acts = (None, None);
+            let out = ctx.run(input, |ctx| {
+                acts = content(ctx, &t, 1, true, frame, 0);
+            });
+            (acts, out)
+        };
+        let _ = render(raw(None), &mut frame);
+        let (_, out) = render(raw(None), &mut frame);
+        let pos = find_text_pos(&out.shapes, "b.txt").expect("远端栏该画出 b.txt");
+
+        let _ = render(press(pos, 1.0, true), &mut frame);
+        let _ = render(press(pos, 1.05, false), &mut frame);
+
+        assert_eq!(
+            frame
+                .remote
+                .cursor
+                .as_ref()
+                .map(|p| p.display().into_owned()),
+            Some("b.txt".to_string()),
+            "在标签宿主里点一行,光标该落到那一行 —— 落不上说明行根本没被点中"
+        );
+    }
+
     /// 右键菜单要真的挂上去、真的能发出动作 —— `menu_items_for` 全对但
     /// 渲染里没接线,上面两条纯函数测试照样全绿。
     #[test]
@@ -1382,6 +1720,7 @@ mod tests {
                         false,
                         false,
                         &[],
+                        0,
                     );
                 });
             });
@@ -1538,6 +1877,7 @@ mod tests {
                         false,
                         false,
                         &[],
+                        0,
                     );
                 });
             });
@@ -1606,6 +1946,7 @@ mod tests {
                             false,
                             false,
                             &[],
+                            0,
                         );
                     });
                 });

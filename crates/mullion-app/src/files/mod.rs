@@ -5,10 +5,36 @@
 
 use mullion_ssh::sftp::{Entry, EntryKind};
 
+pub mod drag;
 pub mod local;
 pub mod queue;
 pub mod state;
 pub mod transfer;
+
+/// 面板里的两栏之一(F50)。**判据类型,不是显示用的标签** —— 「哪些操作
+/// 可用」(D5:写操作只在远端栏)、「拖过来是上传还是下载」(F58)都按它分流。
+///
+/// 住在 `files` 而不是 `ui::files_panel`:`files` 是纯逻辑层,`ui` 依赖它、
+/// 反过来不成立(同 `state.rs`/`queue.rs`)。`drag.rs` 的落点判据要拿它当
+/// 参数,定义留在 ui 里的话,纯逻辑层就得反向依赖渲染层。
+/// `ui::files_panel` 里有一条 `pub use` 重导出,老的引用路径照样能用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PanelColumn {
+    /// 远端为默认——打开一个 SFTP 标签,用户第一件事多半是看远端目录。
+    #[default]
+    Remote,
+    Local,
+}
+
+impl PanelColumn {
+    /// `Tab` 在两栏之间来回(设计 D23:F6/Tab 换焦点)。
+    pub fn flipped(self) -> Self {
+        match self {
+            PanelColumn::Remote => PanelColumn::Local,
+            PanelColumn::Local => PanelColumn::Remote,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {

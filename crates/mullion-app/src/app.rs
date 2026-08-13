@@ -1358,6 +1358,16 @@ impl App {
             self.start_transfer(generation, crate::files::queue::Direction::Upload);
             return;
         }
+        // F58:**远端栏**的东西拖到本地栏松手了 = 下载。方向由收到动作的栏
+        // 决定,跟上面 `Transfer` 那条正好相反(那是「把本地的送出去」)。
+        if let FileAction::Drop(landing) = &action {
+            self.start_transfer_into(
+                generation,
+                crate::files::drag::direction_for_drop(crate::files::PanelColumn::Local),
+                landing.clone().sub(),
+            );
+            return;
+        }
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
@@ -1378,7 +1388,7 @@ impl App {
                 return;
             }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
-            FileAction::Transfer => return,
+            FileAction::Transfer | FileAction::Drop(_) => return,
             // D5:本地文件在资源管理器里双击就行,`menu_items_for` 也不给
             // 这两项。到这儿同样说明菜单构造被改坏了。
             FileAction::EditExternal | FileAction::EditInline => {
@@ -1432,6 +1442,15 @@ impl App {
                 self.start_transfer(generation, crate::files::queue::Direction::Download);
                 return;
             }
+            // F58:**本地栏**的东西拖到远端栏松手了 = 上传。跟上面那条相反。
+            FileAction::Drop(landing) => {
+                self.start_transfer_into(
+                    generation,
+                    crate::files::drag::direction_for_drop(crate::files::PanelColumn::Remote),
+                    landing.clone().sub(),
+                );
+                return;
+            }
             // F53:编辑。同上,`start_edit` 要 `&mut self`。
             FileAction::EditExternal => {
                 self.start_edit(generation, crate::edit::sessions::EditKind::External);
@@ -1472,6 +1491,7 @@ impl App {
             FileAction::Ask(_)
             | FileAction::OpenInExplorer
             | FileAction::Transfer
+            | FileAction::Drop(_)
             | FileAction::EditExternal
             | FileAction::EditInline => return,
         };
@@ -1721,6 +1741,20 @@ impl App {
     /// 卡住。展开结果经 `UserEvent::TransferPlanned` 回来一次性入队 ——
     /// 边展开边入队的话,队列会在用户眼前长上半天。
     fn start_transfer(&mut self, generation: u64, dir: crate::files::queue::Direction) {
+        self.start_transfer_into(generation, dir, None);
+    }
+
+    /// F58:同 [`Self::start_transfer`],但目标目录可以是目标栏当前目录下的
+    /// **子目录** —— 拖拽落在目录行上时用。
+    ///
+    /// `into` 只改**目标**那一侧的目录,源那一侧仍是发起栏的 cwd:拖的是
+    /// 源栏选中的那几条,它们的位置不因为落点在哪而改变。
+    fn start_transfer_into(
+        &mut self,
+        generation: u64,
+        dir: crate::files::queue::Direction,
+        into: Option<Vec<u8>>,
+    ) {
         use crate::files::queue::Direction;
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
@@ -1747,8 +1781,19 @@ impl App {
         if picked.is_empty() {
             return;
         }
-        let remote_cwd = files.remote.cwd.clone();
-        let local_cwd = files.local.cwd.clone();
+        let mut remote_cwd = files.remote.cwd.clone();
+        let mut local_cwd = files.local.cwd.clone();
+        // F58:落在目录行上 —— 目标那一侧换成那个子目录。**用各自的 join**:
+        // 远端恒用 `/`(SFTP 线上的规矩),本地用平台分隔符,两套路径语义
+        // 不通用(同 `Up` 那条已知区分)。
+        if let Some(name) = into {
+            match dir {
+                Direction::Download => {
+                    local_cwd = crate::files::local::join_local(&local_cwd, &name)
+                }
+                Direction::Upload => remote_cwd = remote_cwd.join(&name),
+            }
+        }
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
@@ -1761,6 +1806,63 @@ impl App {
             let _ = proxy.send_event(UserEvent::TransferPlanned { generation, result });
         });
         self.track_sftp_task(generation, task);
+    }
+
+    /// F52:把从资源管理器扔进窗口的一批绝对路径上传到**远端栏当前目录**。
+    ///
+    /// 落点恒为远端 cwd,不看指针在哪 —— 理由见 `files_panel::show` 里
+    /// `drop_in` 那段(winit 的拖放事件不带坐标),界面已在松手前把这条规则
+    /// 写在栏顶上了。
+    ///
+    /// 一批路径可能横跨多个父目录,而既有的 `plan_transfer` 收的是「相对某
+    /// 一个本地目录的名字」。按父目录分组后逐组发一次 —— **上传那条通路
+    /// 一个字不用改**(改它等于同时动右键上传那条已经验过的路)。
+    fn start_drop_in(&mut self, generation: u64, paths: Vec<std::path::PathBuf>) {
+        use crate::files::queue::Direction;
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let remote_cwd = tab.content.files_panel().remote.cwd.clone();
+        let Some(client) = tab.content.sftp_client() else {
+            self.ui
+                .set_error("SFTP 通道还没建立,请先等目录加载完".into());
+            self.ui_dirty = true;
+            return;
+        };
+        for (parent, names) in crate::files::drag::group_by_parent(&paths) {
+            // 目录/大小当场 stat:后台展开要靠 `is_dir` 决定递不递归,而这一
+            // 批是**本地**路径,`metadata` 就在手边。stat 不到的(拖过来那一
+            // 瞬间被删/权限不足)直接跳过,不塞一条必然失败的 job 进队列。
+            let picked: Vec<(mullion_ssh::sftp::RemotePath, bool, u64)> = names
+                .into_iter()
+                .filter_map(|name| {
+                    let p = parent.join(crate::files::local::to_path(
+                        &mullion_ssh::sftp::RemotePath::from_bytes(name.clone()),
+                    ));
+                    let md = std::fs::metadata(&p).ok()?;
+                    Some((
+                        mullion_ssh::sftp::RemotePath::from_bytes(name),
+                        md.is_dir(),
+                        md.len(),
+                    ))
+                })
+                .collect();
+            if picked.is_empty() {
+                continue;
+            }
+            let local_cwd =
+                mullion_ssh::sftp::RemotePath::from_bytes(crate::files::local::path_bytes(&parent));
+            let client = client.clone();
+            let remote_cwd = remote_cwd.clone();
+            let proxy = self.proxy.clone();
+            let task = self._runtime.spawn(async move {
+                let result =
+                    plan_transfer(&client, Direction::Upload, &picked, &remote_cwd, &local_cwd)
+                        .await;
+                let _ = proxy.send_event(UserEvent::TransferPlanned { generation, result });
+            });
+            self.track_sftp_task(generation, task);
+        }
     }
 
     /// F53:开始编辑光标行那个远端文件。
@@ -4346,7 +4448,7 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 (taken_files.as_mut(), None)
                             };
-                            let (repaint_delay, actions) = render_frame(
+                            let (repaint_delay, mut actions) = render_frame(
                                 a,
                                 &renders,
                                 &mut self.ui,
@@ -4431,6 +4533,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                                 if let Some(action) = actions.files_remote {
                                     self.apply_remote_file_action(gen, action);
+                                }
+                                // F52:从资源管理器扔进来的一批。同一条
+                                // `files_owner_generation` 路由(S1)。
+                                if !actions.files_drop_in.is_empty() {
+                                    self.start_drop_in(
+                                        gen,
+                                        std::mem::take(&mut actions.files_drop_in),
+                                    );
                                 }
                                 // D2:对话框里确认了的写操作。按同一条
                                 // `files_owner_generation` 判据路由(S1),不
@@ -5249,6 +5359,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.annotate_export.is_some()
         || a.files_remote.is_some()
         || a.files_local.is_some()
+        || !a.files_drop_in.is_empty()
         || a.files_op.is_some()
         || a.transfer.is_some()
         || a.edit.is_some()
@@ -6334,6 +6445,22 @@ mod tests {
             "files_remote 单独一个真实动作时必须被 has_real_action 认成\
              「有真实动作」,否则 egui 的 discard 趟会把它静默吃掉(见\
              render_frame 内部长注释)"
+        );
+    }
+
+    /// F52:同上,`files_drop_in` 那一条。**新加字段必须各配一条** ——
+    /// 上面那条守的是 `files_remote`,对新字段一点保护也没有;而漏掉的
+    /// 后果同样是「拖进来一批文件,程序毫无反应」。
+    #[test]
+    fn a_drop_in_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let a = crate::ui::UiActions {
+            files_drop_in: vec![std::path::PathBuf::from("/tmp/a.txt")],
+            ..Default::default()
+        };
+        assert!(
+            has_real_action(&a),
+            "files_drop_in 单独一个真实动作时必须被 has_real_action 认成\
+             「有真实动作」,否则拖进来的文件会在 discard 趟被静默丢掉"
         );
     }
 

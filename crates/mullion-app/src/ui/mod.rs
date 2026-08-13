@@ -396,6 +396,12 @@ pub struct UiActions {
     /// egui 的 discard 趟被静默吃掉,而且默认没有任何测试会变红。
     pub files_remote: Option<files_panel::FileAction>,
     pub files_local: Option<files_panel::FileAction>,
+    /// F52:这一帧从资源管理器**松手**扔进窗口的绝对路径。空 = 没扔。
+    ///
+    /// 不是 `Option<..>` 而是 `Vec`:一次拖放天然是一批,空 `Vec` 就是
+    /// 「没有动作」,不需要再套一层 `Option`。同样受上面那条约束 ——
+    /// `app.rs::has_real_action` 里有对应的一条。
+    pub files_drop_in: Vec<std::path::PathBuf>,
 }
 
 /// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
@@ -439,6 +445,26 @@ pub fn build_ui(
     editor: &mut Option<editor_window::EditorState>,
 ) -> UiActions {
     let mut actions = UiActions::default();
+    // F52:从资源管理器拖进来的文件。`hovered_files` = 还悬着(要预告落点),
+    // `dropped_files` = 松手了(要真传)。两者都只在**文件面板开着**时才算数:
+    // 纯终端标签接不下一批文件,收下它只会变成一次悄无声息的上传。
+    let files_open = files.is_some() || files_content.is_some();
+    let (hovering, dropped) = ctx.input(|i| {
+        (
+            i.raw.hovered_files.len(),
+            i.raw
+                .dropped_files
+                .iter()
+                // 没有 `path` 的是浏览器/剪贴板那种只给字节的来源,拼不出
+                // 本地源路径,收进来就是一条必然失败的 job。
+                .filter_map(|f| f.path.clone())
+                .collect::<Vec<std::path::PathBuf>>(),
+        )
+    });
+    let hovering = if files_open { hovering } else { 0 };
+    if files_open {
+        actions.files_drop_in = dropped;
+    }
     // 主机密钥确认最先画:它是安全关口,任何时候都该盖在最上层(F3)。
     if let Some(view) = &frame.host_key {
         host_key::show(ctx, view, &mut ui_state.host_key_reply);
@@ -473,6 +499,7 @@ pub fn build_ui(
             files_generation,
             frame.files_focused,
             files,
+            hovering,
         );
         actions.files_remote = r;
         actions.files_local = l;
@@ -560,7 +587,14 @@ pub fn build_ui(
     // 决定了它必须是本帧**最后一个** panel 类部件(见 `files_panel::content`
     // 文档),所以放在这里:菜单栏/标签栏/状态栏/各弹窗都已经 show 完。
     if let Some(files) = files_content {
-        let (r, l) = files_panel::content(ctx, t, files_generation, frame.files_focused, files);
+        let (r, l) = files_panel::content(
+            ctx,
+            t,
+            files_generation,
+            frame.files_focused,
+            files,
+            hovering,
+        );
         actions.files_remote = r;
         actions.files_local = l;
     }
@@ -903,6 +937,91 @@ mod tests {
         }
         let text = collect_text(&out.expect("上面刚跑过两帧"));
         assert!(text.contains("传输"), "传输面板没被画出来:{text}");
+    }
+
+    /// F52:一帧带 `dropped_files` 的输入,必须变成 `files_drop_in`。
+    ///
+    /// 这一条守的是**接线**——`files/drag.rs` 的分组逻辑自己有单测,但
+    /// 「`build_ui` 到底有没有去 `ctx.input` 里读这批路径」只有跑一帧
+    /// `build_ui` 才证得了。删掉 `build_ui` 里那句 `actions.files_drop_in =
+    /// dropped`,这条会红。
+    #[test]
+    fn files_dropped_from_the_explorer_become_a_drop_in_action() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut files = files_panel::PanelFrame::default();
+        let input = egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(std::path::PathBuf::from("/tmp/报告.pdf")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (_, actions) =
+            run_frame_content(&ctx, &mut ui_state, base_frame(), input, Some(&mut files));
+        assert_eq!(
+            actions.files_drop_in,
+            vec![std::path::PathBuf::from("/tmp/报告.pdf")],
+        );
+    }
+
+    /// F52:面板没开着的时候拖进来**什么也不发生**。
+    ///
+    /// 纯终端标签接不下一批文件:收下它就是一次用户看不见落点、也没有面板
+    /// 能显示进度的上传。
+    #[test]
+    fn dropping_files_with_no_panel_open_dispatches_nothing() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let input = egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(std::path::PathBuf::from("/tmp/报告.pdf")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (_, actions) = run_frame_content(&ctx, &mut ui_state, base_frame(), input, None);
+        assert!(
+            actions.files_drop_in.is_empty(),
+            "面板关着还收下拖入 = 一次没人看得见的上传"
+        );
+    }
+
+    /// F52 / 设计 D9(规则先于动作可见):**悬停期间**就要把落点写在屏幕上。
+    ///
+    /// winit 的拖放事件不带坐标,落点恒为远端 cwd —— 这条规则反直觉,松手
+    /// 之后再说就晚了(东西已经传出去了)。删掉 `files_panel::show` 里那句
+    /// `colored_label(... drop_in_hint ...)`,这条会红。
+    #[test]
+    fn hovering_files_over_the_window_announces_the_target_directory_before_release() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut files = files_panel::PanelFrame::default();
+        files.remote.cwd = mullion_ssh::sftp::RemotePath::from_bytes(b"/srv/www".to_vec());
+        let hovering = || egui::RawInput {
+            hovered_files: vec![egui::HoveredFile::default(), egui::HoveredFile::default()],
+            ..Default::default()
+        };
+        // 两帧:`CentralPanel` 首帧 `fade_in` 只记 `Shape::Noop`。
+        let _ = run_frame_content(
+            &ctx,
+            &mut ui_state,
+            base_frame(),
+            hovering(),
+            Some(&mut files),
+        );
+        let (out, _) = run_frame_content(
+            &ctx,
+            &mut ui_state,
+            base_frame(),
+            hovering(),
+            Some(&mut files),
+        );
+        let text = collect_text(&out);
+        assert!(
+            text.contains("松开上传 2 项到 /srv/www"),
+            "悬停时没把落点写出来,用户只能松手之后才知道传到哪:{text}"
+        );
     }
 
     fn title_view(host: &str) -> crate::ui::pane_title::TitleView<'_> {
