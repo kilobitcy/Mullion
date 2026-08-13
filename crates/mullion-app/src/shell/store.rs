@@ -16,6 +16,16 @@ pub fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "mullion").map(|d| d.config_dir().to_path_buf())
 }
 
+/// F71:`<dir>/secrets.enc` 要不要主密码。
+///
+/// app 启动时**先问这个**再决定打不打开会话库(设计 D10):`mullion-store`
+/// 零 UI,永远不会主动索要密码。探测失败(文件头读不懂)时**报错而不是
+/// 当成「不用密码」**——那会拿钥匙串密钥去解一个主密码文件,报出来的是
+/// 「密文损坏」,把真正的原因盖掉。
+pub fn probe_needs_password(dir: &std::path::Path) -> Result<bool, StoreError> {
+    Ok(Vault::probe_scheme(dir)?.has_password())
+}
+
 /// 打开会话保险库的错误。
 #[derive(Debug)]
 pub enum StoreOpenError {
@@ -55,6 +65,30 @@ impl SessionStore {
         Ok(Self {
             vault: Vault::open(dir, key)?,
         })
+    }
+
+    /// F71:用主密码打开。密码错时 `Vault` 报的是 `WrongPassword`
+    /// (不是 `Crypto`),调用方据此决定「让解锁框留着重试」还是「收掉弹窗报错」。
+    pub fn unlock(dir: PathBuf, password: &str) -> Result<Self, StoreError> {
+        Ok(Self {
+            vault: Vault::open_with(dir, mullion_store::Unlock::Password(password))?,
+        })
+    }
+
+    /// F71:当前这个库是不是主密码方案(设置弹窗显示「已设定 / 未设定」)。
+    pub fn has_master_password(&self) -> bool {
+        self.vault.has_master_password()
+    }
+
+    /// F71:设定或修改主密码。内部会立刻重写 `secrets.enc`。
+    pub fn set_master_password(&mut self, password: &str) -> Result<(), StoreError> {
+        self.vault.set_master_password(password)
+    }
+
+    /// F71:撤销主密码,回到钥匙串方案。
+    pub fn clear_master_password(&mut self) -> Result<(), StoreError> {
+        self.vault
+            .clear_master_password(&mullion_store::KeyringSource::new())
     }
 
     pub fn list(&self) -> &[SessionRecord] {

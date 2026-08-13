@@ -20,6 +20,7 @@ pub mod shortcuts;
 pub mod toast;
 pub mod toolbar;
 pub mod transfer_panel;
+pub mod unlock;
 
 use std::sync::Arc;
 
@@ -67,6 +68,9 @@ pub struct UiState {
     /// 出来)。**不直接改 `App::settings`**:字号拖动即预览,没有草稿就没法
     /// 在「取消」时回滚。
     pub settings_draft: Option<settings::SettingsDraft>,
+    /// F71:启动解锁框。`Some` = `secrets.enc` 由主密码加密、还没解开,
+    /// 此刻**会话库尚未打开**。`None` = 不需要密码或已经解开。
+    pub unlock: Option<unlock::UnlockDraft>,
     pub last_error: Option<String>,
     /// 用户是否关掉了当前这条错误卡片。**只该由 `set_error` 复位** ——
     /// 各处直接写 `last_error` 会绕过复位,导致关掉一次后再也看不到错误。
@@ -450,6 +454,11 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话拖字号滑块会
     /// 在 egui 的 discard 趟被静默吃掉,现象是「拖了半天没反应,松手才跳一下」。
     pub settings: Option<settings::SettingsOut>,
+    /// F71:解锁框这一帧的结论(提交 / 退出)。`None` = 还在打字。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按「解锁」
+    /// 毫无反应,而解锁框是整个程序此刻唯一能操作的东西。
+    pub unlock: Option<unlock::UnlockOut>,
 }
 
 /// 指针此刻还在窗口里没有(F59 / 设计 N1 的判据)。
@@ -641,6 +650,14 @@ pub fn build_ui(
         let out = settings::show(ctx, t, draft, env);
         if out != settings::SettingsOut::None {
             actions.settings = Some(out);
+        }
+    }
+    // F71:解锁框。画在设置弹窗**之后**,因为它必须盖在所有东西上面 ——
+    // 它开着的时候会话库还没打开,背后任何一个弹窗都在展示空数据。
+    if let Some(draft) = ui_state.unlock.as_mut() {
+        let out = unlock::show(ctx, t, draft);
+        if out != unlock::UnlockOut::None {
+            actions.unlock = Some(out);
         }
     }
     if ui_state.session_manager_open {

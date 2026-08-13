@@ -23,7 +23,11 @@ const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/session_manager")
 ///
 /// F84 的设置弹窗就是第一个 —— 它 `use` 了 `session_manager::form`，规范
 /// 自然也跟着适用。漏登记的话，规范只管得住「碰巧放对目录」的表单。
-const EXTRA: &[&str] = &[concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/settings.rs")];
+const EXTRA: &[&str] = &[
+    concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/settings.rs"),
+    // F71 的解锁框：同样吃 `metrics` 的宽度/间距刻度，同样得受管。
+    concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/unlock.rs"),
+];
 
 /// 既有违规的行级白名单。
 ///

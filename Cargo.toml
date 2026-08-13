@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.39"
+version = "0.1.40"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -54,3 +54,8 @@ ico = "0.5"
 # 图标正文按 base64 内嵌进 sessions.toml(用户选定的存储方式:换机器拷配置
 # 就带着走)。0.22.1 本来就在 Cargo.lock 里(传递依赖),加直接依赖不引入新版本。
 base64 = "0.22"
+# 主密码(F71):Argon2id 派生 secrets.enc 的主密钥。0.5.3 本来就在 Cargo.lock 里
+# (keyring 的 crypto-rust 特性拉进来的),加直接依赖不引入新版本。
+# `default-features = false` + 只开 `alloc`:默认特性会带上 `rand`,而我们的熵
+# 已经走 chacha20poly1305 的 OsRng,不需要第二条随机源(N6 exe 体积)。
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }

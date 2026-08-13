@@ -15,6 +15,16 @@ pub enum StoreError {
     TomlDe(String),
     /// 加解密失败:密钥错误或密文被篡改/损坏。
     Crypto,
+    /// Argon2id 派生失败(参数非法 / 盐为空)。
+    Kdf(String),
+    /// `secrets.enc` 的文件头读不懂:被截断 / KDF 或盐长本版本不认。
+    /// **与 `Crypto` 分开**:这条说的是「结构不对」,那条说的是「钥匙不对」。
+    CorruptSecrets(String),
+    /// `secrets.enc` 由主密码加密,但调用方没给密码。
+    PasswordRequired,
+    /// 主密码不对。**与 `Crypto` 分开**:用户的下一步动作完全不同
+    /// (重打一遍 vs 从备份恢复)。
+    WrongPassword,
     /// keyring 里的主密钥长度非 32。
     CorruptKey,
     /// OS keyring 访问失败(缺 Secret Service 等)。
@@ -50,6 +60,12 @@ impl fmt::Display for StoreError {
             StoreError::TomlSer(e) => write!(f, "TOML 序列化失败:{e}"),
             StoreError::TomlDe(e) => write!(f, "TOML 解析失败(文件可能被手改坏):{e}"),
             StoreError::Crypto => write!(f, "加解密失败 —— 密钥错误或密文损坏"),
+            StoreError::Kdf(e) => write!(f, "主密码派生失败:{e}"),
+            StoreError::CorruptSecrets(e) => write!(f, "secrets.enc 的文件头读不懂:{e}"),
+            StoreError::PasswordRequired => {
+                write!(f, "secrets.enc 由主密码加密 —— 需要先输入主密码")
+            }
+            StoreError::WrongPassword => write!(f, "主密码不对"),
             StoreError::CorruptKey => write!(f, "主密钥损坏(长度非 32 字节)"),
             StoreError::Keyring(e) => {
                 write!(f, "系统密钥库访问失败:{e} —— 检查 keyring/Secret Service")

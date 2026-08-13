@@ -1152,6 +1152,12 @@ pub struct App {
     /// F21:当前字体量出来不是等宽。同 `settings_families`,只在开弹窗和换
     /// 字体之后重算。
     settings_not_mono: bool,
+    /// F71:解锁框开着时,那份还没能用上的 `layout.toml` 快照。
+    ///
+    /// `restore_tabs` 必须在会话库打开之后跑(「这条会话还在不在库里」是丢弃
+    /// 规则之一),而解锁框开着的时候库还没打开 —— 快照只能先在这儿等着。
+    /// 解锁成功 / 放弃解锁时由 `finish_store_open` 取走。
+    pending_layout: Option<mullion_store::SavedLayout>,
     /// F37:正在为哪个占位标签拨号,以及连上之后要摆回什么形状(E9)。
     ///
     /// **`ConnectOk` 事件本身不带 `TabId`**(它是从 tokio task 发回来的,
@@ -1281,6 +1287,7 @@ impl App {
             settings: mullion_store::Settings::default(),
             settings_backup: None,
             settings_families: Vec::new(),
+            pending_layout: None,
             settings_not_mono: false,
             pending_restore: None,
             dragging: false,
@@ -1333,6 +1340,110 @@ impl App {
             // F55:同 `TabAction::Close` —— 标签的传输随标签一起作废。
             self.cancel_transfers_of(tab.content.generation());
             wind_down(tab);
+        }
+    }
+
+    // ------------------------------------------------ F71 主密码
+
+    /// 收下 `SessionStore::open` 的结果并做完启动收尾。两条路径(不需要密码 /
+    /// 解锁成功)共用 —— 各写一遍的话,以后往收尾里加一步必然漏改一处。
+    fn open_store_with(
+        &mut self,
+        opened: Result<crate::shell::store::SessionStore, mullion_store::StoreError>,
+        saved_layout: mullion_store::SavedLayout,
+    ) {
+        match opened {
+            Ok(s) => {
+                crate::logx::line(&format!("会话库已打开,{} 个会话", s.list().len()));
+                self.store = Some(s);
+            }
+            Err(e) => {
+                crate::logx::line(&format!("会话库打开失败: {e}"));
+                self.ui.set_error(format!("会话库打开失败:{e}"));
+                self.store = None;
+            }
+        }
+        self.finish_store_open(saved_layout);
+    }
+
+    /// 会话库尘埃落定之后的那串收尾:算外观缓存、摆回上次的标签、决定第一屏。
+    ///
+    /// 抽出来的唯一理由是 F71:解锁框开着的时候这些都还不能做(库还没打开,
+    /// 「这条会话还在不在库里」答不上来),得等解锁成功再跑。
+    fn finish_store_open(&mut self, saved_layout: mullion_store::SavedLayout) {
+        // 启动时先算一次,否则第一次打开会话管理器全是无色。
+        self.refresh_appearance();
+        // F37:上次那几个标签摆回来(占位,一条连接都不建 —— 设计 §1)。
+        // **必须在 store 打开之后**:「这条会话还在不在库里」是丢弃规则之一。
+        self.restore_tabs(saved_layout);
+
+        // CLI 直连(路径①)→ 立刻发起连接,进终端态;无参启动(路径②)→ 留在
+        // launcher(conn 仍 None)并自动弹出会话管理器,让用户选/建会话(§2/Task7)。
+        if let Some(cfg) = self.initial.take() {
+            // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
+            self.spawn_connect(cfg, false);
+        } else if self.tabs.is_empty() {
+            // F37:恢复出了占位标签就别再弹会话管理器 —— 用户看到的第一屏
+            // 该是上次那几个标签,不是一个盖住它们的弹窗。
+            self.ui.session_manager_open = true;
+        }
+    }
+
+    /// 施加解锁框这一帧的结论。返回 `true` = 用户要退出程序。
+    fn apply_unlock_action(&mut self, out: crate::ui::unlock::UnlockOut) -> bool {
+        use crate::ui::unlock::UnlockOut as O;
+        match out {
+            O::None => false,
+            O::Quit => true,
+            O::Submit => {
+                let Some(draft) = self.ui.unlock.as_mut() else {
+                    return false;
+                };
+                // 用完就从草稿里搬走:主密码留在一个每帧都被画的结构里没有理由。
+                let password = std::mem::take(&mut draft.password);
+                let Some(dir) = crate::shell::store::config_dir() else {
+                    // 探测那一步已经拿到过目录了,走到这里说明环境在两步之间变了。
+                    self.ui.unlock = None;
+                    self.ui.set_error("无法定位配置目录".into());
+                    let layout = self
+                        .pending_layout
+                        .take()
+                        .unwrap_or_else(mullion_store::SavedLayout::empty);
+                    self.finish_store_open(layout);
+                    return false;
+                };
+                match crate::shell::store::SessionStore::unlock(dir, &password) {
+                    Ok(s) => {
+                        self.ui.unlock = None;
+                        let layout = self
+                            .pending_layout
+                            .take()
+                            .unwrap_or_else(mullion_store::SavedLayout::empty);
+                        self.open_store_with(Ok(s), layout);
+                    }
+                    Err(mullion_store::StoreError::WrongPassword) => {
+                        // **弹窗留着**:密码打错是最常见的情况,把人踢回一个
+                        // 没有会话库的空窗口等于让他重启程序再试。
+                        if let Some(d) = self.ui.unlock.as_mut() {
+                            d.failed = true;
+                        }
+                    }
+                    Err(e) => {
+                        // 密码之外的失败(文件坏了 / 读不出来)不是重试能解决的,
+                        // 收掉弹窗、把原因摆出来,程序照常起(会话功能禁用)。
+                        crate::logx::line(&format!("解锁失败: {e}"));
+                        self.ui.unlock = None;
+                        self.ui.set_error(format!("会话库打开失败:{e}"));
+                        let layout = self
+                            .pending_layout
+                            .take()
+                            .unwrap_or_else(mullion_store::SavedLayout::empty);
+                        self.finish_store_open(layout);
+                    }
+                }
+                self.ui_dirty = true;
+                false
+            }
         }
     }
 
@@ -1433,7 +1544,39 @@ impl App {
                 }
                 self.ui.settings_open = false;
             }
+            // F71:设/改主密码。**弹窗不关** —— 改完主密码还可能接着改字体,
+            // 而且用户需要看到那句「已生效」。
+            O::SetPassword => {
+                let pw = self
+                    .ui
+                    .settings_draft
+                    .as_ref()
+                    .map(|d| d.new_password.clone())
+                    .unwrap_or_default();
+                self.apply_password_change(|s| s.set_master_password(&pw), "主密码已生效");
+            }
+            O::ClearPassword => {
+                self.apply_password_change(
+                    crate::shell::store::SessionStore::clear_master_password,
+                    "主密码已取消,回到系统钥匙串",
+                );
+            }
         }
+    }
+
+    /// F71:跑一次主密码改动,收尾交给 [`finish_password_change`]。
+    fn apply_password_change(
+        &mut self,
+        f: impl FnOnce(&mut crate::shell::store::SessionStore) -> Result<(), mullion_store::StoreError>,
+        ok_msg: &str,
+    ) {
+        let Some(store) = self.store.as_mut() else {
+            self.ui.set_error("会话库没打开,改不了主密码".to_string());
+            return;
+        };
+        let r = f(store);
+        let msg = finish_password_change(self.ui.settings_draft.as_mut(), r, ok_msg);
+        self.ui.set_error(msg);
     }
 
     /// 把草稿里的值搬进 `self.settings`(字号顺手夹紧)。
@@ -1704,6 +1847,9 @@ impl App {
             // F84:设置弹窗里有输入框(手填族名)。不算模态的话,敲进去的字
             // 会同时被发给远端 —— T8 那条「弹窗开着时键盘归 egui」。
             || self.ui.settings_open
+            // F71:解锁框里输的是主密码。不算模态的话,它会一边被 egui 收进
+            // 输入框、一边被原样发给远端 shell —— T8 那条「弹窗开着时键盘归 egui」。
+            || self.ui.unlock.is_some()
             || self.pending_host_key.is_some()
             || self.pending_paste.is_some()
     }
@@ -3963,43 +4109,41 @@ impl ApplicationHandler<UserEvent> for App {
         // 打开会话保险库(Task 6)。失败(keyring 不可用/无法定位配置目录等)不
         // panic/exit——记 ui.last_error,会话管理功能优雅禁用,菜单/关于仍能用
         // (待定 G)。
+        //
+        // F71:先探一下 `secrets.enc` 声明的方案。是主密码方案就**先弹解锁框**,
+        // 会话库这一刻不打开 —— 剩下那串收尾动作推迟到解锁成功之后(见
+        // `finish_store_open`)。
         let dir = crate::shell::store::config_dir();
-        self.store = match dir {
-            Some(d) => match crate::shell::store::SessionStore::open(
-                d,
-                &mullion_store::KeyringSource::new(),
-            ) {
-                Ok(s) => {
-                    crate::logx::line(&format!("会话库已打开,{} 个会话", s.list().len()));
-                    Some(s)
+        match dir {
+            Some(d) => match crate::shell::store::probe_needs_password(&d) {
+                Ok(true) => {
+                    crate::logx::line("secrets.enc 由主密码加密,等待解锁");
+                    self.pending_layout = Some(saved_layout);
+                    self.ui.unlock = Some(crate::ui::unlock::UnlockDraft::default());
+                }
+                Ok(false) => {
+                    self.open_store_with(
+                        crate::shell::store::SessionStore::open(
+                            d,
+                            &mullion_store::KeyringSource::new(),
+                        ),
+                        saved_layout,
+                    );
                 }
                 Err(e) => {
-                    crate::logx::line(&format!("会话库打开失败: {e}"));
+                    // 探测本身失败(文件头读不懂 / 读不出来)。这里**不能**当成
+                    // 「不需要密码」往下走:那会拿钥匙串密钥去解一个主密码文件,
+                    // 报出来的是「密文损坏」,把真正的原因盖掉。
+                    crate::logx::line(&format!("secrets.enc 探测失败: {e}"));
                     self.ui.set_error(format!("会话库打开失败:{e}"));
-                    None
+                    self.finish_store_open(saved_layout);
                 }
             },
             None => {
                 crate::logx::line("无法定位配置目录,会话功能禁用");
                 self.ui.set_error("无法定位配置目录".into());
-                None
+                self.finish_store_open(saved_layout);
             }
-        };
-        // 启动时先算一次,否则第一次打开会话管理器全是无色。
-        self.refresh_appearance();
-        // F37:上次那几个标签摆回来(占位,一条连接都不建 —— 设计 §1)。
-        // **必须在 store 打开之后**:「这条会话还在不在库里」是丢弃规则之一。
-        self.restore_tabs(saved_layout);
-
-        // CLI 直连(路径①)→ 立刻发起连接,进终端态;无参启动(路径②)→ 留在
-        // launcher(conn 仍 None)并自动弹出会话管理器,让用户选/建会话(§2/Task7)。
-        if let Some(cfg) = self.initial.take() {
-            // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
-            self.spawn_connect(cfg, false);
-        } else if self.tabs.is_empty() {
-            // F37:恢复出了占位标签就别再弹会话管理器 —— 用户看到的第一屏
-            // 该是上次那几个标签,不是一个盖住它们的弹窗。
-            self.ui.session_manager_open = true;
         }
         diag::mark(diag::Stage::Idle);
     }
@@ -5158,6 +5302,11 @@ impl ApplicationHandler<UserEvent> for App {
                                     crate::ui::settings::SettingsEnv {
                                         families: &self.settings_families,
                                         not_monospace: self.settings_not_mono,
+                                        has_master_password: self
+                                            .store
+                                            .as_ref()
+                                            .is_some_and(|s| s.has_master_password()),
+                                        store_available: self.store.is_some(),
                                     },
                                 ),
                                 files_focused: self.effective_focus()
@@ -5219,6 +5368,15 @@ impl ApplicationHandler<UserEvent> for App {
                             // 才会照着新值重排(T4)。
                             if let Some(out) = actions.settings {
                                 self.apply_settings_action(out);
+                            }
+                            // F71:解锁框的结论。「退出」走既有的 `request_quit`
+                            // 收口(本帧靠后那一段),不自己再调一次
+                            // `event_loop.exit()` —— 另开一条退出路径就意味着
+                            // 标签的收口顺序有两份。
+                            if let Some(out) = actions.unlock {
+                                if self.apply_unlock_action(out) {
+                                    self.ui.request_quit = true;
+                                }
                             }
                             // 布局动作:点了预设 / 点了标题条的 ×。路由逻辑在自由函数
                             // `apply_layout_actions`(只碰 &mut Workspace,可脱离
@@ -6109,6 +6267,31 @@ fn apply_save(
 /// **一个函数、两个调用点**(`resumed` 建 `TextLayer` 和 `apply_font`):
 /// 两处各写一遍 `pt * scale * 96.0 / 72.0` 的话,改了其中一个的现象是
 /// 「启动时字号对,换个屏就不对了」——而两处相隔两千行。
+/// F71:主密码改动的收尾 —— **无论成败**清空两个密码框,并给出该报的那句话。
+///
+/// 抽成自由函数是为了测得着:`App` 里握着窗口和 GPU,单测造不出来,而
+/// 「失败时密码留在框里」这类错误只能靠测试挡住。
+///
+/// 清空是无条件的:失败时留着,用户下一次点「确定」会连着重试一遍他已经
+/// 知道会失败的动作;成功时留着更糟 —— 一串明文主密码挂在屏幕上直到弹窗关闭。
+///
+/// 报告走 `set_error` 那条状态栏通道(成功也走):它是这个程序唯一的通知
+/// 面,先例是 F59 的「跳过了 N 个目录」。
+fn finish_password_change(
+    draft: Option<&mut crate::ui::settings::SettingsDraft>,
+    r: Result<(), mullion_store::StoreError>,
+    ok_msg: &str,
+) -> String {
+    if let Some(d) = draft {
+        d.new_password.clear();
+        d.confirm_password.clear();
+    }
+    match r {
+        Ok(()) => ok_msg.to_string(),
+        Err(e) => format!("主密码没能改成:{e}"),
+    }
+}
+
 fn font_px_for(pt: f32, scale: f32) -> f32 {
     pt * scale * 96.0 / 72.0
 }
@@ -6130,6 +6313,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.reconnect_tab.is_some()
         || a.reconnect_all
         || a.settings.is_some()
+        || a.unlock.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -6347,9 +6531,9 @@ fn render_frame(
 mod tests {
     use super::{
         apply_layout_actions, apply_save, download_job, effective_focus_of,
-        files_owner_generation_of, font_px_for, has_real_action, next_panel_selection_index,
-        pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down,
-        RestoredTab, Tab, TabContent, TerminalTab,
+        files_owner_generation_of, finish_password_change, font_px_for, has_real_action,
+        next_panel_selection_index, pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at,
+        upload_job, wind_down, RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -6486,6 +6670,107 @@ mod tests {
             has_real_action(&a),
             "只有设置动作时被判成「什么都没发生」—— 这一帧的结论会被 discard \
              趟的默认值覆盖掉"
+        );
+    }
+
+    /// 同上,解锁框那一份。它是整个程序此刻唯一能操作的东西 —— 被 discard
+    /// 趟吃掉的现象是「按解锁毫无反应」,而用户没有第二条出路。
+    ///
+    /// 自证会变红:把 `has_real_action` 里的 `a.unlock.is_some()` 去掉。
+    /// F71:主密码改动收尾**无论成败**都清空两个密码框。
+    ///
+    /// 失败时留着,用户下一次点「确定」会连着重试一遍他已经知道会失败的
+    /// 动作;成功时留着更糟 —— 一串明文主密码挂在屏幕上直到弹窗关闭。
+    #[test]
+    fn a_password_change_always_clears_the_two_boxes() {
+        for r in [Ok(()), Err(mullion_store::StoreError::WrongPassword)] {
+            let mut d = crate::ui::settings::SettingsDraft {
+                family: None,
+                font_pt: 10.0,
+                typed: String::new(),
+                new_password: "hunter2".into(),
+                confirm_password: "hunter2".into(),
+            };
+            let _ = finish_password_change(Some(&mut d), r, "已生效");
+            assert!(
+                d.new_password.is_empty() && d.confirm_password.is_empty(),
+                "密码留在框里了"
+            );
+        }
+    }
+
+    /// 失败要说**为什么**失败,不能笼统一句「没能改成」——用户下一步是
+    /// 「换个密码重试」还是「先修钥匙串」,全看这句话。
+    #[test]
+    fn a_failed_password_change_names_the_reason() {
+        let msg = finish_password_change(
+            None,
+            Err(mullion_store::StoreError::Keyring("钥匙串没开".into())),
+            "已生效",
+        );
+        assert!(msg.contains("钥匙串没开"), "把失败原因吞了:{msg}");
+        let ok = finish_password_change(None, Ok(()), "主密码已生效");
+        assert_eq!(ok, "主密码已生效");
+    }
+
+    #[test]
+    fn unlock_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let mut a = crate::ui::UiActions::default();
+        assert!(!has_real_action(&a), "空动作不该算数");
+        a.unlock = Some(crate::ui::unlock::UnlockOut::Submit);
+        assert!(has_real_action(&a), "解锁动作被 egui 的丢弃趟吞了");
+    }
+
+    /// T8:解锁框开着时键盘必须归 egui。它是个密码输入框 —— 不算模态的话,
+    /// 主密码会一边被收进输入框、一边被原样发进远端 shell(还会落进 shell
+    /// 历史)。
+    ///
+    /// 扎源码而不是造 `App`:`modal_open` 要一个真的 `App`(带窗口/GPU),
+    /// 无头环境造不出来;而这条要防的恰恰是「新增弹窗时漏进这张表」,
+    /// 判据本来就是「那张表里有没有这一项」。
+    ///
+    /// 自证会变红:把 `modal_open` 里的 `self.ui.unlock.is_some()` 删掉。
+    #[test]
+    fn the_unlock_dialog_counts_as_a_modal_so_the_password_never_reaches_the_shell() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 modal_open 的函数结尾")];
+        assert!(
+            body.contains("self.ui.session_manager_open"),
+            "modal_open 的函数体切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.ui.unlock.is_some()"),
+            "解锁框没算进模态:主密码会一边进输入框、一边被发给远端 shell(T8)"
+        );
+    }
+
+    /// F71:探测失败(`secrets.enc` 的文件头读不懂)时**不许**当成「不需要
+    /// 密码」往下走 —— 那会拿钥匙串密钥去解一个主密码文件,报出来的是
+    /// 「密文损坏」,把真正的原因盖掉。
+    ///
+    /// 自证会变红:把 `Err(e)` 那一支改成走 `SessionStore::open`。
+    #[test]
+    fn a_failed_probe_does_not_fall_back_to_opening_with_the_keyring_key() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("match crate::shell::store::probe_needs_password(&d)")
+            .nth(1)
+            .expect("找不到探测那一段");
+        let arm = &after[after.find("Err(e) =>").expect("找不到探测失败那一支")..];
+        let arm = &arm[..arm.find("\n                }").expect("找不到该支的结尾")];
+        assert!(
+            !arm.contains("SessionStore::open"),
+            "探测失败却还是拿钥匙串密钥开库了 —— 真正的原因会被「密文损坏」盖掉"
+        );
+        assert!(
+            arm.contains("set_error"),
+            "探测失败必须说出来,静默禁用会话功能等于让人以为会话全没了"
         );
     }
 

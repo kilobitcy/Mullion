@@ -1,4 +1,4 @@
-//! F84:设置弹窗 —— 外观(字体族 / 字号)+ 快捷键一览。
+//! F84:设置弹窗 —— 外观(字体族 / 字号)+ 安全(F71 主密码)+ 快捷键一览。
 //!
 //! **零 IO、零 GPU**:这里只改一份 [`SettingsDraft`] 并回报一个
 //! [`SettingsOut`],真的换字体(`TextLayer::set_font`)与落盘
@@ -30,6 +30,13 @@ pub struct SettingsDraft {
     /// 「Casc」不该被当成一个真的族名去 `set_font`(那会当场回退到默认字体,
     /// 看起来像每敲一个字母字体就闪一下)。
     pub typed: String,
+    /// F71:「新主密码」框。
+    ///
+    /// **不进 `Settings`、不落盘**:它是一次性动作的输入,不是偏好。
+    /// 施加(`SetPassword`)之后由 `app.rs` 当场清空。
+    pub new_password: String,
+    /// F71:「确认」框。
+    pub confirm_password: String,
 }
 
 impl SettingsDraft {
@@ -39,7 +46,25 @@ impl SettingsDraft {
             family: s.font_family.clone(),
             font_pt: s.font_pt,
             typed: s.font_family.clone().unwrap_or_default(),
+            new_password: String::new(),
+            confirm_password: String::new(),
         }
+    }
+
+    /// F71:两个密码框能不能拿去设定主密码。
+    ///
+    /// 纯函数,`show` 与测试共用同一份判据 —— 各写一遍的话,「按钮灰着但
+    /// 提示说没问题」这种自相矛盾的状态迟早出现。
+    pub fn password_ready(&self) -> bool {
+        !self.new_password.is_empty() && self.new_password == self.confirm_password
+    }
+
+    /// F71:该不该画「两次输入不一致」。
+    ///
+    /// **确认框还空着时不算不一致**:一边打第一个框一边红着,是在指责用户
+    /// 还没做完的事。
+    pub fn password_mismatch(&self) -> bool {
+        !self.confirm_password.is_empty() && self.new_password != self.confirm_password
     }
 }
 
@@ -51,6 +76,12 @@ pub struct SettingsEnv<'a> {
     /// 当前字体量出来**不是等宽**。判据在 `font_pick::is_monospace_advance`,
     /// 量宽度要 `FontSystem`,只能由 `app.rs` 算好传进来。
     pub not_monospace: bool,
+    /// F71:这个库现在是不是主密码方案。决定按钮写「设定」还是「修改」,
+    /// 以及画不画「取消主密码」。
+    pub has_master_password: bool,
+    /// F71:会话库这一刻可用没有。不可用时整个安全分节置灰 —— 库都没打开,
+    /// 「设主密码」是设给谁的。
+    pub store_available: bool,
 }
 
 /// 这一帧用户干了什么。
@@ -64,6 +95,12 @@ pub enum SettingsOut {
     Commit,
     /// 「取消」:调用方把进弹窗前的值装回去,并再换一次字体。
     Cancel,
+    /// F71:按了「设定 / 修改主密码」。密码在 `draft.new_password` 里,
+    /// 由 `app.rs` 取走并当场清空两个框。**弹窗不关**:改完主密码还可能
+    /// 接着改字体,而且用户需要看到那句「已生效」。
+    SetPassword,
+    /// F71:按了「取消主密码」。回到钥匙串方案。
+    ClearPassword,
 }
 
 /// 画设置弹窗。返回这一帧的结论。
@@ -83,6 +120,8 @@ pub fn show(
             let mut first = true;
             form::section(ui, t, "设置", "外观", &mut first);
             appearance(ui, t, draft, env, &mut out);
+            form::section(ui, t, "设置", "安全", &mut first);
+            security(ui, t, draft, env, &mut out);
             form::section(ui, t, "设置", "快捷键", &mut first);
             shortcut_table(ui, t);
             ui.add_space(SP_L);
@@ -210,6 +249,87 @@ fn appearance(
     });
 }
 
+/// 安全分节(F71):主密码状态 + 两个密码框 + 设定/修改 与 取消两个动作。
+fn security(
+    ui: &mut egui::Ui,
+    t: &Theme,
+    draft: &mut SettingsDraft,
+    env: SettingsEnv<'_>,
+    out: &mut SettingsOut,
+) {
+    let avail = ui.available_width();
+    let w = field_w(avail, FIELD_W_M, 0.0);
+    form::grid(ui, "settings_security", |ui| {
+        ui.label("主密码");
+        ui.label(if env.has_master_password {
+            "已设定"
+        } else {
+            "未设定"
+        });
+        ui.end_row();
+
+        ui.label("新主密码");
+        ui.add(
+            egui::TextEdit::singleline(&mut draft.new_password)
+                .password(true)
+                .desired_width(w),
+        );
+        ui.end_row();
+
+        ui.label("确认");
+        ui.add(
+            egui::TextEdit::singleline(&mut draft.confirm_password)
+                .password(true)
+                .desired_width(w),
+        );
+        ui.end_row();
+
+        form::field_error(ui, t, draft.password_mismatch(), "两次输入不一致");
+        // **恒显示**,不是打了字才出现:这句话要在用户决定设不设之前就看到。
+        // 没有第二把钥匙是这个设计的属性,不是缺陷(设计 §4),但属性也得说。
+        ui.label("");
+        ui.label(
+            egui::RichText::new("忘记主密码没有找回途径 —— 已保存的密码与私钥将永久无法解开")
+                .size(11.0)
+                .color(theme::c32(t.danger)),
+        );
+        ui.end_row();
+    });
+
+    ui.add_space(SP_M);
+    ui.horizontal(|ui| {
+        let label = if env.has_master_password {
+            "修改主密码"
+        } else {
+            "设定主密码"
+        };
+        let can_set = env.store_available && draft.password_ready();
+        if ui
+            .add_enabled(can_set, egui::Button::new(label))
+            .on_disabled_hover_text(if env.store_available {
+                "先在两个框里输入同一个非空密码"
+            } else {
+                "会话库没打开,没有可以加密的东西"
+            })
+            .clicked()
+        {
+            *out = SettingsOut::SetPassword;
+        }
+        // 「取消主密码」只在**真的设了**的时候才出现:没设的时候摆一个灰按钮
+        // 在那儿,只会让人以为自己漏看了什么状态。
+        if env.has_master_password {
+            ui.add_space(SP_S);
+            if ui
+                .add_enabled(env.store_available, egui::Button::new("取消主密码"))
+                .on_hover_text("改回由本机钥匙串保管密钥 —— 配置目录就不能再搬到别的机器上用了")
+                .clicked()
+            {
+                *out = SettingsOut::ClearPassword;
+            }
+        }
+    });
+}
+
 /// 快捷键一览。只读表格,数据源是 `ui::shortcuts::SHORTCUTS`(那边有撞键守护)。
 fn shortcut_table(ui: &mut egui::Ui, t: &Theme) {
     egui::ScrollArea::vertical()
@@ -234,11 +354,25 @@ mod tests {
     use super::*;
     use crate::ui::metrics::LABEL_COL_W;
 
+    /// 预热多少帧才去读画面。
+    ///
+    /// 弹窗里嵌了 `ScrollArea` + 两层 `Grid`,宽度是逐帧往外撑的:内层网格
+    /// 这一帧量出来的宽度,下一帧才会把窗口撑开,窗口撑开后 `available_width`
+    /// 又变了……**收敛需要好几帧**,不是两帧。加安全分节之后实测第 7 帧才稳
+    /// (逐帧量「取消」按钮的位置得出),这里取 8 留余量。
+    ///
+    /// 帧数不够有两种症状,都不报错:少太多是画面从中间某一行起整段消失;
+    /// 差一两帧是位置还差几个像素 —— 于是点击落在按钮外面,`click` 返回
+    /// `None`,看着像「按钮不响应」。
+    const FRAMES: usize = 8;
+
     fn draft() -> SettingsDraft {
         SettingsDraft {
             family: Some("Cascadia Mono".into()),
             font_pt: 10.0,
             typed: "Cascadia Mono".into(),
+            new_password: String::new(),
+            confirm_password: String::new(),
         }
     }
 
@@ -252,12 +386,21 @@ mod tests {
     /// 跑两帧并收本帧画出来的文字。两帧:egui 的容器首帧常只记
     /// `Shape::Noop`(同 `ui/restored.rs` 的说明)。
     fn run(d: &mut SettingsDraft, not_monospace: bool) -> (Vec<String>, SettingsOut) {
+        run_env(d, not_monospace, false)
+    }
+
+    /// `run` 的全参版:`has_master_password` 影响安全分节画什么。
+    fn run_env(
+        d: &mut SettingsDraft,
+        not_monospace: bool,
+        has_master_password: bool,
+    ) -> (Vec<String>, SettingsOut) {
         let fams = known();
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let mut out = SettingsOut::None;
         let mut shapes = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..FRAMES {
             let full = ctx.run(egui::RawInput::default(), |ctx| {
                 out = show(
                     ctx,
@@ -266,6 +409,8 @@ mod tests {
                     SettingsEnv {
                         families: &fams,
                         not_monospace,
+                        has_master_password,
+                        store_available: true,
                     },
                 );
             });
@@ -301,11 +446,25 @@ mod tests {
         offset: egui::Vec2,
         release: bool,
     ) -> SettingsOut {
+        interact_env(d, label, offset, release, true, false)
+    }
+
+    /// `interact` 的全参版。`store_available` / `has_master_password` 决定
+    /// 安全分节那两个按钮的可点性与去留。
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn interact_env(
+        d: &mut SettingsDraft,
+        label: &str,
+        offset: egui::Vec2,
+        release: bool,
+        store_available: bool,
+        has_master_password: bool,
+    ) -> SettingsOut {
         let fams = known();
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let mut shapes = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..FRAMES {
             let full = ctx.run(egui::RawInput::default(), |ctx| {
                 show(
                     ctx,
@@ -314,6 +473,8 @@ mod tests {
                     SettingsEnv {
                         families: &fams,
                         not_monospace: false,
+                        has_master_password,
+                        store_available,
                     },
                 );
             });
@@ -354,6 +515,8 @@ mod tests {
                 SettingsEnv {
                     families: &fams2,
                     not_monospace: false,
+                    has_master_password,
+                    store_available,
                 },
             );
         });
@@ -428,6 +591,8 @@ mod tests {
             family: Some("Comic Sans MS".into()),
             font_pt: 10.0,
             typed: "Comic Sans MS".into(),
+            new_password: String::new(),
+            confirm_password: String::new(),
         };
         let (texts, _) = run(&mut d, false);
         assert!(
@@ -444,6 +609,145 @@ mod tests {
         let (texts, _) = run(&mut d, false);
         assert!(texts.iter().any(|s| s == "主题"));
         assert!(texts.iter().any(|s| s.contains("Mullion Dark")));
+    }
+
+    // ---- F71 安全分节 ----
+
+    /// 当前是不是主密码方案,得**明说**。用户装到一半忘了自己设没设,
+    /// 唯一的验证途径不该是「重启一次看弹不弹解锁框」。
+    #[test]
+    fn the_security_section_says_whether_a_master_password_is_set() {
+        let (off, _) = run_env(&mut draft(), false, false);
+        assert!(off.iter().any(|s| s == "未设定"), "没说没设:{off:?}");
+        assert!(
+            off.iter().any(|s| s == "设定主密码"),
+            "没设的时候按钮该写「设定」:{off:?}"
+        );
+        let (on, _) = run_env(&mut draft(), false, true);
+        assert!(on.iter().any(|s| s == "已设定"), "没说已设:{on:?}");
+        assert!(
+            on.iter().any(|s| s == "修改主密码"),
+            "设过的时候按钮该写「修改」:{on:?}"
+        );
+    }
+
+    /// 两次不一致要当场说,而且按钮点不动 —— 否则用户设成一个自己打错的
+    /// 密码,下次启动才发现,那时已经进不去了。
+    #[test]
+    fn mismatched_confirmation_is_called_out_and_blocks_the_button() {
+        let mut d = SettingsDraft {
+            new_password: "hunter2".into(),
+            confirm_password: "hunter3".into(),
+            ..draft()
+        };
+        assert!(!d.password_ready(), "不一致却认为可以设");
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s.contains("两次输入不一致")),
+            "两次不一致却什么都不说:{texts:?}"
+        );
+        assert_eq!(
+            click(&mut d, "设定主密码"),
+            SettingsOut::None,
+            "不一致时按钮该是灰的"
+        );
+    }
+
+    /// 确认框还空着不算「不一致」——一边打第一个框一边红着,是在指责用户
+    /// 还没做完的事。
+    #[test]
+    fn a_half_typed_password_is_not_yet_a_mismatch() {
+        let mut d = SettingsDraft {
+            new_password: "hunter2".into(),
+            confirm_password: String::new(),
+            ..draft()
+        };
+        assert!(!d.password_mismatch(), "只打了第一个框就判定不一致");
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            !texts.iter().any(|s| s.contains("两次输入不一致")),
+            "还没开始打确认框就红了:{texts:?}"
+        );
+    }
+
+    /// 空密码设不了 —— 两个框都空着时「一致」在字面上成立,判据必须额外
+    /// 挡住空串,否则一次误点就把库换成一个用空串解开的主密码。
+    #[test]
+    fn an_empty_password_cannot_be_set() {
+        let mut d = draft();
+        assert!(d.new_password.is_empty() && d.confirm_password.is_empty());
+        assert!(!d.password_ready(), "两个框都空着却认为可以设");
+        assert_eq!(
+            click(&mut d, "设定主密码"),
+            SettingsOut::None,
+            "空密码不该能设"
+        );
+    }
+
+    /// 一致且非空时才真的发 `SetPassword`。上一条只证明了「点不动」,
+    /// 这条证明按钮不是**永远**点不动。
+    #[test]
+    fn a_matching_password_can_be_set() {
+        let mut d = SettingsDraft {
+            new_password: "hunter2".into(),
+            confirm_password: "hunter2".into(),
+            ..draft()
+        };
+        assert!(d.password_ready());
+        assert_eq!(click(&mut d, "设定主密码"), SettingsOut::SetPassword);
+    }
+
+    /// 「忘了没有找回途径」必须**一开始就在**,不是打了字才出现:
+    /// 这句话要在用户决定设不设之前就看到,设完再说等于事后通知。
+    #[test]
+    fn the_irreversible_warning_is_always_visible_not_only_after_typing() {
+        let (texts, _) = run(&mut draft(), false);
+        assert!(
+            texts.iter().any(|s| s.contains("没有找回途径")),
+            "还没打字就该看到这句警告:{texts:?}"
+        );
+    }
+
+    /// 「取消主密码」只在**设过**的时候出现。没设的时候摆一个出来,用户
+    /// 会以为自己设过。
+    #[test]
+    fn clearing_is_only_offered_when_a_password_is_set() {
+        let (off, _) = run_env(&mut draft(), false, false);
+        assert!(
+            !off.iter().any(|s| s.contains("取消主密码")),
+            "没设主密码却给了「取消主密码」:{off:?}"
+        );
+        let (on, _) = run_env(&mut draft(), false, true);
+        assert!(
+            on.iter().any(|s| s.contains("取消主密码")),
+            "设过了却撤不掉:{on:?}"
+        );
+        assert_eq!(
+            interact_env(
+                &mut draft(),
+                "取消主密码",
+                egui::Vec2::ZERO,
+                true,
+                true,
+                true
+            ),
+            SettingsOut::ClearPassword
+        );
+    }
+
+    /// 会话库没打开时整个分节点不动 —— 库都没打开,「设主密码」是设给谁的。
+    #[test]
+    fn a_closed_store_cannot_have_its_password_changed() {
+        let mut d = SettingsDraft {
+            new_password: "hunter2".into(),
+            confirm_password: "hunter2".into(),
+            ..draft()
+        };
+        assert_eq!(
+            interact_env(&mut d, "设定主密码", egui::Vec2::ZERO, true, false, false),
+            SettingsOut::None,
+            "库没打开却能设主密码"
+        );
     }
 
     /// 快捷键一览真的画出来了(不是一个空表)。

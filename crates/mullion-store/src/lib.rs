@@ -7,12 +7,14 @@ pub mod error;
 pub mod group;
 pub mod inherit;
 pub mod jump;
+pub mod kdf;
 pub mod known_hosts;
 pub mod layout;
 pub mod master_key;
 pub mod migrate;
 pub mod model;
 pub mod network;
+pub mod secrets_file;
 pub mod settings;
 pub mod sftp;
 pub mod tunnel;
@@ -24,6 +26,7 @@ pub use automation::{
 pub use error::StoreError;
 pub use group::GroupRecord;
 pub use inherit::{resolve, PrefsLayer, ResolvedConfig, DEFAULT_SCROLLBACK};
+pub use kdf::{derive_key, KdfParams, SALT_LEN};
 pub use known_hosts::{HostKeyEntry, KnownHostsFile};
 pub use layout::{
     SavedDir, SavedLayout, SavedNodeEntry, SavedTab, SavedTabKind, SavedWindow,
@@ -36,7 +39,8 @@ pub use model::{
     IconSpec, Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
+pub use secrets_file::Scheme;
 pub use settings::{Settings, CURRENT_SETTINGS_SCHEMA, MAX_FONT_PT, MIN_FONT_PT};
 pub use sftp::{Bookmark, SftpPrefs};
 pub use tunnel::{TunnelId, TunnelKind, TunnelRecord};
-pub use vault::{SessionDraft, TunnelDraft, Vault};
+pub use vault::{SessionDraft, TunnelDraft, Unlock, Vault};

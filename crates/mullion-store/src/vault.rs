@@ -26,6 +26,21 @@ pub struct Vault {
     tunnels: Vec<TunnelRecord>,
     secrets: SecretMap,
     key: [u8; 32],
+    /// `secrets.enc` 用的密钥方案(F71)。**`save()` 按它决定写不写文件头**,
+    /// 与 `key` 永远同源同步 —— 两者不一致的后果是「用 A 的密钥写出声称 B 的
+    /// 文件」,下次打开时所有凭据永久解不开。
+    scheme: crate::secrets_file::Scheme,
+}
+
+/// 打开保险库时用什么开锁(F71,设计 D9/D10)。
+///
+/// `mullion-store` **永远不会主动索要密码**(零 UI 是架构不变量):是不是要密码,
+/// 由 app 先 [`Vault::probe_scheme`] 探测、自己弹解锁框,再把密码传进来。
+pub enum Unlock<'a> {
+    /// 钥匙串方案(今天的默认)。
+    Keyring(&'a dyn MasterKeySource),
+    /// 主密码方案。
+    Password(&'a str),
 }
 
 /// 新建/编辑会话的输入(不含 id/modified_at,由 vault 分配/注入)。
@@ -64,10 +79,30 @@ impl Vault {
         self.dir.join("secrets.enc")
     }
 
+    /// `<dir>/secrets.enc` 声明的密钥方案。文件不存在 → `Keyring`(新库默认)。
+    ///
+    /// app 启动时先调这个,决定要不要在打开会话库之前先弹解锁框(设计 D10)。
+    pub fn probe_scheme(dir: &Path) -> Result<crate::secrets_file::Scheme, StoreError> {
+        let path = dir.join("secrets.enc");
+        if !path.exists() {
+            return Ok(crate::secrets_file::Scheme::Keyring);
+        }
+        let blob = fs::read(&path)?;
+        Ok(crate::secrets_file::parse(&blob)?.0)
+    }
+
     /// 打开(或初始化)`dir` 下的保险库。dir 由调用方(app)算好(directories)传入。
+    ///
+    /// 保留原签名(设计 D9):遇到主密码加密的文件时返回
+    /// [`StoreError::PasswordRequired`],**而不是** `Crypto` —— 后者会让调用方
+    /// 以为文件坏了。要开主密码库走 [`Vault::open_with`]。
     pub fn open(dir: PathBuf, key_source: &dyn MasterKeySource) -> Result<Self, StoreError> {
+        Self::open_with(dir, Unlock::Keyring(key_source))
+    }
+
+    /// 打开保险库,由调用方指定开锁方式(F71)。
+    pub fn open_with(dir: PathBuf, unlock: Unlock<'_>) -> Result<Self, StoreError> {
         fs::create_dir_all(&dir)?;
-        let key = key_source.load_or_create()?;
 
         let sessions_path = dir.join("sessions.toml");
         let Loaded {
@@ -79,13 +114,37 @@ impl Vault {
         } = load_sessions(&sessions_path)?;
 
         let secrets_path = dir.join("secrets.enc");
-        let mut secrets = if secrets_path.exists() {
-            let blob = fs::read(&secrets_path)?;
-            let plain = crypto::decrypt(&key, &blob)?;
-            let text = String::from_utf8(plain)?;
-            toml::from_str::<SecretMap>(&text)?
+        let raw = if secrets_path.exists() {
+            Some(fs::read(&secrets_path)?)
         } else {
-            SecretMap::new()
+            None
+        };
+        // 方案由**文件自己**声明(设计 D1);文件不在就按调用方给的开锁方式定。
+        let scheme = match &raw {
+            Some(blob) => crate::secrets_file::parse(blob)?.0,
+            None => match unlock {
+                Unlock::Keyring(_) => crate::secrets_file::Scheme::Keyring,
+                Unlock::Password(_) => crate::secrets_file::Scheme::Argon2id {
+                    params: crate::kdf::KdfParams::default(),
+                    salt: crate::kdf::random_salt(),
+                },
+            },
+        };
+        let key = derive_for(&scheme, &unlock)?;
+
+        let mut secrets = match &raw {
+            Some(blob) => {
+                let payload = crate::secrets_file::parse(blob)?.1;
+                // 主密码方案下,解不开**优先解释成密码错**(设计 D8):用户的下一步
+                // 动作完全不同(重打一遍 vs 从备份恢复)。
+                let plain = crypto::decrypt(&key, payload).map_err(|e| match scheme {
+                    crate::secrets_file::Scheme::Argon2id { .. } => StoreError::WrongPassword,
+                    crate::secrets_file::Scheme::Keyring => e,
+                })?;
+                let text = String::from_utf8(plain)?;
+                toml::from_str::<SecretMap>(&text)?
+            }
+            None => SecretMap::new(),
         };
 
         // 裁剪孤儿密文:sessions.toml 可能被手改或在两文件写入之间崩溃残留旧 id
@@ -118,6 +177,7 @@ impl Vault {
             tunnels,
             secrets,
             key,
+            scheme,
         };
         if migrated {
             // 立即写回 v2,避免下次打开重复迁移并覆盖掉备份。
@@ -138,9 +198,50 @@ impl Vault {
         write_atomic(&self.sessions_path(), toml_text.as_bytes())?;
 
         let secret_text = toml::to_string_pretty(&self.secrets)?;
-        let blob = crypto::encrypt(&self.key, secret_text.as_bytes())?;
+        let payload = crypto::encrypt(&self.key, secret_text.as_bytes())?;
+        // F71:`Keyring` 方案下 `encode` 是恒等,写出的字节与本片之前完全一致。
+        let blob = crate::secrets_file::encode(&self.scheme, &payload);
         write_atomic(&self.secrets_path(), &blob)?;
         Ok(())
+    }
+
+    /// 当前是不是主密码方案(UI 显示「已设定 / 未设定」)。
+    pub fn has_master_password(&self) -> bool {
+        self.scheme.has_password()
+    }
+
+    /// 设定或修改主密码(F71)。换新盐、重新派生、**立刻整文件重写**。
+    ///
+    /// 空密码不算密码:那会让「已设定」这个状态对应一个人人都能解开的库。
+    ///
+    /// **不动钥匙串条目**(设计 D6):删除是不可逆的,而它的存在完全无害
+    /// (没有文件再引用它),留着还让「撤销主密码」有一条不必重新生成密钥的路。
+    pub fn set_master_password(&mut self, password: &str) -> Result<(), StoreError> {
+        if password.is_empty() {
+            return Err(StoreError::Kdf("主密码不能为空".into()));
+        }
+        let params = crate::kdf::KdfParams::default();
+        let salt = crate::kdf::random_salt();
+        let key = crate::kdf::derive_key(password, &salt, params)?;
+        self.key = key;
+        self.scheme = crate::secrets_file::Scheme::Argon2id { params, salt };
+        self.save()
+    }
+
+    /// 撤销主密码,回到钥匙串方案(F71)。
+    ///
+    /// **先拿到钥匙串密钥再改自己的字段**(设计 D7):钥匙串不可用时报错并停在
+    /// 主密码方案。反过来写的话,内存里的密钥换了、文件还是老的,下一次任何
+    /// `save()` 都会用错的密钥重写整个 `secrets.enc` —— 所有凭据当场变成
+    /// 永久解不开的字节。
+    pub fn clear_master_password(
+        &mut self,
+        key_source: &dyn MasterKeySource,
+    ) -> Result<(), StoreError> {
+        let key = key_source.load_or_create()?;
+        self.key = key;
+        self.scheme = crate::secrets_file::Scheme::Keyring;
+        self.save()
     }
 
     pub fn list(&self) -> &[SessionRecord] {
@@ -502,6 +603,30 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
     }
 }
 
+/// 按文件声明的方案 + 调用方给的开锁方式,算出主密钥(F71)。
+///
+/// 两种**不匹配**各有专门的错误,不许混成一个「解密失败」:
+/// - 文件要密码、调用方只给了钥匙串 → `PasswordRequired`(app 据此弹解锁框)
+/// - 文件不要密码、调用方却给了密码 → `WrongPassword`(这是调用方搞错了对象,
+///   拿密码去派生只会得到一把解不开这个文件的钥匙,提前说清楚)
+fn derive_for(
+    scheme: &crate::secrets_file::Scheme,
+    unlock: &Unlock<'_>,
+) -> Result<[u8; 32], StoreError> {
+    match (scheme, unlock) {
+        (crate::secrets_file::Scheme::Keyring, Unlock::Keyring(src)) => src.load_or_create(),
+        (crate::secrets_file::Scheme::Keyring, Unlock::Password(_)) => {
+            Err(StoreError::WrongPassword)
+        }
+        (crate::secrets_file::Scheme::Argon2id { .. }, Unlock::Keyring(_)) => {
+            Err(StoreError::PasswordRequired)
+        }
+        (crate::secrets_file::Scheme::Argon2id { params, salt }, Unlock::Password(pw)) => {
+            crate::kdf::derive_key(pw, salt, *params)
+        }
+    }
+}
+
 /// tmp + rename 原子写:防写到一半崩溃导致两文件 desync。
 /// `known_hosts` 模块复用同一实现,故 `pub(crate)`。
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
@@ -680,6 +805,189 @@ mod tests {
         assert!(matches!(
             vault.set_group(SessionId(999), None),
             Err(StoreError::NotFound(_))
+        ));
+    }
+
+    // ---- F71 主密码 ----------------------------------------------------
+
+    /// 建一个装了一条密码的库,返回目录。
+    fn vault_with_secret(dir: &std::path::Path) {
+        let mut v = Vault::open(dir.to_path_buf(), &key()).unwrap();
+        v.add(draft_pw("a", "p1"), "2026-08-13T00:00:00Z");
+        v.save().unwrap();
+    }
+
+    /// spec F71 要的「未设主密码时与今日行为逐字节等价」的可测形式:
+    /// 磁盘上的 `secrets.enc` 必须能被**本片之前那条路径**(钥匙串密钥直接
+    /// `crypto::decrypt`)原样解开 —— 没有文件头、没有任何新前缀。
+    #[test]
+    fn without_a_master_password_the_file_stays_in_the_legacy_format() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        let bytes = fs::read(dir.path().join("secrets.enc")).unwrap();
+        let plain =
+            crypto::decrypt(&[5u8; 32], &bytes).expect("不设主密码时,老路径必须能一字不改地解开");
+        assert!(String::from_utf8(plain).unwrap().contains("p1"));
+    }
+
+    #[test]
+    fn setting_a_master_password_rewrites_the_file_so_the_old_key_no_longer_opens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            v.set_master_password("hunter2").unwrap();
+        }
+        let bytes = fs::read(dir.path().join("secrets.enc")).unwrap();
+        assert!(
+            crypto::decrypt(&[5u8; 32], &bytes).is_err(),
+            "设了主密码之后,钥匙串那把旧密钥必须再也解不开这个文件"
+        );
+        assert!(
+            Vault::probe_scheme(dir.path()).unwrap().has_password(),
+            "文件必须自报是主密码方案"
+        );
+    }
+
+    #[test]
+    fn a_password_protected_vault_reopens_with_the_right_password() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            v.set_master_password("hunter2").unwrap();
+        }
+        let v = Vault::open_with(dir.path().to_path_buf(), Unlock::Password("hunter2")).unwrap();
+        assert_eq!(
+            v.secret(SessionId(1)).unwrap().password.as_deref(),
+            Some("p1"),
+            "换成主密码方案不得丢任何一条凭据"
+        );
+    }
+
+    /// 设计 D8:密码错与文件损坏必须分开报 —— 用户的下一步动作完全不同。
+    #[test]
+    fn the_wrong_password_is_reported_as_wrong_password_not_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            v.set_master_password("hunter2").unwrap();
+        }
+        let r = Vault::open_with(dir.path().to_path_buf(), Unlock::Password("hunter3")).err();
+        assert!(
+            matches!(r, Some(StoreError::WrongPassword)),
+            "密码错必须报 WrongPassword,报 Crypto 会把人引去查文件损坏,实际 {r:?}"
+        );
+    }
+
+    /// 设计 D9:老签名遇到主密码文件要说「需要密码」,不是「密文损坏」。
+    #[test]
+    fn opening_a_password_protected_vault_the_old_way_asks_for_a_password() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            v.set_master_password("hunter2").unwrap();
+        }
+        let r = Vault::open(dir.path().to_path_buf(), &key()).err();
+        assert!(
+            matches!(r, Some(StoreError::PasswordRequired)),
+            "实际 {r:?}"
+        );
+    }
+
+    #[test]
+    fn changing_the_master_password_invalidates_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            v.set_master_password("old").unwrap();
+        }
+        {
+            let mut v =
+                Vault::open_with(dir.path().to_path_buf(), Unlock::Password("old")).unwrap();
+            v.set_master_password("new").unwrap();
+        }
+        assert!(matches!(
+            Vault::open_with(dir.path().to_path_buf(), Unlock::Password("old")),
+            Err(StoreError::WrongPassword)
+        ));
+        let v = Vault::open_with(dir.path().to_path_buf(), Unlock::Password("new")).unwrap();
+        assert_eq!(
+            v.secret(SessionId(1)).unwrap().password.as_deref(),
+            Some("p1")
+        );
+    }
+
+    #[test]
+    fn clearing_the_master_password_returns_the_file_to_the_legacy_format() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            v.set_master_password("hunter2").unwrap();
+        }
+        {
+            let mut v =
+                Vault::open_with(dir.path().to_path_buf(), Unlock::Password("hunter2")).unwrap();
+            v.clear_master_password(&key()).unwrap();
+            assert!(!v.has_master_password());
+        }
+        assert!(!Vault::probe_scheme(dir.path()).unwrap().has_password());
+        let bytes = fs::read(dir.path().join("secrets.enc")).unwrap();
+        crypto::decrypt(&[5u8; 32], &bytes).expect("撤销之后必须回到钥匙串能开的老格式");
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(
+            v.secret(SessionId(1)).unwrap().password.as_deref(),
+            Some("p1"),
+            "撤销主密码不得丢凭据"
+        );
+    }
+
+    /// 空密码不算密码:允许它就等于让「已设定」这个状态对应一个人人都能开的库。
+    #[test]
+    fn an_empty_master_password_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert!(matches!(v.set_master_password(""), Err(StoreError::Kdf(_))));
+        assert!(!v.has_master_password(), "被拒之后必须还停在钥匙串方案");
+    }
+
+    #[test]
+    fn probe_scheme_on_a_missing_file_says_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!Vault::probe_scheme(dir.path()).unwrap().has_password());
+    }
+
+    /// 空库(还没 save 过)也能直接设主密码 —— 此时 `secrets.enc` 尚不存在,
+    /// `set_master_password` 里的 `save()` 负责把它连同文件头一起造出来。
+    #[test]
+    fn a_brand_new_vault_can_be_given_a_master_password() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            v.set_master_password("hunter2").unwrap();
+            v.add(draft_pw("a", "p1"), "2026-08-13T00:00:00Z");
+            v.save().unwrap();
+        }
+        let v = Vault::open_with(dir.path().to_path_buf(), Unlock::Password("hunter2")).unwrap();
+        assert_eq!(
+            v.secret(SessionId(1)).unwrap().password.as_deref(),
+            Some("p1")
+        );
+    }
+
+    /// 拿密码去开一个钥匙串库 —— 报「密码不对」而不是拿密码派生出一把
+    /// 解不开的钥匙再报「密文损坏」。
+    #[test]
+    fn a_password_against_a_keyring_vault_is_reported_not_silently_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        vault_with_secret(dir.path());
+        assert!(matches!(
+            Vault::open_with(dir.path().to_path_buf(), Unlock::Password("hunter2")),
+            Err(StoreError::WrongPassword)
         ));
     }
 
