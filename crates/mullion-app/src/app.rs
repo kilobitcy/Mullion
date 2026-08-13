@@ -1865,6 +1865,41 @@ impl App {
         }
     }
 
+    /// F59:把远端栏当前的选中集交给操作系统拖出去。
+    ///
+    /// **立刻返回**,`DoDragDrop` 在 `dragout` 自己的线程上跑(设计 D10:
+    /// winit 的回调栈里起嵌套模态消息循环必 panic)。这里做的只有三件事:
+    /// 摘出能拖的那几条、把跳过的目录数说出来、把 runtime 句柄和 sftp 连接
+    /// 交过去(流是目标程序读的,读的时候我们才真去拉)。
+    fn start_drag_out(&mut self, generation: u64) {
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let (items, skipped_dirs) = crate::dragout::items_for(&tab.content.files_panel().remote);
+        let Some(client) = tab.content.sftp_client() else {
+            self.ui
+                .set_error("SFTP 通道还没建立,请先等目录加载完".into());
+            self.ui_dirty = true;
+            return;
+        };
+        if items.is_empty() {
+            // 全被跳过(整批都是目录)。**必须说话** —— 不然用户拖出去
+            // 松了手,什么都没发生,也没有任何提示。
+            if skipped_dirs > 0 {
+                self.ui
+                    .set_error(format!("目录还不能拖出({skipped_dirs} 个),请选文件"));
+                self.ui_dirty = true;
+            }
+            return;
+        }
+        if skipped_dirs > 0 {
+            self.ui
+                .set_error(format!("跳过了 {skipped_dirs} 个目录,只拖文件"));
+            self.ui_dirty = true;
+        }
+        crate::dragout::start(self._runtime.handle().clone(), client, items);
+    }
+
     /// F53:开始编辑光标行那个远端文件。
     ///
     /// **不进传输队列**(D3-1):临时路径是我们自己造的,冲突/重名/Windows
@@ -4542,6 +4577,11 @@ impl ApplicationHandler<UserEvent> for App {
                                         std::mem::take(&mut actions.files_drop_in),
                                     );
                                 }
+                                // F59:指针出了窗口,把这一拖交给系统。
+                                // 同一条 `files_owner_generation` 路由(S1)。
+                                if actions.files_drag_out {
+                                    self.start_drag_out(gen);
+                                }
                                 // D2:对话框里确认了的写操作。按同一条
                                 // `files_owner_generation` 判据路由(S1),不
                                 // 重新算一遍。
@@ -5360,6 +5400,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.files_remote.is_some()
         || a.files_local.is_some()
         || !a.files_drop_in.is_empty()
+        || a.files_drag_out
         || a.files_op.is_some()
         || a.transfer.is_some()
         || a.edit.is_some()
@@ -6461,6 +6502,22 @@ mod tests {
             has_real_action(&a),
             "files_drop_in 单独一个真实动作时必须被 has_real_action 认成\
              「有真实动作」,否则拖进来的文件会在 discard 趟被静默丢掉"
+        );
+    }
+
+    /// F59:同上,`files_drag_out` 那一条。计划里原本假设「拖出走既有的
+    /// `files_remote` 字段所以不用改 `has_real_action`」——实际接线走的是
+    /// 独立字段,假设不成立。漏掉的后果是「拖出窗口松了手,什么都没发生」。
+    #[test]
+    fn a_drag_out_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let a = crate::ui::UiActions {
+            files_drag_out: true,
+            ..Default::default()
+        };
+        assert!(
+            has_real_action(&a),
+            "files_drag_out 单独一个真实动作时必须被 has_real_action 认成\
+             「有真实动作」,否则这一拖会在 discard 趟被静默丢掉"
         );
     }
 

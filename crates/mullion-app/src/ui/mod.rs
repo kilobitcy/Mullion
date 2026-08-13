@@ -402,6 +402,26 @@ pub struct UiActions {
     /// 「没有动作」,不需要再套一层 `Option`。同样受上面那条约束 ——
     /// `app.rs::has_real_action` 里有对应的一条。
     pub files_drop_in: Vec<std::path::PathBuf>,
+    /// F59:这一帧要把「远端栏起的那一拖」交给操作系统(设计 N1)。
+    ///
+    /// 只是一个信号,拖哪几条由 `app.rs` 从属主标签的远端栏选中集现算 ——
+    /// UI 侧算好再带过来的话,`UiActions` 就得认识 `DragOutItem`,而那是
+    /// 平台层的类型。同样受上面那条约束:`app.rs::has_real_action` 里有
+    /// 对应的一条。
+    pub files_drag_out: bool,
+}
+
+/// 指针此刻还在窗口里没有(F59 / 设计 N1 的判据)。
+///
+/// **不能用「egui 有没有收到 `PointerGone`」来判**:拖拽期间 Windows 会把
+/// 鼠标捕获给窗口,`WM_MOUSELEAVE` 根本不发,winit 也就没有 `CursorLeft`
+/// 可转 —— 指针早飞到桌面上了,egui 这边还以为在窗口里,F59 永远不触发。
+/// 拿坐标跟视口矩形比才靠得住:捕获期间 `WM_MOUSEMOVE` 照常来,坐标会是
+/// 负数或超出宽高。
+fn pointer_inside_window(ctx: &egui::Context) -> bool {
+    let screen = ctx.screen_rect();
+    ctx.input(|i| i.pointer.latest_pos())
+        .is_some_and(|p| screen.contains(p))
 }
 
 /// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
@@ -464,6 +484,24 @@ pub fn build_ui(
     let hovering = if files_open { hovering } else { 0 };
     if files_open {
         actions.files_drop_in = dropped;
+    }
+    // F59:远端栏起的那一拖,指针一旦出了窗口就交给操作系统(设计 N1)。
+    // 窗口内不交 —— 那一半手势是 F58(拖到本地栏 = 下载),`DoDragDrop`
+    // 一接管鼠标捕获,F58 的远端→本地方向当场失效。
+    let dragging_from =
+        egui::DragAndDrop::payload::<crate::files::drag::DragFrom>(ctx).map(|p| p.0);
+    if files_open
+        && crate::dragout::should_hand_off(
+            dragging_from,
+            pointer_inside_window(ctx),
+            crate::dragout::is_running(),
+        )
+    {
+        // 交出去之后**必须**把 egui 的载荷清掉:`DoDragDrop` 会接管鼠标,
+        // egui 再也收不到松手事件,载荷就永远挂着 —— 指针下次晃出窗口
+        // 又起一条拖出,而用户根本没按着鼠标。
+        egui::DragAndDrop::clear_payload(ctx);
+        actions.files_drag_out = true;
     }
     // 主机密钥确认最先画:它是安全关口,任何时候都该盖在最上层(F3)。
     if let Some(view) = &frame.host_key {
@@ -1022,6 +1060,114 @@ mod tests {
             text.contains("松开上传 2 项到 /srv/www"),
             "悬停时没把落点写出来,用户只能松手之后才知道传到哪:{text}"
         );
+    }
+
+    /// F59 的手势输入:窗口 1000×700,载荷说这一拖从哪一栏起,指针停在
+    /// `pointer` 上(可以在窗口外 —— 拖拽期间 Windows 把鼠标捕获给窗口,
+    /// `WM_MOUSEMOVE` 照常来,坐标会超出宽高)。
+    fn dragging(
+        ctx: &egui::Context,
+        from: crate::files::PanelColumn,
+        pointer: egui::Pos2,
+    ) -> egui::RawInput {
+        egui::DragAndDrop::set_payload(ctx, crate::files::drag::DragFrom(from));
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..Default::default()
+        }
+    }
+
+    /// F59 / 设计 N1:远端栏起的拖,指针**出了窗口**才交给操作系统。
+    ///
+    /// 这是正向自证 —— 手势真的发生过。删掉 `build_ui` 里那段
+    /// `should_hand_off` 判断,这条会红。
+    #[test]
+    fn a_remote_drag_that_leaves_the_window_is_handed_to_the_operating_system() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut files = files_panel::PanelFrame::default();
+        let input = dragging(
+            &ctx,
+            crate::files::PanelColumn::Remote,
+            egui::pos2(1200.0, 350.0),
+        );
+        let (_, actions) =
+            run_frame_content(&ctx, &mut ui_state, base_frame(), input, Some(&mut files));
+        assert!(actions.files_drag_out, "指针都飞到桌面上了,还没交给系统");
+    }
+
+    /// F59 / 设计 N1:**指针还在窗口里就不交** —— 这是 F58 的命根子。
+    ///
+    /// 远端栏起拖的手势同时属于 F58(拖到本地栏 = 下载)。窗口内就交给
+    /// 系统的话,`DoDragDrop` 接管鼠标捕获,F58 的远端→本地方向当场失效。
+    /// 把 `should_hand_off` 里的 `!pointer_inside_window` 删掉,这条会红。
+    #[test]
+    fn a_remote_drag_still_inside_the_window_stays_with_f58() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut files = files_panel::PanelFrame::default();
+        let input = dragging(
+            &ctx,
+            crate::files::PanelColumn::Remote,
+            egui::pos2(500.0, 350.0),
+        );
+        let (_, actions) =
+            run_frame_content(&ctx, &mut ui_state, base_frame(), input, Some(&mut files));
+        assert!(
+            !actions.files_drag_out,
+            "窗口内就交给系统,F58 的远端→本地方向会被鼠标捕获抢走"
+        );
+    }
+
+    /// F59 / 设计 D5:本地栏的文件拖到别处是资源管理器自己的事。
+    #[test]
+    fn a_local_drag_that_leaves_the_window_is_not_handed_to_the_operating_system() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut files = files_panel::PanelFrame::default();
+        let input = dragging(
+            &ctx,
+            crate::files::PanelColumn::Local,
+            egui::pos2(1200.0, 350.0),
+        );
+        let (_, actions) =
+            run_frame_content(&ctx, &mut ui_state, base_frame(), input, Some(&mut files));
+        assert!(!actions.files_drag_out);
+    }
+
+    /// F59:交出去的**同一帧**必须把 egui 的载荷清掉。
+    ///
+    /// `DoDragDrop` 会接管鼠标,egui 再也收不到松手事件 —— 不清的话载荷
+    /// 永远挂着,指针下次晃出窗口又起一条拖出,而用户根本没按着鼠标。
+    #[test]
+    fn handing_off_clears_the_egui_payload_so_it_cannot_fire_twice() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut files = files_panel::PanelFrame::default();
+        let input = dragging(
+            &ctx,
+            crate::files::PanelColumn::Remote,
+            egui::pos2(1200.0, 350.0),
+        );
+        let (_, first) =
+            run_frame_content(&ctx, &mut ui_state, base_frame(), input, Some(&mut files));
+        assert!(first.files_drag_out, "第一帧就没交出去,后面这一半白测");
+        // 第二帧只挪指针,不重置载荷。
+        let again = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events: vec![egui::Event::PointerMoved(egui::pos2(1300.0, 360.0))],
+            ..Default::default()
+        };
+        let (_, second) =
+            run_frame_content(&ctx, &mut ui_state, base_frame(), again, Some(&mut files));
+        assert!(!second.files_drag_out, "载荷没清掉,同一拖又交了一次");
     }
 
     fn title_view(host: &str) -> crate::ui::pane_title::TitleView<'_> {

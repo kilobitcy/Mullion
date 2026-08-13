@@ -29,6 +29,23 @@
   发了 BSU 却再不发 ESU(TUI 被 kill / 链路截断)时强行出帧,宁可闪一下也不停在死画面。
   **守护**:`render::tests::esu_split_across_feeds_is_still_detected`
   / `unterminated_sync_block_times_out`。
+- **在 winit 的回调栈里起任何嵌套模态消息循环 = 必 panic(D10,F59 拖出踩到的)。**
+  `DoDragDrop` / `TrackPopupMenu` / `MessageBox` / `DialogBox` 这一类 API 自己跑一个
+  嵌套消息循环,循环里会派发 `WM_PAINT`;而 winit 0.30 的 Windows 后端对
+  `RedrawRequested` 是**绕过事件缓冲直接回调**的
+  (`platform_impl/windows/event_loop/runner.rs` 的 `send_event` → `call_event_handler`,
+  里面 `event_handler.take().expect("either event handler is re-entrant (likely)…")`)。
+  于是嵌套循环里的第一次重绘就把 handler 取空 →
+  panic,**而且崩溃点在 winit 内部,栈上看不出是谁起的嵌套循环**。
+  **规则**:这类调用一律挪到自己的线程上(自己 `OleInitialize`/`CoInitialize`),
+  UI 线程只负责 `spawn` 后立刻返回。**守护**:没有自动守护 —— 无头验不了;
+  实现见 `dragout/win.rs`,那里把这条写在文件头。
+- **指针出没出窗口,不能靠 winit 的 `CursorLeft` 判(F59 / 设计 N1)。**
+  按下鼠标后 Windows 把鼠标捕获给窗口,`WM_MOUSELEAVE` 根本不发,winit 也就没有
+  `CursorLeft` 可转 —— 指针早飞到桌面上了,egui 这边还以为在窗口里。
+  **规则**:拿坐标跟视口矩形比(捕获期间 `WM_MOUSEMOVE` 照常来,坐标会是负数或
+  超出宽高)。**守护**:`ui::tests::a_remote_drag_that_leaves_the_window_is_handed_to_the_operating_system`
+  与 `..._still_inside_the_window_stays_with_f58`。
 
 ## glyphon / 文字
 
