@@ -148,6 +148,18 @@ pub enum EntryKind {
     Other,
 }
 
+/// [`SftpClient::write_if_unchanged`] 的结果(F53)。
+///
+/// 两条分支都带回**远端当前的** `(mtime, size)`:调用方无论走哪条都要拿它
+/// 刷快照 —— 冲突之后不刷的话,下一次保存还会撞上同一个冲突,处置框永远关不掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// 写下去了。戳是写完之后回读的。
+    Written { mtime: u32, size: u64 },
+    /// 远端变过,**一个字节都没写**。戳是远端当前的。
+    Conflict { mtime: u32, size: u64 },
+}
+
 #[derive(Debug)]
 pub enum SftpError {
     /// 开 channel / 请求 subsystem 失败。
@@ -156,6 +168,10 @@ pub enum SftpError {
     Protocol(String),
     /// 路径含非 UTF-8 字节 —— **请求根本没发出去**(设计 D16 修订)。
     NonUtf8Name,
+    /// F53:文件超过了调用方给的上限,**读到一半就停了**(见 `read_all`)。
+    /// 单独一个变体而不是塞进 `Protocol`:界面要据此给出「用下载功能」这条
+    /// 出路,而不是把一句协议错误原样甩给用户。
+    TooLarge(u64),
 }
 
 impl std::fmt::Display for SftpError {
@@ -164,6 +180,11 @@ impl std::fmt::Display for SftpError {
             SftpError::Subsystem => write!(f, "远端没有开启 SFTP 子系统,或连接已断开"),
             SftpError::Protocol(m) => write!(f, "{m}"),
             SftpError::NonUtf8Name => write!(f, "{}", NonUtf8Path),
+            SftpError::TooLarge(limit) => write!(
+                f,
+                "文件超过 {} MB,编辑器打不开;用「下载到本地」取回来再处理",
+                limit / (1024 * 1024)
+            ),
         }
     }
 }
@@ -406,6 +427,85 @@ impl SftpClient {
             .await
             .map_err(|e| SftpError::Protocol(e.to_string()))?;
         Ok(RemoteFile { file })
+    }
+
+    /// 一次把整个远端文件读进内存(F53 编辑用)。**带上限**。
+    ///
+    /// 编辑通路的两条大小闸门(内置 1 MB / 外部 64 MB)最终都落在这里。
+    /// 上限**必须边读边判**,不能读完再看长度 —— 那样一个 8 GB 的 core dump
+    /// 会在「拒绝」之前先把进程 OOM 掉,而用户看到的是程序直接消失。
+    ///
+    /// 与传输通路的分块循环刻意分开:那条要报进度、要能取消、要落盘;
+    /// 这条只服务「打开来改一改」,全量在内存里反而让调用方简单一个数量级。
+    pub async fn read_all(&self, path: &RemotePath, limit: u64) -> Result<Vec<u8>, SftpError> {
+        let mut file = self.open_read(path).await?;
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read_chunk(&mut buf).await?;
+            if n == 0 {
+                return Ok(out);
+            }
+            if out.len() as u64 + n as u64 > limit {
+                return Err(SftpError::TooLarge(limit));
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// 覆盖写回(F53)。**TRUNC 直接写目标**,不走临时文件 + rename。
+    ///
+    /// 理由同设计 D19:rename 会换掉 inode,原文件的属主 / 权限 / ACL / 硬链接
+    /// 全部丢失 —— 对 `/etc/nginx/nginx.conf` 这类被编辑的文件就是实打实的破坏。
+    /// 代价是「写到一半断线会留下截断文件」,由上层的 `.mullion.bak` 兜(D3-7)。
+    pub async fn write_all_truncate(
+        &self,
+        path: &RemotePath,
+        bytes: &[u8],
+    ) -> Result<(), SftpError> {
+        let mut file = self.open_write(path, true).await?;
+        for chunk in bytes.chunks(64 * 1024) {
+            file.write_chunk(chunk).await?;
+        }
+        // 空文件也要走到这里:`open_write` 带 TRUNC 已经把内容清掉了,
+        // 但不 `finish()` 就没人等那条 close 的应答(见 `RemoteFile` 文档)。
+        file.finish().await
+    }
+
+    /// 先比对、再覆盖(F53/设计 D3-8)。**远端在我们编辑期间变过就一个字节都不写。**
+    ///
+    /// `expected` 是打开时记下的 `(mtime, size)`。判断放在这一层而不是调用方,
+    /// 是因为「比对」和「写」之间不能插进别的 await 点,而调用方有三条路径
+    /// (本地存盘轮询 / 内置编辑器保存 / 冲突框选了覆盖)会用到它 ——
+    /// 判据散成三份,迟早只剩一份是对的。
+    ///
+    /// `backup` 给的话,**只在确认没冲突、且真要写之前**落一份(D3-7)。
+    /// 放在这里同理:冲突时提前写出去的备份是纯垃圾文件。
+    pub async fn write_if_unchanged(
+        &self,
+        path: &RemotePath,
+        bytes: &[u8],
+        expected: (u32, u64),
+        backup: Option<(&RemotePath, &[u8])>,
+    ) -> Result<WriteOutcome, SftpError> {
+        let before = self.stat(path).await?;
+        if (before.mtime, before.size) != expected {
+            return Ok(WriteOutcome::Conflict {
+                mtime: before.mtime,
+                size: before.size,
+            });
+        }
+        if let Some((bak_path, bak_bytes)) = backup {
+            self.write_all_truncate(bak_path, bak_bytes).await?;
+        }
+        self.write_all_truncate(path, bytes).await?;
+        // 回读新戳:下一次比对要拿它当基准。用本地算出来的长度顶替是不行的,
+        // mtime 只有服务端知道,猜一个的话下一次保存必然误判成冲突。
+        let after = self.stat(path).await?;
+        Ok(WriteOutcome::Written {
+            mtime: after.mtime,
+            size: after.size,
+        })
     }
 
     /// 目标在不在。冲突探测用。

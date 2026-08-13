@@ -150,6 +150,44 @@ pub enum UserEvent {
         job: u64,
         result: Result<(), String>,
     },
+    /// F53:要编辑的那个远端文件读回来了。`result` 是「内容 + 读到它那一刻的
+    /// 远端戳」——戳是回传前判冲突的唯一依据(D3-8),必须跟内容同一次往返
+    /// 里取,事后补一次 `stat` 拿到的是**别人可能已经改过**之后的值。
+    ///
+    /// 按世代路由(S1):读一个几十 MB 的文件够用户切好几次标签。
+    EditOpened {
+        generation: u64,
+        kind: crate::edit::sessions::EditKind,
+        remote: mullion_ssh::sftp::RemotePath,
+        result: Result<(Vec<u8>, crate::edit::sessions::RemoteStamp), String>,
+    },
+    /// F53:看门任务报的一次本地文件状态。**只在与上次不同时才发** ——
+    /// 每秒一条空事件会把事件循环从 `Wait` 里薅起来,白烧 CPU(T3)。
+    /// `None` = 临时文件不见了(用户自己删了 / 编辑器换了 inode)。
+    ///
+    /// 「第一次看到只登记基线、不算改动」这条规则**不在任务里**,在
+    /// `EditSessions::changed_locally` 里 —— 它有单测,任务里再判一遍就成了
+    /// 两份判据。
+    EditTick {
+        key: u64,
+        stamp: Option<crate::edit::sessions::LocalStamp>,
+    },
+    /// F53:一次回传的结果。**不带世代号**:`key` 全局唯一且不回收,
+    /// 属主标签关掉时 `drain_generation` 会把条目一并收走,「还在不在表里」
+    /// 就是唯一需要的过期判据(同隧道那条)。
+    EditSaved {
+        key: u64,
+        result: Result<EditWriteOutcome, String>,
+    },
+}
+
+/// F53:一次回传到底发生了什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditWriteOutcome {
+    /// 写成了,附回传后远端的新戳(下一次比对的基准)。
+    Done(crate::edit::sessions::RemoteStamp),
+    /// 远端在我们编辑期间被改过 —— **什么都没写**,附远端当前的戳。
+    Conflict(crate::edit::sessions::RemoteStamp),
 }
 
 /// 展开后的一条传输:两端完整路径和大小都算好了,入队即可跑。
@@ -993,6 +1031,28 @@ pub struct App {
     /// 每条 job 的完整参数(见 `TransferSpec`)。job 真正走完(不是挂在冲突上)
     /// 之后删掉,不然队列清空了它还在涨。
     transfer_specs: std::collections::HashMap<u64, TransferSpec>,
+    /// F53:所有还挂在监视里的编辑。跨标签一份,理由同 `transfer_queue`。
+    edits: crate::edit::sessions::EditSessions,
+    /// F53:内置编辑器窗口。**同一时刻只开一个** —— 多开的价值远小于
+    /// 「哪个窗口对应哪个文件」带来的混乱,而这里每个窗口背后都是一次
+    /// 会覆盖远端文件的写。
+    editor: Option<crate::ui::editor_window::EditorState>,
+    /// F53:每条编辑的看门任务(1 秒看一次本地 mtime,D3-10)。
+    ///
+    /// **不走事件循环的 `WaitUntil`**:那条路径是 T3/T7 的高压区(三个分支
+    /// 都要显式复位 `control_flow`),为一个「一秒一次的文件 stat」去动它
+    /// 得不偿失。tokio 任务经 `proxy` 回送事件,天然会唤醒事件循环。
+    edit_watchers: std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
+    /// F53/D3-7:打开那一刻读到的原文,用来在**第一次**回传前留一份
+    /// `.mullion.bak`。回传成功后即丢 —— 之后远端那份就是我们自己写的,
+    /// 再备份一次既没有意义又要多传一遍全量。
+    edit_originals: std::collections::HashMap<u64, Vec<u8>>,
+    /// F53:撞上冲突时远端**当时**的戳。「保留远端」要拿它刷快照(D3-9),
+    /// 「覆盖远端」要拿它当新的比对基准 —— 否则覆盖那一下会再撞一次冲突。
+    edit_conflicts: std::collections::HashMap<u64, crate::edit::sessions::RemoteStamp>,
+    /// F53:外部编辑用的临时文件根目录。退出时整棵删掉(D3-12)。
+    /// 进程启动时算一次 —— `directories` 每次调用都要摸环境变量。
+    edit_root: std::path::PathBuf,
 }
 
 /// F59:传输队列在跑时的界面刷新间隔(毫秒)。进度条 5Hz 已经够顺,
@@ -1057,6 +1117,12 @@ impl App {
             transfer_queue: crate::files::queue::Queue::new(DEFAULT_TRANSFER_CONCURRENCY),
             transfer_cancels: std::collections::HashMap::new(),
             transfer_specs: std::collections::HashMap::new(),
+            edits: crate::edit::sessions::EditSessions::new(),
+            editor: None,
+            edit_watchers: std::collections::HashMap::new(),
+            edit_originals: std::collections::HashMap::new(),
+            edit_conflicts: std::collections::HashMap::new(),
+            edit_root: crate::edit::tempdir::root(),
         }
     }
 
@@ -1313,6 +1379,12 @@ impl App {
             }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
             FileAction::Transfer => return,
+            // D5:本地文件在资源管理器里双击就行,`menu_items_for` 也不给
+            // 这两项。到这儿同样说明菜单构造被改坏了。
+            FileAction::EditExternal | FileAction::EditInline => {
+                log::warn!("本地栏收到了编辑请求,已忽略(D5)");
+                return;
+            }
             FileAction::OpenInExplorer => {
                 let dir = files.local.cwd.clone();
                 if let Err(e) = local::open_in_file_manager(&dir) {
@@ -1360,6 +1432,15 @@ impl App {
                 self.start_transfer(generation, crate::files::queue::Direction::Download);
                 return;
             }
+            // F53:编辑。同上,`start_edit` 要 `&mut self`。
+            FileAction::EditExternal => {
+                self.start_edit(generation, crate::edit::sessions::EditKind::External);
+                return;
+            }
+            FileAction::EditInline => {
+                self.start_edit(generation, crate::edit::sessions::EditKind::Inline);
+                return;
+            }
             _ => {}
         }
         let client = {
@@ -1387,8 +1468,12 @@ impl App {
                 self.ui_dirty = true;
                 return;
             }
-            // 这三个在函数开头就分流掉了(那里不需要借 `files`),走不到这儿。
-            FileAction::Ask(_) | FileAction::OpenInExplorer | FileAction::Transfer => return,
+            // 这几个在函数开头就分流掉了(那里不需要借 `files`),走不到这儿。
+            FileAction::Ask(_)
+            | FileAction::OpenInExplorer
+            | FileAction::Transfer
+            | FileAction::EditExternal
+            | FileAction::EditInline => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
@@ -1590,6 +1675,12 @@ impl App {
             self.ui_dirty = true;
             return;
         }
+        // F53:编辑冲突的处置。同上,不走远端写操作那条通用路径 ——
+        // 三条出路里有两条根本不发请求。
+        if let FileOp::ResolveEdit { key, choice } = op {
+            self.resolve_edit(key, choice);
+            return;
+        }
 
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
@@ -1613,7 +1704,9 @@ impl App {
                     .map_err(|e| e.to_string()),
                 FileOp::Delete { targets } => delete_all(&client, conn.as_ref(), &targets).await,
                 // 函数开头已经分流走了,走到这里说明分流被删了。
-                FileOp::Resolve { .. } => unreachable!("冲突处置不该走远端写操作这条路"),
+                FileOp::Resolve { .. } | FileOp::ResolveEdit { .. } => {
+                    unreachable!("冲突处置不该走远端写操作这条路")
+                }
             };
             let _ = proxy.send_event(UserEvent::SftpOpDone { generation, result });
         });
@@ -1668,6 +1761,411 @@ impl App {
             let _ = proxy.send_event(UserEvent::TransferPlanned { generation, result });
         });
         self.track_sftp_task(generation, task);
+    }
+
+    /// F53:开始编辑光标行那个远端文件。
+    ///
+    /// **不进传输队列**(D3-1):临时路径是我们自己造的,冲突/重名/Windows
+    /// 非法名那一整套语义都不适用;传输面板是「用户发起的传输」的账本,
+    /// 混进「打开一个文件」会让「全部取消」的语义变歧义。
+    ///
+    /// 目标取**光标行**,与 `FileAsk::Rename`/`Chmod` 同一条约定 ——
+    /// 双击那条入口会先把光标挪到被双击的行上(见 `files_panel::show`)。
+    fn start_edit(&mut self, generation: u64, kind: crate::edit::sessions::EditKind) {
+        use crate::edit::sessions::EditKind;
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let state = &tab.content.files_panel().remote;
+        let Some(cur) = state.cursor.clone() else {
+            return;
+        };
+        let Some(e) = state.entries.iter().find(|e| e.name == cur) else {
+            return;
+        };
+        // 名字送不上线的行,任何单目标操作都做不了(同删除/传输那条判据)。
+        if e.kind != mullion_ssh::sftp::EntryKind::File || !cur.is_operable() {
+            self.ui.set_error("只能编辑普通文件".into());
+            self.ui_dirty = true;
+            return;
+        }
+        let limit = match kind {
+            EditKind::Inline => crate::edit::INLINE_LIMIT,
+            EditKind::External => crate::edit::EXTERNAL_LIMIT,
+        };
+        // 菜单已经按 size 置灰过一遍,这里再判一次是因为**光标行可能已经变了**
+        // (双击那条路径就是先挪光标再发动作),而且键盘快捷键那类入口根本
+        // 不经过菜单。闸门必须落在真正要发请求的这一处。
+        if e.size > limit {
+            self.ui.set_error(format!(
+                "「{}」有 {},超过了这种打开方式的上限({})",
+                cur.display(),
+                crate::files::human_size(e.size),
+                crate::files::human_size(limit),
+            ));
+            self.ui_dirty = true;
+            return;
+        }
+        let remote = state.cwd.join(cur.as_bytes());
+        let Some(client) = tab.content.sftp_client() else {
+            self.ui
+                .set_error("SFTP 通道还没建立,请先等目录加载完".into());
+            self.ui_dirty = true;
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let path = remote.clone();
+        let task = self._runtime.spawn(async move {
+            let result = read_for_edit(&client, &path, limit).await;
+            let _ = proxy.send_event(UserEvent::EditOpened {
+                generation,
+                kind,
+                remote,
+                result,
+            });
+        });
+        self.track_sftp_task(generation, task);
+        self.ui.set_toast("正在打开…");
+        self.ui_dirty = true;
+    }
+
+    /// F53:文件读回来了 —— 落临时文件交给外部程序,或者开内置窗口。
+    fn finish_edit_open(
+        &mut self,
+        generation: u64,
+        kind: crate::edit::sessions::EditKind,
+        remote: mullion_ssh::sftp::RemotePath,
+        result: Result<(Vec<u8>, crate::edit::sessions::RemoteStamp), String>,
+    ) {
+        use crate::edit::sessions::EditKind;
+        self.ui_dirty = true;
+        let (bytes, snapshot) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.ui.set_error(e);
+                return;
+            }
+        };
+        // 属主标签在这次往返里被关掉了:临时文件还没落地,直接丢弃就是对的。
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let session = tab.title.clone();
+        let label = remote.display().to_string();
+        let local = crate::edit::tempdir::temp_path(&self.edit_root, &session, &remote);
+        match kind {
+            // 外部编辑对内容**完全透明**:字节原样落盘、原样传回。二进制也照开,
+            // 用户自己知道 .png 该用什么程序打开(D3-3 那条「二进制拒绝」是
+            // 内置编辑器的事 —— 那里内容要变成 `String`)。
+            EditKind::External => {
+                if let Some(dir) = local.parent() {
+                    if let Err(e) = std::fs::create_dir_all(dir) {
+                        self.ui.set_error(format!("建不了临时目录:{e}"));
+                        return;
+                    }
+                }
+                if let Err(e) = std::fs::write(&local, &bytes) {
+                    self.ui.set_error(format!("写不了临时文件:{e}"));
+                    return;
+                }
+                if let Err(e) = crate::edit::launch::open_with_default(&local) {
+                    self.ui.set_error(e);
+                    return;
+                }
+                let key = self
+                    .edits
+                    .add(generation, kind, remote, local.clone(), snapshot);
+                self.edit_originals.insert(key, bytes);
+                self.watch_edit(key, local);
+                self.ui
+                    .set_toast(format!("已交给默认程序:{label}。存盘后自动回传"));
+            }
+            EditKind::Inline => {
+                let probe = crate::edit::text::probe(&bytes);
+                let text = crate::edit::text::decode(&bytes, &probe);
+                // 内置这一条在磁盘上**没有文件**:内容全在窗口里,所以也
+                // **不起看门任务**(「变了没有」窗口自己知道)。`local` 仍然
+                // 记着,只为「结束编辑」时统一走同一条清理路径(删不存在的
+                // 文件本来就不报错)。
+                let key = self.edits.add(generation, kind, remote, local, snapshot);
+                self.edit_originals.insert(key, bytes);
+                self.editor = Some(crate::ui::editor_window::EditorState::new(
+                    key,
+                    label,
+                    text,
+                    probe.read_only_reason(),
+                    probe.eol,
+                    probe.bom,
+                ));
+            }
+        }
+    }
+
+    /// F53/D3-10:给一条外部编辑起看门任务。1 秒看一次本地 mtime。
+    ///
+    /// **不猜编辑器进程退没退**:用户可能开着 vim 存十次,也可能用一个
+    /// 常驻的 GUI 编辑器一直开着。「文件变了就传」是唯一不需要猜的判据。
+    fn watch_edit(&mut self, key: u64, local: std::path::PathBuf) {
+        let proxy = self.proxy.clone();
+        let task = self._runtime.spawn(async move {
+            let mut last: Option<crate::edit::sessions::LocalStamp> = None;
+            let mut first = true;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let stamp = local_stamp(&local);
+                // 只在**变了**的时候发。每秒一条空事件会把事件循环从 `Wait`
+                // 里薅起来,白烧 CPU(T3)。首轮无条件发一次,让
+                // `changed_locally` 把基线登记上。
+                if first || stamp != last {
+                    first = false;
+                    last = stamp;
+                    if proxy
+                        .send_event(UserEvent::EditTick { key, stamp })
+                        .is_err()
+                    {
+                        return; // 事件循环没了
+                    }
+                }
+            }
+        });
+        if let Some(old) = self.edit_watchers.insert(key, task) {
+            old.abort();
+        }
+    }
+
+    /// F53:看门任务报了一次本地状态。
+    fn on_edit_tick(&mut self, key: u64, stamp: Option<crate::edit::sessions::LocalStamp>) {
+        for k in self.edits.changed_locally(&[(key, stamp)]) {
+            self.push_edit(k, None);
+        }
+    }
+
+    /// F53:把一条编辑的当前内容传回远端。
+    ///
+    /// `bytes` 为 `None` 时从本地临时文件读(外部编辑那条路);内置编辑器
+    /// 保存时把编码好的字节直接给进来 —— 内置那条在磁盘上根本没有文件。
+    ///
+    /// `snapshot` 取自条目本身:回传前 `stat` 一次远端跟它比,对不上就是
+    /// 冲突(D3-8)。冲突处置里的「覆盖远端」会先把快照刷成远端当前值,
+    /// 所以走的还是这同一条函数,不需要一条「强制写」的旁路。
+    fn push_edit(&mut self, key: u64, bytes: Option<Vec<u8>>) {
+        use crate::edit::sessions::EditState;
+        let Some(e) = self.edits.get(key) else {
+            return;
+        };
+        let (generation, remote, local, snapshot, saved_once) = (
+            e.generation,
+            e.remote.clone(),
+            e.local.clone(),
+            e.snapshot,
+            e.saved_once,
+        );
+        let bytes = match bytes {
+            Some(b) => b,
+            None => match std::fs::read(&local) {
+                Ok(b) => b,
+                Err(err) => {
+                    self.fail_edit(key, format!("读不到本地临时文件:{err}"));
+                    return;
+                }
+            },
+        };
+        // D3-7:只在**第一次**回传前留备份。远端那份在第一次回传之后就是
+        // 我们自己写的了,再备份既没意义又要多传一遍全量(用户在 vim 里
+        // 存十次就是十遍)。
+        let backup = if saved_once {
+            None
+        } else {
+            self.edit_originals.get(&key).cloned()
+        };
+        let client = match self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.sftp_client())
+        {
+            Some(c) => c,
+            None => {
+                self.fail_edit(key, "连接已断开,改动还在本地临时文件里".into());
+                return;
+            }
+        };
+        if let Some(e) = self.edits.get_mut(key) {
+            e.state = EditState::Uploading;
+        }
+        let proxy = self.proxy.clone();
+        let task = self._runtime.spawn(async move {
+            let result = write_back(&client, &remote, &bytes, snapshot, backup).await;
+            let _ = proxy.send_event(UserEvent::EditSaved { key, result });
+        });
+        self.track_sftp_task(generation, task);
+        self.ui_dirty = true;
+    }
+
+    /// 把一条编辑标成失败。**不弹错误框** —— 失败原因就写在「编辑中」那一行上,
+    /// 用户正在别的窗口里改字,一个模态框只会打断他。
+    fn fail_edit(&mut self, key: u64, why: String) {
+        use crate::edit::sessions::EditState;
+        let why2 = why.clone();
+        if let Some(e) = self.edits.get_mut(key) {
+            e.state = EditState::Failed(why);
+        }
+        if let Some(ed) = self.editor.as_mut().filter(|ed| ed.key == key) {
+            ed.finish_save(Err(why2));
+        }
+        self.ui_dirty = true;
+    }
+
+    /// F53:一次回传收工。
+    fn on_edit_saved(&mut self, key: u64, result: Result<EditWriteOutcome, String>) {
+        use crate::edit::sessions::EditState;
+        self.ui_dirty = true;
+        let (generation, local, label) = match self.edits.get(key) {
+            Some(e) => (e.generation, e.local.clone(), e.label.clone()),
+            // 条目在这次往返里被「结束编辑」掉了 —— 结果丢掉就是对的。
+            None => return,
+        };
+        match result {
+            Ok(EditWriteOutcome::Done(remote_now)) => {
+                self.edits
+                    .accept_write_back(key, remote_now, local_stamp(&local));
+                self.edit_originals.remove(&key);
+                self.edit_conflicts.remove(&key);
+                if let Some(ed) = self.editor.as_mut().filter(|ed| ed.key == key) {
+                    ed.finish_save(Ok(()));
+                }
+                self.ui.set_toast(format!("已回传:{label}"));
+                // 远端那一栏要刷 —— 大小/时间变了,不刷用户会以为没传上去。
+                self.dispatch_panel_action_for(
+                    generation,
+                    crate::ui::files_panel::PanelColumn::Remote,
+                    crate::ui::files_panel::FileAction::Refresh,
+                );
+            }
+            Ok(EditWriteOutcome::Conflict(remote_now)) => {
+                self.edit_conflicts.insert(key, remote_now);
+                if let Some(e) = self.edits.get_mut(key) {
+                    e.state = EditState::Conflict;
+                }
+                if let Some(ed) = self.editor.as_mut().filter(|ed| ed.key == key) {
+                    ed.finish_save(Err("远端已被改动,见处置框".into()));
+                }
+                self.open_edit_conflict(key);
+            }
+            Err(why) => self.fail_edit(key, why),
+        }
+    }
+
+    /// F53:开(或重开)一条编辑的冲突处置框。
+    fn open_edit_conflict(&mut self, key: u64) {
+        let Some(e) = self.edits.get(key) else {
+            return;
+        };
+        self.ui.files_dialog = Some(crate::ui::files_dialog::FilesDialog::EditConflict {
+            name: e.remote.display().to_string(),
+            key,
+        });
+        self.ui_dirty = true;
+    }
+
+    /// F53:用户在冲突框里选完了。
+    fn resolve_edit(&mut self, key: u64, choice: crate::ui::files_dialog::EditResolve) {
+        use crate::edit::sessions::EditState;
+        use crate::ui::files_dialog::EditResolve;
+        self.ui_dirty = true;
+        // 没有记到远端当时的戳就没法安全处置(条目已经被收走之类)。
+        let Some(remote_now) = self.edit_conflicts.get(&key).copied() else {
+            return;
+        };
+        match choice {
+            EditResolve::KeepRemote => {
+                // D3-9:**必须刷快照**。不刷的话下一次保存还会撞上同一个
+                // 冲突,这个框永远关不掉。
+                self.edits.keep_remote(key, remote_now);
+                self.edit_conflicts.remove(&key);
+                self.ui.set_toast("已保留远端那一份");
+            }
+            EditResolve::Overwrite => {
+                // 把比对基准换成远端当前值,再走同一条回传 —— 于是这一次
+                // `stat` 一定对得上,写下去。
+                if let Some(e) = self.edits.get_mut(key) {
+                    e.snapshot = remote_now;
+                    e.state = EditState::Watching;
+                }
+                self.edit_conflicts.remove(&key);
+                let bytes = self.editor_bytes_for(key);
+                self.push_edit(key, bytes);
+            }
+            EditResolve::SaveCopy => {
+                let Some(e) = self.edits.get(key) else {
+                    return;
+                };
+                let (generation, copy) = (e.generation, copy_path(&e.remote));
+                let bytes = match self.editor_bytes_for(key) {
+                    Some(b) => b,
+                    None => match std::fs::read(&e.local) {
+                        Ok(b) => b,
+                        Err(err) => {
+                            self.fail_edit(key, format!("读不到本地临时文件:{err}"));
+                            return;
+                        }
+                    },
+                };
+                let Some(client) = self
+                    .tabs
+                    .by_generation(generation)
+                    .and_then(|t| t.content.sftp_client())
+                else {
+                    self.fail_edit(key, "连接已断开,改动还在本地临时文件里".into());
+                    return;
+                };
+                // 副本落地之后,这条编辑就认远端那一份 —— 否则它会一直红着,
+                // 而用户已经把自己的改动安全存下来了。
+                self.edits.keep_remote(key, remote_now);
+                self.edit_conflicts.remove(&key);
+                let name = copy.display().to_string();
+                let proxy = self.proxy.clone();
+                let task = self._runtime.spawn(async move {
+                    let result = client
+                        .write_all_truncate(&copy, &bytes)
+                        .await
+                        .map_err(|e| format!("另存副本失败:{e}"));
+                    let _ = proxy.send_event(UserEvent::SftpOpDone { generation, result });
+                });
+                self.track_sftp_task(generation, task);
+                self.ui.set_toast(format!("已另存为 {name}"));
+            }
+        }
+    }
+
+    /// 内置编辑器此刻的字节(如果这条正开在内置编辑器里)。外部编辑那条恒
+    /// `None` —— 内容在临时文件里,由调用方读盘。
+    fn editor_bytes_for(&self, key: u64) -> Option<Vec<u8>> {
+        self.editor
+            .as_ref()
+            .filter(|e| e.key == key)
+            .map(|e| e.bytes())
+    }
+
+    /// F53:结束一条编辑 —— 停看门、删临时文件、从列表里去掉。
+    fn end_edit(&mut self, key: u64) {
+        if let Some(task) = self.edit_watchers.remove(&key) {
+            task.abort();
+        }
+        self.edit_originals.remove(&key);
+        self.edit_conflicts.remove(&key);
+        if let Some(e) = self.edits.remove(key) {
+            // 删不掉只记一条:临时文件残留不影响正确性,退出时那次
+            // `tempdir::purge` 还会再扫一遍。
+            if e.kind == crate::edit::sessions::EditKind::External {
+                if let Err(err) = std::fs::remove_file(&e.local) {
+                    log::debug!("删临时文件失败({}):{err}", e.local.display());
+                }
+            }
+        }
+        if self.editor.as_ref().is_some_and(|e| e.key == key) {
+            self.editor = None;
+        }
+        self.ui_dirty = true;
     }
 
     /// F55/F56:每帧调一次 —— 队列放行几条就起几条 worker。
@@ -3181,6 +3679,27 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.request_ui_redraw();
             }
+            UserEvent::EditOpened {
+                generation,
+                kind,
+                remote,
+                result,
+            } => {
+                self.finish_edit_open(generation, kind, remote, result);
+                self.request_ui_redraw();
+            }
+            UserEvent::EditTick { key, stamp } => {
+                self.on_edit_tick(key, stamp);
+                // **不无条件重绘**:看门任务只在文件真的变了时才发这条,
+                // 但「变了」不一定改动界面(基线登记那一次就不改)。
+                if self.ui_dirty {
+                    self.request_ui_redraw();
+                }
+            }
+            UserEvent::EditSaved { key, result } => {
+                self.on_edit_saved(key, result);
+                self.request_ui_redraw();
+            }
         }
     }
 
@@ -3315,11 +3834,24 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match event {
             WindowEvent::CloseRequested => {
+                // F53/D3-12:有改动没传回远端就先拦一下。**只拦第一次** ——
+                // 拦第二次的话,用户在确认框里选了「仍然退出」之后,那一下
+                // `event_loop.exit()` 会再走一遍这里又被拦住,窗口永远关不掉。
+                if self.edits.blocks_exit() && !self.ui.exit_pending {
+                    crate::logx::line("CloseRequested → 有未回传的编辑,先问一句");
+                    self.ui.exit_pending = true;
+                    self.request_ui_redraw();
+                    return;
+                }
                 crate::logx::line("CloseRequested → 退出");
                 // F92:进程要走了,20 秒的 timeout 别悬着。
                 if let Some(h) = self.probe_task.take() {
                     h.abort();
                 }
+                // D3-12:临时目录整棵删掉。放在 `exit()` 之前 —— winit 的
+                // `exiting()` 在某些平台上不保证被调到,而残留的临时目录里
+                // 是远端文件的明文副本。
+                crate::edit::tempdir::purge(&self.edit_root);
                 event_loop.exit();
             }
             // 焦点/遮挡:记录以便定位「失焦后无法回到前台/黑屏」;回到前台时补一次
@@ -3823,6 +4355,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 content_arg,
                                 files_owner_generation.unwrap_or(0),
                                 &self.transfer_queue,
+                                &self.edits,
+                                &mut self.editor,
                             );
                             drop(renders);
                             drop(titles);
@@ -3925,6 +4459,60 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
                                     TransferUiAction::ClearFinished => {
                                         self.transfer_queue.clear_finished()
+                                    }
+                                }
+                                self.ui_dirty = true;
+                            }
+                            // F53:「编辑中」面板上按下的东西。
+                            if let Some(a) = actions.edit {
+                                use crate::ui::edit_panel::EditUiAction;
+                                match a {
+                                    EditUiAction::End(key) => self.end_edit(key),
+                                    EditUiAction::Resolve(key) => self.open_edit_conflict(key),
+                                }
+                            }
+                            // F53:内置编辑器窗口。保存走**与外部编辑同一条**
+                            // 回传路径(含远端变更检查)——分两条的话冲突检查
+                            // 迟早只剩一条上有。
+                            if let Some(a) = actions.editor {
+                                use crate::ui::editor_window::EditorAction;
+                                match a {
+                                    EditorAction::Save => {
+                                        if let Some(ed) = self.editor.as_mut() {
+                                            let (key, bytes, backup) =
+                                                (ed.key, ed.bytes(), ed.backup);
+                                            ed.busy = true;
+                                            // 用户把「留一份 .mullion.bak」关了:
+                                            // 把原文丢掉,这条回传就不会带备份。
+                                            if !backup {
+                                                self.edit_originals.remove(&key);
+                                            }
+                                            self.push_edit(key, Some(bytes));
+                                        }
+                                    }
+                                    // 关窗 = 这条编辑结束(确认丢弃已经在窗口里
+                                    // 问过了)。临时文件一并收掉。
+                                    EditorAction::Close(key) => self.end_edit(key),
+                                }
+                            }
+                            // F53/D3-12:退出确认框的选择。
+                            if let Some(c) = actions.exit {
+                                use crate::ui::edit_panel::ExitChoice;
+                                self.ui.exit_pending = false;
+                                match c {
+                                    // `exit_pending` 已经清掉,这一下 CloseRequested
+                                    // 就穿过拦截了(见那里的注释)。
+                                    ExitChoice::Anyway => {
+                                        if let Some(h) = self.probe_task.take() {
+                                            h.abort();
+                                        }
+                                        crate::edit::tempdir::purge(&self.edit_root);
+                                        event_loop.exit();
+                                    }
+                                    ExitChoice::Cancel => {
+                                        // 回去处理:把「编辑中」展开,否则用户
+                                        // 关掉框之后还得自己去找那一行。
+                                        self.ui.edit_expanded = true;
                                     }
                                 }
                                 self.ui_dirty = true;
@@ -4431,6 +5019,89 @@ fn spawn_sftp_open(
     })
 }
 
+/// F53:本地临时文件此刻的样子。`None` = 不在了(用户自己删了 / 编辑器
+/// 换了 inode 又没落回原名)。
+///
+/// mtime 取**毫秒**:秒级分不出「同一秒内保存两次」,而脚本化的编辑
+/// (`sed -i` 连着跑两遍)就是这个节奏。
+fn local_stamp(path: &std::path::Path) -> Option<crate::edit::sessions::LocalStamp> {
+    let md = std::fs::metadata(path).ok()?;
+    let ms = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((ms, md.len()))
+}
+
+/// F53/D3-7:备份落在**同目录**、原名加后缀。不放临时目录 —— 用户找回它
+/// 的时候人在远端那台机器上,不在我们的临时目录里。
+fn backup_path(remote: &mullion_ssh::sftp::RemotePath) -> mullion_ssh::sftp::RemotePath {
+    let mut bytes = remote.as_bytes().to_vec();
+    bytes.extend_from_slice(b".mullion.bak");
+    mullion_ssh::sftp::RemotePath::from_bytes(bytes)
+}
+
+/// F53:「另存为副本」的落点。
+fn copy_path(remote: &mullion_ssh::sftp::RemotePath) -> mullion_ssh::sftp::RemotePath {
+    let mut bytes = remote.as_bytes().to_vec();
+    bytes.extend_from_slice(b".mullion-copy");
+    mullion_ssh::sftp::RemotePath::from_bytes(bytes)
+}
+
+/// F53/D3-8:回传一次。真正的「先比对再覆盖」在 `SftpClient::write_if_unchanged`
+/// 里(那一层才够得着假服务端做端到端守护),这里只负责把 `.mullion.bak`
+/// 的落点算出来、把协议错误翻成人话。
+async fn write_back(
+    client: &mullion_ssh::sftp::SftpClient,
+    remote: &mullion_ssh::sftp::RemotePath,
+    bytes: &[u8],
+    snapshot: crate::edit::sessions::RemoteStamp,
+    backup: Option<Vec<u8>>,
+) -> Result<EditWriteOutcome, String> {
+    let bak = backup.map(|orig| (backup_path(remote), orig));
+    let outcome = client
+        .write_if_unchanged(
+            remote,
+            bytes,
+            snapshot,
+            bak.as_ref().map(|(p, b)| (p, b.as_slice())),
+        )
+        .await
+        .map_err(|e| format!("回传失败:{e}"))?;
+    Ok(match outcome {
+        mullion_ssh::sftp::WriteOutcome::Written { mtime, size } => {
+            EditWriteOutcome::Done((mtime, size))
+        }
+        mullion_ssh::sftp::WriteOutcome::Conflict { mtime, size } => {
+            EditWriteOutcome::Conflict((mtime, size))
+        }
+    })
+}
+
+/// F53:把要编辑的文件整个读回来,并取回**读完那一刻**的远端戳。
+///
+/// `stat` 放在读之后:戳的用途是回传前判「远端有没有被别人改过」,它必须
+/// 描述我们手上这份内容对应的那个版本。读之前 stat 的话,读的过程中(几十
+/// MB 走高延迟链路可能好几秒)对方改了文件,我们会拿着旧戳 + 撕裂的内容,
+/// 回传时判定「没人动过」直接覆盖 —— 那正是这套机制要防的事。
+async fn read_for_edit(
+    client: &mullion_ssh::sftp::SftpClient,
+    path: &mullion_ssh::sftp::RemotePath,
+    limit: u64,
+) -> Result<(Vec<u8>, crate::edit::sessions::RemoteStamp), String> {
+    let bytes = client
+        .read_all(path, limit)
+        .await
+        .map_err(|e| format!("读取文件失败:{e}"))?;
+    let st = client
+        .stat(path)
+        .await
+        .map_err(|e| format!("读取文件属性失败:{e}"))?;
+    Ok((bytes, (st.mtime, st.size)))
+}
+
 /// F50:异步列一次目录。结果经 `UserEvent::SftpListed` 回送(`App::accept_sftp_listed`
 /// 接)。`seq` 原样带上,回来时对着 `PaneState::request_seq` 校验——用户点得
 /// 比网络快时,后发先至的旧结果据此被丢弃。自由函数的理由同 `spawn_sftp_open`。
@@ -4580,6 +5251,9 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.files_local.is_some()
         || a.files_op.is_some()
         || a.transfer.is_some()
+        || a.edit.is_some()
+        || a.editor.is_some()
+        || a.exit.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -4603,6 +5277,9 @@ fn render_frame(
     files_generation: u64,
     // F55:传输队列,只读转给 `build_ui`(见其同名参数的文档)。
     queue: &crate::files::queue::Queue,
+    // F53:在编辑的那些文件 + 内置编辑器窗口,转给 `build_ui`。
+    edits: &crate::edit::sessions::EditSessions,
+    editor: &mut Option<crate::ui::editor_window::EditorState>,
 ) -> (std::time::Duration, crate::ui::UiActions) {
     diag::count_frame();
     // --- egui:每帧都跑,launcher 态(panes 为空)也要画菜单/状态栏。---
@@ -4639,6 +5316,8 @@ fn render_frame(
             files_content.as_deref_mut(),
             files_generation,
             queue,
+            edits,
+            editor,
         );
         if has_real_action(&this_pass) {
             actions = this_pass;

@@ -36,6 +36,14 @@ pub enum FilesDialog {
         /// 九宫格当前值(低 9 位)。
         mode: u32,
     },
+    /// F53:回传前发现远端那份已经被别人改过(D3-8)。**必须问** ——
+    /// 直接覆盖会悄悄吃掉别人的改动,而这是我们自己发起的写。
+    EditConflict {
+        /// 冲突的那个文件(给用户看的完整路径)。
+        name: String,
+        /// 是哪一条编辑。同 `Conflict::job`:按名字回填会串。
+        key: u64,
+    },
     /// F55:传输的目标已存在。**必须问**,绝不静默覆盖。
     Conflict {
         /// 冲突的那个名字(给用户看的,不参与拼路径)。
@@ -66,6 +74,11 @@ pub enum FileOp {
         path: RemotePath,
         mode: u32,
     },
+    /// F53:编辑冲突的处置。同 `Resolve`,界面只送回选择。
+    ResolveEdit {
+        key: u64,
+        choice: EditResolve,
+    },
     /// F55:冲突处置。**不带路径** —— 具体怎么落盘由 worker 按 `choice`
     /// 决定,界面只负责把用户的选择原样送回队列。
     Resolve {
@@ -73,6 +86,18 @@ pub enum FileOp {
         choice: crate::files::queue::Conflict,
         apply_all: bool,
     },
+}
+
+/// F53:回传撞上「远端已被改动」时的三条出路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditResolve {
+    /// 不回传,认远端那一份。**同时把快照刷成远端当前值**(D3-9)——
+    /// 不刷的话下一次保存还会撞上同一个冲突,框永远关不掉。
+    KeepRemote,
+    /// 拿我这份盖掉远端。会丢掉别人的改动,所以标危险色。
+    Overwrite,
+    /// 存成同目录下的一个副本,两份都留着,谁也不丢。
+    SaveCopy,
 }
 
 /// 删除确认框的那句话。抽成纯函数是因为它是**这一片唯一一句会直接导致
@@ -277,6 +302,55 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 });
             });
         }
+        FilesDialog::EditConflict { name, key } => {
+            let key = *key;
+            let name_disp = name.clone();
+            modal(ctx, "远端文件已被改动", |ui| {
+                ui.label(format!("你在编辑「{name_disp}」期间,远端那一份变了。"));
+                ui.label(
+                    egui::RichText::new("直接覆盖会丢掉对方的改动,不可撤销。")
+                        .color(theme::c32(t.fg_dim)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("保留远端(丢弃我的改动)").clicked() {
+                        op = Some(FileOp::ResolveEdit {
+                            key,
+                            choice: EditResolve::KeepRemote,
+                        });
+                        close = true;
+                    }
+                    if ui.button("另存为副本").clicked() {
+                        op = Some(FileOp::ResolveEdit {
+                            key,
+                            choice: EditResolve::SaveCopy,
+                        });
+                        close = true;
+                    }
+                    // 「覆盖远端」标危险色(F119):三条里唯一会毁数据的。
+                    if ui
+                        .button(egui::RichText::new("覆盖远端").color(theme::c32(t.danger)))
+                        .clicked()
+                    {
+                        op = Some(FileOp::ResolveEdit {
+                            key,
+                            choice: EditResolve::Overwrite,
+                        });
+                        close = true;
+                    }
+                    // 「取消」= 保留远端,**不能只关框**:那条编辑会一直挂在
+                    // `Conflict` 上,每次轮询都想回传、每次都撞冲突,而快照
+                    // 永远不动 —— 界面上只看得出「这个文件一直红着」。
+                    if ui.button("取消").clicked() {
+                        op = Some(FileOp::ResolveEdit {
+                            key,
+                            choice: EditResolve::KeepRemote,
+                        });
+                        close = true;
+                    }
+                });
+            });
+        }
         FilesDialog::Conflict {
             name,
             job,
@@ -405,6 +479,76 @@ mod tests {
             }),
             "取消必须把这条 job 收掉"
         );
+    }
+
+    fn edit_conflict() -> Option<FilesDialog> {
+        Some(FilesDialog::EditConflict {
+            name: "/etc/nginx/nginx.conf".into(),
+            key: 9,
+        })
+    }
+
+    /// D3-8:回传撞上「远端也被人改了」时,三条出路一条都不能少 ——
+    /// 只给「覆盖 / 取消」的话,用户为了不丢自己的改动只能选覆盖,
+    /// 于是对方的改动一定没了。
+    #[test]
+    fn the_edit_conflict_dialog_offers_a_way_out_that_loses_nobodys_work() {
+        let mut d = edit_conflict();
+        let texts = dialog_texts(&mut d);
+        let joined = texts.join(" ");
+        assert!(joined.contains("nginx.conf"), "该说清是哪个文件:{joined}");
+        assert!(joined.contains("远端"), "该说清发生了什么:{joined}");
+        for label in ["保留远端(丢弃我的改动)", "另存为副本", "覆盖远端", "取消"]
+        {
+            assert!(
+                texts.iter().any(|s| s == label),
+                "冲突处置框少了「{label}」:{texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_overwrite_reports_which_edit_it_belongs_to() {
+        let mut d = edit_conflict();
+        let op = click_button(&mut d, "覆盖远端");
+        assert_eq!(
+            op,
+            Some(FileOp::ResolveEdit {
+                key: 9,
+                choice: EditResolve::Overwrite,
+            })
+        );
+        assert!(d.is_none(), "选完该把框关掉");
+    }
+
+    #[test]
+    fn choosing_save_a_copy_keeps_both_sides() {
+        let mut d = edit_conflict();
+        assert_eq!(
+            click_button(&mut d, "另存为副本"),
+            Some(FileOp::ResolveEdit {
+                key: 9,
+                choice: EditResolve::SaveCopy,
+            })
+        );
+    }
+
+    /// 「取消」必须落到 `KeepRemote`,**不能只关框**:只关框的话那条编辑
+    /// 一直挂在 `Conflict` 上,每次存盘都想回传、每次都撞同一个冲突,
+    /// 快照永远不动,界面上只看得出「这个文件一直红着」。
+    #[test]
+    fn canceling_an_edit_conflict_settles_it_instead_of_leaving_the_file_stuck_red() {
+        let mut d = edit_conflict();
+        let op = click_button(&mut d, "取消");
+        assert_eq!(
+            op,
+            Some(FileOp::ResolveEdit {
+                key: 9,
+                choice: EditResolve::KeepRemote,
+            }),
+            "取消必须把这条编辑收掉"
+        );
+        assert!(d.is_none());
     }
 
     /// 文件和目录要**分开数**。混着数的话,「将删除 3 个文件」后面跟着

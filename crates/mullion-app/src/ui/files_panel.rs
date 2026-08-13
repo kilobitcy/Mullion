@@ -33,6 +33,14 @@ pub enum FileAction {
     /// F52:把这一栏选中的东西传到对面那一栏(远端栏 = 下载,本地栏 = 上传)。
     /// **方向由发起的栏决定**,不需要额外参数 —— 调用方本来就知道自己是哪栏。
     Transfer,
+    /// F53:用系统默认程序编辑**光标行**那个远端文件。
+    ///
+    /// 不带路径:跟 `FileAsk::Rename`/`Chmod` 一样走「光标行」这条既有约定,
+    /// app 侧本来就要按光标行解析目标。双击那条路径会先把光标挪到被双击的
+    /// 行上再发这个动作,所以两个入口拿到的是同一个目标。
+    EditExternal,
+    /// F53:在内置编辑器里编辑光标行。
+    EditInline,
 }
 
 /// 要打开哪个对话框。
@@ -58,30 +66,75 @@ pub enum MenuItem {
     OpenInExplorer,
     Refresh,
     Transfer,
+    EditExternal,
+    EditInline,
+}
+
+/// 右键那一刻的光标行。**只有「是不是普通文件」和大小** —— 那一刻手上
+/// 只有 `Entry`,没有内容,所以「是不是二进制」在这里判不了
+/// (D3-3:二进制留到读回内容之后判)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuTarget {
+    /// 目录 / 链接 / 设备文件都不是。编辑只对普通文件成立。
+    pub is_file: bool,
+    pub size: u64,
+}
+
+/// 菜单里的一项。带 `disabled` 是因为「这个文件太大所以编不了」必须**说出来**:
+/// 悄悄少一项,用户只会以为程序坏了(D3-2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuEntry {
+    pub label: &'static str,
+    pub item: MenuItem,
+    /// 置灰的理由。`None` = 可点。
+    pub disabled: Option<&'static str>,
+}
+
+fn on(label: &'static str, item: MenuItem) -> MenuEntry {
+    MenuEntry {
+        label,
+        item,
+        disabled: None,
+    }
 }
 
 /// 这一栏此刻该有哪些右键菜单项。
 ///
 /// - `column`:远端栏才有写操作(设计 D5:本地文件管理外包给资源管理器)。
-/// - `has_cursor`:有没有光标行。没有就不给单目标操作 ——
+/// - `target`:光标行。`None` 就不给单目标操作 ——
 ///   给一个点了没反应的菜单项比不给更让人困惑。
-pub fn menu_items_for(column: PanelColumn, has_cursor: bool) -> Vec<(&'static str, MenuItem)> {
-    let mut out: Vec<(&'static str, MenuItem)> = Vec::new();
+pub fn menu_items_for(column: PanelColumn, target: Option<MenuTarget>) -> Vec<MenuEntry> {
+    let mut out: Vec<MenuEntry> = Vec::new();
     if column == PanelColumn::Remote {
-        out.push(("新建文件夹…", MenuItem::Ask(FileAsk::NewDir)));
-        if has_cursor {
-            out.push(("下载到本地", MenuItem::Transfer));
-            out.push(("重命名…", MenuItem::Ask(FileAsk::Rename)));
-            out.push(("属性(权限)…", MenuItem::Ask(FileAsk::Chmod)));
-            out.push(("删除…", MenuItem::Ask(FileAsk::Delete)));
+        out.push(on("新建文件夹…", MenuItem::Ask(FileAsk::NewDir)));
+        if let Some(tg) = target {
+            out.push(on("下载到本地", MenuItem::Transfer));
+            // F53:只对普通文件出现。目录/链接上给一个「编辑」纯属误导。
+            if tg.is_file {
+                out.push(MenuEntry {
+                    label: "用默认程序编辑",
+                    item: MenuItem::EditExternal,
+                    disabled: (tg.size > crate::edit::EXTERNAL_LIMIT)
+                        .then_some("文件太大,用「下载到本地」取回来再处理"),
+                });
+                out.push(MenuEntry {
+                    label: "在 Mullion 里编辑",
+                    item: MenuItem::EditInline,
+                    disabled: (tg.size > crate::edit::INLINE_LIMIT)
+                        .then_some("超过 1 MB,请用「用默认程序编辑」"),
+                });
+            }
+            out.push(on("重命名…", MenuItem::Ask(FileAsk::Rename)));
+            out.push(on("属性(权限)…", MenuItem::Ask(FileAsk::Chmod)));
+            out.push(on("删除…", MenuItem::Ask(FileAsk::Delete)));
         }
     } else {
-        if has_cursor {
-            out.push(("上传到远端", MenuItem::Transfer));
+        if target.is_some() {
+            out.push(on("上传到远端", MenuItem::Transfer));
         }
-        out.push(("在资源管理器中打开", MenuItem::OpenInExplorer));
+        out.push(on("在资源管理器中打开", MenuItem::OpenInExplorer));
     }
-    out.push(("刷新", MenuItem::Refresh));
+    out.push(on("刷新", MenuItem::Refresh));
     out
 }
 
@@ -92,6 +145,8 @@ impl MenuItem {
             MenuItem::OpenInExplorer => FileAction::OpenInExplorer,
             MenuItem::Refresh => FileAction::Refresh,
             MenuItem::Transfer => FileAction::Transfer,
+            MenuItem::EditExternal => FileAction::EditExternal,
+            MenuItem::EditInline => FileAction::EditInline,
         }
     }
 }
@@ -102,15 +157,34 @@ fn menu_body(
     ui: &mut Ui,
     id: &str,
     column: PanelColumn,
-    has_cursor: bool,
+    target: Option<MenuTarget>,
     hit: &mut Option<MenuItem>,
 ) {
     annotate::mark(ui.ctx(), format!("文件面板/{id}/右键菜单"), ui.max_rect());
-    for (label, item) in menu_items_for(column, has_cursor) {
-        if ui.button(label).clicked() {
-            *hit = Some(item);
-            ui.close_menu();
+    for e in menu_items_for(column, target) {
+        match e.disabled {
+            // 置灰项仍然画出来,并且把理由挂成 hover —— 灰着不说话等于没说。
+            Some(why) => {
+                ui.add_enabled(false, egui::Button::new(e.label))
+                    .on_disabled_hover_text(why);
+            }
+            None => {
+                if ui.button(e.label).clicked() {
+                    *hit = Some(e.item);
+                    ui.close_menu();
+                }
+            }
         }
+    }
+}
+
+/// 把一行折成右键菜单要看的那两个事实。
+fn menu_target(e: &mullion_ssh::sftp::Entry) -> MenuTarget {
+    MenuTarget {
+        // `is_operable()` 而不是 `is_utf8()`:名字送不上线的行,任何
+        // 单目标操作都做不了(D1 定的 UI 闸门)。
+        is_file: e.kind == EntryKind::File && e.name.is_operable(),
+        size: e.size,
     }
 }
 
@@ -181,12 +255,17 @@ pub fn show(
     // 挂到栏尾会把整栏罩住,书签按钮和行的左键点击全被它吃掉
     // (`clicking_a_bookmark_dispatches_goto_to_its_path` 逮到过这一版)。
     let mut menu_hit = None;
+    let bg_target = state
+        .cursor
+        .as_ref()
+        .and_then(|c| state.entries.iter().find(|e| e.name == *c))
+        .map(menu_target);
     ui.interact(
         ui.max_rect(),
         ui.id().with(("files-bg-menu", id, generation)),
         egui::Sense::click(),
     )
-    .context_menu(|ui| menu_body(ui, id, column, state.cursor.is_some(), &mut menu_hit));
+    .context_menu(|ui| menu_body(ui, id, column, bg_target, &mut menu_hit));
     // 就地收口,不留到函数末尾 —— 下面 `Load` 不是 `Ready` 时会提前 return,
     // 挂在末尾的话「正在读取目录…」时右键点刷新没反应。
     if let Some(item) = menu_hit.take() {
@@ -261,6 +340,7 @@ pub fn show(
     type Click = (mullion_ssh::sftp::RemotePath, bool, bool);
     let mut clicked: Option<Click> = None;
     let mut goto = None;
+    let mut edit = false;
     egui::ScrollArea::vertical()
         .id_salt(scroll_id_salt(id, generation))
         .auto_shrink([false, false])
@@ -282,11 +362,23 @@ pub fn show(
                 }
                 // 行自己也挂一份菜单:行是后注册的,压在背景那份上面,
                 // 右键落在行上时背景那份收不到(见函数开头的 z 序说明)。
-                // `has_cursor` 直接给 `true` —— 右键这一下已经保证有目标行了。
-                resp.context_menu(|ui| menu_body(ui, id, column, true, &mut menu_hit));
+                // 目标直接取被右键的这一行 —— 不走 `state.cursor`,那个要等
+                // 出了闭包才更新,这一帧里还是上一条。
+                let tg = menu_target(e);
+                resp.context_menu(|ui| menu_body(ui, id, column, Some(tg), &mut menu_hit));
                 if resp.double_clicked() {
-                    if let Some(target) = state.enter_target(e) {
-                        goto = Some(target);
+                    match state.enter_target(e) {
+                        Some(target) => goto = Some(target),
+                        // F53:双击**文件**不该是「什么都不发生」。远端栏交给
+                        // 默认程序编辑;本地栏什么也不做(D5:本地文件管理外包
+                        // 给资源管理器,双击本地文件应由用户在资源管理器里做)。
+                        None if column == PanelColumn::Remote && tg.is_file => {
+                            // 先把光标挪到被双击的这一行 —— 动作本身不带路径,
+                            // app 侧按光标行解析目标。
+                            clicked = Some((e.name.clone(), false, false));
+                            edit = true;
+                        }
+                        None => {}
                     }
                 }
             }
@@ -296,6 +388,9 @@ pub fn show(
     }
     if let Some(g) = goto {
         action = Some(FileAction::Goto(g));
+    }
+    if edit {
+        action = Some(FileAction::EditExternal);
     }
     if let Some(item) = menu_hit {
         action = Some(item.into_action());
@@ -707,6 +802,14 @@ mod tests {
         shapes.iter().find_map(|cs| walk(&cs.shape, needle))
     }
 
+    /// 光标停在一个「普通、不大」的文件上 —— 菜单测试的默认目标。
+    fn a_file() -> MenuTarget {
+        MenuTarget {
+            is_file: true,
+            size: 1024,
+        }
+    }
+
     fn entry(name: &[u8], kind: EntryKind) -> Entry {
         Entry {
             name: RemotePath::from_bytes(name.to_vec()),
@@ -731,18 +834,18 @@ mod tests {
     /// 永远不出现远端写操作(加入口时最容易顺手把整套菜单抄过去)。
     #[test]
     fn both_columns_offer_a_transfer_entry_but_only_the_remote_one_can_write() {
-        let remote = menu_items_for(PanelColumn::Remote, true);
-        let local = menu_items_for(PanelColumn::Local, true);
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()));
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()));
         assert!(
-            remote.iter().any(|(l, _)| *l == "下载到本地"),
+            remote.iter().any(|e| e.label == "下载到本地"),
             "远端栏该有下载:{remote:?}"
         );
         assert!(
-            local.iter().any(|(l, _)| *l == "上传到远端"),
+            local.iter().any(|e| e.label == "上传到远端"),
             "本地栏该有上传:{local:?}"
         );
         assert!(
-            !local.iter().any(|(_, m)| matches!(m, MenuItem::Ask(_))),
+            !local.iter().any(|e| matches!(e.item, MenuItem::Ask(_))),
             "本地栏冒出了远端写操作(D5):{local:?}"
         );
     }
@@ -752,9 +855,9 @@ mod tests {
     #[test]
     fn no_cursor_means_no_transfer_entry_at_all() {
         for column in [PanelColumn::Remote, PanelColumn::Local] {
-            let items = menu_items_for(column, false);
+            let items = menu_items_for(column, None);
             assert!(
-                !items.iter().any(|(_, m)| *m == MenuItem::Transfer),
+                !items.iter().any(|e| e.item == MenuItem::Transfer),
                 "{column:?} 栏在没有光标行时给出了传输入口:{items:?}"
             );
         }
@@ -1216,8 +1319,8 @@ mod tests {
     /// (egui 的 `context_menu` 要一次右键 + 一帧才展开,测起来又脆又慢)。
     #[test]
     fn the_local_column_never_offers_a_write_operation() {
-        let remote = menu_items_for(PanelColumn::Remote, true);
-        let local = menu_items_for(PanelColumn::Local, true);
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()));
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()));
         for ask in [
             FileAsk::NewDir,
             FileAsk::Rename,
@@ -1225,16 +1328,16 @@ mod tests {
             FileAsk::Chmod,
         ] {
             assert!(
-                remote.iter().any(|(_, a)| *a == MenuItem::Ask(ask)),
+                remote.iter().any(|e| e.item == MenuItem::Ask(ask)),
                 "远端栏该有 {ask:?}"
             );
             assert!(
-                !local.iter().any(|(_, a)| *a == MenuItem::Ask(ask)),
+                !local.iter().any(|e| e.item == MenuItem::Ask(ask)),
                 "本地栏不该出现 {ask:?}(D5:本地文件管理外包给资源管理器)"
             );
         }
         assert!(
-            local.iter().any(|(_, a)| *a == MenuItem::OpenInExplorer),
+            local.iter().any(|e| e.item == MenuItem::OpenInExplorer),
             "本地栏该有「在资源管理器中打开」"
         );
     }
@@ -1243,17 +1346,17 @@ mod tests {
     /// 给一个「点了没反应」的菜单项比不给更让人困惑。
     #[test]
     fn single_target_operations_are_absent_without_a_cursor_row() {
-        let items = menu_items_for(PanelColumn::Remote, false);
+        let items = menu_items_for(PanelColumn::Remote, None);
         for ask in [FileAsk::Rename, FileAsk::Chmod, FileAsk::Delete] {
             assert!(
-                !items.iter().any(|(_, a)| *a == MenuItem::Ask(ask)),
+                !items.iter().any(|e| e.item == MenuItem::Ask(ask)),
                 "没有光标行时不该出现 {ask:?}"
             );
         }
         // 「新建文件夹」不需要选中任何东西 —— 空目录里也得能建。
         assert!(items
             .iter()
-            .any(|(_, a)| *a == MenuItem::Ask(FileAsk::NewDir)));
+            .any(|e| e.item == MenuItem::Ask(FileAsk::NewDir)));
     }
 
     /// 右键菜单要真的挂上去、真的能发出动作 —— `menu_items_for` 全对但
@@ -1327,6 +1430,203 @@ mod tests {
             action,
             Some(FileAction::Ask(FileAsk::NewDir)),
             "点菜单里的「新建文件夹…」该发出 Ask(NewDir)"
+        );
+    }
+
+    /// F53/D5:编辑的是**远端**文件。本地栏双击/右键都不该冒出这两项 ——
+    /// 本地文件本来就该在资源管理器里双击。
+    #[test]
+    fn the_local_column_never_offers_a_remote_edit_entry() {
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()));
+        assert!(
+            !local
+                .iter()
+                .any(|e| matches!(e.item, MenuItem::EditExternal | MenuItem::EditInline)),
+            "本地栏冒出了远端编辑入口:{local:?}"
+        );
+        // 反面:远端栏必须有,否则上一条断言在「谁都没有」时也是绿的。
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()));
+        assert!(
+            remote
+                .iter()
+                .any(|e| matches!(e.item, MenuItem::EditExternal | MenuItem::EditInline)),
+            "远端栏该有编辑入口:{remote:?}"
+        );
+    }
+
+    /// 目录 / 链接上给一个「编辑」纯属误导 —— 点下去只能报错。
+    #[test]
+    fn only_a_plain_file_offers_editing() {
+        let dir = MenuTarget {
+            is_file: false,
+            size: 4096,
+        };
+        let items = menu_items_for(PanelColumn::Remote, Some(dir));
+        assert!(
+            !items
+                .iter()
+                .any(|e| matches!(e.item, MenuItem::EditExternal | MenuItem::EditInline)),
+            "目录上不该出现编辑项:{items:?}"
+        );
+        // 但目录仍然可以下载 / 重命名 —— 别把整段菜单一起砍掉了。
+        assert!(items.iter().any(|e| e.item == MenuItem::Transfer));
+    }
+
+    /// 太大的文件:菜单项**留着并置灰、带理由**,不是悄悄消失。
+    /// 少一项用户只会以为程序坏了(D3-2)。
+    #[test]
+    fn an_oversize_file_keeps_a_greyed_entry_that_says_why() {
+        let big = MenuTarget {
+            is_file: true,
+            size: crate::edit::INLINE_LIMIT + 1,
+        };
+        let items = menu_items_for(PanelColumn::Remote, Some(big));
+        let inline = items
+            .iter()
+            .find(|e| e.item == MenuItem::EditInline)
+            .expect("超限也该看得见这一项");
+        assert!(
+            inline.disabled.is_some_and(|w| w.contains("1 MB")),
+            "该说清为什么点不了:{inline:?}"
+        );
+        // 只超内置那一档时,外部编辑还得能点。
+        let ext = items
+            .iter()
+            .find(|e| e.item == MenuItem::EditExternal)
+            .expect("该有外部编辑");
+        assert!(ext.disabled.is_none(), "1 MB 出头不该拦住外部编辑:{ext:?}");
+
+        let huge = MenuTarget {
+            is_file: true,
+            size: crate::edit::EXTERNAL_LIMIT + 1,
+        };
+        let items = menu_items_for(PanelColumn::Remote, Some(huge));
+        assert!(
+            items
+                .iter()
+                .find(|e| e.item == MenuItem::EditExternal)
+                .expect("该有外部编辑")
+                .disabled
+                .is_some(),
+            "超过外部上限该置灰:{items:?}"
+        );
+    }
+
+    /// D20:双击一个**文件**在 D1/D2 里是「什么都不发生」——最容易被当成
+    /// 程序卡了。F53 之后它该直接开外部编辑器。
+    #[test]
+    fn double_clicking_a_plain_file_opens_the_external_editor_instead_of_doing_nothing() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![
+            entry(b"a.txt", EntryKind::File),
+            entry(b"sub", EntryKind::Dir),
+        ];
+        state.load = Load::Ready;
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState| {
+            let mut action = None;
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        false,
+                        &[],
+                    );
+                });
+            });
+            (action, out)
+        };
+        let _ = render(egui::RawInput::default(), &mut state);
+        let (_, out) = render(egui::RawInput::default(), &mut state);
+
+        // `at` 是这一帧的时间戳。**必须显式给、而且两次双击要隔开** ——
+        // egui 0.30 的连击计数**只看时间不看位置**(`input_state/mod.rs`
+        // 的 `triple_click`),紧挨着的第二次双击会被算成三连击,
+        // `double_clicked()` 只认 count == 2,于是一声不响地不触发。
+        let double = |pos: egui::Pos2, at: f64| {
+            let mut input = egui::RawInput {
+                time: Some(at),
+                ..Default::default()
+            };
+            input.events.push(egui::Event::PointerMoved(pos));
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+            input
+        };
+
+        let file_pos = find_text_pos(&out.shapes, "a.txt").expect("列表里该有 a.txt");
+        let (action, _) = render(double(file_pos, 1.0), &mut state);
+        assert_eq!(
+            action,
+            Some(FileAction::EditExternal),
+            "双击文件该开外部编辑器"
+        );
+        // 而且光标要落在被双击的那一行 —— 动作不带路径,靠光标定目标。
+        assert_eq!(
+            state.cursor.as_ref().map(|c| c.as_bytes().to_vec()),
+            Some(b"a.txt".to_vec()),
+            "双击没把光标挪过去,app 侧会去编辑别的文件"
+        );
+
+        // 反面:同一份数据挂在**本地栏**上,双击文件什么也不该发生
+        // (D5:本地文件在资源管理器里双击就行)。菜单那条口径已经有
+        // `the_local_column_never_offers_a_remote_edit_entry` 守着,
+        // 双击是另一条独立的入口,漏了它照样能把本地文件送去编辑远端。
+        {
+            let ctx = egui::Context::default();
+            let mut local = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+            local.entries = vec![entry(b"a.txt", EntryKind::File)];
+            local.load = Load::Ready;
+            let render_local = |input: egui::RawInput, state: &mut PaneState| {
+                let mut action = None;
+                let out = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        action = show(
+                            ui,
+                            &t,
+                            "本地",
+                            1,
+                            PanelColumn::Local,
+                            state,
+                            false,
+                            false,
+                            &[],
+                        );
+                    });
+                });
+                (action, out)
+            };
+            let _ = render_local(egui::RawInput::default(), &mut local);
+            let (_, out) = render_local(egui::RawInput::default(), &mut local);
+            let pos = find_text_pos(&out.shapes, "a.txt").expect("本地栏里该有 a.txt");
+            let (action, _) = render_local(double(pos, 1.0), &mut local);
+            assert_eq!(action, None, "本地栏双击文件不该发出任何远端动作");
+        }
+
+        // 反面:双击**目录**仍然是进目录,不能被编辑这条路抢走。
+        // 先空跑一帧让 egui 的点击计数归零 —— 紧挨着上一次双击再点,
+        // 它会当成一串连击而不是新的一次双击。
+        let (_, out) = render(egui::RawInput::default(), &mut state);
+        let dir_pos = find_text_pos(&out.shapes, "sub").expect("列表里该有 sub");
+        let (action, _) = render(double(dir_pos, 10.0), &mut state);
+        assert!(
+            matches!(action, Some(FileAction::Goto(_))),
+            "双击目录该进目录,实际 {action:?}"
         );
     }
 }

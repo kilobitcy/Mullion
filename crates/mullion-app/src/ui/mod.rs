@@ -2,6 +2,8 @@
 pub mod annotate;
 pub mod badge;
 pub mod chrome;
+pub mod edit_panel;
+pub mod editor_window;
 pub mod files_dialog;
 pub mod files_panel;
 pub mod group_manager;
@@ -255,6 +257,10 @@ pub struct UiState {
     /// `#[derive(Default)]` 只会给 `false`,而默认状态应当是折叠(一行摘要)——
     /// 传输是后台事,不该一入队就把终端挤掉六行。
     pub transfer_expanded: bool,
+    /// F53:「编辑中」面板是不是展开着。语义取反的理由同 `transfer_expanded`。
+    pub edit_expanded: bool,
+    /// F53/D3-12:用户点了关闭,但有编辑没传上去 —— 拦下来问一句。
+    pub exit_pending: bool,
 }
 
 impl UiState {
@@ -358,6 +364,17 @@ pub struct UiActions {
     pub files_op: Option<files_dialog::FileOp>,
     /// F55:底部传输队列面板上按下的东西(取消 / 全部取消 / 清除已完成)。
     pub transfer: Option<transfer_panel::TransferUiAction>,
+    /// F53:底部「编辑中」面板上按下的东西(结束编辑 / 重开处置框)。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action`。
+    pub edit: Option<edit_panel::EditUiAction>,
+    /// F53:内置编辑器窗口上按下的东西(保存 / 关闭)。
+    pub editor: Option<editor_window::EditorAction>,
+    /// F53/D3-12:退出确认框上的选择。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 这一条尤其:被静默吃掉
+    /// 的话「仍然退出」按下去毫无反应,用户只能去杀进程。
+    pub exit: Option<edit_panel::ExitChoice>,
     /// 点了工具栏上的某个布局预设。
     pub preset: Option<crate::shell::workspace::Preset>,
     /// 点了某个 pane 标题条上的 ×。
@@ -415,6 +432,11 @@ pub fn build_ui(
     // F55:传输队列。只读 —— 面板只把用户按的东西回报成 `UiActions::transfer`,
     // 队列本身由 `app.rs` 改(改动要和取消旗标一起做,分两处必然错位)。
     queue: &crate::files::queue::Queue,
+    // F53:在编辑的那些文件。同 `queue`,只读。
+    edits: &crate::edit::sessions::EditSessions,
+    // F53:内置编辑器窗口。**可写** —— 用户敲进去的字就落在这里面,
+    // 跟 `files_dialog` 同一个模式(状态在 UI 侧,提交动作回 `app.rs`)。
+    editor: &mut Option<editor_window::EditorState>,
 ) -> UiActions {
     let mut actions = UiActions::default();
     // 主机密钥确认最先画:它是安全关口,任何时候都该盖在最上层(F3)。
@@ -517,6 +539,12 @@ pub fn build_ui(
     // 面板发起的模态,该盖在别的窗口上;排在 toast 之前 —— 操作反馈永远
     // 在最上面(走查 13)。
     actions.files_op = files_dialog::show(ctx, t, &mut ui_state.files_dialog);
+    // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
+    actions.editor = editor_window::show(ctx, t, editor);
+    // F53/D3-12:退出确认。排在最后一个模态 —— 它一旦开着,别的都不重要了。
+    if ui_state.exit_pending {
+        actions.exit = edit_panel::show_exit_confirm(ctx, t, edits);
+    }
     // 走查 13:操作反馈飘在所有弹窗之上 —— 保存成功的那条 toast 要在会话
     // 管理器还开着的时候就能看见,不然用户根本不知道刚才那一下有没有生效。
     toast::show(ctx, t, &mut ui_state.pending_toast, &mut ui_state.toast);
@@ -524,6 +552,10 @@ pub fn build_ui(
     // 的先后从窗口边缘往里堆,于是它落在状态栏**上方**(设计要的位置);
     // 又排在下面的 `CentralPanel` 之前,不然它拿不到空间分配。
     actions.transfer = transfer_panel::show(ctx, t, queue, &mut ui_state.transfer_expanded);
+    // F53:「编辑中」列表。排在传输面板之后 show,于是落在它**上方**
+    // (`TopBottomPanel` 从窗口边缘往里堆)——编辑是用户正在做的事,
+    // 比后台传输更该靠近视线。
+    actions.edit = edit_panel::show(ctx, t, edits, &mut ui_state.edit_expanded);
     // D1:标签宿主的文件面板——`CentralPanel`,egui 的 Panel 空间分配规则
     // 决定了它必须是本帧**最后一个** panel 类部件(见 `files_panel::content`
     // 文档),所以放在这里:菜单栏/标签栏/状态栏/各弹窗都已经 show 完。
@@ -757,6 +789,9 @@ mod tests {
                 // F55:这批既有测试都不涉及传输队列,给一个空队列 ——
                 // 队列空时 `transfer_panel::show` 直接不画,对它们是 no-op。
                 &crate::files::queue::Queue::new(4),
+                // F53:同理,没有在编辑的文件 = 「编辑中」面板不画。
+                &crate::edit::sessions::EditSessions::new(),
+                &mut None,
             );
         });
         (out, actions)
@@ -785,6 +820,8 @@ mod tests {
                 0,
                 // 同 `run_frame`:空队列 = 不画传输面板。
                 &crate::files::queue::Queue::new(4),
+                &crate::edit::sessions::EditSessions::new(),
+                &mut None,
             );
         });
         (out, actions)
@@ -859,6 +896,8 @@ mod tests {
                     None,
                     0,
                     &queue,
+                    &crate::edit::sessions::EditSessions::new(),
+                    &mut None,
                 );
             }));
         }
