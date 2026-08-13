@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::credential::CredentialId;
 use crate::model::{GroupId, SessionId};
 use crate::tunnel::TunnelId;
 
@@ -51,6 +52,14 @@ pub enum StoreError {
     /// 隧道引用了不存在的会话。同 `JumpDangling` 的道理:静默回落到
     /// 任何一个「别的会话」都等于把端口悄悄接到另一台机器上。
     TunnelDangling(SessionId),
+    /// 目标凭据不存在(F74)。
+    CredentialNotFound(CredentialId),
+    /// 凭据还被这些会话引用着,不能删(F74,设计 D7)。带上引用者便于 UI
+    /// 直接列出「先去解绑这几条」。
+    CredentialInUse(Vec<SessionId>),
+    /// 会话引用的凭据不存在。**绝不回落到别的身份**——与 `JumpDangling`
+    /// 同一条铁律:静默换一个身份去登录是安全事故(设计 D6)。
+    DanglingCredential(CredentialId),
 }
 
 impl fmt::Display for StoreError {
@@ -94,6 +103,16 @@ impl fmt::Display for StoreError {
             StoreError::TunnelDangling(id) => write!(
                 f,
                 "隧道引用的会话 {id:?} 不存在 —— 它可能已被删除,请重新指定或删除此隧道"
+            ),
+            StoreError::CredentialNotFound(id) => write!(f, "凭据不存在:{id:?}"),
+            StoreError::CredentialInUse(ids) => write!(
+                f,
+                "这份凭据还被 {} 条会话引用着 —— 请先把它们改成别的凭据再删",
+                ids.len()
+            ),
+            StoreError::DanglingCredential(id) => write!(
+                f,
+                "会话引用的凭据 {id:?} 不存在 —— 它可能已被删除,请重新指定认证方式"
             ),
         }
     }

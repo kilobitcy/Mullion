@@ -102,6 +102,7 @@ mod tests {
             name: true,
             host: false,
             user: false,
+            credential: false,
         };
         assert_eq!(missing.tab(), Some(TAB_CONNECT));
         assert_eq!(badge_of(TAB_CONNECT, missing, &buf), Badge::Missing);

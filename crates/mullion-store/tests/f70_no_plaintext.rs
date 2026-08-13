@@ -30,12 +30,12 @@ fn plaintext_secret_never_hits_disk() {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: AuthKind::PublicKey {
+            auth: Auth::inline(
+                "u",
+                AuthKind::PublicKey {
                     has_passphrase: true,
                 },
-            },
+            ),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: Default::default(),

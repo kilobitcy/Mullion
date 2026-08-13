@@ -6,14 +6,27 @@
 use std::path::Path;
 
 use mullion_store::{
-    AppearancePrefs, Auth, AuthKind, AutomationPrefs, Connection, GroupId, Identity, NetworkPrefs,
-    Protocol, SecretEntry, SessionDraft, SessionId, SessionRecord, TerminalPrefs,
+    AppearancePrefs, Auth, AuthKind, AutomationPrefs, Connection, CredentialId, GroupId, Identity,
+    InlineAuth, NetworkPrefs, Protocol, SecretEntry, SessionDraft, SessionId, SessionRecord,
+    TerminalPrefs,
 };
+
+/// 「这条会话的身份从哪来」(F74 设计 D9)。**严格二选一** —— 与
+/// `mullion_store::Auth` 的两个变体一一对应,UI 上不给「引用 + 局部覆盖」的
+/// 中间态,那正是本功能要消灭的东西。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredSourceUi {
+    /// 本会话独有:用户名 + 密码/私钥都填在这张表单上。
+    Own,
+    /// 引用共享凭据:身份整块来自 `credential_id` 指的那份。
+    Shared,
+}
 
 /// 编辑表单里认证方式的选择。不复用 `AuthKind` 本身,因为 UI 在密码/公钥两种模式
 /// 间切换时要各自保留自己的缓冲(密码框内容、私钥路径都不该因切换选项就丢)。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AuthKindUi {
+    #[default]
     Password,
     PublicKey,
 }
@@ -56,6 +69,13 @@ pub struct EditorBuffer {
     pub protocol: Protocol,
     pub user: String,
     pub note: String,
+    /// F74:身份来自本会话还是共享凭据。`Shared` 时下面的
+    /// `user`/`auth_kind`/`password`/`key_data`/`passphrase` 全部不参与保存,
+    /// 但**不清空** —— 用户切回 `Own` 应看到自己原来填的,而不是从头再来
+    /// (同 `jump_chain` 切模式不清空的理由)。
+    pub cred_source: CredSourceUi,
+    /// `cred_source == Shared` 时引用哪一份。`None` = 还没选,保存被禁。
+    pub credential_id: Option<CredentialId>,
     pub auth_kind: AuthKindUi,
     pub password: String,
     /// 用户是否碰过密码框。未碰 = `SecretField::Keep`(已存值保留)。
@@ -138,6 +158,8 @@ impl Default for EditorBuffer {
             protocol: Protocol::Ssh,
             user: String::new(),
             note: String::new(),
+            cred_source: CredSourceUi::Own,
+            credential_id: None,
             auth_kind: AuthKindUi::Password,
             password: String::new(),
             password_touched: false,
@@ -290,7 +312,17 @@ impl EditorBuffer {
             host: rec.connection.host.clone(),
             port: rec.connection.port.to_string(),
             protocol: rec.connection.protocol,
-            user: rec.auth.user.clone(),
+            // 引用共享凭据的会话身上没有用户名(F74)—— 留空,由下面的
+            // `cred_source` 把表单切到共享档,用户名那行整个不画。
+            user: rec
+                .auth
+                .as_inline()
+                .map_or_else(String::new, |i| i.user.clone()),
+            cred_source: match rec.auth {
+                Auth::Inline(_) => CredSourceUi::Own,
+                Auth::Ref(_) => CredSourceUi::Shared,
+            },
+            credential_id: rec.auth.credential_id(),
             note: rec.identity.note.clone(),
             preserved_group_id: rec.identity.group_id,
             preserved_tags: rec.identity.tags.clone(),
@@ -335,9 +367,9 @@ impl EditorBuffer {
         };
         // 公钥会话不回填任何私钥信息:正文是明文凭据,store 不回吐;路径 v5 起
         // 已不存在。UI 靠 `SecretPresence::private_key` 显示「已导入 / 未设置」。
-        match &rec.auth.kind {
-            AuthKind::Password => buf.auth_kind = AuthKindUi::Password,
-            AuthKind::PublicKey { .. } => buf.auth_kind = AuthKindUi::PublicKey,
+        match rec.auth.as_inline().map(|i| &i.kind) {
+            Some(AuthKind::PublicKey { .. }) => buf.auth_kind = AuthKindUi::PublicKey,
+            Some(AuthKind::Password) | None => buf.auth_kind = AuthKindUi::Password,
         }
         // 图标不需要任何回填:它整个躺在 `preserved_appearance` 里(第 289 行
         // 已经 clone 过来了),图标页直接读写那份。
@@ -421,7 +453,11 @@ pub(crate) fn merge_secret(
 /// 跟着表单走会把 has_passphrase 写成 false,下次连接时 russh 拿到加密私钥
 /// 却不知道要口令。密码认证(`AuthKind::Password`)没有这个字段,原样跳过。
 pub(crate) fn sync_has_passphrase(draft: &mut SessionDraft, merged: Option<&SecretEntry>) {
-    if let AuthKind::PublicKey { has_passphrase, .. } = &mut draft.auth.kind {
+    if let Some(InlineAuth {
+        kind: AuthKind::PublicKey { has_passphrase, .. },
+        ..
+    }) = draft.auth.as_inline_mut()
+    {
         *has_passphrase = merged.is_some_and(|s| s.passphrase.is_some());
     }
 }
@@ -441,6 +477,17 @@ pub(crate) fn secret_fields(
         } else {
             SecretField::Set(v.to_string())
         }
+    }
+    // 引用共享凭据时,身份三件套全在凭据的侧车里(设计 D4)。会话自己那三格
+    // 一律 `Clear`:留着就是 secrets.enc 里三条谁也不会去读的孤儿明文。
+    // **代理口令不在此列** —— 它归会话,不归凭据。
+    if buf.cred_source == CredSourceUi::Shared {
+        return (
+            SecretField::Clear,
+            SecretField::Clear,
+            field(buf.proxy_password_touched, &buf.proxy_password),
+            SecretField::Clear,
+        );
     }
     let (password, passphrase, private_key) = match buf.auth_kind {
         AuthKindUi::Password => (
@@ -471,22 +518,35 @@ pub(crate) fn import_key_file(
     path: &Path,
     read: impl FnOnce(&Path) -> std::io::Result<String>,
 ) {
+    match read_key_file(path, read) {
+        Ok((text, note)) => {
+            buf.key_data = text;
+            buf.key_touched = true;
+            buf.key_note = Some(note);
+        }
+        Err(note) => buf.key_note = Some(note),
+    }
+}
+
+/// 上面那件事里与缓冲无关的那一半:读文件 + 判「像不像私钥」+ 措辞。
+/// `Ok((正文, 提示))` / `Err(提示)`。
+///
+/// 抽出来是因为凭据表单(F74)有自己的缓冲类型,却必须给出**同一套判定和
+/// 同一句话** —— 各写一遍的话,「选成了 .pub」这条提示迟早只剩一边有。
+pub(crate) fn read_key_file(
+    path: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+) -> Result<(String, String), String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     match read(path) {
-        Err(e) => buf.key_note = Some(format!("读不了 {name}:{e}")),
-        Ok(text) if !looks_like_private_key(&text) => {
-            buf.key_note = Some(format!(
-                "{name} 不像私钥 —— 要选的是私钥本体,不是 .pub 公钥"
-            ));
-        }
-        Ok(text) => {
-            buf.key_data = text;
-            buf.key_touched = true;
-            buf.key_note = Some(format!("已导入 {name}"));
-        }
+        Err(e) => Err(format!("读不了 {name}:{e}")),
+        Ok(text) if !looks_like_private_key(&text) => Err(format!(
+            "{name} 不像私钥 —— 要选的是私钥本体,不是 .pub 公钥"
+        )),
+        Ok(text) => Ok((text, format!("已导入 {name}"))),
     }
 }
 
@@ -636,9 +696,14 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
             port,
             protocol: buf.protocol,
         },
-        auth: Auth {
-            user: buf.user.trim().to_string(),
-            kind,
+        auth: match buf.cred_source {
+            CredSourceUi::Own => Auth::inline(buf.user.trim(), kind),
+            // 保存按钮在没选凭据时是禁用的(`validate::check`),但
+            // `build_draft` 得是全函数 —— 键盘保存那条路径够不着按钮状态。
+            CredSourceUi::Shared => Auth::Ref(
+                buf.credential_id
+                    .ok_or_else(|| "请先选一份共享凭据".to_string())?,
+            ),
         },
         terminal: buf.preserved_terminal.clone(),
         appearance: buf.preserved_appearance.clone(),
@@ -688,6 +753,12 @@ mod tests {
         ColorSpec, ColorTarget, IconKind, IconSpec, JumpRef, ProxyChoice, ProxyEndpoint,
     };
 
+    /// 本模块绝大多数测试用的是「自带认证」档(`CredSourceUi::Own`),
+    /// 断言认证方式时统一走这里。共享凭据档单独由下面三条覆盖。
+    fn inline_kind(d: &SessionDraft) -> &AuthKind {
+        &d.auth.as_inline().expect("build_draft 产出自带认证").kind
+    }
+
     /// 红线:`EditorBuffer` 携带三个明文口令缓冲。若 derive(Debug),`{:?}` 会把
     /// 它们打印出来——目前虽无调用点,但属休眠风险(对照 `mullion_ssh::hop::Hop`
     /// 的手写打码 Debug)。必须手写 Debug 并打码。
@@ -720,10 +791,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("u", AuthKind::Password),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: NetworkPrefs { proxy: None, jump },
@@ -756,7 +824,7 @@ mod tests {
         assert_eq!(draft.identity.name, "dev");
         assert_eq!(draft.connection.host, "192.0.2.10");
         assert_eq!(draft.connection.port, 22);
-        assert!(matches!(draft.auth.kind, AuthKind::Password));
+        assert!(matches!(inline_kind(&draft), AuthKind::Password));
         assert_eq!(
             draft.secret.as_ref().and_then(|s| s.password.clone()),
             Some("pw".to_string())
@@ -782,7 +850,7 @@ mod tests {
         b.passphrase = "ph".into();
         b.passphrase_touched = true; // ← 新增这一行,模拟用户真的输入过
         let draft = build_draft(&b).unwrap();
-        match draft.auth.kind {
+        match inline_kind(&draft) {
             AuthKind::PublicKey { has_passphrase } => assert!(has_passphrase),
             _ => panic!("应为 PublicKey"),
         }
@@ -797,7 +865,7 @@ mod tests {
         let mut b = buf();
         b.auth_kind = AuthKindUi::PublicKey;
         let draft = build_draft(&b).unwrap();
-        match draft.auth.kind {
+        match inline_kind(&draft) {
             AuthKind::PublicKey { has_passphrase, .. } => assert!(!has_passphrase),
             _ => panic!("应为 PublicKey"),
         }
@@ -835,10 +903,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "user".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("user", AuthKind::Password),
             terminal: TerminalPrefs {
                 scrollback: Some(12345),
             },
@@ -919,10 +984,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "user".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("user", AuthKind::Password),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: NetworkPrefs {
@@ -1277,7 +1339,7 @@ mod tests {
         let mut draft = build_draft(&buf).expect("build");
         assert!(
             matches!(
-                draft.auth.kind,
+                inline_kind(&draft),
                 AuthKind::PublicKey {
                     has_passphrase: false,
                     ..
@@ -1290,7 +1352,7 @@ mod tests {
         sync_has_passphrase(&mut draft, Some(&merged));
         assert!(
             matches!(
-                draft.auth.kind,
+                inline_kind(&draft),
                 AuthKind::PublicKey {
                     has_passphrase: true,
                     ..
@@ -1787,6 +1849,76 @@ mod tests {
                 Some("旧的"),
                 "{label}:导入失败不该把原来的图标弄没"
             );
+        }
+    }
+
+    /// F74:表单切到「共享凭据」档 → 草稿产出 `Auth::Ref`,并且会话自己那三个
+    /// 身份槽位一律 `Clear`(设计 D4)。
+    ///
+    /// 只断 `Auth::Ref` 不够:身份槽位若走 `Keep`,secrets.enc 里会留下三条谁也
+    /// 不会去读的孤儿明文 —— 用户以为「密码搬到凭据里了」,旧密码其实还躺在盘上。
+    /// 代理口令归会话不归凭据,必须**不**被清掉,否则改一次来源就得重填代理口令。
+    #[test]
+    fn shared_source_builds_a_reference_and_clears_the_sessions_own_identity_secrets() {
+        let mut b = buf();
+        b.password = "旧密码".into();
+        b.password_touched = true;
+        b.proxy_password = "代理口令".into();
+        b.proxy_password_touched = true;
+        b.cred_source = CredSourceUi::Shared;
+        b.credential_id = Some(CredentialId(7));
+
+        let draft = build_draft(&b).expect("选好了凭据就该能存");
+        assert_eq!(
+            draft.auth,
+            Auth::Ref(CredentialId(7)),
+            "共享档的草稿必须是引用,不能又落一份内联身份"
+        );
+
+        let (password, passphrase, proxy_password, private_key) = secret_fields(&b);
+        assert_eq!(password, SecretField::Clear, "会话自己的密码必须清掉");
+        assert_eq!(passphrase, SecretField::Clear);
+        assert_eq!(private_key, SecretField::Clear);
+        assert_eq!(
+            proxy_password,
+            SecretField::Set("代理口令".into()),
+            "代理口令归会话,不该被凭据档连坐清掉"
+        );
+    }
+
+    /// F74:来源切到共享再切回独有,用户名得还在。
+    ///
+    /// 共享档界面上不画用户名那一行,但缓冲里的 `user` 不能跟着被抹掉 ——
+    /// 否则用户只是点开下拉看了一眼又切回来,原来的用户名就没了,保存按钮
+    /// 突然变灰,他还得回想自己本来填的是谁。
+    #[test]
+    fn switching_back_to_own_source_restores_the_original_user() {
+        let mut b = buf();
+        b.cred_source = CredSourceUi::Shared;
+        b.credential_id = Some(CredentialId(7));
+        // 用户改了主意,切回「本会话独有」。
+        b.cred_source = CredSourceUi::Own;
+
+        let draft = build_draft(&b).expect("切回独有档后应能存");
+        let inline = draft.auth.as_inline().expect("独有档应产出内联身份");
+        assert_eq!(inline.user, "user", "切来源不该把用户名擦掉");
+    }
+
+    /// F74:共享档没挑具体哪一份凭据 → `build_draft` 硬失败。
+    ///
+    /// 保存按钮此时是禁用的(`validate::check`),但键盘保存那条路径够不着按钮
+    /// 状态,`build_draft` 必须自己是全函数。悄悄退回内联身份是最坏的处置:
+    /// 存进去的是一条用户名为空、没有任何凭据的会话,拨号时才炸。
+    #[test]
+    fn shared_source_without_a_chosen_credential_refuses_to_build() {
+        let mut b = buf();
+        b.cred_source = CredSourceUi::Shared;
+        b.credential_id = None;
+
+        // `SessionDraft` 没有 Debug(它带明文口令),不能用 `expect_err`。
+        match build_draft(&b) {
+            Err(msg) => assert!(!msg.is_empty(), "失败必须给一句能看懂的话"),
+            Ok(_) => panic!("没挑凭据就不该存得下去"),
         }
     }
 }

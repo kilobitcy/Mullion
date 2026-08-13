@@ -98,10 +98,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("u", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: NetworkPrefs::default(),

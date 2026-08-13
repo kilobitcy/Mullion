@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::credential::{CredentialId, CredentialRecord};
 use crate::crypto;
 use crate::error::StoreError;
 use crate::group::GroupRecord;
@@ -24,6 +25,7 @@ pub struct Vault {
     groups: Vec<GroupRecord>,
     sessions: Vec<SessionRecord>,
     tunnels: Vec<TunnelRecord>,
+    credentials: Vec<CredentialRecord>,
     secrets: SecretMap,
     key: [u8; 32],
     /// `secrets.enc` 用的密钥方案(F71)。**`save()` 按它决定写不写文件头**,
@@ -71,6 +73,37 @@ pub struct TunnelDraft {
     pub kind: TunnelKind,
 }
 
+/// 新建/编辑凭据的输入(不含 id,由 vault 分配)。与 `SessionDraft` 同构。
+pub struct CredentialDraft {
+    pub name: String,
+    pub user: String,
+    pub kind: crate::model::AuthKind,
+    /// 密码 / 私钥正文 / 私钥口令;无则 None。
+    /// **代理口令不在这里** —— 那是会话的东西(设计 D4)。
+    pub secret: Option<SecretEntry>,
+}
+
+/// 解析后的认证:到底以谁的身份、用什么方式、拿哪份密文去登录。
+///
+/// owned 而非借用:跳板链本来就是 `Vec<SessionRecord>`(clone 过一遍),
+/// 借用只会把调用点被生命周期绑死,收益为零(设计 D5)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAuth {
+    pub user: String,
+    pub kind: crate::model::AuthKind,
+    pub secret: Option<SecretEntry>,
+}
+
+/// 凭据密文在 `secrets.enc` 里的键(设计 D3)。
+///
+/// 带 `cred:` 前缀而不是另开一张表:`secrets.enc` 是一个
+/// `BTreeMap<String, SecretEntry>`,另开表要改文件格式(又一次不兼容);
+/// 前缀是纯加法,旧文件天然没有这类键,且与 `SessionId` 的十进制表示
+/// 不可能撞车(有测试钉着)。
+fn cred_key(id: CredentialId) -> String {
+    format!("cred:{}", id.0)
+}
+
 impl Vault {
     fn sessions_path(&self) -> PathBuf {
         self.dir.join("sessions.toml")
@@ -109,6 +142,7 @@ impl Vault {
             groups,
             sessions,
             tunnels,
+            credentials,
             migrated,
             legacy_key_paths,
         } = load_sessions(&sessions_path)?;
@@ -150,8 +184,13 @@ impl Vault {
         // 裁剪孤儿密文:sessions.toml 可能被手改或在两文件写入之间崩溃残留旧 id
         // (spec §3.2「load 容忍 desync」)。不裁的话,后续 add() 用 max+1 复用旧 id
         // 会静默继承无关会话的密文。
-        let live: std::collections::BTreeSet<String> =
-            sessions.iter().map(|s| s.id.0.to_string()).collect();
+        // F74:集合必须**同时**含凭据的键。少了它,凭据口令每次打开都被当成
+        // 孤儿静默删掉 —— 用户看到的是「昨天还能连,今天要我重新输密码」。
+        let live: std::collections::BTreeSet<String> = sessions
+            .iter()
+            .map(|s| s.id.0.to_string())
+            .chain(credentials.iter().map(|c| cred_key(c.id)))
+            .collect();
         secrets.retain(|k, _| live.contains(k));
 
         // v<5 迁移:旧文件里公钥会话只存了私钥**路径**,把路径指向的内容读进来
@@ -175,6 +214,7 @@ impl Vault {
             groups,
             sessions,
             tunnels,
+            credentials,
             secrets,
             key,
             scheme,
@@ -193,6 +233,7 @@ impl Vault {
             group: self.groups.clone(),
             session: self.sessions.clone(),
             tunnel: self.tunnels.clone(),
+            credential: self.credentials.clone(),
         };
         let toml_text = toml::to_string_pretty(&file)?;
         write_atomic(&self.sessions_path(), toml_text.as_bytes())?;
@@ -405,6 +446,138 @@ impl Vault {
         Ok(())
     }
 
+    // ---- F74 凭据实体 --------------------------------------------------
+
+    pub fn credentials(&self) -> &[CredentialRecord] {
+        &self.credentials
+    }
+
+    pub fn credential(&self, id: CredentialId) -> Option<&CredentialRecord> {
+        self.credentials.iter().find(|c| c.id == id)
+    }
+
+    /// 凭据自己的密文(密码 / 私钥正文 / 私钥口令)。
+    ///
+    /// **不含代理口令**:那是会话的东西,不是身份的东西(设计 D4)。
+    pub fn credential_secret(&self, id: CredentialId) -> Option<&SecretEntry> {
+        self.secrets.get(&cred_key(id))
+    }
+
+    /// 新增凭据。id 取现有 max+1(空库从 1 起),**与会话/隧道号池互不影响**。
+    pub fn add_credential(&mut self, draft: CredentialDraft) -> CredentialId {
+        let id = CredentialId(
+            self.credentials
+                .iter()
+                .map(|c| c.id.0)
+                .max()
+                .map_or(1, |m| m + 1),
+        );
+        self.put_credential_secret(id, draft.secret);
+        self.credentials.push(CredentialRecord {
+            id,
+            name: draft.name,
+            user: draft.user,
+            kind: draft.kind,
+        });
+        id
+    }
+
+    pub fn update_credential(
+        &mut self,
+        id: CredentialId,
+        draft: CredentialDraft,
+    ) -> Result<(), StoreError> {
+        let rec = self
+            .credentials
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(StoreError::CredentialNotFound(id))?;
+        rec.name = draft.name;
+        rec.user = draft.user;
+        rec.kind = draft.kind;
+        self.put_credential_secret(id, draft.secret);
+        Ok(())
+    }
+
+    /// 删除凭据。**被引用时硬失败并带上引用者**(设计 D7)。
+    ///
+    /// 不学分组的「删了就把引用置空」:分组是组织手段,丢了不影响能不能连;
+    /// 凭据是身份,悄悄解绑等于把一堆会话变成连不上的废配置,而用户要到
+    /// 下次连接时才发现。
+    pub fn delete_credential(&mut self, id: CredentialId) -> Result<(), StoreError> {
+        if self.credential(id).is_none() {
+            return Err(StoreError::CredentialNotFound(id));
+        }
+        let users = self.sessions_using(id);
+        if !users.is_empty() {
+            return Err(StoreError::CredentialInUse(users));
+        }
+        self.credentials.retain(|c| c.id != id);
+        self.secrets.remove(&cred_key(id));
+        Ok(())
+    }
+
+    /// 引用了这份凭据的会话(按 id 升序,UI 直接拿去列「先解绑这几条」)。
+    pub fn sessions_using(&self, id: CredentialId) -> Vec<SessionId> {
+        let mut v: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|s| s.auth.credential_id() == Some(id))
+            .map(|s| s.id)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn put_credential_secret(&mut self, id: CredentialId, secret: Option<SecretEntry>) {
+        match secret {
+            Some(sec) => {
+                self.secrets.insert(cred_key(id), sec);
+            }
+            None => {
+                self.secrets.remove(&cred_key(id));
+            }
+        }
+    }
+
+    /// 解析一条会话的认证:本会话独有就用它自己的,引用共享凭据就查凭据表。
+    pub fn resolve_auth(&self, rec: &SessionRecord) -> Result<ResolvedAuth, StoreError> {
+        self.resolve_auth_of(&rec.auth, self.secret(rec.id))
+    }
+
+    /// `resolve_auth` 的参数化内核:直接吃一份 `Auth` + 「本会话独有」时该用的
+    /// 密文,不要求它已经入库 —— F92「测试连接」解析的是**尚未保存的草稿**,
+    /// 草稿没有 id,查不到自己的密文(与 `resolve_layer` /
+    /// `expand_jump_chain_of` 同一个模式)。
+    ///
+    /// 两条路径共用这一个内核,否则迟早出现「拨测通过、保存后连不上」。
+    ///
+    /// 悬空引用**硬失败**(设计 D6):不回落到 agent、不回落到空口令、
+    /// 不回落到任何别的身份。
+    pub fn resolve_auth_of(
+        &self,
+        auth: &Auth,
+        inline_secret: Option<&SecretEntry>,
+    ) -> Result<ResolvedAuth, StoreError> {
+        match auth {
+            Auth::Inline(i) => Ok(ResolvedAuth {
+                user: i.user.clone(),
+                kind: i.kind.clone(),
+                secret: inline_secret.cloned(),
+            }),
+            Auth::Ref(id) => {
+                let c = self
+                    .credential(*id)
+                    .ok_or(StoreError::DanglingCredential(*id))?;
+                Ok(ResolvedAuth {
+                    user: c.user.clone(),
+                    kind: c.kind.clone(),
+                    secret: self.credential_secret(*id).cloned(),
+                })
+            }
+        }
+    }
+
     pub fn tunnels(&self) -> &[TunnelRecord] {
         &self.tunnels
     }
@@ -537,6 +710,7 @@ struct Loaded {
     groups: Vec<GroupRecord>,
     sessions: Vec<SessionRecord>,
     tunnels: Vec<TunnelRecord>,
+    credentials: Vec<CredentialRecord>,
     /// 版本落后、已就地升级 → 必须立刻 `save()` 写回,否则下次打开重复迁移
     /// 并覆盖掉备份。
     migrated: bool,
@@ -553,6 +727,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
             groups: Vec::new(),
             sessions: Vec::new(),
             tunnels: Vec::new(),
+            credentials: Vec::new(),
             migrated: false,
             legacy_key_paths: BTreeMap::new(),
         });
@@ -588,6 +763,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
             groups: file.group,
             sessions: file.session,
             tunnels: file.tunnel,
+            credentials: file.credential,
             migrated: true,
             legacy_key_paths,
         })
@@ -597,6 +773,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
             groups: file.group,
             sessions: file.session,
             tunnels: file.tunnel,
+            credentials: file.credential,
             migrated: false,
             legacy_key_paths: BTreeMap::new(),
         })
@@ -662,10 +839,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("u", AuthKind::Password),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
@@ -806,6 +980,308 @@ mod tests {
             vault.set_group(SessionId(999), None),
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    // ---- F74 凭据实体 --------------------------------------------------
+
+    fn cred_draft(name: &str, user: &str, pw: Option<&str>) -> CredentialDraft {
+        CredentialDraft {
+            name: name.into(),
+            user: user.into(),
+            kind: AuthKind::Password,
+            secret: pw.map(|p| SecretEntry {
+                password: Some(p.into()),
+                passphrase: None,
+                proxy_password: None,
+                private_key: None,
+            }),
+        }
+    }
+
+    /// 凭据号池独立于会话/隧道:挤在一个号池里会让「凭据 7」和「会话 7」
+    /// 在日志/错误文案里长得一样,排查时误判成同一个对象。
+    #[test]
+    fn credential_ids_are_max_plus_one_and_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        for i in 0..3 {
+            v.add(draft_pw(&format!("s{i}"), "p"), "t");
+        }
+        assert_eq!(
+            v.add_credential(cred_draft("运维", "ops", Some("p1"))),
+            CredentialId(1)
+        );
+        assert_eq!(
+            v.add_credential(cred_draft("只读", "ro", None)),
+            CredentialId(2)
+        );
+    }
+
+    /// 失效模式 1:`Vault::open` 的孤儿裁剪集合必须**同时**含凭据的键。
+    ///
+    /// 自证会变红:把 `open` 里 `live` 的 `.chain(credentials...)` 去掉,
+    /// 这条立刻报「凭据口令被当成孤儿删掉了」。症状在真实使用里是
+    /// 「昨天还能连,今天要我重新输密码」,而且没有任何报错。
+    #[test]
+    fn credential_secrets_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cid = {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let cid = v.add_credential(cred_draft("运维", "ops", Some("shared-pw")));
+            v.save().unwrap();
+            cid
+        };
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(v.credentials().len(), 1, "凭据本身不该丢");
+        assert_eq!(
+            v.credential_secret(cid).and_then(|s| s.password.as_deref()),
+            Some("shared-pw"),
+            "凭据口令被当成孤儿密文删掉了"
+        );
+    }
+
+    /// 失效模式 8:`cred:` 前缀与 `SessionId` 的十进制表示不可能撞车。
+    /// 撞了的后果是凭据密文覆盖掉会话密文(或反过来),两边都读到错的口令。
+    #[test]
+    fn credential_secret_keys_cannot_collide_with_session_ids() {
+        let k = cred_key(CredentialId(1));
+        assert!(k.starts_with("cred:"), "实际 {k}");
+        assert!(
+            k.parse::<u64>().is_err(),
+            "凭据键必须不是纯十进制,否则会与 SessionId 的键撞车"
+        );
+        assert_ne!(k, SessionId(1).0.to_string());
+    }
+
+    /// 失效模式 3:被引用的凭据不可删,且错误要**带上引用者**——
+    /// 只说「有人在用」而不说是谁,用户得挨条会话点开看。
+    #[test]
+    fn deleting_a_referenced_credential_is_refused_and_names_the_referents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let cid = v.add_credential(cred_draft("运维", "ops", Some("p1")));
+        let mut d = draft_pw("a", "ignored");
+        d.auth = Auth::Ref(cid);
+        d.secret = None;
+        let sid = v.add(d, "t");
+
+        match v.delete_credential(cid) {
+            Err(StoreError::CredentialInUse(ids)) => assert_eq!(ids, vec![sid]),
+            other => panic!("被引用的凭据必须拒绝删除并列出引用者,实际 {other:?}"),
+        }
+        assert!(v.credential(cid).is_some(), "拒绝之后凭据必须还在");
+
+        // 解绑之后才能删,且连带清掉它的密文。
+        let mut d2 = draft_pw("a", "own-pw");
+        d2.auth = Auth::inline("u", AuthKind::Password);
+        v.update(sid, d2, "t2").unwrap();
+        v.delete_credential(cid).unwrap();
+        assert!(v.credential_secret(cid).is_none(), "删凭据必须连带清密文");
+        assert!(matches!(
+            v.delete_credential(cid),
+            Err(StoreError::CredentialNotFound(_))
+        ));
+    }
+
+    /// 引用凭据的会话解析出的是**凭据的**用户名与密文。
+    #[test]
+    fn a_session_referencing_a_credential_resolves_to_the_credentials_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let cid = v.add_credential(cred_draft("运维", "ops", Some("shared-pw")));
+        let mut d = draft_pw("a", "own-pw");
+        d.auth = Auth::Ref(cid);
+        let sid = v.add(d, "t");
+
+        let r = v.resolve_auth(v.get(sid).unwrap()).unwrap();
+        assert_eq!(r.user, "ops");
+        assert_eq!(r.secret.unwrap().password.as_deref(), Some("shared-pw"));
+
+        // 反面:本会话独有时解析出的是它自己的。
+        let sid2 = v.add(draft_pw("b", "b-pw"), "t");
+        let r2 = v.resolve_auth(v.get(sid2).unwrap()).unwrap();
+        assert_eq!(r2.user, "u");
+        assert_eq!(r2.secret.unwrap().password.as_deref(), Some("b-pw"));
+    }
+
+    /// 失效模式 2:悬空引用**硬失败**,绝不降级。
+    ///
+    /// 降级的后果是「用一个别的身份登上了机器」—— 与 `JumpDangling` /
+    /// `TunnelDangling` 同一条铁律。这里的悬空只能靠手改文件或旧版本残留
+    /// 造出来(`delete_credential` 拦着正常路径),所以直接构造。
+    #[test]
+    fn a_dangling_credential_is_rejected_never_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let mut d = draft_pw("a", "own-pw");
+        d.auth = Auth::Ref(CredentialId(99));
+        let sid = v.add(d, "t");
+
+        match v.resolve_auth(v.get(sid).unwrap()) {
+            Err(StoreError::DanglingCredential(CredentialId(99))) => {}
+            other => panic!("悬空凭据必须硬失败,实际 {other:?}"),
+        }
+    }
+
+    /// 失效模式 4:代理口令**永远**来自会话自己的密文,不随凭据走。
+    ///
+    /// 代理是「怎么出网」,凭据是「以谁的身份」。两台机器共用一把私钥却各走
+    /// 各的代理是完全正常的配置;让凭据接管代理口令,换一次共享凭据就会把
+    /// 一串机器的代理口令换没了。
+    #[test]
+    fn the_proxy_password_always_comes_from_the_session_not_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let cid = v.add_credential(cred_draft("运维", "ops", Some("shared-pw")));
+        let mut d = draft_pw("a", "unused");
+        d.auth = Auth::Ref(cid);
+        d.secret = Some(SecretEntry {
+            password: None,
+            passphrase: None,
+            proxy_password: Some("proxy-pw".into()),
+            private_key: None,
+        });
+        let sid = v.add(d, "t");
+
+        assert_eq!(
+            v.secret(sid).and_then(|s| s.proxy_password.as_deref()),
+            Some("proxy-pw"),
+            "会话自己的代理口令不该因为引用了凭据就消失"
+        );
+        assert!(
+            v.resolve_auth(v.get(sid).unwrap())
+                .unwrap()
+                .secret
+                .unwrap()
+                .proxy_password
+                .is_none(),
+            "凭据里不该带代理口令 —— 那是会话的东西"
+        );
+    }
+
+    /// 草稿路径(F92 拨测)与入库路径共用同一个解析内核:草稿没有 id,
+    /// 查不到自己的密文,必须能把手上那份直接喂进来。
+    #[test]
+    fn a_draft_resolves_through_the_same_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let cid = v.add_credential(cred_draft("运维", "ops", Some("shared-pw")));
+
+        let own = SecretEntry {
+            password: Some("draft-pw".into()),
+            passphrase: None,
+            proxy_password: None,
+            private_key: None,
+        };
+        let inline = v
+            .resolve_auth_of(&Auth::inline("me", AuthKind::Password), Some(&own))
+            .unwrap();
+        assert_eq!(inline.user, "me");
+        assert_eq!(inline.secret.unwrap().password.as_deref(), Some("draft-pw"));
+
+        // 草稿引用凭据时,手上那份 inline 密文一律**不参与** —— 严格二选一。
+        let by_ref = v.resolve_auth_of(&Auth::Ref(cid), Some(&own)).unwrap();
+        assert_eq!(by_ref.user, "ops");
+        assert_eq!(
+            by_ref.secret.unwrap().password.as_deref(),
+            Some("shared-pw")
+        );
+    }
+
+    /// 失效模式 7:v8 库升 v9 **零迁移代码**,且迁移**绝不静默合并**出凭据
+    /// (那是 F75,只在用户点头后做)。
+    #[test]
+    fn migrating_v8_maps_every_session_to_inline_and_leaves_the_credential_table_empty() {
+        const V8: &str = r#"
+schema_version = 8
+
+[[session]]
+id = 1
+modified_at = "2026-08-01T00:00:00Z"
+
+[session.identity]
+name = "机器 A"
+
+[session.connection]
+host = "10.0.0.1"
+port = 22
+protocol = "ssh"
+
+[session.auth]
+user = "ubuntu"
+kind = "password"
+
+[[session]]
+id = 2
+modified_at = "2026-08-01T00:00:00Z"
+
+[session.identity]
+name = "机器 B"
+
+[session.connection]
+host = "10.0.0.2"
+port = 2222
+protocol = "ssh"
+
+[session.auth]
+user = "ubuntu"
+kind = "public_key"
+has_passphrase = true
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sessions.toml"), V8).unwrap();
+        let v = Vault::open(dir.path().to_path_buf(), &key()).expect("v8 文件必须能直接打开");
+
+        assert_eq!(v.list().len(), 2);
+        let a = v.get(SessionId(1)).unwrap();
+        assert_eq!(a.identity.name, "机器 A");
+        assert_eq!(a.connection.host, "10.0.0.1");
+        assert_eq!(
+            a.auth,
+            Auth::inline("ubuntu", AuthKind::Password),
+            "v8 的 auth 分节必须逐字段等价映射成 Inline"
+        );
+        let b = v.get(SessionId(2)).unwrap();
+        assert_eq!(b.connection.port, 2222);
+        assert_eq!(
+            b.auth,
+            Auth::inline(
+                "ubuntu",
+                AuthKind::PublicKey {
+                    has_passphrase: true
+                }
+            )
+        );
+        assert!(
+            v.credentials().is_empty(),
+            "迁移不许自作主张把两条同名 ubuntu 合并成一份共享凭据 —— 那是 F75,要用户点头"
+        );
+        assert!(
+            dir.path().join("sessions.toml.bak").exists(),
+            "升级前必须留备份"
+        );
+        let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
+        assert!(now.contains("schema_version = 9"), "磁盘上应已升到 v9");
+    }
+
+    /// 引用凭据的会话存盘再读回,引用关系不能丢(丢了就是悄悄变回自带认证,
+    /// 而自带的那份是空的 → 连不上)。
+    #[test]
+    fn a_reference_survives_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cid, sid) = {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let cid = v.add_credential(cred_draft("运维", "ops", Some("shared-pw")));
+            let mut d = draft_pw("a", "x");
+            d.auth = Auth::Ref(cid);
+            d.secret = None;
+            let sid = v.add(d, "t");
+            v.save().unwrap();
+            (cid, sid)
+        };
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(v.get(sid).unwrap().auth, Auth::Ref(cid));
+        assert_eq!(v.resolve_auth(v.get(sid).unwrap()).unwrap().user, "ops");
     }
 
     // ---- F71 主密码 ----------------------------------------------------
@@ -1070,9 +1546,12 @@ mod tests {
         assert!(v.secrets_keys_for_test().is_empty(), "open 应裁掉孤儿密文");
         // 新建一个无密钥会话(会复用 id=1),绝不能继承旧密码
         let mut d = draft_pw("new", "x");
-        d.auth.kind = AuthKind::PublicKey {
-            has_passphrase: false,
-        };
+        d.auth = Auth::inline(
+            "u",
+            AuthKind::PublicKey {
+                has_passphrase: false,
+            },
+        );
         d.secret = None;
         let id = v.add(d, "t");
         assert!(v.secret(id).is_none(), "无密钥新会话不得继承孤儿密文");
@@ -1184,7 +1663,7 @@ kind = "password"
         assert_eq!(s.identity.name, "v2sess");
         assert_eq!(s.connection.host, "192.0.2.20");
         assert_eq!(s.connection.port, 2222);
-        assert_eq!(s.auth.user, "u2");
+        assert_eq!(s.auth.as_inline().unwrap().user, "u2");
 
         assert!(
             dir.path().join("sessions.toml.bak").exists(),
@@ -1541,10 +2020,7 @@ port = 7891
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("u", AuthKind::Password),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
@@ -1831,9 +2307,12 @@ has_passphrase = false
         {
             let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
             let mut d = draft();
-            d.auth.kind = AuthKind::PublicKey {
-                has_passphrase: false,
-            };
+            d.auth = Auth::inline(
+                "u",
+                AuthKind::PublicKey {
+                    has_passphrase: false,
+                },
+            );
             d.secret = Some(SecretEntry {
                 password: None,
                 passphrase: None,

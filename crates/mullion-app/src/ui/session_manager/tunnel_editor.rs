@@ -275,6 +275,7 @@ pub(crate) fn expose_warning(buf: &TunnelEditorBuffer) -> Option<(ExposeTone, St
 pub(crate) fn session_ref_label(
     id: Option<SessionId>,
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
 ) -> (String, Option<&'static str>) {
     use mullion_store::Protocol;
     let Some(id) = id else {
@@ -292,7 +293,9 @@ pub(crate) fn session_ref_label(
         Some(s) => (
             format!(
                 "{} ({}@{})",
-                s.identity.name, s.auth.user, s.connection.host
+                s.identity.name,
+                mullion_store::display_user(&s.auth, credentials),
+                s.connection.host
             ),
             None,
         ),
@@ -317,6 +320,7 @@ pub(super) fn show(
     t: &Theme,
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
 ) {
     let Some(buf) = ui_state.tunnel_editor.as_mut() else {
         ui.colored_label(
@@ -350,14 +354,16 @@ pub(super) fn show(
         ui.end_row();
 
         form::required(ui, t, "经由会话");
-        let (selected, err) = session_ref_label(buf.session_id, sessions);
+        let (selected, err) = session_ref_label(buf.session_id, sessions, credentials);
         egui::ComboBox::from_id_salt("tunnel_session")
             .selected_text(selected)
             .show_ui(ui, |ui| {
                 for s in ssh_candidates(sessions) {
                     let label = format!(
                         "{} ({}@{})",
-                        s.identity.name, s.auth.user, s.connection.host
+                        s.identity.name,
+                        mullion_store::display_user(&s.auth, credentials),
+                        s.connection.host
                     );
                     ui.selectable_value(&mut buf.session_id, Some(s.id), label);
                 }
@@ -647,21 +653,21 @@ mod tests {
         let sftp = sess_rec(2, "文件中转", mullion_store::Protocol::Sftp);
         let all = vec![ssh.clone(), sftp.clone()];
 
-        let (text, err) = session_ref_label(Some(SessionId(1)), &all);
+        let (text, err) = session_ref_label(Some(SessionId(1)), &all, &[]);
         assert!(text.contains("生产主控"), "实际: {text}");
         assert!(err.is_none(), "正常引用不该报错");
 
-        let (text, err) = session_ref_label(Some(SessionId(9)), &all);
+        let (text, err) = session_ref_label(Some(SessionId(9)), &all, &[]);
         assert!(text.contains("已删除"), "实际: {text}");
         assert_eq!(err, Some("引用的会话已删除"));
 
         // 「删掉了」和「是 SFTP 节点」是两种完全不同的修法:前者要重建会话,
         // 后者只需改选一条 SSH 会话。合成一句话等于让用户猜。
-        let (text, err) = session_ref_label(Some(SessionId(2)), &all);
+        let (text, err) = session_ref_label(Some(SessionId(2)), &all, &[]);
         assert!(text.contains("文件中转"), "实际: {text}");
         assert_eq!(err, Some("该会话是 SFTP 节点，不能用于转发"));
 
-        let (text, err) = session_ref_label(None, &all);
+        let (text, err) = session_ref_label(None, &all, &[]);
         assert_eq!(text, "(未选择)");
         assert!(err.is_none());
     }
@@ -682,10 +688,7 @@ mod tests {
                 port: 22,
                 protocol,
             },
-            auth: Auth {
-                user: "root".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("root", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -706,7 +709,7 @@ mod tests {
         for _ in 0..2 {
             let out = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, &mut st, sessions);
+                    show(ui, &t, &mut st, sessions, &[]);
                 });
             });
             texts = collect_text(&out.shapes);

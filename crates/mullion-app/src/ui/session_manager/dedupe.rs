@@ -12,15 +12,18 @@
 //! 确实分不出来(该加区分信息),但它们是**两台不同的服务**,不是重复(不该
 //! 提醒用户"你存重了")。
 
-use mullion_store::{GroupRecord, SessionId, SessionRecord};
+use mullion_store::{display_user, CredentialRecord, GroupRecord, SessionId, SessionRecord};
 
 /// 在列表上会不会被看成同一行。列表只显示名称 + `user@host`,所以只比这三样
 /// ——**外加协议**:列表按协议分页(F118)之后,两个协议的记录永远不会同框
 /// 出现,把它们判成同形等于给一个不存在的视觉冲突加噪音。而「同一台机器
 /// 建一条 SSH + 一条 SFTP」是 D1 明确接受的正常用法。
-fn looks_same(a: &SessionRecord, b: &SessionRecord) -> bool {
+fn looks_same(a: &SessionRecord, b: &SessionRecord, credentials: &[CredentialRecord]) -> bool {
     a.identity.name == b.identity.name
-        && a.auth.user == b.auth.user
+        // 比的是**列表上写出来的那个用户名**(F74):引用共享凭据的会话,
+        // 用户看到的是凭据里的用户名。拿 `Auth` 本身比,两条引用同一份凭据、
+        // 显示完全一样的会话会被判成"不同形",区分信息就不会追加。
+        && display_user(&a.auth, credentials) == display_user(&b.auth, credentials)
         && a.connection.host == b.connection.host
         && a.connection.protocol == b.connection.protocol
 }
@@ -41,6 +44,7 @@ pub(super) fn duplicate_of(
     protocol: mullion_store::Protocol,
     editing: Option<SessionId>,
     all: &[SessionRecord],
+    credentials: &[CredentialRecord],
 ) -> Option<SessionId> {
     // 比较前 trim:表单里名字末尾多一个空格,存进去在列表上跟没空格的完全
     // 一样,却躲过了重复检测 —— 那正是这条要防的情况。
@@ -49,7 +53,7 @@ pub(super) fn duplicate_of(
         .find(|r| {
             Some(r.id) != editing
                 && r.identity.name == name
-                && r.auth.user == user
+                && display_user(&r.auth, credentials) == user
                 && r.connection.host == host
                 && r.connection.port == port
                 && r.connection.protocol == protocol
@@ -70,10 +74,11 @@ pub(super) fn disambiguate(
     rec: &SessionRecord,
     all: &[SessionRecord],
     groups: &[GroupRecord],
+    credentials: &[CredentialRecord],
 ) -> Option<String> {
     let twins: Vec<&SessionRecord> = all
         .iter()
-        .filter(|r| r.id != rec.id && looks_same(r, rec))
+        .filter(|r| r.id != rec.id && looks_same(r, rec, credentials))
         .collect();
     if twins.is_empty() {
         return None;
@@ -146,10 +151,7 @@ mod tests {
                 port,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "brain".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("brain", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -176,12 +178,30 @@ mod tests {
     fn same_name_but_different_host_is_not_a_duplicate() {
         let all = vec![rec(1, "prod", "10.0.0.1", 22)];
         assert_eq!(
-            duplicate_of("prod", "brain", "10.0.0.2", 22, Protocol::Ssh, None, &all),
+            duplicate_of(
+                "prod",
+                "brain",
+                "10.0.0.2",
+                22,
+                Protocol::Ssh,
+                None,
+                &all,
+                &[]
+            ),
             None,
             "主机不同就不是重复"
         );
         assert_eq!(
-            duplicate_of("prod", "brain", "10.0.0.1", 2222, Protocol::Ssh, None, &all),
+            duplicate_of(
+                "prod",
+                "brain",
+                "10.0.0.1",
+                2222,
+                Protocol::Ssh,
+                None,
+                &all,
+                &[]
+            ),
             None,
             "端口不同是两台不同的服务,不是重复"
         );
@@ -200,7 +220,8 @@ mod tests {
                 22,
                 Protocol::Ssh,
                 None,
-                &all
+                &all,
+                &[]
             ),
             Some(SessionId(1))
         );
@@ -213,7 +234,8 @@ mod tests {
                 22,
                 Protocol::Ssh,
                 None,
-                &all
+                &all,
+                &[]
             ),
             Some(SessionId(1)),
             "前后空格不该让重复检测失灵"
@@ -228,7 +250,8 @@ mod tests {
                 22,
                 Protocol::Ssh,
                 Some(SessionId(1)),
-                &all
+                &all,
+                &[]
             ),
             None,
             "编辑自己不该被判成重复"
@@ -247,24 +270,27 @@ mod tests {
         a.identity.group_id = Some(GroupId(1));
         b.identity.group_id = Some(GroupId(2));
         let all = vec![a.clone(), b.clone()];
-        assert_eq!(disambiguate(&a, &all, &groups), Some("生产".into()));
-        assert_eq!(disambiguate(&b, &all, &groups), Some("测试".into()));
+        assert_eq!(disambiguate(&a, &all, &groups, &[]), Some("生产".into()));
+        assert_eq!(disambiguate(&b, &all, &groups, &[]), Some("测试".into()));
 
         // 同分组、端口不同 → 用端口。
         let mut c = rec(3, "web01", "10.0.0.1", 2222);
         c.identity.group_id = Some(GroupId(1));
         let all = vec![a.clone(), c.clone()];
-        assert_eq!(disambiguate(&a, &all, &groups), Some(":22".into()));
-        assert_eq!(disambiguate(&c, &all, &groups), Some(":2222".into()));
+        assert_eq!(disambiguate(&a, &all, &groups, &[]), Some(":22".into()));
+        assert_eq!(disambiguate(&c, &all, &groups, &[]), Some(":2222".into()));
 
         // 分组端口都一样、只有备注不同 → 用备注首句(截到第一个句号)。
         let mut d = rec(4, "web01", "10.0.0.1", 22);
         d.identity.group_id = Some(GroupId(1));
         d.identity.note = "老板那台。别乱动".into();
         let all = vec![a.clone(), d.clone()];
-        assert_eq!(disambiguate(&d, &all, &groups), Some("老板那台".into()));
         assert_eq!(
-            disambiguate(&a, &all, &groups),
+            disambiguate(&d, &all, &groups, &[]),
+            Some("老板那台".into())
+        );
+        assert_eq!(
+            disambiguate(&a, &all, &groups, &[]),
             Some("无备注".into()),
             "没备注的那条也得说话,否则它看起来像「正常的那条」"
         );
@@ -272,7 +298,7 @@ mod tests {
         // 一条未分组、一条有分组 —— 未分组那条也要标出来。
         let e = rec(5, "web01", "10.0.0.1", 22); // group_id = None
         let all = vec![a.clone(), e.clone()];
-        assert_eq!(disambiguate(&e, &all, &groups), Some("未分组".into()));
+        assert_eq!(disambiguate(&e, &all, &groups, &[]), Some("未分组".into()));
     }
 
     /// 列表上独一无二的会话不该被加任何后缀 —— 平白给每行加尾巴,列表会
@@ -282,13 +308,13 @@ mod tests {
         let a = rec(1, "web01", "10.0.0.1", 22);
         let b = rec(2, "db01", "10.0.0.2", 22);
         let all = vec![a.clone(), b.clone()];
-        assert_eq!(disambiguate(&a, &all, &[]), None);
+        assert_eq!(disambiguate(&a, &all, &[], &[]), None);
 
         // 三样都区分不开(真重复)→ 也返回 None:该由保存时的提醒负责,
         // 列表上塞一段没有信息量的文字没有意义。
         let twin = rec(2, "web01", "10.0.0.1", 22);
         let all = vec![a.clone(), twin];
-        assert_eq!(disambiguate(&a, &all, &[]), None);
+        assert_eq!(disambiguate(&a, &all, &[], &[]), None);
     }
 
     /// 备注按**字符**截断。中文备注按字节切会当场 panic。
@@ -316,17 +342,17 @@ mod tests {
         b.connection.protocol = mullion_store::Protocol::Sftp;
         let all = vec![a.clone(), b.clone()];
         assert_eq!(
-            disambiguate(&a, &all, &[]),
+            disambiguate(&a, &all, &[], &[]),
             None,
             "跨协议的两条不该被判成同形"
         );
-        assert_eq!(disambiguate(&b, &all, &[]), None);
+        assert_eq!(disambiguate(&b, &all, &[], &[]), None);
 
         // 反面：同协议、其它都一样时仍然要追加区分信息，否则这条改动
         // 把原有保护一起弄没了。
         let mut c = rec(3, "web01", "10.0.0.1", 2222);
         c.connection.protocol = mullion_store::Protocol::Ssh;
         let all = vec![a.clone(), c];
-        assert_eq!(disambiguate(&a, &all, &[]), Some(":22".into()));
+        assert_eq!(disambiguate(&a, &all, &[], &[]), Some(":22".into()));
     }
 }

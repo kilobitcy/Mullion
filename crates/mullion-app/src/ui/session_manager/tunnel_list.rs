@@ -45,12 +45,18 @@ pub(crate) fn row_title(rec: &TunnelRecord) -> String {
 }
 
 /// 一行的副标题:引用的会话。悬垂时说清楚是**引用**坏了,不是隧道配错了。
-fn row_subtitle(rec: &TunnelRecord, sessions: &[SessionRecord]) -> (String, bool) {
+fn row_subtitle(
+    rec: &TunnelRecord,
+    sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
+) -> (String, bool) {
     match sessions.iter().find(|s| s.id == rec.session_id) {
         Some(s) => (
             format!(
                 "经 {} ({}@{})",
-                s.identity.name, s.auth.user, s.connection.host
+                s.identity.name,
+                mullion_store::display_user(&s.auth, credentials),
+                s.connection.host
             ),
             false,
         ),
@@ -126,6 +132,7 @@ pub(super) fn show(
     tunnels: &[TunnelRecord],
     states: &[(TunnelId, TunnelState)],
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
 ) {
     // 底部「+ 新建」先占位,理由同 `list::show` —— 面板先分配高度,
     // 下面的 `ScrollArea` 才吃得到真实剩余高度。
@@ -167,7 +174,7 @@ pub(super) fn show(
                     continue;
                 };
                 let state = states.iter().find(|(tid, _)| *tid == id).map(|(_, s)| s);
-                row(ui, t, ui_state, rec, state, sessions);
+                row(ui, t, ui_state, rec, state, sessions, credentials);
             }
         });
 }
@@ -179,9 +186,10 @@ fn row(
     rec: &TunnelRecord,
     state: Option<&TunnelState>,
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
 ) {
     let selected = ui_state.tunnel_editor_id == Some(rec.id);
-    let (sub, dangling) = row_subtitle(rec, sessions);
+    let (sub, dangling) = row_subtitle(rec, sessions, credentials);
     let spec = button_spec(dangling, state.is_some());
 
     ui.horizontal(|ui| {

@@ -34,12 +34,12 @@ fn automation_env_is_plaintext_in_sessions_toml_and_absent_from_secrets_enc() {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: AuthKind::PublicKey {
+            auth: Auth::inline(
+                "u",
+                AuthKind::PublicKey {
                     has_passphrase: false,
                 },
-            },
+            ),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: Default::default(),

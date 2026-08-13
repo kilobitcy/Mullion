@@ -56,6 +56,9 @@ pub enum UserEvent {
     /// 私钥文件对话框结束。`None` = 用户取消/对话框失败——也要回送,否则
     /// `key_picker_busy` 永远清不掉,以后再点「选择…」就没反应了。
     KeyPathPicked(Option<PathBuf>),
+    /// F74:凭据表单里那次私钥选择的结果。与 `KeyPathPicked` **分开**——
+    /// 正文要写进哪个缓冲(会话的还是凭据的),只有事件变体分得清。
+    CredentialKeyPathPicked(Option<PathBuf>),
     /// F61:「导入 .ico…」的结果。`None` = 用户取消 / 对话框起不来。
     IconPathPicked(Option<PathBuf>),
     /// 主机密钥需要用户确认(F3)。握手线程正挂在 `reply` 上等回答,
@@ -4458,6 +4461,20 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.request_ui_redraw();
             }
+            UserEvent::CredentialKeyPathPicked(picked) => {
+                self.key_picker_busy = false;
+                if let Some(p) = picked {
+                    if let Some(buf) = self.ui.credential_editor.as_mut() {
+                        crate::ui::session_manager::import_credential_key_file(buf, &p, |p| {
+                            std::fs::read_to_string(p)
+                        });
+                        if let Some(note) = buf.key_note.take() {
+                            self.ui.key_drop_note = Some(note);
+                        }
+                    }
+                }
+                self.request_ui_redraw();
+            }
             UserEvent::IconPathPicked(picked) => {
                 self.icon_picker_busy = false;
                 if let Some(p) = picked {
@@ -5250,12 +5267,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 .count();
                             let groups: &[mullion_store::GroupRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.groups());
+                            let credentials: &[mullion_store::CredentialRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.credentials());
                             let tunnels: &[mullion_store::TunnelRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.tunnels());
                             let tunnel_states = self.tunnels.snapshot();
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
+                                credentials,
                                 tunnels,
                                 tunnel_states: &tunnel_states,
                                 store_available,
@@ -5276,6 +5296,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 paste: paste_view,
                                 secret_presence: match (self.store.as_ref(), self.ui.editor_id) {
                                     (Some(s), Some(id)) => s.secret_presence(id),
+                                    _ => crate::ui::session_manager::SecretPresence::default(),
+                                },
+                                // F74:凭据档那份。新建凭据(`editor_id == None`)
+                                // 落默认值 —— 库里还没有它,谈不上「已设置」。
+                                credential_presence: match (
+                                    self.store.as_ref(),
+                                    self.ui.credential_editor_id,
+                                ) {
+                                    (Some(s), Some(id)) => s.credential_secret_presence(id),
                                     _ => crate::ui::session_manager::SecretPresence::default(),
                                 },
                                 // 「跑着的时候盖住上一次的结论」这条规则放在
@@ -5770,6 +5799,45 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // F74 凭据 CRUD 的施加点。同上,UI 只写意图,这里才碰 store。
+                if let Some(id) = self.ui.credential_delete_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match store.delete_credential(id) {
+                            Ok(()) => match store.save() {
+                                Ok(()) => {
+                                    // 删掉的正好是右栏在编辑的那份 → 清表单,
+                                    // 否则再点保存会以「更新」的语义去改一个
+                                    // 已经不存在的 id(同隧道侧)。
+                                    if self.ui.credential_editor_id == Some(id) {
+                                        self.ui.credential_editor_id = None;
+                                        self.ui.credential_editor = None;
+                                        self.ui.credential_editor_baseline = None;
+                                    }
+                                    self.ui.set_toast("已删除凭据");
+                                }
+                                Err(e) => self.ui.set_error(format!("删除凭据失败:{e}")),
+                            },
+                            // 被引用时把引用者的**会话名**报出来(D7)。
+                            Err(e) => {
+                                let msg = credential_delete_error(&e, store.list());
+                                self.ui.set_error(msg);
+                            }
+                        }
+                    }
+                }
+                if let Some(intent) = self.ui.credential_save_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match apply_credential_save(store, intent) {
+                            Ok(id) => {
+                                self.ui.credential_editor_id = Some(id);
+                                self.ui.credential_editor_baseline =
+                                    self.ui.credential_editor.clone();
+                                self.ui.set_toast("已保存凭据");
+                            }
+                            Err(msg) => self.ui.set_error(msg),
+                        }
+                    }
+                }
                 // Task 16:分组管理弹窗的 intent 施加点(F60)。`delete_group` 已在
                 // store 层把仍引用该分组的会话 group_id 置 None(vault.rs 的
                 // `delete_group` 文档:「分组是组织手段,不是会话的所有者」)、不删会话,
@@ -5810,6 +5878,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if std::mem::take(&mut self.ui.pick_key_request) && !self.key_picker_busy {
                     self.key_picker_busy = true;
                     self.spawn_file_picker("选择私钥文件", None, UserEvent::KeyPathPicked);
+                }
+                // 凭据表单里的「选择…」私钥。与会话侧共用 `key_picker_busy`
+                // (一次只该开一个对话框),但回送的是**另一个事件** ——
+                // 正文要写进哪个缓冲,只有事件变体分得清。
+                if std::mem::take(&mut self.ui.pick_credential_key_request) && !self.key_picker_busy
+                {
+                    self.key_picker_busy = true;
+                    self.spawn_file_picker(
+                        "选择私钥文件",
+                        None,
+                        UserEvent::CredentialKeyPathPicked,
+                    );
                 }
                 // 「导入 .ico…」:同上。加扩展名过滤,免得用户选中 .png 才被
                 // 告知不行 —— 归一化只吃 .ico 容器。
@@ -6246,6 +6326,93 @@ fn apply_save(
     }
 }
 
+/// 施加一次「保存凭据」意图(F74)。与 `apply_save` 同构、同样抽成自由函数,
+/// 理由也一样:「编辑已有凭据点保存把密码清空」这类错误只能靠无窗口单测挡住。
+///
+/// 凭据**没有代理口令那一格**(设计 D4),合成时那一支恒 `Keep` ——
+/// 传 `Clear` 会把会话侧不小心写进来的东西悄悄抹掉,`Keep` 才是「不归我管」。
+///
+/// 返回被写入的凭据 id:新建时是 store 分配的那个,调用方要拿它把编辑器
+/// 切到「正在编辑这一条」,否则再点一次保存会又新建一条。
+fn apply_credential_save(
+    store: &mut crate::shell::store::SessionStore,
+    intent: crate::ui::session_manager::CredentialSaveIntent,
+) -> Result<mullion_store::CredentialId, String> {
+    use crate::ui::session_manager::{merge_secret, SecretField};
+
+    let crate::ui::session_manager::CredentialSaveIntent {
+        editing_id,
+        mut draft,
+        password,
+        passphrase,
+        private_key,
+    } = intent;
+
+    // 先 clone 出来释放不可变借用,下面才能 &mut store。
+    let existing = editing_id
+        .and_then(|id| store.credential_secret(id))
+        .cloned();
+    let merged = merge_secret(
+        existing.as_ref(),
+        &password,
+        &passphrase,
+        &SecretField::Keep,
+        &private_key,
+    );
+    // `has_passphrase` 必须跟**合成后**的密文走,不能跟表单走:编辑已有凭据
+    // 时口令框恒为空,跟着表单会写成 false,下次连接 russh 拿到加密私钥却
+    // 不知道要口令。会话侧是 `sync_has_passphrase`,凭据的 `kind` 在
+    // `CredentialDraft` 顶层,直接改。
+    if let mullion_store::AuthKind::PublicKey { has_passphrase } = &mut draft.kind {
+        *has_passphrase = merged.as_ref().is_some_and(|s| s.passphrase.is_some());
+    }
+    draft.secret = merged;
+
+    let id = match editing_id {
+        Some(id) => {
+            store
+                .update_credential(id, draft)
+                .map_err(|e| format!("保存凭据失败:{e}"))?;
+            id
+        }
+        None => store.add_credential(draft),
+    };
+    store
+        .save()
+        .map_err(|e| format!("保存凭据失败:{e}"))
+        .map(|_| id)
+}
+
+/// 删凭据被拒时该说的那句话(F74/D7)。
+///
+/// store 只报得出 `SessionId`,而用户认的是会话名 —— 只说「还有 3 条会话
+/// 引用着」等于让他挨个点开会话去找是哪三条,而「去解绑谁」正是他接下来
+/// 唯一要做的事。非「被引用」的错误原样透传。
+fn credential_delete_error(
+    e: &mullion_store::StoreError,
+    sessions: &[mullion_store::SessionRecord],
+) -> String {
+    match e {
+        mullion_store::StoreError::CredentialInUse(ids) => {
+            let names: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    sessions
+                        .iter()
+                        .find(|s| s.id == *id)
+                        .map_or_else(|| format!("{id:?}"), |s| s.identity.name.clone())
+                })
+                .collect();
+            format!(
+                "删不了:{} 条会话还在用这份凭据 —— {}",
+                names.len(),
+                names.join("、")
+            )
+        }
+        other => format!("删除凭据失败:{other}"),
+    }
+}
+
 /// 一帧渲染:先跑 egui(菜单栏 + 工具栏 + 状态栏 + 标题条,§4.2),再(终端态时)
 /// 叠加背景色块 + 文字前景趟。返回 (egui 想要的下次重绘时间, 本帧的布局动作)——
 /// 前者 `Duration::MAX` = 不需要,调用方据此走 T3/T7 的 `next_frame_at`/
@@ -6530,10 +6697,11 @@ fn render_frame(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_layout_actions, apply_save, download_job, effective_focus_of,
-        files_owner_generation_of, finish_password_change, font_px_for, has_real_action,
-        next_panel_selection_index, pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at,
-        upload_job, wind_down, RestoredTab, Tab, TabContent, TerminalTab,
+        apply_credential_save, apply_layout_actions, apply_save, credential_delete_error,
+        download_job, effective_focus_of, files_owner_generation_of, finish_password_change,
+        font_px_for, has_real_action, next_panel_selection_index, pane_still_wanted,
+        snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down, RestoredTab, Tab,
+        TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -9182,6 +9350,166 @@ mod tests {
         (dir, store)
     }
 
+    /// F74:凭据保存一次,`store.credentials()` 里就得有它,且拿得到的是
+    /// **store 分配的那个 id** —— 返回值错了的现象是「再点一次保存又新建
+    /// 一条」,而用户看到的只是列表里多出一份同名凭据。
+    #[test]
+    fn a_saved_credential_lands_in_the_store_under_the_returned_id() {
+        let (_dir, mut store) = tmp_store();
+        let buf = crate::ui::session_manager::CredentialEditorBuffer {
+            name: "运维号".into(),
+            user: "ops".into(),
+            ..Default::default()
+        };
+        let (password, passphrase, private_key) =
+            crate::ui::session_manager::credential_secret_fields(&buf);
+        let id = apply_credential_save(
+            &mut store,
+            crate::ui::session_manager::CredentialSaveIntent {
+                editing_id: None,
+                draft: crate::ui::session_manager::build_credential_draft(&buf).expect("build"),
+                password,
+                passphrase,
+                private_key,
+            },
+        )
+        .expect("保存应成功");
+        let rec = store
+            .credentials()
+            .iter()
+            .find(|c| c.id == id)
+            .expect("apply_credential_save 返回的 id 必须是 store 真正分配的那个");
+        assert_eq!(rec.name, "运维号");
+        assert_eq!(rec.user, "ops");
+    }
+
+    /// F74 端到端红线,与会话侧 `editing_a_session_without_touching_password_keeps_it`
+    /// 同形:**存一份带私钥+口令的凭据,再原样保存一次(两个框都没碰),
+    /// 私钥正文和口令必须都还在,`has_passphrase` 也不能被打回 false。**
+    ///
+    /// 后半条是独立的一个坑:编辑时口令框恒为空,`build_credential_draft`
+    /// 自己算出来的 `has_passphrase` 必然是 false,只有 `apply_credential_save`
+    /// 里那句按合成结果的校正能把它救回来;丢了的现象是下次连接时 russh
+    /// 拿着加密私钥却不知道要口令。
+    ///
+    /// 自证会变红(两次):
+    /// 1. 把 `apply_credential_save` 里的 `store.credential_secret(id)` 换成
+    ///    `None` —— 私钥/口令双双变 None。
+    /// 2. 删掉那句 `*has_passphrase = ...` 的校正 —— 读回的 kind 是
+    ///    `PublicKey { has_passphrase: false }`。
+    #[test]
+    fn saving_an_existing_credential_again_keeps_its_key_and_passphrase() {
+        let (_dir, mut store) = tmp_store();
+
+        let mut first = crate::ui::session_manager::CredentialEditorBuffer {
+            name: "部署号".into(),
+            user: "root".into(),
+            auth_kind: crate::ui::session_manager::AuthKindUi::PublicKey,
+            ..Default::default()
+        };
+        first.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n".into();
+        first.key_touched = true;
+        first.passphrase = "ph".into();
+        first.passphrase_touched = true;
+        let (password, passphrase, private_key) =
+            crate::ui::session_manager::credential_secret_fields(&first);
+        let id = apply_credential_save(
+            &mut store,
+            crate::ui::session_manager::CredentialSaveIntent {
+                editing_id: None,
+                draft: crate::ui::session_manager::build_credential_draft(&first).expect("build"),
+                password,
+                passphrase,
+                private_key,
+            },
+        )
+        .expect("首次保存应成功");
+
+        // 重新打开这份凭据:密文框一律为空、没碰过(store 不回吐明文)。
+        let second = crate::ui::session_manager::CredentialEditorBuffer::from_record(
+            store
+                .credentials()
+                .iter()
+                .find(|c| c.id == id)
+                .expect("刚存的凭据应在库里"),
+        );
+        let (password, passphrase, private_key) =
+            crate::ui::session_manager::credential_secret_fields(&second);
+        apply_credential_save(
+            &mut store,
+            crate::ui::session_manager::CredentialSaveIntent {
+                editing_id: Some(id),
+                draft: crate::ui::session_manager::build_credential_draft(&second).expect("build"),
+                password,
+                passphrase,
+                private_key,
+            },
+        )
+        .expect("二次保存应成功");
+
+        let secret = store.credential_secret(id).expect("密文整条不该塌成 None");
+        assert!(
+            secret.private_key.is_some(),
+            "私钥正文没碰过就该留着,实得 None"
+        );
+        assert_eq!(
+            secret.passphrase.as_deref(),
+            Some("ph"),
+            "口令没碰过就该留着"
+        );
+        assert_eq!(
+            store
+                .credentials()
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.kind.clone()),
+            Some(mullion_store::AuthKind::PublicKey {
+                has_passphrase: true
+            }),
+            "has_passphrase 必须跟合成后的密文走,不跟空着的表单走"
+        );
+    }
+
+    /// F74/D7:删被引用的凭据被拒时,状态栏那句话里要有**引用者的会话名**。
+    ///
+    /// store 只报得出 `SessionId`(`CredentialInUse` 的 Display 连数量都只
+    /// 说个数),照直透传的话用户得挨个点开会话去找是谁在用。
+    ///
+    /// 自证会变红:把 `credential_delete_error` 的 `CredentialInUse` 分支
+    /// 删掉、让它落到 `other` 透传 store 原文。
+    #[test]
+    fn refusing_to_delete_a_credential_names_the_sessions_using_it() {
+        let (_dir, mut store) = tmp_store();
+        let cid = store.add_credential(mullion_store::CredentialDraft {
+            name: "运维号".into(),
+            user: "ops".into(),
+            kind: mullion_store::AuthKind::Password,
+            secret: None,
+        });
+        for name in ["web01", "db02"] {
+            let buf = crate::ui::session_manager::EditorBuffer {
+                name: name.into(),
+                host: "192.0.2.10".into(),
+                cred_source: crate::ui::session_manager::CredSourceUi::Shared,
+                credential_id: Some(cid),
+                ..Default::default()
+            };
+            store.add(
+                crate::ui::session_manager::build_draft(&buf).expect("build"),
+                "2026-08-13T00:00:00Z",
+            );
+        }
+
+        let err = store
+            .delete_credential(cid)
+            .expect_err("被引用的凭据不该删得掉");
+        let msg = credential_delete_error(&err, store.list());
+        assert!(
+            msg.contains("web01") && msg.contains("db02"),
+            "拒绝的理由必须点名是谁在用;实得:{msg}"
+        );
+    }
+
     /// F73 端到端红线:**先存一个带密码的会话,再原样保存一次(密码框没碰过),
     /// 密码必须还在。** 这是用户实际会走的路径,也是改前会丢密码的那条。
     ///
@@ -9379,7 +9707,7 @@ mod tests {
             .iter()
             .find(|r| r.id == id)
             .expect("刚保存的会话应能在 store 里查到");
-        match &rec.auth.kind {
+        match &rec.auth.as_inline().expect("测试里存的是自带认证").kind {
             mullion_store::AuthKind::PublicKey { has_passphrase, .. } => assert!(
                 *has_passphrase,
                 "passphrase 合成后仍有值,has_passphrase 必须是 true"

@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 
 use mullion_ssh::config::SshConfig;
-use mullion_store::{MasterKeySource, SessionDraft, SessionId, SessionRecord, StoreError, Vault};
+use mullion_store::{
+    CredentialId, MasterKeySource, SessionDraft, SessionId, SessionRecord, StoreError, Vault,
+};
 
 use super::session_map::{to_dial_plan, DialPlan, MapError};
 use crate::ui::session_manager::SecretPresence;
@@ -133,6 +135,35 @@ impl SessionStore {
         self.vault.add_group(name)
     }
 
+    /// 共享凭据表(F74)。UI 拿它显示「有效用户名」与凭据档列表。
+    pub fn credentials(&self) -> &[mullion_store::CredentialRecord] {
+        self.vault.credentials()
+    }
+
+    /// F74 凭据 CRUD。与会话侧一样,写完由调用方 `save()` 落盘。
+    pub fn add_credential(&mut self, draft: mullion_store::CredentialDraft) -> CredentialId {
+        self.vault.add_credential(draft)
+    }
+
+    pub fn update_credential(
+        &mut self,
+        id: CredentialId,
+        draft: mullion_store::CredentialDraft,
+    ) -> Result<(), StoreError> {
+        self.vault.update_credential(id, draft)
+    }
+
+    /// 删凭据。**被会话引用时拒绝**并回报引用者(设计 D7)——
+    /// 静默删掉会让那些会话下次连接时整条报错。
+    pub fn delete_credential(&mut self, id: CredentialId) -> Result<(), StoreError> {
+        self.vault.delete_credential(id)
+    }
+
+    /// 哪些会话正引用这份凭据。删除确认框要照实列出来。
+    pub fn sessions_using_credential(&self, id: CredentialId) -> Vec<SessionId> {
+        self.vault.sessions_using(id)
+    }
+
     pub fn tunnels(&self) -> &[mullion_store::TunnelRecord] {
         self.vault.tunnels()
     }
@@ -206,6 +237,29 @@ impl SessionStore {
         }
     }
 
+    /// 读一份凭据的已存密文。**返回明文**,理由同上面的 `secret`:只给保存
+    /// 路径的三态合成用(`app::apply_credential_save`)。
+    pub fn credential_secret(
+        &self,
+        id: CredentialId,
+    ) -> Option<&mullion_store::model::SecretEntry> {
+        self.vault.credential_secret(id)
+    }
+
+    /// 凭据自己的密文存在情况(F74)。与 `secret_presence` 各自独立:
+    /// 凭据没有代理口令那一格(设计 D4),那一位恒 false。
+    pub fn credential_secret_presence(&self, id: CredentialId) -> SecretPresence {
+        match self.vault.credential_secret(id) {
+            None => SecretPresence::default(),
+            Some(s) => SecretPresence {
+                password: s.password.is_some(),
+                passphrase: s.passphrase.is_some(),
+                proxy_password: false,
+                private_key: s.private_key.is_some(),
+            },
+        }
+    }
+
     /// 取会话 → 用其(已解密的)secret 组 SshConfig(双击连接用)。
     ///
     /// 拨号链在这里物化:代理来自继承解析,跳板来自引用图展开。
@@ -224,20 +278,40 @@ impl SessionStore {
     pub fn dial_plan_for(&self, id: SessionId) -> Result<(SshConfig, bool), StoreOpenError> {
         let rec = self.vault.get(id).ok_or(StoreOpenError::NotFound(id))?;
         let secret = self.vault.secret(id);
+        // F74:先解析身份(引用的凭据可能悬空 → 在这里 `?` 出去),再物化。
+        let auth = self.vault.resolve_auth(rec)?;
         let DialPlan {
             mut cfg,
             wants_sftp,
-        } = to_dial_plan(rec, secret)?;
+        } = to_dial_plan(rec, &auth)?;
 
         let resolved = self.vault.resolve_for(id)?;
         let jumps = self.vault.expand_jump_chain(id)?;
+        let hops = self.resolve_jumps(&jumps)?;
         cfg.hops = super::dial_plan::build_hops_with_proxy_secret(
             resolved.proxy.as_ref(),
-            &jumps,
-            &|jid| self.vault.secret(jid).cloned(),
+            &hops,
+            // 代理口令始终取**目标会话**的侧车,不跟着凭据走(设计 D4)。
             secret,
         );
         Ok((cfg, wants_sftp))
+    }
+
+    /// 每一跳都解析成「跳板记录 + 它自己的身份」。任何一跳引用的凭据悬空,
+    /// 整条链就地失败 —— 与跳板悬空同一处置(设计 D6)。
+    fn resolve_jumps<'a>(
+        &self,
+        jumps: &'a [SessionRecord],
+    ) -> Result<Vec<super::dial_plan::Jump<'a>>, StoreError> {
+        jumps
+            .iter()
+            .map(|rec| {
+                Ok(super::dial_plan::Jump {
+                    rec,
+                    auth: self.vault.resolve_auth(rec)?,
+                })
+            })
+            .collect()
     }
 
     /// 按**草稿**(含未保存改动)组 SshConfig。「测试连接」(F92)用。
@@ -251,17 +325,17 @@ impl SessionStore {
     pub fn ssh_config_for_draft(&self, draft: &SessionDraft) -> Result<SshConfig, StoreOpenError> {
         let rec = draft_to_record(draft);
         let secret = draft.secret.as_ref();
+        // 草稿没有 id,查不到「自己的」密文,所以走参数化内核:手上的这份
+        // `auth` + 手上的这份 secret(F74 设计 D5)。
+        let auth = self.vault.resolve_auth_of(&draft.auth, secret)?;
         // 同上:`wants_sftp` 先丢弃,Task 10 才真正接线。
-        let DialPlan { mut cfg, .. } = to_dial_plan(&rec, secret)?;
+        let DialPlan { mut cfg, .. } = to_dial_plan(&rec, &auth)?;
 
         let resolved = self.vault.resolve_layer(draft, draft.identity.group_id);
         let jumps = self.vault.expand_jump_chain_of(&resolved.jump)?;
-        cfg.hops = super::dial_plan::build_hops_with_proxy_secret(
-            resolved.proxy.as_ref(),
-            &jumps,
-            &|jid| self.vault.secret(jid).cloned(),
-            secret,
-        );
+        let hops = self.resolve_jumps(&jumps)?;
+        cfg.hops =
+            super::dial_plan::build_hops_with_proxy_secret(resolved.proxy.as_ref(), &hops, secret);
         Ok(cfg)
     }
 }
@@ -305,10 +379,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "user".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("user", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -459,6 +530,135 @@ mod tests {
         assert_eq!(cfg.host, "198.51.100.7", "拨测必须用草稿里的新 host");
         // 库里那条一点没动 —— 拨测是只读的。
         assert_eq!(store.list()[0].connection.host, "192.0.2.10");
+    }
+
+    /// F74:引用共享凭据的会话,拨号时用的是**凭据里的**用户名与密码,
+    /// 不是会话自己身上那份(它压根没有)。
+    ///
+    /// 自证变红的方式:把 `dial_plan_for` 里的 `resolve_auth(rec)?` 换回
+    /// 直接读会话记录 —— 引用型会话根本给不出 user/kind,那条路走不通,
+    /// 而这正是本测试要钉住的事实。
+    #[test]
+    fn a_session_referencing_a_credential_dials_with_the_credentials_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+        let cid = store.add_credential(mullion_store::CredentialDraft {
+            name: "运维".into(),
+            user: "ops".into(),
+            kind: AuthKind::Password,
+            secret: Some(SecretEntry {
+                password: Some("shared-pw".into()),
+                passphrase: None,
+                proxy_password: None,
+                private_key: None,
+            }),
+        });
+
+        let mut d = draft();
+        d.auth = Auth::Ref(cid);
+        // 会话自己那份密文里放一个**不一样**的密码:被拿去用就说明串味了。
+        d.secret = Some(SecretEntry {
+            password: Some("session-pw".into()),
+            passphrase: None,
+            proxy_password: None,
+            private_key: None,
+        });
+        let id = store.add(d, "2026-08-13T00:00:00Z");
+
+        let cfg = store.ssh_config_for(id).unwrap();
+        assert_eq!(cfg.user, "ops", "用户名必须来自凭据");
+        assert!(
+            matches!(cfg.auth, AuthMethod::Password(p) if p == "shared-pw"),
+            "密码必须来自凭据的侧车"
+        );
+    }
+
+    /// 跳板引用共享凭据时,那一跳也得拿凭据的身份 —— 跳板的解析与目标会话
+    /// 走的是同一个内核,不是只给目标会话接了线。
+    #[test]
+    fn a_jump_referencing_a_credential_carries_the_credentials_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+        let cid = store.add_credential(mullion_store::CredentialDraft {
+            name: "堡垒机私钥".into(),
+            user: "jump-ops".into(),
+            kind: AuthKind::PublicKey {
+                has_passphrase: false,
+            },
+            secret: Some(SecretEntry {
+                password: None,
+                passphrase: None,
+                proxy_password: None,
+                private_key: Some("KEYBODY".into()),
+            }),
+        });
+
+        let mut bastion = draft();
+        bastion.identity.name = "bastion".into();
+        bastion.connection.host = "203.0.113.1".into();
+        bastion.auth = Auth::Ref(cid);
+        bastion.secret = None;
+        let bastion_id = store.add(bastion, "2026-08-13T00:00:00Z");
+
+        let mut d = draft();
+        d.network = mullion_store::NetworkPrefs {
+            proxy: None,
+            jump: Some(vec![mullion_store::JumpRef(bastion_id)]),
+        };
+        let id = store.add(d, "2026-08-13T00:00:00Z");
+
+        let cfg = store.ssh_config_for(id).unwrap();
+        match &cfg.hops[0] {
+            mullion_ssh::hop::Hop::SshJump {
+                user,
+                auth: AuthMethod::PublicKey { key_data, .. },
+                ..
+            } => {
+                assert_eq!(user, "jump-ops");
+                assert_eq!(key_data, "KEYBODY");
+            }
+            other => panic!("跳板应带上凭据的私钥,实际: {other:?}"),
+        }
+    }
+
+    /// 悬空的凭据引用必须让整条 `ssh_config_for` 报错,**绝不降级**。
+    ///
+    /// 与跳板悬空同样的道理:静默退回 agent / 空口令,用户看到的是一条
+    /// 指不到原因的 AuthFailed,甚至可能以另一个身份连上去。
+    ///
+    /// 自证变红的方式:把 `Vault::resolve_auth_of` 里 `Auth::Ref` 那支的
+    /// `ok_or(DanglingCredential)?` 换成「查不到就当成空 inline」。
+    #[test]
+    fn a_dangling_credential_reference_fails_the_whole_dial() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SessionStore::open(dir.path().to_path_buf(), &InMemoryKey([1u8; 32])).unwrap();
+        let mut d = draft();
+        d.auth = Auth::Ref(mullion_store::CredentialId(999));
+        let id = store.add(d, "2026-08-13T00:00:00Z");
+        // 断言到**具体变体**,不是笼统的 `is_err()`:降级成「空身份」照样会
+        // 因为缺密码而报 `MissingSecret`,笼统断言分辨不出这两种,变异跑不红
+        // (第一次写成 `is_err()` 时正是这样漏过去的)。
+        assert!(
+            matches!(
+                store.ssh_config_for(id),
+                Err(StoreOpenError::Store(StoreError::DanglingCredential(c)))
+                    if c == mullion_store::CredentialId(999)
+            ),
+            "悬空凭据必须报「凭据不存在」,不能降级成别的失败"
+        );
+        // 草稿路径(F92 拨测)同样不许降级 —— 两条路共用一个解析内核。
+        let mut draft_ref = draft();
+        draft_ref.auth = Auth::Ref(mullion_store::CredentialId(999));
+        assert!(
+            matches!(
+                store.ssh_config_for_draft(&draft_ref),
+                Err(StoreOpenError::Store(StoreError::DanglingCredential(_)))
+            ),
+            "拨测遇到悬空凭据也必须报同一个错"
+        );
     }
 
     /// F92 + 安全:草稿里的跳板引用悬空时必须**硬失败**。

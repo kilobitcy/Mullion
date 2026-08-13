@@ -74,12 +74,15 @@ fn tip(d: &Disabled) -> Option<String> {
 
 /// `sessions` 只被「连接」页的跳板链编辑器用到:自定义跳板是**对另一条会话的
 /// 引用**(设计 D2),要列出候选、要把 id 显示成人看得懂的名字。
+// 同 `session_manager::show`:内部叶子函数,压参数数没有实际收益。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn show(
     ui: &mut Ui,
     t: &Theme,
     ui_state: &mut UiState,
     groups: &[GroupRecord],
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
     presence: SecretPresence,
     mode: super::ManagerMode,
 ) {
@@ -131,7 +134,17 @@ pub(super) fn show(
         .editor_baseline
         .as_ref()
         .is_some_and(|base| super::is_dirty(buf, base));
-    let missing = super::validate::check(&buf.name, &buf.host, &buf.user);
+    let missing = super::validate::check(
+        &buf.name,
+        &buf.host,
+        &buf.user,
+        match buf.cred_source {
+            super::CredSourceUi::Own => super::validate::Identity::Own,
+            super::CredSourceUi::Shared => super::validate::Identity::Shared {
+                chosen: buf.credential_id.is_some(),
+            },
+        },
+    );
     // 走查 3:名称 + user@host + 端口 + 协议全撞上另一条已存在的会话时提醒一句。
     // **只提醒,不禁用保存** —— 「先存一条一样的、回头改其中一条」是合理用法,
     // 拦下来只会逼用户去改一个假名字再改回来。
@@ -143,6 +156,7 @@ pub(super) fn show(
         buf.protocol,
         ui_state.editor_id,
         sessions,
+        credentials,
     )
     .is_some();
     let reason = why(mode, missing, &ui_state.probe);
@@ -558,6 +572,7 @@ pub(super) fn show(
                 buf,
                 presence,
                 &ui_state.key_candidates,
+                credentials,
                 &mut ui_state.touched,
             ),
             super::TAB_AUTOMATION => super::fields::automation(ui, t, buf, groups),
@@ -576,6 +591,7 @@ pub(super) fn show(
                 buf,
                 groups,
                 sessions,
+                credentials,
                 ui_state.editor_id,
                 presence,
                 focus_name,
@@ -788,6 +804,7 @@ mod tests {
                         &mut ui_state,
                         &[],
                         sessions,
+                        &[],
                         crate::ui::session_manager::SecretPresence::default(),
                         crate::ui::session_manager::ManagerMode::Sessions,
                     );
@@ -817,6 +834,7 @@ mod tests {
                         &mut ui_state,
                         &[],
                         sessions,
+                        &[],
                         crate::ui::session_manager::SecretPresence::default(),
                         crate::ui::session_manager::ManagerMode::Sessions,
                     );
@@ -885,6 +903,7 @@ mod tests {
                         &mut ui_state,
                         &[],
                         &[],
+                        &[],
                         crate::ui::session_manager::SecretPresence::default(),
                         crate::ui::session_manager::ManagerMode::Sessions,
                     );
@@ -943,6 +962,7 @@ mod tests {
                             &mut ui_state,
                             &[],
                             &[],
+                            &[],
                             crate::ui::session_manager::SecretPresence::default(),
                             crate::ui::session_manager::ManagerMode::Sessions,
                         );
@@ -999,6 +1019,7 @@ mod tests {
                                 ui,
                                 &t,
                                 ui_state,
+                                &[],
                                 &[],
                                 &[],
                                 crate::ui::session_manager::SecretPresence::default(),
@@ -1094,6 +1115,7 @@ mod tests {
                         ui_state,
                         &[],
                         &[],
+                        &[],
                         crate::ui::session_manager::SecretPresence::default(),
                         crate::ui::session_manager::ManagerMode::Sessions,
                     );
@@ -1155,10 +1177,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "root".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("root", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -1189,10 +1208,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "root".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("root", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -1235,6 +1251,7 @@ mod tests {
                             ui_state,
                             &[],
                             sessions,
+                            &[],
                             crate::ui::session_manager::SecretPresence::default(),
                             crate::ui::session_manager::ManagerMode::Sessions,
                         );
@@ -1394,6 +1411,7 @@ mod tests {
             name: false,
             host: true,
             user: false,
+            credential: false,
         };
         let d = why(ManagerMode::Sessions, missing, &ProbeState::Running);
         match &d {
@@ -1431,6 +1449,7 @@ mod tests {
             name: true,
             host: false,
             user: true,
+            credential: false,
         };
         let d = why(ManagerMode::Sessions, missing, &ProbeState::Idle);
         assert_eq!(tip(&d), Some("还缺:会话名称、用户名".to_owned()));
@@ -1848,6 +1867,7 @@ mod tests {
                     ui,
                     &crate::theme::MULLION_DARK,
                     ui_state,
+                    &[],
                     &[],
                     &[],
                     super::SecretPresence::default(),

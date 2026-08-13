@@ -52,13 +52,10 @@ pub struct Connection {
 }
 
 /// 认证(分节)。**永不可继承**。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Auth {
-    pub user: String,
-    /// 平铺进 `[session.auth]`,不额外产生一层 table。
-    #[serde(flatten)]
-    pub kind: AuthKind,
-}
+///
+/// F74 起是「本会话独有 / 引用共享凭据」二选一,定义搬到了 `credential.rs`
+/// (那里同时管着凭据实体本身与两者共用的 TOML 编码)。
+pub use crate::credential::{Auth, InlineAuth};
 
 /// 一条会话(非敏感字段)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +209,8 @@ pub struct AppearancePrefs {
 ///      (正文 base64 内嵌),并可配底色。
 /// v7 = v6 + `[[tunnel]]`:隧道成为引用会话的一等对象(F110~F117)。
 /// v8 = v7 + `session.sftp`:SFTP 书签与默认远端/本地目录(F120)。
+/// v9 = v8 + `[[credential]]` 与 `[session.auth].source`:凭据成为可被多条会话
+///      引用的一等对象(F74)。
 ///
 /// 结构上新版本能直接读旧版本(新字段全带 `serde(default)`),升版本号是为了让
 /// **旧客户端明确拒绝**,而不是静默丢弃新分节再写回。v5 还多一层理由:旧客户端
@@ -219,9 +218,14 @@ pub struct AppearancePrefs {
 /// `session.sftp` 是同一条理由:旧客户端读 v8 会把整个分节丢掉再写回,拒绝
 /// 比静默吃掉好。
 ///
+/// v9 **没有一行迁移转换代码**:v8 的 auth 分节没有 `source` 键 → 直接读成
+/// `Inline`,`[[credential]]` 缺失 → `serde(default)` 补空。版本号照升,因为
+/// v9 文件里可能有 `source = "ref"` 的会话 —— 旧客户端会把 `credential_id`
+/// 当未知字段丢掉、把 `user`/`kind` 当缺失,拒绝比装作能用好。
+///
 /// **号段归属**:F74(凭据实体)原定 v3→v4,被 F40~F44 先落地拿走了 4,再被本次
 /// 「私钥入库」拿走了 5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
-pub const CURRENT_SCHEMA: u32 = 8;
+pub const CURRENT_SCHEMA: u32 = 9;
 
 fn schema_v1() -> u32 {
     1
@@ -240,6 +244,10 @@ pub struct SessionsFile {
     /// v7 新增。旧文件没有这个键 → `default` 补空数组,无需迁移代码。
     #[serde(default)]
     pub tunnel: Vec<crate::tunnel::TunnelRecord>,
+    /// v9 新增(F74)。同上:旧文件没有 → 空表。**迁移绝不往里填东西** ——
+    /// 把重复的 `(用户名, 私钥)` 提取成共享凭据是 F75,且只在用户点头后做。
+    #[serde(default)]
+    pub credential: Vec<crate::credential::CredentialRecord>,
 }
 
 #[cfg(test)]
@@ -262,12 +270,12 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "user".into(),
-                kind: AuthKind::PublicKey {
+            auth: Auth::inline(
+                "user",
+                AuthKind::PublicKey {
                     has_passphrase: false,
                 },
-            },
+            ),
             terminal: TerminalPrefs {
                 scrollback: Some(5000),
             },
@@ -281,6 +289,7 @@ mod tests {
             group: Vec::new(),
             session: vec![rec.clone()],
             tunnel: Vec::new(),
+            credential: Vec::new(),
         };
         let s = toml::to_string_pretty(&file).unwrap();
         let back: SessionsFile = toml::from_str(&s).unwrap();
@@ -303,10 +312,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("u", AuthKind::Password),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
@@ -318,6 +324,7 @@ mod tests {
             group: Vec::new(),
             session: vec![rec],
             tunnel: Vec::new(),
+            credential: Vec::new(),
         };
         let s = toml::to_string_pretty(&file).unwrap();
         assert!(s.contains("[session.auth]"), "应有 auth 分节: {s}");

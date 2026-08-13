@@ -11,7 +11,7 @@ use crate::ui::metrics::{
 use crate::ui::session_manager::form::{field_error, grid, required, section};
 use crate::ui::session_manager::inherit_row::{self, Source};
 use crate::ui::session_manager::{
-    AuthKindUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
+    AuthKindUi, CredSourceUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
 };
 
 /// 三态下拉:继承(`None`)/ 开 / 关。
@@ -173,6 +173,7 @@ pub(super) fn basic(
     buf: &mut EditorBuffer,
     groups: &[GroupRecord],
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
     editing: Option<SessionId>,
     presence: SecretPresence,
     focus_name: bool,
@@ -342,7 +343,16 @@ pub(super) fn basic(
     // 那一页只有一行代理,右侧 70% 是空白。
     network(ui, t, buf, groups, presence, &mut first);
 
-    jump(ui, t, buf, groups, sessions, editing, &mut first);
+    jump(
+        ui,
+        t,
+        buf,
+        groups,
+        sessions,
+        credentials,
+        editing,
+        &mut first,
+    );
 }
 
 /// `Color32` → `#rrggbb`。色盘吐的是 `Color32`,库里存的是 hex 文本,
@@ -610,12 +620,15 @@ pub(crate) fn appearance(
 /// 用户根本找不到。
 ///
 /// 三态与 `NetworkPrefs::jump` 一一对应,见 `JumpModeUi` 的说明。
+// 同上:内部叶子函数,为压参数数引一个专用结构体没有实际收益。
+#[allow(clippy::too_many_arguments)]
 fn jump(
     ui: &mut Ui,
     t: &Theme,
     buf: &mut EditorBuffer,
     groups: &[GroupRecord],
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
     editing: Option<SessionId>,
     first: &mut bool,
 ) {
@@ -662,7 +675,7 @@ fn jump(
             JumpModeUi::None | JumpModeUi::Inherit => {}
             JumpModeUi::Custom => {
                 ui.label("跳板链");
-                ui.vertical(|ui| chain_editor(ui, t, buf, sessions, editing));
+                ui.vertical(|ui| chain_editor(ui, t, buf, sessions, credentials, editing));
                 ui.end_row();
             }
         }
@@ -675,6 +688,7 @@ fn chain_editor(
     t: &Theme,
     buf: &mut EditorBuffer,
     sessions: &[SessionRecord],
+    credentials: &[mullion_store::CredentialRecord],
     editing: Option<SessionId>,
 ) {
     // 本帧的结构变更先记下来,循环结束后统一施加 —— 循环里正持着
@@ -695,7 +709,11 @@ fn chain_editor(
                         ui.label(&s.identity.name);
                         ui.colored_label(
                             crate::theme::c32(t.fg_dimmer),
-                            format!("{}@{}", s.auth.user, s.connection.host),
+                            format!(
+                                "{}@{}",
+                                mullion_store::display_user(&s.auth, credentials),
+                                s.connection.host
+                            ),
                         );
                     }
                     // 悬空引用不能悄悄不显示:拨号时 `expand_jump_chain` 会
@@ -745,7 +763,9 @@ fn chain_editor(
             {
                 let label = format!(
                     "{} ({}@{})",
-                    s.identity.name, s.auth.user, s.connection.host
+                    s.identity.name,
+                    mullion_store::display_user(&s.auth, credentials),
+                    s.connection.host
                 );
                 if ui.selectable_label(false, label).clicked() {
                     add = Some(s.id);
@@ -796,17 +816,55 @@ fn chain_editor(
     }
 }
 
+/// 引用共享凭据时贴在「身份」节下面的一句话。
+///
+/// 必须说清「改的是这份凭据本身、会连带影响别的会话」—— 共享凭据的全部价值
+/// 是「换密钥改一处」,同一枚硬币的背面就是「改一处影响多处」。不写这句,
+/// 用户会把它当成一个「填起来更省事的用户名」,直到某天改一份凭据连带把
+/// 五台机器的登录改掉才发现。
+pub(super) const SHARED_CREDENTIAL_NOTE: &str =
+    "用户名与密码属于这份凭据本身;要改请去「凭据」页 —— 改动会作用到所有引用它的会话。";
+
+#[allow(clippy::too_many_arguments)] // 表单页函数,参数就是页面要画的那些东西
 pub(super) fn auth(
     ui: &mut Ui,
     t: &Theme,
     buf: &mut EditorBuffer,
     presence: SecretPresence,
     key_candidates: &[std::path::PathBuf],
+    credentials: &[mullion_store::CredentialRecord],
     touched: &mut super::validate::Touched,
 ) {
     let mut first = true;
     section(ui, t, "会话管理器/右栏", "身份", &mut first);
     grid(ui, "sm_auth", |ui| {
+        // 来源开关放在「身份」节顶上、两档都画:它是这一页的分岔口,
+        // 藏进任何一档里都会让用户切过去之后找不到切回来的路。
+        ui.label("凭据来源");
+        ui.horizontal(|ui| {
+            let vis = &mut ui.visuals_mut().selection;
+            vis.bg_fill = crate::theme::c32(t.accent).linear_multiply(0.35);
+            ui.selectable_value(&mut buf.cred_source, CredSourceUi::Own, "本会话独有");
+            ui.selectable_value(&mut buf.cred_source, CredSourceUi::Shared, "共享凭据");
+        });
+        ui.end_row();
+
+        if buf.cred_source == CredSourceUi::Shared {
+            // 共享档:用户名/认证方式/密码整块都不画。**不是禁用而是不画** ——
+            // 严格二选一(设计 D1),画一组灰着的输入框等于在暗示「这里还有一份
+            // 会话自己的身份」,而那正是本功能要消灭的东西。
+            required(ui, t, "凭据");
+            credential_combo(ui, buf, credentials);
+            ui.end_row();
+            field_error(ui, t, buf.credential_id.is_none(), "请选一份共享凭据");
+
+            ui.label("这份凭据");
+            let (text, color) = credential_summary(buf.credential_id, credentials, t);
+            ui.colored_label(crate::theme::c32(color), text);
+            ui.end_row();
+            return;
+        }
+
         required(ui, t, "用户名");
         let user_resp = ui.add(
             egui::TextEdit::singleline(&mut buf.user).desired_width(field_w(
@@ -837,6 +895,16 @@ pub(super) fn auth(
         });
         ui.end_row();
     });
+
+    if buf.cred_source == CredSourceUi::Shared {
+        ui.add_space(crate::ui::metrics::SP_XS);
+        ui.label(
+            egui::RichText::new(SHARED_CREDENTIAL_NOTE)
+                .size(11.0)
+                .color(crate::theme::c32(t.fg_muted)),
+        );
+        return;
+    }
 
     section(ui, t, "会话管理器/右栏", "凭据", &mut first);
     grid(ui, "sm_auth_secret", |ui| match buf.auth_kind {
@@ -932,6 +1000,65 @@ pub(super) fn auth(
 /// 的地方栽赃自己。
 pub(super) const SECRET_STORAGE_NOTE: &str =
     "密码与私钥经 XChaCha20-Poly1305 加密后存进 secrets.enc,主密钥交给 Windows 凭据管理器保管。";
+
+/// 共享凭据下拉。抽成独立函数并**返回 `Response`**,理由同 `key_candidate_combo`:
+/// 让守护测试扎在生产代码上,而不是在测试里另起一份同构的 ComboBox。
+///
+/// 空库时禁用并说明去处 —— 一个点了没反应的下拉,用户只会以为程序卡了。
+pub(super) fn credential_combo(
+    ui: &mut Ui,
+    buf: &mut EditorBuffer,
+    credentials: &[mullion_store::CredentialRecord],
+) -> egui::Response {
+    let has_any = !credentials.is_empty();
+    let selected = buf
+        .credential_id
+        .and_then(|id| credentials.iter().find(|c| c.id == id))
+        .map_or_else(|| "请选择…".to_string(), |c| c.name.clone());
+    let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
+    ui.add_enabled_ui(has_any, |ui| {
+        egui::ComboBox::from_id_salt("sm_credential")
+            .width(w)
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                for c in credentials {
+                    // 下拉项带上用户名:凭据名是用户自己起的,「运维号」这种
+                    // 名字光看名字分不出是 root 还是 ops。
+                    let label = format!("{} —— {}", c.name, c.user);
+                    let picked = Some(c.id) == buf.credential_id;
+                    if ui.selectable_label(picked, label).clicked() {
+                        buf.credential_id = Some(c.id);
+                    }
+                }
+            });
+    })
+    .response
+    .on_disabled_hover_text("凭据库是空的 —— 先去「凭据」页新建一份")
+}
+
+/// 选中凭据的只读摘要 `(文案, 颜色)`。
+///
+/// 悬空(引用的凭据已被删)必须**标红说明**,不能画成空白:这条会话拨号时
+/// 是硬失败的(设计 D6),界面上装作没事,用户只会在连接失败时才发现。
+fn credential_summary(
+    id: Option<mullion_store::CredentialId>,
+    credentials: &[mullion_store::CredentialRecord],
+    t: &Theme,
+) -> (String, mullion_term::snapshot::Rgb) {
+    let Some(id) = id else {
+        return ("尚未选择".to_string(), t.fg_muted);
+    };
+    match credentials.iter().find(|c| c.id == id) {
+        Some(c) => {
+            let kind = match c.kind {
+                mullion_store::AuthKind::Password => "密码",
+                mullion_store::AuthKind::PublicKey { .. } => "公钥",
+            };
+            (format!("{}(以 {} 认证)", c.user, kind), t.fg)
+        }
+        None => ("引用的凭据已被删除 —— 请重新选一份".to_string(), t.danger),
+    }
+}
 
 /// 私钥候选下拉。抽成独立函数并**返回 `Response`**,是为了让守护测试能扎在
 /// 真实生产代码上 —— 原先测试自己复制一份同构的 ComboBox 去断言,`auth()` 里
@@ -1708,10 +1835,12 @@ fn bookmark_editor(ui: &mut Ui, t: &Theme, bookmarks: &mut Vec<(String, String)>
 
 #[cfg(test)]
 mod tests {
-    use super::{auth, automation, basic, key_candidate_combo, network, tri_state};
+    use super::{
+        auth, automation, basic, credential_combo, key_candidate_combo, network, tri_state,
+    };
     use crate::theme::Theme;
     use crate::ui::session_manager::{
-        AuthKindUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
+        AuthKindUi, CredSourceUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
     };
     use mullion_store::{
         Auth, AuthKind, Connection, GroupRecord, Identity, Protocol, SessionId, SessionRecord,
@@ -1875,6 +2004,7 @@ mod tests {
                 &mut buf,
                 &[],
                 &[],
+                &[],
                 None,
                 SecretPresence::default(),
                 false,
@@ -1915,6 +2045,7 @@ mod tests {
                 ui,
                 &t,
                 &mut buf,
+                &[],
                 &[],
                 &[],
                 None,
@@ -2575,10 +2706,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "ops".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("ops", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -2614,6 +2742,7 @@ mod tests {
                 buf,
                 &[],
                 sessions,
+                &[],
                 Some(SessionId(1)),
                 SecretPresence::default(),
                 false,
@@ -2640,6 +2769,7 @@ mod tests {
                     ui,
                     &t,
                     &mut buf,
+                    &[],
                     &[],
                     &[],
                     None,
@@ -2693,6 +2823,7 @@ mod tests {
                     &mut buf,
                     &[],
                     &[],
+                    &[],
                     None,
                     SecretPresence::default(),
                     false,
@@ -2739,6 +2870,7 @@ mod tests {
                         ui,
                         &t,
                         buf,
+                        &[],
                         &[],
                         &[],
                         Some(SessionId(1)),
@@ -3291,7 +3423,7 @@ mod tests {
 
     fn run_auth(buf: &mut EditorBuffer, presence: SecretPresence) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
-        run_page(|ui| auth(ui, &t, buf, presence, &[], &mut Default::default()))
+        run_page(|ui| auth(ui, &t, buf, presence, &[], &[], &mut Default::default()))
     }
 
     fn run_automation(buf: &mut EditorBuffer) -> egui::FullOutput {
@@ -3514,6 +3646,7 @@ mod tests {
                         buf,
                         &[],
                         &sessions,
+                        &[],
                         Some(SessionId(1)),
                         SecretPresence::default(),
                         false,
@@ -3722,6 +3855,7 @@ mod tests {
                         buf,
                         &[],
                         &sessions,
+                        &[],
                         Some(SessionId(1)),
                         SecretPresence::default(),
                         false,
@@ -3799,6 +3933,7 @@ mod tests {
                         buf,
                         &[],
                         &sessions,
+                        &[],
                         Some(SessionId(1)),
                         SecretPresence::default(),
                         false,
@@ -3971,7 +4106,7 @@ mod tests {
     ) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
         run_page_at(width, 1.0, |ui| {
-            auth(ui, &t, buf, presence, &[], &mut Default::default())
+            auth(ui, &t, buf, presence, &[], &[], &mut Default::default())
         })
     }
 
@@ -4059,6 +4194,7 @@ mod tests {
                                 buf,
                                 &[],
                                 &[],
+                                &[],
                                 None,
                                 SecretPresence::default(),
                                 false,
@@ -4142,6 +4278,7 @@ mod tests {
                 ui,
                 &t,
                 buf,
+                &[],
                 &[],
                 &[],
                 None,
@@ -4373,5 +4510,163 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// F74 用的凭据样本。
+    fn cred(id: u64, name: &str, user: &str) -> mullion_store::CredentialRecord {
+        mullion_store::CredentialRecord {
+            id: mullion_store::CredentialId(id),
+            name: name.into(),
+            user: user.into(),
+            kind: AuthKind::Password,
+        }
+    }
+
+    /// 在同一个 `Context` 上反复渲染「认证」页,每帧点一次写着 `clicks[i]`
+    /// 的部件,返回最后一帧画出的全部文字。
+    ///
+    /// **必须多帧**:ComboBox 的候选项要等按钮被点开的下一帧才画得出来,
+    /// 一帧之内既点不开也点不中。
+    fn click_through_auth(
+        buf: &mut EditorBuffer,
+        credentials: &[mullion_store::CredentialRecord],
+        clicks: &[&str],
+    ) -> Vec<String> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let run = |input: egui::RawInput, buf: &mut EditorBuffer| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    auth(
+                        ui,
+                        &t,
+                        buf,
+                        SecretPresence::default(),
+                        &[],
+                        credentials,
+                        &mut Default::default(),
+                    );
+                });
+            })
+        };
+        let mut out = run(egui::RawInput::default(), buf);
+        for label in clicks {
+            let pos = find_text_center(&out.shapes, label)
+                .unwrap_or_else(|| panic!("页面上找不到写着「{label}」的部件"));
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            let _ = run(input, buf);
+            // 点完再空跑一帧才取形状:ComboBox 的候选列表画在 `egui::Area` 里,
+            // 而 `Area` 首帧 fade_in 只记 `Shape::Noop`,点击那一帧扫不到任何
+            // 候选项文字(D1 切片踩过同一个坑)。
+            out = run(egui::RawInput::default(), buf);
+        }
+        all_text(&out.shapes)
+    }
+
+    /// 找写着 `needle` 的那段文字的**中心点** —— `find_text_pos` 给的是左上角,
+    /// 拿它去点击会落在字的边上,点不中控件。
+    fn find_text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(t) if t.galley.job.text.contains(needle) => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// F74/D1:选了「共享凭据」,会话自己那套身份输入(用户名、认证方式、
+    /// 密码/私钥)整块**不画**。
+    ///
+    /// 不是禁用而是不画:画一组灰着的框等于在暗示「这里还留着一份会话自己的
+    /// 身份」,而「一台机器到底用哪个用户名要靠追查」正是本功能要消灭的东西。
+    /// 顺带钉住摘要与那句「去『凭据』页改」——用户得知道改动会波及别的会话。
+    ///
+    /// 自证变红的方式:把 `auth()` 里共享档那条 `return` 删掉。
+    #[test]
+    fn the_shared_source_hides_the_sessions_own_identity_inputs() {
+        let creds = vec![cred(1, "运维号", "ops")];
+        let mut buf = EditorBuffer {
+            cred_source: CredSourceUi::Shared,
+            credential_id: Some(mullion_store::CredentialId(1)),
+            ..Default::default()
+        };
+        let texts = click_through_auth(&mut buf, &creds, &[]);
+
+        for gone in ["用户名", "认证方式", "密码", "私钥", "私钥口令"] {
+            assert!(
+                !texts.iter().any(|s| s == gone),
+                "共享档下不该画「{gone}」这一行;实际画出:{texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().any(|s| s.contains("ops")),
+            "得让用户看见这份凭据是谁;实际画出:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s == super::SHARED_CREDENTIAL_NOTE),
+            "得说清改凭据会波及所有引用它的会话;实际画出:{texts:?}"
+        );
+    }
+
+    /// F74:凭据库是空的时候,下拉必须**禁用**——`on_disabled_hover_text`
+    /// 的判据是 `!self.enabled`(egui-0.30.0 `response.rs:557-568`),
+    /// enabled 为真则那句「先去『凭据』页新建一份」永远弹不出来,用户对着
+    /// 一个点了没反应的下拉只会以为程序卡了。判据与 `key_candidate_combo`
+    /// 那条同源。
+    ///
+    /// 自证变红的方式:把 `credential_combo` 里的 `has_any` 改成 `true`。
+    #[test]
+    fn the_credential_combo_is_disabled_only_while_the_library_is_empty() {
+        let mut enabled = Vec::new();
+        for creds in [Vec::new(), vec![cred(1, "运维号", "ops")]] {
+            // 两次各用一个独立 Context:同一 pass 里两个同 id_salt 的
+            // ComboBox 会撞 id,0.30 在 debug 下会画红字警告。
+            let ctx = egui::Context::default();
+            let mut buf = EditorBuffer::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    enabled.push(credential_combo(ui, &mut buf, &creds).enabled());
+                });
+            });
+        }
+        assert_eq!(
+            enabled,
+            vec![false, true],
+            "空库应禁用、有凭据应可用(顺序:空库、有一份)"
+        );
+    }
+
+    /// F74:在下拉里点中一份凭据,`credential_id` 要真的改过去 ——
+    /// 这是「引用共享凭据」在 UI 上唯一的入口,接线断了整个功能就没了。
+    ///
+    /// 自证变红的方式:把 `credential_combo` 里
+    /// `buf.credential_id = Some(c.id)` 那行删掉。
+    #[test]
+    fn picking_a_credential_from_the_combo_updates_the_buffer() {
+        let creds = vec![cred(1, "运维号", "ops"), cred(2, "备用号", "root")];
+        let mut buf = EditorBuffer {
+            cred_source: CredSourceUi::Shared,
+            ..Default::default()
+        };
+        // 第一下点开下拉(按钮上写着「请选择…」),第二下点中第二份凭据。
+        click_through_auth(&mut buf, &creds, &["请选择", "备用号"]);
+        assert_eq!(
+            buf.credential_id,
+            Some(mullion_store::CredentialId(2)),
+            "点中的是「备用号」"
+        );
     }
 }

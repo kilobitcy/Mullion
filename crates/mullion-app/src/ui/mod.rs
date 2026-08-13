@@ -175,6 +175,26 @@ pub struct UiState {
     /// F111:点了「停止」。
     pub tunnel_stop_request: Option<TunnelId>,
 
+    // --- F74 凭据模式。与会话侧/隧道侧同样**各自独立**,理由同上。---
+    /// 正在编辑的凭据 id;`None` = 新建。
+    pub credential_editor_id: Option<mullion_store::CredentialId>,
+    /// 凭据表单的跨帧缓冲。`None` = 右栏未在编辑任何凭据(画空态提示)。
+    pub credential_editor: Option<session_manager::CredentialEditorBuffer>,
+    /// 凭据表单的基线快照,用于脏检查。与 `credential_editor` 同时设置、同时清空。
+    pub credential_editor_baseline: Option<session_manager::CredentialEditorBuffer>,
+    /// 凭据表单点「保存」→ app 事后据此调 `store.add_credential`/`update_credential`。
+    pub credential_save_request: Option<session_manager::CredentialSaveIntent>,
+    /// 二次确认后的删除意图 → app 事后据此调 `store.delete_credential`。
+    pub credential_delete_request: Option<mullion_store::CredentialId>,
+    /// 点了删凭据但还没二次确认;确认后转成 `credential_delete_request`。
+    pub pending_credential_delete: Option<mullion_store::CredentialId>,
+    /// 凭据右栏「保存」被点了。中转一层的理由同 `save_click`。
+    pub credential_save_click: bool,
+    /// 凭据表单里点了「导入…」私钥 → app 事后另起线程开系统文件对话框。
+    /// 与会话侧的 `pick_key_request` **分开**:回调要把正文写进哪个缓冲,
+    /// 共用一位就分不出来了。
+    pub pick_credential_key_request: bool,
+
     /// 主机密钥弹窗的回答(F3)。`Some(true)` = 接受;`Some(false)` = 取消连接。
     /// 同样只承载意图:record + save + 回送 oneshot 都在 app.rs 施加点做。
     pub host_key_reply: Option<bool>,
@@ -331,6 +351,10 @@ pub struct UiFrame<'a> {
     pub sessions: &'a [SessionRecord],
     /// 分组列表(F60)。列表分组折叠 + 编辑器分组下拉都读这个。store 不可用时传 `&[]`。
     pub groups: &'a [GroupRecord],
+    /// 共享凭据表(F74)。列表副标题、跳板/隧道下拉里那个 `user@host` 的
+    /// `user` 要从这里查 —— 引用凭据的会话自己身上没有用户名。
+    /// store 不可用时传 `&[]`。
+    pub credentials: &'a [mullion_store::CredentialRecord],
     /// 隧道列表(F110)。会话管理器「隧道」页的左栏读它;删会话的确认框也读它
     /// 来列受影响的隧道。store 不可用时传 `&[]`。
     pub tunnels: &'a [mullion_store::TunnelRecord],
@@ -349,6 +373,9 @@ pub struct UiFrame<'a> {
     pub paste: Option<paste::PasteView<'a>>,
     /// 当前被编辑会话的三个凭据槽位「有没有值」。**只有 bool,无明文**。
     pub secret_presence: session_manager::SecretPresence,
+    /// F74:当前选中**凭据**的密文存在情况。与 `secret_presence` 各自独立
+    /// (两档各画各的密文框)。
+    pub credential_presence: session_manager::SecretPresence,
     /// F40~F44:自动化状态一句话。`None` = 这条连接没跑过自动化。
     /// 生命周期由 `App` 管:一直显示到下一次 `spawn_connect`(那时清空)。
     pub automation: Option<&'a str>,
@@ -667,10 +694,12 @@ pub fn build_ui(
             ui_state,
             frame.sessions,
             frame.groups,
+            frame.credentials,
             frame.tunnels,
             frame.tunnel_states,
             frame.store_available,
             frame.secret_presence,
+            frame.credential_presence,
             frame.appearance,
         );
     }
@@ -891,6 +920,7 @@ mod tests {
             settings: None,
             sessions: &[],
             groups: &[],
+            credentials: &[],
             tunnels: &[],
             tunnel_states: &[],
             store_available: false,
@@ -902,6 +932,7 @@ mod tests {
             host_key: None,
             paste: None,
             secret_presence: session_manager::SecretPresence::default(),
+            credential_presence: session_manager::SecretPresence::default(),
             automation: None,
             // 测试专用:`AppearanceCache` 没有 const 构造,借 `Box::leak` 换一个
             // `'static` 引用——只在测试进程里泄漏一次,不是生产路径。

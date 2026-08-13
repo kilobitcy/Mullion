@@ -5,7 +5,7 @@
 use std::fmt;
 
 use mullion_ssh::config::{AuthMethod, SshConfig};
-use mullion_store::{AuthKind, Protocol, SecretEntry, SessionRecord};
+use mullion_store::{AuthKind, Protocol, ResolvedAuth, SessionRecord};
 
 /// 映射失败原因。
 #[derive(Debug, PartialEq, Eq)]
@@ -31,14 +31,19 @@ impl fmt::Display for MapError {
 
 impl std::error::Error for MapError {}
 
-/// `SessionRecord` + 解密后的敏感部分 → `SshConfig`。cols/rows 先给占位默认,
+/// `SessionRecord` + **已解析的身份** → `SshConfig`。cols/rows 先给占位默认,
 /// 窗口出来后由 window_change 校正到真实尺寸(与既有 `cli::parse_args` 一致)。
+///
+/// 身份走 `ResolvedAuth` 而不是直接读 `rec.auth`(F74):会话可能引用共享凭据,
+/// 那时用户名/认证方式/密文全在凭据那边,而查凭据是可失败的(悬空必须硬失败,
+/// 设计 D6),不该混进这层「只做映射」的纯函数。
 ///
 /// **模块私有,对外只留 [`to_dial_plan`]。** 公开两个入口的话,后来者顺手
 /// 拿了这个就悄悄丢掉 `wants_sftp` —— 那正是 D24 要堵的坑,没道理自己再
 /// 挖一遍。
-fn to_ssh_config(rec: &SessionRecord, secret: Option<&SecretEntry>) -> Result<SshConfig, MapError> {
-    let auth = match &rec.auth.kind {
+fn to_ssh_config(rec: &SessionRecord, resolved: &ResolvedAuth) -> Result<SshConfig, MapError> {
+    let secret = resolved.secret.as_ref();
+    let auth = match &resolved.kind {
         AuthKind::Password => {
             let pw = secret
                 .and_then(|s| s.password.clone())
@@ -68,7 +73,7 @@ fn to_ssh_config(rec: &SessionRecord, secret: Option<&SecretEntry>) -> Result<Ss
     Ok(SshConfig {
         host: rec.connection.host.clone(),
         port: rec.connection.port,
-        user: rec.auth.user.clone(),
+        user: resolved.user.clone(),
         auth,
         cols: 80,
         rows: 24,
@@ -89,13 +94,10 @@ pub struct DialPlan {
     pub wants_sftp: bool,
 }
 
-/// `SessionRecord` + 解密后的敏感部分 → 一次完整的连接意图。
-pub fn to_dial_plan(
-    rec: &SessionRecord,
-    secret: Option<&SecretEntry>,
-) -> Result<DialPlan, MapError> {
+/// `SessionRecord` + 已解析的身份 → 一次完整的连接意图。
+pub fn to_dial_plan(rec: &SessionRecord, resolved: &ResolvedAuth) -> Result<DialPlan, MapError> {
     Ok(DialPlan {
-        cfg: to_ssh_config(rec, secret)?,
+        cfg: to_ssh_config(rec, resolved)?,
         wants_sftp: rec.connection.protocol == Protocol::Sftp,
     })
 }
@@ -123,15 +125,23 @@ mod tests {
                 port: 2222,
                 protocol: proto,
             },
-            auth: Auth {
-                user: "u".into(),
-                kind: auth,
-            },
+            auth: Auth::inline("u", auth),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
             automation: Default::default(),
             sftp: Default::default(),
+        }
+    }
+
+    /// 上游(`shell::store`)解析完之后交给映射层的形状:自带认证的会话
+    /// 就是「照抄自己那份 + 自己的侧车」。
+    fn resolved(r: &SessionRecord, sec: Option<&SecretEntry>) -> ResolvedAuth {
+        let i = r.auth.as_inline().expect("测试里都是自带认证");
+        ResolvedAuth {
+            user: i.user.clone(),
+            kind: i.kind.clone(),
+            secret: sec.cloned(),
         }
     }
 
@@ -144,7 +154,7 @@ mod tests {
             proxy_password: None,
             private_key: None,
         };
-        let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
+        let cfg = to_ssh_config(&r, &resolved(&r, Some(&sec))).unwrap();
         assert_eq!(cfg.host, "h");
         assert_eq!(cfg.port, 2222);
         assert_eq!(cfg.user, "u");
@@ -156,7 +166,7 @@ mod tests {
     fn password_without_secret_errors() {
         let r = rec(AuthKind::Password, Protocol::Ssh);
         assert!(matches!(
-            to_ssh_config(&r, None),
+            to_ssh_config(&r, &resolved(&r, None)),
             Err(MapError::MissingSecret)
         ));
     }
@@ -176,7 +186,7 @@ mod tests {
             proxy_password: None,
             private_key: Some("KEYBODY".into()),
         };
-        let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
+        let cfg = to_ssh_config(&r, &resolved(&r, Some(&sec))).unwrap();
         match cfg.auth {
             AuthMethod::PublicKey {
                 key_data,
@@ -203,7 +213,7 @@ mod tests {
             proxy_password: None,
             private_key: Some("KEYBODY".into()),
         };
-        let cfg = to_ssh_config(&r, Some(&sec)).unwrap();
+        let cfg = to_ssh_config(&r, &resolved(&r, Some(&sec))).unwrap();
         assert!(matches!(
             cfg.auth,
             AuthMethod::PublicKey {
@@ -225,7 +235,7 @@ mod tests {
             Protocol::Ssh,
         );
         assert!(matches!(
-            to_ssh_config(&r, None),
+            to_ssh_config(&r, &resolved(&r, None)),
             Err(MapError::MissingPrivateKey)
         ));
         assert!(
@@ -250,7 +260,8 @@ mod tests {
             private_key: None,
         };
 
-        let plan = to_dial_plan(&r, Some(&sec)).expect("SFTP 节点必须能映射出拨号参数");
+        let plan =
+            to_dial_plan(&r, &resolved(&r, Some(&sec))).expect("SFTP 节点必须能映射出拨号参数");
         assert_eq!(plan.cfg.host, "h");
         assert_eq!(plan.cfg.port, 2222);
         assert!(plan.wants_sftp, "SFTP 节点连上后开的是 sftp subsystem");
@@ -267,7 +278,7 @@ mod tests {
             proxy_password: None,
             private_key: None,
         };
-        let plan = to_dial_plan(&r, Some(&sec)).expect("SSH 会话映射");
+        let plan = to_dial_plan(&r, &resolved(&r, Some(&sec))).expect("SSH 会话映射");
         assert!(!plan.wants_sftp);
     }
 
@@ -281,7 +292,7 @@ mod tests {
             Protocol::Ssh,
         );
         assert!(matches!(
-            to_ssh_config(&r, None),
+            to_ssh_config(&r, &resolved(&r, None)),
             Err(MapError::MissingSecret)
         ));
     }

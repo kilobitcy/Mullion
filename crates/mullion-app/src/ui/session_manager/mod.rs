@@ -7,6 +7,8 @@
 //! `request_quit` 完全同构。
 
 mod buffer;
+pub(crate) mod credential_editor;
+pub(crate) mod credential_list;
 mod dedupe;
 mod editor;
 mod env_hint;
@@ -29,7 +31,13 @@ pub(crate) use buffer::{
     merge_secret, secret_fields, set_color_target, sync_has_passphrase,
 };
 pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
-pub use buffer::{EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget};
+pub use buffer::{
+    CredSourceUi, EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget,
+};
+pub use credential_editor::{
+    build_credential_draft, credential_secret_fields, import_credential_key_file, in_use_message,
+    users_of, CredentialEditorBuffer, CredentialSaveIntent,
+};
 pub use tunnel_editor::{TunnelEditorBuffer, TunnelKindUi, TunnelSaveIntent};
 
 /// 会话管理器的顶层模式(F116/F118)。三类对象左右栏整体切换,不共用列表 ——
@@ -43,6 +51,9 @@ pub enum ManagerMode {
     #[default]
     Sessions,
     Sftp,
+    /// F74 共享凭据。排在 SFTP 与隧道之间:它跟会话/SFTP 一样是「登录用的东西」,
+    /// 隧道是「连上之后转发什么」,顺序照着用户的心智走一遍。
+    Credentials,
     Tunnels,
 }
 
@@ -56,7 +67,7 @@ pub(crate) fn protocol_of(mode: ManagerMode) -> Option<mullion_store::Protocol> 
     match mode {
         ManagerMode::Sessions => Some(Protocol::Ssh),
         ManagerMode::Sftp => Some(Protocol::Sftp),
-        ManagerMode::Tunnels => None,
+        ManagerMode::Credentials | ManagerMode::Tunnels => None,
     }
 }
 
@@ -334,6 +345,7 @@ fn mode_bar(ui: &mut egui::Ui, ui_state: &mut UiState) -> egui::Rect {
         for (mode, label) in [
             (ManagerMode::Sessions, "会话"),
             (ManagerMode::Sftp, "SFTP"),
+            (ManagerMode::Credentials, "凭据"),
             (ManagerMode::Tunnels, "隧道"),
         ] {
             let on = ui_state.manager_mode == mode;
@@ -348,6 +360,36 @@ fn mode_bar(ui: &mut egui::Ui, ui_state: &mut UiState) -> egui::Rect {
 
 /// 删隧道的二次确认。独立小窗:隧道的删除按钮在右栏表单上,把确认内联进表单
 /// 会把下面的字段整体顶下去,用户点「取消」后视线还得再找一遍原来的位置。
+/// 删凭据的二次确认。理由同 `tunnel_delete_confirm`:删除按钮在右栏表单上,
+/// 把确认内联进表单会把下面的字段整体顶下去。
+///
+/// **能走到这里的凭据一定没人引用** —— 有引用者时按钮是真禁用的
+/// (`credential_editor::show`),这个框根本弹不出来。
+fn credential_delete_confirm(
+    ctx: &egui::Context,
+    t: &Theme,
+    ui_state: &mut UiState,
+    id: mullion_store::CredentialId,
+    name: &str,
+) {
+    egui::Window::new("删除凭据")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.colored_label(theme::c32(t.danger_soft), format!("删除「{name}」?"));
+            ui.horizontal(|ui| {
+                if ui.button("删除").clicked() {
+                    ui_state.credential_delete_request = Some(id);
+                    ui_state.pending_credential_delete = None;
+                }
+                if ui.button("取消").clicked() {
+                    ui_state.pending_credential_delete = None;
+                }
+            });
+        });
+}
+
 fn tunnel_delete_confirm(
     ctx: &egui::Context,
     t: &Theme,
@@ -386,10 +428,15 @@ pub fn show(
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
+    credentials: &[mullion_store::CredentialRecord],
     tunnels: &[TunnelRecord],
     tunnel_states: &[(TunnelId, mullion_ssh::tunnel::TunnelState)],
     store_available: bool,
     presence: SecretPresence,
+    // `credential_presence`:当前选中**凭据**的密文存在情况(F74)。与
+    // `presence` 各自独立 —— 两档各画各的密文框,共用一份会让凭据表单
+    // 报着会话的「已设置」。
+    credential_presence: SecretPresence,
     appearance: &crate::ui::badge::AppearanceCache,
 ) -> Option<egui::Rect> {
     if !ui_state.session_manager_open {
@@ -432,24 +479,25 @@ pub fn show(
                 }
             }
             keys::Action::Open => {
-                // 隧道档压根没有会话可连;会话档与 SFTP 档都能连(SFTP 节点连上
-                // 开的是独占文件标签,不是终端)。
+                // 隧道档、凭据档压根没有会话可连;会话档与 SFTP 档都能连
+                // (SFTP 节点连上开的是独占文件标签,不是终端)。
                 //
-                // 判据写成 `!= Tunnels` 而不是列举 `Sessions || Sftp`:这条跟
-                // 下面 D4 那道兜底闸门是同一个判据,列举式在加档时必然漏 ——
-                // 本来就漏过一次,D1 让 SFTP 节点可连之后,双击/右键/右栏按钮
-                // 三条入口都改了,唯独这条键盘路径的注释和逻辑停在
-                // 「F50 未实现」,纯键盘用户按 Enter 完全没反应。
-                if ui_state.manager_mode != ManagerMode::Tunnels {
+                // 判据走 `protocol_of`(「这一档列的是哪种协议的会话记录」的
+                // 唯一真源),而不是列举模式或写 `!= Tunnels`:列举式在加档时
+                // 必然漏 —— 已经漏过两次,一次是 D1 让 SFTP 可连之后这条键盘
+                // 路径没跟上(纯键盘用户按 Enter 完全没反应),一次是 F74 加
+                // 「凭据」档时 `!= Tunnels` 会把它误判成「可以连」。
+                if protocol_of(ui_state.manager_mode).is_some() {
                     if let Some(id) = ui_state.editor_id {
                         ui_state.connect_request = Some(id);
                     }
                 }
             }
             keys::Action::Tab(n) => {
-                // 隧道档的右栏不是 Tab 编辑器,切页没有意义。
+                // 隧道档、凭据档的右栏不是 Tab 编辑器,切页没有意义。
+                // 判据同上走 `protocol_of`,理由见 `Action::Open` 那段。
                 //
-                // `!= ManagerMode::Tunnels` 这个判断**不是**跟下面
+                // 这个模式判断**不是**跟下面
                 // `editor.is_some()` 重叠的冗余条件,不能因为看起来多余就删掉:
                 // `mode_bar`(上面)切模式时只写 `ui_state.manager_mode`,
                 // 刻意不碰 `editor`/`editor_baseline`(保留另一档表单的脏状态,
@@ -463,7 +511,7 @@ pub fn show(
                 // SFTP 档少一页(D5),`n` 是**位置序号**不是 Tab 下标,
                 // 必须过 `visible_tabs` 映射 —— 直接写 `editor_tab = n`
                 // 会让 Ctrl+3 打开「登录后」而 Tab 条上高亮的是「图标」。
-                if ui_state.manager_mode != ManagerMode::Tunnels && ui_state.editor.is_some() {
+                if protocol_of(ui_state.manager_mode).is_some() && ui_state.editor.is_some() {
                     if let Some(&tab) = visible_tabs(ui_state.manager_mode).get(n) {
                         ui_state.editor_tab = tab;
                     }
@@ -615,15 +663,25 @@ pub fn show(
                         ui_state,
                         sessions,
                         groups,
+                        credentials,
                         tunnels,
                         tunnel_states,
                         appearance,
                         // 上面 `match` 的两个分支都保证 `protocol_of` 有值。
                         protocol_of(ui_state.manager_mode).expect("会话/SFTP 档必有协议"),
                     ),
-                    ManagerMode::Tunnels => {
-                        tunnel_list::show(ui, t, ui_state, tunnels, tunnel_states, sessions)
+                    ManagerMode::Credentials => {
+                        credential_list::show(ui, t, ui_state, credentials, sessions)
                     }
+                    ManagerMode::Tunnels => tunnel_list::show(
+                        ui,
+                        t,
+                        ui_state,
+                        tunnels,
+                        tunnel_states,
+                        sessions,
+                        credentials,
+                    ),
                 });
             annotate::mark(ui.ctx(), "会话管理器/左栏", list_panel.response.rect);
 
@@ -643,10 +701,22 @@ pub fn show(
                     // 先拷出来(`ManagerMode` 是 `Copy`),再传这份拷贝。
                     let mode = ui_state.manager_mode;
                     match mode {
-                        ManagerMode::Sessions | ManagerMode::Sftp => {
-                            editor::show(ui, t, ui_state, groups, sessions, presence, mode)
+                        ManagerMode::Sessions | ManagerMode::Sftp => editor::show(
+                            ui,
+                            t,
+                            ui_state,
+                            groups,
+                            sessions,
+                            credentials,
+                            presence,
+                            mode,
+                        ),
+                        ManagerMode::Credentials => {
+                            credential_editor::show(ui, t, ui_state, sessions, credential_presence)
                         }
-                        ManagerMode::Tunnels => tunnel_editor::show(ui, t, ui_state, sessions),
+                        ManagerMode::Tunnels => {
+                            tunnel_editor::show(ui, t, ui_state, sessions, credentials)
+                        }
                     }
                 });
         });
@@ -692,6 +762,51 @@ pub fn show(
             // 目标已经不在库里(别处删掉了)→ 撤掉挂着的确认,
             // 不能留一个指向空气的确认框等用户去点。
             None => ui_state.pending_tunnel_delete = None,
+        }
+    }
+
+    // 凭据侧的同一套。`credential_editor::show` 正持着 `credential_editor`
+    // 的 `&mut`,那里只置标志,`build_credential_draft` 要整体读缓冲。
+    if std::mem::take(&mut ui_state.credential_save_click) {
+        if let Some(buf) = ui_state.credential_editor.as_ref() {
+            match credential_editor::build_credential_draft(buf) {
+                Ok(draft) => {
+                    let (password, passphrase, private_key) =
+                        credential_editor::credential_secret_fields(buf);
+                    ui_state.credential_save_request = Some(CredentialSaveIntent {
+                        editing_id: ui_state.credential_editor_id,
+                        draft,
+                        password,
+                        passphrase,
+                        private_key,
+                    });
+                    // 保存成功后基线要跟上,否则刚存完就被判成脏。
+                    ui_state.credential_editor_baseline = ui_state.credential_editor.clone();
+                }
+                Err(msg) => ui_state.set_error(msg),
+            }
+        }
+    }
+    if let Some(id) = ui_state.pending_credential_delete {
+        let name = credentials
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.clone());
+        match name {
+            Some(name) => credential_delete_confirm(ctx, t, ui_state, id, &name),
+            // 目标已经不在库里(别处删掉了)→ 撤掉挂着的确认,不能留一个
+            // 指向空气的确认框等用户去点。
+            None => ui_state.pending_credential_delete = None,
+        }
+    }
+    // 凭据表单里导入/清除私钥留下的一行提示 → 转成编辑器顶部那条通知。
+    // 与会话侧同一处置(瞬态,留在缓冲里会把表单误判成脏)。
+    if let Some(buf) = ui_state.credential_editor.as_mut() {
+        if let Some(note) = buf.key_note.take() {
+            ui_state.key_drop_note = Some(note);
+        }
+        if std::mem::take(&mut buf.pick_key_clicked) {
+            ui_state.pick_credential_key_request = true;
         }
     }
 
@@ -757,7 +872,7 @@ pub fn show(
     // (那是给人看的,这一道是保证行为)。
     // `connect_skip_automation` 必须一起清:留着它会漂到下一次真正的连接上,
     // 用户会莫名其妙地跳过一次自动化。
-    if ui_state.manager_mode == ManagerMode::Tunnels {
+    if protocol_of(ui_state.manager_mode).is_none() {
         ui_state.connect_request = None;
         ui_state.connect_skip_automation = false;
     }
@@ -944,10 +1059,7 @@ mod tunnel_ui_tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "root".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("root", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -987,6 +1099,16 @@ mod tunnel_ui_tests {
         sessions: &[SessionRecord],
         tunnels: &[TunnelRecord],
     ) -> (egui::Context, egui::FullOutput) {
+        run_with_credentials(ui_state, sessions, tunnels, &[])
+    }
+
+    /// 同上,但能喂一份凭据库(F74 的「凭据」档要用)。
+    fn run_with_credentials(
+        ui_state: &mut UiState,
+        sessions: &[SessionRecord],
+        tunnels: &[TunnelRecord],
+        credentials: &[mullion_store::CredentialRecord],
+    ) -> (egui::Context, egui::FullOutput) {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let once = |st: &mut UiState| {
@@ -997,9 +1119,11 @@ mod tunnel_ui_tests {
                     st,
                     sessions,
                     &[],
+                    credentials,
                     tunnels,
                     &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1125,6 +1249,7 @@ mod tunnel_ui_tests {
             name: true,
             host: true,
             user: true,
+            credential: true,
         };
         let visible = visible_tabs(ManagerMode::Sftp);
         for m in [
@@ -1133,6 +1258,14 @@ mod tunnel_ui_tests {
                 name: false,
                 host: false,
                 user: true,
+                credential: false,
+            },
+            // F74:共享凭据没挑 —— 缺项落在「认证」页,SFTP 档也看得见。
+            super::validate::Missing {
+                name: false,
+                host: false,
+                user: false,
+                credential: true,
             },
         ] {
             if let Some(tab) = m.tab() {
@@ -1201,7 +1334,9 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1286,7 +1421,9 @@ mod tunnel_ui_tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -1341,6 +1478,159 @@ mod tunnel_ui_tests {
         assert!(!has(&texts, "本地 3306"), "会话页不该画隧道行: {texts:?}");
     }
 
+    fn cred(id: u64, name: &str, user: &str) -> mullion_store::CredentialRecord {
+        mullion_store::CredentialRecord {
+            id: mullion_store::CredentialId(id),
+            name: name.into(),
+            user: user.into(),
+            kind: mullion_store::AuthKind::Password,
+        }
+    }
+
+    /// F74:模式条四档,顺序定死「会话 · SFTP · 凭据 · 隧道」。
+    ///
+    /// 顺序不是审美问题:用户是靠位置记按钮的,插一档进来把「隧道」挤走,
+    /// 每个既有用户的肌肉记忆都得重学一遍。这条钉住位置,将来再加档时
+    /// 会先变红,逼人显式决定插在哪。
+    ///
+    /// 判据用**画出来的 x 坐标**,不是数组字面量 —— 后者是拿常量断言常量。
+    #[test]
+    fn the_mode_bar_has_four_tabs_in_a_fixed_order() {
+        let (_c, out) = run(&mut open(ManagerMode::Sessions), &[], &[]);
+        let xs: Vec<f32> = ["会话", "SFTP", "凭据", "隧道"]
+            .iter()
+            .map(|label| {
+                find_text_pos(&out.shapes, label)
+                    .unwrap_or_else(|| panic!("模式条上没有「{label}」这一档"))
+                    .x
+            })
+            .collect();
+        assert!(
+            xs.windows(2).all(|w| w[0] < w[1]),
+            "四档必须按「会话·SFTP·凭据·隧道」从左到右排;实得 x={xs:?}"
+        );
+    }
+
+    /// F74:切到「凭据」档,左栏画的是凭据,不是会话。
+    #[test]
+    fn credential_mode_renders_the_credential_list() {
+        let sessions = vec![sess(1, "生产主控")];
+        let creds = vec![cred(1, "运维号", "ops")];
+
+        let (_c, out) =
+            run_with_credentials(&mut open(ManagerMode::Credentials), &sessions, &[], &creds);
+        let texts = all_text(&out.shapes);
+        assert!(has(&texts, "运维号"), "凭据行没画出来: {texts:?}");
+        assert!(
+            !has(&texts, "生产主控"),
+            "凭据页不该画会话列表行: {texts:?}"
+        );
+    }
+
+    /// F74/D7:被引用的凭据,删除按钮**当场**禁用并把引用者的名字列出来。
+    ///
+    /// 只说「有会话在用」等于让用户挨个点开会话去找是谁 —— 而「先去解绑谁」
+    /// 正是他接下来唯一要做的事。
+    ///
+    /// 自证变红的方式:把 `credential_editor::show` 里那句
+    /// `ui.colored_label(theme::c32(t.danger), msg)` 删掉。
+    #[test]
+    fn deleting_a_referenced_credential_is_blocked_and_names_the_holders() {
+        use mullion_store::{Auth, CredentialId};
+        let mut web = sess(1, "web01");
+        web.auth = Auth::Ref(CredentialId(1));
+        let creds = vec![cred(1, "运维号", "ops")];
+
+        let mut st = open(ManagerMode::Credentials);
+        st.credential_editor_id = Some(CredentialId(1));
+        st.credential_editor = Some(CredentialEditorBuffer::from_record(&creds[0]));
+
+        let (_c, out) = run_with_credentials(&mut st, &[web], &[], &creds);
+        let texts = all_text(&out.shapes);
+        assert!(
+            texts.iter().any(|s| s.contains("web01")),
+            "拦下来时必须点名是谁在用;实际画出:{texts:?}"
+        );
+        assert!(st.pending_credential_delete.is_none(), "光渲染不该发起删除");
+    }
+
+    /// F74:站在「凭据」档按 ↑↓ / Ctrl+2,不许去动背后那个看不见的会话编辑器。
+    ///
+    /// 切模式时刻意不清 `editor`/`editor_baseline`(保留另一档的脏状态,见
+    /// `mode_bar` 文档),所以在凭据档上这两个字段依然是 `Some` —— 少了模式
+    /// 门控,按一下方向键就会对一条用户完全看不见的会话发切换意图,表单脏时
+    /// 还会凭空弹出「有未保存的更改」。这与隧道档是同一类漏洞,判据统一走
+    /// `protocol_of`。
+    ///
+    /// 自证变红的方式:把 `Action::Tab(n)` 与 `Action::Prev|Next` 两处的
+    /// `protocol_of(...)` 判断去掉。
+    #[test]
+    fn credential_mode_swallows_list_and_tab_shortcuts() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![sess(1, "a"), sess(2, "b")];
+        let key = |k: egui::Key, modifiers: egui::Modifiers| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let drive = |st: &mut UiState, events: Vec<egui::Event>, modifiers| {
+            let ctx = egui::Context::default();
+            let mut run = |events: Vec<egui::Event>| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        show(
+                            ctx,
+                            &t,
+                            st,
+                            &sessions,
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            true,
+                            SecretPresence::default(),
+                            SecretPresence::default(),
+                            &crate::ui::badge::AppearanceCache::default(),
+                        );
+                    },
+                );
+            };
+            run(Vec::new());
+            run(events);
+        };
+
+        let cmd = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        let mut st = open(ManagerMode::Credentials);
+        st.editor = Some(EditorBuffer::default());
+        st.editor_id = Some(SessionId(1));
+        st.editor_tab = 0;
+
+        drive(&mut st, vec![key(egui::Key::Num2, cmd)], cmd);
+        assert_eq!(st.editor_tab, 0, "凭据档下 Ctrl+2 不该动会话编辑器的 Tab");
+
+        drive(
+            &mut st,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::default())],
+            egui::Modifiers::default(),
+        );
+        assert_eq!(
+            st.editor_id,
+            Some(SessionId(1)),
+            "凭据档下 ↓ 不该切走背后那条看不见的会话"
+        );
+        assert!(!st.confirm_switch, "更不该凭空弹出「有未保存的更改」");
+    }
+
     /// F100:新 UI 元素必须登记,否则标注模式导不出它 —— 用户就是靠导出的
     /// 标注来提需求的,漏登记等于这块界面在对话里没有名字。
     #[test]
@@ -1361,7 +1651,9 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1438,9 +1730,11 @@ mod tunnel_ui_tests {
                         &mut st,
                         &sessions,
                         &[],
+                        &[],
                         tunnels,
                         &[],
                         true,
+                        SecretPresence::default(),
                         SecretPresence::default(),
                         &crate::ui::badge::AppearanceCache::default(),
                     );
@@ -1638,9 +1932,11 @@ mod tunnel_ui_tests {
                     &mut st,
                     &sessions,
                     &[],
+                    &[],
                     &tunnels,
                     &states,
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1694,7 +1990,9 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1725,7 +2023,9 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1776,7 +2076,9 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -1872,10 +2174,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "root".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("root", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -1908,7 +2207,9 @@ mod tests {
                             &[],
                             &[],
                             &[],
+                            &[],
                             true,
+                            SecretPresence::default(),
                             SecretPresence::default(),
                             &crate::ui::badge::AppearanceCache::default(),
                         );
@@ -2095,7 +2396,9 @@ mod tests {
                 &groups,
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -2110,7 +2413,9 @@ mod tests {
                 &groups,
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -2159,7 +2464,9 @@ mod tests {
                 &groups,
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -2174,7 +2481,9 @@ mod tests {
                 &groups,
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -2261,7 +2570,9 @@ mod tests {
                 &groups,
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -2276,7 +2587,9 @@ mod tests {
                 &groups,
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -2345,7 +2658,9 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -2546,7 +2861,9 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -2685,7 +3002,9 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -2701,7 +3020,9 @@ mod tests {
                 &groups,
                 &[],
                 &[],
+                &[],
                 true,
+                SecretPresence::default(),
                 SecretPresence::default(),
                 &crate::ui::badge::AppearanceCache::default(),
             );
@@ -2752,7 +3073,9 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -2778,7 +3101,9 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -2834,7 +3159,9 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );
@@ -2878,10 +3205,7 @@ mod tests {
                 port: 22,
                 protocol: mullion_store::Protocol::Ssh,
             },
-            auth: mullion_store::model::Auth {
-                user: "root".into(),
-                kind: mullion_store::model::AuthKind::Password,
-            },
+            auth: mullion_store::Auth::inline("root", mullion_store::model::AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -2924,7 +3248,9 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     true,
+                    SecretPresence::default(),
                     SecretPresence::default(),
                     &crate::ui::badge::AppearanceCache::default(),
                 );

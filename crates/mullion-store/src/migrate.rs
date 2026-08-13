@@ -111,10 +111,7 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
                 port: r.port,
                 protocol: r.protocol,
             },
-            auth: Auth {
-                user: r.user,
-                kind: r.auth,
-            },
+            auth: Auth::inline(r.user, r.auth),
             terminal: TerminalPrefs::default(),
             appearance: AppearancePrefs::default(),
             network: crate::network::NetworkPrefs::default(),
@@ -128,6 +125,9 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
         session,
         // v1 文件里不存在隧道概念,空数组是**永久**正确的。
         tunnel: Vec::new(),
+        // 同理:v1 文件里不存在共享凭据。**不在迁移里做去重提取**(那是 F75,
+        // 且必须用户点头),迁移后凭据表恒为空。
+        credential: Vec::new(),
     })
 }
 
@@ -165,10 +165,10 @@ has_passphrase = false
         assert_eq!(s.connection.host, "192.0.2.10");
         assert_eq!(s.connection.port, 22);
         assert_eq!(s.connection.protocol, Protocol::Ssh);
-        assert_eq!(s.auth.user, "user");
+        assert_eq!(s.auth.as_inline().unwrap().user, "user");
         assert_eq!(s.modified_at, "2026-07-25T00:00:00Z");
         assert!(matches!(
-            &s.auth.kind,
+            &s.auth.as_inline().unwrap().kind,
             AuthKind::PublicKey {
                 has_passphrase: false,
                 ..
@@ -251,11 +251,12 @@ kind = "password"
     }
 
     /// 版本号是**故意**钉死的:动它就意味着用户的库要迁移一次,不该被
-    /// 顺手改掉。v8 的理由见 `CURRENT_SCHEMA` 文档 —— 新增 `session.sftp`,
-    /// 旧客户端读 v8 会把整个分节丢掉再写回,拒绝比静默吃掉好。
+    /// 顺手改掉。v9 的理由见 `CURRENT_SCHEMA` 文档 —— 新增 `[[credential]]`
+    /// 与 `[session.auth].source`,旧客户端读 v9 会把 `credential_id` 当未知
+    /// 字段丢掉、把 `user`/`kind` 当缺失,拒绝比装作能用好。
     #[test]
-    fn current_schema_is_eight() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 8);
+    fn current_schema_is_nine() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 9);
     }
 
     /// v5 的库里存的 emoji 图标**必须原样读得出来**。
@@ -366,9 +367,9 @@ session_name = "claude"
         assert_eq!(s.identity.tags, vec!["prod".to_string()]);
         assert_eq!(s.connection.host, "192.0.2.10");
         assert_eq!(s.connection.port, 2222);
-        assert_eq!(s.auth.user, "ops");
+        assert_eq!(s.auth.as_inline().unwrap().user, "ops");
         assert_eq!(
-            s.auth.kind,
+            s.auth.as_inline().unwrap().kind,
             crate::model::AuthKind::PublicKey {
                 has_passphrase: true
             }
@@ -425,7 +426,7 @@ kind = "password"
         let rec = &file.session[0];
         assert_eq!(rec.identity.name, "机器 A");
         assert_eq!(rec.connection.host, "10.0.0.1");
-        assert_eq!(rec.auth.user, "ubuntu");
+        assert_eq!(rec.auth.as_inline().unwrap().user, "ubuntu");
         // 新分节整体缺省。
         assert_eq!(rec.sftp, crate::sftp::SftpPrefs::default());
         assert!(rec.sftp.default_remote.is_none());

@@ -180,10 +180,12 @@ fn shoot(opts: &Opts) -> Result<String, String> {
                 &mut ui,
                 &sessions,
                 &groups,
+                &[],
                 &tunnels,
                 &[],
                 store_available,
                 presence,
+                Default::default(),
                 &appearance,
             );
             if annotate_scene {
@@ -492,12 +494,12 @@ fn sess(id: u64, name: &str, host: &str, group: Option<GroupId>) -> SessionRecor
             port: 22,
             protocol: Protocol::Ssh,
         },
-        auth: Auth {
-            user: "ubuntu".into(),
-            kind: AuthKind::PublicKey {
+        auth: Auth::inline(
+            "ubuntu",
+            AuthKind::PublicKey {
                 has_passphrase: false,
             },
-        },
+        ),
         terminal: Default::default(),
         appearance: Default::default(),
         network: Default::default(),

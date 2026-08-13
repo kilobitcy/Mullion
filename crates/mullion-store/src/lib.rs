@@ -2,6 +2,7 @@
 //! 依赖方向:app → store;store 不依赖 core/term/ssh。
 
 pub mod automation;
+pub mod credential;
 pub mod crypto;
 pub mod error;
 pub mod group;
@@ -23,6 +24,7 @@ pub mod vault;
 pub use automation::{
     build_plan, AutomationCommand, AutomationPrefs, EnvVar, ResolvedAutomation, Step, TmuxChoice,
 };
+pub use credential::{display_user, Auth, CredentialId, CredentialRecord, InlineAuth};
 pub use error::StoreError;
 pub use group::GroupRecord;
 pub use inherit::{resolve, PrefsLayer, ResolvedConfig, DEFAULT_SCROLLBACK};
@@ -35,12 +37,12 @@ pub use layout::{
 pub use master_key::{InMemoryKey, KeyringSource, MasterKeySource};
 pub use migrate::{migrate_v1, SchemaProbe};
 pub use model::{
-    AppearancePrefs, Auth, AuthKind, ColorSpec, ColorTarget, Connection, GroupId, IconKind,
-    IconSpec, Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
+    AppearancePrefs, AuthKind, ColorSpec, ColorTarget, Connection, GroupId, IconKind, IconSpec,
+    Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
 pub use secrets_file::Scheme;
 pub use settings::{Settings, CURRENT_SETTINGS_SCHEMA, MAX_FONT_PT, MIN_FONT_PT};
 pub use sftp::{Bookmark, SftpPrefs};
 pub use tunnel::{TunnelId, TunnelKind, TunnelRecord};
-pub use vault::{SessionDraft, TunnelDraft, Unlock, Vault};
+pub use vault::{CredentialDraft, ResolvedAuth, SessionDraft, TunnelDraft, Unlock, Vault};

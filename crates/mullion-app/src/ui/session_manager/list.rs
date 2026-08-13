@@ -521,6 +521,7 @@ pub(super) fn show(
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
+    credentials: &[mullion_store::CredentialRecord],
     tunnels: &[mullion_store::TunnelRecord],
     tunnel_states: &[(mullion_store::TunnelId, mullion_ssh::tunnel::TunnelState)],
     appearance: &crate::ui::badge::AppearanceCache,
@@ -654,6 +655,7 @@ pub(super) fn show(
                                 r,
                                 sessions,
                                 groups,
+                                credentials,
                                 tunnels,
                                 running_note.as_deref(),
                                 pending_delete_target,
@@ -711,6 +713,7 @@ fn row(
     rec: &SessionRecord,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
+    credentials: &[mullion_store::CredentialRecord],
     tunnels: &[mullion_store::TunnelRecord],
     // 删除确认里那句「其中 N 条正在运行」。只有待确认的那一行用得上,
     // 所以在 `show` 里算一次传下来,不是每行都去查一遍运行时表。
@@ -731,9 +734,10 @@ fn row(
     // 走查 3:列表上有另一行长得一模一样时,副标题后面追加一段区分信息
     // (分组名 / 端口 / 备注首句)。没有重名时 `disambiguate` 返回 `None`,
     // 副标题保持原样 —— 不给每行平白加尾巴。
-    let sub = match super::dedupe::disambiguate(rec, sessions, groups) {
-        Some(extra) => format!("{}@{} · {}", rec.auth.user, rec.connection.host, extra),
-        None => format!("{}@{}", rec.auth.user, rec.connection.host),
+    let user = mullion_store::display_user(&rec.auth, credentials);
+    let sub = match super::dedupe::disambiguate(rec, sessions, groups, credentials) {
+        Some(extra) => format!("{}@{} · {}", user, rec.connection.host, extra),
+        None => format!("{}@{}", user, rec.connection.host),
     };
     let resp = session_row(ui, t, rec, &sub, selected, a, &ui_state.search, d);
     // 带上会话名:同一个插桩点会登记出十几行,只写「会话行」的话导出里全是
@@ -861,10 +865,7 @@ mod tests {
                 port: 22,
                 protocol: Protocol::Ssh,
             },
-            auth: Auth {
-                user: "user".into(),
-                kind: AuthKind::Password,
-            },
+            auth: Auth::inline("user", AuthKind::Password),
             terminal: Default::default(),
             appearance: Default::default(),
             network: Default::default(),
@@ -935,6 +936,7 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
                     &[],
                     &[],
                     &crate::ui::badge::AppearanceCache::default(),
@@ -1013,6 +1015,7 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     &crate::ui::badge::AppearanceCache::default(),
                     mullion_store::Protocol::Ssh,
                 );
@@ -1074,6 +1077,7 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
                         &[],
                         &[],
                         &crate::ui::badge::AppearanceCache::default(),
@@ -1173,6 +1177,7 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
                         &[],
                         &[],
                         &crate::ui::badge::AppearanceCache::default(),
@@ -1281,6 +1286,7 @@ mod tests {
                         &groups,
                         &[],
                         &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
                         mullion_store::Protocol::Sftp,
                     );
@@ -1387,6 +1393,7 @@ mod tests {
                         &groups,
                         &[],
                         &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
                         mullion_store::Protocol::Sftp,
                     );
@@ -1491,6 +1498,7 @@ mod tests {
                         &groups,
                         &[],
                         &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
                         mullion_store::Protocol::Ssh,
                     );
@@ -1513,7 +1521,7 @@ mod tests {
     #[test]
     fn a_long_host_is_elided_with_an_ellipsis_instead_of_being_hard_clipped() {
         let mut r = rec(1, "短名", "very-long-hostname.internal.example.com", &[]);
-        r.auth.user = "ubuntu".into();
+        r.auth = mullion_store::Auth::inline("ubuntu", mullion_store::AuthKind::Password);
         // 280 = `LIST_W`,左栏的默认宽度,也就是用户实际看到的那一档。
         let out = run_list_sized(&[r], egui::vec2(280.0, 400.0));
         let (galley, pos, clip) =
@@ -1630,6 +1638,7 @@ mod tests {
                         &groups,
                         &[],
                         &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
                         mullion_store::Protocol::Ssh,
                     );
@@ -1670,6 +1679,7 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
                         &[],
                         &[],
                         &crate::ui::badge::AppearanceCache::default(),
@@ -1781,6 +1791,7 @@ mod tests {
                         &groups,
                         &[],
                         &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
                         mullion_store::Protocol::Ssh,
                     );
@@ -1832,6 +1843,7 @@ mod tests {
                         ui_state,
                         &sessions,
                         &groups,
+                        &[],
                         &[],
                         &[],
                         &crate::ui::badge::AppearanceCache::default(),
@@ -1970,6 +1982,7 @@ mod tests {
                         &groups,
                         &[],
                         &[],
+                        &[],
                         &crate::ui::badge::AppearanceCache::default(),
                         mullion_store::Protocol::Ssh,
                     );
@@ -2095,6 +2108,7 @@ mod tests {
                     &groups,
                     &[],
                     &[],
+                    &[],
                     &crate::ui::badge::AppearanceCache::default(),
                     protocol,
                 );
@@ -2116,6 +2130,7 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
                     &[],
                     &[],
                     appearance,
@@ -2225,6 +2240,7 @@ mod tests {
                             &mut ui_state,
                             sessions,
                             &groups,
+                            &[],
                             &[],
                             &[],
                             appearance,
