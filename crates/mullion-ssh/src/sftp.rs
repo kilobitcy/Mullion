@@ -274,6 +274,204 @@ impl SftpClient {
             .map_err(|e| SftpError::Protocol(e.to_string()))?;
         Ok(RemotePath::from_bytes(out.into_bytes()))
     }
+
+    /// 新建目录。父目录不存在会失败(**不做 `mkdir -p`** —— 界面上用户是在
+    /// 某个具体目录里按的「新建文件夹」,父目录必然存在;悄悄创建一串中间
+    /// 目录只会把打错的路径变成一堆垃圾目录)。
+    pub async fn create_dir(&self, path: &RemotePath) -> Result<(), SftpError> {
+        let wire = path.as_wire()?;
+        self.inner
+            .create_dir(wire)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
+    /// 改名 / 移动。**两个路径都要能发得出去**:任一端被 `as_wire` 挡下就
+    /// 整条不发 —— 只挡一端的话,另一端会被拿去跟一个 lossy 串配对,
+    /// 结果是把文件改成一个谁也打不开的名字。
+    pub async fn rename(&self, from: &RemotePath, to: &RemotePath) -> Result<(), SftpError> {
+        let (f, t) = (from.as_wire()?, to.as_wire()?);
+        self.inner
+            .rename(f, t)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
+    /// 删一个**文件或符号链接**。SFTP 的 REMOVE 对链接删的是链接本身,
+    /// **不跟随**(设计 D17)—— 搞错了就是把远端整个目标目录删了。
+    /// 目录要走 [`SftpClient::remove_dir`]。
+    pub async fn remove_file(&self, path: &RemotePath) -> Result<(), SftpError> {
+        let wire = path.as_wire()?;
+        self.inner
+            .remove_file(wire)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
+    /// 删一个**空目录**。非空会被服务端拒 —— 递归删除见
+    /// [`crate::remove_tree::remove_tree`]。
+    pub async fn remove_dir(&self, path: &RemotePath) -> Result<(), SftpError> {
+        let wire = path.as_wire()?;
+        self.inner
+            .remove_dir(wire)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
+    /// 改权限位(设计 D21)。
+    ///
+    /// **只送 permissions 一个字段**:SFTP v3 的 attrs 带 flags 位图,没设的
+    /// 字段不会被写过去。顺手把 uid/gid/mtime 一起送出去等于拿本地的猜测
+    /// 覆盖远端的真值。
+    pub async fn set_permissions(&self, path: &RemotePath, mode: u32) -> Result<(), SftpError> {
+        let wire = path.as_wire()?;
+        let attrs = russh_sftp::protocol::FileAttributes {
+            permissions: Some(mode & 0o7777),
+            ..Default::default()
+        };
+        self.inner
+            .set_metadata(wire, attrs)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
+    /// 取一条的属性。**用 lstat 语义(不跟随链接)**,与 `list_dir` 的
+    /// readdir 对齐 —— 跟随了的话,递归删除会把「指向目录的链接」当目录
+    /// 走进去,那正是 D17 要挡的事故。
+    pub async fn stat(&self, path: &RemotePath) -> Result<Entry, SftpError> {
+        let wire = path.as_wire()?;
+        let md = self
+            .inner
+            .symlink_metadata(wire)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        // 判定顺序与 `list_dir` 一致:先 symlink —— 一些 sshd 会把 symlink
+        // 和 dir 两个类型位一起报回来,先判 dir 就会把链接误认成目录。
+        let kind = if md.is_symlink() {
+            EntryKind::Symlink
+        } else if md.is_dir() {
+            EntryKind::Dir
+        } else if md.is_regular() {
+            EntryKind::File
+        } else {
+            EntryKind::Other
+        };
+        Ok(Entry {
+            // 名字只取最后一段,与 `Entry::name`「只是名字,不含目录部分」
+            // 的语义一致。
+            name: RemotePath::from_bytes(last_segment(path.as_bytes()).to_vec()),
+            kind,
+            size: md.size.unwrap_or(0),
+            mtime: md.mtime.unwrap_or(0),
+            mode: md.permissions.unwrap_or(0) & 0o7777,
+            uid: md.uid.unwrap_or(0),
+            gid: md.gid.unwrap_or(0),
+            link_target: None,
+        })
+    }
+
+    /// 打开一个远端文件**读**(F52)。
+    ///
+    /// 返回的 [`RemoteFile`] 分块读,进度由调用方按 `read_chunk` 的返回值
+    /// 累计 —— 传输层要在每块之后更新界面,一次性 `read_to_end` 会让 2GB
+    /// 的文件在进度条上一动不动,还把整个文件读进内存。
+    pub async fn open_read(&self, path: &RemotePath) -> Result<RemoteFile, SftpError> {
+        let wire = path.as_wire()?;
+        let file = self
+            .inner
+            .open(wire)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        Ok(RemoteFile { file })
+    }
+
+    /// 打开一个远端文件**写**(F52)。`truncate` 为真时截断已有内容。
+    ///
+    /// 刻意**不带** `EXCLUDE`:能不能覆盖由上层的冲突策略决定(设计 D19),
+    /// 协议层再挡一道的话,「用户明确选了覆盖」也会失败。
+    pub async fn open_write(
+        &self,
+        path: &RemotePath,
+        truncate: bool,
+    ) -> Result<RemoteFile, SftpError> {
+        let wire = path.as_wire()?;
+        let mut flags =
+            russh_sftp::protocol::OpenFlags::WRITE | russh_sftp::protocol::OpenFlags::CREATE;
+        if truncate {
+            flags |= russh_sftp::protocol::OpenFlags::TRUNCATE;
+        }
+        let file = self
+            .inner
+            .open_with_flags(wire, flags)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        Ok(RemoteFile { file })
+    }
+
+    /// 目标在不在。冲突探测用。
+    ///
+    /// 与 [`SftpClient::stat`] 的区别:那条把「不存在」和「没权限」都变成
+    /// `Err`,而冲突判断必须把两者分开 —— 分不开就只能一律当冲突,
+    /// 每传一个文件都弹一次窗。
+    pub async fn exists(&self, path: &RemotePath) -> Result<bool, SftpError> {
+        let wire = path.as_wire()?;
+        self.inner
+            .try_exists(wire)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+}
+
+/// 一个打开着的远端文件(F52)。分块读 / 分块写。
+///
+/// **必须 `finish()` 收尾**:`russh_sftp` 的 `File` 有 Drop 兜底
+/// (`close_nowait`),但那条关闭请求没人等应答 —— 上传完立刻去 rename
+/// 会撞上「文件还开着」,而失败信息只会说「改名失败」,查不到根上。
+pub struct RemoteFile {
+    file: russh_sftp::client::fs::File,
+}
+
+impl RemoteFile {
+    /// 读一块。返回 0 表示到文件尾。
+    pub async fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, SftpError> {
+        use tokio::io::AsyncReadExt;
+        self.file
+            .read(buf)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
+    /// 写一块。内部会 pipeline 多个 WRITE 请求(见 `russh_sftp` 的
+    /// `max_concurrent_writes`),所以高延迟链路上写比读快得多 ——
+    /// 这正是设计 D8 说「下载受串行 READ 拖累」的由来。
+    pub async fn write_chunk(&mut self, buf: &[u8]) -> Result<(), SftpError> {
+        use tokio::io::AsyncWriteExt;
+        self.file
+            .write_all(buf)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
+    /// 冲干净并关闭,**等应答**。理由见结构体文档。
+    pub async fn finish(mut self) -> Result<(), SftpError> {
+        use tokio::io::AsyncWriteExt;
+        self.file
+            .flush()
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        self.file
+            .close()
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+}
+
+/// `/a/b/c` → `c`。根本身(`/`)与不含 `/` 的相对名原样返回。
+fn last_segment(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|b| *b == b'/') {
+        Some(ix) if ix + 1 < path.len() => &path[ix + 1..],
+        _ => path,
+    }
 }
 
 #[cfg(test)]

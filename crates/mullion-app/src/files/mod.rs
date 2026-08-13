@@ -6,7 +6,9 @@
 use mullion_ssh::sftp::{Entry, EntryKind};
 
 pub mod local;
+pub mod queue;
 pub mod state;
+pub mod transfer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {

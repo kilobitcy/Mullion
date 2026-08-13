@@ -5,9 +5,11 @@
 pub mod config;
 pub mod dial;
 pub mod error;
+pub mod exec;
 pub mod hop;
 pub mod known_hosts;
 pub mod proxy;
+pub mod remove_tree;
 pub mod schedule;
 pub mod session;
 pub mod sftp;

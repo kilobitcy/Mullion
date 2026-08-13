@@ -119,6 +119,60 @@ pub enum UserEvent {
         seq: u64,
         result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
     },
+    /// D2/F54:一次远端写操作跑完了。`Ok(())` = 成功,`Err` = 已经格式化好的
+    /// 可读原因。**按世代路由**(S1):用户在一次网络往返期间切了标签,结果
+    /// 也要回到发起它的那个标签,不是当前活动标签。
+    ///
+    /// 成功之后由接收方发起一次刷新 —— 写操作不带回新的目录内容,不刷新的话
+    /// 界面上那个文件「还在」,用户会以为删除没生效然后再删一次。
+    SftpOpDone {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    /// F52:一批传输展开完了(目录已经递归成一条条文件级 job),可以入队。
+    /// **展开在后台做**:远端目录要走网络列目录,本地目录要走磁盘遍历,
+    /// 都不能压在窗口线程上。`Err` = 展开阶段就失败(目录读不了 / 落点名在
+    /// Windows 上非法),这时**一条 job 都不建** —— 传一半再报错比不传更糟。
+    TransferPlanned {
+        generation: u64,
+        result: Result<Vec<PlannedJob>, String>,
+    },
+    /// F59:一条传输的进度。**高频**(一个 100MB 的文件几千条)——
+    /// 接它的地方绝不能每条都请求重绘(T3),只更队列数据,重绘交给帧闸。
+    TransferProgress {
+        job: u64,
+        done: u64,
+    },
+    /// F55:一条传输收工。`Err` 里的冲突标记会被队列翻译成
+    /// `JobState::Conflict`(见 `crate::files::queue::JobError`),其余
+    /// 都是已经格式化好的中文原因。
+    TransferDone {
+        job: u64,
+        result: Result<(), String>,
+    },
+}
+
+/// 展开后的一条传输:两端完整路径和大小都算好了,入队即可跑。
+#[derive(Clone, Debug)]
+pub struct PlannedJob {
+    dir: crate::files::queue::Direction,
+    /// 本地端完整路径(上传时是源,下载时是落点)。
+    local: std::path::PathBuf,
+    /// 远端完整路径(上传时是落点,下载时是源)。
+    remote: mullion_ssh::sftp::RemotePath,
+    total: u64,
+    label: String,
+}
+
+/// 一条传输的全部输入。**冲突处置后重跑读的是同一份** —— 重新算一遍的话
+/// 「用户当时选的是哪个文件」和「现在光标在哪」会对不上。
+#[derive(Clone)]
+struct TransferSpec {
+    dir: crate::files::queue::Direction,
+    /// S1:属主标签的世代。worker 起跑时按它找连接。
+    generation: u64,
+    local: std::path::PathBuf,
+    remote: mullion_ssh::sftp::RemotePath,
 }
 
 /// 一次在途自动化的把手。三条通道都是 `Option`,因为每一条都是**一次性边**:
@@ -395,6 +449,371 @@ fn effective_focus_of(
 ///
 /// 返回下一个选中项在 `rows` 里的下标;`rows` 为空时没有"选第几个"这个
 /// 概念,返回 `None`(空列表若走进 `Some(rows.len() - 1)` 那支会直接下溢)。
+/// 逐条删。目录走递归删除(F57:先 exec 后回退),文件与链接走 remove。
+///
+/// **一条失败就停**,并把已经删掉的条数报进错误里:继续删下去的话,用户
+/// 看到一条「权限不足」却不知道前面几条到底删没删,而这一步不可逆。
+async fn delete_all(
+    client: &Arc<mullion_ssh::sftp::SftpClient>,
+    conn: Option<&Arc<SshConnection>>,
+    targets: &[(mullion_ssh::sftp::RemotePath, bool)],
+) -> Result<(), String> {
+    for (ix, (path, is_dir)) in targets.iter().enumerate() {
+        let r = if *is_dir {
+            match conn {
+                // 递归删除要 exec 快路径,而 exec 要连接句柄。拿不到就
+                // 退化成纯 SFTP 的 rmdir —— 只删得掉空目录,但总比不给删好。
+                Some(c) => mullion_ssh::remove_tree::remove_tree(client, c, path)
+                    .await
+                    .map(|_| ()),
+                None => client.remove_dir(path).await,
+            }
+        } else {
+            // **链接走 remove_file** —— SFTP 的 REMOVE 删的是链接本身,
+            // 不跟随(设计 D17)。
+            client.remove_file(path).await
+        };
+        if let Err(e) = r {
+            return Err(format!(
+                "删除 {} 失败:{e}(前面 {ix} 条已删除)",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// F52:把「用户点中的一批条目」摊成**文件级** job。目录要递归展开:远端走
+/// `list_dir`,本地走 `walk_dir`。两侧都**不跟随符号链接**(设计 D17,理由同
+/// `remove_tree`:跟随会跑出这棵树,把用户没看见的东西也传走)。
+///
+/// 上传时顺手把远端那边需要的子目录建出来 —— 递归上传的第一条 job 落在
+/// `a/b/c.txt` 上时 `a/b` 还不存在,`open_write` 会直接失败。放在这里而不是
+/// worker 里:worker 是并发跑的,几条同时 mkdir 同一个目录纯属互相踩。
+async fn plan_transfer(
+    client: &Arc<mullion_ssh::sftp::SftpClient>,
+    dir: crate::files::queue::Direction,
+    picked: &[(mullion_ssh::sftp::RemotePath, bool, u64)],
+    remote_cwd: &mullion_ssh::sftp::RemotePath,
+    local_cwd: &mullion_ssh::sftp::RemotePath,
+) -> Result<Vec<PlannedJob>, String> {
+    use crate::files::queue::Direction;
+    let mut out = Vec::new();
+    for (name, is_dir, size) in picked {
+        match dir {
+            Direction::Download => {
+                let remote = remote_cwd.join(name.as_bytes());
+                if *is_dir {
+                    plan_download_dir(client, &remote, &mut out, local_cwd).await?;
+                } else {
+                    out.push(download_job(&remote, &[], local_cwd, *size)?);
+                }
+            }
+            Direction::Upload => {
+                let local = crate::files::local::to_path(&crate::files::local::join_local(
+                    local_cwd,
+                    name.as_bytes(),
+                ));
+                if *is_dir {
+                    for w in crate::files::local::walk_dir(&local)? {
+                        out.push(upload_job(&local, &w.rel, remote_cwd, name, w.size));
+                    }
+                } else {
+                    out.push(upload_job(&local, &[], remote_cwd, name, *size));
+                }
+            }
+        }
+    }
+    if dir == Direction::Upload {
+        // `BTreeSet` 的字节序天然把祖先排在后代前面(`/a` < `/a/b`),
+        // 照这个顺序建就不会「先建孙子再建儿子」。已存在的错误吞掉:
+        // 目标目录本来就在是最常见的情况,不是失败。
+        let dirs: std::collections::BTreeSet<mullion_ssh::sftp::RemotePath> =
+            out.iter().map(|j| j.remote.parent()).collect();
+        for d in dirs {
+            let _ = client.create_dir(&d).await;
+        }
+    }
+    Ok(out)
+}
+
+/// 一条下载 job:远端绝对路径(+ 相对段)→ 本地落点。
+///
+/// D16:落点名在 Windows 上非法就**整条拒掉并给建议名**,不静默改写 ——
+/// 用户以为传下来的是 `aux.log`,实际是 `_aux.log`,下次照着原名找不到。
+fn download_job(
+    remote_root: &mullion_ssh::sftp::RemotePath,
+    rel: &[Vec<u8>],
+    local_dir: &mullion_ssh::sftp::RemotePath,
+    size: u64,
+) -> Result<PlannedJob, String> {
+    let mut remote = remote_root.clone();
+    let mut local = crate::files::local::to_path(local_dir);
+    let root_name = last_segment(remote_root);
+    check_windows_name(&root_name)?;
+    local.push(&root_name);
+    for seg in rel {
+        remote = remote.join(seg);
+        let s = String::from_utf8_lossy(seg).into_owned();
+        check_windows_name(&s)?;
+        local.push(&s);
+    }
+    let label = local
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(PlannedJob {
+        dir: crate::files::queue::Direction::Download,
+        local,
+        remote,
+        total: size,
+        label,
+    })
+}
+
+fn check_windows_name(name: &str) -> Result<(), String> {
+    match crate::files::transfer::illegal_on_windows(name) {
+        None => Ok(()),
+        Some(sug) => Err(format!(
+            "「{name}」在 Windows 上不是合法文件名,传下来会失败。\
+             先在远端改成「{sug}」这类名字再传。"
+        )),
+    }
+}
+
+/// 路径的最后一段。空路径 / 根返回整串,不 panic。
+fn last_segment(p: &mullion_ssh::sftp::RemotePath) -> String {
+    let b = p.as_bytes();
+    let seg = b.rsplit(|c| *c == b'/').next().unwrap_or(b);
+    String::from_utf8_lossy(seg).into_owned()
+}
+
+/// 一条上传 job:本地路径(+ 相对段)→ 远端落点。
+///
+/// 不像 `download_job` 那样要校验名字 —— 目标是 POSIX 端,本地能存在的名字
+/// 在那边基本都合法(反过来才是问题,那条由 `download_job` 挡)。
+fn upload_job(
+    local_root: &std::path::Path,
+    rel: &[String],
+    remote_dir: &mullion_ssh::sftp::RemotePath,
+    root_name: &mullion_ssh::sftp::RemotePath,
+    size: u64,
+) -> PlannedJob {
+    let mut local = local_root.to_path_buf();
+    let mut remote = remote_dir.join(root_name.as_bytes());
+    for seg in rel {
+        local.push(seg);
+        remote = remote.join(seg.as_bytes());
+    }
+    let label = rel
+        .last()
+        .cloned()
+        .unwrap_or_else(|| root_name.display().into_owned());
+    PlannedJob {
+        dir: crate::files::queue::Direction::Upload,
+        local,
+        remote,
+        total: size,
+        label,
+    }
+}
+
+/// 远端目录递归展开。**不跟随符号链接**(D17)。
+///
+/// 手写栈而不是递归 `async fn` —— 后者要 `Box::pin` 兜生命周期,写出来更长
+/// 也更容易出错,而这里的递归结构简单到用栈表达就够。
+async fn plan_download_dir(
+    client: &Arc<mullion_ssh::sftp::SftpClient>,
+    root: &mullion_ssh::sftp::RemotePath,
+    out: &mut Vec<PlannedJob>,
+    local_dir: &mullion_ssh::sftp::RemotePath,
+) -> Result<(), String> {
+    let mut stack: Vec<Vec<Vec<u8>>> = vec![Vec::new()];
+    while let Some(cur) = stack.pop() {
+        let mut dir = root.clone();
+        for seg in &cur {
+            dir = dir.join(seg);
+        }
+        let entries = client.list_dir(&dir).await.map_err(|e| e.to_string())?;
+        for e in entries {
+            // 链接和 socket/fifo 之类一律跳过:前者是 D17,后者根本没有
+            // 「内容」可传,传下来只会得到一个 0 字节的普通文件。
+            if e.kind == mullion_ssh::sftp::EntryKind::Symlink
+                || e.kind == mullion_ssh::sftp::EntryKind::Other
+                || !e.name.is_operable()
+            {
+                continue;
+            }
+            let mut next = cur.clone();
+            next.push(e.name.as_bytes().to_vec());
+            if e.kind == mullion_ssh::sftp::EntryKind::Dir {
+                stack.push(next);
+            } else {
+                out.push(download_job(root, &next, local_dir, e.size)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 跑一条传输。**自己开一条 sftp channel**(见 `App::pump_transfers` 的注释)。
+///
+/// 冲突(目标已存在)且还没处置过时返回 `JobError::Conflict`,由队列翻译成
+/// `JobState::Conflict` 去问用户 —— worker 因此是无状态的:不持有任何等用户
+/// 回答的通道,被取消/被丢弃都不会留下悬着的东西。
+async fn run_transfer(
+    conn: Arc<SshConnection>,
+    spec: TransferSpec,
+    resolved: Option<crate::files::queue::Conflict>,
+    job: u64,
+    proxy: &EventLoopProxy<UserEvent>,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    use crate::files::queue::{Conflict, Direction, JobError};
+    use crate::files::transfer::{dedup_name, staging_name};
+
+    let client = mullion_ssh::sftp::SftpClient::open(conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut dst_local = spec.local.clone();
+    let mut dst_remote = spec.remote.clone();
+    let exists = match spec.dir {
+        Direction::Download => dst_local.exists(),
+        Direction::Upload => client
+            .exists(&dst_remote)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+    if exists {
+        match resolved {
+            // 还没问过用户 —— 交回队列去问。**绝不静默覆盖**(F55)。
+            None => return Err(JobError::Conflict.into()),
+            Some(Conflict::Skip) => return Ok(()),
+            Some(Conflict::Overwrite) => {}
+            Some(Conflict::Rename) => match spec.dir {
+                Direction::Download => {
+                    let parent = dst_local
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf();
+                    let base = dst_local
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    dst_local = parent.join(dedup_name(&base, |c| parent.join(c).exists()));
+                }
+                Direction::Upload => {
+                    // 远端查重:**列一次目录**而不是一个候选名一次 `exists`
+                    // ——后者在高延迟链路上是 N 个 RTT,而且 `dedup_name` 的
+                    // 探测闭包是同步的,压根塞不进 `await`。
+                    let parent = dst_remote.parent();
+                    let taken: std::collections::BTreeSet<Vec<u8>> = client
+                        .list_dir(&parent)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|e| e.name.as_bytes().to_vec())
+                        .collect();
+                    let base = last_segment(&dst_remote);
+                    let name = dedup_name(&base, |c| taken.contains(c.as_bytes()));
+                    dst_remote = parent.join(name.as_bytes());
+                }
+            },
+        }
+    }
+
+    // D19:新建走 `.part` 再改名(传到一半断线不会留下一个看着像成品的残件);
+    // 覆盖则直接写目标(保住 inode / 权限 / 硬链接 —— 先删再建会全丢)。
+    let overwriting = exists && resolved == Some(Conflict::Overwrite);
+    let mut done: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+    match spec.dir {
+        Direction::Download => {
+            let final_name = dst_local
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let staging = dst_local.with_file_name(staging_name(&final_name, overwriting));
+            if let Some(parent) = staging.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("建不了本地目录:{e}"))?;
+            }
+            let mut src = client
+                .open_read(&spec.remote)
+                .await
+                .map_err(|e| e.to_string())?;
+            {
+                use std::io::Write;
+                let mut f =
+                    std::fs::File::create(&staging).map_err(|e| format!("写不了本地文件:{e}"))?;
+                loop {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::fs::remove_file(&staging);
+                        return Err("已取消".into());
+                    }
+                    let n = src.read_chunk(&mut buf).await.map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    f.write_all(&buf[..n])
+                        .map_err(|e| format!("写不了本地文件:{e}"))?;
+                    done += n as u64;
+                    let _ = proxy.send_event(UserEvent::TransferProgress { job, done });
+                }
+                f.flush().map_err(|e| format!("写不了本地文件:{e}"))?;
+            }
+            if staging != dst_local {
+                std::fs::rename(&staging, &dst_local).map_err(|e| format!("改名失败:{e}"))?;
+            }
+        }
+        Direction::Upload => {
+            use std::io::Read;
+            let final_name = last_segment(&dst_remote);
+            let staging = dst_remote
+                .parent()
+                .join(staging_name(&final_name, overwriting).as_bytes());
+            let mut f =
+                std::fs::File::open(&spec.local).map_err(|e| format!("读不了本地文件:{e}"))?;
+            let mut dst = client
+                .open_write(&staging, true)
+                .await
+                .map_err(|e| e.to_string())?;
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    // 先把 channel 收干净再删残件 —— 文件还开着时删,某些
+                    // sshd 上会报「file still open」。
+                    let _ = dst.finish().await;
+                    let _ = client.remove_file(&staging).await;
+                    return Err("已取消".into());
+                }
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| format!("读不了本地文件:{e}"))?;
+                if n == 0 {
+                    break;
+                }
+                dst.write_chunk(&buf[..n])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                done += n as u64;
+                let _ = proxy.send_event(UserEvent::TransferProgress { job, done });
+            }
+            // `finish()` 不能省:`File` 的 Drop 走的是 `close_nowait`,紧接着
+            // 改名会撞上「文件还开着」(见 `RemoteFile::finish` 的文档)。
+            dst.finish().await.map_err(|e| e.to_string())?;
+            if staging != dst_remote {
+                client
+                    .rename(&staging, &dst_remote)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn next_panel_selection_index(
     rows: &[&mullion_ssh::sftp::Entry],
     selected: Option<&mullion_ssh::sftp::RemotePath>,
@@ -564,7 +983,26 @@ pub struct App {
     /// 不是这一帧的真实生效值**——能否兑现取决于面板此刻在不在(见
     /// `effective_focus` 按上下文夹紧的说明)。默认终端,与迁移前行为一致。
     focus: shell::input_route::Focus,
+    /// F55:**跨标签**的传输队列。挂在 `App` 上而不是标签上 —— 设计里它
+    /// 是全局的一条队列,切标签不该看见另一份;标签关掉时用
+    /// `Queue::cancel_generation` 作废属于它的那些 job。
+    transfer_queue: crate::files::queue::Queue,
+    /// 每条在跑的 job 的取消旗标。worker 每块之后看一眼 —— 取消得能在
+    /// 2GB 传到一半时立刻生效,不能等整个文件传完。
+    transfer_cancels: std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
+    /// 每条 job 的完整参数(见 `TransferSpec`)。job 真正走完(不是挂在冲突上)
+    /// 之后删掉,不然队列清空了它还在涨。
+    transfer_specs: std::collections::HashMap<u64, TransferSpec>,
 }
+
+/// F59:传输队列在跑时的界面刷新间隔(毫秒)。进度条 5Hz 已经够顺,
+/// 再密只是白烧 GPU —— 真实进度数据由 `TransferProgress` 事件实时更新,
+/// 这个值只决定「多久把它画出来一次」。
+const TRANSFER_UI_INTERVAL_MS: u64 = 200;
+
+/// F56:同时在跑的传输条数。每条一条独立的 sftp channel —— 开太大的话
+/// 每条都在抢同一个 TCP 窗口,总吞吐反而掉(设计 D8)。
+const DEFAULT_TRANSFER_CONCURRENCY: usize = 4;
 
 /// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
 /// TODO:与字体族一起做成可配置(见 spec F21)。
@@ -615,6 +1053,10 @@ impl App {
             pending_skip_automation: false,
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
+            // F56:默认 4 条并发。可配 UI 是 D2-c 的欠账,先按设计定的默认值走。
+            transfer_queue: crate::files::queue::Queue::new(DEFAULT_TRANSFER_CONCURRENCY),
+            transfer_cancels: std::collections::HashMap::new(),
+            transfer_specs: std::collections::HashMap::new(),
         }
     }
 
@@ -640,7 +1082,20 @@ impl App {
     /// 关掉活动标签并收口。关空即回 launcher 态。
     fn close_active_tab(&mut self) {
         if let Some(tab) = self.tabs.close_active() {
+            // F55:同 `TabAction::Close` —— 标签的传输随标签一起作废。
+            self.cancel_transfers_of(tab.content.generation());
             wind_down(tab);
+        }
+    }
+
+    /// F55:作废属于某个标签的全部传输。扳旗标(让在跑的 worker 立刻停)
+    /// **和**改队列状态(让界面上那几条变成「已取消」)缺一不可。
+    fn cancel_transfers_of(&mut self, generation: u64) {
+        for id in self.transfer_queue.cancel_generation(generation) {
+            if let Some(c) = self.transfer_cancels.remove(&id) {
+                c.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.transfer_specs.remove(&id);
         }
     }
 
@@ -831,6 +1286,12 @@ impl App {
     ) {
         use crate::files::local;
         use crate::ui::files_panel::FileAction;
+        // F52:上传。**在借出 `files` 之前分流** —— `start_transfer` 要
+        // `&mut self`,借着 `tab.content.files_panel_mut()` 是调不了的。
+        if matches!(action, FileAction::Transfer) {
+            self.start_transfer(generation, crate::files::queue::Direction::Upload);
+            return;
+        }
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
@@ -842,6 +1303,22 @@ impl App {
             FileAction::ToggleHidden => {
                 files.local.show_hidden = !files.local.show_hidden;
                 self.ui_dirty = true;
+                return;
+            }
+            // D5:本地栏不提供写操作,`menu_items_for` 也不会给出这些项 ——
+            // 真到了这里说明菜单构造被改坏了,不静默吞掉。
+            FileAction::Ask(ask) => {
+                log::warn!("本地栏收到了写操作请求 {ask:?},已忽略(D5)");
+                return;
+            }
+            // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
+            FileAction::Transfer => return,
+            FileAction::OpenInExplorer => {
+                let dir = files.local.cwd.clone();
+                if let Err(e) = local::open_in_file_manager(&dir) {
+                    self.ui.set_error(e);
+                    self.ui_dirty = true;
+                }
                 return;
             }
         };
@@ -864,6 +1341,27 @@ impl App {
         action: crate::ui::files_panel::FileAction,
     ) {
         use crate::ui::files_panel::FileAction;
+        // D2:这两个不发网络请求,在借出 `files` 之前就分流掉 —— 借着
+        // `tab.content.files_panel_mut()` 是没法再调 `&mut self` 方法的。
+        match &action {
+            // 开对话框。真正的写操作等用户确认之后从 `UiActions::files_op`
+            // 回来(见 `apply_file_op`)。
+            FileAction::Ask(ask) => {
+                self.open_files_dialog(generation, *ask);
+                return;
+            }
+            // 本地栏专属,远端栏收到就是接线接错了 —— 老实记一条,不静默吞。
+            FileAction::OpenInExplorer => {
+                log::warn!("远端栏收到 OpenInExplorer,已忽略");
+                return;
+            }
+            // F52:下载。同 `Ask`,在借出 `files` 之前分流。
+            FileAction::Transfer => {
+                self.start_transfer(generation, crate::files::queue::Direction::Download);
+                return;
+            }
+            _ => {}
+        }
         let client = {
             let Some(tab) = self.tabs.by_generation_mut(generation) else {
                 return;
@@ -889,6 +1387,8 @@ impl App {
                 self.ui_dirty = true;
                 return;
             }
+            // 这三个在函数开头就分流掉了(那里不需要借 `files`),走不到这儿。
+            FileAction::Ask(_) | FileAction::OpenInExplorer | FileAction::Transfer => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
@@ -906,8 +1406,7 @@ impl App {
     /// (`window_event`)已经用 `files_owner_generation()` 算好了传进来,这里
     /// 不再假设"就是当前活动的那个"。
     ///
-    /// **只读浏览(D1)**:`Delete`/`F2` 本切片不接——那是 D2 的写操作,现在
-    /// 接了是给一个按下去没反应的键。
+    /// D2:`Delete`/`F2` 打开删除 / 重命名对话框,**只在远端栏**(设计 D5)。
     fn handle_panel_key(
         &mut self,
         generation: u64,
@@ -933,8 +1432,10 @@ impl App {
                     return;
                 };
                 let (column, state) = tab.content.files_panel().active_state();
+                // 「进去」是**单目标**动作,认光标行而不是选择集 ——
+                // 多选了 5 条时「进哪一个」没有答案。
                 let Some(target) = state
-                    .selected
+                    .cursor
                     .as_ref()
                     .and_then(|name| state.entries.iter().find(|e| &e.name == name))
                     .and_then(|e| state.enter_target(e))
@@ -955,6 +1456,28 @@ impl App {
                     files.active_column = files.active_column.flipped();
                     self.ui_dirty = true;
                 }
+            }
+            WinitKey::Named(NamedKey::Delete) | WinitKey::Named(NamedKey::F2) => {
+                // 设计 D5:本地栏不提供删除 / 重命名。焦点在本地栏时这两个键
+                // **静默不动**,不是转投远端栏 —— 用户看着本地栏按 Delete、
+                // 结果删了远端文件,是这一片能造成的最坏后果。
+                let column = self
+                    .tabs
+                    .by_generation(generation)
+                    .map(|t| t.content.files_panel().active_column);
+                if column != Some(crate::ui::files_panel::PanelColumn::Remote) {
+                    return;
+                }
+                let ask = if matches!(key, WinitKey::Named(NamedKey::Delete)) {
+                    crate::ui::files_panel::FileAsk::Delete
+                } else {
+                    crate::ui::files_panel::FileAsk::Rename
+                };
+                self.dispatch_panel_action_for(
+                    generation,
+                    crate::ui::files_panel::PanelColumn::Remote,
+                    FileAction::Ask(ask),
+                );
             }
             WinitKey::Named(NamedKey::ArrowUp) => self.move_panel_selection(generation, -1),
             WinitKey::Named(NamedKey::ArrowDown) => self.move_panel_selection(generation, 1),
@@ -979,6 +1502,209 @@ impl App {
         self.dispatch_panel_action_for(generation, column, action);
     }
 
+    /// D2:把一个「打开对话框」的意图落成 `UiState::files_dialog`。
+    ///
+    /// **对话框的内容在这里一次性算好**(要删哪些、原名是什么、当前权限是
+    /// 多少),不是等渲染时再回头查面板状态:对话框开着的时候用户可能已经
+    /// 切了标签、目录已经刷新过,那时再查就是另一份数据了。
+    fn open_files_dialog(&mut self, generation: u64, ask: crate::ui::files_panel::FileAsk) {
+        use crate::ui::files_dialog::FilesDialog;
+        use crate::ui::files_panel::FileAsk;
+
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let state = &tab.content.files_panel().remote;
+        let dialog = match ask {
+            FileAsk::NewDir => Some(FilesDialog::NewDir {
+                parent: state.cwd.clone(),
+                name: String::new(),
+            }),
+            FileAsk::Rename => state.cursor.as_ref().map(|cur| FilesDialog::Rename {
+                from: state.cwd.join(cur.as_bytes()),
+                name: cur.display().to_string(),
+            }),
+            FileAsk::Chmod => state.cursor.as_ref().and_then(|cur| {
+                let e = state.entries.iter().find(|e| &e.name == cur)?;
+                Some(FilesDialog::Chmod {
+                    path: state.cwd.join(cur.as_bytes()),
+                    mode: e.mode & 0o777,
+                })
+            }),
+            FileAsk::Delete => {
+                // 选中集为空时退化成「删光标那一条」—— 用户按 Delete 时
+                // 多半就是想删高亮那条,弹一个「没有选中任何条目」的空框
+                // 只会让人以为程序坏了。
+                let picked = if state.selected.is_empty() {
+                    state.cursor.iter().cloned().collect::<Vec<_>>()
+                } else {
+                    state.selected_paths()
+                };
+                let targets: Vec<(mullion_ssh::sftp::RemotePath, bool)> = picked
+                    .iter()
+                    .filter_map(|name| {
+                        let e = state.entries.iter().find(|e| &e.name == name)?;
+                        // 发不出去的名字不许进删除列表 —— 请求打不中那个文件,
+                        // 而它会在确认框里让用户以为「删了 5 条」。
+                        if !name.is_operable() {
+                            return None;
+                        }
+                        Some((
+                            state.cwd.join(name.as_bytes()),
+                            e.kind == mullion_ssh::sftp::EntryKind::Dir,
+                        ))
+                    })
+                    .collect();
+                if targets.is_empty() {
+                    None
+                } else {
+                    Some(FilesDialog::Delete { targets })
+                }
+            }
+        };
+        if dialog.is_some() {
+            self.ui.files_dialog = dialog;
+            // 对话框是新出现的窗口,不请求重绘的话键盘发起的那条路径
+            // (Delete / F2)要等鼠标动一下才画得出来(D1 复核挖出的同款 bug)。
+            self.request_ui_redraw();
+        }
+    }
+
+    /// D2/F54:执行一次已确认的远端写操作。
+    ///
+    /// 全部走后台 task + `UserEvent::SftpOpDone` 回流,**不在 UI 线程上等**:
+    /// 一次递归删除在高延迟链路上可能跑几十秒,阻塞窗口线程等于整个程序卡死。
+    fn apply_file_op(&mut self, generation: u64, op: crate::ui::files_dialog::FileOp) {
+        use crate::ui::files_dialog::FileOp;
+
+        // F55:冲突处置不是「一次远端写操作」——它只改队列状态,由
+        // `pump_transfers` 决定要不要重新起 worker。在这里提前分流,
+        // 免得为它白开一条 sftp channel。
+        if let FileOp::Resolve {
+            job,
+            choice,
+            apply_all,
+        } = op
+        {
+            self.transfer_queue.resolve_conflict(job, choice, apply_all);
+            self.ui_dirty = true;
+            return;
+        }
+
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let Some(client) = tab.content.sftp_client() else {
+            self.ui
+                .set_error("SFTP 通道还没建立,请先等目录加载完".into());
+            return;
+        };
+        let conn = tab.content.sftp_connection();
+        let proxy = self.proxy.clone();
+        let task = self._runtime.spawn(async move {
+            let result = match op {
+                FileOp::NewDir(p) => client.create_dir(&p).await.map_err(|e| e.to_string()),
+                FileOp::Rename { from, to } => {
+                    client.rename(&from, &to).await.map_err(|e| e.to_string())
+                }
+                FileOp::Chmod { path, mode } => client
+                    .set_permissions(&path, mode)
+                    .await
+                    .map_err(|e| e.to_string()),
+                FileOp::Delete { targets } => delete_all(&client, conn.as_ref(), &targets).await,
+                // 函数开头已经分流走了,走到这里说明分流被删了。
+                FileOp::Resolve { .. } => unreachable!("冲突处置不该走远端写操作这条路"),
+            };
+            let _ = proxy.send_event(UserEvent::SftpOpDone { generation, result });
+        });
+        self.track_sftp_task(generation, task);
+    }
+
+    /// F52:发起一批传输。**方向由发起的栏决定**:远端栏 = 下载(源是远端栏
+    /// 的选中集),本地栏 = 上传。
+    ///
+    /// 这里只把「用户点中的那几条」摘出来就交给后台展开(目录要递归):远端
+    /// 递归要走网络列目录,本地递归要遍历磁盘,压在窗口线程上就是整个程序
+    /// 卡住。展开结果经 `UserEvent::TransferPlanned` 回来一次性入队 ——
+    /// 边展开边入队的话,队列会在用户眼前长上半天。
+    fn start_transfer(&mut self, generation: u64, dir: crate::files::queue::Direction) {
+        use crate::files::queue::Direction;
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let files = tab.content.files_panel();
+        let src = match dir {
+            Direction::Download => &files.remote,
+            Direction::Upload => &files.local,
+        };
+        // 名字发不出去 wire 请求的一律不收(同删除那条路径的判据)——
+        // 收进来只会让用户以为「传了 5 个」,其实有一个必然失败。
+        let picked: Vec<(mullion_ssh::sftp::RemotePath, bool, u64)> = src
+            .picked_entries()
+            .into_iter()
+            .filter(|e| e.name.is_operable())
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.kind == mullion_ssh::sftp::EntryKind::Dir,
+                    e.size,
+                )
+            })
+            .collect();
+        if picked.is_empty() {
+            return;
+        }
+        let remote_cwd = files.remote.cwd.clone();
+        let local_cwd = files.local.cwd.clone();
+        let Some(client) = tab.content.sftp_client() else {
+            self.ui
+                .set_error("SFTP 通道还没建立,请先等目录加载完".into());
+            self.ui_dirty = true;
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let task = self._runtime.spawn(async move {
+            let result = plan_transfer(&client, dir, &picked, &remote_cwd, &local_cwd).await;
+            let _ = proxy.send_event(UserEvent::TransferPlanned { generation, result });
+        });
+        self.track_sftp_task(generation, task);
+    }
+
+    /// F55/F56:每帧调一次 —— 队列放行几条就起几条 worker。
+    ///
+    /// **每条 job 自己开一条 sftp channel**(worker 里的 `SftpClient::open`):
+    /// 共用一条的话请求在同一个 session 上串行,并发度实际等于 1,设计 D8
+    /// 说的吞吐问题原样还在。
+    fn pump_transfers(&mut self) {
+        for id in self.transfer_queue.take_runnable() {
+            let Some(spec) = self.transfer_specs.get(&id).cloned() else {
+                self.transfer_queue.finish(id, Err("任务参数丢了".into()));
+                continue;
+            };
+            let Some(tab) = self.tabs.by_generation(spec.generation) else {
+                // 属主标签没了 —— 关标签那条路径已经 `cancel_generation` 过,
+                // 这里是兜底,不该再当成"失败"报给用户。
+                self.transfer_queue.cancel(id);
+                continue;
+            };
+            let Some(conn) = tab.content.sftp_connection() else {
+                self.transfer_queue.finish(id, Err("连接已断开".into()));
+                continue;
+            };
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.transfer_cancels.insert(id, cancel.clone());
+            // 冲突处置结果随 job 存在队列里(重跑时才知道该覆盖还是改名)。
+            let resolved = self.transfer_queue.get(id).and_then(|j| j.resolved);
+            let generation = spec.generation;
+            let proxy = self.proxy.clone();
+            let task = self._runtime.spawn(async move {
+                let result = run_transfer(conn, spec, resolved, id, &proxy, &cancel).await;
+                let _ = proxy.send_event(UserEvent::TransferDone { job: id, result });
+            });
+            self.track_sftp_task(generation, task);
+        }
+    }
+
     fn dispatch_panel_action_for(
         &mut self,
         generation: u64,
@@ -994,7 +1720,7 @@ impl App {
 
     /// `↑`/`↓`:在有焦点的那一栏里移动 `selected`。纯 UI 状态,不经过
     /// `apply_*_file_action` 那条异步链路(不触发网络请求),直接改
-    /// `PaneState::selected`。没有选中项时,`↓` 从第一行开始、`↑` 从最后一
+    /// `PaneState` 的光标与选择集。没有选中项时,`↓` 从第一行开始、`↑` 从最后一
     /// 行开始——用户第一下按方向键该落在看得见的那一头,而不是无反应。
     fn move_panel_selection(&mut self, generation: u64, delta: i32) {
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
@@ -1002,11 +1728,14 @@ impl App {
         };
         let state = tab.content.files_panel_mut().active_state_mut();
         let rows = state.rows();
-        let Some(next) = next_panel_selection_index(&rows, state.selected.as_ref(), delta) else {
+        let Some(next) = next_panel_selection_index(&rows, state.cursor.as_ref(), delta) else {
             return;
         };
         let name = rows[next].name.clone();
-        state.selected = Some(name);
+        drop(rows);
+        // 方向键 = 单选移动:光标走到哪,选择集就只剩哪一条(Shift+方向键
+        // 扩选不在本切片范围内)。
+        state.select_only(&name);
         self.ui_dirty = true;
     }
 
@@ -2373,6 +3102,85 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_sftp_listed(generation, seq, result);
             }
+            UserEvent::SftpOpDone { generation, result } => {
+                match result {
+                    Ok(()) => {
+                        self.ui.set_toast("已完成");
+                        // 写操作不带回新的目录内容 —— 不刷新的话界面上那个
+                        // 文件「还在」,用户会以为没生效然后再删一次。
+                        self.dispatch_panel_action_for(
+                            generation,
+                            crate::ui::files_panel::PanelColumn::Remote,
+                            crate::ui::files_panel::FileAction::Refresh,
+                        );
+                    }
+                    Err(msg) => self.ui.set_error(msg),
+                }
+                self.request_ui_redraw();
+            }
+            UserEvent::TransferPlanned { generation, result } => {
+                match result {
+                    Ok(jobs) => {
+                        for p in jobs {
+                            let id = self.transfer_queue.push(crate::files::queue::NewJob {
+                                dir: p.dir,
+                                generation,
+                                label: p.label,
+                                total: p.total,
+                            });
+                            self.transfer_specs.insert(
+                                id,
+                                TransferSpec {
+                                    dir: p.dir,
+                                    generation,
+                                    local: p.local,
+                                    remote: p.remote,
+                                },
+                            );
+                        }
+                    }
+                    // 展开阶段就失败 —— 一条 job 都没建,老实报出来。
+                    Err(e) => self.ui.set_error(e),
+                }
+                self.request_ui_redraw();
+            }
+            UserEvent::TransferProgress { job, done } => {
+                // T3:**高频事件,只更数据不重绘**。一个 100MB 的文件会发几千条,
+                // 每条都请求重绘就是每秒几千帧、风扇起飞。进度显示由
+                // `RedrawRequested` 里那段「队列在跑就标脏 + 排下一帧」按帧闸
+                // 驱动(~5Hz),与事件频率无关。
+                self.transfer_queue.progress(job, done);
+            }
+            UserEvent::TransferDone { job, result } => {
+                self.transfer_cancels.remove(&job);
+                self.transfer_queue.finish(job, result);
+                // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
+                if let Some(spec) = self.transfer_specs.get(&job) {
+                    let (generation, dir) = (spec.generation, spec.dir);
+                    let column = match dir {
+                        crate::files::queue::Direction::Download => {
+                            crate::ui::files_panel::PanelColumn::Local
+                        }
+                        crate::files::queue::Direction::Upload => {
+                            crate::ui::files_panel::PanelColumn::Remote
+                        }
+                    };
+                    self.dispatch_panel_action_for(
+                        generation,
+                        column,
+                        crate::ui::files_panel::FileAction::Refresh,
+                    );
+                }
+                // 真正走完的才丢 spec:挂在冲突上的那些还要**用同一份**重跑。
+                if self
+                    .transfer_queue
+                    .get(job)
+                    .is_none_or(|j| j.state.is_finished())
+                {
+                    self.transfer_specs.remove(&job);
+                }
+                self.request_ui_redraw();
+            }
         }
     }
 
@@ -2710,6 +3518,28 @@ impl ApplicationHandler<UserEvent> for App {
                 // 仅终端态有字节可处理;launcher 态(ws=None)没有终端,跳过,但下面的帧率闸 + egui
                 // 渲染仍要跑(egui 在 launcher 也要画占位 UI)。
                 self.pump_io();
+                // 1.5 F55/F59:传输队列每帧推进一次(放行 worker + 采样速率)。
+                // **放在帧里而不是事件里**是 T3:进度事件每秒几千条,靠它们
+                // 驱动重绘就是风扇起飞;这里只把「队列在跑」当成脏,重绘频率
+                // 因此由下面那段排期(~5Hz)决定,与事件频率无关。
+                self.pump_transfers();
+                if self.transfer_queue.summary().busy {
+                    self.transfer_queue.tick(self.start.elapsed().as_secs_f64());
+                    self.ui_dirty = true;
+                }
+                // 1.6 F55:有 job 挂在冲突上就把处置框弹出来。**绝不静默覆盖**;
+                // 也不重复弹:已经有别的对话框开着时等它先关掉。
+                if self.ui.files_dialog.is_none() {
+                    if let Some(j) = self.transfer_queue.first_conflict() {
+                        self.ui.files_dialog =
+                            Some(crate::ui::files_dialog::FilesDialog::Conflict {
+                                name: j.label.clone(),
+                                job: j.id,
+                                apply_all: false,
+                            });
+                        self.ui_dirty = true;
+                    }
+                }
                 // 2.2 自愈:能收到重绘请求本身就说明窗口大概率看得见。若还挂在
                 // Minimized 且实测尺寸非零,就地恢复(否则一次异常的 Resized(0,0)
                 // 之后再没有非零 Resized,窗口永久停在 PumpOnly:字节照收,画面
@@ -2992,6 +3822,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 sidebar_arg,
                                 content_arg,
                                 files_owner_generation.unwrap_or(0),
+                                &self.transfer_queue,
                             );
                             drop(renders);
                             drop(titles);
@@ -3042,6 +3873,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                                 Some(crate::ui::chrome::TabAction::Close(ix)) => {
                                     if let Some(tab) = self.tabs.close(ix) {
+                                        // F55:标签没了,它的传输也就没有落点/
+                                        // 连接了 —— 先作废再收口。
+                                        self.cancel_transfers_of(tab.content.generation());
                                         wind_down(tab);
                                     }
                                     self.ui_dirty = true;
@@ -3064,6 +3898,36 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Some(action) = actions.files_remote {
                                     self.apply_remote_file_action(gen, action);
                                 }
+                                // D2:对话框里确认了的写操作。按同一条
+                                // `files_owner_generation` 判据路由(S1),不
+                                // 重新算一遍。
+                                if let Some(op) = actions.files_op {
+                                    self.apply_file_op(gen, op);
+                                }
+                            }
+                            // F55:传输面板上按的东西。**取消要同时扳旗标和改队列**:
+                            // 只改队列的话 worker 还在闷头传完整个文件,只扳旗标
+                            // 的话界面上那条永远停在百分比上。
+                            if let Some(a) = actions.transfer {
+                                use crate::ui::transfer_panel::TransferUiAction;
+                                match a {
+                                    TransferUiAction::Cancel(id) => {
+                                        if let Some(c) = self.transfer_cancels.get(&id) {
+                                            c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        self.transfer_queue.cancel(id);
+                                    }
+                                    TransferUiAction::CancelAll => {
+                                        for c in self.transfer_cancels.values() {
+                                            c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        self.transfer_queue.cancel_all();
+                                    }
+                                    TransferUiAction::ClearFinished => {
+                                        self.transfer_queue.clear_finished()
+                                    }
+                                }
+                                self.ui_dirty = true;
                             }
                             // F100:导出的 Markdown 送剪贴板。写剪贴板是 IO,`ui/`
                             // 那一层只画不做 IO,所以在这里发起(同 F18 的复制路径)。
@@ -3111,6 +3975,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 // `frame_is_dirty` 判 Idle,动画/交互反馈直接丢帧。
                                 self.ui_dirty = true;
                                 let at = Instant::now() + repaint_delay;
+                                self.next_frame_at = Some(at);
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+                            } else if self.transfer_queue.summary().busy {
+                                // F59:队列在跑时自己排下一帧。不排的话画面会
+                                // 冻在传输开始那一帧 —— 进度事件按 T3 刻意不
+                                // 请求重绘,没有别的东西会唤醒事件循环。
+                                // T7:这一支同样显式复位 control_flow。
+                                self.ui_dirty = true;
+                                let at = Instant::now()
+                                    + std::time::Duration::from_millis(TRANSFER_UI_INTERVAL_MS);
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                             } else if let Some(at) = self.sync_timeout_wake(now) {
@@ -3704,8 +4578,12 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.annotate_export.is_some()
         || a.files_remote.is_some()
         || a.files_local.is_some()
+        || a.files_op.is_some()
+        || a.transfer.is_some()
 }
 
+/// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
+#[allow(clippy::too_many_arguments)]
 fn render_frame(
     a: &mut Active,
     panes: &[crate::gpu::PaneRender<'_>],
@@ -3723,6 +4601,8 @@ fn render_frame(
     // `None` 时不会被用到——调用方传的是 `files_owner_generation.unwrap_or(0)`,
     // 那种情况下这个 0 只是个从不会被读取的占位值。
     files_generation: u64,
+    // F55:传输队列,只读转给 `build_ui`(见其同名参数的文档)。
+    queue: &crate::files::queue::Queue,
 ) -> (std::time::Duration, crate::ui::UiActions) {
     diag::count_frame();
     // --- egui:每帧都跑,launcher 态(panes 为空)也要画菜单/状态栏。---
@@ -3758,6 +4638,7 @@ fn render_frame(
             files.as_deref_mut(),
             files_content.as_deref_mut(),
             files_generation,
+            queue,
         );
         if has_real_action(&this_pass) {
             actions = this_pass;
@@ -3910,9 +4791,9 @@ fn render_frame(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_layout_actions, apply_save, effective_focus_of, files_owner_generation_of,
-        has_real_action, next_panel_selection_index, pane_still_wanted, sync_timeout_wake_at,
-        wind_down, Tab, TabContent, TerminalTab,
+        apply_layout_actions, apply_save, download_job, effective_focus_of,
+        files_owner_generation_of, has_real_action, next_panel_selection_index, pane_still_wanted,
+        sync_timeout_wake_at, upload_job, wind_down, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -4863,6 +5744,295 @@ mod tests {
             "effective_focus_of 在活动标签是 Files 时必须恒返回 \
              Focus::FilesPanel —— 那种标签没有终端可回,按 Terminal 路由的话\
              方向键/回车会去找一个不存在的 pane,静默无反应"
+        );
+    }
+
+    /// `UiActions` 加了字段却漏改 `has_real_action` 的话,新动作会在 egui 的
+    /// discard 趟被静默吃掉 —— 症状是「点了确认,什么也没发生,也不报错」。
+    ///
+    /// 按大括号配平截出一条 `match` 分支。`rest` 必须**从 `=> {` 起算**
+    /// ——从 arm 的模式起算的话,模式自带的那对花括号(`{ job, done }`)
+    /// 会让深度在第一步就归零,截出来的「arm」一行代码都不含。
+    ///
+    /// 截不到闭合大括号时返回整串,调用方据此断言(`arm.len() < rest.len()`)
+    /// 自己没有退化成扫全文件。
+    fn brace_balanced_arm(rest: &str) -> &str {
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[..i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest
+    }
+
+    /// 取 `match event` 里某条分支的**块体**。`pattern` 只给模式部分,
+    /// 这里自己接上 `" => {"` 再找 —— 光按模式找会命中同一个变体在别处的
+    /// **构造**处(`send_event(UserEvent::TransferProgress { job, done })`),
+    /// 截出来的是那一段代码,断言全部落空。
+    fn arm_of<'a>(production: &'a str, pattern: &str) -> &'a str {
+        let needle = format!("{pattern} => {{");
+        let at = production
+            .find(&needle)
+            .unwrap_or_else(|| panic!("找不到 {pattern} 的处理分支"));
+        let rest = &production[at + production[at..].find("=> {").expect("arm 没有块体")..];
+        let arm = brace_balanced_arm(rest);
+        assert!(
+            arm.len() < rest.len(),
+            "{pattern} 没截到闭合大括号,断言会退化成扫全文件"
+        );
+        arm
+    }
+
+    /// **T3 守护**:进度事件是高频的(一个 100MB 的文件几千条),那条 arm 里
+    /// 一旦出现 `ui_dirty` / `request_redraw`,就变成每秒几千帧、风扇起飞 ——
+    /// 正是 T3 点名的那条红线。进度显示该由帧闸驱动,不由事件驱动。
+    ///
+    /// 结构守护(`user_event` 要 `&mut App`,无头造不出来)。
+    /// 自证会变红:在那条 arm 里加一句 `self.ui_dirty = true;`。
+    #[test]
+    fn transfer_progress_events_never_request_a_redraw_so_the_fan_stays_quiet() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let arm = arm_of(production, "UserEvent::TransferProgress { job, done }");
+        assert!(
+            arm.contains("progress(job, done)"),
+            "arm 切歪了(没更新队列进度),下面那条否定断言会空过:{arm}"
+        );
+        assert!(
+            !arm.contains("ui_dirty") && !arm.contains("request_redraw"),
+            "进度事件里出现了重绘(T3):{arm}"
+        );
+    }
+
+    /// 传完必须刷新**目标那一栏**。不刷的症状:文件其实传到了,但列表里
+    /// 看不见,用户以为没成、再传一次。
+    ///
+    /// 自证会变红:删掉那条 arm 里的 `dispatch_panel_action_for(...)`。
+    #[test]
+    fn a_finished_transfer_refreshes_the_destination_column_so_the_file_shows_up() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let arm = arm_of(production, "UserEvent::TransferDone { job, result }");
+        assert!(
+            arm.contains("FileAction::Refresh"),
+            "传完不刷新,新文件不会出现在列表里:{arm}"
+        );
+        assert!(
+            arm.contains("PanelColumn::Local") && arm.contains("PanelColumn::Remote"),
+            "刷新写死成了一栏 —— 下载该刷本地、上传该刷远端:{arm}"
+        );
+    }
+
+    /// F56:每条传输**自己开一条 sftp channel**。共用标签那条
+    /// (`tab.content.sftp_client()`)的话,请求在同一个 session 上串行,
+    /// 并发度实际等于 1,设计 D8 说的吞吐问题原样还在 —— 而且症状是「设了 4
+    /// 并发但一点不快」,没人会怀疑到这里。
+    ///
+    /// 自证会变红:把 `run_transfer` 里的 `SftpClient::open(conn)` 换成从
+    /// 外面传进来的 client。
+    #[test]
+    fn every_transfer_opens_its_own_channel_so_concurrency_is_real() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let after = production
+            .split("async fn run_transfer(")
+            .nth(1)
+            .expect("找不到 run_transfer 的定义");
+        let body = &after[..after.find("\n}\n").expect("找不到 run_transfer 的函数结尾")];
+        assert!(
+            body.contains("spec.dir"),
+            "run_transfer 的函数体切歪了({} 字节),下面那条断言会空过",
+            body.len()
+        );
+        assert!(
+            body.contains("SftpClient::open(conn)"),
+            "worker 没有自己开 channel —— 并发度会静默退化成 1(F56/设计 D8)"
+        );
+    }
+
+    /// 传输面板上的按钮**必须算「真动作」**:`has_real_action` 是手写枚举,
+    /// 漏一个字段,egui 的丢弃趟就会把这一帧的点击悄悄吃掉(取消传输点了
+    /// 没反应,而且时灵时不灵)。
+    ///
+    /// 自证会变红:把 `has_real_action` 里的 `a.transfer.is_some()` 删掉。
+    #[test]
+    fn a_transfer_ui_action_counts_as_a_real_action_so_it_is_not_swallowed() {
+        use crate::ui::UiActions;
+        let a = UiActions {
+            transfer: Some(crate::ui::transfer_panel::TransferUiAction::CancelAll),
+            ..Default::default()
+        };
+        assert!(has_real_action(&a), "取消传输被 egui 的丢弃趟吞了");
+    }
+
+    /// D16:落点名在 Windows 上非法时**整条拒掉并给建议名**,不静默改写。
+    /// 静默改写的后果是用户以为下下来的是 `aux.log`,实际叫别的名字,
+    /// 下次照着原名找不到、脚本也对不上。
+    #[test]
+    fn a_name_that_windows_cannot_store_stops_the_job_with_a_suggestion() {
+        let remote = mullion_ssh::sftp::RemotePath::from_bytes(b"/srv/aux".to_vec());
+        let local = mullion_ssh::sftp::RemotePath::from_bytes(b"/tmp".to_vec());
+        let err = download_job(&remote, &[], &local, 1).expect_err("aux 是保留设备名,该拒掉");
+        assert!(err.contains("aux"), "错误里得点名是哪个文件:{err}");
+        assert!(err.contains("_aux"), "错误里得给建议名:{err}");
+    }
+
+    /// 递归下载要把远端的子树原样落到本地目录下面 —— 拼错的话所有文件会
+    /// 挤在同一层(或者跑到目标目录外面去)。
+    #[test]
+    fn a_download_job_mirrors_the_remote_subtree_under_the_local_directory() {
+        let remote = mullion_ssh::sftp::RemotePath::from_bytes(b"/srv/data".to_vec());
+        let local = mullion_ssh::sftp::RemotePath::from_bytes(b"/tmp/dl".to_vec());
+        let j = download_job(&remote, &[b"sub".to_vec(), b"a.txt".to_vec()], &local, 7)
+            .expect("名字合法");
+        assert_eq!(j.remote.display(), "/srv/data/sub/a.txt");
+        assert_eq!(
+            j.local,
+            std::path::Path::new("/tmp/dl")
+                .join("data")
+                .join("sub")
+                .join("a.txt")
+        );
+        assert_eq!(j.total, 7);
+        assert_eq!(j.label, "a.txt");
+    }
+
+    /// 递归上传的镜像方向。远端一律用 `/`,不能跟着本机分隔符走。
+    #[test]
+    fn an_upload_job_mirrors_the_local_subtree_under_the_remote_directory() {
+        let root = std::path::Path::new("/home/u/data");
+        let remote_dir = mullion_ssh::sftp::RemotePath::from_bytes(b"/srv".to_vec());
+        let name = mullion_ssh::sftp::RemotePath::from_bytes(b"data".to_vec());
+        let j = upload_job(root, &["sub".into(), "a.txt".into()], &remote_dir, &name, 9);
+        assert_eq!(j.remote.display(), "/srv/data/sub/a.txt");
+        assert_eq!(j.local, root.join("sub").join("a.txt"));
+        assert_eq!(j.label, "a.txt");
+    }
+
+    /// 破坏性验证:把 `has_real_action` 里的 `a.files_op.is_some()` 删掉,
+    /// 这条必须变红。
+    #[test]
+    fn a_confirmed_file_operation_counts_as_a_real_action() {
+        use crate::ui::files_dialog::FileOp;
+        use crate::ui::UiActions;
+
+        let mut a = UiActions::default();
+        assert!(!has_real_action(&a), "全空时不该算有动作");
+
+        a.files_op = Some(FileOp::NewDir(mullion_ssh::sftp::RemotePath::from_bytes(
+            b"/x".to_vec(),
+        )));
+        assert!(has_real_action(&a), "files_op 没被算进 has_real_action");
+    }
+
+    /// 写操作完成后**必须刷新**。不刷新的症状是:删了一个文件,列表里
+    /// 那一行还在,用户以为没生效再删一次,收到一条 NoSuchFile。
+    ///
+    /// 这是结构守护(`user_event` 要 `&mut App`,无头造不出来):断言
+    /// `SftpOpDone` 的处理分支里确实发了一次 `Refresh`。
+    #[test]
+    fn a_successful_write_triggers_a_refresh_so_the_list_is_not_stale() {
+        let src = include_str!("app.rs");
+        // 只看生产代码那一半 —— 断言字符串写在本测试里,连自己这行都算
+        // 命中的话就是一条自证自伪的假测试(同 `files_panel` 里那条)。
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        // 定位到**处理分支**(`match event` 里那个),不是枚举定义处 ——
+        // 后者在前面,取到它的话后面截出来的一段根本不含处理代码。
+        let at = production
+            .find("UserEvent::SftpOpDone { generation, result } => {")
+            .expect("找不到 SftpOpDone 的处理分支");
+        // **从 `=> {` 起算**,不是从 `UserEvent::` 起算:模式里那对
+        // `{ generation, result }` 花括号会让配平在第一步就归零,截出来的
+        // 「arm」只有模式本身、一行代码都不含(断言于是恒红)。
+        let rest = &production[at + production[at..].find("=> {").expect("arm 没有块体")..];
+        // 按大括号配平截出这一条 arm。**不能拿「下一个 `UserEvent::`」当边界**:
+        // 这是 `match` 的最后一条分支,那样截会一路截到文件末尾,把别处
+        // (F5 那条)的 `FileAction::Refresh` 也算进来 —— 断言于是恒绿
+        // (删掉整段刷新代码它照样过,变异验收当场逮到)。
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let arm = &rest[..end];
+        assert!(
+            arm.len() < rest.len(),
+            "没截到 arm 的闭合大括号,下面的断言会退化成扫全文件"
+        );
+        assert!(
+            arm.contains("FileAction::Refresh"),
+            "写操作成功后没有刷新目录 —— 界面会一直显示已经删掉的那一行"
+        );
+    }
+
+    /// 设计 D5 最要命的一条:焦点在**本地栏**时按 `Delete`,绝不能去删远端
+    /// 文件。转投远端栏是一个看着「体贴」、后果不可逆的实现。
+    ///
+    /// 结构守护(`handle_panel_key` 要 `&mut App`,无头造不出来):断言那一段
+    /// 里确实有「不是远端栏就 return」这道闸。
+    #[test]
+    fn delete_and_rename_keys_do_nothing_while_the_local_column_has_focus() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let at = production
+            .find("WinitKey::Named(NamedKey::Delete) | WinitKey::Named(NamedKey::F2) => {")
+            .expect("找不到 Delete/F2 键的处理分支");
+        // 按大括号配平截出这一条 arm —— 从 `=> {` 起算,理由同
+        // `a_successful_write_triggers_a_refresh_so_the_list_is_not_stale`。
+        let rest = &production[at + production[at..].find("=> {").expect("arm 没有块体")..];
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let arm = &rest[..end];
+        assert!(
+            arm.len() < rest.len(),
+            "没截到 arm 的闭合大括号,下面的断言会退化成扫全文件"
+        );
+        assert!(
+            arm.contains("!= Some(crate::ui::files_panel::PanelColumn::Remote)")
+                && arm.contains("return;"),
+            "Delete/F2 的处理里没有「焦点不在远端栏就不动」这道闸 —— \
+             用户看着本地栏按 Delete 会删掉远端文件"
         );
     }
 

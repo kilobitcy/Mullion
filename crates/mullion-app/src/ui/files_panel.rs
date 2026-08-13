@@ -24,6 +24,94 @@ pub enum FileAction {
     Refresh,
     /// 切隐藏文件显示。
     ToggleHidden,
+    /// D2:请求**打开一个对话框**。真正的写操作要等用户在对话框里确认之后,
+    /// 由 `UiActions::files_op` 发出 —— 右键点一下就把远端文件删了这种事
+    /// 不该存在。
+    Ask(FileAsk),
+    /// D5:本地栏专属 —— 用系统文件管理器打开当前目录。
+    OpenInExplorer,
+    /// F52:把这一栏选中的东西传到对面那一栏(远端栏 = 下载,本地栏 = 上传)。
+    /// **方向由发起的栏决定**,不需要额外参数 —— 调用方本来就知道自己是哪栏。
+    Transfer,
+}
+
+/// 要打开哪个对话框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAsk {
+    /// 在当前目录里新建文件夹。**不需要选中任何东西**。
+    NewDir,
+    /// 重命名**光标行**(单目标)。
+    Rename,
+    /// 删除**选中集**(可多条)。
+    Delete,
+    /// 改**光标行**的权限(单目标)。
+    Chmod,
+}
+
+/// 右键菜单里的一项。抽成枚举(而不是直接在渲染里写按钮)是为了让
+/// 「哪些项该出现」能脱离 egui 单测 —— egui 的 `context_menu` 要一次
+/// 右键 + 一帧才展开,在测试里驱动它又脆又慢,而「本地栏不许出现删除」
+/// 恰恰是这一片最不能出错的一条。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    Ask(FileAsk),
+    OpenInExplorer,
+    Refresh,
+    Transfer,
+}
+
+/// 这一栏此刻该有哪些右键菜单项。
+///
+/// - `column`:远端栏才有写操作(设计 D5:本地文件管理外包给资源管理器)。
+/// - `has_cursor`:有没有光标行。没有就不给单目标操作 ——
+///   给一个点了没反应的菜单项比不给更让人困惑。
+pub fn menu_items_for(column: PanelColumn, has_cursor: bool) -> Vec<(&'static str, MenuItem)> {
+    let mut out: Vec<(&'static str, MenuItem)> = Vec::new();
+    if column == PanelColumn::Remote {
+        out.push(("新建文件夹…", MenuItem::Ask(FileAsk::NewDir)));
+        if has_cursor {
+            out.push(("下载到本地", MenuItem::Transfer));
+            out.push(("重命名…", MenuItem::Ask(FileAsk::Rename)));
+            out.push(("属性(权限)…", MenuItem::Ask(FileAsk::Chmod)));
+            out.push(("删除…", MenuItem::Ask(FileAsk::Delete)));
+        }
+    } else {
+        if has_cursor {
+            out.push(("上传到远端", MenuItem::Transfer));
+        }
+        out.push(("在资源管理器中打开", MenuItem::OpenInExplorer));
+    }
+    out.push(("刷新", MenuItem::Refresh));
+    out
+}
+
+impl MenuItem {
+    fn into_action(self) -> FileAction {
+        match self {
+            MenuItem::Ask(a) => FileAction::Ask(a),
+            MenuItem::OpenInExplorer => FileAction::OpenInExplorer,
+            MenuItem::Refresh => FileAction::Refresh,
+            MenuItem::Transfer => FileAction::Transfer,
+        }
+    }
+}
+
+/// 画一份右键菜单的内容。背景和每一行各挂一份(见 `show` 里的说明),
+/// 抽出来免得两处的菜单项悄悄长得不一样。
+fn menu_body(
+    ui: &mut Ui,
+    id: &str,
+    column: PanelColumn,
+    has_cursor: bool,
+    hit: &mut Option<MenuItem>,
+) {
+    annotate::mark(ui.ctx(), format!("文件面板/{id}/右键菜单"), ui.max_rect());
+    for (label, item) in menu_items_for(column, has_cursor) {
+        if ui.button(label).clicked() {
+            *hit = Some(item);
+            ui.close_menu();
+        }
+    }
 }
 
 /// 列宽。名称列吃掉剩余宽度,其余定宽 —— 定宽列一旦跟着内容浮动,
@@ -53,6 +141,11 @@ fn scroll_id_salt(id: &str, generation: u64) -> String {
 /// `generation`:调用方(`sidebar`/`content`)所属那个标签的世代号,只用来
 /// 拼 `ScrollArea` 的持久化 id(见 `scroll_id_salt`),不参与任何业务判断。
 ///
+/// `column`:这是远端栏还是本地栏。**只用来决定右键菜单里有哪些项**
+/// (D5:写操作只在远端栏)。不复用 `id` 那个字符串做判据 —— 拿显示用的
+/// 中文标签当权限开关,哪天有人把 `"远端"` 改成 `"服务器"`,本地栏就会
+/// 长出一个删除远端文件的菜单。
+///
 /// `focused`:F6/Tab 换焦点(设计 D23,代码复核挖出的可达性缺口)——这一栏
 /// 此刻是不是键盘真正落点的那一栏。`true` 才画边框,调用方(`sidebar`/
 /// `content`)已经把「面板本身有没有键盘焦点」与「`active_column` 是不是
@@ -63,6 +156,7 @@ pub fn show(
     t: &Theme,
     id: &str,
     generation: u64,
+    column: PanelColumn,
     state: &mut PaneState,
     show_owner: bool,
     focused: bool,
@@ -78,6 +172,25 @@ pub fn show(
             egui::Rounding::same(4.0),
             egui::Stroke::new(2.0, theme::c32(t.accent)),
         );
+    }
+
+    // 整栏背景的右键菜单:空白处右键也要能「新建文件夹」/「刷新」——
+    // 那是用户在一个空目录里唯一的入口。
+    //
+    // **必须注册在所有内容之前**:egui 同层内后注册的部件压在先注册的上面,
+    // 挂到栏尾会把整栏罩住,书签按钮和行的左键点击全被它吃掉
+    // (`clicking_a_bookmark_dispatches_goto_to_its_path` 逮到过这一版)。
+    let mut menu_hit = None;
+    ui.interact(
+        ui.max_rect(),
+        ui.id().with(("files-bg-menu", id, generation)),
+        egui::Sense::click(),
+    )
+    .context_menu(|ui| menu_body(ui, id, column, state.cursor.is_some(), &mut menu_hit));
+    // 就地收口,不留到函数末尾 —— 下面 `Load` 不是 `Ready` 时会提前 return,
+    // 挂在末尾的话「正在读取目录…」时右键点刷新没反应。
+    if let Some(item) = menu_hit.take() {
+        action = Some(item.into_action());
     }
 
     // 路径条 + 上级 + 刷新。
@@ -143,7 +256,10 @@ pub fn show(
     // `rows` 借着 `&state.entries` 不放(它是 `Vec<&Entry>`),闭包里不能再
     // 借一次 `&mut state`——新选中的那条先记局部变量,出了闭包再落回 `state`。
     let selected = state.selected.clone();
-    let mut clicked = None;
+    /// 点中的那一条 + 当时按着的修饰键(ctrl, shift)。F54 的多选语义在
+    /// `PaneState::click_row` 里,这里只负责把「点了什么、按着什么」带出闭包。
+    type Click = (mullion_ssh::sftp::RemotePath, bool, bool);
+    let mut clicked: Option<Click> = None;
     let mut goto = None;
     egui::ScrollArea::vertical()
         .id_salt(scroll_id_salt(id, generation))
@@ -151,10 +267,23 @@ pub fn show(
         .show_rows(ui, ROW_H, rows.len(), |ui, range| {
             for ix in range {
                 let e = rows[ix];
-                let resp = row(ui, t, e, show_owner, selected.as_ref() == Some(&e.name));
+                let resp = row(ui, t, e, show_owner, selected.contains(&e.name));
                 if resp.clicked() {
-                    clicked = Some(e.name.clone());
+                    // `command` 而不是 `ctrl`:egui 已经把 macOS 的 ⌘ 归一化
+                    // 到这一位上,写 `ctrl` 会让 macOS 用户点不出多选。
+                    let m = ui.input(|i| i.modifiers);
+                    clicked = Some((e.name.clone(), m.command, m.shift));
                 }
+                if resp.secondary_clicked() && !selected.contains(&e.name) {
+                    // 右键点到一条**没选中**的行:先让它成为唯一选中项。
+                    // 不这么做的话,菜单里的「删除…」删的是别处那批选中项,
+                    // 而用户以为删的是他右键的这一条 —— 而删除不可逆。
+                    clicked = Some((e.name.clone(), false, false));
+                }
+                // 行自己也挂一份菜单:行是后注册的,压在背景那份上面,
+                // 右键落在行上时背景那份收不到(见函数开头的 z 序说明)。
+                // `has_cursor` 直接给 `true` —— 右键这一下已经保证有目标行了。
+                resp.context_menu(|ui| menu_body(ui, id, column, true, &mut menu_hit));
                 if resp.double_clicked() {
                     if let Some(target) = state.enter_target(e) {
                         goto = Some(target);
@@ -162,11 +291,14 @@ pub fn show(
                 }
             }
         });
-    if let Some(name) = clicked {
-        state.selected = Some(name);
+    if let Some((name, ctrl, shift)) = clicked {
+        state.click_row(&name, ctrl, shift);
     }
     if let Some(g) = goto {
         action = Some(FileAction::Goto(g));
+    }
+    if let Some(item) = menu_hit {
+        action = Some(item.into_action());
     }
     action
 }
@@ -432,6 +564,7 @@ pub fn sidebar(
                     t,
                     "远端",
                     generation,
+                    PanelColumn::Remote,
                     &mut frame.remote,
                     frame.show_owner,
                     panel_focused && frame.active_column == PanelColumn::Remote,
@@ -444,6 +577,7 @@ pub fn sidebar(
                 t,
                 "本地",
                 generation,
+                PanelColumn::Local,
                 &mut frame.local,
                 false,
                 panel_focused && frame.active_column == PanelColumn::Local,
@@ -508,6 +642,7 @@ pub fn content(
                         t,
                         "远端",
                         generation,
+                        PanelColumn::Remote,
                         &mut frame.remote,
                         frame.show_owner,
                         panel_focused && frame.active_column == PanelColumn::Remote,
@@ -523,6 +658,7 @@ pub fn content(
                             t,
                             "本地",
                             generation,
+                            PanelColumn::Local,
                             &mut frame.local,
                             false,
                             panel_focused && frame.active_column == PanelColumn::Local,
@@ -591,6 +727,39 @@ mod tests {
     /// 实际画出的 range 交给调用方(它内部算完直接喂进 `add_contents`,
     /// 外部拿不到),没法从渲染结果反推「到底画了几行」。改成断言源码里
     /// 用的是 `show_rows` 而不是 `show`——只要这一行还在,虚拟滚动就还在。
+    /// F52:两栏各有一个传输入口,方向由栏决定。同时守住 D5 —— 本地栏
+    /// 永远不出现远端写操作(加入口时最容易顺手把整套菜单抄过去)。
+    #[test]
+    fn both_columns_offer_a_transfer_entry_but_only_the_remote_one_can_write() {
+        let remote = menu_items_for(PanelColumn::Remote, true);
+        let local = menu_items_for(PanelColumn::Local, true);
+        assert!(
+            remote.iter().any(|(l, _)| *l == "下载到本地"),
+            "远端栏该有下载:{remote:?}"
+        );
+        assert!(
+            local.iter().any(|(l, _)| *l == "上传到远端"),
+            "本地栏该有上传:{local:?}"
+        );
+        assert!(
+            !local.iter().any(|(_, m)| matches!(m, MenuItem::Ask(_))),
+            "本地栏冒出了远端写操作(D5):{local:?}"
+        );
+    }
+
+    /// 没有光标行时不给传输入口 —— 点了没反应的菜单项比没有更让人困惑
+    /// (与 `重命名…`/`删除…` 同一条口径)。
+    #[test]
+    fn no_cursor_means_no_transfer_entry_at_all() {
+        for column in [PanelColumn::Remote, PanelColumn::Local] {
+            let items = menu_items_for(column, false);
+            assert!(
+                !items.iter().any(|(_, m)| *m == MenuItem::Transfer),
+                "{column:?} 栏在没有光标行时给出了传输入口:{items:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_huge_directory_is_rendered_with_show_rows_not_a_full_scan() {
         // `include_str!` 把这份测试代码自身也读了进来 —— 断言字符串若直接
@@ -622,7 +791,17 @@ mod tests {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, "远端", 1, state, false, false, &[]);
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        false,
+                        &[],
+                    );
                 });
             });
             for shape in out.shapes.iter() {
@@ -774,7 +953,17 @@ mod tests {
             for _ in 0..2 {
                 let out = ctx.run(egui::RawInput::default(), |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        show(ui, &t, "远端", 1, &mut state, false, focused, &[]);
+                        show(
+                            ui,
+                            &t,
+                            "远端",
+                            1,
+                            PanelColumn::Remote,
+                            &mut state,
+                            false,
+                            focused,
+                            &[],
+                        );
                     });
                 });
                 n = count_stroked_rects(&out.shapes, accent);
@@ -876,12 +1065,32 @@ mod tests {
         // 先跑一帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop)。
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &t, "远端", 1, &mut state, false, false, &bookmarks);
+                show(
+                    ui,
+                    &t,
+                    "远端",
+                    1,
+                    PanelColumn::Remote,
+                    &mut state,
+                    false,
+                    false,
+                    &bookmarks,
+                );
             });
         });
         let out = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                show(ui, &t, "远端", 1, &mut state, false, false, &bookmarks);
+                show(
+                    ui,
+                    &t,
+                    "远端",
+                    1,
+                    PanelColumn::Remote,
+                    &mut state,
+                    false,
+                    false,
+                    &bookmarks,
+                );
             });
         });
         let pos = find_text_pos(&out.shapes, "日志").expect("书签「日志」没画出来");
@@ -902,7 +1111,17 @@ mod tests {
         let mut action = None;
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                action = show(ui, &t, "远端", 1, &mut state, false, false, &bookmarks);
+                action = show(
+                    ui,
+                    &t,
+                    "远端",
+                    1,
+                    PanelColumn::Remote,
+                    &mut state,
+                    false,
+                    false,
+                    &bookmarks,
+                );
             });
         });
         assert_eq!(
@@ -931,7 +1150,17 @@ mod tests {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, "远端", 1, &mut state, false, false, &bookmarks);
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        false,
+                        &bookmarks,
+                    );
                 });
             });
             for shape in out.shapes.iter() {
@@ -980,5 +1209,124 @@ mod tests {
         }
         let count = texts.iter().filter(|s| s.contains("日志")).count();
         assert_eq!(count, 1, "书签「日志」该只出现在远端栏一次,实际: {texts:?}");
+    }
+
+    /// D5:**本地栏没有写操作入口**。菜单项的存在与否是纯结构的事,
+    /// 用 `menu_items_for` 这个纯函数验,不必真去点开右键菜单
+    /// (egui 的 `context_menu` 要一次右键 + 一帧才展开,测起来又脆又慢)。
+    #[test]
+    fn the_local_column_never_offers_a_write_operation() {
+        let remote = menu_items_for(PanelColumn::Remote, true);
+        let local = menu_items_for(PanelColumn::Local, true);
+        for ask in [
+            FileAsk::NewDir,
+            FileAsk::Rename,
+            FileAsk::Delete,
+            FileAsk::Chmod,
+        ] {
+            assert!(
+                remote.iter().any(|(_, a)| *a == MenuItem::Ask(ask)),
+                "远端栏该有 {ask:?}"
+            );
+            assert!(
+                !local.iter().any(|(_, a)| *a == MenuItem::Ask(ask)),
+                "本地栏不该出现 {ask:?}(D5:本地文件管理外包给资源管理器)"
+            );
+        }
+        assert!(
+            local.iter().any(|(_, a)| *a == MenuItem::OpenInExplorer),
+            "本地栏该有「在资源管理器中打开」"
+        );
+    }
+
+    /// 没有光标行时,单目标操作(重命名 / 改权限 / 删除)必须不可用 ——
+    /// 给一个「点了没反应」的菜单项比不给更让人困惑。
+    #[test]
+    fn single_target_operations_are_absent_without_a_cursor_row() {
+        let items = menu_items_for(PanelColumn::Remote, false);
+        for ask in [FileAsk::Rename, FileAsk::Chmod, FileAsk::Delete] {
+            assert!(
+                !items.iter().any(|(_, a)| *a == MenuItem::Ask(ask)),
+                "没有光标行时不该出现 {ask:?}"
+            );
+        }
+        // 「新建文件夹」不需要选中任何东西 —— 空目录里也得能建。
+        assert!(items
+            .iter()
+            .any(|(_, a)| *a == MenuItem::Ask(FileAsk::NewDir)));
+    }
+
+    /// 右键菜单要真的挂上去、真的能发出动作 —— `menu_items_for` 全对但
+    /// 渲染里没接线,上面两条纯函数测试照样全绿。
+    #[test]
+    fn right_clicking_the_remote_column_opens_a_menu_that_can_dispatch_an_ask() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState| {
+            let mut action = None;
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        false,
+                        &[],
+                    );
+                });
+            });
+            (action, out)
+        };
+        // 两帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop)。
+        let _ = render(egui::RawInput::default(), &mut state);
+        let _ = render(egui::RawInput::default(), &mut state);
+
+        // 在面板中部右键 → 菜单展开。
+        let pos = egui::pos2(200.0, 200.0);
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let _ = render(input, &mut state);
+        let (_, out) = render(egui::RawInput::default(), &mut state);
+        let target =
+            find_text_pos(&out.shapes, "新建文件夹").expect("右键之后菜单里该有「新建文件夹…」");
+
+        // 点它 → 发出 Ask(NewDir)。
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let (action, _) = render(input, &mut state);
+        assert_eq!(
+            action,
+            Some(FileAction::Ask(FileAsk::NewDir)),
+            "点菜单里的「新建文件夹…」该发出 Ask(NewDir)"
+        );
     }
 }

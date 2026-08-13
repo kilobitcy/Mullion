@@ -55,7 +55,7 @@ fn tree() -> Tree {
 
 #[tokio::test]
 async fn listing_a_directory_returns_kinds_sizes_and_link_targets() {
-    let (addr, _probe) = common::spawn_sftp_server(tree()).await;
+    let (addr, _probe, _tree) = common::spawn_sftp_server(tree()).await;
     let conn = Arc::new(
         establish(&cfg(addr), Arc::new(AcceptAll))
             .await
@@ -102,7 +102,7 @@ async fn a_utf8_chinese_directory_is_requested_byte_for_byte() {
         "/home/testuser/文档".as_bytes().to_vec(),
         vec![Node::file(b"x", 1)],
     );
-    let (addr, probe) = common::spawn_sftp_server(t).await;
+    let (addr, probe, _tree) = common::spawn_sftp_server(t).await;
     let conn = Arc::new(
         establish(&cfg(addr), Arc::new(AcceptAll))
             .await
@@ -136,7 +136,7 @@ async fn a_utf8_chinese_directory_is_requested_byte_for_byte() {
 ///    字节的协议库)。
 #[tokio::test]
 async fn a_non_utf8_name_is_listed_but_no_request_is_ever_sent_for_it() {
-    let (addr, probe) = common::spawn_sftp_server(tree()).await;
+    let (addr, probe, _tree) = common::spawn_sftp_server(tree()).await;
     let conn = Arc::new(
         establish(&cfg(addr), Arc::new(AcceptAll))
             .await
@@ -194,7 +194,7 @@ async fn a_non_utf8_name_is_listed_but_no_request_is_ever_sent_for_it() {
 /// `.` 要能解析成登录目录 —— 默认远端目录留空时走的就是这条(D15)。
 #[tokio::test]
 async fn a_dot_path_canonicalizes_to_the_login_directory() {
-    let (addr, _probe) = common::spawn_sftp_server(tree()).await;
+    let (addr, _probe, _tree) = common::spawn_sftp_server(tree()).await;
     let conn = Arc::new(
         establish(&cfg(addr), Arc::new(AcceptAll))
             .await
@@ -214,7 +214,7 @@ async fn a_dot_path_canonicalizes_to_the_login_directory() {
 /// `PermitTTY no` 环境下会直接被拒。
 #[tokio::test]
 async fn opening_sftp_never_requests_a_pty() {
-    let (addr, probe) = common::spawn_sftp_server(tree()).await;
+    let (addr, probe, _tree) = common::spawn_sftp_server(tree()).await;
     let conn = Arc::new(
         establish(&cfg(addr), Arc::new(AcceptAll))
             .await
@@ -236,7 +236,7 @@ async fn opening_sftp_never_requests_a_pty() {
 /// 开第二个不需要任何网络参数(签名里就没有)。
 #[tokio::test]
 async fn a_second_sftp_client_reuses_the_same_connection() {
-    let (addr, _probe) = common::spawn_sftp_server(tree()).await;
+    let (addr, _probe, _tree) = common::spawn_sftp_server(tree()).await;
     let conn = Arc::new(
         establish(&cfg(addr), Arc::new(AcceptAll))
             .await
@@ -264,7 +264,7 @@ async fn a_second_sftp_client_reuses_the_same_connection() {
 /// 变红——那是提醒改测试意图,不是提醒删掉它。
 #[tokio::test]
 async fn a_full_browse_session_never_sends_a_single_write_request() {
-    let (addr, probe) = common::spawn_sftp_server(tree()).await;
+    let (addr, probe, _tree) = common::spawn_sftp_server(tree()).await;
     let conn = Arc::new(
         establish(&cfg(addr), Arc::new(AcceptAll))
             .await

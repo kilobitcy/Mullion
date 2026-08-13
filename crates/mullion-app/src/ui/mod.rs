@@ -2,6 +2,7 @@
 pub mod annotate;
 pub mod badge;
 pub mod chrome;
+pub mod files_dialog;
 pub mod files_panel;
 pub mod group_manager;
 pub mod host_key;
@@ -13,6 +14,7 @@ pub mod paste;
 pub mod session_manager;
 pub mod toast;
 pub mod toolbar;
+pub mod transfer_panel;
 
 use std::sync::Arc;
 
@@ -241,6 +243,18 @@ pub struct UiState {
     /// 「还没拖过」的哨兵,真正的默认宽度由 `files_panel::sidebar` 在
     /// `0.0` 时代入,见那里的注释。
     pub files_sidebar_w: f32,
+    /// D2:远端写操作的对话框状态。`None` = 没开。
+    ///
+    /// 挂在 `UiState` 而不是 `PanelFrame` 上:对话框是**全局模态**,同一时刻
+    /// 只该有一个,而 `PanelFrame` 每个标签一份。放进 `PanelFrame` 的话,
+    /// 切个标签就会冒出另一个删除确认框。
+    pub files_dialog: Option<files_dialog::FilesDialog>,
+    /// F55:传输队列面板是不是折叠着。
+    ///
+    /// **语义取反成「展开」**,为的是 `Default` 能给出想要的默认值:
+    /// `#[derive(Default)]` 只会给 `false`,而默认状态应当是折叠(一行摘要)——
+    /// 传输是后台事,不该一入队就把终端挤掉六行。
+    pub transfer_expanded: bool,
 }
 
 impl UiState {
@@ -336,6 +350,14 @@ pub struct UiFrame<'a> {
 /// 逐字段枚举的。新增字段时**必须**同步那处判断,否则新动作会在 discard 趟被静默丢弃。
 #[derive(Default)]
 pub struct UiActions {
+    /// D2:用户在对话框里**确认**了的远端写操作。到这一步没有回头路,
+    /// `app.rs` 收到就直接发请求。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话这个动作会在
+    /// egui 的 discard 趟被静默吃掉,而且默认没有任何测试会变红。
+    pub files_op: Option<files_dialog::FileOp>,
+    /// F55:底部传输队列面板上按下的东西(取消 / 全部取消 / 清除已完成)。
+    pub transfer: Option<transfer_panel::TransferUiAction>,
     /// 点了工具栏上的某个布局预设。
     pub preset: Option<crate::shell::workspace::Preset>,
     /// 点了某个 pane 标题条上的 ×。
@@ -362,6 +384,10 @@ pub struct UiActions {
 /// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
 /// 各 pane 标题条(F83)、弹窗,之后把中央区剩余尺寸写回 `central_px`。
 /// 返回本帧的布局动作。
+///
+/// 参数多是因为它是整个 UI 的唯一入口:每个参数都是一块互斥的、必须由调用方
+/// 算好的帧状态,打包成结构体只是把「谁该填什么」从类型系统挪进文档。
+#[allow(clippy::too_many_arguments)]
 pub fn build_ui(
     ctx: &egui::Context,
     t: &crate::theme::Theme,
@@ -386,6 +412,9 @@ pub fn build_ui(
     // `u64` 而不是 `Option<u64>`——靠类型系统强制每个调用点都得算好它,
     // 不是靠测试兜底。
     files_generation: u64,
+    // F55:传输队列。只读 —— 面板只把用户按的东西回报成 `UiActions::transfer`,
+    // 队列本身由 `app.rs` 改(改动要和取消旗标一起做,分两处必然错位)。
+    queue: &crate::files::queue::Queue,
 ) -> UiActions {
     let mut actions = UiActions::default();
     // 主机密钥确认最先画:它是安全关口,任何时候都该盖在最上层(F3)。
@@ -484,9 +513,17 @@ pub fn build_ui(
     if ui_state.group_manager_open {
         group_manager::show(ctx, ui_state, frame.groups);
     }
+    // D2:远端写操作确认框。排在会话管理器/分组管理器之后 —— 它是从文件
+    // 面板发起的模态,该盖在别的窗口上;排在 toast 之前 —— 操作反馈永远
+    // 在最上面(走查 13)。
+    actions.files_op = files_dialog::show(ctx, t, &mut ui_state.files_dialog);
     // 走查 13:操作反馈飘在所有弹窗之上 —— 保存成功的那条 toast 要在会话
     // 管理器还开着的时候就能看见,不然用户根本不知道刚才那一下有没有生效。
     toast::show(ctx, t, &mut ui_state.pending_toast, &mut ui_state.toast);
+    // F55:传输队列面板。**排在状态栏之后 show** —— `TopBottomPanel` 按 show
+    // 的先后从窗口边缘往里堆,于是它落在状态栏**上方**(设计要的位置);
+    // 又排在下面的 `CentralPanel` 之前,不然它拿不到空间分配。
+    actions.transfer = transfer_panel::show(ctx, t, queue, &mut ui_state.transfer_expanded);
     // D1:标签宿主的文件面板——`CentralPanel`,egui 的 Panel 空间分配规则
     // 决定了它必须是本帧**最后一个** panel 类部件(见 `files_panel::content`
     // 文档),所以放在这里:菜单栏/标签栏/状态栏/各弹窗都已经 show 完。
@@ -717,6 +754,9 @@ mod tests {
                 // scroll_id_salt_differs_by_generation`,直接测抽出来的纯
                 // 函数,不需要走这整条 `build_ui` 管线)。随便给一个固定值。
                 0,
+                // F55:这批既有测试都不涉及传输队列,给一个空队列 ——
+                // 队列空时 `transfer_panel::show` 直接不画,对它们是 no-op。
+                &crate::files::queue::Queue::new(4),
             );
         });
         (out, actions)
@@ -743,6 +783,8 @@ mod tests {
                 files_content.as_deref_mut(),
                 // 同 `run_frame`:这批测试不关心具体世代号。
                 0,
+                // 同 `run_frame`:空队列 = 不画传输面板。
+                &crate::files::queue::Queue::new(4),
             );
         });
         (out, actions)
@@ -787,6 +829,41 @@ mod tests {
             walk(&cs.shape, &mut text);
         }
         text
+    }
+
+    /// F55:队列非空时,传输面板必须真的挂进 `build_ui` —— 面板文件自己的
+    /// 测试只证明它「画得对」,证明不了「它被画了」。删掉 `build_ui` 里那行
+    /// `actions.transfer = transfer_panel::show(...)`,这条会红。
+    #[test]
+    fn a_non_empty_transfer_queue_is_actually_drawn_by_build_ui() {
+        let mut queue = crate::files::queue::Queue::new(4);
+        queue.push(crate::files::queue::NewJob {
+            dir: crate::files::queue::Direction::Upload,
+            generation: 1,
+            label: "报告.pdf".into(),
+            total: 100,
+        });
+        queue.take_runnable();
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut out = None;
+        // 两帧:`TopBottomPanel` 首帧 `fade_in` 只记 `Shape::Noop`。
+        for _ in 0..2 {
+            out = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                build_ui(
+                    ctx,
+                    &crate::theme::MULLION_DARK,
+                    &mut ui_state,
+                    base_frame(),
+                    None,
+                    None,
+                    0,
+                    &queue,
+                );
+            }));
+        }
+        let text = collect_text(&out.expect("上面刚跑过两帧"));
+        assert!(text.contains("传输"), "传输面板没被画出来:{text}");
     }
 
     fn title_view(host: &str) -> crate::ui::pane_title::TitleView<'_> {

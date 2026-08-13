@@ -24,14 +24,26 @@ pub struct PaneState {
     pub sort_key: SortKey,
     pub sort_dir: SortDir,
     pub show_hidden: bool,
-    /// 选中的是**哪一条**,不是「第几行」。
+    /// **选中集**(F54 多选)。存的是身份(`RemotePath`)不是下标。
     ///
     /// 存下标会错行:点一次列头 `entries` 就重排了,`show_hidden` 一切
-    /// 过滤结果也变了,下标却纹丝不动 —— 高亮会跳到另一个文件上。本切片
-    /// 只是看着别扭,等操作接到选中项上就是**对错文件下手**。
-    /// 存身份则天然自愈:那一条没了(被过滤掉、或刷新后不在了),
-    /// 找不到匹配即为「没选中」。
-    pub selected: Option<RemotePath>,
+    /// 过滤结果也变了,下标却纹丝不动 —— 高亮会跳到另一个文件上。D1 时
+    /// 只是看着别扭,D2 起操作真的接到选中项上,错行就是**对错文件下手**,
+    /// 而删除不可逆。存身份则天然自愈:那一条没了,匹配不上即为没选中。
+    ///
+    /// 用 `BTreeSet` 不是 `Vec`:去重是硬需求(Ctrl 点两次同一条),
+    /// 而 `RemotePath` 的 `Ord` 是字节序、正好够当集合键。
+    /// **集合里的顺序无意义** —— 要按可见行序拿,用 [`PaneState::selected_paths`]。
+    pub selected: std::collections::BTreeSet<RemotePath>,
+    /// 光标行:`↑`/`↓` 移动的那一条,也是**单目标**操作(重命名、改权限)
+    /// 的对象。
+    ///
+    /// 与 `selected` 分开是必须的 —— 多选了 5 条时「重命名」该改哪一条
+    /// 没有答案,界面上就得有一条明确的「当前行」。
+    pub cursor: Option<RemotePath>,
+    /// `Shift` 范围选择的起点。平点 / Ctrl 点会把它挪到点中那条;
+    /// Shift 点**不挪**(否则连续 Shift 点会变成一段一段接龙)。
+    pub anchor: Option<RemotePath>,
     /// 每发一次请求 +1。异步结果回来时对不上就丢弃 ——
     /// 用户点得比网络快时,后发先至的旧结果会把新目录顶掉。
     pub request_seq: u64,
@@ -46,7 +58,9 @@ impl PaneState {
             sort_key: SortKey::Name,
             sort_dir: SortDir::Asc,
             show_hidden: false,
-            selected: None,
+            selected: std::collections::BTreeSet::new(),
+            cursor: None,
+            anchor: None,
             request_seq: 0,
         }
     }
@@ -56,7 +70,7 @@ impl PaneState {
     pub fn begin_load(&mut self, cwd: RemotePath) -> u64 {
         self.cwd = cwd;
         self.load = Load::Loading;
-        self.selected = None;
+        self.clear_selection();
         self.request_seq += 1;
         self.request_seq
     }
@@ -71,6 +85,10 @@ impl PaneState {
                 super::sort(&mut v, self.sort_key, self.sort_dir);
                 self.entries = v;
                 self.load = Load::Ready;
+                // 刷新后已经不存在的条目要从选择集里剔掉 —— 留着的话,
+                // 删除确认框会列出远端已经没有的路径,用户点确认后收到
+                // 一条 NoSuchFile,完全不知道自己删的是什么。
+                self.prune_selection();
             }
             Err(msg) => {
                 self.entries.clear();
@@ -122,6 +140,113 @@ impl PaneState {
             _ => None,
         }
     }
+
+    /// 清空选择集、光标与锚点。换目录时必须**整套**清 —— 只清一部分的话,
+    /// 新目录里同名的文件会凭空带着上一个目录的选中态,而删除不可逆。
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.cursor = None;
+        self.anchor = None;
+    }
+
+    /// 把已经不在 `entries` 里的选中项 / 光标 / 锚点剔掉。
+    fn prune_selection(&mut self) {
+        let alive: std::collections::BTreeSet<&RemotePath> =
+            self.entries.iter().map(|e| &e.name).collect();
+        self.selected.retain(|p| alive.contains(p));
+        if self.cursor.as_ref().is_some_and(|p| !alive.contains(p)) {
+            self.cursor = None;
+        }
+        if self.anchor.as_ref().is_some_and(|p| !alive.contains(p)) {
+            self.anchor = None;
+        }
+    }
+
+    /// 某一行是不是选中的。渲染每行都要问一次,所以是集合查找不是线性扫。
+    pub fn is_selected(&self, name: &RemotePath) -> bool {
+        self.selected.contains(name)
+    }
+
+    /// 选中项,**按当前可见行序**给出。
+    ///
+    /// 删除确认框列路径、将来的批量下载排队都用它 —— 用户看到的顺序和
+    /// 我们处理的顺序一致,对账才对得上。
+    pub fn selected_paths(&self) -> Vec<RemotePath> {
+        self.rows()
+            .into_iter()
+            .filter(|e| self.selected.contains(&e.name))
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    /// 操作目标:**选中集非空就是选中集,否则退化成光标那一条**(都按可见
+    /// 行序)。F52 的传输入口用它。
+    ///
+    /// 这条「没选中就当选了光标行」的退化语义与 `FileAsk::Delete` 一致
+    /// (见 `App::open_files_dialog`)——用户右键一条没选中的行、或者用键盘
+    /// 移到某行直接发起操作时,想要的就是那一条;弹一个「没有选中任何条目」
+    /// 只会让人以为程序坏了。
+    ///
+    /// 返回的是 `Entry` 而不是路径:传输要的不只是名字,还要 `kind`(目录得
+    /// 递归展开)和 `size`(进度条的分母)。
+    pub fn picked_entries(&self) -> Vec<&Entry> {
+        let picked: Vec<RemotePath> = if self.selected.is_empty() {
+            self.cursor.iter().cloned().collect()
+        } else {
+            self.selected_paths()
+        };
+        self.rows()
+            .into_iter()
+            .filter(|e| picked.contains(&e.name))
+            .collect()
+    }
+
+    /// 点了一行。`ctrl` = 切换单条,`shift` = 从锚点到这里的闭区间,
+    /// 都不按 = 只选这一条。
+    ///
+    /// **范围按可见行序算**(`rows()`),不是 `entries` 的存储序:点过列头
+    /// 重排、或关着隐藏文件时,用户说的「从这儿到那儿」指的是他眼里看到
+    /// 的那一段。按存储序算会把一条他从没见过的 `.env` 选进删除列表。
+    pub fn click_row(&mut self, name: &RemotePath, ctrl: bool, shift: bool) {
+        if shift {
+            let Some(anchor) = self.anchor.clone() else {
+                self.select_only(name);
+                return;
+            };
+            let order: Vec<RemotePath> = self.rows().into_iter().map(|e| e.name.clone()).collect();
+            let (Some(a), Some(b)) = (
+                order.iter().position(|p| *p == anchor),
+                order.iter().position(|p| p == name),
+            ) else {
+                // 锚点已经不在可见行里(被过滤掉 / 刷新后没了)——
+                // 退化成平点,不猜用户想选哪一段。
+                self.select_only(name);
+                return;
+            };
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            self.selected = order[lo..=hi].iter().cloned().collect();
+            self.cursor = Some(name.clone());
+            // 锚点**不动** —— 动了的话连续 Shift 点会变成一段接一段。
+            return;
+        }
+        if ctrl {
+            if !self.selected.remove(name) {
+                self.selected.insert(name.clone());
+            }
+            self.cursor = Some(name.clone());
+            self.anchor = Some(name.clone());
+            return;
+        }
+        self.select_only(name);
+    }
+
+    /// 只选这一条,光标与锚点都落到它上面。
+    pub fn select_only(&mut self, name: &RemotePath) {
+        self.selected.clear();
+        self.selected.insert(name.clone());
+        self.cursor = Some(name.clone());
+        self.anchor = Some(name.clone());
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +268,49 @@ mod tests {
 
     fn state() -> PaneState {
         PaneState::new(RemotePath::from_bytes(b"/home/u".to_vec()))
+    }
+
+    /// F52:没选中任何东西时,操作目标退化成光标那一条 —— 右键一条没选中的
+    /// 行就发起传输是最常见的用法,这里空手而归的话菜单点了等于没点。
+    #[test]
+    fn nothing_selected_means_the_cursor_row_is_the_target() {
+        let mut s = state();
+        s.accept(
+            s.request_seq,
+            Ok(vec![
+                e("a.txt", EntryKind::File),
+                e("b.txt", EntryKind::File),
+            ]),
+        );
+        s.cursor = Some(RemotePath::from_bytes(b"b.txt".to_vec()));
+        let picked = s.picked_entries();
+        assert_eq!(picked.len(), 1, "该退化成光标那一条:{picked:?}");
+        assert_eq!(picked[0].name.display(), "b.txt");
+    }
+
+    /// 有选中集时**光标不额外算一条** —— 否则用户选了 3 个、光标停在第 4 个
+    /// 上,会莫名其妙传 4 个文件。
+    #[test]
+    fn a_selection_wins_over_the_cursor_so_nothing_extra_is_transferred() {
+        let mut s = state();
+        s.accept(
+            s.request_seq,
+            Ok(vec![
+                e("a.txt", EntryKind::File),
+                e("b.txt", EntryKind::File),
+                e("c.txt", EntryKind::File),
+            ]),
+        );
+        s.selected = [RemotePath::from_bytes(b"a.txt".to_vec())]
+            .into_iter()
+            .collect();
+        s.cursor = Some(RemotePath::from_bytes(b"c.txt".to_vec()));
+        let names: Vec<String> = s
+            .picked_entries()
+            .iter()
+            .map(|e| e.name.display().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.txt".to_string()], "光标那条被多算了进来");
     }
 
     /// 用户点得比网络快时,**后发先至的旧结果必须被丢掉** ——
@@ -228,7 +396,7 @@ mod tests {
         s.entries = vec![e("a.txt", EntryKind::File), e("z.txt", EntryKind::File)];
         s.load = Load::Ready;
         let picked = s.entries[0].name.clone(); // a.txt,此刻在第 0 行
-        s.selected = Some(picked.clone());
+        s.select_only(&picked);
         assert_eq!(s.rows()[0].name, picked);
 
         s.click_header(SortKey::Name); // 同一列再点 → 翻成降序
@@ -238,11 +406,124 @@ mod tests {
             picked,
             "前提:重排确实把它挪到了另一行,否则这条测试什么也没守到"
         );
-        assert_eq!(
-            s.selected.as_ref(),
-            Some(&picked),
-            "选中跟着文件走,不跟着行号走"
+        assert!(s.is_selected(&picked), "选中跟着文件走,不跟着行号走");
+    }
+
+    fn ready(names: &[&str]) -> PaneState {
+        let mut s = state();
+        s.entries = names.iter().map(|n| e(n, EntryKind::File)).collect();
+        s.load = Load::Ready;
+        s
+    }
+
+    fn rp(name: &str) -> RemotePath {
+        RemotePath::from_bytes(name.as_bytes().to_vec())
+    }
+
+    /// 平点一行:清空原有选择,只留这一条,光标与锚点都落到它上面。
+    #[test]
+    fn a_plain_click_selects_exactly_one_row() {
+        let mut s = ready(&["a", "b", "c"]);
+        s.click_row(&rp("a"), false, false);
+        s.click_row(&rp("c"), false, false);
+        assert_eq!(s.selected_paths(), vec![rp("c")], "平点该只剩最后点的那条");
+        assert_eq!(s.cursor.as_ref(), Some(&rp("c")));
+        assert_eq!(s.anchor.as_ref(), Some(&rp("c")));
+    }
+
+    /// Ctrl 点:切换那一条的选中态,其余不动。
+    #[test]
+    fn a_ctrl_click_toggles_one_row_without_clearing_the_rest() {
+        let mut s = ready(&["a", "b", "c"]);
+        s.click_row(&rp("a"), false, false);
+        s.click_row(&rp("c"), true, false);
+        assert_eq!(s.selected_paths(), vec![rp("a"), rp("c")]);
+        // 再 Ctrl 点一次 c 应当取消它
+        s.click_row(&rp("c"), true, false);
+        assert_eq!(s.selected_paths(), vec![rp("a")]);
+    }
+
+    /// Shift 点:从锚点到这一条**闭区间**全选,按当前**可见行序**算 ——
+    /// 不是按 `entries` 的存储顺序,也不是按字节序。
+    #[test]
+    fn a_shift_click_selects_the_inclusive_visible_range() {
+        let mut s = ready(&["a", "b", "c", "d"]);
+        s.click_row(&rp("b"), false, false); // 锚点 = b
+        s.click_row(&rp("d"), false, true);
+        assert_eq!(s.selected_paths(), vec![rp("b"), rp("c"), rp("d")]);
+        assert_eq!(s.anchor.as_ref(), Some(&rp("b")), "Shift 不该挪动锚点");
+        assert_eq!(s.cursor.as_ref(), Some(&rp("d")), "光标跟着走");
+    }
+
+    /// 反向 Shift(从下往上点)同样是闭区间。
+    #[test]
+    fn a_backwards_shift_click_selects_the_same_range() {
+        let mut s = ready(&["a", "b", "c", "d"]);
+        s.click_row(&rp("d"), false, false);
+        s.click_row(&rp("b"), false, true);
+        assert_eq!(s.selected_paths(), vec![rp("b"), rp("c"), rp("d")]);
+    }
+
+    /// 隐藏文件被过滤掉时,Shift 范围**不该把看不见的那条也选上** ——
+    /// 用户选的是他看得见的那一段,删除确认框里冒出一条他从没见过的
+    /// `.env` 是最坏的一种意外。
+    #[test]
+    fn a_shift_range_never_picks_up_rows_that_are_filtered_out() {
+        let mut s = state();
+        // 存储序里 `.secret` 夹在 a 与 c 中间 —— 按存储序算范围就会选中它。
+        s.entries = vec![
+            e("a", EntryKind::File),
+            e(".secret", EntryKind::File),
+            e("c", EntryKind::File),
+        ];
+        s.load = Load::Ready;
+        s.show_hidden = false;
+        assert_eq!(s.rows().len(), 2, "前提:隐藏项确实被过滤掉了");
+
+        s.click_row(&rp("a"), false, false);
+        s.click_row(&rp("c"), false, true);
+        // 断言打在**原始选择集**上,不是 `selected_paths()` —— 后者自己又按
+        // `rows()` 过滤了一遍,会把偷偷选进来的隐藏项遮住,断言就恒绿了。
+        assert!(
+            !s.is_selected(&rp(".secret")),
+            "被过滤掉的隐藏项不该混进范围选择: {:?}",
+            s.selected
         );
+        assert_eq!(s.selected_paths(), vec![rp("a"), rp("c")]);
+    }
+
+    /// 换目录必须把选择集、光标、锚点一起清干净 —— 留着的话,新目录里
+    /// 恰好同名的文件会凭空「已选中」,而删除是不可逆的。
+    #[test]
+    fn navigating_away_clears_the_whole_selection() {
+        let mut s = ready(&["a", "b"]);
+        s.click_row(&rp("a"), false, false);
+        s.click_row(&rp("b"), true, false);
+        s.begin_load(rp("/elsewhere"));
+        assert!(s.selected.is_empty(), "换目录该清空选择集");
+        assert!(s.cursor.is_none());
+        assert!(s.anchor.is_none());
+    }
+
+    /// 刷新之后,**已经不在列表里的选中项要被丢掉**。留着的话,删除确认框
+    /// 会列出一个远端已经没有的路径,用户点确认后收到一条 NoSuchFile,
+    /// 完全不知道自己删的是什么。
+    #[test]
+    fn a_refresh_drops_selections_that_no_longer_exist() {
+        let mut s = ready(&["a", "b"]);
+        let seq = s.begin_load(rp("/home/u"));
+        // `begin_load` 已经清了,这里手工放回去 —— 模拟「刷新当前目录时
+        // 选中态还在」这个真实场景(刷新走的是同一条 accept 路径)。
+        s.selected.insert(rp("a"));
+        s.selected.insert(rp("b"));
+        s.cursor = Some(rp("b"));
+        s.anchor = Some(rp("b"));
+
+        assert!(s.accept(seq, Ok(vec![e("a", EntryKind::File)])));
+
+        assert_eq!(s.selected_paths(), vec![rp("a")], "没了的那条该被丢掉");
+        assert!(s.cursor.is_none(), "光标指着的那条没了,光标也该清掉");
+        assert!(s.anchor.is_none(), "锚点同理");
     }
 
     #[test]

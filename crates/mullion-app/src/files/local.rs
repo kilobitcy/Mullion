@@ -168,9 +168,98 @@ pub fn default_local(configured: Option<&str>) -> RemotePath {
     RemotePath::from_bytes(path_bytes(&home))
 }
 
+/// 用系统文件管理器打开一个本地目录(设计 D5:本地文件管理外包出去)。
+///
+/// 平台命令抽成 [`open_command`] 是为了能在无头环境验参数 —— 真的 spawn
+/// 一个资源管理器在 CI 里既跑不起来也没法断言。
+pub fn open_in_file_manager(dir: &RemotePath) -> Result<(), String> {
+    let (prog, arg) = open_command(dir);
+    std::process::Command::new(&prog)
+        .arg(&arg)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打不开文件管理器({prog}):{e}"))
+}
+
+/// 平台对应的「打开目录」命令。**不拼 shell 命令行** —— 直接给
+/// `Command::arg`,路径里的空格 / 引号 / `$` 全都不需要转义,
+/// 也就没有注入面。
+fn open_command(dir: &RemotePath) -> (String, std::ffi::OsString) {
+    let path = to_path(dir).into_os_string();
+    #[cfg(windows)]
+    {
+        ("explorer.exe".to_string(), path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ("open".to_string(), path)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        ("xdg-open".to_string(), path)
+    }
+}
+
+/// 递归枚举出来的一个文件。
+pub struct Walked {
+    /// 相对枚举根的路径段。目标端按同样的层级重建 —— 只带文件名的话,
+    /// 一棵三层目录树会被摊平糊到同一个目录下,同名文件互相覆盖。
+    pub rel: Vec<String>,
+    pub size: u64,
+}
+
+/// 递归枚举一个本地目录下的**普通文件**(F52 上传目录用)。
+///
+/// **不跟随符号链接**(与 `remove_tree` 的 D17 同款理由):跟随的话
+/// 一个 `link -> /` 就是把整个根目录塞进传输队列。
+pub fn walk_dir(root: &std::path::Path) -> Result<Vec<Walked>, String> {
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), Vec::<String>::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let rd = std::fs::read_dir(&dir).map_err(|e| format!("读不了 {}:{e}", dir.display()))?;
+        for de in rd {
+            let de = de.map_err(|e| format!("读不了 {}:{e}", dir.display()))?;
+            // `symlink_metadata`(lstat)而不是 `metadata`(stat):
+            // 后者会解引用链接,类型判定跟着变成目标的类型。
+            let md = de
+                .path()
+                .symlink_metadata()
+                .map_err(|e| format!("读不了 {}:{e}", de.path().display()))?;
+            if md.is_symlink() {
+                continue;
+            }
+            let mut child_rel = rel.clone();
+            child_rel.push(de.file_name().to_string_lossy().into_owned());
+            if md.is_dir() {
+                stack.push((de.path(), child_rel));
+            } else if md.is_file() {
+                out.push(Walked {
+                    rel: child_rel,
+                    size: md.len(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 路径**原样**交给 `Command::arg`,不经 shell —— 名字里有空格或
+    /// `$(...)` 的目录也不需要转义,更没有注入面。
+    #[test]
+    fn the_file_manager_command_passes_the_path_as_a_single_argument() {
+        let d = RemotePath::from_bytes(b"/tmp/a b $(x)".to_vec());
+        let (prog, arg) = open_command(&d);
+        assert!(!prog.is_empty());
+        assert_eq!(
+            arg,
+            std::ffi::OsString::from("/tmp/a b $(x)"),
+            "路径必须原样当成一个参数,不许拼进命令行字符串"
+        );
+    }
 
     #[test]
     fn listing_a_local_directory_reports_kinds_and_sizes() {
@@ -263,6 +352,47 @@ mod tests {
         if let Ok(home) = std::env::var("HOME") {
             assert_eq!(to_path(&d), PathBuf::from(home), "留空时开在用户主目录");
         }
+    }
+
+    /// 递归传输靠这个把「一个目录」摊成「一串文件 + 它们在目标端的
+    /// 相对位置」。相对路径算错 = 整棵树糊到同一个目录下。
+    #[test]
+    fn walking_a_directory_yields_files_with_paths_relative_to_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("one.txt"), b"1").unwrap();
+        std::fs::write(root.join("b/two.txt"), b"22").unwrap();
+
+        let mut got: Vec<(String, u64)> = walk_dir(&root)
+            .expect("枚举")
+            .into_iter()
+            .map(|w| (w.rel.join("/"), w.size))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("b/two.txt".to_string(), 2), ("one.txt".to_string(), 1)]
+        );
+    }
+
+    /// D17 同款理由:跟随链接会把链接指向的整棵树拖进传输队列。
+    /// 建符号链接在 Windows 上要管理员权限,只在 Unix 上跑。
+    #[cfg(unix)]
+    #[test]
+    fn walking_does_not_follow_symlinks_out_of_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("a");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tmp.path().join("target.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("target.txt"), root.join("link")).unwrap();
+
+        let got = walk_dir(&root).expect("枚举");
+        assert!(
+            got.iter().all(|w| w.rel != vec!["link".to_string()]),
+            "符号链接不该进传输列表:{:?}",
+            got.iter().map(|w| w.rel.clone()).collect::<Vec<_>>()
+        );
     }
 
     /// 配置里填了就**原样**用它 —— 忽略入参的实现在上一条里是抓不到的
