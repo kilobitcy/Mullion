@@ -12,6 +12,7 @@ pub mod diag;
 pub mod dragout;
 pub mod edit;
 pub mod files;
+pub mod font_pick;
 pub mod frame;
 pub mod gpu;
 pub mod grid;

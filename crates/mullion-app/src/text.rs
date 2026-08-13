@@ -35,9 +35,10 @@ use glyphon::{
     TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 
-/// 显示字体族名。须在系统里已安装;未装则 cosmic-text 回退到默认字体(不崩,
-/// 但等宽/对齐可能变差)。TODO:做成可配置(见 spec F21)。
-const FONT_FAMILY: &str = "Google Sans Code";
+/// 内置默认字体族名。须在系统里已安装;未装则 cosmic-text 回退到默认字体
+/// (不崩,但等宽/对齐可能变差)。F21 起用户可以在设置里改成别的族名,
+/// 没设时仍是这一款。
+pub const DEFAULT_FONT_FAMILY: &str = "Google Sans Code";
 
 /// glyphon 文字资源 + 每行一个 Buffer。GPU 胶水:无单测。
 pub struct TextLayer {
@@ -49,6 +50,11 @@ pub struct TextLayer {
     buffers: Vec<Buffer>, // 每屏面行一个
     pub cell_w: f32,
     pub cell_h: f32,
+    /// F21:当前生效的字体族。`None` = [`DEFAULT_FONT_FAMILY`]。
+    family: Option<String>,
+    /// F21:当前字号的**物理像素**值(= pt × scale × 96/72,换算在 app 侧)。
+    /// 留着是为了 `ScaleFactorChanged` 只换 scale 时能重算,不必回头去问设置。
+    font_px: f32,
     /// F80:glyphon 的兜底文字色(span 未带显式色时用)。当前每个 span 都带色,
     /// 取不到;留着是为了主题一换就整体跟走,不留一处旧灰的潜伏陷阱。
     default_fg: Rgb,
@@ -71,6 +77,7 @@ impl TextLayer {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         font_px: f32,
+        family: Option<&str>,
         default_fg: Rgb,
     ) -> Self {
         let mut font_system = FontSystem::new();
@@ -82,7 +89,7 @@ impl TextLayer {
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let line_h = (font_px * 1.25).ceil();
         // 用 'M' 的 advance 估等宽单元格宽度。
-        let cell_w = measure_cell_w(&mut font_system, font_px, line_h);
+        let cell_w = measure_cell_w(&mut font_system, font_px, line_h, family);
         Self {
             font_system,
             swash,
@@ -92,8 +99,65 @@ impl TextLayer {
             buffers: Vec::new(),
             cell_w,
             cell_h: line_h,
+            family: family.map(str::to_string),
+            font_px,
             default_fg,
         }
+    }
+
+    /// F21:换字体族 / 字号。重算单元格尺寸,**不重建 `TextLayer`**。
+    ///
+    /// 尺寸怎么传到远端:**什么都不用另做**。`App::compute_geoms` 直接读
+    /// `cell_w`/`cell_h`,下一帧 `Workspace::apply_geometry` 比对 `last_grid`
+    /// 不同就发 `window_change`(T4/F34)——与拖窗口、开侧栏、标签栏出现
+    /// 完全同一条路径。**任何为了改字体方便而另算一份 cols/rows 的写法都是
+    /// 第二条尺寸传播路径**,正是 T4 要挡的东西。
+    ///
+    /// 非有限或非正的 `font_px` **直接忽略**:让它进去的话 `cell_h` 会变成
+    /// NaN/0,前者进 wgpu 的尺寸计算(`gui-render-gotchas.md` 记过的崩溃点),
+    /// 后者让 `rows` 变成除零。
+    pub fn set_font(&mut self, family: Option<&str>, font_px: f32) {
+        if !font_px.is_finite() || font_px <= 0.0 {
+            return;
+        }
+        self.family = family.map(str::to_string);
+        self.font_px = font_px;
+        self.cell_h = (font_px * 1.25).ceil();
+        self.cell_w = measure_cell_w(&mut self.font_system, font_px, self.cell_h, family);
+    }
+
+    /// 当前生效的族名,交给 cosmic-text 的那一份(`None` 时是内置默认)。
+    fn family_name(&self) -> &str {
+        self.family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY)
+    }
+
+    /// F21:系统里装了哪些字体族。整理规则(去重/排序/打标)在
+    /// `font_pick::sort_families`(纯函数,有测试),这里只负责去问 fontdb。
+    pub fn families(&self) -> Vec<crate::font_pick::FontChoice> {
+        let raw = self
+            .font_system
+            .db()
+            .faces()
+            .flat_map(|f| {
+                f.families
+                    .iter()
+                    .map(move |(name, _lang)| (name.clone(), f.monospaced))
+            })
+            .collect();
+        crate::font_pick::sort_families(raw)
+    }
+
+    /// F21:量一个字符在**当前字体**下的 advance,给等宽校验用
+    /// (`font_pick::is_monospace_advance`)。
+    pub fn advance_of(&mut self, ch: char) -> f32 {
+        let family = self.family.clone();
+        measure_advance(
+            &mut self.font_system,
+            self.font_px,
+            self.cell_h,
+            family.as_deref(),
+            ch,
+        )
     }
 
     /// 为所有 pane 准备文字。每个 pane 用自己的 `term_px` 作原点**和**裁剪框。
@@ -115,7 +179,11 @@ impl TextLayer {
         // 逐行富文本这段与原 `prepare` 一字不差,只是 `res.width` 换成了该 pane
         // 的宽度 —— 属性切段逻辑有 VT 快照测试兜着,改它会连带 fixture 一起红。
         let mut rows_per_pane: Vec<usize> = Vec::with_capacity(panes.len());
-        let attrs = Attrs::new().family(Family::Name(FONT_FAMILY));
+        // 族名先克隆到局部:`Attrs` 借的是 `&str`,直接借 `self.family` 的话
+        // 下面就没法再 `&mut self.font_system` 了(E0502)。每帧一次短字符串
+        // 克隆,相对每帧几千个 glyph 的整形开销可以忽略。
+        let family_owned = self.family_name().to_string();
+        let attrs = Attrs::new().family(Family::Name(&family_owned));
         for p in panes {
             rows_per_pane.push(p.snap.rows as usize);
             for row in 0..p.snap.rows {
@@ -190,12 +258,25 @@ impl TextLayer {
 }
 
 /// 用 'M' 估等宽字符宽度。核对 cosmic-text 0.12 的 LayoutRun / glyph 结构后取宽度。
-fn measure_cell_w(fs: &mut FontSystem, font_px: f32, line_h: f32) -> f32 {
+fn measure_cell_w(fs: &mut FontSystem, font_px: f32, line_h: f32, family: Option<&str>) -> f32 {
+    measure_advance(fs, font_px, line_h, family, 'M')
+}
+
+/// 量单个字符的 advance。`measure_cell_w`(定单元格宽)与 `advance_of`
+/// (等宽校验)共用 —— 两处若各写一份,校验量的就不是排版实际用的那个宽度。
+fn measure_advance(
+    fs: &mut FontSystem,
+    font_px: f32,
+    line_h: f32,
+    family: Option<&str>,
+    ch: char,
+) -> f32 {
+    let name = family.unwrap_or(DEFAULT_FONT_FAMILY);
     let mut buf = Buffer::new(fs, Metrics::new(font_px, line_h));
     buf.set_text(
         fs,
-        "M",
-        Attrs::new().family(Family::Name(FONT_FAMILY)),
+        &ch.to_string(),
+        Attrs::new().family(Family::Name(name)),
         Shaping::Advanced,
     );
     buf.shape_until_scroll(fs, false);

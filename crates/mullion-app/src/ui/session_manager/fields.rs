@@ -181,7 +181,7 @@ pub(super) fn basic(
     // 页面级游标:整个「连接」页(基本/归类/代理/跳板)共用一个,
     // 见 `section()` 文档注释。
     let mut first = true;
-    section(ui, t, "基本", &mut first);
+    section(ui, t, "会话管理器/右栏", "基本", &mut first);
     grid(ui, "sm_basic", |ui| {
         required(ui, t, "名称");
         let name_resp = ui.add(
@@ -252,7 +252,7 @@ pub(super) fn basic(
         ui.end_row();
     });
 
-    section(ui, t, "归类", &mut first);
+    section(ui, t, "会话管理器/右栏", "归类", &mut first);
     grid(ui, "sm_basic_group", |ui| {
         ui.label("分组");
         let current = buf
@@ -388,7 +388,7 @@ pub(crate) fn appearance(
     use mullion_store::{ColorSpec, ColorTarget, IconKind};
 
     let mut first = true;
-    section(ui, t, "外观", &mut first);
+    section(ui, t, "会话管理器/右栏", "外观", &mut first);
     grid(ui, "sm_basic_appearance", |ui| {
         ui.label("图标");
         ui.vertical(|ui| {
@@ -571,7 +571,7 @@ pub(crate) fn appearance(
     // 走查 4:「竖条如果是『图标颜色』的体现,就和『图标』页的颜色设置对应上,
     // 并在图标页加实时预览」。竖条本来就同源(两边都走
     // `badge::should_paint(ColorTarget::ListItem)`),缺的只是让用户当场看见。
-    section(ui, t, "预览", &mut first);
+    section(ui, t, "会话管理器/右栏", "预览", &mut first);
     let preview = crate::ui::badge::Appearance {
         icon: buf.preserved_appearance.icon.clone(),
         color: buf.preserved_appearance.color.clone(),
@@ -619,7 +619,7 @@ fn jump(
     editing: Option<SessionId>,
     first: &mut bool,
 ) {
-    section(ui, t, "跳板", first);
+    section(ui, t, "会话管理器/右栏", "跳板", first);
     grid(ui, "sm_basic_jump", |ui| {
         ui.label("跳板");
         // 「继承分组」→「继承」:同一件事全项目一个说法(走查 19)。
@@ -805,7 +805,7 @@ pub(super) fn auth(
     touched: &mut super::validate::Touched,
 ) {
     let mut first = true;
-    section(ui, t, "身份", &mut first);
+    section(ui, t, "会话管理器/右栏", "身份", &mut first);
     grid(ui, "sm_auth", |ui| {
         required(ui, t, "用户名");
         let user_resp = ui.add(
@@ -838,7 +838,7 @@ pub(super) fn auth(
         ui.end_row();
     });
 
-    section(ui, t, "凭据", &mut first);
+    section(ui, t, "会话管理器/右栏", "凭据", &mut first);
     grid(ui, "sm_auth_secret", |ui| match buf.auth_kind {
         AuthKindUi::Password => {
             ui.label("密码");
@@ -986,7 +986,7 @@ pub(super) fn network(
     presence: SecretPresence,
     first: &mut bool,
 ) {
-    section(ui, t, "代理", first);
+    section(ui, t, "会话管理器/右栏", "代理", first);
     grid(ui, "sm_net_proxy", |ui| {
         ui.label("代理");
         let line = matches!(buf.proxy_mode, ProxyModeUi::Inherit).then(|| {
@@ -1108,7 +1108,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
     }
 
     let mut first = true;
-    section(ui, t, "总开关", &mut first);
+    section(ui, t, "会话管理器/右栏", "总开关", &mut first);
     grid(ui, "sm_auto_enabled", |ui| {
         ui.label("登录后自动化");
         // 选了「继承」才画生效值 —— 显式选了「开」的人不需要被告知「实际生效:开」。
@@ -1131,7 +1131,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
         ui.end_row();
     });
 
-    section(ui, t, "tmux", &mut first);
+    section(ui, t, "会话管理器/右栏", "tmux", &mut first);
     grid(ui, "sm_auto_tmux", |ui| {
         ui.label("连上后");
         let text = match &a.tmux {
@@ -1217,7 +1217,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
         }
     });
 
-    section(ui, t, "工作目录", &mut first);
+    section(ui, t, "会话管理器/右栏", "工作目录", &mut first);
     grid(ui, "sm_auto_dir", |ui| {
         ui.label("初始目录");
         let mut s = a.work_dir.clone().unwrap_or_default();
@@ -1263,7 +1263,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
         ui.end_row();
     });
 
-    section(ui, t, "登录后命令", &mut first);
+    section(ui, t, "会话管理器/右栏", "登录后命令", &mut first);
     // `None`(继承)与 `Some(vec![])`(显式空覆盖)必须可区分 —— 所以**绝不能**
     // 用 `get_or_insert_with(Vec::new)`:那样光是打开这一页就会把「继承」
     // 悄悄翻成「显式覆盖成空」,分组里配的命令全部失效。
@@ -1421,7 +1421,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
         };
     }
 
-    section(ui, t, "环境变量", &mut first);
+    section(ui, t, "会话管理器/右栏", "环境变量", &mut first);
     // 走查 18:常驻的是灰字事实,红框只留给真的像在存密码的变量名。
     // 先 clone 出来:下面整段持着 `a.env` 的可变借用。命中通常是空 Vec,
     // 不产生分配。
@@ -1552,7 +1552,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
         };
     }
 
-    section(ui, t, "时序", &mut first);
+    section(ui, t, "会话管理器/右栏", "时序", &mut first);
     grid(ui, "sm_auto_timing", |ui| {
         ui.label("首字节后再等");
         let (v, src) = resolve_u32(
@@ -1629,7 +1629,7 @@ pub(super) fn automation(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, groups:
 /// `automation`/`appearance` 那样自己 `let mut first = true`:这一页目前
 /// 只有两节,让调用方持有游标,将来要跟别的内容拼一页也不用改签名。
 pub(super) fn sftp(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, first: &mut bool) {
-    section(ui, t, "默认目录", first);
+    section(ui, t, "会话管理器/右栏", "默认目录", first);
     grid(ui, "sm_sftp_dirs", |ui| {
         ui.label("默认远端目录");
         ui.add(
@@ -1648,7 +1648,7 @@ pub(super) fn sftp(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, first: &mut b
         ui.end_row();
     });
 
-    section(ui, t, "书签", first);
+    section(ui, t, "会话管理器/右栏", "书签", first);
     grid(ui, "sm_sftp_bookmarks", |ui| {
         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
             ui.label("书签");

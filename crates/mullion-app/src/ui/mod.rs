@@ -15,6 +15,8 @@ pub mod pane_title;
 pub mod paste;
 pub mod restored;
 pub mod session_manager;
+pub mod settings;
+pub mod shortcuts;
 pub mod toast;
 pub mod toolbar;
 pub mod transfer_panel;
@@ -58,6 +60,13 @@ pub fn install_cjk_font(ctx: &egui::Context) {
 pub struct UiState {
     pub session_manager_open: bool,
     pub about_open: bool,
+    /// F84:设置弹窗开着没有。菜单项直接置位;`app.rs::sync_settings_dialog`
+    /// 看着它建 / 清 `settings_draft`。
+    pub settings_open: bool,
+    /// F84:设置弹窗正在编辑的那份草稿。`None` = 弹窗关着(或这一帧还没建
+    /// 出来)。**不直接改 `App::settings`**:字号拖动即预览,没有草稿就没法
+    /// 在「取消」时回滚。
+    pub settings_draft: Option<settings::SettingsDraft>,
     pub last_error: Option<String>,
     /// 用户是否关掉了当前这条错误卡片。**只该由 `set_error` 复位** ——
     /// 各处直接写 `last_error` 会绕过复位,导致关掉一次后再也看不到错误。
@@ -358,6 +367,13 @@ pub struct UiFrame<'a> {
     /// F37:这一帧一共有几个占位标签(不只活动那个)。菜单里「全部重连」
     /// 是否可点看它。
     pub restored_count: usize,
+    /// F84/F21:设置弹窗这一帧要用的、它自己算不出来的东西。`None` = 弹窗
+    /// 关着。
+    ///
+    /// **是缓存不是现算**(同 `appearance` 那条):枚举系统字体要走 fontdb 的
+    /// 全部 face,量等宽要 shape 两个字形 —— 每帧来一遍就是陷阱 T3。由
+    /// `App::sync_settings_dialog` 在弹窗打开那一刻和每次换字体之后各算一次。
+    pub settings: Option<settings::SettingsEnv<'a>>,
 }
 
 /// 用户这一帧在 UI 上做的、需要 app 事后施加的布局动作。
@@ -429,6 +445,11 @@ pub struct UiActions {
     /// F37:菜单里按了「全部重连」。逐个占位标签走同一条 `reconnect_tab`
     /// 的处置路径,不分叉。同样受上面那条约束。
     pub reconnect_all: bool,
+    /// F84:设置弹窗这一帧的结论(预览 / 确定 / 取消)。`None` = 没动过。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话拖字号滑块会
+    /// 在 egui 的 discard 趟被静默吃掉,现象是「拖了半天没反应,松手才跳一下」。
+    pub settings: Option<settings::SettingsOut>,
 }
 
 /// 指针此刻还在窗口里没有(F59 / 设计 N1 的判据)。
@@ -612,6 +633,15 @@ pub fn build_ui(
                 ui.hyperlink_to("GitHub", "https://github.com/kilobitcy/Mullion");
             });
         ui_state.about_open = open;
+    }
+    // F84:设置弹窗。`frame.settings` 与 `settings_draft` 必须同时就位 ——
+    // 前者是 `app.rs` 算好的环境,后者是草稿;缺一说明弹窗刚被点开、
+    // `sync_settings_dialog` 还没跑到,这一帧先不画。
+    if let (Some(env), Some(draft)) = (frame.settings, ui_state.settings_draft.as_mut()) {
+        let out = settings::show(ctx, t, draft, env);
+        if out != settings::SettingsOut::None {
+            actions.settings = Some(out);
+        }
     }
     if ui_state.session_manager_open {
         session_manager::show(
@@ -841,6 +871,7 @@ mod tests {
     /// 一个空 `UiFrame`,测试各自按需覆盖需要的字段。
     fn base_frame() -> UiFrame<'static> {
         UiFrame {
+            settings: None,
             sessions: &[],
             groups: &[],
             tunnels: &[],

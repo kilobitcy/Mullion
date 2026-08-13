@@ -1138,6 +1138,20 @@ pub struct App {
     last_saved_layout: Option<mullion_store::SavedLayout>,
     /// F37:上一次比对快照的时刻。节流窗口见 `layout_snapshot::should_flush`。
     layout_checked_at: Instant,
+    /// F84/F21:当前**生效**的外观设置。`resumed` 里从 `settings.toml` 读出来,
+    /// 之后由设置弹窗的预览/确定/取消改写。
+    settings: mullion_store::Settings,
+    /// F84:打开设置弹窗那一刻的 `settings` 副本。「取消」就是把它装回去。
+    ///
+    /// 不用「草稿没落地过就等于原值」那种写法:预览是**真的改** `settings`
+    /// 并当场换字体的(设计 §8),原值不另存一份就找不回来了。
+    settings_backup: Option<mullion_store::Settings>,
+    /// F84:系统装了哪些字体族。弹窗打开时算一次 —— 枚举 fontdb 的全部 face
+    /// 不能进每帧路径(陷阱 T3)。
+    settings_families: Vec<crate::font_pick::FontChoice>,
+    /// F21:当前字体量出来不是等宽。同 `settings_families`,只在开弹窗和换
+    /// 字体之后重算。
+    settings_not_mono: bool,
     /// F37:正在为哪个占位标签拨号,以及连上之后要摆回什么形状(E9)。
     ///
     /// **`ConnectOk` 事件本身不带 `TabId`**(它是从 tokio task 发回来的,
@@ -1227,10 +1241,6 @@ const TRANSFER_UI_INTERVAL_MS: u64 = 200;
 /// 每条都在抢同一个 TCP 窗口,总吞吐反而掉(设计 D8)。
 const DEFAULT_TRANSFER_CONCURRENCY: usize = 4;
 
-/// 显示字号(磅 / point)。渲染时按窗口 DPI 缩放成物理像素。
-/// TODO:与字体族一起做成可配置(见 spec F21)。
-const FONT_POINT_SIZE: f32 = 10.0;
-
 impl App {
     pub fn new(
         runtime: Runtime,
@@ -1266,6 +1276,12 @@ impl App {
             clipboard: crate::clipboard::Clipboard::new(),
             last_saved_layout: None,
             layout_checked_at: Instant::now(),
+            // F84:真正的值在 `resumed` 里从 `settings.toml` 读(要先有窗口才
+            // 知道 DPI,才能把 pt 换成像素)。这里先放默认。
+            settings: mullion_store::Settings::default(),
+            settings_backup: None,
+            settings_families: Vec::new(),
+            settings_not_mono: false,
             pending_restore: None,
             dragging: false,
             prev_click: None,
@@ -1317,6 +1333,114 @@ impl App {
             // F55:同 `TabAction::Close` —— 标签的传输随标签一起作废。
             self.cancel_transfers_of(tab.content.generation());
             wind_down(tab);
+        }
+    }
+
+    // ------------------------------------------------ F84/F21 外观设置
+
+    /// 弹窗开着就备好草稿与环境,关上就清掉。
+    ///
+    /// **必须在借出 `self.store`/`self.tabs` 之前调**(同 `Present` 分支里
+    /// 那几处触发)——它要 `&mut self`。
+    fn sync_settings_dialog(&mut self) {
+        if self.ui.settings_open {
+            if self.ui.settings_draft.is_none() {
+                self.ui.settings_draft = Some(crate::ui::settings::SettingsDraft::from_settings(
+                    &self.settings,
+                ));
+                // 预览是真的改 `self.settings`,原值不另存一份,「取消」就回不去了。
+                self.settings_backup = Some(self.settings.clone());
+                self.settings_families = self
+                    .active
+                    .as_ref()
+                    .map(|a| a.text.families())
+                    .unwrap_or_default();
+                self.refresh_monospace_warning();
+                self.ui_dirty = true;
+            }
+        } else if self.ui.settings_draft.is_some() {
+            self.ui.settings_draft = None;
+            self.settings_backup = None;
+            // 清空而不是留着:字体是能在运行期装上的,下次开弹窗要重新枚举。
+            self.settings_families = Vec::new();
+        }
+    }
+
+    /// 量一下当前字体等不等宽,结果给弹窗画那条警告。
+    ///
+    /// 判据在 `font_pick::is_monospace_advance`(纯函数、有测试),这里只负责
+    /// 把两个 advance 量出来 —— 量宽度要 `FontSystem`,那是 GPU 侧的东西。
+    fn refresh_monospace_warning(&mut self) {
+        self.settings_not_mono = match self.active.as_mut() {
+            Some(a) => {
+                let m = a.text.advance_of('M');
+                let i = a.text.advance_of('i');
+                !crate::font_pick::is_monospace_advance(m, i)
+            }
+            // 还没有窗口就无从量起。报「不等宽」是指错方向,报「等宽」才是
+            // 中性的默认(同 `is_monospace_advance` 量不出来时的取舍)。
+            None => false,
+        };
+    }
+
+    /// 把 `self.settings` 的字体族/字号真的换到 `TextLayer` 上。
+    ///
+    /// **不在这里算 cols/rows**:换字体改的是 `cell_w`/`cell_h`,而
+    /// `compute_geoms` 每帧从 `a.text` 现读这两个值,再经 `apply_geometry`
+    /// 发 `window_change`(T4)。这条链路已经存在,这里只要标脏让它跑起来;
+    /// 在这儿另算一遍尺寸就是 T4 的复发方式。
+    fn apply_font(&mut self) {
+        let Some(a) = self.active.as_mut() else {
+            return;
+        };
+        let scale = a.window.scale_factor() as f32;
+        let px = font_px_for(self.settings.font_pt, scale);
+        a.text.set_font(self.settings.font_family.as_deref(), px);
+        self.ui_dirty = true;
+        self.refresh_monospace_warning();
+    }
+
+    /// 施加设置弹窗这一帧的结论。
+    fn apply_settings_action(&mut self, out: crate::ui::settings::SettingsOut) {
+        use crate::ui::settings::SettingsOut as O;
+        match out {
+            O::None => {}
+            O::Preview => {
+                self.take_settings_draft();
+                self.apply_font();
+            }
+            O::Commit => {
+                // 也在这里再取一次草稿:用户完全可能什么都没动直接点确定,
+                // 那样一次 `Preview` 都没来过。
+                self.take_settings_draft();
+                self.apply_font();
+                let saved = crate::shell::store::config_dir()
+                    .ok_or_else(|| "定位不到配置目录".to_string())
+                    .and_then(|d| {
+                        mullion_store::settings::save(&d, &self.settings).map_err(|e| e.to_string())
+                    });
+                // 写失败要说 —— 设置是用户刚点了确定的显式动作,静默失败
+                // = 这次改了、下次启动又变回去,而他不知道为什么。
+                if let Err(e) = saved {
+                    self.ui.set_error(format!("设置没能存下来:{e}"));
+                }
+                self.ui.settings_open = false;
+            }
+            O::Cancel => {
+                if let Some(backup) = self.settings_backup.take() {
+                    self.settings = backup;
+                    self.apply_font();
+                }
+                self.ui.settings_open = false;
+            }
+        }
+    }
+
+    /// 把草稿里的值搬进 `self.settings`(字号顺手夹紧)。
+    fn take_settings_draft(&mut self) {
+        if let Some(d) = self.ui.settings_draft.as_ref() {
+            self.settings.font_family = d.family.clone();
+            self.settings.font_pt = mullion_store::settings::clamp_font_pt(d.font_pt);
         }
     }
 
@@ -1577,6 +1701,9 @@ impl App {
     fn modal_open(&self) -> bool {
         self.ui.session_manager_open
             || self.ui.about_open
+            // F84:设置弹窗里有输入框(手填族名)。不算模态的话,敲进去的字
+            // 会同时被发给远端 —— T8 那条「弹窗开着时键盘归 egui」。
+            || self.ui.settings_open
             || self.pending_host_key.is_some()
             || self.pending_paste.is_some()
     }
@@ -3782,16 +3909,29 @@ impl ApplicationHandler<UserEvent> for App {
             window.scale_factor()
         ));
         let gpu = Gpu::new(window.clone(), self._runtime.handle());
-        // 字号 10pt,按窗口 DPI 缩放成物理像素(inner_size 是物理像素,须一致):
+        // F84/F21:外观设置必须在建 `TextLayer` **之前**读出来 —— 字体族与
+        // 字号是构造参数,建完再改就得多走一趟 `set_font`,首帧会用默认字体
+        // 画一次再跳。读不出来只是回到默认外观,不阻断启动(见
+        // `mullion_store::settings::load`)。
+        self.settings = crate::shell::store::config_dir()
+            .map(|d| {
+                let l = mullion_store::settings::load(&d);
+                if let Some(note) = l.note {
+                    crate::logx::line(&format!("F84:{note}"));
+                }
+                l.settings
+            })
+            .unwrap_or_default();
+        // 字号按窗口 DPI 缩放成物理像素(inner_size 是物理像素,须一致):
         // px = pt * (96*scale/72)。Windows 常见 125%/150% 缩放下才不会过小。
-        // TODO:字体/字号做成可配置 + 跟随 ScaleFactorChanged 动态更新(见 spec F21)。
         let scale = window.scale_factor() as f32;
-        let font_px = FONT_POINT_SIZE * scale * 96.0 / 72.0;
+        let font_px = font_px_for(self.settings.font_pt, scale);
         let text = TextLayer::new(
             &gpu.device,
             &gpu.queue,
             gpu.config.format,
             font_px,
+            self.settings.font_family.as_deref(),
             MULLION_DARK.term_fg,
         );
         // egui 0.30 同帧集成(§4.1):本 Task 只画一个占位 `egui::Window` 证明管线通;
@@ -4515,8 +4655,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                // DPI 跟随是 F21,这里暂不重建字体,仅记录(跨屏 DPI 变化时字号不更新)。
                 crate::logx::line(&format!("ScaleFactorChanged({scale_factor})"));
+                // F21:字号存的是 pt,物理像素随 DPI 变 —— 把窗口从 150% 的屏
+                // 拖到 100% 的屏,不重建字体的话字会缩成原来的三分之二。
+                // 走 `apply_font` 这一条路(它顺带标脏),不在这里另算一遍 ——
+                // 第二条尺寸传播路径就是 T4 的复发方式。
+                self.apply_font();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             // 指针坐标只在这里更新;滚轮上报要用(F17),划选要用(F18)。
@@ -4830,6 +4974,10 @@ impl ApplicationHandler<UserEvent> for App {
                             // 按世代号放回去——期间哪怕用户切换/关闭了标签也不会
                             // 错放(S1)。`files_panel_mut` 两个变体都有,不用再
                             // `and_then(as_terminal_mut)` 判一次种类。
+                            // F84:备好 / 清掉设置弹窗的草稿与环境。必须在
+                            // 下面那些 `self.store`/`self.tabs` 的借用之前 ——
+                            // 它要 `&mut self`。
+                            self.sync_settings_dialog();
                             let mut taken_files = files_owner_generation.and_then(|gen| {
                                 self.tabs
                                     .by_generation_mut(gen)
@@ -5006,6 +5154,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 决定画不画焦点边框。
                                 restored: restored_view,
                                 restored_count,
+                                settings: self.ui.settings_open.then_some(
+                                    crate::ui::settings::SettingsEnv {
+                                        families: &self.settings_families,
+                                        not_monospace: self.settings_not_mono,
+                                    },
+                                ),
                                 files_focused: self.effective_focus()
                                     == shell::input_route::Focus::FilesPanel,
                             };
@@ -5059,6 +5213,12 @@ impl ApplicationHandler<UserEvent> for App {
                                     p.pacer.mark_presented();
                                 }
                                 ws.apply_geometry(&geoms);
+                            }
+                            // F84:设置弹窗的结论。放在布局动作之前 —— 换字体
+                            // 改的是 `cell_w`/`cell_h`,下一帧的 `compute_geoms`
+                            // 才会照着新值重排(T4)。
+                            if let Some(out) = actions.settings {
+                                self.apply_settings_action(out);
                             }
                             // 布局动作:点了预设 / 点了标题条的 ×。路由逻辑在自由函数
                             // `apply_layout_actions`(只碰 &mut Workspace,可脱离
@@ -5944,6 +6104,15 @@ fn apply_save(
 /// 曾发现删掉 `files_remote` 这一条,662 个既有测试全绿——没有任何测试构造过
 /// "`files_remote` 是唯一真实动作"的一帧。守护测试见
 /// `files_remote_alone_counts_as_a_real_action_for_the_discard_guard`。
+/// F21:字号(pt)按窗口 DPI 换成物理像素。
+///
+/// **一个函数、两个调用点**(`resumed` 建 `TextLayer` 和 `apply_font`):
+/// 两处各写一遍 `pt * scale * 96.0 / 72.0` 的话,改了其中一个的现象是
+/// 「启动时字号对,换个屏就不对了」——而两处相隔两千行。
+fn font_px_for(pt: f32, scale: f32) -> f32 {
+    pt * scale * 96.0 / 72.0
+}
+
 fn has_real_action(a: &crate::ui::UiActions) -> bool {
     a.preset.is_some()
         || a.close_pane.is_some()
@@ -5960,6 +6129,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.exit.is_some()
         || a.reconnect_tab.is_some()
         || a.reconnect_all
+        || a.settings.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -6177,9 +6347,9 @@ fn render_frame(
 mod tests {
     use super::{
         apply_layout_actions, apply_save, download_job, effective_focus_of,
-        files_owner_generation_of, has_real_action, next_panel_selection_index, pane_still_wanted,
-        snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down, RestoredTab, Tab,
-        TabContent, TerminalTab,
+        files_owner_generation_of, font_px_for, has_real_action, next_panel_selection_index,
+        pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down,
+        RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -6188,6 +6358,136 @@ mod tests {
     use mullion_core::layout::{Dir, Node, PaneId, Rect};
     use mullion_store::SessionId;
     use std::sync::Arc;
+
+    // ------------------------------------------------ F84/F21 外观设置
+
+    /// F21:字号存的是 pt,画出来的是像素 —— 换一块 DPI 不同的屏,同一个 pt
+    /// 必须换算出不同的像素,否则「跟随 DPI」这条验收点根本不成立。
+    ///
+    /// 自证会变红:把 `font_px_for` 改成直接返回 `pt`。
+    #[test]
+    fn the_same_point_size_is_more_pixels_on_a_higher_dpi_screen() {
+        let at_100 = font_px_for(10.0, 1.0);
+        let at_150 = font_px_for(10.0, 1.5);
+        assert!(
+            at_150 > at_100 * 1.4,
+            "150% 缩放下 {at_150}px vs 100% 的 {at_100}px —— 没在跟 DPI 走"
+        );
+        // 96/72:pt 是 1/72 英寸,屏幕按 96dpi 算。10pt @100% = 13.33px。
+        assert!((at_100 - 13.333_334).abs() < 0.01, "10pt@100% 应是 13.33px");
+    }
+
+    /// **T4 的字体版**:换字号改的是 `cell_w`/`cell_h`,而远端 tmux 是按
+    /// `cols`/`rows` 排版的 —— 同一块中央区,字变大就必须让远端知道列数变少了,
+    /// 否则全屏 TUI 按旧列数排版,当场错行。
+    ///
+    /// 扎的是 `layout_geometry` 这条**唯一**的换算(`compute_geoms` 现读
+    /// `a.text.cell_w/cell_h` 喂给它),纯函数、不需要 GPU。
+    ///
+    /// 自证会变红:把 `layout_geometry` 里 `grid_size_for` 的除法换成常量。
+    #[test]
+    fn changing_the_cell_size_changes_what_the_remote_is_told() {
+        use crate::shell::workspace::{layout_geometry, PxRect};
+        let tree = Node::Leaf(PaneId(0));
+        let area = PxRect {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 900,
+        };
+        let small = layout_geometry(&tree, area, (10.0, 20.0), false)[0].grid;
+        let big = layout_geometry(&tree, area, (20.0, 40.0), false)[0].grid;
+        assert!(
+            big.0 < small.0 && big.1 < small.1,
+            "字元从 10x20 放大到 20x40,远端却被告知 {big:?}(原 {small:?})——\
+             列/行数没跟着变,远端 TUI 会按旧列数排版"
+        );
+    }
+
+    /// **不许有第二条尺寸传播路径**(T4 的复发方式)。
+    ///
+    /// `apply_font` 只换字体 + 标脏,`cols`/`rows` 由既有的
+    /// `compute_geoms` → `apply_geometry` 那条链路下一帧现算。它自己算一遍的
+    /// 话,两处会在「标题条开关」「文件侧栏挤窄」这些场景下漂开,而症状
+    /// (远端偶尔错行)极难对上原因。
+    ///
+    /// 扎源码结构的理由同 `file_actions_never_narrow_to_terminal_tabs_only`
+    /// (`App` 单测里造不出 `Active`:要 wgpu 设备和真窗口)。
+    ///
+    /// 自证会变红:在 `apply_font` 里加一句 `layout_geometry(...)`,
+    /// 或者把 `self.ui_dirty = true;` 删掉。
+    #[test]
+    fn a_font_change_goes_through_the_same_geometry_path_as_a_resize() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn apply_font(&mut self)")
+            .nth(1)
+            .expect("找不到 apply_font 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 apply_font 的函数结尾")];
+        assert!(
+            body.contains("set_font("),
+            "apply_font 的函数体切歪了 —— 下面几条断言会空过"
+        );
+        assert!(
+            body.contains("self.ui_dirty = true;"),
+            "换了字体不标脏:远端一安静就没有下一帧,新字号要等用户碰一下鼠标\
+             才生效(而 `apply_geometry` 只在 present 那一帧跑)"
+        );
+        for forbidden in ["layout_geometry", "compute_geoms", "apply_geometry"] {
+            assert!(
+                !body.contains(forbidden),
+                "apply_font 里出现了 {forbidden} —— 尺寸传播必须只有 \
+                 compute_geoms 那一条路径(T4)"
+            );
+        }
+    }
+
+    /// F21:`ScaleFactorChanged` 必须真的重建字体。
+    ///
+    /// 这条事件在无头环境里发不出来(要真把窗口拖到另一块 DPI 不同的屏上),
+    /// 所以扎源码:那个分支里必须调 `apply_font`。改这条之前它只记一行日志,
+    /// 现象是跨屏之后字号纹丝不动。
+    ///
+    /// 自证会变红:把该分支里的 `self.apply_font();` 删掉。
+    #[test]
+    fn the_scale_factor_change_actually_rebuilds_the_font() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("WindowEvent::ScaleFactorChanged")
+            .nth(1)
+            .expect("找不到 ScaleFactorChanged 分支");
+        // 分支体止于下一个 `WindowEvent::` —— 匹配臂是并列的。
+        let body = &after[..after
+            .find("WindowEvent::")
+            .expect("找不到 ScaleFactorChanged 的下一个匹配臂")];
+        assert!(
+            body.contains("scale_factor"),
+            "分支体切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.apply_font()"),
+            "DPI 变了却不重建字体:把窗口从 150% 的屏拖到 100% 的屏,字会\
+             一直是原来那么大(物理像素没换算)"
+        );
+    }
+
+    /// D4b 那条老坑的第 N 次复现防线:设置动作**单独**也要算「真动作」,
+    /// 否则它会在 egui 的 discard 趟被静默吃掉 —— 现象是拖字号滑块半天没反应。
+    ///
+    /// 自证会变红:把 `has_real_action` 里的 `a.settings.is_some()` 去掉。
+    #[test]
+    fn settings_alone_counts_as_a_real_action_for_the_discard_guard() {
+        let mut a = crate::ui::UiActions::default();
+        assert!(!has_real_action(&a), "空动作不该算数");
+        a.settings = Some(crate::ui::settings::SettingsOut::Preview);
+        assert!(
+            has_real_action(&a),
+            "只有设置动作时被判成「什么都没发生」—— 这一帧的结论会被 discard \
+             趟的默认值覆盖掉"
+        );
+    }
 
     #[test]
     fn redraw_is_frame_capped() {

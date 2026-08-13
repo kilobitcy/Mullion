@@ -8,7 +8,9 @@
 //! `let w = 80.0; desired_width(w)` 绕得过去；「用了常量但选错档位」
 //! （该 `FIELD_W_S` 却写 `FIELD_W_L`）它看不出来；下面 `ALLOW` 里的
 //! 白名单行也挡不住——它登记的是既有欠债，不是「加进来就绿了」的许可
-//! （理由见 `ALLOW` 的文档注释）。那三类只能靠评审。
+//! （理由见 `ALLOW` 的文档注释）；**扫描范围本身是逐个登记的**——
+//! 既不在 `DIR` 目录下、也没进 `EXTRA` 的新表单，规范对它一条都管不住。
+//! 那四类只能靠评审。
 //! 规范全文见 `docs/ui-form-guidelines.md`；上面这三类局限与该文档
 //! 「机械守护挡不住什么」一节是同一份内容，改一处要同步另一处。
 
@@ -16,6 +18,12 @@ use std::path::Path;
 
 /// 扫描范围：会话管理器的全部 UI 源码。
 const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/session_manager");
+
+/// 扫描范围（续）：复用同一套 `form` 构件、但不在上面那个目录里的表单。
+///
+/// F84 的设置弹窗就是第一个 —— 它 `use` 了 `session_manager::form`，规范
+/// 自然也跟着适用。漏登记的话，规范只管得住「碰巧放对目录」的表单。
+const EXTRA: &[&str] = &[concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/settings.rs")];
 
 /// 既有违规的行级白名单。
 ///
@@ -96,6 +104,16 @@ fn each_source(mut f: impl FnMut(&str, &str)) {
         let src = std::fs::read_to_string(&path).expect("源码读不出");
         f(&name, &src);
     }
+    for extra in EXTRA {
+        let path = Path::new(extra);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("文件名不是 UTF-8")
+            .to_string();
+        let src = std::fs::read_to_string(path).expect("源码读不出");
+        f(&name, &src);
+    }
 }
 
 /// 间距只能用 `SP_XS/S/M/L/XL` 五档。裸数字让「这一处该多松」变成各人各拍
@@ -103,7 +121,7 @@ fn each_source(mut f: impl FnMut(&str, &str)) {
 ///
 /// 自证会变红：把任意一处 `ui.add_space(SP_S)` 改回 `ui.add_space(8.0)`。
 #[test]
-fn no_bare_numeric_spacing_in_session_manager_ui() {
+fn no_bare_numeric_spacing_in_form_ui() {
     let mut bad = Vec::new();
     each_source(|name, src| {
         for (f, line_no, line) in scan(src, name, "add_space(") {
@@ -124,7 +142,7 @@ fn no_bare_numeric_spacing_in_session_manager_ui() {
 ///
 /// 自证会变红：把任意一处 `desired_width(field_w(...))` 改回 `desired_width(80.0)`。
 #[test]
-fn no_bare_numeric_field_width_in_session_manager_ui() {
+fn no_bare_numeric_field_width_in_form_ui() {
     let mut bad = Vec::new();
     each_source(|name, src| {
         for (f, line_no, line) in scan(src, name, "desired_width(") {

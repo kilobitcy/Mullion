@@ -11,7 +11,7 @@ mod dedupe;
 mod editor;
 mod env_hint;
 mod fields;
-mod form;
+pub(crate) mod form;
 mod highlight;
 mod inherit_row;
 mod jump_preview;

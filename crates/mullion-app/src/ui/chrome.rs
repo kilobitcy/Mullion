@@ -90,8 +90,13 @@ pub fn top_menu(
                         ui_state.files_sidebar_open = !ui_state.files_sidebar_open;
                         ui.close_menu();
                     }
-                    ui.add_enabled(false, egui::Button::new("(F84 设置 · 后续切片)"));
-                    ui.add_enabled(false, egui::Button::new("(快捷键 · 后续切片)"));
+                    // F84:设置弹窗(外观 + 快捷键一览)。原先这里挂着两条
+                    // 置灰占位,「快捷键」那条不再单独出现 —— 一览表就在设置
+                    // 弹窗里,再给它一个入口只会让人以为是两个不同的东西。
+                    if ui.button("设置…").clicked() {
+                        ui_state.settings_open = true;
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("关于", |ui| {
                     if ui.button("关于 Mullion").clicked() {

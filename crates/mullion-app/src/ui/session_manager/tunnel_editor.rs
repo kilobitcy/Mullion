@@ -331,7 +331,7 @@ pub(super) fn show(
     let mut first = true;
     let w = wording(buf.kind);
 
-    form::section(ui, t, "转发", &mut first);
+    form::section(ui, t, "会话管理器/右栏", "转发", &mut first);
     form::grid(ui, "tunnel_forward", |ui| {
         form::required(ui, t, "类型");
         egui::ComboBox::from_id_salt("tunnel_kind")
@@ -366,7 +366,7 @@ pub(super) fn show(
         form::field_error(ui, t, err.is_some(), err.unwrap_or_default());
     });
 
-    form::section(ui, t, "侦听", &mut first);
+    form::section(ui, t, "会话管理器/右栏", "侦听", &mut first);
     form::grid(ui, "tunnel_listen", |ui| {
         form::required(ui, t, w.listen);
         ui.add(
@@ -413,7 +413,7 @@ pub(super) fn show(
     });
 
     if buf.kind != TunnelKindUi::Dynamic {
-        form::section(ui, t, "目标", &mut first);
+        form::section(ui, t, "会话管理器/右栏", "目标", &mut first);
         form::grid(ui, "tunnel_target", |ui| {
             form::required(ui, t, w.target);
             ui.horizontal(|ui| {
@@ -445,7 +445,7 @@ pub(super) fn show(
         });
     }
 
-    form::section(ui, t, "其他", &mut first);
+    form::section(ui, t, "会话管理器/右栏", "其他", &mut first);
     form::grid(ui, "tunnel_misc", |ui| {
         ui.label("说明");
         ui.add(

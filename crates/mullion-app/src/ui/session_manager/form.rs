@@ -14,7 +14,7 @@ use crate::ui::annotate;
 use crate::ui::metrics::LABEL_COL_W;
 
 /// 两列表单的统一样式:左列标签定宽,右列输入撑满。
-pub(super) fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
+pub(crate) fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
     egui::Grid::new(id)
         .num_columns(2)
         .spacing([crate::ui::metrics::SP_M, crate::ui::metrics::SP_S])
@@ -23,6 +23,10 @@ pub(super) fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
 }
 
 /// 分区小标题。11px + fg_muted,上面留一档大间距 + 一条细分隔线 ——
+///
+/// `scope` 是 F100 标注路径的前缀(如 `"会话管理器/右栏"`)。**由调用方传**
+/// 而不是写死:同一套构件现在也被设置弹窗用,路径写死会让标注模式导出一段
+/// 指向错误位置的文本,而 F100 的全部价值就是那段文本能直接定位到代码。
 /// 表单一路平铺下来没有任何视觉锚点,眼睛找不到「这几行是一组」
 /// (走查 P2-17)。
 ///
@@ -50,7 +54,7 @@ pub(super) fn grid(ui: &mut Ui, id: &str, add: impl FnOnce(&mut Ui)) {
 /// 内部自己 `let mut first = true`:那等于把硬编码换了个地方,子函数被
 /// 单独渲染成一页时(如某些测试)看起来「恰好」对,一旦真被插进别的页面
 /// 中间就会在不该有线的地方多画一条。
-pub(super) fn section(ui: &mut Ui, t: &Theme, title: &str, first: &mut bool) {
+pub(crate) fn section(ui: &mut Ui, t: &Theme, scope: &str, title: &str, first: &mut bool) {
     use crate::ui::metrics::{SP_L, SP_XS};
     if !*first {
         ui.add_space(SP_L);
@@ -66,11 +70,7 @@ pub(super) fn section(ui: &mut Ui, t: &Theme, title: &str, first: &mut bool) {
     // F100:标的是**分节标题这一行**,不是分节整块 —— `section` 只画标题、不
     // 持有内容闭包,拿不到整块的 rect。要标整块得把这个函数改成包住内容的
     // 容器,那是另一回事。指标题够用:人说的是「『代理』这一节太挤」。
-    annotate::mark(
-        ui.ctx(),
-        format!("会话管理器/右栏/分节「{title}」"),
-        head.rect,
-    );
+    annotate::mark(ui.ctx(), format!("{scope}/分节「{title}」"), head.rect);
     ui.add_space(SP_XS);
 }
 
@@ -86,7 +86,7 @@ pub(super) fn required(ui: &mut Ui, t: &Theme, text: &str) {
 /// 左对齐 —— 挂在标签那一列会被误读成「这一行的标签」。
 ///
 /// 只在 `show` 为真时才占行:恒占位会让表单在没有错误时凭空多出三段空白。
-pub(super) fn field_error(ui: &mut Ui, t: &Theme, show: bool, msg: &str) {
+pub(crate) fn field_error(ui: &mut Ui, t: &Theme, show: bool, msg: &str) {
     if !show {
         return;
     }
