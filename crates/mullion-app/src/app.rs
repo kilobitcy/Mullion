@@ -61,6 +61,8 @@ pub enum UserEvent {
     CredentialKeyPathPicked(Option<PathBuf>),
     /// F61:「导入 .ico…」的结果。`None` = 用户取消 / 对话框起不来。
     IconPathPicked(Option<PathBuf>),
+    /// F2:「导入 ssh config…」选中的文件。`None` = 用户取消。
+    SshConfigPicked(Option<PathBuf>),
     /// 主机密钥需要用户确认(F3)。握手线程正挂在 `reply` 上等回答,
     /// **必须**最终发一个 bool 回去或丢弃 sender(丢弃 = 拒绝,fail-closed)。
     /// `Box` 是因为 `HostKeyPrompt` 比其余变体大得多,不装箱会撑大整个枚举。
@@ -1116,6 +1118,9 @@ pub struct App {
     /// 图标文件对话框是否在跑。跟 `key_picker_busy` 分开 —— 两个按钮在不同
     /// Tab 上,共用一个标志会让「刚选完私钥」把图标按钮也按不动。
     icon_picker_busy: bool,
+    /// F2:ssh config 文件对话框是否在跑。同样单独一个 —— 它开在菜单栏上,
+    /// 跟会话/凭据编辑器里的两个按钮互不相干。
+    import_picker_busy: bool,
     /// egui 侧有内容待画(菜单展开/hover/弹窗/错误提示)。与「终端来了新字节」是
     /// 两个独立脏源,`frame::frame_is_dirty` 取并集——只看终端字节的话,远端一安静
     /// egui 的交互就被 `RedrawAction::Idle` 吞掉,菜单点不开。
@@ -1280,6 +1285,7 @@ impl App {
             visible: shell::window_state::Visibility::default(),
             key_picker_busy: false,
             icon_picker_busy: false,
+            import_picker_busy: false,
             ui_dirty: true, // 首帧必须画出来
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
@@ -1855,6 +1861,10 @@ impl App {
             || self.ui.unlock.is_some()
             || self.pending_host_key.is_some()
             || self.pending_paste.is_some()
+            // F2:导入预览弹窗。里面没有输入框,但有「导入 N 条」这种一按就
+            // 落库的按钮,而空格/回车在 egui 里是按钮的激活键 —— 不算模态的话,
+            // 用户在弹窗上敲的键会照样漏给远端 shell(T8)。
+            || self.ui.import.is_some()
     }
 
     /// 活动标签本身是不是 `TabContent::Files`(D1 的标签宿主)。`files_owner_generation`
@@ -3822,11 +3832,16 @@ impl App {
         &self,
         title: &str,
         filter: Option<(&str, &[&str])>,
+        dir: Option<PathBuf>,
         done: fn(Option<PathBuf>) -> UserEvent,
     ) {
         let mut dialog = rfd::FileDialog::new().set_title(title);
         if let Some((name, exts)) = filter {
             dialog = dialog.add_filter(name, exts);
+        }
+        // 目录不存在就别设 —— 有的实现会把不存在的路径当成「打开失败」。
+        if let Some(d) = dir.filter(|d| d.is_dir()) {
+            dialog = dialog.set_directory(d);
         }
         if let Some(a) = &self.active {
             dialog = dialog.set_parent(a.window.as_ref());
@@ -4471,6 +4486,26 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(note) = buf.key_note.take() {
                             self.ui.key_drop_note = Some(note);
                         }
+                    }
+                }
+                self.request_ui_redraw();
+            }
+            UserEvent::SshConfigPicked(picked) => {
+                self.import_picker_busy = false;
+                if let Some(p) = picked {
+                    match std::fs::read_to_string(&p) {
+                        Ok(text) => {
+                            let parsed = mullion_store::parse_ssh_config(&text);
+                            let existing: &[mullion_store::SessionRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.list());
+                            self.ui.import = Some(crate::ui::import_dialog::ImportState {
+                                path: p.display().to_string(),
+                                rows: crate::ui::import_dialog::build_rows(&parsed, existing),
+                                skipped: crate::ui::import_dialog::skip_lines(&parsed),
+                            });
+                        }
+                        // 读不出来就直接说,别开一个空弹窗让用户以为文件是空的。
+                        Err(e) => self.ui.set_error(format!("读不了 {}:{e}", p.display())),
                     }
                 }
                 self.request_ui_redraw();
@@ -5686,7 +5721,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let touched_store = self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
                     || self.ui.group_intent.is_some()
-                    || self.ui.move_to_group.is_some();
+                    || self.ui.move_to_group.is_some()
+                    // F2:导入一次能加进几十条会话,外观缓存必须跟着重算 ——
+                    // 漏掉它的话新会话在列表里画的是默认色/默认图标。
+                    || self.ui.import_request.is_some();
                 if self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
                     || self.ui.move_to_group.is_some()
@@ -5838,6 +5876,19 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // F2:ssh config 导入的施加点。与会话保存同构 —— 弹窗只交出
+                // 勾好的行,落库(含跳板两阶段回填)在 `apply_import`。
+                if let Some(rows) = self.ui.import_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        let now = time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default();
+                        match apply_import(store, &rows, &now) {
+                            Ok(n) => self.ui.set_toast(format!("已导入 {n} 条会话")),
+                            Err(msg) => self.ui.set_error(msg),
+                        }
+                    }
+                }
                 // Task 16:分组管理弹窗的 intent 施加点(F60)。`delete_group` 已在
                 // store 层把仍引用该分组的会话 group_id 置 None(vault.rs 的
                 // `delete_group` 文档:「分组是组织手段,不是会话的所有者」)、不删会话,
@@ -5877,7 +5928,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 「选择…」私钥文件:同样是 egui 闭包只记意图、这里才施加。
                 if std::mem::take(&mut self.ui.pick_key_request) && !self.key_picker_busy {
                     self.key_picker_busy = true;
-                    self.spawn_file_picker("选择私钥文件", None, UserEvent::KeyPathPicked);
+                    self.spawn_file_picker("选择私钥文件", None, None, UserEvent::KeyPathPicked);
                 }
                 // 凭据表单里的「选择…」私钥。与会话侧共用 `key_picker_busy`
                 // (一次只该开一个对话框),但回送的是**另一个事件** ——
@@ -5887,6 +5938,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.key_picker_busy = true;
                     self.spawn_file_picker(
                         "选择私钥文件",
+                        None,
                         None,
                         UserEvent::CredentialKeyPathPicked,
                     );
@@ -5898,7 +5950,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.spawn_file_picker(
                         "选择图标文件",
                         Some(("图标", &["ico"])),
+                        None,
                         UserEvent::IconPathPicked,
+                    );
+                }
+                // F2:导入 ssh config。初始目录指向 `~/.ssh`(设计 D7),
+                // 省掉用户手动翻目录;不加扩展名过滤 —— config 文件没有后缀。
+                if std::mem::take(&mut self.ui.import_pick_request) && !self.import_picker_busy {
+                    self.import_picker_busy = true;
+                    self.spawn_file_picker(
+                        "选择 ssh config 文件",
+                        None,
+                        crate::ui::session_manager::keyscan::default_ssh_dir(),
+                        UserEvent::SshConfigPicked,
                     );
                 }
                 // 连接:双击行 / 点「连接」。必须在 store 的 &mut 借用结束后调
@@ -6383,6 +6447,58 @@ fn apply_credential_save(
         .map(|_| id)
 }
 
+/// 施加一次 `~/.ssh/config` 导入(F2)。返回真正建出来的会话数。
+///
+/// **两阶段**(设计 D4):`ProxyJump` 在 config 里写的是主机别名,而本项目的
+/// 跳板是 `JumpRef(SessionId)` —— id 要等落库才有。所以先按勾选把会话全建
+/// 出来、记下 `别名 → id`,再回头把跳板翻译进去。
+///
+/// 指向本批之外的别名一律跳过(那条会话照常导入,只是跳板留空)——
+/// **不凭空造一条跳板会话**,那是往库里塞用户没批准的配置。
+///
+/// 抽成自由函数是为了能无窗口单测:两阶段回填错了的现象是「导进来了但跳板
+/// 是空的」,只有真跑一遍才看得出来。
+fn apply_import(
+    store: &mut crate::shell::store::SessionStore,
+    rows: &[crate::ui::import_dialog::ImportRow],
+    now: &str,
+) -> Result<usize, String> {
+    use std::collections::BTreeMap;
+
+    let picked: Vec<&crate::ui::import_dialog::ImportRow> =
+        rows.iter().filter(|r| r.selected).collect();
+    let mut ids: BTreeMap<String, mullion_store::SessionId> = BTreeMap::new();
+    for row in &picked {
+        let id = store.add(crate::ui::import_dialog::draft_of(&row.entry), now);
+        ids.insert(row.entry.alias.clone(), id);
+    }
+    for row in &picked {
+        if row.entry.proxy_jump.is_empty() {
+            continue;
+        }
+        let chain: Vec<mullion_store::JumpRef> = row
+            .entry
+            .proxy_jump
+            .iter()
+            .filter_map(|alias| ids.get(alias).copied().map(mullion_store::JumpRef))
+            .collect();
+        if chain.is_empty() {
+            continue;
+        }
+        let id = ids[&row.entry.alias];
+        // 读回刚建的那条改 network.jump 再写回去:`SessionStore` 只暴露
+        // 「整条 draft 覆盖」这一种更新(与会话编辑器共用同一条路径),
+        // 没有单字段 setter,也不该为导入新开一个。
+        let mut draft = crate::ui::import_dialog::draft_of(&row.entry);
+        draft.network.jump = Some(chain);
+        store
+            .update(id, draft, now)
+            .map_err(|e| format!("回填跳板失败:{e}"))?;
+    }
+    store.save().map_err(|e| format!("导入失败:{e}"))?;
+    Ok(picked.len())
+}
+
 /// 删凭据被拒时该说的那句话(F74/D7)。
 ///
 /// store 只报得出 `SessionId`,而用户认的是会话名 —— 只说「还有 3 条会话
@@ -6697,11 +6813,11 @@ fn render_frame(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_credential_save, apply_layout_actions, apply_save, credential_delete_error,
-        download_job, effective_focus_of, files_owner_generation_of, finish_password_change,
-        font_px_for, has_real_action, next_panel_selection_index, pane_still_wanted,
-        snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down, RestoredTab, Tab,
-        TabContent, TerminalTab,
+        apply_credential_save, apply_import, apply_layout_actions, apply_save,
+        credential_delete_error, download_job, effective_focus_of, files_owner_generation_of,
+        finish_password_change, font_px_for, has_real_action, next_panel_selection_index,
+        pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down,
+        RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -6915,6 +7031,55 @@ mod tests {
         assert!(
             body.contains("self.ui.unlock.is_some()"),
             "解锁框没算进模态:主密码会一边进输入框、一边被发给远端 shell(T8)"
+        );
+    }
+
+    /// T8:F2 的导入预览弹窗也必须计进模态。判据与理由同上一条 —— 这张表
+    /// 每加一个弹窗就要补一项,而「加了弹窗忘了补」正是它要防的。
+    ///
+    /// 自证会变红:把 `modal_open` 里的 `self.ui.import.is_some()` 删掉。
+    #[test]
+    fn the_import_preview_counts_as_a_modal_so_keys_do_not_leak_to_the_shell() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 modal_open 的函数结尾")];
+        assert!(
+            body.contains("self.ui.session_manager_open"),
+            "modal_open 的函数体切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.ui.import.is_some()"),
+            "导入预览没算进模态:弹窗上敲的键会漏给远端 shell(T8)"
+        );
+    }
+
+    /// F61/F62:导入会一次加进几十条会话,外观缓存必须跟着重算 —— 漏掉
+    /// 它的话新会话在列表里画的是默认色/默认图标,而用户完全不知道为什么。
+    ///
+    /// 与 `modal_open` 那两条同样扎源码:`touched_store` 要一个真的 `App`
+    /// 才求得出值,而这条要防的正是「新增一条改 store 的通道时忘了计入」。
+    ///
+    /// 自证会变红:把 `touched_store` 里的 `import_request` 那一项删掉。
+    #[test]
+    fn importing_sessions_counts_as_touching_the_store_so_the_look_is_recomputed() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("let touched_store = ")
+            .nth(1)
+            .expect("找不到 touched_store 的赋值");
+        let expr = &after[..after.find(";\n").expect("找不到该赋值的结尾")];
+        assert!(
+            expr.contains("self.ui.save_request"),
+            "touched_store 的表达式切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            expr.contains("self.ui.import_request"),
+            "导入没算进 touched_store:新导入的会话会画成默认外观(F61/F62)"
         );
     }
 
@@ -9348,6 +9513,79 @@ mod tests {
         let store = crate::shell::store::SessionStore::open(dir.path().to_path_buf(), &FixedKey)
             .expect("open store");
         (dir, store)
+    }
+
+    /// F2 两阶段回填的红线:**导入两条互为跳板的会话后,被跳板那条的
+    /// `network.jump` 必须真的指向另一条的 id。**
+    ///
+    /// 一阶段建完就完事的写法编译得过、导入也「成功」了,现象是跳板静静
+    /// 地空着,用户要到第一次连接才发现流量根本没过堡垒机。
+    ///
+    /// 自证会变红:把 `apply_import` 的第二个 `for` 循环整段删掉。
+    #[test]
+    fn importing_a_pair_wires_the_proxy_jump_to_the_real_session_id() {
+        let (_dir, mut store) = tmp_store();
+        let parsed = mullion_store::parse_ssh_config(
+            "Host target\n  User ops\n  ProxyJump bastion\nHost bastion\n  User ops\n",
+        );
+        let rows = crate::ui::import_dialog::build_rows(&parsed, &[]);
+        let n = apply_import(&mut store, &rows, "2026-08-13T00:00:00Z").expect("导入应成功");
+        assert_eq!(n, 2);
+
+        let bastion = store
+            .list()
+            .iter()
+            .find(|s| s.identity.name == "bastion")
+            .expect("bastion 应已导入")
+            .id;
+        let target = store
+            .list()
+            .iter()
+            .find(|s| s.identity.name == "target")
+            .expect("target 应已导入");
+        assert_eq!(
+            target.network.jump,
+            Some(vec![mullion_store::JumpRef(bastion)]),
+            "ProxyJump 必须翻成对刚建那条会话的引用"
+        );
+    }
+
+    /// 指向本批之外的别名:那条会话照常导入,跳板留空,**绝不凭空造一条
+    /// 跳板会话**(设计 D4)——那是往库里塞用户没批准的配置。
+    ///
+    /// 自证会变红:让 `apply_import` 对找不到的别名 `store.add` 一条占位会话。
+    #[test]
+    fn a_jump_outside_the_batch_leaves_the_jump_empty_and_invents_nothing() {
+        let (_dir, mut store) = tmp_store();
+        let parsed = mullion_store::parse_ssh_config("Host lonely\n  User ops\n  ProxyJump gone\n");
+        let rows = crate::ui::import_dialog::build_rows(&parsed, &[]);
+        apply_import(&mut store, &rows, "2026-08-13T00:00:00Z").expect("导入应成功");
+
+        assert_eq!(store.list().len(), 1, "不该凭空多造一条「gone」");
+        assert_eq!(
+            store.list()[0].network.jump,
+            Some(Vec::new()),
+            "跳板该留空,而不是继承(None)"
+        );
+    }
+
+    /// 没勾的行一条都不许进库 —— 预览的意义就在这里。
+    #[test]
+    fn unchecked_rows_are_not_imported() {
+        let (_dir, mut store) = tmp_store();
+        let parsed = mullion_store::parse_ssh_config("Host a\n  User ops\nHost b\n  User ops\n");
+        let mut rows = crate::ui::import_dialog::build_rows(&parsed, &[]);
+        rows[1].selected = false;
+        let n = apply_import(&mut store, &rows, "2026-08-13T00:00:00Z").expect("导入应成功");
+        assert_eq!(n, 1);
+        assert_eq!(
+            store
+                .list()
+                .iter()
+                .map(|s| s.identity.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["a".to_string()]
+        );
     }
 
     /// F74:凭据保存一次,`store.credentials()` 里就得有它,且拿得到的是

@@ -18,7 +18,7 @@ mod highlight;
 mod inherit_row;
 mod jump_preview;
 mod keys;
-mod keyscan;
+pub(crate) mod keyscan;
 pub(crate) mod list;
 mod tab_badge;
 mod tags;

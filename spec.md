@@ -74,7 +74,7 @@ Mullion 的赌注是：**这个交集市场没人做，而它正在快速变大*
 | ID | 需求 | 优先级 | 验收标准 |
 |---|---|---|---|
 | F1 | SSH 密码 / 公钥 / ssh-agent 认证 | P0 | 三种方式各有一个针对真实 sshd 容器的集成测试 |
-| F2 | 导入 `~/.ssh/config`（Host / HostName / Port / User / IdentityFile / ProxyJump） | P0 | 给定 fixture config，解析结果与预期 struct 相等 |
+| F2 | 导入 `~/.ssh/config`（Host / HostName / Port / User / IdentityFile / ProxyJump） | P0 | 给定 fixture config，解析结果与预期 struct 相等。**已实现（v0.1.42）**：解析器在 `mullion-store::ssh_config`（零 IO，按 `man ssh_config` 的 **first-obtains** 语义合并通配块），入口是菜单「会话 → 导入 ssh config…」→ 预览勾选 → 批量落库；`ProxyJump` 两阶段回填成本项目的跳板引用，指向批外的别名会话照导、跳板留空并在预览里标黄。**`IdentityFile` 只把路径记进会话备注、不读私钥正文**（v5 起私钥正文入库，批量代读等于替用户做主）；同名会话不覆盖、默认不勾；`Include` 不展开、`Match` 块与否定模式整块跳过，均在预览里逐条说明。设计见 `docs/superpowers/specs/2026-08-13-ssh-config-import-design.md` |
 | F3 | TOFU 主机密钥校验：首次记录指纹，变更时拦截并弹窗（F92「测试连接」触发的指纹确认**仅本次信任、不写 known_hosts**——一次拨测不该在用户还没决定要不要保存这个会话时就改动信任库。） | P0 | 指纹不匹配时连接必须失败；单测断言 `verify()` 返回 false |
 | F3-a | `known_hosts` 的 key 采用 OpenSSH 的 `[host]:port` 形式（端口为 22 时省略方括号只写 `host`） | P2 | 单测：同主机名不同端口是两条独立记录；旧的裸 `host` 记录仍能读出（迁移兼容）。**现状（v0.1.7）key 只用主机名，同主机换端口会误报「密钥已变更」** |
 | F4 | SOCKS5 / HTTP CONNECT 代理，含带认证的 | P0 | 对本地 mock 代理的集成测试 |
@@ -96,7 +96,7 @@ Mullion 的赌注是：**这个交集市场没人做，而它正在快速变大*
 | F18 | 划选复制 / 粘贴，粘贴走 bracketed paste | P1 | 单测：开启 bracketed paste 时粘贴内容被 `ESC[200~` 包裹 |
 | F19 | 终端内搜索（正则） | P2 | — |
 | F20 | 链接识别 + Ctrl 点击打开 | P2 | — |
-| F21 | 可配置显示字体（字体族 / 字号 / 字重，随 DPI 缩放，跟随 `ScaleFactorChanged` 动态更新） | P1 | 配置解析单测；字体族缺失时优雅回退。当前 MVP 硬编码 Google Sans Code / Normal / 10pt，待做成可配置 |
+| F21 | 可配置显示字体（字体族 / 字号 / 字重，随 DPI 缩放，跟随 `ScaleFactorChanged` 动态更新） | P1 | 配置解析单测；字体族缺失时优雅回退。**已实现（v0.1.39）**：字体族 / 字号在设置弹窗（F84）里可配，落 `settings.toml`；字重仍是 Normal 一档 |
 
 ### 4.3 分屏（本项目的自研核心）
 
@@ -388,6 +388,7 @@ UI 不出——每条隧道启动都是一次完整建链，可能要 TOFU/密�
 | **插队** | F110–F117 | 隧道可用（§4.12，2026-08 取货）。**排在 F50–F55 之前**，SFTP 相应推后 |
 | **插队** | F118–F119 | SFTP 节点管理 + 表单规范（2026-08）。**F50–F57 SFTP 传输本体仍在其后**（含 P2 的 F56/F57，比 v0.4 里程碑的 F50–F55 范围更大），本档只管节点配置 |
 | **插队** | F74 | 凭据实体（2026-08-13，v0.1.41）。一份凭据被多条会话引用，换密钥只改一处；schema v8→v9。**F75 去重提取仍未做** |
+| **插队** | F2 | 导入 `~/.ssh/config`（2026-08-13，v0.1.42）。`spec.md` 里最后一个 P0 落地 |
 | **D 系列** | F36 → F50/F120 → F54–F57 → F53 → F52/F58/F59 | SFTP 文件浏览器（2026-08-12 取货，设计见 `docs/superpowers/specs/2026-08-12-sftp-browser-design.md`）。分五片各自发版：**D0** 标签页最小版（F36 提前，因为 SFTP 节点连上后需要地方安放）→ **D1** 只读浏览 + 书签/默认目录（F50/F120，schema v8）→ **D2** 写操作与传输（F54–F57）→ **D3** 编辑（F53）→ **D4** 拖拽三类（F52/F58/F59）。F37 持久化**不在内**，仍归 v0.5 |
 
 **v0.1 的判定标准是人工目视，不是测试通过。** 终端仿真的坑只在真实 TUI 下暴露，

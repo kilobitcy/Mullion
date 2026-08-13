@@ -52,6 +52,11 @@ pub fn top_menu(
                         ui_state.group_manager_open = true;
                         ui.close_menu();
                     }
+                    // F2:导入是一次性动作,不做开机自动发现(设计 D7)。
+                    if ui.button("导入 ssh config…").clicked() {
+                        ui_state.import_pick_request = true;
+                        ui.close_menu();
+                    }
                     if ui
                         .add_enabled(connected, egui::Button::new("断开"))
                         .clicked()

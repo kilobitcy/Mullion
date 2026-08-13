@@ -10,6 +10,7 @@ pub mod group_manager;
 pub mod host_key;
 pub mod ico;
 pub mod icon;
+pub mod import_dialog;
 pub mod metrics;
 pub mod pane_title;
 pub mod paste;
@@ -68,6 +69,15 @@ pub struct UiState {
     /// 出来)。**不直接改 `App::settings`**:字号拖动即预览,没有草稿就没法
     /// 在「取消」时回滚。
     pub settings_draft: Option<settings::SettingsDraft>,
+    /// F2:「导入 ssh config…」被点了 → `app.rs` 事后开系统文件对话框。
+    pub import_pick_request: bool,
+    /// F2:导入预览弹窗的状态。`Some` = 弹窗开着(文件已解析)。
+    ///
+    /// **必须计进 `app.rs::modal_open`**:里面有勾选框和按钮,不算模态的话
+    /// 键盘会同时被发去远端(T8)。
+    pub import: Option<import_dialog::ImportState>,
+    /// F2:预览里按了「导入」,值是**勾选后的那份行**。由 `app.rs` 落库。
+    pub import_request: Option<Vec<import_dialog::ImportRow>>,
     /// F71:启动解锁框。`Some` = `secrets.enc` 由主密码加密、还没解开,
     /// 此刻**会话库尚未打开**。`None` = 不需要密码或已经解开。
     pub unlock: Option<unlock::UnlockDraft>,
@@ -706,6 +716,9 @@ pub fn build_ui(
     if ui_state.group_manager_open {
         group_manager::show(ctx, ui_state, frame.groups);
     }
+    // F2:ssh config 导入预览。排在会话管理器之后 —— 它是从菜单发起的模态,
+    // 该盖在会话管理器上面(用户可能是开着管理器时想起来要导入的)。
+    import_dialog::show(ctx, t, ui_state);
     // D2:远端写操作确认框。排在会话管理器/分组管理器之后 —— 它是从文件
     // 面板发起的模态,该盖在别的窗口上;排在 toast 之前 —— 操作反馈永远
     // 在最上面(走查 13)。

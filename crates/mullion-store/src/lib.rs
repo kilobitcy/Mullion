@@ -18,6 +18,7 @@ pub mod network;
 pub mod secrets_file;
 pub mod settings;
 pub mod sftp;
+pub mod ssh_config;
 pub mod tunnel;
 pub mod vault;
 
@@ -44,5 +45,6 @@ pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
 pub use secrets_file::Scheme;
 pub use settings::{Settings, CURRENT_SETTINGS_SCHEMA, MAX_FONT_PT, MIN_FONT_PT};
 pub use sftp::{Bookmark, SftpPrefs};
+pub use ssh_config::{parse as parse_ssh_config, HostEntry, ParsedConfig, SkipNote};
 pub use tunnel::{TunnelId, TunnelKind, TunnelRecord};
 pub use vault::{CredentialDraft, ResolvedAuth, SessionDraft, TunnelDraft, Unlock, Vault};
