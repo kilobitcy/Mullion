@@ -213,6 +213,22 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+/// 铺在 `bg` 上的文字该用深色还是浅色。
+///
+/// **实算对比度取胜者**,不按亮度阈值拍脑袋:阈值法在中间调(#808080 一带)
+/// 两边都勉强,而 F122 的标签底色是用户自选的任意 hex,没有色板纪律兜底。
+///
+/// 两个候选取纯黑/纯白:任何底色上,这两个里至少有一个 ≥ 4.5:1。
+pub fn readable_fg(bg: Rgb) -> Rgb {
+    let dark = Rgb::new(0, 0, 0);
+    let light = Rgb::new(0xff, 0xff, 0xff);
+    if contrast_ratio(dark, bg) >= contrast_ratio(light, bg) {
+        dark
+    } else {
+        light
+    }
+}
+
 /// 输入框占位符文字。**所有 `hint_text` 都必须走这里。**
 ///
 /// egui 画 hint 用的是 `Visuals::weak_text_color()`
@@ -467,6 +483,25 @@ mod tests {
         assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01);
         assert!((contrast_ratio(white, black) - 21.0).abs() < 0.01, "对称");
         assert!((contrast_ratio(white, white) - 1.0).abs() < 1e-9);
+    }
+
+    /// F122:整块上色后,标题文字的对比度不能再靠色板纪律 —— 用户配的是任意
+    /// hex。`readable_fg` 必须在任何底色上都给出 ≥ 4.5:1(WCAG 1.4.3 文本阈值)。
+    ///
+    /// 自证会变红:把 `readable_fg` 改成恒返回浅色。
+    #[test]
+    fn readable_fg_clears_the_text_threshold_on_any_background() {
+        // 8 个预设直接取 `LABEL_PALETTE`,不手抄一份 —— 抄的那份改了色板不会跟着变。
+        let presets = LABEL_PALETTE.iter().map(|(_, hex, _)| *hex);
+        for hex in presets.chain(["#000000", "#ffffff", "#808080"]) {
+            let bg = parse_hex(hex).unwrap();
+            let fg = readable_fg(bg);
+            assert!(
+                contrast_ratio(fg, bg) >= 4.5,
+                "{hex} 上的前景色只有 {:.2}:1",
+                contrast_ratio(fg, bg)
+            );
+        }
     }
 
     /// 走查 P2-17:占位符文字要达 WCAG AA 的 4.5:1。

@@ -20,6 +20,7 @@ mod jump_preview;
 mod keys;
 pub(crate) mod keyscan;
 pub(crate) mod list;
+pub(crate) mod reorder;
 mod tab_badge;
 mod tags;
 pub(crate) mod tunnel_editor;

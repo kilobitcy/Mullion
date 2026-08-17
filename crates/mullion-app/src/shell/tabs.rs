@@ -8,6 +8,7 @@
 //! 零 egui/winit/wgpu/tokio,可纯单测。`app.rs` 只做接线。
 
 use mullion_store::SessionId;
+use mullion_term::snapshot::Rgb;
 
 /// 标签身份。**不是下标** —— 下标会因为关闭左边的标签而位移,身份不会。
 ///
@@ -36,7 +37,21 @@ pub struct Tab<C> {
     /// F61/F62 外观查表键(`AppearanceCache::get`)。`None` = 快速连接或 store 不可用,
     /// 此时标签不着色、不画图标。
     pub session_id: Option<SessionId>,
+    /// F122:用户在**这个标签**上改的名字。`None` = 用 `title`。
+    ///
+    /// 覆盖是运行期的:不写 store(会话列表/pane 标题条/状态栏一律不受影响)、
+    /// 也不进 F37 布局快照 —— 关窗口即丢是设计,不是欠账。
+    pub title_override: Option<String>,
+    /// F122:用户在这个标签上配的色。`None` = 退回会话色(`ColorTarget::Tab`)。
+    pub color_override: Option<Rgb>,
     pub content: C,
+}
+
+impl<C> Tab<C> {
+    /// 标签栏上真正显示的名字:本地覆盖优先。
+    pub fn display_title(&self) -> &str {
+        self.title_override.as_deref().unwrap_or(&self.title)
+    }
 }
 
 /// 一列标签 + 活动下标。
@@ -101,6 +116,8 @@ impl<C> Tabs<C> {
             id,
             title,
             session_id,
+            title_override: None,
+            color_override: None,
             content,
         });
         self.active = self.tabs.len() - 1;
@@ -144,10 +161,15 @@ impl<C> Tabs<C> {
     pub fn replace(&mut self, id: TabId, title: String, content: C) -> Option<Tab<C>> {
         let ix = self.tabs.iter().position(|t| t.id == id)?;
         let session_id = self.tabs[ix].session_id;
+        // F122:覆盖是标签自己的事实,重连换的是内容,不该把它抹掉。
+        let title_override = self.tabs[ix].title_override.clone();
+        let color_override = self.tabs[ix].color_override;
         let fresh = Tab {
             id,
             title,
             session_id,
+            title_override,
+            color_override,
             content,
         };
         Some(std::mem::replace(&mut self.tabs[ix], fresh))
@@ -736,5 +758,48 @@ mod tests {
                 "{key:?} 在无模态时本该命中,否则上面那条断言是空跑"
             );
         }
+    }
+
+    /// F122:没设覆盖时显示名 = 连接时拼的 `title`。
+    #[test]
+    fn display_title_falls_back_to_the_connection_title() {
+        let mut tabs = Tabs::default();
+        let id = tabs.open("u@h".into(), None, Fake(1));
+        assert_eq!(tabs.iter().next().unwrap().display_title(), "u@h");
+        let _ = id;
+    }
+
+    /// F122 的核心判据(D3):覆盖挂在**标签**上,不挂在会话上。同一个会话开两个
+    /// 标签,改其中一个,另一个纹丝不动。
+    ///
+    /// 自证会变红:把 `title_override` 改成按 `session_id` 查表。
+    #[test]
+    fn a_title_override_belongs_to_one_tab_not_to_its_session() {
+        let sid = SessionId(7);
+        let mut tabs = Tabs::default();
+        tabs.open("u@h".into(), Some(sid), Fake(1));
+        tabs.open("u@h".into(), Some(sid), Fake(2));
+        tabs.iter_mut().next().unwrap().title_override = Some("日志".into());
+        let shown: Vec<&str> = tabs.iter().map(|t| t.display_title()).collect();
+        assert_eq!(shown, vec!["日志", "u@h"]);
+    }
+
+    /// F37:占位标签重连走 `replace`,它只换 `title`/`content` ——
+    /// 用户改的名字/颜色**必须活过重连**,否则「重连一下名字自己变回去了」。
+    ///
+    /// 自证会变红:在 `replace` 里给新 `Tab` 填 `title_override: None`。
+    #[test]
+    fn reconnecting_a_tab_keeps_its_overrides() {
+        let mut tabs = Tabs::default();
+        let id = tabs.open("占位".into(), None, Fake(1));
+        {
+            let tab = tabs.iter_mut().next().unwrap();
+            tab.title_override = Some("构建机".into());
+            tab.color_override = Some(Rgb::new(0xe0, 0x67, 0x67));
+        }
+        tabs.replace(id, "u@h".into(), Fake(2));
+        let tab = tabs.iter().next().unwrap();
+        assert_eq!(tab.display_title(), "构建机");
+        assert_eq!(tab.color_override, Some(Rgb::new(0xe0, 0x67, 0x67)));
     }
 }

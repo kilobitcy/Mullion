@@ -150,11 +150,33 @@ pub struct TabView<'a> {
     /// E3:改名与配色改的是**会话记录**,没有记录的标签(快速连接 /
     /// 占位标签)两项都得禁掉。不能拿 `appearance.is_some()` 代替 ——
     /// 那是「有没有配过颜色」,不是「有没有会话记录」。
+    ///
+    /// F122:右键「重命名…」/「设置颜色…」不再依据这个字段门控(改名配色
+    /// 现在改的是 `Tab.title_override`/`color_override`,不需要会话记录)——
+    /// 字段本身保留,仍是「切标签」「找会话」等别处逻辑要用的身份。
     pub session_id: Option<mullion_store::SessionId>,
     /// F61/F62:这个标签所属会话的已解析外观。`None` = 没有对应会话记录
     /// (快速连接、或 store 不可用)。**必须来自 `badge::AppearanceCache`**,
-    /// 不许在这里现解析(陷阱 T3)。
+    /// 不许在这里现解析(陷阱 T3)。仅供图标(`paint_icon` 的底色仍参考它)——
+    /// 标签底色改走下面的 `color`。
     pub appearance: Option<&'a crate::ui::badge::Appearance>,
+    /// F122:这个标签的**有效色** = 标签覆盖 ?? 会话色(过 `ColorTarget::Tab`
+    /// 闸门)。在 `app.rs` 构造时算好 —— 一个落点一份判定,`one_tab` 里
+    /// 不许再自己调一次 `should_paint`,两处迟早分叉。
+    pub color: Option<egui::Color32>,
+}
+
+/// F122/D5:标签的**有效色** = 标签覆盖 > 会话色 > 无。
+///
+/// 抽成函数而不是在 `app.rs` 里写 `or_else`:取值序是判据,判据要有一个
+/// 测得着的落点。写反的现象是「标签配了色但显示的是会话色」。
+///
+/// 自证会变红:把 `override_color.or(session_color)` 的两边对调。
+pub fn effective_tab_color(
+    override_color: Option<egui::Color32>,
+    session_color: Option<egui::Color32>,
+) -> Option<egui::Color32> {
+    override_color.or(session_color)
 }
 
 /// 用户这一帧在标签栏上做了什么。每帧至多一个。
@@ -226,6 +248,39 @@ pub fn tab_bar(ctx: &egui::Context, t: &Theme, views: &[TabView<'_>]) -> Option<
     action
 }
 
+/// F122:标签底色。`color` = 有效色(标签覆盖 ?? 会话色),`None` 时退回主题两档。
+///
+/// 非活动标签把有效色按 `INACTIVE_MIX` 混面板底色降一档 —— 一排标签全是满色
+/// 时,「哪个是当前的」就只能靠底部横杠一条线去认了。
+pub fn tab_fill(color: Option<egui::Color32>, active: bool, t: &Theme) -> egui::Color32 {
+    match (color, active) {
+        (Some(c), true) => c,
+        (Some(c), false) => mix(theme::c32(t.bar_tool), c, INACTIVE_MIX),
+        (None, true) => theme::c32(t.panel_head),
+        (None, false) => theme::c32(t.bar_tool),
+    }
+}
+
+/// 非活动标签保留多少节点色。0.55 是「一眼还认得出是哪个颜色」与
+/// 「和活动标签分得开」两边的折中,人工验收清单里有一条专门看它。
+const INACTIVE_MIX: f32 = 0.55;
+
+/// 线性混色。与 `session_manager::list::blend` 同一手法 —— 那个是
+/// `pub(crate)` 到 `session_manager` 内部的私有函数,跨模块复用要先提可见性,
+/// 而这里只用一处,先各留一份;哪天出现第三处再收敛到 `theme`。
+fn mix(base: egui::Color32, top: egui::Color32, a: f32) -> egui::Color32 {
+    let f = |b: u8, t: u8| {
+        (b as f32 + (t as f32 - b as f32) * a)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgb(
+        f(base.r(), top.r()),
+        f(base.g(), top.g()),
+        f(base.b(), top.b()),
+    )
+}
+
 /// 画一个标签。返回它这一帧被点出来的动作。
 ///
 /// 几何上先 `allocate_exact_size` 把地盘钉死,再用 painter 画底/横杠、用一个
@@ -237,15 +292,24 @@ fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<T
         egui::vec2(TAB_W, TAB_H),
         egui::Sense::click().union(egui::Sense::hover()),
     );
-    // F62:节点色只做**底部那条横杠**,不做整块底色 —— 用户配的是任意
-    // #rrggbb,拿它当底色会让标题文字的对比度落到不可读区,而 F80 的色板
-    // 纪律管不到用户自己挑的颜色。没配节点色就退回 accent。
-    let node = v
-        .appearance
-        .and_then(|a| crate::ui::badge::should_paint(a, mullion_store::ColorTarget::Tab));
-    let bg = if v.active { t.panel_head } else { t.bar_tool };
+    let node = v.color;
+    // 「有没有上色」这一个判据后面要用两次(标题前景色、活动横杠色),
+    // 只判一次,不重复 match 同一个 `node`。
+    let colored = node.is_some();
+    let bg = tab_fill(node, v.active, t);
     let p = ui.painter();
-    p.rect_filled(rect, egui::Rounding::same(4.0), theme::c32(bg));
+    p.rect_filled(rect, egui::Rounding::same(4.0), bg);
+    // F122:活动横杠**保留**。整块上色之后它不再表达节点色,只表达
+    // 「哪个是活动标签」—— 有色时用前景色画,才在满色底上看得见。
+    let fg = if colored {
+        theme::c32(theme::readable_fg(mullion_term::snapshot::Rgb::new(
+            bg.r(),
+            bg.g(),
+            bg.b(),
+        )))
+    } else {
+        theme::c32(if v.active { t.fg_strong } else { t.fg_muted })
+    };
     if v.active {
         p.rect_filled(
             egui::Rect::from_min_max(
@@ -253,7 +317,7 @@ fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<T
                 rect.max,
             ),
             egui::Rounding::same(1.0),
-            node.unwrap_or(theme::c32(t.accent)),
+            if colored { fg } else { theme::c32(t.accent) },
         );
     }
     let inner = rect.shrink2(egui::vec2(6.0, 2.0));
@@ -275,19 +339,18 @@ fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<T
             if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
                 let (r, _) =
                     ui.allocate_exact_size(egui::vec2(TAB_ICON, TAB_ICON), egui::Sense::hover());
-                crate::ui::badge::paint_icon(ui.painter(), r, icon, node);
+                // F122:底色改成 `fg`,不再是 `node` —— 标签整块已经是
+                // `node` 那个颜色,拿它给图标垫底会跟标签底色糊成一片,
+                // 垫底这道保护就形同虚设了。
+                crate::ui::badge::paint_icon(ui.painter(), r, icon, Some(fg));
             }
             ui.add(
-                egui::Label::new(egui::RichText::new(v.title).color(theme::c32(if v.active {
-                    t.fg_strong
-                } else {
-                    t.fg_muted
-                })))
-                .truncate()
-                // E1:**必须关掉**。egui 0.30 默认 `selectable_labels = true`,
-                // 可选中文本的 Label 会 sense click 把命中抢走,自己又不做
-                // 任何事 —— 现象是「点标签的文字那一片没反应,点空白处才切」。
-                .selectable(false),
+                egui::Label::new(egui::RichText::new(v.title).color(fg))
+                    .truncate()
+                    // E1:**必须关掉**。egui 0.30 默认 `selectable_labels = true`,
+                    // 可选中文本的 Label 会 sense click 把命中抢走,自己又不做
+                    // 任何事 —— 现象是「点标签的文字那一片没反应,点空白处才切」。
+                    .selectable(false),
             );
         });
     });
@@ -299,27 +362,15 @@ fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<T
     let mut props = false;
     let resp = resp.on_hover_text(v.title);
     resp.context_menu(|ui| {
-        // E3:没有会话记录的标签(快速连接 / 占位标签)改不了名也配不了色 ——
-        // 改的是会话记录本身。禁用而不是隐藏:隐藏了用户会以为功能不存在。
-        let has_session = v.session_id.is_some();
-        if ui
-            .add_enabled(has_session, egui::Button::new("重命名…"))
-            .clicked()
-        {
+        // F122:覆盖挂在标签上,不需要会话记录 —— 快速连接开的标签一样能
+        // 改名配色,原来那道 `add_enabled(has_session, ..)` 的前提已经不存在。
+        if ui.button("重命名…").clicked() {
             props = true;
             ui.close_menu();
         }
-        if ui
-            .add_enabled(has_session, egui::Button::new("设置颜色…"))
-            .clicked()
-        {
+        if ui.button("设置颜色…").clicked() {
             props = true;
             ui.close_menu();
-        }
-        if !has_session {
-            ui.label(
-                egui::RichText::new("这个标签没有对应的会话记录").color(theme::c32(t.fg_dimmer)),
-            );
         }
         ui.separator();
         if ui.button("关闭").clicked() {
@@ -658,6 +709,7 @@ mod tests {
             active: true,
             session_id: None,
             appearance: None,
+            color: None,
         }];
         let texts = tab_titles(&views);
         assert!(
@@ -666,29 +718,19 @@ mod tests {
         );
     }
 
-    /// F62:活动标签底部那条横杠用会话的节点色 —— 且必须过 `ColorTarget::Tab`
-    /// 这道闸门。没勾「标签页」的会话不该在这儿上色(用它自己的颜色画,等于
-    /// 绕过用户在编辑器里做的选择)。
+    /// F122:标签底色从「底部横杠」改成整块背景之后,`TabView.color`(有效色)
+    /// 该不该染已经在 `app.rs` 构造时用 `should_paint`/`ColorTarget::Tab` 判完
+    /// (那道闸门由 `badge::should_paint_only_where_apply_to_says_so` 守着,
+    /// 不该在这里重测)——这条测试收窄成只测「染了色确实进了渲染」。
     ///
-    /// 数「这个颜色的填充矩形」而不是数图形总数:活动标签无论有没有节点色都会
-    /// 画一条横杠(退回 `accent`),总数不变,数总数这条断言会恒绿。
+    /// 数「这个颜色的填充矩形」而不是数图形总数:活动标签无论有没有色都会画
+    /// 一块底,总数不变,数总数这条断言会恒绿。
     ///
-    /// 自证会变红:把 `one_tab` 里 `should_paint` 的 `ColorTarget::Tab` 换成
-    /// `ColorTarget::ListItem`,或把 `node.unwrap_or(...)` 改成只用 `accent`。
+    /// 自证会变红:把 `one_tab` 里 `tab_fill(node, v.active, t)` 换成恒
+    /// `tab_fill(None, v.active, t)`。
     #[test]
-    fn active_tab_uses_the_session_color() {
-        use mullion_store::{ColorSpec, ColorTarget};
+    fn active_tab_paints_its_effective_color_as_full_background() {
         let color = egui::Color32::from_rgb(0x1e, 0x88, 0xe5);
-
-        fn appearance(targets: Vec<ColorTarget>) -> crate::ui::badge::Appearance {
-            crate::ui::badge::Appearance {
-                icon: None,
-                color: Some(ColorSpec {
-                    hex: "#1e88e5".into(),
-                    apply_to: targets,
-                }),
-            }
-        }
 
         fn fills_of(views: &[TabView<'_>], want: egui::Color32) -> usize {
             let ctx = egui::Context::default();
@@ -723,31 +765,66 @@ mod tests {
                 .sum()
         }
 
-        let not_tab = appearance(vec![ColorTarget::ListItem]);
-        let views = [TabView {
+        let none = [TabView {
             title: "build-01",
             active: true,
             session_id: None,
-            appearance: Some(&not_tab),
+            appearance: None,
+            color: None,
         }];
         assert_eq!(
-            fills_of(&views, color),
+            fills_of(&none, color),
             0,
-            "只勾了「会话列表」的会话,不该把这个颜色画到标签上"
+            "没配有效色的标签不该出现这个颜色的填充"
         );
 
-        let tab = appearance(vec![ColorTarget::Tab]);
-        let views = [TabView {
+        let colored = [TabView {
             title: "build-01",
             active: true,
             session_id: None,
-            appearance: Some(&tab),
+            appearance: None,
+            color: Some(color),
         }];
         assert_eq!(
-            fills_of(&views, color),
+            fills_of(&colored, color),
             1,
-            "勾了「标签页」的活动标签,底部横杠应该恰好用这个颜色画一次"
+            "配了有效色的活动标签,底色应该恰好用这个颜色整块画一次"
         );
+    }
+
+    /// F122:标签底色四象限。有色时整块上色(活动满色、非活动降一档),
+    /// 无色时维持原来的两档主题底色。
+    ///
+    /// 自证会变红:让非活动有色标签也返回满色 —— 第二条断言会红。
+    #[test]
+    fn tab_fill_covers_the_four_cases() {
+        let t = &crate::theme::MULLION_DARK;
+        let c = egui::Color32::from_rgb(0xe0, 0x67, 0x67);
+        assert_eq!(tab_fill(Some(c), true, t), c, "活动 + 有色 = 满色");
+        assert_ne!(tab_fill(Some(c), false, t), c, "非活动要降一档");
+        assert_ne!(
+            tab_fill(Some(c), false, t),
+            theme::c32(t.bar_tool),
+            "降一档不等于不上色"
+        );
+        assert_eq!(tab_fill(None, true, t), theme::c32(t.panel_head));
+        assert_eq!(tab_fill(None, false, t), theme::c32(t.bar_tool));
+    }
+
+    /// F122/D5:取值序的判据要有一个测得着的落点(`effective_tab_color`),
+    /// 不是在测试体里现造一个闭包重新定义一遍语义 —— 那样测的是
+    /// `Option::or` 自己的行为,跟生产代码里真正的取值序毫无连接,写反了
+    /// 也照样绿(本项目记过教训的「常量重言式」恒绿模式)。
+    ///
+    /// 自证会变红:把 `effective_tab_color` 里 `override_color.or(session_color)`
+    /// 的两边对调。
+    #[test]
+    fn the_override_colour_wins_over_the_session_colour() {
+        let over = egui::Color32::from_rgb(1, 2, 3);
+        let session = egui::Color32::from_rgb(4, 5, 6);
+        assert_eq!(effective_tab_color(Some(over), Some(session)), Some(over));
+        assert_eq!(effective_tab_color(None, Some(session)), Some(session));
+        assert_eq!(effective_tab_color(None, None), None);
     }
 
     /// 标签栏占了中央区多少高度。`None` = 这一帧根本没画标签栏。
@@ -758,6 +835,7 @@ mod tests {
                 active: i == 0,
                 session_id: None,
                 appearance: None,
+                color: None,
             })
             .collect();
         let ctx = egui::Context::default();
@@ -821,12 +899,14 @@ mod tests {
                 active: true,
                 session_id: None,
                 appearance: None,
+                color: None,
             },
             TabView {
                 title: "build-02",
                 active: false,
                 session_id: None,
                 appearance: None,
+                color: None,
             },
         ];
         let mut paths = Vec::new();
@@ -903,12 +983,14 @@ mod tests {
                 active: true,
                 session_id: None,
                 appearance: None,
+                color: None,
             },
             TabView {
                 title: "第二个",
                 active: false,
                 session_id: None,
                 appearance: None,
+                color: None,
             },
         ];
         let ctx = egui::Context::default();
@@ -964,12 +1046,14 @@ mod tests {
                 active: true,
                 session_id: None,
                 appearance: None,
+                color: None,
             },
             TabView {
                 title: "第二个",
                 active: false,
                 session_id: Some(mullion_store::SessionId(1)),
                 appearance: None,
+                color: None,
             },
         ];
         let ctx = egui::Context::default();
@@ -1081,50 +1165,35 @@ mod tests {
         got
     }
 
-    /// E3:`has_session`(右键菜单「重命名…」/「设置颜色…」的启用判据)必须
-    /// 锁在 `session_id.is_some()` 上,不能换成 `appearance.is_some()`——
-    /// 后者是「有没有配过颜色」,不是「有没有会话记录」。
+    /// F122/D6:标签属性(改名/配色)现在改的是 `Tab.title_override`/
+    /// `color_override`,挂在标签自己身上,不再依赖会话记录 —— 快速连接开出
+    /// 的标签(`session_id == None`)右键「重命名…」「设置颜色…」也必须点得动。
     ///
-    /// 真实差异窗口:新建会话到 `AppearanceCache` 重算之间的那一帧,
-    /// `session_id` 已经有效,但外观缓存(`appearance`)还没跟上,仍是
-    /// `None`——此刻菜单项必须仍然可点,不能因为外观缓存慢半拍就一起被挡。
-    /// 反过来,没有会话记录的标签(快速连接)哪怕外观缓存里凑巧留着一条
-    /// 陈旧的 `Appearance`,也不该被误判成「有会话」而放行。
+    /// 这条测试的前身(`has_session_gate_is_keyed_on_session_id_not_on_appearance`)
+    /// 测的是「没有会话记录时必须禁用」,前提已被本 task 反转,原地改写成
+    /// 「没有会话记录也必须能点」。
     ///
-    /// 自证会变红:把 `has_session` 的表达式从 `v.session_id.is_some()`
-    /// 换成 `v.appearance.is_some()`。
+    /// 自证会变红:把 `one_tab` 右键菜单里的按钮换回
+    /// `add_enabled(v.session_id.is_some(), ..)`。
     #[test]
-    fn has_session_gate_is_keyed_on_session_id_not_on_appearance() {
+    fn context_menu_items_are_clickable_even_without_a_session_record() {
         let t = crate::theme::MULLION_DARK;
-
-        // 差异窗口:有 session_id,外观缓存还没跟上(appearance = None)——
-        // 「重命名…」必须仍然可点。
-        let fresh_session = [TabView {
-            title: "刚建的会话",
-            active: true,
-            session_id: Some(mullion_store::SessionId(7)),
-            appearance: None,
-        }];
-        assert_eq!(
-            click_context_menu_item(&t, &fresh_session, "刚建的会话", "重命名…"),
-            Some(TabAction::Props(0)),
-            "有会话记录、外观缓存还没跟上时,「重命名…」必须仍然可点"
-        );
-
-        // 反方向:没有 session_id,但外观缓存里留着一条陈旧的 appearance——
-        // 不该被误判成「有会话」。
-        let stale_appearance = crate::ui::badge::Appearance::default();
         let quick_connect = [TabView {
             title: "快速连接",
             active: true,
             session_id: None,
-            appearance: Some(&stale_appearance),
+            appearance: None,
+            color: None,
         }];
         assert_eq!(
             click_context_menu_item(&t, &quick_connect, "快速连接", "重命名…"),
-            None,
-            "没有会话记录的标签,哪怕外观缓存里留着陈旧的 appearance,\
-             也不该能点「重命名…」"
+            Some(TabAction::Props(0)),
+            "没有会话记录的标签,右键「重命名…」现在也该能点通"
+        );
+        assert_eq!(
+            click_context_menu_item(&t, &quick_connect, "快速连接", "设置颜色…"),
+            Some(TabAction::Props(0)),
+            "没有会话记录的标签,右键「设置颜色…」现在也该能点通"
         );
     }
 }

@@ -390,6 +390,45 @@ impl Vault {
         Ok(())
     }
 
+    /// F121:把一条会话挪到 `before` 之前(`None` = 末尾),顺带改组。
+    ///
+    /// 组内排序与跨组拖动**共用这一个入口** —— 拆成两个函数会让「跨组时位置
+    /// 怎么算」有两份实现,而这两份必然分叉。
+    ///
+    /// `before` 指向的记录不存在时落到末尾而不是报错:UI 拿到 id 与松手之间
+    /// 隔着若干帧,那条记录可能刚被删掉,这不是异常。
+    ///
+    /// **不重打 `modified_at`**:换位置是组织动作,不是内容变更(同 `set_group`)。
+    pub fn move_session(
+        &mut self,
+        id: SessionId,
+        group: Option<GroupId>,
+        before: Option<SessionId>,
+    ) -> Result<(), StoreError> {
+        if before == Some(id) {
+            return Ok(());
+        }
+        let from = self
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or(StoreError::NotFound(id))?;
+        let mut rec = self.sessions.remove(from);
+        rec.identity.group_id = group;
+        // 下标必须在 `remove` **之后**再算:先算的话,目标在被拖走那条右边时
+        // 会因为整体左移而差一位。
+        let at = match before {
+            Some(t) => self
+                .sessions
+                .iter()
+                .position(|s| s.id == t)
+                .unwrap_or(self.sessions.len()),
+            None => self.sessions.len(),
+        };
+        self.sessions.insert(at, rec);
+        Ok(())
+    }
+
     pub fn groups(&self) -> &[GroupRecord] {
         &self.groups
     }
@@ -2335,5 +2374,115 @@ has_passphrase = false
             Some("NEW-KEY-ALREADY-IMPORTED"),
             "侧车里已有的私钥不该被旧路径里的内容覆盖"
         );
+    }
+
+    // ---- F121 手动排序 --------------------------------------------------
+
+    /// F121:组内前移。`before` 指向谁,就插在谁**前面**。
+    ///
+    /// 自证会变红:把实现里「先 remove 再定位 before」改成「先定位再 remove」——
+    /// 目标在被拖走那条右边时会差一位。
+    #[test]
+    fn move_session_puts_the_record_right_before_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let mut names = Vec::new();
+        for n in ["a", "b", "c"] {
+            let mut d = draft();
+            d.identity.name = n.into();
+            names.push(v.add(d, "2026-08-16T00:00:00Z"));
+        }
+        // c 挪到 a 前面 → c, a, b
+        v.move_session(names[2], None, Some(names[0])).unwrap();
+        let order: Vec<&str> = v.list().iter().map(|r| r.identity.name.as_str()).collect();
+        assert_eq!(order, vec!["c", "a", "b"]);
+
+        // a 挪到 b 前面(目标在自己右边)→ c, a, b 不变
+        v.move_session(names[0], None, Some(names[1])).unwrap();
+        let order: Vec<&str> = v.list().iter().map(|r| r.identity.name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["c", "a", "b"],
+            "先定位再 remove 会把 a 插到 b 后面"
+        );
+    }
+
+    /// `before = None` = 挪到末尾。组内最后一行的下半区落点走这条。
+    #[test]
+    fn move_session_with_no_target_goes_to_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let mut ids = Vec::new();
+        for n in ["a", "b", "c"] {
+            let mut d = draft();
+            d.identity.name = n.into();
+            ids.push(v.add(d, "2026-08-16T00:00:00Z"));
+        }
+        v.move_session(ids[0], None, None).unwrap();
+        let order: Vec<&str> = v.list().iter().map(|r| r.identity.name.as_str()).collect();
+        assert_eq!(order, vec!["b", "c", "a"]);
+    }
+
+    /// 跨组拖动:顺带改 `group_id`。位置与组两件事一个入口做完 ——
+    /// 分两次调用会在中间留下一个「已经改了组、还没挪位置」的可观察状态。
+    #[test]
+    fn move_session_across_groups_sets_the_group_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let gid = v.add_group("生产".into());
+        let a = v.add(draft(), "2026-08-16T00:00:00Z");
+        v.move_session(a, Some(gid), None).unwrap();
+        assert_eq!(v.get(a).unwrap().identity.group_id, Some(gid));
+    }
+
+    /// 拖到自己身上 = 什么都不做,**不报错**。UI 侧已经挡了一道,
+    /// 这里再挡一道:报错会让上层弹一个用户看不懂的失败提示。
+    #[test]
+    fn move_session_onto_itself_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let a = v.add(draft(), "2026-08-16T00:00:00Z");
+        let b = v.add(draft(), "2026-08-16T00:00:00Z");
+        v.move_session(a, None, Some(a)).unwrap();
+        assert_eq!(
+            v.list().iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+    }
+
+    /// `before` 指向一条已经不存在的记录(别处刚删掉)→ 落到末尾,不报错。
+    #[test]
+    fn move_session_with_a_dangling_target_falls_back_to_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let a = v.add(draft(), "2026-08-16T00:00:00Z");
+        let b = v.add(draft(), "2026-08-16T00:00:00Z");
+        v.move_session(a, None, Some(SessionId(9999))).unwrap();
+        assert_eq!(
+            v.list().iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![b, a]
+        );
+    }
+
+    /// 被拖的记录不存在 → `Err`。这一条是真错误(UI 手上的 id 来自本帧列表)。
+    #[test]
+    fn move_session_reports_a_missing_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert!(v.move_session(SessionId(9999), None, None).is_err());
+    }
+
+    /// 换位置不算「改了这条会话」——`modified_at` 不许动(同 `set_group` 的理由)。
+    ///
+    /// 自证会变红:在 `move_session` 里补一句写 `modified_at`。
+    #[test]
+    fn move_session_does_not_touch_modified_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let a = v.add(draft(), "2026-08-16T00:00:00Z");
+        let b = v.add(draft(), "2026-08-16T00:00:00Z");
+        let before = v.get(a).unwrap().modified_at.clone();
+        v.move_session(a, None, Some(b)).unwrap();
+        assert_eq!(v.get(a).unwrap().modified_at, before);
     }
 }

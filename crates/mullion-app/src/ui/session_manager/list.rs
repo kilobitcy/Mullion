@@ -5,12 +5,17 @@
 
 use egui::{NumExt as _, Ui};
 use mullion_store::model::SessionRecord;
-use mullion_store::{GroupRecord, SessionId};
+use mullion_store::{GroupId, GroupRecord, SessionId};
 
 use crate::theme::{self, Theme};
 use crate::ui::annotate;
 use crate::ui::session_manager::{group_header, SwitchTarget};
 use crate::ui::UiState;
+
+/// F121:拖拽载荷。裹一层 newtype 而不是直接用 `SessionId` —— egui 的
+/// `DragAndDrop` 按类型取载荷,裸 id 会跟将来别处的拖拽撞类型。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DragSession(pub SessionId);
 
 /// 左栏的三档密度(F61)。**宽度是唯一输入** —— 用户拖分隔条就是在选档。
 ///
@@ -163,9 +168,12 @@ fn session_row(
     query: &str,
     d: Density,
 ) -> egui::Response {
+    // F121:这一行既是拖源也是落点,`Sense` 必须同时认点击和拖拽 ——
+    // 只留 `click()` 的话 `drag_started()` 永远为假,拖拽整个功能安静地
+    // 不存在。
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_h(d)),
-        egui::Sense::click(),
+        egui::Sense::click_and_drag(),
     );
     let p = ui.painter();
 
@@ -562,6 +570,10 @@ pub(super) fn show(
     // 之后 `available_width` 已经扣掉滚动条,会在阈值附近来回抖档。
     let d = density_for(ui.available_width());
 
+    // F121/D9:这一帧准不准拖。搜索中或 `Icons` 档下有行被藏起来,可见顺序
+    // 不等于真实顺序,落点是歧义的 —— 见 `reorder::drag_enabled`。
+    let drag_on = super::reorder::drag_enabled(&ui_state.search, d);
+
     // 底部「分隔线 + 新建按钮」用 `TopBottomPanel::bottom` 先占位:egui 的面板
     // 布局保证面板先分配自己的高度,再把外层 `ui` 的可用区底边收缩到面板上沿
     // (见 egui-0.30.0 `containers/panel.rs::show_inside` 里 `TopBottomSide::Bottom`
@@ -606,6 +618,8 @@ pub(super) fn show(
 
     let mut hidden = 0usize;
     egui::ScrollArea::vertical()
+        // F121:**必须关掉**,理由见 `the_list_scroll_area_does_not_eat_drags`。
+        .drag_to_scroll(false)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             // 用 `group_manager::group_sessions` 归桶(而不是自己按 group_id 手动
@@ -644,15 +658,22 @@ pub(super) fn show(
                 // 搜索期间强制展开:`default_open` 只在 CollapsingState 首次
                 // 加载时生效,用户手动折叠过就被持久化进 ctx.data(),再也展不开。
                 let force = if searching { Some(true) } else { None };
+                // 只取 id,给 `reorder::next_in_group` 用 —— 组内下一条只关心
+                // 顺序,不关心记录本身。
+                let member_ids: Vec<SessionId> = members.iter().map(|r| r.id).collect();
                 let header = group_header(&title, gid, members.len())
                     .open(force)
                     .show(ui, |ui| {
-                        for r in &members {
+                        for (i, r) in members.iter().enumerate() {
+                            let next = super::reorder::next_in_group(&member_ids, i);
                             row(
                                 ui,
                                 t,
                                 ui_state,
                                 r,
+                                next,
+                                gid,
+                                drag_on,
                                 sessions,
                                 groups,
                                 credentials,
@@ -672,6 +693,13 @@ pub(super) fn show(
                     format!("会话管理器/左栏/分组头「{title}」"),
                     header.header_response.rect,
                 );
+                // F121:分组头也是落点 —— 折叠的组、空组只能从这里进去。
+                if drag_on {
+                    if let Some(from) = header.header_response.dnd_release_payload::<DragSession>()
+                    {
+                        ui_state.reorder_request = Some(super::reorder::drop_on_group(from.0, gid));
+                    }
+                }
             }
             if hidden > 0 {
                 ui.add_space(crate::ui::metrics::SP_XS);
@@ -711,6 +739,12 @@ fn row(
     t: &Theme,
     ui_state: &mut UiState,
     rec: &SessionRecord,
+    // F121:这一行在**本组可见顺序**里的下一条(组内最后一行 = `None`)、
+    // 它所在的组、以及这一帧准不准拖 —— 三者都由 `show()` 算一次传下来,
+    // 落点判定层(`reorder::drop_on_row`)照单全收,自己不重算。
+    next_in_group: Option<SessionId>,
+    group: Option<GroupId>,
+    drag_on: bool,
     sessions: &[SessionRecord],
     groups: &[GroupRecord],
     credentials: &[mullion_store::CredentialRecord],
@@ -740,6 +774,48 @@ fn row(
         None => format!("{}@{}", user, rec.connection.host),
     };
     let resp = session_row(ui, t, rec, &sub, selected, a, &ui_state.search, d);
+
+    // F121:行既是拖源也是落点。
+    let resp = if drag_on {
+        // `dnd_set_drag_payload` 内部第一件事就是 `if self.drag_started()`
+        // (见本地锁定版 egui-0.30.0 `response.rs:420-430`),外层不必再判一次。
+        resp.dnd_set_drag_payload(DragSession(rec.id));
+        // 插入线要在**松手之前**看得见:落点规则不写在屏幕上,用户就只能
+        // 松手试一次再撤销(而这里没有撤销)。跟下面松手判定用同一个
+        // `interact_pos()`——两处判的是同一件事(指针在上半还是下半),
+        // 用两个不同访问器是无谓的风险敞口。
+        if let Some(from) = egui::DragAndDrop::payload::<DragSession>(ui.ctx()) {
+            if from.0 != rec.id && resp.contains_pointer() {
+                let upper = ui
+                    .input(|i| i.pointer.interact_pos())
+                    .is_some_and(|p| p.y < resp.rect.center().y);
+                let y = if upper {
+                    resp.rect.top()
+                } else {
+                    resp.rect.bottom()
+                };
+                ui.painter().hline(
+                    resp.rect.x_range(),
+                    y,
+                    egui::Stroke::new(2.0, theme::c32(t.accent)),
+                );
+            }
+        }
+        if let Some(from) = resp.dnd_release_payload::<DragSession>() {
+            let upper = ui
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| p.y < resp.rect.center().y);
+            ui_state.reorder_request =
+                super::reorder::drop_on_row(from.0, rec.id, group, next_in_group, upper);
+        }
+        resp
+    } else {
+        // D9:搜索中 / 图标档下有行被藏起来,可见顺序不等于真实顺序,松手落
+        // 在两行之间到底插在哪一条隐藏行前后是歧义的 —— 不猜,直接不让拖,
+        // 并说明原因(不然用户只会觉得「怎么拖不动」)。
+        resp.on_hover_text("搜索中 / 图标档下不能拖动排序 —— 有行被藏起来,落点会有歧义")
+    };
+
     // 带上会话名:同一个插桩点会登记出十几行,只写「会话行」的话导出里全是
     // 一模一样的路径,读的人分不出说的是哪一行。
     annotate::mark(
@@ -2665,6 +2741,236 @@ mod tests {
         assert!(
             !has(super::super::LIST_MIN_W, "dev-box"),
             "纯图标档不该有名称"
+        );
+    }
+
+    /// F58 踩过的坑,这里必须再钉一次:`ScrollArea` 的 `drag_to_scroll` 默认开着,
+    /// 它在视口上注册一个吃 drag 的部件,把按在行上的那一下抢去当滚动手势 ——
+    /// 行的 `drag_started()` 永远为假,拖拽排序整个功能安静地不存在。
+    ///
+    /// 自证会变红:删掉 `show()` 里 `ScrollArea::vertical()` 那行关闭调用。
+    /// **只看 `#[cfg(test)]` 之前的正文**:本测试自己的文档注释/断言消息里
+    /// 也会提到那行调用的写法,`include_str!` 整份文件搜的话会跟这段注释
+    /// 自我匹配上,把真实调用点删掉之后测试还是绿的——那就是一条测不出
+    /// 回归的假测试。
+    #[test]
+    fn the_list_scroll_area_does_not_eat_drags() {
+        let src = include_str!("list.rs");
+        let production = src.split("#[cfg(test)]").next().expect("拆不出正文部分");
+        assert!(
+            production.contains(".drag_to_scroll(false)"),
+            "左栏 ScrollArea 没关掉 drag_to_scroll,行的 drag_started() 会恒假(F58/F121)"
+        );
+    }
+
+    /// 用真实指针事件驱动一次完整拖拽(源行按下 → 移动超过阈值 → 落到目标
+    /// 行上半区松手),断言落点意图真的写进了 `ui_state.reorder_request`——
+    /// `reorder::drop_on_row` 本身已经在 `reorder.rs` 单测过,这里测的是
+    /// UI 有没有真的接上它。手法照抄
+    /// `pending_delete_set_this_frame_by_context_menu_is_not_erased_in_the_same_frame`
+    /// 的「多帧真实指针事件」套路,不是直接手动赋值验证稳态。
+    ///
+    /// 关键的一帧:源行按下后,只发一个下移超过 6px(egui
+    /// `InputState::max_click_dist`)的 `PointerMoved`,**不重发**
+    /// `PointerButton` 按下事件——`PointerState::down` 本身跨帧持久
+    /// (见 `PointerState::begin_pass` 只在收到 `PointerButton` 事件时才改
+    /// `self.down`)。这一帧里 `has_moved_too_much_for_a_click` 才会变真,
+    /// `is_decidedly_dragging` 才会变真,源行的 `drag_started()` 才会为真,
+    /// `dnd_set_drag_payload` 才会真的把载荷放进 `DragAndDrop`。
+    ///
+    /// 这条测试同时钉住了这条链路上的每一环:`Sense::click_and_drag()`
+    /// (不然 `drag_started()` 恒假)、`dnd_set_drag_payload`/
+    /// `dnd_release_payload` 的接线、以及 `resp.rect.center().y` 的上下半区
+    /// 判定。
+    #[test]
+    fn dropping_on_the_upper_half_of_a_row_writes_a_reorder_request() {
+        let sessions = vec![
+            rec(1, "session-a-drag-src", "192.0.2.10", &[]),
+            rec(2, "session-b-drag-target", "192.0.2.20", &[]),
+        ];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            let t = crate::theme::MULLION_DARK;
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        &[],
+                        &[],
+                        &[],
+                        &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
+                    );
+                });
+            })
+        };
+
+        // 两帧空跑,让布局稳定下来再取文字锚点。
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let src_pos = find_text_pos(&out.shapes, "session-a-drag-src")
+            .expect("源行 session-a 应该已经画出来了");
+        let dst_pos = find_text_pos(&out.shapes, "session-b-drag-target")
+            .expect("目标行 session-b 应该已经画出来了");
+        // `session_row` 画名字的锚点是 `rect.top()+NAME_TOP(9)`;行高 48,
+        // 行中心在 `rect.top()+24`。`+15` 落在行体中间(同既有测试
+        // `row_click_pos` 的算法),`+5` 落在中心线之上 = 上半区。
+        let src_click = egui::pos2(src_pos.x - 20.0, src_pos.y + 15.0);
+        let dst_upper = egui::pos2(dst_pos.x - 20.0, dst_pos.y + 5.0);
+
+        let primary = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        // 按下源行。
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(src_click),
+                    primary(src_click, true),
+                ],
+                ..Default::default()
+            },
+        );
+        // 下移超过阈值 —— 只发 `PointerMoved`,按住状态本身跨帧持久。
+        let moved = egui::pos2(src_click.x, src_click.y + 30.0);
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(moved)],
+                ..Default::default()
+            },
+        );
+        // 移到目标行上半区并松手。
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(dst_upper),
+                    primary(dst_upper, false),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            ui_state.reorder_request,
+            Some(super::super::reorder::ReorderIntent {
+                id: SessionId(1),
+                group: None,
+                before: Some(SessionId(2)),
+            }),
+            "拖到 session-b 上半区应该插在它前面"
+        );
+    }
+
+    /// 同一条链路的下半区分支:拖到目标行下半区应该插在它**在本组可见顺序
+    /// 里的下一条**前面。三条会话同组,顺带钉住 `show()` 传给 `row()` 的
+    /// `next_in_group` 真的来自这一帧的 `member_ids`(过滤/归桶之后的可见
+    /// 顺序),不是 `matched` 或 `sessions` —— 传错的话第三行会被漏算,
+    /// 下半区落点会插到组尾而不是插在它前面。
+    #[test]
+    fn dropping_on_the_lower_half_of_a_row_inserts_before_the_next_member() {
+        let sessions = vec![
+            rec(1, "session-a-drag-src", "192.0.2.10", &[]),
+            rec(2, "session-b-drag-target", "192.0.2.20", &[]),
+            rec(3, "session-c-drag-tail", "192.0.2.30", &[]),
+        ];
+        let groups: Vec<GroupRecord> = Vec::new();
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            let t = crate::theme::MULLION_DARK;
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &groups,
+                        &[],
+                        &[],
+                        &[],
+                        &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
+                    );
+                });
+            })
+        };
+
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let src_pos = find_text_pos(&out.shapes, "session-a-drag-src")
+            .expect("源行 session-a 应该已经画出来了");
+        let dst_pos = find_text_pos(&out.shapes, "session-b-drag-target")
+            .expect("目标行 session-b 应该已经画出来了");
+        let src_click = egui::pos2(src_pos.x - 20.0, src_pos.y + 15.0);
+        // `+35` 落在中心线(`+24`)之下 = 下半区,但仍在 48px 行高之内。
+        let dst_lower = egui::pos2(dst_pos.x - 20.0, dst_pos.y + 35.0);
+
+        let primary = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(src_click),
+                    primary(src_click, true),
+                ],
+                ..Default::default()
+            },
+        );
+        let moved = egui::pos2(src_click.x, src_click.y + 30.0);
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(moved)],
+                ..Default::default()
+            },
+        );
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(dst_lower),
+                    primary(dst_lower, false),
+                ],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            ui_state.reorder_request,
+            Some(super::super::reorder::ReorderIntent {
+                id: SessionId(1),
+                group: None,
+                before: Some(SessionId(3)),
+            }),
+            "拖到 session-b 下半区应该插在 session-c(它在本组的下一条)前面"
         );
     }
 }

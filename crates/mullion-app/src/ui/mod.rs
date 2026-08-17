@@ -123,6 +123,9 @@ pub struct UiState {
     /// 右键菜单手上只有一个 id,为了改一个 `group_id` 去凭空造一份 draft,一旦
     /// 哪个字段填漏就是静默地把用户的配置改掉。
     pub move_to_group: Option<(SessionId, Option<GroupId>)>,
+    /// F121:左栏拖拽排序的结论。同 `move_to_group`:UI 只写意图,
+    /// `app.rs` 才碰 store。
+    pub reorder_request: Option<session_manager::reorder::ReorderIntent>,
     /// 编辑表单点「保存」→ app 事后据此调 `store.add`/`store.update`。
     pub save_request: Option<session_manager::SaveIntent>,
     /// 正在编辑的会话 id;`None` = 新建。
@@ -312,13 +315,14 @@ pub struct UiState {
     /// F53/D3-12:用户点了关闭,但有编辑没传上去 —— 拦下来问一句。
     pub exit_pending: bool,
 
-    // --- E2/E3:标签属性弹窗(改名 + 配色)。---
+    // --- F122:标签属性弹窗(改名 + 配色,只作用于这个标签自己)。---
     /// 弹窗的编辑缓冲。`None` = 弹窗关着。双击标签 / 右键菜单请求打开时,
-    /// app.rs 据当前会话记录建出一份。
+    /// app.rs 据这个标签**当前的有效值**(覆盖优先,否则会话名/会话色)建一份。
     pub tab_props: Option<tab_props::TabPropsDraft>,
     /// 弹窗里按了「保存」,值先落到这里 —— `UiActions::tab_props` 是
-    /// `render_frame` 每帧重建的局部量,借用释放前就没了;真正碰 store
-    /// 要等 `self.active`/`self.ui` 的借用释放之后(同 `save_request`)。
+    /// `render_frame` 每帧重建的局部量,借用释放前就没了;真正写回
+    /// `self.tabs` 要等 `self.active`/`self.ui` 的借用释放之后(同
+    /// `save_request` 的中转理由,但这里**不碰 store**)。
     pub tab_props_save: Option<tab_props::TabPropsAction>,
 }
 

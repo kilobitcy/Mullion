@@ -123,6 +123,16 @@ impl SessionStore {
         self.vault.set_group(id, group)
     }
 
+    /// F121:左栏拖拽排序。见 `Vault::move_session`。
+    pub fn move_session(
+        &mut self,
+        id: SessionId,
+        group: Option<mullion_store::GroupId>,
+        before: Option<SessionId>,
+    ) -> Result<(), StoreError> {
+        self.vault.move_session(id, group, before)
+    }
+
     pub fn save(&self) -> Result<(), StoreError> {
         self.vault.save()
     }

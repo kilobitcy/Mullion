@@ -1876,6 +1876,8 @@ impl App {
             id: tab_id,
             title: String::new(),
             session_id: Some(session_id),
+            title_override: None,
+            color_override: None,
             content: old_content,
         });
         self.reconnect_tab(tab_id);
@@ -5485,13 +5487,26 @@ impl ApplicationHandler<UserEvent> for App {
                                 .tabs
                                 .iter()
                                 .enumerate()
-                                .map(|(i, tab)| crate::ui::chrome::TabView {
-                                    title: tab.title.as_str(),
-                                    active: i == active_ix,
-                                    session_id: tab.session_id,
-                                    appearance: tab
-                                        .session_id
-                                        .and_then(|sid| self.appearance.get(sid)),
+                                .map(|(i, tab)| {
+                                    let appearance =
+                                        tab.session_id.and_then(|sid| self.appearance.get(sid));
+                                    crate::ui::chrome::TabView {
+                                        title: tab.display_title(),
+                                        active: i == active_ix,
+                                        session_id: tab.session_id,
+                                        appearance,
+                                        // F122:覆盖优先,否则会话色(设计 D5:
+                                        // 同一条视觉通道,一个标签上不出现两种颜色)。
+                                        color: crate::ui::chrome::effective_tab_color(
+                                            tab.color_override.map(theme::c32),
+                                            appearance.and_then(|a| {
+                                                crate::ui::badge::should_paint(
+                                                    a,
+                                                    mullion_store::ColorTarget::Tab,
+                                                )
+                                            }),
+                                        ),
+                                    }
                                 })
                                 .collect();
                             // F37:活动标签是占位标签时,中央区画的东西。同
@@ -5697,46 +5712,38 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui.session_manager_open = true;
                                     self.ui_dirty = true;
                                 }
-                                // E2/E3:双击标签,或右键菜单点了「重命名…」/
-                                // 「设置颜色…」。用会话记录当前的名字/颜色建一份
-                                // 草稿 —— 没有会话记录的标签(快速连接)点不出
-                                // `session_id`,右键菜单里那两项本来就是禁用的,
-                                // 双击这里同样静默不开(没有可编辑的东西)。
+                                // F122:双击标签,或右键菜单点了「重命名…」/
+                                // 「设置颜色…」。初值取**当前有效值**(覆盖优先,
+                                // 否则会话名/会话色)—— 不再去 store 里捞记录,
+                                // 改的东西也不再写回去。
                                 Some(crate::ui::chrome::TabAction::Props(ix)) => {
-                                    if let Some(sid) =
-                                        self.tabs.iter().nth(ix).and_then(|t| t.session_id)
-                                    {
-                                        let (name, color, targets) = self
-                                            .store
-                                            .as_ref()
-                                            .and_then(|s| s.list().iter().find(|r| r.id == sid))
-                                            .map(|rec| {
-                                                let spec = rec.appearance.color.clone();
-                                                let c32 = spec
-                                                    .as_ref()
-                                                    .and_then(|c| theme::parse_hex(&c.hex))
-                                                    .map(theme::c32);
-                                                let targets =
-                                                    spec.map(|c| c.apply_to).unwrap_or_default();
-                                                (rec.identity.name.clone(), c32, targets)
-                                            })
-                                            .unwrap_or_default();
+                                    if let Some(tab) = self.tabs.get(ix) {
+                                        let color = crate::ui::chrome::effective_tab_color(
+                                            tab.color_override.map(theme::c32),
+                                            tab.session_id
+                                                .and_then(|sid| self.appearance.get(sid))
+                                                .and_then(|a| {
+                                                    crate::ui::badge::should_paint(
+                                                        a,
+                                                        mullion_store::ColorTarget::Tab,
+                                                    )
+                                                }),
+                                        );
                                         self.ui.tab_props =
                                             Some(crate::ui::tab_props::TabPropsDraft {
-                                                session_id: sid,
-                                                name,
+                                                tab_id: tab.id,
+                                                name: tab.display_title().to_string(),
                                                 color,
-                                                targets,
                                             });
                                     }
                                     self.ui_dirty = true;
                                 }
                                 None => {}
                             }
-                            // E2/E3:标签属性弹窗按了「保存」。先落到 `self.ui`
+                            // F122:标签属性弹窗按了「保存」。先落到 `self.ui`
                             // 上(同 `save_request` 的中转理由:egui 闭包借不到
-                            // `&mut store`),真正写 store 在下面 `touched_store`
-                            // 那段、`self.active`/`self.ui` 的借用释放之后。
+                            // `&mut self.tabs`),真正施加在下面、`self.active`/
+                            // `self.ui` 的借用释放之后。
                             if let Some(a @ crate::ui::tab_props::TabPropsAction::Save { .. }) =
                                 actions.tab_props.take()
                             {
@@ -5978,23 +5985,23 @@ impl ApplicationHandler<UserEvent> for App {
                 // Task 6:会话管理弹窗的 intent 施加点。放在 `plan` 整块之后——此处
                 // self.active/self.ws/self.ui 的借用都已释放,才能拿 `&mut
                 // self.store`(egui 闭包里借不到它,只能在这里事后统一施加)。
-                // `touched_store` 必须在三个 `take()` 之前算:`take()` 之后就
-                // 问不出「刚才有没有意图」了。F61/F62 的外观缓存要在会话/分组
-                // 变更后重算。
+                // `touched_store` 必须在下面那几个 `take()` 之前算:`take()`
+                // 之后就问不出「刚才有没有意图」了。F61/F62 的外观缓存要在
+                // 会话/分组变更后重算。
                 let touched_store = self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
                     || self.ui.group_intent.is_some()
                     || self.ui.move_to_group.is_some()
+                    // F121:拖拽排序改的是会话的 group_id 与顺序 —— 跨组会换
+                    // 继承来源,外观(图标/颜色)可能跟着变,必须重算全表。
+                    || self.ui.reorder_request.is_some()
                     // F2:导入一次能加进几十条会话,外观缓存必须跟着重算 ——
                     // 漏掉它的话新会话在列表里画的是默认色/默认图标。
-                    || self.ui.import_request.is_some()
-                    // E3:标签属性弹窗改的是会话的 identity.name /
-                    // appearance.color —— 不算进来的话,改了颜色要重启才
-                    // 看得见(AppearanceCache 只在 store 变更后 rebuild)。
-                    || self.ui.tab_props_save.is_some();
+                    || self.ui.import_request.is_some();
                 if self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
                     || self.ui.move_to_group.is_some()
+                    || self.ui.reorder_request.is_some()
                 {
                     // keyring/TOML 是同步 IO,在事件回调里可能阻塞(Windows 凭据管理器
                     // 偶发几百 ms),打点让看门狗能指认。
@@ -6035,6 +6042,18 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // F121:左栏拖拽排序。
+                if let Some(i) = self.ui.reorder_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match store
+                            .move_session(i.id, i.group, i.before)
+                            .and_then(|_| store.save())
+                        {
+                            Ok(()) => self.ui.set_toast("已调整顺序"),
+                            Err(e) => self.ui.set_error(format!("调整顺序失败:{e}")),
+                        }
+                    }
+                }
                 if let Some(save) = self.ui.save_request.take() {
                     if let Some(store) = self.store.as_mut() {
                         let now = time::OffsetDateTime::now_utc()
@@ -6055,24 +6074,16 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                // E2/E3:标签属性弹窗的施加点。与会话表单的 `save_request`
-                // 同构,同样只在这里碰 store。
+                // F122:标签属性的施加点。**不碰 store** —— 只写标签自己的
+                // 两个覆盖字段。放在这里(而不是渲染闭包里)的理由不变:
+                // 闭包里 `self.tabs` 正被借出去画标签栏。
                 if let Some(crate::ui::tab_props::TabPropsAction::Save {
-                    session_id,
+                    tab_id,
                     name,
                     color,
                 }) = self.ui.tab_props_save.take()
                 {
-                    if let Some(store) = self.store.as_mut() {
-                        let now = time::OffsetDateTime::now_utc()
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_default();
-                        match apply_tab_props_save(store, session_id, name.clone(), color, &now) {
-                            Ok(()) => self.ui.set_toast("已保存标签属性"),
-                            Err(e) => self.ui.set_error(e),
-                        }
-                    }
-                    sync_tab_titles_for_session(&mut self.tabs, session_id, &name);
+                    apply_tab_props(&mut self.tabs, tab_id, name, color);
                     self.ui_dirty = true;
                 }
                 // F110 隧道 CRUD 的施加点。与会话侧同构:UI 只写意图,这里才碰
@@ -6677,76 +6688,23 @@ fn apply_save(
     }
 }
 
-/// 施加一次「标签属性(改名 + 配色)」保存意图(E2/E3)。与 `apply_save`
-/// 同构、同样抽成自由函数,理由也一样:「取出 → 改两个字段 → upsert」
-/// 只能靠无窗口单测挡住「悄悄清空了别的分节」这类错误。
+/// F122:把弹窗里改的名字/颜色写到那个标签上。
 ///
-/// **`SessionStore`/`Vault` 没有 `get_mut`**(切片 H 的设计:`update` 要
-/// 一份完整的 `SessionDraft`,含 `secret`,不是「改一个字段」的接口)——
-/// 所以这里先把现有记录整份克隆出来,只改 `identity.name` /
-/// `appearance.color` 这两个字段,其余分节原样揣回 `update`,密文那半
-/// 单独从 `store.secret` 取一份 `Keep` 语义的克隆(`None` 也要原样传回,
-/// 不能因为「这次没改密码」就把已有密文抹掉)。
-fn apply_tab_props_save(
-    store: &mut crate::shell::store::SessionStore,
-    session_id: mullion_store::SessionId,
+/// 空名字(或只有空白)= 清除覆盖,退回连接时拼的 `title` —— 存一个空标签名
+/// 会让标签栏上出现一块点得到但看不见的东西。
+///
+/// 自由函数而不是 `&mut self` 方法:调用点在渲染闭包之后,`self` 的其它字段
+/// 此时另有借用(同 `apply_save` 的理由),而且这样能脱离 `App` 单测。
+fn apply_tab_props<C>(
+    tabs: &mut crate::shell::tabs::Tabs<C>,
+    tab_id: crate::shell::tabs::TabId,
     name: String,
-    color: Option<mullion_store::ColorSpec>,
-    now: &str,
-) -> Result<(), String> {
-    let rec = store
-        .list()
-        .iter()
-        .find(|r| r.id == session_id)
-        .cloned()
-        .ok_or_else(|| "保存失败:会话已不存在".to_string())?;
-    let secret = store.secret(session_id).cloned();
-    let draft = mullion_store::SessionDraft {
-        identity: mullion_store::Identity {
-            name,
-            ..rec.identity
-        },
-        connection: rec.connection,
-        auth: rec.auth,
-        terminal: rec.terminal,
-        appearance: mullion_store::AppearancePrefs {
-            color,
-            ..rec.appearance
-        },
-        network: rec.network,
-        automation: rec.automation,
-        sftp: rec.sftp,
-        secret,
-    };
-    store
-        .update(session_id, draft, now)
-        .map_err(|e| format!("保存失败:{e}"))?;
-    store.save().map_err(|e| format!("保存失败:{e}"))
-}
-
-/// E2:标签属性弹窗保存成功后,**眼前的标签必须立刻跟着变**。标签标题是
-/// 连接时拼的运行态快照,不引用 `identity.name`——只写回 store 的话,标签
-/// 纹丝不动,用户会以为改名没生效。
-///
-/// 同一条会话可能被不止一个标签引用(同一台机器开了两个 pane/标签),
-/// 必须同步**所有**指向这个 `session_id` 的标签,不能只改活动的那个——
-/// 否则切到另一个标签会看到没跟着改的旧标题。
-///
-/// 抽成纯函数是因为原地写在事件循环里没法脱离 `Tabs` 单测——这条「同步
-/// 所有」是特地要防的行为,写对了但只测「活动标签变了」的话,退化成
-/// 「只改活动标签」不会被任何测试挡住。
-fn sync_tab_titles_for_session(
-    tabs: &mut Tabs<TabContent>,
-    session_id: mullion_store::SessionId,
-    name: &str,
+    color: Option<mullion_term::snapshot::Rgb>,
 ) {
-    if name.is_empty() {
-        return;
-    }
-    for tab in tabs.iter_mut() {
-        if tab.session_id == Some(session_id) {
-            tab.title = name.to_string();
-        }
+    let trimmed = name.trim();
+    if let Some(tab) = tabs.iter_mut().find(|t| t.id == tab_id) {
+        tab.title_override = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        tab.color_override = color;
     }
 }
 
@@ -7174,12 +7132,11 @@ fn render_frame(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_credential_save, apply_import, apply_layout_actions, apply_save,
-        apply_tab_props_save, credential_delete_error, download_job, effective_focus_of,
-        files_owner_generation_of, finish_password_change, font_px_for, has_real_action,
-        next_panel_selection_index, pane_still_wanted, snapshot_tabs_of,
-        sync_tab_titles_for_session, sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal,
-        RestoredTab, Tab, TabContent, TerminalTab,
+        apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
+        credential_delete_error, download_job, effective_focus_of, files_owner_generation_of,
+        finish_password_change, font_px_for, has_real_action, next_panel_selection_index,
+        pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at, tab_title, upload_job,
+        wind_down, Modal, RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -7611,12 +7568,12 @@ mod tests {
         );
     }
 
-    /// F61/F62:标签属性弹窗改的是会话的颜色 —— 不算进 `touched_store` 的话,
-    /// 用户改了颜色,标签横杠要等下次重启才变。
+    /// F122:弹窗保存不再是「写 store 的意图」——`touched_store` 里不许再有它,
+    /// 否则每改一次标签名都白跑一次外观全表重算。
     ///
-    /// 自证会变红:把 `touched_store` 里的 `tab_props` 那一项删掉。
+    /// 自证会变红:把 `self.ui.tab_props_save.is_some()` 加回 `touched_store`。
     #[test]
-    fn renaming_a_tab_counts_as_touching_the_store_so_the_look_is_recomputed() {
+    fn tab_props_is_no_longer_a_store_write_intent() {
         let src = include_str!("app.rs");
         let after = src
             .split("let touched_store = ")
@@ -7628,8 +7585,57 @@ mod tests {
             "切歪了 —— 下面那条会空过"
         );
         assert!(
-            expr.contains("tab_props"),
-            "标签属性没算进 touched_store:改了颜色要重启才看得见(F61/F62)"
+            !expr.contains("tab_props"),
+            "标签属性已改成运行期覆盖(F122),不该再算进 touched_store"
+        );
+    }
+
+    /// F121:拖拽排序改的是会话的 `group_id` 与顺序,跨组会换继承来源,
+    /// 外观(图标/颜色)可能跟着变 —— 漏算的话拖拽跨组之后那一行的图标/
+    /// 颜色不会跟着重算,用户看到的还是旧外观。
+    ///
+    /// 自证会变红:把 `touched_store` 里的 `self.ui.reorder_request` 那一项删掉。
+    #[test]
+    fn dragging_a_session_counts_as_touching_the_store_so_the_look_is_recomputed() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("let touched_store = ")
+            .nth(1)
+            .expect("找不到 touched_store 的赋值");
+        let expr = &after[..after.find(";\n").expect("找不到该赋值的结尾")];
+        assert!(
+            expr.contains("self.ui.save_request"),
+            "touched_store 的表达式切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            expr.contains("self.ui.reorder_request"),
+            "拖拽排序没算进 touched_store:跨组拖拽后外观缓存不会重算(F121)"
+        );
+    }
+
+    /// F121:拖拽排序落盘走的也是 keyring/TOML 同步 IO,跟删除/保存/移动分组
+    /// 同一条门槛——漏算的话看门狗测不出这条路径可能阻塞事件循环。
+    ///
+    /// 自证会变红:把 `diag::mark(diag::Stage::StoreIo)` 前面那个 `if` 里的
+    /// `self.ui.reorder_request.is_some()` 删掉。
+    #[test]
+    fn dragging_a_session_is_marked_as_store_io_for_the_watchdog() {
+        let src = include_str!("app.rs");
+        let idx = src
+            .find("diag::mark(diag::Stage::StoreIo);")
+            .expect("找不到 StoreIo 打点");
+        let before = &src[..idx];
+        let start = before
+            .rfind("if self.ui.delete_request.is_some()")
+            .expect("找不到打点前面那个 if 的开头");
+        let cond = &src[start..idx];
+        assert!(
+            cond.contains("self.ui.save_request.is_some()"),
+            "切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            cond.contains("self.ui.reorder_request.is_some()"),
+            "拖拽排序没算进 StoreIo 打点条件(F121)"
         );
     }
 
@@ -10100,6 +10106,8 @@ mod tests {
             id: TabId(1),
             title: "test".into(),
             session_id: None,
+            title_override: None,
+            color_override: None,
             content: TabContent::Terminal(Box::new(TerminalTab {
                 ws: Workspace::new(test_pane(1), 0),
                 current_preset: None,
@@ -10550,92 +10558,84 @@ mod tests {
         );
     }
 
-    /// E2/E3:标签属性弹窗的写回(`apply_tab_props_save`)只准动
-    /// `identity.name` 和 `appearance.color`——`connection`/`secret` 这些跟
-    /// 「改名/配色」毫不相干的字段必须原样保留。写回逻辑走的是
-    /// clone-then-`update()`(store 没有 `get_mut`),一旦有人图省事重新拼一份
-    /// `SessionDraft` 而不是 `..rec.xxx` 结构更新,漏改的字段会静默清空。
+    /// F122 的核心判据(D1):标签属性保存只落在标签自己的两个覆盖字段上,
+    /// 连接时拼的 `title` 不被改写。
     ///
-    /// 自证会变红:把 `apply_tab_props_save` 里 `connection: rec.connection`
-    /// 换成 `connection: mullion_store::Connection { host: String::new(), ..rec.connection }`
-    /// ——host 断言报错。
+    /// 「不写 store」这条**不是**这里验的——`apply_tab_props` 的签名只吃
+    /// `&mut Tabs<C>`,结构上就碰不到 store,真去构造一个 store 断言它没变
+    /// 反而是分支不可达的恒绿测试。「不写 store」由
+    /// `tab_props_is_no_longer_a_store_write_intent`(源码级守护)与这个签名
+    /// 本身共同保证。
+    ///
+    /// 自证会变红:把 `t.title_override`/`color_override` 的赋值改错(比如
+    /// 恒设 `None`,或把 `title` 也一起改写)。
     #[test]
-    fn apply_tab_props_save_only_touches_name_and_color_leaves_everything_else_alone() {
-        let (_dir, mut store) = tmp_store();
-        let buf = crate::ui::session_manager::EditorBuffer {
-            name: "dev".into(),
-            host: "192.0.2.10".into(),
-            user: "user".into(),
-            password: "s3cr3t".into(),
-            ..Default::default()
-        };
-        let id = apply_save(
-            &mut store,
-            crate::ui::session_manager::SaveIntent {
-                editing_id: None,
-                draft: crate::ui::session_manager::build_draft(&buf).expect("build"),
-                password: crate::ui::session_manager::SecretField::Set("s3cr3t".into()),
-                passphrase: crate::ui::session_manager::SecretField::Clear,
-                proxy_password: crate::ui::session_manager::SecretField::Clear,
-                private_key: crate::ui::session_manager::SecretField::Keep,
-                then_connect: false,
-            },
-            "2026-08-03T00:00:00Z",
-        )
-        .expect("保存应成功");
-
-        apply_tab_props_save(
-            &mut store,
-            id,
-            "生产库".into(),
-            Some(mullion_store::ColorSpec {
-                hex: "#123456".into(),
-                apply_to: vec![mullion_store::ColorTarget::Tab],
-            }),
-            "2026-08-03T00:00:01Z",
-        )
-        .expect("保存标签属性应成功");
-
-        let rec = store.list().iter().find(|r| r.id == id).expect("会话还在");
-        assert_eq!(rec.identity.name, "生产库");
-        assert_eq!(
-            rec.connection.host, "192.0.2.10",
-            "连接目标不该被改名/配色操作动到"
+    fn applying_tab_props_only_writes_the_two_override_fields() {
+        let mut tabs: crate::shell::tabs::Tabs<u64> = Default::default();
+        let sid = mullion_store::SessionId(1);
+        let tab = tabs.open("u@h".into(), Some(sid), 1);
+        apply_tab_props(
+            &mut tabs,
+            tab,
+            "日志".into(),
+            Some(mullion_term::snapshot::Rgb::new(0xe0, 0x67, 0x67)),
         );
+        let t = tabs.iter().next().unwrap();
+        assert_eq!(t.display_title(), "日志");
         assert_eq!(
-            store.secret(id).and_then(|s| s.password.as_deref()),
-            Some("s3cr3t"),
-            "密文不该被改名/配色操作抹掉"
+            t.color_override,
+            Some(mullion_term::snapshot::Rgb::new(0xe0, 0x67, 0x67))
         );
+        assert_eq!(t.title, "u@h", "连接时拼的 title 不该被改写");
     }
 
-    /// E2:一份会话可能被不止一个标签引用(同一台机器开着两个 pane/标签)——
-    /// 标签属性弹窗保存后必须同步**所有**指向这个 `session_id` 的标签,不能
-    /// 只改活动的那个。既要防「漏改非活动标签」,也要防反方向的退化——
-    /// 「全扫」写成了「全改」,把不相干会话的标签也带着改了名。
+    /// F122:空名字(或只有空白)= 清除覆盖,退回连接时拼的 `title`。
     ///
-    /// 自证会变红:把 `sync_tab_titles_for_session` 里的 `tabs.iter_mut()`
-    /// 换成只处理活动标签(比如 `tabs.active_mut().into_iter()`)。
+    /// 存一个空标签名会让标签栏上出现一块点得到但看不见的东西 —— 所以
+    /// `apply_tab_props` 把这种输入当成「用户想清掉覆盖」,而不是「把
+    /// 标签名存成空串」。先设一个非空覆盖再清,才测得出「清除」这个动作;
+    /// 一开始就是 `None`、传空还是 `None` 是恒绿的重言式。
+    ///
+    /// 自证会变红:把 `(!trimmed.is_empty()).then(...)` 改成
+    /// `Some(trimmed.to_string())`。
     #[test]
-    fn saving_tab_props_retitles_every_tab_pointing_at_the_same_session_not_just_the_active_one() {
-        let sid = SessionId(4);
-        let other = SessionId(5);
-        let mut tabs: Tabs<TabContent> = Tabs::default();
-        // 三次 `open` 依次成为活动标签,最终活动的是「别的会话」那条 ——
-        // 前两条(同一 session_id)此刻都不是活动标签。
-        tabs.open("旧名字A".into(), Some(sid), restored_tab(4, 1));
-        tabs.open("旧名字B".into(), Some(sid), restored_tab(4, 1));
-        tabs.open("别的会话".into(), Some(other), restored_tab(5, 1));
-
-        sync_tab_titles_for_session(&mut tabs, sid, "生产库");
-
-        let titles: Vec<&str> = tabs.iter().map(|t| t.title.as_str()).collect();
-        assert_eq!(titles[0], "生产库", "非活动标签也该跟着改名");
-        assert_eq!(titles[1], "生产库", "同一会话的另一个标签也该跟着改名");
+    fn apply_tab_props_with_a_blank_name_clears_the_override() {
+        let mut tabs: crate::shell::tabs::Tabs<u64> = Default::default();
+        let sid = mullion_store::SessionId(1);
+        let tab = tabs.open("u@h".into(), Some(sid), 1);
+        apply_tab_props(&mut tabs, tab, "日志".into(), None);
         assert_eq!(
-            titles[2], "别的会话",
-            "指向别的 session_id 的标签不该被这次改名动到(全扫不能退化成全改)"
+            tabs.iter().next().unwrap().display_title(),
+            "日志",
+            "先设一个非空覆盖,后面才测得出清除"
         );
+
+        apply_tab_props(&mut tabs, tab, "".into(), None);
+        let t = tabs.iter().next().unwrap();
+        assert_eq!(t.title_override, None, "空串应清掉覆盖,而不是存成空串");
+        assert_eq!(t.display_title(), "u@h", "清除后应退回连接时拼的 title");
+
+        apply_tab_props(&mut tabs, tab, "日志".into(), None);
+        apply_tab_props(&mut tabs, tab, "   ".into(), None);
+        let t = tabs.iter().next().unwrap();
+        assert_eq!(t.title_override, None, "纯空白同样应清掉覆盖");
+        assert_eq!(t.display_title(), "u@h", "清除后应退回连接时拼的 title");
+    }
+
+    /// F122/D2:覆盖**不进 F37 布局快照**。`snapshot_tabs_of` 存的必须是连接时拼的
+    /// `tab.title`,不是 `display_title()` —— 存了覆盖的话,「关窗口即丢」这条承诺
+    /// 就变成了「关窗口还在,但会话改了名又不跟着变」的第三种语义。
+    ///
+    /// 自证会变红:把 `snapshot_tabs_of` 里的 `tab.title.clone()` 改成
+    /// `tab.display_title().to_string()`。
+    #[test]
+    fn a_tab_override_never_reaches_the_layout_snapshot() {
+        let mut tabs: Tabs<TabContent> = Default::default();
+        tabs.open("u@h".into(), Some(SessionId(1)), restored_tab(1, 1));
+        tabs.iter_mut().next().unwrap().title_override = Some("日志".into());
+        let (saved, _) = snapshot_tabs_of(&tabs);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].title, "u@h", "覆盖被写进了布局快照");
     }
 
     /// F73 参数错位红线:`merge_secret(existing, &password, &passphrase,

@@ -357,17 +357,11 @@ pub(super) fn basic(
 
 /// `Color32` → `#rrggbb`。色盘吐的是 `Color32`,库里存的是 hex 文本,
 /// 两个方向都只有一份实现(反方向是 `theme::parse_hex`)。
-///
-/// `pub(crate)`——`ui::tab_props`(标签属性弹窗,E2/E3)也要用同一份格式化,
-/// 两处各写一份的话格式约定容易悄悄漂移。
 pub(crate) fn hex_of(c: egui::Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }
 
-/// 四个着色落点的中文文案。`ui::session_manager::fields::appearance`(会话
-/// 编辑器的「应用到」)与 `ui::tab_props`(标签属性弹窗的「应用到」)共用
-/// 同一份——两处各留一份的话,以后加/改落点很容易只改中一处,用户会看到
-/// 同一个东西在两处叫不同的名字。
+/// 四个着色落点的中文文案,给会话编辑器的「应用到」用。
 pub(crate) const COLOR_TARGET_LABELS: [(mullion_store::ColorTarget, &str); 4] = [
     (mullion_store::ColorTarget::ListItem, "会话列表"),
     (mullion_store::ColorTarget::Tab, "标签页"),
