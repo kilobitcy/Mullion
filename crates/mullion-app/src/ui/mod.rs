@@ -326,7 +326,7 @@ pub struct UiState {
     /// `save_request` 的中转理由,但这里**不碰 store**)。
     pub tab_props_save: Option<tab_props::TabPropsAction>,
 
-    /// 换节点弹窗(点了 pane 标题条的 `⇄`)。`None` = 关着。
+    /// 换节点弹窗(点了 pane 标题条的 `⇆`)。`None` = 关着。
     /// 里面有搜索框 —— 必须同步登记进 `app.rs::modal_open`(T8)。
     pub rehost: Option<rehost::RehostDraft>,
     /// 弹窗里选定了节点,等着 `app.rs` 去拨号。中转一道的理由同
@@ -764,13 +764,26 @@ pub fn build_ui(
     // 一次性小模态」,不需要跟文件面板抢前后顺序,跟着它的位置走就够了。
     actions.tab_props = tab_props::show(ctx, t, &mut ui_state.tab_props);
     // 换节点弹窗。同为「从别处(pane 标题条)发起的一次性小模态」,跟着标签
-    // 属性弹窗的位置走。
+    // 属性弹窗的位置走。**位置例外**:它要钉在发起它的那块 pane 里,所以先
+    // 从本帧的 `titles`(与渲染/命中/window_change 同源的那份几何)里把该
+    // pane 的矩形捞出来,像素除 `pixels_per_point` 换成 egui 的逻辑点。
+    let rehost_rect = ui_state.rehost.as_ref().and_then(|d| {
+        let ppp = ctx.pixels_per_point();
+        frame.titles.iter().find(|v| v.geom.id == d.pane).map(|v| {
+            let p = v.geom.px;
+            egui::Rect::from_min_size(
+                egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp),
+                egui::vec2(p.w as f32 / ppp, p.h as f32 / ppp),
+            )
+        })
+    });
     actions.rehost = rehost::show(
         ctx,
         t,
         &mut ui_state.rehost,
         frame.sessions,
         frame.appearance,
+        rehost_rect,
     );
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
     actions.editor = editor_window::show(ctx, t, editor);
@@ -1514,6 +1527,53 @@ mod tests {
         assert!(
             !without_title.contains("uniquehostmarker"),
             "titles 为空时不该出现任何标题条文案,实际文本: {without_title:?}"
+        );
+    }
+
+    /// 换节点弹窗的位置必须由 `frame.titles` 里那块 pane 的几何决定。
+    /// `rehost.rs` 自己那条只证了「`show` 收到矩形会用」,证不了 `build_ui`
+    /// 真的把矩形算出来传下去 —— 上一次「闸门覆盖缺口」就是这么漏的。
+    ///
+    /// 破坏性验证:把 `build_ui` 里传给 `rehost::show` 的 `rehost_rect` 改成
+    /// 硬编码 `None`,弹窗退回整窗左上角,本测试红。
+    #[test]
+    fn build_ui_puts_the_rehost_picker_inside_that_panes_geometry() {
+        let mut view = title_view("h");
+        // 刻意偏离原点、也刻意不占满窗口:弹窗要是没跟着 pane 走就落不进来。
+        view.geom.px = PxRect {
+            x: 300,
+            y: 200,
+            w: 460,
+            h: 360,
+        };
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut ui_state = UiState {
+            rehost: Some(crate::ui::rehost::RehostDraft::new(PaneId(1))),
+            ..Default::default()
+        };
+        for time in [0.0_f64, 1.0] {
+            let _ = run_frame(
+                &ctx,
+                &mut ui_state,
+                UiFrame {
+                    titles: std::slice::from_ref(&view),
+                    ..base_frame()
+                },
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+        let got = ctx
+            .memory(|m| m.area_rect(crate::ui::rehost::area_id(PaneId(1))))
+            .expect("换节点弹窗开着却没有 Area");
+        let pane = egui::Rect::from_min_size(egui::pos2(300.0, 200.0), egui::vec2(460.0, 360.0));
+        assert!(
+            pane.contains_rect(got),
+            "换节点弹窗没落在那块 pane 里:pane={pane:?} 弹窗={got:?}"
         );
     }
 

@@ -81,7 +81,7 @@ fn rehost_id(id: PaneId) -> egui::Id {
 /// 反应」「两个挨着的按钮串没串」就永远测不到,而「想换节点结果把 pane 关了」
 /// 是一次不可撤销的误操作。
 ///
-/// 尺寸按字形实测宽度算,不写死:`×` 和 `⇄` 在不同字体下宽度不同,写死会让
+/// 尺寸按字形实测宽度算,不写死:`×` 和 `⇆` 在不同字体下宽度不同,写死会让
 /// 其中一个要么被裁一半、要么留一大块空白。
 fn small_action_button(ui: &mut egui::Ui, id: egui::Id, glyph: &str, t: &Theme) -> egui::Response {
     let font = egui::FontId::proportional(13.0);
@@ -169,7 +169,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     // 用户要的入口:分屏之后在这里把这块 pane 换到别的节点。
                     // 放在 × 左边而不是做成"点主机名":主机名会被 `.truncate()`
                     // 截断,长主机名时点击靶子会缩到几个像素宽。
-                    if small_action_button(ui, rehost_id(v.geom.id), "⇄", t)
+                    if small_action_button(ui, rehost_id(v.geom.id), "⇆", t)
                         .on_hover_text("把这块分屏换到别的节点")
                         .clicked()
                     {
