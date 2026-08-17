@@ -87,6 +87,27 @@ pub enum UserEvent {
         /// 会给用户弹一条跟当前连接毫不相干的错误 toast,必须按世代过滤。
         generation: u64,
     },
+    /// 换节点(用户报的问题 2):到新机器的连接建好、PTY 也开好了。
+    ///
+    /// **跟 `ConnectOk` 分开**:那条事件的语义是「开一个新标签」,这条是
+    /// 「把已有的一块 pane 改挂过去」。挤在一起只能靠运行时标志判别,而两者
+    /// 走错了的后果并不一样(前者多一个标签,后者顶掉一块正在用的 pane)。
+    PaneRehosted {
+        /// 发起时属主标签的世代号。拨号是真实网络往返,期间用户可能已经把
+        /// 这块 pane 关掉、切了预设、甚至断开重连 —— 判据同 `PaneOpened`。
+        generation: u64,
+        pane: PaneId,
+        /// 新机器那条连接。**必须整条持有**(Drop 即断连),挂进 `ws.hosts`。
+        handle: Arc<SshConnection>,
+        ssh: SshSession,
+        rx: Receiver<Vec<u8>>,
+    },
+    /// 换节点失败。这块 pane 原样留在旧机器上 —— 用户可以再试一次。
+    PaneRehostErr {
+        generation: u64,
+        pane: PaneId,
+        msg: String,
+    },
     /// F92:一次拨测成功。`u64` 是发起时的世代号,过期的直接丢。
     ProbeOk(u64),
     /// F92:一次拨测失败(含超时)。
@@ -243,6 +264,27 @@ struct AutomationHandle {
     disconnect: Option<tokio::sync::oneshot::Sender<()>>,
     /// 换新连接时 abort:旧那次的结论对新连接没有意义。
     task: tokio::task::JoinHandle<()>,
+}
+
+/// 一次在途的换节点。真正换挂要等 `PaneRehosted` 抵达,而那条事件带不动
+/// 这些东西 —— 标题条要的名字/地址、外观要的 `SessionId`、以及新节点的登录后
+/// 命令,全都得在**用户选中那一帧**算好存下来。
+///
+/// 理由同 `pending_automation_template`:拨号是真实网络往返(高延迟代理链路
+/// 下几百 ms 到几秒),这期间用户完全可能去会话管理器把这条会话改了甚至删了,
+/// 到那时再回头查库,发出去的字节就跟他选中时看到的对不上。
+struct PendingRehost {
+    generation: u64,
+    pane: PaneId,
+    /// 标题条上显示的名字(会话名)。
+    label: String,
+    /// `host:port`,标题条副标题用。
+    addr: String,
+    session_id: mullion_store::SessionId,
+    /// 新节点的登录后命令。**跳过 tmux**——用户拍板的规则,与分屏新开的
+    /// pane 一致(见 `automation::pending_for_extra_pane`):多块 pane attach
+    /// 同一个 tmux session 会内容镜像。`None` = 这个节点没配自动化。
+    plan: Option<crate::automation::PendingAutomation>,
 }
 
 /// 一个终端标签的全部 **per-connection** 状态(D0 决策 S2)。
@@ -1301,6 +1343,11 @@ pub struct App {
     pending_automation_template: Option<mullion_store::ResolvedAutomation>,
     /// F44 右键「连接(跳过自动化)」的一次性标志。`ConnectOk` 消费后立即清零。
     pending_skip_automation: bool,
+    /// 换节点在途的那些。`Vec` 而不是 `Option`:两块 pane 可以同时在换
+    /// (弹窗一次只开一个,但拨号是异步的,第一次还没回来就能发起第二次),
+    /// 用 `Option` 的话后发的会把先发的元信息顶掉 —— 现象是换好之后标题条
+    /// 上写着另一台机器的名字。按 `(generation, pane)` 取走。
+    pending_rehost: Vec<PendingRehost>,
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
     /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
     tunnels: crate::tunnels::TunnelRuntime,
@@ -1379,6 +1426,9 @@ enum Modal {
     /// 当前标签、`Ctrl+Shift+B` 仍能开关文件侧栏(两条快捷键的闸门都是
     /// `modal_open()`)。
     ExitConfirm,
+    /// 换节点弹窗(pane 标题条上的 `⇄`)。里面有搜索框 —— 不算模态的话敲的
+    /// 字会同时发给远端 shell(T8)。
+    Rehost,
 }
 
 impl Modal {
@@ -1395,6 +1445,7 @@ impl Modal {
         Modal::GroupManager,
         Modal::TabProps,
         Modal::ExitConfirm,
+        Modal::Rehost,
     ];
 }
 
@@ -1463,6 +1514,7 @@ impl App {
             probe_task: None,
             pending_automation: None,
             pending_automation_template: None,
+            pending_rehost: Vec::new(),
             pending_skip_automation: false,
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
@@ -2080,6 +2132,8 @@ impl App {
             // F53/D3-12:退出确认框。不算模态的话,`Ctrl+W`/`Ctrl+Shift+B`
             // 会在它开着的时候照旧生效(T8)。
             Modal::ExitConfirm => self.ui.exit_pending,
+            // 换节点弹窗里有搜索框 —— 同 `TabProps` 的理由(T8)。
+            Modal::Rehost => self.ui.rehost.is_some(),
         })
     }
 
@@ -4157,6 +4211,99 @@ impl App {
         }
     }
 
+    /// 换节点(用户报的问题 2):把一块已有的 pane 挂到另一条会话上。
+    ///
+    /// **另起一条自己的 SSH 连接**,不蹭这个标签已有的那条 —— 新节点是另一台
+    /// 机器,复用无从谈起(与 F35 分屏「同机器多 channel」正相反)。
+    ///
+    /// 与 `spawn_connect` 的分工:那条走完会**开一个新标签**,这条只换一块
+    /// pane 的挂靠。共用同一个 `establish` + `open_pty` 两步拆分,不共用事件。
+    fn spawn_rehost(&mut self, pane: PaneId, session: mullion_store::SessionId) {
+        let Some(generation) = self.active_term().map(|t| t.ws.generation()) else {
+            // 活动标签不是终端(文件标签 / launcher)。到不了:换节点的入口是
+            // pane 标题条,而标题条只有终端标签才画。
+            log::warn!(target: "mullion", "换节点:活动标签不是终端,忽略");
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            self.ui.set_error("配置库不可用,无法换节点".to_string());
+            return;
+        };
+        let (cfg, wants_sftp) = match store.dial_plan_for(session) {
+            Ok(v) => v,
+            Err(e) => {
+                self.ui.set_error(e.to_string());
+                return;
+            }
+        };
+        if wants_sftp {
+            // 弹窗已经把 SFTP 节点滤掉了(`ui::rehost::visible`),这里是第二道:
+            // 真挂过去会得到一块永远不出字的黑屏,而用户只会觉得「换节点坏了」。
+            self.ui
+                .set_error("这是 SFTP 节点,没有终端,不能换到它上面".to_string());
+            return;
+        }
+        // 名字/地址/自动化都在**这一帧**定死。理由见 `PendingRehost` 的文档。
+        let label = store
+            .list()
+            .iter()
+            .find(|r| r.id == session)
+            .map_or_else(|| cfg.host.clone(), |r| r.identity.name.clone());
+        let plan = store
+            .resolved(session)
+            .ok()
+            .and_then(|r| crate::automation::pending_for_extra_pane(&r.automation));
+        self.pending_rehost.push(PendingRehost {
+            generation,
+            pane,
+            label,
+            addr: format!("{}:{}", cfg.host, cfg.port),
+            session_id: session,
+            plan,
+        });
+        let proxy = self.proxy.clone();
+        let wake_proxy = self.proxy.clone();
+        let policy: Arc<dyn HostKeyPolicy> = Arc::new(crate::host_key::PromptingPolicy::new(
+            self.known_hosts.clone(),
+            self.proxy.clone(),
+            true,
+        ));
+        self._runtime.spawn(async move {
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = wake_proxy.send_event(UserEvent::Wake);
+            });
+            let handle = match mullion_ssh::session::establish(&cfg, policy).await {
+                Ok(h) => Arc::new(h),
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::PaneRehostErr {
+                        generation,
+                        pane,
+                        msg: format!("换节点失败: {e}"),
+                    });
+                    return;
+                }
+            };
+            match mullion_ssh::session::open_pty(handle.clone(), &cfg, wake).await {
+                Ok((ssh, rx)) => {
+                    let _ = proxy.send_event(UserEvent::PaneRehosted {
+                        generation,
+                        pane,
+                        handle,
+                        ssh,
+                        rx,
+                    });
+                }
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::PaneRehostErr {
+                        generation,
+                        pane,
+                        msg: format!("换节点失败: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
     /// F92:拨一次完整认证后立刻断开。**不开 channel、不起 pty** ——
     /// 拨测只回答「这条链路加上这份凭据能不能登上去」。
     fn spawn_probe(&mut self, cfg: SshConfig) {
@@ -4889,6 +5036,83 @@ impl ApplicationHandler<UserEvent> for App {
                 // C1:旧世代的失败提示落到新世代头上,会给用户弹一条跟当前连接
                 // 毫不相干的错误 toast——按世代过滤,只有当前世代的失败才展示。
                 // S1:世代号即路由键,查得到属主标签才说明这条失败还有意义。
+                if self.tabs.by_generation(generation).is_some() {
+                    self.ui.set_error(msg);
+                    self.ui_dirty = true;
+                    self.request_ui_redraw();
+                }
+            }
+            UserEvent::PaneRehosted {
+                generation,
+                pane,
+                handle,
+                ssh,
+                rx,
+            } => {
+                // 元信息在用户选中那一帧就存下了(`PendingRehost`)。取不到 =
+                // 这条事件没有对应的发起记录(理论上到不了),丢掉:硬编一个
+                // 占位标题挂上去,标题条会写着一个假名字。
+                let Some(ix) = self
+                    .pending_rehost
+                    .iter()
+                    .position(|p| p.generation == generation && p.pane == pane)
+                else {
+                    log::warn!(target: "mullion", "换节点:pane {} 的在途记录已经不在了,丢弃", pane.0);
+                    return;
+                };
+                let pending = self.pending_rehost.swap_remove(ix);
+                // 包成 `Arc`:自动化 task 要跟 pane 共享同一条 channel 的写口
+                // (同 `PaneOpened`,见 `PtyWriter for Arc<SshSession>`)。
+                let ssh = Arc::new(ssh);
+                let mut attached: Option<Arc<mullion_ssh::session::SshSession>> = None;
+                if let Some(ws) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.as_terminal_mut())
+                    .map(|t| &mut t.ws)
+                {
+                    ws.hosts.push(crate::shell::workspace::HostConn {
+                        label: pending.label,
+                        addr: pending.addr,
+                        session_id: Some(pending.session_id),
+                        handle,
+                    });
+                    let host_ix = ws.hosts.len() - 1;
+                    if rehost_pane(ws, pane, generation, host_ix, Box::new(ssh.clone()), rx) {
+                        attached = Some(ssh);
+                    } else {
+                        // 没挂成(pane 在拨号途中没了)——刚 push 的那条必须撤掉,
+                        // 否则 `hosts` 里留一条谁也不指向的连接,占着不关。
+                        ws.hosts.pop();
+                        log::warn!(
+                            target: "mullion",
+                            "换节点:pane {} 在拨号途中已经不在了(世代 {generation}),丢弃",
+                            pane.0
+                        );
+                    }
+                }
+                if let Some(sink) = attached {
+                    // 用户拍板:换过节点的 pane 要跑**新节点**的登录后命令,
+                    // 规则同分屏新开的那些 —— 跳过 tmux,其余照跑。
+                    if let Some(plan) = pending.plan {
+                        self.start_automation(generation, pane, plan, sink);
+                    }
+                    self.ui.set_toast("已换节点");
+                    self.ui_dirty = true;
+                    self.request_ui_redraw();
+                }
+            }
+            UserEvent::PaneRehostErr {
+                generation,
+                pane,
+                msg,
+            } => {
+                log::warn!(target: "mullion", "pane {} 换节点失败: {msg}", pane.0);
+                // 在途记录必须清掉,否则同一块 pane 再换一次时,
+                // `PaneRehosted` 会取到上一次那条(标题条写着上一台机器的名字)。
+                self.pending_rehost
+                    .retain(|p| !(p.generation == generation && p.pane == pane));
+                // 失败提示按世代过滤,理由同 `PaneOpenErr`。
                 if self.tabs.by_generation(generation).is_some() {
                     self.ui.set_error(msg);
                     self.ui_dirty = true;
@@ -5935,6 +6159,21 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui.request_quit = true;
                                 }
                             }
+                            // 点了 pane 标题条的「换节点」:开弹窗,真正换在
+                            // 用户选完之后。**只开弹窗,不预判节点** —— 这一步
+                            // 没有任何默认答案可猜。
+                            if let Some(pane) = actions.rehost_pane {
+                                self.ui.rehost = Some(crate::ui::rehost::RehostDraft::new(pane));
+                                self.ui_dirty = true;
+                            }
+                            // 换节点弹窗的结论。`Cancel` 什么都不做(弹窗自己
+                            // 已经关了);`Pick` 落到 `self.ui` 上中转,真正
+                            // 发起在下面借用释放之后(同 `tab_props_save`)。
+                            if let Some(crate::ui::rehost::RehostAction::Pick { pane, session }) =
+                                actions.rehost
+                            {
+                                self.ui.rehost_request = Some((pane, session));
+                            }
                             // 布局动作:点了预设 / 点了标题条的 ×。路由逻辑在自由函数
                             // `apply_layout_actions`(只碰 &mut Workspace,可脱离
                             // runtime/proxy 单测);真正开新 channel 需要 runtime/proxy,
@@ -6351,6 +6590,11 @@ impl ApplicationHandler<UserEvent> for App {
                     apply_tab_props(&mut self.tabs, tab_id, name, color);
                     self.ui_dirty = true;
                 }
+                // 换节点的发起点。放在这里(而不是渲染闭包里)的理由同
+                // `tab_props_save`:闭包里 `self.ui`/`self.active` 正被借出去。
+                if let Some((pane, session)) = self.ui.rehost_request.take() {
+                    self.spawn_rehost(pane, session);
+                }
                 // F110 隧道 CRUD 的施加点。与会话侧同构:UI 只写意图,这里才碰
                 // store。**不复用** `save_request`/`delete_request` 那两条通道 ——
                 // 它们带的是 `SessionDraft`/`SessionId`,类型不同,挤在一起只能靠
@@ -6688,6 +6932,64 @@ fn apply_layout_actions(
 /// 纯函数(只读 `&Workspace`),不碰 `EventLoopProxy`,可脱离真实事件循环单测。
 fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
     ws.generation() == generation && mullion_core::layout::leaves(ws.tree()).contains(&id)
+}
+
+/// 把一块已有的 pane 改挂到刚连上的另一台机器上(用户报的问题 2)。
+///
+/// 返回 `false` = 这块 pane 已经不在了(拨号途中被关掉 / 用户切了预设 / 断开
+/// 重连换了世代),调用方该让新开的 channel 自然 Drop —— 挂上去就是一个渲染
+/// 看不见、`pump` 却仍在驱动的孤儿(同 `pane_still_wanted` 的第 1 条理由)。
+///
+/// **`emulator` 必须换新的,不能沿用**:回滚缓冲里全是上一台机器的输出,留着
+/// 等于让用户往上一翻就看到另一台机器的内容,而屏幕上的提示符是新机器的 ——
+/// 这种「看起来对、其实错」的画面比黑屏危险得多。
+///
+/// **旧的 `HostConn` 留在 `hosts` 里不摘**:`host_ix` 是**下标即身份**,摘掉
+/// 一条会让排在它后面的所有 pane 的 `host_ix` 集体错位(指向另一台机器,输入
+/// 照发)。`hosts[0]` 还额外被 sftp 侧栏和 `last_cfg` 认着。代价是那条连接闲
+/// 置到整个标签关闭为止——换节点是低频操作,拿一条闲置连接换掉一整类静默的
+/// 错位 bug 是划算的。
+///
+/// `host_ix` 由调用方现算(`ws.hosts.len() - 1`,刚 push 进去那条)。**不在这里
+/// push `HostConn`**:那个类型里揣着 `Arc<SshConnection>`,而 `SshConnection`
+/// 的字段是私有的、只能由真实握手造出来 —— 收它当参数等于把这整段判定推出
+/// 单测范围。收一个已经算好的下标,这段就能拿真实构造的 `Workspace` 直接测。
+///
+/// 纯函数(只碰 `&mut Workspace`),不要 runtime/proxy,可脱离真实事件循环单测。
+fn rehost_pane(
+    ws: &mut Workspace,
+    id: PaneId,
+    generation: u64,
+    host_ix: usize,
+    pty: Box<dyn crate::shell::workspace::PtyWriter>,
+    rx: Receiver<Vec<u8>>,
+) -> bool {
+    if !pane_still_wanted(ws, id, generation) {
+        return false;
+    }
+    let Some(p) = ws.pane_mut(id) else {
+        // `pane_still_wanted` 只保证 id 在**树**上;`PaneState` 是另一回事
+        // (分屏刚切出来、channel 还没开好的叶子就没有)。换节点的入口是
+        // pane 标题条,只有画得出来的 pane 才有标题条,所以实际到不了这里。
+        return false;
+    };
+    let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
+    let d = theme::term_default_colors(&MULLION_DARK);
+    emulator.set_default_colors(d.fg, d.bg);
+    p.host_ix = host_ix;
+    p.emulator = emulator;
+    // 旧的 `pty`/`rx` 在这两句赋值里被 Drop —— Drop 即关掉上一台机器的
+    // channel,不留孤儿。
+    p.pty = pty;
+    p.rx = rx;
+    p.pacer = SyncFramePacer::new();
+    p.status = crate::shell::workspace::PaneStatus::Live;
+    // 自动化的「就绪」判据要重新攒(新机器还一个字节都没说话);`last_grid`
+    // 给不可能的初值,逼下一帧 apply_geometry 发一次 window_change(T4)——
+    // 新开的 channel 是 80x24,不发的话远端按 80x24 排版。
+    p.saw_first_byte = false;
+    p.last_grid = (0, 0);
+    true
 }
 
 /// F120:`spawn_sftp_open` 该从哪个目录起步——配置了默认远端目录(编辑器
@@ -7181,6 +7483,8 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.settings.is_some()
         || a.unlock.is_some()
         || a.tab_props.is_some()
+        || a.rehost.is_some()
+        || a.rehost_pane.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -7400,9 +7704,9 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         autoscroll_for_pane, credential_delete_error, download_job, effective_focus_of,
         files_owner_generation_of, finish_password_change, font_px_for, has_real_action,
-        ime_cursor_area, next_panel_selection_index, pane_still_wanted, snapshot_tabs_of,
-        sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal, RestoredTab, Tab,
-        TabContent, TerminalTab,
+        ime_cursor_area, next_panel_selection_index, pane_still_wanted, rehost_pane,
+        snapshot_tabs_of, sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal,
+        RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -7643,6 +7947,30 @@ mod tests {
             "只有设置动作时被判成「什么都没发生」—— 这一帧的结论会被 discard \
              趟的默认值覆盖掉"
         );
+    }
+
+    /// 同上,换节点那两份。被 discard 趟吃掉的现象分别是「点 `⇄` 不弹窗」和
+    /// 「在弹窗里选了节点毫无反应」——后者尤其难查:弹窗自己关掉了,看起来
+    /// 像是生效了。
+    ///
+    /// 自证会变红:把 `has_real_action` 里 `a.rehost.is_some()` /
+    /// `a.rehost_pane.is_some()` 任意一条去掉 —— 写这条测试时后者本来就漏了,
+    /// 它当场就红了。
+    #[test]
+    fn rehost_actions_count_as_real_actions_for_the_discard_guard() {
+        let mut a = crate::ui::UiActions::default();
+        assert!(!has_real_action(&a), "空动作不该算数");
+        a.rehost = Some(crate::ui::rehost::RehostAction::Pick {
+            pane: PaneId(2),
+            session: mullion_store::SessionId(1),
+        });
+        assert!(has_real_action(&a), "选中的节点被 discard 趟吞了");
+
+        let b = crate::ui::UiActions {
+            rehost_pane: Some(PaneId(2)),
+            ..Default::default()
+        };
+        assert!(has_real_action(&b), "点 `⇄` 的那一下被 discard 趟吞了");
     }
 
     /// 同上,解锁框那一份。它是整个程序此刻唯一能操作的东西 —— 被 discard
@@ -7886,6 +8214,10 @@ mod tests {
                 Modal::ExitConfirm => assert!(
                     Modal::ALL.contains(&Modal::ExitConfirm),
                     "ExitConfirm 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::Rehost => assert!(
+                    Modal::ALL.contains(&Modal::Rehost),
+                    "Rehost 没登记进 Modal::ALL(T8)"
                 ),
             }
         }
@@ -8448,6 +8780,77 @@ mod tests {
             ws.pane(PaneId(2)).map(|p| p.last_grid),
             Some((99, 99)),
             "新世代刚建好的 PaneState 不该被旧世代的迟到事件顶掉"
+        );
+    }
+
+    /// 一块 pane 上现在显示的是哪些字(拉平成一行,只用来断言"有没有留旧内容")。
+    fn screen_text(p: &crate::shell::workspace::PaneState) -> String {
+        let snap = p.emulator.snapshot();
+        (0..snap.rows)
+            .flat_map(|r| snap.row(r).iter().map(|c| c.ch).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// 用户报的问题 2:分屏出来的 pane 要能换到别的节点。
+    ///
+    /// 三条断言各挡一类静默错误:
+    /// - `host_ix` 没跟着改 → 键盘输入照旧写进**上一台**机器(屏幕上却是新机器
+    ///   的提示符,用户完全看不出来)。
+    /// - 沿用旧 `emulator` → 往上一翻是上一台机器的输出,同样"看起来对"。
+    /// - `last_grid` 不复位 → 下一帧的 `apply_geometry` 认为尺寸没变、不发
+    ///   `window_change`,新 channel 就一直按 80x24 排版(T4)。
+    ///
+    /// 自证会变红:把 `rehost_pane` 里 `p.host_ix` / `p.emulator` / `p.last_grid`
+    /// 任意一句赋值删掉。
+    #[test]
+    fn rehosting_a_pane_repoints_it_and_wipes_the_old_hosts_screen() {
+        let mut ws = Workspace::new(test_pane(1), 0);
+        {
+            let p = ws.pane_mut(PaneId(1)).expect("首 pane 必在");
+            p.emulator.feed(b"OLDHOST");
+            p.saw_first_byte = true;
+            p.last_grid = (120, 40);
+        }
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        assert!(
+            rehost_pane(&mut ws, PaneId(1), 0, 3, Box::new(NullPty), rx),
+            "pane 在、世代也对,换节点该成功"
+        );
+        let p = ws.pane(PaneId(1)).expect("换完 pane 还在");
+        assert_eq!(p.host_ix, 3, "输入还会写到上一台机器上");
+        assert!(
+            !screen_text(p).contains("OLDHOST"),
+            "屏幕上还留着上一台机器的输出:{}",
+            screen_text(p).trim_end()
+        );
+        assert!(
+            !p.saw_first_byte,
+            "新机器还一个字节都没说话,就绪判据必须重攒"
+        );
+        assert_eq!(
+            p.last_grid,
+            (0, 0),
+            "不复位的话下一帧不会发 window_change(T4)"
+        );
+    }
+
+    /// 拨号是真实网络往返,这期间用户完全可能把这块 pane 关掉、切预设、
+    /// 或者断开重连(换了世代)。挂上去就是一个渲染看不见、`pump` 却仍在
+    /// 驱动的孤儿 —— 同 `pane_still_wanted` 挡的那类。
+    ///
+    /// 自证会变红:把 `rehost_pane` 开头那个 `pane_still_wanted` 早退去掉。
+    #[test]
+    fn rehosting_a_pane_that_is_gone_is_refused() {
+        let mut ws = Workspace::new(test_pane(1), 1);
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        assert!(
+            !rehost_pane(&mut ws, PaneId(1), 0, 3, Box::new(NullPty), rx),
+            "这是上一个世代发起的换节点,必须拒绝"
+        );
+        assert_eq!(
+            ws.pane(PaneId(1)).map(|p| p.host_ix),
+            Some(0),
+            "被拒绝时不该动 pane 的任何字段"
         );
     }
 
@@ -9728,6 +10131,43 @@ mod tests {
             body.contains("pending_for_extra_pane"),
             "PaneOpened 没有为新 pane 起自动化 —— 分屏出来的 pane 会是干净 shell,\
              节点配的 cd/export/启动命令一条都不跑,且没有任何报错"
+        );
+    }
+
+    /// **接线守护**:换节点挂失败(pane 在拨号途中没了)时,刚 push 进
+    /// `ws.hosts` 的那条必须撤掉。
+    ///
+    /// 漏了的话现象**完全静默**:`hosts` 里留一条谁的 `host_ix` 都不指向的
+    /// 连接,`Arc<SshConnection>` 攥着不放 —— 远端那条 SSH 会话一直开着,
+    /// 直到整个标签关闭。没有任何报错,也不影响画面。
+    ///
+    /// 扎源码而非行为:`rehost_pane` 之外的这段在 `App::user_event` 里,
+    /// 而 `App` 要 `EventLoopProxy` 才能构造,单测里造不出来。
+    ///
+    /// 自证会变红:把那个 `else` 分支里的 `ws.hosts.pop();` 删掉。
+    #[test]
+    fn a_failed_rehost_takes_its_host_back_out_of_the_list() {
+        let src = include_str!("app.rs");
+        // 锚点拆开拼,理由同上一条(第四类恒绿模式:源码级测试自我匹配)。
+        let start = concat!("UserEvent::Pane", "Rehosted {");
+        let stop = concat!("UserEvent::Pane", "RehostErr {");
+        let after = src.rsplit(start).next().expect("找不到 PaneRehosted 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneRehosted 分支的结尾")];
+        // 注释行剥掉:这段代码里就有一句注释解释了为什么要 pop,不剥的话
+        // 删掉 pop 本身测试照绿(踩过一次)。
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("rehost_pane("),
+            "切错片段了:这段不像 PaneRehosted 的 match 分支"
+        );
+        assert!(
+            body.contains("hosts.pop()"),
+            "换节点没挂成时没把刚 push 的 HostConn 撤掉 —— 一条谁也不指向的 SSH \
+             连接会一直开到标签关闭,而且完全静默"
         );
     }
 

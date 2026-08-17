@@ -15,6 +15,7 @@ pub mod import_dialog;
 pub mod metrics;
 pub mod pane_title;
 pub mod paste;
+pub mod rehost;
 pub mod restored;
 pub mod session_manager;
 pub mod settings;
@@ -324,6 +325,14 @@ pub struct UiState {
     /// `self.tabs` 要等 `self.active`/`self.ui` 的借用释放之后(同
     /// `save_request` 的中转理由,但这里**不碰 store**)。
     pub tab_props_save: Option<tab_props::TabPropsAction>,
+
+    /// 换节点弹窗(点了 pane 标题条的 `⇄`)。`None` = 关着。
+    /// 里面有搜索框 —— 必须同步登记进 `app.rs::modal_open`(T8)。
+    pub rehost: Option<rehost::RehostDraft>,
+    /// 弹窗里选定了节点,等着 `app.rs` 去拨号。中转一道的理由同
+    /// `tab_props_save`:`UiActions` 是渲染闭包里的局部量,而发起连接要
+    /// `&mut self`(runtime / proxy),得等闭包对 `self.ui` 的借用释放。
+    pub rehost_request: Option<(mullion_core::layout::PaneId, mullion_store::SessionId)>,
 }
 
 impl UiState {
@@ -463,6 +472,9 @@ pub struct UiActions {
     pub preset: Option<crate::shell::workspace::Preset>,
     /// 点了某个 pane 标题条上的 ×。
     pub close_pane: Option<mullion_core::layout::PaneId>,
+    /// 点了 pane 标题条上的「换节点」。只是**请求**——选哪个节点由 App
+    /// 弹出的会话列表决定。
+    pub rehost_pane: Option<mullion_core::layout::PaneId>,
     /// F36:点了标签栏(切换 / 关闭 / `+`)。
     pub tab: Option<chrome::TabAction>,
     /// F100:标注模式导出的 Markdown,等着送剪贴板。
@@ -516,6 +528,11 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按「保存」
     /// 会在 egui 的 discard 趟被静默吃掉。
     pub tab_props: Option<tab_props::TabPropsAction>,
+    /// 换节点弹窗这一帧的结论(选定 / 取消)。`None` = 还在挑。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话选中的那一下
+    /// 会在 egui 的 discard 趟被静默吃掉,现象是「点了节点毫无反应」。
+    pub rehost: Option<rehost::RehostAction>,
 }
 
 /// 指针此刻还在窗口里没有(F59 / 设计 N1 的判据)。
@@ -746,6 +763,15 @@ pub fn build_ui(
     // E2/E3:标签属性弹窗。排在文件写操作确认框之后 —— 同为「从别处发起的
     // 一次性小模态」,不需要跟文件面板抢前后顺序,跟着它的位置走就够了。
     actions.tab_props = tab_props::show(ctx, t, &mut ui_state.tab_props);
+    // 换节点弹窗。同为「从别处(pane 标题条)发起的一次性小模态」,跟着标签
+    // 属性弹窗的位置走。
+    actions.rehost = rehost::show(
+        ctx,
+        t,
+        &mut ui_state.rehost,
+        frame.sessions,
+        frame.appearance,
+    );
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
     actions.editor = editor_window::show(ctx, t, editor);
     // F53/D3-12:退出确认。排在最后一个模态 —— 它一旦开着,别的都不重要了。
@@ -798,7 +824,9 @@ pub fn build_ui(
 
     // 标题条最后画:它用绝对坐标,而坐标依赖上面几个 Panel 定完的中央区。
     // Area 不参与 Panel 的空间分配,所以放在 available_rect 之后不影响换算。
-    actions.close_pane = pane_title::show(ctx, t, frame.titles);
+    let title_action = pane_title::show(ctx, t, frame.titles);
+    actions.close_pane = title_action.close;
+    actions.rehost_pane = title_action.rehost;
 
     // F100 标注模式:**必须是最后一步**。它要读的是本帧所有 `annotate::mark()`
     // 登记完之后的候选表,而且铺的那层「吃指针」Area 得盖在包括 toast 在内的

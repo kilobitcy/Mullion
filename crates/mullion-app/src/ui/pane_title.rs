@@ -64,9 +64,59 @@ fn area_id(id: PaneId) -> egui::Id {
     egui::Id::new(("pane_title", id.0))
 }
 
-pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<PaneId> {
+/// 两个按钮的 id。**显式给**而不是让 egui 按布局位置自动生成:测试要
+/// `ctx.read_response(id)` 取回矩形才点得中它们,而自动 id 依赖布局顺序,
+/// 一改布局就失效。
+fn close_id(id: PaneId) -> egui::Id {
+    egui::Id::new(("pane_title_close", id.0))
+}
+fn rehost_id(id: PaneId) -> egui::Id {
+    egui::Id::new(("pane_title_rehost", id.0))
+}
+
+/// 标题条上的一个小按钮。
+///
+/// **手动 `allocate` + `interact`,不用 `ui.small_button`**:后者的 id 由布局
+/// 顺序自动生成,测试没法 `ctx.read_response(id)` 取回矩形去点它 ——「点了有没有
+/// 反应」「两个挨着的按钮串没串」就永远测不到,而「想换节点结果把 pane 关了」
+/// 是一次不可撤销的误操作。
+///
+/// 尺寸按字形实测宽度算,不写死:`×` 和 `⇄` 在不同字体下宽度不同,写死会让
+/// 其中一个要么被裁一半、要么留一大块空白。
+fn small_action_button(ui: &mut egui::Ui, id: egui::Id, glyph: &str, t: &Theme) -> egui::Response {
+    let font = egui::FontId::proportional(13.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(glyph.to_string(), font, theme::c32(t.fg_muted));
+    let size = galley.size() + egui::vec2(8.0, 2.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 3.0, theme::c32(t.panel_head));
+    }
+    let color = theme::c32(if resp.hovered() {
+        t.fg_strong
+    } else {
+        t.fg_muted
+    });
+    let at = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(at, galley, color);
+    resp
+}
+
+/// 一帧里标题条上发生的事。每项每帧至多一个(多块 pane 同时被点是不可能的)。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TitleAction {
+    /// 点了 ×。
+    pub close: Option<PaneId>,
+    /// 点了「换节点」——只是**请求**,选哪个节点由 App 弹窗决定。
+    pub rehost: Option<PaneId>,
+}
+
+pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAction {
     let ppp = ctx.pixels_per_point();
-    let mut closed = None;
+    let mut action = TitleAction::default();
     for v in views {
         let tp = v.geom.title_px;
         if tp.h == 0 {
@@ -110,8 +160,20 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<P
                 );
                 content.set_clip_rect(inner);
                 content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("×").on_hover_text("关闭此分屏").clicked() {
-                        closed = Some(v.geom.id);
+                    if small_action_button(ui, close_id(v.geom.id), "×", t)
+                        .on_hover_text("关闭此分屏")
+                        .clicked()
+                    {
+                        action.close = Some(v.geom.id);
+                    }
+                    // 用户要的入口:分屏之后在这里把这块 pane 换到别的节点。
+                    // 放在 × 左边而不是做成"点主机名":主机名会被 `.truncate()`
+                    // 截断,长主机名时点击靶子会缩到几个像素宽。
+                    if small_action_button(ui, rehost_id(v.geom.id), "⇄", t)
+                        .on_hover_text("把这块分屏换到别的节点")
+                        .clicked()
+                    {
+                        action.rehost = Some(v.geom.id);
                     }
                     // 剩下的空间(已扣掉 × 按钮)左对齐摆状态点 + 主机名;主机名
                     // 排版用的 available_width 到这里已经是扣掉 × 之后的余量。
@@ -159,7 +221,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> Option<P
                 ui.allocate_rect(full, egui::Sense::hover());
             });
     }
-    closed
+    action
 }
 
 #[cfg(test)]
@@ -310,6 +372,101 @@ mod tests {
             "长主机名把 Area 撑宽到 {},应截断在 160 逻辑点以内",
             rect.width()
         );
+    }
+
+    /// 在指定的**逻辑点**位置完整点一下(移入 → 按下 → 抬起)。
+    ///
+    /// 三个事件必须在同一帧里发全:egui 的 `clicked()` 判据是「本帧收到了
+    /// 抬起、且按下时指针也在这个 widget 上」,只发按下或只发抬起都点不出来。
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        let modifiers = egui::Modifiers::default();
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// 跑一帧拿按钮位置、再跑一帧点它,返回 `show` 的动作。
+    fn click_button(which: egui::Id) -> TitleAction {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let views = [TitleView {
+            geom: geom_800x600_title32(1),
+            index: 1,
+            host: Some("dev@build-01"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+        }];
+        // **必须显式把时间推过 `Area` 的 fade_in**。默认 `RawInput` 的
+        // `time` 是 `None`,egui 会拿墙钟凑,两帧之间可能只过了几微秒 ——
+        // 淡入没走完时 `Area` 的内容不可交互,点下去毫无反应,而现象是
+        // 「测试红,但代码看着没错」。跟 `icon_backdrop_uses_the_pane_title_target`
+        // 同一个坑、同一个解法。
+        let frame = |ctx: &egui::Context, t: f64| {
+            ctx.run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &crate::theme::MULLION_DARK, &views);
+                },
+            )
+        };
+        // 两帧预热:第一帧让按钮登记进 widget 表,第二帧把淡入走完。
+        let _ = frame(&ctx, 0.0);
+        let _ = frame(&ctx, 1.0);
+        let rect = ctx
+            .read_response(which)
+            .unwrap_or_else(|| panic!("标题条上找不到 {which:?} 这个按钮"))
+            .rect;
+        let mut out = TitleAction::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(2.0),
+                ..click_at(rect.center())
+            },
+            |ctx| {
+                out = show(ctx, &crate::theme::MULLION_DARK, &views);
+            },
+        );
+        out
+    }
+
+    /// 用户要的入口:分屏之后在 **pane 标题条上**把这块换到别的节点。
+    ///
+    /// 自证会变红:把 `show` 里换节点按钮的 `rehost = Some(..)` 删掉。
+    #[test]
+    fn clicking_the_rehost_button_asks_to_change_this_panes_node() {
+        let a = click_button(rehost_id(PaneId(1)));
+        assert_eq!(a.rehost, Some(PaneId(1)), "点「换节点」应报告这块 pane");
+        assert_eq!(a.close, None, "点「换节点」不该顺带把 pane 关了");
+    }
+
+    /// 反面:两个按钮挨着,串了的话用户想换节点却把 pane 关掉了 —— 一次
+    /// 不可撤销的误操作。
+    ///
+    /// 自证会变红:把 `show` 里两个按钮的赋值对调。
+    #[test]
+    fn clicking_close_still_closes_and_does_not_ask_to_rehost() {
+        let a = click_button(close_id(PaneId(1)));
+        assert_eq!(a.close, Some(PaneId(1)));
+        assert_eq!(a.rehost, None, "点 × 不该弹换节点");
     }
 
     /// F83 标题条开关关闭(`title_px.h == 0`)时,这个 pane 不该画出任何 `Area`——
