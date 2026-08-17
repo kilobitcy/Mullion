@@ -520,8 +520,10 @@ fn on_page(rec: &SessionRecord, query: &str, protocol: mullion_store::Protocol) 
     rec.connection.protocol == protocol && matches(rec, query)
 }
 
-// 同 `session_manager::show`:内部叶子函数,为压参数数引一个专用结构体
-// 没有实际收益(`row` 更早就是这个情况,见它头上的同款 allow)。
+// 这里的参数彼此类型互不相同(五种元素类型各异的切片 + 主题 + 缓存 + 协议),
+// 传反了编译不过,位置传参不构成风险 —— 所以只挂豁免,不学 `row` 引 `RowCtx`。
+// `row` 那边是另一回事:它有一对同类型参数(两个 `Option<SessionId>`),
+// 错位能编译过且症状隐蔽,才值得收敛。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn show(
     ui: &mut Ui,
@@ -668,21 +670,23 @@ pub(super) fn show(
                             let next = super::reorder::next_in_group(&member_ids, i);
                             row(
                                 ui,
-                                t,
                                 ui_state,
-                                r,
-                                next,
-                                gid,
-                                drag_on,
-                                sessions,
-                                groups,
-                                credentials,
-                                tunnels,
-                                running_note.as_deref(),
-                                pending_delete_target,
                                 &mut pending_delete_rendered,
-                                appearance,
-                                d,
+                                RowCtx {
+                                    t,
+                                    rec: r,
+                                    next_in_group: next,
+                                    group: gid,
+                                    drag_on,
+                                    sessions,
+                                    groups,
+                                    credentials,
+                                    tunnels,
+                                    running_note: running_note.as_deref(),
+                                    pending_delete_target,
+                                    appearance,
+                                    d,
+                                },
                             );
                         }
                     });
@@ -727,36 +731,57 @@ pub(super) fn show(
     }
 }
 
-/// 画一行 + 挂交互(单击选中 / 双击连接 / 右键删除确认)。
+/// `row()` 的全部只读输入。
 ///
-/// `pending_delete_target` / `pending_delete_rendered`:「这一帧是否真的渲染过
-/// 待确认删除的目标行」的事后判定标志,见调用侧 `show()` 里的说明——
-/// 只在 `rec.id == pending_delete_target` 时置位,不直接读 `ui_state.pending_delete`,
-/// 避免本帧内刚发生的新右键覆盖被误当成「旧目标已渲染」。
-#[allow(clippy::too_many_arguments)]
-fn row(
-    ui: &mut Ui,
-    t: &Theme,
-    ui_state: &mut UiState,
-    rec: &SessionRecord,
-    // F121:这一行在**本组可见顺序**里的下一条(组内最后一行 = `None`)、
-    // 它所在的组、以及这一帧准不准拖 —— 三者都由 `show()` 算一次传下来,
-    // 落点判定层(`reorder::drop_on_row`)照单全收,自己不重算。
+/// 这些原先是 13 个位置参数。别的参数彼此类型不同、传反了编译不过,唯独
+/// `next_in_group` 与 `pending_delete_target` 同为 `Option<SessionId>` ——
+/// 这一对调换过来照样编译得过,症状却是「画面看着挺正常,只有拖拽落点和
+/// 删除确认在静默错位」。收进具名字段之后,写错字段名是编译错误,不再
+/// 依赖调用者记住顺序。
+struct RowCtx<'a> {
+    t: &'a Theme,
+    rec: &'a SessionRecord,
+    /// F121:这一行在**本组可见顺序**里的下一条(组内最后一行 = `None`)、
+    /// 它所在的组、以及这一帧准不准拖 —— 三者都由 `show()` 算一次传下来,
+    /// 落点判定层(`reorder::drop_on_row`)照单全收,自己不重算。
     next_in_group: Option<SessionId>,
     group: Option<GroupId>,
     drag_on: bool,
-    sessions: &[SessionRecord],
-    groups: &[GroupRecord],
-    credentials: &[mullion_store::CredentialRecord],
-    tunnels: &[mullion_store::TunnelRecord],
-    // 删除确认里那句「其中 N 条正在运行」。只有待确认的那一行用得上,
-    // 所以在 `show` 里算一次传下来,不是每行都去查一遍运行时表。
-    running_note: Option<&str>,
+    sessions: &'a [SessionRecord],
+    groups: &'a [GroupRecord],
+    credentials: &'a [mullion_store::CredentialRecord],
+    tunnels: &'a [mullion_store::TunnelRecord],
+    /// 删除确认里那句「其中 N 条正在运行」。只有待确认的那一行用得上,
+    /// 所以在 `show` 里算一次传下来,不是每行都去查一遍运行时表。
+    running_note: Option<&'a str>,
     pending_delete_target: Option<SessionId>,
-    pending_delete_rendered: &mut bool,
-    appearance: &crate::ui::badge::AppearanceCache,
+    appearance: &'a crate::ui::badge::AppearanceCache,
     d: Density,
-) {
+}
+
+/// 画一行 + 挂交互(单击选中 / 双击连接 / 右键删除确认)。
+///
+/// `cx.pending_delete_target` / `pending_delete_rendered`:「这一帧是否真的渲染过
+/// 待确认删除的目标行」的事后判定标志,见调用侧 `show()` 里的说明——
+/// 只在 `rec.id == pending_delete_target` 时置位,不直接读 `ui_state.pending_delete`,
+/// 避免本帧内刚发生的新右键覆盖被误当成「旧目标已渲染」。
+fn row(ui: &mut Ui, ui_state: &mut UiState, pending_delete_rendered: &mut bool, cx: RowCtx<'_>) {
+    let RowCtx {
+        t,
+        rec,
+        next_in_group,
+        group,
+        drag_on,
+        sessions,
+        groups,
+        credentials,
+        tunnels,
+        running_note,
+        pending_delete_target,
+        appearance,
+        d,
+    } = cx;
+
     if pending_delete_target == Some(rec.id) {
         *pending_delete_rendered = true;
     }
