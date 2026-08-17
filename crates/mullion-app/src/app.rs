@@ -989,6 +989,24 @@ fn snapshot_tabs_of(tabs: &Tabs<TabContent>) -> (Vec<mullion_store::SavedTab>, u
     (out, active_tab)
 }
 
+/// E2:`ConnectOk` 抵达时新标签该叫什么名字。**优先取会话名**,空名字
+/// (或压根没有会话记录,如快速连接)退回 `user@host`;两者都没有
+/// (理论上不可达,兜底)退回「远端」。
+///
+/// 抽成纯函数是因为原地写在 `ConnectOk` 分支里没法脱离事件循环单测 ——
+/// 这条优先级过去是缺的:标题恒取 `user@host`,完全没看过会话名,
+/// 于是标签属性弹窗把名字存进 store 之后,**下一次**重连同一条会话,
+/// 新标签仍然叫 `user@host`,用户会以为刚才那次改名根本没生效。
+fn tab_title(session_name: Option<&str>, user_host: Option<(&str, &str)>) -> String {
+    if let Some(name) = session_name.filter(|n| !n.is_empty()) {
+        return name.to_string();
+    }
+    if let Some((user, host)) = user_host {
+        return format!("{user}@{host}");
+    }
+    "远端".to_string()
+}
+
 /// F37:`ConnectOk` 抵达时该**顶替第几个标签**,`None` = 开一个新的。
 ///
 /// 抽成自由函数是因为 `App` 要 `EventLoopProxy`、单测里造不出来,而这里
@@ -1244,6 +1262,62 @@ pub struct App {
     /// F53:外部编辑用的临时文件根目录。退出时整棵删掉(D3-12)。
     /// 进程启动时算一次 —— `directories` 每次调用都要摸环境变量。
     edit_root: std::path::PathBuf,
+}
+
+/// 一种会盖住主界面的模态弹窗。
+///
+/// **存在的唯一理由是让编译器当守护**:`modal_open` 过去是一串 `||` 列举,
+/// 新增弹窗时全靠人记得补一行 —— 已经漏过三次(editor / files_dialog /
+/// group_manager),后果是那个弹窗开着时用户敲的字**同时被发给远端 shell**
+/// (T8)。改成枚举之后,加一个变体就必须在 `modal_open` 的 `match` 里给出
+/// 「它现在开着吗」,不给就编译不过。
+///
+/// **加变体时要同步两处**:`ALL` 和测试里的 `VARIANT_COUNT`
+/// (`every_modal_variant_is_listed_in_all`)。`ALL` 少写一项编译器管不着,
+/// 那条测试就是补这个缺口的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Modal {
+    SessionManager,
+    About,
+    Settings,
+    Unlock,
+    HostKey,
+    Paste,
+    Import,
+    /// F53:内置文件编辑器。**过去漏了** —— 它是个多行输入框,不算模态
+    /// 的话里面压根打不出字(键盘全被判给终端)。
+    Editor,
+    /// D2:远端写操作确认框(新建文件夹 / 重命名 / 删除 / 改权限)。
+    /// **过去漏了** —— 新建文件夹时敲的目录名会同时发给远端 shell。
+    FilesDialog,
+    /// F60:分组管理器。**过去漏了**(`modal_open` 的旧注释已承认)——
+    /// 里面有分组名输入框。
+    GroupManager,
+    /// E2/E3:标签属性弹窗(改名 + 配色)。里面有名字输入框 —— 不算模态的话
+    /// 敲的字会同时发给远端 shell(T8)。
+    TabProps,
+    /// F53/D3-12:退出确认框(「还有改动没传回远端」)。**切片 J 终审才发现
+    /// 漏了** —— 它从 D3 引入起就没进过这张表:开着的时候 `Ctrl+W` 仍能关掉
+    /// 当前标签、`Ctrl+Shift+B` 仍能开关文件侧栏(两条快捷键的闸门都是
+    /// `modal_open()`)。
+    ExitConfirm,
+}
+
+impl Modal {
+    const ALL: &'static [Modal] = &[
+        Modal::SessionManager,
+        Modal::About,
+        Modal::Settings,
+        Modal::Unlock,
+        Modal::HostKey,
+        Modal::Paste,
+        Modal::Import,
+        Modal::Editor,
+        Modal::FilesDialog,
+        Modal::GroupManager,
+        Modal::TabProps,
+        Modal::ExitConfirm,
+    ];
 }
 
 /// F59:传输队列在跑时的界面刷新间隔(毫秒)。进度条 5Hz 已经够顺,
@@ -1759,6 +1833,54 @@ impl App {
         self.spawn_connect(cfg, wants_sftp);
     }
 
+    /// B3:SFTP 节点标签断了之后按「重连」。
+    ///
+    /// **就地降级成 `RestoredTab` 再走 `reconnect_tab`**,而不是另写一条
+    /// 拨号链路 —— F37 已经有一条完整的「拨号 → `ConnectOk` 就地替换标签」
+    /// 路径,再写一条就有两处要维护(而且第二条一定会漏掉 `pending_restore`
+    /// 那道防连点的闸)。
+    ///
+    /// 代价:重连后回默认远端目录,不回断线前那个。可接受 —— F120 明确
+    /// 「不记忆上次打开的目录」。
+    ///
+    /// `generation` 而不是「活动标签」:与本文件其余五条 F50 路径同一条
+    /// S1 纪律 —— 用户点「重连」那一刻活动标签理论上可能已经切走了。
+    fn demote_files_tab_and_reconnect(&mut self, generation: u64) {
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
+            return;
+        };
+        let Some(session_id) = tab.session_id else {
+            // 快速连接开出来的 SFTP 标签没有会话记录,无从重连。
+            self.ui
+                .set_error("这个标签没有对应的会话记录,无法重连".to_string());
+            self.ui_dirty = true;
+            return;
+        };
+        let tab_id = tab.id;
+        let new_generation = self.next_ws_generation;
+        self.next_ws_generation += 1;
+        // 旧连接的后台任务必须先收口 —— 每个任务经 Arc 持有一份连接保活
+        // 引用,只替换 content 收不了口(同 `wind_down` 那条纪律)。
+        let old_content = std::mem::replace(
+            &mut tab.content,
+            TabContent::Restored(RestoredTab {
+                session_id,
+                tree: Vec::new(),
+                focus_leaf: 0,
+                generation: new_generation,
+                wants_sftp: true,
+                dialing: false,
+            }),
+        );
+        wind_down(Tab {
+            id: tab_id,
+            title: String::new(),
+            session_id: Some(session_id),
+            content: old_content,
+        });
+        self.reconnect_tab(tab_id);
+    }
+
     /// F37:菜单里的「全部重连」。**一个一个来** —— `reconnect_tab` 里那道
     /// `pending_restore` 闸保证同时只有一条在拨号,这里只是把第一个还没连
     /// 的占位标签交给它;剩下的等这条连上之后用户再按一次。
@@ -1847,24 +1969,35 @@ impl App {
 
     /// 有没有模态盖着。分流(§4.5)与标签快捷键共用同一个判据 —— 两处各写一遍
     /// 的话,新增一种弹窗时漏改一处,现象是「弹窗开着按 Ctrl+W 把背后的标签关了」。
-    /// **与抽出来之前逐字等价**。`ui.group_manager_open` 不在这张表里,是既有
-    /// 行为(它也是个 `egui::Window`、里面有输入框,看着像该算模态)—— 但那是
-    /// 分流层的既有缺口,不在 F36 的射程内,改它要单独一笔。
+    ///
+    /// **`match` 必须留在这个函数体里**:既有的两条守护测试
+    /// (`the_unlock_dialog_counts_as_a_modal_...` / `the_import_preview_...`)
+    /// 扎的是这个函数的源码文本,抽到别的方法里会让它们空过。
     fn modal_open(&self) -> bool {
-        self.ui.session_manager_open
-            || self.ui.about_open
+        Modal::ALL.iter().any(|m| match m {
+            Modal::SessionManager => self.ui.session_manager_open,
+            Modal::About => self.ui.about_open,
             // F84:设置弹窗里有输入框(手填族名)。不算模态的话,敲进去的字
             // 会同时被发给远端 —— T8 那条「弹窗开着时键盘归 egui」。
-            || self.ui.settings_open
+            Modal::Settings => self.ui.settings_open,
             // F71:解锁框里输的是主密码。不算模态的话,它会一边被 egui 收进
-            // 输入框、一边被原样发给远端 shell —— T8 那条「弹窗开着时键盘归 egui」。
-            || self.ui.unlock.is_some()
-            || self.pending_host_key.is_some()
-            || self.pending_paste.is_some()
+            // 输入框、一边被原样发给远端 shell —— T8。
+            Modal::Unlock => self.ui.unlock.is_some(),
+            Modal::HostKey => self.pending_host_key.is_some(),
+            Modal::Paste => self.pending_paste.is_some(),
             // F2:导入预览弹窗。里面没有输入框,但有「导入 N 条」这种一按就
-            // 落库的按钮,而空格/回车在 egui 里是按钮的激活键 —— 不算模态的话,
-            // 用户在弹窗上敲的键会照样漏给远端 shell(T8)。
-            || self.ui.import.is_some()
+            // 落库的按钮,而空格/回车在 egui 里是按钮的激活键 —— T8。
+            Modal::Import => self.ui.import.is_some(),
+            Modal::Editor => self.editor.is_some(),
+            Modal::FilesDialog => self.ui.files_dialog.is_some(),
+            Modal::GroupManager => self.ui.group_manager_open,
+            // E2/E3:标签属性弹窗里有名字输入框 —— 不算模态的话,敲的字会
+            // 同时被发给远端 shell(T8)。
+            Modal::TabProps => self.ui.tab_props.is_some(),
+            // F53/D3-12:退出确认框。不算模态的话,`Ctrl+W`/`Ctrl+Shift+B`
+            // 会在它开着的时候照旧生效(T8)。
+            Modal::ExitConfirm => self.ui.exit_pending,
+        })
     }
 
     /// 活动标签本身是不是 `TabContent::Files`(D1 的标签宿主)。`files_owner_generation`
@@ -2036,6 +2169,12 @@ impl App {
             );
             return;
         }
+        // B3:本地栏是本机文件系统,没有「连接」概念,不会进 `Load::Disconnected`
+        // 态、也就画不出「重连」按钮。真收到这个动作说明分派接错了,不静默吞。
+        if matches!(action, FileAction::Reconnect) {
+            log::warn!("本地栏收到了 Reconnect,已忽略(本地栏没有连接概念)");
+            return;
+        }
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
@@ -2060,7 +2199,7 @@ impl App {
                 return;
             }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
-            FileAction::Transfer | FileAction::Drop(_) => return,
+            FileAction::Transfer | FileAction::Drop(_) | FileAction::Reconnect => return,
             // D5:本地文件在资源管理器里双击就行,`menu_items_for` 也不给
             // 这两项。到这儿同样说明菜单构造被改坏了。
             FileAction::EditExternal | FileAction::EditInline => {
@@ -2132,6 +2271,23 @@ impl App {
                 self.start_edit(generation, crate::edit::sessions::EditKind::Inline);
                 return;
             }
+            // B3:用户在「已断开」态点了「重连」。两种宿主两种语义,**不共用
+            // 一条路径**:SFTP 节点标签(`TabContent::Files`)独占自己的连接
+            // (ADR-010/D6),重连 = 重建整条连接;终端标签的侧栏只是蹭
+            // `ws.hosts[0]` 的连接,sftp channel 单独死掉时重开它即可 ——
+            // SSH 本体断了是终端的事,侧栏不越权重建。
+            FileAction::Reconnect => {
+                let is_files_tab = self
+                    .tabs
+                    .by_generation(generation)
+                    .is_some_and(|t| matches!(t.content, TabContent::Files(_)));
+                if is_files_tab {
+                    self.demote_files_tab_and_reconnect(generation);
+                } else {
+                    self.trigger_sftp_open(generation);
+                }
+                return;
+            }
             _ => {}
         }
         let client = {
@@ -2169,7 +2325,8 @@ impl App {
             | FileAction::Transfer
             | FileAction::Drop(_)
             | FileAction::EditExternal
-            | FileAction::EditInline => return,
+            | FileAction::EditInline
+            | FileAction::Reconnect => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
@@ -3191,7 +3348,9 @@ impl App {
     }
 
     /// S1:`UserEvent::SftpListed` 同样按世代查属主标签。`seq` 对不上
-    /// (用户点得比网络快时的后发先至)由 `PaneState::accept` 内部丢弃。
+    /// (用户点得比网络快时的后发先至)丢弃 —— `Ok` 分支复用
+    /// `PaneState::accept` 内部的判据,`Err` 分支手工复一份同款判据,理由
+    /// 见下。
     fn accept_sftp_listed(
         &mut self,
         generation: u64,
@@ -3200,7 +3359,57 @@ impl App {
     ) {
         if let Some(tab) = self.tabs.by_generation_mut(generation) {
             if let Some(files) = tab.content.files_panel_mut() {
-                files.remote.accept(seq, result);
+                let pane = &mut files.remote;
+                match result {
+                    Ok(entries) => {
+                        pane.accept(seq, Ok(entries));
+                    }
+                    Err(msg) => {
+                        // `PaneState::accept` 收到 `Err` 时恒落 `Load::Failed`,
+                        // 这里要按分类分流到 `Disconnected`,所以不能直接复用
+                        // 它——但 seq 判据(丢弃后发先至的旧结果)必须原样照做。
+                        if seq == pane.request_seq {
+                            pane.entries.clear();
+                            // B3:连接级失败要转断开态(给重连入口),路径级
+                            // 停在原地报一句。判据在纯函数里,可单测。
+                            pane.load = match crate::files::fail::classify(&msg) {
+                                crate::files::fail::FailKind::Session => {
+                                    crate::files::state::Load::Disconnected
+                                }
+                                crate::files::fail::FailKind::Path => {
+                                    crate::files::state::Load::Failed(msg)
+                                }
+                            };
+                        }
+                    }
+                }
+            }
+            // B3 复核修订:转成 `Disconnected` 之后,死掉的 client **不能**
+            // 继续留在槽位里。`trigger_sftp_open` 的既有短路守卫是
+            // `sftp_client().is_some() || already_loading`——槽位不清空的话
+            // 它会看见一个「死了但还在」的 client,直接 return 什么都不做,
+            // 「重连」按钮变成死按钮。这正是 B3 要解决的场景(channel 用着
+            // 用着死了),跟「从未开成功过」(那种情况下槽位本来就是 `None`,
+            // 守卫本来就会放行)不是同一回事,不能假设它已经被别处清过。
+            //
+            // 顺带 abort 掉绑在同一条死连接上的在途 sftp 任务并清空任务表——
+            // 它们攥着的 `Arc<SshConnection>` 不该在连接已经证实死亡之后
+            // 还继续悬着等自己的网络往返超时(ADR-009 channel 泄漏那一类
+            // 问题;同 `wind_down` 关标签时的收口纪律,只是这里收口的时机
+            // 是「确认断连」而不是「标签关闭」)。
+            let just_disconnected = tab
+                .content
+                .files_panel()
+                .is_some_and(|f| matches!(f.remote.load, crate::files::state::Load::Disconnected));
+            if just_disconnected {
+                if let Some(slot) = tab.content.sftp_mut() {
+                    *slot = None;
+                }
+                if let Some(tasks) = tab.content.sftp_tasks_mut() {
+                    for t in tasks.drain(..) {
+                        t.abort();
+                    }
+                }
             }
         } else {
             log::debug!(target: "mullion", "丢弃过期世代 {generation} 的目录列表(seq={seq})");
@@ -4200,9 +4409,19 @@ impl ApplicationHandler<UserEvent> for App {
                 let pending = self.pending_restore.take();
                 let cfg = self.pending_cfg.clone();
                 let session_id = self.ui.connect_request_last;
-                let title = cfg
-                    .as_ref()
-                    .map_or_else(|| "远端".to_string(), |c| format!("{}@{}", c.user, c.host));
+                // E2:标签标题优先取会话名,退回 `user@host`(见 `tab_title`
+                // 的文档)——过去这里恒取 `user@host`,标签属性弹窗改的名字
+                // 要等到**下一次**重连同一条会话才用得上,现在改完立刻生效。
+                let title = tab_title(
+                    session_id
+                        .and_then(|id| {
+                            self.store
+                                .as_ref()
+                                .and_then(|s| s.list().iter().find(|r| r.id == id))
+                        })
+                        .map(|rec| rec.identity.name.as_str()),
+                    cfg.as_ref().map(|c| (c.user.as_str(), c.host.as_str())),
+                );
                 // F120:这个标签对应会话在编辑器「SFTP」分节配置的默认目录/书签。
                 // 没有 `session_id`(理论上不可达,`connect_request_last` 由发起
                 // 连接那一刻设好)或 store 里查不到(会话已被删)都落回全空默认——
@@ -5269,6 +5488,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 .map(|(i, tab)| crate::ui::chrome::TabView {
                                     title: tab.title.as_str(),
                                     active: i == active_ix,
+                                    session_id: tab.session_id,
                                     appearance: tab
                                         .session_id
                                         .and_then(|sid| self.appearance.get(sid)),
@@ -5477,7 +5697,50 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui.session_manager_open = true;
                                     self.ui_dirty = true;
                                 }
+                                // E2/E3:双击标签,或右键菜单点了「重命名…」/
+                                // 「设置颜色…」。用会话记录当前的名字/颜色建一份
+                                // 草稿 —— 没有会话记录的标签(快速连接)点不出
+                                // `session_id`,右键菜单里那两项本来就是禁用的,
+                                // 双击这里同样静默不开(没有可编辑的东西)。
+                                Some(crate::ui::chrome::TabAction::Props(ix)) => {
+                                    if let Some(sid) =
+                                        self.tabs.iter().nth(ix).and_then(|t| t.session_id)
+                                    {
+                                        let (name, color, targets) = self
+                                            .store
+                                            .as_ref()
+                                            .and_then(|s| s.list().iter().find(|r| r.id == sid))
+                                            .map(|rec| {
+                                                let spec = rec.appearance.color.clone();
+                                                let c32 = spec
+                                                    .as_ref()
+                                                    .and_then(|c| theme::parse_hex(&c.hex))
+                                                    .map(theme::c32);
+                                                let targets =
+                                                    spec.map(|c| c.apply_to).unwrap_or_default();
+                                                (rec.identity.name.clone(), c32, targets)
+                                            })
+                                            .unwrap_or_default();
+                                        self.ui.tab_props =
+                                            Some(crate::ui::tab_props::TabPropsDraft {
+                                                session_id: sid,
+                                                name,
+                                                color,
+                                                targets,
+                                            });
+                                    }
+                                    self.ui_dirty = true;
+                                }
                                 None => {}
+                            }
+                            // E2/E3:标签属性弹窗按了「保存」。先落到 `self.ui`
+                            // 上(同 `save_request` 的中转理由:egui 闭包借不到
+                            // `&mut store`),真正写 store 在下面 `touched_store`
+                            // 那段、`self.active`/`self.ui` 的借用释放之后。
+                            if let Some(a @ crate::ui::tab_props::TabPropsAction::Save { .. }) =
+                                actions.tab_props.take()
+                            {
+                                self.ui.tab_props_save = Some(a);
                             }
                             // F37:占位标签上按了「重连」/菜单里按了「全部
                             // 重连」。两条走同一个 `reconnect_tab`,不分叉。
@@ -5724,7 +5987,11 @@ impl ApplicationHandler<UserEvent> for App {
                     || self.ui.move_to_group.is_some()
                     // F2:导入一次能加进几十条会话,外观缓存必须跟着重算 ——
                     // 漏掉它的话新会话在列表里画的是默认色/默认图标。
-                    || self.ui.import_request.is_some();
+                    || self.ui.import_request.is_some()
+                    // E3:标签属性弹窗改的是会话的 identity.name /
+                    // appearance.color —— 不算进来的话,改了颜色要重启才
+                    // 看得见(AppearanceCache 只在 store 变更后 rebuild)。
+                    || self.ui.tab_props_save.is_some();
                 if self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
                     || self.ui.move_to_group.is_some()
@@ -5787,6 +6054,26 @@ impl ApplicationHandler<UserEvent> for App {
                             Err(msg) => self.ui.set_error(msg),
                         }
                     }
+                }
+                // E2/E3:标签属性弹窗的施加点。与会话表单的 `save_request`
+                // 同构,同样只在这里碰 store。
+                if let Some(crate::ui::tab_props::TabPropsAction::Save {
+                    session_id,
+                    name,
+                    color,
+                }) = self.ui.tab_props_save.take()
+                {
+                    if let Some(store) = self.store.as_mut() {
+                        let now = time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default();
+                        match apply_tab_props_save(store, session_id, name.clone(), color, &now) {
+                            Ok(()) => self.ui.set_toast("已保存标签属性"),
+                            Err(e) => self.ui.set_error(e),
+                        }
+                    }
+                    sync_tab_titles_for_session(&mut self.tabs, session_id, &name);
+                    self.ui_dirty = true;
                 }
                 // F110 隧道 CRUD 的施加点。与会话侧同构:UI 只写意图,这里才碰
                 // store。**不复用** `save_request`/`delete_request` 那两条通道 ——
@@ -6390,6 +6677,79 @@ fn apply_save(
     }
 }
 
+/// 施加一次「标签属性(改名 + 配色)」保存意图(E2/E3)。与 `apply_save`
+/// 同构、同样抽成自由函数,理由也一样:「取出 → 改两个字段 → upsert」
+/// 只能靠无窗口单测挡住「悄悄清空了别的分节」这类错误。
+///
+/// **`SessionStore`/`Vault` 没有 `get_mut`**(切片 H 的设计:`update` 要
+/// 一份完整的 `SessionDraft`,含 `secret`,不是「改一个字段」的接口)——
+/// 所以这里先把现有记录整份克隆出来,只改 `identity.name` /
+/// `appearance.color` 这两个字段,其余分节原样揣回 `update`,密文那半
+/// 单独从 `store.secret` 取一份 `Keep` 语义的克隆(`None` 也要原样传回,
+/// 不能因为「这次没改密码」就把已有密文抹掉)。
+fn apply_tab_props_save(
+    store: &mut crate::shell::store::SessionStore,
+    session_id: mullion_store::SessionId,
+    name: String,
+    color: Option<mullion_store::ColorSpec>,
+    now: &str,
+) -> Result<(), String> {
+    let rec = store
+        .list()
+        .iter()
+        .find(|r| r.id == session_id)
+        .cloned()
+        .ok_or_else(|| "保存失败:会话已不存在".to_string())?;
+    let secret = store.secret(session_id).cloned();
+    let draft = mullion_store::SessionDraft {
+        identity: mullion_store::Identity {
+            name,
+            ..rec.identity
+        },
+        connection: rec.connection,
+        auth: rec.auth,
+        terminal: rec.terminal,
+        appearance: mullion_store::AppearancePrefs {
+            color,
+            ..rec.appearance
+        },
+        network: rec.network,
+        automation: rec.automation,
+        sftp: rec.sftp,
+        secret,
+    };
+    store
+        .update(session_id, draft, now)
+        .map_err(|e| format!("保存失败:{e}"))?;
+    store.save().map_err(|e| format!("保存失败:{e}"))
+}
+
+/// E2:标签属性弹窗保存成功后,**眼前的标签必须立刻跟着变**。标签标题是
+/// 连接时拼的运行态快照,不引用 `identity.name`——只写回 store 的话,标签
+/// 纹丝不动,用户会以为改名没生效。
+///
+/// 同一条会话可能被不止一个标签引用(同一台机器开了两个 pane/标签),
+/// 必须同步**所有**指向这个 `session_id` 的标签,不能只改活动的那个——
+/// 否则切到另一个标签会看到没跟着改的旧标题。
+///
+/// 抽成纯函数是因为原地写在事件循环里没法脱离 `Tabs` 单测——这条「同步
+/// 所有」是特地要防的行为,写对了但只测「活动标签变了」的话,退化成
+/// 「只改活动标签」不会被任何测试挡住。
+fn sync_tab_titles_for_session(
+    tabs: &mut Tabs<TabContent>,
+    session_id: mullion_store::SessionId,
+    name: &str,
+) {
+    if name.is_empty() {
+        return;
+    }
+    for tab in tabs.iter_mut() {
+        if tab.session_id == Some(session_id) {
+            tab.title = name.to_string();
+        }
+    }
+}
+
 /// 施加一次「保存凭据」意图(F74)。与 `apply_save` 同构、同样抽成自由函数,
 /// 理由也一样:「编辑已有凭据点保存把密码清空」这类错误只能靠无窗口单测挡住。
 ///
@@ -6597,6 +6957,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.reconnect_all
         || a.settings.is_some()
         || a.unlock.is_some()
+        || a.tab_props.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -6814,9 +7175,10 @@ fn render_frame(
 mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save,
-        credential_delete_error, download_job, effective_focus_of, files_owner_generation_of,
-        finish_password_change, font_px_for, has_real_action, next_panel_selection_index,
-        pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at, upload_job, wind_down,
+        apply_tab_props_save, credential_delete_error, download_job, effective_focus_of,
+        files_owner_generation_of, finish_password_change, font_px_for, has_real_action,
+        next_panel_selection_index, pane_still_wanted, snapshot_tabs_of,
+        sync_tab_titles_for_session, sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal,
         RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
@@ -7058,6 +7420,172 @@ mod tests {
         );
     }
 
+    /// T8:四个曾经漏登记的弹窗(内置编辑器 / 文件写操作确认框 / 分组管理器 /
+    /// 标签属性弹窗)也必须计进模态。判据与理由同上两条 ——
+    /// `every_modal_variant_is_listed_in_all` 只防「变体没塞进 `Modal::ALL`」,
+    /// 防不住「变体在 `ALL` 里,但 `modal_open` 的 `match` 分支被悄悄改成
+    /// `=> false`」这种接线错误(复核实测:把这四臂都改成 `=> false`,
+    /// `cargo test --lib` 之前是全绿的 —— `TabProps` 是切片 J 终审补的,
+    /// 之前完全没有守护)。
+    ///
+    /// 自证会变红:把 `modal_open` 里 `self.editor.is_some()` /
+    /// `self.ui.files_dialog.is_some()` / `self.ui.group_manager_open` /
+    /// `self.ui.tab_props.is_some()` 任意一处改成字面量 `false`。
+    #[test]
+    fn the_editor_files_dialog_group_manager_and_tab_props_windows_count_as_modals_so_keys_do_not_leak_to_the_shell(
+    ) {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 modal_open 的函数结尾")];
+        assert!(
+            body.contains("self.ui.session_manager_open"),
+            "modal_open 的函数体切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.editor.is_some()"),
+            "内置编辑器没算进模态:编辑器开着时键盘仍判给终端,里面根本打不出字(T8)"
+        );
+        assert!(
+            body.contains("self.ui.files_dialog.is_some()"),
+            "文件写操作确认框没算进模态:新建文件夹时敲的目录名会同时发给远端 shell(T8)"
+        );
+        assert!(
+            body.contains("self.ui.group_manager_open"),
+            "分组管理器没算进模态:分组名输入框里敲的字会同时发给远端 shell(T8)"
+        );
+        assert!(
+            body.contains("self.ui.tab_props.is_some()"),
+            "标签属性弹窗没算进模态:改名输入框里敲的字会同时发给远端 shell(T8)"
+        );
+    }
+
+    /// T8:退出确认框(「还有改动没传回远端」)也必须计进模态。**从 D3 引入
+    /// 起就没进过这张表**,是切片 J 终审才发现的漏网之鱼 —— 与前几条不同,
+    /// 它没有输入框,后果不是「键盘被同时发给远端」,而是「`Ctrl+W`/
+    /// `Ctrl+Shift+B` 两条快捷键的闸门都是 `modal_open()`,不算模态的话它俩
+    /// 照样在退出确认框开着期间生效」。
+    ///
+    /// 自证会变红:把 `modal_open` 里 `self.ui.exit_pending` 改成字面量
+    /// `false`。
+    #[test]
+    fn the_exit_confirm_dialog_counts_as_a_modal_so_ctrl_w_and_ctrl_shift_b_do_not_leak_through() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 modal_open 的函数结尾")];
+        assert!(
+            body.contains("self.ui.session_manager_open"),
+            "modal_open 的函数体切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.ui.exit_pending"),
+            "退出确认框没算进模态:Ctrl+W/Ctrl+Shift+B 会在它开着期间照旧生效(T8)"
+        );
+    }
+
+    /// T8:模态表的**完备性**守护。`Modal::ALL` 少写一个变体编译器不管 ——
+    /// 这条测试补上那个缺口。
+    ///
+    /// 用穷尽 `match`(`check` 内部)而不是数变体总数 —— 旧版靠人工维护
+    /// `VARIANT_COUNT` 防不住「加了变体、也补了 `modal_open` 的 `match`
+    /// 分支,却忘了塞进 `ALL`」:那种情况下 `ALL.len()` 没变,`VARIANT_COUNT`
+    /// 也没人去改,测试照绿。改成穷尽 `match` 之后,新增一个 `Modal` 变体
+    /// 如果不给 `check` 里的 `match` 补一条分支,**这个函数本身就编译
+    /// 不过**(`non-exhaustive patterns`)——这个检查在编译期生效,与
+    /// 「有没有实际拿这个变体去调用 `check`」无关。
+    ///
+    /// 与上面几条不同,这条不扎源码:`Modal` 是纯枚举,不需要真 `App` 就能数。
+    ///
+    /// 自证会变红/编译不过:
+    /// - 从 `Modal::ALL` 里删掉任意一个变体 → 对应那一臂的 `assert!` 变红。
+    /// - 给 `Modal` 加一个新变体、只在 `modal_open` 里补分支、不回来改这条
+    ///   测试 → `check` 里的 `match` 非穷尽,编译不过。
+    #[test]
+    fn every_modal_variant_is_listed_in_all() {
+        fn check(m: Modal) {
+            match m {
+                Modal::SessionManager => assert!(
+                    Modal::ALL.contains(&Modal::SessionManager),
+                    "SessionManager 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::About => assert!(
+                    Modal::ALL.contains(&Modal::About),
+                    "About 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::Settings => assert!(
+                    Modal::ALL.contains(&Modal::Settings),
+                    "Settings 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::Unlock => assert!(
+                    Modal::ALL.contains(&Modal::Unlock),
+                    "Unlock 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::HostKey => assert!(
+                    Modal::ALL.contains(&Modal::HostKey),
+                    "HostKey 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::Paste => assert!(
+                    Modal::ALL.contains(&Modal::Paste),
+                    "Paste 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::Import => assert!(
+                    Modal::ALL.contains(&Modal::Import),
+                    "Import 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::Editor => assert!(
+                    Modal::ALL.contains(&Modal::Editor),
+                    "Editor 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::FilesDialog => assert!(
+                    Modal::ALL.contains(&Modal::FilesDialog),
+                    "FilesDialog 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::GroupManager => assert!(
+                    Modal::ALL.contains(&Modal::GroupManager),
+                    "GroupManager 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::TabProps => assert!(
+                    Modal::ALL.contains(&Modal::TabProps),
+                    "TabProps 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::ExitConfirm => assert!(
+                    Modal::ALL.contains(&Modal::ExitConfirm),
+                    "ExitConfirm 没登记进 Modal::ALL(T8)"
+                ),
+            }
+        }
+        for m in [
+            Modal::SessionManager,
+            Modal::About,
+            Modal::Settings,
+            Modal::Unlock,
+            Modal::HostKey,
+            Modal::Paste,
+            Modal::Import,
+            Modal::Editor,
+            Modal::FilesDialog,
+            Modal::GroupManager,
+            Modal::TabProps,
+            Modal::ExitConfirm,
+        ] {
+            check(m);
+        }
+        // 去重后仍是同一个数 —— 防「复制粘贴写重了一项来凑数」。
+        let mut seen = std::collections::HashSet::new();
+        for m in Modal::ALL {
+            assert!(seen.insert(format!("{m:?}")), "Modal::ALL 里有重复项:{m:?}");
+        }
+    }
+
     /// F61/F62:导入会一次加进几十条会话,外观缓存必须跟着重算 —— 漏掉
     /// 它的话新会话在列表里画的是默认色/默认图标,而用户完全不知道为什么。
     ///
@@ -7080,6 +7608,28 @@ mod tests {
         assert!(
             expr.contains("self.ui.import_request"),
             "导入没算进 touched_store:新导入的会话会画成默认外观(F61/F62)"
+        );
+    }
+
+    /// F61/F62:标签属性弹窗改的是会话的颜色 —— 不算进 `touched_store` 的话,
+    /// 用户改了颜色,标签横杠要等下次重启才变。
+    ///
+    /// 自证会变红:把 `touched_store` 里的 `tab_props` 那一项删掉。
+    #[test]
+    fn renaming_a_tab_counts_as_touching_the_store_so_the_look_is_recomputed() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("let touched_store = ")
+            .nth(1)
+            .expect("找不到 touched_store 的赋值");
+        let expr = &after[..after.find(";\n").expect("找不到该赋值的结尾")];
+        assert!(
+            expr.contains("self.ui.save_request"),
+            "切歪了 —— 下面那条会空过"
+        );
+        assert!(
+            expr.contains("tab_props"),
+            "标签属性没算进 touched_store:改了颜色要重启才看得见(F61/F62)"
         );
     }
 
@@ -7893,6 +8443,144 @@ mod tests {
             body.contains(".by_generation_mut(generation)"),
             "accept_sftp_listed 没按世代查属主标签 —— 迟到的目录列表会落到\
              当前活动标签而不是真正发起这次列目录的那个标签上"
+        );
+    }
+
+    /// **接线守护**(B3):`accept_sftp_listed` 的 `Err` 分支必须过一遍
+    /// `files::fail::classify` 分流,不能像 `Ok` 分支那样直接甩给
+    /// `PaneState::accept`(那样只会恒落 `Load::Failed`,连接死了也不会
+    /// 转 `Disconnected`、用户就看不到「重连」入口)。
+    ///
+    /// **扎的是源码结构**:`App` 单测里造不出来(`EventLoopProxy`),这里
+    /// 只挡得住「函数体里没提这三个符号」这一种退化。
+    ///
+    /// 自证会变红:把 `Err` 分支换成直接 `pane.accept(seq, Err(msg))`
+    /// (即退回旧写法,丢掉分类)。
+    #[test]
+    fn sftp_listed_error_is_routed_through_fail_classify() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn accept_sftp_listed(")
+            .nth(1)
+            .expect("找不到 accept_sftp_listed 的定义");
+        let body = &after[..after
+            .find("\n    /// UI 侧变了")
+            .expect("找不到 accept_sftp_listed 的函数结尾")];
+        assert!(
+            body.contains("crate::files::fail::classify(&msg)"),
+            "accept_sftp_listed 的 Err 分支没有过 files::fail::classify 分类"
+        );
+        assert!(
+            body.contains("crate::files::state::Load::Disconnected"),
+            "accept_sftp_listed 的 Err 分支没有落地 Load::Disconnected 分支"
+        );
+        assert!(
+            body.contains("crate::files::state::Load::Failed(msg)"),
+            "accept_sftp_listed 的 Err 分支没有保留 Load::Failed 分支(路径级仍要停在原地报错)"
+        );
+    }
+
+    /// **接线守护**(B3 复核修订):`demote_files_tab_and_reconnect` 必须先
+    /// `wind_down` 旧连接的内容,再把 `content` 换成占位标签。
+    ///
+    /// 漏掉这一步:旧连接的后台任务(含它们手里那份 `Arc<SshConnection>`,
+    /// 每个任务靠它保活)不会收口,是 ADR-009 说的 channel 泄漏那一类问题的
+    /// 又一个变种——只是触发点从「关标签」换成了「点重连」。
+    ///
+    /// **复核实测过**:删掉这段 `wind_down` 调用,`cargo test --workspace`
+    /// 全绿——没有任何既有测试覆盖到这条路径,必须专门补一条。
+    ///
+    /// **扎的是源码结构**(`App` 单测里造不出来,理由同本文件其余接线守护:
+    /// 需要 `EventLoopProxy`)。验证边界:只挡得住「函数体里没提 wind_down」
+    /// 这一种退化,挡不住换个等价说法的更隐蔽退化。
+    ///
+    /// 自证会变红:删掉函数体里 `wind_down(Tab { ... })` 那几行。
+    #[test]
+    fn demote_files_tab_and_reconnect_winds_down_the_old_connection() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn demote_files_tab_and_reconnect(")
+            .nth(1)
+            .expect("找不到 demote_files_tab_and_reconnect 的定义");
+        let body = &after[..after
+            .find("\n    fn reconnect_next_restored")
+            .expect("找不到 demote_files_tab_and_reconnect 的函数结尾")];
+        // 先证明切出来的确实是函数体,不是切歪了的空/无关片段 —— 下面那条
+        // 否定断言(其实是肯定断言里带否定语气)才有意义。
+        assert!(
+            body.contains("mem::replace"),
+            "demote_files_tab_and_reconnect 的函数体切歪了(切出来 {} 字节,\
+             没提到 mem::replace)—— 下面那条断言会空过",
+            body.len()
+        );
+        assert!(
+            body.contains("wind_down("),
+            "demote_files_tab_and_reconnect 没有调用 wind_down —— 旧连接的\
+             后台任务(含它们手里那份 Arc<SshConnection>)不会收口,是\
+             ADR-009 说的 channel 泄漏(触发点从「关标签」换成了「点重连」)"
+        );
+    }
+
+    /// **接线守护**(B3 复核修订):`accept_sftp_listed` 判定为 `Disconnected`
+    /// 之后必须清空 sftp 槽位,「重连」才不是死按钮。
+    ///
+    /// 背景:`trigger_sftp_open` 的短路守卫是
+    /// `tab.content.sftp_client().is_some() || already_loading`——全仓唯一
+    /// 写 `Some` 的地方是 `accept_sftp_opened` 的 `Ok` 分支,`sftp_client()`
+    /// 只克隆 `Arc`、不做存活性检查。B3 要处理的场景**恰好**是「channel
+    /// 已经开成功、用着用着死了」,这意味着槽位在失败发生的那一刻必然是
+    /// `Some(一个死掉的 client)`——如果没人清掉它,用户点「重连」时
+    /// `trigger_sftp_open` 会在第一行直接 `return`,界面上什么反应都没有。
+    ///
+    /// **扎的是源码结构**(`App`/`EventLoopProxy` 单测里造不出来)。判据钉在
+    /// 两处必须同时成立才算数,不是孤立断言槽位赋值本身(那样太容易变成
+    /// 重言式):
+    /// 1. `accept_sftp_listed` 里,紧跟在「读到 `Load::Disconnected`」这个
+    ///    条件之后,确实清了 `sftp_mut()` 槽位;
+    /// 2. `trigger_sftp_open` 的短路守卫确实读的还是同一个 `sftp_client()`
+    ///    ——防止有人把守卫改成读别的字段,让第 1 条断言变成不痛不痒的死代码。
+    ///
+    /// 自证会变红:删掉 `accept_sftp_listed` 里 `just_disconnected` 那段清
+    /// 槽位的代码(复核实测过:删掉之后 `cargo test --workspace` 全绿,
+    /// 因为没有任何测试越过 `App` 的边界验证这条因果链)。
+    #[test]
+    fn reconnect_after_a_session_failure_actually_reopens_the_channel() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn accept_sftp_listed(")
+            .nth(1)
+            .expect("找不到 accept_sftp_listed 的定义");
+        let body = &after[..after
+            .find("\n    /// UI 侧变了")
+            .expect("找不到 accept_sftp_listed 的函数结尾")];
+
+        // 「读到 Disconnected 状态」这一句必须存在,且清槽位的代码要跟着
+        // 它走——不能是与判定逻辑脱节的孤立赋值。
+        let after_disconnect_check =
+            body.split("Load::Disconnected)").nth(1).unwrap_or_else(|| {
+                panic!(
+                    "accept_sftp_listed 里没有找到「读 Disconnected 状态之后」\
+                     这一段(形如 `matches!(f.remote.load, ...Load::Disconnected)`)——\
+                     清槽位的判据应该跟着这个状态走,不能是孤立赋值"
+                )
+            });
+        assert!(
+            after_disconnect_check.contains("sftp_mut()")
+                && after_disconnect_check.contains("= None"),
+            "accept_sftp_listed 判定连接断开之后没有清空 sftp 槽位 —— \
+             trigger_sftp_open 的既有短路守卫会挡住重连请求,「重连」变成死按钮"
+        );
+
+        // 守卫读的必须还是同一个 sftp_client() —— 防止上面那条断言被
+        // 「守卫改了个说法,清槽位这行成了摆设」这种退化绕过去。
+        let trigger_after = src
+            .split("fn trigger_sftp_open(")
+            .nth(1)
+            .expect("找不到 trigger_sftp_open 的定义");
+        assert!(
+            trigger_after.contains("tab.content.sftp_client().is_some() || already_loading"),
+            "trigger_sftp_open 的短路守卫变了 —— 需要重新核对「清槽位能解锁\
+             重连」这条因果链是否还成立"
         );
     }
 
@@ -9125,6 +9813,23 @@ mod tests {
         assert_eq!(replace_target(Some(TabId(99)), &[TabId(10)]), None);
     }
 
+    /// E2:标签标题优先取会话名,空名字退回 `user@host`。
+    ///
+    /// 自证会变红:把 `.filter(|n| !n.is_empty())` 去掉,空名字会让标题变空白。
+    #[test]
+    fn the_tab_title_prefers_the_session_name_but_falls_back_to_user_at_host() {
+        assert_eq!(
+            tab_title(Some("生产库"), Some(("root", "10.0.0.1"))),
+            "生产库"
+        );
+        assert_eq!(
+            tab_title(Some(""), Some(("root", "10.0.0.1"))),
+            "root@10.0.0.1"
+        );
+        assert_eq!(tab_title(None, Some(("root", "10.0.0.1"))), "root@10.0.0.1");
+        assert_eq!(tab_title(None, None), "远端");
+    }
+
     /// **接线守护 / F120**:`ConnectOk` 建标签时必须用 `PanelFrame::new(..)`
     /// 接配置的默认本地目录/书签,并把 `sftp_default_remote` 填成
     /// `sftp_prefs.default_remote`——不许有任何一条分支退回
@@ -9842,6 +10547,94 @@ mod tests {
         assert!(
             store.list().iter().any(|r| r.id == id),
             "apply_save 返回的 id 必须是 store 真正分配的那个"
+        );
+    }
+
+    /// E2/E3:标签属性弹窗的写回(`apply_tab_props_save`)只准动
+    /// `identity.name` 和 `appearance.color`——`connection`/`secret` 这些跟
+    /// 「改名/配色」毫不相干的字段必须原样保留。写回逻辑走的是
+    /// clone-then-`update()`(store 没有 `get_mut`),一旦有人图省事重新拼一份
+    /// `SessionDraft` 而不是 `..rec.xxx` 结构更新,漏改的字段会静默清空。
+    ///
+    /// 自证会变红:把 `apply_tab_props_save` 里 `connection: rec.connection`
+    /// 换成 `connection: mullion_store::Connection { host: String::new(), ..rec.connection }`
+    /// ——host 断言报错。
+    #[test]
+    fn apply_tab_props_save_only_touches_name_and_color_leaves_everything_else_alone() {
+        let (_dir, mut store) = tmp_store();
+        let buf = crate::ui::session_manager::EditorBuffer {
+            name: "dev".into(),
+            host: "192.0.2.10".into(),
+            user: "user".into(),
+            password: "s3cr3t".into(),
+            ..Default::default()
+        };
+        let id = apply_save(
+            &mut store,
+            crate::ui::session_manager::SaveIntent {
+                editing_id: None,
+                draft: crate::ui::session_manager::build_draft(&buf).expect("build"),
+                password: crate::ui::session_manager::SecretField::Set("s3cr3t".into()),
+                passphrase: crate::ui::session_manager::SecretField::Clear,
+                proxy_password: crate::ui::session_manager::SecretField::Clear,
+                private_key: crate::ui::session_manager::SecretField::Keep,
+                then_connect: false,
+            },
+            "2026-08-03T00:00:00Z",
+        )
+        .expect("保存应成功");
+
+        apply_tab_props_save(
+            &mut store,
+            id,
+            "生产库".into(),
+            Some(mullion_store::ColorSpec {
+                hex: "#123456".into(),
+                apply_to: vec![mullion_store::ColorTarget::Tab],
+            }),
+            "2026-08-03T00:00:01Z",
+        )
+        .expect("保存标签属性应成功");
+
+        let rec = store.list().iter().find(|r| r.id == id).expect("会话还在");
+        assert_eq!(rec.identity.name, "生产库");
+        assert_eq!(
+            rec.connection.host, "192.0.2.10",
+            "连接目标不该被改名/配色操作动到"
+        );
+        assert_eq!(
+            store.secret(id).and_then(|s| s.password.as_deref()),
+            Some("s3cr3t"),
+            "密文不该被改名/配色操作抹掉"
+        );
+    }
+
+    /// E2:一份会话可能被不止一个标签引用(同一台机器开着两个 pane/标签)——
+    /// 标签属性弹窗保存后必须同步**所有**指向这个 `session_id` 的标签,不能
+    /// 只改活动的那个。既要防「漏改非活动标签」,也要防反方向的退化——
+    /// 「全扫」写成了「全改」,把不相干会话的标签也带着改了名。
+    ///
+    /// 自证会变红:把 `sync_tab_titles_for_session` 里的 `tabs.iter_mut()`
+    /// 换成只处理活动标签(比如 `tabs.active_mut().into_iter()`)。
+    #[test]
+    fn saving_tab_props_retitles_every_tab_pointing_at_the_same_session_not_just_the_active_one() {
+        let sid = SessionId(4);
+        let other = SessionId(5);
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        // 三次 `open` 依次成为活动标签,最终活动的是「别的会话」那条 ——
+        // 前两条(同一 session_id)此刻都不是活动标签。
+        tabs.open("旧名字A".into(), Some(sid), restored_tab(4, 1));
+        tabs.open("旧名字B".into(), Some(sid), restored_tab(4, 1));
+        tabs.open("别的会话".into(), Some(other), restored_tab(5, 1));
+
+        sync_tab_titles_for_session(&mut tabs, sid, "生产库");
+
+        let titles: Vec<&str> = tabs.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles[0], "生产库", "非活动标签也该跟着改名");
+        assert_eq!(titles[1], "生产库", "同一会话的另一个标签也该跟着改名");
+        assert_eq!(
+            titles[2], "别的会话",
+            "指向别的 session_id 的标签不该被这次改名动到(全扫不能退化成全改)"
         );
     }
 

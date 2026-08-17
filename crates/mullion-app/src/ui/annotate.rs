@@ -235,6 +235,30 @@ pub fn spot_paths(ctx: &egui::Context) -> Vec<String> {
     with_state(ctx, |st| st.spots.iter().map(|s| s.path.clone()).collect())
 }
 
+/// 读回本帧登记的矩形:**先找路径完全相等的**,没有再退回「含 `needle`
+/// 的第一处」。
+///
+/// **给测试用** —— 无头环境里要往某个部件的中心注入点击,硬编码坐标一改
+/// 布局就静默打空(点了个空地方,测试却因为别的原因绿着)。
+///
+/// **为什么不像 `ensure_picked` 那样只做子串匹配**:父路径往往是子路径的
+/// 前缀(`标签栏/标签 2` vs `标签栏/标签 2/关闭`),而子控件通常先登记 ——
+/// 只做子串匹配的话,查父控件会**静默**拿到子控件那一小块矩形。切片 J 的
+/// Task 9 就踩了:想点标签标题,实际点在了 × 上。
+///
+/// **前提:标注模式必须开着**(`toggle`)。关着时 `mark` 直接 return,
+/// 这里必然返回 `None`。
+#[cfg(test)]
+pub fn spot_rect(ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
+    with_state(ctx, |st| {
+        st.spots
+            .iter()
+            .find(|s| s.path == needle)
+            .or_else(|| st.spots.iter().find(|s| s.path.contains(needle)))
+            .map(|s| s.rect)
+    })
+}
+
 /// 确保「路径里含 `needle` 的第一处」处于选中态,返回是否找到。
 ///
 /// **给 `examples/ui_shot.rs` 用**:出图脚本要摆出「已选中两处」的样子,不该
@@ -816,5 +840,67 @@ mod tests {
         let ctx = egui::Context::default();
         exit(&ctx);
         assert!(!is_on(&ctx), "Esc 在标注模式关着时不该把它打开");
+    }
+
+    /// 按语义路径取回本帧登记的矩形。测试要往某个部件的中心注入点击 ——
+    /// 硬编码坐标一改布局就静默打空,所以必须问 `annotate` 要。
+    ///
+    /// 顺带钉住那条最容易踩的前提:**标注模式关着时 `mark` 直接 return**,
+    /// 不开模式就一处也找不到。
+    ///
+    /// 自证会变红:把 `spot_rect` 改成恒返回 `None`。
+    #[test]
+    fn spot_rect_finds_a_marked_widget_but_only_when_the_mode_is_on() {
+        let ctx = egui::Context::default();
+        let r = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 30.0));
+
+        // 模式关着 —— 登记不进去。
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            mark(ctx, "甲/乙", r);
+        });
+        assert_eq!(
+            spot_rect(&ctx, "甲/乙"),
+            None,
+            "标注模式关着时 mark 应该直接 return"
+        );
+
+        // 打开模式再登记。
+        toggle(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            mark(ctx, "甲/乙", r);
+        });
+        assert_eq!(spot_rect(&ctx, "甲/乙"), Some(r));
+        // 找不到完全相等的才退回子串匹配。
+        assert_eq!(spot_rect(&ctx, "乙"), Some(r));
+        assert_eq!(spot_rect(&ctx, "丙"), None);
+    }
+
+    /// 父路径是子路径的前缀、且子控件**先**登记时,查父控件必须拿到父的
+    /// 矩形,不能静默拿到子的那一小块。
+    ///
+    /// 守的是切片 J Task 9 踩到的坑:`标签栏/标签 2/关闭`(× 按钮)先登记,
+    /// `标签栏/标签 2`(整块标签)后登记,只做子串匹配的话「点标签标题」的
+    /// 测试实际点在了 × 上,红得莫名其妙。
+    ///
+    /// 自证会变红:把 `spot_rect` 里的精确匹配那一支去掉,只留 `contains`。
+    #[test]
+    fn spot_rect_prefers_an_exact_path_over_a_child_that_was_marked_first() {
+        let ctx = egui::Context::default();
+        let child = egui::Rect::from_min_size(egui::pos2(90.0, 5.0), egui::vec2(14.0, 14.0));
+        let parent = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(120.0, 24.0));
+
+        toggle(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            // 子先、父后 —— 跟 `one_tab` 里的登记顺序一致。
+            mark(ctx, "标签栏/标签 2/关闭", child);
+            mark(ctx, "标签栏/标签 2", parent);
+        });
+
+        assert_eq!(
+            spot_rect(&ctx, "标签栏/标签 2"),
+            Some(parent),
+            "查父控件拿到了子控件的矩形 —— 往这块中心注入点击会点到 × 上"
+        );
+        assert_eq!(spot_rect(&ctx, "标签栏/标签 2/关闭"), Some(child));
     }
 }

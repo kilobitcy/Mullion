@@ -4,6 +4,7 @@ pub mod badge;
 pub mod chrome;
 pub mod edit_panel;
 pub mod editor_window;
+pub mod file_icon;
 pub mod files_dialog;
 pub mod files_panel;
 pub mod group_manager;
@@ -18,6 +19,7 @@ pub mod restored;
 pub mod session_manager;
 pub mod settings;
 pub mod shortcuts;
+pub mod tab_props;
 pub mod toast;
 pub mod toolbar;
 pub mod transfer_panel;
@@ -309,6 +311,15 @@ pub struct UiState {
     pub edit_expanded: bool,
     /// F53/D3-12:用户点了关闭,但有编辑没传上去 —— 拦下来问一句。
     pub exit_pending: bool,
+
+    // --- E2/E3:标签属性弹窗(改名 + 配色)。---
+    /// 弹窗的编辑缓冲。`None` = 弹窗关着。双击标签 / 右键菜单请求打开时,
+    /// app.rs 据当前会话记录建出一份。
+    pub tab_props: Option<tab_props::TabPropsDraft>,
+    /// 弹窗里按了「保存」,值先落到这里 —— `UiActions::tab_props` 是
+    /// `render_frame` 每帧重建的局部量,借用释放前就没了;真正碰 store
+    /// 要等 `self.active`/`self.ui` 的借用释放之后(同 `save_request`)。
+    pub tab_props_save: Option<tab_props::TabPropsAction>,
 }
 
 impl UiState {
@@ -496,6 +507,11 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按「解锁」
     /// 毫无反应,而解锁框是整个程序此刻唯一能操作的东西。
     pub unlock: Option<unlock::UnlockOut>,
+    /// E2/E3:标签属性弹窗这一帧的结论(保存 / 取消)。`None` = 还在编辑。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按「保存」
+    /// 会在 egui 的 discard 趟被静默吃掉。
+    pub tab_props: Option<tab_props::TabPropsAction>,
 }
 
 /// 指针此刻还在窗口里没有(F59 / 设计 N1 的判据)。
@@ -723,6 +739,9 @@ pub fn build_ui(
     // 面板发起的模态,该盖在别的窗口上;排在 toast 之前 —— 操作反馈永远
     // 在最上面(走查 13)。
     actions.files_op = files_dialog::show(ctx, t, &mut ui_state.files_dialog);
+    // E2/E3:标签属性弹窗。排在文件写操作确认框之后 —— 同为「从别处发起的
+    // 一次性小模态」,不需要跟文件面板抢前后顺序,跟着它的位置走就够了。
+    actions.tab_props = tab_props::show(ctx, t, &mut ui_state.tab_props);
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
     actions.editor = editor_window::show(ctx, t, editor);
     // F53/D3-12:退出确认。排在最后一个模态 —— 它一旦开着,别的都不重要了。
@@ -1736,7 +1755,6 @@ mod tests {
             local: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
                 b"/".to_vec(),
             )),
-            show_owner: false,
             bookmarks: Vec::new(),
             active_column: files_panel::PanelColumn::default(),
         };
@@ -1797,7 +1815,6 @@ mod tests {
             local: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
                 b"/".to_vec(),
             )),
-            show_owner: false,
             bookmarks: Vec::new(),
             active_column: files_panel::PanelColumn::default(),
         };
@@ -1940,7 +1957,6 @@ mod tests {
             local: crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
                 b"/".to_vec(),
             )),
-            show_owner: false,
             bookmarks: Vec::new(),
             active_column: files_panel::PanelColumn::default(),
         };

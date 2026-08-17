@@ -6,6 +6,7 @@
 use mullion_ssh::sftp::{Entry, EntryKind};
 
 pub mod drag;
+pub mod fail;
 pub mod local;
 pub mod queue;
 pub mod state;
@@ -42,6 +43,8 @@ pub enum SortKey {
     Size,
     Mtime,
     Perm,
+    /// D2:按 `uid` 排,`uid` 相同再按 `gid`。
+    Owner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +83,7 @@ pub fn sort(entries: &mut [Entry], key: SortKey, dir: SortDir) {
             // 两行显示一模一样的 `rwxr-xr-x` 会排不到一起(其中一个带
             // setuid),用户找不出原因。
             SortKey::Perm => (a.mode & 0o777).cmp(&(b.mode & 0o777)),
+            SortKey::Owner => a.uid.cmp(&b.uid).then(a.gid.cmp(&b.gid)),
         };
         match dir {
             SortDir::Asc => ord,
@@ -277,5 +281,30 @@ mod tests {
         assert_eq!(perm_string(0o755), "rwxr-xr-x");
         assert_eq!(perm_string(0o644), "rw-r--r--");
         assert_eq!(perm_string(0o40755 & 0o7777), "rwxr-xr-x");
+    }
+
+    /// 同 `e()`,多带 uid/gid 两个参数 —— 属主排序测试要能自己摆 uid/gid,
+    /// 用不上 `e()` 恒定的 1000:1000。
+    fn entry_with_owner(name: &str, uid: u32, gid: u32) -> Entry {
+        Entry {
+            uid,
+            gid,
+            ..e(name, EntryKind::File, 1024, 1_700_000_000)
+        }
+    }
+
+    /// D2:属主列可排序。按 uid 排,uid 相同再按 gid。
+    ///
+    /// 自证会变红:把 `SortKey::Owner` 那一支改成 `Ordering::Equal`。
+    #[test]
+    fn sorting_by_owner_orders_by_uid_then_gid() {
+        let mut v = vec![
+            entry_with_owner("c", 1000, 1000),
+            entry_with_owner("a", 0, 0),
+            entry_with_owner("b", 1000, 5),
+        ];
+        sort(&mut v, SortKey::Owner, SortDir::Asc);
+        let names: Vec<_> = v.iter().map(|e| e.name.display().to_string()).collect();
+        assert_eq!(names, vec!["a", "b", "c"], "属主排序不对:应按 uid 再 gid");
     }
 }

@@ -147,6 +147,10 @@ pub fn tab_bar_px() -> f32 {
 pub struct TabView<'a> {
     pub title: &'a str,
     pub active: bool,
+    /// E3:改名与配色改的是**会话记录**,没有记录的标签(快速连接 /
+    /// 占位标签)两项都得禁掉。不能拿 `appearance.is_some()` 代替 ——
+    /// 那是「有没有配过颜色」,不是「有没有会话记录」。
+    pub session_id: Option<mullion_store::SessionId>,
     /// F61/F62:这个标签所属会话的已解析外观。`None` = 没有对应会话记录
     /// (快速连接、或 store 不可用)。**必须来自 `badge::AppearanceCache`**,
     /// 不许在这里现解析(陷阱 T3)。
@@ -161,6 +165,13 @@ pub enum TabAction {
     /// 右侧 `+`:打开会话管理器。**不是「新建空标签」**——没连接的标签在本项目
     /// 里什么都画不了,建出来只是一个空壳。
     NewSession,
+    /// E2/E3:请求打开「标签属性」弹窗(改名 + 配色)。双击标签、或右键
+    /// 菜单里选「重命名…」/「设置颜色…」都发它。
+    ///
+    /// **只是「请求打开弹窗」,不是「已经改好了」** —— 真正的写回要等
+    /// 用户在弹窗里按保存(同 `FileAsk` 那条约定:右键点一下就把东西改了
+    /// 这种事不该存在)。
+    Props(usize),
 }
 
 /// 画标签栏(F36)。返回用户这一帧的动作。
@@ -178,7 +189,10 @@ pub fn tab_bar(ctx: &egui::Context, t: &Theme, views: &[TabView<'_>]) -> Option<
         .frame(
             egui::Frame::none()
                 .fill(theme::c32(t.bar_tool))
-                .inner_margin(egui::Margin::symmetric(4.0, TAB_MARGIN_Y))
+                .inner_margin(egui::Margin::symmetric(
+                    crate::ui::metrics::SP_XS,
+                    TAB_MARGIN_Y,
+                ))
                 .stroke(theme::stroke(t)),
         )
         .show(ctx, |ui| {
@@ -269,7 +283,11 @@ fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<T
                 } else {
                     t.fg_muted
                 })))
-                .truncate(),
+                .truncate()
+                // E1:**必须关掉**。egui 0.30 默认 `selectable_labels = true`,
+                // 可选中文本的 Label 会 sense click 把命中抢走,自己又不做
+                // 任何事 —— 现象是「点标签的文字那一片没反应,点空白处才切」。
+                .selectable(false),
             );
         });
     });
@@ -277,11 +295,44 @@ fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<T
     // 标题在固定宽度里多半是截断的,tooltip 给全名 —— 不然用户分不清
     // 「同一台机的两个标签」谁是谁。
     let clicked = resp.clicked();
-    resp.on_hover_text(v.title);
+    let double = resp.double_clicked();
+    let mut props = false;
+    let resp = resp.on_hover_text(v.title);
+    resp.context_menu(|ui| {
+        // E3:没有会话记录的标签(快速连接 / 占位标签)改不了名也配不了色 ——
+        // 改的是会话记录本身。禁用而不是隐藏:隐藏了用户会以为功能不存在。
+        let has_session = v.session_id.is_some();
+        if ui
+            .add_enabled(has_session, egui::Button::new("重命名…"))
+            .clicked()
+        {
+            props = true;
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(has_session, egui::Button::new("设置颜色…"))
+            .clicked()
+        {
+            props = true;
+            ui.close_menu();
+        }
+        if !has_session {
+            ui.label(
+                egui::RichText::new("这个标签没有对应的会话记录").color(theme::c32(t.fg_dimmer)),
+            );
+        }
+        ui.separator();
+        if ui.button("关闭").clicked() {
+            closed = true;
+            ui.close_menu();
+        }
+    });
     // × 的判定排在整块之前:它压在标签矩形上面,点它同时也落在标签里,
     // 先判关闭才不会变成「点 × 只是切过去」。
     if closed {
         Some(TabAction::Close(ix))
+    } else if props || double {
+        Some(TabAction::Props(ix))
     } else if clicked {
         Some(TabAction::Switch(ix))
     } else {
@@ -332,7 +383,7 @@ pub fn status_bar(
         .frame(
             egui::Frame::none()
                 .fill(theme::c32(t.bar_status))
-                .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                .inner_margin(egui::Margin::symmetric(crate::ui::metrics::SP_S, 2.0))
                 .stroke(theme::stroke(t)),
         )
         .show(ctx, |ui| {
@@ -605,6 +656,7 @@ mod tests {
         let views = [TabView {
             title: "build-01",
             active: true,
+            session_id: None,
             appearance: None,
         }];
         let texts = tab_titles(&views);
@@ -675,6 +727,7 @@ mod tests {
         let views = [TabView {
             title: "build-01",
             active: true,
+            session_id: None,
             appearance: Some(&not_tab),
         }];
         assert_eq!(
@@ -687,6 +740,7 @@ mod tests {
         let views = [TabView {
             title: "build-01",
             active: true,
+            session_id: None,
             appearance: Some(&tab),
         }];
         assert_eq!(
@@ -702,6 +756,7 @@ mod tests {
             .map(|i| TabView {
                 title: "build-01",
                 active: i == 0,
+                session_id: None,
                 appearance: None,
             })
             .collect();
@@ -764,11 +819,13 @@ mod tests {
             TabView {
                 title: "build-01",
                 active: true,
+                session_id: None,
                 appearance: None,
             },
             TabView {
                 title: "build-02",
                 active: false,
+                session_id: None,
                 appearance: None,
             },
         ];
@@ -801,6 +858,273 @@ mod tests {
         assert!(
             with > none,
             "给了会话色就该多画一个色块(无 {none} 个图形,有 {with} 个)"
+        );
+    }
+
+    /// 在渲染结果的形状树里找**第一处**含 `needle` 的文字中心点,用来给点击
+    /// 事件定位。抄自 `files_panel`/`session_manager` 几处同名测试辅助
+    /// (项目里没有跨文件复用的路子,按既有做法各自留一份)。
+    fn find_text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                    Some(ts.pos + ts.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// E1:点标签**标题文字**要能切换标签,不是只有空白处才有反应。
+    ///
+    /// 过去点标题文字那一片没反应:egui 0.30 默认 `selectable_labels = true`,
+    /// 标题 `Label` 会 sense click 把命中抢走,而它自己什么也不做。
+    ///
+    /// 直接点渲染出来的标题**字形正中**(用 `find_text_pos` 从形状树里找),
+    /// 而不是按标签矩形比例猜坐标 —— 这样才是真的在复现「点文字那一片」,
+    /// 也不受标签宽度改动影响。
+    ///
+    /// (最初按 annotate 的 `spot_rect("标签栏/标签 2")` 取矩形,但那个 needle
+    /// 对 `.contains()` 来说也匹配同一标签更早注册的
+    /// `标签栏/标签 2/关闭`,取到的是 × 的矩形而不是整个标签 —— 点出来变成
+    /// `Close`,是测试自己的取点方式有歧义,不是生产代码的锅,故换用
+    /// `find_text_pos` 绕开。)
+    ///
+    /// 自证会变红:把标题 `Label` 的 `.selectable(false)` 去掉。
+    #[test]
+    fn clicking_anywhere_on_a_tab_switches_to_it() {
+        let t = crate::theme::MULLION_DARK;
+        // 标签 1 是活动的,点标签 2 的标题文字应该切过去。
+        let views = [
+            TabView {
+                title: "第一个",
+                active: true,
+                session_id: None,
+                appearance: None,
+            },
+            TabView {
+                title: "第二个",
+                active: false,
+                session_id: None,
+                appearance: None,
+            },
+        ];
+        let ctx = egui::Context::default();
+        // 两帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop)。
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                tab_bar(ctx, &t, &views);
+            }));
+        }
+        let pos = find_text_pos(&out.unwrap().shapes, "第二个").expect("标签栏该画出「第二个」");
+
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let mut got = None;
+        let _ = ctx.run(input, |ctx| {
+            got = tab_bar(ctx, &t, &views);
+        });
+        assert_eq!(
+            got,
+            Some(TabAction::Switch(1)),
+            "点标签 2 的标题文字没切过去 —— 标题 Label 把点击吃了"
+        );
+    }
+
+    /// E2:双击标签 = 请求打开属性弹窗(改名 + 配色),不是切换。
+    ///
+    /// 两次点击挤在**同一帧**的一批事件里(抄 `files_panel.rs` 里
+    /// `double_clicking_a_plain_file_opens_the_external_editor_instead_of_doing_nothing`
+    /// 的做法):`RawInput::time` 必须显式给一个非零值 —— egui 0.30 的连击
+    /// 计数看的是相对上一次点击的时间间隔,默认 `RawInput` 的 `time` 是
+    /// `None`(按 0 处理),会和首帧的隐式 0 撞在一起判不出「两次」。
+    ///
+    /// 自证会变红:把 `props || double` 里的 `double` 去掉。
+    #[test]
+    fn double_clicking_a_tab_asks_for_the_properties_dialog() {
+        let t = crate::theme::MULLION_DARK;
+        let views = [
+            TabView {
+                title: "第一个",
+                active: true,
+                session_id: None,
+                appearance: None,
+            },
+            TabView {
+                title: "第二个",
+                active: false,
+                session_id: Some(mullion_store::SessionId(1)),
+                appearance: None,
+            },
+        ];
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                tab_bar(ctx, &t, &views);
+            }));
+        }
+        let pos = find_text_pos(&out.unwrap().shapes, "第二个").expect("标签栏该画出「第二个」");
+
+        let mut input = egui::RawInput {
+            time: Some(1.0),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pos));
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+        }
+        let mut got = None;
+        let _ = ctx.run(input, |ctx| {
+            got = tab_bar(ctx, &t, &views);
+        });
+        assert_eq!(
+            got,
+            Some(TabAction::Props(1)),
+            "双击标签 2 没请求属性弹窗(拿到的是 {got:?})"
+        );
+    }
+
+    /// 右键点 `tab_title` 命中的标签打开右键菜单,再点菜单里含 `item_text`
+    /// 的那一项,回它这一帧触发的 `TabAction`(`None` = 没触发,包括「按钮
+    /// 被禁用点不动」)。
+    ///
+    /// 手法照抄 `session_manager::list::sftp_row_context_menu_connect_button_is_truly_unclickable_not_just_grey`:
+    /// 真实指针事件右键打开菜单、`find_text_pos` 反推按钮矩形再点下去,不直接
+    /// 读 `Response` 的 enabled 标记 —— 这样测的是「真的点不动/点得动」,
+    /// 不是「看起来对不对」。
+    fn click_context_menu_item(
+        t: &crate::theme::Theme,
+        views: &[TabView<'_>],
+        tab_title: &str,
+        item_text: &str,
+    ) -> Option<TabAction> {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                tab_bar(ctx, t, views);
+            }));
+        }
+        let tab_pos = find_text_pos(&out.unwrap().shapes, tab_title).expect("标签栏该画出这个标签");
+
+        let secondary = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(tab_pos),
+                    secondary(tab_pos, true),
+                    secondary(tab_pos, false),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                tab_bar(ctx, t, views);
+            },
+        );
+
+        // 菜单弹出用的是 `Area`,首次遇到某个 id 先做一趟不可见的 sizing
+        // pass,真正把内容画出来要等下一帧,所以再空跑一帧。
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            tab_bar(ctx, t, views);
+        });
+        let item_pos = find_text_pos(&out.shapes, item_text)
+            .unwrap_or_else(|| panic!("右键菜单里应该画出了「{item_text}」"));
+
+        let primary = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut got = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(item_pos),
+                    primary(item_pos, true),
+                    primary(item_pos, false),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                got = tab_bar(ctx, t, views);
+            },
+        );
+        got
+    }
+
+    /// E3:`has_session`(右键菜单「重命名…」/「设置颜色…」的启用判据)必须
+    /// 锁在 `session_id.is_some()` 上,不能换成 `appearance.is_some()`——
+    /// 后者是「有没有配过颜色」,不是「有没有会话记录」。
+    ///
+    /// 真实差异窗口:新建会话到 `AppearanceCache` 重算之间的那一帧,
+    /// `session_id` 已经有效,但外观缓存(`appearance`)还没跟上,仍是
+    /// `None`——此刻菜单项必须仍然可点,不能因为外观缓存慢半拍就一起被挡。
+    /// 反过来,没有会话记录的标签(快速连接)哪怕外观缓存里凑巧留着一条
+    /// 陈旧的 `Appearance`,也不该被误判成「有会话」而放行。
+    ///
+    /// 自证会变红:把 `has_session` 的表达式从 `v.session_id.is_some()`
+    /// 换成 `v.appearance.is_some()`。
+    #[test]
+    fn has_session_gate_is_keyed_on_session_id_not_on_appearance() {
+        let t = crate::theme::MULLION_DARK;
+
+        // 差异窗口:有 session_id,外观缓存还没跟上(appearance = None)——
+        // 「重命名…」必须仍然可点。
+        let fresh_session = [TabView {
+            title: "刚建的会话",
+            active: true,
+            session_id: Some(mullion_store::SessionId(7)),
+            appearance: None,
+        }];
+        assert_eq!(
+            click_context_menu_item(&t, &fresh_session, "刚建的会话", "重命名…"),
+            Some(TabAction::Props(0)),
+            "有会话记录、外观缓存还没跟上时,「重命名…」必须仍然可点"
+        );
+
+        // 反方向:没有 session_id,但外观缓存里留着一条陈旧的 appearance——
+        // 不该被误判成「有会话」。
+        let stale_appearance = crate::ui::badge::Appearance::default();
+        let quick_connect = [TabView {
+            title: "快速连接",
+            active: true,
+            session_id: None,
+            appearance: Some(&stale_appearance),
+        }];
+        assert_eq!(
+            click_context_menu_item(&t, &quick_connect, "快速连接", "重命名…"),
+            None,
+            "没有会话记录的标签,哪怕外观缓存里留着陈旧的 appearance,\
+             也不该能点「重命名…」"
         );
     }
 }

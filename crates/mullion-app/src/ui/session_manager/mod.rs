@@ -12,7 +12,7 @@ pub(crate) mod credential_list;
 mod dedupe;
 mod editor;
 mod env_hint;
-mod fields;
+pub(crate) mod fields;
 pub(crate) mod form;
 mod highlight;
 mod inherit_row;

@@ -357,9 +357,23 @@ pub(super) fn basic(
 
 /// `Color32` → `#rrggbb`。色盘吐的是 `Color32`,库里存的是 hex 文本,
 /// 两个方向都只有一份实现(反方向是 `theme::parse_hex`)。
-pub(super) fn hex_of(c: egui::Color32) -> String {
+///
+/// `pub(crate)`——`ui::tab_props`(标签属性弹窗,E2/E3)也要用同一份格式化,
+/// 两处各写一份的话格式约定容易悄悄漂移。
+pub(crate) fn hex_of(c: egui::Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
 }
+
+/// 四个着色落点的中文文案。`ui::session_manager::fields::appearance`(会话
+/// 编辑器的「应用到」)与 `ui::tab_props`(标签属性弹窗的「应用到」)共用
+/// 同一份——两处各留一份的话,以后加/改落点很容易只改中一处,用户会看到
+/// 同一个东西在两处叫不同的名字。
+pub(crate) const COLOR_TARGET_LABELS: [(mullion_store::ColorTarget, &str); 4] = [
+    (mullion_store::ColorTarget::ListItem, "会话列表"),
+    (mullion_store::ColorTarget::Tab, "标签页"),
+    (mullion_store::ColorTarget::PaneTitle, "pane 标题条"),
+    (mullion_store::ColorTarget::StatusBar, "状态栏"),
+];
 
 /// 图标在列表实际取图尺寸下的实时预览。
 ///
@@ -559,12 +573,7 @@ pub(crate) fn appearance(
         ui.label("作用于");
         ui.vertical(|ui| match &mut buf.preserved_appearance.color {
             Some(spec) => {
-                for (target, label) in [
-                    (ColorTarget::ListItem, "会话列表"),
-                    (ColorTarget::Tab, "标签页"),
-                    (ColorTarget::PaneTitle, "pane 标题条"),
-                    (ColorTarget::StatusBar, "状态栏"),
-                ] {
+                for (target, label) in COLOR_TARGET_LABELS {
                     let mut on = spec.apply_to.contains(&target);
                     if ui.checkbox(&mut on, label).changed() {
                         crate::ui::session_manager::set_color_target(spec, target, on);

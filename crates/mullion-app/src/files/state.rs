@@ -15,6 +15,9 @@ pub enum Load {
     Ready,
     /// 出错了,字符串是已经格式化好的可读原因。
     Failed(String),
+    /// B3:连接/通道没了。跟 `Failed` 分开是因为**界面动作不同** ——
+    /// 这个状态要给一个重连入口,而 `Failed` 只是报一句、停在原地。
+    Disconnected,
 }
 
 pub struct PaneState {

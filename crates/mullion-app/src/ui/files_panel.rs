@@ -47,6 +47,13 @@ pub enum FileAction {
     /// 「把我这栏选中的送出去」,`Drop` 是「把对面栏选中的收进来」。源永远是
     /// 另一栏的选中集(载荷里只带栏,见 `drag::DragFrom`)。
     Drop(crate::files::drag::Landing),
+    /// B3:这一栏所在的连接断了,用户按了「重连」。
+    ///
+    /// **不带参数**:重连的目标是「这个标签」,而标签是谁由 app 侧知道
+    /// (面板本身不知道自己挂在哪个标签上)。两种宿主的语义不同,分派在
+    /// app 侧做:SFTP 节点标签重建整条连接;终端标签的侧栏只重开
+    /// sftp channel(SSH 本体断了是终端的事,侧栏不越权)。
+    Reconnect,
 }
 
 /// 要打开哪个对话框。
@@ -199,7 +206,151 @@ fn menu_target(e: &mullion_ssh::sftp::Entry) -> MenuTarget {
 const W_SIZE: f32 = 78.0;
 const W_MTIME: f32 = 132.0;
 const W_PERM: f32 = 86.0;
+/// D2:属主列(`uid:gid`)。SFTP v3 的 attrs 里 uid/gid 就是数字,而
+/// `russh-sftp 2.4.0` 的客户端 `DirEntry` 不暴露 `longname` —— 名字在协议层
+/// 拿不到,不为此去 exec 一次 `id`(设计 D21)。
+const W_OWNER: f32 = 92.0;
 const ROW_H: f32 = 22.0;
+/// D1:图标格子的边长 + 它和名称之间的空隙。
+const W_ICON: f32 = 16.0;
+const ICON_GAP: f32 = 4.0;
+/// 图标格子的左内边距。**单一定义源**——`icon_rect()` 用它摆图标,
+/// `name_start_x_offset()` 用它算名称起点该让到哪。复核挖出的坑:曾经
+/// 这个 `4.0` 散落在 `row()` 里构造 `icon_rect`、`name_start_x_offset()`、
+/// 以及测试里**独立重建**的 `icon_rect` 三处——测试拿自己重建的矩形去比,
+/// 生产代码里的那一份改错了照样测不出来。
+const ICON_LEFT_PAD: f32 = 4.0;
+
+/// 图标格子(相对 `row_rect` 摆放)。`row()` 和测试都调这个,不各自重建
+/// ——理由见 `ICON_LEFT_PAD` 的文档注释。
+fn icon_rect(row_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            row_rect.left() + ICON_LEFT_PAD,
+            row_rect.center().y - W_ICON * 0.5,
+        ),
+        egui::vec2(W_ICON, W_ICON),
+    )
+}
+
+/// 名称文字的起点 x(相对 `rect.left()` 的偏移)。抽成纯函数只为了能脱离
+/// egui 单测(见 `tests::name_start_clears_the_icon_cell`)——图标格子从
+/// `rect.left() + ICON_LEFT_PAD` 起、宽 `W_ICON`,名称必须让在它右边,
+/// 否则名字会压在图标上面。
+fn name_start_x_offset() -> f32 {
+    ICON_LEFT_PAD + W_ICON + ICON_GAP
+}
+
+/// 可选列(大小/修改时间/权限/属主),固定顺序 = 宽度不够时的收起顺序
+/// 倒过来(排在后面的先被收起:先丢属主,再权限,再修改时间,最后大小)。
+/// `visible_col_count()`/`header()`/`row()`/两条列布局守护测试都从这份表
+/// 拿宽度与 `SortKey`,不许另起一份 —— 加一列/改一列宽只用改这里一处。
+const OPTIONAL_COLS: [(&str, SortKey, f32); 4] = [
+    ("大小", SortKey::Size, W_SIZE),
+    ("修改时间", SortKey::Mtime, W_MTIME),
+    ("权限", SortKey::Perm, W_PERM),
+    ("属主", SortKey::Owner, W_OWNER),
+];
+
+/// 宽度不够时,`OPTIONAL_COLS` 从右向左收起,取最大的 k(0..=4)使得留给
+/// 名称列的宽度仍 `>= 80`(名称列地板)。这是唯一的收起判据 ——
+/// `name_w()`、列头、行体都调它决定「这个宽度下有几列可见」。
+///
+/// 复核实测出的现象(默认侧栏 360px 下):不做这个收起的话,列头按四列
+/// 定宽从左往右累加,总宽恒为 488px;行体的权限/属主却是从
+/// `rect.right()` 倒着锚的。可用宽度不够 488 时两套定位必然分家 ——
+/// 属主列有数据没标题(标题起点 396 被裁没了),权限标题反而画到了权限
+/// 数据右边。收起可选列让名称列吃掉全部剩余宽度,`total >= 100` 时两套
+/// 定位代数上恒等,错位从根上消失(见 `name_w()` 的文档注释)。
+fn visible_col_count(total: f32) -> usize {
+    let mut sum = 0.0_f32;
+    let mut k = 0usize;
+    for &(_, _, w) in OPTIONAL_COLS.iter() {
+        if total - W_ICON - ICON_GAP - (sum + w) < 80.0 {
+            break;
+        }
+        sum += w;
+        k += 1;
+    }
+    k
+}
+
+/// 名称列宽度。**一处算、多处用**(`header_name_col_w()`/`row_size_col_left()`
+/// 都基于它)——按 `visible_col_count()` 给名称列让出剩余宽度,只在这一处
+/// 算,别处不许各算一遍。
+///
+/// 只要 `total >= 100`,`total - W_ICON - ICON_GAP - (可见列宽度之和)` 恒
+/// `>= 80`(`visible_col_count()` 的判据保证的),`.max(80.0)` 这个地板
+/// 实际不会被触发 —— 留着只是给 `total < 100` 兜底。
+///
+/// **「到不了」只对 `sidebar()` 成立**:它有 `width_range(280.0..=640.0)`
+/// 兜着,`total` 最小也是 280,进不了 `(0,100)` 这个区间。`content()`
+/// (标签宿主)是整窗口对半分,代码里没有 `min_inner_size` 之类的窗口
+/// 最小尺寸兜底——窗口宽 < 约 208px 时单栏 `total` 理论上会跌进
+/// `(0,100)`,这时地板生效,`header_name_col_w(total)` 会算出**超过
+/// 实际可用宽度**的值(比如 `total=90` 时算出 100)。这正是本文件这批
+/// 收起逻辑要根除的那类「列头请求宽度越过可用区」,只是换了个更极端的
+/// 触发路径——已知限制,未处理(该场景本身没人要求兜底,加保护是没人
+/// 要的功能)。
+fn name_w(total: f32) -> f32 {
+    let k = visible_col_count(total);
+    let sum: f32 = OPTIONAL_COLS[..k].iter().map(|&(_, _, w)| w).sum();
+    (total - W_ICON - ICON_GAP - sum).max(80.0)
+}
+
+/// 列头「名称」列的显示宽度。列头没有单独的图标格子——它在视觉上对应的
+/// 是行体「图标格子 + 间隙 + 名称」这个**合并区域**,所以要在 `name_w()`
+/// 之上再加回 `W_ICON + ICON_GAP`。抽成函数(而不是在 `header()` 里内联)
+/// 是为了让对齐守护测试能在不起 egui 上下文的情况下,调到与 `header()`
+/// 完全相同的这一份计算 —— 写两份的话,`header()` 里那份改错了,测试的
+/// 影子计算不会跟着错,照样测不出来。
+fn header_name_col_w(total: f32) -> f32 {
+    name_w(total) + W_ICON + ICON_GAP
+}
+
+/// 列头「大小/修改时间/权限/属主」里当前可见的那几列,各自的
+/// `(标签, SortKey, 左边界, 宽度)`,左边界从 `header_name_col_w(total)`
+/// 开始累加。`header()` 拿它逐列 `allocate_exact_size` 并挂排序点击,
+/// 对齐守护测试拿它跟行体那份(`row_col_lefts()`)比 —— 两边各自独立
+/// 累加,不共用最终结果,一边改错了另一边不会跟着错,能测出来。
+fn header_col_lefts(total: f32) -> Vec<(&'static str, SortKey, f32, f32)> {
+    let k = visible_col_count(total);
+    let mut x = header_name_col_w(total);
+    OPTIONAL_COLS[..k]
+        .iter()
+        .map(|&(label, key, w)| {
+            let left = x;
+            x += w;
+            (label, key, left, w)
+        })
+        .collect()
+}
+
+/// 行体「大小」列的左边界(绝对坐标,基于 `row_rect.left()`)。**`row()`
+/// 和对齐守护测试都调这个,不许测试自己重建这份算式**——同 `icon_rect()`
+/// 的教训(见其文档注释):测试独立重建的话,这里改错了,测试拿的还是
+/// 自己那份「正确」几何,照样测不出来。
+fn row_size_col_left(row_rect: egui::Rect) -> f32 {
+    row_rect.left() + W_ICON + ICON_GAP + name_w(row_rect.width())
+}
+
+/// 行体「大小/修改时间/权限/属主」里当前可见的那几列,各自的
+/// `(标签, SortKey, 左边界, 宽度)`,左边界从 `row_size_col_left(row_rect)`
+/// 开始累加。`row()` 拿它给每一列的文字定位(视觉上仍是原来的
+/// RIGHT_CENTER / 右内缩 4px,只是坐标改从这里取,不再自己用
+/// `rect.right()` 倒着算)。
+fn row_col_lefts(row_rect: egui::Rect) -> Vec<(&'static str, SortKey, f32, f32)> {
+    let k = visible_col_count(row_rect.width());
+    let mut x = row_size_col_left(row_rect);
+    OPTIONAL_COLS[..k]
+        .iter()
+        .map(|&(label, key, w)| {
+            let left = x;
+            x += w;
+            (label, key, left, w)
+        })
+        .collect()
+}
 
 /// `ScrollArea` 持久化 id 的拼装,抽成纯函数只为了能脱离 egui 单测
 /// (见 `tests::scroll_id_salt_differs_by_generation`)。
@@ -242,7 +393,6 @@ pub fn show(
     generation: u64,
     column: PanelColumn,
     state: &mut PaneState,
-    show_owner: bool,
     focused: bool,
     bookmarks: &[mullion_store::Bookmark],
     drop_in: usize,
@@ -368,6 +518,13 @@ pub fn show(
             ui.colored_label(theme::c32(t.danger), msg.clone());
             return action;
         }
+        Load::Disconnected => {
+            ui.colored_label(theme::c32(t.danger), "连接已断开");
+            if ui.button("重连").clicked() {
+                action = Some(FileAction::Reconnect);
+            }
+            return action;
+        }
         Load::Ready => {}
     }
 
@@ -398,7 +555,7 @@ pub fn show(
         .show_rows(ui, ROW_H, rows.len(), |ui, range| {
             for ix in range {
                 let e = rows[ix];
-                let resp = row(ui, t, e, show_owner, selected.contains(&e.name));
+                let resp = row(ui, t, e, column, selected.contains(&e.name));
                 // F58:行既是拖源也是落点。
                 if resp.drag_started() {
                     // 拖一条**没选中**的行:先让它成为唯一选中项。不这么做的话
@@ -492,14 +649,34 @@ pub fn show(
 fn header(ui: &mut Ui, t: &Theme, id: &str, state: &mut PaneState) {
     ui.horizontal(|ui| {
         annotate::mark(ui.ctx(), format!("文件面板/{id}/列头"), ui.max_rect());
+        // `ui.horizontal`默认在相邻部件间插入 `item_spacing.x`(8pt)——四列之间
+        // 就是 3 处空隙,共 24pt。下面 `name_w` 只按四列自身宽度求和 == 可用宽度,
+        // 没有扣掉这 24pt,`ui.horizontal` 请求的总宽度因此比 `available_width()`
+        // 多 24pt,会把外层 ui 的 `max_rect` 撑宽——两栏对调(F50 A 组)后这多出
+        // 的 24pt 越过两栏间 8pt 的缝隙侵入邻栏,`dragging_from_the_local_column_
+        // onto_a_remote_directory_row_drops_into_that_directory` 等守护测试因此
+        // 变红(邻栏的行抢先拿走了 dnd 载荷)。清零间距而不是从 `name_w` 里扣,
+        // 这样四列衔接处跟 `row()` 里手工画的四列(本来就是零间距的绝对坐标)
+        // 对得齐,不会因为「扣了间距」反而让表头跟表身错位。
+        ui.spacing_mut().item_spacing.x = 0.0;
         let mut hit = None;
-        let name_w = (ui.available_width() - W_SIZE - W_MTIME - W_PERM).max(80.0);
-        for (label, key, w) in [
-            ("名称", SortKey::Name, name_w),
-            ("大小", SortKey::Size, W_SIZE),
-            ("修改时间", SortKey::Mtime, W_MTIME),
-            ("权限", SortKey::Perm, W_PERM),
-        ] {
+        let total = ui.available_width();
+        // 表头这一列没有单独的图标格子——它跟 `row()` 里「图标格子 + 名称」
+        // 那个**合并宽度**对齐,所以用 `header_name_col_w()` 在 `name_w()`
+        // 之上加回 `W_ICON + ICON_GAP`(该函数与 `name_w()` 同款「一处算、
+        // 两处用」——夹紧地板已经在 `name_w()` 里做过一次,这里不用再抬
+        // 一次地板,加法上代数等价,也省得两处维护同一个地板常量)。
+        //
+        // 大小/修改时间/权限/属主这四列不再是字面量数组——`total` 不够时
+        // 从右向左收起(见 `visible_col_count()`),`header_col_lefts()` 只
+        // 给回当前可见的那几列,收起的列这里根本不出现在循环里。
+        let mut cols = vec![("名称", SortKey::Name, header_name_col_w(total))];
+        cols.extend(
+            header_col_lefts(total)
+                .into_iter()
+                .map(|(label, key, _left, w)| (label, key, w)),
+        );
+        for (label, key, w) in cols {
             let mark = if state.sort_key == key {
                 match state.sort_dir {
                     crate::files::SortDir::Asc => " ▲",
@@ -509,8 +686,11 @@ fn header(ui: &mut Ui, t: &Theme, id: &str, state: &mut PaneState) {
                 ""
             };
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
+            // 逐列登记:上面那处只标了整行,四列各自的可点矩形并不等于整行 ——
+            // 测试要往「名称」列具体点,不能拿整行中心去凑(改宽了就打偏)。
+            annotate::mark(ui.ctx(), format!("文件面板/{id}/列头/{label}"), rect);
             ui.painter().text(
-                rect.left_center() + egui::vec2(4.0, 0.0),
+                rect.left_center() + egui::vec2(crate::ui::metrics::SP_XS, 0.0),
                 egui::Align2::LEFT_CENTER,
                 format!("{label}{mark}"),
                 egui::FontId::proportional(11.0),
@@ -530,7 +710,7 @@ fn row(
     ui: &mut Ui,
     t: &Theme,
     e: &mullion_ssh::sftp::Entry,
-    show_owner: bool,
+    column: PanelColumn,
     selected: bool,
 ) -> egui::Response {
     // `click_and_drag` 而不是 `click`(F58):行要能起拖。`clicked()` /
@@ -557,6 +737,11 @@ fn row(
     } else {
         theme::c32(t.fg)
     };
+    // D1:类型图标。颜色跟文字**同源**(上面那个 `fg`),不另算一套 ——
+    // 否则会出现「文字灰了图标还亮着」这种自相矛盾的行。排在名称文字
+    // 之前画,视觉上图标在名字左边。
+    crate::ui::file_icon::paint(p, icon_rect(rect), e.kind, fg);
+
     let mut label = e.name.display().to_string();
     if let (EntryKind::Symlink, Some(tgt)) = (e.kind, &e.link_target) {
         label = format!("{label} → {}", tgt.display());
@@ -564,46 +749,85 @@ fn row(
     if !usable {
         label = format!("{label}(名称非 UTF-8,本版无法操作)");
     }
-    let name_w = (rect.width() - W_SIZE - W_MTIME - W_PERM).max(80.0);
     p.text(
-        rect.left_center() + egui::vec2(4.0, 0.0),
+        rect.left_center() + egui::vec2(name_start_x_offset(), 0.0),
         egui::Align2::LEFT_CENTER,
         label,
         font.clone(),
         fg,
     );
-    let size_x = rect.left() + name_w + W_SIZE;
-    let size_text = if e.kind == EntryKind::Dir {
-        String::new()
-    } else {
-        human_size(e.size)
-    };
-    p.text(
-        egui::pos2(size_x, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        size_text,
-        font.clone(),
-        theme::c32(t.fg_mid),
-    );
-    p.text(
-        egui::pos2(size_x + 8.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        mtime_text(e.mtime),
-        font.clone(),
-        theme::c32(t.fg_mid),
-    );
-    let mut perm = perm_string(e.mode);
-    if show_owner {
-        perm = format!("{perm} {}:{}", e.uid, e.gid);
+    // 名称列的可用宽度让出图标格子 + 间隙,否则长文件名会顶到大小列上——
+    // `row_size_col_left()` 是「大小」列左边界,生产代码与对齐守护测试
+    // 共用同一份(见其文档注释)。
+    //
+    // 下面四列(大小/修改时间/权限/属主)宽度不够时会被从右向左收起——
+    // `row_col_lefts()` 只给回当前可见的那几列,顺序固定,缺的列在这个
+    // `Vec` 里直接不存在,对应的 `if let` 分支就不画。视觉上每一列仍是
+    // 原来的 RIGHT_CENTER / 右内缩 4px:最后一个可见的可选列(不管是
+    // 属主、权限还是别的)恒贴着 `rect.right()`——`name_w()` 保证了这点
+    // (见其文档注释)。
+    let cols = row_col_lefts(rect);
+    if let Some(&(_, _, size_left, size_w)) = cols.first() {
+        let size_text = if e.kind == EntryKind::Dir {
+            String::new()
+        } else {
+            human_size(e.size)
+        };
+        p.text(
+            egui::pos2(size_left + size_w, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            size_text,
+            font.clone(),
+            theme::c32(t.fg_mid),
+        );
     }
-    p.text(
-        rect.right_center() - egui::vec2(4.0, 0.0),
-        egui::Align2::RIGHT_CENTER,
-        perm,
-        font,
-        theme::c32(t.fg_dim),
-    );
+    if let Some(&(_, _, mtime_left, _)) = cols.get(1) {
+        p.text(
+            egui::pos2(mtime_left + crate::ui::metrics::SP_S, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            mtime_text(e.mtime),
+            font.clone(),
+            theme::c32(t.fg_mid),
+        );
+    }
+    // 权限列(不再把 uid:gid 拼在后面 —— 属主拆成了独立列)。
+    if let Some(&(_, _, perm_left, perm_w)) = cols.get(2) {
+        p.text(
+            egui::pos2(
+                perm_left + perm_w - crate::ui::metrics::SP_XS,
+                rect.center().y,
+            ),
+            egui::Align2::RIGHT_CENTER,
+            perm_string(e.mode),
+            font.clone(),
+            theme::c32(t.fg_dim),
+        );
+    }
+    // D2:属主列。**本地栏恒画 `—`**,判据见 `owner_text` 的文档注释。
+    if let Some(&(_, _, owner_left, owner_w)) = cols.get(3) {
+        p.text(
+            egui::pos2(
+                owner_left + owner_w - crate::ui::metrics::SP_XS,
+                rect.center().y,
+            ),
+            egui::Align2::RIGHT_CENTER,
+            owner_text(column, e.uid, e.gid),
+            font,
+            theme::c32(t.fg_dim),
+        );
+    }
     resp
+}
+
+/// 属主列文案。**本地栏恒画 `—`**,判据是 `column == PanelColumn::Local`
+/// 而不是 `uid == 0` —— 远端真的有 root 拥有的文件,拿 0 当「没有属主
+/// 信息」的哨兵会让那些文件的属主列也变成 `—`。
+fn owner_text(column: PanelColumn, uid: u32, gid: u32) -> String {
+    if column == PanelColumn::Local {
+        "—".to_string()
+    } else {
+        format!("{uid}:{gid}")
+    }
 }
 
 /// 两栏之一。定义搬去了 `crate::files`(纯逻辑层,`drag.rs` 的落点判据要
@@ -614,8 +838,6 @@ pub use crate::files::PanelColumn;
 pub struct PanelFrame {
     pub remote: PaneState,
     pub local: PaneState,
-    /// D21:属主:组默认隐藏,列头右键打开。
-    pub show_owner: bool,
     /// F120:该会话配置的远端书签,原样转给远端栏画书签条。纯数据,空
     /// `Vec` 是安全默认——符合 `Default` impl 文档下面那条「加字段前先想
     /// 清楚」的约束。
@@ -644,7 +866,6 @@ impl Default for PanelFrame {
         Self {
             remote: PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(crate::files::local::default_local(None)),
-            show_owner: false,
             bookmarks: Vec::new(),
             active_column: PanelColumn::default(),
         }
@@ -736,32 +957,33 @@ pub fn sidebar(
         .show(ctx, |ui| {
             annotate::mark(ui.ctx(), "文件侧栏", ui.max_rect());
             let h = ui.available_height();
-            ui.allocate_ui(egui::vec2(ui.available_width(), h * 0.6), |ui| {
-                out.0 = show(
+            // A3:比例**跟着远端走,不跟着位置走** —— 侧栏是「终端为主 +
+            // 文件为辅」的场景,辅助视图里远端才是主体。所以上面(本地)0.4、
+            // 下面(远端)0.6。
+            ui.allocate_ui(egui::vec2(ui.available_width(), h * 0.4), |ui| {
+                out.1 = show(
                     ui,
                     t,
-                    "远端",
+                    "本地",
                     generation,
-                    PanelColumn::Remote,
-                    &mut frame.remote,
-                    frame.show_owner,
-                    panel_focused && frame.active_column == PanelColumn::Remote,
-                    &frame.bookmarks,
-                    drop_in,
+                    PanelColumn::Local,
+                    &mut frame.local,
+                    panel_focused && frame.active_column == PanelColumn::Local,
+                    &[],
+                    0,
                 );
             });
             ui.separator();
-            out.1 = show(
+            out.0 = show(
                 ui,
                 t,
-                "本地",
+                "远端",
                 generation,
-                PanelColumn::Local,
-                &mut frame.local,
-                false,
-                panel_focused && frame.active_column == PanelColumn::Local,
-                &[],
-                0,
+                PanelColumn::Remote,
+                &mut frame.remote,
+                panel_focused && frame.active_column == PanelColumn::Remote,
+                &frame.bookmarks,
+                drop_in,
             );
         });
     // 把这一帧的实际宽度读回来。**注意它只是个镜像,驱动不了任何东西**:
@@ -824,28 +1046,20 @@ pub fn content(
             // 画面上文字照旧(`painter` 直接按坐标画),但整个标签宿主里
             // **一行都点不中**。这是 D4a 做拖拽时才暴露出来的既存 bug。
             let full = ui.max_rect();
-            let gap = 8.0;
+            let gap = crate::ui::metrics::SP_S;
             let half = ((full.width() - gap) * 0.5).max(0.0);
             let left = egui::Rect::from_min_size(full.min, egui::vec2(half, full.height()));
             let right =
                 egui::Rect::from_min_max(egui::pos2(full.max.x - half, full.min.y), full.max);
             ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
-                out.0 = show(
-                    ui,
-                    t,
-                    "远端",
-                    generation,
-                    PanelColumn::Remote,
-                    &mut frame.remote,
-                    frame.show_owner,
-                    panel_focused && frame.active_column == PanelColumn::Remote,
-                    &frame.bookmarks,
-                    drop_in,
-                );
-            });
-            ui.painter()
-                .vline(full.center().x, full.y_range(), theme::stroke(t));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
+                // B1:**必须显式裁剪**。`max_rect` 只是布局预算,子 ui 的
+                // `clip_rect` 默认原样继承父 painter(`egui-0.30.0`
+                // `ui.rs::new_child` 直接 `clone()` 父 `painter`,不看
+                // `max_rect`)——`CentralPanel` 的裁剪范围横跨整个内容区、
+                // 两栏共用,不裁的话本栏画出界的东西(滚动条、超宽内容)
+                // 会一路画进右栏(实测证实,见
+                // `tests::the_two_columns_get_independent_non_overlapping_scroll_areas`)。
+                ui.set_clip_rect(left);
                 out.1 = show(
                     ui,
                     t,
@@ -853,10 +1067,26 @@ pub fn content(
                     generation,
                     PanelColumn::Local,
                     &mut frame.local,
-                    false,
                     panel_focused && frame.active_column == PanelColumn::Local,
                     &[],
                     0,
+                );
+            });
+            ui.painter()
+                .vline(full.center().x, full.y_range(), theme::stroke(t));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
+                // B1:同左栏,见上面的注释。
+                ui.set_clip_rect(right);
+                out.0 = show(
+                    ui,
+                    t,
+                    "远端",
+                    generation,
+                    PanelColumn::Remote,
+                    &mut frame.remote,
+                    panel_focused && frame.active_column == PanelColumn::Remote,
+                    &frame.bookmarks,
+                    drop_in,
                 );
             });
         });
@@ -918,6 +1148,30 @@ mod tests {
             gid: 1000,
             link_target: None,
         }
+    }
+
+    /// D1:名称文字的起点必须落在图标格子**右侧**,不能重叠 —— 否则长文件名
+    /// 一开头就会压在图标上面。判据是几何关系而不是照抄实现算式(照抄的话
+    /// 改错了两处、算式仍然自洽就测不出来)。
+    ///
+    /// **图标格子调 `icon_rect()` 而不是自己重建**——复核挖出的坑:曾经这里
+    /// 独立拼过一份 `icon_rect`,生产代码里的 `ICON_LEFT_PAD` 改错了、测试
+    /// 拿的还是自己那份「正确」矩形,照样测不出来。共用同一份生产逻辑,
+    /// 两处才是同一个判据。
+    ///
+    /// 自证会变红:把 `name_start_x_offset` 里的 `ICON_GAP` 换成 `-ICON_GAP`,
+    /// 或者把整个函数体改回 `4.0`(相当于没让位);也可以把 `icon_rect()`
+    /// 里的 `ICON_LEFT_PAD` 换成更大的值(如 `12.0`)而不动
+    /// `name_start_x_offset()`——两处一旦失步,这里也会红。
+    #[test]
+    fn name_start_clears_the_icon_cell() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, ROW_H));
+        let icon = icon_rect(rect);
+        let name_x = rect.left() + name_start_x_offset();
+        assert!(
+            name_x >= icon.right(),
+            "名称起点 {name_x} 落在图标格子 {icon:?} 里面,名字会压到图标上"
+        );
     }
 
     /// 两万项的目录里,一帧只该画可见那几十行 —— `show_rows` 没接对
@@ -991,18 +1245,7 @@ mod tests {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(
-                        ui,
-                        &t,
-                        "远端",
-                        1,
-                        PanelColumn::Remote,
-                        state,
-                        false,
-                        false,
-                        &[],
-                        0,
-                    );
+                    show(ui, &t, "远端", 1, PanelColumn::Remote, state, false, &[], 0);
                 });
             });
             for shape in out.shapes.iter() {
@@ -1073,7 +1316,6 @@ mod tests {
         let mut frame = PanelFrame {
             remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
-            show_owner: false,
             bookmarks: Vec::new(),
             active_column: PanelColumn::default(),
         };
@@ -1161,7 +1403,6 @@ mod tests {
                             1,
                             PanelColumn::Remote,
                             &mut state,
-                            false,
                             focused,
                             &[],
                             0,
@@ -1225,7 +1466,6 @@ mod tests {
         let mut frame = PanelFrame {
             remote: PaneState::new(RemotePath::from_bytes(b"/remote".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/local".to_vec())),
-            show_owner: false,
             bookmarks: Vec::new(),
             active_column: PanelColumn::Remote,
         };
@@ -1275,7 +1515,6 @@ mod tests {
                     PanelColumn::Remote,
                     &mut state,
                     false,
-                    false,
                     &bookmarks,
                     0,
                 );
@@ -1290,7 +1529,6 @@ mod tests {
                     1,
                     PanelColumn::Remote,
                     &mut state,
-                    false,
                     false,
                     &bookmarks,
                     0,
@@ -1322,7 +1560,6 @@ mod tests {
                     1,
                     PanelColumn::Remote,
                     &mut state,
-                    false,
                     false,
                     &bookmarks,
                     0,
@@ -1363,7 +1600,6 @@ mod tests {
                         PanelColumn::Remote,
                         &mut state,
                         false,
-                        false,
                         &bookmarks,
                         0,
                     );
@@ -1390,7 +1626,6 @@ mod tests {
         let mut frame = PanelFrame {
             remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
-            show_owner: false,
             bookmarks: vec![mullion_store::Bookmark {
                 name: "日志".into(),
                 path: "/var/log".into(),
@@ -1710,18 +1945,7 @@ mod tests {
             let mut action = None;
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = show(
-                        ui,
-                        &t,
-                        "远端",
-                        1,
-                        PanelColumn::Remote,
-                        state,
-                        false,
-                        false,
-                        &[],
-                        0,
-                    );
+                    action = show(ui, &t, "远端", 1, PanelColumn::Remote, state, false, &[], 0);
                 });
             });
             (action, out)
@@ -1867,18 +2091,7 @@ mod tests {
             let mut action = None;
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = show(
-                        ui,
-                        &t,
-                        "远端",
-                        1,
-                        PanelColumn::Remote,
-                        state,
-                        false,
-                        false,
-                        &[],
-                        0,
-                    );
+                    action = show(ui, &t, "远端", 1, PanelColumn::Remote, state, false, &[], 0);
                 });
             });
             (action, out)
@@ -1936,18 +2149,7 @@ mod tests {
                 let mut action = None;
                 let out = ctx.run(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        action = show(
-                            ui,
-                            &t,
-                            "本地",
-                            1,
-                            PanelColumn::Local,
-                            state,
-                            false,
-                            false,
-                            &[],
-                            0,
-                        );
+                        action = show(ui, &t, "本地", 1, PanelColumn::Local, state, false, &[], 0);
                     });
                 });
                 (action, out)
@@ -1969,5 +2171,574 @@ mod tests {
             matches!(action, Some(FileAction::Goto(_))),
             "双击目录该进目录,实际 {action:?}"
         );
+    }
+
+    /// B2:点列头必须真的能排序。功能本身早就在(`click_header`),
+    /// 坏的是**点击落不到列头上** —— 整栏背景挂了一个覆盖 `max_rect` 的
+    /// `interact`(右键菜单宿主),它把列头的命中吃掉了。
+    ///
+    /// **必须预热若干帧再点**:egui 的部件矩形要上一帧的布局结果才存在,
+    /// 第一帧注入点击必然打空(这是本项目 egui 测试的既有坑,见切片 G
+    /// 「预热帧数不足的两种静默症状」)。
+    ///
+    /// 自证会变红:把 `header()` 里 `if resp.clicked() { hit = Some(key) }`
+    /// 改成 `if false { .. }`。
+    #[test]
+    fn clicking_the_name_header_actually_flips_the_sort_direction() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![
+            entry(b"b.txt", EntryKind::File),
+            entry(b"a.txt", EntryKind::File),
+        ];
+        state.load = Load::Ready;
+        assert_eq!(state.sort_key, SortKey::Name);
+        assert_eq!(state.sort_dir, crate::files::SortDir::Asc);
+
+        let ctx = egui::Context::default();
+        // 取矩形的前提:标注模式必须开着,否则 `mark` 直接 return(Task 0)。
+        annotate::toggle(&ctx);
+        // **真实窗口宽度**,不能用 egui 测试默认的无穷大画布:侧栏典型宽
+        // 320~450px(见 `DEFAULT_SIDEBAR_W`),不设边界的话「名称」列会占掉
+        // 几乎全部宽度,点哪儿都落在它身上,测试测不出真实场景下四列挤在
+        // 一起时点击会不会打偏。
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 700.0));
+        let mut header_rect = None;
+        for frame in 0..4 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            if frame == 3 {
+                if let Some(r) = header_rect {
+                    let pos: egui::Pos2 = r;
+                    input.events.push(egui::Event::PointerMoved(pos));
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        &[],
+                        0,
+                    );
+                });
+            });
+            header_rect = annotate::spot_rect(&ctx, "文件面板/远端/列头/名称")
+                .map(|r: egui::Rect| r.center());
+        }
+        assert_eq!(
+            state.sort_dir,
+            crate::files::SortDir::Desc,
+            "点了「名称」列头,排序方向没翻 —— 点击没落到列头上"
+        );
+    }
+
+    /// A 组:两栏方位是「本地在前、远端在后」—— 标签宿主左本地右远端,
+    /// 侧栏上本地下远端。两个宿主用**同一条**规则。
+    ///
+    /// 判据用 annotate 记下的矩形,不看调用顺序 —— 调用顺序是实现细节,
+    /// 位置才是用户看见的东西。
+    ///
+    /// 自证会变红:把 `content()` 里两次 `show()` 的 left/right 换回去。
+    #[test]
+    fn the_local_column_comes_first_in_both_hosts() {
+        let ctx = egui::Context::default();
+        // 取矩形的前提:标注模式必须开着,否则 `mark` 直接 return。
+        annotate::toggle(&ctx);
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = PanelFrame::default();
+
+        // 标签宿主用宽窗口,否则无边界画布会让左右两栏的几何断言失真。
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    content(ctx, &t, 7, true, &mut frame, 0);
+                },
+            );
+        }
+        let local = annotate::spot_rect(&ctx, "文件面板/本地").expect("本地栏没画");
+        let remote = annotate::spot_rect(&ctx, "文件面板/远端").expect("远端栏没画");
+        assert!(
+            local.center().x < remote.center().x,
+            "标签宿主:本地栏必须在左边(本地 x={} 远端 x={})",
+            local.center().x,
+            remote.center().x
+        );
+
+        let ctx2 = egui::Context::default();
+        annotate::toggle(&ctx2);
+        let mut ui_state = crate::ui::UiState::default();
+        let mut frame2 = PanelFrame::default();
+        // 侧栏用真实窗口尺寸(见 `clicking_the_name_header_...` 的同款注释)。
+        let screen2 = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 700.0));
+        for _ in 0..3 {
+            let _ = ctx2.run(
+                egui::RawInput {
+                    screen_rect: Some(screen2),
+                    ..Default::default()
+                },
+                |ctx| {
+                    sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame2, 0);
+                },
+            );
+        }
+        let local2 = annotate::spot_rect(&ctx2, "文件面板/本地").expect("本地栏没画");
+        let remote2 = annotate::spot_rect(&ctx2, "文件面板/远端").expect("远端栏没画");
+        assert!(
+            local2.center().y < remote2.center().y,
+            "侧栏:本地栏必须在上面(本地 y={} 远端 y={})",
+            local2.center().y,
+            remote2.center().y
+        );
+        // 分母必须是侧栏**总高**,不能拿 `remote2.height()` 当参照系:「远端」
+        // 那次 `show()` 没包 `allocate_ui` 裁剪,它内部 `annotate::mark` 记的是
+        // 整条侧栏未裁剪的 `ui.max_rect()`(恒等于侧栏总高)——拿它跟本地栏比,
+        // 无论 `sidebar()` 里的比例改成几比几,这条断言都恒真(复核实测把
+        // `h * 0.4` 改成 `h * 0.9` 照样绿)。改成对总高的占比区间:守住
+        // 0.4:0.6 这个刻意取舍(辅助视图里远端才是主体),留一点余量给
+        // `ui.separator()` 那几像素。
+        let total = annotate::spot_rect(&ctx2, "文件侧栏").expect("侧栏没画");
+        assert!(
+            local2.height() > total.height() * 0.25 && local2.height() < total.height() * 0.5,
+            "侧栏:本地栏该占约四成高度(0.4:0.6 里的 0.4),实际本地 {} / 总高 {}",
+            local2.height(),
+            total.height()
+        );
+    }
+
+    /// 递归找 `Shape::Vec` 里描边颜色匹配的矩形,返回**它所在那个顶层
+    /// `ClippedShape` 的 `clip_rect`**(不是矩形自己的几何)—— 这才是决定
+    /// 它实际会不会画出边界的东西:`max_rect` 只是布局预算,`clip_rect`
+    /// 才是画的时候真正生效的裁剪范围(`egui-0.30.0` `painter.rs::add`,
+    /// 每笔画都记着当时 `self.clip_rect`)。
+    fn find_stroke_clip(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+    ) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, clip: egui::Rect, color: egui::Color32) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, clip, color)),
+                egui::Shape::Rect(r) if r.stroke.color == color && r.stroke.width > 0.0 => {
+                    Some(clip)
+                }
+                _ => None,
+            }
+        }
+        shapes
+            .iter()
+            .find_map(|cs| walk(&cs.shape, cs.clip_rect, color))
+    }
+
+    /// B1:两栏的 `ScrollArea` 必须是两个独立的滚动状态,且各自的视口不越界。
+    ///
+    /// **嫌疑 1(几何)查证结论:成立**。`content()` 用 `ui.scope_builder(
+    /// UiBuilder::new().max_rect(left))` 摆内容,但 egui-0.30 的
+    /// `Ui::new_child`(`ui.rs:263`)只是把父 ui 的 `painter`(带着它的
+    /// `clip_rect`)原样 `clone()` 过去,`max_rect` 不影响 `clip_rect` 分毫。
+    /// 实测(临时探针,已删除)证实:两栏内部任何一笔画记下的 `ClippedShape::
+    /// clip_rect` 都是整个 `CentralPanel` 的裁剪范围(跨两栏共享),不是本栏
+    /// 矩形。断言借用 `show()` 里已有的聚焦边框(`focused` 时画的
+    /// `rect_stroke(ui.max_rect(), ...)`)—— 它的**几何**矩形本来就等于本栏
+    /// 矩形(所以拿它当参照不会像 sidebar 那次一样恒真),但它的
+    /// `clip_rect` 在没有显式裁剪时会横跨两栏。
+    ///
+    /// **嫌疑 2(id 撞车)查证结论:不成立(未复现)**。`scroll_id_salt` 的
+    /// 最终 id 是 `ui.id().with(salt)`;两个 `scope_builder` 子 ui 的 `ui.id()`
+    /// 因为都没显式给 `UiBuilder::id_salt`,退化成同一个 `Id::from("child")`
+    /// 常量、算出同一个 `stable_id`(`ui.rs:265,289`,实测证实)——但
+    /// `scroll_id_salt(id, generation)` 自己已经把 `"远端"`/`"本地"` 拼进了
+    /// salt 字符串,`Id::new(不同字符串)` 本来就不同,`ui.id().with(不同salt)`
+    /// 因此依然不同。两栏当前**没有**共享滚动状态。保留这条判据当回归
+    /// 守护:它在这次查证里没红,但改回 `scroll_id_salt` 忽略 `id` 的那次
+    /// 变异验证里会红(两个 `scope_builder` 的 `ui.id()` 本来就相同,盐再一样
+    /// 就真的会撞)。
+    ///
+    /// 自证会变红(两条各自):
+    /// 1. 删掉下面 `content()` 里新增的 `ui.set_clip_rect(...)` —— 裁剪矩形
+    ///    断言变红;
+    /// 2. `scroll_id_salt` 改成 `format!("files-{generation}")`(忽略 `id`)——
+    ///    滚动独立性断言变红。
+    #[test]
+    fn the_two_columns_get_independent_non_overlapping_scroll_areas() {
+        let t = crate::theme::MULLION_DARK;
+        let accent = theme::c32(t.accent);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+
+        // --- 嫌疑 1:裁剪矩形不能越过本栏自己的边界。 -----------------
+        let clip_within_own_bounds = |active: PanelColumn| -> (egui::Rect, egui::Rect) {
+            let ctx = egui::Context::default();
+            annotate::toggle(&ctx);
+            let mut frame = PanelFrame {
+                remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
+                local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
+                bookmarks: Vec::new(),
+                active_column: active,
+            };
+            frame.local.entries = vec![entry(b"local-a.txt", EntryKind::File)];
+            frame.local.load = Load::Ready;
+            frame.remote.entries = vec![entry(b"remote-a.txt", EntryKind::File)];
+            frame.remote.load = Load::Ready;
+
+            let mut out = None;
+            for _ in 0..3 {
+                out = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        content(ctx, &t, 7, true, &mut frame, 0);
+                    },
+                ));
+            }
+            let out = out.unwrap();
+            let path = match active {
+                PanelColumn::Local => "文件面板/本地",
+                PanelColumn::Remote => "文件面板/远端",
+            };
+            let geo = annotate::spot_rect(&ctx, path).expect("这一栏没画");
+            let clip =
+                find_stroke_clip(&out.shapes, accent).expect("聚焦边框没画出来(focused 没生效)");
+            (geo, clip)
+        };
+
+        let (local_geo, local_clip) = clip_within_own_bounds(PanelColumn::Local);
+        assert!(
+            local_clip.max.x <= local_geo.max.x + 0.5,
+            "本地栏的裁剪矩形越过了它自己的右边界,内容会画进右栏: \
+             clip.max.x={} 本栏 max.x={}",
+            local_clip.max.x,
+            local_geo.max.x
+        );
+
+        let (remote_geo, remote_clip) = clip_within_own_bounds(PanelColumn::Remote);
+        assert!(
+            remote_clip.min.x >= remote_geo.min.x - 0.5,
+            "远端栏的裁剪矩形越过了它自己的左边界,内容会画进本地栏: \
+             clip.min.x={} 本栏 min.x={}",
+            remote_clip.min.x,
+            remote_geo.min.x
+        );
+
+        // --- 嫌疑 2:往左栏灌一次滚轮,右栏的行位置不该跟着挪。 --------
+        let ctx = egui::Context::default();
+        let mut frame = PanelFrame {
+            remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
+            local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
+            bookmarks: Vec::new(),
+            active_column: PanelColumn::Local,
+        };
+        frame.local.entries = (0..200)
+            .map(|i| entry(format!("local-{i}.txt").as_bytes(), EntryKind::File))
+            .collect();
+        frame.local.load = Load::Ready;
+        frame.remote.entries = (0..200)
+            .map(|i| entry(format!("remote-{i}.txt").as_bytes(), EntryKind::File))
+            .collect();
+        frame.remote.load = Load::Ready;
+
+        let text_y = |shapes: &[egui::epaint::ClippedShape], needle: &str| -> f32 {
+            find_text_pos(shapes, needle)
+                .unwrap_or_else(|| panic!("没找到 {needle}"))
+                .y
+        };
+
+        // 预热三帧,拿滚动前的基线位置。
+        let mut out = None;
+        for _ in 0..3 {
+            out = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    content(ctx, &t, 7, true, &mut frame, 0);
+                },
+            ));
+        }
+        let before = out.unwrap();
+        let local_y_before = text_y(&before.shapes, "local-3.txt");
+        let remote_y_before = text_y(&before.shapes, "remote-3.txt");
+
+        // 指针悬在本地栏(左半边)上,灌一大股滚轮。
+        let scroll_input = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(50.0, 300.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -600.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut out = Some(ctx.run(scroll_input, |ctx| {
+            content(ctx, &t, 7, true, &mut frame, 0);
+        }));
+        // 再跑两帧,让滚动状态稳定下来(smooth scroll 有插值)。
+        for _ in 0..2 {
+            out = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    content(ctx, &t, 7, true, &mut frame, 0);
+                },
+            ));
+        }
+        let after = out.unwrap();
+
+        assert_ne!(
+            find_text_pos(&after.shapes, "local-3.txt").map(|p| p.y),
+            Some(local_y_before),
+            "本地栏灌了滚轮,`local-3.txt` 的位置却没变 —— 滚动没生效,测试前提不成立"
+        );
+        let remote_y_after = text_y(&after.shapes, "remote-3.txt");
+        assert!(
+            (remote_y_after - remote_y_before).abs() < 0.5,
+            "只往本地栏灌了滚轮,远端栏的 `remote-3.txt` 却跟着挪了位置 \
+             (滚动前 y={remote_y_before} 滚动后 y={remote_y_after})—— \
+             两栏共用了同一份滚动状态"
+        );
+    }
+
+    /// D3:名称列宽度必须**一处算**。`row()` 或 `header()` 里再写一遍这个
+    /// 减法表达式的话,加一列就会有一处漏改,现象是列头文字和行内容错位——
+    /// 而且错得很小(几个像素),没人会当成 bug 报上来,它就一直错着。
+    ///
+    /// 自证会变红:在 `row()` 里加一份内联的 `total - W_ICON - ICON_GAP - sum`
+    /// 影子计算(哪怕值算对,这条测试也该红——它守的是「只有一处」,不是
+    /// 「算得对不对」)。
+    #[test]
+    fn the_name_column_width_is_computed_in_exactly_one_place() {
+        let src = include_str!("files_panel.rs");
+        // 扫产品代码(第一个 #[cfg(test)] 之前),数一数减法表达式出现几次。
+        let prod = src.split("#[cfg(test)]").next().expect("源码切歪了");
+        let inline = prod.matches("- W_ICON - ICON_GAP - sum").count();
+        assert_eq!(
+            inline, 1,
+            "名称列宽度算了 {inline} 次 —— 必须只在 `name_w()` 里算一次,\
+             两处各算一遍会让列头和行错位"
+        );
+    }
+
+    /// D2/控制者补充 2/协调者复核收口:列头与行体的**每一条**列边界都必须
+    /// 重合,在 k=4/3/2/1/0 五个档位各取一个代表宽度(含 280/360/488/640
+    /// 四个真实值:280/640 是侧栏拖拽范围两端,360 是默认侧栏宽,488 是
+    /// 旧的「四列恒定宽」临界点)。这条测试守的是:列头文字与行内容错位
+    /// 几个像素这件事,错位很小,没人会当成 bug 报上来,它会一直悄悄错着。
+    ///
+    /// 两侧都调**生产函数**——列头侧 `header_col_lefts()`/`header_name_col_w()`
+    /// 是 `header()` 自己也调的那份计算,行体侧 `row_col_lefts()`/
+    /// `row_size_col_left()` 是 `row()` 自己也调的那份计算,测试不独立重建
+    /// 任何一侧的算式(同 `icon_rect()` 的教训:测试自己拼一份「我以为生产
+    /// 代码是这么写的」公式的话,生产代码那份改错了,测试仍然只是在跟自己
+    /// 的影子比,照样测不出来)。`header_col_lefts()`/`row_col_lefts()` 各自
+    /// 独立累加(不共用最终结果),一边改错了另一边不会跟着错。
+    ///
+    /// 自证会变红(两条各自):
+    /// 1. 把 `header_name_col_w()` 里的 `+ W_ICON + ICON_GAP` 去掉;
+    /// 2. 把 `row_col_lefts()` 里某个列宽换成别的常量(比如把属主列的宽度
+    ///    换成 `W_PERM`)。
+    #[test]
+    fn the_header_and_row_size_column_start_at_the_same_x_across_widths() {
+        // (宽度, 期望的可见列数 k)——见 `visible_col_count()` 的分档:
+        // 150→0(深度夹紧,连一列可选列都放不下),280→1(侧栏拖拽下限),
+        // 360→2(默认侧栏宽),420→3(k=3 的代表宽度,落在 [396,488) 区间),
+        // 488→4(旧的「四列恒定宽」临界点,恰好卡在地板上),640→4(侧栏
+        // 拖拽上限,不夹紧,富余量最大)。
+        for (w, expect_k) in [
+            (150.0_f32, 0usize),
+            (280.0, 1),
+            (360.0, 2),
+            (420.0, 3),
+            (488.0, 4),
+            (640.0, 4),
+        ] {
+            // 名称列本身的边界(列头/行体各自的「合并区域」右边界)。
+            let header_name_left = header_name_col_w(w);
+            let row_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, ROW_H));
+            let row_name_left = row_size_col_left(row_rect);
+            assert!(
+                (header_name_left - row_name_left).abs() < 0.01,
+                "宽度 {w} 下列头/行体「名称」列右边界不重合:列头 {header_name_left}, 行体 {row_name_left}"
+            );
+
+            let header_cols = header_col_lefts(w);
+            let row_cols = row_col_lefts(row_rect);
+            assert_eq!(
+                header_cols.len(),
+                expect_k,
+                "宽度 {w} 下列头侧可见列数不对:期望 {expect_k},实际 {}",
+                header_cols.len()
+            );
+            assert_eq!(
+                header_cols.len(),
+                row_cols.len(),
+                "宽度 {w} 下列头/行体可见列数不一致:列头 {},行体 {}",
+                header_cols.len(),
+                row_cols.len()
+            );
+            for (h, r) in header_cols.iter().zip(row_cols.iter()) {
+                let (h_label, h_key, h_left, h_w) = *h;
+                let (_, r_key, r_left, r_w) = *r;
+                assert_eq!(
+                    h_key, r_key,
+                    "宽度 {w} 下列头/行体列顺序不一致:列头 {h_label:?}({h_key:?}),行体 {r_key:?}"
+                );
+                assert!(
+                    (h_left - r_left).abs() < 0.01,
+                    "宽度 {w} 下「{h_label}」列左边界不重合:列头 {h_left}, 行体 {r_left}"
+                );
+                assert!(
+                    (h_w - r_w).abs() < 0.01,
+                    "宽度 {w} 下「{h_label}」列宽不一致:列头 {h_w}, 行体 {r_w}"
+                );
+            }
+        }
+    }
+
+    /// D2/控制者补充 2:宽度不够时,大小/修改时间/权限/属主四列必须**从右
+    /// 向左**收起(先丢属主,再权限,再修改时间,最后大小)。这是复核实测
+    /// 出的真实画面对应的修法:默认侧栏 360px 下,不收起的话属主列有数据
+    /// 没标题(标题起点 396 被列头裁掉了),权限标题反而画到了权限数据
+    /// 右边——收起可选列、让名称列吃掉剩余宽度之后,这个错位从根上消失
+    /// (见 `visible_col_count()`/`name_w()` 的文档注释)。
+    ///
+    /// 自证会变红:
+    /// 1. 把可见列数的判据 `< 80.0` 改成 `< 0.0`(等价于永不收起);
+    /// 2. 把 `OPTIONAL_COLS` 的收起顺序反过来(从左往右丢)。
+    #[test]
+    fn columns_are_dropped_from_the_right_as_the_panel_gets_narrower() {
+        assert_eq!(visible_col_count(640.0), 4, "640px(侧栏上限)应该四列全在");
+        assert_eq!(visible_col_count(488.0), 4, "488px(旧临界点)应该四列全在");
+        assert_eq!(visible_col_count(360.0), 2, "360px(默认侧栏宽)应该只剩两列");
+        assert_eq!(visible_col_count(280.0), 1, "280px(侧栏下限)应该只剩一列");
+
+        // 420px 落在 k=3 的区间([396,488))——可见的应该是「大小/修改时间/
+        // 权限」,收起的应该是最右边的「属主」,不是别的列。
+        let keys: Vec<SortKey> = header_col_lefts(420.0)
+            .iter()
+            .map(|&(_, key, _, _)| key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![SortKey::Size, SortKey::Mtime, SortKey::Perm],
+            "420px 下理应可见「大小/修改时间/权限」三列、收起「属主」——实际可见: {keys:?}"
+        );
+    }
+
+    /// D2:本地栏的属主列画 `—`,不画 `0:0`。判据是栏别不是 uid ——
+    /// 远端真的有 root(uid=0)拥有的文件。
+    ///
+    /// 自证会变红:把判据从 `column == PanelColumn::Local` 改成 `e.uid == 0`,
+    /// 然后这条测试里那个远端 root 文件会画成 `—`。
+    #[test]
+    fn the_local_column_shows_a_dash_for_owner_but_remote_root_shows_zeros() {
+        assert_eq!(owner_text(PanelColumn::Local, 0, 0), "—");
+        assert_eq!(owner_text(PanelColumn::Remote, 0, 0), "0:0");
+        assert_eq!(owner_text(PanelColumn::Remote, 1000, 1000), "1000:1000");
+    }
+
+    /// 质量复核实测:把 `row()` 里权限槽(`cols.get(2)`)与属主槽
+    /// (`cols.get(3)`)绘制的内容对调,`files_panel` 全部 33 个测试全绿——
+    /// 对齐守护测试(`the_header_and_row_size_column_start_at_the_same_x_
+    /// across_widths`)只比几何(label/key/left/width),完全不看「谁画在
+    /// 哪个槽位」。用户会在「权限」标题下看到 `uid:gid`、在「属主」标题下
+    /// 看到 `rwxr-x---`,测试网毫无反应。
+    ///
+    /// 这条测试直接读渲染出的 `Shape::Text`,断言每个槽位画出来的数据
+    /// 文本落在**自己**那个槽位的 x 区间里。顺带把大小、修改时间两个槽位
+    /// 也一并锁上——同一类判据,x 区间同样来自 `row_col_lefts()`,不算
+    /// 超范围。
+    ///
+    /// entry 特意挑了四个槽位互不相同、不会看混的值:大小 `777 B`、权限
+    /// `rwxr-x---`、属主 `1000:33`,彼此没有子串重叠,`find_text_pos` 不会
+    /// 找混。
+    ///
+    /// x 区间来自生产函数 `row_col_lefts(row_rect)`——`row()` 自己也调的
+    /// 那份计算,测试不重抄坐标(同 `icon_rect()`/`row_size_col_left()` 的
+    /// 教训)。
+    ///
+    /// 自证会变红:把 `row()` 里权限槽与属主槽两处绘制的内容对调
+    /// (`perm_string(e.mode)` 画进属主槽的 `p.text(...)`、
+    /// `owner_text(...)` 画进权限槽的 `p.text(...)`)。
+    #[test]
+    fn each_optional_column_paints_its_own_data_not_a_neighbors() {
+        let t = crate::theme::MULLION_DARK;
+        let e = Entry {
+            size: 777,
+            mode: 0o750,
+            uid: 1000,
+            gid: 33,
+            ..entry(b"f.txt", EntryKind::File)
+        };
+        // 700px:留足余量的 k=4 代表宽度,四个可选列全部可见。
+        let width = 700.0_f32;
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    // 显式给 `row()` 一块零边距、宽度已知的矩形——不然
+                    // `row_rect` 的实际宽度取决于 egui 默认 `screen_rect` /
+                    // `CentralPanel` 默认边距,测试里没法跟 `row_col_lefts()`
+                    // 对上同一个数。手法同生产代码 `content()` 切两栏
+                    // (`ui.scope_builder(UiBuilder::new().max_rect(..))`)。
+                    let rect =
+                        egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(width, ROW_H));
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        row(ui, &t, &e, PanelColumn::Remote, false);
+                    });
+                });
+        });
+
+        let row_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, ROW_H));
+        let cols = row_col_lefts(row_rect);
+        assert_eq!(cols.len(), 4, "700px 应该四列全部可见,自查前提不成立");
+
+        let expect = [
+            (human_size(e.size), cols[0]),
+            (mtime_text(e.mtime), cols[1]),
+            (perm_string(e.mode), cols[2]),
+            (owner_text(PanelColumn::Remote, e.uid, e.gid), cols[3]),
+        ];
+        for (text, (label, _key, left, w)) in expect {
+            let pos = find_text_pos(&out.shapes, &text)
+                .unwrap_or_else(|| panic!("没画出「{label}」列该有的文本 {text:?}"));
+            assert!(
+                pos.x >= left && pos.x <= left + w,
+                "「{label}」列的文本 {text:?} 落在 x={},不在自己的区间 [{left},{}] 里\
+                 ——画错槽位了",
+                pos.x,
+                left + w
+            );
+        }
     }
 }

@@ -41,6 +41,17 @@ pub struct EditorState {
     pub notice: Option<String>,
     /// 点了关闭但内容是脏的 —— 压一条确认条,不直接关。
     pub confirm_close: bool,
+    /// C 组:最大化状态。`true` 时窗口铺满主窗口客户区。
+    /// 纯 UI 运行态,不持久化 —— 关掉编辑器就没了(与 F37 的布局持久化
+    /// 无关,那存的是标签与分屏形状)。
+    pub maximized: bool,
+    /// C 组:最大化之前(非最大化状态下)最近一次渲染出的窗口矩形。
+    /// 每个非最大化帧都更新 —— 「还原」要钉回这里。
+    pub last_rect: Option<egui::Rect>,
+    /// C 组:一次性信号 ——「下一帧把窗口钉回这个矩形」,用完即清。
+    /// 不这样做的话,停止钉满屏几何后 egui 会把上一帧的全屏尺寸当成窗口
+    /// 当前状态一直留着,「还原」等于没按。
+    pub restore_to: Option<egui::Rect>,
 }
 
 impl EditorState {
@@ -65,6 +76,9 @@ impl EditorState {
             busy: false,
             notice: None,
             confirm_close: false,
+            maximized: false,
+            last_rect: None,
+            restore_to: None,
         }
     }
 
@@ -109,6 +123,25 @@ impl EditorState {
     }
 }
 
+/// C 组:窗口这一帧要不要钉几何、钉到哪。
+/// - 最大化:每帧钉满屏(不每帧钉的话,用户在最大化状态下拖边缘,egui 会
+///   记住那个尺寸,再按「还原」就还原不回去了)。
+/// - 刚点了还原:钉回最大化之前那一帧记下的矩形**一帧**,然后放手 ——
+///   不钉的话 egui 会把全屏那个尺寸当成窗口当前状态一直留着,「还原」
+///   等于没按。
+/// - 其余情况:不钉,窗口归用户拖。
+fn pinned_rect(
+    maximized: bool,
+    restore_to: Option<egui::Rect>,
+    screen: egui::Rect,
+) -> Option<egui::Rect> {
+    if maximized {
+        Some(screen)
+    } else {
+        restore_to
+    }
+}
+
 /// 画编辑器窗口。返回本帧的动作。
 ///
 /// `state` 传 `&mut Option<..>`:关窗要把它清成 `None`,这一步在这里做 ——
@@ -123,80 +156,120 @@ pub fn show(
     let mut close = false;
     let title = format!("{}{}", if s.dirty() { "● " } else { "" }, s.path);
 
-    egui::Window::new("编辑文件")
+    let screen = ctx.screen_rect();
+    // 用「进入这一帧时」的状态决定钉不钉、钉到哪 —— 本帧里用户点击
+    // 最大化/还原会改 `s.maximized`/`s.restore_to`,但那个改动到下一帧
+    // 才生效,不然「点还原的这一帧」会把刚被点掉的满屏矩形误记成
+    // last_rect(回到 1 的老问题)。
+    let was_maximized = s.maximized;
+    let pin = pinned_rect(was_maximized, s.restore_to, screen);
+    let mut win = egui::Window::new("编辑文件")
         .collapsible(false)
         .resizable(true)
-        .default_size(egui::vec2(720.0, 480.0))
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            crate::ui::annotate::mark(ui.ctx(), "内置编辑器".to_string(), ui.max_rect());
+        .default_size(egui::vec2(720.0, 480.0));
+    if let Some(r) = pin {
+        win = win.current_pos(r.min).fixed_size(r.size());
+    }
+    if !was_maximized {
+        // 还原信号只用这一帧。
+        s.restore_to = None;
+    }
+
+    let resp = win.show(ctx, |ui| {
+        crate::ui::annotate::mark(ui.ctx(), "内置编辑器".to_string(), ui.max_rect());
+        ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&title).color(theme::c32(t.fg_mid)));
-
-            if let Some(why) = s.read_only {
-                ui.colored_label(theme::c32(t.warn), format!("只读:{why}"));
-            }
-            if s.eol == Eol::Mixed {
-                ui.horizontal(|ui| {
-                    ui.colored_label(theme::c32(t.warn), "这个文件换行符混用,保存会把全文统一成:");
-                    ui.selectable_value(&mut s.eol_choice, Some(Eol::Lf), "LF");
-                    ui.selectable_value(&mut s.eol_choice, Some(Eol::Crlf), "CRLF");
-                });
-            }
-            if let Some(n) = &s.notice {
-                ui.colored_label(theme::c32(t.fg_dim), n);
-            }
-
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .max_height(360.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut s.text)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(20)
-                            // 只读一律靠这一条落地。靠「保存按钮置灰」是不够的:
-                            // 用户改了半天才发现存不了,那些改动全白费。
-                            .interactive(s.read_only.is_none()),
-                    );
-                });
-            ui.separator();
-
-            if s.confirm_close {
-                ui.colored_label(theme::c32(t.danger), "有未保存的修改,关掉就没了。");
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(egui::RichText::new("丢弃并关闭").color(theme::c32(t.danger)))
-                        .clicked()
-                    {
-                        action = Some(EditorAction::Close(s.key));
-                        close = true;
-                    }
-                    if ui.button("继续编辑").clicked() {
-                        s.confirm_close = false;
-                    }
-                });
-                return;
-            }
-
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(s.can_save(), egui::Button::new("保存到远端"))
-                    .clicked()
-                {
-                    action = Some(EditorAction::Save);
-                }
-                if ui.button("关闭").clicked() {
-                    if s.dirty() {
-                        s.confirm_close = true;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if s.maximized { "还原" } else { "最大化" };
+                if ui.small_button(label).clicked() {
+                    if s.maximized {
+                        // 还原:钉回最大化之前记下的矩形。
+                        s.maximized = false;
+                        s.restore_to = s.last_rect;
                     } else {
-                        action = Some(EditorAction::Close(s.key));
-                        close = true;
+                        s.maximized = true;
                     }
                 }
-                ui.checkbox(&mut s.backup, "写前留一份 .mullion.bak");
             });
         });
+
+        if let Some(why) = s.read_only {
+            ui.colored_label(theme::c32(t.warn), format!("只读:{why}"));
+        }
+        if s.eol == Eol::Mixed {
+            ui.horizontal(|ui| {
+                ui.colored_label(theme::c32(t.warn), "这个文件换行符混用,保存会把全文统一成:");
+                ui.selectable_value(&mut s.eol_choice, Some(Eol::Lf), "LF");
+                ui.selectable_value(&mut s.eol_choice, Some(Eol::Crlf), "CRLF");
+            });
+        }
+        if let Some(n) = &s.notice {
+            ui.colored_label(theme::c32(t.fg_dim), n);
+        }
+
+        ui.separator();
+        // C 组:高度跟着窗口走。**减去底部按钮行的预算** —— 不减的话
+        // `ScrollArea` 会把可用高度吃光,保存/关闭那一行被挤出窗口。
+        let reserve = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0;
+        let h = (ui.available_height() - reserve).max(80.0);
+        egui::ScrollArea::vertical().max_height(h).show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut s.text)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(20)
+                    // 只读一律靠这一条落地。靠「保存按钮置灰」是不够的:
+                    // 用户改了半天才发现存不了,那些改动全白费。
+                    .interactive(s.read_only.is_none()),
+            );
+        });
+        ui.separator();
+
+        if s.confirm_close {
+            ui.colored_label(theme::c32(t.danger), "有未保存的修改,关掉就没了。");
+            ui.horizontal(|ui| {
+                if ui
+                    .button(egui::RichText::new("丢弃并关闭").color(theme::c32(t.danger)))
+                    .clicked()
+                {
+                    action = Some(EditorAction::Close(s.key));
+                    close = true;
+                }
+                if ui.button("继续编辑").clicked() {
+                    s.confirm_close = false;
+                }
+            });
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(s.can_save(), egui::Button::new("保存到远端"))
+                .clicked()
+            {
+                action = Some(EditorAction::Save);
+            }
+            if ui.button("关闭").clicked() {
+                if s.dirty() {
+                    s.confirm_close = true;
+                } else {
+                    action = Some(EditorAction::Close(s.key));
+                    close = true;
+                }
+            }
+            ui.checkbox(&mut s.backup, "写前留一份 .mullion.bak");
+        });
+    });
+
+    if !was_maximized {
+        // 非最大化的每一帧都记下渲染出的矩形 —— 「还原」要钉回这里。
+        // 用 `was_maximized`(帧首状态)而不是这一帧点击后的
+        // `s.maximized`:点了「还原」的这一帧,窗口渲染出来的还是满屏
+        // 矩形,拿它去更新 `last_rect` 会把刚要还原回去的目标覆盖掉。
+        if let Some(r) = &resp {
+            s.last_rect = Some(r.response.rect);
+        }
+    }
 
     if close {
         *state = None;
@@ -207,6 +280,30 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C 组:编辑器窗口不许锚死、不许写死编辑区高度。
+    ///
+    /// `anchor` 会让 `egui::Window` 完全无法拖动(egui 0.30:设了 anchor 就
+    /// 忽略用户拖拽的位移);编辑区高度写死会让窗口放大后编辑区仍停在
+    /// 原高度 —— 两者合起来就是「没法全屏」。
+    ///
+    /// 扎源码而不是造窗口:这两条都是**代码里有没有这一行**的事实,
+    /// 而窗口的实际可拖性要真人拖一下才知道。
+    ///
+    /// 自证会变红:把 `.anchor(egui::Align2::CENTER_CENTER, ..)` 加回去。
+    #[test]
+    fn the_editor_window_is_neither_anchored_nor_height_locked() {
+        let src = include_str!("editor_window.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("源码切歪了");
+        assert!(
+            !prod.contains(".anchor("),
+            "编辑器窗口还锚着 —— 锚死的 egui::Window 拖不动"
+        );
+        assert!(
+            !prod.contains("max_height(360.0)"),
+            "编辑区高度还写死在 360 —— 窗口放大了它也不跟着长"
+        );
+    }
 
     fn editable() -> Option<EditorState> {
         Some(EditorState::new(
@@ -392,6 +489,88 @@ mod tests {
             act,
             Some(EditorAction::Close(77)),
             "关的是哪一条必须写在动作里"
+        );
+    }
+
+    /// C 组:标题行的最大化/还原按钮真的能点、真的会翻转状态,
+    /// **而且按钮上的文字真的跟着变**。
+    ///
+    /// 单靠后面这行 `texts()` 断言之前,「文案跟着变」只是被
+    /// `click()` 内部的 `find_button_pos` 间接测住:文案不对的话它就找不到
+    /// 叫「还原」的按钮而直接 panic —— 失败信息说的是「找不到按钮」,
+    /// 不是「文案不对」,诊断性差。这里显式断言画面上出现的文字。
+    #[test]
+    fn the_maximize_button_toggles_state_and_flips_its_own_label() {
+        let mut s = editable();
+        assert!(!s.as_ref().unwrap().maximized, "前提:默认不是最大化");
+        assert!(
+            texts(&mut s).iter().any(|x| x == "最大化"),
+            "初始态按钮该写着「最大化」"
+        );
+
+        assert_eq!(click(&mut s, "最大化"), None, "最大化不产生 EditorAction");
+        assert!(s.as_ref().unwrap().maximized, "点了最大化,状态该翻转");
+        assert!(
+            texts(&mut s).iter().any(|x| x == "还原"),
+            "最大化之后按钮该改写成「还原」"
+        );
+
+        assert_eq!(click(&mut s, "还原"), None);
+        assert!(!s.as_ref().unwrap().maximized, "再点一次该还原");
+        assert!(
+            texts(&mut s).iter().any(|x| x == "最大化"),
+            "还原之后按钮该改回「最大化」"
+        );
+    }
+
+    /// C 组:`pinned_rect` 是几何决策的唯一出口,纯函数,单独锁住三种输入。
+    /// 用具体数字断言具体数字 —— 不在测试里重抄一遍函数体,否则「改坏了
+    /// 函数,测试跟着错」这种变异测不出来。
+    #[test]
+    fn pinned_rect_covers_its_three_cases_with_concrete_numbers() {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let restore = egui::Rect::from_min_size(egui::pos2(100.0, 80.0), egui::vec2(720.0, 480.0));
+
+        // 最大化:不管 restore_to 是什么,钉满屏。
+        assert_eq!(pinned_rect(true, None, screen), Some(screen));
+        assert_eq!(pinned_rect(true, Some(restore), screen), Some(screen));
+
+        // 非最大化 + 有还原信号:钉回那个矩形。
+        assert_eq!(pinned_rect(false, Some(restore), screen), Some(restore));
+
+        // 非最大化 + 没有还原信号:不钉,窗口归用户拖。
+        assert_eq!(pinned_rect(false, None, screen), None);
+    }
+
+    /// C 组:点「还原」记下的 `restore_to`,必须是最大化**之前**那个窗口
+    /// 大小的矩形,而不是最大化期间那个满屏矩形 —— 否则「还原」等于
+    /// 把窗口重新摆回满屏,跟没按一样。
+    ///
+    /// 如果这条在无头环境下因窗口几何预热不稳而失败,应如实报告,不得
+    /// 改造成恒绿断言。
+    #[test]
+    fn restoring_records_the_pre_maximize_rect_not_the_full_screen_one() {
+        let mut s = editable();
+        // 热身,让非最大化状态下的 last_rect 先落定。
+        let _ = texts(&mut s);
+        let before_max = s.as_ref().unwrap().last_rect;
+        assert!(before_max.is_some(), "热身之后 last_rect 该有值了");
+
+        assert_eq!(click(&mut s, "最大化"), None);
+        assert!(s.as_ref().unwrap().maximized);
+        // 最大化期间不该再更新 last_rect —— 它应该还是最大化前记的那个。
+        assert_eq!(
+            s.as_ref().unwrap().last_rect,
+            before_max,
+            "最大化期间 last_rect 不该被满屏矩形覆盖"
+        );
+
+        assert_eq!(click(&mut s, "还原"), None);
+        assert!(!s.as_ref().unwrap().maximized);
+        assert_eq!(
+            s.as_ref().unwrap().restore_to,
+            before_max,
+            "还原信号该钉回最大化之前的矩形,而不是满屏矩形"
         );
     }
 
