@@ -60,6 +60,18 @@
   cosmic-text 按字形 advance 排——纯等宽 ASCII 能对齐,CJK/字体回退时字形 x 未必落在格上,
   可能与背景块错位。这是 [adr-001](adr-001-glyph-rendering.md) 已拍板的 v0.1 取舍(通用文本路径),
   人眼验项;不可接受时退路是专用 wgpu 逐格字形管线。
+- **量 `cell_w` 的字号必须跟排版实际用的字号同源,否则字压字只在特定「字号 × 缩放」
+  组合下出现。** 症状:终端里后面的字压到前面的字上(用户报的现象:`.md` 和
+  `12 条` 重叠),换个 DPI 又好了,极难归因。曾经排版用 `Metrics::new(cell_h * 0.8,
+  cell_h)`,量 `cell_w` 却按 `Metrics::new(font_px, cell_h)`;`cell_h = ceil(font_px
+  * 1.25)`,两者只在 `font_px * 1.25` 恰好是整数时相等(10pt@150% 相等,10pt@100%
+  差 2%,一行 60 列就能漂出 1.2 格)。**规则**:排版与量宽必须调同一个函数——收进
+  `text.rs` 的 `grid_metrics(font_px, cell_h)`,文件里不许再有第二处
+  `Metrics::new(...)`。**守护**:
+  `text::tests::the_font_size_used_for_layout_is_the_one_cell_w_was_measured_with`
+  (遍历 pt × scale 九组,判据是 60 个 `M` 的实际 advance == 60 × `cell_w`,容差
+  0.5px)、`text::tests::only_grid_metrics_constructs_the_grid_metrics`(钉住
+  `Metrics::new` 全文件只此一处调用)。
 
 ## wgpu
 
@@ -250,6 +262,20 @@
   该测试直接调用 `show()` 内部实际使用的 `group_header` 函数(不是重抄一遍表达式),删掉
   `.id_salt(gid)` 这一行测试立即变红(已实测)。无头容器里这条能测,因为撞的是 egui 的
   `Id` 值本身(可用 `header_response.id` 读出来比较),不需要真的截图或判断像素。
+
+- **盖在终端上的纯装饰(分屏分界线/焦点描边)要用 `ctx.layer_painter`,不要用
+  `egui::Area`。** 症状:加了分界线/焦点描边之后终端划选失效——鼠标按下没反应,
+  但键盘还灵。`Area`(以及任何 `allocate_*`)会占一块**可交互**矩形,T8 的指针路由是
+  「先喂 egui 后判」,盖在终端上的 `Area` 会把指针事件吃掉。**规则**:纯装饰走
+  `ctx.layer_painter(egui::LayerId::new(egui::Order::Background, id))`——只画不占;
+  `Order::Background` 就够,egui 整层 composite 在 wgpu 自绘的终端之上,同时又在
+  面板/弹窗之下(不会盖住模态框)。另一半:**装饰不许改几何**——给焦点 pane 缩
+  `term_px` 让出描边空间会改 `grid`,每切一次焦点就发一次 `window_change`(T4),
+  远端 TUI 每点一下重排一次;分界线画进 `layout_geometry` 里已经让出的 `GAP_PX`
+  缝中,焦点描边紧贴 `px` 边界画,都不动 `term_px`。**守护**:`ui::pane_edges::tests`
+  (6 条,含 `the_vertical_divider_lands_in_the_gap_that_no_pane_owns` /
+  `the_horizontal_divider_lands_in_the_gap_that_no_pane_owns` 钉住分界线不压
+  `term_px`、`no_ring_is_painted_when_nothing_has_focus` 钉住无焦点不画环)。
 
 - **多标签页场景下,`ScrollArea::id_salt` 只拼「栏位名」不拼「标签」,会跨标签继承滚动
   位置(F50/F36,与上一条 F60 同根)。** `files_panel.rs` 的 `sidebar()`/`content()` 原来

@@ -20,8 +20,28 @@ pub struct PxRect {
     pub h: u32,
 }
 
-/// pane 标题条高度(F83)。
-pub const TITLE_BAR_PX: u32 = 32;
+/// 标题条高度,**逻辑点**。物理像素要走 [`title_bar_px`]。
+///
+/// 曾经是物理像素常量 `TITLE_BAR_PX = 32`。标题条里的内容(`shrink2(8, 4)`
+/// 的边距、图标边长)全是逻辑点,150% 缩放下 32 物理像素只有 21.33 点,
+/// 内高 13.33 点装不下 14 点的图标 —— 底部被 clip 掉。geom 层是物理像素的
+/// 地盘(见 `ui/toolbar.rs` 顶部那段单位说明),所以缩放在**边界**上做:
+/// 常量存点,`layout_geometry` 收 ppp 换成像素。
+pub const TITLE_BAR_PT: f32 = 32.0;
+
+/// 当前 DPI 下标题条占多少物理像素。
+///
+/// 非有限或非正的 `ppp` 落回 1.0:winit 在显示器热插拔的瞬间报过 0 / NaN
+/// 的 `scale_factor`,算出 0 会让标题条整排消失、算出巨值会把终端区挤成
+/// 0 行,而且两者都要等下一帧 ppp 正常了才恢复。
+pub fn title_bar_px(ppp: f32) -> u32 {
+    let ppp = if ppp.is_finite() && ppp > 0.0 {
+        ppp
+    } else {
+        1.0
+    };
+    (TITLE_BAR_PT * ppp).round() as u32
+}
 
 /// 相邻 pane 之间的分隔线宽度(F80)。
 ///
@@ -50,11 +70,15 @@ pub struct PaneGeom {
 ///
 /// `area` 是整个终端区的像素矩形(窗口扣掉 egui 菜单栏/工具栏/状态栏之后剩下的)。
 /// `cell` 是字元像素尺寸 `(宽, 高)`。`title_bars` 对应 F83 开关。
+/// `ppp` 是当前窗口的 `scale_factor`,标题条高度按它换算成物理像素;**不要在
+/// geom 里读全局**,geom 是纯函数层,ppp 由调用方 `compute_geoms` 从
+/// `window.scale_factor()` 传进来。
 pub fn layout_geometry(
     tree: &Node,
     area: PxRect,
     cell: (f32, f32),
     title_bars: bool,
+    ppp: f32,
 ) -> Vec<PaneGeom> {
     // u16 承载像素:4K 宽 3840 远低于 65535。超大屏(理论上 >65535px)饱和截断,
     // 画面会不对但不会静默回绕成小值。
@@ -79,7 +103,7 @@ pub fn layout_geometry(
             };
             // 标题条不能比 pane 本身还高(窗口被拖到极小时会发生)。
             let title_h = if title_bars {
-                TITLE_BAR_PX.min(px.h)
+                title_bar_px(ppp).min(px.h)
             } else {
                 0
             };
@@ -145,7 +169,7 @@ mod tests {
 
     #[test]
     fn single_pane_fills_area_and_yields_no_gap() {
-        let g = layout_geometry(&leaf(1), AREA, CELL, false);
+        let g = layout_geometry(&leaf(1), AREA, CELL, false, 1.0);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].px, AREA);
         assert_eq!(g[0].term_px, AREA, "只有一个 pane 时不该让任何像素给分隔线");
@@ -154,7 +178,7 @@ mod tests {
 
     #[test]
     fn inner_pane_yields_one_pixel_for_the_divider_f80() {
-        let g = layout_geometry(&hsplit(0.5, leaf(1), leaf(2)), AREA, CELL, false);
+        let g = layout_geometry(&hsplit(0.5, leaf(1), leaf(2)), AREA, CELL, false, 1.0);
         assert_eq!(g[0].px.w, 400);
         assert_eq!(g[0].term_px.w, 399, "左 pane 要让 1px 给竖分隔线");
         assert_eq!(g[1].px.w, 400);
@@ -174,7 +198,7 @@ mod tests {
     /// 下 pane 挨底,不让位:term_px.h=300 → grid.1 = 300/20 = 15。
     #[test]
     fn inner_pane_yields_one_pixel_for_the_horizontal_divider_f80() {
-        let g = layout_geometry(&vsplit(0.5, leaf(1), leaf(2)), AREA, CELL, false);
+        let g = layout_geometry(&vsplit(0.5, leaf(1), leaf(2)), AREA, CELL, false, 1.0);
         assert_eq!(g[0].px.h, 300);
         assert_eq!(g[0].term_px.h, 299, "上 pane 要让 1px 给横分隔线");
         assert_eq!(g[1].px.h, 300);
@@ -185,24 +209,24 @@ mod tests {
 
     #[test]
     fn grid_excludes_title_bar_f83() {
-        let off = layout_geometry(&leaf(1), AREA, CELL, false);
-        let on = layout_geometry(&leaf(1), AREA, CELL, true);
-        assert_eq!(on[0].title_px.h, TITLE_BAR_PX);
+        let off = layout_geometry(&leaf(1), AREA, CELL, false, 1.0);
+        let on = layout_geometry(&leaf(1), AREA, CELL, true, 1.0);
+        assert_eq!(on[0].title_px.h, title_bar_px(1.0));
         assert_eq!(off[0].title_px.h, 0);
         assert_eq!(
             on[0].term_px.y,
-            AREA.y + TITLE_BAR_PX,
+            AREA.y + title_bar_px(1.0),
             "终端区必须从标题条下沿开始,否则首行被标题条盖住"
         );
-        assert_eq!(on[0].term_px.h, AREA.h - TITLE_BAR_PX);
+        assert_eq!(on[0].term_px.h, AREA.h - title_bar_px(1.0));
     }
 
     /// F83 开关会改行数 → 必须重发 window_change(T4)。这条锁住「行数确实变了」,
     /// 免得后来有人把标题条画成 overlay(不占空间)却忘了同步改注释。
     #[test]
     fn title_bar_toggle_changes_rows_f83() {
-        let off = layout_geometry(&leaf(1), AREA, CELL, false);
-        let on = layout_geometry(&leaf(1), AREA, CELL, true);
+        let off = layout_geometry(&leaf(1), AREA, CELL, false, 1.0);
+        let on = layout_geometry(&leaf(1), AREA, CELL, true, 1.0);
         assert_eq!(off[0].grid, (80, 30));
         assert_eq!(on[0].grid, (80, 28), "600-32=568px / 20px = 28 行");
         assert_ne!(off[0].grid, on[0].grid);
@@ -221,7 +245,7 @@ mod tests {
             a: Box::new(hsplit(0.5, leaf(1), leaf(2))),
             b: Box::new(hsplit(0.5, leaf(3), leaf(4))),
         };
-        let g = layout_geometry(&tree, area, CELL, true);
+        let g = layout_geometry(&tree, area, CELL, true, 1.0);
         assert_eq!(g.len(), 4);
         let covered: u64 = g
             .iter()
@@ -288,7 +312,7 @@ mod tests {
             a: Box::new(hsplit(0.5, leaf(1), leaf(2))),
             b: Box::new(hsplit(0.5, leaf(3), leaf(4))),
         };
-        let g = layout_geometry(&tree, AREA, CELL, true);
+        let g = layout_geometry(&tree, AREA, CELL, true, 1.0);
         assert_eq!(g.len(), 4);
 
         assert_eq!(
@@ -425,8 +449,37 @@ mod tests {
             w: 4,
             h: 4,
         };
-        let g = layout_geometry(&leaf(1), tiny, CELL, true);
+        let g = layout_geometry(&leaf(1), tiny, CELL, true, 1.0);
         assert_eq!(g[0].title_px.h, 4, "标题条不能比 pane 还高");
         assert_eq!(g[0].grid, (1, 1));
+    }
+
+    /// ⑤:标题条高度是**逻辑点**,要随 DPI 缩放。
+    ///
+    /// 32 物理像素在 150% 缩放下只有 21.33 逻辑点,而标题条内容(上下各
+    /// 4 点边距 + 14 点图标)按逻辑点排 —— 内高 13.33 点装不下 14 点的图标,
+    /// 底部被 clip 掉(用户报的「图标底部被截断」)。
+    ///
+    /// 自证会变红:把 `title_bar_px` 改回 `|_| 32`。
+    #[test]
+    fn the_title_bar_is_thirty_two_logical_points_at_any_scale() {
+        assert_eq!(title_bar_px(1.0), 32);
+        assert_eq!(title_bar_px(1.25), 40);
+        assert_eq!(title_bar_px(1.5), 48);
+        assert_eq!(title_bar_px(2.0), 64);
+    }
+
+    /// 坏 ppp 不能把标题条算成 0 或天文数字:winit 在某些显示器热插拔的瞬间
+    /// 报过 0 / NaN 的 scale_factor(见 docs/gui-render-gotchas.md 的 wgpu
+    /// 尺寸 NaN 那条),算出 0 的话标题条整排消失、算出巨值的话终端区被挤成
+    /// 0 行,两者都不可恢复(下一帧的 ppp 正常了才回来)。
+    ///
+    /// 自证会变红:删掉 `title_bar_px` 里的 `is_finite() && > 0.0` 兜底。
+    #[test]
+    fn a_bogus_scale_factor_falls_back_to_one() {
+        assert_eq!(title_bar_px(0.0), 32);
+        assert_eq!(title_bar_px(-2.0), 32);
+        assert_eq!(title_bar_px(f32::NAN), 32);
+        assert_eq!(title_bar_px(f32::INFINITY), 32);
     }
 }

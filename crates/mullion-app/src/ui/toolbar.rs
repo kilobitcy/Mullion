@@ -16,7 +16,7 @@ use crate::theme::{self, Theme};
 // 项目里「px」有两种语义,判断依据是数据来源、不是变量名:egui 面板层(本文件、
 // `chrome.rs` 的菜单栏/状态栏)的设计 token 直接当逻辑点喂给 egui,不除
 // `pixels_per_point()`,因为它们的源头(`Mullion.dc.html` 原型)本就是 CSS px,
-// 该随系统缩放一起放大;而布局树 `geom.rs` 层(`TITLE_BAR_PX`/`GAP_PX`/
+// 该随系统缩放一起放大;而布局树 `geom.rs` 层(`TITLE_BAR_PT`/`GAP_PX`/
 // `PaneGeom.term_px`)算出来的是真物理像素,跨层喂给 egui(如 `pane_title.rs` 的
 // `fixed_pos`)才需要 `/ ppp`。这两层弄反一次:125%/150% 缩放下(Windows 最常见
 // 设置)按钮组会撑破菜单栏高度。

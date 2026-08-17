@@ -5,6 +5,7 @@
 pub mod emulator;
 pub mod keymap;
 pub mod palette;
+pub mod remote_state;
 pub mod selection;
 pub mod snapshot;
 

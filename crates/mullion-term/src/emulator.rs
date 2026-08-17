@@ -17,23 +17,41 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use vte::ansi::Processor;
 
 use crate::palette;
+use crate::remote_state::{parse_title, Osc7Sniffer, RemoteState};
 use crate::selection::{CellSide, SelectionKind};
 use crate::snapshot::{Cursor, GridSnapshot, Rgb, SnapCell};
 
-/// 收集 `Event::PtyWrite`——需要回写对端的字节。共享缓冲,Term 持一份克隆。
+/// 收集 `Term` 发出的事件。共享缓冲,`Term` 持一份克隆。
+///
+/// 三件事:
+/// - `Event::PtyWrite` —— 需要回写对端的字节(**T1 红线**,漏了就是同步输出
+///   探测无应答、全屏 TUI 闪、鼠标全废)。
+/// - `Event::Title` —— OSC 0/2 的窗口标题(⑥ 认 tmux 会话名那条腿)。
+/// - `Event::ResetTitle` —— 标题栈弹回「无标题」(`CSI 23 t` 弹栈,栈里那格
+///   是压栈时(`CSI 22 t`)记的旧值,vim 之类会用这对操作在启动/退出时
+///   切标题)。**不能落进 `_ => {}`**:漏了这条,`sink.title` 会一直留着
+///   上一条旧值,标题条上永久挂一个已经不存在的 tmux 会话名。
 #[derive(Clone, Default)]
-struct PtyWriteCollector {
+struct EventSink {
     buf: Arc<Mutex<Vec<u8>>>,
+    /// **只留最后一条**:标题是「当前值」,不是流水。
+    title: Arc<Mutex<Option<String>>>,
 }
 
-impl EventListener for PtyWriteCollector {
+impl EventListener for EventSink {
     fn send_event(&self, event: Event) {
-        // 只关心需要回写对端的字节;其余事件(标题、响铃等)骨架阶段先忽略。
-        if let Event::PtyWrite(text) = event {
-            self.buf
+        match event {
+            Event::PtyWrite(text) => self
+                .buf
                 .lock()
                 .expect("pty-write buffer poisoned")
-                .extend_from_slice(text.as_bytes());
+                .extend_from_slice(text.as_bytes()),
+            Event::Title(t) => *self.title.lock().expect("title slot poisoned") = Some(t),
+            Event::ResetTitle => {
+                *self.title.lock().expect("title slot poisoned") = Some(String::new())
+            }
+            // 其余事件(响铃、剪贴板……)本项目还不用。
+            _ => {}
         }
     }
 }
@@ -60,11 +78,15 @@ impl Dimensions for GridSize {
 
 /// 单个 pane 的 VT 仿真器:喂入字节 → 推进网格状态 + 攒出站回写。
 pub struct Emulator {
-    term: Term<PtyWriteCollector>,
+    term: Term<EventSink>,
     parser: Processor,
-    collector: PtyWriteCollector,
+    sink: EventSink,
     /// F80:可注入的默认前景/背景色。默认为出厂值,app 层挂主题后覆盖。
     defaults: palette::DefaultColors,
+    /// ⑥:OSC 7 嗅探器。alacritty 不解析 OSC 7,这条腿是我们自己的。
+    osc7: Osc7Sniffer,
+    /// ⑥:嗅探到的最新 cwd,等 `take_remote_state` 取走。
+    cwd: Option<Vec<u8>>,
 }
 
 impl Emulator {
@@ -87,23 +109,30 @@ impl Emulator {
     /// 极大值都不会立即 panic/OOM。但这里**不做合理性校验**,调用方(接配置文件时)
     /// 自己保证传入值合理。
     pub fn with_history(cols: u16, rows: u16, history: usize) -> Self {
-        let collector = PtyWriteCollector::default();
+        let sink = EventSink::default();
         let dims = GridSize { cols, rows };
         let config = Config {
             scrolling_history: history,
             ..Config::default()
         };
-        let term = Term::new(config, &dims, collector.clone());
+        let term = Term::new(config, &dims, sink.clone());
         Self {
             term,
             parser: Processor::new(),
-            collector,
+            sink,
             defaults: palette::DefaultColors::default(),
+            osc7: Osc7Sniffer::default(),
+            cwd: None,
         }
     }
 
     /// 喂入一段来自对端的字节,推进 VT 状态机(不节流,VT 状态机很快)。
     pub fn feed(&mut self, bytes: &[u8]) {
+        // ⑥:OSC 7 alacritty 不解析,我们自己扫一遍。两条腿互不影响,
+        // 放在 `advance` 之前只是让「先看一眼再交出去」读起来顺。
+        if let Some(cwd) = self.osc7.feed(bytes) {
+            self.cwd = Some(cwd);
+        }
         self.parser.advance(&mut self.term, bytes);
     }
 
@@ -140,13 +169,28 @@ impl Emulator {
 
     /// 取走并清空出站缓冲——这些字节必须回写 SSH channel(T1 红线)。
     pub fn take_pty_writes(&mut self) -> Vec<u8> {
-        std::mem::take(
-            &mut *self
-                .collector
-                .buf
-                .lock()
-                .expect("pty-write buffer poisoned"),
-        )
+        std::mem::take(&mut *self.sink.buf.lock().expect("pty-write buffer poisoned"))
+    }
+
+    /// ⑥:自上次调用以来远端报出的状态。`None` = 什么新东西都没有。
+    ///
+    /// **cwd 以 OSC 7 为准**,标题里的路径只在没有 OSC 7 时兜底:OSC 7 是
+    /// 路径本身,标题里那个是给人看的(带 `~` 缩写、可能被 shell 截断)。
+    ///
+    /// 「取走」语义(拿完清空)而不是「读」:调用方是每帧跑一次的
+    /// `Workspace::pump`,留着的话每帧都要把同一个值再算一遍(T3 那一类
+    /// 白烧 CPU)。
+    pub fn take_remote_state(&mut self) -> Option<RemoteState> {
+        let title = self.sink.title.lock().expect("title slot poisoned").take();
+        let cwd = self.cwd.take();
+        if title.is_none() && cwd.is_none() {
+            return None;
+        }
+        let mut out = title.as_deref().map(parse_title).unwrap_or_default();
+        if cwd.is_some() {
+            out.cwd = cwd;
+        }
+        Some(out)
     }
 
     /// 注入默认前景/背景色(F80 主题)。影响所有「未显式指定颜色」的格子,
@@ -717,6 +761,87 @@ mod tests {
             "回溯一行后顶行是 alpha,不该还高亮"
         );
         assert!(snap.row(1)[0].selected, "bravo 下移一行,高亮应跟着走");
+    }
+
+    /// ⑥:两条腿都要接上 —— OSC 7 给 cwd,OSC 2 给标题(tmux 名)。
+    ///
+    /// **T1 不能被这次改动碰坏**:`EventSink` 现在同时收 `PtyWrite` 和
+    /// `Title`,`match` 写歪一个分支就会把回写字节吞掉(现象见 T1:同步输出
+    /// 探测无应答、全屏 TUI 闪、鼠标全废)。所以这条测试同时验一遍回写。
+    ///
+    /// 自证会变红:把 `feed` 里的 `osc7.feed(bytes)` 那段删掉(cwd 断言红);
+    /// 把 `EventSink` 的 `Event::Title` 分支删掉(tmux 断言红)。
+    #[test]
+    fn osc_reports_land_in_the_remote_state() {
+        let mut emu = Emulator::new(80, 24);
+        assert_eq!(emu.take_remote_state(), None, "什么都没收到时不该有状态");
+
+        emu.feed(b"\x1b]7;file://h/home/dev/Mullion\x07");
+        emu.feed(b"\x1b]2;main:0:bash\x07");
+        let st = emu.take_remote_state().expect("该收到远端状态");
+        assert_eq!(st.cwd.as_deref(), Some(&b"/home/dev/Mullion"[..]));
+        assert_eq!(st.tmux.as_deref(), Some("main"));
+        assert!(st.title_seen);
+
+        assert_eq!(emu.take_remote_state(), None, "take 之后应清空");
+    }
+
+    /// **OSC 7 压过标题里的路径**:OSC 7 是路径本身,标题里那个是给人看的
+    /// (带 `~` 缩写、可能被 shell 截断)。反过来的话 ② 会拿一个 `~/x` 去
+    /// 当 SFTP 起始目录,而 sftp-server 不展开 `~`。
+    ///
+    /// 自证会变红:把 `take_remote_state` 里的覆盖顺序倒过来,即
+    /// `out.cwd = out.cwd.take().or(cwd);`(让标题里的路径压过 OSC 7)。
+    #[test]
+    fn osc7_wins_over_the_path_inside_the_title() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"\x1b]2;dev@h: ~/Mullion\x07");
+        emu.feed(b"\x1b]7;file://h/home/dev/Mullion\x07");
+        let st = emu.take_remote_state().expect("该收到远端状态");
+        assert_eq!(st.cwd.as_deref(), Some(&b"/home/dev/Mullion"[..]));
+    }
+
+    /// 只来了 OSC 7、没来标题时 `title_seen == false` —— 调用方靠它决定
+    /// 「要不要按这批数据重置 tmux 名」。恒 `true` 的话每次目录变化都会把
+    /// tmux 会话名清掉(用户在 tmux 里 `cd` 一下,会话名就消失了)。
+    ///
+    /// 自证会变红:在 `take_remote_state` 里 `Some(out)` 之前插一行
+    /// `out.title_seen = true;`。
+    #[test]
+    fn a_cwd_only_batch_does_not_claim_a_title_was_seen() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"\x1b]7;file://h/tmp\x07");
+        let st = emu.take_remote_state().expect("该收到远端状态");
+        assert!(!st.title_seen, "没收到标题却说收到了");
+        assert_eq!(st.tmux, None);
+    }
+
+    /// 标题栈弹回「无标题」必须把 `tmux` 清掉,否则用户退出用了标题栈的程序
+    /// (vim 之类,进入时 `CSI 22 t` 压栈存旧标题、退出时 `CSI 23 t` 弹栈还原)
+    /// 之后,标题条上会永久挂一个已经不存在的 tmux 会话名。
+    ///
+    /// 走的是真实字节路径,不是直接构造 `Event`:先 `CSI 22 t` 压栈
+    /// (此时 alacritty 内部标题还是初始的 `None`,压的就是这个 `None`),
+    /// 再用 OSC 2 把标题设成 tmux 名,最后 `CSI 23 t` 弹栈——弹回的正是
+    /// 压栈时记的那个 `None`,`alacritty_terminal` 0.26 的 `pop_title` 会
+    /// 据此调 `set_title(None)`,发出 `Event::ResetTitle`(已读
+    /// `alacritty_terminal-0.26.0/src/term/mod.rs` 的 `push_title`/`pop_title`
+    /// /`set_title` 源码确认;CSI 参数见 `vte-0.15.0/src/ansi.rs` 的
+    /// `('t', []) => match … { 22 => push_title, 23 => pop_title }`)。
+    ///
+    /// 自证会变红:把 `EventSink` 的 `Event::ResetTitle` 分支删掉。
+    #[test]
+    fn a_title_stack_pop_clears_the_stale_tmux_name() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"\x1b[22t"); // CSI 22 t:压栈,存的是当前(空)标题
+        emu.feed(b"\x1b]2;main:0:bash\x07"); // OSC 2:设标题,带 tmux 会话名
+        let st = emu.take_remote_state().expect("该收到远端状态");
+        assert_eq!(st.tmux.as_deref(), Some("main"));
+
+        emu.feed(b"\x1b[23t"); // CSI 23 t:弹栈,还原成压栈时的空标题
+        let st = emu.take_remote_state().expect("弹栈也是一次新状态");
+        assert!(st.title_seen);
+        assert_eq!(st.tmux, None, "弹回空标题后,旧的 tmux 会话名必须被清掉");
     }
 
     /// F80:注入的默认色必须真的穿透 resolve 到达 snapshot。

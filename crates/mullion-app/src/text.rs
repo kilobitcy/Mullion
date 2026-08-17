@@ -251,7 +251,7 @@ impl TextLayer {
         res: Resolution,
     ) -> Result<(), glyphon::PrepareError> {
         self.viewport.update(queue, res);
-        let metrics = Metrics::new(self.cell_h * 0.8, self.cell_h);
+        let metrics = grid_metrics(self.font_px, self.cell_h);
 
         // 第一遍:填 buffer(要先全部填完,才能借它们建 TextArea)。
         // 每个 buffer 对应一个 `RowRun`,`placements` 记它该落在哪(第二遍用)。
@@ -359,6 +359,18 @@ impl TextLayer {
     }
 }
 
+/// 终端网格的排版度量。**唯一来源** —— 量 `cell_w` 的那次和真正排版的那次
+/// 必须用同一个 `Metrics`。
+///
+/// 曾经不同源:排版用 `Metrics::new(cell_h * 0.8, cell_h)`,而 `cell_w` 是按
+/// `Metrics::new(font_px, cell_h)` 量的。`cell_h = ceil(font_px * 1.25)`,
+/// 两者只在 `font_px * 1.25` 恰好是整数时相等 —— 10pt@150% 相等、10pt@100%
+/// 差 2%,一行 60 列漂出 1.2 格,字压字。守护:
+/// `the_font_size_used_for_layout_is_the_one_cell_w_was_measured_with`。
+fn grid_metrics(font_px: f32, cell_h: f32) -> Metrics {
+    Metrics::new(font_px, cell_h)
+}
+
 /// 用 'M' 估等宽字符宽度。核对 cosmic-text 0.12 的 LayoutRun / glyph 结构后取宽度。
 fn measure_cell_w(fs: &mut FontSystem, font_px: f32, line_h: f32, family: Option<&str>) -> f32 {
     measure_advance(fs, font_px, line_h, family, 'M')
@@ -374,7 +386,7 @@ fn measure_advance(
     ch: char,
 ) -> f32 {
     let name = family.unwrap_or(DEFAULT_FONT_FAMILY);
-    let mut buf = Buffer::new(fs, Metrics::new(font_px, line_h));
+    let mut buf = Buffer::new(fs, grid_metrics(font_px, line_h));
     buf.set_text(
         fs,
         &ch.to_string(),
@@ -624,5 +636,98 @@ mod tests {
             h: 0,
         });
         assert!(r >= l && b >= t, "left/top 必须不大于 right/bottom");
+    }
+
+    /// ①:**排版用的字号必须与量 `cell_w` 用的字号是同一个**。
+    ///
+    /// 不同源的话每格都差一点点,一行 60 列累计成整格,后面的字直接压到前面
+    /// 的字上(用户报的现象:`.md` 和 `12 条` 重叠)。而且 `cell_h * 0.8`
+    /// 与 `font_px` 在 `font_px * 1.25` 是整数时**恰好相等**,所以这个 bug
+    /// 只在部分「字号 × 缩放」组合下出现 —— 必须遍历几组才盯得住。
+    ///
+    /// 判据是「60 个 `M` 的实际 advance == 60 × cell_w」,容差 0.5px:
+    /// 半个像素以内人眼看不出,超过就是会累积的系统偏差。
+    ///
+    /// 这条位移断言守的是端到端不漂,但它依赖的 `cell_w` 和排版 buffer
+    /// **现在都经过同一个 `grid_metrics` 调用**——两边同源之后,把
+    /// `grid_metrics` 内部公式改坏是「两处一起坏但仍互相自洽」,cosmic-text
+    /// 对同字符重复排版天然线性(60 × 单字宽度),这条断言对 `grid_metrics`
+    /// 内部改动**不敏感**,恒绿。真正钉死 `grid_metrics` 契约的是下面那对
+    /// `assert_eq!`:自证会变红,把 `grid_metrics` 的第一个参数改回
+    /// `cell_h * 0.8`。位移断言本身仍然留着,它守的是另一件事——
+    /// 「cosmic-text 排同一字符是线性的」这个前提,不能删。
+    #[test]
+    fn the_font_size_used_for_layout_is_the_one_cell_w_was_measured_with() {
+        let mut fs = FontSystem::new();
+        for pt in [10.0_f32, 11.0, 13.0] {
+            for scale in [1.0_f32, 1.25, 1.5] {
+                let font_px = pt * scale * 96.0 / 72.0;
+                let cell_h = (font_px * 1.25).ceil();
+
+                // 契约断言:排版字号就是量 cell_w 用的 font_px 本身,不是任何
+                // 由 cell_h 反推出来的近似值(原 bug 就是 `cell_h * 0.8`)。
+                let m = grid_metrics(font_px, cell_h);
+                assert_eq!(
+                    m.font_size, font_px,
+                    "pt={pt} scale={scale}: 排版字号不是 font_px 本身"
+                );
+                assert_eq!(
+                    m.line_height, cell_h,
+                    "pt={pt} scale={scale}: 行高不是 cell_h"
+                );
+
+                let cell_w = measure_cell_w(&mut fs, font_px, cell_h, None);
+
+                const COLS: usize = 60;
+                let mut buf = Buffer::new(&mut fs, grid_metrics(font_px, cell_h));
+                buf.set_text(
+                    &mut fs,
+                    &"M".repeat(COLS),
+                    Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY)),
+                    Shaping::Advanced,
+                );
+                buf.shape_until_scroll(&mut fs, false);
+                let laid = buf
+                    .layout_runs()
+                    .next()
+                    .and_then(|run| run.glyphs.last().map(|g| g.x + g.w))
+                    .expect("60 个 M 应该排出一行");
+
+                let want = cell_w * COLS as f32;
+                assert!(
+                    (laid - want).abs() < 0.5,
+                    "pt={pt} scale={scale}: 排版排出 {laid:.2}px,按 cell_w \
+                     算应是 {want:.2}px,偏了 {:.2}px({:.2} 格)—— 排版字号\
+                     与量 cell_w 的字号不同源",
+                    laid - want,
+                    (laid - want) / cell_w
+                );
+            }
+        }
+    }
+
+    /// ①:`Metrics::new` 在本文件里只许出现一次 —— 就是 `grid_metrics` 内部
+    /// 那一次。
+    ///
+    /// 上面那条测试有个盲区:它验不到 `prepare_panes`(那需要真实 wgpu
+    /// Device/Queue,这一层跑不起来)。所以「排版那一处有没有绕过唯一来源」
+    /// 只能从源码上扎。将来若有人在 `prepare_panes` 里重新手写一个
+    /// `Metrics::new(...)`,文字重叠会原样复发,而端到端只有人眼看得出来。
+    ///
+    /// 针在运行时拼:写成字面量的话这条测试自己的源码就会匹配上自己,恒绿。
+    #[test]
+    fn only_grid_metrics_constructs_the_grid_metrics() {
+        let needle = concat!("Metrics", "::new(");
+        let n = include_str!("text.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("///"))
+            .filter(|l| l.contains(needle))
+            .count();
+        assert_eq!(
+            n, 1,
+            "text.rs 里构造 Metrics 的代码行出现了 {n} 次,应该只有 \
+             `grid_metrics` 内部那一次 —— 别的地方直接构造 Metrics 就绕开了\
+             唯一来源,排版字号和 cell_w 会再次不同源"
+        );
     }
 }

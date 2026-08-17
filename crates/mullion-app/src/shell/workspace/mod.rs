@@ -6,7 +6,7 @@
 pub mod geom;
 pub mod preset;
 
-pub use geom::{layout_geometry, PaneGeom, PxRect, GAP_PX, TITLE_BAR_PX};
+pub use geom::{layout_geometry, title_bar_px, PaneGeom, PxRect, GAP_PX, TITLE_BAR_PT};
 pub use preset::{icon_cells, next_focus, plan_preset, preset_tree, Preset, PresetPlan};
 
 /// pane 的连接状态(§6.3)。断开的 pane 内容保留、可滚可复制,只是不再收发。
@@ -98,6 +98,15 @@ pub struct PaneState {
     /// 上次发出去的 (cols, rows)。F34 只在这个值变化时才发 window_change ——
     /// 每帧无脑发会把远端 SIGWINCH 刷爆,tmux 里的 TUI 不停重排。
     pub last_grid: (u16, u16),
+    /// ⑥:远端报出来的当前目录(字节,见 `RemoteState::cwd`)。
+    /// `None` = 远端没报过(裸 shell 不设标题、或 tmux 没开 `set-titles`)。
+    /// **只增不清**:拿不到新值时保留上一个已知值,比闪成「未知」有用。
+    pub cwd: Option<Vec<u8>>,
+    /// ⑥:tmux 会话名。`None` = 不在 tmux 里(或远端没开 `set-titles`)。
+    /// 与 `cwd` 不同,**收到新标题就整体重置** —— 用户退出 tmux 之后 bash 会
+    /// 发自己的标题,这时必须把会话名清掉,否则标题条上会永久挂着一个已经
+    /// 不存在的会话名。
+    pub tmux: Option<String>,
 }
 
 /// 多 pane 工作区:布局树 + 每 pane 状态 + 主机连接池。
@@ -306,6 +315,19 @@ impl Workspace {
                     }
                 }
             }
+            // ⑥:远端状态。**必须在 `inbound.is_empty()` 的 `continue` 之前**——
+            // OSC 字节喂进 `emulator` 的路径不止「这一帧从 rx 收到新字节」这一条
+            // (比如测试直接调 `emulator.feed`),放在 `continue` 之后会让这些
+            // 情形永远收集不到。两个字段的重置策略不同,见 `PaneState::cwd` /
+            // `::tmux` 的文档。
+            if let Some(st) = p.emulator.take_remote_state() {
+                if let Some(cwd) = st.cwd {
+                    p.cwd = Some(cwd);
+                }
+                if st.title_seen {
+                    p.tmux = st.tmux;
+                }
+            }
             if inbound.is_empty() {
                 continue;
             }
@@ -444,6 +466,8 @@ mod tests {
                 status: PaneStatus::Live,
                 saw_first_byte: false,
                 last_grid: (80, 24),
+                cwd: None,
+                tmux: None,
             },
             Probe {
                 writes: probe_writes,
@@ -860,6 +884,93 @@ mod tests {
             mullion_core::layout::leaves(ws.tree()),
             vec![PaneId(1)],
             "失败时树不该被动"
+        );
+    }
+
+    /// ⑥:远端报出来的 cwd / tmux 名要落到 `PaneState` 上。
+    ///
+    /// **两个字段的更新策略不同**,一条测试同时钉住:
+    /// - `cwd` 只增不清:拿不到新值时保留上一个已知值(比闪成「未知」有用)。
+    /// - `tmux` 收到新标题就整体重置,**包括重置成 `None`** —— 用户退出 tmux
+    ///   之后 bash 会发自己的标题,这时必须把会话名清掉,否则标题条上会永久
+    ///   挂着一个已经不存在的会话名。
+    ///
+    /// 自证会变红:把 `pump` 里 `if st.title_seen { p.tmux = st.tmux }` 改成
+    /// `if let Some(t) = st.tmux { p.tmux = Some(t) }`(第三段红);把
+    /// `if let Some(cwd) = st.cwd` 改成无条件 `p.cwd = st.cwd`(第四段红 ——
+    /// 第二、三段里 `st.cwd` 恒 `Some`:段 2 走 OSC 7,段 3 的标题
+    /// `dev@h: /tmp` 本身带路径,`parse_title` 会兜底解出来,所以这两段验
+    /// 不出这个变异;第四段的标题 `plain:0:bash` 不含任何路径 token,
+    /// `st.cwd` 才真的是 `None`,专门冲着「只增不清」去)。
+    #[test]
+    fn remote_state_lands_on_the_pane_with_the_right_reset_policy() {
+        let (first, _probe) = fake_pane(1);
+        let mut ws = Workspace::new(first, 0);
+        let id = PaneId(1);
+
+        // 1. tmux 里,报了目录
+        ws.pane_mut(id)
+            .unwrap()
+            .emulator
+            .feed(b"\x1b]2;work:0:bash\x07");
+        ws.pane_mut(id)
+            .unwrap()
+            .emulator
+            .feed(b"\x1b]7;file://h/home/dev/Mullion\x07");
+        ws.pump(0);
+        assert_eq!(
+            ws.pane(id).unwrap().cwd.as_deref(),
+            Some(&b"/home/dev/Mullion"[..])
+        );
+        assert_eq!(ws.pane(id).unwrap().tmux.as_deref(), Some("work"));
+
+        // 2. 只报了新目录 —— tmux 名不该被这一批清掉
+        ws.pane_mut(id)
+            .unwrap()
+            .emulator
+            .feed(b"\x1b]7;file://h/tmp\x07");
+        ws.pump(0);
+        assert_eq!(ws.pane(id).unwrap().cwd.as_deref(), Some(&b"/tmp"[..]));
+        assert_eq!(
+            ws.pane(id).unwrap().tmux.as_deref(),
+            Some("work"),
+            "只报目录不该把 tmux 名清掉"
+        );
+
+        // 3. 退出 tmux,bash 发自己的标题 —— 会话名必须清掉,cwd 留着
+        ws.pane_mut(id)
+            .unwrap()
+            .emulator
+            .feed(b"\x1b]2;dev@h: /tmp\x07");
+        ws.pump(0);
+        assert_eq!(
+            ws.pane(id).unwrap().tmux,
+            None,
+            "退出 tmux 之后会话名还挂着"
+        );
+        assert_eq!(
+            ws.pane(id).unwrap().cwd.as_deref(),
+            Some(&b"/tmp"[..]),
+            "cwd 不该被标题批次清掉"
+        );
+
+        // 4. 换了个新 tmux 会话,但这条标题里没有任何路径 token(`parse_title`
+        // 给出 cwd: None)—— 这一段专门钉「cwd 只增不清」:st.cwd 是 None,
+        // p.cwd 必须原样保留上一个已知值,不能被这一批清掉。
+        ws.pane_mut(id)
+            .unwrap()
+            .emulator
+            .feed(b"\x1b]2;plain:0:bash\x07");
+        ws.pump(0);
+        assert_eq!(
+            ws.pane(id).unwrap().cwd.as_deref(),
+            Some(&b"/tmp"[..]),
+            "st.cwd 是 None 时 p.cwd 必须保留上一个已知值(只增不清)"
+        );
+        assert_eq!(
+            ws.pane(id).unwrap().tmux.as_deref(),
+            Some("plain"),
+            "标题批次仍要整体重置 tmux"
         );
     }
 }

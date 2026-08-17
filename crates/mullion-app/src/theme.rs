@@ -36,6 +36,14 @@ pub struct Theme {
     pub sunken_bg: Rgb,
     /// 描边不透明度。描边色恒为白,只调 alpha(§2.1 的 rgba(255,255,255,0.06))。
     pub stroke_alpha: u8,
+    /// ③ F80:分屏之间那 1 物理像素分界线的颜色。
+    ///
+    /// **F80 冻结色表里没有这一项**,因为当时根本没画分界线 —— 这是新增项,
+    /// 不是改既有值。为什么不复用 `stroke`(白 6%):`stroke` 是画在
+    /// `panel_bg` 上的边框,分界线画在 `term_bg` 上、只有 1 物理像素宽,
+    /// 6% 的白在那个条件下看不见。守护:
+    /// `the_divider_is_visible_but_not_loud_against_the_terminal_background`。
+    pub divider: Rgb,
 
     // --- 前景灰阶(§2.2) ---
     pub fg: Rgb,
@@ -87,6 +95,7 @@ pub const MULLION_DARK: Theme = Theme {
     panel_head: Rgb::new(0x19, 0x1c, 0x27),
     sunken_bg: Rgb::new(0x0e, 0x10, 0x18),
     stroke_alpha: 15, // 0.06 × 255 ≈ 15
+    divider: Rgb::new(0x28, 0x2b, 0x38),
 
     fg: Rgb::new(0xe4, 0xe6, 0xf0),
     fg_strong: Rgb::new(0xd3, 0xd6, 0xea),
@@ -559,5 +568,31 @@ mod tests {
             "RichText 没带颜色 = 走 egui fallback = 对比度原样偏低"
         );
         assert_eq!(color, c32(MULLION_DARK.fg_dimmer));
+    }
+
+    /// ③:分界线要「不干扰视觉重点,但也不能忽略」。
+    ///
+    /// **不能退回 `theme::stroke`**(白 6%):1 物理像素的 6% 白叠在
+    /// `term_bg #14161f` 上只抬约 14/255,深色屏 + 1px 宽下基本看不见 ——
+    /// 那就成了「可以忽略」,正好是用户明确否掉的一头。
+    /// 也不能太亮:比终端底色抬超过 64/255 就成了一条抢眼的白线。
+    ///
+    /// 自证会变红:把 `divider` 改成与 `term_bg` 同值(下界红);
+    /// 改成 `#ffffff`(上界红)。
+    #[test]
+    fn the_divider_is_visible_but_not_loud_against_the_terminal_background() {
+        let t = MULLION_DARK;
+        for (name, a, b) in [
+            ("r", t.divider.r, t.term_bg.r),
+            ("g", t.divider.g, t.term_bg.g),
+            ("b", t.divider.b, t.term_bg.b),
+        ] {
+            let lift = i32::from(a) - i32::from(b);
+            assert!(
+                (16..=64).contains(&lift),
+                "divider 的 {name} 通道比 term_bg 抬了 {lift}/255,该落在 16..=64:\
+                 低于 16 眼睛看不见(等于没画),高于 64 是一条抢眼的白线"
+            );
+        }
     }
 }

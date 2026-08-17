@@ -531,6 +531,14 @@ impl TabContent {
         }
     }
 
+    /// ②:这个标签焦点 pane 报出来的当前目录。SFTP 节点标签/占位标签没有
+    /// 终端,恒 `None`。
+    fn focused_pane_cwd(&self) -> Option<Vec<u8>> {
+        self.as_terminal()
+            .and_then(|t| t.ws.focused())
+            .and_then(|p| p.cwd.clone())
+    }
+
     /// D6:这个标签的 sftp 该蹭哪条连接。`Terminal` 蹭会话已建立的连接
     /// (`ws.hosts.first()`,ADR-009 下今天恒为其一);`Files` 独占自己的
     /// (`establish` 来的那条,ADR-010 同款理由)。`Terminal` 分支理论上可能是
@@ -1248,6 +1256,17 @@ pub struct App {
     /// 两个独立脏源,`frame::frame_is_dirty` 取并集——只看终端字节的话,远端一安静
     /// egui 的交互就被 `RedrawAction::Idle` 吞掉,菜单点不开。
     ui_dirty: bool,
+    /// ②:上一帧结束时侧栏的开合状态,用来判「关→开」跃迁。
+    ///
+    /// **不能是 `render_frame` 调用前的帧内局部变量**:侧栏开关有两条路——
+    /// 菜单(`chrome.rs`)在 `render_frame` **内部**改
+    /// `self.ui.files_sidebar_open`,帧内局部变量能测出跃迁;但热键
+    /// (`files_hotkey_event`,由 `window_event` 在**另一次事件回调**里调用)
+    /// 在 `render_frame` 之外改这个标志——等下一次重绘跑到帧内局部变量赋值
+    /// 那一行时,标志早就已经是 `true` 了,`open && !was_open` 恒假,
+    /// Ctrl+Shift+B 开侧栏就永远同步不到焦点 pane 的目录。跨帧字段 + 判据
+    /// 放在 `render_frame` 调用之后,两条路径才都覆盖得到。
+    files_sidebar_was_open: bool,
     /// 指针最近一次的物理像素坐标。`MouseWheel` 事件本身不带坐标,鼠标上报
     /// (F17 alt screen 档)要的 (col,row) 只能靠 `CursorMoved` 记着。
     cursor_px: (f32, f32),
@@ -1490,6 +1509,7 @@ impl App {
             icon_picker_busy: false,
             import_picker_busy: false,
             ui_dirty: true, // 首帧必须画出来
+            files_sidebar_was_open: false,
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
             last_saved_layout: None,
@@ -2223,6 +2243,31 @@ impl App {
         self.ui.files_sidebar_open = !self.ui.files_sidebar_open;
         self.request_ui_redraw();
         true
+    }
+
+    /// ②:把远端栏带到焦点 pane 报出来的目录。
+    ///
+    /// 两种情形:
+    /// - sftp 还没开(`sftp_client()` 是 `None`):什么都不用做 ——
+    ///   `trigger_sftp_open` 稍后自己会读焦点 pane 的 cwd 定起始目录。
+    /// - 已经开着:走一次普通的 `Goto`,与用户手点目录**同一条路径** ——
+    ///   不新开第二条加载/错误处理逻辑。
+    ///
+    /// 拿不到绝对路径就什么都不做(面板停在原处),不猜 —— 见
+    /// [`files_start_dir`]。
+    ///
+    /// 判定核心在 [`sync_target_of`]:这里只管取数据(世代 / 属主标签 /
+    /// sftp client / 焦点 pane 的 cwd)、调用、按结果派发。
+    fn sync_files_to_focused_pane(&mut self) {
+        let gen = self.files_owner_generation();
+        let tab = gen.and_then(|g| self.tabs.by_generation(g));
+        let has_client = tab.is_some_and(|t| t.content.sftp_client().is_some());
+        let pane_cwd = tab.and_then(|t| t.content.focused_pane_cwd());
+        let Some((gen, dir)) = sync_target_of(gen, has_client, pane_cwd.as_deref()) else {
+            return;
+        };
+        let target = mullion_ssh::sftp::RemotePath::from_bytes(dir.into_bytes());
+        self.apply_remote_file_action(gen, crate::ui::files_panel::FileAction::Goto(target));
     }
 
     /// F6/设计 D23:在终端与文件面板之间切换键盘焦点。**独立于**
@@ -3422,16 +3467,13 @@ impl App {
             return;
         };
         let default_remote = tab.content.sftp_default_remote();
+        // ②:优先开在这个标签焦点 pane 报出来的目录。
+        let pane_cwd = tab.content.focused_pane_cwd();
+        let start_dir = files_start_dir(pane_cwd.as_deref(), default_remote.as_deref());
         if let Some(files) = tab.content.files_panel_mut() {
             files.remote.load = crate::files::state::Load::Loading;
         }
-        let task = spawn_sftp_open(
-            &self._runtime,
-            &self.proxy,
-            generation,
-            conn,
-            default_remote,
-        );
+        let task = spawn_sftp_open(&self._runtime, &self.proxy, generation, conn, start_dir);
         self.track_sftp_task(generation, task);
     }
 
@@ -3636,6 +3678,7 @@ impl App {
             area,
             (a.text.cell_w, a.text.cell_h),
             ws.title_bars,
+            a.window.scale_factor() as f32,
         )
     }
 
@@ -4867,6 +4910,8 @@ impl ApplicationHandler<UserEvent> for App {
                         // 故意给一个不可能的初值:下一帧 apply_geometry 必然发一次
                         // window_change,真实列/行数才知道(T4)。
                         last_grid: (0, 0),
+                        cwd: None,
+                        tmux: None,
                     },
                     generation,
                 );
@@ -5008,6 +5053,8 @@ impl ApplicationHandler<UserEvent> for App {
                             status: crate::shell::workspace::PaneStatus::Live,
                             saw_first_byte: false,
                             last_grid: (0, 0),
+                            cwd: None,
+                            tmux: None,
                         });
                     } else {
                         // 让 ssh/rx 在这个分支结束时自然 Drop——Drop 会关掉这条
@@ -5968,6 +6015,14 @@ impl ApplicationHandler<UserEvent> for App {
                                                     .and_then(|p| ws.hosts.get(p.host_ix))
                                                     .and_then(|h| h.session_id)
                                                     .and_then(|sid| self.appearance.get(sid)),
+                                                // ⑥:远端报出来的目录 / tmux 名。
+                                                // 拿不到就是 `None` —— 不显示,
+                                                // 不猜。
+                                                cwd_leaf: ws
+                                                    .pane(g.id)
+                                                    .and_then(|p| p.cwd.as_deref())
+                                                    .and_then(crate::ui::pane_title::dir_leaf),
+                                                tmux: ws.pane(g.id).and_then(|p| p.tmux.as_deref()),
                                             })
                                             .collect()
                                     })
@@ -6142,6 +6197,14 @@ impl ApplicationHandler<UserEvent> for App {
                                     *files = pf;
                                 }
                             }
+
+                            // ②:侧栏「关→开」跃迁才同步一次。一直跟着焦点
+                            // pane 走的话,用户在面板里点开的目录会被反复
+                            // 拽回终端所在目录,完全没法浏览。
+                            if self.ui.files_sidebar_open && !self.files_sidebar_was_open {
+                                self.sync_files_to_focused_pane();
+                            }
+                            self.files_sidebar_was_open = self.ui.files_sidebar_open;
 
                             self.limiter.record_present(now);
                             // egui 侧已画出;下面若 egui 又要一帧会重新置脏。
@@ -6999,7 +7062,62 @@ fn rehost_pane(
     // 新开的 channel 是 80x24,不发的话远端按 80x24 排版。
     p.saw_first_byte = false;
     p.last_grid = (0, 0);
+    // ⑥:`cwd`/`tmux` 同 `emulator` 一个道理——旧值是上一台机器嗅出来的
+    // (OSC 7 目录 / 窗口标题里的 tmux 会话名),留着会在标题条右区挂一条
+    // 「看起来对、其实属于上一台机器」的过期标注,而且 `cwd` 是"只增不清"
+    // 语义(见字段注释),不会被新机器的输出自然覆盖掉一个空值,必须在这里
+    // 主动清空。
+    p.cwd = None;
+    p.tmux = None;
     true
+}
+
+/// ② 文件面板远端栏该开在哪。
+///
+/// 优先级:焦点 pane 报出来的当前目录 > F120 配置的默认远端目录 > `None`
+/// (交给 [`configured_remote_dir`] 落回 `"."`,也就是登录目录)。
+///
+/// **只接受绝对路径**:标题里拿到的可能是 `~/Mullion`,而 openssh 的
+/// `sftp-server` **不展开 `~`** —— 直接拿去 `canonicalize` 会失败,面板会停在
+/// 「取不到登录目录」,比不继承更糟。非 UTF-8 的远端路径同样落回配置值
+/// (`spawn_sftp_open` 收 `Option<String>`);标题条那边仍会 lossy 显示,
+/// 见 `pane_title::dir_leaf`。
+fn files_start_dir(pane_cwd: Option<&[u8]>, default_remote: Option<&str>) -> Option<String> {
+    let from_pane = pane_cwd
+        .filter(|c| c.starts_with(b"/"))
+        .and_then(|c| String::from_utf8(c.to_vec()).ok());
+    from_pane.or_else(|| default_remote.map(str::to_string))
+}
+
+/// `App::sync_files_to_focused_pane` 的纯逻辑核心。原来那四个早退(有没有
+/// 属主世代 / sftp 是否已连 / 焦点 pane 有没有报出绝对路径)全埋在
+/// `&mut self` 方法体里,完全靠人读代码——顺序换掉,或者把 `has_client`
+/// 判断写反,都不会有任何测试变红。按本文件其余 `_of` 函数的惯例抽出来,
+/// 方法体只留取数据 + 调用 + 派发。
+///
+/// 不接第四个「配置的默认远端目录」参数(`files_start_dir` 第二参在调用点
+/// 固定传 `None`):面板已经开着了,拿不到 pane 目录时退回配置值会把用户
+/// 当前的导航位置拽走,宁可什么都不做——这是 `sync_files_to_focused_pane`
+/// 与 `trigger_sftp_open`(会传 `default_remote` 兜底)刻意不同的地方。
+///
+/// 返回 `String` 而不是 `mullion_ssh::sftp::RemotePath`:后者的构造在
+/// `mullion-ssh`,这里保持零依赖更好测;调用方自己转。返回 `None` = 这一次
+/// 不同步(面板停在原处)。
+fn sync_target_of(
+    gen: Option<u64>,
+    has_client: bool,
+    pane_cwd: Option<&[u8]>,
+) -> Option<(u64, String)> {
+    let gen = gen?;
+    if !has_client {
+        // sftp 还没开:`trigger_sftp_open` 稍后自己会读焦点 pane 的 cwd 定
+        // 起始目录,这里现在发 Goto 只会打到一条还不存在的连接上。
+        return None;
+    }
+    // 第二参固定 `None`:面板已经开着了,退回配置的默认远端目录会把用户
+    // 当前的导航位置拽走——拿不到 pane 目录就宁可什么都不做。
+    let dir = files_start_dir(pane_cwd, None)?;
+    Some((gen, dir))
 }
 
 /// F120:`spawn_sftp_open` 该从哪个目录起步——配置了默认远端目录(编辑器
@@ -7731,10 +7849,10 @@ mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         autoscroll_for_pane, credential_delete_error, download_job, effective_focus_of,
-        files_owner_generation_of, finish_password_change, font_px_for, has_real_action,
-        ime_cursor_area, next_panel_selection_index, pane_still_wanted, rehost_pane,
-        snapshot_tabs_of, sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal,
-        RestoredTab, Tab, TabContent, TerminalTab,
+        files_owner_generation_of, files_start_dir, finish_password_change, font_px_for,
+        has_real_action, ime_cursor_area, next_panel_selection_index, pane_still_wanted,
+        rehost_pane, snapshot_tabs_of, sync_target_of, sync_timeout_wake_at, tab_title, upload_job,
+        wind_down, Modal, RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -7883,8 +8001,8 @@ mod tests {
             w: 1600,
             h: 900,
         };
-        let small = layout_geometry(&tree, area, (10.0, 20.0), false)[0].grid;
-        let big = layout_geometry(&tree, area, (20.0, 40.0), false)[0].grid;
+        let small = layout_geometry(&tree, area, (10.0, 20.0), false, 1.0)[0].grid;
+        let big = layout_geometry(&tree, area, (20.0, 40.0), false, 1.0)[0].grid;
         assert!(
             big.0 < small.0 && big.1 < small.1,
             "字元从 10x20 放大到 20x40,远端却被告知 {big:?}(原 {small:?})——\
@@ -8458,7 +8576,7 @@ mod tests {
             w: 1600,
             h: 900,
         };
-        let geoms = layout_geometry(&tree, area, (10.0, 20.0), true);
+        let geoms = layout_geometry(&tree, area, (10.0, 20.0), true, 1.0);
         assert_eq!(geoms.len(), 2);
         for g in &geoms {
             assert!(
@@ -8509,6 +8627,8 @@ mod tests {
             status: crate::shell::workspace::PaneStatus::Live,
             saw_first_byte: false,
             last_grid: (80, 24),
+            cwd: None,
+            tmux: None,
         }
     }
 
@@ -8857,15 +8977,17 @@ mod tests {
 
     /// 用户报的问题 2:分屏出来的 pane 要能换到别的节点。
     ///
-    /// 三条断言各挡一类静默错误:
+    /// 每条断言各挡一类静默错误:
     /// - `host_ix` 没跟着改 → 键盘输入照旧写进**上一台**机器(屏幕上却是新机器
     ///   的提示符,用户完全看不出来)。
     /// - 沿用旧 `emulator` → 往上一翻是上一台机器的输出,同样"看起来对"。
     /// - `last_grid` 不复位 → 下一帧的 `apply_geometry` 认为尺寸没变、不发
     ///   `window_change`,新 channel 就一直按 80x24 排版(T4)。
+    /// - `cwd`/`tmux` 不清空 → 标题条右区继续显示上一台机器嗅出来的目录/
+    ///   tmux 会话名,换到新机器后仍然挂着,是一条过期的错误标注。
     ///
     /// 自证会变红:把 `rehost_pane` 里 `p.host_ix` / `p.emulator` / `p.last_grid`
-    /// 任意一句赋值删掉。
+    /// / `p.cwd` / `p.tmux` 任意一句赋值删掉。
     #[test]
     fn rehosting_a_pane_repoints_it_and_wipes_the_old_hosts_screen() {
         let mut ws = Workspace::new(test_pane(1), 0);
@@ -8874,6 +8996,8 @@ mod tests {
             p.emulator.feed(b"OLDHOST");
             p.saw_first_byte = true;
             p.last_grid = (120, 40);
+            p.cwd = Some(b"/home/dev/A".to_vec());
+            p.tmux = Some("work".into());
         }
         let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
         assert!(
@@ -8895,6 +9019,11 @@ mod tests {
             p.last_grid,
             (0, 0),
             "不复位的话下一帧不会发 window_change(T4)"
+        );
+        assert_eq!(p.cwd, None, "标题条右区还挂着上一台机器的目录,是过期信息");
+        assert_eq!(
+            p.tmux, None,
+            "标题条右区还挂着上一台机器的 tmux 会话名,是过期信息"
         );
     }
 
@@ -10498,6 +10627,8 @@ mod tests {
                 saw_first_byte: false,
                 // 不可能的初值:第一次 apply_geometry 必然发一次,基线由它建立。
                 last_grid: (0, 0),
+                cwd: None,
+                tmux: None,
             },
             0,
         );
@@ -10515,11 +10646,11 @@ mod tests {
         };
         let tree = ws.tree().clone();
 
-        ws.apply_geometry(&layout_geometry(&tree, full, cell, false));
+        ws.apply_geometry(&layout_geometry(&tree, full, cell, false, 1.0));
         let before = *seen.lock().unwrap().last().expect("第一次必然发一次");
         seen.lock().unwrap().clear();
 
-        ws.apply_geometry(&layout_geometry(&tree, shrunk, cell, false));
+        ws.apply_geometry(&layout_geometry(&tree, shrunk, cell, false, 1.0));
         let after = seen.lock().unwrap().clone();
         assert_eq!(
             after.len(),
@@ -10580,6 +10711,8 @@ mod tests {
                 status: crate::shell::workspace::PaneStatus::Live,
                 saw_first_byte: false,
                 last_grid: (0, 0),
+                cwd: None,
+                tmux: None,
             },
             0,
         );
@@ -10597,11 +10730,11 @@ mod tests {
         };
         let tree = ws.tree().clone();
 
-        ws.apply_geometry(&layout_geometry(&tree, full, cell, false));
+        ws.apply_geometry(&layout_geometry(&tree, full, cell, false, 1.0));
         let before = *seen.lock().unwrap().last().expect("第一次必然发一次");
         seen.lock().unwrap().clear();
 
-        ws.apply_geometry(&layout_geometry(&tree, narrowed, cell, false));
+        ws.apply_geometry(&layout_geometry(&tree, narrowed, cell, false, 1.0));
         let after = seen.lock().unwrap().clone();
         assert_eq!(
             after.len(),
@@ -10620,7 +10753,7 @@ mod tests {
         // 的话,一个只在变窄时发 resize 的实现照样绿 —— 而它的症状是关掉侧栏
         // 后远端 TUI 仍按窄列数排版,右边空一条,直到下次拖窗口才恢复。
         seen.lock().unwrap().clear();
-        ws.apply_geometry(&layout_geometry(&tree, full, cell, false));
+        ws.apply_geometry(&layout_geometry(&tree, full, cell, false, 1.0));
         let back = seen.lock().unwrap().clone();
         assert_eq!(back.len(), 1, "关侧栏也必须恰好发一次 window_change");
         assert_eq!(back[0].0, before.0, "列数要回到开侧栏之前那个值");
@@ -11817,7 +11950,13 @@ mod tests {
     /// 覆盖了「读」的正确性,这条只补「读到的值有没有被原样传下去」这一环。
     ///
     /// 自证会变红:把 `spawn_sftp_open(` 调用里的 `default_remote,` 改成
-    /// `None,`(复核实测的原始变异点)。
+    /// `None,`(复核实测的原始变异点);把 `files_start_dir(pane_cwd.as_deref(),
+    /// default_remote.as_deref())` 的第二个实参换成字面量 `None`(配置值
+    /// 在中转这一步被静默丢弃,`start_dir` 字符串本身还在,前一条断言测不出来)。
+    ///
+    /// ②:`default_remote` 现在不再直接传给 `spawn_sftp_open`,而是先跟焦点
+    /// pane 的 cwd 一起过 `files_start_dir`。这条守的仍是「配置值不许在这一步
+    /// 丢掉」,只是落点从参数名变成了 `start_dir` 这条链。
     #[test]
     fn trigger_sftp_open_passes_the_tabs_default_remote_into_spawn_sftp_open() {
         let src = include_str!("app.rs");
@@ -11842,15 +11981,233 @@ mod tests {
             .find(");")
             .expect("找不到 spawn_sftp_open 调用的结尾")];
         assert!(
-            call_args.contains("default_remote"),
-            "spawn_sftp_open 的调用没有把 default_remote 传下去——配置的\
-             默认远端目录会在这一步被静默丢弃,验收清单第 7 条(登录后落到\
-             配置的默认目录)会失效"
+            call_args.contains("start_dir"),
+            "spawn_sftp_open 的调用没有把起始目录传下去——配置的默认远端目录\
+             和 ② 的目录继承都会在这一步被静默丢弃,验收清单第 7 条会失效"
+        );
+
+        // ②:`default_remote` 现在经 `files_start_dir` 中转,所以光断言
+        // `spawn_sftp_open` 收到 `start_dir` 是不够的 —— 把第二个实参换成
+        // 字面量 `None`(配置值静默丢弃)照样能过。这里扎住实参本身。
+        let mixed = body
+            .split("files_start_dir(")
+            .nth(1)
+            .expect("trigger_sftp_open 里没调 files_start_dir");
+        let mixed_args = &mixed[..mixed.find(");").expect("找不到 files_start_dir 调用的结尾")];
+        assert!(
+            mixed_args.contains("default_remote"),
+            "files_start_dir 的第二个实参不是从 tab 读出来的 default_remote——\
+             配置的默认远端目录会在这一步被静默丢弃,验收清单第 7 条失效"
+        );
+    }
+
+    /// ②:文件面板远端栏该开在哪。优先级:焦点 pane 报出来的当前目录 >
+    /// F120 配置的默认远端目录 > `None`(交给 `spawn_sftp_open` 里的
+    /// `canonicalize(".")` 落回登录目录)。
+    ///
+    /// **只接受绝对路径**:标题里拿到的可能是 `~/Mullion`,而 openssh 的
+    /// `sftp-server` **不展开 `~`** —— 直接拿去 `canonicalize` 会失败,
+    /// 面板会停在「取不到登录目录」,比不继承更糟。`~` 那种只用来在标题条上
+    /// 显示目录名。
+    ///
+    /// 自证会变红:把 `files_start_dir` 里 `starts_with('/')` 那个判断删掉
+    /// (`~` 用例红);把 `pane_cwd` 那条优先级去掉(第一条红)。
+    #[test]
+    fn files_start_dir_prefers_the_panes_cwd_but_only_if_absolute() {
+        assert_eq!(
+            files_start_dir(Some(b"/home/dev/Mullion"), Some("/srv")).as_deref(),
+            Some("/home/dev/Mullion"),
+            "pane 报的目录该压过配置的默认目录"
+        );
+        assert_eq!(
+            files_start_dir(Some(b"~/Mullion"), Some("/srv")).as_deref(),
+            Some("/srv"),
+            "~ 不是绝对路径,sftp-server 不展开它,该落回配置值"
+        );
+        assert_eq!(
+            files_start_dir(None, Some("/srv")).as_deref(),
+            Some("/srv"),
+            "没有 pane 目录时用配置值"
+        );
+        assert_eq!(files_start_dir(None, None), None);
+        // 非 UTF-8 的远端路径落回配置值:`spawn_sftp_open` 收 `Option<String>`,
+        // 到不了这条路。标题条那边仍会 lossy 显示出来(`dir_leaf`)。
+        assert_eq!(
+            files_start_dir(Some(b"/tmp/\xff"), Some("/srv")).as_deref(),
+            Some("/srv")
+        );
+        // 空切片:`starts_with(b"/")` 为假,同 `~` 一样落回配置值——不是
+        // panic 也不是「当成根目录」。
+        assert_eq!(
+            files_start_dir(Some(b""), Some("/srv")).as_deref(),
+            Some("/srv")
+        );
+    }
+
+    /// `App::sync_files_to_focused_pane` 的判定核心 `sync_target_of`:
+    /// 四个早退(有没有属主世代 / sftp 是否已连 / 焦点 pane 有没有报出
+    /// 绝对路径)+ 一条正常路径。此前这条链完全埋在 `&mut self` 方法体里
+    /// 靠人读代码——把 `has_client` 判断写反、或者把 client 检查和 dir
+    /// 计算的顺序换掉,都不会有任何测试变红。
+    ///
+    /// 自证会变红:
+    /// - 把 `has_client` 那个判断取反(`if has_client { return None; }`)——
+    ///   `has_client_false_blocks_it_even_with_a_good_cwd` 和
+    ///   `happy_path_returns_the_generation_and_the_directory` 都该红。
+    /// - 把 `files_start_dir(pane_cwd, None)` 换成无条件接受(丢掉「只接受
+    ///   绝对路径」)——`relative_pane_cwd_blocks_it_the_same_way_as_a_missing_one`
+    ///   该红。
+    /// - 让 `sync_target_of` 无脑返回 `None`——
+    ///   `happy_path_returns_the_generation_and_the_directory` 该红。
+    #[test]
+    fn sync_target_of_covers_all_four_early_returns_and_the_happy_path() {
+        // 早退①:没有属主世代——即使 sftp 已连、pane 目录是合法绝对路径,
+        // 用户可感知的后果是「侧栏开了却什么都没同步」,不该发生同步。
+        assert_eq!(
+            sync_target_of(None, true, Some(b"/home/dev/x")),
+            None,
+            "没有属主世代时不该同步——这个分支理论上到不了(`sync_files_to_focused_pane`\
+             早就该拿不到 has_client/pane_cwd),但纯函数自己也不能在这种输入下瞎猜一个世代出来"
+        );
+
+        // 早退②:sftp 还没连上。用户可感知的后果:面板已经在等 `trigger_sftp_open`
+        // 把 sftp 连起来,这时候发 Goto 会打到一条还不存在的连接上。
+        assert_eq!(
+            sync_target_of(Some(7), false, Some(b"/home/dev/x")),
+            None,
+            "sftp 还没开时不该发 Goto——那条连接还不存在"
+        );
+
+        // 早退③:焦点 pane 没报过目录。用户可感知的后果:面板停在原处,
+        // 不该凭空跳到某个猜测目录。
+        assert_eq!(
+            sync_target_of(Some(7), true, None),
+            None,
+            "拿不到 pane 目录时不该同步——面板该停在原处"
+        );
+
+        // 早退④:pane 报的是相对路径/`~`。同上,openssh 的 sftp-server 不
+        // 展开 `~`,发过去只会让面板停在「取不到登录目录」。
+        assert_eq!(
+            sync_target_of(Some(7), true, Some(b"~/Mullion")),
+            None,
+            "pane 目录不是绝对路径时不该同步——发过去 sftp-server 展不开 `~`"
+        );
+
+        // 正常路径:世代 + 已连 + 绝对路径,三者都齐了才同步。
+        assert_eq!(
+            sync_target_of(Some(7), true, Some(b"/home/dev/x")),
+            Some((7, "/home/dev/x".to_string())),
+            "三个条件都满足时该把 (世代, 目录) 原样吐出来"
+        );
+    }
+
+    /// ② 的接线守护:`trigger_sftp_open` 必须把「焦点 pane 的 cwd」和
+    /// 「配置的默认远端目录」一起交给 `files_start_dir`,再把结果传下去。
+    ///
+    /// **扎的是源码结构**,理由同
+    /// `trigger_sftp_open_passes_the_tabs_default_remote_into_spawn_sftp_open`:
+    /// 真正验它要一条活 sftp 连接。验证边界:挡得住「忘了继承」和「把
+    /// default_remote 直接传下去」,挡不住 `files_start_dir` 自己写错(那由
+    /// 上面那条纯函数测试守)。
+    ///
+    /// 自证会变红:把 `trigger_sftp_open` 里的 `files_start_dir(...)` 换回
+    /// 直接传 `default_remote`;把 `files_start_dir` 的**第一个**实参换成字面量
+    /// `None`(读了 `focused_pane_cwd()` 却没传下去 —— 光断言"源码里调过这个
+    /// 函数"是拦不住这一种的,所以下面要扎实参本身)。
+    #[test]
+    fn trigger_sftp_open_inherits_the_focused_panes_directory() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn trigger_sftp_open(&mut self, generation: u64) {")
+            .nth(1)
+            .expect("找不到 trigger_sftp_open 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 trigger_sftp_open 的函数结尾")];
+
+        assert!(
+            body.contains("focused_pane_cwd()"),
+            "trigger_sftp_open 没读焦点 pane 的当前目录 —— ② 的继承会静默失效"
+        );
+        let call_after = body
+            .split("spawn_sftp_open(")
+            .nth(1)
+            .expect("找不到 spawn_sftp_open 调用");
+        let call_args = &call_after[..call_after
+            .find(");")
+            .expect("找不到 spawn_sftp_open 调用的结尾")];
+        assert!(
+            call_args.contains("start_dir"),
+            "spawn_sftp_open 收到的不是 files_start_dir 的结果"
+        );
+
+        // `body.contains("focused_pane_cwd()")` 只说明源码里调过它,不说明返回值
+        // 真的进了 `files_start_dir` —— 第一参被静默换成 `None` 时那条断言照过。
+        // 扎实参本身(对称于另一条测试里守 `default_remote` 的那段)。
+        let mixed = body
+            .split("files_start_dir(")
+            .nth(1)
+            .expect("trigger_sftp_open 里没调 files_start_dir");
+        let mixed_args = &mixed[..mixed.find(");").expect("找不到 files_start_dir 调用的结尾")];
+        assert!(
+            mixed_args.contains("pane_cwd"),
+            "files_start_dir 的第一个实参不是焦点 pane 的 cwd —— ② 的继承会静默\
+             失效,面板每次都开在配置的默认目录"
+        );
+    }
+
+    /// ②:侧栏从「关」变「开」那一帧,把远端栏带到焦点 pane 报出来的目录。
+    ///
+    /// 判据必须是「关→开」跃迁,而不是「侧栏当前是开的」这个每帧恒真的条件
+    /// ——否则用户在面板里手动点开的目录,会在下一帧就被拽回终端所在目录,
+    /// 面板变得没法浏览。
+    ///
+    /// 判据存在 `App::files_sidebar_was_open` 这个跨帧字段里,而不是
+    /// `render_frame` 调用前的帧内局部变量:侧栏开关有两条路——菜单
+    /// (`chrome.rs`)在 `render_frame` **内部**改 `self.ui.files_sidebar_open`,
+    /// 帧内局部变量能测出跃迁;但热键(`files_hotkey_event`,由
+    /// `window_event` 在另一次事件回调里调用)在 `render_frame` **之外**改
+    /// 这个标志——等下一帧的重绘块跑到帧内局部变量赋值那一行时,标志早就
+    /// 已经是 `true` 了,`open && !was_open` 恒假,Ctrl+Shift+B 开侧栏永远
+    /// 同步不到。用跨帧字段、并把判据放在 `render_frame` 调用**之后**,
+    /// 两条路径才都能覆盖到。
+    ///
+    /// **扎的是源码结构**:真正验它要一条活 sftp 连接和真实一帧渲染,这个
+    /// 测试容器里造不出来(同上面几条接线守护的限制)。
+    ///
+    /// 自证会变红:
+    /// - 把 `sync_files_to_focused_pane` 整个函数删掉/改名 —— 第一条断言红。
+    /// - 把判据改成 `if self.ui.files_sidebar_open {`(去掉跃迁判断)——
+    ///   第二条断言红。
+    /// - 删掉帧尾 `self.files_sidebar_was_open = self.ui.files_sidebar_open;`
+    ///   —— 第三条断言红。
+    #[test]
+    fn the_files_sidebar_syncs_to_the_terminal_only_on_the_closed_to_open_edge() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(
+            prod.len() < src.len(),
+            "没能把搜索范围切到 `mod tests` 之前 —— 下面的断言会命中测试自己\
+             写的字面量,变成恒绿"
+        );
+
+        assert!(
+            prod.contains("fn sync_files_to_focused_pane(&mut self)"),
+            "缺 sync_files_to_focused_pane —— ② 在侧栏已开着时会静默不生效"
         );
         assert!(
-            !call_args.trim_end().ends_with("None,") && !call_args.trim_end().ends_with("None"),
-            "spawn_sftp_open 调用的最后一个参数是字面量 None,不是从 tab 里\
-             读出来的 default_remote"
+            prod.contains("if self.ui.files_sidebar_open && !self.files_sidebar_was_open {"),
+            "同步的判据不是「关→开」跃迁 —— 每帧都同步会把用户在面板里点开的\
+             目录反复拽回终端所在目录"
+        );
+        assert!(
+            prod.contains("self.files_sidebar_was_open = self.ui.files_sidebar_open;"),
+            "没有在帧尾记下这一帧的开合状态 —— 下一帧判不出跃迁,\
+             而且热键那条路(在另一次事件回调里改标志)会永远同步不到"
         );
     }
 }

@@ -196,6 +196,14 @@ pub enum TabAction {
     Props(usize),
 }
 
+/// ⑦:标签栏总开关。当前隐藏 —— 用户嫌它占地方,而多标签今天还能靠
+/// `Ctrl+Tab`(D0 的 `shell::tabs::hotkey`)和菜单切换,不缺入口。
+///
+/// **留常量而不是删代码**:F36 的行为约定(一个标签也出条、恒定高度、
+/// annotate 注册)全都还有测试守着 —— 那些测试走 `tab_bar_inner(.., true)`,
+/// 把这里翻回 `true` 就是完整可用的标签栏,不需要考古。
+const SHOW_TAB_BAR: bool = false;
+
 /// 画标签栏(F36)。返回用户这一帧的动作。
 ///
 /// **常驻,不自动隐藏**(spec F36 验收):标签栏的显隐是一次高度跳变,整幅终端
@@ -204,7 +212,27 @@ pub enum TabAction {
 /// 标签)同样画,只是里面只有一个 `+` —— 否则「连上第一台机」会多一次高度跳变。
 ///
 /// 固定高度而不是由内容撑开,理由同 `menu_px`。
+///
+/// ⑦:当前默认**不显示**(见 `SHOW_TAB_BAR`)。上面这些不变量说的是
+/// `enabled == true` 时的行为 —— 不因标签数量变化而动态隐藏,不是「这个
+/// 函数现在就会把标签栏画出来」。
 pub fn tab_bar(ctx: &egui::Context, t: &Theme, views: &[TabView<'_>]) -> Option<TabAction> {
+    tab_bar_inner(ctx, t, views, SHOW_TAB_BAR)
+}
+
+/// 标签栏本体。`enabled == false` 时**什么都不建**并立刻返回 —— 不能建一个
+/// 高度 0 的 panel:`TopBottomPanel` 无论多矮都会从 `available_rect` 里分走
+/// 自己那一份,中央区因此变矮,`central_px` → `layout_geometry` →
+/// `pty.resize` 白发一次 `window_change`(T4)。
+fn tab_bar_inner(
+    ctx: &egui::Context,
+    t: &Theme,
+    views: &[TabView<'_>],
+    enabled: bool,
+) -> Option<TabAction> {
+    if !enabled {
+        return None;
+    }
     let mut action = None;
     let bar = egui::TopBottomPanel::top("tabs")
         .exact_height(tab_bar_px())
@@ -673,6 +701,9 @@ mod tests {
         );
     }
 
+    // ⑦:走 `tab_bar_inner(.., true)` 而不是 `tab_bar` —— 标签栏默认隐藏了,
+    // 这个辅助函数被下面几条测试复用,守的是「开关打开时的行为」,不该跟着
+    // 开关一起失效。
     fn tab_titles(views: &[TabView<'_>]) -> Vec<String> {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
@@ -680,7 +711,7 @@ mod tests {
         // 同 `run_status`:面板首帧 `fade_in`,形状全被记成 Noop,必须跑两帧。
         for _ in 0..2 {
             let out = ctx.run(Default::default(), |ctx| {
-                tab_bar(ctx, &crate::theme::MULLION_DARK, views);
+                tab_bar_inner(ctx, &crate::theme::MULLION_DARK, views, true);
             });
             acc.clear();
             fn walk(s: &egui::Shape, out: &mut Vec<String>) {
@@ -728,6 +759,8 @@ mod tests {
     ///
     /// 自证会变红:把 `one_tab` 里 `tab_fill(node, v.active, t)` 换成恒
     /// `tab_fill(None, v.active, t)`。
+    // ⑦:走 `tab_bar_inner(.., true)` 而不是 `tab_bar` —— 标签栏默认隐藏了,
+    // 这条测试守的是「开关打开时的行为」,不该跟着开关一起失效。
     #[test]
     fn active_tab_paints_its_effective_color_as_full_background() {
         let color = egui::Color32::from_rgb(0x1e, 0x88, 0xe5);
@@ -747,7 +780,7 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        tab_bar(ctx, &crate::theme::MULLION_DARK, views);
+                        tab_bar_inner(ctx, &crate::theme::MULLION_DARK, views, true);
                     },
                 ));
             }
@@ -828,6 +861,9 @@ mod tests {
     }
 
     /// 标签栏占了中央区多少高度。`None` = 这一帧根本没画标签栏。
+    ///
+    /// ⑦:走 `tab_bar_inner(.., true)` 而不是 `tab_bar` —— 标签栏默认隐藏了,
+    /// 这条测试守的是「开关打开时的行为」,不该跟着开关一起失效。
     fn bar_height(tabs: usize) -> f32 {
         let views: Vec<TabView<'_>> = (0..tabs)
             .map(|i| TabView {
@@ -843,7 +879,7 @@ mod tests {
         let mut h = 0.0;
         for _ in 0..2 {
             let _ = ctx.run(Default::default(), |ctx| {
-                tab_bar(ctx, &crate::theme::MULLION_DARK, &views);
+                tab_bar_inner(ctx, &crate::theme::MULLION_DARK, &views, true);
                 h = ctx.screen_rect().height() - ctx.available_rect().height();
             });
         }
@@ -888,6 +924,9 @@ mod tests {
     /// 「第 2 个标签的 × 太小」这类反馈标不到就只能用嘴描述。
     ///
     /// 自证会变红:注释掉 `tab_bar` / `one_tab` 里任一句 `annotate::mark`。
+    ///
+    /// ⑦:走 `tab_bar_inner(.., true)` 而不是 `tab_bar` —— 标签栏默认隐藏了,
+    /// 这条测试守的是「开关打开时的行为」,不该跟着开关一起失效。
     #[test]
     fn annotate_mode_registers_the_tab_bar_and_each_tab() {
         let ctx = egui::Context::default();
@@ -912,7 +951,7 @@ mod tests {
         let mut paths = Vec::new();
         for _ in 0..2 {
             let _ = ctx.run(Default::default(), |ctx| {
-                tab_bar(ctx, &crate::theme::MULLION_DARK, &views);
+                tab_bar_inner(ctx, &crate::theme::MULLION_DARK, &views, true);
                 paths = annotate::spot_paths(ctx);
             });
         }
@@ -973,6 +1012,9 @@ mod tests {
     /// `find_text_pos` 绕开。)
     ///
     /// 自证会变红:把标题 `Label` 的 `.selectable(false)` 去掉。
+    ///
+    /// ⑦:走 `tab_bar_inner(.., true)` 而不是 `tab_bar` —— 标签栏默认隐藏了,
+    /// 这条测试守的是「开关打开时的行为」,不该跟着开关一起失效。
     #[test]
     fn clicking_anywhere_on_a_tab_switches_to_it() {
         let t = crate::theme::MULLION_DARK;
@@ -998,7 +1040,7 @@ mod tests {
         let mut out = None;
         for _ in 0..2 {
             out = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                tab_bar(ctx, &t, &views);
+                tab_bar_inner(ctx, &t, &views, true);
             }));
         }
         let pos = find_text_pos(&out.unwrap().shapes, "第二个").expect("标签栏该画出「第二个」");
@@ -1019,7 +1061,7 @@ mod tests {
         });
         let mut got = None;
         let _ = ctx.run(input, |ctx| {
-            got = tab_bar(ctx, &t, &views);
+            got = tab_bar_inner(ctx, &t, &views, true);
         });
         assert_eq!(
             got,
@@ -1037,6 +1079,9 @@ mod tests {
     /// `None`(按 0 处理),会和首帧的隐式 0 撞在一起判不出「两次」。
     ///
     /// 自证会变红:把 `props || double` 里的 `double` 去掉。
+    ///
+    /// ⑦:走 `tab_bar_inner(.., true)` 而不是 `tab_bar` —— 标签栏默认隐藏了,
+    /// 这条测试守的是「开关打开时的行为」,不该跟着开关一起失效。
     #[test]
     fn double_clicking_a_tab_asks_for_the_properties_dialog() {
         let t = crate::theme::MULLION_DARK;
@@ -1060,7 +1105,7 @@ mod tests {
         let mut out = None;
         for _ in 0..2 {
             out = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                tab_bar(ctx, &t, &views);
+                tab_bar_inner(ctx, &t, &views, true);
             }));
         }
         let pos = find_text_pos(&out.unwrap().shapes, "第二个").expect("标签栏该画出「第二个」");
@@ -1082,7 +1127,7 @@ mod tests {
         }
         let mut got = None;
         let _ = ctx.run(input, |ctx| {
-            got = tab_bar(ctx, &t, &views);
+            got = tab_bar_inner(ctx, &t, &views, true);
         });
         assert_eq!(
             got,
@@ -1099,6 +1144,10 @@ mod tests {
     /// 真实指针事件右键打开菜单、`find_text_pos` 反推按钮矩形再点下去,不直接
     /// 读 `Response` 的 enabled 标记 —— 这样测的是「真的点不动/点得动」,
     /// 不是「看起来对不对」。
+    ///
+    /// ⑦:走 `tab_bar_inner(.., true)` 而不是 `tab_bar` —— 标签栏默认隐藏了,
+    /// 这个辅助函数被下面的测试复用,守的是「开关打开时的行为」,不该跟着
+    /// 开关一起失效。
     fn click_context_menu_item(
         t: &crate::theme::Theme,
         views: &[TabView<'_>],
@@ -1109,7 +1158,7 @@ mod tests {
         let mut out = None;
         for _ in 0..2 {
             out = Some(ctx.run(egui::RawInput::default(), |ctx| {
-                tab_bar(ctx, t, views);
+                tab_bar_inner(ctx, t, views, true);
             }));
         }
         let tab_pos = find_text_pos(&out.unwrap().shapes, tab_title).expect("标签栏该画出这个标签");
@@ -1130,14 +1179,14 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                tab_bar(ctx, t, views);
+                tab_bar_inner(ctx, t, views, true);
             },
         );
 
         // 菜单弹出用的是 `Area`,首次遇到某个 id 先做一趟不可见的 sizing
         // pass,真正把内容画出来要等下一帧,所以再空跑一帧。
         let out = ctx.run(egui::RawInput::default(), |ctx| {
-            tab_bar(ctx, t, views);
+            tab_bar_inner(ctx, t, views, true);
         });
         let item_pos = find_text_pos(&out.shapes, item_text)
             .unwrap_or_else(|| panic!("右键菜单里应该画出了「{item_text}」"));
@@ -1159,7 +1208,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                got = tab_bar(ctx, t, views);
+                got = tab_bar_inner(ctx, t, views, true);
             },
         );
         got
@@ -1194,6 +1243,54 @@ mod tests {
             click_context_menu_item(&t, &quick_connect, "快速连接", "设置颜色…"),
             Some(TabAction::Props(0)),
             "没有会话记录的标签,右键「设置颜色…」现在也该能点通"
+        );
+    }
+
+    /// ⑦:标签栏现在默认隐藏 —— **一个像素都不占**(不是画成透明、也不是
+    /// 高度置 0 的空 panel:空 panel 仍会分掉中央区,`central_px` 跟着变,
+    /// 白发一次 `window_change`,T4)。
+    ///
+    /// 同时钉住「只是隐藏、没被删掉」:`tab_bar_inner(.., true)` 必须照旧
+    /// 出条 —— 这条测试和下面三条既有测试一起构成「开关能翻回来」的证据。
+    ///
+    /// 自证会变红:把 `SHOW_TAB_BAR` 改回 `true`(第一条断言红);把
+    /// `tab_bar_inner` 里的 `TopBottomPanel` 删掉(第二条红)。
+    #[test]
+    fn the_tab_bar_is_hidden_by_default_but_still_buildable() {
+        let views = [TabView {
+            title: "a",
+            active: true,
+            session_id: None,
+            appearance: None,
+            color: None,
+        }];
+
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let mut before = 0.0;
+        let mut after = 0.0;
+        let _ = ctx.run(Default::default(), |ctx| {
+            before = ctx.available_rect().height();
+            tab_bar(ctx, &t, &views);
+            after = ctx.available_rect().height();
+        });
+        assert!(
+            (before - after).abs() < f32::EPSILON,
+            "标签栏关掉之后还在吃中央区的高度({before} → {after})"
+        );
+
+        let ctx2 = egui::Context::default();
+        let mut enabled_after = 0.0;
+        let mut enabled_before = 0.0;
+        let _ = ctx2.run(Default::default(), |ctx| {
+            enabled_before = ctx.available_rect().height();
+            tab_bar_inner(ctx, &t, &views, true);
+            enabled_after = ctx.available_rect().height();
+        });
+        assert!(
+            enabled_before - enabled_after > 1.0,
+            "把开关打开之后标签栏应该照旧出条,实测中央区只矮了 {}",
+            enabled_before - enabled_after
         );
     }
 }

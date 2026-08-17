@@ -13,6 +13,7 @@ pub mod ico;
 pub mod icon;
 pub mod import_dialog;
 pub mod metrics;
+pub mod pane_edges;
 pub mod pane_title;
 pub mod paste;
 pub mod rehost;
@@ -837,6 +838,10 @@ pub fn build_ui(
 
     // 标题条最后画:它用绝对坐标,而坐标依赖上面几个 Panel 定完的中央区。
     // Area 不参与 Panel 的空间分配,所以放在 available_rect 之后不影响换算。
+    // ③④:分界线 + 焦点描边。**在标题条之前画** —— 标题条是 `Area`
+    // (`Order::Middle`),分界线是 `Order::Background` 的 layer_painter,
+    // 层序由 Order 决定而不是调用顺序,但把「底衬」放前面读起来才顺。
+    pane_edges::paint(ctx, t, frame.titles);
     let title_action = pane_title::show(ctx, t, frame.titles);
     actions.close_pane = title_action.close;
     actions.rehost_pane = title_action.rehost;
@@ -885,7 +890,7 @@ fn annotate_env(ctx: &egui::Context, ui_state: &UiState, frame: &UiFrame<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell::workspace::{PaneStatus, PxRect, TITLE_BAR_PX};
+    use crate::shell::workspace::{title_bar_px, PaneStatus, PxRect};
     use mullion_core::layout::PaneId;
 
     /// 用户关掉错误卡片后,**下一个**错误必须重新弹出来。
@@ -1378,13 +1383,13 @@ mod tests {
                     x: 0,
                     y: 0,
                     w: 800,
-                    h: TITLE_BAR_PX,
+                    h: title_bar_px(1.0),
                 },
                 term_px: PxRect {
                     x: 0,
-                    y: TITLE_BAR_PX,
+                    y: title_bar_px(1.0),
                     w: 800,
-                    h: 600 - TITLE_BAR_PX,
+                    h: 600 - title_bar_px(1.0),
                 },
                 grid: (80, 28),
             },
@@ -1393,6 +1398,8 @@ mod tests {
             status: PaneStatus::Live,
             focused: true,
             appearance: None,
+            cwd_leaf: None,
+            tmux: None,
         }
     }
 

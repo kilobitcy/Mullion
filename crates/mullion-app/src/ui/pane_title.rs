@@ -22,6 +22,28 @@ pub struct TitleView<'a> {
     /// (快速连接、或 store 不可用)。**必须来自 `badge::AppearanceCache`**,
     /// 不许在这里现解析(陷阱 T3)。
     pub appearance: Option<&'a crate::ui::badge::Appearance>,
+    /// ⑥:远端当前目录的最后一级(已由 `dir_leaf` 取好)。`None` = 不知道。
+    ///
+    /// **拿 `String` 而不是 `&str`**:源头 `PaneState.cwd` 是字节,取最后一级
+    /// 要经过 `to_string_lossy`,借不出一个活到本帧结束的 `&str`。每 pane
+    /// 每帧一次短字符串分配,相对每帧几千个 glyph 可以忽略。
+    pub cwd_leaf: Option<String>,
+    /// ⑥:tmux 会话名。`None` = 不在 tmux 里 / 远端没开 `set-titles`。
+    pub tmux: Option<&'a str>,
+}
+
+/// ④:焦点分屏标题条上那层 accent 的不透明度。0.14 —— 够看出「这块亮一点」,
+/// 又不至于把主机名的对比度压下去。
+const FOCUS_TINT: f32 = 0.14;
+
+/// ⑤:图标边长(逻辑点)。
+///
+/// 目标是 16 点(设计稿尺寸,再大就压过主机名);上限之外还要有下限:
+/// 极小 pane 上 `layout_geometry` 会用 `title_bar_px(ppp).min(px.h)` 把标题条
+/// 压扁,那时按内高缩到 10 点为止 —— 再小就是一坨糊,不如让它糊得整齐些。
+/// 减 2 点是给图标留呼吸空间,不让它顶到边距线上。
+pub fn icon_side(inner_h: f32) -> f32 {
+    (inner_h - 2.0).clamp(10.0, 16.0)
 }
 
 /// 标题条上的文字。抽成纯函数是因为格式会被人反复调,而它是唯一能自动验的部分。
@@ -62,6 +84,56 @@ pub fn title_text(index: usize, host: Option<&str>, status: PaneStatus) -> Strin
 /// `Area` 的 id,`show` 和测试都从这里取,别在两处各写一遍字面量。
 fn area_id(id: PaneId) -> egui::Id {
     egui::Id::new(("pane_title", id.0))
+}
+
+/// ⑥:右区最多占标题条的多少宽度。0.45 —— 一半以内,保证主机名(标识)
+/// 永远比目录名(上下文)有优先权。
+const SIDE_MAX_FRAC: f32 = 0.45;
+
+/// ⑥:目录路径的最后一级,给标题条显示用。
+///
+/// `/` 与 `~` 原样返回(它们本身就是「最后一级」);尾部斜杠忽略;空路径
+/// 给 `None`(别在标题条上摆一个空标签)。
+///
+/// 非 UTF-8 走 `to_string_lossy`:显示层宁可出一个 `�` 也要把目录名摆出来 ——
+/// 整段消失的话用户完全不知道自己在哪。**② 那边不吃这个宽容度**,它只接受
+/// 绝对路径的原始字节。
+pub fn dir_leaf(cwd: &[u8]) -> Option<String> {
+    let trimmed = match cwd {
+        [] => return None,
+        [b'/'] => return Some("/".to_string()),
+        // `strip_suffix` 只剥一层:`/tmp//` 剥一次还剩 `/tmp/`,`rposition`
+        // 照样定位到那个新暴露出来的尾部 `/`,`leaf` 就成了空串,整段目录名
+        // 消失。这里用 `while` 剥掉**全部**尾部斜杠,再走同一套取最后一级的
+        // 逻辑,退化成显示 `"tmp"` 而不是什么都不显示。
+        _ => {
+            let mut t = cwd;
+            while let Some(s) = t.strip_suffix(b"/") {
+                t = s;
+            }
+            t
+        }
+    };
+    let leaf = match trimmed.iter().rposition(|&b| b == b'/') {
+        Some(i) => &trimmed[i + 1..],
+        None => trimmed,
+    };
+    if leaf.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(leaf).into_owned())
+}
+
+/// ⑥:标题条右区的文字。两者都没有时 `None`(整段不画,不留孤零零的 `·`)。
+///
+/// tmux 名在前:它是「我在哪个工作区」,比目录更外层。
+pub fn side_text(cwd_leaf: Option<&str>, tmux: Option<&str>) -> Option<String> {
+    match (tmux, cwd_leaf) {
+        (Some(s), Some(d)) => Some(format!("{s} · {d}")),
+        (Some(s), None) => Some(s.to_string()),
+        (None, Some(d)) => Some(d.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// 两个按钮的 id。**显式给**而不是让 egui 按布局位置自动生成:测试要
@@ -144,12 +216,20 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
             .fixed_pos(pos)
             .order(egui::Order::Middle)
             .show(ctx, |ui| {
-                ui.painter().rect(
-                    full,
-                    0.0,
-                    theme::c32(if v.focused { t.panel_head } else { t.panel_bg }),
-                    theme::stroke(t),
-                );
+                ui.painter()
+                    .rect(full, 0.0, theme::c32(t.panel_bg), theme::stroke(t));
+                // ④:焦点分屏的标题条上叠一层薄 accent。底色统一走 `panel_bg`
+                // 再叠色,而不是焦点时换成 `panel_head` —— `panel_head` 是
+                // 「面板表头」那一档灰,跟 F62 的会话语义色、跟未聚焦态都太近,
+                // 分屏一多就分不出来。`gamma_multiply` 把不透明的 accent 变成
+                // 半透明,叠出来是一层薄色而不是一块纯 accent 底。
+                if v.focused {
+                    ui.painter().rect_filled(
+                        full,
+                        0.0,
+                        theme::c32(t.accent).gamma_multiply(FOCUS_TINT),
+                    );
+                }
                 // F62:语义色竖条走左边缘。**用 painter 直接画在 `full` 里**,
                 // 不新增任何 widget、不参与布局计算 —— 这是绕开本文件顶部
                 // 那两个越界坑的做法(`Frame` 的 min_rect+margin 撑破 Area、
@@ -189,6 +269,46 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     {
                         action.rehost = Some(v.geom.id);
                     }
+                    // ⑥:右区 —— tmux 会话名 + 当前目录最后一级。摆在 `⇆`
+                    // 左边,颜色比主机名弱:它是上下文,不是标识。
+                    //
+                    // **手动 `layout_no_wrap` + `allocate_exact_size`,不用
+                    // `Label::truncate()`**:`right_to_left` 里一个会截断的
+                    // Label 会先 claim 掉全部剩余宽度,左区主机名就一点都不剩了。
+                    // 手动摆能把宽度夹在 `SIDE_MAX_FRAC` 以内,两区各自截断。
+                    if let Some(s) = side_text(v.cwd_leaf.as_deref(), v.tmux) {
+                        let color = theme::c32(t.fg_muted);
+                        let galley =
+                            ui.painter()
+                                .layout_no_wrap(s, egui::FontId::proportional(12.0), color);
+                        let w = galley.size().x.min(full.width() * SIDE_MAX_FRAC);
+                        let (r, _) = ui.allocate_exact_size(
+                            egui::vec2(w, galley.size().y),
+                            egui::Sense::hover(),
+                        );
+                        // 再按自己那块矩形裁一次:外层 `set_clip_rect(inner)`
+                        // 只挡住溢出标题条,挡不住右区的字压向 `⇆`/`×` 按钮。
+                        //
+                        // 方向已核实(不是直觉上的「往左压主机名」):`r` 是在
+                        // `right_to_left` 布局里 `allocate_exact_size` 分配的,
+                        // `align2()` 取 `Align2([Align::RIGHT, ..])`
+                        // (egui-0.30.0 `layout.rs:620`),`align_size_within_range`
+                        // 对 `Align::RIGHT` 的结果是 `max` 钉在传入 range 的
+                        // `max`、`min = max - size`(`emath-0.30.0
+                        // src/align.rs:113-131`,`Self::Max` 那条分支)——
+                        // 也就是说 `r.max.x` 钉在
+                        // cursor 当前的右边界(此刻正是已经摆好的 `⇆` 按钮左沿),
+                        // `r.min.x = r.max.x - w`。而 `galley` 排版时传的是
+                        // `f32::INFINITY`(`layout_no_wrap`,`painter.rs:516-522`),
+                        // 自然宽度可能大于夹紧后的 `w`;`Painter::galley(pos, ..)`
+                        // 画的 `pos` 是文本**左上角**(`epaint-0.30.0
+                        // src/shape.rs:993` `TextShape::pos` 的文档原话），从
+                        // `r.min` 向右延展。所以未裁剪时,超宽的部分是从 `r.min`
+                        // 越过 `r.max.x` 继续往右,压向已经画在更右边的
+                        // `⇆`/`×` 按钮,而不是往左压主机名(主机名在这段代码
+                        // 更后面才用剩余空间摆,方向相反)。
+                        ui.painter().with_clip_rect(r).galley(r.min, galley, color);
+                    }
                     // 剩下的空间(已扣掉 × 按钮)左对齐摆状态点 + 主机名;主机名
                     // 排版用的 available_width 到这里已经是扣掉 × 之后的余量。
                     // × 不被顶出条外,靠的是 right_to_left 先占位 + 外层 set_clip_rect
@@ -202,8 +322,10 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                         // F61:图标画在状态点之前。`content` 是个 `new_child` +
                         // `set_clip_rect`,画多了只会被裁掉,不会把 `Area` 撑大。
                         if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
+                            // ⑤:边长按内容区高度算,不写死 —— 见 `icon_side`。
+                            let side = icon_side(inner.height());
                             let (r, _) = ui
-                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                                .allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
                             crate::ui::badge::paint_icon(
                                 ui.painter(),
                                 r,
@@ -264,8 +386,12 @@ mod tests {
         assert_eq!(title_text(3, None, PaneStatus::Live), "3 · 连接中…");
     }
 
-    fn geom_800x600_title32(id: u32) -> PaneGeom {
-        use crate::shell::workspace::{PxRect, TITLE_BAR_PX};
+    /// 800×600 物理像素、开着标题条的单 pane 几何。
+    ///
+    /// ⑤:标题条高度现在随 DPI 走,所以要传 ppp —— 传死 32 的话高 DPI 的
+    /// 用例量的就不是真实几何。
+    fn geom_800x600_title32(id: u32, ppp: f32) -> PaneGeom {
+        use crate::shell::workspace::{title_bar_px, PxRect};
         PaneGeom {
             id: PaneId(id),
             px: PxRect {
@@ -278,7 +404,7 @@ mod tests {
                 x: 0,
                 y: 100,
                 w: 800,
-                h: TITLE_BAR_PX,
+                h: title_bar_px(ppp),
             },
             term_px: PxRect {
                 x: 0,
@@ -303,12 +429,14 @@ mod tests {
             let ctx = egui::Context::default();
             crate::ui::annotate::toggle(&ctx);
             let mut view = TitleView {
-                geom: geom_800x600_title32(1),
+                geom: geom_800x600_title32(1, 1.0),
                 index: 1,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
                 appearance: None,
+                cwd_leaf: None,
+                tmux: None,
             };
             view.geom.title_px.h = title_h;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -350,17 +478,19 @@ mod tests {
     /// ppp 覆盖 100% / 125% / 150%——Windows 最常见的三档缩放。
     #[test]
     fn area_rect_matches_title_px_exactly_across_dpi_scales() {
-        use crate::shell::workspace::TITLE_BAR_PX;
+        use crate::shell::workspace::title_bar_px;
         for ppp in [1.0f32, 1.25, 1.5] {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(ppp);
             let views = [TitleView {
-                geom: geom_800x600_title32(1),
+                geom: geom_800x600_title32(1, ppp),
                 index: 1,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
                 appearance: None,
+                cwd_leaf: None,
+                tmux: None,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -369,7 +499,7 @@ mod tests {
                 .memory(|m| m.area_rect(area_id(PaneId(1))))
                 .unwrap_or_else(|| panic!("ppp={ppp}: 标题条没画出任何 Area"));
             let want_w = 800.0 / ppp;
-            let want_h = TITLE_BAR_PX as f32 / ppp;
+            let want_h = title_bar_px(ppp) as f32 / ppp;
             assert!(
                 (rect.width() - want_w).abs() < 0.5,
                 "ppp={ppp}: Area 宽 {} 应约等于 title_px 换算值 {want_w},差太多说明撑出了标题条",
@@ -387,7 +517,7 @@ mod tests {
     /// `title_px` 右边界,侵入邻居 pane 的地盘。
     #[test]
     fn long_host_name_does_not_push_area_past_title_px() {
-        use crate::shell::workspace::{PxRect, TITLE_BAR_PX};
+        use crate::shell::workspace::{title_bar_px, PxRect};
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
         let geom = PaneGeom {
@@ -402,7 +532,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 w: 160,
-                h: TITLE_BAR_PX,
+                h: title_bar_px(1.0),
             },
             term_px: PxRect {
                 x: 0,
@@ -419,6 +549,8 @@ mod tests {
             status: PaneStatus::Live,
             focused: true,
             appearance: None,
+            cwd_leaf: None,
+            tmux: None,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -464,12 +596,14 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
         let views = [TitleView {
-            geom: geom_800x600_title32(1),
+            geom: geom_800x600_title32(1, 1.0),
             index: 1,
             host: Some("dev@build-01"),
             status: PaneStatus::Live,
             focused: true,
             appearance: None,
+            cwd_leaf: None,
+            tmux: None,
         }];
         // **必须显式把时间推过 `Area` 的 fade_in**。默认 `RawInput` 的
         // `time` 是 `None`,egui 会拿墙钟凑,两帧之间可能只过了几微秒 ——
@@ -563,6 +697,8 @@ mod tests {
             status: PaneStatus::Live,
             focused: true,
             appearance: None,
+            cwd_leaf: None,
+            tmux: None,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -598,12 +734,14 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
         let views = [TitleView {
-            geom: geom_800x600_title32(1),
+            geom: geom_800x600_title32(1, 1.0),
             index: 1,
             host: Some("dev@build-01"),
             status: PaneStatus::Live,
             focused: true,
             appearance,
+            cwd_leaf: None,
+            tmux: None,
         }];
         // 跑两帧:`Area` 默认 `fade_in`,第一帧 opacity 是 0,画的图形会被
         // painter 记成 `Shape::Noop`(egui-0.30 `painter.rs::Painter::add`),
@@ -659,7 +797,7 @@ mod tests {
     /// 它们 —— 这条测试钉死这个前提在有外观的情况下依然成立。
     #[test]
     fn area_rect_stays_exact_even_with_appearance_bar_and_icon() {
-        use crate::shell::workspace::TITLE_BAR_PX;
+        use crate::shell::workspace::title_bar_px;
         use mullion_store::{ColorTarget, IconKind, IconSpec};
         let a = crate::ui::badge::Appearance {
             // 必须用**真能画出来**的图标。用 `IconKind::Builtin`/`Emoji` 的话
@@ -679,12 +817,14 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(ppp);
             let views = [TitleView {
-                geom: geom_800x600_title32(1),
+                geom: geom_800x600_title32(1, ppp),
                 index: 1,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
                 appearance: Some(&a),
+                cwd_leaf: None,
+                tmux: None,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -698,7 +838,7 @@ mod tests {
                 rect.width()
             );
             assert!(
-                (rect.height() - TITLE_BAR_PX as f32 / ppp).abs() < 0.5,
+                (rect.height() - title_bar_px(ppp) as f32 / ppp).abs() < 0.5,
                 "ppp={ppp}: 加了外观后 Area 高 {} 撑出了 title_px",
                 rect.height()
             );
@@ -741,12 +881,14 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(1.0);
             let views = [TitleView {
-                geom: geom_800x600_title32(1),
+                geom: geom_800x600_title32(1, 1.0),
                 index: 1,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
                 appearance,
+                cwd_leaf: None,
+                tmux: None,
             }];
             // 显式推进时间,而不是像 `run_title` 那样跑两帧靠墙钟走时间:
             // 这条测试要比较**颜色**,`fade_in` 半路上的不透明度会把 RGB
@@ -802,5 +944,443 @@ mod tests {
             with_bg, 1,
             "勾了「pane 标题条」的会话,图标下应该恰好垫一块这个颜色的方块"
         );
+    }
+
+    /// ⑤:图标必须**整个**画在标题条内容区里,任何 DPI 下都不许被裁。
+    ///
+    /// `paint_icon` 走 `painter.image`,在形状列表里是唯一的 `Shape::Mesh`
+    /// (文字是 `Shape::Text`,底色/竖条是 `Shape::Rect`)—— 拿它的
+    /// `visual_bounding_rect()` 跟 `inner`(= `full.shrink2(8, 4)`)比。
+    ///
+    /// 曾经的 bug:标题条高度是 32 **物理**像素常量,而边距/图标是逻辑点,
+    /// 150% 缩放下内高只有 13.33 点,装不下 14 点的图标,底部被
+    /// `set_clip_rect(inner)` 裁掉。
+    ///
+    /// 自证会变红:把 Task 3a 的 `title_bar_px` 改回 `|_| 32`(高 DPI 下标题条
+    /// 只剩 21.33 点,内高 13.33 点,装不下图标)。
+    ///
+    /// **这条测试验的是 3a,验不到 `icon_side` 本身** —— `icon_side` 里那个
+    /// `- 2.0` 已经保证结果恒小于内高,与 clamp 的两个边界无关;而 3a 修好之后
+    /// `inner.height()` 在任何 ppp 下都恒为 24 点,压根走不到边界。`icon_side`
+    /// 的边界行为由 `icon_side_stays_inside_the_content_box_until_the_bar_is_squashed`
+    /// 单独钉。
+    #[test]
+    fn the_icon_fits_inside_the_title_bar_at_every_scale() {
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0] {
+            let ap = crate::ui::badge::Appearance {
+                icon: Some(mullion_store::IconSpec {
+                    kind: mullion_store::IconKind::Ico,
+                    value: real_ico(),
+                    bg: None,
+                }),
+                ..Default::default()
+            };
+            let id = PaneId(7);
+            let views = [TitleView {
+                geom: geom_800x600_title32(id.0, ppp),
+                index: 1,
+                host: Some("h"),
+                status: PaneStatus::Live,
+                focused: false,
+                appearance: Some(&ap),
+                cwd_leaf: None,
+                tmux: None,
+            }];
+
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let t = crate::theme::MULLION_DARK;
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                let out = ctx.run(Default::default(), |ctx| {
+                    show(ctx, &t, &views);
+                });
+                shapes = out.shapes;
+            }
+
+            let full = {
+                let tp = views[0].geom.title_px;
+                egui::Rect::from_min_size(
+                    egui::pos2(tp.x as f32 / ppp, tp.y as f32 / ppp),
+                    egui::vec2(tp.w as f32 / ppp, tp.h as f32 / ppp),
+                )
+            };
+            let inner = full.shrink2(egui::vec2(8.0, 4.0));
+
+            let mut seen = 0;
+            for cs in &shapes {
+                collect_meshes(&cs.shape, &mut |r: egui::Rect| {
+                    seen += 1;
+                    assert!(
+                        inner.contains_rect(r),
+                        "ppp={ppp}: 图标 {r:?} 没装进内容区 {inner:?}(内高 {:.2} 点)",
+                        inner.height()
+                    );
+                });
+            }
+            assert_eq!(seen, 1, "ppp={ppp}: 该恰好画出一个图标 mesh,实际 {seen} 个");
+        }
+    }
+
+    /// 递归找 `Shape::Mesh`(`Vec` / `Callback` 之外的容器只有 `Vec`)。
+    fn collect_meshes(s: &egui::Shape, f: &mut impl FnMut(egui::Rect)) {
+        match s {
+            egui::Shape::Mesh(_) => f(s.visual_bounding_rect()),
+            egui::Shape::Vec(v) => {
+                for x in v {
+                    collect_meshes(x, f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// ⑤:`icon_side` 的三条契约。
+    ///
+    /// 上面那条 DPI 测试验不到这里(见它的注释),所以边界单独钉:
+    /// - **正常标题条**(内高 24 点)下图标恒装得进内容区,且留着呼吸空间;
+    /// - **上界 16**:再大就压过主机名 —— 这是观感约束,不是安全约束;
+    /// - **下界 10**:极小 pane 上 `layout_geometry` 用
+    ///   `title_bar_px(ppp).min(px.h)` 把标题条压扁,那时**故意**不再跟着缩,
+    ///   宁可糊得整齐也不要缩成一坨。所以内高小于 12 点时图标确实会被
+    ///   `set_clip_rect` 裁 —— 这是有意为之的取舍,不是 bug,钉在这里免得
+    ///   将来有人当 bug「修」掉。
+    ///
+    /// 自证会变红:把 clamp 上限改成 `f32::MAX`(24.0/100.0 两条红);把下限
+    /// 改成 0.0(6.0/0.0 两条红);把 `- 2.0` 去掉(14.0 那条红 —— **24.0 那条
+    /// 抓不到这处删改**:24-2=22 与 24 都会被上界 16 吃掉,结果一样;14.0 落在
+    /// 两个边界都够不着的区间,`icon_side(14.0)` 才会因为少了这 2 点从
+    /// 12.0 变成 14.0)。
+    #[test]
+    fn icon_side_stays_inside_the_content_box_until_the_bar_is_squashed() {
+        // 正常标题条:32 点高、上下各 4 点边距 → 内高 24 点,超出上界。
+        assert!(icon_side(24.0) < 24.0, "正常内高下图标该装得进去");
+        assert_eq!(icon_side(24.0), 16.0, "正常内高下取上界 16");
+        // 两个边界都够不着的中间地带:直接体现 `- 2.0` 这个呼吸空间。
+        assert_eq!(icon_side(14.0), 12.0, "两个边界都够不着时应是内高减 2");
+        // 上界:标题条再高图标也不跟着长。
+        assert_eq!(icon_side(100.0), 16.0);
+        // 下界:压扁到这个程度就不再缩了,图标反而比内高大 —— 有意为之。
+        assert_eq!(icon_side(6.0), 10.0);
+        assert_eq!(icon_side(0.0), 10.0);
+    }
+
+    /// ④:焦点分屏的标题条要叠一层半透明 accent。
+    ///
+    /// 判据取「有一个覆盖整条标题条、且 alpha < 255 的填充」——
+    /// 不能只数形状个数(加一个别的装饰就跟着变绿),也不能比精确颜色
+    /// (`gamma_multiply` 的结果依赖 egui 内部的 gamma 曲线,钉死就成了
+    /// 测 egui 而不是测我们)。
+    ///
+    /// 自证会变红:把 `if v.focused` 那段 `rect_filled` 删掉;或把
+    /// `FOCUS_TINT` 改成 1.0(alpha 变 255,不再是「薄」的一层)。
+    #[test]
+    fn the_focused_panes_title_bar_is_tinted_with_translucent_accent() {
+        let id = PaneId(3);
+        let g = geom_800x600_title32(id.0, 1.0);
+        let full = egui::Rect::from_min_size(
+            egui::pos2(g.title_px.x as f32, g.title_px.y as f32),
+            egui::vec2(g.title_px.w as f32, g.title_px.h as f32),
+        );
+
+        let tinted = |focused: bool| {
+            let views = [TitleView {
+                geom: g,
+                index: 1,
+                host: Some("h"),
+                status: PaneStatus::Live,
+                focused,
+                appearance: None,
+                cwd_leaf: None,
+                tmux: None,
+            }];
+            let ctx = egui::Context::default();
+            let t = crate::theme::MULLION_DARK;
+            // **必须显式把时间推过 `Area` 的 fade_in**(同 `click_button` /
+            // `icon_backdrop_uses_the_pane_title_target_not_list_item` 的坑):
+            // 淡入没走完时,连不透明的 `panel_bg` 底色本身都会被 opacity 缩成
+            // 半透明,被误判成第二层「半透明覆盖」,现象是「有 accent 那层,
+            // 但计数多了一个」。
+            let mut shapes = Vec::new();
+            for t_sec in [0.0, 1.0] {
+                shapes = ctx
+                    .run(
+                        egui::RawInput {
+                            time: Some(t_sec),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            show(ctx, &t, &views);
+                        },
+                    )
+                    .shapes;
+            }
+            let mut hits = 0;
+            for cs in &shapes {
+                count_translucent_covers(&cs.shape, full, &mut hits);
+            }
+            hits
+        };
+
+        assert_eq!(tinted(true), 1, "焦点标题条上该有一层半透明 accent");
+        assert_eq!(tinted(false), 0, "非焦点标题条不该有任何半透明覆盖");
+    }
+
+    fn count_translucent_covers(s: &egui::Shape, full: egui::Rect, hits: &mut usize) {
+        match s {
+            egui::Shape::Rect(r) => {
+                let a = r.fill.a();
+                if a > 0 && a < 255 && r.rect.contains_rect(full.shrink(0.5)) {
+                    *hits += 1;
+                }
+            }
+            egui::Shape::Vec(v) => {
+                for x in v {
+                    count_translucent_covers(x, full, hits);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// ⑥:目录名取最后一级。
+    #[test]
+    fn dir_leaf_takes_the_last_component() {
+        assert_eq!(dir_leaf(b"/home/dev/Mullion").as_deref(), Some("Mullion"));
+        assert_eq!(dir_leaf(b"/home/dev/Mullion/").as_deref(), Some("Mullion"));
+        assert_eq!(
+            dir_leaf(b"/").as_deref(),
+            Some("/"),
+            "根目录自己就是最后一级"
+        );
+        assert_eq!(dir_leaf(b"~").as_deref(), Some("~"));
+        assert_eq!(dir_leaf(b"~/Mullion").as_deref(), Some("Mullion"));
+        assert_eq!(dir_leaf(b""), None, "空路径没有最后一级,别显示一个空标签");
+    }
+
+    /// 连续尾斜杠曾经会让整段目录名消失(`strip_suffix` 只剥一层,`/tmp//`
+    /// 剥一次还剩 `/tmp/`,`leaf` 算出来是空串,直接 `return None`)。
+    /// 这类值可能从 `mullion-term::parse_title`(按空白切 token,不做路径
+    /// 规范化)流进来,不能假设远端只给单斜杠结尾。
+    ///
+    /// 自证会变红:把 `dir_leaf` 里剥全部尾斜杠的 `while` 循环换回单次
+    /// `cwd.strip_suffix(b"/").unwrap_or(cwd)`。
+    #[test]
+    fn dir_leaf_strips_all_trailing_slashes_not_just_one() {
+        assert_eq!(dir_leaf(b"/tmp//").as_deref(), Some("tmp"));
+    }
+
+    /// 全是斜杠、没有可显示的末级——**有意保留**的现状:剥完尾斜杠只剩空串,
+    /// 走到「空路径没有最后一级」同一条分支,给 `None` 而不是伪造一个标签。
+    #[test]
+    fn dir_leaf_of_all_slashes_is_none() {
+        assert_eq!(
+            dir_leaf(b"//"),
+            None,
+            "剥完尾斜杠只剩空串,没有可显示的末级,有意给 None"
+        );
+    }
+
+    /// 非 UTF-8 的远端路径不能让标题条整段消失 —— 显示层宁可出一个 `�`
+    /// 也要把目录名摆出来(用户至少知道自己在哪个目录)。
+    ///
+    /// 自证会变红:把 `dir_leaf` 里的 `to_string_lossy` 换成
+    /// `std::str::from_utf8(..).ok()?`。
+    #[test]
+    fn a_non_utf8_dir_name_is_shown_lossily_rather_than_dropped() {
+        let leaf = dir_leaf(b"/tmp/\xff\xfe").expect("非 UTF-8 也要给出个东西来");
+        assert!(!leaf.is_empty());
+    }
+
+    /// ⑥:右区文字。两者都没有时**整段不画** —— 不留一个孤零零的分隔符。
+    ///
+    /// 自证会变红:把 `side_text` 的 `(None, None)` 分支改成
+    /// `Some(String::new())`。
+    #[test]
+    fn side_text_shows_what_it_has_and_nothing_when_it_has_neither() {
+        assert_eq!(
+            side_text(Some("Mullion"), Some("work")).as_deref(),
+            Some("work · Mullion")
+        );
+        assert_eq!(side_text(Some("Mullion"), None).as_deref(), Some("Mullion"));
+        assert_eq!(side_text(None, Some("work")).as_deref(), Some("work"));
+        assert_eq!(side_text(None, None), None);
+    }
+
+    /// **右区不许把 `Area` 撑出 `title_px`**(本文件顶部越界坑第 1 条):
+    /// 撑出去就会横向侵入右边邻居、纵向盖住终端第一行,吃掉本该属于终端的
+    /// 指针事件(T8 变体)。长目录名 + 长 tmux 名 + 高 DPI 一起上。
+    ///
+    /// **这条测试实际守住的是 `show()` 末尾 `ui.allocate_rect(full, ..)` 这条
+    /// 既有防线本身**(不是本任务新写的右区代码):`content` 是个独立
+    /// `UiBuilder` 建的 `new_child`,不参与父 `ui` 的尺寸折算;`show()` 最后
+    /// 显式 `allocate_rect(full, ..)` 把 `Area` 的占用尺寸硬钉成 `full`,跟
+    /// `content` 里长什么样完全解耦。**因此把右区换成任何实现(哪怕是不截断
+    /// 的 `Label::new(s)`,已实测)都验不出来**——那条防线挡在更外层,右区
+    /// 自己怎么写都到不了能撑爆 `Area` 的位置。
+    ///
+    /// 自证会变红(冲着真正被这条测试钉住的机制去):把 `show()` 末尾的
+    /// `ui.allocate_rect(full, egui::Sense::hover())` 换成
+    /// `ui.allocate_rect(full.shrink(50.0), egui::Sense::hover())`。已实测:
+    /// `ppp=1: Area 是 [750.0 0.0],该是 800×32`。
+    #[test]
+    fn a_long_cwd_and_tmux_name_do_not_push_the_area_past_title_px() {
+        for ppp in [1.0_f32, 1.5, 2.0] {
+            let id = PaneId(9);
+            let g = geom_800x600_title32(id.0, ppp);
+            let views = [TitleView {
+                geom: g,
+                index: 1,
+                host: Some("dev@a-very-long-hostname-that-eats-the-row"),
+                status: PaneStatus::Live,
+                focused: true,
+                appearance: None,
+                cwd_leaf: Some("a-directory-name-that-is-also-absurdly-long".to_string()),
+                tmux: Some("a-tmux-session-name-that-is-long-too"),
+            }];
+
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let t = crate::theme::MULLION_DARK;
+            for _ in 0..2 {
+                let _ = ctx.run(Default::default(), |ctx| {
+                    show(ctx, &t, &views);
+                });
+            }
+            let rect = ctx
+                .memory(|m| m.area_rect(area_id(id)))
+                .expect("标题条的 Area 该存在");
+            let want_w = g.title_px.w as f32 / ppp;
+            let want_h = g.title_px.h as f32 / ppp;
+            assert!(
+                (rect.width() - want_w).abs() < 0.5 && (rect.height() - want_h).abs() < 0.5,
+                "ppp={ppp}: Area 是 {:?},该是 {want_w}×{want_h}",
+                rect.size()
+            );
+        }
+    }
+
+    /// 左右分区各自截断:**长主机名不该把目录名挤掉**。分屏一多的时候,
+    /// 主机名往往全都一样,目录名恰恰是唯一能区分的那一项。
+    ///
+    /// `cwd_leaf` 特意造得很长(拼上 `"work · "` 前缀后接近 170 字符),
+    /// 这样右区放置时刻的 `ui.available_width()` 会被真正踩到(粗估 ~740pt)。
+    ///
+    /// **判据是宽度,不是文字内容**:早前版本靠 `joined.contains("dev@")`
+    /// 判主机名有没有被挤没,但 `epaint::Galley::text()` 的文档原话是
+    /// 「The full, non-elided text of the input job」(`epaint-0.30.0/src/
+    /// text/text_layout_types.rs:718-722`,实现直接 `&self.job.text`)——
+    /// **不管排版时截没截、挤没挤到 0,它永远吐出排版前的完整原文**。实测过:
+    /// 把右区手动 `layout_no_wrap` 换成 `ui.add(egui::Label::new(s).truncate())`
+    /// 后,主机名 Label 拿到的可用宽度确实被压到 0,但 `galley.text()` 里主机名
+    /// 全文依然原样出现,`contains("dev@")` 这条断言在结构上**不可能**因为任何
+    /// 宽度挤压类变异变红——所以改用 `collect_text_widths` 读 `galley.size().x`
+    /// (由 `galley_from_rows` 从实际排出来的 `rows` 算,`text_layout.rs:592-678`,
+    /// 会反映挤压/省略后的宽度,不同于 `.text()`)。
+    ///
+    /// **右区宽度本身量不出「夹没夹住」,只有主机名宽度量得出「挤没挤」**:
+    /// 曾经想用 `side_w <= full.width() * SIDE_MAX_FRAC + 1.0` 当右区判据,
+    /// 实测发现这条在**正确实现下就是假的**——右区手动 `layout_no_wrap` 传的是
+    /// `f32::INFINITY`(`egui-0.30.0/src/painter.rs:516-523`),产出的 `galley`
+    /// 自身的 `rect`/`size()` 是排版时的自然宽度,`SIDE_MAX_FRAC` 夹紧只夹了
+    /// `allocate_exact_size` 传的矩形宽度(`w`),跟 `galley` 自己的 `size()`
+    /// 是两个不同的量;`with_clip_rect` 只影响绘制,不改 `galley.rect`。
+    /// 而 `Shape::Text`(`epaint-0.30.0/src/shape.rs:992-1020`)只存 `pos` +
+    /// 完整 `galley`,不存 `allocate_exact_size` 那个已经夹过的矩形,读不回来。
+    /// 实测(ppp=1,标题条 800pt,`SIDE_MAX_FRAC*800+1=361`):
+    /// - 正确实现:右区 galley 宽度 **969pt**(已经 > 361,说明这条判据在正确
+    ///   实现下就会假红,不能用);主机名宽度 **341pt**。
+    /// - `.truncate()` 变异:右区宽度 728pt(依然 > 361,不具区分度);
+    ///   主机名宽度骤降到 **12pt**。
+    ///
+    /// 两种实现下右区宽度都超过 361,量不出区别;主机名宽度从 341 掉到 12,
+    /// 区分度非常干净。所以最终判据只保留主机名宽度下限(`> 20.0`,够放几个
+    /// 字符),这也更直接对应测试名字「不该把目录名挤掉」反过来看的那面——
+    /// 「不该把主机名挤没」。`contains("work")` / 目录名前缀两条留作内容层面
+    /// 的存在性检查(右区没有整段消失),不是挤压判据。
+    ///
+    /// **自证操作**(已实测,真会变红):把 `show()` 里右区那段手动
+    /// `layout_no_wrap` + `allocate_exact_size` + `with_clip_rect` 换成
+    /// `ui.add(egui::Label::new(s).truncate());`,重跑这条测试,
+    /// `host_w > 20.0` 断言失败,报错信息里能看到实测宽度 ≈12。
+    #[test]
+    fn a_long_host_name_does_not_squeeze_out_the_directory_name() {
+        let id = PaneId(11);
+        // 单靠短目录名(比如原来的 "Mullion")无法让 SIDE_MAX_FRAC 夹紧
+        // 真正生效——见上面函数文档。这里特意造一个很长的目录名。
+        let long_dir = "a-directory-name-that-is-absurdly-long-and-just-keeps-going-\
+and-going-and-going-and-going-and-going-and-going-and-going-and-going-and-going-\
+and-going-and-going-and-going";
+        let views = [TitleView {
+            geom: geom_800x600_title32(id.0, 1.0),
+            index: 1,
+            host: Some("dev@a-very-long-hostname-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+            cwd_leaf: Some(long_dir.to_string()),
+            tmux: Some("work"),
+        }];
+
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let mut texts: Vec<(String, f32)> = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(Default::default(), |ctx| {
+                show(ctx, &t, &views);
+            });
+            texts.clear();
+            for cs in &out.shapes {
+                collect_text_widths(&cs.shape, &mut texts);
+            }
+        }
+        let joined = texts
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let dir_prefix = &long_dir[..20];
+        assert!(
+            joined.contains(dir_prefix),
+            "目录名被长主机名挤掉了,画出来的文字是:{joined}"
+        );
+        assert!(
+            joined.contains("work"),
+            "tmux 名没画出来,画出来的文字是:{joined}"
+        );
+        // 主机名那个 shape 实际分到的宽度:这是真正的挤压判据。
+        // 用宽度而非 `galley.text()` 内容——见上面函数文档,`Galley::text()`
+        // 结构性地永远返回排版前的完整原文,测不出任何视觉挤压。
+        let host_w = texts
+            .iter()
+            .find(|(s, _)| s.contains("dev@"))
+            .map(|(_, w)| *w)
+            .unwrap_or(0.0);
+        assert!(
+            host_w > 20.0,
+            "主机名被挤到几乎 0 宽(实测 {host_w}pt,够放几个字符至少要 >20pt)—— \
+             右区抢了主机名的地盘,画出来的文字是:{joined}"
+        );
+    }
+
+    /// 收集每个 `Shape::Text` 的 `(原文, 实际分到的宽度)`。
+    ///
+    /// **宽度取 `galley.size().x`(即 `rect.size().x`),不是文字内容**:
+    /// `epaint::Galley::text()` 的文档原话是「The full, non-elided text of
+    /// the input job」(`epaint-0.30.0/src/text/text_layout_types.rs:718-722`,
+    /// 实现直接 `&self.job.text`)——**不管排版时截没截、挤没挤到 0,它永远
+    /// 吐出排版前的完整原文**。真正反映挤压的是 `Galley.rect`(由
+    /// `galley_from_rows` 从实际排出来的 `rows` 算出,`text_layout.rs:592-678`),
+    /// 也就是 `size()`。
+    fn collect_text_widths(s: &egui::Shape, out: &mut Vec<(String, f32)>) {
+        match s {
+            egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.size().x)),
+            egui::Shape::Vec(v) => {
+                for x in v {
+                    collect_text_widths(x, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
