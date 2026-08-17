@@ -119,6 +119,20 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
     let mut action = TitleAction::default();
     for v in views {
         let tp = v.geom.title_px;
+        // F100:pane 三处插桩。终端网格是 GPU 自绘的,accesskit 那条腿看不见它,
+        // 而「这块终端」恰恰是最常要指的东西。**放在下面那个 `continue` 之前** ——
+        // 标题条关掉时(F83)pane 和终端区仍然要能标。
+        let px = |r: crate::shell::workspace::PxRect| {
+            egui::Rect::from_min_size(
+                egui::pos2(r.x as f32 / ppp, r.y as f32 / ppp),
+                egui::vec2(r.w as f32 / ppp, r.h as f32 / ppp),
+            )
+        };
+        crate::ui::annotate::mark(ctx, format!("分屏 {}", v.index), px(v.geom.px));
+        crate::ui::annotate::mark(ctx, format!("分屏 {}/终端区", v.index), px(v.geom.term_px));
+        if tp.h != 0 {
+            crate::ui::annotate::mark(ctx, format!("分屏 {}/标题条", v.index), px(tp));
+        }
         if tp.h == 0 {
             continue; // 标题条关掉了(F83 开关)
         }
@@ -273,6 +287,51 @@ mod tests {
                 h: 568,
             },
             grid: (80, 28),
+        }
+    }
+
+    /// pane 整块 / 标题条 / 终端区都要能在标注模式(F100)里选中。终端网格是
+    /// GPU 自绘的,不是 egui widget,accesskit 那条腿覆盖不到它 —— 只能手工插桩。
+    ///
+    /// **标题条关掉时(F83)仍要能标 pane 与终端区**:`show` 里那句
+    /// `if tp.h == 0 { continue }` 在插桩之后,不能把它们一起跳过。
+    ///
+    /// 自证会变红:把 `show` 里三句 `annotate::mark` 中任意一句注释掉。
+    #[test]
+    fn panes_are_markable_even_when_the_title_bar_is_hidden() {
+        for title_h in [0, 32] {
+            let ctx = egui::Context::default();
+            crate::ui::annotate::toggle(&ctx);
+            let mut view = TitleView {
+                geom: geom_800x600_title32(1),
+                index: 1,
+                host: Some("dev@build-01"),
+                status: PaneStatus::Live,
+                focused: true,
+                appearance: None,
+            };
+            view.geom.title_px.h = title_h;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(
+                    ctx,
+                    &crate::theme::MULLION_DARK,
+                    std::slice::from_ref(&view),
+                );
+            });
+            let paths = crate::ui::annotate::spot_paths(&ctx);
+            assert!(
+                paths.contains(&"分屏 1".to_string()),
+                "title_h={title_h}: {paths:?}"
+            );
+            assert!(
+                paths.contains(&"分屏 1/终端区".to_string()),
+                "title_h={title_h}: {paths:?}"
+            );
+            assert_eq!(
+                paths.contains(&"分屏 1/标题条".to_string()),
+                title_h != 0,
+                "title_h={title_h}: 标题条关掉时不该登记一个零高的标题条"
+            );
         }
     }
 

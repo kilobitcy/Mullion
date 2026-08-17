@@ -7550,7 +7550,7 @@ fn render_frame(
     // 静默清空)。改成"仅当本趟产出非默认值时才覆盖":真实点击总能被记住,
     // discard 趟的空结果不会覆盖掉它;若两趟都没有真实点击,`actions` 保持
     // 默认值,语义不变。
-    let full_output = a.egui_ctx.run(raw_input, |ctx| {
+    let mut full_output = a.egui_ctx.run(raw_input, |ctx| {
         // `files` 是 `Option<&mut PanelFrame>`:`ctx.run` 的闭包是 `FnMut`、
         // 内部是个多趟 loop(见上面注释),不能把它按值 move 进来(第二趟就没了)。
         // `as_deref_mut()` 每趟从 `&mut Option<&mut PanelFrame>` 里取一个新的
@@ -7573,6 +7573,15 @@ fn render_frame(
             actions = this_pass;
         }
     });
+    // F100 标注模式的自动候选:本帧的 accesskit 树归约后给**下一帧**当候选
+    // (`annotate::overlay` 跑在上面那个 `ctx.run` 里面,树要等 run 返回才有)。
+    // 必须在 `handle_platform_output` **之前** take —— 那个函数按值吃掉整个
+    // `PlatformOutput`。take 而非 clone:我们不调 `init_accesskit`,egui-winit
+    // 那边的 adapter 恒为 None,拿到 None 什么都不做。
+    crate::ui::annotate::ingest_accesskit(
+        &a.egui_ctx,
+        full_output.platform_output.accesskit_update.take(),
+    );
     a.egui_state
         .handle_platform_output(&a.window, full_output.platform_output);
     let paint_jobs = a

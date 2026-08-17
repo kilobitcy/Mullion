@@ -24,9 +24,17 @@ tokio = { workspace = true, features = ["time"] }
 russh.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 directories = "5"
-egui.workspace = true
+# F100 标注模式的自动候选:模式开着时 egui 每帧吐一棵含全部控件的 accesskit 树,
+# 拿来当候选(见 `ui/annotate.rs`)—— 没有它,能标注的就只有手工插桩的那几十个
+# 容器,按钮/输入框/复选框一个都点不中。
+# `egui-winit` 的同名 feature **必须同步开**:它对 `PlatformOutput` 做穷尽解构,
+# egui 那边多出 `accesskit_update` 字段而它这边没开,就是 E0027 整片编不过。
+# 我们**不调** `State::init_accesskit`,所以 adapter 恒为 `None`,不注册 Windows
+# UIA,没有平台侧开销;代价只是 exe 里多带 accesskit(交叉编译已验证,新增的
+# `uiautomationcore.dll`/`propsys.dll` 都是 Windows 自带的系统 DLL)。
+egui = { workspace = true, features = ["accesskit"] }
 egui-wgpu.workspace = true
-egui-winit.workspace = true
+egui-winit = { workspace = true, features = ["accesskit"] }
 rfd.workspace = true
 time.workspace = true
 log.workspace = true
@@ -73,19 +81,11 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 # 离屏 UI 截图 harness(`examples/ui_shot.rs`):无头把 egui 外壳渲染成 PNG,
 # 给「改完能自己看一眼」用。**只在 example/test target 生效**,不进 exe。
-# 它给 egui 开 accesskit feature —— feature 是并集,故 `cargo test` 会多编
-# accesskit,但 `cargo build --release` 不含 dev-deps,正式构建不受影响。
-egui_kittest = { version = "0.30", features = ["wgpu"] }
-# **必须与 egui_kittest 同时出现**:kittest 给 `egui` 开 accesskit,于是
-# `egui::PlatformOutput` 多出 `accesskit_update` 字段;而 `egui-winit` 里对
-# 该结构的穷尽解构由**它自己**的同名 feature 控制,不开就少一个字段、E0027
-# 整片编不过。两个同名 feature 必须同步。
 #
-# 放 dev-dependencies 而不是上面的 [dependencies],是靠 `resolver = "2"`:
-# dev-deps 的 feature 不统一到正式构建 —— `cargo test`/`--all-targets` 下
-# 两者都带 accesskit(编得过),`cargo build --release` 不含 dev-deps,
-# 正式 exe 里 egui/egui-winit 都还是原样,不白搭一个 accesskit_winit 进去。
-egui-winit = { workspace = true, features = ["accesskit"] }
+# 它也给 egui 开 accesskit feature —— 从 F100 自动候选那一版起,正式依赖里
+# 已经开了同一个 feature(见上面 `[dependencies]` 的 egui/egui-winit),所以
+# 这里不再需要额外声明 `egui-winit` 来对齐两个同名 feature。
+egui_kittest = { version = "0.30", features = ["wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # 自建 wgpu device 要阻塞等 `request_device`。TestRenderer::new() 会取
 # 枚举到的第一个 adapter(不可控),故不用它,见 examples/ui_shot.rs。

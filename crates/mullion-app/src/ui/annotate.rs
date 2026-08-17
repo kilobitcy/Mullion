@@ -31,6 +31,10 @@
 
 use std::panic::Location;
 
+// accesskit 走 egui 的 re-export(`egui/src/lib.rs:448` 的 `pub use accesskit`),
+// **不在 Cargo.toml 里另开一个直接依赖** —— 那样两边可能解析到不同版本,
+// `TreeUpdate` 就成了两个互不相认的类型。
+use egui::accesskit;
 use mullion_term::keymap::{Key, Mods};
 
 use crate::theme::{self, Theme};
@@ -70,14 +74,26 @@ pub fn hotkey(key: Key, mods: Mods, on: bool) -> Option<Hotkey> {
     }
 }
 
+/// 一处候选的来源。
+///
+/// 分两支是因为自动候选**没有**插桩点:硬给它编一个 `Location` 等于骗人,而
+/// F100 导出的全部价值就是「这段文本里的位置能直接拿去读代码」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Src {
+    /// 手工 `mark()` 的插桩点。`&'static Location` 是编译期常量,不是运行时抓的栈。
+    Site(&'static Location<'static>),
+    /// accesskit 自动登记。`container` = 包住它的最小手工容器的插桩点(已渲染成
+    /// `文件:行号`),没有容器则 `None`。
+    Auto { container: Option<String> },
+}
+
 /// 一处可点选的目标。每帧由散布在 UI 里的 `mark()` 重新登记。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Spot {
     /// 语义路径,用 `/` 分层,如 `会话管理器/左栏/会话行[节点 03]`。
     pub path: String,
     pub rect: egui::Rect,
-    /// 插桩点的源码位置。`&'static Location` 是编译期常量,不是运行时抓的栈。
-    pub src: &'static Location<'static>,
+    pub src: Src,
 }
 
 /// 已点选的一处。跟 `Spot` 分开是因为它要**跨帧活着**:`spots` 每帧清空重建
@@ -96,11 +112,14 @@ pub struct Picked {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Detail {
     /// 只列选中项,一行一条。
-    #[default]
     Compact,
     /// 加上本帧一共登记了多少处,以及每条的完整层级。
     Normal,
     /// 连**没选中**的候选一起列 —— 用来问「这一片区域里都有些什么」。
+    ///
+    /// **默认档**:一进标注模式就该看得见这片区域里有什么。紧凑档只列选中项,
+    /// 而「我不知道这里都有些什么」正是要问的东西。
+    #[default]
     Full,
 }
 
@@ -159,8 +178,14 @@ struct State {
     export_request: bool,
     /// 生成好、等着 `build_ui` 取走送剪贴板的那一份。
     export_ready: Option<String>,
-    /// 导出详细度(`Ctrl+Shift+D` 循环)。默认紧凑。
+    /// 导出详细度(`Ctrl+Shift+D` 循环)。默认详细。
     detail: Detail,
+    /// 上一帧 accesskit 树归约出来的自动候选:本帧的树要等 `ctx.run` 返回后才
+    /// 拿得到(`overlay` 跑在 `run` **里面**),只能给下一帧用。
+    auto: Vec<AutoNode>,
+    /// `overlay` 那块吃指针的全屏区自己的 widget id。它 `Sense::click()` 是
+    /// focusable 的,会进 accesskit 树 —— 不剔掉就成了一个盖住全屏的候选。
+    overlay_id: Option<egui::Id>,
 }
 
 fn id() -> egui::Id {
@@ -189,11 +214,21 @@ pub fn is_on(ctx: &egui::Context) -> bool {
 pub fn toggle(ctx: &egui::Context) -> bool {
     let on = !is_on(ctx);
     ctx.data_mut(|d| d.insert_temp(on_id(), on));
+    // 树只在模式开着时构:关着时 egui 压根不进 accesskit 那段代码,
+    // 「模式关着零开销」这条不变。
+    if on {
+        ctx.enable_accesskit();
+    } else {
+        ctx.disable_accesskit();
+    }
     with_state(ctx, |st| {
         st.on = on;
         if !on {
             st.picked.clear();
             st.spots.clear();
+            // 自动候选也要清:留着的话下次进来第一帧带着上次界面的候选(用户
+            // 早切到别的标签页了),描边描在一片空地上。
+            st.auto.clear();
             st.export_request = false;
         }
     });
@@ -229,10 +264,20 @@ pub fn take_export(ctx: &egui::Context) -> Option<String> {
     with_state(ctx, |st| st.export_ready.take())
 }
 
-/// 读回本帧登记的语义路径。**给测试与 `examples/ui_shot.rs` 用** —— 插桩铺没铺、
+/// 本帧的完整候选表 = 手工插桩 + 自动候选。
+///
+/// **读候选的地方一律走这里**,别再直接读 `st.spots`:只让 `overlay` 看见自动
+/// 候选的话,屏上点得中、导出与测试里却看不见,这种错位在无头环境查不出来。
+fn all_of(st: &State) -> Vec<Spot> {
+    let mut v = st.spots.clone();
+    v.extend(auto_spots(&st.auto, &st.spots));
+    v
+}
+
+/// 读回本帧的候选路径。**给测试与 `examples/ui_shot.rs` 用** —— 插桩铺没铺、
 /// 铺在哪儿,在无头环境里没有别的办法看见。
 pub fn spot_paths(ctx: &egui::Context) -> Vec<String> {
-    with_state(ctx, |st| st.spots.iter().map(|s| s.path.clone()).collect())
+    with_state(ctx, |st| all_of(st).into_iter().map(|s| s.path).collect())
 }
 
 /// 读回本帧登记的矩形:**先找路径完全相等的**,没有再退回「含 `needle`
@@ -251,10 +296,10 @@ pub fn spot_paths(ctx: &egui::Context) -> Vec<String> {
 #[cfg(test)]
 pub fn spot_rect(ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
     with_state(ctx, |st| {
-        st.spots
-            .iter()
+        let all = all_of(st);
+        all.iter()
             .find(|s| s.path == needle)
-            .or_else(|| st.spots.iter().find(|s| s.path.contains(needle)))
+            .or_else(|| all.iter().find(|s| s.path.contains(needle)))
             .map(|s| s.rect)
     })
 }
@@ -271,7 +316,7 @@ pub fn spot_rect(ctx: &egui::Context, needle: &str) -> Option<egui::Rect> {
 /// **必须在同一帧的 `overlay()` 之前调** —— `overlay` 末尾会清空 `spots`。
 pub fn ensure_picked(ctx: &egui::Context, needle: &str) -> bool {
     with_state(ctx, |st| {
-        let Some(sp) = st.spots.iter().find(|s| s.path.contains(needle)).cloned() else {
+        let Some(sp) = all_of(st).into_iter().find(|s| s.path.contains(needle)) else {
             return false;
         };
         let p = picked_of(&sp);
@@ -299,15 +344,22 @@ pub fn mark(ctx: &egui::Context, path: impl Into<String>, rect: egui::Rect) {
     let spot = Spot {
         path: path.into(),
         rect,
-        src: Location::caller(),
+        src: Src::Site(Location::caller()),
     };
     with_state(ctx, |st| st.spots.push(spot));
 }
 
-/// 源码位置渲染成 `路径:行号`。**保留完整相对路径**(不只留文件名):这段文本是
+/// 来源渲染成 `路径:行号`。**保留完整相对路径**(不只留文件名):这段文本是
 /// 给 Claude 读的,全路径能直接拿去 `Read`,`list.rs:349` 还得先搜一遍。
-fn src_of(loc: &Location<'static>) -> String {
-    format!("{}:{}", loc.file(), loc.line())
+///
+/// 自动候选给不出行号,只能给出「包住它的那个容器」的插桩点 —— 那也够 Claude
+/// 定位到文件,再按控件文字搜一下就到行。没有容器时**明说不知道**,不伪造。
+fn src_of(src: &Src) -> String {
+    match src {
+        Src::Site(loc) => format!("{}:{}", loc.file(), loc.line()),
+        Src::Auto { container: Some(c) } => format!("{c}(容器 · 自动候选)"),
+        Src::Auto { container: None } => "(自动候选 · 无插桩容器)".to_string(),
+    }
 }
 
 /// 矩形渲染成 `(左,上)-(右,下)`,取整到整数点。半像素小数对人和 Claude 都没有
@@ -340,7 +392,7 @@ fn picked_of(s: &Spot) -> Picked {
     Picked {
         path: s.path.clone(),
         rect: rect_of(s.rect),
-        src: src_of(s.src),
+        src: src_of(&s.src),
     }
 }
 
@@ -356,6 +408,148 @@ pub fn pick(picked: &mut Vec<Picked>, spot: &Spot) {
         }
         None => picked.push(p),
     }
+}
+
+/// accesskit 的角色翻成人说的话。路径是要照着念给 Claude 听的,`TextInput`
+/// 念不出来。
+fn role_name(r: accesskit::Role) -> &'static str {
+    use accesskit::Role;
+    match r {
+        Role::Button => "按钮",
+        Role::Label => "文字",
+        Role::TextInput | Role::MultilineTextInput => "输入框",
+        Role::CheckBox => "复选框",
+        Role::RadioButton => "单选",
+        Role::RadioGroup => "单选组",
+        Role::ComboBox => "下拉框",
+        Role::Slider => "滑块",
+        Role::SpinButton => "数值框",
+        Role::Link => "链接",
+        Role::ColorWell => "色块",
+        Role::ProgressIndicator => "进度",
+        Role::ScrollView => "滚动区",
+        Role::Window => "窗口",
+        _ => "控件",
+    }
+}
+
+/// 吃下本帧的 accesskit 树,归约成 `AutoNode` 存起来给**下一帧**当候选。
+///
+/// 由 `app.rs` 在 `ctx.run` 返回之后、`handle_platform_output` 之前调 ——
+/// 那个函数按值吃掉整个 `PlatformOutput`,晚一步就拿不到了。
+pub fn ingest_accesskit(ctx: &egui::Context, update: Option<accesskit::TreeUpdate>) {
+    if !is_on(ctx) {
+        return;
+    }
+    let Some(update) = update else {
+        return;
+    };
+    // `overlay` 自己那块吃指针的全屏区也会进树(`Sense::click()` 是 focusable 的),
+    // 不剔掉就是一个盖住全屏的候选。
+    //
+    // `Id::accesskit_id()` 是 `pub(crate)`,外面调不到;但 `Id::value()` 是 pub,
+    // 而 egui 那句就是 `self.value().into()`(`egui/src/id.rs:82`),所以这样构出
+    // 来的 `NodeId` 与它写进树里的那个必然相等。
+    let skip = with_state(ctx, |st| {
+        st.overlay_id.map(|id| accesskit::NodeId::from(id.value()))
+    });
+    let nodes: Vec<AutoNode> = update
+        .nodes
+        .iter()
+        .filter(|(id, _)| Some(*id) != skip)
+        .filter_map(|(_, n)| {
+            // bounds 为 None 的是根节点之类没有几何的东西,点不到。
+            let b = n.bounds()?;
+            Some(AutoNode {
+                rect: egui::Rect::from_min_max(
+                    egui::pos2(b.x0 as f32, b.y0 as f32),
+                    egui::pos2(b.x1 as f32, b.y1 as f32),
+                ),
+                role: role_name(n.role()),
+                // egui 对 `Role::Label` 把文本写进 value 而不是 label
+                // (`egui/src/response.rs` 的 `fill_accesskit_node_from_widget_info`),
+                // 两处都要看,只看一处会让所有静态文字变成没有名字的「文字」。
+                label: n
+                    .label()
+                    .map(str::to_string)
+                    .or_else(|| n.value().map(str::to_string)),
+            })
+        })
+        .collect();
+    with_state(ctx, |st| st.auto = nodes);
+}
+
+/// accesskit 树归约成的一个节点。**故意不含任何 accesskit 类型** —— 组装逻辑
+/// (`auto_spots`)才好单测:造三个字段的字面量,而不是去串一堆 builder。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoNode {
+    pub rect: egui::Rect,
+    /// 中文角色名,如「按钮」。来自 `role_name()`,是编译期常量。
+    pub role: &'static str,
+    /// 控件上的文字。egui 对 `Role::Label` 把文本写进 value 而不是 label,
+    /// 归约那一层已经统一取过。
+    pub label: Option<String>,
+}
+
+/// 两个矩形是不是同一块。阈值 1pt:手工 `mark()` 传的就是 widget 自己的 rect,
+/// 但中间过了 `Area` 偏移与 DPI 换算,不会分毫不差。
+fn same_rect(a: egui::Rect, b: egui::Rect) -> bool {
+    (a.left() - b.left()).abs() < 1.0
+        && (a.top() - b.top()).abs() < 1.0
+        && (a.right() - b.right()).abs() < 1.0
+        && (a.bottom() - b.bottom()).abs() < 1.0
+}
+
+/// 把归约后的 accesskit 节点组装成候选:挂容器、去重、同名编号。
+///
+/// **纯函数**,不碰 egui 状态。`manual` 是本帧手工 `mark()` 登记的那些。
+pub fn auto_spots(auto: &[AutoNode], manual: &[Spot]) -> Vec<Spot> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for n in auto {
+        if !n.rect.is_positive() {
+            continue;
+        }
+        // 手工那份信息更多(有真行号),重合就让给它 —— 同一个东西在候选表里
+        // 出现两次,点上去命中谁全看排序。
+        if manual.iter().any(|m| same_rect(m.rect, n.rect)) {
+            continue;
+        }
+        // 挂到**包住它的最小**手工容器下 —— 同 `hit()` 里「面积最小 = 最具体」
+        // 的道理;挂到最外层那个铺满窗口的容器,等于每条的源码位置都指向同一处。
+        let host = manual
+            .iter()
+            .filter(|m| m.rect.contains_rect(n.rect))
+            .min_by(|a, b| {
+                a.rect
+                    .area()
+                    .partial_cmp(&b.rect.area())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let leaf = match n.label.as_deref() {
+            Some(l) if !l.is_empty() => format!("{}「{}」", n.role, l),
+            _ => n.role.to_string(),
+        };
+        let base = match host {
+            Some(h) => format!("{}/{}", h.path, leaf),
+            None => format!("自动/{leaf}"),
+        };
+        let count = seen.entry(base.clone()).or_insert(0);
+        *count += 1;
+        let path = if *count == 1 {
+            base
+        } else {
+            format!("{base}[{count}]")
+        };
+        out.push(Spot {
+            path,
+            rect: n.rect,
+            src: Src::Auto {
+                container: host.map(|h| src_of(&h.src)),
+            },
+        });
+    }
+    out
 }
 
 /// 生成导出的 Markdown。**纯函数** —— 这是本模块唯一必须字字对的部分,所以它
@@ -403,7 +597,7 @@ pub fn markdown(env: &Env, picked: &[Picked], spots: &[Spot], detail: Detail) ->
                 "- {} — {} — {}\n",
                 sp.path,
                 rect_of(sp.rect),
-                src_of(sp.src)
+                src_of(&sp.src)
             ));
         }
         s.push_str("\n</details>\n");
@@ -419,12 +613,13 @@ pub fn overlay(ctx: &egui::Context, t: &Theme, env: &Env) {
     if !is_on(ctx) {
         return;
     }
-    let (spots, mut picked, export_request, detail) = with_state(ctx, |st| {
+    let (spots, mut picked, export_request, detail, auto_empty) = with_state(ctx, |st| {
         (
-            st.spots.clone(),
+            all_of(st),
             st.picked.clone(),
             std::mem::take(&mut st.export_request),
             st.detail,
+            st.auto.is_empty(),
         )
     });
 
@@ -446,6 +641,8 @@ pub fn overlay(ctx: &egui::Context, t: &Theme, env: &Env) {
         .fade_in(false)
         .show(ctx, |ui| {
             let resp = ui.allocate_rect(screen, egui::Sense::click());
+            // 记下自己的 id,`ingest_accesskit` 要拿它把这块全屏区从树里剔掉。
+            with_state(ui.ctx(), |st| st.overlay_id = Some(resp.id));
             let p = ui.painter();
 
             // 已选中的:描边 + 编号徽标。先画,让悬停描边盖在上面。
@@ -503,6 +700,13 @@ pub fn overlay(ctx: &egui::Context, t: &Theme, env: &Env) {
             );
         });
 
+    // 刚进模式那一帧手上还没有树 —— 主动催一帧,否则没有别的输入时自动候选
+    // 永远不出现(用户会以为标注模式只认得那几十个容器)。**只在空的时候催**:
+    // 每帧无条件催就是 T3/N3 那条「每秒几千次重绘」的红线。
+    if auto_empty {
+        ctx.request_repaint();
+    }
+
     let ready = export_request.then(|| markdown(env, &picked, &spots, detail));
     with_state(ctx, |st| {
         st.picked = picked;
@@ -548,7 +752,7 @@ mod tests {
         Spot {
             path: path.into(),
             rect,
-            src: Location::caller(),
+            src: Src::Site(Location::caller()),
         }
     }
 
@@ -633,11 +837,13 @@ mod tests {
         assert_eq!(hotkey(Key::Char('f'), only_ctrl, true), None);
     }
 
-    /// 三档循环必须回到起点,否则换过一圈就再也回不到默认的紧凑档。
+    /// 三档循环必须回到起点,否则换过一圈就再也回不到某一档。
+    ///
+    /// 起点显式写成 `Compact`,不再从 `Detail::default()` 取 —— 默认档是哪一档
+    /// 由 `the_default_detail_level_is_full` 单独守,两件事分开测。
     #[test]
-    fn detail_cycles_back_to_compact() {
-        let d = Detail::default();
-        assert_eq!(d, Detail::Compact);
+    fn detail_cycles_back_to_where_it_started() {
+        let d = Detail::Compact;
         assert_eq!(d.next(), Detail::Normal);
         assert_eq!(d.next().next(), Detail::Full);
         assert_eq!(d.next().next().next(), Detail::Compact);
@@ -704,7 +910,7 @@ mod tests {
         let row1 = spot("列表/会话行[甲]", r(0.0, 0.0, 100.0, 44.0));
         let row2 = spot("列表/会话行[乙]", r(0.0, 44.0, 100.0, 44.0));
         // 同一个 helper 造的,`src` 必然相同 —— 这正是要防的场景。
-        assert_eq!(src_of(row1.src), src_of(row2.src));
+        assert_eq!(src_of(&row1.src), src_of(&row2.src));
 
         let mut picked = Vec::new();
         pick(&mut picked, &row1);
@@ -740,7 +946,7 @@ mod tests {
         );
         assert!(md.contains("(45,118)-(307,162)"), "缺屏幕矩形:{md}");
         assert!(
-            md.contains(&src_of(s.src)),
+            md.contains(&src_of(&s.src)),
             "缺插桩点源码位置 —— 没有它 Claude 还得自己猜是哪段代码:{md}"
         );
         // 全局上下文那一行:窗口尺寸/缩放/主题/界面/密度档。
@@ -902,5 +1108,302 @@ mod tests {
             "查父控件拿到了子控件的矩形 —— 往这块中心注入点击会点到 × 上"
         );
         assert_eq!(spot_rect(&ctx, "标签栏/标签 2/关闭"), Some(child));
+    }
+
+    /// 默认档必须是**详细** —— 用户要的是「一进标注模式就能看见这片区域里都有
+    /// 什么」,紧凑档只列选中项,做不到这件事。
+    ///
+    /// 自证会变红:把 `Detail` 上的 `#[default]` 挪回 `Compact`。
+    #[test]
+    fn the_default_detail_level_is_full() {
+        assert_eq!(Detail::default(), Detail::Full);
+    }
+
+    /// 三种来源在导出里长得不一样:手工插桩给得出 `文件:行号`,自动候选只能给出
+    /// 「包住它的那个容器」的插桩点,没有容器时必须**明说自己不知道**,不能伪造
+    /// 一个看起来像真的行号。
+    ///
+    /// 自证会变红:把 `src_of` 的 `Auto` 两支合并成一支。
+    #[test]
+    fn source_rendering_tells_manual_sites_apart_from_automatic_candidates() {
+        let manual = Src::Site(Location::caller());
+        assert!(src_of(&manual).contains(':'), "手工插桩要给出 文件:行号");
+
+        let with_host = Src::Auto {
+            container: Some("crates/mullion-app/src/ui/settings.rs:123".into()),
+        };
+        let s = src_of(&with_host);
+        assert!(s.contains("settings.rs:123"), "要带上容器插桩点:{s}");
+        assert!(s.contains("自动"), "要标明这是自动候选,不是插桩点本身:{s}");
+
+        let orphan = Src::Auto { container: None };
+        assert!(
+            src_of(&orphan).contains("无插桩容器"),
+            "没有容器时必须明说,不能伪造行号"
+        );
+    }
+
+    /// 读候选的每个入口都必须看见自动候选。只改 `overlay` 不改 `spot_paths` 的话,
+    /// 屏上点得中、`ui_shot` 与测试却看不见 —— 这种错位在无头环境里查不出来。
+    ///
+    /// 自证会变红:把 `spot_paths` 改回只读 `st.spots`。
+    #[test]
+    fn every_reader_sees_both_manual_and_automatic_candidates() {
+        let ctx = egui::Context::default();
+        toggle(&ctx);
+        with_state(&ctx, |st| {
+            st.auto = vec![AutoNode {
+                rect: r(10.0, 10.0, 60.0, 24.0),
+                role: "按钮",
+                label: Some("保存".into()),
+            }];
+        });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            mark(ctx, "设置", r(0.0, 0.0, 200.0, 200.0));
+        });
+
+        let paths = spot_paths(&ctx);
+        assert!(paths.contains(&"设置".to_string()), "手工那条腿:{paths:?}");
+        assert!(
+            paths.contains(&"设置/按钮「保存」".to_string()),
+            "自动那条腿:{paths:?}"
+        );
+        assert_eq!(
+            spot_rect(&ctx, "设置/按钮「保存」"),
+            Some(r(10.0, 10.0, 60.0, 24.0))
+        );
+        assert!(ensure_picked(&ctx, "按钮「保存」"), "自动候选也要能被选中");
+    }
+
+    fn auto(role: &'static str, label: Option<&str>, rect: egui::Rect) -> AutoNode {
+        AutoNode {
+            rect,
+            role,
+            label: label.map(str::to_string),
+        }
+    }
+
+    /// 自动候选必须挂到**包住它的最小**手工容器下。挂错(挂到最外层那个铺满窗口
+    /// 的容器)的话,导出里每一条的源码位置都会指向同一个文件,等于没有。
+    ///
+    /// 自证会变红:把 `auto_spots` 里选容器的 `min_by` 改成 `.next()`。
+    #[test]
+    fn an_automatic_candidate_hangs_under_the_smallest_container_that_encloses_it() {
+        let manual = vec![
+            spot("窗口", r(0.0, 0.0, 800.0, 600.0)),
+            spot("窗口/设置", r(100.0, 100.0, 400.0, 300.0)),
+        ];
+        let got = auto_spots(
+            &[auto("按钮", Some("保存"), r(120.0, 120.0, 60.0, 24.0))],
+            &manual,
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "窗口/设置/按钮「保存」");
+        assert_eq!(
+            got[0].src,
+            Src::Auto {
+                container: Some(src_of(&manual[1].src))
+            },
+            "源码位置要指向内层容器的插桩点"
+        );
+    }
+
+    /// 落在所有手工容器之外的控件仍要能选中 —— 只是没有容器可挂。
+    #[test]
+    fn a_candidate_outside_every_container_is_still_selectable() {
+        let got = auto_spots(
+            &[auto("按钮", Some("确定"), r(10.0, 10.0, 40.0, 20.0))],
+            &[],
+        );
+        assert_eq!(got[0].path, "自动/按钮「确定」");
+        assert_eq!(got[0].src, Src::Auto { container: None });
+    }
+
+    /// 手工已经登记过的那块矩形,自动候选不能再来一份:候选表里同一个东西出现
+    /// 两次,点上去每次命中谁全看排序,而手工那份信息更多(有真行号)。
+    ///
+    /// 自证会变红:把 `auto_spots` 里那句 `if manual.iter().any(same_rect)` 删掉。
+    #[test]
+    fn a_candidate_that_duplicates_a_manual_site_is_dropped() {
+        let manual = vec![spot("状态栏/隧道指示器", r(700.0, 580.0, 80.0, 18.0))];
+        // 差半个点 —— 手工 mark 传的就是 widget 自己的 rect,但中间过了 `Area`
+        // 偏移与 DPI 换算,不会分毫不差。
+        let got = auto_spots(
+            &[auto("按钮", Some("隧道"), r(700.4, 580.0, 80.0, 18.0))],
+            &manual,
+        );
+        assert!(got.is_empty(), "与手工插桩重合的自动候选必须丢掉:{got:?}");
+    }
+
+    /// 同一个容器里五个「删除」按钮,不编号的话导出里五行一模一样,用户说
+    /// 「第 3 个删除按钮」跟文本对不上。
+    ///
+    /// 自证会变红:把 `auto_spots` 里的 `seen` 计数删掉,永远用 base。
+    #[test]
+    fn same_named_controls_in_one_container_get_numbered() {
+        let manual = vec![spot("列表", r(0.0, 0.0, 300.0, 300.0))];
+        let nodes: Vec<AutoNode> = (0..3)
+            .map(|i| {
+                auto(
+                    "按钮",
+                    Some("删除"),
+                    r(10.0, 10.0 + i as f32 * 30.0, 60.0, 24.0),
+                )
+            })
+            .collect();
+        let paths: Vec<String> = auto_spots(&nodes, &manual)
+            .into_iter()
+            .map(|s| s.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "列表/按钮「删除」",
+                "列表/按钮「删除」[2]",
+                "列表/按钮「删除」[3]"
+            ]
+        );
+    }
+
+    /// 没有标签的控件(图标按钮、纯装饰容器)不能给出空的「」—— 那种路径念不出来,
+    /// 也搜不到。退回角色名。
+    #[test]
+    fn an_unlabeled_control_falls_back_to_its_role_name() {
+        let got = auto_spots(
+            &[
+                auto("滚动区", None, r(0.0, 0.0, 100.0, 100.0)),
+                auto("按钮", Some(""), r(0.0, 0.0, 20.0, 20.0)),
+            ],
+            &[],
+        );
+        assert_eq!(got[0].path, "自动/滚动区");
+        assert_eq!(got[1].path, "自动/按钮", "空标签要当没有标签处理");
+    }
+
+    /// 退化矩形点不到,只会在 hit test 里当噪音 —— 跟 `mark()` 那条规则一致。
+    #[test]
+    fn degenerate_automatic_candidates_are_dropped() {
+        let got = auto_spots(
+            &[
+                auto("按钮", Some("空"), egui::Rect::NOTHING),
+                auto("按钮", Some("零宽"), r(10.0, 10.0, 0.0, 20.0)),
+            ],
+            &[],
+        );
+        assert!(got.is_empty(), "零面积/负矩形不该进候选表:{got:?}");
+    }
+
+    /// 端到端:一个**普通的 egui 按钮**,没有任何插桩,必须在两帧之后成为候选。
+    /// 这条钉住整条链 —— `enable_accesskit` → egui 构树 → `ingest_accesskit`
+    /// 归约 → `auto_spots` 组装。链上任何一环断了它就红,而这是唯一能证明
+    /// 「自动那半边真的通了」的测试。
+    ///
+    /// 自证会变红:把 `toggle` 里的 `ctx.enable_accesskit()` 注释掉。
+    #[test]
+    fn a_plain_egui_button_becomes_a_candidate_without_any_instrumentation() {
+        let ctx = egui::Context::default();
+        toggle(&ctx);
+
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let draw = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("保存");
+            });
+        };
+
+        // 第一帧:egui 构树,但树要等 `run` 返回才拿得到 —— `overlay` 跑在
+        // `run` 里面,所以自动候选天生慢一帧。
+        let mut out = ctx.run(input(), draw);
+        ingest_accesskit(&ctx, out.platform_output.accesskit_update.take());
+
+        // 第二帧:自动候选可用。在 `overlay` 之前读 —— overlay 末尾会清空 spots。
+        let mut paths = Vec::new();
+        let _ = ctx.run(input(), |ctx| {
+            draw(ctx);
+            paths = spot_paths(ctx);
+        });
+        assert!(
+            paths.iter().any(|p| p.contains("按钮「保存」")),
+            "没插桩的按钮必须成为候选,实际候选:{paths:?}"
+        );
+    }
+
+    /// 模式关着时 egui 不许构树 —— 「模式关着零开销」是 F100 的硬约束
+    /// (N3 红线的邻居)。
+    ///
+    /// 自证会变红:在 `toggle` 之外的地方无条件调一次 `ctx.enable_accesskit()`。
+    #[test]
+    fn no_accesskit_tree_is_built_while_the_mode_is_off() {
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("保存");
+            });
+        });
+        assert!(
+            out.platform_output.accesskit_update.is_none(),
+            "没开标注模式,egui 不该构 accesskit 树"
+        );
+    }
+
+    /// 模式关着时就算硬塞一棵树进来也不该被吃下 —— 关模式与开模式之间那一帧的
+    /// 树是上一个界面的,留着就是鬼影。
+    ///
+    /// 自证会变红:把 `ingest_accesskit` 开头的 `if !is_on(ctx) { return; }` 删掉。
+    #[test]
+    fn nothing_is_ingested_while_the_mode_is_off() {
+        let ctx = egui::Context::default();
+        toggle(&ctx);
+        let mut out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.button("保存");
+                });
+            },
+        );
+        let tree = out.platform_output.accesskit_update.take();
+        assert!(tree.is_some(), "前提:开着模式时该有树");
+
+        exit(&ctx);
+        ingest_accesskit(&ctx, tree);
+        assert!(
+            spot_paths(&ctx).is_empty(),
+            "模式关着时不该吃下任何树:{:?}",
+            spot_paths(&ctx)
+        );
+    }
+
+    /// 退出标注模式要连自动候选一起清 —— 留着的话下次进来第一帧带着上次界面的
+    /// 候选(用户早切到别的标签页了),描边描在一片空地上。
+    ///
+    /// 自证会变红:把 `toggle` 里的 `st.auto.clear()` 删掉。
+    #[test]
+    fn leaving_the_mode_clears_the_automatic_candidates_too() {
+        let ctx = egui::Context::default();
+        toggle(&ctx);
+        with_state(&ctx, |st| {
+            st.auto = vec![AutoNode {
+                rect: r(0.0, 0.0, 10.0, 10.0),
+                role: "按钮",
+                label: None,
+            }];
+        });
+        assert_eq!(spot_paths(&ctx).len(), 1, "前提:退出前有一处自动候选");
+
+        exit(&ctx);
+        assert!(spot_paths(&ctx).is_empty(), "退出后候选表必须是空的");
     }
 }
