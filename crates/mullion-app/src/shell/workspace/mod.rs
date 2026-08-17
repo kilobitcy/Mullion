@@ -17,6 +17,7 @@ pub enum PaneStatus {
 }
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use mullion_core::layout::{close_pane, leaves, split_pane, Dir, Node, PaneId};
 use mullion_ssh::session::{SshConnection, SshSession, TrySendErr};
@@ -316,6 +317,28 @@ impl Workspace {
                 let _ = p.pty.write(out);
             }
         }
+    }
+
+    /// 所有 pane 里最早的那个同步块超时点(T2)。app 拿它排一次 `WaitUntil`。
+    pub fn vt_sync_deadline(&self) -> Option<Instant> {
+        self.panes
+            .iter()
+            .filter_map(|p| p.emulator.vt_sync_deadline())
+            .min()
+    }
+
+    /// 到点的同步块就地收口,返回有没有任何一个 pane 真的收了口(收了就得出帧,
+    /// 否则字节进了 `Term` 却没人画)。
+    ///
+    /// **必须独立于 `pump`**:超时这条路径的前提就是「没有新字节进来」,挂在
+    /// 排空 rx 的循环里(那里 `inbound.is_empty()` 就 `continue`)等于没接。
+    /// 详见 `Emulator::flush_expired_sync` 的文档。
+    pub fn flush_expired_vt_sync(&mut self, now: Instant) -> bool {
+        let mut flushed = false;
+        for p in &mut self.panes {
+            flushed |= p.emulator.flush_expired_sync(now);
+        }
+        flushed
     }
 
     /// 施加几何(F34/T4)。**四条触发路径**(套预设 / 关 pane / 窗口 resize /

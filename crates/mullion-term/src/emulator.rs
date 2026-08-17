@@ -107,6 +107,37 @@ impl Emulator {
         self.parser.advance(&mut self.term, bytes);
     }
 
+    /// 当前同步块(DEC 2026)的超时时刻。`None` = 没有在进行中的同步块。
+    ///
+    /// 见 [`Emulator::flush_expired_sync`]。app 侧拿它去排一次 `WaitUntil`,
+    /// 否则「到点了没人来问」——超时形同虚设。
+    pub fn vt_sync_deadline(&self) -> Option<std::time::Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// 同步块超时了就地收口,返回有没有真的收口。
+    ///
+    /// **T2 的另一半,不是可选优化。** `vte::ansi::Processor` 收到 BSU
+    /// (`CSI ? 2026 h`)之后会把后续字节**全部攒在它自己肚子里**,`Term` 完全
+    /// 看不到,直到 ESU(`CSI ? 2026 l`)到达。协议给了 150ms 上限,但 vte 只
+    /// 负责记下这个时刻,**调用方不主动 `stop_sync` 就永远不会到期**
+    /// (`advance` 只看 `pending_timeout()` 决定要不要继续攒,从不判它过没过期)。
+    ///
+    /// 漏了这一步的现象:高延迟链路上 ESU 跟内容被拆进两个包(Nagle + 延迟
+    /// ACK,正是本项目的主场景),画面就**永远慢一拍**——敲 `l` 什么都不出,
+    /// 敲 `s` 才看到 `l`,而且干等不会自己冒出来,必须再敲一个键把上一包的
+    /// ESU 带过来。app 层那个 `SyncFramePacer` 救不了:它管的是「出不出帧」,
+    /// 而字节压根还没进 `Term`,出多少帧都是旧画面。
+    pub fn flush_expired_sync(&mut self, now: std::time::Instant) -> bool {
+        match self.vt_sync_deadline() {
+            Some(deadline) if now >= deadline => {
+                self.parser.stop_sync(&mut self.term);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 取走并清空出站缓冲——这些字节必须回写 SSH channel(T1 红线)。
     pub fn take_pty_writes(&mut self) -> Vec<u8> {
         std::mem::take(
@@ -383,6 +414,48 @@ mod tests {
         assert!(
             snap.row(1)[1].spacer,
             "宽字符右半的真 spacer(WIDE_CHAR_SPACER)仍要标 true,渲染要跳过"
+        );
+    }
+
+    /// T2 的另一半:BSU 之后的字节被 vte 攒在 `Processor` 里,`Term` 看不到;
+    /// 到了协议规定的超时点必须由我们主动收口,不然画面**永远慢一拍**
+    /// ——ESU 跟内容被拆进两个包时,前一包的内容要等下一包才冒出来
+    /// (高延迟链路上就是「敲一个字看不到,再敲一个才看到前一个」)。
+    ///
+    /// 自证会变红:把 `flush_expired_sync` 里的 `self.parser.stop_sync(…)`
+    /// 去掉(只留 `true`),最后一条断言立刻红。
+    #[test]
+    fn a_synchronized_update_that_never_gets_its_esu_is_flushed_on_timeout() {
+        let head =
+            |emu: &Emulator| -> String { emu.snapshot().cells[..5].iter().map(|c| c.ch).collect() };
+        let mut emu = Emulator::new(20, 3);
+        assert_eq!(emu.vt_sync_deadline(), None, "没开同步块时不该有超时点");
+
+        emu.feed(b"\x1b[?2026h");
+        emu.feed(b"hello");
+        assert_eq!(
+            head(&emu),
+            "     ",
+            "BSU 之后的字节按协议先攒着,这一步是对的"
+        );
+        let deadline = emu.vt_sync_deadline().expect("BSU 之后必须记下一个超时点");
+
+        assert!(
+            !emu.flush_expired_sync(deadline - std::time::Duration::from_millis(1)),
+            "没到点就收口 = 同步块白开,流式输出会撕裂(T2)"
+        );
+        assert_eq!(head(&emu), "     ");
+
+        assert!(emu.flush_expired_sync(deadline), "到点必须收口");
+        assert_eq!(
+            head(&emu),
+            "hello",
+            "超时后字节仍没进 Term —— 画面会一直停在上一次更新上"
+        );
+        assert_eq!(
+            emu.vt_sync_deadline(),
+            None,
+            "收口后超时点该清掉,否则会反复排期"
         );
     }
 

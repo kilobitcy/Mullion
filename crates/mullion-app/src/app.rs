@@ -3947,8 +3947,18 @@ impl App {
     /// 远端的同步输出探测/光标查询永久等不到应答。
     fn pump_io(&mut self) {
         let now = self.now_ms();
+        let mut flushed = false;
         if let Some(ws) = self.active_ws_mut() {
             ws.pump(now);
+            // T2:超时的同步块要就地收口 —— 字节还压在 vte 的 `Processor` 里,
+            // `Term` 根本没见过,再怎么出帧也只是旧画面。
+            // 见 `Emulator::flush_expired_sync`。
+            flushed = ws.flush_expired_vt_sync(Instant::now());
+        }
+        if flushed {
+            // 收口出来的字节没经过 `pacer.feed`,`panes_ready_to_present` 判不出
+            // 脏;不标脏这一帧会被判 Idle,收口等于白做。
+            self.ui_dirty = true;
         }
         self.drive_automation();
     }
@@ -7201,9 +7211,18 @@ pub(crate) fn cancel_probe(epoch: &mut u64, state: &mut crate::ui::session_manag
 /// `render::earliest_sync_timeout_ms`(已单测),这里只做时钟基准换算。
 fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> Option<Instant> {
     let ws = ws?;
-    let deadline_ms =
-        crate::render::earliest_sync_timeout_ms(ws.panes().iter().map(|p| &p.pacer), now_ms)?;
-    Some(start + std::time::Duration::from_millis(deadline_ms))
+    let pacer =
+        crate::render::earliest_sync_timeout_ms(ws.panes().iter().map(|p| &p.pacer), now_ms)
+            .map(|ms| start + std::time::Duration::from_millis(ms));
+    // T2 的另一半:`SyncFramePacer` 管的是「出不出帧」,而 vte 的 `Processor`
+    // 在 BSU 之后把字节攒在自己肚子里,`Term` 压根没见过——那个超时点同样得
+    // 有人到点来问一次(`Emulator::flush_expired_sync`)。两个取最早的:只排
+    // 其中一个,另一个就只能等下一个不相关事件顺带救回来,而「下一个事件」
+    // 在用户打字的场景里就是**下一次按键**,画面于是永远慢一拍。
+    match (pacer, ws.vt_sync_deadline()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// 施加一次保存意图。抽成纯函数是为了能在没有窗口的情况下测「编辑已有会话
@@ -8724,6 +8743,42 @@ mod tests {
             sync_timeout_wake_at(start, Some(&ws), 150),
             None,
             "超时已过,不该再为同一个 pane 排一次唤醒(否则是忙转)"
+        );
+    }
+
+    /// T2 的另一半:vte 的 `Processor` 在 BSU 之后把字节攒在自己肚子里,
+    /// `Term` 完全看不到——它那个超时点也必须被排进 `WaitUntil`。
+    ///
+    /// 只排 `SyncFramePacer` 那一个的话,「到点出帧」出的还是旧画面:字节根本
+    /// 没进 `Term`。高延迟链路上 ESU 跟内容被拆进两个包时,现象就是画面永远
+    /// 慢一拍,而且非得再敲一个键才会动。
+    ///
+    /// 自证会变红:把 `sync_timeout_wake_at` 里 `ws.vt_sync_deadline()` 那一项
+    /// 去掉(只返回 `pacer`)。
+    #[test]
+    fn sync_timeout_wake_also_covers_the_emulators_own_sync_buffer() {
+        let start = std::time::Instant::now();
+        let mut ws = Workspace::new(test_pane(1), 0);
+        // 只喂 emulator,**不喂 pacer** —— 这样返回值只可能来自 vt 那一路。
+        ws.pane_mut(PaneId(1))
+            .unwrap()
+            .emulator
+            .feed(b"\x1b[?2026h");
+
+        let at = sync_timeout_wake_at(start, Some(&ws), 0)
+            .expect("emulator 卡在同步块里,必须排一次唤醒去收口");
+        assert_eq!(
+            Some(at),
+            ws.vt_sync_deadline(),
+            "唤醒时刻必须就是 vte 记下的那个超时点"
+        );
+
+        // 收口之后不该再排:否则每帧都排一次,就是 T3/T7 的忙转。
+        assert!(ws.flush_expired_vt_sync(at), "到点必须收得掉");
+        assert_eq!(
+            sync_timeout_wake_at(start, Some(&ws), 0),
+            None,
+            "收口后还在排唤醒 = 忙转"
         );
     }
 
