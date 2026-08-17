@@ -98,6 +98,30 @@ pub fn pending_for(
     })
 }
 
+/// **不是**这条连接第一个 pane 的那些 pane（分屏新开的、换过节点的）该跑什么。
+/// `None` = 无事可做，连 oneshot 都不建。
+///
+/// 与 `pending_for` 的差别只有一处：**跳过 tmux**（见
+/// `build_plan_without_tmux`）。用户拍板的规则是「只有建标签的那个 pane 全套
+/// 跑，其余跳过 tmux、其余照跑」——两块 pane attach 同一个 session 会内容镜像，
+/// 而 `cd` / `export` / 启动命令对每块新 shell 都仍然成立。
+///
+/// 收 `&ResolvedAutomation` 而不是 `SessionId`+lookup：模板是 `ConnectOk` 那一刻
+/// 就随标签存下来的（`TerminalTab::automation_template`），此后分屏多少次都用
+/// 同一份。**刻意不回头再查库**——与 `pending_for` 同一个理由：连上之后用户
+/// 完全可能改了配置甚至删了会话，那时候分屏发出去的字节就跟他当初连接时看到的
+/// 配置对不上了。
+pub fn pending_for_extra_pane(tpl: &ResolvedAutomation) -> Option<PendingAutomation> {
+    let steps = mullion_store::build_plan_without_tmux(tpl);
+    if steps.is_empty() {
+        return None;
+    }
+    Some(PendingAutomation {
+        steps,
+        ready_timeout_ms: tpl.ready_timeout_ms,
+    })
+}
+
 /// `ConnectOk` 抵达时：取走待办计划与一次性跳过标志，回答「这次到底起不起」。
 ///
 /// 两个 `&mut` 都是**取走**语义，这正是本函数存在的理由：计划和跳过标志都必须
@@ -257,6 +281,71 @@ mod tests {
             Some((enabled_automation(), "web01".into()))
         });
         assert!(on.is_some());
+    }
+
+    /// 分屏新开的 pane 跑命令,但**绝不碰 tmux** —— 这是用户拍板的规则,
+    /// 也是 `AutomationHandle` 当初钉死 `PaneId(1)` 的原始顾虑(两块 pane
+    /// attach 同一 session 会内容镜像 + 尺寸打架)的正解。
+    ///
+    /// 自证会变红:把 `pending_for_extra_pane` 里的
+    /// `build_plan_without_tmux(tpl)` 换成 `build_plan(tpl, "x")`。
+    #[test]
+    fn an_extra_pane_runs_the_commands_but_never_attaches_tmux() {
+        let mut a = enabled_automation();
+        a.tmux = Some(TmuxChoice::Attach {
+            session_name: Some("web01".into()),
+        });
+
+        // 前提:同一份配置给第一个 pane 时确实会发 tmux,否则下面恒真。
+        let first = pending_for(Some(SessionId(7)), |_| Some((a.clone(), "web01".into())))
+            .expect("第一个 pane 该有计划");
+        assert!(String::from_utf8(first.steps[0].bytes.clone())
+            .unwrap()
+            .contains("tmux"));
+
+        let extra = pending_for_extra_pane(&a).expect("配了命令就该有计划");
+        for s in &extra.steps {
+            let line = String::from_utf8(s.bytes.clone()).unwrap();
+            assert!(!line.contains("tmux"), "分屏 pane 不许碰 tmux: {line}");
+            assert!(line.contains("echo hi"), "登录后命令要照跑: {line}");
+        }
+    }
+
+    /// 只配了 tmux(没有任何命令/环境/工作目录)的会话:分屏 pane 无事可做,
+    /// 必须**连 oneshot 都不建** —— 否则状态栏会挂一句"自动化:进行中",
+    /// 一直挂到超时,而实际上一个字节都不会发。
+    #[test]
+    fn an_extra_pane_with_only_tmux_configured_starts_nothing() {
+        let mut a = enabled_automation();
+        a.tmux = Some(TmuxChoice::Attach { session_name: None });
+        a.commands.clear();
+        assert!(
+            pending_for(Some(SessionId(7)), |_| Some((a.clone(), "web01".into()))).is_some(),
+            "前提:第一个 pane 仍有计划(就是那句 tmux)"
+        );
+        assert!(pending_for_extra_pane(&a).is_none());
+    }
+
+    /// F44 总开关关掉时,分屏 pane 同样一步不发 —— 否则"关掉自动化"这个开关
+    /// 在分屏后会静默失效。
+    #[test]
+    fn an_extra_pane_respects_the_master_switch() {
+        let mut a = enabled_automation();
+        assert!(pending_for_extra_pane(&a).is_some(), "前提:开着时有计划");
+        a.enabled = false;
+        assert!(pending_for_extra_pane(&a).is_none());
+    }
+
+    /// 超时值必须跟着模板走,不能落回内置默认 —— 用户把 ready_timeout 调到
+    /// 60s 是因为这台机器登录慢,分屏 pane 登录同样慢。
+    ///
+    /// 自证会变红:把 `ready_timeout_ms: tpl.ready_timeout_ms` 写成
+    /// `DEFAULT_READY_TIMEOUT_MS`。
+    #[test]
+    fn an_extra_pane_inherits_the_configured_ready_timeout() {
+        let mut a = enabled_automation();
+        a.ready_timeout_ms = 60_000;
+        assert_eq!(pending_for_extra_pane(&a).unwrap().ready_timeout_ms, 60_000);
     }
 
     /// CLI 直连(`mullion user@host -p 22 -i key`)没有 SessionId,不该跑自动化。

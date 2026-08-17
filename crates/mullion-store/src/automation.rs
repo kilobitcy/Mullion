@@ -204,6 +204,22 @@ pub fn build_plan(a: &ResolvedAutomation, fallback_name: &str) -> Vec<Step> {
     }
 }
 
+/// 同一份配置,但**跳过 tmux 那一步**:环境变量 / 工作目录 / 登录后命令照跑。
+///
+/// 给「不是这条连接第一个 pane」的 pane 用 —— 分屏新开的、以及换过节点的。
+/// 理由在 `AutomationHandle` 的文档里:多块 pane attach 同一个 tmux session 会
+/// 内容镜像,且 `window-size` 取 `latest` 会反复 reflow、取 `smallest` 会留白。
+/// 而用户配的 `cd` / `export` / 启动命令对每块新 shell 都仍然成立。
+///
+/// 不收 `fallback_name`:那个参数**只**服务于 tmux 会话名的兜底,这条路径上
+/// 没有任何东西会用到它。留着等于给调用方一个「传什么都行」的哑参数。
+pub fn build_plan_without_tmux(a: &ResolvedAutomation) -> Vec<Step> {
+    if !a.enabled {
+        return Vec::new();
+    }
+    build_no_tmux(a, Duration::from_millis(u64::from(a.initial_delay_ms)))
+}
+
 /// tmux `new-session` 的启动命令串。为空表示「没东西要跑」,调用方应整段省略。
 fn start_command(a: &ResolvedAutomation) -> String {
     let mut parts = export_stmts(a);
@@ -812,6 +828,76 @@ mod tests {
         assert!(
             build_plan(&resolved(None), "web01").is_empty(),
             "没配任何东西 → 零步"
+        );
+    }
+
+    /// 分屏新开的 pane / 换过节点的 pane 要跑登录后命令,但**不能碰 tmux**:
+    /// 两块 pane attach 同一个 session 会内容镜像,`window-size` 取 `latest`
+    /// 还会反复 reflow、取 `smallest` 会留白(`AutomationHandle` 的原始理由)。
+    /// 用户拍板的规则是「跳过 tmux,其余照跑」。
+    ///
+    /// 自证会变红:把 `build_plan_without_tmux` 的实现改成直接转发
+    /// `build_plan(a, "")`。
+    #[test]
+    fn plan_without_tmux_keeps_the_commands_but_never_touches_tmux() {
+        let mut a = resolved(Some(TmuxChoice::Attach {
+            session_name: Some("web01".into()),
+        }));
+        a.work_dir = Some("/srv/app".into());
+        a.env = vec![EnvVar {
+            key: "FOO".into(),
+            value: "bar".into(),
+        }];
+        a.commands = vec![AutomationCommand {
+            text: "cargo watch".into(),
+            delay_ms: None,
+        }];
+
+        // 前提:同一份配置走完整计划时确实会发 tmux —— 否则下面那条
+        // 「不含 tmux」的断言是恒真的。
+        assert!(text_of(&build_plan(&a, "fallback")[0]).contains("tmux"));
+
+        let plan = build_plan_without_tmux(&a);
+        assert_eq!(plan.len(), 1, "没配逐条延时时仍应合成一步");
+        let line = text_of(&plan[0]);
+        assert!(
+            !line.contains("tmux"),
+            "跳过 tmux 的计划里不许出现 tmux: {line}"
+        );
+        assert!(line.contains("export FOO='bar'"), "环境变量要照跑: {line}");
+        assert!(line.contains("cd '/srv/app'"), "工作目录要照跑: {line}");
+        assert!(line.contains("cargo watch"), "登录后命令要照跑: {line}");
+        assert_eq!(plan[0].delay, Duration::from_millis(300));
+    }
+
+    /// 总开关关掉时,跳过 tmux 的这条路也必须是零步 —— 否则 F44「关掉自动化」
+    /// 在分屏 pane 上会失效,用户关了却还是有命令被发出去。
+    ///
+    /// 自证会变红:把 `build_plan_without_tmux` 里的 `if !a.enabled` 删掉。
+    #[test]
+    fn plan_without_tmux_still_respects_the_master_switch() {
+        let mut a = resolved(None);
+        a.commands = vec![AutomationCommand {
+            text: "ls".into(),
+            delay_ms: None,
+        }];
+        assert!(!build_plan_without_tmux(&a).is_empty(), "前提:开着时非空");
+        a.enabled = false;
+        assert!(
+            build_plan_without_tmux(&a).is_empty(),
+            "F44 关掉就一步都不发"
+        );
+    }
+
+    /// 配的是 tmux **而且没有任何命令**时,跳过 tmux 就等于无事可做 ——
+    /// 必须是零步,不能凭空发一个空行(那是一次多余的回车,会打进远端 shell)。
+    #[test]
+    fn plan_without_tmux_is_empty_when_tmux_was_the_only_thing_configured() {
+        let a = resolved(Some(TmuxChoice::Attach { session_name: None }));
+        assert!(!build_plan(&a, "web01").is_empty(), "前提:完整计划非空");
+        assert!(
+            build_plan_without_tmux(&a).is_empty(),
+            "只配了 tmux 的会话,分屏 pane 无事可做"
         );
     }
 

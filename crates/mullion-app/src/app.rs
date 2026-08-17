@@ -93,7 +93,12 @@ pub enum UserEvent {
     ProbeErr(u64, String),
     /// F40~F44:一次自动化结束。`u64` 是发起时的 `Workspace` 世代号,
     /// 过期的直接丢(同 `PaneOpenErr::generation`)。
-    AutomationDone(u64, crate::automation::Outcome),
+    ///
+    /// **必须带 `PaneId`**:一个标签现在可以同时跑多份自动化(每块 pane 一份,
+    /// 分屏新开的那些跳过 tmux)。只按世代找的话,先结束的那份会把还在跑的
+    /// 别份 handle 一起清掉——状态栏的「进行中」提前消失,`user_took_over`
+    /// 也再取消不了它们。
+    AutomationDone(u64, PaneId, crate::automation::Outcome),
     /// F111/F114:某条隧道的监管任务报了一次状态。**不带世代号** ——
     /// 隧道不属于 `Workspace`(ADR-010:它有自己的连接),重连一次终端不会
     /// 让 `TunnelId` 被复用;「还在不在运行时表里」就是唯一需要的过期判据
@@ -222,9 +227,16 @@ struct TransferSpec {
 /// 一次在途自动化的把手。三条通道都是 `Option`,因为每一条都是**一次性边**:
 /// `take()` 天然保证不会重复触发,也省掉一个「是否已触发」的布尔标志。
 struct AutomationHandle {
-    /// 只认这一个 pane 的首字节。总设计 §7 前提②:分屏新开的 pane 是干净
-    /// shell,不重复跑自动化(所有 pane attach 同一个 tmux session 会内容
-    /// 镜像,且 `window-size` 取 `latest` 会反复 reflow、取 `smallest` 会留白)。
+    /// 只认这一个 pane 的首字节。
+    ///
+    /// 一个标签可以同时挂**多份**(`TerminalTab::automation` 是 `Vec`):每块
+    /// pane 各跑各的。原先钉死 `PaneId(1)`(总设计 §7 前提②)的理由是「所有
+    /// pane attach 同一个 tmux session 会内容镜像,且 `window-size` 取 `latest`
+    /// 会反复 reflow、取 `smallest` 会留白」——那个顾虑现在由
+    /// `automation::pending_for_extra_pane`**跳过 tmux 步骤**来化解,而不再靠
+    /// 「除第一个 pane 外什么都不跑」。用户配的 `cd` / `export` / 启动命令对每块
+    /// 新 shell 都仍然成立,不跑才是错的(用户报的问题:分屏出来的 pane 没执行
+    /// 登录后命令)。
     pane: PaneId,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -251,8 +263,22 @@ struct TerminalTab {
     /// **按标签存而不是按 App 存**:否则在标签 A 上分屏,会拿标签 B(最近一次
     /// 连接)的 term/尺寸去开 channel。
     last_cfg: Option<SshConfig>,
-    /// F40~F44:这个标签上正在跑的那一次自动化。`None` = 没在跑。
-    automation: Option<AutomationHandle>,
+    /// F40~F44:这个标签上**正在跑的每一份**自动化,每块 pane 至多一份。
+    /// 空表 = 没在跑。
+    ///
+    /// 从 `Option` 改成 `Vec` 是因为分屏新开的 pane 也要跑登录后命令
+    /// (见 `AutomationHandle::pane`)。跑完/被取消的那一份由
+    /// `accept_automation_done` 按 `PaneId` 摘掉,稳态下长度 ≤ 分屏数。
+    automation: Vec<AutomationHandle>,
+    /// F40~F44:这条连接的自动化配置**快照**,给后来的 pane 用(分屏新开的、
+    /// 换过节点的)。`None` = 这条连接不跑自动化(没配 / 关了 / 用户右键
+    /// 「跳过一次」)。
+    ///
+    /// **在 `ConnectOk` 那一刻定死,之后绝不回头查库**——与
+    /// `automation::PendingAutomation` 同一个理由:连上之后用户完全可能改了
+    /// 配置甚至删了会话,那时候分屏发出去的字节就跟他当初点「连接」时看到的
+    /// 配置对不上了。
+    automation_template: Option<mullion_store::ResolvedAutomation>,
     /// 上一次自动化的结论文案。一直显示到这个标签被替换/关闭 —— 不做定时淡出:
     /// 状态栏本来就是常驻信息区,而定时清除要再引一个 deadline 进帧循环,
     /// 正是 spec §1 修订一要避免的东西。
@@ -1068,7 +1094,9 @@ fn replace_target(
 fn wind_down(tab: Tab<TabContent>) {
     match tab.content {
         TabContent::Terminal(t) => {
-            if let Some(h) = t.automation {
+            // 每块 pane 各一份,一个都不能漏 —— 漏掉的那份会继续往一条没真正
+            // 断开的 channel 上发命令(见本函数开头的说明)。
+            for h in t.automation {
                 h.task.abort();
             }
             // F50/D6:sftp 后台任务同理——见 `TerminalTab::sftp_tasks` 的文档。
@@ -1264,6 +1292,13 @@ pub struct App {
     /// `ConnectOk` 不携带 `SessionId`,到那时只能读 `ui.connect_request_last`,
     /// 而连接在途期间用户完全可能改了配置甚至删了这条会话。
     pending_automation: Option<crate::automation::PendingAutomation>,
+    /// 同一次点击算好的自动化配置**原件**,`ConnectOk` 抵达时移交给新标签的
+    /// `automation_template`,供后来的 pane(分屏 / 换节点)复用。
+    ///
+    /// 跟 `pending_automation` 在同一帧、由同一次 `store.resolved()` 算出,
+    /// 理由一模一样:连接在途期间用户改了配置,分屏发出去的字节就跟他点
+    /// 「连接」时看到的对不上了。
+    pending_automation_template: Option<mullion_store::ResolvedAutomation>,
     /// F44 右键「连接(跳过自动化)」的一次性标志。`ConnectOk` 消费后立即清零。
     pending_skip_automation: bool,
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
@@ -1427,6 +1462,7 @@ impl App {
             probe_epoch: 0,
             probe_task: None,
             pending_automation: None,
+            pending_automation_template: None,
             pending_skip_automation: false,
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
@@ -3771,7 +3807,14 @@ impl App {
     /// (行号会漂,别钉死);数量由
     /// `user_intent_write_points_all_yield_to_the_user` 钉住。
     fn user_took_over(&mut self) {
-        if let Some(h) = self.active_term_mut().and_then(|t| t.automation.as_mut()) {
+        let Some(t) = self.active_term_mut() else {
+            return;
+        };
+        // **只掐焦点 pane 那一份**。分屏后每块 pane 各跑各的自动化
+        // (见 `AutomationHandle::pane`):用户在左边敲字,不该把右边正在
+        // 跑的登录后命令拦腰截断——那是两条互不相干的 shell。
+        let focus = t.ws.focus();
+        if let Some(h) = t.automation.iter_mut().find(|h| h.pane == focus) {
             // drop 发送端即取消(`write_scheduled` 的 doc:收到值**或**发送端
             // 被 drop 都算取消)。
             h.cancel.take();
@@ -3861,6 +3904,66 @@ impl App {
     /// 自动化会一直等到超时。
     ///
     /// 每帧调,所以**零分配**:只读两个 bool、`take()` 两个 `Option`。
+    /// 起一份自动化:建三条一次性通道、spawn 那个 task、把 handle 挂到属主标签。
+    ///
+    /// 两个调用点(`ConnectOk` 的第一个 pane、`PaneOpened` 的后来者)必须共用
+    /// 这一处 —— 分开写的话「结束时回送 `AutomationDone` 要带上 `PaneId`」这类
+    /// 约束就得在两个地方各维护一遍,漏一处的现象是那份自动化永远摘不掉,
+    /// 状态栏的「进行中」一直挂着。
+    ///
+    /// `sink` 收 `Arc<SshSession>`:自动化 task 与 pane 同时持有同一条 channel
+    /// 的写口(见 `PtyWriter for Arc<SshSession>` 的文档)。
+    fn start_automation(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        plan: crate::automation::PendingAutomation,
+        sink: Arc<mullion_ssh::session::SshSession>,
+    ) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let (disc_tx, disc_rx) = tokio::sync::oneshot::channel();
+        let sink: Arc<dyn mullion_ssh::schedule::ByteSink> = sink;
+        let proxy = self.proxy.clone();
+        let steps = plan.steps.len();
+        let timeout_ms = plan.ready_timeout_ms;
+        log::info!(
+            target: "mullion",
+            "自动化:pane {} 有 {steps} 步待发,就绪超时 {timeout_ms}ms",
+            pane.0
+        );
+        let task = self._runtime.spawn(async move {
+            let outcome =
+                crate::automation::run(sink, plan.steps, ready_rx, cancel_rx, disc_rx, timeout_ms)
+                    .await;
+            let _ = proxy.send_event(UserEvent::AutomationDone(generation, pane, outcome));
+        });
+        if let Some(t) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|tab| tab.content.as_terminal_mut())
+        {
+            // 同一个 pane 不该同时挂两份(换节点会走到这里第二次):先摘掉旧的,
+            // 否则 `drive_automation` 会把首字节喂给两份,而 `user_took_over`
+            // 只取消得掉其中一份。
+            if let Some(old) = t.automation.iter().position(|h| h.pane == pane) {
+                t.automation.swap_remove(old).task.abort();
+            }
+            t.automation.push(AutomationHandle {
+                pane,
+                ready: Some(ready_tx),
+                cancel: Some(cancel_tx),
+                disconnect: Some(disc_tx),
+                task,
+            });
+        } else {
+            // 属主标签在这几行之间没了(理论上到不了:同一帧同步执行)。
+            // 不 abort 的话那个 task 会一直等到超时,还攥着一份 channel 写口。
+            log::warn!(target: "mullion", "自动化起好时属主标签(世代 {generation})已不在,丢弃");
+            task.abort();
+        }
+    }
+
     fn drive_automation(&mut self) {
         // **遍历所有标签,不只是活动标签**:用户完全可能连上标签 A(自动化正在
         // 等首字节)就切到标签 B 去,只驱动活动标签的话 A 那次会一直等到超时。
@@ -3872,24 +3975,26 @@ impl App {
             let Some(t) = tab.content.as_terminal_mut() else {
                 continue;
             };
-            let Some(h) = t.automation.as_mut() else {
-                continue;
-            };
-            // pane 不在了(被关掉/换世代):让 task 自然结束,别让它挂到超时。
-            let Some(pane) = t.ws.pane(h.pane) else {
-                h.disconnect.take();
-                continue;
-            };
-            if pane.status == crate::shell::workspace::PaneStatus::Disconnected {
-                // send 的 Err(接收端已走)无所谓:task 已经结束了。
-                if let Some(tx) = h.disconnect.take() {
-                    let _ = tx.send(());
+            // 每块 pane 各有一份(分屏新开的也跑,见 `AutomationHandle::pane`)。
+            // `ws` 与 `automation` 是同一个结构体的两个字段,分别借用合法。
+            let (ws, handles) = (&t.ws, &mut t.automation);
+            for h in handles.iter_mut() {
+                // pane 不在了(被关掉/换世代):让 task 自然结束,别让它挂到超时。
+                let Some(pane) = ws.pane(h.pane) else {
+                    h.disconnect.take();
+                    continue;
+                };
+                if pane.status == crate::shell::workspace::PaneStatus::Disconnected {
+                    // send 的 Err(接收端已走)无所谓:task 已经结束了。
+                    if let Some(tx) = h.disconnect.take() {
+                        let _ = tx.send(());
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if pane.saw_first_byte {
-                if let Some(tx) = h.ready.take() {
-                    let _ = tx.send(());
+                if pane.saw_first_byte {
+                    if let Some(tx) = h.ready.take() {
+                        let _ = tx.send(());
+                    }
                 }
             }
         }
@@ -3931,21 +4036,27 @@ impl App {
         if let Some(t) = self.active_term_mut() {
             t.automation_status = None;
         }
-        self.pending_automation =
-            crate::automation::pending_for(self.ui.connect_request_last, |id| {
-                let store = self.store.as_ref()?;
-                let resolved = store.resolved(id).ok()?;
-                // `ResolvedConfig` 不含会话名,而 `build_plan` 要它做 tmux 的
-                // fallback_name(用户没填 tmux 会话名时按会话名推导)。
-                let name = store
-                    .list()
-                    .iter()
-                    .find(|r| r.id == id)?
-                    .identity
-                    .name
-                    .clone();
-                Some((resolved.automation, name))
-            });
+        // 同一次解析里顺手留一份**原件**:后来的 pane(分屏新开的、换过节点的)
+        // 要按它算「跳过 tmux」的计划。绝不等到分屏那一刻再查库——那时用户可能
+        // 已经改了配置(见 `pending_automation_template` 的文档)。
+        let mut tpl: Option<mullion_store::ResolvedAutomation> = None;
+        let plan = crate::automation::pending_for(self.ui.connect_request_last, |id| {
+            let store = self.store.as_ref()?;
+            let resolved = store.resolved(id).ok()?;
+            // `ResolvedConfig` 不含会话名,而 `build_plan` 要它做 tmux 的
+            // fallback_name(用户没填 tmux 会话名时按会话名推导)。
+            let name = store
+                .list()
+                .iter()
+                .find(|r| r.id == id)?
+                .identity
+                .name
+                .clone();
+            tpl = Some(resolved.automation.clone());
+            Some((resolved.automation, name))
+        });
+        self.pending_automation = plan;
+        self.pending_automation_template = tpl;
         // 会话管理器发起的连接也要记下,否则第二次连接后开分屏会用上一台
         // 主机的 term/尺寸(F35 的 open_pty 靠它)。`ConnectOk` 抵达时移交给
         // 新建的标签。
@@ -4155,7 +4266,12 @@ impl App {
     /// 自动化结束。**必须按世代过滤**:高延迟链路下用户完全可能在自动化还在
     /// 跑的时候断开重连,旧世代的「自动化已中止:连接已断开」落到新连接的
     /// 状态栏上,是一条与当前连接毫不相干的误导信息(判据同 `PaneOpenErr`)。
-    fn accept_automation_done(&mut self, generation: u64, outcome: crate::automation::Outcome) {
+    fn accept_automation_done(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        outcome: crate::automation::Outcome,
+    ) {
         // S1:结论回给**属主标签**,不是活动标签 —— 后者会让「在 A 上跑的自动化
         // 结论」显示成 B 的状态。
         let Some(t) = self
@@ -4166,9 +4282,14 @@ impl App {
             log::debug!(target: "mullion", "丢弃过期世代 {generation} 的自动化结论");
             return;
         };
-        log::info!(target: "mullion", "自动化结束: {outcome:?}");
+        log::info!(target: "mullion", "自动化结束(pane {}): {outcome:?}", pane.0);
         t.automation_status = Some(crate::automation::status_text(outcome));
-        t.automation = None;
+        // **只摘掉报信的那一份**。一个标签可以同时跑好几份(每块 pane 一份),
+        // 整个清空会让还在跑的那些永远摘不掉:状态栏的「进行中」提前消失,
+        // `user_took_over` 也再取消不了它们。
+        if let Some(ix) = t.automation.iter().position(|h| h.pane == pane) {
+            t.automation.swap_remove(ix);
+        }
         self.ui_dirty = true;
         self.request_ui_redraw();
     }
@@ -4618,7 +4739,8 @@ impl ApplicationHandler<UserEvent> for App {
                         ws,
                         current_preset: Some(Preset::Single),
                         last_cfg: cfg,
-                        automation: None,
+                        automation: Vec::new(),
+                        automation_template: None,
                         automation_status: None,
                         // F50:每个标签自己的一份侧栏状态(D1:侧栏按会话记住)。
                         files: crate::ui::files_panel::PanelFrame::new(
@@ -4654,28 +4776,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
                 self.ui.close_session_manager();
                 self.ui_dirty = true;
+                // 模板跟计划**同进同退**:只有这次真的要跑自动化,才把配置留给
+                // 后来的 pane。否则「右键跳过一次」在分屏时会失效——用户明确
+                // 说了这次不跑,分屏出来的 pane 却照跑不误。
+                let tpl = self.pending_automation_template.take();
                 if let Some(plan) = crate::automation::take_pending(
                     &mut self.pending_automation,
                     &mut self.pending_skip_automation,
                 ) {
-                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-                    let (disc_tx, disc_rx) = tokio::sync::oneshot::channel();
-                    let sink: Arc<dyn mullion_ssh::schedule::ByteSink> = ssh;
-                    let proxy = self.proxy.clone();
-                    let steps = plan.steps.len();
-                    let timeout_ms = plan.ready_timeout_ms;
-                    log::info!(
-                        target: "mullion",
-                        "自动化:{steps} 步待发,就绪超时 {timeout_ms}ms"
-                    );
-                    let task = self._runtime.spawn(async move {
-                        let outcome = crate::automation::run(
-                            sink, plan.steps, ready_rx, cancel_rx, disc_rx, timeout_ms,
-                        )
-                        .await;
-                        let _ = proxy.send_event(UserEvent::AutomationDone(generation, outcome));
-                    });
                     // S1:挂回**属主标签**(按世代号查),不用「活动标签」——
                     // `open` 刚把新标签设为活动,今天两者等价,但那是巧合:
                     // 哪天连接成功不再顺带切换焦点,这里就会把 handle 挂错标签。
@@ -4684,15 +4792,11 @@ impl ApplicationHandler<UserEvent> for App {
                         .by_generation_mut(generation)
                         .and_then(|tab| tab.content.as_terminal_mut())
                     {
-                        t.automation = Some(AutomationHandle {
-                            // 只有第一个 pane 跑自动化(总设计 §7 前提②)。
-                            pane: PaneId(1),
-                            ready: Some(ready_tx),
-                            cancel: Some(cancel_tx),
-                            disconnect: Some(disc_tx),
-                            task,
-                        });
+                        t.automation_template = tpl;
                     }
+                    // 建标签的这个 pane 照配置**全套**跑,含 tmux
+                    // (`PaneId(1)` 见 `Workspace::new`)。
+                    self.start_automation(generation, PaneId(1), plan, ssh);
                 }
                 self.request_ui_redraw();
             }
@@ -4707,6 +4811,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // S1:按**世代号**找属主标签,绝不用「活动标签」去接 —— 用户在
                 // 标签 A 发起分屏、切到标签 B 的这几百毫秒里事件抵达,拿活动标签
                 // 接就会把 A 的 pane 挂到 B 上。
+                //
+                // 真的挂上去了才在下面起自动化(拿着写口出来,而不是在 `ws` 的
+                // 借用里直接调 `start_automation` —— 那要 `&mut self`)。
+                let mut attached: Option<Arc<mullion_ssh::session::SshSession>> = None;
                 if let Some(ws) = self
                     .tabs
                     .by_generation_mut(generation)
@@ -4729,6 +4837,10 @@ impl ApplicationHandler<UserEvent> for App {
                         let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
                         let d = theme::term_default_colors(&MULLION_DARK);
                         emulator.set_default_colors(d.fg, d.bg);
+                        // 包成 `Arc`:自动化 task 要跟 pane 共享同一条 channel
+                        // 的写口(见 `PtyWriter for Arc<SshSession>`)。
+                        let ssh = Arc::new(ssh);
+                        attached = Some(ssh.clone());
                         ws.attach_pane(PaneState {
                             id,
                             host_ix: 0,
@@ -4748,6 +4860,21 @@ impl ApplicationHandler<UserEvent> for App {
                             "pane {} 的 channel 开好时已经不属于当前世代了(世代 {generation},用户已切走/重连),丢弃",
                             id.0
                         );
+                    }
+                }
+                // 用户报的问题:分屏出来的 pane 没执行节点的登录后命令。
+                // **跳过 tmux、其余照跑**(用户拍板的规则,见
+                // `automation::pending_for_extra_pane`)。模板是连接那一刻存下的,
+                // 这里不回头查库 —— 连上之后用户可能已经改了配置。
+                if let Some(sink) = attached {
+                    let plan = self
+                        .tabs
+                        .by_generation(generation)
+                        .and_then(|tab| tab.content.as_terminal())
+                        .and_then(|t| t.automation_template.as_ref())
+                        .and_then(crate::automation::pending_for_extra_pane);
+                    if let Some(plan) = plan {
+                        self.start_automation(generation, id, plan, sink);
                     }
                 }
                 self.ui_dirty = true;
@@ -4862,8 +4989,8 @@ impl ApplicationHandler<UserEvent> for App {
                 crate::app::accept_probe(epoch, self.probe_epoch, &mut self.ui.probe, Err(msg));
                 self.request_ui_redraw();
             }
-            UserEvent::AutomationDone(generation, outcome) => {
-                self.accept_automation_done(generation, outcome);
+            UserEvent::AutomationDone(generation, pane, outcome) => {
+                self.accept_automation_done(generation, pane, outcome);
             }
             UserEvent::TunnelState { id, state } => self.accept_tunnel_state(id, state),
             UserEvent::SftpOpened { generation, result } => {
@@ -5716,7 +5843,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 活到 `render_frame`,走 `&self` 方法会锁住整个 self。
                                 automation: crate::automation::status_line(
                                     active_term_of(&self.tabs)
-                                        .is_some_and(|t| t.automation.is_some()),
+                                        .is_some_and(|t| !t.automation.is_empty()),
                                     active_term_of(&self.tabs)
                                         .and_then(|t| t.automation_status.as_deref()),
                                 ),
@@ -9128,7 +9255,8 @@ mod tests {
                 ws: Workspace::new(test_pane(1), 7),
                 current_preset: None,
                 last_cfg: None,
-                automation: None,
+                automation: Vec::new(),
+                automation_template: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
@@ -9556,6 +9684,50 @@ mod tests {
             body.contains("self.drive_automation()"),
             "pump_io 没有驱动 drive_automation —— 首字节/断线两条边就断了,\
              用户最小化着连上时自动化会一直等到超时,且不会有任何报错"
+        );
+    }
+
+    /// **接线守护**:每块新开的 pane 都要起自己那一份自动化。
+    ///
+    /// 用户报的问题就是这条边不存在:菜单栏点分屏,新 pane 是干净 shell,
+    /// 节点配的 `cd` / `export` / 启动命令一条都没跑。挂在 `PaneOpened` 上而
+    /// 不是发起分屏时,是因为只有 channel 真的开好、`attach_pane` 真的挂上去了,
+    /// 才有东西可写(高延迟链路上这中间可能过去好几秒,期间用户还可能切走)。
+    ///
+    /// **扎的是源码结构而非运行时行为**:`App` 要 `EventLoopProxy` 才能构造。
+    /// 这条只钉「分支里调了 `pending_for_extra_pane`」;跳不跳 tmux、总开关认不认
+    /// 由 `automation::tests` 那几条真单测把守。
+    ///
+    /// 自证会变红:把 `PaneOpened` 分支末尾那段 `if let Some(sink) = attached`
+    /// 整个删掉。
+    #[test]
+    fn a_freshly_opened_pane_starts_its_own_automation() {
+        let src = include_str!("app.rs");
+        // 锚点**拆开拼**:写成完整字面量的话,这条测试自己的源码里也有一份,
+        // `rsplit` 会切到测试本身 —— 一条永远绿的测试(本项目踩过的第四类
+        // 恒绿模式:源码级字符串测试自我匹配)。
+        let start = concat!("UserEvent::Pane", "Opened {");
+        let stop = concat!("UserEvent::Pane", "OpenErr {");
+        let after = src.rsplit(start).next().expect("找不到 PaneOpened 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneOpened 分支的结尾")];
+        // **注释行必须剥掉**。第一版没剥,而这段代码上方恰好有一句解释性注释
+        // 也提到了 `pending_for_extra_pane` —— 把调用整个删掉,测试照样绿。
+        // 源码级断言只能扎在代码上:注释想写什么写什么,不该有资格让测试通过。
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 前提:切出来的确实是那条 match 分支,不是别处的 send_event。
+        // 切错了片段的话下面那条断言测的就不是想测的东西。
+        assert!(
+            body.contains("pane_still_wanted"),
+            "切错片段了:这段不像 PaneOpened 的 match 分支"
+        );
+        assert!(
+            body.contains("pending_for_extra_pane"),
+            "PaneOpened 没有为新 pane 起自动化 —— 分屏出来的 pane 会是干净 shell,\
+             节点配的 cd/export/启动命令一条都不跑,且没有任何报错"
         );
     }
 
@@ -10355,7 +10527,8 @@ mod tests {
                 ws: Workspace::new(test_pane(1), 0),
                 current_preset: None,
                 last_cfg: None,
-                automation: None,
+                automation: Vec::new(),
+                automation_template: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
@@ -11101,7 +11274,8 @@ mod tests {
                 ws: Workspace::new(test_pane(1), 0),
                 current_preset: None,
                 last_cfg: None,
-                automation: None,
+                automation: Vec::new(),
+                automation_template: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
