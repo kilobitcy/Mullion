@@ -477,6 +477,41 @@ impl TabContent {
     }
 }
 
+/// F18 拖拽出界的自动滚动量。判据是**焦点 pane 的终端区**,不是整个窗口。
+///
+/// 窗口边界不能用:终端区上沿之上还有菜单栏 + 标签栏(几十像素),下沿之下还有
+/// 状态栏/传输面板。指针拉到那些地方时窗口坐标仍是正数、仍小于窗口高,
+/// `autoscroll_lines` 一行都不滚 —— 用户必须把鼠标拖出**整个窗口**才跨得了屏,
+/// 而正常终端是拖到内容区顶端就开始滚。分屏后每块 pane 的上下沿还各不相同,
+/// 只有按焦点那块算才对得上。
+///
+/// 换算与 `cursor_in_grid`/`selection_cursor` 同源(都减 `term_px` 的原点):
+/// 两处不同源的话,选区终点落在这一格、却按另一套边界决定滚不滚。
+fn autoscroll_for_pane(cursor_px_y: f32, term: shell::workspace::PxRect, cell_h: f32) -> i32 {
+    input::autoscroll_lines(cursor_px_y - term.y as f32, term.h as f32, cell_h)
+}
+
+/// 输入法候选框该占的物理像素矩形 `(x, y, w, h)`:焦点 pane 里光标那一格。
+///
+/// 传窗口原点的话候选窗永远飘在窗口左上角 —— 打中文时得低头找候选。夹紧是
+/// 因为 resize 的中间态里光标行列可能短暂超出当前几何,不夹会把候选框推到
+/// 邻居 pane / 状态栏上。
+fn ime_cursor_area(
+    term: shell::workspace::PxRect,
+    cursor: (u16, u16),
+    cell_w: f32,
+    cell_h: f32,
+) -> (u32, u32, u32, u32) {
+    let w = (cell_w.max(1.0)) as u32;
+    let h = (cell_h.max(1.0)) as u32;
+    // 至少留一格:`w`/`h` 比 pane 还大时 saturating_sub 会得 0,夹出个空矩形。
+    let max_x = term.w.saturating_sub(w);
+    let max_y = term.h.saturating_sub(h);
+    let x = (u32::from(cursor.0) * w).min(max_x);
+    let y = (u32::from(cursor.1) * h).min(max_y);
+    (term.x + x, term.y + y, w, h)
+}
+
 /// 活动标签的 workspace。
 ///
 /// 写成**自由函数而不是 `App` 的方法**是被借用检查器逼的:`App` 的方法借的是
@@ -1204,6 +1239,14 @@ pub struct App {
     /// 拖拽出界时每帧要滚的行数;0 = 不自动滚。**只在真正 present 的那一帧施加**
     /// (见 `RedrawRequested` 里的说明),否则重演 T3/T7。
     autoscroll: i32,
+    /// 输入法组字状态。组字期间 winit 照样发 `KeyboardInput`(logical_key 是
+    /// 拼音字母),不靠它吞掉的话打「你好」会先往远端送一串 `nihao`。
+    ime: input::ImeState,
+    /// 上次告诉系统输入法的候选框位置(物理像素 `(x, y, w, h)`)。
+    ///
+    /// 记着是为了**只在变化时**调 `set_ime_cursor_area`:那是一次跨进程的
+    /// 系统调用,每帧无脑调与 T3 同一类问题(光标每闪一次就调一遍)。
+    ime_cursor_area: Option<(u32, u32, u32, u32)>,
     /// 待用户确认的多行粘贴(F18)。`Some` = 弹窗开着,计入 `modal`(T8)。
     pending_paste: Option<String>,
     /// F61/F62:会话外观的解析缓存。**只在会话/分组变更后 rebuild**,
@@ -1377,6 +1420,8 @@ impl App {
             prev_click: None,
             press_anchor: None,
             autoscroll: 0,
+            ime: Default::default(),
+            ime_cursor_area: None,
             pending_paste: None,
             appearance: Default::default(),
             probe_epoch: 0,
@@ -3588,9 +3633,13 @@ impl App {
         let Some(a) = self.active.as_ref() else {
             return;
         };
-        let win_h = a.gpu.config.height as f32;
         let cell_h = a.text.cell_h;
-        self.autoscroll = input::autoscroll_lines(self.cursor_px.1, win_h, cell_h);
+        // 判据取焦点 pane 的终端区,不是整窗 —— 见 `autoscroll_for_pane`。
+        // 拿不到几何(还没排过版)时不滚,别拿窗口边界凑合。
+        self.autoscroll = match self.focused_geom() {
+            Some(g) => autoscroll_for_pane(self.cursor_px.1, g.term_px, cell_h),
+            None => 0,
+        };
         if let Some((col, row, side)) = self.selection_cursor() {
             if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                 pane.emulator.selection_update(col, row, side);
@@ -3630,6 +3679,38 @@ impl App {
             }
         }
         self.copy_selection();
+    }
+
+    /// 告诉系统输入法候选框该贴在哪(焦点 pane 的光标格)。
+    ///
+    /// 只在位置**变了**才调:`set_ime_cursor_area` 是跨进程系统调用,每帧无脑
+    /// 调与 T3 同一类问题。拿不到几何/光标不可见时不动 —— 保持上一次的位置
+    /// 比把候选框弹回窗口角落好。
+    fn apply_ime_cursor_area(&mut self) {
+        let Some(g) = self.focused_geom() else { return };
+        let Some(a) = self.active.as_ref() else {
+            return;
+        };
+        let (cell_w, cell_h) = (a.text.cell_w, a.text.cell_h);
+        let Some(cur) = self
+            .active_ws()
+            .and_then(Workspace::focused)
+            .map(|p| p.emulator.cursor())
+            .filter(|c| c.visible)
+        else {
+            return;
+        };
+        let area = ime_cursor_area(g.term_px, (cur.col, cur.row), cell_w, cell_h);
+        if self.ime_cursor_area == Some(area) {
+            return;
+        }
+        self.ime_cursor_area = Some(area);
+        if let Some(a) = self.active.as_ref() {
+            a.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(area.0, area.1),
+                winit::dpi::PhysicalSize::new(area.2, area.3),
+            );
+        }
     }
 
     /// 把当前选区写进系统剪贴板。无选区 = 什么都不做(`selection_text` 返回
@@ -3686,8 +3767,9 @@ impl App {
     /// 同步输出探测自动化就自杀,而且现象是「有时候能跑有时候跑不了」。
     ///
     /// 将来新增用户输入路径(如鼠标按钮上报 F15)也必须一并接上这里。
-    /// 当前的四处以 `grep -n "pty.write" crates/mullion-app/src/app.rs` 为准
-    /// (行号会漂,别钉死)。
+    /// 当前的几处以 `grep -n "pty.write" crates/mullion-app/src/app.rs` 为准
+    /// (行号会漂,别钉死);数量由
+    /// `user_intent_write_points_all_yield_to_the_user` 钉住。
     fn user_took_over(&mut self) {
         if let Some(h) = self.active_term_mut().and_then(|t| t.automation.as_mut()) {
             // drop 发送端即取消(`write_scheduled` 的 doc:收到值**或**发送端
@@ -4276,6 +4358,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
+        // 输入法:winit **默认不发** `WindowEvent::Ime`,不打开这个开关的话中文/
+        // 日文输入法一个字都递不进来(用户报的「ssh 连接后不能输入汉字」)。
+        // 候选框位置由 `apply_ime_cursor_area` 每帧跟着终端光标走。
+        window.set_ime_allowed(true);
         let init_size = window.inner_size();
         crate::logx::line(&format!(
             "resumed: 窗口创建 {}x{} scale={}",
@@ -5185,7 +5271,38 @@ impl ApplicationHandler<UserEvent> for App {
                 log::debug!(target: "mullion", "Resized({}x{})", size.width, size.height);
                 self.apply_resize(size.width, size.height);
             }
+            // 输入法(F21):中文/日文的字是从这条路进来的,不是 `KeyboardInput`。
+            // `set_ime_allowed(true)` 在 `resumed` 里开,不开这条事件根本不会发。
+            WindowEvent::Ime(ime) => {
+                match &ime {
+                    winit::event::Ime::Preedit(text, _) => self.ime.on_preedit(text),
+                    winit::event::Ime::Commit(text) => {
+                        self.ime.on_commit();
+                        // 组字结果按用户输入对待:先回底部(否则「打了但看不到」,
+                        // 与按键/粘贴同一条口径),再写焦点 pane。
+                        if let Some(bytes) = input::ime_commit_bytes(text) {
+                            if let Some(pane) =
+                                self.active_ws_mut().and_then(Workspace::focused_mut)
+                            {
+                                pane.emulator.selection_clear();
+                                pane.emulator.scroll_to_bottom();
+                                let _ = pane.pty.write(bytes);
+                                // F40:用户接管,自动化让位(借用已释放)。
+                                self.user_took_over();
+                            }
+                        }
+                    }
+                    winit::event::Ime::Enabled => {}
+                    winit::event::Ime::Disabled => self.ime.on_disabled(),
+                }
+                self.request_ui_redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                // 组字期间的按键是拼音字母,归输入法。不吞的话打「你好」会先往
+                // 远端送一串 `nihao` 再送「你好」(见 `input::ImeState`)。
+                if self.ime.swallows_key() {
+                    return;
+                }
                 if event.state == ElementState::Pressed {
                     if let Some((key, mods)) = input::translate_key(&event, self.mods) {
                         // F18:`Ctrl+Shift+C/V` 必须在 `encode_key` 之前截住。
@@ -5239,6 +5356,20 @@ impl ApplicationHandler<UserEvent> for App {
                             let _ = pane.pty.write(bytes);
                             // F40:用户接管,自动化让位(借用已释放)。
                             self.user_took_over();
+                        }
+                    } else if let Some(text) = input::translate_text(&event.logical_key, self.mods)
+                    {
+                        // 合成输入(死键 / 部分布局)把结果整段塞进 `Character`,
+                        // 映射不成单键。旧实现直接丢 —— 按出来的字凭空消失。
+                        if let Some(bytes) = input::ime_commit_bytes(&text) {
+                            if let Some(pane) =
+                                self.active_ws_mut().and_then(Workspace::focused_mut)
+                            {
+                                pane.emulator.selection_clear();
+                                pane.emulator.scroll_to_bottom();
+                                let _ = pane.pty.write(bytes);
+                                self.user_took_over();
+                            }
                         }
                     }
                 }
@@ -5980,6 +6111,13 @@ impl ApplicationHandler<UserEvent> for App {
                     let at = Instant::now() + std::time::Duration::from_millis(16);
                     self.next_frame_at = Some(at);
                     event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+                }
+
+                // 输入法候选框跟着终端光标走。**只在 present 过的那一帧算**、
+                // 且只在位置真变了才调 —— `set_ime_cursor_area` 是跨进程系统
+                // 调用,每帧无脑调是 T3 那一类问题(光标每闪一次调一遍)。
+                if presented {
+                    self.apply_ime_cursor_area();
                 }
 
                 // Task 6:会话管理弹窗的 intent 施加点。放在 `plan` 整块之后——此处
@@ -7133,10 +7271,11 @@ fn render_frame(
 mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
-        credential_delete_error, download_job, effective_focus_of, files_owner_generation_of,
-        finish_password_change, font_px_for, has_real_action, next_panel_selection_index,
-        pane_still_wanted, snapshot_tabs_of, sync_timeout_wake_at, tab_title, upload_job,
-        wind_down, Modal, RestoredTab, Tab, TabContent, TerminalTab,
+        autoscroll_for_pane, credential_delete_error, download_job, effective_focus_of,
+        files_owner_generation_of, finish_password_change, font_px_for, has_real_action,
+        ime_cursor_area, next_panel_selection_index, pane_still_wanted, snapshot_tabs_of,
+        sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal, RestoredTab, Tab,
+        TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -7145,6 +7284,109 @@ mod tests {
     use mullion_core::layout::{Dir, Node, PaneId, Rect};
     use mullion_store::SessionId;
     use std::sync::Arc;
+
+    // ------------------------------------------------ F18 划选自动滚动
+
+    /// F18:拖拽出界的自动滚动,判据必须是**焦点 pane 的终端区**,不是整个窗口。
+    ///
+    /// 用窗口边界的后果就是用户报的那条:「左键按住不动往上拉,选不到上一屏」。
+    /// 终端区上沿之上还有菜单栏 + 标签栏(几十像素),指针拉到那里时窗口坐标
+    /// 仍是正数、仍小于窗口高 —— `autoscroll_lines` 返回 0,一行都不滚。用户
+    /// 得把鼠标拖出整个窗口才滚得动,而正常终端是拖到内容区顶端就开始滚。
+    ///
+    /// 自证会变红:把 `autoscroll_for_pane` 里的 `term.y`/`term.h` 换回窗口
+    /// 原点(0)与窗口高 —— 头两条断言立刻红。
+    #[test]
+    fn autoscroll_triggers_at_the_terminal_edge_not_the_window_edge() {
+        // 菜单栏 + 标签栏占掉顶上 100px,终端区 y=100..500,底下还有状态栏。
+        let term = crate::shell::workspace::PxRect {
+            x: 0,
+            y: 100,
+            w: 800,
+            h: 400,
+        };
+        assert!(
+            autoscroll_for_pane(60.0, term, 16.0) > 0,
+            "指针在 y=60:还在窗口里,但已经拉出终端区上沿 —— 必须往历史滚"
+        );
+        assert!(
+            autoscroll_for_pane(560.0, term, 16.0) < 0,
+            "指针在 y=560:拉出终端区下沿 —— 必须往新内容滚"
+        );
+        assert_eq!(
+            autoscroll_for_pane(300.0, term, 16.0),
+            0,
+            "指针在终端区内部不该滚"
+        );
+    }
+
+    /// 分屏后每块 pane 的上下沿都不一样,滚动判据必须跟着**焦点那块**走。
+    /// 上下分屏时,下面那块的上沿在窗口中部:指针停在窗口中上部对上面那块
+    /// 是"区内",对下面那块却已经是"拉出上沿"。
+    ///
+    /// 自证会变红:让 `autoscroll_for_pane` 忽略 `term.y`。
+    #[test]
+    fn autoscroll_bounds_follow_the_focused_pane_not_the_whole_terminal_area() {
+        let top = crate::shell::workspace::PxRect {
+            x: 0,
+            y: 100,
+            w: 800,
+            h: 200,
+        };
+        let bottom = crate::shell::workspace::PxRect {
+            x: 0,
+            y: 300,
+            w: 800,
+            h: 200,
+        };
+        assert_eq!(
+            autoscroll_for_pane(250.0, top, 16.0),
+            0,
+            "y=250 落在上面那块内部,不该滚"
+        );
+        assert!(
+            autoscroll_for_pane(250.0, bottom, 16.0) > 0,
+            "同一个 y 对下面那块已经在上沿之外,焦点在它身上时必须滚"
+        );
+    }
+
+    // ------------------------------------------------ 输入法候选框
+
+    /// 候选框必须贴在**终端光标**那一格上。系统输入法拿这个矩形定位候选窗,
+    /// 传窗口原点的话候选框永远飘在窗口左上角 —— 打中文时得低头找候选。
+    ///
+    /// 自证会变红:把 `ime_cursor_area` 里的 `term.x`/`term.y` 去掉。
+    #[test]
+    fn ime_candidate_box_sits_on_the_terminal_cursor_not_the_window_corner() {
+        let term = crate::shell::workspace::PxRect {
+            x: 40,
+            y: 100,
+            w: 800,
+            h: 400,
+        };
+        // 光标在第 10 列第 5 行,格子 8×16。
+        assert_eq!(
+            ime_cursor_area(term, (10, 5), 8.0, 16.0),
+            (40 + 80, 100 + 80, 8, 16)
+        );
+    }
+
+    /// 候选框不能跑到 pane 外面去:光标行号在 resize 的中间态里可能短暂
+    /// 大于终端区高度,不夹的话候选框会飘到下一个 pane / 状态栏上。
+    ///
+    /// 自证会变红:去掉 `ime_cursor_area` 里的两处夹紧。
+    #[test]
+    fn ime_candidate_box_is_clamped_inside_the_pane() {
+        let term = crate::shell::workspace::PxRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 32,
+        };
+        let (x, y, _, _) = ime_cursor_area(term, (999, 999), 8.0, 16.0);
+        assert!(x < 80, "x={x} 越出了 pane 右缘");
+        assert!(y < 32, "y={y} 越出了 pane 下缘");
+    }
 
     // ------------------------------------------------ F84/F21 外观设置
 
@@ -9319,9 +9561,10 @@ mod tests {
 
     /// **接线守护**:用户意图写入点的数量。
     ///
-    /// `user_took_over` 的文档说「当前的四处以 grep 为准」——这条测试把那句话
-    /// 变成可执行断言。四个写入点里滚轮的两处(`Report`/`ArrowKeys`)共用分支
-    /// 末尾一次调用,所以调用点是三处。
+    /// `user_took_over` 的文档说「当前的几处以 grep 为准」——这条测试把那句话
+    /// 变成可执行断言。滚轮的两处(`Report`/`ArrowKeys`)共用分支末尾一次调用;
+    /// 输入法(F21)把总数从三处推到五处:`Ime::Commit` 与合成文本(死键 /
+    /// 部分布局塞进 `Character` 的多字符)各是一条独立的用户输入路径。
     ///
     /// 挡两个方向:
     /// - **少了**:重构时删掉一处,自动化在用户已经开始打字后仍继续发命令,
@@ -9343,10 +9586,10 @@ mod tests {
             .expect("split 至少有一段");
         let calls = prod.matches("self.user_took_over();").count();
         assert_eq!(
-            calls, 3,
-            "用户意图写入点的取消调用应为 3 处(粘贴/滚轮/键盘,滚轮两个分支\
-             共用一次),实际 {calls} 处 —— 少了会让自动化在用户打字时继续发\
-             命令,多了说明新增了输入路径但没复核这条不变量"
+            calls, 5,
+            "用户意图写入点的取消调用应为 5 处(粘贴/滚轮/键盘/输入法提交/\
+             合成文本,滚轮两个分支共用一次),实际 {calls} 处 —— 少了会让自动化\
+             在用户打字时继续发命令,多了说明新增了输入路径但没复核这条不变量"
         );
     }
 

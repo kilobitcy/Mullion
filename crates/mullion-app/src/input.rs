@@ -43,13 +43,86 @@ pub fn translate_logical(logical: &WKey, mods: ModifiersState) -> Option<(Key, M
             let mut chars = s.chars();
             let c = chars.next()?;
             if chars.next().is_some() {
-                return None; // 多字符(IME 合成)MVP 先不处理
+                return None; // 多字符(合成输入)不是「一个键」,归 `translate_text`
             }
             Key::Char(c)
         }
         _ => return None,
     };
     Some((key, m))
+}
+
+/// 无法映射成单个键、但仍是可打印文本的按键 → 原样发给远端的文本。
+///
+/// 合成输入(死键、部分键盘布局)会把结果整段塞进 `Character`。旧实现在
+/// [`translate_logical`] 里直接丢弃,症状是"按出来的字凭空消失"。
+///
+/// 三条边界:
+/// - **单字符不走这里**:那条路要经 `encode_key`,T6 的 Shift+Enter 等编码规则
+///   都在那儿,被文本路径抢走就全退化成裸字符。
+/// - **Ctrl/Alt/Super 不走这里**:那是快捷键,当文本发过去是往远端灌乱码。
+///   Shift 例外——Shift+字母本来就是大写字母,是正经文本。
+/// - 真正的中文/日文输入走的是 `WindowEvent::Ime`(见 [`ImeState`]),不是这条。
+pub fn translate_text(logical: &WKey, mods: ModifiersState) -> Option<String> {
+    if mods.control_key() || mods.alt_key() || mods.super_key() {
+        return None;
+    }
+    let WKey::Character(s) = logical else {
+        return None;
+    };
+    s.chars().nth(1)?; // 单字符归 translate_logical
+    Some(s.to_string())
+}
+
+/// IME 组字状态(F21 输入法)。
+///
+/// **为什么必须有**:winit 在组字期间照样发 `KeyboardInput`,`logical_key` 就是
+/// 用户敲的拼音字母。不拦的话打「你好」会先往远端送一串 `nihao`,再送「你好」。
+///
+/// 三条结束边:`Commit`(选了字)、空 `Preedit`(按 Esc 取消候选)、`Disabled`
+/// (切走输入法 / 失焦)。**少认一条,组字状态就永久挂着,此后一个键都进不了
+/// 终端** —— 与 T8 同一类"输入永久失灵"的故障。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ImeState {
+    preediting: bool,
+}
+
+impl ImeState {
+    /// 收到 `Ime::Preedit`。空串 = 候选被取消,组字结束。
+    pub fn on_preedit(&mut self, text: &str) {
+        self.preediting = !text.is_empty();
+    }
+
+    /// 收到 `Ime::Commit`,组字结束。
+    pub fn on_commit(&mut self) {
+        self.preediting = false;
+    }
+
+    /// 收到 `Ime::Disabled`(切走输入法 / 失焦),组字结束。
+    pub fn on_disabled(&mut self) {
+        self.preediting = false;
+    }
+
+    /// 这一刻的按键该不该被吞掉(组字中 = 该吞)。
+    pub fn swallows_key(&self) -> bool {
+        self.preediting
+    }
+}
+
+/// IME 提交的文本 → 发给远端的字节。
+///
+/// 换行归一成 `\r`,与 `mullion_term::keymap::encode_paste` 同一套规则:
+/// 少数输入法会一次提交带换行的整段,送 `\n` 过去 shell 不换行。
+/// 空提交返回 `None` —— 取消候选时某些平台会补一条空 commit。
+///
+/// **不做 bracketed paste 包裹**:这是逐字输入,不是粘贴;包起来会让远端把
+/// 用户敲的每个字当成一次粘贴事件(shell 的括号粘贴提示会一路刷屏)。
+pub fn ime_commit_bytes(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty() {
+        return None;
+    }
+    let out: String = text.replace("\r\n", "\r").replace('\n', "\r");
+    Some(out.into_bytes())
 }
 
 /// 一次滚轮增量 → 行数(正数 = 向上 / 往历史)。
@@ -221,11 +294,101 @@ mod tests {
     }
 
     #[test]
-    fn multichar_ime_is_ignored() {
-        // 多字符(输入法合成)MVP 先不当按键处理,交给后续 IME 支持。
+    fn multichar_is_not_a_single_key() {
+        // 多字符(输入法合成 / 死键组合)不是「一个键」,`translate_logical` 交给
+        // `translate_text` 走文本路径,不在这里硬塞进 `Key::Char`。
         assert!(
             translate_logical(&WKey::Character("ab".into()), ModifiersState::empty()).is_none()
         );
+    }
+
+    #[test]
+    fn multichar_character_is_sent_as_text_so_composed_input_reaches_the_remote() {
+        // F21/输入法:部分布局与死键组合会把合成结果整段塞进 `Character`。
+        // 旧实现直接 `return None` 丢掉 —— 用户按出来的字凭空消失。
+        assert_eq!(
+            translate_text(&WKey::Character("ǹǐ".into()), ModifiersState::empty()).as_deref(),
+            Some("ǹǐ")
+        );
+    }
+
+    #[test]
+    fn single_char_is_not_taken_by_the_text_path() {
+        // 单字符走 `translate_logical` → `encode_key`(那里才有 T6 的 Shift+Enter
+        // 等编码规则)。文本路径抢走的话所有修饰键组合都会退化成裸字符。
+        assert_eq!(
+            translate_text(&WKey::Character("a".into()), ModifiersState::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn multichar_with_ctrl_or_alt_is_a_shortcut_not_text() {
+        // 带 Ctrl/Alt/Super 的组合是快捷键,原样当文本发过去就是往远端灌乱码。
+        for m in [
+            ModifiersState::CONTROL,
+            ModifiersState::ALT,
+            ModifiersState::SUPER,
+        ] {
+            assert_eq!(
+                translate_text(&WKey::Character("ab".into()), m),
+                None,
+                "{m:?} 下不该走文本路径"
+            );
+        }
+        // Shift 不算:Shift+字母本来就是大写字母,是正经文本。
+        assert_eq!(
+            translate_text(&WKey::Character("AB".into()), ModifiersState::SHIFT).as_deref(),
+            Some("AB")
+        );
+    }
+
+    #[test]
+    fn ime_swallows_keys_while_composing_so_pinyin_letters_do_not_leak() {
+        // winit 在组字期间**照样**发 `KeyboardInput`(logical_key 就是拼音字母)。
+        // 不拦的话打「你好」会先往远端送一串 "nihao",再送「你好」。
+        let mut ime = ImeState::default();
+        assert!(!ime.swallows_key(), "没在组字时不该吞键");
+        ime.on_preedit("ni");
+        assert!(ime.swallows_key(), "组字中必须吞掉拼音字母");
+        ime.on_commit();
+        assert!(
+            !ime.swallows_key(),
+            "提交后要立刻放行,否则下一个字都打不出来"
+        );
+    }
+
+    #[test]
+    fn empty_preedit_ends_composition() {
+        // 用户按 Esc 取消候选:winit 发的是空 preedit,不是 commit。只认 commit
+        // 的话组字状态永远挂着,此后**一个键都进不了终端**。
+        let mut ime = ImeState::default();
+        ime.on_preedit("ni");
+        ime.on_preedit("");
+        assert!(!ime.swallows_key());
+    }
+
+    #[test]
+    fn disabling_ime_ends_composition() {
+        // 切走输入法 / 失焦时 winit 发 `Ime::Disabled`,同样要解除吞键,
+        // 否则用户切回英文输入法后键盘整个失灵。
+        let mut ime = ImeState::default();
+        ime.on_preedit("ni");
+        ime.on_disabled();
+        assert!(!ime.swallows_key());
+    }
+
+    #[test]
+    fn ime_commit_normalizes_newlines_to_cr_like_paste_does() {
+        // 少数输入法会一次提交带换行的整段。终端要的是 `\r`,送 `\n` 过去
+        // shell 不换行(与 `encode_paste` 同一套归一规则)。
+        assert_eq!(ime_commit_bytes("a\r\nb\nc"), Some(b"a\rb\rc".to_vec()));
+    }
+
+    #[test]
+    fn empty_ime_commit_sends_nothing() {
+        // 取消候选时某些平台会补一条空 commit;发个空写入是白占一次 channel。
+        assert_eq!(ime_commit_bytes(""), None);
     }
 
     #[test]

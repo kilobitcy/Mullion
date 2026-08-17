@@ -196,6 +196,24 @@ impl Emulator {
         }
     }
 
+    /// 光标在**可视区**里的位置。[`Emulator::snapshot`] 里那份 `cursor` 的
+    /// 轻量同源版:换算规则一字不差,但不建 cols×rows 的 `Vec`。
+    ///
+    /// 存在的理由是输入法候选框定位每帧都要问一次光标 —— 为此建一整份网格
+    /// 快照正是陷阱 T3(每帧一次大堆分配)。守护:
+    /// `cursor_agrees_with_the_full_snapshot_even_after_scrolling`。
+    pub fn cursor(&self) -> Cursor {
+        let grid = self.term.grid();
+        let offset = grid.display_offset() as i32;
+        let p = grid.cursor.point;
+        let cursor_row = p.line.0 + offset;
+        Cursor {
+            row: cursor_row.max(0) as u16,
+            col: p.column.0 as u16,
+            visible: cursor_row >= 0 && (cursor_row as usize) < grid.screen_lines(),
+        }
+    }
+
     /// 改变网格尺寸(F34:分屏 reflow / 窗口 resize 时调用)。
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(GridSize { cols, rows });
@@ -473,6 +491,22 @@ mod tests {
             "b",
             "alt screen 下 scroll_display 静默无效,画面不该动"
         );
+    }
+
+    #[test]
+    fn cursor_agrees_with_the_full_snapshot_even_after_scrolling() {
+        // 输入法候选框每帧都要问一次光标在哪。走 `snapshot()` 的话每帧多建一个
+        // cols×rows 的 Vec —— 正是陷阱 T3。`cursor()` 是那份快照的轻量同源版:
+        // 两者**必须**给同一个答案,否则候选框会贴在光标以外的地方。
+        //
+        // 自证会变红:把 `cursor()` 里的 `+ offset` 去掉。
+        let mut emu = Emulator::new(20, 2);
+        emu.feed(b"alpha\r\nbravo\r\ncharlie");
+        assert_eq!(emu.cursor(), emu.snapshot().cursor);
+        // 回溯之后光标滚出可视区,`visible` 也要一致 —— 不然候选框会钉在边缘行。
+        emu.scroll(Scroll::Delta(5));
+        assert_eq!(emu.cursor(), emu.snapshot().cursor);
+        assert!(!emu.cursor().visible, "回溯到历史里,光标该判不可见");
     }
 
     #[test]
