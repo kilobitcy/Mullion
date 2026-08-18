@@ -41,10 +41,13 @@ pub enum CursorShape {
     /// 竖线。**本项目的默认**(见 `Emulator::with_history`)。
     #[default]
     Beam,
-    /// 空心框。远端主动要求时才会出现(我们自己用它表示"非焦点 pane",
-    /// 那条路径不看这个字段)。
+    /// 空心框。**当前不可达**:`Term::cursor_style()` 只吐 DECSCUSR/OSC 50
+    /// 能表达的三种形状,这个值在 alacritty 里只走 vi-mode,而本项目不开 vi-mode。
+    /// 留着是为了让 `map_shape` 能穷尽匹配。(渲染层"非焦点 pane 画空心框"
+    /// 是 `gpu.rs` 自己的另一套判断,不读这个字段。)
     HollowBlock,
-    /// 远端要求不画光标。
+    /// 远端要求不画光标。**当前不可达**:DECTCEM 走的是 `Cursor::visible`,
+    /// `cursor_style()` 不看它。同样只为穷尽匹配而留。
     Hidden,
 }
 
