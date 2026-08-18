@@ -4560,24 +4560,54 @@ impl App {
 
     /// F128:这一帧该发起哪些重拨。挂在帧循环上而不是在 `pump` 里直接拨:
     /// `Workspace` 不认识 tokio、也不认识 store(架构不变量),拨号是 app 的事。
+    ///
+    /// **遍历所有标签,不只是活动标签**——理由同 `drive_automation`:用户
+    /// 完全可能开着标签 A 连了台机器就切去标签 B,只驱动活动标签的话标签 A
+    /// 断线要等用户切回去才会开始重拨,「尽快恢复」这条诉求就落空了。
     fn drive_reconnects(&mut self) {
-        let Some(generation) = self.active_term().map(|t| t.ws.generation()) else {
-            return;
-        };
-        let in_flight: Vec<usize> = self
-            .reconnecting
+        let generations: Vec<u64> = self
+            .tabs
             .iter()
-            .filter(|(g, _, _)| *g == generation)
-            .map(|(_, h, _)| *h)
+            .filter_map(|tab| tab.content.as_terminal())
+            .map(|t| t.ws.generation())
             .collect();
-        let Some(t) = self.active_term() else { return };
-        // `Workspace::panes()` 返回 `&[PaneState]`(既有签名),所以走 `.iter()`。
-        let panes: Vec<(PaneId, usize, crate::shell::workspace::PaneStatus)> =
-            t.ws.panes()
+        let mut plans: Vec<(u64, usize)> = Vec::new();
+        for generation in generations {
+            let Some(t) = self
+                .tabs
+                .by_generation(generation)
+                .and_then(|t| t.content.as_terminal())
+            else {
+                continue;
+            };
+            // 稳态早退(T3):这个标签没有 pane 在 `Reconnecting` 就不用往下
+            // collect 两个 `Vec`——多标签下这个函数每帧都对每个标签跑一遍,
+            // 早退把稳态成本压回一次 bool 扫描。
+            if !t
+                .ws
+                .panes()
                 .iter()
-                .map(|p| (p.id, p.host_ix, p.status))
+                .any(|p| p.status == crate::shell::workspace::PaneStatus::Reconnecting)
+            {
+                continue;
+            }
+            let in_flight: Vec<usize> = self
+                .reconnecting
+                .iter()
+                .filter(|(g, _, _)| *g == generation)
+                .map(|(_, h, _)| *h)
                 .collect();
-        for host_ix in crate::reconnect::hosts_to_redial(&panes, &in_flight) {
+            // `Workspace::panes()` 返回 `&[PaneState]`(既有签名),所以走 `.iter()`。
+            let panes: Vec<(PaneId, usize, crate::shell::workspace::PaneStatus)> =
+                t.ws.panes()
+                    .iter()
+                    .map(|p| (p.id, p.host_ix, p.status))
+                    .collect();
+            for host_ix in crate::reconnect::hosts_to_redial(&panes, &in_flight) {
+                plans.push((generation, host_ix));
+            }
+        }
+        for (generation, host_ix) in plans {
             // `attempt = 0` 是「首次重拨」:`delay_for(0)` 是 `None`(退避表
             // 1-indexed,`backoff_delay(0)` 视 0 为非法输入),`unwrap_or_default()`
             // 把它变成零延迟——首次立刻拨,失败后才进 1s/2s/4s… 的退避。
@@ -4600,7 +4630,10 @@ impl App {
             return;
         };
         let Some(cfg) = t.last_cfg.clone() else {
-            log::warn!(target: "mullion", "重连:标签没有 last_cfg,放弃");
+            log::warn!(
+                target: "mullion",
+                "重连:世代 {generation} host {host_ix} 没有 last_cfg,放弃"
+            );
             return;
         };
         // 这条连接上挂着哪些 pane —— 每块都要一条新 channel(adr-009)。
@@ -5553,6 +5586,18 @@ impl ApplicationHandler<UserEvent> for App {
                             attached.push((id, ssh));
                         }
                     }
+                    if attached.is_empty() {
+                        // 拨号那几秒里这条连接上的 pane 全被用户关掉了——刚 push
+                        // 的这条 HostConn 没人指,必须撤掉,否则占着一条不关的
+                        // 连接挂到整个标签关闭为止(pop 的前提同 `PaneRehosted`:
+                        // push 到这里之间没有 `.await`、没有别的地方能插入
+                        // `ws.hosts.push`)。
+                        t.ws.hosts.pop();
+                        log::warn!(
+                            target: "mullion",
+                            "重连:host {host_ix}(世代 {generation})拨号途中所有 pane 都没了,丢弃新连接",
+                        );
+                    }
                     // 死掉的那条连接上开的 SFTP channel 一起完蛋 —— 留着的话
                     // 侧栏每次操作静默失败,用户看到的是「文件面板卡住了」。
                     for task in t.sftp_tasks.drain(..) {
@@ -5566,6 +5611,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 断线前那个 Claude Code 会话回不来(这正是 F128 的初衷)。
                 // 跳过 tmux new-session 那类"开新会话"的步骤,规则同分屏新开的
                 // pane(`pending_for_extra_pane`)。
+                let reconnected = !attached.is_empty();
                 if let Some(tpl) = template {
                     for (id, sink) in attached {
                         if let Some(plan) = crate::automation::pending_for_extra_pane(&tpl) {
@@ -5573,7 +5619,11 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                self.ui.set_toast("已重新连接");
+                // 零个 pane 真接上却弹「已重新连接」是名不副实——那种情况下
+                // 上面已经把刚 push 的 `HostConn` 撤掉了,用户什么都没得到。
+                if reconnected {
+                    self.ui.set_toast("已重新连接");
+                }
                 self.ui_dirty = true;
                 self.request_ui_redraw();
             }
@@ -5585,7 +5635,10 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.reconnecting
                     .retain(|(g, h, _)| !(*g == generation && *h == host_ix));
-                log::warn!(target: "mullion", "第 {attempt} 次重连失败: {msg}");
+                log::warn!(
+                    target: "mullion",
+                    "世代 {generation} host {host_ix} 第 {attempt} 次重连失败: {msg}"
+                );
                 let next = attempt + 1;
                 if crate::reconnect::delay_for(next).is_some() {
                     self.spawn_reconnect(generation, host_ix, next);
@@ -5606,9 +5659,7 @@ impl ApplicationHandler<UserEvent> for App {
                         for id in ids {
                             if let Some(p) = ws.pane_mut(id) {
                                 p.status = crate::reconnect::status_after_failure(next);
-                                p.emulator
-                                    .feed(b"\r\n[Mullion] \xe9\x87\x8d\xe8\xbf\x9e\xe5\xa4\xb1\xe8\xb4\xa5\xe6\xac\xa1\xe6\x95\xb0\xe8\xbf\x87\xe5\xa4\x9a\xef\xbc\x8c\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2\xe9\x87\x8d\xe8\xaf\x95\xe3\x80\x82\r\n");
-                                // "重连失败次数过多,已停止重试。"
+                                p.emulator.feed(&crate::reconnect::give_up_notice_bytes());
                             }
                         }
                     }
@@ -13335,6 +13386,12 @@ mod tests {
     /// 取某个函数的函数体源码。**`marker` 必须带行首缩进**——不带的话
     /// `include_str!` 出来的源码里会先匹配到测试自己写的那个字符串字面量,
     /// 断言就变成了「测试自我匹配」,永远绿(本项目已实证的第五类恒绿模式)。
+    ///
+    /// **隐含前提:`cargo fmt --check` 已经过。** `find("\n    }\n")` 靠
+    /// rustfmt 保证「方法自己的收尾 `}` 独占一行且缩进恰好 4 空格,内部嵌套块
+    /// (`if let`/`match`/`async move` 等)的收尾缩进一律深于 4 空格」——否则
+    /// 函数体内部一个巧合缩进到 4 空格的 `}` 会把这里截断在错误的位置。日后
+    /// 在别处复用这个辅助函数前,先确认这个前提仍然成立。
     fn fn_body<'a>(src: &'a str, marker: &str) -> &'a str {
         assert!(
             marker.starts_with("    "),
@@ -13464,5 +13521,58 @@ mod tests {
             "死掉的 SftpClient 必须丢掉"
         );
         assert!(body.contains("t.sftp_home = None;"));
+    }
+
+    /// **接线守护 / F128**:拨号那几秒里这条连接上的 pane 全被用户关掉了
+    /// (`attached` 为空)时,刚 push 进 `ws.hosts` 的那条必须撤掉 —— 否则一条
+    /// 谁也不指的 `Arc<SshConnection>` 会一直占到标签关闭为止,完全静默。
+    /// 同一时刻也不该弹「已重新连接」的 toast —— 用户什么都没得到。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
+    ///
+    /// 自证会变红:把 `if attached.is_empty() { ... }` 那段删掉,或者把
+    /// `set_toast` 挪出 `if reconnected { ... }`,改成无条件调用。
+    #[test]
+    fn reconnect_rolls_back_the_host_when_every_pane_vanished_mid_dial() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("attached.is_empty()") && body.contains("hosts.pop()"),
+            "所有 pane 都没了时没有把刚 push 的 HostConn 撤掉"
+        );
+        assert!(
+            body.contains("if reconnected {"),
+            "toast 没有按「真的有 pane 接上」收敛,零个 pane 接上也会弹「已重新连接」"
+        );
+    }
+
+    /// **接线守护 / F128**:`drive_reconnects` 必须遍历所有标签,不能只驱动
+    /// 活动标签——理由同 `drive_automation`(见其文档注释):用户完全可能
+    /// 开着标签 A 连了台机器就切去标签 B,只驱动活动标签的话标签 A 断线要等
+    /// 用户切回去才会开始重拨,用户「尽快恢复重连」的诉求就落空了。
+    ///
+    /// 锚点拆开拼(`concat!`),理由同 `reconnect_uses_the_cfg_frozen_at_connect_time`。
+    ///
+    /// 自证会变红:把 `self.tabs.iter()` 换回 `self.active_term()`。
+    #[test]
+    fn drive_reconnects_walks_every_tab_not_just_the_active_one() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "drive_reconnects(&mut self) {"));
+        assert!(
+            !body.contains("active_term"),
+            "drive_reconnects 只驱动了活动标签 —— 后台标签断线要等用户切回去\
+             才会开始重拨"
+        );
     }
 }

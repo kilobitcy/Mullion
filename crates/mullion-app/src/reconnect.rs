@@ -61,6 +61,18 @@ pub fn notice_bytes(attempt: u32, delay: Duration) -> Vec<u8> {
     .into_bytes()
 }
 
+/// 退避到顶、放弃重连时喂进 emulator 的那一行提示。同 `notice_bytes`:纯文本
+/// + 前后各一个 `\r\n`,不做倒计时。
+///
+/// **必须是普通字符串字面量**,不是手工 hex 转义的 `b"..."`——那种写法全文件
+/// 只有一处,内容靠旁边注释反推,字节和注释谁也不校验谁;日后改文案的人
+/// 很可能只改了注释、忘了转 hex,现象是「注释说一套、屏幕显示另一套」。
+pub fn give_up_notice_bytes() -> Vec<u8> {
+    "\r\n[Mullion] 重连失败次数过多,已停止重试。\r\n"
+        .to_owned()
+        .into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +158,19 @@ mod tests {
         assert_eq!(s.matches('\n').count(), 2, "只有一行正文");
         assert!(s.contains("第 2 次"), "实际:{s:?}");
         assert!(s.contains("4"), "要告诉用户等多久,实际:{s:?}");
+    }
+
+    /// F128:退避到顶、放弃重连时的屏内提示,同样是**一行**纯文本输出
+    /// (同 `notice_bytes`)。
+    #[test]
+    fn the_give_up_notice_is_one_line_of_plain_output() {
+        let s = String::from_utf8(give_up_notice_bytes()).unwrap();
+        assert!(s.starts_with("\r\n"), "另起一行,不覆盖远端最后那行输出");
+        assert!(s.ends_with("\r\n"));
+        assert_eq!(s.matches('\n').count(), 2, "只有一行正文");
+        assert!(
+            s.contains("重连失败"),
+            "要让用户知道已经放弃重试,实际:{s:?}"
+        );
     }
 }
