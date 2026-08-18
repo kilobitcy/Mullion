@@ -468,8 +468,12 @@ impl Workspace {
     }
 }
 
+/// 供 `app.rs` 等跨模块测试复用的脚手架(F128:`reattach_pane`/`rehost_pane`
+/// 的测试要造 `Workspace`/`fake_pane`,原先这些都锁在 `tests` 模块里出不来)。
+/// **只挪不改**——内容与原先 `mod tests` 里的逐字节一致,只是换了个模块名
+/// 并把要跨模块用的项标了 `pub`。
 #[cfg(test)]
-mod tests {
+pub mod tests_support {
     use super::*;
     use crate::theme::{term_default_colors, MULLION_DARK};
     use std::sync::Mutex;
@@ -500,15 +504,15 @@ mod tests {
         }
     }
 
-    struct Probe {
-        writes: Arc<Mutex<Vec<Vec<u8>>>>,
-        resizes: Arc<Mutex<Vec<(u16, u16)>>>,
-        resize_fails: Arc<Mutex<bool>>,
-        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub struct Probe {
+        pub writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+        pub resize_fails: Arc<Mutex<bool>>,
+        pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     }
 
     /// 造一个挂着 FakePty 的 pane,并把它的输入端 / 观测端一起返回。
-    fn fake_pane(id: u32) -> (PaneState, Probe) {
+    pub fn fake_pane(id: u32) -> (PaneState, Probe) {
         let pty = FakePty::default();
         let probe_writes = pty.writes.clone();
         let probe_resizes = pty.resizes.clone();
@@ -540,7 +544,7 @@ mod tests {
         )
     }
 
-    fn ws_with(n: u32) -> (Workspace, Vec<Probe>) {
+    pub fn ws_with(n: u32) -> (Workspace, Vec<Probe>) {
         let (first, p0) = fake_pane(1);
         let mut ws = Workspace::new(first, 0);
         let mut probes = vec![p0];
@@ -552,6 +556,24 @@ mod tests {
         }
         (ws, probes)
     }
+
+    /// 一条崭新的、没接任何东西的 PTY 管道 —— 换 channel 那两条路径要拿它当
+    /// 「新开好的 channel」。
+    pub fn fresh_pipe() -> (
+        Box<dyn super::PtyWriter>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (p, probe) = fake_pane(999);
+        let rx = p.rx;
+        std::mem::forget(probe); // 发送端留着,免得 rx 立刻变成 Disconnected
+        (p.pty, rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tests_support::{fake_pane, ws_with};
 
     /// T1:光标位置查询的应答必须回写到**产生它的那个 pane 自己的** channel。
     /// 串到别的 pane 上去,发起查询的 TUI 就永远等不到应答 → 全屏 TUI 冻死。

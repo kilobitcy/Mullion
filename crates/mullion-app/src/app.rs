@@ -7261,19 +7261,7 @@ fn rehost_pane(
     let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
     let d = theme::term_default_colors(&MULLION_DARK);
     emulator.set_default_colors(d.fg, d.bg);
-    p.host_ix = host_ix;
     p.emulator = emulator;
-    // 旧的 `pty`/`rx` 在这两句赋值里被 Drop —— Drop 即关掉上一台机器的
-    // channel,不留孤儿。
-    p.pty = pty;
-    p.rx = rx;
-    p.pacer = SyncFramePacer::new();
-    p.status = crate::shell::workspace::PaneStatus::Live;
-    // 自动化的「就绪」判据要重新攒(新机器还一个字节都没说话);`last_grid`
-    // 给不可能的初值,逼下一帧 apply_geometry 发一次 window_change(T4)——
-    // 新开的 channel 是 80x24,不发的话远端按 80x24 排版。
-    p.saw_first_byte = false;
-    p.last_grid = (0, 0);
     // ⑥:`cwd`/`tmux` 同 `emulator` 一个道理——旧值是上一台机器嗅出来的
     // (OSC 7 目录 / 窗口标题里的 tmux 会话名),留着会在标题条右区挂一条
     // 「看起来对、其实属于上一台机器」的过期标注,而且 `cwd` 是"只增不清"
@@ -7281,6 +7269,61 @@ fn rehost_pane(
     // 主动清空。
     p.cwd = None;
     p.tmux = None;
+    swap_pane_channel(p, host_ix, pty, rx);
+    true
+}
+
+/// 换 channel 时两条路径(换机器 / 重连)**共同**要做的事。
+///
+/// 抽出来是因为漏掉其中任何一条都会产生难查的 bug:`last_grid` 漏了是 T4
+/// (远端按 80 列排版),`saw_first_byte` 漏了是自动化在一条还没说话的 channel
+/// 上开跑,`pacer` 漏了是上一条 channel 没收口的同步块把新内容一直攒着(T2)。
+fn swap_pane_channel(
+    p: &mut crate::shell::workspace::PaneState,
+    host_ix: usize,
+    pty: Box<dyn crate::shell::workspace::PtyWriter>,
+    rx: Receiver<Vec<u8>>,
+) {
+    p.host_ix = host_ix;
+    // 旧的 `pty`/`rx` 在这两句赋值里被 Drop —— Drop 即关掉上一条 channel,
+    // 不留孤儿。
+    p.pty = pty;
+    p.rx = rx;
+    p.pacer = SyncFramePacer::new();
+    p.status = crate::shell::workspace::PaneStatus::Live;
+    // 自动化的「就绪」判据要重新攒(新 channel 还一个字节都没说话);`last_grid`
+    // 给不可能的初值,逼下一帧 apply_geometry 发一次 window_change(T4)——
+    // 新开的 channel 是 80x24,不发的话远端按 80x24 排版。
+    p.saw_first_byte = false;
+    p.last_grid = (0, 0);
+}
+
+/// F128:断线重连之后把 pane 挂到**新开的 channel** 上。
+///
+/// 与 `rehost_pane` 的唯一差别:**保留 `emulator`**(以及它嗅出来的 `cwd`/`tmux`)。
+/// 还是同一台机器、同一个用户,断线前那一屏内容是用户想看的东西
+/// (往往正是导致断线的那条报错),重建等于当场抹掉。`host_ix` 仍要传:
+/// 重连会往 `ws.hosts` 里 push 一条新的 `HostConn`(旧的那条连接已经死了)。
+///
+/// F128 拆成 5 个任务:这是第 3 个,只落这个函数本身;重连调度(何时调它)
+/// 是 Task 14(退避算法)/ Task 15(接线)的事,故暂时只有测试在调 ——
+/// `allow(dead_code)` 到 Task 15 接线后应该能摘掉。
+#[allow(dead_code)]
+fn reattach_pane(
+    ws: &mut Workspace,
+    id: PaneId,
+    generation: u64,
+    host_ix: usize,
+    pty: Box<dyn crate::shell::workspace::PtyWriter>,
+    rx: Receiver<Vec<u8>>,
+) -> bool {
+    if !pane_still_wanted(ws, id, generation) {
+        return false;
+    }
+    let Some(p) = ws.pane_mut(id) else {
+        return false;
+    };
+    swap_pane_channel(p, host_ix, pty, rx);
     true
 }
 
@@ -8184,9 +8227,9 @@ mod tests {
         autoscroll_for_pane, blink_on_at, blink_wake_at, credential_delete_error, download_job,
         effective_focus_of, expand_tilde, files_owner_generation_of, files_start_dir,
         finish_password_change, font_px_for, has_real_action, ime_cursor_area,
-        next_panel_selection_index, pane_still_wanted, rehost_pane, snapshot_tabs_of,
-        sync_target_of, sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal, RestoredTab,
-        Tab, TabContent, TerminalTab,
+        next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
+        snapshot_tabs_of, sync_target_of, sync_timeout_wake_at, tab_title, upload_job, wind_down,
+        Modal, RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -9485,6 +9528,76 @@ mod tests {
             ws.pane(PaneId(1)).map(|p| p.host_ix),
             Some(0),
             "被拒绝时不该动 pane 的任何字段"
+        );
+    }
+
+    /// F128:重连换的是 channel,**不是机器** —— 屏上内容必须原样留着
+    /// (用户拍板:保留旧屏内容)。重建 emulator 的话,断线前那一屏
+    /// (往往正是他想看的报错)当场消失。
+    ///
+    /// 自证会变红:把 `reattach_pane` 改成调 `rehost_pane`。
+    #[test]
+    fn reattach_keeps_the_screen_but_rehost_wipes_it() {
+        use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
+        let (mut ws, _p) = ws_with(1);
+        let gen = ws.generation();
+        ws.pane_mut(PaneId(1))
+            .unwrap()
+            .emulator
+            .feed(b"before-the-drop");
+        let (pty, rx) = fresh_pipe();
+        assert!(reattach_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
+        let text: String = ws
+            .pane(PaneId(1))
+            .unwrap()
+            .emulator
+            .snapshot()
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(
+            text.contains("before-the-drop"),
+            "重连不该抹掉断线前的内容,实际:{text:?}"
+        );
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().status,
+            crate::shell::workspace::PaneStatus::Live
+        );
+
+        // 对照组:换机器那条路必须**抹掉**内容(否则上一台机器的输出会
+        // 挂在新机器的屏上,用户完全分不清哪些字是谁说的)。
+        let (pty, rx) = fresh_pipe();
+        assert!(rehost_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
+        let text: String = ws
+            .pane(PaneId(1))
+            .unwrap()
+            .emulator
+            .snapshot()
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(!text.contains("before-the-drop"), "换机器该重建 emulator");
+    }
+
+    /// F128:换了 channel 之后必须逼出一次 `window_change`(T4)。
+    /// 新 channel 是 80x24,不重发的话远端 tmux 里的 TUI 按 80 列排版,
+    /// 全屏 TUI 直接错行 —— 这是 T4 的原样复发。
+    ///
+    /// 自证会变红:把 `reattach_pane` 里的 `p.last_grid = (0, 0);` 删掉。
+    #[test]
+    fn reattach_forces_a_window_change() {
+        use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
+        let (mut ws, _p) = ws_with(1);
+        let gen = ws.generation();
+        ws.pane_mut(PaneId(1)).unwrap().last_grid = (120, 40);
+        let (pty, rx) = fresh_pipe();
+        reattach_pane(&mut ws, PaneId(1), gen, 0, pty, rx);
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().last_grid,
+            (0, 0),
+            "不复位的话下一帧 apply_geometry 认为尺寸没变,不发 window_change(T4)"
         );
     }
 
