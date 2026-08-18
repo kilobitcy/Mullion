@@ -84,34 +84,34 @@ pub fn translate_text(logical: &WKey, mods: ModifiersState) -> Option<String> {
 /// 终端** —— 与 T8 同一类"输入永久失灵"的故障。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImeState {
-    preediting: bool,
-    /// F126:组字中的拼音串,要画在光标处。三条结束边都必须清空它。
+    /// F126:组字中的拼音串,要画在光标处。**这是唯一真值源** —— 「在不在组字」
+    /// 就是「这串空不空」,不另留一个 bool:两份状态迟早会在某条结束边上失步,
+    /// 而失步的那一半正好是「永久吞键」这种最难查的故障。
     text: String,
 }
 
 impl ImeState {
     /// 收到 `Ime::Preedit`。空串 = 候选被取消,组字结束。
     pub fn on_preedit(&mut self, text: &str) {
-        self.preediting = !text.is_empty();
+        // 复用已分配的堆缓冲:组字期间每敲一个字母就来一次,`= text.to_owned()`
+        // 会一路分配再释放。
         self.text.clear();
         self.text.push_str(text);
     }
 
     /// 收到 `Ime::Commit`,组字结束。
     pub fn on_commit(&mut self) {
-        self.preediting = false;
         self.text.clear();
     }
 
     /// 收到 `Ime::Disabled`(切走输入法 / 失焦),组字结束。
     pub fn on_disabled(&mut self) {
-        self.preediting = false;
         self.text.clear();
     }
 
     /// 这一刻的按键该不该被吞掉(组字中 = 该吞)。
     pub fn swallows_key(&self) -> bool {
-        self.preediting
+        !self.text.is_empty()
     }
 
     /// F126:组字中的拼音串,空串 = 没在组字。
@@ -402,7 +402,8 @@ mod tests {
     /// 永不消失的幽灵拼音,而且它会一直盖着底下的真实内容。
     ///
     /// 自证会变红:把 `on_commit` / `on_disabled` 里的 `self.text.clear()` 删掉
-    /// 任意一句。
+    /// 任意一句。第三条边(空 `Preedit`)最不直观 —— 它靠的是 `on_preedit` 自己
+    /// 那句 `clear()`,删掉它这条测试同样变红。
     #[test]
     fn every_end_of_composition_clears_the_text() {
         for end in ["commit", "empty-preedit", "disabled"] {
