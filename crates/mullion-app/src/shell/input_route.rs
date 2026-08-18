@@ -9,6 +9,38 @@ pub enum InputKind {
     Pointer,
 }
 
+use crate::shell::workspace::PaneStatus;
+
+/// F129:`Ctrl+D` 这一下该干什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtrlD {
+    /// 照常送 `0x04`(EOF)。
+    SendEof,
+    /// 关掉这块分屏。
+    ClosePane,
+    /// 关掉整个标签(这块是最后一块分屏)。
+    CloseTab,
+}
+
+/// F129:判据只有两条 —— 这块 pane 还活着吗、它是不是最后一块。
+///
+/// **活着就一定是 EOF**:Ctrl+D 是 shell 里退出登录、给 `cat` 收尾的标准键,
+/// 改掉的话用户在正常会话里会莫名其妙丢一块分屏。断了之后 EOF 反正也送不出去,
+/// 这个键在那儿本来就是废的,拿来关分屏不抢任何东西。
+pub fn ctrl_d_action(status: PaneStatus, is_last_pane: bool) -> CtrlD {
+    match status {
+        PaneStatus::Live => CtrlD::SendEof,
+        // 重连中的也算:用户按这个键的意思就是「别等了,收掉」。
+        PaneStatus::Reconnecting | PaneStatus::Disconnected => {
+            if is_last_pane {
+                CtrlD::CloseTab
+            } else {
+                CtrlD::ClosePane
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Route {
     /// 交给 egui(菜单/状态栏/模态弹窗/表单)。
@@ -237,5 +269,48 @@ mod tests {
     fn f6_toggles_focus_between_terminal_and_panel() {
         assert_eq!(Focus::Terminal.toggled(), Focus::FilesPanel);
         assert_eq!(Focus::FilesPanel.toggled(), Focus::Terminal);
+    }
+
+    /// F129:**活着的 pane 上 Ctrl+D 永远是 EOF**。这个语义不能动 ——
+    /// 它是 shell 退出登录、给 `cat`/`ssh` 收尾的标准键,改掉的话用户
+    /// 在正常会话里按 Ctrl+D 会莫名其妙丢一块分屏。
+    ///
+    /// 自证会变红:把 `ctrl_d_action` 里 `PaneStatus::Live` 那一支删掉。
+    #[test]
+    fn ctrl_d_on_a_live_pane_is_always_eof() {
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Live, true),
+            CtrlD::SendEof,
+            "最后一块活 pane 上也是 EOF"
+        );
+        assert_eq!(ctrl_d_action(PaneStatus::Live, false), CtrlD::SendEof);
+    }
+
+    /// F129:断开的 pane 上 Ctrl+D 关掉这块分屏 —— 断了之后 EOF 送不出去,
+    /// 这个键在那儿本来就是废的。重连中的也算「断开」:用户按这个键的意思
+    /// 就是「别等了,收掉」。
+    #[test]
+    fn ctrl_d_on_a_dead_pane_closes_it() {
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Disconnected, false),
+            CtrlD::ClosePane
+        );
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Reconnecting, false),
+            CtrlD::ClosePane
+        );
+    }
+
+    /// F129:断开的 pane 是标签里最后一块时,关掉整个标签。
+    /// `Workspace::close_pane` 本来就拒绝关最后一块(F31),不特判的话
+    /// 用户按下去**什么都不会发生**,只能去菜单里找「断开」。
+    ///
+    /// 自证会变红:把 `is_last` 那个参数在函数体里忽略掉。
+    #[test]
+    fn ctrl_d_on_the_last_dead_pane_closes_the_whole_tab() {
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Disconnected, true),
+            CtrlD::CloseTab
+        );
     }
 }

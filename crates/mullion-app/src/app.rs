@@ -6256,6 +6256,45 @@ impl ApplicationHandler<UserEvent> for App {
                             self.request_ui_redraw();
                             return;
                         }
+                        // F129:断开的 pane 上 Ctrl+D 改成「关掉这块分屏」。
+                        // 必须在 `encode_key` 之前 —— 它会把 Ctrl+D 编成 0x04,
+                        // 漏下去就是往一条死 channel 上写字节(静默失败)。
+                        if mods.ctrl
+                            && !mods.shift
+                            && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(&'d'))
+                        {
+                            let st = self
+                                .active_ws()
+                                .and_then(Workspace::focused)
+                                .map(|p| p.status);
+                            let is_last = self
+                                .active_ws()
+                                .map(|ws| ws.pane_count() <= 1)
+                                .unwrap_or(true);
+                            if let Some(st) = st {
+                                match crate::shell::input_route::ctrl_d_action(st, is_last) {
+                                    crate::shell::input_route::CtrlD::SendEof => {}
+                                    crate::shell::input_route::CtrlD::ClosePane => {
+                                        let id = self.active_ws().map(Workspace::focus);
+                                        if let (Some(id), Some(ws)) = (id, self.active_ws_mut()) {
+                                            ws.close_pane(id);
+                                        }
+                                        self.ui_dirty = true;
+                                        self.request_ui_redraw();
+                                        return;
+                                    }
+                                    crate::shell::input_route::CtrlD::CloseTab => {
+                                        // 复用既有的关标签路径(Ctrl+W / 菜单「断开」
+                                        // 走的同一条):它负责 abort 自动化、
+                                        // 收 sftp task、按顺序 drop workspace。
+                                        self.close_active_tab();
+                                        self.ui_dirty = true;
+                                        self.request_ui_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                         let bytes = mullion_term::keymap::encode_key(key, mods, self.kitty);
                         // `let _` 全文件都这样:写/resize 失败(断线等)没有用户提示、
                         // 无重连。断线感知与重连是 S3,后续 spec,这里不做。
