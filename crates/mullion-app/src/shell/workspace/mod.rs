@@ -558,15 +558,25 @@ pub mod tests_support {
     }
 
     /// 一条崭新的、没接任何东西的 PTY 管道 —— 换 channel 那两条路径要拿它当
-    /// 「新开好的 channel」。
+    /// 「新开好的 channel」。**连观测端一起给**:要验证「pty/rx 真的换过去了」,
+    /// 就得能分辨字节到底进了哪一条管子。
+    pub fn fresh_pipe_probed() -> (
+        Box<dyn super::PtyWriter>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        Probe,
+    ) {
+        let (p, probe) = fake_pane(999);
+        (p.pty, p.rx, probe)
+    }
+
+    /// 不关心观测端时的简写。
     pub fn fresh_pipe() -> (
         Box<dyn super::PtyWriter>,
         tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
-        let (p, probe) = fake_pane(999);
-        let rx = p.rx;
+        let (pty, rx, probe) = fresh_pipe_probed();
         std::mem::forget(probe); // 发送端留着,免得 rx 立刻变成 Disconnected
-        (p.pty, rx)
+        (pty, rx)
     }
 }
 

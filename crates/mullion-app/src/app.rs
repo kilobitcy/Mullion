@@ -9585,6 +9585,55 @@ mod tests {
         assert!(!text.contains("before-the-drop"), "换机器该重建 emulator");
     }
 
+    /// F128:`swap_pane_channel` 存在的**唯一理由**就是把 pane 挪到新 channel 上,
+    /// 而「pty 换没换」「rx 换没换」原先一条断言都没有 —— 两处赋值随便删一个,
+    /// 全仓 1207 个测试照样全绿。这两条恰恰是最要命的:
+    /// - `pty` 没换:新开的 channel 当场被 Drop,用户敲的键写进已死的旧 channel,
+    ///   屏上却显示「已连上」,输入静默全丢、没有任何报错。
+    /// - `rx` 没换:下一帧 `pump` 立刻在旧 rx 上读到 `Disconnected`,而这时新连接
+    ///   是活的,`rx_closed_action` 判成「远端自己退了」→ pane 被永久错标成
+    ///   `Disconnected`,**再也不会自动重试**。
+    ///
+    /// 自证会变红:删掉 `swap_pane_channel` 里的 `p.pty = pty;`(前半段红)
+    /// 或 `p.rx = rx;`(后半段红)。
+    #[tokio::test]
+    async fn reattach_actually_swaps_both_the_pty_and_the_rx() {
+        use crate::shell::workspace::tests_support::{fresh_pipe_probed, ws_with};
+        let (mut ws, old) = ws_with(1);
+        let gen = ws.generation();
+        let (pty, rx, fresh) = fresh_pipe_probed();
+        assert!(reattach_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
+
+        // pty:写出去的字节只能落在新管子上。
+        let _ = ws.pane(PaneId(1)).unwrap().pty.write(b"ping".to_vec());
+        assert_eq!(
+            fresh.writes.lock().unwrap().as_slice(),
+            [b"ping".to_vec()],
+            "写没落到新 channel 上 = pty 没换"
+        );
+        assert!(
+            old[0].writes.lock().unwrap().is_empty(),
+            "还在往断掉的旧 channel 里写"
+        );
+
+        // rx:只有从新管子灌进来的字节才收得到。
+        fresh.tx.try_send(b"pong".to_vec()).unwrap();
+        ws.pump(0);
+        let text: String = ws
+            .pane(PaneId(1))
+            .unwrap()
+            .emulator
+            .snapshot()
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(
+            text.contains("pong"),
+            "新 channel 的输出没收到 = rx 没换,实际:{text:?}"
+        );
+    }
+
     /// F128:换了 channel 之后必须逼出一次 `window_change`(T4)。
     /// 新 channel 是 80x24,不重发的话远端 tmux 里的 TUI 按 80 列排版,
     /// 全屏 TUI 直接错行 —— 这是 T4 的原样复发。
