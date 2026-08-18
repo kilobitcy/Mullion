@@ -296,11 +296,14 @@ mod tests {
         }
     }
 
-    /// 四种类型必须两两长得不一样 —— 否则「这是目录还是文件还是别的什么」
+    /// 八种类型必须两两长得不一样 —— 否则「这是目录还是压缩包还是别的什么」
     /// 这个图标本来要回答的问题它没有回答。
     ///
-    /// 自证会变红:把 `Symlink` 那一支改成直接 `outline(rect, File)`,或把
-    /// `Other` 改成直接 `outline(rect, File)`。
+    /// 判据是顶点序列的 `{:?}` 全等,**只是弱守护**:它挡得住「复制粘贴成
+    /// 同一支形状」这类回归,挡不住「新形状和老形状长得太像」——后者只有
+    /// 人眼能判,归人工验收。
+    ///
+    /// 自证会变红:把 `Link` 那一支改成直接 `outline(rect, IconKind::Other)`。
     #[test]
     fn every_kind_looks_different_from_every_other_kind() {
         let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0));
