@@ -40,6 +40,9 @@ pub const BAR_PX: f32 = 2.0;
 ///
 /// - 非焦点 pane:恒 `Hollow`,不看远端形状、不看闪烁相位。
 /// - 焦点 pane:远端要什么形状给什么;闪到「灭」的半周期就不画。
+///
+/// 两个裸 `bool` 相邻,**顺序是 `focused` 在前、`blink_on` 在后**,传反不会
+/// 编译报错、只会静默画错(非焦点跟着闪、焦点恒空心)。加调用点时照抄这一行。
 pub fn style_for(
     shape: mullion_term::snapshot::CursorShape,
     focused: bool,
@@ -964,6 +967,7 @@ mod tests {
             CursorShape::Beam,
             CursorShape::Block,
             CursorShape::Underline,
+            CursorShape::HollowBlock,
             CursorShape::Hidden,
         ] {
             assert_eq!(
