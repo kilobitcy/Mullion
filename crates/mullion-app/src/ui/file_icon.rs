@@ -279,7 +279,11 @@ mod tests {
     /// F127:点开头的隐藏文件不能把整个名字当扩展名 —— `.bashrc` 的
     /// 「扩展名」是空的,该落到 `Other`,而不是去查一个叫 `bashrc` 的扩展名。
     ///
-    /// 自证会变红:把 `ext_of` 里那句 `if stem.is_empty() { return "" }` 删掉。
+    /// 自证会变红:把 `ext_of` 里那句 `if name[..ix].is_empty() { return
+    /// String::new() }` 删掉 —— 但只用 `.bashrc` 测不出来(`bashrc` 本来就不在
+    /// `EXT_TABLE` 里,删不删这条分支结果都是 `Other`)。真正压到这条分支的是
+    /// `.gz` 这种「裸后缀」文件名:删掉该分支后,`ext_of` 会把 `.gz` 的
+    /// 「扩展名」算成 `gz`,而 `gz` **确实在表里**,于是误判成 `Archive`。
     #[test]
     fn dotfiles_have_no_extension() {
         assert_eq!(classify(EntryKind::File, ".bashrc", 0o644), IconKind::Other);
@@ -287,6 +291,11 @@ mod tests {
             classify(EntryKind::File, ".config.json", 0o644),
             IconKind::Doc,
             "点开头但确实有扩展名的照常判"
+        );
+        assert_eq!(
+            classify(EntryKind::File, ".gz", 0o644),
+            IconKind::Other,
+            "点号在开头时,哪怕「扩展名」凑巧撞上表项也不能当真"
         );
     }
 }
