@@ -2226,27 +2226,29 @@ impl App {
     }
 
     /// F125:这一帧光标该不该画出来。失焦时恒 `true`(不闪,常显)——
-    /// 焦点 pane 在失焦状态下由 `style_for` 收到 `focused=false`,画成空心框。
+    /// **不是**画成空心框:`style_for` 的 `focused` 参数来自
+    /// `PaneRender.focused = Some(g.id) == focus`(分屏内哪个 pane 有焦点),
+    /// 跟窗口有没有拿到 OS 焦点(这里的 `self.window_focused`)是两个不相干
+    /// 的量,这次改动没有把二者接起来。实际效果是:窗口失焦时,焦点 pane
+    /// 仍按远端 DECSCUSR 给的形状画(Block/Bar/Underline),只是不再闪烁。
+    ///
+    /// 薄壳:决策全在 `blink_on_at`(可脱离 `App` 单测),同 `sync_timeout_wake`
+    /// 委托给 `sync_timeout_wake_at` 的理由——`App` 在无 GPU/窗口的环境下构造
+    /// 不出来,分支逻辑只能靠这条路径测得着。
     fn blink_on(&self, now: Instant) -> bool {
-        if !self.window_focused {
-            return true;
-        }
         let elapsed = now
             .saturating_duration_since(self.last_input_at)
             .as_millis() as u64;
-        crate::frame::blink_visible(elapsed, 0)
+        blink_on_at(self.window_focused, elapsed)
     }
 
     /// F125:下一次光标相位翻转的时刻。`None` = 这一刻不需要为闪烁排唤醒
-    /// (窗口失焦 / 没有终端在前台)。
+    /// (窗口失焦 / 没有终端在前台)。薄壳,理由同 `blink_on`。
     fn blink_wake(&self, now: Instant) -> Option<Instant> {
-        if !self.window_focused || self.active_ws().is_none() {
-            return None;
-        }
         let elapsed = now
             .saturating_duration_since(self.last_input_at)
             .as_millis() as u64;
-        let ms = crate::frame::blink_next_flip_ms(elapsed, 0);
+        let ms = blink_wake_at(self.window_focused, self.active_ws().is_some(), elapsed)?;
         Some(now + std::time::Duration::from_millis(ms))
     }
 
@@ -4079,6 +4081,11 @@ impl App {
     /// 真正发送。到这里要么不需要确认,要么用户已经点了「粘贴」。粘贴目标
     /// 是**焦点 pane**——分屏后粘贴永远只进当前正在操作的那一块。
     fn send_paste(&mut self, text: &str) {
+        // F125:粘贴也是输入,重置闪烁相位——否则在暗周期粘贴,光标最长要等
+        // 530ms 才转亮,与「刚有动作光标一定亮」的意图相悖。必须在借出
+        // `self.active_ws_mut()` 之前做,否则跟下面 `pane` 的可变借用冲突
+        // (同 `self.user_took_over()` 挪到 `pane` 借用结束之后的理由一样)。
+        self.last_input_at = Instant::now();
         let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) else {
             return;
         };
@@ -7607,6 +7614,37 @@ fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> 
     }
 }
 
+/// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
+/// 「距上次输入多少毫秒」,不碰 `&App`,理由同 `sync_timeout_wake_at`(`App`
+/// 在无 GPU/窗口的环境下构造不出来,这几条分支只能靠这条路径单测)。
+///
+/// 隐式耦合:`window_focused == true` 但没有活跃终端(launcher 态,没有 pane
+/// 要画)时,这个函数仍按相位交替返回 —— 调用方(`quads_for_panes`)那时压根
+/// 没有光标要画,返回值不会被用到。复核已确认这不是 bug:「有没有活跃终端」
+/// 故意不是这个函数的判据,那是 `blink_wake_at`(要不要为它排周期唤醒)的事,
+/// 这里只管「这一刻该不该画」。
+fn blink_on_at(window_focused: bool, elapsed_since_input_ms: u64) -> bool {
+    if !window_focused {
+        return true;
+    }
+    crate::frame::blink_visible(elapsed_since_input_ms, 0)
+}
+
+/// F125:`App::blink_wake` 的核心判据抽成自由函数,理由同 `blink_on_at`。
+/// `has_active_terminal` 对应 `App::active_ws().is_some()`:没有活跃终端就没有
+/// 光标要画,不必为闪烁排周期唤醒。返回值是「还要多少毫秒后翻转相位」,
+/// `None` = 这一刻不需要排(窗口失焦 / 没有活跃终端)。
+fn blink_wake_at(
+    window_focused: bool,
+    has_active_terminal: bool,
+    elapsed_since_input_ms: u64,
+) -> Option<u64> {
+    if !window_focused || !has_active_terminal {
+        return None;
+    }
+    Some(crate::frame::blink_next_flip_ms(elapsed_since_input_ms, 0))
+}
+
 /// 施加一次保存意图。抽成纯函数是为了能在没有窗口的情况下测「编辑已有会话
 /// 不会把凭据清掉」(F73)——这条路径以前埋在事件循环里,只能靠上机手点。
 ///
@@ -8117,11 +8155,12 @@ fn render_frame(
 mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
-        autoscroll_for_pane, credential_delete_error, download_job, effective_focus_of,
-        expand_tilde, files_owner_generation_of, files_start_dir, finish_password_change,
-        font_px_for, has_real_action, ime_cursor_area, next_panel_selection_index,
-        pane_still_wanted, rehost_pane, snapshot_tabs_of, sync_target_of, sync_timeout_wake_at,
-        tab_title, upload_job, wind_down, Modal, RestoredTab, Tab, TabContent, TerminalTab,
+        autoscroll_for_pane, blink_on_at, blink_wake_at, credential_delete_error, download_job,
+        effective_focus_of, expand_tilde, files_owner_generation_of, files_start_dir,
+        finish_password_change, font_px_for, has_real_action, ime_cursor_area,
+        next_panel_selection_index, pane_still_wanted, rehost_pane, snapshot_tabs_of,
+        sync_target_of, sync_timeout_wake_at, tab_title, upload_job, wind_down, Modal, RestoredTab,
+        Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -9178,6 +9217,71 @@ mod tests {
             sync_timeout_wake_at(start, Some(&ws), 0),
             None,
             "收口后还在排唤醒 = 忙转"
+        );
+    }
+
+    /// F125:窗口失焦时,光标判据必须两件事一起做到——恒画(不因暗周期消失)
+    /// 且不再为闪烁排周期唤醒(不需要,反正恒画;排了也只是空转)。
+    ///
+    /// 自证会变红:把 `blink_on_at` 里 `if !window_focused { return true; }`
+    /// 这条短路删掉(改回直接按相位算),或者把 `blink_wake_at` 里
+    /// `!window_focused` 那半个条件删掉。
+    #[test]
+    fn unfocused_window_shows_a_steady_cursor_and_never_wakes_for_it() {
+        // elapsed 故意落在暗半周期(530..1060ms 那一段)——聚焦状态下这一刻
+        // `blink_on_at` 该是 false,拿它来反证「失焦短路」确实生效,而不是
+        // 巧合落在了亮半周期。
+        let dark_elapsed = 700;
+        assert!(
+            !crate::frame::blink_visible(dark_elapsed, 0),
+            "测试前提:这个 elapsed 在聚焦状态下必须是暗半周期,否则下面的断言测不出短路"
+        );
+        assert!(
+            blink_on_at(false, dark_elapsed),
+            "失焦时光标必须恒亮,不能被相位算成暗"
+        );
+        assert_eq!(
+            blink_wake_at(false, true, dark_elapsed),
+            None,
+            "失焦时不该为闪烁排唤醒——反正恒亮,排了也是空转"
+        );
+    }
+
+    /// F125:有焦点但没有活跃终端(launcher 态,没有 pane 可画光标)时,不该为
+    /// 闪烁排周期唤醒——排了是纯粹的空转,没有任何东西会因为它而改变。
+    ///
+    /// 自证会变红:把 `blink_wake_at` 里 `|| !has_active_terminal` 那半个条件
+    /// 删掉。
+    #[test]
+    fn focused_without_a_terminal_never_wakes_for_blink() {
+        assert_eq!(
+            blink_wake_at(true, false, 0),
+            None,
+            "没有活跃终端就没有光标要画,不该排唤醒"
+        );
+    }
+
+    /// F125:有焦点且有活跃终端时,`blink_on_at`/`blink_wake_at` 必须原样转发
+    /// `crate::frame` 那两个纯函数的判据——相位算法本身在 `frame::tests` 里已经
+    /// 单测过,这里只验证「转发没转错参数」。
+    ///
+    /// 自证会变红:把 `blink_on_at`/`blink_wake_at` 里传给
+    /// `crate::frame::blink_visible`/`blink_next_flip_ms` 的参数改错(比如都
+    /// 换成常量 `0`)。
+    #[test]
+    fn focused_with_a_terminal_follows_the_blink_phase() {
+        for elapsed in [0, 100, 529, 530, 800, 1059, 1060] {
+            assert_eq!(
+                blink_on_at(true, elapsed),
+                crate::frame::blink_visible(elapsed, 0),
+                "elapsed={elapsed}:画不画必须原样转发相位算法"
+            );
+        }
+        let ms = blink_wake_at(true, true, 300).expect("有焦点有终端必须排唤醒");
+        assert_eq!(
+            ms,
+            crate::frame::blink_next_flip_ms(300, 0),
+            "唤醒时刻必须原样转发相位算法"
         );
     }
 
