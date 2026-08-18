@@ -108,6 +108,28 @@ pub enum UserEvent {
         pane: PaneId,
         msg: String,
     },
+    /// F128:一次断线重连拨通了。**跟 `PaneRehosted` 分开**:那条的语义是
+    /// 「把 pane 改挂到另一台机器」(要重建 emulator),这条是「同一台机器
+    /// 换一条 channel」(必须保留 emulator)。挤在一起只能靠运行时标志判别,
+    /// 而走错的后果是把用户断线前那一屏抹掉。
+    PaneReconnected {
+        generation: u64,
+        /// 这条连接原来的 `host_ix`——重连成功后 `ws.hosts` 会 push 一条新的,
+        /// 挂在旧 ix 上的**每一块** pane 都要跟着换过去(adr-009:一条连接
+        /// 多块 pane)。
+        host_ix: usize,
+        handle: Arc<SshConnection>,
+        /// 每块 pane 一条新 channel,顺序与 `panes` 对齐。
+        channels: Vec<(PaneId, SshSession, Receiver<Vec<u8>>)>,
+    },
+    /// F128:一次重连没拨通。`attempt` 是刚失败的这次的序号,决定下次等多久
+    /// (以及要不要放弃),判据在 `crate::reconnect`。
+    PaneReconnectErr {
+        generation: u64,
+        host_ix: usize,
+        attempt: u32,
+        msg: String,
+    },
     /// F92:一次拨测成功。`u64` 是发起时的世代号,过期的直接丢。
     ProbeOk(u64),
     /// F92:一次拨测失败(含超时)。
@@ -1408,6 +1430,10 @@ pub struct App {
     /// 用 `Option` 的话后发的会把先发的元信息顶掉 —— 现象是换好之后标题条
     /// 上写着另一台机器的名字。按 `(generation, pane)` 取走。
     pending_rehost: Vec<PendingRehost>,
+    /// F128:正在重拨的连接 `(generation, host_ix, 已失败次数)`。
+    /// 存在这张表里的 host 这一帧不再发起 —— 帧循环 60fps,不去重就是
+    /// 一秒六十条连接(判据在 `reconnect::hosts_to_redial`)。
+    reconnecting: Vec<(u64, usize, u32)>,
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
     /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
     tunnels: crate::tunnels::TunnelRuntime,
@@ -1578,6 +1604,7 @@ impl App {
             pending_automation: None,
             pending_automation_template: None,
             pending_rehost: Vec::new(),
+            reconnecting: Vec::new(),
             pending_skip_automation: false,
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
@@ -4531,6 +4558,130 @@ impl App {
         });
     }
 
+    /// F128:这一帧该发起哪些重拨。挂在帧循环上而不是在 `pump` 里直接拨:
+    /// `Workspace` 不认识 tokio、也不认识 store(架构不变量),拨号是 app 的事。
+    fn drive_reconnects(&mut self) {
+        let Some(generation) = self.active_term().map(|t| t.ws.generation()) else {
+            return;
+        };
+        let in_flight: Vec<usize> = self
+            .reconnecting
+            .iter()
+            .filter(|(g, _, _)| *g == generation)
+            .map(|(_, h, _)| *h)
+            .collect();
+        let Some(t) = self.active_term() else { return };
+        // `Workspace::panes()` 返回 `&[PaneState]`(既有签名),所以走 `.iter()`。
+        let panes: Vec<(PaneId, usize, crate::shell::workspace::PaneStatus)> =
+            t.ws.panes()
+                .iter()
+                .map(|p| (p.id, p.host_ix, p.status))
+                .collect();
+        for host_ix in crate::reconnect::hosts_to_redial(&panes, &in_flight) {
+            // `attempt = 0` 是「首次重拨」:`delay_for(0)` 是 `None`(退避表
+            // 1-indexed,`backoff_delay(0)` 视 0 为非法输入),`unwrap_or_default()`
+            // 把它变成零延迟——首次立刻拨,失败后才进 1s/2s/4s… 的退避。
+            // **别把 0 改成 1**,那会让首次重拨白等 1 秒。
+            self.spawn_reconnect(generation, host_ix, 0);
+        }
+    }
+
+    /// F128:为一条已经死掉的连接发起第 `attempt` 次重拨。
+    ///
+    /// 凭据取 `tab.last_cfg`(连接那一刻定死的),**绝不回头查库** ——
+    /// 用户在断线期间完全可能改了会话甚至删了它,那时候拨出去的目标就跟他
+    /// 当初点「连接」时看到的不是一回事(理由同 `PendingRehost`)。
+    fn spawn_reconnect(&mut self, generation: u64, host_ix: usize, attempt: u32) {
+        let Some(t) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.as_terminal())
+        else {
+            return;
+        };
+        let Some(cfg) = t.last_cfg.clone() else {
+            log::warn!(target: "mullion", "重连:标签没有 last_cfg,放弃");
+            return;
+        };
+        // 这条连接上挂着哪些 pane —— 每块都要一条新 channel(adr-009)。
+        let panes: Vec<PaneId> =
+            t.ws.panes()
+                .iter()
+                .filter(|p| {
+                    p.host_ix == host_ix
+                        && p.status == crate::shell::workspace::PaneStatus::Reconnecting
+                })
+                .map(|p| p.id)
+                .collect();
+        if panes.is_empty() {
+            return;
+        }
+        self.reconnecting.push((generation, host_ix, attempt));
+        let delay = crate::reconnect::delay_for(attempt).unwrap_or_default();
+        // 屏内提示(§7.3):喂进 emulator 当普通输出,不做倒计时。
+        let notice = crate::reconnect::notice_bytes(attempt + 1, delay);
+        if let Some(ws) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.as_terminal_mut())
+            .map(|t| &mut t.ws)
+        {
+            for id in &panes {
+                if let Some(p) = ws.pane_mut(*id) {
+                    p.emulator.feed(&notice);
+                }
+            }
+        }
+        let proxy = self.proxy.clone();
+        let wake_proxy = self.proxy.clone();
+        // 主机密钥照旧走后台策略:指纹变了就当场停(不是「重连时放松校验」——
+        // 断线正是中间人最好下手的时机)。
+        let policy: Arc<dyn HostKeyPolicy> = Arc::new(crate::host_key::PromptingPolicy::new(
+            self.known_hosts.clone(),
+            self.proxy.clone(),
+            true,
+        ));
+        self._runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = wake_proxy.send_event(UserEvent::Wake);
+            });
+            let handle = match mullion_ssh::session::establish(&cfg, policy).await {
+                Ok(h) => Arc::new(h),
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::PaneReconnectErr {
+                        generation,
+                        host_ix,
+                        attempt,
+                        msg: e.to_string(),
+                    });
+                    return;
+                }
+            };
+            let mut channels = Vec::new();
+            for id in panes {
+                match mullion_ssh::session::open_pty(handle.clone(), &cfg, wake.clone()).await {
+                    Ok((ssh, rx)) => channels.push((id, ssh, rx)),
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::PaneReconnectErr {
+                            generation,
+                            host_ix,
+                            attempt,
+                            msg: e.to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = proxy.send_event(UserEvent::PaneReconnected {
+                generation,
+                host_ix,
+                handle,
+                channels,
+            });
+        });
+    }
+
     /// F92:拨一次完整认证后立刻断开。**不开 channel、不起 pty** ——
     /// 拨测只回答「这条链路加上这份凭据能不能登上去」。
     fn spawn_probe(&mut self, cfg: SshConfig) {
@@ -5356,6 +5507,116 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_ui_redraw();
                 }
             }
+            UserEvent::PaneReconnected {
+                generation,
+                host_ix,
+                handle,
+                channels,
+            } => {
+                self.reconnecting
+                    .retain(|(g, h, _)| !(*g == generation && *h == host_ix));
+                let mut attached: Vec<(PaneId, Arc<mullion_ssh::session::SshSession>)> = Vec::new();
+                let mut template = None;
+                if let Some(t) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.as_terminal_mut())
+                {
+                    // 旧的 `HostConn` 已经死了,但不能原地替换掉:别的 pane
+                    // 可能还引用着它的 ix(比如同一台机器上有 pane 是用户
+                    // 敲了 `exit` 的 `Disconnected`,那块不该被拖着换)。
+                    // push 一条新的,只把这次重连的 pane 指过去。
+                    let old = &t.ws.hosts[host_ix];
+                    let (label, addr, session_id) =
+                        (old.label.clone(), old.addr.clone(), old.session_id);
+                    t.ws.hosts.push(crate::shell::workspace::HostConn {
+                        label,
+                        addr,
+                        session_id,
+                        handle,
+                        // F124:新连接 = 新的 tmux 服务器状态,自举重来一遍
+                        // (`tmux set -g` 幂等,重发无副作用)。
+                        tmux_bootstrap: Default::default(),
+                        tmux_last_try: None,
+                    });
+                    let new_ix = t.ws.hosts.len() - 1;
+                    for (id, ssh, rx) in channels {
+                        let ssh = Arc::new(ssh);
+                        if reattach_pane(
+                            &mut t.ws,
+                            id,
+                            generation,
+                            new_ix,
+                            Box::new(ssh.clone()),
+                            rx,
+                        ) {
+                            attached.push((id, ssh));
+                        }
+                    }
+                    // 死掉的那条连接上开的 SFTP channel 一起完蛋 —— 留着的话
+                    // 侧栏每次操作静默失败,用户看到的是「文件面板卡住了」。
+                    for task in t.sftp_tasks.drain(..) {
+                        task.abort();
+                    }
+                    t.sftp = None;
+                    t.sftp_home = None;
+                    template = t.automation_template.clone();
+                }
+                // 用户拍板:重连之后重跑登录后命令 —— 否则 tmux 不 attach,
+                // 断线前那个 Claude Code 会话回不来(这正是 F128 的初衷)。
+                // 跳过 tmux new-session 那类"开新会话"的步骤,规则同分屏新开的
+                // pane(`pending_for_extra_pane`)。
+                if let Some(tpl) = template {
+                    for (id, sink) in attached {
+                        if let Some(plan) = crate::automation::pending_for_extra_pane(&tpl) {
+                            self.start_automation(generation, id, plan, sink);
+                        }
+                    }
+                }
+                self.ui.set_toast("已重新连接");
+                self.ui_dirty = true;
+                self.request_ui_redraw();
+            }
+            UserEvent::PaneReconnectErr {
+                generation,
+                host_ix,
+                attempt,
+                msg,
+            } => {
+                self.reconnecting
+                    .retain(|(g, h, _)| !(*g == generation && *h == host_ix));
+                log::warn!(target: "mullion", "第 {attempt} 次重连失败: {msg}");
+                let next = attempt + 1;
+                if crate::reconnect::delay_for(next).is_some() {
+                    self.spawn_reconnect(generation, host_ix, next);
+                } else {
+                    // 退避到顶:落回 `Disconnected`,交给用户决定重连还是关掉。
+                    if let Some(ws) = self
+                        .tabs
+                        .by_generation_mut(generation)
+                        .and_then(|t| t.content.as_terminal_mut())
+                        .map(|t| &mut t.ws)
+                    {
+                        let ids: Vec<PaneId> = ws
+                            .panes()
+                            .iter()
+                            .filter(|p| p.host_ix == host_ix)
+                            .map(|p| p.id)
+                            .collect();
+                        for id in ids {
+                            if let Some(p) = ws.pane_mut(id) {
+                                p.status = crate::reconnect::status_after_failure(next);
+                                p.emulator
+                                    .feed(b"\r\n[Mullion] \xe9\x87\x8d\xe8\xbf\x9e\xe5\xa4\xb1\xe8\xb4\xa5\xe6\xac\xa1\xe6\x95\xb0\xe8\xbf\x87\xe5\xa4\x9a\xef\xbc\x8c\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2\xe9\x87\x8d\xe8\xaf\x95\xe3\x80\x82\r\n");
+                                // "重连失败次数过多,已停止重试。"
+                            }
+                        }
+                    }
+                    self.ui.set_error(format!("重连失败: {msg}"));
+                }
+                self.ui_dirty = true;
+                self.request_ui_redraw();
+            }
             UserEvent::KeyPathPicked(picked) => {
                 self.key_picker_busy = false;
                 if let Some(p) = picked {
@@ -5982,6 +6243,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // 仅终端态有字节可处理;launcher 态(ws=None)没有终端,跳过,但下面的帧率闸 + egui
                 // 渲染仍要跑(egui 在 launcher 也要画占位 UI)。
                 self.pump_io();
+                // F128:这一帧该重拨的连接。挂在 IO 泵之后——`pump_io` 里的
+                // `ws.pump` 才会把 rx 关闭翻译成 `PaneStatus::Reconnecting`,
+                // 顺序反了就晚一帧才发起重拨。
+                self.drive_reconnects();
                 // 1.5 F55/F59:传输队列每帧推进一次(放行 worker + 采样速率)。
                 // **放在帧里而不是事件里**是 T3:进度事件每秒几千条,靠它们
                 // 驱动重绘就是风扇起飞;这里只把「队列在跑」当成脏,重绘频率
@@ -7305,10 +7570,8 @@ fn swap_pane_channel(
 /// (往往正是导致断线的那条报错),重建等于当场抹掉。`host_ix` 仍要传:
 /// 重连会往 `ws.hosts` 里 push 一条新的 `HostConn`(旧的那条连接已经死了)。
 ///
-/// F128 拆成 5 个任务:这是第 3 个,只落这个函数本身;重连调度(何时调它)
-/// 是 Task 14(退避算法)/ Task 15(接线)的事,故暂时只有测试在调 ——
-/// `allow(dead_code)` 到 Task 15 接线后应该能摘掉。
-#[allow(dead_code)]
+/// F128 拆成 5 个任务:这是第 3 个,只落这个函数本身;调度(Task 14 的退避算法 /
+/// Task 15 的接线)接上之后,调用方是 `UserEvent::PaneReconnected` 分支。
 fn reattach_pane(
     ws: &mut Workspace,
     id: PaneId,
@@ -13067,5 +13330,139 @@ mod tests {
             "没有在帧尾记下这一帧的开合状态 —— 下一帧判不出跃迁,\
              而且热键那条路(在另一次事件回调里改标志)会永远同步不到"
         );
+    }
+
+    /// 取某个函数的函数体源码。**`marker` 必须带行首缩进**——不带的话
+    /// `include_str!` 出来的源码里会先匹配到测试自己写的那个字符串字面量,
+    /// 断言就变成了「测试自我匹配」,永远绿(本项目已实证的第五类恒绿模式)。
+    fn fn_body<'a>(src: &'a str, marker: &str) -> &'a str {
+        assert!(
+            marker.starts_with("    "),
+            "锚点必须带行首缩进,否则测试自我匹配恒绿"
+        );
+        let after = src
+            .split(marker)
+            .nth(1)
+            .unwrap_or_else(|| panic!("找不到 {marker}"));
+        &after[..after.find("\n    }\n").expect("找不到函数结尾")]
+    }
+
+    /// **接线守护 / F128**:重连的凭据必须来自 `tab.last_cfg`,**不许回头查库**。
+    /// 查库的话,用户在断线期间改了这条会话(换了端口/密钥),重连就会拨到
+    /// 一个他没同意过的地方去;会话被删掉时更是直接连不上。
+    /// 理由同 `PendingRehost` / `automation_template`。
+    ///
+    /// 自证会变红:把 `spawn_reconnect` 里的 `last_cfg` 换成 `store.dial_plan_for(..)`。
+    ///
+    /// 锚点拆开拼(`concat!`):写成完整字面量的话,`fn_body` 在 0 处真实定义时
+    /// 会退化成匹配测试自己这行代码,把自己的函数体(而非生产代码)当成
+    /// `body`——已实测踩中过一次(第五类恒绿模式的变体:锚点自我匹配)。
+    #[test]
+    fn reconnect_uses_the_cfg_frozen_at_connect_time() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "spawn_reconnect("));
+        assert!(
+            body.contains("last_cfg"),
+            "重连没用连接时定死的 cfg —— 断线期间改过会话就会拨到别处"
+        );
+        assert!(
+            !body.contains("dial_plan_for"),
+            "重连回头查库了 —— 见 PendingRehost 的文档"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功要走 `reattach_pane`(保留内容),
+    /// 不是 `rehost_pane`(重建 emulator)。走错的现象是「重连之后屏是空的」,
+    /// 而用户最想看的恰恰是断线前那一屏。
+    ///
+    /// 锚点拆开拼(`concat!`),理由同 `a_failed_rehost_takes_its_host_back_out_of_the_list`:
+    /// 写成完整字面量的话,这条测试自己的源码里也有一份,会被自己匹配到
+    /// (第四类恒绿模式:源码级测试自我匹配)。**这条文档注释本身也不能写出
+    /// 完整字面量**——第一版这里写了,反而成了全文件里最后一次出现,
+    /// `rsplit(..).next()` 就切到了这段注释而不是真正的 match 分支,已实证。
+    /// 用 `rsplit(..).next()` 取**最后一次**出现——`spawn_reconnect` 里发事件那次
+    /// 出现在前面,`user_event` 里的 match 分支出现在后面,取最后一次才是
+    /// 真正要测的分支。
+    ///
+    /// 自证会变红:把处理分支里的 `reattach_pane(` 改成 `rehost_pane(`。
+    #[test]
+    fn reconnect_reattaches_instead_of_rehosting() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        // 注释行剥掉:分支上方/内部的解释性注释可能提到同样的字样,不剥的话
+        // 删掉真正的调用测试也可能照绿。
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("reattach_pane("), "重连必须保留屏内容");
+        assert!(
+            !body.contains("rehost_pane("),
+            "走了换机器那条路,内容会被抹掉"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功后要重跑登录后自动化 —— 用户拍板的规则,
+    /// 否则 tmux 不会 attach,断线前那个 Claude Code 会话回不来
+    /// (这正是整个 F128 要解决的场景)。
+    ///
+    /// 锚点拆开拼,理由同上一条。
+    ///
+    /// 自证会变红:把 `PaneReconnected` 分支里的 `start_automation` 那句删掉。
+    #[test]
+    fn reconnect_reruns_post_login_automation() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("self.start_automation("),
+            "没重跑登录后命令 —— tmux 不 attach,Claude Code 会话回不来"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功要把这个标签的 SFTP 侧栏运行态清掉。
+    /// 旧 `SftpClient` 挂在**已经死掉的那条连接**上,留着的话侧栏每次操作都
+    /// 静默失败,而用户看到的是「文件面板卡住了」。
+    ///
+    /// 锚点拆开拼,理由同上一条。
+    ///
+    /// 自证会变红:把 `PaneReconnected` 分支里 `t.sftp = None;` 那句删掉。
+    #[test]
+    fn reconnect_drops_the_dead_sftp_client() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("t.sftp = None;"),
+            "死掉的 SftpClient 必须丢掉"
+        );
+        assert!(body.contains("t.sftp_home = None;"));
     }
 }
