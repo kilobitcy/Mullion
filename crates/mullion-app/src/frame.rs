@@ -66,6 +66,29 @@ pub fn frame_is_dirty(terminal_dirty: bool, ui_dirty: bool) -> bool {
     terminal_dirty || ui_dirty
 }
 
+/// 光标闪烁半周期(毫秒)。530ms 是 Windows 的系统默认光标闪烁周期,
+/// 与用户在别处(记事本、cmd)看到的节奏一致。
+pub const BLINK_HALF_MS: u64 = 530;
+
+/// F125:这一刻光标该不该画出来。
+///
+/// 相位从**最后一次键盘输入**起算:刚敲完一个字符,光标一定是亮的。不这么做的话
+/// 连续打字时光标会随机隐没,观感像丢帧。
+///
+/// 纯函数,不碰时钟也不碰 winit —— 闪烁是本项目里唯一一个「必须周期性重绘」的
+/// 特性,把判据留在能单测的地方,是它不退化成 T3(每帧重绘)的前提。
+pub fn blink_visible(now_ms: u64, last_input_ms: u64) -> bool {
+    let elapsed = now_ms.saturating_sub(last_input_ms);
+    (elapsed / BLINK_HALF_MS).is_multiple_of(2)
+}
+
+/// F125:距下一次相位翻转还有多少毫秒。调用方据此排一次 `WaitUntil`
+/// (**不是** `request_redraw`:那会绕开帧闸,踩 T3/T7)。
+pub fn blink_next_flip_ms(now_ms: u64, last_input_ms: u64) -> u64 {
+    let elapsed = now_ms.saturating_sub(last_input_ms);
+    BLINK_HALF_MS - (elapsed % BLINK_HALF_MS)
+}
+
 /// [`FrameLimiter::plan`] 的决策结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedrawAction {
@@ -125,5 +148,45 @@ mod tests {
             RedrawAction::Throttle { wait_ms: 8 },
             "太快的脏帧应 Throttle,且 wait_ms = 剩余间隔,不是忙等空 request_redraw"
         );
+    }
+
+    /// F125:半周期 530ms(Windows 系统默认光标闪烁周期)。
+    /// 相位从**最后一次输入**起算,不是从进程启动起算。
+    #[test]
+    fn blink_alternates_every_half_period() {
+        assert!(blink_visible(0, 0), "刚输入完必须是亮的");
+        assert!(blink_visible(529, 0), "半周期内一直亮");
+        assert!(!blink_visible(530, 0), "过半周期转灭");
+        assert!(!blink_visible(1059, 0));
+        assert!(blink_visible(1060, 0), "一个整周期后回到亮");
+    }
+
+    /// F125:打字必须重置相位 —— 不重置的话连续打字时光标会随机隐没,
+    /// 观感像丢帧。判据:同一时刻,`last_input` 变了结果就该跟着变。
+    ///
+    /// 自证会变红:把 `blink_visible` 里的 `now_ms - last_input_ms` 换成 `now_ms`。
+    #[test]
+    fn typing_resets_the_phase() {
+        assert!(!blink_visible(600, 0), "距上次输入 600ms:灭");
+        assert!(blink_visible(600, 600), "这一刻刚敲了键:立刻回到亮");
+    }
+
+    /// 时钟倒退(不同来源的 now)不能 panic —— 用饱和减法。
+    #[test]
+    fn clock_going_backwards_is_not_a_panic() {
+        assert!(blink_visible(0, 999));
+    }
+
+    /// F125:下一次相位翻转的时刻,给事件循环排 `WaitUntil` 用。
+    /// **不返回固定的 530**:刚翻转过的那一帧要等满 530,翻转前 10ms 就只等 10ms,
+    /// 否则光标会晚一整拍。
+    ///
+    /// 自证会变红:把 `blink_next_flip_ms` 的函数体改成 `BLINK_HALF_MS`。
+    #[test]
+    fn next_flip_is_the_remainder_of_the_current_half_period() {
+        assert_eq!(blink_next_flip_ms(0, 0), 530);
+        assert_eq!(blink_next_flip_ms(520, 0), 10);
+        assert_eq!(blink_next_flip_ms(530, 0), 530);
+        assert_eq!(blink_next_flip_ms(1000, 0), 60);
     }
 }
