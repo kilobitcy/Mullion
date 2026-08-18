@@ -293,6 +293,7 @@ impl TextLayer {
         queue: &wgpu::Queue,
         panes: &[PaneRender<'_>],
         res: Resolution,
+        preedit_fg: Rgb,
     ) -> Result<(), glyphon::PrepareError> {
         self.viewport.update(queue, res);
         let metrics = grid_metrics(self.font_px, self.cell_h);
@@ -340,6 +341,36 @@ impl TextLayer {
                     buf.set_rich_text(fs, iter, attrs, Shaping::Advanced);
                     buf.shape_until_scroll(fs, false);
                     placements.push((pi, row, run.col));
+                    n += 1;
+                }
+            }
+            // F126:组字中的拼音串。用与正文同一套 buffer 池,颜色取默认前景色
+            // (它盖在自己铺的默认背景上,不跟随底下那格原本的 SGR 颜色 ——
+            // 那格颜色可能恰好等于背景色,拼音就隐形了)。
+            if !p.preedit.is_empty() && p.snap.cursor.visible {
+                for c in crate::text::preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit) {
+                    if n == bufs.len() {
+                        bufs.push(Buffer::new(fs, metrics));
+                    }
+                    let buf = &mut bufs[n];
+                    buf.set_metrics(fs, metrics);
+                    let avail = p
+                        .geom
+                        .term_px
+                        .w
+                        .saturating_sub((f32::from(c.col) * cell_w) as u32)
+                        .max(1) as f32;
+                    buf.set_size(fs, Some(avail), Some(cell_h));
+                    let s = c.ch.to_string();
+                    let color = to_color(preedit_fg);
+                    buf.set_rich_text(
+                        fs,
+                        [(s.as_str(), attrs.color(color))],
+                        attrs,
+                        Shaping::Advanced,
+                    );
+                    buf.shape_until_scroll(fs, false);
+                    placements.push((pi, p.snap.cursor.row, c.col));
                     n += 1;
                 }
             }

@@ -69,6 +69,9 @@ pub struct PaneRender<'a> {
     pub geom: PaneGeom,
     pub snap: &'a GridSnapshot,
     pub focused: bool,
+    /// F126:这个 pane 上组字中的拼音串。**只有焦点 pane 非空** ——
+    /// 输入法一次只对一个 pane 生效。
+    pub preedit: &'a str,
 }
 
 /// 空心光标的边框粗细(像素)。
@@ -86,6 +89,9 @@ const HOLLOW_PX: f32 = 1.0;
 /// `palette::DEFAULT_*`——那样主题一换就和 clear 色失配。
 ///
 /// `cursor` 控制光标画法,调用方按 pane 是否焦点该传哪种由 `style_for` 决定(F125)。
+///
+/// `cursor_col_override`:F126 组字期间光标要画在拼音串末尾而不是原始列号,
+/// 传 `Some` 覆盖 `snap.cursor.col`;`None` 时用快照自带的列(绝大多数调用)。
 pub fn quads_for(
     snap: &GridSnapshot,
     origin: (f32, f32),
@@ -93,6 +99,7 @@ pub fn quads_for(
     cell_h: f32,
     defaults: DefaultColors,
     cursor: CursorStyle,
+    cursor_col_override: Option<u16>,
 ) -> Vec<Quad> {
     let mut quads = Vec::new();
     for row in 0..snap.rows {
@@ -120,7 +127,8 @@ pub fn quads_for(
         }
     }
     if snap.cursor.visible {
-        let x = origin.0 + snap.cursor.col as f32 * cell_w;
+        let col = cursor_col_override.unwrap_or(snap.cursor.col);
+        let x = origin.0 + col as f32 * cell_w;
         let y = origin.1 + snap.cursor.row as f32 * cell_h;
         // MVP 光标用默认前景色。原本硬编码 0xcc,主题化后必须跟着走,
         // 否则新前景下光标是一块突兀的旧灰。
@@ -216,11 +224,39 @@ pub fn quads_for_panes(
             origin.0 + p.geom.term_px.w as f32,
             origin.1 + p.geom.term_px.h as f32,
         );
+        // F126:组字中时光标要停在拼音串末尾,不是原始列——两处必须用同一个
+        // `preedit_cursor_col` 调用,和 `text::prepare_panes` 摆字用的是同一套
+        // 布局(`preedit_layout`),否则光标和拼音串错位。
+        let cursor_col_override = if p.preedit.is_empty() {
+            None
+        } else {
+            Some(crate::text::preedit_cursor_col(
+                p.snap.cols,
+                p.snap.cursor.col,
+                p.preedit,
+            ))
+        };
         out.extend(
-            quads_for(p.snap, origin, cell_w, cell_h, defaults, style)
-                .into_iter()
-                .filter_map(|q| clamp_quad_to_bounds(q, bounds)),
+            quads_for(
+                p.snap,
+                origin,
+                cell_w,
+                cell_h,
+                defaults,
+                style,
+                cursor_col_override,
+            )
+            .into_iter()
+            .filter_map(|q| clamp_quad_to_bounds(q, bounds)),
         );
+        if !p.preedit.is_empty() && p.snap.cursor.visible {
+            let cells = crate::text::preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit);
+            out.extend(
+                preedit_quads(&cells, origin, p.snap.cursor.row, cell_w, cell_h, defaults)
+                    .into_iter()
+                    .filter_map(|q| clamp_quad_to_bounds(q, bounds)),
+            );
+        }
     }
     out
 }
@@ -242,6 +278,46 @@ fn clamp_quad_to_bounds(q: Quad, (left, top, right, bottom): (f32, f32, f32, f32
         h,
         color: q.color,
     })
+}
+
+/// preedit 下划线粗细(像素)。比光标那条 `BAR_PX` 细:它是「未提交」的标记,
+/// 不该比光标本身还抢眼。
+pub const UNDERLINE_PX: f32 = 1.0;
+
+/// F126:组字中的拼音串要画的色块 —— 每格一个背景(盖住底下的原字符)+
+/// 一条下划线(未提交的标记;glyphon 不画下划线,只能自己来)。
+///
+/// `origin` 与 `quads_for` 同一个约定:终端区左上角的窗口像素坐标。
+/// `row` 是光标所在行(preedit 不跨行)。
+pub fn preedit_quads(
+    cells: &[crate::text::PreeditCell],
+    origin: (f32, f32),
+    row: u16,
+    cell_w: f32,
+    cell_h: f32,
+    defaults: DefaultColors,
+) -> Vec<Quad> {
+    let mut out = Vec::with_capacity(cells.len() * 2);
+    let y = origin.1 + f32::from(row) * cell_h;
+    for c in cells {
+        let x = origin.0 + f32::from(c.col) * cell_w;
+        let w = f32::from(c.width) * cell_w;
+        out.push(Quad {
+            x,
+            y,
+            w,
+            h: cell_h,
+            color: [defaults.bg.r, defaults.bg.g, defaults.bg.b],
+        });
+        out.push(Quad {
+            x,
+            y: y + cell_h - UNDERLINE_PX,
+            w,
+            h: UNDERLINE_PX,
+            color: [defaults.fg.r, defaults.fg.g, defaults.fg.b],
+        });
+    }
+    out
 }
 
 use std::sync::Arc;
@@ -551,6 +627,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
         );
         assert_eq!(quads.len(), 2, "一个背景块 + 一个光标块");
         for q in &quads {
@@ -570,6 +647,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
         );
         assert!(quads.is_empty(), "默认背景不该产生色块(省 GPU)");
     }
@@ -584,6 +662,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
         );
         assert_eq!(quads.len(), 1);
         assert_eq!(
@@ -609,6 +688,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
         );
         assert_eq!(quads.len(), 1, "仅光标块(默认背景无块)");
         assert_eq!(quads[0].w, 10.0);
@@ -649,6 +729,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
         );
         assert_eq!(quads.len(), 1, "选中格必须画底色块");
         assert_eq!(quads[0].color, [0xcc, 0xcc, 0xcc], "底色应换成前景色");
@@ -691,6 +772,7 @@ mod tests {
             20.0,
             DefaultColors { fg, bg },
             CursorStyle::Block,
+            None,
         );
         let cursor = quads.last().expect("光标可见时应有一个 quad");
         assert_eq!(cursor.color, [0xe4, 0xe6, 0xf0], "光标色应取注入的默认前景");
@@ -711,6 +793,7 @@ mod tests {
                 bg,
             },
             CursorStyle::Block,
+            None,
         );
         assert!(
             quads.is_empty(),
@@ -731,6 +814,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Hollow,
+            None,
         );
         assert_eq!(quads.len(), 4, "空心光标 = 上下左右四条边");
         // 每条边都是 1px 细的,且都贴着这一格的边界。
@@ -775,6 +859,7 @@ mod tests {
                 20.0,
                 DefaultColors::default(),
                 style,
+                None,
             );
             assert!(quads.is_empty(), "光标不可见时不该画: {style:?}");
         }
@@ -813,11 +898,13 @@ mod tests {
                 geom: geom(1, 0),
                 snap: &a,
                 focused: true,
+                preedit: "",
             },
             PaneRender {
                 geom: geom(2, 400),
                 snap: &b,
                 focused: false,
+                preedit: "",
             },
         ];
         let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
@@ -861,11 +948,13 @@ mod tests {
                 geom: geom(1, 0),
                 snap: &a,
                 focused: true,
+                preedit: "",
             },
             PaneRender {
                 geom: geom(2, 400),
                 snap: &b,
                 focused: false,
+                preedit: "",
             },
         ];
         let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
@@ -920,6 +1009,7 @@ mod tests {
                 bg: Rgb::new(0x10, 0x10, 0x10),
             },
             style,
+            None,
         )
     }
 
@@ -1025,6 +1115,7 @@ mod tests {
             geom,
             snap: &snap,
             focused: true,
+            preedit: "",
         }];
         let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert_eq!(quads.len(), 1);
@@ -1076,11 +1167,13 @@ mod tests {
                 geom: geom(1, 0),
                 snap: &a,
                 focused: true,
+                preedit: "",
             }, // Bar(shape=Beam,焦点),term_px = x:0..1
             PaneRender {
                 geom: geom(2, 2),
                 snap: &b,
                 focused: false,
+                preedit: "",
             }, // Hollow(非焦点),term_px = x:2..3
         ];
         let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
@@ -1128,6 +1221,7 @@ mod tests {
             geom,
             snap: &snap,
             focused: true,
+            preedit: "",
         }];
         let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert_eq!(quads.len(), 1);
@@ -1180,11 +1274,13 @@ mod tests {
                 geom: geom(1, 0),
                 snap: &a,
                 focused: true,
+                preedit: "",
             }, // Bar(shape=Beam,焦点),term_px = y:0..1
             PaneRender {
                 geom: geom(2, 2),
                 snap: &b,
                 focused: false,
+                preedit: "",
             }, // Hollow(非焦点),term_px = y:2..3
         ];
         let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
@@ -1196,6 +1292,58 @@ mod tests {
                 "光标 quad 越过自己 pane 的 term_px 边界(y 方向): {q:?}"
             );
         }
+    }
+
+    /// F126:preedit 每一格都要先铺一层背景色盖住底下的原字符,再画下划线。
+    /// 不铺底的话,拼音会和底下的命令行文字叠在一起,糊成一团。
+    ///
+    /// 自证会变红:把 `preedit_quads` 里那句 push 背景 quad 删掉。
+    #[test]
+    fn preedit_covers_the_cells_underneath_and_underlines_them() {
+        let cells = vec![
+            crate::text::PreeditCell {
+                col: 2,
+                ch: 'n',
+                width: 1,
+            },
+            crate::text::PreeditCell {
+                col: 3,
+                ch: 'i',
+                width: 1,
+            },
+        ];
+        let d = DefaultColors {
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0x10, 0x10, 0x10),
+        };
+        let q = preedit_quads(&cells, (0.0, 0.0), 1, 10.0, 20.0, d);
+        // 每格 2 个 quad:底 + 下划线。
+        assert_eq!(q.len(), 4);
+        let bg: Vec<_> = q.iter().filter(|q| q.h == 20.0).collect();
+        assert_eq!(bg.len(), 2, "两格底色");
+        assert_eq!(bg[0].x, 20.0);
+        assert_eq!(bg[0].y, 20.0, "第 1 行");
+        assert_eq!(bg[0].color, [0x10, 0x10, 0x10], "底色 = 默认背景色");
+        let ul: Vec<_> = q.iter().filter(|q| q.h == UNDERLINE_PX).collect();
+        assert_eq!(ul.len(), 2, "两格下划线");
+        assert_eq!(ul[0].y, 20.0 + 20.0 - UNDERLINE_PX, "贴格子底缘");
+        assert_eq!(ul[0].color, [0xcc, 0xcc, 0xcc], "下划线 = 默认前景色");
+    }
+
+    /// F126:宽字符的底色/下划线要盖满两格,画一格的话汉字右半露出底下的旧字。
+    #[test]
+    fn wide_preedit_cell_covers_two_columns() {
+        let cells = vec![crate::text::PreeditCell {
+            col: 0,
+            ch: '你',
+            width: 2,
+        }];
+        let d = DefaultColors {
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0x10, 0x10, 0x10),
+        };
+        let q = preedit_quads(&cells, (0.0, 0.0), 0, 10.0, 20.0, d);
+        assert!(q.iter().all(|q| q.w == 20.0), "两格宽");
     }
 
     /// bg quad 整个落在 term_px 外时必须被**整体丢弃**,不能留下一个 w<=0 的
@@ -1233,6 +1381,7 @@ mod tests {
             geom,
             snap: &snap,
             focused: true,
+            preedit: "",
         }];
         let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert!(

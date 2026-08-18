@@ -3993,7 +3993,16 @@ impl App {
         else {
             return;
         };
-        let area = ime_cursor_area(g.term_px, (cur.col, cur.row), cell_w, cell_h);
+        // F126:组字中候选框要跟拼音串末尾走,不是原始光标列 —— 与
+        // `gpu::quads_for_panes`/`text::prepare_panes` 摆字用的是同一个
+        // `preedit_cursor_col`,否则候选框和内联拼音的视觉光标位置对不上。
+        let cols = self
+            .active_ws()
+            .and_then(Workspace::focused)
+            .map(|p| p.emulator.cols())
+            .unwrap_or(cur.col + 1);
+        let col = crate::text::preedit_cursor_col(cols, cur.col, self.ime.preedit());
+        let area = ime_cursor_area(g.term_px, (col, cur.row), cell_w, cell_h);
         if self.ime_cursor_area == Some(area) {
             return;
         }
@@ -5856,7 +5865,12 @@ impl ApplicationHandler<UserEvent> for App {
             // `set_ime_allowed(true)` 在 `resumed` 里开,不开这条事件根本不会发。
             WindowEvent::Ime(ime) => {
                 match &ime {
-                    winit::event::Ime::Preedit(text, _) => self.ime.on_preedit(text),
+                    winit::event::Ime::Preedit(text, _) => {
+                        self.ime.on_preedit(text);
+                        // F125:拼音现在内联上屏,组字中敲字母也算「输入」——
+                        // 不重置的话光标可能闪到暗周期,用户敲拼音时观感是丢帧。
+                        self.last_input_at = Instant::now();
+                    }
                     winit::event::Ime::Commit(text) => {
                         self.ime.on_commit();
                         // F125:输入法提交也是输入,重置闪烁相位。
@@ -5878,6 +5892,9 @@ impl ApplicationHandler<UserEvent> for App {
                     winit::event::Ime::Enabled => {}
                     winit::event::Ime::Disabled => self.ime.on_disabled(),
                 }
+                // F126:preedit 串变了,候选框该跟去拼音串末尾——不补这一句,
+                // 候选框位置要等下一次别的事件才更新,组字时肉眼可见地滞后一拍。
+                self.apply_ime_cursor_area();
                 self.request_ui_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -6157,10 +6174,16 @@ impl ApplicationHandler<UserEvent> for App {
                             let focus = self.active_ws().map(Workspace::focus);
                             let renders: Vec<crate::gpu::PaneRender<'_>> = snaps
                                 .iter()
-                                .map(|(g, s)| crate::gpu::PaneRender {
-                                    geom: *g,
-                                    snap: s,
-                                    focused: Some(g.id) == focus,
+                                .map(|(g, s)| {
+                                    let focused_here = Some(g.id) == focus;
+                                    crate::gpu::PaneRender {
+                                        geom: *g,
+                                        snap: s,
+                                        focused: focused_here,
+                                        // F126:输入法一次只对一个 pane 生效,
+                                        // 非焦点 pane 不画拼音串。
+                                        preedit: if focused_here { self.ime.preedit() } else { "" },
+                                    }
                                 })
                                 .collect();
                             // 同 `active_ws_of` 的说明:这里借出去的 `titles` 一直
@@ -8051,10 +8074,13 @@ fn render_frame(
         );
         // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
         // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。
-        if let Err(e) = a
-            .text
-            .prepare_panes(&a.gpu.device, &a.gpu.queue, panes, res)
-        {
+        if let Err(e) = a.text.prepare_panes(
+            &a.gpu.device,
+            &a.gpu.queue,
+            panes,
+            res,
+            theme::term_default_colors(&MULLION_DARK).fg,
+        ) {
             log::warn!(target: "mullion", "glyphon prepare 失败,跳过本帧: {e:?}");
             diag::count_skipped();
             return (std::time::Duration::MAX, actions);

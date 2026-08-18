@@ -314,6 +314,12 @@ impl Emulator {
         }
     }
 
+    /// 网格列数。**轻量路径**,不建整格快照 —— F126 输入法 preedit 布局
+    /// 每帧都要问一次列数,和 `cursor()` 存在的理由一样(避免 T3)。
+    pub fn cols(&self) -> u16 {
+        self.term.columns() as u16
+    }
+
     /// 改变网格尺寸(F34:分屏 reflow / 窗口 resize 时调用)。
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(GridSize { cols, rows });
@@ -535,6 +541,15 @@ mod tests {
         emu.resize(20, 5);
         let snap = emu.snapshot();
         assert_eq!((snap.cols, snap.rows), (20, 5));
+    }
+
+    /// F126:`cols()` 是 `snapshot().cols` 的轻量同源版 —— 输入法候选框定位
+    /// 每帧都要问一次列数,不该为此建一整份网格快照(T3)。
+    #[test]
+    fn cols_agrees_with_the_full_snapshot() {
+        let mut emu = Emulator::new(10, 3);
+        emu.resize(20, 5);
+        assert_eq!(emu.cols(), emu.snapshot().cols);
     }
 
     #[test]
