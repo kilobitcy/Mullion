@@ -422,6 +422,28 @@ mod tests {
         assert_eq!(plan.keep, vec![PaneId(1)]);
     }
 
+    /// F128:三态的相对顺序必须是 `Disconnected` → `Reconnecting` → `Live`。
+    /// 穷尽 match 只保证「加状态时编译报错」,保证不了这三个数字没写反 ——
+    /// 写反了就是减屏时**杀活的、留正在重连的**,而且悄无声息。
+    ///
+    /// 自证会变红:把 `close_priority` 里 `Reconnecting` 和 `Live` 的返回值对调。
+    #[test]
+    fn close_prefers_reconnecting_over_live() {
+        let cur = [
+            (PaneId(1), PaneStatus::Live),
+            (PaneId(2), PaneStatus::Reconnecting),
+            (PaneId(3), PaneStatus::Live),
+            (PaneId(4), PaneStatus::Disconnected),
+        ];
+        let plan = plan_preset(Preset::TwoLeftRight, &cur);
+        assert_eq!(
+            plan.close,
+            vec![PaneId(4), PaneId(2)],
+            "先关死透的,再关重连中的,活的一个不动"
+        );
+        assert_eq!(plan.keep, vec![PaneId(1), PaneId(3)]);
+    }
+
     #[test]
     fn focus_survives_when_its_pane_survives() {
         assert_eq!(next_focus(PaneId(3), &[PaneId(1), PaneId(3)]), PaneId(3));
