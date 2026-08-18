@@ -188,6 +188,23 @@ use glyphon::{
     TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 
+/// F126(代码质量复核 Important #2):这一行该不该把某段列区间当成"空白"
+/// 交给 `row_to_runs` —— 判据是纯数据(是不是光标所在行 / 是不是在组字 /
+/// 光标本身可不可见),不碰 wgpu、不碰 `FontSystem`,可以脱离 GPU 单测。
+///
+/// **原 bug 正出在这条判断上**:上一轮直接把它内联写在 `prepare_panes` 的
+/// 循环里,`prepare_panes` 整体要真实 wgpu `Device`/`Queue` 才能跑,这条纯
+/// 数据判断因此一起被挡在 GPU 门外、从没被单测覆盖过。抽成自由函数,
+/// `PaneRender` 本身是纯数据类型(`gpu.rs` 的既有测试大量直接构造它),
+/// 三个条件都能在没有窗口的情况下单测到。
+pub fn hidden_span_for_row(p: &PaneRender<'_>, row: u16) -> Option<(u16, u16)> {
+    if row != p.snap.cursor.row || p.preedit.is_empty() || !p.snap.cursor.visible {
+        return None;
+    }
+    let cells = preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit);
+    preedit_span(&cells)
+}
+
 /// 内置默认字体族名。须在系统里已安装;未装则 cosmic-text 回退到默认字体
 /// (不崩,但等宽/对齐可能变差)。F21 起用户可以在设置里改成别的族名,
 /// 没设时仍是这一款。
@@ -348,23 +365,13 @@ impl TextLayer {
         let (cell_w, cell_h) = (self.cell_w, self.cell_h);
         let mut n = 0usize;
         for (pi, p) in panes.iter().enumerate() {
-            // F126:组字中的拼音串占的列区间只在光标行生效——正文 run 要在这
-            // 个区间让路(见 `row_to_runs` 的 `hidden` 参数文档),不然背景
-            // quad 盖不住排在它后面的文字层,拼音会和原字符的字形叠在一起。
-            // preedit 为空时 `preedit_cells` 是空 `Vec`(不分配堆内存),
-            // `preedit_span` 对空切片返回 `None`,不组字的帧不多做任何事(T3)。
-            let preedit_cells = if !p.preedit.is_empty() && p.snap.cursor.visible {
-                preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit)
-            } else {
-                Vec::new()
-            };
-            let preedit_hidden = preedit_span(&preedit_cells);
             for row in 0..p.snap.rows {
-                let hidden = if row == p.snap.cursor.row {
-                    preedit_hidden
-                } else {
-                    None
-                };
+                // F126:组字中的拼音串占的列区间只在光标行生效——正文 run 要
+                // 在这个区间让路(见 `row_to_runs` 的 `hidden` 参数文档),
+                // 不然背景 quad 盖不住排在它后面的文字层,拼音会和原字符的
+                // 字形叠在一起。判断本身是纯函数 `hidden_span_for_row`,
+                // 见它的文档——这正是原 bug 溜过测试的那层接线。
+                let hidden = hidden_span_for_row(p, row);
                 for run in row_to_runs(p.snap.row(row), hidden) {
                     if n == bufs.len() {
                         bufs.push(Buffer::new(fs, metrics));
@@ -392,8 +399,15 @@ impl TextLayer {
             }
             // F126:组字中的拼音串。用与正文同一套 buffer 池,颜色取默认前景色
             // (它盖在自己铺的默认背景上,不跟随底下那格原本的 SGR 颜色 ——
-            // 那格颜色可能恰好等于背景色,拼音就隐形了)。复用上面已经算好的
-            // `preedit_cells`,不重复调用 `preedit_layout`。
+            // 那格颜色可能恰好等于背景色,拼音就隐形了)。守卫与
+            // `hidden_span_for_row` 内部判据同源(非空 + 光标可见);preedit
+            // 串很短(几个字符),这里再算一次 `preedit_layout` 不是 T3 那一类
+            // 大分配。
+            let preedit_cells = if !p.preedit.is_empty() && p.snap.cursor.visible {
+                preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit)
+            } else {
+                Vec::new()
+            };
             for c in &preedit_cells {
                 if n == bufs.len() {
                     bufs.push(Buffer::new(fs, metrics));
@@ -524,7 +538,8 @@ fn measure_advance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell::workspace::PxRect;
+    use crate::shell::workspace::{PaneGeom, PxRect};
+    use mullion_term::snapshot::GridSnapshot;
 
     fn cell(ch: char, fg: Rgb, spacer: bool) -> SnapCell {
         SnapCell {
@@ -973,5 +988,166 @@ mod tests {
         assert_eq!(preedit_span(&cells), Some((3, 6)));
         let wide = preedit_layout(20, 0, "你a");
         assert_eq!(preedit_span(&wide), Some((0, 3)), "宽字占两格,止列要算上它");
+    }
+
+    /// F126(代码质量复核 Important #2)以下 `hidden_span_for_row` 系列测试
+    /// 覆盖的正是原 bug 所在的那层接线:`prepare_panes` 决定"这一行该不该把
+    /// 某段列区间藏起来交给 `row_to_runs`"的判断逻辑,曾经内联写在
+    /// `prepare_panes` 的行循环里、被"整体需要真实 wgpu Device/Queue"这个
+    /// 借口一起挡在了 GPU 门外。抽成纯函数后,`PaneRender` 本身是纯数据类型,
+    /// 这里直接构造即可,不用碰 wgpu、不用碰 FontSystem。
+    fn geom_for_hidden_span_tests() -> PaneGeom {
+        PaneGeom {
+            id: mullion_core::layout::PaneId(1),
+            px: PxRect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 600,
+            },
+            title_px: PxRect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 0,
+            },
+            term_px: PxRect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 600,
+            },
+            grid: (20, 4),
+        }
+    }
+
+    fn snapshot_for_hidden_span_tests(
+        cursor_row: u16,
+        cursor_col: u16,
+        visible: bool,
+    ) -> GridSnapshot {
+        let blank = SnapCell {
+            ch: ' ',
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0x10, 0x10, 0x10),
+            width: 1,
+            spacer: false,
+            selected: false,
+        };
+        GridSnapshot {
+            cols: 20,
+            rows: 4,
+            cells: vec![blank; 20 * 4],
+            cursor: mullion_term::snapshot::Cursor {
+                row: cursor_row,
+                col: cursor_col,
+                visible,
+                shape: mullion_term::snapshot::CursorShape::Block,
+                blinking: true,
+            },
+        }
+    }
+
+    /// 光标行 + preedit 非空 + 光标可见 → `Some(正确区间)`。
+    ///
+    /// 自证会变红:把 `hidden_span_for_row` 里 `preedit_span(&cells)` 换成
+    /// `None`(或者干脆让整个函数体永远 `None`)。
+    #[test]
+    fn hidden_span_for_row_on_cursor_row_covers_the_preedit() {
+        let geom = geom_for_hidden_span_tests();
+        let snap = snapshot_for_hidden_span_tests(1, 3, true);
+        let p = PaneRender {
+            geom,
+            snap: &snap,
+            focused: true,
+            preedit: "abc",
+        };
+        assert_eq!(hidden_span_for_row(&p, 1), Some((3, 6)));
+    }
+
+    /// 非光标行 → `None` —— preedit 只在光标所在那一行生效,别的行不该有任何
+    /// 列被藏起来。
+    ///
+    /// 自证会变红:把 `row != p.snap.cursor.row` 这个判据删掉(不再检查行号)。
+    #[test]
+    fn hidden_span_for_row_on_a_different_row_is_none() {
+        let geom = geom_for_hidden_span_tests();
+        let snap = snapshot_for_hidden_span_tests(1, 3, true);
+        let p = PaneRender {
+            geom,
+            snap: &snap,
+            focused: true,
+            preedit: "abc",
+        };
+        assert_eq!(hidden_span_for_row(&p, 0), None, "第 0 行不是光标所在行");
+        assert_eq!(hidden_span_for_row(&p, 2), None, "第 2 行不是光标所在行");
+    }
+
+    /// preedit 为空(没在组字)→ `None`。
+    ///
+    /// 自证说明(已亲手验证,不是想当然):单独删掉 `hidden_span_for_row` 里的
+    /// `p.preedit.is_empty()` 这一支判据**不会**让这条测试变红——`preedit_layout`
+    /// 对空串本就返回空 `Vec`,`preedit_span(&[])` 自身的 `?` 提前返回已经兜底
+    /// 出 `None`,这条判据目前是（有意保留的）冗余短路,只省一次无意义的
+    /// `preedit_layout` 调用,不改变可观察行为。真正钉住"preedit 为空 → None"
+    /// 这条契约、会让本测试变红的变异在更底层:把 `preedit_span` 的 `?` 提前
+    /// 返回删掉换成 `unwrap_or_default()`(见 `preedit_span_covers_first_to_last_and_is_none_when_empty`
+    /// 那条测试的自证注释,它已经钉住这个变异)。这里仍然保留这条测试,是为了在
+    /// `hidden_span_for_row` 这一层直接钉住"preedit 为空 → None"的契约,不依赖
+    /// 读者跳到 `preedit_span` 才能确认。
+    #[test]
+    fn hidden_span_for_row_with_empty_preedit_is_none() {
+        let geom = geom_for_hidden_span_tests();
+        let snap = snapshot_for_hidden_span_tests(1, 3, true);
+        let p = PaneRender {
+            geom,
+            snap: &snap,
+            focused: true,
+            preedit: "",
+        };
+        assert_eq!(hidden_span_for_row(&p, 1), None);
+    }
+
+    /// 光标不可见(比如滚动到回溯历史区)→ `None` —— 呼应 gpu.rs 里
+    /// `preedit_has_zero_effect_when_the_cursor_is_invisible` 的同一条约束,
+    /// 这里钉的是产生 hidden 区间的源头。
+    ///
+    /// 自证会变红:把 `!p.snap.cursor.visible` 这个判据删掉。
+    #[test]
+    fn hidden_span_for_row_with_invisible_cursor_is_none() {
+        let geom = geom_for_hidden_span_tests();
+        let snap = snapshot_for_hidden_span_tests(1, 3, false);
+        let p = PaneRender {
+            geom,
+            snap: &snap,
+            focused: true,
+            preedit: "abc",
+        };
+        assert_eq!(hidden_span_for_row(&p, 1), None);
+    }
+
+    /// 宽字 preedit 的区间端点正确 —— 止列要算上宽字占的两格,不能只按字符数算。
+    ///
+    /// 自证会变红(已亲手验证):把 `hidden_span_for_row` 里的
+    /// `preedit_span(&cells)` 换成按"字符数"而不是"宽度和"算止列,例如
+    /// `cells.first().map(|f| (f.col, f.col + p.preedit.chars().count() as u16))`。
+    /// 纯 ASCII 场景下字符数恰好等于宽度和,`hidden_span_for_row_on_cursor_row_covers_the_preedit`
+    /// 那条测试测不出来;但 "你a" 里 `你` 占两格、字符数却只算 1,止列会退化成
+    /// `Some((0, 2))`,与期望的 `Some((0, 3))` 不符,只有这条测试会红。
+    #[test]
+    fn hidden_span_for_row_wide_char_endpoints_account_for_double_width() {
+        let geom = geom_for_hidden_span_tests();
+        let snap = snapshot_for_hidden_span_tests(1, 0, true);
+        let p = PaneRender {
+            geom,
+            snap: &snap,
+            focused: true,
+            preedit: "你a",
+        };
+        assert_eq!(
+            hidden_span_for_row(&p, 1),
+            Some((0, 3)),
+            "'你' 占第 0-1 列,'a' 占第 2 列,止列该是 3"
+        );
     }
 }

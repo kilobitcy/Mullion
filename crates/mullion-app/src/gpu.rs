@@ -224,18 +224,19 @@ pub fn quads_for_panes(
             origin.0 + p.geom.term_px.w as f32,
             origin.1 + p.geom.term_px.h as f32,
         );
+        // F126:preedit 是否在生效——**唯一判据**,`cursor_col_override` 与下面
+        // 追加 preedit 背景/下划线 quad 那支必须长在同一个变量上,不能分别
+        // 各判一次。光标不可见时(比如滚动到回溯历史区)两者都不该生效:
+        // `quads_for` 的光标分支本身 gated 在 `snap.cursor.visible`,算出来的
+        // `Some(col)` 根本用不上,却要白跑一次 `preedit_cursor_col` →
+        // `preedit_layout`,每帧多分配一个 Vec(T3)。守护:
+        // `preedit_has_zero_effect_when_the_cursor_is_invisible`。
+        let preedit_active = !p.preedit.is_empty() && p.snap.cursor.visible;
         // F126:组字中时光标要停在拼音串末尾,不是原始列——两处必须用同一个
         // `preedit_cursor_col` 调用,和 `text::prepare_panes` 摆字用的是同一套
         // 布局(`preedit_layout`),否则光标和拼音串错位。
-        let cursor_col_override = if p.preedit.is_empty() {
-            None
-        } else {
-            Some(crate::text::preedit_cursor_col(
-                p.snap.cols,
-                p.snap.cursor.col,
-                p.preedit,
-            ))
-        };
+        let cursor_col_override = preedit_active
+            .then(|| crate::text::preedit_cursor_col(p.snap.cols, p.snap.cursor.col, p.preedit));
         out.extend(
             quads_for(
                 p.snap,
@@ -249,7 +250,7 @@ pub fn quads_for_panes(
             .into_iter()
             .filter_map(|q| clamp_quad_to_bounds(q, bounds)),
         );
-        if !p.preedit.is_empty() && p.snap.cursor.visible {
+        if preedit_active {
             let cells = crate::text::preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit);
             out.extend(
                 preedit_quads(&cells, origin, p.snap.cursor.row, cell_w, cell_h, defaults)
@@ -1344,6 +1345,65 @@ mod tests {
         };
         let q = preedit_quads(&cells, (0.0, 0.0), 0, 10.0, 20.0, d);
         assert!(q.iter().all(|q| q.w == 20.0), "两格宽");
+    }
+
+    /// F126(代码质量复核 Important #1):`cursor_col_override` 与 preedit
+    /// 背景/下划线 quad 那支的守卫**必须同源**——都长在 `quads_for_panes`
+    /// 里同一个 `preedit_active` 局部变量上。光标不可见时(比如滚动到回溯
+    /// 历史区)两者都不该生效,`quads_for_panes` 的输出必须和 `p.preedit`
+    /// 本来就是空串时完全一致——preedit 对不可见光标是**零影响**,不是
+    /// "算了但用不上"。
+    ///
+    /// 自证会变红:把 `cursor_col_override` 那支的守卫改回只判
+    /// `!p.preedit.is_empty()`(不判 `p.snap.cursor.visible`)。虽然
+    /// `quads_for` 自己会因为光标不可见而不画光标块,`cursor_col_override`
+    /// 传 `Some` 还是 `None` 在这条断言上确实测不出差异——这条测试真正钉住
+    /// 的是第二个变异:把 `if preedit_active` 那句改回
+    /// `if !p.preedit.is_empty()`(不判 `p.snap.cursor.visible`),那样光标
+    /// 不可见时仍会画出 preedit 底色/下划线 quad,和空 preedit 的输出就不再
+    /// 相等,断言直接失败。
+    #[test]
+    fn preedit_has_zero_effect_when_the_cursor_is_invisible() {
+        let mut with_preedit = snap_with_cursor(1, 0, CursorShape::Beam);
+        with_preedit.cursor.visible = false; // 滚到回溯区之类的场景
+        let without_preedit = with_preedit.clone();
+        let geom = PaneGeom {
+            id: mullion_core::layout::PaneId(1),
+            px: PxRect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 600,
+            },
+            title_px: PxRect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 0,
+            },
+            term_px: PxRect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: 600,
+            },
+            grid: (4, 2),
+        };
+        let with_panes = [PaneRender {
+            geom,
+            snap: &with_preedit,
+            focused: true,
+            preedit: "ni",
+        }];
+        let without_panes = [PaneRender {
+            geom,
+            snap: &without_preedit,
+            focused: true,
+            preedit: "",
+        }];
+        let a = quads_for_panes(&with_panes, 10.0, 20.0, DefaultColors::default(), true);
+        let b = quads_for_panes(&without_panes, 10.0, 20.0, DefaultColors::default(), true);
+        assert_eq!(a, b, "光标不可见时,preedit 不该让输出产生任何差异");
     }
 
     /// bg quad 整个落在 term_px 外时必须被**整体丢弃**,不能留下一个 w<=0 的
