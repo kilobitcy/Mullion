@@ -7943,6 +7943,7 @@ fn render_frame(
             a.text.cell_w,
             a.text.cell_h,
             theme::term_default_colors(&MULLION_DARK),
+            true, // TODO(Task 4): 接真实 blink_on,事件循环排 WaitUntil
         );
         // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
         // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。

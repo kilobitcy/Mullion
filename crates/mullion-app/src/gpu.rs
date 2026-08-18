@@ -15,14 +15,50 @@ pub struct Quad {
 
 use crate::shell::workspace::PaneGeom;
 
-/// 光标画法。多 pane 下必须区分:4 个 pane 同时亮 4 个实心光标的话,
+/// 光标画法(F125)。多 pane 下必须区分:4 个 pane 同时亮 4 个光标的话,
 /// 用户看不出键盘输入进了哪一块(§7.1)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorStyle {
-    /// 焦点 pane:实心块。
+    /// 实心块(远端 DECSCUSR 要 Block 时)。
     Block,
-    /// 非焦点 pane:空心框。
+    /// 竖线,本项目默认。
+    Bar,
+    /// 下划线。
+    Underline,
+    /// 空心框:**非焦点 pane 恒用这个**,远端要 HollowBlock 时也是它。
     Hollow,
+    /// 不画:远端要求隐藏,或焦点 pane 闪到了「灭」的半周期。
+    None,
+}
+
+/// 竖线宽 / 下划线高(像素)。1px 在高 DPI 下几乎看不见,和 `HOLLOW_PX` 一样
+/// 不做 DPI 缩放(同一档处理)。
+pub const BAR_PX: f32 = 2.0;
+
+/// 这一帧该怎么画这个 pane 的光标(F125)。**唯一判据源**——`quads_for_panes`
+/// 与测试都走它,不许各写一份。
+///
+/// - 非焦点 pane:恒 `Hollow`,不看远端形状、不看闪烁相位。
+/// - 焦点 pane:远端要什么形状给什么;闪到「灭」的半周期就不画。
+pub fn style_for(
+    shape: mullion_term::snapshot::CursorShape,
+    focused: bool,
+    blink_on: bool,
+) -> CursorStyle {
+    use mullion_term::snapshot::CursorShape as S;
+    if !focused {
+        return CursorStyle::Hollow;
+    }
+    if !blink_on {
+        return CursorStyle::None;
+    }
+    match shape {
+        S::Block => CursorStyle::Block,
+        S::Beam => CursorStyle::Bar,
+        S::Underline => CursorStyle::Underline,
+        S::HollowBlock => CursorStyle::Hollow,
+        S::Hidden => CursorStyle::None,
+    }
 }
 
 /// 一个 pane 的渲染输入。
@@ -46,7 +82,7 @@ const HOLLOW_PX: f32 = 1.0;
 /// `defaults` 必须来自 `theme::term_default_colors`(F80 三处同源),不要直接传
 /// `palette::DEFAULT_*`——那样主题一换就和 clear 色失配。
 ///
-/// `cursor` 控制光标画法:焦点 pane 传 `Block`,其余 pane 传 `Hollow`(§7.1)。
+/// `cursor` 控制光标画法,调用方按 pane 是否焦点该传哪种由 `style_for` 决定(F125)。
 pub fn quads_for(
     snap: &GridSnapshot,
     origin: (f32, f32),
@@ -129,6 +165,21 @@ pub fn quads_for(
                     quads.push(q);
                 }
             }
+            CursorStyle::Bar => quads.push(Quad {
+                x,
+                y,
+                w: BAR_PX,
+                h: cell_h,
+                color,
+            }),
+            CursorStyle::Underline => quads.push(Quad {
+                x,
+                y: y + cell_h - BAR_PX,
+                w: cell_w,
+                h: BAR_PX,
+                color,
+            }),
+            CursorStyle::None => {}
         }
     }
     quads
@@ -150,15 +201,12 @@ pub fn quads_for_panes(
     cell_w: f32,
     cell_h: f32,
     defaults: DefaultColors,
+    blink_on: bool,
 ) -> Vec<Quad> {
     let mut out = Vec::new();
     for p in panes {
         let origin = (p.geom.term_px.x as f32, p.geom.term_px.y as f32);
-        let style = if p.focused {
-            CursorStyle::Block
-        } else {
-            CursorStyle::Hollow
-        };
+        let style = style_for(p.snap.cursor.shape, p.focused, blink_on);
         let bounds = (
             origin.0,
             origin.1,
@@ -769,7 +817,7 @@ mod tests {
                 focused: false,
             },
         ];
-        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default());
+        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert_eq!(quads.len(), 2);
         assert_eq!((quads[0].x, quads[0].y), (0.0, 132.0));
         assert_eq!((quads[1].x, quads[1].y), (400.0, 132.0));
@@ -780,6 +828,7 @@ mod tests {
     fn only_the_focused_pane_gets_a_solid_cursor() {
         let mut a = snap_1x1(Rgb::new(0, 0, 0));
         a.cursor.visible = true;
+        a.cursor.shape = CursorShape::Block; // 焦点 pane 按远端形状画,这里显式要 Block
         let mut b = snap_1x1(Rgb::new(0, 0, 0));
         b.cursor.visible = true;
         let geom = |id: u32, x: u32| PaneGeom {
@@ -816,7 +865,7 @@ mod tests {
                 focused: false,
             },
         ];
-        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default());
+        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         let (pane0, pane1): (Vec<&Quad>, Vec<&Quad>) = quads.iter().partition(|q| q.x < 400.0);
         assert_eq!(pane0.len(), 1, "焦点 pane(x<400)只应有 1 个实心光标块");
         assert_eq!(
@@ -828,6 +877,113 @@ mod tests {
         assert!(
             pane1.iter().all(|q| q.w == 1.0 || q.h == 1.0),
             "非焦点光标每条都应是 1px 边框,不是实心块"
+        );
+    }
+
+    /// 造一个 cols=4 rows=2、光标在 (row, col) 且形状为 `shape` 的快照(F125)。
+    fn snap_with_cursor(col: u16, row: u16, shape: CursorShape) -> GridSnapshot {
+        let blank = SnapCell {
+            ch: ' ',
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0x10, 0x10, 0x10),
+            width: 1,
+            spacer: false,
+            selected: false,
+        };
+        GridSnapshot {
+            cols: 4,
+            rows: 2,
+            cells: vec![blank; 8],
+            cursor: mullion_term::snapshot::Cursor {
+                row,
+                col,
+                visible: true,
+                shape,
+                blinking: true,
+            },
+        }
+    }
+
+    /// 只取光标那部分 quad:格子底色全是默认色,`quads_for` 不会为它们出 quad,
+    /// 所以剩下的就是光标(F125)。
+    fn cursor_quads(snap: &GridSnapshot, style: CursorStyle) -> Vec<Quad> {
+        quads_for(
+            snap,
+            (0.0, 0.0),
+            10.0,
+            20.0,
+            DefaultColors {
+                fg: Rgb::new(0xcc, 0xcc, 0xcc),
+                bg: Rgb::new(0x10, 0x10, 0x10),
+            },
+            style,
+        )
+    }
+
+    /// F125:竖线光标只占 `BAR_PX` 宽,不是整格 —— 画成整格就是原来的实心块。
+    ///
+    /// 自证会变红:把 `CursorStyle::Bar` 那一支的 `w: BAR_PX` 改成 `w: cell_w`。
+    #[test]
+    fn beam_cursor_is_a_thin_bar_at_the_cell_left_edge() {
+        let snap = snap_with_cursor(2, 1, CursorShape::Beam);
+        let q = cursor_quads(&snap, CursorStyle::Bar);
+        assert_eq!(q.len(), 1, "竖线是一个 quad");
+        assert_eq!(q[0].w, BAR_PX, "宽度是 BAR_PX");
+        assert_eq!(q[0].h, 20.0, "高度占满整格");
+        assert_eq!(q[0].x, 2.0 * 10.0, "贴在格子左缘");
+    }
+
+    /// F125:下划线光标贴格子底缘,高 `BAR_PX`。
+    ///
+    /// 自证会变红:把 `Underline` 那一支的 `y` 改成 `y`(不加 `cell_h - BAR_PX`)。
+    #[test]
+    fn underline_cursor_sits_on_the_cell_bottom() {
+        let snap = snap_with_cursor(0, 0, CursorShape::Underline);
+        let q = cursor_quads(&snap, CursorStyle::Underline);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].h, BAR_PX);
+        assert_eq!(q[0].y, 20.0 - BAR_PX, "贴底");
+    }
+
+    /// F125:远端要求隐藏光标(`CSI 0 SP q` 之外还有 `DECTCEM`)时一个 quad 都不画。
+    ///
+    /// 自证会变红:把 `CursorStyle::None` 那一支改成 `Block` 的画法。
+    #[test]
+    fn hidden_cursor_draws_nothing() {
+        let snap = snap_with_cursor(0, 0, CursorShape::Hidden);
+        assert!(cursor_quads(&snap, CursorStyle::None).is_empty());
+    }
+
+    /// F125:**非焦点 pane 恒空心框、且不看快照里的形状**。
+    /// 4 块分屏一起闪 / 一起画竖线的话,用户看不出键盘输入进了哪一块(§7.1)。
+    ///
+    /// 自证会变红:把 `style_for` 里非焦点那一支改成跟焦点一样走 `from_shape`。
+    #[test]
+    fn unfocused_pane_is_always_hollow_regardless_of_remote_shape() {
+        for shape in [
+            CursorShape::Beam,
+            CursorShape::Block,
+            CursorShape::Underline,
+            CursorShape::Hidden,
+        ] {
+            assert_eq!(
+                style_for(shape, false, true),
+                CursorStyle::Hollow,
+                "{shape:?} 在非焦点 pane 上必须是空心框"
+            );
+        }
+    }
+
+    /// F125:焦点 pane 上,闪烁到「灭」的那半周期不画光标;非焦点 pane 不受影响
+    /// (它本来就不闪,`blink_on` 传什么都是空心框)。
+    ///
+    /// 自证会变红:把 `style_for` 里 `if !blink_on` 那一支删掉。
+    #[test]
+    fn blink_off_hides_only_the_focused_cursor() {
+        assert_eq!(style_for(CursorShape::Beam, true, false), CursorStyle::None);
+        assert_eq!(
+            style_for(CursorShape::Beam, false, false),
+            CursorStyle::Hollow
         );
     }
 
@@ -866,7 +1022,7 @@ mod tests {
             snap: &snap,
             focused: true,
         }];
-        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default());
+        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert_eq!(quads.len(), 1);
         assert_eq!(
             quads[0],
@@ -916,14 +1072,14 @@ mod tests {
                 geom: geom(1, 0),
                 snap: &a,
                 focused: true,
-            }, // Block,term_px = x:0..1
+            }, // Bar(shape=Beam,焦点),term_px = x:0..1
             PaneRender {
                 geom: geom(2, 2),
                 snap: &b,
                 focused: false,
-            }, // Hollow,term_px = x:2..3
+            }, // Hollow(非焦点),term_px = x:2..3
         ];
-        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default());
+        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert!(!quads.is_empty());
         for q in &quads {
             let (left, right) = if q.x < 2.0 { (0.0, 1.0) } else { (2.0, 3.0) };
@@ -969,7 +1125,7 @@ mod tests {
             snap: &snap,
             focused: true,
         }];
-        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default());
+        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert_eq!(quads.len(), 1);
         assert_eq!(
             quads[0],
@@ -1020,14 +1176,14 @@ mod tests {
                 geom: geom(1, 0),
                 snap: &a,
                 focused: true,
-            }, // Block,term_px = y:0..1
+            }, // Bar(shape=Beam,焦点),term_px = y:0..1
             PaneRender {
                 geom: geom(2, 2),
                 snap: &b,
                 focused: false,
-            }, // Hollow,term_px = y:2..3
+            }, // Hollow(非焦点),term_px = y:2..3
         ];
-        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default());
+        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert!(!quads.is_empty());
         for q in &quads {
             let (top, bottom) = if q.y < 2.0 { (0.0, 1.0) } else { (2.0, 3.0) };
@@ -1074,7 +1230,7 @@ mod tests {
             snap: &snap,
             focused: true,
         }];
-        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default());
+        let quads = quads_for_panes(&panes, 10.0, 20.0, DefaultColors::default(), true);
         assert!(
             quads.is_empty(),
             "term_px.w=0 时 bg quad 应被整体丢弃(clamp 后 w<=0),不应留下退化 quad: {quads:?}"
