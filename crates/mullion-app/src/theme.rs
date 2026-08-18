@@ -79,6 +79,24 @@ pub struct Theme {
     /// Windows 系统红 #e81123,用作大面积底色太刺眼;两者不互相替代。
     pub danger_soft: Rgb,
 
+    // --- F127 文件类型图标色(§2.3 的延伸) ---
+    /// 目录:蓝。与 `accent`(偏紫)刻意拉开,不然选中行的强调色和图标糊在一起。
+    pub icon_dir: Rgb,
+    /// 归档:橙。
+    pub icon_archive: Rgb,
+    /// 图片:绿。
+    pub icon_image: Rgb,
+    /// 代码:紫。
+    pub icon_code: Rgb,
+    /// 文档:灰蓝(最"安静"的一类,因为它最多)。
+    pub icon_doc: Rgb,
+    /// 可执行:黄。
+    pub icon_exec: Rgb,
+    /// 符号链接:青。
+    pub icon_link: Rgb,
+    /// 其他:中性灰。
+    pub icon_other: Rgb,
+
     // --- 终端色(§2.4) ---
     pub term_bg: Rgb,
     pub term_fg: Rgb,
@@ -113,6 +131,17 @@ pub const MULLION_DARK: Theme = Theme {
     info: Rgb::new(0x7c, 0x9e, 0xff),
     danger: Rgb::new(0xe8, 0x11, 0x23),
     danger_soft: Rgb::new(0xe0, 0x67, 0x67),
+
+    icon_dir: Rgb::new(0x6f, 0xa8, 0xff),
+    icon_archive: Rgb::new(0xe0, 0x9a, 0x4a),
+    icon_image: Rgb::new(0x5f, 0xc2, 0x8a),
+    icon_code: Rgb::new(0xb0, 0x8c, 0xff),
+    icon_doc: Rgb::new(0x9a, 0xa8, 0xc4),
+    icon_exec: Rgb::new(0xd8, 0xc0, 0x52),
+    icon_link: Rgb::new(0x58, 0xc0, 0xc8),
+    // 比 `fg_dimmer`(0x8a90a8)亮一档:两者同值的话,「可操作的 other」
+    // 和「不可操作的 other」在屏上一模一样,`color_for` 的灰化就失效了。
+    icon_other: Rgb::new(0xa8, 0xae, 0xc4),
 
     // 与 panel_bg 同值:终端就是最大的那块 panel。
     term_bg: Rgb::new(0x14, 0x16, 0x1f),
@@ -568,6 +597,48 @@ mod tests {
             "RichText 没带颜色 = 走 egui fallback = 对比度原样偏低"
         );
         assert_eq!(color, c32(MULLION_DARK.fg_dimmer));
+    }
+
+    /// F127:8 类图标色在面板底色上必须达到 WCAG 1.4.11 的非文本对比度 3:1,
+    /// 否则「颜色区分类型」这件事对暗色主题下的细线条图标不成立。
+    /// 阈值与写法同 F62 的会话语义色。
+    #[test]
+    fn file_icon_colors_are_visible_on_the_panel() {
+        let t = MULLION_DARK;
+        for (name, c) in [
+            ("dir", t.icon_dir),
+            ("archive", t.icon_archive),
+            ("image", t.icon_image),
+            ("code", t.icon_code),
+            ("doc", t.icon_doc),
+            ("exec", t.icon_exec),
+            ("link", t.icon_link),
+            ("other", t.icon_other),
+        ] {
+            let ratio = contrast_ratio(c, t.panel_bg);
+            assert!(ratio >= 3.0, "{name} 在面板底上只有 {ratio:.2}:1");
+        }
+    }
+
+    /// F127:8 类颜色必须两两不同 —— 两类同色等于少一类。
+    #[test]
+    fn file_icon_colors_are_all_distinct() {
+        let t = MULLION_DARK;
+        let all = [
+            t.icon_dir,
+            t.icon_archive,
+            t.icon_image,
+            t.icon_code,
+            t.icon_doc,
+            t.icon_exec,
+            t.icon_link,
+            t.icon_other,
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "第 {i} 类和第 {j} 类同色");
+            }
+        }
     }
 
     /// ③:分界线要「不干扰视觉重点,但也不能忽略」。
