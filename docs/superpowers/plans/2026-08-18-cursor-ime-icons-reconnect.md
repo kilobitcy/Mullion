@@ -1915,9 +1915,10 @@ rx 永远不关,pump 里的 Disconnected 分支永远不触发。"
     /// `RxClosed::Reconnect`。
     #[test]
     fn a_closed_rx_means_reconnect_only_if_the_transport_died() {
-        assert_eq!(rx_closed_action(true), RxClosed::Reconnect, "链路死了");
+        // 入参是「连接是否还活着」(`transport_alive`),别把两边写反了。
+        assert_eq!(rx_closed_action(false), RxClosed::Reconnect, "链路死了");
         assert_eq!(
-            rx_closed_action(false),
+            rx_closed_action(true),
             RxClosed::UserExited,
             "连接还活着 = 远端 shell 自己退了,不许重连"
         );
