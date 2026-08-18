@@ -9541,10 +9541,14 @@ mod tests {
         use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
         let (mut ws, _p) = ws_with(1);
         let gen = ws.generation();
-        ws.pane_mut(PaneId(1))
-            .unwrap()
-            .emulator
-            .feed(b"before-the-drop");
+        let p = ws.pane_mut(PaneId(1)).unwrap();
+        p.emulator.feed(b"before-the-drop");
+        // F128:**起始状态必须是 `Reconnecting`** —— 起始就是 `Live` 的话,
+        // 下面那条 `status == Live` 的断言把 `swap_pane_channel` 里的
+        // `p.status = Live` 删掉也照样绿(终态碰巧没变),等于没守护。
+        // 而这一条恰恰是重连最关键的一步:不置回 Live,重连成功了标题条
+        // 还一直黄着、Ctrl+D 还按「断开」那套语义走。
+        p.status = crate::shell::workspace::PaneStatus::Reconnecting;
         let (pty, rx) = fresh_pipe();
         assert!(reattach_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
         let text: String = ws
