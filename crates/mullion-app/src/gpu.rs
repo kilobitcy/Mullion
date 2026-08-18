@@ -463,7 +463,7 @@ mod tests {
     use super::*;
     use crate::shell::workspace::PxRect;
     use mullion_term::palette::DefaultColors;
-    use mullion_term::snapshot::{Cursor, Rgb, SnapCell};
+    use mullion_term::snapshot::{Cursor, CursorShape, Rgb, SnapCell};
 
     fn snap_1x1(bg: Rgb) -> GridSnapshot {
         GridSnapshot {
@@ -481,6 +481,8 @@ mod tests {
                 row: 0,
                 col: 0,
                 visible: false,
+                shape: CursorShape::Beam,
+                blinking: true,
             },
         }
     }
@@ -577,6 +579,8 @@ mod tests {
                 row: 0,
                 col: 0,
                 visible: false,
+                shape: CursorShape::Beam,
+                blinking: true,
             },
         }
     }
@@ -626,6 +630,8 @@ mod tests {
             row: 0,
             col: 0,
             visible: true,
+            shape: CursorShape::Beam,
+            blinking: true,
         };
         let quads = quads_for(
             &snap,
