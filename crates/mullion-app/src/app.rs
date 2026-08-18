@@ -1248,6 +1248,12 @@ pub struct App {
     /// 被 `RedrawAction::Throttle` 挡住时记的到点时刻;`about_to_wait` 据此在
     /// deadline 到达后补一次 `request_redraw`,而不是靠陈旧 `WaitUntil` 忙转(T3/N3)。
     next_frame_at: Option<Instant>,
+    /// F125:最后一次**键盘输入**的时刻,光标闪烁相位从它起算(打字重置相位)。
+    /// 用 `Instant` 而不是 `u64`:与 `next_frame_at`/`sync_timeout_wake` 同一套时钟。
+    last_input_at: Instant,
+    /// F125:窗口有没有焦点。失焦时不闪(也就不需要周期唤醒),与 Windows 上
+    /// 其它终端的惯例一致。
+    window_focused: bool,
     /// 唤醒/连接结果回送通道(注入 `session::connect` 的 wake,以及本身发 UserEvent)。
     proxy: EventLoopProxy<UserEvent>,
     /// 已知主机指纹表(F3),对应磁盘 `known_hosts.toml`。SSH 线程只读它做判断;
@@ -1530,6 +1536,8 @@ impl App {
             active: None,
             limiter: FrameLimiter::new(16), // ~60fps(T3)
             next_frame_at: None,
+            last_input_at: Instant::now(),
+            window_focused: true,
             proxy,
             known_hosts,
             pending_host_key: None,
@@ -2215,6 +2223,46 @@ impl App {
     /// `holding_deadline_ms` 天然不再返回同一个过去的时刻,不会重复排期。
     fn sync_timeout_wake(&self, now_ms: u64) -> Option<Instant> {
         sync_timeout_wake_at(self.start, self.active_ws(), now_ms)
+    }
+
+    /// F125:这一帧光标该不该画出来。失焦时恒 `true`(不闪,常显)——
+    /// 焦点 pane 在失焦状态下由 `style_for` 收到 `focused=false`,画成空心框。
+    fn blink_on(&self, now: Instant) -> bool {
+        if !self.window_focused {
+            return true;
+        }
+        let elapsed = now
+            .saturating_duration_since(self.last_input_at)
+            .as_millis() as u64;
+        crate::frame::blink_visible(elapsed, 0)
+    }
+
+    /// F125:下一次光标相位翻转的时刻。`None` = 这一刻不需要为闪烁排唤醒
+    /// (窗口失焦 / 没有终端在前台)。
+    fn blink_wake(&self, now: Instant) -> Option<Instant> {
+        if !self.window_focused || self.active_ws().is_none() {
+            return None;
+        }
+        let elapsed = now
+            .saturating_duration_since(self.last_input_at)
+            .as_millis() as u64;
+        let ms = crate::frame::blink_next_flip_ms(elapsed, 0);
+        Some(now + std::time::Duration::from_millis(ms))
+    }
+
+    /// 所有「定时唤醒源」的汇合点:取最早的那个。**新增定时源一律加在这里**,
+    /// 各自排各自的 `WaitUntil` 会互相覆盖(后写的赢),症状是某个定时行为
+    /// 时灵时不灵。
+    ///
+    /// `now` 与两处调用点手里的 `now_ms`(`self.now_ms()`,自 `self.start` 起算
+    /// 的毫秒数)同源;`blink_wake` 要的是 `Instant`,这里用 `self.start +
+    /// Duration::from_millis(now)` 换算回去——与 `now_ms()` 互为逆运算,不引入漂移。
+    fn next_timer_wake(&self, now: u64) -> Option<Instant> {
+        let blink_now = self.start + std::time::Duration::from_millis(now);
+        [self.sync_timeout_wake(now), self.blink_wake(blink_now)]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// 有没有模态盖着。分流(§4.5)与标签快捷键共用同一个判据 —— 两处各写一遍
@@ -5663,6 +5711,8 @@ impl ApplicationHandler<UserEvent> for App {
             // 重绘,避免停在陈旧/空白帧(此前这些事件落 `_ => {}`,不重绘也不留痕)。
             WindowEvent::Focused(focused) => {
                 crate::logx::line(&format!("Focused({focused})"));
+                // F125:失焦不闪,省掉后台窗口的周期唤醒。
+                self.window_focused = focused;
                 if focused {
                     self.recheck_visibility();
                     self.request_ui_redraw();
@@ -5802,6 +5852,8 @@ impl ApplicationHandler<UserEvent> for App {
                     winit::event::Ime::Preedit(text, _) => self.ime.on_preedit(text),
                     winit::event::Ime::Commit(text) => {
                         self.ime.on_commit();
+                        // F125:输入法提交也是输入,重置闪烁相位。
+                        self.last_input_at = Instant::now();
                         // 组字结果按用户输入对待:先回底部(否则「打了但看不到」,
                         // 与按键/粘贴同一条口径),再写焦点 pane。
                         if let Some(bytes) = input::ime_commit_bytes(text) {
@@ -5828,6 +5880,8 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if event.state == ElementState::Pressed {
+                    // F125:打字重置闪烁相位,保证「刚敲完光标一定是亮的」。
+                    self.last_input_at = Instant::now();
                     if let Some((key, mods)) = input::translate_key(&event, self.mods) {
                         // F18:`Ctrl+Shift+C/V` 必须在 `encode_key` 之前截住。
                         // Ctrl+C 会被编码成 `0x03`(SIGINT)——漏下去就是「想复制
@@ -6274,6 +6328,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 files_focused: self.effective_focus()
                                     == shell::input_route::Focus::FilesPanel,
                             };
+                            // F125:光标该不该画,得在借出 `self.active` 之前算——
+                            // `blink_on` 要读 `self.window_focused`/`self.last_input_at`/
+                            // `self.active_ws()`,这几个都是 `&self` 方法,借用会跟下面
+                            // `self.active.as_mut()` 冲突。
+                            let blink_on = self.blink_on(Instant::now());
                             let a = self.active.as_mut().expect("上面刚判过 is_some");
                             // D1:两种宿主互斥(见上面 `files_owner_generation`
                             // 的说明),`taken_files` 只会有其中一份非空数据 ——
@@ -6295,6 +6354,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 &self.transfer_queue,
                                 &self.edits,
                                 &mut self.editor,
+                                blink_on,
                             );
                             drop(renders);
                             drop(titles);
@@ -6611,10 +6671,11 @@ impl ApplicationHandler<UserEvent> for App {
                                     + std::time::Duration::from_millis(TRANSFER_UI_INTERVAL_MS);
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
-                            } else if let Some(at) = self.sync_timeout_wake(now) {
-                                // Important #2/T2:egui 这帧不需要重绘,但有 pane 卡在
-                                // 未超时的同步块里——主动排一次到超时点的唤醒,而不是
-                                // 无条件 Wait 等下一个不相关事件顺带救回冻住的画面。
+                            } else if let Some(at) = self.next_timer_wake(now) {
+                                // Important #2/T2/F125:egui 这帧不需要重绘,但有 pane 卡在
+                                // 未超时的同步块里,或者光标该翻转相位了——经
+                                // `next_timer_wake` 统一汇合,主动排一次到最早那个
+                                // 时刻的唤醒,而不是无条件 Wait 等不相关事件顺带救回。
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                             } else {
@@ -6632,8 +6693,9 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                     }
                     RedrawAction::Idle => {
-                        // Important #2/T2:同上——没有脏帧不代表没有 pane 卡在同步块里。
-                        if let Some(at) = self.sync_timeout_wake(now) {
+                        // Important #2/T2/F125:同上——没有脏帧不代表没有 pane 卡在同步
+                        // 块里,也不代表光标不需要翻转相位。
+                        if let Some(at) = self.next_timer_wake(now) {
                             self.next_frame_at = Some(at);
                             event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                         } else {
@@ -7850,6 +7912,10 @@ fn render_frame(
     // F53:在编辑的那些文件 + 内置编辑器窗口,转给 `build_ui`。
     edits: &crate::edit::sessions::EditSessions,
     editor: &mut Option<crate::ui::editor_window::EditorState>,
+    // F125:这一帧光标该不该画出来(闪烁相位),调用方 `App::window_event` 算好了
+    // 原样转给 `quads_for_panes`——算这个要读 `self.window_focused`/
+    // `self.last_input_at`,那两个字段在这里(`Active` 而非 `App`)够不着。
+    blink_on: bool,
 ) -> (std::time::Duration, crate::ui::UiActions) {
     diag::count_frame();
     // --- egui:每帧都跑,launcher 态(panes 为空)也要画菜单/状态栏。---
@@ -7943,7 +8009,7 @@ fn render_frame(
             a.text.cell_w,
             a.text.cell_h,
             theme::term_default_colors(&MULLION_DARK),
-            true, // TODO(Task 4): 接真实 blink_on,事件循环排 WaitUntil
+            blink_on,
         );
         // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
         // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。
@@ -9112,6 +9178,47 @@ mod tests {
             sync_timeout_wake_at(start, Some(&ws), 0),
             None,
             "收口后还在排唤醒 = 忙转"
+        );
+    }
+
+    /// **接线守护 / F125**:闪烁的下一次唤醒必须并进既有的「定时唤醒」判据,
+    /// 而不是各自为政 —— 两个定时源各排各的,后写的那个会把先写的覆盖掉,
+    /// 症状是「光标闪起来之后同步块超时不再收口」(T2 复发)。
+    ///
+    /// 自证会变红:把 `next_timer_wake` 的函数体改成只 `self.sync_timeout_wake(now)`。
+    #[test]
+    fn timer_wakeups_are_merged_in_one_place() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("    fn next_timer_wake(")
+            .nth(1)
+            .expect("找不到 next_timer_wake 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            body.contains("self.sync_timeout_wake(now)"),
+            "定时唤醒没并进同步块超时 —— T2 会复发"
+        );
+        assert!(
+            body.contains("self.blink_wake("),
+            "定时唤醒没并进光标闪烁 —— 光标只会在别的事件顺带唤醒时才翻转"
+        );
+    }
+
+    /// **接线守护 / F125**:闪烁只许排 `WaitUntil`,不许 `request_redraw`。
+    /// 后者绕开帧闸,是 T3(GPU 空转)/T7(100% CPU 忙转)的直接触发方式。
+    ///
+    /// 自证会变红:在 `blink_wake` 里加一句 `self.request_ui_redraw();`。
+    #[test]
+    fn blink_never_forces_a_redraw() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("    fn blink_wake(")
+            .nth(1)
+            .expect("找不到 blink_wake 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            !body.contains("request_redraw"),
+            "闪烁不许直接请求重绘,只能排 WaitUntil(T3/T7)"
         );
     }
 
