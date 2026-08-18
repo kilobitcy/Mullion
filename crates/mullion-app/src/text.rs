@@ -67,7 +67,17 @@ fn advance_is_cell_wide(cell: &SnapCell) -> bool {
 /// 全空白且未选中的 run 直接丢掉:刚连上时满屏是空格,不剪的话一行要建几十个
 /// 什么都不画的 buffer(T3)。选中的空白**必须**留着 —— 它的字色被反成了 bg,
 /// 丢掉会让选区里的空格露出底色块上的原字色,看起来像"选区里有洞"。
-pub fn row_to_runs(cells: &[SnapCell]) -> Vec<RowRun> {
+///
+/// `hidden`:F126 组字期间,preedit 覆盖的 `[起列, 止列)` 区间要让正文完全不
+/// 出字形——**quad 批先画、文字批后画**,`gpu::preedit_quads` 铺的背景 quad
+/// 只盖得住已经画完的 quad 层,盖不住排在它后面的文字层;真正让原字符消失
+/// 的必须是文字层自己不产出那几列的字形。区间内的格按「整字丢弃」处理(不是
+/// 「按空格填充」——填空格会让一个 run 保持完整但中间夹着不可见字符,读起来
+/// 正确,但语义上仍是"这一列有 run 覆盖",不如直接断开、语义对齐渲染顺序更
+/// 直白),这会把跨区间的 run 自然劈成两段。宽字符只要有一列落在区间内就整字
+/// 都不画(半个宽字是花屏),用**列区间重叠**判定而不是单列包含,这样宽字左
+/// 半未被区间直接命中、但右半(spacer 对应的那一列)被命中时,仍能整字剔除。
+pub fn row_to_runs(cells: &[SnapCell], hidden: Option<(u16, u16)>) -> Vec<RowRun> {
     let mut runs: Vec<RowRun> = Vec::new();
     // 当前正在攒的 run:(起始列, 该 run 覆盖的格)。
     let mut open: Option<(u16, Vec<SnapCell>)> = None;
@@ -91,6 +101,14 @@ pub fn row_to_runs(cells: &[SnapCell]) -> Vec<RowRun> {
             continue; // 宽字符右半:字形已由左格承载,也不该另起一列
         }
         let col = ix as u16;
+        if let Some((h0, h1)) = hidden {
+            // 与 `cell.width` 同一套宽度判据(不新起一套),区间重叠即整字剔除。
+            let w = u16::from(cell.width.max(1));
+            if col < h1 && col + w > h0 {
+                flush(&mut open, &mut runs); // 断开当前 run,这一格不产出字形
+                continue;
+            }
+        }
         if advance_is_cell_wide(cell) {
             match open.as_mut() {
                 Some((_, group)) => group.push(*cell),
@@ -149,6 +167,18 @@ pub fn preedit_cursor_col(cols: u16, cursor_col: u16, text: &str) -> u16 {
         Some(c) => c.col + u16::from(c.width),
         None => cursor_col,
     }
+}
+
+/// F126:preedit 串占据的列区间 `[起列, 止列)`——止列是最后一格的
+/// `col + width`。空串返回 `None`。
+///
+/// 喂给 `row_to_runs` 的 `hidden` 参数,让正文文字层在这个区间让路——
+/// 否则组字位置不在行尾时,拼音会跟原字符的字形叠在同一批 buffer 里,
+/// 背景 quad(先画)盖不住排在它后面的文字层。
+pub fn preedit_span(cells: &[PreeditCell]) -> Option<(u16, u16)> {
+    let first = cells.first()?;
+    let last = cells.last()?;
+    Some((first.col, last.col + u16::from(last.width)))
 }
 
 use crate::gpu::PaneRender;
@@ -318,8 +348,24 @@ impl TextLayer {
         let (cell_w, cell_h) = (self.cell_w, self.cell_h);
         let mut n = 0usize;
         for (pi, p) in panes.iter().enumerate() {
+            // F126:组字中的拼音串占的列区间只在光标行生效——正文 run 要在这
+            // 个区间让路(见 `row_to_runs` 的 `hidden` 参数文档),不然背景
+            // quad 盖不住排在它后面的文字层,拼音会和原字符的字形叠在一起。
+            // preedit 为空时 `preedit_cells` 是空 `Vec`(不分配堆内存),
+            // `preedit_span` 对空切片返回 `None`,不组字的帧不多做任何事(T3)。
+            let preedit_cells = if !p.preedit.is_empty() && p.snap.cursor.visible {
+                preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit)
+            } else {
+                Vec::new()
+            };
+            let preedit_hidden = preedit_span(&preedit_cells);
             for row in 0..p.snap.rows {
-                for run in row_to_runs(p.snap.row(row)) {
+                let hidden = if row == p.snap.cursor.row {
+                    preedit_hidden
+                } else {
+                    None
+                };
+                for run in row_to_runs(p.snap.row(row), hidden) {
                     if n == bufs.len() {
                         bufs.push(Buffer::new(fs, metrics));
                     }
@@ -346,33 +392,32 @@ impl TextLayer {
             }
             // F126:组字中的拼音串。用与正文同一套 buffer 池,颜色取默认前景色
             // (它盖在自己铺的默认背景上,不跟随底下那格原本的 SGR 颜色 ——
-            // 那格颜色可能恰好等于背景色,拼音就隐形了)。
-            if !p.preedit.is_empty() && p.snap.cursor.visible {
-                for c in crate::text::preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit) {
-                    if n == bufs.len() {
-                        bufs.push(Buffer::new(fs, metrics));
-                    }
-                    let buf = &mut bufs[n];
-                    buf.set_metrics(fs, metrics);
-                    let avail = p
-                        .geom
-                        .term_px
-                        .w
-                        .saturating_sub((f32::from(c.col) * cell_w) as u32)
-                        .max(1) as f32;
-                    buf.set_size(fs, Some(avail), Some(cell_h));
-                    let s = c.ch.to_string();
-                    let color = to_color(preedit_fg);
-                    buf.set_rich_text(
-                        fs,
-                        [(s.as_str(), attrs.color(color))],
-                        attrs,
-                        Shaping::Advanced,
-                    );
-                    buf.shape_until_scroll(fs, false);
-                    placements.push((pi, p.snap.cursor.row, c.col));
-                    n += 1;
+            // 那格颜色可能恰好等于背景色,拼音就隐形了)。复用上面已经算好的
+            // `preedit_cells`,不重复调用 `preedit_layout`。
+            for c in &preedit_cells {
+                if n == bufs.len() {
+                    bufs.push(Buffer::new(fs, metrics));
                 }
+                let buf = &mut bufs[n];
+                buf.set_metrics(fs, metrics);
+                let avail = p
+                    .geom
+                    .term_px
+                    .w
+                    .saturating_sub((f32::from(c.col) * cell_w) as u32)
+                    .max(1) as f32;
+                buf.set_size(fs, Some(avail), Some(cell_h));
+                let s = c.ch.to_string();
+                let color = to_color(preedit_fg);
+                buf.set_rich_text(
+                    fs,
+                    [(s.as_str(), attrs.color(color))],
+                    attrs,
+                    Shaping::Advanced,
+                );
+                buf.shape_until_scroll(fs, false);
+                placements.push((pi, p.snap.cursor.row, c.col));
+                n += 1;
             }
         }
         // 池子里多出来的必须砍掉:留着的话上一帧的字会被下面第二遍以外的
@@ -599,7 +644,7 @@ mod tests {
             cell(' ', w, true),
             cell('x', w, false),
         ];
-        let runs = row_to_runs(&row);
+        let runs = row_to_runs(&row, None);
         let cols: Vec<u16> = runs.iter().map(|r| r.col).collect();
         let texts: Vec<String> = runs
             .iter()
@@ -621,7 +666,7 @@ mod tests {
     fn a_plain_ascii_line_is_still_a_single_run() {
         let w = Rgb::new(0xcc, 0xcc, 0xcc);
         let row: Vec<SnapCell> = "hello world".chars().map(|c| cell(c, w, false)).collect();
-        let runs = row_to_runs(&row);
+        let runs = row_to_runs(&row, None);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].col, 0);
     }
@@ -634,7 +679,7 @@ mod tests {
     fn runs_still_split_spans_by_color() {
         let white = Rgb::new(0xcc, 0xcc, 0xcc);
         let red = Rgb::new(205, 0, 0);
-        let runs = row_to_runs(&[cell('a', white, false), cell('b', red, false)]);
+        let runs = row_to_runs(&[cell('a', white, false), cell('b', red, false)], None);
         assert_eq!(runs.len(), 1, "同为 ASCII,仍是一个 run");
         assert_eq!(runs[0].spans.len(), 2, "run 内部要按颜色切成两段");
         assert_eq!(runs[0].spans[0].1, to_color(white));
@@ -653,7 +698,7 @@ mod tests {
             cell('中', w, false),
             cell(' ', w, true),
         ];
-        let cols: Vec<u16> = row_to_runs(&row).iter().map(|r| r.col).collect();
+        let cols: Vec<u16> = row_to_runs(&row, None).iter().map(|r| r.col).collect();
         assert_eq!(cols, vec![0, 2]);
     }
 
@@ -665,7 +710,7 @@ mod tests {
     fn a_blank_line_produces_no_runs() {
         let w = Rgb::new(0xcc, 0xcc, 0xcc);
         let row: Vec<SnapCell> = std::iter::repeat_n(cell(' ', w, false), 80).collect();
-        assert!(row_to_runs(&row).is_empty());
+        assert!(row_to_runs(&row, None).is_empty());
     }
 
     /// 选中的空白格**必须**保留 —— 它的字色被反成了 bg,底色那趟也画了反色块;
@@ -684,7 +729,66 @@ mod tests {
             spacer: false,
             selected: true,
         }];
-        assert_eq!(row_to_runs(&row).len(), 1);
+        assert_eq!(row_to_runs(&row, None).len(), 1);
+    }
+
+    /// F126(spec 复核挖出的真 bug):`hidden` 区间要让正文 run 完全让路,
+    /// 不能只是"背景 quad 盖住"——quad 批先画、文字批后画,背景 quad 盖不住
+    /// 排在它后面的原字符字形。`abcdef` 隐藏 `[2, 4)` 应该劈成两段:
+    /// 第 0-1 列("ab")与第 4-5 列("ef"),第 2、3 列不产出任何字形。
+    ///
+    /// 自证会变红:把 `row_to_runs` 里 `if let Some((h0, h1)) = hidden` 这整段
+    /// 判断删掉(等价于永远不传 `hidden`)——`row_to_runs` 会把 `abcdef` 排成
+    /// 一个不劈段的 run,`texts` 就是 `["abcdef"]` 而不是 `["ab", "ef"]`。
+    #[test]
+    fn hidden_span_splits_a_run_and_drops_the_covered_columns() {
+        let w = Rgb::new(0xcc, 0xcc, 0xcc);
+        let row: Vec<SnapCell> = "abcdef".chars().map(|c| cell(c, w, false)).collect();
+        let runs = row_to_runs(&row, Some((2, 4)));
+        let cols: Vec<u16> = runs.iter().map(|r| r.col).collect();
+        let texts: Vec<String> = runs
+            .iter()
+            .map(|r| r.spans.iter().map(|(s, _)| s.as_str()).collect())
+            .collect();
+        assert_eq!(cols, vec![0, 4], "被隐藏区间劈成两段,第二段从第 4 列起");
+        assert_eq!(texts, vec!["ab", "ef"], "第 2、3 列不产出任何字形");
+    }
+
+    /// F126:宽字符只要有一列落在隐藏区间内就整字都不画,不能只切掉半个字
+    /// (半个宽字是花屏)。'中' 占第 2、3 两列(spacer 在第 3 列)。
+    ///
+    /// - 隐藏区间 `[2, 4)`(整字都在区间内):整字消失。
+    /// - 隐藏区间 `[3, 4)`(只覆盖 spacer 那一列,即宽字的右半):约定按同一条
+    ///   "列区间重叠即整字剔除" 判据处理——只要重叠就剔除整字,不单独为
+    ///   "只压中右半" 开一条特例分支(特例分支等于又长出一套宽度判据,
+    ///   与 `preedit_layout`"半个汉字是花屏"的口径不一致)。
+    ///
+    /// 自证会变红:把重叠判据 `col < h1 && col + w > h0` 改成单列包含判据
+    /// `col >= h0 && col < h1`——那样 `[3, 4)` 命中不了宽字的主格(col=2),
+    /// 宽字的左半会被当作没受影响、继续画出来,右半的 spacer 本来就不产字形,
+    /// 表面上看不出错,但换成"宽字在 [1,2) 之类只压左半列"的场景就会露出半个
+    /// 宽字。
+    #[test]
+    fn wide_char_is_dropped_whole_when_hidden_span_overlaps_either_half() {
+        let w = Rgb::new(0xcc, 0xcc, 0xcc);
+        let row = [
+            cell('a', w, false),
+            cell('b', w, false),
+            cell('中', w, false),
+            cell(' ', w, true), // spacer:'中' 的右半
+            cell('x', w, false),
+        ];
+        for hidden in [(2, 4), (3, 4)] {
+            let runs = row_to_runs(&row, Some(hidden));
+            let texts: Vec<String> = runs
+                .iter()
+                .flat_map(|r| r.spans.iter().map(|(s, _)| s.clone()))
+                .collect();
+            assert!(
+                !texts.iter().any(|s| s.contains('中')),
+                "隐藏区间 {hidden:?} 与宽字有重叠,'中' 不该出现在任何 run 里: {texts:?}"
+            );
+        }
     }
 
     /// §7.1:每个 pane 的 TextArea 必须裁到**自己的** term_px。
@@ -853,5 +957,21 @@ mod tests {
         assert_eq!(preedit_cursor_col(20, 0, "你a"), 3);
         assert_eq!(preedit_cursor_col(5, 3, "abcde"), 5, "截断后停在行尾");
         assert_eq!(preedit_cursor_col(20, 7, ""), 7, "没在组字就是原位");
+    }
+
+    /// F126:`preedit_span` 是喂给 `row_to_runs` 的 `hidden` 区间的唯一来源。
+    /// 空 cells(没在组字)必须是 `None`,不能是 `Some((0,0))` 那种退化区间 ——
+    /// `hidden` 的重叠判据 `col < h1 && ...` 对 `(0,0)` 恰好永远不重叠,退化区间
+    /// 不会露出可见 bug,但语义上是错的,留着会在未来改判据时变成隐患。
+    ///
+    /// 自证会变红:把 `preedit_span` 的 `?` 提前返回删掉,换成
+    /// `cells.first().map(...).unwrap_or_default()`。
+    #[test]
+    fn preedit_span_covers_first_to_last_and_is_none_when_empty() {
+        assert_eq!(preedit_span(&[]), None, "没在组字时不该有隐藏区间");
+        let cells = preedit_layout(20, 3, "abc");
+        assert_eq!(preedit_span(&cells), Some((3, 6)));
+        let wide = preedit_layout(20, 0, "你a");
+        assert_eq!(preedit_span(&wide), Some((0, 3)), "宽字占两格,止列要算上它");
     }
 }
