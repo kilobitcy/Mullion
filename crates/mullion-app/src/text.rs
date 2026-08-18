@@ -107,6 +107,50 @@ pub fn row_to_runs(cells: &[SnapCell]) -> Vec<RowRun> {
     runs
 }
 
+/// F126:preedit 串里的一格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreeditCell {
+    /// 0-based 列号(终端网格)。
+    pub col: u16,
+    pub ch: char,
+    /// 显示宽度:CJK = 2,其余 = 1。
+    pub width: u8,
+}
+
+/// F126:把组字中的拼音串摆到终端网格上,从光标格起。
+///
+/// - 宽字符占两格,与 `SnapCell::width` 同一套判据(`unicode-width`),
+///   不另起一套 —— 底色/下划线是按格子画的,两套宽度判据会当场错位。
+/// - **超出行尾直接截断**,不折行:preedit 是纯覆盖层,不该有改动行内容布局的权力。
+/// - 宽字符跨不过行尾时整个丢掉,不画左半(半个汉字是花屏)。
+pub fn preedit_layout(cols: u16, cursor_col: u16, text: &str) -> Vec<PreeditCell> {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = Vec::new();
+    let mut col = cursor_col;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0).clamp(1, 2) as u16;
+        if col + w > cols {
+            break;
+        }
+        out.push(PreeditCell {
+            col,
+            ch,
+            width: w as u8,
+        });
+        col += w;
+    }
+    out
+}
+
+/// F126:组字期间光标该画在哪一列 —— 拼音串**末尾**(已拍板)。
+/// 空串(没在组字)时就是原位。
+pub fn preedit_cursor_col(cols: u16, cursor_col: u16, text: &str) -> u16 {
+    match preedit_layout(cols, cursor_col, text).last() {
+        Some(c) => c.col + u16::from(c.width),
+        None => cursor_col,
+    }
+}
+
 use crate::gpu::PaneRender;
 use crate::shell::workspace::PxRect;
 use glyphon::{
@@ -729,5 +773,54 @@ mod tests {
              `grid_metrics` 内部那一次 —— 别的地方直接构造 Metrics 就绕开了\
              唯一来源,排版字号和 cell_w 会再次不同源"
         );
+    }
+
+    /// F126:拼音串从光标格开始逐格摆,ASCII 一格一个。
+    #[test]
+    fn preedit_starts_at_the_cursor_cell() {
+        let cells = preedit_layout(20, 3, "abc");
+        assert_eq!(cells.len(), 3);
+        assert_eq!((cells[0].col, cells[0].ch, cells[0].width), (3, 'a', 1));
+        assert_eq!((cells[2].col, cells[2].ch, cells[2].width), (5, 'c', 1));
+    }
+
+    /// F126:已转换出的汉字占两格 —— 按一格摆的话,后面的字会左移,
+    /// 而底色/下划线是按格子画的,两套定位当场分家。
+    ///
+    /// 自证会变红:把 `preedit_layout` 里的宽度改成恒 1。
+    #[test]
+    fn wide_chars_take_two_cells() {
+        let cells = preedit_layout(20, 0, "你a");
+        assert_eq!((cells[0].col, cells[0].width), (0, 2));
+        assert_eq!((cells[1].col, cells[1].width), (2, 1), "汉字之后让开两格");
+    }
+
+    /// F126:超出行尾直接截断,不折行 —— preedit 是纯覆盖层,不该有改行内容
+    /// 布局的权力。
+    ///
+    /// 自证会变红:把截断判据 `col + w > cols` 改成 `col > cols`。
+    #[test]
+    fn preedit_is_truncated_at_the_line_end() {
+        let cells = preedit_layout(5, 3, "abcde");
+        assert_eq!(cells.len(), 2, "只放得下两格");
+        assert_eq!(cells.last().unwrap().col, 4);
+    }
+
+    /// F126:宽字符跨不过行尾时整个丢掉,不能只画左半 —— 半个汉字是花屏。
+    #[test]
+    fn a_wide_char_that_does_not_fit_is_dropped_whole() {
+        let cells = preedit_layout(5, 4, "你");
+        assert!(cells.is_empty(), "第 4 列放不下两格宽的字");
+    }
+
+    /// F126:光标停在拼音串**末尾**(已拍板)。串放不下时停在最后画出来的那格之后。
+    ///
+    /// 自证会变红:把 `preedit_cursor_col` 改成直接返回 `cursor_col`。
+    #[test]
+    fn cursor_sits_at_the_end_of_the_preedit() {
+        assert_eq!(preedit_cursor_col(20, 3, "abc"), 6);
+        assert_eq!(preedit_cursor_col(20, 0, "你a"), 3);
+        assert_eq!(preedit_cursor_col(5, 3, "abcde"), 5, "截断后停在行尾");
+        assert_eq!(preedit_cursor_col(20, 7, ""), 7, "没在组字就是原位");
     }
 }

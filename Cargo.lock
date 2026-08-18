@@ -2549,6 +2549,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "unicode-width 0.2.2",
  "wgpu",
  "windows 0.59.0",
  "windows-core 0.59.0",
