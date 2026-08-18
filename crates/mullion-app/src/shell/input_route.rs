@@ -10,6 +10,7 @@ pub enum InputKind {
 }
 
 use crate::shell::workspace::PaneStatus;
+use mullion_term::keymap::{Key, Mods};
 
 /// F129:`Ctrl+D` 这一下该干什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,20 @@ pub enum CtrlD {
     ClosePane,
     /// 关掉整个标签(这块是最后一块分屏)。
     CloseTab,
+}
+
+/// F129:这一下按键是不是「裸 Ctrl+D」—— 只有它才轮得到 `ctrl_d_action` 说话。
+///
+/// **必须排掉 `alt`**:Windows 把 AltGr 合成成 Left-Ctrl + Right-Alt,不排的话
+/// 用户在断开的 pane 上用 AltGr 打字就会莫名其妙丢一块分屏(最后一块时是整个
+/// 标签,连自动化和 sftp task 一起收走)。Windows 11 是本项目唯一的一等公民,
+/// 这条必踩。`sup` 一并排掉:Win+D 是系统级「显示桌面」,不该被我们截。
+pub fn is_bare_ctrl_d(key: Key, mods: Mods) -> bool {
+    mods.ctrl
+        && !mods.shift
+        && !mods.alt
+        && !mods.sup
+        && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(&'d'))
 }
 
 /// F129:判据只有两条 —— 这块 pane 还活着吗、它是不是最后一块。
@@ -269,6 +284,58 @@ mod tests {
     fn f6_toggles_focus_between_terminal_and_panel() {
         assert_eq!(Focus::Terminal.toggled(), Focus::FilesPanel);
         assert_eq!(Focus::FilesPanel.toggled(), Focus::Terminal);
+    }
+
+    /// F129:**AltGr 不许被当成 Ctrl+D**。Windows 把 AltGr 合成成
+    /// Left-Ctrl + Right-Alt,所以「按住 Ctrl 且键是 d」这条判据在 Windows 上
+    /// 会被 AltGr+D 命中 —— 而 Windows 11 是本项目唯一的一等公民。
+    /// 后果不是丢一个字符,是丢一块分屏(最后一块时连整个标签一起收走)。
+    ///
+    /// 自证会变红:把 `is_bare_ctrl_d` 里的 `!mods.alt` 删掉。
+    #[test]
+    fn altgr_is_not_ctrl_d_because_windows_synthesizes_it_as_ctrl_plus_alt() {
+        let altgr = Mods {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert!(
+            !is_bare_ctrl_d(Key::Char('d'), altgr),
+            "AltGr+D 被当成了 Ctrl+D —— 用户在断开的 pane 上打字会丢分屏"
+        );
+        let win = Mods {
+            ctrl: true,
+            sup: true,
+            ..Default::default()
+        };
+        assert!(!is_bare_ctrl_d(Key::Char('d'), win));
+    }
+
+    /// F129:裸 Ctrl+D(含大写)要认得出来,别把 `is_bare_ctrl_d` 收得太紧
+    /// 以至于谁都不匹配 —— 那样 F129 整个功能静默失效,上面那条排除测试
+    /// 还是绿的。
+    ///
+    /// 自证会变红:把 `is_bare_ctrl_d` 的函数体改成 `false`。
+    #[test]
+    fn bare_ctrl_d_is_recognized_in_either_case() {
+        let ctrl = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert!(is_bare_ctrl_d(Key::Char('d'), ctrl));
+        assert!(is_bare_ctrl_d(Key::Char('D'), ctrl));
+        // Ctrl+Shift+D 不是它 —— 那一带是 F18 的划选/粘贴热键区。
+        assert!(!is_bare_ctrl_d(
+            Key::Char('d'),
+            Mods {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            }
+        ));
+        // 别的键、以及没按 Ctrl 的 d,都不是。
+        assert!(!is_bare_ctrl_d(Key::Char('c'), ctrl));
+        assert!(!is_bare_ctrl_d(Key::Char('d'), Mods::default()));
     }
 
     /// F129:**活着的 pane 上 Ctrl+D 永远是 EOF**。这个语义不能动 ——

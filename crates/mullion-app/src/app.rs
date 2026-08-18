@@ -6259,10 +6259,9 @@ impl ApplicationHandler<UserEvent> for App {
                         // F129:断开的 pane 上 Ctrl+D 改成「关掉这块分屏」。
                         // 必须在 `encode_key` 之前 —— 它会把 Ctrl+D 编成 0x04,
                         // 漏下去就是往一条死 channel 上写字节(静默失败)。
-                        if mods.ctrl
-                            && !mods.shift
-                            && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(&'d'))
-                        {
+                        // 修饰键判据走纯函数,不在这儿内联 —— 它要排掉 AltGr
+                        // (Windows 合成成 Ctrl+Alt),那条只有单测守得住。
+                        if crate::shell::input_route::is_bare_ctrl_d(key, mods) {
                             let st = self
                                 .active_ws()
                                 .and_then(Workspace::focused)
