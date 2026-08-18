@@ -82,30 +82,41 @@ pub fn translate_text(logical: &WKey, mods: ModifiersState) -> Option<String> {
 /// 三条结束边:`Commit`(选了字)、空 `Preedit`(按 Esc 取消候选)、`Disabled`
 /// (切走输入法 / 失焦)。**少认一条,组字状态就永久挂着,此后一个键都进不了
 /// 终端** —— 与 T8 同一类"输入永久失灵"的故障。
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImeState {
     preediting: bool,
+    /// F126:组字中的拼音串,要画在光标处。三条结束边都必须清空它。
+    text: String,
 }
 
 impl ImeState {
     /// 收到 `Ime::Preedit`。空串 = 候选被取消,组字结束。
     pub fn on_preedit(&mut self, text: &str) {
         self.preediting = !text.is_empty();
+        self.text.clear();
+        self.text.push_str(text);
     }
 
     /// 收到 `Ime::Commit`,组字结束。
     pub fn on_commit(&mut self) {
         self.preediting = false;
+        self.text.clear();
     }
 
     /// 收到 `Ime::Disabled`(切走输入法 / 失焦),组字结束。
     pub fn on_disabled(&mut self) {
         self.preediting = false;
+        self.text.clear();
     }
 
     /// 这一刻的按键该不该被吞掉(组字中 = 该吞)。
     pub fn swallows_key(&self) -> bool {
         self.preediting
+    }
+
+    /// F126:组字中的拼音串,空串 = 没在组字。
+    pub fn preedit(&self) -> &str {
+        &self.text
     }
 }
 
@@ -376,6 +387,35 @@ mod tests {
         ime.on_preedit("ni");
         ime.on_disabled();
         assert!(!ime.swallows_key());
+    }
+
+    /// F126:组字中的拼音串必须被留下来 —— 它就是要画到屏幕上的东西。
+    #[test]
+    fn preedit_text_is_kept_for_rendering() {
+        let mut ime = ImeState::default();
+        ime.on_preedit("gang'jin");
+        assert_eq!(ime.preedit(), "gang'jin");
+        assert!(ime.swallows_key(), "组字中照旧吞键");
+    }
+
+    /// F126:三条结束边**都**要清空文本。漏一条的现象是屏幕上留一串
+    /// 永不消失的幽灵拼音,而且它会一直盖着底下的真实内容。
+    ///
+    /// 自证会变红:把 `on_commit` / `on_disabled` 里的 `self.text.clear()` 删掉
+    /// 任意一句。
+    #[test]
+    fn every_end_of_composition_clears_the_text() {
+        for end in ["commit", "empty-preedit", "disabled"] {
+            let mut ime = ImeState::default();
+            ime.on_preedit("nihao");
+            match end {
+                "commit" => ime.on_commit(),
+                "empty-preedit" => ime.on_preedit(""),
+                _ => ime.on_disabled(),
+            }
+            assert_eq!(ime.preedit(), "", "{end} 之后必须没有残留");
+            assert!(!ime.swallows_key(), "{end} 之后不该继续吞键");
+        }
     }
 
     #[test]
