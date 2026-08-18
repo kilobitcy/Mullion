@@ -737,10 +737,17 @@ fn row(
     } else {
         theme::c32(t.fg)
     };
-    // D1:类型图标。颜色跟文字**同源**(上面那个 `fg`),不另算一套 ——
-    // 否则会出现「文字灰了图标还亮着」这种自相矛盾的行。排在名称文字
-    // 之前画,视觉上图标在名字左边。
-    crate::ui::file_icon::paint(p, icon_rect(rect), e.kind, fg);
+    // D1/F127:类型图标。判类看 `EntryKind` + 扩展名 + x 位,颜色跟
+    // 可操作性同源(不可操作 → 与文字一样是 dim),不另算一套 —— 否则会
+    // 出现「文字灰了图标还亮着」这种自相矛盾的行。排在名称文字之前画,
+    // 视觉上图标在名字左边。
+    let icon_kind = crate::ui::file_icon::classify(e.kind, e.name.display().as_ref(), e.mode);
+    crate::ui::file_icon::paint(
+        p,
+        icon_rect(rect),
+        icon_kind,
+        theme::c32(crate::ui::file_icon::color_for(icon_kind, usable, t)),
+    );
 
     let mut label = e.name.display().to_string();
     if let (EntryKind::Symlink, Some(tgt)) = (e.kind, &e.link_target) {

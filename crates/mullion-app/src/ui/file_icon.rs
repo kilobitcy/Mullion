@@ -108,13 +108,13 @@ pub fn classify(kind: EntryKind, name: &str, mode: u32) -> IconKind {
 
 /// 一个图标由若干条折线组成(闭合与否由调用方按形状约定)。
 /// 抽出来只为**可单测** —— 像素长什么样仍然只有人眼能判。
-pub fn outline(rect: egui::Rect, kind: EntryKind) -> Vec<Vec<egui::Pos2>> {
+pub fn outline(rect: egui::Rect, kind: IconKind) -> Vec<Vec<egui::Pos2>> {
     // 留一圈内边距,图标不顶满行高。
     let r = rect.shrink(2.0);
     let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
     match kind {
         // 文件夹:带页签的梯形。
-        EntryKind::Dir => vec![vec![
+        IconKind::Dir => vec![vec![
             egui::pos2(l, b),
             egui::pos2(l, t + r.height() * 0.25),
             egui::pos2(l + r.width() * 0.4, t + r.height() * 0.25),
@@ -123,8 +123,82 @@ pub fn outline(rect: egui::Rect, kind: EntryKind) -> Vec<Vec<egui::Pos2>> {
             egui::pos2(rt, b),
             egui::pos2(l, b),
         ]],
-        // 文件:右上角折角的页。两条折线 —— 页身 + 折角。
-        EntryKind::File => {
+        // 归档:盒子 + 一条捆带。
+        IconKind::Archive => vec![
+            vec![
+                egui::pos2(l, t + r.height() * 0.2),
+                egui::pos2(rt, t + r.height() * 0.2),
+                egui::pos2(rt, b),
+                egui::pos2(l, b),
+                egui::pos2(l, t + r.height() * 0.2),
+            ],
+            vec![
+                egui::pos2(l + r.width() * 0.4, t + r.height() * 0.2),
+                egui::pos2(l + r.width() * 0.4, b),
+            ],
+            vec![
+                egui::pos2(l + r.width() * 0.6, t + r.height() * 0.2),
+                egui::pos2(l + r.width() * 0.6, b),
+            ],
+        ],
+        // 图片:相框 + 里面一座山。
+        IconKind::Image => vec![
+            vec![
+                egui::pos2(l, t),
+                egui::pos2(rt, t),
+                egui::pos2(rt, b),
+                egui::pos2(l, b),
+                egui::pos2(l, t),
+            ],
+            vec![
+                egui::pos2(l + r.width() * 0.15, b - r.height() * 0.2),
+                egui::pos2(l + r.width() * 0.4, t + r.height() * 0.45),
+                egui::pos2(l + r.width() * 0.6, b - r.height() * 0.2),
+            ],
+        ],
+        // 代码:一对尖括号。
+        IconKind::Code => vec![
+            vec![
+                egui::pos2(l + r.width() * 0.4, t + r.height() * 0.15),
+                egui::pos2(l, r.center().y),
+                egui::pos2(l + r.width() * 0.4, b - r.height() * 0.15),
+            ],
+            vec![
+                egui::pos2(rt - r.width() * 0.4, t + r.height() * 0.15),
+                egui::pos2(rt, r.center().y),
+                egui::pos2(rt - r.width() * 0.4, b - r.height() * 0.15),
+            ],
+        ],
+        // 文档:页 + 三条文字线(与「归档」的盒子形状区分开)。
+        IconKind::Doc => {
+            let mut v = vec![vec![
+                egui::pos2(l + r.width() * 0.15, t),
+                egui::pos2(rt - r.width() * 0.15, t),
+                egui::pos2(rt - r.width() * 0.15, b),
+                egui::pos2(l + r.width() * 0.15, b),
+                egui::pos2(l + r.width() * 0.15, t),
+            ]];
+            for i in 1..=3 {
+                let y = t + r.height() * (0.2 * i as f32 + 0.1);
+                v.push(vec![
+                    egui::pos2(l + r.width() * 0.3, y),
+                    egui::pos2(rt - r.width() * 0.3, y),
+                ]);
+            }
+            v
+        }
+        // 可执行:一个朝右的三角(播放/运行)+ 底座。
+        IconKind::Exec => vec![
+            vec![
+                egui::pos2(l + r.width() * 0.25, t + r.height() * 0.1),
+                egui::pos2(rt - r.width() * 0.1, r.center().y),
+                egui::pos2(l + r.width() * 0.25, b - r.height() * 0.3),
+                egui::pos2(l + r.width() * 0.25, t + r.height() * 0.1),
+            ],
+            vec![egui::pos2(l, b), egui::pos2(rt, b)],
+        ],
+        // 符号链接:页 + 一个指出去的箭头。
+        IconKind::Link => {
             let fold = r.width() * 0.3;
             vec![
                 vec![
@@ -140,20 +214,15 @@ pub fn outline(rect: egui::Rect, kind: EntryKind) -> Vec<Vec<egui::Pos2>> {
                     egui::pos2(rt - fold, t + fold),
                     egui::pos2(rt, t + fold),
                 ],
+                vec![
+                    egui::pos2(l + r.width() * 0.25, b - r.height() * 0.25),
+                    egui::pos2(rt - r.width() * 0.2, t + r.height() * 0.35),
+                ],
             ]
         }
-        // 符号链接:页 + 一个指出去的箭头。
-        EntryKind::Symlink => {
-            let mut v = outline(rect, EntryKind::File);
-            v.push(vec![
-                egui::pos2(l + r.width() * 0.25, b - r.height() * 0.25),
-                egui::pos2(rt - r.width() * 0.2, t + r.height() * 0.35),
-            ]);
-            v
-        }
         // 其他(设备文件/socket/命名管道等,SFTP 协议里存在但没有专门图标的
-        // 类型):菱形,与另外三种都不同形,不落回文件/文件夹的形状假装认识它。
-        EntryKind::Other => vec![vec![
+        // 类型):菱形,与另外几种都不同形,不落回文件/文件夹的形状假装认识它。
+        IconKind::Other => vec![vec![
             egui::pos2(l + r.width() * 0.5, t),
             egui::pos2(rt, t + r.height() * 0.5),
             egui::pos2(l + r.width() * 0.5, b),
@@ -164,9 +233,31 @@ pub fn outline(rect: egui::Rect, kind: EntryKind) -> Vec<Vec<egui::Pos2>> {
 }
 
 /// 把 `outline` 画出来。
-pub fn paint(painter: &egui::Painter, rect: egui::Rect, kind: EntryKind, color: egui::Color32) {
+pub fn paint(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, color: egui::Color32) {
     for line in outline(rect, kind) {
         painter.add(egui::Shape::line(line, egui::Stroke::new(1.0, color)));
+    }
+}
+
+/// F127:类型 → 颜色。**不可操作的行恒 `fg_dimmer`**,与名称文字同源 ——
+/// 两套判据会出现「文字灰了图标还亮着」这种自相矛盾的行(D1 定的闸门)。
+pub fn color_for(
+    kind: IconKind,
+    usable: bool,
+    t: &crate::theme::Theme,
+) -> mullion_term::snapshot::Rgb {
+    if !usable {
+        return t.fg_dimmer;
+    }
+    match kind {
+        IconKind::Dir => t.icon_dir,
+        IconKind::Archive => t.icon_archive,
+        IconKind::Image => t.icon_image,
+        IconKind::Code => t.icon_code,
+        IconKind::Doc => t.icon_doc,
+        IconKind::Exec => t.icon_exec,
+        IconKind::Link => t.icon_link,
+        IconKind::Other => t.icon_other,
     }
 }
 
@@ -174,11 +265,15 @@ pub fn paint(painter: &egui::Painter, rect: egui::Rect, kind: EntryKind, color: 
 mod tests {
     use super::*;
 
-    const ALL_KINDS: [EntryKind; 4] = [
-        EntryKind::Dir,
-        EntryKind::File,
-        EntryKind::Symlink,
-        EntryKind::Other,
+    const ALL_KINDS: [IconKind; 8] = [
+        IconKind::Dir,
+        IconKind::Archive,
+        IconKind::Image,
+        IconKind::Code,
+        IconKind::Doc,
+        IconKind::Exec,
+        IconKind::Link,
+        IconKind::Other,
     ];
 
     /// 图标必须**画在给定的格子里**。越界的话它会压到相邻列的文字上,
@@ -209,7 +304,7 @@ mod tests {
     #[test]
     fn every_kind_looks_different_from_every_other_kind() {
         let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0));
-        let shapes: Vec<(EntryKind, String)> = ALL_KINDS
+        let shapes: Vec<(IconKind, String)> = ALL_KINDS
             .iter()
             .map(|&k| (k, format!("{:?}", outline(cell, k))))
             .collect();
@@ -297,5 +392,16 @@ mod tests {
             IconKind::Other,
             "点号在开头时,哪怕「扩展名」凑巧撞上表项也不能当真"
         );
+    }
+
+    /// F127:颜色由类型决定,且**不可操作的行仍然整体变灰** —— 这是 D1 定的
+    /// 闸门,不能因为加了类型色就丢掉,否则会出现「文字灰了图标还亮着」。
+    ///
+    /// 自证会变红:把 `color_for` 里 `if !usable` 那一支删掉。
+    #[test]
+    fn unusable_rows_stay_dim_even_with_type_colors() {
+        let t = crate::theme::MULLION_DARK;
+        assert_eq!(color_for(IconKind::Archive, true, &t), t.icon_archive);
+        assert_eq!(color_for(IconKind::Archive, false, &t), t.fg_dimmer);
     }
 }
