@@ -13613,4 +13613,33 @@ mod tests {
              才会开始重拨"
         );
     }
+
+    /// **接线守护 / F129**:Ctrl+D 的判定必须排在 `encode_key` **之前**。
+    /// 挪到之后的后果是静默的:Ctrl+D 先被编成 `0x04` 写进一条死 channel
+    /// (T1 式静默失败),而 `ctrl_d_action` / `is_bare_ctrl_d` 的纯函数单测
+    /// 全都还是绿的,没人会发现这个功能已经废了。
+    ///
+    /// 锚点全部拆开拼:完整字面量会被这条测试自己的源码匹配到,那是本项目
+    /// 已实证的第五类恒绿模式。
+    ///
+    /// 自证会变红:把 F129 那段接线整体挪到 `encode_key(...)` 之后。
+    #[test]
+    fn ctrl_d_is_decided_before_the_key_gets_encoded() {
+        let src = include_str!("app.rs");
+        let start = concat!("WindowEvent::Keyboard", "Input { event, .. } => {");
+        let after = src.split(start).nth(1).expect("找不到 KeyboardInput 分支");
+        let body = &after[..after
+            .find(concat!("WindowEvent::Redraw", "Requested"))
+            .expect("找不到 KeyboardInput 分支的结尾")];
+        let ctrl_d_at = body
+            .find(concat!("is_bare_", "ctrl_d("))
+            .expect("找不到 Ctrl+D 接线");
+        let encode_at = body
+            .find(concat!("encode_", "key(key, mods"))
+            .expect("找不到 encode_key 调用");
+        assert!(
+            ctrl_d_at < encode_at,
+            "Ctrl+D 的判定跑到 encode_key 后面了 —— 它会被编成 0x04 写进死 channel"
+        );
+    }
 }
