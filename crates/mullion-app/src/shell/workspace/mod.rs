@@ -15,7 +15,47 @@ pub use preset::{icon_cells, next_focus, plan_preset, preset_tree, Preset, Prese
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneStatus {
     Live,
+    /// F128:链路死了,正在自动退避重连。**内容保留**——重连成功后接着往下写,
+    /// 用户滚回去还能看到断线前的输出。
+    Reconnecting,
+    /// 不会自己回来了:远端 shell 自己退了(用户敲了 `exit`),或重试到顶。
     Disconnected,
+}
+
+/// F128:`rx` 关闭该怎么处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxClosed {
+    /// 链路死了,自动重连。
+    Reconnect,
+    /// 远端 shell 自己退了(`exit`),SSH 连接还活着 —— **绝不重连**,
+    /// 否则用户永远退不出登录。
+    UserExited,
+}
+
+/// F128:判据只有一条 —— SSH **连接**(不是 channel)还在不在。
+/// channel 关了而连接还在 = 远端进程退了;连接也没了 = 链路死了。
+pub fn rx_closed_action(transport_alive: bool) -> RxClosed {
+    if transport_alive {
+        RxClosed::UserExited
+    } else {
+        RxClosed::Reconnect
+    }
+}
+
+/// F128:`hosts[ix]` 这条连接的传输层还活着没有。
+///
+/// 抽成 fn 指针字段是为了**能在无头测试里翻转** —— 直接查
+/// `handle.is_closed()` 的话,"链路死了"这个状态在测试里根本造不出来
+/// (测试用的 `Workspace` 连 `HostConn` 都没有)。
+/// 查不到 host 时返回 `true`(当成"连接还在"):那是异常状态,
+/// 宁可不重连,也不要对着一条不存在的连接无限重拨。
+pub fn default_link_alive(hosts: &[HostConn], ix: usize) -> bool {
+    // 写成 match 而不是 `map_or`/`is_none_or`:后两者在不同 clippy 版本里
+    // 会互相建议对方(`-D warnings` 下就是编不过),match 两边都不挑刺。
+    match hosts.get(ix) {
+        None => true,
+        Some(h) => !h.handle.is_closed(),
+    }
 }
 
 use std::sync::Arc;
@@ -138,6 +178,8 @@ pub struct Workspace {
     /// 没有意义,只判等),真正保证"新世代的值一定跟旧世代不一样"是调用方
     /// (`App`)的责任——`Workspace` 自己没法保证,见 `new` 的说明。
     generation: u64,
+    /// F128:判据见 `default_link_alive`。测试里可替换。
+    pub link_alive: fn(&[HostConn], usize) -> bool,
 }
 
 impl Workspace {
@@ -156,6 +198,7 @@ impl Workspace {
             hosts: Vec::new(),
             title_bars: true,
             generation,
+            link_alive: default_link_alive,
         }
     }
 
@@ -312,6 +355,8 @@ impl Workspace {
     /// 写错 channel 的后果不是"输出乱一点":发起同步输出探测 / 光标位置查询的
     /// TUI 会永远等不到应答,表现为整块 pane 冻死。
     pub fn pump(&mut self, now_ms: u64) {
+        let link_alive = self.link_alive;
+        let hosts = &self.hosts;
         for p in &mut self.panes {
             let mut inbound: Vec<Vec<u8>> = Vec::new();
             loop {
@@ -323,7 +368,11 @@ impl Workspace {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         // §6.3:内容保留(可滚可复制),只是不再收发。
-                        p.status = PaneStatus::Disconnected;
+                        // F128:关掉的成因决定要不要重连,判据见 `rx_closed_action`。
+                        p.status = match rx_closed_action(link_alive(hosts, p.host_ix)) {
+                            RxClosed::Reconnect => PaneStatus::Reconnecting,
+                            RxClosed::UserExited => PaneStatus::Disconnected,
+                        };
                         break;
                     }
                 }
@@ -1028,5 +1077,51 @@ mod tests {
             "HostConn 上没有「上次发起时刻」—— 重试判据拿不到 since_last_ms,\
              要么永不重试要么每帧重试"
         );
+    }
+
+    /// F128:`rx` 关了有两个成因,**判反了两边都是灾难**:
+    /// - 用户敲 `exit`(连接还活着)却去重连 → 用户永远退不出登录,
+    ///   每次 exit 都被自动拉回来。
+    /// - 链路死了却当成正常退出 → 就是今天的现状,永远不重连。
+    ///
+    /// 判据是 SSH **连接**(不是 channel)还在不在。
+    ///
+    /// 自证会变红:把 `rx_closed_action` 的函数体改成恒返回
+    /// `RxClosed::Reconnect`。
+    #[test]
+    fn a_closed_rx_means_reconnect_only_if_the_transport_died() {
+        // 入参是「连接是否还活着」(见 `rx_closed_action` 的 `transport_alive`):
+        // 活着(true)= 用户 exit,死了(false)= 链路断,重连。
+        assert_eq!(rx_closed_action(false), RxClosed::Reconnect, "链路死了");
+        assert_eq!(
+            rx_closed_action(true),
+            RxClosed::UserExited,
+            "连接还活着 = 远端 shell 自己退了,不许重连"
+        );
+    }
+
+    /// F128:`pump` 必须按成因分别置位。`Reconnecting` 与 `Disconnected`
+    /// 的差别是「等一下会自己回来」vs「不会再回来了」,标题条的点、
+    /// Ctrl+D 的语义、减屏时先关谁,三处都看它。
+    #[tokio::test]
+    async fn pump_marks_reconnecting_when_the_transport_died() {
+        let (mut ws, probes) = ws_with(1);
+        // 造「链路死了」:丢掉发送端(rx 关闭)+ 让判据报 false。
+        drop(probes);
+        ws.link_alive = |_, _| false;
+        ws.pump(0);
+        assert_eq!(ws.pane(PaneId(1)).unwrap().status, PaneStatus::Reconnecting);
+    }
+
+    /// 反面:同样是 rx 关了,链路还活着就只是「远端 shell 退了」。
+    /// 这一条与上一条**必须成对**——只有一条的话,把 `rx_closed_action` 写成
+    /// 恒返回某一个值也能过。
+    #[tokio::test]
+    async fn pump_marks_disconnected_when_the_remote_shell_exited() {
+        let (mut ws, probes) = ws_with(1);
+        drop(probes);
+        ws.link_alive = |_, _| true;
+        ws.pump(0);
+        assert_eq!(ws.pane(PaneId(1)).unwrap().status, PaneStatus::Disconnected);
     }
 }

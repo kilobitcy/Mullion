@@ -307,6 +307,9 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                         }
                         let dot = match v.status {
                             PaneStatus::Live => t.ok,
+                            // F128:重连中 = 黄色(还有救),与 Disconnected 的灰
+                            // 明确区分:用户看一眼就知道要不要自己动手。
+                            PaneStatus::Reconnecting => t.warn,
                             PaneStatus::Disconnected => t.fg_dim,
                         };
                         ui.colored_label(theme::c32(dot), "●");
