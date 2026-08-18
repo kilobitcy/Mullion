@@ -50,10 +50,26 @@ pub struct Settings {
     /// `ScaleFactorChanged` 动态更新」。
     #[serde(default = "default_font_pt")]
     pub font_pt: f32,
+    /// F124:连上之后自动开一条旁路 exec,把远端 tmux 的 `set-titles` 打开、
+    /// `set-titles-string` 改成带 `#{pane_current_path}` 的格式。
+    ///
+    /// **默认开**:F123 的两个功能(标题条目录名 / SFTP 目录继承)在没配过的
+    /// 远端上一个字节都收不到,而「没配过」是绝大多数机器的状态。关掉之后
+    /// 整条自举不跑(连一次 exec 都不发),F123 退回手工配置(见
+    /// `docs/remote-state-setup.md`)。
+    ///
+    /// 这是往用户的机器上写东西(改的是 tmux 服务器**内存里**的全局选项,
+    /// 不落盘、server 退出即失效),所以必须给得出「不要」。
+    #[serde(default = "default_tmux_bootstrap")]
+    pub tmux_bootstrap: bool,
 }
 
 fn default_font_pt() -> f32 {
     DEFAULT_FONT_PT
+}
+
+fn default_tmux_bootstrap() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -62,6 +78,7 @@ impl Default for Settings {
             schema_version: CURRENT_SETTINGS_SCHEMA,
             font_family: None,
             font_pt: DEFAULT_FONT_PT,
+            tmux_bootstrap: true,
         }
     }
 }
@@ -169,6 +186,7 @@ mod tests {
             schema_version: CURRENT_SETTINGS_SCHEMA,
             font_family: Some("Cascadia Mono".to_string()),
             font_pt: 13.5,
+            tmux_bootstrap: true,
         };
         save(dir.path(), &s).expect("写盘");
         let back = load(dir.path());
@@ -261,5 +279,36 @@ mod tests {
         assert!(back.note.is_none());
         assert_eq!(back.settings.font_pt, DEFAULT_FONT_PT);
         assert_eq!(back.settings.font_family, None);
+    }
+
+    /// F124:自举开关默认**开**。这是新字段,老的 settings.toml 里没有它 ——
+    /// `serde(default)` 必须给 `true`,给 `false` 的话所有老用户升上来功能
+    /// 静默不生效,而他们在设置里看到的是「开着」。
+    ///
+    /// 自证会变红:把 `default_tmux_bootstrap` 的返回值改成 `false`。
+    #[test]
+    fn tmux_bootstrap_defaults_to_on_for_files_written_before_it_existed() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "schema_version = 1\nfont_pt = 10.0\n",
+        )
+        .expect("写老格式文件");
+        let back = load(dir.path());
+        assert!(back.note.is_none(), "老文件不该有 note:{:?}", back.note);
+        assert!(back.settings.tmux_bootstrap, "老文件缺这个字段时该默认开");
+    }
+
+    /// 关掉之后要能存住 —— 默认值是 `true`,写盘再读回必须仍是 `false`。
+    /// 光有上一条(缺字段时默认开)的话,「读不出用户关过」这种错法照样全绿。
+    #[test]
+    fn tmux_bootstrap_survives_a_round_trip_when_turned_off() {
+        let dir = tmp();
+        let s = Settings {
+            tmux_bootstrap: false,
+            ..Settings::default()
+        };
+        save(dir.path(), &s).expect("写盘");
+        assert!(!load(dir.path()).settings.tmux_bootstrap);
     }
 }

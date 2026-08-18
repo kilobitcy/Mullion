@@ -4,10 +4,13 @@
 > 的**缩小版承接者**,不是复活:不依赖 tmux 转发内层 OSC 7(那条正是 F51 被否的理由
 > 之一),改走 tmux 自己发的窗口标题;而且只在侧栏「关→开」跃迁那一次继承,不做持续跟随。
 
-分屏标题条右边那一小段「tmux 名 · 目录名」,以及 `Ctrl+Shift+B` 打开文件面板时
-远端栏落在哪个目录,数据**全部来自远端自己发过来的 OSC 转义序列**。
-远端不发,这两个功能就静默降级(标题条不显示那一段、文件面板落回登录目录)——
-不是 bug,是拿不到。
+分屏标题条上「目录名 · tmux 名」那两段(自 2026-08-18 起并进左边那一整串
+`序号 · 节点名 · 目录名 · tmux 名`,不再是右侧角标),以及 `Ctrl+Shift+B` 打开文件面板时
+远端栏落在哪个目录,数据**全部来自远端自己发过来的 OSC 转义序列**。**自 2026-08-18
+起,这些转义序列默认由 F124 自动配置好**(连上就在一条旁路 channel 里把远端 tmux 的
+`set-titles`/`set-titles-string` 开好),正常情况下你不用做任何事。只有**远端没有
+tmux**、或者你在设置弹窗里**关掉了这个自举开关**,这两个功能才会静默降级(标题条
+不显示那一段、文件面板落回登录目录)——不是 bug,是拿不到。
 
 ## 为什么不能旁路问一句
 
@@ -18,9 +21,47 @@ adr-009:一条 SSH 连接承载所有分屏。旁路开一条 exec channel 跑
 
 所以只剩「远端主动报、按 channel 收」这一条路。
 
+**F124 的旁路 channel 没有绕开这条限制,恰恰是这条限制的一个例外证明**:F124 不问
+「当前 pane 路径是什么」,只改 tmux 服务器的**全局**选项(`set-titles`/
+`set-titles-string`)——`set-titles` 本来就与 pane 无关,不存在「问的是哪一块」这个
+问题,所以旁路 exec 在这里可行。之后每个 pane 各自的路径,靠的还是上面说的
+「远端主动报、按 channel 收」:tmux 用 `#{pane_current_path}` 把每个 pane 自己的
+路径填进它自己发出的窗口标题里,mullion 照旧从各 pane 的字节流里嗅标题。
+
 ## 远端要怎么配
 
-### tmux(推荐,一行,**tmux 场景下唯一可靠的一条**)
+### 默认:F124 自动配置好了,通常不用做任何事
+
+连上 SSH 之后,mullion 立刻在一条旁路 exec channel 里跑:
+
+```
+tmux set -g set-titles on && tmux set -g set-titles-string '#S:#I:#W #{pane_current_path}'
+```
+
+- **什么时候跑**:连上立刻跑一次;没成功(比如 tmux 服务器还没起)就每 **30 秒**
+  重试一次,直到成功为止——成功之后这条连接就**永不再试**。
+  重试**由帧驱动**(判据挂在事件循环的空闲回调上),不是独立的后台定时器:
+  窗口完全没有任何输入/输出、一帧都不画的时候不会凭空触发。这不影响实际使用——
+  用户真要去开 tmux 就必然在敲键盘,敲键盘就有帧。
+- **成功判据是 exec 的退出码**:两条 `tmux set` 用 `&&` 串联,退出码 0 当且仅当
+  两条都成功。用 `;` 串会把「没配上」误记成「已配上」然后不再重试,所以刻意不用。
+- **影响面**:改的是 tmux **服务器全局**选项,不是某个 pane 私有的。同一台机器上
+  如果还有别的终端 `attach` 了同一个 tmux server,它们的窗口标题也会被一起改成
+  `会话名:窗口号:窗口名 目录` 这个格式。这个选项活在 tmux 服务器**内存**里,不写
+  `~/.tmux.conf`,server 退出(`tmux kill-server`)即失效——下次连接 F124 会重新
+  配一遍。
+- **怎么关**:设置弹窗 →「远端」分节 →「自动配置远端 tmux 的状态上报」勾选框,
+  关掉之后这条连接不会再跑这条命令(已经配上的不会被撤销)。
+- **已知时延**:tmux 只在**下一次客户端重绘**时才会重新计算并发送标题,不是
+  `cd` 一敲就立刻更新——实测是等到下一次提示符刷新(敲下一条命令、按回车)才看到
+  标题条跟上。
+
+### 关掉自举之后,怎么自己配
+
+关掉「自动配置远端 tmux 的状态上报」开关,或者远端根本没有 tmux(比如裸 shell、
+或用的是 screen),F124 的自举就不会跑,想要 F123 的效果得自己配。
+
+#### tmux(推荐,一行,**tmux 场景下唯一可靠的一条**)
 
 `~/.tmux.conf`:
 
@@ -42,7 +83,7 @@ set -g set-titles-string '#S:#I:#W #{pane_current_path}'
 cwd 的判据是标题里第一个以 `/`、`~/` 开头或恰好是 `~` 的空白分隔 token。
 改完 `tmux kill-server` 或 `tmux source-file ~/.tmux.conf`。
 
-### shell 报 cwd(OSC 7)—— **只在不经过 tmux 时有用**
+#### shell 报 cwd(OSC 7)—— **只在不经过 tmux 时有用**
 
 Ubuntu 的 bash 默认**不发** OSC 7。可以加到 `~/.bashrc`:
 
@@ -75,9 +116,10 @@ zsh 用户装了 `oh-my-zsh` 的话通常已经在发了;fish 从 3.x 起默认�
 
 ## 降级行为
 
-| 远端配置 | 标题条右区 | 文件面板起始目录 |
+| 远端配置 | 标题条里的目录/tmux 两段 | 文件面板起始目录 |
 |---|---|---|
-| 都没配 | 不显示 | F120 配置的默认远端目录 → 登录目录(`.`) |
+| 开着 F124(默认) | `会话名 · 目录名` | 该目录 |
+| 没配(关了 F124 或远端没 tmux) | 不显示 | F120 配置的默认远端目录 → 登录目录(`.`) |
 | 只开 `set-titles on` | `会话名` | 同上(标题里没有路径) |
 | `set-titles-string` 带路径 | `会话名 · 目录名` | 该目录(若是绝对路径) |
 | tmux 之外还发了 OSC 7 | `会话名 · 目录名`(以 OSC 7 为准) | 该目录 |
@@ -101,11 +143,16 @@ zsh 用户装了 `oh-my-zsh` 的话通常已经在发了;fish 从 3.x 起默认�
 
 ## 相关代码
 
+- 自举:`crates/mullion-app/src/remote_bootstrap.rs`(命令串 + 重试判据)+
+  `App::tick_tmux_bootstrap`(`about_to_wait` 里跑)
 - 解析:`crates/mullion-term/src/remote_state.rs`(纯函数,14 条测试)
 - 采集:`Emulator::feed` 里跑 `Osc7Sniffer`,`Emulator::take_remote_state` 取走
 - 落地:`Workspace::pump`(`crates/mullion-app/src/shell/workspace/mod.rs`)→
   `PaneState.cwd` / `.tmux`
-- 显示:`crates/mullion-app/src/ui/pane_title.rs` 的 `dir_leaf` / `side_text`
+- 显示:`crates/mullion-app/src/ui/pane_title.rs` 的 `dir_leaf` / `title_text`
+  (`title_text` 把「序号 · 节点 · 目录 · tmux」拼成左边一整串;右侧角标那套
+  `side_text` 已随该改动删除)
 - 继承:`crates/mullion-app/src/app.rs` 的 `files_start_dir`(首次打开走
   `trigger_sftp_open`)/ `sync_files_to_focused_pane`(已开着时的关→开跃迁同步)/
   `files_hotkey_event`(`Ctrl+Shift+B`)
+- `~` 展开:`crates/mullion-app/src/app.rs` 的 `expand_tilde` / `files_start_dir`

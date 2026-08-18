@@ -16,6 +16,11 @@ use crate::ui::metrics::{field_w, FIELD_W_M, FIELD_W_S, SP_L, SP_M, SP_S};
 use crate::ui::session_manager::form;
 use crate::ui::shortcuts::SHORTCUTS;
 
+/// 自举开关的标签。测试要靠它在画出来的 `Shape::Text` 里找到这个部件,
+/// 所以实现与测试必须共用同一份 —— 各写一遍的话改文案时测试会静默地
+/// 点不中,`interact` 里那句 panic 才是唯一的提示。
+const BOOTSTRAP_LABEL: &str = "自动配置远端 tmux 的状态上报";
+
 /// 弹窗里正在编辑的那份设置。
 ///
 /// **不直接改 `App::settings`**:字号是拖动即预览的(设计 §8),没有一份草稿
@@ -37,6 +42,8 @@ pub struct SettingsDraft {
     pub new_password: String,
     /// F71:「确认」框。
     pub confirm_password: String,
+    /// F124:自动配置远端 tmux 状态上报。
+    pub tmux_bootstrap: bool,
 }
 
 impl SettingsDraft {
@@ -48,6 +55,7 @@ impl SettingsDraft {
             typed: s.font_family.clone().unwrap_or_default(),
             new_password: String::new(),
             confirm_password: String::new(),
+            tmux_bootstrap: s.tmux_bootstrap,
         }
     }
 
@@ -120,6 +128,8 @@ pub fn show(
             let mut first = true;
             form::section(ui, t, "设置", "外观", &mut first);
             appearance(ui, t, draft, env, &mut out);
+            form::section(ui, t, "设置", "远端", &mut first);
+            remote(ui, t, draft, &mut out);
             form::section(ui, t, "设置", "安全", &mut first);
             security(ui, t, draft, env, &mut out);
             form::section(ui, t, "设置", "快捷键", &mut first);
@@ -249,6 +259,38 @@ fn appearance(
     });
 }
 
+/// 远端分节:自动配置 tmux 状态上报(F124)。
+///
+/// 走 `form::grid` 两列骨架(规范 #1):复选框和灰字说明都挂**输入列**、
+/// 标签列留空(规范 #6),否则它俩会从 x=0 起画,跟上下两个分节里所有输入框
+/// 的左边缘错开。
+fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut SettingsOut) {
+    form::grid(ui, "settings_remote", |ui| {
+        ui.label("");
+        if ui
+            .checkbox(&mut draft.tmux_bootstrap, BOOTSTRAP_LABEL)
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
+
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "连上后开一条旁路命令通道,打开远端 tmux 的 set-titles 并让它报出当前目录。\
+                 分屏标题条上的目录名、以及文件面板继承终端所在目录都靠它。\
+                 改的是 tmux 服务器内存里的全局选项(不写任何文件,server 退出即失效),\
+                 那台机器上 attach 同一个 tmux 的其它终端,窗口标题也会跟着变成这个格式。",
+            )
+            .size(11.0)
+            .color(theme::c32(t.fg_dim)),
+        );
+        ui.end_row();
+    });
+    ui.add_space(SP_M);
+}
+
 /// 安全分节(F71):主密码状态 + 两个密码框 + 设定/修改 与 取消两个动作。
 fn security(
     ui: &mut egui::Ui,
@@ -373,6 +415,7 @@ mod tests {
             typed: "Cascadia Mono".into(),
             new_password: String::new(),
             confirm_password: String::new(),
+            tmux_bootstrap: true,
         }
     }
 
@@ -593,6 +636,7 @@ mod tests {
             typed: "Comic Sans MS".into(),
             new_password: String::new(),
             confirm_password: String::new(),
+            tmux_bootstrap: true,
         };
         let (texts, _) = run(&mut d, false);
         assert!(
@@ -748,6 +792,40 @@ mod tests {
             SettingsOut::None,
             "库没打开却能设主密码"
         );
+    }
+
+    // ---- F124 远端分节 ----
+
+    /// F124:点自举开关要当场回报 `Preview`(草稿变了、需要重画),
+    /// 「确定」时才落盘。回报 `None` 的话用户点了没反应。
+    ///
+    /// 用文件里既有的 `interact` 脚手架:它跑满 `FRAMES` 帧预热(切片 G 吃过
+    /// 「预热帧数不足 → 点击落在按钮外面」的亏),再按标签文字找到部件中心点
+    /// 下去。复选框是 `Sense::click()`,要**同帧松手**(`release = true`)。
+    ///
+    /// 自证会变红:把 `resp.changed()` 那个分支删掉。
+    #[test]
+    fn toggling_the_bootstrap_checkbox_reports_a_preview() {
+        let mut d = draft();
+        assert!(d.tmux_bootstrap, "脚手架的初值该是开着的");
+        let out = interact(&mut d, BOOTSTRAP_LABEL, egui::Vec2::ZERO, true);
+        assert!(!d.tmux_bootstrap, "复选框没被真的点到,这条测试测了个寂寞");
+        assert_eq!(out, SettingsOut::Preview);
+    }
+
+    /// F124:草稿要从**落盘的真值**起,不是每次都摆一个 `true` 上去。
+    /// 起错了的症状是「用户关掉过,再打开设置弹窗又显示开着」——而只要他
+    /// 这时点了确定,关掉的选择就被这个假的初值覆盖回去了。
+    ///
+    /// 自证会变红:把 `from_settings` 里那行改成 `tmux_bootstrap: true,`。
+    #[test]
+    fn the_draft_starts_from_the_stored_switch_not_from_a_hardcoded_default() {
+        let s = mullion_store::Settings {
+            tmux_bootstrap: false,
+            ..Default::default()
+        };
+        assert!(!SettingsDraft::from_settings(&s).tmux_bootstrap);
+        assert!(SettingsDraft::from_settings(&mullion_store::Settings::default()).tmux_bootstrap);
     }
 
     /// 快捷键一览真的画出来了(不是一个空表)。

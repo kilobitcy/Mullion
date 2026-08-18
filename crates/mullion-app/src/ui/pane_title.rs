@@ -23,12 +23,16 @@ pub struct TitleView<'a> {
     /// 不许在这里现解析(陷阱 T3)。
     pub appearance: Option<&'a crate::ui::badge::Appearance>,
     /// ⑥:远端当前目录的最后一级(已由 `dir_leaf` 取好)。`None` = 不知道。
+    /// 拼进左区那一整串 `序号 · 节点名 · 目录名 · tmux名`(`title_text`),
+    /// 不再是独立右区。
     ///
     /// **拿 `String` 而不是 `&str`**:源头 `PaneState.cwd` 是字节,取最后一级
     /// 要经过 `to_string_lossy`,借不出一个活到本帧结束的 `&str`。每 pane
     /// 每帧一次短字符串分配,相对每帧几千个 glyph 可以忽略。
     pub cwd_leaf: Option<String>,
     /// ⑥:tmux 会话名。`None` = 不在 tmux 里 / 远端没开 `set-titles`。
+    /// 拼进左区那一整串 `序号 · 节点名 · 目录名 · tmux名`(`title_text`),
+    /// 不再是独立右区。
     pub tmux: Option<&'a str>,
 }
 
@@ -47,16 +51,33 @@ pub fn icon_side(inner_h: f32) -> f32 {
 }
 
 /// 标题条上的文字。抽成纯函数是因为格式会被人反复调,而它是唯一能自动验的部分。
-pub fn title_text(index: usize, host: Option<&str>, status: PaneStatus) -> String {
-    match (host, status) {
-        (Some(h), PaneStatus::Live) => format!("{index} · {h}"),
-        (Some(h), PaneStatus::Disconnected) => format!("{index} · {h} (已断开)"),
-        // (None, Disconnected) 并进这条通配分支是安全的,不是漏判:状态机里
+///
+/// 格式:`序号 · 节点名 · 最后一级目录名 · tmux 会话名`。后两段来自 F123 的
+/// 远端状态,**拿不到就连分隔符一起消失**(留一个孤零零的 `·` 比不显示更糟)。
+///
+/// 断开时只留 `序号 · 节点名 (已断开)`:目录名和 tmux 名此刻是陈旧值,
+/// 远端早就不说话了,摆着是误导。
+pub fn title_text(
+    index: usize,
+    host: Option<&str>,
+    dir: Option<&str>,
+    tmux: Option<&str>,
+    status: PaneStatus,
+) -> String {
+    let Some(h) = host else {
+        // (None, Disconnected) 并进这条是安全的,不是漏判:状态机里
         // host == None 当且仅当 PaneState 还没挂上(见 Workspace::apply_preset),
         // 此时 status 走默认的 Live;一旦 PaneState 存在,host_ix 必指向真实的
         // HostConn,host 必为 Some。这个组合在当前状态机下不可达。
-        (None, _) => format!("{index} · 连接中…"),
+        return format!("{index} · 连接中…");
+    };
+    if status == PaneStatus::Disconnected {
+        return format!("{index} · {h} (已断开)");
     }
+    let mut parts = vec![index.to_string(), h.to_string()];
+    parts.extend(dir.map(str::to_string));
+    parts.extend(tmux.map(str::to_string));
+    parts.join(" · ")
 }
 
 /// 画一批标题条,返回被点了 × 的 pane(每帧至多一个)。
@@ -85,10 +106,6 @@ pub fn title_text(index: usize, host: Option<&str>, status: PaneStatus) -> Strin
 fn area_id(id: PaneId) -> egui::Id {
     egui::Id::new(("pane_title", id.0))
 }
-
-/// ⑥:右区最多占标题条的多少宽度。0.45 —— 一半以内,保证主机名(标识)
-/// 永远比目录名(上下文)有优先权。
-const SIDE_MAX_FRAC: f32 = 0.45;
 
 /// ⑥:目录路径的最后一级,给标题条显示用。
 ///
@@ -122,18 +139,6 @@ pub fn dir_leaf(cwd: &[u8]) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(leaf).into_owned())
-}
-
-/// ⑥:标题条右区的文字。两者都没有时 `None`(整段不画,不留孤零零的 `·`)。
-///
-/// tmux 名在前:它是「我在哪个工作区」,比目录更外层。
-pub fn side_text(cwd_leaf: Option<&str>, tmux: Option<&str>) -> Option<String> {
-    match (tmux, cwd_leaf) {
-        (Some(s), Some(d)) => Some(format!("{s} · {d}")),
-        (Some(s), None) => Some(s.to_string()),
-        (None, Some(d)) => Some(d.to_string()),
-        (None, None) => None,
-    }
 }
 
 /// 两个按钮的 id。**显式给**而不是让 egui 按布局位置自动生成:测试要
@@ -269,47 +274,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     {
                         action.rehost = Some(v.geom.id);
                     }
-                    // ⑥:右区 —— tmux 会话名 + 当前目录最后一级。摆在 `⇆`
-                    // 左边,颜色比主机名弱:它是上下文,不是标识。
-                    //
-                    // **手动 `layout_no_wrap` + `allocate_exact_size`,不用
-                    // `Label::truncate()`**:`right_to_left` 里一个会截断的
-                    // Label 会先 claim 掉全部剩余宽度,左区主机名就一点都不剩了。
-                    // 手动摆能把宽度夹在 `SIDE_MAX_FRAC` 以内,两区各自截断。
-                    if let Some(s) = side_text(v.cwd_leaf.as_deref(), v.tmux) {
-                        let color = theme::c32(t.fg_muted);
-                        let galley =
-                            ui.painter()
-                                .layout_no_wrap(s, egui::FontId::proportional(12.0), color);
-                        let w = galley.size().x.min(full.width() * SIDE_MAX_FRAC);
-                        let (r, _) = ui.allocate_exact_size(
-                            egui::vec2(w, galley.size().y),
-                            egui::Sense::hover(),
-                        );
-                        // 再按自己那块矩形裁一次:外层 `set_clip_rect(inner)`
-                        // 只挡住溢出标题条,挡不住右区的字压向 `⇆`/`×` 按钮。
-                        //
-                        // 方向已核实(不是直觉上的「往左压主机名」):`r` 是在
-                        // `right_to_left` 布局里 `allocate_exact_size` 分配的,
-                        // `align2()` 取 `Align2([Align::RIGHT, ..])`
-                        // (egui-0.30.0 `layout.rs:620`),`align_size_within_range`
-                        // 对 `Align::RIGHT` 的结果是 `max` 钉在传入 range 的
-                        // `max`、`min = max - size`(`emath-0.30.0
-                        // src/align.rs:113-131`,`Self::Max` 那条分支)——
-                        // 也就是说 `r.max.x` 钉在
-                        // cursor 当前的右边界(此刻正是已经摆好的 `⇆` 按钮左沿),
-                        // `r.min.x = r.max.x - w`。而 `galley` 排版时传的是
-                        // `f32::INFINITY`(`layout_no_wrap`,`painter.rs:516-522`),
-                        // 自然宽度可能大于夹紧后的 `w`;`Painter::galley(pos, ..)`
-                        // 画的 `pos` 是文本**左上角**(`epaint-0.30.0
-                        // src/shape.rs:993` `TextShape::pos` 的文档原话），从
-                        // `r.min` 向右延展。所以未裁剪时,超宽的部分是从 `r.min`
-                        // 越过 `r.max.x` 继续往右,压向已经画在更右边的
-                        // `⇆`/`×` 按钮,而不是往左压主机名(主机名在这段代码
-                        // 更后面才用剩余空间摆,方向相反)。
-                        ui.painter().with_clip_rect(r).galley(r.min, galley, color);
-                    }
-                    // 剩下的空间(已扣掉 × 按钮)左对齐摆状态点 + 主机名;主机名
+                    // 剩下的空间(已扣掉 × / ⇆ 按钮)左对齐摆状态点 + 一整串标题文字;
                     // 排版用的 available_width 到这里已经是扣掉 × 之后的余量。
                     // × 不被顶出条外,靠的是 right_to_left 先占位 + 外层 set_clip_rect
                     // 裁剪(clip 同时裁交互,见 egui `Ui::interact`,egui-0.30 `ui.rs:1057`
@@ -317,7 +282,9 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     // Area 的外部几何已被
                     // `allocate_rect(full, ..)` 硬钉死,与内容截不截断完全解耦。
                     // `.truncate()` 现在唯一的作用是视觉观感(省略号 vs 硬裁切),
-                    // 不是防止 × 被顶出条外的兜底——删掉它 12 条测试仍全绿。
+                    // 不是防止 × 被顶出条外的兜底。这个观感由
+                    // `a_title_too_long_for_the_bar_gets_an_ellipsis_not_a_hard_cut`
+                    // 钉着(删掉 `.truncate()` 它会红)。
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         // F61:图标画在状态点之前。`content` 是个 `new_child` +
                         // `set_clip_rect`,画多了只会被裁掉,不会把 `Area` 撑大。
@@ -345,9 +312,18 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                         ui.colored_label(theme::c32(dot), "●");
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(title_text(v.index, v.host, v.status)).color(
-                                    theme::c32(if v.focused { t.fg_strong } else { t.fg_muted }),
-                                ),
+                                egui::RichText::new(title_text(
+                                    v.index,
+                                    v.host,
+                                    v.cwd_leaf.as_deref(),
+                                    v.tmux,
+                                    v.status,
+                                ))
+                                .color(theme::c32(if v.focused {
+                                    t.fg_strong
+                                } else {
+                                    t.fg_muted
+                                })),
                             )
                             .truncate(),
                         );
@@ -364,26 +340,69 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
 mod tests {
     use super::*;
 
+    /// ⑥/F123:一整串按「序号 · 节点名 · 目录名 · tmux 名」拼。
+    ///
+    /// 序号保留:分屏一多要靠它认哪块是哪块。
     #[test]
-    fn title_shows_index_and_host() {
+    fn title_puts_host_then_directory_then_tmux_on_one_line() {
         assert_eq!(
-            title_text(2, Some("dev@build-01"), PaneStatus::Live),
-            "2 · dev@build-01"
+            title_text(
+                2,
+                Some("build-01"),
+                Some("Mullion"),
+                Some("main"),
+                PaneStatus::Live
+            ),
+            "2 · build-01 · Mullion · main"
+        );
+    }
+
+    /// 缺的段**连分隔符一起消失** —— 留一个孤零零的 `·` 比不显示更糟。
+    ///
+    /// 自证会变红:把实现改成无条件 `format!("{index} · {host} · {dir} · {tmux}")`
+    /// 并把 `None` 渲染成空串。
+    #[test]
+    fn missing_pieces_take_their_separator_with_them() {
+        assert_eq!(
+            title_text(3, Some("build-01"), Some("Mullion"), None, PaneStatus::Live),
+            "3 · build-01 · Mullion"
+        );
+        assert_eq!(
+            title_text(4, Some("build-01"), None, Some("main"), PaneStatus::Live),
+            "4 · build-01 · main"
+        );
+        assert_eq!(
+            title_text(5, Some("build-01"), None, None, PaneStatus::Live),
+            "5 · build-01"
         );
     }
 
     /// §6.3:断开的 pane 内容留着可滚可复制,但状态必须写在脸上 ——
     /// 不然用户会对着一块不响应的终端反复敲键。
+    ///
+    /// **断开时不带目录和 tmux 名**:那两个此刻是陈旧值(远端早就不说话了),
+    /// 摆着是误导。
+    ///
+    /// 自证会变红:把 `Disconnected` 分支也拼上 dir/tmux。
     #[test]
-    fn disconnected_pane_says_so() {
-        let s = title_text(1, Some("h"), PaneStatus::Disconnected);
-        assert!(s.contains("已断开"), "断开状态没写进标题: {s}");
+    fn a_disconnected_pane_says_so_and_drops_the_stale_context() {
+        let s = title_text(
+            1,
+            Some("build-01"),
+            Some("Mullion"),
+            Some("main"),
+            PaneStatus::Disconnected,
+        );
+        assert_eq!(s, "1 · build-01 (已断开)");
     }
 
     /// 预分配了叶子位但 channel 还没开好的空窗期(见 Workspace::apply_preset)。
     #[test]
     fn pane_without_a_host_yet_says_connecting() {
-        assert_eq!(title_text(3, None, PaneStatus::Live), "3 · 连接中…");
+        assert_eq!(
+            title_text(3, None, Some("Mullion"), Some("main"), PaneStatus::Live),
+            "3 · 连接中…"
+        );
     }
 
     /// 800×600 物理像素、开着标题条的单 pane 几何。
@@ -1022,6 +1041,76 @@ mod tests {
         }
     }
 
+    /// 装不下时给**省略号**,不是硬裁在半个字上。
+    ///
+    /// 合成一整串之后这条才有分量:以前主机名和右区各自分开、各自短,现在
+    /// `序号 · 节点 · 目录 · tmux` 一条串起来,长度是四段之和,窄 pane 上
+    /// 「装不下」从边角情况变成了常态。
+    ///
+    /// **不是在验「不换行」** —— 这个 `Layout` 下 `wrap_mode` 本来就是
+    /// `Extend`,删掉 `.truncate()` 也不会换行(已实测,`show()` 里那段注释
+    /// 也是这么写的)。删掉它真正的后果是文字被 `set_clip_rect(inner)` 硬裁
+    /// 在半个字形上、没有任何「后面还有」的提示。
+    ///
+    /// 另外那条 `a_long_cwd_and_tmux_name_do_not_push_the_area_past_title_px`
+    /// 验不到这个:它钉的是 `show()` 末尾 `allocate_rect(full, ..)`,`Area`
+    /// 的尺寸跟 `content` 里截不截断完全解耦(它自己的文档也这么写)。
+    ///
+    /// 自证会变红:删掉 `show()` 里 `Label` 上的 `.truncate()`。
+    #[test]
+    fn a_title_too_long_for_the_bar_gets_an_ellipsis_not_a_hard_cut() {
+        let id = PaneId(11);
+        let views = [TitleView {
+            geom: geom_800x600_title32(id.0, 1.0),
+            index: 1,
+            host: Some("dev@a-very-long-hostname-that-eats-the-whole-row-by-itself"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+            cwd_leaf: Some("a-directory-name-that-is-also-absurdly-long".to_string()),
+            tmux: Some("a-tmux-session-name-that-is-long-too"),
+        }];
+
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(Default::default(), |ctx| {
+                show(ctx, &t, &views);
+            });
+            shapes = out.shapes;
+        }
+
+        let mut texts = Vec::new();
+        for cs in &shapes {
+            collect_galleys(&cs.shape, &mut |t: &str, elided| {
+                texts.push((t.to_string(), elided));
+            });
+        }
+        let title = texts
+            .iter()
+            .find(|(t, _)| t.contains("dev@"))
+            .expect("标题文字一个 shape 都没画出来,测试失去意义");
+        assert!(
+            title.1,
+            "标题装不下却没打省略号 —— 会被内容区硬裁在半个字上:{:?}",
+            title.0
+        );
+    }
+
+    /// 递归找 `Shape::Text`,给出每个 galley 的原文与「是否被省略」。
+    fn collect_galleys(s: &egui::Shape, f: &mut impl FnMut(&str, bool)) {
+        match s {
+            egui::Shape::Text(t) => f(t.galley.text(), t.galley.elided),
+            egui::Shape::Vec(v) => {
+                for x in v {
+                    collect_galleys(x, f);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 递归找 `Shape::Mesh`(`Vec` / `Callback` 之外的容器只有 `Vec`)。
     fn collect_meshes(s: &egui::Shape, f: &mut impl FnMut(egui::Rect)) {
         match s {
@@ -1192,21 +1281,6 @@ mod tests {
         assert!(!leaf.is_empty());
     }
 
-    /// ⑥:右区文字。两者都没有时**整段不画** —— 不留一个孤零零的分隔符。
-    ///
-    /// 自证会变红:把 `side_text` 的 `(None, None)` 分支改成
-    /// `Some(String::new())`。
-    #[test]
-    fn side_text_shows_what_it_has_and_nothing_when_it_has_neither() {
-        assert_eq!(
-            side_text(Some("Mullion"), Some("work")).as_deref(),
-            Some("work · Mullion")
-        );
-        assert_eq!(side_text(Some("Mullion"), None).as_deref(), Some("Mullion"));
-        assert_eq!(side_text(None, Some("work")).as_deref(), Some("work"));
-        assert_eq!(side_text(None, None), None);
-    }
-
     /// **右区不许把 `Area` 撑出 `title_px`**(本文件顶部越界坑第 1 条):
     /// 撑出去就会横向侵入右边邻居、纵向盖住终端第一行,吃掉本该属于终端的
     /// 指针事件(T8 变体)。长目录名 + 长 tmux 名 + 高 DPI 一起上。
@@ -1257,130 +1331,6 @@ mod tests {
                 "ppp={ppp}: Area 是 {:?},该是 {want_w}×{want_h}",
                 rect.size()
             );
-        }
-    }
-
-    /// 左右分区各自截断:**长主机名不该把目录名挤掉**。分屏一多的时候,
-    /// 主机名往往全都一样,目录名恰恰是唯一能区分的那一项。
-    ///
-    /// `cwd_leaf` 特意造得很长(拼上 `"work · "` 前缀后接近 170 字符),
-    /// 这样右区放置时刻的 `ui.available_width()` 会被真正踩到(粗估 ~740pt)。
-    ///
-    /// **判据是宽度,不是文字内容**:早前版本靠 `joined.contains("dev@")`
-    /// 判主机名有没有被挤没,但 `epaint::Galley::text()` 的文档原话是
-    /// 「The full, non-elided text of the input job」(`epaint-0.30.0/src/
-    /// text/text_layout_types.rs:718-722`,实现直接 `&self.job.text`)——
-    /// **不管排版时截没截、挤没挤到 0,它永远吐出排版前的完整原文**。实测过:
-    /// 把右区手动 `layout_no_wrap` 换成 `ui.add(egui::Label::new(s).truncate())`
-    /// 后,主机名 Label 拿到的可用宽度确实被压到 0,但 `galley.text()` 里主机名
-    /// 全文依然原样出现,`contains("dev@")` 这条断言在结构上**不可能**因为任何
-    /// 宽度挤压类变异变红——所以改用 `collect_text_widths` 读 `galley.size().x`
-    /// (由 `galley_from_rows` 从实际排出来的 `rows` 算,`text_layout.rs:592-678`,
-    /// 会反映挤压/省略后的宽度,不同于 `.text()`)。
-    ///
-    /// **右区宽度本身量不出「夹没夹住」,只有主机名宽度量得出「挤没挤」**:
-    /// 曾经想用 `side_w <= full.width() * SIDE_MAX_FRAC + 1.0` 当右区判据,
-    /// 实测发现这条在**正确实现下就是假的**——右区手动 `layout_no_wrap` 传的是
-    /// `f32::INFINITY`(`egui-0.30.0/src/painter.rs:516-523`),产出的 `galley`
-    /// 自身的 `rect`/`size()` 是排版时的自然宽度,`SIDE_MAX_FRAC` 夹紧只夹了
-    /// `allocate_exact_size` 传的矩形宽度(`w`),跟 `galley` 自己的 `size()`
-    /// 是两个不同的量;`with_clip_rect` 只影响绘制,不改 `galley.rect`。
-    /// 而 `Shape::Text`(`epaint-0.30.0/src/shape.rs:992-1020`)只存 `pos` +
-    /// 完整 `galley`,不存 `allocate_exact_size` 那个已经夹过的矩形,读不回来。
-    /// 实测(ppp=1,标题条 800pt,`SIDE_MAX_FRAC*800+1=361`):
-    /// - 正确实现:右区 galley 宽度 **969pt**(已经 > 361,说明这条判据在正确
-    ///   实现下就会假红,不能用);主机名宽度 **341pt**。
-    /// - `.truncate()` 变异:右区宽度 728pt(依然 > 361,不具区分度);
-    ///   主机名宽度骤降到 **12pt**。
-    ///
-    /// 两种实现下右区宽度都超过 361,量不出区别;主机名宽度从 341 掉到 12,
-    /// 区分度非常干净。所以最终判据只保留主机名宽度下限(`> 20.0`,够放几个
-    /// 字符),这也更直接对应测试名字「不该把目录名挤掉」反过来看的那面——
-    /// 「不该把主机名挤没」。`contains("work")` / 目录名前缀两条留作内容层面
-    /// 的存在性检查(右区没有整段消失),不是挤压判据。
-    ///
-    /// **自证操作**(已实测,真会变红):把 `show()` 里右区那段手动
-    /// `layout_no_wrap` + `allocate_exact_size` + `with_clip_rect` 换成
-    /// `ui.add(egui::Label::new(s).truncate());`,重跑这条测试,
-    /// `host_w > 20.0` 断言失败,报错信息里能看到实测宽度 ≈12。
-    #[test]
-    fn a_long_host_name_does_not_squeeze_out_the_directory_name() {
-        let id = PaneId(11);
-        // 单靠短目录名(比如原来的 "Mullion")无法让 SIDE_MAX_FRAC 夹紧
-        // 真正生效——见上面函数文档。这里特意造一个很长的目录名。
-        let long_dir = "a-directory-name-that-is-absurdly-long-and-just-keeps-going-\
-and-going-and-going-and-going-and-going-and-going-and-going-and-going-and-going-\
-and-going-and-going-and-going";
-        let views = [TitleView {
-            geom: geom_800x600_title32(id.0, 1.0),
-            index: 1,
-            host: Some("dev@a-very-long-hostname-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            status: PaneStatus::Live,
-            focused: true,
-            appearance: None,
-            cwd_leaf: Some(long_dir.to_string()),
-            tmux: Some("work"),
-        }];
-
-        let ctx = egui::Context::default();
-        let t = crate::theme::MULLION_DARK;
-        let mut texts: Vec<(String, f32)> = Vec::new();
-        for _ in 0..2 {
-            let out = ctx.run(Default::default(), |ctx| {
-                show(ctx, &t, &views);
-            });
-            texts.clear();
-            for cs in &out.shapes {
-                collect_text_widths(&cs.shape, &mut texts);
-            }
-        }
-        let joined = texts
-            .iter()
-            .map(|(s, _)| s.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let dir_prefix = &long_dir[..20];
-        assert!(
-            joined.contains(dir_prefix),
-            "目录名被长主机名挤掉了,画出来的文字是:{joined}"
-        );
-        assert!(
-            joined.contains("work"),
-            "tmux 名没画出来,画出来的文字是:{joined}"
-        );
-        // 主机名那个 shape 实际分到的宽度:这是真正的挤压判据。
-        // 用宽度而非 `galley.text()` 内容——见上面函数文档,`Galley::text()`
-        // 结构性地永远返回排版前的完整原文,测不出任何视觉挤压。
-        let host_w = texts
-            .iter()
-            .find(|(s, _)| s.contains("dev@"))
-            .map(|(_, w)| *w)
-            .unwrap_or(0.0);
-        assert!(
-            host_w > 20.0,
-            "主机名被挤到几乎 0 宽(实测 {host_w}pt,够放几个字符至少要 >20pt)—— \
-             右区抢了主机名的地盘,画出来的文字是:{joined}"
-        );
-    }
-
-    /// 收集每个 `Shape::Text` 的 `(原文, 实际分到的宽度)`。
-    ///
-    /// **宽度取 `galley.size().x`(即 `rect.size().x`),不是文字内容**:
-    /// `epaint::Galley::text()` 的文档原话是「The full, non-elided text of
-    /// the input job」(`epaint-0.30.0/src/text/text_layout_types.rs:718-722`,
-    /// 实现直接 `&self.job.text`)——**不管排版时截没截、挤没挤到 0,它永远
-    /// 吐出排版前的完整原文**。真正反映挤压的是 `Galley.rect`(由
-    /// `galley_from_rows` 从实际排出来的 `rows` 算出,`text_layout.rs:592-678`),
-    /// 也就是 `size()`。
-    fn collect_text_widths(s: &egui::Shape, out: &mut Vec<(String, f32)>) {
-        match s {
-            egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.size().x)),
-            egui::Shape::Vec(v) => {
-                for x in v {
-                    collect_text_widths(x, out);
-                }
-            }
-            _ => {}
         }
     }
 }

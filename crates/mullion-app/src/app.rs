@@ -134,11 +134,19 @@ pub enum UserEvent {
     /// (用户在标签 A 开侧栏、切到标签 B 的几百毫秒里这条抵达,拿活动标签接
     /// 就会把 A 的 client 挂到 B 上)。`Err` 已经是格式化好的中文原因,
     /// 不是 `SftpError` 的 Debug。
+    ///
+    /// F123:成功时三样一起回来:`(client, 登录目录, 这次要打开的目录)`。
+    ///
+    /// **登录目录与起始目录是两回事**:前者恒等于 `canonicalize(".")`,用来
+    /// 展开标题里报的 `~/...`(F123);后者是本次要 list 的那个目录,可能来自
+    /// pane 的 cwd、F120 的配置值,或者就等于登录目录。合成一个字段的话
+    /// 「侧栏关→开跃迁」那条路会拿着用户浏览到的目录去当 home 用。
     SftpOpened {
         generation: u64,
         result: Result<
             (
                 Arc<mullion_ssh::sftp::SftpClient>,
+                mullion_ssh::sftp::RemotePath,
                 mullion_ssh::sftp::RemotePath,
             ),
             String,
@@ -361,6 +369,13 @@ struct TerminalTab {
     /// 建标签时从 `store` 读一次存进来,之后不再变——跟 `last_cfg` 同理,
     /// 不随会话记录后续被编辑而变化(那是下一次连接才会生效的东西)。
     sftp_default_remote: Option<String>,
+    /// F123:这条 sftp 连接的**真登录目录**(`canonicalize(".")` 的结果)。
+    /// `None` = sftp 还没开好。用来把标题里报的 `~/Mullion` 展开成绝对路径
+    /// (`sftp-server` 不展开 `~`)。
+    ///
+    /// **不是「面板当前目录」**:那个在 `files.remote.cwd` 里,会随用户浏览
+    /// 移动;这个在同一次 sftp 连接内不变(重连会被新连接的值覆盖)。
+    sftp_home: Option<mullion_ssh::sftp::RemotePath>,
 }
 
 /// D1/D6:一个「SFTP 节点」标签的全部状态——**独占**自己的连接(跟隧道同一个
@@ -385,6 +400,8 @@ struct FilesTab {
     sftp_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// F120:同 `TerminalTab::sftp_default_remote`,文档见那边。
     sftp_default_remote: Option<String>,
+    /// F123:同 `TerminalTab::sftp_home`,文档见那边。
+    sftp_home: Option<mullion_ssh::sftp::RemotePath>,
 }
 
 /// F37:从 `layout.toml` 恢复出来的**占位标签** —— 一条连接都没建。
@@ -528,6 +545,24 @@ impl TabContent {
             TabContent::Terminal(t) => t.sftp_default_remote.clone(),
             TabContent::Files(f) => f.sftp_default_remote.clone(),
             TabContent::Restored(_) => None,
+        }
+    }
+
+    /// F123:这个标签 sftp 的登录目录。占位标签恒 `None`。
+    fn sftp_home(&self) -> Option<Vec<u8>> {
+        match self {
+            TabContent::Terminal(t) => t.sftp_home.as_ref().map(|p| p.as_bytes().to_vec()),
+            TabContent::Files(f) => f.sftp_home.as_ref().map(|p| p.as_bytes().to_vec()),
+            TabContent::Restored(_) => None,
+        }
+    }
+
+    /// 同上,写入。占位标签没有 sftp,静默忽略。
+    fn set_sftp_home(&mut self, home: mullion_ssh::sftp::RemotePath) {
+        match self {
+            TabContent::Terminal(t) => t.sftp_home = Some(home),
+            TabContent::Files(f) => f.sftp_home = Some(home),
+            TabContent::Restored(_) => {}
         }
     }
 
@@ -1820,6 +1855,7 @@ impl App {
         if let Some(d) = self.ui.settings_draft.as_ref() {
             self.settings.font_family = d.family.clone();
             self.settings.font_pt = mullion_store::settings::clamp_font_pt(d.font_pt);
+            self.settings.tmux_bootstrap = d.tmux_bootstrap;
         }
     }
 
@@ -1893,6 +1929,65 @@ impl App {
         match mullion_store::layout::save(&dir, &now) {
             Ok(()) => self.last_saved_layout = Some(now),
             Err(e) => log::debug!(target: "mullion", "布局落盘失败: {e}"),
+        }
+    }
+
+    /// F124:该配的连接配一遍 tmux 状态上报。
+    ///
+    /// 每次空闲都跑一遍,但真正的活只有「几个原子读 + 一次减法」——
+    /// `should_attempt` 挡在最前面,标签数与主机数都是个位数,不构成 T3
+    /// 意义上的每帧重活。
+    ///
+    /// 失败**只记 debug 日志**:用户没装 tmux、tmux 用的是非默认 socket、
+    /// 账号被 `ForceCommand` 限制,都会走到这里,弹错误卡片不成比例。
+    ///
+    /// `exec()` 本身**没有超时包裹**:挂住的最坏后果是这条连接不再重试
+    /// (`busy` 一直置着),且 task 攥着的那份 `Arc<SshConnection>` 会让连接
+    /// 晚于 `HostConn` 被 drop 才真断开。不卡 UI、数量有界。刻意的降级。
+    fn tick_tmux_bootstrap(&mut self) {
+        let enabled = self.settings.tmux_bootstrap;
+        let now = Instant::now();
+        for tab in self.tabs.iter_mut() {
+            let Some(t) = tab.content.as_terminal_mut() else {
+                // SFTP 节点标签没有 PTY,也就没有 tmux 客户端在跑;占位标签
+                // 连连接都没有。两者都无事可做。
+                continue;
+            };
+            for host in &mut t.ws.hosts {
+                let since = host
+                    .tmux_last_try
+                    .map(|at| now.duration_since(at).as_millis() as u64);
+                if !crate::remote_bootstrap::should_attempt(
+                    enabled,
+                    host.tmux_bootstrap.is_done(),
+                    host.tmux_bootstrap.is_busy(),
+                    since,
+                ) {
+                    continue;
+                }
+                host.tmux_last_try = Some(now);
+                host.tmux_bootstrap.mark_busy();
+                let conn = host.handle.clone();
+                let flags = host.tmux_bootstrap.clone();
+                // `tabs` 与 `_runtime` 是 `App` 上两个互不相干的字段,借用检查器
+                // 分得开,不必先收集再 spawn。
+                self._runtime.spawn(async move {
+                    let cmd = crate::remote_bootstrap::bootstrap_command();
+                    let ok = match mullion_ssh::exec::exec(&conn, cmd).await {
+                        Ok(out) => out.succeeded(),
+                        Err(e) => {
+                            log::debug!(target: "mullion", "tmux 自举失败:{e}");
+                            false
+                        }
+                    };
+                    log::debug!(
+                        target: "mullion",
+                        "tmux 自举结论:{}",
+                        if ok { "已配好" } else { "未配上,稍后重试" }
+                    );
+                    flags.finish(ok);
+                });
+            }
         }
     }
 
@@ -2263,7 +2358,10 @@ impl App {
         let tab = gen.and_then(|g| self.tabs.by_generation(g));
         let has_client = tab.is_some_and(|t| t.content.sftp_client().is_some());
         let pane_cwd = tab.and_then(|t| t.content.focused_pane_cwd());
-        let Some((gen, dir)) = sync_target_of(gen, has_client, pane_cwd.as_deref()) else {
+        let home = tab.and_then(|t| t.content.sftp_home());
+        let Some((gen, dir)) =
+            sync_target_of(gen, has_client, pane_cwd.as_deref(), home.as_deref())
+        else {
             return;
         };
         let target = mullion_ssh::sftp::RemotePath::from_bytes(dir.into_bytes());
@@ -3467,13 +3565,22 @@ impl App {
             return;
         };
         let default_remote = tab.content.sftp_default_remote();
-        // ②:优先开在这个标签焦点 pane 报出来的目录。
+        // ②:优先开在这个标签焦点 pane 报出来的目录。起始目录的计算
+        // (`files_start_dir`)挪进了 `spawn_sftp_open`——`~` 展开要用远端的
+        // 真登录目录,而那个值只有 `canonicalize(".")` 回来之后才知道,这里
+        // 算不了(F123)。
         let pane_cwd = tab.content.focused_pane_cwd();
-        let start_dir = files_start_dir(pane_cwd.as_deref(), default_remote.as_deref());
         if let Some(files) = tab.content.files_panel_mut() {
             files.remote.load = crate::files::state::Load::Loading;
         }
-        let task = spawn_sftp_open(&self._runtime, &self.proxy, generation, conn, start_dir);
+        let task = spawn_sftp_open(
+            &self._runtime,
+            &self.proxy,
+            generation,
+            conn,
+            default_remote,
+            pane_cwd,
+        );
         self.track_sftp_task(generation, task);
     }
 
@@ -3487,12 +3594,13 @@ impl App {
             (
                 Arc<mullion_ssh::sftp::SftpClient>,
                 mullion_ssh::sftp::RemotePath,
+                mullion_ssh::sftp::RemotePath,
             ),
             String,
         >,
     ) {
         match result {
-            Ok((client, home)) => {
+            Ok((client, home, dir)) => {
                 let seq = {
                     let Some(tab) = self.tabs.by_generation_mut(generation) else {
                         log::debug!(target: "mullion", "丢弃过期世代 {generation} 的 SFTP 打开结果");
@@ -3503,13 +3611,15 @@ impl App {
                         return;
                     };
                     *slot = Some(client.clone());
+                    // F123:登录目录存下来,给「侧栏关→开跃迁」那条路展开 `~`。
+                    tab.content.set_sftp_home(home);
                     let Some(files) = tab.content.files_panel_mut() else {
                         return;
                     };
-                    files.remote.begin_load(home.clone())
+                    files.remote.begin_load(dir.clone())
                 };
                 let task =
-                    spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, home, seq);
+                    spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, dir, seq);
                 self.track_sftp_task(generation, task);
             }
             Err(msg) => {
@@ -4864,6 +4974,7 @@ impl ApplicationHandler<UserEvent> for App {
                             sftp: None,
                             sftp_tasks: Vec::new(),
                             sftp_default_remote: sftp_prefs.default_remote,
+                            sftp_home: None,
                         })),
                     );
                     self.ui.close_session_manager();
@@ -4924,6 +5035,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // (`ConnectOk` 事件本身不带 SessionId)。
                     session_id,
                     handle,
+                    tmux_bootstrap: Default::default(),
+                    tmux_last_try: None,
                 });
                 // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
                 // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
@@ -4952,6 +5065,7 @@ impl ApplicationHandler<UserEvent> for App {
                         sftp: None,
                         sftp_tasks: Vec::new(),
                         sftp_default_remote: sftp_prefs.default_remote,
+                        sftp_home: None,
                     })),
                 );
                 // F37:是重连一个占位标签 → 把上次的分屏形状搭回来,并给新长
@@ -5133,6 +5247,8 @@ impl ApplicationHandler<UserEvent> for App {
                         addr: pending.addr,
                         session_id: Some(pending.session_id),
                         handle,
+                        tmux_bootstrap: Default::default(),
+                        tmux_last_try: None,
                     });
                     let host_ix = ws.hosts.len() - 1;
                     if rehost_pane(ws, pane, generation, host_ix, Box::new(ssh.clone()), rx) {
@@ -6940,6 +7056,10 @@ impl ApplicationHandler<UserEvent> for App {
         // 帧循环里 —— 它跟渲染无关,而 `about_to_wait` 是「已经闲下来了」
         // 这个语义唯一准确的位置。
         self.flush_layout_if_due();
+        // F124:到点就配一遍远端 tmux 的状态上报。跟布局落盘同一个理由放在
+        // 这里 —— 它跟渲染无关,而 `about_to_wait` 是「已经闲下来了」这个
+        // 语义唯一准确的位置。
+        self.tick_tmux_bootstrap();
         // 即将阻塞等事件 = 正常空闲。看门狗据此不误报(等事件本来就可以等很久)。
         diag::mark(diag::Stage::Idle);
     }
@@ -7072,20 +7192,61 @@ fn rehost_pane(
     true
 }
 
+/// F123 补缺口:把 `~` / `~/x` 拿远端的**真登录目录**展开成绝对路径。
+///
+/// 为什么需要:Ubuntu 默认 bash 报的标题是 `user@host: ~/Mullion`,而 openssh 的
+/// `sftp-server` **不展开 `~`** —— 直接拿去 `canonicalize` 会失败,面板停在
+/// 「取不到登录目录」,比不继承更糟。
+///
+/// 只认恰好是 `~` 和以 `~/` 开头两种。**`~user` 不展开**:那要查远端的 passwd,
+/// 我们不知道,猜错会把用户带到别人的家目录去。已经是绝对路径的返回 `None` ——
+/// 那一档由调用方更优先地处理。
+fn expand_tilde(cwd: &[u8], home: &[u8]) -> Option<Vec<u8>> {
+    let rest = match cwd {
+        b"~" => return Some(home.to_vec()),
+        _ => cwd.strip_prefix(b"~/")?,
+    };
+    // 接缝两侧的多余斜杠都剥掉再拼,否则 home=`/` + rest=`x` 会拼出 `//x`
+    // (POSIX 4.13:**恰好**两个前导斜杠由实现自行解释)。两侧都要剥:home 侧
+    // 是 `/` 结尾,cwd 侧是 `~//x` 这种冗余写法,只堵一侧另一侧照样漏。
+    let mut out = home.to_vec();
+    while out.last() == Some(&b'/') {
+        out.pop();
+    }
+    out.push(b'/');
+    out.extend_from_slice(rest.strip_prefix(b"/").unwrap_or(rest));
+    Some(out)
+}
+
 /// ② 文件面板远端栏该开在哪。
 ///
-/// 优先级:焦点 pane 报出来的当前目录 > F120 配置的默认远端目录 > `None`
-/// (交给 [`configured_remote_dir`] 落回 `"."`,也就是登录目录)。
+/// 优先级:焦点 pane 报出来的当前目录(绝对路径)> 展开 `~` 后的目录
+/// (需要已知登录目录,见 [`expand_tilde`])> F120 配置的默认远端目录 >
+/// `None`(交给 [`configured_remote_dir`] 落回 `"."`,也就是登录目录)。
 ///
-/// **只接受绝对路径**:标题里拿到的可能是 `~/Mullion`,而 openssh 的
-/// `sftp-server` **不展开 `~`** —— 直接拿去 `canonicalize` 会失败,面板会停在
-/// 「取不到登录目录」,比不继承更糟。非 UTF-8 的远端路径同样落回配置值
-/// (`spawn_sftp_open` 收 `Option<String>`);标题条那边仍会 lossy 显示,
-/// 见 `pane_title::dir_leaf`。
-fn files_start_dir(pane_cwd: Option<&[u8]>, default_remote: Option<&str>) -> Option<String> {
-    let from_pane = pane_cwd
-        .filter(|c| c.starts_with(b"/"))
-        .and_then(|c| String::from_utf8(c.to_vec()).ok());
+/// 标题里拿到的常常是 `~/Mullion` 这种缩写,而 openssh 的 `sftp-server`
+/// **不展开 `~`** —— 直接拿去 `canonicalize` 会失败,面板会停在
+/// 「取不到登录目录」,比不继承更糟。`home` 已知时会先把它展开成绝对路径;
+/// `home` 未知(sftp 还没开)时不猜,落回配置值。非 UTF-8 的远端路径
+/// (展开前后都算)同样落回配置值(`spawn_sftp_open` 收 `Option<String>`);
+/// 标题条那边仍会 lossy 显示,见 `pane_title::dir_leaf`。
+fn files_start_dir(
+    pane_cwd: Option<&[u8]>,
+    default_remote: Option<&str>,
+    home: Option<&[u8]>,
+) -> Option<String> {
+    let absolute = |c: &[u8]| -> Option<String> {
+        if !c.starts_with(b"/") {
+            return None;
+        }
+        String::from_utf8(c.to_vec()).ok()
+    };
+    let from_pane = pane_cwd.and_then(|c| {
+        absolute(c).or_else(|| {
+            let home = home?;
+            absolute(&expand_tilde(c, home)?)
+        })
+    });
     from_pane.or_else(|| default_remote.map(str::to_string))
 }
 
@@ -7107,6 +7268,7 @@ fn sync_target_of(
     gen: Option<u64>,
     has_client: bool,
     pane_cwd: Option<&[u8]>,
+    home: Option<&[u8]>,
 ) -> Option<(u64, String)> {
     let gen = gen?;
     if !has_client {
@@ -7116,7 +7278,7 @@ fn sync_target_of(
     }
     // 第二参固定 `None`:面板已经开着了,退回配置的默认远端目录会把用户
     // 当前的导航位置拽走——拿不到 pane 目录就宁可什么都不做。
-    let dir = files_start_dir(pane_cwd, None)?;
+    let dir = files_start_dir(pane_cwd, None, home)?;
     Some((gen, dir))
 }
 
@@ -7149,21 +7311,61 @@ fn configured_remote_dir(configured: Option<&str>) -> mullion_ssh::sftp::RemoteP
 /// 攥着 `Arc<SshConnection>` 撑住本该断开的连接(见 `wind_down`)。
 ///
 /// `default_remote`(F120):会话编辑器「SFTP」分节配置的默认远端目录,
-/// `None` 时落回登录目录 —— 判定逻辑在 `configured_remote_dir`。
+/// `pane_cwd`(F123):焦点 pane 报出来的当前目录。两者都原样递进来,起始
+/// 目录的计算(`files_start_dir`)挪到了这里 —— `~` 展开要用远端的真登录
+/// 目录,而那个值只有 `canonicalize(".")` 回来之后才知道,调用方那一侧
+/// 算不了。
 fn spawn_sftp_open(
     runtime: &Runtime,
     proxy: &EventLoopProxy<UserEvent>,
     generation: u64,
     handle: Arc<SshConnection>,
     default_remote: Option<String>,
+    pane_cwd: Option<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     let proxy = proxy.clone();
     runtime.spawn(async move {
         let result = match mullion_ssh::sftp::SftpClient::open(handle).await {
             Ok(client) => {
-                let login_dir = configured_remote_dir(default_remote.as_deref());
-                match client.canonicalize(&login_dir).await {
-                    Ok(home) => Ok((Arc::new(client), home)),
+                let dot = mullion_ssh::sftp::RemotePath::from_bytes(b".".to_vec());
+                match client.canonicalize(&dot).await {
+                    Ok(home) => {
+                        // F123:`~` 只有在这里才展得开 —— 登录目录要等
+                        // `canonicalize(".")` 回来才知道,调用方那一侧算不了。
+                        let from_pane = pane_cwd
+                            .as_deref()
+                            .and_then(|c| files_start_dir(Some(c), None, Some(home.as_bytes())));
+                        let configured = configured_remote_dir(default_remote.as_deref());
+
+                        // pane 报的目录**打不开就降级**,不判整体失败:标题由
+                        // tmux 异步报上来,那个目录可能刚被删掉/权限变了。继承
+                        // 目录是锦上添花,不该让文件面板整个打不开。配置值
+                        // (F120)则相反 —— 它打不开必须报出来,静默忽略用户
+                        // 配置正是本项目最不想要的失效方式。
+                        let mut dir = None;
+                        if let Some(p) = from_pane {
+                            let p = mullion_ssh::sftp::RemotePath::from_bytes(p.into_bytes());
+                            match client.canonicalize(&p).await {
+                                Ok(d) => dir = Some(d),
+                                Err(e) => log::debug!(
+                                    target: "mullion",
+                                    "pane 报的目录打不开,退回默认起始目录:{e}"
+                                ),
+                            }
+                        }
+                        match dir {
+                            Some(dir) => Ok((Arc::new(client), home, dir)),
+                            // 没配默认目录时起点就是登录目录,省掉第二次往返
+                            // (高延迟链路上一次 RTT 是能看出来的)。
+                            None if configured.as_bytes() == b"." => {
+                                Ok((Arc::new(client), home.clone(), home))
+                            }
+                            None => match client.canonicalize(&configured).await {
+                                Ok(dir) => Ok((Arc::new(client), home, dir)),
+                                Err(e) => Err(format!("SFTP 已连上,但打不开起始目录:{e}")),
+                            },
+                        }
+                    }
                     // 这一步失败时 channel **已经开成功了**,只是取不到登录
                     // 目录。跟上面那条共用「打开 SFTP 失败」会把排查方向带偏
                     // 到连接/认证层,而真实原因通常在权限或远端 `.` 不可 stat。
@@ -7849,10 +8051,10 @@ mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         autoscroll_for_pane, credential_delete_error, download_job, effective_focus_of,
-        files_owner_generation_of, files_start_dir, finish_password_change, font_px_for,
-        has_real_action, ime_cursor_area, next_panel_selection_index, pane_still_wanted,
-        rehost_pane, snapshot_tabs_of, sync_target_of, sync_timeout_wake_at, tab_title, upload_job,
-        wind_down, Modal, RestoredTab, Tab, TabContent, TerminalTab,
+        expand_tilde, files_owner_generation_of, files_start_dir, finish_password_change,
+        font_px_for, has_real_action, ime_cursor_area, next_panel_selection_index,
+        pane_still_wanted, rehost_pane, snapshot_tabs_of, sync_target_of, sync_timeout_wake_at,
+        tab_title, upload_job, wind_down, Modal, RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -8136,6 +8338,7 @@ mod tests {
                 typed: String::new(),
                 new_password: "hunter2".into(),
                 confirm_password: "hunter2".into(),
+                tmux_bootstrap: true,
             };
             let _ = finish_password_change(Some(&mut d), r, "已生效");
             assert!(
@@ -9716,12 +9919,123 @@ mod tests {
     fn the_idle_path_flushes_the_layout_periodically() {
         let src = include_str!("app.rs");
         let after = src
-            .split("fn about_to_wait(")
+            .split("\n    fn about_to_wait(")
             .nth(1)
-            .expect("找不到 about_to_wait");
+            .expect("找不到 about_to_wait 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 about_to_wait 的函数结尾")];
         assert!(
-            after[..2000].contains("self.flush_layout_if_due();"),
+            body.contains("self.flush_layout_if_due();"),
             "about_to_wait 不再定期落盘布局 —— 进程被杀时整场布局全丢"
+        );
+    }
+
+    /// **接线守护 / F124**:自举 tick 必须挂在 `about_to_wait` 上。
+    ///
+    /// 挂在别处的后果是静默的:挂在 `RedrawRequested` 的 `Present` 分支里,
+    /// 被节流掉的帧就不跑;不挂,整个功能一次都不会发起。
+    ///
+    /// **扎的是源码结构**:真正验它要一条活连接 + `EventLoopProxy`,这个
+    /// 测试容器里造不出来。验证边界:挡得住「整个调用被删/挪走」,挡不住
+    /// 「函数体被掏空」。
+    ///
+    /// 自证会变红:把 `self.tick_tmux_bootstrap();` 从 `about_to_wait` 里删掉。
+    #[test]
+    fn about_to_wait_ticks_the_tmux_bootstrap() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n    fn about_to_wait(")
+            .nth(1)
+            .expect("找不到 about_to_wait 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 about_to_wait 的函数结尾")];
+        assert!(
+            body.contains("self.tick_tmux_bootstrap();"),
+            "about_to_wait 不再跑自举 tick —— F124 一次都不会发起"
+        );
+    }
+
+    /// **接线守护 / F124**:草稿里的自举开关要真被搬进 `self.settings`。
+    ///
+    /// 漏掉这一行的症状很隐蔽:复选框点得动、界面也重画了(`Preview` 回报是
+    /// 草稿层的事),但 `self.settings` 一直是老值,于是「关掉」既不生效、
+    /// 按确定也不会落盘,下次打开弹窗又显示开着。
+    ///
+    /// **扎的是源码结构**:`take_settings_draft` 要一个完整的 `App`,这个测试
+    /// 容器里造不出来。验证边界:挡得住「整行被删」,挡不住「搬的是常量」。
+    ///
+    /// 自证会变红:把 `self.settings.tmux_bootstrap = d.tmux_bootstrap;` 删掉。
+    #[test]
+    fn the_settings_draft_write_back_carries_the_bootstrap_switch() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n    fn take_settings_draft(&mut self) {")
+            .nth(1)
+            .expect("找不到 take_settings_draft 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 take_settings_draft 的函数结尾")];
+        assert!(
+            body.contains("self.settings.font_pt"),
+            "函数体切歪了({} 字节)",
+            body.len()
+        );
+        assert!(
+            body.contains("self.settings.tmux_bootstrap = d.tmux_bootstrap;"),
+            "自举开关没被搬进 settings —— 用户关不掉、也存不住"
+        );
+    }
+
+    /// **接线守护 / F124**:tick 的三件事都得在——判据走
+    /// `remote_bootstrap::should_attempt`、发的是 `bootstrap_command()`、
+    /// 结论按退出码写回 `finish(..)`。
+    ///
+    /// 每一条漏掉都是静默的:
+    /// - 不走 `should_attempt` → 要么每帧发一次 exec(高延迟链路上刷爆),
+    ///   要么只发第一次(tmux 服务器晚起就永远配不上)。
+    /// - 不用 `bootstrap_command()` → live 测试验的命令跟实际发的不是同一条。
+    /// - 不写回 `finish` → `busy` 永远置着,第一次之后再也不重试。
+    ///
+    /// 自证会变红:把 `should_attempt(..)` 换成 `true`。
+    #[test]
+    fn the_bootstrap_tick_uses_the_shared_predicate_command_and_writes_back() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n    fn tick_tmux_bootstrap(&mut self) {")
+            .nth(1)
+            .expect("找不到 tick_tmux_bootstrap 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 tick_tmux_bootstrap 的函数结尾")];
+        // 先证明切出来的确实是函数体(切歪成空串的话下面几条会空过)。
+        assert!(
+            body.contains("hosts"),
+            "tick_tmux_bootstrap 的函数体切歪了(切出来 {} 字节)",
+            body.len()
+        );
+        assert!(
+            body.contains("remote_bootstrap::should_attempt("),
+            "tick 没走共享判据"
+        );
+        assert!(
+            body.contains("self.settings.tmux_bootstrap"),
+            "tick 没读设置开关 —— 用户关掉了照样发 exec"
+        );
+        assert!(
+            body.contains("remote_bootstrap::bootstrap_command()"),
+            "tick 发的不是共享的命令串"
+        );
+        assert!(
+            body.contains(".mark_busy()"),
+            "发起前没置 busy —— 上一次还挂在网络上时会再发一次,\
+             高延迟链路上叠成一串"
+        );
+        assert!(
+            body.contains(".finish(ok)"),
+            "tick 没把**退出码算出来的结论**写回标志 —— 写死 `finish(true)` 的话\
+             第一次尝试就 latch 成功,「tmux 服务器还没起」再也配不上"
         );
     }
 
@@ -9858,6 +10172,7 @@ mod tests {
                 sftp: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
+                sftp_home: None,
             })),
         );
         tabs
@@ -11171,6 +11486,7 @@ mod tests {
                 sftp: None,
                 sftp_tasks: vec![task],
                 sftp_default_remote: None,
+                sftp_home: None,
             })),
         };
 
@@ -11918,6 +12234,7 @@ mod tests {
                 sftp: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: configured.map(|s| s.to_string()),
+                sftp_home: None,
             }))
         }
 
@@ -11936,41 +12253,38 @@ mod tests {
         );
     }
 
-    /// **F120 补链路覆盖(调用点半程)**:`trigger_sftp_open` 必须把上面那条
-    /// 测试钉住的取值结果**原样传给** `spawn_sftp_open`,不能读了却在调用处
-    /// 换成别的值——复核实测的原始变异点就是把这个调用参数硬改成 `None`。
+    /// **接线守护**:`trigger_sftp_open` 把「配置的默认远端目录」和「焦点 pane
+    /// 报出来的 cwd」**两样都原样**递给 `spawn_sftp_open`。
     ///
-    /// **扎的是源码结构而非运行时行为**:`trigger_sftp_open` 只有在
-    /// `tab.content.sftp_connection()` 返回 `Some` 时才会走到 `spawn_sftp_open`
-    /// 那一步,而 `Terminal` 变体的连接来自 `ws.hosts` 里的 `Arc<SshConnection>`、
-    /// `Files` 变体的 `conn` 字段本身就是 `Arc<SshConnection>`——`SshConnection::new`
-    /// 对 `mullion-app` 不可见,这个测试容器里两个变体都造不出「连接已就绪」的
-    /// 状态,真实调用路径无法用真实对象触发(同 `file_actions_never_narrow_to_terminal_tabs_only`
-    /// 等一批「要 Arc<SshConnection>」的接线守护面对的限制)。上面那条测试已经
-    /// 覆盖了「读」的正确性,这条只补「读到的值有没有被原样传下去」这一环。
+    /// 起始目录的计算从这里挪进了 `spawn_sftp_open` —— `~` 展开要用远端的真
+    /// 登录目录,而那个值只有 `canonicalize(".")` 回来之后才知道,在这里算
+    /// 就必然拿不到。这里只负责把两个原料递下去,少递一个都是静默失效:
+    /// 少了 `default_remote`,F120 配置的默认目录被丢;少了 `pane_cwd`,
+    /// F123 的目录继承被丢。
     ///
-    /// 自证会变红:把 `spawn_sftp_open(` 调用里的 `default_remote,` 改成
-    /// `None,`(复核实测的原始变异点);把 `files_start_dir(pane_cwd.as_deref(),
-    /// default_remote.as_deref())` 的第二个实参换成字面量 `None`(配置值
-    /// 在中转这一步被静默丢弃,`start_dir` 字符串本身还在,前一条断言测不出来)。
-    ///
-    /// ②:`default_remote` 现在不再直接传给 `spawn_sftp_open`,而是先跟焦点
-    /// pane 的 cwd 一起过 `files_start_dir`。这条守的仍是「配置值不许在这一步
-    /// 丢掉」,只是落点从参数名变成了 `start_dir` 这条链。
+    /// 自证会变红:把 `pane_cwd` 那个实参换成 `None`。
     #[test]
-    fn trigger_sftp_open_passes_the_tabs_default_remote_into_spawn_sftp_open() {
+    fn trigger_sftp_open_hands_both_ingredients_to_spawn_sftp_open() {
         let src = include_str!("app.rs");
-        let after = src
-            .split("fn trigger_sftp_open(&mut self, generation: u64) {")
-            .nth(1)
+        // 锚点带**行首缩进**:`"\n    fn …"` 在源码里只有真正的方法定义处成立。
+        // 不带的话,测试自己 `.split("fn trigger_sftp_open(…")` 这行字面量也会
+        // 被 `include_str!` 匹配上,函数一旦改名/被删,切分不会走到 `expect`,
+        // 而是切到测试自己身上,报出一条方向完全跑偏的错误。
+        let at = src
+            .find("\n    fn trigger_sftp_open(&mut self, generation: u64) {")
             .expect("找不到 trigger_sftp_open 的定义");
+        let after = &src[at + 1..];
         let body = &after[..after
             .find("\n    }\n")
             .expect("找不到 trigger_sftp_open 的函数结尾")];
 
         assert!(
             body.contains("let default_remote = tab.content.sftp_default_remote();"),
-            "trigger_sftp_open 没有从 tab 读 default_remote"
+            "trigger_sftp_open 没从 tab 读 default_remote"
+        );
+        assert!(
+            body.contains("focused_pane_cwd()"),
+            "trigger_sftp_open 没读焦点 pane 的当前目录 —— 目录继承会静默失效"
         );
 
         let call_after = body
@@ -11981,23 +12295,12 @@ mod tests {
             .find(");")
             .expect("找不到 spawn_sftp_open 调用的结尾")];
         assert!(
-            call_args.contains("start_dir"),
-            "spawn_sftp_open 的调用没有把起始目录传下去——配置的默认远端目录\
-             和 ② 的目录继承都会在这一步被静默丢弃,验收清单第 7 条会失效"
+            call_args.contains("default_remote"),
+            "spawn_sftp_open 没收到 default_remote —— F120 的默认目录被静默丢弃"
         );
-
-        // ②:`default_remote` 现在经 `files_start_dir` 中转,所以光断言
-        // `spawn_sftp_open` 收到 `start_dir` 是不够的 —— 把第二个实参换成
-        // 字面量 `None`(配置值静默丢弃)照样能过。这里扎住实参本身。
-        let mixed = body
-            .split("files_start_dir(")
-            .nth(1)
-            .expect("trigger_sftp_open 里没调 files_start_dir");
-        let mixed_args = &mixed[..mixed.find(");").expect("找不到 files_start_dir 调用的结尾")];
         assert!(
-            mixed_args.contains("default_remote"),
-            "files_start_dir 的第二个实参不是从 tab 读出来的 default_remote——\
-             配置的默认远端目录会在这一步被静默丢弃,验收清单第 7 条失效"
+            call_args.contains("pane_cwd"),
+            "spawn_sftp_open 没收到 pane_cwd —— F123 的目录继承被静默丢弃"
         );
     }
 
@@ -12015,31 +12318,117 @@ mod tests {
     #[test]
     fn files_start_dir_prefers_the_panes_cwd_but_only_if_absolute() {
         assert_eq!(
-            files_start_dir(Some(b"/home/dev/Mullion"), Some("/srv")).as_deref(),
+            files_start_dir(Some(b"/home/dev/Mullion"), Some("/srv"), None).as_deref(),
             Some("/home/dev/Mullion"),
             "pane 报的目录该压过配置的默认目录"
         );
+        // ~ 展开需要已知 home;这里 home 未知(sftp 还没开),该落回配置值。
         assert_eq!(
-            files_start_dir(Some(b"~/Mullion"), Some("/srv")).as_deref(),
+            files_start_dir(Some(b"~/Mullion"), Some("/srv"), None).as_deref(),
             Some("/srv"),
-            "~ 不是绝对路径,sftp-server 不展开它,该落回配置值"
+            "home 未知时 ~ 不展开,sftp-server 不展开它,该落回配置值"
         );
         assert_eq!(
-            files_start_dir(None, Some("/srv")).as_deref(),
+            files_start_dir(None, Some("/srv"), None).as_deref(),
             Some("/srv"),
             "没有 pane 目录时用配置值"
         );
-        assert_eq!(files_start_dir(None, None), None);
+        assert_eq!(files_start_dir(None, None, None), None);
         // 非 UTF-8 的远端路径落回配置值:`spawn_sftp_open` 收 `Option<String>`,
         // 到不了这条路。标题条那边仍会 lossy 显示出来(`dir_leaf`)。
         assert_eq!(
-            files_start_dir(Some(b"/tmp/\xff"), Some("/srv")).as_deref(),
+            files_start_dir(Some(b"/tmp/\xff"), Some("/srv"), None).as_deref(),
             Some("/srv")
         );
         // 空切片:`starts_with(b"/")` 为假,同 `~` 一样落回配置值——不是
         // panic 也不是「当成根目录」。
         assert_eq!(
-            files_start_dir(Some(b""), Some("/srv")).as_deref(),
+            files_start_dir(Some(b""), Some("/srv"), None).as_deref(),
+            Some("/srv")
+        );
+    }
+
+    /// F123 补缺口:标题里拿到的常常是 `~/Mullion` 这种缩写,而 openssh 的
+    /// `sftp-server` **不展开 `~`**。拿 SFTP 的真登录目录(`canonicalize(".")`)
+    /// 把它拼成绝对路径,裸 shell 场景就不用配任何东西也能继承目录了。
+    ///
+    /// 自证会变红:让 `expand_tilde` 无条件返回 `None`(前两条红);
+    /// 把 `~user` 那条也当成 `~` 展开(第四条红)。
+    #[test]
+    fn expand_tilde_uses_the_sftp_login_directory() {
+        assert_eq!(
+            expand_tilde(b"~", b"/home/dev").as_deref(),
+            Some(&b"/home/dev"[..])
+        );
+        assert_eq!(
+            expand_tilde(b"~/Mullion", b"/home/dev").as_deref(),
+            Some(&b"/home/dev/Mullion"[..])
+        );
+        // 已经是绝对路径:不归它管(调用方那一档更优先)。
+        assert_eq!(expand_tilde(b"/srv/app", b"/home/dev"), None);
+        // `~user` 的语义要查远端的 passwd,我们不知道 —— **不猜**。
+        assert_eq!(expand_tilde(b"~foo/x", b"/home/dev"), None);
+        assert_eq!(expand_tilde(b"", b"/home/dev"), None);
+        // home 自己是根目录时不能拼出 `//x`。
+        assert_eq!(expand_tilde(b"~/x", b"/").as_deref(), Some(&b"/x"[..]));
+        // home 带尾斜杠同理。
+        assert_eq!(
+            expand_tilde(b"~/x", b"/home/dev/").as_deref(),
+            Some(&b"/home/dev/x"[..])
+        );
+        // 冗余斜杠出在 **cwd 侧**时也一样 —— 只剥 home 那一侧的话,
+        // `~//x` + home=`/` 会拼出正是这里想避开的 `//x`。
+        assert_eq!(expand_tilde(b"~//x", b"/").as_deref(), Some(&b"/x"[..]));
+        assert_eq!(
+            expand_tilde(b"~//x", b"/home/dev").as_deref(),
+            Some(&b"/home/dev/x"[..])
+        );
+    }
+
+    /// 四档优先级:pane 报的绝对路径 > 展开后的 `~` > 配置的默认远端目录 >
+    /// `None`(交给调用方落回登录目录)。
+    ///
+    /// 自证会变红:把 `home` 那一档删掉(第二条落到 `/srv`,红)。
+    #[test]
+    fn files_start_dir_expands_a_tilde_before_falling_back_to_the_configured_dir() {
+        // 绝对路径最优先,home 在不在都一样。
+        assert_eq!(
+            files_start_dir(Some(b"/home/dev/Mullion"), Some("/srv"), Some(b"/home/dev"))
+                .as_deref(),
+            Some("/home/dev/Mullion")
+        );
+        // `~` + 已知 home → 展开。
+        assert_eq!(
+            files_start_dir(Some(b"~/Mullion"), Some("/srv"), Some(b"/home/dev")).as_deref(),
+            Some("/home/dev/Mullion")
+        );
+        // `~` 但 home 未知(sftp 还没开):不展开、不猜 `/home/<user>`,
+        // 落回配置值。
+        assert_eq!(
+            files_start_dir(Some(b"~/Mullion"), Some("/srv"), None).as_deref(),
+            Some("/srv")
+        );
+        // pane 什么都没报:配置值。
+        assert_eq!(
+            files_start_dir(None, Some("/srv"), Some(b"/home/dev")).as_deref(),
+            Some("/srv")
+        );
+        // 都没有:None。
+        assert_eq!(files_start_dir(None, None, Some(b"/home/dev")), None);
+        // 非 UTF-8 展开结果同样进不了 `Option<String>`,落回配置值。
+        assert_eq!(
+            files_start_dir(Some(b"~/\xff"), Some("/srv"), Some(b"/home/dev")).as_deref(),
+            Some("/srv")
+        );
+        // home 自己不是绝对路径(远端 `canonicalize(".")` 返回了怪东西)时,
+        // 展开结果照样不绝对 —— 展开后必须**再**过一遍绝对路径检查。少了那道
+        // 检查这两条会把 `relative/x`、`` 当成起始目录发给 sftp-server。
+        assert_eq!(
+            files_start_dir(Some(b"~/x"), Some("/srv"), Some(b"relative")).as_deref(),
+            Some("/srv")
+        );
+        assert_eq!(
+            files_start_dir(Some(b"~"), Some("/srv"), Some(b"")).as_deref(),
             Some("/srv")
         );
     }
@@ -12064,7 +12453,7 @@ mod tests {
         // 早退①:没有属主世代——即使 sftp 已连、pane 目录是合法绝对路径,
         // 用户可感知的后果是「侧栏开了却什么都没同步」,不该发生同步。
         assert_eq!(
-            sync_target_of(None, true, Some(b"/home/dev/x")),
+            sync_target_of(None, true, Some(b"/home/dev/x"), None),
             None,
             "没有属主世代时不该同步——这个分支理论上到不了(`sync_files_to_focused_pane`\
              早就该拿不到 has_client/pane_cwd),但纯函数自己也不能在这种输入下瞎猜一个世代出来"
@@ -12073,7 +12462,7 @@ mod tests {
         // 早退②:sftp 还没连上。用户可感知的后果:面板已经在等 `trigger_sftp_open`
         // 把 sftp 连起来,这时候发 Goto 会打到一条还不存在的连接上。
         assert_eq!(
-            sync_target_of(Some(7), false, Some(b"/home/dev/x")),
+            sync_target_of(Some(7), false, Some(b"/home/dev/x"), None),
             None,
             "sftp 还没开时不该发 Goto——那条连接还不存在"
         );
@@ -12081,79 +12470,144 @@ mod tests {
         // 早退③:焦点 pane 没报过目录。用户可感知的后果:面板停在原处,
         // 不该凭空跳到某个猜测目录。
         assert_eq!(
-            sync_target_of(Some(7), true, None),
+            sync_target_of(Some(7), true, None, None),
             None,
             "拿不到 pane 目录时不该同步——面板该停在原处"
         );
 
-        // 早退④:pane 报的是相对路径/`~`。同上,openssh 的 sftp-server 不
-        // 展开 `~`,发过去只会让面板停在「取不到登录目录」。
+        // 早退④:pane 报的是相对路径/`~`,home 未知时不展开。同上,openssh
+        // 的 sftp-server 不展开 `~`,发过去只会让面板停在「取不到登录目录」。
         assert_eq!(
-            sync_target_of(Some(7), true, Some(b"~/Mullion")),
+            sync_target_of(Some(7), true, Some(b"~/Mullion"), None),
             None,
-            "pane 目录不是绝对路径时不该同步——发过去 sftp-server 展不开 `~`"
+            "home 未知时 pane 目录不是绝对路径就不该同步——发过去 sftp-server 展不开 `~`"
         );
 
         // 正常路径:世代 + 已连 + 绝对路径,三者都齐了才同步。
         assert_eq!(
-            sync_target_of(Some(7), true, Some(b"/home/dev/x")),
+            sync_target_of(Some(7), true, Some(b"/home/dev/x"), None),
             Some((7, "/home/dev/x".to_string())),
             "三个条件都满足时该把 (世代, 目录) 原样吐出来"
         );
+
+        // `home` 真的透传下去了。上面每一条的 `home` 都是 `None`,而 `None` 下
+        // 「透传」和「吞掉」行为一模一样 —— 只有这条(`~` + 已知 home)能分辨。
+        // 少了它,`files_start_dir(pane_cwd, None, None)` 这种漏传照样全绿,
+        // 而登录目录接真值之后 `~` 就永远展不开了。
+        assert_eq!(
+            sync_target_of(Some(7), true, Some(b"~/x"), Some(b"/home/dev")),
+            Some((7, "/home/dev/x".to_string())),
+            "home 已知时该透传给 files_start_dir,让 `~` 展开后再同步"
+        );
     }
 
-    /// ② 的接线守护:`trigger_sftp_open` 必须把「焦点 pane 的 cwd」和
-    /// 「配置的默认远端目录」一起交给 `files_start_dir`,再把结果传下去。
+    /// **接线守护**:两个起始目录来源的**失败处置不一样**,不能被抹平。
     ///
-    /// **扎的是源码结构**,理由同
-    /// `trigger_sftp_open_passes_the_tabs_default_remote_into_spawn_sftp_open`:
-    /// 真正验它要一条活 sftp 连接。验证边界:挡得住「忘了继承」和「把
-    /// default_remote 直接传下去」,挡不住 `files_start_dir` 自己写错(那由
-    /// 上面那条纯函数测试守)。
+    /// pane 报的目录会过期(标题由 tmux 异步报来,目录可能刚被删),打不开就
+    /// 退回默认起始目录、面板照常打开;配置的默认远端目录(F120)打不开则必须
+    /// 报错 —— 静默忽略用户填的配置是本项目最不想要的失效方式。抹平成「都报错」
+    /// 会让 pane 目录一过期文件面板就整个打不开;抹平成「都降级」会让写错的
+    /// F120 配置永远不吭声。
     ///
-    /// 自证会变红:把 `trigger_sftp_open` 里的 `files_start_dir(...)` 换回
-    /// 直接传 `default_remote`;把 `files_start_dir` 的**第一个**实参换成字面量
-    /// `None`(读了 `focused_pane_cwd()` 却没传下去 —— 光断言"源码里调过这个
-    /// 函数"是拦不住这一种的,所以下面要扎实参本身)。
+    /// 自证会变红:把 pane 那条的 `Err(e) => log::debug!(…)` 改成 `Err(e) =>
+    /// return Err(…)` 之类的直接失败(第二条红);或把配置那条的 `Err` 分支
+    /// 也改成退回 home(第三条红)。
     #[test]
-    fn trigger_sftp_open_inherits_the_focused_panes_directory() {
+    fn only_the_stale_pane_directory_degrades_a_bad_configured_dir_must_surface() {
         let src = include_str!("app.rs");
-        let after = src
-            .split("fn trigger_sftp_open(&mut self, generation: u64) {")
-            .nth(1)
-            .expect("找不到 trigger_sftp_open 的定义");
+        let at = src
+            .find("\nfn spawn_sftp_open(")
+            .expect("找不到 spawn_sftp_open 的定义");
+        let after = &src[at + 1..];
+        let body = &after[..after
+            .find("\n}\n")
+            .expect("找不到 spawn_sftp_open 的函数结尾")];
+        assert!(
+            body.contains("canonicalize(&dot)"),
+            "函数体切歪了({} 字节)",
+            body.len()
+        );
+        assert!(
+            body.contains("\"pane 报的目录打不开,退回默认起始目录:{e}\""),
+            "pane 目录打不开时没降级 —— 目录一过期文件面板就整个打不开"
+        );
+        assert!(
+            body.contains("Err(e) => Err(format!(\"SFTP 已连上,但打不开起始目录:{e}\"))"),
+            "配置的默认远端目录打不开时没报错 —— F120 的配置会被静默忽略"
+        );
+    }
+
+    /// **接线守护**:`accept_sftp_opened` 必须把真登录目录存进标签。
+    ///
+    /// 不存的话「侧栏已开着、关→开跃迁」那条路(`sync_files_to_focused_pane`)
+    /// 拿不到 home,`~/Mullion` 展不开,面板停在原处 —— 而首次打开那条路
+    /// 却是好的,现象成了「第一次开对、之后再开都不对」,极难对上原因。
+    ///
+    /// 自证会变红:把 `set_sftp_home` 那一行删掉。
+    #[test]
+    fn accept_sftp_opened_remembers_the_login_directory() {
+        let src = include_str!("app.rs");
+        // 锚点带行首缩进,切到自身闭合括号(不是「下一个 `fn`」)—— 后者会把
+        // 下一个函数的文档注释也带进来,注释里出现 `set_sftp_home` 字样就够让
+        // 这条守护在实现真丢了那行时照样绿。
+        let at = src
+            .find("\n    fn accept_sftp_opened(")
+            .expect("找不到 accept_sftp_opened 的定义");
+        let after = &src[at + 1..];
         let body = &after[..after
             .find("\n    }\n")
-            .expect("找不到 trigger_sftp_open 的函数结尾")];
-
+            .expect("找不到 accept_sftp_opened 的函数结尾")];
         assert!(
-            body.contains("focused_pane_cwd()"),
-            "trigger_sftp_open 没读焦点 pane 的当前目录 —— ② 的继承会静默失效"
+            body.contains("generation"),
+            "函数体切歪了({} 字节)",
+            body.len()
         );
-        let call_after = body
-            .split("spawn_sftp_open(")
-            .nth(1)
-            .expect("找不到 spawn_sftp_open 调用");
-        let call_args = &call_after[..call_after
-            .find(");")
-            .expect("找不到 spawn_sftp_open 调用的结尾")];
         assert!(
-            call_args.contains("start_dir"),
-            "spawn_sftp_open 收到的不是 files_start_dir 的结果"
+            body.contains("set_sftp_home("),
+            "登录目录没被存下来 —— 侧栏「关→开」跃迁那条路展不开 ~"
         );
+    }
 
-        // `body.contains("focused_pane_cwd()")` 只说明源码里调过它,不说明返回值
-        // 真的进了 `files_start_dir` —— 第一参被静默换成 `None` 时那条断言照过。
-        // 扎实参本身(对称于另一条测试里守 `default_remote` 的那段)。
-        let mixed = body
-            .split("files_start_dir(")
+    /// **接线守护**:`sync_files_to_focused_pane` 要把存下来的登录目录喂给
+    /// `sync_target_of`。传死 `None` 的话这条路永远展不开 `~`。
+    ///
+    /// 自证会变红:把 `sync_target_of` 的第四个实参改成字面量 `None`。
+    #[test]
+    fn the_sidebar_sync_feeds_the_login_directory_into_the_predicate() {
+        let src = include_str!("app.rs");
+        // 锚点带行首缩进,理由同 `trigger_sftp_open_hands_both_ingredients_…`。
+        let at = src
+            .find("\n    fn sync_files_to_focused_pane(&mut self) {")
+            .expect("找不到 sync_files_to_focused_pane 的定义");
+        let after = &src[at + 1..];
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 sync_files_to_focused_pane 的函数结尾")];
+        assert!(body.contains("sftp_home()"), "没读标签存下的登录目录");
+        let call = body
+            .split("sync_target_of(")
             .nth(1)
-            .expect("trigger_sftp_open 里没调 files_start_dir");
-        let mixed_args = &mixed[..mixed.find(");").expect("找不到 files_start_dir 调用的结尾")];
+            .expect("没调 sync_target_of");
+        // 切到**配对**的右括号,不是第一个 —— 实参里带 `.as_deref()` 这种
+        // 空括号是惯用写法,按第一个 `)` 切会把实参串截在 `pane_cwd.as_deref(`
+        // 处,于是这条守护恒红,逼得生产代码为迁就测试写成怪样子。
+        let end = {
+            let mut depth = 1usize;
+            call.char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(i)
+                })
+                .expect("找不到 sync_target_of 调用的结尾")
+        };
+        let args = &call[..end];
         assert!(
-            mixed_args.contains("pane_cwd"),
-            "files_start_dir 的第一个实参不是焦点 pane 的 cwd —— ② 的继承会静默\
-             失效,面板每次都开在配置的默认目录"
+            args.contains("home"),
+            "sync_target_of 收到的不是登录目录:{args}"
         );
     }
 

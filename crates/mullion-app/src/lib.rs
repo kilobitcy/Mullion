@@ -21,6 +21,7 @@ pub mod input;
 pub mod logx;
 pub mod pane;
 pub mod reflow;
+pub mod remote_bootstrap;
 pub mod render;
 pub mod session_pump;
 pub mod shell;

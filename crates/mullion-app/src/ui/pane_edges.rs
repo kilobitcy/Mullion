@@ -11,21 +11,37 @@
 //! egui 整层 composite 在 wgpu 自绘的终端之上,所以 `Background` 也在终端
 //! 之上,同时在面板/弹窗之下 —— 不会盖住模态框。
 
-use crate::shell::workspace::{PaneGeom, PxRect, GAP_PX};
+use crate::shell::workspace::{term_pad_px, PaneGeom, PxRect, GAP_PX};
 use crate::theme::{self, Theme};
 use crate::ui::pane_title::TitleView;
 
 /// 这块 pane 让给分界线的两条缝:`(右缘竖线, 下缘横线)`。没让位就是 `None`。
 ///
-/// 判据是「`term_px` 比 `px` 小」—— 与 `layout_geometry` 里 `at_right` /
-/// `at_bottom` 那两个判断同源,不在这里重新推一遍「谁在边上」(推第二遍
-/// 就会有第二份真值,布局一改就分叉)。
+/// `ppp` 收的是**算 `g` 时用的那个** `scale_factor`,内缩量由本函数自己
+/// `term_pad_px(ppp)` 出来 —— 不收算好的 `pad: u32`:那是个没有单位的裸整数,
+/// 传成 `GAP_PX` 或用错 ppp 算出来的值编译器都拦不住,只会在特定 DPI 下画错线。
+///
+/// 内缩量参与判据是因为:竖线判据不能再单纯看
+/// 「`term_px.w` 比 `px.w` 小」:F80 之后**每个** pane 的 `term_px` 都会因为
+/// 内缩而比 `px` 窄,不分是否真的挨着邻居。判据改成「比只扣内缩之后还窄
+/// 超过 `2*pad`」——多出来的那部分才是让给分隔线的 `GAP_PX`。竖线的判断因此
+/// 仍然与 `layout_geometry` 里 `at_right` 同源(只是隔着 `pad` 这个已知量间接
+/// 对比,而不是重新推一遍「谁在边上」),横线不受横向内缩影响,判据不变。
 ///
 /// 竖线只跨 `term_px` 的纵向范围:标题条那一段的同一列像素由标题条自己的
 /// 底色填满,再画一道会在标题条上多出一截亮线。
-pub fn divider_lines_of(g: &PaneGeom) -> (Option<PxRect>, Option<PxRect>) {
-    let right = (g.term_px.w < g.px.w).then(|| PxRect {
-        x: g.px.x + g.term_px.w,
+///
+/// 竖线的 `x` **不能**再用 `g.px.x + g.term_px.w` 算 —— 那条公式假设
+/// `term_px.x == px.x`(F80 之前成立),F80 内缩后 `term_px.x = px.x + pad`,
+/// 沿用旧公式会把竖线画到 `[px.x+term_px.w, ..)`,那正好落在 `term_px` 内部
+/// (`term_px.w` 本身已经把 pad 扣过一次),等于把分隔线画穿了终端内容。
+/// 让给分隔线的那 1px 恒是这块 pane **自己 `px` 区间的最后一列**(设计见模块
+/// 文档:「非最右/最下的 pane 在 `term_px` 上各让出 1px,分隔线画在让出来的
+/// 缝里」),所以直接从 `px` 反推:`x = px.x + px.w - GAP_PX`。
+pub fn divider_lines_of(g: &PaneGeom, ppp: f32) -> (Option<PxRect>, Option<PxRect>) {
+    let pad = term_pad_px(ppp);
+    let right = (g.px.w.saturating_sub(g.term_px.w) > 2 * pad).then(|| PxRect {
+        x: g.px.x + g.px.w - GAP_PX,
         y: g.term_px.y,
         w: GAP_PX,
         h: g.term_px.h,
@@ -65,7 +81,7 @@ pub fn paint(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) {
         )
     };
     for v in views {
-        let (right, bottom) = divider_lines_of(&v.geom);
+        let (right, bottom) = divider_lines_of(&v.geom, ppp);
         for line in [right, bottom].into_iter().flatten() {
             p.rect_filled(to_pt(line), 0.0, theme::c32(t.divider));
         }
@@ -124,7 +140,7 @@ mod tests {
     #[test]
     fn a_lone_pane_has_no_divider_at_all() {
         let g = layout_geometry(&leaf(1), AREA, CELL, false, 1.0);
-        assert_eq!(divider_lines_of(&g[0]), (None, None));
+        assert_eq!(divider_lines_of(&g[0], 1.0), (None, None));
     }
 
     /// ③ 的核心几何约定:竖线必须落在**两块 pane 的 `term_px` 都没占用**的
@@ -139,7 +155,7 @@ mod tests {
         let g = layout_geometry(&tree, AREA, CELL, false, 1.0);
         assert_eq!(g.len(), 2, "该分出两块");
 
-        let (right, bottom) = divider_lines_of(&g[0]);
+        let (right, bottom) = divider_lines_of(&g[0], 1.0);
         let line = right.expect("左 pane 该有一条右缘竖线");
         assert_eq!(bottom, None, "左右分屏不该有横线");
         assert_eq!(line.w, GAP_PX, "分界线就是那条缝的宽度,不许更宽");
@@ -153,7 +169,7 @@ mod tests {
             );
         }
         assert_eq!(
-            divider_lines_of(&g[1]),
+            divider_lines_of(&g[1], 1.0),
             (None, None),
             "最右那块没让出缝,不该再画线(会画到窗口边缘外/邻居身上)"
         );
@@ -176,7 +192,7 @@ mod tests {
         let tree = vsplit(0.5, leaf(1), leaf(2));
         let g = layout_geometry(&tree, AREA, CELL, true, 1.0);
 
-        let (right, bottom) = divider_lines_of(&g[0]);
+        let (right, bottom) = divider_lines_of(&g[0], 1.0);
         assert_eq!(right, None, "上下分屏不该有竖线");
         let line = bottom.expect("上 pane 该有一条下缘横线");
         assert_eq!(line.h, GAP_PX);
@@ -189,7 +205,7 @@ mod tests {
                 p.id
             );
         }
-        assert_eq!(divider_lines_of(&g[1]), (None, None));
+        assert_eq!(divider_lines_of(&g[1], 1.0), (None, None));
     }
 
     fn view(g: PaneGeom, index: usize, focused: bool) -> TitleView<'static> {

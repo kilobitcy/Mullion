@@ -6,7 +6,9 @@
 pub mod geom;
 pub mod preset;
 
-pub use geom::{layout_geometry, title_bar_px, PaneGeom, PxRect, GAP_PX, TITLE_BAR_PT};
+pub use geom::{
+    layout_geometry, term_pad_px, title_bar_px, PaneGeom, PxRect, GAP_PX, TERM_PAD_PT, TITLE_BAR_PT,
+};
 pub use preset::{icon_cells, next_focus, plan_preset, preset_tree, Preset, PresetPlan};
 
 /// pane 的连接状态(§6.3)。断开的 pane 内容保留、可滚可复制,只是不再收发。
@@ -77,6 +79,17 @@ pub struct HostConn {
     /// 目标主机连接(含跳板保活)。**必须整条持有**:Drop 即断连。`Arc` 是必须的:
     /// russh 的 `Handle` 没实现 `Clone`,只有 `Drop`(释放即断连)。
     pub handle: Arc<SshConnection>,
+    /// F124:这台机器上的 tmux 状态上报配过没有。**按连接存**——B2-b 换主机
+    /// 之后一个 `Workspace` 上会有多条 `HostConn`,每台机器的 tmux 服务器
+    /// 各自独立,共享一份 `done` 会让第二台永远配不上。
+    pub tmux_bootstrap: crate::remote_bootstrap::BootstrapFlags,
+    /// F124:上次**发起**自举的时刻。`None` = 还没试过。判据见
+    /// `remote_bootstrap::should_attempt`。
+    ///
+    /// 断线重连会造一整个新的 `Workspace` 世代、也就是新的 `HostConn`,这两个
+    /// 字段随之清零、重新配一遍。这是对的:`tmux set -g` 幂等,重发无副作用,
+    /// 而远端 tmux 服务器可能在断线期间重启过。
+    pub tmux_last_try: Option<std::time::Instant>,
 }
 
 /// 一个分屏的全部运行时状态。
@@ -971,6 +984,49 @@ mod tests {
             ws.pane(id).unwrap().tmux.as_deref(),
             Some("plain"),
             "标题批次仍要整体重置 tmux"
+        );
+    }
+
+    /// F124:两次 `BootstrapFlags::default()` 造出来的是**互不相干**的两份状态。
+    /// 一个 `Workspace` 上会有多条 `HostConn`(B2-b 换主机),每台机器的 tmux
+    /// 服务器各自独立,串在一起的话第一台成功 latch 了 `done`,第二台就永远
+    /// 配不上。
+    ///
+    /// **这条不碰 `HostConn`**:它里面有 `Arc<SshConnection>`,而
+    /// `SshConnection::new` 是 `mullion-ssh` 内部的 `pub(crate)`,这边造不出实例。
+    /// 所以它只挡得住「`default()` 退化成共享同一个静态实例」这一种坏法;
+    /// 「字段真的挂在 `HostConn` 上」由下一条源码级守护兜。
+    #[test]
+    fn each_host_connection_carries_its_own_bootstrap_state() {
+        let a = crate::remote_bootstrap::BootstrapFlags::default();
+        let b = crate::remote_bootstrap::BootstrapFlags::default();
+        a.finish(true);
+        assert!(a.is_done());
+        assert!(!b.is_done(), "两条连接的自举状态串了");
+    }
+
+    /// **接线守护**:自举状态必须挂在 `HostConn` 上。
+    ///
+    /// **扎的是源码结构**(`HostConn` 造不出实例,见上一条的说明)。验证边界:
+    /// 挡得住「字段整个搬走」,挡不住「两边都留一份、只是没人用这份」。
+    ///
+    /// 自证会变红:把 `pub tmux_bootstrap: ...` 那行从 `HostConn` 删掉。
+    #[test]
+    fn bootstrap_state_lives_on_the_host_connection() {
+        let src = include_str!("mod.rs");
+        let after = src
+            .split("\npub struct HostConn {")
+            .nth(1)
+            .expect("找不到 HostConn 的定义");
+        let body = &after[..after.find("\n}\n").expect("找不到 HostConn 的结尾")];
+        assert!(
+            body.contains("tmux_bootstrap"),
+            "HostConn 上没有自举状态 —— 多主机时会共用一份 done"
+        );
+        assert!(
+            body.contains("tmux_last_try"),
+            "HostConn 上没有「上次发起时刻」—— 重试判据拿不到 since_last_ms,\
+             要么永不重试要么每帧重试"
         );
     }
 }

@@ -29,18 +29,26 @@ pub struct PxRect {
 /// 常量存点,`layout_geometry` 收 ppp 换成像素。
 pub const TITLE_BAR_PT: f32 = 32.0;
 
-/// 当前 DPI 下标题条占多少物理像素。
+/// 逻辑点 → 当前 DPI 下的物理像素。
 ///
 /// 非有限或非正的 `ppp` 落回 1.0:winit 在显示器热插拔的瞬间报过 0 / NaN
 /// 的 `scale_factor`,算出 0 会让标题条整排消失、算出巨值会把终端区挤成
 /// 0 行,而且两者都要等下一帧 ppp 正常了才恢复。
-pub fn title_bar_px(ppp: f32) -> u32 {
+///
+/// **兜底只写这一处**:每个用到 ppp 的常量各抄一遍的话,以后改兜底策略
+/// (比如给 ppp 加个上限)必然漏改其中一处,而两处各有各的测试、谁也照不出谁。
+fn pt_to_px(pt: f32, ppp: f32) -> u32 {
     let ppp = if ppp.is_finite() && ppp > 0.0 {
         ppp
     } else {
         1.0
     };
-    (TITLE_BAR_PT * ppp).round() as u32
+    (pt * ppp).round() as u32
+}
+
+/// 当前 DPI 下标题条占多少物理像素。
+pub fn title_bar_px(ppp: f32) -> u32 {
+    pt_to_px(TITLE_BAR_PT, ppp)
 }
 
 /// 相邻 pane 之间的分隔线宽度(F80)。
@@ -49,6 +57,18 @@ pub fn title_bar_px(ppp: f32) -> u32 {
 /// app 侧的事 —— 非最右/最下的 pane 在 `term_px` 上各让出 1px,分隔线画在让出来
 /// 的缝里。改 core 去扣格会把「拼满不重叠」那条不变量一起破坏掉。
 pub const GAP_PX: u32 = 1;
+
+/// 终端网格区左右各内缩多少,**逻辑点**(F80)。
+///
+/// 8 点 = 标题条内边距(`shrink2(8, 4)`)的横向值,标题文字与终端首列因此落在
+/// 同一条竖线上。纵向**不缩** —— 再吃半行高度不值。
+pub const TERM_PAD_PT: f32 = 8.0;
+
+/// 当前 DPI 下的左右缩进,物理像素。非有限/非正的 `ppp` 落回 1.0,
+/// 理由同 [`pt_to_px`]。
+pub fn term_pad_px(ppp: f32) -> u32 {
+    pt_to_px(TERM_PAD_PT, ppp)
+}
 
 /// 一个 pane 的全部几何。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,10 +129,17 @@ pub fn layout_geometry(
             };
             let at_right = px.x + px.w >= right_end;
             let at_bottom = px.y + px.h >= bottom_end;
+            let pad = term_pad_px(ppp);
+            let term_w =
+                px.w.saturating_sub(if at_right { 0 } else { GAP_PX })
+                    .saturating_sub(2 * pad);
             let term_px = PxRect {
-                x: px.x,
+                // 左右各内缩 pad(F80)。`w` 已经扣过分隔线让位,两者叠加而
+                // 不是二选一。极窄 pane 上 `saturating_sub` 让它退化到 0 ——
+                // `grid_size_for` 仍会夹到至少 (1, 1),PTY 侧收不到 0 列。
+                x: px.x + pad,
                 y: px.y + title_h,
-                w: px.w.saturating_sub(if at_right { 0 } else { GAP_PX }),
+                w: term_w,
                 h: px
                     .h
                     .saturating_sub(title_h)
@@ -172,20 +199,44 @@ mod tests {
         let g = layout_geometry(&leaf(1), AREA, CELL, false, 1.0);
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].px, AREA);
-        assert_eq!(g[0].term_px, AREA, "只有一个 pane 时不该让任何像素给分隔线");
-        assert_eq!(g[0].grid, (80, 30));
+        // F80:term_px 不再等于 AREA —— 左右各内缩 term_pad_px(1.0)=8,
+        // 纵向不动。「不该让任何像素给分隔线」这半条仍然成立(单 pane 没有
+        // 分隔线邻居),但左右缩进是独立于分隔线让位的另一条规则。
+        let pad = term_pad_px(1.0);
+        assert_eq!(
+            g[0].term_px,
+            PxRect {
+                x: AREA.x + pad,
+                y: AREA.y,
+                w: AREA.w - 2 * pad,
+                h: AREA.h,
+            },
+            "单 pane 不让分隔线,但仍要左右各内缩 8 点"
+        );
+        assert_eq!(g[0].grid, (78, 30), "784px / 10px = 78.4 → floor 78");
     }
 
     #[test]
     fn inner_pane_yields_one_pixel_for_the_divider_f80() {
         let g = layout_geometry(&hsplit(0.5, leaf(1), leaf(2)), AREA, CELL, false, 1.0);
+        let pad = term_pad_px(1.0);
         assert_eq!(g[0].px.w, 400);
-        assert_eq!(g[0].term_px.w, 399, "左 pane 要让 1px 给竖分隔线");
+        assert_eq!(
+            g[0].term_px.w,
+            400 - GAP_PX - 2 * pad,
+            "左 pane 要让 1px 给竖分隔线,还要左右各内缩 8 点"
+        );
         assert_eq!(g[1].px.w, 400);
-        assert_eq!(g[1].term_px.w, 400, "最右 pane 右边没有邻居,不让位");
-        // 让位只吃掉不足一格的余量,列数不变。
-        assert_eq!(g[0].grid, (39, 30));
-        assert_eq!(g[1].grid, (40, 30));
+        assert_eq!(
+            g[1].term_px.w,
+            400 - 2 * pad,
+            "最右 pane 右边没有邻居不让分隔线,但仍要内缩"
+        );
+        // 383/10=38.3、384/10=38.4,两边都 floor 到 38 —— 内缩量(16px)盖过了
+        // 两者之间那 1px 分隔线差异,列数因此相同(这与内缩前的旧行为不同,
+        // 旧行为下两块列数是 39 vs 40)。
+        assert_eq!(g[0].grid, (38, 30));
+        assert_eq!(g[1].grid, (38, 30));
     }
 
     /// 镜像 `inner_pane_yields_one_pixel_for_the_divider_f80`,验证纵向(`Dir::Vertical`,
@@ -196,6 +247,9 @@ mod tests {
     /// 下 pane px.h=300(row 400..700,恰好等于 bottom_end=700 → at_bottom=true)。
     /// 上 pane 不挨底,让 1px:term_px.h=299 → grid.1 = floor(299/20) = 14。
     /// 下 pane 挨底,不让位:term_px.h=300 → grid.1 = 300/20 = 15。
+    /// h/grid.1 不受 F80 左右内缩影响。但 vsplit 两块都是满宽(800px)、都
+    /// `at_right`,所以 grid.0(列数)这次两块相同,都要扣 F80 的左右内缩:
+    /// term_px.w = 800 - 2*8 = 784 → floor(784/10) = 78。
     #[test]
     fn inner_pane_yields_one_pixel_for_the_horizontal_divider_f80() {
         let g = layout_geometry(&vsplit(0.5, leaf(1), leaf(2)), AREA, CELL, false, 1.0);
@@ -203,8 +257,8 @@ mod tests {
         assert_eq!(g[0].term_px.h, 299, "上 pane 要让 1px 给横分隔线");
         assert_eq!(g[1].px.h, 300);
         assert_eq!(g[1].term_px.h, 300, "最下 pane 下边没有邻居,不让位");
-        assert_eq!(g[0].grid, (80, 14));
-        assert_eq!(g[1].grid, (80, 15));
+        assert_eq!(g[0].grid, (78, 14));
+        assert_eq!(g[1].grid, (78, 15));
     }
 
     #[test]
@@ -227,8 +281,10 @@ mod tests {
     fn title_bar_toggle_changes_rows_f83() {
         let off = layout_geometry(&leaf(1), AREA, CELL, false, 1.0);
         let on = layout_geometry(&leaf(1), AREA, CELL, true, 1.0);
-        assert_eq!(off[0].grid, (80, 30));
-        assert_eq!(on[0].grid, (80, 28), "600-32=568px / 20px = 28 行");
+        // 列数(grid.0)因 F80 的左右内缩从 80 变成 78(784px / 10px),与标题条
+        // 开关无关,两边都要改;这条测试真正要锁的行数(grid.1)不受影响。
+        assert_eq!(off[0].grid, (78, 30));
+        assert_eq!(on[0].grid, (78, 28), "600-32=568px / 20px = 28 行");
         assert_ne!(off[0].grid, on[0].grid);
     }
 
@@ -296,14 +352,18 @@ mod tests {
     /// at_bottom = px.y+px.h >= 700:pane1/2 → 400,false;pane3/4 → 700,true。
     /// title_bars=true → title_h = min(32, px.h=300) = 32,四个 pane 一样。
     ///
-    /// term_px.x = px.x;term_px.y = px.y+32;
-    /// term_px.w = px.w - (at_right?0:1);term_px.h = px.h-32-(at_bottom?0:1)。
+    /// F80:左右内缩 pad = term_pad_px(1.0) = 8,对**每个** pane 都生效(不分
+    /// 是否挨窗口边缘)——它内缩的是每块 pane 自己的终端区,不是只处理窗口外框。
     ///
-    /// pane1: term_px={x:0,  y:132,w:399,h:267}(不挨右不挨底,双让位都扣)
-    /// pane2: term_px={x:400,y:132,w:400,h:267}(挨右不挨底,只扣纵向让位)
-    /// pane3: term_px={x:0,  y:432,w:399,h:268}(不挨右挨底,只扣横向让位)
-    /// pane4: term_px={x:400,y:432,w:400,h:268}(挨右挨底,两个让位都不扣)
-    /// title_px 四个都是 {x:px.x, y:px.y, w:400, h:32}。
+    /// term_px.x = px.x + pad;term_px.y = px.y+32;
+    /// term_px.w = px.w - (at_right?0:1) - 2*pad;term_px.h = px.h-32-(at_bottom?0:1)。
+    ///
+    /// pane1: term_px={x:8,  y:132,w:383,h:267}(不挨右不挨底,让位+内缩都扣)
+    /// pane2: term_px={x:408,y:132,w:384,h:267}(挨右不挨底,只扣纵向让位+内缩)
+    /// pane3: term_px={x:8,  y:432,w:383,h:268}(不挨右挨底,只扣横向让位+内缩)
+    /// pane4: term_px={x:408,y:432,w:384,h:268}(挨右挨底,只扣内缩)
+    /// title_px 四个都是 {x:px.x, y:px.y, w:400, h:32}(标题条不受 F80 影响,
+    /// F80 只缩终端网格区)。
     #[test]
     fn nested_2x2_with_title_bars_yields_correct_term_and_title_px_f30_f83() {
         let tree = mullion_core::layout::Node::Split {
@@ -338,12 +398,12 @@ mod tests {
         assert_eq!(
             g[0].term_px,
             PxRect {
-                x: 0,
+                x: 8,
                 y: 132,
-                w: 399,
+                w: 383,
                 h: 267
             },
-            "左上 pane:不挨右不挨底,标题条与横向/纵向让位都要同时扣掉"
+            "左上 pane:不挨右不挨底,标题条、横向让位、F80 左右内缩都要同时扣掉"
         );
 
         assert_eq!(
@@ -369,12 +429,12 @@ mod tests {
         assert_eq!(
             g[1].term_px,
             PxRect {
-                x: 400,
+                x: 408,
                 y: 132,
-                w: 400,
+                w: 384,
                 h: 267
             },
-            "右上 pane:挨右不挨底,只扣标题条 + 纵向让位"
+            "右上 pane:挨右不挨底,扣标题条 + 纵向让位,F80 内缩仍然要扣"
         );
 
         assert_eq!(
@@ -400,12 +460,12 @@ mod tests {
         assert_eq!(
             g[2].term_px,
             PxRect {
-                x: 0,
+                x: 8,
                 y: 432,
-                w: 399,
+                w: 383,
                 h: 268
             },
-            "左下 pane:不挨右挨底,只扣标题条 + 横向让位"
+            "左下 pane:不挨右挨底,扣标题条 + 横向让位,F80 内缩仍然要扣"
         );
 
         assert_eq!(
@@ -431,12 +491,12 @@ mod tests {
         assert_eq!(
             g[3].term_px,
             PxRect {
-                x: 400,
+                x: 408,
                 y: 432,
-                w: 400,
+                w: 384,
                 h: 268
             },
-            "右下 pane:挨右挨底,只扣标题条,两个让位都不扣"
+            "右下 pane:挨右挨底,两个分隔线让位都不扣,但 F80 内缩仍然要扣"
         );
     }
 
@@ -481,5 +541,71 @@ mod tests {
         assert_eq!(title_bar_px(-2.0), 32);
         assert_eq!(title_bar_px(f32::NAN), 32);
         assert_eq!(title_bar_px(f32::INFINITY), 32);
+    }
+
+    /// F80:终端区左右各内缩,不再顶着 pane 边界。缩进量是**逻辑点**,
+    /// 跟标题条一样随 DPI 缩放 —— 写死物理像素的话 200% 缩放下这条缝会
+    /// 细成一半。
+    ///
+    /// 自证会变红:把 `term_pad_px` 改回 `|_| 0`。
+    #[test]
+    fn the_terminal_area_is_inset_on_both_sides() {
+        assert_eq!(term_pad_px(1.0), 8);
+        assert_eq!(term_pad_px(1.5), 12);
+        assert_eq!(term_pad_px(2.0), 16);
+
+        let g = layout_geometry(&leaf(1), AREA, CELL, false, 1.0);
+        let pad = term_pad_px(1.0);
+        assert_eq!(g[0].term_px.x, AREA.x + pad, "左边没内缩");
+        assert_eq!(g[0].term_px.w, AREA.w - 2 * pad, "宽度没扣掉两侧缩进");
+        // 纵向不动 —— 再吃半行高度不值。
+        assert_eq!(g[0].term_px.y, AREA.y);
+        assert_eq!(g[0].term_px.h, AREA.h);
+    }
+
+    /// 非有限 / 非正的 `ppp` 落回 1.0,理由同 `title_bar_px`:winit 在显示器
+    /// 热插拔的瞬间报过 0 / NaN 的 `scale_factor`。
+    ///
+    /// 自证会变红:删掉 `term_pad_px` 里的 `is_finite() && > 0.0` 兜底。
+    #[test]
+    fn a_broken_scale_factor_falls_back_for_the_pad_too() {
+        assert_eq!(term_pad_px(0.0), 8);
+        assert_eq!(term_pad_px(-2.0), 8);
+        assert_eq!(term_pad_px(f32::NAN), 8);
+        assert_eq!(term_pad_px(f32::INFINITY), 8);
+    }
+
+    /// 极窄 pane:宽度扣到 0 而不是下溢回绕成天文数字,`grid` 仍被夹到
+    /// 至少 `(1, 1)`(PTY 侧不接受 0 列)。
+    ///
+    /// 自证会变红:把 `saturating_sub` 换成 `-`(debug 下 panic,release 下回绕)。
+    #[test]
+    fn a_pane_narrower_than_the_padding_degrades_instead_of_underflowing() {
+        let tiny = PxRect {
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 40,
+        };
+        let g = layout_geometry(&leaf(1), tiny, CELL, false, 1.0);
+        assert_eq!(g[0].term_px.w, 0);
+        assert!(
+            g[0].grid.0 >= 1 && g[0].grid.1 >= 1,
+            "grid 没被夹到至少 1×1"
+        );
+    }
+
+    /// 缩进与分隔线让位(`GAP_PX`)叠加:左右分屏时,左边那块**既**要让 1px
+    /// 给分隔线,**又**要内缩 —— 两者都扣,不是二选一。
+    ///
+    /// 自证会变红:把缩进写成 `w - 2*pad` 覆盖掉 GAP 那一步(左块宽度会多 1)。
+    #[test]
+    fn padding_and_the_divider_gap_both_apply_to_the_left_pane() {
+        let g = layout_geometry(&hsplit(0.5, leaf(1), leaf(2)), AREA, CELL, false, 1.0);
+        let pad = term_pad_px(1.0);
+        let left = &g[0];
+        let right = &g[1];
+        assert_eq!(left.term_px.w, left.px.w - GAP_PX - 2 * pad);
+        assert_eq!(right.term_px.w, right.px.w - 2 * pad, "最右块不让分隔线");
     }
 }
