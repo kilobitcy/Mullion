@@ -398,6 +398,17 @@ struct TerminalTab {
     /// **不是「面板当前目录」**:那个在 `files.remote.cwd` 里,会随用户浏览
     /// 移动;这个在同一次 sftp 连接内不变(重连会被新连接的值覆盖)。
     sftp_home: Option<mullion_ssh::sftp::RemotePath>,
+    /// F128:这个标签在途的重连任务(`spawn_reconnect` 每发起一次拨号存一个)。
+    /// **必须在 `wind_down` 里一并 abort**——理由同 `automation`/`sftp_tasks`:
+    /// 那个 task 在退避 `sleep` 或 `establish` 握手里挂着,只 drop `TerminalTab`
+    /// 完全收不了口。`establish` 内部没有超时包裹(同 `SftpClient::open`),
+    /// 高延迟代理链路黑洞时可能挂很久;用户关标签之后它还会拨完号、做完一整
+    /// 套认证(远端多一条登录记录),然后才因为 `by_generation_mut` 查不到
+    /// 属主标签而把结果丢掉——白拨一次。
+    ///
+    /// 每次 `push` 前先 `retain` 掉已经跑完的,稳态下不会无界增长(同
+    /// `sftp_tasks`)。
+    reconnect_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// D1/D6:一个「SFTP 节点」标签的全部状态——**独占**自己的连接(跟隧道同一个
@@ -1212,6 +1223,12 @@ fn wind_down(tab: Tab<TabContent>) {
             // 它自己的网络往返结束(`SftpClient::open` 那两步还完全没有
             // 超时包裹,链路黑洞时可能永远不结束)。
             for task in t.sftp_tasks {
+                task.abort();
+            }
+            // F128:在途的重连任务同理——见 `TerminalTab::reconnect_tasks` 的文档。
+            // 不 abort 的话,用户关标签这一刻若正巧有一次拨号在途,那个任务会把
+            // 整套认证做完(远端多一条登录记录)才发现属主标签已经没了。
+            for task in t.reconnect_tasks {
                 task.abort();
             }
             // `t.ws` 在这里 drop —— 每个 `PaneState` 随之 drop,关掉它那条 SSH channel。
@@ -4678,7 +4695,7 @@ impl App {
             self.proxy.clone(),
             true,
         ));
-        self._runtime.spawn(async move {
+        let task = self._runtime.spawn(async move {
             tokio::time::sleep(delay).await;
             let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 let _ = wake_proxy.send_event(UserEvent::Wake);
@@ -4717,6 +4734,19 @@ impl App {
                 channels,
             });
         });
+        // 句柄存回属主标签,`wind_down` 才收得了口(见 `reconnect_tasks` 的
+        // 文档)。取不到属主标签就当场 abort —— 与 `track_sftp_task` 同一套
+        // 「无人收留就别让它跑」的纪律。
+        if let Some(t) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.as_terminal_mut())
+        {
+            t.reconnect_tasks.retain(|h| !h.is_finished());
+            t.reconnect_tasks.push(task);
+        } else {
+            task.abort();
+        }
     }
 
     /// F92:拨一次完整认证后立刻断开。**不开 channel、不起 pty** ——
@@ -5318,6 +5348,7 @@ impl ApplicationHandler<UserEvent> for App {
                         sftp_tasks: Vec::new(),
                         sftp_default_remote: sftp_prefs.default_remote,
                         sftp_home: None,
+                        reconnect_tasks: Vec::new(),
                     })),
                 );
                 // F37:是重连一个占位标签 → 把上次的分屏形状搭回来,并给新长
@@ -10933,6 +10964,7 @@ mod tests {
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
                 sftp_home: None,
+                reconnect_tasks: Vec::new(),
             })),
         );
         tabs
@@ -12247,6 +12279,7 @@ mod tests {
                 sftp_tasks: vec![task],
                 sftp_default_remote: None,
                 sftp_home: None,
+                reconnect_tasks: Vec::new(),
             })),
         };
 
@@ -12264,6 +12297,89 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "wind_down 没有 abort 掉在途的 sftp 任务 —— 任务会继续攥着 \
              Arc<SshConnection>,撑住本该随标签一起断开的连接"
+        );
+    }
+
+    /// **接线守护(F128 版,真实行为而非源码文本)**:关标签必须 abort 掉在途的
+    /// **重连**任务。
+    ///
+    /// 与上面 sftp 那条同一类问题的第三次重演,而 F128 落地时漏了这一处:
+    /// `spawn_reconnect` 起的 task 挂在退避 `sleep` 或 `establish` 握手上,
+    /// 只 drop `TerminalTab` 收不了口。用户关掉标签之后它仍会拨完号、做完一整
+    /// 套认证(远端因此多一条登录记录),然后才因为查不到属主标签把结果丢掉。
+    /// `establish` 内部没有超时包裹,高延迟代理链路黑洞时这个"白拨"可能挂很久。
+    ///
+    /// 写法与 `wind_down_aborts_outstanding_sftp_tasks` 完全一致(哑任务 +
+    /// `Drop` 观测),理由见那条:比匹配 `.abort()` 字符串更接近真实行为。
+    ///
+    /// 自证会变红:把 `wind_down` 里 `for task in t.reconnect_tasks` 那一段删掉。
+    #[tokio::test]
+    async fn wind_down_aborts_outstanding_reconnect_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_flag = started.clone();
+        let guard_flag = dropped.clone();
+        let task = tokio::spawn(async move {
+            let _guard = SetOnDrop(guard_flag);
+            started_flag.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+
+        // 先让哑任务真正被 poll 过一次,理由见 sftp 那条测试里的长注释。
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "测试用的哑任务没能跑起来 —— 测试脚手架本身有问题,不是被测代码的锅"
+        );
+
+        let tab = Tab {
+            id: TabId(1),
+            title: "test".into(),
+            session_id: None,
+            title_override: None,
+            color_override: None,
+            content: TabContent::Terminal(Box::new(TerminalTab {
+                ws: Workspace::new(test_pane(1), 0),
+                current_preset: None,
+                last_cfg: None,
+                automation: Vec::new(),
+                automation_template: None,
+                automation_status: None,
+                files: Default::default(),
+                sftp: None,
+                sftp_tasks: Vec::new(),
+                sftp_default_remote: None,
+                sftp_home: None,
+                reconnect_tasks: vec![task],
+            })),
+        };
+
+        wind_down(tab);
+
+        for _ in 0..200 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "wind_down 没有 abort 掉在途的重连任务 —— 关了标签之后它还会拨完号、\
+             做完一整套认证,远端多一条登录记录"
         );
     }
 
@@ -12995,6 +13111,7 @@ mod tests {
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: configured.map(|s| s.to_string()),
                 sftp_home: None,
+                reconnect_tasks: Vec::new(),
             }))
         }
 
