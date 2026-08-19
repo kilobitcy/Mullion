@@ -13,3 +13,7 @@
 # 本地待办与工具落盘,跟代码无关
 /todo.md
 /.playwright-mcp/
+
+# 本地权限缓存,每台机器不同、只增不减;`.claude/skills/` 反而必须入库
+# (发版流程的权威细节都在里面,CLAUDE.md 只留骨架 + 指针)
+/.claude/settings.local.json

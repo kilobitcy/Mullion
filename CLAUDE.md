@@ -164,28 +164,19 @@ cargo doc -p russh --open   # 或直接读 ~/.cargo/registry/src/**/russh-*/src/
 只要本轮改动落到了 `mullion-app`（或任何影响 Windows 端行为的地方）并且我要拿去实机验，
 **一条龙做完，别停下来问「要不要 bump / 要不要发版」**：
 
-1. **升 patch 版本号** —— `Cargo.toml` 的 `workspace.package.version`，第三位 +1。单独一个
-   `chore: 版本 0.1.N(一句话说清这版修了什么)` 提交。
+1. **升 patch 版本号** —— `workspace.package.version` 第三位 +1，单独一个 `chore:` 提交。
 2. **跑绿** —— `cargo test --workspace` + `clippy -D warnings` + `fmt --check`。不绿不发。
-3. **交叉编译** —— `cargo build --release --target x86_64-pc-windows-gnu -p mullion-app`，
-   并按 `docs/cross-compile-windows.md` 做 objdump 依赖验收（出现 `libgcc_s_seh-1.dll` /
-   `libwinpthread-1.dll` 即为不合格，必须修）。
-4. **发 GitHub Release** —— 我从 GitHub 下，不要只在本地留 exe、也不要让我手动 scp：
-   ```bash
-   sha256sum mullion.exe > mullion.exe.sha256
-   HTTPS_PROXY=http://127.0.0.1:7890 gh release create v0.1.N \
-     mullion.exe mullion.exe.sha256 -t "v0.1.N" -F notes.md --repo kilobitcy/Mullion
-   ```
-   **Release 标题只能是纯版本号 `v0.1.N`**，不带破折号、不带一句话摘要、不带 emoji ——
-   列表里要一眼扫清版本序列。想说的话全部写进 notes 正文。
-   notes 里写：修了什么 + **人工验收清单**（无头验不了的那些，见「你无法验证的东西」）+ sha256
-   + **首次运行提示**（未签名 exe 每版都会被 SmartScreen 拦，`Unblock-File .\mullion.exe`，
-   详见 `docs/cross-compile-windows.md`）。
-5. **报给我** —— Release 链接 + sha256 + 验收清单。
+3. **交叉编译** Windows exe，并做 objdump 依赖验收 —— 出现 `libgcc_s_seh-1.dll` /
+   `libwinpthread-1.dll` **即为不合格，必须修**。
+4. **签名** —— `scripts/sign-windows.sh`（自签名证书在 `~/.mullion-signing/`，私钥不进仓库）。
+   **必须在算 sha256 之前**，签名会改文件内容。**这是唯一漏了也不报错的一步**：不签照样
+   算得出 hash、发得掉 Release，只有我在 Windows 上看到「发布者：未知」才发现。
+5. **发 GitHub Release** —— **标题只能是纯版本号 `v0.1.N`**，不带破折号、不带摘要、不带 emoji。
+   先 push 再发版（`gh release create` 会把 tag 建在远端当前 HEAD 上）。
+6. **报给我** —— Release 链接 + sha256 + 人工验收清单。
 
-约束：**本机 DNS 解析不了 github**，`gh`/curl 必须带 `HTTPS_PROXY=http://127.0.0.1:7890`，
-SSH push 走 `socks5 127.0.0.1:7891` 的 ProxyCommand；GitHub Actions 因账单锁不可用，
-`release.yml` 虽然正确但发不出去，一律走上面的手动路线。私密信息（真机 IP / 用户名 /
+具体命令、代理设置、notes 模板见 `.claude/skills/release-windows/SKILL.md`（说「发版」时自动加载）。
+**本机 DNS 解析不了 github**，所有 `gh`/curl 都要走代理。私密信息（真机 IP / 用户名 /
 私钥路径 / 凭据）**永不进被跟踪文件、永不推送**，库里只留占位。
 
 ## 提交约定
@@ -197,13 +188,8 @@ SSH push 走 `socks5 127.0.0.1:7891` 的 ProxyCommand；GitHub Actions 因账单
 
 ## 目录约定
 
-```
-crates/          五个 crate，见上
-scripts/         录制 fixture、打包等一次性脚本
-docs/            ADR（adr-NNN-*，一个决策一个文件）+ 运行手册/踩坑汇总
-docs/superpowers/ 各切片的设计 spec 与实现 plan（brainstorm/writing-plans 产物）
-spec.md          需求，唯一真源
-```
+ADR 放 `docs/adr-NNN-*.md`，一个决策一个文件；brainstorm/writing-plans 的产物
+（各切片的设计 spec 与实现 plan）放 `docs/superpowers/`。
 
 `docs/` 关键非 ADR 文件：
 - `cross-compile-windows.md` —— Linux 交叉编译 Windows exe 的运行手册（代理/mingw/objdump/live 验证/发布 Release）
