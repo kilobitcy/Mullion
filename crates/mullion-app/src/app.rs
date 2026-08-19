@@ -8007,38 +8007,6 @@ fn files_start_dir(
     from_pane.or_else(|| default_remote.map(str::to_string))
 }
 
-/// `App::sync_files_to_focused_pane` 的纯逻辑核心。原来那四个早退(有没有
-/// 属主世代 / sftp 是否已连 / 焦点 pane 有没有报出绝对路径)全埋在
-/// `&mut self` 方法体里,完全靠人读代码——顺序换掉,或者把 `has_client`
-/// 判断写反,都不会有任何测试变红。按本文件其余 `_of` 函数的惯例抽出来,
-/// 方法体只留取数据 + 调用 + 派发。
-///
-/// 不接第四个「配置的默认远端目录」参数(`files_start_dir` 第二参在调用点
-/// 固定传 `None`):面板已经开着了,拿不到 pane 目录时退回配置值会把用户
-/// 当前的导航位置拽走,宁可什么都不做——这是 `sync_files_to_focused_pane`
-/// 与 `trigger_sftp_open`(会传 `default_remote` 兜底)刻意不同的地方。
-///
-/// 返回 `String` 而不是 `mullion_ssh::sftp::RemotePath`:后者的构造在
-/// `mullion-ssh`,这里保持零依赖更好测;调用方自己转。返回 `None` = 这一次
-/// 不同步(面板停在原处)。
-fn sync_target_of(
-    gen: Option<u64>,
-    has_client: bool,
-    pane_cwd: Option<&[u8]>,
-    home: Option<&[u8]>,
-) -> Option<(u64, String)> {
-    let gen = gen?;
-    if !has_client {
-        // sftp 还没开:`trigger_sftp_open` 稍后自己会读焦点 pane 的 cwd 定
-        // 起始目录,这里现在发 Goto 只会打到一条还不存在的连接上。
-        return None;
-    }
-    // 第二参固定 `None`:面板已经开着了,退回配置的默认远端目录会把用户
-    // 当前的导航位置拽走——拿不到 pane 目录就宁可什么都不做。
-    let dir = files_start_dir(pane_cwd, None, home)?;
-    Some((gen, dir))
-}
-
 /// F132:「文件侧栏关→开」那一帧该做什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SyncPlan {
@@ -8051,10 +8019,19 @@ enum SyncPlan {
 }
 
 /// [`SyncPlan`] 的判定。纯函数 —— `App` 要 `EventLoopProxy`,无头测试里
-/// 造不出来,只有把判定摘出来才验得了。
+/// 造不出来,只有把判定摘出来才验得了。把这几个早退埋在 `&mut self` 方法体里
+/// 的话,顺序换掉、或者把 `has_client` 判断写反,都不会有任何测试变红。
 ///
 /// `focus_host_ix` 为 `None` = 这个标签没有终端(SFTP 节点标签),
 /// 「焦点分屏在哪台」无从谈起,不重开。
+///
+/// 不接「配置的默认远端目录」参数(`files_start_dir` 第二参这里固定传
+/// `None`):面板已经开着了,拿不到 pane 目录时退回配置值会把用户当前的
+/// 导航位置拽走,宁可什么都不做 —— 这是它与 `trigger_sftp_open`(会传
+/// `default_remote` 兜底)刻意不同的地方。
+///
+/// `Goto` 带 `String` 而不是 `mullion_ssh::sftp::RemotePath`:后者的构造在
+/// `mullion-ssh`,这里保持零依赖更好测;调用方自己转。
 fn sync_plan_of(
     has_client: bool,
     sftp_host_ix: Option<usize>,
@@ -8896,8 +8873,8 @@ mod tests {
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, font_px_for, has_real_action, ime_cursor_area,
         next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
-        snapshot_tabs_of, sync_plan_of, sync_target_of, sync_timeout_wake_at, tab_title,
-        upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab,
+        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title, upload_job, wind_down,
+        Modal, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -13724,74 +13701,6 @@ mod tests {
         );
     }
 
-    /// `App::sync_files_to_focused_pane` 的判定核心 `sync_target_of`:
-    /// 四个早退(有没有属主世代 / sftp 是否已连 / 焦点 pane 有没有报出
-    /// 绝对路径)+ 一条正常路径。此前这条链完全埋在 `&mut self` 方法体里
-    /// 靠人读代码——把 `has_client` 判断写反、或者把 client 检查和 dir
-    /// 计算的顺序换掉,都不会有任何测试变红。
-    ///
-    /// 自证会变红:
-    /// - 把 `has_client` 那个判断取反(`if has_client { return None; }`)——
-    ///   `has_client_false_blocks_it_even_with_a_good_cwd` 和
-    ///   `happy_path_returns_the_generation_and_the_directory` 都该红。
-    /// - 把 `files_start_dir(pane_cwd, None)` 换成无条件接受(丢掉「只接受
-    ///   绝对路径」)——`relative_pane_cwd_blocks_it_the_same_way_as_a_missing_one`
-    ///   该红。
-    /// - 让 `sync_target_of` 无脑返回 `None`——
-    ///   `happy_path_returns_the_generation_and_the_directory` 该红。
-    #[test]
-    fn sync_target_of_covers_all_four_early_returns_and_the_happy_path() {
-        // 早退①:没有属主世代——即使 sftp 已连、pane 目录是合法绝对路径,
-        // 用户可感知的后果是「侧栏开了却什么都没同步」,不该发生同步。
-        assert_eq!(
-            sync_target_of(None, true, Some(b"/home/dev/x"), None),
-            None,
-            "没有属主世代时不该同步——这个分支理论上到不了(`sync_files_to_focused_pane`\
-             早就该拿不到 has_client/pane_cwd),但纯函数自己也不能在这种输入下瞎猜一个世代出来"
-        );
-
-        // 早退②:sftp 还没连上。用户可感知的后果:面板已经在等 `trigger_sftp_open`
-        // 把 sftp 连起来,这时候发 Goto 会打到一条还不存在的连接上。
-        assert_eq!(
-            sync_target_of(Some(7), false, Some(b"/home/dev/x"), None),
-            None,
-            "sftp 还没开时不该发 Goto——那条连接还不存在"
-        );
-
-        // 早退③:焦点 pane 没报过目录。用户可感知的后果:面板停在原处,
-        // 不该凭空跳到某个猜测目录。
-        assert_eq!(
-            sync_target_of(Some(7), true, None, None),
-            None,
-            "拿不到 pane 目录时不该同步——面板该停在原处"
-        );
-
-        // 早退④:pane 报的是相对路径/`~`,home 未知时不展开。同上,openssh
-        // 的 sftp-server 不展开 `~`,发过去只会让面板停在「取不到登录目录」。
-        assert_eq!(
-            sync_target_of(Some(7), true, Some(b"~/Mullion"), None),
-            None,
-            "home 未知时 pane 目录不是绝对路径就不该同步——发过去 sftp-server 展不开 `~`"
-        );
-
-        // 正常路径:世代 + 已连 + 绝对路径,三者都齐了才同步。
-        assert_eq!(
-            sync_target_of(Some(7), true, Some(b"/home/dev/x"), None),
-            Some((7, "/home/dev/x".to_string())),
-            "三个条件都满足时该把 (世代, 目录) 原样吐出来"
-        );
-
-        // `home` 真的透传下去了。上面每一条的 `home` 都是 `None`,而 `None` 下
-        // 「透传」和「吞掉」行为一模一样 —— 只有这条(`~` + 已知 home)能分辨。
-        // 少了它,`files_start_dir(pane_cwd, None, None)` 这种漏传照样全绿,
-        // 而登录目录接真值之后 `~` 就永远展不开了。
-        assert_eq!(
-            sync_target_of(Some(7), true, Some(b"~/x"), Some(b"/home/dev")),
-            Some((7, "/home/dev/x".to_string())),
-            "home 已知时该透传给 files_start_dir,让 `~` 展开后再同步"
-        );
-    }
-
     /// **接线守护**:两个起始目录来源的**失败处置不一样**,不能被抹平。
     ///
     /// pane 报的目录会过期(标题由 tmux 异步报来,目录可能刚被删),打不开就
@@ -13924,6 +13833,24 @@ mod tests {
             sync_plan_of(true, Some(0), Some(0), None, Some(b"/home/dev")),
             SyncPlan::Nothing
         );
+
+        // 以下两条从退休的 `sync_target_of` 的测试搬过来 —— 它被本函数取代,
+        // 但这两条语义在上面五条里**测不出来**:上面每条的 `pane_cwd` 都是
+        // 绝对路径,`home` 传什么都不影响结果,把第五个参数整个吞掉照样全绿。
+
+        // pane 报的是 `~` 而 home 还不知道(sftp 刚连上、还没 canonicalize):
+        // 不展开、不同步。openssh 的 sftp-server 不认 `~`,发过去只会让面板
+        // 停在「取不到登录目录」。
+        assert_eq!(
+            sync_plan_of(true, Some(0), Some(0), Some(b"~/Mullion"), None),
+            SyncPlan::Nothing
+        );
+        // home 已知时必须**透传**给 `files_start_dir`,`~` 才展得开。少了这条,
+        // 内部写死 `files_start_dir(pane_cwd, None, None)` 也不会有测试变红。
+        assert_eq!(
+            sync_plan_of(true, Some(0), Some(0), Some(b"~/x"), Some(b"/home/dev")),
+            SyncPlan::Goto("/home/dev/x".into())
+        );
     }
 
     /// **接线守护**:`sync_files_to_focused_pane` 要把存下来的登录目录喂给
@@ -13960,12 +13887,12 @@ mod tests {
                     }
                     (depth == 0).then_some(i)
                 })
-                .expect("找不到 sync_target_of 调用的结尾")
+                .expect("找不到 sync_plan_of 调用的结尾")
         };
         let args = &call[..end];
         assert!(
             args.contains("home"),
-            "sync_target_of 收到的不是登录目录:{args}"
+            "sync_plan_of 收到的不是登录目录:{args}"
         );
     }
 
