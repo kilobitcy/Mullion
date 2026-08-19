@@ -256,9 +256,17 @@ impl Emulator {
                         || (spacer && col > 0 && r.contains(Point::new(buf_line, Column(col - 1))))
                         || (leading && r.contains(Point::new(buf_line, Column(col + 1))))
                 });
+                // SGR 1 把前景基色提到亮色(判据与理由见 `palette::bold_brighten`)。
+                // **只动前景**:`\e[1;44m` 里的 bold 说的是前景,背景一起提亮会让
+                // 反色块整体发光。
+                let fg = if flags.contains(Flags::BOLD) {
+                    palette::bold_brighten(cell.fg)
+                } else {
+                    cell.fg
+                };
                 cells.push(SnapCell {
                     ch: cell.c,
-                    fg: palette::resolve(cell.fg, colors, self.defaults),
+                    fg: palette::resolve(fg, colors, self.defaults),
                     bg: palette::resolve(cell.bg, colors, self.defaults),
                     width: if flags.contains(Flags::WIDE_CHAR) {
                         2
@@ -450,8 +458,64 @@ mod tests {
         let snap = emu.snapshot();
         assert_eq!(
             snap.row(0)[0].fg,
-            Rgb::new(205, 0, 0),
+            Rgb::new(0xc5, 0x0f, 0x1f),
             "SGR 31 应解析成我们表里的红"
+        );
+    }
+
+    /// **用户实机报的那个症状**:深色底上目录名读不出来。
+    ///
+    /// `ls` 的目录色和绝大多数 PS1 用的是 `01;34`(bold + blue)。不做提亮时它
+    /// 落到 ANSI blue `#0037DA`,在终端底色 `#14161f` 上对比度 2.2:1,基本读不
+    /// 出来;提到 bright blue `#3B78FF` 之后是 4.6:1。规则来自 xterm,也是
+    /// Windows Terminal / pwsh 的出厂默认(`intenseTextStyle: "bright"`)。
+    ///
+    /// 断言写在 `snapshot` 这一层而不是 `bold_brighten` 那个纯函数上:纯函数
+    /// 绿着而 `snapshot` 忘了调它,正是这个功能最可能的失效方式。
+    ///
+    /// 自证会变红:把 `snapshot` 里那个 `Flags::BOLD` 分支去掉。
+    #[test]
+    fn bold_lifts_a_base_color_to_its_bright_twin_so_dirs_stay_readable() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;34mD");
+        let snap = emu.snapshot();
+        assert_eq!(
+            snap.row(0)[0].fg,
+            Rgb::new(0x3b, 0x78, 0xff),
+            "bold + blue 应提亮成 bright blue,否则深色底上读不出来"
+        );
+    }
+
+    /// 反面①:提亮**只认 `Named` 基色**。truecolor 是程序精确点名的颜色,
+    /// 擅自提亮就是篡改 —— TUI 自己配的主题会被我们改花。
+    ///
+    /// 自证会变红:把 `bold_brighten` 的 `other => other` 改成也动 `Spec`。
+    #[test]
+    fn bold_never_touches_a_color_the_program_named_exactly() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;38;2;10;20;30mT");
+        assert_eq!(emu.snapshot().row(0)[0].fg, Rgb::new(10, 20, 30));
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;38;5;1mI"); // 256 色索引 1,不是 Named(Red)
+        assert_eq!(
+            emu.snapshot().row(0)[0].fg,
+            Rgb::new(0xc5, 0x0f, 0x1f),
+            "Indexed(1) 该原样解析,不能被提亮成 Indexed(9)"
+        );
+    }
+
+    /// 反面②:`\e[1;44m` 里的 bold 说的是**前景**。把背景一起提亮,反色块会
+    /// 整体发光 —— 状态栏、选中行那类满屏色块首当其冲。
+    ///
+    /// 自证会变红:把 `snapshot` 里 `bg` 那行也套上 `bold_brighten`。
+    #[test]
+    fn bold_leaves_the_background_alone() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;44mB");
+        assert_eq!(
+            emu.snapshot().row(0)[0].bg,
+            Rgb::new(0x00, 0x37, 0xda),
+            "背景不该跟着 bold 提亮"
         );
     }
 

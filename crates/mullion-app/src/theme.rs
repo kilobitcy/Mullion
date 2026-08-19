@@ -511,6 +511,53 @@ mod tests {
         );
     }
 
+    /// 「bold 提亮」必须**真的**提高可读性:每个亮色在终端底色上都得比它的
+    /// 基色更亮。
+    ///
+    /// 判据落在 app 层,因为**只有这一层同时知道两样东西** —— ANSI 表归
+    /// `mullion-term`,终端底色 `term_bg` 归主题。term 层测得了「bold 走没走
+    /// 提亮那条路」,测不了「提完之后到底看不看得清」。
+    ///
+    /// 这条对任何一套调色板都成立,不是照着 Campbell 的数字反填的阈值:
+    /// 一套 bright 比 base 还暗的调色板,`bold_brighten` 就成了帮倒忙。
+    ///
+    /// 自证会变红:把 ANSI 表里 bright blue 和 blue 的值对调。
+    #[test]
+    fn every_bright_color_outreads_its_base_on_the_terminal_background() {
+        use mullion_term::palette::indexed_default;
+        const NAMES: [&str; 8] = [
+            "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+        ];
+        for (i, name) in NAMES.iter().enumerate() {
+            let base = contrast_ratio(indexed_default(i as u8), MULLION_DARK.term_bg);
+            let bright = contrast_ratio(indexed_default(i as u8 + 8), MULLION_DARK.term_bg);
+            assert!(
+                bright > base,
+                "bright {name} 在终端底色上比 {name} 还暗({bright:.2} ≤ {base:.2}),\
+                 bold 提亮成了帮倒忙"
+            );
+        }
+    }
+
+    /// 用户实机报的那个症状的**数值判据**:`ls` 的目录名(`01;34` → bright
+    /// blue)必须过 WCAG 1.4.3 的正文线 4.5:1。
+    ///
+    /// 目录名是终端里最常读的一类文字。原来那套 xterm 默认值在这里是
+    /// 1.9:1(蓝 `#0000EE` 直接落上去,还没有提亮这一步)—— 图上就是一团
+    /// 读不出来的墨块。
+    ///
+    /// 自证会变红:把 ANSI 表里 bright blue 换回 `#5C5CFF`(3.80,读得出来但
+    /// 不过线)或 `#0000EE`。
+    #[test]
+    fn a_directory_name_clears_the_wcag_body_text_line() {
+        use mullion_term::palette::indexed_default;
+        let ratio = contrast_ratio(indexed_default(12), MULLION_DARK.term_bg);
+        assert!(
+            ratio >= 4.5,
+            "bright blue 对终端底色只有 {ratio:.2}:1,ls 的目录名在深色屏上读不清"
+        );
+    }
+
     /// 对比度公式自身的锚点:纯黑对纯白必须正好是 21:1(WCAG 定义的上界),
     /// 同色必须是 1:1。没有这条,上面那条 3:1 断言可能是在用一个算错的公式
     /// 「验证通过」。

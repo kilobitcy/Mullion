@@ -9,24 +9,40 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Rgb as AnsiR
 
 use crate::snapshot::Rgb;
 
-/// 16 个标准 ANSI 颜色(经典 xterm 默认值)。索引 0..16。
+/// 16 个标准 ANSI 颜色。索引 0..16。
+///
+/// 取值 = **Campbell**,Windows Terminal / pwsh 的出厂配色。原来用的是经典
+/// xterm 默认值,它的 blue `#0000EE` 在深色终端底上对比度只有 1.9:1 —— 深色屏
+/// 上是一团几乎读不出来的墨块,这正是用户报的「深色底 + 深色字看不清」。
+///
+/// 值抄自 `microsoft/terminal` 的 `TerminalSettingsModel/defaults.json`
+/// (2026-08-19 拉取核实,不是凭记忆写的)。
+///
+/// **换这张表本身修不好那个问题**:Campbell 的 blue `#0037DA` 对比度也才 2.2:1。
+/// 真正让 pwsh 里 `ls` 的目录名可读的是 `bold_brighten` 那条规则 —— 两件事
+/// 必须一起做,见那个函数的文档。
+///
+/// 取舍:Campbell 比 xterm 默认更柔和,少数**非 bold** 的裸基色反而更暗
+/// (magenta 从 3.9:1 降到 2.3:1,red 3.1→3.0)。接受,因为用户点名的参照物就是
+/// pwsh,而实际会用到裸 magenta 当正文的场景极少 —— 常见的高亮用法(PS1、
+/// `ls`、grep)都带 bold,走的是提亮那条路。
 const ANSI16: [Rgb; 16] = [
-    Rgb::new(0, 0, 0),       // 0  black
-    Rgb::new(205, 0, 0),     // 1  red
-    Rgb::new(0, 205, 0),     // 2  green
-    Rgb::new(205, 205, 0),   // 3  yellow
-    Rgb::new(0, 0, 238),     // 4  blue
-    Rgb::new(205, 0, 205),   // 5  magenta
-    Rgb::new(0, 205, 205),   // 6  cyan
-    Rgb::new(229, 229, 229), // 7  white
-    Rgb::new(127, 127, 127), // 8  bright black
-    Rgb::new(255, 0, 0),     // 9  bright red
-    Rgb::new(0, 255, 0),     // 10 bright green
-    Rgb::new(255, 255, 0),   // 11 bright yellow
-    Rgb::new(92, 92, 255),   // 12 bright blue
-    Rgb::new(255, 0, 255),   // 13 bright magenta
-    Rgb::new(0, 255, 255),   // 14 bright cyan
-    Rgb::new(255, 255, 255), // 15 bright white
+    Rgb::new(0x0c, 0x0c, 0x0c), // 0  black
+    Rgb::new(0xc5, 0x0f, 0x1f), // 1  red
+    Rgb::new(0x13, 0xa1, 0x0e), // 2  green
+    Rgb::new(0xc1, 0x9c, 0x00), // 3  yellow
+    Rgb::new(0x00, 0x37, 0xda), // 4  blue
+    Rgb::new(0x88, 0x17, 0x98), // 5  magenta
+    Rgb::new(0x3a, 0x96, 0xdd), // 6  cyan
+    Rgb::new(0xcc, 0xcc, 0xcc), // 7  white
+    Rgb::new(0x76, 0x76, 0x76), // 8  bright black
+    Rgb::new(0xe7, 0x48, 0x56), // 9  bright red
+    Rgb::new(0x16, 0xc6, 0x0c), // 10 bright green
+    Rgb::new(0xf9, 0xf1, 0xa5), // 11 bright yellow
+    Rgb::new(0x3b, 0x78, 0xff), // 12 bright blue
+    Rgb::new(0xb4, 0x00, 0x9e), // 13 bright magenta
+    Rgb::new(0x61, 0xd6, 0xd6), // 14 bright cyan
+    Rgb::new(0xf2, 0xf2, 0xf2), // 15 bright white
 ];
 
 /// 默认前景 / 背景的**出厂值**(无注入、无 OSC 覆盖时)。
@@ -72,6 +88,31 @@ pub fn indexed_default(i: u8) -> Rgb {
             let v = (i - 232) * 10 + 8;
             Rgb::new(v, v, v)
         }
+    }
+}
+
+/// SGR 1(bold)对**前景基色**的效果:提到对应的亮色。
+///
+/// 这是 xterm 的老规矩,也是 Windows Terminal / pwsh 的出厂默认
+/// (`intenseTextStyle: "bright"`) —— 用户点名要参照的就是它。
+///
+/// **为什么非做不可**:`ls` 的目录色和绝大多数 PS1 用的是 `01;34`
+/// (bold + blue)。不映射的话它落到 ANSI blue,在深色终端底上对比度 2.2:1,
+/// 基本读不出来;提到 bright blue 之后是 4.6:1,过 WCAG AA 正文线。换调色板
+/// 治不了这一条(两套调色板的 blue 都在 2:1 上下),只有这条规则能治。
+///
+/// **只作用于 `Named`**:
+/// - `Indexed`(256 色)和 `Spec`(truecolor)是程序精确点名的颜色,擅自提亮
+///   等于篡改 —— TUI 自己配的主题会被我们改花。
+/// - `Named(Foreground)`(SGR 39 的默认前景)经 `to_bright` 变成
+///   `BrightForeground`,而它在 `named_default` 里仍然落 `d.fg`。所以「默认
+///   白字加粗」不会变色,只有真的点了名的 8 个基色会提亮。
+/// - 背景色**不过这个函数**:`\e[1;44m` 里的 bold 说的是前景,把背景一起提亮
+///   会让反色块整体发光。
+pub fn bold_brighten(color: AnsiColor) -> AnsiColor {
+    match color {
+        AnsiColor::Named(n) => AnsiColor::Named(n.to_bright()),
+        other => other,
     }
 }
 
@@ -123,7 +164,7 @@ mod tests {
                 &colors,
                 DefaultColors::default()
             ),
-            Rgb::new(205, 0, 0)
+            Rgb::new(0xc5, 0x0f, 0x1f)
         );
     }
 
@@ -132,7 +173,7 @@ mod tests {
         let colors = Colors::default();
         assert_eq!(
             resolve(AnsiColor::Indexed(1), &colors, DefaultColors::default()),
-            Rgb::new(205, 0, 0)
+            Rgb::new(0xc5, 0x0f, 0x1f)
         );
     }
 
@@ -225,7 +266,7 @@ mod tests {
         };
         assert_eq!(
             resolve(AnsiColor::Named(NamedColor::Red), &colors, d),
-            Rgb::new(205, 0, 0)
+            Rgb::new(0xc5, 0x0f, 0x1f)
         );
     }
 
