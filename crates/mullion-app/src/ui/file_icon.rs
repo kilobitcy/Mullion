@@ -18,9 +18,42 @@ pub enum IconKind {
     Image,
     Code,
     Doc,
+    /// F133:PDF。
+    Pdf,
+    /// F133:Word 文档。
+    Word,
+    /// F133:表格(含 csv —— 双击它多半是想到表格里看)。
+    Excel,
+    /// F133:演示文稿。
+    Slides,
     Exec,
     Link,
+    /// F134:普通文件的兜底(扩展名不认识、也没有可执行位)。
+    File,
+    /// F134:`EntryKind::Other` 专用 —— 设备文件 / socket / 命名管道。
+    /// **不含**「不认识的普通文件」,那是 `File`。
     Other,
+}
+
+impl IconKind {
+    /// 全部类型。**加变体必须同时加进这里** —— 「两两长得不一样」「不越格」
+    /// 两条守护都照它遍历,漏加等于新类型不受任何守护。
+    /// `every_kind_used_by_the_extension_table_is_listed_in_all` 会逮住漏加。
+    pub const ALL: &'static [IconKind] = &[
+        IconKind::Dir,
+        IconKind::Archive,
+        IconKind::Image,
+        IconKind::Code,
+        IconKind::Doc,
+        IconKind::Pdf,
+        IconKind::Word,
+        IconKind::Excel,
+        IconKind::Slides,
+        IconKind::Exec,
+        IconKind::Link,
+        IconKind::File,
+        IconKind::Other,
+    ];
 }
 
 /// 扩展名 → 类型。**唯一的一张表**,加类型只改这里。小写比对,调用方负责归一。
@@ -60,10 +93,14 @@ const EXT_TABLE: &[(&str, IconKind)] = &[
     ("txt", IconKind::Doc),
     ("log", IconKind::Doc),
     ("json", IconKind::Doc),
-    ("csv", IconKind::Doc),
-    ("pdf", IconKind::Doc),
-    ("doc", IconKind::Doc),
-    ("docx", IconKind::Doc),
+    ("pdf", IconKind::Pdf),
+    ("doc", IconKind::Word),
+    ("docx", IconKind::Word),
+    ("xls", IconKind::Excel),
+    ("xlsx", IconKind::Excel),
+    ("csv", IconKind::Excel),
+    ("ppt", IconKind::Slides),
+    ("pptx", IconKind::Slides),
     ("exe", IconKind::Exec),
     ("msi", IconKind::Exec),
     ("bat", IconKind::Exec),
@@ -103,7 +140,9 @@ pub fn classify(kind: EntryKind, name: &str, mode: u32) -> IconKind {
     if mode & 0o111 != 0 {
         return IconKind::Exec;
     }
-    IconKind::Other
+    // F134:不认识的**普通文件**用普通文件的图标。`Other` 只留给
+    // `EntryKind::Other`(设备/socket/命名管道)——上面已经 return 过了。
+    IconKind::File
 }
 
 /// 一个图标由若干条折线组成(闭合与否由调用方按形状约定)。
@@ -187,6 +226,97 @@ pub fn outline(rect: egui::Rect, kind: IconKind) -> Vec<Vec<egui::Pos2>> {
             }
             v
         }
+        // PDF:页 + 底部一条实心横条(粗到一眼能认出是色块而不是文字线)。
+        IconKind::Pdf => {
+            let (pl, pr) = (l + r.width() * 0.15, rt - r.width() * 0.15);
+            vec![
+                vec![
+                    egui::pos2(pl, t),
+                    egui::pos2(pr, t),
+                    egui::pos2(pr, b),
+                    egui::pos2(pl, b),
+                    egui::pos2(pl, t),
+                ],
+                vec![
+                    egui::pos2(pl, b - r.height() * 0.3),
+                    egui::pos2(pr, b - r.height() * 0.3),
+                    egui::pos2(pr, b - r.height() * 0.12),
+                    egui::pos2(pl, b - r.height() * 0.12),
+                    egui::pos2(pl, b - r.height() * 0.3),
+                ],
+            ]
+        }
+        // Word:页 + 一个折线 W。
+        IconKind::Word => {
+            let (pl, pr) = (l + r.width() * 0.15, rt - r.width() * 0.15);
+            let (wt, wb) = (t + r.height() * 0.35, b - r.height() * 0.2);
+            vec![
+                vec![
+                    egui::pos2(pl, t),
+                    egui::pos2(pr, t),
+                    egui::pos2(pr, b),
+                    egui::pos2(pl, b),
+                    egui::pos2(pl, t),
+                ],
+                vec![
+                    egui::pos2(pl + r.width() * 0.08, wt),
+                    egui::pos2(pl + r.width() * 0.22, wb),
+                    egui::pos2(r.center().x, wt + r.height() * 0.18),
+                    egui::pos2(pr - r.width() * 0.22, wb),
+                    egui::pos2(pr - r.width() * 0.08, wt),
+                ],
+            ]
+        }
+        // Excel:页 + 2×2 网格。
+        IconKind::Excel => {
+            let (pl, pr) = (l + r.width() * 0.15, rt - r.width() * 0.15);
+            let (gt, gb) = (t + r.height() * 0.35, b - r.height() * 0.15);
+            let (gl, gr) = (pl + r.width() * 0.08, pr - r.width() * 0.08);
+            vec![
+                vec![
+                    egui::pos2(pl, t),
+                    egui::pos2(pr, t),
+                    egui::pos2(pr, b),
+                    egui::pos2(pl, b),
+                    egui::pos2(pl, t),
+                ],
+                vec![
+                    egui::pos2(gl, gt),
+                    egui::pos2(gr, gt),
+                    egui::pos2(gr, gb),
+                    egui::pos2(gl, gb),
+                    egui::pos2(gl, gt),
+                ],
+                vec![
+                    egui::pos2(gl, (gt + gb) * 0.5),
+                    egui::pos2(gr, (gt + gb) * 0.5),
+                ],
+                vec![
+                    egui::pos2((gl + gr) * 0.5, gt),
+                    egui::pos2((gl + gr) * 0.5, gb),
+                ],
+            ]
+        }
+        // 演示文稿:页 + 一块横向「屏幕」条(比 Excel 的网格宽而扁)。
+        IconKind::Slides => {
+            let (pl, pr) = (l + r.width() * 0.15, rt - r.width() * 0.15);
+            vec![
+                vec![
+                    egui::pos2(pl, t),
+                    egui::pos2(pr, t),
+                    egui::pos2(pr, b),
+                    egui::pos2(pl, b),
+                    egui::pos2(pl, t),
+                ],
+                vec![
+                    egui::pos2(pl + r.width() * 0.06, t + r.height() * 0.38),
+                    egui::pos2(pr - r.width() * 0.06, t + r.height() * 0.38),
+                    egui::pos2(pr - r.width() * 0.06, b - r.height() * 0.28),
+                    egui::pos2(pl + r.width() * 0.06, b - r.height() * 0.28),
+                    egui::pos2(pl + r.width() * 0.06, t + r.height() * 0.38),
+                ],
+            ]
+        }
         // 可执行:一个朝右的三角(播放/运行)+ 底座。
         IconKind::Exec => vec![
             vec![
@@ -217,6 +347,26 @@ pub fn outline(rect: egui::Rect, kind: IconKind) -> Vec<Vec<egui::Pos2>> {
                 vec![
                     egui::pos2(l + r.width() * 0.25, b - r.height() * 0.25),
                     egui::pos2(rt - r.width() * 0.2, t + r.height() * 0.35),
+                ],
+            ]
+        }
+        // F134:普通文件 —— 折角空白页。跟 `Doc`(页 + 三条横线)、
+        // `Link`(折角页 + 箭头)靠「有没有横线 / 有没有箭头」区分。
+        IconKind::File => {
+            let fold = r.width() * 0.3;
+            vec![
+                vec![
+                    egui::pos2(l + r.width() * 0.1, t),
+                    egui::pos2(rt - r.width() * 0.1 - fold, t),
+                    egui::pos2(rt - r.width() * 0.1, t + fold),
+                    egui::pos2(rt - r.width() * 0.1, b),
+                    egui::pos2(l + r.width() * 0.1, b),
+                    egui::pos2(l + r.width() * 0.1, t),
+                ],
+                vec![
+                    egui::pos2(rt - r.width() * 0.1 - fold, t),
+                    egui::pos2(rt - r.width() * 0.1 - fold, t + fold),
+                    egui::pos2(rt - r.width() * 0.1, t + fold),
                 ],
             ]
         }
@@ -255,8 +405,13 @@ pub fn color_for(
         IconKind::Image => t.icon_image,
         IconKind::Code => t.icon_code,
         IconKind::Doc => t.icon_doc,
+        IconKind::Pdf => t.icon_pdf,
+        IconKind::Word => t.icon_word,
+        IconKind::Excel => t.icon_excel,
+        IconKind::Slides => t.icon_slides,
         IconKind::Exec => t.icon_exec,
         IconKind::Link => t.icon_link,
+        IconKind::File => t.icon_file,
         IconKind::Other => t.icon_other,
     }
 }
@@ -264,17 +419,6 @@ pub fn color_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const ALL_KINDS: [IconKind; 8] = [
-        IconKind::Dir,
-        IconKind::Archive,
-        IconKind::Image,
-        IconKind::Code,
-        IconKind::Doc,
-        IconKind::Exec,
-        IconKind::Link,
-        IconKind::Other,
-    ];
 
     /// 图标必须**画在给定的格子里**。越界的话它会压到相邻列的文字上,
     /// 而 painter 直接按坐标画、不受布局约束,越界了编译器一声不吭。
@@ -284,7 +428,7 @@ mod tests {
     #[test]
     fn every_icon_stays_inside_its_cell() {
         let cell = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(16.0, 16.0));
-        for kind in ALL_KINDS {
+        for &kind in IconKind::ALL {
             for line in outline(cell, kind) {
                 for p in line {
                     assert!(
@@ -307,7 +451,7 @@ mod tests {
     #[test]
     fn every_kind_looks_different_from_every_other_kind() {
         let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0));
-        let shapes: Vec<(IconKind, String)> = ALL_KINDS
+        let shapes: Vec<(IconKind, String)> = IconKind::ALL
             .iter()
             .map(|&k| (k, format!("{:?}", outline(cell, k))))
             .collect();
@@ -335,8 +479,15 @@ mod tests {
             ("README.md", IconKind::Doc),
             ("app.log", IconKind::Doc),
             ("setup.exe", IconKind::Exec),
-            ("data.bin", IconKind::Other),
-            ("Makefile", IconKind::Other),
+            ("report.pdf", IconKind::Pdf),
+            ("合同.DOCX", IconKind::Word),
+            ("notes.doc", IconKind::Word),
+            ("budget.xlsx", IconKind::Excel),
+            ("data.csv", IconKind::Excel),
+            ("deck.pptx", IconKind::Slides),
+            ("deck.ppt", IconKind::Slides),
+            ("data.bin", IconKind::File),
+            ("Makefile", IconKind::File),
         ] {
             assert_eq!(
                 classify(EntryKind::File, name, 0o644),
@@ -384,7 +535,7 @@ mod tests {
     /// 「扩展名」算成 `gz`,而 `gz` **确实在表里**,于是误判成 `Archive`。
     #[test]
     fn dotfiles_have_no_extension() {
-        assert_eq!(classify(EntryKind::File, ".bashrc", 0o644), IconKind::Other);
+        assert_eq!(classify(EntryKind::File, ".bashrc", 0o644), IconKind::File);
         assert_eq!(
             classify(EntryKind::File, ".config.json", 0o644),
             IconKind::Doc,
@@ -392,7 +543,7 @@ mod tests {
         );
         assert_eq!(
             classify(EntryKind::File, ".gz", 0o644),
-            IconKind::Other,
+            IconKind::File,
             "点号在开头时,哪怕「扩展名」凑巧撞上表项也不能当真"
         );
     }
@@ -406,5 +557,44 @@ mod tests {
         let t = crate::theme::MULLION_DARK;
         assert_eq!(color_for(IconKind::Archive, true, &t), t.icon_archive);
         assert_eq!(color_for(IconKind::Archive, false, &t), t.fg_dimmer);
+    }
+
+    /// F134:「不认识的普通文件」和「设备/socket 这类特殊类型」必须是两种
+    /// 图标。合成一种的话,一屏陌生扩展名的普通文件全成了菱形,而真正需要
+    /// 「这不是普通文件」提示的那几条被淹掉了。
+    ///
+    /// 自证会变红:把 `classify` 末尾的兜底从 `IconKind::File` 改回
+    /// `IconKind::Other`。
+    #[test]
+    fn an_unknown_regular_file_is_not_the_same_as_a_device_node() {
+        assert_eq!(classify(EntryKind::File, "data.bin", 0o644), IconKind::File);
+        assert_eq!(classify(EntryKind::Other, "ttyS0", 0o666), IconKind::Other);
+        assert_ne!(
+            outline(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0)),
+                IconKind::File
+            ),
+            outline(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0)),
+                IconKind::Other
+            ),
+            "两者共用了同一支形状"
+        );
+    }
+
+    /// 加了新类型却忘了写进 `IconKind::ALL` 的话,「两两不同」「不越格」两条
+    /// 守护会**悄悄漏掉**新类型 —— 本项目已经踩过三次「列举式门控在加档时
+    /// 必然漏」。这条把 `EXT_TABLE` 当交叉验证:表里出现过的每个类型都必须
+    /// 在 `ALL` 里。
+    ///
+    /// 自证会变红:往 `EXT_TABLE` 加一个 `ALL` 里没有的类型。
+    #[test]
+    fn every_kind_used_by_the_extension_table_is_listed_in_all() {
+        for (ext, kind) in EXT_TABLE {
+            assert!(
+                IconKind::ALL.contains(kind),
+                "{kind:?}(来自扩展名 {ext})不在 IconKind::ALL 里"
+            );
+        }
     }
 }
