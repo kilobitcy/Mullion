@@ -2526,21 +2526,73 @@ impl App {
     /// 拿不到绝对路径就什么都不做(面板停在原处),不猜 —— 见
     /// [`files_start_dir`]。
     ///
-    /// 判定核心在 [`sync_target_of`]:这里只管取数据(世代 / 属主标签 /
-    /// sftp client / 焦点 pane 的 cwd)、调用、按结果派发。
+    /// 判定核心在 [`sync_plan_of`]:这里只管取数据(世代 / 属主标签 /
+    /// sftp client / 这条 channel 记录在案的机器 / 焦点分屏所在的机器 /
+    /// 焦点 pane 的 cwd)、调用、按结果派发。
+    ///
+    /// F132:三选一 —— 同一台机器只 `Goto`;焦点分屏换到了**另一台**,
+    /// 原来那条 sftp channel 连的还是旧机器,`Goto` 只会把路径发去错的
+    /// 连接上(路径对了、机器错了),必须先摘旧连接、在新机器上 `Reopen`。
     fn sync_files_to_focused_pane(&mut self) {
-        let gen = self.files_owner_generation();
-        let tab = gen.and_then(|g| self.tabs.by_generation(g));
-        let has_client = tab.is_some_and(|t| t.content.sftp_client().is_some());
-        let pane_cwd = tab.and_then(|t| t.content.focused_pane_cwd());
-        let home = tab.and_then(|t| t.content.sftp_home());
-        let Some((gen, dir)) =
-            sync_target_of(gen, has_client, pane_cwd.as_deref(), home.as_deref())
-        else {
+        let Some(gen) = self.files_owner_generation() else {
             return;
         };
-        let target = mullion_ssh::sftp::RemotePath::from_bytes(dir.into_bytes());
-        self.apply_remote_file_action(gen, crate::ui::files_panel::FileAction::Goto(target));
+        let tab = self.tabs.by_generation(gen);
+        let has_client = tab.is_some_and(|t| t.content.sftp_client().is_some());
+        let sftp_host_ix = tab.and_then(|t| t.content.sftp_host_ix());
+        let focus_host_ix = tab.and_then(|t| t.content.focused_pane_host_ix());
+        let pane_cwd = tab.and_then(|t| t.content.focused_pane_cwd());
+        let home = tab.and_then(|t| t.content.sftp_home());
+        match sync_plan_of(
+            has_client,
+            sftp_host_ix,
+            focus_host_ix,
+            pane_cwd.as_deref(),
+            home.as_deref(),
+        ) {
+            SyncPlan::Nothing => {}
+            SyncPlan::Goto(dir) => {
+                let target = mullion_ssh::sftp::RemotePath::from_bytes(dir.into_bytes());
+                self.apply_remote_file_action(
+                    gen,
+                    crate::ui::files_panel::FileAction::Goto(target),
+                );
+            }
+            SyncPlan::Reopen => self.reopen_sftp_on_focused_host(gen),
+        }
+    }
+
+    /// F132:焦点分屏在另一台机器上 —— 把这条 sftp channel 换过去。
+    ///
+    /// **顺序不可换**:先 abort 在途任务、摘掉旧 client,再
+    /// `trigger_sftp_open`。反过来的话它开头那句
+    /// `if tab.content.sftp_client().is_some() { return; }` 会直接早退,
+    /// 什么都不发 —— 用户看到的是「按了没反应」。同理**不在这里把面板置成
+    /// 加载中**:那会撞上它的 already_loading 早退(置加载中是
+    /// `trigger_sftp_open` 自己的事)。
+    ///
+    /// 摘 client 只是把 `Arc` 从槽位拿走:正在跑的传输各自持有自己的 `Arc`,
+    /// 能跑完,不会被腰斩。
+    fn reopen_sftp_on_focused_host(&mut self, generation: u64) {
+        if let Some(tab) = self.tabs.by_generation_mut(generation) {
+            if let Some(tasks) = tab.content.sftp_tasks_mut() {
+                for t in tasks.drain(..) {
+                    t.abort();
+                }
+            }
+            if let Some(slot) = tab.content.sftp_mut() {
+                *slot = None;
+            }
+            if let Some(t) = tab.content.as_terminal_mut() {
+                t.sftp_host_ix = None;
+            }
+            if let Some(files) = tab.content.files_panel_mut() {
+                // 换了台机器,原来那一屏的选中/光标指的是另一台上的文件,
+                // 留着只会让下一次操作打到不存在的路径上。
+                files.remote.clear_selection();
+            }
+        }
+        self.trigger_sftp_open(generation);
     }
 
     /// F6/设计 D23:在终端与文件面板之间切换键盘焦点。**独立于**
@@ -13875,9 +13927,9 @@ mod tests {
     }
 
     /// **接线守护**:`sync_files_to_focused_pane` 要把存下来的登录目录喂给
-    /// `sync_target_of`。传死 `None` 的话这条路永远展不开 `~`。
+    /// `sync_plan_of`。传死 `None` 的话这条路永远展不开 `~`。
     ///
-    /// 自证会变红:把 `sync_target_of` 的第四个实参改成字面量 `None`。
+    /// 自证会变红:把 `sync_plan_of` 的第五个实参改成字面量 `None`。
     #[test]
     fn the_sidebar_sync_feeds_the_login_directory_into_the_predicate() {
         let src = include_str!("app.rs");
@@ -13891,9 +13943,9 @@ mod tests {
             .expect("找不到 sync_files_to_focused_pane 的函数结尾")];
         assert!(body.contains("sftp_home()"), "没读标签存下的登录目录");
         let call = body
-            .split("sync_target_of(")
+            .split("sync_plan_of(")
             .nth(1)
-            .expect("没调 sync_target_of");
+            .expect("没调 sync_plan_of");
         // 切到**配对**的右括号,不是第一个 —— 实参里带 `.as_deref()` 这种
         // 空括号是惯用写法,按第一个 `)` 切会把实参串截在 `pane_cwd.as_deref(`
         // 处,于是这条守护恒红,逼得生产代码为迁就测试写成怪样子。
@@ -14352,6 +14404,48 @@ mod tests {
         assert!(
             ctrl_d_at < encode_at,
             "Ctrl+D 的判定跑到 encode_key 后面了 —— 它会被编成 0x04 写进死 channel"
+        );
+    }
+
+    /// F132:重开之前必须**先摘掉旧 client**,再调 `trigger_sftp_open`。
+    ///
+    /// 顺序反了是静默失败:`trigger_sftp_open` 开头就有
+    /// `if tab.content.sftp_client().is_some() { return; }`,旧 client 还挂着
+    /// 的话它直接早退,一个字节都不会发 —— 用户看到的是「按了没反应,侧栏
+    /// 还是连着另一台机器」。
+    ///
+    /// 同理**不能提前把面板置成加载中**:`trigger_sftp_open` 的另一个
+    /// 早退条件正是 `already_loading`。
+    ///
+    /// 扎的是源码结构(要活连接才验得了真行为)。锚点带行首缩进。
+    ///
+    /// 自证会变红:把 `reopen_sftp_on_focused_host` 里那句
+    /// `*slot = None;` 删掉,或在它里面把面板置成加载中。
+    #[test]
+    fn reopening_sftp_drops_the_old_client_before_asking_for_a_new_one() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(prod.len() < src.len(), "范围没切到 mod tests 之前");
+        let at = prod
+            .find("    fn reopen_sftp_on_focused_host(")
+            .expect("缺 reopen_sftp_on_focused_host —— 换节点后侧栏不会跟过去");
+        let body = &prod[at..];
+        let end = body.find("\n    }\n").expect("找不到函数结尾");
+        let body = &body[..end];
+        let drop_at = body.find("*slot = None;").expect("没摘掉旧 client");
+        let call_at = body
+            .find("self.trigger_sftp_open(generation);")
+            .expect("没调 trigger_sftp_open");
+        assert!(
+            drop_at < call_at,
+            "先调了 trigger_sftp_open 才摘旧 client —— 它会在开头早退,静默失败"
+        );
+        assert!(
+            !body.contains("Load::Loading"),
+            "提前把面板置成加载中会撞上 trigger_sftp_open 的 already_loading 早退"
         );
     }
 }
