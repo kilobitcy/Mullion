@@ -381,10 +381,25 @@ impl Workspace {
                     Err(TryRecvError::Disconnected) => {
                         // §6.3:内容保留(可滚可复制),只是不再收发。
                         // F128:关掉的成因决定要不要重连,判据见 `rx_closed_action`。
-                        p.status = match rx_closed_action(link_alive(hosts, p.host_ix)) {
-                            RxClosed::Reconnect => PaneStatus::Reconnecting,
-                            RxClosed::UserExited => PaneStatus::Disconnected,
-                        };
+                        //
+                        // **只有 `Live` 才做这次判定** —— 状态转移只能从 `Live`
+                        // 出发。已经是 `Reconnecting` 的 pane 手里那条 `rx` 属于
+                        // **旧**连接,而 `link_alive` 查的是 `hosts[host_ix]` 的
+                        // **当前**连接:重连成功就地替换过之后那条是活的,判据会
+                        // 返回 `UserExited`,把一块正等着新 channel 的 pane 打成
+                        // `Disconnected`——`hosts_to_redial` 从此不再管它,那块
+                        // 分屏永久停在"已断开",而同一条连接上的其它分屏都回来了。
+                        // (同一条 host 上各 pane 的 `rx` 不保证同一帧关闭,所以
+                        // 这个窗口是真实存在的,不是理论假设。)
+                        //
+                        // `Disconnected` 同理不再重判:它是终态,只有 `reattach_pane`
+                        // /`rehost_pane` 换 channel 才能离开。
+                        if p.status == PaneStatus::Live {
+                            p.status = match rx_closed_action(link_alive(hosts, p.host_ix)) {
+                                RxClosed::Reconnect => PaneStatus::Reconnecting,
+                                RxClosed::UserExited => PaneStatus::Disconnected,
+                            };
+                        }
                         break;
                     }
                 }
@@ -1194,5 +1209,58 @@ mod tests {
         ws.link_alive = |_, _| true;
         ws.pump(0);
         assert_eq!(ws.pane(PaneId(1)).unwrap().status, PaneStatus::Disconnected);
+    }
+
+    /// F128 竞态:一块**已经在等新 channel**(`Reconnecting`)的 pane,绝不能
+    /// 因为手里那条旧 `rx` 关闭而被重新判定成 `Disconnected`。
+    ///
+    /// 现场:adr-009 下一条 SSH 连接承载多块分屏,链路一死时各 pane 的 `rx`
+    /// **不保证同一帧关闭**(各自的 reader task 独立,而且缓冲里积压的字节要先
+    /// 排空)。于是会出现:A 先翻 `Reconnecting` → 为这条 host 发起重连 → 拨号
+    /// 成功、`hosts[host_ix]` 就地换成新的活连接 → 这之后 B 的旧 `rx` 才关闭。
+    /// 此时 `link_alive` 查到的是**新**连接(活的),`rx_closed_action` 返回
+    /// `UserExited`,B 被打成 `Disconnected` —— `hosts_to_redial` 从此不再管它,
+    /// 那块分屏永久停在"已断开",而同一条连接上的其它分屏都回来了,用户完全
+    /// 看不出成因。
+    ///
+    /// 这条与上面两条**必须成组**:上面两条只覆盖 `Live` 出发的两个方向,
+    /// 把「谁能触发这次判定」整个删掉它们照样绿。
+    ///
+    /// 自证会变红:把 `pump` 里 `if p.status == PaneStatus::Live` 那个门去掉。
+    #[tokio::test]
+    async fn a_pane_waiting_for_its_new_channel_is_never_downgraded_to_disconnected() {
+        let (mut ws, probes) = ws_with(1);
+        drop(probes);
+        ws.pane_mut(PaneId(1)).unwrap().status = PaneStatus::Reconnecting;
+        // 重连已经成功、`hosts[host_ix]` 换成了新的活连接,但这块 pane 还没拿到
+        // 自己的新 channel —— 手里的 `rx` 仍是旧的那条(已关)。
+        ws.link_alive = |_, _| true;
+        ws.pump(0);
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().status,
+            PaneStatus::Reconnecting,
+            "等着新 channel 的 pane 被打成了 Disconnected —— 它再也不会被重拨"
+        );
+    }
+
+    /// 同一条门的另一半:`Disconnected` 是终态,`rx` 关闭不该把它拉回
+    /// `Reconnecting`。用户敲了 `exit` 之后链路才断(比如他接着关窗口),
+    /// 不挡的话那块 pane 会自己"复活"成重连中,用户永远退不出登录 ——
+    /// 正是 `rx_closed_action` 那条红线要防的现象,只是换了个入口。
+    ///
+    /// 自证会变红:同上(去掉那个门之后,`link_alive` 报 false 就会把
+    /// `Disconnected` 改成 `Reconnecting`)。
+    #[tokio::test]
+    async fn a_pane_the_user_exited_is_never_pulled_back_into_reconnecting() {
+        let (mut ws, probes) = ws_with(1);
+        drop(probes);
+        ws.pane_mut(PaneId(1)).unwrap().status = PaneStatus::Disconnected;
+        ws.link_alive = |_, _| false;
+        ws.pump(0);
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().status,
+            PaneStatus::Disconnected,
+            "已经断开的 pane 被拉回重连中 —— 用户退不出登录"
+        );
     }
 }
