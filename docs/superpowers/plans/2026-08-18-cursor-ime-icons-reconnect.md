@@ -1915,9 +1915,10 @@ rx 永远不关,pump 里的 Disconnected 分支永远不触发。"
     /// `RxClosed::Reconnect`。
     #[test]
     fn a_closed_rx_means_reconnect_only_if_the_transport_died() {
-        assert_eq!(rx_closed_action(true), RxClosed::Reconnect, "链路死了");
+        // 入参是「连接是否还活着」(`transport_alive`),别把两边写反了。
+        assert_eq!(rx_closed_action(false), RxClosed::Reconnect, "链路死了");
         assert_eq!(
-            rx_closed_action(false),
+            rx_closed_action(true),
             RxClosed::UserExited,
             "连接还活着 = 远端 shell 自己退了,不许重连"
         );
@@ -2387,12 +2388,14 @@ mod tests {
     /// F128:退避到顶(`backoff_delay` 返回 `None`)= 放弃,pane 落到
     /// `Disconnected`,由用户自己决定重连还是关掉。一直重试到天荒地老的话,
     /// 一台已经拆机的服务器会让客户端永远有一个后台任务在跑。
+    /// **`backoff_delay` 是 1-indexed**:`backoff_delay(0)` 返回 `None`(非法输入),
+    /// 第一次重试是 `attempt == 1`。接线时传 0 会让 pane 当场放弃重连。
     #[test]
     fn giving_up_turns_into_a_plain_disconnect() {
-        let last = (0..).find(|a| delay_for(*a).is_none()).expect("总会有上限");
+        let last = (1..).find(|a| delay_for(*a).is_none()).expect("总会有上限");
         assert!(delay_for(last).is_none());
         assert_eq!(status_after_failure(last), PaneStatus::Disconnected);
-        assert_eq!(status_after_failure(0), PaneStatus::Reconnecting);
+        assert_eq!(status_after_failure(1), PaneStatus::Reconnecting);
     }
 
     /// F128:屏内提示是**一行**,喂进 emulator 当普通输出。做倒计时的话要在

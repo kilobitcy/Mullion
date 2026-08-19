@@ -122,6 +122,28 @@ pub fn pending_for_extra_pane(tpl: &ResolvedAutomation) -> Option<PendingAutomat
     })
 }
 
+/// 这块 pane 的连接状态是否意味着「在跑的那份自动化该当场取消」。
+///
+/// 判据是**这条 channel 还能不能把字节送出去**，不是「pane 会不会回来」。
+/// `Reconnecting` 也要取消：F128 之前链路一死就直接是 `Disconnected`，
+/// 「死了就立刻取消」这条语义靠 `== Disconnected` 表达是对的；F128 插进
+/// `Reconnecting` 这个中间态之后，同一条判据就漏了 —— 等 ready 的那份自动化
+/// 得一直挂到自己的 `ready_timeout_ms` 才收场，而它等的那条 channel 早就没了。
+/// 重连成功后 `PaneReconnected` 会另起一份（跳过 tmux 那套），旧的这份留着
+/// 只会往一条死 channel 上写。
+///
+/// 抽成纯函数而不是在 `drive_automation` 里写 `matches!`：判据本身能脱离
+/// `App`/事件循环单测，而 `drive_automation` 不能（同 F129 的 Ctrl+D 判据）。
+pub fn should_cancel_on_status(status: crate::shell::workspace::PaneStatus) -> bool {
+    use crate::shell::workspace::PaneStatus;
+    match status {
+        PaneStatus::Live => false,
+        // 穷尽列出而不是 `_ => true`：以后再加状态（比如「挂起」）时，
+        // 编译器会逼着人回来想一遍该不该取消，而不是静默归到"取消"这一档。
+        PaneStatus::Reconnecting | PaneStatus::Disconnected => true,
+    }
+}
+
 /// `ConnectOk` 抵达时：取走待办计划与一次性跳过标志，回答「这次到底起不起」。
 ///
 /// 两个 `&mut` 都是**取走**语义，这正是本函数存在的理由：计划和跳过标志都必须
@@ -248,6 +270,29 @@ mod tests {
         DEFAULT_INITIAL_DELAY_MS, DEFAULT_INTER_DELAY_MS, DEFAULT_READY_TIMEOUT_MS,
     };
     use mullion_store::{AutomationCommand, ResolvedAutomation, SessionId, TmuxChoice};
+
+    /// F128 回归:链路刚死、还在退避重连的那段时间里,在跑的自动化必须**当场**
+    /// 取消。判据写成 `== Disconnected` 的话(F128 之前唯一的"死法"),
+    /// `Reconnecting` 这个中间态会漏掉——等首字节的那份自动化会一直挂到自己的
+    /// `ready_timeout_ms`(默认几十秒)才收场,而它等的那条 channel 早没了;
+    /// 期间重连成功了的话,`PaneReconnected` 起的新一份和这份旧的会同时往
+    /// 同一块 pane 上写。
+    ///
+    /// 自证会变红:把 `should_cancel_on_status` 里 `Reconnecting` 那一档挪回
+    /// `false`(也就是回到 F128 引入中间态之前的判据)。
+    #[test]
+    fn a_reconnecting_pane_cancels_its_automation_just_like_a_dead_one() {
+        use crate::shell::workspace::PaneStatus;
+        assert!(
+            should_cancel_on_status(PaneStatus::Reconnecting),
+            "链路死了还在重连,这份自动化等的那条 channel 已经没了"
+        );
+        assert!(should_cancel_on_status(PaneStatus::Disconnected));
+        assert!(
+            !should_cancel_on_status(PaneStatus::Live),
+            "活着的 pane 绝不能取消 —— 那会让登录后命令永远跑不起来"
+        );
+    }
 
     /// 造一份「开着、有一条命令」的解析结果。
     fn enabled_automation() -> ResolvedAutomation {

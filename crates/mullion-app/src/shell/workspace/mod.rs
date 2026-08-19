@@ -15,7 +15,47 @@ pub use preset::{icon_cells, next_focus, plan_preset, preset_tree, Preset, Prese
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneStatus {
     Live,
+    /// F128:链路死了,正在自动退避重连。**内容保留**——重连成功后接着往下写,
+    /// 用户滚回去还能看到断线前的输出。
+    Reconnecting,
+    /// 不会自己回来了:远端 shell 自己退了(用户敲了 `exit`),或重试到顶。
     Disconnected,
+}
+
+/// F128:`rx` 关闭该怎么处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxClosed {
+    /// 链路死了,自动重连。
+    Reconnect,
+    /// 远端 shell 自己退了(`exit`),SSH 连接还活着 —— **绝不重连**,
+    /// 否则用户永远退不出登录。
+    UserExited,
+}
+
+/// F128:判据只有一条 —— SSH **连接**(不是 channel)还在不在。
+/// channel 关了而连接还在 = 远端进程退了;连接也没了 = 链路死了。
+pub fn rx_closed_action(transport_alive: bool) -> RxClosed {
+    if transport_alive {
+        RxClosed::UserExited
+    } else {
+        RxClosed::Reconnect
+    }
+}
+
+/// F128:`hosts[ix]` 这条连接的传输层还活着没有。
+///
+/// 抽成 fn 指针字段是为了**能在无头测试里翻转** —— 直接查
+/// `handle.is_closed()` 的话,"链路死了"这个状态在测试里根本造不出来
+/// (测试用的 `Workspace` 连 `HostConn` 都没有)。
+/// 查不到 host 时返回 `true`(当成"连接还在"):那是异常状态,
+/// 宁可不重连,也不要对着一条不存在的连接无限重拨。
+pub fn default_link_alive(hosts: &[HostConn], ix: usize) -> bool {
+    // 写成 match 而不是 `map_or`/`is_none_or`:后两者在不同 clippy 版本里
+    // 会互相建议对方(`-D warnings` 下就是编不过),match 两边都不挑刺。
+    match hosts.get(ix) {
+        None => true,
+        Some(h) => !h.handle.is_closed(),
+    }
 }
 
 use std::sync::Arc;
@@ -86,10 +126,22 @@ pub struct HostConn {
     /// F124:上次**发起**自举的时刻。`None` = 还没试过。判据见
     /// `remote_bootstrap::should_attempt`。
     ///
-    /// 断线重连会造一整个新的 `Workspace` 世代、也就是新的 `HostConn`,这两个
-    /// 字段随之清零、重新配一遍。这是对的:`tmux set -g` 幂等,重发无副作用,
-    /// 而远端 tmux 服务器可能在断线期间重启过。
+    /// 断线重连换掉这条连接的 `handle` 时,这两个字段一并清零、重新配一遍
+    /// (见 `UserEvent::PaneReconnected` 的处理)。这是对的:`tmux set -g` 幂等,
+    /// 重发无副作用,而远端 tmux 服务器可能在断线期间重启过。
     pub tmux_last_try: Option<std::time::Instant>,
+    /// F128:拨出这条连接用的参数。**按连接存,不是按标签存**。
+    ///
+    /// 标签级的 `TerminalTab::last_cfg` 只记得**最初**连的那台机器:用户用
+    /// 「换节点」把一块 pane 挪到另一台服务器上之后,`hosts` 里就有了两台机器,
+    /// 而 `last_cfg` 仍是第一台的。那时候第二台断线,拿 `last_cfg` 去重拨就是
+    /// 静默连到**另一台机器**上——地址、凭据、主机指纹全对不上,而用户看到的
+    /// 只是"重连好了"。`host_ix` 本来就是"哪台机器"的身份,拨号参数就该跟它走。
+    ///
+    /// `None` = 这条连接没有可复用的拨号参数(CLI 直连早期路径 / store 不可用),
+    /// 此时不重连(`spawn_reconnect` 直接放弃并记日志)——宁可让用户手动重连,
+    /// 也不猜一份配置拨出去。
+    pub cfg: Option<mullion_ssh::config::SshConfig>,
 }
 
 /// 一个分屏的全部运行时状态。
@@ -138,6 +190,8 @@ pub struct Workspace {
     /// 没有意义,只判等),真正保证"新世代的值一定跟旧世代不一样"是调用方
     /// (`App`)的责任——`Workspace` 自己没法保证,见 `new` 的说明。
     generation: u64,
+    /// F128:判据见 `default_link_alive`。测试里可替换。
+    pub link_alive: fn(&[HostConn], usize) -> bool,
 }
 
 impl Workspace {
@@ -156,6 +210,7 @@ impl Workspace {
             hosts: Vec::new(),
             title_bars: true,
             generation,
+            link_alive: default_link_alive,
         }
     }
 
@@ -312,6 +367,8 @@ impl Workspace {
     /// 写错 channel 的后果不是"输出乱一点":发起同步输出探测 / 光标位置查询的
     /// TUI 会永远等不到应答,表现为整块 pane 冻死。
     pub fn pump(&mut self, now_ms: u64) {
+        let link_alive = self.link_alive;
+        let hosts = &self.hosts;
         for p in &mut self.panes {
             let mut inbound: Vec<Vec<u8>> = Vec::new();
             loop {
@@ -323,7 +380,26 @@ impl Workspace {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         // §6.3:内容保留(可滚可复制),只是不再收发。
-                        p.status = PaneStatus::Disconnected;
+                        // F128:关掉的成因决定要不要重连,判据见 `rx_closed_action`。
+                        //
+                        // **只有 `Live` 才做这次判定** —— 状态转移只能从 `Live`
+                        // 出发。已经是 `Reconnecting` 的 pane 手里那条 `rx` 属于
+                        // **旧**连接,而 `link_alive` 查的是 `hosts[host_ix]` 的
+                        // **当前**连接:重连成功就地替换过之后那条是活的,判据会
+                        // 返回 `UserExited`,把一块正等着新 channel 的 pane 打成
+                        // `Disconnected`——`hosts_to_redial` 从此不再管它,那块
+                        // 分屏永久停在"已断开",而同一条连接上的其它分屏都回来了。
+                        // (同一条 host 上各 pane 的 `rx` 不保证同一帧关闭,所以
+                        // 这个窗口是真实存在的,不是理论假设。)
+                        //
+                        // `Disconnected` 同理不再重判:它是终态,只有 `reattach_pane`
+                        // /`rehost_pane` 换 channel 才能离开。
+                        if p.status == PaneStatus::Live {
+                            p.status = match rx_closed_action(link_alive(hosts, p.host_ix)) {
+                                RxClosed::Reconnect => PaneStatus::Reconnecting,
+                                RxClosed::UserExited => PaneStatus::Disconnected,
+                            };
+                        }
                         break;
                     }
                 }
@@ -419,8 +495,12 @@ impl Workspace {
     }
 }
 
+/// 供 `app.rs` 等跨模块测试复用的脚手架(F128:`reattach_pane`/`rehost_pane`
+/// 的测试要造 `Workspace`/`fake_pane`,原先这些都锁在 `tests` 模块里出不来)。
+/// **只挪不改**——内容与原先 `mod tests` 里的逐字节一致,只是换了个模块名
+/// 并把要跨模块用的项标了 `pub`。
 #[cfg(test)]
-mod tests {
+pub mod tests_support {
     use super::*;
     use crate::theme::{term_default_colors, MULLION_DARK};
     use std::sync::Mutex;
@@ -451,15 +531,15 @@ mod tests {
         }
     }
 
-    struct Probe {
-        writes: Arc<Mutex<Vec<Vec<u8>>>>,
-        resizes: Arc<Mutex<Vec<(u16, u16)>>>,
-        resize_fails: Arc<Mutex<bool>>,
-        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub struct Probe {
+        pub writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
+        pub resize_fails: Arc<Mutex<bool>>,
+        pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     }
 
     /// 造一个挂着 FakePty 的 pane,并把它的输入端 / 观测端一起返回。
-    fn fake_pane(id: u32) -> (PaneState, Probe) {
+    pub fn fake_pane(id: u32) -> (PaneState, Probe) {
         let pty = FakePty::default();
         let probe_writes = pty.writes.clone();
         let probe_resizes = pty.resizes.clone();
@@ -491,7 +571,7 @@ mod tests {
         )
     }
 
-    fn ws_with(n: u32) -> (Workspace, Vec<Probe>) {
+    pub fn ws_with(n: u32) -> (Workspace, Vec<Probe>) {
         let (first, p0) = fake_pane(1);
         let mut ws = Workspace::new(first, 0);
         let mut probes = vec![p0];
@@ -503,6 +583,34 @@ mod tests {
         }
         (ws, probes)
     }
+
+    /// 一条崭新的、没接任何东西的 PTY 管道 —— 换 channel 那两条路径要拿它当
+    /// 「新开好的 channel」。**连观测端一起给**:要验证「pty/rx 真的换过去了」,
+    /// 就得能分辨字节到底进了哪一条管子。
+    pub fn fresh_pipe_probed() -> (
+        Box<dyn super::PtyWriter>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        Probe,
+    ) {
+        let (p, probe) = fake_pane(999);
+        (p.pty, p.rx, probe)
+    }
+
+    /// 不关心观测端时的简写。
+    pub fn fresh_pipe() -> (
+        Box<dyn super::PtyWriter>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (pty, rx, probe) = fresh_pipe_probed();
+        std::mem::forget(probe); // 发送端留着,免得 rx 立刻变成 Disconnected
+        (pty, rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tests_support::{fake_pane, ws_with};
 
     /// T1:光标位置查询的应答必须回写到**产生它的那个 pane 自己的** channel。
     /// 串到别的 pane 上去,发起查询的 TUI 就永远等不到应答 → 全屏 TUI 冻死。
@@ -1027,6 +1135,132 @@ mod tests {
             body.contains("tmux_last_try"),
             "HostConn 上没有「上次发起时刻」—— 重试判据拿不到 since_last_ms,\
              要么永不重试要么每帧重试"
+        );
+    }
+
+    /// **接线守护 / F128**:拨号参数必须挂在 `HostConn` 上,不能只有标签级的
+    /// `TerminalTab::last_cfg`。
+    ///
+    /// 换节点(B2-b)之后一个 `Workspace` 上有两台机器,而 `last_cfg` 只记得
+    /// **最初**那台。第二台断线时拿 `last_cfg` 去重拨,拨的是另一台机器 ——
+    /// 地址、凭据、指纹全对不上,用户看到的却只是「已重新连接」。
+    ///
+    /// 扎源码结构的理由同上一条(`HostConn` 里有 `Arc<SshConnection>`,
+    /// 字段私有、只能由真实握手造出来,测试里造不出实例)。验证边界:挡得住
+    /// 「字段被搬回标签级」,挡不住「两边都留一份、重连仍读错那份」——后者由
+    /// `app.rs` 里的 `reconnect_dials_the_host_it_lost_not_the_first_one` 兜。
+    ///
+    /// 自证会变红:把 `pub cfg: Option<..>` 那行从 `HostConn` 删掉。
+    #[test]
+    fn dial_config_lives_on_the_host_connection() {
+        let src = include_str!("mod.rs");
+        let after = src
+            .split("\npub struct HostConn {")
+            .nth(1)
+            .expect("找不到 HostConn 的定义");
+        let body = &after[..after.find("\n}\n").expect("找不到 HostConn 的结尾")];
+        assert!(
+            body.contains("pub cfg:"),
+            "HostConn 上没有拨号参数 —— 换过节点之后重连会拨回最初那台机器"
+        );
+    }
+
+    /// F128:`rx` 关了有两个成因,**判反了两边都是灾难**:
+    /// - 用户敲 `exit`(连接还活着)却去重连 → 用户永远退不出登录,
+    ///   每次 exit 都被自动拉回来。
+    /// - 链路死了却当成正常退出 → 就是今天的现状,永远不重连。
+    ///
+    /// 判据是 SSH **连接**(不是 channel)还在不在。
+    ///
+    /// 自证会变红:把 `rx_closed_action` 的函数体改成恒返回
+    /// `RxClosed::Reconnect`。
+    #[test]
+    fn a_closed_rx_means_reconnect_only_if_the_transport_died() {
+        // 入参是「连接是否还活着」(见 `rx_closed_action` 的 `transport_alive`):
+        // 活着(true)= 用户 exit,死了(false)= 链路断,重连。
+        assert_eq!(rx_closed_action(false), RxClosed::Reconnect, "链路死了");
+        assert_eq!(
+            rx_closed_action(true),
+            RxClosed::UserExited,
+            "连接还活着 = 远端 shell 自己退了,不许重连"
+        );
+    }
+
+    /// F128:`pump` 必须按成因分别置位。`Reconnecting` 与 `Disconnected`
+    /// 的差别是「等一下会自己回来」vs「不会再回来了」,标题条的点、
+    /// Ctrl+D 的语义、减屏时先关谁,三处都看它。
+    #[tokio::test]
+    async fn pump_marks_reconnecting_when_the_transport_died() {
+        let (mut ws, probes) = ws_with(1);
+        // 造「链路死了」:丢掉发送端(rx 关闭)+ 让判据报 false。
+        drop(probes);
+        ws.link_alive = |_, _| false;
+        ws.pump(0);
+        assert_eq!(ws.pane(PaneId(1)).unwrap().status, PaneStatus::Reconnecting);
+    }
+
+    /// 反面:同样是 rx 关了,链路还活着就只是「远端 shell 退了」。
+    /// 这一条与上一条**必须成对**——只有一条的话,把 `rx_closed_action` 写成
+    /// 恒返回某一个值也能过。
+    #[tokio::test]
+    async fn pump_marks_disconnected_when_the_remote_shell_exited() {
+        let (mut ws, probes) = ws_with(1);
+        drop(probes);
+        ws.link_alive = |_, _| true;
+        ws.pump(0);
+        assert_eq!(ws.pane(PaneId(1)).unwrap().status, PaneStatus::Disconnected);
+    }
+
+    /// F128 竞态:一块**已经在等新 channel**(`Reconnecting`)的 pane,绝不能
+    /// 因为手里那条旧 `rx` 关闭而被重新判定成 `Disconnected`。
+    ///
+    /// 现场:adr-009 下一条 SSH 连接承载多块分屏,链路一死时各 pane 的 `rx`
+    /// **不保证同一帧关闭**(各自的 reader task 独立,而且缓冲里积压的字节要先
+    /// 排空)。于是会出现:A 先翻 `Reconnecting` → 为这条 host 发起重连 → 拨号
+    /// 成功、`hosts[host_ix]` 就地换成新的活连接 → 这之后 B 的旧 `rx` 才关闭。
+    /// 此时 `link_alive` 查到的是**新**连接(活的),`rx_closed_action` 返回
+    /// `UserExited`,B 被打成 `Disconnected` —— `hosts_to_redial` 从此不再管它,
+    /// 那块分屏永久停在"已断开",而同一条连接上的其它分屏都回来了,用户完全
+    /// 看不出成因。
+    ///
+    /// 这条与上面两条**必须成组**:上面两条只覆盖 `Live` 出发的两个方向,
+    /// 把「谁能触发这次判定」整个删掉它们照样绿。
+    ///
+    /// 自证会变红:把 `pump` 里 `if p.status == PaneStatus::Live` 那个门去掉。
+    #[tokio::test]
+    async fn a_pane_waiting_for_its_new_channel_is_never_downgraded_to_disconnected() {
+        let (mut ws, probes) = ws_with(1);
+        drop(probes);
+        ws.pane_mut(PaneId(1)).unwrap().status = PaneStatus::Reconnecting;
+        // 重连已经成功、`hosts[host_ix]` 换成了新的活连接,但这块 pane 还没拿到
+        // 自己的新 channel —— 手里的 `rx` 仍是旧的那条(已关)。
+        ws.link_alive = |_, _| true;
+        ws.pump(0);
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().status,
+            PaneStatus::Reconnecting,
+            "等着新 channel 的 pane 被打成了 Disconnected —— 它再也不会被重拨"
+        );
+    }
+
+    /// 同一条门的另一半:`Disconnected` 是终态,`rx` 关闭不该把它拉回
+    /// `Reconnecting`。用户敲了 `exit` 之后链路才断(比如他接着关窗口),
+    /// 不挡的话那块 pane 会自己"复活"成重连中,用户永远退不出登录 ——
+    /// 正是 `rx_closed_action` 那条红线要防的现象,只是换了个入口。
+    ///
+    /// 自证会变红:同上(去掉那个门之后,`link_alive` 报 false 就会把
+    /// `Disconnected` 改成 `Reconnecting`)。
+    #[tokio::test]
+    async fn a_pane_the_user_exited_is_never_pulled_back_into_reconnecting() {
+        let (mut ws, probes) = ws_with(1);
+        drop(probes);
+        ws.pane_mut(PaneId(1)).unwrap().status = PaneStatus::Disconnected;
+        ws.link_alive = |_, _| false;
+        ws.pump(0);
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().status,
+            PaneStatus::Disconnected,
+            "已经断开的 pane 被拉回重连中 —— 用户退不出登录"
         );
     }
 }

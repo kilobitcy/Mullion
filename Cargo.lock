@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-app"
-version = "0.1.50"
+version = "0.1.52"
 dependencies = [
  "arboard",
  "base64",
@@ -2549,6 +2549,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "unicode-width 0.2.2",
  "wgpu",
  "windows 0.59.0",
  "windows-core 0.59.0",
@@ -2558,11 +2559,11 @@ dependencies = [
 
 [[package]]
 name = "mullion-core"
-version = "0.1.50"
+version = "0.1.52"
 
 [[package]]
 name = "mullion-ssh"
-version = "0.1.50"
+version = "0.1.52"
 dependencies = [
  "log",
  "russh",
@@ -2572,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-store"
-version = "0.1.50"
+version = "0.1.52"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -2584,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-term"
-version = "0.1.50"
+version = "0.1.52"
 dependencies = [
  "alacritty_terminal",
  "vte",

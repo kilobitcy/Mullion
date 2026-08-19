@@ -9,6 +9,53 @@ pub enum InputKind {
     Pointer,
 }
 
+use crate::shell::workspace::PaneStatus;
+use mullion_term::keymap::{Key, Mods};
+
+/// F129:`Ctrl+D` 这一下该干什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtrlD {
+    /// 照常送 `0x04`(EOF)。
+    SendEof,
+    /// 关掉这块分屏。
+    ClosePane,
+    /// 关掉整个标签(这块是最后一块分屏)。
+    CloseTab,
+}
+
+/// F129:这一下按键是不是「裸 Ctrl+D」—— 只有它才轮得到 `ctrl_d_action` 说话。
+///
+/// **必须排掉 `alt`**:Windows 把 AltGr 合成成 Left-Ctrl + Right-Alt,不排的话
+/// 用户在断开的 pane 上用 AltGr 打字就会莫名其妙丢一块分屏(最后一块时是整个
+/// 标签,连自动化和 sftp task 一起收走)。Windows 11 是本项目唯一的一等公民,
+/// 这条必踩。`sup` 一并排掉:Win+D 是系统级「显示桌面」,不该被我们截。
+pub fn is_bare_ctrl_d(key: Key, mods: Mods) -> bool {
+    mods.ctrl
+        && !mods.shift
+        && !mods.alt
+        && !mods.sup
+        && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(&'d'))
+}
+
+/// F129:判据只有两条 —— 这块 pane 还活着吗、它是不是最后一块。
+///
+/// **活着就一定是 EOF**:Ctrl+D 是 shell 里退出登录、给 `cat` 收尾的标准键,
+/// 改掉的话用户在正常会话里会莫名其妙丢一块分屏。断了之后 EOF 反正也送不出去,
+/// 这个键在那儿本来就是废的,拿来关分屏不抢任何东西。
+pub fn ctrl_d_action(status: PaneStatus, is_last_pane: bool) -> CtrlD {
+    match status {
+        PaneStatus::Live => CtrlD::SendEof,
+        // 重连中的也算:用户按这个键的意思就是「别等了,收掉」。
+        PaneStatus::Reconnecting | PaneStatus::Disconnected => {
+            if is_last_pane {
+                CtrlD::CloseTab
+            } else {
+                CtrlD::ClosePane
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Route {
     /// 交给 egui(菜单/状态栏/模态弹窗/表单)。
@@ -237,5 +284,100 @@ mod tests {
     fn f6_toggles_focus_between_terminal_and_panel() {
         assert_eq!(Focus::Terminal.toggled(), Focus::FilesPanel);
         assert_eq!(Focus::FilesPanel.toggled(), Focus::Terminal);
+    }
+
+    /// F129:**AltGr 不许被当成 Ctrl+D**。Windows 把 AltGr 合成成
+    /// Left-Ctrl + Right-Alt,所以「按住 Ctrl 且键是 d」这条判据在 Windows 上
+    /// 会被 AltGr+D 命中 —— 而 Windows 11 是本项目唯一的一等公民。
+    /// 后果不是丢一个字符,是丢一块分屏(最后一块时连整个标签一起收走)。
+    ///
+    /// 自证会变红:把 `is_bare_ctrl_d` 里的 `!mods.alt` 删掉。
+    #[test]
+    fn altgr_is_not_ctrl_d_because_windows_synthesizes_it_as_ctrl_plus_alt() {
+        let altgr = Mods {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert!(
+            !is_bare_ctrl_d(Key::Char('d'), altgr),
+            "AltGr+D 被当成了 Ctrl+D —— 用户在断开的 pane 上打字会丢分屏"
+        );
+        let win = Mods {
+            ctrl: true,
+            sup: true,
+            ..Default::default()
+        };
+        assert!(!is_bare_ctrl_d(Key::Char('d'), win));
+    }
+
+    /// F129:裸 Ctrl+D(含大写)要认得出来,别把 `is_bare_ctrl_d` 收得太紧
+    /// 以至于谁都不匹配 —— 那样 F129 整个功能静默失效,上面那条排除测试
+    /// 还是绿的。
+    ///
+    /// 自证会变红:把 `is_bare_ctrl_d` 的函数体改成 `false`。
+    #[test]
+    fn bare_ctrl_d_is_recognized_in_either_case() {
+        let ctrl = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert!(is_bare_ctrl_d(Key::Char('d'), ctrl));
+        assert!(is_bare_ctrl_d(Key::Char('D'), ctrl));
+        // Ctrl+Shift+D 不是它 —— 那一带是 F18 的划选/粘贴热键区。
+        assert!(!is_bare_ctrl_d(
+            Key::Char('d'),
+            Mods {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            }
+        ));
+        // 别的键、以及没按 Ctrl 的 d,都不是。
+        assert!(!is_bare_ctrl_d(Key::Char('c'), ctrl));
+        assert!(!is_bare_ctrl_d(Key::Char('d'), Mods::default()));
+    }
+
+    /// F129:**活着的 pane 上 Ctrl+D 永远是 EOF**。这个语义不能动 ——
+    /// 它是 shell 退出登录、给 `cat`/`ssh` 收尾的标准键,改掉的话用户
+    /// 在正常会话里按 Ctrl+D 会莫名其妙丢一块分屏。
+    ///
+    /// 自证会变红:把 `ctrl_d_action` 里 `PaneStatus::Live` 那一支删掉。
+    #[test]
+    fn ctrl_d_on_a_live_pane_is_always_eof() {
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Live, true),
+            CtrlD::SendEof,
+            "最后一块活 pane 上也是 EOF"
+        );
+        assert_eq!(ctrl_d_action(PaneStatus::Live, false), CtrlD::SendEof);
+    }
+
+    /// F129:断开的 pane 上 Ctrl+D 关掉这块分屏 —— 断了之后 EOF 送不出去,
+    /// 这个键在那儿本来就是废的。重连中的也算「断开」:用户按这个键的意思
+    /// 就是「别等了,收掉」。
+    #[test]
+    fn ctrl_d_on_a_dead_pane_closes_it() {
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Disconnected, false),
+            CtrlD::ClosePane
+        );
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Reconnecting, false),
+            CtrlD::ClosePane
+        );
+    }
+
+    /// F129:断开的 pane 是标签里最后一块时,关掉整个标签。
+    /// `Workspace::close_pane` 本来就拒绝关最后一块(F31),不特判的话
+    /// 用户按下去**什么都不会发生**,只能去菜单里找「断开」。
+    ///
+    /// 自证会变红:把 `is_last` 那个参数在函数体里忽略掉。
+    #[test]
+    fn ctrl_d_on_the_last_dead_pane_closes_the_whole_tab() {
+        assert_eq!(
+            ctrl_d_action(PaneStatus::Disconnected, true),
+            CtrlD::CloseTab
+        );
     }
 }

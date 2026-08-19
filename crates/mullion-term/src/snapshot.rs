@@ -29,12 +29,38 @@ pub struct SnapCell {
     pub selected: bool,
 }
 
+/// 光标形状(F125)。**本 crate 自己的枚举**,不把 `vte::ansi::CursorShape`
+/// 漏进公开 API —— 架构不变量要求 `mullion-app` 只认识 `mullion-term` 的类型,
+/// 而且 alacritty 将来加变体时,映射处会编译报错而不是被 `_ =>` 悄悄吞掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    /// 实心块。
+    Block,
+    /// 下划线。
+    Underline,
+    /// 竖线。**本项目的默认**(见 `Emulator::with_history`)。
+    #[default]
+    Beam,
+    /// 空心框。**当前不可达**:`Term::cursor_style()` 只吐 DECSCUSR/OSC 50
+    /// 能表达的三种形状,这个值在 alacritty 里只走 vi-mode,而本项目不开 vi-mode。
+    /// 留着是为了让 `map_shape` 能穷尽匹配。(渲染层"非焦点 pane 画空心框"
+    /// 是 `gpu.rs` 自己的另一套判断,不读这个字段。)
+    HollowBlock,
+    /// 远端要求不画光标。**当前不可达**:DECTCEM 走的是 `Cursor::visible`,
+    /// `cursor_style()` 不看它。同样只为穷尽匹配而留。
+    Hidden,
+}
+
 /// 光标快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
     pub row: u16,
     pub col: u16,
     pub visible: bool,
+    /// F125:远端 DECSCUSR 要求的形状,没要求过就是 `Beam`(本项目默认)。
+    pub shape: CursorShape,
+    /// F125:远端要求闪不闪,没要求过就是 `true`。
+    pub blinking: bool,
 }
 
 /// 一帧网格快照:行优先,`cells.len() == cols * rows`。

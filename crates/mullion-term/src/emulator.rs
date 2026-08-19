@@ -19,7 +19,7 @@ use vte::ansi::Processor;
 use crate::palette;
 use crate::remote_state::{parse_title, Osc7Sniffer, RemoteState};
 use crate::selection::{CellSide, SelectionKind};
-use crate::snapshot::{Cursor, GridSnapshot, Rgb, SnapCell};
+use crate::snapshot::{Cursor, CursorShape, GridSnapshot, Rgb, SnapCell};
 
 /// 收集 `Term` 发出的事件。共享缓冲,`Term` 持一份克隆。
 ///
@@ -76,6 +76,19 @@ impl Dimensions for GridSize {
     }
 }
 
+/// `vte` 的形状 → 本 crate 的形状。**穷尽 match,不留 `_` 兜底**:
+/// alacritty 加新变体时这里编译报错,比悄悄退化成某个形状好。
+fn map_shape(s: alacritty_terminal::vte::ansi::CursorShape) -> CursorShape {
+    use alacritty_terminal::vte::ansi::CursorShape as V;
+    match s {
+        V::Block => CursorShape::Block,
+        V::Underline => CursorShape::Underline,
+        V::Beam => CursorShape::Beam,
+        V::HollowBlock => CursorShape::HollowBlock,
+        V::Hidden => CursorShape::Hidden,
+    }
+}
+
 /// 单个 pane 的 VT 仿真器:喂入字节 → 推进网格状态 + 攒出站回写。
 pub struct Emulator {
     term: Term<EventSink>,
@@ -113,6 +126,12 @@ impl Emulator {
         let dims = GridSize { cols, rows };
         let config = Config {
             scrolling_history: history,
+            // F125:远端没发 DECSCUSR 时的形状。项目默认是**闪烁竖线**,
+            // 不是 alacritty 的实心块 —— 这是用户明确要的默认。
+            default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle {
+                shape: alacritty_terminal::vte::ansi::CursorShape::Beam,
+                blinking: true,
+            },
             ..Config::default()
         };
         let term = Term::new(config, &dims, sink.clone());
@@ -237,9 +256,17 @@ impl Emulator {
                         || (spacer && col > 0 && r.contains(Point::new(buf_line, Column(col - 1))))
                         || (leading && r.contains(Point::new(buf_line, Column(col + 1))))
                 });
+                // SGR 1 把前景基色提到亮色(判据与理由见 `palette::bold_brighten`)。
+                // **只动前景**:`\e[1;44m` 里的 bold 说的是前景,背景一起提亮会让
+                // 反色块整体发光。
+                let fg = if flags.contains(Flags::BOLD) {
+                    palette::bold_brighten(cell.fg)
+                } else {
+                    cell.fg
+                };
                 cells.push(SnapCell {
                     ch: cell.c,
-                    fg: palette::resolve(cell.fg, colors, self.defaults),
+                    fg: palette::resolve(fg, colors, self.defaults),
                     bg: palette::resolve(cell.bg, colors, self.defaults),
                     width: if flags.contains(Flags::WIDE_CHAR) {
                         2
@@ -257,6 +284,7 @@ impl Emulator {
         let p = grid.cursor.point;
         // 光标行是「相对屏面」的,加上 offset 才是「相对可视区」。
         let cursor_row = p.line.0 + offset;
+        let style = self.term.cursor_style();
         GridSnapshot {
             cols: cols as u16,
             rows: rows as u16,
@@ -267,6 +295,8 @@ impl Emulator {
                 // MVP 未接 DECTCEM(`\x1b[?25l`/`\x1b[?25h`)光标隐藏/显示;
                 // 这里只处理「滚出可视区」这一种不可见(F17)。
                 visible: cursor_row >= 0 && (cursor_row as usize) < rows,
+                shape: map_shape(style.shape),
+                blinking: style.blinking,
             },
         }
     }
@@ -282,11 +312,20 @@ impl Emulator {
         let offset = grid.display_offset() as i32;
         let p = grid.cursor.point;
         let cursor_row = p.line.0 + offset;
+        let style = self.term.cursor_style();
         Cursor {
             row: cursor_row.max(0) as u16,
             col: p.column.0 as u16,
             visible: cursor_row >= 0 && (cursor_row as usize) < grid.screen_lines(),
+            shape: map_shape(style.shape),
+            blinking: style.blinking,
         }
+    }
+
+    /// 网格列数。**轻量路径**,不建整格快照 —— F126 输入法 preedit 布局
+    /// 每帧都要问一次列数,和 `cursor()` 存在的理由一样(避免 T3)。
+    pub fn cols(&self) -> u16 {
+        self.term.columns() as u16
     }
 
     /// 改变网格尺寸(F34:分屏 reflow / 窗口 resize 时调用)。
@@ -379,6 +418,7 @@ fn side_of(side: CellSide) -> Side {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::CursorShape;
     use crate::snapshot::Rgb;
     use alacritty_terminal::grid::Scroll;
 
@@ -418,8 +458,64 @@ mod tests {
         let snap = emu.snapshot();
         assert_eq!(
             snap.row(0)[0].fg,
-            Rgb::new(205, 0, 0),
+            Rgb::new(0xc5, 0x0f, 0x1f),
             "SGR 31 应解析成我们表里的红"
+        );
+    }
+
+    /// **用户实机报的那个症状**:深色底上目录名读不出来。
+    ///
+    /// `ls` 的目录色和绝大多数 PS1 用的是 `01;34`(bold + blue)。不做提亮时它
+    /// 落到 ANSI blue `#0037DA`,在终端底色 `#14161f` 上对比度 2.2:1,基本读不
+    /// 出来;提到 bright blue `#3B78FF` 之后是 4.6:1。规则来自 xterm,也是
+    /// Windows Terminal / pwsh 的出厂默认(`intenseTextStyle: "bright"`)。
+    ///
+    /// 断言写在 `snapshot` 这一层而不是 `bold_brighten` 那个纯函数上:纯函数
+    /// 绿着而 `snapshot` 忘了调它,正是这个功能最可能的失效方式。
+    ///
+    /// 自证会变红:把 `snapshot` 里那个 `Flags::BOLD` 分支去掉。
+    #[test]
+    fn bold_lifts_a_base_color_to_its_bright_twin_so_dirs_stay_readable() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;34mD");
+        let snap = emu.snapshot();
+        assert_eq!(
+            snap.row(0)[0].fg,
+            Rgb::new(0x3b, 0x78, 0xff),
+            "bold + blue 应提亮成 bright blue,否则深色底上读不出来"
+        );
+    }
+
+    /// 反面①:提亮**只认 `Named` 基色**。truecolor 是程序精确点名的颜色,
+    /// 擅自提亮就是篡改 —— TUI 自己配的主题会被我们改花。
+    ///
+    /// 自证会变红:把 `bold_brighten` 的 `other => other` 改成也动 `Spec`。
+    #[test]
+    fn bold_never_touches_a_color_the_program_named_exactly() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;38;2;10;20;30mT");
+        assert_eq!(emu.snapshot().row(0)[0].fg, Rgb::new(10, 20, 30));
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;38;5;1mI"); // 256 色索引 1,不是 Named(Red)
+        assert_eq!(
+            emu.snapshot().row(0)[0].fg,
+            Rgb::new(0xc5, 0x0f, 0x1f),
+            "Indexed(1) 该原样解析,不能被提亮成 Indexed(9)"
+        );
+    }
+
+    /// 反面②:`\e[1;44m` 里的 bold 说的是**前景**。把背景一起提亮,反色块会
+    /// 整体发光 —— 状态栏、选中行那类满屏色块首当其冲。
+    ///
+    /// 自证会变红:把 `snapshot` 里 `bg` 那行也套上 `bold_brighten`。
+    #[test]
+    fn bold_leaves_the_background_alone() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;44mB");
+        assert_eq!(
+            emu.snapshot().row(0)[0].bg,
+            Rgb::new(0x00, 0x37, 0xda),
+            "背景不该跟着 bold 提亮"
         );
     }
 
@@ -509,6 +605,15 @@ mod tests {
         emu.resize(20, 5);
         let snap = emu.snapshot();
         assert_eq!((snap.cols, snap.rows), (20, 5));
+    }
+
+    /// F126:`cols()` 是 `snapshot().cols` 的轻量同源版 —— 输入法候选框定位
+    /// 每帧都要问一次列数,不该为此建一整份网格快照(T3)。
+    #[test]
+    fn cols_agrees_with_the_full_snapshot() {
+        let mut emu = Emulator::new(10, 3);
+        emu.resize(20, 5);
+        assert_eq!(emu.cols(), emu.snapshot().cols);
     }
 
     #[test]
@@ -867,5 +972,55 @@ mod tests {
         let cell = &snap.row(0)[0];
         assert_eq!(cell.fg, crate::palette::DEFAULT_FG);
         assert_eq!(cell.bg, crate::palette::DEFAULT_BG);
+    }
+
+    /// F125:远端一言不发时,光标必须是**竖线 + 闪烁** —— 这是用户要的默认。
+    ///
+    /// 自证会变红:把 `with_history` 里 `default_cursor_style` 那两行删掉
+    /// (回到 alacritty 的默认 `Block` + 不闪)。
+    #[test]
+    fn default_cursor_is_a_blinking_beam() {
+        let emu = Emulator::new(20, 5);
+        let c = emu.snapshot().cursor;
+        assert_eq!(c.shape, CursorShape::Beam, "默认该是竖线");
+        assert!(c.blinking, "默认该闪");
+    }
+
+    /// F125:远端用 DECSCUSR(`CSI Ps SP q`)要什么形状就给什么形状。
+    /// Ps: 0/1=闪块 2=稳定块 3=闪下划线 4=稳定下划线 5=闪竖线 6=稳定竖线。
+    ///
+    /// 自证会变红:把 `snapshot()` 里 `shape:` 那一行改成写死
+    /// `CursorShape::Beam`。
+    #[test]
+    fn decscusr_selects_shape_and_blink() {
+        for (ps, want_shape, want_blink) in [
+            (b"1", CursorShape::Block, true),
+            (b"2", CursorShape::Block, false),
+            (b"3", CursorShape::Underline, true),
+            (b"4", CursorShape::Underline, false),
+            (b"5", CursorShape::Beam, true),
+            (b"6", CursorShape::Beam, false),
+        ] {
+            let mut emu = Emulator::new(20, 5);
+            let mut seq = b"\x1b[".to_vec();
+            seq.extend_from_slice(ps);
+            seq.extend_from_slice(b" q");
+            emu.feed(&seq);
+            let c = emu.snapshot().cursor;
+            assert_eq!(c.shape, want_shape, "Ps={} 的形状", ps[0] as char);
+            assert_eq!(c.blinking, want_blink, "Ps={} 的闪烁位", ps[0] as char);
+        }
+    }
+
+    /// `cursor()` 是 `snapshot().cursor` 的轻量同源版,新加的两个字段同样必须同源
+    /// ——只在 `snapshot()` 里填、`cursor()` 里漏掉的话,IME 定位那条路径拿到的
+    /// 形状恒是默认值。
+    ///
+    /// 自证会变红:把 `cursor()` 里的 `shape` 改成写死 `CursorShape::Block`。
+    #[test]
+    fn lightweight_cursor_agrees_on_shape_and_blink() {
+        let mut emu = Emulator::new(20, 5);
+        emu.feed(b"\x1b[4 q");
+        assert_eq!(emu.cursor(), emu.snapshot().cursor);
     }
 }

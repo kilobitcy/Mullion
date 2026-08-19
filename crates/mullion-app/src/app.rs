@@ -108,6 +108,28 @@ pub enum UserEvent {
         pane: PaneId,
         msg: String,
     },
+    /// F128:一次断线重连拨通了。**跟 `PaneRehosted` 分开**:那条的语义是
+    /// 「把 pane 改挂到另一台机器」(要重建 emulator),这条是「同一台机器
+    /// 换一条 channel」(必须保留 emulator)。挤在一起只能靠运行时标志判别,
+    /// 而走错的后果是把用户断线前那一屏抹掉。
+    PaneReconnected {
+        generation: u64,
+        /// 这条连接原来的 `host_ix`——重连成功后 `ws.hosts` 会 push 一条新的,
+        /// 挂在旧 ix 上的**每一块** pane 都要跟着换过去(adr-009:一条连接
+        /// 多块 pane)。
+        host_ix: usize,
+        handle: Arc<SshConnection>,
+        /// 每块 pane 一条新 channel,顺序与 `panes` 对齐。
+        channels: Vec<(PaneId, SshSession, Receiver<Vec<u8>>)>,
+    },
+    /// F128:一次重连没拨通。`attempt` 是刚失败的这次的序号,决定下次等多久
+    /// (以及要不要放弃),判据在 `crate::reconnect`。
+    PaneReconnectErr {
+        generation: u64,
+        host_ix: usize,
+        attempt: u32,
+        msg: String,
+    },
     /// F92:一次拨测成功。`u64` 是发起时的世代号,过期的直接丢。
     ProbeOk(u64),
     /// F92:一次拨测失败(含超时)。
@@ -293,6 +315,10 @@ struct PendingRehost {
     /// pane 一致(见 `automation::pending_for_extra_pane`):多块 pane attach
     /// 同一个 tmux session 会内容镜像。`None` = 这个节点没配自动化。
     plan: Option<crate::automation::PendingAutomation>,
+    /// F128:拨这台**新**机器用的参数,随 `HostConn` 一起存进 `ws.hosts`。
+    /// 不带的话,换过节点的那条连接断线时只剩标签级 `last_cfg` 可取,
+    /// 而那是**最初**那台机器的(见 `HostConn::cfg` 的文档)。
+    cfg: SshConfig,
 }
 
 /// 一个终端标签的全部 **per-connection** 状态(D0 决策 S2)。
@@ -376,6 +402,17 @@ struct TerminalTab {
     /// **不是「面板当前目录」**:那个在 `files.remote.cwd` 里,会随用户浏览
     /// 移动;这个在同一次 sftp 连接内不变(重连会被新连接的值覆盖)。
     sftp_home: Option<mullion_ssh::sftp::RemotePath>,
+    /// F128:这个标签在途的重连任务(`spawn_reconnect` 每发起一次拨号存一个)。
+    /// **必须在 `wind_down` 里一并 abort**——理由同 `automation`/`sftp_tasks`:
+    /// 那个 task 在退避 `sleep` 或 `establish` 握手里挂着,只 drop `TerminalTab`
+    /// 完全收不了口。`establish` 内部没有超时包裹(同 `SftpClient::open`),
+    /// 高延迟代理链路黑洞时可能挂很久;用户关标签之后它还会拨完号、做完一整
+    /// 套认证(远端多一条登录记录),然后才因为 `by_generation_mut` 查不到
+    /// 属主标签而把结果丢掉——白拨一次。
+    ///
+    /// 每次 `push` 前先 `retain` 掉已经跑完的,稳态下不会无界增长(同
+    /// `sftp_tasks`)。
+    reconnect_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// D1/D6:一个「SFTP 节点」标签的全部状态——**独占**自己的连接(跟隧道同一个
@@ -575,10 +612,19 @@ impl TabContent {
     }
 
     /// D6:这个标签的 sftp 该蹭哪条连接。`Terminal` 蹭会话已建立的连接
-    /// (`ws.hosts.first()`,ADR-009 下今天恒为其一);`Files` 独占自己的
-    /// (`establish` 来的那条,ADR-010 同款理由)。`Terminal` 分支理论上可能是
-    /// `None`(连接尚未真正建立完成的极短窗口;测试脚手架也会构造出空
-    /// `hosts` 的 `Workspace`)。
+    /// (`ws.hosts.first()`);`Files` 独占自己的(`establish` 来的那条,
+    /// ADR-010 同款理由)。`Terminal` 分支理论上可能是 `None`(连接尚未真正
+    /// 建立完成的极短窗口;测试脚手架也会构造出空 `hosts` 的 `Workspace`)。
+    ///
+    /// `hosts[0]` 是**这个标签的主连接**,而不是「第 0 次建立的连接」——
+    /// 断线重连就地替换它的 `handle`(见 `UserEvent::PaneReconnected`),所以
+    /// 重连之后这里取到的仍是活的那条。F128 早期版本走的是 push 新连接那条
+    /// 路,`hosts[0]` 从此指向死连接,症状是重连之后文件面板永久打不开。
+    ///
+    /// **换节点(B2-b)之后这里仍指第一台机器**:那时 `hosts` 里真有两台,
+    /// 而侧栏只有一份。属于既有限制(D6 起就是如此),不是重连引入的 ——
+    /// 真要按聚焦 pane 取,得先解决「`t.sftp` 这条已开的 channel 属于哪台」,
+    /// 否则会出现 client 来自 A、conn 来自 B 的错配。
     fn sftp_connection(&self) -> Option<Arc<SshConnection>> {
         match self {
             TabContent::Terminal(t) => t.ws.hosts.first().map(|h| h.handle.clone()),
@@ -1192,6 +1238,12 @@ fn wind_down(tab: Tab<TabContent>) {
             for task in t.sftp_tasks {
                 task.abort();
             }
+            // F128:在途的重连任务同理——见 `TerminalTab::reconnect_tasks` 的文档。
+            // 不 abort 的话,用户关标签这一刻若正巧有一次拨号在途,那个任务会把
+            // 整套认证做完(远端多一条登录记录)才发现属主标签已经没了。
+            for task in t.reconnect_tasks {
+                task.abort();
+            }
             // `t.ws` 在这里 drop —— 每个 `PaneState` 随之 drop,关掉它那条 SSH channel。
         }
         // D1:文件标签没有自动化、没有 PTY——只有 sftp 后台任务需要收口,
@@ -1248,6 +1300,12 @@ pub struct App {
     /// 被 `RedrawAction::Throttle` 挡住时记的到点时刻;`about_to_wait` 据此在
     /// deadline 到达后补一次 `request_redraw`,而不是靠陈旧 `WaitUntil` 忙转(T3/N3)。
     next_frame_at: Option<Instant>,
+    /// F125:最后一次**键盘输入**的时刻,光标闪烁相位从它起算(打字重置相位)。
+    /// 用 `Instant` 而不是 `u64`:与 `next_frame_at`/`sync_timeout_wake` 同一套时钟。
+    last_input_at: Instant,
+    /// F125:窗口有没有焦点。失焦时不闪(也就不需要周期唤醒),与 Windows 上
+    /// 其它终端的惯例一致。
+    window_focused: bool,
     /// 唤醒/连接结果回送通道(注入 `session::connect` 的 wake,以及本身发 UserEvent)。
     proxy: EventLoopProxy<UserEvent>,
     /// 已知主机指纹表(F3),对应磁盘 `known_hosts.toml`。SSH 线程只读它做判断;
@@ -1402,6 +1460,10 @@ pub struct App {
     /// 用 `Option` 的话后发的会把先发的元信息顶掉 —— 现象是换好之后标题条
     /// 上写着另一台机器的名字。按 `(generation, pane)` 取走。
     pending_rehost: Vec<PendingRehost>,
+    /// F128:正在重拨的连接 `(generation, host_ix, 已失败次数)`。
+    /// 存在这张表里的 host 这一帧不再发起 —— 帧循环 60fps,不去重就是
+    /// 一秒六十条连接(判据在 `reconnect::hosts_to_redial`)。
+    reconnecting: Vec<(u64, usize, u32)>,
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
     /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
     tunnels: crate::tunnels::TunnelRuntime,
@@ -1480,7 +1542,7 @@ enum Modal {
     /// 当前标签、`Ctrl+Shift+B` 仍能开关文件侧栏(两条快捷键的闸门都是
     /// `modal_open()`)。
     ExitConfirm,
-    /// 换节点弹窗(pane 标题条上的 `⇆`)。里面有搜索框 —— 不算模态的话敲的
+    /// 换节点弹窗(pane 标题条上的换节点按钮)。里面有搜索框 —— 不算模态的话敲的
     /// 字会同时发给远端 shell(T8)。
     Rehost,
 }
@@ -1530,6 +1592,8 @@ impl App {
             active: None,
             limiter: FrameLimiter::new(16), // ~60fps(T3)
             next_frame_at: None,
+            last_input_at: Instant::now(),
+            window_focused: true,
             proxy,
             known_hosts,
             pending_host_key: None,
@@ -1570,6 +1634,7 @@ impl App {
             pending_automation: None,
             pending_automation_template: None,
             pending_rehost: Vec::new(),
+            reconnecting: Vec::new(),
             pending_skip_automation: false,
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
@@ -2215,6 +2280,48 @@ impl App {
     /// `holding_deadline_ms` 天然不再返回同一个过去的时刻,不会重复排期。
     fn sync_timeout_wake(&self, now_ms: u64) -> Option<Instant> {
         sync_timeout_wake_at(self.start, self.active_ws(), now_ms)
+    }
+
+    /// F125:这一帧光标该不该画出来。失焦时恒 `true`(不闪,常显)——
+    /// **不是**画成空心框:`style_for` 的 `focused` 参数来自
+    /// `PaneRender.focused = Some(g.id) == focus`(分屏内哪个 pane 有焦点),
+    /// 跟窗口有没有拿到 OS 焦点(这里的 `self.window_focused`)是两个不相干
+    /// 的量,这次改动没有把二者接起来。实际效果是:窗口失焦时,焦点 pane
+    /// 仍按远端 DECSCUSR 给的形状画(Block/Bar/Underline),只是不再闪烁。
+    ///
+    /// 薄壳:决策全在 `blink_on_at`(可脱离 `App` 单测),同 `sync_timeout_wake`
+    /// 委托给 `sync_timeout_wake_at` 的理由——`App` 在无 GPU/窗口的环境下构造
+    /// 不出来,分支逻辑只能靠这条路径测得着。
+    fn blink_on(&self, now: Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.last_input_at)
+            .as_millis() as u64;
+        blink_on_at(self.window_focused, elapsed)
+    }
+
+    /// F125:下一次光标相位翻转的时刻。`None` = 这一刻不需要为闪烁排唤醒
+    /// (窗口失焦 / 没有终端在前台)。薄壳,理由同 `blink_on`。
+    fn blink_wake(&self, now: Instant) -> Option<Instant> {
+        let elapsed = now
+            .saturating_duration_since(self.last_input_at)
+            .as_millis() as u64;
+        let ms = blink_wake_at(self.window_focused, self.active_ws().is_some(), elapsed)?;
+        Some(now + std::time::Duration::from_millis(ms))
+    }
+
+    /// 所有「定时唤醒源」的汇合点:取最早的那个。**新增定时源一律加在这里**,
+    /// 各自排各自的 `WaitUntil` 会互相覆盖(后写的赢),症状是某个定时行为
+    /// 时灵时不灵。
+    ///
+    /// `now` 与两处调用点手里的 `now_ms`(`self.now_ms()`,自 `self.start` 起算
+    /// 的毫秒数)同源;`blink_wake` 要的是 `Instant`,这里用 `self.start +
+    /// Duration::from_millis(now)` 换算回去——与 `now_ms()` 互为逆运算,不引入漂移。
+    fn next_timer_wake(&self, now: u64) -> Option<Instant> {
+        let blink_now = self.start + std::time::Duration::from_millis(now);
+        [self.sync_timeout_wake(now), self.blink_wake(blink_now)]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// 有没有模态盖着。分流(§4.5)与标签快捷键共用同一个判据 —— 两处各写一遍
@@ -3542,10 +3649,10 @@ impl App {
     /// 差异收掉):
     /// - `Terminal`(侧栏,D1 之前就有):蹭会话已建立的连接
     ///   (`SftpClient::open` 的签名里刻意没有网络参数),不重新握手。取
-    ///   `hosts.first()` 而不是「聚焦 pane 那台」,前提是 ADR-009 下
-    ///   `PaneState::host_ix` 目前**恒为 0**(一个 workspace 事实上只挂一条
-    ///   连接),二者今天等价。等多主机分屏真落地,这里要跟着改成按聚焦 pane
-    ///   取——否则侧栏会连到另一台机器上,而用户看不出来。
+    ///   `hosts.first()` = 这个标签的主连接(断线重连会**就地替换**它,不是
+    ///   另 push 一条,见 `TabContent::sftp_connection` 的文档)。用户按
+    ///   「换节点」把某块 pane 挪到第二台机器上之后,侧栏仍连第一台 ——
+    ///   既有限制,同一处文档里写清了为什么不顺手改。
     /// - `Files`(D1 标签宿主):独占的连接(`establish` 单独建的那条,
     ///   ADR-010 同款理由),`sftp_connection` 恒 `Some`。
     fn trigger_sftp_open(&mut self, generation: u64) {
@@ -3943,7 +4050,16 @@ impl App {
         else {
             return;
         };
-        let area = ime_cursor_area(g.term_px, (cur.col, cur.row), cell_w, cell_h);
+        // F126:组字中候选框要跟拼音串末尾走,不是原始光标列 —— 与
+        // `gpu::quads_for_panes`/`text::prepare_panes` 摆字用的是同一个
+        // `preedit_cursor_col`,否则候选框和内联拼音的视觉光标位置对不上。
+        let cols = self
+            .active_ws()
+            .and_then(Workspace::focused)
+            .map(|p| p.emulator.cols())
+            .unwrap_or(cur.col + 1);
+        let col = crate::text::preedit_cursor_col(cols, cur.col, self.ime.preedit());
+        let area = ime_cursor_area(g.term_px, (col, cur.row), cell_w, cell_h);
         if self.ime_cursor_area == Some(area) {
             return;
         }
@@ -4031,6 +4147,11 @@ impl App {
     /// 真正发送。到这里要么不需要确认,要么用户已经点了「粘贴」。粘贴目标
     /// 是**焦点 pane**——分屏后粘贴永远只进当前正在操作的那一块。
     fn send_paste(&mut self, text: &str) {
+        // F125:粘贴也是输入,重置闪烁相位——否则在暗周期粘贴,光标最长要等
+        // 530ms 才转亮,与「刚有动作光标一定亮」的意图相悖。必须在借出
+        // `self.active_ws_mut()` 之前做,否则跟下面 `pane` 的可变借用冲突
+        // (同 `self.user_took_over()` 挪到 `pane` 借用结束之后的理由一样)。
+        self.last_input_at = Instant::now();
         let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) else {
             return;
         };
@@ -4201,7 +4322,11 @@ impl App {
                     h.disconnect.take();
                     continue;
                 };
-                if pane.status == crate::shell::workspace::PaneStatus::Disconnected {
+                // 判据在 `automation::should_cancel_on_status`(纯函数,可单测)。
+                // **不要写成 `== Disconnected`**:F128 之后链路死了先落到
+                // `Reconnecting`,那样写会让这份自动化一直挂到自己的
+                // ready_timeout 才收场(见那个函数的文档)。
+                if crate::automation::should_cancel_on_status(pane.status) {
                     // send 的 Err(接收端已走)无所谓:task 已经结束了。
                     if let Some(tx) = h.disconnect.take() {
                         let _ = tx.send(());
@@ -4423,6 +4548,7 @@ impl App {
             addr: format!("{}:{}", cfg.host, cfg.port),
             session_id: session,
             plan,
+            cfg: cfg.clone(),
         });
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
@@ -4465,6 +4591,180 @@ impl App {
                 }
             }
         });
+    }
+
+    /// F128:这一帧该发起哪些重拨。挂在帧循环上而不是在 `pump` 里直接拨:
+    /// `Workspace` 不认识 tokio、也不认识 store(架构不变量),拨号是 app 的事。
+    ///
+    /// **遍历所有标签,不只是活动标签**——理由同 `drive_automation`:用户
+    /// 完全可能开着标签 A 连了台机器就切去标签 B,只驱动活动标签的话标签 A
+    /// 断线要等用户切回去才会开始重拨,「尽快恢复」这条诉求就落空了。
+    fn drive_reconnects(&mut self) {
+        let generations: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.content.as_terminal())
+            .map(|t| t.ws.generation())
+            .collect();
+        let mut plans: Vec<(u64, usize)> = Vec::new();
+        for generation in generations {
+            let Some(t) = self
+                .tabs
+                .by_generation(generation)
+                .and_then(|t| t.content.as_terminal())
+            else {
+                continue;
+            };
+            // 稳态早退(T3):这个标签没有 pane 在 `Reconnecting` 就不用往下
+            // collect 两个 `Vec`——多标签下这个函数每帧都对每个标签跑一遍,
+            // 早退把稳态成本压回一次 bool 扫描。
+            if !t
+                .ws
+                .panes()
+                .iter()
+                .any(|p| p.status == crate::shell::workspace::PaneStatus::Reconnecting)
+            {
+                continue;
+            }
+            let in_flight: Vec<usize> = self
+                .reconnecting
+                .iter()
+                .filter(|(g, _, _)| *g == generation)
+                .map(|(_, h, _)| *h)
+                .collect();
+            // `Workspace::panes()` 返回 `&[PaneState]`(既有签名),所以走 `.iter()`。
+            let panes: Vec<(PaneId, usize, crate::shell::workspace::PaneStatus)> =
+                t.ws.panes()
+                    .iter()
+                    .map(|p| (p.id, p.host_ix, p.status))
+                    .collect();
+            for host_ix in crate::reconnect::hosts_to_redial(&panes, &in_flight) {
+                plans.push((generation, host_ix));
+            }
+        }
+        for (generation, host_ix) in plans {
+            // `attempt = 0` 是「首次重拨」:`delay_for(0)` 是 `None`(退避表
+            // 1-indexed,`backoff_delay(0)` 视 0 为非法输入),`unwrap_or_default()`
+            // 把它变成零延迟——首次立刻拨,失败后才进 1s/2s/4s… 的退避。
+            // **别把 0 改成 1**,那会让首次重拨白等 1 秒。
+            self.spawn_reconnect(generation, host_ix, 0);
+        }
+    }
+
+    /// F128:为一条已经死掉的连接发起第 `attempt` 次重拨。
+    ///
+    /// 凭据取 **`ws.hosts[host_ix].cfg`**(建这条连接那一刻定死的),两条纪律:
+    ///
+    /// - **绝不回头查库** —— 用户在断线期间完全可能改了会话甚至删了它,那时候
+    ///   拨出去的目标就跟他当初点「连接」时看到的不是一回事(理由同 `PendingRehost`)。
+    /// - **绝不取标签级的 `last_cfg`** —— 那只记得**最初**连的那台机器。用户
+    ///   用「换节点」把 pane 挪到第二台服务器之后,第二台断线时拿 `last_cfg`
+    ///   重拨就是静默连到另一台机器上(见 `HostConn::cfg` 的文档)。
+    fn spawn_reconnect(&mut self, generation: u64, host_ix: usize, attempt: u32) {
+        let Some(t) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.as_terminal())
+        else {
+            return;
+        };
+        let Some(cfg) = t.ws.hosts.get(host_ix).and_then(|h| h.cfg.clone()) else {
+            log::warn!(
+                target: "mullion",
+                "重连:世代 {generation} host {host_ix} 没有拨号参数,放弃"
+            );
+            return;
+        };
+        // 这条连接上挂着哪些 pane —— 每块都要一条新 channel(adr-009)。
+        let panes: Vec<PaneId> =
+            t.ws.panes()
+                .iter()
+                .filter(|p| {
+                    p.host_ix == host_ix
+                        && p.status == crate::shell::workspace::PaneStatus::Reconnecting
+                })
+                .map(|p| p.id)
+                .collect();
+        if panes.is_empty() {
+            return;
+        }
+        self.reconnecting.push((generation, host_ix, attempt));
+        let delay = crate::reconnect::delay_for(attempt).unwrap_or_default();
+        // 屏内提示(§7.3):喂进 emulator 当普通输出,不做倒计时。
+        let notice = crate::reconnect::notice_bytes(attempt + 1, delay);
+        if let Some(ws) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.as_terminal_mut())
+            .map(|t| &mut t.ws)
+        {
+            for id in &panes {
+                if let Some(p) = ws.pane_mut(*id) {
+                    p.emulator.feed(&notice);
+                }
+            }
+        }
+        let proxy = self.proxy.clone();
+        let wake_proxy = self.proxy.clone();
+        // 主机密钥照旧走后台策略:指纹变了就当场停(不是「重连时放松校验」——
+        // 断线正是中间人最好下手的时机)。
+        let policy: Arc<dyn HostKeyPolicy> = Arc::new(crate::host_key::PromptingPolicy::new(
+            self.known_hosts.clone(),
+            self.proxy.clone(),
+            true,
+        ));
+        let task = self._runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = wake_proxy.send_event(UserEvent::Wake);
+            });
+            let handle = match mullion_ssh::session::establish(&cfg, policy).await {
+                Ok(h) => Arc::new(h),
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::PaneReconnectErr {
+                        generation,
+                        host_ix,
+                        attempt,
+                        msg: e.to_string(),
+                    });
+                    return;
+                }
+            };
+            let mut channels = Vec::new();
+            for id in panes {
+                match mullion_ssh::session::open_pty(handle.clone(), &cfg, wake.clone()).await {
+                    Ok((ssh, rx)) => channels.push((id, ssh, rx)),
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::PaneReconnectErr {
+                            generation,
+                            host_ix,
+                            attempt,
+                            msg: e.to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = proxy.send_event(UserEvent::PaneReconnected {
+                generation,
+                host_ix,
+                handle,
+                channels,
+            });
+        });
+        // 句柄存回属主标签,`wind_down` 才收得了口(见 `reconnect_tasks` 的
+        // 文档)。取不到属主标签就当场 abort —— 与 `track_sftp_task` 同一套
+        // 「无人收留就别让它跑」的纪律。
+        if let Some(t) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.as_terminal_mut())
+        {
+            t.reconnect_tasks.retain(|h| !h.is_finished());
+            t.reconnect_tasks.push(task);
+        } else {
+            task.abort();
+        }
     }
 
     /// F92:拨一次完整认证后立刻断开。**不开 channel、不起 pty** ——
@@ -5037,6 +5337,10 @@ impl ApplicationHandler<UserEvent> for App {
                     handle,
                     tmux_bootstrap: Default::default(),
                     tmux_last_try: None,
+                    // F128:重连要用它。跟下面 `last_cfg` 同一份,但那份是
+                    // **标签级**的(标题条读 user/host/port),换过节点之后
+                    // 就不再代表"每一条连接"——见 `HostConn::cfg` 的文档。
+                    cfg: cfg.clone(),
                 });
                 // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
                 // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
@@ -5066,6 +5370,7 @@ impl ApplicationHandler<UserEvent> for App {
                         sftp_tasks: Vec::new(),
                         sftp_default_remote: sftp_prefs.default_remote,
                         sftp_home: None,
+                        reconnect_tasks: Vec::new(),
                     })),
                 );
                 // F37:是重连一个占位标签 → 把上次的分屏形状搭回来,并给新长
@@ -5249,6 +5554,9 @@ impl ApplicationHandler<UserEvent> for App {
                         handle,
                         tmux_bootstrap: Default::default(),
                         tmux_last_try: None,
+                        // F128:拨这台新机器的参数跟着它自己走。落回
+                        // `last_cfg` 的话,这条连接断线时会拨回最初那台机器。
+                        cfg: Some(pending.cfg),
                     });
                     let host_ix = ws.hosts.len() - 1;
                     if rehost_pane(ws, pane, generation, host_ix, Box::new(ssh.clone()), rx) {
@@ -5291,6 +5599,172 @@ impl ApplicationHandler<UserEvent> for App {
                     self.ui_dirty = true;
                     self.request_ui_redraw();
                 }
+            }
+            UserEvent::PaneReconnected {
+                generation,
+                host_ix,
+                handle,
+                channels,
+            } => {
+                self.reconnecting
+                    .retain(|(g, h, _)| !(*g == generation && *h == host_ix));
+                let mut attached: Vec<(PaneId, Arc<mullion_ssh::session::SshSession>)> = Vec::new();
+                let mut template = None;
+                if let Some(t) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.as_terminal_mut())
+                {
+                    // pane 先挂到新 channel 上。`host_ix` **不变** —— 重连换的
+                    // 是同一台机器的连接,不是换机器,那个下标本来就还是它。
+                    for (id, ssh, rx) in channels {
+                        let ssh = Arc::new(ssh);
+                        if reattach_pane(
+                            &mut t.ws,
+                            id,
+                            generation,
+                            host_ix,
+                            Box::new(ssh.clone()),
+                            rx,
+                        ) {
+                            attached.push((id, ssh));
+                        }
+                    }
+                    if attached.is_empty() {
+                        // 拨号那几秒里这条连接上的 pane 全被用户关掉了 ——
+                        // 新连接没人要,**不替换**,`handle` 随这个分支结束而
+                        // Drop(Drop 即断连)。旧的死 `HostConn` 原样留着:
+                        // 它至少还带着 label/addr/cfg,下次真有 pane 要重连时
+                        // 还用得上。
+                        log::warn!(
+                            target: "mullion",
+                            "重连:host {host_ix}(世代 {generation})拨号途中所有 pane 都没了,丢弃新连接",
+                        );
+                    } else if let Some(h) = t.ws.hosts.get_mut(host_ix) {
+                        // **就地替换,绝不 push**:`hosts[ix]` 的语义是「第 ix
+                        // **台机器**的当前连接」,不是「第 ix 次建立的连接」。
+                        // push 一条新的会让 `hosts[0]` 不再是这个标签的主连接,
+                        // 而认着这个下标的地方一个都不会跟着走 ——
+                        // `TabContent::sftp_connection`(文件面板)、
+                        // `spawn_fresh_panes`(分屏开 channel)、`PaneOpened` 里
+                        // 硬编的 `host_ix: 0` 全都会指向刚断掉的那条死连接,
+                        // 症状是重连之后文件面板永久打不开、新开的分屏必然失败,
+                        // 而终端本身工作正常,用户完全看不出成因。
+                        //
+                        // 旧的那条 `HostConn` 在这次赋值里 Drop —— Drop 即断连,
+                        // 而它本来就已经死了(`rx_closed_action` 的重连判据就是
+                        // 「传输层没了」),不留孤儿。
+                        //
+                        // 同一台机器上那些用户敲过 `exit` 的 `Disconnected` pane
+                        // **不会被拖着换**:它们的 `host_ix` 仍指这里,但状态机
+                        // 走的是 `rx_closed_action(link_alive(..))` —— 连接活了
+                        // 之后返回的是 `UserExited`,状态原样是 `Disconnected`。
+                        // 它们的 `pty`/`rx` 还是旧的死 channel,写入静默失败,
+                        // 与替换前完全一致。
+                        //
+                        // `label`/`addr`/`session_id`/`cfg` 原样留着:同一台机器,
+                        // 这四样本来就该一样(旧实现也是从旧的那条复制过来的)。
+                        h.handle = handle;
+                        // F124:新连接 = 新的 tmux 服务器状态,自举重来一遍
+                        // (`tmux set -g` 幂等,重发无副作用)。
+                        h.tmux_bootstrap = Default::default();
+                        h.tmux_last_try = None;
+                    }
+                    // 这次拨号没赶上的 pane 补一次(判据见
+                    // `reconnect::strays_after_reconnect`):同一条连接上各 pane
+                    // 的 `rx` 不保证同一帧关闭,慢一步的那块不会出现在
+                    // `channels` 里,而它手里攥的是已经死掉的旧 channel ——
+                    // 不补的话它的输入静默丢失,标题条上却一切正常。
+                    // 置回 `Reconnecting`,下一帧 `drive_reconnects` 收走。
+                    if !attached.is_empty() {
+                        let snapshot: Vec<(PaneId, usize, crate::shell::workspace::PaneStatus)> =
+                            t.ws.panes()
+                                .iter()
+                                .map(|p| (p.id, p.host_ix, p.status))
+                                .collect();
+                        let done: Vec<PaneId> = attached.iter().map(|(id, _)| *id).collect();
+                        for id in
+                            crate::reconnect::strays_after_reconnect(&snapshot, host_ix, &done)
+                        {
+                            if let Some(p) = t.ws.pane_mut(id) {
+                                p.status = crate::shell::workspace::PaneStatus::Reconnecting;
+                            }
+                            log::info!(
+                                target: "mullion",
+                                "重连:pane {} 没赶上这次拨号,补一次重连",
+                                id.0
+                            );
+                        }
+                    }
+                    // 死掉的那条连接上开的 SFTP channel 一起完蛋 —— 留着的话
+                    // 侧栏每次操作静默失败,用户看到的是「文件面板卡住了」。
+                    for task in t.sftp_tasks.drain(..) {
+                        task.abort();
+                    }
+                    t.sftp = None;
+                    t.sftp_home = None;
+                    template = t.automation_template.clone();
+                }
+                // 用户拍板:重连之后重跑登录后命令 —— 否则 tmux 不 attach,
+                // 断线前那个 Claude Code 会话回不来(这正是 F128 的初衷)。
+                // 跳过 tmux new-session 那类"开新会话"的步骤,规则同分屏新开的
+                // pane(`pending_for_extra_pane`)。
+                let reconnected = !attached.is_empty();
+                if let Some(tpl) = template {
+                    for (id, sink) in attached {
+                        if let Some(plan) = crate::automation::pending_for_extra_pane(&tpl) {
+                            self.start_automation(generation, id, plan, sink);
+                        }
+                    }
+                }
+                // 零个 pane 真接上却弹「已重新连接」是名不副实——那种情况下
+                // 上面已经把刚 push 的 `HostConn` 撤掉了,用户什么都没得到。
+                if reconnected {
+                    self.ui.set_toast("已重新连接");
+                }
+                self.ui_dirty = true;
+                self.request_ui_redraw();
+            }
+            UserEvent::PaneReconnectErr {
+                generation,
+                host_ix,
+                attempt,
+                msg,
+            } => {
+                self.reconnecting
+                    .retain(|(g, h, _)| !(*g == generation && *h == host_ix));
+                log::warn!(
+                    target: "mullion",
+                    "世代 {generation} host {host_ix} 第 {attempt} 次重连失败: {msg}"
+                );
+                let next = attempt + 1;
+                if crate::reconnect::delay_for(next).is_some() {
+                    self.spawn_reconnect(generation, host_ix, next);
+                } else {
+                    // 退避到顶:落回 `Disconnected`,交给用户决定重连还是关掉。
+                    if let Some(ws) = self
+                        .tabs
+                        .by_generation_mut(generation)
+                        .and_then(|t| t.content.as_terminal_mut())
+                        .map(|t| &mut t.ws)
+                    {
+                        let ids: Vec<PaneId> = ws
+                            .panes()
+                            .iter()
+                            .filter(|p| p.host_ix == host_ix)
+                            .map(|p| p.id)
+                            .collect();
+                        for id in ids {
+                            if let Some(p) = ws.pane_mut(id) {
+                                p.status = crate::reconnect::status_after_failure(next);
+                                p.emulator.feed(&crate::reconnect::give_up_notice_bytes());
+                            }
+                        }
+                    }
+                    self.ui.set_error(format!("重连失败: {msg}"));
+                }
+                self.ui_dirty = true;
+                self.request_ui_redraw();
             }
             UserEvent::KeyPathPicked(picked) => {
                 self.key_picker_busy = false;
@@ -5663,6 +6137,8 @@ impl ApplicationHandler<UserEvent> for App {
             // 重绘,避免停在陈旧/空白帧(此前这些事件落 `_ => {}`,不重绘也不留痕)。
             WindowEvent::Focused(focused) => {
                 crate::logx::line(&format!("Focused({focused})"));
+                // F125:失焦不闪,省掉后台窗口的周期唤醒。
+                self.window_focused = focused;
                 if focused {
                     self.recheck_visibility();
                     self.request_ui_redraw();
@@ -5799,9 +6275,16 @@ impl ApplicationHandler<UserEvent> for App {
             // `set_ime_allowed(true)` 在 `resumed` 里开,不开这条事件根本不会发。
             WindowEvent::Ime(ime) => {
                 match &ime {
-                    winit::event::Ime::Preedit(text, _) => self.ime.on_preedit(text),
+                    winit::event::Ime::Preedit(text, _) => {
+                        self.ime.on_preedit(text);
+                        // F125:拼音现在内联上屏,组字中敲字母也算「输入」——
+                        // 不重置的话光标可能闪到暗周期,用户敲拼音时观感是丢帧。
+                        self.last_input_at = Instant::now();
+                    }
                     winit::event::Ime::Commit(text) => {
                         self.ime.on_commit();
+                        // F125:输入法提交也是输入,重置闪烁相位。
+                        self.last_input_at = Instant::now();
                         // 组字结果按用户输入对待:先回底部(否则「打了但看不到」,
                         // 与按键/粘贴同一条口径),再写焦点 pane。
                         if let Some(bytes) = input::ime_commit_bytes(text) {
@@ -5819,6 +6302,9 @@ impl ApplicationHandler<UserEvent> for App {
                     winit::event::Ime::Enabled => {}
                     winit::event::Ime::Disabled => self.ime.on_disabled(),
                 }
+                // F126:preedit 串变了,候选框该跟去拼音串末尾——不补这一句,
+                // 候选框位置要等下一次别的事件才更新,组字时肉眼可见地滞后一拍。
+                self.apply_ime_cursor_area();
                 self.request_ui_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -5828,6 +6314,8 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if event.state == ElementState::Pressed {
+                    // F125:打字重置闪烁相位,保证「刚敲完光标一定是亮的」。
+                    self.last_input_at = Instant::now();
                     if let Some((key, mods)) = input::translate_key(&event, self.mods) {
                         // F18:`Ctrl+Shift+C/V` 必须在 `encode_key` 之前截住。
                         // Ctrl+C 会被编码成 `0x03`(SIGINT)——漏下去就是「想复制
@@ -5865,6 +6353,44 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             self.request_ui_redraw();
                             return;
+                        }
+                        // F129:断开的 pane 上 Ctrl+D 改成「关掉这块分屏」。
+                        // 必须在 `encode_key` 之前 —— 它会把 Ctrl+D 编成 0x04,
+                        // 漏下去就是往一条死 channel 上写字节(静默失败)。
+                        // 修饰键判据走纯函数,不在这儿内联 —— 它要排掉 AltGr
+                        // (Windows 合成成 Ctrl+Alt),那条只有单测守得住。
+                        if crate::shell::input_route::is_bare_ctrl_d(key, mods) {
+                            let st = self
+                                .active_ws()
+                                .and_then(Workspace::focused)
+                                .map(|p| p.status);
+                            let is_last = self
+                                .active_ws()
+                                .map(|ws| ws.pane_count() <= 1)
+                                .unwrap_or(true);
+                            if let Some(st) = st {
+                                match crate::shell::input_route::ctrl_d_action(st, is_last) {
+                                    crate::shell::input_route::CtrlD::SendEof => {}
+                                    crate::shell::input_route::CtrlD::ClosePane => {
+                                        let id = self.active_ws().map(Workspace::focus);
+                                        if let (Some(id), Some(ws)) = (id, self.active_ws_mut()) {
+                                            ws.close_pane(id);
+                                        }
+                                        self.ui_dirty = true;
+                                        self.request_ui_redraw();
+                                        return;
+                                    }
+                                    crate::shell::input_route::CtrlD::CloseTab => {
+                                        // 复用既有的关标签路径(Ctrl+W / 菜单「断开」
+                                        // 走的同一条):它负责 abort 自动化、
+                                        // 收 sftp task、按顺序 drop workspace。
+                                        self.close_active_tab();
+                                        self.ui_dirty = true;
+                                        self.request_ui_redraw();
+                                        return;
+                                    }
+                                }
+                            }
                         }
                         let bytes = mullion_term::keymap::encode_key(key, mods, self.kitty);
                         // `let _` 全文件都这样:写/resize 失败(断线等)没有用户提示、
@@ -5904,6 +6430,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // 仅终端态有字节可处理;launcher 态(ws=None)没有终端,跳过,但下面的帧率闸 + egui
                 // 渲染仍要跑(egui 在 launcher 也要画占位 UI)。
                 self.pump_io();
+                // F128:这一帧该重拨的连接。挂在 IO 泵之后——`pump_io` 里的
+                // `ws.pump` 才会把 rx 关闭翻译成 `PaneStatus::Reconnecting`,
+                // 顺序反了就晚一帧才发起重拨。
+                self.drive_reconnects();
                 // 1.5 F55/F59:传输队列每帧推进一次(放行 worker + 采样速率)。
                 // **放在帧里而不是事件里**是 T3:进度事件每秒几千条,靠它们
                 // 驱动重绘就是风扇起飞;这里只把「队列在跑」当成脏,重绘频率
@@ -6096,10 +6626,16 @@ impl ApplicationHandler<UserEvent> for App {
                             let focus = self.active_ws().map(Workspace::focus);
                             let renders: Vec<crate::gpu::PaneRender<'_>> = snaps
                                 .iter()
-                                .map(|(g, s)| crate::gpu::PaneRender {
-                                    geom: *g,
-                                    snap: s,
-                                    focused: Some(g.id) == focus,
+                                .map(|(g, s)| {
+                                    let focused_here = Some(g.id) == focus;
+                                    crate::gpu::PaneRender {
+                                        geom: *g,
+                                        snap: s,
+                                        focused: focused_here,
+                                        // F126:输入法一次只对一个 pane 生效,
+                                        // 非焦点 pane 不画拼音串。
+                                        preedit: if focused_here { self.ime.preedit() } else { "" },
+                                    }
                                 })
                                 .collect();
                             // 同 `active_ws_of` 的说明:这里借出去的 `titles` 一直
@@ -6274,6 +6810,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 files_focused: self.effective_focus()
                                     == shell::input_route::Focus::FilesPanel,
                             };
+                            // F125:光标该不该画,得在借出 `self.active` 之前算——
+                            // `blink_on` 要读 `self.window_focused`/`self.last_input_at`/
+                            // `self.active_ws()`,这几个都是 `&self` 方法,借用会跟下面
+                            // `self.active.as_mut()` 冲突。
+                            let blink_on = self.blink_on(Instant::now());
                             let a = self.active.as_mut().expect("上面刚判过 is_some");
                             // D1:两种宿主互斥(见上面 `files_owner_generation`
                             // 的说明),`taken_files` 只会有其中一份非空数据 ——
@@ -6295,6 +6836,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 &self.transfer_queue,
                                 &self.edits,
                                 &mut self.editor,
+                                blink_on,
                             );
                             drop(renders);
                             drop(titles);
@@ -6611,10 +7153,11 @@ impl ApplicationHandler<UserEvent> for App {
                                     + std::time::Duration::from_millis(TRANSFER_UI_INTERVAL_MS);
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
-                            } else if let Some(at) = self.sync_timeout_wake(now) {
-                                // Important #2/T2:egui 这帧不需要重绘,但有 pane 卡在
-                                // 未超时的同步块里——主动排一次到超时点的唤醒,而不是
-                                // 无条件 Wait 等下一个不相关事件顺带救回冻住的画面。
+                            } else if let Some(at) = self.next_timer_wake(now) {
+                                // Important #2/T2/F125:egui 这帧不需要重绘,但有 pane 卡在
+                                // 未超时的同步块里,或者光标该翻转相位了——经
+                                // `next_timer_wake` 统一汇合,主动排一次到最早那个
+                                // 时刻的唤醒,而不是无条件 Wait 等不相关事件顺带救回。
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                             } else {
@@ -6632,8 +7175,9 @@ impl ApplicationHandler<UserEvent> for App {
                         event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                     }
                     RedrawAction::Idle => {
-                        // Important #2/T2:同上——没有脏帧不代表没有 pane 卡在同步块里。
-                        if let Some(at) = self.sync_timeout_wake(now) {
+                        // Important #2/T2/F125:同上——没有脏帧不代表没有 pane 卡在同步
+                        // 块里,也不代表光标不需要翻转相位。
+                        if let Some(at) = self.next_timer_wake(now) {
                             self.next_frame_at = Some(at);
                             event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                         } else {
@@ -7139,9 +7683,13 @@ fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
 ///
 /// **旧的 `HostConn` 留在 `hosts` 里不摘**:`host_ix` 是**下标即身份**,摘掉
 /// 一条会让排在它后面的所有 pane 的 `host_ix` 集体错位(指向另一台机器,输入
-/// 照发)。`hosts[0]` 还额外被 sftp 侧栏和 `last_cfg` 认着。代价是那条连接闲
-/// 置到整个标签关闭为止——换节点是低频操作,拿一条闲置连接换掉一整类静默的
-/// 错位 bug 是划算的。
+/// 照发)。`hosts[0]` 还额外被 sftp 侧栏认着。代价是那条连接闲置到整个标签
+/// 关闭为止——换节点是低频操作,拿一条闲置连接换掉一整类静默的错位 bug
+/// 是划算的。
+///
+/// F128 补充:**只有换机器才 push**。断线重连走的是就地替换
+/// (`UserEvent::PaneReconnected`),因为那是同一台机器的连接换了一条,
+/// `hosts[ix]` 的语义始终是「第 ix **台机器**的当前连接」。理由详见那个分支。
 ///
 /// `host_ix` 由调用方现算(`ws.hosts.len() - 1`,刚 push 进去那条)。**不在这里
 /// push `HostConn`**:那个类型里揣着 `Arc<SshConnection>`,而 `SshConnection`
@@ -7169,19 +7717,7 @@ fn rehost_pane(
     let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
     let d = theme::term_default_colors(&MULLION_DARK);
     emulator.set_default_colors(d.fg, d.bg);
-    p.host_ix = host_ix;
     p.emulator = emulator;
-    // 旧的 `pty`/`rx` 在这两句赋值里被 Drop —— Drop 即关掉上一台机器的
-    // channel,不留孤儿。
-    p.pty = pty;
-    p.rx = rx;
-    p.pacer = SyncFramePacer::new();
-    p.status = crate::shell::workspace::PaneStatus::Live;
-    // 自动化的「就绪」判据要重新攒(新机器还一个字节都没说话);`last_grid`
-    // 给不可能的初值,逼下一帧 apply_geometry 发一次 window_change(T4)——
-    // 新开的 channel 是 80x24,不发的话远端按 80x24 排版。
-    p.saw_first_byte = false;
-    p.last_grid = (0, 0);
     // ⑥:`cwd`/`tmux` 同 `emulator` 一个道理——旧值是上一台机器嗅出来的
     // (OSC 7 目录 / 窗口标题里的 tmux 会话名),留着会在标题条右区挂一条
     // 「看起来对、其实属于上一台机器」的过期标注,而且 `cwd` 是"只增不清"
@@ -7189,6 +7725,59 @@ fn rehost_pane(
     // 主动清空。
     p.cwd = None;
     p.tmux = None;
+    swap_pane_channel(p, host_ix, pty, rx);
+    true
+}
+
+/// 换 channel 时两条路径(换机器 / 重连)**共同**要做的事。
+///
+/// 抽出来是因为漏掉其中任何一条都会产生难查的 bug:`last_grid` 漏了是 T4
+/// (远端按 80 列排版),`saw_first_byte` 漏了是自动化在一条还没说话的 channel
+/// 上开跑,`pacer` 漏了是上一条 channel 没收口的同步块把新内容一直攒着(T2)。
+fn swap_pane_channel(
+    p: &mut crate::shell::workspace::PaneState,
+    host_ix: usize,
+    pty: Box<dyn crate::shell::workspace::PtyWriter>,
+    rx: Receiver<Vec<u8>>,
+) {
+    p.host_ix = host_ix;
+    // 旧的 `pty`/`rx` 在这两句赋值里被 Drop —— Drop 即关掉上一条 channel,
+    // 不留孤儿。
+    p.pty = pty;
+    p.rx = rx;
+    p.pacer = SyncFramePacer::new();
+    p.status = crate::shell::workspace::PaneStatus::Live;
+    // 自动化的「就绪」判据要重新攒(新 channel 还一个字节都没说话);`last_grid`
+    // 给不可能的初值,逼下一帧 apply_geometry 发一次 window_change(T4)——
+    // 新开的 channel 是 80x24,不发的话远端按 80x24 排版。
+    p.saw_first_byte = false;
+    p.last_grid = (0, 0);
+}
+
+/// F128:断线重连之后把 pane 挂到**新开的 channel** 上。
+///
+/// 与 `rehost_pane` 的唯一差别:**保留 `emulator`**(以及它嗅出来的 `cwd`/`tmux`)。
+/// 还是同一台机器、同一个用户,断线前那一屏内容是用户想看的东西
+/// (往往正是导致断线的那条报错),重建等于当场抹掉。`host_ix` 仍要传:
+/// 重连会往 `ws.hosts` 里 push 一条新的 `HostConn`(旧的那条连接已经死了)。
+///
+/// F128 拆成 5 个任务:这是第 3 个,只落这个函数本身;调度(Task 14 的退避算法 /
+/// Task 15 的接线)接上之后,调用方是 `UserEvent::PaneReconnected` 分支。
+fn reattach_pane(
+    ws: &mut Workspace,
+    id: PaneId,
+    generation: u64,
+    host_ix: usize,
+    pty: Box<dyn crate::shell::workspace::PtyWriter>,
+    rx: Receiver<Vec<u8>>,
+) -> bool {
+    if !pane_still_wanted(ws, id, generation) {
+        return false;
+    }
+    let Some(p) = ws.pane_mut(id) else {
+        return false;
+    };
+    swap_pane_channel(p, host_ix, pty, rx);
     true
 }
 
@@ -7545,6 +8134,37 @@ fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> 
     }
 }
 
+/// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
+/// 「距上次输入多少毫秒」,不碰 `&App`,理由同 `sync_timeout_wake_at`(`App`
+/// 在无 GPU/窗口的环境下构造不出来,这几条分支只能靠这条路径单测)。
+///
+/// 隐式耦合:`window_focused == true` 但没有活跃终端(launcher 态,没有 pane
+/// 要画)时,这个函数仍按相位交替返回 —— 调用方(`quads_for_panes`)那时压根
+/// 没有光标要画,返回值不会被用到。复核已确认这不是 bug:「有没有活跃终端」
+/// 故意不是这个函数的判据,那是 `blink_wake_at`(要不要为它排周期唤醒)的事,
+/// 这里只管「这一刻该不该画」。
+fn blink_on_at(window_focused: bool, elapsed_since_input_ms: u64) -> bool {
+    if !window_focused {
+        return true;
+    }
+    crate::frame::blink_visible(elapsed_since_input_ms, 0)
+}
+
+/// F125:`App::blink_wake` 的核心判据抽成自由函数,理由同 `blink_on_at`。
+/// `has_active_terminal` 对应 `App::active_ws().is_some()`:没有活跃终端就没有
+/// 光标要画,不必为闪烁排周期唤醒。返回值是「还要多少毫秒后翻转相位」,
+/// `None` = 这一刻不需要排(窗口失焦 / 没有活跃终端)。
+fn blink_wake_at(
+    window_focused: bool,
+    has_active_terminal: bool,
+    elapsed_since_input_ms: u64,
+) -> Option<u64> {
+    if !window_focused || !has_active_terminal {
+        return None;
+    }
+    Some(crate::frame::blink_next_flip_ms(elapsed_since_input_ms, 0))
+}
+
 /// 施加一次保存意图。抽成纯函数是为了能在没有窗口的情况下测「编辑已有会话
 /// 不会把凭据清掉」(F73)——这条路径以前埋在事件循环里,只能靠上机手点。
 ///
@@ -7850,6 +8470,10 @@ fn render_frame(
     // F53:在编辑的那些文件 + 内置编辑器窗口,转给 `build_ui`。
     edits: &crate::edit::sessions::EditSessions,
     editor: &mut Option<crate::ui::editor_window::EditorState>,
+    // F125:这一帧光标该不该画出来(闪烁相位),调用方 `App::window_event` 算好了
+    // 原样转给 `quads_for_panes`——算这个要读 `self.window_focused`/
+    // `self.last_input_at`,那两个字段在这里(`Active` 而非 `App`)够不着。
+    blink_on: bool,
 ) -> (std::time::Duration, crate::ui::UiActions) {
     diag::count_frame();
     // --- egui:每帧都跑,launcher 态(panes 为空)也要画菜单/状态栏。---
@@ -7943,13 +8567,17 @@ fn render_frame(
             a.text.cell_w,
             a.text.cell_h,
             theme::term_default_colors(&MULLION_DARK),
+            blink_on,
         );
         // 渲染路径不许 panic:prepare 失败(如长会话把图集喂满 AtlasFull)记录并
         // 跳过整帧(含 egui),与 Task 3 之前的行为一致——不拖垮整个 GUI。
-        if let Err(e) = a
-            .text
-            .prepare_panes(&a.gpu.device, &a.gpu.queue, panes, res)
-        {
+        if let Err(e) = a.text.prepare_panes(
+            &a.gpu.device,
+            &a.gpu.queue,
+            panes,
+            res,
+            theme::term_default_colors(&MULLION_DARK).fg,
+        ) {
             log::warn!(target: "mullion", "glyphon prepare 失败,跳过本帧: {e:?}");
             diag::count_skipped();
             return (std::time::Duration::MAX, actions);
@@ -8050,11 +8678,12 @@ fn render_frame(
 mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
-        autoscroll_for_pane, credential_delete_error, download_job, effective_focus_of,
-        expand_tilde, files_owner_generation_of, files_start_dir, finish_password_change,
-        font_px_for, has_real_action, ime_cursor_area, next_panel_selection_index,
-        pane_still_wanted, rehost_pane, snapshot_tabs_of, sync_target_of, sync_timeout_wake_at,
-        tab_title, upload_job, wind_down, Modal, RestoredTab, Tab, TabContent, TerminalTab,
+        autoscroll_for_pane, blink_on_at, blink_wake_at, credential_delete_error, download_job,
+        effective_focus_of, expand_tilde, files_owner_generation_of, files_start_dir,
+        finish_password_change, font_px_for, has_real_action, ime_cursor_area,
+        next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
+        snapshot_tabs_of, sync_target_of, sync_timeout_wake_at, tab_title, upload_job, wind_down,
+        Modal, RestoredTab, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -8297,7 +8926,7 @@ mod tests {
         );
     }
 
-    /// 同上,换节点那两份。被 discard 趟吃掉的现象分别是「点 `⇆` 不弹窗」和
+    /// 同上,换节点那两份。被 discard 趟吃掉的现象分别是「点换节点按钮不弹窗」和
     /// 「在弹窗里选了节点毫无反应」——后者尤其难查:弹窗自己关掉了,看起来
     /// 像是生效了。
     ///
@@ -8318,7 +8947,7 @@ mod tests {
             rehost_pane: Some(PaneId(2)),
             ..Default::default()
         };
-        assert!(has_real_action(&b), "点 `⇆` 的那一下被 discard 趟吞了");
+        assert!(has_real_action(&b), "点换节点按钮的那一下被 discard 趟吞了");
     }
 
     /// 同上,解锁框那一份。它是整个程序此刻唯一能操作的东西 —— 被 discard
@@ -9114,6 +9743,112 @@ mod tests {
         );
     }
 
+    /// F125:窗口失焦时,光标判据必须两件事一起做到——恒画(不因暗周期消失)
+    /// 且不再为闪烁排周期唤醒(不需要,反正恒画;排了也只是空转)。
+    ///
+    /// 自证会变红:把 `blink_on_at` 里 `if !window_focused { return true; }`
+    /// 这条短路删掉(改回直接按相位算),或者把 `blink_wake_at` 里
+    /// `!window_focused` 那半个条件删掉。
+    #[test]
+    fn unfocused_window_shows_a_steady_cursor_and_never_wakes_for_it() {
+        // elapsed 故意落在暗半周期(530..1060ms 那一段)——聚焦状态下这一刻
+        // `blink_on_at` 该是 false,拿它来反证「失焦短路」确实生效,而不是
+        // 巧合落在了亮半周期。
+        let dark_elapsed = 700;
+        assert!(
+            !crate::frame::blink_visible(dark_elapsed, 0),
+            "测试前提:这个 elapsed 在聚焦状态下必须是暗半周期,否则下面的断言测不出短路"
+        );
+        assert!(
+            blink_on_at(false, dark_elapsed),
+            "失焦时光标必须恒亮,不能被相位算成暗"
+        );
+        assert_eq!(
+            blink_wake_at(false, true, dark_elapsed),
+            None,
+            "失焦时不该为闪烁排唤醒——反正恒亮,排了也是空转"
+        );
+    }
+
+    /// F125:有焦点但没有活跃终端(launcher 态,没有 pane 可画光标)时,不该为
+    /// 闪烁排周期唤醒——排了是纯粹的空转,没有任何东西会因为它而改变。
+    ///
+    /// 自证会变红:把 `blink_wake_at` 里 `|| !has_active_terminal` 那半个条件
+    /// 删掉。
+    #[test]
+    fn focused_without_a_terminal_never_wakes_for_blink() {
+        assert_eq!(
+            blink_wake_at(true, false, 0),
+            None,
+            "没有活跃终端就没有光标要画,不该排唤醒"
+        );
+    }
+
+    /// F125:有焦点且有活跃终端时,`blink_on_at`/`blink_wake_at` 必须原样转发
+    /// `crate::frame` 那两个纯函数的判据——相位算法本身在 `frame::tests` 里已经
+    /// 单测过,这里只验证「转发没转错参数」。
+    ///
+    /// 自证会变红:把 `blink_on_at`/`blink_wake_at` 里传给
+    /// `crate::frame::blink_visible`/`blink_next_flip_ms` 的参数改错(比如都
+    /// 换成常量 `0`)。
+    #[test]
+    fn focused_with_a_terminal_follows_the_blink_phase() {
+        for elapsed in [0, 100, 529, 530, 800, 1059, 1060] {
+            assert_eq!(
+                blink_on_at(true, elapsed),
+                crate::frame::blink_visible(elapsed, 0),
+                "elapsed={elapsed}:画不画必须原样转发相位算法"
+            );
+        }
+        let ms = blink_wake_at(true, true, 300).expect("有焦点有终端必须排唤醒");
+        assert_eq!(
+            ms,
+            crate::frame::blink_next_flip_ms(300, 0),
+            "唤醒时刻必须原样转发相位算法"
+        );
+    }
+
+    /// **接线守护 / F125**:闪烁的下一次唤醒必须并进既有的「定时唤醒」判据,
+    /// 而不是各自为政 —— 两个定时源各排各的,后写的那个会把先写的覆盖掉,
+    /// 症状是「光标闪起来之后同步块超时不再收口」(T2 复发)。
+    ///
+    /// 自证会变红:把 `next_timer_wake` 的函数体改成只 `self.sync_timeout_wake(now)`。
+    #[test]
+    fn timer_wakeups_are_merged_in_one_place() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("    fn next_timer_wake(")
+            .nth(1)
+            .expect("找不到 next_timer_wake 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            body.contains("self.sync_timeout_wake(now)"),
+            "定时唤醒没并进同步块超时 —— T2 会复发"
+        );
+        assert!(
+            body.contains("self.blink_wake("),
+            "定时唤醒没并进光标闪烁 —— 光标只会在别的事件顺带唤醒时才翻转"
+        );
+    }
+
+    /// **接线守护 / F125**:闪烁只许排 `WaitUntil`,不许 `request_redraw`。
+    /// 后者绕开帧闸,是 T3(GPU 空转)/T7(100% CPU 忙转)的直接触发方式。
+    ///
+    /// 自证会变红:在 `blink_wake` 里加一句 `self.request_ui_redraw();`。
+    #[test]
+    fn blink_never_forces_a_redraw() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("    fn blink_wake(")
+            .nth(1)
+            .expect("找不到 blink_wake 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            !body.contains("request_redraw"),
+            "闪烁不许直接请求重绘,只能排 WaitUntil(T3/T7)"
+        );
+    }
+
     /// 复核 C1(终审):跨「断开→重连」世代的 PaneId 碰撞。`Workspace::new` 每
     /// 次都从 `next_id = id.0 + 1` 起步(生产代码里首 pane 恒 `PaneId(1)`),
     /// 所以每建一个新 Workspace,分屏分配出的 id 都从 2 重新计数——旧世代
@@ -9247,6 +9982,129 @@ mod tests {
             ws.pane(PaneId(1)).map(|p| p.host_ix),
             Some(0),
             "被拒绝时不该动 pane 的任何字段"
+        );
+    }
+
+    /// F128:重连换的是 channel,**不是机器** —— 屏上内容必须原样留着
+    /// (用户拍板:保留旧屏内容)。重建 emulator 的话,断线前那一屏
+    /// (往往正是他想看的报错)当场消失。
+    ///
+    /// 自证会变红:把 `reattach_pane` 改成调 `rehost_pane`。
+    #[test]
+    fn reattach_keeps_the_screen_but_rehost_wipes_it() {
+        use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
+        let (mut ws, _p) = ws_with(1);
+        let gen = ws.generation();
+        let p = ws.pane_mut(PaneId(1)).unwrap();
+        p.emulator.feed(b"before-the-drop");
+        // F128:**起始状态必须是 `Reconnecting`** —— 起始就是 `Live` 的话,
+        // 下面那条 `status == Live` 的断言把 `swap_pane_channel` 里的
+        // `p.status = Live` 删掉也照样绿(终态碰巧没变),等于没守护。
+        // 而这一条恰恰是重连最关键的一步:不置回 Live,重连成功了标题条
+        // 还一直黄着、Ctrl+D 还按「断开」那套语义走。
+        p.status = crate::shell::workspace::PaneStatus::Reconnecting;
+        let (pty, rx) = fresh_pipe();
+        assert!(reattach_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
+        let text: String = ws
+            .pane(PaneId(1))
+            .unwrap()
+            .emulator
+            .snapshot()
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(
+            text.contains("before-the-drop"),
+            "重连不该抹掉断线前的内容,实际:{text:?}"
+        );
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().status,
+            crate::shell::workspace::PaneStatus::Live
+        );
+
+        // 对照组:换机器那条路必须**抹掉**内容(否则上一台机器的输出会
+        // 挂在新机器的屏上,用户完全分不清哪些字是谁说的)。
+        let (pty, rx) = fresh_pipe();
+        assert!(rehost_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
+        let text: String = ws
+            .pane(PaneId(1))
+            .unwrap()
+            .emulator
+            .snapshot()
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(!text.contains("before-the-drop"), "换机器该重建 emulator");
+    }
+
+    /// F128:`swap_pane_channel` 存在的**唯一理由**就是把 pane 挪到新 channel 上,
+    /// 而「pty 换没换」「rx 换没换」原先一条断言都没有 —— 两处赋值随便删一个,
+    /// 全仓 1207 个测试照样全绿。这两条恰恰是最要命的:
+    /// - `pty` 没换:新开的 channel 当场被 Drop,用户敲的键写进已死的旧 channel,
+    ///   屏上却显示「已连上」,输入静默全丢、没有任何报错。
+    /// - `rx` 没换:下一帧 `pump` 立刻在旧 rx 上读到 `Disconnected`,而这时新连接
+    ///   是活的,`rx_closed_action` 判成「远端自己退了」→ pane 被永久错标成
+    ///   `Disconnected`,**再也不会自动重试**。
+    ///
+    /// 自证会变红:删掉 `swap_pane_channel` 里的 `p.pty = pty;`(前半段红)
+    /// 或 `p.rx = rx;`(后半段红)。
+    #[tokio::test]
+    async fn reattach_actually_swaps_both_the_pty_and_the_rx() {
+        use crate::shell::workspace::tests_support::{fresh_pipe_probed, ws_with};
+        let (mut ws, old) = ws_with(1);
+        let gen = ws.generation();
+        let (pty, rx, fresh) = fresh_pipe_probed();
+        assert!(reattach_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
+
+        // pty:写出去的字节只能落在新管子上。
+        let _ = ws.pane(PaneId(1)).unwrap().pty.write(b"ping".to_vec());
+        assert_eq!(
+            fresh.writes.lock().unwrap().as_slice(),
+            [b"ping".to_vec()],
+            "写没落到新 channel 上 = pty 没换"
+        );
+        assert!(
+            old[0].writes.lock().unwrap().is_empty(),
+            "还在往断掉的旧 channel 里写"
+        );
+
+        // rx:只有从新管子灌进来的字节才收得到。
+        fresh.tx.try_send(b"pong".to_vec()).unwrap();
+        ws.pump(0);
+        let text: String = ws
+            .pane(PaneId(1))
+            .unwrap()
+            .emulator
+            .snapshot()
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(
+            text.contains("pong"),
+            "新 channel 的输出没收到 = rx 没换,实际:{text:?}"
+        );
+    }
+
+    /// F128:换了 channel 之后必须逼出一次 `window_change`(T4)。
+    /// 新 channel 是 80x24,不重发的话远端 tmux 里的 TUI 按 80 列排版,
+    /// 全屏 TUI 直接错行 —— 这是 T4 的原样复发。
+    ///
+    /// 自证会变红:把 `reattach_pane` 里的 `p.last_grid = (0, 0);` 删掉。
+    #[test]
+    fn reattach_forces_a_window_change() {
+        use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
+        let (mut ws, _p) = ws_with(1);
+        let gen = ws.generation();
+        ws.pane_mut(PaneId(1)).unwrap().last_grid = (120, 40);
+        let (pty, rx) = fresh_pipe();
+        reattach_pane(&mut ws, PaneId(1), gen, 0, pty, rx);
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().last_grid,
+            (0, 0),
+            "不复位的话下一帧 apply_geometry 认为尺寸没变,不发 window_change(T4)"
         );
     }
 
@@ -10173,6 +11031,7 @@ mod tests {
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
                 sftp_home: None,
+                reconnect_tasks: Vec::new(),
             })),
         );
         tabs
@@ -11487,6 +12346,7 @@ mod tests {
                 sftp_tasks: vec![task],
                 sftp_default_remote: None,
                 sftp_home: None,
+                reconnect_tasks: Vec::new(),
             })),
         };
 
@@ -11504,6 +12364,89 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "wind_down 没有 abort 掉在途的 sftp 任务 —— 任务会继续攥着 \
              Arc<SshConnection>,撑住本该随标签一起断开的连接"
+        );
+    }
+
+    /// **接线守护(F128 版,真实行为而非源码文本)**:关标签必须 abort 掉在途的
+    /// **重连**任务。
+    ///
+    /// 与上面 sftp 那条同一类问题的第三次重演,而 F128 落地时漏了这一处:
+    /// `spawn_reconnect` 起的 task 挂在退避 `sleep` 或 `establish` 握手上,
+    /// 只 drop `TerminalTab` 收不了口。用户关掉标签之后它仍会拨完号、做完一整
+    /// 套认证(远端因此多一条登录记录),然后才因为查不到属主标签把结果丢掉。
+    /// `establish` 内部没有超时包裹,高延迟代理链路黑洞时这个"白拨"可能挂很久。
+    ///
+    /// 写法与 `wind_down_aborts_outstanding_sftp_tasks` 完全一致(哑任务 +
+    /// `Drop` 观测),理由见那条:比匹配 `.abort()` 字符串更接近真实行为。
+    ///
+    /// 自证会变红:把 `wind_down` 里 `for task in t.reconnect_tasks` 那一段删掉。
+    #[tokio::test]
+    async fn wind_down_aborts_outstanding_reconnect_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_flag = started.clone();
+        let guard_flag = dropped.clone();
+        let task = tokio::spawn(async move {
+            let _guard = SetOnDrop(guard_flag);
+            started_flag.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+
+        // 先让哑任务真正被 poll 过一次,理由见 sftp 那条测试里的长注释。
+        for _ in 0..200 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "测试用的哑任务没能跑起来 —— 测试脚手架本身有问题,不是被测代码的锅"
+        );
+
+        let tab = Tab {
+            id: TabId(1),
+            title: "test".into(),
+            session_id: None,
+            title_override: None,
+            color_override: None,
+            content: TabContent::Terminal(Box::new(TerminalTab {
+                ws: Workspace::new(test_pane(1), 0),
+                current_preset: None,
+                last_cfg: None,
+                automation: Vec::new(),
+                automation_template: None,
+                automation_status: None,
+                files: Default::default(),
+                sftp: None,
+                sftp_tasks: Vec::new(),
+                sftp_default_remote: None,
+                sftp_home: None,
+                reconnect_tasks: vec![task],
+            })),
+        };
+
+        wind_down(tab);
+
+        for _ in 0..200 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "wind_down 没有 abort 掉在途的重连任务 —— 关了标签之后它还会拨完号、\
+             做完一整套认证,远端多一条登录记录"
         );
     }
 
@@ -12235,6 +13178,7 @@ mod tests {
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: configured.map(|s| s.to_string()),
                 sftp_home: None,
+                reconnect_tasks: Vec::new(),
             }))
         }
 
@@ -12662,6 +13606,354 @@ mod tests {
             prod.contains("self.files_sidebar_was_open = self.ui.files_sidebar_open;"),
             "没有在帧尾记下这一帧的开合状态 —— 下一帧判不出跃迁,\
              而且热键那条路(在另一次事件回调里改标志)会永远同步不到"
+        );
+    }
+
+    /// 取某个函数的函数体源码。**`marker` 必须带行首缩进**——不带的话
+    /// `include_str!` 出来的源码里会先匹配到测试自己写的那个字符串字面量,
+    /// 断言就变成了「测试自我匹配」,永远绿(本项目已实证的第五类恒绿模式)。
+    ///
+    /// **隐含前提:`cargo fmt --check` 已经过。** `find("\n    }\n")` 靠
+    /// rustfmt 保证「方法自己的收尾 `}` 独占一行且缩进恰好 4 空格,内部嵌套块
+    /// (`if let`/`match`/`async move` 等)的收尾缩进一律深于 4 空格」——否则
+    /// 函数体内部一个巧合缩进到 4 空格的 `}` 会把这里截断在错误的位置。日后
+    /// 在别处复用这个辅助函数前,先确认这个前提仍然成立。
+    fn fn_body<'a>(src: &'a str, marker: &str) -> &'a str {
+        assert!(
+            marker.starts_with("    "),
+            "锚点必须带行首缩进,否则测试自我匹配恒绿"
+        );
+        let after = src
+            .split(marker)
+            .nth(1)
+            .unwrap_or_else(|| panic!("找不到 {marker}"));
+        &after[..after.find("\n    }\n").expect("找不到函数结尾")]
+    }
+
+    /// **接线守护 / F128**:重连的凭据必须是建这条连接那一刻定死的那份,
+    /// **不许回头查库**。查库的话,用户在断线期间改了这条会话(换了端口/密钥),
+    /// 重连就会拨到一个他没同意过的地方去;会话被删掉时更是直接连不上。
+    /// 理由同 `PendingRehost` / `automation_template`。
+    ///
+    /// 自证会变红:把 `spawn_reconnect` 里取 cfg 那句换成 `store.dial_plan_for(..)`。
+    ///
+    /// 锚点拆开拼(`concat!`):写成完整字面量的话,`fn_body` 在 0 处真实定义时
+    /// 会退化成匹配测试自己这行代码,把自己的函数体(而非生产代码)当成
+    /// `body`——已实测踩中过一次(第五类恒绿模式的变体:锚点自我匹配)。
+    #[test]
+    fn reconnect_uses_the_cfg_frozen_at_connect_time() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "spawn_reconnect("));
+        assert!(
+            !body.contains("dial_plan_for"),
+            "重连回头查库了 —— 见 PendingRehost 的文档"
+        );
+        assert!(
+            !body.contains("self.store"),
+            "重连回头查库了 —— 见 PendingRehost 的文档"
+        );
+    }
+
+    /// **接线守护 / F128**:重连要拨的是**断掉的那台机器**,不是标签最初连的
+    /// 那台。
+    ///
+    /// `TerminalTab::last_cfg` 在 `ConnectOk` 那一刻定死、此后再也不更新,
+    /// 而「换节点」(`PaneRehosted`)会往 `ws.hosts` 里加**第二台机器**。
+    /// 拿 `last_cfg` 去重拨 `host_ix > 0` 的那条连接,就是静默连到另一台机器
+    /// 上——地址、凭据、主机指纹全对不上,而用户看到的只是「已重新连接」,
+    /// 接着往一台他没打算登录的服务器上敲命令。
+    ///
+    /// 结构性守护(`spawn_reconnect` 要 `&mut App` + 真实 runtime,无头环境
+    /// 造不出来)。**关键是那条否定断言**:光断言"读了 hosts"挡不住
+    /// 「两个来源都留着、`unwrap_or` 落回 `last_cfg`」这种写法,而那正是最
+    /// 自然的"稳妥"改法,也正好把 bug 原样保留。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_uses_the_cfg_frozen_at_connect_time`。
+    #[test]
+    fn reconnect_dials_the_host_it_lost_not_the_first_one() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "spawn_reconnect("));
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("hosts.get(host_ix)"),
+            "重连没有按 host_ix 取拨号参数 —— 换过节点之后会拨回最初那台机器"
+        );
+        assert!(
+            !code.contains("last_cfg"),
+            "重连仍读得到标签级 last_cfg —— 只要它还在这个函数里,\
+             「取不到就落回 last_cfg」这种写法就会把 bug 原样带回来"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功要走 `reattach_pane`(保留内容),
+    /// 不是 `rehost_pane`(重建 emulator)。走错的现象是「重连之后屏是空的」,
+    /// 而用户最想看的恰恰是断线前那一屏。
+    ///
+    /// 锚点拆开拼(`concat!`),理由同 `a_failed_rehost_takes_its_host_back_out_of_the_list`:
+    /// 写成完整字面量的话,这条测试自己的源码里也有一份,会被自己匹配到
+    /// (第四类恒绿模式:源码级测试自我匹配)。**这条文档注释本身也不能写出
+    /// 完整字面量**——第一版这里写了,反而成了全文件里最后一次出现,
+    /// `rsplit(..).next()` 就切到了这段注释而不是真正的 match 分支,已实证。
+    /// 用 `rsplit(..).next()` 取**最后一次**出现——`spawn_reconnect` 里发事件那次
+    /// 出现在前面,`user_event` 里的 match 分支出现在后面,取最后一次才是
+    /// 真正要测的分支。
+    ///
+    /// 自证会变红:把处理分支里的 `reattach_pane(` 改成 `rehost_pane(`。
+    #[test]
+    fn reconnect_reattaches_instead_of_rehosting() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        // 注释行剥掉:分支上方/内部的解释性注释可能提到同样的字样,不剥的话
+        // 删掉真正的调用测试也可能照绿。
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("reattach_pane("), "重连必须保留屏内容");
+        assert!(
+            !body.contains("rehost_pane("),
+            "走了换机器那条路,内容会被抹掉"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功后要重跑登录后自动化 —— 用户拍板的规则,
+    /// 否则 tmux 不会 attach,断线前那个 Claude Code 会话回不来
+    /// (这正是整个 F128 要解决的场景)。
+    ///
+    /// 锚点拆开拼,理由同上一条。
+    ///
+    /// 自证会变红:把 `PaneReconnected` 分支里的 `start_automation` 那句删掉。
+    #[test]
+    fn reconnect_reruns_post_login_automation() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("self.start_automation("),
+            "没重跑登录后命令 —— tmux 不 attach,Claude Code 会话回不来"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功要把这个标签的 SFTP 侧栏运行态清掉。
+    /// 旧 `SftpClient` 挂在**已经死掉的那条连接**上,留着的话侧栏每次操作都
+    /// 静默失败,而用户看到的是「文件面板卡住了」。
+    ///
+    /// 锚点拆开拼,理由同上一条。
+    ///
+    /// 自证会变红:把 `PaneReconnected` 分支里 `t.sftp = None;` 那句删掉。
+    #[test]
+    fn reconnect_drops_the_dead_sftp_client() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("t.sftp = None;"),
+            "死掉的 SftpClient 必须丢掉"
+        );
+        assert!(body.contains("t.sftp_home = None;"));
+    }
+
+    /// **接线守护 / F128**:重连必须**就地替换** `hosts[host_ix]` 的 handle,
+    /// 绝不往 `ws.hosts` 里 push 一条新的。
+    ///
+    /// push 的写法会让 `hosts[0]` 不再是这个标签的主连接,而认着这个下标的
+    /// 地方一个都不会跟着走:`TabContent::sftp_connection`(文件面板)、
+    /// `spawn_fresh_panes`(分屏开 channel)、`PaneOpened` 里硬编的
+    /// `host_ix: 0` 全都会继续指向刚断掉的那条**死**连接。症状是主链路
+    /// 自动重连之后文件面板永久打不开(`t.sftp = None` 让它每次重试、每次
+    /// 失败)、新开的分屏必然失败,而终端本身工作正常 —— 用户完全看不出成因。
+    /// 顺带:push 还会让 `hosts` 随每次断线单调增长,长期挂机攒下一堆死连接。
+    ///
+    /// 那条否定断言是这条测试的重点:光断言"有 get_mut"挡不住「两种都写、
+    /// 某个分支仍 push」。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
+    ///
+    /// 自证会变红:把就地替换那几句换回 `t.ws.hosts.push(HostConn { .. })`。
+    #[test]
+    fn reconnect_swaps_the_host_in_place_instead_of_appending_a_new_one() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("hosts.get_mut(host_ix)") && body.contains("h.handle = handle;"),
+            "重连没有就地替换 hosts[host_ix] 的 handle"
+        );
+        assert!(
+            !body.contains("hosts.push("),
+            "重连往 hosts 里 push 了新连接 —— hosts[0] 从此指向死连接,\
+             文件面板和分屏会静默挂在上面"
+        );
+        assert!(
+            body.contains("h.tmux_bootstrap = Default::default();"),
+            "换了连接却没重置 tmux 自举状态 —— 远端 tmux 服务器可能在断线\
+             期间重启过,状态上报再也配不上"
+        );
+    }
+
+    /// **接线守护 / F128**:拨号那几秒里这条连接上的 pane 全被用户关掉了
+    /// (`attached` 为空)时,**不能**把新连接装进 `hosts` —— 一条谁也不指的
+    /// `Arc<SshConnection>` 会一直占到标签关闭为止,完全静默。
+    /// 同一时刻也不该弹「已重新连接」的 toast —— 用户什么都没得到。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
+    ///
+    /// 自证会变红:把就地替换从 `else if` 里提出来,改成无条件执行;
+    /// 或者把 `set_toast` 挪出 `if reconnected { ... }`。
+    #[test]
+    fn reconnect_keeps_the_new_connection_out_when_every_pane_vanished_mid_dial() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("if attached.is_empty() {")
+                && body.contains("} else if let Some(h) = t.ws.hosts.get_mut(host_ix) {"),
+            "替换没有挂在「真的有 pane 接上」这个前提下 —— 一块 pane 都没接上时\
+             也会把新连接装进 hosts,占着不关"
+        );
+        assert!(
+            body.contains("if reconnected {"),
+            "toast 没有按「真的有 pane 接上」收敛,零个 pane 接上也会弹「已重新连接」"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功之后必须把「没赶上这次拨号」的 pane 捞回
+    /// `Reconnecting`。
+    ///
+    /// 同一条 SSH 连接上每块 pane 有各自的读取任务,传输层死了之后它们的 `rx`
+    /// **不保证同一帧关闭**(缓冲里的字节要先排完)。慢一步的那块在
+    /// `hosts_to_redial` 拍板时还是 `Live`,不会进这次拨号的名单,于是
+    /// `channels` 里没有它 —— 它攥着一条已经死掉的旧 channel,写入静默失败,
+    /// 而标题条上一切正常。更糟的是就地替换之后 `hosts[host_ix]` 变活了,
+    /// 它下一帧真关闭时 `rx_closed_action(link_alive == true)` 会判成
+    /// `UserExited`,直接钉死成 `Disconnected`,**再也不会重连**。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
+    ///
+    /// 自证会变红:把 `strays_after_reconnect` 那个 for 循环删掉,或者把循环体
+    /// 里的 `p.status = ...Reconnecting;` 删掉。
+    #[test]
+    fn reconnect_picks_up_the_panes_that_missed_this_dial() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("strays_after_reconnect("),
+            "重连之后没有回捞漏网的 pane —— 慢一步关闭的那块会被钉死成 \
+             Disconnected,永久不再重连"
+        );
+        assert!(
+            body.contains("p.status = crate::shell::workspace::PaneStatus::Reconnecting;"),
+            "捞出来了却没把状态置回 Reconnecting —— drive_reconnects 不会收走它"
+        );
+    }
+
+    /// **接线守护 / F128**:`drive_reconnects` 必须遍历所有标签,不能只驱动
+    /// 活动标签——理由同 `drive_automation`(见其文档注释):用户完全可能
+    /// 开着标签 A 连了台机器就切去标签 B,只驱动活动标签的话标签 A 断线要等
+    /// 用户切回去才会开始重拨,用户「尽快恢复重连」的诉求就落空了。
+    ///
+    /// 锚点拆开拼(`concat!`),理由同 `reconnect_uses_the_cfg_frozen_at_connect_time`。
+    ///
+    /// 自证会变红:把 `self.tabs.iter()` 换回 `self.active_term()`。
+    #[test]
+    fn drive_reconnects_walks_every_tab_not_just_the_active_one() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "drive_reconnects(&mut self) {"));
+        assert!(
+            !body.contains("active_term"),
+            "drive_reconnects 只驱动了活动标签 —— 后台标签断线要等用户切回去\
+             才会开始重拨"
+        );
+    }
+
+    /// **接线守护 / F129**:Ctrl+D 的判定必须排在 `encode_key` **之前**。
+    /// 挪到之后的后果是静默的:Ctrl+D 先被编成 `0x04` 写进一条死 channel
+    /// (T1 式静默失败),而 `ctrl_d_action` / `is_bare_ctrl_d` 的纯函数单测
+    /// 全都还是绿的,没人会发现这个功能已经废了。
+    ///
+    /// 锚点全部拆开拼:完整字面量会被这条测试自己的源码匹配到,那是本项目
+    /// 已实证的第五类恒绿模式。
+    ///
+    /// 自证会变红:把 F129 那段接线整体挪到 `encode_key(...)` 之后。
+    #[test]
+    fn ctrl_d_is_decided_before_the_key_gets_encoded() {
+        let src = include_str!("app.rs");
+        let start = concat!("WindowEvent::Keyboard", "Input { event, .. } => {");
+        let after = src.split(start).nth(1).expect("找不到 KeyboardInput 分支");
+        let body = &after[..after
+            .find(concat!("WindowEvent::Redraw", "Requested"))
+            .expect("找不到 KeyboardInput 分支的结尾")];
+        let ctrl_d_at = body
+            .find(concat!("is_bare_", "ctrl_d("))
+            .expect("找不到 Ctrl+D 接线");
+        let encode_at = body
+            .find(concat!("encode_", "key(key, mods"))
+            .expect("找不到 encode_key 调用");
+        assert!(
+            ctrl_d_at < encode_at,
+            "Ctrl+D 的判定跑到 encode_key 后面了 —— 它会被编成 0x04 写进死 channel"
         );
     }
 }

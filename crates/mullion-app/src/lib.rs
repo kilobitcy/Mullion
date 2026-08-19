@@ -20,6 +20,7 @@ pub mod host_key;
 pub mod input;
 pub mod logx;
 pub mod pane;
+pub mod reconnect;
 pub mod reflow;
 pub mod remote_bootstrap;
 pub mod render;

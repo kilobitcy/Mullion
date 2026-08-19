@@ -275,6 +275,22 @@ pub(crate) async fn establish_forwarding(
     Ok((SshConnection::new(handle, dialed.jumps), rx))
 }
 
+/// F128:本项目的 russh 客户端配置。
+///
+/// 抽成函数是为了能单测 —— `handshake_and_auth` 要真网络,配置对不对在无头
+/// 环境里只能这样验。默认值不能用:`client::Config::default()` 的
+/// `keepalive_interval` 是 `None`,详见 `keepalive_is_configured_so_a_half_open_link_is_detected`。
+pub fn client_config() -> client::Config {
+    client::Config {
+        // 10s 一个包,连丢 3 次(≈30s)判定断开。
+        keepalive_interval: Some(std::time::Duration::from_secs(10)),
+        keepalive_max: 3,
+        // 显式写出来:空闲不是断线,挂几小时的 tmux 是本项目的常态用法。
+        inactivity_timeout: None,
+        ..client::Config::default()
+    }
+}
+
 /// 在已建立的流上完成 SSH 握手 + 认证。目标主机与跳板共用此函数,
 /// 避免两条认证路径漂移(例如只在其中一条修了 PUBKEY_HASH)。
 ///
@@ -298,7 +314,7 @@ where
         outcome: outcome.clone(),
         forwarded,
     };
-    let config = Arc::new(client::Config::default());
+    let config = Arc::new(client_config());
     let mut handle = client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| host_key_or(&outcome, e))?;
@@ -707,5 +723,40 @@ mod tests {
             hops: Vec::new(),
         };
         assert!(cfg.hops.is_empty(), "空 hops 即直连");
+    }
+
+    /// F128:**没有 keepalive 就没有断线检测**。高延迟代理链路上,链路中断
+    /// 通常是「TCP 半开」——两端都不发 FIN/RST,连接看起来还在,只是字节
+    /// 再也过不去。不周期性发包的话:`rx` 永远不关 → `Workspace::pump` 里
+    /// 那条 `TryRecvError::Disconnected` 分支永远不触发 → pane 连
+    /// `Disconnected` 都标不上,更谈不上重连。
+    ///
+    /// 10s × 3 = 最迟 30s 判定断开。再短的话,代理链路上偶发的几秒卡顿
+    /// 会被误判成断线,把一条其实还活着的连接踢掉。
+    ///
+    /// 自证会变红:把 `client_config()` 的函数体换回 `client::Config::default()`。
+    #[test]
+    fn keepalive_is_configured_so_a_half_open_link_is_detected() {
+        let c = client_config();
+        assert_eq!(
+            c.keepalive_interval,
+            Some(std::time::Duration::from_secs(10)),
+            "russh 默认是 None(一个包都不发)"
+        );
+        assert_eq!(c.keepalive_max, 3, "连丢 3 次判定断开");
+    }
+
+    /// F128:**不设 `inactivity_timeout`**。它是「多久没收到任何数据就断」,
+    /// 而本项目的典型用法就是挂着一个几小时没输出的 tmux —— 设了它等于
+    /// 定时踢掉空闲会话。链路死活由 keepalive 判定,不由「有没有内容」判定。
+    ///
+    /// 自证会变红:在 `client_config()` 里给 `inactivity_timeout` 赋任意值。
+    #[test]
+    fn idle_sessions_are_never_timed_out() {
+        assert_eq!(
+            client_config().inactivity_timeout,
+            None,
+            "挂着不动的 tmux 不是死连接"
+        );
     }
 }

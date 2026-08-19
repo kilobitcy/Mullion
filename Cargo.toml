@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.50"
+version = "0.1.52"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -17,6 +17,11 @@ license = "Apache-2.0"
 [workspace.dependencies]
 alacritty_terminal = "0.26"
 vte = "0.15"
+# preedit 网格布局(F126)复用 SnapCell::width 同一套宽度判据:alacritty_terminal
+# 0.26 内部就是拿这个 crate 的 UnicodeWidthChar 判定 WIDE_CHAR(见其 term/mod.rs
+# input()),版本对齐 Cargo.lock 里被它解出来的那个(0.2.2),不能另起一套,
+# 否则底色/下划线(按格子画)与文字位置会当场错位。
+unicode-width = "0.2"
 # 加密后端用 ring(非默认 aws-lc-rs):避免 aws-lc-sys 的 C/汇编构建,
 # Linux→Windows 交叉编译干净、原生 Windows 编译也免装 NASM。RSA 密钥仍走独立的 rsa crate。
 russh = { version = "0.54", default-features = false, features = ["ring", "flate2", "rsa"] }

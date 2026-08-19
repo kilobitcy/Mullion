@@ -174,18 +174,28 @@ pub fn plan_for_count(want: usize, current: &[(PaneId, PaneStatus)]) -> PresetPl
             close: Vec::new(),
         };
     }
-    // 减屏:先关已断开的,再关活着的,同类里按几何逆序(右下角先走)。
+    // 减屏:按「关掉的代价」从小到大关。**穷尽 match**——加状态时这里
+    // 编译报错,而不是新状态悄悄一个都关不掉(那样 close 会凑不够 extra 个,
+    // 减屏静默失效)。
+    fn close_priority(s: PaneStatus) -> u8 {
+        match s {
+            PaneStatus::Disconnected => 0, // 已经死透,先关
+            PaneStatus::Reconnecting => 1, // 还有救,但没内容在动
+            PaneStatus::Live => 2,         // 最后才关活的
+        }
+    }
     let extra = current.len() - want;
-    let by_status = |want_status: PaneStatus| {
-        current
-            .iter()
-            .rev()
-            .filter(move |(_, s)| *s == want_status)
-            .map(|(id, _)| *id)
-    };
-    let close: Vec<PaneId> = by_status(PaneStatus::Disconnected)
-        .chain(by_status(PaneStatus::Live))
+    let mut ranked: Vec<(u8, usize, PaneId)> = current
+        .iter()
+        .enumerate()
+        .map(|(i, (id, s))| (close_priority(*s), usize::MAX - i, *id))
+        .collect();
+    // 同优先级里按几何逆序(右下角先走)——`usize::MAX - i` 就是逆序键。
+    ranked.sort_by_key(|(p, rev, _)| (*p, *rev));
+    let close: Vec<PaneId> = ranked
+        .into_iter()
         .take(extra)
+        .map(|(_, _, id)| id)
         .collect();
     PresetPlan {
         keep: current
@@ -410,6 +420,28 @@ mod tests {
         let plan = plan_preset(Preset::Single, &cur);
         assert_eq!(plan.close, vec![PaneId(3), PaneId(4), PaneId(2)]);
         assert_eq!(plan.keep, vec![PaneId(1)]);
+    }
+
+    /// F128:三态的相对顺序必须是 `Disconnected` → `Reconnecting` → `Live`。
+    /// 穷尽 match 只保证「加状态时编译报错」,保证不了这三个数字没写反 ——
+    /// 写反了就是减屏时**杀活的、留正在重连的**,而且悄无声息。
+    ///
+    /// 自证会变红:把 `close_priority` 里 `Reconnecting` 和 `Live` 的返回值对调。
+    #[test]
+    fn close_prefers_reconnecting_over_live() {
+        let cur = [
+            (PaneId(1), PaneStatus::Live),
+            (PaneId(2), PaneStatus::Reconnecting),
+            (PaneId(3), PaneStatus::Live),
+            (PaneId(4), PaneStatus::Disconnected),
+        ];
+        let plan = plan_preset(Preset::TwoLeftRight, &cur);
+        assert_eq!(
+            plan.close,
+            vec![PaneId(4), PaneId(2)],
+            "先关死透的,再关重连中的,活的一个不动"
+        );
+        assert_eq!(plan.keep, vec![PaneId(1), PaneId(3)]);
     }
 
     #[test]
