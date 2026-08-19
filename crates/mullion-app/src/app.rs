@@ -2579,6 +2579,18 @@ impl App {
                 self.ui_dirty = true;
                 return;
             }
+            // F131:同远端那条,只是 home 来自本机。
+            FileAction::GotoInput(input) => {
+                let home = crate::files::local::home_dir();
+                match crate::files::path_input::resolve_local_input(
+                    input,
+                    &files.local.cwd,
+                    home.as_ref(),
+                ) {
+                    Some(p) => p,
+                    None => return,
+                }
+            }
             // D5:本地栏不提供写操作,`menu_items_for` 也不会给出这些项 ——
             // 真到了这里说明菜单构造被改坏了,不静默吞掉。
             FileAction::Ask(ask) => {
@@ -2687,6 +2699,10 @@ impl App {
             self.trigger_sftp_open(generation);
             return;
         };
+        let home = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.sftp_home());
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
@@ -2705,6 +2721,20 @@ impl App {
                 files.remote.show_hidden = !files.remote.show_hidden;
                 self.ui_dirty = true;
                 return;
+            }
+            // F131:路径条敲的原文,在这里才解析 —— `~` 要用远端登录目录展开。
+            // 解析不出来(空输入 / `~` 但还不知道登录目录)就什么都不做;
+            // 真正跳不过去的路径交给远端报错(`spawn_sftp_list_dir` 失败会落
+            // `Load::Failed`),不在客户端猜。
+            FileAction::GotoInput(input) => {
+                match crate::files::path_input::resolve_remote_input(
+                    input,
+                    &files.remote.cwd,
+                    home.as_deref(),
+                ) {
+                    Some(p) => p,
+                    None => return,
+                }
             }
             // 这几个在函数开头就分流掉了(那里不需要借 `files`),走不到这儿。
             FileAction::Ask(_)
@@ -10256,6 +10286,75 @@ mod tests {
                 "{name} 收窄成了只认终端标签 —— SFTP 节点开的文件标签会被静默\
                  跳过(track_sftp_task 那处更狠:在途的 open 请求会被自己 abort,\
                  标签永远停在「正在读取目录…」且不报错)"
+            );
+        }
+    }
+
+    /// F131 接线守护:两栏 `FileAction::GotoInput` 分支必须调用**各自那份**
+    /// 的解析函数、用**各自那份**的 cwd —— `apply_local_file_action` 和
+    /// `apply_remote_file_action` 长得几乎一样(`Up`/`Refresh` 就是
+    /// `local`/`remote` 各写一份、内容不同),复制粘贴时最容易把远端那份的
+    /// 调用抄进本地分支(或反过来)。抄错的后果是「本地路径条按 POSIX 规则
+    /// 解析」或「远端路径条按本机规则解析」,跳转要么跳错要么整个失效,
+    /// 且不会有任何报错——两个函数都编译得过、跑得起来。
+    ///
+    /// **扎的是源码结构而非运行时行为**,理由同上面
+    /// `file_actions_never_narrow_to_terminal_tabs_only`:`App` 要
+    /// `EventLoopProxy`,单测里造不出来。验证边界:只挡得住「函数体里出现了
+    /// 另一栏那份标识符」这一种写法,挡不住把两个解析函数的实现改成互相委托
+    /// 之类的等价写法。
+    ///
+    /// 自证会变红:把 `apply_local_file_action` 里 `GotoInput` 分支的
+    /// `resolve_local_input`/`files.local.cwd` 换成
+    /// `resolve_remote_input`/`files.remote.cwd`(或者反过来改远端那份)。
+    #[test]
+    fn goto_input_resolves_against_the_matching_column_not_the_other_one() {
+        let src = include_str!("app.rs");
+        // 只看生产代码那一半 —— 理由同
+        // `a_successful_write_triggers_a_refresh_so_the_list_is_not_stale`:
+        // 断言用到的标识符字面量写在本测试自己身上,不切掉的话会命中自己。
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        for (fn_name, own_resolver, own_cwd, other_resolver, other_cwd) in [
+            (
+                "fn apply_local_file_action",
+                "resolve_local_input(",
+                "files.local.cwd",
+                "resolve_remote_input(",
+                "files.remote.cwd",
+            ),
+            (
+                "fn apply_remote_file_action",
+                "resolve_remote_input(",
+                "files.remote.cwd",
+                "resolve_local_input(",
+                "files.local.cwd",
+            ),
+        ] {
+            let after = production
+                .split(fn_name)
+                .nth(1)
+                .unwrap_or_else(|| panic!("找不到 {fn_name} 的定义"));
+            // 同 `file_actions_never_narrow_to_terminal_tabs_only`:这两个都是
+            // `impl App` 里的方法,函数体止于第一个 4 空格缩进的右花括号。
+            let body = &after[..after
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("找不到 {fn_name} 的函数结尾"))];
+            assert!(
+                body.contains("FileAction::GotoInput"),
+                "{fn_name} 切出来的函数体里没有 GotoInput 分支 —— 要么切歪了,\
+                 要么这条分支被删掉了"
+            );
+            assert!(
+                body.contains(own_resolver) && body.contains(own_cwd),
+                "{fn_name} 的 GotoInput 分支没有调用 {own_resolver} 或没用 \
+                 {own_cwd} 当基准目录"
+            );
+            assert!(
+                !body.contains(other_resolver) && !body.contains(other_cwd),
+                "{fn_name} 里出现了另一栏那份的调用/字段({other_resolver} / \
+                 {other_cwd})—— 大概率是复制粘贴时手滑抄错了栏"
             );
         }
     }

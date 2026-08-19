@@ -154,6 +154,11 @@ pub fn parent_local(p: &RemotePath) -> RemotePath {
     }
 }
 
+/// 本机主目录。`None` = 取不到(极少数无 HOME 的环境)。
+pub fn home_dir() -> Option<RemotePath> {
+    directories::BaseDirs::new().map(|b| RemotePath::from_bytes(path_bytes(b.home_dir())))
+}
+
 /// 默认本地目录:配置里填了就用它,留空用用户主目录,再拿不到就用
 /// 当前工作目录 —— 任何一步都不 panic,面板宁可开在一个奇怪的地方
 /// 也不能开不出来。
@@ -161,11 +166,11 @@ pub fn default_local(configured: Option<&str>) -> RemotePath {
     if let Some(s) = configured.filter(|s| !s.trim().is_empty()) {
         return RemotePath::from_bytes(s.as_bytes().to_vec());
     }
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    RemotePath::from_bytes(path_bytes(&home))
+    if let Some(h) = home_dir() {
+        return h;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    RemotePath::from_bytes(path_bytes(&cwd))
 }
 
 /// 用系统文件管理器打开一个本地目录(设计 D5:本地文件管理外包出去)。

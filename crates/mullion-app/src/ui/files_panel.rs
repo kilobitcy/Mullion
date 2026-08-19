@@ -18,6 +18,10 @@ use mullion_ssh::sftp::EntryKind;
 pub enum FileAction {
     /// 进这个目录(双击目录 / 跟随链接 / 点书签 / 点路径面包屑)。
     Goto(mullion_ssh::sftp::RemotePath),
+    /// F131:用户在路径条里敲完回车的**原文**。故意不在面板里解析 ——
+    /// `~` 要用远端登录目录展开,而那个值挂在 `TabContent` 上,面板不知道
+    /// 也不该知道(同 `Reconnect` 不带参数的理由)。
+    GotoInput(String),
     /// 回上一级。
     Up,
     /// 刷新当前目录。
