@@ -50,6 +50,11 @@ pub struct PaneState {
     /// 每发一次请求 +1。异步结果回来时对不上就丢弃 ——
     /// 用户点得比网络快时,后发先至的旧结果会把新目录顶掉。
     pub request_seq: u64,
+    /// F131:路径条正在被编辑时的缓冲。`None` = 只读态(默认)。
+    ///
+    /// 放每栏一份而不是每面板一份:两栏各有自己的路径条,而 egui 的键盘
+    /// 焦点唯一 —— 另一栏的编辑框一失焦就自己取消了,不需要额外互斥。
+    pub path_edit: Option<String>,
 }
 
 impl PaneState {
@@ -65,6 +70,7 @@ impl PaneState {
             cursor: None,
             anchor: None,
             request_seq: 0,
+            path_edit: None,
         }
     }
 

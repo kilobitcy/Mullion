@@ -356,6 +356,26 @@ fn row_col_lefts(row_rect: egui::Rect) -> Vec<(&'static str, SortKey, f32, f32)>
         .collect()
 }
 
+/// 路径条只读态那块的 id。**必须是稳定的** ——「点得中路径条」是 F131 唯一
+/// 的入口,而 egui 自动分配的 id 在测试里只能靠猜坐标。按栏分:两栏各一条。
+fn path_label_id(id: &str) -> egui::Id {
+    egui::Id::new(("files-path-label", id))
+}
+
+/// 编辑框自己的 id。同上。
+fn path_edit_id(id: &str) -> egui::Id {
+    egui::Id::new(("files-path-edit", id))
+}
+
+/// F131:退出编辑态。`commit` = 这一下是回车(要跳),否则是 Esc / 失焦
+/// (丢弃)。返回要发出去的动作。
+///
+/// **默认丢弃**:失焦最常见的原因是用户去点了别处,那不是「确认」。
+fn finish_path_edit(state: &mut PaneState, commit: bool) -> Option<FileAction> {
+    let buf = state.path_edit.take()?;
+    commit.then_some(FileAction::GotoInput(buf))
+}
+
 /// `ScrollArea` 持久化 id 的拼装,抽成纯函数只为了能脱离 egui 单测
 /// (见 `tests::scroll_id_salt_differs_by_generation`)。
 ///
@@ -482,7 +502,39 @@ pub fn show(
         }
         let path = state.cwd.display().to_string();
         annotate::mark(ui.ctx(), format!("文件面板/{id}/路径"), ui.max_rect());
-        ui.add(egui::Label::new(egui::RichText::new(path).color(theme::c32(t.fg_mid))).truncate());
+        match state.path_edit.as_mut() {
+            // 编辑态。**注意它能收到键盘全靠 `Modal::FilesPathEdit`**(下一个
+            // 任务接)—— 面板拿着键盘焦点时,键根本不喂给 egui
+            // (`input_route::egui_should_see_focused`,T8 的注入点),不算
+            // 模态的话这个框里一个字都打不出来(同 `Modal::Editor` 的坑)。
+            Some(buf) => {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(buf)
+                        .id(path_edit_id(id))
+                        .desired_width(ui.available_width()),
+                );
+                if !resp.has_focus() {
+                    // 首帧:把焦点给它,否则用户还得再点一下才能打字。
+                    resp.request_focus();
+                }
+                if resp.lost_focus() {
+                    let commit = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if let Some(a) = finish_path_edit(state, commit) {
+                        action = Some(a);
+                    }
+                }
+            }
+            None => {
+                let label = ui.add(
+                    egui::Label::new(egui::RichText::new(path.clone()).color(theme::c32(t.fg_mid)))
+                        .truncate(),
+                );
+                let hit = ui.interact(label.rect, path_label_id(id), egui::Sense::click());
+                if hit.clicked() {
+                    state.path_edit = Some(path);
+                }
+            }
+        }
     });
 
     // F120:书签栏。调用方(`sidebar`/`content`)只给远端栏传非空切片 ——
@@ -2751,5 +2803,110 @@ mod tests {
                 left + w
             );
         }
+    }
+
+    /// F131:点一下路径条就该进入编辑态。进不去的话这个功能对用户完全
+    /// 不存在(它没有别的入口 —— 没有按钮、没有菜单项)。
+    ///
+    /// 两帧预热 + 显式推进时间:`Area`/面板的首帧布局没走完时点不中
+    /// (本项目踩过的 egui 坑,见 docs/gui-render-gotchas.md)。
+    ///
+    /// 自证会变红:把 `show` 里路径条那层 `if resp.clicked()` 分支删掉。
+    #[test]
+    fn clicking_the_path_bar_starts_editing_it() {
+        let mut state = PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+            b"/var/log".to_vec(),
+        ));
+        state.load = Load::Ready;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let run = |input: egui::RawInput, state: &mut PaneState| {
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &crate::theme::MULLION_DARK,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        true,
+                        &[],
+                        0,
+                    );
+                });
+            });
+        };
+        for t in [0.0_f64, 1.0] {
+            run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..base()
+                },
+                &mut state,
+            );
+        }
+        let rect = ctx
+            .read_response(path_label_id("远端"))
+            .expect("路径条没有可交互的响应 —— 它点不动")
+            .rect;
+        let pos = rect.center();
+        let m = egui::Modifiers::default();
+        run(
+            egui::RawInput {
+                time: Some(2.0),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: m,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: m,
+                    },
+                ],
+                ..base()
+            },
+            &mut state,
+        );
+        assert_eq!(
+            state.path_edit.as_deref(),
+            Some("/var/log"),
+            "点了路径条却没进入编辑态(或者没把当前目录填进去)"
+        );
+    }
+
+    /// F131:退出编辑态**不跳转**是默认;只有回车才跳。反过来的话
+    /// (失焦即提交)用户点别处就会被莫名其妙带走。
+    ///
+    /// 这条只测状态机本身(`finish_path_edit`),不驱动 egui —— 回车/Esc
+    /// 在 egui 里都表现为 `lost_focus`,区分靠的是当帧有没有 Enter 键事件。
+    #[test]
+    fn leaving_the_path_editor_without_enter_discards_the_input() {
+        let mut state = PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+            b"/var/log".to_vec(),
+        ));
+        state.path_edit = Some("/etc".into());
+        assert_eq!(finish_path_edit(&mut state, false), None);
+        assert!(state.path_edit.is_none(), "退出编辑态时缓冲没清");
+
+        state.path_edit = Some("/etc".into());
+        assert_eq!(
+            finish_path_edit(&mut state, true),
+            Some(FileAction::GotoInput("/etc".into()))
+        );
+        assert!(state.path_edit.is_none());
     }
 }
