@@ -708,6 +708,16 @@ fn files_owner_generation_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> Opt
     }
 }
 
+/// `App::files_path_editing` 的纯逻辑核心(F131),理由同上 —— 拆出来是为了
+/// 能用真实构造的 `Tabs<TabContent>` 单测「path_edit 被置上 → 判定为编辑态」,
+/// 不需要一个真的 `App`(`App::new` 要 `EventLoopProxy`,测试容器里造不出来)。
+fn files_path_editing_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> bool {
+    files_owner_generation_of(tabs, sidebar_open)
+        .and_then(|g| tabs.by_generation(g))
+        .and_then(|t| t.content.files_panel())
+        .is_some_and(|f| f.remote.path_edit.is_some() || f.local.path_edit.is_some())
+}
+
 /// `App::effective_focus` 的纯逻辑核心,理由同上。三条分支里前两条(活动标签
 /// 是 Terminal、侧栏开/关)能用真实构造的 `TerminalTab` 单测;第三条(活动
 /// 标签是 Files)测不到——`FilesTab::conn` 是 `Arc<SshConnection>`,
@@ -1545,6 +1555,13 @@ enum Modal {
     /// 换节点弹窗(pane 标题条上的换节点按钮)。里面有搜索框 —— 不算模态的话敲的
     /// 字会同时发给远端 shell(T8)。
     Rehost,
+    /// F131:文件面板的路径条正在被编辑。**不算模态的话那个输入框收不到
+    /// 任何键** —— 面板持有键盘焦点时键根本不喂 egui(T8 的注入点在
+    /// `input_route::egui_should_see_focused`),Backspace 还会被
+    /// `handle_panel_key` 解释成「回上级目录」。同 `Editor` 的理由。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写(同 `Rehost` 的姿态)。
+    FilesPathEdit,
 }
 
 impl Modal {
@@ -1562,6 +1579,7 @@ impl Modal {
         Modal::TabProps,
         Modal::ExitConfirm,
         Modal::Rehost,
+        Modal::FilesPathEdit,
     ];
 }
 
@@ -2356,6 +2374,8 @@ impl App {
             Modal::ExitConfirm => self.ui.exit_pending,
             // 换节点弹窗里有搜索框 —— 同 `TabProps` 的理由(T8)。
             Modal::Rehost => self.ui.rehost.is_some(),
+            // F131:见 `Modal::FilesPathEdit` 的说明。
+            Modal::FilesPathEdit => self.files_path_editing(),
         })
     }
 
@@ -2374,6 +2394,15 @@ impl App {
     /// 判据,两处必然迟早漂移(比如以后侧栏加一种"半开"状态,只改了一处)。
     fn files_owner_generation(&self) -> Option<u64> {
         files_owner_generation_of(&self.tabs, self.ui.files_sidebar_open)
+    }
+
+    /// F131:这一帧文件面板的某一栏正在编辑路径吗。
+    ///
+    /// 判据走 `files_owner_generation()`,与面板「这一帧到底画不画得出来」
+    /// 同源 —— 面板不可见时恒 `false`,不会因为某个后台标签里留着一个没清
+    /// 干净的编辑缓冲就把整个窗口判成模态。纯逻辑核心是 `files_path_editing_of`。
+    fn files_path_editing(&self) -> bool {
+        files_path_editing_of(&self.tabs, self.ui.files_sidebar_open)
     }
 
     /// 这一帧真正生效的键盘焦点(协调者修订 2)。裸的 `self.focus` 只是用户
@@ -8709,8 +8738,8 @@ mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         autoscroll_for_pane, blink_on_at, blink_wake_at, credential_delete_error, download_job,
-        effective_focus_of, expand_tilde, files_owner_generation_of, files_start_dir,
-        finish_password_change, font_px_for, has_real_action, ime_cursor_area,
+        effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
+        files_start_dir, finish_password_change, font_px_for, has_real_action, ime_cursor_area,
         next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
         snapshot_tabs_of, sync_target_of, sync_timeout_wake_at, tab_title, upload_job, wind_down,
         Modal, RestoredTab, Tab, TabContent, TerminalTab,
@@ -9227,6 +9256,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::Rehost),
                     "Rehost 没登记进 Modal::ALL(T8)"
                 ),
+                Modal::FilesPathEdit => assert!(
+                    Modal::ALL.contains(&Modal::FilesPathEdit),
+                    "FilesPathEdit 没登记进 Modal::ALL(T8/F131)"
+                ),
             }
         }
         for m in [
@@ -9242,6 +9275,7 @@ mod tests {
             Modal::GroupManager,
             Modal::TabProps,
             Modal::ExitConfirm,
+            Modal::FilesPathEdit,
         ] {
             check(m);
         }
@@ -11505,6 +11539,46 @@ mod tests {
         assert_eq!(files_owner_generation_of(&tabs, true), Some(7));
     }
 
+    /// F131 行为级测试(而不是上面那条源码扫描守护):真的构造一棵
+    /// `Tabs<TabContent>`,把某一栏的 `path_edit` 置上,断言
+    /// `files_path_editing_of` —— `Modal::FilesPathEdit` 真正读的那个判据 ——
+    /// 认出这是编辑态;清空后必须变回 `false`。不需要真的 `App`(它要
+    /// `EventLoopProxy`,测试容器里造不出来),纯逻辑核心已经拆成自由函数。
+    #[test]
+    fn files_path_editing_of_is_true_only_while_a_path_buffer_is_open() {
+        let mut tabs = tabs_with_one_terminal_tab();
+        assert!(
+            !files_path_editing_of(&tabs, true),
+            "还没点编辑,不该判成编辑态"
+        );
+
+        tabs.active_mut()
+            .unwrap()
+            .content
+            .files_panel_mut()
+            .unwrap()
+            .remote
+            .path_edit = Some("/etc".into());
+        assert!(
+            files_path_editing_of(&tabs, true),
+            "remote 栏的 path_edit 置上后必须判成编辑态,否则 Modal::FilesPathEdit\
+             永远不生效,输入框收不到键"
+        );
+
+        tabs.active_mut()
+            .unwrap()
+            .content
+            .files_panel_mut()
+            .unwrap()
+            .remote
+            .path_edit = None;
+        assert!(
+            !files_path_editing_of(&tabs, true),
+            "提交/取消编辑后缓冲清空,必须退出模态,否则普通键盘操作会被一直\
+             错误地全量喂给 egui"
+        );
+    }
+
     /// 前置 A 的**另一半**:`files_local` 与 `files_remote` 是同构的缺口,
     /// 上一条只钉死了远端那半。复核实测:删掉 `has_real_action` 里
     /// `a.files_local.is_some()` 那一行,补测之前全仓库照样全绿——因为没有
@@ -13705,6 +13779,42 @@ mod tests {
             prod.contains("self.files_sidebar_was_open = self.ui.files_sidebar_open;"),
             "没有在帧尾记下这一帧的开合状态 —— 下一帧判不出跃迁,\
              而且热键那条路(在另一次事件回调里改标志)会永远同步不到"
+        );
+    }
+
+    /// F131:路径条的编辑态必须算模态。**不算的话那个输入框里一个字都打不
+    /// 出来** —— 面板拿着键盘焦点时,键不会喂给 egui
+    /// (`input_route::egui_should_see_focused` 是 T8 的注入点),而是被
+    /// `handle_panel_key` 吃掉:Backspace 变成「回上级目录」,字母键什么都
+    /// 不做。这跟 `Modal::Editor` 当年踩的是同一个坑。
+    ///
+    /// 自证会变红:把 `Modal::FilesPathEdit` 从 `Modal::ALL` 里删掉
+    /// (第二条断言红),或把 `modal_open` 里那一支改成 `=> false`
+    /// (第三条断言红)。
+    #[test]
+    fn the_files_path_editor_is_a_modal_or_it_cannot_receive_a_single_keystroke() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(
+            prod.len() < src.len(),
+            "没能把搜索范围切到 `mod tests` 之前 —— 下面的断言会命中测试自己\
+             写的字面量,变成恒绿"
+        );
+        assert!(
+            prod.contains("    FilesPathEdit,"),
+            "Modal 枚举里没有 FilesPathEdit"
+        );
+        assert!(
+            prod.contains("        Modal::FilesPathEdit,"),
+            "Modal::ALL 里漏了 FilesPathEdit —— modal_open 照 ALL 遍历,\
+             漏加等于这一支从来不生效"
+        );
+        assert!(
+            prod.contains("            Modal::FilesPathEdit => self.files_path_editing(),"),
+            "modal_open 没有认 FilesPathEdit"
         );
     }
 
