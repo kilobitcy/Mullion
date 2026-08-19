@@ -652,6 +652,16 @@ impl TabContent {
         match self {
             TabContent::Terminal(t) => {
                 let ix = host_ix.unwrap_or(0);
+                if host_ix.is_some() && ix >= t.ws.hosts.len() {
+                    // 目前到不了:`hosts` 只增不减(换节点 push、重连原地换
+                    // `handle`),记下的下标不会腐坏。但真到了这儿,回落 hosts[0]
+                    // 就是**原样重现**这条改动要修的 bug(路径对了、机器错了),
+                    // 而且悄无声息。留个信号,别让它下次以静默的形式回来。
+                    log::warn!(
+                        "sftp host_ix {ix} 越界(hosts 只有 {} 台),回落到第一台",
+                        t.ws.hosts.len()
+                    );
+                }
                 t.ws.hosts
                     .get(ix)
                     .or_else(|| t.ws.hosts.first())
