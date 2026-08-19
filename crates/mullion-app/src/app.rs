@@ -1542,7 +1542,7 @@ enum Modal {
     /// 当前标签、`Ctrl+Shift+B` 仍能开关文件侧栏(两条快捷键的闸门都是
     /// `modal_open()`)。
     ExitConfirm,
-    /// 换节点弹窗(pane 标题条上的 `⇆`)。里面有搜索框 —— 不算模态的话敲的
+    /// 换节点弹窗(pane 标题条上的换节点按钮)。里面有搜索框 —— 不算模态的话敲的
     /// 字会同时发给远端 shell(T8)。
     Rehost,
 }
@@ -8926,7 +8926,7 @@ mod tests {
         );
     }
 
-    /// 同上,换节点那两份。被 discard 趟吃掉的现象分别是「点 `⇆` 不弹窗」和
+    /// 同上,换节点那两份。被 discard 趟吃掉的现象分别是「点换节点按钮不弹窗」和
     /// 「在弹窗里选了节点毫无反应」——后者尤其难查:弹窗自己关掉了,看起来
     /// 像是生效了。
     ///
@@ -8947,7 +8947,7 @@ mod tests {
             rehost_pane: Some(PaneId(2)),
             ..Default::default()
         };
-        assert!(has_real_action(&b), "点 `⇆` 的那一下被 discard 趟吞了");
+        assert!(has_real_action(&b), "点换节点按钮的那一下被 discard 趟吞了");
     }
 
     /// 同上,解锁框那一份。它是整个程序此刻唯一能操作的东西 —— 被 discard

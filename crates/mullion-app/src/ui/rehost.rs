@@ -1,6 +1,6 @@
 //! 换节点弹窗:把某一块分屏挂到另一条会话上。
 //!
-//! 入口是 pane 标题条上的 `⇆`(`pane_title::TitleAction::rehost`)。这里只
+//! 入口是 pane 标题条上的换节点按钮(`pane_title::TitleAction::rehost`)。这里只
 //! **选**节点 —— 真正的断开/重连由 `app.rs::spawn_rehost` 做。
 //!
 //! **这个弹窗要登记进 `app.rs::modal_open` 的 `Modal` 枚举**:里面有搜索框,

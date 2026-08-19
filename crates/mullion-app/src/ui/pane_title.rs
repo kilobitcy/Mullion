@@ -151,6 +151,25 @@ fn rehost_id(id: PaneId) -> egui::Id {
     egui::Id::new(("pane_title_rehost", id.0))
 }
 
+/// 标题条小按钮的字号,也是自绘图标的边长。
+const BUTTON_SIZE: f32 = 13.0;
+
+/// 标题条小按钮上画什么。
+#[derive(Clone, Copy)]
+enum Mark {
+    /// 一个字形。**只用于码位一定存在的字符** —— `×` 是 U+00D7(Latin-1
+    /// Supplement),任何拉丁字体都有。
+    Glyph(&'static str),
+    /// 自绘的「换节点」双向箭头。
+    ///
+    /// 原来写的是 `⇆`(U+21C6),实机上是个 tofu 方框 □:egui 内嵌的
+    /// Ubuntu-Light 没有这个码位,`install_cjk_font` 回退到的微软雅黑也没有
+    /// (U+21C6 不在 GBK 里)。换一个"更常见的箭头字符"治不了本 —— F21 允许
+    /// 用户换显示字体,换一次就可能再缺一次,而字形缺失这类事**只有人眼能
+    /// 发现**(无头环境里 galley 照样有尺寸,测不出来)。自绘完全不依赖字体。
+    SwapArrows,
+}
+
 /// 标题条上的一个小按钮。
 ///
 /// **手动 `allocate` + `interact`,不用 `ui.small_button`**:后者的 id 由布局
@@ -158,14 +177,21 @@ fn rehost_id(id: PaneId) -> egui::Id {
 /// 反应」「两个挨着的按钮串没串」就永远测不到,而「想换节点结果把 pane 关了」
 /// 是一次不可撤销的误操作。
 ///
-/// 尺寸按字形实测宽度算,不写死:`×` 和 `⇆` 在不同字体下宽度不同,写死会让
-/// 其中一个要么被裁一半、要么留一大块空白。
-fn small_action_button(ui: &mut egui::Ui, id: egui::Id, glyph: &str, t: &Theme) -> egui::Response {
-    let font = egui::FontId::proportional(13.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(glyph.to_string(), font, theme::c32(t.fg_muted));
-    let size = galley.size() + egui::vec2(8.0, 2.0);
+/// 字形的尺寸按实测宽度算,不写死:`×` 在不同字体下宽度不同,写死会让它要么被
+/// 裁一半、要么留一大块空白。自绘图标没有这个问题,给个正方形边长即可。
+fn small_action_button(ui: &mut egui::Ui, id: egui::Id, mark: Mark, t: &Theme) -> egui::Response {
+    let galley = match mark {
+        Mark::Glyph(g) => Some(ui.painter().layout_no_wrap(
+            g.to_string(),
+            egui::FontId::proportional(BUTTON_SIZE),
+            theme::c32(t.fg_muted),
+        )),
+        Mark::SwapArrows => None,
+    };
+    let content = galley
+        .as_ref()
+        .map_or(egui::Vec2::splat(BUTTON_SIZE), |g| g.size());
+    let size = content + egui::vec2(8.0, 2.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let resp = ui.interact(rect, id, egui::Sense::click());
     if resp.hovered() {
@@ -177,9 +203,35 @@ fn small_action_button(ui: &mut egui::Ui, id: egui::Id, glyph: &str, t: &Theme) 
     } else {
         t.fg_muted
     });
-    let at = rect.center() - galley.size() / 2.0;
-    ui.painter().galley(at, galley, color);
+    match galley {
+        Some(g) => {
+            let at = rect.center() - g.size() / 2.0;
+            ui.painter().galley(at, g, color);
+        }
+        None => paint_swap_arrows(ui.painter(), rect, color),
+    }
     resp
+}
+
+/// 画「⇆」:上排箭头指右,下排箭头指左。纯线段,零字体依赖。
+///
+/// 尺寸全部由 `rect` 推,不写死像素 —— DPI 变了(`ScaleFactorChanged`)按钮矩形
+/// 跟着变,图标必须一起变,否则高 DPI 下会缩成一小撮。
+fn paint_swap_arrows(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let half_w = BUTTON_SIZE * 0.42;
+    let gap = BUTTON_SIZE * 0.18; // 两排的半间距
+    let head = BUTTON_SIZE * 0.20; // 箭头斜线的边长
+    let stroke = egui::Stroke::new((BUTTON_SIZE * 0.10).max(1.0), color);
+    let (l, r) = (c.x - half_w, c.x + half_w);
+    for (y, tip, back) in [
+        (c.y - gap, r, r - head), // 上排:箭头在右
+        (c.y + gap, l, l + head), // 下排:箭头在左
+    ] {
+        painter.line_segment([egui::pos2(l, y), egui::pos2(r, y)], stroke);
+        painter.line_segment([egui::pos2(tip, y), egui::pos2(back, y - head)], stroke);
+        painter.line_segment([egui::pos2(tip, y), egui::pos2(back, y + head)], stroke);
+    }
 }
 
 /// 一帧里标题条上发生的事。每项每帧至多一个(多块 pane 同时被点是不可能的)。
@@ -259,7 +311,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                 );
                 content.set_clip_rect(inner);
                 content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if small_action_button(ui, close_id(v.geom.id), "×", t)
+                    if small_action_button(ui, close_id(v.geom.id), Mark::Glyph("×"), t)
                         .on_hover_text("关闭此分屏")
                         .clicked()
                     {
@@ -268,13 +320,13 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     // 用户要的入口:分屏之后在这里把这块 pane 换到别的节点。
                     // 放在 × 左边而不是做成"点主机名":主机名会被 `.truncate()`
                     // 截断,长主机名时点击靶子会缩到几个像素宽。
-                    if small_action_button(ui, rehost_id(v.geom.id), "⇆", t)
+                    if small_action_button(ui, rehost_id(v.geom.id), Mark::SwapArrows, t)
                         .on_hover_text("把这块分屏换到别的节点")
                         .clicked()
                     {
                         action.rehost = Some(v.geom.id);
                     }
-                    // 剩下的空间(已扣掉 × / ⇆ 按钮)左对齐摆状态点 + 一整串标题文字;
+                    // 剩下的空间(已扣掉 × / 换节点按钮)左对齐摆状态点 + 一整串标题文字;
                     // 排版用的 available_width 到这里已经是扣掉 × 之后的余量。
                     // × 不被顶出条外,靠的是 right_to_left 先占位 + 外层 set_clip_rect
                     // 裁剪(clip 同时裁交互,见 egui `Ui::interact`,egui-0.30 `ui.rs:1057`
@@ -671,6 +723,53 @@ mod tests {
         let a = click_button(rehost_id(PaneId(1)));
         assert_eq!(a.rehost, Some(PaneId(1)), "点「换节点」应报告这块 pane");
         assert_eq!(a.close, None, "点「换节点」不该顺带把 pane 关了");
+    }
+
+    /// 标题条上的按钮**不许**用超出 Latin-1 的字符画。
+    ///
+    /// 原来的换节点按钮写的是 `⇆`(U+21C6),实机上是个 tofu 方框 □ —— egui 内嵌
+    /// 的 Ubuntu-Light 没这个码位,`install_cjk_font` 回退到的微软雅黑也没有。
+    /// 这类事**只有人眼能发现**:字形缺失时 `layout_no_wrap` 照样返回一个正常
+    /// 尺寸的 galley,任何几何断言都是绿的。所以守护只能落在"用了什么字符"上。
+    ///
+    /// 阈值取 0x100(Latin-1 Supplement 及以下):`×` U+00D7 在这里面,任何拉丁
+    /// 字体都有它;想画别的就走 `Mark` 的自绘分支,那条路零字体依赖。
+    /// F21 允许用户换显示字体,换一次就可能再缺一次 —— 这也是不能靠"挑一个更
+    /// 常见的箭头字符"了事的原因。
+    ///
+    /// 锚点拆开拼 **且** 先剥掉注释行:两层都要。拼是防扫到测试自己这行代码;
+    /// 剥注释是防扫到任何一处**文档里写全的字面量** —— 本项目在源码级守护上
+    /// 反复栽在这上面(注释里写全字面量是第五类恒绿模式的第二种形态),
+    /// 这条测试第一版就因为文档里举了反例而假红。所以文档里也不写全 `⇆`
+    /// 那个实参,只说码位。
+    ///
+    /// 自证会变红:把换节点按钮改回 `Mark::Glyph` 加 U+21C6 那个字符。
+    #[test]
+    fn title_bar_buttons_never_use_a_glyph_the_font_might_not_have() {
+        let raw = include_str!("pane_title.rs");
+        let src: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = concat!("Mark::Gly", "ph(\"");
+        let mut seen = 0;
+        for tail in src.split(needle).skip(1) {
+            let arg = &tail[..tail.find('"').expect("Mark::Glyph 的实参没有闭引号")];
+            seen += 1;
+            for ch in arg.chars() {
+                assert!(
+                    (ch as u32) < 0x100,
+                    "标题条按钮用了 {ch:?}(U+{:04X})—— 超出 Latin-1,\
+                     实机上很可能画成 tofu 方框。改走 Mark 的自绘分支",
+                    ch as u32
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "一个 Mark::Glyph 都没扫到 —— 锚点失效,这条测试恒绿了"
+        );
     }
 
     /// 反面:两个按钮挨着,串了的话用户想换节点却把 pane 关掉了 —— 一次

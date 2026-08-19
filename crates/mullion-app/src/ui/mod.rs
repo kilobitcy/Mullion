@@ -327,7 +327,7 @@ pub struct UiState {
     /// `save_request` 的中转理由,但这里**不碰 store**)。
     pub tab_props_save: Option<tab_props::TabPropsAction>,
 
-    /// 换节点弹窗(点了 pane 标题条的 `⇆`)。`None` = 关着。
+    /// 换节点弹窗(点了 pane 标题条的换节点按钮)。`None` = 关着。
     /// 里面有搜索框 —— 必须同步登记进 `app.rs::modal_open`(T8)。
     pub rehost: Option<rehost::RehostDraft>,
     /// 弹窗里选定了节点,等着 `app.rs` 去拨号。中转一道的理由同
