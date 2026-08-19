@@ -315,6 +315,10 @@ struct PendingRehost {
     /// pane 一致(见 `automation::pending_for_extra_pane`):多块 pane attach
     /// 同一个 tmux session 会内容镜像。`None` = 这个节点没配自动化。
     plan: Option<crate::automation::PendingAutomation>,
+    /// F128:拨这台**新**机器用的参数,随 `HostConn` 一起存进 `ws.hosts`。
+    /// 不带的话,换过节点的那条连接断线时只剩标签级 `last_cfg` 可取,
+    /// 而那是**最初**那台机器的(见 `HostConn::cfg` 的文档)。
+    cfg: SshConfig,
 }
 
 /// 一个终端标签的全部 **per-connection** 状态(D0 决策 S2)。
@@ -4544,6 +4548,7 @@ impl App {
             addr: format!("{}:{}", cfg.host, cfg.port),
             session_id: session,
             plan,
+            cfg: cfg.clone(),
         });
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
@@ -4648,9 +4653,13 @@ impl App {
 
     /// F128:为一条已经死掉的连接发起第 `attempt` 次重拨。
     ///
-    /// 凭据取 `tab.last_cfg`(连接那一刻定死的),**绝不回头查库** ——
-    /// 用户在断线期间完全可能改了会话甚至删了它,那时候拨出去的目标就跟他
-    /// 当初点「连接」时看到的不是一回事(理由同 `PendingRehost`)。
+    /// 凭据取 **`ws.hosts[host_ix].cfg`**(建这条连接那一刻定死的),两条纪律:
+    ///
+    /// - **绝不回头查库** —— 用户在断线期间完全可能改了会话甚至删了它,那时候
+    ///   拨出去的目标就跟他当初点「连接」时看到的不是一回事(理由同 `PendingRehost`)。
+    /// - **绝不取标签级的 `last_cfg`** —— 那只记得**最初**连的那台机器。用户
+    ///   用「换节点」把 pane 挪到第二台服务器之后,第二台断线时拿 `last_cfg`
+    ///   重拨就是静默连到另一台机器上(见 `HostConn::cfg` 的文档)。
     fn spawn_reconnect(&mut self, generation: u64, host_ix: usize, attempt: u32) {
         let Some(t) = self
             .tabs
@@ -4659,10 +4668,10 @@ impl App {
         else {
             return;
         };
-        let Some(cfg) = t.last_cfg.clone() else {
+        let Some(cfg) = t.ws.hosts.get(host_ix).and_then(|h| h.cfg.clone()) else {
             log::warn!(
                 target: "mullion",
-                "重连:世代 {generation} host {host_ix} 没有 last_cfg,放弃"
+                "重连:世代 {generation} host {host_ix} 没有拨号参数,放弃"
             );
             return;
         };
@@ -5328,6 +5337,10 @@ impl ApplicationHandler<UserEvent> for App {
                     handle,
                     tmux_bootstrap: Default::default(),
                     tmux_last_try: None,
+                    // F128:重连要用它。跟下面 `last_cfg` 同一份,但那份是
+                    // **标签级**的(标题条读 user/host/port),换过节点之后
+                    // 就不再代表"每一条连接"——见 `HostConn::cfg` 的文档。
+                    cfg: cfg.clone(),
                 });
                 // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
                 // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
@@ -5541,6 +5554,9 @@ impl ApplicationHandler<UserEvent> for App {
                         handle,
                         tmux_bootstrap: Default::default(),
                         tmux_last_try: None,
+                        // F128:拨这台新机器的参数跟着它自己走。落回
+                        // `last_cfg` 的话,这条连接断线时会拨回最初那台机器。
+                        cfg: Some(pending.cfg),
                     });
                     let host_ix = ws.hosts.len() - 1;
                     if rehost_pane(ws, pane, generation, host_ix, Box::new(ssh.clone()), rx) {
@@ -13588,12 +13604,12 @@ mod tests {
         &after[..after.find("\n    }\n").expect("找不到函数结尾")]
     }
 
-    /// **接线守护 / F128**:重连的凭据必须来自 `tab.last_cfg`,**不许回头查库**。
-    /// 查库的话,用户在断线期间改了这条会话(换了端口/密钥),重连就会拨到
-    /// 一个他没同意过的地方去;会话被删掉时更是直接连不上。
+    /// **接线守护 / F128**:重连的凭据必须是建这条连接那一刻定死的那份,
+    /// **不许回头查库**。查库的话,用户在断线期间改了这条会话(换了端口/密钥),
+    /// 重连就会拨到一个他没同意过的地方去;会话被删掉时更是直接连不上。
     /// 理由同 `PendingRehost` / `automation_template`。
     ///
-    /// 自证会变红:把 `spawn_reconnect` 里的 `last_cfg` 换成 `store.dial_plan_for(..)`。
+    /// 自证会变红:把 `spawn_reconnect` 里取 cfg 那句换成 `store.dial_plan_for(..)`。
     ///
     /// 锚点拆开拼(`concat!`):写成完整字面量的话,`fn_body` 在 0 处真实定义时
     /// 会退化成匹配测试自己这行代码,把自己的函数体(而非生产代码)当成
@@ -13603,12 +13619,47 @@ mod tests {
         let src = include_str!("app.rs");
         let body = fn_body(src, concat!("    fn ", "spawn_reconnect("));
         assert!(
-            body.contains("last_cfg"),
-            "重连没用连接时定死的 cfg —— 断线期间改过会话就会拨到别处"
-        );
-        assert!(
             !body.contains("dial_plan_for"),
             "重连回头查库了 —— 见 PendingRehost 的文档"
+        );
+        assert!(
+            !body.contains("self.store"),
+            "重连回头查库了 —— 见 PendingRehost 的文档"
+        );
+    }
+
+    /// **接线守护 / F128**:重连要拨的是**断掉的那台机器**,不是标签最初连的
+    /// 那台。
+    ///
+    /// `TerminalTab::last_cfg` 在 `ConnectOk` 那一刻定死、此后再也不更新,
+    /// 而「换节点」(`PaneRehosted`)会往 `ws.hosts` 里加**第二台机器**。
+    /// 拿 `last_cfg` 去重拨 `host_ix > 0` 的那条连接,就是静默连到另一台机器
+    /// 上——地址、凭据、主机指纹全对不上,而用户看到的只是「已重新连接」,
+    /// 接着往一台他没打算登录的服务器上敲命令。
+    ///
+    /// 结构性守护(`spawn_reconnect` 要 `&mut App` + 真实 runtime,无头环境
+    /// 造不出来)。**关键是那条否定断言**:光断言"读了 hosts"挡不住
+    /// 「两个来源都留着、`unwrap_or` 落回 `last_cfg`」这种写法,而那正是最
+    /// 自然的"稳妥"改法,也正好把 bug 原样保留。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_uses_the_cfg_frozen_at_connect_time`。
+    #[test]
+    fn reconnect_dials_the_host_it_lost_not_the_first_one() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "spawn_reconnect("));
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("hosts.get(host_ix)"),
+            "重连没有按 host_ix 取拨号参数 —— 换过节点之后会拨回最初那台机器"
+        );
+        assert!(
+            !code.contains("last_cfg"),
+            "重连仍读得到标签级 last_cfg —— 只要它还在这个函数里,\
+             「取不到就落回 last_cfg」这种写法就会把 bug 原样带回来"
         );
     }
 

@@ -126,10 +126,22 @@ pub struct HostConn {
     /// F124:上次**发起**自举的时刻。`None` = 还没试过。判据见
     /// `remote_bootstrap::should_attempt`。
     ///
-    /// 断线重连会造一整个新的 `Workspace` 世代、也就是新的 `HostConn`,这两个
-    /// 字段随之清零、重新配一遍。这是对的:`tmux set -g` 幂等,重发无副作用,
-    /// 而远端 tmux 服务器可能在断线期间重启过。
+    /// 断线重连换掉这条连接的 `handle` 时,这两个字段一并清零、重新配一遍
+    /// (见 `UserEvent::PaneReconnected` 的处理)。这是对的:`tmux set -g` 幂等,
+    /// 重发无副作用,而远端 tmux 服务器可能在断线期间重启过。
     pub tmux_last_try: Option<std::time::Instant>,
+    /// F128:拨出这条连接用的参数。**按连接存,不是按标签存**。
+    ///
+    /// 标签级的 `TerminalTab::last_cfg` 只记得**最初**连的那台机器:用户用
+    /// 「换节点」把一块 pane 挪到另一台服务器上之后,`hosts` 里就有了两台机器,
+    /// 而 `last_cfg` 仍是第一台的。那时候第二台断线,拿 `last_cfg` 去重拨就是
+    /// 静默连到**另一台机器**上——地址、凭据、主机指纹全对不上,而用户看到的
+    /// 只是"重连好了"。`host_ix` 本来就是"哪台机器"的身份,拨号参数就该跟它走。
+    ///
+    /// `None` = 这条连接没有可复用的拨号参数(CLI 直连早期路径 / store 不可用),
+    /// 此时不重连(`spawn_reconnect` 直接放弃并记日志)——宁可让用户手动重连,
+    /// 也不猜一份配置拨出去。
+    pub cfg: Option<mullion_ssh::config::SshConfig>,
 }
 
 /// 一个分屏的全部运行时状态。
@@ -1108,6 +1120,33 @@ mod tests {
             body.contains("tmux_last_try"),
             "HostConn 上没有「上次发起时刻」—— 重试判据拿不到 since_last_ms,\
              要么永不重试要么每帧重试"
+        );
+    }
+
+    /// **接线守护 / F128**:拨号参数必须挂在 `HostConn` 上,不能只有标签级的
+    /// `TerminalTab::last_cfg`。
+    ///
+    /// 换节点(B2-b)之后一个 `Workspace` 上有两台机器,而 `last_cfg` 只记得
+    /// **最初**那台。第二台断线时拿 `last_cfg` 去重拨,拨的是另一台机器 ——
+    /// 地址、凭据、指纹全对不上,用户看到的却只是「已重新连接」。
+    ///
+    /// 扎源码结构的理由同上一条(`HostConn` 里有 `Arc<SshConnection>`,
+    /// 字段私有、只能由真实握手造出来,测试里造不出实例)。验证边界:挡得住
+    /// 「字段被搬回标签级」,挡不住「两边都留一份、重连仍读错那份」——后者由
+    /// `app.rs` 里的 `reconnect_dials_the_host_it_lost_not_the_first_one` 兜。
+    ///
+    /// 自证会变红:把 `pub cfg: Option<..>` 那行从 `HostConn` 删掉。
+    #[test]
+    fn dial_config_lives_on_the_host_connection() {
+        let src = include_str!("mod.rs");
+        let after = src
+            .split("\npub struct HostConn {")
+            .nth(1)
+            .expect("找不到 HostConn 的定义");
+        let body = &after[..after.find("\n}\n").expect("找不到 HostConn 的结尾")];
+        assert!(
+            body.contains("pub cfg:"),
+            "HostConn 上没有拨号参数 —— 换过节点之后重连会拨回最初那台机器"
         );
     }
 
