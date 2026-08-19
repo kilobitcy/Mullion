@@ -4292,7 +4292,11 @@ impl App {
                     h.disconnect.take();
                     continue;
                 };
-                if pane.status == crate::shell::workspace::PaneStatus::Disconnected {
+                // 判据在 `automation::should_cancel_on_status`(纯函数,可单测)。
+                // **不要写成 `== Disconnected`**:F128 之后链路死了先落到
+                // `Reconnecting`,那样写会让这份自动化一直挂到自己的
+                // ready_timeout 才收场(见那个函数的文档)。
+                if crate::automation::should_cancel_on_status(pane.status) {
                     // send 的 Err(接收端已走)无所谓:task 已经结束了。
                     if let Some(tx) = h.disconnect.take() {
                         let _ = tx.send(());
