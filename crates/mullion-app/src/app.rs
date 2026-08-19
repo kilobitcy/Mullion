@@ -2579,10 +2579,11 @@ impl App {
     /// - 列目录任务被硬杀则 `PaneState::load` 永远翻不出 `Loading`(只有
     ///   `accept` 翻得动),接着就是上面那条永久早退。
     ///
-    /// 而它们本来就不需要被打断:传输和写操作各自持有自己的 `Arc<SshConnection>`
-    /// 并**自己开一条 channel**,跟这里换掉的 client 无关;用户是对着旧那台
-    /// 机器发起的,让它传完才是对的。迟到的列目录结果由 `invalidate` 递增的
-    /// `request_seq` 挡掉。
+    /// 而它们本来就不需要被打断:两类任务在发起时各自克隆了一份 `Arc`(传输
+    /// 拿 `Arc<SshConnection>` 并**自己开一条新 channel**,写操作拿的是
+    /// `Arc<SftpClient>`、复用已开的那条),`*slot = None` 只是把槽位里的那份
+    /// 引用拿走,谁都不会因此失效。用户是对着旧那台机器发起的,让它跑完才是
+    /// 对的。迟到的列目录结果由 `invalidate` 递增的 `request_seq` 挡掉。
     fn reopen_sftp_on_focused_host(&mut self, generation: u64) {
         if let Some(tab) = self.tabs.by_generation_mut(generation) {
             if let Some(slot) = tab.content.sftp_mut() {
@@ -14384,8 +14385,12 @@ mod tests {
              (被杀就永远发不出 TransferDone,队列里的 job 永久占并发名额)和\
              列目录任务(被杀就永远翻不出 Loading,下一句 trigger_sftp_open 早退)"
         );
+        // 判据带 `remote.` 限定:两栏都是 `PaneState`、都有 `invalidate()`,
+        // 就在同一个 `if let Some(files)` 块里。手滑写成 `local` 的话远端栏
+        // 保持旧机器的 `Loading`,原样复发下面那条早退 —— 而只扫函数名的话
+        // 这个手滑一条测试都不会红(复核实测 1262 条全绿)。
         assert!(
-            body.contains("invalidate()"),
+            body.contains("files.remote.invalidate()"),
             "没作废远端栏 —— load 留在 Loading 会让紧接着的 trigger_sftp_open\
              撞 already_loading 早退,而那之后 has_client 是 false、判定首行就\
              短路,没有任何自愈路径"
