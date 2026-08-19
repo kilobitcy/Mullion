@@ -2564,22 +2564,27 @@ impl App {
 
     /// F132:焦点分屏在另一台机器上 —— 把这条 sftp channel 换过去。
     ///
-    /// **顺序不可换**:先 abort 在途任务、摘掉旧 client,再
-    /// `trigger_sftp_open`。反过来的话它开头那句
-    /// `if tab.content.sftp_client().is_some() { return; }` 会直接早退,
-    /// 什么都不发 —— 用户看到的是「按了没反应」。同理**不在这里把面板置成
-    /// 加载中**:那会撞上它的 already_loading 早退(置加载中是
-    /// `trigger_sftp_open` 自己的事)。
+    /// **顺序不可换**:先摘掉旧 client,再 `trigger_sftp_open`。反过来的话它
+    /// 开头那句 `sftp_client().is_some() || already_loading` 会直接早退,什么
+    /// 都不发 —— 用户看到的是「按了没反应」。同理**不在这里把面板置成加载
+    /// 中**:那撞的是同一句的另一半(置加载中是 `trigger_sftp_open` 自己的
+    /// 事);作废用 `invalidate`,它把 `load` 退回 `Idle`。
     ///
-    /// 摘 client 只是把 `Arc` 从槽位拿走:正在跑的传输各自持有自己的 `Arc`,
-    /// 能跑完,不会被腰斩。
+    /// **不动 `sftp_tasks`**。那个池子是混的:`track_sftp_task` 把列目录、
+    /// 写操作、以及 `pump_transfers` 里每条传输的句柄都塞在一起,`drain` 后
+    /// 无差别 abort 会连着两样东西一起打断 ——
+    /// - 传输 worker 被硬杀就再也发不出 `UserEvent::TransferDone`,队列里那条
+    ///   job 永久停在 `Running`,而 `take_runnable` 按 `Running` 数占并发名额,
+    ///   撞几次就把全局传输堵死;
+    /// - 列目录任务被硬杀则 `PaneState::load` 永远翻不出 `Loading`(只有
+    ///   `accept` 翻得动),接着就是上面那条永久早退。
+    ///
+    /// 而它们本来就不需要被打断:传输和写操作各自持有自己的 `Arc<SshConnection>`
+    /// 并**自己开一条 channel**,跟这里换掉的 client 无关;用户是对着旧那台
+    /// 机器发起的,让它传完才是对的。迟到的列目录结果由 `invalidate` 递增的
+    /// `request_seq` 挡掉。
     fn reopen_sftp_on_focused_host(&mut self, generation: u64) {
         if let Some(tab) = self.tabs.by_generation_mut(generation) {
-            if let Some(tasks) = tab.content.sftp_tasks_mut() {
-                for t in tasks.drain(..) {
-                    t.abort();
-                }
-            }
             if let Some(slot) = tab.content.sftp_mut() {
                 *slot = None;
             }
@@ -2587,9 +2592,7 @@ impl App {
                 t.sftp_host_ix = None;
             }
             if let Some(files) = tab.content.files_panel_mut() {
-                // 换了台机器,原来那一屏的选中/光标指的是另一台上的文件,
-                // 留着只会让下一次操作打到不存在的路径上。
-                files.remote.clear_selection();
+                files.remote.invalidate();
             }
         }
         self.trigger_sftp_open(generation);
@@ -14373,6 +14376,51 @@ mod tests {
         assert!(
             !body.contains("Load::Loading"),
             "提前把面板置成加载中会撞上 trigger_sftp_open 的 already_loading 早退"
+        );
+        // 复核挖出的两个 Critical,判据钉在这里。
+        assert!(
+            !body.contains(".abort()"),
+            "重开 sftp 不许 abort `sftp_tasks` —— 那个池子里混着传输 worker\
+             (被杀就永远发不出 TransferDone,队列里的 job 永久占并发名额)和\
+             列目录任务(被杀就永远翻不出 Loading,下一句 trigger_sftp_open 早退)"
+        );
+        assert!(
+            body.contains("invalidate()"),
+            "没作废远端栏 —— load 留在 Loading 会让紧接着的 trigger_sftp_open\
+             撞 already_loading 早退,而那之后 has_client 是 false、判定首行就\
+             短路,没有任何自愈路径"
+        );
+    }
+
+    /// F132:判定说要 `Reopen`,`sync_files_to_focused_pane` 就得真的去重开。
+    ///
+    /// 这一臂写成空操作的话,编译过、全部单测绿,实机行为却原样退回这条改动
+    /// 要修的 bug(侧栏连着第一台、路径却来自第二台)—— 两位复核各自独立
+    /// 把它改成 `SyncPlan::Reopen => {}` 实测过 1260 条全绿,缺口是真的。
+    ///
+    /// 判定(`sync_plan_of`)和执行(`reopen_sftp_on_focused_host`)各有测试,
+    /// 唯独中间这根线没人守;`App` 造不出来,只能扎源码。
+    ///
+    /// 自证会变红:把那一臂改成 `SyncPlan::Reopen => {}`。
+    #[test]
+    fn deciding_to_reopen_actually_calls_the_reopen_path() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(prod.len() < src.len(), "范围没切到 mod tests 之前");
+        let at = prod
+            .find("    fn sync_files_to_focused_pane(&mut self) {")
+            .expect("找不到 sync_files_to_focused_pane 的定义");
+        let body = &prod[at..];
+        let end = body.find("\n    }\n").expect("找不到函数结尾");
+        let arm = body[..end]
+            .find("SyncPlan::Reopen =>")
+            .expect("没处理 Reopen —— 换过节点的分屏永远等不到侧栏跟过去");
+        assert!(
+            body[arm..end].contains("self.reopen_sftp_on_focused_host("),
+            "Reopen 那一臂没调 reopen_sftp_on_focused_host"
         );
     }
 }

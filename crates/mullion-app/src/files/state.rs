@@ -89,6 +89,25 @@ impl PaneState {
         self.request_seq
     }
 
+    /// F132:这一栏连的机器要换了 —— 把它作废,等新连接重新加载。
+    ///
+    /// 三件事一件都不能少:
+    /// - `request_seq += 1`:在途的列目录结果是**另一台**机器上的内容,回来时
+    ///   必须被 `accept` 的序号校验丢掉,否则新连接刚开好就被旧机器的目录覆盖。
+    /// - `load` 退回 `Idle`:留在 `Loading` 的话,`App::trigger_sftp_open` 的
+    ///   `already_loading` 早退会让新的 open 一个字节都发不出去,面板永久转圈
+    ///   —— 而那之后 `has_client` 是 `false`,判定在第一行就短路,**没有任何
+    ///   自愈路径**,只能重启。
+    /// - 清选中:选的是另一台上的文件,留着只会让下一次操作打到不存在的路径。
+    ///
+    /// 跟 `begin_load` 分开是因为这里**没有**下一个 cwd 可填:去哪个目录要等
+    /// 新连接 `canonicalize(".")` 回来才知道(F123)。
+    pub fn invalidate(&mut self) {
+        self.load = Load::Idle;
+        self.clear_selection();
+        self.request_seq += 1;
+    }
+
     /// 收下一次加载结果。序号对不上返回 `false`(结果被丢弃)。
     pub fn accept(&mut self, seq: u64, result: Result<Vec<Entry>, String>) -> bool {
         if seq != self.request_seq {
@@ -538,6 +557,38 @@ mod tests {
         assert_eq!(s.selected_paths(), vec![rp("a")], "没了的那条该被丢掉");
         assert!(s.cursor.is_none(), "光标指着的那条没了,光标也该清掉");
         assert!(s.anchor.is_none(), "锚点同理");
+    }
+
+    /// F132:换机器前作废这一栏 —— 三件事各自都能单独出事,逐条钉。
+    ///
+    /// 尤其**递增序号**那条:少了它,在途的那次列目录(内容来自**上一台**
+    /// 机器)回来时序号照样对得上,会被当成新连接的结果收下,用户于是在
+    /// B 机的面板里看着 A 机的目录 —— 而这正是 F132 要修的那类错位。
+    ///
+    /// 自证会变红:把 `invalidate` 里的 `request_seq += 1` / `load = Idle` /
+    /// `clear_selection()` 分别删掉,对应断言各红一条。
+    #[test]
+    fn invalidating_a_pane_makes_the_in_flight_listing_of_the_old_host_stale() {
+        let mut s = state();
+        let stale = s.begin_load(rp("/srv"));
+        s.selected.insert(rp("a"));
+        s.cursor = Some(rp("a"));
+
+        s.invalidate();
+
+        assert!(
+            !s.accept(stale, Ok(vec![e("from-old-host", EntryKind::File)])),
+            "旧机器那次列目录还能被收下 —— 面板会显示另一台上的内容"
+        );
+        assert_eq!(
+            s.load,
+            Load::Idle,
+            "留在 Loading 的话 trigger_sftp_open 会撞 already_loading 早退,面板永久转圈"
+        );
+        assert!(
+            s.selected_paths().is_empty() && s.cursor.is_none(),
+            "选中/光标指的是另一台上的文件,留着会让下一次操作打到不存在的路径"
+        );
     }
 
     #[test]
