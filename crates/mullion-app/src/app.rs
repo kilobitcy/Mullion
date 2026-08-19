@@ -165,6 +165,9 @@ pub enum UserEvent {
     /// 「侧栏关→开跃迁」那条路会拿着用户浏览到的目录去当 home 用。
     SftpOpened {
         generation: u64,
+        /// F132:这条 channel 开在哪台上。发起时是什么,回来时还是什么 ——
+        /// 期间用户可能已经换了焦点分屏,不能在收到时现算。
+        host_ix: Option<usize>,
         result: Result<
             (
                 Arc<mullion_ssh::sftp::SftpClient>,
@@ -370,6 +373,12 @@ struct TerminalTab {
     /// (`accept_sftp_opened` 收到 `Err` 时不写这个字段,留着 `None` 让下次
     /// 用户点击时能重试)。蹭 `ws.hosts[0].handle` 已建立的连接开,不重新握手。
     sftp: Option<Arc<mullion_ssh::sftp::SftpClient>>,
+    /// F132:`sftp` 这条 channel 开在 `ws.hosts` 的哪一台上。`None` = 还没开过。
+    ///
+    /// 用户用「换节点」把某块分屏挪到第二台机器之后,`hosts` 里就有两台,
+    /// 而侧栏只有一条 channel。不记归属的话,侧栏连的是第一台、目录却来自
+    /// 焦点分屏(第二台)——**路径对了、机器错了**,一次看不出错的误操作。
+    sftp_host_ix: Option<usize>,
     /// F50/D6:这个标签在途的 sftp 后台任务(`spawn_sftp_open`/
     /// `spawn_sftp_list_dir` 各开一个,句柄经调用方存回这里)。**必须在
     /// `wind_down` 里一并 abort**——理由和上面 `automation` 那条一模一样:
@@ -611,23 +620,43 @@ impl TabContent {
             .and_then(|p| p.cwd.clone())
     }
 
-    /// D6:这个标签的 sftp 该蹭哪条连接。`Terminal` 蹭会话已建立的连接
-    /// (`ws.hosts.first()`);`Files` 独占自己的(`establish` 来的那条,
-    /// ADR-010 同款理由)。`Terminal` 分支理论上可能是 `None`(连接尚未真正
-    /// 建立完成的极短窗口;测试脚手架也会构造出空 `hosts` 的 `Workspace`)。
+    /// F132:焦点分屏挂在 `ws.hosts` 的哪一台上。SFTP 节点标签/占位标签
+    /// 没有终端,恒 `None`。
+    fn focused_pane_host_ix(&self) -> Option<usize> {
+        self.as_terminal()
+            .and_then(|t| t.ws.focused())
+            .map(|p| p.host_ix)
+    }
+
+    /// F132:这条 sftp channel **记录在案**开在哪台机器上(`accept_sftp_opened`
+    /// 写入)。`Files` 恒 `None`——它的连接独占,`sftp_connection_for` 不看
+    /// 这个值。
     ///
-    /// `hosts[0]` 是**这个标签的主连接**,而不是「第 0 次建立的连接」——
-    /// 断线重连就地替换它的 `handle`(见 `UserEvent::PaneReconnected`),所以
-    /// 重连之后这里取到的仍是活的那条。F128 早期版本走的是 push 新连接那条
-    /// 路,`hosts[0]` 从此指向死连接,症状是重连之后文件面板永久打不开。
+    /// 用于取跟已开 sftp client **同一台**的 `SshConnection`(删除的 exec
+    /// 快路径 / 传输 worker 各自开的 channel)——不能改用
+    /// `focused_pane_host_ix()`:焦点分屏随时可能已经换到别的机器,那样会让
+    /// `client`(host A 的 sftp 会话)和 `conn`(host B 的连接)错配到两台
+    /// 不同的机器上。
+    fn sftp_host_ix(&self) -> Option<usize> {
+        self.as_terminal().and_then(|t| t.sftp_host_ix)
+    }
+
+    /// D6/F132:这个标签的 sftp 该蹭哪条连接。
     ///
-    /// **换节点(B2-b)之后这里仍指第一台机器**:那时 `hosts` 里真有两台,
-    /// 而侧栏只有一份。属于既有限制(D6 起就是如此),不是重连引入的 ——
-    /// 真要按聚焦 pane 取,得先解决「`t.sftp` 这条已开的 channel 属于哪台」,
-    /// 否则会出现 client 来自 A、conn 来自 B 的错配。
-    fn sftp_connection(&self) -> Option<Arc<SshConnection>> {
+    /// `host_ix` = 要开在哪台上(`None` 或越界时落回 `hosts[0]`,也就是
+    /// 这个标签的主连接)。`Files` 宿主独占自己那条(ADR-010),不看 `host_ix`。
+    ///
+    /// `hosts[ix]` 在断线重连时是**就地替换** `handle`(见
+    /// `UserEvent::PaneReconnected`),所以重连之后这里取到的仍是活的那条。
+    fn sftp_connection_for(&self, host_ix: Option<usize>) -> Option<Arc<SshConnection>> {
         match self {
-            TabContent::Terminal(t) => t.ws.hosts.first().map(|h| h.handle.clone()),
+            TabContent::Terminal(t) => {
+                let ix = host_ix.unwrap_or(0);
+                t.ws.hosts
+                    .get(ix)
+                    .or_else(|| t.ws.hosts.first())
+                    .map(|h| h.handle.clone())
+            }
             TabContent::Files(f) => Some(f.conn.clone()),
             TabContent::Restored(_) => None,
         }
@@ -3000,7 +3029,7 @@ impl App {
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
             return;
         };
-        let conn = tab.content.sftp_connection();
+        let conn = tab.content.sftp_connection_for(tab.content.sftp_host_ix());
         let proxy = self.proxy.clone();
         let task = self._runtime.spawn(async move {
             let result = match op {
@@ -3621,7 +3650,7 @@ impl App {
                 self.transfer_queue.cancel(id);
                 continue;
             };
-            let Some(conn) = tab.content.sftp_connection() else {
+            let Some(conn) = tab.content.sftp_connection_for(tab.content.sftp_host_ix()) else {
                 self.transfer_queue.finish(id, Err("连接已断开".into()));
                 continue;
             };
@@ -3704,16 +3733,16 @@ impl App {
 
     /// F50/D6:首次要远端数据(或者上一次开失败、用户又点了一下)时,开一条
     /// sftp channel。结果经 `UserEvent::SftpOpened` 回来(`accept_sftp_opened`
-    /// 接)。两种宿主取连接的来源不同(`TabContent::sftp_connection` 已经把
-    /// 差异收掉):
+    /// 接)。两种宿主取连接的来源不同(`TabContent::sftp_connection_for` 已经
+    /// 把差异收掉):
     /// - `Terminal`(侧栏,D1 之前就有):蹭会话已建立的连接
     ///   (`SftpClient::open` 的签名里刻意没有网络参数),不重新握手。取
-    ///   `hosts.first()` = 这个标签的主连接(断线重连会**就地替换**它,不是
-    ///   另 push 一条,见 `TabContent::sftp_connection` 的文档)。用户按
-    ///   「换节点」把某块 pane 挪到第二台机器上之后,侧栏仍连第一台 ——
-    ///   既有限制,同一处文档里写清了为什么不顺手改。
+    ///   `焦点分屏所在那台`(F132,`focused_pane_host_ix`)——用户按「换节点」
+    ///   把某块 pane 挪到第二台机器上之后,新开的侧栏该连它此刻正看着的那台,
+    ///   不是这个标签最早建立的那台。真实归属要等 channel 打开成功才落
+    ///   `sftp_host_ix`(`accept_sftp_opened`),这里只是**发起**用的意图。
     /// - `Files`(D1 标签宿主):独占的连接(`establish` 单独建的那条,
-    ///   ADR-010 同款理由),`sftp_connection` 恒 `Some`。
+    ///   ADR-010 同款理由),`sftp_connection_for` 不看 `host_ix`,恒 `Some`。
     fn trigger_sftp_open(&mut self, generation: u64) {
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
@@ -3727,7 +3756,8 @@ impl App {
             // 已经开好了,或者已经在开的路上——别在下一帧/下一次点击重复触发。
             return;
         }
-        let Some(conn) = tab.content.sftp_connection() else {
+        let host_ix = tab.content.focused_pane_host_ix();
+        let Some(conn) = tab.content.sftp_connection_for(host_ix) else {
             return;
         };
         let default_remote = tab.content.sftp_default_remote();
@@ -3743,6 +3773,7 @@ impl App {
             &self._runtime,
             &self.proxy,
             generation,
+            host_ix,
             conn,
             default_remote,
             pane_cwd,
@@ -3756,6 +3787,7 @@ impl App {
     fn accept_sftp_opened(
         &mut self,
         generation: u64,
+        host_ix: Option<usize>,
         result: Result<
             (
                 Arc<mullion_ssh::sftp::SftpClient>,
@@ -3777,6 +3809,16 @@ impl App {
                         return;
                     };
                     *slot = Some(client.clone());
+                    // F132:记住这条 channel 的真实归属。**在这里记,不在发起处**
+                    // —— 开 channel 是一次网络往返,期间焦点分屏可能已经换了。
+                    // 直接匹配 `TabContent::Terminal` 变体(不借那个「只认终端
+                    // 标签」的专用访问器,理由见 `file_actions_never_narrow_…`
+                    // 那条守护的文档)——`sftp_host_ix` 是 `TerminalTab` 独有
+                    // 字段,`FilesTab` 没有也不需要这个概念,不属于要跨变体
+                    // 共享的那六条通用行为,不踩那条守护的意图。
+                    if let TabContent::Terminal(t) = &mut tab.content {
+                        t.sftp_host_ix = host_ix;
+                    }
                     // F123:登录目录存下来,给「侧栏关→开跃迁」那条路展开 `~`。
                     tab.content.set_sftp_home(home);
                     let Some(files) = tab.content.files_panel_mut() else {
@@ -5426,6 +5468,7 @@ impl ApplicationHandler<UserEvent> for App {
                             sftp_prefs.bookmarks,
                         ),
                         sftp: None,
+                        sftp_host_ix: None,
                         sftp_tasks: Vec::new(),
                         sftp_default_remote: sftp_prefs.default_remote,
                         sftp_home: None,
@@ -5923,8 +5966,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.accept_automation_done(generation, pane, outcome);
             }
             UserEvent::TunnelState { id, state } => self.accept_tunnel_state(id, state),
-            UserEvent::SftpOpened { generation, result } => {
-                self.accept_sftp_opened(generation, result);
+            UserEvent::SftpOpened {
+                generation,
+                host_ix,
+                result,
+            } => {
+                self.accept_sftp_opened(generation, host_ix, result);
             }
             UserEvent::SftpListed {
                 generation,
@@ -7930,6 +7977,43 @@ fn sync_target_of(
     Some((gen, dir))
 }
 
+/// F132:「文件侧栏关→开」那一帧该做什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SyncPlan {
+    /// 什么都不做(还没连上 / pane 没报过目录)。
+    Nothing,
+    /// 同一台机器,只把远端栏带到这个目录。
+    Goto(String),
+    /// 焦点分屏在**另一台**机器上:摘掉现在这条 sftp channel,在那台上重开。
+    Reopen,
+}
+
+/// [`SyncPlan`] 的判定。纯函数 —— `App` 要 `EventLoopProxy`,无头测试里
+/// 造不出来,只有把判定摘出来才验得了。
+///
+/// `focus_host_ix` 为 `None` = 这个标签没有终端(SFTP 节点标签),
+/// 「焦点分屏在哪台」无从谈起,不重开。
+fn sync_plan_of(
+    has_client: bool,
+    sftp_host_ix: Option<usize>,
+    focus_host_ix: Option<usize>,
+    pane_cwd: Option<&[u8]>,
+    home: Option<&[u8]>,
+) -> SyncPlan {
+    if !has_client {
+        return SyncPlan::Nothing;
+    }
+    if let Some(fix) = focus_host_ix {
+        if sftp_host_ix != Some(fix) {
+            return SyncPlan::Reopen;
+        }
+    }
+    match files_start_dir(pane_cwd, None, home) {
+        Some(dir) => SyncPlan::Goto(dir),
+        None => SyncPlan::Nothing,
+    }
+}
+
 /// F120:`spawn_sftp_open` 该从哪个目录起步——配置了默认远端目录(编辑器
 /// 「SFTP」分节)就用它,没配置(`None`)落回登录目录(`.`)。
 ///
@@ -7963,10 +8047,15 @@ fn configured_remote_dir(configured: Option<&str>) -> mullion_ssh::sftp::RemoteP
 /// 目录的计算(`files_start_dir`)挪到了这里 —— `~` 展开要用远端的真登录
 /// 目录,而那个值只有 `canonicalize(".")` 回来之后才知道,调用方那一侧
 /// 算不了。
+///
+/// `host_ix`(F132):`handle` 对应 `ws.hosts` 的哪一台,原样带在
+/// `UserEvent::SftpOpened` 里回去,让 `accept_sftp_opened` 记下这条 channel
+/// 的真实归属——开 channel 期间用户可能已经换了焦点分屏,不能等回来时现算。
 fn spawn_sftp_open(
     runtime: &Runtime,
     proxy: &EventLoopProxy<UserEvent>,
     generation: u64,
+    host_ix: Option<usize>,
     handle: Arc<SshConnection>,
     default_remote: Option<String>,
     pane_cwd: Option<Vec<u8>>,
@@ -8022,7 +8111,11 @@ fn spawn_sftp_open(
             }
             Err(e) => Err(format!("打开 SFTP 失败:{e}")),
         };
-        let _ = proxy.send_event(UserEvent::SftpOpened { generation, result });
+        let _ = proxy.send_event(UserEvent::SftpOpened {
+            generation,
+            host_ix,
+            result,
+        });
     })
 }
 
@@ -8741,8 +8834,8 @@ mod tests {
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, font_px_for, has_real_action, ime_cursor_area,
         next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
-        snapshot_tabs_of, sync_target_of, sync_timeout_wake_at, tab_title, upload_job, wind_down,
-        Modal, RestoredTab, Tab, TabContent, TerminalTab,
+        snapshot_tabs_of, sync_plan_of, sync_target_of, sync_timeout_wake_at, tab_title,
+        upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -11161,6 +11254,7 @@ mod tests {
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
+                sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
                 sftp_home: None,
@@ -12531,6 +12625,7 @@ mod tests {
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
+                sftp_host_ix: None,
                 sftp_tasks: vec![task],
                 sftp_default_remote: None,
                 sftp_home: None,
@@ -12616,6 +12711,7 @@ mod tests {
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
+                sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
                 sftp_home: None,
@@ -13363,6 +13459,7 @@ mod tests {
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
+                sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: configured.map(|s| s.to_string()),
                 sftp_home: None,
@@ -13697,6 +13794,73 @@ mod tests {
         assert!(
             body.contains("set_sftp_home("),
             "登录目录没被存下来 —— 侧栏「关→开」跃迁那条路展不开 ~"
+        );
+    }
+
+    /// F132:这条 sftp channel 到底开在哪台机器上,必须在**打开成功回来的
+    /// 那一刻**记下(`accept_sftp_opened`),而不是发起时就写。
+    ///
+    /// 开 channel 是一次真实网络往返,期间用户完全可能又换了焦点分屏;
+    /// 发起时写的话,`sftp_host_ix` 记的是「最后一次发起的意图」,而不是
+    /// 「手上这条 client 的真实归属」——之后的比对全部错位,症状是换节点后
+    /// 侧栏时对时不对,查都没法查。
+    ///
+    /// 扎的是源码结构:真验它要一条活 sftp 连接,这个测试容器里造不出来
+    /// (同本文件其余几条接线守护)。
+    ///
+    /// 自证会变红:把 `t.sftp_host_ix = host_ix;` 从 `accept_sftp_opened`
+    /// 挪进 `trigger_sftp_open`。
+    #[test]
+    fn the_sftp_host_is_recorded_when_the_channel_opens_not_when_it_is_requested() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(prod.len() < src.len(), "范围没切到 mod tests 之前");
+        let at = prod
+            .find("    fn accept_sftp_opened(")
+            .expect("找不到 accept_sftp_opened");
+        let body = &prod[at..];
+        let end = body.find("\n    }\n").expect("找不到函数结尾");
+        assert!(
+            body[..end].contains("sftp_host_ix = host_ix"),
+            "accept_sftp_opened 里没记 sftp_host_ix —— 换节点后的比对会永远错位"
+        );
+    }
+
+    /// F132:「侧栏关→开」那一帧该做什么,三选一。这是这条改动里唯一测得动
+    /// 的核心逻辑(`App` 本身要 `EventLoopProxy`,无头容器造不出来)。
+    ///
+    /// 自证会变红:把 `sync_plan_of` 里 host 比对那一支删掉 —— 第三条断言
+    /// 会从 `Reopen` 变成 `Goto`,也就是回到「路径对了、机器错了」那个 bug。
+    #[test]
+    fn the_open_edge_reopens_sftp_only_when_the_focused_pane_is_on_another_host() {
+        // 还没连上:什么都不做(`trigger_sftp_open` 那条路负责起步)。
+        assert_eq!(
+            sync_plan_of(false, None, Some(0), Some(b"/srv"), Some(b"/home/dev")),
+            SyncPlan::Nothing
+        );
+        // 同一台:只同步目录。
+        assert_eq!(
+            sync_plan_of(true, Some(0), Some(0), Some(b"/srv"), Some(b"/home/dev")),
+            SyncPlan::Goto("/srv".into())
+        );
+        // 换过节点的分屏:必须重开,否则连的是第一台机器、路径却来自第二台。
+        assert_eq!(
+            sync_plan_of(true, Some(0), Some(1), Some(b"/srv"), Some(b"/home/dev")),
+            SyncPlan::Reopen
+        );
+        // SFTP 节点标签(没有终端,拿不到 host_ix):照旧只同步目录。
+        assert_eq!(
+            sync_plan_of(true, Some(0), None, Some(b"/srv"), Some(b"/home/dev")),
+            SyncPlan::Goto("/srv".into())
+        );
+        // 同一台但 pane 没报过目录:什么都不做,不能把用户当前浏览的位置
+        // 拽回一个猜出来的目录。
+        assert_eq!(
+            sync_plan_of(true, Some(0), Some(0), None, Some(b"/home/dev")),
+            SyncPlan::Nothing
         );
     }
 
