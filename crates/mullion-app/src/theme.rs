@@ -96,6 +96,17 @@ pub struct Theme {
     pub icon_link: Rgb,
     /// 其他:中性灰。
     pub icon_other: Rgb,
+    /// F133:PDF。红,对齐 Windows 上的既有心智。
+    pub icon_pdf: Rgb,
+    /// F133:Word 文档(doc/docx)。蓝。
+    pub icon_word: Rgb,
+    /// F133:表格(xls/xlsx/csv)。绿。
+    pub icon_excel: Rgb,
+    /// F133:演示文稿(ppt/pptx)。橙。
+    pub icon_slides: Rgb,
+    /// F134:普通文件的默认图标色。中性,比 `icon_other`(设备/socket)亮 ——
+    /// 「不认识的普通文件」是绝大多数,不该跟极少数特殊类型抢注意力。
+    pub icon_file: Rgb,
 
     // --- 终端色(§2.4) ---
     pub term_bg: Rgb,
@@ -142,6 +153,11 @@ pub const MULLION_DARK: Theme = Theme {
     // 比 `fg_dimmer`(0x8a90a8)亮一档:两者同值的话,「可操作的 other」
     // 和「不可操作的 other」在屏上一模一样,`color_for` 的灰化就失效了。
     icon_other: Rgb::new(0xa8, 0xae, 0xc4),
+    icon_pdf: Rgb::new(0xe2, 0x6d, 0x6d),
+    icon_word: Rgb::new(0x5b, 0x9c, 0xf0),
+    icon_excel: Rgb::new(0x4f, 0xb3, 0x72),
+    icon_slides: Rgb::new(0xe8, 0x8b, 0x3d),
+    icon_file: Rgb::new(0xc2, 0xc8, 0xd8),
 
     // 与 panel_bg 同值:终端就是最大的那块 panel。
     term_bg: Rgb::new(0x14, 0x16, 0x1f),
@@ -661,6 +677,11 @@ mod tests {
             ("exec", t.icon_exec),
             ("link", t.icon_link),
             ("other", t.icon_other),
+            ("pdf", t.icon_pdf),
+            ("word", t.icon_word),
+            ("excel", t.icon_excel),
+            ("slides", t.icon_slides),
+            ("file", t.icon_file),
         ] {
             let ratio = contrast_ratio(c, t.panel_bg);
             assert!(ratio >= 3.0, "{name} 在面板底上只有 {ratio:.2}:1");
@@ -680,6 +701,11 @@ mod tests {
             t.icon_exec,
             t.icon_link,
             t.icon_other,
+            t.icon_pdf,
+            t.icon_word,
+            t.icon_excel,
+            t.icon_slides,
+            t.icon_file,
         ];
         for i in 0..all.len() {
             for j in (i + 1)..all.len() {
