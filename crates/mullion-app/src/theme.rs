@@ -154,9 +154,14 @@ pub const MULLION_DARK: Theme = Theme {
     // 和「不可操作的 other」在屏上一模一样,`color_for` 的灰化就失效了。
     icon_other: Rgb::new(0xa8, 0xae, 0xc4),
     icon_pdf: Rgb::new(0xe2, 0x6d, 0x6d),
-    icon_word: Rgb::new(0x5b, 0x9c, 0xf0),
-    icon_excel: Rgb::new(0x4f, 0xb3, 0x72),
-    icon_slides: Rgb::new(0xe8, 0x8b, 0x3d),
+    // 原定 #5b9cf0 与既有 icon_dir(#6fa8ff)RGB 欧氏距离仅 ≈28,同屏易混
+    // (目录和 docx 是常见组合);往更深更饱和的蓝调开,拉到 ≈91。
+    icon_word: Rgb::new(0x2f, 0x6f, 0xe0),
+    // 原定 #4fb372 与既有 icon_image(#5fc28a)距离仅 ≈33;调深调纯,拉到 ≈105。
+    icon_excel: Rgb::new(0x1f, 0x8a, 0x4c),
+    // 原定 #e88b3d 与既有 icon_archive(#e09a4a)距离仅 ≈21(zip 和 pptx 常见
+    // 同屏);往更红更饱和的橙调开,拉到 ≈68。
+    icon_slides: Rgb::new(0xf2, 0x69, 0x1f),
     icon_file: Rgb::new(0xc2, 0xc8, 0xd8),
 
     // 与 panel_bg 同值:终端就是最大的那块 panel。
@@ -688,7 +693,15 @@ mod tests {
         }
     }
 
-    /// F127:8 类颜色必须两两不同 —— 两类同色等于少一类。
+    /// F127:13 类颜色必须两两不同 —— 两类同色等于少一类。
+    ///
+    /// **这条只保证「不完全相等」,保证不了「肉眼可区分」**:已知既有色里
+    /// `icon_doc`(#9aa8c4)与 `icon_other`(#a8aec4)的 RGB 欧氏距离仅
+    /// ≈15.2,同屏出现(普通文件混在文档列表里)时其实很难分辨,是已知技术债。
+    /// 没在这里加距离阈值断言 —— 阈值只能设成这个既有最小值,加了不产生新约束;
+    /// 设更大的值会反过来要求改既有色,而 UI 视觉规格(色板全表)是冻结的,
+    /// 既有色不许动。F133/F134 新加的三色(word/excel/slides)已人工核实
+    /// 各自与最近既有色的距离 ≥ 40(分别 ≈91/≈105/≈68),不会加重这个债。
     #[test]
     fn file_icon_colors_are_all_distinct() {
         let t = MULLION_DARK;
