@@ -12,7 +12,7 @@
 //! 更让人以为是 bug。
 
 use mullion_core::layout::PaneId;
-use mullion_store::{ColorTarget, Protocol, SessionId, SessionRecord};
+use mullion_store::{ColorTarget, GroupRecord, Protocol, SessionId, SessionRecord};
 
 use crate::theme::{self, Theme};
 
@@ -75,11 +75,21 @@ fn matches(rec: &SessionRecord, needle: &str) -> bool {
     rec.identity.name.to_lowercase().contains(&n) || rec.connection.host.to_lowercase().contains(&n)
 }
 
-/// 这一帧该列出哪些会话。纯函数,便于单测「过滤规则」本身。
-fn visible<'a>(sessions: &'a [SessionRecord], needle: &str) -> Vec<&'a SessionRecord> {
-    sessions
-        .iter()
-        .filter(|r| r.connection.protocol == Protocol::Ssh)
+/// 这一帧该列出哪些会话。**顺序来自会话管理器左栏的 `visible_order`**——
+/// 两边各排一套的话,左栏里挨着的两条在这儿会隔着半屏,而用户是照着左栏的
+/// 记忆找的(F130)。搜索词传空:借它的**顺序**,不借它的过滤规则(左栏还搜
+/// 标签,这里只搜名字和地址)。
+///
+/// `Protocol::Ssh` 同时替掉了原先那道协议过滤:SFTP 节点没有 PTY,换过去
+/// 只有一块永远不出字的黑屏。
+fn visible<'a>(
+    sessions: &'a [SessionRecord],
+    groups: &[GroupRecord],
+    needle: &str,
+) -> Vec<&'a SessionRecord> {
+    crate::ui::session_manager::list::visible_order(sessions, groups, "", Protocol::Ssh)
+        .into_iter()
+        .filter_map(|id| sessions.iter().find(|r| r.id == id))
         .filter(|r| matches(r, needle))
         .collect()
 }
@@ -133,6 +143,7 @@ pub fn show(
     t: &Theme,
     draft: &mut Option<RehostDraft>,
     sessions: &[SessionRecord],
+    groups: &[GroupRecord],
     appearance: &crate::ui::badge::AppearanceCache,
     pane_rect: Option<egui::Rect>,
 ) -> Option<RehostAction> {
@@ -171,7 +182,7 @@ pub fn show(
                             .desired_width(field_w),
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
-                    let rows = visible(sessions, &d.filter);
+                    let rows = visible(sessions, groups, &d.filter);
                     if rows.is_empty() {
                         ui.label(
                             egui::RichText::new("没有可用的 SSH 会话")
@@ -267,7 +278,15 @@ mod tests {
                     ..base()
                 },
                 |ctx| {
-                    show(ctx, &MULLION_DARK, draft, sessions, &cache, Some(pane()));
+                    show(
+                        ctx,
+                        &MULLION_DARK,
+                        draft,
+                        sessions,
+                        &[],
+                        &cache,
+                        Some(pane()),
+                    );
                 },
             );
         }
@@ -299,7 +318,15 @@ mod tests {
                 ..base()
             },
             |ctx| {
-                out = show(ctx, &MULLION_DARK, draft, sessions, &cache, Some(pane()));
+                out = show(
+                    ctx,
+                    &MULLION_DARK,
+                    draft,
+                    sessions,
+                    &[],
+                    &cache,
+                    Some(pane()),
+                );
             },
         );
         out
@@ -336,6 +363,7 @@ mod tests {
                         &MULLION_DARK,
                         &mut draft,
                         &sessions,
+                        &[],
                         &cache,
                         Some(pane()),
                     );
@@ -385,12 +413,68 @@ mod tests {
             rec(8, "files", "10.0.0.2", Protocol::Sftp),
         ];
         assert_eq!(
-            visible(&sessions, "")
+            visible(&sessions, &[], "")
                 .iter()
                 .map(|r| r.id)
                 .collect::<Vec<_>>(),
             vec![SessionId(7)],
             "SFTP 节点不该出现在换节点列表里"
+        );
+    }
+
+    /// F130:弹窗的行顺序必须跟会话管理器左栏一模一样。两边各排一套的话,
+    /// 左栏里挨着的两条在这儿可能隔着半屏 —— 而用户是照着左栏的记忆找的。
+    ///
+    /// 顺序的唯一真值来源是 `list::visible_order`(左栏渲染与键盘导航也用它)。
+    ///
+    /// fixture 刻意让**数组顺序与分组顺序相反**:`sessions` 里 7、8、9 依次是
+    /// 未分组、组 2、组 1,而 `groups` 是 [组 1, 组 2]。照数组顺序出是
+    /// [7,8,9],照分组出是 [9,8,7] —— 不这么造的话这条断言在旧实现下也是绿的。
+    ///
+    /// 自证会变红:把 `visible` 改回 `sessions.iter().filter(..)`。
+    #[test]
+    fn rows_are_ordered_exactly_like_the_session_manager_list() {
+        use mullion_store::{GroupId, GroupRecord};
+
+        let groups = vec![
+            GroupRecord {
+                id: GroupId(1),
+                name: "一组".into(),
+                tags: Vec::new(),
+                terminal: Default::default(),
+                appearance: Default::default(),
+                network: Default::default(),
+                automation: Default::default(),
+            },
+            GroupRecord {
+                id: GroupId(2),
+                name: "二组".into(),
+                tags: Vec::new(),
+                terminal: Default::default(),
+                appearance: Default::default(),
+                network: Default::default(),
+                automation: Default::default(),
+            },
+        ];
+        let mut a = rec(7, "未分组", "10.0.0.7", Protocol::Ssh);
+        let mut b = rec(8, "二组的", "10.0.0.8", Protocol::Ssh);
+        let mut c = rec(9, "一组的", "10.0.0.9", Protocol::Ssh);
+        a.identity.group_id = None;
+        b.identity.group_id = Some(GroupId(2));
+        c.identity.group_id = Some(GroupId(1));
+        let sessions = vec![a, b, c];
+
+        let got: Vec<SessionId> = visible(&sessions, &groups, "")
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let want =
+            crate::ui::session_manager::list::visible_order(&sessions, &groups, "", Protocol::Ssh);
+        assert_eq!(got, want, "换节点弹窗的顺序跟左栏对不上");
+        assert_eq!(
+            got,
+            vec![SessionId(9), SessionId(8), SessionId(7)],
+            "分组顺序没生效 —— fixture 或实现有一处没按分组排"
         );
     }
 
@@ -404,9 +488,9 @@ mod tests {
             rec(7, "生产机", "10.0.0.7", Protocol::Ssh),
             rec(8, "测试机", "192.168.1.8", Protocol::Ssh),
         ];
-        assert_eq!(visible(&sessions, "").len(), 2, "空搜索词该全放行");
+        assert_eq!(visible(&sessions, &[], "").len(), 2, "空搜索词该全放行");
         assert_eq!(
-            visible(&sessions, "生产")
+            visible(&sessions, &[], "生产")
                 .iter()
                 .map(|r| r.id)
                 .collect::<Vec<_>>(),
@@ -414,7 +498,7 @@ mod tests {
             "按名字搜不到"
         );
         assert_eq!(
-            visible(&sessions, "192.168")
+            visible(&sessions, &[], "192.168")
                 .iter()
                 .map(|r| r.id)
                 .collect::<Vec<_>>(),

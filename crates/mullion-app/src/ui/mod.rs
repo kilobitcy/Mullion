@@ -783,6 +783,7 @@ pub fn build_ui(
         t,
         &mut ui_state.rehost,
         frame.sessions,
+        frame.groups,
         frame.appearance,
         rehost_rect,
     );
