@@ -608,10 +608,19 @@ impl TabContent {
     }
 
     /// D6:这个标签的 sftp 该蹭哪条连接。`Terminal` 蹭会话已建立的连接
-    /// (`ws.hosts.first()`,ADR-009 下今天恒为其一);`Files` 独占自己的
-    /// (`establish` 来的那条,ADR-010 同款理由)。`Terminal` 分支理论上可能是
-    /// `None`(连接尚未真正建立完成的极短窗口;测试脚手架也会构造出空
-    /// `hosts` 的 `Workspace`)。
+    /// (`ws.hosts.first()`);`Files` 独占自己的(`establish` 来的那条,
+    /// ADR-010 同款理由)。`Terminal` 分支理论上可能是 `None`(连接尚未真正
+    /// 建立完成的极短窗口;测试脚手架也会构造出空 `hosts` 的 `Workspace`)。
+    ///
+    /// `hosts[0]` 是**这个标签的主连接**,而不是「第 0 次建立的连接」——
+    /// 断线重连就地替换它的 `handle`(见 `UserEvent::PaneReconnected`),所以
+    /// 重连之后这里取到的仍是活的那条。F128 早期版本走的是 push 新连接那条
+    /// 路,`hosts[0]` 从此指向死连接,症状是重连之后文件面板永久打不开。
+    ///
+    /// **换节点(B2-b)之后这里仍指第一台机器**:那时 `hosts` 里真有两台,
+    /// 而侧栏只有一份。属于既有限制(D6 起就是如此),不是重连引入的 ——
+    /// 真要按聚焦 pane 取,得先解决「`t.sftp` 这条已开的 channel 属于哪台」,
+    /// 否则会出现 client 来自 A、conn 来自 B 的错配。
     fn sftp_connection(&self) -> Option<Arc<SshConnection>> {
         match self {
             TabContent::Terminal(t) => t.ws.hosts.first().map(|h| h.handle.clone()),
@@ -3636,10 +3645,10 @@ impl App {
     /// 差异收掉):
     /// - `Terminal`(侧栏,D1 之前就有):蹭会话已建立的连接
     ///   (`SftpClient::open` 的签名里刻意没有网络参数),不重新握手。取
-    ///   `hosts.first()` 而不是「聚焦 pane 那台」,前提是 ADR-009 下
-    ///   `PaneState::host_ix` 目前**恒为 0**(一个 workspace 事实上只挂一条
-    ///   连接),二者今天等价。等多主机分屏真落地,这里要跟着改成按聚焦 pane
-    ///   取——否则侧栏会连到另一台机器上,而用户看不出来。
+    ///   `hosts.first()` = 这个标签的主连接(断线重连会**就地替换**它,不是
+    ///   另 push 一条,见 `TabContent::sftp_connection` 的文档)。用户按
+    ///   「换节点」把某块 pane 挪到第二台机器上之后,侧栏仍连第一台 ——
+    ///   既有限制,同一处文档里写清了为什么不顺手改。
     /// - `Files`(D1 标签宿主):独占的连接(`establish` 单独建的那条,
     ///   ADR-010 同款理由),`sftp_connection` 恒 `Some`。
     fn trigger_sftp_open(&mut self, generation: u64) {
@@ -5590,31 +5599,15 @@ impl ApplicationHandler<UserEvent> for App {
                     .by_generation_mut(generation)
                     .and_then(|t| t.content.as_terminal_mut())
                 {
-                    // 旧的 `HostConn` 已经死了,但不能原地替换掉:别的 pane
-                    // 可能还引用着它的 ix(比如同一台机器上有 pane 是用户
-                    // 敲了 `exit` 的 `Disconnected`,那块不该被拖着换)。
-                    // push 一条新的,只把这次重连的 pane 指过去。
-                    let old = &t.ws.hosts[host_ix];
-                    let (label, addr, session_id) =
-                        (old.label.clone(), old.addr.clone(), old.session_id);
-                    t.ws.hosts.push(crate::shell::workspace::HostConn {
-                        label,
-                        addr,
-                        session_id,
-                        handle,
-                        // F124:新连接 = 新的 tmux 服务器状态,自举重来一遍
-                        // (`tmux set -g` 幂等,重发无副作用)。
-                        tmux_bootstrap: Default::default(),
-                        tmux_last_try: None,
-                    });
-                    let new_ix = t.ws.hosts.len() - 1;
+                    // pane 先挂到新 channel 上。`host_ix` **不变** —— 重连换的
+                    // 是同一台机器的连接,不是换机器,那个下标本来就还是它。
                     for (id, ssh, rx) in channels {
                         let ssh = Arc::new(ssh);
                         if reattach_pane(
                             &mut t.ws,
                             id,
                             generation,
-                            new_ix,
+                            host_ix,
                             Box::new(ssh.clone()),
                             rx,
                         ) {
@@ -5622,16 +5615,44 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     if attached.is_empty() {
-                        // 拨号那几秒里这条连接上的 pane 全被用户关掉了——刚 push
-                        // 的这条 HostConn 没人指,必须撤掉,否则占着一条不关的
-                        // 连接挂到整个标签关闭为止(pop 的前提同 `PaneRehosted`:
-                        // push 到这里之间没有 `.await`、没有别的地方能插入
-                        // `ws.hosts.push`)。
-                        t.ws.hosts.pop();
+                        // 拨号那几秒里这条连接上的 pane 全被用户关掉了 ——
+                        // 新连接没人要,**不替换**,`handle` 随这个分支结束而
+                        // Drop(Drop 即断连)。旧的死 `HostConn` 原样留着:
+                        // 它至少还带着 label/addr/cfg,下次真有 pane 要重连时
+                        // 还用得上。
                         log::warn!(
                             target: "mullion",
                             "重连:host {host_ix}(世代 {generation})拨号途中所有 pane 都没了,丢弃新连接",
                         );
+                    } else if let Some(h) = t.ws.hosts.get_mut(host_ix) {
+                        // **就地替换,绝不 push**:`hosts[ix]` 的语义是「第 ix
+                        // **台机器**的当前连接」,不是「第 ix 次建立的连接」。
+                        // push 一条新的会让 `hosts[0]` 不再是这个标签的主连接,
+                        // 而认着这个下标的地方一个都不会跟着走 ——
+                        // `TabContent::sftp_connection`(文件面板)、
+                        // `spawn_fresh_panes`(分屏开 channel)、`PaneOpened` 里
+                        // 硬编的 `host_ix: 0` 全都会指向刚断掉的那条死连接,
+                        // 症状是重连之后文件面板永久打不开、新开的分屏必然失败,
+                        // 而终端本身工作正常,用户完全看不出成因。
+                        //
+                        // 旧的那条 `HostConn` 在这次赋值里 Drop —— Drop 即断连,
+                        // 而它本来就已经死了(`rx_closed_action` 的重连判据就是
+                        // 「传输层没了」),不留孤儿。
+                        //
+                        // 同一台机器上那些用户敲过 `exit` 的 `Disconnected` pane
+                        // **不会被拖着换**:它们的 `host_ix` 仍指这里,但状态机
+                        // 走的是 `rx_closed_action(link_alive(..))` —— 连接活了
+                        // 之后返回的是 `UserExited`,状态原样是 `Disconnected`。
+                        // 它们的 `pty`/`rx` 还是旧的死 channel,写入静默失败,
+                        // 与替换前完全一致。
+                        //
+                        // `label`/`addr`/`session_id`/`cfg` 原样留着:同一台机器,
+                        // 这四样本来就该一样(旧实现也是从旧的那条复制过来的)。
+                        h.handle = handle;
+                        // F124:新连接 = 新的 tmux 服务器状态,自举重来一遍
+                        // (`tmux set -g` 幂等,重发无副作用)。
+                        h.tmux_bootstrap = Default::default();
+                        h.tmux_last_try = None;
                     }
                     // 死掉的那条连接上开的 SFTP channel 一起完蛋 —— 留着的话
                     // 侧栏每次操作静默失败,用户看到的是「文件面板卡住了」。
@@ -7620,9 +7641,13 @@ fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
 ///
 /// **旧的 `HostConn` 留在 `hosts` 里不摘**:`host_ix` 是**下标即身份**,摘掉
 /// 一条会让排在它后面的所有 pane 的 `host_ix` 集体错位(指向另一台机器,输入
-/// 照发)。`hosts[0]` 还额外被 sftp 侧栏和 `last_cfg` 认着。代价是那条连接闲
-/// 置到整个标签关闭为止——换节点是低频操作,拿一条闲置连接换掉一整类静默的
-/// 错位 bug 是划算的。
+/// 照发)。`hosts[0]` 还额外被 sftp 侧栏认着。代价是那条连接闲置到整个标签
+/// 关闭为止——换节点是低频操作,拿一条闲置连接换掉一整类静默的错位 bug
+/// 是划算的。
+///
+/// F128 补充:**只有换机器才 push**。断线重连走的是就地替换
+/// (`UserEvent::PaneReconnected`),因为那是同一台机器的连接换了一条,
+/// `hosts[ix]` 的语义始终是「第 ix **台机器**的当前连接」。理由详见那个分支。
 ///
 /// `host_ix` 由调用方现算(`ws.hosts.len() - 1`,刚 push 进去那条)。**不在这里
 /// push `HostConn`**:那个类型里揣着 `Arc<SshConnection>`,而 `SshConnection`
@@ -13682,17 +13707,25 @@ mod tests {
         assert!(body.contains("t.sftp_home = None;"));
     }
 
-    /// **接线守护 / F128**:拨号那几秒里这条连接上的 pane 全被用户关掉了
-    /// (`attached` 为空)时,刚 push 进 `ws.hosts` 的那条必须撤掉 —— 否则一条
-    /// 谁也不指的 `Arc<SshConnection>` 会一直占到标签关闭为止,完全静默。
-    /// 同一时刻也不该弹「已重新连接」的 toast —— 用户什么都没得到。
+    /// **接线守护 / F128**:重连必须**就地替换** `hosts[host_ix]` 的 handle,
+    /// 绝不往 `ws.hosts` 里 push 一条新的。
+    ///
+    /// push 的写法会让 `hosts[0]` 不再是这个标签的主连接,而认着这个下标的
+    /// 地方一个都不会跟着走:`TabContent::sftp_connection`(文件面板)、
+    /// `spawn_fresh_panes`(分屏开 channel)、`PaneOpened` 里硬编的
+    /// `host_ix: 0` 全都会继续指向刚断掉的那条**死**连接。症状是主链路
+    /// 自动重连之后文件面板永久打不开(`t.sftp = None` 让它每次重试、每次
+    /// 失败)、新开的分屏必然失败,而终端本身工作正常 —— 用户完全看不出成因。
+    /// 顺带:push 还会让 `hosts` 随每次断线单调增长,长期挂机攒下一堆死连接。
+    ///
+    /// 那条否定断言是这条测试的重点:光断言"有 get_mut"挡不住「两种都写、
+    /// 某个分支仍 push」。
     ///
     /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
     ///
-    /// 自证会变红:把 `if attached.is_empty() { ... }` 那段删掉,或者把
-    /// `set_toast` 挪出 `if reconnected { ... }`,改成无条件调用。
+    /// 自证会变红:把就地替换那几句换回 `t.ws.hosts.push(HostConn { .. })`。
     #[test]
-    fn reconnect_rolls_back_the_host_when_every_pane_vanished_mid_dial() {
+    fn reconnect_swaps_the_host_in_place_instead_of_appending_a_new_one() {
         let src = include_str!("app.rs");
         let start = concat!("UserEvent::Pane", "Reconnected {");
         let stop = concat!("UserEvent::Pane", "ReconnectErr {");
@@ -13707,8 +13740,50 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            body.contains("attached.is_empty()") && body.contains("hosts.pop()"),
-            "所有 pane 都没了时没有把刚 push 的 HostConn 撤掉"
+            body.contains("hosts.get_mut(host_ix)") && body.contains("h.handle = handle;"),
+            "重连没有就地替换 hosts[host_ix] 的 handle"
+        );
+        assert!(
+            !body.contains("hosts.push("),
+            "重连往 hosts 里 push 了新连接 —— hosts[0] 从此指向死连接,\
+             文件面板和分屏会静默挂在上面"
+        );
+        assert!(
+            body.contains("h.tmux_bootstrap = Default::default();"),
+            "换了连接却没重置 tmux 自举状态 —— 远端 tmux 服务器可能在断线\
+             期间重启过,状态上报再也配不上"
+        );
+    }
+
+    /// **接线守护 / F128**:拨号那几秒里这条连接上的 pane 全被用户关掉了
+    /// (`attached` 为空)时,**不能**把新连接装进 `hosts` —— 一条谁也不指的
+    /// `Arc<SshConnection>` 会一直占到标签关闭为止,完全静默。
+    /// 同一时刻也不该弹「已重新连接」的 toast —— 用户什么都没得到。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
+    ///
+    /// 自证会变红:把就地替换从 `else if` 里提出来,改成无条件执行;
+    /// 或者把 `set_toast` 挪出 `if reconnected { ... }`。
+    #[test]
+    fn reconnect_keeps_the_new_connection_out_when_every_pane_vanished_mid_dial() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("if attached.is_empty() {")
+                && body.contains("} else if let Some(h) = t.ws.hosts.get_mut(host_ix) {"),
+            "替换没有挂在「真的有 pane 接上」这个前提下 —— 一块 pane 都没接上时\
+             也会把新连接装进 hosts,占着不关"
         );
         assert!(
             body.contains("if reconnected {"),
