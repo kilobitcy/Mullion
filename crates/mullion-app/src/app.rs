@@ -5866,13 +5866,28 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     // 死掉的那条连接上开的 SFTP channel 一起完蛋 —— 留着的话
                     // 侧栏每次操作静默失败,用户看到的是「文件面板卡住了」。
+                    //
+                    // 这里 abort 是对的(连接真没了,任务再跑也只是等超时),
+                    // 但光 abort 不够:被硬杀的 worker 发不出 `TransferDone`、
+                    // 被硬杀的列目录也翻不动 `PaneState::load`。两个收尾各自补
+                    // 在下面 —— 队列在借用外 `cancel_transfers_of`,面板这里
+                    // `invalidate`(否则 `load` 永远停在 `Loading`,之后每次
+                    // `trigger_sftp_open` 都撞 `already_loading` 早退,侧栏
+                    // **永久**打不开,重连成功了也救不回来)。
                     for task in t.sftp_tasks.drain(..) {
                         task.abort();
                     }
                     t.sftp = None;
                     t.sftp_home = None;
+                    t.files.remote.invalidate();
                     template = t.automation_template.clone();
                 }
+                // 借用外:上面 abort 掉的传输 worker 不会再发 `TransferDone`,
+                // 队列里那几条会永久停在 `Running`,而 `take_runnable` 按
+                // `Running` 数占并发名额(默认 4)—— 断几次线就把全局传输堵死。
+                // 放在 abort **之后**:先杀任务再收口,中间不会有 worker 抢着
+                // 把状态从「已取消」改写成「失败」。
+                self.cancel_transfers_of(generation);
                 // 用户拍板:重连之后重跑登录后命令 —— 否则 tmux 不 attach,
                 // 断线前那个 Claude Code 会话回不来(这正是 F128 的初衷)。
                 // 跳过 tmux new-session 那类"开新会话"的步骤,规则同分屏新开的
@@ -14394,6 +14409,60 @@ mod tests {
             "没作废远端栏 —— load 留在 Loading 会让紧接着的 trigger_sftp_open\
              撞 already_loading 早退,而那之后 has_client 是 false、判定首行就\
              短路,没有任何自愈路径"
+        );
+    }
+
+    /// F128:断线重连把死连接上的 sftp 任务 abort 掉之后,**两处状态必须各自
+    /// 收口**,否则重连成功了侧栏也回不来。
+    ///
+    /// - `cancel_transfers_of`:被硬杀的传输 worker 再也发不出 `TransferDone`,
+    ///   队列里那几条永久停在 `Running`,而 `take_runnable` 按 `Running` 数占
+    ///   并发名额(默认 4)—— 断几次线就把全局传输堵死,只能重启。
+    /// - `files.remote.invalidate()`:被硬杀的列目录任务翻不动 `PaneState::load`
+    ///   (只有 `accept` 翻得动),留在 `Loading` 的话之后每次 `trigger_sftp_open`
+    ///   都撞 `already_loading` 早退,一个字节都不发,侧栏**永久**打不开。
+    ///
+    /// 与 F132 的 `reopen_sftp_on_focused_host` 是同一类失效、不同处置:那边
+    /// 连接还活着(只是换台机器),所以**不** abort、让传输跑完;这边连接真
+    /// 没了,abort 是对的,但得把两处状态收干净。
+    ///
+    /// 扎源码结构(要真断线才验得了)。**锚点必须拆开拼**(`concat!`):同一分支
+    /// 上另有六条守护走的是 `src.rsplit(锚点).next()`(取最后一次出现),这里
+    /// 写成完整字面量的话「最后一次」就变成本测试自己这行,那六条会集体切错
+    /// 范围而变红 —— 已实证,不是假设。文档注释里同样不能写全。
+    ///
+    /// 自证会变红:删掉 `self.cancel_transfers_of(generation);` 或
+    /// `t.files.remote.invalidate();` 任一句。
+    #[test]
+    fn a_reconnect_settles_both_the_transfer_queue_and_the_remote_pane() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(prod.len() < src.len(), "范围没切到 mod tests 之前");
+        let start = concat!("            UserEvent::Pane", "Reconnected {");
+        let stop = concat!("\n            UserEvent::Pane", "ReconnectErr {");
+        let at = prod.find(start).expect("找不到 PaneReconnected 的处理分支");
+        let body = &prod[at..];
+        let end = body
+            .find(stop)
+            .expect("找不到分支结尾(下一个 UserEvent 臂)");
+        let body = &body[..end];
+        assert!(
+            body.contains("sftp_tasks.drain(..)"),
+            "锚点失效:这个分支已经不 abort sftp 任务了,下面两条断言随之失去意义,\
+             该重新想清楚收口该怎么做"
+        );
+        assert!(
+            body.contains("self.cancel_transfers_of(generation);"),
+            "abort 了传输 worker 却没让队列收口 —— job 永久停在 Running,\
+             按 Running 数算的并发名额被吃掉,断几次线全局传输就堵死"
+        );
+        assert!(
+            body.contains("files.remote.invalidate()"),
+            "abort 了列目录任务却没作废远端栏 —— load 永远停在 Loading,\
+             之后每次 trigger_sftp_open 都撞 already_loading 早退,侧栏永久打不开"
         );
     }
 
