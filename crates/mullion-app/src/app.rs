@@ -11577,6 +11577,21 @@ mod tests {
             "提交/取消编辑后缓冲清空,必须退出模态,否则普通键盘操作会被一直\
              错误地全量喂给 egui"
         );
+
+        // 本地栏那半必须单独钉一次:判据是 `remote || local`,只测 remote 的话
+        // 把 `|| local` 那一半删掉照样全绿 —— 本项目在同一个文件里已经栽过
+        // 一次同构缺口(见下一条 `files_local_alone_counts_as_a_real_action_…`)。
+        tabs.active_mut()
+            .unwrap()
+            .content
+            .files_panel_mut()
+            .unwrap()
+            .local
+            .path_edit = Some("D:\\work".into());
+        assert!(
+            files_path_editing_of(&tabs, true),
+            "本地栏的 path_edit 置上后也必须判成编辑态 —— 两栏各有一条路径条"
+        );
     }
 
     /// 前置 A 的**另一半**:`files_local` 与 `files_remote` 是同构的缺口,
