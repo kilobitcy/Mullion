@@ -513,11 +513,18 @@ pub fn show(
                         .id(path_edit_id(id))
                         .desired_width(ui.available_width()),
                 );
-                if !resp.has_focus() {
-                    // 首帧:把焦点给它,否则用户还得再点一下才能打字。
-                    resp.request_focus();
-                }
-                if resp.lost_focus() {
+                // **不在这里 `request_focus()`**——焦点只在「进入编辑态那一刻」
+                // (下面 `None` 分支的点击处)请求一次。质量复核实测过:改成
+                // 无条件每帧 `request_focus()`,两栏各自发现自己没焦点就抢
+                // 回去,先进编辑态的那栏永远 `lost_focus()` 不了,退不出来。
+                //
+                // 收口条件是 `lost_focus() || clicked_elsewhere()`:光凭
+                // `lost_focus()` 只覆盖 Esc/Tab/被别的控件抢焦点——复核实测
+                // 点击文件行这类普通控件并不会让 `TextEdit` 失焦,不加
+                // `clicked_elsewhere()` 的话「点别处取消编辑」根本不成立。
+                // `clicked_elsewhere()` 触发时当帧没有 Enter 事件,`commit`
+                // 自然是 `false`,不会把这一下误判成提交。
+                if resp.lost_focus() || resp.clicked_elsewhere() {
                     let commit = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if let Some(a) = finish_path_edit(state, commit) {
                         action = Some(a);
@@ -525,13 +532,22 @@ pub fn show(
                 }
             }
             None => {
-                let label = ui.add(
+                // 命中区域用**整行剩余宽度**,不能用 `label.rect`——`Label`
+                // 按文字实际宽度分配,复核实测 `cwd == "/"` 时那个 rect 只有
+                // 4px 宽,路径条右侧一大片空白点了没反应(而这是这个功能
+                // 唯一的入口)。`available_rect_before_wrap()` 在加 `Label`
+                // 之前取,拿到的是这一行到行尾的整块剩余区域;`ui.interact`
+                // 不会因为传了更大的 rect 而重新分配布局,`Label` 自己的
+                // `.truncate()` 视觉效果不受影响。
+                let row_rect = ui.available_rect_before_wrap();
+                ui.add(
                     egui::Label::new(egui::RichText::new(path.clone()).color(theme::c32(t.fg_mid)))
                         .truncate(),
                 );
-                let hit = ui.interact(label.rect, path_label_id(id), egui::Sense::click());
+                let hit = ui.interact(row_rect, path_label_id(id), egui::Sense::click());
                 if hit.clicked() {
                     state.path_edit = Some(path);
+                    ui.ctx().memory_mut(|m| m.request_focus(path_edit_id(id)));
                 }
             }
         }
@@ -2808,10 +2824,13 @@ mod tests {
     /// F131:点一下路径条就该进入编辑态。进不去的话这个功能对用户完全
     /// 不存在(它没有别的入口 —— 没有按钮、没有菜单项)。
     ///
-    /// 两帧预热 + 显式推进时间:`Area`/面板的首帧布局没走完时点不中
-    /// (本项目踩过的 egui 坑,见 docs/gui-render-gotchas.md)。
+    /// 两帧预热是防御性的,不是必需的:实测过把预热砍到一帧这条测试照样
+    /// 绿(这条路径没有 `Area`/`Panel` 首帧 fade_in 那个坑,`CentralPanel`
+    /// 直接画)。留着两帧是跟其它同类测试(`clicking_a_bookmark_dispatches_
+    /// goto_to_its_path` 等)保持同一手法,不是这里单独需要。
     ///
-    /// 自证会变红:把 `show` 里路径条那层 `if resp.clicked()` 分支删掉。
+    /// 自证会变红:把 `show` 里路径条那层 `if hit.clicked()` 分支删掉
+    /// (已用「注释掉该分支」实测验证过,见提交记录)。
     #[test]
     fn clicking_the_path_bar_starts_editing_it() {
         let mut state = PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
@@ -2908,5 +2927,241 @@ mod tests {
             Some(FileAction::GotoInput("/etc".into()))
         );
         assert!(state.path_edit.is_none());
+    }
+
+    /// F131:质量复核实测出的真 bug ——如果渲染那侧每帧都无条件
+    /// `request_focus()`,两栏各自发现自己没焦点就抢回去,先进编辑态的
+    /// 那栏永远抢不到 `lost_focus()`,永久退不出编辑态。这条测出的是
+    /// 「后进编辑态的一栏能把先进的那栏挤出去」——两栏互斥只应该靠
+    /// 「egui 键盘焦点唯一」自然发生,不需要面板代码额外判断另一栏。
+    ///
+    /// 自证会变红:把 `show` 里编辑态分支**整段**还原成 Task 6 最初那版
+    /// (`if !resp.has_focus() { resp.request_focus(); }` 每帧无条件抢焦点、
+    /// 收口条件只有 `resp.lost_focus()`,没有 `clicked_elsewhere()`)——
+    /// 已实测:两栏各自每帧抢焦点,而**后画的那栏(`content()` 里远端画在
+    /// 本地之后)每帧都能把焦点抢回来**,`frame.remote.path_edit` 永远退不出
+    /// `Some`,断言会红(实测报错:`实际却还留在: Some("/var/log")`)。
+    ///
+    /// **只单独还原 `request_focus()` 那一句、留着 `clicked_elsewhere()`
+    /// 不动,验证不出这条 bug**——已实测确认:那种局部还原下测试仍然绿,
+    /// 因为点本地栏路径条这一下本身也会让远端栏的 `clicked_elsewhere()`
+    /// 判真,把它顶出编辑态,盖住了焦点互抢那条独立的坑。真正会暴露这条
+    /// bug 的是「不点任何东西、纯靠重复渲染」的场景(两栏都已经在编辑态时,
+    /// 每帧都无条件 `request_focus()` 会让双方永远抢不出胜负),但那种
+    /// 构造方式脱离了用户真实操作路径,没有采用;这里改用「整段代码
+    /// 还原回 Task 6 最初版本」作为变异验证,因为这正是质量复核实际测出、
+    /// 也是这次要修的那个真实回归。
+    #[test]
+    fn entering_edit_mode_in_one_column_evicts_the_other_columns_editor() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = PanelFrame {
+            remote: PaneState::new(RemotePath::from_bytes(b"/var/log".to_vec())),
+            local: PaneState::new(RemotePath::from_bytes(b"/home/u".to_vec())),
+            bookmarks: Vec::new(),
+            active_column: PanelColumn::default(),
+        };
+        frame.remote.load = Load::Ready;
+        frame.local.load = Load::Ready;
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let run = |input: egui::RawInput, frame: &mut PanelFrame| {
+            let _ = ctx.run(input, |ctx| {
+                content(ctx, &t, 1, false, frame, 0);
+            });
+        };
+        let mut clock = 0.0_f64;
+        let mut tick = || {
+            clock += 1.0;
+            clock
+        };
+        for _ in 0..2 {
+            run(
+                egui::RawInput {
+                    time: Some(tick()),
+                    ..base()
+                },
+                &mut frame,
+            );
+        }
+
+        let m = egui::Modifiers::default();
+        let click_at = |pos: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: m,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: m,
+                },
+            ]
+        };
+
+        // 远端栏先点进编辑态。
+        let remote_pos = ctx
+            .read_response(path_label_id("远端"))
+            .expect("远端路径条没有可交互的响应")
+            .rect
+            .center();
+        run(
+            egui::RawInput {
+                time: Some(tick()),
+                events: click_at(remote_pos),
+                ..base()
+            },
+            &mut frame,
+        );
+        assert_eq!(
+            frame.remote.path_edit.as_deref(),
+            Some("/var/log"),
+            "前提不成立:远端栏没能先进入编辑态"
+        );
+
+        // 再跑一帧,让远端栏的 `TextEdit` 真的拿到键盘焦点(焦点请求发生在
+        // 点击那一帧,widget 要到下一帧渲染时才会体现 `has_focus()`)。
+        run(
+            egui::RawInput {
+                time: Some(tick()),
+                ..base()
+            },
+            &mut frame,
+        );
+
+        // 本地栏也点进编辑态。
+        let local_pos = ctx
+            .read_response(path_label_id("本地"))
+            .expect("本地路径条没有可交互的响应")
+            .rect
+            .center();
+        run(
+            egui::RawInput {
+                time: Some(tick()),
+                events: click_at(local_pos),
+                ..base()
+            },
+            &mut frame,
+        );
+        assert_eq!(
+            frame.local.path_edit.as_deref(),
+            Some("/home/u"),
+            "前提不成立:本地栏没能也进入编辑态"
+        );
+
+        // 再多跑几帧,让远端栏因为焦点被本地栏抢走而 `lost_focus()`、
+        // 自己退出编辑态 —— 不需要任何「另一栏进editing就清掉这栏」的
+        // 显式判断,纯靠 egui 焦点唯一自然发生。
+        for _ in 0..3 {
+            run(
+                egui::RawInput {
+                    time: Some(tick()),
+                    ..base()
+                },
+                &mut frame,
+            );
+        }
+
+        assert_eq!(
+            frame.remote.path_edit, None,
+            "本地栏进了编辑态之后,远端栏该因为失去焦点自动退出编辑态,\
+             实际却还留在: {:?}",
+            frame.remote.path_edit
+        );
+    }
+
+    /// F131:质量复核实测出的真 bug —— `Label` 的响应矩形按**文字实际
+    /// 宽度**分配,`cwd == "/"` 时那个矩形只有几像素宽,路径条右侧一大片
+    /// 看着像能点的空白其实点不动。而这是这个功能唯一的入口(没有按钮、
+    /// 没有菜单项),命中区域小等于功能不存在。
+    ///
+    /// 自证会变红:把 `show` 里 `ui.interact(row_rect, ...)` 的 `row_rect`
+    /// 换回 `label.rect`(Task 6 最初那版写法)。
+    #[test]
+    fn a_short_path_still_has_a_wide_clickable_area() {
+        let mut state = PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(b"/".to_vec()));
+        state.load = Load::Ready;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let run = |input: egui::RawInput, state: &mut PaneState| {
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &crate::theme::MULLION_DARK,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        true,
+                        &[],
+                        0,
+                    );
+                });
+            });
+        };
+        for t in [0.0_f64, 1.0] {
+            run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..base()
+                },
+                &mut state,
+            );
+        }
+        let rect = ctx
+            .read_response(path_label_id("远端"))
+            .expect("路径条没有可交互的响应")
+            .rect;
+        // 点 rect 左边界往右 150px 处 —— 路径只有一个字符时,按文字宽度
+        // 算的命中区域必然覆盖不到这里。
+        let pos = egui::pos2(rect.left() + 150.0, rect.center().y);
+        let m = egui::Modifiers::default();
+        run(
+            egui::RawInput {
+                time: Some(2.0),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: m,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: m,
+                    },
+                ],
+                ..base()
+            },
+            &mut state,
+        );
+        assert_eq!(
+            state.path_edit.as_deref(),
+            Some("/"),
+            "点路径条右侧的空白处没能进入编辑态,命中区域太窄:{rect:?}"
+        );
     }
 }
