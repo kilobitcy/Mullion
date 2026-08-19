@@ -205,8 +205,8 @@ fn menu_target(e: &mullion_ssh::sftp::Entry) -> MenuTarget {
     }
 }
 
-/// 列宽。名称列吃掉剩余宽度,其余定宽 —— 定宽列一旦跟着内容浮动,
-/// 换个目录整张表就会横着抖。
+/// 列宽的默认值。用户可以拖(F135),拖出来的值放在 `ColWidths` 里;
+/// 这几个常量只负责给出「第一次打开时长什么样」。
 const W_SIZE: f32 = 78.0;
 const W_MTIME: f32 = 132.0;
 const W_PERM: f32 = 86.0;
@@ -245,115 +245,88 @@ fn name_start_x_offset() -> f32 {
     ICON_LEFT_PAD + W_ICON + ICON_GAP
 }
 
-/// 可选列(大小/修改时间/权限/属主),固定顺序 = 宽度不够时的收起顺序
-/// 倒过来(排在后面的先被收起:先丢属主,再权限,再修改时间,最后大小)。
-/// `visible_col_count()`/`header()`/`row()`/两条列布局守护测试都从这份表
-/// 拿宽度与 `SortKey`,不许另起一份 —— 加一列/改一列宽只用改这里一处。
-const OPTIONAL_COLS: [(&str, SortKey, f32); 4] = [
-    ("大小", SortKey::Size, W_SIZE),
-    ("修改时间", SortKey::Mtime, W_MTIME),
-    ("权限", SortKey::Perm, W_PERM),
-    ("属主", SortKey::Owner, W_OWNER),
-];
-
-/// 宽度不够时,`OPTIONAL_COLS` 从右向左收起,取最大的 k(0..=4)使得留给
-/// 名称列的宽度仍 `>= 80`(名称列地板)。这是唯一的收起判据 ——
-/// `name_w()`、列头、行体都调它决定「这个宽度下有几列可见」。
+/// 五列的当前宽度(point)。**名称列的宽度含图标格** —— 沿用列头
+/// 「图标 + 名称 = 一个合并区域」的既有语义,不额外记一份图标宽。
 ///
-/// 复核实测出的现象(默认侧栏 360px 下):不做这个收起的话,列头按四列
-/// 定宽从左往右累加,总宽恒为 488px;行体的权限/属主却是从
-/// `rect.right()` 倒着锚的。可用宽度不够 488 时两套定位必然分家 ——
-/// 属主列有数据没标题(标题起点 396 被裁没了),权限标题反而画到了权限
-/// 数据右边。收起可选列让名称列吃掉全部剩余宽度,`total >= 100` 时两套
-/// 定位代数上恒等,错位从根上消失(见 `name_w()` 的文档注释)。
-fn visible_col_count(total: f32) -> usize {
-    let mut sum = 0.0_f32;
-    let mut k = 0usize;
-    for &(_, _, w) in OPTIONAL_COLS.iter() {
-        if total - W_ICON - ICON_GAP - (sum + w) < 80.0 {
-            break;
+/// 放 `ui::UiState`(全局一份,远端/本地/所有标签共用),**不落盘**:
+/// 拖列宽是个随手调整,不值得为它动 store schema(设计 D2)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColWidths {
+    pub name: f32,
+    pub size: f32,
+    pub mtime: f32,
+    pub perm: f32,
+    pub owner: f32,
+}
+
+impl Default for ColWidths {
+    /// 名称列 220:比旧模型在默认侧栏(360px)下算出来的 130 宽不少,
+    /// 代价是一打开就是横向滚动状态 —— 这是设计 D1 明确接受的取舍
+    /// (五列恒在 > 一眼看全)。不满意改这一行就行。
+    fn default() -> Self {
+        Self {
+            name: 220.0,
+            size: W_SIZE,
+            mtime: W_MTIME,
+            perm: W_PERM,
+            owner: W_OWNER,
         }
-        sum += w;
-        k += 1;
     }
-    k
 }
 
-/// 名称列宽度。**一处算、多处用**(`header_name_col_w()`/`row_size_col_left()`
-/// 都基于它)——按 `visible_col_count()` 给名称列让出剩余宽度,只在这一处
-/// 算,别处不许各算一遍。
+/// 列序号 → 最小宽度。名称列要放得下图标格 + 几个字;其余列至少要能
+/// 放下被截断后的标题(一个字 + 省略号)。
+fn col_min(i: usize) -> f32 {
+    if i == 0 {
+        80.0
+    } else {
+        48.0
+    }
+}
+
+/// 列宽上限。拖到几千 px 不会崩,但滚动条会退化成一条几乎抓不住的细线。
+const COL_MAX: f32 = 800.0;
+
+/// 列序号 → 可变引用。拖拽热区按序号改宽度,`match` 只写这一份 ——
+/// 散成五处 `if i == 0 { .. } else if ..` 的话,加一列必漏一处。
+fn col_w_mut(c: &mut ColWidths, i: usize) -> &mut f32 {
+    match i {
+        0 => &mut c.name,
+        1 => &mut c.size,
+        2 => &mut c.mtime,
+        3 => &mut c.perm,
+        _ => &mut c.owner,
+    }
+}
+
+/// **列布局的唯一真值来源**:`(标签, SortKey, 左边界, 宽度)` ×5,
+/// 左边界从 0 起算(相对行/列头的左边界)。
 ///
-/// 只要 `total >= 100`,`total - W_ICON - ICON_GAP - (可见列宽度之和)` 恒
-/// `>= 80`(`visible_col_count()` 的判据保证的),`.max(80.0)` 这个地板
-/// 实际不会被触发 —— 留着只是给 `total < 100` 兜底。
-///
-/// **「到不了」只对 `sidebar()` 成立**:它有 `width_range(280.0..=640.0)`
-/// 兜着,`total` 最小也是 280,进不了 `(0,100)` 这个区间。`content()`
-/// (标签宿主)是整窗口对半分,代码里没有 `min_inner_size` 之类的窗口
-/// 最小尺寸兜底——窗口宽 < 约 208px 时单栏 `total` 理论上会跌进
-/// `(0,100)`,这时地板生效,`header_name_col_w(total)` 会算出**超过
-/// 实际可用宽度**的值(比如 `total=90` 时算出 100)。这正是本文件这批
-/// 收起逻辑要根除的那类「列头请求宽度越过可用区」,只是换了个更极端的
-/// 触发路径——已知限制,未处理(该场景本身没人要求兜底,加保护是没人
-/// 要的功能)。
-fn name_w(total: f32) -> f32 {
-    let k = visible_col_count(total);
-    let sum: f32 = OPTIONAL_COLS[..k].iter().map(|&(_, _, w)| w).sum();
-    (total - W_ICON - ICON_GAP - sum).max(80.0)
+/// 列头(`header_at`)和行体(`row`)调的是同一份 —— 旧模型里两边各自
+/// 累加、靠一条对齐测试守着不许分家,现在坐标同源,分家在物理上不可能
+/// 发生。**不许在别处再写一遍这个累加。**
+fn col_lefts(c: &ColWidths) -> [(&'static str, SortKey, f32, f32); 5] {
+    let mut out = [("", SortKey::Name, 0.0, 0.0); 5];
+    let mut x = 0.0;
+    for (i, (label, key, w)) in [
+        ("名称", SortKey::Name, c.name),
+        ("大小", SortKey::Size, c.size),
+        ("修改时间", SortKey::Mtime, c.mtime),
+        ("权限", SortKey::Perm, c.perm),
+        ("属主", SortKey::Owner, c.owner),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        out[i] = (label, key, x, w);
+        x += w;
+    }
+    out
 }
 
-/// 列头「名称」列的显示宽度。列头没有单独的图标格子——它在视觉上对应的
-/// 是行体「图标格子 + 间隙 + 名称」这个**合并区域**,所以要在 `name_w()`
-/// 之上再加回 `W_ICON + ICON_GAP`。抽成函数(而不是在 `header()` 里内联)
-/// 是为了让对齐守护测试能在不起 egui 上下文的情况下,调到与 `header()`
-/// 完全相同的这一份计算 —— 写两份的话,`header()` 里那份改错了,测试的
-/// 影子计算不会跟着错,照样测不出来。
-fn header_name_col_w(total: f32) -> f32 {
-    name_w(total) + W_ICON + ICON_GAP
-}
-
-/// 列头「大小/修改时间/权限/属主」里当前可见的那几列,各自的
-/// `(标签, SortKey, 左边界, 宽度)`,左边界从 `header_name_col_w(total)`
-/// 开始累加。`header()` 拿它逐列 `allocate_exact_size` 并挂排序点击,
-/// 对齐守护测试拿它跟行体那份(`row_col_lefts()`)比 —— 两边各自独立
-/// 累加,不共用最终结果,一边改错了另一边不会跟着错,能测出来。
-fn header_col_lefts(total: f32) -> Vec<(&'static str, SortKey, f32, f32)> {
-    let k = visible_col_count(total);
-    let mut x = header_name_col_w(total);
-    OPTIONAL_COLS[..k]
-        .iter()
-        .map(|&(label, key, w)| {
-            let left = x;
-            x += w;
-            (label, key, left, w)
-        })
-        .collect()
-}
-
-/// 行体「大小」列的左边界(绝对坐标,基于 `row_rect.left()`)。**`row()`
-/// 和对齐守护测试都调这个,不许测试自己重建这份算式**——同 `icon_rect()`
-/// 的教训(见其文档注释):测试独立重建的话,这里改错了,测试拿的还是
-/// 自己那份「正确」几何,照样测不出来。
-fn row_size_col_left(row_rect: egui::Rect) -> f32 {
-    row_rect.left() + W_ICON + ICON_GAP + name_w(row_rect.width())
-}
-
-/// 行体「大小/修改时间/权限/属主」里当前可见的那几列,各自的
-/// `(标签, SortKey, 左边界, 宽度)`,左边界从 `row_size_col_left(row_rect)`
-/// 开始累加。`row()` 拿它给每一列的文字定位(视觉上仍是原来的
-/// RIGHT_CENTER / 右内缩 4px,只是坐标改从这里取,不再自己用
-/// `rect.right()` 倒着算)。
-fn row_col_lefts(row_rect: egui::Rect) -> Vec<(&'static str, SortKey, f32, f32)> {
-    let k = visible_col_count(row_rect.width());
-    let mut x = row_size_col_left(row_rect);
-    OPTIONAL_COLS[..k]
-        .iter()
-        .map(|&(label, key, w)| {
-            let left = x;
-            x += w;
-            (label, key, left, w)
-        })
-        .collect()
+/// 内容总宽 = 各列之和。视口比它窄就出横向滚动条(F136)。
+fn content_w(c: &ColWidths) -> f32 {
+    c.name + c.size + c.mtime + c.perm + c.owner
 }
 
 /// 路径条只读态那块的 id。**必须是稳定的** ——「点得中路径条」是 F131 唯一
@@ -420,6 +393,7 @@ pub fn show(
     focused: bool,
     bookmarks: &[mullion_store::Bookmark],
     drop_in: usize,
+    cols: &mut ColWidths,
 ) -> Option<FileAction> {
     let mut action = None;
     annotate::mark(ui.ctx(), format!("文件面板/{id}"), ui.max_rect());
@@ -600,7 +574,15 @@ pub fn show(
         Load::Ready => {}
     }
 
-    header(ui, t, id, state);
+    // F136:先占住一条横带留给列头(在 `ScrollArea` 之前分配,行体才会从
+    // 它下面开始排),实际的绘制挪到滚动区**之后**做,好让列头在 z 序上
+    // 压在行体上面(与原设计一致)。真正决定列头位置的偏移量另外算——
+    // 见下方 `header_offset_x` 那条长注释,**不是**从这里的滚动区输出里
+    // 现取(那份值下一帧才轮到行体去用,读它会让列头比行体多抢一步)。
+    let (header_band, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_H),
+        egui::Sense::hover(),
+    );
 
     let rows = state.rows();
     // `rows` 借着 `&state.entries` 不放(它是 `Vec<&Entry>`),闭包里不能再
@@ -616,7 +598,24 @@ pub fn show(
     // 借用规则同 `clicked` —— 闭包里改不了 `state`,出了闭包再落。
     let mut drag_start: Option<mullion_ssh::sftp::RemotePath> = None;
     let mut landing: Option<crate::files::drag::Landing> = None;
-    egui::ScrollArea::vertical()
+    let total_w = content_w(cols);
+    // F136:列头要用的偏移是「这一帧的行体实际拿去排版的那份」,不是
+    // 「这一帧滚动结束后要存给下一帧用的那份」——egui 的 `ScrollArea` 内部
+    // 在 `begin()` 时就用 persisted 偏移把行体的屏幕坐标定死了,之后处理
+    // 本帧滚轮事件才更新偏移、存回去给下一帧用(`ScrollAreaOutput` 里
+    // 拿到的正是这个「已更新、留给下一帧」的值)。如果列头读的是
+    // `show_rows()` 返回的 `state.offset.x`,在滚轮还没被(可能跨多帧)
+    // 平滑消化完之前,列头会比行体本身多走一步——不是「滞后」,是「抢先」,
+    // 肉眼同样是错位。这里在调用 `show_rows` 之前,用同一个持久化 id 把
+    // 上一帧存的偏移原样读出来,和行体这一帧实际用的值保证逐帧位元对位。
+    let header_offset_x = egui::scroll_area::State::load(
+        ui.ctx(),
+        ui.make_persistent_id(egui::Id::new(scroll_id_salt(id, generation))),
+    )
+    .unwrap_or_default()
+    .offset
+    .x;
+    egui::ScrollArea::both()
         .id_salt(scroll_id_salt(id, generation))
         // F58:**必须关掉**。`drag_to_scroll` 默认开着,它在视口上注册一个
         // 吃 drag 的部件,把按在行上的那一下抢去当滚动手势 —— 行的
@@ -625,9 +624,14 @@ pub fn show(
         .drag_to_scroll(false)
         .auto_shrink([false, false])
         .show_rows(ui, ROW_H, rows.len(), |ui, range| {
+            // F136:**必须显式要这个宽度**。egui 0.30 的 `show_rows` 只
+            // `set_height`,宽度全看内容自己撑 —— 空目录(range 为空)时一行
+            // 都不画,`content_size.x` 恒等于视口宽,水平滚动条不出现,
+            // 右边那几列的列头就永远滚不到。
+            ui.set_min_width(total_w);
             for ix in range {
                 let e = rows[ix];
-                let resp = row(ui, t, e, column, selected.contains(&e.name));
+                let resp = row(ui, t, e, column, selected.contains(&e.name), cols);
                 // F58:行既是拖源也是落点。
                 if resp.drag_started() {
                     // 拖一条**没选中**的行:先让它成为唯一选中项。不这么做的话
@@ -689,6 +693,15 @@ pub fn show(
                 }
             }
         });
+    // F136:把列头补画在上面占住的横带里,用的是调用 `show_rows` 之前
+    // 读到的 `header_offset_x`(见上方长注释)。
+    ui.scope_builder(egui::UiBuilder::new().max_rect(header_band), |ui| {
+        // **必须显式裁剪**:子 ui 的 clip_rect 默认原样继承父 painter,
+        // 不裁的话列宽之和超过视口时,右边几列的标题会画到隔壁栏
+        // (同 `content()` 里两栏那两处 `set_clip_rect`)。
+        ui.set_clip_rect(header_band);
+        header_at(ui, t, id, state, cols, header_band, header_offset_x);
+    });
     // F58:落在空白处(行与行之间、列头下方的空白)。**必须排在行之后** ——
     // `dnd_release_payload` 会把载荷取走,背景先问的话落在目录行上的那一下
     // 会被背景吃掉,「传进子目录」永远走不到。
@@ -718,64 +731,121 @@ pub fn show(
     action
 }
 
-fn header(ui: &mut Ui, t: &Theme, id: &str, state: &mut PaneState) {
-    ui.horizontal(|ui| {
-        annotate::mark(ui.ctx(), format!("文件面板/{id}/列头"), ui.max_rect());
-        // `ui.horizontal`默认在相邻部件间插入 `item_spacing.x`(8pt)——四列之间
-        // 就是 3 处空隙,共 24pt。下面 `name_w` 只按四列自身宽度求和 == 可用宽度,
-        // 没有扣掉这 24pt,`ui.horizontal` 请求的总宽度因此比 `available_width()`
-        // 多 24pt,会把外层 ui 的 `max_rect` 撑宽——两栏对调(F50 A 组)后这多出
-        // 的 24pt 越过两栏间 8pt 的缝隙侵入邻栏,`dragging_from_the_local_column_
-        // onto_a_remote_directory_row_drops_into_that_directory` 等守护测试因此
-        // 变红(邻栏的行抢先拿走了 dnd 载荷)。清零间距而不是从 `name_w` 里扣,
-        // 这样四列衔接处跟 `row()` 里手工画的四列(本来就是零间距的绝对坐标)
-        // 对得齐,不会因为「扣了间距」反而让表头跟表身错位。
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let mut hit = None;
-        let total = ui.available_width();
-        // 表头这一列没有单独的图标格子——它跟 `row()` 里「图标格子 + 名称」
-        // 那个**合并宽度**对齐,所以用 `header_name_col_w()` 在 `name_w()`
-        // 之上加回 `W_ICON + ICON_GAP`(该函数与 `name_w()` 同款「一处算、
-        // 两处用」——夹紧地板已经在 `name_w()` 里做过一次,这里不用再抬
-        // 一次地板,加法上代数等价,也省得两处维护同一个地板常量)。
-        //
-        // 大小/修改时间/权限/属主这四列不再是字面量数组——`total` 不够时
-        // 从右向左收起(见 `visible_col_count()`),`header_col_lefts()` 只
-        // 给回当前可见的那几列,收起的列这里根本不出现在循环里。
-        let mut cols = vec![("名称", SortKey::Name, header_name_col_w(total))];
-        cols.extend(
-            header_col_lefts(total)
-                .into_iter()
-                .map(|(label, key, _left, w)| (label, key, w)),
+/// 把列头画在 `band` 里,整体左移 `offset_x`。
+///
+/// `offset_x` 是横向滚动偏移(F136,`show()` 传来的 `header_offset_x`——
+/// 调 `show_rows` **之前**从持久化 `ScrollArea` 状态里读到的那份,和行体
+/// 这一帧实际排版用的是同一个值,见 `show()` 里那条长注释)。拆出这个
+/// 函数是因为**列头必须在占位横带确定之后才画得出正确的位置**(见设计
+/// §③),而占位又必须在 `ScrollArea` 之前 —— 占位与绘制天然要分成两处。
+fn header_at(
+    ui: &mut Ui,
+    t: &Theme,
+    id: &str,
+    state: &mut PaneState,
+    cols: &mut ColWidths,
+    band: egui::Rect,
+    offset_x: f32,
+) {
+    annotate::mark(ui.ctx(), format!("文件面板/{id}/列头"), band);
+    // F135:列宽拖拽热区。**必须先于列体注册**:egui 同层内先注册的部件
+    // 拿到命中权,挂在后面的话边界那 6pt 上的按下会被排序点击吃掉。
+    //
+    // 热区认的是**每一列的右边界**(i = 0..5),拖动只改第 i 列的宽度,
+    // 右边的列整体平移(不做此消彼长的「借宽度」—— 总宽有横向滚动兜着,
+    // 没有守恒的必要)。
+    const HANDLE_W: f32 = 6.0;
+    for (i, (_, _, left, w)) in col_lefts(cols).into_iter().enumerate() {
+        let x = band.left() + left + w - offset_x;
+        let handle = egui::Rect::from_min_max(
+            egui::pos2(x - HANDLE_W * 0.5, band.top()),
+            egui::pos2(x + HANDLE_W * 0.5, band.bottom()),
         );
-        for (label, key, w) in cols {
-            let mark = if state.sort_key == key {
-                match state.sort_dir {
-                    crate::files::SortDir::Asc => " ▲",
-                    crate::files::SortDir::Desc => " ▼",
-                }
-            } else {
-                ""
-            };
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
-            // 逐列登记:上面那处只标了整行,四列各自的可点矩形并不等于整行 ——
-            // 测试要往「名称」列具体点,不能拿整行中心去凑(改宽了就打偏)。
-            annotate::mark(ui.ctx(), format!("文件面板/{id}/列头/{label}"), rect);
-            ui.painter().text(
-                rect.left_center() + egui::vec2(crate::ui::metrics::SP_XS, 0.0),
-                egui::Align2::LEFT_CENTER,
-                format!("{label}{mark}"),
-                egui::FontId::proportional(11.0),
-                theme::c32(t.fg_muted),
+        let resp = ui
+            .interact(
+                handle,
+                ui.id().with(("files-col-resize", id, i)),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            let target = col_w_mut(cols, i);
+            *target = (*target + resp.drag_delta().x).clamp(col_min(i), COL_MAX);
+        }
+        if resp.hovered() || resp.dragged() {
+            // 抓住的是哪条线,要看得见。
+            ui.painter().with_clip_rect(band).vline(
+                x,
+                band.y_range(),
+                egui::Stroke::new(1.0, theme::c32(t.accent)),
             );
-            if resp.clicked() {
-                hit = Some(key);
+        }
+    }
+    let mut hit = None;
+    for (i, (label, key, left, w)) in col_lefts(cols).into_iter().enumerate() {
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(band.left() + left - offset_x, band.top()),
+            egui::vec2(w, ROW_H),
+        );
+        // 逐列登记:整行那一处标不了「往名称列点」这种精确目标
+        // (F100 标注模式与点击测试都靠它)。
+        //
+        // 登记前先跟 `band` 求交,**不能直接登记未裁剪的 `rect`**:横滚之后
+        // 列会整个或部分移出可视区(`rect.left()` 甚至可能是负数),原样登记
+        // 的话 F100 标注模式会报出一个屏幕上已经看不见、点不到的「候选」。
+        // 完全滚出去的列交出来是非正矩形,`annotate::mark` 自己会因为
+        // `is_positive()` 为假而不登记 —— 不用在这里另写一次判断。
+        annotate::mark(
+            ui.ctx(),
+            format!("文件面板/{id}/列头/{label}"),
+            rect.intersect(band),
+        );
+        // id 必须显式给:不再走 `allocate_exact_size` 的自动分配,而两栏
+        // 的列头在同一个 `Context` 里同名,不掺 `id`(远端/本地)和列序号
+        // 会撞成同一个部件。
+        let resp = ui.interact(
+            rect,
+            ui.id().with(("files-col-head", id, i)),
+            egui::Sense::click(),
+        );
+        let mark = if state.sort_key == key {
+            match state.sort_dir {
+                crate::files::SortDir::Asc => " ▲",
+                crate::files::SortDir::Desc => " ▼",
             }
+        } else {
+            ""
+        };
+        // 裁到横带内:列宽之和超过视口时,右边那几列的标题不能画到
+        // 隔壁栏去(同 `content()` 里两栏各自 `set_clip_rect` 的理由)。
+        let font = egui::FontId::proportional(11.0);
+        let painter = ui.painter().with_clip_rect(band);
+        let measure = |s: &str| {
+            painter
+                .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        };
+        painter.text(
+            rect.left_center() + egui::vec2(crate::ui::metrics::SP_XS, 0.0),
+            egui::Align2::LEFT_CENTER,
+            elide(
+                &format!("{label}{mark}"),
+                w - crate::ui::metrics::SP_XS * 2.0,
+                Elide::End,
+                measure,
+            ),
+            font.clone(),
+            theme::c32(t.fg_muted),
+        );
+        if resp.clicked() {
+            hit = Some(key);
         }
-        if let Some(k) = hit {
-            state.click_header(k);
-        }
-    });
+    }
+    if let Some(k) = hit {
+        state.click_header(k);
+    }
 }
 
 fn row(
@@ -784,19 +854,40 @@ fn row(
     e: &mullion_ssh::sftp::Entry,
     column: PanelColumn,
     selected: bool,
+    cols: &ColWidths,
 ) -> egui::Response {
     // `click_and_drag` 而不是 `click`(F58):行要能起拖。`clicked()` /
     // `double_clicked()` 在这个 Sense 下照旧 —— egui 只有在指针真的移出
     // 拖拽阈值之后才把这一下判成拖,原地按松仍然是点击。
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), ROW_H),
-        egui::Sense::click_and_drag(),
-    );
+    //
+    // 行宽取「内容总宽」与「视口宽」的**较大者**:
+    // - 总宽 > 视口 → 行要撑满内容宽,否则右边几列画在行的交互 rect 之外;
+    // - 总宽 < 视口 → 行要铺满视口,否则选中高亮只有半行长,右边那片空白
+    //   点不中行、也接不住 drop(`a_row_in_the_tab_host_can_actually_be_clicked`
+    //   与 `dropping_on_the_blank_part_of_a_column_targets_its_current_directory`
+    //   两条现有测试守着这两件事)。
+    let w = content_w(cols).max(ui.available_width());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click_and_drag());
     if selected {
         ui.painter().rect_filled(rect, 2.0, theme::c32(t.sunken_bg));
     }
     let p = ui.painter();
     let font = egui::FontId::proportional(12.0);
+    // F137:测宽用**真实字体**。`Painter::layout_no_wrap` 内部带按帧滑动窗口
+    // 的 `LayoutJob` 缓存(`epaint-0.30.0` `text/fonts.rs` `begin_pass` 里
+    // `flush_cache` 只保留「上一帧用过」的条目,不是整段清空)——**稳态下**
+    // (列宽帧间不变)命中率高、很便宜;但 `truncate_to_width` 的二分查找
+    // 每一步测的是不同长度的前缀,是不同的缓存 key,**列宽逐帧变化时**
+    // (Task 6 拖拽进行中、或窗口连续 resize)这批中间前缀逐帧不同、命中不了,
+    // 最坏情况(窄列 + 长名字全触发截断)一屏能摸到千级 `layout_no_wrap`/帧。
+    // 颜色传 `Color32::WHITE` 占位、只取尺寸不画——但缓存 key 是整个
+    // `LayoutJob`(含颜色),这个占位色和真正画字用的颜色各自产生一份独立
+    // 缓存条目,是预期开销,不是 bug。
+    let measure = |s: &str| {
+        p.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
     // 非可操作名字画成 dim + 后缀说明:用户要能一眼看出「这个动不了」
     // 而不是点下去才发现(D16 修订)。判据是 `is_operable`,不是 `is_utf8`——
     // 后者对「线上 lossy 过的 `U+FFFD` 串」恒为真,拿它当判据会让这条
@@ -828,73 +919,95 @@ fn row(
     if !usable {
         label = format!("{label}(名称非 UTF-8,本版无法操作)");
     }
+    // 名称列的可用宽度:让出图标格子 + 间隙,右边再留一个 `SP_XS` 的
+    // 呼吸位,否则截断后的省略号会紧贴着「大小」列的数字。
+    let name_budget = cols.name - name_start_x_offset() - crate::ui::metrics::SP_XS;
     p.text(
         rect.left_center() + egui::vec2(name_start_x_offset(), 0.0),
         egui::Align2::LEFT_CENTER,
-        label,
+        // **拼完整串再截**:符号链接的 `→ target` 和「名称非 UTF-8」那句
+        // 后缀都得参与预算,先截名字再拼后缀的话后缀照样溢出。
+        elide(&label, name_budget, Elide::Middle, measure),
         font.clone(),
         fg,
     );
     // 名称列的可用宽度让出图标格子 + 间隙,否则长文件名会顶到大小列上——
-    // `row_size_col_left()` 是「大小」列左边界,生产代码与对齐守护测试
-    // 共用同一份(见其文档注释)。
-    //
-    // 下面四列(大小/修改时间/权限/属主)宽度不够时会被从右向左收起——
-    // `row_col_lefts()` 只给回当前可见的那几列,顺序固定,缺的列在这个
-    // `Vec` 里直接不存在,对应的 `if let` 分支就不画。视觉上每一列仍是
-    // 原来的 RIGHT_CENTER / 右内缩 4px:最后一个可见的可选列(不管是
-    // 属主、权限还是别的)恒贴着 `rect.right()`——`name_w()` 保证了这点
-    // (见其文档注释)。
-    let cols = row_col_lefts(rect);
-    if let Some(&(_, _, size_left, size_w)) = cols.first() {
-        let size_text = if e.kind == EntryKind::Dir {
-            String::new()
-        } else {
-            human_size(e.size)
-        };
-        p.text(
-            egui::pos2(size_left + size_w, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            size_text,
-            font.clone(),
-            theme::c32(t.fg_mid),
-        );
-    }
-    if let Some(&(_, _, mtime_left, _)) = cols.get(1) {
-        p.text(
-            egui::pos2(mtime_left + crate::ui::metrics::SP_S, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            mtime_text(e.mtime),
-            font.clone(),
-            theme::c32(t.fg_mid),
-        );
-    }
-    // 权限列(不再把 uid:gid 拼在后面 —— 属主拆成了独立列)。
-    if let Some(&(_, _, perm_left, perm_w)) = cols.get(2) {
-        p.text(
-            egui::pos2(
-                perm_left + perm_w - crate::ui::metrics::SP_XS,
-                rect.center().y,
-            ),
-            egui::Align2::RIGHT_CENTER,
-            perm_string(e.mode),
-            font.clone(),
-            theme::c32(t.fg_dim),
-        );
-    }
-    // D2:属主列。**本地栏恒画 `—`**,判据见 `owner_text` 的文档注释。
-    if let Some(&(_, _, owner_left, owner_w)) = cols.get(3) {
-        p.text(
-            egui::pos2(
-                owner_left + owner_w - crate::ui::metrics::SP_XS,
-                rect.center().y,
-            ),
-            egui::Align2::RIGHT_CENTER,
-            owner_text(column, e.uid, e.gid),
-            font,
-            theme::c32(t.fg_dim),
-        );
-    }
+    // 下面四列的坐标从 `col_lefts()` 取,与 `header_at()` 同源(见其文档
+    // 注释),不许在这里另起一份累加。
+    let lay = col_lefts(cols);
+    // 大小(右对齐)
+    let (_, _, size_left, size_w) = lay[1];
+    let size_text = if e.kind == EntryKind::Dir {
+        String::new()
+    } else {
+        human_size(e.size)
+    };
+    p.text(
+        egui::pos2(
+            rect.left() + size_left + size_w - crate::ui::metrics::SP_XS,
+            rect.center().y,
+        ),
+        egui::Align2::RIGHT_CENTER,
+        elide(
+            &size_text,
+            size_w - crate::ui::metrics::SP_XS,
+            Elide::End,
+            measure,
+        ),
+        font.clone(),
+        theme::c32(t.fg_mid),
+    );
+    // 修改时间(左对齐)
+    let (_, _, mtime_left, mtime_w) = lay[2];
+    p.text(
+        egui::pos2(
+            rect.left() + mtime_left + crate::ui::metrics::SP_S,
+            rect.center().y,
+        ),
+        egui::Align2::LEFT_CENTER,
+        elide(
+            &mtime_text(e.mtime),
+            mtime_w - crate::ui::metrics::SP_S,
+            Elide::End,
+            measure,
+        ),
+        font.clone(),
+        theme::c32(t.fg_mid),
+    );
+    // 权限(右对齐,不再把 uid:gid 拼在后面 —— 属主拆成了独立列)。
+    let (_, _, perm_left, perm_w) = lay[3];
+    p.text(
+        egui::pos2(
+            rect.left() + perm_left + perm_w - crate::ui::metrics::SP_XS,
+            rect.center().y,
+        ),
+        egui::Align2::RIGHT_CENTER,
+        elide(
+            &perm_string(e.mode),
+            perm_w - crate::ui::metrics::SP_XS,
+            Elide::End,
+            measure,
+        ),
+        font.clone(),
+        theme::c32(t.fg_dim),
+    );
+    // 属主(右对齐)。**本地栏恒画 `—`**,判据见 `owner_text` 的文档注释。
+    let (_, _, owner_left, owner_w) = lay[4];
+    p.text(
+        egui::pos2(
+            rect.left() + owner_left + owner_w - crate::ui::metrics::SP_XS,
+            rect.center().y,
+        ),
+        egui::Align2::RIGHT_CENTER,
+        elide(
+            &owner_text(column, e.uid, e.gid),
+            owner_w - crate::ui::metrics::SP_XS,
+            Elide::End,
+            measure,
+        ),
+        font,
+        theme::c32(t.fg_dim),
+    );
     resp
 }
 
@@ -907,6 +1020,105 @@ fn owner_text(column: PanelColumn, uid: u32, gid: u32) -> String {
     } else {
         format!("{uid}:{gid}")
     }
+}
+
+/// F137:截断方式。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Elide {
+    /// 尾部省略:`2026-08-19 10:3…`。给数值/时间/权限/属主与列头标题用。
+    End,
+    /// 中间省略、保留扩展名:`a-very-long-fil….tar.gz`。只给名称列用 ——
+    /// 一列同前缀的备份文件尾部省略之后全长一样,信息量清零。
+    Middle,
+}
+
+const ELLIPSIS: &str = "…";
+
+/// 把 `text` 截到 `max_w` 以内,截掉的地方放一个 `…`。
+///
+/// `measure`:测一段文字的宽度。生产侧传 `|s| painter.layout_no_wrap(...)`
+/// ——**必须用真实字体测**,CJK 一个字顶两个 ASCII,按字符数估算会在中文
+/// 目录里全错。测试侧传桩,于是这个函数本身不需要 egui 上下文就能测。
+///
+/// **前提:`measure` 对前缀单调不减**(前缀越长越宽)。二分查找依赖这一点;
+/// 对正常字体成立(字形宽度非负)。
+fn elide(text: &str, max_w: f32, mode: Elide, measure: impl Fn(&str) -> f32) -> String {
+    if measure(text) <= max_w {
+        return text.to_string();
+    }
+    let ellipsis_w = measure(ELLIPSIS);
+    if mode == Elide::Middle {
+        if let Some(tail) = ext_tail(text) {
+            let tail_w = measure(tail);
+            // 尾段 + 省略号吃掉超过一半预算 → 退化成尾部省略。留一个前面
+            // 什么都放不下的尾巴,不如老老实实从后面截。
+            if tail_w + ellipsis_w <= max_w * 0.5 {
+                let head_src = &text[..text.len() - tail.len()];
+                let head = truncate_to_width(head_src, max_w - tail_w - ellipsis_w, &measure);
+                return format!("{head}{ELLIPSIS}{tail}");
+            }
+        }
+    }
+    // 尾部省略(也是 `Middle` 的退化路径)。
+    if ellipsis_w > max_w {
+        // 连一个省略号都放不下:什么都不画。画半个字符更像渲染坏了。
+        return String::new();
+    }
+    let head = truncate_to_width(text, max_w - ellipsis_w, &measure);
+    format!("{head}{ELLIPSIS}")
+}
+
+/// 从右往左取至多 **2 段**扩展名,总长(字符数)不超过 10。
+///
+/// `a.tar.gz` → `.tar.gz`;`a.txt` → `.txt`;`x.20260819.backup` → `.backup`
+/// (两段共 16 > 10);`.bashrc` → `None`(点在开头,那是名字不是扩展名);
+/// `no-ext` → `None`。
+fn ext_tail(name: &str) -> Option<&str> {
+    let mut best = None;
+    let mut rest = name;
+    for _ in 0..2 {
+        let Some((head, _)) = rest.rsplit_once('.') else {
+            break;
+        };
+        if head.is_empty() {
+            break;
+        }
+        // `head` 是 `rest` 的前缀,而 `rest` 是 `name` 的前缀 ——
+        // `head.len()` 因此也是 `name` 里的字节偏移。
+        let cand = &name[head.len()..];
+        if cand.chars().count() > 10 {
+            break;
+        }
+        best = Some(cand);
+        rest = head;
+    }
+    best
+}
+
+/// `s` 里能放进 `budget` 的最长**前缀**(切在 `char` 边界上)。
+///
+/// 二分而不是逐字符递减:一屏有几十行 × 五列,长名字逐字符退让会把
+/// `layout_no_wrap` 调用次数推到每帧上万次。
+fn truncate_to_width<'a>(s: &'a str, budget: f32, measure: &impl Fn(&str) -> f32) -> &'a str {
+    if measure(s) <= budget {
+        return s;
+    }
+    let bounds: Vec<usize> = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()))
+        .collect();
+    // 找最大的 `lo` 使 `s[..bounds[lo]]` 放得下。`lo = 0`(空串)恒满足。
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if measure(&s[..bounds[mid]]) <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    &s[..bounds[lo]]
 }
 
 /// 两栏之一。定义搬去了 `crate::files`(纯逻辑层,`drag.rs` 的落点判据要
@@ -1050,6 +1262,7 @@ pub fn sidebar(
                     panel_focused && frame.active_column == PanelColumn::Local,
                     &[],
                     0,
+                    &mut ui_state.files_cols,
                 );
             });
             ui.separator();
@@ -1063,6 +1276,7 @@ pub fn sidebar(
                 panel_focused && frame.active_column == PanelColumn::Remote,
                 &frame.bookmarks,
                 drop_in,
+                &mut ui_state.files_cols,
             );
         });
     // 把这一帧的实际宽度读回来。**注意它只是个镜像,驱动不了任何东西**:
@@ -1108,6 +1322,7 @@ pub fn content(
     panel_focused: bool,
     frame: &mut PanelFrame,
     drop_in: usize,
+    cols: &mut ColWidths,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     egui::CentralPanel::default()
@@ -1149,6 +1364,7 @@ pub fn content(
                     panel_focused && frame.active_column == PanelColumn::Local,
                     &[],
                     0,
+                    cols,
                 );
             });
             ui.painter()
@@ -1166,6 +1382,7 @@ pub fn content(
                     panel_focused && frame.active_column == PanelColumn::Remote,
                     &frame.bookmarks,
                     drop_in,
+                    cols,
                 );
             });
         });
@@ -1227,6 +1444,283 @@ mod tests {
             gid: 1000,
             link_target: None,
         }
+    }
+
+    /// 测宽桩:ASCII 7pt / 非 ASCII 14pt(CJK 一个字顶两个 ASCII,省略号
+    /// 也是非 ASCII)。用桩而不是真字体,这几条测试才能脱离 egui 上下文跑。
+    fn stub_measure(s: &str) -> f32 {
+        s.chars()
+            .map(|c| if c.is_ascii() { 7.0 } else { 14.0 })
+            .sum()
+    }
+
+    /// F137:名称列中间省略,**扩展名必须留住** —— 一列同前缀的
+    /// `backup-2026-08-19.tar.gz` / `.log` / `.sql`,尾部省略之后全长一样,
+    /// 等于把这一列的信息量清零。
+    ///
+    /// 自证会变红:把 `ext_tail()` 的两段扩展名循环改成只取一段
+    /// (`.tar.gz` 会退化成 `.gz`),或者把 `Middle` 直接转发给 `End`。
+    #[test]
+    fn eliding_a_name_in_the_middle_keeps_its_extension() {
+        let out = elide(
+            "a-very-long-filename.tar.gz",
+            140.0,
+            Elide::Middle,
+            stub_measure,
+        );
+        assert!(
+            out.ends_with(".tar.gz"),
+            "两段扩展名没留住,实际截成了 {out:?}"
+        );
+        assert!(out.contains('…'), "中间没有省略号,实际 {out:?}");
+        assert!(
+            stub_measure(&out) <= 140.0,
+            "截完还是超宽({}),实际 {out:?}",
+            stub_measure(&out)
+        );
+
+        let cjk = elide(
+            "很长的中文文件名很长的中文文件名.txt",
+            100.0,
+            Elide::Middle,
+            stub_measure,
+        );
+        assert!(cjk.ends_with(".txt"), "单段扩展名没留住,实际 {cjk:?}");
+        assert!(
+            stub_measure(&cjk) <= 100.0,
+            "CJK 名字截完超宽({}),实际 {cjk:?}",
+            stub_measure(&cjk)
+        );
+    }
+
+    /// `ext_tail()` 直接单测,文档注释承诺的五个行为 + `.gitignore` 各断言
+    /// 一遍。**开头的点不是扩展名** —— `.bashrc` / `.gitignore` 这类
+    /// dotfile 必须返回 `None`,否则会被 `elide(Middle)` 截成
+    /// `….gitignore` 这种「省略号 + 全名」的垃圾(省略号什么都没省掉)。
+    ///
+    /// 自证会变红:去掉 `ext_tail()` 里 `head.is_empty()` 那条守卫 ——
+    /// 见下方实测。
+    #[test]
+    fn ext_tail_treats_a_leading_dot_as_part_of_the_name() {
+        assert_eq!(ext_tail("a.tar.gz"), Some(".tar.gz"));
+        assert_eq!(ext_tail("a.txt"), Some(".txt"));
+        assert_eq!(ext_tail("x.20260819.backup"), Some(".backup"));
+        assert_eq!(ext_tail(".bashrc"), None);
+        assert_eq!(ext_tail("no-ext"), None);
+        assert_eq!(ext_tail(".gitignore"), None);
+    }
+
+    /// 边界:放得下就原样返回;没有扩展名 / 扩展名自己就吃掉半个预算 /
+    /// 预算窄到连省略号都放不下 —— 都不许 panic,也不许超宽。
+    ///
+    /// 自证会变红:去掉 `elide()` 里「省略号都放不下就返回空串」那条 ——
+    /// 实测 `elide("abc.txt", 10.0, Elide::End, stub_measure)` 会截成
+    /// `"…"`(宽 14),超过预算 10,断言在 `"abc.txt" 在预算 10 下截成了
+    /// "…",宽 14` 报错。
+    #[test]
+    fn eliding_never_exceeds_the_budget_and_never_panics() {
+        // 放得下 → 原样。
+        assert_eq!(elide("a.txt", 999.0, Elide::Middle, stub_measure), "a.txt");
+        for (text, budget) in [
+            ("no-extension-but-really-long-indeed", 60.0),
+            ("x.20260819.backup", 60.0),
+            (".bashrc", 30.0),
+            ("很长很长很长很长的中文名", 40.0),
+            ("abc.txt", 10.0),
+            ("abc.txt", 0.0),
+            ("", 50.0),
+        ] {
+            for mode in [Elide::End, Elide::Middle] {
+                let out = elide(text, budget, mode, stub_measure);
+                assert!(
+                    stub_measure(&out) <= budget + 0.01,
+                    "{text:?} 在预算 {budget} 下截成了 {out:?},宽 {}",
+                    stub_measure(&out)
+                );
+            }
+        }
+    }
+
+    /// `Elide::End` 必须**真的截**,不能靠退化成空串蒙混过关 —— 空串宽度
+    /// 恒为 0,能不劳而获地通过任何「不超预算」的上界断言。这条锁的是
+    /// 正面结果:一个放不下的无扩展名串走 `End`,必须产出「原串前缀 + 省略
+    /// 号」的非空结果,而不是随便什么宽度合规的东西。
+    ///
+    /// 自证会变红:把 `elide()` 里 `End` 路径(`ellipsis_w > max_w` 判断
+    /// 之后那一段)整段改成恒 `return String::new();` —— 见下方实测。
+    #[test]
+    fn eliding_end_mode_actually_truncates_instead_of_degrading_to_empty() {
+        let text = "no-extension-but-really-long-indeed";
+        let out = elide(text, 60.0, Elide::End, stub_measure);
+        assert!(out.ends_with('…'), "结果没有以省略号结尾,实际 {out:?}");
+        let head = out.strip_suffix('…').expect("上面已断言以省略号结尾");
+        assert!(!head.is_empty(), "省略号前面是空的,退化成了纯省略号");
+        assert!(
+            text.starts_with(head),
+            "省略号前面的部分 {head:?} 不是原串 {text:?} 的前缀"
+        );
+        assert!(
+            stub_measure(&out) <= 60.0 + 0.01,
+            "截完还是超宽({}),实际 {out:?}",
+            stub_measure(&out)
+        );
+    }
+
+    /// `truncate_to_width()` 没有 `budget <= 0.0` 早退也不会 panic ——
+    /// 二分本身对非正预算是良构的:`s = ""` 时 `bounds = [0]`,`hi = 0`,
+    /// 循环不进,直接返回 `""`;`s` 非空且 `budget <= 0` 时,`measure` 非负
+    /// 保证 `measure(&s[..bounds[mid]]) <= budget` 恒为 false,`hi` 一路收到
+    /// `lo`(初值 0),同样返回 `""`,过程中 `mid - 1` 因为 `mid = (lo+hi)
+    /// .div_ceil(2)` 在 `hi > lo` 时恒 `>= 1` 而不下溢。
+    ///
+    /// 自证会变红(两处均实测过):
+    /// - 把 `lo` 初值从 `0` 改成 `1` → `"abc"` 那条炸,截成 `"a"` 而不是
+    ///   `""`(`assertion left == right failed / left: "a" / right: ""`)。
+    /// - 把 `if measure(&s[..bounds[mid]]) <= budget { lo = mid }` 的判断
+    ///   短路成恒假(`lo` 永远停在初值不再前进)→ 正常情形那条炸,预算
+    ///   14 放得下两个字符却截成 `""`(`left: "" / right: "ab"`)。
+    #[test]
+    fn truncate_to_width_returns_an_empty_prefix_for_a_non_positive_budget() {
+        assert_eq!(truncate_to_width("", 0.0, &stub_measure), "");
+        assert_eq!(truncate_to_width("abc", 0.0, &stub_measure), "");
+        assert_eq!(truncate_to_width("很长的中文", -5.0, &stub_measure), "");
+        // 不是只测退化路径:预算刚好放得下两个 ASCII 字符时,返回两字符前缀。
+        assert_eq!(truncate_to_width("abcdef", 14.0, &stub_measure), "ab");
+    }
+
+    /// F137 的验收判据:长名字**画不到**「大小」列上。
+    ///
+    /// 纯函数那两条只守 `elide()` 自己算得对不对 —— 生产代码完全可以
+    /// 算完了不用(或者预算传错),这条从真实渲染结果里取两个 galley
+    /// 的横向区间来比,才守得住「接上了」。
+    ///
+    /// 自证会变红:把 `row()` 里名称那处的 `elide(...)` 换回原来的
+    /// `label` 直画。
+    #[test]
+    fn a_long_name_is_elided_so_it_cannot_reach_the_size_column() {
+        /// 找到含 `needle` 的文字,返回它的**横向区间**(左, 右)。
+        fn text_span(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<(f32, f32)> {
+            fn walk(shape: &egui::Shape, needle: &str) -> Option<(f32, f32)> {
+                match shape {
+                    egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                    egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                        Some((ts.pos.x, ts.pos.x + ts.galley.size().x))
+                    }
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+        }
+
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        // 长到无论如何都放不进 220pt 名称列的名字。
+        state.entries = vec![entry(
+            b"aaaaaaaaaa-bbbbbbbbbb-cccccccccc-dddddddddd-eeeeeeeeee.tar.gz",
+            EntryKind::File,
+        )];
+        state.load = Load::Ready;
+
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(raw(None), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        &[],
+                        0,
+                        &mut cols,
+                    );
+                });
+            }));
+        }
+        let out = out.expect("跑了两帧");
+        // 名称的 galley:截断后一定含 `…`,而且尾巴留着 `.tar.gz`。
+        let name = text_span(&out.shapes, "…").expect("长名字应该被截断并带上省略号");
+        let value = text_span(&out.shapes, "1.0 KB").expect("行里该画出大小数值");
+        assert!(
+            name.1 <= value.0 + 0.01,
+            "名字右边界 {} 越过了大小数值左边界 {} —— 两串文字重叠在一起了",
+            name.1,
+            value.0
+        );
+    }
+
+    /// F137 的验收判据(列头):`row()` 那条只守行体,列头没有对应守护——
+    /// 补的这一条。把「修改时间」列拖到窄于标题本身的宽度,标题必须被
+    /// 截断到不超列宽,不能横穿到隔壁列头上面。
+    ///
+    /// 自证会变红:把 `header_at()` 里的 `elide(...)` 换回
+    /// `format!("{label}{mark}")` 直画(已实测:47 条既有测试原样全绿,
+    /// 说明没有任何既有测试守着列头这一处,必须补)。
+    #[test]
+    fn a_narrow_column_header_is_elided_so_it_does_not_overflow_the_column() {
+        /// 找到「文字是 `full` 的前缀(可能带一个尾随 `…`)」的那个 galley,
+        /// 返回它的宽度。不按精确字符串找 —— 截断结果具体截多少字符是
+        /// `elide()` 的实现细节,这里只关心「有没有截、宽度对不对」。
+        fn prefix_galley_width(shapes: &[egui::epaint::ClippedShape], full: &str) -> Option<f32> {
+            fn walk(shape: &egui::Shape, full: &str) -> Option<f32> {
+                match shape {
+                    egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, full)),
+                    egui::Shape::Text(ts) => {
+                        let text = ts.galley.text();
+                        let head = text.strip_suffix('…').unwrap_or(text);
+                        (!head.is_empty() && full.starts_with(head)).then(|| ts.galley.size().x)
+                    }
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|cs| walk(&cs.shape, full))
+        }
+
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+
+        // 「修改时间」四个 CJK 字在 11pt 下实测宽 44 —— 30pt 一定放不下、
+        // 会被截断,又没窄到连省略号都放不下(那样会画出空字符串,反而
+        // 测不了「有没有截断」)。
+        let mut cols = ColWidths {
+            mtime: 30.0,
+            ..ColWidths::default()
+        };
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(raw(None), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        &[],
+                        0,
+                        &mut cols,
+                    );
+                });
+            }));
+        }
+        let out = out.expect("跑了两帧");
+        let w = prefix_galley_width(&out.shapes, "修改时间")
+            .expect("「修改时间」列头该画出一个是全名前缀的 galley");
+        assert!(
+            w <= cols.mtime + 0.01,
+            "列头宽 {w} 超过了列宽 {}(mtime 列),标题横穿到隔壁列头去了",
+            cols.mtime
+        );
     }
 
     /// D1:名称文字的起点必须落在图标格子**右侧**,不能重叠 —— 否则长文件名
@@ -1316,7 +1810,11 @@ mod tests {
     ///
     /// 两帧不是保险起见:egui 的 `Panel`/`Area` 首帧带 fade_in,记的是
     /// `Shape::Noop`,只画一帧一个字都读不到。
-    fn rendered_texts(state: &mut PaneState) -> Vec<String> {
+    ///
+    /// `cols`:调用方传列宽 —— 非 UTF-8 那两条测试要用远宽于默认值的名称列
+    /// (见其调用处注释:默认 220pt 下这两条只是踩着 1pt 余量幸存,字体度量/
+    /// DPI/字体版本任何一点漂移都会让它们翻红)。
+    fn rendered_texts(state: &mut PaneState, cols: &mut ColWidths) -> Vec<String> {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let mut texts = Vec::new();
@@ -1324,7 +1822,18 @@ mod tests {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, "远端", 1, PanelColumn::Remote, state, false, &[], 0);
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        cols,
+                    );
                 });
             });
             for shape in out.shapes.iter() {
@@ -1337,6 +1846,13 @@ mod tests {
     }
 
     /// 非 UTF-8 的名字必须**看得见**(用户要知道那儿有东西)且**标注不可操作**。
+    ///
+    /// 用远宽于默认值的名称列(900pt)跑 —— 这条守的是「提示存在」,不是
+    /// 「窄列下也完整可见」;实测默认 220pt 名称列下,拼完整串
+    /// `中.txt(名称非 UTF-8,本版无法操作)` 宽 193.0pt,预算
+    /// `220 - 24(图标+间隙) - 4(SP_XS) = 192.0pt`,只差 1pt 就会把
+    /// 「名称非 UTF-8」这句自己截掉 —— 字体度量/DPI/字体版本任何一点漂移
+    /// 都会让它翻红,不该悬在这种边界上。
     #[test]
     fn a_non_utf8_name_is_shown_with_an_explicit_note() {
         let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
@@ -1346,7 +1862,11 @@ mod tests {
         )];
         state.load = Load::Ready;
 
-        let texts = rendered_texts(&mut state);
+        let mut cols = ColWidths {
+            name: 900.0,
+            ..ColWidths::default()
+        };
+        let texts = rendered_texts(&mut state, &mut cols);
         assert!(
             texts.iter().any(|s| s.contains("名称非 UTF-8")),
             "非 UTF-8 条目要带明确说明,实际画出来的文本: {texts:?}"
@@ -1365,6 +1885,8 @@ mod tests {
     /// 从 `is_operable()` 改回 `is_utf8()` 它照样绿。而 `russh-sftp 2.4.0` 收包
     /// 时就把非 UTF-8 字节 lossy 成了这种串 —— 真实链路上到手的**只有**这一类,
     /// 上一条守不住的恰恰是唯一会发生的那种。
+    ///
+    /// 同上一条,用 900pt 名称列跑 —— 理由同见其文档注释。
     #[test]
     fn a_lossy_name_that_is_valid_utf8_is_still_marked_unusable() {
         let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
@@ -1375,7 +1897,11 @@ mod tests {
             "前提:这串本身是合法 UTF-8,这正是不能拿 is_utf8() 当判据的原因"
         );
 
-        let texts = rendered_texts(&mut state);
+        let mut cols = ColWidths {
+            name: 900.0,
+            ..ColWidths::default()
+        };
+        let texts = rendered_texts(&mut state, &mut cols);
         assert!(
             texts.iter().any(|s| s.contains("名称非 UTF-8")),
             "lossy 名字也要标注不可操作,实际画出来的文本: {texts:?}"
@@ -1404,11 +1930,12 @@ mod tests {
         frame.local.load = Load::Ready;
 
         let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
         let mut texts = Vec::new();
         for _ in 0..2 {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0);
+                content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
             });
             for shape in out.shapes.iter() {
                 if let egui::epaint::Shape::Text(ts) = &shape.shape {
@@ -1471,6 +1998,7 @@ mod tests {
             state.entries = vec![entry(b"a.txt", EntryKind::File)];
             state.load = Load::Ready;
             let ctx = egui::Context::default();
+            let mut cols = ColWidths::default();
             let mut n = 0;
             for _ in 0..2 {
                 let out = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1485,6 +2013,7 @@ mod tests {
                             focused,
                             &[],
                             0,
+                            &mut cols,
                         );
                     });
                 });
@@ -1526,6 +2055,206 @@ mod tests {
             scroll_id_salt("本地", 1),
             "同一标签内远端栏和本地栏的 ScrollArea id 撞了"
         );
+    }
+
+    /// F136:内容比视口宽时,横着滚 —— 而且**列头要跟着一起滚**。
+    /// 列头不跟的话,滚过去之后标题和数据完全对不上,比不能滚更糟。
+    ///
+    /// 判据是「位移量相同」而不是「x 相等」:列头标题左对齐、行内数值
+    /// 右对齐,静态 x 本来就不相等。
+    ///
+    /// 自证会变红(两条各自):
+    /// 1. 把 `header_at()` 里的 `- offset_x` 去掉(列头不跟随);
+    /// 2. 把 `ScrollArea::both()` 改回 `vertical()`(根本滚不动,前置断言先红)。
+    #[test]
+    fn horizontal_scroll_moves_the_header_and_the_rows_by_the_same_amount() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        // 视口给得比内容总宽窄一大截,逼出横向滚动。
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 400.0));
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState, cols: &mut ColWidths| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        cols,
+                    );
+                });
+            })
+        };
+        let base = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let _ = render(base.clone(), &mut state, &mut cols);
+        let before = render(base.clone(), &mut state, &mut cols);
+        let head_before = find_text_pos(&before.shapes, "大小")
+            .expect("该画出列头「大小」")
+            .x;
+        let value_before = find_text_pos(&before.shapes, "1.0 KB")
+            .expect("该画出大小数值")
+            .x;
+
+        // 灌一股**水平**滚轮(Shift 不需要:MouseWheel 的 delta.x 就是横向)。
+        let scroll = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(150.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(-120.0, 0.0),
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = render(scroll, &mut state, &mut cols);
+        // 平滑滚动有插值,多跑两帧让偏移稳定。
+        let _ = render(base.clone(), &mut state, &mut cols);
+        let after = render(base, &mut state, &mut cols);
+        let head_after = find_text_pos(&after.shapes, "大小")
+            .expect("滚动后该仍画出列头「大小」")
+            .x;
+        let value_after = find_text_pos(&after.shapes, "1.0 KB")
+            .expect("滚动后该仍画出大小数值")
+            .x;
+
+        let d_value = value_after - value_before;
+        assert!(
+            d_value < -1.0,
+            "灌了水平滚轮,行内数值却没左移(位移 {d_value})—— 横向滚动没生效,测试前提不成立"
+        );
+        let d_head = head_after - head_before;
+        assert!(
+            (d_head - d_value).abs() < 1.0,
+            "列头位移 {d_head} 与行体位移 {d_value} 对不上 —— 列头没跟着横向滚动走"
+        );
+    }
+
+    /// F100/F136:横滚之后,某一列整个移出可视区,它就**不该**再出现在标注
+    /// 模式的候选表里——登记一个屏幕上已经看不见、点不到的矩形,F100 会给
+    /// 用户报出一个假目标。判据放宽成「但凡登记了,矩形必须落在 `header_band`
+    /// 内」而不是死抠「名称」这一列会不会消失:后者跟视口宽/列宽的具体数字
+    /// 绑得太死,改一下默认列宽这条就会莫名其妙红。
+    ///
+    /// 直接把 `ScrollArea` 的持久化偏移量写死到一个「名称列整个滚出去了」的
+    /// 值,不真的去灌一串滚轮——F136 那条已经证过滚轮驱动的动画要跨很多
+    /// 真实帧才收敛,这里只关心「偏移量很大时标注还对不对」,没必要跟着
+    /// 陪绑那份收敛时机。
+    ///
+    /// 自证会变红:把 `header_at()` 里 `annotate::mark(..., rect.intersect(band))`
+    /// 改回 `annotate::mark(..., rect)`(不求交,直接登记未裁剪矩形)。
+    #[test]
+    fn a_column_scrolled_out_of_view_is_not_registered_with_an_off_screen_rect() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 400.0));
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let base = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        // 先跑一帧拿到 `show()` 内部用来拼 `ScrollArea` 持久化 id 的那个
+        // 父 `Ui` id——跟生产代码里 `header_offset_x` 用的是同一份计算
+        // (`ui.make_persistent_id(egui::Id::new(scroll_id_salt(...)))`)。
+        let mut parent_id = None;
+        let _ = ctx.run(base.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                parent_id = Some(ui.id());
+                show(
+                    ui,
+                    &t,
+                    "远端",
+                    1,
+                    PanelColumn::Remote,
+                    &mut state,
+                    false,
+                    &[],
+                    0,
+                    &mut cols,
+                );
+            });
+        });
+        let scroll_id = parent_id
+            .expect("该拿到 Ui id")
+            .with(egui::Id::new(scroll_id_salt("远端", 1)));
+
+        // 直接把持久化偏移写死成「名称列(宽 220)整个滚出去」的量,不用等
+        // 滚轮动画收敛。
+        let mut seeded = egui::scroll_area::State::default();
+        seeded.offset.x = ColWidths::default().name + 30.0;
+        seeded.store(&ctx, scroll_id);
+
+        annotate::toggle(&ctx);
+        // egui 的 `Panel`/`Area` 首帧有 fade-in,多跑一帧让矩形稳定
+        // (同文件其它标注测试的既有做法)。
+        let _ = ctx.run(base.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    &t,
+                    "远端",
+                    1,
+                    PanelColumn::Remote,
+                    &mut state,
+                    false,
+                    &[],
+                    0,
+                    &mut cols,
+                );
+            });
+        });
+        let _ = ctx.run(base, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    &t,
+                    "远端",
+                    1,
+                    PanelColumn::Remote,
+                    &mut state,
+                    false,
+                    &[],
+                    0,
+                    &mut cols,
+                );
+            });
+        });
+
+        let band = annotate::spot_rect(&ctx, "文件面板/远端/列头").expect("列头横带该登记");
+        let paths = annotate::spot_paths(&ctx);
+        let col_paths: Vec<&String> = paths
+            .iter()
+            .filter(|p| p.starts_with("文件面板/远端/列头/"))
+            .collect();
+        assert!(
+            !col_paths.is_empty(),
+            "至少该有几列还留在可视区内,候选表却是空的:{paths:?}"
+        );
+        for p in col_paths {
+            let r = annotate::spot_rect(&ctx, p).unwrap_or_else(|| panic!("{p} 该找得到矩形"));
+            assert!(
+                band.contains_rect(r),
+                "{p} 登记的矩形 {r:?} 超出了列头横带 {band:?} —— 横向滚动后 \
+                 F100 报出了一个屏幕上已经看不见的候选"
+            );
+        }
     }
 
     /// F6/Tab 换焦点(设计 D23):`PanelColumn::flipped` 必须真的换到另一栏,
@@ -1583,6 +2312,7 @@ mod tests {
             path: "/var/log".into(),
         }];
         let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
         // 先跑一帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop)。
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1596,6 +2326,7 @@ mod tests {
                     false,
                     &bookmarks,
                     0,
+                    &mut cols,
                 );
             });
         });
@@ -1611,6 +2342,7 @@ mod tests {
                     false,
                     &bookmarks,
                     0,
+                    &mut cols,
                 );
             });
         });
@@ -1642,6 +2374,7 @@ mod tests {
                     false,
                     &bookmarks,
                     0,
+                    &mut cols,
                 );
             });
         });
@@ -1666,6 +2399,7 @@ mod tests {
             path: "/srv/app".into(),
         }];
         let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
         let mut texts = Vec::new();
         for _ in 0..2 {
             texts.clear();
@@ -1681,6 +2415,7 @@ mod tests {
                         false,
                         &bookmarks,
                         0,
+                        &mut cols,
                     );
                 });
             });
@@ -1715,11 +2450,12 @@ mod tests {
         frame.local.load = Load::Ready;
 
         let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
         let mut texts = Vec::new();
         for _ in 0..2 {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0);
+                content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
             });
             for shape in out.shapes.iter() {
                 if let egui::epaint::Shape::Text(ts) = &shape.shape {
@@ -1834,10 +2570,11 @@ mod tests {
             .selected
             .insert(RemotePath::from_bytes(b"a.txt".to_vec()));
         let ctx = egui::Context::default();
-        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
             });
             (acts, out)
         };
@@ -1872,10 +2609,11 @@ mod tests {
             .selected
             .insert(RemotePath::from_bytes(b"a.txt".to_vec()));
         let ctx = egui::Context::default();
-        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
             });
             (acts, out)
         };
@@ -1910,10 +2648,11 @@ mod tests {
             .selected
             .insert(RemotePath::from_bytes(b"b.txt".to_vec()));
         let ctx = egui::Context::default();
-        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
             });
             (acts, out)
         };
@@ -1950,10 +2689,11 @@ mod tests {
             .selected
             .insert(RemotePath::from_bytes(b"b.txt".to_vec()));
         let ctx = egui::Context::default();
-        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
             });
             (acts, out)
         };
@@ -1986,10 +2726,11 @@ mod tests {
         let t = crate::theme::MULLION_DARK;
         let mut frame = two_columns();
         let ctx = egui::Context::default();
-        let render = |input: egui::RawInput, frame: &mut PanelFrame| {
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
             });
             (acts, out)
         };
@@ -2020,11 +2761,23 @@ mod tests {
         state.entries = vec![entry(b"a.txt", EntryKind::File)];
         state.load = Load::Ready;
         let ctx = egui::Context::default();
-        let render = |input: egui::RawInput, state: &mut PaneState| {
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, state: &mut PaneState| {
             let mut action = None;
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = show(ui, &t, "远端", 1, PanelColumn::Remote, state, false, &[], 0);
+                    action = show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        &mut cols,
+                    );
                 });
             });
             (action, out)
@@ -2166,11 +2919,23 @@ mod tests {
         ];
         state.load = Load::Ready;
         let ctx = egui::Context::default();
-        let render = |input: egui::RawInput, state: &mut PaneState| {
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, state: &mut PaneState| {
             let mut action = None;
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = show(ui, &t, "远端", 1, PanelColumn::Remote, state, false, &[], 0);
+                    action = show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        &mut cols,
+                    );
                 });
             });
             (action, out)
@@ -2221,14 +2986,26 @@ mod tests {
         // 双击是另一条独立的入口,漏了它照样能把本地文件送去编辑远端。
         {
             let ctx = egui::Context::default();
+            let mut cols = ColWidths::default();
             let mut local = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
             local.entries = vec![entry(b"a.txt", EntryKind::File)];
             local.load = Load::Ready;
-            let render_local = |input: egui::RawInput, state: &mut PaneState| {
+            let mut render_local = |input: egui::RawInput, state: &mut PaneState| {
                 let mut action = None;
                 let out = ctx.run(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        action = show(ui, &t, "本地", 1, PanelColumn::Local, state, false, &[], 0);
+                        action = show(
+                            ui,
+                            &t,
+                            "本地",
+                            1,
+                            PanelColumn::Local,
+                            state,
+                            false,
+                            &[],
+                            0,
+                            &mut cols,
+                        );
                     });
                 });
                 (action, out)
@@ -2282,6 +3059,7 @@ mod tests {
         // 几乎全部宽度,点哪儿都落在它身上,测试测不出真实场景下四列挤在
         // 一起时点击会不会打偏。
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 700.0));
+        let mut cols = ColWidths::default();
         let mut header_rect = None;
         for frame in 0..4 {
             let mut input = egui::RawInput {
@@ -2318,6 +3096,7 @@ mod tests {
                         false,
                         &[],
                         0,
+                        &mut cols,
                     );
                 });
             });
@@ -2348,6 +3127,7 @@ mod tests {
 
         // 标签宿主用宽窗口,否则无边界画布会让左右两栏的几何断言失真。
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut cols = ColWidths::default();
         for _ in 0..3 {
             let _ = ctx.run(
                 egui::RawInput {
@@ -2355,7 +3135,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0);
+                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
                 },
             );
         }
@@ -2481,6 +3261,7 @@ mod tests {
             frame.local.load = Load::Ready;
             frame.remote.entries = vec![entry(b"remote-a.txt", EntryKind::File)];
             frame.remote.load = Load::Ready;
+            let mut cols = ColWidths::default();
 
             let mut out = None;
             for _ in 0..3 {
@@ -2490,7 +3271,7 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        content(ctx, &t, 7, true, &mut frame, 0);
+                        content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
                     },
                 ));
             }
@@ -2539,6 +3320,7 @@ mod tests {
             .map(|i| entry(format!("remote-{i}.txt").as_bytes(), EntryKind::File))
             .collect();
         frame.remote.load = Load::Ready;
+        let mut cols = ColWidths::default();
 
         let text_y = |shapes: &[egui::epaint::ClippedShape], needle: &str| -> f32 {
             find_text_pos(shapes, needle)
@@ -2555,7 +3337,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0);
+                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
                 },
             ));
         }
@@ -2577,7 +3359,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = Some(ctx.run(scroll_input, |ctx| {
-            content(ctx, &t, 7, true, &mut frame, 0);
+            content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
         }));
         // 再跑两帧,让滚动状态稳定下来(smooth scroll 有插值)。
         for _ in 0..2 {
@@ -2587,7 +3369,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0);
+                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
                 },
             ));
         }
@@ -2607,129 +3389,151 @@ mod tests {
         );
     }
 
-    /// D3:名称列宽度必须**一处算**。`row()` 或 `header()` 里再写一遍这个
-    /// 减法表达式的话,加一列就会有一处漏改,现象是列头文字和行内容错位——
-    /// 而且错得很小(几个像素),没人会当成 bug 报上来,它就一直错着。
+    /// F136/D1:五列**恒定存在**,不再随宽度收起。窄栏下放不下是靠横向
+    /// 滚动条解决的,不是靠把列藏起来 —— 藏起来的那一版会让「属主」这类
+    /// 信息在默认侧栏宽下永远看不到。
     ///
-    /// 自证会变红:在 `row()` 里加一份内联的 `total - W_ICON - ICON_GAP - sum`
-    /// 影子计算(哪怕值算对,这条测试也该红——它守的是「只有一处」,不是
-    /// 「算得对不对」)。
+    /// 自证会变红:在 `col_lefts()` 里按总宽过滤掉最后几列。
     #[test]
-    fn the_name_column_width_is_computed_in_exactly_one_place() {
-        let src = include_str!("files_panel.rs");
-        // 扫产品代码(第一个 #[cfg(test)] 之前),数一数减法表达式出现几次。
-        let prod = src.split("#[cfg(test)]").next().expect("源码切歪了");
-        let inline = prod.matches("- W_ICON - ICON_GAP - sum").count();
+    fn all_five_columns_are_present_no_matter_how_narrow_the_panel_is() {
+        let cols = ColWidths::default();
+        let keys: Vec<SortKey> = col_lefts(&cols).iter().map(|&(_, k, _, _)| k).collect();
         assert_eq!(
-            inline, 1,
-            "名称列宽度算了 {inline} 次 —— 必须只在 `name_w()` 里算一次,\
-             两处各算一遍会让列头和行错位"
+            keys,
+            vec![
+                SortKey::Name,
+                SortKey::Size,
+                SortKey::Mtime,
+                SortKey::Perm,
+                SortKey::Owner
+            ],
+            "五列的顺序或数量变了 —— 列布局是唯一真值来源,顺序即收起顺序的时代已经结束"
         );
     }
 
-    /// D2/控制者补充 2/协调者复核收口:列头与行体的**每一条**列边界都必须
-    /// 重合,在 k=4/3/2/1/0 五个档位各取一个代表宽度(含 280/360/488/640
-    /// 四个真实值:280/640 是侧栏拖拽范围两端,360 是默认侧栏宽,488 是
-    /// 旧的「四列恒定宽」临界点)。这条测试守的是:列头文字与行内容错位
-    /// 几个像素这件事,错位很小,没人会当成 bug 报上来,它会一直悄悄错着。
+    /// 列坐标必须是**首尾相接、无缝无叠**的累加,而且总宽等于各列之和 ——
+    /// `content_w()` 与 `col_lefts()` 一旦对不上,横向滚动的可滚范围就会
+    /// 比实际内容短一截,最右边那列永远滚不到。
     ///
-    /// 两侧都调**生产函数**——列头侧 `header_col_lefts()`/`header_name_col_w()`
-    /// 是 `header()` 自己也调的那份计算,行体侧 `row_col_lefts()`/
-    /// `row_size_col_left()` 是 `row()` 自己也调的那份计算,测试不独立重建
-    /// 任何一侧的算式(同 `icon_rect()` 的教训:测试自己拼一份「我以为生产
-    /// 代码是这么写的」公式的话,生产代码那份改错了,测试仍然只是在跟自己
-    /// 的影子比,照样测不出来)。`header_col_lefts()`/`row_col_lefts()` 各自
-    /// 独立累加(不共用最终结果),一边改错了另一边不会跟着错。
-    ///
-    /// 自证会变红(两条各自):
-    /// 1. 把 `header_name_col_w()` 里的 `+ W_ICON + ICON_GAP` 去掉;
-    /// 2. 把 `row_col_lefts()` 里某个列宽换成别的常量(比如把属主列的宽度
-    ///    换成 `W_PERM`)。
+    /// 自证会变红:把 `content_w()` 改成漏加 `owner`;或在 `col_lefts()`
+    /// 的累加里插一个间距。
     #[test]
-    fn the_header_and_row_size_column_start_at_the_same_x_across_widths() {
-        // (宽度, 期望的可见列数 k)——见 `visible_col_count()` 的分档:
-        // 150→0(深度夹紧,连一列可选列都放不下),280→1(侧栏拖拽下限),
-        // 360→2(默认侧栏宽),420→3(k=3 的代表宽度,落在 [396,488) 区间),
-        // 488→4(旧的「四列恒定宽」临界点,恰好卡在地板上),640→4(侧栏
-        // 拖拽上限,不夹紧,富余量最大)。
-        for (w, expect_k) in [
-            (150.0_f32, 0usize),
-            (280.0, 1),
-            (360.0, 2),
-            (420.0, 3),
-            (488.0, 4),
-            (640.0, 4),
-        ] {
-            // 名称列本身的边界(列头/行体各自的「合并区域」右边界)。
-            let header_name_left = header_name_col_w(w);
-            let row_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, ROW_H));
-            let row_name_left = row_size_col_left(row_rect);
+    fn column_lefts_are_contiguous_and_sum_to_the_content_width() {
+        let cols = ColWidths {
+            name: 111.0,
+            size: 22.0,
+            mtime: 33.0,
+            perm: 44.0,
+            owner: 55.0,
+        };
+        let lay = col_lefts(&cols);
+        assert_eq!(lay[0].2, 0.0, "第一列必须从 0 起算(相对行左边界)");
+        for w in lay.windows(2) {
+            let (label, _, left, width) = w[0];
+            let (next_label, _, next_left, _) = w[1];
             assert!(
-                (header_name_left - row_name_left).abs() < 0.01,
-                "宽度 {w} 下列头/行体「名称」列右边界不重合:列头 {header_name_left}, 行体 {row_name_left}"
+                (left + width - next_left).abs() < 0.01,
+                "「{label}」右边界 {} 与「{next_label}」左边界 {next_left} 不相接",
+                left + width
             );
-
-            let header_cols = header_col_lefts(w);
-            let row_cols = row_col_lefts(row_rect);
-            assert_eq!(
-                header_cols.len(),
-                expect_k,
-                "宽度 {w} 下列头侧可见列数不对:期望 {expect_k},实际 {}",
-                header_cols.len()
-            );
-            assert_eq!(
-                header_cols.len(),
-                row_cols.len(),
-                "宽度 {w} 下列头/行体可见列数不一致:列头 {},行体 {}",
-                header_cols.len(),
-                row_cols.len()
-            );
-            for (h, r) in header_cols.iter().zip(row_cols.iter()) {
-                let (h_label, h_key, h_left, h_w) = *h;
-                let (_, r_key, r_left, r_w) = *r;
-                assert_eq!(
-                    h_key, r_key,
-                    "宽度 {w} 下列头/行体列顺序不一致:列头 {h_label:?}({h_key:?}),行体 {r_key:?}"
-                );
-                assert!(
-                    (h_left - r_left).abs() < 0.01,
-                    "宽度 {w} 下「{h_label}」列左边界不重合:列头 {h_left}, 行体 {r_left}"
-                );
-                assert!(
-                    (h_w - r_w).abs() < 0.01,
-                    "宽度 {w} 下「{h_label}」列宽不一致:列头 {h_w}, 行体 {r_w}"
-                );
-            }
         }
+        let last = lay[4];
+        assert!(
+            (last.2 + last.3 - content_w(&cols)).abs() < 0.01,
+            "最后一列右边界 {} 与 content_w() {} 对不上",
+            last.2 + last.3,
+            content_w(&cols)
+        );
     }
 
-    /// D2/控制者补充 2:宽度不够时,大小/修改时间/权限/属主四列必须**从右
-    /// 向左**收起(先丢属主,再权限,再修改时间,最后大小)。这是复核实测
-    /// 出的真实画面对应的修法:默认侧栏 360px 下,不收起的话属主列有数据
-    /// 没标题(标题起点 396 被列头裁掉了),权限标题反而画到了权限数据
-    /// 右边——收起可选列、让名称列吃掉剩余宽度之后,这个错位从根上消失
-    /// (见 `visible_col_count()`/`name_w()` 的文档注释)。
+    /// D3 的替代守护:列头与行体**画在同一组 x 上**。原来两边各自累加,
+    /// 靠一条几何测试守住不许错位;现在坐标同源,几何断言会退化成重言式
+    /// —— 所以改成从**真实渲染结果**里取两串文字来比:列头的「大小」标题
+    /// 与行里的大小数值必须落在同一列里。
     ///
-    /// 自证会变红:
-    /// 1. 把可见列数的判据 `< 80.0` 改成 `< 0.0`(等价于永不收起);
-    /// 2. 把 `OPTIONAL_COLS` 的收起顺序反过来(从左往右丢)。
+    /// **不能直接比两个文字中心的 x**:列头左对齐、数值右对齐,中心天生
+    /// 不相等。改成比**中心差**——已知列头中心是「`C` 加 `size_left` 加
+    /// `SP_XS` 再加 `hw` 的一半」,数值中心是「`C` 加 `size_left` 加
+    /// `size_w` 减 `SP_XS` 再减 `vw` 的一半」(`C` 是面板内容区左边界,
+    /// 列头与行体共用同一个 `ui`、同一个 `C`,减法里直接消掉,不需要求出
+    /// 它的绝对值)。所以「期望差」只剩 `2*SP_XS + (hw+vw)/2 - size_w`,
+    /// `hw`/`vw`(两串文字的实际像素宽)用 `ctx.fonts()` 现场量,不写死
+    /// 数字——字体度量随平台/字体版本变,硬编码在别的机器上会假红。容差
+    /// 1.0pt,只够盖浮点/像素取整的抖动。
+    ///
+    /// 这条测试的前一版容差是 `±size_w`(整列宽),20px 的错位量不到列宽
+    /// 一半,盖不住——**已实测**:见下方两次记录。
+    ///
+    /// 自证(已实测,不是猜的):给 `header_at()` 的列 rect 临时加一个
+    /// 20px 偏移(`egui::pos2(band.left() + left - offset_x + 20.0, ...)`)
+    /// → 这条测试 FAIL(中心差偏出 1.0pt 容差,实测偏移量 ≈20pt);还原
+    /// 偏移后 PASS。旧的「容差 ±size_w」写法在同样 20px 偏移下量不出来
+    /// (复核挖出的问题,190px 左右才会触发旧判据)。
     #[test]
-    fn columns_are_dropped_from_the_right_as_the_panel_gets_narrower() {
-        assert_eq!(visible_col_count(640.0), 4, "640px(侧栏上限)应该四列全在");
-        assert_eq!(visible_col_count(488.0), 4, "488px(旧临界点)应该四列全在");
-        assert_eq!(visible_col_count(360.0), 2, "360px(默认侧栏宽)应该只剩两列");
-        assert_eq!(visible_col_count(280.0), 1, "280px(侧栏下限)应该只剩一列");
+    fn the_size_header_and_the_size_value_land_in_the_same_column() {
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
 
-        // 420px 落在 k=3 的区间([396,488))——可见的应该是「大小/修改时间/
-        // 权限」,收起的应该是最右边的「属主」,不是别的列。
-        let keys: Vec<SortKey> = header_col_lefts(420.0)
-            .iter()
-            .map(|&(_, key, _, _)| key)
-            .collect();
-        assert_eq!(
-            keys,
-            vec![SortKey::Size, SortKey::Mtime, SortKey::Perm],
-            "420px 下理应可见「大小/修改时间/权限」三列、收起「属主」——实际可见: {keys:?}"
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(raw(None), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        &[],
+                        0,
+                        &mut cols,
+                    );
+                });
+            }));
+        }
+        let out = out.expect("跑了两帧");
+        // `entry()` 的 size 是 1024 → `human_size` 印成 "1.0 KB"。
+        let head = find_text_pos(&out.shapes, "大小").expect("列头该画出「大小」");
+        let value = find_text_pos(&out.shapes, "1.0 KB").expect("行里该画出大小数值");
+
+        // 现场量出两串文字各自的像素宽——字体/字号跟生产代码
+        // (`header_at()`/`row()`)完全对应:列头用 11.0 号 `fg_muted`,
+        // 数值用 12.0 号 `fg_mid`。
+        let hw = ctx
+            .fonts(|f| {
+                f.layout_no_wrap(
+                    "大小".to_string(),
+                    egui::FontId::proportional(11.0),
+                    theme::c32(t.fg_muted),
+                )
+            })
+            .size()
+            .x;
+        let vw = ctx
+            .fonts(|f| {
+                f.layout_no_wrap(
+                    "1.0 KB".to_string(),
+                    egui::FontId::proportional(12.0),
+                    theme::c32(t.fg_mid),
+                )
+            })
+            .size()
+            .x;
+
+        let lay = col_lefts(&cols);
+        let (_, _, _size_left, size_w) = lay[1];
+        let expected_diff = 2.0 * crate::ui::metrics::SP_XS + (hw + vw) / 2.0 - size_w;
+        let actual_diff = head.x - value.x;
+        assert!(
+            (actual_diff - expected_diff).abs() < 1.0,
+            "列头「大小」与行内数值的中心差 = {actual_diff},期望 {expected_diff}\
+             (容差 1.0pt)—— 列头与行体的列坐标分家了"
         );
     }
 
@@ -2745,25 +3549,22 @@ mod tests {
         assert_eq!(owner_text(PanelColumn::Remote, 1000, 1000), "1000:1000");
     }
 
-    /// 质量复核实测:把 `row()` 里权限槽(`cols.get(2)`)与属主槽
-    /// (`cols.get(3)`)绘制的内容对调,`files_panel` 全部 33 个测试全绿——
-    /// 对齐守护测试(`the_header_and_row_size_column_start_at_the_same_x_
-    /// across_widths`)只比几何(label/key/left/width),完全不看「谁画在
-    /// 哪个槽位」。用户会在「权限」标题下看到 `uid:gid`、在「属主」标题下
-    /// 看到 `rwxr-x---`,测试网毫无反应。
+    /// 质量复核实测:把 `row()` 里权限槽(`lay[3]`)与属主槽(`lay[4]`)
+    /// 绘制的内容对调,`files_panel` 全部测试全绿——列坐标测试只比几何
+    /// (label/key/left/width),完全不看「谁画在哪个槽位」。用户会在
+    /// 「权限」标题下看到 `uid:gid`、在「属主」标题下看到 `rwxr-x---`,
+    /// 测试网毫无反应。
     ///
     /// 这条测试直接读渲染出的 `Shape::Text`,断言每个槽位画出来的数据
     /// 文本落在**自己**那个槽位的 x 区间里。顺带把大小、修改时间两个槽位
-    /// 也一并锁上——同一类判据,x 区间同样来自 `row_col_lefts()`,不算
-    /// 超范围。
+    /// 也一并锁上——同一类判据,x 区间同样来自 `col_lefts()`,不算超范围。
     ///
     /// entry 特意挑了四个槽位互不相同、不会看混的值:大小 `777 B`、权限
     /// `rwxr-x---`、属主 `1000:33`,彼此没有子串重叠,`find_text_pos` 不会
     /// 找混。
     ///
-    /// x 区间来自生产函数 `row_col_lefts(row_rect)`——`row()` 自己也调的
-    /// 那份计算,测试不重抄坐标(同 `icon_rect()`/`row_size_col_left()` 的
-    /// 教训)。
+    /// x 区间来自生产函数 `col_lefts(cols)`——`row()` 自己也调的那份计算,
+    /// 测试不重抄坐标(同 `icon_rect()` 的教训)。
     ///
     /// 自证会变红:把 `row()` 里权限槽与属主槽两处绘制的内容对调
     /// (`perm_string(e.mode)` 画进属主槽的 `p.text(...)`、
@@ -2778,8 +3579,8 @@ mod tests {
             gid: 33,
             ..entry(b"f.txt", EntryKind::File)
         };
-        // 700px:留足余量的 k=4 代表宽度,四个可选列全部可见。
-        let width = 700.0_f32;
+        let cols = ColWidths::default();
+        let width = content_w(&cols);
         let ctx = egui::Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default()
@@ -2787,26 +3588,23 @@ mod tests {
                 .show(ctx, |ui| {
                     // 显式给 `row()` 一块零边距、宽度已知的矩形——不然
                     // `row_rect` 的实际宽度取决于 egui 默认 `screen_rect` /
-                    // `CentralPanel` 默认边距,测试里没法跟 `row_col_lefts()`
+                    // `CentralPanel` 默认边距,测试里没法跟 `col_lefts()`
                     // 对上同一个数。手法同生产代码 `content()` 切两栏
                     // (`ui.scope_builder(UiBuilder::new().max_rect(..))`)。
                     let rect =
                         egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(width, ROW_H));
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        row(ui, &t, &e, PanelColumn::Remote, false);
+                        row(ui, &t, &e, PanelColumn::Remote, false, &cols);
                     });
                 });
         });
 
-        let row_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, ROW_H));
-        let cols = row_col_lefts(row_rect);
-        assert_eq!(cols.len(), 4, "700px 应该四列全部可见,自查前提不成立");
-
+        let lay = col_lefts(&cols);
         let expect = [
-            (human_size(e.size), cols[0]),
-            (mtime_text(e.mtime), cols[1]),
-            (perm_string(e.mode), cols[2]),
-            (owner_text(PanelColumn::Remote, e.uid, e.gid), cols[3]),
+            (human_size(e.size), lay[1]),
+            (mtime_text(e.mtime), lay[2]),
+            (perm_string(e.mode), lay[3]),
+            (owner_text(PanelColumn::Remote, e.uid, e.gid), lay[4]),
         ];
         for (text, (label, _key, left, w)) in expect {
             let pos = find_text_pos(&out.shapes, &text)
@@ -2846,7 +3644,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        let run = |input: egui::RawInput, state: &mut PaneState| {
+        let mut cols = ColWidths::default();
+        let mut run = |input: egui::RawInput, state: &mut PaneState| {
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     show(
@@ -2859,6 +3658,7 @@ mod tests {
                         true,
                         &[],
                         0,
+                        &mut cols,
                     );
                 });
             });
@@ -2972,9 +3772,10 @@ mod tests {
             )),
             ..Default::default()
         };
-        let run = |input: egui::RawInput, frame: &mut PanelFrame| {
+        let mut cols = ColWidths::default();
+        let mut run = |input: egui::RawInput, frame: &mut PanelFrame| {
             let _ = ctx.run(input, |ctx| {
-                content(ctx, &t, 1, false, frame, 0);
+                content(ctx, &t, 1, false, frame, 0, &mut cols);
             });
         };
         let mut clock = 0.0_f64;
@@ -3102,7 +3903,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        let run = |input: egui::RawInput, state: &mut PaneState| {
+        let mut cols = ColWidths::default();
+        let mut run = |input: egui::RawInput, state: &mut PaneState| {
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     show(
@@ -3115,6 +3917,7 @@ mod tests {
                         true,
                         &[],
                         0,
+                        &mut cols,
                     );
                 });
             });
@@ -3163,5 +3966,453 @@ mod tests {
             Some("/"),
             "点路径条右侧的空白处没能进入编辑态,命中区域太窄:{rect:?}"
         );
+    }
+
+    /// D2:列宽是**外部状态**,不是每帧现造的 —— 造在 `show()` 内部的话
+    /// 拖出来的宽度下一帧就被冲掉,拖拽功能会以「拖得动、松手弹回」的形式
+    /// 安静失效。判据:同一份 `ColWidths` 改了之后,画出来的列位置跟着变。
+    ///
+    /// 自证会变红:把 `show()` 里的 `cols` 参数忽略掉、改回内部
+    /// `ColWidths::default()`。
+    #[test]
+    fn the_column_widths_come_from_the_caller_not_from_a_fresh_default() {
+        let t = crate::theme::MULLION_DARK;
+        let render = |cols: &mut ColWidths| {
+            let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+            state.entries = vec![entry(b"a.txt", EntryKind::File)];
+            state.load = Load::Ready;
+            let ctx = egui::Context::default();
+            let mut out = None;
+            for _ in 0..2 {
+                out = Some(ctx.run(raw(None), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show(
+                            ui,
+                            &t,
+                            "远端",
+                            1,
+                            PanelColumn::Remote,
+                            &mut state,
+                            false,
+                            &[],
+                            0,
+                            cols,
+                        );
+                    });
+                }));
+            }
+            find_text_pos(&out.expect("跑了两帧").shapes, "1.0 KB")
+                .expect("行里该画出大小数值")
+                .x
+        };
+
+        let mut narrow = ColWidths::default();
+        let mut wide = ColWidths {
+            name: ColWidths::default().name + 120.0,
+            ..ColWidths::default()
+        };
+        let x_narrow = render(&mut narrow);
+        let x_wide = render(&mut wide);
+        assert!(
+            (x_wide - x_narrow - 120.0).abs() < 1.0,
+            "名称列加宽 120 之后,大小数值应该右移 120(实际 {x_narrow} → {x_wide})\
+             —— 列宽没有从调用方读进来"
+        );
+    }
+
+    /// F135:拖列边界只改**被拖的那一列**,右边的列整体平移。
+    /// 不做「向右借宽度」那种此消彼长的语义 —— 总宽本来就允许超出视口
+    /// (有横向滚动兜着),没有守恒的必要,而守恒会让「我只想加宽名称列」
+    /// 变成「顺手把修改时间列挤没了」。
+    ///
+    /// 自证会变红:把 `col_w_mut(cols, i)` 换成固定改 `cols.name`;
+    /// 或者在改宽度时顺手把下一列减掉同样的量。
+    ///
+    /// **拖的是「大小」列的右边界,不是「名称」列的** —— 这不是随手选的:
+    /// 如果拖名称列(下标 0)去验证「换成固定改 `cols.name`」这条自证,
+    /// 硬编码目标(`cols.name`)和真实目标(下标 0 对应的也是 `cols.name`)
+    /// 恰好重合,测试测不出任何区别(已实测:把 `col_w_mut` 硬编码成
+    /// `cols.name` 后,若这条测试改拖名称列,`before.size == after.size`
+    /// 与 `before.name < after.name` 两条断言照样全部通过,测试恒绿)。
+    /// 换成拖中间的「大小」列(下标 1),硬编码就会显形:
+    /// `cols.size` 不会变,`cols.name` 却会跟着动。
+    #[test]
+    fn dragging_a_column_edge_only_widens_that_column() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let mut cols = ColWidths::default();
+        let before = cols;
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState, cols: &mut ColWidths| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        cols,
+                    );
+                });
+            })
+        };
+        // 标注模式开着才能读回 `annotate::mark` 登记的矩形(`spot_rect`
+        // 文档里写明「前提:标注模式必须开着」)。这是拿列边界精确坐标
+        // **唯一不靠猜字形宽度**的路子 —— 早先按「标题文字中心 - 半个
+        // 猜测宽度」反推 edge_x 的写法在 CJK 字形下算出来的偏移和真实
+        // 边界差了 9px,直接落在 6pt 热区外,测试假红了一版,现改用
+        // `header_at()` 里为列头登记的同一份矩形。
+        annotate::toggle(&ctx);
+        // 两帧稳定布局。列头的登记矩形右边界就是「大小」列的右边界
+        // (它跟「修改时间」列之间那道热区的中心)。
+        let _ = render(raw(None), &mut state, &mut cols);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let size_head = annotate::spot_rect(&ctx, "文件面板/远端/列头/大小")
+            .expect("该登记出列头「大小」的矩形");
+        let head_y = size_head.center().y;
+        let edge_x = size_head.right();
+
+        // 按下 → 拖到右边 +60 → 松手。egui 要指针移动超过阈值才判成拖,
+        // 中间多灌一帧。
+        let _ = render(
+            press(egui::pos2(edge_x, head_y), 1.0, true),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            moved(egui::pos2(edge_x + 30.0, head_y), 1.1),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            moved(egui::pos2(edge_x + 60.0, head_y), 1.2),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            press(egui::pos2(edge_x + 60.0, head_y), 1.3, false),
+            &mut state,
+            &mut cols,
+        );
+
+        assert!(
+            cols.size > before.size + 40.0,
+            "拖了大小列右边界 +60,宽度却只从 {} 变成 {} —— 拖拽没接上",
+            before.size,
+            cols.size
+        );
+        assert_eq!(
+            (cols.name, cols.mtime, cols.perm, cols.owner),
+            (before.name, before.mtime, before.perm, before.owner),
+            "拖大小列把别的列宽也改了"
+        );
+    }
+
+    /// F135:再怎么往左拖也不能把列拖没 —— 宽度为 0 的列点不中、拖不回来,
+    /// 用户会以为这一列被永久删掉了。
+    ///
+    /// 走跟上一条测试同样的真实拖拽路径(而不是直接调
+    /// `.clamp(col_min(i), COL_MAX)` 再断言结果满足这个 clamp 本身的语义 ——
+    /// 那测的是标准库 `f32::clamp`,不是生产代码,对生产代码里的 clamp
+    /// 删不删都恒绿。这里把名称列右边界往左狠拖几千 px,断言真实拖拽路径
+    /// 产出的宽度落在最小值以上。
+    ///
+    /// 自证(已实测):把 `header_at()` 里的
+    /// `.clamp(col_min(i), COL_MAX)` 去掉 → 本条测试变红。**实情**:去掉
+    /// clamp 时,先炸的是 egui 自己在 `ui.rs:908` 的
+    /// `assertion failed: 0.0 <= width`(宽度被拖成负数,egui 内部对负宽度
+    /// 有断言)——不是本测试下面那几条 `assert!` 先失败。红是真红,但红法
+    /// 跟字面上看到的 panic 位置对不上,免得后人看见 egui 内部 panic 以为
+    /// 是这条测试写坏了。
+    #[test]
+    fn a_column_cannot_be_dragged_below_its_minimum() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState, cols: &mut ColWidths| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        cols,
+                    );
+                });
+            })
+        };
+        annotate::toggle(&ctx);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let name_head = annotate::spot_rect(&ctx, "文件面板/远端/列头/名称")
+            .expect("该登记出列头「名称」的矩形");
+        let head_y = name_head.center().y;
+        let edge_x = name_head.right();
+
+        // 按下 → 分两帧把指针拖到远超最小宽度的左边 → 松手。
+        let _ = render(
+            press(egui::pos2(edge_x, head_y), 1.0, true),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            moved(egui::pos2(edge_x - 500.0, head_y), 1.1),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            moved(egui::pos2(edge_x - 5000.0, head_y), 1.2),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            press(egui::pos2(edge_x - 5000.0, head_y), 1.3, false),
+            &mut state,
+            &mut cols,
+        );
+
+        assert!(
+            cols.name >= col_min(0),
+            "名称列被拖到了 {},低于最小宽度 {}(第 0 列)",
+            cols.name,
+            col_min(0)
+        );
+        assert!(
+            cols.name > 0.0,
+            "名称列宽度是 {},拖没了 —— 用户点不中也拖不回来",
+            cols.name
+        );
+    }
+
+    /// F135:再怎么往右拖也不能让列无限变宽 —— 拖到几千 px 会让横向滚动条
+    /// 退化成一条几乎抓不住的细线(见 `COL_MAX` 定义处的注释),必须有上限。
+    ///
+    /// 跟 `a_column_cannot_be_dragged_below_its_minimum` 对称:走同一条真实
+    /// 拖拽路径(而不是直接断言 `f32::clamp` 自身的语义),把名称列右边界
+    /// 往右狠拖几千 px,断言真实拖拽路径产出的宽度落在 `COL_MAX` 以内。
+    /// 这条测试目前是唯一守 `COL_MAX` 上界的测试 —— 在它加入之前,把
+    /// `.clamp(col_min(i), COL_MAX)` 换成 `.max(col_min(i))`(只留下界,
+    /// 丢掉上界)不会让当时已有的任何一条测试变红。
+    ///
+    /// 自证(已实测):把 `header_at()` 里的 `.clamp(col_min(i), COL_MAX)`
+    /// 换成 `.max(col_min(i))` → 本条测试变红(`cols.name` 被拖到几千,
+    /// 远超 `COL_MAX` 的 800.0),而 `a_column_cannot_be_dragged_below_its_minimum`
+    /// 仍然绿 —— 因为 `.max(col_min(i))` 照样卡住下界,只是丢了上界。
+    #[test]
+    fn a_column_cannot_be_dragged_past_its_maximum() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let mut cols = ColWidths::default();
+        let before = cols;
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState, cols: &mut ColWidths| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        cols,
+                    );
+                });
+            })
+        };
+        annotate::toggle(&ctx);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let name_head = annotate::spot_rect(&ctx, "文件面板/远端/列头/名称")
+            .expect("该登记出列头「名称」的矩形");
+        let head_y = name_head.center().y;
+        let edge_x = name_head.right();
+
+        // 按下 → 分两帧把指针拖到远超上限宽度的右边 → 松手。
+        let _ = render(
+            press(egui::pos2(edge_x, head_y), 1.0, true),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            moved(egui::pos2(edge_x + 500.0, head_y), 1.1),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            moved(egui::pos2(edge_x + 5000.0, head_y), 1.2),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            press(egui::pos2(edge_x + 5000.0, head_y), 1.3, false),
+            &mut state,
+            &mut cols,
+        );
+
+        assert!(
+            cols.name <= COL_MAX,
+            "名称列被拖到了 {},超过上限 {}",
+            cols.name,
+            COL_MAX
+        );
+        assert!(
+            cols.name > before.name,
+            "名称列宽度是 {},跟拖之前的 {} 相比没有变化 —— 拖拽没接上",
+            cols.name,
+            before.name
+        );
+    }
+
+    /// 拖拽热区不能把整列的排序点击吃掉 —— 点列头**中心**必须照旧改排序。
+    ///
+    /// **自证(已实测,不是「把 HANDLE_W 改成整列宽」这么简单)**:egui-0.30
+    /// 的命中测试按 `Sense` 分组独立算(`hit_test.rs` `hit_test_on_close`:
+    /// `hit_click` 只在 `sense.click` 的部件里找,`hit_drag` 只在
+    /// `sense.drag` 的部件里找,互不竞争)。热区是纯 `Sense::drag()`,不带
+    /// `click`,所以单纯把 `HANDLE_W` 从 6pt 改成整列宽 **测不出这条测试的
+    /// 红**(已实测三种改法,`clicking_the_middle_of_a_header_still_sorts`
+    /// 全绿;倒是会把 `dragging_a_column_edge_only_widens_that_column` 测
+    /// 红 —— 拖满整列宽后相邻热区会在共享边界重叠,判归哪一列变得有歧义)。
+    /// 真正会让本条变红的改法(已实测):热区的 `Sense::drag()` 换成
+    /// `Sense::click_and_drag()`、宽度改成整列宽、**且**把这段热区循环挪到
+    /// 列体循环**之后**注册(三处同时改,单独改任何一处都不够)。
+    #[test]
+    fn clicking_the_middle_of_a_header_still_sorts() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let before = state.sort_key;
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState, cols: &mut ColWidths| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        cols,
+                    );
+                });
+            })
+        };
+        let _ = render(raw(None), &mut state, &mut cols);
+        let out = render(raw(None), &mut state, &mut cols);
+        let pos = find_text_pos(&out.shapes, "修改时间").expect("该画出列头「修改时间」");
+        let _ = render(press(pos, 1.0, true), &mut state, &mut cols);
+        let _ = render(press(pos, 1.1, false), &mut state, &mut cols);
+        assert_ne!(
+            state.sort_key, before,
+            "点了「修改时间」列头中心,排序键却没变 —— 拖拽热区把整列的点击吃掉了"
+        );
+        assert_eq!(state.sort_key, SortKey::Mtime);
+    }
+
+    /// F135:守的是**热区注册顺序**这条不变量。热区若挂在列体循环之后
+    /// (跟 `header_at()` 开头那条「必须先于列体注册」的注释反过来),
+    /// 边界那 6pt 上的按下会被列体的点击吃掉 —— 结果排序和缩放**两边都不
+    /// 响应**:egui `hit_test.rs` 的 `hit_test_on_close` 对同一个点同时命中
+    /// 一个纯 click 部件和一个纯 drag 部件时,谁在「上面」(在 `close` 列表
+    /// 里排得靠后 = 更晚注册)谁赢;drag 在上且是纯 drag(不带 click)时,
+    /// 直接把 click 结果吃成 `None`,不会退回给下面那个 click 部件
+    /// (`hit_test.rs` `(Some(hit_click), Some(hit_drag))` 分支,
+    /// `click_is_on_top_of_drag` 为假的那一路)。
+    ///
+    /// 落点必须**正好在边界 x 上**(不是边界 ±几 pt 的某个安全距离),
+    /// 而且**原地按下—松开、不移动**——这样才会真正撞上「同一个点被两种
+    /// sense 同时命中」的分支,跟 `clicking_the_middle_of_a_header_still_sorts`
+    /// (落点在列中央,离任何热区都远)测的是两码事。
+    ///
+    /// 自证(已实测):把这段热区循环整体挪到列体循环**之后**
+    /// (`header_at()` 里两个 `for` 循环互换顺序,其余都不动)→ 本条测试
+    /// 变红,`assert_ne!(state.sort_key, before, ...)` 失败,
+    /// `state.sort_key` 停在初始值 `Name` 不动(被挪到后面的列体循环没抢到
+    /// 这次点击,`clicking_the_middle_of_a_header_still_sorts` 仍然
+    /// 保持绿,因为它的落点在列中央,不落在这条不变量守的边界点上)。
+    #[test]
+    fn pressing_exactly_on_a_column_edge_still_sorts() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let before = state.sort_key;
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState, cols: &mut ColWidths| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        &[],
+                        0,
+                        cols,
+                    );
+                });
+            })
+        };
+        annotate::toggle(&ctx);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let size_head = annotate::spot_rect(&ctx, "文件面板/远端/列头/大小")
+            .expect("该登记出列头「大小」的矩形");
+        let head_y = size_head.center().y;
+        // 边界 x 本身 —— 不留安全距离,故意踩在「大小」右边界 =
+        // 「修改时间」左边界这条共享线上。
+        let edge_x = size_head.right();
+
+        // 原地按下—松开,不经过任何 `moved` 帧:egui 判定「没有越过拖拽
+        // 阈值」,是货真价实的一次点击尝试,不是拖拽。
+        let _ = render(
+            press(egui::pos2(edge_x, head_y), 1.0, true),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(
+            press(egui::pos2(edge_x, head_y), 1.1, false),
+            &mut state,
+            &mut cols,
+        );
+
+        assert_ne!(
+            state.sort_key, before,
+            "在「大小/修改时间」分界线上原地按下—松开,排序键却没变 —— \
+             热区注册顺序反了,把这一下的点击吃掉了"
+        );
+        assert_eq!(state.sort_key, SortKey::Mtime);
     }
 }

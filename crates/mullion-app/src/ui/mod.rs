@@ -300,6 +300,13 @@ pub struct UiState {
     /// 「还没拖过」的哨兵,真正的默认宽度由 `files_panel::sidebar` 在
     /// `0.0` 时代入,见那里的注释。
     pub files_sidebar_w: f32,
+    /// F135:文件面板五列的宽度。**全局一份**——远端栏/本地栏/所有标签
+    /// 共用一套(跟 `files_sidebar_w` 同款:用户拖一次就该处处生效)。
+    ///
+    /// **不落盘**(设计 D2):关窗口就回到默认宽度。`UiState` 走
+    /// `#[derive(Default)]`,而 `ColWidths` 自己实现了 `Default`,所以
+    /// 这里不需要 `files_sidebar_w` 那种 `0.0` 哨兵。
+    pub files_cols: files_panel::ColWidths,
     /// D2:远端写操作的对话框状态。`None` = 没开。
     ///
     /// 挂在 `UiState` 而不是 `PanelFrame` 上:对话框是**全局模态**,同一时刻
@@ -821,6 +828,7 @@ pub fn build_ui(
             frame.files_focused,
             files,
             hovering,
+            &mut ui_state.files_cols,
         );
         actions.files_remote = r;
         actions.files_local = l;

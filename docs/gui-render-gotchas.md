@@ -296,6 +296,25 @@
   抽成纯函数 `scroll_id_salt(id, generation)`,测试直接比较两次调用的返回值;把
   `generation` 从格式串里删掉这条测试立即变红(已实测)。
 
+- **要拿"这一帧" `ScrollArea` 的真实水平偏移,必须在 `show`/`show_rows` **之前**读
+  持久化状态,读它的返回值会让跟随元素抢先一帧(F136)。** `files_panel.rs` 的列头要
+  跟着内容区同步横移,直觉写法是 `let out = ScrollArea::both().show_rows(...); header(out.state.offset.x)`——
+  编译过、单帧静态截图也看不出问题,但滚轮还在平滑收敛(`InputState` 对大幅、非
+  `smooth` 的 `MouseWheel` delta 会摊到多个真实墙钟帧,见 `input_state/mod.rs`)时列头会
+  比内容区**多走一步**,不是滞后而是**抢先**,肉眼同样是错位。根因是 `ScrollArea` 的
+  `begin()` 在处理本帧滚轮输入**之前**就用上一帧存的偏移把行体的屏幕坐标定死了;
+  `Prepared::end()`(在 `add_contents` 之后跑)才处理本帧滚轮、把更新后的偏移存回去
+  给**下一帧**的 `begin()` 用——`ScrollAreaOutput.state.offset` 拿到的正是这个「已更新、
+  留给下一帧」的值,不是本帧行体实际用来排版的那份。**规则**:调用 `show`/`show_rows`
+  之前,先用同一个持久化 id 调 `egui::scroll_area::State::load(ctx, id)` 把上一帧存的偏移
+  原样读出来,用这份值驱动跟随元素,不要等 `ScrollAreaOutput` 返回后再读。**这个 id 的
+  推导必须与 `ScrollArea::begin()` 内部算 id 的方式逐字一致**(当前是
+  `ui.make_persistent_id(id_salt)`,`id_salt` 与传给 `.id_salt(...)` 的值同源)——这是升级
+  egui 版本时最容易悄悄失守的一环:`begin()` 内部换了 id 拼法而这里没跟着换,会读到
+  一个从不存在的 id、`State::load` 恒返回 `None`/默认值,不报错,只是列头再也不跟手,
+  而且现象和"根本没修"完全一样,不体现在返回值类型或 panic 上。
+  **守护**:`ui::files_panel::tests::horizontal_scroll_moves_the_header_and_the_rows_by_the_same_amount`。
+
 - **测试里用 `ctx.set_pixels_per_point()` 设 DPI,会把画布悄悄变成 8000×8000。**
   它是 `Context::set_zoom_factor` 的包装,只在**下一帧**生效(`egui-0.30.0/src/context.rs`
   1953-1957 是包装、1994-2004 是延迟);生效那一帧会把「上一帧的 screen_rect」按新旧
