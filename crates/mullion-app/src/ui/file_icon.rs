@@ -352,6 +352,9 @@ pub fn outline(rect: egui::Rect, kind: IconKind) -> Vec<Vec<egui::Pos2>> {
         }
         // F134:普通文件 —— 折角空白页。跟 `Doc`(页 + 三条横线)、
         // `Link`(折角页 + 箭头)靠「有没有横线 / 有没有箭头」区分。
+        // 页宽的内边距取 0.1,**故意**跟 `Link`(0,贴边)和 `Doc`/四类 office
+        // (0.15)都错开:这三支都是「一张页」,箭头/横线在 16px 下只有一两个
+        // 像素,页宽差是第二道区分。看着不统一也别顺手对齐。
         IconKind::File => {
             let fold = r.width() * 0.3;
             vec![
