@@ -28,6 +28,37 @@ pub fn hosts_to_redial(panes: &[(PaneId, usize, PaneStatus)], in_flight: &[usize
     seen
 }
 
+/// 一次重连成功之后,这条 host 上**没换到新 channel** 的那些 pane 里,哪些要
+/// 补一次重拨(置回 `Reconnecting`,下一帧由 `hosts_to_redial` 收走)。
+///
+/// 为什么会有"漏网的":`spawn_reconnect` 是按**发起那一刻**已经翻成
+/// `Reconnecting` 的 pane 去开 channel 的。而 adr-009 下一条连接承载多块分屏,
+/// 各 pane 的 `rx` 不保证同一帧关闭(reader task 各自独立,缓冲里积压的字节还要
+/// 先排空)。于是 A 先翻、带着 A 去拨号,B 慢了几帧才翻 —— 拨回来的 channel 里
+/// 没有 B 的份,B 手里攥的还是那条已经死掉的旧 channel:输入静默丢失(按项目
+/// 惯例 `let _ = pty.write(..)`),而标题条上它看起来一切正常。
+///
+/// **只捞 `Live`**:`Reconnecting` 的下一帧本来就会被 `hosts_to_redial` 收走,
+/// 不用在这里动;`Disconnected` 一律不碰 —— 那是用户敲 `exit` 或者重试到顶
+/// 放弃的终态,把它拉回来等于替用户决定"你还想连着"。
+///
+/// 判据成立的前提:重连只由 `rx_closed_action(transport_alive == false)` 触发,
+/// 也就是**整条传输层**死了。传输层死了,这条 host 上的每一条 channel 都死了,
+/// 所以"没换到新 channel 的 `Live` pane"必然是攥着死 channel 的。
+pub fn strays_after_reconnect(
+    panes: &[(PaneId, usize, PaneStatus)],
+    host_ix: usize,
+    attached: &[PaneId],
+) -> Vec<PaneId> {
+    panes
+        .iter()
+        .filter(|(id, ix, status)| {
+            *ix == host_ix && *status == PaneStatus::Live && !attached.contains(id)
+        })
+        .map(|(id, _, _)| *id)
+        .collect()
+}
+
 /// 第 `attempt` 次重试前该等多久(`attempt` 从 1 开始,同
 /// `mullion_ssh::tunnel::backoff_delay` 的约定)。`None` = 到顶,放弃。
 ///
@@ -113,6 +144,49 @@ mod tests {
             (PaneId(2), 1, PaneStatus::Live),
         ];
         assert!(hosts_to_redial(&panes, &[]).is_empty());
+    }
+
+    /// F128 竞态:重连拨回来的 channel 里没份的那些 pane 要补一次重拨。
+    ///
+    /// adr-009 下一条连接承载多块分屏,各 pane 的 `rx` 不保证同一帧关闭 ——
+    /// A 先翻 `Reconnecting`、带着 A 去拨号,B 慢几帧才翻,拨回来的 channel 里
+    /// 就没有 B 的份。不补的话 B 攥着一条死 channel:输入静默丢失(项目惯例是
+    /// `let _ = pty.write(..)`),而标题条上它看起来一切正常。
+    ///
+    /// 自证会变红:把 `strays_after_reconnect` 的函数体改成 `Vec::new()`。
+    #[test]
+    fn a_pane_that_missed_the_redial_gets_picked_up_again() {
+        let panes = [
+            (PaneId(1), 0usize, PaneStatus::Live), // 换到新 channel 上了
+            (PaneId(2), 0, PaneStatus::Live),      // 慢了一步,没赶上这次拨号
+            (PaneId(3), 1, PaneStatus::Live),      // 另一台机器,不关这次的事
+        ];
+        assert_eq!(
+            strays_after_reconnect(&panes, 0, &[PaneId(1)]),
+            vec![PaneId(2)]
+        );
+    }
+
+    /// F128:`Disconnected` 一律不碰 —— 那是用户敲了 `exit`(或者重试到顶
+    /// 放弃)的终态。捞回来等于替用户决定「你还想连着」,他就永远退不出登录,
+    /// 正是 `rx_closed_action` 那条红线要防的现象。
+    ///
+    /// `Reconnecting` 也不用捞:下一帧 `hosts_to_redial` 本来就会收走它,
+    /// 在这里重复置位只是无用功。
+    ///
+    /// 自证会变红:把 `strays_after_reconnect` 里的 `== PaneStatus::Live`
+    /// 换成 `!= PaneStatus::Disconnected`(会多捞 `Reconnecting`),
+    /// 或者换成 `true`(连用户 exit 的那块也捞)。
+    #[test]
+    fn a_pane_the_user_exited_is_never_dragged_back_into_reconnecting() {
+        let panes = [
+            (PaneId(1), 0usize, PaneStatus::Disconnected),
+            (PaneId(2), 0, PaneStatus::Reconnecting),
+        ];
+        assert!(
+            strays_after_reconnect(&panes, 0, &[]).is_empty(),
+            "只该捞 Live:Disconnected 是用户的决定,Reconnecting 下一帧自会被收走"
+        );
     }
 
     /// F128:退避表直接用隧道那套(`mullion_ssh::tunnel::backoff_delay`),

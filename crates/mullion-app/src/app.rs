@@ -5670,6 +5670,32 @@ impl ApplicationHandler<UserEvent> for App {
                         h.tmux_bootstrap = Default::default();
                         h.tmux_last_try = None;
                     }
+                    // 这次拨号没赶上的 pane 补一次(判据见
+                    // `reconnect::strays_after_reconnect`):同一条连接上各 pane
+                    // 的 `rx` 不保证同一帧关闭,慢一步的那块不会出现在
+                    // `channels` 里,而它手里攥的是已经死掉的旧 channel ——
+                    // 不补的话它的输入静默丢失,标题条上却一切正常。
+                    // 置回 `Reconnecting`,下一帧 `drive_reconnects` 收走。
+                    if !attached.is_empty() {
+                        let snapshot: Vec<(PaneId, usize, crate::shell::workspace::PaneStatus)> =
+                            t.ws.panes()
+                                .iter()
+                                .map(|p| (p.id, p.host_ix, p.status))
+                                .collect();
+                        let done: Vec<PaneId> = attached.iter().map(|(id, _)| *id).collect();
+                        for id in
+                            crate::reconnect::strays_after_reconnect(&snapshot, host_ix, &done)
+                        {
+                            if let Some(p) = t.ws.pane_mut(id) {
+                                p.status = crate::shell::workspace::PaneStatus::Reconnecting;
+                            }
+                            log::info!(
+                                target: "mullion",
+                                "重连:pane {} 没赶上这次拨号,补一次重连",
+                                id.0
+                            );
+                        }
+                    }
                     // 死掉的那条连接上开的 SFTP channel 一起完蛋 —— 留着的话
                     // 侧栏每次操作静默失败,用户看到的是「文件面板卡住了」。
                     for task in t.sftp_tasks.drain(..) {
@@ -13839,6 +13865,47 @@ mod tests {
         assert!(
             body.contains("if reconnected {"),
             "toast 没有按「真的有 pane 接上」收敛,零个 pane 接上也会弹「已重新连接」"
+        );
+    }
+
+    /// **接线守护 / F128**:重连成功之后必须把「没赶上这次拨号」的 pane 捞回
+    /// `Reconnecting`。
+    ///
+    /// 同一条 SSH 连接上每块 pane 有各自的读取任务,传输层死了之后它们的 `rx`
+    /// **不保证同一帧关闭**(缓冲里的字节要先排完)。慢一步的那块在
+    /// `hosts_to_redial` 拍板时还是 `Live`,不会进这次拨号的名单,于是
+    /// `channels` 里没有它 —— 它攥着一条已经死掉的旧 channel,写入静默失败,
+    /// 而标题条上一切正常。更糟的是就地替换之后 `hosts[host_ix]` 变活了,
+    /// 它下一帧真关闭时 `rx_closed_action(link_alive == true)` 会判成
+    /// `UserExited`,直接钉死成 `Disconnected`,**再也不会重连**。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
+    ///
+    /// 自证会变红:把 `strays_after_reconnect` 那个 for 循环删掉,或者把循环体
+    /// 里的 `p.status = ...Reconnecting;` 删掉。
+    #[test]
+    fn reconnect_picks_up_the_panes_that_missed_this_dial() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("strays_after_reconnect("),
+            "重连之后没有回捞漏网的 pane —— 慢一步关闭的那块会被钉死成 \
+             Disconnected,永久不再重连"
+        );
+        assert!(
+            body.contains("p.status = crate::shell::workspace::PaneStatus::Reconnecting;"),
+            "捞出来了却没把状态置回 Reconnecting —— drive_reconnects 不会收走它"
         );
     }
 
