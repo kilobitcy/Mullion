@@ -55,6 +55,7 @@ mullion-app      winit + wgpu + glyphon(终端自绘)+ egui(外壳:菜单/状态
 | T6 | Shift+Enter 编码错 | Claude Code 里无法插入换行，一按就提交 | `keymap::tests::shift_enter_without_kitty_is_esc_cr` |
 | T7 | 帧率节流后 `ControlFlow::WaitUntil` 不复位 | 首次节流后永久 100% CPU 忙转（T3/N3 红线） | `frame::tests`（`plan` 决策 4 条）；事件循环三分支须显式复位 control_flow |
 | T8 | 判给终端的键盘事件仍先喂 `egui_state.on_window_event` | egui 焦点系统吞掉 Tab → 焦点跳到菜单栏 → `wants_keyboard_input()` 恒 true → 终端**永久**收不到任何键（Tab 补全后回车/退格全废，鼠标仍灵） | `input_route::tests::terminal_keyboard_is_never_fed_to_egui_so_tab_cannot_steal_focus`；键盘先判后喂，指针先喂后判 |
+| T9 | 往 egui 的 UI 字符串里直接写非 ASCII 符号 | egui 字体链只有两级（内置 + 微软雅黑），链外字形画成豆腐块 `□`；**编译/测试/日志全静默，只有人眼能看见**，且 Linux 开发机上多半是正常的 | `tests/glyph_whitelist.rs::no_ui_string_contains_a_glyph_the_font_cannot_draw`；要么登记进 `ui::glyphs::VERIFIED`（判据是 **GBK** 内，不是 GB18030），要么走 `ui::icon` 自绘 |
 
 **T1 和 T3/T7 是最容易在重构中被悄悄破坏的。** 事件循环在 `app.rs`（`main.rs` 只做接线），
 动 `emulator.rs` 或 `app.rs` 事件循环时，先跑这几个测试，改完再跑一遍。

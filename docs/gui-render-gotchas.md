@@ -351,3 +351,26 @@
   当前只在建窗口时取一次 `scale_factor`,**未跟随 `ScaleFactorChanged`**——跨不同 DPI 显示器不更新(F21 待做)。
 - **`Family::Name("Google Sans Code")` 须系统已装**,否则 cosmic-text 回退默认字体(不崩,对齐可能差)。
   字体族/字号当前硬编码,可配置见 spec **F21**。
+
+## egui 字形覆盖面(F143,豆腐块)
+
+- **egui 的字体链只有两级**:内置 `Ubuntu-Light` + `NotoEmoji`,加上
+  `ui::install_cjk_font` 追加的系统 CJK 字体(Windows 首选 `C:\Windows\Fonts\msyh.ttc`
+  微软雅黑)。**两级都没有的字形,epaint 画成豆腐块 `□`**。
+  **症状**:编译过、测试全绿、日志一声不吭,只有人在 Windows 上看着那个方块。
+  Linux 开发机上多半是正常的 —— 桌面 fontconfig 里那堆符号字体在 Windows 上不存在。
+- **规则**:非 ASCII 符号要么在 `ui::glyphs::VERIFIED` 里登记过,要么走
+  `ui::icon` 自绘。**登记这一步就是闸门**:它逼你先去 Windows 实机画一眼再回来加。
+- **判据是 GBK/CP936,不是 GB18030**。GB18030 编码全 Unicode,「能编码」对任何
+  字符都成立 —— 拿它当判据等于没有判据(本项目走过这个弯路)。
+- **守护**:`crates/mullion-app/tests/glyph_whitelist.rs` 扫 `src/**/*.rs` 的字符串与
+  字符字面量。两个实现上的坑:
+  - **用 `proc-macro2` 真做词法分析,不用正则**。本库注释密度高,注释里一个孤零零的
+    引号就能把正则的配对整个错开。
+  - **跳过 attribute 时,`#` 后面那个可选的 `!` 不能忘**:`//!` 内部文档注释展开成
+    `#![doc = "..."]`,`#` 与 `[` 之间隔着一个 `Punct`。只认 `#[` 的话,全库每个模块头的
+    正文都会被当成 UI 字符串扫 —— 实测多出 23 处假红,其中就有 `icon.rs` 模块头里
+    **当反例举**的那几个字符(源码扫描类守护的老毛病:注释里的反例会把自己扫红)。
+- **已知画不出来的**(本轮换掉的 13 处):`▾` `▴` `▸` `⚠` `⟳` `↻` `✕` `•`。
+  能用的替身:`▲` `▼` `★` `☆` `→` `↑` `↓` `×` `●` `—` `…` `·`,
+  以及 `Glyph::{Cross, ArrowUp, ArrowDown, Info, Refresh, TriangleDown, TriangleRight}` 自绘。
