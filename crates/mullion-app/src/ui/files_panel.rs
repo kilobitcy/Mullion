@@ -1243,7 +1243,14 @@ pub fn sidebar(
         .frame(
             egui::Frame::none()
                 .fill(theme::c32(t.panel_bg))
-                .stroke(theme::stroke(t)),
+                .stroke(theme::stroke(t))
+                // F138:内容不贴边。左右比上下宽 —— 横向是「内容 vs 边框」的
+                // 关系,纵向相邻的是别的面板,那边本就有分隔线垫着。取值只从
+                // `metrics` 的间距五档里选,不写裸数字。
+                .inner_margin(egui::Margin::symmetric(
+                    crate::ui::metrics::SP_S,
+                    crate::ui::metrics::SP_XS,
+                )),
         )
         .show(ctx, |ui| {
             annotate::mark(ui.ctx(), "文件侧栏", ui.max_rect());
@@ -1329,7 +1336,12 @@ pub fn content(
         .frame(
             egui::Frame::none()
                 .fill(theme::c32(t.panel_bg))
-                .stroke(theme::stroke(t)),
+                .stroke(theme::stroke(t))
+                // F138:同 `sidebar`,见那里的注释。
+                .inner_margin(egui::Margin::symmetric(
+                    crate::ui::metrics::SP_S,
+                    crate::ui::metrics::SP_XS,
+                )),
         )
         .show(ctx, |ui| {
             annotate::mark(ui.ctx(), "文件标签", ui.max_rect());
@@ -2513,6 +2525,60 @@ mod tests {
     }
 
     /// 摆一份「远端有个 logs 目录 + 一个 b.txt,本地有个 a.txt」的两栏。
+    /// F138:面板内容不能贴着外框画。判据取**真值** —— 「↑」按钮实际画出来
+    /// 的位置,与面板外框的左缘相比,至少留出 `SP_S`。
+    ///
+    /// 不拿常量断言常量(那是重言式、恒绿):把两个宿主的 `inner_margin`
+    /// 删掉之后,按钮会紧贴面板左缘,这条必红。
+    #[test]
+    fn the_panel_does_not_draw_its_contents_flush_against_its_own_edge() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        // 三帧:egui 的 Panel 首帧是 sizing pass,rect 还没稳定。面板外框和
+        // 「↑」的位置**必须取自同一帧**,否则比的是两套布局。
+        let mut out = ctx.run(raw(None), |ctx| {
+            content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
+        });
+        for _ in 0..2 {
+            out = ctx.run(raw(None), |ctx| {
+                content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
+            });
+        }
+        let mut lefts: Vec<f32> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Rect(r) => Some(r.rect.left()),
+                _ => None,
+            })
+            .collect();
+        lefts.sort_by(|a, b| a.partial_cmp(b).expect("坐标不该是 NaN"));
+        // 最靠左的矩形 = 面板外框(`CentralPanel` 的 `Frame` 背景);
+        // 第一个**比它靠右**的矩形 = 最靠左的内容(路径条那几个按钮的底)。
+        let panel_left = *lefts.first().expect("一个矩形都没画出来 —— 脚手架本身有问题");
+        let content_left = lefts
+            .iter()
+            .copied()
+            .find(|x| *x > panel_left)
+            .expect("除了外框什么都没画");
+        assert!(
+            content_left >= panel_left + crate::ui::metrics::SP_S,
+            "内容贴着面板边缘画(最左内容={content_left}, 面板左缘={panel_left}),\
+             F138 要求至少留 {} 点内边距",
+            crate::ui::metrics::SP_S
+        );
+        // 「↑」是路径条的第一个控件,它必须落在内容区里 —— 上面那条只保证
+        // 「有个东西没贴边」,这条把它钉到具体控件上。
+        let arrow = find_text_pos(&out.shapes, "↑").expect("路径条的「↑」没画出来");
+        assert!(
+            arrow.x >= content_left,
+            "「↑」画到了内容区左缘之外(x={}, 内容左缘={content_left})",
+            arrow.x
+        );
+    }
+
     fn two_columns() -> PanelFrame {
         let mut frame = PanelFrame::default();
         frame.remote.cwd = RemotePath::from_bytes(b"/srv".to_vec());
