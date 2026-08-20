@@ -22,6 +22,27 @@ pub enum Glyph {
     ArrowDown,
     /// ⓘ:说明性提示。挂在常驻灰字前面(走查 18)。
     Info,
+    /// 刷新。顶掉 U+27F3 与 U+21BB 两个字符 —— 都不在 GBK,是豆腐。
+    Refresh,
+    /// 实心下三角:折叠面板的**展开**态。顶掉 U+25BE(GBK 外)。
+    TriangleDown,
+    /// 实心右三角:折叠面板的**折起**态。顶掉 U+25B8(GBK 外)。
+    TriangleRight,
+}
+
+impl Glyph {
+    /// 全部变体。**加变体时必须同步这里** —— 测试遍历的是它,漏了就等于
+    /// 那个新图标没有任何越界守护。`shapes()` 的穷尽 `match` 拦得住「忘了
+    /// 画」,拦不住「忘了登记进 ALL」。
+    pub const ALL: &'static [Glyph] = &[
+        Glyph::Cross,
+        Glyph::ArrowUp,
+        Glyph::ArrowDown,
+        Glyph::Info,
+        Glyph::Refresh,
+        Glyph::TriangleDown,
+        Glyph::TriangleRight,
+    ];
 }
 
 /// 图标笔画占 rect 的比例。留边是为了让图标在按钮里不顶着边框。
@@ -77,6 +98,58 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
                 stroke: stroke.into(),
             },
         ],
+        // 顺时针 270° 圆弧 + 端点箭头。epaint 没有 arc 图元,用 16 段折线
+        // 近似 —— 16px 见方下肉眼分辨不出是折线。
+        //
+        // 半径取 `h * 0.6` 而不是贴着 `h`:箭头的两条翼各再伸出 `h * 0.35`,
+        // 加起来 0.95h 仍在框内。贴边画的话箭头会捅进邻居按钮的地盘,而
+        // `every_glyph_stays_inside_its_rect` 正是为此存在。
+        Glyph::Refresh => {
+            const SEGS: usize = 16;
+            let r = h * 0.6;
+            let a0 = std::f32::consts::FRAC_PI_2;
+            let sweep = std::f32::consts::PI * 1.5;
+            let pts: Vec<_> = (0..=SEGS)
+                .map(|i| {
+                    let a = a0 + sweep * (i as f32 / SEGS as f32);
+                    pos2(c.x + r * a.cos(), c.y + r * a.sin())
+                })
+                .collect();
+            let tip = pts[SEGS];
+            let wing = h * 0.35;
+            vec![
+                Shape::line(pts, stroke),
+                Shape::LineSegment {
+                    points: [tip, pos2(tip.x - wing, tip.y - wing * 0.4)],
+                    stroke: stroke.into(),
+                },
+                Shape::LineSegment {
+                    points: [tip, pos2(tip.x + wing * 0.4, tip.y + wing)],
+                    stroke: stroke.into(),
+                },
+            ]
+        }
+        // 实心三角。**用填充不用描边**:12px 见方里空心三角的三条边会被
+        // 反走样糊成一团灰。`convex_polygon` 产出的是 `Shape::Path`,
+        // 测试里的 `points_of` 已经认得。
+        Glyph::TriangleDown => vec![Shape::convex_polygon(
+            vec![
+                pos2(c.x - h * 0.7, c.y - h * 0.4),
+                pos2(c.x + h * 0.7, c.y - h * 0.4),
+                pos2(c.x, c.y + h * 0.6),
+            ],
+            stroke.color,
+            Stroke::NONE,
+        )],
+        Glyph::TriangleRight => vec![Shape::convex_polygon(
+            vec![
+                pos2(c.x - h * 0.4, c.y - h * 0.7),
+                pos2(c.x - h * 0.4, c.y + h * 0.7),
+                pos2(c.x + h * 0.6, c.y),
+            ],
+            stroke.color,
+            Stroke::NONE,
+        )],
     }
 }
 
@@ -166,7 +239,7 @@ mod tests {
     /// 而 egui 不会因此报任何错 —— 只有人眼能看出来。
     #[test]
     fn every_glyph_stays_inside_its_rect() {
-        for g in [Glyph::Cross, Glyph::ArrowUp, Glyph::ArrowDown, Glyph::Info] {
+        for g in Glyph::ALL.iter().copied() {
             for p in points_of(&shapes(r(), g, s())) {
                 assert!(r().contains(p), "{g:?} 的端点 {p:?} 跑出了 {:?}", r());
             }
@@ -321,6 +394,60 @@ mod tests {
             gray_out(on),
             "禁用态没走 egui 标准的 gray_out —— 会比同一行里别的禁用控件暗一档"
         );
+    }
+
+    /// 折叠三角必须朝对方向 —— 画反了不会编译错、不会 panic,只会让
+    /// 「展开」看起来像「折起」。同 `arrow_up_points_up_and_arrow_down_points_down`
+    /// 的理由。
+    ///
+    /// 自证会变红:把 `shapes()` 里 `TriangleDown` 和 `TriangleRight`
+    /// 两个分支的返回值对调。
+    #[test]
+    fn the_collapse_triangles_point_down_and_right() {
+        let down = points_of(&shapes(r(), Glyph::TriangleDown, s()));
+        let right = points_of(&shapes(r(), Glyph::TriangleRight, s()));
+        let c = r().center();
+        // 尖端 = 离中心最远的那个点(三角只有三个点,尖端唯一)。
+        let apex_down = down
+            .iter()
+            .copied()
+            .max_by(|a, b| a.y.total_cmp(&b.y))
+            .unwrap();
+        let apex_right = right
+            .iter()
+            .copied()
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .unwrap();
+        assert!(apex_down.y > c.y, "TriangleDown 的尖端没朝下");
+        assert!(
+            (apex_down.x - c.x).abs() < 1.0,
+            "TriangleDown 的尖端没在竖直中线上"
+        );
+        assert!(apex_right.x > c.x, "TriangleRight 的尖端没朝右");
+        assert!(
+            (apex_right.y - c.y).abs() < 1.0,
+            "TriangleRight 的尖端没在水平中线上"
+        );
+    }
+
+    /// `Glyph::ALL` 必须真的列全 —— 漏一个,`every_glyph_stays_inside_its_rect`
+    /// 就悄悄不覆盖它了(本项目记过的「列举式门控在加档时必然漏」)。
+    ///
+    /// 没有办法让编译器数枚举变体,所以判据取「每个变体画出来的点集**互不
+    /// 相同**」:至少能保证 ALL 里没有重复填充、凑数目。真正的闸门是
+    /// `shapes()` 那个穷尽 `match` —— 加变体不补分支直接编译不过。
+    ///
+    /// 自证会变红:把 `ALL` 里的 `Glyph::TriangleRight` 改成再写一遍
+    /// `Glyph::TriangleDown`。
+    #[test]
+    fn every_glyph_in_all_draws_something_distinct() {
+        let mut seen: Vec<Vec<egui::Pos2>> = Vec::new();
+        for g in Glyph::ALL.iter().copied() {
+            let pts = points_of(&shapes(r(), g, s()));
+            assert!(!pts.is_empty(), "{g:?} 什么都没画");
+            assert!(!seen.contains(&pts), "{g:?} 与 ALL 里另一个变体画得一模一样");
+            seen.push(pts);
+        }
     }
 
     /// 从形状里抠出所有端点,给上面几个测试用。
