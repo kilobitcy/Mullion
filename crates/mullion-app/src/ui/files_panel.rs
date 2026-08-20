@@ -335,34 +335,42 @@ fn col_w_mut(c: &mut ColWidths, i: usize) -> &mut f32 {
     }
 }
 
-/// **列布局的唯一真值来源**:`(标签, SortKey, 左边界, 宽度)` ×5,
+/// **列布局的唯一真值来源**:`(标签, SortKey, 左边界, 宽度)`,
 /// 左边界从 0 起算(相对行/列头的左边界)。
 ///
 /// 列头(`header_at`)和行体(`row`)调的是同一份 —— 旧模型里两边各自
 /// 累加、靠一条对齐测试守着不许分家,现在坐标同源,分家在物理上不可能
 /// 发生。**不许在别处再写一遍这个累加。**
-fn col_lefts(c: &ColWidths) -> [(&'static str, SortKey, f32, f32); 5] {
-    let mut out = [("", SortKey::Name, 0.0, 0.0); 5];
-    let mut x = 0.0;
-    for (i, (label, key, w)) in [
+///
+/// F146:**本地栏没有属主列**,所以列数按栏走(远端 5、本地 4)。
+/// `files/local.rs` 构造 `Entry` 时 uid/gid 恒填 0,那一列在数据源头上
+/// 就不存在。判据按栏静态、不按数据 —— 理由见
+/// `tests::the_local_column_has_no_owner_column_but_the_remote_one_does`。
+fn col_lefts(c: &ColWidths, column: PanelColumn) -> Vec<(&'static str, SortKey, f32, f32)> {
+    let mut specs: Vec<(&'static str, SortKey, f32)> = vec![
         ("名称", SortKey::Name, c.name),
         ("大小", SortKey::Size, c.size),
         ("修改时间", SortKey::Mtime, c.mtime),
         ("权限", SortKey::Perm, c.perm),
-        ("属主", SortKey::Owner, c.owner),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        out[i] = (label, key, x, w);
+    ];
+    if column == PanelColumn::Remote {
+        specs.push(("属主", SortKey::Owner, c.owner));
+    }
+    let mut out = Vec::with_capacity(specs.len());
+    let mut x = 0.0;
+    for (label, key, w) in specs {
+        out.push((label, key, x, w));
         x += w;
     }
     out
 }
 
 /// 内容总宽 = 各列之和。视口比它窄就出横向滚动条(F136)。
-fn content_w(c: &ColWidths) -> f32 {
-    c.name + c.size + c.mtime + c.perm + c.owner
+///
+/// 必须跟 `col_lefts` 走同一份列表 —— 各写一遍的话本地栏会多出一整列宽
+/// 的空白可滚区域,横向滚动条比内容还长。
+fn content_w(c: &ColWidths, column: PanelColumn) -> f32 {
+    col_lefts(c, column).iter().map(|(_, _, _, w)| w).sum()
 }
 
 /// 路径条只读态那块的 id。**必须是稳定的** ——「点得中路径条」是 F131 唯一
@@ -704,7 +712,7 @@ pub fn show(
     // 借用规则同 `clicked` —— 闭包里改不了 `state`,出了闭包再落。
     let mut drag_start: Option<mullion_ssh::sftp::RemotePath> = None;
     let mut landing: Option<crate::files::drag::Landing> = None;
-    let total_w = content_w(cols);
+    let total_w = content_w(cols, column);
     // F136:列头要用的偏移是「这一帧的行体实际拿去排版的那份」,不是
     // 「这一帧滚动结束后要存给下一帧用的那份」——egui 的 `ScrollArea` 内部
     // 在 `begin()` 时就用 persisted 偏移把行体的屏幕坐标定死了,之后处理
@@ -806,7 +814,7 @@ pub fn show(
         // 不裁的话列宽之和超过视口时,右边几列的标题会画到隔壁栏
         // (同 `content()` 里两栏那两处 `set_clip_rect`)。
         ui.set_clip_rect(header_band);
-        header_at(ui, t, id, state, cols, header_band, header_offset_x);
+        header_at(ui, t, id, column, state, cols, header_band, header_offset_x);
     });
     // F58:落在空白处(行与行之间、列头下方的空白)。**必须排在行之后** ——
     // `dnd_release_payload` 会把载荷取走,背景先问的话落在目录行上的那一下
@@ -844,10 +852,12 @@ pub fn show(
 /// 这一帧实际排版用的是同一个值,见 `show()` 里那条长注释)。拆出这个
 /// 函数是因为**列头必须在占位横带确定之后才画得出正确的位置**(见设计
 /// §③),而占位又必须在 `ScrollArea` 之前 —— 占位与绘制天然要分成两处。
+#[allow(clippy::too_many_arguments)] // 同 `show`:一帧要画的东西天然多
 fn header_at(
     ui: &mut Ui,
     t: &Theme,
     id: &str,
+    column: PanelColumn,
     state: &mut PaneState,
     cols: &mut ColWidths,
     band: egui::Rect,
@@ -861,7 +871,7 @@ fn header_at(
     // 右边的列整体平移(不做此消彼长的「借宽度」—— 总宽有横向滚动兜着,
     // 没有守恒的必要)。
     const HANDLE_W: f32 = 6.0;
-    for (i, (_, _, left, w)) in col_lefts(cols).into_iter().enumerate() {
+    for (i, (_, _, left, w)) in col_lefts(cols, column).into_iter().enumerate() {
         let x = band.left() + left + w - offset_x;
         let handle = egui::Rect::from_min_max(
             egui::pos2(x - HANDLE_W * 0.5, band.top()),
@@ -889,7 +899,7 @@ fn header_at(
         }
     }
     let mut hit = None;
-    for (i, (label, key, left, w)) in col_lefts(cols).into_iter().enumerate() {
+    for (i, (label, key, left, w)) in col_lefts(cols, column).into_iter().enumerate() {
         let rect = egui::Rect::from_min_size(
             egui::pos2(band.left() + left - offset_x, band.top()),
             egui::vec2(w, ROW_H),
@@ -973,7 +983,7 @@ fn row(
     //   点不中行、也接不住 drop(`a_row_in_the_tab_host_can_actually_be_clicked`
     //   与 `dropping_on_the_blank_part_of_a_column_targets_its_current_directory`
     //   两条现有测试守着这两件事)。
-    let w = content_w(cols).max(ui.available_width());
+    let w = content_w(cols, column).max(ui.available_width());
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click_and_drag());
     if selected {
         ui.painter().rect_filled(rect, 2.0, theme::c32(t.sunken_bg));
@@ -1041,7 +1051,7 @@ fn row(
     // 名称列的可用宽度让出图标格子 + 间隙,否则长文件名会顶到大小列上——
     // 下面四列的坐标从 `col_lefts()` 取,与 `header_at()` 同源(见其文档
     // 注释),不许在这里另起一份累加。
-    let lay = col_lefts(cols);
+    let lay = col_lefts(cols, column);
     // 大小(右对齐)
     let (_, _, size_left, size_w) = lay[1];
     let size_text = if e.kind == EntryKind::Dir {
@@ -1098,23 +1108,25 @@ fn row(
         font.clone(),
         theme::c32(t.fg_dim),
     );
-    // 属主(右对齐)。**本地栏恒画 `—`**,判据见 `owner_text` 的文档注释。
-    let (_, _, owner_left, owner_w) = lay[4];
-    p.text(
-        egui::pos2(
-            rect.left() + owner_left + owner_w - crate::ui::metrics::SP_XS,
-            rect.center().y,
-        ),
-        egui::Align2::RIGHT_CENTER,
-        elide(
-            &owner_text(column, e.uid, e.gid, owners),
-            owner_w - crate::ui::metrics::SP_XS,
-            Elide::End,
-            measure,
-        ),
-        font,
-        theme::c32(t.fg_dim),
-    );
+    // 属主(右对齐)。F146:本地栏没有这一列 —— `col_lefts` 已经不返回它,
+    // 这里跟着按「下标存不存在」判,不再各写一份栏别判断。
+    if let Some(&(_, _, owner_left, owner_w)) = lay.get(4) {
+        p.text(
+            egui::pos2(
+                rect.left() + owner_left + owner_w - crate::ui::metrics::SP_XS,
+                rect.center().y,
+            ),
+            egui::Align2::RIGHT_CENTER,
+            elide(
+                &owner_text(column, e.uid, e.gid, owners),
+                owner_w - crate::ui::metrics::SP_XS,
+                Elide::End,
+                measure,
+            ),
+            font,
+            theme::c32(t.fg_dim),
+        );
+    }
     resp
 }
 
@@ -2720,6 +2732,47 @@ mod tests {
         assert!(found, "空名字的书签要回退显示路径");
     }
 
+    /// F146:本地栏不画「属主」列。`files/local.rs` 构造 `Entry` 时
+    /// `uid`/`gid` **恒填 0**,本地栏的属主在数据源头上就不存在 ——
+    /// `owner_text` 因此对本地栏恒返回破折号,画出来是一整列破折号,
+    /// 白占 120pt 又什么都不说。
+    ///
+    /// 判据按**栏**静态,不按数据:「本栏所有条目 uid==0」这种动态判据会
+    /// 让远端一个全 root 的目录(`/etc` 之类很常见)莫名其妙少一列,
+    /// 切个目录又冒出来,列宽还跟着跳。
+    ///
+    /// 自证会变红:把 `col_lefts` 的 `column` 入参忽略掉,恒返回五列。
+    #[test]
+    fn the_local_column_has_no_owner_column_but_the_remote_one_does() {
+        let local = col_lefts(&ColWidths::default(), PanelColumn::Local);
+        let remote = col_lefts(&ColWidths::default(), PanelColumn::Remote);
+        assert!(
+            !local.iter().any(|(label, ..)| *label == "属主"),
+            "本地栏画了属主列,实得:{:?}",
+            local.iter().map(|(l, ..)| *l).collect::<Vec<_>>()
+        );
+        assert!(
+            remote.iter().any(|(label, ..)| *label == "属主"),
+            "远端栏丢了属主列"
+        );
+        assert_eq!(local.len(), 4);
+        assert_eq!(remote.len(), 5);
+    }
+
+    /// 内容总宽必须跟着少一列 —— 不跟的话本地栏会多出 120pt 的空白可滚
+    /// 区域,横向滚动条比内容长。
+    ///
+    /// 自证会变红:把 `content_w` 里的 `column` 入参忽略掉。
+    #[test]
+    fn the_local_content_width_drops_the_owner_column_too() {
+        let c = ColWidths::default();
+        assert_eq!(
+            content_w(&c, PanelColumn::Remote) - content_w(&c, PanelColumn::Local),
+            c.owner,
+            "两栏总宽之差应当正好是属主列宽"
+        );
+    }
+
     /// F145:书签下拉里每一条显示的是**完整绝对路径**,不是文件夹名。
     /// 用户点开下拉是为了确认「这条书签到底指哪儿」—— 只给个 `nginx`
     /// 等于没回答这个问题(同名目录在不同机器、不同层级下遍地都是)。
@@ -3863,15 +3916,21 @@ mod tests {
         );
     }
 
-    /// F136/D1:五列**恒定存在**,不再随宽度收起。窄栏下放不下是靠横向
-    /// 滚动条解决的,不是靠把列藏起来 —— 藏起来的那一版会让「属主」这类
-    /// 信息在默认侧栏宽下永远看不到。
+    /// F136/D1:**远端栏**五列恒定存在,不再随宽度收起。窄栏下放不下是靠
+    /// 横向滚动条解决的,不是靠把列藏起来 —— 藏起来的那一版会让「属主」
+    /// 这类信息在默认侧栏宽下永远看不到。
+    ///
+    /// (本地栏少一列属主,判据按栏静态,见
+    /// `the_local_column_has_no_owner_column_but_the_remote_one_does`。)
     ///
     /// 自证会变红:在 `col_lefts()` 里按总宽过滤掉最后几列。
     #[test]
     fn all_five_columns_are_present_no_matter_how_narrow_the_panel_is() {
         let cols = ColWidths::default();
-        let keys: Vec<SortKey> = col_lefts(&cols).iter().map(|&(_, k, _, _)| k).collect();
+        let keys: Vec<SortKey> = col_lefts(&cols, PanelColumn::Remote)
+            .iter()
+            .map(|&(_, k, _, _)| k)
+            .collect();
         assert_eq!(
             keys,
             vec![
@@ -3900,7 +3959,7 @@ mod tests {
             perm: 44.0,
             owner: 55.0,
         };
-        let lay = col_lefts(&cols);
+        let lay = col_lefts(&cols, PanelColumn::Remote);
         assert_eq!(lay[0].2, 0.0, "第一列必须从 0 起算(相对行左边界)");
         for w in lay.windows(2) {
             let (label, _, left, width) = w[0];
@@ -3913,10 +3972,10 @@ mod tests {
         }
         let last = lay[4];
         assert!(
-            (last.2 + last.3 - content_w(&cols)).abs() < 0.01,
+            (last.2 + last.3 - content_w(&cols, PanelColumn::Remote)).abs() < 0.01,
             "最后一列右边界 {} 与 content_w() {} 对不上",
             last.2 + last.3,
-            content_w(&cols)
+            content_w(&cols, PanelColumn::Remote)
         );
     }
 
@@ -4000,7 +4059,7 @@ mod tests {
             .size()
             .x;
 
-        let lay = col_lefts(&cols);
+        let lay = col_lefts(&cols, PanelColumn::Remote);
         let (_, _, _size_left, size_w) = lay[1];
         let expected_diff = 2.0 * crate::ui::metrics::SP_XS + (hw + vw) / 2.0 - size_w;
         let actual_diff = head.x - value.x;
@@ -4080,7 +4139,7 @@ mod tests {
             ..entry(b"f.txt", EntryKind::File)
         };
         let cols = ColWidths::default();
-        let width = content_w(&cols);
+        let width = content_w(&cols, PanelColumn::Remote);
         let ctx = egui::Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default()
@@ -4107,7 +4166,7 @@ mod tests {
                 });
         });
 
-        let lay = col_lefts(&cols);
+        let lay = col_lefts(&cols, PanelColumn::Remote);
         let expect = [
             (human_size(e.size), lay[1]),
             (mtime_text(e.mtime), lay[2]),
