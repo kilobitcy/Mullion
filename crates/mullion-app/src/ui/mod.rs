@@ -1956,6 +1956,7 @@ mod tests {
                 b"/".to_vec(),
             )),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: files_panel::PanelColumn::default(),
         };
         for _ in 0..2 {
@@ -2016,6 +2017,7 @@ mod tests {
                 b"/".to_vec(),
             )),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: files_panel::PanelColumn::default(),
         };
         for _ in 0..2 {
@@ -2158,6 +2160,7 @@ mod tests {
                 b"/".to_vec(),
             )),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: files_panel::PanelColumn::default(),
         };
         fn entry(name: &[u8]) -> mullion_ssh::sftp::Entry {

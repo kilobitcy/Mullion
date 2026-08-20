@@ -123,6 +123,20 @@ impl SessionStore {
         self.vault.set_group(id, group)
     }
 
+    /// F139:文件面板路径条上的 ☆ 收藏。见 `Vault::add_bookmark`(按路径去重)。
+    pub fn add_bookmark(
+        &mut self,
+        id: SessionId,
+        mark: mullion_store::Bookmark,
+    ) -> Result<(), StoreError> {
+        self.vault.add_bookmark(id, mark)
+    }
+
+    /// F139:取消收藏。见 `Vault::remove_bookmark`。
+    pub fn remove_bookmark(&mut self, id: SessionId, path: &str) -> Result<(), StoreError> {
+        self.vault.remove_bookmark(id, path)
+    }
+
     /// F121:左栏拖拽排序。见 `Vault::move_session`。
     pub fn move_session(
         &mut self,

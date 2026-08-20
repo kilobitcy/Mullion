@@ -2741,6 +2741,12 @@ impl App {
                 }
                 return;
             }
+            // F139:书签只给远端栏(本地栏调用点传的是 `BookmarkView::none()`,
+            // 连 ☆ 都画不出来)。到这儿说明接线接错了,不静默吞。
+            FileAction::BookmarkAdd { .. } | FileAction::BookmarkRemove { .. } => {
+                log::warn!("本地栏收到了书签动作,已忽略(书签只属于远端栏)");
+                return;
+            }
         };
         let seq = files.local.begin_load(target.clone());
         let result = local::list_dir(&local::to_path(&target));
@@ -2815,6 +2821,17 @@ impl App {
                 }
                 return;
             }
+            // F139:收藏 / 取消收藏。**不走下面那条 `target` 的路** —— 它们
+            // 不改当前目录,只改会话配置;而且要借 `self.store`,夹不进后面
+            // 那段借着 `tab` 的代码里。
+            FileAction::BookmarkAdd { name, path } => {
+                self.add_bookmark(generation, path.clone(), name.clone());
+                return;
+            }
+            FileAction::BookmarkRemove { path } => {
+                self.remove_bookmark(generation, path.clone());
+                return;
+            }
             _ => {}
         }
         let client = {
@@ -2871,12 +2888,85 @@ impl App {
             | FileAction::Drop(_)
             | FileAction::EditExternal
             | FileAction::EditInline
-            | FileAction::Reconnect => return,
+            | FileAction::Reconnect
+            | FileAction::BookmarkAdd { .. }
+            | FileAction::BookmarkRemove { .. } => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
             spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, target, seq);
         self.track_sftp_task(generation, task);
+        self.ui_dirty = true;
+    }
+
+    /// F139:把一条书签写进会话配置,并同步这个标签的内存副本。
+    ///
+    /// **两处都要写**:`PanelFrame::bookmarks` 是这一帧画 ★/▾ 用的,store
+    /// 那份是重启之后还在的。只写一处的话,要么星星不变实心、要么关掉客户端
+    /// 收藏就没了。
+    ///
+    /// 存盘立刻做(`store.save()`),不攒着 —— 收藏是随手动作,用户不会为它
+    /// 去点「保存」;攒到退出再写的话,一次崩溃就全没了。
+    fn add_bookmark(&mut self, generation: u64, path: String, name: String) {
+        let Some(sid) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.session_id)
+        else {
+            // UI 已经按 `BookmarkView::can_edit` 把 ☆ 置灰了,走到这儿说明
+            // 接线被改坏了 —— 不静默吞。
+            log::warn!("收到 BookmarkAdd 但标签没有 SessionId,已忽略");
+            return;
+        };
+        let mark = mullion_store::Bookmark {
+            name,
+            path: path.clone(),
+        };
+        if let Some(store) = self.store.as_mut() {
+            if let Err(e) = store
+                .add_bookmark(sid, mark.clone())
+                .and_then(|_| store.save())
+            {
+                self.ui.set_error(e.to_string());
+                return;
+            }
+        }
+        if let Some(files) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.files_panel_mut())
+        {
+            // 去重判据与 store 侧同一条(按路径),两边不许分叉。
+            if !files.bookmarks.iter().any(|b| b.path == mark.path) {
+                files.bookmarks.push(mark);
+            }
+        }
+        self.ui_dirty = true;
+    }
+
+    /// F139:取消收藏。按路径相等匹配 —— 书签的身份就是路径。
+    fn remove_bookmark(&mut self, generation: u64, path: String) {
+        let Some(sid) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.session_id)
+        else {
+            log::warn!("收到 BookmarkRemove 但标签没有 SessionId,已忽略");
+            return;
+        };
+        if let Some(store) = self.store.as_mut() {
+            if let Err(e) = store.remove_bookmark(sid, &path).and_then(|_| store.save()) {
+                self.ui.set_error(e.to_string());
+                return;
+            }
+        }
+        if let Some(files) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.files_panel_mut())
+        {
+            files.bookmarks.retain(|b| b.path != path);
+        }
         self.ui_dirty = true;
     }
 
@@ -5439,6 +5529,8 @@ impl ApplicationHandler<UserEvent> for App {
                             files: crate::ui::files_panel::PanelFrame::new(
                                 sftp_prefs.default_local.as_deref(),
                                 sftp_prefs.bookmarks,
+                                // F139:没有会话记录就没地方存书签,☆ 置灰。
+                                session_id.is_some(),
                             ),
                             conn: handle,
                             generation,
@@ -5536,6 +5628,8 @@ impl ApplicationHandler<UserEvent> for App {
                         files: crate::ui::files_panel::PanelFrame::new(
                             sftp_prefs.default_local.as_deref(),
                             sftp_prefs.bookmarks,
+                            // F139:没有会话记录就没地方存书签,☆ 置灰。
+                            session_id.is_some(),
                         ),
                         sftp: None,
                         sftp_host_ix: None,
@@ -9512,6 +9606,34 @@ mod tests {
             expr.contains("self.ui.reorder_request"),
             "拖拽排序没算进 touched_store:跨组拖拽后外观缓存不会重算(F121)"
         );
+    }
+
+    /// F139:☆ 收藏必须**当场存盘**。这两个方法各写两处(store 一份、
+    /// `PanelFrame` 内存一份),漏掉 `store.save()` 的症状是「收藏了、星星也
+    /// 变实心了,关掉客户端再开就没了」——全程零报错,只有重启才发现。
+    ///
+    /// 跟 `touched_store` 那几条同款扎源码:这两个方法要一个真的 `App` 才调
+    /// 得动,而 `App` 在无头环境里造不出来。切片必须先切到函数体内 ——
+    /// `include_str!("app.rs")` 读的是同一个文件,本测试自己也含
+    /// `store.save()` 这个串,不缩范围就永远绿(第五类恒绿模式)。
+    ///
+    /// 自证会变红:把 `add_bookmark` 里的 `.and_then(|_| store.save())` 删掉。
+    #[test]
+    fn bookmarking_writes_through_to_disk_immediately() {
+        let src = include_str!("app.rs");
+        for f in ["fn add_bookmark(&mut self", "fn remove_bookmark(&mut self"] {
+            let after = src.split(f).nth(1).unwrap_or_else(|| panic!("找不到 {f}"));
+            // 到下一个方法定义为止 = 这一个函数的函数体。
+            let body = &after[..after.find("\n    fn ").expect("找不到该函数的结尾")];
+            assert!(
+                body.contains("by_generation(generation)"),
+                "{f} 的函数体切歪了 —— 下面那条断言会空过"
+            );
+            assert!(
+                body.contains("store.save()"),
+                "{f} 只改了内存没存盘:收藏在重启后消失(F139)"
+            );
+        }
     }
 
     /// F121:拖拽排序落盘走的也是 keyring/TOML 同步 IO,跟删除/保存/移动分组

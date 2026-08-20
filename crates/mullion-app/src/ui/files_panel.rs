@@ -58,6 +58,35 @@ pub enum FileAction {
     /// app 侧做:SFTP 节点标签重建整条连接;终端标签的侧栏只重开
     /// sftp channel(SSH 本体断了是终端的事,侧栏不越权)。
     Reconnect,
+    /// F139:把当前目录收进书签。`name` 由 UI 按路径末段算好 —— app 侧只管
+    /// 落盘,不重复一遍命名规则。
+    BookmarkAdd { path: String, name: String },
+    /// F139:取消收藏。按 `path` 相等匹配 —— 书签的身份就是路径(重名允许,
+    /// 同路径不允许重复收藏)。
+    BookmarkRemove { path: String },
+}
+
+/// F139:画书签相关控件要的两样东西。
+///
+/// 合成一个结构体而不是给 `show` 再加一个参数:两者永远一起出现,
+/// 而且分开传很容易在本地栏那个调用点只改一个(「列表给空、可编辑忘了关」
+/// 会画出一个点得动但存不进任何地方的 ☆)。
+#[derive(Clone, Copy)]
+pub struct BookmarkView<'a> {
+    /// 该会话已配的书签。
+    pub list: &'a [mullion_store::Bookmark],
+    /// 这个标签绑着一条会话记录(有 `SessionId`),收藏才有地方落盘。
+    pub can_edit: bool,
+}
+
+impl BookmarkView<'_> {
+    /// 本地栏用:没有书签,也不能收藏(本地目录收藏不在 F139 范围内)。
+    pub fn none() -> Self {
+        Self {
+            list: &[],
+            can_edit: false,
+        }
+    }
 }
 
 /// 要打开哪个对话框。
@@ -349,6 +378,17 @@ fn finish_path_edit(state: &mut PaneState, commit: bool) -> Option<FileAction> {
     commit.then_some(FileAction::GotoInput(buf))
 }
 
+/// F139:新书签的默认名 = 路径末段。
+///
+/// 根目录没有末段,回退成 `/` —— 空名字虽然 store 允许(界面会回退显示
+/// 整条路径),但那会让下拉里冒出一条 `/`……的长路径,不如直接给个 `/`。
+fn bookmark_default_name(path: &str) -> String {
+    match path.trim_end_matches('/').rsplit('/').next() {
+        Some(seg) if !seg.is_empty() => seg.to_owned(),
+        _ => "/".to_owned(),
+    }
+}
+
 /// `ScrollArea` 持久化 id 的拼装,抽成纯函数只为了能脱离 egui 单测
 /// (见 `tests::scroll_id_salt_differs_by_generation`)。
 ///
@@ -391,7 +431,7 @@ pub fn show(
     column: PanelColumn,
     state: &mut PaneState,
     focused: bool,
-    bookmarks: &[mullion_store::Bookmark],
+    bookmarks: BookmarkView<'_>,
     drop_in: usize,
     cols: &mut ColWidths,
 ) -> Option<FileAction> {
@@ -475,6 +515,57 @@ pub fn show(
             action = Some(FileAction::Refresh);
         }
         let path = state.cwd.display().to_string();
+        // F139:收藏当前目录 + 书签下拉。**必须画在路径标签之前** —— 下面
+        // 那个 `Label` 用 `available_width` 吃掉整行剩余宽度,排在它后面的
+        // 按钮会被挤出可视区。
+        //
+        // ★/☆ 由「当前 cwd 在不在书签列表里」现算:列表就是唯一真值,
+        // 不另存一个会跟它不同步的标志位。
+        let starred = bookmarks.list.iter().any(|b| b.path == path);
+        ui.add_enabled_ui(bookmarks.can_edit, |ui| {
+            let hit = ui
+                .small_button(if starred { "★" } else { "☆" })
+                .on_hover_text(if starred {
+                    "取消收藏这个目录"
+                } else {
+                    "收藏这个目录"
+                })
+                // 置灰时 egui 不显示普通 tooltip,得用这一个 —— 一个点不动
+                // 又不说为什么的按钮比没有更糟。
+                .on_disabled_hover_text("这个标签不来自已保存的会话,书签无处存放");
+            if hit.clicked() {
+                action = Some(if starred {
+                    FileAction::BookmarkRemove { path: path.clone() }
+                } else {
+                    FileAction::BookmarkAdd {
+                        name: bookmark_default_name(&path),
+                        path: path.clone(),
+                    }
+                });
+            }
+        });
+        ui.add_enabled_ui(!bookmarks.list.is_empty(), |ui| {
+            ui.menu_button("▾", |ui| {
+                for b in bookmarks.list {
+                    // 空名字是 store 明确允许的合法状态(`Bookmark::name` 的
+                    // 文档),界面回退显示路径本身,不能画一条没有文字的项。
+                    let label = if b.name.is_empty() {
+                        b.path.as_str()
+                    } else {
+                        b.name.as_str()
+                    };
+                    if ui.button(label).on_hover_text(&b.path).clicked() {
+                        action = Some(FileAction::Goto(mullion_ssh::sftp::RemotePath::from_bytes(
+                            b.path.as_bytes().to_vec(),
+                        )));
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("收藏的路径")
+            .on_disabled_hover_text("还没有收藏任何路径");
+        });
         annotate::mark(ui.ctx(), format!("文件面板/{id}/路径"), ui.max_rect());
         match state.path_edit.as_mut() {
             // 编辑态。**注意它能收到键盘全靠 `Modal::FilesPathEdit`**(下一个
@@ -527,29 +618,9 @@ pub fn show(
         }
     });
 
-    // F120:书签栏。调用方(`sidebar`/`content`)只给远端栏传非空切片 ——
-    // 本地栏永远收到 `&[]`,这里不按 `id` 分支,谁传谁画。放在路径条之后、
-    // `Load` 匹配之前:哪怕目录还没读完(`Idle`/`Loading`/`Failed`)书签也该
-    // 一直可点,不该等目录列出来才出现。
-    if !bookmarks.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            annotate::mark(ui.ctx(), format!("文件面板/{id}/书签栏"), ui.max_rect());
-            for b in bookmarks {
-                // 空名字是 store 明确允许的合法状态(`Bookmark::name` 文档),
-                // 界面回退显示路径本身,不能画一个没有任何文字的按钮。
-                let label = if b.name.is_empty() {
-                    b.path.as_str()
-                } else {
-                    b.name.as_str()
-                };
-                if ui.small_button(label).on_hover_text(&b.path).clicked() {
-                    action = Some(FileAction::Goto(mullion_ssh::sftp::RemotePath::from_bytes(
-                        b.path.as_bytes().to_vec(),
-                    )));
-                }
-            }
-        });
-    }
+    // F139:原来这里有一条横排书签栏(`if !bookmarks.is_empty()` + 一排
+    // `small_button`)。已去掉 —— 它只在该会话已经配过书签时才出现,用户
+    // 根本不知道它存在,还白占一整行高度。书签改走路径条上的 ▾ 下拉。
 
     match &state.load {
         Load::Idle => {
@@ -1133,6 +1204,11 @@ pub struct PanelFrame {
     /// `Vec` 是安全默认——符合 `Default` impl 文档下面那条「加字段前先想
     /// 清楚」的约束。
     pub bookmarks: Vec<mullion_store::Bookmark>,
+    /// F139:这个标签绑着会话记录没有(`Tab::session_id.is_some()`)。没绑就
+    /// 没地方存书签,☆ 按钮置灰。默认 `false` —— 与这个结构体
+    /// 「新标签初值 / 借用过桥占位」的双重语境约定一致(见 `Default` 的说明):
+    /// 不知道的时候按"不能写"处理,最坏结果是少一个功能,不是静默丢数据。
+    pub session_bound: bool,
     /// F6/Tab 换焦点(设计 D23):面板内键盘动作(进目录/上级/刷新/切隐藏/
     /// 移动选中)作用在哪一栏。纯 UI 状态,安全默认值(`Remote`),同样符合
     /// 上面那条「加字段前先想清楚」的约束。
@@ -1158,6 +1234,7 @@ impl Default for PanelFrame {
             remote: PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(crate::files::local::default_local(None)),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: PanelColumn::default(),
         }
     }
@@ -1168,10 +1245,20 @@ impl PanelFrame {
     /// `files::local::default_local`(`None` = 用户主目录);远端目录不在这里
     /// 决定 —— 连接尚未建立时根本没有远端可拿,拿真实登录目录/配置值是
     /// `app.rs::spawn_sftp_open` 建立连接后才做的事。
-    pub fn new(default_local: Option<&str>, bookmarks: Vec<mullion_store::Bookmark>) -> Self {
+    ///
+    /// `session_bound`:F139 —— 这个标签有没有 `SessionId`。**显式参数而不是
+    /// 事后赋值**:加参数的话编译器会逼每个调用点表态,漏一个就编译不过;
+    /// 而 `frame.session_bound = ...` 那种写法漏了没人提醒,表现是某种标签
+    /// 里的 ☆ 永远置灰,而用户只会觉得"这功能坏了"。
+    pub fn new(
+        default_local: Option<&str>,
+        bookmarks: Vec<mullion_store::Bookmark>,
+        session_bound: bool,
+    ) -> Self {
         Self {
             local: PaneState::new(crate::files::local::default_local(default_local)),
             bookmarks,
+            session_bound,
             ..Self::default()
         }
     }
@@ -1267,7 +1354,7 @@ pub fn sidebar(
                     PanelColumn::Local,
                     &mut frame.local,
                     panel_focused && frame.active_column == PanelColumn::Local,
-                    &[],
+                    BookmarkView::none(),
                     0,
                     &mut ui_state.files_cols,
                 );
@@ -1281,7 +1368,10 @@ pub fn sidebar(
                 PanelColumn::Remote,
                 &mut frame.remote,
                 panel_focused && frame.active_column == PanelColumn::Remote,
-                &frame.bookmarks,
+                BookmarkView {
+                    list: &frame.bookmarks,
+                    can_edit: frame.session_bound,
+                },
                 drop_in,
                 &mut ui_state.files_cols,
             );
@@ -1384,7 +1474,7 @@ pub fn content(
                     PanelColumn::Local,
                     &mut frame.local,
                     panel_focused && frame.active_column == PanelColumn::Local,
-                    &[],
+                    BookmarkView::none(),
                     0,
                     cols,
                 );
@@ -1402,7 +1492,10 @@ pub fn content(
                     PanelColumn::Remote,
                     &mut frame.remote,
                     panel_focused && frame.active_column == PanelColumn::Remote,
-                    &frame.bookmarks,
+                    BookmarkView {
+                        list: &frame.bookmarks,
+                        can_edit: frame.session_bound,
+                    },
                     drop_in,
                     cols,
                 );
@@ -1657,7 +1750,7 @@ mod tests {
                         PanelColumn::Remote,
                         &mut state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -1728,7 +1821,7 @@ mod tests {
                         PanelColumn::Remote,
                         &mut state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -1852,7 +1945,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         cols,
                     );
@@ -1944,6 +2037,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: PanelColumn::default(),
         };
         frame.remote.entries = vec![entry(b"remote-only.txt", EntryKind::File)];
@@ -2033,7 +2127,7 @@ mod tests {
                             PanelColumn::Remote,
                             &mut state,
                             focused,
-                            &[],
+                            BookmarkView::none(),
                             0,
                             &mut cols,
                         );
@@ -2109,7 +2203,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         cols,
                     );
@@ -2207,7 +2301,7 @@ mod tests {
                     PanelColumn::Remote,
                     &mut state,
                     false,
-                    &[],
+                    BookmarkView::none(),
                     0,
                     &mut cols,
                 );
@@ -2236,7 +2330,7 @@ mod tests {
                     PanelColumn::Remote,
                     &mut state,
                     false,
-                    &[],
+                    BookmarkView::none(),
                     0,
                     &mut cols,
                 );
@@ -2252,7 +2346,7 @@ mod tests {
                     PanelColumn::Remote,
                     &mut state,
                     false,
-                    &[],
+                    BookmarkView::none(),
                     0,
                     &mut cols,
                 );
@@ -2297,6 +2391,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/remote".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/local".to_vec())),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: PanelColumn::Remote,
         };
         assert_eq!(frame.active_state().0, PanelColumn::Remote);
@@ -2321,70 +2416,21 @@ mod tests {
         );
     }
 
-    /// F120:书签栏要画出来,且点一下就要发出对应路径的 `Goto`。
-    /// 空名字的书签(store 里明确允许)必须回退显示路径本身,不能画个空按钮
-    /// 让用户根本点不到。
-    #[test]
-    fn clicking_a_bookmark_dispatches_goto_to_its_path() {
+    /// 跑一帧远端栏,把书签视图喂进去,拿回动作和这一帧的形状树。
+    ///
+    /// 书签相关的守护全要「先跑一帧稳定布局,再拿坐标点下去」(egui Panel
+    /// 首帧是 sizing pass),所以统一在这里收口。
+    fn run_remote(
+        ctx: &egui::Context,
+        state: &mut PaneState,
+        cols: &mut ColWidths,
+        bookmarks: &[mullion_store::Bookmark],
+        can_edit: bool,
+        input: egui::RawInput,
+    ) -> (Option<FileAction>, Vec<egui::epaint::ClippedShape>) {
         let t = crate::theme::MULLION_DARK;
-        let mut state = PaneState::new(RemotePath::from_bytes(b"/".to_vec()));
-        state.load = Load::Ready;
-        let bookmarks = vec![mullion_store::Bookmark {
-            name: "日志".into(),
-            path: "/var/log".into(),
-        }];
-        let ctx = egui::Context::default();
-        let mut cols = ColWidths::default();
-        // 先跑一帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop)。
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                show(
-                    ui,
-                    &t,
-                    "远端",
-                    1,
-                    PanelColumn::Remote,
-                    &mut state,
-                    false,
-                    &bookmarks,
-                    0,
-                    &mut cols,
-                );
-            });
-        });
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                show(
-                    ui,
-                    &t,
-                    "远端",
-                    1,
-                    PanelColumn::Remote,
-                    &mut state,
-                    false,
-                    &bookmarks,
-                    0,
-                    &mut cols,
-                );
-            });
-        });
-        let pos = find_text_pos(&out.shapes, "日志").expect("书签「日志」没画出来");
-
-        let mut input = egui::RawInput::default();
-        input.events.push(egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: Default::default(),
-        });
-        input.events.push(egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        });
         let mut action = None;
-        let _ = ctx.run(input, |ctx| {
+        let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 action = show(
                     ui,
@@ -2392,101 +2438,204 @@ mod tests {
                     "远端",
                     1,
                     PanelColumn::Remote,
-                    &mut state,
+                    state,
                     false,
-                    &bookmarks,
+                    BookmarkView {
+                        list: bookmarks,
+                        can_edit,
+                    },
                     0,
-                    &mut cols,
+                    cols,
                 );
             });
         });
+        (action, out.shapes)
+    }
+
+    /// 一次完整的左键点击(按下 + 抬起)。`PointerMoved` 不能省:egui 的
+    /// 交互靠指针位置,只发按钮事件时 hover 判定拿不到坐标。
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        input
+    }
+
+    fn ready_at(path: &[u8]) -> PaneState {
+        let mut state = PaneState::new(RemotePath::from_bytes(path.to_vec()));
+        state.load = Load::Ready;
+        state
+    }
+
+    /// F139:当前目录没被收藏时路径条给的是空心 ☆,点它发出 `BookmarkAdd`,
+    /// 默认名取路径末段(不是整条路径 —— 下拉里一长串没法认)。
+    #[test]
+    fn clicking_the_hollow_star_bookmarks_the_current_directory() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/var/log");
+        let mut cols = ColWidths::default();
+        let (_, shapes) = run_remote(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &[],
+            true,
+            egui::RawInput::default(),
+        );
+        let pos = find_text_pos(&shapes, "☆").expect("没收藏时该画空心星");
+        let (action, _) = run_remote(&ctx, &mut state, &mut cols, &[], true, click_at(pos));
+        assert_eq!(
+            action,
+            Some(FileAction::BookmarkAdd {
+                name: "log".into(),
+                path: "/var/log".into(),
+            }),
+            "点空心星该收藏当前目录,默认名取末段"
+        );
+    }
+
+    /// F139:已收藏时是实心 ★,再点 = 取消收藏(设计定的切换语义)。
+    /// ★/☆ 靠「cwd 在不在列表里」现算,这条同时守住那个判定没写反。
+    #[test]
+    fn clicking_the_filled_star_removes_that_bookmark() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/var/log");
+        let mut cols = ColWidths::default();
+        let marks = vec![mullion_store::Bookmark {
+            name: "日志".into(),
+            path: "/var/log".into(),
+        }];
+        let (_, shapes) = run_remote(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &marks,
+            true,
+            egui::RawInput::default(),
+        );
+        let pos = find_text_pos(&shapes, "★").expect("已收藏的目录该画实心星");
+        let (action, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(pos));
+        assert_eq!(
+            action,
+            Some(FileAction::BookmarkRemove {
+                path: "/var/log".into()
+            }),
+            "点实心星该取消收藏"
+        );
+    }
+
+    /// F139:标签不是从已保存的会话开出来的(CLI 直连)时没地方存书签,
+    /// ☆ 必须置灰 —— 能点但存不下去是最糟的一种:用户以为收藏成功了。
+    #[test]
+    fn the_star_is_disabled_when_the_tab_is_not_bound_to_a_session() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/var/log");
+        let mut cols = ColWidths::default();
+        let (_, shapes) = run_remote(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &[],
+            false,
+            egui::RawInput::default(),
+        );
+        let pos = find_text_pos(&shapes, "☆").expect("置灰也要画出来,不是藏起来");
+        let (action, _) = run_remote(&ctx, &mut state, &mut cols, &[], false, click_at(pos));
+        assert_eq!(action, None, "没有会话记录时点星不该发出任何书签动作");
+    }
+
+    /// F139:书签全走 ▾ 下拉(横排书签栏已删)。点开再点其中一条,
+    /// 要发出指向它 `path` 的 `Goto`。
+    #[test]
+    fn picking_a_bookmark_from_the_dropdown_emits_goto() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/");
+        let mut cols = ColWidths::default();
+        let marks = vec![mullion_store::Bookmark {
+            name: "日志".into(),
+            path: "/var/log".into(),
+        }];
+        let (_, shapes) = run_remote(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &marks,
+            true,
+            egui::RawInput::default(),
+        );
+        let arrow = find_text_pos(&shapes, "▾").expect("有书签时该画下拉按钮");
+        // 点开菜单。菜单要到**下一帧**才画得出来,所以这一帧只管点。
+        let (_, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(arrow));
+        let mut item = None;
+        for _ in 0..3 {
+            let (_, shapes) = run_remote(
+                &ctx,
+                &mut state,
+                &mut cols,
+                &marks,
+                true,
+                egui::RawInput::default(),
+            );
+            item = find_text_pos(&shapes, "日志");
+            if item.is_some() {
+                break;
+            }
+        }
+        let item = item.expect("下拉里该有「日志」这一条");
+        let (action, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(item));
         assert_eq!(
             action,
             Some(FileAction::Goto(RemotePath::from_bytes(
                 b"/var/log".to_vec()
             ))),
-            "点书签该发出指向它 path 的 Goto"
+            "点下拉里的书签该发出指向它 path 的 Goto"
         );
     }
 
-    /// 空名字是 store 明确允许的合法状态(`Bookmark::name` 文档),界面必须
-    /// 回退显示路径本身,而不是画一个没有任何文字的按钮。
+    /// 空名字是 store 明确允许的合法状态(`Bookmark::name` 文档),下拉里
+    /// 必须回退显示路径本身,而不是画一条没有任何文字、根本点不中的项。
     #[test]
     fn a_bookmark_with_an_empty_name_falls_back_to_showing_its_path() {
-        let t = crate::theme::MULLION_DARK;
-        let mut state = PaneState::new(RemotePath::from_bytes(b"/".to_vec()));
-        state.load = Load::Ready;
-        let bookmarks = vec![mullion_store::Bookmark {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/");
+        let mut cols = ColWidths::default();
+        let marks = vec![mullion_store::Bookmark {
             name: String::new(),
             path: "/srv/app".into(),
         }];
-        let ctx = egui::Context::default();
-        let mut cols = ColWidths::default();
-        let mut texts = Vec::new();
-        for _ in 0..2 {
-            texts.clear();
-            let out = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    show(
-                        ui,
-                        &t,
-                        "远端",
-                        1,
-                        PanelColumn::Remote,
-                        &mut state,
-                        false,
-                        &bookmarks,
-                        0,
-                        &mut cols,
-                    );
-                });
-            });
-            for shape in out.shapes.iter() {
-                if let egui::epaint::Shape::Text(ts) = &shape.shape {
-                    texts.push(ts.galley.text().to_owned());
-                }
-            }
-        }
-        assert!(
-            texts.iter().any(|s| s.contains("/srv/app")),
-            "空名字的书签要回退显示路径,实际画出来的文本: {texts:?}"
+        let (_, shapes) = run_remote(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &marks,
+            true,
+            egui::RawInput::default(),
         );
-    }
-
-    /// D1:书签栏只在远端栏出现。用 `content()` 整体渲染,书签名只该出现
-    /// 一次 —— 若本地栏调用点也误传了 `frame.bookmarks`(复制粘贴错一个
-    /// 参数的那类真实失误),这个名字会画两遍。
-    #[test]
-    fn only_the_remote_column_gets_a_bookmarks_bar() {
-        let t = crate::theme::MULLION_DARK;
-        let mut frame = PanelFrame {
-            remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
-            local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
-            bookmarks: vec![mullion_store::Bookmark {
-                name: "日志".into(),
-                path: "/var/log".into(),
-            }],
-            active_column: PanelColumn::default(),
-        };
-        frame.remote.load = Load::Ready;
-        frame.local.load = Load::Ready;
-
-        let ctx = egui::Context::default();
-        let mut cols = ColWidths::default();
-        let mut texts = Vec::new();
-        for _ in 0..2 {
-            texts.clear();
-            let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
-            });
-            for shape in out.shapes.iter() {
-                if let egui::epaint::Shape::Text(ts) = &shape.shape {
-                    texts.push(ts.galley.text().to_owned());
-                }
+        let arrow = find_text_pos(&shapes, "▾").expect("有书签时该画下拉按钮");
+        let (_, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(arrow));
+        let mut found = false;
+        for _ in 0..3 {
+            let (_, shapes) = run_remote(
+                &ctx,
+                &mut state,
+                &mut cols,
+                &marks,
+                true,
+                egui::RawInput::default(),
+            );
+            if find_text_pos(&shapes, "/srv/app").is_some() {
+                found = true;
+                break;
             }
         }
-        let count = texts.iter().filter(|s| s.contains("日志")).count();
-        assert_eq!(count, 1, "书签「日志」该只出现在远端栏一次,实际: {texts:?}");
+        assert!(found, "空名字的书签要回退显示路径");
     }
 
     /// D5:**本地栏没有写操作入口**。菜单项的存在与否是纯结构的事,
@@ -2567,7 +2716,9 @@ mod tests {
         lefts.sort_by(|a, b| a.partial_cmp(b).expect("坐标不该是 NaN"));
         // 最靠左的矩形 = 面板外框(`CentralPanel` 的 `Frame` 背景);
         // 第一个**比它靠右**的矩形 = 最靠左的内容(路径条那几个按钮的底)。
-        let panel_left = *lefts.first().expect("一个矩形都没画出来 —— 脚手架本身有问题");
+        let panel_left = *lefts
+            .first()
+            .expect("一个矩形都没画出来 —— 脚手架本身有问题");
         let content_left = lefts
             .iter()
             .copied()
@@ -2850,7 +3001,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -3008,7 +3159,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -3078,7 +3229,7 @@ mod tests {
                             PanelColumn::Local,
                             state,
                             false,
-                            &[],
+                            BookmarkView::none(),
                             0,
                             &mut cols,
                         );
@@ -3170,7 +3321,7 @@ mod tests {
                         PanelColumn::Remote,
                         &mut state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -3331,6 +3482,7 @@ mod tests {
                 remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
                 local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
                 bookmarks: Vec::new(),
+                session_bound: false,
                 active_column: active,
             };
             frame.local.entries = vec![entry(b"local-a.txt", EntryKind::File)];
@@ -3386,6 +3538,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: PanelColumn::Local,
         };
         frame.local.entries = (0..200)
@@ -3566,7 +3719,7 @@ mod tests {
                         PanelColumn::Remote,
                         &mut state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -3732,7 +3885,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         true,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -3834,6 +3987,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/var/log".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/home/u".to_vec())),
             bookmarks: Vec::new(),
+            session_bound: false,
             active_column: PanelColumn::default(),
         };
         frame.remote.load = Load::Ready;
@@ -3991,7 +4145,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         true,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         &mut cols,
                     );
@@ -4070,7 +4224,7 @@ mod tests {
                             PanelColumn::Remote,
                             &mut state,
                             false,
-                            &[],
+                            BookmarkView::none(),
                             0,
                             cols,
                         );
@@ -4132,7 +4286,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         cols,
                     );
@@ -4226,7 +4380,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         cols,
                     );
@@ -4310,7 +4464,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         cols,
                     );
@@ -4394,7 +4548,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         cols,
                     );
@@ -4454,7 +4608,7 @@ mod tests {
                         PanelColumn::Remote,
                         state,
                         false,
-                        &[],
+                        BookmarkView::none(),
                         0,
                         cols,
                     );

@@ -429,6 +429,45 @@ impl Vault {
         Ok(())
     }
 
+    /// F139:给一条会话加一个 SFTP 书签(文件面板路径条上的 ☆)。
+    ///
+    /// 不走 `update`:同 `set_group` 的理由 —— 调用方手上只有一个 id,为了改
+    /// 一条书签去凭空重建整份 `SessionDraft`,漏填任何字段都是静默把用户的
+    /// 配置改掉。
+    ///
+    /// **按 `path` 去重**:书签的身份就是路径(`remove_bookmark` 也按它匹配),
+    /// 而路径条的 ★/☆ 靠「当前目录在不在列表里」现算 —— 存进两条同路径的
+    /// 书签,用户点「取消收藏」会看起来点一次没反应。
+    ///
+    /// **不重打 `modified_at`**:收藏是浏览过程中的组织动作,不是配置内容变更。
+    pub fn add_bookmark(
+        &mut self,
+        id: SessionId,
+        mark: crate::sftp::Bookmark,
+    ) -> Result<(), StoreError> {
+        let rec = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(StoreError::NotFound(id))?;
+        if !rec.sftp.bookmarks.iter().any(|b| b.path == mark.path) {
+            rec.sftp.bookmarks.push(mark);
+        }
+        Ok(())
+    }
+
+    /// F139:取消收藏。按路径相等匹配 —— 书签的身份就是路径,名字可以重复
+    /// 也可以为空。
+    pub fn remove_bookmark(&mut self, id: SessionId, path: &str) -> Result<(), StoreError> {
+        let rec = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(StoreError::NotFound(id))?;
+        rec.sftp.bookmarks.retain(|b| b.path != path);
+        Ok(())
+    }
+
     pub fn groups(&self) -> &[GroupRecord] {
         &self.groups
     }
@@ -2026,6 +2065,57 @@ port = 7891
             rec.sftp.bookmarks.is_empty(),
             "update 是整体覆盖语义(与 terminal/network 那几节一致):\
              这一版 draft 没带书签,存回去就该是空的"
+        );
+    }
+
+    /// F139:路径条上的 ☆ 收藏必须**存得进盘**,而不是只改内存里那份 ——
+    /// 只改内存的症状是「收藏了,重开客户端没了」,且全程没有报错。
+    ///
+    /// 顺带守住去重:同一个路径收藏两次只该留一条。路径条的 ★/☆ 靠
+    /// 「当前目录在不在列表里」现算,重复项会让「取消收藏」看起来点了没反应。
+    #[test]
+    fn bookmarks_added_from_the_path_bar_survive_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            id = v.add(draft(), "2026-08-20T00:00:00Z");
+            v.add_bookmark(
+                id,
+                crate::sftp::Bookmark {
+                    name: "log".into(),
+                    path: "/var/log".into(),
+                },
+            )
+            .unwrap();
+            // 同一个路径再来一次(用户在同一个目录连点两下 ☆ 之间隔了一次
+            // 刷新,列表还没同步),名字不同也不许多出一条。
+            v.add_bookmark(
+                id,
+                crate::sftp::Bookmark {
+                    name: "另一个名字".into(),
+                    path: "/var/log".into(),
+                },
+            )
+            .unwrap();
+            v.save().unwrap();
+        }
+        {
+            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let rec = v.get(id).unwrap();
+            assert_eq!(rec.sftp.bookmarks.len(), 1, "同一路径收藏两次该去重");
+            assert_eq!(rec.sftp.bookmarks[0].path, "/var/log");
+            assert_eq!(
+                rec.sftp.bookmarks[0].name, "log",
+                "去重要留先来的那条,不是拿后来的覆盖"
+            );
+            v.remove_bookmark(id, "/var/log").unwrap();
+            v.save().unwrap();
+        }
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert!(
+            v.get(id).unwrap().sftp.bookmarks.is_empty(),
+            "取消收藏没存盘 —— 删掉的书签重启后会回来"
         );
     }
 
