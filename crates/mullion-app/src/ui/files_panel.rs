@@ -927,8 +927,8 @@ fn header_at(
         );
         let mark = if state.sort_key == key {
             match state.sort_dir {
-                crate::files::SortDir::Asc => " ▲",
-                crate::files::SortDir::Desc => " ▼",
+                crate::files::SortDir::Asc => "▲",
+                crate::files::SortDir::Desc => "▼",
             }
         } else {
             ""
@@ -943,18 +943,34 @@ fn header_at(
                 .size()
                 .x
         };
+        // F147:排序标识画在**列尾**,不是跟在标题屁股后面。
+        //
+        // 跟在后面那一版有个必然的坏结果:标题与标识拼成一串一起送去截断,
+        // 列一窄先被 `Elide::End` 吃掉的就是末尾的标识 —— 而列窄恰恰是最
+        // 需要看见「按哪列排的」的时候。这里反过来:**先给标识留出预算**,
+        // 标题在剩下的宽度里截断。标识永远画得出来,标题该截就截。
+        let pad = crate::ui::metrics::SP_XS;
+        let mark_w = if mark.is_empty() {
+            0.0
+        } else {
+            measure(mark) + pad
+        };
         painter.text(
-            rect.left_center() + egui::vec2(crate::ui::metrics::SP_XS, 0.0),
+            rect.left_center() + egui::vec2(pad, 0.0),
             egui::Align2::LEFT_CENTER,
-            elide(
-                &format!("{label}{mark}"),
-                w - crate::ui::metrics::SP_XS * 2.0,
-                Elide::End,
-                measure,
-            ),
+            elide(label, w - pad * 2.0 - mark_w, Elide::End, measure),
             font.clone(),
             theme::c32(t.fg_muted),
         );
+        if !mark.is_empty() {
+            painter.text(
+                rect.right_center() - egui::vec2(pad, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                mark,
+                font.clone(),
+                theme::c32(t.fg_muted),
+            );
+        }
         if resp.clicked() {
             hit = Some(key);
         }
@@ -1631,6 +1647,21 @@ mod tests {
                 egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
                 egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
                     Some(ts.pos + ts.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// 同 `find_text_pos`,但给的是整块文字的**矩形**。判「贴着某条边」
+    /// 这类事得用边界:拿中心点判要先猜字宽,猜出来的阈值不算判据。
+    fn find_text_rect(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                    Some(egui::Rect::from_min_size(ts.pos, ts.galley.size()))
                 }
                 _ => None,
             }
@@ -5068,5 +5099,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 渲染一次远端栏的列头,返回这一帧的 shapes。排序状态由调用方给。
+    fn header_shapes(
+        cols: &ColWidths,
+        key: SortKey,
+        dir: crate::files::SortDir,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        state.sort_key = key;
+        state.sort_dir = dir;
+        let mut cols = *cols;
+        let ctx = egui::Context::default();
+        let mut render = || {
+            ctx.run(raw(None), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        BookmarkView::none(),
+                        0,
+                        &mut cols,
+                    );
+                });
+            })
+        };
+        // 两帧:列头要等占位横带定下来之后才画得出正确位置。
+        let _ = render();
+        render().shapes
+    }
+
+    /// F147:排序标识画在**列尾**,不是跟在标题后面。
+    ///
+    /// 判据是「标识**右边界**贴着列的右边界、只留一格 `SP_XS`」,不是
+    /// 「标识 x > 标题 x」—— 后者在拼接版里也成立(标识本来就跟在标题
+    /// 右边),那样的判据抓不住这次改动。用边界不用中心点:拿中心点判要
+    /// 先猜字宽,猜出来的阈值不算判据。
+    ///
+    /// 列的 x 区间从**标题的左边界反推**(标题左 = 列左 + `SP_XS`),
+    /// 不在测试里另算一份横带起点 —— 横带的绝对位置取决于 `CentralPanel`
+    /// 的默认边距,那是测试算不准的东西。
+    ///
+    /// 自证会变红:把两处 `painter.text` 换回一处
+    /// `elide(&format!("{label}{mark}"), ..)`,标识跟着标题回到列首。
+    #[test]
+    fn the_sort_marker_sits_at_the_far_end_of_the_column() {
+        let cols = ColWidths::default();
+        let shapes = header_shapes(&cols, SortKey::Size, crate::files::SortDir::Asc);
+        let marker = find_text_rect(&shapes, "▲").expect("升序该画出「▲」");
+        let title = find_text_rect(&shapes, "大小").expect("该画出列头「大小」");
+
+        // 列宽取生产布局那一份,不抄常量。
+        let pad = crate::ui::metrics::SP_XS;
+        let (_, _, _, w) = col_lefts(&cols, PanelColumn::Remote)[1];
+        let col_right = title.left() - pad + w;
+
+        assert!(
+            (col_right - marker.right() - pad).abs() < 1.0,
+            "标识右边界 {} 没贴着列右边界 {col_right}(该留一格 {pad})—— 它没画在列尾",
+            marker.right()
+        );
+        assert!(
+            marker.left() > title.right(),
+            "标识(从 {} 起)压在标题(到 {} 止)上或跑到了它左边",
+            marker.left(),
+            title.right()
+        );
+    }
+
+    /// F147:列窄到放不下整个标题时,**先保标识**、截标题。
+    ///
+    /// 拼接版在这里必然丢标识:`Elide::End` 从尾部截,标识就在尾部。
+    /// 而列窄恰恰是最需要看清「按哪列排的」的时候。
+    ///
+    /// 自证会变红:换回拼接版,`find_text_pos(.., "▼")` 拿到 `None`。
+    #[test]
+    fn a_narrow_column_truncates_its_title_but_keeps_the_sort_marker() {
+        let cols = ColWidths {
+            mtime: col_min(2),
+            ..ColWidths::default()
+        };
+        let shapes = header_shapes(&cols, SortKey::Mtime, crate::files::SortDir::Desc);
+        assert!(
+            find_text_pos(&shapes, "▼").is_some(),
+            "列窄到 {} 时降序标识被截没了 —— 标题吃掉了标识的预算",
+            cols.mtime
+        );
+        assert!(
+            find_text_pos(&shapes, "修改时间").is_none(),
+            "列只有 {} 宽,整个标题却还画得下?这条测试没测到截断那一支",
+            cols.mtime
+        );
+        assert!(
+            find_text_pos(&shapes, ELLIPSIS).is_some(),
+            "标题被截断了却没画省略号"
+        );
     }
 }
