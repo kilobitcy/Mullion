@@ -1784,7 +1784,7 @@ mod tunnel_ui_tests {
         let texts = all_text(&out.shapes);
         assert!(has(&texts, "引用的会话已删除"), "没有提示悬垂: {texts:?}");
         assert!(
-            has(&texts, "已删除的会话 (id=999)"),
+            has(&texts, "（已删除）会话 id=999"),
             "下拉必须保持显示原来的 id,而不是跳到第一条: {texts:?}"
         );
         assert_eq!(

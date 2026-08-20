@@ -85,7 +85,8 @@ mod tests {
     /// 改成 `true`，第二组断言立刻红。
     #[test]
     fn only_registered_symbols_pass_and_the_known_tofu_does_not() {
-        for c in ['—', '…', '·', '→', '↑', '↓', '×', '●', '★', '☆', '▲', '▼'] {
+        for c in ['—', '…', '·', '→', '↑', '↓', '×', '●', '★', '☆', '▲', '▼']
+        {
             assert!(is_allowed(c), "已登记的 {c:?} 应当放行");
         }
         // 这六个在 GBK 里没有 —— 微软雅黑与 egui 内置字体两边都画不出来。

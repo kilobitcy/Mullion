@@ -48,7 +48,9 @@ impl HostKeyView<'_> {
 
     pub fn title(&self) -> &'static str {
         if self.is_changed() {
-            "⚠ 主机密钥已变更"
+            // F143:原先前缀的警告符 U+26A0 不在 GBK,是豆腐块。这里是纯
+            // 字符串(窗口标题),没有自绘余地,改中文措辞。
+            "主机密钥已变更（警告）"
         } else {
             "主机密钥确认"
         }

@@ -297,7 +297,7 @@ pub(super) fn basic(
                     for (i, tag) in buf.preserved_tags.iter().enumerate() {
                         // id 必须 salt 到 `(索引, 文本)`:两个 chips 文字相同
                         // (大小写不同,去重放行)时,只按文本 salt 会撞 id,
-                        // 点一个 ✕ 删掉另一个。
+                        // 点一个叉删掉另一个。
                         let id = ui.id().with(("sm_tag_chip", i, tag.as_str()));
                         ui.push_id(id, |ui| {
                             egui::Frame::none()
@@ -307,10 +307,28 @@ pub(super) fn basic(
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.colored_label(crate::theme::c32(t.fg_dim), tag);
-                                        if ui
-                                            .add(egui::Button::new("✕").frame(false).small())
-                                            .clicked()
-                                        {
+                                        // F143:原先写的 U+2715 不在 GBK ——
+                                        // 这正是走查 P0-5 当年报的那个豆腐块,
+                                        // `icon.rs` 模块头记着它,却又在这里
+                                        // 长了回来。这就是白名单守护存在的理由。
+                                        //
+                                        // 包一层 `scope` 是为了拿到按钮矩形:
+                                        // 自绘之后它没有任何文字,标注模式下
+                                        // 认不出来,测试也没法按文本定位。
+                                        let hit = ui.scope(|ui| {
+                                            crate::ui::icon::icon_button(
+                                                ui,
+                                                crate::ui::icon::Glyph::Cross,
+                                                true,
+                                                "移除这个标签",
+                                            )
+                                        });
+                                        crate::ui::annotate::mark(
+                                            ui.ctx(),
+                                            format!("会话管理器/标签/{tag}/移除"),
+                                            hit.response.rect,
+                                        );
+                                        if hit.inner {
                                             remove = Some(i);
                                         }
                                     });
@@ -2866,6 +2884,9 @@ mod tests {
             ..Default::default()
         };
         let ctx = egui::Context::default();
+        // 删除叉是自绘的、没有文字,只能靠 annotate 定位,而 `mark` 只在
+        // 标注模式开着时才登记。
+        crate::ui::annotate::toggle(&ctx);
         let run = |buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -2935,9 +2956,12 @@ mod tests {
             "标签该以 chip 的形式画出来"
         );
 
-        // 点 chip 上的 ✕ 删掉它。
-        let out = run(&mut buf, egui::RawInput::default());
-        let x = find_text_pos(&out.shapes, "✕").expect("chip 上该有个 ✕");
+        // 点 chip 上的删除叉删掉它。F143 之后那个叉是自绘的、没有文字,
+        // `find_text_pos` 找不到 —— 靠 annotate 记下的矩形定位。
+        let _ = run(&mut buf, egui::RawInput::default());
+        let x = crate::ui::annotate::spot_rect(&ctx, "会话管理器/标签/prod/移除")
+            .expect("chip 上该有个删除叉")
+            .center();
         let _ = run(
             &mut buf,
             egui::RawInput {
@@ -2949,7 +2973,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(buf.preserved_tags.is_empty(), "点 ✕ 该把这个标签删掉");
+        assert!(buf.preserved_tags.is_empty(), "点删除叉该把这个标签删掉");
     }
 
     fn run_appearance(buf: &mut EditorBuffer) -> egui::FullOutput {

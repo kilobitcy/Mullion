@@ -38,8 +38,22 @@ pub fn show(
         )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let arrow = if *expanded { "▾" } else { "▸" };
-                if ui.button(format!("{arrow} 传输")).clicked() {
+                // F143:原先那两个三角字符都不在 GBK,画出来是豆腐。三角
+                // 改自绘,文字仍走普通按钮 —— 两个控件并排,点哪个都翻折叠。
+                let g = if *expanded {
+                    crate::ui::icon::Glyph::TriangleDown
+                } else {
+                    crate::ui::icon::Glyph::TriangleRight
+                };
+                let tip = if *expanded {
+                    "折起传输队列"
+                } else {
+                    "展开传输队列"
+                };
+                if crate::ui::icon::icon_button(ui, g, true, tip) {
+                    *expanded = !*expanded;
+                }
+                if ui.button("传输").clicked() {
                     *expanded = !*expanded;
                 }
                 ui.colored_label(theme::c32(t.fg_mid), summary_line(&s, queue.rate_bps()));

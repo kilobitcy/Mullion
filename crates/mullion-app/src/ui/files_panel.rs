@@ -518,7 +518,9 @@ pub fn show(
         {
             action = Some(FileAction::Up);
         }
-        if ui.small_button("⟳").on_hover_text("刷新(F5)").clicked() {
+        // F143:原先写的 U+27F3 不在 GBK,微软雅黑与 egui 内置字体两边都
+        // 没有 —— 画出来是豆腐块。自绘不受字体覆盖面影响。
+        if crate::ui::icon::icon_button(ui, crate::ui::icon::Glyph::Refresh, true, "刷新(F5)") {
             action = Some(FileAction::Refresh);
         }
         let path = state.cwd.display().to_string();
@@ -552,7 +554,12 @@ pub fn show(
             }
         });
         ui.add_enabled_ui(!bookmarks.list.is_empty(), |ui| {
-            ui.menu_button("▾", |ui| {
+            // F143:原先写的 U+25BE 不在 GBK,是豆腐块(用户 v0.1.56 实测
+            // 报的就是这一个)。`menu_button` 只收文本,换不了自绘 —— 改用
+            // `menu_custom_button` 传一个空文本按钮,再把三角画进它的 rect。
+            let btn =
+                egui::Button::new("").min_size(egui::Vec2::splat(ui.spacing().interact_size.y));
+            let menu = egui::menu::menu_custom_button(ui, btn, |ui| {
                 for b in bookmarks.list {
                     // 空名字是 store 明确允许的合法状态(`Bookmark::name` 的
                     // 文档),界面回退显示路径本身,不能画一条没有文字的项。
@@ -568,10 +575,24 @@ pub fn show(
                         ui.close_menu();
                     }
                 }
-            })
-            .response
-            .on_hover_text("收藏的路径")
-            .on_disabled_hover_text("还没有收藏任何路径");
+            });
+            let resp = menu.response;
+            // 按钮体是空的,三角自己画上去。颜色走 `interact()` 取当前交互
+            // 态;禁用时不用另外压暗 —— `add_enabled_ui` 已经给这个 `Ui` 的
+            // painter 挂了 fade,画上去自动跟着淡。
+            if ui.is_rect_visible(resp.rect) {
+                let fg = ui.style().interact(&resp).fg_stroke.color;
+                ui.painter().extend(crate::ui::icon::shapes(
+                    resp.rect,
+                    crate::ui::icon::Glyph::TriangleDown,
+                    egui::Stroke::new(1.5, fg),
+                ));
+            }
+            // 按钮体没有文字了,标注模式下靠文本认不出它是什么;显式登记一
+            // 个候选。测试也拿它定位(原先是 `find_text_pos("▾")`)。
+            annotate::mark(ui.ctx(), format!("文件面板/{id}/路径/书签"), resp.rect);
+            resp.on_hover_text("收藏的路径")
+                .on_disabled_hover_text("还没有收藏任何路径");
         });
         annotate::mark(ui.ctx(), format!("文件面板/{id}/路径"), ui.max_rect());
         match state.path_edit.as_mut() {
@@ -2484,6 +2505,17 @@ mod tests {
         (action, out.shapes)
     }
 
+    /// 书签下拉按钮的位置。F143 之后它是自绘三角、没有任何文字,
+    /// `find_text_pos` 找不到它了 —— 只能靠 annotate 记下的矩形。
+    ///
+    /// 调用前 `ctx` 必须已 `annotate::toggle`(否则 `mark` 直接 return),
+    /// 且至少跑过一帧。
+    fn bookmark_arrow(ctx: &egui::Context) -> egui::Pos2 {
+        annotate::spot_rect(ctx, "文件面板/远端/路径/书签")
+            .expect("有书签时该画下拉按钮")
+            .center()
+    }
+
     /// 一次完整的左键点击(按下 + 抬起)。`PointerMoved` 不能省:egui 的
     /// 交互靠指针位置,只发按钮事件时 hover 判定拿不到坐标。
     fn click_at(pos: egui::Pos2) -> egui::RawInput {
@@ -2588,13 +2620,16 @@ mod tests {
     #[test]
     fn picking_a_bookmark_from_the_dropdown_emits_goto() {
         let ctx = egui::Context::default();
+        // 下拉按钮 F143 之后是自绘三角、没有文字,只能靠 annotate 定位,
+        // 而 `mark` 只在标注模式开着时才登记。
+        annotate::toggle(&ctx);
         let mut state = ready_at(b"/");
         let mut cols = ColWidths::default();
         let marks = vec![mullion_store::Bookmark {
             name: "日志".into(),
             path: "/var/log".into(),
         }];
-        let (_, shapes) = run_remote(
+        run_remote(
             &ctx,
             &mut state,
             &mut cols,
@@ -2602,7 +2637,7 @@ mod tests {
             true,
             egui::RawInput::default(),
         );
-        let arrow = find_text_pos(&shapes, "▾").expect("有书签时该画下拉按钮");
+        let arrow = bookmark_arrow(&ctx);
         // 点开菜单。菜单要到**下一帧**才画得出来,所以这一帧只管点。
         let (_, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(arrow));
         let mut item = None;
@@ -2636,13 +2671,16 @@ mod tests {
     #[test]
     fn a_bookmark_with_an_empty_name_falls_back_to_showing_its_path() {
         let ctx = egui::Context::default();
+        // 下拉按钮 F143 之后是自绘三角、没有文字,只能靠 annotate 定位,
+        // 而 `mark` 只在标注模式开着时才登记。
+        annotate::toggle(&ctx);
         let mut state = ready_at(b"/");
         let mut cols = ColWidths::default();
         let marks = vec![mullion_store::Bookmark {
             name: String::new(),
             path: "/srv/app".into(),
         }];
-        let (_, shapes) = run_remote(
+        run_remote(
             &ctx,
             &mut state,
             &mut cols,
@@ -2650,7 +2688,7 @@ mod tests {
             true,
             egui::RawInput::default(),
         );
-        let arrow = find_text_pos(&shapes, "▾").expect("有书签时该画下拉按钮");
+        let arrow = bookmark_arrow(&ctx);
         let (_, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(arrow));
         let mut found = false;
         for _ in 0..3 {

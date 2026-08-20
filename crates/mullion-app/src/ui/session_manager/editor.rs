@@ -187,9 +187,11 @@ pub(super) fn show(
         // `egui::Window::new(title)` 拿标题文本当 id 源,标题一变窗口位置和
         // 尺寸就整个重置。而且脏的是这张表单,不是整个管理器。
         if dirty {
+            // F143:圆点用 `●`(U+25CF)不用 U+2022 —— 后者不在 GBK,是豆腐。
+            // `●` 比它大一圈,字号跟着从 16 收到 10。
             ui.label(
-                egui::RichText::new("•")
-                    .size(16.0)
+                egui::RichText::new("●")
+                    .size(10.0)
                     .color(theme::c32(t.accent)),
             )
             .on_hover_text("有未保存的更改");
@@ -970,7 +972,7 @@ mod tests {
                 })
             };
             let _ = run();
-            find_text_pos_exact(&run().shapes, "•").is_some()
+            find_text_pos_exact(&run().shapes, "●").is_some()
         };
 
         assert!(

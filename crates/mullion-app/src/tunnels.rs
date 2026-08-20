@@ -154,10 +154,13 @@ pub fn indicator(states: &[TunnelState], configured: usize) -> Option<Indicator>
     } else {
         Severity::Calm
     };
+    // F143:原先那两个符号(U+21BB / U+2717)都不在 GBK,是豆腐块。这里是
+    // **纯字符串**(进 `Indicator::text`,由状态栏当普通文本画),没有自绘的
+    // 余地 —— 只能换成白名单里的字符。`…` 表「还在路上」,`×` 表「断了」。
     let mark = match severity {
         Severity::Calm => "",
-        Severity::Warn => " ↻",
-        Severity::Danger => " ✗",
+        Severity::Warn => "…",
+        Severity::Danger => " ×",
     };
     Some(Indicator {
         text: format!("隧道 {running}/{configured}{mark}"),

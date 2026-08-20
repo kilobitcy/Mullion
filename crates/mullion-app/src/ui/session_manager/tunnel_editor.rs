@@ -282,12 +282,14 @@ pub(crate) fn session_ref_label(
         return ("(未选择)".to_string(), None);
     };
     match sessions.iter().find(|s| s.id == id) {
+        // F143:原先两条前缀的警告符 U+26A0 不在 GBK,是豆腐块。纯字符串,
+        // 没有自绘余地,改中文措辞。
         None => (
-            format!("⚠ 已删除的会话 (id={})", id.0),
+            format!("（已删除）会话 id={}", id.0),
             Some("引用的会话已删除"),
         ),
         Some(s) if s.connection.protocol != Protocol::Ssh => (
-            format!("⚠ {} (SFTP 节点)", s.identity.name),
+            format!("（不可用）{}（SFTP 节点）", s.identity.name),
             Some("该会话是 SFTP 节点，不能用于转发"),
         ),
         Some(s) => (

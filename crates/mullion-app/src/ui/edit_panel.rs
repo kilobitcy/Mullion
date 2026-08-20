@@ -97,8 +97,21 @@ pub fn show(
         .show(ctx, |ui| {
             crate::ui::annotate::mark(ui.ctx(), "编辑中列表".to_string(), ui.max_rect());
             ui.horizontal(|ui| {
-                let arrow = if *expanded { "▾" } else { "▸" };
-                if ui.button(format!("{arrow} 编辑中")).clicked() {
+                // F143:同 `transfer_panel`,那两个三角字符是豆腐,改自绘。
+                let g = if *expanded {
+                    crate::ui::icon::Glyph::TriangleDown
+                } else {
+                    crate::ui::icon::Glyph::TriangleRight
+                };
+                let tip = if *expanded {
+                    "折起编辑中列表"
+                } else {
+                    "展开编辑中列表"
+                };
+                if crate::ui::icon::icon_button(ui, g, true, tip) {
+                    *expanded = !*expanded;
+                }
+                if ui.button("编辑中").clicked() {
                     *expanded = !*expanded;
                 }
                 ui.colored_label(theme::c32(t.fg_mid), format!("{total} 个文件"));

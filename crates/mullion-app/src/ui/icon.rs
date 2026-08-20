@@ -445,7 +445,10 @@ mod tests {
         for g in Glyph::ALL.iter().copied() {
             let pts = points_of(&shapes(r(), g, s()));
             assert!(!pts.is_empty(), "{g:?} 什么都没画");
-            assert!(!seen.contains(&pts), "{g:?} 与 ALL 里另一个变体画得一模一样");
+            assert!(
+                !seen.contains(&pts),
+                "{g:?} 与 ALL 里另一个变体画得一模一样"
+            );
             seen.push(pts);
         }
     }
