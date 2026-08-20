@@ -307,6 +307,12 @@ pub struct UiState {
     /// `#[derive(Default)]`,而 `ColWidths` 自己实现了 `Default`,所以
     /// 这里不需要 `files_sidebar_w` 那种 `0.0` 哨兵。
     pub files_cols: files_panel::ColWidths,
+    /// F59:文件面板**上一帧**的外框矩形。`None` = 上一帧没画文件面板。
+    ///
+    /// 为什么是上一帧:拖出交接的判定发生在 `build_ui` 的前段(要在动作
+    /// 路由之前算出 `files_drag_out`),而两个宿主(`SidePanel`/`CentralPanel`)
+    /// 都在那之后才 show。拖拽持续几十帧,差一帧的矩形对判据没有影响。
+    pub files_panel_rect: Option<egui::Rect>,
     /// D2:远端写操作的对话框状态。`None` = 没开。
     ///
     /// 挂在 `UiState` 而不是 `PanelFrame` 上:对话框是**全局模态**,同一时刻
@@ -543,17 +549,26 @@ pub struct UiActions {
     pub rehost: Option<rehost::RehostAction>,
 }
 
-/// 指针此刻还在窗口里没有(F59 / 设计 N1 的判据)。
+/// 指针此刻还在**文件面板**里没有(F59 / 设计 N1 的判据,2026-08-20 修正)。
+///
+/// 原来比的是视口矩形(「还在窗口里没有」)。那个判据在**窗口最大化**时
+/// 永远成立 —— 指针无处可去,拖出到资源管理器从 v0.1.37 起没触发过一次。
+/// 改成比文件面板自己的矩形:离开面板就说明用户想把文件放到别处去。
 ///
 /// **不能用「egui 有没有收到 `PointerGone`」来判**:拖拽期间 Windows 会把
 /// 鼠标捕获给窗口,`WM_MOUSELEAVE` 根本不发,winit 也就没有 `CursorLeft`
-/// 可转 —— 指针早飞到桌面上了,egui 这边还以为在窗口里,F59 永远不触发。
-/// 拿坐标跟视口矩形比才靠得住:捕获期间 `WM_MOUSEMOVE` 照常来,坐标会是
-/// 负数或超出宽高。
-fn pointer_inside_window(ctx: &egui::Context) -> bool {
-    let screen = ctx.screen_rect();
+/// 可转 —— 指针早飞出去了,egui 这边还以为在原地,F59 永远不触发。
+/// 拿坐标跟矩形比才靠得住:捕获期间 `WM_MOUSEMOVE` 照常来,坐标会落在
+/// 矩形之外(甚至是负数)。
+///
+/// `rect` 为 `None`(面板刚开、还没画过一帧)时返回 `true` —— 保守当作
+/// 「在面板内」,宁可晚一帧交接,也不要在面板第一帧就把手势甩给 OS。
+/// 指针位置取不到时返回 `false`:指针都不知道在哪了,当然不在面板里,
+/// 这是旧「出了窗口」行为的超集。
+fn pointer_inside_panel(ctx: &egui::Context, rect: Option<egui::Rect>) -> bool {
+    let Some(rect) = rect else { return true };
     ctx.input(|i| i.pointer.latest_pos())
-        .is_some_and(|p| screen.contains(p))
+        .is_some_and(|p| rect.contains(p))
 }
 
 /// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
@@ -617,18 +632,28 @@ pub fn build_ui(
     if files_open {
         actions.files_drop_in = dropped;
     }
-    // F59:远端栏起的那一拖,指针一旦出了窗口就交给操作系统(设计 N1)。
-    // 窗口内不交 —— 那一半手势是 F58(拖到本地栏 = 下载),`DoDragDrop`
-    // 一接管鼠标捕获,F58 的远端→本地方向当场失效。
+    // F59:远端栏起的那一拖,指针一旦**离开文件面板**就交给操作系统
+    // (设计 N1,2026-08-20 修正)。原判据是「出了窗口」——用户窗口最大化时
+    // 永远不成立,这个功能从 v0.1.37 起没触发过一次。面板内不交 —— 那一半
+    // 手势是 F58(拖到本地栏 = 下载),`DoDragDrop` 一接管鼠标捕获,F58 的
+    // 远端→本地方向当场失效。
     let dragging_from =
         egui::DragAndDrop::payload::<crate::files::drag::DragFrom>(ctx).map(|p| p.0);
     if files_open
         && crate::dragout::should_hand_off(
             dragging_from,
-            pointer_inside_window(ctx),
+            pointer_inside_panel(ctx, ui_state.files_panel_rect),
             crate::dragout::is_running(),
         )
     {
+        // D12:全流程日志。拖到别人进程里没反应时这是唯一的诊断手段,
+        // 而「判据成不成立」正是 v0.1.37 那个 bug 藏身的地方。
+        log::debug!(
+            target: crate::dragout::LOG,
+            "交给 OS:指针 {:?} 已离开文件面板 {:?}",
+            ctx.input(|i| i.pointer.latest_pos()),
+            ui_state.files_panel_rect
+        );
         // 交出去之后**必须**把 egui 的载荷清掉:`DoDragDrop` 会接管鼠标,
         // egui 再也收不到松手事件,载荷就永远挂着 —— 指针下次晃出窗口
         // 又起一条拖出,而用户根本没按着鼠标。
@@ -829,6 +854,7 @@ pub fn build_ui(
             files,
             hovering,
             &mut ui_state.files_cols,
+            &mut ui_state.files_panel_rect,
         );
         actions.files_remote = r;
         actions.files_local = l;
@@ -1289,15 +1315,41 @@ mod tests {
         }
     }
 
-    /// F59 / 设计 N1:远端栏起的拖,指针**出了窗口**才交给操作系统。
+    /// 跑一帧只为把文件面板的矩形填进 `UiState::files_panel_rect` ——
+    /// 交接判据用的是**上一帧**的矩形(见 `pointer_inside_panel`),
+    /// 单帧测试里那个字段还是 `None`,判据会保守地不交接。
+    ///
+    /// 预热帧的指针放在面板正中,免得它自己先触发一次交接。
+    fn warm_up_panel_rect(
+        ctx: &egui::Context,
+        ui_state: &mut UiState,
+        files: &mut files_panel::PanelFrame,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events: vec![egui::Event::PointerMoved(egui::pos2(500.0, 350.0))],
+            ..Default::default()
+        };
+        let _ = run_frame_content(ctx, ui_state, base_frame(), input, Some(files));
+        assert!(
+            ui_state.files_panel_rect.is_some(),
+            "预热帧没把面板矩形填进 UiState —— 脚手架本身有问题"
+        );
+    }
+
+    /// F59 / 设计 N1:远端栏起的拖,指针**离开文件面板**就交给操作系统。
     ///
     /// 这是正向自证 —— 手势真的发生过。删掉 `build_ui` 里那段
     /// `should_hand_off` 判断,这条会红。
     #[test]
-    fn a_remote_drag_that_leaves_the_window_is_handed_to_the_operating_system() {
+    fn a_remote_drag_that_leaves_the_panel_is_handed_to_the_operating_system() {
         let ctx = egui::Context::default();
         let mut ui_state = UiState::default();
         let mut files = files_panel::PanelFrame::default();
+        warm_up_panel_rect(&ctx, &mut ui_state, &mut files);
         let input = dragging(
             &ctx,
             crate::files::PanelColumn::Remote,
@@ -1306,6 +1358,45 @@ mod tests {
         let (_, actions) =
             run_frame_content(&ctx, &mut ui_state, base_frame(), input, Some(&mut files));
         assert!(actions.files_drag_out, "指针都飞到桌面上了,还没交给系统");
+    }
+
+    /// **F59 在 v0.1.54 之前的真 bug**:窗口最大化时,指针离开文件面板却
+    /// 仍在窗口里 —— 旧判据(`pointer_inside_window`)恒为真,拖出永远不触发。
+    ///
+    /// 这条用**侧栏**宿主:面板只占右侧一条,左边是终端区,正是用户实际
+    /// 拖过去的地方。把 `pointer_inside_panel(...)` 换回按 `ctx.screen_rect()`
+    /// 判的写法,这条必红。
+    #[test]
+    fn a_remote_drag_that_left_the_panel_but_not_the_window_is_still_handed_off() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut files = files_panel::PanelFrame::default();
+        // 预热:侧栏宿主自己把矩形填进 `UiState`。
+        let warm = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events: vec![egui::Event::PointerMoved(egui::pos2(900.0, 350.0))],
+            ..Default::default()
+        };
+        let _ = run_frame(&ctx, &mut ui_state, base_frame(), warm, Some(&mut files));
+        let panel = ui_state
+            .files_panel_rect
+            .expect("侧栏没把矩形填进 UiState —— 脚手架本身有问题");
+        // 指针挪到终端区:在窗口**里**,在面板**外**。
+        let outside = egui::pos2(panel.left() - 100.0, 350.0);
+        assert!(
+            ctx.screen_rect().contains(outside),
+            "这个点必须还在窗口里,否则测不出旧判据的毛病"
+        );
+        let input = dragging(&ctx, crate::files::PanelColumn::Remote, outside);
+        let (_, actions) = run_frame(&ctx, &mut ui_state, base_frame(), input, Some(&mut files));
+        assert!(
+            actions.files_drag_out,
+            "指针已经拖出文件面板(还在窗口里),没有交给系统 —— \
+             窗口最大化时这就是「拖了完全没反应」的成因(F59)"
+        );
     }
 
     /// F59 / 设计 N1:**指针还在窗口里就不交** —— 这是 F58 的命根子。
@@ -1356,6 +1447,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut ui_state = UiState::default();
         let mut files = files_panel::PanelFrame::default();
+        warm_up_panel_rect(&ctx, &mut ui_state, &mut files);
         let input = dragging(
             &ctx,
             crate::files::PanelColumn::Remote,

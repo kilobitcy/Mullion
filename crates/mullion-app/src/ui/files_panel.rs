@@ -1294,6 +1294,8 @@ pub fn sidebar(
     // 以后要做「宽度按会话记住」,光把值存进这个字段不够 —— 得连带清掉
     // egui memory 里对应的 `PanelState`,否则改了也看不见。
     ui_state.files_sidebar_w = resp.response.rect.width();
+    // F59:把外框矩形留给下一帧的拖出交接判据(见 `UiState::files_panel_rect`)。
+    ui_state.files_panel_rect = Some(resp.response.rect);
     out
 }
 
@@ -1322,6 +1324,11 @@ pub fn sidebar(
 /// `files_panel.rs` 里重新假设一遍。
 ///
 /// `drop_in`:同 `sidebar` 的同名参数。
+///
+/// `panel_rect`:F59 —— 把本帧的外框矩形写回去,给下一帧的拖出交接判据用。
+/// 独立出参而不是收整个 `UiState`:标签宿主刻意不认识 `UiState`(上面
+/// `cols` 那段同理),多收一个可变引用会把这条边界打掉。
+#[allow(clippy::too_many_arguments)] // 同 `show`:一帧要画的东西天然多
 pub fn content(
     ctx: &egui::Context,
     t: &Theme,
@@ -1330,6 +1337,7 @@ pub fn content(
     frame: &mut PanelFrame,
     drop_in: usize,
     cols: &mut ColWidths,
+    panel_rect: &mut Option<egui::Rect>,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     egui::CentralPanel::default()
@@ -1345,6 +1353,8 @@ pub fn content(
         )
         .show(ctx, |ui| {
             annotate::mark(ui.ctx(), "文件标签", ui.max_rect());
+            // F59:见本函数 `panel_rect` 参数的说明。
+            *panel_rect = Some(ui.max_rect());
             // **两栏的矩形自己切,不走 `ui.horizontal` + `allocate_ui`**:
             // 在 `horizontal` 布局里 `ui.available_height()` 给的是**当前这一行**
             // 的高度(这里是 18pt),不是整块内容区。照它分配的话两栏各只有一行
@@ -1947,7 +1957,7 @@ mod tests {
         for _ in 0..2 {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
+                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
             });
             for shape in out.shapes.iter() {
                 if let egui::epaint::Shape::Text(ts) = &shape.shape {
@@ -2467,7 +2477,7 @@ mod tests {
         for _ in 0..2 {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
+                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
             });
             for shape in out.shapes.iter() {
                 if let egui::epaint::Shape::Text(ts) = &shape.shape {
@@ -2539,11 +2549,11 @@ mod tests {
         // 三帧:egui 的 Panel 首帧是 sizing pass,rect 还没稳定。面板外框和
         // 「↑」的位置**必须取自同一帧**,否则比的是两套布局。
         let mut out = ctx.run(raw(None), |ctx| {
-            content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
+            content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
         });
         for _ in 0..2 {
             out = ctx.run(raw(None), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0, &mut cols);
+                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
             });
         }
         let mut lefts: Vec<f32> = out
@@ -2640,7 +2650,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
             });
             (acts, out)
         };
@@ -2679,7 +2689,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
             });
             (acts, out)
         };
@@ -2718,7 +2728,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
             });
             (acts, out)
         };
@@ -2759,7 +2769,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
             });
             (acts, out)
         };
@@ -2796,7 +2806,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
             });
             (acts, out)
         };
@@ -3201,7 +3211,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
+                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
                 },
             );
         }
@@ -3337,7 +3347,7 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
+                        content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
                     },
                 ));
             }
@@ -3403,7 +3413,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
+                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
                 },
             ));
         }
@@ -3425,7 +3435,7 @@ mod tests {
             ..Default::default()
         };
         let mut out = Some(ctx.run(scroll_input, |ctx| {
-            content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
+            content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
         }));
         // 再跑两帧,让滚动状态稳定下来(smooth scroll 有插值)。
         for _ in 0..2 {
@@ -3435,7 +3445,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols);
+                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
                 },
             ));
         }
@@ -3841,7 +3851,7 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut run = |input: egui::RawInput, frame: &mut PanelFrame| {
             let _ = ctx.run(input, |ctx| {
-                content(ctx, &t, 1, false, frame, 0, &mut cols);
+                content(ctx, &t, 1, false, frame, 0, &mut cols, &mut None);
             });
         };
         let mut clock = 0.0_f64;

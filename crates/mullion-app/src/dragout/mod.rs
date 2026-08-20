@@ -79,22 +79,26 @@ pub fn items_for(state: &PaneState) -> (Vec<DragOutItem>, usize) {
     (items, skipped_dirs)
 }
 
-/// 什么时候把这一拖交给操作系统(设计 N1)。
+/// 什么时候把这一拖交给操作系统(设计 N1,2026-08-20 修正)。
 ///
 /// - `from`:egui 拖拽载荷说这一拖是从哪一栏起的。`None` = 现在没在拖。
-/// - `pointer_inside_window`:指针还在窗口里没有。
+/// - `pointer_inside_panel`:指针还在**文件面板矩形**里没有。
 /// - `already_running`:已经有一条拖出线程在跑了。
 ///
-/// **`!pointer_inside_window` 这一条是 F58 的命根子**:远端栏起拖的手势
-/// 同时属于 F58(拖到本地栏 = 下载)。窗口内就交给 OS 的话,`DoDragDrop`
-/// 会接管鼠标捕获,F58 的远端→本地方向当场失效。窗口内 = 内部传输,
-/// 窗口外 = 交给系统。
+/// **判据是「出没出文件面板」,不是「出没出窗口」**。后者是 v0.1.37 的原始
+/// 实现,而窗口最大化时它永远不成立 —— 指针无处可去,这个功能从发布起
+/// 一次都没触发过(用户报「拖了完全没反应、也没有任何提示」,而
+/// `App::start_drag_out` 的每条失败路径都会 `set_error`,无提示 = 根本没被调到)。
+///
+/// `!pointer_inside_panel` 这一条仍是 **F58 的命根子**:远端栏起拖的手势
+/// 同时属于 F58(拖到本地栏 = 下载),而两栏都在面板矩形**内**,所以那半个
+/// 手势全程不会触发 OLE 交接。面板内 = 内部传输,面板外 = 交给系统。
 pub fn should_hand_off(
     from: Option<PanelColumn>,
-    pointer_inside_window: bool,
+    pointer_inside_panel: bool,
     already_running: bool,
 ) -> bool {
-    from == Some(PanelColumn::Remote) && !pointer_inside_window && !already_running
+    from == Some(PanelColumn::Remote) && !pointer_inside_panel && !already_running
 }
 
 /// 现在有没有一条拖出在跑。
@@ -237,11 +241,18 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_that_is_still_inside_the_window_is_not_handed_to_the_os() {
-        // **F58 的命根子**:远端栏起拖的手势同时属于「拖到本地栏 = 下载」。
-        // 窗口内就交给 OS 的话,`DoDragDrop` 接管鼠标捕获,F58 的远端→本地
-        // 方向当场失效。
+    fn a_drag_that_is_still_inside_the_files_panel_is_not_handed_to_the_os() {
+        // **F58 的命根子**:远端栏起拖的手势同时属于「拖到本地栏 = 下载」,
+        // 而两栏都在面板矩形里。面板内就交给 OS 的话,`DoDragDrop` 接管
+        // 鼠标捕获,F58 的远端→本地方向当场失效。
         assert!(!should_hand_off(Some(PanelColumn::Remote), true, false));
+    }
+
+    #[test]
+    fn a_drag_that_left_the_panel_is_handed_to_the_os() {
+        // 判据的另一半。真正把「离开面板」和「离开窗口」区分开的守护在
+        // `ui::tests::a_pointer_outside_the_panel_is_not_inside_it_even_when_the_window_is_maximized`
+        // ——那里才看得见调用方喂进来的是哪一个量。
         assert!(should_hand_off(Some(PanelColumn::Remote), false, false));
     }
 
