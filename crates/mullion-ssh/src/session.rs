@@ -409,6 +409,9 @@ async fn authenticate_agent(
 enum SshCmd {
     Write(Vec<u8>),
     Resize(u16, u16),
+    /// F140:显式收口。让 io_task 发出 `SSH_MSG_CHANNEL_CLOSE` 之后退出 ——
+    /// 光靠 drop 句柄不行,russh 0.54.5 的 `ChannelWriteHalf` 没有 `Drop`。
+    Close,
 }
 
 /// 句柄非阻塞发命令的失败原因。
@@ -445,6 +448,15 @@ impl SshSession {
         self.cmd_tx
             .try_send(SshCmd::Resize(cols, rows))
             .map_err(map_try_send)
+    }
+
+    /// F140:显式关掉这条 channel。**非阻塞、非 async** —— 调用点全在 UI
+    /// 同步路径上(关分屏 / 换节点 / 关标签)。
+    ///
+    /// 失败一律忽略:队列满或 io_task 已经退出,两种情况都意味着"这条
+    /// channel 已经在收口或已经没了",没有可补救的动作,更不该让 UI 卡住。
+    pub fn close(&self) {
+        let _ = self.cmd_tx.try_send(SshCmd::Close);
     }
 }
 
@@ -543,9 +555,24 @@ async fn io_task(
                 Some(SshCmd::Resize(c, r)) => {
                     let _ = write.window_change(c as u32, r as u32, 0, 0).await;
                 }
-                None => {
+                Some(SshCmd::Close) => {
+                    // F140:先 eof 再 close —— 让远端先知道"我不再发数据了",
+                    // 再拆 channel。close 是 sshd 关掉 pty 的触发点,pty 上的
+                    // 前台进程组随之收 SIGHUP(tmux client 收到 = detach,
+                    // tmux server/session 不受影响)。
                     let _ = write.eof().await;
-                    break; // 所有句柄已 drop
+                    let _ = write.close().await;
+                    break;
+                }
+                None => {
+                    // 所有句柄已 drop。**这里也要 close**:`Arc<SshSession>`
+                    // 可能被自动化 task 多处持有,显式 `close()` 走不到的路径
+                    // 由这条兜底。russh 0.54.5 的 `ChannelWriteHalf` 没有
+                    // `Drop`,不发就是泄漏一个 channel slot,累积到 sshd 的
+                    // `MaxSessions` 之后同一条连接开不出新 pane。
+                    let _ = write.eof().await;
+                    let _ = write.close().await;
+                    break;
                 }
             },
         }
@@ -555,6 +582,24 @@ async fn io_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F140:`SshSession::close()` 必须把一条 `Close` 命令送进 io 队列 ——
+    /// 那是 `io_task` 发出 `SSH_MSG_CHANNEL_CLOSE` 的唯一触发点。
+    ///
+    /// 为什么要有这条:关分屏时只 drop 句柄的话,`io_task` 走的是 `None`
+    /// 分支;而 russh 0.54.5 对 `ChannelWriteHalf` 没有 `Drop` 实现,远端
+    /// shell 会一直挂着,channel slot 累积到 sshd 的 `MaxSessions` 之后
+    /// 同一条连接再也开不出新分屏。
+    #[tokio::test]
+    async fn close_sends_a_close_command_down_the_io_queue() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<SshCmd>(4);
+        let s = SshSession { cmd_tx };
+        s.close();
+        assert!(
+            matches!(cmd_rx.recv().await, Some(SshCmd::Close)),
+            "close() 没有把 Close 命令发出去 —— io_task 不会发 CHANNEL_CLOSE"
+        );
+    }
 
     #[test]
     fn rsa_pubkey_hash_is_sha2_512_not_legacy_sha1() {
