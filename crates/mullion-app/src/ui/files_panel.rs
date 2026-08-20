@@ -1348,6 +1348,12 @@ const DEFAULT_SIDEBAR_W: f32 = 360.0;
 ///
 /// `drop_in`:F52 —— 此刻从资源管理器拖着几个文件悬在窗口上,只转给远端栏
 /// (理由见 `show` 的同名参数)。
+/// F144 的内缩量。跟 `content()` 里那个 `pad` 是同一档 —— 抽出来是为了
+/// 「两个宿主必须一致」这件事有个单一出处,而不是靠两处各写一遍 `SP_XS`。
+fn column_pad() -> egui::Vec2 {
+    egui::vec2(crate::ui::metrics::SP_XS, crate::ui::metrics::SP_XS)
+}
+
 pub fn sidebar(
     ctx: &egui::Context,
     t: &Theme,
@@ -1388,18 +1394,24 @@ pub fn sidebar(
             ui.allocate_ui(egui::vec2(ui.available_width(), h * 0.4), |ui| {
                 // 裁到本栏之内,理由同 `content()` 里两栏各自那句 `set_clip_rect`。
                 ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-                out.1 = show(
-                    ui,
-                    t,
-                    "本地",
-                    generation,
-                    PanelColumn::Local,
-                    &mut frame.local,
-                    panel_focused && frame.active_column == PanelColumn::Local,
-                    BookmarkView::none(),
-                    0,
-                    &mut ui_state.files_cols,
-                );
+                // F144:裁剪区照旧,布局预算内缩一档。理由同 `content()` ——
+                // 见那里那段长注释;两处必须一起改,否则同一个控件在标签
+                // 宿主里不缺角、在侧栏里缺角。
+                let inner = ui.max_rect().shrink2(column_pad());
+                ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                    out.1 = show(
+                        ui,
+                        t,
+                        "本地",
+                        generation,
+                        PanelColumn::Local,
+                        &mut frame.local,
+                        panel_focused && frame.active_column == PanelColumn::Local,
+                        BookmarkView::none(),
+                        0,
+                        &mut ui_state.files_cols,
+                    );
+                });
             });
             ui.separator();
             // **必须跟本地栏一样包一层把矩形限死**。直接 `show(ui, ..)` 的话
@@ -1412,21 +1424,25 @@ pub fn sidebar(
             // clicks_under_the_remote_column`。
             ui.allocate_ui(ui.available_size(), |ui| {
                 ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-                out.0 = show(
-                    ui,
-                    t,
-                    "远端",
-                    generation,
-                    PanelColumn::Remote,
-                    &mut frame.remote,
-                    panel_focused && frame.active_column == PanelColumn::Remote,
-                    BookmarkView {
-                        list: &frame.bookmarks,
-                        can_edit: frame.session_bound,
-                    },
-                    drop_in,
-                    &mut ui_state.files_cols,
-                );
+                // F144:同本地栏,见上面。
+                let inner = ui.max_rect().shrink2(column_pad());
+                ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                    out.0 = show(
+                        ui,
+                        t,
+                        "远端",
+                        generation,
+                        PanelColumn::Remote,
+                        &mut frame.remote,
+                        panel_focused && frame.active_column == PanelColumn::Remote,
+                        BookmarkView {
+                            list: &frame.bookmarks,
+                            can_edit: frame.session_bound,
+                        },
+                        drop_in,
+                        &mut ui_state.files_cols,
+                    );
+                });
             });
         });
     // 把这一帧的实际宽度读回来。**注意它只是个镜像,驱动不了任何东西**:
@@ -1507,10 +1523,23 @@ pub fn content(
             let full = ui.max_rect();
             let gap = crate::ui::metrics::SP_S;
             let half = ((full.width() - gap) * 0.5).max(0.0);
+            // F144:**裁剪区照旧,布局预算内缩一档**。两者必须错开,一起缩
+            // 等于没缩 —— 控件是从 `max_rect.min` 起画的,`clip_rect` 跟着
+            // 缩到同一个位置,描边照样贴边被切(实现时真踩过一次)。
+            //
+            // 裁剪区维持原样是 B1 定的(见下面 `set_clip_rect` 那段);内缩
+            // 布局预算是为了让控件从裁剪边往里让出 SP_XS,圆角描边的外半
+            // 像素有地方落。不让的话用户看到的是「↑ 按钮左边缺 1/4 圆弧」
+            // 「路径条控件没有上边框」(v0.1.56 实测报的两条)。
+            //
+            // 外框那一档留白是 `CentralPanel` 的 `inner_margin` 给的(F138),
+            // 管不到这里 —— 两栏是在它之内再切一刀,那一刀上本来一点余量
+            // 都没有。守护:`tests::panel_content_does_not_touch_the_clip_edge`。
+            let pad = column_pad();
             let left = egui::Rect::from_min_size(full.min, egui::vec2(half, full.height()));
             let right =
                 egui::Rect::from_min_max(egui::pos2(full.max.x - half, full.min.y), full.max);
-            ui.scope_builder(egui::UiBuilder::new().max_rect(left), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left.shrink2(pad)), |ui| {
                 // B1:**必须显式裁剪**。`max_rect` 只是布局预算,子 ui 的
                 // `clip_rect` 默认原样继承父 painter(`egui-0.30.0`
                 // `ui.rs::new_child` 直接 `clone()` 父 `painter`,不看
@@ -1534,7 +1563,7 @@ pub fn content(
             });
             ui.painter()
                 .vline(full.center().x, full.y_range(), theme::stroke(t));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(right.shrink2(pad)), |ui| {
                 // B1:同左栏,见上面的注释。
                 ui.set_clip_rect(right);
                 out.0 = show(
@@ -2810,6 +2839,54 @@ mod tests {
         );
     }
 
+    /// F144:控件不许贴着**裁剪边**画。贴着画的话圆角描边的外半像素会被
+    /// `clip_rect` 切掉,用户看到的是「↑ 按钮左边缺了 1/4 圆弧」「路径条
+    /// 控件没有上边框」(v0.1.56 实测报的两条)。
+    ///
+    /// 跟 `the_panel_does_not_draw_its_contents_flush_against_its_own_edge`
+    /// 不是一回事:那条比的是「内容 vs 面板**外框**」,F138 的 `inner_margin`
+    /// 已经解决;这条比的是「内容 vs 本栏**裁剪区**」—— 两栏是在 margin
+    /// 之内再切一刀的,那一刀上没有任何留白。
+    ///
+    /// 判据取**真值**:拿「↑」按钮这一帧实际画出来的矩形,和这一帧实际
+    /// 作用在它身上的 `clip_rect`(`ClippedShape` 自带)比。向外扩 1pt
+    /// 覆盖描边宽度。不比 margin 常量 —— 那是拿常量断言常量。
+    ///
+    /// 自证会变红:把 `content()` 里 `left`/`right` 两个 rect 的
+    /// `.shrink2(..)` 去掉。
+    #[test]
+    fn panel_content_does_not_touch_the_clip_edge() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        // 三帧,理由同上面那条:首帧是 sizing pass。
+        let mut out = ctx.run(raw(None), |ctx| {
+            content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+        });
+        for _ in 0..2 {
+            out = ctx.run(raw(None), |ctx| {
+                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+            });
+        }
+        let up = find_text_pos(&out.shapes, "↑").expect("路径条的「↑」没画出来");
+        // 框住这个「↑」的最小矩形 = 按钮底色。取最小的那个,不然会选中
+        // 面板外框(它也包含这个点)。
+        let (btn, clip) = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Rect(r) if r.rect.contains(up) => Some((r.rect, cs.clip_rect)),
+                _ => None,
+            })
+            .min_by(|a, b| (a.0.area()).total_cmp(&b.0.area()))
+            .expect("「↑」没有按钮底 —— 脚手架本身有问题");
+        assert!(
+            clip.contains_rect(btn.expand(1.0)),
+            "「↑」按钮 {btn:?} 贴着裁剪边 {clip:?} —— 圆角描边的外半像素会被切掉"
+        );
+    }
+
     fn two_columns() -> PanelFrame {
         let mut frame = PanelFrame::default();
         frame.remote.cwd = RemotePath::from_bytes(b"/srv".to_vec());
@@ -3635,8 +3712,13 @@ mod tests {
         let accent = theme::c32(t.accent);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
 
-        // --- 嫌疑 1:裁剪矩形不能越过本栏自己的边界。 -----------------
-        let clip_within_own_bounds = |active: PanelColumn| -> (egui::Rect, egui::Rect) {
+        // --- 嫌疑 1:裁剪矩形不能伸进隔壁栏。 -------------------------
+        //
+        // 判据比的是**隔壁栏的边界**,不是本栏自己的:F144 之后本栏的
+        // `max_rect` 比裁剪区窄 `SP_XS`(内容内缩、裁剪区照旧),拿本栏自己
+        // 的几何当上界会把那 4pt 判成越界 —— 而那 4pt 落在两栏之间的 gap
+        // 里,一个像素也到不了隔壁栏。这条守的是「串画」,gap 不算串画。
+        let clip_within_own_bounds = |active: PanelColumn| -> (egui::Rect, egui::Rect, egui::Rect) {
             let ctx = egui::Context::default();
             annotate::toggle(&ctx);
             let mut frame = PanelFrame {
@@ -3665,32 +3747,29 @@ mod tests {
                 ));
             }
             let out = out.unwrap();
-            let path = match active {
-                PanelColumn::Local => "文件面板/本地",
-                PanelColumn::Remote => "文件面板/远端",
-            };
-            let geo = annotate::spot_rect(&ctx, path).expect("这一栏没画");
+            let geo = |p: &str| annotate::spot_rect(&ctx, p).expect("这一栏没画");
+            // 裁剪区来自**当前聚焦那一栏**的边框(下面 `active` 决定聚焦谁)。
             let clip =
                 find_stroke_clip(&out.shapes, accent).expect("聚焦边框没画出来(focused 没生效)");
-            (geo, clip)
+            (geo("文件面板/本地"), geo("文件面板/远端"), clip)
         };
 
-        let (local_geo, local_clip) = clip_within_own_bounds(PanelColumn::Local);
+        let (_, remote_geo, local_clip) = clip_within_own_bounds(PanelColumn::Local);
         assert!(
-            local_clip.max.x <= local_geo.max.x + 0.5,
-            "本地栏的裁剪矩形越过了它自己的右边界,内容会画进右栏: \
-             clip.max.x={} 本栏 max.x={}",
+            local_clip.max.x <= remote_geo.min.x + 0.5,
+            "本地栏的裁剪矩形伸进了远端栏,内容会画进右栏: \
+             clip.max.x={} 远端栏 min.x={}",
             local_clip.max.x,
-            local_geo.max.x
+            remote_geo.min.x
         );
 
-        let (remote_geo, remote_clip) = clip_within_own_bounds(PanelColumn::Remote);
+        let (local_geo, _, remote_clip) = clip_within_own_bounds(PanelColumn::Remote);
         assert!(
-            remote_clip.min.x >= remote_geo.min.x - 0.5,
-            "远端栏的裁剪矩形越过了它自己的左边界,内容会画进本地栏: \
-             clip.min.x={} 本栏 min.x={}",
+            remote_clip.min.x >= local_geo.max.x - 0.5,
+            "远端栏的裁剪矩形伸进了本地栏,内容会画进左栏: \
+             clip.min.x={} 本地栏 max.x={}",
             remote_clip.min.x,
-            remote_geo.min.x
+            local_geo.max.x
         );
 
         // --- 嫌疑 2:往左栏灌一次滚轮,右栏的行位置不该跟着挪。 --------
