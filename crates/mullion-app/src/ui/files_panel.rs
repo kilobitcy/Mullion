@@ -561,14 +561,18 @@ pub fn show(
                 egui::Button::new("").min_size(egui::Vec2::splat(ui.spacing().interact_size.y));
             let menu = egui::menu::menu_custom_button(ui, btn, |ui| {
                 for b in bookmarks.list {
-                    // 空名字是 store 明确允许的合法状态(`Bookmark::name` 的
-                    // 文档),界面回退显示路径本身,不能画一条没有文字的项。
-                    let label = if b.name.is_empty() {
-                        b.path.as_str()
-                    } else {
-                        b.name.as_str()
-                    };
-                    if ui.button(label).on_hover_text(&b.path).clicked() {
+                    // F145:主文本恒是**完整绝对路径**。用户点开这个下拉
+                    // 就是为了确认「这条书签指哪儿」,只给个 `nginx` 等于
+                    // 没回答 —— 同名目录在不同机器、不同层级下遍地都是。
+                    //
+                    // 用户自己起的名字不丢:非空且与路径不同时挂到 hover 上。
+                    // (空名是 store 明确允许的合法状态,见 `Bookmark::name`
+                    // 的文档 —— 现在这个分支不再影响主文本,只影响 hover。)
+                    let mut item = ui.button(b.path.as_str());
+                    if !b.name.is_empty() && b.name != b.path {
+                        item = item.on_hover_text(&b.name);
+                    }
+                    if item.clicked() {
                         action = Some(FileAction::Goto(mullion_ssh::sftp::RemotePath::from_bytes(
                             b.path.as_bytes().to_vec(),
                         )));
@@ -2545,6 +2549,35 @@ mod tests {
             .center()
     }
 
+    /// 打开书签下拉,在随后几帧里找 `needle` 这段文字,返回它的位置。
+    ///
+    /// 三条书签测试共用。菜单要到**下一帧**才画得出来,而具体是第几帧
+    /// 取决于 egui 的 Area 布局,所以这里最多试三帧。
+    ///
+    /// 会自己开标注模式 —— 下拉按钮 F143 之后是自绘三角、没有文字,
+    /// 只能靠 annotate 记下的矩形定位,而 `mark` 只在模式开着时才登记。
+    fn open_bookmark_menu_and_find(
+        ctx: &egui::Context,
+        state: &mut PaneState,
+        cols: &mut ColWidths,
+        marks: &[mullion_store::Bookmark],
+        needle: &str,
+    ) -> Option<egui::Pos2> {
+        if !annotate::is_on(ctx) {
+            annotate::toggle(ctx);
+        }
+        run_remote(ctx, state, cols, marks, true, egui::RawInput::default());
+        let arrow = bookmark_arrow(ctx);
+        run_remote(ctx, state, cols, marks, true, click_at(arrow));
+        for _ in 0..3 {
+            let (_, shapes) = run_remote(ctx, state, cols, marks, true, egui::RawInput::default());
+            if let Some(p) = find_text_pos(&shapes, needle) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
     /// 一次完整的左键点击(按下 + 抬起)。`PointerMoved` 不能省:egui 的
     /// 交互靠指针位置,只发按钮事件时 hover 判定拿不到坐标。
     fn click_at(pos: egui::Pos2) -> egui::RawInput {
@@ -2644,47 +2677,20 @@ mod tests {
         assert_eq!(action, None, "没有会话记录时点星不该发出任何书签动作");
     }
 
-    /// F139:书签全走 ▾ 下拉(横排书签栏已删)。点开再点其中一条,
+    /// F139:书签全走下拉(横排书签栏已删)。点开再点其中一条,
     /// 要发出指向它 `path` 的 `Goto`。
     #[test]
     fn picking_a_bookmark_from_the_dropdown_emits_goto() {
         let ctx = egui::Context::default();
-        // 下拉按钮 F143 之后是自绘三角、没有文字,只能靠 annotate 定位,
-        // 而 `mark` 只在标注模式开着时才登记。
-        annotate::toggle(&ctx);
         let mut state = ready_at(b"/");
         let mut cols = ColWidths::default();
         let marks = vec![mullion_store::Bookmark {
             name: "日志".into(),
             path: "/var/log".into(),
         }];
-        run_remote(
-            &ctx,
-            &mut state,
-            &mut cols,
-            &marks,
-            true,
-            egui::RawInput::default(),
-        );
-        let arrow = bookmark_arrow(&ctx);
-        // 点开菜单。菜单要到**下一帧**才画得出来,所以这一帧只管点。
-        let (_, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(arrow));
-        let mut item = None;
-        for _ in 0..3 {
-            let (_, shapes) = run_remote(
-                &ctx,
-                &mut state,
-                &mut cols,
-                &marks,
-                true,
-                egui::RawInput::default(),
-            );
-            item = find_text_pos(&shapes, "日志");
-            if item.is_some() {
-                break;
-            }
-        }
-        let item = item.expect("下拉里该有「日志」这一条");
+        // F145 之后菜单项的主文本是路径,不是名字 —— 按路径找。
+        let item = open_bookmark_menu_and_find(&ctx, &mut state, &mut cols, &marks, "/var/log")
+            .expect("下拉里该有这一条");
         let (action, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(item));
         assert_eq!(
             action,
@@ -2696,45 +2702,44 @@ mod tests {
     }
 
     /// 空名字是 store 明确允许的合法状态(`Bookmark::name` 文档),下拉里
-    /// 必须回退显示路径本身,而不是画一条没有任何文字、根本点不中的项。
+    /// 不能画一条没有任何文字、根本点不中的项。
+    ///
+    /// F145 之后主文本恒是路径,这条自然成立 —— 留着是因为它守的是
+    /// 「空名不产生空项」,那跟主文本取什么无关,换回名字优先时还得靠它。
     #[test]
     fn a_bookmark_with_an_empty_name_falls_back_to_showing_its_path() {
         let ctx = egui::Context::default();
-        // 下拉按钮 F143 之后是自绘三角、没有文字,只能靠 annotate 定位,
-        // 而 `mark` 只在标注模式开着时才登记。
-        annotate::toggle(&ctx);
         let mut state = ready_at(b"/");
         let mut cols = ColWidths::default();
         let marks = vec![mullion_store::Bookmark {
             name: String::new(),
             path: "/srv/app".into(),
         }];
-        run_remote(
-            &ctx,
-            &mut state,
-            &mut cols,
-            &marks,
-            true,
-            egui::RawInput::default(),
-        );
-        let arrow = bookmark_arrow(&ctx);
-        let (_, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(arrow));
-        let mut found = false;
-        for _ in 0..3 {
-            let (_, shapes) = run_remote(
-                &ctx,
-                &mut state,
-                &mut cols,
-                &marks,
-                true,
-                egui::RawInput::default(),
-            );
-            if find_text_pos(&shapes, "/srv/app").is_some() {
-                found = true;
-                break;
-            }
-        }
+        let found =
+            open_bookmark_menu_and_find(&ctx, &mut state, &mut cols, &marks, "/srv/app").is_some();
         assert!(found, "空名字的书签要回退显示路径");
+    }
+
+    /// F145:书签下拉里每一条显示的是**完整绝对路径**,不是文件夹名。
+    /// 用户点开下拉是为了确认「这条书签到底指哪儿」—— 只给个 `nginx`
+    /// 等于没回答这个问题(同名目录在不同机器、不同层级下遍地都是)。
+    ///
+    /// 自证会变红:把 `show()` 里那个 `let label = b.path.as_str();`
+    /// 改回按 `b.name` 优先。
+    #[test]
+    fn the_bookmark_menu_shows_the_full_path_not_just_the_folder_name() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/");
+        let mut cols = ColWidths::default();
+        let marks = vec![mullion_store::Bookmark {
+            name: "日志".into(),
+            path: "/var/log/nginx".into(),
+        }];
+        assert!(
+            open_bookmark_menu_and_find(&ctx, &mut state, &mut cols, &marks, "/var/log/nginx")
+                .is_some(),
+            "书签菜单里没有完整路径"
+        );
     }
 
     /// D5:**本地栏没有写操作入口**。菜单项的存在与否是纯结构的事,
