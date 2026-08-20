@@ -1346,6 +1346,8 @@ pub fn sidebar(
             // 文件为辅」的场景,辅助视图里远端才是主体。所以上面(本地)0.4、
             // 下面(远端)0.6。
             ui.allocate_ui(egui::vec2(ui.available_width(), h * 0.4), |ui| {
+                // 裁到本栏之内,理由同 `content()` 里两栏各自那句 `set_clip_rect`。
+                ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
                 out.1 = show(
                     ui,
                     t,
@@ -1360,21 +1362,32 @@ pub fn sidebar(
                 );
             });
             ui.separator();
-            out.0 = show(
-                ui,
-                t,
-                "远端",
-                generation,
-                PanelColumn::Remote,
-                &mut frame.remote,
-                panel_focused && frame.active_column == PanelColumn::Remote,
-                BookmarkView {
-                    list: &frame.bookmarks,
-                    can_edit: frame.session_bound,
-                },
-                drop_in,
-                &mut ui_state.files_cols,
-            );
+            // **必须跟本地栏一样包一层把矩形限死**。直接 `show(ui, ..)` 的话
+            // `ui.max_rect()` 是**整条侧栏**(egui 的 `max_rect` 是 ui 建出来
+            // 那一刻的预算,不随 cursor 往下走而缩),于是 `show()` 开头那个
+            // 覆盖整栏的右键菜单宿主(`ui.interact(ui.max_rect(), ..)`)会连
+            // 上面的本地栏一起罩住 —— 它注册在本地栏所有控件之后,同层后注册者
+            // 压在上面,本地栏的 ↑/⟳/☆/▾ 和路径条**一个都点不中**(v0.1.55
+            // 用户实测)。守护:`tests::the_sidebar_local_column_still_receives_
+            // clicks_under_the_remote_column`。
+            ui.allocate_ui(ui.available_size(), |ui| {
+                ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                out.0 = show(
+                    ui,
+                    t,
+                    "远端",
+                    generation,
+                    PanelColumn::Remote,
+                    &mut frame.remote,
+                    panel_focused && frame.active_column == PanelColumn::Remote,
+                    BookmarkView {
+                        list: &frame.bookmarks,
+                        can_edit: frame.session_bound,
+                    },
+                    drop_in,
+                    &mut ui_state.files_cols,
+                );
+            });
         });
     // 把这一帧的实际宽度读回来。**注意它只是个镜像,驱动不了任何东西**:
     // egui 0.30 的 `SidePanel::show_inside_dyn` 先取 `default_width`,紧接着
@@ -3400,11 +3413,14 @@ mod tests {
             local2.center().y,
             remote2.center().y
         );
-        // 分母必须是侧栏**总高**,不能拿 `remote2.height()` 当参照系:「远端」
-        // 那次 `show()` 没包 `allocate_ui` 裁剪,它内部 `annotate::mark` 记的是
-        // 整条侧栏未裁剪的 `ui.max_rect()`(恒等于侧栏总高)——拿它跟本地栏比,
-        // 无论 `sidebar()` 里的比例改成几比几,这条断言都恒真(复核实测把
-        // `h * 0.4` 改成 `h * 0.9` 照样绿)。改成对总高的占比区间:守住
+        // 分母是侧栏**总高**,历史原因:「远端」那次 `show()` 曾经没包
+        // `allocate_ui`,它内部 `annotate::mark` 记的是整条侧栏未裁剪的
+        // `ui.max_rect()`(恒等于侧栏总高)——拿它跟本地栏比,无论 `sidebar()`
+        // 里的比例改成几比几,这条断言都恒真(复核实测把 `h * 0.4` 改成
+        // `h * 0.9` 照样绿)。那个几何事实后来被认定为真 bug(它让远端栏的
+        // 交互层罩住本地栏,见 `the_sidebar_local_column_still_receives_clicks_
+        // under_the_remote_column`)并已修掉,但分母仍留在总高上:参照系少一层
+        // 依赖更稳。守住
         // 0.4:0.6 这个刻意取舍(辅助视图里远端才是主体),留一点余量给
         // `ui.separator()` 那几像素。
         let total = annotate::spot_rect(&ctx2, "文件侧栏").expect("侧栏没画");
@@ -3413,6 +3429,94 @@ mod tests {
             "侧栏:本地栏该占约四成高度(0.4:0.6 里的 0.4),实际本地 {} / 总高 {}",
             local2.height(),
             total.height()
+        );
+    }
+
+    /// 侧栏宿主里,本地栏的按钮与路径条必须真的点得中。
+    ///
+    /// v0.1.55 用户实测的真 bug:`sidebar()` 里本地栏包在 `allocate_ui` 里、
+    /// 矩形被限死,**远端栏那次 `show()` 却直接拿外层 `ui`** —— 它的
+    /// `ui.max_rect()` 恒等于**整条侧栏**(上面那条测试的注释早就记下了这个
+    /// 几何事实,只是当时只当成「断言参照系不能用它」)。于是 `show()` 开头
+    /// 那个覆盖整栏的右键菜单宿主(`ui.interact(ui.max_rect(), ..)`)罩住了
+    /// 本地栏;它注册在本地栏所有控件**之后**,同层后注册者压在上面,本地栏的
+    /// ↑/⟳/☆/▾ 与路径条全部收不到点击。`show()` 自己那条注释("挂到栏尾会把
+    /// 整栏罩住,书签按钮和行的左键点击全被它吃掉")说的正是这个失效模式,
+    /// 只是没料到它会从**隔壁栏**罩过来。
+    ///
+    /// 标签宿主 `content()` 没这个问题:两栏各自 `scope_builder` 限死矩形。
+    ///
+    /// 自证会变红:把 `sidebar()` 里远端栏那次 `show()` 的 `allocate_ui`
+    /// 包装去掉、改回直接 `show(ui, ..)`。
+    #[test]
+    fn the_sidebar_local_column_still_receives_clicks_under_the_remote_column() {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        annotate::toggle(&ctx);
+        let mut ui_state = crate::ui::UiState::default();
+        let mut frame = PanelFrame::default();
+        frame.local.entries = vec![entry(b"local-a.txt", EntryKind::File)];
+        frame.local.load = Load::Ready;
+        frame.remote.entries = vec![entry(b"remote-a.txt", EntryKind::File)];
+        frame.remote.load = Load::Ready;
+        // 侧栏用真实窗口尺寸(见 `clicking_the_name_header_...` 的同款注释)。
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 700.0));
+        let base = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let click_at = |pos: egui::Pos2| {
+            let mut input = base();
+            input.events.push(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            input
+        };
+        let run =
+            |input: egui::RawInput, frame: &mut PanelFrame, ui_state: &mut crate::ui::UiState| {
+                let mut acts = (None, None);
+                let out = ctx.run(input, |ctx| {
+                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0);
+                });
+                (acts, out)
+            };
+
+        // 部件矩形要上一帧的布局结果才存在,先预热(切片 G 的坑)。
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let (_, out) = run(base(), &mut frame, &mut ui_state);
+            shapes = out.shapes;
+        }
+
+        // 侧栏里本地栏在上、先画,所以第一个 ↑ 就是本地那个。
+        let up = find_text_pos(&shapes, "↑").expect("路径条上该有 ↑ 按钮");
+        assert!(
+            up.y < screen.center().y,
+            "取到的 ↑ 不在侧栏上半部(本地栏),测试选错了目标: y={}",
+            up.y
+        );
+        let ((_, local_act), _) = run(click_at(up), &mut frame, &mut ui_state);
+        assert_eq!(
+            local_act,
+            Some(FileAction::Up),
+            "点本地栏的 ↑ 没反应 —— 多半是被远端栏那个覆盖整条侧栏的交互层吃掉了"
+        );
+
+        // 路径条同理:它是 F131 唯一的入口,点不中等于这个功能不存在。
+        // 取行首往下一点、行尾往左一点 —— 那片是路径标签的命中区(按钮都在左边)。
+        let row = annotate::spot_rect(&ctx, "文件面板/本地/路径").expect("本地栏路径条没画");
+        let pos = egui::pos2(row.max.x - 8.0, row.min.y + 6.0);
+        assert!(frame.local.path_edit.is_none(), "前提:此刻不该在编辑态");
+        let _ = run(click_at(pos), &mut frame, &mut ui_state);
+        assert!(
+            frame.local.path_edit.is_some(),
+            "点本地栏路径条没进编辑态 —— 同上,交互被隔壁栏罩住了"
         );
     }
 
