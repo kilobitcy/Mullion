@@ -1293,7 +1293,11 @@ fn wind_down(tab: Tab<TabContent>) {
             for task in t.reconnect_tasks {
                 task.abort();
             }
-            // `t.ws` 在这里 drop —— 每个 `PaneState` 随之 drop,关掉它那条 SSH channel。
+            // F140:**显式**关掉每块 pane 的 channel,然后 `t.ws` 才 drop。
+            // 光靠 drop 关不掉 —— russh 0.54.5 的 `ChannelWriteHalf` 没有
+            // `Drop` 实现(这一行原本的注释写反了)。不关的话,关掉一个开了
+            // 4 块分屏的标签就在远端留下 4 个挂着的 shell。
+            t.ws.close_all_panes();
         }
         // D1:文件标签没有自动化、没有 PTY——只有 sftp 后台任务需要收口,
         // 理由与上面 `Terminal` 分支那段一模一样(见 `FilesTab::sftp_tasks`
@@ -7928,8 +7932,11 @@ fn swap_pane_channel(
     rx: Receiver<Vec<u8>>,
 ) {
     p.host_ix = host_ix;
-    // 旧的 `pty`/`rx` 在这两句赋值里被 Drop —— Drop 即关掉上一条 channel,
-    // 不留孤儿。
+    // F140:**先显式关掉旧 channel**。旧的 `pty`/`rx` 会在下面两句赋值里被
+    // Drop,但 Drop 关不掉 channel —— russh 0.54.5 的 `ChannelWriteHalf` 没有
+    // `Drop` 实现(这行原本的注释写反了)。不关的话,换一次节点 / 重连一次
+    // 就在远端留一个挂着的 shell,并占着一个 channel slot。
+    p.pty.close();
     p.pty = pty;
     p.rx = rx;
     p.pacer = SyncFramePacer::new();
@@ -9660,6 +9667,7 @@ mod tests {
         fn resize(&self, _cols: u16, _rows: u16) -> Result<(), mullion_ssh::session::TrySendErr> {
             Ok(())
         }
+        fn close(&self) {}
     }
 
     fn test_pane(id: u32) -> crate::shell::workspace::PaneState {
@@ -12125,6 +12133,7 @@ mod tests {
                 self.0.lock().unwrap().push((cols, rows));
                 Ok(())
             }
+            fn close(&self) {}
         }
 
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -12210,6 +12219,7 @@ mod tests {
                 self.0.lock().unwrap().push((cols, rows));
                 Ok(())
             }
+            fn close(&self) {}
         }
 
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -12705,6 +12715,74 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "wind_down 没有 abort 掉在途的 sftp 任务 —— 任务会继续攥着 \
              Arc<SshConnection>,撑住本该随标签一起断开的连接"
+        );
+    }
+
+    /// F140:关标签要把它名下**每一块** pane 的 channel 都关掉。
+    ///
+    /// `wind_down` 原本只 abort 后台任务、然后让 `Workspace` 自然 drop ——
+    /// 而 drop 关不掉 channel(russh 0.54.5 的 `ChannelWriteHalf` 没有 `Drop`)。
+    /// 用户关掉一个开了 4 块分屏的标签,远端就多 4 个挂着的 shell,同时占着
+    /// 4 个 channel slot。
+    ///
+    /// 自证会变红:把 `wind_down` 里那句 `t.ws.close_all_panes()` 删掉。
+    #[test]
+    fn winding_down_a_terminal_tab_closes_every_pane_channel_f140() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingPty(Arc<AtomicUsize>);
+        impl crate::shell::workspace::PtyWriter for CountingPty {
+            fn write(&self, _b: Vec<u8>) -> Result<(), mullion_ssh::session::TrySendErr> {
+                Ok(())
+            }
+            fn resize(&self, _c: u16, _r: u16) -> Result<(), mullion_ssh::session::TrySendErr> {
+                Ok(())
+            }
+            fn close(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut p1 = test_pane(1);
+        p1.pty = Box::new(CountingPty(closes.clone()));
+        let mut ws = Workspace::new(p1, 0);
+        let id2 = ws
+            .split_focused(mullion_core::layout::Dir::Horizontal)
+            .expect("分不出第二块");
+        let mut p2 = test_pane(id2.0);
+        p2.id = id2;
+        p2.pty = Box::new(CountingPty(closes.clone()));
+        ws.attach_pane(p2);
+
+        let tab = Tab {
+            id: TabId(1),
+            title: "test".into(),
+            session_id: None,
+            title_override: None,
+            color_override: None,
+            content: TabContent::Terminal(Box::new(TerminalTab {
+                ws,
+                current_preset: None,
+                last_cfg: None,
+                automation: Vec::new(),
+                automation_template: None,
+                automation_status: None,
+                files: Default::default(),
+                sftp: None,
+                sftp_host_ix: None,
+                sftp_tasks: Vec::new(),
+                sftp_default_remote: None,
+                sftp_home: None,
+                reconnect_tasks: Vec::new(),
+            })),
+        };
+        wind_down(tab);
+
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            2,
+            "关标签没关掉全部 pane 的 channel —— 远端会留下挂着的 shell(F140)"
         );
     }
 

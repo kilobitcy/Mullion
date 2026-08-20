@@ -78,6 +78,14 @@ use crate::session_pump;
 pub trait PtyWriter: Send {
     fn write(&self, bytes: Vec<u8>) -> Result<(), TrySendErr>;
     fn resize(&self, cols: u16, rows: u16) -> Result<(), TrySendErr>;
+    /// F140:显式关掉这条 channel(发 `SSH_MSG_CHANNEL_CLOSE`)。
+    ///
+    /// **没有默认实现**:漏实现就该编译不过。给个空默认的话,将来新加的
+    /// 写口会静默地不收口 —— 而那正是 F140 要修的那个 bug 的形状。
+    ///
+    /// 无返回值:调用点都在"反正要丢弃这个 pane 了"的路径上,失败没有
+    /// 补救动作(见 `SshSession::close` 的文档)。
+    fn close(&self);
 }
 
 impl PtyWriter for SshSession {
@@ -86,6 +94,9 @@ impl PtyWriter for SshSession {
     }
     fn resize(&self, cols: u16, rows: u16) -> Result<(), TrySendErr> {
         SshSession::resize(self, cols, rows)
+    }
+    fn close(&self) {
+        SshSession::close(self)
     }
 }
 
@@ -103,6 +114,9 @@ impl PtyWriter for Arc<SshSession> {
     }
     fn resize(&self, cols: u16, rows: u16) -> Result<(), TrySendErr> {
         SshSession::resize(self, cols, rows)
+    }
+    fn close(&self) {
+        SshSession::close(self)
     }
 }
 
@@ -337,15 +351,34 @@ impl Workspace {
         self.panes.push(pane);
     }
 
-    /// 关闭一个 pane(F31):树上兄弟顶替,`PaneState` 一并丢弃(channel 随之关闭)。
+    /// 关闭一个 pane(F31):树上兄弟顶替,`PaneState` 一并丢弃。
     /// 最后一个 pane 不可关,返回 `false` 且什么都不动。
+    ///
+    /// F140:**丢弃 `PaneState` 不等于关掉 channel**。russh 0.54.5 的
+    /// `ChannelWriteHalf` 没有 `Drop` 实现,不显式 `close()` 的话远端 shell
+    /// 会一直挂着,channel slot 泄漏到 sshd 的 `MaxSessions` 上限(默认 10)
+    /// 之后,同一条连接再也开不出新分屏(adr-009 已列的失效模式)。
     pub fn close_pane(&mut self, id: PaneId) -> bool {
         if !close_pane(&mut self.tree, id) {
             return false;
         }
+        if let Some(p) = self.panes.iter().find(|p| p.id == id) {
+            p.pty.close();
+        }
         self.panes.retain(|p| p.id != id);
         self.focus = next_focus(self.focus, &leaves(&self.tree));
         true
+    }
+
+    /// F140:关掉**所有** pane 的 channel。关标签时用(见 `app.rs::wind_down`)
+    /// —— 那条路径不经过 `close_pane`,整个 `Workspace` 被直接 drop。
+    ///
+    /// 不改任何状态:调用方紧接着就要丢弃整个 `Workspace`,清空 `panes`
+    /// 只是多一步没人观察得到的写。
+    pub fn close_all_panes(&self) {
+        for p in &self.panes {
+            p.pty.close();
+        }
     }
 
     /// 把焦点 pane 一分为二(F30)。返回新 pane 的 id(还没有 `PaneState`,
@@ -515,6 +548,9 @@ pub mod tests_support {
         /// (高延迟链路 + 大段粘贴时的真实场景,见 mullion-ssh/src/session.rs 的
         /// `TrySendErr` 注释),用来测 apply_geometry 的重试语义。
         resize_fails: Arc<Mutex<bool>>,
+        /// F140:`close()` 被调了几次。**计数而不是布尔** —— 重复关是无害的
+        /// (io_task 已退出时 try_send 失败即忽略),但一次都没有就是泄漏。
+        closes: Arc<Mutex<usize>>,
     }
 
     impl PtyWriter for FakePty {
@@ -529,12 +565,16 @@ pub mod tests_support {
             self.resizes.lock().unwrap().push((cols, rows));
             Ok(())
         }
+        fn close(&self) {
+            *self.closes.lock().unwrap() += 1;
+        }
     }
 
     pub struct Probe {
         pub writes: Arc<Mutex<Vec<Vec<u8>>>>,
         pub resizes: Arc<Mutex<Vec<(u16, u16)>>>,
         pub resize_fails: Arc<Mutex<bool>>,
+        pub closes: Arc<Mutex<usize>>,
         pub tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     }
 
@@ -544,6 +584,7 @@ pub mod tests_support {
         let probe_writes = pty.writes.clone();
         let probe_resizes = pty.resizes.clone();
         let probe_resize_fails = pty.resize_fails.clone();
+        let probe_closes = pty.closes.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
         let d = term_default_colors(&MULLION_DARK);
@@ -566,6 +607,7 @@ pub mod tests_support {
                 writes: probe_writes,
                 resizes: probe_resizes,
                 resize_fails: probe_resize_fails,
+                closes: probe_closes,
                 tx,
             },
         )
@@ -956,6 +998,48 @@ mod tests {
         assert!(ws.close_pane(PaneId(2)));
         assert_eq!(mullion_core::layout::leaves(ws.tree()), vec![PaneId(1)]);
         assert_eq!(ws.focus(), PaneId(1));
+    }
+
+    /// F140:关分屏必须**显式**关掉那条 SSH channel。
+    ///
+    /// 光丢弃 `PaneState` 不够:那条路径最终走到 `io_task` 的 `None` 分支,
+    /// 而 russh 0.54.5 的 `ChannelWriteHalf` 没有 `Drop` —— 远端 shell 一直
+    /// 挂着,channel slot 泄漏到 sshd 的 `MaxSessions` 之后同一条连接再也
+    /// 开不出新分屏。
+    ///
+    /// 自证会变红:把 `close_pane` 里那句 `p.pty.close()` 删掉。
+    #[test]
+    fn closing_a_pane_closes_its_channel_f140() {
+        let (mut ws, p) = ws_with(2);
+        assert_eq!(*p[1].closes.lock().unwrap(), 0, "还没关就已经调过 close");
+        assert!(ws.close_pane(PaneId(2)));
+        assert_eq!(
+            *p[1].closes.lock().unwrap(),
+            1,
+            "关分屏没有关掉它的 channel —— 远端 shell 会挂着不死(F140)"
+        );
+        assert_eq!(
+            *p[0].closes.lock().unwrap(),
+            0,
+            "只该关被关的那块,不能顺手把留下的那块也关了"
+        );
+    }
+
+    /// F140:关标签要关掉**每一块** pane 的 channel,不是只关焦点那块。
+    ///
+    /// 自证会变红:把 `close_all_panes` 的循环改成只关 `self.focus` 那块。
+    #[test]
+    fn closing_every_pane_closes_every_channel_f140() {
+        let (ws, p) = ws_with(3);
+        ws.close_all_panes();
+        for (i, probe) in p.iter().enumerate() {
+            assert_eq!(
+                *probe.closes.lock().unwrap(),
+                1,
+                "第 {} 块 pane 的 channel 没关 —— 关标签会在远端留下挂着的 shell(F140)",
+                i + 1
+            );
+        }
     }
 
     /// 新分配的 id 不能撞已有 pane —— 撞了就是两个 PaneState 抢一个叶子位,
