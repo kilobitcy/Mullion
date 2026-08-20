@@ -4991,4 +4991,82 @@ mod tests {
         );
         assert_eq!(state.sort_key, SortKey::Mtime);
     }
+
+    /// F147:**每一列**都排得动,**两栏**都排得动。用户报「大小和修改时间
+    /// 不能排序」,这条把整个矩阵一次锁死 —— 之前只有「修改时间」中心
+    /// (`clicking_the_middle_of_a_header_still_sorts`)和「大小/修改时间」
+    /// 分界线(`pressing_exactly_on_a_column_edge_still_sorts`)两个点被守着,
+    /// 而且都只在远端栏。
+    ///
+    /// 列的清单**取自生产函数** `col_lefts()`,不在测试里另抄一份:以后再
+    /// 加列会自动进入覆盖,本地栏少一列属主也自动对上(F146)。
+    ///
+    /// 每一列开测前先把 `sort_key` 拨到**别的**列上,于是判据统一成
+    /// 「首点 → 该列 + 升序,再点 → 降序」,不用为「名称列初始就是当前列」
+    /// 单开一条分支。
+    ///
+    /// 自证(已实测):把 `header_at()` 里 `if resp.clicked() { hit = Some(key) }`
+    /// 改成 `if resp.clicked() && key == SortKey::Name`,本条变红,报
+    /// 「远端栏点了列头「大小」,排序没切到这一列的升序」。
+    #[test]
+    fn every_column_header_sorts_in_both_panes() {
+        let t = crate::theme::MULLION_DARK;
+        for (id, column) in [("远端", PanelColumn::Remote), ("本地", PanelColumn::Local)] {
+            for (label, key, _, _) in col_lefts(&ColWidths::default(), column) {
+                let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+                state.entries = vec![entry(b"a.txt", EntryKind::File)];
+                state.load = Load::Ready;
+                // 拨到「别的列」:测名称列时用权限列打底,其余一律用名称列。
+                state.sort_key = if key == SortKey::Name {
+                    SortKey::Perm
+                } else {
+                    SortKey::Name
+                };
+                state.sort_dir = crate::files::SortDir::Asc;
+                let mut cols = ColWidths::default();
+                let ctx = egui::Context::default();
+                let render = |input: egui::RawInput, state: &mut PaneState, c: &mut ColWidths| {
+                    ctx.run(input, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show(
+                                ui,
+                                &t,
+                                id,
+                                1,
+                                column,
+                                state,
+                                false,
+                                BookmarkView::none(),
+                                0,
+                                c,
+                            );
+                        });
+                    })
+                };
+                annotate::toggle(&ctx);
+                // 两帧预热:列头矩形要等占位横带定下来之后才登记得出。
+                let _ = render(raw(None), &mut state, &mut cols);
+                let _ = render(raw(None), &mut state, &mut cols);
+                let head = annotate::spot_rect(&ctx, &format!("文件面板/{id}/列头/{label}"))
+                    .unwrap_or_else(|| panic!("{id}栏没登记出列头「{label}」的矩形"));
+                let pos = head.center();
+
+                let _ = render(press(pos, 1.0, true), &mut state, &mut cols);
+                let _ = render(press(pos, 1.1, false), &mut state, &mut cols);
+                assert_eq!(
+                    (state.sort_key, state.sort_dir),
+                    (key, crate::files::SortDir::Asc),
+                    "{id}栏点了列头「{label}」,排序没切到这一列的升序"
+                );
+
+                let _ = render(press(pos, 2.0, true), &mut state, &mut cols);
+                let _ = render(press(pos, 2.1, false), &mut state, &mut cols);
+                assert_eq!(
+                    (state.sort_key, state.sort_dir),
+                    (key, crate::files::SortDir::Desc),
+                    "{id}栏再点一次列头「{label}」,方向没翻成降序"
+                );
+            }
+        }
+    }
 }
