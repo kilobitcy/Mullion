@@ -324,6 +324,59 @@ struct PendingRehost {
     cfg: SshConfig,
 }
 
+/// F141:断线重连时,把**哪块 pane** 接回**哪个 tmux 会话**。
+///
+/// 在 `ConnectOk`(自动化真的起跑的那一帧)记下,判据与计划生成同源
+/// (`mullion_store::tmux_session_name` 就是 `build_plan` tmux 分支的判据本身)
+/// —— 记岔了的后果不是「没接回来」,而是「接到了另一个会话上」。
+#[derive(Debug, Clone)]
+struct TmuxAttach {
+    /// 建标签的那块 pane(`PaneId(1)`,见 `Workspace::new`)。分屏出来的、
+    /// 换过节点的都不是它。
+    pane: PaneId,
+    /// 它当时挂在 `ws.hosts` 的第几台上。**判据里必须带上它**:用户把这块
+    /// pane「换节点」搬到第二台机器之后,pane id 不变、`host_ix` 变了 ——
+    /// 只认 pane id 的话,新机器断线重连时会把**上一台**机器的 tmux 会话名
+    /// 发过去,在一台根本没有那个会话的机器上凭空新建一个同名会话。
+    host_ix: usize,
+    /// 当初真的 attach 上去的那个会话名(已 sanitize)。**不是「现在配置里
+    /// 写的那个」**:断线到重连之间用户完全可能去改会话名,按新名字 attach
+    /// 会接到一个空会话,而他要的那个还在远端挂着。
+    session_name: String,
+}
+
+impl TmuxAttach {
+    /// 这次重连回来的 `(pane, host_ix)` 是不是当初 attach 了 tmux 的那一块。
+    ///
+    /// 抽成方法只为了能脱离 `App`/事件循环单测(`App` 在无头环境构造不出来,
+    /// 同 `automation::should_cancel_on_status` 的理由)。
+    fn matches(&self, pane: PaneId, host_ix: usize) -> bool {
+        self.pane == pane && self.host_ix == host_ix
+    }
+}
+
+/// F141:`ConnectOk` 那一刻该不该记下「重连时接回哪个 tmux 会话」。
+/// `None` = 这次连接没走 tmux,重连时全部 pane 都按分屏那套处理。
+///
+/// 抽成纯函数(而不是在 `ConnectOk` 分支里就地写)只为了能单测 —— 那条分支
+/// 要一个真的 `App` + 一条真的 SSH 连接才跑得起来,而这里定死的三件事
+/// (哪块 pane、哪台 host、哪个会话名)全都是「错了也看不出来、直到某天
+/// 重连接到别的会话上」的那类。
+fn tmux_attach_for_connect(
+    tpl: Option<&mullion_store::ResolvedAutomation>,
+    fallback_name: Option<&str>,
+) -> Option<TmuxAttach> {
+    Some(TmuxAttach {
+        // 建标签的那一块 —— 与下面 `start_automation(.., PaneId(1), ..)`
+        // 是同一块 pane(`Workspace::new` 的第一块)。
+        pane: PaneId(1),
+        // 这个 `ws` 是刚建的,`hosts` 里只有这一条(同 `PaneOpened` 里硬编的
+        // `host_ix: 0`)。
+        host_ix: 0,
+        session_name: mullion_store::tmux_session_name(tpl?, fallback_name?)?,
+    })
+}
+
 /// 一个终端标签的全部 **per-connection** 状态(D0 决策 S2)。
 ///
 /// 这五项过去都平摊在 `App` 上,单标签时看不出问题;多标签时它们会串味 ——
@@ -358,6 +411,13 @@ struct TerminalTab {
     /// 配置甚至删了会话,那时候分屏发出去的字节就跟他当初点「连接」时看到的
     /// 配置对不上了。
     automation_template: Option<mullion_store::ResolvedAutomation>,
+    /// F141:这条连接上「当初 attach 了 tmux 的那块 pane」。`None` = 这个标签
+    /// 压根没走 tmux(没配 / 关了 / 会话名为空 / 用户「跳过一次」)。
+    ///
+    /// 断线重连时**只有它**该被接回原来的 tmux 会话,其余 pane 照旧跳过 tmux
+    /// (多块 pane attach 同一个 session 会内容镜像 —— 那正是
+    /// `pending_for_extra_pane` 存在的理由)。
+    tmux_attach: Option<TmuxAttach>,
     /// 上一次自动化的结论文案。一直显示到这个标签被替换/关闭 —— 不做定时淡出:
     /// 状态栏本来就是常驻信息区,而定时清除要再引一个 deadline 进帧循环,
     /// 正是 spec §1 修订一要避免的东西。
@@ -1506,6 +1566,13 @@ pub struct App {
     /// 理由一模一样:连接在途期间用户改了配置,分屏发出去的字节就跟他点
     /// 「连接」时看到的对不上了。
     pending_automation_template: Option<mullion_store::ResolvedAutomation>,
+    /// F141:同一次点击里取到的**会话名**(tmux 会话名的兜底来源)。
+    /// `ConnectOk` 抵达时跟模板一起用来算 `TerminalTab::tmux_attach`。
+    ///
+    /// 单独存一份而不是到时候回头查库:理由同 `pending_automation_template`
+    /// ——连接在途期间用户可能把会话改名,那时候算出来的会话名就不是这次真的
+    /// attach 上去的那个了。
+    pending_automation_name: Option<String>,
     /// F44 右键「连接(跳过自动化)」的一次性标志。`ConnectOk` 消费后立即清零。
     pending_skip_automation: bool,
     /// 换节点在途的那些。`Vec` 而不是 `Option`:两块 pane 可以同时在换
@@ -1694,6 +1761,7 @@ impl App {
             probe_task: None,
             pending_automation: None,
             pending_automation_template: None,
+            pending_automation_name: None,
             pending_rehost: Vec::new(),
             reconnecting: Vec::new(),
             pending_skip_automation: false,
@@ -4643,6 +4711,9 @@ impl App {
         // 要按它算「跳过 tmux」的计划。绝不等到分屏那一刻再查库——那时用户可能
         // 已经改了配置(见 `pending_automation_template` 的文档)。
         let mut tpl: Option<mullion_store::ResolvedAutomation> = None;
+        // F141:同一次解析里把会话名也留一份 —— 重连要按**当初**那个名字把
+        // tmux 会话接回来(见 `pending_automation_name`)。
+        let mut fallback_name: Option<String> = None;
         let plan = crate::automation::pending_for(self.ui.connect_request_last, |id| {
             let store = self.store.as_ref()?;
             let resolved = store.resolved(id).ok()?;
@@ -4656,10 +4727,12 @@ impl App {
                 .name
                 .clone();
             tpl = Some(resolved.automation.clone());
+            fallback_name = Some(name.clone());
             Some((resolved.automation, name))
         });
         self.pending_automation = plan;
         self.pending_automation_template = tpl;
+        self.pending_automation_name = fallback_name;
         // 会话管理器发起的连接也要记下,否则第二次连接后开分屏会用上一台
         // 主机的 term/尺寸(F35 的 open_pty 靠它)。`ConnectOk` 抵达时移交给
         // 新建的标签。
@@ -5623,6 +5696,9 @@ impl ApplicationHandler<UserEvent> for App {
                         last_cfg: cfg,
                         automation: Vec::new(),
                         automation_template: None,
+                        // F141:下面 `take_pending` 成功时才填(那时才知道这次
+                        // 到底有没有 attach tmux)。
+                        tmux_attach: None,
                         automation_status: None,
                         // F50:每个标签自己的一份侧栏状态(D1:侧栏按会话记住)。
                         files: crate::ui::files_panel::PanelFrame::new(
@@ -5667,6 +5743,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 后来的 pane。否则「右键跳过一次」在分屏时会失效——用户明确
                 // 说了这次不跑,分屏出来的 pane 却照跑不误。
                 let tpl = self.pending_automation_template.take();
+                let tmux_name = self.pending_automation_name.take();
                 if let Some(plan) = crate::automation::take_pending(
                     &mut self.pending_automation,
                     &mut self.pending_skip_automation,
@@ -5679,6 +5756,9 @@ impl ApplicationHandler<UserEvent> for App {
                         .by_generation_mut(generation)
                         .and_then(|tab| tab.content.as_terminal_mut())
                     {
+                        // F141:这次全套跑里到底 attach 了哪个 tmux 会话 ——
+                        // 断线重连要照着它把用户接回去。
+                        t.tmux_attach = tmux_attach_for_connect(tpl.as_ref(), tmux_name.as_deref());
                         t.automation_template = tpl;
                     }
                     // 建标签的这个 pane 照配置**全套**跑,含 tmux
@@ -5876,6 +5956,8 @@ impl ApplicationHandler<UserEvent> for App {
                     .retain(|(g, h, _)| !(*g == generation && *h == host_ix));
                 let mut attached: Vec<(PaneId, Arc<mullion_ssh::session::SshSession>)> = Vec::new();
                 let mut template = None;
+                // F141:当初 attach 了 tmux 的是哪块 pane、哪个会话。
+                let mut tmux_attach: Option<TmuxAttach> = None;
                 if let Some(t) = self
                     .tabs
                     .by_generation_mut(generation)
@@ -5979,6 +6061,7 @@ impl ApplicationHandler<UserEvent> for App {
                     t.sftp_home = None;
                     t.files.remote.invalidate();
                     template = t.automation_template.clone();
+                    tmux_attach = t.tmux_attach.clone();
                 }
                 // 借用外:上面 abort 掉的传输 worker 不会再发 `TransferDone`,
                 // 队列里那几条会永久停在 `Running`,而 `take_runnable` 按
@@ -5988,12 +6071,24 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cancel_transfers_of(generation);
                 // 用户拍板:重连之后重跑登录后命令 —— 否则 tmux 不 attach,
                 // 断线前那个 Claude Code 会话回不来(这正是 F128 的初衷)。
-                // 跳过 tmux new-session 那类"开新会话"的步骤,规则同分屏新开的
-                // pane(`pending_for_extra_pane`)。
+                //
+                // F141:**分两种 pane**。当初 attach 了 tmux 的那一块要真的
+                // 「接回去」(`pending_for_reattach`,`attach -d` 踢掉断线残留
+                // 的旧 client);其余 pane(分屏出来的、换过节点的)照旧跳过
+                // tmux、只重跑 cd/export/命令 —— 让它们也 attach 会内容镜像。
+                // 这条分岔之前不存在:所有 pane 一律走跳过 tmux 那条,于是
+                // 「重连之后 tmux 会话回不来」(v0.1.55 用户实测),而紧挨着的
+                // 这段注释写的却正好是它本该做到的事。
                 let reconnected = !attached.is_empty();
                 if let Some(tpl) = template {
                     for (id, sink) in attached {
-                        if let Some(plan) = crate::automation::pending_for_extra_pane(&tpl) {
+                        let plan = match tmux_attach.as_ref() {
+                            Some(x) if x.matches(id, host_ix) => {
+                                crate::automation::pending_for_reattach(&tpl, &x.session_name)
+                            }
+                            _ => crate::automation::pending_for_extra_pane(&tpl),
+                        };
+                        if let Some(plan) = plan {
                             self.start_automation(generation, id, plan, sink);
                         }
                     }
@@ -8993,8 +9088,9 @@ mod tests {
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, font_px_for, has_real_action, ime_cursor_area,
         next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
-        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title, upload_job, wind_down,
-        Modal, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab,
+        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title, tmux_attach_for_connect,
+        upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab,
+        TmuxAttach,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -11439,6 +11535,7 @@ mod tests {
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
+                tmux_attach: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
@@ -12812,6 +12909,7 @@ mod tests {
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
+                tmux_attach: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
@@ -12889,6 +12987,7 @@ mod tests {
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
+                tmux_attach: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
@@ -12966,6 +13065,7 @@ mod tests {
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
+                tmux_attach: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
@@ -13714,6 +13814,7 @@ mod tests {
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
+                tmux_attach: None,
                 automation_status: None,
                 files: Default::default(),
                 sftp: None,
@@ -14323,6 +14424,87 @@ mod tests {
         );
     }
 
+    /// F141:重连的「接回 tmux」只认**当初那块 pane、在当初那台机器上**。
+    ///
+    /// 第二条断言是这条判据存在的全部理由:用户把主 pane「换节点」搬到第二台
+    /// 机器之后,pane id 不变、`host_ix` 变了。只认 pane id 的话,新机器断线
+    /// 重连时会把**上一台**机器的 tmux 会话名发过去,在一台根本没有那个会话
+    /// 的机器上凭空新建一个同名会话 —— 用户会以为「会话没了」。
+    ///
+    /// F141:`ConnectOk` 记下的会话名必须**就是**这次真的 attach 上去的那个,
+    /// 而且钉在建标签的那块 pane、那台 host 上。
+    ///
+    /// 三件事错了都看不出来,直到某天断线重连接到别的会话上(或者在一台
+    /// 没有那个会话的机器上凭空新建一个)。
+    ///
+    /// 自证会变红(各自):把 `tmux_attach_for_connect` 里的 `PaneId(1)` 改成
+    /// `PaneId(2)`;把 `host_ix: 0` 改成 `1`;把 `tmux_session_name(..)` 换成
+    /// `Some(fallback_name?.to_string())`(漏掉 sanitize 与「显式名优先」)。
+    #[test]
+    fn the_connect_records_exactly_the_tmux_session_the_plan_attaches() {
+        let auto = mullion_store::ResolvedAutomation {
+            enabled: true,
+            tmux: Some(mullion_store::TmuxChoice::Attach { session_name: None }),
+            commands: Vec::new(),
+            work_dir: None,
+            env: Vec::new(),
+            initial_delay_ms: 300,
+            inter_delay_ms: 200,
+            ready_timeout_ms: 15_000,
+        };
+        let it = tmux_attach_for_connect(Some(&auto), Some("web01.prod:2"))
+            .expect("配了 tmux 就该记下来");
+        assert_eq!(it.pane, PaneId(1), "记的是建标签的那块 pane");
+        assert_eq!(it.host_ix, 0, "记的是这条连接的第一台 host");
+        // 计划里真的发出去的名字 —— 拿它当参照,而不是自己再拼一遍
+        // (自己拼的话,sanitize 规则改了两边一起错,测试照绿)。
+        let line = String::from_utf8(
+            mullion_store::build_plan(&auto, "web01.prod:2")[0]
+                .bytes
+                .clone(),
+        )
+        .expect("ASCII");
+        assert!(
+            line.contains(&format!("-t '{}'", it.session_name)),
+            "记下的会话名跟计划实际 attach 的那个对不上: 记的是 {} / 计划是 {line}",
+            it.session_name
+        );
+
+        // 没走 tmux 的三种情形都不许记 —— 记了的话重连会凭空 attach 一个
+        // 当初根本没建起来的会话。
+        let mut off = auto.clone();
+        off.tmux = Some(mullion_store::TmuxChoice::Off);
+        assert!(tmux_attach_for_connect(Some(&off), Some("web01")).is_none());
+        assert!(
+            tmux_attach_for_connect(None, Some("web01")).is_none(),
+            "没有模板(比如 CLI 直连)时无从谈起"
+        );
+        assert!(
+            tmux_attach_for_connect(Some(&auto), None).is_none(),
+            "没有会话名时同理"
+        );
+    }
+
+    /// 自证会变红:把 `TmuxAttach::matches` 里的 `&& self.host_ix == host_ix`
+    /// 删掉。
+    #[test]
+    fn only_the_pane_that_attached_tmux_on_that_very_host_gets_reattached() {
+        let it = TmuxAttach {
+            pane: PaneId(1),
+            host_ix: 0,
+            session_name: "web01".into(),
+        };
+        assert!(it.matches(PaneId(1), 0), "就是它,该接回去");
+        assert!(
+            !it.matches(PaneId(2), 0),
+            "分屏出来的 pane 不许 attach 同一个会话(会内容镜像)"
+        );
+        assert!(
+            !it.matches(PaneId(1), 1),
+            "换过节点之后它已经在别的机器上了,那台没有这个会话"
+        );
+    }
+
     /// **接线守护 / F128**:重连成功后要重跑登录后自动化 —— 用户拍板的规则,
     /// 否则 tmux 不会 attach,断线前那个 Claude Code 会话回不来
     /// (这正是整个 F128 要解决的场景)。
@@ -14348,6 +14530,21 @@ mod tests {
         assert!(
             body.contains("self.start_automation("),
             "没重跑登录后命令 —— tmux 不 attach,Claude Code 会话回不来"
+        );
+        // F141:光"重跑登录后命令"不够 —— v0.1.55 这里跑的是**跳过 tmux**的
+        // 那一份(`pending_for_extra_pane`),于是断线前那个 tmux 会话根本回
+        // 不来,而上面那条断言照绿。判据必须细到「主 pane 走的是接回原会话
+        // 那条路」。
+        //
+        // 自证会变红:把分支里的 `pending_for_reattach(` 改回
+        // `pending_for_extra_pane(`。
+        assert!(
+            body.contains(concat!("pending_for_", "reattach(")),
+            "重连没走「接回原 tmux 会话」那条路,用户的 Claude Code 会话回不来"
+        );
+        assert!(
+            body.contains(concat!("pending_for_", "extra_pane(")),
+            "其余 pane(分屏出来的)仍必须走跳过 tmux 那条,否则内容会镜像"
         );
     }
 

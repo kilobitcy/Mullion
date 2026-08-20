@@ -122,6 +122,28 @@ pub fn pending_for_extra_pane(tpl: &ResolvedAutomation) -> Option<PendingAutomat
     })
 }
 
+/// F141:**断线重连**回来的那块 pane 该跑什么 —— 前提是它当初就是 attach 了
+/// tmux 的那一块(判据在 `App::tmux_attach`,不在这里)。
+///
+/// 与 `pending_for` 的差别只有 `attach -d`(见 `build_plan_reattach`);与
+/// `pending_for_extra_pane` 的差别是**根本不同的目的**:那个是「在一块新
+/// shell 里把 cd/export/命令再跑一遍」,这个是「把断线前那个 tmux 会话接回来」。
+/// 用户断线前跑着的 Claude Code 能不能回来,全看这条路径走对没有。
+///
+/// 收 `name` 而不是回头查库:同 `pending_for_extra_pane`,断线到重连之间用户
+/// 完全可能改了会话名 —— 那时候按新名字去 attach,接到的是一个空会话(或者
+/// 新建一个),而他要的那个还在远端挂着。名字必须是**当初连上时用的那个**。
+pub fn pending_for_reattach(tpl: &ResolvedAutomation, name: &str) -> Option<PendingAutomation> {
+    let steps = mullion_store::build_plan_reattach(tpl, name);
+    if steps.is_empty() {
+        return None;
+    }
+    Some(PendingAutomation {
+        steps,
+        ready_timeout_ms: tpl.ready_timeout_ms,
+    })
+}
+
 /// 这块 pane 的连接状态是否意味着「在跑的那份自动化该当场取消」。
 ///
 /// 判据是**这条 channel 还能不能把字节送出去**，不是「pane 会不会回来」。
@@ -354,6 +376,51 @@ mod tests {
             assert!(!line.contains("tmux"), "分屏 pane 不许碰 tmux: {line}");
             assert!(line.contains("echo hi"), "登录后命令要照跑: {line}");
         }
+    }
+
+    /// F141:**重连**回来的主 pane 与分屏 pane 走的是两条不同的路 —— 前者要
+    /// 把 tmux 会话接回来,后者不许碰 tmux。同一份配置、同一个入口,只有调用
+    /// 的函数不同,所以这条测试把两者摆在一起比。
+    ///
+    /// 自证会变红:把 `pending_for_reattach` 里的 `build_plan_reattach` 换成
+    /// `build_plan_without_tmux`(也就是 v0.1.55 的行为 —— 重连之后 tmux 回不来)。
+    #[test]
+    fn a_reconnected_main_pane_comes_back_to_its_tmux_session_unlike_an_extra_pane() {
+        let mut a = enabled_automation();
+        a.tmux = Some(TmuxChoice::Attach {
+            session_name: Some("web01".into()),
+        });
+
+        let back = pending_for_reattach(&a, "web01").expect("配了 tmux 就该有重连计划");
+        assert_eq!(back.steps.len(), 1, "有 tmux 只发一步(设计 §2)");
+        let line = String::from_utf8(back.steps[0].bytes.clone()).unwrap();
+        assert!(
+            line.contains("attach -d -t 'web01'"),
+            "重连要接回原会话并踢掉断线残留的 client: {line}"
+        );
+
+        // 同一份配置,分屏 pane 那条路必须仍然不碰 tmux —— 两条路不能被
+        // 「统一」成一条(这正是这次改动最容易被后人顺手抹平的地方)。
+        let extra = pending_for_extra_pane(&a).expect("配了命令就该有计划");
+        for s in &extra.steps {
+            let line = String::from_utf8(s.bytes.clone()).unwrap();
+            assert!(!line.contains("tmux"), "分屏 pane 不许碰 tmux: {line}");
+        }
+    }
+
+    /// F141:没配 tmux 的会话,重连计划是空的 —— 调用方据此回落到
+    /// `pending_for_extra_pane`(重跑 cd/export/命令)。这里守的是**不许**
+    /// 在这条路径上悄悄把命令再跑一遍:那会在一块已经 attach 上 TUI 的
+    /// 屏幕里打字(设计 §2 要挡的正是这个)。
+    #[test]
+    fn there_is_nothing_to_reattach_when_the_session_never_used_tmux() {
+        let mut off = enabled_automation();
+        off.tmux = Some(TmuxChoice::Off);
+        assert!(pending_for_reattach(&off, "web01").is_none());
+        assert!(
+            pending_for_extra_pane(&off).is_some(),
+            "前提:这份配置本身有命令要跑,上一条断言才不是重言式"
+        );
     }
 
     /// 只配了 tmux(没有任何命令/环境/工作目录)的会话:分屏 pane 无事可做,

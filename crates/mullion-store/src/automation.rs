@@ -168,40 +168,90 @@ pub fn build_plan(a: &ResolvedAutomation, fallback_name: &str) -> Vec<Step> {
     }
     let initial = Duration::from_millis(u64::from(a.initial_delay_ms));
     match &a.tmux {
-        Some(TmuxChoice::Attach { session_name }) => {
-            let raw = session_name.as_deref().unwrap_or(fallback_name);
-            let name = sanitize_tmux_name(raw);
-            if name.is_empty() {
-                // 没有可用的会话名。宁可什么都不做,也不发 `attach -t ''` 这种残命令。
-                return Vec::new();
-            }
-            let q = shell_quote(&name);
-            // `||` 的回落条件是 `has-session` 探测失败(会话不存在 → 新建),这条路径
-            // 实测正常。但 `exec` 会替换进程镜像:一旦 `attach` 起来了、之后才运行时
-            // 失败(例如会话在探测与 attach 之间被别的客户端 kill),原 shell 已不
-            // 存在,**不会**回落去新建——远端控制进程直接退出、channel 随之关闭。
-            // 已知且接受:竞态窗口极小,「多开一个意外的新会话」也并不比「掉线重连」更好。
-            let mut cmd = format!(
-                "tmux has-session -t {q} 2>/dev/null && exec tmux attach -t {q} \
-                 || exec tmux new-session -s {q}"
-            );
-            if let Some(dir) = non_empty(a.work_dir.as_deref()) {
-                // 只挂在 new-session 上:附着已有会话时改它的工作目录是越权。
-                cmd.push_str(&format!(" -c {}", shell_quote(dir)));
-            }
-            let start = start_command(a);
-            if !start.is_empty() {
-                cmd.push(' ');
-                cmd.push_str(&shell_quote(&start));
-            }
-            vec![Step {
+        Some(TmuxChoice::Attach { .. }) => match tmux_session_name(a, fallback_name) {
+            // 没有可用的会话名。宁可什么都不做,也不发 `attach -t ''` 这种残命令。
+            None => Vec::new(),
+            Some(name) => vec![Step {
                 delay: initial,
-                bytes: line(&cmd),
-            }]
-        }
+                bytes: line(&tmux_command(a, &name, false)),
+            }],
+        },
         // `None`(没配)与 `Some(Off)`(显式关)在这里等价。
         _ => build_no_tmux(a, initial),
     }
+}
+
+/// F141:**断线重连**专用的计划。与 [`build_plan`] 逐字节相同,只有一处差别:
+/// `attach` 带上 `-d`。
+///
+/// `-d` 让新 client 把**同一个会话上已有的其他 client 踢掉**。重连场景下那个
+/// 「其他 client」几乎必然是我们自己的残骸:SSH 链路断了,但远端 sshd 与 tmux
+/// 服务器要等 TCP 超时(默认可以是几分钟)才知道,那期间旧 client 还挂在会话上。
+/// 不踢的话两个 client 同时 attach,tmux 的 `window-size` 取 `latest` 会跟着
+/// 两边尺寸反复 reflow、取 `smallest` 会在窗口周围留白 —— 症状是重连之后排版
+/// 莫名其妙,而且要等到远端超时才自愈。
+///
+/// **`-d` 只加在 `attach` 上,绝不能加在 `new-session` 上**:对 `new-session`
+/// 而言 `-d` 是「建好但不 attach」,那会让远端 shell 立刻返回、用户对着一个空
+/// 会话发呆(守护:`reattach_never_puts_the_detach_flag_on_new_session`)。
+///
+/// 返回空 = 这份配置根本不走 tmux(关了 / 没配 / 会话名 sanitize 后为空)。
+/// **不静默回落成「无 tmux 的登录后命令」**——调用方要的是「把之前那个会话接
+/// 回来」,悄悄换成「在新 shell 里重跑一遍命令」是另一回事,该由调用方明写。
+pub fn build_plan_reattach(a: &ResolvedAutomation, fallback_name: &str) -> Vec<Step> {
+    match tmux_session_name(a, fallback_name) {
+        None => Vec::new(),
+        Some(name) => vec![Step {
+            delay: Duration::from_millis(u64::from(a.initial_delay_ms)),
+            bytes: line(&tmux_command(a, &name, true)),
+        }],
+    }
+}
+
+/// F141:这份配置最终会 attach / 新建的 tmux 会话名。`None` = 不走 tmux
+/// (自动化关着 / 没配 tmux / 显式 `Off` / 会话名 sanitize 之后是空的)。
+///
+/// **是 `build_plan` tmux 分支的判据本身**,不是它的复制品 —— 调用方
+/// (app 侧记「这块 pane 到底 attach 了哪个会话」)与计划生成必须永远同口径,
+/// 否则会出现「记着要重连的会话名,和当初真的 attach 上去的那个不是同一个」。
+pub fn tmux_session_name(a: &ResolvedAutomation, fallback_name: &str) -> Option<String> {
+    if !a.enabled {
+        return None;
+    }
+    let Some(TmuxChoice::Attach { session_name }) = &a.tmux else {
+        return None;
+    };
+    let name = sanitize_tmux_name(session_name.as_deref().unwrap_or(fallback_name));
+    (!name.is_empty()).then_some(name)
+}
+
+/// tmux 分支那一行命令。`detach_others` = attach 时带 `-d`(见
+/// [`build_plan_reattach`])。
+///
+/// `name` 必须已经过 `sanitize_tmux_name`(调用方都是从 `tmux_session_name`
+/// 拿的)。
+fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> String {
+    let q = shell_quote(name);
+    // `||` 的回落条件是 `has-session` 探测失败(会话不存在 → 新建),这条路径
+    // 实测正常。但 `exec` 会替换进程镜像:一旦 `attach` 起来了、之后才运行时
+    // 失败(例如会话在探测与 attach 之间被别的客户端 kill),原 shell 已不
+    // 存在,**不会**回落去新建——远端控制进程直接退出、channel 随之关闭。
+    // 已知且接受:竞态窗口极小,「多开一个意外的新会话」也并不比「掉线重连」更好。
+    let d = if detach_others { " -d" } else { "" };
+    let mut cmd = format!(
+        "tmux has-session -t {q} 2>/dev/null && exec tmux attach{d} -t {q} \
+         || exec tmux new-session -s {q}"
+    );
+    if let Some(dir) = non_empty(a.work_dir.as_deref()) {
+        // 只挂在 new-session 上:附着已有会话时改它的工作目录是越权。
+        cmd.push_str(&format!(" -c {}", shell_quote(dir)));
+    }
+    let start = start_command(a);
+    if !start.is_empty() {
+        cmd.push(' ');
+        cmd.push_str(&shell_quote(&start));
+    }
+    cmd
 }
 
 /// 同一份配置,但**跳过 tmux 那一步**:环境变量 / 工作目录 / 登录后命令照跑。
@@ -574,6 +624,135 @@ mod tests {
             build_plan(&a2, "  ").is_empty(),
             "回退名全空白时不得生成计划"
         );
+    }
+
+    /// F141:重连计划与首连计划**只差一个 `-d`**。
+    ///
+    /// 拿整行做差而不是逐个 `contains`:两条分支共用 `tmux_command` 是当下的
+    /// 实现,但没有什么拦得住以后有人把重连那条单独改一笔(加个 `-r`、换个
+    /// 回落策略)。整行相等的断言会当场变红。
+    ///
+    /// 自证会变红:把 `build_plan_reattach` 里的 `true` 改成 `false`。
+    #[test]
+    fn the_reattach_plan_is_the_first_connect_plan_plus_the_detach_flag() {
+        let mut a = resolved(Some(TmuxChoice::Attach { session_name: None }));
+        // 用**完整**配置(工作目录 + env + 命令),不留一条只在简单配置下成立的断言。
+        a.work_dir = Some("/srv".into());
+        a.env = vec![EnvVar {
+            key: "RUST_LOG".into(),
+            value: "debug".into(),
+        }];
+        a.commands = vec![AutomationCommand {
+            text: "claude".into(),
+            delay_ms: None,
+        }];
+
+        let first = text_of(&build_plan(&a, "web01")[0]);
+        let again = text_of(&build_plan_reattach(&a, "web01")[0]);
+        assert!(
+            again.contains("&& exec tmux attach -d -t 'web01'"),
+            "重连要踢掉断线残留的旧 client: {again}"
+        );
+        assert!(
+            !first.contains(" -d"),
+            "首次连接不该踢掉别处正 attach 着的 client: {first}"
+        );
+        assert_eq!(
+            again.replace("attach -d -t", "attach -t"),
+            first,
+            "除了 attach 的 -d,重连计划必须与首连计划逐字相同"
+        );
+        assert_eq!(
+            build_plan_reattach(&a, "web01").len(),
+            1,
+            "同 build_plan:有 tmux 就只发一步"
+        );
+    }
+
+    /// F141:`-d` 对 `new-session` 是「建好但**不** attach」——加错地方的后果是
+    /// 远端 shell 立刻返回,用户对着一个空会话发呆,而且看不出成因。
+    ///
+    /// 自证会变红:把 `tmux_command` 里的 `-d` 从 `attach{d}` 挪到
+    /// `new-session{d}`。
+    #[test]
+    fn reattach_never_puts_the_detach_flag_on_new_session() {
+        let a = resolved(Some(TmuxChoice::Attach { session_name: None }));
+        let line = text_of(&build_plan_reattach(&a, "web01")[0]);
+        assert!(
+            line.contains("|| exec tmux new-session -s 'web01'"),
+            "会话不在了仍要新建: {line}"
+        );
+        assert!(
+            !line.contains("new-session -d"),
+            "-d 加在 new-session 上等于「建了不进去」: {line}"
+        );
+    }
+
+    /// F141:不走 tmux 的配置,重连计划是**空**的 —— 不许静默回落成
+    /// 「在新 shell 里重跑一遍登录后命令」。那是另一回事,该由调用方明写
+    /// (app 侧的 `pending_for_extra_pane`)。
+    ///
+    /// 自证会变红:把 `build_plan_reattach` 的 `None` 分支改成
+    /// `build_no_tmux(a, ..)`。
+    #[test]
+    fn the_reattach_plan_is_empty_when_there_is_no_tmux_to_come_back_to() {
+        let mut off = resolved(Some(TmuxChoice::Off));
+        off.commands = vec![AutomationCommand {
+            text: "claude".into(),
+            delay_ms: None,
+        }];
+        assert!(
+            build_plan_reattach(&off, "web01").is_empty(),
+            "显式关掉 tmux 时不该有重连计划"
+        );
+        assert!(
+            !build_plan_without_tmux(&off).is_empty(),
+            "前提:这份配置本身是有命令要跑的,上面那条断言才不是重言式"
+        );
+        assert!(
+            build_plan_reattach(&resolved(None), "web01").is_empty(),
+            "没配 tmux 时同理"
+        );
+    }
+
+    /// F141:`tmux_session_name` 必须与 `build_plan` 的 tmux 分支同口径 ——
+    /// app 侧靠它记「这块 pane 当初 attach 的是哪个会话」,记岔了就会在重连时
+    /// 把用户接到另一个会话上。
+    #[test]
+    fn the_recorded_session_name_matches_what_the_plan_actually_attaches() {
+        let auto = resolved(Some(TmuxChoice::Attach { session_name: None }));
+        assert_eq!(
+            tmux_session_name(&auto, "web01.prod:2"),
+            Some("web01-prod-2".into()),
+            "回退名要跟计划一样 sanitize"
+        );
+        let explicit = resolved(Some(TmuxChoice::Attach {
+            session_name: Some("claude".into()),
+        }));
+        assert_eq!(
+            tmux_session_name(&explicit, "web01"),
+            Some("claude".into()),
+            "显式名同样胜出"
+        );
+
+        // 三种「没有 tmux 可回」的情形。
+        assert_eq!(
+            tmux_session_name(&resolved(Some(TmuxChoice::Off)), "web01"),
+            None
+        );
+        assert_eq!(tmux_session_name(&resolved(None), "web01"), None);
+        let mut disabled = auto.clone();
+        disabled.enabled = false;
+        assert_eq!(
+            tmux_session_name(&disabled, "web01"),
+            None,
+            "F44 关掉自动化时不该记下任何会话名"
+        );
+
+        // 名字为空 → 计划放弃,记录也必须一起放弃(否则重连会去 attach 一个
+        // 当初根本没建起来的会话)。
+        assert_eq!(tmux_session_name(&auto, "   "), None);
+        assert!(build_plan(&auto, "   ").is_empty(), "两者必须同进同退");
     }
 
     /// 上一条测试的两条 assert 靠 `||` 右边(回退名全空白)才通过——
