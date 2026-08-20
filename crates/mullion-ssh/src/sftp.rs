@@ -133,7 +133,8 @@ pub struct Entry {
     /// 权限位。**只取低 12 位**,类型位已经在 `kind` 里了。
     pub mode: u32,
     /// SFTP 的 attrs 里 uid/gid 是**数字**,协议拿不到 /etc/passwd 映射。
-    /// 界面就老实显示 `1000:1000`,不为此去 exec 一次 `id`(设计 D21)。
+    /// F142 起界面显示名字,靠的是列完目录后单独 exec 一次 `getent`
+    /// (`mullion_app::files::owners`),不是这里能给出的信息。
     pub uid: u32,
     pub gid: u32,
     /// 符号链接的目标。非链接为 `None`。

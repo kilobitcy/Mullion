@@ -8,6 +8,7 @@ use mullion_ssh::sftp::{Entry, EntryKind};
 pub mod drag;
 pub mod fail;
 pub mod local;
+pub mod owners;
 pub mod path_input;
 pub mod queue;
 pub mod state;

@@ -239,10 +239,17 @@ fn menu_target(e: &mullion_ssh::sftp::Entry) -> MenuTarget {
 const W_SIZE: f32 = 78.0;
 const W_MTIME: f32 = 132.0;
 const W_PERM: f32 = 86.0;
-/// D2:属主列(`uid:gid`)。SFTP v3 的 attrs 里 uid/gid 就是数字,而
-/// `russh-sftp 2.4.0` 的客户端 `DirEntry` 不暴露 `longname` —— 名字在协议层
-/// 拿不到,不为此去 exec 一次 `id`(设计 D21)。
-const W_OWNER: f32 = 92.0;
+/// 属主列(`用户名:组名`)。
+///
+/// D2 原本定的是 `uid:gid` 加 92pt —— 理由是「名字在 SFTP 协议层拿不到,
+/// 不为此去 exec」(设计 D21)。**F142 推翻了 D21 的后半句**:用户要看名字,
+/// 于是列完目录后按需批量问一次 `getent`(`files::owners`)。前半句仍然成立,
+/// 这也正是必须额外跑一条命令的原因。
+///
+/// 宽度随之从 92 放到 120:`deploy:docker` 这种两段名字在 92pt 下会被截成
+/// `deploy:doc…`,而属主列**截了就等于没有**(看不出是谁)。用户仍可拖
+/// (F135)。
+const W_OWNER: f32 = 120.0;
 const ROW_H: f32 = 22.0;
 /// D1:图标格子的边长 + 它和名称之间的空隙。
 const W_ICON: f32 = 16.0;
@@ -659,6 +666,9 @@ pub fn show(
     // `rows` 借着 `&state.entries` 不放(它是 `Vec<&Entry>`),闭包里不能再
     // 借一次 `&mut state`——新选中的那条先记局部变量,出了闭包再落回 `state`。
     let selected = state.selected.clone();
+    // F142:属主名字表。跟 `rows` 一样是不可变借用,两者共存没问题;
+    // **不 clone** —— 一份表可能有上百个条目,每帧复制一遍纯属浪费。
+    let owners = &state.owners;
     /// 点中的那一条 + 当时按着的修饰键(ctrl, shift)。F54 的多选语义在
     /// `PaneState::click_row` 里,这里只负责把「点了什么、按着什么」带出闭包。
     type Click = (mullion_ssh::sftp::RemotePath, bool, bool);
@@ -702,7 +712,7 @@ pub fn show(
             ui.set_min_width(total_w);
             for ix in range {
                 let e = rows[ix];
-                let resp = row(ui, t, e, column, selected.contains(&e.name), cols);
+                let resp = row(ui, t, e, column, selected.contains(&e.name), cols, owners);
                 // F58:行既是拖源也是落点。
                 if resp.drag_started() {
                     // 拖一条**没选中**的行:先让它成为唯一选中项。不这么做的话
@@ -926,6 +936,7 @@ fn row(
     column: PanelColumn,
     selected: bool,
     cols: &ColWidths,
+    owners: &crate::files::owners::OwnerNames,
 ) -> egui::Response {
     // `click_and_drag` 而不是 `click`(F58):行要能起拖。`clicked()` /
     // `double_clicked()` 在这个 Sense 下照旧 —— egui 只有在指针真的移出
@@ -1071,7 +1082,7 @@ fn row(
         ),
         egui::Align2::RIGHT_CENTER,
         elide(
-            &owner_text(column, e.uid, e.gid),
+            &owner_text(column, e.uid, e.gid, owners),
             owner_w - crate::ui::metrics::SP_XS,
             Elide::End,
             measure,
@@ -1085,11 +1096,19 @@ fn row(
 /// 属主列文案。**本地栏恒画 `—`**,判据是 `column == PanelColumn::Local`
 /// 而不是 `uid == 0` —— 远端真的有 root 拥有的文件,拿 0 当「没有属主
 /// 信息」的哨兵会让那些文件的属主列也变成 `—`。
-fn owner_text(column: PanelColumn, uid: u32, gid: u32) -> String {
+///
+/// F142:远端栏优先画 `用户名:组名`,名字**还没查到或查不到**时那一段
+/// 回退成数字(`deploy:10001`)。缓存与查询逻辑在 `files::owners`。
+fn owner_text(
+    column: PanelColumn,
+    uid: u32,
+    gid: u32,
+    owners: &crate::files::owners::OwnerNames,
+) -> String {
     if column == PanelColumn::Local {
         "—".to_string()
     } else {
-        format!("{uid}:{gid}")
+        owners.text(uid, gid)
     }
 }
 
@@ -3877,9 +3896,35 @@ mod tests {
     /// 然后这条测试里那个远端 root 文件会画成 `—`。
     #[test]
     fn the_local_column_shows_a_dash_for_owner_but_remote_root_shows_zeros() {
-        assert_eq!(owner_text(PanelColumn::Local, 0, 0), "—");
-        assert_eq!(owner_text(PanelColumn::Remote, 0, 0), "0:0");
-        assert_eq!(owner_text(PanelColumn::Remote, 1000, 1000), "1000:1000");
+        let none = crate::files::owners::OwnerNames::default();
+        assert_eq!(owner_text(PanelColumn::Local, 0, 0, &none), "—");
+        assert_eq!(owner_text(PanelColumn::Remote, 0, 0, &none), "0:0");
+        assert_eq!(
+            owner_text(PanelColumn::Remote, 1000, 1000, &none),
+            "1000:1000"
+        );
+    }
+
+    /// F142:名字查到了就画名字。**本地栏不受影响** —— 它恒画 `—`,哪怕
+    /// 那份表里恰好有同号的 uid(本地栏那份表永远是空的,但判据不能依赖
+    /// 这一点:靠「表是空的」来保证本地栏画 `—`,哪天两栏共用一份缓存就塌了)。
+    ///
+    /// 自证会变红:把 `owner_text` 远端分支的 `owners.text(uid, gid)` 换回
+    /// `format!("{uid}:{gid}")`,第一条断言拿到 `1000:1000`。
+    #[test]
+    fn a_remote_owner_shows_its_name_once_getent_has_answered() {
+        let mut o = crate::files::owners::OwnerNames::default();
+        // 分隔符取生产常量,不抄字面量 —— 抄了的话改分隔符会让这条测试
+        // 假红(它要守的是「名字画出来了」,不是分隔符长什么样)。
+        let sep = crate::files::owners::SEP;
+        o.merge(
+            format!("deploy:x:1000:1000::/home/deploy:/bin/sh\n{sep}\ndocker:x:1000:\n").as_bytes(),
+        );
+        assert_eq!(
+            owner_text(PanelColumn::Remote, 1000, 1000, &o),
+            "deploy:docker"
+        );
+        assert_eq!(owner_text(PanelColumn::Local, 1000, 1000, &o), "—");
     }
 
     /// 质量复核实测:把 `row()` 里权限槽(`lay[3]`)与属主槽(`lay[4]`)
@@ -3927,7 +3972,15 @@ mod tests {
                     let rect =
                         egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(width, ROW_H));
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        row(ui, &t, &e, PanelColumn::Remote, false, &cols);
+                        row(
+                            ui,
+                            &t,
+                            &e,
+                            PanelColumn::Remote,
+                            false,
+                            &cols,
+                            &crate::files::owners::OwnerNames::default(),
+                        );
                     });
                 });
         });
@@ -3937,7 +3990,15 @@ mod tests {
             (human_size(e.size), lay[1]),
             (mtime_text(e.mtime), lay[2]),
             (perm_string(e.mode), lay[3]),
-            (owner_text(PanelColumn::Remote, e.uid, e.gid), lay[4]),
+            (
+                owner_text(
+                    PanelColumn::Remote,
+                    e.uid,
+                    e.gid,
+                    &crate::files::owners::OwnerNames::default(),
+                ),
+                lay[4],
+            ),
         ];
         for (text, (label, _key, left, w)) in expect {
             let pos = find_text_pos(&out.shapes, &text)

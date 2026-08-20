@@ -184,6 +184,20 @@ pub enum UserEvent {
         seq: u64,
         result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
     },
+    /// F142:一次 `getent` 查完了(属主列要显示的用户名/组名)。
+    ///
+    /// **失败也要送回来**(`stdout: None`):发出去那一刻这批 id 已经记进了
+    /// 负缓存(`OwnerNames::take_missing`),不回送的话它们永远不会被再问一次
+    /// —— 一次网络抖动就把这台机器的属主列钉死在数字上。接收方按 `query`
+    /// 撤回负缓存。
+    ///
+    /// 送的是**原始 stdout 而不是解析结果**:解析是纯逻辑,放在窗口线程上
+    /// 跑没有代价,而且能跟 `files::owners` 的单测共用同一条代码路径。
+    OwnerNames {
+        generation: u64,
+        query: crate::files::owners::Query,
+        stdout: Option<Vec<u8>>,
+    },
     /// D2/F54:一次远端写操作跑完了。`Ok(())` = 成功,`Err` = 已经格式化好的
     /// 可读原因。**按世代路由**(S1):用户在一次网络往返期间切了标签,结果
     /// 也要回到发起它的那个标签,不是当前活动标签。
@@ -4052,6 +4066,10 @@ impl App {
                     let Some(files) = tab.content.files_panel_mut() else {
                         return;
                     };
+                    // F142:新连接 = 新的一套 uid/gid 映射。同一个 1000 在
+                    // 两台机器上是两个人,不清就是把 A 机的名字画在 B 机的
+                    // 文件上(换节点、断线重连都会走到这里)。
+                    files.remote.owners.clear();
                     files.remote.begin_load(dir.clone())
                 };
                 let task =
@@ -4082,12 +4100,20 @@ impl App {
         seq: u64,
         result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
     ) {
+        // F142:这一屏出现了哪些还没问过名字的 uid/gid。在借用块里算、出块
+        // 之后再发 —— `spawn` 要 `&self._runtime`/`&self.proxy`,而这里
+        // `tab` 攥着 `&mut self.tabs`。
+        let mut ask: Option<crate::files::owners::Query> = None;
         if let Some(tab) = self.tabs.by_generation_mut(generation) {
             if let Some(files) = tab.content.files_panel_mut() {
                 let pane = &mut files.remote;
                 match result {
                     Ok(entries) => {
                         pane.accept(seq, Ok(entries));
+                        // **`accept` 之后才问**:它内部会按 `seq` 丢弃后发先至
+                        // 的旧结果,拿被丢弃的那批 entries 去问就是白跑一趟
+                        // 网络往返(而且会把一批用不上的 id 记进负缓存)。
+                        ask = pane.owners.take_missing(&pane.entries);
                     }
                     Err(msg) => {
                         // `PaneState::accept` 收到 `Err` 时恒落 `Load::Failed`,
@@ -4136,8 +4162,61 @@ impl App {
                     }
                 }
             }
+            // F142:连接刚被判定死亡时**不问** —— 那条命令一定失败,徒增一次
+            // 无谓往返。负缓存不撤也没关系:重开连接时 `accept_sftp_opened`
+            // 会把整份缓存清掉。
+            //
+            // 取连接的方式与 `trigger_sftp_open` 同源(`sftp_connection_for`
+            // 收掉了两种宿主的差异),但这里用**已落定的** `sftp_host_ix` 而不是
+            // `focused_pane_host_ix`:名字要查的是「这批 entries 是从哪台机器
+            // 列出来的」,不是「用户此刻焦点在哪台」——列目录那一次网络往返
+            // 期间用户可能刚换过节点,拿焦点那台去问就是在 B 机上查 A 机的 uid。
+            let conn = tab
+                .content
+                .sftp_connection_for(tab.content.sftp_host_ix())
+                .filter(|_| !just_disconnected);
+            match (ask.take(), conn) {
+                (Some(q), Some(conn)) => {
+                    let task = spawn_getent(&self._runtime, &self.proxy, generation, conn, q);
+                    self.track_sftp_task(generation, task);
+                }
+                // 问不成:把负缓存撤回,下次列目录重新问(同 `spawn_getent`
+                // 失败那条路)。
+                (Some(q), None) => {
+                    if let Some(tab) = self.tabs.by_generation_mut(generation) {
+                        if let Some(files) = tab.content.files_panel_mut() {
+                            files.remote.owners.forget(&q);
+                        }
+                    }
+                }
+                (None, _) => {}
+            }
         } else {
             log::debug!(target: "mullion", "丢弃过期世代 {generation} 的目录列表(seq={seq})");
+        }
+        self.ui_dirty = true;
+        self.request_ui_redraw();
+    }
+
+    /// F142:一次 `getent` 的结果落地。世代对不上就丢(S1,同 `accept_sftp_listed`);
+    /// **`stdout: None`(没发出去/远端拒了)要撤回负缓存**,否则这批 id 再也
+    /// 不会被问第二次。
+    fn accept_owner_names(
+        &mut self,
+        generation: u64,
+        query: crate::files::owners::Query,
+        stdout: Option<Vec<u8>>,
+    ) {
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
+            log::debug!(target: "mullion", "丢弃过期世代 {generation} 的属主名字");
+            return;
+        };
+        let Some(files) = tab.content.files_panel_mut() else {
+            return;
+        };
+        match stdout {
+            Some(out) => files.remote.owners.merge(&out),
+            None => files.remote.owners.forget(&query),
         }
         self.ui_dirty = true;
         self.request_ui_redraw();
@@ -6253,6 +6332,13 @@ impl ApplicationHandler<UserEvent> for App {
                 result,
             } => {
                 self.accept_sftp_listed(generation, seq, result);
+            }
+            UserEvent::OwnerNames {
+                generation,
+                query,
+                stdout,
+            } => {
+                self.accept_owner_names(generation, query, stdout);
             }
             UserEvent::SftpOpDone { generation, result } => {
                 match result {
@@ -8482,6 +8568,45 @@ fn spawn_sftp_list_dir(
             generation,
             seq,
             result,
+        });
+    })
+}
+
+/// F142:异步问一批 uid/gid 的名字。结果经 `UserEvent::OwnerNames` 回送
+/// (`App::accept_owner_names` 接)。
+///
+/// **成败都回送**:失败时送 `stdout: None`,接收方据此撤回负缓存。静默失败
+/// 的后果是这批 id 在这条连接的余生里永远显示成数字。
+///
+/// 同样**返回 `JoinHandle`,调用方必须存进 `sftp_tasks`** —— 理由同
+/// `spawn_sftp_list_dir`:关标签/断连时要能立刻收口,而不是等这条 exec
+/// 自己的网络超时。
+fn spawn_getent(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    conn: Arc<SshConnection>,
+    query: crate::files::owners::Query,
+) -> tokio::task::JoinHandle<()> {
+    let proxy = proxy.clone();
+    runtime.spawn(async move {
+        let stdout = match mullion_ssh::exec::exec(&conn, query.command()).await {
+            // 退出码**不看**:`getent` 一个 id 都没查到时返回 2,而那是完全
+            // 正常的结果(容器里的孤儿 uid)。有多少条解出多少条,`parse`
+            // 自己会跳过垃圾行。
+            Ok(out) => Some(out.stdout),
+            Err(e) => {
+                // sftp-only 账号(`ForceCommand internal-sftp`)会走到这儿 ——
+                // 属主列退回数字,别的功能照常。不弹 toast:用户没主动要过
+                // 这次查询,为它弹一个错误框是噪音。
+                log::debug!(target: "mullion", "getent 查属主名字失败:{e}");
+                None
+            }
+        };
+        let _ = proxy.send_event(UserEvent::OwnerNames {
+            generation,
+            query,
+            stdout,
         });
     })
 }
@@ -10978,8 +11103,11 @@ mod tests {
             .split("fn accept_sftp_listed(")
             .nth(1)
             .expect("找不到 accept_sftp_listed 的定义");
+        // 结尾锚点 = 紧跟它的下一个 item 的**签名**(F142 起是
+        // `accept_owner_names`)。切到签名为止、不进那个函数体 —— 进去了的话
+        // 它体内的 `by_generation_mut` 会替 `accept_sftp_listed` 顶包。
         let body = &after[..after
-            .find("\n    /// UI 侧变了")
+            .find("\n    fn accept_owner_names(")
             .expect("找不到 accept_sftp_listed 的函数结尾")];
         assert!(
             body.contains(".by_generation_mut(generation)"),
@@ -11006,7 +11134,7 @@ mod tests {
             .nth(1)
             .expect("找不到 accept_sftp_listed 的定义");
         let body = &after[..after
-            .find("\n    /// UI 侧变了")
+            .find("\n    fn accept_owner_names(")
             .expect("找不到 accept_sftp_listed 的函数结尾")];
         assert!(
             body.contains("crate::files::fail::classify(&msg)"),
@@ -11093,7 +11221,7 @@ mod tests {
             .nth(1)
             .expect("找不到 accept_sftp_listed 的定义");
         let body = &after[..after
-            .find("\n    /// UI 侧变了")
+            .find("\n    fn accept_owner_names(")
             .expect("找不到 accept_sftp_listed 的函数结尾")];
 
         // 「读到 Disconnected 状态」这一句必须存在,且清槽位的代码要跟着
@@ -11123,6 +11251,95 @@ mod tests {
             trigger_after.contains("tab.content.sftp_client().is_some() || already_loading"),
             "trigger_sftp_open 的短路守卫变了 —— 需要重新核对「清槽位能解锁\
              重连」这条因果链是否还成立"
+        );
+    }
+
+    /// **接线守护**(F142):属主名字这条链的三个接头。`App` 单测里造不出来
+    /// (`EventLoopProxy`),只能扎源码结构;验证边界与本文件其余同类守护一样,
+    /// 挡得住「整段被删/退回旧写法」,挡不住等价改写。
+    ///
+    /// 三条各自的失效后果:
+    /// 1. 不在 `accept` 之后问 → 拿被 seq 丢弃的旧 entries 去问,白跑一次
+    ///    网络往返,还把一批用不上的 id 记进负缓存;
+    /// 2. 拿焦点那台机器去问 → 在 B 机上查 A 机的 uid,画出来的名字是错的
+    ///    (比不显示更糟:用户没法分辨);
+    /// 3. 换连接不清缓存 → 同上,只是触发点换成「换节点/重连」。
+    ///
+    /// 自证会变红:分别删掉 `accept_sftp_listed` 里的 `take_missing`、把
+    /// `sftp_host_ix()` 换成 `focused_pane_host_ix()`、删掉
+    /// `accept_sftp_opened` 里的 `owners.clear()`。
+    #[test]
+    fn owner_names_are_asked_on_the_right_host_at_the_right_time() {
+        let src = include_str!("app.rs");
+        let listed_after = src
+            .split("fn accept_sftp_listed(")
+            .nth(1)
+            .expect("找不到 accept_sftp_listed 的定义");
+        let listed = &listed_after[..listed_after
+            .find("\n    fn accept_owner_names(")
+            .expect("找不到 accept_sftp_listed 的函数结尾")];
+
+        let accept_at = listed
+            .find("pane.accept(seq, Ok(entries));")
+            .expect("accept_sftp_listed 里找不到落地 entries 那一句");
+        let ask_at = listed
+            .find("owners.take_missing(")
+            .expect("accept_sftp_listed 没有发起属主名字查询 —— 属主列会永远是数字");
+        assert!(
+            accept_at < ask_at,
+            "属主名字查询发在 `pane.accept` **之前** —— 被 seq 丢弃的那批 entries \
+             也会被拿去问一遍"
+        );
+        assert!(
+            listed.contains("sftp_connection_for(tab.content.sftp_host_ix())"),
+            "accept_sftp_listed 查属主名字用的不是「列出这批 entries 的那台机器」\
+             —— 换节点期间会在 B 机上查 A 机的 uid"
+        );
+
+        let opened_after = src
+            .split("fn accept_sftp_opened(")
+            .nth(1)
+            .expect("找不到 accept_sftp_opened 的定义");
+        let opened = &opened_after[..opened_after
+            .find("\n    fn accept_sftp_listed(")
+            .expect("找不到 accept_sftp_opened 的函数结尾")];
+        assert!(
+            opened.contains("owners.clear()"),
+            "换到新连接时没清属主名字缓存 —— 同一个 uid 在两台机器上是两个人"
+        );
+    }
+
+    /// **接线守护**(F142):`getent` 跑失败也必须回送 `UserEvent::OwnerNames`。
+    ///
+    /// 发出去那一刻这批 id 已经记进负缓存(`OwnerNames::take_missing` 的语义),
+    /// 静默失败 = 它们在这条连接的余生里永远显示成数字,而且没有任何症状可查。
+    ///
+    /// 自证会变红:把 `spawn_getent` 里 `Err` 分支的 `None` 换成
+    /// `return`(即失败就不回送)。
+    #[test]
+    fn a_getent_that_failed_still_reports_back_so_the_cache_rolls_back() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn spawn_getent(")
+            .nth(1)
+            .expect("找不到 spawn_getent 的定义");
+        let body = &after[..after
+            .find("\n/// 采纳一次拨测结果")
+            .expect("找不到 spawn_getent 的函数结尾")];
+        let err_at = body
+            .find("Err(e) =>")
+            .expect("spawn_getent 没有处理 exec 失败(sftp-only 账号会走到这条路)");
+        assert!(
+            !body[err_at..].contains("return"),
+            "spawn_getent 的失败分支提前 return 了 —— 负缓存撤不回来,\
+             这批 uid 在这条连接上永远显示成数字"
+        );
+        let send_at = body
+            .find("send_event(UserEvent::OwnerNames")
+            .expect("spawn_getent 没有回送结果");
+        assert!(
+            err_at < send_at,
+            "回送发生在失败分支之前 —— 失败那条路走不到回送"
         );
     }
 

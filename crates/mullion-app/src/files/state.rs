@@ -60,6 +60,12 @@ pub struct PaneState {
     /// 重复请求——这个前提不成立的话,这里就不是「不需要额外互斥」,而是
     /// 「谁都退不出去」。
     pub path_edit: Option<String>,
+    /// F142:这条连接上的 uid/gid → 名字缓存。**本地栏那份永远是空的**
+    /// (本地栏属主列恒画 `—`,见 `ui::files_panel::owner_text`)。
+    ///
+    /// 挂在栏上而不是标签上:一栏对应一条连接,换连接时只需清这一份
+    /// (`OwnerNames::clear`,调用点在 `app.rs` 拿到新 SFTP client 那一刻)。
+    pub owners: super::owners::OwnerNames,
 }
 
 impl PaneState {
@@ -76,6 +82,7 @@ impl PaneState {
             anchor: None,
             request_seq: 0,
             path_edit: None,
+            owners: super::owners::OwnerNames::default(),
         }
     }
 
