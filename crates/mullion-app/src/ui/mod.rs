@@ -7,6 +7,7 @@ pub mod editor_window;
 pub mod file_icon;
 pub mod files_dialog;
 pub mod files_panel;
+pub mod glyphs;
 pub mod group_manager;
 pub mod host_key;
 pub mod ico;
