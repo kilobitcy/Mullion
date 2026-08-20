@@ -94,3 +94,7 @@ pollster = "0.4"
 # 字形白名单守护(`ui::glyphs`)要判「这个字符在不在 GBK 里」——GBK 是
 # 微软雅黑字形覆盖面的实用近似。**只在 test target 生效**,不进 exe。
 encoding_rs = "0.8"
+# 字形白名单守护要**只看字符串字面量、不看注释**。正则做不到(注释里
+# 随手写个引号就崩),所以走真正的 Rust 词法分析。`span-locations` 是
+# 为了报错时能给出行号 —— 一条 U+XXXX 没有行号谁也定位不了。
+proc-macro2 = { version = "1", features = ["span-locations"] }

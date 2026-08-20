@@ -2554,6 +2554,7 @@ dependencies = [
  "mullion-store",
  "mullion-term",
  "pollster",
+ "proc-macro2",
  "rfd",
  "russh",
  "tempfile",
