@@ -64,3 +64,26 @@ base64 = "0.22"
 # `default-features = false` + 只开 `alloc`:默认特性会带上 `rand`,而我们的熵
 # 已经走 chacha20poly1305 的 OsRng,不需要第二条随机源(N6 exe 体积)。
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+
+# N6(安装包 < 25MB)。在这之前 release 用的是 cargo 默认值,交叉编译出来的
+# exe 是 38.6 MiB —— 超标 54%,而且从来没有任何自动化盯着它。
+#
+# 实测(x86_64-pc-windows-gnu,同一份源码,只换 profile):
+#   默认            38.6 MiB
+#   lto+cgu=1       17.1 MiB  ← 采用
+#   +strip          15.4 MiB
+#   +panic=abort    13.9 MiB
+#
+# **刻意不开 strip**:LTO 把海量单态化重复符号合并掉了(符号数 107433 → 22345),
+# strip 的收益从 10.6 MiB 塌缩到 1.7 MiB;而代价是 `logx.rs` 那个 panic 钩子
+# 落盘的 backtrace 从函数名退化成一串十六进制地址。ADR-008 说过,GUI 子系统
+# 没控制台、事件日志不记进程挂起,那份 backtrace 是唯一能拿到的现场。
+#
+# **刻意不开 panic=abort**:再省 1.5 MiB,但 `dragout/win.rs` 的 catch_unwind
+# (拖出线程 panic 不能带走整个进程)会当场失效,tokio 的任务级 panic 隔离也一起
+# 没了 —— 任何一条 SSH/SFTP 后台任务 panic 都会直接杀掉 app。
+#
+# 代价:release 构建约 2 分钟(实测)。日常 `cargo test` 走 dev profile,不受影响。
+[profile.release]
+lto = "fat"
+codegen-units = 1
