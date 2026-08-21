@@ -878,6 +878,7 @@ pub fn show(
     //   `ScrollArea` 实际占多高,状态行的 y 坐标恒定卡在列头正下方几像素。
     //   排在这里、`ScrollArea` 刚结束、`header_at` 还没跑的位置,才用得上
     //   `ScrollArea` 自己推进的光标(见上面 `body_h` 那条注释)。
+    //   守护:`tests::the_status_row_is_drawn_below_the_last_row_not_under_the_header`。
     ui.add_space(crate::ui::metrics::SP_XS);
     ui.colored_label(theme::c32(t.fg_dim), state.status_text());
     // F136:把列头补画在上面占住的横带里,用的是调用 `show_rows` 之前
@@ -3278,6 +3279,65 @@ mod tests {
             find_text_pos(&out.shapes, "2 项").is_some(),
             "远端栏两条都没选中,状态行该显示「2 项」;`ScrollArea` 没有
              `max_height` 兜底时,这个部件会从渲染输出里整个消失"
+        );
+    }
+
+    /// F150:钉住「状态行必须画在 `header_at` 补画列头之前」这条不变量
+    /// (`show()` 里那段长注释)。此前这条只写在注释里,没有任何断言 ——
+    /// 把状态行那两行挪到 `header_at(...)` 之后,既有 70 条测试全绿。
+    ///
+    /// 判据是**相对位置**,不是绝对像素:
+    /// - `status.y > last_row.y`:状态行必须落在最后一行内容**下方**。
+    /// - `status.y > header.y + ROW_H`:状态行与列头之间至少隔开一整行高。
+    ///   两条一起判是因为单看「低于列头」不够狠 —— `header_at` 出 bug 时
+    ///   状态行会被拽到贴着列头的位置,`status.y` 仍然略大于 `header.y`
+    ///   (只差几像素),只判「大于」测不出这种「贴着但没真的排到栏底」的坏法,
+    ///   必须再加一条「差距要有一整行那么大」。
+    ///
+    ///   不用绝对阈值(比如「`status.y` 必须 > 300」):窗口尺寸、行数、
+    ///   `raw()` 给的 1200×800 只要改一个,阈值就得跟着重算,而相对关系
+    ///   (「状态行在列头下方一整行开外」「状态行在最后一行内容下方」)
+    ///   在任何窗口尺寸下都成立。
+    ///
+    /// 三个锚点都取远端栏独有的文字,避免撞到本地栏同名的列头/计数:
+    /// - `"属主"`:F146 本地栏没有这一列,只有远端栏画得出来。
+    /// - `"b.txt"`:只在远端栏的测试数据里。
+    /// - `"2 项"`:远端栏两条、本地栏一条,计数不会撞。
+    #[test]
+    fn the_status_row_is_drawn_below_the_last_row_not_under_the_header() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            ctx.run(input, |ctx| {
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+            })
+        };
+        // 两帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop,同本文件
+        // 其余测试的既定做法)。
+        let _ = render(raw(None), &mut frame);
+        let out = render(raw(None), &mut frame);
+
+        let header = find_text_pos(&out.shapes, "属主").expect("远端栏该有「属主」列头");
+        let last_row = find_text_pos(&out.shapes, "b.txt").expect("远端栏该画出 b.txt 这一行");
+        let status = find_text_pos(&out.shapes, "2 项").expect("远端栏状态行该显示「2 项」");
+
+        assert!(
+            status.y > last_row.y,
+            "状态行 y={} 应落在最后一行内容 y={} 下方 —— 状态行被画到了
+             行体上面或与之重叠,像是排到了栏中间而不是栏底",
+            status.y,
+            last_row.y
+        );
+        assert!(
+            status.y > header.y + ROW_H,
+            "状态行 y={} 应比列头 y={} 至少低一个 ROW_H —— 差距不够说明状态行
+             被 `header_at` 的 `scope_builder` 拽回了列头附近(收尾时
+             `advance_cursor_after_rect` 对 TopDown 是硬赋值),而不是排在
+             `ScrollArea` 内容之后",
+            status.y,
+            header.y
         );
     }
 
