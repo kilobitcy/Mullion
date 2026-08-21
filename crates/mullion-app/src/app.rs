@@ -853,6 +853,30 @@ fn effective_focus_of(
     }
 }
 
+/// F149:这次 IME 事件该不该落到终端。
+///
+/// **判据直接复用 `route_focused`,不另起一套。** IME 就是键盘输入的一种,
+/// 只是走了 `WindowEvent::Ime` 这条另外的路;两套判据迟早会在维护里分叉,
+/// 而分叉的后果是「某些情况下中文又漏进远端 shell」这种间歇性、极难查的故障。
+///
+/// 抽成不依赖 `App` 的自由函数是为了能单测 —— `App` 在无头环境里造不出来。
+fn ime_goes_to_terminal_of(
+    focus: shell::input_route::Focus,
+    modal_open: bool,
+    egui_wants_keyboard: bool,
+) -> bool {
+    matches!(
+        shell::input_route::route_focused(
+            focus,
+            modal_open,
+            egui_wants_keyboard,
+            false,
+            shell::input_route::InputKind::Keyboard,
+        ),
+        shell::input_route::Route::Terminal
+    )
+}
+
 /// `App::move_panel_selection` 的下标数学核心。抽成不依赖 `App`/`Tabs` 的
 /// 自由函数,理由同上面几个 `_of` 函数——这段是这次改动里唯一有算法复杂度
 /// 的部分(代码复核 #3),此前只有靠 generation 路由的结构守护测试,边界
@@ -6919,39 +6943,75 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_resize(size.width, size.height);
             }
             // 输入法(F21):中文/日文的字是从这条路进来的,不是 `KeyboardInput`。
-            // `set_ime_allowed(true)` 在 `resumed` 里开,不开这条事件根本不会发。
+            // `set_ime_allowed(true)` 在 `resumed` 里开,egui 想关掉它的那次调用
+            // 被 F149 的账本按压拦住了(见 `input::ime_ledger_clamp`)。
             WindowEvent::Ime(ime) => {
-                match &ime {
-                    winit::event::Ime::Preedit(text, _) => {
-                        self.ime.on_preedit(text);
-                        // F125:拼音现在内联上屏,组字中敲字母也算「输入」——
-                        // 不重置的话光标可能闪到暗周期,用户敲拼音时观感是丢帧。
-                        self.last_input_at = Instant::now();
-                    }
-                    winit::event::Ime::Commit(text) => {
-                        self.ime.on_commit();
-                        // F125:输入法提交也是输入,重置闪烁相位。
-                        self.last_input_at = Instant::now();
-                        // 组字结果按用户输入对待:先回底部(否则「打了但看不到」,
-                        // 与按键/粘贴同一条口径),再写焦点 pane。
-                        if let Some(bytes) = input::ime_commit_bytes(text) {
-                            if let Some(pane) =
-                                self.active_ws_mut().and_then(Workspace::focused_mut)
-                            {
-                                pane.emulator.selection_clear();
-                                pane.emulator.scroll_to_bottom();
-                                let _ = pane.pty.write(bytes);
-                                // F40:用户接管,自动化让位(借用已释放)。
-                                self.user_took_over();
+                // F149:这条事件此前**没有**过输入分流 —— 上面的 `is_kbd` 只匹配
+                // `KeyboardInput`,于是 Ime 一路喂给了 egui、又一路写进焦点 pane
+                // 的 PTY:在会话名 / 标签改名 / 路径条里打的中文会同时上屏和发到
+                // 远端 shell(混在命令行里不显眼,所以一直没人报)。
+                //
+                // 已知缺口(复核挖出,故意不修):归属是按**每个 Ime 子事件**现算的,
+                // 不是按「一次组字」锁定的。用户在 egui 文本框里敲拼音、组字还没
+                // 确认就点回终端,随后那条 `Ime::Commit` 会跟着新焦点算成
+                // `to_terminal == true`,本该进表单的中文被写进远端 shell;反过来
+                // (终端组字中途点进 egui)不泄漏,但会被下面的 `on_disabled()` 清掉
+                // 打了一半的拼音,观感是「字凭空消失」。两个方向各错一半——锁定归属
+                // 会让「终端组字中途点进 egui 再提交」把字打进终端,同样是错的,而
+                // 且现状已经严格优于修复前(修复前是任何时候都双写)。彻底解法要能
+                // 在焦点切换时打断 OS 的组字,超出本次范围。
+                let to_terminal = ime_goes_to_terminal_of(
+                    self.effective_focus(),
+                    self.modal_open(),
+                    self.active
+                        .as_ref()
+                        .is_some_and(|a| a.egui_ctx.wants_keyboard_input()),
+                );
+                if to_terminal {
+                    match &ime {
+                        winit::event::Ime::Preedit(text, _) => {
+                            self.ime.on_preedit(text);
+                            // F125:拼音现在内联上屏,组字中敲字母也算「输入」——
+                            // 不重置的话光标可能闪到暗周期,用户敲拼音时观感是丢帧。
+                            self.last_input_at = Instant::now();
+                        }
+                        winit::event::Ime::Commit(text) => {
+                            self.ime.on_commit();
+                            // F125:输入法提交也是输入,重置闪烁相位。
+                            self.last_input_at = Instant::now();
+                            // 组字结果按用户输入对待:先回底部(否则「打了但看不到」,
+                            // 与按键/粘贴同一条口径),再写焦点 pane。
+                            if let Some(bytes) = input::ime_commit_bytes(text) {
+                                if let Some(pane) =
+                                    self.active_ws_mut().and_then(Workspace::focused_mut)
+                                {
+                                    pane.emulator.selection_clear();
+                                    pane.emulator.scroll_to_bottom();
+                                    let _ = pane.pty.write(bytes);
+                                    // F40:用户接管,自动化让位(借用已释放)。
+                                    self.user_took_over();
+                                }
                             }
                         }
+                        winit::event::Ime::Enabled => {}
+                        winit::event::Ime::Disabled => self.ime.on_disabled(),
                     }
-                    winit::event::Ime::Enabled => {}
-                    winit::event::Ime::Disabled => self.ime.on_disabled(),
+                    // F126:preedit 串变了,候选框该跟去拼音串末尾——不补这一句,
+                    // 候选框位置要等下一次别的事件才更新,组字时肉眼可见地滞后一拍。
+                    self.apply_ime_cursor_area();
+                } else {
+                    // 这串拼音是打给 egui 的。终端侧的组字状态**必须清掉**:
+                    // 留着的话 F126 会把它内联画在终端光标处(用户在会话名框里
+                    // 打字,终端上跟着显示拼音),而且 `swallows_key()` 恒 true
+                    // 会让终端永久吞键 —— 与 `ImeState` 少认一条结束边同一类故障。
+                    self.ime.on_disabled();
+                    // 候选框位置的记账作废:egui 自己会调 `set_ime_cursor_area`
+                    // 把框摆到它的文本框那儿(egui-winit `lib.rs:863`),而我们的
+                    // `ime_cursor_area` 没跟着变。不作废的话,回到终端组字时若算出
+                    // 的 area 与记账值相同,`apply_ime_cursor_area` 会在第一行早退,
+                    // 候选框一直停在那个文本框原来的位置。
+                    self.ime_cursor_area = None;
                 }
-                // F126:preedit 串变了,候选框该跟去拼音串末尾——不补这一句,
-                // 候选框位置要等下一次别的事件才更新,组字时肉眼可见地滞后一拍。
-                self.apply_ime_cursor_area();
                 self.request_ui_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -9425,10 +9485,10 @@ mod tests {
         autoscroll_for_pane, blink_on_at, blink_wake_at, credential_delete_error, download_job,
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, font_px_for, has_real_action, ime_cursor_area,
-        next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
-        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title, tmux_attach_for_connect,
-        upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab,
-        TmuxAttach,
+        ime_goes_to_terminal_of, next_panel_selection_index, pane_still_wanted, reattach_pane,
+        rehost_pane, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title,
+        tmux_attach_for_connect, upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -12224,6 +12284,85 @@ mod tests {
             "effective_focus_of 在活动标签是 Files 时必须恒返回 \
              Focus::FilesPanel —— 那种标签没有终端可回,按 Terminal 路由的话\
              方向键/回车会去找一个不存在的 pane,静默无反应"
+        );
+    }
+
+    /// F149:IME 事件该不该落到终端,判据与普通键盘完全一致 —— 它就是键盘输入
+    /// 的一种,只是走了另一条 winit 事件。四种组合都断言:只测一种的话,一份
+    /// 「恒 true」或「恒 false」的实现有一半概率蒙混过去。
+    #[test]
+    fn ime_reaches_the_terminal_only_when_the_keyboard_would() {
+        use crate::shell::input_route::Focus;
+        assert!(
+            ime_goes_to_terminal_of(Focus::Terminal, false, false),
+            "终端聚焦、无模态、egui 不要键盘 → 中文该进终端"
+        );
+        assert!(
+            !ime_goes_to_terminal_of(Focus::Terminal, false, true),
+            "egui 文本框正拿着键盘焦点 → 中文是打给它的,不能同时发到远端 shell"
+        );
+        assert!(
+            !ime_goes_to_terminal_of(Focus::FilesPanel, false, false),
+            "焦点在文件面板 → 不该往终端写"
+        );
+        assert!(
+            !ime_goes_to_terminal_of(Focus::Terminal, true, false),
+            "模态弹窗开着 → 一切归 egui"
+        );
+    }
+
+    /// F149:IME 不归终端的那条分支,必须清掉组字状态并作废候选框记账。
+    ///
+    /// 少了 `on_disabled()`,终端会永久吞键(`swallows_key()` 恒 true)且把别人的
+    /// 拼音内联画在自己光标处;少了 `ime_cursor_area = None`,回到终端组字时候选框
+    /// 会停在 egui 文本框原来的位置。两条都编译得过、都只有人眼能发现。
+    ///
+    /// `App` 在无头环境造不出来,只能扎源码结构。按 `} else {` 切出那条分支的体,
+    /// 并断言切出来的确实比整段短(否则退化成扫全文件,恒绿)。
+    ///
+    /// **两个 `split` 锚点都带 `\n` 前缀**:不带的话,`let to_terminal =
+    /// ime_goes_to_terminal_of(` 这串字面量在本文件里会命中两次——真调用点一次,
+    /// 加上本测试自己那句 `.split("…")` 里的字面量一次。`split` 只取第一处,
+    /// 目前恰好是真调用点排在前面所以结果碰巧对,但这是运气,不是保证:一旦
+    /// 两处顺序换了,`after` 会从「真调用点之后的代码」膨胀成「测试自己那行
+    /// 之后的几乎整个文件」,下面 `else_body.len() < after.len()` 的自检随之
+    /// 形同虚设(`after` 本身已经是半个文件,谁都比它短)。带 `\n` 前缀后,
+    /// 只有真正顶格缩进 16 空格、前面是换行符的那一处(真调用点)才会命中,
+    /// 测试自己那句因为前面是 `.split("` 而不是换行,不会被算进去。
+    /// 光加前缀还不够——为了不让「唯一性」退化成又一条靠运气的假设,下面显式
+    /// 断言 `matches().count() == 1`,把它钉成保证而不是巧合。
+    #[test]
+    fn ime_that_is_not_for_the_terminal_clears_composition_and_invalidates_the_candidate_box() {
+        let src = include_str!("app.rs");
+        let call_site = "\n                let to_terminal = ime_goes_to_terminal_of(";
+        assert_eq!(
+            src.matches(call_site).count(),
+            1,
+            "锚点必须在本文件里唯一 —— 出现两次的话 split 取到哪一处就成了运气,\
+             切出来的 after 会膨胀到大半个文件,下面那句 len 自检随之失效"
+        );
+        let after = src
+            .split(call_site)
+            .nth(1)
+            .expect("找不到 F149 的 IME 分流接线");
+        let else_body = after
+            .split("\n                } else {")
+            .nth(1)
+            .expect("找不到 IME 不归终端的那条分支");
+        let else_body = &else_body[..else_body
+            .find("\n                }")
+            .expect("找不到 else 分支的结尾")];
+        assert!(
+            else_body.len() < after.len(),
+            "没切出分支体,断言会退化成扫全文件"
+        );
+        assert!(
+            else_body.contains("self.ime.on_disabled();"),
+            "IME 不归终端时必须清组字状态,否则终端永久吞键:{else_body}"
+        );
+        assert!(
+            else_body.contains("self.ime_cursor_area = None;"),
+            "IME 不归终端时必须作废候选框记账,否则候选框停在 egui 文本框那儿:{else_body}"
         );
     }
 
