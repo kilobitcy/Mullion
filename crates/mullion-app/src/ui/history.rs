@@ -128,7 +128,7 @@ pub fn show(
             annotate::mark(ui.ctx(), "恢复现场弹窗", ui.max_rect());
             ui.label(theme::hint_text(
                 t,
-                "选一条摆回标签栏。摆回来的标签不会自动连接,点「重连」才拨号。",
+                "选一条摆回标签栏,会一条接一条自动重连。",
             ));
             ui.add_space(SP_M);
             egui::ScrollArea::vertical()
@@ -179,11 +179,16 @@ pub fn show(
                             egui::FontId::proportional(12.0),
                             theme::c32(t.fg_dim),
                         );
+                        // F153-b:**单击即恢复**。原来是「单击选中 + 双击恢复」,
+                        // 用户报的是「点了没反应」—— 双击在高延迟远程桌面/触控板
+                        // 上本来就不好按,而这个弹窗只有一件事可做。
+                        //
+                        // `selected` 与「恢复」按钮都留着:那是键盘路径的出口。
+                        //
+                        // 不再单列 `double_clicked()` 分支:双击的第一次点击已经
+                        // 置过 `clicked()`,那条是死代码。
                         if resp.clicked() {
                             d.selected = i;
-                        }
-                        // 双击 = 选中并恢复,与会话管理器双击连接一致。
-                        if resp.double_clicked() {
                             out = Some(HistoryOut::Restore(row.id.clone()));
                         }
                     }
@@ -362,7 +367,7 @@ mod tests {
         let pos = shapes
             .iter()
             .find_map(|cs| find(&cs.shape, label))
-            .unwrap_or_else(|| panic!("弹窗里没有写着「{label}」的按钮"));
+            .unwrap_or_else(|| panic!("弹窗里没有写着「{label}」的控件"));
         let mut input = egui::RawInput::default();
         for pressed in [true, false] {
             input.events.push(egui::Event::PointerButton {
@@ -377,6 +382,13 @@ mod tests {
             out = show(ctx, &t, draft);
         });
         out
+    }
+
+    /// 点第 `i` 行的中央。拿那一行的 `head` 文字当锚点 —— 它就画在那一行的
+    /// rect 里,不必自己算行高(行高改了这里也不会跟着坏)。
+    fn click_row(draft: &mut Option<HistoryDraft>, i: usize) -> Option<HistoryOut> {
+        let head = draft.as_ref().expect("草稿").rows[i].head.clone();
+        click(draft, &head)
     }
 
     /// `None` 的草稿什么都不画 —— 弹窗关着就是关着。
@@ -431,5 +443,33 @@ mod tests {
             });
         }
         assert_eq!(out, None);
+    }
+
+    /// F153-b:单击一行就恢复那一条,不用再去够「恢复」按钮。用户报的原话是
+    /// 「点了没反应」—— 原来要双击。
+    ///
+    /// 自证会变红:把 `clicked()` 分支改回只写 `d.selected = i`。
+    #[test]
+    fn clicking_a_row_restores_that_record_right_away() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        assert_eq!(
+            click_row(&mut draft, 1),
+            Some(HistoryOut::Restore("b".into()))
+        );
+    }
+
+    /// F153:提示语必须跟行为一致。自动重连之后,「点「重连」才拨号」是假话
+    /// —— 用户照着它等,以为程序没反应。
+    ///
+    /// 自证会变红:把那句文案改回去。
+    #[test]
+    fn the_hint_no_longer_promises_a_manual_reconnect() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        let joined = texts(&mut draft).join(" ");
+        assert!(
+            !joined.contains("点「重连」才拨号"),
+            "提示语还在说要手动重连:{joined}"
+        );
+        assert!(joined.contains("自动重连"), "提示语没说会自动重连:{joined}");
     }
 }
