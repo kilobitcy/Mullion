@@ -566,6 +566,21 @@ struct PendingRestore {
     focus_leaf: usize,
 }
 
+/// F153:恢复现场之后正在自动串行拨号。`None` = 没在自动拨。
+///
+/// **一条接一条,不并发**:F37 §1 否掉自动重连的理由是「别让高延迟代理链路上
+/// 同时挤一堆握手」——那条理由否的是并发,不是自动。串行既满足「恢复完就能用」,
+/// 也不违反它。
+#[derive(Debug, Default)]
+struct AutoDial {
+    /// 已经试过的标签(不管成没成)。**不能省**:失败那条的 `dialing` 会被
+    /// `ConnectErr` 复位,「第一个未 dialing 的占位标签」判据会把它反复选中,
+    /// 队列在一条连不上的会话上原地打转。
+    tried: Vec<shell::tabs::TabId>,
+    ok: usize,
+    err: usize,
+}
+
 /// 标签装的东西。
 ///
 /// `Terminal` 装箱(`Box<TerminalTab>`)是 clippy `large_enum_variant` 逼的:
@@ -1395,6 +1410,29 @@ fn replace_target(
     ids.iter().position(|id| *id == want)
 }
 
+/// F153:自动串行拨号该轮到哪个占位标签。`None` = 没有下一条了。
+///
+/// 自由函数,理由同 `replace_target`:`App` 要 `EventLoopProxy`,单测里造不出来。
+fn next_auto_dial(
+    tabs: &shell::tabs::Tabs<TabContent>,
+    tried: &[shell::tabs::TabId],
+) -> Option<shell::tabs::TabId> {
+    tabs.iter().find_map(|t| match &t.content {
+        TabContent::Restored(_) if !tried.contains(&t.id) => Some(t.id),
+        _ => None,
+    })
+}
+
+/// F153:自动串行拨号收尾那条 toast。抽成纯函数 —— 文案是这条路径上唯一
+/// 有分支的东西,跑一整轮拨号去测它是拿最贵的手段测最便宜的。
+fn auto_dial_summary(ok: usize, err: usize) -> String {
+    if err == 0 {
+        format!("已自动连上 {ok} 个标签")
+    } else {
+        format!("{ok} 条已连接,{err} 条失败(点「重连」可再试)")
+    }
+}
+
 /// 关掉一个标签时的收口。**顺序是这条函数存在的全部理由**:
 ///
 /// 自动化 task 也持有一份 `Arc<SshSession>`。只 drop 掉 `Workspace`(即 pane 那
@@ -1599,6 +1637,8 @@ pub struct App {
     /// (`RestoredTab::dialing`),「全部重连」也是一个一个来 —— 高延迟代理
     /// 链路上同时拉 N 条连接正是设计 §1 否掉自动重连的理由之一。
     pending_restore: Option<PendingRestore>,
+    /// F153:恢复现场之后的自动串行拨号进度。
+    auto_dial: Option<AutoDial>,
     /// 左键是否按住(划选进行中)。松开即结束,不跨 focus 保留。
     dragging: bool,
     /// 上一次左键按下的连击状态,喂 `input::click_kind` 判双击/三击。
@@ -1900,6 +1940,7 @@ impl App {
             pending_history: None,
             settings_not_mono: false,
             pending_restore: None,
+            auto_dial: None,
             dragging: false,
             prev_click: None,
             press_anchor: None,
@@ -2404,9 +2445,14 @@ impl App {
     /// 已经有一次重连在途时**直接不理**:同时拉多条连接正是设计 §1 否掉
     /// 自动重连的理由之一。按钮此时本来也是禁用的,这里是第二道闸
     /// (菜单的「全部重连」够得着同一个入口)。
-    fn reconnect_tab(&mut self, tab_id: shell::tabs::TabId) {
+    ///
+    /// 返回值 = **这一次有没有真的把拨号发出去**。F153 的自动队列靠它区分
+    /// 「等 `ConnectOk`/`ConnectErr` 回来推进」和「压根不会有事件回来,当场
+    /// 记一笔失败接着试下一条」—— 缺凭据 / 库没打开时这个函数直接 return,
+    /// 不返回这个真值的话队列会永远等一个不来的事件。
+    fn reconnect_tab(&mut self, tab_id: shell::tabs::TabId) -> bool {
         if self.pending_restore.is_some() {
-            return;
+            return false;
         }
         let Some((session_id, tree, focus_leaf)) =
             self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| {
@@ -2417,16 +2463,16 @@ impl App {
                 }
             })
         else {
-            return;
+            return false;
         };
         let plan = match self.store.as_ref().map(|s| s.dial_plan_for(session_id)) {
             Some(Ok(plan)) => plan,
             Some(Err(e)) => {
                 self.ui.set_error(e.to_string());
                 self.ui_dirty = true;
-                return;
+                return false;
             }
-            None => return,
+            None => return false,
         };
         let (cfg, wants_sftp) = plan;
         self.pending_restore = Some(PendingRestore {
@@ -2450,6 +2496,7 @@ impl App {
         self.cli_direct = false;
         self.ui_dirty = true;
         self.spawn_connect(cfg, wants_sftp);
+        true
     }
 
     /// B3:SFTP 节点标签断了之后按「重连」。
@@ -2499,15 +2546,17 @@ impl App {
             color_override: None,
             content: old_content,
         });
-        self.reconnect_tab(tab_id);
+        let _ = self.reconnect_tab(tab_id);
     }
 
     /// F37:菜单里的「全部重连」。**一个一个来** —— `reconnect_tab` 里那道
     /// `pending_restore` 闸保证同时只有一条在拨号,这里只是把第一个还没连
     /// 的占位标签交给它;剩下的等这条连上之后用户再按一次。
     ///
-    /// 「排队自动连完」是刻意没做的:那等于把设计 §1 否掉的「启动即自动重连
-    /// 全部」换个触发时机又做了一遍(N 条握手互相拖慢、缺凭据时连弹 N 个框)。
+    /// **这条路径**不排队自动连完:菜单里的「全部重连」是随手点的,连成一串
+    /// 长活动会让人以为客户端卡住了。F153 的「恢复上次的现场」那条路径**会**
+    /// 排队(`advance_auto_dial`)—— 那是用户明确表达了「我要用这一批」,
+    /// 而且照样一条接一条、不并发,设计 §1 否的是并发不是自动。
     fn reconnect_next_restored(&mut self) {
         let Some(id) = self.tabs.iter().find_map(|t| match &t.content {
             TabContent::Restored(r) if !r.dialing => Some(t.id),
@@ -2515,7 +2564,43 @@ impl App {
         }) else {
             return;
         };
-        self.reconnect_tab(id);
+        let _ = self.reconnect_tab(id);
+    }
+
+    /// F153:推进自动串行拨号。`outcome` = 刚结束那一条的结果
+    /// (`Some(true)` 成功 / `Some(false)` 失败 / `None` = 起点,还没拨过)。
+    ///
+    /// 用 `loop` 而不是递归:一条都没发起出去(缺凭据/库没打开)时要接着
+    /// 试下一条,递归深度会跟着标签数走。
+    fn advance_auto_dial(&mut self, outcome: Option<bool>) {
+        let Some(mut auto) = self.auto_dial.take() else {
+            return;
+        };
+        match outcome {
+            Some(true) => auto.ok += 1,
+            Some(false) => auto.err += 1,
+            None => {}
+        }
+        loop {
+            let Some(next) = next_auto_dial(&self.tabs, &auto.tried) else {
+                // 一条都没试过就到头了(恢复出来的标签全被筛掉)——不报
+                // 「已自动连上 0 个标签」,那只会让人以为出了什么事。
+                if !auto.tried.is_empty() {
+                    self.ui.set_toast(auto_dial_summary(auto.ok, auto.err));
+                }
+                self.ui_dirty = true;
+                return;
+            };
+            auto.tried.push(next);
+            if self.reconnect_tab(next) {
+                self.auto_dial = Some(auto);
+                self.ui_dirty = true;
+                return;
+            }
+            // 连拨号都没发起出去 —— 不会有 `ConnectOk`/`ConnectErr` 回来
+            // 推进队列,当场记一笔失败,接着试下一条。
+            auto.err += 1;
+        }
     }
 
     /// F37:把读出来的布局摆成占位标签。**必须在 `self.store` 打开之后调**
@@ -2661,6 +2746,10 @@ impl App {
         // 不清的话 `save_layout_if_changed` 会拿旧快照比出「没变」,新摆回来
         // 的标签永远不落盘。
         self.last_saved_layout = None;
+        // F153:摆完就一条接一条地拨号。用户选「恢复」的意思就是要用它们,
+        // 不是要再挨个点一遍「重连」。
+        self.auto_dial = Some(AutoDial::default());
+        self.advance_auto_dial(None);
         self.ui_dirty = true;
     }
 
@@ -6261,7 +6350,14 @@ impl ApplicationHandler<UserEvent> for App {
                 handle,
                 wants_sftp,
                 pty,
-            } => self.accept_connect_ok(handle, wants_sftp, pty),
+            } => {
+                self.accept_connect_ok(handle, wants_sftp, pty);
+                // F153:**在分派点推进而不是在 `accept_connect_ok` 里面** ——
+                // 那个函数有多条早退 return(SFTP 标签、缺 pty 的异常路径),
+                // 写在里面会漏掉其中一条,症状是自动拨号连到某个 SFTP 标签
+                // 就停住。
+                self.advance_auto_dial(Some(true));
+            }
             UserEvent::PaneOpened {
                 id,
                 ssh,
@@ -6753,6 +6849,9 @@ impl ApplicationHandler<UserEvent> for App {
                         r.dialing = false;
                     }
                 }
+                // F153:这一条完了,接着拨下一条。失败不中断队列 —— 一条会话
+                // 的凭据不对,不该把其余的一起吊死。
+                self.advance_auto_dial(Some(false));
                 self.ui.set_error(msg);
                 self.request_ui_redraw();
             }
@@ -7945,7 +8044,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // F37:占位标签上按了「重连」/菜单里按了「全部
                             // 重连」。两条走同一个 `reconnect_tab`,不分叉。
                             if let Some(id) = actions.reconnect_tab {
-                                self.reconnect_tab(id);
+                                let _ = self.reconnect_tab(id);
                             }
                             if actions.reconnect_all {
                                 self.reconnect_next_restored();
@@ -9734,13 +9833,14 @@ fn render_frame(
 mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
-        autoscroll_for_pane, blink_on_at, blink_wake_at, credential_delete_error, download_job,
-        effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
-        files_start_dir, finish_password_change, font_px_for, has_real_action, ime_cursor_area,
-        ime_goes_to_terminal_of, new_pane_emulator, next_panel_selection_index, pane_still_wanted,
-        reattach_pane, rehost_pane, resolved_scrollback, snapshot_tabs_of, sync_plan_of,
-        sync_timeout_wake_at, tab_title, tmux_attach_for_connect, upload_job, wind_down, Modal,
-        RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
+        auto_dial_summary, autoscroll_for_pane, blink_on_at, blink_wake_at,
+        credential_delete_error, download_job, effective_focus_of, expand_tilde,
+        files_owner_generation_of, files_path_editing_of, files_start_dir, finish_password_change,
+        font_px_for, has_real_action, ime_cursor_area, ime_goes_to_terminal_of, new_pane_emulator,
+        next_auto_dial, next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
+        resolved_scrollback, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title,
+        tmux_attach_for_connect, upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -12504,6 +12604,104 @@ mod tests {
             saved[0].tree
         );
         assert_eq!(saved[0].focus_leaf, 2, "焦点叶子没原样存回去");
+    }
+
+    /// F153:自动串行拨号选下一条时**必须跳过已经试过的**。
+    ///
+    /// 不跳的话:失败那条的 `dialing` 刚被 `ConnectErr` 复位(F37 收口),
+    /// 「第一个未 dialing 的占位标签」判据会把它反复选中 —— 队列在一条
+    /// 连不上的会话上原地打转,永远走不到后面的标签。
+    ///
+    /// 自证会变红:把 `next_auto_dial` 里的 `!tried.contains(&t.id)` 去掉。
+    #[test]
+    fn the_auto_dial_queue_skips_tabs_it_already_tried() {
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("甲".into(), Some(SessionId(1)), restored_tab(1, 1));
+        tabs.open("乙".into(), Some(SessionId(2)), restored_tab(2, 1));
+        let first = next_auto_dial(&tabs, &[]).expect("该给出第一条");
+        let second = next_auto_dial(&tabs, &[first]).expect("该给出第二条");
+        assert_ne!(first, second, "试过的标签又被选了一次 —— 队列会原地打转");
+        assert_eq!(
+            next_auto_dial(&tabs, &[first, second]),
+            None,
+            "两条都试过了还给第三条"
+        );
+    }
+
+    /// F153:已经连上的标签不在自动拨号队列里 —— 它没有什么可拨的。
+    #[test]
+    fn the_auto_dial_queue_only_looks_at_placeholder_tabs() {
+        let tabs = tabs_with_one_terminal_tab();
+        assert_eq!(next_auto_dial(&tabs, &[]), None);
+    }
+
+    /// F153:收尾那条 toast 的文案。全成功和有失败要分得开 —— 后者得让用户
+    /// 知道「有几条要自己点」。
+    #[test]
+    fn the_auto_dial_summary_tells_failures_apart_from_a_clean_run() {
+        assert_eq!(auto_dial_summary(3, 0), "已自动连上 3 个标签");
+        assert_eq!(
+            auto_dial_summary(2, 1),
+            "2 条已连接,1 条失败(点「重连」可再试)"
+        );
+    }
+
+    /// **接线守护 / F153**:恢复现场之后要自己开始拨号,不能等用户挨个点。
+    ///
+    /// 自证会变红:删掉 `restore_history` 里那两句 `self.auto_dial = ...` /
+    /// `self.advance_auto_dial(None)`。
+    #[test]
+    fn restoring_a_record_starts_dialing_on_its_own() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn restore_history(")
+            .nth(1)
+            .expect("找不到 restore_history");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 restore_history 的结尾")];
+        assert!(
+            body.contains("那条现场已经不在了"),
+            "切片切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.advance_auto_dial("),
+            "恢复现场之后没有自动开始拨号(F153)"
+        );
+    }
+
+    /// **接线守护 / F153**:两种结局都要推进队列。只接 `ConnectOk` 的话,
+    /// 第一条连不上就把整条队列吊死在那儿。
+    ///
+    /// 自证会变红:删掉 `ConnectErr` 分支里那句 `advance_auto_dial(Some(false))`。
+    #[test]
+    fn both_outcomes_advance_the_auto_dial_queue() {
+        let src = include_str!("app.rs");
+        let err = src
+            .split("UserEvent::ConnectErr(msg) => {")
+            .nth(1)
+            .expect("找不到 ConnectErr 分支");
+        let err_body = &err[..err.find("\n            UserEvent::").unwrap_or(err.len())];
+        assert!(
+            err_body.contains("advance_auto_dial(Some(false))"),
+            "拨号失败不推进队列 —— 一条连不上就把后面全吊死"
+        );
+        // 切片键**带上换行和缩进**:`UserEvent::ConnectOk {` 在本文件里出现
+        // 三次(两次是 `spawn_connect` 里往 proxy 发事件),只有事件分派那条
+        // match 臂是「行首 + 12 空格」。转义写法让这行代码本身不会自我匹配。
+        let ok = src
+            .split("\n            UserEvent::ConnectOk {")
+            .nth(1)
+            .expect("找不到 ConnectOk 分派点");
+        let ok_body = &ok[..ok.find("\n            UserEvent::").unwrap_or(ok.len())];
+        assert!(
+            ok_body.contains("accept_connect_ok("),
+            "切片切到的不是 ConnectOk 的分派点 —— 下面那条断言会空过"
+        );
+        assert!(
+            ok_body.contains("advance_auto_dial(Some(true))"),
+            "拨号成功不推进队列 —— 只会连上第一条"
+        );
     }
 
     /// `effective_focus_of`/`files_owner_generation_of` 的测试脚手架:一个
