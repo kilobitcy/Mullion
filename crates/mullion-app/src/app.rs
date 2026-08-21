@@ -5106,6 +5106,240 @@ impl App {
         });
     }
 
+    /// `spawn_connect` 拨号成功后的落地:开标签、建 `Workspace`、接自动化。
+    ///
+    /// 从 `user_event` 的 `UserEvent::ConnectOk` 分支原样搬出来(218 行),
+    /// **一条语句都没动**。搬出来的理由是那个 `match` 已经长到 836 行,
+    /// 而这一支自己就占 224 行 —— 读它得先滚过前面十几个变体。
+    ///
+    /// 分支里的两处 `return` 语义不变:`user_event` 的 `match` 之后没有任何
+    /// 代码,「从分支返回」和「从函数返回」本来就等价。
+    fn accept_connect_ok(
+        &mut self,
+        handle: Arc<SshConnection>,
+        wants_sftp: bool,
+        pty: Option<(SshSession, Receiver<Vec<u8>>)>,
+    ) {
+        // 一旦连上就进入交互态:后续(哪怕是本次会话断开后)的连接失败
+        // 不再是「CLI 直连首次失败」,不该导致整个 GUI exit(1)(复核 #1)。
+        self.cli_direct = false;
+        // C1:每次连接都是全新世代——`next_ws_generation` 取值后自增,
+        // 保证跟上一次(如果有)断开的那个世代号不同,哪怕 `PaneId`
+        // 因为 `next_id` 重新计数而撞号,也能靠这个分辨。D1:`Files`
+        // 标签同样要一个世代号(S1 路由键),两种标签共用这一个计数器。
+        let generation = self.next_ws_generation;
+        self.next_ws_generation += 1;
+        // F37:这次连接是不是某个占位标签按「重连」发起的。**取出即
+        // 消费**:留着的话下一次正常连接会跑去顶替一个早就连上的标签。
+        let pending = self.pending_restore.take();
+        let cfg = self.pending_cfg.clone();
+        let session_id = self.ui.connect_request_last;
+        // E2:标签标题优先取会话名,退回 `user@host`(见 `tab_title`
+        // 的文档)——过去这里恒取 `user@host`,标签属性弹窗改的名字
+        // 要等到**下一次**重连同一条会话才用得上,现在改完立刻生效。
+        let title = tab_title(
+            session_id
+                .and_then(|id| {
+                    self.store
+                        .as_ref()
+                        .and_then(|s| s.list().iter().find(|r| r.id == id))
+                })
+                .map(|rec| rec.identity.name.as_str()),
+            cfg.as_ref().map(|c| (c.user.as_str(), c.host.as_str())),
+        );
+        // F120:这个标签对应会话在编辑器「SFTP」分节配置的默认目录/书签。
+        // 没有 `session_id`(理论上不可达,`connect_request_last` 由发起
+        // 连接那一刻设好)或 store 里查不到(会话已被删)都落回全空默认——
+        // 跟「没配置」等价,不阻断连接本身。
+        let sftp_prefs = session_id
+            .and_then(|id| {
+                self.store
+                    .as_ref()
+                    .and_then(|s| s.list().iter().find(|r| r.id == id))
+            })
+            .map(|rec| rec.sftp.clone())
+            .unwrap_or_default();
+
+        if wants_sftp {
+            // D1/D6:SFTP 节点——独占标签、独占连接(`handle`),不开
+            // PTY。真正开 sftp channel 挪到 `trigger_sftp_open`
+            // (跟侧栏共用同一条路径),这里只管把标签立起来、触发
+            // 首次打开。
+            crate::logx::line("连接成功,进入 SFTP 标签");
+            self.place_tab(
+                pending.as_ref(),
+                title,
+                session_id,
+                TabContent::Files(Box::new(FilesTab {
+                    files: crate::ui::files_panel::PanelFrame::new(
+                        sftp_prefs.default_local.as_deref(),
+                        sftp_prefs.bookmarks,
+                        // F139:没有会话记录就没地方存书签,☆ 置灰。
+                        session_id.is_some(),
+                    ),
+                    conn: handle,
+                    generation,
+                    sftp: None,
+                    sftp_tasks: Vec::new(),
+                    sftp_default_remote: sftp_prefs.default_remote,
+                    sftp_home: None,
+                })),
+            );
+            self.ui.close_session_manager();
+            self.ui_dirty = true;
+            self.trigger_sftp_open(generation);
+            self.request_ui_redraw();
+            return;
+        }
+
+        let Some((ssh, rx)) = pty else {
+            // `spawn_connect` 保证 `wants_sftp=false` 时 `pty` 恒
+            // `Some`(`open_pty` 失败走 `ConnectErr`,不会发一个
+            // 「两者皆无」的 `ConnectOk`)。到这里说明违反了这个前提——
+            // 目前唯一的生产者(`spawn_connect`)维持着这个不变量,
+            // 这条分支实际不可达;但如果哪天真的走到这里,不能只记
+            // 日志静默丢弃——用户会看到「点了连接,什么都没发生」,
+            // 跟 `ConnectErr`/host_key 弹窗那些故意不做静默失败的路径
+            // 不一致。复用已有的错误展示通道,不新开概念。
+            log::error!(target: "mullion", "ConnectOk 缺少 pty 且未标记 wants_sftp,忽略");
+            self.ui
+                .set_error("连接内部状态异常,请重试(缺少终端通道)".to_string());
+            self.request_ui_redraw();
+            return;
+        };
+        crate::logx::line("连接成功,进入终端态");
+        let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
+        let d = theme::term_default_colors(&MULLION_DARK);
+        emulator.set_default_colors(d.fg, d.bg);
+        // pane 和自动化 task 要共享同一条 channel(spec §1 修订二):
+        // `PaneState.pty` 本来就是 `Box<dyn PtyWriter>`,`SshSession`
+        // 内部只有一个 mpsc Sender、本身 Send+Sync,`Arc` 只是共享
+        // 所有权,不引入锁。既有调用点零改动。
+        let ssh = Arc::new(ssh);
+        let mut ws = crate::shell::workspace::Workspace::new(
+            PaneState {
+                id: PaneId(1),
+                host_ix: 0,
+                emulator,
+                pty: Box::new(ssh.clone()),
+                rx,
+                pacer: SyncFramePacer::new(),
+                status: crate::shell::workspace::PaneStatus::Live,
+                saw_first_byte: false,
+                // 故意给一个不可能的初值:下一帧 apply_geometry 必然发一次
+                // window_change,真实列/行数才知道(T4)。
+                last_grid: (0, 0),
+                cwd: None,
+                tmux: None,
+            },
+            generation,
+        );
+        ws.hosts.push(crate::shell::workspace::HostConn {
+            label: title.clone(),
+            addr: cfg
+                .as_ref()
+                .map_or_else(String::new, |c| format!("{}:{}", c.host, c.port)),
+            // 取发起这次连接时记下的那条会话
+            // (`ConnectOk` 事件本身不带 SessionId)。
+            session_id,
+            handle,
+            tmux_bootstrap: Default::default(),
+            tmux_last_try: None,
+            // F128:重连要用它。跟下面 `last_cfg` 同一份,但那份是
+            // **标签级**的(标题条读 user/host/port),换过节点之后
+            // 就不再代表"每一条连接"——见 `HostConn::cfg` 的文档。
+            cfg: cfg.clone(),
+        });
+        // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
+        // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
+        // `switching_tabs_does_not_touch_the_ssh_connections`)。
+        // launcher 态(`tabs` 为空)时这就是第一个标签,CLI 直连同理。
+        //
+        // **同一条会话可以开多个标签,不去重、标题也不加序号**:序号会让
+        // 「关掉中间那个」之后编号整体跳变,反而更难认;区分靠节点色和
+        // hover 出来的 `user@host`。
+        let replaced = self.place_tab(
+            pending.as_ref(),
+            title,
+            session_id,
+            TabContent::Terminal(Box::new(TerminalTab {
+                ws,
+                current_preset: Some(Preset::Single),
+                last_cfg: cfg,
+                automation: Vec::new(),
+                automation_template: None,
+                // F141:下面 `take_pending` 成功时才填(那时才知道这次
+                // 到底有没有 attach tmux)。
+                tmux_attach: None,
+                automation_status: None,
+                // F50:每个标签自己的一份侧栏状态(D1:侧栏按会话记住)。
+                files: crate::ui::files_panel::PanelFrame::new(
+                    sftp_prefs.default_local.as_deref(),
+                    sftp_prefs.bookmarks,
+                    // F139:没有会话记录就没地方存书签,☆ 置灰。
+                    session_id.is_some(),
+                ),
+                sftp: None,
+                sftp_host_ix: None,
+                sftp_tasks: Vec::new(),
+                sftp_default_remote: sftp_prefs.default_remote,
+                sftp_home: None,
+                reconnect_tasks: Vec::new(),
+            })),
+        );
+        // F37:是重连一个占位标签 → 把上次的分屏形状搭回来,并给新长
+        // 出来的叶子在这条连接上另开 channel(与 F35 预设分屏同一条路)。
+        // 树坏了(`apply_saved_tree` 返回 `None`)就保持单屏,不阻断连接。
+        if replaced {
+            if let Some(p) = pending.as_ref() {
+                let fresh = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|tab| tab.content.as_terminal_mut())
+                    .and_then(|t| {
+                        let fresh = t.ws.apply_saved_tree(&p.tree, p.focus_leaf)?;
+                        // 恢复出来的形状一般不对应任何预设按钮;单叶子
+                        // 例外(它就是 Single)。
+                        t.current_preset = (p.tree.len() == 1).then_some(Preset::Single);
+                        Some(fresh)
+                    });
+                if let Some(fresh) = fresh {
+                    self.spawn_fresh_panes(fresh);
+                }
+            }
+        }
+        // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
+        self.ui.close_session_manager();
+        self.ui_dirty = true;
+        // 模板跟计划**同进同退**:只有这次真的要跑自动化,才把配置留给
+        // 后来的 pane。否则「右键跳过一次」在分屏时会失效——用户明确
+        // 说了这次不跑,分屏出来的 pane 却照跑不误。
+        let tpl = self.pending_automation.template.take();
+        let tmux_name = self.pending_automation.session_name.take();
+        if let Some(plan) = crate::automation::take_pending(
+            &mut self.pending_automation.plan,
+            &mut self.pending_automation.skip,
+        ) {
+            // S1:挂回**属主标签**(按世代号查),不用「活动标签」——
+            // `open` 刚把新标签设为活动,今天两者等价,但那是巧合:
+            // 哪天连接成功不再顺带切换焦点,这里就会把 handle 挂错标签。
+            if let Some(t) = self
+                .tabs
+                .by_generation_mut(generation)
+                .and_then(|tab| tab.content.as_terminal_mut())
+            {
+                // F141:这次全套跑里到底 attach 了哪个 tmux 会话 ——
+                // 断线重连要照着它把用户接回去。
+                t.tmux_attach = tmux_attach_for_connect(tpl.as_ref(), tmux_name.as_deref());
+                t.automation_template = tpl;
+            }
+            // 建标签的这个 pane 照配置**全套**跑,含 tmux
+            // (`PaneId(1)` 见 `Workspace::new`)。
+            self.start_automation(generation, PaneId(1), plan, ssh);
+        }
+        self.request_ui_redraw();
+    }
+
     /// F35 分屏复用连接:给 `fresh`(树上已占好叶子位、还没有 `PaneState`)里的
     /// 每个 id,在同一条 SSH 连接上另开一条 channel。真正决定"该不该开、开
     /// 哪些"的路由逻辑在自由函数 `apply_layout_actions`(可脱离 runtime/proxy
@@ -5910,226 +6144,7 @@ impl ApplicationHandler<UserEvent> for App {
                 handle,
                 wants_sftp,
                 pty,
-            } => {
-                // 一旦连上就进入交互态:后续(哪怕是本次会话断开后)的连接失败
-                // 不再是「CLI 直连首次失败」,不该导致整个 GUI exit(1)(复核 #1)。
-                self.cli_direct = false;
-                // C1:每次连接都是全新世代——`next_ws_generation` 取值后自增,
-                // 保证跟上一次(如果有)断开的那个世代号不同,哪怕 `PaneId`
-                // 因为 `next_id` 重新计数而撞号,也能靠这个分辨。D1:`Files`
-                // 标签同样要一个世代号(S1 路由键),两种标签共用这一个计数器。
-                let generation = self.next_ws_generation;
-                self.next_ws_generation += 1;
-                // F37:这次连接是不是某个占位标签按「重连」发起的。**取出即
-                // 消费**:留着的话下一次正常连接会跑去顶替一个早就连上的标签。
-                let pending = self.pending_restore.take();
-                let cfg = self.pending_cfg.clone();
-                let session_id = self.ui.connect_request_last;
-                // E2:标签标题优先取会话名,退回 `user@host`(见 `tab_title`
-                // 的文档)——过去这里恒取 `user@host`,标签属性弹窗改的名字
-                // 要等到**下一次**重连同一条会话才用得上,现在改完立刻生效。
-                let title = tab_title(
-                    session_id
-                        .and_then(|id| {
-                            self.store
-                                .as_ref()
-                                .and_then(|s| s.list().iter().find(|r| r.id == id))
-                        })
-                        .map(|rec| rec.identity.name.as_str()),
-                    cfg.as_ref().map(|c| (c.user.as_str(), c.host.as_str())),
-                );
-                // F120:这个标签对应会话在编辑器「SFTP」分节配置的默认目录/书签。
-                // 没有 `session_id`(理论上不可达,`connect_request_last` 由发起
-                // 连接那一刻设好)或 store 里查不到(会话已被删)都落回全空默认——
-                // 跟「没配置」等价,不阻断连接本身。
-                let sftp_prefs = session_id
-                    .and_then(|id| {
-                        self.store
-                            .as_ref()
-                            .and_then(|s| s.list().iter().find(|r| r.id == id))
-                    })
-                    .map(|rec| rec.sftp.clone())
-                    .unwrap_or_default();
-
-                if wants_sftp {
-                    // D1/D6:SFTP 节点——独占标签、独占连接(`handle`),不开
-                    // PTY。真正开 sftp channel 挪到 `trigger_sftp_open`
-                    // (跟侧栏共用同一条路径),这里只管把标签立起来、触发
-                    // 首次打开。
-                    crate::logx::line("连接成功,进入 SFTP 标签");
-                    self.place_tab(
-                        pending.as_ref(),
-                        title,
-                        session_id,
-                        TabContent::Files(Box::new(FilesTab {
-                            files: crate::ui::files_panel::PanelFrame::new(
-                                sftp_prefs.default_local.as_deref(),
-                                sftp_prefs.bookmarks,
-                                // F139:没有会话记录就没地方存书签,☆ 置灰。
-                                session_id.is_some(),
-                            ),
-                            conn: handle,
-                            generation,
-                            sftp: None,
-                            sftp_tasks: Vec::new(),
-                            sftp_default_remote: sftp_prefs.default_remote,
-                            sftp_home: None,
-                        })),
-                    );
-                    self.ui.close_session_manager();
-                    self.ui_dirty = true;
-                    self.trigger_sftp_open(generation);
-                    self.request_ui_redraw();
-                    return;
-                }
-
-                let Some((ssh, rx)) = pty else {
-                    // `spawn_connect` 保证 `wants_sftp=false` 时 `pty` 恒
-                    // `Some`(`open_pty` 失败走 `ConnectErr`,不会发一个
-                    // 「两者皆无」的 `ConnectOk`)。到这里说明违反了这个前提——
-                    // 目前唯一的生产者(`spawn_connect`)维持着这个不变量,
-                    // 这条分支实际不可达;但如果哪天真的走到这里,不能只记
-                    // 日志静默丢弃——用户会看到「点了连接,什么都没发生」,
-                    // 跟 `ConnectErr`/host_key 弹窗那些故意不做静默失败的路径
-                    // 不一致。复用已有的错误展示通道,不新开概念。
-                    log::error!(target: "mullion", "ConnectOk 缺少 pty 且未标记 wants_sftp,忽略");
-                    self.ui
-                        .set_error("连接内部状态异常,请重试(缺少终端通道)".to_string());
-                    self.request_ui_redraw();
-                    return;
-                };
-                crate::logx::line("连接成功,进入终端态");
-                let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
-                let d = theme::term_default_colors(&MULLION_DARK);
-                emulator.set_default_colors(d.fg, d.bg);
-                // pane 和自动化 task 要共享同一条 channel(spec §1 修订二):
-                // `PaneState.pty` 本来就是 `Box<dyn PtyWriter>`,`SshSession`
-                // 内部只有一个 mpsc Sender、本身 Send+Sync,`Arc` 只是共享
-                // 所有权,不引入锁。既有调用点零改动。
-                let ssh = Arc::new(ssh);
-                let mut ws = crate::shell::workspace::Workspace::new(
-                    PaneState {
-                        id: PaneId(1),
-                        host_ix: 0,
-                        emulator,
-                        pty: Box::new(ssh.clone()),
-                        rx,
-                        pacer: SyncFramePacer::new(),
-                        status: crate::shell::workspace::PaneStatus::Live,
-                        saw_first_byte: false,
-                        // 故意给一个不可能的初值:下一帧 apply_geometry 必然发一次
-                        // window_change,真实列/行数才知道(T4)。
-                        last_grid: (0, 0),
-                        cwd: None,
-                        tmux: None,
-                    },
-                    generation,
-                );
-                ws.hosts.push(crate::shell::workspace::HostConn {
-                    label: title.clone(),
-                    addr: cfg
-                        .as_ref()
-                        .map_or_else(String::new, |c| format!("{}:{}", c.host, c.port)),
-                    // 取发起这次连接时记下的那条会话
-                    // (`ConnectOk` 事件本身不带 SessionId)。
-                    session_id,
-                    handle,
-                    tmux_bootstrap: Default::default(),
-                    tmux_last_try: None,
-                    // F128:重连要用它。跟下面 `last_cfg` 同一份,但那份是
-                    // **标签级**的(标题条读 user/host/port),换过节点之后
-                    // 就不再代表"每一条连接"——见 `HostConn::cfg` 的文档。
-                    cfg: cfg.clone(),
-                });
-                // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
-                // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
-                // `switching_tabs_does_not_touch_the_ssh_connections`)。
-                // launcher 态(`tabs` 为空)时这就是第一个标签,CLI 直连同理。
-                //
-                // **同一条会话可以开多个标签,不去重、标题也不加序号**:序号会让
-                // 「关掉中间那个」之后编号整体跳变,反而更难认;区分靠节点色和
-                // hover 出来的 `user@host`。
-                let replaced = self.place_tab(
-                    pending.as_ref(),
-                    title,
-                    session_id,
-                    TabContent::Terminal(Box::new(TerminalTab {
-                        ws,
-                        current_preset: Some(Preset::Single),
-                        last_cfg: cfg,
-                        automation: Vec::new(),
-                        automation_template: None,
-                        // F141:下面 `take_pending` 成功时才填(那时才知道这次
-                        // 到底有没有 attach tmux)。
-                        tmux_attach: None,
-                        automation_status: None,
-                        // F50:每个标签自己的一份侧栏状态(D1:侧栏按会话记住)。
-                        files: crate::ui::files_panel::PanelFrame::new(
-                            sftp_prefs.default_local.as_deref(),
-                            sftp_prefs.bookmarks,
-                            // F139:没有会话记录就没地方存书签,☆ 置灰。
-                            session_id.is_some(),
-                        ),
-                        sftp: None,
-                        sftp_host_ix: None,
-                        sftp_tasks: Vec::new(),
-                        sftp_default_remote: sftp_prefs.default_remote,
-                        sftp_home: None,
-                        reconnect_tasks: Vec::new(),
-                    })),
-                );
-                // F37:是重连一个占位标签 → 把上次的分屏形状搭回来,并给新长
-                // 出来的叶子在这条连接上另开 channel(与 F35 预设分屏同一条路)。
-                // 树坏了(`apply_saved_tree` 返回 `None`)就保持单屏,不阻断连接。
-                if replaced {
-                    if let Some(p) = pending.as_ref() {
-                        let fresh = self
-                            .tabs
-                            .by_generation_mut(generation)
-                            .and_then(|tab| tab.content.as_terminal_mut())
-                            .and_then(|t| {
-                                let fresh = t.ws.apply_saved_tree(&p.tree, p.focus_leaf)?;
-                                // 恢复出来的形状一般不对应任何预设按钮;单叶子
-                                // 例外(它就是 Single)。
-                                t.current_preset = (p.tree.len() == 1).then_some(Preset::Single);
-                                Some(fresh)
-                            });
-                        if let Some(fresh) = fresh {
-                            self.spawn_fresh_panes(fresh);
-                        }
-                    }
-                }
-                // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
-                self.ui.close_session_manager();
-                self.ui_dirty = true;
-                // 模板跟计划**同进同退**:只有这次真的要跑自动化,才把配置留给
-                // 后来的 pane。否则「右键跳过一次」在分屏时会失效——用户明确
-                // 说了这次不跑,分屏出来的 pane 却照跑不误。
-                let tpl = self.pending_automation.template.take();
-                let tmux_name = self.pending_automation.session_name.take();
-                if let Some(plan) = crate::automation::take_pending(
-                    &mut self.pending_automation.plan,
-                    &mut self.pending_automation.skip,
-                ) {
-                    // S1:挂回**属主标签**(按世代号查),不用「活动标签」——
-                    // `open` 刚把新标签设为活动,今天两者等价,但那是巧合:
-                    // 哪天连接成功不再顺带切换焦点,这里就会把 handle 挂错标签。
-                    if let Some(t) = self
-                        .tabs
-                        .by_generation_mut(generation)
-                        .and_then(|tab| tab.content.as_terminal_mut())
-                    {
-                        // F141:这次全套跑里到底 attach 了哪个 tmux 会话 ——
-                        // 断线重连要照着它把用户接回去。
-                        t.tmux_attach = tmux_attach_for_connect(tpl.as_ref(), tmux_name.as_deref());
-                        t.automation_template = tpl;
-                    }
-                    // 建标签的这个 pane 照配置**全套**跑,含 tmux
-                    // (`PaneId(1)` 见 `Workspace::new`)。
-                    self.start_automation(generation, PaneId(1), plan, ssh);
-                }
-                self.request_ui_redraw();
-            }
+            } => self.accept_connect_ok(handle, wants_sftp, pty),
             UserEvent::PaneOpened {
                 id,
                 ssh,
@@ -13398,13 +13413,17 @@ mod tests {
     #[test]
     fn every_new_tab_bumps_the_generation_so_it_is_a_unique_routing_key() {
         let src = include_str!("app.rs");
+        // 锚点拆开拼,免得 `split` 撞上这行字面量自身(理由同
+        // `reconnect_drops_the_dead_sftp_client`)。换成函数体边界之后比原来的
+        // 「两个 UserEvent 变体之间」稳:后者依赖 `ConnectErr` 恰好紧跟在
+        // `ConnectOk` 后面这个纯排版事实。
         let after = src
-            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
+            .split(concat!("fn accept_", "connect_ok("))
             .nth(1)
-            .expect("找不到 ConnectOk 的事件分支");
+            .expect("找不到 accept_connect_ok");
         let body = &after[..after
-            .find("\n            }\n")
-            .expect("找不到 ConnectOk 分支的结尾")];
+            .find("\n    }\n")
+            .expect("找不到 accept_connect_ok 的结尾")];
         assert!(
             body.contains("let generation = self.next_ws_generation;"),
             "ConnectOk 没有取世代号 —— 下面那条断言会空过"
@@ -13428,13 +13447,17 @@ mod tests {
     #[test]
     fn connecting_opens_a_new_tab_instead_of_replacing_the_active_one() {
         let src = include_str!("app.rs");
+        // 锚点拆开拼,免得 `split` 撞上这行字面量自身(理由同
+        // `reconnect_drops_the_dead_sftp_client`)。换成函数体边界之后比原来的
+        // 「两个 UserEvent 变体之间」稳:后者依赖 `ConnectErr` 恰好紧跟在
+        // `ConnectOk` 后面这个纯排版事实。
         let after = src
-            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
+            .split(concat!("fn accept_", "connect_ok("))
             .nth(1)
-            .expect("找不到 ConnectOk 的事件分支");
+            .expect("找不到 accept_connect_ok");
         let body = &after[..after
-            .find("\n            }\n")
-            .expect("找不到 ConnectOk 分支的结尾")];
+            .find("\n    }\n")
+            .expect("找不到 accept_connect_ok 的结尾")];
         // D1:`ConnectOk` 两条分支各摆一次标签 —— SFTP 那条(`wants_sftp`)
         // 摆 `TabContent::Files`,终端那条摆 `TabContent::Terminal`。
         // F37:两处都改走 `place_tab`(它在没有 `pending_restore` 时**就是**
@@ -13516,13 +13539,17 @@ mod tests {
     #[test]
     fn connect_ok_wires_configured_sftp_prefs_into_both_new_tabs() {
         let src = include_str!("app.rs");
+        // 锚点拆开拼,免得 `split` 撞上这行字面量自身(理由同
+        // `reconnect_drops_the_dead_sftp_client`)。换成函数体边界之后比原来的
+        // 「两个 UserEvent 变体之间」稳:后者依赖 `ConnectErr` 恰好紧跟在
+        // `ConnectOk` 后面这个纯排版事实。
         let after = src
-            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
+            .split(concat!("fn accept_", "connect_ok("))
             .nth(1)
-            .expect("找不到 ConnectOk 的事件分支");
+            .expect("找不到 accept_connect_ok");
         let body = &after[..after
-            .find("\n            }\n")
-            .expect("找不到 ConnectOk 分支的结尾")];
+            .find("\n    }\n")
+            .expect("找不到 accept_connect_ok 的结尾")];
         assert!(
             body.contains("let sftp_prefs ="),
             "ConnectOk 没有从 store 读配置的 SFTP 偏好"
@@ -13590,7 +13617,7 @@ mod tests {
         );
     }
 
-    /// **接线守护 / D1**:`ConnectOk` 收到 `wants_sftp: true` 那条分支,不许
+    /// **接线守护 / D1**:`accept_connect_ok` 收到 `wants_sftp: true` 那条分支,不许
     /// 走「先建 `Workspace`/`open_pty`」的终端建标签路径——它是靠早 `return`
     /// 跟终端分支分开的(见 `spawn_connect` 那条守护里的 `return;`),这里补
     /// 反过来的一半:SFTP 分支自己也不能碰 `open_pty`/`Workspace::new`。
@@ -13601,20 +13628,22 @@ mod tests {
     #[test]
     fn connect_ok_wants_sftp_branch_never_touches_open_pty_or_workspace() {
         let src = include_str!("app.rs");
+        // 锚点拆开拼 + 换成函数体边界,理由同上一条。内层那个结尾锚点跟着
+        // 缩进走:分支体从 `match` 里的 16 空格降到方法体的 8 空格。
         let after = src
-            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
+            .split(concat!("fn accept_", "connect_ok("))
             .nth(1)
-            .expect("找不到 ConnectOk 的事件分支");
+            .expect("找不到 accept_connect_ok");
         let full_body = &after[..after
-            .find("\n            }\n")
-            .expect("找不到 ConnectOk 分支的结尾")];
+            .find("\n    }\n")
+            .expect("找不到 accept_connect_ok 的结尾")];
         let sftp_branch = full_body
             .split("if wants_sftp {")
             .nth(1)
-            .expect("找不到 ConnectOk 里的 wants_sftp 分支")
-            .split("\n                }\n")
+            .expect("找不到 accept_connect_ok 里的 wants_sftp 分支")
+            .split("\n        }\n")
             .next()
-            .expect("找不到 ConnectOk 里 wants_sftp 分支的结尾");
+            .expect("找不到 accept_connect_ok 里 wants_sftp 分支的结尾");
         assert!(
             sftp_branch.contains("return;"),
             "ConnectOk 的 wants_sftp 分支没有及时 return —— 会继续往下掉进 \
