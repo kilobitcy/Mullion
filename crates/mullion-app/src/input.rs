@@ -136,6 +136,28 @@ pub fn ime_commit_bytes(text: &str) -> Option<Vec<u8>> {
     Some(out.into_bytes())
 }
 
+/// F149:这一帧该往 `egui_winit::State` 的 IME 账本里写什么。`None` = 别动它。
+///
+/// **窗口的 IME 归宿主所有,egui 不许关它。** egui-winit 的去抖是
+/// 「账本 ≠ 目标值才发 `set_ime_allowed`」(`lib.rs:849`)。egui 里没有文本框
+/// 在组字的帧,目标值是 `false`;把账本预先写成同一个 `false`,那次调用就
+/// 发不出去,窗口保持 `resumed` 里设的常开。
+///
+/// 终端不是 egui 部件,egui 永远不会知道它也需要 IME —— 不按住账本的话,
+/// 用户点过一次任意输入框(换节点搜索框、路径条、标签改名、会话管理器字段)
+/// 再点回终端,中文输入就永久没了,且**没有自愈路径**,只能重启。
+///
+/// 返回 `Some(true)` 是**反的**:那会制造 `true != false`,禁用调用每帧必发。
+/// 这是复核阶段真的写反过一次的地方,`the_ime_ledger_is_clamped_to_false_...`
+/// 钉着方向。
+pub fn ime_ledger_clamp(egui_wants_ime: bool) -> Option<bool> {
+    if egui_wants_ime {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// 一次滚轮增量 → 行数(正数 = 向上 / 往历史)。
 ///
 /// `LineDelta` 一格按 3 行(与主流终端一致)。`PixelDelta`(触控板/精密滚轮)按
@@ -288,6 +310,27 @@ mod tests {
     use std::time::Duration;
     use winit::dpi::PhysicalPosition;
     use winit::event::MouseScrollDelta;
+
+    /// F149:egui 不要 IME 的那些帧,账本必须被写成 **false**。
+    ///
+    /// 写 `true` 是反的 —— egui 的去抖是「账本 ≠ 目标值才发调用」,目标值这时
+    /// 正是 `false`,写 true 反而每帧都触发一次 `set_ime_allowed(false)`,
+    /// 窗口从第一帧起就没有 IME。这条断言钉的就是这个方向。
+    #[test]
+    fn the_ime_ledger_is_clamped_to_false_so_egui_never_disables_the_window_ime() {
+        assert_eq!(
+            ime_ledger_clamp(false),
+            Some(false),
+            "egui 不要 IME 时,账本要写成与目标值相同的 false,去抖才会短路"
+        );
+    }
+
+    /// egui 自己要 IME 的帧不许动账本:它这时要发的是 `set_ime_allowed(true)`,
+    /// 对一个本就开着的窗口无害,插手只会让两边的账再次对不上。
+    #[test]
+    fn the_ime_ledger_is_left_alone_while_egui_is_composing() {
+        assert_eq!(ime_ledger_clamp(true), None);
+    }
 
     #[test]
     fn enter_maps_to_key_enter() {

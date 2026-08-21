@@ -9257,6 +9257,19 @@ fn render_frame(
         &a.egui_ctx,
         full_output.platform_output.accesskit_update.take(),
     );
+    // F149:把 egui 的 IME 账本按住。egui-winit 的去抖是「账本 ≠ 目标值才发
+    // `set_ime_allowed`」——egui 里没有文本框在组字的帧,它会发一次
+    // `set_ime_allowed(false)`,关掉的是**整个窗口**的 IME。终端不是 egui
+    // 部件,egui 永远不知道它也需要 IME,于是用户点过一次任意输入框再点回
+    // 终端,中文输入就永久没了(没有自愈路径,只能重启 exe)。
+    //
+    // 把账本预先写成它这一帧本来要写的 `false`,去抖短路,那次调用发不出去,
+    // 窗口保持 `resumed` 里设的常开。**必须排在 `handle_platform_output`
+    // 之前** —— 排在后面等于什么都没做(它读的是调用当时的账本),而且照样
+    // 编译、照样静默失灵,守护见 `the_ime_ledger_is_clamped_before_egui_...`。
+    if let Some(v) = input::ime_ledger_clamp(full_output.platform_output.ime.is_some()) {
+        a.egui_state.set_allow_ime(v);
+    }
     a.egui_state
         .handle_platform_output(&a.window, full_output.platform_output);
     let paint_jobs = a
@@ -15492,6 +15505,31 @@ mod tests {
         assert!(
             body[arm..end].contains("self.reopen_sftp_on_focused_host("),
             "Reopen 那一臂没调 reopen_sftp_on_focused_host"
+        );
+    }
+
+    /// F149:账本必须在 `handle_platform_output` **之前**按住。
+    ///
+    /// 顺序错了这个修复完全失效 —— 那个函数读的是调用当时的账本,之后再改
+    /// 一点用都没有 —— 而且照样编译、测试照样能跑,只有实机打不出中文才暴露。
+    ///
+    /// 锚点**必须带行首换行 + 缩进**:不带的话会匹配到本测试自己那一行
+    /// (`include_str!("app.rs")` 读的就是这个文件),`find` 拿到测试的位置,
+    /// 断言变成拿测试自己跟实现比,恒绿。这里的字面量里 `\n` 是转义序列,
+    /// 测试自身那一行含的是反斜杠加 n 两个字符,匹配不上真换行,是安全的。
+    #[test]
+    fn the_ime_ledger_is_clamped_before_egui_gets_a_chance_to_disable_it() {
+        let src = include_str!("app.rs");
+        let clamp = src
+            .find("\n    if let Some(v) = input::ime_ledger_clamp(")
+            .expect("找不到 F149 的账本按压接线");
+        let hpo = src
+            .find("\n        .handle_platform_output(")
+            .expect("找不到 handle_platform_output 的调用");
+        assert!(
+            clamp < hpo,
+            "ime_ledger_clamp 必须排在 handle_platform_output 之前,否则账本改了也没人读,\
+             中文输入照样会被 egui 关掉"
         );
     }
 }
