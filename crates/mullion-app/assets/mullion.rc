@@ -1,0 +1,12 @@
+/* Windows 资源脚本(F152)。由 build.rs 交给 windres 编成 .o 链进 exe。
+ *
+ * 资源序号必须是 1,且必须与 `crate::icon_res::RESOURCE_ID` 一致:
+ *   - 资源管理器/开始菜单取 **ID 最小**的那个 ICON 资源当文件图标;
+ *   - app.rs 用 `Icon::from_resource(RESOURCE_ID, ..)` 按序号取窗口/任务栏图标,
+ *     序号对不上时 winit 只返回 Err,构建照样绿、exe 文件图标照样有,
+ *     **只有窗口和任务栏图标静默消失** —— 守护测试见 tests/icon_resource.rs。
+ *
+ * 引号里的路径只许用 ASCII:windres 按代码页(默认 1252)读 .rc,非 ASCII
+ * 文件名会被当 latin-1 解释,找不到文件。注释里的中文不参与解析,无妨。
+ */
+1 ICON "mullion.ico"

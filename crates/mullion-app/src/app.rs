@@ -5706,6 +5706,33 @@ impl ApplicationHandler<UserEvent> for App {
                 attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
             }
         }
+        // F152:标题栏/Alt-Tab/任务栏的图标。**必须显式挂** —— winit 0.30.13
+        // 注册窗口类时写死 `hIcon: 0`(`platform_impl/windows/window.rs:1417`),
+        // 不会去读 exe 的资源图标,只嵌资源的话这三处永远是那张空白默认图。
+        //
+        // 从资源段按序号取,而不是 `include_bytes!` 一份再解码:同一张 ico
+        // 就只有一份(370 KB,N6 体积),而且**尺寸由 Windows 自己从 ico 里挑**,
+        // 比我们在 CPU 上重采样准 —— 高 DPI 下它会去拿 48/64 那几帧。
+        //
+        // 取不到就不设(保持默认图标),不 panic:图标缺失不该拦住一个 SSH 客户端启动。
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::{IconExtWindows as _, WindowAttributesExtWindows as _};
+            let px = |n: u32| Some(winit::dpi::PhysicalSize::new(n, n));
+            // 标题栏那张按 16 要(ICON_SMALL);任务栏那张不给尺寸,让
+            // `LR_DEFAULTSIZE` 跟着系统 DPI 走(ICON_BIG)。
+            let small = winit::window::Icon::from_resource(
+                crate::icon_res::RESOURCE_ID,
+                px(crate::icon_res::SMALL_PX),
+            );
+            let big = winit::window::Icon::from_resource(crate::icon_res::RESOURCE_ID, None);
+            if let Err(e) = &small {
+                crate::logx::line(&format!("F152:窗口图标取不到({e:?}),用系统默认"));
+            }
+            attrs = attrs
+                .with_window_icon(small.ok())
+                .with_taskbar_icon(big.ok());
+        }
         let window = Arc::new(event_loop.create_window(attrs).expect("create_window"));
         // 输入法:winit **默认不发** `WindowEvent::Ime`,不打开这个开关的话中文/
         // 日文输入法一个字都递不进来(用户报的「ssh 连接后不能输入汉字」)。

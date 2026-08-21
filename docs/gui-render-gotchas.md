@@ -374,3 +374,28 @@
 - **已知画不出来的**(本轮换掉的 13 处):`▾` `▴` `▸` `⚠` `⟳` `↻` `✕` `•`。
   能用的替身:`▲` `▼` `★` `☆` `→` `↑` `↓` `×` `●` `—` `…` `·`,
   以及 `Glyph::{Cross, ArrowUp, ArrowDown, Info, Refresh, TriangleDown, TriangleRight}` 自绘。
+
+## 程序图标(F152)
+
+- **winit 注册窗口类时写死 `hIcon: 0` / `hIconSm: 0`**
+  (`winit-0.30.13/src/platform_impl/windows/window.rs:1417`)。它**不会**去加载 exe
+  资源段里的图标 —— 这跟绝大多数 Win32 程序的直觉相反。
+  **症状**:`build.rs` 把 ico 编进 `.rsrc` 之后,资源管理器和开始菜单里的文件图标
+  有了,**标题栏左上角、Alt-Tab、任务栏三处仍然是那张空白默认图**,而且构建全绿。
+- **规则**:资源段和 `with_window_icon`/`with_taskbar_icon` **两条路都要走**。
+  后者在 `resumed()` 建窗口之前用 `Icon::from_resource(icon_res::RESOURCE_ID, ..)`
+  从**同一份**资源里取,不要 `include_bytes!` 第二份 —— 一份数据、一个真值源,
+  尺寸也交给 Windows 自己从 ico 里挑(高 DPI 下它会去拿 48/64 那几帧,
+  比在 CPU 上重采样准)。
+- **`ICON_SMALL` 那张要显式给 16x16**。不传尺寸时 winit 走 `LR_DEFAULTSIZE`,
+  拿到的是 `SM_CXICON`(32),再被系统压到 16 显示,缩放是最近邻,细线条会糊。
+- **资源序号是个隐式契约**:`.rc` 里的 `1 ICON` 与 `icon_res::RESOURCE_ID` 对不上时,
+  `from_resource` 只返回 `Err`,而合理的处置是「取不到就不设」—— 于是构建绿、
+  文件图标还在,只有窗口和任务栏的图标静默消失。守护在
+  `crates/mullion-app/tests/icon_resource.rs`(解析 `.rc` 与常量比对)。
+- **那段代码裹在 `cfg(windows)` 里**,本机 `cargo test` 一行都编不到。改完必须
+  交叉编译一次;资源本身可以在 Linux 上验完:解析 PE 的资源目录,确认有
+  `RT_GROUP_ICON id=1`(这才是 `LoadImageW(.., IMAGE_ICON, ..)` 去找的东西,
+  不是 `RT_ICON`)以及各尺寸的 `RT_ICON`。
+- **`windres` 要 `-I assets`**:`.rc` 里写的是相对文件名,而它的搜索起点是进程的
+  工作目录(cargo 设成 crate 根),不是 `.rc` 所在目录。少了就报 "can't open icon file"。

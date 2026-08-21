@@ -17,6 +17,7 @@ pub mod frame;
 pub mod gpu;
 pub mod grid;
 pub mod host_key;
+pub mod icon_res;
 pub mod input;
 pub mod logx;
 pub mod pane;
