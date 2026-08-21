@@ -287,6 +287,41 @@ impl PaneState {
         self.cursor = Some(name.clone());
         self.anchor = Some(name.clone());
     }
+
+    /// F150:栏底状态行的文案。
+    ///
+    /// 这一行同时是**用户唯一能看见的选中证据** —— 用户报过「按 Ctrl 点,
+    /// 屏幕上完全没变化」,当时高亮画得比背景还暗,除了这行字之外没有任何
+    /// 途径能分辨「没选上」和「选上了但看不见」。
+    ///
+    /// 两条口径:
+    /// - 计数按**可见行**(`rows()`),不是 `entries.len()` —— 关着隐藏文件时
+    ///   两者不一样,报存储数跟用户眼睛看到的对不上。
+    /// - 体积只算文件。目录的 `size` 在 SFTP 里是元数据大小(常见 4096),
+    ///   加进去给出的是个没有意义的数;而全选目录时干脆不拼体积,拼出来
+    ///   「· 0 B」是在撒谎。
+    pub fn status_text(&self) -> String {
+        let rows = self.rows();
+        let picked: Vec<&Entry> = rows
+            .iter()
+            .copied()
+            .filter(|e| self.selected.contains(&e.name))
+            .collect();
+        if picked.is_empty() {
+            return format!("{} 项", rows.len());
+        }
+        let bytes: u64 = picked
+            .iter()
+            .filter(|e| e.kind != EntryKind::Dir)
+            .map(|e| e.size)
+            .sum();
+        let has_file = picked.iter().any(|e| e.kind != EntryKind::Dir);
+        if has_file {
+            format!("已选 {} 项 · {}", picked.len(), super::human_size(bytes))
+        } else {
+            format!("已选 {} 项", picked.len())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -605,5 +640,57 @@ mod tests {
         assert!(s.accept(seq, Err("没有那个文件".into())));
         assert!(s.entries.is_empty());
         assert_eq!(s.load, Load::Failed("没有那个文件".into()));
+    }
+
+    /// 没选中时状态行报的是**可见行数**,不是 `entries.len()` ——
+    /// 关着隐藏文件时两者不一样,报存储数就跟用户眼睛看到的对不上。
+    #[test]
+    fn the_status_line_counts_visible_rows_when_nothing_is_selected() {
+        let mut s = PaneState::new(rp("/"));
+        s.entries = vec![
+            e("a", EntryKind::File),
+            e("b", EntryKind::File),
+            e(".hidden", EntryKind::File),
+        ];
+        s.load = Load::Ready;
+        assert_eq!(s.status_text(), "2 项", "隐藏文件不该计进去");
+        s.show_hidden = true;
+        assert_eq!(s.status_text(), "3 项");
+    }
+
+    /// 选中时报条数 + 体积。体积只算文件 —— 目录的 `size` 在 SFTP 里是元数据
+    /// 大小(常见 4096),加进去给出的是一个没有意义的数。
+    #[test]
+    fn the_status_line_reports_the_selection_size_counting_files_only() {
+        let mut s = PaneState::new(rp("/"));
+        let mut big = e("big.bin", EntryKind::File);
+        big.size = 2048;
+        let mut small = e("small.txt", EntryKind::File);
+        small.size = 1024;
+        let mut dir = e("logs", EntryKind::Dir);
+        dir.size = 4096;
+        s.entries = vec![big, small, dir];
+        s.load = Load::Ready;
+        s.selected.insert(rp("big.bin"));
+        s.selected.insert(rp("small.txt"));
+        s.selected.insert(rp("logs"));
+        assert_eq!(
+            s.status_text(),
+            "已选 3 项 · 3.0 KB",
+            "3 条(含一个目录),体积只算两个文件的 2048+1024"
+        );
+    }
+
+    /// 只选了目录 → **不拼体积**。拼出来是「已选 1 项 · 0 B」,而目录当然
+    /// 不是 0 字节,那行字是在撒谎。
+    #[test]
+    fn a_directory_only_selection_omits_the_size_instead_of_claiming_zero_bytes() {
+        let mut s = PaneState::new(rp("/"));
+        let mut dir = e("logs", EntryKind::Dir);
+        dir.size = 4096;
+        s.entries = vec![dir];
+        s.load = Load::Ready;
+        s.selected.insert(rp("logs"));
+        assert_eq!(s.status_text(), "已选 1 项");
     }
 }
