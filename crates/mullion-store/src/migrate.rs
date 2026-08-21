@@ -451,6 +451,7 @@ kind = "password"
                     path: "/etc/nginx".into(),
                 },
             ],
+            local_bookmarks: Vec::new(),
         };
         let text = toml::to_string(&prefs).unwrap();
         let back: crate::sftp::SftpPrefs = toml::from_str(&text).unwrap();

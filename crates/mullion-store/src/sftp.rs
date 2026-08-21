@@ -34,4 +34,16 @@ pub struct SftpPrefs {
     pub default_local: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// F154:**本地**栏路径条上的 ☆ 收进来的目录(Windows 形态的绝对路径)。
+    ///
+    /// 与 `bookmarks` **分成两份**,不是一份混着存:两栏的路径空间毫无关系
+    /// (`D:\work` 和 `/var/log`),混在一起的话路径条那句「当前 cwd 在不在
+    /// 列表里」的现算判据会在两栏之间串味 —— 远端进到一个恰好同名的目录
+    /// 就会显示成已收藏。
+    ///
+    /// 挂在会话记录下(而不是全局):与 `bookmarks` 同一个存放位置、同一套
+    /// 「没有 `SessionId` 就置灰」的规则,代价是同一台机器的两条会话各存
+    /// 各的(设计 ③ 已认下)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_bookmarks: Vec<Bookmark>,
 }
