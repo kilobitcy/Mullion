@@ -13380,6 +13380,43 @@ mod tests {
         );
     }
 
+    /// **接线守护 / D0**:`ConnectOk` 每开一个标签必须把 `next_ws_generation`
+    /// 往前拨一格。
+    ///
+    /// 世代号是**标签路由键** —— `by_generation_mut`、`drive_*` 那几个每帧
+    /// 驱动函数、SFTP/传输/编辑的每一条回程事件,全靠它认领「这条结果是哪个
+    /// 标签的」。不自增的话第二个标签跟第一个同号,`by_generation_mut` 命中
+    /// 的永远是先找到的那个:症状是在新标签里下载的文件把进度画到旧标签上、
+    /// 关掉一个标签把另一个的传输一起取消,而且**两个标签本身都工作正常**,
+    /// 归因极难。
+    ///
+    /// 这条是重构期补的:变异测试(注释掉 `self.next_ws_generation += 1;`)
+    /// 实测**全绿放行**,1901 个测试没有一个抓得住 —— 因为它们几乎都只开
+    /// 一个标签,单标签下同号与不同号无从区分。
+    ///
+    /// 自证会变红:注释掉 `ConnectOk` 里的 `self.next_ws_generation += 1;`。
+    #[test]
+    fn every_new_tab_bumps_the_generation_so_it_is_a_unique_routing_key() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("UserEvent::ConnectOk {\n                handle,\n                wants_sftp,\n                pty,\n            } => {")
+            .nth(1)
+            .expect("找不到 ConnectOk 的事件分支");
+        let body = &after[..after
+            .find("\n            }\n")
+            .expect("找不到 ConnectOk 分支的结尾")];
+        assert!(
+            body.contains("let generation = self.next_ws_generation;"),
+            "ConnectOk 没有取世代号 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.next_ws_generation += 1;"),
+            "取了世代号却没往前拨 —— 下一个标签会拿到同一个号,\
+             by_generation_mut 从此认错标签(进度画到别的标签上、\
+             关一个标签取消另一个的传输),而两个标签本身都正常"
+        );
+    }
+
     /// **接线守护 / Task 5**:`ConnectOk` 必须**开新标签**,不许再顶掉活动标签。
     ///
     /// Task 2 的过渡实现是 `close_active()` + `open()`(单标签下与迁移前逐帧
@@ -15455,6 +15492,48 @@ mod tests {
             body.contains("h.tmux_bootstrap = Default::default();"),
             "换了连接却没重置 tmux 自举状态 —— 远端 tmux 服务器可能在断线\
              期间重启过,状态上报再也配不上"
+        );
+    }
+
+    /// **接线守护 / F128**:重连回来必须把这条 host 从 `reconnecting` 里摘掉。
+    ///
+    /// `reconnecting` 的语义是「这一帧不要再为它发起拨号」(判据在
+    /// `reconnect::hosts_to_redial`,60fps 下不去重就是一秒六十条连接)。
+    /// 拨号成功后不摘,这条 `(generation, host_ix)` 就**永远**留在表里,
+    /// `hosts_to_redial` 从此对它一律跳过 —— 症状是**第一次断线能自动重连,
+    /// 之后再断就再也不重连了**,而且没有任何报错:标题条显示 Reconnecting,
+    /// 一直转到用户手动点重连为止。用户感知是「自动重连时灵时不灵」。
+    ///
+    /// 这条是重构期补的:变异测试(删掉 `retain` 那两行)实测**全绿放行**,
+    /// 1901 个测试没有一个抓得住。
+    ///
+    /// 锚点拆开拼,理由同 `reconnect_drops_the_dead_sftp_client`。
+    ///
+    /// 自证会变红:删掉分支开头的 `self.reconnecting.retain(...)` 那两行。
+    #[test]
+    fn a_finished_reconnect_is_taken_out_of_the_in_flight_table_so_the_next_drop_redials() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("self.reconnecting"),
+            "重连回来没碰 reconnecting 表 —— 这条 host 永远停在「拨号在途」,\
+             以后再断线 hosts_to_redial 一律跳过,自动重连永久失效"
+        );
+        assert!(
+            body.contains(".retain(|(g, h, _)| !(*g == generation && *h == host_ix));"),
+            "摘除条件不是「同世代同 host」—— 条件写宽了会把别的标签仍在途的\
+             拨号一起摘掉(那条会被重复发起),写窄了等于没摘"
         );
     }
 
