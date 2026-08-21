@@ -128,6 +128,9 @@ pub struct EditorBuffer {
     pub preserved_terminal: TerminalPrefs,
     pub preserved_appearance: AppearancePrefs,
     pub preserved_automation: AutomationPrefs,
+    /// F154:本地书签。表单里没有对应字段(本地目录收藏是在文件面板上点
+    /// ☆ 加的),原样带着走 —— 不带的话保存一次就全没了,静默。
+    pub preserved_local_bookmarks: Vec<mullion_store::Bookmark>,
 
     /// 「浏览…」按钮本帧被点了。`mod.rs` 在借用释放后转成
     /// `UiState::pick_key_request`,随即复位。
@@ -182,6 +185,7 @@ impl Default for EditorBuffer {
             preserved_terminal: TerminalPrefs::default(),
             preserved_appearance: AppearancePrefs::default(),
             preserved_automation: AutomationPrefs::default(),
+            preserved_local_bookmarks: Vec::new(),
             pick_key_clicked: false,
             pick_icon_clicked: false,
             sftp_default_remote: String::new(),
@@ -265,6 +269,7 @@ impl std::fmt::Debug for EditorBuffer {
             .field("preserved_terminal", &self.preserved_terminal)
             .field("preserved_appearance", &self.preserved_appearance)
             .field("preserved_automation", &self.preserved_automation)
+            .field("preserved_local_bookmarks", &self.preserved_local_bookmarks)
             .field("sftp_default_remote", &self.sftp_default_remote)
             .field("sftp_default_local", &self.sftp_default_local)
             .field("sftp_bookmarks", &self.sftp_bookmarks)
@@ -329,6 +334,7 @@ impl EditorBuffer {
             preserved_terminal: rec.terminal.clone(),
             preserved_appearance: rec.appearance.clone(),
             preserved_automation: rec.automation.clone(),
+            preserved_local_bookmarks: rec.sftp.local_bookmarks.clone(),
             sftp_default_remote: rec.sftp.default_remote.clone().unwrap_or_default(),
             sftp_default_local: rec.sftp.default_local.clone().unwrap_or_default(),
             sftp_bookmarks: rec
@@ -727,6 +733,8 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
                     path: path.clone(),
                 })
                 .collect(),
+            // F154:表单里没有这一项,原样带回去(同 `preserved_automation`)。
+            local_bookmarks: buf.preserved_local_bookmarks.clone(),
         },
         secret: None,
     };
@@ -1016,10 +1024,43 @@ mod tests {
                 name: "日志".into(),
                 path: "/var/log".into(),
             }],
+            local_bookmarks: Vec::new(),
         };
         let buf = EditorBuffer::from_record(&rec);
         let draft = build_draft(&buf).unwrap();
         assert_eq!(draft.sftp, rec.sftp, "SFTP 默认目录与书签必须原样往返");
+    }
+
+    /// F154:本地书签不是表单字段,`build_draft` 是整份重建 `SftpPrefs` ——
+    /// 不显式保住的话,用户在会话编辑器里点一次「保存」就把它们全清了,
+    /// **而且没有任何提示**(同 `preserved_automation` 那条的教训)。
+    ///
+    /// 自证会变红:把 `build_draft` 里的
+    /// `local_bookmarks: buf.preserved_local_bookmarks.clone()` 换成
+    /// `local_bookmarks: Vec::new()`。
+    #[test]
+    fn local_bookmarks_survive_an_editor_round_trip_even_though_no_field_shows_them() {
+        let mut rec = rec_with_jump(None);
+        rec.sftp = mullion_store::SftpPrefs {
+            default_remote: Some("/srv/app".into()),
+            default_local: Some(r"D:\work".into()),
+            bookmarks: vec![mullion_store::Bookmark {
+                name: "日志".into(),
+                path: "/var/log".into(),
+            }],
+            local_bookmarks: vec![mullion_store::Bookmark {
+                name: "工程".into(),
+                path: r"D:\work\proj".into(),
+            }],
+        };
+        let buf = EditorBuffer::from_record(&rec);
+        let draft = build_draft(&buf).expect("表单该能转回草稿");
+        assert_eq!(
+            draft.sftp.local_bookmarks.len(),
+            1,
+            "编辑器保存把本地书签清空了"
+        );
+        assert_eq!(draft.sftp.local_bookmarks[0].path, r"D:\work\proj");
     }
 
     /// **F120 记录一处刻意保留的超范围行为**:路径是纯空白的书签行会在
