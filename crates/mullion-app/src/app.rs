@@ -3046,6 +3046,25 @@ impl App {
             log::warn!("本地栏收到了 Reconnect,已忽略(本地栏没有连接概念)");
             return;
         }
+        // F154:本地目录收藏。**在借出 `files` 之前分流** —— 它们要
+        // `&mut self`(store + 存盘),借着 `tab.content.files_panel_mut()`
+        // 是调不了的;而且它们不改当前目录,不该走下面那条 `target` 的路。
+        match &action {
+            FileAction::BookmarkAdd { name, path } => {
+                self.add_bookmark(
+                    generation,
+                    path.clone(),
+                    name.clone(),
+                    crate::files::PanelColumn::Local,
+                );
+                return;
+            }
+            FileAction::BookmarkRemove { path } => {
+                self.remove_bookmark(generation, path.clone(), crate::files::PanelColumn::Local);
+                return;
+            }
+            _ => {}
+        }
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
@@ -3082,7 +3101,11 @@ impl App {
                 return;
             }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
-            FileAction::Transfer | FileAction::Drop(_) | FileAction::Reconnect => return,
+            FileAction::Transfer
+            | FileAction::Drop(_)
+            | FileAction::Reconnect
+            | FileAction::BookmarkAdd { .. }
+            | FileAction::BookmarkRemove { .. } => return,
             // D5:本地文件在资源管理器里双击就行,`menu_items_for` 也不给
             // 这两项。到这儿同样说明菜单构造被改坏了。
             FileAction::EditExternal | FileAction::EditInline => {
@@ -3095,12 +3118,6 @@ impl App {
                     self.ui.set_error(e);
                     self.ui_dirty = true;
                 }
-                return;
-            }
-            // F139:书签只给远端栏(本地栏调用点传的是 `BookmarkView::none()`,
-            // 连 ☆ 都画不出来)。到这儿说明接线接错了,不静默吞。
-            FileAction::BookmarkAdd { .. } | FileAction::BookmarkRemove { .. } => {
-                log::warn!("本地栏收到了书签动作,已忽略(书签只属于远端栏)");
                 return;
             }
         };
@@ -3181,11 +3198,16 @@ impl App {
             // 不改当前目录,只改会话配置;而且要借 `self.store`,夹不进后面
             // 那段借着 `tab` 的代码里。
             FileAction::BookmarkAdd { name, path } => {
-                self.add_bookmark(generation, path.clone(), name.clone());
+                self.add_bookmark(
+                    generation,
+                    path.clone(),
+                    name.clone(),
+                    crate::files::PanelColumn::Remote,
+                );
                 return;
             }
             FileAction::BookmarkRemove { path } => {
-                self.remove_bookmark(generation, path.clone());
+                self.remove_bookmark(generation, path.clone(), crate::files::PanelColumn::Remote);
                 return;
             }
             _ => {}
@@ -3263,7 +3285,17 @@ impl App {
     ///
     /// 存盘立刻做(`store.save()`),不攒着 —— 收藏是随手动作,用户不会为它
     /// 去点「保存」;攒到退出再写的话,一次崩溃就全没了。
-    fn add_bookmark(&mut self, generation: u64, path: String, name: String) {
+    ///
+    /// F154:`column` 决定落在哪一份列表上。两栏的路径空间毫无关系
+    /// (`D:\work` 和 `/var/log`),混着存会让路径条那句「当前 cwd 在不在
+    /// 列表里」的现算判据在两栏之间串味。
+    fn add_bookmark(
+        &mut self,
+        generation: u64,
+        path: String,
+        name: String,
+        column: crate::files::PanelColumn,
+    ) {
         let Some(sid) = self
             .tabs
             .by_generation(generation)
@@ -3278,11 +3310,14 @@ impl App {
             name,
             path: path.clone(),
         };
+        let local = column == crate::files::PanelColumn::Local;
         if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store
-                .add_bookmark(sid, mark.clone())
-                .and_then(|_| store.save())
-            {
+            let r = if local {
+                store.add_local_bookmark(sid, mark.clone())
+            } else {
+                store.add_bookmark(sid, mark.clone())
+            };
+            if let Err(e) = r.and_then(|_| store.save()) {
                 self.ui.set_error(e.to_string());
                 return;
             }
@@ -3292,16 +3327,27 @@ impl App {
             .by_generation_mut(generation)
             .and_then(|t| t.content.files_panel_mut())
         {
+            let list = if local {
+                &mut files.local_bookmarks
+            } else {
+                &mut files.bookmarks
+            };
             // 去重判据与 store 侧同一条(按路径),两边不许分叉。
-            if !files.bookmarks.iter().any(|b| b.path == mark.path) {
-                files.bookmarks.push(mark);
+            if !list.iter().any(|b| b.path == mark.path) {
+                list.push(mark);
             }
         }
         self.ui_dirty = true;
     }
 
-    /// F139:取消收藏。按路径相等匹配 —— 书签的身份就是路径。
-    fn remove_bookmark(&mut self, generation: u64, path: String) {
+    /// F139/F154:取消收藏。按路径相等匹配 —— 书签的身份就是路径。
+    /// `column` 的含义同 `add_bookmark`。
+    fn remove_bookmark(
+        &mut self,
+        generation: u64,
+        path: String,
+        column: crate::files::PanelColumn,
+    ) {
         let Some(sid) = self
             .tabs
             .by_generation(generation)
@@ -3310,8 +3356,14 @@ impl App {
             log::warn!("收到 BookmarkRemove 但标签没有 SessionId,已忽略");
             return;
         };
+        let local = column == crate::files::PanelColumn::Local;
         if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store.remove_bookmark(sid, &path).and_then(|_| store.save()) {
+            let r = if local {
+                store.remove_local_bookmark(sid, &path)
+            } else {
+                store.remove_bookmark(sid, &path)
+            };
+            if let Err(e) = r.and_then(|_| store.save()) {
                 self.ui.set_error(e.to_string());
                 return;
             }
@@ -3321,7 +3373,11 @@ impl App {
             .by_generation_mut(generation)
             .and_then(|t| t.content.files_panel_mut())
         {
-            files.bookmarks.retain(|b| b.path != path);
+            if local {
+                files.local_bookmarks.retain(|b| b.path != path);
+            } else {
+                files.bookmarks.retain(|b| b.path != path);
+            }
         }
         self.ui_dirty = true;
     }
@@ -10363,7 +10419,39 @@ mod tests {
                 body.contains("store.save()"),
                 "{f} 只改了内存没存盘:收藏在重启后消失(F139)"
             );
+            // F154:两栏各有一条 store 路径和一份帧内镜像,漏掉任何一条的
+            // 症状都是「某一栏的 ☆ 点了没反应 / 重启后没了」,且不报错。
+            assert!(
+                body.contains("PanelColumn::Local"),
+                "{f} 没有按栏分流 —— 本地栏的收藏会写进远端那份列表"
+            );
+            assert!(
+                body.contains("local_bookmarks"),
+                "{f} 没碰本地那份镜像 —— 本地栏收藏后这一帧不会变实心"
+            );
         }
+    }
+
+    /// F154 接线守护:本地栏收到书签动作要**真处理**,不是记一条 warn 扔掉。
+    ///
+    /// 自证会变红:把 `apply_local_file_action` 里那两条分支改回
+    /// `log::warn!("本地栏收到了书签动作,已忽略(书签只属于远端栏)")`。
+    #[test]
+    fn the_local_column_actually_stores_its_bookmarks() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn apply_local_file_action")
+            .nth(1)
+            .expect("找不到 apply_local_file_action");
+        let body = &after[..after.find("\n    fn ").expect("找不到该函数的结尾")];
+        assert!(
+            body.contains("self.add_bookmark(") && body.contains("self.remove_bookmark("),
+            "本地栏没接上书签落盘 —— ☆ 点了什么都不会发生"
+        );
+        assert!(
+            !body.contains("书签只属于远端栏"),
+            "本地栏还在把书签动作当接线错误扔掉(F154 已经把它接上了)"
+        );
     }
 
     /// F121:拖拽排序落盘走的也是 keyring/TOML 同步 IO,跟删除/保存/移动分组

@@ -137,6 +137,20 @@ impl SessionStore {
         self.vault.remove_bookmark(id, path)
     }
 
+    /// F154:**本地**栏路径条上的 ☆。另一份列表,见 `Vault::add_local_bookmark`。
+    pub fn add_local_bookmark(
+        &mut self,
+        id: SessionId,
+        mark: mullion_store::Bookmark,
+    ) -> Result<(), StoreError> {
+        self.vault.add_local_bookmark(id, mark)
+    }
+
+    /// F154:取消收藏本地目录。见 `Vault::remove_local_bookmark`。
+    pub fn remove_local_bookmark(&mut self, id: SessionId, path: &str) -> Result<(), StoreError> {
+        self.vault.remove_local_bookmark(id, path)
+    }
+
     /// F121:左栏拖拽排序。见 `Vault::move_session`。
     pub fn move_session(
         &mut self,
