@@ -54,7 +54,7 @@ pub enum UserEvent {
     /// 异步 connect 失败,已格式化的可操作错误(F6 分类由 `session::connect` 内部给)。
     ConnectErr(String),
     /// 私钥文件对话框结束。`None` = 用户取消/对话框失败——也要回送,否则
-    /// `key_picker_busy` 永远清不掉,以后再点「选择…」就没反应了。
+    /// `PickerBusy::key` 永远清不掉,以后再点「选择…」就没反应了。
     KeyPathPicked(Option<PathBuf>),
     /// F74:凭据表单里那次私钥选择的结果。与 `KeyPathPicked` **分开**——
     /// 正文要写进哪个缓冲(会话的还是凭据的),只有事件变体分得清。
@@ -317,7 +317,7 @@ struct AutomationHandle {
 /// 这些东西 —— 标题条要的名字/地址、外观要的 `SessionId`、以及新节点的登录后
 /// 命令,全都得在**用户选中那一帧**算好存下来。
 ///
-/// 理由同 `pending_automation_template`:拨号是真实网络往返(高延迟代理链路
+/// 理由同 `PendingAutomationState::template`:拨号是真实网络往返(高延迟代理链路
 /// 下几百 ms 到几秒),这期间用户完全可能去会话管理器把这条会话改了甚至删了,
 /// 到那时再回头查库,发出去的字节就跟他选中时看到的对不上。
 struct PendingRehost {
@@ -1487,15 +1487,8 @@ pub struct App {
     /// 窗口可见性。Windows 最小化会送 `Resized(0,0)`,此时必须整帧跳过 GPU 与
     /// grid 传播,只保留 IO 泵(见 `shell::window_state`)。
     visible: shell::window_state::Visibility,
-    /// 文件对话框线程是否在跑。防止连点「选择…」开出多个对话框
-    /// (Windows 上主窗被 owner 关系禁用,Linux/XDG 未必)。
-    key_picker_busy: bool,
-    /// 图标文件对话框是否在跑。跟 `key_picker_busy` 分开 —— 两个按钮在不同
-    /// Tab 上,共用一个标志会让「刚选完私钥」把图标按钮也按不动。
-    icon_picker_busy: bool,
-    /// F2:ssh config 文件对话框是否在跑。同样单独一个 —— 它开在菜单栏上,
-    /// 跟会话/凭据编辑器里的两个按钮互不相干。
-    import_picker_busy: bool,
+    /// 三个文件对话框各自的在跑标志,见 `PickerBusy`。
+    picker_busy: PickerBusy,
     /// egui 侧有内容待画(菜单展开/hover/弹窗/错误提示)。与「终端来了新字节」是
     /// 两个独立脏源,`frame::frame_is_dirty` 取并集——只看终端字节的话,远端一安静
     /// egui 的交互就被 `RedrawAction::Idle` 吞掉,菜单点不开。
@@ -1602,28 +1595,9 @@ pub struct App {
     /// 在途拨测任务。退出或取消时 abort —— 20 秒的 timeout 悬着不管,
     /// 关窗后进程还要多活 20 秒。
     probe_task: Option<tokio::task::JoinHandle<()>>,
-    /// `spawn_connect` 算好、等 `ConnectOk` 抵达时启用的计划。
-    ///
-    /// 在 `spawn_connect`(用户点击那一帧)算而不是 `ConnectOk` 里算:
-    /// `ConnectOk` 不携带 `SessionId`,到那时只能读 `ui.connect_request_last`,
-    /// 而连接在途期间用户完全可能改了配置甚至删了这条会话。
-    pending_automation: Option<crate::automation::PendingAutomation>,
-    /// 同一次点击算好的自动化配置**原件**,`ConnectOk` 抵达时移交给新标签的
-    /// `automation_template`,供后来的 pane(分屏 / 换节点)复用。
-    ///
-    /// 跟 `pending_automation` 在同一帧、由同一次 `store.resolved()` 算出,
-    /// 理由一模一样:连接在途期间用户改了配置,分屏发出去的字节就跟他点
-    /// 「连接」时看到的对不上了。
-    pending_automation_template: Option<mullion_store::ResolvedAutomation>,
-    /// F141:同一次点击里取到的**会话名**(tmux 会话名的兜底来源)。
-    /// `ConnectOk` 抵达时跟模板一起用来算 `TerminalTab::tmux_attach`。
-    ///
-    /// 单独存一份而不是到时候回头查库:理由同 `pending_automation_template`
-    /// ——连接在途期间用户可能把会话改名,那时候算出来的会话名就不是这次真的
-    /// attach 上去的那个了。
-    pending_automation_name: Option<String>,
-    /// F44 右键「连接(跳过自动化)」的一次性标志。`ConnectOk` 消费后立即清零。
-    pending_skip_automation: bool,
+    /// F40~F44/F141:一次「点连接」那一帧算好、等 `ConnectOk` 抵达时消费的
+    /// 自动化待决包,见 `PendingAutomationState`。
+    pending_automation: PendingAutomationState,
     /// 换节点在途的那些。`Vec` 而不是 `Option`:两块 pane 可以同时在换
     /// (弹窗一次只开一个,但拨号是异步的,第一次还没回来就能发起第二次),
     /// 用 `Option` 的话后发的会把先发的元信息顶掉 —— 现象是换好之后标题条
@@ -1662,6 +1636,45 @@ struct TransferState {
     /// 每条 job 的完整参数(见 `TransferSpec`)。job 真正走完(不是挂在冲突上)
     /// 之后删掉,不然队列清空了它还在涨。
     specs: std::collections::HashMap<u64, TransferSpec>,
+}
+
+/// 三个文件对话框各自的「线程在跑吗」标志。防止连点「选择…」开出多个
+/// 对话框(Windows 上主窗被 owner 关系禁用,Linux/XDG 未必)。
+///
+/// **这三个必须各是各的,绝不能合并成一个 `bool`** —— 收在同一个结构里
+/// 是为了少占 `App` 的字段位,不是因为它们可以共用状态。三个按钮分别在
+/// 会话编辑器的「连接」Tab、会话编辑器的「外观」Tab、和菜单栏上;共用
+/// 一个标志的现象是「刚选完私钥,图标按钮就按不动了」。
+#[derive(Default)]
+struct PickerBusy {
+    /// 私钥文件对话框。
+    key: bool,
+    /// 图标文件对话框。
+    icon: bool,
+    /// F2:ssh config 文件对话框。
+    import: bool,
+}
+
+/// F40~F44/F141:一次「点连接」在**那一帧**算好、等 `ConnectOk` 抵达时
+/// 消费的自动化待决包。
+///
+/// 四项由同一次点击、同一次 `store.resolved()` 算出,也在同一处消费。
+/// **都是在点击帧算而不是 `ConnectOk` 里算**:`ConnectOk` 不携带
+/// `SessionId`,到那时只能回头读库,而连接在途期间用户完全可能改了配置、
+/// 把会话改名、甚至删掉它 —— 那样分屏发出去的字节就跟他点「连接」时
+/// 看到的对不上了。
+#[derive(Default)]
+struct PendingAutomationState {
+    /// 等 `ConnectOk` 抵达时启用的计划。
+    plan: Option<crate::automation::PendingAutomation>,
+    /// 自动化配置**原件**,`ConnectOk` 抵达时移交给新标签的
+    /// `automation_template`,供后来的 pane(分屏 / 换节点)复用。
+    template: Option<mullion_store::ResolvedAutomation>,
+    /// F141:**会话名**(tmux 会话名的兜底来源)。`ConnectOk` 抵达时跟
+    /// `template` 一起用来算 `TerminalTab::tmux_attach`。
+    session_name: Option<String>,
+    /// F44 右键「连接(跳过自动化)」的一次性标志。`ConnectOk` 消费后立即清零。
+    skip: bool,
 }
 
 impl TransferState {
@@ -1831,9 +1844,7 @@ impl App {
             ui: crate::ui::UiState::default(),
             store: None,
             visible: shell::window_state::Visibility::default(),
-            key_picker_busy: false,
-            icon_picker_busy: false,
-            import_picker_busy: false,
+            picker_busy: PickerBusy::default(),
             ui_dirty: true, // 首帧必须画出来
             files_sidebar_was_open: false,
             cursor_px: (0.0, 0.0),
@@ -1866,12 +1877,9 @@ impl App {
             appearance: Default::default(),
             probe_epoch: 0,
             probe_task: None,
-            pending_automation: None,
-            pending_automation_template: None,
-            pending_automation_name: None,
+            pending_automation: PendingAutomationState::default(),
             pending_rehost: Vec::new(),
             reconnecting: Vec::new(),
-            pending_skip_automation: false,
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
             // F56:默认 4 条并发。可配 UI 是 D2-c 的欠账,先按设计定的默认值走。
@@ -5027,10 +5035,10 @@ impl App {
         }
         // 同一次解析里顺手留一份**原件**:后来的 pane(分屏新开的、换过节点的)
         // 要按它算「跳过 tmux」的计划。绝不等到分屏那一刻再查库——那时用户可能
-        // 已经改了配置(见 `pending_automation_template` 的文档)。
+        // 已经改了配置(见 `PendingAutomationState::template` 的文档)。
         let mut tpl: Option<mullion_store::ResolvedAutomation> = None;
         // F141:同一次解析里把会话名也留一份 —— 重连要按**当初**那个名字把
-        // tmux 会话接回来(见 `pending_automation_name`)。
+        // tmux 会话接回来(见 `PendingAutomationState::session_name`)。
         let mut fallback_name: Option<String> = None;
         let plan = crate::automation::pending_for(self.ui.connect_request_last, |id| {
             let store = self.store.as_ref()?;
@@ -5048,9 +5056,9 @@ impl App {
             fallback_name = Some(name.clone());
             Some((resolved.automation, name))
         });
-        self.pending_automation = plan;
-        self.pending_automation_template = tpl;
-        self.pending_automation_name = fallback_name;
+        self.pending_automation.plan = plan;
+        self.pending_automation.template = tpl;
+        self.pending_automation.session_name = fallback_name;
         // 会话管理器发起的连接也要记下,否则第二次连接后开分屏会用上一台
         // 主机的 term/尺寸(F35 的 open_pty 靠它)。`ConnectOk` 抵达时移交给
         // 新建的标签。
@@ -6097,11 +6105,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // 模板跟计划**同进同退**:只有这次真的要跑自动化,才把配置留给
                 // 后来的 pane。否则「右键跳过一次」在分屏时会失效——用户明确
                 // 说了这次不跑,分屏出来的 pane 却照跑不误。
-                let tpl = self.pending_automation_template.take();
-                let tmux_name = self.pending_automation_name.take();
+                let tpl = self.pending_automation.template.take();
+                let tmux_name = self.pending_automation.session_name.take();
                 if let Some(plan) = crate::automation::take_pending(
-                    &mut self.pending_automation,
-                    &mut self.pending_skip_automation,
+                    &mut self.pending_automation.plan,
+                    &mut self.pending_automation.skip,
                 ) {
                     // S1:挂回**属主标签**(按世代号查),不用「活动标签」——
                     // `open` 刚把新标签设为活动,今天两者等价,但那是巧合:
@@ -6498,7 +6506,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_ui_redraw();
             }
             UserEvent::KeyPathPicked(picked) => {
-                self.key_picker_busy = false;
+                self.picker_busy.key = false;
                 if let Some(p) = picked {
                     if let Some(buf) = self.ui.editor.as_mut() {
                         // v5:选中的文件当场读成正文存进缓冲,路径不留。
@@ -6513,7 +6521,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_ui_redraw();
             }
             UserEvent::CredentialKeyPathPicked(picked) => {
-                self.key_picker_busy = false;
+                self.picker_busy.key = false;
                 if let Some(p) = picked {
                     if let Some(buf) = self.ui.credential_editor.as_mut() {
                         crate::ui::session_manager::import_credential_key_file(buf, &p, |p| {
@@ -6527,7 +6535,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_ui_redraw();
             }
             UserEvent::SshConfigPicked(picked) => {
-                self.import_picker_busy = false;
+                self.picker_busy.import = false;
                 if let Some(p) = picked {
                     match std::fs::read_to_string(&p) {
                         Ok(text) => {
@@ -6547,7 +6555,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_ui_redraw();
             }
             UserEvent::IconPathPicked(picked) => {
-                self.icon_picker_busy = false;
+                self.picker_busy.icon = false;
                 if let Some(p) = picked {
                     if let Some(buf) = self.ui.editor.as_mut() {
                         self.ui.icon_error =
@@ -8258,16 +8266,16 @@ impl ApplicationHandler<UserEvent> for App {
                     self.refresh_appearance();
                 }
                 // 「选择…」私钥文件:同样是 egui 闭包只记意图、这里才施加。
-                if std::mem::take(&mut self.ui.pick_key_request) && !self.key_picker_busy {
-                    self.key_picker_busy = true;
+                if std::mem::take(&mut self.ui.pick_key_request) && !self.picker_busy.key {
+                    self.picker_busy.key = true;
                     self.spawn_file_picker("选择私钥文件", None, None, UserEvent::KeyPathPicked);
                 }
-                // 凭据表单里的「选择…」私钥。与会话侧共用 `key_picker_busy`
+                // 凭据表单里的「选择…」私钥。与会话侧共用 `PickerBusy::key`
                 // (一次只该开一个对话框),但回送的是**另一个事件** ——
                 // 正文要写进哪个缓冲,只有事件变体分得清。
-                if std::mem::take(&mut self.ui.pick_credential_key_request) && !self.key_picker_busy
+                if std::mem::take(&mut self.ui.pick_credential_key_request) && !self.picker_busy.key
                 {
-                    self.key_picker_busy = true;
+                    self.picker_busy.key = true;
                     self.spawn_file_picker(
                         "选择私钥文件",
                         None,
@@ -8277,8 +8285,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // 「导入 .ico…」:同上。加扩展名过滤,免得用户选中 .png 才被
                 // 告知不行 —— 归一化只吃 .ico 容器。
-                if std::mem::take(&mut self.ui.pick_icon_request) && !self.icon_picker_busy {
-                    self.icon_picker_busy = true;
+                if std::mem::take(&mut self.ui.pick_icon_request) && !self.picker_busy.icon {
+                    self.picker_busy.icon = true;
                     self.spawn_file_picker(
                         "选择图标文件",
                         Some(("图标", &["ico"])),
@@ -8288,8 +8296,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // F2:导入 ssh config。初始目录指向 `~/.ssh`(设计 D7),
                 // 省掉用户手动翻目录;不加扩展名过滤 —— config 文件没有后缀。
-                if std::mem::take(&mut self.ui.import_pick_request) && !self.import_picker_busy {
-                    self.import_picker_busy = true;
+                if std::mem::take(&mut self.ui.import_pick_request) && !self.picker_busy.import {
+                    self.picker_busy.import = true;
                     self.spawn_file_picker(
                         "选择 ssh config 文件",
                         None,
@@ -8317,7 +8325,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // 一次**失败**的连接尝试(配置坏了走 Err 支)会把标志
                             // 留给另一条还在途的连接:用户没点过跳过,那条连接的
                             // 自动化却被 `take_pending` 静默丢掉。
-                            self.pending_skip_automation = skip_automation;
+                            self.pending_automation.skip = skip_automation;
                             self.spawn_connect(cfg, wants_sftp);
                         }
                         Some(Err(e)) => self.ui.set_error(e.to_string()),
