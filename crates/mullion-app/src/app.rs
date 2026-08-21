@@ -1650,8 +1650,20 @@ pub struct App {
     /// 每条 job 的完整参数(见 `TransferSpec`)。job 真正走完(不是挂在冲突上)
     /// 之后删掉,不然队列清空了它还在涨。
     transfer_specs: std::collections::HashMap<u64, TransferSpec>,
+    /// F53:外部/内置编辑的全部状态,见 `EditState`。
+    edit: EditState,
+}
+
+/// F53:一次「把远端文件拉下来编辑再回传」牵扯到的全部状态。
+///
+/// **收成一个结构而不是散在 `App` 上**:这五项的生命周期是**同一条**——
+/// 一条编辑从 `sessions.add` 起算,`close_edit` 时必须同时摘掉它的 watcher、
+/// original、conflict。散着放时每加一条清理路径都得记得凑齐五处,漏一处的
+/// 表现是「关掉的文件还在后台被 stat」或「第二次编辑不再备份原文」,而且
+/// 两者都不报错。聚在一起之后,漏没漏一眼就能看出来。
+struct EditState {
     /// F53:所有还挂在监视里的编辑。跨标签一份,理由同 `transfer_queue`。
-    edits: crate::edit::sessions::EditSessions,
+    sessions: crate::edit::sessions::EditSessions,
     /// F53:内置编辑器窗口。**同一时刻只开一个** —— 多开的价值远小于
     /// 「哪个窗口对应哪个文件」带来的混乱,而这里每个窗口背后都是一次
     /// 会覆盖远端文件的写。
@@ -1661,17 +1673,30 @@ pub struct App {
     /// **不走事件循环的 `WaitUntil`**:那条路径是 T3/T7 的高压区(三个分支
     /// 都要显式复位 `control_flow`),为一个「一秒一次的文件 stat」去动它
     /// 得不偿失。tokio 任务经 `proxy` 回送事件,天然会唤醒事件循环。
-    edit_watchers: std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
+    watchers: std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
     /// F53/D3-7:打开那一刻读到的原文,用来在**第一次**回传前留一份
     /// `.mullion.bak`。回传成功后即丢 —— 之后远端那份就是我们自己写的,
     /// 再备份一次既没有意义又要多传一遍全量。
-    edit_originals: std::collections::HashMap<u64, Vec<u8>>,
+    originals: std::collections::HashMap<u64, Vec<u8>>,
     /// F53:撞上冲突时远端**当时**的戳。「保留远端」要拿它刷快照(D3-9),
     /// 「覆盖远端」要拿它当新的比对基准 —— 否则覆盖那一下会再撞一次冲突。
-    edit_conflicts: std::collections::HashMap<u64, crate::edit::sessions::RemoteStamp>,
+    conflicts: std::collections::HashMap<u64, crate::edit::sessions::RemoteStamp>,
     /// F53:外部编辑用的临时文件根目录。退出时整棵删掉(D3-12)。
     /// 进程启动时算一次 —— `directories` 每次调用都要摸环境变量。
-    edit_root: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+impl EditState {
+    fn new() -> Self {
+        Self {
+            sessions: crate::edit::sessions::EditSessions::new(),
+            editor: None,
+            watchers: std::collections::HashMap::new(),
+            originals: std::collections::HashMap::new(),
+            conflicts: std::collections::HashMap::new(),
+            root: crate::edit::tempdir::root(),
+        }
+    }
 }
 
 /// 一种会盖住主界面的模态弹窗。
@@ -1833,12 +1858,7 @@ impl App {
             transfer_queue: crate::files::queue::Queue::new(DEFAULT_TRANSFER_CONCURRENCY),
             transfer_cancels: std::collections::HashMap::new(),
             transfer_specs: std::collections::HashMap::new(),
-            edits: crate::edit::sessions::EditSessions::new(),
-            editor: None,
-            edit_watchers: std::collections::HashMap::new(),
-            edit_originals: std::collections::HashMap::new(),
-            edit_conflicts: std::collections::HashMap::new(),
-            edit_root: crate::edit::tempdir::root(),
+            edit: EditState::new(),
         }
     }
 
@@ -2681,7 +2701,7 @@ impl App {
             // F2:导入预览弹窗。里面没有输入框,但有「导入 N 条」这种一按就
             // 落库的按钮,而空格/回车在 egui 里是按钮的激活键 —— T8。
             Modal::Import => self.ui.import.is_some(),
-            Modal::Editor => self.editor.is_some(),
+            Modal::Editor => self.edit.editor.is_some(),
             Modal::FilesDialog => self.ui.files_dialog.is_some(),
             Modal::GroupManager => self.ui.group_manager_open,
             // E2/E3:标签属性弹窗里有名字输入框 —— 不算模态的话,敲的字会
@@ -3754,7 +3774,7 @@ impl App {
         };
         let session = tab.title.clone();
         let label = remote.display().to_string();
-        let local = crate::edit::tempdir::temp_path(&self.edit_root, &session, &remote);
+        let local = crate::edit::tempdir::temp_path(&self.edit.root, &session, &remote);
         match kind {
             // 外部编辑对内容**完全透明**:字节原样落盘、原样传回。二进制也照开,
             // 用户自己知道 .png 该用什么程序打开(D3-3 那条「二进制拒绝」是
@@ -3775,9 +3795,10 @@ impl App {
                     return;
                 }
                 let key = self
-                    .edits
+                    .edit
+                    .sessions
                     .add(generation, kind, remote, local.clone(), snapshot);
-                self.edit_originals.insert(key, bytes);
+                self.edit.originals.insert(key, bytes);
                 self.watch_edit(key, local);
                 self.ui
                     .set_toast(format!("已交给默认程序:{label}。存盘后自动回传"));
@@ -3789,9 +3810,12 @@ impl App {
                 // **不起看门任务**(「变了没有」窗口自己知道)。`local` 仍然
                 // 记着,只为「结束编辑」时统一走同一条清理路径(删不存在的
                 // 文件本来就不报错)。
-                let key = self.edits.add(generation, kind, remote, local, snapshot);
-                self.edit_originals.insert(key, bytes);
-                self.editor = Some(crate::ui::editor_window::EditorState::new(
+                let key = self
+                    .edit
+                    .sessions
+                    .add(generation, kind, remote, local, snapshot);
+                self.edit.originals.insert(key, bytes);
+                self.edit.editor = Some(crate::ui::editor_window::EditorState::new(
                     key,
                     label,
                     text,
@@ -3830,14 +3854,14 @@ impl App {
                 }
             }
         });
-        if let Some(old) = self.edit_watchers.insert(key, task) {
+        if let Some(old) = self.edit.watchers.insert(key, task) {
             old.abort();
         }
     }
 
     /// F53:看门任务报了一次本地状态。
     fn on_edit_tick(&mut self, key: u64, stamp: Option<crate::edit::sessions::LocalStamp>) {
-        for k in self.edits.changed_locally(&[(key, stamp)]) {
+        for k in self.edit.sessions.changed_locally(&[(key, stamp)]) {
             self.push_edit(k, None);
         }
     }
@@ -3852,7 +3876,7 @@ impl App {
     /// 所以走的还是这同一条函数,不需要一条「强制写」的旁路。
     fn push_edit(&mut self, key: u64, bytes: Option<Vec<u8>>) {
         use crate::edit::sessions::EditState;
-        let Some(e) = self.edits.get(key) else {
+        let Some(e) = self.edit.sessions.get(key) else {
             return;
         };
         let (generation, remote, local, snapshot, saved_once) = (
@@ -3878,7 +3902,7 @@ impl App {
         let backup = if saved_once {
             None
         } else {
-            self.edit_originals.get(&key).cloned()
+            self.edit.originals.get(&key).cloned()
         };
         let client = match self
             .tabs
@@ -3891,7 +3915,7 @@ impl App {
                 return;
             }
         };
-        if let Some(e) = self.edits.get_mut(key) {
+        if let Some(e) = self.edit.sessions.get_mut(key) {
             e.state = EditState::Uploading;
         }
         let proxy = self.proxy.clone();
@@ -3908,10 +3932,10 @@ impl App {
     fn fail_edit(&mut self, key: u64, why: String) {
         use crate::edit::sessions::EditState;
         let why2 = why.clone();
-        if let Some(e) = self.edits.get_mut(key) {
+        if let Some(e) = self.edit.sessions.get_mut(key) {
             e.state = EditState::Failed(why);
         }
-        if let Some(ed) = self.editor.as_mut().filter(|ed| ed.key == key) {
+        if let Some(ed) = self.edit.editor.as_mut().filter(|ed| ed.key == key) {
             ed.finish_save(Err(why2));
         }
         self.ui_dirty = true;
@@ -3921,18 +3945,19 @@ impl App {
     fn on_edit_saved(&mut self, key: u64, result: Result<EditWriteOutcome, String>) {
         use crate::edit::sessions::EditState;
         self.ui_dirty = true;
-        let (generation, local, label) = match self.edits.get(key) {
+        let (generation, local, label) = match self.edit.sessions.get(key) {
             Some(e) => (e.generation, e.local.clone(), e.label.clone()),
             // 条目在这次往返里被「结束编辑」掉了 —— 结果丢掉就是对的。
             None => return,
         };
         match result {
             Ok(EditWriteOutcome::Done(remote_now)) => {
-                self.edits
+                self.edit
+                    .sessions
                     .accept_write_back(key, remote_now, local_stamp(&local));
-                self.edit_originals.remove(&key);
-                self.edit_conflicts.remove(&key);
-                if let Some(ed) = self.editor.as_mut().filter(|ed| ed.key == key) {
+                self.edit.originals.remove(&key);
+                self.edit.conflicts.remove(&key);
+                if let Some(ed) = self.edit.editor.as_mut().filter(|ed| ed.key == key) {
                     ed.finish_save(Ok(()));
                 }
                 self.ui.set_toast(format!("已回传:{label}"));
@@ -3944,11 +3969,11 @@ impl App {
                 );
             }
             Ok(EditWriteOutcome::Conflict(remote_now)) => {
-                self.edit_conflicts.insert(key, remote_now);
-                if let Some(e) = self.edits.get_mut(key) {
+                self.edit.conflicts.insert(key, remote_now);
+                if let Some(e) = self.edit.sessions.get_mut(key) {
                     e.state = EditState::Conflict;
                 }
-                if let Some(ed) = self.editor.as_mut().filter(|ed| ed.key == key) {
+                if let Some(ed) = self.edit.editor.as_mut().filter(|ed| ed.key == key) {
                     ed.finish_save(Err("远端已被改动,见处置框".into()));
                 }
                 self.open_edit_conflict(key);
@@ -3959,7 +3984,7 @@ impl App {
 
     /// F53:开(或重开)一条编辑的冲突处置框。
     fn open_edit_conflict(&mut self, key: u64) {
-        let Some(e) = self.edits.get(key) else {
+        let Some(e) = self.edit.sessions.get(key) else {
             return;
         };
         self.ui.files_dialog = Some(crate::ui::files_dialog::FilesDialog::EditConflict {
@@ -3975,30 +4000,30 @@ impl App {
         use crate::ui::files_dialog::EditResolve;
         self.ui_dirty = true;
         // 没有记到远端当时的戳就没法安全处置(条目已经被收走之类)。
-        let Some(remote_now) = self.edit_conflicts.get(&key).copied() else {
+        let Some(remote_now) = self.edit.conflicts.get(&key).copied() else {
             return;
         };
         match choice {
             EditResolve::KeepRemote => {
                 // D3-9:**必须刷快照**。不刷的话下一次保存还会撞上同一个
                 // 冲突,这个框永远关不掉。
-                self.edits.keep_remote(key, remote_now);
-                self.edit_conflicts.remove(&key);
+                self.edit.sessions.keep_remote(key, remote_now);
+                self.edit.conflicts.remove(&key);
                 self.ui.set_toast("已保留远端那一份");
             }
             EditResolve::Overwrite => {
                 // 把比对基准换成远端当前值,再走同一条回传 —— 于是这一次
                 // `stat` 一定对得上,写下去。
-                if let Some(e) = self.edits.get_mut(key) {
+                if let Some(e) = self.edit.sessions.get_mut(key) {
                     e.snapshot = remote_now;
                     e.state = EditState::Watching;
                 }
-                self.edit_conflicts.remove(&key);
+                self.edit.conflicts.remove(&key);
                 let bytes = self.editor_bytes_for(key);
                 self.push_edit(key, bytes);
             }
             EditResolve::SaveCopy => {
-                let Some(e) = self.edits.get(key) else {
+                let Some(e) = self.edit.sessions.get(key) else {
                     return;
                 };
                 let (generation, copy) = (e.generation, copy_path(&e.remote));
@@ -4022,8 +4047,8 @@ impl App {
                 };
                 // 副本落地之后,这条编辑就认远端那一份 —— 否则它会一直红着,
                 // 而用户已经把自己的改动安全存下来了。
-                self.edits.keep_remote(key, remote_now);
-                self.edit_conflicts.remove(&key);
+                self.edit.sessions.keep_remote(key, remote_now);
+                self.edit.conflicts.remove(&key);
                 let name = copy.display().to_string();
                 let proxy = self.proxy.clone();
                 let task = self._runtime.spawn(async move {
@@ -4042,7 +4067,8 @@ impl App {
     /// 内置编辑器此刻的字节(如果这条正开在内置编辑器里)。外部编辑那条恒
     /// `None` —— 内容在临时文件里,由调用方读盘。
     fn editor_bytes_for(&self, key: u64) -> Option<Vec<u8>> {
-        self.editor
+        self.edit
+            .editor
             .as_ref()
             .filter(|e| e.key == key)
             .map(|e| e.bytes())
@@ -4050,12 +4076,12 @@ impl App {
 
     /// F53:结束一条编辑 —— 停看门、删临时文件、从列表里去掉。
     fn end_edit(&mut self, key: u64) {
-        if let Some(task) = self.edit_watchers.remove(&key) {
+        if let Some(task) = self.edit.watchers.remove(&key) {
             task.abort();
         }
-        self.edit_originals.remove(&key);
-        self.edit_conflicts.remove(&key);
-        if let Some(e) = self.edits.remove(key) {
+        self.edit.originals.remove(&key);
+        self.edit.conflicts.remove(&key);
+        if let Some(e) = self.edit.sessions.remove(key) {
             // 删不掉只记一条:临时文件残留不影响正确性,退出时那次
             // `tempdir::purge` 还会再扫一遍。
             if e.kind == crate::edit::sessions::EditKind::External {
@@ -4064,8 +4090,8 @@ impl App {
                 }
             }
         }
-        if self.editor.as_ref().is_some_and(|e| e.key == key) {
-            self.editor = None;
+        if self.edit.editor.as_ref().is_some_and(|e| e.key == key) {
+            self.edit.editor = None;
         }
         self.ui_dirty = true;
     }
@@ -6809,7 +6835,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // F53/D3-12:有改动没传回远端就先拦一下。**只拦第一次** ——
                 // 拦第二次的话,用户在确认框里选了「仍然退出」之后,那一下
                 // `event_loop.exit()` 会再走一遍这里又被拦住,窗口永远关不掉。
-                if self.edits.blocks_exit() && !self.ui.exit_pending {
+                if self.edit.sessions.blocks_exit() && !self.ui.exit_pending {
                     crate::logx::line("CloseRequested → 有未回传的编辑,先问一句");
                     self.ui.exit_pending = true;
                     self.request_ui_redraw();
@@ -6828,7 +6854,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // D3-12:临时目录整棵删掉。放在 `exit()` 之前 —— winit 的
                 // `exiting()` 在某些平台上不保证被调到,而残留的临时目录里
                 // 是远端文件的明文副本。
-                crate::edit::tempdir::purge(&self.edit_root);
+                crate::edit::tempdir::purge(&self.edit.root);
                 event_loop.exit();
             }
             // 焦点/遮挡:记录以便定位「失焦后无法回到前台/黑屏」;回到前台时补一次
@@ -7568,8 +7594,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 content_arg,
                                 files_owner_generation.unwrap_or(0),
                                 &self.transfer_queue,
-                                &self.edits,
-                                &mut self.editor,
+                                &mut self.edit,
                                 blink_on,
                             );
                             drop(renders);
@@ -7804,14 +7829,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 use crate::ui::editor_window::EditorAction;
                                 match a {
                                     EditorAction::Save => {
-                                        if let Some(ed) = self.editor.as_mut() {
+                                        if let Some(ed) = self.edit.editor.as_mut() {
                                             let (key, bytes, backup) =
                                                 (ed.key, ed.bytes(), ed.backup);
                                             ed.busy = true;
                                             // 用户把「留一份 .mullion.bak」关了:
                                             // 把原文丢掉,这条回传就不会带备份。
                                             if !backup {
-                                                self.edit_originals.remove(&key);
+                                                self.edit.originals.remove(&key);
                                             }
                                             self.push_edit(key, Some(bytes));
                                         }
@@ -7832,7 +7857,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         if let Some(h) = self.probe_task.take() {
                                             h.abort();
                                         }
-                                        crate::edit::tempdir::purge(&self.edit_root);
+                                        crate::edit::tempdir::purge(&self.edit.root);
                                         event_loop.exit();
                                     }
                                     ExitChoice::Cancel => {
@@ -9285,9 +9310,11 @@ fn render_frame(
     files_generation: u64,
     // F55:传输队列,只读转给 `build_ui`(见其同名参数的文档)。
     queue: &crate::files::queue::Queue,
-    // F53:在编辑的那些文件 + 内置编辑器窗口,转给 `build_ui`。
-    edits: &crate::edit::sessions::EditSessions,
-    editor: &mut Option<crate::ui::editor_window::EditorState>,
+    // F53:在编辑的那些文件 + 内置编辑器窗口,拆开转给 `build_ui`。
+    // 整个 `EditState` 收着传而不是摊成两个参数:这函数只能是自由函数
+    // (`panes` 借着 `self` 的一部分,拿不到 `&mut self`),参数表因此是
+    // `App` 字段的手工投影 —— 每加一项 edit 状态就得再加一个参数。
+    edit: &mut EditState,
     // F125:这一帧光标该不该画出来(闪烁相位),调用方 `App::window_event` 算好了
     // 原样转给 `quads_for_panes`——算这个要读 `self.window_focused`/
     // `self.last_input_at`,那两个字段在这里(`Active` 而非 `App`)够不着。
@@ -9328,8 +9355,8 @@ fn render_frame(
             files_content.as_deref_mut(),
             files_generation,
             queue,
-            edits,
-            editor,
+            &edit.sessions,
+            &mut edit.editor,
         );
         if has_real_action(&this_pass) {
             actions = this_pass;
@@ -9892,7 +9919,7 @@ mod tests {
     /// `cargo test --lib` 之前是全绿的 —— `TabProps` 是切片 J 终审补的,
     /// 之前完全没有守护)。
     ///
-    /// 自证会变红:把 `modal_open` 里 `self.editor.is_some()` /
+    /// 自证会变红:把 `modal_open` 里 `self.edit.editor.is_some()` /
     /// `self.ui.files_dialog.is_some()` / `self.ui.group_manager_open` /
     /// `self.ui.tab_props.is_some()` 任意一处改成字面量 `false`。
     #[test]
@@ -9911,7 +9938,7 @@ mod tests {
             "modal_open 的函数体切歪了 —— 下面那条断言会空过"
         );
         assert!(
-            body.contains("self.editor.is_some()"),
+            body.contains("self.edit.editor.is_some()"),
             "内置编辑器没算进模态:编辑器开着时键盘仍判给终端,里面根本打不出字(T8)"
         );
         assert!(
