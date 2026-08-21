@@ -692,6 +692,21 @@ pub fn show(
     // 压在行体上面(与原设计一致)。真正决定列头位置的偏移量另外算——
     // 见下方 `header_offset_x` 那条长注释,**不是**从这里的滚动区输出里
     // 现取(那份值下一帧才轮到行体去用,读它会让列头比行体多抢一步)。
+    // F150:栏底状态行要占一行,先从可用高度里扣掉,喂给下面 `ScrollArea` 的
+    // `.max_height(..)`。**必须在 ScrollArea 之前算**。`max(ROW_H)` 兜住面板
+    // 被拖到极窄时的负数。
+    //
+    // 这个约束管的是**`ScrollArea` 自己占多高**,不是状态行会不会被挤没
+    // (状态行真正的位置兜底见下面画状态行那段注释,靠的是「画在 `header_at`
+    // 的 `scope_builder` 之前」,不是这里)。没有这一行,`ScrollArea` 开着
+    // `auto_shrink([false, false])` 会把可用高度全部吃满——即使目录只有两三
+    // 条,底下也会拖出一大片仍然可滚动、可交互的空白区域,吞掉本该落到别处
+    // 的点击与滚轮;插桩实测还发现更直接的后果:`ScrollArea` 结束时把 `ui`
+    // 的布局光标推到一个离谱的 y 坐标,紧跟着画的状态行会整个从渲染输出里
+    // 消失(不是「位置偏了」,是「这个部件没了」)。
+    // 守护:`tests::the_status_row_only_renders_when_the_scroll_area_height_is_capped`。
+    let body_h = (ui.available_height() - ROW_H * 2.0).max(ROW_H);
+
     let (header_band, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_H),
         egui::Sense::hover(),
@@ -733,6 +748,7 @@ pub fn show(
     .x;
     egui::ScrollArea::both()
         .id_salt(scroll_id_salt(id, generation))
+        .max_height(body_h)
         // F58:**必须关掉**。`drag_to_scroll` 默认开着,它在视口上注册一个
         // 吃 drag 的部件,把按在行上的那一下抢去当滚动手势 —— 行的
         // `drag_started()` 永远为假,拖拽整个功能安静地不存在。桌面端本来
@@ -809,8 +825,34 @@ pub fn show(
                 }
             }
         });
+    if let Some(name) = drag_start {
+        state.select_only(&name);
+    }
+    if let Some((name, ctrl, shift)) = clicked {
+        state.click_row(&name, ctrl, shift);
+    }
+    // F150:栏底状态行。**必须画在 `click_row` 之后、`header_at` 的
+    // `scope_builder` 之前**:
+    // - 画在 `click_row` 之后 —— 点击的效果要在同一帧就反映到这行字上,
+    //   否则用户点一下看到的还是上一帧的数,像是没生效。
+    // - 必须画在 `header_at` 之前 —— `header_at` 用
+    //   `ui.scope_builder(UiBuilder::new().max_rect(header_band), ..)` 补画
+    //   列头,`scope_builder` 收尾会调 `advance_cursor_after_rect`,把 `ui`
+    //   的布局光标**硬重置**到列头那个子 ui 的 `min_rect`(而 `header_at`
+    //   内部全是 `ui.interact`/`ui.painter()` 直接画,没有一次真正的部件分
+    //   配,子 ui 的 `min_rect` 因此停在列头带顶部那个零尺寸的种子点)。
+    //   于是排在 `header_at` 之后的部件,光标已经被拽回列头顶部附近,画出
+    //   来的东西会贴着列头、盖在它上面,而不是接在 `ScrollArea` 内容之后
+    //   ——这一点插桩实测过,状态行排在 `header_at` 之后时,不管
+    //   `ScrollArea` 实际占多高,状态行的 y 坐标恒定卡在列头正下方几像素。
+    //   排在这里、`ScrollArea` 刚结束、`header_at` 还没跑的位置,才用得上
+    //   `ScrollArea` 自己推进的光标(见上面 `body_h` 那条注释)。
+    ui.add_space(crate::ui::metrics::SP_XS);
+    ui.colored_label(theme::c32(t.fg_dim), state.status_text());
     // F136:把列头补画在上面占住的横带里,用的是调用 `show_rows` 之前
-    // 读到的 `header_offset_x`(见上方长注释)。
+    // 读到的 `header_offset_x`(见上方长注释)。**必须排在状态行之后**——
+    // 见上面状态行注释,这个 `scope_builder` 会把 `ui` 的布局光标重置到列
+    // 头附近,排在它之前的部件才吃得到 `ScrollArea` 真实占用的高度。
     ui.scope_builder(egui::UiBuilder::new().max_rect(header_band), |ui| {
         // **必须显式裁剪**:子 ui 的 clip_rect 默认原样继承父 painter,
         // 不裁的话列宽之和超过视口时,右边几列的标题会画到隔壁栏
@@ -825,12 +867,6 @@ pub fn show(
         if let Some(from) = bg.dnd_release_payload::<crate::files::drag::DragFrom>() {
             landing = crate::files::drag::drop_target(from.0, column, None);
         }
-    }
-    if let Some(name) = drag_start {
-        state.select_only(&name);
-    }
-    if let Some((name, ctrl, shift)) = clicked {
-        state.click_row(&name, ctrl, shift);
     }
     if let Some(l) = landing {
         action = Some(FileAction::Drop(l));
@@ -3099,6 +3135,119 @@ mod tests {
         let mut input = raw(Some(time));
         input.events.push(egui::Event::PointerMoved(pos));
         input
+    }
+
+    /// 带修饰键的点击。**修饰键必须写进 `RawInput::modifiers`**,不是只写进
+    /// 事件里的那份 —— `files_panel` 读的是 `ui.input(|i| i.modifiers)`,
+    /// 即全局状态。只设事件里那份的话,Ctrl 位根本传不到 `click_row`,
+    /// 多选静默失效而所有断言照样绿。
+    fn press_mod(
+        pos: egui::Pos2,
+        time: f64,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    ) -> egui::RawInput {
+        let mut input = raw(Some(time));
+        input.modifiers = modifiers;
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        });
+        input
+    }
+
+    /// Windows/Linux 上 egui 把 Ctrl 归一化到 `command` 位,`files_panel`
+    /// 读的正是 `command`(写 `ctrl` 会让 macOS 用户点不出多选)。两位都置上,
+    /// 与真实平台一致。
+    fn ctrl() -> egui::Modifiers {
+        egui::Modifiers {
+            command: true,
+            ctrl: true,
+            ..Default::default()
+        }
+    }
+
+    /// F150:**这是「Ctrl 多选」唯一的端到端守护。**
+    ///
+    /// `click_row` 的 Ctrl 语义在 `files::state` 里有单测,但从来没有一条
+    /// 测试证明「点击真的把 ctrl 位带进去了」—— 中间隔着
+    /// `ui.input(|i| i.modifiers)` 这一步,读错来源(比如读事件里那份而不是
+    /// 全局状态)会让多选整个不成立,而 `files::state` 那些单测全绿。
+    ///
+    /// 断言打在**状态行文字**上:那是用户唯一看得见的选中证据。
+    #[test]
+    fn ctrl_clicking_a_second_row_adds_it_to_the_selection() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            ctx.run(input, |ctx| {
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+            })
+        };
+        let _ = render(raw(None), &mut frame);
+        let out = render(raw(None), &mut frame);
+        let b = find_text_pos(&out.shapes, "b.txt").expect("远端栏该画出 b.txt");
+        let logs = find_text_pos(&out.shapes, "logs").expect("远端栏该画出 logs");
+
+        // 平点 b.txt。
+        let _ = render(press(b, 1.0, true), &mut frame);
+        let _ = render(press(b, 1.1, false), &mut frame);
+        // Ctrl 点 logs —— 该是「再加一条」,不是「换成这一条」。
+        let _ = render(press_mod(logs, 1.2, true, ctrl()), &mut frame);
+        let _ = render(press_mod(logs, 1.3, false, ctrl()), &mut frame);
+
+        let out = render(raw(None), &mut frame);
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(ts) => Some(ts.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|s| s == "已选 2 项 · 1.0 KB"),
+            "Ctrl 点第二行该把它加进选择集,状态行该显示选中态文案;\
+             实际画出来的是 {texts:?}"
+        );
+    }
+
+    /// F150:`.max_height(body_h)` 的守护。**判据是状态行画不画得出来,不是
+    /// 它画在哪**——`content_renders_both_panels_with_their_own_state` 那类
+    /// 测试用的窗口是 1200×800,一个高窗口 + 只有两三行数据的栏,`auto_shrink
+    /// ([false, false])` 会让 `ScrollArea` 在没有 `max_height` 时把可用高度
+    /// 全部吃满(远超实际内容需要的高度)。这时 `ScrollArea` 结束后 `ui` 的
+    /// 布局光标被推到一个离谱的 y 坐标,紧跟着画的状态行 `colored_label`
+    /// 整个从渲染输出里消失(插桩实测过:`find_text_pos` 找不到「N 项」这个
+    /// 词,不是「位置偏了」,是「根本没有这个部件」)。
+    ///
+    /// 自证会变红(两种坏法都试过,见 Task 5 复核记录):
+    /// 1. 把 `.max_height(body_h)` 换成 `.max_height(f32::INFINITY)`。
+    /// 2. 把这一行整个删掉(`body_h` 变成未使用变量,加 `let _ = body_h;`
+    ///    绕开 clippy 以免混淆信号)。
+    #[test]
+    fn the_status_row_only_renders_when_the_scroll_area_height_is_capped() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            ctx.run(input, |ctx| {
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+            })
+        };
+        let _ = render(raw(None), &mut frame);
+        let out = render(raw(None), &mut frame);
+        assert!(
+            find_text_pos(&out.shapes, "2 项").is_some(),
+            "远端栏两条都没选中,状态行该显示「2 项」;`ScrollArea` 没有
+             `max_height` 兜底时,这个部件会从渲染输出里整个消失"
+        );
     }
 
     /// F58:栏间拖拽。**这是拖拽唯一的无头守护** —— `drag.rs` 那几条纯函数
