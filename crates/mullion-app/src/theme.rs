@@ -44,6 +44,14 @@ pub struct Theme {
     /// 6% 的白在那个条件下看不见。守护:
     /// `the_divider_is_visible_but_not_loud_against_the_terminal_background`。
     pub divider: Rgb,
+    /// ④ F150:多选高亮填充的 alpha(画在 `accent` 上)。
+    ///
+    /// **F80 冻结色表里没有这一项**,和 `divider` 一样是新增项、不是改既有值。
+    /// 原来选中行画的是 `sunken_bg`(#0e1018),比 `panel_bg`(#14161f)还暗
+    /// 6 个亮度单位,笔记本屏上人眼分辨不出来 —— 用户因此以为文件面板没有
+    /// 多选功能。不新造色相,只给既有的 `accent` 配一个 alpha。
+    /// 守护:`a_selected_row_is_painted_with_the_accent_fill_not_the_sunken_bg`。
+    pub sel_alpha: u8,
 
     // --- 前景灰阶(§2.2) ---
     pub fg: Rgb,
@@ -125,6 +133,7 @@ pub const MULLION_DARK: Theme = Theme {
     sunken_bg: Rgb::new(0x0e, 0x10, 0x18),
     stroke_alpha: 15, // 0.06 × 255 ≈ 15
     divider: Rgb::new(0x28, 0x2b, 0x38),
+    sel_alpha: 51, // 0.2 × 255 ≈ 51
 
     fg: Rgb::new(0xe4, 0xe6, 0xf0),
     fg_strong: Rgb::new(0xd3, 0xd6, 0xea),
@@ -311,6 +320,15 @@ pub fn c32(c: Rgb) -> egui::Color32 {
 /// 主题描边(白 + 低 alpha)。
 pub fn stroke(t: &Theme) -> egui::Stroke {
     egui::Stroke::new(1.0, egui::Color32::from_white_alpha(t.stroke_alpha))
+}
+
+/// F150:多选高亮的行底色(`accent` + 低 alpha)。
+///
+/// 用 `from_rgba_unmultiplied`:`sel_alpha` 是「相对于底下那层的不透明度」,
+/// 不是预乘值。写成 `Color32::from_rgba_premultiplied` 会得到一个几乎全黑的
+/// 颜色 —— 编译过、画得出、就是看不见,和它要修的那个 bug 一模一样。
+pub fn selection_fill(t: &Theme) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(t.accent.r, t.accent.g, t.accent.b, t.sel_alpha)
 }
 
 /// 把主题写进 egui 的 `Visuals`(外加一处 `Spacing::scroll`,见下)。启动时对

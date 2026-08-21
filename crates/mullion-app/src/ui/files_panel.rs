@@ -251,6 +251,8 @@ const W_PERM: f32 = 86.0;
 /// (F135)。
 const W_OWNER: f32 = 120.0;
 const ROW_H: f32 = 22.0;
+/// F150:选中行左侧色条的宽度(逻辑点)。
+const SEL_BAR_W: f32 = 2.0;
 /// D1:图标格子的边长 + 它和名称之间的空隙。
 const W_ICON: f32 = 16.0;
 const ICON_GAP: f32 = 4.0;
@@ -1002,7 +1004,18 @@ fn row(
     let w = content_w(cols, column).max(ui.available_width());
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click_and_drag());
     if selected {
-        ui.painter().rect_filled(rect, 2.0, theme::c32(t.sunken_bg));
+        // F150:accent 半透明铺满整行 + 行首一条实色。原来画 `sunken_bg`,
+        // 比 `panel_bg` 还暗 6 个亮度单位,肉眼分辨不出来 —— 用户因此以为
+        // 文件面板根本没有多选(`click_row` 的 Ctrl/Shift 语义一直都在)。
+        // 色条不是装饰:底色再淡也可能被行内容夺走注意力,一条实色边给出
+        // 「这一段是选中的」的轮廓,连选多行时一眼能看出范围。
+        ui.painter()
+            .rect_filled(rect, 2.0, theme::selection_fill(t));
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(SEL_BAR_W, rect.height())),
+            0.0,
+            theme::c32(t.accent),
+        );
     }
     let p = ui.painter();
     let font = egui::FontId::proportional(12.0);
@@ -2221,6 +2234,72 @@ mod tests {
             walk(&cs.shape, color, &mut n);
         }
         n
+    }
+
+    /// 数一数有多少个指定填充色的矩形。`w_range` 用来把宽窄不同的两种矩形
+    /// 分开(整行底色 vs 2pt 的左侧色条)——只判颜色的话,色条和底色都算
+    /// 进去,「色条没画」这种退化验不出来。
+    fn count_filled_rects(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+        w_range: std::ops::RangeInclusive<f32>,
+    ) -> usize {
+        shapes
+            .iter()
+            .filter(|s| match &s.shape {
+                egui::epaint::Shape::Rect(r) => {
+                    r.fill == color && w_range.contains(&r.rect.width())
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// F150:选中行必须画成 accent 半透明 + 左侧 2pt 实色色条。
+    ///
+    /// 原来画的是 `sunken_bg`(#0e1018),比 `panel_bg`(#14161f)还暗 —— 用户
+    /// 报「按 Ctrl 点,屏幕上完全没变化」,根因就在这儿。这条测试拿颜色本身
+    /// 当判据,换回任何一个比背景暗的 token 都会红。
+    #[test]
+    fn a_selected_row_is_painted_with_the_accent_fill_not_the_sunken_bg() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        frame
+            .remote
+            .selected
+            .insert(RemotePath::from_bytes(b"b.txt".to_vec()));
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut render = |frame: &mut PanelFrame| {
+            let mut out = None;
+            let o = ctx.run(raw(None), |ctx| {
+                out = Some(content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None));
+            });
+            let _ = out;
+            o
+        };
+        let _ = render(&mut frame);
+        let out = render(&mut frame);
+
+        assert_eq!(
+            count_filled_rects(
+                &out.shapes,
+                crate::theme::selection_fill(&t),
+                20.0..=f32::MAX
+            ),
+            1,
+            "选中的那一行该有一块 accent 半透明的整行底色"
+        );
+        assert_eq!(
+            count_filled_rects(&out.shapes, crate::theme::c32(t.accent), 1.0..=3.0),
+            1,
+            "选中的那一行该有一条 2pt 宽的 accent 实色左侧色条"
+        );
+        assert_eq!(
+            count_filled_rects(&out.shapes, crate::theme::c32(t.sunken_bg), 20.0..=f32::MAX),
+            0,
+            "不该再用 sunken_bg 画选中行 —— 它比 panel_bg 还暗,等于没画"
+        );
     }
 
     /// 复核 #2(代码质量复核挖出的可达性缺口):F6/Tab 把键盘焦点切到文件
