@@ -4224,6 +4224,54 @@ mod tests {
         );
     }
 
+    /// F154 接线守护(**侧栏那一份**)。`sidebar()` 和 `content()` 是两个各自
+    /// 独立的调用点,只守住一个的话另一个退化了没人知道 —— 症状是「标签宿主
+    /// 里能收藏,侧栏里 ☆ 恒置灰」,而两处代码看起来一模一样。
+    ///
+    /// 自证会变红(实测过):把 `sidebar()` 里本地栏的
+    /// `list: &frame.local_bookmarks` 改成 `list: &frame.bookmarks`。
+    #[test]
+    fn the_sidebar_local_column_also_reads_the_local_bookmark_list() {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState::default();
+        let mut frame = PanelFrame {
+            remote: PaneState::new(RemotePath::from_bytes(b"/srv".to_vec())),
+            local: PaneState::new(RemotePath::from_bytes(b"/home/me".to_vec())),
+            bookmarks: Vec::new(),
+            local_bookmarks: vec![mullion_store::Bookmark {
+                name: "家".into(),
+                path: "/home/me".into(),
+            }],
+            session_bound: true,
+            active_column: PanelColumn::default(),
+        };
+        frame.remote.load = Load::Ready;
+        frame.local.load = Load::Ready;
+        // 侧栏用真实窗口尺寸(同上一条测试)。
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 700.0));
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = ctx
+                .run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame, 0);
+                    },
+                )
+                .shapes;
+        }
+        let star = find_text_pos(&shapes, "★").expect("本地目录已收藏,侧栏本地栏该画实心星");
+        assert!(
+            star.y < screen.center().y,
+            "实心星画在了侧栏下半部(远端栏)—— 侧栏本地栏读的不是本地那份列表:y={}",
+            star.y
+        );
+    }
+
     /// 递归找 `Shape::Vec` 里描边颜色匹配的矩形,返回**它所在那个顶层
     /// `ClippedShape` 的 `clip_rect`**(不是矩形自己的几何)—— 这才是决定
     /// 它实际会不会画出边界的东西:`max_rect` 只是布局预算,`clip_rect`
