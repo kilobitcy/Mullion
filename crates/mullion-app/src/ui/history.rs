@@ -1,0 +1,435 @@
+//! F148:「恢复上次的现场」弹窗(设计 D9/D10)。
+//!
+//! **零 IO**:这里只画一份已经准备好的行、回报用户选了哪条,真的读盘/摆标签
+//! 在 `app.rs`。
+//!
+//! 时间显示用**相对时间**(设计 X3):`time` 0.3 只开了 `formatting` feature,
+//! 拿不到本地时区偏移(`now_local` 要 `local-offset`,而且在多线程进程里按
+//! soundness 规则通常返回 `Err`)。绝对时间在中国时区会差 8 小时 —— 相对时间
+//! 既规避了这个坑,对「认出哪条记录」也更好用。
+
+use crate::theme::{self, Theme};
+use crate::ui::annotate;
+use crate::ui::metrics::{SP_L, SP_M, SP_S, SP_XS};
+
+/// 摘要里最多列几个会话名,超出的折成 `+N`。
+const SUMMARY_MAX: usize = 3;
+
+/// 列表里的一行。**已经算好的字符串**,画的时候不做任何计算 ——
+/// 这些文本的判据(几天前、摘要怎么折)全是纯函数,单独测。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryRow {
+    /// 实例 id,回报给 `app.rs` 用来认领槽位(D12)。
+    pub id: String,
+    /// 第一行:`3 小时前 · 4 个标签 · 7 块分屏`。
+    pub head: String,
+    /// 第二行:`prod-web-01 · nas · db-01 · +1`。
+    pub summary: String,
+}
+
+/// 弹窗自己的那点状态。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryDraft {
+    pub rows: Vec<HistoryRow>,
+    /// 选中第几行。恒有值 —— 列表非空才会建这个草稿(见 `new`)。
+    pub selected: usize,
+}
+
+impl HistoryDraft {
+    /// **只在 `rows` 非空时调**:空列表的弹窗等于让用户点一下才能开始干活
+    /// (D9:没有任何记录时不弹)。
+    pub fn new(rows: Vec<HistoryRow>) -> Self {
+        Self { rows, selected: 0 }
+    }
+}
+
+/// 这一帧用户干了什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryOut {
+    /// 恢复这个实例 id 的现场。
+    Restore(String),
+    /// 「不恢复」/ 关掉弹窗。菜单里还有常驻入口能再打开(D9)。
+    Dismiss,
+}
+
+/// 相对时间(设计 X3)。`now` 与 `updated_at` 都是 Unix 秒(UTC)。
+///
+/// 超过 7 天退回 `MM-DD`(UTC 日期,最多差一天)—— 到那个尺度上,「11 天前」
+/// 不如一个日期好定位。
+pub fn when_text(now: i64, updated_at: i64) -> String {
+    // 未来的时刻(时钟往回跳过)按「刚刚」算 —— 显示「-3 小时前」更莫名其妙。
+    let d = now.saturating_sub(updated_at);
+    if d < 60 {
+        return "刚刚".into();
+    }
+    if d < 3600 {
+        return format!("{} 分钟前", d / 60);
+    }
+    if d < 86_400 {
+        return format!("{} 小时前", d / 3600);
+    }
+    if d < 7 * 86_400 {
+        return format!("{} 天前", d / 86_400);
+    }
+    match time::OffsetDateTime::from_unix_timestamp(updated_at) {
+        Ok(dt) => format!("{:02}-{:02}", dt.month() as u8, dt.day()),
+        // 时刻本身是垃圾(手改过的文件)。用破折号而不是编一个日期出来。
+        Err(_) => "—".into(),
+    }
+}
+
+/// 会话名摘要。超过 `SUMMARY_MAX` 个折成 `+N`。
+///
+/// 空列表给一句话而不是空字符串:第二行空着的话,那一行的高度还在,看着像
+/// 渲染出了 bug。
+pub fn summary_text(titles: &[String]) -> String {
+    if titles.is_empty() {
+        return "(没有可恢复的标签)".into();
+    }
+    if titles.len() <= SUMMARY_MAX {
+        return titles.join(" · ");
+    }
+    format!(
+        "{} · +{}",
+        titles[..SUMMARY_MAX].join(" · "),
+        titles.len() - SUMMARY_MAX
+    )
+}
+
+/// 第一行。`panes` 是所有标签的分屏数之和。
+///
+/// 单标签单分屏时不啰嗦「1 个标签 · 1 块分屏」—— 那两句话没有信息量,
+/// 只是把真正有用的时间挤到一边。
+pub fn head_text(when: &str, tabs: usize, panes: usize) -> String {
+    if tabs <= 1 && panes <= 1 {
+        return when.to_string();
+    }
+    if panes <= tabs {
+        return format!("{when} · {tabs} 个标签");
+    }
+    format!("{when} · {tabs} 个标签 · {panes} 块分屏")
+}
+
+/// 画弹窗。返回 `Some` = 这一帧有结论(由 `app.rs` 负责把 `draft` 置 `None`)。
+///
+/// `draft` 为 `None` = 弹窗关着,什么都不画。
+pub fn show(
+    ctx: &egui::Context,
+    t: &Theme,
+    draft: &mut Option<HistoryDraft>,
+) -> Option<HistoryOut> {
+    let d = draft.as_mut()?;
+    let mut out = None;
+    egui::Window::new("恢复上次的现场")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            annotate::mark(ui.ctx(), "恢复现场弹窗", ui.max_rect());
+            ui.label(theme::hint_text(
+                t,
+                "选一条摆回标签栏。摆回来的标签不会自动连接,点「重连」才拨号。",
+            ));
+            ui.add_space(SP_M);
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    for i in 0..d.rows.len() {
+                        let selected = i == d.selected;
+                        let row = &d.rows[i];
+                        // 整行可点:只让文字可点的话,行末的空白点不中,而用户
+                        // 会去点行的任何地方(J 片「标签宿主一行都点不中」的
+                        // 同一个教训)。
+                        let resp = ui.allocate_response(
+                            egui::vec2(ui.available_width(), 44.0),
+                            egui::Sense::click(),
+                        );
+                        // 选中 / 悬停的底色与会话列表同源:那边是
+                        // `session_manager::list::row_bg(selected, hovered, None, t)`
+                        // 的两条常量臂。**照抄取值而不是调那个函数** ——
+                        // 它是 `pub(crate)` 且第三个参数是节点色(本列表没有
+                        // 节点概念),为两个常量拉一条跨模块依赖不划算。
+                        // 色板已冻结,**不许**往 `Theme` 里加新字段。
+                        if selected {
+                            ui.painter().rect_filled(
+                                resp.rect,
+                                egui::Rounding::same(4.0),
+                                theme::c32(t.sunken_bg),
+                            );
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(
+                                resp.rect,
+                                egui::Rounding::same(4.0),
+                                theme::c32(t.panel_head),
+                            );
+                        }
+                        let mut p = resp.rect.min + egui::vec2(SP_S, SP_XS);
+                        ui.painter().text(
+                            p,
+                            egui::Align2::LEFT_TOP,
+                            &row.head,
+                            egui::FontId::proportional(14.0),
+                            theme::c32(t.fg_strong),
+                        );
+                        p.y += 20.0;
+                        ui.painter().text(
+                            p,
+                            egui::Align2::LEFT_TOP,
+                            &row.summary,
+                            egui::FontId::proportional(12.0),
+                            theme::c32(t.fg_dim),
+                        );
+                        if resp.clicked() {
+                            d.selected = i;
+                        }
+                        // 双击 = 选中并恢复,与会话管理器双击连接一致。
+                        if resp.double_clicked() {
+                            out = Some(HistoryOut::Restore(row.id.clone()));
+                        }
+                    }
+                });
+            ui.add_space(SP_L);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("恢复").min_size([96.0, 28.0].into()))
+                    .clicked()
+                {
+                    out = Some(HistoryOut::Restore(d.rows[d.selected].id.clone()));
+                }
+                ui.add_space(SP_S);
+                if ui.button("不恢复").clicked() {
+                    out = Some(HistoryOut::Dismiss);
+                }
+            });
+        });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_record_says_just_now() {
+        assert_eq!(when_text(1000, 1000), "刚刚");
+        assert_eq!(when_text(1000, 941), "刚刚");
+    }
+
+    #[test]
+    fn relative_time_walks_up_the_units() {
+        assert_eq!(when_text(1_000_000, 1_000_000 - 120), "2 分钟前");
+        assert_eq!(when_text(1_000_000, 1_000_000 - 3 * 3600), "3 小时前");
+        assert_eq!(when_text(1_000_000, 1_000_000 - 2 * 86_400), "2 天前");
+    }
+
+    /// 超过一周退回日期 —— 「11 天前」在那个尺度上不如一个日期好定位。
+    #[test]
+    fn anything_older_than_a_week_falls_back_to_a_date() {
+        // 1_755_000_000 = 2025-08-12T12:00:00Z,减 30 天 = 2025-07-13T12:00:00Z。
+        assert_eq!(
+            when_text(1_755_000_000, 1_755_000_000 - 30 * 86_400),
+            "07-13"
+        );
+    }
+
+    /// 时钟往回跳过(记录的时刻在未来)时不显示负数 —— 「-3 小时前」比
+    /// 「刚刚」更让人以为程序坏了。
+    ///
+    /// 自证会变红:把 `when_text` 里的 `if d < 60` 改成 `if (0..60).contains(&d)`
+    /// —— 兜住负数的是这条分支,**不是** `saturating_sub`(那个防的是另一件事,
+    /// 见下一条测试)。
+    #[test]
+    fn a_record_stamped_in_the_future_reads_as_just_now() {
+        assert_eq!(when_text(1000, 9999), "刚刚");
+    }
+
+    /// 记录文件是手能改的,`updated_at` 能塞进**任何** `i64`,包括 `i64::MIN`。
+    /// `now - i64::MIN` 在 debug 构建下溢出 panic —— 一个被手改过的记录就能让
+    /// 客户端起不来,所以 `when_text` 里的 `saturating_sub` 不是装饰。
+    ///
+    /// 饱和之后 `d` 变成 `i64::MAX`,落进「超过一周」那一支,而
+    /// `from_unix_timestamp(i64::MIN)` 给 `Err` —— 于是显示破折号,而不是编一个
+    /// 日期出来。
+    ///
+    /// 自证会变红:把 `saturating_sub` 换成裸减法(那会 panic,panic 也是红)。
+    #[test]
+    fn a_hand_edited_timestamp_at_the_low_extreme_does_not_crash_the_client() {
+        assert_eq!(when_text(1000, i64::MIN), "—");
+    }
+
+    #[test]
+    fn a_short_summary_lists_every_session() {
+        let t = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(summary_text(&t), "a · b");
+    }
+
+    /// 长摘要折成 `+N` —— 不折的话第二行会把弹窗撑得比屏幕还宽。
+    #[test]
+    fn a_long_summary_is_folded() {
+        let t: Vec<String> = (1..=6).map(|i| format!("s{i}")).collect();
+        assert_eq!(summary_text(&t), "s1 · s2 · s3 · +3");
+    }
+
+    /// 空摘要给一句话,不是空字符串:那一行的高度还在,空着看着像渲染坏了。
+    #[test]
+    fn an_empty_summary_says_so_instead_of_going_blank() {
+        assert_eq!(summary_text(&[]), "(没有可恢复的标签)");
+    }
+
+    /// 单标签单分屏不啰嗦 —— 「1 个标签 · 1 块分屏」没有信息量。
+    #[test]
+    fn a_single_pane_record_does_not_brag_about_its_counts() {
+        assert_eq!(head_text("刚刚", 1, 1), "刚刚");
+    }
+
+    #[test]
+    fn a_record_with_splits_reports_both_counts() {
+        assert_eq!(
+            head_text("3 小时前", 4, 7),
+            "3 小时前 · 4 个标签 · 7 块分屏"
+        );
+    }
+
+    /// 标签数等于分屏数(每个标签都只有一块)时不重复报同一个数。
+    #[test]
+    fn a_record_without_splits_only_reports_the_tab_count() {
+        assert_eq!(head_text("2 天前", 3, 3), "2 天前 · 3 个标签");
+    }
+
+    fn rows() -> Vec<HistoryRow> {
+        vec![
+            HistoryRow {
+                id: "a".into(),
+                head: "刚刚 · 2 个标签".into(),
+                summary: "prod · nas".into(),
+            },
+            HistoryRow {
+                id: "b".into(),
+                head: "3 小时前".into(),
+                summary: "db-01".into(),
+            },
+        ]
+    }
+
+    /// 跑两帧,收本帧画出来的所有文字。**两帧**:`egui::Window` 首帧
+    /// `fade_in` 只记 `Shape::Noop`(同 `ui/restored.rs` 的说明)。
+    fn texts(draft: &mut Option<HistoryDraft>) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    show(ctx, &t, draft);
+                })
+                .shapes;
+        }
+        let mut out = Vec::new();
+        for cs in &shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    /// 点一下写着 `label` 的那颗按钮,返回这一帧 `show` 的结论。
+    fn click(draft: &mut Option<HistoryDraft>, label: &str) -> Option<HistoryOut> {
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, label)),
+                egui::Shape::Text(ts) if ts.galley.text() == label => {
+                    Some(ts.pos + ts.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    show(ctx, &t, draft);
+                })
+                .shapes;
+        }
+        let pos = shapes
+            .iter()
+            .find_map(|cs| find(&cs.shape, label))
+            .unwrap_or_else(|| panic!("弹窗里没有写着「{label}」的按钮"));
+        let mut input = egui::RawInput::default();
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let mut out = None;
+        let _ = ctx.run(input, |ctx| {
+            out = show(ctx, &t, draft);
+        });
+        out
+    }
+
+    /// `None` 的草稿什么都不画 —— 弹窗关着就是关着。
+    #[test]
+    fn a_closed_dialog_draws_nothing() {
+        let mut draft = None;
+        assert!(texts(&mut draft).is_empty());
+    }
+
+    /// 每一条记录的两行都要画出来:只画第一行的话,多开场景下两条记录的
+    /// 时间可能很接近,用户分不出哪条是哪个窗口(D10)。
+    #[test]
+    fn every_row_shows_both_its_lines() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        let joined = texts(&mut draft).join(" ");
+        assert!(joined.contains("刚刚 · 2 个标签"), "第一行没画:{joined}");
+        assert!(joined.contains("prod · nas"), "第二行没画:{joined}");
+        assert!(joined.contains("3 小时前"), "第二条记录没画:{joined}");
+    }
+
+    /// 「恢复」回报的是**当前选中那一条的 id**,不是恒第一条。
+    ///
+    /// 自证会变红:把 `d.rows[d.selected].id` 改成 `d.rows[0].id`。
+    #[test]
+    fn restoring_reports_the_selected_record_not_the_first_one() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        draft.as_mut().unwrap().selected = 1;
+        assert_eq!(
+            click(&mut draft, "恢复"),
+            Some(HistoryOut::Restore("b".into()))
+        );
+    }
+
+    #[test]
+    fn dismissing_reports_dismiss() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        assert_eq!(click(&mut draft, "不恢复"), Some(HistoryOut::Dismiss));
+    }
+
+    /// 光把弹窗画出来不等于选了什么 —— 否则它一出现就自己恢复了,
+    /// 「可以选择恢复」这条需求当场作废。
+    #[test]
+    fn merely_showing_the_dialog_restores_nothing() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        assert!(!texts(&mut draft).is_empty());
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                out = show(ctx, &t, &mut draft);
+            });
+        }
+        assert_eq!(out, None);
+    }
+}

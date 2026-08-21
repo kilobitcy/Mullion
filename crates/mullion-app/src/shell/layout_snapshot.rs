@@ -473,6 +473,8 @@ mod tests {
         let layout = SavedLayout {
             schema_version: 1,
             active_tab: 0,
+            // F148 的时刻字段;这些测试只关心树与会话筛选,填 0 即可。
+            updated_at: 0,
             window: None,
             tabs: vec![tab(1, one_leaf()), tab(2, one_leaf()), tab(3, one_leaf())],
         };
@@ -490,6 +492,8 @@ mod tests {
         let layout = SavedLayout {
             schema_version: 1,
             active_tab: 0,
+            // F148 的时刻字段;这些测试只关心树与会话筛选,填 0 即可。
+            updated_at: 0,
             window: None,
             tabs: vec![
                 tab(1, vec![SavedNodeEntry::split(SavedDir::Horizontal, 0.5)]),
@@ -511,6 +515,8 @@ mod tests {
         let layout = SavedLayout {
             schema_version: 1,
             active_tab: 2,
+            // F148 的时刻字段;这些测试只关心树与会话筛选,填 0 即可。
+            updated_at: 0,
             window: None,
             tabs: vec![tab(1, one_leaf()), tab(2, one_leaf()), tab(3, one_leaf())],
         };
@@ -525,6 +531,8 @@ mod tests {
         let layout = SavedLayout {
             schema_version: 1,
             active_tab: 1,
+            // F148 的时刻字段;这些测试只关心树与会话筛选,填 0 即可。
+            updated_at: 0,
             window: None,
             tabs: vec![tab(1, one_leaf()), tab(2, one_leaf())],
         };

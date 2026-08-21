@@ -75,6 +75,12 @@ pub fn top_menu(
                         ui_state.reconnect_all_request = true;
                         ui.close_menu();
                     }
+                    // F148 D9:常驻入口。只有启动弹窗的话,用户手滑点了
+                    // 「不恢复」就再也回不去,而那 10 条记录还在磁盘上躺着。
+                    if ui.button("恢复上次的现场…").clicked() {
+                        ui_state.history_request = true;
+                        ui.close_menu();
+                    }
                     if ui.button("退出").clicked() {
                         ui_state.request_quit = true;
                         ui.close_menu();
@@ -516,6 +522,22 @@ pub fn status_bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **接线守护 / F148 D9**:菜单里必须留一个常驻入口。
+    ///
+    /// 只有启动弹窗的话,用户手滑点了「不恢复」就再也回不去,而那 10 条记录
+    /// 还在磁盘上躺着。
+    ///
+    /// **扎的是源码结构**(菜单项要展开 `menu_button` 才画得出来,跑帧测不到)。
+    /// 判据串带上行首缩进,避免匹配到这条测试自己(第五类恒绿模式)。
+    #[test]
+    fn the_session_menu_has_a_permanent_entry_to_the_history_dialog() {
+        let src = include_str!("chrome.rs");
+        assert!(
+            src.contains("\n                    if ui.button(\"恢复上次的现场…\").clicked() {"),
+            "「会话」菜单里没有恢复现场的常驻入口 —— 点过一次「不恢复」就再也回不去了"
+        );
+    }
 
     #[test]
     fn status_text_connected_single_pane() {

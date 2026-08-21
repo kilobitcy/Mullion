@@ -139,6 +139,13 @@ pub struct SavedLayout {
     /// 活动标签下标。越界由 app 侧夹到 0(E6)。
     #[serde(default)]
     pub active_tab: usize,
+    /// F148:这份记录最后一次写盘的时刻(Unix 秒,UTC)。`0` = 不知道
+    /// (v1 老文件迁移过来的、或手改出来的)。
+    ///
+    /// **必须排在 `window` 之前、`tabs` 之前**:toml 的「值在表之前」规则 ——
+    /// 标量字段排在 `[window]` 表和 `[[tab]]` 表数组后面会直接序列化失败。
+    #[serde(default)]
+    pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<SavedWindow>,
     /// **必须排在 `window` 之后**,理由同 `SavedTab::tree`。
@@ -226,6 +233,7 @@ mod tests {
         SavedLayout {
             schema_version: CURRENT_LAYOUT_SCHEMA,
             active_tab: 1,
+            updated_at: 1_755_000_000,
             window: Some(SavedWindow {
                 width: 1600.5,
                 height: 900.25,
@@ -271,6 +279,26 @@ mod tests {
         assert_eq!(after, before, "round-trip 后不一致:\n{text}");
     }
 
+    /// F148:记录的时刻要能 round-trip。列表按它排序、「3 小时前」按它算 ——
+    /// 丢了它,10 条记录的先后顺序就只能靠文件 mtime,而 mtime 会被备份软件、
+    /// 同步盘、`touch` 改掉。
+    #[test]
+    fn the_updated_at_stamp_survives_a_round_trip() {
+        let before = sample();
+        let text = toml::to_string_pretty(&before).expect("序列化不该失败");
+        let after: SavedLayout = toml::from_str(&text).expect("解析不该失败");
+        assert_eq!(after.updated_at, 1_755_000_000, "时刻丢了:\n{text}");
+    }
+
+    /// 老文件(没有这个字段)读进来是 0,不失败 —— 后续 Task 的迁移要读的正是
+    /// 这种文件。
+    #[test]
+    fn a_file_without_an_updated_at_reads_back_as_zero() {
+        let text = "schema_version = 1\n";
+        let got: SavedLayout = toml::from_str(text).expect("缺字段不该解析失败");
+        assert_eq!(got.updated_at, 0);
+    }
+
     /// `f32` 的 ratio 必须精确回来。TOML 的浮点是 f64 文本,写出去再读回来
     /// 若走了一次 `f32 → f64 → f32` 的不当舍入,拖过的分隔条会每次重启都
     /// 偏一点点 —— 十次之后用户就发现布局「自己在漂」。
@@ -280,6 +308,7 @@ mod tests {
             let one = SavedLayout {
                 schema_version: CURRENT_LAYOUT_SCHEMA,
                 active_tab: 0,
+                updated_at: 0,
                 window: None,
                 tabs: vec![SavedTab {
                     kind: SavedTabKind::Terminal,

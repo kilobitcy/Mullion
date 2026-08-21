@@ -9,6 +9,7 @@ pub mod files_dialog;
 pub mod files_panel;
 pub mod glyphs;
 pub mod group_manager;
+pub mod history;
 pub mod host_key;
 pub mod ico;
 pub mod icon;
@@ -86,6 +87,16 @@ pub struct UiState {
     /// F71:启动解锁框。`Some` = `secrets.enc` 由主密码加密、还没解开,
     /// 此刻**会话库尚未打开**。`None` = 不需要密码或已经解开。
     pub unlock: Option<unlock::UnlockDraft>,
+    /// F148:恢复列表弹窗。`Some` = 弹窗开着。
+    ///
+    /// **必须计进 `app.rs::modal_open`**:里面有一颗一按就摆回整个标签栏的
+    /// 按钮,而空格/回车是 egui 的按钮激活键(T8)。
+    pub history: Option<history::HistoryDraft>,
+    /// F148:菜单里点了「恢复上次的现场…」→ `app.rs` 事后读盘、建草稿。
+    ///
+    /// **不在这里直接建草稿**:建草稿要读 `layouts` 目录、还要查会话库把
+    /// 已删会话的标签滤掉(D16),而 `ui/` 这一层零 IO。
+    pub history_request: bool,
     pub last_error: Option<String>,
     /// 用户是否关掉了当前这条错误卡片。**只该由 `set_error` 复位** ——
     /// 各处直接写 `last_error` 会绕过复位,导致关掉一次后再也看不到错误。
@@ -548,6 +559,11 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话选中的那一下
     /// 会在 egui 的 discard 趟被静默吃掉,现象是「点了节点毫无反应」。
     pub rehost: Option<rehost::RehostAction>,
+    /// F148:恢复列表这一帧的结论(恢复某条 / 不恢复)。`None` = 没动过。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话「恢复」按下去
+    /// 毫无反应,而这个弹窗是启动后唯一能操作的东西。
+    pub history: Option<history::HistoryOut>,
 }
 
 /// 指针此刻还在**文件面板**里没有(F59 / 设计 N1 的判据,2026-08-20 修正)。
@@ -768,6 +784,11 @@ pub fn build_ui(
             actions.unlock = Some(out);
         }
     }
+    // F148:恢复列表。画在解锁框**之后** —— 解锁框开着时会话库还没打开,
+    // 这个列表里「哪条会话还在」根本答不上来(它由 `app.rs` 在库打开之后
+    // 才建草稿,所以此刻它必然是 `None`,这里只是把顺序写明白)。
+    // 排在会话管理器**之前**:启动那一刻它是用户看到的第一样东西。
+    actions.history = history::show(ctx, t, &mut ui_state.history);
     if ui_state.session_manager_open {
         session_manager::show(
             ctx,

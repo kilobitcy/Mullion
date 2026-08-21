@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mullion_core::layout::PaneId;
 use mullion_ssh::config::SshConfig;
@@ -1505,6 +1505,17 @@ pub struct App {
     ///
     /// 代价是每 2 秒一次的快照构造(几个 `String` 克隆),对 60fps 的帧预算
     /// 可以忽略;收益是这一类漏接线的 bug 结构上不存在。
+    /// F148:本实例在历史目录里的身份。**恢复一条记录时会被换成那条记录的
+    /// id**(设计 D12 接管槽位)—— 所以它不是 `const`,也不能是启动时算完就
+    /// 不再变的东西。
+    instance_id: String,
+    /// F148:上一次写心跳的时刻。
+    ///
+    /// **与 `layout_checked_at` 分开**:布局落盘是「不脏就不写」,心跳必须
+    /// **无条件**写 —— 搭它的顺风车的话,一个开着不动的窗口永远不写心跳,
+    /// 会被别的实例判成死的,于是它正用着的现场出现在别人的恢复列表里
+    /// (设计 D4 的实现约束)。
+    heartbeat_at: Instant,
     last_saved_layout: Option<mullion_store::SavedLayout>,
     /// F37:上一次比对快照的时刻。节流窗口见 `layout_snapshot::should_flush`。
     layout_checked_at: Instant,
@@ -1522,12 +1533,12 @@ pub struct App {
     /// F21:当前字体量出来不是等宽。同 `settings_families`,只在开弹窗和换
     /// 字体之后重算。
     settings_not_mono: bool,
-    /// F71:解锁框开着时,那份还没能用上的 `layout.toml` 快照。
+    /// F71 + F148:解锁框开着时,那份还没能用上的历史列表。
     ///
-    /// `restore_tabs` 必须在会话库打开之后跑(「这条会话还在不在库里」是丢弃
-    /// 规则之一),而解锁框开着的时候库还没打开 —— 快照只能先在这儿等着。
-    /// 解锁成功 / 放弃解锁时由 `finish_store_open` 取走。
-    pending_layout: Option<mullion_store::SavedLayout>,
+    /// 「这条会话还在不在库里」是丢弃规则之一(D16),而解锁框开着的时候库
+    /// 还没打开 —— 列表只能先在这儿等着。解锁成功 / 放弃解锁时由
+    /// `finish_store_open` 取走。
+    pending_history: Option<Vec<mullion_store::HistoryEntry>>,
     /// F37:正在为哪个占位标签拨号,以及连上之后要摆回什么形状(E9)。
     ///
     /// **`ConnectOk` 事件本身不带 `TabId`**(它是从 tokio task 发回来的,
@@ -1686,6 +1697,10 @@ enum Modal {
     ///
     /// **不进 `touched_store`**:它一行 store 都不写(同 `Rehost` 的姿态)。
     FilesPathEdit,
+    /// F148:「恢复上次的现场」弹窗。里面没有输入框,但有一颗一按就摆回
+    /// 整个标签栏的「恢复」按钮,而空格/回车在 egui 里是按钮的激活键 ——
+    /// 同 `Modal::Import` 的理由(T8)。
+    History,
 }
 
 impl Modal {
@@ -1704,6 +1719,7 @@ impl Modal {
         Modal::ExitConfirm,
         Modal::Rehost,
         Modal::FilesPathEdit,
+        Modal::History,
     ];
 }
 
@@ -1753,6 +1769,14 @@ impl App {
             files_sidebar_was_open: false,
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
+            instance_id: mullion_store::new_instance_id(
+                mullion_store::now_ms(),
+                std::process::id(),
+            ),
+            // 减去一整个间隔:第一次 `about_to_wait` 就该写下心跳,而不是
+            // 等 15 秒 —— 那 15 秒里别的实例会把本进程判成死的。
+            heartbeat_at: Instant::now()
+                - Duration::from_secs(mullion_store::HEARTBEAT_INTERVAL_SECS),
             last_saved_layout: None,
             layout_checked_at: Instant::now(),
             // F84:真正的值在 `resumed` 里从 `settings.toml` 读(要先有窗口才
@@ -1760,7 +1784,7 @@ impl App {
             settings: mullion_store::Settings::default(),
             settings_backup: None,
             settings_families: Vec::new(),
-            pending_layout: None,
+            pending_history: None,
             settings_not_mono: false,
             pending_restore: None,
             dragging: false,
@@ -1829,7 +1853,7 @@ impl App {
     fn open_store_with(
         &mut self,
         opened: Result<crate::shell::store::SessionStore, mullion_store::StoreError>,
-        saved_layout: mullion_store::SavedLayout,
+        history: Vec<mullion_store::HistoryEntry>,
     ) {
         match opened {
             Ok(s) => {
@@ -1842,29 +1866,34 @@ impl App {
                 self.store = None;
             }
         }
-        self.finish_store_open(saved_layout);
+        self.finish_store_open(history);
     }
 
-    /// 会话库尘埃落定之后的那串收尾:算外观缓存、摆回上次的标签、决定第一屏。
+    /// 会话库尘埃落定之后的那串收尾:算外观缓存、决定第一屏。
     ///
     /// 抽出来的唯一理由是 F71:解锁框开着的时候这些都还不能做(库还没打开,
     /// 「这条会话还在不在库里」答不上来),得等解锁成功再跑。
-    fn finish_store_open(&mut self, saved_layout: mullion_store::SavedLayout) {
+    ///
+    /// **F148 起不再自动摆回标签**(D1):启动摆什么由用户在恢复列表里选。
+    fn finish_store_open(&mut self, history: Vec<mullion_store::HistoryEntry>) {
         // 启动时先算一次,否则第一次打开会话管理器全是无色。
         self.refresh_appearance();
-        // F37:上次那几个标签摆回来(占位,一条连接都不建 —— 设计 §1)。
-        // **必须在 store 打开之后**:「这条会话还在不在库里」是丢弃规则之一。
-        self.restore_tabs(saved_layout);
 
-        // CLI 直连(路径①)→ 立刻发起连接,进终端态;无参启动(路径②)→ 留在
-        // launcher(conn 仍 None)并自动弹出会话管理器,让用户选/建会话(§2/Task7)。
+        // CLI 直连(路径①)→ 立刻发起连接,进终端态。
         if let Some(cfg) = self.initial.take() {
             // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
             self.spawn_connect(cfg, false);
-        } else if self.tabs.is_empty() {
-            // F37:恢复出了占位标签就别再弹会话管理器 —— 用户看到的第一屏
-            // 该是上次那几个标签,不是一个盖住它们的弹窗。
+            return;
+        }
+        // F148 D9:无参启动 → 有历史就先给恢复列表,没有就照旧弹会话管理器。
+        // **必须在这里而不是 `resumed` 里**:「这条会话还在不在库里」要查
+        // 会话库,而库到这一刻才刚打开。
+        let rows = self.history_rows(&history);
+        if rows.is_empty() {
+            // 首次运行 / 全被清空 —— 弹一个空列表等于让用户点一下才能开始干活。
             self.ui.session_manager_open = true;
+        } else {
+            self.ui.history = Some(crate::ui::history::HistoryDraft::new(rows));
         }
     }
 
@@ -1884,21 +1913,15 @@ impl App {
                     // 探测那一步已经拿到过目录了,走到这里说明环境在两步之间变了。
                     self.ui.unlock = None;
                     self.ui.set_error("无法定位配置目录".into());
-                    let layout = self
-                        .pending_layout
-                        .take()
-                        .unwrap_or_else(mullion_store::SavedLayout::empty);
-                    self.finish_store_open(layout);
+                    let history = self.pending_history.take().unwrap_or_default();
+                    self.finish_store_open(history);
                     return false;
                 };
                 match crate::shell::store::SessionStore::unlock(dir, &password) {
                     Ok(s) => {
                         self.ui.unlock = None;
-                        let layout = self
-                            .pending_layout
-                            .take()
-                            .unwrap_or_else(mullion_store::SavedLayout::empty);
-                        self.open_store_with(Ok(s), layout);
+                        let history = self.pending_history.take().unwrap_or_default();
+                        self.open_store_with(Ok(s), history);
                     }
                     Err(mullion_store::StoreError::WrongPassword) => {
                         // **弹窗留着**:密码打错是最常见的情况,把人踢回一个
@@ -1913,11 +1936,8 @@ impl App {
                         crate::logx::line(&format!("解锁失败: {e}"));
                         self.ui.unlock = None;
                         self.ui.set_error(format!("会话库打开失败:{e}"));
-                        let layout = self
-                            .pending_layout
-                            .take()
-                            .unwrap_or_else(mullion_store::SavedLayout::empty);
-                        self.finish_store_open(layout);
+                        let history = self.pending_history.take().unwrap_or_default();
+                        self.finish_store_open(history);
                     }
                 }
                 self.ui_dirty = true;
@@ -2069,6 +2089,15 @@ impl App {
 
     // ------------------------------------------------ F37 布局持久化(E7/E8)
 
+    /// F148 D14:迁移老 `layout.toml` 时给那条记录用的 id。
+    ///
+    /// **不能直接用 `self.instance_id`**:那是本实例正在写的槽位,迁移过去
+    /// 会被本进程 2 秒后的第一次落盘(此刻标签栏是空的)当场覆盖成空现场 ——
+    /// 用户升级前那一屏就这么没了。
+    fn instance_id_for_legacy(&self) -> String {
+        format!("{}-legacy", self.instance_id)
+    }
+
     /// 把当前的标签栏 + 分屏形状 + 窗口几何拍成一份可落盘的快照。
     ///
     /// **`session_id == None` 的标签跳过**(设计 E2/E6):快速连接(命令行
@@ -2082,6 +2111,10 @@ impl App {
         mullion_store::SavedLayout {
             schema_version: mullion_store::CURRENT_LAYOUT_SCHEMA,
             active_tab,
+            // F148:**这里恒填 0**。时刻由落盘那一侧在确定要写之后才盖上 ——
+            // 在这里盖的话,每次现算的快照都带着不同的时刻,`last_saved_layout`
+            // 的逐字段比对就永远不相等,于是空闲时每 2 秒也会写一次盘。
+            updated_at: 0,
             window: self.window_geometry(),
             tabs,
         }
@@ -2126,6 +2159,10 @@ impl App {
     ///
     /// 写盘失败**只记日志**,不弹错误卡片:布局是「上次的场景」,不是用户
     /// 资产(设计 E1),为它打断用户不成比例。
+    ///
+    /// F148:写的是**本实例的槽位** `layouts/<instance_id>.toml`,不再是共享的
+    /// `layout.toml` —— 多开时两个进程每 2 秒轮流覆盖同一个文件,最后关的赢
+    /// (那正是这一片要修的第一件事)。
     fn save_layout_if_changed(&mut self) {
         let now = self.snapshot_layout();
         if self.last_saved_layout.as_ref() == Some(&now) {
@@ -2134,9 +2171,32 @@ impl App {
         let Some(dir) = crate::shell::store::config_dir() else {
             return;
         };
-        match mullion_store::layout::save(&dir, &now) {
+        // 时刻在**确定要写**之后才盖:盖在 `snapshot_layout` 里的话,上面那句
+        // 比对永远不相等(见那里的注释)。
+        let mut out = now.clone();
+        out.updated_at = mullion_store::now_secs();
+        match mullion_store::save_record(&dir, &self.instance_id, &out) {
+            // 记 `now`(时刻为 0 的那份)而不是 `out` —— 下一次比对拿到的
+            // 也是时刻为 0 的新快照,两者才可比。
             Ok(()) => self.last_saved_layout = Some(now),
-            Err(e) => log::debug!(target: "mullion", "布局落盘失败: {e}"),
+            Err(e) => log::debug!(target: "mullion", "现场落盘失败: {e}"),
+        }
+    }
+
+    /// F148:到点就写一次心跳。**无条件**,不看布局脏不脏 —— 见
+    /// `heartbeat_at` 字段的说明。
+    fn tick_heartbeat(&mut self) {
+        if self.heartbeat_at.elapsed().as_secs() < mullion_store::HEARTBEAT_INTERVAL_SECS {
+            return;
+        }
+        self.heartbeat_at = Instant::now();
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        if let Err(e) =
+            mullion_store::touch_alive(&dir, &self.instance_id, mullion_store::now_secs())
+        {
+            log::debug!(target: "mullion", "心跳写入失败: {e}");
         }
     }
 
@@ -2370,6 +2430,11 @@ impl App {
             return;
         }
         let count = usable.tabs.len();
+        // D13:**追加**在现有标签后面,不清空 —— 清空会断掉正在跑的连接。
+        // 所以得先记住追加起点:存进记录里的 `active_tab` 是**那条记录内部**
+        // 的下标,不是本窗口标签栏里的下标。
+        let base = self.tabs.len();
+        let active = usable.active_tab;
         for t in usable.tabs {
             let generation = self.next_ws_generation;
             self.next_ws_generation += 1;
@@ -2387,8 +2452,112 @@ impl App {
             );
         }
         // `open` 每开一个都会把它设成活动标签,所以最后再切回存的那一个。
-        self.tabs.switch_to_index(usable.active_tab);
-        crate::logx::line(&format!("F37:恢复了 {count} 个占位标签"));
+        // D13:加上追加起点 —— 运行中恢复时前面还有别的标签,用记录内部的
+        // 裸下标会跳到一个不相干的标签上。
+        self.tabs.switch_to_index(base + active);
+        crate::logx::line(&format!("F148:恢复了 {count} 个占位标签"));
+        self.ui_dirty = true;
+    }
+
+    /// F148:把一批记录做成弹窗要画的行(D10/D16)。
+    ///
+    /// **会话已删的标签在这里就被滤掉**(沿用 `layout_snapshot::usable` 的
+    /// 规则):摘要里列一个已经不存在的会话名,用户点了恢复只会得到一个点了
+    /// 必然失败的「重连」。**整条记录一个可用标签都不剩时,这条记录不进列表**
+    /// —— 它恢复出来是个空窗口。
+    ///
+    /// **活着的实例的记录不进列表**(D3):那个现场正被别人用着。
+    fn history_rows(
+        &self,
+        entries: &[mullion_store::HistoryEntry],
+    ) -> Vec<crate::ui::history::HistoryRow> {
+        let known: Vec<SessionId> = self
+            .store
+            .as_ref()
+            .map_or(Vec::new(), |s| s.list().iter().map(|r| r.id).collect());
+        let now = mullion_store::now_secs();
+        let mut out = Vec::new();
+        for e in entries {
+            if e.alive {
+                continue;
+            }
+            let usable =
+                crate::shell::layout_snapshot::usable(e.layout.clone(), &|id| known.contains(&id));
+            if usable.tabs.is_empty() {
+                continue;
+            }
+            let titles: Vec<String> = usable.tabs.iter().map(|t| t.title.clone()).collect();
+            let panes: usize = usable
+                .tabs
+                .iter()
+                .map(|t| crate::shell::layout_snapshot::leaf_count(&t.tree).unwrap_or(1))
+                .sum();
+            let when = crate::ui::history::when_text(now, e.layout.updated_at);
+            out.push(crate::ui::history::HistoryRow {
+                id: e.id.clone(),
+                head: crate::ui::history::head_text(&when, usable.tabs.len(), panes),
+                summary: crate::ui::history::summary_text(&titles),
+            });
+        }
+        out
+    }
+
+    /// F148:菜单里点了「恢复上次的现场…」—— 现读一次盘、建草稿。
+    ///
+    /// **现读而不是用启动时那份**:这中间可能又有别的窗口关掉了,拿旧列表
+    /// 会让用户看不到刚关的那个现场。
+    fn open_history_dialog(&mut self) {
+        let entries = crate::shell::store::config_dir()
+            .map(|d| mullion_store::list_records(&d, mullion_store::now_secs()))
+            .unwrap_or_default();
+        let rows = self.history_rows(&entries);
+        if rows.is_empty() {
+            self.ui.set_toast("没有可恢复的现场");
+            return;
+        }
+        self.ui.history = Some(crate::ui::history::HistoryDraft::new(rows));
+        self.ui_dirty = true;
+    }
+
+    /// F148:恢复一条记录(D12 接管槽位 / D13 追加进当前窗口)。
+    ///
+    /// 三步,顺序不能换:
+    /// 1. 读出那条记录并摆回标签(**追加**在现有标签后面,不清空 —— 清空会
+    ///    断掉正在跑的连接);
+    /// 2. 删掉本实例原来的槽位文件(启动时它通常还不存在,删除是 no-op);
+    /// 3. 把本实例的身份换成那条记录的 id —— 此后就往那个文件写。
+    ///
+    /// 第 3 步是「接管」的全部内容(D12):不接管的话,本实例仍在写自己的新
+    /// 槽位,而老记录原样躺着 —— 下次启动列表里就会出现两条内容几乎一样的
+    /// 记录,而且越滚越多。
+    ///
+    /// **窗口几何不套用**(X8/D13):窗口已经建好了,再跳一次位置只会让人
+    /// 眼花。
+    fn restore_history(&mut self, id: &str) {
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        let now = mullion_store::now_secs();
+        let Some(entry) = mullion_store::list_records(&dir, now)
+            .into_iter()
+            .find(|e| e.id == id)
+        else {
+            // 两次启动之间被别的实例裁掉了(D5)。不是错误,说一声就行。
+            self.ui.set_toast("那条现场已经不在了");
+            return;
+        };
+        self.restore_tabs(entry.layout);
+        // 2 → 3:先删旧槽位再改身份,顺序反了会把**刚接管的那个文件**删掉。
+        mullion_store::remove_record(&dir, &self.instance_id);
+        self.instance_id = id.to_string();
+        // 接管之后立刻打一次心跳:别的实例这一刻起就该把这个槽位看成「有人
+        // 在用」,否则第二个新实例会把它也列出来,两个进程往同一个文件写(D12
+        // 的残余竞态)。
+        let _ = mullion_store::touch_alive(&dir, &self.instance_id, now);
+        // 本实例的记录内容变了(标签栏多了一批),下次比对必须重来一遍 ——
+        // 不清的话 `save_layout_if_changed` 会拿旧快照比出「没变」,新摆回来
+        // 的标签永远不落盘。
+        self.last_saved_layout = None;
         self.ui_dirty = true;
     }
 
@@ -2501,6 +2670,8 @@ impl App {
             Modal::Rehost => self.ui.rehost.is_some(),
             // F131:见 `Modal::FilesPathEdit` 的说明。
             Modal::FilesPathEdit => self.files_path_editing(),
+            // F148:见 `Modal::History` 的说明(T8)。
+            Modal::History => self.ui.history.is_some(),
         })
     }
 
@@ -5459,24 +5630,34 @@ impl ApplicationHandler<UserEvent> for App {
         // adapter 枚举 / request_device 是阻塞调用,显卡驱动出问题时会卡死在这里——
         // 打上阶段标记,看门狗才说得出「卡在 startup」而不是一片空白。
         diag::mark(diag::Stage::Startup);
-        // F37:**建窗口之前**就把上次的布局读出来 —— 几何要写进
+        // F148:先把 v1 的 `layout.toml` 迁成一条记录并删掉它(D14),再裁剪
+        // 到 10 条(D5/X6:**只在启动时裁一次**,关窗口时也裁的话「读整个
+        // 目录」就从一次性动作变成了每个实例退出都要做的共享操作)。
+        //
+        // 两件事都在建窗口之前做:下面要拿最新一条的几何去填
         // `WindowAttributes`,建完再 `set_outer_position` 会让用户看见窗口
         // 先在默认位置闪一下再跳过去。
-        //
-        // `layout::load` 没有 `Result`(设计 E6):布局文件坏了的正确表现是
-        // 「这次没恢复」,而不是「打不开客户端」。这里的 `unwrap_or_else`
-        // 只对付「连配置目录都定位不到」。
-        let saved_layout = crate::shell::store::config_dir()
-            .map(|d| mullion_store::layout::load(&d))
-            .map(|l| {
-                if let Some(note) = l.note {
-                    crate::logx::line(&format!("F37:{note}"));
+        let history = crate::shell::store::config_dir()
+            .map(|d| {
+                let now = mullion_store::now_secs();
+                if let Some(id) =
+                    mullion_store::migrate_legacy(&d, &self.instance_id_for_legacy(), now)
+                {
+                    crate::logx::line(&format!("F148:老的 layout.toml 已迁成记录 {id}"));
                 }
-                l.layout
+                let dropped = mullion_store::prune(&d, now);
+                if dropped > 0 {
+                    crate::logx::line(&format!("F148:裁掉了 {dropped} 条旧记录"));
+                }
+                mullion_store::list_records(&d, now)
             })
-            .unwrap_or_else(mullion_store::SavedLayout::empty);
+            .unwrap_or_default();
+        // X8:启动**不摆标签**(D1),但窗口总得有个大小和位置 —— 取最新
+        // 一条记录的几何(死活不论)。恢复某条记录时**不再改窗口几何**:
+        // 窗口已经建好了,再跳一次位置只会让人眼花(D13)。
+        let saved_window = history.first().and_then(|e| e.layout.window);
         let mut attrs = Window::default_attributes().with_title("mullion");
-        if let Some(w) = saved_layout.window {
+        if let Some(w) = saved_window {
             // 夹紧判据全在 `layout_snapshot::clamp_to_monitors` 里(纯函数,
             // 有守护测试)—— 拔掉一块显示器之后,上次那个位置可能已经在
             // 所有屏幕之外,窗口会恢复到用户根本看不见的地方。
@@ -5577,7 +5758,7 @@ impl ApplicationHandler<UserEvent> for App {
             Some(d) => match crate::shell::store::probe_needs_password(&d) {
                 Ok(true) => {
                     crate::logx::line("secrets.enc 由主密码加密,等待解锁");
-                    self.pending_layout = Some(saved_layout);
+                    self.pending_history = Some(history);
                     self.ui.unlock = Some(crate::ui::unlock::UnlockDraft::default());
                 }
                 Ok(false) => {
@@ -5586,7 +5767,7 @@ impl ApplicationHandler<UserEvent> for App {
                             d,
                             &mullion_store::KeyringSource::new(),
                         ),
-                        saved_layout,
+                        history,
                     );
                 }
                 Err(e) => {
@@ -5595,13 +5776,13 @@ impl ApplicationHandler<UserEvent> for App {
                     // 报出来的是「密文损坏」,把真正的原因盖掉。
                     crate::logx::line(&format!("secrets.enc 探测失败: {e}"));
                     self.ui.set_error(format!("会话库打开失败:{e}"));
-                    self.finish_store_open(saved_layout);
+                    self.finish_store_open(history);
                 }
             },
             None => {
                 crate::logx::line("无法定位配置目录,会话功能禁用");
                 self.ui.set_error("无法定位配置目录".into());
-                self.finish_store_open(saved_layout);
+                self.finish_store_open(history);
             }
         }
         diag::mark(diag::Stage::Idle);
@@ -7356,6 +7537,20 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui.request_quit = true;
                                 }
                             }
+                            // F148:恢复列表的结论。
+                            if let Some(out) = actions.history.take() {
+                                // 无论恢复还是不恢复,弹窗都收掉 —— 「恢复」之后
+                                // 还留着的话,用户会以为可以再选一条(而那时
+                                // 本实例已经接管了槽位)。
+                                self.ui.history = None;
+                                if let crate::ui::history::HistoryOut::Restore(id) = out {
+                                    self.restore_history(&id);
+                                }
+                                self.ui_dirty = true;
+                            }
+                            if std::mem::take(&mut self.ui.history_request) {
+                                self.open_history_dialog();
+                            }
                             // 点了 pane 标题条的「换节点」:开弹窗,真正换在
                             // 用户选完之后。**只开弹窗,不预判节点** —— 这一步
                             // 没有任何默认答案可猜。
@@ -8066,6 +8261,10 @@ impl ApplicationHandler<UserEvent> for App {
         // 帧循环里 —— 它跟渲染无关,而 `about_to_wait` 是「已经闲下来了」
         // 这个语义唯一准确的位置。
         self.flush_layout_if_due();
+        // F148:心跳。**与落盘分开的一次独立写**,理由见 `heartbeat_at`:
+        // 布局没变时不落盘,心跳却必须照写,否则开着不动的窗口会被别的实例
+        // 判成死的。
+        self.tick_heartbeat();
         // F124:到点就配一遍远端 tmux 的状态上报。跟布局落盘同一个理由放在
         // 这里 —— 它跟渲染无关,而 `about_to_wait` 是「已经闲下来了」这个
         // 语义唯一准确的位置。
@@ -8975,6 +9174,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.tab_props.is_some()
         || a.rehost.is_some()
         || a.rehost_pane.is_some()
+        || a.history.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -9733,6 +9933,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::FilesPathEdit),
                     "FilesPathEdit 没登记进 Modal::ALL(T8/F131)"
                 ),
+                Modal::History => assert!(
+                    Modal::ALL.contains(&Modal::History),
+                    "History 没登记进 Modal::ALL(T8/F148)"
+                ),
             }
         }
         for m in [
@@ -9748,7 +9952,11 @@ mod tests {
             Modal::GroupManager,
             Modal::TabProps,
             Modal::ExitConfirm,
+            // 补漏:这一项过去缺席 —— `match` 有它那一臂,但循环从不喂它,
+            // 那条 `assert!` 是死代码(F148 复核顺带发现)。
+            Modal::Rehost,
             Modal::FilesPathEdit,
+            Modal::History,
         ] {
             check(m);
         }
@@ -9757,6 +9965,52 @@ mod tests {
         for m in Modal::ALL {
             assert!(seen.insert(format!("{m:?}")), "Modal::ALL 里有重复项:{m:?}");
         }
+    }
+
+    /// **接线守护 / F148**:恢复列表弹窗必须算模态(T8)。
+    ///
+    /// 不算的话,它开着的时候 `Ctrl+W` 仍能关掉背后的标签、方向键仍被判给
+    /// 终端 —— 而这个弹窗是启动后用户看到的第一样东西。
+    #[test]
+    fn the_history_dialog_counts_as_a_modal_so_it_does_not_share_the_keyboard() {
+        assert!(
+            Modal::ALL.contains(&Modal::History),
+            "History 没登记进 Modal::ALL(T8)"
+        );
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open");
+        let body = &after[..after.find("\n    }\n").expect("找不到 modal_open 的结尾")];
+        // **不能只查 `"Modal::History =>"` 这个子串**:把 History 并进别的臂
+        // (如 `Modal::FilesPathEdit | Modal::History => self.files_path_editing(),`)
+        // 时,这个子串原样躺在合并后的那一行里,断言会假绿。查完整那一臂,
+        // 判据落在「History 真的映射到 `self.ui.history.is_some()`」上。
+        assert!(
+            body.contains("Modal::History => self.ui.history.is_some()"),
+            "modal_open 里没有 History 独立的那一臂(T8)"
+        );
+    }
+
+    /// **接线守护 / F148**:弹窗的结论必须进 `has_real_action`。
+    ///
+    /// 漏了的话,「恢复」按下去会在 egui 的 discard 趟被静默吃掉 —— 而这个
+    /// 弹窗是启动后唯一能操作的东西,用户只能去杀进程。
+    ///
+    /// 自证会变红:把 `has_real_action` 里的 `|| a.history.is_some()` 删掉。
+    #[test]
+    fn the_history_dialog_action_is_not_swallowed_by_the_discard_pass() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn has_real_action(")
+            .nth(1)
+            .expect("找不到 has_real_action");
+        let body = &after[..after.find("\n}\n").expect("找不到 has_real_action 的结尾")];
+        assert!(
+            body.contains("a.history.is_some()"),
+            "恢复列表的结论会在 discard 趟被静默吃掉"
+        );
     }
 
     /// F61/F62:导入会一次加进几十条会话,外观缓存必须跟着重算 —— 漏掉
@@ -11542,6 +11796,58 @@ mod tests {
         );
     }
 
+    /// **接线守护 / F148**:心跳必须挂在 `about_to_wait` 上,而且**不能**
+    /// 走 `flush_layout_if_due` 那条「不脏就不写」的路。
+    ///
+    /// 漏了的症状极其隐蔽:一个开着不动的窗口(布局没变 → 不落盘 → 不写心跳)
+    /// 会被别的实例判成死的,于是它**正在用**的现场出现在别人的恢复列表里,
+    /// 被恢复出来就是两个窗口抢同一个槽位(设计 D4)。
+    ///
+    /// **扎的是源码结构**:真正验它要一个完整的 `App` + `EventLoopProxy`,
+    /// 容器里造不出来。验证边界:挡得住「整个调用被删/挪走」,挡不住
+    /// 「函数体被掏空」。
+    ///
+    /// 自证会变红:删掉 `about_to_wait` 里那句 `self.tick_heartbeat();`。
+    #[test]
+    fn about_to_wait_writes_the_heartbeat() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n    fn about_to_wait(")
+            .nth(1)
+            .expect("找不到 about_to_wait 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 about_to_wait 的函数结尾")];
+        assert!(
+            body.contains("self.tick_heartbeat();"),
+            "about_to_wait 不写心跳 —— 开着不动的窗口会被别人判死,现场被克隆走"
+        );
+    }
+
+    /// **接线守护 / F148**:心跳**不许**跟布局落盘共用节流窗口。
+    ///
+    /// 自证会变红:把 `tick_heartbeat` 的函数体改成
+    /// `self.save_layout_if_changed()` 那种「先比对再写」的形状。
+    #[test]
+    fn the_heartbeat_is_written_unconditionally_not_only_when_the_layout_changed() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn tick_heartbeat(")
+            .nth(1)
+            .expect("找不到 tick_heartbeat");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 tick_heartbeat 的结尾")];
+        assert!(
+            !body.contains("last_saved_layout"),
+            "心跳搭上了布局落盘的「不脏就不写」—— 开着不动的窗口永远不写心跳"
+        );
+        assert!(
+            body.contains("touch_alive("),
+            "tick_heartbeat 没真的写心跳文件"
+        );
+    }
+
     /// **接线守护 / F124**:草稿里的自举开关要真被搬进 `self.settings`。
     ///
     /// 漏掉这一行的症状很隐蔽:复选框点得动、界面也重画了(`Preview` 回报是
@@ -11645,6 +11951,23 @@ mod tests {
         );
     }
 
+    /// **D13**:运行中恢复要**追加**,不能把现有标签顶掉 —— 顶掉会断连接。
+    ///
+    /// 自证会变红:把 `restore_tabs` 里的 `base + active` 改回 `active`。
+    #[test]
+    fn restoring_into_a_non_empty_window_switches_to_the_newly_added_tab() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn restore_tabs(")
+            .nth(1)
+            .expect("找不到 restore_tabs");
+        let body = &after[..after.find("\n    }\n").expect("找不到 restore_tabs 的结尾")];
+        assert!(
+            body.contains("base + active"),
+            "恢复时活动标签用的是记录内部的裸下标 —— 运行中恢复会跳到不相干的标签上"
+        );
+    }
+
     /// **接线守护 / F37**:存下来的窗口几何必须过 `clamp_to_monitors` 再交给
     /// winit。不夹的话,拔掉副屏之后窗口会开在一块不存在的屏幕上——用户看到
     /// 的是「程序启动了但没有窗口」,而且**没有任何办法**把它弄回来。
@@ -11658,6 +11981,66 @@ mod tests {
         assert!(
             after.contains("layout_snapshot::clamp_to_monitors("),
             "启动时没夹紧窗口几何 —— 副屏拔掉后窗口会开在看不见的地方"
+        );
+    }
+
+    /// **接线守护 / F148 D1**:启动**不再**自动摆回上次的标签。
+    ///
+    /// 多开成为常态之后,「最近一条」是哪个窗口关出来的完全不可预测 ——
+    /// 自动摆回一个随机窗口的布局比不摆更困惑。摆什么由用户在恢复列表里选。
+    ///
+    /// 自证会变红:把 `finish_store_open` 里那句 `self.restore_tabs(..)` 加回来。
+    #[test]
+    fn startup_no_longer_restores_tabs_behind_the_users_back() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn finish_store_open(")
+            .nth(1)
+            .expect("找不到 finish_store_open");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 finish_store_open 的结尾")];
+        assert!(
+            !body.contains("self.restore_tabs("),
+            "启动仍在自动摆回标签 —— 多开时摆的是哪个窗口的现场完全不可预测(D1)"
+        );
+    }
+
+    /// **接线守护 / F148 D14**:启动时必须迁移老的 `layout.toml`。
+    ///
+    /// 漏了的话,升级那一次用户正开着的现场直接消失,而且老文件会永远躺在
+    /// 那儿不被任何人读。
+    ///
+    /// 自证会变红:删掉 `resumed` 里那句 `mullion_store::migrate_legacy(`。
+    ///
+    /// **必须切到 `resumed` 的函数体末尾再判**:不收尾的话 `after` 一路延伸到
+    /// 下一个 `"fn resumed("` 字面量(也就是别的测试里的那个 split 参数),
+    /// 而本测试自己的文档注释里就写着这个判据串 —— 一旦那条不相关的测试被
+    /// 改名或挪走,这条守护就变成「自己匹配自己」的恒绿(第四类)。
+    #[test]
+    fn startup_migrates_the_legacy_layout_file() {
+        let src = include_str!("app.rs");
+        let after = src.split("fn resumed(").nth(1).expect("找不到 resumed");
+        let body = &after[..after.find("\n    }\n").expect("找不到 resumed 的结尾")];
+        assert!(
+            body.contains("mullion_store::migrate_legacy("),
+            "启动不迁移老的 layout.toml —— 升级那次的现场会直接消失(D14)"
+        );
+    }
+
+    /// **接线守护 / F148 D5/X6**:裁剪只在启动时做一次。
+    ///
+    /// 自证会变红:删掉 `resumed` 里那句 `mullion_store::prune(`。
+    ///
+    /// 收尾的理由同上一条。
+    #[test]
+    fn startup_prunes_the_history_once() {
+        let src = include_str!("app.rs");
+        let after = src.split("fn resumed(").nth(1).expect("找不到 resumed");
+        let body = &after[..after.find("\n    }\n").expect("找不到 resumed 的结尾")];
+        assert!(
+            body.contains("mullion_store::prune("),
+            "启动不裁剪历史 —— layouts 目录会无限增长"
         );
     }
 
