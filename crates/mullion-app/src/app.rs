@@ -1640,18 +1640,38 @@ pub struct App {
     /// 不是这一帧的真实生效值**——能否兑现取决于面板此刻在不在(见
     /// `effective_focus` 按上下文夹紧的说明)。默认终端,与迁移前行为一致。
     focus: shell::input_route::Focus,
+    /// F55:上传/下载队列的全部状态,见 `TransferState`。
+    transfer: TransferState,
+    /// F53:外部/内置编辑的全部状态,见 `EditState`。
+    edit: EditState,
+}
+
+/// F55:一条传输 job 从入队到落地牵扯到的全部状态。
+///
+/// 三项按 job id 一一对应,`queue` 是主表、另两项是它的边料:job 结束时
+/// 三处必须一起清。收成一个结构的理由同 `EditState` —— 散在 `App` 上时
+/// 「队列空了但 `specs` 还在涨」这类泄漏没有任何静态提示。
+struct TransferState {
     /// F55:**跨标签**的传输队列。挂在 `App` 上而不是标签上 —— 设计里它
     /// 是全局的一条队列,切标签不该看见另一份;标签关掉时用
     /// `Queue::cancel_generation` 作废属于它的那些 job。
-    transfer_queue: crate::files::queue::Queue,
+    queue: crate::files::queue::Queue,
     /// 每条在跑的 job 的取消旗标。worker 每块之后看一眼 —— 取消得能在
     /// 2GB 传到一半时立刻生效,不能等整个文件传完。
-    transfer_cancels: std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
+    cancels: std::collections::HashMap<u64, Arc<std::sync::atomic::AtomicBool>>,
     /// 每条 job 的完整参数(见 `TransferSpec`)。job 真正走完(不是挂在冲突上)
     /// 之后删掉,不然队列清空了它还在涨。
-    transfer_specs: std::collections::HashMap<u64, TransferSpec>,
-    /// F53:外部/内置编辑的全部状态,见 `EditState`。
-    edit: EditState,
+    specs: std::collections::HashMap<u64, TransferSpec>,
+}
+
+impl TransferState {
+    fn new() -> Self {
+        Self {
+            queue: crate::files::queue::Queue::new(DEFAULT_TRANSFER_CONCURRENCY),
+            cancels: std::collections::HashMap::new(),
+            specs: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// F53:一次「把远端文件拉下来编辑再回传」牵扯到的全部状态。
@@ -1662,7 +1682,7 @@ pub struct App {
 /// 表现是「关掉的文件还在后台被 stat」或「第二次编辑不再备份原文」,而且
 /// 两者都不报错。聚在一起之后,漏没漏一眼就能看出来。
 struct EditState {
-    /// F53:所有还挂在监视里的编辑。跨标签一份,理由同 `transfer_queue`。
+    /// F53:所有还挂在监视里的编辑。跨标签一份,理由同 `TransferState::queue`。
     sessions: crate::edit::sessions::EditSessions,
     /// F53:内置编辑器窗口。**同一时刻只开一个** —— 多开的价值远小于
     /// 「哪个窗口对应哪个文件」带来的混乱,而这里每个窗口背后都是一次
@@ -1855,9 +1875,7 @@ impl App {
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
             // F56:默认 4 条并发。可配 UI 是 D2-c 的欠账,先按设计定的默认值走。
-            transfer_queue: crate::files::queue::Queue::new(DEFAULT_TRANSFER_CONCURRENCY),
-            transfer_cancels: std::collections::HashMap::new(),
-            transfer_specs: std::collections::HashMap::new(),
+            transfer: TransferState::new(),
             edit: EditState::new(),
         }
     }
@@ -2608,11 +2626,11 @@ impl App {
     /// F55:作废属于某个标签的全部传输。扳旗标(让在跑的 worker 立刻停)
     /// **和**改队列状态(让界面上那几条变成「已取消」)缺一不可。
     fn cancel_transfers_of(&mut self, generation: u64) {
-        for id in self.transfer_queue.cancel_generation(generation) {
-            if let Some(c) = self.transfer_cancels.remove(&id) {
+        for id in self.transfer.queue.cancel_generation(generation) {
+            if let Some(c) = self.transfer.cancels.remove(&id) {
                 c.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            self.transfer_specs.remove(&id);
+            self.transfer.specs.remove(&id);
         }
     }
 
@@ -3467,7 +3485,7 @@ impl App {
             apply_all,
         } = op
         {
-            self.transfer_queue.resolve_conflict(job, choice, apply_all);
+            self.transfer.queue.resolve_conflict(job, choice, apply_all);
             self.ui_dirty = true;
             return;
         }
@@ -4102,25 +4120,25 @@ impl App {
     /// 共用一条的话请求在同一个 session 上串行,并发度实际等于 1,设计 D8
     /// 说的吞吐问题原样还在。
     fn pump_transfers(&mut self) {
-        for id in self.transfer_queue.take_runnable() {
-            let Some(spec) = self.transfer_specs.get(&id).cloned() else {
-                self.transfer_queue.finish(id, Err("任务参数丢了".into()));
+        for id in self.transfer.queue.take_runnable() {
+            let Some(spec) = self.transfer.specs.get(&id).cloned() else {
+                self.transfer.queue.finish(id, Err("任务参数丢了".into()));
                 continue;
             };
             let Some(tab) = self.tabs.by_generation(spec.generation) else {
                 // 属主标签没了 —— 关标签那条路径已经 `cancel_generation` 过,
                 // 这里是兜底,不该再当成"失败"报给用户。
-                self.transfer_queue.cancel(id);
+                self.transfer.queue.cancel(id);
                 continue;
             };
             let Some(conn) = tab.content.sftp_connection_for(tab.content.sftp_host_ix()) else {
-                self.transfer_queue.finish(id, Err("连接已断开".into()));
+                self.transfer.queue.finish(id, Err("连接已断开".into()));
                 continue;
             };
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            self.transfer_cancels.insert(id, cancel.clone());
+            self.transfer.cancels.insert(id, cancel.clone());
             // 冲突处置结果随 job 存在队列里(重跑时才知道该覆盖还是改名)。
-            let resolved = self.transfer_queue.get(id).and_then(|j| j.resolved);
+            let resolved = self.transfer.queue.get(id).and_then(|j| j.resolved);
             let generation = spec.generation;
             let proxy = self.proxy.clone();
             let task = self._runtime.spawn(async move {
@@ -6618,13 +6636,13 @@ impl ApplicationHandler<UserEvent> for App {
                 match result {
                     Ok(jobs) => {
                         for p in jobs {
-                            let id = self.transfer_queue.push(crate::files::queue::NewJob {
+                            let id = self.transfer.queue.push(crate::files::queue::NewJob {
                                 dir: p.dir,
                                 generation,
                                 label: p.label,
                                 total: p.total,
                             });
-                            self.transfer_specs.insert(
+                            self.transfer.specs.insert(
                                 id,
                                 TransferSpec {
                                     dir: p.dir,
@@ -6645,13 +6663,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // 每条都请求重绘就是每秒几千帧、风扇起飞。进度显示由
                 // `RedrawRequested` 里那段「队列在跑就标脏 + 排下一帧」按帧闸
                 // 驱动(~5Hz),与事件频率无关。
-                self.transfer_queue.progress(job, done);
+                self.transfer.queue.progress(job, done);
             }
             UserEvent::TransferDone { job, result } => {
-                self.transfer_cancels.remove(&job);
-                self.transfer_queue.finish(job, result);
+                self.transfer.cancels.remove(&job);
+                self.transfer.queue.finish(job, result);
                 // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
-                if let Some(spec) = self.transfer_specs.get(&job) {
+                if let Some(spec) = self.transfer.specs.get(&job) {
                     let (generation, dir) = (spec.generation, spec.dir);
                     let column = match dir {
                         crate::files::queue::Direction::Download => {
@@ -6669,11 +6687,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // 真正走完的才丢 spec:挂在冲突上的那些还要**用同一份**重跑。
                 if self
-                    .transfer_queue
+                    .transfer
+                    .queue
                     .get(job)
                     .is_none_or(|j| j.state.is_finished())
                 {
-                    self.transfer_specs.remove(&job);
+                    self.transfer.specs.remove(&job);
                 }
                 self.request_ui_redraw();
             }
@@ -7199,14 +7218,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // 驱动重绘就是风扇起飞;这里只把「队列在跑」当成脏,重绘频率
                 // 因此由下面那段排期(~5Hz)决定,与事件频率无关。
                 self.pump_transfers();
-                if self.transfer_queue.summary().busy {
-                    self.transfer_queue.tick(self.start.elapsed().as_secs_f64());
+                if self.transfer.queue.summary().busy {
+                    self.transfer.queue.tick(self.start.elapsed().as_secs_f64());
                     self.ui_dirty = true;
                 }
                 // 1.6 F55:有 job 挂在冲突上就把处置框弹出来。**绝不静默覆盖**;
                 // 也不重复弹:已经有别的对话框开着时等它先关掉。
                 if self.ui.files_dialog.is_none() {
-                    if let Some(j) = self.transfer_queue.first_conflict() {
+                    if let Some(j) = self.transfer.queue.first_conflict() {
                         self.ui.files_dialog =
                             Some(crate::ui::files_dialog::FilesDialog::Conflict {
                                 name: j.label.clone(),
@@ -7593,7 +7612,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 sidebar_arg,
                                 content_arg,
                                 files_owner_generation.unwrap_or(0),
-                                &self.transfer_queue,
+                                &self.transfer.queue,
                                 &mut self.edit,
                                 blink_on,
                             );
@@ -7797,19 +7816,19 @@ impl ApplicationHandler<UserEvent> for App {
                                 use crate::ui::transfer_panel::TransferUiAction;
                                 match a {
                                     TransferUiAction::Cancel(id) => {
-                                        if let Some(c) = self.transfer_cancels.get(&id) {
+                                        if let Some(c) = self.transfer.cancels.get(&id) {
                                             c.store(true, std::sync::atomic::Ordering::Relaxed);
                                         }
-                                        self.transfer_queue.cancel(id);
+                                        self.transfer.queue.cancel(id);
                                     }
                                     TransferUiAction::CancelAll => {
-                                        for c in self.transfer_cancels.values() {
+                                        for c in self.transfer.cancels.values() {
                                             c.store(true, std::sync::atomic::Ordering::Relaxed);
                                         }
-                                        self.transfer_queue.cancel_all();
+                                        self.transfer.queue.cancel_all();
                                     }
                                     TransferUiAction::ClearFinished => {
-                                        self.transfer_queue.clear_finished()
+                                        self.transfer.queue.clear_finished()
                                     }
                                 }
                                 self.ui_dirty = true;
@@ -7916,7 +7935,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 let at = Instant::now() + repaint_delay;
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
-                            } else if self.transfer_queue.summary().busy {
+                            } else if self.transfer.queue.summary().busy {
                                 // F59:队列在跑时自己排下一帧。不排的话画面会
                                 // 冻在传输开始那一帧 —— 进度事件按 T3 刻意不
                                 // 请求重绘,没有别的东西会唤醒事件循环。
