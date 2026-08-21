@@ -5234,6 +5234,7 @@ impl App {
                     files: crate::ui::files_panel::PanelFrame::new(
                         sftp_prefs.default_local.as_deref(),
                         sftp_prefs.bookmarks,
+                        sftp_prefs.local_bookmarks,
                         // F139:没有会话记录就没地方存书签,☆ 置灰。
                         session_id.is_some(),
                     ),
@@ -5335,6 +5336,7 @@ impl App {
                 files: crate::ui::files_panel::PanelFrame::new(
                     sftp_prefs.default_local.as_deref(),
                     sftp_prefs.bookmarks,
+                    sftp_prefs.local_bookmarks,
                     // F139:没有会话记录就没地方存书签,☆ 置灰。
                     session_id.is_some(),
                 ),

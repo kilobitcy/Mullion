@@ -80,7 +80,12 @@ pub struct BookmarkView<'a> {
 }
 
 impl BookmarkView<'_> {
-    /// 本地栏用:没有书签,也不能收藏(本地目录收藏不在 F139 范围内)。
+    /// 「这一栏不关心书签」的视图。F154 之后**生产代码里没有调用方**了
+    /// (本地栏也接上了真列表),只剩测试拿它当脚手架 —— 那些测试测的是
+    /// 别的东西,不该被迫编一份书签列表出来。
+    ///
+    /// 别拿它去填新的生产调用点:`can_edit: false` 的症状是 ☆ 点不动,
+    /// 而编译器一声不吭(这正是 F154 要修的那个 bug)。
     pub fn none() -> Self {
         Self {
             list: &[],
@@ -1357,6 +1362,9 @@ pub struct PanelFrame {
     /// `Vec` 是安全默认——符合 `Default` impl 文档下面那条「加字段前先想
     /// 清楚」的约束。
     pub bookmarks: Vec<mullion_store::Bookmark>,
+    /// F154:该会话配置的**本地**书签,转给本地栏。与 `bookmarks` 分两份的
+    /// 理由见 `mullion_store::SftpPrefs::local_bookmarks`。
+    pub local_bookmarks: Vec<mullion_store::Bookmark>,
     /// F139:这个标签绑着会话记录没有(`Tab::session_id.is_some()`)。没绑就
     /// 没地方存书签,☆ 按钮置灰。默认 `false` —— 与这个结构体
     /// 「新标签初值 / 借用过桥占位」的双重语境约定一致(见 `Default` 的说明):
@@ -1387,6 +1395,7 @@ impl Default for PanelFrame {
             remote: PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(crate::files::local::default_local(None)),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::default(),
         }
@@ -1406,11 +1415,13 @@ impl PanelFrame {
     pub fn new(
         default_local: Option<&str>,
         bookmarks: Vec<mullion_store::Bookmark>,
+        local_bookmarks: Vec<mullion_store::Bookmark>,
         session_bound: bool,
     ) -> Self {
         Self {
             local: PaneState::new(crate::files::local::default_local(default_local)),
             bookmarks,
+            local_bookmarks,
             session_bound,
             ..Self::default()
         }
@@ -1520,7 +1531,10 @@ pub fn sidebar(
                         PanelColumn::Local,
                         &mut frame.local,
                         panel_focused && frame.active_column == PanelColumn::Local,
-                        BookmarkView::none(),
+                        BookmarkView {
+                            list: &frame.local_bookmarks,
+                            can_edit: frame.session_bound,
+                        },
                         0,
                         &mut ui_state.files_cols,
                     );
@@ -1669,7 +1683,10 @@ pub fn content(
                     PanelColumn::Local,
                     &mut frame.local,
                     panel_focused && frame.active_column == PanelColumn::Local,
-                    BookmarkView::none(),
+                    BookmarkView {
+                        list: &frame.local_bookmarks,
+                        can_edit: frame.session_bound,
+                    },
                     0,
                     cols,
                 );
@@ -2247,6 +2264,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::default(),
         };
@@ -2667,6 +2685,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/remote".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/local".to_vec())),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::Remote,
         };
@@ -2714,6 +2733,39 @@ mod tests {
                     "远端",
                     1,
                     PanelColumn::Remote,
+                    state,
+                    false,
+                    BookmarkView {
+                        list: bookmarks,
+                        can_edit,
+                    },
+                    0,
+                    cols,
+                );
+            });
+        });
+        (action, out.shapes)
+    }
+
+    /// 跑一帧**本地**栏。与 `run_remote` 对称,只差栏别和标题。
+    fn run_local(
+        ctx: &egui::Context,
+        state: &mut PaneState,
+        cols: &mut ColWidths,
+        bookmarks: &[mullion_store::Bookmark],
+        can_edit: bool,
+        input: egui::RawInput,
+    ) -> (Option<FileAction>, Vec<egui::epaint::ClippedShape>) {
+        let t = crate::theme::MULLION_DARK;
+        let mut action = None;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = show(
+                    ui,
+                    &t,
+                    "本地",
+                    1,
+                    PanelColumn::Local,
                     state,
                     false,
                     BookmarkView {
@@ -2814,6 +2866,73 @@ mod tests {
                 path: "/var/log".into(),
             }),
             "点空心星该收藏当前目录,默认名取末段"
+        );
+    }
+
+    /// F154:本地栏的 ☆ 不再是死按钮 —— 点它发 `BookmarkAdd`,路径取本地 cwd。
+    ///
+    /// 自证会变红:把 `sidebar`/`content` 里本地栏那两个调用点改回
+    /// `BookmarkView::none()`(那时 `can_edit=false`,按钮点不动)。
+    #[test]
+    fn clicking_the_local_hollow_star_bookmarks_the_current_local_directory() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/home/me/proj");
+        let mut cols = ColWidths::default();
+        let (_, shapes) = run_local(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &[],
+            true,
+            egui::RawInput::default(),
+        );
+        let pos = find_text_pos(&shapes, "☆").expect("没收藏时该画空心星");
+        let (action, _) = run_local(&ctx, &mut state, &mut cols, &[], true, click_at(pos));
+        match action {
+            Some(FileAction::BookmarkAdd { path, .. }) => {
+                assert_eq!(path, "/home/me/proj", "收藏的不是本地栏当前目录");
+            }
+            other => panic!("本地栏点 ☆ 没有发出 BookmarkAdd:{other:?}"),
+        }
+    }
+
+    /// F154 接线守护:本地栏读的是**本地**那份列表。传成远端那份的话,
+    /// 收藏了本地目录也不会变实心 —— 而 store 里其实存着(静默不一致)。
+    ///
+    /// 自证会变红:把 `content` 里本地栏的 `list: &frame.local_bookmarks`
+    /// 改成 `list: &frame.bookmarks`。
+    #[test]
+    fn the_local_column_reads_the_local_bookmark_list_not_the_remote_one() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = PanelFrame {
+            remote: PaneState::new(RemotePath::from_bytes(b"/srv".to_vec())),
+            local: PaneState::new(RemotePath::from_bytes(b"/home/me".to_vec())),
+            bookmarks: Vec::new(),
+            local_bookmarks: vec![mullion_store::Bookmark {
+                name: "家".into(),
+                path: "/home/me".into(),
+            }],
+            session_bound: true,
+            active_column: PanelColumn::default(),
+        };
+        frame.remote.load = Load::Ready;
+        frame.local.load = Load::Ready;
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut shapes = Vec::new();
+        // 两帧:`CentralPanel` 首帧是 sizing pass(同本文件其余跑帧测试)。
+        for _ in 0..2 {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+                })
+                .shapes;
+        }
+        let star = find_text_pos(&shapes, "★").expect("本地目录已收藏,本地栏该画实心星");
+        let mid = ctx.screen_rect().center().x;
+        assert!(
+            star.x < mid,
+            "实心星画在了右半边(远端栏)—— 本地栏读的不是本地那份列表"
         );
     }
 
@@ -4176,6 +4295,7 @@ mod tests {
                 remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
                 local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
                 bookmarks: Vec::new(),
+                local_bookmarks: Vec::new(),
                 session_bound: false,
                 active_column: active,
             };
@@ -4229,6 +4349,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/".to_vec())),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::Local,
         };
@@ -4726,6 +4847,7 @@ mod tests {
             remote: PaneState::new(RemotePath::from_bytes(b"/var/log".to_vec())),
             local: PaneState::new(RemotePath::from_bytes(b"/home/u".to_vec())),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::default(),
         };

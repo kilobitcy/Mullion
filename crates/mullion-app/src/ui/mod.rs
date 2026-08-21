@@ -1978,6 +1978,7 @@ mod tests {
                 b"/".to_vec(),
             )),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: files_panel::PanelColumn::default(),
         };
@@ -2039,6 +2040,7 @@ mod tests {
                 b"/".to_vec(),
             )),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: files_panel::PanelColumn::default(),
         };
@@ -2182,6 +2184,7 @@ mod tests {
                 b"/".to_vec(),
             )),
             bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: files_panel::PanelColumn::default(),
         };
