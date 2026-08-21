@@ -6739,6 +6739,20 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.cli_direct && self.active_ws().is_none() {
                     std::process::exit(1);
                 }
+                // F37:这次失败的如果是某个占位标签的重连,**必须在这里收口**。
+                // 不收的话 `reconnect_tab` 开头那道 `pending_restore` 闸永久
+                // 关闭 —— 这个进程里所有占位标签的「重连」从此静默无反应,
+                // 而按钮还停在禁用的「连接中…」。没有自愈路径,只能重启 exe。
+                if let Some(p) = self.pending_restore.take() {
+                    if let Some(TabContent::Restored(r)) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.id == p.tab_id)
+                        .map(|t| &mut t.content)
+                    {
+                        r.dialing = false;
+                    }
+                }
                 self.ui.set_error(msg);
                 self.request_ui_redraw();
             }
@@ -13710,6 +13724,41 @@ mod tests {
         use super::replace_target;
         use crate::shell::tabs::TabId;
         assert_eq!(replace_target(Some(TabId(99)), &[TabId(10)]), None);
+    }
+
+    /// **接线守护 / F37 既存 bug**:拨号失败必须把 `pending_restore` 和那个
+    /// 标签的 `dialing` 一起收口。
+    ///
+    /// 少了 `pending_restore.take()`:`reconnect_tab` 开头那道闸永久关闭 ——
+    /// 这个进程里**所有**占位标签的「重连」从此静默无反应。
+    /// 少了 `dialing = false`:按钮永远停在禁用的「连接中…」。
+    /// 两条都是「一次失败换永久坏 + 全程不报错」,所以分开断言 —— 只钉一条
+    /// 会让另一条悄悄退化。
+    ///
+    /// 自证会变红:把 `ConnectErr` 分支里的 `self.pending_restore.take()`
+    /// 删掉(第一条红),或把复位 `dialing` 那几行删掉(第二条红)。
+    #[test]
+    fn a_failed_dial_releases_the_reconnect_latch_and_re_enables_the_button() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("UserEvent::ConnectErr(msg) => {")
+            .nth(1)
+            .expect("找不到 ConnectErr 分支");
+        let body = &after[..after
+            .find("\n            UserEvent::")
+            .unwrap_or(after.len())];
+        assert!(
+            body.contains("连接失败"),
+            "切片切歪了 —— 下面两条断言会空过"
+        );
+        assert!(
+            body.contains("self.pending_restore.take()"),
+            "拨号失败没释放 pending_restore —— 之后所有占位标签都再也连不上"
+        );
+        assert!(
+            body.contains("dialing = false"),
+            "拨号失败没复位 dialing —— 那个标签的「重连」按钮永远禁用"
+        );
     }
 
     /// E2:标签标题优先取会话名,空名字退回 `user@host`。
