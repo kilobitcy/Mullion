@@ -10407,7 +10407,11 @@ mod tests {
     #[test]
     fn bookmarking_writes_through_to_disk_immediately() {
         let src = include_str!("app.rs");
-        for f in ["fn add_bookmark(&mut self", "fn remove_bookmark(&mut self"] {
+        // **切片键不带 `&mut self`**:F154 给这两个方法加了参数,rustfmt 随即
+        // 把签名折成多行,`fn add_bookmark(&mut self` 这个串在真正的定义处
+        // 不再出现 —— 只剩本测试自己那份数组字面量,于是 `split` 切到的是
+        // 测试自己的源码,整条测试恒绿(第五类恒绿模式,当场实测复现过)。
+        for f in ["fn add_bookmark(", "fn remove_bookmark("] {
             let after = src.split(f).nth(1).unwrap_or_else(|| panic!("找不到 {f}"));
             // 到下一个方法定义为止 = 这一个函数的函数体。
             let body = &after[..after.find("\n    fn ").expect("找不到该函数的结尾")];
