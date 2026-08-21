@@ -74,6 +74,13 @@ Windows 上 IME 被 `set_ime_allowed(false)` 禁用后,输入法切换键确实�
 
 **规则:窗口的 IME 恒为开。egui 不许关它。**
 
+egui 的去抖是「账本 ≠ 目标值才发调用」(`lib.rs:849`:
+`if self.allow_ime != allow_ime { window.set_ime_allowed(allow_ime) }`)。
+要短路那次 `set_ime_allowed(false)`,得把账本扳成和目标值**相同**的 `false`
+——「骗 egui 说已经关过了」,它就不动手,窗口保持 `resumed` 里设的常开。
+**扳成 `true` 是反的**:那会制造 `true != false`,禁用调用每帧必发,
+bug 从「用过输入框才触发」恶化成「从第一帧起就没有中文」。
+
 改动落在 `app.rs` 的 `handle_platform_output` 调用点(`app.rs:9260`),
 **必须在它之前**:
 
@@ -81,18 +88,23 @@ Windows 上 IME 被 `set_ime_allowed(false)` 禁用后,输入法切换键确实�
 // F149:egui-winit 用 self.allow_ime 做去抖,本帧 egui 里没有文本框在组字时
 // 它会 set_ime_allowed(false),把整个窗口的 IME 关掉。终端不是 egui 部件,
 // egui 永远不知道它也需要 IME —— 于是用户点过一次任意输入框再点回终端,
-// 中文输入就永久没了。在它读记账值之前把账本扳成 true,那次调用不会发生。
-if crate::input::keep_ime_open(full_output.platform_output.ime.is_some()) {
-    a.egui_state.set_allow_ime(true);
+// 中文输入就永久没了。把账本预先扳成它这一帧要写的 false,去抖短路,
+// 那次禁用调用不会发生;窗口的 IME 保持 resumed 里设的常开。
+// egui 需要 IME 的帧不动账本 —— 它要发的是 set_ime_allowed(true),
+// 对一个本就开着的窗口无害(至多每次聚焦进文本框时多一次冗余调用)。
+if crate::input::suppress_ime_disable(full_output.platform_output.ime.is_some()) {
+    a.egui_state.set_allow_ime(false);
 }
 ```
 
-选**拦在源头**而不是"事后再 `set_ime_allowed(true)` 扳回来":后者在文本框
-失焦那一帧会连发 `false` → `true` 两次跨进程系统调用,Windows 上有打断
-正在进行的组字的风险,而且多一次没必要的 IPC(与 T3 同类顾虑)。
+选**拦在源头**而不是"事后再 `set_ime_allowed(true)` 扳回来":后者把账本
+留在 `true`,下一帧 egui 又看到 `true != false` 再关一次、我们再开一次 ——
+**每帧两次**跨进程系统调用,永不收敛(与 T3 同类问题),且在 Windows 上
+有打断正在进行的组字的风险。
 
 `State::set_allow_ime()` / `allow_ime()` 是 `egui-winit` 的公开 API
-(`lib.rs:197`/`202`),正是给"宿主自己也需要 IME"这类混合场景准备的。
+(`lib.rs:197`/`202`),就是给宿主在 egui 之外自己调过 `set_ime_allowed`
+时同步账本用的。
 
 **为什么这样就够**:全项目只有两处会动窗口的 IME 开关 —— `resumed` 里那次
 `true`,和 egui 这次。后者被拦住之后,窗口 IME 恒开。
@@ -160,7 +172,7 @@ sel_bar: accent
 
 | 目标 | 测试 | 自证会变红的改法 |
 |---|---|---|
-| F149 拦截逻辑 | `input::tests::ime_stays_open_when_egui_has_no_text_field` | 把 `keep_ime_open` 的返回改成 `egui_wants_ime` |
+| F149 拦截逻辑 | `input::tests::the_ledger_is_clamped_exactly_when_egui_has_no_text_field` | 把 `suppress_ime_disable` 的返回取反(变成「egui 要 IME 时才拦」) |
 | F149 **调用顺序** | 源码级:`set_allow_ime` 那一句必须出现在 `handle_platform_output` 之前 | 两句对调 —— 顺序错了这个修复完全失效,而且照样编译、静默失灵 |
 | 现象 3 路由 | `app::tests::ime_commit_goes_to_the_terminal_only_when_it_has_focus` | 去掉焦点判据 |
 | F150 高亮 | kittest:选中行存在 `sel_bg` 色的 `rect_filled` + `sel_bar` 色的竖条 | 把颜色改回 `sunken_bg` |
