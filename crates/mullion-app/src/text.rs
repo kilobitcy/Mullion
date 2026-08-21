@@ -1150,4 +1150,200 @@ mod tests {
             "'你' 占第 0-1 列,'a' 占第 2 列,止列该是 3"
         );
     }
+
+    /// 把一串文本铺成一行 `SnapCell`,不足 `cols` 的用空格补满 —— 与
+    /// `Emulator::snapshot` 出来的行同形(宽字符后面跟一个 spacer 格)。
+    fn bench_row(text: &str, cols: u16) -> Vec<SnapCell> {
+        use unicode_width::UnicodeWidthChar;
+        let fg = Rgb::new(0xcc, 0xcc, 0xcc);
+        let bg = Rgb::new(0x1e, 0x1e, 0x1e);
+        let blank = SnapCell {
+            ch: ' ',
+            fg,
+            bg,
+            width: 1,
+            spacer: false,
+            selected: false,
+        };
+        let mut v: Vec<SnapCell> = Vec::with_capacity(cols as usize);
+        for ch in text.chars() {
+            let w = ch.width().unwrap_or(1) as u8;
+            if v.len() + usize::from(w) > cols as usize {
+                break;
+            }
+            v.push(SnapCell {
+                ch,
+                fg,
+                bg,
+                width: w,
+                spacer: false,
+                selected: false,
+            });
+            if w == 2 {
+                v.push(SnapCell {
+                    ch,
+                    fg,
+                    bg,
+                    width: 2,
+                    spacer: true,
+                    selected: false,
+                });
+            }
+        }
+        v.resize(cols as usize, blank);
+        v
+    }
+
+    /// C1 量化脚手架:一帧 shaping 到底花多少。**不是断言型测试**,所以标了
+    /// `#[ignore]`,由人工跑:
+    ///
+    /// ```text
+    /// cargo test -p mullion-app --release shaping_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// 为什么需要它:`prepare_panes` 每帧对**每个 run** 无条件
+    /// `set_rich_text` + `shape_until_scroll`,屏幕内容一帧没变也照做一遍。
+    /// 该不该给它上缓存(cosmic-text 有个默认关着的 `shape-run-cache`)、
+    /// 还是该按 `Term::damage()` 做脏行短路,得先知道这一步的量级 ——
+    /// 而 shaping 是纯 CPU 的、不碰 GPU,无头机器上就量得出来。
+    ///
+    /// 两种输入必须分开量,平均数会把关键的不对称性抹掉。`row_to_runs` 把
+    /// 「advance 等于格宽」的连续格并成一个 run,于是:
+    ///   - 满屏 ASCII:一行只有 1 个 run,但每行文本各不相同
+    ///   - 满屏 CJK :每个汉字自成 1 个 run,run 数是行数的几十倍
+    ///
+    /// 缓存对前者几乎必然不命中(key 就是整行文本,滚动日志每行都是新的),
+    /// 对后者命中率极高(key 集合收敛到常用汉字那几千个)。所以这里的 CJK
+    /// 行刻意从一个有界的字集里取字,ASCII 行刻意每行都不一样 —— 这才是
+    /// 两种场景各自的真实形态。
+    ///
+    /// **绝对值只在同一台机器上横向比较有意义**:Linux 上既没有
+    /// Google Sans Code 也没有微软雅黑,两种文字都会 fallback 到别的字体,
+    /// shaping 成本与 Windows 实机不同。不要拿这里的数字去对 N2/N7 的表。
+    ///
+    /// 调用序列是照着 `prepare_panes` 的内层循环抄的 —— **那边改了这里要
+    /// 跟着改**,否则量的就不是真实路径了。
+    ///
+    /// # 本机首测结果(2026-08-21,Linux 开发机,仅供同机横向比较)
+    ///
+    /// | 场景 | 现状 | 开 `shape-run-cache` 对照 |
+    /// |---|---|---|
+    /// | ASCII 静态 | 2.263 ms | 0.978 ms(−57%) |
+    /// | ASCII 滚动 | 2.166 ms | 0.855 ms(−61%) |
+    /// | CJK 静态 | 2.852 ms | 2.040 ms(−28%) |
+    /// | CJK 滚动 | 2.877 ms | 2.068 ms(−28%) |
+    ///
+    /// 三条结论,都跟动手前的直觉相反,记下来免得再猜一遍:
+    ///
+    /// 1. **单 pane 就吃掉 60Hz 一帧预算的 13~17%**(2.2~2.9ms / 16.667ms)。
+    ///    8 pane 分屏 ≈ 18~23ms/帧,单这一步就超预算 —— N2 的头号嫌疑人。
+    /// 2. **缓存对 ASCII 滚动同样有效**(−61%),不像"每行文本都不同就必不
+    ///    命中"那么直觉。因为 cosmic-text 的 key 粒度是 `ShapeWord` 里
+    ///    「词内同 script 段」而不是整行(见其 `shape.rs::shape_run_cached`
+    ///    的 `line[start_run..end_run]`),日志里反复出现的 `worker`/`task`/
+    ///    `bytes` 这类词全都命中。反过来说,UUID / hash / base64 那种高熵
+    ///    输出仍会不断产生新 key,而 `ShapeRunCache::trim` 在 cosmic-text
+    ///    和 glyphon 内部**都没有调用点** —— 真要开它,得自己定期 trim。
+    /// 3. **CJK 的瓶颈不是 shaping 算法**。每个汉字自成 run、key 是单字、
+    ///    命中率应接近 100%,却只快 28%;成本大头是 2400 个 run 的固定
+    ///    管理开销(`set_size`/`set_rich_text`/`shape_until_scroll` 各调
+    ///    2400 次)。缓存治不了这个,只有减少「每帧重建的 run 数」能治 ——
+    ///    也就是按 `Term::damage()` 做脏行短路。
+    #[test]
+    #[ignore = "量化脚手架,不做断言。人工跑:-- --ignored --nocapture"]
+    fn shaping_cost_per_frame() {
+        use std::time::Instant;
+
+        const COLS: u16 = 120;
+        const ROWS: u16 = 40;
+        const FRAMES: u32 = 60;
+        /// 常用汉字的近似字集大小 —— CJK 行从这个区间里取字,模拟真实中文
+        /// 「字数有界、组合无界」的形态。
+        const CJK_POOL: u32 = 3000;
+
+        // 多造 FRAMES 行:滚动模式下逐帧往下挪一行窗口。
+        let total = u32::from(ROWS) + FRAMES;
+        let ascii: Vec<Vec<SnapCell>> = (0..total)
+            .map(|i| {
+                bench_row(
+                    &format!(
+                        "[{i:04}] worker-{i} finished task in {}ms, bytes={}, ok",
+                        i * 7 % 997,
+                        i * 131 % 65536
+                    ),
+                    COLS,
+                )
+            })
+            .collect();
+        let cjk: Vec<Vec<SnapCell>> = (0..total)
+            .map(|i| {
+                let s: String = (0..u32::from(COLS / 2))
+                    .filter_map(|k| char::from_u32(0x4E00 + (i * 31 + k) % CJK_POOL))
+                    .collect();
+                bench_row(&s, COLS)
+            })
+            .collect();
+
+        let font_px = 16.0_f32;
+        let cell_h = (font_px * 1.25).ceil();
+        let metrics = grid_metrics(font_px, cell_h);
+
+        // 「时间维度」的两种形态必须都量,它们对任何按文本做 key 的缓存意义
+        // 完全相反:
+        //   静态 —— 同一屏重绘(切焦点、拖分屏边界、光标闪烁),每帧文本一模
+        //            一样,缓存 100% 命中
+        //   滚动 —— 流式输出(**本项目的主场景**:远端 TUI 在刷屏),每帧都有
+        //            新行进来,ASCII 那一半的 key 是一次性的,必然不命中
+        // 只量静态会把缓存的收益放大到不真实 —— 何况 T3 的帧率节流本来就让
+        // 静置时不重绘,静态那一列的现实权重远小于滚动。
+        for (text_kind, lines) in [("ASCII", &ascii), ("CJK", &cjk)] {
+            for scrolling in [false, true] {
+                // FontSystem::new() 会扫系统字体,几百毫秒起 —— 建在计时之外。
+                // 每组各建一个,免得上一组把字形缓存捂热了带进下一组。
+                let mut fs = FontSystem::new();
+                let mut bufs: Vec<Buffer> = Vec::new();
+                let attrs = Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY));
+
+                let one_frame = |f: u32, fs: &mut FontSystem, bufs: &mut Vec<Buffer>| -> usize {
+                    let top = if scrolling { f as usize } else { 0 };
+                    let mut n = 0usize;
+                    for row in &lines[top..top + usize::from(ROWS)] {
+                        for run in row_to_runs(row, None) {
+                            if n == bufs.len() {
+                                bufs.push(Buffer::new(fs, metrics));
+                            }
+                            let buf = &mut bufs[n];
+                            buf.set_metrics(fs, metrics);
+                            // 给足够宽,跟 prepare_panes 一样不靠 cosmic-text 换行。
+                            buf.set_size(fs, Some(f32::from(COLS) * font_px), Some(cell_h));
+                            let iter = run.spans.iter().map(|(s, c)| (s.as_str(), attrs.color(*c)));
+                            buf.set_rich_text(fs, iter, attrs, Shaping::Advanced);
+                            buf.shape_until_scroll(fs, false);
+                            n += 1;
+                        }
+                    }
+                    bufs.truncate(n);
+                    n
+                };
+
+                // 首帧含字形加载/缓存预热,与稳态分开报。
+                let t0 = Instant::now();
+                let runs = one_frame(0, &mut fs, &mut bufs);
+                let first = t0.elapsed();
+
+                let t1 = Instant::now();
+                for f in 0..FRAMES {
+                    one_frame(f, &mut fs, &mut bufs);
+                }
+                let steady = t1.elapsed() / FRAMES;
+
+                let mode = if scrolling { "滚动" } else { "静态" };
+                println!(
+                    "{text_kind:<5} {mode} {COLS}×{ROWS}: run={runs:<5} \
+                     首帧={first:>9.3?}  稳态={steady:>9.3?}/帧"
+                );
+            }
+        }
+        println!("(60Hz 一帧预算 16.667ms。以上是**单 pane**,8 pane 分屏乘 8)");
+    }
 }
