@@ -1,6 +1,6 @@
 # Mullion — 项目上下文
 
-> 全局偏好（语言、精简度、Scope Discipline、防注入、写文件行数上限）见 `~/.claude/CLAUDE.md`
+> 全局偏好（语言、精简度、Scope Discipline、防注入）见 `~/.claude/CLAUDE.md`
 > 与 `~/.claude/rules/`。**此处不重复，只写这个项目特有的东西。**
 
 
@@ -95,17 +95,10 @@ cargo test --workspace > /tmp/test.log 2>&1; grep -nE "test result|FAILED|panick
 
 ### VT 快照测试（本项目最重要的测试手段）
 
-终端仿真的正确性没法靠眼睛看。做法是：
+终端仿真的正确性没法靠眼睛看，只能拿真实录下来的字节流喂 `Emulator` 再比对快照。
+**新增 VT 相关功能时必须配一个 fixture**，否则这个功能在真实 TUI 下是什么样，没人知道。
 
-1. 在真实环境里录一段字节流：`ssh host 'tmux new -d …'` 后用 `script -q` 抓原始输出，
-   存到 `crates/mullion-term/tests/fixtures/*.bin`
-2. 测试里把字节喂进 `Emulator`，把 grid 渲染成纯文本 + 属性摘要
-3. 跟 `*.snap` 比对
-
-已有 fixture 见目录。**新增 VT 相关功能时必须配一个 fixture**，
-否则这个功能在真实 TUI 下是什么样，没人知道。
-
-录制脚本：`scripts/record-fixture.sh`（还没写，需要时告诉我）。
+fixture 在 `crates/mullion-term/tests/fixtures/`；录制步骤见 `docs/vt-fixtures.md`。
 
 ---
 
@@ -164,20 +157,11 @@ cargo doc -p russh --open   # 或直接读 ~/.cargo/registry/src/**/russh-*/src/
 ## 交付约定（**不用每次再问我，默认执行**）
 
 只要本轮改动落到了 `mullion-app`（或任何影响 Windows 端行为的地方）并且我要拿去实机验，
-**一条龙做完，别停下来问「要不要 bump / 要不要发版」**：
+**一条龙做完，别停下来问「要不要 bump / 要不要发版」**：升 patch 版本号 → 跑绿 →
+交叉编译 + objdump 验收 → 签名 → 发 GitHub Release → 报链接和人工验收清单。
 
-1. **升 patch 版本号** —— `workspace.package.version` 第三位 +1，单独一个 `chore:` 提交。
-2. **跑绿** —— `cargo test --workspace` + `clippy -D warnings` + `fmt --check`。不绿不发。
-3. **交叉编译** Windows exe，并做 objdump 依赖验收 —— 出现 `libgcc_s_seh-1.dll` /
-   `libwinpthread-1.dll` **即为不合格，必须修**。
-4. **签名** —— `scripts/sign-windows.sh`（自签名证书在 `~/.mullion-signing/`，私钥不进仓库）。
-   **必须在算 sha256 之前**，签名会改文件内容。**这是唯一漏了也不报错的一步**：不签照样
-   算得出 hash、发得掉 Release，只有我在 Windows 上看到「发布者：未知」才发现。
-5. **发 GitHub Release** —— **标题只能是纯版本号 `v0.1.N`**，不带破折号、不带摘要、不带 emoji。
-   先 push 再发版（`gh release create` 会把 tag 建在远端当前 HEAD 上）。
-6. **报给我** —— Release 链接 + sha256 + 人工验收清单。
-
-具体命令、代理设置、notes 模板见 `.claude/skills/release-windows/SKILL.md`（说「发版」时自动加载）。
+完整步骤、命令、代理设置、notes 模板见 `.claude/skills/release-windows/SKILL.md`
+（说「发版」时自动加载）。**别凭记忆做**——每一步都有漏了也不报错的坑。
 **本机 DNS 解析不了 github**，所有 `gh`/curl 都要走代理。私密信息（真机 IP / 用户名 /
 私钥路径 / 凭据）**永不进被跟踪文件、永不推送**，库里只留占位。
 
@@ -198,14 +182,7 @@ ADR 放 `docs/adr-NNN-*.md`，一个决策一个文件；brainstorm/writing-plan
 - `gui-render-gotchas.md` —— GUI/渲染/输入层「编译过跑起来才崩」的坑（动那几个文件前必读）
 - `ui-form-guidelines.md` —— 表单布局规范（分节/宽度三档/间距五档/危险措辞/空态文案），
   写任何 egui 表单前先扫一眼；机械守护在 `crates/mullion-app/tests/form_guidelines.rs`
-- 最新 ADR：`adr-010`（隧道是与会话平级的一等对象，**独占**自己的 SSH 连接——不复用会话那条；
-  刻意偏离 PuTTY 的「隧道属于会话」与 adr-009 的「一条连接承载多单元」，两处理由都在里面；
-  硬约束是 `russh` 的 `tcpip_forward` 要 `&mut self`，`Arc<Handle>` 给不出，`-R` 复用连接编译不过）；
-  `adr-009`（一条 SSH 连接开多 channel 承载多分屏；含它引入的四条新失效模式：
-  channel 泄漏、T1 升级为 per-pane、迟到的 `PaneOpened` 要查树成员 + Workspace 世代）；
-  `adr-008`（自诊断日志：接 `log` facade 白拿 wgpu/winit/russh 内部诊断 + 阶段打点 +
-  看门狗；级别用 `MULLION_LOG` / `MULLION_LOG_DEPS`，默认 info/warn）；
-  `adr-007`（用 egui 做外壳：菜单/状态栏/会话弹窗；含与 wgpu23/winit0.30 同帧集成的坑）
+- ADR 全在 `docs/adr-NNN-*.md`，按需读原文；碰架构决策前先查有没有对应 ADR。
 
 架构级决策（换 GUI 框架、换 SSH 库、改依赖方向）写进 `docs/adr-NNN-*.md`，
 写清「当时的备选是什么、为什么否掉」。半年后回头看，理由比结论值钱。
