@@ -56,6 +56,7 @@ mullion-app      winit + wgpu + glyphon(终端自绘)+ egui(外壳:菜单/状态
 | T7 | 帧率节流后 `ControlFlow::WaitUntil` 不复位 | 首次节流后永久 100% CPU 忙转（T3/N3 红线） | `frame::tests`（`plan` 决策 4 条）；事件循环三分支须显式复位 control_flow |
 | T8 | 判给终端的键盘事件仍先喂 `egui_state.on_window_event` | egui 焦点系统吞掉 Tab → 焦点跳到菜单栏 → `wants_keyboard_input()` 恒 true → 终端**永久**收不到任何键（Tab 补全后回车/退格全废，鼠标仍灵） | `input_route::tests::terminal_keyboard_is_never_fed_to_egui_so_tab_cannot_steal_focus`；键盘先判后喂，指针先喂后判 |
 | T9 | 往 egui 的 UI 字符串里直接写非 ASCII 符号 | egui 字体链只有两级（内置 + 微软雅黑），链外字形画成豆腐块 `□`；**编译/测试/日志全静默，只有人眼能看见**，且 Linux 开发机上多半是正常的 | `tests/glyph_whitelist.rs::no_ui_string_contains_a_glyph_the_font_cannot_draw`；要么登记进 `ui::glyphs::VERIFIED`（判据是 **GBK** 内，不是 GB18030），要么走 `ui::icon` 自绘 |
+| T10 | 以为窗口的 IME 开关是自己说了算 | `egui-winit` 每帧按「egui 里有没有文本框在组字」调 `set_ime_allowed`，**关掉的是整个窗口的 IME**。终端不是 egui 部件，egui 永远不知道它也需要 IME——用户点过一次任意输入框再回终端，中文**永久**打不出来（按 Windows 中英文切换键毫无反应），且没有自愈路径，只能重启 exe。同族的还有「`WindowEvent::Ime` 绕过输入分流」：egui 输入框里打的中文会**同时**上屏和发到远端 shell | `input::tests::the_ime_ledger_is_clamped_to_false_so_egui_never_disables_the_window_ime`；`app::tests::the_ime_ledger_is_clamped_before_egui_gets_a_chance_to_disable_it`（顺序错了完全失效且静默）；`app::tests::ime_reaches_the_terminal_only_when_the_keyboard_would` |
 
 **T1 和 T3/T7 是最容易在重构中被悄悄破坏的。** 事件循环在 `app.rs`（`main.rs` 只做接线），
 动 `emulator.rs` 或 `app.rs` 事件循环时，先跑这几个测试，改完再跑一遍。
