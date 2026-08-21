@@ -186,6 +186,12 @@ pub struct PaneState {
     /// 发自己的标题,这时必须把会话名清掉,否则标题条上会永久挂着一个已经
     /// 不存在的会话名。
     pub tmux: Option<String>,
+    /// F17:上一次**报告过**的实际 scrollback 行数,只用于日志去重。
+    ///
+    /// 拖窗口会连续产生几十次列数变化,每次都落一行「已夹紧」会把日志刷爆;
+    /// 而完全不报告的话,「配了 10000 行、往上翻只有 2700 行」就是一个查无
+    /// 可查的静默行为。初值 0 保证第一次一定报告。
+    pub history_reported: usize,
 }
 
 /// 多 pane 工作区:布局树 + 每 pane 状态 + 主机连接池。
@@ -500,6 +506,7 @@ impl Workspace {
             // 真的变了,这是本地渲染要用的尺寸,和远端有没有收到 window_change
             // 是两回事 —— 不跟着改,本地渲染立刻就会错(不用等远端确认)。
             p.emulator.resize(g.grid.0, g.grid.1);
+            Self::report_history_clamp(p);
             // 只有远端确认收到(Ok)才推进 last_grid;`TrySendErr::Full`(出站队列
             // 满,高延迟链路 + 大段粘贴时是有据可查的真实场景,见
             // mullion-ssh/src/session.rs 的 TrySendErr 注释)时保留旧值,让下一次
@@ -511,6 +518,32 @@ impl Workspace {
             if p.pty.resize(g.grid.0, g.grid.1).is_ok() {
                 p.last_grid = g.grid;
             }
+        }
+    }
+
+    /// F17:实际生效的 scrollback 行数变了就落一行日志(只在被预算夹到时)。
+    ///
+    /// **为什么必须说话**:`Emulator` 会按 `HISTORY_BUDGET_BYTES` 把宽 pane 的
+    /// 回溯行数往下夹(N5 内存红线的兜底)。夹紧本身是对的,但用户看到的是
+    /// 「我配了 10000 行,往上翻到 2700 行就没了」——不落日志的话这条线索
+    /// 根本无处可查,又是一次「配了没反应还不说为什么」。
+    ///
+    /// 去重靠 `history_reported`:`apply_geometry` 已经按 `last_grid` 挡掉了
+    /// 没变化的几何,但拖窗口本身会连续产生几十个不同的列数。
+    fn report_history_clamp(p: &mut PaneState) {
+        let actual = p.emulator.history_lines();
+        if actual == p.history_reported {
+            return;
+        }
+        p.history_reported = actual;
+        let requested = p.emulator.requested_history();
+        if actual < requested {
+            log::info!(
+                target: "mullion",
+                "pane {}:回溯 {requested} 行超出单 pane 内存预算({} 列),实际生效 {actual} 行",
+                p.id.0,
+                p.emulator.cols(),
+            );
         }
     }
 
@@ -602,6 +635,7 @@ pub mod tests_support {
                 last_grid: (80, 24),
                 cwd: None,
                 tmux: None,
+                history_reported: 0,
             },
             Probe {
                 writes: probe_writes,
@@ -822,6 +856,61 @@ mod tests {
         assert!(
             probes[0].resizes.lock().unwrap().is_empty(),
             "尺寸未变却发了 window_change"
+        );
+    }
+
+    /// F17:pane 一拖宽,回溯行数就得按新列数重夹一次 —— 而这只可能发生在
+    /// `apply_geometry` 里(pane 全是按 80×24 占位建出来的,真实列数只从
+    /// 这里来)。
+    ///
+    /// 这条守的是**记账那一半**:`history_reported` 不跟着走的话,拖窗口
+    /// 途中每一个中间列数都会重复落一行「已夹紧」,把日志刷爆。
+    ///
+    /// **它守不住「grid 上的行真被砍了」**:`history_lines()` 是按当前列数
+    /// 重算一遍的纯函数,跟 grid 的实际状态无关 —— 拿掉
+    /// `Emulator::resize` 里的 `apply_history_budget()` 这条测试照绿
+    /// (实测过)。那一半由 `emulator::tests::resize_reclamps_history_to_the_byte_budget`
+    /// 用真实行内容守,不要把职责搬到这里来。
+    ///
+    /// 自证会变红:把 `apply_geometry` 里的 `Self::report_history_clamp(p);` 删掉。
+    #[test]
+    fn a_wider_pane_reclamps_its_scrollback_and_reports_once() {
+        let (mut ws, _probes) = ws_with(1);
+        let wide = |cols: u16| {
+            vec![PaneGeom {
+                id: PaneId(1),
+                px: PxRect {
+                    x: 0,
+                    y: 0,
+                    w: 8000,
+                    h: 480,
+                },
+                title_px: PxRect {
+                    x: 0,
+                    y: 0,
+                    w: 8000,
+                    h: 0,
+                },
+                term_px: PxRect {
+                    x: 0,
+                    y: 0,
+                    w: 8000,
+                    h: 480,
+                },
+                grid: (cols, 24),
+            }]
+        };
+        let requested = ws.panes()[0].emulator.requested_history();
+        ws.apply_geometry(&wide(4000));
+        let clamped = ws.panes()[0].emulator.history_lines();
+        assert!(
+            clamped < requested,
+            "4000 列下 {requested} 行远超单 pane 内存预算,却一行没夹(N5)"
+        );
+        assert_eq!(
+            ws.panes()[0].history_reported,
+            clamped,
+            "夹紧了却没记账 —— 拖窗口时每个中间列数都会重复落一次日志"
         );
     }
 

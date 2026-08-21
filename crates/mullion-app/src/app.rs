@@ -1346,6 +1346,39 @@ fn tab_title(session_name: Option<&str>, user_host: Option<(&str, &str)>) -> Str
     "远端".to_string()
 }
 
+/// 新建一格 pane 的 VT 仿真器。**三个注入点必须全走这里。**
+///
+/// 网格给 80×24 占位,真实尺寸由下一帧 `apply_geometry` 校准(T4)。
+///
+/// 两件事过去是分头写在三处的:主题底色(F80 §3.2「三处同源」的第三处)
+/// 和 scrollback(F17)。前者已经踩过一次(漏了会让终端底色跟 clear 色失配),
+/// 后者更隐蔽 —— 漏掉某一处的表现是「分屏出来的 pane 回溯深度跟主 pane 不
+/// 一样」,几乎没人会往配置注入上想。
+fn new_pane_emulator(scrollback: usize) -> mullion_term::emulator::Emulator {
+    let mut emulator = mullion_term::emulator::Emulator::with_history(80, 24, scrollback);
+    let d = theme::term_default_colors(&MULLION_DARK);
+    emulator.set_default_colors(d.fg, d.bg);
+    emulator
+}
+
+/// F17:一条会话解析后的回溯行数。
+///
+/// `None`(快速连接)/ store 不可用 / 会话已被删,一律落回 store 的内置默认 ——
+/// **不另起一套默认值**,否则「未分组会话」在配置页看到的数字和终端里真正
+/// 生效的数字会对不上。
+///
+/// `u32 → usize` 的上界由 `Emulator` 按字节预算兜底,这里不重复夹。
+fn resolved_scrollback(
+    store: Option<&shell::store::SessionStore>,
+    session_id: Option<SessionId>,
+) -> usize {
+    let v = session_id
+        .zip(store)
+        .and_then(|(id, s)| s.resolved(id).ok())
+        .map_or(mullion_store::DEFAULT_SCROLLBACK, |c| c.scrollback);
+    v as usize
+}
+
 /// F37:`ConnectOk` 抵达时该**顶替第几个标签**,`None` = 开一个新的。
 ///
 /// 抽成自由函数是因为 `App` 要 `EventLoopProxy`、单测里造不出来,而这里
@@ -5015,6 +5048,33 @@ impl App {
         }
     }
 
+    /// F17:把改过的 `scrollback` 推给**已经在跑的** pane,不必重连。
+    ///
+    /// 用户改完保存,期待的是「立刻按新深度往上翻」,而不是「下次连上才算」——
+    /// 后者正是这个项目反复踩过的「配了没反应」。往小调时 alacritty 会真把
+    /// 多余的行释放掉(`Emulator::set_history` → `shrink_lines`),所以这条
+    /// 路径同时也是**内存能收回来**的那条。
+    ///
+    /// 按标签的 `session_id` 逐标签解析:一个窗口里可以同时开着好几条会话
+    /// 的标签,拿活动标签的配置刷全部就串味了。快速连接的标签(`session_id`
+    /// 为 `None`)落回内置默认,与它连接时拿到的值一致,等于不动。
+    ///
+    /// **已知缺口**:唯一的触发点是「在会话管理器里保存」,而 `scrollback`
+    /// 目前**没有编辑控件**(F17 只做完了 store 这一头)。也就是说这条路径
+    /// 现在只可能被「改了同一条会话的别的字段」顺带带起来。等 UI 补上,
+    /// 这里不需要改。
+    fn refresh_scrollback(&mut self) {
+        for tab in self.tabs.iter_mut() {
+            let n = resolved_scrollback(self.store.as_ref(), tab.session_id);
+            let Some(t) = tab.content.as_terminal_mut() else {
+                continue;
+            };
+            for p in t.ws.panes_mut_iter() {
+                p.emulator.set_history(n);
+            }
+        }
+    }
+
     /// 在 `_runtime` 上异步连接;结果经 `proxy` 以 `UserEvent` 回送(§5)。
     /// 不阻塞调用方(winit 事件循环线程)。拆成 `establish` + `open_pty` 两步
     /// (而不是直接调更省事的 `session::connect`):分屏(F35)要在同一条连接上
@@ -5208,9 +5268,7 @@ impl App {
             return;
         };
         crate::logx::line("连接成功,进入终端态");
-        let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
-        let d = theme::term_default_colors(&MULLION_DARK);
-        emulator.set_default_colors(d.fg, d.bg);
+        let emulator = new_pane_emulator(resolved_scrollback(self.store.as_ref(), session_id));
         // pane 和自动化 task 要共享同一条 channel(spec §1 修订二):
         // `PaneState.pty` 本来就是 `Box<dyn PtyWriter>`,`SshSession`
         // 内部只有一个 mpsc Sender、本身 Send+Sync,`Arc` 只是共享
@@ -5231,6 +5289,7 @@ impl App {
                 last_grid: (0, 0),
                 cwd: None,
                 tmux: None,
+                history_reported: 0,
             },
             generation,
         );
@@ -6160,6 +6219,15 @@ impl ApplicationHandler<UserEvent> for App {
                 // 真的挂上去了才在下面起自动化(拿着写口出来,而不是在 `ws` 的
                 // 借用里直接调 `start_automation` —— 那要 `&mut self`)。
                 let mut attached: Option<Arc<mullion_ssh::session::SshSession>> = None;
+                // F17:回溯行数取**这个标签所属会话**的配置(分屏出来的 pane
+                // 与主 pane 同源)。必须赶在下面借出 `ws` 之前算完 —— 它要读
+                // `self.store`,而 `ws` 是从 `self.tabs` 借出来的。
+                let scrollback = resolved_scrollback(
+                    self.store.as_ref(),
+                    self.tabs
+                        .by_generation(generation)
+                        .and_then(|t| t.session_id),
+                );
                 if let Some(ws) = self
                     .tabs
                     .by_generation_mut(generation)
@@ -6179,9 +6247,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // 深度防御,挡的正是「将来有人把上面那句改回活动标签」这类回退,
                     // 而代价只是一次整数比较(每开一条 channel 一次)。
                     if pane_still_wanted(ws, id, generation) {
-                        let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
-                        let d = theme::term_default_colors(&MULLION_DARK);
-                        emulator.set_default_colors(d.fg, d.bg);
+                        let emulator = new_pane_emulator(scrollback);
                         // 包成 `Arc`:自动化 task 要跟 pane 共享同一条 channel
                         // 的写口(见 `PtyWriter for Arc<SshSession>`)。
                         let ssh = Arc::new(ssh);
@@ -6198,6 +6264,7 @@ impl ApplicationHandler<UserEvent> for App {
                             last_grid: (0, 0),
                             cwd: None,
                             tmux: None,
+                            history_reported: 0,
                         });
                     } else {
                         // 让 ssh/rx 在这个分支结束时自然 Drop——Drop 会关掉这条
@@ -6265,6 +6332,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // (同 `PaneOpened`,见 `PtyWriter for Arc<SshSession>`)。
                 let ssh = Arc::new(ssh);
                 let mut attached: Option<Arc<mullion_ssh::session::SshSession>> = None;
+                // F17:换节点之后回溯行数按**新节点**的会话配置来(同上,
+                // 得赶在借出 `ws` 之前算);`pending` 里必有 session_id。
+                let scrollback = resolved_scrollback(self.store.as_ref(), Some(pending.session_id));
                 if let Some(ws) = self
                     .tabs
                     .by_generation_mut(generation)
@@ -6283,7 +6353,15 @@ impl ApplicationHandler<UserEvent> for App {
                         cfg: Some(pending.cfg),
                     });
                     let host_ix = ws.hosts.len() - 1;
-                    if rehost_pane(ws, pane, generation, host_ix, Box::new(ssh.clone()), rx) {
+                    if rehost_pane(
+                        ws,
+                        pane,
+                        generation,
+                        host_ix,
+                        Box::new(ssh.clone()),
+                        rx,
+                        scrollback,
+                    ) {
                         attached = Some(ssh);
                     } else {
                         // 没挂成(pane 在拨号途中没了)——刚 push 的那条必须撤掉,
@@ -8279,6 +8357,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // (比如 `delete` 成功但 `save` 失败),按实际状态重算才是对的。
                 if touched_store {
                     self.refresh_appearance();
+                    // F17:同一个门控 —— 改了会话/分组就可能改了 `scrollback`
+                    // 的继承结果,推给在跑的 pane(见 `refresh_scrollback`)。
+                    self.refresh_scrollback();
                 }
                 // 「选择…」私钥文件:同样是 egui 闭包只记意图、这里才施加。
                 if std::mem::take(&mut self.ui.pick_key_request) && !self.picker_busy.key {
@@ -8523,6 +8604,7 @@ fn rehost_pane(
     host_ix: usize,
     pty: Box<dyn crate::shell::workspace::PtyWriter>,
     rx: Receiver<Vec<u8>>,
+    scrollback: usize,
 ) -> bool {
     if !pane_still_wanted(ws, id, generation) {
         return false;
@@ -8533,10 +8615,12 @@ fn rehost_pane(
         // pane 标题条,只有画得出来的 pane 才有标题条,所以实际到不了这里。
         return false;
     };
-    let mut emulator = mullion_term::emulator::Emulator::new(80, 24);
-    let d = theme::term_default_colors(&MULLION_DARK);
-    emulator.set_default_colors(d.fg, d.bg);
-    p.emulator = emulator;
+    // F17:回溯行数跟**新节点**那条会话走,与下面清 `cwd`/`tmux` 同一个道理
+    // ——这一格从此属于另一台机器了。
+    p.emulator = new_pane_emulator(scrollback);
+    // 换了仿真器,夹紧状态要重新报告一次(`history_reported` 的语义是
+    // 「上次报告过的是哪个数」,不重置就可能把新仿真器的第一次夹紧吞掉)。
+    p.history_reported = 0;
     // ⑥:`cwd`/`tmux` 同 `emulator` 一个道理——旧值是上一台机器嗅出来的
     // (OSC 7 目录 / 窗口标题里的 tmux 会话名),留着会在标题条右区挂一条
     // 「看起来对、其实属于上一台机器」的过期标注,而且 `cwd` 是"只增不清"
@@ -9581,10 +9665,10 @@ mod tests {
         autoscroll_for_pane, blink_on_at, blink_wake_at, credential_delete_error, download_job,
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, font_px_for, has_real_action, ime_cursor_area,
-        ime_goes_to_terminal_of, next_panel_selection_index, pane_still_wanted, reattach_pane,
-        rehost_pane, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title,
-        tmux_attach_for_connect, upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach,
+        ime_goes_to_terminal_of, new_pane_emulator, next_panel_selection_index, pane_still_wanted,
+        reattach_pane, rehost_pane, resolved_scrollback, snapshot_tabs_of, sync_plan_of,
+        sync_timeout_wake_at, tab_title, tmux_attach_for_connect, upload_job, wind_down, Modal,
+        RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -10450,6 +10534,7 @@ mod tests {
             last_grid: (80, 24),
             cwd: None,
             tmux: None,
+            history_reported: 0,
         }
     }
 
@@ -10928,7 +11013,15 @@ mod tests {
         }
         let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
         assert!(
-            rehost_pane(&mut ws, PaneId(1), 0, 3, Box::new(NullPty), rx),
+            rehost_pane(
+                &mut ws,
+                PaneId(1),
+                0,
+                3,
+                Box::new(NullPty),
+                rx,
+                mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+            ),
             "pane 在、世代也对,换节点该成功"
         );
         let p = ws.pane(PaneId(1)).expect("换完 pane 还在");
@@ -10964,7 +11057,15 @@ mod tests {
         let mut ws = Workspace::new(test_pane(1), 1);
         let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
         assert!(
-            !rehost_pane(&mut ws, PaneId(1), 0, 3, Box::new(NullPty), rx),
+            !rehost_pane(
+                &mut ws,
+                PaneId(1),
+                0,
+                3,
+                Box::new(NullPty),
+                rx,
+                mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+            ),
             "这是上一个世代发起的换节点,必须拒绝"
         );
         assert_eq!(
@@ -11015,7 +11116,15 @@ mod tests {
         // 对照组:换机器那条路必须**抹掉**内容(否则上一台机器的输出会
         // 挂在新机器的屏上,用户完全分不清哪些字是谁说的)。
         let (pty, rx) = fresh_pipe();
-        assert!(rehost_pane(&mut ws, PaneId(1), gen, 0, pty, rx));
+        assert!(rehost_pane(
+            &mut ws,
+            PaneId(1),
+            gen,
+            0,
+            pty,
+            rx,
+            mullion_term::emulator::Emulator::DEFAULT_HISTORY
+        ));
         let text: String = ws
             .pane(PaneId(1))
             .unwrap()
@@ -13219,6 +13328,7 @@ mod tests {
                 last_grid: (0, 0),
                 cwd: None,
                 tmux: None,
+                history_reported: 0,
             },
             0,
         );
@@ -13304,6 +13414,7 @@ mod tests {
                 last_grid: (0, 0),
                 cwd: None,
                 tmux: None,
+                history_reported: 0,
             },
             0,
         );
@@ -15858,6 +15969,159 @@ mod tests {
             clamp < hpo,
             "ime_ledger_clamp 必须排在 handle_platform_output 之前,否则账本改了也没人读,\
              中文输入照样会被 egui 关掉"
+        );
+    }
+
+    // ------------------------------------------------ F17 scrollback 接线
+
+    /// 造一个只有一条会话的 store,那条会话的 `scrollback` 由参数指定。
+    fn store_with_scrollback(
+        dir: &std::path::Path,
+        scrollback: Option<u32>,
+    ) -> (crate::shell::store::SessionStore, SessionId) {
+        let mut store = crate::shell::store::SessionStore::open(
+            dir.to_path_buf(),
+            &mullion_store::InMemoryKey([1u8; 32]),
+        )
+        .expect("开 store");
+        let draft = mullion_store::SessionDraft {
+            identity: mullion_store::Identity {
+                name: "dev".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: mullion_store::Connection {
+                host: "192.0.2.10".into(),
+                port: 22,
+                protocol: mullion_store::Protocol::Ssh,
+            },
+            auth: mullion_store::Auth::inline("user", mullion_store::AuthKind::Password),
+            terminal: mullion_store::TerminalPrefs { scrollback },
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+            sftp: Default::default(),
+            secret: None,
+        };
+        let id = store.add(draft, "2026-08-21T00:00:00Z");
+        (store, id)
+    }
+
+    /// F17:用户配的回溯行数必须真的抵达 `Emulator`。
+    ///
+    /// 这条线过去整个是断的:store 那一头(字段 + 继承 + 迁移)和 UI 那一头
+    /// 各由一个切片做完,中间从来没接上 —— 三个注入点全写死
+    /// `Emulator::new(80, 24)`,恒取内置默认。**恒取默认也能让别的测试全绿**,
+    /// 所以必须有一条专门盯着"取到的是配置值"。
+    ///
+    /// 自证会变红:把 `resolved_scrollback` 里的 `s.resolved(id).ok()` 换成 `None`。
+    #[test]
+    fn scrollback_comes_from_the_session_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, id) = store_with_scrollback(dir.path(), Some(777));
+        assert_eq!(resolved_scrollback(Some(&store), Some(id)), 777);
+    }
+
+    /// 快速连接(没有会话记录)、store 打不开、会话已被删 —— 一律落回 store
+    /// 的**内置默认**。
+    ///
+    /// **不许是 0**:`unwrap_or_default()` 在这里会让 scrollback 整个消失,
+    /// 症状只是"往上翻不动",没人会怀疑到默认值头上(`inherit.rs` 的字段
+    /// 注释专门为这个陷阱留过一段话)。也不许在这里另写一个字面量 —— 那样
+    /// 配置页显示的数字和终端里真正生效的数字会各说各话。
+    ///
+    /// 自证会变红:把 `map_or(DEFAULT_SCROLLBACK, ..)` 改成 `map_or(0, ..)`。
+    #[test]
+    fn scrollback_falls_back_to_the_store_default_not_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, id) = store_with_scrollback(dir.path(), None);
+        let default = mullion_store::DEFAULT_SCROLLBACK as usize;
+        assert!(default > 0);
+        assert_eq!(resolved_scrollback(None, Some(id)), default, "store 不可用");
+        assert_eq!(resolved_scrollback(Some(&store), None), default, "快速连接");
+        assert_eq!(
+            resolved_scrollback(Some(&store), Some(SessionId(999))),
+            default,
+            "会话已被删"
+        );
+        assert_eq!(
+            resolved_scrollback(Some(&store), Some(id)),
+            default,
+            "会话没配 scrollback,该走继承链的默认"
+        );
+    }
+
+    /// 新建 pane 的仿真器同时带上主题底色(F80 §3.2 三处同源之一)和用户配的
+    /// 回溯行数(F17)。两件事分头写在三个注入点上,漏一处都是静默的。
+    #[test]
+    fn a_new_pane_emulator_carries_both_the_theme_and_the_scrollback() {
+        let emu = new_pane_emulator(4321);
+        assert_eq!(emu.requested_history(), 4321);
+        let snap = emu.snapshot();
+        let cell = &snap.row(0)[0];
+        assert_eq!(
+            cell.bg,
+            crate::theme::MULLION_DARK.term_bg,
+            "空格背景应是主题底色"
+        );
+        assert_eq!(
+            cell.fg,
+            crate::theme::MULLION_DARK.term_fg,
+            "空格前景应是主题前景"
+        );
+    }
+
+    /// **三个注入点必须全走 `new_pane_emulator`。**
+    ///
+    /// 只能从源码上扎:漏掉其中一处的表现是「某种方式开出来的 pane 回溯深度
+    /// 跟别的不一样」,没有任何测试会因此变红,而端到端要往上翻几千行才看得
+    /// 出来。三处分别是 `accept_connect_ok`(主 pane)、`PaneOpened`(分屏)、
+    /// `rehost_pane`(换节点)。
+    ///
+    /// 针在运行时拼:写成字面量的话这条测试自己的源码就会匹配上自己,恒绿。
+    #[test]
+    fn no_production_site_constructs_an_emulator_with_the_default_history() {
+        let needle = concat!("Emulator", "::new(");
+        let src = include_str!("app.rs");
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("找不到 tests mod")];
+        let hits: Vec<_> = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("///"))
+            .filter(|l| l.contains(needle))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "生产代码里还有 {} 处直接构造 Emulator:{hits:?} —— 它们拿的是内置\
+             默认回溯行数,用户在会话里配的值到不了(F17)。走 `new_pane_emulator`",
+            hits.len()
+        );
+    }
+
+    /// F17「立刻生效」的接线:改完会话配置那一帧要把新值推给在跑的 pane。
+    ///
+    /// 与 `refresh_appearance` 同一个 `touched_store` 门控 —— 分开写迟早
+    /// 漏掉一个;而漏掉的表现是「改了配置得重连才算数」,正是这个项目反复
+    /// 踩过的那类静默。
+    ///
+    /// 自证会变红:把门控里的 `self.refresh_scrollback();` 删掉。
+    #[test]
+    fn a_store_change_pushes_the_new_scrollback_to_live_panes() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n                if touched_store {")
+            .nth(1)
+            .expect("找不到 touched_store 的门控块");
+        let body = &after[..after.find("\n                }\n").expect("门控块没有结尾")];
+        assert!(
+            body.contains("self.refresh_appearance();"),
+            "门控块切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            body.contains("self.refresh_scrollback();"),
+            "改了会话配置没把 scrollback 推给在跑的 pane:用户改完得重连才生效(F17)"
         );
     }
 }

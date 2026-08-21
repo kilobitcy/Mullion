@@ -89,6 +89,29 @@ fn map_shape(s: alacritty_terminal::vte::ansi::CursorShape) -> CursorShape {
     }
 }
 
+/// alacritty 的 `Cell` 一格占多少字节。**实测值**,不是估算 —— scrollback
+/// 的整个内存预算都建立在它上面,所以配了一条
+/// `cell_size_matches_the_budget_assumption` 盯着它:alacritty 哪天给 `Cell`
+/// 加字段,这条会先红,而不是等内存在真机上悄悄翻倍。
+const BYTES_PER_CELL: usize = 24;
+
+/// 把「用户要的回溯行数」按内存预算夹成「实际能给的行数」。
+///
+/// **为什么按字节夹而不是按行夹**:`scrollback` 是行数,但真实占用是
+/// `行数 × 列数 × 24B`。同样 10k 行,80 列的 pane 占 19MB,4K 全屏铺开
+/// 400 列就是 96MB。N5 要求 8 pane 共 300MB —— 一个纯行数上限在宽 pane
+/// 下根本拦不住,只有按字节夹才是对的量纲。
+///
+/// 抽成不依赖 `Emulator` 的自由函数是为了能纯单测:夹错的症状(内存悄悄
+/// 超标,或用户配的行数被无声砍掉)在真机上极难归因。
+///
+/// **至少返回 1 行**:返回 0 会让 scrollback 整个消失(往上翻什么都没有),
+/// 那是比"历史短一点"严重得多的功能退化,宁可略微超一点预算。
+pub fn clamp_history(requested: usize, cols: u16, budget_bytes: usize) -> usize {
+    let per_line = usize::from(cols.max(1)) * BYTES_PER_CELL;
+    requested.min((budget_bytes / per_line).max(1))
+}
+
 /// 单个 pane 的 VT 仿真器:喂入字节 → 推进网格状态 + 攒出站回写。
 pub struct Emulator {
     term: Term<EventSink>,
@@ -100,12 +123,26 @@ pub struct Emulator {
     osc7: Osc7Sniffer,
     /// ⑥:嗅探到的最新 cwd,等 `take_remote_state` 取走。
     cwd: Option<Vec<u8>>,
+    /// 用户**要求**的回溯行数,**未**按预算夹紧。
+    ///
+    /// 只存夹紧后的值是不行的:pane 从窄拖宽会把行数夹小,再拖回窄时若拿
+    /// 夹过的值当基准,历史就被单向砍没了、回不来。所以原始诉求要留着,
+    /// 每次列数变化都拿它重夹一次。
+    requested_history: usize,
 }
 
 impl Emulator {
     /// 默认 scrollback 深度(行)。F17:约 10k 行,和 alacritty 默认一致。
     /// 这是**上限**约 80 列 × 10k 行(按需增长,短会话实际占用远小于此)。
     pub const DEFAULT_HISTORY: usize = 10_000;
+
+    /// 单个 pane 的 scrollback 内存预算(字节)。见 [`clamp_history`] 的
+    /// 文档说明为什么是字节而不是行数。
+    ///
+    /// 32MB × 8 pane = 256MB,给 wgpu/egui/glyphon 和其余一切留出 N5
+    /// (300MB)里剩下的余量。默认 10k 行在 136 列以内不会被这条夹到 ——
+    /// 也就是说常规窗口下用户感觉不到它存在,它只在宽 pane 上兜底。
+    pub const HISTORY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
     /// 新建 `cols × rows` 的仿真器,scrollback 用 [`Emulator::DEFAULT_HISTORY`]。
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -119,13 +156,17 @@ impl Emulator {
     ///
     /// `history` 是**上限**而非预分配——alacritty 的 scrollback 存储按需增长
     /// (`Storage` 初始只为可视行分配,历史行滚动到时才 `initialize`),传入 0 或
-    /// 极大值都不会立即 panic/OOM。但这里**不做合理性校验**,调用方(接配置文件时)
-    /// 自己保证传入值合理。
+    /// 极大值都不会立即 panic/OOM。
+    ///
+    /// 传进来的是**用户的诉求值**,会按 [`Emulator::HISTORY_BUDGET_BYTES`]
+    /// 夹紧后才交给 alacritty —— 校验放在这一层而不是指望每个调用方自觉,
+    /// 是因为 `sessions.toml` 里那个字段是 `u32`,手填一个 1000_0000 就是
+    /// 几百 GB 的分配意图。上层想知道实际给了多少,问 [`Emulator::history_lines`]。
     pub fn with_history(cols: u16, rows: u16, history: usize) -> Self {
         let sink = EventSink::default();
         let dims = GridSize { cols, rows };
         let config = Config {
-            scrolling_history: history,
+            scrolling_history: clamp_history(history, cols, Self::HISTORY_BUDGET_BYTES),
             // F125:远端没发 DECSCUSR 时的形状。项目默认是**闪烁竖线**,
             // 不是 alacritty 的实心块 —— 这是用户明确要的默认。
             default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle {
@@ -142,7 +183,51 @@ impl Emulator {
             defaults: palette::DefaultColors::default(),
             osc7: Osc7Sniffer::default(),
             cwd: None,
+            requested_history: history,
         }
+    }
+
+    /// 当前**实际生效**的回溯行数(已按预算夹紧)。
+    ///
+    /// 上层拿它跟用户配的值比,不相等就落日志 —— 静默砍掉用户配置是这个
+    /// 项目反复踩过的坑,「配了没反应又不说为什么」比"配不了"更难排查。
+    pub fn history_lines(&self) -> usize {
+        clamp_history(
+            self.requested_history,
+            self.cols(),
+            Self::HISTORY_BUDGET_BYTES,
+        )
+    }
+
+    /// 用户**要求**的回溯行数(未夹紧)。跟 [`Emulator::history_lines`] 不等
+    /// 就说明预算兜底生效了,上层据此落一行日志。
+    pub fn requested_history(&self) -> usize {
+        self.requested_history
+    }
+
+    /// F17:改回溯行数,**立刻生效**,不必重连。
+    ///
+    /// 传的是用户诉求值,内部按当前列数夹紧。往小调时 alacritty 的
+    /// `update_history` 会 `shrink_lines` 真正把行释放掉,不是只改上限。
+    pub fn set_history(&mut self, requested: usize) {
+        self.requested_history = requested;
+        self.apply_history_budget();
+    }
+
+    /// 按当前列数把 [`Emulator::requested_history`] 重夹一次并落到 grid 上。
+    ///
+    /// **已知限制**:`Term::grid_mut` 给的是当前**活动** grid。alt screen
+    /// 期间调它,改的是 alt grid(历史恒 0,等于无操作),primary 的上限要等
+    /// 退出 alt 之后的下一次 `resize` 才补上。alacritty 没有公开访问
+    /// inactive grid 的口子,这里认下这个缺口而不是假装没有 —— 影响面是
+    /// 「在全屏 TUI 里拖宽 pane,退出前那段时间 primary 仍按旧上限算」。
+    fn apply_history_budget(&mut self) {
+        let lines = clamp_history(
+            self.requested_history,
+            self.cols(),
+            Self::HISTORY_BUDGET_BYTES,
+        );
+        self.term.grid_mut().update_history(lines);
     }
 
     /// 喂入一段来自对端的字节,推进 VT 状态机(不节流,VT 状态机很快)。
@@ -331,6 +416,12 @@ impl Emulator {
     /// 改变网格尺寸(F34:分屏 reflow / 窗口 resize 时调用)。
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(GridSize { cols, rows });
+        // 列数变了,同样的行数占的内存就跟着变 —— 必须按新列数把预算重夹
+        // 一次,否则夹紧在最主要的那条路径上完全失效:pane 是按 80×24 的
+        // **占位尺寸**建出来的(见 app.rs 的三个注入点),真实列数全靠这里
+        // 的 resize 补。只在构造时夹的话,一个 400 列的 pane 永远按 80 列
+        // 的账被放行。
+        self.apply_history_budget();
     }
 
     /// 滚动可视区(F17 回溯)。`Scroll::Delta(正数)` = 往历史方向(向上)。
@@ -1022,5 +1113,144 @@ mod tests {
         let mut emu = Emulator::new(20, 5);
         emu.feed(b"\x1b[4 q");
         assert_eq!(emu.cursor(), emu.snapshot().cursor);
+    }
+
+    /// 一个足够宽、宽到能把预算夹出可观测差别的列数。
+    ///
+    /// 取 4000 而不是 `u16::MAX`:resize 会把每一行历史都 grow 到新列数,
+    /// 65535 列 × 400 行 × 24B ≈ 472MB,测试自己就把机器吃了。4000 列下
+    /// 预算允许 349 行,喂 400 行就能看出砍没砍,峰值 ~38MB。
+    const WIDE: u16 = 4000;
+
+    /// 内存预算的算式整个建立在「一格 24 字节」上。alacritty 哪天给 `Cell`
+    /// 加个字段,预算就会静静地算少一截 —— 那是在真机上悄悄超 N5、且没有
+    /// 任何症状指向这里的那种 bug,只能靠钉死它来发现。
+    ///
+    /// 自证会变红:把 `BYTES_PER_CELL` 改成 32。
+    #[test]
+    fn cell_size_matches_the_budget_assumption() {
+        assert_eq!(
+            std::mem::size_of::<alacritty_terminal::term::cell::Cell>(),
+            BYTES_PER_CELL,
+            "alacritty 的 Cell 布局变了,scrollback 的内存预算算式要跟着改"
+        );
+    }
+
+    /// 预算之内的诉求原样放行 —— 常规窗口(80~136 列)下用户配的 10k 行
+    /// 不该被动一根汗毛。夹紧是宽 pane 上的兜底,不是普遍性的削减。
+    #[test]
+    fn clamp_history_leaves_a_request_within_budget_alone() {
+        let b = Emulator::HISTORY_BUDGET_BYTES;
+        assert_eq!(clamp_history(10_000, 80, b), 10_000);
+        assert_eq!(clamp_history(10_000, 136, b), 10_000);
+    }
+
+    /// 同样的行数,列数翻倍就只能给一半 —— 这正是「按字节夹而不是按行夹」
+    /// 的全部意义所在。
+    ///
+    /// 自证会变红:把 `clamp_history` 里的 `per_line` 改成不乘 `cols`。
+    #[test]
+    fn clamp_history_scales_with_column_count() {
+        let b = Emulator::HISTORY_BUDGET_BYTES;
+        let narrow = clamp_history(usize::MAX, 100, b);
+        let wide = clamp_history(usize::MAX, 200, b);
+        assert_eq!(narrow, b / (100 * BYTES_PER_CELL));
+        assert_eq!(wide, narrow / 2, "列数翻倍,能给的行数减半");
+    }
+
+    /// 再怎么挤也至少留 1 行:给 0 会让 scrollback 整个消失(往上翻空空
+    /// 如也),那比"历史短一点"严重得多。
+    ///
+    /// 自证会变红:把 `clamp_history` 里的 `.max(1)` 去掉。
+    #[test]
+    fn clamp_history_never_returns_zero() {
+        assert_eq!(clamp_history(10_000, u16::MAX, 1), 1, "预算荒谬也要留 1 行");
+        assert!(
+            clamp_history(10_000, 0, Emulator::HISTORY_BUDGET_BYTES) > 0,
+            "0 列(不该出现,但别在这里除零/给 0 行)"
+        );
+    }
+
+    /// F17:`sessions.toml` 里的 `scrollback` 是 `u32`,手填一千万行不该
+    /// 变成几百 GB 的分配意图 —— 构造这一层就得挡住,不能指望每个调用方
+    /// 自觉(原来的文档写的正是"调用方自己保证传入值合理",而唯一的调用方
+    /// 压根没做)。
+    ///
+    /// **断言的是行为不是返回值**:`history_lines()` 只是把 `clamp_history`
+    /// 再算一遍,拿它跟 `clamp_history` 对比是自己跟自己对,恒绿。这里喂进
+    /// 超过上限的行数,验证最早那些行确实已经被 alacritty 丢掉了。
+    ///
+    /// 自证会变红:把 `with_history` 里的 `clamp_history(...)` 换回裸 `history`。
+    #[test]
+    fn with_history_clamps_an_absurd_request() {
+        let allowed = clamp_history(usize::MAX, WIDE, Emulator::HISTORY_BUDGET_BYTES);
+        assert!(
+            allowed < 398,
+            "测试前提:{WIDE} 列下预算须夹到 398 行以内(实际 {allowed})"
+        );
+
+        let mut emu = Emulator::with_history(WIDE, 2, 10_000_000);
+        for i in 0..400 {
+            emu.feed(format!("L{i}\r\n").as_bytes());
+        }
+        emu.scroll(Scroll::Top);
+        assert_ne!(
+            row_text(&emu.snapshot(), 0),
+            "L0",
+            "一千万行的诉求被原样放行了 —— 构造时没夹"
+        );
+    }
+
+    /// **夹紧最容易失效的那条路径**:pane 是按 `Emulator::new(80, 24)` 的
+    /// 占位尺寸建出来的(见 app.rs 的三个注入点),真实列数全靠 `resize`
+    /// 补。只在构造时夹一次的话,一个 400 列的 pane 永远按 80 列的账放行,
+    /// 预算形同虚设 —— 而症状是内存悄悄超标,没有任何直接线索指回这里。
+    ///
+    /// 自证会变红:把 `resize` 里的 `self.apply_history_budget()` 注释掉。
+    #[test]
+    fn resize_reclamps_history_to_the_byte_budget() {
+        let mut emu = Emulator::with_history(10, 2, 1000);
+        for i in 0..400 {
+            emu.feed(format!("L{i}\r\n").as_bytes());
+        }
+        emu.scroll(Scroll::Top);
+        assert_eq!(
+            row_text(&emu.snapshot(), 0),
+            "L0",
+            "10 列下 1000 行的诉求在预算内,历史一行都不该丢"
+        );
+
+        emu.resize(WIDE, 2);
+        emu.scroll(Scroll::Top);
+        assert_ne!(
+            row_text(&emu.snapshot(), 0),
+            "L0",
+            "拖宽之后最早那行还在 —— 预算没有按新列数重夹"
+        );
+    }
+
+    /// F17:改配置**立刻生效**,不必重连。往小调时 alacritty 的
+    /// `update_history` 会 `shrink_lines` 真把行释放掉,不是只改个上限。
+    ///
+    /// 行号的算法与 `scrollback_holds_configured_lines` 同源:喂 N 行后
+    /// 可视区是 L(N-1) + 末尾换行推出的空行,历史是 L(N-1-h)..=L(N-2)。
+    ///
+    /// 自证会变红:把 `set_history` 里的 `apply_history_budget()` 去掉。
+    #[test]
+    fn set_history_takes_effect_immediately() {
+        let mut emu = Emulator::with_history(10, 2, 1000);
+        for i in 0..300 {
+            emu.feed(format!("L{i}\r\n").as_bytes());
+        }
+        emu.scroll(Scroll::Top);
+        assert_eq!(row_text(&emu.snapshot(), 0), "L0");
+
+        emu.set_history(50);
+        emu.scroll(Scroll::Top);
+        assert_eq!(
+            row_text(&emu.snapshot(), 0),
+            "L249",
+            "调小没有立刻收缩 —— 用户会以为'配了没反应'"
+        );
     }
 }
