@@ -488,6 +488,37 @@ pub fn show(
     let incoming = egui::DragAndDrop::payload::<crate::files::drag::DragFrom>(ui.ctx())
         .filter(|f| f.0 != column)
         .is_some();
+    // F151:本栏正被拖 —— 在指针旁画一个跟随的小胶囊。
+    //
+    // 判据是「载荷来自**本栏**」:两栏都会走到这里,不区分的话同一次拖拽
+    // 会被画两遍(两个胶囊叠在一起,边缘毛糙)。
+    //
+    // 画在 `Order::Tooltip` 层:那是 egui 里唯一保证压在所有 panel 之上的
+    // 常规层,画在当前 `ui` 的 painter 上会被另一栏的背景盖掉。
+    let outgoing = egui::DragAndDrop::payload::<crate::files::drag::DragFrom>(ui.ctx())
+        .is_some_and(|f| f.0 == column);
+    if outgoing {
+        if let Some(p) = ui.ctx().pointer_latest_pos() {
+            let first = state
+                .selected_paths()
+                .first()
+                .map(|n| n.display().into_owned())
+                .unwrap_or_default();
+            let label = crate::files::drag::preview_label(state.selected.len(), &first);
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new(("files-drag-preview", id)),
+            ));
+            let font = egui::FontId::proportional(12.0);
+            let galley = painter.layout_no_wrap(label, font, theme::c32(t.accent_fg));
+            // 偏移一点,别让胶囊压在指针尖底下(挡住落点行的高亮)。
+            let at = p + egui::vec2(crate::ui::metrics::SP_M, crate::ui::metrics::SP_M);
+            let pad = egui::vec2(crate::ui::metrics::SP_S, crate::ui::metrics::SP_XS);
+            let bg = egui::Rect::from_min_size(at, galley.size() + pad * 2.0);
+            painter.rect_filled(bg, 4.0, theme::c32(t.accent));
+            painter.galley(at + pad, galley, theme::c32(t.accent_fg));
+        }
+    }
     if incoming && bg.contains_pointer() {
         ui.painter().rect_stroke(
             ui.max_rect(),
@@ -3405,6 +3436,49 @@ mod tests {
 
         assert_eq!(acts.0, None, "同栏内拖不该发出任何传输");
         assert_eq!(acts.1, None);
+    }
+
+    /// F151:多选拖拽途中,指针旁边该跟着画出「拖动 N 项」。
+    ///
+    /// `preview_label` 本身有纯函数测试,但接线在 `content()` 里 —— 判据
+    /// 取反了(比如画成 `incoming` 而不是 `outgoing`)、层选错了(画在
+    /// 当前 `ui` 的 painter 上被另一栏背景盖掉)都不会被那条纯函数测试逮到。
+    #[test]
+    fn a_multi_item_drag_paints_a_running_count_next_to_the_pointer() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        frame
+            .remote
+            .selected
+            .insert(RemotePath::from_bytes(b"logs".to_vec()));
+        frame
+            .remote
+            .selected
+            .insert(RemotePath::from_bytes(b"b.txt".to_vec()));
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            ctx.run(input, |ctx| {
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+            })
+        };
+        let _ = render(raw(None), &mut frame);
+        let out = render(raw(None), &mut frame);
+        let src = find_text_pos(&out.shapes, "b.txt").expect("远端栏该画出 b.txt");
+        let dst = find_text_pos(&out.shapes, "a.txt").expect("本地栏该画出 a.txt");
+
+        // 按下已选中的 b.txt(不改变选中集,仍是 {logs, b.txt} 两项)→ 移开。
+        // `outgoing` 判据读的是 `DragAndDrop::payload`,而 `dnd_set_drag_payload`
+        // 要到本帧行循环里才写入 —— 同一帧内前者读到的还是上一帧的值,所以
+        // 起拖要多渲染一帧,预览才追得上。
+        let _ = render(press(src, 1.0, true), &mut frame);
+        let _ = render(moved(dst, 1.1), &mut frame);
+        let out = render(moved(dst, 1.2), &mut frame);
+
+        assert!(
+            find_text_pos(&out.shapes, "拖动 2 项").is_some(),
+            "两条一起拖,指针旁该显示「拖动 2 项」,而不是空手拖"
+        );
     }
 
     /// 标签宿主里两栏各占**整块**高度。曾经用 `ui.horizontal` +

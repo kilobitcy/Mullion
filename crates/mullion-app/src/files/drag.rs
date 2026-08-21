@@ -115,6 +115,21 @@ pub fn drop_in_hint(remote_cwd: &RemotePath, n: usize) -> String {
     format!("松开上传 {n} 项到 {}", remote_cwd.display())
 }
 
+/// F151:拖拽途中跟着指针走的那个小胶囊上写什么。
+///
+/// `Response::dnd_set_drag_payload` 只挂载荷、不画预览 —— 没有这一条的话
+/// 拖起来指针底下什么都没有,用户分不清「拖没拖着」「拖了几项」。
+///
+/// 单项显名字(用户要确认拖的是哪一个),多项显条数(名字列表在指针边上
+/// 铺不下,而且这时用户关心的是「有没有把该选的都带上」)。
+pub fn preview_label(n: usize, first: &str) -> String {
+    if n <= 1 {
+        first.to_owned()
+    } else {
+        format!("拖动 {n} 项")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +214,22 @@ mod tests {
         let h = drop_in_hint(&RemotePath::from_bytes(b"/srv/www".to_vec()), 3);
         assert!(h.contains("/srv/www"), "必须写出目标目录:{h}");
         assert!(h.contains('3'), "必须写出条数:{h}");
+    }
+
+    /// 拖一条时显名字、拖多条时显条数。
+    ///
+    /// `Response::dnd_set_drag_payload` 只挂载荷、**不画任何预览** ——
+    /// 在此之前拖起来指针底下空空如也,用户分不清「拖没拖着」和「拖了几项」。
+    #[test]
+    fn the_drag_preview_names_a_single_file_but_counts_a_multi_selection() {
+        assert_eq!(preview_label(1, "a.txt"), "a.txt");
+        assert_eq!(preview_label(3, "a.txt"), "拖动 3 项");
+    }
+
+    /// 0 项是拖不起来的(起拖时没选中会先把那条选上),真走到这儿也不能
+    /// 印成「拖动 0 项」——那是在报告一个不存在的动作。
+    #[test]
+    fn an_empty_drag_falls_back_to_the_name_instead_of_claiming_zero_items() {
+        assert_eq!(preview_label(0, "a.txt"), "a.txt");
     }
 }
