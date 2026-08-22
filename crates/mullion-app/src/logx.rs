@@ -46,6 +46,32 @@ pub fn parse_level(raw: Option<&str>, default: LevelFilter) -> LevelFilter {
     }
 }
 
+/// 设置里的三档 → (自家 crate 档位, 第三方 crate 档位)。
+///
+/// **第三方永远比自家低一档**:wgpu/naga/winit 一开 debug 就刷屏(见模块
+/// 顶部说明),跟着自家一起提上去的话,每 5 秒一行的剖面会被淹没在几万行
+/// adapter 日志里 —— 那等于这个功能没做。
+pub fn levels_for(level: mullion_store::LogLevel) -> (LevelFilter, LevelFilter) {
+    match level {
+        mullion_store::LogLevel::Error => (LevelFilter::Error, LevelFilter::Error),
+        mullion_store::LogLevel::Info => (LevelFilter::Info, LevelFilter::Warn),
+        mullion_store::LogLevel::Debug => (LevelFilter::Debug, LevelFilter::Info),
+    }
+}
+
+/// 设置 + 两个环境变量 → 最终档位。**环境变量覆盖设置**。
+///
+/// 纯函数(环境变量由调用方读好传进来),这样「谁覆盖谁」这条规则测得动 ——
+/// 直接在测试里 `set_var` 的话,并行跑的测试会互相偷环境。
+pub fn resolve_levels(
+    stored: mullion_store::LogLevel,
+    env_app: Option<&str>,
+    env_deps: Option<&str>,
+) -> (LevelFilter, LevelFilter) {
+    let (app, deps) = levels_for(stored);
+    (parse_level(env_app, app), parse_level(env_deps, deps))
+}
+
 /// 目标是否属于本项目自己的 crate(`mullion-app` 的 target 形如 `mullion_app::app`)。
 fn is_own_crate(target: &str) -> bool {
     target.starts_with("mullion")
@@ -77,7 +103,10 @@ impl Log for FileLogger {
 }
 
 /// 打开日志文件(必要时先轮转)+ 接管 `log` facade + 安装 panic 钩子。`main` 最早调用一次。
-pub fn init(version: &str) {
+///
+/// `stored` 来自 `settings.toml`(`main` 在调用本函数**之前**读好)。
+/// 读不到设置时传 `LogLevel::Info`。
+pub fn init(version: &str, stored: mullion_store::LogLevel) {
     let path = log_path();
     let file = path.as_ref().and_then(|p| {
         if let Some(parent) = p.parent() {
@@ -88,14 +117,9 @@ pub fn init(version: &str) {
     });
     let _ = SINK.set(file.map(Mutex::new));
 
-    let app = parse_level(
-        std::env::var("MULLION_LOG").ok().as_deref(),
-        LevelFilter::Info,
-    );
-    let deps = parse_level(
-        std::env::var("MULLION_LOG_DEPS").ok().as_deref(),
-        LevelFilter::Warn,
-    );
+    let env_app = std::env::var("MULLION_LOG").ok();
+    let env_deps = std::env::var("MULLION_LOG_DEPS").ok();
+    let (app, deps) = resolve_levels(stored, env_app.as_deref(), env_deps.as_deref());
     // set_boxed_logger 只可能成功一次(集成测试里重复调会 Err)——失败静默,
     // 日志绝不能反过来拖垮程序。
     if log::set_boxed_logger(Box::new(FileLogger { app, deps })).is_ok() {
@@ -195,5 +219,71 @@ mod tests {
         assert!(is_own_crate("mullion"));
         assert!(!is_own_crate("wgpu_core::device"));
         assert!(!is_own_crate("winit::platform_impl"));
+    }
+
+    use mullion_store::LogLevel;
+
+    /// 设置里的档位映射成两个 `LevelFilter`:自家 crate 一个、第三方一个。
+    ///
+    /// **第三方档位不等于自家档位**:wgpu/naga 一开 debug 就刷屏(本文件
+    /// 顶部注释里记着),把它们跟自家一起提上去,每 5 秒一行的剖面会被淹没
+    /// 在几万行 adapter 日志里 —— 那等于这个功能没做。
+    ///
+    /// 自证会变红:把 `levels_for` 里 Debug 档的 deps 从 `Info` 改成 `Debug`。
+    #[test]
+    fn the_dependency_level_never_follows_our_own_all_the_way_up() {
+        assert_eq!(
+            levels_for(LogLevel::Debug),
+            (LevelFilter::Debug, LevelFilter::Info)
+        );
+        assert_eq!(
+            levels_for(LogLevel::Info),
+            (LevelFilter::Info, LevelFilter::Warn)
+        );
+        assert_eq!(
+            levels_for(LogLevel::Error),
+            (LevelFilter::Error, LevelFilter::Error)
+        );
+    }
+
+    /// 环境变量**覆盖**设置:排障时不必先进 GUI 改设置再重启。
+    ///
+    /// 反过来(设置覆盖环境变量)的话,「我明明设了 MULLION_LOG=debug
+    /// 怎么还是没有」会变成一个查无可查的问题。
+    ///
+    /// 自证会变红:把 `resolve_levels` 里两个 `parse_level` 的 default
+    /// 参数换成写死的 `LevelFilter::Info`/`Warn`。
+    #[test]
+    fn an_environment_variable_wins_over_the_stored_setting() {
+        // 设置说 error,环境变量说 debug → 用 debug。
+        assert_eq!(
+            resolve_levels(LogLevel::Error, Some("debug"), None),
+            (LevelFilter::Debug, LevelFilter::Error),
+            "MULLION_LOG 没能覆盖设置里的档位"
+        );
+        // 环境变量缺席 → 完全按设置。
+        assert_eq!(
+            resolve_levels(LogLevel::Debug, None, None),
+            (LevelFilter::Debug, LevelFilter::Info)
+        );
+        // 依赖档有自己的环境变量,同样覆盖。
+        assert_eq!(
+            resolve_levels(LogLevel::Info, None, Some("off")),
+            (LevelFilter::Info, LevelFilter::Off)
+        );
+    }
+
+    /// 环境变量写错(`verbose`)时回落到**设置里的档位**,而不是回落到
+    /// 硬编码的默认。用户在设置里选了 debug、又在环境变量里打错一个词,
+    /// 结果日志静默降回 info —— 那比直接忽略更难查。
+    ///
+    /// 自证会变红:把 `resolve_levels` 里 `parse_level(env_app, app)` 的
+    /// 第二个参数改成 `LevelFilter::Info`。
+    #[test]
+    fn a_typo_in_the_environment_falls_back_to_the_stored_level_not_to_a_hardcoded_one() {
+        assert_eq!(
+            resolve_levels(LogLevel::Debug, Some("verbose"), None),
+            (LevelFilter::Debug, LevelFilter::Info)
+        );
     }
 }

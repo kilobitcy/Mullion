@@ -22,9 +22,26 @@ fn main() {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
+    // F155:日志档位来自 settings.toml。**必须在 logx::init 之前读** ——
+    // 档位决定了 facade 的 max_level,init 之后再改就晚了。
+    //
+    // settings.toml 是明文 TOML、不经 keyring/主密码(见 store 的 settings.rs),
+    // 所以这一步不需要会话库打开,也不会弹解锁框。读不出来就按默认档位跑,
+    // 那句降级说明等 init 之后再补记 —— 此刻还没有日志可写。
+    let (log_level, settings_note) = match mullion_app::shell::store::config_dir() {
+        Some(dir) => {
+            let loaded = mullion_store::settings::load(&dir);
+            (loaded.settings.log_level, loaded.note)
+        }
+        None => (mullion_store::LogLevel::Info, None),
+    };
+
     // 文件日志 + panic 钩子:GUI 子系统下崩溃/卡死无声消失,靠这个取证。
     // init 同时接管 `log` facade,wgpu/winit/russh 的内部诊断一并落进同一个文件。
-    mullion_app::logx::init(env!("CARGO_PKG_VERSION"));
+    mullion_app::logx::init(env!("CARGO_PKG_VERSION"), log_level);
+    if let Some(note) = settings_note {
+        mullion_app::logx::line(&format!("settings.toml:{note}"));
+    }
     // 环境快照 + 看门狗:卡死时靠它说出「卡在哪个阶段、卡了多久、内存多少」,
     // 不必去翻 Windows 事件日志(它根本不记录 GUI 进程挂起)。
     mullion_app::diag::log_startup_env(env!("CARGO_PKG_VERSION"));
