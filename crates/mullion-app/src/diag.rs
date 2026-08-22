@@ -42,7 +42,10 @@ pub enum Stage {
     StoreIo,
 }
 
-const STAGE_NAMES: [&str; 12] = [
+/// `Stage` 一共有几个变体。`STAGE_US` 与后续的剖面快照都按它定长。
+pub const STAGE_COUNT: usize = 12;
+
+const STAGE_NAMES: [&str; STAGE_COUNT] = [
     "idle",
     "startup",
     "window_event",
@@ -57,12 +60,58 @@ const STAGE_NAMES: [&str; 12] = [
     "store_io",
 ];
 
-fn stage_name(raw: u8) -> &'static str {
+pub fn stage_name(raw: u8) -> &'static str {
     STAGE_NAMES.get(raw as usize).copied().unwrap_or("?")
 }
 
-static STAGE: AtomicU8 = AtomicU8::new(Stage::Idle as u8);
-static BEAT_MS: AtomicU64 = AtomicU64::new(0);
+/// 阶段时钟:当前阶段 + 上次换阶段的时刻 + 每阶段的驻留时长分布。
+///
+/// 抽成结构体(而不是三个裸 `static`)只为一件事:**测试能自己造一个**。
+/// 进程级 static 是全 crate 共享的 —— `host_key::tests` 之类的测试会间接
+/// 调到 `mark()`,在并行 runner 下偷走 prev/since 这一对,让本文件的断言
+/// 概率性假红。给测试一个自己的实例,这类干扰整类消失,顺带连 `sleep`
+/// 都不需要了(时刻由调用方传进来)。
+struct StageClock {
+    stage: AtomicU8,
+    beat_us: AtomicU64,
+    /// 每个阶段的驻留时长分布。索引 = `Stage as usize`。
+    ///
+    /// **白得的**:`mark()` 本来就铺满了事件循环,离开一个阶段时顺手把这一趟
+    /// 的时长记进去,就有了「pump 慢还是 present 慢」的答案,不需要任何新插桩点。
+    hist: [crate::profile::Histogram; STAGE_COUNT],
+}
+
+impl StageClock {
+    const fn new() -> Self {
+        Self {
+            stage: AtomicU8::new(Stage::Idle as u8),
+            beat_us: AtomicU64::new(0),
+            hist: [const { crate::profile::Histogram::new() }; STAGE_COUNT],
+        }
+    }
+
+    /// 进入 `stage`,并把**刚刚结束的那个阶段**的驻留时长记进它自己的桶。
+    ///
+    /// `now_us` 由调用方给:生产里是 `elapsed_us()`,测试里是常量 —— 于是
+    /// 这段逻辑测起来既不依赖时钟也不依赖 sleep。
+    ///
+    /// **单写者**:生产环境里只有主线程(事件循环)调用,看门狗线程只读。
+    /// 两次 `swap` 因此不需要凑成一次原子快照 —— 多个线程并发调用会互相
+    /// 偷走 prev/since 这一对。
+    fn mark(&self, stage: Stage, now_us: u64) {
+        let prev = self.stage.swap(stage as u8, Ordering::Relaxed);
+        let since = self.beat_us.swap(now_us, Ordering::Relaxed);
+        // `Idle` 不计时:阻塞等事件本来就可以很久,算进去会让直方图被一个
+        // 几十秒的样本主导,其余全淹掉。
+        if prev != Stage::Idle as u8 {
+            if let Some(h) = self.hist.get(prev as usize) {
+                h.record_us(now_us.saturating_sub(since));
+            }
+        }
+    }
+}
+
+static CLOCK: StageClock = StageClock::new();
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -72,14 +121,27 @@ static PRESENTS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
 static INBOUND_BYTES: AtomicU64 = AtomicU64::new(0);
 
-fn elapsed_ms() -> u64 {
-    ORIGIN.get().map_or(0, |o| o.elapsed().as_millis() as u64)
+fn elapsed_us() -> u64 {
+    ORIGIN.get().map_or(0, |o| o.elapsed().as_micros() as u64)
 }
 
-/// 进入某个阶段。主线程在事件循环各处调用;开销 = 两条 relaxed 原子写。
+/// 进入某个阶段。主线程在事件循环各处调用。
+///
+/// 开销:一次 `Instant::elapsed` + 两条 relaxed 原子交换 + 一次原子加法。
+/// Windows 上 `Instant::now` 走 QPC,约 20~30ns —— 帧路径上可以忽略,
+/// 但**绝不能**在这里做格式化或加锁(T3)。
 pub fn mark(stage: Stage) {
-    STAGE.store(stage as u8, Ordering::Relaxed);
-    BEAT_MS.store(elapsed_ms(), Ordering::Relaxed);
+    CLOCK.mark(stage, elapsed_us());
+}
+
+/// 「上次换阶段到现在」有多少毫秒。看门狗的阈值是毫秒级的,而时基是微秒。
+///
+/// 抽成纯函数**只为一件事:这个 `/1000` 能被测试盯住**。埋在
+/// `watchdog_loop` 里的话,漏掉它会让 `beat_us`(µs 量级,通常比 `now_us`
+/// 大不了但量纲错位)把 `saturating_sub` 饱和成 0 —— 看门狗**静默永久
+/// 失效**,编译器和现有测试都不会吭一声。
+pub fn stuck_ms(now_us: u64, beat_us: u64) -> u64 {
+    now_us.saturating_sub(beat_us) / 1000
 }
 
 pub fn count_frame() {
@@ -217,7 +279,7 @@ pub fn start_watchdog(stall_ms: u64) {
         return;
     }
     let _ = ORIGIN.set(Instant::now());
-    BEAT_MS.store(0, Ordering::Relaxed);
+    CLOCK.beat_us.store(0, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name("mullion-watchdog".into())
         .spawn(move || watchdog_loop(stall_ms));
@@ -235,9 +297,9 @@ fn watchdog_loop(stall_ms: u64) {
     let mut last_metrics = 0u64;
     loop {
         std::thread::sleep(Duration::from_millis(1_000));
-        let now = elapsed_ms();
-        let stage = STAGE.load(Ordering::Relaxed);
-        let stuck = now.saturating_sub(BEAT_MS.load(Ordering::Relaxed));
+        let now_us = elapsed_us();
+        let stage = CLOCK.stage.load(Ordering::Relaxed);
+        let stuck = stuck_ms(now_us, CLOCK.beat_us.load(Ordering::Relaxed));
 
         if stage == Stage::Idle as u8 {
             // 正常空闲:阻塞等事件本来就可以很久,不是卡死。
@@ -259,8 +321,8 @@ fn watchdog_loop(stall_ms: u64) {
             reported_ms = stuck;
         }
 
-        if now.saturating_sub(last_metrics) >= METRICS_EVERY_MS {
-            last_metrics = now;
+        if now_us.saturating_sub(last_metrics) >= METRICS_EVERY_MS * 1000 {
+            last_metrics = now_us;
             // debug 级:默认不开,排查时 `MULLION_LOG=debug` 就能拿到完整时间线。
             if log::log_enabled!(target: "mullion", log::Level::Debug) {
                 let mem = sample_memory()
@@ -269,7 +331,7 @@ fn watchdog_loop(stall_ms: u64) {
                 log::debug!(
                     target: "mullion",
                     "心跳 t={}s 阶段={} 帧={} present={} 跳帧={} 入站={}KB {mem}",
-                    now / 1000,
+                    now_us / 1_000_000,
                     stage_name(stage),
                     FRAMES.load(Ordering::Relaxed),
                     PRESENTS.load(Ordering::Relaxed),
@@ -316,5 +378,91 @@ mod tests {
             let m = sample_memory().expect("本平台应能采到内存");
             assert!(m.process_bytes > 0, "进程内存不该为 0");
         }
+    }
+
+    /// `mark` 换阶段时必须把**上一个阶段**待了多久记进它自己的桶。
+    ///
+    /// 这是整份剖面的地基:事件循环里已经铺满 `mark()`,累计这一步做对了,
+    /// 「pump 慢还是 present 慢」就不需要任何新插桩点。做错了(比如记进
+    /// 新阶段而不是旧阶段)不会有任何报错,只会让剖面**一直指错人**。
+    ///
+    /// 用自己的 `StageClock`、时刻直接传常量:不碰进程级 static,也就不会
+    /// 被别的测试(`host_key::tests` 也会间接调 `mark`)偷走 prev/since。
+    ///
+    /// 自证会变红:把 `StageClock::mark` 里的 `prev` 换成 `stage as u8`。
+    #[test]
+    fn marking_a_new_stage_charges_the_elapsed_time_to_the_stage_that_just_ended() {
+        let clock = StageClock::new();
+        clock.mark(Stage::Pump, 1_000);
+        clock.mark(Stage::Present, 3_500);
+
+        let pump = clock.hist[Stage::Pump as usize].drain();
+        let present = clock.hist[Stage::Present as usize].drain();
+        assert_eq!(
+            crate::profile::total(&pump),
+            1,
+            "离开 Pump 时没把它这一趟的耗时记下来"
+        );
+        assert!(
+            (2_000..=4_096).contains(&crate::profile::quantile_us(&pump, 1.0)),
+            "Pump 待了 2500µs,却记成了 {}µs",
+            crate::profile::quantile_us(&pump, 1.0)
+        );
+        assert_eq!(
+            crate::profile::total(&present),
+            0,
+            "耗时被记到了刚进入的阶段头上 —— 剖面会一直指错人"
+        );
+    }
+
+    /// `Idle` 的时长**不进直方图**。阻塞等事件本来就可以很久,把它算进去
+    /// 会让直方图永远被一个几十秒的样本主导,其余全部淹没在噪声里。
+    ///
+    /// 自证会变红:把 `StageClock::mark` 里那句跳过 Idle 的判断删掉。
+    #[test]
+    fn time_spent_idle_is_not_charged_to_anything() {
+        let clock = StageClock::new();
+        clock.mark(Stage::Idle, 0);
+        clock.mark(Stage::UserEvent, 5_000_000);
+        assert_eq!(
+            crate::profile::total(&clock.hist[Stage::Idle as usize].drain()),
+            0,
+            "空闲等待被当成了耗时"
+        );
+    }
+
+    /// 时基必须是微秒。毫秒精度下单帧各阶段几乎全是 0 —— 剖面看着像
+    /// 「哪里都不慢」,而实际瓶颈藏在被截断的小数里。
+    ///
+    /// 只读 `ORIGIN`(`OnceLock`,设过就不再变)+ 两次单调读,不碰任何
+    /// 会被别的测试改写的状态,所以不需要串行化。
+    ///
+    /// 自证会变红:把 `elapsed_us` 的 `as_micros()` 改成 `as_millis()`。
+    #[test]
+    fn the_clock_counts_microseconds_not_milliseconds() {
+        let _ = ORIGIN.set(Instant::now());
+        let a = elapsed_us();
+        std::thread::sleep(Duration::from_millis(2));
+        let b = elapsed_us();
+        assert!(
+            b.saturating_sub(a) >= 1_000,
+            "睡了 2ms 时钟只走了 {}µs —— 时基不是微秒",
+            b.saturating_sub(a)
+        );
+    }
+
+    /// 看门狗的阈值是毫秒,时基是微秒,中间那次换算漏掉的话看门狗会
+    /// **静默永久失效**(`saturating_sub` 几乎永远饱和成 0,再也不报警),
+    /// 而编译器和其余测试一句话都不会说。
+    ///
+    /// 自证会变红:把 `stuck_ms` 里的 `/ 1000` 去掉。
+    #[test]
+    fn the_watchdog_converts_microseconds_to_its_millisecond_threshold() {
+        assert_eq!(stuck_ms(5_000_000, 1_000_000), 4_000);
+        assert_eq!(stuck_ms(1_500, 1_000), 0, "半毫秒不该算成一毫秒");
+        // 时钟异常导致的倒流不许下溢成天文数字 —— 那会让看门狗每秒刷屏。
+        assert_eq!(stuck_ms(1_000, 9_999_999), 0);
+        // 3 秒阈值刚好越线。
+        assert!(stuck_ms(3_000_000, 0) >= DEFAULT_STALL_MS);
     }
 }
