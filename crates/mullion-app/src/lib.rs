@@ -23,6 +23,7 @@ pub mod logx;
 pub mod pane;
 pub mod profile;
 pub mod reconnect;
+pub mod redact;
 pub mod reflow;
 pub mod remote_bootstrap;
 pub mod render;
