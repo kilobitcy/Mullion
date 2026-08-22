@@ -21,6 +21,7 @@ pub mod icon_res;
 pub mod input;
 pub mod logx;
 pub mod pane;
+pub mod profile;
 pub mod reconnect;
 pub mod reflow;
 pub mod remote_bootstrap;
