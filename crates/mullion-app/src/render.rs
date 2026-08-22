@@ -26,6 +26,13 @@ pub struct SyncFramePacer {
     /// 上一段末尾那截「可能是被切开的 BSU/ESU 前缀」,与下一段拼接后再扫。
     /// 最长 [`SYNC_PREFIX_MAX`] 字节。
     tail: Vec<u8>,
+    /// F155/T2 剖面:进入过多少次同步块(每个 BSU→ESU/超时算一次)。
+    blocks: u32,
+    /// F155/T2 剖面:有多少个同步块是靠 [`SYNC_TIMEOUT_MS`] 逃生门硬挤出来的
+    /// (对端没把 ESU 发完)。
+    timeouts: u32,
+    /// 当前这个同步块的超时是否已经计过数——闩住,避免连续多帧重复计。
+    timeout_counted: bool,
 }
 
 impl SyncFramePacer {
@@ -55,6 +62,8 @@ impl SyncFramePacer {
                 if !self.in_sync {
                     self.in_sync = true;
                     self.sync_since_ms = now_ms;
+                    self.blocks = self.blocks.saturating_add(1);
+                    self.timeout_counted = false;
                 }
                 i += BSU.len();
             } else if buf[i..].starts_with(ESU) {
@@ -113,8 +122,33 @@ impl SyncFramePacer {
     }
 
     /// 记录已提交一帧,清除脏标记。
-    pub fn mark_presented(&mut self) {
+    ///
+    /// `now_ms` 用于判定这一帧是否是靠 [`SYNC_TIMEOUT_MS`] 逃生门硬挤出来的
+    /// (F155/T2 剖面)。
+    pub fn mark_presented(&mut self, now_ms: u64) {
+        // 出帧那一刻仍在同步块里、且已经过了 SYNC_TIMEOUT_MS —— 这一帧只可能是靠
+        // 逃生门硬挤出来的(对端没把 ESU 发完)。闩住,同一个块只算一次;下一个 BSU
+        // 进来才复位。判据自带 150ms 检查,所以即使某帧是被 egui 的 ui_dirty 推出来
+        // 的(那时可能有 pane 正在合法攒帧),也不会误计。
+        if self.in_sync
+            && !self.timeout_counted
+            && now_ms.saturating_sub(self.sync_since_ms) >= SYNC_TIMEOUT_MS
+        {
+            self.timeouts = self.timeouts.saturating_add(1);
+            self.timeout_counted = true;
+        }
         self.dirty = false;
+    }
+
+    /// 取走这一窗口攒下的同步块计数并清零(F155/T2 剖面)。
+    ///
+    /// 必须在这里清零而不是让调用方自减:计数器的语义是「这一窗口发生了几次」,
+    /// 让调用方各自减一遍在多 pane 场景下极易漏减、重复上报。
+    pub fn take_counts(&mut self) -> (u32, u32) {
+        (
+            std::mem::take(&mut self.blocks),
+            std::mem::take(&mut self.timeouts),
+        )
     }
 }
 
@@ -184,7 +218,7 @@ mod tests {
         // 收到 ESU,提交一帧。
         pacer.feed(ESU, 0);
         assert!(pacer.should_present(0), "收到 ESU 后应提交一帧");
-        pacer.mark_presented();
+        pacer.mark_presented(0);
         assert!(!pacer.should_present(0), "提交后脏标记应清除");
     }
 
@@ -334,8 +368,8 @@ mod tests {
         let mut b = SyncFramePacer::new();
         a.feed(b"a output", 0);
         assert!(panes_ready_to_present([&a, &b].into_iter(), 0));
-        a.mark_presented();
-        b.mark_presented();
+        a.mark_presented(0);
+        b.mark_presented(0);
 
         b.feed(b"b output", 1);
         assert!(
@@ -353,7 +387,7 @@ mod tests {
         let mut a = SyncFramePacer::new();
         let mut b = SyncFramePacer::new();
         b.feed(BSU, 0); // b 进入同步区间(顺带标脏)
-        b.mark_presented(); // 清掉 b 的 dirty,但 in_sync 仍为 true
+        b.mark_presented(0); // 清掉 b 的 dirty,但 in_sync 仍为 true(未超时,不计入 timeouts)
         assert!(!b.should_present(0), "b 自己没有新数据,理应不出帧");
 
         a.feed(b"content", 0); // a 有新数据要画
@@ -407,6 +441,67 @@ mod tests {
             earliest_sync_timeout_ms(std::iter::once(&empty), 0),
             None,
             "从没进过同步块的 pane 不该产生一个假的唤醒时刻"
+        );
+    }
+
+    /// F155/T2 剖面:进入一次同步块只算一个块,哪怕 BSU 在块内(比如流式输出
+    /// 时对端重复发)重复出现——`in_sync` 已经是 true 时不该重新计数。
+    #[test]
+    fn re_entering_bsu_inside_a_block_counts_once() {
+        let mut pacer = SyncFramePacer::new();
+        pacer.feed(BSU, 0);
+        pacer.feed(BSU, 10); // 同一个块内又来一次 BSU(不应发生,但要防御)
+        pacer.feed(BSU, 20);
+        assert_eq!(pacer.take_counts(), (1, 0), "块内重复 BSU 不该多算");
+    }
+
+    /// F155/T2 剖面:ESU 正常收口的块不算超时——那是本项目的正常路径,
+    /// 不能让每一次流式输出都在剖面里报一次「超时」。
+    #[test]
+    fn a_block_closed_by_esu_is_not_a_timeout() {
+        let mut pacer = SyncFramePacer::new();
+        pacer.feed(BSU, 0);
+        pacer.feed(b"streaming", 10);
+        pacer.feed(ESU, 20); // 远早于 SYNC_TIMEOUT_MS
+        pacer.mark_presented(20);
+        assert_eq!(pacer.take_counts(), (1, 0), "正常收口的块不该计进 timeouts");
+    }
+
+    /// F155/T2 剖面:对端不发 ESU、过了 150ms 才靠逃生门出帧的块算一次超时,
+    /// 且同一个块哪怕连续好几帧都卡在超时状态,也只计一次——不然剖面会把
+    /// 一次真实故障夸大成几十次。
+    #[test]
+    fn an_unterminated_block_counts_one_timeout_even_across_repeated_frames() {
+        let mut pacer = SyncFramePacer::new();
+        pacer.feed(BSU, 0);
+        pacer.feed(b"half a frame", 0);
+        // 逃生门出帧的那一帧:should_present 应为 true(见 unterminated_sync_block_times_out)。
+        assert!(pacer.should_present(SYNC_TIMEOUT_MS));
+        pacer.mark_presented(SYNC_TIMEOUT_MS);
+        // ESU 仍未到,后续几帧继续卡在同一个(未超时判定意义上已放行、但
+        // in_sync 仍为 true 的)块里,每帧都会再次 mark_presented。
+        pacer.mark_presented(SYNC_TIMEOUT_MS + 16);
+        pacer.mark_presented(SYNC_TIMEOUT_MS + 32);
+        assert_eq!(
+            pacer.take_counts(),
+            (1, 1),
+            "同一个未收口的块连续多帧只该计一次超时"
+        );
+    }
+
+    /// F155/T2 剖面:`take_counts` 取走后必须归零,否则下一个 5 秒窗口会
+    /// 把上一窗口的计数重新报一遍——同一次故障在日志里出现两次。
+    #[test]
+    fn take_counts_drains_so_the_next_window_does_not_re_report() {
+        let mut pacer = SyncFramePacer::new();
+        pacer.feed(BSU, 0);
+        pacer.feed(b"stuck", 0);
+        pacer.mark_presented(SYNC_TIMEOUT_MS);
+        assert_eq!(pacer.take_counts(), (1, 1));
+        assert_eq!(
+            pacer.take_counts(),
+            (0, 0),
+            "取走之后应归零,不能被下一个窗口重复上报"
         );
     }
 }

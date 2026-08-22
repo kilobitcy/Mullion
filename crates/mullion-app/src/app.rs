@@ -7972,9 +7972,19 @@ impl ApplicationHandler<UserEvent> for App {
                             // 施加几何:F34/T4 的唯一出口。本帧 build_ui 刚写入的
                             // central_px 要下一帧才生效(与 B0 起就是这个语义)。
                             if let Some(ws) = self.active_ws_mut() {
+                                // F155/T2:各 pane 的同步块计数在 present 之后收口再
+                                // 汇总上报——与 `mark_presented` 用同一个 `now`(ms
+                                // 时基,见 `self.now_ms()`),否则超时判据会跟 `feed`
+                                // 用的时钟基准对不上。
+                                let mut sync_blocks = 0u32;
+                                let mut sync_timeouts = 0u32;
                                 for p in ws.panes_mut_iter() {
-                                    p.pacer.mark_presented();
+                                    p.pacer.mark_presented(now);
+                                    let (blocks, timeouts) = p.pacer.take_counts();
+                                    sync_blocks = sync_blocks.saturating_add(blocks);
+                                    sync_timeouts = sync_timeouts.saturating_add(timeouts);
                                 }
+                                diag::count_sync(sync_blocks as u64, sync_timeouts as u64);
                                 ws.apply_geometry(&geoms);
                             }
                             // F84:设置弹窗的结论。放在布局动作之前 —— 换字体
@@ -16691,6 +16701,36 @@ mod tests {
             assert!(
                 prod.contains(needle),
                 "剖面采集点 `{needle}` 没接进事件循环 —— 剖面里那一列会恒为零"
+            );
+        }
+    }
+
+    /// F155/T2:每 pane 的同步块计数(`take_counts`)必须被汇总并喂给
+    /// `diag::count_sync`,否则剖面里「同步块=/超时=」两列会恒为零 ——
+    /// 这是本项目最有价值的一组指标,历史上「打字慢一拍」的真根因就是这里
+    /// 的超时收口。
+    ///
+    /// 同 `the_frame_profile_hooks_are_all_wired_into_the_event_loop`:只搜
+    /// `mod tests` 之前的那一段源码,否则 needle 会命中这条测试自己。
+    ///
+    /// 自证会变红:删掉 `diag::count_sync(...)` 那句接线,或者把
+    /// `p.pacer.take_counts()` 那句删掉(汇总永远是 0,`diag::count_sync`
+    /// 还在但传的是死值)。
+    #[test]
+    fn the_sync_block_counts_are_collected_and_forwarded_to_the_profile() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面每条断言都会恒真"
+        );
+        for needle in ["p.pacer.take_counts()", "diag::count_sync("] {
+            assert!(
+                prod.contains(needle),
+                "同步块计数接线 `{needle}` 没接进事件循环 —— 剖面里这一列会恒为零"
             );
         }
     }

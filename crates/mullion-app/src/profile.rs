@@ -154,6 +154,11 @@ pub struct Snapshot {
     pub connects_err: u64,
     pub reconnects: u64,
     pub sftp_ops: u64,
+    /// T2(领域陷阱):各 pane 攒帧状态机进入过多少次同步块。
+    pub sync_blocks: u64,
+    /// T2:其中有多少个块是靠 150ms 逃生门硬挤出来的(对端没发完 ESU)。
+    /// 历史上「打字慢一拍」的真根因就是这里。
+    pub sync_timeouts: u64,
     pub tabs: u64,
     pub panes: u64,
     pub hosts: u64,
@@ -184,6 +189,8 @@ impl Snapshot {
             connects_err: 0,
             reconnects: 0,
             sftp_ops: 0,
+            sync_blocks: 0,
+            sync_timeouts: 0,
             tabs: 0,
             panes: 0,
             hosts: 0,
@@ -200,6 +207,10 @@ impl Snapshot {
     /// **`stage_us` 有意不算活动**：事件循环被无关的定时器唤一下（重连退避、
     /// 心跳）也会留下阶段样本，把它算成活动就等于「进程活着就每 5 秒写一次盘」，
     /// 又回到这条判据要防的那件事上。有帧/有字节/有按键/有节流才算真在干活。
+    ///
+    /// **`sync_timeouts` 不能只靠 `sync_blocks` 兜住**：一个同步块可以在上一个
+    /// 窗口进入、这个窗口才超时逃生——那种窗口 `sync_blocks` 为 0 但
+    /// `sync_timeouts` 非零，恰恰是最需要落盘的一种（T2 故障正在发生）。
     pub fn is_idle(&self) -> bool {
         self.frames == 0
             && self.throttled == 0
@@ -212,6 +223,8 @@ impl Snapshot {
             && self.connects_err == 0
             && self.reconnects == 0
             && self.sftp_ops == 0
+            && self.sync_blocks == 0
+            && self.sync_timeouts == 0
     }
 }
 
@@ -256,7 +269,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
 
     Some(format!(
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
-         redraw=term:{}/ui:{}/both:{} in={} key={}x/echo={}x/p95={} {} \
+         redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
          conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
         secs,
         s.frames,
@@ -269,6 +282,8 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         s.redraw_terminal,
         s.redraw_ui,
         s.redraw_both,
+        s.sync_blocks,
+        s.sync_timeouts,
         rate,
         s.keys,
         total(&s.echo_us),
@@ -418,6 +433,8 @@ mod tests {
             keys: 12,
             connects_ok: 1,
             sftp_ops: 3,
+            sync_blocks: 12,
+            sync_timeouts: 3,
             tabs: 2,
             panes: 3,
             hosts: 2,
@@ -490,13 +507,25 @@ mod tests {
     }
 
     /// 跳帧数为 0 时也要**显式写出来**。省略掉的话，「这个窗口没跳帧」与
-    /// 「这个版本忘了统计跳帧」在日志里长得一模一样。
+    /// 「这个版本忘了统计跳帧」在日志里长得一模一样。同理覆盖 T2 的
+    /// `sync_timeouts`：「这个窗口没超时」与「忘了统计超时」不能长得一样。
     #[test]
     fn a_zero_count_is_printed_rather_than_omitted() {
         let mut s = busy_snapshot();
         s.skipped = 0;
+        s.sync_timeouts = 0;
         let line = render_line(&s).expect("忙窗口该有一行");
         assert!(line.contains("skip=0"), "零值被省略了：{line}");
+        assert!(line.contains("超时=0x"), "同步块超时的零值被省略了：{line}");
+    }
+
+    /// T2(领域陷阱)：同步块与超时次数必须原样进得了剖面行，这是本项目
+    /// 最有价值的一组指标——历史上「打字慢一拍」的真根因就是这里的超时收口。
+    #[test]
+    fn the_sync_block_counts_reach_the_line() {
+        let line = render_line(&busy_snapshot()).expect("忙窗口该有一行");
+        assert!(line.contains("同步块=12x"), "没报同步块次数：{line}");
+        assert!(line.contains("超时=3x"), "没报同步块超时次数：{line}");
     }
 
     /// 吞吐是**速率**，不是这个窗口的字节总数：窗口被调度拖长时，同样的
@@ -518,24 +547,29 @@ mod tests {
         assert!(b.contains("50.0KB/s"), "20 秒窗口没按时长摊开：{b}");
     }
 
-    /// 四个「有事发生但没画成帧」的字段,**每一个都必须单独**把窗口顶成非空闲。
+    /// 六个「有事发生但没画成帧」的字段,**每一个都必须单独**把窗口顶成非空闲。
     ///
     /// 「重绘全被帧闸挡下、一帧没画成」正是领域陷阱 T3 发作时的样子;判成
-    /// 空闲就等于把要查的那个指标 drain 掉又不打印,数据静默丢失。
+    /// 空闲就等于把要查的那个指标 drain 掉又不打印,数据静默丢失。`sync_blocks`/
+    /// `sync_timeouts`(T2)同理:一个同步块可以在上一个窗口进入、这个窗口才
+    /// 超时逃生,那种窗口 `sync_blocks` 恰好是 0,只能靠 `sync_timeouts` 自己
+    /// 把窗口顶成非空闲。
     ///
     /// 逐字段循环而不是一份「几个字段一起非零」的 fixture:后者删掉任一条
-    /// 判据,剩下的都能替它兜住,测试照绿 —— 只能证明「四条里至少还剩一条」。
+    /// 判据,剩下的都能替它兜住,测试照绿 —— 只能证明「六条里至少还剩一条」。
     ///
     /// 自证会变红:删掉 `is_idle` 里 `throttled`/`redraw_terminal`/`redraw_ui`/
-    /// `redraw_both` 中的**任意一条**。
+    /// `redraw_both`/`sync_blocks`/`sync_timeouts` 中的**任意一条**。
     #[test]
     #[allow(clippy::type_complexity)]
     fn each_no_frame_activity_counter_alone_keeps_the_window_from_being_idle() {
-        let fields: [(&str, fn(&mut Snapshot)); 4] = [
+        let fields: [(&str, fn(&mut Snapshot)); 6] = [
             ("throttled", |s| s.throttled = 400),
             ("redraw_terminal", |s| s.redraw_terminal = 400),
             ("redraw_ui", |s| s.redraw_ui = 400),
             ("redraw_both", |s| s.redraw_both = 400),
+            ("sync_blocks", |s| s.sync_blocks = 400),
+            ("sync_timeouts", |s| s.sync_timeouts = 400),
         ];
         for (name, set) in fields {
             let mut s = Snapshot {

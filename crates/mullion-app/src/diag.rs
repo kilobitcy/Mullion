@@ -131,6 +131,10 @@ static CONNECTS_OK: AtomicU64 = AtomicU64::new(0);
 static CONNECTS_ERR: AtomicU64 = AtomicU64::new(0);
 static RECONNECTS: AtomicU64 = AtomicU64::new(0);
 static SFTP_OPS: AtomicU64 = AtomicU64::new(0);
+/// F155/T2 剖面:各 pane 攒帧状态机报上来的同步块计数(领域陷阱 T2 —— 历史上
+/// 「打字慢一拍」的真根因就是这里的超时收口)。
+static SYNC_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static SYNC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// 状态量(此刻是多少),不是「这窗口发生了几次」—— 采集时读而不清。
 static TABS: AtomicU64 = AtomicU64::new(0);
 static PANES: AtomicU64 = AtomicU64::new(0);
@@ -236,6 +240,16 @@ pub fn count_reconnect() {
 
 pub fn count_sftp_op() {
     SFTP_OPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 本帧各 pane 攒帧状态机报上来的同步块计数(T2)。两者都为 0 时直接返回,
+/// 免得静止时也在 relaxed 原子上打转。
+pub fn count_sync(blocks: u64, timeouts: u64) {
+    if blocks == 0 && timeouts == 0 {
+        return;
+    }
+    SYNC_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+    SYNC_TIMEOUTS.fetch_add(timeouts, Ordering::Relaxed);
 }
 
 /// 此刻的规模。App 每帧调一次(三条 relaxed 原子存,可忽略)。
@@ -458,6 +472,8 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.connects_err = CONNECTS_ERR.swap(0, Ordering::Relaxed);
     s.reconnects = RECONNECTS.swap(0, Ordering::Relaxed);
     s.sftp_ops = SFTP_OPS.swap(0, Ordering::Relaxed);
+    s.sync_blocks = SYNC_BLOCKS.swap(0, Ordering::Relaxed);
+    s.sync_timeouts = SYNC_TIMEOUTS.swap(0, Ordering::Relaxed);
     s.tabs = TABS.load(Ordering::Relaxed);
     s.panes = PANES.load(Ordering::Relaxed);
     s.hosts = HOSTS.load(Ordering::Relaxed);
