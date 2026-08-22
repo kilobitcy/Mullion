@@ -6960,9 +6960,6 @@ impl ApplicationHandler<UserEvent> for App {
                 self.transfer.queue.progress(job, done);
             }
             UserEvent::TransferDone { job, result } => {
-                // F155:一个 job = 一次完整传输,不是每个数据块 —— 那是
-                // `TransferProgress`(一个 100MB 的文件几千条,T3 红线),不能计。
-                diag::count_sftp_op();
                 self.transfer.cancels.remove(&job);
                 self.transfer.queue.finish(job, result);
                 // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
