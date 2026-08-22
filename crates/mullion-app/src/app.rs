@@ -6960,6 +6960,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.transfer.queue.progress(job, done);
             }
             UserEvent::TransferDone { job, result } => {
+                // F155:一次传输完成 = 一次 SFTP 操作。计在 Done 而不是
+                // Progress —— 后者一个大文件几千条(见同 arm 的 T3 守护)。
+                diag::count_sftp_op();
                 self.transfer.cancels.remove(&job);
                 self.transfer.queue.finish(job, result);
                 // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
@@ -9957,10 +9960,43 @@ mod tests {
             ("diag::count_connect(true)", "连接成功"),
             ("diag::count_connect(false)", "连接失败"),
             ("diag::count_reconnect()", "重连"),
-            ("diag::count_sftp_op()", "SFTP 操作"),
         ] {
             assert!(prod.contains(needle), "{what}没计数 —— 剖面里那一列恒为零");
         }
+    }
+
+    /// F155:**两类** SFTP 操作都要计数 —— 目录操作(mkdir/rm/rename)与
+    /// 传输完成。
+    ///
+    /// 按分支各扎一次,而不是在整份源码里搜一次 `count_sftp_op()`:后者
+    /// 在有两个接线点时,删掉其中任意一个都仍然搜得到,断言恒绿。这不是
+    /// 假设 —— 本切片实现时正是先漏了这一点,才把传输那一路的接线又拿掉了。
+    ///
+    /// `TransferProgress` **绝不能**计数:一个 100MB 的文件几千条,计进去
+    /// 剖面里的 SFTP 列就变成了进度条的采样数,毫无意义(同 arm 的 T3 守护)。
+    ///
+    /// 自证会变红:删掉两条分支里的任意一句 `diag::count_sftp_op();`。
+    #[test]
+    fn both_kinds_of_sftp_operations_are_counted() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        for (pattern, what) in [
+            ("UserEvent::SftpOpDone { generation, result }", "目录操作"),
+            ("UserEvent::TransferDone { job, result }", "传输完成"),
+        ] {
+            let arm = arm_of(production, pattern);
+            assert!(
+                arm.contains("diag::count_sftp_op();"),
+                "{what}那一路没计数 —— 剖面里的 SFTP 列会少算一半"
+            );
+        }
+        let progress = arm_of(production, "UserEvent::TransferProgress { job, done }");
+        assert!(
+            !progress.contains("count_sftp_op"),
+            "进度事件被计成了 SFTP 操作 —— 一个大文件几千条,这一列就废了"
+        );
     }
 
     // ------------------------------------------------ F18 划选自动滚动
