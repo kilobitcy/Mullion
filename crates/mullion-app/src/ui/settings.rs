@@ -21,6 +21,20 @@ use crate::ui::shortcuts::SHORTCUTS;
 /// 点不中,`interact` 里那句 panic 才是唯一的提示。
 const BOOTSTRAP_LABEL: &str = "自动配置远端 tmux 的状态上报";
 
+/// 三档的中文标签。**实现与测试共用同一份** —— 各写一遍的话,改文案时
+/// 测试会静默地点不中,`interact` 里那句 panic 才是唯一的提示。
+const LEVEL_ERROR_LABEL: &str = "只记错误";
+const LEVEL_INFO_LABEL: &str = "常规（含性能剖面）";
+const LEVEL_DEBUG_LABEL: &str = "详细（排查用）";
+
+fn level_label(lv: mullion_store::LogLevel) -> &'static str {
+    match lv {
+        mullion_store::LogLevel::Error => LEVEL_ERROR_LABEL,
+        mullion_store::LogLevel::Info => LEVEL_INFO_LABEL,
+        mullion_store::LogLevel::Debug => LEVEL_DEBUG_LABEL,
+    }
+}
+
 /// 弹窗里正在编辑的那份设置。
 ///
 /// **不直接改 `App::settings`**:字号是拖动即预览的(设计 §8),没有一份草稿
@@ -44,6 +58,9 @@ pub struct SettingsDraft {
     pub confirm_password: String,
     /// F124:自动配置远端 tmux 状态上报。
     pub tmux_bootstrap: bool,
+    /// F155:日志详细档位。回写进 `Settings` 与施加到 log facade 都在
+    /// `app.rs` 的「确定」分支里做。
+    pub log_level: mullion_store::LogLevel,
 }
 
 impl SettingsDraft {
@@ -56,6 +73,7 @@ impl SettingsDraft {
             new_password: String::new(),
             confirm_password: String::new(),
             tmux_bootstrap: s.tmux_bootstrap,
+            log_level: s.log_level,
         }
     }
 
@@ -130,6 +148,8 @@ pub fn show(
             appearance(ui, t, draft, env, &mut out);
             form::section(ui, t, "设置", "远端", &mut first);
             remote(ui, t, draft, &mut out);
+            form::section(ui, t, "设置", "诊断", &mut first);
+            diagnostics(ui, t, draft);
             form::section(ui, t, "设置", "安全", &mut first);
             security(ui, t, draft, env, &mut out);
             form::section(ui, t, "设置", "快捷键", &mut first);
@@ -291,6 +311,50 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
     ui.add_space(SP_M);
 }
 
+/// 诊断分节(F155):日志详细度。
+///
+/// 走 `form::grid` 两列骨架(规范 #1),说明文字挂**输入列**、标签列留空
+/// (规范 #6)。本 task 没有会改变输出的控件(回写 `Settings` 与施加到
+/// log facade 在 `app.rs` 的「确定」分支里做),所以不接 `out` 参数。
+fn diagnostics(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft) {
+    let avail = ui.available_width();
+    form::grid(ui, "settings_diagnostics", |ui| {
+        ui.label("日志详细度");
+        let w = field_w(avail, FIELD_W_M, 0.0);
+        egui::ComboBox::from_id_salt("settings_log_level")
+            .width(w)
+            .selected_text(level_label(draft.log_level))
+            .show_ui(ui, |ui| {
+                for lv in [
+                    mullion_store::LogLevel::Error,
+                    mullion_store::LogLevel::Info,
+                    mullion_store::LogLevel::Debug,
+                ] {
+                    if ui
+                        .selectable_label(draft.log_level == lv, level_label(lv))
+                        .clicked()
+                    {
+                        draft.log_level = lv;
+                    }
+                }
+            });
+        ui.end_row();
+
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "常规档每 5 秒记一行性能剖面（帧耗时、吞吐、各阶段占用、回显往返），\
+                 排查卡顿靠它。详细档还会逐事件记录，日志会大很多。\
+                 环境变量 MULLION_LOG 若设了，会盖过这里的选择。",
+            )
+            .size(11.0)
+            .color(theme::c32(t.fg_dim)),
+        );
+        ui.end_row();
+    });
+    ui.add_space(SP_M);
+}
+
 /// 安全分节(F71):主密码状态 + 两个密码框 + 设定/修改 与 取消两个动作。
 fn security(
     ui: &mut egui::Ui,
@@ -416,6 +480,7 @@ mod tests {
             new_password: String::new(),
             confirm_password: String::new(),
             tmux_bootstrap: true,
+            log_level: mullion_store::LogLevel::Info,
         }
     }
 
@@ -637,6 +702,7 @@ mod tests {
             new_password: String::new(),
             confirm_password: String::new(),
             tmux_bootstrap: true,
+            log_level: mullion_store::LogLevel::Info,
         };
         let (texts, _) = run(&mut d, false);
         assert!(
@@ -836,6 +902,93 @@ mod tests {
         assert!(
             texts.iter().any(|s| s == "Ctrl+Shift+C"),
             "快捷键一览是空的:{texts:?}"
+        );
+    }
+
+    // ---- F155 诊断分节 ----
+
+    /// 三档都要画出来,而且**当前档位要被选中**。只画不选中的话,用户看到
+    /// 三个一样的选项,无从判断现在是哪档。
+    #[test]
+    fn the_diagnostics_section_shows_the_current_level() {
+        let mut d = draft();
+        d.log_level = mullion_store::LogLevel::Debug;
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s == "日志详细度"),
+            "没画标签:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s == LEVEL_DEBUG_LABEL),
+            "下拉没显示当前档位:{texts:?}"
+        );
+        // 换一档,显示的也要跟着换 —— 否则「显示的是当前档」这条断言
+        // 可能只是碰巧撞上了写死的文案。
+        d.log_level = mullion_store::LogLevel::Error;
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s == LEVEL_ERROR_LABEL),
+            "换了档位显示没跟着变:{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|s| s == LEVEL_DEBUG_LABEL),
+            "旧档位的文案还在:{texts:?}"
+        );
+    }
+
+    /// 草稿从**落盘的真值**起。起错了的症状是「用户改成 debug,重开设置又
+    /// 显示默认档」—— 而他只要这时点确定,改过的选择就被假初值覆盖回去了。
+    ///
+    /// 自证会变红:把 `from_settings` 里那行改成写死的 `LogLevel::Info`。
+    #[test]
+    fn the_draft_starts_from_the_stored_log_level() {
+        let s = mullion_store::Settings {
+            log_level: mullion_store::LogLevel::Error,
+            ..Default::default()
+        };
+        assert_eq!(
+            SettingsDraft::from_settings(&s).log_level,
+            mullion_store::LogLevel::Error
+        );
+        assert_eq!(
+            SettingsDraft::from_settings(&mullion_store::Settings::default()).log_level,
+            mullion_store::LogLevel::Info,
+            "默认档不是 info"
+        );
+    }
+
+    /// 三档的标签必须两两不同。撞了的话下拉里出现两行一样的字,
+    /// 用户点哪一行都像没反应,而所有断言「文案出现过」的测试照绿。
+    #[test]
+    fn the_three_level_labels_are_distinct() {
+        let all = [LEVEL_ERROR_LABEL, LEVEL_INFO_LABEL, LEVEL_DEBUG_LABEL];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "两档标签撞了");
+            }
+            assert!(!a.is_empty(), "有一档的标签是空的");
+        }
+        assert_eq!(
+            level_label(mullion_store::LogLevel::Error),
+            LEVEL_ERROR_LABEL
+        );
+        assert_eq!(level_label(mullion_store::LogLevel::Info), LEVEL_INFO_LABEL);
+        assert_eq!(
+            level_label(mullion_store::LogLevel::Debug),
+            LEVEL_DEBUG_LABEL
+        );
+    }
+
+    /// 说明文字必须点破「环境变量会盖过这里的选择」。不说的话,带着
+    /// `MULLION_LOG=debug` 启动的用户在这儿选了「只记错误」、日志却照旧,
+    /// 这是个查无可查的问题 —— 设置文件里存的确实是他选的那个值。
+    #[test]
+    fn the_hint_admits_that_the_environment_variable_wins() {
+        let mut d = draft();
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s.contains("MULLION_LOG")),
+            "没说明环境变量会覆盖:{texts:?}"
         );
     }
 }
