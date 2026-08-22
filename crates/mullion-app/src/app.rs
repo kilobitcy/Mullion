@@ -2221,7 +2221,50 @@ impl App {
                     "主密码已取消,回到系统钥匙串",
                 );
             }
+            // F155:设置里点了导出。置位交给每帧的 `drain_export_log_request`
+            // 统一处理 —— 两个入口(菜单/设置)共用同一条路径,不复制一遍。
+            O::ExportLog => {
+                self.ui.export_log_request = true;
+            }
         }
+    }
+
+    /// F155:把 `mullion.log` 脱敏后另存一份,并把路径告诉用户。
+    ///
+    /// **同步读写、在主线程上做**:日志文件上限 8MB(debug 档 64MB),
+    /// 一次读+写在本机盘上是几十毫秒,而这是用户点了按钮等着看结果的动作 ——
+    /// 为它开一条 task 换来的是「点完什么都没发生,过一会儿状态栏突然变了」。
+    /// 落在 `Stage::StoreIo` 里,卡住的话看门狗会说出来。
+    fn drain_export_log_request(&mut self) {
+        if !std::mem::take(&mut self.ui.export_log_request) {
+            return;
+        }
+        diag::mark(diag::Stage::StoreIo);
+        // 缓冲里可能还压着刚刚那几行,先刷下去,否则导出的副本缺最后一段。
+        crate::logx::flush_now();
+        let done = crate::logx::log_path()
+            .ok_or_else(|| "定位不到日志文件".to_string())
+            .and_then(|src| {
+                let text = std::fs::read_to_string(&src).map_err(|e| format!("读不出日志({e})"))?;
+                let mut r = crate::redact::Redactor::new();
+                let mut out = crate::redact::header();
+                for line in text.lines() {
+                    out.push_str(&r.line(line));
+                    out.push('\n');
+                }
+                let dst = src.with_file_name("mullion-redacted.log");
+                std::fs::write(&dst, out).map_err(|e| format!("写不出副本({e})"))?;
+                Ok(dst)
+            });
+        match done {
+            Ok(dst) => {
+                let msg = format!("已导出脱敏日志:{}", dst.display());
+                crate::logx::line(&msg);
+                self.ui.set_error(msg);
+            }
+            Err(e) => self.ui.set_error(format!("导出脱敏日志失败:{e}")),
+        }
+        self.ui_dirty = true;
     }
 
     /// F71:跑一次主密码改动,收尾交给 [`finish_password_change`]。
@@ -8016,6 +8059,9 @@ impl ApplicationHandler<UserEvent> for App {
                             if std::mem::take(&mut self.ui.history_request) {
                                 self.open_history_dialog();
                             }
+                            // F155:导出脱敏日志。两个入口(菜单/设置)共用
+                            // 这一条施加路径,见 `drain_export_log_request`。
+                            self.drain_export_log_request();
                             // 点了 pane 标题条的「换节点」:开弹窗,真正换在
                             // 用户选完之后。**只开弹窗,不预判节点** —— 这一步
                             // 没有任何默认答案可猜。
@@ -10735,19 +10781,24 @@ mod tests {
     /// F121:拖拽排序落盘走的也是 keyring/TOML 同步 IO,跟删除/保存/移动分组
     /// 同一条门槛——漏算的话看门狗测不出这条路径可能阻塞事件循环。
     ///
+    /// **锚点是先找 `if`、再从那之后找 `diag::mark`**(不是反过来):F155 在
+    /// `drain_export_log_request` 里加了另一处合法的
+    /// `diag::mark(diag::Stage::StoreIo);`,且它在源码里排在这个 `if` 之前 ——
+    /// 反过来找(先 `find` mark 再 `rfind` if)会截到那一处不相关的打点。
+    ///
     /// 自证会变红:把 `diag::mark(diag::Stage::StoreIo)` 前面那个 `if` 里的
     /// `self.ui.reorder_request.is_some()` 删掉。
     #[test]
     fn dragging_a_session_is_marked_as_store_io_for_the_watchdog() {
         let src = include_str!("app.rs");
-        let idx = src
+        let start = src
+            .find("if self.ui.delete_request.is_some()")
+            .expect("找不到打点前面那个 if 的开头");
+        let after = &src[start..];
+        let idx = after
             .find("diag::mark(diag::Stage::StoreIo);")
             .expect("找不到 StoreIo 打点");
-        let before = &src[..idx];
-        let start = before
-            .rfind("if self.ui.delete_request.is_some()")
-            .expect("找不到打点前面那个 if 的开头");
-        let cond = &src[start..idx];
+        let cond = &after[..idx];
         assert!(
             cond.contains("self.ui.save_request.is_some()"),
             "切歪了 —— 下面那条断言会空过"
@@ -16733,6 +16784,39 @@ mod tests {
                 "同步块计数接线 `{needle}` 没接进事件循环 —— 剖面里这一列会恒为零"
             );
         }
+    }
+
+    /// F155:`drain_export_log_request` 必须**既被定义、也被调用**。
+    ///
+    /// 只定义不调用 → 用户点了「导出脱敏日志…」没反应;只置位不消费(反过来,
+    /// 万一以后有人把调用点删掉但留着方法)→ `export_log_request` 这个 bool
+    /// 永远是 `true`,之后随便哪一帧都会再导一次(而且第一次点击也不会有
+    /// 任何反馈,因为消费点根本没跑到)。
+    ///
+    /// 同 `the_frame_profile_hooks_are_all_wired_into_the_event_loop`:只搜
+    /// `mod tests` 之前的那一段源码,否则 needle 会命中这条测试自己。
+    ///
+    /// 自证会变红:删掉 `fn drain_export_log_request` 的定义(第一条断言红),
+    /// 或删掉事件循环里 `self.drain_export_log_request();` 那句调用(第二条红)。
+    #[test]
+    fn drain_export_log_request_is_both_defined_and_called() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面每条断言都会恒真"
+        );
+        assert!(
+            prod.contains("fn drain_export_log_request(&mut self) {"),
+            "drain_export_log_request 没有被定义"
+        );
+        assert!(
+            prod.contains("self.drain_export_log_request();"),
+            "drain_export_log_request 定义了但事件循环里没调用 —— 用户点了导出没反应"
+        );
     }
 
     /// 重绘归因传的两个布尔,必须与 `frame_is_dirty` 收到的是**同一对**。

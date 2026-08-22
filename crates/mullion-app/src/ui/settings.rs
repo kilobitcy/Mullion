@@ -127,6 +127,9 @@ pub enum SettingsOut {
     SetPassword,
     /// F71:按了「取消主密码」。回到钥匙串方案。
     ClearPassword,
+    /// F155:按了「导出脱敏日志」。真正的读盘/写盘由 `app.rs` 做 —— 弹窗这一层
+    /// 零 IO。**弹窗不关**:导出是个附带动作,用户多半还要接着改别的。
+    ExportLog,
 }
 
 /// 画设置弹窗。返回这一帧的结论。
@@ -149,7 +152,7 @@ pub fn show(
             form::section(ui, t, "设置", "远端", &mut first);
             remote(ui, t, draft, &mut out);
             form::section(ui, t, "设置", "诊断", &mut first);
-            diagnostics(ui, t, draft);
+            diagnostics(ui, t, draft, &mut out);
             form::section(ui, t, "设置", "安全", &mut first);
             security(ui, t, draft, env, &mut out);
             form::section(ui, t, "设置", "快捷键", &mut first);
@@ -311,12 +314,11 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
     ui.add_space(SP_M);
 }
 
-/// 诊断分节(F155):日志详细度。
+/// 诊断分节(F155):日志详细度 + 导出脱敏日志。
 ///
 /// 走 `form::grid` 两列骨架(规范 #1),说明文字挂**输入列**、标签列留空
-/// (规范 #6)。本 task 没有会改变输出的控件(回写 `Settings` 与施加到
-/// log facade 在 `app.rs` 的「确定」分支里做),所以不接 `out` 参数。
-fn diagnostics(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft) {
+/// (规范 #6)。
+fn diagnostics(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut SettingsOut) {
     let avail = ui.available_width();
     form::grid(ui, "settings_diagnostics", |ui| {
         ui.label("日志详细度");
@@ -352,6 +354,19 @@ fn diagnostics(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft) {
         );
         ui.end_row();
     });
+    ui.add_space(SP_M);
+    if ui.button("导出脱敏日志…").clicked() {
+        *out = SettingsOut::ExportLog;
+    }
+    // 脱敏是**尽力而为的模式匹配**，不是「导出即安全」——对外发送前
+    // 请自己再看一眼(同 `redact` 模块文档顶部那句如实陈述)。
+    ui.label(
+        egui::RichText::new(
+            "脱敏是尽力而为的模式匹配，覆盖不到的写法会漏，对外发送前请自己再看一眼。",
+        )
+        .size(11.0)
+        .color(theme::c32(t.fg_dim)),
+    );
     ui.add_space(SP_M);
 }
 
@@ -989,6 +1004,31 @@ mod tests {
         assert!(
             texts.iter().any(|s| s.contains("MULLION_LOG")),
             "没说明环境变量会覆盖:{texts:?}"
+        );
+    }
+
+    /// F155:诊断分节里必须有「导出脱敏日志…」按钮,点了要回报
+    /// `SettingsOut::ExportLog`(真正的读盘/写盘由 `app.rs` 做)。
+    ///
+    /// 第二条断言是这个功能的诚信底线:脱敏是尽力而为的模式匹配,不是
+    /// 「导出即安全」——按钮旁边必须如实说清楚,否则用户会把这份「脱敏」
+    /// 日志当成真的安全就往外发。
+    ///
+    /// 自证会变红:把 `diagnostics` 里 `*out = SettingsOut::ExportLog;`
+    /// 那一行删掉(第一条断言红);把那句「脱敏是尽力而为…」的提示删掉
+    /// (第二条断言红)。
+    #[test]
+    fn the_diagnostics_section_offers_export_and_admits_it_is_best_effort() {
+        let mut d = draft();
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s.contains("尽力而为")),
+            "没有说清楚脱敏是尽力而为的模式匹配,会给用户「导出即安全」的错觉:{texts:?}"
+        );
+        assert_eq!(
+            click(&mut d, "导出脱敏日志…"),
+            SettingsOut::ExportLog,
+            "按钮没有回报 ExportLog"
         );
     }
 }

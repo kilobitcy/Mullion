@@ -97,6 +97,12 @@ pub struct UiState {
     /// **不在这里直接建草稿**:建草稿要读 `layouts` 目录、还要查会话库把
     /// 已删会话的标签滤掉(D16),而 `ui/` 这一层零 IO。
     pub history_request: bool,
+    /// F155:菜单/设置里点了「导出脱敏日志…」→ `app.rs` 事后读日志文件、
+    /// 脱敏、另存。
+    ///
+    /// **不在这里直接导出**:要读整个日志文件再写一个新文件,而 `ui/` 这一层
+    /// 零 IO(同 `history_request`)。
+    pub export_log_request: bool,
     pub last_error: Option<String>,
     /// 用户是否关掉了当前这条错误卡片。**只该由 `set_error` 复位** ——
     /// 各处直接写 `last_error` 会绕过复位,导致关掉一次后再也看不到错误。

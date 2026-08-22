@@ -101,6 +101,12 @@ pub fn top_menu(
                         ui_state.files_sidebar_open = !ui_state.files_sidebar_open;
                         ui.close_menu();
                     }
+                    // F155:导出脱敏日志。常驻在这里 —— 用户在「把日志发我
+                    // 看看」这个语境下会先想到菜单,不会先想到去翻设置弹窗。
+                    if ui.button("导出脱敏日志…").clicked() {
+                        ui_state.export_log_request = true;
+                        ui.close_menu();
+                    }
                     // F84:设置弹窗(外观 + 快捷键一览)。原先这里挂着两条
                     // 置灰占位,「快捷键」那条不再单独出现 —— 一览表就在设置
                     // 弹窗里,再给它一个入口只会让人以为是两个不同的东西。
@@ -536,6 +542,33 @@ mod tests {
         assert!(
             src.contains("\n                    if ui.button(\"恢复上次的现场…\").clicked() {"),
             "「会话」菜单里没有恢复现场的常驻入口 —— 点过一次「不恢复」就再也回不去了"
+        );
+    }
+
+    /// F155:「配置」菜单里必须留一个常驻的「导出脱敏日志…」入口 —— 只放设置
+    /// 弹窗里的话,用户在「把日志发我看看」这个语境下找不到它。
+    ///
+    /// **扎的是源码结构**(菜单项要展开 `menu_button` 才画得出来,跑帧测不到),
+    /// 且**先切掉测试模块**再找 needle —— `include_str!` 拿到的是含这条测试
+    /// 自己的全文,不切的话 needle 字面量写在测试体里就已经让 `contains`
+    /// 恒真了(本项目记过这个恒绿模式)。`str::split` 找不到分隔符时会把整串
+    /// 原样还回来,所以额外钉一条「切完确实变短了」的兜底。
+    ///
+    /// 自证会变红:把 `chrome.rs` 里「导出脱敏日志…」那个菜单项删掉。
+    #[test]
+    fn the_settings_menu_has_a_permanent_entry_to_export_the_redacted_log() {
+        let src = include_str!("chrome.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面这条断言会恒真"
+        );
+        assert!(
+            prod.contains("if ui.button(\"导出脱敏日志…\").clicked() {"),
+            "「配置」菜单里没有导出脱敏日志的常驻入口"
         );
     }
 
