@@ -121,6 +121,161 @@ pub fn fmt_us(us: u64) -> String {
     }
 }
 
+/// 一个 5 秒窗口里采到的全部东西。
+///
+/// **纯数据**：由 `diag.rs` 的周期线程从各个原子计数器 drain 出来填好，
+/// 再交给 [`render_line`]。分成两步是为了让「这一行长什么样」可以脱离
+/// 线程、时钟和全局状态单测 —— 剖面行本身是要被人读的产物，格式错了
+/// （单位漏了、零值省略了、跨行了）编译器一句话都不会说。
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// 这个窗口有多长（ms）。周期线程受调度影响不会正好 5000。
+    pub window_ms: u64,
+    pub frames: u64,
+    pub presents: u64,
+    pub skipped: u64,
+    pub inbound_bytes: u64,
+    /// 重绘触发原因：只有终端来了字节 / 只有 egui 要重绘 / 两者都有。
+    pub redraw_terminal: u64,
+    pub redraw_ui: u64,
+    pub redraw_both: u64,
+    /// 被帧闸挡下的重绘次数（T3 的直接体感指标）。
+    pub throttled: u64,
+    /// 按键次数。
+    pub keys: u64,
+    /// 「按键 → 下一段入站字节抵达」的间隔分布。**是回显往返的近似**，
+    /// 见 `diag::note_key` 的说明。
+    pub echo_us: Counts,
+    /// 整帧耗时分布。
+    pub frame_us: Counts,
+    /// 逐阶段驻留时长分布，索引 = `diag::Stage as usize`。
+    pub stage_us: StageCounts,
+    pub connects_ok: u64,
+    pub connects_err: u64,
+    pub reconnects: u64,
+    pub sftp_ops: u64,
+    pub tabs: u64,
+    pub panes: u64,
+    pub hosts: u64,
+    pub mem_process_mb: u64,
+}
+
+/// 逐阶段计数。长度与 `diag::Stage` 的变体数一致。
+pub type StageCounts = [Counts; crate::diag::STAGE_COUNT];
+
+impl Snapshot {
+    /// 一份全零的快照。
+    pub fn empty() -> Self {
+        Self {
+            window_ms: 0,
+            frames: 0,
+            presents: 0,
+            skipped: 0,
+            inbound_bytes: 0,
+            redraw_terminal: 0,
+            redraw_ui: 0,
+            redraw_both: 0,
+            throttled: 0,
+            keys: 0,
+            echo_us: [0; BUCKETS],
+            frame_us: [0; BUCKETS],
+            stage_us: [[0; BUCKETS]; crate::diag::STAGE_COUNT],
+            connects_ok: 0,
+            connects_err: 0,
+            reconnects: 0,
+            sftp_ops: 0,
+            tabs: 0,
+            panes: 0,
+            hosts: 0,
+            mem_process_mb: 0,
+        }
+    }
+
+    /// 这个窗口里什么都没发生。
+    ///
+    /// 判据只看「有没有画过帧 / 有没有收过字节 / 有没有按过键 / 有没有连接
+    /// 或 SFTP 动作」—— 标签数、内存这类**状态量**在空闲时也非零，拿它们
+    /// 判活会让空闲的 mullion 每 5 秒写一次盘，笔记本硬盘永远睡不下去。
+    pub fn is_idle(&self) -> bool {
+        self.frames == 0
+            && self.inbound_bytes == 0
+            && self.keys == 0
+            && self.connects_ok == 0
+            && self.connects_err == 0
+            && self.reconnects == 0
+            && self.sftp_ops == 0
+    }
+}
+
+/// 把一个窗口渲染成**一行**日志。`None` = 这个窗口空闲，不该写。
+///
+/// 单行是硬要求：日志按行 grep，一条记录跨行就没法用
+/// `grep profile mullion.log` 拉出时间序列。
+pub fn render_line(s: &Snapshot) -> Option<String> {
+    if s.is_idle() {
+        return None;
+    }
+    let secs = (s.window_ms as f64 / 1000.0).max(0.001);
+    let bps = s.inbound_bytes as f64 / secs;
+    let rate = if bps >= 1024.0 {
+        format!("{:.1}KB/s", bps / 1024.0)
+    } else {
+        format!("{bps:.0}B/s")
+    };
+    // 阶段按「样本数 × p95」倒序取前四段 —— 全列出来一行有十二段，人眼
+    // 扫不动，而排在后面的那些恒定是零。
+    let mut stages: Vec<(usize, u64, u64)> = s
+        .stage_us
+        .iter()
+        .enumerate()
+        .map(|(k, c)| (k, total(c), quantile_us(c, 0.95)))
+        .filter(|(_, n, _)| *n > 0)
+        .collect();
+    stages.sort_by_key(|(_, n, p95)| std::cmp::Reverse(n.saturating_mul(*p95)));
+    stages.truncate(4);
+    let stage_part = stages
+        .iter()
+        .map(|(k, n, p95)| {
+            format!(
+                "{}={}x/p95={}",
+                crate::diag::stage_name(*k as u8),
+                n,
+                fmt_us(*p95)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Some(format!(
+        "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
+         redraw=term:{}/ui:{}/both:{} in={} key={}x/echo_p95={} {} \
+         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
+        secs,
+        s.frames,
+        fmt_us(quantile_us(&s.frame_us, 0.5)),
+        fmt_us(quantile_us(&s.frame_us, 0.95)),
+        fmt_us(quantile_us(&s.frame_us, 1.0)),
+        s.presents,
+        s.skipped,
+        s.throttled,
+        s.redraw_terminal,
+        s.redraw_ui,
+        s.redraw_both,
+        rate,
+        s.keys,
+        fmt_us(quantile_us(&s.echo_us, 0.95)),
+        stage_part,
+        s.connects_ok,
+        s.connects_err,
+        s.reconnects,
+        s.sftp_ops,
+        s.tabs,
+        s.panes,
+        s.hosts,
+        s.mem_process_mb,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +393,119 @@ mod tests {
         assert_eq!(fmt_us(999), "999us");
         assert_eq!(fmt_us(1_000), "1.0ms");
         assert_eq!(fmt_us(16_500), "16.5ms");
+    }
+
+    fn busy_snapshot() -> Snapshot {
+        let mut s = Snapshot {
+            window_ms: 5_000,
+            frames: 300,
+            presents: 298,
+            skipped: 2,
+            inbound_bytes: 1_024_000,
+            redraw_terminal: 200,
+            redraw_ui: 80,
+            redraw_both: 20,
+            throttled: 40,
+            keys: 12,
+            connects_ok: 1,
+            sftp_ops: 3,
+            tabs: 2,
+            panes: 3,
+            hosts: 2,
+            mem_process_mb: 180,
+            ..Snapshot::empty()
+        };
+        s.frame_us[bucket_of(8_000)] = 300;
+        s
+    }
+
+    /// 空窗口（一帧没画、一个字节没收）**不该产出一行**。
+    ///
+    /// 没有这条，笔记本合盖前挂着的 mullion 会每 5 秒写一次盘，硬盘永远
+    /// 睡不下去 —— 这正是布局落盘已经踩过一次的坑。
+    ///
+    /// 自证会变红：把 `Snapshot::is_idle` 的函数体改成 `false`。
+    #[test]
+    fn an_idle_window_produces_no_line_at_all() {
+        let idle = Snapshot {
+            window_ms: 5_000,
+            ..Snapshot::empty()
+        };
+        assert!(idle.is_idle());
+        assert!(render_line(&idle).is_none(), "空闲窗口不该写盘");
+        assert!(!busy_snapshot().is_idle());
+        assert!(render_line(&busy_snapshot()).is_some());
+    }
+
+    /// 「空闲」只看这个窗口里**发生过什么**，不看**此刻是什么状态**。
+    ///
+    /// 拿标签数/内存这类状态量判活的话，只要开着一个标签就永远不算空闲，
+    /// 上一条测试守的那件事会被静默绕过。
+    ///
+    /// 自证会变红：在 `is_idle` 的条件里加上 `&& self.tabs == 0`。
+    #[test]
+    fn having_tabs_open_is_not_activity() {
+        let parked = Snapshot {
+            window_ms: 5_000,
+            tabs: 3,
+            panes: 5,
+            hosts: 2,
+            mem_process_mb: 200,
+            ..Snapshot::empty()
+        };
+        assert!(parked.is_idle(), "挂着不动也被算成了活动 —— 硬盘会永远醒着");
+    }
+
+    /// 一行里必须同时有「多快」和「慢在哪一段」。只报总帧耗时的话，
+    /// 看到 p95=200ms 也说不出该去优化 pump 还是 present。
+    #[test]
+    fn the_line_carries_both_the_frame_time_and_the_per_stage_breakdown() {
+        let mut s = busy_snapshot();
+        s.stage_us[crate::diag::Stage::Pump as usize][bucket_of(50_000)] = 100;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("frame"), "没报帧耗时：{line}");
+        assert!(line.contains("p95"), "没报分位数：{line}");
+        assert!(line.contains("pump="), "没报阶段耗时：{line}");
+    }
+
+    /// 剖面行是给人扫的，一行里的数字必须带单位与量纲；而且**不能换行**
+    /// —— 日志按行 grep，一条记录跨行就没法用 `grep profile` 拉出时间序列。
+    #[test]
+    fn the_line_is_single_line_and_units_are_explicit() {
+        let line = render_line(&busy_snapshot()).expect("忙窗口该有一行");
+        assert!(!line.contains('\n'), "剖面行不许换行：{line}");
+        assert!(
+            line.contains("KB/s") || line.contains("B/s"),
+            "吞吐没带单位：{line}"
+        );
+    }
+
+    /// 跳帧数为 0 时也要**显式写出来**。省略掉的话，「这个窗口没跳帧」与
+    /// 「这个版本忘了统计跳帧」在日志里长得一模一样。
+    #[test]
+    fn a_zero_count_is_printed_rather_than_omitted() {
+        let mut s = busy_snapshot();
+        s.skipped = 0;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("skip=0"), "零值被省略了：{line}");
+    }
+
+    /// 吞吐是**速率**，不是这个窗口的字节总数：窗口被调度拖长时，同样的
+    /// 字节数应该报出更小的速率。不除以时长的话，「远端安静了但线程被
+    /// 挂了 10 秒」会显示成吞吐翻倍。
+    ///
+    /// 自证会变红：把 `render_line` 里的 `s.inbound_bytes as f64 / secs`
+    /// 改成 `s.inbound_bytes as f64`。
+    #[test]
+    fn throughput_is_a_rate_so_a_longer_window_reports_less() {
+        let short = busy_snapshot();
+        let long = Snapshot {
+            window_ms: 20_000,
+            ..busy_snapshot()
+        };
+        let a = render_line(&short).expect("有一行");
+        let b = render_line(&long).expect("有一行");
+        assert!(a.contains("200.0KB/s"), "5 秒窗口的速率不对：{a}");
+        assert!(b.contains("50.0KB/s"), "20 秒窗口没按时长摊开：{b}");
     }
 }

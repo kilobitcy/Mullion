@@ -121,6 +121,26 @@ static PRESENTS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
 static INBOUND_BYTES: AtomicU64 = AtomicU64::new(0);
 
+// F155 剖面用的计数器。采集端只做原子加法 —— 帧路径上做别的就是 T3。
+static REDRAW_TERMINAL: AtomicU64 = AtomicU64::new(0);
+static REDRAW_UI: AtomicU64 = AtomicU64::new(0);
+static REDRAW_BOTH: AtomicU64 = AtomicU64::new(0);
+static THROTTLED: AtomicU64 = AtomicU64::new(0);
+static KEYS: AtomicU64 = AtomicU64::new(0);
+static CONNECTS_OK: AtomicU64 = AtomicU64::new(0);
+static CONNECTS_ERR: AtomicU64 = AtomicU64::new(0);
+static RECONNECTS: AtomicU64 = AtomicU64::new(0);
+static SFTP_OPS: AtomicU64 = AtomicU64::new(0);
+/// 状态量(此刻是多少),不是「这窗口发生了几次」—— 采集时读而不清。
+static TABS: AtomicU64 = AtomicU64::new(0);
+static PANES: AtomicU64 = AtomicU64::new(0);
+static HOSTS: AtomicU64 = AtomicU64::new(0);
+
+static FRAME_US: crate::profile::Histogram = crate::profile::Histogram::new();
+static ECHO_US: crate::profile::Histogram = crate::profile::Histogram::new();
+/// 最后一次按键的时刻(µs)。0 = 还没按过 / 已被下一段入站字节消费掉。
+static LAST_KEY_US: AtomicU64 = AtomicU64::new(0);
+
 fn elapsed_us() -> u64 {
     ORIGIN.get().map_or(0, |o| o.elapsed().as_micros() as u64)
 }
@@ -156,6 +176,73 @@ pub fn count_skipped() {
 }
 pub fn count_inbound(bytes: usize) {
     INBOUND_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// 整帧耗时(从 redraw 入口到 present 结束)。
+pub fn record_frame_us(us: u64) {
+    FRAME_US.record_us(us);
+}
+
+/// 这一帧的重绘是被谁触发的。三类分开计,才看得出「远端安静时 egui 还在
+/// 每秒要几十次重绘」这种白烧 GPU 的情况。
+pub fn count_redraw(terminal: bool, ui: bool) {
+    match (terminal, ui) {
+        (true, true) => &REDRAW_BOTH,
+        (true, false) => &REDRAW_TERMINAL,
+        (false, true) => &REDRAW_UI,
+        // 两边都不脏时事件循环不会走到这里;真走到了也不该计进任何一类。
+        (false, false) => return,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
+/// 一次重绘被帧闸挡下(T3 的直接体感指标)。
+pub fn count_throttled() {
+    THROTTLED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 用户按下了一个会发往远端的键。记下时刻,等下一段入站字节来时算回显往返。
+///
+/// **这是近似**:连续打字时,第 N 个键的回显可能在第 N+1 个键之后才到,
+/// 那样量到的是一个偏小的值;反过来,远端自己吐的输出(比如 `top` 刷新)
+/// 也会被当成回显,同样偏小。它回答不了「精确延迟是多少」,能回答的是
+/// 「这条链路的回显是十毫秒级还是几百毫秒级」——而后者正是高延迟代理
+/// 链路上要看的量级。精确做法要给每个按键打序号并等它原样回来,那需要
+/// 在 VT 层做匹配,是另一片的工作量。
+pub fn note_key() {
+    KEYS.fetch_add(1, Ordering::Relaxed);
+    LAST_KEY_US.store(elapsed_us(), Ordering::Relaxed);
+}
+
+/// 有入站字节抵达。若在此之前有一次未被消费的按键,记一次回显往返。
+pub fn note_inbound_for_echo() {
+    let key_us = LAST_KEY_US.swap(0, Ordering::Relaxed);
+    if key_us > 0 {
+        ECHO_US.record_us(elapsed_us().saturating_sub(key_us));
+    }
+}
+
+pub fn count_connect(ok: bool) {
+    if ok {
+        CONNECTS_OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CONNECTS_ERR.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn count_reconnect() {
+    RECONNECTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn count_sftp_op() {
+    SFTP_OPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 此刻的规模。App 每帧调一次(三条 relaxed 原子存,可忽略)。
+pub fn set_scale(tabs: usize, panes: usize, hosts: usize) {
+    TABS.store(tabs as u64, Ordering::Relaxed);
+    PANES.store(panes as u64, Ordering::Relaxed);
+    HOSTS.store(hosts as u64, Ordering::Relaxed);
 }
 
 /// 卡住多久之后才第一次报警。低于这个值的都是正常的长帧。
@@ -322,25 +409,53 @@ fn watchdog_loop(stall_ms: u64) {
         }
 
         if now_us.saturating_sub(last_metrics) >= METRICS_EVERY_MS * 1000 {
+            let window_ms = now_us.saturating_sub(last_metrics) / 1000;
             last_metrics = now_us;
-            // debug 级:默认不开,排查时 `MULLION_LOG=debug` 就能拿到完整时间线。
-            if log::log_enabled!(target: "mullion", log::Level::Debug) {
-                let mem = sample_memory()
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "内存采样不可用".into());
-                log::debug!(
-                    target: "mullion",
-                    "心跳 t={}s 阶段={} 帧={} present={} 跳帧={} 入站={}KB {mem}",
-                    now_us / 1_000_000,
-                    stage_name(stage),
-                    FRAMES.load(Ordering::Relaxed),
-                    PRESENTS.load(Ordering::Relaxed),
-                    SKIPPED.load(Ordering::Relaxed),
-                    INBOUND_BYTES.load(Ordering::Relaxed) / 1024,
-                );
+            // **info 级**:这一行就是本切片存在的理由,默认档位下必须有。
+            // 逐事件细节仍在 debug 级。
+            if log::log_enabled!(target: "mullion", log::Level::Info) {
+                if let Some(line) = crate::profile::render_line(&take_snapshot(window_ms)) {
+                    log::info!(target: "mullion", "{line}");
+                }
             }
         }
     }
+}
+
+/// 把这一窗口的所有计数器**取走**,凑成一份快照。
+///
+/// 计次量全部 `swap(0)` / `drain()`:剖面报的是「这 5 秒」,不是自启动以来
+/// 的累计 —— 累计值会被启动那几秒的尖峰永久污染,跑了一小时之后 p95
+/// 反映的还是一小时前的事。
+///
+/// 状态量(tabs/panes/hosts)读而不清:它们描述的是「此刻有几个标签」,
+/// 不是「这 5 秒发生了几次」。
+fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
+    let mut s = crate::profile::Snapshot::empty();
+    s.window_ms = window_ms;
+    s.frames = FRAMES.swap(0, Ordering::Relaxed);
+    s.presents = PRESENTS.swap(0, Ordering::Relaxed);
+    s.skipped = SKIPPED.swap(0, Ordering::Relaxed);
+    s.inbound_bytes = INBOUND_BYTES.swap(0, Ordering::Relaxed);
+    s.redraw_terminal = REDRAW_TERMINAL.swap(0, Ordering::Relaxed);
+    s.redraw_ui = REDRAW_UI.swap(0, Ordering::Relaxed);
+    s.redraw_both = REDRAW_BOTH.swap(0, Ordering::Relaxed);
+    s.throttled = THROTTLED.swap(0, Ordering::Relaxed);
+    s.keys = KEYS.swap(0, Ordering::Relaxed);
+    s.echo_us = ECHO_US.drain();
+    s.frame_us = FRAME_US.drain();
+    for (k, h) in CLOCK.hist.iter().enumerate() {
+        s.stage_us[k] = h.drain();
+    }
+    s.connects_ok = CONNECTS_OK.swap(0, Ordering::Relaxed);
+    s.connects_err = CONNECTS_ERR.swap(0, Ordering::Relaxed);
+    s.reconnects = RECONNECTS.swap(0, Ordering::Relaxed);
+    s.sftp_ops = SFTP_OPS.swap(0, Ordering::Relaxed);
+    s.tabs = TABS.load(Ordering::Relaxed);
+    s.panes = PANES.load(Ordering::Relaxed);
+    s.hosts = HOSTS.load(Ordering::Relaxed);
+    s.mem_process_mb = sample_memory().map_or(0, |m| m.process_bytes / (1024 * 1024));
+    s
 }
 
 #[cfg(test)]
