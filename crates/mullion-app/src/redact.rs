@@ -56,7 +56,7 @@ impl Redactor {
     /// 见过的原始值,哪怕这一行里原样裸露出现、没有任何标记,也要换成
     /// 同一个假名 —— 不然「同一台机器这一小时重连了 17 次」这类跨行模式,
     /// 一旦某一行只写了裸主机名就串不起来了。
-    fn replace_known_bare_tokens(&self, s: &str) -> String {
+    fn replace_known_bare_tokens(&mut self, s: &str) -> String {
         if self.map.is_empty() {
             return s.to_string();
         }
@@ -71,8 +71,9 @@ impl Redactor {
                     j += 1;
                 }
                 let cand: String = cs[start..j].iter().collect();
-                if let Some(alias) = self.map.get(&cand) {
-                    out.push_str(alias);
+                if self.map.contains_key(&cand) {
+                    let alias = self.alias("host", &cand);
+                    out.push_str(&alias);
                     i = j;
                     continue;
                 }
