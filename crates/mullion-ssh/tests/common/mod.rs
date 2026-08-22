@@ -85,8 +85,14 @@ impl Handler for EchoHandler {
 /// 在 127.0.0.1:0 起 echo server,返回实际监听地址。随进程/运行时结束回收。
 #[allow(dead_code)]
 pub async fn spawn_echo_server() -> std::net::SocketAddr {
-    let host_key =
-        russh::keys::load_secret_key("tests/fixtures/server_hostkey", None).expect("load hostkey");
+    spawn_echo_server_with_hostkey("tests/fixtures/server_hostkey").await
+}
+
+/// 指定主机密钥的 echo server。要在**同一个** 127.0.0.1 上摆出两台指纹不同的
+/// 主机时用(F3-a 的键冲突测试)。
+#[allow(dead_code)]
+pub async fn spawn_echo_server_with_hostkey(key_path: &str) -> std::net::SocketAddr {
+    let host_key = russh::keys::load_secret_key(key_path, None).expect("load hostkey");
     let mut config = russh::server::Config::default();
     config.keys.push(host_key);
     let config = Arc::new(config);

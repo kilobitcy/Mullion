@@ -17,6 +17,8 @@ use crate::app::UserEvent;
 /// 一次待用户回答的主机密钥确认。经 `UserEvent::HostKeyPrompt` 送到 GUI 线程,
 /// 用户点完把 bool 从 `reply` 送回,握手线程随即恢复。
 pub struct HostKeyPrompt {
+    /// TOFU 表的键,也是弹窗上「主机」那一行 —— 非默认端口写成
+    /// `[host]:port`(`mullion_ssh::known_hosts::host_key_id`)。
     pub host: String,
     /// 形如 `ssh-ed25519`,供用户核对时对上 `ssh-keygen -lf` 的输出。
     pub algo: String,
@@ -40,8 +42,11 @@ pub enum HostKeyCheck {
 }
 
 /// F3 的全部判断逻辑(纯函数,见模块头注释)。
-pub fn check(known: &KnownHostsFile, host: &str, fingerprint: &str) -> HostKeyCheck {
-    match known.get(host) {
+///
+/// `host_id` 是 ssh 层组好的端点键(含非默认端口),原样当表键用 ——
+/// 这里再做任何加工都会让写入与读取的拼法漂移。
+pub fn check(known: &KnownHostsFile, host_id: &str, fingerprint: &str) -> HostKeyCheck {
+    match known.get(host_id) {
         Some(e) if e.fingerprint == fingerprint => HostKeyCheck::Trusted,
         Some(e) => HostKeyCheck::NeedsPrompt {
             previous: Some(e.clone()),
@@ -80,7 +85,7 @@ impl PromptingPolicy {
 impl HostKeyPolicy for PromptingPolicy {
     fn decide<'a>(
         &'a self,
-        host: &'a str,
+        host_id: &'a str,
         algo: &'a str,
         fp: &'a Fingerprint,
     ) -> HostKeyFuture<'a> {
@@ -95,7 +100,7 @@ impl HostKeyPolicy for PromptingPolicy {
         // panic-safe,中毒后继续用不会读到半成品,选择恢复而不是 expect。
         let outcome_of_check = {
             let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
-            check(&known, host, &text)
+            check(&known, host_id, &text)
         };
         let previous = match outcome_of_check {
             HostKeyCheck::Trusted => {
@@ -106,7 +111,7 @@ impl HostKeyPolicy for PromptingPolicy {
         // 用户不同意 / 弹窗送不到 / GUI 先退出时的统一拒绝理由。
         let rejection = match &previous {
             Some(e) => HostKeyOutcome::Changed {
-                host: host.to_owned(),
+                host: host_id.to_owned(),
                 // 存档里是文本;解析不出(文件被手改坏)只影响错误消息里的展示,
                 // 不影响「拒绝」这个判定本身。
                 expected: Fingerprint::parse_ssh(&e.fingerprint)
@@ -114,7 +119,7 @@ impl HostKeyPolicy for PromptingPolicy {
                 got: fp.clone(),
             },
             None => HostKeyOutcome::Unknown {
-                host: host.to_owned(),
+                host: host_id.to_owned(),
                 got: fp.clone(),
             },
         };
@@ -125,7 +130,7 @@ impl HostKeyPolicy for PromptingPolicy {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .send_event(UserEvent::HostKeyPrompt(Box::new(HostKeyPrompt {
-                host: host.to_owned(),
+                host: host_id.to_owned(),
                 algo: algo.to_owned(),
                 fingerprint: text,
                 previous,
@@ -164,7 +169,7 @@ impl TrustedOnlyPolicy {
 impl HostKeyPolicy for TrustedOnlyPolicy {
     fn decide<'a>(
         &'a self,
-        host: &'a str,
+        host_id: &'a str,
         _algo: &'a str,
         fp: &'a Fingerprint,
     ) -> HostKeyFuture<'a> {
@@ -173,21 +178,21 @@ impl HostKeyPolicy for TrustedOnlyPolicy {
         // 中毒后继续用也只是 `BTreeMap::get`,panic-safe。
         let outcome = {
             let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
-            check(&known, host, &text)
+            check(&known, host_id, &text)
         };
         let decision = match outcome {
             HostKeyCheck::Trusted => HostKeyDecision::Accept,
             HostKeyCheck::NeedsPrompt {
                 previous: Some(e), ..
             } => HostKeyDecision::Reject(HostKeyOutcome::Changed {
-                host: host.to_owned(),
+                host: host_id.to_owned(),
                 expected: Fingerprint::parse_ssh(&e.fingerprint)
                     .unwrap_or_else(|| Fingerprint(Vec::new())),
                 got: fp.clone(),
             }),
             HostKeyCheck::NeedsPrompt { previous: None } => {
                 HostKeyDecision::Reject(HostKeyOutcome::Unknown {
-                    host: host.to_owned(),
+                    host: host_id.to_owned(),
                     got: fp.clone(),
                 })
             }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use mullion_ssh::config::{AuthMethod, SshConfig};
 use mullion_ssh::error::ConnectError;
-use mullion_ssh::known_hosts::{Fingerprint, KnownHosts, TofuAccept};
+use mullion_ssh::known_hosts::{host_key_id, Fingerprint, KnownHosts, TofuAccept};
 use mullion_ssh::session::establish;
 
 fn cfg(addr: std::net::SocketAddr, auth: AuthMethod) -> SshConfig {
@@ -59,12 +59,14 @@ async fn pubkey_auth_succeeds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn changed_host_key_is_rejected() {
     // F3:预置一个不同指纹 → 连接必须 HostKeyChanged。
+    // 预置用的键必须跟 ssh 层实际查表用的拼法一致(F3-a:含端口),
+    // 否则记录压根命中不到,这条用例会变成「未知主机被自动记下」的假绿。
     let addr = common::spawn_echo_server().await;
     let known = Arc::new(Mutex::new(KnownHosts::new()));
-    known
-        .lock()
-        .unwrap()
-        .record(&addr.ip().to_string(), Fingerprint(vec![0xde, 0xad]));
+    known.lock().unwrap().record(
+        &host_key_id(&addr.ip().to_string(), addr.port()),
+        Fingerprint(vec![0xde, 0xad]),
+    );
     let policy = Arc::new(TofuAccept::new(known));
     let c = cfg(addr, AuthMethod::Password(common::TEST_PASSWORD.into()));
     match establish(&c, policy).await {

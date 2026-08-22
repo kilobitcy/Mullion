@@ -172,7 +172,10 @@ async fn advance(
             }
         }
         Hop::SshJump {
-            host, user, auth, ..
+            host,
+            port,
+            user,
+            auth,
         } => {
             let label = hop.endpoint();
             let fail = |cause: String| ConnectError::JumpFailed {
@@ -181,16 +184,28 @@ async fn advance(
             };
             // 跳板自己的 SSH 握手 + 认证。主机密钥同样过 policy(F3)。
             let handle = match stream {
-                DialStream::Tcp(s) => {
-                    crate::session::handshake_and_auth(s, host, user, auth, policy.clone(), None)
-                        .await
-                        .map_err(|e| fail(e.to_string()))?
-                }
-                DialStream::Channel(s) => {
-                    crate::session::handshake_and_auth(s, host, user, auth, policy.clone(), None)
-                        .await
-                        .map_err(|e| fail(e.to_string()))?
-                }
+                DialStream::Tcp(s) => crate::session::handshake_and_auth(
+                    s,
+                    host,
+                    *port,
+                    user,
+                    auth,
+                    policy.clone(),
+                    None,
+                )
+                .await
+                .map_err(|e| fail(e.to_string()))?,
+                DialStream::Channel(s) => crate::session::handshake_and_auth(
+                    s,
+                    host,
+                    *port,
+                    user,
+                    auth,
+                    policy.clone(),
+                    None,
+                )
+                .await
+                .map_err(|e| fail(e.to_string()))?,
             };
             // 在跳板上开一条通向下一站的转发通道。
             // originator 字段填本地占位:sshd 只记日志,不参与路由。

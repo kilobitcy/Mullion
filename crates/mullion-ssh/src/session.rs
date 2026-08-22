@@ -18,7 +18,10 @@ use crate::known_hosts::{Fingerprint, HostKeyDecision, HostKeyOutcome, HostKeyPo
 /// 必须 pub:establish/connect 是 pub 且签名里出现 Handle<ClientHandler>,私有类型出现在
 /// 公开接口会 E0446。字段保持私有 → 对外不透明。
 pub struct ClientHandler {
-    host: String,
+    /// TOFU 表的键(`known_hosts::host_key_id` 组出来的,含非默认端口),
+    /// **不是**裸主机名 —— 少了端口这一段,同一地址上的多台主机会共用一条
+    /// 记录并互相判对方为中间人(F3-a)。
+    host_id: String,
     policy: Arc<dyn HostKeyPolicy>,
     outcome: Arc<Mutex<Option<HostKeyOutcome>>>,
     /// `-R` 的回连出口(F112)。`None` = 这条连接没请求过远端转发。
@@ -73,7 +76,7 @@ impl client::Handler for ClientHandler {
         let algo = key.algorithm().to_string();
         // 弹窗策略会在这里挂起,等用户回答——sshd 的 LoginGraceTime(默认 120s)
         // 是这里能等多久的上限,超时对端会直接断开。
-        match self.policy.decide(&self.host, &algo, &fp).await {
+        match self.policy.decide(&self.host_id, &algo, &fp).await {
             HostKeyDecision::Accept => Ok(true),
             HostKeyDecision::Reject(o) => {
                 *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
@@ -244,8 +247,16 @@ pub async fn establish(
     policy: Arc<dyn HostKeyPolicy>,
 ) -> Result<SshConnection, ConnectError> {
     let dialed = crate::dial::dial(&cfg.hops, &cfg.host, cfg.port, policy.clone()).await?;
-    let handle =
-        handshake_and_auth(dialed.stream, &cfg.host, &cfg.user, &cfg.auth, policy, None).await?;
+    let handle = handshake_and_auth(
+        dialed.stream,
+        &cfg.host,
+        cfg.port,
+        &cfg.user,
+        &cfg.auth,
+        policy,
+        None,
+    )
+    .await?;
     Ok(SshConnection::new(handle, dialed.jumps))
 }
 
@@ -266,6 +277,7 @@ pub(crate) async fn establish_forwarding(
     let handle = handshake_and_auth(
         dialed.stream,
         &cfg.host,
+        cfg.port,
         &cfg.user,
         &cfg.auth,
         policy,
@@ -296,9 +308,14 @@ pub fn client_config() -> client::Config {
 ///
 /// `forwarded` 只有 `-R` 会给。跳板一律传 `None` —— 跳板上不该有回连,
 /// 万一来了,`ClientHandler` 会显式 `close()` 掉。
+///
+/// `port` 只为组 TOFU 键([`crate::known_hosts::host_key_id`])—— 流已经
+/// 建好了,连到哪不归这里管。它必须是**这一段连接**自己的端口:目标传目标的,
+/// 跳板传跳板的。传错/不传,同一地址上的多台主机就共用一条 TOFU 记录(F3-a)。
 pub(crate) async fn handshake_and_auth<S>(
     stream: S,
     host: &str,
+    port: u16,
     user: &str,
     auth: &AuthMethod,
     policy: Arc<dyn HostKeyPolicy>,
@@ -309,7 +326,7 @@ where
 {
     let outcome = Arc::new(Mutex::new(None));
     let handler = ClientHandler {
-        host: host.to_string(),
+        host_id: crate::known_hosts::host_key_id(host, port),
         policy,
         outcome: outcome.clone(),
         forwarded,
@@ -656,7 +673,7 @@ mod tests {
         let outcome = Arc::new(Mutex::new(None));
         (
             ClientHandler {
-                host: "h".into(),
+                host_id: "h".into(),
                 policy,
                 outcome: outcome.clone(),
                 forwarded: None,

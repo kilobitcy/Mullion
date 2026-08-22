@@ -7,6 +7,33 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+/// SSH 默认端口。键格式对它有特例(见 [`host_key_id`])。
+const DEFAULT_SSH_PORT: u16 = 22;
+
+/// TOFU 表的键:一台主机的**端点**标识,而不只是主机名。
+///
+/// 端口必须进键。否则「同一个 host、不同端口」的多台机器共用一条记录,
+/// 互相覆盖 —— 用户每换一台连,看到的都是最高危的「主机密钥已变更」,
+/// 而实际上没有任何东西变过(F3-a)。本机端口转发/跳板落地到 `127.0.0.1`
+/// 的用法一撞就中。
+///
+/// 拼法与 OpenSSH 的 `known_hosts` 一致:默认端口裸写 host,非默认端口写成
+/// `[host]:port`。两条理由:
+/// 1. 用户能拿自己的 `known_hosts` 逐条对照,不用学第二套写法;
+/// 2. v0.1.63 及以前存下的记录全是裸 host,等价于「22 端口」,继续命中 ——
+///    换成一律带端口会让整张表一次性失配,每台主机都退回「首次连接」。
+///
+/// 代价:v0.1.63 及以前用**非** 22 端口连过的主机,旧记录再也命中不到,
+/// 会重新问一次 TOFU。这是有意的 —— 那些旧记录恰恰是键冲突的受害者,
+/// 指纹属于谁已经说不清了,重新确认一次比继续信任它更安全。
+pub fn host_key_id(host: &str, port: u16) -> String {
+    if port == DEFAULT_SSH_PORT {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
 /// 主机密钥指纹。骨架用原始字节表示(真实为公钥的哈希摘要)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint(pub Vec<u8>);
@@ -120,9 +147,18 @@ pub type HostKeyFuture<'a> = Pin<Box<dyn Future<Output = HostKeyDecision> + Send
 ///
 /// 返回 Future:app 的弹窗版要在这里挂起,等 GUI 线程回答(F3)。
 pub trait HostKeyPolicy: Send + Sync {
+    /// `host_id` 是 [`host_key_id`] 组出来的**端点**键(非默认端口写成
+    /// `[host]:port`),直接拿它查/写 TOFU 表即可,别再自己拼一遍 ——
+    /// 拼法一旦漂移,同一台主机就会在表里占两条记录,TOFU 形同虚设。
+    /// 它也是展示给用户看的那个「主机」字段:带上端口正好消除歧义。
+    ///
     /// `algo` 形如 `ssh-ed25519`,只用于弹窗展示与人工核对。
-    fn decide<'a>(&'a self, host: &'a str, algo: &'a str, fp: &'a Fingerprint)
-        -> HostKeyFuture<'a>;
+    fn decide<'a>(
+        &'a self,
+        host_id: &'a str,
+        algo: &'a str,
+        fp: &'a Fingerprint,
+    ) -> HostKeyFuture<'a>;
 }
 
 /// TOFU 策略:未记录→记录并放行;一致→放行;不一致→拒(Changed)。
@@ -173,6 +209,36 @@ mod tests {
 
     fn fp(bytes: &[u8]) -> Fingerprint {
         Fingerprint(bytes.to_vec())
+    }
+
+    /// F3-a:同一个 host 上的不同端口必须是**不同的** TOFU 键。
+    ///
+    /// 真实症状:多台服务器经本机不同端口接入(`127.0.0.1:2222`、
+    /// `127.0.0.1:2223`…),键都退化成裸 `127.0.0.1`,互相覆盖 ——
+    /// 每换一台连就弹一次最高危的「主机密钥已变更(疑似中间人)」,
+    /// 而其实没有任何东西变过。
+    #[test]
+    fn different_ports_on_the_same_host_are_different_keys() {
+        assert_ne!(
+            host_key_id("127.0.0.1", 2222),
+            host_key_id("127.0.0.1", 2223),
+            "同 host 不同端口共用一条记录 = 两台机器互相判对方为中间人"
+        );
+    }
+
+    /// 键格式与 OpenSSH 的 `known_hosts` 对齐:默认端口裸 host,非默认端口
+    /// `[host]:port`。
+    ///
+    /// 「22 用裸 host」不是美观问题:v0.1.63 及以前存下的记录全是裸 host,
+    /// 换成一律带端口会让整张表一次性失配,每台主机都退回「首次连接」。
+    #[test]
+    fn host_key_id_matches_openssh_spelling() {
+        assert_eq!(host_key_id("h.example", 22), "h.example");
+        assert_eq!(host_key_id("h.example", 2222), "[h.example]:2222");
+        // IPv6 字面量:22 端口同样裸写(OpenSSH 如此),非默认端口靠方括号
+        // 把地址里的冒号与端口分隔符区分开。
+        assert_eq!(host_key_id("::1", 22), "::1");
+        assert_eq!(host_key_id("::1", 2222), "[::1]:2222");
     }
 
     #[test]
