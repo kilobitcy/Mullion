@@ -6369,6 +6369,7 @@ impl ApplicationHandler<UserEvent> for App {
                 wants_sftp,
                 pty,
             } => {
+                diag::count_connect(true);
                 self.accept_connect_ok(handle, wants_sftp, pty);
                 // F153:**在分派点推进而不是在 `accept_connect_ok` 里面** ——
                 // 那个函数有多条早退 return(SFTP 标签、缺 pty 的异常路径),
@@ -6580,6 +6581,7 @@ impl ApplicationHandler<UserEvent> for App {
                 handle,
                 channels,
             } => {
+                diag::count_reconnect();
                 self.reconnecting
                     .retain(|(g, h, _)| !(*g == generation && *h == host_ix));
                 let mut attached: Vec<(PaneId, Arc<mullion_ssh::session::SshSession>)> = Vec::new();
@@ -6847,6 +6849,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_ui_redraw();
             }
             UserEvent::ConnectErr(msg) => {
+                diag::count_connect(false);
                 // 待定 F:CLI 直连从未成功连过时,保留可脚本化的 exit(1) 语义;
                 // launcher 态(或已连过又断开)只记错误,交 UI 展示(ui.last_error)。
                 crate::logx::line(&format!("连接失败: {msg}"));
@@ -6907,6 +6910,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.accept_owner_names(generation, query, stdout);
             }
             UserEvent::SftpOpDone { generation, result } => {
+                diag::count_sftp_op();
                 match result {
                     Ok(()) => {
                         self.ui.set_toast("已完成");
@@ -6956,6 +6960,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.transfer.queue.progress(job, done);
             }
             UserEvent::TransferDone { job, result } => {
+                // F155:一个 job = 一次完整传输,不是每个数据块 —— 那是
+                // `TransferProgress`(一个 100MB 的文件几千条,T3 红线),不能计。
+                diag::count_sftp_op();
                 self.transfer.cancels.remove(&job);
                 self.transfer.queue.finish(job, result);
                 // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
@@ -7472,6 +7479,15 @@ impl ApplicationHandler<UserEvent> for App {
                             pane.emulator.selection_clear();
                             // F17:一按普通键就贴回底部,否则「打字了但看不到自己输入」。
                             pane.emulator.scroll_to_bottom();
+                            // F155:记下这次按键的时刻,等下一段入站字节来时
+                            // 算回显往返。加在这里而不是键盘事件入口 ——
+                            // 被 egui 吞掉、或 launcher 态没有终端可写的那些键
+                            // 永远等不到回显,计进去只会把分布拉偏。`bytes` 为空
+                            // 时不发往远端(当前 `encode_key` 不会,但防御一下),
+                            // 不该记,否则等不到回显还占着上一次按键的起点。
+                            if !bytes.is_empty() {
+                                diag::note_key();
+                            }
                             let _ = pane.pty.write(bytes);
                             // F40:用户接管,自动化让位(借用已释放)。
                             self.user_took_over();
@@ -9887,6 +9903,68 @@ mod tests {
     use mullion_core::layout::{Dir, Node, PaneId, Rect};
     use mullion_store::SessionId;
     use std::sync::Arc;
+
+    // ------------------------------------------------ F155 剖面接线
+
+    /// F155:回显往返靠「按键时刻」与「下一段入站字节」配对,两个点缺一
+    /// 不可。只接前者的话回显永远采不到样本(剖面行里恒为 `echo=0x`);
+    /// 只接后者的话它永远没有配对的起点。吞吐同理 —— `count_inbound`
+    /// 不接的话剖面里 `in=` 恒为 `0B/s`,看着像远端一个字节都没发过来。
+    ///
+    /// **只搜 `mod tests` 之前的那一段**:needle 本身就写在下面这个数组里,
+    /// 整份文件搜的话每一条都恒真,这测试就成了摆设。
+    ///
+    /// 自证会变红:删掉任意一句接线。
+    #[test]
+    fn the_input_and_throughput_hooks_are_wired() {
+        let app_src = include_str!("app.rs");
+        let prod = app_src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(app_src);
+        // `split` 找不到模式时原样返回整份 haystack,`.next()` 永远是 `Some`,
+        // 光靠 `expect` 兜不住 —— 切不干净就会搜到这条测试自己的文本。
+        assert!(
+            prod.len() < app_src.len(),
+            "没能切掉测试模块 —— 下面每条断言都会恒真"
+        );
+        assert!(
+            prod.contains("diag::note_key()"),
+            "按键那一端没接 —— 回显永远采不到样本,剖面行里恒为 echo=0x"
+        );
+        let pump_src = include_str!("session_pump.rs");
+        assert!(
+            pump_src.contains("note_inbound_for_echo()")
+                || prod.contains("diag::note_inbound_for_echo()"),
+            "入站那一端没接 —— 回显往返永远配不上对"
+        );
+        assert!(
+            pump_src.contains("count_inbound(") || prod.contains("diag::count_inbound("),
+            "入站字节没计数 —— 剖面里吞吐恒为 0B/s,看着像远端一个字节都没发过来"
+        );
+    }
+
+    /// F155:连接成败、重连、SFTP 要进剖面。高延迟代理链路上「这一小时
+    /// 重连了 17 次」是最直接的线索,而它在今天的日志里只能靠人肉数 WARN 行。
+    ///
+    /// 自证会变红:删掉任意一句接线。
+    #[test]
+    fn connection_outcomes_are_counted_for_the_profile() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(prod.len() < src.len(), "没能切掉测试模块 —— 断言会恒真");
+        for (needle, what) in [
+            ("diag::count_connect(true)", "连接成功"),
+            ("diag::count_connect(false)", "连接失败"),
+            ("diag::count_reconnect()", "重连"),
+            ("diag::count_sftp_op()", "SFTP 操作"),
+        ] {
+            assert!(prod.contains(needle), "{what}没计数 —— 剖面里那一列恒为零");
+        }
+    }
 
     // ------------------------------------------------ F18 划选自动滚动
 
