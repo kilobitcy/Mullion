@@ -16597,7 +16597,15 @@ mod tests {
         let prod = src
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
-            .expect("app.rs 的测试模块分界变了");
+            .unwrap_or(src);
+        // `split` 找不到模式时会把整份 haystack 原样返回,`.next()` 永远是
+        // `Some` —— 光靠 `expect` 兜不住。切不干净的话下面搜到的会是这条
+        // 测试**自己**文档注释里的那句 `count_redraw(self.ui_dirty, ...)`,
+        // 断言直接恒绿。
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 会搜到测试自己的文本,断言恒绿"
+        );
         let call = prod
             .split("diag::count_redraw(")
             .nth(1)
