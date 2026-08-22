@@ -196,8 +196,16 @@ impl Snapshot {
     /// 判据只看「有没有画过帧 / 有没有收过字节 / 有没有按过键 / 有没有连接
     /// 或 SFTP 动作」—— 标签数、内存这类**状态量**在空闲时也非零，拿它们
     /// 判活会让空闲的 mullion 每 5 秒写一次盘，笔记本硬盘永远睡不下去。
+    ///
+    /// **`stage_us` 有意不算活动**：事件循环被无关的定时器唤一下（重连退避、
+    /// 心跳）也会留下阶段样本，把它算成活动就等于「进程活着就每 5 秒写一次盘」，
+    /// 又回到这条判据要防的那件事上。有帧/有字节/有按键/有节流才算真在干活。
     pub fn is_idle(&self) -> bool {
         self.frames == 0
+            && self.throttled == 0
+            && self.redraw_terminal == 0
+            && self.redraw_ui == 0
+            && self.redraw_both == 0
             && self.inbound_bytes == 0
             && self.keys == 0
             && self.connects_ok == 0
@@ -248,7 +256,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
 
     Some(format!(
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
-         redraw=term:{}/ui:{}/both:{} in={} key={}x/echo_p95={} {} \
+         redraw=term:{}/ui:{}/both:{} in={} key={}x/echo={}x/p95={} {} \
          conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
         secs,
         s.frames,
@@ -263,6 +271,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         s.redraw_both,
         rate,
         s.keys,
+        total(&s.echo_us),
         fmt_us(quantile_us(&s.echo_us, 0.95)),
         stage_part,
         s.connects_ok,
@@ -507,5 +516,72 @@ mod tests {
         let b = render_line(&long).expect("有一行");
         assert!(a.contains("200.0KB/s"), "5 秒窗口的速率不对：{a}");
         assert!(b.contains("50.0KB/s"), "20 秒窗口没按时长摊开：{b}");
+    }
+
+    /// 四个「有事发生但没画成帧」的字段,**每一个都必须单独**把窗口顶成非空闲。
+    ///
+    /// 「重绘全被帧闸挡下、一帧没画成」正是领域陷阱 T3 发作时的样子;判成
+    /// 空闲就等于把要查的那个指标 drain 掉又不打印,数据静默丢失。
+    ///
+    /// 逐字段循环而不是一份「几个字段一起非零」的 fixture:后者删掉任一条
+    /// 判据,剩下的都能替它兜住,测试照绿 —— 只能证明「四条里至少还剩一条」。
+    ///
+    /// 自证会变红:删掉 `is_idle` 里 `throttled`/`redraw_terminal`/`redraw_ui`/
+    /// `redraw_both` 中的**任意一条**。
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn each_no_frame_activity_counter_alone_keeps_the_window_from_being_idle() {
+        let fields: [(&str, fn(&mut Snapshot)); 4] = [
+            ("throttled", |s| s.throttled = 400),
+            ("redraw_terminal", |s| s.redraw_terminal = 400),
+            ("redraw_ui", |s| s.redraw_ui = 400),
+            ("redraw_both", |s| s.redraw_both = 400),
+        ];
+        for (name, set) in fields {
+            let mut s = Snapshot {
+                window_ms: 5_000,
+                ..Snapshot::empty()
+            };
+            set(&mut s);
+            assert!(
+                !s.is_idle(),
+                "只有 {name} 非零时窗口被当成了空闲 —— T3 的指标会被静默丢掉"
+            );
+            assert!(render_line(&s).is_some(), "只有 {name} 非零时没出剖面行");
+        }
+    }
+
+    /// 节流次数要如实报进剖面行(零值也报,见
+    /// `a_zero_count_is_printed_rather_than_omitted`)。
+    #[test]
+    fn the_throttle_count_reaches_the_line() {
+        let s = Snapshot {
+            window_ms: 5_000,
+            throttled: 400,
+            ..Snapshot::empty()
+        };
+        let line = render_line(&s).expect("这种窗口必须出一行");
+        assert!(line.contains("throttle=400"), "没报节流次数:{line}");
+    }
+
+    /// 「没量到一次回显」和「量到的回显是 0µs」必须在日志里长得不一样。
+    ///
+    /// 只打 p95 的话两者都是 `0us`;看日志的人会把「这条链路根本没采到样本」
+    /// 读成「回显快到 0 微秒」,方向完全反了。
+    ///
+    /// 自证会变红:把 `render_line` 里的 `total(&s.echo_us)` 换成常量 `0`。
+    #[test]
+    fn an_unmeasured_echo_is_told_apart_from_a_fast_one() {
+        let no_samples = render_line(&busy_snapshot()).expect("有一行");
+        assert!(
+            no_samples.contains("echo=0x"),
+            "没报回显样本数:{no_samples}"
+        );
+
+        let mut measured = busy_snapshot();
+        measured.echo_us[bucket_of(30_000)] = 7;
+        let line = render_line(&measured).expect("有一行");
+        assert!(line.contains("echo=7x"), "回显样本数不对:{line}");
+        assert!(!line.contains("p95=0us"), "量到了却报 0:{line}");
     }
 }

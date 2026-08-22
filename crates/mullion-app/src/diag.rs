@@ -397,7 +397,7 @@ fn watchdog_loop(stall_ms: u64) {
                 .unwrap_or_else(|| "内存采样不可用".into());
             log::warn!(
                 target: "mullion",
-                "事件循环停滞 {:.1}s;最后阶段={} 帧={} present={} 跳帧={} 入站={}KB {mem}",
+                "事件循环停滞 {:.1}s;最后阶段={} 近5s内 帧={} present={} 跳帧={} 入站={}KB {mem}",
                 stuck as f64 / 1000.0,
                 stage_name(stage),
                 FRAMES.load(Ordering::Relaxed),
@@ -411,10 +411,13 @@ fn watchdog_loop(stall_ms: u64) {
         if now_us.saturating_sub(last_metrics) >= METRICS_EVERY_MS * 1000 {
             let window_ms = now_us.saturating_sub(last_metrics) / 1000;
             last_metrics = now_us;
-            // **info 级**:这一行就是本切片存在的理由,默认档位下必须有。
-            // 逐事件细节仍在 debug 级。
+            // **无条件** drain:计数器的语义必须是「这一窗口」,不能取决于日志
+            // 档位。挂在门里的话,error 档下计数器一路累积,而停滞报警行读的
+            // 是同一批 static —— 同一个数字在不同档位下含义不同,是排障时
+            // 最坏的一类坑。渲染(格式化)才是贵的那步,只有它需要关在门里。
+            let snap = take_snapshot(window_ms);
             if log::log_enabled!(target: "mullion", log::Level::Info) {
-                if let Some(line) = crate::profile::render_line(&take_snapshot(window_ms)) {
+                if let Some(line) = crate::profile::render_line(&snap) {
                     log::info!(target: "mullion", "{line}");
                 }
             }
