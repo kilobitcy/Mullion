@@ -528,4 +528,30 @@ mod tests {
             assert_eq!(filter_from_usize(f as usize), f, "{f} 走一圈变了");
         }
     }
+
+    /// 运行期换档必须**同时**抬 `log::set_max_level`。
+    ///
+    /// facade 那一层的粗过滤在 `FileLogger::enabled` **之前**:不抬上去的话,
+    /// 自家档位提到 debug 也一条都到不了我们手里 —— 用户在设置里选了详细档、
+    /// 日志一行没多,而设置文件里存的确实是他选的那个值。
+    ///
+    /// 这里扎的是**源码结构**:`set_levels` 只在 `init` 之后才有效果,而
+    /// `init` 会接管进程唯一的 `log` facade,单测里跑不了真流程。
+    ///
+    /// 自证会变红:删掉 `set_levels` 里那句 `log::set_max_level(..)`。
+    #[test]
+    fn changing_the_level_also_raises_the_facade_filter() {
+        let src = include_str!("logx.rs");
+        let body = src
+            .split("pub fn set_levels(")
+            .nth(1)
+            .expect("set_levels 没了？这条测试的锚点失效了")
+            .split("\n}\n")
+            .next()
+            .expect("set_levels 的函数体没有闭合？");
+        assert!(
+            body.contains("set_max_level"),
+            "换档没抬 facade 的粗过滤 —— 提到 debug 档也一条都到不了 enabled"
+        );
+    }
 }
