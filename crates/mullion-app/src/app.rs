@@ -2154,6 +2154,22 @@ impl App {
         self.refresh_monospace_warning();
     }
 
+    /// F155:把设置里的日志档位施加到 `log` facade 上。
+    ///
+    /// **环境变量仍然优先**(`logx::resolve_levels`):用户带着
+    /// `MULLION_LOG=debug` 启动、又在设置里选了「只记错误」,他要的是前者。
+    fn apply_log_level(&self) {
+        let env_app = std::env::var("MULLION_LOG").ok();
+        let env_deps = std::env::var("MULLION_LOG_DEPS").ok();
+        let (app, deps) = crate::logx::resolve_levels(
+            self.settings.log_level,
+            env_app.as_deref(),
+            env_deps.as_deref(),
+        );
+        crate::logx::set_levels(app, deps);
+        crate::logx::line(&format!("日志档位改为 app={app} deps={deps}"));
+    }
+
     /// 施加设置弹窗这一帧的结论。
     fn apply_settings_action(&mut self, out: crate::ui::settings::SettingsOut) {
         use crate::ui::settings::SettingsOut as O;
@@ -2168,6 +2184,7 @@ impl App {
                 // 那样一次 `Preview` 都没来过。
                 self.take_settings_draft();
                 self.apply_font();
+                self.apply_log_level();
                 let saved = crate::shell::store::config_dir()
                     .ok_or_else(|| "定位不到配置目录".to_string())
                     .and_then(|d| {
@@ -2228,6 +2245,7 @@ impl App {
             self.settings.font_family = d.family.clone();
             self.settings.font_pt = mullion_store::settings::clamp_font_pt(d.font_pt);
             self.settings.tmux_bootstrap = d.tmux_bootstrap;
+            self.settings.log_level = d.log_level;
         }
     }
 
@@ -12363,6 +12381,50 @@ mod tests {
         assert!(
             body.contains("self.settings.tmux_bootstrap = d.tmux_bootstrap;"),
             "自举开关没被搬进 settings —— 用户关不掉、也存不住"
+        );
+    }
+
+    /// F155:点了「确定」要做两件事 —— 把档位**存进设置**,并**当场施加**
+    /// 到 log facade 上。
+    ///
+    /// 少了前者:重开设置又显示旧档,而且他这时点确定就把选择覆盖回去了。
+    /// 少了后者:「选了详细档,日志一行没多」,重启才对 —— 最难自查的那种。
+    ///
+    /// 这里扎的是**源码结构**:真跑一遍要 `App`(无头环境构造不出来),
+    /// 而 `apply_log_level` 是纯副作用、没有可断言的返回值。回写部分与
+    /// `tmux_bootstrap` 那条守护切的是同一个函数体(`take_settings_draft`);
+    /// 施加部分切的是 `O::Commit` 这个match分支。
+    ///
+    /// 自证会变红:删掉回写那一行,或删掉 `O::Commit` 里的 `apply_log_level()`。
+    #[test]
+    fn committing_the_settings_stores_and_applies_the_new_log_level() {
+        let src = include_str!("app.rs");
+
+        // 回写:与 tmux_bootstrap 用同一条路径(`take_settings_draft`)。
+        let draft_after = src
+            .split("\n    fn take_settings_draft(&mut self) {")
+            .nth(1)
+            .expect("找不到 take_settings_draft 的定义");
+        let draft_body = &draft_after[..draft_after
+            .find("\n    }\n")
+            .expect("找不到 take_settings_draft 的函数结尾")];
+        assert!(
+            draft_body.contains("self.settings.log_level = d.log_level;"),
+            "档位没存进设置 —— 重开设置显示的是旧档,再点确定就把选择覆盖回去了"
+        );
+
+        // 施加:O::Commit 分支里要调用 apply_log_level()。
+        let commit_after = src
+            .split("O::Commit => {")
+            .nth(1)
+            .expect("apply_settings_action 里没有 O::Commit 分支了？测试的锚点失效了");
+        let commit_body = commit_after
+            .split("O::Cancel")
+            .next()
+            .unwrap_or(commit_after);
+        assert!(
+            commit_body.contains("self.apply_log_level();"),
+            "档位没当场施加到 log facade —— 设置存对了、日志却没变,重启才生效"
         );
     }
 

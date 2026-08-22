@@ -16,6 +16,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use log::{LevelFilter, Log, Metadata, Record};
@@ -62,6 +63,9 @@ fn emit<W: Write>(w: &mut W, full: &str, level: log::Level) {
 }
 
 static SINK: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+/// 运行期够到 logger 的句柄(设置弹窗点「确定」时换档要用)。`init` 之前是空的。
+static LOGGER: OnceLock<&'static FileLogger> = OnceLock::new();
 
 /// 日志文件路径:`<config_dir>/mullion.log`(Windows `%APPDATA%\mullion\config\mullion.log`)。
 pub fn log_path() -> Option<PathBuf> {
@@ -112,17 +116,46 @@ fn is_own_crate(target: &str) -> bool {
     target.starts_with("mullion")
 }
 
+/// `usize` → `LevelFilter`。`log` 自己就是拿判别值当序号用的(`Off` 最小、
+/// `Trace` 最大),这里手写一张表而不是 `transmute` —— 越界时回落到 `Trace`
+/// (放行多于该放行的)比 UB 安全。
+fn filter_from_usize(v: usize) -> LevelFilter {
+    match v {
+        0 => LevelFilter::Off,
+        1 => LevelFilter::Error,
+        2 => LevelFilter::Warn,
+        3 => LevelFilter::Info,
+        4 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    }
+}
+
 struct FileLogger {
-    app: LevelFilter,
-    deps: LevelFilter,
+    app: AtomicUsize,
+    deps: AtomicUsize,
+}
+
+impl FileLogger {
+    fn new(app: LevelFilter, deps: LevelFilter) -> Self {
+        Self {
+            app: AtomicUsize::new(app as usize),
+            deps: AtomicUsize::new(deps as usize),
+        }
+    }
+
+    /// 运行期换档。设置弹窗点「确定」时走这里。
+    fn set(&self, app: LevelFilter, deps: LevelFilter) {
+        self.app.store(app as usize, Ordering::Relaxed);
+        self.deps.store(deps as usize, Ordering::Relaxed);
+    }
 }
 
 impl Log for FileLogger {
     fn enabled(&self, md: &Metadata) -> bool {
         let limit = if is_own_crate(md.target()) {
-            self.app
+            filter_from_usize(self.app.load(Ordering::Relaxed))
         } else {
-            self.deps
+            filter_from_usize(self.deps.load(Ordering::Relaxed))
         };
         md.level() <= limit
     }
@@ -166,9 +199,13 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
     });
     let _ = SINK.set(file.map(Mutex::new));
 
-    // set_boxed_logger 只可能成功一次(集成测试里重复调会 Err)——失败静默,
+    // 泄漏成 `&'static`:`set_logger` 要求 `&'static dyn Log`,而我们还要
+    // 留一个句柄给运行期换档。进程一生只泄漏这一个,不是问题。
+    let logger: &'static FileLogger = Box::leak(Box::new(FileLogger::new(app, deps)));
+    let _ = LOGGER.set(logger);
+    // set_logger 只可能成功一次(集成测试里重复调会 Err)——失败静默,
     // 日志绝不能反过来拖垮程序。
-    if log::set_boxed_logger(Box::new(FileLogger { app, deps })).is_ok() {
+    if log::set_logger(logger).is_ok() {
         log::set_max_level(app.max(deps));
     }
 
@@ -226,6 +263,18 @@ fn write_line_at(msg: &str, level: log::Level) {
         if let Ok(mut f) = m.lock() {
             emit(&mut *f, &full, level);
         }
+    }
+}
+
+/// 运行期改档位(设置弹窗点了确定)。`init` 之前调用无效果。
+///
+/// 同时要更新 `log::set_max_level`:facade 那一层的粗过滤在
+/// `FileLogger::enabled` **之前**,不抬上去的话,自家档位提到 debug
+/// 也一条都到不了我们手里。
+pub fn set_levels(app: LevelFilter, deps: LevelFilter) {
+    if let Some(l) = LOGGER.get() {
+        l.set(app, deps);
+        log::set_max_level(app.max(deps));
     }
 }
 
@@ -418,5 +467,65 @@ mod tests {
 
         emit(&mut spy, "boom\n", log::Level::Error);
         assert_eq!(spy.flushes, 1, "错误没有立刻落盘,卡死时最后一行会丢");
+    }
+
+    /// 运行期换档必须真的改变「这条日志放不放行」。
+    ///
+    /// 只测 `set_levels` 存进去了是不够的:存了但 `enabled` 没读它,
+    /// 症状是「设置里选了详细档,日志一行没多」,而设置文件里存的确实对 ——
+    /// 重启又是好的,这种最难自查。
+    ///
+    /// 自证会变红:把 `enabled` 里读原子那两行换回读固定字段。
+    #[test]
+    fn changing_the_level_at_runtime_changes_what_gets_through() {
+        let lg = FileLogger::new(LevelFilter::Warn, LevelFilter::Error);
+        let own = log::Metadata::builder()
+            .target("mullion_app::app")
+            .level(log::Level::Info)
+            .build();
+        assert!(!lg.enabled(&own), "warn 档不该放行 info");
+
+        lg.set(LevelFilter::Debug, LevelFilter::Error);
+        assert!(
+            lg.enabled(&own),
+            "换到 debug 档后 info 仍被挡 —— 换档没生效"
+        );
+    }
+
+    /// 自家 crate 与第三方各走各的档。混成一个的话,把自家提到 debug
+    /// 会连 wgpu 一起提上去,每 5 秒一行的剖面被淹没在几万行 adapter 日志里。
+    ///
+    /// 自证会变红:把 `enabled` 里的 `is_own_crate` 分支去掉,两边都用 `app`。
+    #[test]
+    fn the_two_level_dials_stay_independent_at_runtime() {
+        let lg = FileLogger::new(LevelFilter::Debug, LevelFilter::Error);
+        let theirs = log::Metadata::builder()
+            .target("wgpu_core::device")
+            .level(log::Level::Info)
+            .build();
+        let ours = log::Metadata::builder()
+            .target("mullion_app::app")
+            .level(log::Level::Info)
+            .build();
+        assert!(lg.enabled(&ours), "自家 info 被挡了");
+        assert!(!lg.enabled(&theirs), "第三方跟着自家一起被提上去了");
+    }
+
+    /// `LevelFilter` ↔ `usize` 的往返必须无损。错一档的症状是静默的:
+    /// 日志少了或多了,没有任何报错。
+    ///
+    /// 自证会变红:把 `filter_from_usize` 里 `3 => Info` 改成 `3 => Warn`。
+    #[test]
+    fn the_level_survives_the_round_trip_through_an_atomic() {
+        for f in [
+            LevelFilter::Off,
+            LevelFilter::Error,
+            LevelFilter::Warn,
+            LevelFilter::Info,
+            LevelFilter::Debug,
+            LevelFilter::Trace,
+        ] {
+            assert_eq!(filter_from_usize(f as usize), f, "{f} 走一圈变了");
+        }
     }
 }
