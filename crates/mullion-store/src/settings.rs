@@ -32,6 +32,29 @@ pub const MAX_FONT_PT: f32 = 32.0;
 /// 老用户升上来,画面必须一个像素都不变。
 pub const DEFAULT_FONT_PT: f32 = 10.0;
 
+/// 日志详细档位(F155)。
+///
+/// **只有三档**,不照搬 `log::LevelFilter` 的六档:`trace`/`off` 对用户没有
+/// 可解释的含义(前者是给 crate 作者看的,后者等于「出了事没证据」),
+/// 而多一个档就多一种「我到底该选哪个」的犹豫。
+///
+/// 这里**不认识 `log` crate** —— `mullion-store` 是零依赖方向的叶子
+/// (见 `layout.rs` 那条架构守护)。映射成 `LevelFilter` 是 app 侧 `logx` 的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// 只记错误与降级。日志最小,但出了性能问题手上没有数据。
+    Error,
+    /// 默认:生命周期事件 + 每 5 秒一行性能剖面。
+    Info,
+    /// 上面全部,外加逐事件细节。给排查用,日志会大很多。
+    Debug,
+}
+
+fn default_log_level() -> LogLevel {
+    LogLevel::Info
+}
+
 /// 全局外观设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -62,6 +85,12 @@ pub struct Settings {
     /// 不落盘、server 退出即失效),所以必须给得出「不要」。
     #[serde(default = "default_tmux_bootstrap")]
     pub tmux_bootstrap: bool,
+    /// F155:日志详细档位。
+    ///
+    /// 契约(**本提交尚未接线**):app 侧 `logx` 在环境变量 `MULLION_LOG`
+    /// 存在时应覆盖这里 —— 排障时不必先进 GUI 改设置。
+    #[serde(default = "default_log_level")]
+    pub log_level: LogLevel,
 }
 
 fn default_font_pt() -> f32 {
@@ -79,6 +108,7 @@ impl Default for Settings {
             font_family: None,
             font_pt: DEFAULT_FONT_PT,
             tmux_bootstrap: true,
+            log_level: LogLevel::Info,
         }
     }
 }
@@ -187,6 +217,7 @@ mod tests {
             font_family: Some("Cascadia Mono".to_string()),
             font_pt: 13.5,
             tmux_bootstrap: true,
+            ..Settings::default()
         };
         save(dir.path(), &s).expect("写盘");
         let back = load(dir.path());
@@ -310,5 +341,72 @@ mod tests {
         };
         save(dir.path(), &s).expect("写盘");
         assert!(!load(dir.path()).settings.tmux_bootstrap);
+    }
+
+    /// 新字段:老的 settings.toml 里没有它,缺省必须是 `Info`。
+    ///
+    /// 给 `Debug` 的话所有老用户升上来日志量暴涨、盘被写满;给 `Error` 的话
+    /// 他们的日志静默变空,而设置里显示的是另一回事。
+    ///
+    /// 自证会变红:把 `default_log_level` 的返回值改成 `LogLevel::Debug`。
+    #[test]
+    fn log_level_defaults_to_info_for_files_written_before_it_existed() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "schema_version = 1\nfont_pt = 10.0\n",
+        )
+        .expect("写老格式文件");
+        let back = load(dir.path());
+        assert!(back.note.is_none(), "老文件不该有 note:{:?}", back.note);
+        assert_eq!(back.settings.log_level, LogLevel::Info);
+    }
+
+    /// 改过的档位要能存住。光有上一条的话,「读不出用户改过」这种错法全绿。
+    #[test]
+    fn a_changed_log_level_survives_a_round_trip() {
+        let dir = tmp();
+        for lv in [LogLevel::Error, LogLevel::Info, LogLevel::Debug] {
+            let s = Settings {
+                log_level: lv,
+                ..Settings::default()
+            };
+            save(dir.path(), &s).expect("写盘");
+            assert_eq!(
+                load(dir.path()).settings.log_level,
+                lv,
+                "档位 {lv:?} 没存住"
+            );
+        }
+    }
+
+    /// 手改成不认识的档位名 → 整份设置回落到默认值,**但要带一句 note**。
+    ///
+    /// 这里钉的是「降级要出声」,不是「只有 log_level 受影响」——`load()` 的
+    /// 解析失败分支是整份回落,字体、tmux 开关会一起丢。走的也是
+    /// `a_broken_file_degrades_to_defaults_with_a_note` 的同一处代码,
+    /// 留着它是因为「用户手改错档位名」是这条路径最可能被真实触发的方式。
+    #[test]
+    fn an_unknown_level_name_degrades_loudly_instead_of_silently() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "schema_version = 1\nlog_level = \"verbose\"\n",
+        )
+        .expect("写文件");
+        let back = load(dir.path());
+        assert_eq!(back.settings.log_level, LogLevel::Info);
+        assert!(back.note.is_some(), "档位名不认识却一声不吭");
+    }
+
+    /// 档位的磁盘写法是小写英文单词 —— 这是要被人手改的文件,形态本身是契约。
+    #[test]
+    fn levels_are_written_as_lowercase_words() {
+        let s = Settings {
+            log_level: LogLevel::Debug,
+            ..Settings::default()
+        };
+        let text = toml::to_string_pretty(&s).expect("序列化");
+        assert!(text.contains("log_level = \"debug\""), "写法变了:\n{text}");
     }
 }
