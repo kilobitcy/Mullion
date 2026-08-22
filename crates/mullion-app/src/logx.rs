@@ -26,7 +26,42 @@ use time::OffsetDateTime;
 /// debug/trace 级别下 wgpu + 自家心跳的量不小,不设上限会把盘写满。
 const ROTATE_AT_BYTES: u64 = 8 * 1024 * 1024;
 
-static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+/// debug/trace 档的单文件上限。8MB 在 debug 下几十秒就满 —— 出问题那一刻的
+/// 记录会被自己后面的日志冲掉,而那正是唯一有价值的一段。
+const ROTATE_AT_BYTES_DEBUG: u64 = 64 * 1024 * 1024;
+
+/// 这个档位下,单个日志文件多大就轮转。
+pub fn rotate_bytes_for(app: LevelFilter) -> u64 {
+    if app >= LevelFilter::Debug {
+        ROTATE_AT_BYTES_DEBUG
+    } else {
+        ROTATE_AT_BYTES
+    }
+}
+
+/// 这一条要不要立刻落盘。
+///
+/// 「逐行落盘」是本文件原本的意图(卡死时「最后一行停在哪」是硬证据),
+/// 但 debug 档下每帧几条日志、每条一次 write 系统调用,写盘就进了帧预算,
+/// 测出来的不再是原来的程序(T3)。折中:错误/警告立刻 flush(稀少),
+/// 其余走缓冲、由 `diag` 的周期线程每秒 flush 一次,最坏丢一秒。
+pub fn flush_immediately(level: log::Level) -> bool {
+    level <= log::Level::Warn
+}
+
+/// 写一行到 sink,按级别决定要不要立刻 flush。
+///
+/// 抽成泛型只为一件事:**测试能拿一个假 sink 数 flush 次数**。`SINK` 是
+/// 进程级 `OnceLock`,测试碰不了它,而「判断做对了」与「判断真的落到 sink 上」
+/// 是两回事 —— 中间断一根线,纯函数的测试照样全绿。
+fn emit<W: Write>(w: &mut W, full: &str, level: log::Level) {
+    let _ = w.write_all(full.as_bytes());
+    if flush_immediately(level) {
+        let _ = w.flush();
+    }
+}
+
+static SINK: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
 
 /// 日志文件路径:`<config_dir>/mullion.log`(Windows `%APPDATA%\mullion\config\mullion.log`)。
 pub fn log_path() -> Option<PathBuf> {
@@ -96,10 +131,15 @@ impl Log for FileLogger {
         if !self.enabled(r.metadata()) {
             return;
         }
-        write_line(&format!("{:<5} {}: {}", r.level(), r.target(), r.args()));
+        write_line_at(
+            &format!("{:<5} {}: {}", r.level(), r.target(), r.args()),
+            r.level(),
+        );
     }
 
-    fn flush(&self) {}
+    fn flush(&self) {
+        flush_now();
+    }
 }
 
 /// 打开日志文件(必要时先轮转)+ 接管 `log` facade + 安装 panic 钩子。`main` 最早调用一次。
@@ -107,19 +147,25 @@ impl Log for FileLogger {
 /// `stored` 来自 `settings.toml`(`main` 在调用本函数**之前**读好)。
 /// 读不到设置时传 `LogLevel::Info`。
 pub fn init(version: &str, stored: mullion_store::LogLevel) {
+    let env_app = std::env::var("MULLION_LOG").ok();
+    let env_deps = std::env::var("MULLION_LOG_DEPS").ok();
+    let (app, deps) = resolve_levels(stored, env_app.as_deref(), env_deps.as_deref());
+
     let path = log_path();
     let file = path.as_ref().and_then(|p| {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        rotate_if_large(p);
-        OpenOptions::new().create(true).append(true).open(p).ok()
+        rotate_if_large(p, rotate_bytes_for(app));
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+            .map(std::io::BufWriter::new)
     });
     let _ = SINK.set(file.map(Mutex::new));
 
-    let env_app = std::env::var("MULLION_LOG").ok();
-    let env_deps = std::env::var("MULLION_LOG_DEPS").ok();
-    let (app, deps) = resolve_levels(stored, env_app.as_deref(), env_deps.as_deref());
     // set_boxed_logger 只可能成功一次(集成测试里重复调会 Err)——失败静默,
     // 日志绝不能反过来拖垮程序。
     if log::set_boxed_logger(Box::new(FileLogger { app, deps })).is_ok() {
@@ -135,6 +181,9 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
             "==== mullion {version} 启动(无法定位配置目录,仅 stderr;app={app} deps={deps})===="
         )),
     }
+    // 启动横幅走的是 info 级(缓冲写)。刚起来就崩的话缓冲还没刷过 ——
+    // 而「有没有走到 init」恰恰是这种崩溃唯一的线索。
+    flush_now();
 
     // panic 钩子:把 panic 信息 + backtrace 落盘,避免 GUI 子系统下无声退出。
     std::panic::set_hook(Box::new(|info| {
@@ -143,16 +192,17 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_else(|| "?".into());
-        write_line(&format!(
-            "PANIC mullion: @ {loc}: {info}\n--- backtrace ---\n{bt}\n--- end ---"
-        ));
+        write_line_at(
+            &format!("PANIC mullion: @ {loc}: {info}\n--- backtrace ---\n{bt}\n--- end ---"),
+            log::Level::Error,
+        );
     }));
 }
 
 /// 超过上限就把旧日志挪到 `.1`(只留一代)。失败静默:轮转不成也要能继续写。
-fn rotate_if_large(p: &Path) {
+fn rotate_if_large(p: &Path, limit: u64) {
     if let Ok(md) = std::fs::metadata(p) {
-        if md.len() > ROTATE_AT_BYTES {
+        if md.len() > limit {
             let _ = std::fs::rename(p, p.with_extension("log.1"));
         }
     }
@@ -164,11 +214,9 @@ pub fn line(msg: &str) {
     log::info!(target: "mullion", "{msg}");
 }
 
-/// 真正落盘:带 UTC 时间戳,写文件 + stderr,逐行 flush。
-///
-/// 逐行 flush 是刻意的:卡死/被强杀时进程没有机会 flush 缓冲区,而「日志最后一行
-/// 停在哪」正是判断卡在哪一步的硬证据。失败静默(日志绝不能反过来拖垮程序)。
-fn write_line(msg: &str) {
+/// 真正落盘:带 UTC 时间戳,写文件 + stderr。`level` 决定要不要立刻 flush
+/// (见 [`flush_immediately`])。失败静默(日志绝不能反过来拖垮程序)。
+fn write_line_at(msg: &str, level: log::Level) {
     let ts = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_default();
@@ -176,7 +224,16 @@ fn write_line(msg: &str) {
     let _ = write!(std::io::stderr(), "{full}");
     if let Some(Some(m)) = SINK.get() {
         if let Ok(mut f) = m.lock() {
-            let _ = f.write_all(full.as_bytes());
+            emit(&mut *f, &full, level);
+        }
+    }
+}
+
+/// 把缓冲里的日志刷到盘上。`diag` 的周期线程每秒调一次 —— 没有它,
+/// info/debug 档下卡死时最后几秒的记录会随进程一起消失。
+pub fn flush_now() {
+    if let Some(Some(m)) = SINK.get() {
+        if let Ok(mut f) = m.lock() {
             let _ = f.flush();
         }
     }
@@ -285,5 +342,81 @@ mod tests {
             resolve_levels(LogLevel::Debug, Some("verbose"), None),
             (LevelFilter::Debug, LevelFilter::Info)
         );
+    }
+
+    /// debug 档写得多,8MB 一代几十秒就冲掉了 —— 真正出问题那一刻的记录
+    /// 已经被自己后面的日志刷没了。档位高时上限跟着抬。
+    ///
+    /// 自证会变红:把 `rotate_bytes_for` 改成恒返回 `ROTATE_AT_BYTES`。
+    #[test]
+    fn a_chattier_level_gets_a_bigger_file_before_rotating() {
+        let info = rotate_bytes_for(LevelFilter::Info);
+        let debug = rotate_bytes_for(LevelFilter::Debug);
+        assert_eq!(info, ROTATE_AT_BYTES);
+        assert!(
+            debug >= info * 4,
+            "debug 档的上限只有 {debug},几十秒就把出问题那一刻冲掉了"
+        );
+        assert_eq!(
+            rotate_bytes_for(LevelFilter::Trace),
+            debug,
+            "trace 比 debug 还吵,不该反而回到小上限"
+        );
+    }
+
+    /// 哪些级别必须**立刻**落盘。
+    ///
+    /// 本文件存在的全部理由是「卡死/被强杀时最后一行停在哪」—— 缓冲写会把
+    /// 这个能力削掉。折中:错误与警告立刻 flush(它们稀少,代价可忽略),
+    /// info/debug 走缓冲、由周期线程每秒 flush 一次,最坏丢一秒。
+    ///
+    /// 自证会变红:把 `flush_immediately` 改成恒 `false`。
+    #[test]
+    fn errors_are_flushed_at_once_while_chatter_may_wait_a_second() {
+        assert!(flush_immediately(log::Level::Error));
+        assert!(flush_immediately(log::Level::Warn));
+        assert!(!flush_immediately(log::Level::Info));
+        assert!(!flush_immediately(log::Level::Debug));
+    }
+
+    /// 记录 flush 次数的假 sink。
+    struct Spy {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for Spy {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    /// `flush_immediately` 这个判断必须真的落到 sink 上。
+    ///
+    /// 光测那个纯函数是不够的:它返回什么与「写的时候有没有照做」是两回事,
+    /// 中间断一根线,测试照绿而日志在卡死时全丢 —— 那是这个文件唯一的用途。
+    ///
+    /// 自证会变红:把 `emit` 里的 `if flush_immediately(level)` 改成 `if true`
+    /// 或 `if false`,两种改法各扎一条断言。
+    #[test]
+    fn the_flush_decision_actually_reaches_the_sink() {
+        let mut spy = Spy {
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+        emit(&mut spy, "chatter\n", log::Level::Info);
+        assert_eq!(spy.flushes, 0, "info 级也立刻 flush,缓冲等于没做");
+        assert!(
+            !spy.bytes.is_empty(),
+            "不 flush 不等于不写 —— 字节必须进缓冲"
+        );
+
+        emit(&mut spy, "boom\n", log::Level::Error);
+        assert_eq!(spy.flushes, 1, "错误没有立刻落盘,卡死时最后一行会丢");
     }
 }

@@ -422,6 +422,10 @@ fn watchdog_loop(stall_ms: u64) {
                 }
             }
         }
+
+        // info/debug 档走缓冲写,靠这里把最后一秒刷下去 —— 没有它,
+        // 卡死时最后几秒的日志会随进程一起消失,而那正是唯一有用的一段。
+        crate::logx::flush_now();
     }
 }
 
