@@ -7554,14 +7554,24 @@ impl ApplicationHandler<UserEvent> for App {
                 // 「确实触发了一次 RedrawRequested」当作脏——这不是无条件轮询:
                 // ControlFlow::Wait 下 winit 不会凭空生成 RedrawRequested,真正的重绘
                 // 频率由触发它的事件(resize/connect/wake/OS 重绘)决定。
-                let dirty = match self.active_ws() {
-                    Some(ws) => crate::frame::frame_is_dirty(
-                        crate::render::panes_ready_to_present(
-                            ws.panes().iter().map(|p| &p.pacer),
-                            now,
-                        ),
-                        self.ui_dirty,
+                let terminal_dirty = match self.active_ws() {
+                    Some(ws) => crate::render::panes_ready_to_present(
+                        ws.panes().iter().map(|p| &p.pacer),
+                        now,
                     ),
+                    None => false,
+                };
+                // F155:重绘归因。两个布尔必须与下面 `frame_is_dirty` 收到的是
+                // 同一对,否则剖面里「远端来了字节」与「egui 要重绘」全是假的。
+                diag::count_redraw(terminal_dirty, self.ui_dirty);
+                // F155:此刻的规模。三条 relaxed 原子存,可忽略。
+                diag::set_scale(
+                    self.tabs.len(),
+                    self.active_ws().map_or(0, |ws| ws.pane_count()),
+                    self.active_ws().map_or(0, |ws| ws.hosts.len()),
+                );
+                let dirty = match self.active_ws() {
+                    Some(_) => crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty),
                     None => true,
                 };
                 let action = self.limiter.plan(dirty, now);
@@ -7894,6 +7904,13 @@ impl ApplicationHandler<UserEvent> for App {
                             } else {
                                 (taken_files.as_mut(), None)
                             };
+                            // F155:整帧耗时。量在**调用点**而不是 `render_frame`
+                            // 里面 —— 那个函数有五条跳帧的提前 return,在里面量
+                            // 会把跳帧那几路全漏掉,而跳掉的帧同样消耗了时间,
+                            // 漏记会让 p95 偏乐观。
+                            // `Instant::now` 在 Windows 上走 QPC,约 20~30ns,
+                            // 每帧两次可忽略;**绝不能**在这里做格式化(T3)。
+                            let frame_started = Instant::now();
                             let (repaint_delay, mut actions) = render_frame(
                                 a,
                                 &renders,
@@ -7906,6 +7923,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 &mut self.edit,
                                 blink_on,
                             );
+                            diag::record_frame_us(frame_started.elapsed().as_micros() as u64);
                             drop(renders);
                             drop(titles);
                             drop(snaps);
@@ -8252,6 +8270,8 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     RedrawAction::Throttle { wait_ms } => {
+                        // F155:被帧闸挡下的次数(T3 的直接体感指标)。
+                        diag::count_throttled();
                         let at = Instant::now() + std::time::Duration::from_millis(wait_ms);
                         self.next_frame_at = Some(at);
                         event_loop.set_control_flow(ControlFlow::WaitUntil(at));
@@ -16526,6 +16546,72 @@ mod tests {
         assert!(
             body.contains("self.refresh_scrollback();"),
             "改了会话配置没把 scrollback 推给在跑的 pane:用户改完得重连才生效(F17)"
+        );
+    }
+
+    /// F155:四个采集点必须都在事件循环里接上。
+    ///
+    /// 扎源码结构而不是跑帧:这几处都在 `window_event` 的重绘分支里,要真的
+    /// 窗口和 GPU 才跑得起来。漏接一处不会有任何报错,只会让剖面里那一列
+    /// **恒为零** —— 而「这个窗口没跳帧」与「这个版本忘了统计」在日志里
+    /// 长得一模一样。
+    ///
+    /// **只搜 `mod tests` 之前的那一段源码**:needle 本身就写在下面这个
+    /// 数组里,整份文件搜的话每一条都恒真,这测试就成了摆设。
+    ///
+    /// 自证会变红:删掉下面任意一句接线。
+    #[test]
+    fn the_frame_profile_hooks_are_all_wired_into_the_event_loop() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面每条断言都会恒真"
+        );
+        for needle in [
+            "diag::record_frame_us(",
+            "diag::count_redraw(",
+            "diag::count_throttled()",
+            "diag::set_scale(",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "剖面采集点 `{needle}` 没接进事件循环 —— 剖面里那一列会恒为零"
+            );
+        }
+    }
+
+    /// 重绘归因传的两个布尔,必须与 `frame_is_dirty` 收到的是**同一对**。
+    ///
+    /// 传错(比如两个都传 `self.ui_dirty`)的话,剖面里「远端来了字节」与
+    /// 「egui 要重绘」这两列全是假的,而它们正是用来判断「远端安静时还在
+    /// 白烧 GPU」的依据 —— 归因错了比没有更糟,会把人带去改错地方。
+    ///
+    /// 自证会变红:把接线改成 `diag::count_redraw(self.ui_dirty, self.ui_dirty)`。
+    #[test]
+    fn the_redraw_attribution_uses_the_same_pair_as_the_dirty_check() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("app.rs 的测试模块分界变了");
+        let call = prod
+            .split("diag::count_redraw(")
+            .nth(1)
+            .expect("没接 count_redraw")
+            .split(");")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            call.contains("self.ui_dirty"),
+            "count_redraw 的 ui 那一路不是 self.ui_dirty:{call}"
+        );
+        assert!(
+            !call.contains("self.ui_dirty, self.ui_dirty"),
+            "两路传了同一个值,归因是假的:{call}"
         );
     }
 }
