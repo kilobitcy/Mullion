@@ -29,6 +29,7 @@ pub mod remote_bootstrap;
 pub mod render;
 pub mod session_pump;
 pub mod shell;
+pub mod shell_bootstrap;
 pub mod text;
 pub mod theme;
 pub mod tunnels;
