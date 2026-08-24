@@ -28,6 +28,7 @@ pub mod reflow;
 pub mod remote_bootstrap;
 pub mod render;
 pub mod session_pump;
+pub mod shaped_cache;
 pub mod shell;
 pub mod shell_bootstrap;
 pub mod text;
