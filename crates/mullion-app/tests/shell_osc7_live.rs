@@ -19,7 +19,14 @@ use std::process::Command;
 ///   这个 `%s` 会被当成格式符、吃掉一个不存在的参数、展开成空 —— 吐出来的
 ///   是一条**错的绝对路径**,而错的绝对路径骗得过下游所有校验。
 /// - 空格钉住 `"$PWD"` 外面那对双引号没被漏掉(漏了就在空格处断成两段)。
-const DIR_NAME: &str = "mullion osc7 100%s";
+///
+/// 带进程号:目录名固定的话,同一台机器上并发跑两次 `cargo test`(多 worktree /
+/// 后台 agent / CI 并发 job)会撞同一个路径,而先跑完那个的 `remove_dir` 能在
+/// 另一个的 bash 还以它为 cwd 时把它删掉 —— 那之后 `getcwd()` 直接返回
+/// `ENOENT`,`$PWD` 填不出来,受害者在一个跟本功能毫无关系的地方假红。
+fn dir_name() -> String {
+    format!("mullion osc7 100%s-{}", std::process::id())
+}
 
 /// 收尾:断言失败(panic)那条路径也要把目录删掉。
 struct RmOnDrop(std::path::PathBuf);
@@ -32,7 +39,7 @@ impl Drop for RmOnDrop {
 
 #[test]
 fn a_real_bash_reports_the_directory_the_injection_asks_for() {
-    let dir = std::env::temp_dir().join(DIR_NAME);
+    let dir = std::env::temp_dir().join(dir_name());
     std::fs::create_dir_all(&dir).expect("建测试目录");
     let _cleanup = RmOnDrop(dir.clone());
     // 规范化:`temp_dir()` 可能含软链,而 bash 的 `$PWD` 报的是 `getcwd()`
@@ -75,9 +82,13 @@ fn a_real_bash_reports_the_directory_the_injection_asks_for() {
             String::from_utf8_lossy(&out.stderr)
         )
     });
+    // 比字节而不是比 `from_utf8_lossy`:两条不同的非 UTF-8 路径会被 lossy 成
+    // 同一串 `U+FFFD`,那是条能把真差异吃掉的假绿路径。
     assert_eq!(
+        got,
+        dir.as_os_str().as_bytes(),
+        "解出来的目录不是 bash 当时所在的那个:got={:?} want={:?}",
         String::from_utf8_lossy(&got),
-        String::from_utf8_lossy(dir.as_os_str().as_bytes()),
-        "解出来的目录不是 bash 当时所在的那个"
+        dir
     );
 }
