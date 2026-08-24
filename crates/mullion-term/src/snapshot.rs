@@ -14,6 +14,72 @@ impl Rgb {
     }
 }
 
+/// FNV-1a(64 位)的偏移基与质数。
+///
+/// 为什么手写而不是 `DefaultHasher`:`std` 的 `RandomState` 带随机种子,
+/// 同一份内容在同一进程的两帧之间都可能算出不同的值,拿它做跨帧比对是
+/// 直接坏掉的;`DefaultHasher::new()` 虽然确定,但标准库**明确不保证**
+/// 跨版本稳定。FNV-1a 只有十行,零依赖,可直接单测。
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+fn eat(h: u64, b: u8) -> u64 {
+    (h ^ u64::from(b)).wrapping_mul(FNV_PRIME)
+}
+
+/// 一行的内容指纹(F12)。**渲染层判"这一行要不要重新整形"的唯一判据。**
+///
+/// # 最关键的不变量
+///
+/// 喂进去的字段必须**恰好等于** `mullion-app` 的 `text::row_to_runs` /
+/// `row_to_spans` 真正读到的字段。少喂一个,那一类变化就**静默**不重画 ——
+/// 症状是屏幕上留着一行陈旧的字,编译不报错、测试不报错、日志不报错,
+/// 只有人眼能发现。
+///
+/// 两层机械守护,缺一不可:
+///
+/// 1. **存量字段**:本模块 `tests` 里的六条 `a_changed_*_changes_the_row_hash`,
+///    一条对一个字段,一条都不能省。
+/// 2. **增量字段**:下面那句**穷尽解构**。给 `SnapCell` 加字段(比如
+///    underline)时,这里会当场编译报错,强迫作者对"进不进哈希"表态,
+///    而不是静默漏掉。**不要**把它改成 `cell.ch` 那种点号取字段的写法 ——
+///    那样加字段就没有任何提示了。
+///
+/// SGR bold 不必单列:`Emulator::snapshot` 已经用 `palette::bold_brighten`
+/// 把它烘进了 `fg`。
+pub fn hash_row(cells: &[SnapCell]) -> u64 {
+    let mut h = FNV_OFFSET;
+    for cell in cells {
+        // 穷尽解构 —— 见上面的文档,这一行是增量字段的唯一守护。
+        let SnapCell {
+            ch,
+            fg,
+            bg,
+            width,
+            spacer,
+            selected,
+        } = *cell;
+        for b in (ch as u32).to_le_bytes() {
+            h = eat(h, b);
+        }
+        for b in [
+            fg.r,
+            fg.g,
+            fg.b,
+            bg.r,
+            bg.g,
+            bg.b,
+            width,
+            u8::from(spacer),
+            u8::from(selected),
+        ] {
+            h = eat(h, b);
+        }
+    }
+    h
+}
+
 /// 单元格快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapCell {
@@ -77,5 +143,105 @@ impl GridSnapshot {
     pub fn row(&self, row: u16) -> &[SnapCell] {
         let start = row as usize * self.cols as usize;
         &self.cells[start..start + self.cols as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个基准格。各测试只动其中一个字段,用来证明"那个字段进了哈希"。
+    fn base() -> SnapCell {
+        SnapCell {
+            ch: 'a',
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0x10, 0x10, 0x10),
+            width: 1,
+            spacer: false,
+            selected: false,
+        }
+    }
+
+    /// 改一个字段,断言整行指纹跟着变。
+    fn changing(f: impl FnOnce(&mut SnapCell)) -> (u64, u64) {
+        let before = [base(), base()];
+        let mut after = before;
+        f(&mut after[1]);
+        (hash_row(&before), hash_row(&after))
+    }
+
+    /// 同样的一行,算两次必须一样。**没有这条,下面六条全是恒绿的**
+    /// —— 一个每次返回随机数的 `hash_row` 能让"变了就不等"全部通过。
+    ///
+    /// 自证会变红:让 `hash_row` 的 `h` 初值改成随每次调用变化的东西。
+    #[test]
+    fn the_same_row_hashes_the_same_every_time() {
+        let row = [base(), base()];
+        assert_eq!(hash_row(&row), hash_row(&row));
+    }
+
+    /// 内容变(SGR 之外最常见的一种)。
+    ///
+    /// 自证会变红:从 `hash_row` 里删掉喂 `ch` 的那几行。
+    #[test]
+    fn a_changed_char_changes_the_row_hash() {
+        let (a, b) = changing(|c| c.ch = 'b');
+        assert_ne!(a, b, "改了字符,指纹没变 —— 屏幕会留着旧字");
+    }
+
+    /// SGR 前景色 / 主题换色 / bold 提亮,最终都落在 `fg` 上。
+    ///
+    /// 自证会变红:从 `hash_row` 里删掉 `fg.r`/`fg.g`/`fg.b`。
+    #[test]
+    fn a_changed_fg_changes_the_row_hash() {
+        let (a, b) = changing(|c| c.fg = Rgb::new(0xff, 0x00, 0x00));
+        assert_ne!(a, b, "改了前景色,指纹没变");
+    }
+
+    /// 背景色。选区反色会把它读成文字色(`text.rs::row_to_spans`),
+    /// 所以它同样影响整形结果,不是"只影响 quad 层"。
+    ///
+    /// 自证会变红:从 `hash_row` 里删掉 `bg.r`/`bg.g`/`bg.b`。
+    #[test]
+    fn a_changed_bg_changes_the_row_hash() {
+        let (a, b) = changing(|c| c.bg = Rgb::new(0x00, 0xff, 0x00));
+        assert_ne!(a, b, "改了背景色,指纹没变 —— 选区反色会用陈旧字色");
+    }
+
+    /// 宽度决定 `row_to_runs` 怎么切 run(F16)。
+    ///
+    /// 自证会变红:从 `hash_row` 里删掉 `width`。
+    #[test]
+    fn a_changed_width_changes_the_row_hash() {
+        let (a, b) = changing(|c| c.width = 2);
+        assert_ne!(a, b, "改了显示宽度,指纹没变");
+    }
+
+    /// spacer 决定这一格跳不跳过。
+    ///
+    /// 自证会变红:从 `hash_row` 里删掉 `spacer`。
+    #[test]
+    fn a_changed_spacer_changes_the_row_hash() {
+        let (a, b) = changing(|c| c.spacer = true);
+        assert_ne!(a, b, "改了 spacer 标记,指纹没变");
+    }
+
+    /// F18 选区。alacritty 的 `Term::damage()` **不含**选区变化,
+    /// 这正是本设计不用 damage 的头号理由 —— 指纹必须自己覆盖它。
+    ///
+    /// 自证会变红:从 `hash_row` 里删掉 `selected`。
+    #[test]
+    fn a_changed_selection_changes_the_row_hash() {
+        let (a, b) = changing(|c| c.selected = true);
+        assert_ne!(a, b, "改了选中标记,指纹没变 —— 划选后文字不反色");
+    }
+
+    /// 行变长/变短必须换指纹。定长逐格喂字节天然覆盖,写下来是防止
+    /// 日后有人"优化"成只喂非空白格。
+    ///
+    /// 自证会变红:在 `hash_row` 开头加 `let cells = &cells[..1.min(cells.len())];`。
+    #[test]
+    fn a_longer_row_hashes_differently() {
+        assert_ne!(hash_row(&[base()]), hash_row(&[base(), base()]));
     }
 }
