@@ -370,11 +370,11 @@ impl Emulator {
         // 光标行是「相对屏面」的,加上 offset 才是「相对可视区」。
         let cursor_row = p.line.0 + offset;
         let style = self.term.cursor_style();
-        GridSnapshot {
-            cols: cols as u16,
-            rows: rows as u16,
+        GridSnapshot::new(
+            cols as u16,
+            rows as u16,
             cells,
-            cursor: Cursor {
+            Cursor {
                 row: cursor_row.max(0) as u16,
                 col: p.column.0 as u16,
                 // MVP 未接 DECTCEM(`\x1b[?25l`/`\x1b[?25h`)光标隐藏/显示;
@@ -383,7 +383,7 @@ impl Emulator {
                 shape: map_shape(style.shape),
                 blinking: style.blinking,
             },
-        }
+        )
     }
 
     /// 光标在**可视区**里的位置。[`Emulator::snapshot`] 里那份 `cursor` 的
@@ -743,6 +743,36 @@ mod tests {
             row_text(&emu.snapshot(), 0),
             "two",
             "回底后应重新贴最新输出"
+        );
+    }
+
+    /// F17:回溯滚动后,行指纹跟着**内容**走,而不是跟着屏幕位置走。
+    ///
+    /// 2 行屏面喂 3 行 → 可视区是 two/three,"one" 进了 scrollback。
+    /// 回溯一行后可视区变成 one/two:原来第 0 行的 "two" 挪到了第 1 行,
+    /// 两者指纹必须相等 —— 不等就说明指纹的行号换算与 `snapshot()` 里
+    /// 既有的 `display_offset` 换算不同源,差分会在滚动时整屏误判。
+    ///
+    /// 自证会变红:把 `GridSnapshot::new` 里的行切片换成固定的第 0 行
+    /// (`cells.get(0..w)`)。
+    #[test]
+    fn row_hashes_follow_the_content_when_scrolled_back() {
+        let mut emu = Emulator::new(10, 2);
+        emu.feed(b"one\r\ntwo\r\nthree");
+        let before = emu.snapshot(); // 可视区:two / three
+
+        emu.scroll(Scroll::Delta(1));
+        let after = emu.snapshot(); // 可视区:one / two
+
+        assert_eq!(
+            before.row_hash(0),
+            after.row_hash(1),
+            "原第 0 行(two)回溯后落在第 1 行,指纹该相等"
+        );
+        assert_ne!(
+            before.row_hash(0),
+            after.row_hash(0),
+            "回溯后第 0 行是 one,不该与原来的 two 同指纹"
         );
     }
 

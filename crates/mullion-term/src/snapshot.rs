@@ -136,13 +136,49 @@ pub struct GridSnapshot {
     pub rows: u16,
     pub cells: Vec<SnapCell>,
     pub cursor: Cursor,
+    /// 每行的内容指纹(F12),长度 == `rows`。
+    ///
+    /// **私有是有意的**:它必须与 `cells` 严格同步,而字段公开就意味着
+    /// crate 外可以手搓一个 `GridSnapshot { .. }` 却把指纹填成 `vec![0; n]`
+    /// —— 那样渲染层会认为"这一行永远没变",屏幕永久停在第一帧。
+    /// 私有之后唯一的构造入口是 [`GridSnapshot::new`],编译器保证同步。
+    row_hash: Vec<u64>,
 }
 
 impl GridSnapshot {
+    /// **唯一的构造入口**,顺手把每行指纹算好(F12)。
+    ///
+    /// `cells.len()` 应当等于 `cols × rows`;不足的行按 0 补指纹而不是
+    /// panic —— 快照是渲染路径上的东西,宁可这一帧多整形一次,也不能崩。
+    pub fn new(cols: u16, rows: u16, cells: Vec<SnapCell>, cursor: Cursor) -> Self {
+        let w = cols as usize;
+        let row_hash = (0..rows as usize)
+            .map(|r| {
+                let start = r * w;
+                cells.get(start..start + w).map_or(0, hash_row)
+            })
+            .collect();
+        Self {
+            cols,
+            rows,
+            cells,
+            cursor,
+            row_hash,
+        }
+    }
+
     /// 第 `row` 行的单元格切片(长度 == cols)。
     pub fn row(&self, row: u16) -> &[SnapCell] {
         let start = row as usize * self.cols as usize;
         &self.cells[start..start + self.cols as usize]
+    }
+
+    /// 第 `row` 行的内容指纹(F12)。越界返回 0。
+    ///
+    /// 0 是"未知"而不是"某个具体内容":调用方拿它跟缓存里的值比,
+    /// 比不上就重新整形 —— 越界那一帧多整形一次,而不是漏画。
+    pub fn row_hash(&self, row: u16) -> u64 {
+        self.row_hash.get(row as usize).copied().unwrap_or(0)
     }
 }
 
@@ -243,5 +279,52 @@ mod tests {
     #[test]
     fn a_longer_row_hashes_differently() {
         assert_ne!(hash_row(&[base()]), hash_row(&[base(), base()]));
+    }
+
+    fn cursor_at_origin() -> Cursor {
+        Cursor {
+            row: 0,
+            col: 0,
+            visible: false,
+            shape: CursorShape::Beam,
+            blinking: false,
+        }
+    }
+
+    /// `new()` 给每一行都算好指纹,长度 == rows。
+    ///
+    /// 自证会变红:让 `GridSnapshot::new` 的 `row_hash` 收成 `Vec::new()`。
+    #[test]
+    fn new_fills_one_hash_per_row() {
+        let s = GridSnapshot::new(3, 2, vec![base(); 6], cursor_at_origin());
+        assert_eq!(s.row_hash(0), hash_row(s.row(0)));
+        assert_eq!(s.row_hash(1), hash_row(s.row(1)));
+    }
+
+    /// **F12 的验收标准**(`spec.md`:"只改一行后,脏行集合只含那一行")。
+    ///
+    /// 自证会变红:让 `GridSnapshot::new` 把每一行的指纹都算成
+    /// `hash_row(&cells)`(整份 cells 而不是本行切片)—— 那样改一行会让
+    /// 所有行的指纹一起变,差分就退化成全量。
+    #[test]
+    fn changing_one_row_moves_only_that_rows_hash() {
+        let before = GridSnapshot::new(3, 3, vec![base(); 9], cursor_at_origin());
+        let mut cells = vec![base(); 9];
+        cells[3 + 1].ch = 'Z'; // 第 1 行、第 1 列
+        let after = GridSnapshot::new(3, 3, cells, cursor_at_origin());
+
+        assert_eq!(before.row_hash(0), after.row_hash(0), "第 0 行不该变");
+        assert_ne!(before.row_hash(1), after.row_hash(1), "第 1 行该变");
+        assert_eq!(before.row_hash(2), after.row_hash(2), "第 2 行不该变");
+    }
+
+    /// 越界行号返回 0 而不是 panic。渲染层拿到的 `rows` 与快照的 `rows`
+    /// 在 resize 那一帧可能短暂不一致,不能让它把进程带走。
+    ///
+    /// 自证会变红:把 `row_hash()` 的实现改成 `self.row_hash[row as usize]`。
+    #[test]
+    fn an_out_of_range_row_hash_is_zero_not_a_panic() {
+        let s = GridSnapshot::new(3, 2, vec![base(); 6], cursor_at_origin());
+        assert_eq!(s.row_hash(9), 0);
     }
 }
