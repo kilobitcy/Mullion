@@ -85,6 +85,22 @@ pub struct Settings {
     /// 不落盘、server 退出即失效),所以必须给得出「不要」。
     #[serde(default = "default_tmux_bootstrap")]
     pub tmux_bootstrap: bool,
+    /// F156-c:pane 的 shell channel 一建立,就往 PTY 注入一行,让远端 shell
+    /// 从此每个提示符发一次 OSC 7(当前目录)。
+    ///
+    /// **默认开**:非 tmux 场景下 `PaneState.cwd` 本来一条腿都没有 ——
+    /// Ubuntu 的 bash 默认不发 OSC 7,而窗口标题那条腿只要 PS1 被
+    /// starship / oh-my-bash 接管就断。用户报的「`Ctrl+Shift+B` 经常留在 `~`」
+    /// 就是这个。
+    ///
+    /// 与 [`Settings::tmux_bootstrap`] **分开两个开关**:那个改的是远端 tmux
+    /// 服务器内存里的选项,这个往用户**当前这条 shell** 里写一行命令并清屏。
+    /// 副作用完全不同,想只关掉其中一件是合理诉求,一个开关做不到。
+    ///
+    /// 不写远端任何文件 —— 只活在这条 shell 的内存里,断开即消失。命令串与
+    /// 逐处理由见 `mullion_app::shell_bootstrap::OSC7_SETUP`。
+    #[serde(default = "default_shell_osc7_bootstrap")]
+    pub shell_osc7_bootstrap: bool,
     /// F155:日志详细档位。
     ///
     /// 契约(**本提交尚未接线**):app 侧 `logx` 在环境变量 `MULLION_LOG`
@@ -101,6 +117,10 @@ fn default_tmux_bootstrap() -> bool {
     true
 }
 
+fn default_shell_osc7_bootstrap() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -108,6 +128,7 @@ impl Default for Settings {
             font_family: None,
             font_pt: DEFAULT_FONT_PT,
             tmux_bootstrap: true,
+            shell_osc7_bootstrap: true,
             log_level: LogLevel::Info,
         }
     }
@@ -341,6 +362,40 @@ mod tests {
         };
         save(dir.path(), &s).expect("写盘");
         assert!(!load(dir.path()).settings.tmux_bootstrap);
+    }
+
+    /// F156-c:老的 `settings.toml` 里没有这个字段,读出来必须**默认开** ——
+    /// 关着的话,所有已经在用的用户升级上来之后,非 tmux 场景仍然跟不住目录,
+    /// 而他们不会知道设置里多了一个开关。
+    ///
+    /// 自证会变红:把 `default_shell_osc7_bootstrap` 的返回值改成 `false`。
+    #[test]
+    fn shell_osc7_bootstrap_defaults_to_on_for_files_written_before_it_existed() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "schema_version = 1\nfont_pt = 10.0\n",
+        )
+        .expect("写老格式文件");
+        let back = load(dir.path());
+        assert!(back.note.is_none(), "老文件不该有 note:{:?}", back.note);
+        assert!(
+            back.settings.shell_osc7_bootstrap,
+            "老文件缺这个字段时该默认开"
+        );
+    }
+
+    /// 关掉之后要真的留得住 —— 这条命令是往用户当前这条 shell 里写东西并
+    /// 清屏,「关了下次又自己开回来」是不能接受的。
+    #[test]
+    fn shell_osc7_bootstrap_survives_a_round_trip_when_turned_off() {
+        let dir = tmp();
+        let s = Settings {
+            shell_osc7_bootstrap: false,
+            ..Settings::default()
+        };
+        save(dir.path(), &s).expect("写盘");
+        assert!(!load(dir.path()).settings.shell_osc7_bootstrap);
     }
 
     /// 新字段:老的 settings.toml 里没有它,缺省必须是 `Info`。
