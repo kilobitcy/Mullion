@@ -124,10 +124,46 @@ zsh 用户装了 `oh-my-zsh` 的话通常已经在发了;fish 从 3.x 起默认�
 | `set-titles-string` 带路径 | `会话名 · 目录名` | 该目录(若是绝对路径) |
 | tmux 之外还发了 OSC 7 | `会话名 · 目录名`(以 OSC 7 为准) | 该目录 |
 
-标题里的路径常常是 `~/Mullion` 这种缩写形式。**`~` 只用来在标题条上显示目录名**,
-不拿去当 SFTP 起始目录 —— openssh 的 `sftp-server` 不展开 `~`,直接拿 `~/Mullion`
-去 `canonicalize` 会失败,面板会停在「取不到登录目录」,比不继承更糟
-(`files_start_dir` 只接受以 `/` 开头的绝对路径,`~/...` 一律落回配置的默认远端目录)。
+标题里的路径常常是 `~/Mullion` 这种缩写形式,而 openssh 的 `sftp-server`
+**不展开 `~`** —— 直接拿 `~/Mullion` 去 `canonicalize` 会失败,面板会停在
+「取不到登录目录」,比不继承更糟。
+
+所以 `files_start_dir` 分两档处理:已经是绝对路径的直接用;`~` / `~/x` 在
+**登录目录已知**时(sftp 已经开过、拿到过 home)由 `expand_tilde` 展开成绝对
+路径,登录目录未知时才落回配置的默认远端目录。`~user` **不展开** —— 那要查
+远端的 passwd,猜错会把用户带到别人的家目录去。
+
+## 不经过 tmux 时:客户端自己注入(F156-c)
+
+上面整节讲的都是「远端配好了会怎样」。**非 tmux 场景的问题在于绝大多数远端
+根本没配**:Ubuntu 的 bash 默认不发 OSC 7,而窗口标题那条腿只要 PS1 被
+starship / oh-my-bash / 自定义 rc 接管就断 —— 两条腿同时断,`PaneState.cwd`
+一个字节都收不到,`Ctrl+Shift+B` 只能停在登录目录。
+
+F156-c 的做法是:**pane 的 shell channel 一建立就往 PTY 写一行**,让这条
+shell 从此每个提示符发一次 OSC 7。命令串与逐处理由见
+`crates/mullion-app/src/shell_bootstrap.rs` 的 `OSC7_SETUP`;发它的地方是
+`App::on_pane_ready`(三条 pane 建立路径共用的唯一入口)。
+
+- **不写远端任何文件**,只改这条 shell 内存里的 `PROMPT_COMMAND`,断开即消失。
+  这是它能默认开启、而「往 `~/.bashrc` 追加」不能的原因。
+- 用户原有的 `PROMPT_COMMAND` 保留(拼在我们这条后面),不覆盖。
+- 末尾带一次 `clear`,所以 motd / 登录横幅会被清掉。
+- 开关在设置弹窗「远端」分节,与 F124 那个**分开**(`shell_osc7_bootstrap`)。
+
+**已知限制:**
+- **tmux 场景无效但无害** —— tmux 吃掉内层 OSC 7 不转发(F51 被否的同一个
+  事实),那个场景走 F124 那条腿。
+- **fish / csh 下这一行是语法错误**,屏幕上会打一行报错。fish 3.x 起本来就
+  默认发 OSC 7,不做兼容;请关掉开关。
+- **注入只发生在 pane 建立那一刻**。用户之后在 pane 里 `ssh` 到第三台机器,
+  `PROMPT_COMMAND` 不会跟过去。
+- 远端 sshd 配了 `ForceCommand`、或用户的登录 shell 直接就是 tmux 时,写进去
+  的字节会变成那个程序的输入。这是注入方案的固有代价。
+
+**为什么不在按 `Ctrl+Shift+B` 那一刻现写:** 那时 pane 里可能正跑着 Claude Code
+之类的全屏 TUI,写进去的字节会变成 TUI 的按键输入。**pane 刚建立、shell 还没跑
+任何程序**是唯一安全的注入窗口。
 
 ## 文件面板已经开着时,不会跟着终端 cd 跑
 
@@ -145,6 +181,9 @@ zsh 用户装了 `oh-my-zsh` 的话通常已经在发了;fish 从 3.x 起默认�
 
 - 自举:`crates/mullion-app/src/remote_bootstrap.rs`(命令串 + 重试判据)+
   `App::tick_tmux_bootstrap`(`about_to_wait` 里跑)
+- 非 tmux 自举:`crates/mullion-app/src/shell_bootstrap.rs`(注入串)+
+  `App::on_pane_ready`(三条 pane 建立路径共用的注入点)+
+  `crates/mullion-app/tests/shell_osc7_live.rs`(拿真 bash 验转义)
 - 解析:`crates/mullion-term/src/remote_state.rs`(纯函数,14 条测试)
 - 采集:`Emulator::feed` 里跑 `Osc7Sniffer`,`Emulator::take_remote_state` 取走
 - 落地:`Workspace::pump`(`crates/mullion-app/src/shell/workspace/mod.rs`)→
