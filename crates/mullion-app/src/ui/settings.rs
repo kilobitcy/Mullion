@@ -336,7 +336,8 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
                 "分屏刚连上时往远端 shell 发一行命令,让它此后每个提示符都报一次当前目录。\
                  上面那条只在远端开着 tmux 时管用,这条管的是不经过 tmux 的场景 ——\
                  文件面板继承终端所在目录靠它。\
-                 只改这条 shell 内存里的 PROMPT_COMMAND(不写远端任何文件,断开即消失),\
+                 只改这条 shell 内存里的提示符钩子(bash 是 PROMPT_COMMAND,zsh 是 precmd_functions;\
+                 不写远端任何文件,断开即消失),\
                  发完会清一次屏,所以登录横幅会被一起清掉。\
                  远端 shell 不是 bash / zsh(比如 fish)时,屏幕上会打出一行报错,\
                  那种情况请关掉这个开关。",
