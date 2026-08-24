@@ -5152,14 +5152,26 @@ impl App {
     /// `ByteSink::write` 是**同步**的(`try_send` 语义),不需要起 task。
     /// 写失败(出站队列满 / channel 已死)只记一行日志:这是锦上添花的功能,
     /// 拿不到目录就退回 F120 配置的默认远端目录,不该把连接本身搅黄。
+    ///
+    /// `may_clear_screen`:断线重连传 `false` —— 那条路径的 shell 是
+    /// `reattach_pane` 刚接回来的,本地屏幕内容被刻意保留,注入串自带的
+    /// `clear` 会把它抹掉。其余三处调用点传 `true`。
     fn on_pane_ready(
         &mut self,
         generation: u64,
         pane: PaneId,
         sink: Arc<mullion_ssh::session::SshSession>,
         plan: Option<crate::automation::PendingAutomation>,
+        may_clear_screen: bool,
     ) {
-        if self.settings.shell_osc7_bootstrap {
+        // F156-c 回归修复:断线重连(F128)刻意保留断线前的屏幕内容
+        // (`reattach_pane`,守护见 `reattach_keeps_the_screen_but_rehost_wipes_it`)。
+        // OSC 7 注入串以 `clear` 收尾,对**每一块**重连成功的 pane 无条件发的话
+        // 会把刚保住的内容抹掉,跟这块 pane 有没有登录后命令(`plan`)毫无关系。
+        // `PaneReconnected` 分支传 `false`,其余三处(首次连接 / 分屏新开 /
+        // 换节点)传 `true` —— 那三种情况下这块 pane 从用户视角看本来就是
+        // 「全新出现」的,清屏没有代价。
+        if may_clear_screen && self.settings.shell_osc7_bootstrap {
             let bytes = crate::shell_bootstrap::osc7_setup_line();
             if let Err(e) = mullion_ssh::schedule::ByteSink::write(sink.as_ref(), bytes) {
                 log::warn!(
@@ -5648,7 +5660,7 @@ impl App {
         // 建标签的这个 pane 照配置**全套**跑,含 tmux
         // (`PaneId(1)` 见 `Workspace::new`)。F156-c:注入也在这里发,
         // 见 `on_pane_ready`。
-        self.on_pane_ready(generation, PaneId(1), ssh, plan);
+        self.on_pane_ready(generation, PaneId(1), ssh, plan, true);
         self.request_ui_redraw();
     }
 
@@ -6548,7 +6560,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .and_then(|tab| tab.content.as_terminal())
                         .and_then(|t| t.automation_template.as_ref())
                         .and_then(crate::automation::pending_for_extra_pane);
-                    self.on_pane_ready(generation, id, sink, plan);
+                    self.on_pane_ready(generation, id, sink, plan, true);
                 }
                 self.ui_dirty = true;
                 self.request_ui_redraw();
@@ -6636,7 +6648,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(sink) = attached {
                     // 用户拍板:换过节点的 pane 要跑**新节点**的登录后命令,
                     // 规则同分屏新开的那些 —— 跳过 tmux,其余照跑。
-                    self.on_pane_ready(generation, pane, sink, pending.plan);
+                    self.on_pane_ready(generation, pane, sink, pending.plan, true);
                     self.ui.set_toast("已换节点");
                     self.ui_dirty = true;
                     self.request_ui_redraw();
@@ -6805,7 +6817,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // F156-c:重连出来的 channel 也是一条刚起的干净 shell
                         // (真正的 tmux attach 是 `plan` 里的一步,还没发出去),
                         // 同样要经 `on_pane_ready` 注入 OSC 7。
-                        self.on_pane_ready(generation, id, sink, plan);
+                        self.on_pane_ready(generation, id, sink, plan, false);
                     }
                 }
                 // 零个 pane 真接上却弹「已重新连接」是名不副实——那种情况下
@@ -12798,6 +12810,46 @@ mod tests {
         assert!(
             body.contains("self.settings.shell_osc7_bootstrap"),
             "注入没读开关,用户关不掉"
+        );
+    }
+
+    /// F156-c 回归修复:断线重连(`PaneReconnected`)**不许**清屏。
+    ///
+    /// `reattach_pane` 刻意保留断线前的屏幕内容(见
+    /// `reattach_keeps_the_screen_but_rehost_wipes_it`)—— 而 F156-c 加的
+    /// OSC 7 注入串以 `clear` 收尾,对每一块重连成功的 pane 无条件发,跟
+    /// `plan` 是不是 `None` 毫无关系。这条判据是:注入这一步是否被一个「允许
+    /// 清屏」的开关挡住,重连路径必须把这个开关传 `false`。
+    ///
+    /// 同一族设计原则见 F156-b:`rehost_pane`(用户手动操作)跟焦点,
+    /// `reattach_pane`(后台自愈)刻意不跟 —— 断线重连不该打扰用户的屏幕。
+    ///
+    /// 锚点拆开拼(`concat!`)、用 `rsplit(start).next()` 取最后一次出现,
+    /// 理由同 `reconnect_reruns_post_login_automation`:直接写完整字面量
+    /// 会被这条测试自己的源码(`start` 那个字符串字面量)算成一次出现,
+    /// 挤掉真正要切的那个分支。
+    ///
+    /// 自证会变红:把 `PaneReconnected` 分支里传给 `on_pane_ready` 的那个
+    /// bool 改回 `true`(或者把 `on_pane_ready` 里这个开关的判断删掉)。
+    #[test]
+    fn reconnecting_never_clears_the_screen_even_with_a_pending_plan() {
+        let src = include_str!("app.rs");
+        let start = concat!("UserEvent::Pane", "Reconnected {");
+        let stop = concat!("UserEvent::Pane", "ReconnectErr {");
+        let after = src
+            .rsplit(start)
+            .next()
+            .expect("找不到 PaneReconnected 分支");
+        let raw = &after[..after.find(stop).expect("找不到 PaneReconnected 分支的结尾")];
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("self.on_pane_ready(generation, id, sink, plan, false)"),
+            "PaneReconnected 分支没有把「允许清屏」传 false —— 重连会抹掉\
+             reattach_pane 刚保住的屏幕内容:{body}"
         );
     }
 
