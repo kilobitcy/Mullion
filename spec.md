@@ -87,7 +87,7 @@ Mullion 的赌注是：**这个交集市场没人做，而它正在快速变大*
 |---|---|---|---|
 | F10 | VT100/xterm 仿真：256 色、truecolor、alternate screen、滚动区域 | P0 | `vttest` 主要项目通过；VT 快照测试覆盖 |
 | F11 | **同步输出（DEC 2026）**：在 BSU/ESU 之间攒帧，收到 ESU 才提交 | P0 | 单测：喂入含 `CSI ? 2026 h/l` 的序列，断言中间态未触发 present |
-| F12 | 差分渲染：用 `Term::damage()` 只重画脏行 | P0 | 单测：只改一行后，damage 只含那一行 |
+| F12 | 差分整形：按行内容指纹跳过未变行的文本整形（不用 `Term::damage()`，理由见 [adr-011](docs/adr-011-row-fingerprint-vs-term-damage.md)） | P0 | 单测：只改一行后，脏行集合只含那一行 |
 | F13 | Kitty 键盘协议；不支持时优雅退化 | P0 | 见 F14 |
 | F14 | **Shift+Enter 正确编码**（Kitty → CSI-u；否则 → `ESC CR`），Ctrl+J 恒为 `\n` | P0 | `keymap` 单测已覆盖 |
 | F15 | SGR 鼠标上报；**按住 Shift 强制走本地划选** | P0 | `keymap` 单测已覆盖 |

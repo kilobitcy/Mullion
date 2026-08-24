@@ -155,6 +155,28 @@
   `SnapCell.spacer` **只标 `WIDE_CHAR_SPACER`**;把 LEADING 也标会让下游漏画那一列背景。
   守护:`emulator::tests::snapshot_cjk_line_wrap_leading_spacer_is_not_spacer`。
 
+### 行指纹的字段覆盖面必须与整形读到的字段同源（F12）
+
+**症状**：屏幕上留着一行陈旧的字。编译不报错、测试不报错、日志不报错,
+只有人眼能发现,而且多半只在特定操作后偶发(比如「换了主题但有一行没跟着变」)。
+
+**规则**：`snapshot::hash_row` 喂进哈希的字段,必须**恰好等于**
+`text::row_to_runs` / `row_to_spans` 真正读到的字段。少喂一个,那一类变化
+就静默不重画。当前是 `SnapCell` 的全部六个字段。
+
+**守护(两层,缺一不可)**：
+- 存量字段:`snapshot.rs` 的 `mod tests` 里六条 `a_changed_*_changes_the_row_hash`,
+  一条对一个字段。
+- 增量字段:`hash_row` 函数体内的**穷尽解构**
+  `let SnapCell { ch, fg, bg, width, spacer, selected } = *cell;`。给 `SnapCell`
+  加字段时这里会当场编译报错,强迫作者对「进不进哈希」表态。**不要**把它改成
+  `cell.ch` 那种点号取字段的写法——那样加字段就没有任何提示了。
+
+同一条纪律的另一半在 app 侧:组字行**绝不能**写进 `ShapedCache`
+(见 `shaped_cache::plan_row` 的文档)。写进去的话,用户按 Esc 取消组字后
+指纹没变、缓存命中,会复用那份**带拼音空洞的** buffer——被盖住的几个字
+永久消失。
+
 ## SSH（平台差异）
 
 - **`AgentClient::connect_env()` 仅 Unix。** Windows 的 ssh-agent 走命名管道,无此函数,
