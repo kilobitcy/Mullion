@@ -21,6 +21,9 @@ use crate::ui::shortcuts::SHORTCUTS;
 /// 点不中,`interact` 里那句 panic 才是唯一的提示。
 const BOOTSTRAP_LABEL: &str = "自动配置远端 tmux 的状态上报";
 
+/// F156-c 那个开关的标签。同上,实现与测试**共用这一份**。
+const OSC7_LABEL: &str = "让远端 shell 报出当前目录(非 tmux 场景)";
+
 /// 三档的中文标签。**实现与测试共用同一份** —— 各写一遍的话,改文案时
 /// 测试会静默地点不中,`interact` 里那句 panic 才是唯一的提示。
 const LEVEL_ERROR_LABEL: &str = "只记错误";
@@ -58,6 +61,8 @@ pub struct SettingsDraft {
     pub confirm_password: String,
     /// F124:自动配置远端 tmux 状态上报。
     pub tmux_bootstrap: bool,
+    /// F156-c:往远端 shell 注入一次 OSC 7 上报。
+    pub shell_osc7_bootstrap: bool,
     /// F155:日志详细档位。回写进 `Settings` 与施加到 log facade 都在
     /// `app.rs` 的「确定」分支里做。
     pub log_level: mullion_store::LogLevel,
@@ -73,6 +78,7 @@ impl SettingsDraft {
             new_password: String::new(),
             confirm_password: String::new(),
             tmux_bootstrap: s.tmux_bootstrap,
+            shell_osc7_bootstrap: s.shell_osc7_bootstrap,
             log_level: s.log_level,
         }
     }
@@ -282,7 +288,11 @@ fn appearance(
     });
 }
 
-/// 远端分节:自动配置 tmux 状态上报(F124)。
+/// 远端分节:自动配置 tmux 状态上报(F124)+ 让远端 shell 报出当前目录(F156-c)。
+///
+/// **两个独立开关**,不是一个。副作用完全不同:F124 改的是远端 tmux 服务器
+/// 内存里的全局选项,F156-c 往用户**当前这条 shell** 里写一行命令并清屏。
+/// 想只关掉其中一件是合理诉求,一个开关做不到。
 ///
 /// 走 `form::grid` 两列骨架(规范 #1):复选框和灰字说明都挂**输入列**、
 /// 标签列留空(规范 #6),否则它俩会从 x=0 起画,跟上下两个分节里所有输入框
@@ -305,6 +315,31 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
                  分屏标题条上的目录名、以及文件面板继承终端所在目录都靠它。\
                  改的是 tmux 服务器内存里的全局选项(不写任何文件,server 退出即失效),\
                  那台机器上 attach 同一个 tmux 的其它终端,窗口标题也会跟着变成这个格式。",
+            )
+            .size(11.0)
+            .color(theme::c32(t.fg_dim)),
+        );
+        ui.end_row();
+
+        ui.label("");
+        if ui
+            .checkbox(&mut draft.shell_osc7_bootstrap, OSC7_LABEL)
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
+
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "分屏刚连上时往远端 shell 发一行命令,让它此后每个提示符都报一次当前目录。\
+                 上面那条只在远端开着 tmux 时管用,这条管的是不经过 tmux 的场景 ——\
+                 文件面板继承终端所在目录靠它。\
+                 只改这条 shell 内存里的 PROMPT_COMMAND(不写远端任何文件,断开即消失),\
+                 发完会清一次屏,所以登录横幅会被一起清掉。\
+                 远端 shell 不是 bash / zsh(比如 fish)时,屏幕上会打出一行报错,\
+                 那种情况请关掉这个开关。",
             )
             .size(11.0)
             .color(theme::c32(t.fg_dim)),
@@ -495,6 +530,7 @@ mod tests {
             new_password: String::new(),
             confirm_password: String::new(),
             tmux_bootstrap: true,
+            shell_osc7_bootstrap: true,
             log_level: mullion_store::LogLevel::Info,
         }
     }
@@ -717,6 +753,7 @@ mod tests {
             new_password: String::new(),
             confirm_password: String::new(),
             tmux_bootstrap: true,
+            shell_osc7_bootstrap: true,
             log_level: mullion_store::LogLevel::Info,
         };
         let (texts, _) = run(&mut d, false);
@@ -907,6 +944,67 @@ mod tests {
         };
         assert!(!SettingsDraft::from_settings(&s).tmux_bootstrap);
         assert!(SettingsDraft::from_settings(&mullion_store::Settings::default()).tmux_bootstrap);
+    }
+
+    // ---- F156-c 远端分节第二个开关 ----
+
+    /// F156-c:点这个开关要当场回报 `Preview`(草稿变了、要重画),
+    /// 「确定」时才落盘。回报 `None` 的话用户点了没反应。
+    ///
+    /// 用文件里既有的 `interact` 脚手架(跑满 `FRAMES` 帧预热,再按标签文字
+    /// 找部件中心点下去;复选框是 `Sense::click()`,要同帧松手)。
+    ///
+    /// 自证会变红:把 `remote()` 里这个复选框的 `.changed()` 分支删掉。
+    #[test]
+    fn toggling_the_shell_osc7_checkbox_reports_a_preview() {
+        let mut d = draft();
+        assert!(d.shell_osc7_bootstrap, "脚手架的初值该是开着的");
+        let out = interact(&mut d, OSC7_LABEL, egui::Vec2::ZERO, true);
+        assert!(
+            !d.shell_osc7_bootstrap,
+            "复选框没被真的点到,这条测试测了个寂寞"
+        );
+        assert_eq!(out, SettingsOut::Preview);
+    }
+
+    /// F156-c:两个开关是**独立**的 —— 点了这个,F124 那个不许跟着动。
+    /// 它们的副作用完全不同(一个改远端 tmux 服务器的内存选项,一个往用户
+    /// 当前这条 shell 里写命令并清屏),串在一起等于把「只关掉其中一件」
+    /// 这个合理诉求堵死。
+    ///
+    /// 自证会变红:把 `remote()` 里第二个 `checkbox` 的第一个参数写成
+    /// `&mut draft.tmux_bootstrap`(**这正是复制粘贴最容易出的错**,
+    /// 而且它不报错、只是两个开关联动)。
+    #[test]
+    fn the_two_remote_switches_are_independent() {
+        let mut d = draft();
+        let _ = interact(&mut d, OSC7_LABEL, egui::Vec2::ZERO, true);
+        assert!(!d.shell_osc7_bootstrap, "点的是 OSC 7 那个");
+        assert!(d.tmux_bootstrap, "点 OSC 7 那个把 F124 的开关也带翻了");
+
+        let mut d = draft();
+        let _ = interact(&mut d, BOOTSTRAP_LABEL, egui::Vec2::ZERO, true);
+        assert!(!d.tmux_bootstrap, "点的是 tmux 那个");
+        assert!(
+            d.shell_osc7_bootstrap,
+            "点 tmux 那个把 OSC 7 的开关也带翻了"
+        );
+    }
+
+    /// F156-c:草稿从**落盘的真值**起。起错了的症状是「用户关掉过,再打开
+    /// 设置弹窗又显示开着」—— 而只要他这时点了确定,关掉的选择就被覆盖回去。
+    ///
+    /// 自证会变红:把 `from_settings` 里那行改成 `shell_osc7_bootstrap: true,`。
+    #[test]
+    fn the_osc7_draft_starts_from_the_stored_switch() {
+        let s = mullion_store::Settings {
+            shell_osc7_bootstrap: false,
+            ..Default::default()
+        };
+        assert!(!SettingsDraft::from_settings(&s).shell_osc7_bootstrap);
+        assert!(
+            SettingsDraft::from_settings(&mullion_store::Settings::default()).shell_osc7_bootstrap
+        );
     }
 
     /// 快捷键一览真的画出来了(不是一个空表)。

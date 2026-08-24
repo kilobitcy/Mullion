@@ -10347,6 +10347,7 @@ mod tests {
                 new_password: "hunter2".into(),
                 confirm_password: "hunter2".into(),
                 tmux_bootstrap: true,
+                shell_osc7_bootstrap: true,
                 log_level: mullion_store::LogLevel::Info,
             };
             let _ = finish_password_change(Some(&mut d), r, "已生效");
