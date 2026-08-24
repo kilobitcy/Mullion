@@ -120,7 +120,16 @@ pub fn show(
 ) -> Option<HistoryOut> {
     let d = draft.as_mut()?;
     let mut out = None;
+    // F156-a:`.open()` 就是标题栏右上角那个 ×。**用 egui 自带的、不自绘一个
+    // `×` 字符** —— 它是 `line_segment` 画的,不碰 T9 的字形白名单
+    // (`tests/glyph_whitelist.rs`);自绘的话得往 `ui::glyphs::VERIFIED` 里
+    // 登记一个系统本来就提供的控件,不划算。
+    //
+    // × 与底部的「不恢复」并存:后者是键盘路径的出口(Tab 够得到),
+    // 前者是鼠标路径的直觉位置。删掉任一个都会让某一类用户找不到出口。
+    let mut open = true;
     egui::Window::new("恢复上次的现场")
+        .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -207,6 +216,16 @@ pub fn show(
                 }
             });
         });
+    // F156-a:× 和 Esc 同一个出口,都回报既有的 `Dismiss`。
+    //
+    // `get_or_insert` 而不是直接赋值:同一帧里既点了某一行、又把窗关掉,在
+    // 物理上不可能,但让「先发生的结论优先」是显式的,比依赖那个不可能性稳。
+    //
+    // Esc 直接读 `ctx`:这个弹窗里没有文本框,不需要
+    // `session_manager::keys::scan` 那套 `typing` 让位逻辑。
+    if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        out.get_or_insert(HistoryOut::Dismiss);
+    }
     out
 }
 
@@ -389,6 +408,102 @@ mod tests {
     fn click_row(draft: &mut Option<HistoryDraft>, i: usize) -> Option<HistoryOut> {
         let head = draft.as_ref().expect("草稿").rows[i].head.clone();
         click(draft, &head)
+    }
+
+    /// 点标题栏右上角的 ×。
+    ///
+    /// **不能用上面的 `click(label)`** —— 那个靠找 `Shape::Text` 定位,而 egui
+    /// 的 close button 是两条 `line_segment` 画出来的,树里根本没有文字。
+    /// 改从本帧的 accesskit 树里按 egui 给它登记的 label 取 rect
+    /// (`egui/src/containers/window.rs` 的 `close_button`:
+    /// `WidgetInfo::labeled(WidgetType::Button, .., "Close window")`)。
+    ///
+    /// 取不到就 panic 并把树里所有 label 打出来:egui 换版本改了这个 label
+    /// 的话,这条测试要**当场报出来**,而不是静默点到别处、变成一条恒绿。
+    fn click_close_x(draft: &mut Option<HistoryDraft>) -> Option<HistoryOut> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        // 开了才构树(egui 的 `accesskit` feature 已由 `mullion-app` 打开)。
+        ctx.enable_accesskit();
+        // 两帧:`egui::Window` 首帧 `fade_in`,几何还没落定(同 `texts` 的说明)。
+        // 开着 accesskit 时**每帧都会**产出一棵完整的树,所以取最后一帧那棵。
+        let mut update = None;
+        for _ in 0..2 {
+            let mut full = ctx.run(egui::RawInput::default(), |ctx| {
+                show(ctx, &t, draft);
+            });
+            update = full.platform_output.accesskit_update.take();
+        }
+        let nodes = update.expect("开了 accesskit 却没有产出树").nodes;
+        let labels: Vec<String> = nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().map(str::to_string))
+            .collect();
+        let b = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Close window"))
+            .and_then(|(_, n)| n.bounds())
+            .unwrap_or_else(|| panic!("accesskit 树里没有关闭按钮;树里现有的 label:{labels:?}"));
+        let pos = egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let mut out = None;
+        let _ = ctx.run(input, |ctx| {
+            out = show(ctx, &t, draft);
+        });
+        out
+    }
+
+    /// F156-a:用户报的是「这个弹窗看起来关不掉」—— 底部虽然有「不恢复」,
+    /// 但弹窗右上角没有 ×,而那是所有人找出口的第一个地方。
+    ///
+    /// 回报的是**既有的** `Dismiss`,不新增出口变体:`app.rs` 那侧
+    /// 「无论恢复还是不恢复都把弹窗收掉」的处置一行都不用动。
+    ///
+    /// 自证会变红:把 `show` 里的 `.open(&mut open)` 去掉
+    /// (树里就没有那个按钮了,脚手架的 panic 会打出实际的 label 列表)。
+    #[test]
+    fn closing_the_window_with_the_title_bar_x_reports_dismiss() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        assert_eq!(click_close_x(&mut draft), Some(HistoryOut::Dismiss));
+    }
+
+    /// F156-a:Esc 也是出口。× 只照顾鼠标,而这个弹窗是**启动时**弹的 ——
+    /// 用户此刻手还在键盘上。
+    ///
+    /// 自证会变红:把 `show` 末尾那个 `key_pressed(Escape)` 分支删掉。
+    #[test]
+    fn pressing_escape_closes_the_dialog() {
+        let mut draft = Some(HistoryDraft::new(rows()));
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        // 两帧预热,理由同 `texts`。
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(ctx, &t, &mut draft);
+            });
+        }
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        let mut out = None;
+        let _ = ctx.run(input, |ctx| {
+            out = show(ctx, &t, &mut draft);
+        });
+        assert_eq!(out, Some(HistoryOut::Dismiss));
     }
 
     /// `None` 的草稿什么都不画 —— 弹窗关着就是关着。
