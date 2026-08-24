@@ -383,6 +383,14 @@ mod tests {
             back.settings.shell_osc7_bootstrap,
             "老文件缺这个字段时该默认开"
         );
+        // `impl Default` 那一行单独钉一次:上面那条走的是 `serde(default)`
+        // 函数,`Settings::default()` 是另一条路 —— 全新用户(没有
+        // settings.toml)走的正是它。两条都写着 `true`,但没人保证下次有人
+        // 改的时候两条一起改。
+        assert!(
+            Settings::default().shell_osc7_bootstrap,
+            "全新用户拿到的默认值该是开的"
+        );
     }
 
     /// 关掉之后要真的留得住 —— 这条命令是往用户当前这条 shell 里写东西并
