@@ -217,7 +217,16 @@ pub struct TextLayer {
     atlas: TextAtlas,
     viewport: Viewport,
     renderer: TextRenderer,
-    buffers: Vec<Buffer>, // 每屏面行一个
+    /// F12:跨帧的整形缓存,按 `(PaneId, row)` 分槽。取代了原来那个
+    /// "每帧从头填一遍"的 `Vec<Buffer>`。
+    cache: crate::shaped_cache::ShapedCache<Buffer>,
+    /// 空闲的 `Buffer` 回收池。缓存逐出、重整形、清空时的旧 buffer 都进这里,
+    /// 整形时优先从这里取 —— 每帧新建上千个 `Buffer` 就是陷阱 T3,而且滚动
+    /// 场景(每帧每行都变)不回收会比改之前更慢。
+    pool: Vec<Buffer>,
+    /// 临时槽:IME 组字行的正文 + 拼音串 overlay。**它们绝不进 `cache`**
+    /// (理由见 `shaped_cache::plan_row` 的文档)。当池子用,不每帧清空。
+    temp: Vec<Buffer>,
     pub cell_w: f32,
     pub cell_h: f32,
     /// F21:当前生效的字体族。`None` = [`DEFAULT_FONT_FAMILY`]。
@@ -239,6 +248,54 @@ pub fn pane_bounds_ltrb(term: PxRect) -> (i32, i32, i32, i32) {
     let l = term.x as i32;
     let t = term.y as i32;
     (l, t, l + term.w as i32, t + term.h as i32)
+}
+
+/// 把一段 run 整形进 `buf`。**整个渲染路径上唯一调用 `shape_until_scroll`
+/// 的地方** —— 缓存命中时根本不会走到这里,那正是 F12 的收益。
+///
+/// `avail`(交给 `Buffer::set_size` 的可用宽度)按「从这一列到 pane 右缘」
+/// 给,不是整个 pane 宽度:给多了 cosmic-text 不会截断(我们本来就不靠它
+/// 换行,行尾由 `TextBounds` 裁),给少了才会误折行。
+///
+/// 复用来的 buffer 带着上一次的 metrics,所以每次都要 `set_metrics`
+/// (换字号/换 DPI 那一帧不重设,字会按旧行高排)。
+#[allow(clippy::too_many_arguments)]
+fn shape_run(
+    buf: &mut Buffer,
+    fs: &mut FontSystem,
+    metrics: Metrics,
+    spans: &[(String, Color)],
+    col: u16,
+    term_w: u32,
+    cell_w: f32,
+    cell_h: f32,
+    attrs: Attrs<'_>,
+) {
+    buf.set_metrics(fs, metrics);
+    let avail = term_w
+        .saturating_sub((f32::from(col) * cell_w) as u32)
+        .max(1) as f32;
+    buf.set_size(fs, Some(avail), Some(cell_h));
+    let iter = spans.iter().map(|(s, c)| (s.as_str(), attrs.color(*c)));
+    buf.set_rich_text(fs, iter, attrs, Shaping::Advanced);
+    buf.shape_until_scroll(fs, false);
+}
+
+/// 本帧某个 `TextArea` 的 buffer 存在哪。
+#[derive(Clone, Copy)]
+enum BufSrc {
+    /// 在跨帧缓存里:`(键, 这一行第几个 run)`。
+    Cached((mullion_core::layout::PaneId, u16), usize),
+    /// 在临时槽里(IME 组字)。
+    Temp(usize),
+}
+
+/// 本帧要画的一段文字:画在哪个 pane 的哪一行哪一列,buffer 在哪。
+struct Placement {
+    pane_ix: usize,
+    row: u16,
+    col: u16,
+    src: BufSrc,
 }
 
 impl TextLayer {
@@ -266,7 +323,9 @@ impl TextLayer {
             atlas,
             viewport,
             renderer,
-            buffers: Vec::new(),
+            cache: crate::shaped_cache::ShapedCache::new(),
+            pool: Vec::new(),
+            temp: Vec::new(),
             cell_w,
             cell_h: line_h,
             family: family.map(str::to_string),
@@ -294,6 +353,14 @@ impl TextLayer {
         self.font_px = font_px;
         self.cell_h = (font_px * 1.25).ceil();
         self.cell_w = measure_cell_w(&mut self.font_system, font_px, self.cell_h, family);
+        // F12:换字体族/字号/DPI 会让所有已 shape 的 buffer 的 metrics 整体
+        // 作废。这是缓存**唯一的显式失效 hook** —— 别的失效源(内容、SGR、
+        // 选区、主题、pane 宽度)全部由行指纹与 `term_w` 自动覆盖,不需要
+        // 也不应该在各自的入口处再加 hook。
+        //
+        // `pool` / `temp` 不必清:整形路径每次都调 `set_metrics`,池里的
+        // buffer 不会带着陈旧 metrics 上屏。
+        self.cache.clear(&mut self.pool);
     }
 
     /// 当前生效的族名,交给 cosmic-text 的那一份(`None` 时是内置默认)。
@@ -332,8 +399,18 @@ impl TextLayer {
 
     /// 为所有 pane 准备文字。每个 pane 用自己的 `term_px` 作原点**和**裁剪框。
     ///
-    /// buffers 按 `pane_ix` 分段线性存放,与 `areas` 的顺序一一对应 —— glyphon
-    /// 的 `prepare` 要求 buffer 借用活到 `render`,所以不能边建边丢。
+    /// # F12 差分整形
+    ///
+    /// 第一遍逐 `(PaneId, row)` 查 [`crate::shaped_cache::ShapedCache`]:
+    /// 行指纹与 pane 像素宽都没变就**直接复用上一帧 shape 好的 buffer**,
+    /// 连 `row_to_runs` 都不调(它每行要建一批 `String`)。
+    ///
+    /// 改这里之前先读 `shaped_cache::plan_row` 的文档 —— 尤其是"组字行为
+    /// 什么绝不能进缓存"。
+    ///
+    /// 第二遍建 `TextArea`:glyphon 的 `prepare` 要求 buffer 借用活到
+    /// `render`,所以两遍不能合成一遍。`left`/`top`/`bounds` 每帧现算,
+    /// 因此**拖动分屏、移动 pane 不需要重整形**,只有宽度变了才需要。
     pub fn prepare_panes(
         &mut self,
         device: &wgpu::Device,
@@ -342,113 +419,175 @@ impl TextLayer {
         res: Resolution,
         preedit_fg: Rgb,
     ) -> Result<(), glyphon::PrepareError> {
+        use crate::shaped_cache::{CachedRun, RowPlan};
+
         self.viewport.update(queue, res);
         let metrics = grid_metrics(self.font_px, self.cell_h);
-
-        // 第一遍:填 buffer(要先全部填完,才能借它们建 TextArea)。
-        // 每个 buffer 对应一个 `RowRun`,`placements` 记它该落在哪(第二遍用)。
-        // 一个 buffer 一个 run 而不是一行:见 `row_to_runs` 的文档(CJK 错位)。
-        //
-        // **复用而不是每帧 clear + new**:满屏 CJK 时 run 数是行数的几十倍
-        // (每个汉字自成一 run),每帧重新分配近千个 `Buffer` 就是 T3 那一类
-        // 「GPU 没事干、CPU 在烧」。`buffers` 当池子用,末尾多出来的 truncate 掉。
-        let mut placements: Vec<(usize, u16, u16)> = Vec::new();
         // 族名先克隆到局部:`Attrs` 借的是 `&str`,直接借 `self.family` 的话
         // 下面就没法再 `&mut self.font_system` 了(E0502)。每帧一次短字符串
-        // 克隆,相对每帧几千个 glyph 的整形开销可以忽略。
+        // 克隆,相对整形开销可以忽略。
         let family_owned = self.family_name().to_string();
         let attrs = Attrs::new().family(Family::Name(&family_owned));
-        // 字段级借用分割:`font_system` 与 `buffers` 是两个字段,分别可变借用
+        // 字段级借用分割:这几个是 `TextLayer` 的不同字段,分别可变借用
         // 合法;写成 `self.xxx` 穿插调用就借不出来了。
         let fs = &mut self.font_system;
-        let bufs = &mut self.buffers;
+        let cache = &mut self.cache;
+        let pool = &mut self.pool;
+        let temp = &mut self.temp;
         let (cell_w, cell_h) = (self.cell_w, self.cell_h);
-        let mut n = 0usize;
-        for (pi, p) in panes.iter().enumerate() {
+
+        cache.begin_frame();
+        let mut plan: Vec<Placement> = Vec::new();
+        let mut temp_n = 0usize;
+        let (mut hits, mut misses) = (0u64, 0u64);
+
+        for (pane_ix, p) in panes.iter().enumerate() {
+            // 缓存键必须是稳定身份。`pane_ix` 是当帧下标,关掉中间一块
+            // pane 会让它挪位 —— 拿它当键会张冠李戴。
+            let pane_id = p.geom.id;
+            let term_w = p.geom.term_px.w;
             for row in 0..p.snap.rows {
                 // F126:组字中的拼音串占的列区间只在光标行生效——正文 run 要
                 // 在这个区间让路(见 `row_to_runs` 的 `hidden` 参数文档),
                 // 不然背景 quad 盖不住排在它后面的文字层,拼音会和原字符的
-                // 字形叠在一起。判断本身是纯函数 `hidden_span_for_row`,
-                // 见它的文档——这正是原 bug 溜过测试的那层接线。
+                // 字形叠在一起。
                 let hidden = hidden_span_for_row(p, row);
-                for run in row_to_runs(p.snap.row(row), hidden) {
-                    if n == bufs.len() {
-                        bufs.push(Buffer::new(fs, metrics));
+                let key = (pane_id, row);
+                let hash = p.snap.row_hash(row);
+                match crate::shaped_cache::plan_row(cache.get(key), hash, term_w, hidden.is_some())
+                {
+                    RowPlan::Reuse => {
+                        hits += 1;
+                        cache.touch(key);
+                        if let Some(r) = cache.get(key) {
+                            for (ix, run) in r.runs.iter().enumerate() {
+                                plan.push(Placement {
+                                    pane_ix,
+                                    row,
+                                    col: run.col,
+                                    src: BufSrc::Cached(key, ix),
+                                });
+                            }
+                        }
                     }
-                    let buf = &mut bufs[n];
-                    // 复用来的 buffer 带着上一次的 metrics:换字号/换 DPI 那一帧
-                    // 不重设,字会按旧行高排(F21 的 `set_font` 只改 `cell_h`)。
-                    buf.set_metrics(fs, metrics);
-                    // 宽度按「从这一列到 pane 右缘」给,不是整个 pane 宽度 ——
-                    // 给多了 cosmic-text 不会截断(我们本来就不靠它换行,行尾
-                    // 由 `TextBounds` 裁),给少了才会误折行。
-                    let avail = p
-                        .geom
-                        .term_px
-                        .w
-                        .saturating_sub((f32::from(run.col) * cell_w) as u32)
-                        .max(1) as f32;
-                    buf.set_size(fs, Some(avail), Some(cell_h));
-                    let iter = run.spans.iter().map(|(s, c)| (s.as_str(), attrs.color(*c)));
-                    buf.set_rich_text(fs, iter, attrs, Shaping::Advanced);
-                    buf.shape_until_scroll(fs, false);
-                    placements.push((pi, row, run.col));
-                    n += 1;
+                    RowPlan::Reshape => {
+                        misses += 1;
+                        // 先把旧载荷收回池子再整形,否则滚动场景每帧新建
+                        // 上千个 `Buffer`(T3),比改之前还慢。
+                        cache.recycle_row(key, pool);
+                        let mut runs: Vec<CachedRun<Buffer>> = Vec::new();
+                        for run in row_to_runs(p.snap.row(row), hidden) {
+                            let mut buf = pool.pop().unwrap_or_else(|| Buffer::new(fs, metrics));
+                            shape_run(
+                                &mut buf, fs, metrics, &run.spans, run.col, term_w, cell_w, cell_h,
+                                attrs,
+                            );
+                            plan.push(Placement {
+                                pane_ix,
+                                row,
+                                col: run.col,
+                                src: BufSrc::Cached(key, runs.len()),
+                            });
+                            runs.push(CachedRun {
+                                col: run.col,
+                                payload: buf,
+                            });
+                        }
+                        // 空 `runs` 也要写:整行空白的产物就是空集,不写条目
+                        // 的话空行永远 miss,而空行是空闲画面的大头。
+                        cache.insert(key, hash, term_w, runs);
+                    }
+                    RowPlan::Temporary => {
+                        for run in row_to_runs(p.snap.row(row), hidden) {
+                            if temp_n == temp.len() {
+                                temp.push(Buffer::new(fs, metrics));
+                            }
+                            shape_run(
+                                &mut temp[temp_n],
+                                fs,
+                                metrics,
+                                &run.spans,
+                                run.col,
+                                term_w,
+                                cell_w,
+                                cell_h,
+                                attrs,
+                            );
+                            plan.push(Placement {
+                                pane_ix,
+                                row,
+                                col: run.col,
+                                src: BufSrc::Temp(temp_n),
+                            });
+                            temp_n += 1;
+                        }
+                    }
                 }
             }
-            // F126:组字中的拼音串。用与正文同一套 buffer 池,颜色取默认前景色
-            // (它盖在自己铺的默认背景上,不跟随底下那格原本的 SGR 颜色 ——
-            // 那格颜色可能恰好等于背景色,拼音就隐形了)。守卫与
-            // `hidden_span_for_row` 内部判据同源(非空 + 光标可见);preedit
-            // 串很短(几个字符),这里再算一次 `preedit_layout` 不是 T3 那一类
-            // 大分配。
+
+            // F126:组字中的拼音串本身。走临时槽,颜色取默认前景色(它盖在
+            // 自己铺的默认背景上,不跟随底下那格原本的 SGR 颜色 —— 那格
+            // 颜色可能恰好等于背景色,拼音就隐形了)。守卫与
+            // `hidden_span_for_row` 内部判据同源(非空 + 光标可见)。
             let preedit_cells = if !p.preedit.is_empty() && p.snap.cursor.visible {
                 preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit)
             } else {
                 Vec::new()
             };
             for c in &preedit_cells {
-                if n == bufs.len() {
-                    bufs.push(Buffer::new(fs, metrics));
+                if temp_n == temp.len() {
+                    temp.push(Buffer::new(fs, metrics));
                 }
-                let buf = &mut bufs[n];
-                buf.set_metrics(fs, metrics);
-                let avail = p
-                    .geom
-                    .term_px
-                    .w
-                    .saturating_sub((f32::from(c.col) * cell_w) as u32)
-                    .max(1) as f32;
-                buf.set_size(fs, Some(avail), Some(cell_h));
-                let s = c.ch.to_string();
-                let color = to_color(preedit_fg);
-                buf.set_rich_text(
+                let spans = [(c.ch.to_string(), to_color(preedit_fg))];
+                shape_run(
+                    &mut temp[temp_n],
                     fs,
-                    [(s.as_str(), attrs.color(color))],
+                    metrics,
+                    &spans,
+                    c.col,
+                    term_w,
+                    cell_w,
+                    cell_h,
                     attrs,
-                    Shaping::Advanced,
                 );
-                buf.shape_until_scroll(fs, false);
-                placements.push((pi, p.snap.cursor.row, c.col));
-                n += 1;
+                plan.push(Placement {
+                    pane_ix,
+                    row: p.snap.cursor.row,
+                    col: c.col,
+                    src: BufSrc::Temp(temp_n),
+                });
+                temp_n += 1;
             }
         }
-        // 池子里多出来的必须砍掉:留着的话上一帧的字会被下面第二遍以外的
-        // 路径看到(`buffers.len()` 是池容量,不是本帧 run 数)。
-        bufs.truncate(n);
+
+        // 帧末逐出:本帧没访问过的键(pane 关了、行数缩了、切了标签)全删,
+        // 载荷回池子。刻意不在 `close_pane` 之类的地方各加清理 hook。
+        cache.end_frame(pool);
+        crate::diag::count_reshape(hits, misses);
 
         // 第二遍:建 TextArea,bounds 用**该 pane 的**矩形而不是整窗。
         // `left` 加上 `col × cell_w` —— 这一项就是 CJK 对齐的落点:与
         // `gpu::quads_for` 画底色/光标用的是同一个式子。
-        let mut areas: Vec<TextArea> = Vec::with_capacity(self.buffers.len());
-        for (bi, &(pi, row, col)) in placements.iter().enumerate() {
-            let p = &panes[pi];
+        let mut areas: Vec<TextArea> = Vec::with_capacity(plan.len());
+        for pl in &plan {
+            let Some(p) = panes.get(pl.pane_ix) else {
+                continue;
+            };
+            let buffer = match pl.src {
+                BufSrc::Cached(key, ix) => match self.cache.get(key).and_then(|r| r.runs.get(ix)) {
+                    Some(run) => &run.payload,
+                    None => continue,
+                },
+                BufSrc::Temp(i) => match self.temp.get(i) {
+                    Some(b) => b,
+                    None => continue,
+                },
+            };
             let (left, top, right, bottom) = pane_bounds_ltrb(p.geom.term_px);
             areas.push(TextArea {
-                buffer: &self.buffers[bi],
-                left: p.geom.term_px.x as f32 + f32::from(col) * self.cell_w,
-                top: p.geom.term_px.y as f32 + f32::from(row) * self.cell_h,
+                buffer,
+                left: p.geom.term_px.x as f32 + f32::from(pl.col) * self.cell_w,
+                top: p.geom.term_px.y as f32 + f32::from(pl.row) * self.cell_h,
                 scale: 1.0,
                 bounds: TextBounds {
                     left,

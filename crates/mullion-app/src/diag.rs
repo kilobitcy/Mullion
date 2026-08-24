@@ -481,6 +481,9 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s
 }
 
+// F12(Task 6 会换成真实现):这一帧 (PaneId,row) 缓存命中/未命中数。
+pub fn count_reshape(_hits: u64, _misses: u64) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
