@@ -150,6 +150,16 @@ impl GridSnapshot {
     ///
     /// `cells.len()` 应当等于 `cols × rows`;不足的行按 0 补指纹而不是
     /// panic —— 快照是渲染路径上的东西,宁可这一帧多整形一次,也不能崩。
+    ///
+    /// **参数顺序**:`cols`、`rows` 都是 `u16` 且相邻,传反了编译器拦不住,
+    /// 运行期只会让大部分行的指纹静默退化成 0(当 cols/rows 不等时,
+    /// `r * w` 的步长跟真实布局对不上,多数切片会越界)。
+    ///
+    /// **0 这个哨兵值语义不对称**:越界返回 0,但真实内容也有 1/2^64 的
+    /// 概率恰好算出 0。下游做跨帧缓存时,"这行从未渲染过"的标记**不要**
+    /// 用裸的 `0u64`(`Vec<u64>` 默认值、`or_insert(0)` 这类写法最自然但
+    /// 会踩这个坑)—— 要用 `Option<u64>` 或专门的哨兵区分"没渲染过"和
+    /// "渲染过、恰好是 0"。
     pub fn new(cols: u16, rows: u16, cells: Vec<SnapCell>, cursor: Cursor) -> Self {
         let w = cols as usize;
         let row_hash = (0..rows as usize)
@@ -326,5 +336,38 @@ mod tests {
     fn an_out_of_range_row_hash_is_zero_not_a_panic() {
         let s = GridSnapshot::new(3, 2, vec![base(); 6], cursor_at_origin());
         assert_eq!(s.row_hash(9), 0);
+    }
+
+    /// `new()` 内部按 `cols*rows` 逐行切片时,`cells` 给少了该怎么办 —— 这是
+    /// `.map_or(0, hash_row)` 那个 `None` 分支自己的测试,跟上面那条
+    /// `an_out_of_range_row_hash_is_zero_not_a_panic` 不是一回事:那条测的是
+    /// `row_hash()` 方法对外层 `Vec<u64>` 的越界访问,`cells.len()` 恰好等于
+    /// `cols*rows`,根本不会走到这里的短切片分支。
+    ///
+    /// 传 `cols=3, rows=5` 但只给 6 个格子(刚好够 2 行):前两行能正常切出
+    /// 完整切片,指纹应等于对同一段切片直接调用 `hash_row`;第 2、3、4 行
+    /// 切片会越界,指纹按文档承诺补 0,而不是 panic。
+    ///
+    /// 自证会变红:把 `new()` 里的 `.map_or(0, hash_row)` 改成
+    /// `.map(hash_row).unwrap_or_else(|| hash_row(&[]))`
+    /// (短行不再是 0,而是空切片的 FNV 初值)。
+    #[test]
+    fn cells_shorter_than_cols_times_rows_hashes_short_rows_as_zero_without_panicking() {
+        let cells = vec![base(); 6]; // 够 2 行(cols=3),不够 5 行
+        let s = GridSnapshot::new(3, 5, cells.clone(), cursor_at_origin());
+
+        assert_eq!(
+            s.row_hash(0),
+            hash_row(&cells[0..3]),
+            "第 0 行数据完整,指纹应等于直接对该切片调用 hash_row 的结果"
+        );
+        assert_eq!(
+            s.row_hash(1),
+            hash_row(&cells[3..6]),
+            "第 1 行数据完整,指纹应等于直接对该切片调用 hash_row 的结果"
+        );
+        assert_eq!(s.row_hash(2), 0, "第 2 行已超出 cells 长度,指纹应补 0");
+        assert_eq!(s.row_hash(3), 0, "第 3 行已超出 cells 长度,指纹应补 0");
+        assert_eq!(s.row_hash(4), 0, "第 4 行已超出 cells 长度,指纹应补 0");
     }
 }

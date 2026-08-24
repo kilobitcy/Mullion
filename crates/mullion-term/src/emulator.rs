@@ -750,8 +750,11 @@ mod tests {
     ///
     /// 2 行屏面喂 3 行 → 可视区是 two/three,"one" 进了 scrollback。
     /// 回溯一行后可视区变成 one/two:原来第 0 行的 "two" 挪到了第 1 行,
-    /// 两者指纹必须相等 —— 不等就说明指纹的行号换算与 `snapshot()` 里
-    /// 既有的 `display_offset` 换算不同源,差分会在滚动时整屏误判。
+    /// 两者指纹必须相等。注意:`display_offset` 的换算全发生在
+    /// `Emulator::snapshot()`(本测试未改动的既有代码)里,`GridSnapshot::new`
+    /// 本身完全不含 offset 逻辑 —— 它只是照 `cells` 里已经换算好的顺序逐行
+    /// 切片。这条测试测的是端到端回归:将来谁把 `new()` 里的行切片写死成
+    /// 第 0 行,滚动后指纹就不会跟着内容走,这里会红。
     ///
     /// 自证会变红:把 `GridSnapshot::new` 里的行切片换成固定的第 0 行
     /// (`cells.get(0..w)`)。
