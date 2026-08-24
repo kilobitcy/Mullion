@@ -8878,6 +8878,10 @@ fn pane_still_wanted(ws: &Workspace, id: PaneId, generation: u64) -> bool {
 /// 单测范围。收一个已经算好的下标,这段就能拿真实构造的 `Workspace` 直接测。
 ///
 /// 纯函数(只碰 `&mut Workspace`),不要 runtime/proxy,可脱离真实事件循环单测。
+///
+/// 成功时顺带把**分屏焦点**设到这块 pane(F156-b)。失败路径不设 —— 开头的
+/// `pane_still_wanted` 早退挡在前面(`set_focus` 自己也有成员校验,但让早退
+/// 先挡住,语义更清楚)。
 fn rehost_pane(
     ws: &mut Workspace,
     id: PaneId,
@@ -8910,6 +8914,19 @@ fn rehost_pane(
     p.cwd = None;
     p.tmux = None;
     swap_pane_channel(p, host_ix, pty, rx);
+    // F156-b:焦点跟到这块 pane。用户刚在标题条上亲手指定了新节点,下一步
+    // 必然是往它里面敲东西。
+    //
+    // **放在这个自由函数里、不放事件分支里**:这里能拿真实构造的 `Workspace`
+    // 直接断言 `ws.focus()`;放事件分支只能写「读 `app.rs` 源码找字符串」式的
+    // 断言,那是本项目反复踩到的恒绿模式。
+    //
+    // `reattach_pane`(F128 断线自动重连)**刻意不跟着改**,理由见
+    // `rehosting_moves_the_focus_to_that_pane_but_reattaching_never_does`。
+    //
+    // 只动分屏焦点,不动 egui 的输入焦点:此刻输入焦点若在文件侧栏,本片不
+    // 把它抢回终端(那是另一类语义,用户没要)。
+    ws.set_focus(id);
     true
 }
 
@@ -11554,6 +11571,59 @@ mod tests {
             .map(|c| c.ch)
             .collect();
         assert!(!text.contains("before-the-drop"), "换机器该重建 emulator");
+    }
+
+    /// F156-b:换节点成功后,分屏焦点跟到**那块 pane**;断线重连**绝不**跟。
+    ///
+    /// 两个函数长得很像,但语义相反:
+    /// - 换节点是用户**刚刚**在标题条上亲手指定的,下一步必然是往新节点里
+    ///   敲东西,焦点不跟过去他得再点一下。
+    /// - 断线重连是后台自愈,可能发生在用户正在**另一块** pane 里打字的任意
+    ///   时刻。抢焦点等于把他正在打的字发到另一台机器上去。
+    ///
+    /// 这条差异只写注释拦不住下一次「顺手把这两个函数统一一下」的重构,
+    /// 所以拿一条**对照**测试钉住,而不是两条各测各的。
+    ///
+    /// 自证会变红:
+    /// - 删掉 `rehost_pane` 里的 `ws.set_focus(id);` → 第 3 条断言红
+    /// - 往 `reattach_pane` 里也加一句 `ws.set_focus(id);` → 第 2 条断言红
+    #[test]
+    fn rehosting_moves_the_focus_to_that_pane_but_reattaching_never_does() {
+        use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
+        let (mut ws, _probes) = ws_with(2);
+        let generation = ws.generation();
+        ws.set_focus(PaneId(1));
+        assert_eq!(
+            ws.focus(),
+            PaneId(1),
+            "脚手架的起始焦点就不在 1 号,下面两条断言分不出对错"
+        );
+
+        // 断线重连 2 号:焦点不动。
+        let (pty, rx) = fresh_pipe();
+        assert!(reattach_pane(&mut ws, PaneId(2), generation, 0, pty, rx));
+        assert_eq!(
+            ws.focus(),
+            PaneId(1),
+            "后台自愈把焦点从用户正在用的 pane 抢走了"
+        );
+
+        // 换节点 2 号:焦点跟过去。
+        let (pty, rx) = fresh_pipe();
+        assert!(rehost_pane(
+            &mut ws,
+            PaneId(2),
+            generation,
+            0,
+            pty,
+            rx,
+            mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+        ));
+        assert_eq!(
+            ws.focus(),
+            PaneId(2),
+            "换完节点焦点还留在原来那块 pane 上,用户得再点一下才能打字"
+        );
     }
 
     /// F128:`swap_pane_channel` 存在的**唯一理由**就是把 pane 挪到新 channel 上,
