@@ -12811,6 +12811,14 @@ mod tests {
             body.contains("self.settings.shell_osc7_bootstrap"),
             "注入没读开关,用户关不掉"
         );
+        // 精确锁 `&&`:只分别断言两个变量各自出现过,防不住把 `&&` 改成
+        // `||` —— 那样参数依然「被用到」,编译器不会报 unused,但
+        // `shell_osc7_bootstrap` 默认开着,断线重连(`may_clear_screen=false`)
+        // 会因为 `||` 而照样清屏,精确复现这条测试本来要防的那个回归。
+        assert!(
+            body.contains("if may_clear_screen && self.settings.shell_osc7_bootstrap"),
+            "两个条件不是 `&&` 组合了 —— 断线重连可能又会清屏:{body}"
+        );
     }
 
     /// F156-c 回归修复:断线重连(`PaneReconnected`)**不许**清屏。
