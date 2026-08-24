@@ -594,10 +594,10 @@ mod tests {
     use mullion_term::snapshot::{Cursor, CursorShape, Rgb, SnapCell};
 
     fn snap_1x1(bg: Rgb) -> GridSnapshot {
-        GridSnapshot {
-            cols: 1,
-            rows: 1,
-            cells: vec![SnapCell {
+        GridSnapshot::new(
+            1,
+            1,
+            vec![SnapCell {
                 ch: ' ',
                 fg: Rgb::new(0xcc, 0xcc, 0xcc),
                 bg,
@@ -605,14 +605,14 @@ mod tests {
                 spacer: false,
                 selected: false,
             }],
-            cursor: Cursor {
+            Cursor {
                 row: 0,
                 col: 0,
                 visible: false,
                 shape: CursorShape::Beam,
                 blinking: true,
             },
-        }
+        )
     }
 
     #[test]
@@ -696,10 +696,10 @@ mod tests {
     }
 
     fn snap_selected_1x1(fg: Rgb, bg: Rgb) -> GridSnapshot {
-        GridSnapshot {
-            cols: 1,
-            rows: 1,
-            cells: vec![SnapCell {
+        GridSnapshot::new(
+            1,
+            1,
+            vec![SnapCell {
                 ch: 'a',
                 fg,
                 bg,
@@ -707,14 +707,14 @@ mod tests {
                 spacer: false,
                 selected: true,
             }],
-            cursor: Cursor {
+            Cursor {
                 row: 0,
                 col: 0,
                 visible: false,
                 shape: CursorShape::Beam,
                 blinking: true,
             },
-        }
+        )
     }
 
     #[test]
@@ -983,18 +983,18 @@ mod tests {
             spacer: false,
             selected: false,
         };
-        GridSnapshot {
-            cols: 4,
-            rows: 2,
-            cells: vec![blank; 8],
-            cursor: mullion_term::snapshot::Cursor {
+        GridSnapshot::new(
+            4,
+            2,
+            vec![blank; 8],
+            mullion_term::snapshot::Cursor {
                 row,
                 col,
                 visible: true,
                 shape,
                 blinking: true,
             },
-        }
+        )
     }
 
     /// 只取光标那部分 quad:格子底色全是默认色,`quads_for` 不会为它们出 quad,

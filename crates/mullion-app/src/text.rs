@@ -1034,18 +1034,18 @@ mod tests {
             spacer: false,
             selected: false,
         };
-        GridSnapshot {
-            cols: 20,
-            rows: 4,
-            cells: vec![blank; 20 * 4],
-            cursor: mullion_term::snapshot::Cursor {
+        GridSnapshot::new(
+            20,
+            4,
+            vec![blank; 20 * 4],
+            mullion_term::snapshot::Cursor {
                 row: cursor_row,
                 col: cursor_col,
                 visible,
                 shape: mullion_term::snapshot::CursorShape::Block,
                 blinking: true,
             },
-        }
+        )
     }
 
     /// 光标行 + preedit 非空 + 光标可见 → `Some(正确区间)`。
