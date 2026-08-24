@@ -381,7 +381,7 @@ fn tmux_attach_for_connect(
     fallback_name: Option<&str>,
 ) -> Option<TmuxAttach> {
     Some(TmuxAttach {
-        // 建标签的那一块 —— 与下面 `start_automation(.., PaneId(1), ..)`
+        // 建标签的那一块 —— 与下面 `on_pane_ready(.., PaneId(1), ..)`
         // 是同一块 pane(`Workspace::new` 的第一块)。
         pane: PaneId(1),
         // 这个 `ws` 是刚建的,`hosts` 里只有这一条(同 `PaneOpened` 里硬编的
@@ -2289,6 +2289,7 @@ impl App {
             self.settings.font_pt = mullion_store::settings::clamp_font_pt(d.font_pt);
             self.settings.tmux_bootstrap = d.tmux_bootstrap;
             self.settings.log_level = d.log_level;
+            self.settings.shell_osc7_bootstrap = d.shell_osc7_bootstrap;
         }
     }
 
@@ -5131,6 +5132,48 @@ impl App {
         self.drive_automation();
     }
 
+    /// 一块 pane 挂上了、写口拿到手了 —— 三条路径(首次连接 / 分屏新开 /
+    /// 换节点)共用的落地动作。
+    ///
+    /// **必须是唯一入口。** 三处各写一遍,正是「列举式门控在加档时必然漏」,
+    /// 本项目已经踩中三次;漏一处的症状是那种方式开出来的 pane 永远跟不住
+    /// 目录,而且完全静默。守护:`every_pane_ready_path_goes_through_on_pane_ready`。
+    ///
+    /// 做两件事,**顺序不能反**:
+    /// 1. F156-c:注入一次 OSC 7 上报(见 `shell_bootstrap::OSC7_SETUP`)。
+    /// 2. 有计划的话,起 F40~F44 的登录后自动化。
+    ///
+    /// 注入串自带 `clear`,排在自动化之后会把用户登录后命令的输出清掉一半。
+    ///
+    /// **只在 pane 刚建立、shell 还没跑任何程序时注入。** 这是唯一安全的窗口
+    /// —— 换到 `Ctrl+Shift+B` 那一刻现写的话,pane 里可能正跑着 Claude Code
+    /// 之类的全屏 TUI,写进去的字节会变成那个 TUI 的按键输入。
+    ///
+    /// `ByteSink::write` 是**同步**的(`try_send` 语义),不需要起 task。
+    /// 写失败(出站队列满 / channel 已死)只记一行日志:这是锦上添花的功能,
+    /// 拿不到目录就退回 F120 配置的默认远端目录,不该把连接本身搅黄。
+    fn on_pane_ready(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        sink: Arc<mullion_ssh::session::SshSession>,
+        plan: Option<crate::automation::PendingAutomation>,
+    ) {
+        if self.settings.shell_osc7_bootstrap {
+            let bytes = crate::shell_bootstrap::osc7_setup_line();
+            if let Err(e) = mullion_ssh::schedule::ByteSink::write(sink.as_ref(), bytes) {
+                log::warn!(
+                    target: "mullion",
+                    "pane {} 的 OSC 7 自举没发出去({e:?}),这条 shell 不会报当前目录",
+                    pane.0
+                );
+            }
+        }
+        if let Some(plan) = plan {
+            self.start_automation(generation, pane, plan, sink);
+        }
+    }
+
     /// 首字节 / 断线两条边。挂在 `pump_io` 上而不是重绘上:最小化期间窗口
     /// 未必还会被重绘,但 `Wake` 仍会驱动 `pump_io`——否则用户最小化着连上,
     /// 自动化会一直等到超时。
@@ -5583,10 +5626,11 @@ impl App {
         // 说了这次不跑,分屏出来的 pane 却照跑不误。
         let tpl = self.pending_automation.template.take();
         let tmux_name = self.pending_automation.session_name.take();
-        if let Some(plan) = crate::automation::take_pending(
+        let plan = crate::automation::take_pending(
             &mut self.pending_automation.plan,
             &mut self.pending_automation.skip,
-        ) {
+        );
+        if plan.is_some() {
             // S1:挂回**属主标签**(按世代号查),不用「活动标签」——
             // `open` 刚把新标签设为活动,今天两者等价,但那是巧合:
             // 哪天连接成功不再顺带切换焦点,这里就会把 handle 挂错标签。
@@ -5600,10 +5644,11 @@ impl App {
                 t.tmux_attach = tmux_attach_for_connect(tpl.as_ref(), tmux_name.as_deref());
                 t.automation_template = tpl;
             }
-            // 建标签的这个 pane 照配置**全套**跑,含 tmux
-            // (`PaneId(1)` 见 `Workspace::new`)。
-            self.start_automation(generation, PaneId(1), plan, ssh);
         }
+        // 建标签的这个 pane 照配置**全套**跑,含 tmux
+        // (`PaneId(1)` 见 `Workspace::new`)。F156-c:注入也在这里发,
+        // 见 `on_pane_ready`。
+        self.on_pane_ready(generation, PaneId(1), ssh, plan);
         self.request_ui_redraw();
     }
 
@@ -6503,9 +6548,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .and_then(|tab| tab.content.as_terminal())
                         .and_then(|t| t.automation_template.as_ref())
                         .and_then(crate::automation::pending_for_extra_pane);
-                    if let Some(plan) = plan {
-                        self.start_automation(generation, id, plan, sink);
-                    }
+                    self.on_pane_ready(generation, id, sink, plan);
                 }
                 self.ui_dirty = true;
                 self.request_ui_redraw();
@@ -6593,9 +6636,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(sink) = attached {
                     // 用户拍板:换过节点的 pane 要跑**新节点**的登录后命令,
                     // 规则同分屏新开的那些 —— 跳过 tmux,其余照跑。
-                    if let Some(plan) = pending.plan {
-                        self.start_automation(generation, pane, plan, sink);
-                    }
+                    self.on_pane_ready(generation, pane, sink, pending.plan);
                     self.ui.set_toast("已换节点");
                     self.ui_dirty = true;
                     self.request_ui_redraw();
@@ -6761,9 +6802,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             _ => crate::automation::pending_for_extra_pane(&tpl),
                         };
-                        if let Some(plan) = plan {
-                            self.start_automation(generation, id, plan, sink);
-                        }
+                        // F156-c:重连出来的 channel 也是一条刚起的干净 shell
+                        // (真正的 tmux attach 是 `plan` 里的一步,还没发出去),
+                        // 同样要经 `on_pane_ready` 注入 OSC 7。
+                        self.on_pane_ready(generation, id, sink, plan);
                     }
                 }
                 // 零个 pane 真接上却弹「已重新连接」是名不副实——那种情况下
@@ -12691,6 +12733,99 @@ mod tests {
         );
     }
 
+    /// F156-c:**每一条 pane 建立路径都必须走 `on_pane_ready`。**
+    ///
+    /// 三处调用点各写一遍注入,正是「列举式门控在加档时必然漏」——本项目
+    /// 已经踩中三次。漏一处的症状是:那种方式开出来的 pane 永远跟不住目录,
+    /// 而且完全静默(没有报错、没有日志,只是 `Ctrl+Shift+B` 停在 `~`)。
+    ///
+    /// 判据是「`self.start_automation(` 在整个文件里**只有一个**调用点」——
+    /// 加第四种 pane 建立方式的人只要照着现有的写一句 `self.start_automation`,
+    /// 这条就红,他会被逼着去看 `on_pane_ready`。
+    ///
+    /// 顺序也钉:注入串自带 `clear`,排在自动化**之后**会把用户登录后命令的
+    /// 输出清掉一半。
+    ///
+    /// 自证会变红:
+    /// - 把任意一处调用点改回直接调 `self.start_automation` → 计数变 2,第 1 条红
+    /// - 把 `on_pane_ready` 里的注入删掉 → 第 3 条红
+    /// - 把注入挪到 `start_automation` 之后 → 第 4 条红
+    #[test]
+    fn every_pane_ready_path_goes_through_on_pane_ready() {
+        let src = include_str!("app.rs");
+        // **只数 `mod tests` 之前的那一段**:本测试自己的文档注释与字符串
+        // 字面量里也写着 `self.start_automation(` 这个 needle(用来描述判据
+        // 本身),连着数的话永远数不到 1,变成一条永远红不了也永远真不了的
+        // 假断言。同一手法见 `the_files_sidebar_syncs_to_the_terminal_only_on_the_closed_to_open_edge`。
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(
+            prod.len() < src.len(),
+            "没能把搜索范围切到 `mod tests` 之前 —— 下面的断言会命中测试自己\
+             写的字面量,变成恒绿"
+        );
+        let calls = prod.matches("self.start_automation(").count();
+        assert_eq!(
+            calls, 1,
+            "`self.start_automation(` 有 {calls} 个调用点。新的 pane 建立方式\
+             必须改走 `on_pane_ready`,否则那条路径不会注入 OSC 7(静默失效)"
+        );
+        // 切片键带上换行和缩进,钉住切的是**方法定义**而不是文档注释里的提及。
+        let body = src
+            .split("\n    fn on_pane_ready(")
+            .nth(1)
+            .expect("找不到 on_pane_ready 的定义");
+        let body = &body[..body
+            .find("\n    }\n")
+            .expect("找不到 on_pane_ready 的函数结尾")];
+        assert!(
+            body.len() > 120,
+            "on_pane_ready 的函数体切歪了(切出来 {} 字节)",
+            body.len()
+        );
+        let inject = body
+            .find("shell_bootstrap::osc7_setup_line()")
+            .expect("on_pane_ready 里没有注入 OSC 7 —— 这个方法存在的理由就是它");
+        let automate = body
+            .find("self.start_automation(")
+            .expect("on_pane_ready 里没起自动化 —— 三处调用点的另一半功能丢了");
+        assert!(
+            inject < automate,
+            "注入排在了自动化之后 —— 注入串自带 clear,会把登录后命令的输出清掉"
+        );
+        assert!(
+            body.contains("self.settings.shell_osc7_bootstrap"),
+            "注入没读开关,用户关不掉"
+        );
+    }
+
+    /// F156-c:设置弹窗「确定」时,新开关要真的搬进 `self.settings` ——
+    /// 不搬的话用户改了、点了确定、也落了盘,但**本次运行**仍按旧值走,
+    /// 而他不会知道要重启。
+    ///
+    /// 与既有的 `tmux_bootstrap`/`log_level` 两条切的是同一个函数体
+    /// (`take_settings_draft`),写法照抄它们。
+    ///
+    /// 自证会变红:把 `self.settings.shell_osc7_bootstrap = d.shell_osc7_bootstrap;`
+    /// 删掉。
+    #[test]
+    fn committing_the_settings_carries_the_shell_osc7_switch() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("\n    fn take_settings_draft(&mut self) {")
+            .nth(1)
+            .expect("找不到 take_settings_draft 的定义");
+        let body = &body[..body
+            .find("\n    }\n")
+            .expect("找不到 take_settings_draft 的函数结尾")];
+        assert!(
+            body.contains("self.settings.shell_osc7_bootstrap = d.shell_osc7_bootstrap;"),
+            "「确定」没把 F156-c 的开关搬进 settings:{body}"
+        );
+    }
+
     /// **接线守护 / F124**:tick 的三件事都得在——判据走
     /// `remote_bootstrap::should_attempt`、发的是 `bootstrap_command()`、
     /// 结论按退出码写回 `finish(..)`。
@@ -16188,7 +16323,11 @@ mod tests {
     ///
     /// 锚点拆开拼,理由同上一条。
     ///
-    /// 自证会变红:把 `PaneReconnected` 分支里的 `start_automation` 那句删掉。
+    /// F156-c:三处旧调用点收口进 `on_pane_ready` 之后,这里判据也改成
+    /// `self.on_pane_ready(`(它内部才真的起 `start_automation`,见
+    /// `every_pane_ready_path_goes_through_on_pane_ready`)。
+    ///
+    /// 自证会变红:把 `PaneReconnected` 分支里的 `on_pane_ready` 那句删掉。
     #[test]
     fn reconnect_reruns_post_login_automation() {
         let src = include_str!("app.rs");
@@ -16205,7 +16344,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            body.contains("self.start_automation("),
+            body.contains("self.on_pane_ready("),
             "没重跑登录后命令 —— tmux 不 attach,Claude Code 会话回不来"
         );
         // F141:光"重跑登录后命令"不够 —— v0.1.55 这里跑的是**跳过 tmux**的
