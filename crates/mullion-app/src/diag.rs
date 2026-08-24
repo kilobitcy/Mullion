@@ -135,6 +135,9 @@ static SFTP_OPS: AtomicU64 = AtomicU64::new(0);
 /// 「打字慢一拍」的真根因就是这里的超时收口)。
 static SYNC_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static SYNC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// F12 剖面:整形缓存这一窗口命中/未命中了多少行。
+static RESHAPE_HIT: AtomicU64 = AtomicU64::new(0);
+static RESHAPE_MISS: AtomicU64 = AtomicU64::new(0);
 /// 状态量(此刻是多少),不是「这窗口发生了几次」—— 采集时读而不清。
 static TABS: AtomicU64 = AtomicU64::new(0);
 static PANES: AtomicU64 = AtomicU64::new(0);
@@ -250,6 +253,16 @@ pub fn count_sync(blocks: u64, timeouts: u64) {
     }
     SYNC_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
     SYNC_TIMEOUTS.fetch_add(timeouts, Ordering::Relaxed);
+}
+
+/// 本帧整形缓存的命中/未命中行数(F12)。两者都为 0(这一帧没画)时直接
+/// 返回,免得静止时也在 relaxed 原子上打转。
+pub fn count_reshape(hits: u64, misses: u64) {
+    if hits == 0 && misses == 0 {
+        return;
+    }
+    RESHAPE_HIT.fetch_add(hits, Ordering::Relaxed);
+    RESHAPE_MISS.fetch_add(misses, Ordering::Relaxed);
 }
 
 /// 此刻的规模。App 每帧调一次(三条 relaxed 原子存,可忽略)。
@@ -474,15 +487,14 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.sftp_ops = SFTP_OPS.swap(0, Ordering::Relaxed);
     s.sync_blocks = SYNC_BLOCKS.swap(0, Ordering::Relaxed);
     s.sync_timeouts = SYNC_TIMEOUTS.swap(0, Ordering::Relaxed);
+    s.reshape_hit = RESHAPE_HIT.swap(0, Ordering::Relaxed);
+    s.reshape_miss = RESHAPE_MISS.swap(0, Ordering::Relaxed);
     s.tabs = TABS.load(Ordering::Relaxed);
     s.panes = PANES.load(Ordering::Relaxed);
     s.hosts = HOSTS.load(Ordering::Relaxed);
     s.mem_process_mb = sample_memory().map_or(0, |m| m.process_bytes / (1024 * 1024));
     s
 }
-
-// F12(Task 6 会换成真实现):这一帧 (PaneId,row) 缓存命中/未命中数。
-pub fn count_reshape(_hits: u64, _misses: u64) {}
 
 #[cfg(test)]
 mod tests {

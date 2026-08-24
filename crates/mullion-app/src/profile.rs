@@ -159,6 +159,13 @@ pub struct Snapshot {
     /// T2:其中有多少个块是靠 150ms 逃生门硬挤出来的(对端没发完 ESU)。
     /// 历史上「打字慢一拍」的真根因就是这里。
     pub sync_timeouts: u64,
+    /// F12:本窗口内整形缓存命中的行数。
+    pub reshape_hit: u64,
+    /// F12:未命中(真的跑了一次 shape)的行数。
+    ///
+    /// **这一对是差分整形唯一的运行期守护**:判据写错导致永远 miss 时,
+    /// 画面完全正确、日志一切正常,只有这里的比值会掉下去。
+    pub reshape_miss: u64,
     pub tabs: u64,
     pub panes: u64,
     pub hosts: u64,
@@ -191,6 +198,8 @@ impl Snapshot {
             sftp_ops: 0,
             sync_blocks: 0,
             sync_timeouts: 0,
+            reshape_hit: 0,
+            reshape_miss: 0,
             tabs: 0,
             panes: 0,
             hosts: 0,
@@ -270,7 +279,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
     Some(format!(
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
-         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
+         reshape=hit:{}/miss:{} conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
         secs,
         s.frames,
         fmt_us(quantile_us(&s.frame_us, 0.5)),
@@ -289,6 +298,8 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         total(&s.echo_us),
         fmt_us(quantile_us(&s.echo_us, 0.95)),
         stage_part,
+        s.reshape_hit,
+        s.reshape_miss,
         s.connects_ok,
         s.connects_err,
         s.reconnects,
@@ -435,6 +446,8 @@ mod tests {
             sftp_ops: 3,
             sync_blocks: 12,
             sync_timeouts: 3,
+            reshape_hit: 900,
+            reshape_miss: 100,
             tabs: 2,
             panes: 3,
             hosts: 2,
@@ -617,5 +630,33 @@ mod tests {
         let line = render_line(&measured).expect("有一行");
         assert!(line.contains("echo=7x"), "回显样本数不对:{line}");
         assert!(!line.contains("p95=0us"), "量到了却报 0:{line}");
+    }
+
+    /// F12:整形缓存的命中/未命中必须进剖面行。
+    ///
+    /// 这是"差分整形悄悄退化回全量"的**唯一**运行期守护 —— 判据写错时
+    /// 画面完全正确,只有 miss 数会暴露它。没有这一列,退化是静默的。
+    ///
+    /// 自证会变红:把 `render_line` 里 `reshape=` 那一段删掉。
+    #[test]
+    fn the_reshape_cache_counts_reach_the_line() {
+        let line = render_line(&busy_snapshot()).expect("忙窗口该有一行");
+        assert!(
+            line.contains("reshape=hit:900/miss:100"),
+            "没报整形缓存命中率:{line}"
+        );
+    }
+
+    /// 零命中同样要**显式写出来**:"这个窗口一次都没命中"与"这个版本
+    /// 忘了统计"在日志里不能长得一样(与 `skip=0` 同一条纪律)。
+    ///
+    /// 自证会变红:给 `render_line` 里的 `reshape=` 段加上
+    /// `if s.reshape_hit > 0` 之类的条件。
+    #[test]
+    fn a_zero_reshape_hit_is_printed_rather_than_omitted() {
+        let mut s = busy_snapshot();
+        s.reshape_hit = 0;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("reshape=hit:0/"), "零命中被省略了:{line}");
     }
 }
