@@ -148,9 +148,20 @@ damage 方案的最坏情况是**少画**（静默陈旧）。
 ```
 ShapedCache<T> {                     // 对载荷泛型，见 §6 的理由
     rows: HashMap<(PaneId, u16), CachedRow<T>>,
+    frame: u64,                      // 帧序号，逐出用
 }
-CachedRow<T> { hash: u64, term_w: u32, runs: Vec<CachedRun<T>> }
+CachedRow<T> { hash: u64, term_w: u32, last_seen: u64, runs: Vec<CachedRun<T>> }
 CachedRun<T> { col: u16, payload: T }   // 生产: T = glyphon::Buffer
+```
+
+判据抽成一个纯函数，返回三态枚举而不是 `bool`——`Temporary` 与 `Reshape` 的
+"整形"动作相同但缓存副作用相反（一个写、一个绝不写），用 `bool` 表达不了，
+用枚举则调用方必须穷尽 `match`：
+
+```
+enum RowPlan { Reuse, Reshape, Temporary }
+fn plan_row<T>(cached: Option<&CachedRow<T>>, hash: u64, term_w: u32,
+               is_preedit_row: bool) -> RowPlan
 ```
 
 每帧对每个 `(pane, row)`：
@@ -174,20 +185,37 @@ overlay 同样是临时内容。若把这份结果写回缓存：用户按 Esc �
 整个丢掉，空行的整形产物就是空集——但空行恰是空闲画面的大头，不写条目的话这类行
 永远落在"无缓存条目"分支，miss 率居高不下，正是 §7 要防的那种静默退化。
 
-**逐出**：记录本帧访问过的键，帧末一次 `retain` 删掉未访问的。这一条统一覆盖
-pane 关闭、行数缩小、切标签，**不需要在 `close_pane` 等处各加一处清理 hook**
-——那正是列举式门控会漏的地方。
+**逐出**：每帧开头 `frame += 1`，访问过的条目记下 `last_seen = frame`，帧末一次
+`retain(|_, r| r.last_seen == frame)`。用帧序号而不是每帧新建一个 `HashSet` 记
+访问集，是为了不在帧路径上分配（T3）。这一条统一覆盖 pane 关闭、行数缩小、
+切标签，**不需要在 `close_pane` 等处各加一处清理 hook**——那正是列举式门控会漏
+的地方。
+
+**`Buffer` 必须回收，不能随缓存条目一起丢。** 现状那个 `Vec<Buffer>` 池子存在的
+理由（`text.rs:352-354`：满屏 CJK 时 run 数是行数的几十倍，每帧重新分配近千个
+`Buffer` 就是 T3）在改动后一字不变地成立——而且**更危险**：滚动的日志每帧每行都
+变，若重整形时直接丢弃旧条目、新建 `Buffer`，流式场景（正是 N2 要保的那一档）
+会从"每帧复用池子"退化成"每帧分配上千个 `Buffer`"，**比改之前更慢**。
+因此逐出与重整形都把旧载荷推回一个 `pool: Vec<T>`，整形时优先 `pool.pop()`。
 
 **唯一的显式 hook**：`TextLayer::set_font()` 里 `cache.clear()`。换字体族/字号/DPI
 会让所有已 shape 的 buffer 的 metrics 整体作废，且这是单一入口。
+（`pool` 不必清：整形路径每次都调 `set_metrics`，池里的 buffer 不带陈旧 metrics。）
 
-### 4.3 `PaneRender.id: PaneId`
-
-`PaneRender`（`gpu.rs:68`）增加 `id: mullion_core::layout::PaneId`。
+### 4.3 缓存键必须是稳定身份，不是当帧下标
 
 现在 `prepare_panes` 用的 `pi` 是 `panes.iter().enumerate()` 的**当帧下标**。关掉
 中间一块 pane 会让其后所有 pane 的下标挪位——拿下标当缓存键会**张冠李戴**地把
-A pane 的缓存当成 B pane 用。缓存键必须是稳定身份。
+A pane 的缓存当成 B pane 用。
+
+**不需要改任何结构体**：`PaneRender.geom` 是按值持有的 `PaneGeom`
+（`shell/workspace/geom.rs:75`），它本来就带 `pub id: PaneId`，且
+`PaneId`（`mullion-core/src/layout.rs:9`）已 `derive(Hash, Eq)`，可直接做
+`HashMap` 键。`prepare_panes` 里写 `p.geom.id` 即可。
+
+> 定稿时本节曾要求给 `PaneRender` 加一个 `id` 字段，写实现计划时核对源码发现
+> 稳定 id 早已在手；照原样加会得到一个与 `geom.id` 必须永远相等的冗余字段，
+> 那本身就是一个新的失同步面。已删。
 
 ## 5. 数据流（每帧）
 
@@ -222,10 +250,10 @@ quad，与喂给 cosmic-text 整形的字符颜色没有任何交叉；闪不闪
 
 ### `mullion-app`（纯单测，无 GPU）
 
-- 判据抽成纯函数
-  `row_needs_reshape(cached: Option<&CachedRow>, hash, term_w, is_preedit_row) -> bool`，
-  四条分支各一条测试。
+- 判据纯函数 `plan_row`（§4.2）的四条分支各一条测试。
 - 逐出：本帧未访问的键被删。
+- 回收：被逐出的、以及重整形前的旧载荷都进了 `pool`（数一数 `pool.len()`）。
+  这一条挡的是 §4.2 那个"流式场景比改之前更慢"的退化。
 - 组字取消后一帧：preedit 行的旧条目已被逐出，按 miss 重整形；断言缓存里
   **从未**出现过组字期间的写入（`T = ()` 模拟两帧，验 §4.2"不查也不写"）。
 - 零 run 的行（全空白）也产生缓存条目，第二帧对同内容命中而非 miss。
@@ -247,8 +275,10 @@ quad，与喂给 cosmic-text 整形的字符颜色没有任何交叉；闪不闪
 ## 7. 度量
 
 - 复用 F155 剖面：`text_prepare` 的 p95 应显著下降。
-- **新增 `reshape=命中x/未命中x` 计数进 profile 行。** 没有它的话，"缓存永远
+- **新增 `reshape=hit:{}/miss:{}` 计数进 profile 行。** 没有它的话，"缓存永远
   miss"这种退化会**静默发生**——画面完全正确，性能悄悄回到改之前，没人看得出来。
+  用 ASCII 而不是中文，与同一行里的 `redraw=term:/ui:/both:`、`conn=ok:/err:/re:`
+  同构，且天然绕开 T9（字形白名单）。
 - 复用 `text.rs:1196-1250` 已有的量化脚手架跑前后对比。
 - N1（4 pane 静置 < 1% 单核）按本次的截图方法人工复测。
 
