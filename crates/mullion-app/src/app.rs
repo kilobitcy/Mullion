@@ -1518,6 +1518,11 @@ struct Active {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    /// F159:上一次**真正提交给 GPU** 的那一帧的整帧指纹。
+    ///
+    /// `None` = 没有可比对的上一帧(首帧,或 surface 刚被重新 configure ——
+    /// 那之后交换链内容未定义,拿旧基准比会让画面停在更早的一帧上)。
+    last_frame_fp: Option<crate::frame_fp::FrameFp>,
 }
 
 pub struct App {
@@ -6425,6 +6430,7 @@ impl ApplicationHandler<UserEvent> for App {
             egui_ctx,
             egui_state,
             egui_renderer,
+            last_frame_fp: None,
         });
 
         // 打开会话保险库(Task 6)。失败(keyring 不可用/无法定位配置目录等)不
@@ -9985,6 +9991,53 @@ fn render_frame(
     // 每帧都是 `z:`/`f:` 就坐实了自激回路②。
     diag::note_repaint_delay(repaint_delay);
 
+    // --- F159:整帧指纹。画出来跟上一帧一模一样就不提交 GPU。---
+    //
+    // **判在结果上,不判在原因上**(与 F12 的行指纹同一条推理,见 ADR-011):
+    // 能改变「这一帧长什么样」的来源列举不完,漏一个的症状是屏幕留着陈旧的
+    // 一帧,编译/测试/日志全静默。
+    //
+    // 截断点选在这里(tessellate 之后、终端趟之前):终端侧的全部输入
+    // (行指纹来自快照、几何来自 `compute_geoms`、光标相位由调用方算好)
+    // 在这个位置**已经全部就绪**,不需要先付 `text_prepare` 那几毫秒才知道
+    // 结果没变。egui pass **照跑不跳** —— 它是指纹的真值来源,也是 tooltip /
+    // 菜单动画能继续推进的前提(动画在推进 → 顶点变了 → 指纹不同 → 照常出帧)。
+    let fp = crate::frame_fp::frame_fingerprint(
+        &paint_jobs,
+        panes,
+        blink_on,
+        a.text.style_key(),
+        (a.gpu.config.width, a.gpu.config.height),
+    );
+    // egui 的纹理增量是**每帧 drain 出来、只交付一次**的,非空时一律强制
+    // miss(理由见 `frame_fp::can_skip` 的文档)。
+    let deltas_empty =
+        full_output.textures_delta.set.is_empty() && full_output.textures_delta.free.is_empty();
+    if crate::frame_fp::can_skip(a.last_frame_fp.as_ref(), &fp, deltas_empty) {
+        diag::count_frame_fp(true);
+        // 提前 return 即可,**什么都不用补**:`limiter.record_present` /
+        // `ui_dirty = false` / `pacer.mark_presented` / 同步块收口 / 几何施加
+        // 全在**调用方**(`App::window_event` 的 `Present` 分支)本函数返回
+        // 之后无条件执行,现有的 surface Timeout / AtlasFull 提前 return
+        // 也是被同一段兜住的。
+        //
+        // **这个判断不许挪到调用方侧**:挪出去就得手工重做上面每一笔记账;
+        // 漏掉 `pacer.mark_presented` 一笔,`panes_ready_to_present` 恒真 →
+        // `terminal_dirty` 恒真 → 每帧醒来算一次指纹,退化回 60fps 空转,
+        // 而剖面里 `present` 反而是 0 —— 症状极具迷惑性。
+        //
+        // 返回**真实的** `repaint_delay`(不是别的提前 return 用的
+        // `Duration::MAX`):egui 可能正在推进一段动画,那一路的排期不能被
+        // 「这一帧画面没变」吃掉。
+        //
+        // `a.text.trim()` 被跳过是安全的:`trim` 存在的意义是让下一次
+        // `prepare` 能淘汰旧字形,本帧既然不 `prepare`,也就不会有新字形进
+        // 图集,图集不会增长。(原注释强调 `trim` 必须排在 `AtlasFull` 的
+        // 提前 return 之前 —— 那是因为那条路径**已经 prepare 过了**。)
+        return (repaint_delay, actions);
+    }
+    diag::count_frame_fp(false);
+
     // 每帧先 trim:清掉上一帧的 glyphs_in_use,让本帧 prepare 能按需淘汰旧字形。
     // 必须在 prepare/get_current_texture 的 early-return 之前——挪到函数末尾会导致
     // 一旦 AtlasFull 触发提前 return,trim 永远到不了,图集永远不被清理,
@@ -10040,6 +10093,9 @@ fn render_frame(
         Err(e @ (wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)) => {
             log::warn!(target: "mullion", "wgpu surface {e:?},重新 configure 后跳过本帧");
             a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);
+            // F159:重新 configure 之后交换链内容未定义,旧基准作废 ——
+            // 留着的话下一帧会误判命中,画面停在更早的一帧上。
+            a.last_frame_fp = None;
             diag::count_skipped();
             return (std::time::Duration::MAX, actions);
         }
@@ -10113,6 +10169,11 @@ fn render_frame(
     for id in &full_output.textures_delta.free {
         a.egui_renderer.free_texture(id);
     }
+
+    // F159:只有**真正提交过**的帧才成为下一帧的比对基准。任何提前 return
+    // (prepare 失败 / acquire 失败 / surface 重配)都不更新它 —— 那些帧
+    // 没画出去,拿它们当基准会让下一帧误判命中,屏幕停在更早的一帧上。
+    a.last_frame_fp = Some(fp);
 
     (repaint_delay, actions)
 }
@@ -17482,6 +17543,82 @@ mod tests {
         assert!(
             head.contains("if user_event_marks_dirty(&event)"),
             "判据没接进 user_event 的开头:{head}"
+        );
+    }
+
+    /// F159:指纹命中必须在**任何 GPU 工作之前**提前 return,而基准只能由
+    /// **真正提交过**的帧更新。
+    ///
+    /// 三条各自钉一个「编译过、跑起来才发作」的错法:
+    ///
+    /// - 提前 return 排在 `get_current_texture` 之后 → 每帧照样占一次交换链,
+    ///   Fifo 下照样等一个 vsync,收益归零而剖面看起来一切正常。
+    /// - 基准在提前 return 的路径上也更新 → prepare 失败 / acquire 失败那几帧
+    ///   没画出去却成了基准,下一帧误判命中,屏幕停在更早的一帧上。
+    /// - 判断挪到调用方侧 → 得手工重做 `record_present`/`mark_presented` 那几笔
+    ///   记账,漏一笔就是 60fps 空转且 `present=0`。
+    ///
+    /// 自证会变红:把 `a.last_frame_fp = Some(fp);` 挪到 `frame.present();` 之前。
+    #[test]
+    fn a_fingerprint_hit_returns_before_any_gpu_work_and_only_a_presented_frame_becomes_the_baseline(
+    ) {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 会搜到测试自己的文本,断言恒绿"
+        );
+        let at = |needle: &str| {
+            assert_eq!(
+                prod.matches(needle).count(),
+                1,
+                "`{needle}` 在生产段里不是恰好一处,下面的先后判断会指错地方"
+            );
+            prod.find(needle).expect("上面刚断言过存在")
+        };
+        let fp = at("crate::frame_fp::frame_fingerprint(");
+        let skip = at("if crate::frame_fp::can_skip(");
+        let acquire = at("a.gpu.surface.get_current_texture()");
+        let present = at("frame.present();");
+        let baseline = at("a.last_frame_fp = Some(fp);");
+        assert!(fp < skip, "先判跳帧后算指纹,顺序反了");
+        assert!(
+            skip < acquire,
+            "指纹命中的提前 return 排在 acquire 之后 —— 每帧照样占一次交换链,收益归零"
+        );
+        assert!(
+            present < baseline,
+            "没画出去的帧也成了下一帧的比对基准 —— 屏幕会停在更早的一帧上"
+        );
+    }
+
+    /// F159:surface 被重新 configure 之后,交换链内容未定义,基准必须作废。
+    ///
+    /// 不作废的症状:窗口从遮挡/丢失中恢复之后画面全黑或残留旧内容,而
+    /// 且只在触发过 `SurfaceError::Lost`/`Outdated` 的机器上出现。
+    ///
+    /// 自证会变红:把 Lost/Outdated 分支里那句 `a.last_frame_fp = None;` 删掉。
+    #[test]
+    fn reconfiguring_the_surface_drops_the_fingerprint_baseline() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(prod.len() < src.len(), "没能切掉测试模块,断言会恒绿");
+        let arm = prod
+            .split("a.gpu.surface.configure(&a.gpu.device, &a.gpu.config);")
+            .nth(1)
+            .expect("找不到 surface 重新 configure 的分支");
+        // 按**字符**截,不按字节:`app.rs` 里满是中文注释,`&arm[..300]` 一旦让
+        // 边界落进汉字中间就是 panic 而不是干净的断言失败。
+        let head: String = arm.chars().take(200).collect();
+        assert!(
+            head.contains("a.last_frame_fp = None;"),
+            "重新 configure 之后没作废指纹基准:{head}"
         );
     }
 }
