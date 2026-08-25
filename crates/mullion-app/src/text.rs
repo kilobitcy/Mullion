@@ -368,6 +368,21 @@ impl TextLayer {
         self.family.as_deref().unwrap_or(DEFAULT_FONT_FAMILY)
     }
 
+    /// F159:影响文字层最终长相、但不进任何行指纹的样式量。整帧指纹吃它。
+    ///
+    /// 字体族 / 字号 / DPI 换了而所有行的内容都没变时,行指纹一个都不会变
+    /// —— 少了这一项,换完字体屏幕会停在旧字体的那一帧上,编译/测试/日志
+    /// 全静默(F12 的 `set_font` 显式清缓存治的是另一半:整形结果作废)。
+    pub fn style_key(&self) -> crate::frame_fp::StyleKey<'_> {
+        crate::frame_fp::StyleKey {
+            family: self.family_name(),
+            font_px: self.font_px,
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
+            default_fg: self.default_fg,
+        }
+    }
+
     /// F21:系统里装了哪些字体族。整理规则(去重/排序/打标)在
     /// `font_pick::sort_families`(纯函数,有测试),这里只负责去问 fontdb。
     pub fn families(&self) -> Vec<crate::font_pick::FontChoice> {
