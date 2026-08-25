@@ -130,7 +130,7 @@ if self.pointer.wants_repaint()                  // pointer_events 非空 || del
 | **F159** | 整帧指纹 | 画面跟上一帧一模一样就不提交 GPU |
 
 F158 摘掉的是一层**列举式**兜底，F159 补上的是一层**构造式**兜底。两者必须同版落地
-——只做 F158 会让 `ui_dirty` 成为唯一判据，而它现在是 **40 个置脏点 : 1 个清脏点**
+——只做 F158 会让 `ui_dirty` 成为唯一判据，而它现在是 **80 个置脏点 : 1 个清脏点**
 的结构，漏标一处的症状是「点了没反应 / 连上了画面不动」，编译测试日志全静默。
 按 `MEMORY.md` 的记录，「列举式门控在加档时必然漏」在本项目已踩中三次。
 
@@ -163,7 +163,8 @@ wake=1990x/rr=sched:1689,evt:2  dirty=8365:300,7191:2  egui_ev=0x/f:0  rdelay=z:
 
 ### 4.2 `ui_dirty` 收成方法
 
-40 处 `self.ui_dirty = true;` 机械替换为 `self.mark_ui_dirty();`：
+80 处 `self.ui_dirty = true;`（`grep -c` 实测，全部在 `app.rs`）机械替换为
+`self.mark_ui_dirty();`：
 
 ```rust
 /// 标记 egui 侧需要重绘。**唯一的置脏入口。**
@@ -286,14 +287,36 @@ let dirty = crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty);
 fp = FNV-1a( egui 的 tessellate 产物
            ⊕ 各 pane 的 F12 行指纹
            ⊕ 光标状态
+           ⊕ IME preedit 状态
            ⊕ 几何 )
 ```
 
-与上一帧相同 → **不提交 GPU**：跳过 `text.trim()`、终端趟的
-`quads_for_panes`/`prepare_panes`、`get_current_texture`、`encode`、`present`。
+与上一帧相同 **且 `textures_delta` 为空**（见 6.2a）→ **不提交 GPU**：
+跳过 `text.trim()`、终端趟的 `quads_for_panes`/`prepare_panes`、
+`get_current_texture`、`encode`、`present`。
 
-**其余记账照做**：`limiter.record_present(now)`、`ui_dirty = false`、几何施加。
-这一条很关键——不记账的话下一轮立刻又判 Present，变成 60fps 空跑 egui pass。
+**记账全部照做，且这不是额外工作，是继承来的**：`limiter.record_present(now)`、
+`ui_dirty = false`、`pacer.mark_presented(now)`、同步块收口、几何施加——
+这些全在**调用方**（`app.rs:8068-8080`）`render_frame` 返回之后无条件执行，
+现有的 surface Timeout / AtlasFull 提前 return 也是被同一段兜住的。
+所以命中时在 `render_frame` 内部提前 return 即可，什么都不用补。
+
+**硬约束：跳帧判断必须留在 `render_frame` 内部，不得挪到调用方侧。**
+挪出去就得手工重做上面每一笔记账；漏掉 `pacer.mark_presented` 一笔，
+`panes_ready_to_present` 恒真 → `terminal_dirty` 恒真 → 每帧醒来算指纹，
+退化回 60fps 空转且剖面里 `present` 反而是 0，症状极具迷惑性。
+
+### 6.2a `textures_delta` 非空必须强制 miss
+
+`render_frame` 在 encode 段上传 `full_output.textures_delta.set`
+（egui 字体图集的新字形栅格），present 之后释放 `.free`（`app.rs:9958/10006`）。
+这两个 delta 是 egui **每帧 drain 出来、只交付一次**的——指纹命中就跳的话
+delta 被静默丢弃，之后某帧引用一张从未上传的纹理，花屏或 panic，
+且只在「先命中、后未命中」的序列里发作，无头测试完全够不到。
+
+所以跳帧条件是 `fp 相同 && textures_delta.set.is_empty() && textures_delta.free.is_empty()`。
+delta 非空的帧计入 `miss`（真实频率极低：字形首次栅格化、纹理回收）。
+这条分支必须有守护测试：构造 `set` 非空的 `TexturesDelta`，断言判 miss。
 
 ### 6.2 截断点
 
@@ -326,6 +349,13 @@ egui pass **照跑**，不跳过。它是指纹的真值来源，
 
 **光标**：`blink_on`（F125 的相位）单独入指纹——它不在行指纹里
 （光标由 `gpu::quads_for_panes` 画成独立色块）。
+
+**IME preedit**：组字串、光标截段、落点 pane/行列，逐一入指纹。
+**这一分量不能省**：preedit 画在终端文字层（F126，复用 `SnapCell::width`
+的宽度判据），不在 egui 的 paint_jobs 里；而组字过程中 cells 不变、
+行指纹不变——漏掉它，指纹在整个组字过程中恒命中，
+**打拼音屏幕纹丝不动**，正是 T10 那一族「只有人眼能发现」的坑。
+守护测试：仅改 preedit 内容，断言指纹变。
 
 **几何**：`compute_geoms` 的产物。
 
@@ -403,7 +433,9 @@ egui pass **照跑**，不跳过。它是指纹的真值来源，
    这条专验 §5.2 的风险；坏了的症状是画面卡在旧状态直到你动一下鼠标。
 6. **切主题 / 换字体 / 换字号 / 拖到不同 DPI**：整屏立刻跟走，不能有陈旧帧。
 7. **划选**：拖鼠标划选，选区实时反色，松开不残留。
-8. **中文输入法**：组字、上屏、按 Esc 取消组字后被盖住的字要回来。
+8. **中文输入法**：组字时拼音串要**逐键跟着变**（这条专验 §6.3 的 preedit
+   分量——漏了它的症状就是打拼音屏幕纹丝不动）；上屏正常；
+   按 Esc 取消组字后被盖住的字要回来。
 9. **拖动分屏分界线**：宽度变化后重排正确。
 10. **`fp=hit:/miss:`**：静止时命中率应接近 100%；
     常年 miss 高 = 指纹判据写错，差分白做，但画面正常，只有这里看得出来。
