@@ -6471,6 +6471,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         diag::mark(diag::Stage::UserEvent);
+        // F158:后台事件默认标脏。判据与豁免名单见 `user_event_marks_dirty`。
+        if user_event_marks_dirty(&event) {
+            mark_ui_dirty!(self.ui_dirty);
+        }
         match event {
             UserEvent::Wake => {
                 // 最小化时不请求重绘(也不该指望还能收到 RedrawRequested),但 IO 泵
@@ -9485,6 +9489,71 @@ fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> 
     }
 }
 
+/// F158:这个后台事件该不该把 egui 侧标脏。
+///
+/// **穷尽 `match`,不许用 `_`**:摘掉 launcher 的无条件出帧兜底之后,
+/// `ui_dirty` 成了 launcher 态的唯一判据,漏标一处的症状是「连上了画面
+/// 不动,动一下鼠标才刷出来」。加新变体时这里编译报错,强迫作者表态。
+///
+/// 方向也刻意不对称:判 `true` 最多多画一帧(而且会被 F159 的整帧指纹
+/// 拦掉),判 `false` 是画面卡住。所以默认落在标脏那一侧,只对已知的
+/// 高频事件显式豁免。
+///
+/// **分支不写枚举名前缀**(局部 `use UserEvent::*;`):好几条既有的源码切片
+/// 守护测试(如 `a_freshly_opened_pane_starts_its_own_automation`)拿"枚举名
+/// 前缀 + 变体名 + 左花括号"拼出的字符串当 `rsplit` 锚点,从 `user_event` 里
+/// 抠真正的 match 分支——这里若也写出同一串前缀加变体名,会在源码里制造
+/// 第二个匹配,那些测试会切到这段而不是真正的分支,静默切错(已实测复现:
+/// 10 个既有测试从「测真分支」变成「测到这段的空隙」)。裸变体名不含那个
+/// 前缀,不会命中那些锚点——出于同一原因,这条注释也刻意不把前缀和变体名
+/// 拼在一起写出来。
+fn user_event_marks_dirty(e: &UserEvent) -> bool {
+    use UserEvent::*;
+    match e {
+        // ——— 豁免之一:每秒几千条,靠帧内排期驱动画面 ———
+        //
+        // `Wake` 是「远端来了字节」的通知,画面该不该更新由 `terminal_dirty`
+        // (pacer,含 T2 的同步块攒帧)判;在这里标脏等于把攒帧闸整个绕过去。
+        Wake => false,
+        // 传输进度每秒几千条,靠它驱动重绘就是 T3(风扇起飞)。画面由
+        // `RedrawRequested` 里那段排期推进。
+        TransferProgress { .. } => false,
+        // ——— 豁免之二(理由完全不同):自己判脏 ———
+        //
+        // `EditTick` 的分支把 `self.ui_dirty` **当信号读**(「看门任务只在
+        // 文件真的变了时才发这条,但『变了』不一定改动界面」)。在这里预先
+        // 置真会让那个 `if self.ui_dirty` 恒成立 —— 编译过、测试过、语义
+        // 静默变成「每次 tick 都重绘」。它的分支自成闭环,不需要这里帮忙。
+        EditTick { .. } => false,
+        // ——— 其余一律标脏 ———
+        ConnectOk { .. }
+        | ConnectErr(_)
+        | KeyPathPicked(_)
+        | CredentialKeyPathPicked(_)
+        | IconPathPicked(_)
+        | SshConfigPicked(_)
+        | HostKeyPrompt(_)
+        | PaneOpened { .. }
+        | PaneOpenErr { .. }
+        | PaneRehosted { .. }
+        | PaneRehostErr { .. }
+        | PaneReconnected { .. }
+        | PaneReconnectErr { .. }
+        | ProbeOk(_)
+        | ProbeErr(_, _)
+        | AutomationDone(_, _, _)
+        | TunnelState { .. }
+        | SftpOpened { .. }
+        | SftpListed { .. }
+        | OwnerNames { .. }
+        | SftpOpDone { .. }
+        | TransferPlanned { .. }
+        | TransferDone { .. }
+        | EditOpened { .. }
+        | EditSaved { .. } => true,
+    }
+}
+
 /// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
 /// 「距上次输入多少毫秒」,不碰 `&App`,理由同 `sync_timeout_wake_at`(`App`
 /// 在无 GPU/窗口的环境下构造不出来,这几条分支只能靠这条路径单测)。
@@ -10058,8 +10127,8 @@ mod tests {
         font_px_for, has_real_action, ime_cursor_area, ime_goes_to_terminal_of, new_pane_emulator,
         next_auto_dial, next_panel_selection_index, pane_still_wanted, reattach_pane, rehost_pane,
         resolved_scrollback, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_title,
-        tmux_attach_for_connect, upload_job, wind_down, Modal, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, Modal, RestoredTab,
+        SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -17341,6 +17410,78 @@ mod tests {
             binding.trim(),
             "crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty)",
             "launcher 态又开了一条兜底判据:{binding}"
+        );
+    }
+
+    /// F158:后台事件**默认标脏**,只有三种显式豁免。
+    ///
+    /// 方向不对称是重点:判 `true` 最多多画一帧(而且会被 F159 的整帧指纹
+    /// 拦掉),判 `false` 是「连上了画面不动」。所以 `user_event_marks_dirty`
+    /// 写成穷尽 `match` 而不是 `_ => false` —— 加新变体时编译报错,强迫作者
+    /// 表态,而不是静默落到「不标脏」那一侧。
+    ///
+    /// 自证会变红:把 `user_event_marks_dirty` 里 `ConnectErr` 那一支挪进
+    /// 豁免名单。
+    #[test]
+    fn a_background_event_marks_the_ui_dirty_unless_it_is_a_known_flood() {
+        // 高频、靠帧内排期驱动的两种:标脏就是 T3(风扇起飞)。
+        assert!(
+            !user_event_marks_dirty(&UserEvent::Wake),
+            "Wake 每秒可以来几千条,标脏等于把 T2 的攒帧闸整个绕过去"
+        );
+        assert!(
+            !user_event_marks_dirty(&UserEvent::TransferProgress { job: 1, done: 0 }),
+            "传输进度每秒几千条,靠它驱动重绘就是风扇起飞"
+        );
+        // `EditTick` 豁免的理由**不同**:它自己的分支把 `self.ui_dirty` 当
+        // 信号读(「文件变了不一定改动界面」),在这里预先置真会让那个条件
+        // 恒成立,静默改掉它的语义。
+        assert!(
+            !user_event_marks_dirty(&UserEvent::EditTick {
+                key: 1,
+                stamp: None
+            }),
+            "EditTick 自己判脏,在这里预置会让它分支里的 `if self.ui_dirty` 恒真"
+        );
+        // 其余一律标脏 —— 挑三种最容易漏、且漏了症状最难查的。
+        assert!(
+            user_event_marks_dirty(&UserEvent::ConnectErr("boom".into())),
+            "连接失败不标脏 = 用户点了连接,错误提示要等他动鼠标才出现"
+        );
+        assert!(
+            user_event_marks_dirty(&UserEvent::ProbeOk(7)),
+            "探测结果不标脏 = 会话管理器里的状态永远停在「探测中」"
+        );
+        assert!(
+            user_event_marks_dirty(&UserEvent::KeyPathPicked(None)),
+            "文件对话框取消不标脏 = 按钮永远停在禁用态"
+        );
+    }
+
+    /// F158:那个判据必须**真的接在** `user_event` 的开头。
+    ///
+    /// 纯函数写对了但没接线,是本项目反复踩过的静默失效(F12 的埋点、
+    /// F155 的接线)——判据全绿,画面照样卡住。
+    ///
+    /// 自证会变红:把 `fn user_event` 开头那三行删掉。
+    #[test]
+    fn the_background_dirty_rule_is_actually_wired_into_user_event() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(prod.len() < src.len(), "没能切掉测试模块,断言会恒绿");
+        let body = prod
+            .split("fn user_event(&mut self")
+            .nth(1)
+            .expect("找不到 user_event");
+        // 按字符截,不按字节:`app.rs` 里满是中文注释,`&body[..600]` 一旦
+        // 让边界落进汉字中间就是 panic 而不是干净的断言失败。
+        let head: String = body.chars().take(400).collect();
+        assert!(
+            head.contains("if user_event_marks_dirty(&event)"),
+            "判据没接进 user_event 的开头:{head}"
         );
     }
 }
