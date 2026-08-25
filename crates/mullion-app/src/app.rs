@@ -17254,7 +17254,11 @@ mod tests {
             .split("WindowEvent::RedrawRequested => {")
             .nth(1)
             .expect("找不到 RedrawRequested 分支");
-        let head = &arm[..arm.len().min(200)];
+        // 按**字符**截,不按字节:`arm` 里是中文注释,`&arm[..200]` 一旦让
+        // 边界落进某个汉字中间就是 panic 而不是干净的断言失败,排查的人会
+        // 先去怀疑代码逻辑。150 字符比原来的 200 字节略宽,仍只够放下分支
+        // 开头那几行(计数点现在在第 96 个字符)。
+        let head: String = arm.chars().take(150).collect();
         assert!(
             head.contains("diag::count_wake();"),
             "唤醒计数不在分支开头:{head}"
