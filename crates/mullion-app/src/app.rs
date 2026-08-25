@@ -32,6 +32,25 @@ use crate::text::TextLayer;
 use crate::theme::{self, MULLION_DARK};
 use crate::{diag, input, shell};
 
+/// F157:把 `ui_dirty` 置真,并把**调用点的行号**记进归因表。
+///
+/// **唯一的置脏入口**。绕开它直接给 `self.ui_dirty` 赋值等于在归因表上开一个洞,
+/// 而洞的症状是「剖面里少了一行、看起来一切正常」——守护测试
+/// `tests::every_ui_dirty_set_site_goes_through_the_attribution_macro` 钉死这一条。
+///
+/// **是宏而不是 `App` 的方法**:有些置脏点位于 `self.active` 的可变借用作用域里
+/// (egui 事件分流那一段),那里调不了任何 `&mut self` 方法(E0499);宏展开成
+/// 一句普通的字段赋值,两种上下文都能用。`line!()` 在 `macro_rules!` 体内
+/// 展开成**调用点**的行号,正是归因要的东西。
+///
+/// 开销:一句赋值 + 最坏 8 次 relaxed load + 1 次 CAS,与 `diag::mark` 同量级(T3)。
+macro_rules! mark_ui_dirty {
+    ($slot:expr) => {{
+        $slot = true;
+        crate::diag::note_ui_dirty(line!());
+    }};
+}
+
 /// app 与「连接建立」异步任务之间的事件(ssh io_task / connect 的 wake、结果经此回送)。
 /// 携带 `SshSession`/`Receiver` 等非 `Copy` 负载,故不能派生 Copy/Clone;两者也未实现
 /// `Debug`,故 `UserEvent` 同样不派生 Debug(winit `ApplicationHandler<T>` 只要求 `T: 'static`)。
@@ -2084,7 +2103,7 @@ impl App {
                         self.finish_store_open(history);
                     }
                 }
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 false
             }
         }
@@ -2110,7 +2129,7 @@ impl App {
                     .map(|a| a.text.families())
                     .unwrap_or_default();
                 self.refresh_monospace_warning();
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
             }
         } else if self.ui.settings_draft.is_some() {
             self.ui.settings_draft = None;
@@ -2150,7 +2169,7 @@ impl App {
         let scale = a.window.scale_factor() as f32;
         let px = font_px_for(self.settings.font_pt, scale);
         a.text.set_font(self.settings.font_family.as_deref(), px);
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         self.refresh_monospace_warning();
     }
 
@@ -2264,7 +2283,7 @@ impl App {
             }
             Err(e) => self.ui.set_error(format!("导出脱敏日志失败:{e}")),
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F71:跑一次主密码改动,收尾交给 [`finish_password_change`]。
@@ -2531,7 +2550,7 @@ impl App {
             Some(Ok(plan)) => plan,
             Some(Err(e)) => {
                 self.ui.set_error(e.to_string());
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 return false;
             }
             None => return false,
@@ -2556,7 +2575,7 @@ impl App {
         // 依据(事件本身不带 SessionId),跟双击连接那条路径一样要设。
         self.ui.connect_request_last = Some(session_id);
         self.cli_direct = false;
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         self.spawn_connect(cfg, wants_sftp);
         true
     }
@@ -2581,7 +2600,7 @@ impl App {
             // 快速连接开出来的 SFTP 标签没有会话记录,无从重连。
             self.ui
                 .set_error("这个标签没有对应的会话记录,无法重连".to_string());
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         };
         let tab_id = tab.id;
@@ -2650,13 +2669,13 @@ impl App {
                 if !auto.tried.is_empty() {
                     self.ui.set_toast(auto_dial_summary(auto.ok, auto.err));
                 }
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 return;
             };
             auto.tried.push(next);
             if self.reconnect_tab(next) {
                 self.auto_dial = Some(auto);
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 return;
             }
             // 连拨号都没发起出去 —— 不会有 `ConnectOk`/`ConnectErr` 回来
@@ -2706,7 +2725,7 @@ impl App {
         // 裸下标会跳到一个不相干的标签上。
         self.tabs.switch_to_index(base + active);
         crate::logx::line(&format!("F148:恢复了 {count} 个占位标签"));
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F148:把一批记录做成弹窗要画的行(D10/D16)。
@@ -2766,7 +2785,7 @@ impl App {
             return;
         }
         self.ui.history = Some(crate::ui::history::HistoryDraft::new(rows));
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F148:恢复一条记录(D12 接管槽位 / D13 追加进当前窗口)。
@@ -2812,7 +2831,7 @@ impl App {
         // 不是要再挨个点一遍「重连」。
         self.auto_dial = Some(AutoDial::default());
         self.advance_auto_dial(None);
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F55:作废属于某个标签的全部传输。扳旗标(让在跑的 worker 立刻停)
@@ -3230,7 +3249,7 @@ impl App {
             FileAction::Refresh => files.local.cwd.clone(),
             FileAction::ToggleHidden => {
                 files.local.show_hidden = !files.local.show_hidden;
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 return;
             }
             // F131:同远端那条,只是 home 来自本机。
@@ -3267,7 +3286,7 @@ impl App {
                 let dir = files.local.cwd.clone();
                 if let Err(e) = local::open_in_file_manager(&dir) {
                     self.ui.set_error(e);
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                 }
                 return;
             }
@@ -3275,7 +3294,7 @@ impl App {
         let seq = files.local.begin_load(target.clone());
         let result = local::list_dir(&local::to_path(&target));
         files.local.accept(seq, result);
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F50/D6:远端栏的一次动作。sftp 还没开好时(`sftp.is_none()`,含"上次
@@ -3393,7 +3412,7 @@ impl App {
             FileAction::Refresh => files.remote.cwd.clone(),
             FileAction::ToggleHidden => {
                 files.remote.show_hidden = !files.remote.show_hidden;
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 return;
             }
             // F131:路径条敲的原文,在这里才解析 —— `~` 要用远端登录目录展开。
@@ -3425,7 +3444,7 @@ impl App {
         let task =
             spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, target, seq);
         self.track_sftp_task(generation, task);
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F139:把一条书签写进会话配置,并同步这个标签的内存副本。
@@ -3488,7 +3507,7 @@ impl App {
                 list.push(mark);
             }
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F139/F154:取消收藏。按路径相等匹配 —— 书签的身份就是路径。
@@ -3530,7 +3549,7 @@ impl App {
                 files.bookmarks.retain(|b| b.path != path);
             }
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F50/设计 D23:文件面板拥有键盘焦点时的按键处理。只有
@@ -3597,7 +3616,7 @@ impl App {
                     .and_then(|t| t.content.files_panel_mut())
                 {
                     files.active_column = files.active_column.flipped();
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                 }
             }
             WinitKey::Named(NamedKey::Delete) | WinitKey::Named(NamedKey::F2) => {
@@ -3734,7 +3753,7 @@ impl App {
         } = op
         {
             self.transfer.queue.resolve_conflict(job, choice, apply_all);
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         }
         // F53:编辑冲突的处置。同上,不走远端写操作那条通用路径 ——
@@ -3841,7 +3860,7 @@ impl App {
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         };
         let proxy = self.proxy.clone();
@@ -3872,7 +3891,7 @@ impl App {
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         };
         for (parent, names) in crate::files::drag::group_by_parent(&paths) {
@@ -3928,7 +3947,7 @@ impl App {
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         };
         if items.is_empty() {
@@ -3937,14 +3956,14 @@ impl App {
             if skipped_dirs > 0 {
                 self.ui
                     .set_error(format!("目录还不能拖出({skipped_dirs} 个),请选文件"));
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
             }
             return;
         }
         if skipped_dirs > 0 {
             self.ui
                 .set_error(format!("跳过了 {skipped_dirs} 个目录,只拖文件"));
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
         }
         crate::dragout::start(self._runtime.handle().clone(), client, items);
     }
@@ -3974,7 +3993,7 @@ impl App {
         // 名字送不上线的行,任何单目标操作都做不了(同删除/传输那条判据)。
         if e.kind != mullion_ssh::sftp::EntryKind::File || !cur.is_operable() {
             self.ui.set_error("只能编辑普通文件".into());
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         }
         let limit = match kind {
@@ -3991,14 +4010,14 @@ impl App {
                 crate::files::human_size(e.size),
                 crate::files::human_size(limit),
             ));
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         }
         let remote = state.cwd.join(cur.as_bytes());
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             return;
         };
         let proxy = self.proxy.clone();
@@ -4014,7 +4033,7 @@ impl App {
         });
         self.track_sftp_task(generation, task);
         self.ui.set_toast("正在打开…");
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F53:文件读回来了 —— 落临时文件交给外部程序,或者开内置窗口。
@@ -4026,7 +4045,7 @@ impl App {
         result: Result<(Vec<u8>, crate::edit::sessions::RemoteStamp), String>,
     ) {
         use crate::edit::sessions::EditKind;
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         let (bytes, snapshot) = match result {
             Ok(v) => v,
             Err(e) => {
@@ -4190,7 +4209,7 @@ impl App {
             let _ = proxy.send_event(UserEvent::EditSaved { key, result });
         });
         self.track_sftp_task(generation, task);
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// 把一条编辑标成失败。**不弹错误框** —— 失败原因就写在「编辑中」那一行上,
@@ -4204,13 +4223,13 @@ impl App {
         if let Some(ed) = self.edit.editor.as_mut().filter(|ed| ed.key == key) {
             ed.finish_save(Err(why2));
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F53:一次回传收工。
     fn on_edit_saved(&mut self, key: u64, result: Result<EditWriteOutcome, String>) {
         use crate::edit::sessions::EditState;
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         let (generation, local, label) = match self.edit.sessions.get(key) {
             Some(e) => (e.generation, e.local.clone(), e.label.clone()),
             // 条目在这次往返里被「结束编辑」掉了 —— 结果丢掉就是对的。
@@ -4257,14 +4276,14 @@ impl App {
             name: e.remote.display().to_string(),
             key,
         });
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F53:用户在冲突框里选完了。
     fn resolve_edit(&mut self, key: u64, choice: crate::ui::files_dialog::EditResolve) {
         use crate::edit::sessions::EditState;
         use crate::ui::files_dialog::EditResolve;
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         // 没有记到远端当时的戳就没法安全处置(条目已经被收走之类)。
         let Some(remote_now) = self.edit.conflicts.get(&key).copied() else {
             return;
@@ -4359,7 +4378,7 @@ impl App {
         if self.edit.editor.as_ref().is_some_and(|e| e.key == key) {
             self.edit.editor = None;
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F55/F56:每帧调一次 —— 队列放行几条就起几条 worker。
@@ -4430,7 +4449,7 @@ impl App {
         // 方向键 = 单选移动:光标走到哪,选择集就只剩哪一条(Shift+方向键
         // 扩选不在本切片范围内)。
         state.select_only(&name);
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// F50/D6:sftp 任务开出去之后,把它的句柄存回属主标签的 `sftp_tasks`
@@ -4573,7 +4592,7 @@ impl App {
                 }
             }
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
     }
 
@@ -4681,7 +4700,7 @@ impl App {
         } else {
             log::debug!(target: "mullion", "丢弃过期世代 {generation} 的目录列表(seq={seq})");
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
     }
 
@@ -4705,7 +4724,7 @@ impl App {
             Some(out) => files.remote.owners.merge(&out),
             None => files.remote.owners.forget(&query),
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
     }
 
@@ -4757,7 +4776,7 @@ impl App {
             // 不标脏的话描边会卡在上一帧的位置,看着像「鼠标不跟手」。
             // **不消费**:这个事件还要照旧喂给 egui 维护 hover。
             WindowEvent::CursorMoved { .. } if on => {
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 false
             }
             _ => false,
@@ -4765,7 +4784,7 @@ impl App {
     }
 
     fn request_ui_redraw(&mut self) {
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         if let Some(a) = &self.active {
             a.window.request_redraw();
         }
@@ -5127,7 +5146,7 @@ impl App {
         if flushed {
             // 收口出来的字节没经过 `pacer.feed`,`panes_ready_to_present` 判不出
             // 脏;不标脏这一帧会被判 Idle,收口等于白做。
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
         }
         self.drive_automation();
     }
@@ -5508,7 +5527,7 @@ impl App {
                 })),
             );
             self.ui.close_session_manager();
-            self.ui_dirty = true;
+            mark_ui_dirty!(self.ui_dirty);
             self.trigger_sftp_open(generation);
             self.request_ui_redraw();
             return;
@@ -5632,7 +5651,7 @@ impl App {
         }
         // 连上后关掉会话管理弹窗,别让它盖在新终端上方(复核 #4)。
         self.ui.close_session_manager();
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         // 模板跟计划**同进同退**:只有这次真的要跑自动化,才把配置留给
         // 后来的 pane。否则「右键跳过一次」在分屏时会失效——用户明确
         // 说了这次不跑,分屏出来的 pane 却照跑不误。
@@ -6118,7 +6137,7 @@ impl App {
         if let Some(ix) = t.automation.iter().position(|h| h.pane == pane) {
             t.automation.swap_remove(ix);
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
     }
 
@@ -6251,7 +6270,7 @@ impl App {
                 .unwrap_or_else(|| format!("隧道 {}", id.0));
             self.ui.set_toast(format!("{title} 已停止:{cause}"));
         }
-        self.ui_dirty = true;
+        mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
     }
 }
@@ -6562,7 +6581,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .and_then(crate::automation::pending_for_extra_pane);
                     self.on_pane_ready(generation, id, sink, plan, true);
                 }
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 self.request_ui_redraw();
             }
             UserEvent::PaneOpenErr {
@@ -6576,7 +6595,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // S1:世代号即路由键,查得到属主标签才说明这条失败还有意义。
                 if self.tabs.by_generation(generation).is_some() {
                     self.ui.set_error(msg);
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                     self.request_ui_redraw();
                 }
             }
@@ -6650,7 +6669,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // 规则同分屏新开的那些 —— 跳过 tmux,其余照跑。
                     self.on_pane_ready(generation, pane, sink, pending.plan, true);
                     self.ui.set_toast("已换节点");
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                     self.request_ui_redraw();
                 }
             }
@@ -6667,7 +6686,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // 失败提示按世代过滤,理由同 `PaneOpenErr`。
                 if self.tabs.by_generation(generation).is_some() {
                     self.ui.set_error(msg);
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                     self.request_ui_redraw();
                 }
             }
@@ -6825,7 +6844,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if reconnected {
                     self.ui.set_toast("已重新连接");
                 }
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 self.request_ui_redraw();
             }
             UserEvent::PaneReconnectErr {
@@ -6866,7 +6885,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     self.ui.set_error(format!("重连失败: {msg}"));
                 }
-                self.ui_dirty = true;
+                mark_ui_dirty!(self.ui_dirty);
                 self.request_ui_redraw();
             }
             UserEvent::KeyPathPicked(picked) => {
@@ -7189,7 +7208,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if resp.repaint {
                     // 标脏与请求重绘必须成对:只请求不标脏,那帧会被 frame_is_dirty
                     // 判 Idle 丢掉(终端态尤其明显:远端一安静菜单就点不开)。
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                     active.window.request_redraw();
                 }
                 if is_kbd {
@@ -7223,8 +7242,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let mods = self.mods;
                         self.handle_panel_key(gen, &ke.logical_key, mods);
                         // 代码复核挖出的真 bug:`handle_panel_key`(经
-                        // `dispatch_panel_action`/`move_panel_selection`)只标
-                        // `self.ui_dirty = true`,从不请求重绘。事件循环整个跑在
+                        // `dispatch_panel_action`/`move_panel_selection`)只把
+                        // `self.ui_dirty` 标脏,从不请求重绘。事件循环整个跑在
                         // `ControlFlow::Wait`/`WaitUntil` 上(T3/T7),没有别的事件
                         // 兜底重绘的话,键盘单独触发的这一路(Tab 换栏/↑↓选中/
                         // Enter/Backspace/F5/Ctrl+H)画面会一直停在按键前那一帧,
@@ -7392,7 +7411,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(ws) = self.active_ws_mut() {
                             if ws.focus() != id {
                                 ws.set_focus(id);
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                             }
                         }
                     }
@@ -7549,7 +7568,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         if let (Some(id), Some(ws)) = (id, self.active_ws_mut()) {
                                             ws.close_pane(id);
                                         }
-                                        self.ui_dirty = true;
+                                        mark_ui_dirty!(self.ui_dirty);
                                         self.request_ui_redraw();
                                         return;
                                     }
@@ -7558,7 +7577,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         // 走的同一条):它负责 abort 自动化、
                                         // 收 sftp task、按顺序 drop workspace。
                                         self.close_active_tab();
-                                        self.ui_dirty = true;
+                                        mark_ui_dirty!(self.ui_dirty);
                                         self.request_ui_redraw();
                                         return;
                                     }
@@ -7623,7 +7642,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pump_transfers();
                 if self.transfer.queue.summary().busy {
                     self.transfer.queue.tick(self.start.elapsed().as_secs_f64());
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                 }
                 // 1.6 F55:有 job 挂在冲突上就把处置框弹出来。**绝不静默覆盖**;
                 // 也不重复弹:已经有别的对话框开着时等它先关掉。
@@ -7635,7 +7654,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 job: j.id,
                                 apply_all: false,
                             });
-                        self.ui_dirty = true;
+                        mark_ui_dirty!(self.ui_dirty);
                     }
                 }
                 // 2.2 自愈:能收到重绘请求本身就说明窗口大概率看得见。若还挂在
@@ -8108,7 +8127,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let crate::ui::history::HistoryOut::Restore(id) = out {
                                     self.restore_history(&id);
                                 }
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                             }
                             if std::mem::take(&mut self.ui.history_request) {
                                 self.open_history_dialog();
@@ -8121,7 +8140,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // 没有任何默认答案可猜。
                             if let Some(pane) = actions.rehost_pane {
                                 self.ui.rehost = Some(crate::ui::rehost::RehostDraft::new(pane));
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                             }
                             // 换节点弹窗的结论。`Cancel` 什么都不做(弹窗自己
                             // 已经关了);`Pick` 落到 `self.ui` 上中转,真正
@@ -8140,7 +8159,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     apply_layout_actions(&mut t.ws, &actions)
                                 {
                                     t.current_preset = preset_out;
-                                    self.ui_dirty = true;
+                                    mark_ui_dirty!(self.ui_dirty);
                                     self.spawn_fresh_panes(fresh);
                                 }
                             }
@@ -8151,7 +8170,7 @@ impl ApplicationHandler<UserEvent> for App {
                             match actions.tab {
                                 Some(crate::ui::chrome::TabAction::Switch(ix)) => {
                                     self.tabs.switch_to_index(ix);
-                                    self.ui_dirty = true;
+                                    mark_ui_dirty!(self.ui_dirty);
                                 }
                                 Some(crate::ui::chrome::TabAction::Close(ix)) => {
                                     if let Some(tab) = self.tabs.close(ix) {
@@ -8160,11 +8179,11 @@ impl ApplicationHandler<UserEvent> for App {
                                         self.cancel_transfers_of(tab.content.generation());
                                         wind_down(tab);
                                     }
-                                    self.ui_dirty = true;
+                                    mark_ui_dirty!(self.ui_dirty);
                                 }
                                 Some(crate::ui::chrome::TabAction::NewSession) => {
                                     self.ui.session_manager_open = true;
-                                    self.ui_dirty = true;
+                                    mark_ui_dirty!(self.ui_dirty);
                                 }
                                 // F122:双击标签,或右键菜单点了「重命名…」/
                                 // 「设置颜色…」。初值取**当前有效值**(覆盖优先,
@@ -8190,7 +8209,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                 color,
                                             });
                                     }
-                                    self.ui_dirty = true;
+                                    mark_ui_dirty!(self.ui_dirty);
                                 }
                                 None => {}
                             }
@@ -8265,7 +8284,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         self.transfer.queue.clear_finished()
                                     }
                                 }
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                             }
                             // F53:「编辑中」面板上按下的东西。
                             if let Some(a) = actions.edit {
@@ -8319,14 +8338,14 @@ impl ApplicationHandler<UserEvent> for App {
                                         self.ui.edit_expanded = true;
                                     }
                                 }
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                             }
                             // F100:导出的 Markdown 送剪贴板。写剪贴板是 IO,`ui/`
                             // 那一层只画不做 IO,所以在这里发起(同 F18 的复制路径)。
                             if let Some(md) = actions.annotate_export {
                                 self.clipboard.set(&md);
                                 self.ui.set_toast("标注已复制,粘进 Claude Code");
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                             }
                             // F83 标题条开关:改的是行数,下一帧 compute_geoms
                             // 算出新 grid,再由 apply_geometry 发 window_change。
@@ -8335,7 +8354,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 if let Some(ws) = self.active_ws_mut() {
                                     ws.title_bars = !ws.title_bars;
                                 }
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                             }
                             // 菜单动作(§4.2):断开 = 关掉活动标签(单标签时即回
                             // launcher 态,与 Task 2 之前逐帧等价);退出整个事件循环。
@@ -8365,7 +8384,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if repaint_delay < std::time::Duration::MAX {
                                 // 排期的那一帧必须同时标脏,否则到点重绘时
                                 // `frame_is_dirty` 判 Idle,动画/交互反馈直接丢帧。
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                                 let at = Instant::now() + repaint_delay;
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
@@ -8374,7 +8393,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 冻在传输开始那一帧 —— 进度事件按 T3 刻意不
                                 // 请求重绘,没有别的东西会唤醒事件循环。
                                 // T7:这一支同样显式复位 control_flow。
-                                self.ui_dirty = true;
+                                mark_ui_dirty!(self.ui_dirty);
                                 let at = Instant::now()
                                     + std::time::Duration::from_millis(TRANSFER_UI_INTERVAL_MS);
                                 self.next_frame_at = Some(at);
@@ -8434,7 +8453,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // 滚动改了 display_offset,选区终点要按新视口重新落点,
                     // 否则拖到边缘后画面在滚、选区却停在原地不长。
                     self.update_selection_endpoint();
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                     let at = Instant::now() + std::time::Duration::from_millis(16);
                     self.next_frame_at = Some(at);
                     event_loop.set_control_flow(ControlFlow::WaitUntil(at));
@@ -8549,7 +8568,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }) = self.ui.tab_props_save.take()
                 {
                     apply_tab_props(&mut self.tabs, tab_id, name, color);
-                    self.ui_dirty = true;
+                    mark_ui_dirty!(self.ui_dirty);
                 }
                 // 换节点的发起点。放在这里(而不是渲染闭包里)的理由同
                 // `tab_props_save`:闭包里 `self.ui`/`self.active` 正被借出去。
@@ -10285,7 +10304,7 @@ mod tests {
     /// (`App` 单测里造不出 `Active`:要 wgpu 设备和真窗口)。
     ///
     /// 自证会变红:在 `apply_font` 里加一句 `layout_geometry(...)`,
-    /// 或者把 `self.ui_dirty = true;` 删掉。
+    /// 或者把 `mark_ui_dirty!(self.ui_dirty);` 删掉。
     #[test]
     fn a_font_change_goes_through_the_same_geometry_path_as_a_resize() {
         let src = include_str!("app.rs");
@@ -10301,7 +10320,7 @@ mod tests {
             "apply_font 的函数体切歪了 —— 下面几条断言会空过"
         );
         assert!(
-            body.contains("self.ui_dirty = true;"),
+            body.contains("mark_ui_dirty!(self.ui_dirty);"),
             "换了字体不标脏:远端一安静就没有下一帧,新字号要等用户碰一下鼠标\
              才生效(而 `apply_geometry` 只在 present 那一帧跑)"
         );
@@ -13447,7 +13466,7 @@ mod tests {
     /// 正是 T3 点名的那条红线。进度显示该由帧闸驱动,不由事件驱动。
     ///
     /// 结构守护(`user_event` 要 `&mut App`,无头造不出来)。
-    /// 自证会变红:在那条 arm 里加一句 `self.ui_dirty = true;`。
+    /// 自证会变红:在那条 arm 里加一句 `mark_ui_dirty!(self.ui_dirty);`。
     #[test]
     fn transfer_progress_events_never_request_a_redraw_so_the_fan_stays_quiet() {
         let src = include_str!("app.rs");
@@ -17125,6 +17144,49 @@ mod tests {
         assert!(
             !call.contains("self.ui_dirty, self.ui_dirty"),
             "两路传了同一个值,归因是假的:{call}"
+        );
+    }
+
+    /// F157:**每一处**置脏都必须走 `mark_ui_dirty!`,不许直接写字段赋值。
+    ///
+    /// 直接赋值等于在归因表上开一个洞,而洞的症状是「剖面里少了一行、
+    /// 看起来一切正常」—— 这类静默失效在本项目已经踩中过多次(F12 的
+    /// 埋点、F155 的接线),只能靠机械守护。
+    ///
+    /// 顺带钉住清脏点还在:一起被替换掉的话 `ui_dirty` 再也不会归零,
+    /// 每帧都脏,直接重演 T3。
+    ///
+    /// 自证会变红:把任意一处 `mark_ui_dirty!(self.ui_dirty);` 改回
+    /// 直接字段赋值。
+    #[test]
+    fn every_ui_dirty_set_site_goes_through_the_attribution_macro() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        // `split` 找不到模式时会把整份 haystack 原样返回,`.next()` 永远是
+        // `Some` —— 切不干净的话下面搜到的会是测试自己的文本,断言恒绿。
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 会搜到测试自己的文本,断言恒绿"
+        );
+        assert!(
+            prod.contains("macro_rules! mark_ui_dirty"),
+            "置脏宏不见了 —— 归因整个失效"
+        );
+        assert!(
+            prod.contains("mark_ui_dirty!(self.ui_dirty);"),
+            "一处宏调用都没有 —— 替换没做"
+        );
+        assert_eq!(
+            prod.matches("ui_dirty = true").count(),
+            0,
+            "有置脏点绕开了 mark_ui_dirty! —— F157 的归因表会漏掉它"
+        );
+        assert!(
+            prod.contains("self.ui_dirty = false;"),
+            "清脏点被一起改掉了 —— ui_dirty 再也不会归零,直接重演 T3"
         );
     }
 }

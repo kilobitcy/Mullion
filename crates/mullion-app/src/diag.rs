@@ -12,7 +12,7 @@
 //! `Stage::Idle` 表示「事件循环正常阻塞等事件」——那是常态,看门狗必须忽略,
 //! 否则空闲一分钟就误报。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -138,6 +138,100 @@ static SYNC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// F12 剖面:整形缓存这一窗口命中/未命中了多少行。
 static RESHAPE_HIT: AtomicU64 = AtomicU64::new(0);
 static RESHAPE_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// F157:`ui_dirty` 归因表的槽位数。
+///
+/// 8 而不是 80(置脏点总数):空闲时真正在响的只有个位数处,而这张表要待在
+/// 帧路径上——最坏 8 次 relaxed load + 1 次 CAS,与 `diag::mark` 同量级。
+pub const DIRTY_SITES: usize = 8;
+
+/// `ui_dirty` 置真的归因表:定长、无锁、不分配、不格式化(T3)。
+///
+/// 抽成结构体(而不是一组裸 `static`)只为一件事:**测试能自己造一个**。
+/// 进程级 static 是全 crate 共享的 —— 并行 runner 下别的测试会间接调到
+/// `note_ui_dirty`,共享状态会让本文件的断言概率性假红(与 `StageClock`
+/// 同一条理由)。
+struct DirtyTable {
+    /// 槽位认领的源码行号。0 = 空槽。
+    line: [AtomicU32; DIRTY_SITES],
+    hits: [AtomicU64; DIRTY_SITES],
+    /// 槽位用完之后落到这里,报成 `dirty=...,other:N`。**必须报**:
+    /// 不报的话「这几处就是全部」与「还有一堆没槽位」在日志里长得一样。
+    other: AtomicU64,
+}
+
+impl DirtyTable {
+    const fn new() -> Self {
+        Self {
+            line: [const { AtomicU32::new(0) }; DIRTY_SITES],
+            hits: [const { AtomicU64::new(0) }; DIRTY_SITES],
+            other: AtomicU64::new(0),
+        }
+    }
+
+    /// 记一次「第 `line` 行把 `ui_dirty` 置真了」。
+    ///
+    /// **单写者**:生产环境里只有主线程经 `mark_ui_dirty!` 调用,看门狗线程
+    /// 只读 `drain()`——不需要 CAS 重试,与本文件 `StageClock::mark` 同一条
+    /// 理由。
+    ///
+    /// 两轮线性扫:第一轮找精确命中,直接加计数并返回。找不到命中,第二轮
+    /// 抢一个「空槽,或者这一窗口还一次没响过的槽位」——**关键在后半句**:
+    /// 一个槽位挂着上一窗口的行号,但这一窗口(`drain` 还没取走它)一次都
+    /// 没加过,说明那一处已经安静了,原地把它让给新来的行更有用,不必等
+    /// 到下一次 `drain` 才收回——否则「上一窗口才响过一次的启动尖峰」会把
+    /// 槽位多占一整窗口,恰好把这一窗口真正常驻的那一处挤进 `other`
+    /// (`a_slot_that_went_quiet_is_handed_back_for_the_next_window` 钉的
+    /// 就是这一条)。
+    fn note(&self, line: u32) {
+        for i in 0..DIRTY_SITES {
+            if self.line[i].load(Ordering::Relaxed) == line {
+                self.hits[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        for i in 0..DIRTY_SITES {
+            let quiet = self.line[i].load(Ordering::Relaxed) == 0
+                || self.hits[i].load(Ordering::Relaxed) == 0;
+            if quiet {
+                self.line[i].store(line, Ordering::Relaxed);
+                self.hits[i].store(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.other.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 取走这一窗口的内容。
+    ///
+    /// **这一窗口一次没响过的槽位要还回去**:不还的话,启动那几秒里各来
+    /// 一次的一次性置脏点会把 8 个槽位永久占死,而真正每帧都在置脏的那
+    /// 一处只能落进 `other` —— 一整趟实机往返白跑,且剖面看起来一切正常。
+    fn drain(&self) -> (Vec<(u32, u64)>, u64) {
+        let mut out = Vec::new();
+        for i in 0..DIRTY_SITES {
+            let hits = self.hits[i].swap(0, Ordering::Relaxed);
+            if hits > 0 {
+                out.push((self.line[i].load(Ordering::Relaxed), hits));
+            } else {
+                self.line[i].store(0, Ordering::Relaxed);
+            }
+        }
+        (out, self.other.swap(0, Ordering::Relaxed))
+    }
+}
+
+static DIRTY: DirtyTable = DirtyTable::new();
+
+/// F157:第 `line` 行把 `ui_dirty` 置真了。**只由 `mark_ui_dirty!` 宏调用。**
+///
+/// 只收行号、不收文件名:所有置脏点都在 `app.rs`(由
+/// `app::tests::every_ui_dirty_set_site_goes_through_the_attribution_macro`
+/// 钉死)。存文件名要么存 `&'static str` 的裸指针(不安全还原),要么加锁
+/// ——帧路径上两者都不行(T3)。
+pub fn note_ui_dirty(line: u32) {
+    DIRTY.note(line);
+}
 /// 状态量(此刻是多少),不是「这窗口发生了几次」—— 采集时读而不清。
 static TABS: AtomicU64 = AtomicU64::new(0);
 static PANES: AtomicU64 = AtomicU64::new(0);
@@ -489,6 +583,9 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.sync_timeouts = SYNC_TIMEOUTS.swap(0, Ordering::Relaxed);
     s.reshape_hit = RESHAPE_HIT.swap(0, Ordering::Relaxed);
     s.reshape_miss = RESHAPE_MISS.swap(0, Ordering::Relaxed);
+    let (dirty_sites, dirty_other) = DIRTY.drain();
+    s.dirty_sites = dirty_sites;
+    s.dirty_other = dirty_other;
     s.tabs = TABS.load(Ordering::Relaxed);
     s.panes = PANES.load(Ordering::Relaxed);
     s.hosts = HOSTS.load(Ordering::Relaxed);
@@ -617,5 +714,72 @@ mod tests {
         assert_eq!(stuck_ms(1_000, 9_999_999), 0);
         // 3 秒阈值刚好越线。
         assert!(stuck_ms(3_000_000, 0) >= DEFAULT_STALL_MS);
+    }
+
+    /// F157:归因表在槽位够用时逐行分开计,用完之后落进 `other`。
+    ///
+    /// 表写错的症状是「剖面里有一行数字,但它指的不是那个地方」——归因错了
+    /// 比没有更糟,会把人带去改错地方。
+    ///
+    /// 用**自己的**表实例而不是进程级 static:并行 runner 下别的测试会间接
+    /// 调到 `note_ui_dirty`,共享 static 会让断言概率性假红(与本文件
+    /// `StageClock` 给测试单开实例是同一条理由)。
+    ///
+    /// 自证会变红:把 `DirtyTable::note` 里的线性扫描去掉,永远走 `other`。
+    #[test]
+    fn the_attribution_table_keeps_each_line_apart_until_it_runs_out_of_slots() {
+        let t = DirtyTable::new();
+        for _ in 0..300 {
+            t.note(8365);
+        }
+        t.note(7191);
+        t.note(7191);
+        // 再来 DIRTY_SITES 个各不相同的行号,把槽位撑满并溢出。
+        for line in 1000..(1000 + DIRTY_SITES as u32) {
+            t.note(line);
+        }
+        let (sites, other) = t.drain();
+        assert!(
+            sites.contains(&(8365, 300)),
+            "每帧都在置脏的那一处没被单独计出来:{sites:?}"
+        );
+        assert!(sites.contains(&(7191, 2)), "第二处没被计出来:{sites:?}");
+        assert_eq!(sites.len(), DIRTY_SITES, "槽位没被填满:{sites:?}");
+        assert!(other > 0, "槽位用完之后的置脏必须落进 other,否则会静默消失");
+    }
+
+    /// 取走之后,**这一窗口没再响过**的槽位要还回去。
+    ///
+    /// 不还的话,启动那几秒里各来一次的一次性置脏点会把 8 个槽位永久占死,
+    /// 而真正每帧都在置脏的那一处只能落进 `other` —— 一整趟实机往返白跑,
+    /// 且剖面看起来一切正常。
+    ///
+    /// 自证会变红:把 `drain` 里那句「hits == 0 就把槽位清零」删掉。
+    #[test]
+    fn a_slot_that_went_quiet_is_handed_back_for_the_next_window() {
+        let t = DirtyTable::new();
+        for line in 1..=(DIRTY_SITES as u32) {
+            t.note(line); // 启动期的一次性置脏点,各来一次
+        }
+        let _ = t.drain();
+        for _ in 0..50 {
+            t.note(9999); // 下一个窗口里真正每帧都在置脏的那一处
+        }
+        let (sites, other) = t.drain();
+        assert!(
+            sites.contains(&(9999, 50)),
+            "槽位没还回来,常驻置脏点被挤进了 other:sites={sites:?} other={other}"
+        );
+    }
+
+    /// 计次量是**取走**,不是读取。剖面报的是「这 5 秒」而不是自启动累计。
+    ///
+    /// 自证会变红:把 `drain` 里 `DIRTY_HITS` 的 `swap(0, ..)` 改成 `load(..)`。
+    #[test]
+    fn draining_the_attribution_table_resets_the_window() {
+        let t = DirtyTable::new();
+        t.note(42);
+        assert_eq!(t.drain().0, vec![(42, 1)]);
+        assert!(t.drain().0.is_empty(), "取走之后窗口该是空的");
     }
 }
