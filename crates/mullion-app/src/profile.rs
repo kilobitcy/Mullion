@@ -121,6 +121,37 @@ pub fn fmt_us(us: u64) -> String {
     }
 }
 
+/// `repaint_delay` 落在哪个桶（F157）。
+///
+/// 三分而不是二分:`Duration::MAX` 与「很大的有限值」**必须分开**。前者是
+/// 「egui 不需要重绘」,后者是「egui 要重绘,只是可以等」——归成一类的话,
+/// 剖面里「空闲时 egui 一次都没要过重绘」和「空闲时 egui 每帧都要」长得一样,
+/// 而分辨这两者正是 F157 存在的全部理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepaintBucket {
+    /// `Duration::ZERO` —— egui 要求**立刻**再来一帧。空闲时出现这一档,
+    /// 说明 `InputState::wants_repaint_after` 的第一条判据成立
+    /// (有未处理的指针动作 / 滚动增量 / 输入事件)。
+    Zero,
+    /// 有限非零 —— 动画、tooltip 延时之类,可以等。
+    Finite,
+    /// `Duration::MAX` —— egui 不需要重绘。**真空闲时本该恒是这一档**。
+    Max,
+}
+
+/// 把一个 `repaint_delay` 归进 [`RepaintBucket`]。纯函数,可单测。
+pub fn repaint_bucket(d: std::time::Duration) -> RepaintBucket {
+    // `MAX` 先判:它不是零,所以顺序对结果无影响,但先写它是为了让
+    // 「MAX 是独立一档」这件事在代码里一眼可见。
+    if d == std::time::Duration::MAX {
+        RepaintBucket::Max
+    } else if d.is_zero() {
+        RepaintBucket::Zero
+    } else {
+        RepaintBucket::Finite
+    }
+}
+
 /// 一个 5 秒窗口里采到的全部东西。
 ///
 /// **纯数据**：由 `diag.rs` 的周期线程从各个原子计数器 drain 出来填好，
@@ -658,5 +689,28 @@ mod tests {
         s.reshape_hit = 0;
         let line = render_line(&s).expect("忙窗口该有一行");
         assert!(line.contains("reshape=hit:0/"), "零命中被省略了:{line}");
+    }
+
+    /// F157:`repaint_delay` 的三分桶。**`MAX` 必须与「很大的有限值」分开**。
+    ///
+    /// `Duration::MAX` 的语义是「egui 不需要重绘」,一个很大的有限值的语义是
+    /// 「egui 要重绘,只是可以等」。归成一类的话,剖面里「空闲时 egui 一次都
+    /// 没要过重绘」(健康)和「空闲时 egui 每帧都要重绘,只是可以等很久」
+    /// (本切片要查的那个病)长得一模一样。
+    ///
+    /// 自证会变红:把 `repaint_bucket` 的判据改成
+    /// `if d >= std::time::Duration::from_secs(1) { Max }`。
+    #[test]
+    fn a_huge_finite_repaint_delay_is_not_the_same_as_never() {
+        use std::time::Duration;
+        assert_eq!(repaint_bucket(Duration::ZERO), RepaintBucket::Zero);
+        assert_eq!(repaint_bucket(Duration::from_nanos(1)), RepaintBucket::Finite);
+        assert_eq!(repaint_bucket(Duration::from_millis(16)), RepaintBucket::Finite);
+        assert_eq!(
+            repaint_bucket(Duration::from_secs(86_400)),
+            RepaintBucket::Finite,
+            "一天之后要重绘 ≠ 永远不需要重绘"
+        );
+        assert_eq!(repaint_bucket(Duration::MAX), RepaintBucket::Max);
     }
 }
