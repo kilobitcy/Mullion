@@ -4786,6 +4786,7 @@ impl App {
     fn request_ui_redraw(&mut self) {
         mark_ui_dirty!(self.ui_dirty);
         if let Some(a) = &self.active {
+            diag::count_request_redraw(diag::RedrawSource::Event);
             a.window.request_redraw();
         }
     }
@@ -6480,6 +6481,7 @@ impl ApplicationHandler<UserEvent> for App {
                 ) {
                     self.pump_io();
                 } else if let Some(a) = &self.active {
+                    diag::count_request_redraw(diag::RedrawSource::Event);
                     a.window.request_redraw();
                 }
             }
@@ -7209,6 +7211,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // 标脏与请求重绘必须成对:只请求不标脏,那帧会被 frame_is_dirty
                     // 判 Idle 丢掉(终端态尤其明显:远端一安静菜单就点不开)。
                     mark_ui_dirty!(self.ui_dirty);
+                    diag::count_request_redraw(diag::RedrawSource::Event);
                     active.window.request_redraw();
                 }
                 if is_kbd {
@@ -7626,6 +7629,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // F157:唤醒率读数。必须排在分支第一句,提前 return 的路径
+                // 也要计入。
+                diag::count_wake();
                 let now = self.now_ms();
                 // 1+2. 排空每个 pane 的 rx→feed emu→回写各自的 PtyWrite(T1 红线)——
                 // 仅终端态有字节可处理;launcher 态(ws=None)没有终端,跳过,但下面的帧率闸 + egui
@@ -8842,6 +8848,7 @@ impl ApplicationHandler<UserEvent> for App {
             if Instant::now() >= at {
                 self.next_frame_at = None;
                 if let Some(a) = &self.active {
+                    diag::count_request_redraw(diag::RedrawSource::Scheduled);
                     a.window.request_redraw();
                 }
             }
@@ -9821,6 +9828,10 @@ fn render_frame(
     // --- egui:每帧都跑,launcher 态(panes 为空)也要画菜单/状态栏。---
     diag::mark(diag::Stage::EguiRun);
     let raw_input = a.egui_state.take_egui_input(&a.window);
+    // F157:这一帧喂了 egui 几个事件。egui 的 `wants_repaint_after` 只要本趟
+    // `events` 非空就返回 `Duration::ZERO` —— 空闲时这个数本该是 0,不是 0
+    // 就说明有人在往里灌事件,那正是「凭什么还在出帧」的答案。
+    diag::note_egui_events(raw_input.events.len());
     let mut actions = crate::ui::UiActions::default();
     // egui::Context::run 内部是个 loop(egui 0.30 context.rs:802-841):首趟跑完
     // 若 `platform_output.requested_discard()`(例如某些部件首次展示时调用
@@ -9896,6 +9907,9 @@ fn render_frame(
         .viewport_output
         .get(&egui::ViewportId::ROOT)
         .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+    // F157:egui 到底要不要下一帧。真空闲时本该恒是 `m:`(MAX);日志里
+    // 每帧都是 `z:`/`f:` 就坐实了自激回路②。
+    diag::note_repaint_delay(repaint_delay);
 
     // 每帧先 trim:清掉上一帧的 glyphs_in_use,让本帧 prepare 能按需淘汰旧字形。
     // 必须在 prepare/get_current_texture 的 early-return 之前——挪到函数末尾会导致
@@ -17187,6 +17201,94 @@ mod tests {
         assert!(
             prod.contains("self.ui_dirty = false;"),
             "清脏点被一起改掉了 —— ui_dirty 再也不会归零,直接重演 T3"
+        );
+    }
+
+    /// F157:**每一处** `request_redraw()` 都必须同时记一笔来源。
+    ///
+    /// 漏一处的症状是剖面里 `wake` 与 `rr` 的差值凭空变大,而那个差值正是
+    /// 用来判断「唤醒是谁推的」的唯一依据 —— 归因错了会把人带去改错地方。
+    ///
+    /// 自证会变红:删掉任意一处 `diag::count_request_redraw(...)`,
+    /// 或者新加一处 `request_redraw()` 而不配套记账。
+    #[test]
+    fn every_request_redraw_records_where_it_came_from() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 会搜到测试自己的文本,断言恒绿"
+        );
+        let calls = prod.matches(".request_redraw();").count();
+        let notes = prod.matches("diag::count_request_redraw(").count();
+        assert!(calls > 0, "一处 request_redraw 都没有 —— 切片切错了");
+        assert_eq!(
+            calls, notes,
+            "{calls} 处 request_redraw 只有 {notes} 处记了来源"
+        );
+        assert!(
+            prod.contains("diag::count_request_redraw(diag::RedrawSource::Scheduled)"),
+            "没有任何一处按 `sched`(about_to_wait 到点补画)记账"
+        );
+    }
+
+    /// F157:唤醒计数必须记在 `RedrawRequested` 分支的**最开头**。
+    ///
+    /// 记在后面的话,那些在帧闸之前就 return 掉的路径(最小化 / PumpOnly)
+    /// 完全不计数 —— 而「窗口最小化了却还在每秒醒 400 次」恰恰是最该被
+    /// 看见的一种。
+    ///
+    /// 自证会变红:把 `diag::count_wake();` 挪到 `self.pump_io();` 之后。
+    #[test]
+    fn the_wake_counter_sits_at_the_very_top_of_the_redraw_arm() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(prod.len() < src.len(), "没能切掉测试模块,断言会恒绿");
+        let arm = prod
+            .split("WindowEvent::RedrawRequested => {")
+            .nth(1)
+            .expect("找不到 RedrawRequested 分支");
+        let head = &arm[..arm.len().min(200)];
+        assert!(
+            head.contains("diag::count_wake();"),
+            "唤醒计数不在分支开头:{head}"
+        );
+        assert!(
+            arm.split("self.pump_io();")
+                .next()
+                .unwrap_or_default()
+                .contains("count_wake"),
+            "唤醒计数排在了 pump_io 之后 —— 提前 return 的路径会漏计"
+        );
+    }
+
+    /// F157:喂给 egui 的事件数与 egui 吐回来的 `repaint_delay` 都要采。
+    ///
+    /// 这两个数是本切片**唯一**能回答「`wants_repaint_after` 的哪一条判据
+    /// 每帧都成立」的东西,少任何一个都得再跑一趟实机。
+    ///
+    /// 自证会变红:删掉 `diag::note_egui_events(` 或 `diag::note_repaint_delay(`。
+    #[test]
+    fn the_egui_side_of_the_frame_loop_is_instrumented() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(prod.len() < src.len(), "没能切掉测试模块,断言会恒绿");
+        assert!(
+            prod.contains("diag::note_egui_events(raw_input.events.len());"),
+            "没采「这一帧喂了 egui 几个事件」"
+        );
+        assert!(
+            prod.contains("diag::note_repaint_delay(repaint_delay);"),
+            "没采 egui 吐回来的 repaint_delay"
         );
     }
 }

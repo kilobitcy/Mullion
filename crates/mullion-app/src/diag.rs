@@ -139,6 +139,22 @@ static SYNC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static RESHAPE_HIT: AtomicU64 = AtomicU64::new(0);
 static RESHAPE_MISS: AtomicU64 = AtomicU64::new(0);
 
+/// F157:本窗口收到多少次 `RedrawRequested`。唤醒率的直接读数。
+static WAKES: AtomicU64 = AtomicU64::new(0);
+/// F157:我们主动 `request_redraw` 的次数,按来源分。
+static RR_SCHED: AtomicU64 = AtomicU64::new(0);
+static RR_EVT: AtomicU64 = AtomicU64::new(0);
+/// F157:喂给 egui 的事件总数 / 其中有事件的帧数。
+static EGUI_EVENTS: AtomicU64 = AtomicU64::new(0);
+static EGUI_EVENT_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// F157:`repaint_delay` 三分桶(见 `profile::repaint_bucket`)。
+static RDELAY_ZERO: AtomicU64 = AtomicU64::new(0);
+static RDELAY_FINITE: AtomicU64 = AtomicU64::new(0);
+static RDELAY_MAX: AtomicU64 = AtomicU64::new(0);
+/// F159:整帧指纹命中/未命中的帧数。
+static FP_HIT: AtomicU64 = AtomicU64::new(0);
+static FP_MISS: AtomicU64 = AtomicU64::new(0);
+
 /// F157:`ui_dirty` 归因表的槽位数。
 ///
 /// 8 而不是 75(置脏点总数):空闲时真正在响的只有个位数处,而这张表要待在
@@ -315,6 +331,68 @@ pub fn count_redraw(terminal: bool, ui: bool) {
 /// 一次重绘被帧闸挡下(T3 的直接体感指标)。
 pub fn count_throttled() {
     THROTTLED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// F157:窗口收到了一次 `RedrawRequested`。**记在分支最开头**——记在后面
+/// 的话,最小化 / PumpOnly 那些提前 return 的路径完全不计数,而「最小化了
+/// 却还在每秒醒 400 次」恰恰是最该被看见的一种。
+pub fn count_wake() {
+    WAKES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 我们主动调 `request_redraw` 的来源(F157)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedrawSource {
+    /// `about_to_wait` 到点把被节流的那帧补画出来。
+    Scheduled,
+    /// 因窗口事件 / 后台唤醒 / UI 主动请求。
+    Event,
+}
+
+/// F157:记一次主动请求重绘。
+///
+/// 与 `count_wake` 的差值不为零是**正常**的:多次请求会被 winit 合并成
+/// 一次 `RedrawRequested`,OS 也会主动发。差值本身就是信息,不试图把它
+/// 归成精确的三类(那需要一个「最近一次请求来源」的单槽标记,而合并会让
+/// 它系统性失真)。宁可报两个诚实的数。
+pub fn count_request_redraw(src: RedrawSource) {
+    match src {
+        RedrawSource::Scheduled => &RR_SCHED,
+        RedrawSource::Event => &RR_EVT,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
+/// F157:这一帧喂给 egui 多少个输入事件。0 时直接返回,免得静止时也在
+/// relaxed 原子上打转。
+///
+/// egui 的 `InputState::wants_repaint_after` 只要本趟 `events` 非空就返回
+/// `Duration::ZERO` —— 所以「有几帧带着事件」才是跟 `rdelay=z:` 直接对得上
+/// 的那个数,两者必须分开报。
+pub fn note_egui_events(n: usize) {
+    if n == 0 {
+        return;
+    }
+    EGUI_EVENTS.fetch_add(n as u64, Ordering::Relaxed);
+    EGUI_EVENT_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// F157:egui 这一帧吐回来的 `repaint_delay` 落在哪个桶。
+pub fn note_repaint_delay(d: Duration) {
+    match crate::profile::repaint_bucket(d) {
+        crate::profile::RepaintBucket::Zero => &RDELAY_ZERO,
+        crate::profile::RepaintBucket::Finite => &RDELAY_FINITE,
+        crate::profile::RepaintBucket::Max => &RDELAY_MAX,
+    }
+    .fetch_add(1, Ordering::Relaxed);
+}
+
+/// F159:整帧指纹这一帧命中(没提交 GPU)还是没命中。
+///
+/// **差分类优化唯一的运行期守护**:判据写错导致永远 miss 时,画面完全
+/// 正确、日志一切正常、性能悄悄回到改之前,只有这里的比值会掉。
+pub fn count_frame_fp(hit: bool) {
+    if hit { &FP_HIT } else { &FP_MISS }.fetch_add(1, Ordering::Relaxed);
 }
 
 /// 用户按下了一个会发往远端的键。记下时刻,等下一段入站字节来时算回显往返。
@@ -601,6 +679,16 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     let (dirty_sites, dirty_other) = DIRTY.drain();
     s.dirty_sites = dirty_sites;
     s.dirty_other = dirty_other;
+    s.wakes = WAKES.swap(0, Ordering::Relaxed);
+    s.rr_sched = RR_SCHED.swap(0, Ordering::Relaxed);
+    s.rr_evt = RR_EVT.swap(0, Ordering::Relaxed);
+    s.egui_events = EGUI_EVENTS.swap(0, Ordering::Relaxed);
+    s.egui_event_frames = EGUI_EVENT_FRAMES.swap(0, Ordering::Relaxed);
+    s.rdelay_zero = RDELAY_ZERO.swap(0, Ordering::Relaxed);
+    s.rdelay_finite = RDELAY_FINITE.swap(0, Ordering::Relaxed);
+    s.rdelay_max = RDELAY_MAX.swap(0, Ordering::Relaxed);
+    s.fp_hit = FP_HIT.swap(0, Ordering::Relaxed);
+    s.fp_miss = FP_MISS.swap(0, Ordering::Relaxed);
     s.tabs = TABS.load(Ordering::Relaxed);
     s.panes = PANES.load(Ordering::Relaxed);
     s.hosts = HOSTS.load(Ordering::Relaxed);
