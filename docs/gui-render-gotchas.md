@@ -80,6 +80,19 @@
   出 NaN,该帧几何全坏。`new()` 和 `resize()` **两处**都要用钳制后的值。
 - **`get_current_texture()` 分 `SurfaceError` 四变体处理**:`Timeout` 跳过本帧(别 reconfigure)、
   `Lost`/`Outdated` reconfigure、`OutOfMemory` 记录。别 `Err(_)` 一把吞(黑屏无日志难查)。
+- **`surface.configure()` 之后交换链内容未定义,所有「跟上一帧比」的基准都必须当场作废(F159)。**
+  项目里有**两个** configure 调用点,天各一方:`render_frame` 的 `Lost`/`Outdated` 分支
+  (`app.rs`)、`Gpu::resize`(`gpu.rs`,唯一调用方 `App::apply_resize`)。F159 落地时只堵住了
+  前者,后者漏了整整一轮复核才被挖出来。
+  **症状**:窗口最小化后还原到**原尺寸**(多数窗管的默认行为)—— `apply_resize` 以不变的
+  `(w, h)` 调 `gpu.resize`,surface 被重新 configure,而 `(config.width, config.height)` 是
+  整帧指纹里唯一的几何项、值没变,空闲时其余项也不变 → 指纹命中 → 在内容未定义的交换链上
+  提前 return。**还原后黑屏或停在旧画面,直到某次内容变化才自愈,编译/测试/日志全静默。**
+  尺寸真变了的 `Resized` 反而不受影响(指纹里的尺寸元组变了,自然 miss),所以这条路更难撞见。
+  **规则**:新增任何 configure 调用点,同一个语句块里补作废。守护是**两条**分文件的源码切片
+  测试(`reconfiguring_the_surface_drops_the_fingerprint_baseline` /
+  `resizing_the_surface_also_drops_the_fingerprint_baseline`)—— 它们各钉一处,**跨文件够不着
+  彼此**,第三个调用点不会有任何测试报警,只有 `Gpu::resize` 的文档注释在指路。
 - **挑了 sRGB surface 格式(`.find(|f| f.is_srgb())`),自己的着色器和 `LoadOp::Clear` 就必须手动转线性,否则外壳与终端两套颜色。**
   选中 sRGB 格式后,硬件会把着色器输出色值、`Clear` 的值都当**线性值**再编码成 sRGB——写进去的
   必须是线性值,不是设计稿上那个 sRGB 十六进制。`egui`(`linear_from_gamma_rgb`)和
