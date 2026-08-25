@@ -7686,12 +7686,20 @@ impl ApplicationHandler<UserEvent> for App {
                 // 这里 request_redraw,否则陈旧 WaitUntil 过期后每轮零延迟
                 // ResumeTimeReached 会忙转空转满 CPU(T3/N3 红线)。
                 //
-                // dirty:终端态取「远端来了新字节(pacer,含同步块探测)」与「egui 要
-                // 重绘」的并集——只看前者的话,远端一安静菜单就点不开(见
-                // `frame::frame_is_dirty`)。launcher 态本 Task 没有持续数据源,把
-                // 「确实触发了一次 RedrawRequested」当作脏——这不是无条件轮询:
-                // ControlFlow::Wait 下 winit 不会凭空生成 RedrawRequested,真正的重绘
-                // 频率由触发它的事件(resize/connect/wake/OS 重绘)决定。
+                // dirty:两态**同一条判据** —— 「远端来了新字节(pacer,含同步块
+                // 探测)」与「egui 要重绘」的并集(见 `frame::frame_is_dirty`)。
+                //
+                // F158:这里原本还有一句 `None => true`(launcher 态无条件判脏),
+                // 已摘掉。当时给的理由是「`ControlFlow::Wait` 下 winit 不会凭空
+                // 生成 `RedrawRequested`」,而它在同一函数别处会排 `WaitUntil`
+                // 的前提下不成立:present 之后那段一旦拿到有限的 `repaint_delay`
+                // 就排一次 `WaitUntil`,到点 `about_to_wait` 补一次 `request_redraw`
+                // —— 闭环自激。日志坐实:`tabs=0 panes=0` 时照样
+                // `frame=300x/present=300`,对着一屏静止的占位 UI 每秒提交 60 帧。
+                //
+                // 摘掉之后 `ui_dirty` 成为 launcher 态的唯一判据,而它是
+                // 75 个置脏点 : 1 个清脏点的结构。兜底改由 F159 的整帧指纹
+                // (构造式)提供:漏标脏最多晚一帧,不会永久卡住。
                 let terminal_dirty = match self.active_ws() {
                     Some(ws) => crate::render::panes_ready_to_present(
                         ws.panes().iter().map(|p| &p.pacer),
@@ -7708,10 +7716,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.active_ws().map_or(0, |ws| ws.pane_count()),
                     self.active_ws().map_or(0, |ws| ws.hosts.len()),
                 );
-                let dirty = match self.active_ws() {
-                    Some(_) => crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty),
-                    None => true,
-                };
+                let dirty = crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty);
                 let action = self.limiter.plan(dirty, now);
                 // F18 自动滚动只在**真正出帧**的那一轮施加,见 match 之后的说明。
                 let presented = matches!(action, RedrawAction::Present);
@@ -17293,6 +17298,49 @@ mod tests {
         assert!(
             prod.contains("diag::note_repaint_delay(repaint_delay);"),
             "没采 egui 吐回来的 repaint_delay"
+        );
+    }
+
+    /// F158:判脏在 launcher 态与终端态**必须是同一条判据**。
+    ///
+    /// 摘掉的是原来那句 `None => true`(没连任何东西时无条件判脏)。日志
+    /// 坐实了它的后果:`tabs=0 panes=0` 时照样 `frame=300x/present=300`
+    /// —— 对着一屏静止的占位 UI 每秒提交 60 帧 GPU。旁边注释给的理由
+    /// (「`ControlFlow::Wait` 下 winit 不会凭空生成 `RedrawRequested`」)
+    /// 在同一函数别处会排 `WaitUntil` 的前提下不成立。
+    ///
+    /// 判据本身的真值表由 `frame::tests::egui_repaint_alone_is_dirty_enough`
+    /// 里的 `assert!(!frame_is_dirty(false, false))` 守着,这里只钉接线。
+    ///
+    /// 自证会变红:把绑定式改回
+    /// `match self.active_ws() { Some(_) => crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty), None => true }`。
+    #[test]
+    fn the_frame_dirty_check_is_the_same_in_both_states() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 会搜到测试自己的文本,断言恒绿"
+        );
+        assert_eq!(
+            prod.matches("let dirty = ").count(),
+            1,
+            "`let dirty = ` 不止一处,下面的切片会指错地方"
+        );
+        let binding = prod
+            .split("let dirty = ")
+            .nth(1)
+            .expect("找不到 dirty 的绑定式")
+            .split(";\n")
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            binding.trim(),
+            "crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty)",
+            "launcher 态又开了一条兜底判据:{binding}"
         );
     }
 }
