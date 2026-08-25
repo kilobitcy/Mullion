@@ -5128,6 +5128,14 @@ impl App {
         // 最小化(0×0)不 configure 0 面积表面。
         if plan.reconfigure_surface {
             a.gpu.resize(width, height);
+            // F159:`Gpu::resize` 内部也会重新 configure surface,之后交换链内容
+            // 未定义,旧的整帧指纹基准必须作废——道理与 render_frame 里
+            // Lost/Outdated 分支重新 configure 后作废基准是同一件事。放在这里
+            // 而不是 `Gpu::resize` 内部:`Gpu` 拿不到 `Active`,基准字段
+            // 是 `Active` 的字段。另外这条路不能省——最小化后还原到**原尺寸**时
+            // `frame_fingerprint` 里唯一的几何项(config.width/height)没变,若
+            // 基准没作废,下一帧会误判命中而在未定义内容的交换链上提前 return。
+            a.last_frame_fp = None;
         }
         if plan.request_redraw {
             self.request_ui_redraw();
@@ -17619,6 +17627,71 @@ mod tests {
         assert!(
             head.contains("a.last_frame_fp = None;"),
             "重新 configure 之后没作废指纹基准:{head}"
+        );
+    }
+
+    /// F159:`Gpu::resize` 是 `surface.configure` 的**第二个**调用点(第一个在
+    /// `render_frame` 的 Lost/Outdated 分支,见上一条测试),`apply_resize` 里
+    /// 调完它也必须紧接着作废整帧指纹基准,否则「最小化后还原到原尺寸」这条
+    /// 路——`(config.width, config.height)` 没变、指纹里其余项空闲时也不变——
+    /// 会在内容未定义的交换链上误判命中并提前 return,画面停在最小化之前。
+    ///
+    /// 自证会变红:把 `apply_resize` 里 `a.gpu.resize(width, height);` 之后
+    /// 那句作废语句删掉。
+    #[test]
+    fn resizing_the_surface_also_drops_the_fingerprint_baseline() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(prod.len() < src.len(), "没能切掉测试模块,断言会恒绿");
+        let needle = "a.gpu.resize(width, height);";
+        assert_eq!(
+            prod.matches(needle).count(),
+            1,
+            "调用点数量变了,先确认还是不是唯一的 Gpu::resize(width, height) 调用"
+        );
+        let after = prod.split(needle).nth(1).expect("上面刚断言过存在");
+        // 按**字符**截,不按字节:`app.rs` 满是中文注释,`&after[..N]` 一旦让
+        // 边界落进汉字中间就是 panic 而不是干净的断言失败。窗口紧贴实际距离:
+        // 从调用点到作废语句结尾实测 451 字符,留个位数的余量取 460——太宽会连
+        // 下一段无关代码一起框进来(恒绿),太窄会把真实语句切没(误报)。
+        let head: String = after.chars().take(460).collect();
+        assert!(
+            head.contains("a.last_frame_fp = None;"),
+            "surface 重新 configure(经 Gpu::resize)之后没作废指纹基准:{head}"
+        );
+    }
+
+    /// F159:egui 的纹理增量是**每帧 drain、只交付一次**的,`deltas_empty` 必须
+    /// 同时看 `.set` 和 `.free` 两侧算出来——只看其中一侧,或干脆恒为
+    /// `true`,都会在跳帧时把另一侧的增量静默丢弃(下一次命中时 renderer 拿不到
+    /// 本该更新的图集,花屏或 panic)。
+    ///
+    /// 自证会变红:把 `deltas_empty` 的计算改成 `true`,或者去掉
+    /// `&& full_output.textures_delta.free.is_empty()` 只留 `.set` 那半边。
+    #[test]
+    fn deltas_empty_is_derived_from_both_set_and_free() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(src);
+        assert!(prod.len() < src.len(), "没能切掉测试模块,断言会恒绿");
+        let needle = "let deltas_empty =";
+        assert_eq!(
+            prod.matches(needle).count(),
+            1,
+            "deltas_empty 的赋值处数量变了,先确认还是不是唯一一处"
+        );
+        let after = prod.split(needle).nth(1).expect("上面刚断言过存在");
+        // 窗口紧贴实际距离:赋值语句本体在 100 字符内说得完,不需要往后多框。
+        let head: String = after.chars().take(100).collect();
+        assert!(
+            head.contains("full_output.textures_delta.set.is_empty()")
+                && head.contains("full_output.textures_delta.free.is_empty()"),
+            "deltas_empty 没有同时看 set 和 free 两侧:{head}"
         );
     }
 }

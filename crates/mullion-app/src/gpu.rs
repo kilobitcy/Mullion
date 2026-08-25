@@ -489,6 +489,12 @@ impl Gpu {
     }
 
     /// 表面 resize(窗口尺寸变)。
+    ///
+    /// F159:这里会重新 `surface.configure`,之后交换链内容未定义。调用方必须
+    /// 紧接着作废 `Active::last_frame_fp`(整帧指纹基准),否则下一帧可能在
+    /// 未定义内容的交换链上误判命中、提前 return。这句话没法写在 `Gpu` 内部
+    /// 自己做——`Gpu` 拿不到 `Active`。目前唯一调用方是 `App::apply_resize`,
+    /// 已经补了这一步;以后如果再加第二个调用点,同样要补。
     pub fn resize(&mut self, w: u32, h: u32) {
         self.config.width = w.max(1);
         self.config.height = h.max(1);
