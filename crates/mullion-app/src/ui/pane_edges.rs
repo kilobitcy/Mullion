@@ -218,6 +218,7 @@ mod tests {
             appearance: None,
             cwd_leaf: None,
             tmux: None,
+            notice: None,
         }
     }
 

@@ -34,6 +34,9 @@ pub struct TitleView<'a> {
     /// 拼进左区那一整串 `序号 · 节点名 · 目录名 · tmux名`(`title_text`),
     /// 不再是独立右区。
     pub tmux: Option<&'a str>,
+    /// F163/D4:挂在这块 pane 上的一句说明(attach 失败 / 会话已删 / 连不上)。
+    /// 来自 `PaneState::notice`。**不弹窗** —— 多块 pane 同时失败会连弹好几次。
+    pub notice: Option<&'a str>,
 }
 
 /// ④:焦点分屏标题条上那层 accent 的不透明度。0.14 —— 够看出「这块亮一点」,
@@ -57,27 +60,39 @@ pub fn icon_side(inner_h: f32) -> f32 {
 ///
 /// 断开时只留 `序号 · 节点名 (已断开)`:目录名和 tmux 名此刻是陈旧值,
 /// 远端早就不说话了,摆着是误导。
+///
+/// `notice`(F163/D4):挂在这块 pane 上的一句说明,拼在最后。**所有分支都要
+/// 拼**——包括 `host` 为 `None` 那条 early return:占位 pane(D3 的会话已删 /
+/// D6 的拨号降级)恰恰没有自己的 `host`,而那句说明是它唯一能显示的信息。
 pub fn title_text(
     index: usize,
     host: Option<&str>,
     dir: Option<&str>,
     tmux: Option<&str>,
     status: PaneStatus,
+    notice: Option<&str>,
 ) -> String {
+    let tail = |mut s: String| {
+        if let Some(n) = notice {
+            s.push_str(" · ");
+            s.push_str(n);
+        }
+        s
+    };
     let Some(h) = host else {
-        // (None, Disconnected) 并进这条是安全的,不是漏判:状态机里
-        // host == None 当且仅当 PaneState 还没挂上(见 Workspace::apply_preset),
-        // 此时 status 走默认的 Live;一旦 PaneState 存在,host_ix 必指向真实的
-        // HostConn,host 必为 Some。这个组合在当前状态机下不可达。
-        return format!("{index} · 连接中…");
+        // `(None, ..)` 现在可达:占位 pane(`App::place_dead_pane`)的
+        // `host_pending == true`,构造点据此不把 `hosts[host_ix]`(别人那台
+        // 机器)当成自己的名字传进来,`host` 就是 `None`。这类 pane 没有
+        // 自己的主机名,`notice` 是标题条上唯一有用的信息,必须拼上。
+        return tail(format!("{index} · 连接中…"));
     };
     if status == PaneStatus::Disconnected {
-        return format!("{index} · {h} (已断开)");
+        return tail(format!("{index} · {h} (已断开)"));
     }
     let mut parts = vec![index.to_string(), h.to_string()];
     parts.extend(dir.map(str::to_string));
     parts.extend(tmux.map(str::to_string));
-    parts.join(" · ")
+    tail(parts.join(" · "))
 }
 
 /// 画一批标题条,返回被点了 × 的 pane(每帧至多一个)。
@@ -373,6 +388,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                     v.cwd_leaf.as_deref(),
                                     v.tmux,
                                     v.status,
+                                    v.notice,
                                 ))
                                 .color(theme::c32(if v.focused {
                                     t.fg_strong
@@ -406,7 +422,8 @@ mod tests {
                 Some("build-01"),
                 Some("Mullion"),
                 Some("main"),
-                PaneStatus::Live
+                PaneStatus::Live,
+                None
             ),
             "2 · build-01 · Mullion · main"
         );
@@ -419,15 +436,29 @@ mod tests {
     #[test]
     fn missing_pieces_take_their_separator_with_them() {
         assert_eq!(
-            title_text(3, Some("build-01"), Some("Mullion"), None, PaneStatus::Live),
+            title_text(
+                3,
+                Some("build-01"),
+                Some("Mullion"),
+                None,
+                PaneStatus::Live,
+                None
+            ),
             "3 · build-01 · Mullion"
         );
         assert_eq!(
-            title_text(4, Some("build-01"), None, Some("main"), PaneStatus::Live),
+            title_text(
+                4,
+                Some("build-01"),
+                None,
+                Some("main"),
+                PaneStatus::Live,
+                None
+            ),
             "4 · build-01 · main"
         );
         assert_eq!(
-            title_text(5, Some("build-01"), None, None, PaneStatus::Live),
+            title_text(5, Some("build-01"), None, None, PaneStatus::Live, None),
             "5 · build-01"
         );
     }
@@ -447,6 +478,7 @@ mod tests {
             Some("Mullion"),
             Some("main"),
             PaneStatus::Disconnected,
+            None,
         );
         assert_eq!(s, "1 · build-01 (已断开)");
     }
@@ -455,9 +487,69 @@ mod tests {
     #[test]
     fn pane_without_a_host_yet_says_connecting() {
         assert_eq!(
-            title_text(3, None, Some("Mullion"), Some("main"), PaneStatus::Live),
+            title_text(
+                3,
+                None,
+                Some("Mullion"),
+                Some("main"),
+                PaneStatus::Live,
+                None
+            ),
             "3 · 连接中…"
         );
+    }
+
+    /// F163/D4:attach 失败的说明挂在**这块 pane 的标题条**上,不弹窗 ——
+    /// 多块 pane 同时失败时会连弹好几次。
+    ///
+    /// 自证会变红:把 `title_text` 的 `notice` 参数忽略掉。
+    #[test]
+    fn a_pane_notice_shows_up_on_its_own_title_bar() {
+        let got = title_text(
+            2,
+            Some("prod"),
+            Some("srv"),
+            None,
+            PaneStatus::Live,
+            Some("当初的会话 web01 已不存在"),
+        );
+        assert!(got.contains("web01 已不存在"), "{got}");
+        assert!(got.contains("prod"), "说明不该把原来那串顶掉:{got}");
+    }
+
+    /// 断开态 pane 的说明同样要出得来(D3 占位 / D6 降级都是断开态)——
+    /// 断开分支原本是一条 early return,漏了它就整条看不见。
+    #[test]
+    fn a_disconnected_pane_still_shows_its_notice() {
+        let got = title_text(
+            1,
+            Some("prod"),
+            None,
+            None,
+            PaneStatus::Disconnected,
+            Some("会话已被删除,无法自动恢复"),
+        );
+        assert!(got.contains("会话已被删除"), "{got}");
+    }
+
+    /// D3/D6:占位 pane 没有自己的 `HostConn`(`host_ix` 是哑值 0),标题条
+    /// 不许显示成**别人那台机器**的名字 —— 那台其实连得好好的,用户会以为
+    /// 它断了。没有主机名时,那句说明是标题条上唯一有用的信息,必须出得来。
+    ///
+    /// 自证会变红:把 `title_text` 里 `host: None` 那条 early return 的
+    /// `tail(...)` 去掉。
+    #[test]
+    fn a_pane_with_no_host_of_its_own_still_shows_why() {
+        let got = title_text(
+            2,
+            None,
+            None,
+            None,
+            PaneStatus::Disconnected,
+            Some("会话已被删除,无法自动恢复"),
+        );
+        assert!(got.contains("会话已被删除"), "{got}");
+        assert!(!got.contains("prod"), "{got}");
     }
 
     /// 800×600 物理像素、开着标题条的单 pane 几何。
@@ -511,6 +603,7 @@ mod tests {
                 appearance: None,
                 cwd_leaf: None,
                 tmux: None,
+                notice: None,
             };
             view.geom.title_px.h = title_h;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -565,6 +658,7 @@ mod tests {
                 appearance: None,
                 cwd_leaf: None,
                 tmux: None,
+                notice: None,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -625,6 +719,7 @@ mod tests {
             appearance: None,
             cwd_leaf: None,
             tmux: None,
+            notice: None,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -678,6 +773,7 @@ mod tests {
             appearance: None,
             cwd_leaf: None,
             tmux: None,
+            notice: None,
         }];
         // **必须显式把时间推过 `Area` 的 fade_in**。默认 `RawInput` 的
         // `time` 是 `None`,egui 会拿墙钟凑,两帧之间可能只过了几微秒 ——
@@ -820,6 +916,7 @@ mod tests {
             appearance: None,
             cwd_leaf: None,
             tmux: None,
+            notice: None,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -863,6 +960,7 @@ mod tests {
             appearance,
             cwd_leaf: None,
             tmux: None,
+            notice: None,
         }];
         // 跑两帧:`Area` 默认 `fade_in`,第一帧 opacity 是 0,画的图形会被
         // painter 记成 `Shape::Noop`(egui-0.30 `painter.rs::Painter::add`),
@@ -946,6 +1044,7 @@ mod tests {
                 appearance: Some(&a),
                 cwd_leaf: None,
                 tmux: None,
+                notice: None,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1010,6 +1109,7 @@ mod tests {
                 appearance,
                 cwd_leaf: None,
                 tmux: None,
+                notice: None,
             }];
             // 显式推进时间,而不是像 `run_title` 那样跑两帧靠墙钟走时间:
             // 这条测试要比较**颜色**,`fade_in` 半路上的不透明度会把 RGB
@@ -1106,6 +1206,7 @@ mod tests {
                 appearance: Some(&ap),
                 cwd_leaf: None,
                 tmux: None,
+                notice: None,
             }];
 
             let ctx = egui::Context::default();
@@ -1171,6 +1272,7 @@ mod tests {
             appearance: None,
             cwd_leaf: Some("a-directory-name-that-is-also-absurdly-long".to_string()),
             tmux: Some("a-tmux-session-name-that-is-long-too"),
+            notice: None,
         }];
 
         let ctx = egui::Context::default();
@@ -1284,6 +1386,7 @@ mod tests {
                 appearance: None,
                 cwd_leaf: None,
                 tmux: None,
+                notice: None,
             }];
             let ctx = egui::Context::default();
             let t = crate::theme::MULLION_DARK;
@@ -1413,6 +1516,7 @@ mod tests {
                 appearance: None,
                 cwd_leaf: Some("a-directory-name-that-is-also-absurdly-long".to_string()),
                 tmux: Some("a-tmux-session-name-that-is-long-too"),
+                notice: None,
             }];
 
             let ctx = egui::Context::default();

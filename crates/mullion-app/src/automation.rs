@@ -144,6 +144,33 @@ pub fn pending_for_reattach(tpl: &ResolvedAutomation, name: &str) -> Option<Pend
     })
 }
 
+/// F161/D1+D7:按**实测**会话名把这块 pane 接回 tmux。`None` = 没有可用的名字
+/// (不在 tmux 里 / 远端没开 `set-titles` / 自动化总开关关着)。
+///
+/// 与 `pending_for_reattach` 的差别:那条的名字来自**会话配置**
+/// (`tmux_session_name`),这条来自 F123/F124 远端标题上报的**实测值**。
+/// 用户的 tmux 是在远端手敲 `tt web01` 进去的时候,配置里根本没有那个名字
+/// —— 这正是「一块 pane 都没接回来」的根因。
+///
+/// 与 `pending_for_extra_pane` 的关系是**互斥**,不是叠加:attach 一旦生效,
+/// 屏幕就归那个 TUI 了,之后发任何字节都是打进 TUI(D7)。调用方只能二选一。
+///
+/// `detach_others` 见 `restore_plan::detach_flags`(D5:键是「机器 + 会话名」)。
+pub fn pending_for_measured_attach(
+    tpl: &ResolvedAutomation,
+    name: &str,
+    detach_others: bool,
+) -> Option<PendingAutomation> {
+    let steps = mullion_store::build_plan_attach_measured(tpl, name, detach_others);
+    if steps.is_empty() {
+        return None;
+    }
+    Some(PendingAutomation {
+        steps,
+        ready_timeout_ms: tpl.ready_timeout_ms,
+    })
+}
+
 /// 这块 pane 的连接状态是否意味着「在跑的那份自动化该当场取消」。
 ///
 /// 判据是**这条 channel 还能不能把字节送出去**，不是「pane 会不会回来」。
@@ -883,6 +910,49 @@ mod tests {
         let task = tokio::spawn(run(sink, two_steps(), ready_rx, cancel_rx, disc_rx, 15_000));
         ready_tx.send(()).unwrap();
         assert_eq!(task.await.unwrap(), Outcome::Disconnected);
+    }
+
+    /// D7:有实测 tmux 名的 pane **只发 attach**,配置里的登录后命令整个跳过。
+    ///
+    /// 反例说明为什么必须这么定:用户某会话配了 `cd /srv && npm run dev`,
+    /// 先 attach 进 tmux(dev 正跑着)再发这一串,就是往一个正在跑的进程里
+    /// 打字节。`automation.rs` 开篇那条不变量说的就是这件事:attach 一旦生效,
+    /// 屏幕归那个 TUI。
+    ///
+    /// 自证会变红:把 `build_plan_attach_measured` 换成 `build_plan`
+    /// (那条会把 cd/export 一起拼进来)。
+    #[test]
+    fn a_pane_with_a_measured_tmux_name_skips_the_configured_plan() {
+        let mut a = enabled_automation();
+        a.commands = vec![AutomationCommand {
+            text: "npm run dev".into(),
+            delay_ms: None,
+        }];
+        let got = pending_for_measured_attach(&a, "web01", false).expect("有实测名就该有计划");
+        assert_eq!(got.steps.len(), 1, "attach 之后不许再叠别的步骤");
+        let line = String::from_utf8(got.steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("attach"), "{line}");
+        assert!(!line.contains("npm run dev"), "配置的命令被叠上来了:{line}");
+    }
+
+    /// D7 的另一半:**没有**实测名的 pane 照旧跑配置计划。
+    ///
+    /// 单独一条,防止把今天的行为一起删掉 —— 只测上面那条的话,把
+    /// `pending_for_extra_pane` 整个删掉测试照样绿。
+    #[test]
+    fn a_pane_without_a_measured_name_still_runs_the_configured_plan() {
+        let mut a = enabled_automation();
+        a.commands = vec![AutomationCommand {
+            text: "npm run dev".into(),
+            delay_ms: None,
+        }];
+        assert!(
+            pending_for_measured_attach(&a, "", false).is_none(),
+            "没有实测名时不该产出 attach 计划"
+        );
+        let fallback = pending_for_extra_pane(&a).expect("该回落到配置计划");
+        let line = String::from_utf8(fallback.steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("npm run dev"), "{line}");
     }
 
     /// `initial_delay_ms` 已经是第一个 Step 的 delay,`run` 收到 ready 后

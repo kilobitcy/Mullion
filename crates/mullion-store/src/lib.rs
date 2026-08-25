@@ -24,8 +24,9 @@ pub mod tunnel;
 pub mod vault;
 
 pub use automation::{
-    build_plan, build_plan_reattach, build_plan_without_tmux, tmux_session_name, AutomationCommand,
-    AutomationPrefs, EnvVar, ResolvedAutomation, Step, TmuxChoice,
+    attach_only_command, build_plan, build_plan_attach_measured, build_plan_reattach,
+    build_plan_without_tmux, tmux_session_name, AutomationCommand, AutomationPrefs, EnvVar,
+    ResolvedAutomation, Step, TmuxChoice,
 };
 pub use credential::{display_user, Auth, CredentialId, CredentialRecord, InlineAuth};
 pub use error::StoreError;

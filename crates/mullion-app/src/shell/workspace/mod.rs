@@ -120,6 +120,25 @@ impl PtyWriter for Arc<SshSession> {
     }
 }
 
+/// D3/D6:一条**永远写不出去**的 pty。给「摆出来了但没有连接」的占位 pane 用。
+///
+/// 不用 `Option<Box<dyn PtyWriter>>`:那会让每个写入点都多一层判空,而漏掉
+/// 任何一个的现象是 panic。写失败在本项目本来就是**静默丢弃**的既有语义
+/// (调用点都是裸的 `let _ = pty.write(...)`,出站队列满时也是这样),
+/// 让它走同一条路。
+pub struct DeadPty;
+
+impl PtyWriter for DeadPty {
+    fn write(&self, _bytes: Vec<u8>) -> Result<(), TrySendErr> {
+        Err(TrySendErr::Closed)
+    }
+    fn resize(&self, _cols: u16, _rows: u16) -> Result<(), TrySendErr> {
+        Err(TrySendErr::Closed)
+    }
+    /// 没有 channel 可关。`close` 没有默认实现是刻意的(F140),这里显式给空体。
+    fn close(&self) {}
+}
+
 /// 一条**已建立**的 SSH 连接。B2-a 里恒只有一个;数据模型按 N host × M channel
 /// 设计,是为了 B2-b 的"换主机"能原地加而不用推翻结构(§4.2)。
 pub struct HostConn {
@@ -192,6 +211,20 @@ pub struct PaneState {
     /// 而完全不报告的话,「配了 10000 行、往上翻只有 2700 行」就是一个查无
     /// 可查的静默行为。初值 0 保证第一次一定报告。
     pub history_reported: usize,
+    /// F162:`true` = 这块 pane 还没连上**它自己**那台机器 —— 排队等串行拨号的、
+    /// 会话被删掉的占位(D3)、拨号失败降级的(D6)三种。
+    ///
+    /// 这三种 pane 都必须有 `PaneState`(没有的话画不出文字,树上只是一块短暂
+    /// 空白,见 F35 的「空窗期」约定),但它们的 `host_ix` 指着**主叶子那台机器**,
+    /// **不代表自己的身份**。落盘时据此判断该照运行时量、还是照抄上次从盘上
+    /// 读回来的那份(设计 5.2②:不这么做的话,恢复途中被 kill 掉的 exe 会把
+    /// 还没连上的叶子身份**永久**丢掉)。
+    pub host_pending: bool,
+    /// F163/D6:挂在这块 pane 标题条上的一句说明(「当初的会话 web01 已不存在」
+    /// / 「会话已被删除,无法自动恢复」/「连接失败」)。`None` = 没话要说。
+    ///
+    /// **不弹窗**:多块 pane 同时失败时会连弹好几次(D4)。
+    pub notice: Option<String>,
 }
 
 /// 多 pane 工作区:布局树 + 每 pane 状态 + 主机连接池。
@@ -322,12 +355,19 @@ impl Workspace {
     /// 恢复的是**形状与比例**,pane 里的内容一律是新的 —— 终端 scrollback
     /// 从不落盘(设计 E2)。
     ///
+    /// `main_leaf`(F160,设计 5.2①)= 已经连上的那块 pane 该落在**第几个**
+    /// 叶子位上。恢复时主叶子是「前序第一个身份还连得上的叶子」,不一定是
+    /// 第 0 个 —— 叶子 0 是个拨不了号的占位时,恒填 0 会让已连的 pane 占掉
+    /// 本该空着的那格,主叶子反而空着(现象:恢复回来内容全串了一格)。
+    /// 旧调用点传 `0` 行为不变。越界(文件被手改过)夹回 0,不 panic。
+    ///
     /// `None` = 树编码损坏,**什么都不动**。校验放在任何 mutation 之前:
     /// 中途失败会留下一个树与 `panes` 对不上的工作区,那比不恢复糟得多。
     pub fn apply_saved_tree(
         &mut self,
         entries: &[mullion_store::SavedNodeEntry],
         focus_leaf: usize,
+        main_leaf: usize,
     ) -> Option<Vec<PaneId>> {
         use crate::shell::layout_snapshot as snap;
         // 先验后改。`leaf_count` 通过就意味着下面的 `from_entries` 一定能拼出来
@@ -337,12 +377,22 @@ impl Workspace {
         for id in &plan.close {
             self.panes.retain(|p| p.id != *id);
         }
+        let keep = plan.keep.len();
         let mut ids = plan.keep;
         let mut fresh = Vec::new();
         for _ in 0..plan.spawn {
             let id = self.alloc_id();
             ids.push(id);
             fresh.push(id);
+        }
+        // 5.2①:把那块已连上的 pane 从 0 号叶子位挪到主叶子位。
+        // `rotate_left(1)` 把 `[a, f1, f2]` 变成 `[f1, f2, a]` —— 其余叶子
+        // 依次前移,前序顺序不乱。**只在恰好保留一块 pane 时挪位**:保留多块
+        // 时「哪块算已连的那块」本身就没有定义,乱挪只会把内容互相换位。
+        // 恢复路径上 `ws` 是刚建的,恒只有一块(`Workspace::new`)。
+        if keep == 1 {
+            let main = main_leaf.min(ids.len().saturating_sub(1));
+            ids[0..=main].rotate_left(1);
         }
         self.tree = snap::from_entries(entries, &ids)
             .expect("leaf_count 已经验过结构,这里拼不出来说明两者的判据走样了");
@@ -636,6 +686,8 @@ pub mod tests_support {
                 cwd: None,
                 tmux: None,
                 history_reported: 0,
+                host_pending: false,
+                notice: None,
             },
             Probe {
                 writes: probe_writes,
@@ -1006,7 +1058,7 @@ mod tests {
             SavedNodeEntry::leaf(),
             SavedNodeEntry::leaf(),
         ];
-        let fresh = ws.apply_saved_tree(&entries, 2).expect("编码是好的");
+        let fresh = ws.apply_saved_tree(&entries, 2, 0).expect("编码是好的");
         assert_eq!(fresh.len(), 2, "1 屏 → 3 屏要新开 2 条 channel");
         assert!(!fresh.contains(&PaneId(1)), "已有 pane 不该被重开");
 
@@ -1046,7 +1098,7 @@ mod tests {
             SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
             SavedNodeEntry::leaf(),
         ];
-        assert!(ws.apply_saved_tree(&broken, 0).is_none());
+        assert!(ws.apply_saved_tree(&broken, 0, 0).is_none());
         assert_eq!(ws.tree(), &before, "树被动过了");
         assert_eq!(ws.pane_count(), 2, "pane 被动过了");
         assert_eq!(ws.focus(), PaneId(2), "焦点被动过了");
@@ -1058,8 +1110,61 @@ mod tests {
     fn apply_saved_tree_clamps_an_out_of_range_focus_leaf() {
         use mullion_store::SavedNodeEntry;
         let (mut ws, _p) = ws_with(1);
-        ws.apply_saved_tree(&[SavedNodeEntry::leaf()], 7).unwrap();
+        ws.apply_saved_tree(&[SavedNodeEntry::leaf()], 7, 0)
+            .unwrap();
         assert_eq!(ws.focus(), PaneId(1));
+    }
+
+    /// 设计 5.2①:已连上的那块 pane 必须落在**主叶子**位上。
+    ///
+    /// `apply_saved_tree` 原本把已有 pane 恒填第一个叶子位(`ids = keep + fresh`),
+    /// 而主叶子是「前序第一个**身份还连得上**的叶子」—— 叶子 0 是个占位
+    /// (会话被删了)时,已连的 pane 会占掉本该空着的那格,主叶子反而空着,
+    /// 现象是「恢复回来内容全串了一格」。
+    ///
+    /// 自证会变红:把 `main_leaf` 参数忽略掉、恒按 0 处理。
+    #[test]
+    fn the_connected_pane_lands_on_the_main_leaf_not_the_first_leaf() {
+        use mullion_store::{SavedDir, SavedNodeEntry};
+        let (mut ws, _probes) = ws_with(1);
+        let entries = vec![
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::leaf(),
+        ];
+        ws.apply_saved_tree(&entries, 0, 1).expect("结构完整");
+        let leaves = mullion_core::layout::leaves(ws.tree());
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(
+            leaves[1],
+            PaneId(1),
+            "已连上的那块 pane 该落在主叶子(第 1 个)位上,实际落在了 {leaves:?}"
+        );
+    }
+
+    /// 旧调用点传 0 时行为与改动前逐字节一致。
+    #[test]
+    fn passing_zero_keeps_the_old_placement() {
+        use mullion_store::{SavedDir, SavedNodeEntry};
+        let (mut ws, _probes) = ws_with(1);
+        let entries = vec![
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::leaf(),
+        ];
+        ws.apply_saved_tree(&entries, 0, 0).expect("结构完整");
+        assert_eq!(mullion_core::layout::leaves(ws.tree())[0], PaneId(1));
+    }
+
+    /// 越界的 `main_leaf`(文件被手改过)夹回 0,不 panic —— 恢复是启动路径,
+    /// 为一份坏文件崩掉整个进程不成比例。
+    #[test]
+    fn an_out_of_range_main_leaf_is_clamped() {
+        use mullion_store::SavedNodeEntry;
+        let (mut ws, _probes) = ws_with(1);
+        ws.apply_saved_tree(&[SavedNodeEntry::leaf()], 0, 9)
+            .expect("单叶子");
+        assert_eq!(mullion_core::layout::leaves(ws.tree()), vec![PaneId(1)]);
     }
 
     #[test]

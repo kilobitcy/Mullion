@@ -58,18 +58,42 @@ pub enum SavedTabKind {
 ///
 /// 编码规则:`dir`/`ratio` 同时有值 = 二分节点,它的两棵子树紧跟在后面
 /// (先 a 后 b);两者都没有 = 叶子。
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+///
+/// F160:叶子还带**身份**(`session_id`/`tmux`)。分割节点上这两个恒为 `None`。
+/// **不派生 `Copy`** —— `tmux` 是 `String`。这不是疏忽:身份必须跟叶子走,
+/// 摆在别处(比如 `SavedTab` 上一个平行数组)就会出现「树改了、身份没跟着改」
+/// 的错位,而错位的现象是某块 pane 接回了另一块的 tmux 会话。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SavedNodeEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<SavedDir>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratio: Option<f32>,
+    /// F160:这个叶子当初连的是哪条会话记录。`None` = 旧版 exe 写的(读回时
+    /// 回落到 `SavedTab::session_id`,见 `layout_snapshot::leaf_identities`)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// F160/D1:关 exe 那一刻这块 pane **实际所在**的 tmux 会话名
+    /// (F123/F124 由远端标题上报,不是会话配置里写的那个)。
+    /// `None` = 当初不在 tmux 里 / 远端没开 `set-titles`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<String>,
 }
 
 impl SavedNodeEntry {
-    /// 一个叶子。
+    /// 一个没有身份的叶子。
     pub fn leaf() -> Self {
         Self::default()
+    }
+
+    /// F160:一个带身份的叶子。
+    pub fn leaf_with(session_id: Option<SessionId>, tmux: Option<String>) -> Self {
+        Self {
+            dir: None,
+            ratio: None,
+            session_id,
+            tmux,
+        }
     }
 
     /// 一个二分节点。
@@ -77,12 +101,18 @@ impl SavedNodeEntry {
         Self {
             dir: Some(dir),
             ratio: Some(ratio),
+            session_id: None,
+            tmux: None,
         }
     }
 
     /// 这一项是不是叶子。**两个字段必须一起判**:只判 `dir` 的话,一个
     /// 手改出来的 `{ dir = "horizontal" }`(漏了 ratio)会被当成分割节点,
     /// 然后拿 `unwrap_or` 补一个默认比例 —— 那是在猜用户的布局。
+    ///
+    /// F160:**身份字段不参与这条判据**。参与的话,一个记了 tmux 名的叶子
+    /// 会被当成分割节点,整棵树判坏,那个标签被 `usable` 整个丢掉。
+    /// 守护:`a_leaf_that_carries_an_identity_is_still_a_leaf`。
     pub fn is_leaf(&self) -> bool {
         self.dir.is_none() && self.ratio.is_none()
     }
@@ -350,13 +380,127 @@ mod tests {
         let half = SavedNodeEntry {
             dir: Some(SavedDir::Horizontal),
             ratio: None,
+            ..Default::default()
         };
         assert!(!half.is_leaf());
         let other = SavedNodeEntry {
             dir: None,
             ratio: Some(0.5),
+            ..Default::default()
         };
         assert!(!other.is_leaf());
+    }
+
+    /// F160:叶子带上身份字段之后**仍然是叶子**。
+    ///
+    /// `is_leaf` 只看 `dir`/`ratio` —— 把身份字段也算进去的话,一个记了
+    /// tmux 名的叶子会被解码器当成分割节点,整棵树判坏,那个标签直接被
+    /// `usable` 丢掉(现象:恢复列表里的标签莫名其妙少了几个)。
+    ///
+    /// 自证会变红:把 `is_leaf` 改成 `self.dir.is_none() && self.ratio.is_none()
+    /// && self.session_id.is_none()`。
+    #[test]
+    fn a_leaf_that_carries_an_identity_is_still_a_leaf() {
+        let l = SavedNodeEntry::leaf_with(Some(SessionId(7)), Some("web01".into()));
+        assert!(l.is_leaf(), "带身份的叶子被当成了分割节点");
+        assert_eq!(l.session_id, Some(SessionId(7)));
+        assert_eq!(l.tmux.as_deref(), Some("web01"));
+        assert_eq!(l.dir, None);
+        assert_eq!(l.ratio, None);
+    }
+
+    /// F160:没有身份的叶子编出来必须还是**空表**,与今天的文件逐字节一致。
+    ///
+    /// 这条钉的是**降级兼容的另一半**(D9 不升 schema 的前提):新版 exe 写出来
+    /// 的、没有身份的那些叶子,旧版 exe 读到的东西跟它自己写的一模一样。
+    ///
+    /// 自证会变红:让 `leaf()` 带上身份(例如 `session_id: Some(SessionId(9))`)——
+    /// 叶子那层多写一个 `session_id`,`count()` 变成 2。
+    ///
+    /// **别把「去掉 `skip_serializing_if`」当成自证路径**:toml 的序列化器本来就
+    /// 无条件跳过 `None`,去掉那个属性这条测试照样绿。属性留着是为了别的 serde
+    /// 格式(JSON 会写出 `null`)和表明意图,不是这条测试守的东西。
+    #[test]
+    fn a_leaf_without_an_identity_is_still_encoded_as_an_empty_entry() {
+        let one = SavedLayout {
+            schema_version: CURRENT_LAYOUT_SCHEMA,
+            active_tab: 0,
+            updated_at: 0,
+            window: None,
+            tabs: vec![SavedTab {
+                kind: SavedTabKind::Terminal,
+                session_id: SessionId(1),
+                title: "t".into(),
+                focus_leaf: 0,
+                tree: vec![SavedNodeEntry::leaf()],
+            }],
+        };
+        let text = toml::to_string_pretty(&one).unwrap();
+        assert!(
+            !text.contains("session_id = ") || text.matches("session_id").count() == 1,
+            "空叶子不该写出 session_id(只有 [[tab]] 那一处该有):\n{text}"
+        );
+        assert!(!text.contains("tmux"), "空叶子不该写出 tmux:\n{text}");
+    }
+
+    /// F160:身份字段经过真实文件一个来回不变形。
+    ///
+    /// 会话名里**故意带空格和单引号** —— TOML 的字符串转义与后面 F161 的
+    /// shell 转义是两套东西,这里钉的是前者。
+    #[test]
+    fn leaf_identities_round_trip_through_the_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = SavedLayout {
+            schema_version: CURRENT_LAYOUT_SCHEMA,
+            active_tab: 0,
+            updated_at: 0,
+            window: None,
+            tabs: vec![SavedTab {
+                kind: SavedTabKind::Terminal,
+                session_id: SessionId(3),
+                title: "prod".into(),
+                focus_leaf: 1,
+                tree: vec![
+                    SavedNodeEntry::split(SavedDir::Horizontal, 0.4),
+                    SavedNodeEntry::leaf_with(Some(SessionId(3)), Some("web 01".into())),
+                    SavedNodeEntry::leaf_with(Some(SessionId(7)), Some("it's me".into())),
+                ],
+            }],
+        };
+        save(dir.path(), &before).unwrap();
+        let got = load(dir.path());
+        assert!(got.note.is_none(), "正常读回不该降级:{:?}", got.note);
+        assert_eq!(got.layout, before);
+    }
+
+    /// D9:**旧版 exe 写出来的记录**(叶子只有 dir/ratio,没有身份字段)照样读得回来,
+    /// 身份字段是 `None`。没有这条,升级之后第一次启动会把用户上次的现场整份判坏。
+    #[test]
+    fn a_file_written_by_an_older_exe_still_parses_with_empty_identities() {
+        let text = r#"
+schema_version = 1
+active_tab = 0
+updated_at = 0
+
+[[tab]]
+kind = "terminal"
+session_id = 3
+title = "prod"
+focus_leaf = 0
+
+  [[tab.tree]]
+  dir = "horizontal"
+  ratio = 0.5
+
+  [[tab.tree]]
+
+  [[tab.tree]]
+"#;
+        let got: SavedLayout = toml::from_str(text).expect("旧格式必须还读得动");
+        assert_eq!(got.tabs[0].tree.len(), 3);
+        assert!(got.tabs[0].tree[1].is_leaf());
+        assert_eq!(got.tabs[0].tree[1].session_id, None);
+        assert_eq!(got.tabs[0].tree[1].tmux, None);
     }
 
     #[test]

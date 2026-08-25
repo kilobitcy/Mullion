@@ -254,6 +254,47 @@ fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> Stri
     cmd
 }
 
+/// F161/D1+D2:按**实测**会话名接回 tmux 的那一行命令。
+///
+/// 与 [`tmux_command`] 的唯一差别:**砍掉 `|| exec tmux new-session` 那半段**。
+/// 这是 D2 的红线 —— 实测名是「关 exe 那一刻那块 pane 真的在里面」的会话,
+/// 它不在了就说明远端重启过或用户自己 kill 了,凭空造一个同名空会话只会让
+/// 用户以为现场回来了。**永不替用户在远端造东西。**
+///
+/// **`has-session` 守门必须留着**,砍掉的只是 `||` 后半段:裸的
+/// `exec tmux attach -t X` 在会话不存在时,`exec` 已经把 shell 替换成 tmux
+/// 进程,tmux 报错退出 → channel 关闭 → **pane 当场死掉**,D4 的「挂提示」和
+/// D8 的「停在裸 shell」全部落空。守门之后 `&&` 短路,shell 原地活着。
+/// 探测与 attach 之间的竞态窗口沿用 [`tmux_command`] 里「已知且接受」的结论。
+///
+/// `name` **不过 `sanitize_tmux_name`**:那是给「拿配置里的名字去新建」用的,
+/// 会把 `@` 之类合法字符改掉。实测名是远端 tmux 自己报的 `#S`,已经合法。
+pub fn attach_only_command(name: &str, detach_others: bool) -> String {
+    let q = shell_quote(name);
+    let d = if detach_others { " -d" } else { "" };
+    format!("tmux has-session -t {q} 2>/dev/null && exec tmux attach{d} -t {q}")
+}
+
+/// F161:按实测会话名接回 tmux 的一步计划。空计划 = 不发任何字节。
+///
+/// 恒**恰好一个 Step**(与 `build_plan` 的 tmux 分支同一个不变量):attach
+/// 一旦生效,屏幕就归那个 TUI 了,之后再发任何字节都是打进 TUI(D7)。
+///
+/// 返回空的两种情形:自动化总开关关着;名字去掉空白后为空。
+pub fn build_plan_attach_measured(
+    a: &ResolvedAutomation,
+    name: &str,
+    detach_others: bool,
+) -> Vec<Step> {
+    if !a.enabled || name.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![Step {
+        delay: Duration::from_millis(u64::from(a.initial_delay_ms)),
+        bytes: line(&attach_only_command(name, detach_others)),
+    }]
+}
+
 /// 同一份配置,但**跳过 tmux 那一步**:环境变量 / 工作目录 / 登录后命令照跑。
 ///
 /// 给「不是这条连接第一个 pane」的 pane 用 —— 分屏新开的、以及换过节点的。
@@ -1156,5 +1197,130 @@ mod tests {
             Duration::from_millis(200),
             "未设的落 inter_delay"
         );
+    }
+
+    /// D2 红线:按实测名接回去的命令**绝不新建会话**。
+    ///
+    /// 会话已经不在了(远端重启过 / 用户自己 kill 了),正确的表现是命令失败、
+    /// 停在裸 shell,而不是凭空造一个同名空会话让用户以为「接回来了」。
+    ///
+    /// 自证会变红:在 `attach_only_command` 末尾拼回 `|| exec tmux new-session -s {q}`。
+    #[test]
+    fn the_attach_command_never_creates_a_session() {
+        let cmd = attach_only_command("web01", false);
+        assert!(
+            !cmd.contains("new-session"),
+            "只 attach 的命令串里出现了 new-session:{cmd}"
+        );
+        assert!(cmd.contains("attach"), "总得真的 attach 才行:{cmd}");
+    }
+
+    /// D2 的另一半:`has-session` 守门**不能省**。
+    ///
+    /// 裸的 `exec tmux attach -t X` 在会话不存在时,`exec` 已经把 shell 换成了
+    /// tmux 进程,tmux 报错退出 → channel 关闭 → 这块 pane 当场死掉。那样 D4 的
+    /// 「挂提示」和 D8 的「停在裸 shell」全部落空 —— shell 都没了。
+    /// 有守门则 `&&` 短路,shell 原地活着。
+    ///
+    /// 自证会变红:把 `attach_only_command` 改成 `format!("exec tmux attach{d} -t {q}")`。
+    #[test]
+    fn a_failed_attach_leaves_the_shell_alive() {
+        let cmd = attach_only_command("web01", false);
+        assert!(
+            cmd.starts_with("tmux has-session -t "),
+            "没有 has-session 守门,attach 失败会连 shell 一起带走:{cmd}"
+        );
+        assert!(
+            cmd.contains("2>/dev/null &&"),
+            "守门必须用 `&&` 短路(探测失败就什么都不做):{cmd}"
+        );
+    }
+
+    /// D5:带不带 `-d` 是**参数**,两种都要真的编进命令串。
+    ///
+    /// 自证会变红:把 `detach_others` 参数忽略掉、恒不加 `-d`(或恒加)。
+    #[test]
+    fn the_detach_flag_is_actually_emitted() {
+        assert!(attach_only_command("a", true).contains("attach -d -t "));
+        assert!(!attach_only_command("a", false).contains(" -d "));
+    }
+
+    /// 会话名走 `shell_quote`,不裸拼。远端会话名里带 `'` 或 `$(...)` 时,
+    /// 裸拼就是把用户 tmux 会话名当 shell 代码执行。
+    ///
+    /// 自证会变红:把 `shell_quote(name)` 换成 `name.to_string()`。
+    #[test]
+    fn the_session_name_is_shell_quoted() {
+        let cmd = attach_only_command("it's $(id)", false);
+        assert!(
+            cmd.contains(r#"'it'\''s $(id)'"#),
+            "会话名没走 shell_quote:{cmd}"
+        );
+        assert!(!cmd.contains("-t it's"), "裸拼进去了:{cmd}");
+    }
+
+    /// F161:**实测名不过 `sanitize_tmux_name`**。
+    ///
+    /// 那个函数是给「拿会话记录的名字去**新建** tmux 会话」用的,它把
+    /// `.`/`:`/`$`/`%`/`=`/`@` 换成 `-`。实测名是远端 tmux 自己报上来的
+    /// `#S`,本来就合法;再 sanitize 一遍会把 `web@01` 改成 `web-01`,
+    /// 于是 attach 到一个根本不存在的名字上。
+    ///
+    /// 自证会变红:在 `build_plan_attach_measured` 里对 `name` 调一次
+    /// `sanitize_tmux_name`。
+    #[test]
+    fn a_measured_name_is_not_sanitized_because_the_remote_already_vouched_for_it() {
+        let a = ResolvedAutomation {
+            enabled: true,
+            tmux: None,
+            commands: Vec::new(),
+            work_dir: None,
+            env: Vec::new(),
+            initial_delay_ms: 300,
+            inter_delay_ms: 200,
+            ready_timeout_ms: 15_000,
+        };
+        let steps = build_plan_attach_measured(&a, "web@01", false);
+        let line = String::from_utf8(steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("'web@01'"), "实测名被改写了:{line}");
+    }
+
+    /// 空名字不发命令 —— `tmux attach -t ''` 是一条必然失败的残命令。
+    #[test]
+    fn an_empty_measured_name_produces_no_plan() {
+        let a = ResolvedAutomation {
+            enabled: true,
+            tmux: None,
+            commands: Vec::new(),
+            work_dir: None,
+            env: Vec::new(),
+            initial_delay_ms: 300,
+            inter_delay_ms: 200,
+            ready_timeout_ms: 15_000,
+        };
+        assert!(build_plan_attach_measured(&a, "", false).is_empty());
+        assert!(build_plan_attach_measured(&a, "   ", false).is_empty());
+    }
+
+    /// 自动化总开关关着时,实测 attach 也不发。
+    ///
+    /// 与 `build_plan`/`build_plan_reattach` 同口径(它们靠 `tmux_session_name`
+    /// 里那句 `if !a.enabled` 把关)。用户明确关掉了「登录后自动化」,我们就
+    /// 一个字节都不发 —— 哪怕我们自认为这一条对他有好处。
+    ///
+    /// 自证会变红:删掉 `build_plan_attach_measured` 里的 `if !a.enabled` 早退。
+    #[test]
+    fn turning_automation_off_also_turns_off_the_measured_attach() {
+        let a = ResolvedAutomation {
+            enabled: false,
+            tmux: None,
+            commands: Vec::new(),
+            work_dir: None,
+            env: Vec::new(),
+            initial_delay_ms: 300,
+            inter_delay_ms: 200,
+            ready_timeout_ms: 15_000,
+        };
+        assert!(build_plan_attach_measured(&a, "web01", true).is_empty());
     }
 }

@@ -29,22 +29,73 @@ fn from_saved_dir(d: SavedDir) -> Dir {
     }
 }
 
-/// 运行时树 → 磁盘格式(前序遍历)。**丢掉 `PaneId`**,只留结构与比例(E5)。
-pub fn to_entries(root: &Node) -> Vec<SavedNodeEntry> {
+/// F160:一个叶子的**身份** —— 它连的是哪条会话、当初在哪个 tmux 会话里。
+///
+/// 两个字段的真值源不同,别混:`session_id` 来自 `HostConn`(拨号参数的出处),
+/// `tmux` 来自 F123/F124 远端标题上报的实测值(D1:配置只在实测为空时回落)。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LeafIdentity {
+    pub session_id: Option<SessionId>,
+    pub tmux: Option<String>,
+}
+
+/// 运行时树 → 磁盘格式(前序遍历)。**丢掉 `PaneId`**,只留结构、比例与身份(E5/F160)。
+///
+/// `identity` 回答「这个 pane 该往盘上写什么身份」。**传闭包而不是 `&Workspace`**:
+/// 同 `usable` 的 `known` —— 判据要能脱离一个真实工作区单测,而且这一层不该知道
+/// 「身份是量出来的还是从盘上读回来的」(那条优先级在 app 侧的 `leaf_identity_of`,
+/// 见设计 5.2②)。
+pub fn to_entries(root: &Node, identity: &dyn Fn(PaneId) -> LeafIdentity) -> Vec<SavedNodeEntry> {
     let mut out = Vec::new();
-    push_entries(root, &mut out);
+    push_entries(root, identity, &mut out);
     out
 }
 
-fn push_entries(node: &Node, out: &mut Vec<SavedNodeEntry>) {
+fn push_entries(
+    node: &Node,
+    identity: &dyn Fn(PaneId) -> LeafIdentity,
+    out: &mut Vec<SavedNodeEntry>,
+) {
     match node {
-        Node::Leaf(_) => out.push(SavedNodeEntry::leaf()),
+        Node::Leaf(id) => {
+            let i = identity(*id);
+            out.push(SavedNodeEntry::leaf_with(i.session_id, i.tmux));
+        }
         Node::Split { dir, ratio, a, b } => {
             out.push(SavedNodeEntry::split(to_saved_dir(*dir), *ratio));
-            push_entries(a, out);
-            push_entries(b, out);
+            push_entries(a, identity, out);
+            push_entries(b, identity, out);
         }
     }
+}
+
+/// F160 读回:磁盘编码里每个叶子的身份,**按前序**。
+///
+/// 顺序与 [`from_entries`] 发号的顺序完全一致 —— 先用 [`leaf_count`] 验过结构,
+/// 之后线性过滤出来的叶子序就是前序叶子序(`is_leaf` 刻意不看身份字段,
+/// 见 `SavedNodeEntry::is_leaf`)。两处各写一遍遍历会让某块 pane 接回另一块的
+/// tmux 会话,而那种错位肉眼看不出来。
+///
+/// `tab_session` = `SavedTab::session_id`。叶子自己没记 session 时回落到它 ——
+/// 旧版 exe 写出来的记录整份都没有叶子字段,靠这条降级成今天的标签级行为(D9)。
+/// **回落只补 session,不补 tmux**:旧记录里根本没有实测名,凭空补一个就是猜。
+///
+/// `None` = 编码损坏(判据同 [`leaf_count`])。
+pub fn leaf_identities(
+    entries: &[SavedNodeEntry],
+    tab_session: SessionId,
+) -> Option<Vec<LeafIdentity>> {
+    leaf_count(entries)?;
+    Some(
+        entries
+            .iter()
+            .filter(|e| e.is_leaf())
+            .map(|e| LeafIdentity {
+                session_id: e.session_id.or(Some(tab_session)),
+                tmux: e.tmux.clone(),
+            })
+            .collect(),
+    )
 }
 
 /// 磁盘格式 → 运行时树,叶子按前序用 `ids` 依次发号。
@@ -322,7 +373,7 @@ mod tests {
     #[test]
     fn a_tree_round_trips_through_the_flat_encoding() {
         let before = sample_tree();
-        let entries = to_entries(&before);
+        let entries = to_entries(&before, &|_| LeafIdentity::default());
         let after = from_entries(&entries, &ids(3)).expect("三个叶子三个 id,该拼得出来");
         assert_eq!(after, before, "编码:{entries:?}");
     }
@@ -339,7 +390,7 @@ mod tests {
     #[test]
     fn the_focus_index_counts_leaves_in_the_same_order_the_encoder_writes_them() {
         let tree = sample_tree();
-        let entries = to_entries(&tree);
+        let entries = to_entries(&tree, &|_| LeafIdentity::default());
         let rebuilt = from_entries(&entries, &ids(3)).expect("三个叶子三个 id");
         // `from_entries` 按前序把 ids(3) = [1,2,3] 发下去,所以「叶子 k 的
         // PaneId」就是 `ids(3)[k]`;拿它反问 `focus_leaf_index`,必须得回 k。
@@ -363,7 +414,7 @@ mod tests {
     /// 恢复用的是**新发的号**,不是保存时的号 —— `PaneId` 跨重启没有意义(E5)。
     #[test]
     fn leaves_are_renumbered_in_preorder_with_the_ids_given() {
-        let entries = to_entries(&sample_tree());
+        let entries = to_entries(&sample_tree(), &|_| LeafIdentity::default());
         let fresh = vec![PaneId(40), PaneId(41), PaneId(42)];
         let tree = from_entries(&entries, &fresh).unwrap();
         assert_eq!(
@@ -373,10 +424,120 @@ mod tests {
         );
     }
 
+    /// F160:每个叶子写进盘里的身份,是**它自己那块 pane** 的,不是标签默认的。
+    ///
+    /// 用户「换节点」把第二块 pane 搬到别的机器上之后,`ws.hosts` 里有两台,
+    /// 而磁盘上只记得第一台 —— 恢复时所有 pane 一起拨向那一个会话
+    /// (spec §1.1 症状②)。
+    ///
+    /// 自证会变红:把 `to_entries` 传给 `identity` 的 `PaneId` 换成恒定的
+    /// 第一个叶子 id。
+    #[test]
+    fn a_leaf_carries_the_host_it_was_actually_on_not_the_tab_default() {
+        let tree = sample_tree(); // 叶子按前序是 PaneId(1), PaneId(2), PaneId(3)
+        let entries = to_entries(&tree, &|id: PaneId| LeafIdentity {
+            session_id: Some(SessionId(u64::from(id.0) * 10)),
+            tmux: Some(format!("s{}", id.0)),
+        });
+        let leaves: Vec<&SavedNodeEntry> = entries.iter().filter(|e| e.is_leaf()).collect();
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0].session_id, Some(SessionId(10)));
+        assert_eq!(leaves[1].session_id, Some(SessionId(20)));
+        assert_eq!(leaves[2].session_id, Some(SessionId(30)));
+        assert_eq!(leaves[2].tmux.as_deref(), Some("s3"));
+    }
+
+    /// F160:分割节点上**恒无身份**。有的话文件里会出现一个语义不明的
+    /// 「有 dir 又有 session_id」的项,下一版读它的人无从判断该信哪个。
+    #[test]
+    fn a_split_node_never_carries_an_identity() {
+        let entries = to_entries(&sample_tree(), &|_| LeafIdentity {
+            session_id: Some(SessionId(9)),
+            tmux: Some("x".into()),
+        });
+        for e in entries.iter().filter(|e| !e.is_leaf()) {
+            assert_eq!(e.session_id, None, "分割节点带上了身份:{e:?}");
+            assert_eq!(e.tmux, None, "分割节点带上了身份:{e:?}");
+        }
+    }
+
+    /// F160 读回:身份按**前序**给出来,顺序与 `from_entries` 发号的顺序一致。
+    ///
+    /// 错位的现象是「某块 pane 接回了另一块的 tmux 会话」,肉眼看不出来,
+    /// 所以必须机械对拍。
+    #[test]
+    fn identities_come_back_in_the_same_preorder_the_ids_are_handed_out() {
+        let entries = to_entries(&sample_tree(), &|id: PaneId| LeafIdentity {
+            session_id: Some(SessionId(u64::from(id.0))),
+            tmux: Some(format!("s{}", id.0)),
+        });
+        let got = leaf_identities(&entries, SessionId(99)).expect("结构完整");
+        assert_eq!(
+            got.iter().map(|i| i.tmux.clone()).collect::<Vec<_>>(),
+            vec![
+                Some("s1".to_string()),
+                Some("s2".to_string()),
+                Some("s3".to_string())
+            ]
+        );
+    }
+
+    /// D9 降级:旧版 exe 写的记录(叶子没有身份字段)回落到 `SavedTab::session_id`
+    /// —— 也就是今天的标签级行为。没有这条,升级后第一次启动会把所有叶子都
+    /// 判成「没有身份」。
+    ///
+    /// 自证会变红:把 `leaf_identities` 里的 `.or(Some(tab_session))` 去掉。
+    #[test]
+    fn an_old_record_without_leaf_fields_falls_back_to_the_tab_session() {
+        let old = vec![
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::leaf(),
+        ];
+        let got = leaf_identities(&old, SessionId(42)).expect("结构完整");
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|i| i.session_id == Some(SessionId(42))));
+        assert!(
+            got.iter().all(|i| i.tmux.is_none()),
+            "旧记录里没有实测 tmux 名,不许凭空补一个"
+        );
+    }
+
+    /// 回落**只填 session,不填 tmux**;而叶子自己记了 session 时不许被标签的
+    /// 那个盖掉。两条分支各喂一种输入 —— 只喂一种的话,两道防御会互相掩护
+    /// (`subagent-driven-review-lessons` 记的恒绿模式)。
+    #[test]
+    fn a_leaf_that_recorded_its_own_session_is_not_overwritten_by_the_tab_default() {
+        let mixed = vec![
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf_with(Some(SessionId(7)), Some("web01".into())),
+            SavedNodeEntry::leaf(),
+        ];
+        let got = leaf_identities(&mixed, SessionId(3)).expect("结构完整");
+        assert_eq!(got[0].session_id, Some(SessionId(7)), "被标签默认盖掉了");
+        assert_eq!(got[0].tmux.as_deref(), Some("web01"));
+        assert_eq!(got[1].session_id, Some(SessionId(3)), "该回落的没回落");
+        assert_eq!(got[1].tmux, None);
+    }
+
+    /// 坏编码给 `None`,判据与 `leaf_count` 同源 —— 两处各写一遍的话,会出现
+    /// 「树拼不出来但身份表拼出来了」这种谁也想不到的中间状态。
+    #[test]
+    fn a_corrupt_encoding_has_no_identities_either() {
+        assert_eq!(leaf_identities(&[], SessionId(1)), None);
+        assert_eq!(
+            leaf_identities(
+                &[SavedNodeEntry::split(SavedDir::Vertical, 0.5)],
+                SessionId(1)
+            ),
+            None
+        );
+    }
+
     #[test]
     fn a_single_leaf_tree_round_trips() {
         let one = Node::Leaf(PaneId(9));
-        let entries = to_entries(&one);
+        let entries = to_entries(&one, &|_| LeafIdentity::default());
         assert_eq!(entries.len(), 1);
         assert_eq!(leaf_count(&entries), Some(1));
         assert_eq!(
@@ -396,23 +557,44 @@ mod tests {
         let half = SavedNodeEntry {
             dir: Some(SavedDir::Horizontal),
             ratio: None,
+            ..Default::default()
         };
 
         assert_eq!(leaf_count(&[]), None, "空数组:没有树");
-        assert_eq!(leaf_count(&[split]), None, "分割节点缺了两棵子树");
-        assert_eq!(leaf_count(&[split, leaf]), None, "分割节点只有一棵子树");
-        assert_eq!(leaf_count(&[leaf, leaf]), None, "尾部有多余项");
-        assert_eq!(leaf_count(&[half, leaf, leaf]), None, "半拉的分割节点");
+        assert_eq!(
+            leaf_count(std::slice::from_ref(&split)),
+            None,
+            "分割节点缺了两棵子树"
+        );
+        assert_eq!(
+            leaf_count(&[split.clone(), leaf.clone()]),
+            None,
+            "分割节点只有一棵子树"
+        );
+        assert_eq!(
+            leaf_count(&[leaf.clone(), leaf.clone()]),
+            None,
+            "尾部有多余项"
+        );
+        assert_eq!(
+            leaf_count(&[half.clone(), leaf.clone(), leaf.clone()]),
+            None,
+            "半拉的分割节点"
+        );
 
         assert_eq!(from_entries(&[], &[]), None);
-        assert_eq!(from_entries(&[leaf, leaf], &ids(2)), None, "尾部多余项");
         assert_eq!(
-            from_entries(&[split, leaf, leaf], &ids(3)),
+            from_entries(&[leaf.clone(), leaf.clone()], &ids(2)),
+            None,
+            "尾部多余项"
+        );
+        assert_eq!(
+            from_entries(&[split.clone(), leaf.clone(), leaf.clone()], &ids(3)),
             None,
             "id 数比叶子多:调用方算错了,不该悄悄用前两个"
         );
         assert_eq!(
-            from_entries(&[split, leaf, leaf], &ids(1)),
+            from_entries(&[split.clone(), leaf.clone(), leaf.clone()], &ids(1)),
             None,
             "id 数比叶子少"
         );
@@ -434,7 +616,11 @@ mod tests {
     fn insane_ratios_from_a_hand_edited_file_are_clamped() {
         let leaf = SavedNodeEntry::leaf();
         for (given, expect) in [(0.0f32, 0.05f32), (1.0, 0.95), (-3.0, 0.05), (17.0, 0.95)] {
-            let e = [SavedNodeEntry::split(SavedDir::Vertical, given), leaf, leaf];
+            let e = [
+                SavedNodeEntry::split(SavedDir::Vertical, given),
+                leaf.clone(),
+                leaf.clone(),
+            ];
             let Some(Node::Split { ratio, .. }) = from_entries(&e, &ids(2)) else {
                 panic!("该拼得出来");
             };
@@ -442,7 +628,7 @@ mod tests {
         }
         let e = [
             SavedNodeEntry::split(SavedDir::Vertical, f32::NAN),
-            leaf,
+            leaf.clone(),
             leaf,
         ];
         let Some(Node::Split { ratio, .. }) = from_entries(&e, &ids(2)) else {
