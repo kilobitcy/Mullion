@@ -141,8 +141,9 @@ static RESHAPE_MISS: AtomicU64 = AtomicU64::new(0);
 
 /// F157:`ui_dirty` 归因表的槽位数。
 ///
-/// 8 而不是 80(置脏点总数):空闲时真正在响的只有个位数处,而这张表要待在
-/// 帧路径上——最坏 8 次 relaxed load + 1 次 CAS,与 `diag::mark` 同量级。
+/// 8 而不是 75(置脏点总数):空闲时真正在响的只有个位数处,而这张表要待在
+/// 帧路径上——`note()` 最坏两轮有界扫描(至多 24 次 relaxed load),加一次
+/// store 或 fetch_add 收尾,与 `diag::mark` 同量级。
 pub const DIRTY_SITES: usize = 8;
 
 /// `ui_dirty` 置真的归因表:定长、无锁、不分配、不格式化(T3)。
@@ -207,12 +208,26 @@ impl DirtyTable {
     /// **这一窗口一次没响过的槽位要还回去**:不还的话,启动那几秒里各来
     /// 一次的一次性置脏点会把 8 个槽位永久占死,而真正每帧都在置脏的那
     /// 一处只能落进 `other` —— 一整趟实机往返白跑,且剖面看起来一切正常。
+    ///
+    /// **顺序是承重的:必须先读 `line` 再 `swap(hits)`,反过来会报错行号**。
+    /// `note()` 跑在主线程,`drain()` 跑在看门狗线程,两者各自只是普通
+    /// relaxed 读写,没有加锁把「一个槽位的 line 和 hits」锁成一份快照。
+    /// 若先 `swap(hits)`:swap 完 `hits[i]` 已经是 0,`note()` 在这个缝隙里
+    /// 把这个槽位当成安静槽抢走、写了新行号,drain 再去读 `line[i]` 时读到
+    /// 的就是抢家的行号——报出来的是「新行号命中了旧行号积攒的次数」,
+    /// 正是这张表存在的意义要防的那种「归因指错人」。反过来先读 `line`:
+    /// `note()` 的抢占分支只在看见 `hits[i]==0` 之后才会发生,而这必然发生
+    /// 在 drain 的 `swap` 之后——drain 读 `line` 的那一刻,`note()` 还没有
+    /// 理由去抢这个槽,读到的必然是这一批 hits 归属的那个行号。唯一残留的
+    /// 缝隙是「抢占落在 load 和 swap 之间,而被抢的行本来就是 0 次命中」,
+    /// 此时最多错记一次命中,可接受。
     fn drain(&self) -> (Vec<(u32, u64)>, u64) {
         let mut out = Vec::new();
         for i in 0..DIRTY_SITES {
+            let line = self.line[i].load(Ordering::Relaxed);
             let hits = self.hits[i].swap(0, Ordering::Relaxed);
             if hits > 0 {
-                out.push((self.line[i].load(Ordering::Relaxed), hits));
+                out.push((line, hits));
             } else {
                 self.line[i].store(0, Ordering::Relaxed);
             }
@@ -754,7 +769,10 @@ mod tests {
     /// 而真正每帧都在置脏的那一处只能落进 `other` —— 一整趟实机往返白跑,
     /// 且剖面看起来一切正常。
     ///
-    /// 自证会变红:把 `drain` 里那句「hits == 0 就把槽位清零」删掉。
+    /// 自证会变红:把 `note` 第二轮判定里的 `|| self.hits[i].load(..) == 0`
+    /// 去掉,只留 `line[i] == 0`——回收槽位的活其实是 `note` 自己抢着干的,
+    /// `drain` 里「hits == 0 就清零」那句只在槽位彻底没再被任何行认领时
+    /// 才会被走到,对这条测试是死代码。
     #[test]
     fn a_slot_that_went_quiet_is_handed_back_for_the_next_window() {
         let t = DirtyTable::new();
