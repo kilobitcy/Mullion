@@ -197,6 +197,48 @@ pub struct Snapshot {
     /// **这一对是差分整形唯一的运行期守护**:判据写错导致永远 miss 时,
     /// 画面完全正确、日志一切正常,只有这里的比值会掉下去。
     pub reshape_miss: u64,
+    /// F159:本窗口内整帧指纹命中(没提交 GPU)的帧数。
+    pub fp_hit: u64,
+    /// F159:未命中(真的画了一帧)的帧数。
+    ///
+    /// **这一对是整帧指纹唯一的运行期守护**:判据写错导致永远 miss 时,
+    /// 画面完全正确、日志一切正常、性能悄悄回到改之前,只有这里的比值会掉。
+    pub fp_miss: u64,
+    /// F157:本窗口收到了多少次 `RedrawRequested`(唤醒率的直接读数)。
+    ///
+    /// **提成一等指标是有意的**:整帧指纹会把 CPU 压下去,从而**掩盖**
+    /// 「唤醒 400/s」这个真根因,让下一版失去动力。
+    pub wakes: u64,
+    /// F157:我们**主动**调 `request_redraw` 的次数——`about_to_wait` 到点补画。
+    pub rr_sched: u64,
+    /// F157:我们主动调 `request_redraw` 的次数——因窗口事件 / 后台唤醒 / UI 请求。
+    ///
+    /// `wakes` 与 `rr_sched + rr_evt` 的差值不为零是**正常**的:多次
+    /// `request_redraw` 会被 winit 合并成一次 `RedrawRequested`,OS 也会主动发
+    /// (窗口被遮挡后暴露)。差值本身就是信息,**不试图把它归成精确的三类**
+    /// ——那需要一个「最近一次请求来源」的单槽标记,而合并会让它系统性失真。
+    /// 宁可报两个诚实的数,不报一个精确但错的分类。
+    pub rr_evt: u64,
+    /// F157:`ui_dirty` 被置真的来源(源码行号, 次数)。全部置脏点都在 `app.rs`,
+    /// 所以只带行号不带文件名(见 `diag::note_ui_dirty`)。
+    pub dirty_sites: Vec<(u32, u64)>,
+    /// F157:归因表的 8 个槽位用完之后,落在外面的置脏次数。
+    pub dirty_other: u64,
+    /// F157:这一窗口喂给 egui 的输入事件总数。
+    pub egui_events: u64,
+    /// F157:其中有多少**帧**带着至少一个事件。
+    ///
+    /// 与 `egui_events` 分开报:egui 的 `wants_repaint_after` 只要本趟
+    /// `events` 非空就返回 `Duration::ZERO`,所以「有几帧带着事件」才是
+    /// 跟 `rdelay_zero` 直接对得上的那个数。
+    pub egui_event_frames: u64,
+    /// F157:`repaint_delay == Duration::ZERO` 的帧数。
+    pub rdelay_zero: u64,
+    /// F157:`repaint_delay` 有限非零的帧数。
+    pub rdelay_finite: u64,
+    /// F157:`repaint_delay == Duration::MAX`(egui 不需要重绘)的帧数。
+    /// **真空闲时本该是全部**。
+    pub rdelay_max: u64,
     pub tabs: u64,
     pub panes: u64,
     pub hosts: u64,
@@ -231,6 +273,18 @@ impl Snapshot {
             sync_timeouts: 0,
             reshape_hit: 0,
             reshape_miss: 0,
+            fp_hit: 0,
+            fp_miss: 0,
+            wakes: 0,
+            rr_sched: 0,
+            rr_evt: 0,
+            dirty_sites: Vec::new(),
+            dirty_other: 0,
+            egui_events: 0,
+            egui_event_frames: 0,
+            rdelay_zero: 0,
+            rdelay_finite: 0,
+            rdelay_max: 0,
             tabs: 0,
             panes: 0,
             hosts: 0,
@@ -307,10 +361,30 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
 
+    // F157:置脏点按次数倒序取前三。倒序是重点——空闲时只有一处每帧都在
+    // 置脏,按行号排的话它会被一堆各来过一次的启动期置脏点埋掉。
+    let mut sites = s.dirty_sites.clone();
+    sites.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    sites.truncate(3);
+    let mut dirty_parts: Vec<String> = sites.iter().map(|(l, n)| format!("{l}:{n}")).collect();
+    if s.dirty_other > 0 {
+        dirty_parts.push(format!("other:{}", s.dirty_other));
+    }
+    // 空表报 `-` 而不是空串:人工验收清单第 3 条专门看这个,`dirty=` 后面
+    // 什么都没有 = 埋点根本没接上,而那和「这窗口确实一次没置脏」必须
+    // 在日志里长得不一样。
+    let dirty_part = if dirty_parts.is_empty() {
+        "-".to_string()
+    } else {
+        dirty_parts.join(",")
+    };
+
     Some(format!(
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
-         reshape=hit:{}/miss:{} conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
+         reshape=hit:{}/miss:{} fp=hit:{}/miss:{} wake={}x/rr=sched:{},evt:{} dirty={} \
+         egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
+         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
         secs,
         s.frames,
         fmt_us(quantile_us(&s.frame_us, 0.5)),
@@ -331,6 +405,17 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         stage_part,
         s.reshape_hit,
         s.reshape_miss,
+        s.fp_hit,
+        s.fp_miss,
+        s.wakes,
+        s.rr_sched,
+        s.rr_evt,
+        dirty_part,
+        s.egui_events,
+        s.egui_event_frames,
+        s.rdelay_zero,
+        s.rdelay_finite,
+        s.rdelay_max,
         s.connects_ok,
         s.connects_err,
         s.reconnects,
@@ -479,6 +564,18 @@ mod tests {
             sync_timeouts: 3,
             reshape_hit: 900,
             reshape_miss: 100,
+            fp_hit: 250,
+            fp_miss: 50,
+            wakes: 340,
+            rr_sched: 40,
+            rr_evt: 7,
+            dirty_sites: vec![(8365, 300), (7191, 2)],
+            dirty_other: 5,
+            egui_events: 9,
+            egui_event_frames: 4,
+            rdelay_zero: 300,
+            rdelay_finite: 0,
+            rdelay_max: 0,
             tabs: 2,
             panes: 3,
             hosts: 2,
@@ -704,13 +801,124 @@ mod tests {
     fn a_huge_finite_repaint_delay_is_not_the_same_as_never() {
         use std::time::Duration;
         assert_eq!(repaint_bucket(Duration::ZERO), RepaintBucket::Zero);
-        assert_eq!(repaint_bucket(Duration::from_nanos(1)), RepaintBucket::Finite);
-        assert_eq!(repaint_bucket(Duration::from_millis(16)), RepaintBucket::Finite);
+        assert_eq!(
+            repaint_bucket(Duration::from_nanos(1)),
+            RepaintBucket::Finite
+        );
+        assert_eq!(
+            repaint_bucket(Duration::from_millis(16)),
+            RepaintBucket::Finite
+        );
         assert_eq!(
             repaint_bucket(Duration::from_secs(86_400)),
             RepaintBucket::Finite,
             "一天之后要重绘 ≠ 永远不需要重绘"
         );
         assert_eq!(repaint_bucket(Duration::MAX), RepaintBucket::Max);
+    }
+
+    /// F157:四段归因必须原样进剖面行。
+    ///
+    /// 这一行是本切片**唯一**的产出——下一版改什么完全取决于它。段名或
+    /// 分隔符写错了,人还是能读,但 `findstr` 拉不出时间序列。
+    ///
+    /// 自证会变红:把 `render_line` 里 `wake=` 那一整段删掉。
+    #[test]
+    fn the_frame_loop_attribution_reaches_the_line() {
+        let line = render_line(&busy_snapshot()).expect("忙窗口该有一行");
+        assert!(line.contains("wake=340x"), "没报唤醒次数:{line}");
+        assert!(
+            line.contains("rr=sched:40,evt:7"),
+            "没报主动请求重绘的来源:{line}"
+        );
+        assert!(
+            line.contains("egui_ev=9x/f:4"),
+            "没报喂给 egui 的事件数:{line}"
+        );
+        assert!(
+            line.contains("rdelay=z:300/f:0/m:0"),
+            "没报 repaint_delay 分桶:{line}"
+        );
+        assert!(
+            line.contains("fp=hit:250/miss:50"),
+            "没报整帧指纹命中率:{line}"
+        );
+    }
+
+    /// 置脏点按次数**倒序**取前三,溢出的槽位报成 `other:N`。
+    ///
+    /// 倒序是重点:空闲时只有一处每帧都在置脏,它必须排在第一位;按行号
+    /// 排序的话它会被一堆各来过一次的启动期置脏点埋掉。
+    ///
+    /// 自证会变红:把 `render_line` 里的 `Reverse` 去掉。
+    #[test]
+    fn the_dirty_sites_are_ranked_by_how_often_they_fire() {
+        let mut s = busy_snapshot();
+        s.dirty_sites = vec![(100, 1), (8365, 300), (200, 2), (300, 3)];
+        s.dirty_other = 0;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(
+            line.contains("dirty=8365:300,300:3,200:2"),
+            "置脏点没按次数倒序取前三:{line}"
+        );
+        assert!(!line.contains("100:1"), "第四名不该出现在行里:{line}");
+    }
+
+    /// 归因表溢出必须**说出来**。8 个槽位用完之后落进 `other`,不报的话
+    /// 「这几处就是全部」与「还有一堆没槽位」在日志里长得一样。
+    ///
+    /// 自证会变红:把 `render_line` 里那句 `if s.dirty_other > 0` 的分支删掉。
+    #[test]
+    fn an_overflowing_attribution_table_says_so() {
+        let mut s = busy_snapshot();
+        s.dirty_sites = vec![(8365, 300)];
+        s.dirty_other = 17;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("dirty=8365:300,other:17"), "溢出没报:{line}");
+    }
+
+    /// 一次置脏都没采到时报 `dirty=-`,**不是空字符串**。
+    ///
+    /// 人工验收清单第 3 条专门看这个:`dirty=` 后面什么都没有 = 埋点根本
+    /// 没接上(F12 同款陷阱:埋点白埋时画面完全正常)。留成空串的话它跟
+    /// 「这个窗口确实一次没置脏」长得一样,一整趟实机往返就白跑了。
+    ///
+    /// 自证会变红:把那个 `-` 占位改成空字符串。
+    #[test]
+    fn an_empty_attribution_table_is_told_apart_from_a_missing_one() {
+        let mut s = busy_snapshot();
+        s.dirty_sites = Vec::new();
+        s.dirty_other = 0;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("dirty=- "), "空归因表没有占位符:{line}");
+    }
+
+    /// F157 的四段**一律不进 `is_idle`**。
+    ///
+    /// 它们在空闲时恰恰非零(那正是要查的东西),进了判据就等于「空闲的
+    /// mullion 每 5 秒写一次盘」,笔记本硬盘永远睡不下去——这是布局落盘
+    /// 已经踩过一次的坑,与 F12 的 `reshape_*` 处理一致。
+    ///
+    /// 自证会变红:往 `is_idle` 的条件里加上 `&& self.wakes == 0`。
+    #[test]
+    fn the_new_attribution_counters_do_not_count_as_activity() {
+        let parked = Snapshot {
+            window_ms: 5_000,
+            wakes: 2_000,
+            rr_sched: 1_700,
+            rr_evt: 3,
+            dirty_sites: vec![(8365, 300)],
+            dirty_other: 1,
+            egui_events: 5,
+            egui_event_frames: 2,
+            rdelay_zero: 300,
+            fp_hit: 300,
+            fp_miss: 1,
+            ..Snapshot::empty()
+        };
+        assert!(
+            parked.is_idle(),
+            "光有归因数据就被算成了活动 —— 硬盘会永远醒着"
+        );
     }
 }
