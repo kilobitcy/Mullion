@@ -106,6 +106,25 @@ pub fn egui_should_see(kind: InputKind, modal_open: bool, egui_wants_keyboard: b
     }
 }
 
+/// 这个窗口事件该不该喂给 `egui_winit::State::on_window_event`。
+///
+/// **T7 变种**:`egui-winit` 把 `RedrawRequested` 归进「Things that may require
+/// repaint」,**恒返回 `repaint: true`**(0.30 `lib.rs`)。而我们收到 `repaint`
+/// 就 `mark_ui_dirty` + `window.request_redraw()` —— 后者立刻再生成一个
+/// `RedrawRequested`,闭环自激:事件循环永远有 pending redraw,`WaitUntil`/`Wait`
+/// 一次也等不到。帧闸(`FrameLimiter`)只挡得住**出帧**,挡不住这一圈空转。
+/// v0.1.68 的真机日志坐实:完全空闲(`in=0B/s egui_ev=0x present=0`)时
+/// `window_event` = `dirty` = `rr evt` = 26 万次/5 秒 ≈ 4.8 万次/秒,一整个
+/// 单核烧在这上面;`ui_dirty` 也因此恒真,F158 的「空闲不出帧」被完全架空。
+///
+/// `RedrawRequested` 不携带任何输入信息,egui 也不需要它 —— 帧是我们自己在
+/// `WindowEvent::RedrawRequested` 分支里跑的。其余「may require repaint」的事件
+/// (`Resized`/`Focused`/`Occluded`/`CloseRequested`…)必须照喂:它们是真的状态
+/// 变化,而且各来一次,不构成回环。
+pub fn egui_should_see_window_event(event: &winit::event::WindowEvent) -> bool {
+    !matches!(event, winit::event::WindowEvent::RedrawRequested)
+}
+
 /// `modal_open`:有模态弹窗时吞掉一切;`egui_wants_keyboard`/`egui_wants_pointer`:
 /// 来自 egui 上下文的 `wants_*_input()`;`kind`:本次事件类型。
 pub fn route(
@@ -366,6 +385,41 @@ mod tests {
             ctrl_d_action(PaneStatus::Reconnecting, false),
             CtrlD::ClosePane
         );
+    }
+
+    /// T7 变种:`RedrawRequested` **绝不能**喂给 egui。egui-winit 对它恒返回
+    /// `repaint: true`,而我们收到 `repaint` 就 `request_redraw()` —— 下一个
+    /// `RedrawRequested` 立刻又来,事件循环永远有 pending redraw,空闲时一整个
+    /// 单核烧在空转上(v0.1.68 实机:4.8 万次/秒)。
+    ///
+    /// 自证会变红:把 `egui_should_see_window_event` 的函数体改成 `true`。
+    #[test]
+    fn egui_never_sees_redraw_requested_or_every_frame_asks_for_the_next_one() {
+        assert!(
+            !egui_should_see_window_event(&winit::event::WindowEvent::RedrawRequested),
+            "RedrawRequested 喂进了 egui —— 它恒返回 repaint:true,自激回环"
+        );
+    }
+
+    /// 反向:其余「可能需要重绘」的窗口事件必须照喂 —— 它们是真的状态变化,
+    /// 各来一次,不构成回环。少喂一种的症状各不相同且全是静默的:`Resized`
+    /// 不喂 egui 的布局停在旧尺寸,`Focused` 不喂则失焦后控件仍显示为激活。
+    ///
+    /// 自证会变红:把 `egui_should_see_window_event` 的函数体改成 `false`。
+    #[test]
+    fn the_other_repaint_worthy_window_events_still_reach_egui() {
+        use winit::event::WindowEvent as WE;
+        for ev in [
+            WE::Resized(winit::dpi::PhysicalSize::new(1920, 1080)),
+            WE::Focused(true),
+            WE::Occluded(true),
+            WE::CloseRequested,
+        ] {
+            assert!(
+                egui_should_see_window_event(&ev),
+                "{ev:?} 没喂给 egui —— egui 的状态会静默停在旧值"
+            );
+        }
     }
 
     /// F129:断开的 pane 是标签里最后一块时,关掉整个标签。

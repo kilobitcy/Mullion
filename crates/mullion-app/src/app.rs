@@ -7934,13 +7934,19 @@ impl ApplicationHandler<UserEvent> for App {
                     shell::input_route::Route::FilesPanel
                 );
             } else {
-                let resp = active.egui_state.on_window_event(&active.window, &event);
-                if resp.repaint {
-                    // 标脏与请求重绘必须成对:只请求不标脏,那帧会被 frame_is_dirty
-                    // 判 Idle 丢掉(终端态尤其明显:远端一安静菜单就点不开)。
-                    mark_ui_dirty!(self.ui_dirty);
-                    diag::count_request_redraw(diag::RedrawSource::Event);
-                    active.window.request_redraw();
+                // T7 变种:`RedrawRequested` 在这里被门控挡掉,**绝不能**喂给
+                // egui —— egui-winit 对它恒返回 `repaint: true`,而下面那三句
+                // 里的 `request_redraw()` 立刻又生成一个 `RedrawRequested`,
+                // 闭环自激。判据与理由见 `egui_should_see_window_event`。
+                if shell::input_route::egui_should_see_window_event(&event) {
+                    let resp = active.egui_state.on_window_event(&active.window, &event);
+                    if resp.repaint {
+                        // 标脏与请求重绘必须成对:只请求不标脏,那帧会被 frame_is_dirty
+                        // 判 Idle 丢掉(终端态尤其明显:远端一安静菜单就点不开)。
+                        mark_ui_dirty!(self.ui_dirty);
+                        diag::count_request_redraw(diag::RedrawSource::Event);
+                        active.window.request_redraw();
+                    }
                 }
                 if is_kbd {
                     return; // 上面已判定归 egui(模态/表单聚焦)
@@ -15600,6 +15606,58 @@ mod tests {
             "用户意图写入点的取消调用应为 5 处(粘贴/滚轮/键盘/输入法提交/\
              合成文本,滚轮两个分支共用一次),实际 {calls} 处 —— 少了会让自动化\
              在用户打字时继续发命令,多了说明新增了输入路径但没复核这条不变量"
+        );
+    }
+
+    /// **接线守护 / T7 变种**:`RedrawRequested` 绝不能进
+    /// `egui_state.on_window_event`。egui-winit 0.30 把它归进「Things that may
+    /// require repaint」,恒返回 `repaint: true`;我们收到 `repaint` 就
+    /// `mark_ui_dirty` + `request_redraw()`,后者立刻再生成一个
+    /// `RedrawRequested` —— 闭环自激。帧闸只挡出帧,挡不住这一圈空转:v0.1.68
+    /// 的实机日志里,完全空闲时 `window_event` = `dirty` = `rr evt` =
+    /// 4.8 万次/秒,一整个单核烧掉,而 `ui_dirty` 因此恒真,F158 的
+    /// 「空闲不出帧」被彻底架空(`frame=313x` 对着一屏静止画面每秒跑 62 次
+    /// egui 布局)。
+    ///
+    /// 判定本身在 `shell::input_route::egui_should_see_window_event`(有行为
+    /// 测试);这里扎的是**调用位置** —— `App` 要 `EventLoopProxy` 才能构造,
+    /// 门控有没有真接上只有源码结构能表达。
+    ///
+    /// **先剥掉 `//` 注释行**:上面这段注释里就写着两个标识符,不剥的话删掉
+    /// 真代码它照样绿(恒绿模式⑮)。
+    ///
+    /// 自证会变红:把 `window_event` 里那句
+    /// `shell::input_route::egui_should_see_window_event(&event)` 删掉。
+    #[test]
+    fn redraw_requested_never_reaches_egui_or_the_event_loop_spins_forever() {
+        let src = include_str!("app.rs");
+        // 锚点带**行首缩进 + 完整签名**:不带的话会匹配到测试自己写的那行
+        // 字面量,函数改名后切到的是一段无关源码,报出方向跑偏的错误(恒绿模式⑩)。
+        let at = src
+            .find("\n    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {")
+            .expect("找不到 window_event 的定义");
+        let after = &src[at + 1..];
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 window_event 的函数结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gate = code
+            .find("shell::input_route::egui_should_see_window_event(&event)")
+            .expect(
+                "window_event 没用 egui_should_see_window_event 门控 —— RedrawRequested \
+                 会被喂给 egui,egui-winit 对它恒返回 repaint:true,于是每一帧都在请求下一帧,\
+                 事件循环永远等不到 Wait,空闲时烧满一个核(T3/T7)",
+            );
+        let feed = code
+            .find("egui_state.on_window_event(")
+            .expect("找不到 on_window_event 的调用点");
+        assert!(
+            gate < feed,
+            "门控排在了 on_window_event 之后 —— 排在后面等于没门控"
         );
     }
 
