@@ -82,9 +82,7 @@ static LOGGER: OnceLock<&'static FileLogger> = OnceLock::new();
 /// 调用顺序无关紧要。
 pub fn instance_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| {
-        mullion_store::new_instance_id(mullion_store::now_ms(), std::process::id())
-    })
+    ID.get_or_init(|| mullion_store::new_instance_id(mullion_store::now_ms(), std::process::id()))
 }
 
 /// 日志文件所在目录。给清理逻辑用。
@@ -363,9 +361,9 @@ pub fn should_rotate(len: u64, limit: u64) -> bool {
 
 /// 当前档位对应的轮转上限。`init` 之前按最保守的档算。
 fn current_rotate_bytes() -> u64 {
-    let app = LOGGER
-        .get()
-        .map_or(LevelFilter::Info, |l| filter_from_usize(l.app.load(Ordering::Relaxed)));
+    let app = LOGGER.get().map_or(LevelFilter::Info, |l| {
+        filter_from_usize(l.app.load(Ordering::Relaxed))
+    });
     rotate_bytes_for(app)
 }
 
@@ -490,11 +488,15 @@ fn prune_stale_logs(dir: &Path) {
     }
 
     let mut files: Vec<LogFile> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(id) = parse_log_name(name) else { continue };
+        let Some(id) = parse_log_name(name) else {
+            continue;
+        };
         let mtime = e
             .metadata()
             .and_then(|m| m.modified())
@@ -826,7 +828,10 @@ mod tests {
     fn every_line_carries_the_pid() {
         let line = format_line("2026-08-26T00:00:00Z", 4242, "INFO  mullion: 你好");
         assert!(line.contains("[4242]"), "行里没有 pid:{line}");
-        assert!(line.starts_with("[2026-08-26T00:00:00Z]"), "时间戳不在最前:{line}");
+        assert!(
+            line.starts_with("[2026-08-26T00:00:00Z]"),
+            "时间戳不在最前:{line}"
+        );
         assert!(line.ends_with('\n'), "行尾没有换行:{line:?}");
     }
 
@@ -909,14 +914,14 @@ mod tests {
     #[test]
     fn only_a_real_instance_id_is_recognised_so_other_files_are_never_touched() {
         for bad in [
-            "mullion-redacted.log",          // F155 导出的脱敏副本
-            "mullion-redacted-1-2.log",      // 带 id 的脱敏副本
-            "mullion.log",                   // 上一版的遗留日志
-            "mullion.log.1",                 // 上一版的遗留轮转
-            "mullion-.log",                  // 空 id
-            "mullion-abc-def.log",           // 非数字
-            "mullion-1-2-3.log",             // 三段
-            "notes.txt",                     // 完全无关
+            "mullion-redacted.log",     // F155 导出的脱敏副本
+            "mullion-redacted-1-2.log", // 带 id 的脱敏副本
+            "mullion.log",              // 上一版的遗留日志
+            "mullion.log.1",            // 上一版的遗留轮转
+            "mullion-.log",             // 空 id
+            "mullion-abc-def.log",      // 非数字
+            "mullion-1-2-3.log",        // 三段
+            "notes.txt",                // 完全无关
         ] {
             assert_eq!(parse_log_name(bad), None, "{bad} 不该被当成实例日志");
         }
