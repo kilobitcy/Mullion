@@ -14,6 +14,22 @@
   （present/idle→`Wait`；节流→`WaitUntil` 且记 `next_frame_at`）；被节流的帧靠
   `about_to_wait` 在 deadline 到点补**一次** `request_redraw`，**不要**在原地 `request_redraw`。
   决策抽成纯函数 `FrameLimiter::plan`（守护：`frame::tests` 的 4 条 plan 测试）。
+- **`RedrawRequested` 喂给 `egui_state.on_window_event` = 自激忙转(严重,T3/T7 变种,F158)。**
+  `egui-winit` 0.30 (`lib.rs` 的「Things that may require repaint」一组)对
+  `RedrawRequested` **恒返回 `repaint: true`**;而「标脏与 `request_redraw` 必须成对」
+  那条规则会让我们就地 `request_redraw()`,后者立刻再生成一个 `RedrawRequested` ——
+  闭环。**帧闸挡不住它**:`FrameLimiter` 只决定要不要出帧,事件循环里那个 pending
+  redraw 照排,`Wait`/`WaitUntil` 一次也等不到,单核 100%。v0.1.68 实机日志:完全空闲
+  (`in=0B/s egui_ev=0x present=0`)时 `window_event` = `dirty` = `rr evt` = 26 万次/5 秒
+  ≈ 4.8 万次/秒;`ui_dirty` 随之恒真,**上一条的脏源判据被彻底架空**(`frame=313x` 对着
+  静止画面每秒跑 62 次 egui 布局),只有 F159 的整帧指纹挡住了 GPU 提交,所以
+  `present=0` 看着很正常 —— 这个组合最具迷惑性。**规则**:`RedrawRequested` 不喂 egui
+  (它不携带输入信息,帧是我们自己在那个分支里跑的);其余「may require repaint」的事件
+  (`Resized`/`Focused`/`Occluded`/`CloseRequested`)照喂。判据收口在
+  `shell::input_route::egui_should_see_window_event`。**守护**:
+  `input_route::tests::egui_never_sees_redraw_requested_or_every_frame_asks_for_the_next_one`
+  + `..::the_other_repaint_worthy_window_events_still_reach_egui`(判定)、
+  `app::tests::redraw_requested_never_reaches_egui_or_the_event_loop_spins_forever`(接线)。
 - **`dirty` 有两个独立脏源,漏一个就丢交互。** 终端态若只拿 `pacer.should_present()`
   (=远端来了新字节)当 dirty,远端一安静,egui 自己的重绘需求(菜单展开、hover、弹窗、
   错误提示)就全被 `RedrawAction::Idle` 吞掉——点菜单没反应;而 launcher 态因为硬编码
