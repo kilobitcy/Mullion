@@ -29,7 +29,8 @@
 ### 1. 接 `log` facade,自写 `log::Log` 实现(不引 env_logger / tracing)
 
 `mullion-app` 直接依赖 `log 0.4`;`logx` 提供 `FileLogger`,继续落到
-`<config_dir>/mullion.log`(逐行 flush + stderr)。
+`<config_dir>/mullion-<instance_id>.log`(F166:一实例一文件;`instance_id`
+与 F148 现场历史同源)(逐行 flush + stderr)。
 
 理由:`wgpu` / `wgpu-core` / `wgpu-hal` / `naga` / `winit` / `glyphon` / `russh` **内部全部用
 `log` 打诊断**。接上 facade 后,它们的输出与我们自己的日志落进同一个文件、同一条时间线——
@@ -45,7 +46,8 @@
 | `MULLION_LOG_DEPS` | 第三方 crate | `warn` |
 
 分开是必要的:`MULLION_LOG=debug` 若同时放开 wgpu,每帧几十行会把真正的线索冲走,
-也会迅速撑爆磁盘。启动时若日志超过 8 MB 轮转一代到 `mullion.log.1`。
+也会迅速撑爆磁盘。轮转在**运行期**由看门狗每秒判一次,超限转一代到
+`.log.1`;启动时按心跳判活回收已关实例的日志(留最近 5 组)。
 
 ### 2. 阶段打点 + 看门狗(`diag.rs`)
 

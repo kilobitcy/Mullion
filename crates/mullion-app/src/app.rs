@@ -2551,7 +2551,10 @@ impl App {
         }
     }
 
-    /// F155:把 `mullion.log` 脱敏后另存一份,并把路径告诉用户。
+    /// F155:把**本实例的**日志脱敏后另存一份,并把路径告诉用户。
+    ///
+    /// 只导本实例(F166 之后一实例一文件)。多开时别的实例的日志各自
+    /// 独立,需要的话在那边点。
     ///
     /// **同步读写、在主线程上做**:日志文件上限 8MB(debug 档 64MB),
     /// 一次读+写在本机盘上是几十毫秒,而这是用户点了按钮等着看结果的动作 ——
@@ -2574,13 +2577,40 @@ impl App {
                     out.push_str(&r.line(line));
                     out.push('\n');
                 }
-                let dst = src.with_file_name("mullion-redacted.log");
+                // 带上 instance id:多开时两个实例都点「导出」的话,固定
+                // 文件名会让后点的那个悄悄覆盖前一个。
+                let dst = src.with_file_name(format!(
+                    "mullion-redacted-{}.log",
+                    crate::logx::instance_id()
+                ));
                 std::fs::write(&dst, out).map_err(|e| format!("写不出副本({e})"))?;
                 Ok(dst)
             });
         match done {
             Ok(dst) => {
-                let msg = format!("已导出脱敏日志:{}", dst.display());
+                let others = crate::logx::log_dir()
+                    .and_then(|d| std::fs::read_dir(d).ok())
+                    .map_or(0, |rd| {
+                        rd.flatten()
+                            .filter(|e| {
+                                // `file_name()` 返回的是 OsString(自有值),
+                                // 必须先绑定再借 —— 链式写 `e.file_name().to_str()`
+                                // 会让 `&str` 借在一个当场析构的临时值上,编译失败。
+                                let name = e.file_name();
+                                name.to_str()
+                                    .and_then(crate::logx::parse_log_name)
+                                    .is_some_and(|id| id != crate::logx::instance_id())
+                            })
+                            .count()
+                    });
+                let msg = if others > 0 {
+                    format!(
+                        "已导出脱敏日志:{}(本机还有 {others} 份其他实例的日志)",
+                        dst.display()
+                    )
+                } else {
+                    format!("已导出脱敏日志:{}", dst.display())
+                };
                 crate::logx::line(&msg);
                 self.ui.set_error(msg);
             }
