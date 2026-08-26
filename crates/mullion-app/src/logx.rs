@@ -67,6 +67,21 @@ static SINK: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLo
 /// 运行期够到 logger 的句柄(设置弹窗点「确定」时换档要用)。`init` 之前是空的。
 static LOGGER: OnceLock<&'static FileLogger> = OnceLock::new();
 
+/// 本实例的身份,`{毫秒}-{pid}`(F148 的 `new_instance_id`)。
+///
+/// **在 `logx` 而不是 `App::new` 里生成**:日志文件名要用它,而 `logx::init`
+/// 跑在 `App::new` 之前。共用同一个 id 之后,日志文件与 F148 的现场历史
+/// 记录一一对应 —— 排障时「崩的是哪个实例、它当时恢复的是哪个现场」不用猜。
+///
+/// `get_or_init` 而非 `init` 里 `set`:集成测试不会走 `init`,懒生成让
+/// 调用顺序无关紧要。
+pub fn instance_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        mullion_store::new_instance_id(mullion_store::now_ms(), std::process::id())
+    })
+}
+
 /// 日志文件路径:`<config_dir>/mullion.log`(Windows `%APPDATA%\mullion\config\mullion.log`)。
 pub fn log_path() -> Option<PathBuf> {
     crate::shell::store::config_dir().map(|d| d.join("mullion.log"))
@@ -553,5 +568,40 @@ mod tests {
             body.contains("set_max_level"),
             "换档没抬 facade 的粗过滤 —— 提到 debug 档也一条都到不了 enabled"
         );
+    }
+
+    /// 同一进程里 `instance_id()` 必须每次返回同一个值。
+    ///
+    /// 它同时决定日志文件名和 F148 现场历史的记录名 —— 两次调用拿到不同的
+    /// id,症状是「日志文件里写着 A,历史记录叫 B」,排障时根本对不上号,
+    /// 而且没有任何报错。
+    ///
+    /// 自证会变红:把 `instance_id` 里的 `get_or_init` 换成每次现算
+    /// `new_instance_id(now_ms(), process::id())`。
+    #[test]
+    fn the_instance_id_is_stable_within_one_process() {
+        let a = instance_id();
+        let b = instance_id();
+        assert_eq!(a, b, "同一进程两次拿到不同的 instance id");
+        assert!(!a.is_empty(), "instance id 是空的");
+    }
+
+    /// id 的形状必须是 F148 的 `{毫秒}-{pid}`。
+    ///
+    /// 形状是硬约定:Task 3 的文件名解析器按「两段纯数字」严格校验,
+    /// 形状一变,自己的日志会被自己的清理逻辑判成不认识的文件。
+    ///
+    /// 自证会变红:把 `instance_id` 改成 `format!("mullion-{}", process::id())`。
+    #[test]
+    fn the_instance_id_is_two_numeric_parts() {
+        let id = instance_id();
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 2, "id 不是两段:{id}");
+        for p in parts {
+            assert!(
+                !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
+                "id 里有非数字段:{id}"
+            );
+        }
     }
 }

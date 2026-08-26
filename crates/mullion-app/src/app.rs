@@ -2242,10 +2242,9 @@ impl App {
             files_sidebar_was_open: false,
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
-            instance_id: mullion_store::new_instance_id(
-                mullion_store::now_ms(),
-                std::process::id(),
-            ),
+            // 与日志文件名同源(logx::instance_id):两边共用一个 id,
+            // 日志与现场历史记录才对得上号。
+            instance_id: crate::logx::instance_id().to_string(),
             // 减去一整个间隔:第一次 `about_to_wait` 就该写下心跳,而不是
             // 等 15 秒 —— 那 15 秒里别的实例会把本进程判成死的。
             heartbeat_at: Instant::now()
