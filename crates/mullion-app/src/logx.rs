@@ -260,6 +260,11 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
         let _ = LOG_FILE.set(p.clone());
     }
 
+    // 陈旧日志回收。放在 SINK 建好之后:万一清理本身出事,那条日志还写得出去。
+    if let Some(d) = log_dir() {
+        prune_stale_logs(&d);
+    }
+
     // 泄漏成 `&'static`:`set_logger` 要求 `&'static dyn Log`,而我们还要
     // 留一个句柄给运行期换档。进程一生只泄漏这一个,不是问题。
     let logger: &'static FileLogger = Box::leak(Box::new(FileLogger::new(app, deps)));
@@ -401,6 +406,111 @@ fn rotate_now(guard: &mut Option<std::io::BufWriter<std::fs::File>>, path: &Path
         .open(path)
         .ok()
         .map(std::io::BufWriter::new);
+}
+
+/// 死实例的日志最多留几组。「组」= 一个实例的主文件 + 它轮转出来的 `.log.1`。
+const KEEP_DEAD_LOGS: usize = 5;
+
+/// 多新的文件算「刚动过」,一律不删。见 [`prune_plan`] 的竞态说明。
+const FRESH_SECS: i64 = 60;
+
+/// 扫出来的一个日志文件。
+#[derive(Debug, Clone)]
+pub struct LogFile {
+    pub path: PathBuf,
+    pub instance_id: String,
+    pub mtime_secs: i64,
+}
+
+/// 算出该删哪些日志文件。**纯函数**:真删盘的那一步只负责按计划执行。
+///
+/// 三道保险,顺序不能少:
+/// 1. `self_id` 按**文件名**硬排除 —— 清理跑在 `init` 里,此刻本实例的
+///    F148 心跳文件还不存在(第一次心跳要等 `App` 起来),靠心跳会判死自己。
+/// 2. `alive_ids` 里的一律不动 —— 删掉正在被写的日志,用户看到的是一个
+///    从中间断掉的文件,而断掉的原因不在文件里。
+/// 3. `FRESH_SECS` 内动过的不删 —— 另一个实例可能刚启动还没写心跳,
+///    或者刚崩溃(后者的日志恰恰最该留)。
+///
+/// 分组按 `instance_id` 而非路径:主文件与 `.log.1` 必须同进退,否则死
+/// 实例的 `.1` 永远没人认领,慢性写满盘且无声。
+pub fn prune_plan(
+    files: &[LogFile],
+    alive_ids: &[String],
+    self_id: &str,
+    now_secs: i64,
+    keep: usize,
+) -> Vec<PathBuf> {
+    let mut groups: std::collections::BTreeMap<&str, (i64, Vec<&PathBuf>)> =
+        std::collections::BTreeMap::new();
+    for f in files {
+        if f.instance_id == self_id || alive_ids.iter().any(|a| a == &f.instance_id) {
+            continue;
+        }
+        let e = groups
+            .entry(&f.instance_id)
+            .or_insert((i64::MIN, Vec::new()));
+        e.0 = e.0.max(f.mtime_secs);
+        e.1.push(&f.path);
+    }
+    // 组里**任何**一个文件刚动过,整组都留 —— 主文件新、`.log.1` 旧是常态。
+    groups.retain(|_, (mtime, _)| now_secs.saturating_sub(*mtime) > FRESH_SECS);
+
+    let mut ordered: Vec<(&str, (i64, Vec<&PathBuf>))> = groups.into_iter().collect();
+    ordered.sort_by_key(|(id, (mtime, _))| (std::cmp::Reverse(*mtime), *id));
+    ordered
+        .into_iter()
+        .skip(keep)
+        .flat_map(|(_, (_, paths))| paths.into_iter().cloned())
+        .collect()
+}
+
+/// 扫目录 + 读 F148 心跳 + 执行清理计划。`init` 里调一次,失败全静默。
+fn prune_stale_logs(dir: &Path) {
+    let now = mullion_store::now_secs();
+
+    // F148 的心跳文件:`<dir>/layouts/<id>.alive`,内容是一个 Unix 秒。
+    let mut alive: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(mullion_store::history_dir(dir)) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(id) = name.strip_suffix(&format!(".{}", mullion_store::history::ALIVE_EXT))
+            else {
+                continue;
+            };
+            let hb = std::fs::read_to_string(e.path())
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(i64::MIN);
+            if mullion_store::is_alive(now, hb) {
+                alive.push(id.to_string());
+            }
+        }
+    }
+
+    let mut files: Vec<LogFile> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = parse_log_name(name) else { continue };
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        files.push(LogFile {
+            path: e.path(),
+            instance_id: id.to_string(),
+            mtime_secs: mtime,
+        });
+    }
+
+    for p in prune_plan(&files, &alive, instance_id(), now, KEEP_DEAD_LOGS) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 #[cfg(test)]
@@ -810,5 +920,99 @@ mod tests {
         ] {
             assert_eq!(parse_log_name(bad), None, "{bad} 不该被当成实例日志");
         }
+    }
+
+    fn lf(name: &str, id: &str, mtime: i64) -> LogFile {
+        LogFile {
+            path: PathBuf::from(name),
+            instance_id: id.to_string(),
+            mtime_secs: mtime,
+        }
+    }
+
+    /// **活着的实例永远不被清理**。
+    ///
+    /// 这是整个清理逻辑唯一不能错的一条:删掉一个正在被写的日志,用户
+    /// 排障时看到的是一个从中间断掉的文件,而断掉的原因不在文件里。
+    /// F148 的 `live_instances_are_never_pruned_and_do_not_eat_the_quota`
+    /// 是同一条判据。
+    ///
+    /// 自证会变红:把 `prune_plan` 里 `alive_ids.contains` 那道过滤删掉。
+    #[test]
+    fn a_live_instance_log_is_never_pruned() {
+        let files = vec![
+            lf("a.log", "100-1", 1_000),
+            lf("b.log", "200-2", 2_000),
+            lf("c.log", "300-3", 3_000),
+        ];
+        let alive = vec!["100-1".to_string()];
+        let plan = prune_plan(&files, &alive, "999-9", 9_000, 1);
+        assert!(
+            !plan.contains(&PathBuf::from("a.log")),
+            "活着的实例的日志被列进删除计划了"
+        );
+    }
+
+    /// **自己的文件按文件名硬排除**,不靠心跳。
+    ///
+    /// 清理跑在 `logx::init` 里,而 F148 的第一次心跳要等 `App` 跑起来
+    /// 之后 —— 此刻自己的 `.alive` 文件还不存在,靠心跳判活会把自己判死。
+    ///
+    /// 自证会变红:把 `prune_plan` 里 `f.instance_id != self_id` 那道过滤删掉。
+    #[test]
+    fn our_own_log_is_excluded_by_name_because_our_heartbeat_does_not_exist_yet() {
+        let files = vec![lf("me.log", "999-9", 100), lf("old.log", "100-1", 100)];
+        let plan = prune_plan(&files, &[], "999-9", 9_000, 0);
+        assert!(!plan.contains(&PathBuf::from("me.log")), "把自己的日志删了");
+        assert!(plan.contains(&PathBuf::from("old.log")));
+    }
+
+    /// **刚动过的文件(60 秒内)一律不删**,作为心跳竞态的第二道保险。
+    ///
+    /// 另一个实例可能刚启动、还没写第一次心跳;或者刚崩溃 —— 后者的日志
+    /// 恰恰是最该留的证据。
+    ///
+    /// 自证会变红:把 `prune_plan` 里 `now_secs - f.mtime > FRESH_SECS` 改成恒 true。
+    #[test]
+    fn a_freshly_written_log_is_kept_even_without_a_heartbeat() {
+        let files = vec![lf("fresh.log", "100-1", 9_000 - 10)];
+        let plan = prune_plan(&files, &[], "999-9", 9_000, 0);
+        assert!(plan.is_empty(), "60 秒内动过的日志被删了:{plan:?}");
+    }
+
+    /// 主文件与它轮转出来的 `.log.1` **同进退**。
+    ///
+    /// 分开处理的话,死实例的 `.1` 永远没人删(清理只按主文件名认实例),
+    /// 慢性写满盘 —— 而且完全无声。
+    ///
+    /// 自证会变红:把 `prune_plan` 里的分组改成按 path 而不是按 instance_id。
+    #[test]
+    fn a_rotated_sibling_goes_with_its_main_file() {
+        let files = vec![
+            lf("m.log", "100-1", 100),
+            lf("m.log.1", "100-1", 90),
+            lf("keep.log", "200-2", 5_000),
+        ];
+        let plan = prune_plan(&files, &[], "999-9", 9_000, 1);
+        assert!(plan.contains(&PathBuf::from("m.log")));
+        assert!(
+            plan.contains(&PathBuf::from("m.log.1")),
+            "轮转出来的 .log.1 成了孤儿,永远没人删"
+        );
+        assert!(!plan.contains(&PathBuf::from("keep.log")), "配额内的被删了");
+    }
+
+    /// 配额按**实例**算而不是按文件算,且留最近的。
+    ///
+    /// 自证会变红:把 `prune_plan` 里的 `sort_by_key` 去掉 Reverse。
+    #[test]
+    fn the_quota_keeps_the_most_recent_instances() {
+        let files = vec![
+            lf("old.log", "100-1", 100),
+            lf("mid.log", "200-2", 200),
+            lf("new.log", "300-3", 300),
+        ];
+        let plan = prune_plan(&files, &[], "999-9", 9_000, 2);
+        assert_eq!(plan, vec![PathBuf::from("old.log")], "留的不是最近两个");
     }
 }
