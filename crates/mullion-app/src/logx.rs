@@ -266,13 +266,19 @@ pub fn line(msg: &str) {
     log::info!(target: "mullion", "{msg}");
 }
 
-/// 真正落盘:带 UTC 时间戳,写文件 + stderr。`level` 决定要不要立刻 flush
-/// (见 [`flush_immediately`])。失败静默(日志绝不能反过来拖垮程序)。
+/// 一行日志的最终形状。**抽成纯函数只为可测**:行格式是多实例排障时
+/// 唯一的归属线索,内联在 `format!` 里就只能靠人眼看。
+pub fn format_line(ts: &str, pid: u32, msg: &str) -> String {
+    format!("[{ts}] [{pid}] {msg}\n")
+}
+
+/// 真正落盘:带 UTC 时间戳 + pid,写文件 + stderr。`level` 决定要不要立刻
+/// flush(见 [`flush_immediately`])。失败静默(日志绝不能反过来拖垮程序)。
 fn write_line_at(msg: &str, level: log::Level) {
     let ts = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_default();
-    let full = format!("[{ts}] {msg}\n");
+    let full = format_line(&ts, std::process::id(), msg);
     let _ = write!(std::io::stderr(), "{full}");
     if let Some(Some(m)) = SINK.get() {
         if let Ok(mut f) = m.lock() {
@@ -603,5 +609,32 @@ mod tests {
                 "id 里有非数字段:{id}"
             );
         }
+    }
+
+    /// 每一行都必须带 pid。
+    ///
+    /// 一实例一文件之后 pid 看似冗余,但它是**双保险**:日志被改名、被
+    /// 拼接、被贴进 issue 之后,文件名那层归属就没了,而排障时最常见的
+    /// 动作恰恰是把几个文件拼起来按时间排。
+    ///
+    /// 自证会变红:把 `format_line` 里的 `[{pid}] ` 去掉。
+    #[test]
+    fn every_line_carries_the_pid() {
+        let line = format_line("2026-08-26T00:00:00Z", 4242, "INFO  mullion: 你好");
+        assert!(line.contains("[4242]"), "行里没有 pid:{line}");
+        assert!(line.starts_with("[2026-08-26T00:00:00Z]"), "时间戳不在最前:{line}");
+        assert!(line.ends_with('\n'), "行尾没有换行:{line:?}");
+    }
+
+    /// pid 必须排在时间戳**之后**、正文之前。
+    ///
+    /// 位置不是审美问题:现有的排障习惯是 `findstr profile` 之后按列读,
+    /// pid 插进正文中间会把 profile 行的字段位置整体推移。
+    ///
+    /// 自证会变红:把 `format_line` 改成 `format!("[{pid}] [{ts}] {msg}\n")`。
+    #[test]
+    fn the_pid_sits_between_the_timestamp_and_the_message() {
+        let line = format_line("TS", 7, "MSG");
+        assert_eq!(line, "[TS] [7] MSG\n");
     }
 }
