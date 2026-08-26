@@ -436,6 +436,51 @@ fn fmt_engines(engines: &[(String, u8)], available: bool) -> String {
         .join("/")
 }
 
+/// F169:`profile.mem` 正文的纯渲染。手工记账三个已知大块 + 显式余量
+/// （用户拍板：不做自定义分配器）。
+///
+/// **单位不对称，调用方容易传反**：`process_mb` 已经是 **MB**（进程 RSS，
+/// 整数）；`scroll_b`/`xfer_b`/`text_b` 三个记账块是**字节**，函数内部按
+/// `>> 20` 换算成 MB —— `_b` 后缀就是在提醒「这三个不是 MB」。
+///
+/// 三块各自 `>> 20` 向下取整再相加，会让 `accounted` 比真实值略小，从而让
+/// 「其他」略偏大（三块合计最多偏差 3MB；`process_mb` 本身不取整，不参与
+/// 这个偏差）。这是**如实**的偏差不是 bug：宁可「其他」栏天然带几 MB 的
+/// 取整噪声，也不在这里悄悄补偿——真正要查的是「其他」占比是不是长期
+/// 偏大，几 MB 噪声掩盖不了那个信号。
+///
+/// `process_mb == 0` 不做特殊处理，按数值老实计算——本项目「采不到不许
+/// 编成 0」的规矩意味着调用方应只在采到真实 RSS 时才调用本函数（采不到
+/// 时留在 `Option` 层面处理，不要把 `None` 揉成 0 传进来）。
+///
+/// 余量为负时**显式报超出量**：静默夹 0（`saturating_sub` 一把梭）会让
+/// 「记账模型错了」永远不被发现（spec §5）。
+pub fn mem_parts(process_mb: u64, scroll_b: u64, xfer_b: u64, text_b: u64) -> String {
+    let scroll = scroll_b >> 20;
+    let xfer = xfer_b >> 20;
+    let text = text_b >> 20;
+    let accounted = scroll + xfer + text;
+    if accounted <= process_mb {
+        format!(
+            "{}MB = scroll:{} xfer:{} text:{} 其他:{}",
+            process_mb,
+            scroll,
+            xfer,
+            text,
+            process_mb - accounted
+        )
+    } else {
+        format!(
+            "{}MB = scroll:{} xfer:{} text:{} 其他:0(记账超出RSS {}MB)",
+            process_mb,
+            scroll,
+            xfer,
+            text,
+            accounted - process_mb
+        )
+    }
+}
+
 /// F167:remote-output 与「OSC 7 提示符心跳涓流」的分界。
 /// 涓流每提示符几十字节,真刷屏至少 KB/s 级 —— 1 KB/s 在两者之间有两个
 /// 数量级余量。具名常量,好调。
@@ -1486,5 +1531,34 @@ mod tests {
         assert_eq!(tget("dragout"), 4);
         assert_eq!(tget("其他"), 0, "截断名不该漏进其他");
         assert!(t.unmapped.is_empty());
+    }
+
+    /// F169:余量三态 —— 正常 / 全零 / 负余量报超出而不是负数。
+    ///
+    /// 自证会变红:把负余量分支改成静默夹 0(`saturating_sub` 一把梭),
+    /// 「超出」字样那条断言会抓住;把分支判据 `<=` 写成 `<`,边界那条会抓住。
+    #[test]
+    fn mem_parts_reports_the_remainder_honestly() {
+        // 正常:340 = 128 + 0 + 16 + 196。
+        assert_eq!(
+            mem_parts(340, 128 << 20, 0, 16 << 20),
+            "340MB = scroll:128 xfer:0 text:16 其他:196"
+        );
+        // 全零记账:全进其他。
+        assert_eq!(
+            mem_parts(50, 0, 0, 0),
+            "50MB = scroll:0 xfer:0 text:0 其他:50"
+        );
+        // 负余量:记账 168MB > RSS 100MB,超出 68 要显式打出来。
+        assert_eq!(
+            mem_parts(100, 128 << 20, 24 << 20, 16 << 20),
+            "100MB = scroll:128 xfer:24 text:16 其他:0(记账超出RSS 68MB)"
+        );
+        // 分支边界:记账恰好等于 RSS。余量 0 是**如实的 0**,不是「超出 0MB」
+        // —— 少了这条,把 `<=` 写成 `<` 三条断言全不变红(恒绿缺口)。
+        assert_eq!(
+            mem_parts(144, 128 << 20, 0, 16 << 20),
+            "144MB = scroll:128 xfer:0 text:16 其他:0"
+        );
     }
 }
