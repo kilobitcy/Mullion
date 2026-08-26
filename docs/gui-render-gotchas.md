@@ -450,3 +450,22 @@
   不是 `RT_ICON`)以及各尺寸的 `RT_ICON`。
 - **`windres` 要 `-I assets`**:`.rc` 里写的是相对文件名,而它的搜索起点是进程的
   工作目录(cargo 设成 crate 根),不是 `.rc` 所在目录。少了就报 "can't open icon file"。
+
+## TIMESTAMP_QUERY 必须条件申请（F165）
+
+**症状**：`request_device` 在老驱动/核显上直接失败，程序起不来 —— 而起不来的
+理由只是一个诊断指标。
+
+**规则**：`adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)` 为真才
+放进 `required_features`，否则整块降级成 `gpu_us=n/a`。
+
+**守护**：`profile::tests::a_gpu_timer_that_never_reported_says_n_a_instead_of_zero`
+（保证「不支持」与「0µs」在日志里长得不一样）。
+
+## GPU 帧耗时的回读会悬在半路（F165）
+
+**症状**：长空闲时 `map_async` 的回调迟迟不来，看起来像泄漏。
+
+**规则**：那是正常的 —— 回调要等后续 `poll`/`submit`。`busy` 标志一直为 true，
+期间不再采新样本，下一次渲染自然收割。**不要**为此加超时或强制 `poll`：
+强制 poll 会把空闲时的 CPU 拉起来，正是 F157~F159 刚压下去的那件事。
