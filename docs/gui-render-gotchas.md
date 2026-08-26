@@ -469,3 +469,31 @@
 **规则**：那是正常的 —— 回调要等后续 `poll`/`submit`。`busy` 标志一直为 true，
 期间不再采新样本，下一次渲染自然收割。**不要**为此加超时或强制 `poll`：
 强制 poll 会把空闲时的 CPU 拉起来，正是 F157~F159 刚压下去的那件事。
+
+## GPU 分层的分界时间戳有三条顺序契约（F170）
+
+**症状**：分层数字**看着挺合理**却是错的 —— `term:` 恒等于整帧、`egui:` 恒为 0
+（或反过来）。没有任何报错，只有拿两种负载对比才能看出不对。
+
+三条契约，每条错了都是静默错值：
+
+1. **`mid_mark` 必须在 `pass.forget_lifetime()` 之前调。** `forget_lifetime` 消费
+   `pass` 自身，之后原 pass 就没了；写在它之后只能对 `static_pass` 写，那时
+   egui 那趟已经录进去了，分界点等于 pass 末尾 → `egui:` 恒为 0。
+2. **必须在 `if let Some(terminal_draw)` 判空块之外。** launcher 态（没有终端可画）
+   那些帧照样挂了 `timestamp_writes` 并会被 `resolve`，槽 1 若从没写过，读出来是
+   上一次采样的**残留值** —— 一个来自别的时刻的、看着像模像样的数字。
+3. **`mid_mark` 内部的 `if self.split` 不是冗余判断。** 非分层模式下
+   `end_of_pass_write_index` 本来就是 `Some(1)`，去掉这层守卫会对同一索引在同一
+   pass 内写两次，直接撞 wgpu 的 `QueryUseError::UsedTwiceInsideRenderpass`。
+
+**规则**：`TIMESTAMP_QUERY_INSIDE_PASSES` 与 `TIMESTAMP_QUERY` 一起条件申请，
+两者都在才置 `split`（前者按 wgpu 文档蕴含后者，但 wgpu-core 侧没有通用校验强制
+这条，`&&` 是廉价的保险）。槽数随 `split` 在 2/3 之间变，`resolve_query_set` 的
+范围、staging buffer 的 size、回读的解算三处必须同源，否则读越界或读到半个数。
+`destination_offset` 恒为 0，`QUERY_RESOLVE_BUFFER_ALIGNMENT=256` 约束的是它而不是
+buffer 总大小，3 槽（24 字节）合法。
+
+**守护**：`app::tests::the_gpu_mid_mark_sits_between_terminal_and_egui`（源码顺序，
+三个 needle 在生产段里各唯一；无头环境测不了「槽 1 是否真被写」，那部分只能靠
+人工验收：拿两种负载对比 `term:`/`egui:` 的升降方向）。

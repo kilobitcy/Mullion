@@ -47,7 +47,7 @@ profile      5.0s frame=120x/p50=1.2ms/p95=4.5ms present=118 skip=2 fp=hit:80/mi
 profile.load scene=sftp-transfer tabs=2 panes=5 hosts=3 scroll=12.4k行 xfer=2个/48MB剩 key=0x in=1.2MB/s
 profile.cpu  total=68% main=14% | tokio:31% watchdog:0% 其他:9%
 profile.mem  340MB = scroll:128 xfer:24 text:16 其他:172
-profile.gpu  util=3D:22%,Copy:3% vram=210/8192MB frame=42x/p50=1.2ms/p95=3.4ms | term:0.8ms egui:0.4ms
+profile.gpu  util=3D:22%/Copy:3% vram=210/8192MB frame=42x/p50=1.2ms/p95=3.4ms | term:0.8ms egui:0.4ms
 ```
 
 （`profile.cpu` 的示例组名以 §4 的分组表为准——不存在 `render` 组，
