@@ -245,6 +245,161 @@ pub fn aggregate_engines(items: &[(String, f64)], pid: u32) -> Vec<(String, u8)>
     out
 }
 
+/// GPU 引擎占用探针。**有状态**:PDH 是速率型计数器,查询句柄必须常驻,
+/// 且第一次 `PdhCollectQueryData` 只作基线、不出数。
+pub struct GpuProbe {
+    #[cfg(windows)]
+    inner: Option<PdhQuery>,
+    #[cfg(windows)]
+    primed: bool,
+}
+
+#[cfg(windows)]
+struct PdhQuery {
+    query: isize,
+    counter: isize,
+}
+
+// SAFETY: PDH 句柄是进程级的不透明整数,跨线程使用是 PDH 的正常用法;
+// 本结构体只被看门狗线程独占持有。
+#[cfg(windows)]
+unsafe impl Send for PdhQuery {}
+
+impl GpuProbe {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            inner: open_pdh(),
+            #[cfg(windows)]
+            primed: false,
+        }
+    }
+
+    /// 采一次。首次调用只作基线,返回 `None`。
+    #[cfg(windows)]
+    pub fn sample(&mut self) -> Option<GpuSample> {
+        let q = self.inner.as_ref()?;
+        // SAFETY: `q.query` 由 PdhOpenQueryW 得到,本结构体存活期间有效。
+        if unsafe { windows_sys::Win32::System::Performance::PdhCollectQueryData(q.query) } != 0 {
+            return None;
+        }
+        if !self.primed {
+            // 速率型计数器要两次采集才有值,第一次只是基线。
+            self.primed = true;
+            return None;
+        }
+        let items = read_counter_array(q.counter)?;
+        Some(GpuSample {
+            engines: aggregate_engines(&items, std::process::id()),
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub fn sample(&mut self) -> Option<GpuSample> {
+        None
+    }
+}
+
+impl Default for GpuProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn open_pdh() -> Option<PdhQuery> {
+    use windows_sys::Win32::System::Performance::{PdhAddEnglishCounterW, PdhOpenQueryW};
+    let mut query = 0isize;
+    // SAFETY: 两个 out 参数在栈上;`wide` 给的是 NUL 结尾的 UTF-16。
+    if unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } != 0 {
+        return None;
+    }
+    let mut counter = 0isize;
+    // **必须是 `PdhAddEnglishCounterW`**:`PdhAddCounterW` 吃的是**本地化**
+    // 计数器名,中文 Windows 上这条路径根本找不到 —— 而且是运行期静默失败,
+    // 编译和本机测试全绿。
+    let path = wide(r"\GPU Engine(*)\Utilization Percentage");
+    if unsafe { PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) } != 0 {
+        return None;
+    }
+    Some(PdhQuery { query, counter })
+}
+
+/// 读一次计数器数组。两趟调用:先问要多大缓冲,再取数据。
+#[cfg(windows)]
+fn read_counter_array(counter: isize) -> Option<Vec<(String, f64)>> {
+    use windows_sys::Win32::System::Performance::{
+        PdhGetFormattedCounterArrayW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
+    };
+    let mut size = 0u32;
+    let mut count = 0u32;
+    // SAFETY: 第一趟传空缓冲,PDH 用 `size` 回报所需字节数(返回
+    // PDH_MORE_DATA,非 0,所以这里不检查返回值,只看 size)。
+    unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut size,
+            &mut count,
+            std::ptr::null_mut(),
+        )
+    };
+    if size == 0 {
+        return None;
+    }
+    let n = (size as usize).div_ceil(std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>()) + 1;
+    let mut buf: Vec<PDH_FMT_COUNTERVALUE_ITEM_W> = Vec::with_capacity(n);
+    // 告诉 PDH 缓冲实际有多大(字节数),而不是沿用第一趟回报的 `size`:
+    // `with_capacity(n)` 多留了一项余量,实际分配的字节数 ≥ 第一趟的回报值。
+    // 用小的那个值当入参是安全的(PDH 不会写超出它所知道的范围),但如果
+    // PDH 在两趟之间因为并发的另一次 `PdhCollectQueryData` 让实例数变多,
+    // 传一个偏小的 `size` 会让第二趟又返回 PDH_MORE_DATA、永远读不到数。
+    // 按实际分配的字节数回填,消除这个缝隙。
+    size = (n * std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>()) as u32;
+    // SAFETY: 容量已按 PDH 回报的字节数算好并多留一项;PDH 负责填充,
+    // 之后只读前 `count` 项。
+    let ok = unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut size,
+            &mut count,
+            buf.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        return None;
+    }
+    // SAFETY: PDH 成功返回,前 `count` 项已初始化。
+    unsafe { buf.set_len(count as usize) };
+
+    let mut out = Vec::with_capacity(buf.len());
+    for it in &buf {
+        if it.szName.is_null() {
+            continue;
+        }
+        // SAFETY: `szName` 指向 PDH 填在同一块缓冲尾部的 NUL 结尾宽串。
+        let name = unsafe {
+            let mut len = 0usize;
+            while *it.szName.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(it.szName, len))
+        };
+        // SAFETY: 用 PDH_FMT_DOUBLE 取的数,联合体里有效的是 doubleValue。
+        let v = unsafe { it.FmtValue.Anonymous.doubleValue };
+        if v.is_finite() {
+            out.push((name, v));
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

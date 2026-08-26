@@ -250,6 +250,10 @@ pub struct Snapshot {
     /// 与 `cpu_pct` 口径不同是有意的:F158 那次的症状是「烧满一个核」,
     /// 在多核机上归一化之后只有个位数,会淹没在噪声里。
     pub main_cpu_pct: Option<u8>,
+    /// F165:GPU 引擎占用,按类型聚合的前两名。空 = 采不到或全零。
+    pub gpu_engines: Vec<(String, u8)>,
+    /// F165:GPU 探针可用吗。区分「可用但为 0」与「采不到」。
+    pub gpu_available: bool,
 }
 
 /// 逐阶段计数。长度与 `diag::Stage` 的变体数一致。
@@ -307,6 +311,8 @@ impl Snapshot {
             mem_process_mb: 0,
             cpu_pct: None,
             main_cpu_pct: None,
+            gpu_engines: Vec::new(),
+            gpu_available: false,
         }
     }
 
@@ -359,6 +365,25 @@ impl Snapshot {
 /// 百分比渲染。`None` → `n/a`(不是 0:「采不到」和「真的是 0」是两回事)。
 fn fmt_pct(v: Option<u8>) -> String {
     v.map_or_else(|| "n/a".to_string(), |p| format!("{p}%"))
+}
+
+/// F165:GPU 引擎占用渲染成 `3D:14%/Copy:3%`。
+///
+/// 三种状态必须长得不一样:探针不可用 `n/a`、可用但全零 `0%`、有值列出来。
+/// 把前两种混成一个的话,「这台机器读不到 GPU」和「这台机器没在用 GPU」
+/// 在日志里无法区分。
+fn fmt_engines(engines: &[(String, u8)], available: bool) -> String {
+    if !available {
+        return "n/a".to_string();
+    }
+    if engines.is_empty() {
+        return "0%".to_string();
+    }
+    engines
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}%"))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// 把一个窗口渲染成**一行**日志。`None` = 这个窗口空闲，不该写。
@@ -423,7 +448,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
          reshape=hit:{}/miss:{} fp=hit:{}/miss:{} wake={}x/rr=sched:{},evt:{} dirty={} \
          egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
-         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB cpu={}",
+         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB cpu={} gpu={}",
         secs,
         s.frames,
         fmt_us(quantile_us(&s.frame_us, 0.5)),
@@ -467,6 +492,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
             (None, None) => "n/a".to_string(),
             (a, b) => format!("{}/主线程:{}", fmt_pct(a), fmt_pct(b)),
         },
+        fmt_engines(&s.gpu_engines, s.gpu_available),
     ))
 }
 
@@ -1035,6 +1061,22 @@ mod tests {
         assert!(
             line.contains("cpu=n/a"),
             "采不到时该报 n/a 而不是编一个 0:{line}"
+        );
+    }
+
+    /// GPU 的三种状态在日志里必须长得不一样。
+    ///
+    /// 「读不到 GPU」和「GPU 空着」混成同一个字符串的话,排障时没法判断
+    /// 是探针坏了还是真的没在渲染。
+    ///
+    /// 自证会变红:把 `fmt_engines` 的 `!available` 分支改成返回 `"0%"`。
+    #[test]
+    fn an_unavailable_gpu_probe_reads_differently_from_an_idle_gpu() {
+        assert_eq!(fmt_engines(&[], false), "n/a");
+        assert_eq!(fmt_engines(&[], true), "0%");
+        assert_eq!(
+            fmt_engines(&[("3D".to_string(), 14), ("Copy".to_string(), 3)], true),
+            "3D:14%/Copy:3%"
         );
     }
 }

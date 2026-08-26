@@ -585,9 +585,10 @@ pub fn start_watchdog(stall_ms: u64) {
     // `CpuProbe` 要在主线程上取主线程自己的句柄/tid。搬进 watchdog_loop
     // 里建的话,拿到的是看门狗线程自己(静默错值)。
     let cpu = crate::sysprobe::CpuProbe::new_on_main_thread();
+    let gpu = crate::sysprobe::GpuProbe::new();
     let spawned = std::thread::Builder::new()
         .name("mullion-watchdog".into())
-        .spawn(move || watchdog_loop(stall_ms, cpu));
+        .spawn(move || watchdog_loop(stall_ms, cpu, gpu));
     if let Err(e) = spawned {
         // 看门狗起不来不该拖垮程序,但必须留痕(否则日志里没有它的 WARN 会被误读成「没卡过」)。
         log::warn!(target: "mullion", "看门狗线程启动失败,自诊断降级: {e}");
@@ -597,7 +598,11 @@ pub fn start_watchdog(stall_ms: u64) {
 /// 周期指标行的间隔。既是性能基线,也是「主线程还活着」的心跳。
 const METRICS_EVERY_MS: u64 = 5_000;
 
-fn watchdog_loop(stall_ms: u64, mut cpu: crate::sysprobe::CpuProbe) {
+fn watchdog_loop(
+    stall_ms: u64,
+    mut cpu: crate::sysprobe::CpuProbe,
+    mut gpu: crate::sysprobe::GpuProbe,
+) {
     let mut reported_ms = 0u64;
     let mut last_metrics = 0u64;
     loop {
@@ -637,6 +642,10 @@ fn watchdog_loop(stall_ms: u64, mut cpu: crate::sysprobe::CpuProbe) {
             let mut snap = take_snapshot(window_ms);
             snap.cpu_pct = cpu_sample.map(|c| c.process_pct);
             snap.main_cpu_pct = cpu_sample.map(|c| c.main_thread_pct);
+            if let Some(g) = gpu.sample() {
+                snap.gpu_available = true;
+                snap.gpu_engines = g.engines;
+            }
             if log::log_enabled!(target: "mullion", log::Level::Info) {
                 if let Some(line) = crate::profile::render_line(&snap) {
                     log::info!(target: "mullion", "{line}");
