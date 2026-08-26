@@ -155,63 +155,68 @@ static RDELAY_MAX: AtomicU64 = AtomicU64::new(0);
 static FP_HIT: AtomicU64 = AtomicU64::new(0);
 static FP_MISS: AtomicU64 = AtomicU64::new(0);
 
-/// F157:`ui_dirty` 归因表的槽位数。
+/// F157:归因表的槽位数。`ui_dirty` 置脏点表与 F171 的窗口事件类型表共用。
 ///
 /// 8 而不是 75(置脏点总数):空闲时真正在响的只有个位数处,而这张表要待在
 /// 帧路径上——`note()` 最坏两轮有界扫描(至多 24 次 relaxed load),加一次
 /// store 或 fetch_add 收尾,与 `diag::mark` 同量级。
-pub const DIRTY_SITES: usize = 8;
+pub const TABLE_SLOTS: usize = 8;
 
-/// `ui_dirty` 置真的归因表:定长、无锁、不分配、不格式化(T3)。
+/// 「某个键响了多少次」的归因表:定长、无锁、不分配、不格式化(T3)。
+///
+/// 两个实例:`DIRTY`(键 = `app.rs` 的源码行号,F157)与 `WEV`(键 = 窗口事件
+/// 类型码,F171)。键的语义由使用方定,这里只管计数与槽位回收 —— 复制一份
+/// 结构出来的话,「槽位归还」这条微妙的时序约定就要维护两遍。
 ///
 /// 抽成结构体(而不是一组裸 `static`)只为一件事:**测试能自己造一个**。
 /// 进程级 static 是全 crate 共享的 —— 并行 runner 下别的测试会间接调到
 /// `note_ui_dirty`,共享状态会让本文件的断言概率性假红(与 `StageClock`
 /// 同一条理由)。
-struct DirtyTable {
-    /// 槽位认领的源码行号。0 = 空槽。
-    line: [AtomicU32; DIRTY_SITES],
-    hits: [AtomicU64; DIRTY_SITES],
+struct KeyTable {
+    /// 槽位认领的键。**0 = 空槽**,所以任何键空间都不许把 0 用作真实键
+    /// (F171 的 `wev::kind_of` 因此从 1 起编,`line!()` 天然不会是 0)。
+    key: [AtomicU32; TABLE_SLOTS],
+    hits: [AtomicU64; TABLE_SLOTS],
     /// 槽位用完之后落到这里,报成 `dirty=...,other:N`。**必须报**:
     /// 不报的话「这几处就是全部」与「还有一堆没槽位」在日志里长得一样。
     other: AtomicU64,
 }
 
-impl DirtyTable {
+impl KeyTable {
     const fn new() -> Self {
         Self {
-            line: [const { AtomicU32::new(0) }; DIRTY_SITES],
-            hits: [const { AtomicU64::new(0) }; DIRTY_SITES],
+            key: [const { AtomicU32::new(0) }; TABLE_SLOTS],
+            hits: [const { AtomicU64::new(0) }; TABLE_SLOTS],
             other: AtomicU64::new(0),
         }
     }
 
-    /// 记一次「第 `line` 行把 `ui_dirty` 置真了」。
+    /// 记一次「键 `key` 响了」(F157:某一行置了脏;F171:收到某一类窗口事件)。
     ///
-    /// **单写者**:生产环境里只有主线程经 `mark_ui_dirty!` 调用,看门狗线程
-    /// 只读 `drain()`——不需要 CAS 重试,与本文件 `StageClock::mark` 同一条
-    /// 理由。
+    /// **单写者**:生产环境里只有主线程经 `mark_ui_dirty!` / `note_window_event`
+    /// 调用,看门狗线程只读 `drain()`——不需要 CAS 重试,与本文件
+    /// `StageClock::mark` 同一条理由。
     ///
     /// 两轮线性扫:第一轮找精确命中,直接加计数并返回。找不到命中,第二轮
     /// 抢一个「空槽,或者这一窗口还一次没响过的槽位」——**关键在后半句**:
-    /// 一个槽位挂着上一窗口的行号,但这一窗口(`drain` 还没取走它)一次都
-    /// 没加过,说明那一处已经安静了,原地把它让给新来的行更有用,不必等
+    /// 一个槽位挂着上一窗口的键,但这一窗口(`drain` 还没取走它)一次都
+    /// 没加过,说明那一处已经安静了,原地把它让给新来的键更有用,不必等
     /// 到下一次 `drain` 才收回——否则「上一窗口才响过一次的启动尖峰」会把
     /// 槽位多占一整窗口,恰好把这一窗口真正常驻的那一处挤进 `other`
     /// (`a_slot_that_went_quiet_is_handed_back_for_the_next_window` 钉的
     /// 就是这一条)。
-    fn note(&self, line: u32) {
-        for i in 0..DIRTY_SITES {
-            if self.line[i].load(Ordering::Relaxed) == line {
+    fn note(&self, key: u32) {
+        for i in 0..TABLE_SLOTS {
+            if self.key[i].load(Ordering::Relaxed) == key {
                 self.hits[i].fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
-        for i in 0..DIRTY_SITES {
-            let quiet = self.line[i].load(Ordering::Relaxed) == 0
+        for i in 0..TABLE_SLOTS {
+            let quiet = self.key[i].load(Ordering::Relaxed) == 0
                 || self.hits[i].load(Ordering::Relaxed) == 0;
             if quiet {
-                self.line[i].store(line, Ordering::Relaxed);
+                self.key[i].store(key, Ordering::Relaxed);
                 self.hits[i].store(1, Ordering::Relaxed);
                 return;
             }
@@ -225,34 +230,90 @@ impl DirtyTable {
     /// 一次的一次性置脏点会把 8 个槽位永久占死,而真正每帧都在置脏的那
     /// 一处只能落进 `other` —— 一整趟实机往返白跑,且剖面看起来一切正常。
     ///
-    /// **顺序是承重的:必须先读 `line` 再 `swap(hits)`,反过来会报错行号**。
+    /// **顺序是承重的:必须先读 `key` 再 `swap(hits)`,反过来会报错键**。
     /// `note()` 跑在主线程,`drain()` 跑在看门狗线程,两者各自只是普通
-    /// relaxed 读写,没有加锁把「一个槽位的 line 和 hits」锁成一份快照。
+    /// relaxed 读写,没有加锁把「一个槽位的 key 和 hits」锁成一份快照。
     /// 若先 `swap(hits)`:swap 完 `hits[i]` 已经是 0,`note()` 在这个缝隙里
-    /// 把这个槽位当成安静槽抢走、写了新行号,drain 再去读 `line[i]` 时读到
-    /// 的就是抢家的行号——报出来的是「新行号命中了旧行号积攒的次数」,
-    /// 正是这张表存在的意义要防的那种「归因指错人」。反过来先读 `line`:
+    /// 把这个槽位当成安静槽抢走、写了新键,drain 再去读 `key[i]` 时读到
+    /// 的就是抢家的键——报出来的是「新键命中了旧键积攒的次数」,
+    /// 正是这张表存在的意义要防的那种「归因指错人」。反过来先读 `key`:
     /// `note()` 的抢占分支只在看见 `hits[i]==0` 之后才会发生,而这必然发生
-    /// 在 drain 的 `swap` 之后——drain 读 `line` 的那一刻,`note()` 还没有
-    /// 理由去抢这个槽,读到的必然是这一批 hits 归属的那个行号。唯一残留的
-    /// 缝隙是「抢占落在 load 和 swap 之间,而被抢的行本来就是 0 次命中」,
+    /// 在 drain 的 `swap` 之后——drain 读 `key` 的那一刻,`note()` 还没有
+    /// 理由去抢这个槽,读到的必然是这一批 hits 归属的那个键。唯一残留的
+    /// 缝隙是「抢占落在 load 和 swap 之间,而被抢的键本来就是 0 次命中」,
     /// 此时最多错记一次命中,可接受。
     fn drain(&self) -> (Vec<(u32, u64)>, u64) {
         let mut out = Vec::new();
-        for i in 0..DIRTY_SITES {
-            let line = self.line[i].load(Ordering::Relaxed);
+        for i in 0..TABLE_SLOTS {
+            let key = self.key[i].load(Ordering::Relaxed);
             let hits = self.hits[i].swap(0, Ordering::Relaxed);
             if hits > 0 {
-                out.push((line, hits));
+                out.push((key, hits));
             } else {
-                self.line[i].store(0, Ordering::Relaxed);
+                self.key[i].store(0, Ordering::Relaxed);
             }
         }
         (out, self.other.swap(0, Ordering::Relaxed))
     }
 }
 
-static DIRTY: DirtyTable = DirtyTable::new();
+static DIRTY: KeyTable = KeyTable::new();
+/// F171:窗口事件类型归因表。键 = `wev::kind_of` 的码。
+static WEV: KeyTable = KeyTable::new();
+
+/// F171:指针位置去重。
+///
+/// 只知道「凶手是 `CursorMoved`」还不够:坐标恒定不变说明那是**幽灵事件**
+/// (可以按位置直接掐掉),坐标在变说明真有东西在动指针 —— 两者修法完全
+/// 不同,而这一位信息几乎零成本。
+///
+/// 判据用 **bit 相等**而不是数值相等:更保守,只会漏报 dup、不会误报
+/// (`-0.0` 与 `0.0` 的 bits 不同,会被判成「动过」)。误报 dup 才是危险的
+/// ——那会让人以为「掐掉重复坐标是安全的」。
+struct CursorTracker {
+    last: [AtomicU64; 2],
+    /// 有没有收到过第一次。**不能拿 `last == (0, 0)` 当哨兵**:指针真的
+    /// 停在窗口原点时会被当成「还没收到过」,永远记不出 dup。
+    seen: AtomicBool,
+    dup: AtomicU64,
+}
+
+impl CursorTracker {
+    const fn new() -> Self {
+        Self {
+            last: [const { AtomicU64::new(0) }; 2],
+            seen: AtomicBool::new(false),
+            dup: AtomicU64::new(0),
+        }
+    }
+
+    /// 记一次 `CursorMoved`。返回是否与上一次同坐标(便于测试直接断言)。
+    fn note(&self, x: f64, y: f64) -> bool {
+        let (bx, by) = (x.to_bits(), y.to_bits());
+        let same = self.seen.load(Ordering::Relaxed)
+            && self.last[0].load(Ordering::Relaxed) == bx
+            && self.last[1].load(Ordering::Relaxed) == by;
+        self.last[0].store(bx, Ordering::Relaxed);
+        self.last[1].store(by, Ordering::Relaxed);
+        self.seen.store(true, Ordering::Relaxed);
+        if same {
+            self.dup.fetch_add(1, Ordering::Relaxed);
+        }
+        same
+    }
+
+    /// 取走这一窗口的 dup 计数。
+    ///
+    /// **`last`/`seen` 刻意不重置**:指针在两个 5 秒采样窗口之间没动过,
+    /// 那仍然是 dup。重置的话每个窗口的第一次 `CursorMoved` 都会被算成
+    /// 「动过」,采样窗口越密、dup 率被压得越低 —— 一个随采样频率变化的
+    /// 指标是没法用来下结论的。
+    fn drain(&self) -> u64 {
+        self.dup.swap(0, Ordering::Relaxed)
+    }
+}
+
+static CURSOR: CursorTracker = CursorTracker::new();
 
 /// F157:第 `line` 行把 `ui_dirty` 置真了。**只由 `mark_ui_dirty!` 宏调用。**
 ///
@@ -262,6 +323,20 @@ static DIRTY: DirtyTable = DirtyTable::new();
 /// ——帧路径上两者都不行(T3)。
 pub fn note_ui_dirty(line: u32) {
     DIRTY.note(line);
+}
+
+/// F171:某一类窗口事件让 egui 说「要重绘」。`kind` 来自 `wev::kind_of`。
+///
+/// **埋在 `resp.repaint` 之内,不是收到事件就记**:这张表要回答的是
+/// 「凭什么出帧」,不是「收到了什么」。两者的差集(收到但不触发重绘的)
+/// 由既有的 `window_event` Stage 计数与 `egui_ev` 反推得到。
+pub fn note_window_event(kind: u32) {
+    WEV.note(kind);
+}
+
+/// F171:一次 `CursorMoved` 的物理坐标。判据与理由见 `CursorTracker`。
+pub fn note_cursor_pos(x: f64, y: f64) {
+    CURSOR.note(x, y);
 }
 /// 状态量(此刻是多少),不是「这窗口发生了几次」—— 采集时读而不清。
 static TABS: AtomicU64 = AtomicU64::new(0);
@@ -786,6 +861,10 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     let (dirty_sites, dirty_other) = DIRTY.drain();
     s.dirty_sites = dirty_sites;
     s.dirty_other = dirty_other;
+    let (wev_kinds, wev_other) = WEV.drain();
+    s.wev_kinds = wev_kinds;
+    s.wev_other = wev_other;
+    s.cursor_dup = CURSOR.drain();
     s.wakes = WAKES.swap(0, Ordering::Relaxed);
     s.rr_sched = RR_SCHED.swap(0, Ordering::Relaxed);
     s.rr_evt = RR_EVT.swap(0, Ordering::Relaxed);
@@ -950,17 +1029,17 @@ mod tests {
     /// 调到 `note_ui_dirty`,共享 static 会让断言概率性假红(与本文件
     /// `StageClock` 给测试单开实例是同一条理由)。
     ///
-    /// 自证会变红:把 `DirtyTable::note` 里的线性扫描去掉,永远走 `other`。
+    /// 自证会变红:把 `KeyTable::note` 里的线性扫描去掉,永远走 `other`。
     #[test]
     fn the_attribution_table_keeps_each_line_apart_until_it_runs_out_of_slots() {
-        let t = DirtyTable::new();
+        let t = KeyTable::new();
         for _ in 0..300 {
             t.note(8365);
         }
         t.note(7191);
         t.note(7191);
-        // 再来 DIRTY_SITES 个各不相同的行号,把槽位撑满并溢出。
-        for line in 1000..(1000 + DIRTY_SITES as u32) {
+        // 再来 TABLE_SLOTS 个各不相同的行号,把槽位撑满并溢出。
+        for line in 1000..(1000 + TABLE_SLOTS as u32) {
             t.note(line);
         }
         let (sites, other) = t.drain();
@@ -969,7 +1048,7 @@ mod tests {
             "每帧都在置脏的那一处没被单独计出来:{sites:?}"
         );
         assert!(sites.contains(&(7191, 2)), "第二处没被计出来:{sites:?}");
-        assert_eq!(sites.len(), DIRTY_SITES, "槽位没被填满:{sites:?}");
+        assert_eq!(sites.len(), TABLE_SLOTS, "槽位没被填满:{sites:?}");
         assert!(other > 0, "槽位用完之后的置脏必须落进 other,否则会静默消失");
     }
 
@@ -985,8 +1064,8 @@ mod tests {
     /// 才会被走到,对这条测试是死代码。
     #[test]
     fn a_slot_that_went_quiet_is_handed_back_for_the_next_window() {
-        let t = DirtyTable::new();
-        for line in 1..=(DIRTY_SITES as u32) {
+        let t = KeyTable::new();
+        for line in 1..=(TABLE_SLOTS as u32) {
             t.note(line); // 启动期的一次性置脏点,各来一次
         }
         let _ = t.drain();
@@ -1005,10 +1084,74 @@ mod tests {
     /// 自证会变红:把 `drain` 里 `DIRTY_HITS` 的 `swap(0, ..)` 改成 `load(..)`。
     #[test]
     fn draining_the_attribution_table_resets_the_window() {
-        let t = DirtyTable::new();
+        let t = KeyTable::new();
         t.note(42);
         assert_eq!(t.drain().0, vec![(42, 1)]);
         assert!(t.drain().0.is_empty(), "取走之后窗口该是空的");
+    }
+
+    /// F171:同坐标算 dup,坐标一变就不算。
+    ///
+    /// 这一位是整个 F171 的判据分岔口:dup≈事件数 → 幽灵事件(坐标恒定,
+    /// 可以按位置掐);dup 远小于事件数 → 真有东西在动指针,得先找出是谁。
+    /// 判错这一位,下一轮就会往完全相反的方向改。
+    ///
+    /// 自证会变红:把 `note` 里的 `same` 恒置 true 或恒置 false。
+    #[test]
+    fn a_cursor_event_at_the_same_spot_is_a_duplicate_and_a_moved_one_is_not() {
+        let c = CursorTracker::new();
+        assert!(!c.note(10.0, 20.0), "第一次没有「上一次」可比,不该算 dup");
+        assert!(c.note(10.0, 20.0), "同坐标该算 dup");
+        assert!(c.note(10.0, 20.0), "连续同坐标该继续算 dup");
+        assert!(!c.note(10.0, 21.0), "坐标变了不该算 dup");
+        assert_eq!(c.drain(), 2, "dup 计数与判定不一致");
+    }
+
+    /// F171:**bit 相等,不是数值相等**。`-0.0 == 0.0` 在数值上成立,
+    /// 但 bits 不同 —— 判成「动过」是保守的一侧(只漏报 dup)。
+    ///
+    /// 误报 dup 才危险:那会让人以为「按坐标去重是安全的」,进而掐掉真实的
+    /// 指针移动。
+    ///
+    /// 自证会变红:把 `to_bits()` 比较改成 `x == last_x` 的浮点比较。
+    #[test]
+    fn the_duplicate_test_is_conservative_about_negative_zero() {
+        let c = CursorTracker::new();
+        assert!(!c.note(0.0, 0.0));
+        assert!(!c.note(-0.0, 0.0), "-0.0 该判成动过(保守侧)");
+        assert_eq!(c.drain(), 0);
+    }
+
+    /// F171:指针停在窗口原点也要能记出 dup。
+    ///
+    /// 拿 `last == (0, 0)` 当「还没收到过」的哨兵的话,指针真停在原点时
+    /// 每一次都被当成第一次,dup 恒为 0 —— 静默错值,日志上与「指针一直在动」
+    /// 长得一模一样。
+    ///
+    /// 自证会变红:把 `seen` 去掉、改用 `last == (0, 0)` 判首次。
+    #[test]
+    fn the_origin_is_a_real_position_not_a_sentinel() {
+        let c = CursorTracker::new();
+        c.note(0.0, 0.0);
+        c.note(0.0, 0.0);
+        c.note(0.0, 0.0);
+        assert_eq!(c.drain(), 2, "停在原点的指针记不出 dup");
+    }
+
+    /// F171:取走 dup 计数**不重置上一次的坐标**。
+    ///
+    /// 指针跨过采样窗口边界仍然没动,那仍然是 dup。重置的话每个窗口的
+    /// 第一次 `CursorMoved` 都算「动过」,dup 率会随采样频率变化 ——
+    /// 一个随采样频率变化的指标没法用来下结论。
+    ///
+    /// 自证会变红:在 `drain` 里加上 `self.seen.store(false, ..)`。
+    #[test]
+    fn draining_keeps_the_last_position_so_stillness_survives_the_window() {
+        let c = CursorTracker::new();
+        c.note(7.0, 8.0);
+        assert_eq!(c.drain(), 0);
+        assert!(c.note(7.0, 8.0), "跨窗口的静止被误判成移动");
+        assert_eq!(c.drain(), 1);
     }
 
     /// F167:计次量与状态量的清零语义不能弄反。

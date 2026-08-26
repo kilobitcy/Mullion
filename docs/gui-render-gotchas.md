@@ -56,6 +56,23 @@
   **规则**:这类调用一律挪到自己的线程上(自己 `OleInitialize`/`CoInitialize`),
   UI 线程只负责 `spawn` 后立刻返回。**守护**:没有自动守护 —— 无头验不了;
   实现见 `dragout/win.rs`,那里把这条写在文件头。
+- **`on_window_event` 的 `repaint: true` 几乎是无条件的(F171)。**
+  读上一条时很容易以为「恒返回 true」只是 `RedrawRequested` 的特例。不是。
+  `egui-winit` 0.30.0 的 `on_window_event` 里,返回 `repaint: false` 的**只有五档**:
+  `ActivationTokenDone` / `AxisMotion` / `DoubleTapGesture` / `RotationGesture` / `PanGesture`。
+  其余**全部**返回 true —— 包括 `Occluded`、`Moved`、`Focused`、`CursorLeft` 这些
+  压根不产生任何 `egui::Event` 的档。**规则**:任何「顺手把这个事件也喂给 egui」的改动,
+  等于替 egui 声明了一次重绘;而下一帧 `take_egui_input` 拿到非空 `events` 时 egui 又恒
+  返回 `repaint_delay = ZERO`,于是 `WaitUntil(now)` → `about_to_wait` 再 `request_redraw`,
+  自激的另一半就闭合了。想收窄就在 `egui_should_see_window_event` 里加判据,别指望
+  egui 自己说「不用重绘」。**辨认手法**:`wev=` 段(F171)报的是**触发了重绘的**事件类型
+  分布,与相邻 `dirty=`、`egui_ev=` 三者对读 —— `wev` 的和 ≈ `dirty` 那一行的次数说明
+  判据一致;`egui_ev` 明显更小则说明有一批「不产生 egui 事件却声明了重绘」的档在响。
+- **`set_cursor_icon` 的去重会在指针离开窗口时失效(F171 排查副产物)。**
+  `egui-winit` 拿 `current_cursor_icon: Option<CursorIcon>` 去重,但
+  `pointer_pos_in_points` 为 `None` 时它把这个字段**清成 `None`**,于是下一帧无论图标变没变
+  都会再发一次 `set_cursor`。指针停在窗口外时这条每帧都在响。**它本身不产生窗口事件**,
+  但排查「窗口事件从哪来」时会被算进嫌疑名单,先把它排除掉能省一轮实机往返。
 - **指针出没出窗口,不能靠 winit 的 `CursorLeft` 判(F59 / 设计 N1)。**
   按下鼠标后 Windows 把鼠标捕获给窗口,`WM_MOUSELEAVE` 根本不发,winit 也就没有
   `CursorLeft` 可转 —— 指针早飞到桌面上了,egui 这边还以为在窗口里。

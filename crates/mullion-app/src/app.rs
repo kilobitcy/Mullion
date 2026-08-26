@@ -7970,6 +7970,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if shell::input_route::egui_should_see_window_event(&event) {
                     let resp = active.egui_state.on_window_event(&active.window, &event);
                     if resp.repaint {
+                        // F171:归因埋在 `resp.repaint` **之内** —— 这张表回答的是
+                        // 「凭什么出帧」,不是「收到了什么」。挪到 if 外面就把
+                        // egui 明确说了「不用重绘」的那几类也算了进来,而
+                        // `wev=` 与 `dirty=` 的可比性正来自两者判据相同。
+                        diag::note_window_event(crate::wev::kind_of(&event));
+                        if let WindowEvent::CursorMoved { position, .. } = &event {
+                            diag::note_cursor_pos(position.x, position.y);
+                        }
                         // 标脏与请求重绘必须成对:只请求不标脏,那帧会被 frame_is_dirty
                         // 判 Idle 丢掉(终端态尤其明显:远端一安静菜单就点不开)。
                         mark_ui_dirty!(self.ui_dirty);
@@ -15741,6 +15749,61 @@ mod tests {
         assert!(
             gate < feed,
             "门控排在了 on_window_event 之后 —— 排在后面等于没门控"
+        );
+    }
+
+    /// **接线守护 / F171**:事件类型归因必须埋在 `resp.repaint` 的**分支体内**。
+    ///
+    /// 挪到 `if` 外面就变成「收到了什么」而不是「凭什么出帧」:egui 明确说了
+    /// `repaint: false` 的那五类(`ActivationTokenDone`/`AxisMotion`/
+    /// `DoubleTapGesture`/`RotationGesture`/`PanGesture`)会一起被算进来,
+    /// `wev=` 与相邻的 `dirty=` 就不再是同一个判据下的两级归因,加起来对不上
+    /// —— 而这两段能相互印证正是它们并排放的全部理由。**日志照写、数字照有,
+    /// 只是指向错的地方**,一整趟实机往返白跑。
+    ///
+    /// 判据用**字节偏移**而不是「包含某串」:后者在埋点被挪到 if 外面时照样绿。
+    /// 同款的先剥 `//` 注释行(恒绿模式⑮)——上面这段注释里就写着标识符。
+    ///
+    /// 自证会变红:把那两句埋点从 `if resp.repaint {` 里挪到它上面一行。
+    #[test]
+    fn the_event_kind_is_attributed_only_when_egui_actually_asked_for_a_repaint() {
+        let src = include_str!("app.rs");
+        let at = src
+            .find("\n    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {")
+            .expect("找不到 window_event 的定义");
+        let after = &src[at + 1..];
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 window_event 的函数结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let branch = code
+            .find("if resp.repaint {")
+            .expect("找不到 resp.repaint 分支");
+        // 分支体的结束:紧跟其后的 `request_redraw()`(标脏/请求重绘那一对)。
+        let branch_end = code[branch..]
+            .find("request_redraw();")
+            .expect("resp.repaint 分支里找不到 request_redraw")
+            + branch;
+        let note = code
+            .find("diag::note_window_event(crate::wev::kind_of(&event));")
+            .expect(
+                "window_event 里没有 F171 的事件类型埋点 —— `wev=` 会恒为 `-`,\
+                 而那与「这窗口一次没触发重绘」在日志里长得一模一样",
+            );
+        let cursor = code
+            .find("diag::note_cursor_pos(position.x, position.y);")
+            .expect("window_event 里没有 F171 的指针坐标去重埋点");
+        assert!(
+            branch < note && note < branch_end,
+            "事件类型埋点不在 resp.repaint 分支体内 —— 归因判据与 dirty= 脱钩"
+        );
+        assert!(
+            branch < cursor && cursor < branch_end,
+            "指针坐标埋点不在 resp.repaint 分支体内"
         );
     }
 

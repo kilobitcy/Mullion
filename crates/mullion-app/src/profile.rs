@@ -228,6 +228,20 @@ pub struct Snapshot {
     pub dirty_sites: Vec<(u32, u64)>,
     /// F157:归因表的 8 个槽位用完之后,落在外面的置脏次数。
     pub dirty_other: u64,
+    /// F171:让 egui 说「要重绘」的窗口事件类型(`wev::kind_of` 的码, 次数)。
+    ///
+    /// `dirty_sites` 只能答到「`app.rs` 的哪一行置了脏」,再往上一级就断了。
+    /// 这一段接着往上答「那一行凭什么响」——实机日志里它每 5 秒响 158 次,
+    /// 而用户根本没碰键鼠。
+    pub wev_kinds: Vec<(u32, u64)>,
+    /// F171:事件类型多于槽位时的溢出。**与「有档没登记」无关**:
+    /// `wev::kind_of` 是不带 `_` 的穷尽 match,加档是编译错误。
+    pub wev_other: u64,
+    /// F171:`CursorMoved` 与上一次**同坐标**的次数。
+    ///
+    /// 与 `wev_kinds` 里的 `cursor:N` 并排读:两者接近说明是坐标恒定的幽灵
+    /// 事件(可按位置掐掉),差得远说明真有东西在动指针 —— 修法完全不同。
+    pub cursor_dup: u64,
     /// F157:这一窗口喂给 egui 的输入事件总数。
     pub egui_events: u64,
     /// F157:其中有多少**帧**带着至少一个事件。
@@ -335,6 +349,9 @@ impl Snapshot {
             rr_evt: 0,
             dirty_sites: Vec::new(),
             dirty_other: 0,
+            wev_kinds: Vec::new(),
+            wev_other: 0,
+            cursor_dup: 0,
             egui_events: 0,
             egui_event_frames: 0,
             rdelay_zero: 0,
@@ -409,6 +426,33 @@ impl Snapshot {
     fn cpu_is_busy(&self) -> bool {
         self.cpu_pct.is_some_and(|p| p >= IDLE_CPU_PCT)
             || self.main_cpu_pct.is_some_and(|p| p >= IDLE_MAIN_CPU_PCT)
+    }
+}
+
+/// F157/F171:把一张 `diag::KeyTable` 的采样渲染成 `键:次数,键:次数,other:N`。
+///
+/// **倒序是重点** —— 空闲时只有一两个键每帧都在响,按键值排的话它们会被一堆
+/// 各来过一次的启动期键埋掉,而恰恰是「每帧都响的那个」才是要找的东西。
+///
+/// **空表报 `-` 而不是空串**:`dirty=`/`wev=` 后面什么都没有 = 埋点根本没接上,
+/// 那和「这窗口确实一次没响」必须在日志里长得不一样。
+///
+/// `label` 负责键→显示名:置脏点直接印行号,窗口事件要翻成短名。
+fn render_key_table(items: &[(u32, u64)], other: u64, label: impl Fn(u32) -> String) -> String {
+    let mut top = items.to_vec();
+    top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    top.truncate(3);
+    let mut parts: Vec<String> = top
+        .iter()
+        .map(|(k, n)| format!("{}:{n}", label(*k)))
+        .collect();
+    if other > 0 {
+        parts.push(format!("other:{other}"));
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(",")
     }
 }
 
@@ -613,23 +657,9 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    // F157:置脏点按次数倒序取前三。倒序是重点——空闲时只有一处每帧都在
-    // 置脏,按行号排的话它会被一堆各来过一次的启动期置脏点埋掉。
-    let mut sites = s.dirty_sites.clone();
-    sites.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    sites.truncate(3);
-    let mut dirty_parts: Vec<String> = sites.iter().map(|(l, n)| format!("{l}:{n}")).collect();
-    if s.dirty_other > 0 {
-        dirty_parts.push(format!("other:{}", s.dirty_other));
-    }
-    // 空表报 `-` 而不是空串:人工验收清单第 3 条专门看这个,`dirty=` 后面
-    // 什么都没有 = 埋点根本没接上,而那和「这窗口确实一次没置脏」必须
-    // 在日志里长得不一样。
-    let dirty_part = if dirty_parts.is_empty() {
-        "-".to_string()
-    } else {
-        dirty_parts.join(",")
-    };
+    let dirty_part = render_key_table(&s.dirty_sites, s.dirty_other, |k| k.to_string());
+    // F171:事件类型码要翻成短名再上日志 —— 光有码得回源码查表,归因就废了。
+    let wev_part = render_key_table(&s.wev_kinds, s.wev_other, crate::wev::name_of);
 
     // GPU 帧耗时:样本数为 0 时报 n/a 而不是 p50=0 —— adapter 不支持
     // TIMESTAMP_QUERY 与「GPU 一帧只用了 0µs」必须在日志里长得不一样。
@@ -654,7 +684,7 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
          reshape=hit:{}/miss:{} fp=hit:{}/miss:{} wake={}x/rr=sched:{},evt:{} dirty={} \
-         egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
+         wev={} curdup={} egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
          conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={}",
         secs,
         s.frames,
@@ -682,6 +712,8 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         s.rr_sched,
         s.rr_evt,
         dirty_part,
+        wev_part,
+        s.cursor_dup,
         s.egui_events,
         s.egui_event_frames,
         s.rdelay_zero,
@@ -1037,6 +1069,9 @@ mod tests {
             rr_evt: 7,
             dirty_sites: vec![(8365, 300), (7191, 2)],
             dirty_other: 5,
+            wev_kinds: vec![(13, 300), (10, 2)],
+            wev_other: 1,
+            cursor_dup: 298,
             egui_events: 9,
             egui_event_frames: 4,
             rdelay_zero: 300,
@@ -1359,6 +1394,59 @@ mod tests {
         assert!(line.contains("dirty=- "), "空归因表没有占位符:{line}");
     }
 
+    /// F171:事件类型必须以**短名**上日志,不是裸码。
+    ///
+    /// 印码的话读日志的人得回 `wev.rs` 查表才知道 13 是什么,而这一段的
+    /// 全部用途就是在实机日志里一眼分出「幽灵指针事件」和「真有人在按键」
+    /// —— 需要查表就等于没有归因。
+    ///
+    /// 自证会变红:把 `render_key_table` 的 `label` 换成 `|k| k.to_string()`。
+    #[test]
+    fn the_window_event_kinds_are_named_not_numbered() {
+        let mut s = busy_snapshot();
+        s.wev_kinds = vec![(
+            crate::wev::kind_of(&winit::event::WindowEvent::CloseRequested),
+            7,
+        )];
+        s.wev_other = 0;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("wev=close:7"), "事件类型没翻成短名:{line}");
+    }
+
+    /// F171:`wev=`/`curdup=` 与 `dirty=` **在同一行相邻**。
+    ///
+    /// 三段是一条因果链的三级(哪行置脏 ← 哪类事件 ← 是不是同一个坐标),
+    /// 拆到不同行去就得跨行对齐时间窗口,实机日志里几百个窗口根本对不动。
+    ///
+    /// 自证会变红:把 `wev={} curdup={}` 挪到 profile.cpu 行。
+    #[test]
+    fn the_event_attribution_sits_next_to_the_dirty_sites() {
+        let line = render_line(&busy_snapshot()).expect("忙窗口该有一行");
+        let dirty = line.find("dirty=").expect("没有 dirty 段");
+        let wev = line.find(" wev=").expect("没有 wev 段");
+        let dup = line.find(" curdup=").expect("没有 curdup 段");
+        assert!(dirty < wev && wev < dup, "三段没挨着排:{line}");
+        assert!(
+            line[dirty..dup].lines().count() == 1,
+            "三段被拆到了不同行:{line}"
+        );
+    }
+
+    /// F171:一次事件都没采到时报 `wev=-`,与 `dirty=-` 同款。
+    ///
+    /// 空串会跟「这窗口确实一次没响」长得一样,而这两者的下一步完全相反:
+    /// 前者要回去查接线,后者说明自激已经被掐掉了。
+    ///
+    /// 自证会变红:把 `render_key_table` 的 `-` 占位改成空串。
+    #[test]
+    fn an_empty_event_table_is_told_apart_from_a_missing_one() {
+        let mut s = busy_snapshot();
+        s.wev_kinds = Vec::new();
+        s.wev_other = 0;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("wev=- "), "空事件表没有占位符:{line}");
+    }
+
     /// F157 的四段**一律不进 `is_idle`**。
     ///
     /// 它们在空闲时恰恰非零(那正是要查的东西),进了判据就等于「空闲的
@@ -1375,6 +1463,9 @@ mod tests {
             rr_evt: 3,
             dirty_sites: vec![(8365, 300)],
             dirty_other: 1,
+            wev_kinds: vec![(13, 300)],
+            wev_other: 1,
+            cursor_dup: 299,
             egui_events: 5,
             egui_event_frames: 2,
             rdelay_zero: 300,
