@@ -62,7 +62,12 @@ fn emit<W: Write>(w: &mut W, full: &str, level: log::Level) {
     }
 }
 
-static SINK: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+/// **`Option` 在锁内**是为了运行期轮转:换文件要在持锁时把旧 writer
+/// `take()` 出来 drop 掉再放新的,`Option` 在锁外就换不了。
+static SINK: OnceLock<Mutex<Option<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+/// 本实例日志文件的路径,轮转时要用。`init` 之后才有。
+static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 /// 运行期够到 logger 的句柄(设置弹窗点「确定」时换档要用)。`init` 之前是空的。
 static LOGGER: OnceLock<&'static FileLogger> = OnceLock::new();
@@ -243,7 +248,6 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        rotate_if_large(p, rotate_bytes_for(app));
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -251,7 +255,10 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
             .ok()
             .map(std::io::BufWriter::new)
     });
-    let _ = SINK.set(file.map(Mutex::new));
+    let _ = SINK.set(Mutex::new(file));
+    if let Some(p) = path.as_ref() {
+        let _ = LOG_FILE.set(p.clone());
+    }
 
     // 泄漏成 `&'static`:`set_logger` 要求 `&'static dyn Log`,而我们还要
     // 留一个句柄给运行期换档。进程一生只泄漏这一个,不是问题。
@@ -291,15 +298,6 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
     }));
 }
 
-/// 超过上限就把旧日志挪到 `.1`(只留一代)。失败静默:轮转不成也要能继续写。
-fn rotate_if_large(p: &Path, limit: u64) {
-    if let Ok(md) = std::fs::metadata(p) {
-        if md.len() > limit {
-            let _ = std::fs::rename(p, p.with_extension("log.1"));
-        }
-    }
-}
-
 /// 关键生命周期事件(info 级,target 固定为 `mullion`)。
 /// 保留这个窄接口是为了让事件循环里的取证打点写起来短,行为等价于 `log::info!`。
 pub fn line(msg: &str) {
@@ -320,9 +318,11 @@ fn write_line_at(msg: &str, level: log::Level) {
         .unwrap_or_default();
     let full = format_line(&ts, std::process::id(), msg);
     let _ = write!(std::io::stderr(), "{full}");
-    if let Some(Some(m)) = SINK.get() {
-        if let Ok(mut f) = m.lock() {
-            emit(&mut *f, &full, level);
+    if let Some(m) = SINK.get() {
+        if let Ok(mut g) = m.lock() {
+            if let Some(w) = g.as_mut() {
+                emit(w, &full, level);
+            }
         }
     }
 }
@@ -342,11 +342,65 @@ pub fn set_levels(app: LevelFilter, deps: LevelFilter) {
 /// 把缓冲里的日志刷到盘上。`diag` 的周期线程每秒调一次 —— 没有它,
 /// info/debug 档下卡死时最后几秒的记录会随进程一起消失。
 pub fn flush_now() {
-    if let Some(Some(m)) = SINK.get() {
-        if let Ok(mut f) = m.lock() {
-            let _ = f.flush();
+    if let Some(m) = SINK.get() {
+        if let Ok(mut g) = m.lock() {
+            if let Some(w) = g.as_mut() {
+                let _ = w.flush();
+            }
         }
     }
+}
+
+/// 这个大小该不该轮转。纯函数,可单测。
+pub fn should_rotate(len: u64, limit: u64) -> bool {
+    len > limit
+}
+
+/// 当前档位对应的轮转上限。`init` 之前按最保守的档算。
+fn current_rotate_bytes() -> u64 {
+    let app = LOGGER
+        .get()
+        .map_or(LevelFilter::Info, |l| filter_from_usize(l.app.load(Ordering::Relaxed)));
+    rotate_bytes_for(app)
+}
+
+/// 日志超限就转一代并重开。**由 `diag` 的看门狗线程每秒调一次**。
+///
+/// 为什么不在 `write_line_at` 里判:那是帧路径(每帧几条 debug 日志),
+/// 一次 `metadata` 系统调用就进了帧预算 —— T3 红线。看门狗线程本来就
+/// 每秒醒一次做 flush,顺带查一次大小是免费的。
+///
+/// 为什么不在启动时判:一实例一文件之后文件名唯一,启动时那个文件永远
+/// 是空的,判据永远不成立,64MB 上限形同虚设。
+pub fn rotate_if_needed() {
+    let Some(path) = LOG_FILE.get() else { return };
+    let Some(m) = SINK.get() else { return };
+    let Ok(mut guard) = m.lock() else { return };
+    if guard.is_none() {
+        return;
+    }
+    let len = std::fs::metadata(path).map_or(0, |md| md.len());
+    if !should_rotate(len, current_rotate_bytes()) {
+        return;
+    }
+    rotate_now(&mut guard, path);
+}
+
+/// 轮转本体:**先关后挪**。
+///
+/// 顺序是全部要点。对一个正开着的文件 rename,句柄会跟着 inode 走 ——
+/// 本进程继续往改名后的 `.log.1` 里写,新建的主文件永远是空的,症状是
+/// 「日志某一刻起停住不动」且完全静默。`take()` 让 `BufWriter` 走 Drop
+/// (flush + close),之后 rename 的是一个没人开着的文件。
+fn rotate_now(guard: &mut Option<std::io::BufWriter<std::fs::File>>, path: &Path) {
+    drop(guard.take());
+    let _ = std::fs::rename(path, path.with_extension("log.1"));
+    *guard = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+        .map(std::io::BufWriter::new);
 }
 
 #[cfg(test)]
@@ -690,6 +744,45 @@ mod tests {
             parse_log_name("mullion-1755000000123-4242.log.1"),
             Some("1755000000123-4242"),
             "轮转出来的 .log.1 必须认得出属于哪个实例,否则它成孤儿"
+        );
+    }
+
+    /// 轮转判据。
+    ///
+    /// 自证会变红:把 `should_rotate` 改成恒 `false`。
+    #[test]
+    fn a_file_past_the_limit_wants_to_rotate() {
+        assert!(!should_rotate(0, 100));
+        assert!(!should_rotate(100, 100), "刚好等于上限不该转");
+        assert!(should_rotate(101, 100));
+    }
+
+    /// 轮转必须**先关后挪**,而不是对开着的文件 rename。
+    ///
+    /// 对一个正在写的文件 rename:句柄跟着 inode 走,本进程会继续往
+    /// 改名后的 `.log.1` 里写,而新建的主文件永远是空的 —— 症状是
+    /// 「日志停在某个时刻不动了」,且完全静默。这正是本切片要修的那个
+    /// 多实例老 bug,不能在轮转里以另一种形式重现。
+    ///
+    /// 这里扎的是**源码结构**:真流程要碰进程唯一的 `SINK` 和真实文件系统,
+    /// 单测里跑不动。
+    ///
+    /// 自证会变红:把 `rotate_now` 里的 `guard.take()` 那行删掉。
+    #[test]
+    fn rotation_closes_the_file_before_renaming_it() {
+        let src = include_str!("logx.rs");
+        let body = src
+            .split("fn rotate_now(")
+            .nth(1)
+            .expect("rotate_now 没了?这条测试的锚点失效了")
+            .split("\n}\n")
+            .next()
+            .expect("rotate_now 的函数体没有闭合?");
+        let close_at = body.find("guard.take()").expect("轮转没有先关文件");
+        let rename_at = body.find("rename").expect("轮转没有 rename");
+        assert!(
+            close_at < rename_at,
+            "先 rename 后关文件 —— 句柄会跟着 inode 走,之后所有日志都写进 .log.1"
         );
     }
 
