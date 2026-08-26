@@ -205,17 +205,25 @@ impl Emulator {
         self.requested_history
     }
 
+    /// F167/F169:实际已滚出的历史行数(profile.load 的 scroll= 分母)。
+    ///
+    /// 与 `history_lines`(配置上限,clamp 后的预算)不是一回事 —— 这里是
+    /// `grid().history_size()`,空 pane 为 0,随输出增长。
+    pub fn scrollback_lines(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
     /// F169:scrollback 当前占用的字节数(按满行估算的上界)。
     ///
     /// 与 `clamp_history` 用同一个 `BYTES_PER_CELL` —— 预算和记账必须
     /// 同源,改常量时两边一起动(守护测试盯着)。
     ///
-    /// 用的是 `grid().history_size()`(alacritty 按需增长的**实际已用**行数),
+    /// 用的是 `scrollback_lines()`(alacritty 按需增长的**实际已用**行数),
     /// 不是 `history_lines()`(配置出来的**上限**)——空 pane 还没滚出任何
     /// 历史行时上限已经非零,拿上限记账会把从没写过东西的 pane 也算出
     /// 一笔内存,那是假账不是实占。
     pub fn scrollback_bytes(&self) -> usize {
-        self.term.grid().history_size() * usize::from(self.cols()) * BYTES_PER_CELL
+        self.scrollback_lines() * usize::from(self.cols()) * BYTES_PER_CELL
     }
 
     /// F17:改回溯行数,**立刻生效**,不必重连。

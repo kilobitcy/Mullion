@@ -1387,7 +1387,7 @@ async fn run_transfer(
     // 覆盖则直接写目标(保住 inode / 权限 / 硬链接 —— 先删再建会全丢)。
     let overwriting = exists && resolved == Some(Conflict::Overwrite);
     let mut done: u64 = 0;
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; crate::profile::XFER_CHUNK as usize];
     match spec.dir {
         Direction::Download => {
             let final_name = dst_local
@@ -8125,6 +8125,7 @@ impl ApplicationHandler<UserEvent> for App {
                     match action {
                         WheelAction::LocalScroll { lines } => {
                             pane.emulator.scroll(Scroll::Delta(lines));
+                            diag::count_scroll();
                         }
                         WheelAction::Report {
                             button,
@@ -8308,6 +8309,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.active_ws_mut().and_then(Workspace::focused_mut)
                             {
                                 pane.emulator.scroll(scroll);
+                                diag::count_scroll();
                             }
                             self.request_ui_redraw();
                             return;
@@ -8411,7 +8413,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // 驱动重绘就是风扇起飞;这里只把「队列在跑」当成脏,重绘频率
                 // 因此由下面那段排期(~5Hz)决定,与事件频率无关。
                 self.pump_transfers();
-                if self.transfer.queue.summary().busy {
+                // F169:存一份 summary 给下面 gauge 段复用,同一帧里不用再问队列
+                // 第二遍——队列状态在这之后到 gauge 段之间不会再变。
+                let xs = self.transfer.queue.summary();
+                if xs.busy {
                     self.transfer.queue.tick(self.start.elapsed().as_secs_f64());
                     mark_ui_dirty!(self.ui_dirty);
                 }
@@ -8480,6 +8485,28 @@ impl ApplicationHandler<UserEvent> for App {
                     self.tabs.len(),
                     self.active_ws().map_or(0, |ws| ws.pane_count()),
                     self.active_ws().map_or(0, |ws| ws.hosts.len()),
+                );
+                // F169:内存记账 gauge。遍历全部标签(不是只有活动 ws):
+                // 后台标签的 scrollback 也占内存。几十个 pane 的整数乘加,帧预算内。
+                let mut scroll_bytes = 0u64;
+                let mut scroll_lines = 0u64;
+                for tab in self.tabs.iter() {
+                    if let Some(t) = tab.content.as_terminal() {
+                        for p in t.ws.panes() {
+                            scroll_bytes += p.emulator.scrollback_bytes() as u64;
+                            scroll_lines += p.emulator.scrollback_lines() as u64;
+                        }
+                    }
+                }
+                let text_bytes = self
+                    .active
+                    .as_ref()
+                    .map_or(0, |a| a.text.bytes_estimate() as u64);
+                diag::set_mem_gauges(scroll_bytes, scroll_lines, text_bytes);
+                diag::set_xfer_gauges(
+                    xs.active as u64,
+                    (xs.up + xs.down) as u64,
+                    xs.bytes_total.saturating_sub(xs.bytes_done),
                 );
                 let dirty = crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty);
                 let action = self.limiter.plan(dirty, now);
@@ -9243,6 +9270,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let lines = self.autoscroll;
                     if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                         pane.emulator.scroll(Scroll::Delta(lines));
+                        diag::count_scroll();
                     }
                     // 滚动改了 display_offset,选区终点要按新视口重新落点,
                     // 否则拖到边缘后画面在滚、选区却停在原地不长。
@@ -18781,6 +18809,54 @@ mod tests {
                 "剖面采集点 `{needle}` 没接进事件循环 —— 剖面里那一列会恒为零"
             );
         }
+    }
+
+    /// F167/F169:埋点接线守护。三处滚动调用点每处都要跟 count_scroll,
+    /// gauge 计算必须遍历 self.tabs(全部标签)而不是 active_ws,内存/传输
+    /// 两组 gauge 各自的接线都要在场。
+    ///
+    /// 自证会变红:
+    /// - 删掉任意一处 `diag::count_scroll();`
+    /// - 把遍历改成 `self.active_ws()`
+    /// - 删掉 `scroll_lines += p.emulator.scrollback_lines() as u64;`
+    ///   (行数 gauge 悄悄退化成恒零,`set_mem_gauges(scroll_bytes` 那条
+    ///   锚串本身抓不住这个盲点)
+    /// - 整段删掉 `diag::set_xfer_gauges(...)`(传输 gauge 悄悄退化成
+    ///   恒零,前面几条锚串都不会发现)
+    ///
+    /// 同 `the_frame_profile_hooks_are_all_wired_into_the_event_loop`:只搜
+    /// `mod tests` 之前的那一段源码 —— 否则这条测试自己断言字符串里的
+    /// `diag::count_scroll();` 也会被数进去,计数恒多算一次。
+    #[test]
+    fn scroll_and_gauge_wiring_is_present_in_source() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面每条断言都会恒真"
+        );
+        assert_eq!(
+            prod.matches("diag::count_scroll();").count(),
+            3,
+            "滚动埋点必须恰好三处(滚轮/翻页/拖拽自滚)"
+        );
+        assert!(prod.contains("diag::set_mem_gauges(scroll_bytes"));
+        assert!(
+            prod.contains("for tab in self.tabs.iter() {"),
+            "内存记账必须遍历全部标签,而不是只看 active_ws"
+        );
+        assert!(
+            prod.contains("scroll_lines += p.emulator.scrollback_lines() as u64;"),
+            "scrollback_lines() 没接线 —— profile.load 的行数 gauge 会恒为零, \
+             `set_mem_gauges(scroll_bytes` 这条锚串抓不住这个盲点"
+        );
+        assert!(
+            prod.contains("diag::set_xfer_gauges(\n                    xs.active as u64,"),
+            "传输 gauge 没接线 —— profile.load 的传输在途/字节数会恒为零"
+        );
     }
 
     /// F155/T2:每 pane 的同步块计数(`take_counts`)必须被汇总并喂给

@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// 桶 23 = [4.2s, ∞)，比看门狗的停滞阈值（3s）还大一档，够用。
 pub const BUCKETS: usize = 24;
 
+/// F169:传输 worker 的读写 chunk 字节数。**在途缓冲记账按它算**
+/// (running × 此值),改这里记账自动跟走。app.rs 的传输 buffer 引用它。
+pub const XFER_CHUNK: u64 = 64 * 1024;
+
 /// 一个样本落进哪个桶。
 ///
 /// 纯函数：桶边界是要被分位数换算反过来用的，两处各写一遍必然漂。

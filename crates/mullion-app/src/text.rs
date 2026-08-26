@@ -210,6 +210,12 @@ pub fn hidden_span_for_row(p: &PaneRender<'_>, row: u16) -> Option<(u16, u16)> {
 /// 没设时仍是这一款。
 pub const DEFAULT_FONT_FAMILY: &str = "Google Sans Code";
 
+/// F169:一个整形完的 Buffer(一行终端文字)的估算驻留字节。
+/// 粗估:一行 ~200 格,每字形的 layout/shaping 结果按几十字节算。
+/// 这是**估算**(spec §5),精度要求是量级正确,守护测试只钉「与 Buffer
+/// 数成正比」这一层。
+pub const BUFFER_EST_BYTES: usize = 4096;
+
 /// glyphon 文字资源 + 每行一个 Buffer。GPU 胶水:无单测。
 pub struct TextLayer {
     font_system: FontSystem,
@@ -332,6 +338,11 @@ impl TextLayer {
             font_px,
             default_fg,
         }
+    }
+
+    /// F169:文字层驻留内存估算 = (缓存 + 池 + 临时槽)的 Buffer 数 × 单价。
+    pub fn bytes_estimate(&self) -> usize {
+        (self.cache.len() + self.pool.len() + self.temp.len()) * BUFFER_EST_BYTES
     }
 
     /// F21:换字体族 / 字号。重算单元格尺寸,**不重建 `TextLayer`**。
