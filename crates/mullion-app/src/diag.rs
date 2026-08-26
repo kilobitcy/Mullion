@@ -581,9 +581,13 @@ pub fn start_watchdog(stall_ms: u64) {
     }
     let _ = ORIGIN.set(Instant::now());
     CLOCK.beat_us.store(0, Ordering::Relaxed);
+    // **必须在这里建**:`start_watchdog` 由 `main` 在主线程上调用,而
+    // `CpuProbe` 要在主线程上取主线程自己的句柄/tid。搬进 watchdog_loop
+    // 里建的话,拿到的是看门狗线程自己(静默错值)。
+    let cpu = crate::sysprobe::CpuProbe::new_on_main_thread();
     let spawned = std::thread::Builder::new()
         .name("mullion-watchdog".into())
-        .spawn(move || watchdog_loop(stall_ms));
+        .spawn(move || watchdog_loop(stall_ms, cpu));
     if let Err(e) = spawned {
         // 看门狗起不来不该拖垮程序,但必须留痕(否则日志里没有它的 WARN 会被误读成「没卡过」)。
         log::warn!(target: "mullion", "看门狗线程启动失败,自诊断降级: {e}");
@@ -593,7 +597,7 @@ pub fn start_watchdog(stall_ms: u64) {
 /// 周期指标行的间隔。既是性能基线,也是「主线程还活着」的心跳。
 const METRICS_EVERY_MS: u64 = 5_000;
 
-fn watchdog_loop(stall_ms: u64) {
+fn watchdog_loop(stall_ms: u64, mut cpu: crate::sysprobe::CpuProbe) {
     let mut reported_ms = 0u64;
     let mut last_metrics = 0u64;
     loop {
@@ -629,7 +633,10 @@ fn watchdog_loop(stall_ms: u64) {
             // 档位。挂在门里的话,error 档下计数器一路累积,而停滞报警行读的
             // 是同一批 static —— 同一个数字在不同档位下含义不同,是排障时
             // 最坏的一类坑。渲染(格式化)才是贵的那步,只有它需要关在门里。
-            let snap = take_snapshot(window_ms);
+            let cpu_sample = cpu.sample(window_ms.saturating_mul(1_000_000));
+            let mut snap = take_snapshot(window_ms);
+            snap.cpu_pct = cpu_sample.map(|c| c.process_pct);
+            snap.main_cpu_pct = cpu_sample.map(|c| c.main_thread_pct);
             if log::log_enabled!(target: "mullion", log::Level::Info) {
                 if let Some(line) = crate::profile::render_line(&snap) {
                     log::info!(target: "mullion", "{line}");

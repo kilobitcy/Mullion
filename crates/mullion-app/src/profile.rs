@@ -243,10 +243,26 @@ pub struct Snapshot {
     pub panes: u64,
     pub hosts: u64,
     pub mem_process_mb: u64,
+    /// F164:整个进程的 CPU 占用,**按核数归一**。`None` = 采不到。
+    pub cpu_pct: Option<u8>,
+    /// F164:主线程的 CPU 占用,**不归一**(一个核跑满 = 100)。
+    ///
+    /// 与 `cpu_pct` 口径不同是有意的:F158 那次的症状是「烧满一个核」,
+    /// 在多核机上归一化之后只有个位数,会淹没在噪声里。
+    pub main_cpu_pct: Option<u8>,
 }
 
 /// 逐阶段计数。长度与 `diag::Stage` 的变体数一致。
 pub type StageCounts = [Counts; crate::diag::STAGE_COUNT];
+
+/// F164:进程 CPU 超过这个百分比(按核数归一)就不算空闲。
+const IDLE_CPU_PCT: u8 = 5;
+
+/// F164:主线程 CPU 超过这个百分比(不归一)就不算空闲。
+///
+/// 比进程阈值高:主线程本来就承担事件循环,偶尔的一次唤醒会打到十几。
+/// 20 以上意味着事件循环在真忙 —— 那正是要抓的。
+const IDLE_MAIN_CPU_PCT: u8 = 20;
 
 impl Snapshot {
     /// 一份全零的快照。
@@ -289,6 +305,8 @@ impl Snapshot {
             panes: 0,
             hosts: 0,
             mem_process_mb: 0,
+            cpu_pct: None,
+            main_cpu_pct: None,
         }
     }
 
@@ -305,6 +323,11 @@ impl Snapshot {
     /// **`sync_timeouts` 不能只靠 `sync_blocks` 兜住**：一个同步块可以在上一个
     /// 窗口进入、这个窗口才超时逃生——那种窗口 `sync_blocks` 为 0 但
     /// `sync_timeouts` 非零，恰恰是最需要落盘的一种（T2 故障正在发生）。
+    ///
+    /// **CPU 是唯一一个例外的状态量**:`tabs`/`mem` 那些空闲时也非零,拿它们
+    /// 判活会让空闲的 mullion 每 5 秒写一次盘。但 CPU 不同 —— 空闲时它本该
+    /// 接近零,非零恰恰说明「看着空闲、实则在烧」(F158),那正是最需要落盘的
+    /// 一种窗口。阈值把两者分开。
     pub fn is_idle(&self) -> bool {
         self.frames == 0
             && self.throttled == 0
@@ -319,7 +342,23 @@ impl Snapshot {
             && self.sftp_ops == 0
             && self.sync_blocks == 0
             && self.sync_timeouts == 0
+            && !self.cpu_is_busy()
     }
+
+    /// F164:CPU 读数说明这一窗口其实在干活。
+    ///
+    /// **`is_some_and` 不是 `is_none_or`**:探针采不到(`None`)时必须算
+    /// 「不忙」。反过来的话,任何一台读不到 CPU 的机器上,空闲的 mullion
+    /// 会每 5 秒写一次盘 —— 正是 `is_idle` 这条判据当初要防的事。
+    fn cpu_is_busy(&self) -> bool {
+        self.cpu_pct.is_some_and(|p| p >= IDLE_CPU_PCT)
+            || self.main_cpu_pct.is_some_and(|p| p >= IDLE_MAIN_CPU_PCT)
+    }
+}
+
+/// 百分比渲染。`None` → `n/a`(不是 0:「采不到」和「真的是 0」是两回事)。
+fn fmt_pct(v: Option<u8>) -> String {
+    v.map_or_else(|| "n/a".to_string(), |p| format!("{p}%"))
 }
 
 /// 把一个窗口渲染成**一行**日志。`None` = 这个窗口空闲，不该写。
@@ -384,7 +423,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
          reshape=hit:{}/miss:{} fp=hit:{}/miss:{} wake={}x/rr=sched:{},evt:{} dirty={} \
          egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
-         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB",
+         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB cpu={}",
         secs,
         s.frames,
         fmt_us(quantile_us(&s.frame_us, 0.5)),
@@ -424,6 +463,10 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         s.panes,
         s.hosts,
         s.mem_process_mb,
+        match (s.cpu_pct, s.main_cpu_pct) {
+            (None, None) => "n/a".to_string(),
+            (a, b) => format!("{}/主线程:{}", fmt_pct(a), fmt_pct(b)),
+        },
     ))
 }
 
@@ -919,6 +962,79 @@ mod tests {
         assert!(
             parked.is_idle(),
             "光有归因数据就被算成了活动 —— 硬盘会永远醒着"
+        );
+    }
+
+    /// **CPU 超阈值必须打破空闲门**。
+    ///
+    /// 这是 F164 存在的理由。F158 那次是「看着空闲、实则烧满一个核」——
+    /// 旧的 `is_idle` 只看帧/字节/按键,那种窗口一行都不写,故障在日志里
+    /// 完全不存在。
+    ///
+    /// 自证会变红:把 `is_idle` 里 CPU 那两条判断删掉。
+    #[test]
+    fn a_window_that_looks_idle_but_burns_cpu_still_gets_written() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        assert!(s.is_idle(), "全零快照该算空闲");
+
+        s.main_cpu_pct = Some(96);
+        assert!(
+            !s.is_idle(),
+            "主线程烧满一个核却仍判空闲 —— 这一行不会写盘,故障在日志里不存在"
+        );
+
+        s.main_cpu_pct = None;
+        s.cpu_pct = Some(40);
+        assert!(!s.is_idle(), "进程 CPU 40% 却仍判空闲");
+    }
+
+    /// **采不到(None)不打破空闲门**。
+    ///
+    /// 探针不可用时如果算作「忙」,空闲的 mullion 会每 5 秒写一次盘 ——
+    /// 正是 `is_idle` 这条判据当初要防的事(笔记本硬盘永远睡不下去)。
+    ///
+    /// 自证会变红:把 `is_some_and` 改成 `is_none_or`。
+    #[test]
+    fn a_cpu_probe_that_reports_nothing_does_not_wake_the_disk() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        s.cpu_pct = None;
+        s.main_cpu_pct = None;
+        assert!(s.is_idle(), "采不到 CPU 被当成了忙");
+    }
+
+    /// 真空闲(CPU 接近 0)照旧不写盘。
+    ///
+    /// 自证会变红:把 `IDLE_CPU_PCT` 改成 0。
+    #[test]
+    fn a_genuinely_idle_window_is_still_skipped() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        s.cpu_pct = Some(0);
+        s.main_cpu_pct = Some(1);
+        assert!(s.is_idle(), "真空闲也写盘了,硬盘睡不下去");
+    }
+
+    /// 渲染行里带 CPU,采不到时是 `n/a` 而不是 0。
+    ///
+    /// 自证会变红:把 `fmt_pct` 的 `None` 分支改成返回 `"0%"`。
+    #[test]
+    fn the_line_shows_cpu_and_says_n_a_when_it_could_not_be_read() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        s.frames = 10;
+        s.cpu_pct = Some(8);
+        s.main_cpu_pct = Some(96);
+        let line = render_line(&s).expect("非空闲窗口该出行");
+        assert!(line.contains("cpu=8%/主线程:96%"), "行里没有 CPU:{line}");
+
+        s.cpu_pct = None;
+        s.main_cpu_pct = None;
+        let line = render_line(&s).expect("非空闲窗口该出行");
+        assert!(
+            line.contains("cpu=n/a"),
+            "采不到时该报 n/a 而不是编一个 0:{line}"
         );
     }
 }
