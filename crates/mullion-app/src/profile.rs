@@ -436,6 +436,91 @@ fn fmt_engines(engines: &[(String, u8)], available: bool) -> String {
         .join("/")
 }
 
+/// F167:remote-output 与「OSC 7 提示符心跳涓流」的分界。
+/// 涓流每提示符几十字节,真刷屏至少 KB/s 级 —— 1 KB/s 在两者之间有两个
+/// 数量级余量。具名常量,好调。
+pub const REMOTE_OUTPUT_BPS: u64 = 1024;
+
+/// F167:这 5 秒程序主要在干什么。单值,优先级命中即停(spec §3)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scene {
+    SftpTransfer,
+    Scrollback,
+    Resize,
+    Typing,
+    RemoteOutput,
+    Connecting,
+    UiOnly,
+    /// 空闲门放行了(这一行会写盘),但七条活动判据一条都没命中 —— 帧数为零
+    /// 却在烧 CPU / 重绘全被节流 / T2 同步块超时之类。**这一档本身就是异常
+    /// 信号**:F158 那次「看着空闲、实则烧满一个核」如果当时有这行日志,
+    /// 一眼就能认出来。
+    Unattributed,
+    /// `scene_of` 是纯函数、对任意输入都要有定义;空闲门拦住的窗口不写盘,
+    /// 所以这一档在**正常日志**里不出现。
+    Idle,
+}
+
+impl Scene {
+    pub fn label(self) -> &'static str {
+        match self {
+            Scene::SftpTransfer => "sftp-transfer",
+            Scene::Scrollback => "scrollback",
+            Scene::Resize => "resize",
+            Scene::Typing => "typing",
+            Scene::RemoteOutput => "remote-output",
+            Scene::Connecting => "connecting",
+            Scene::UiOnly => "ui-only",
+            Scene::Unattributed => "unattributed",
+            Scene::Idle => "idle",
+        }
+    }
+}
+
+/// F167:这 5 秒窗口该归到哪一档,按优先级命中即停,不做多标签。
+///
+/// 优先级顺序不是按发生频率,是按「排障时最想知道的是哪一个」:传输
+/// 和滚动会让终端在这几秒里明显变卡,哪怕同一窗口里还有零星按键,也该
+/// 先说是它们在占用;resize 排在 typing 前面是因为 resize 本身会触发一
+/// 整帧重排,量级远超单纯打字,和 typing 撞在同一窗口时前者才是主因。
+/// remote-output 用速率而不是「有没有入站字节」判定,是为了把 OSC 7
+/// 提示符心跳那种涓流排除在外(见 `REMOTE_OUTPUT_BPS`)。
+pub fn scene_of(s: &Snapshot) -> Scene {
+    if s.xfer_jobs > 0 {
+        return Scene::SftpTransfer;
+    }
+    if s.scroll_events > 0 {
+        return Scene::Scrollback;
+    }
+    if total(&s.stage_us[crate::diag::Stage::Resize as usize]) > 0 {
+        return Scene::Resize;
+    }
+    if s.keys > 0 {
+        return Scene::Typing;
+    }
+    // 速率按毫秒换算,窗口为 0 时当 0 处理(不除零)。
+    let bps = s
+        .inbound_bytes
+        .saturating_mul(1000)
+        .checked_div(s.window_ms)
+        .unwrap_or(0);
+    if bps >= REMOTE_OUTPUT_BPS {
+        return Scene::RemoteOutput;
+    }
+    if s.connects_ok + s.connects_err + s.reconnects > 0 {
+        return Scene::Connecting;
+    }
+    if s.frames > 0 {
+        return Scene::UiOnly;
+    }
+    // 空闲门与这七条判据不是子集关系(is_idle 还看 throttled/sync_*/sftp_ops/
+    // CPU)。写盘了却归不出因,如实说「归不出」,不冒充空闲。
+    if !s.is_idle() {
+        return Scene::Unattributed;
+    }
+    Scene::Idle
+}
+
 /// 把一个窗口渲染成**一行**日志。`None` = 这个窗口空闲，不该写。
 ///
 /// 单行是硬要求：日志按行 grep，一条记录跨行就没法用
@@ -1186,5 +1271,74 @@ mod tests {
         s.gpu_frame_us[bucket_of(2_000)] = 3;
         let line = render_line(&s).expect("非空闲窗口该出行");
         assert!(line.contains("gpu_us=3x/"), "采到了却没报:{line}");
+    }
+
+    /// 一条样本的直方图(桶 0 计 1)。场景判据只看 total>0,落哪个桶无关。
+    fn one_sample() -> Counts {
+        let mut c = [0u64; BUCKETS];
+        c[0] = 1;
+        c
+    }
+
+    /// F167:场景优先级。并发时取优先级最高的单值;涓流不算 remote-output。
+    ///
+    /// 自证会变红:把 scene_of 里 sftp 与 scrollback 两个 if 对调,或把
+    /// `>= REMOTE_OUTPUT_BPS` 改成 `>`(边界值那条会抓住)。
+    #[test]
+    fn scene_priority_and_the_trickle_threshold() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5000;
+        assert_eq!(scene_of(&s), Scene::Idle);
+        s.frames = 10;
+        assert_eq!(scene_of(&s), Scene::UiOnly);
+        s.connects_ok = 1;
+        assert_eq!(scene_of(&s), Scene::Connecting);
+        // 阈值两侧:5 秒窗口,1024 B/s 阈值 → 5120 字节是分界。
+        s.inbound_bytes = 5119;
+        assert_eq!(scene_of(&s), Scene::Connecting, "涓流不算远端刷屏");
+        s.inbound_bytes = 5120;
+        assert_eq!(scene_of(&s), Scene::RemoteOutput);
+        s.keys = 1;
+        assert_eq!(scene_of(&s), Scene::Typing);
+        s.stage_us[crate::diag::Stage::Resize as usize] = one_sample();
+        assert_eq!(scene_of(&s), Scene::Resize);
+        s.scroll_events = 1;
+        assert_eq!(scene_of(&s), Scene::Scrollback);
+        s.xfer_jobs = 1;
+        assert_eq!(
+            scene_of(&s),
+            Scene::SftpTransfer,
+            "传输+打字+滚动并发时传输最优先"
+        );
+    }
+
+    /// F167/F158:写盘了却归不出因 ≠ 空闲。
+    ///
+    /// 判据集合对不齐是这里唯一的坑:`is_idle()` 有 14 条判据,活动判据只有
+    /// 七条,差集里的窗口(烧 CPU / 全被节流 / 同步块超时)必须落进
+    /// `Unattributed`,而不是被冒充成 `Idle`。
+    ///
+    /// 自证会变红:把 `scene_of` 结尾的 `if !s.is_idle()` 那段删掉。
+    #[test]
+    fn a_window_that_burns_cpu_without_frames_is_not_called_idle() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5000;
+        s.main_cpu_pct = Some(96);
+        assert!(!s.is_idle(), "前提:这一行会写盘");
+        assert_eq!(scene_of(&s), Scene::Unattributed);
+        // 同族:重绘全被帧闸挡下、T2 同步块超时,都归不出因但都得写盘。
+        let mut t = Snapshot::empty();
+        t.window_ms = 5000;
+        t.throttled = 7;
+        assert_eq!(scene_of(&t), Scene::Unattributed);
+        let mut u = Snapshot::empty();
+        u.window_ms = 5000;
+        u.sync_timeouts = 1;
+        assert_eq!(scene_of(&u), Scene::Unattributed);
+        // 真空闲仍是 Idle(纯函数对任意输入有定义)。
+        let mut z = Snapshot::empty();
+        z.window_ms = 5000;
+        assert!(z.is_idle());
+        assert_eq!(scene_of(&z), Scene::Idle);
     }
 }
