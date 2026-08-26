@@ -45,16 +45,28 @@ v0.1.71 的 profile 行已经记了 `cpu=` / `mem=` / `gpu=` / `vram=` / `gpu_us
 ```
 profile      5.0s frame=120x/p50=1.2ms/p95=4.5ms present=118 skip=2 fp=hit:80/miss:40 …
 profile.load scene=sftp-transfer tabs=2 panes=5 hosts=3 scroll=12.4k行 xfer=2个/48MB剩 key=0x in=1.2MB/s
-profile.cpu  total=68% main=14% | tokio:31% render:14% watchdog:0% 其他:9%
+profile.cpu  total=68% main=14% | tokio:31% watchdog:0% 其他:9%
 profile.mem  340MB = scroll:128 xfer:24 text:16 其他:172
-profile.gpu  util=3D:22%,Copy:3% vram=210/8192MB frame=42x/p50=1.2ms | term:0.8ms egui:0.4ms
+profile.gpu  util=3D:22%,Copy:3% vram=210/8192MB frame=42x/p50=1.2ms/p95=3.4ms | term:0.8ms egui:0.4ms
 ```
+
+（`profile.cpu` 的示例组名以 §4 的分组表为准——不存在 `render` 组，
+渲染跑在主线程上，归 `main`。`frame=` 保留 F165 已有的 p50/p95 两个分位，
+迁移不降精度。）
 
 **规则**：
 
 - `grep "profile\."` 捞全组，`grep "profile.mem"` 只看内存
-- **空闲门不变**：`is_idle()` 为真时整组一行都不写（F157/F164 的判据原样沿用）
+- **每行是一条独立的日志记录**：各自带 `[时间] [pid]` 前缀（F166 的"每行带 pid"
+  不许破坏），**禁止**一条记录嵌 `\n`——嵌了的话，续行没有时间戳和 pid，
+  grep 出来对不上号。`render_line` 现有 doc 注释里"单行是硬要求"要连着改写成
+  "每条记录单行"，理由不变
+- **空闲门不变**：`is_idle()` 为真时整组一行都不写（F157/F164 的判据原样沿用，
+  含 CPU 超阈值破空闲门）
 - 概览行 `profile` 保留现有全部段，只把 `mem=/cpu=/gpu=/vram=/gpu_us=` 五段**移出**到各自的行
+- `profile.load` 的 `scroll=`（回溯总行数）**不是**计数器：它来自 F169 内存记账
+  同一次遍历的 `history_lines` 汇总（gauge），与场景判据用的 `scroll_events`
+  （事件计数）是两个东西，别混
 - 接口：`render_line(&Snapshot) -> Option<String>` 改为 `render_lines(&Snapshot) -> Vec<String>`，
   空闲返回空 `Vec`
 
@@ -69,12 +81,17 @@ profile.gpu  util=3D:22%,Copy:3% vram=210/8192MB frame=42x/p50=1.2ms | term:0.8m
 |---|---|---|---|
 | 1 | `sftp-transfer` | 传输队列非空 | **新增** `xfer_jobs` |
 | 2 | `scrollback` | 本窗口有滚动事件 | **新增** `scroll_events` |
-| 3 | `reshape` | 本窗口有 resize | 已有：`total(&stage_us[Stage::Resize]) > 0` |
+| 3 | `resize` | 本窗口有窗口 resize | 已有：`total(&stage_us[Stage::Resize]) > 0` |
 | 4 | `typing` | `keys > 0` | 已有 |
 | 5 | `remote-output` | 入站速率 ≥ `REMOTE_OUTPUT_BPS` | 已有：`inbound_bytes / 窗口秒数` |
 | 6 | `connecting` | `connects_ok + connects_err + reconnects > 0` | 已有 |
 | 7 | `ui-only` | `frames > 0`，其余皆零（动画/hover） | 已有 |
 | 8 | `idle` | 都为零 | — |
+
+**场景名是 `resize` 不是 `reshape`**（复核时改的）：`reshape` 在概览行里已经被
+F12 的整形缓存 `reshape=hit/miss` 占用，同组日志一词两义，grep 会把两者混出来。
+且已核实 `Stage::Resize` 只在窗口 resize 处打点（`app.rs` 唯一调用点），
+语义就是窗口 resize——分屏拖分界线**不**触发这一档，它走 `ui-only`。
 
 **需要两个新计数器**（`scroll_events`、`xfer_jobs` + `xfer_bytes_left`）。
 这两个本来就得加——`profile.load` 那行的分母 `xfer=2个/48MB剩` 就是它们。
@@ -123,7 +140,13 @@ CPU% 的算法**复用 F164 已有的 `cpu_pct(delta_ns, window_ns, cores)`**，
 | `mullion-watchdog` | `watchdog` |
 | `mullion-file-dialog` | `dialog` |
 | `mullion-dragout`（F59 的 STA 线程） | `dragout` |
+| 空名（没设过名的线程） | `其他`，Debug 档 unmapped 清单里以 `unnamed` 显示 |
 | 其余 | `其他` |
+
+空名那行不是假设：Windows 上 `GetThreadDescription` 对没调过
+`SetThreadDescription` 的线程（驱动、DXGI、PDH 内部线程）返回**空串**；
+不定义去向的话，Debug 档 unmapped 清单里会出现 `:2.1%` 这种没头的怪行。
+（Linux 的 `comm` 总有值，不受影响。）
 
 **防列举式漏项**（本项目踩过三次的模式）：未匹配的线程名在 **Debug 档原样列出**，
 形如 `profile.cpu.unmapped wgpu-poll:2.1% dxgi-worker:0.3%`。漏了哪一类，
@@ -208,10 +231,19 @@ query set 从 2 槽扩到 3 槽：
 
 | TIMESTAMP_QUERY | INSIDE_PASSES | 输出 |
 |---|---|---|
-| 有 | 有 | `frame=42x/p50=1.2ms | term:0.8ms egui:0.4ms` |
-| 有 | 无 | `frame=42x/p50=1.2ms | 分层:n/a` |
-| 无 | 有 | `frame=n/a`（INSIDE_PASSES 单独没用，不申请） |
+| 有 | 有 | `frame=42x/p50=1.2ms/p95=3.4ms \| term:0.8ms egui:0.4ms` |
+| 有 | 无 | `frame=42x/p50=1.2ms/p95=3.4ms \| 分层:n/a` |
+| 无 | 有 | `frame=n/a`（防御性定义，见下） |
 | 无 | 无 | `frame=n/a` |
+
+第三行按 wgpu 合约**不会真实出现**：wgpu-types 23.0.0 的文档写明
+`TIMESTAMP_QUERY_INSIDE_PASSES` "Implies `Features::TIMESTAMP_QUERY` …
+is supported"（`lib.rs:532`）。矩阵仍给它定义（纯函数要对任意输入有定义，
+且这是 wgpu 的合约不是我们的），但申请逻辑可以据此写成：
+**仅当 adapter 同时报告两者时才申请 INSIDE_PASSES**，单独出现按"都不支持"处理。
+
+连带改动别漏：query set 2 槽 → 3 槽时，`resolve` / `staging` 两个 buffer
+从 16 字节扩到 24 字节（3 × 8），解算端按 3 个 u64 读。
 
 GPU 分层归**便宜类，Info 常开**：`write_timestamp` 是录进 command buffer 的 GPU 侧命令，
 不是系统调用，微秒级。
@@ -249,9 +281,9 @@ GPU 分层归**便宜类，Info 常开**：`write_timestamp` 是录进 command b
 | 测什么 | 怎么测 |
 |---|---|
 | `scene_of` 优先级 | 每个 scene 一条；**并发输入取哪个**（传输+打字同时 → `sftp-transfer`）；`REMOTE_OUTPUT_BPS` 的两侧各一条（涓流不算 `remote-output`） |
-| 线程分组 | 前缀匹配；未匹配进"其他"；**防前缀串号** |
+| 线程分组 | 前缀匹配；未匹配进"其他"；**防前缀串号**；**空名进"其他"且 Debug 清单显示 `unnamed`** |
 | 内存余量 | 正常；**余量为负报超出量而不是负数**；各块为 0 |
-| 多行渲染 | 空闲时**零行**；每行前缀正确；五段确实从概览行移走了 |
+| 多行渲染 | 空闲时**零行**；每行前缀正确；五段确实从概览行移走了；**任何一行都不含 `\n`**（多行 = 多条独立记录的纯函数侧守护） |
 | GPU 降级矩阵 | 四种 feature 组合各一条 |
 | `scrollback_bytes` | 与 `clamp_history` 的预算模型**同源**（改了 `BYTES_PER_CELL` 两边一起动） |
 
