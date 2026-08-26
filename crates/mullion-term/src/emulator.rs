@@ -205,6 +205,19 @@ impl Emulator {
         self.requested_history
     }
 
+    /// F169:scrollback 当前占用的字节数(按满行估算的上界)。
+    ///
+    /// 与 `clamp_history` 用同一个 `BYTES_PER_CELL` —— 预算和记账必须
+    /// 同源,改常量时两边一起动(守护测试盯着)。
+    ///
+    /// 用的是 `grid().history_size()`(alacritty 按需增长的**实际已用**行数),
+    /// 不是 `history_lines()`(配置出来的**上限**)——空 pane 还没滚出任何
+    /// 历史行时上限已经非零,拿上限记账会把从没写过东西的 pane 也算出
+    /// 一笔内存,那是假账不是实占。
+    pub fn scrollback_bytes(&self) -> usize {
+        self.term.grid().history_size() * usize::from(self.cols()) * BYTES_PER_CELL
+    }
+
     /// F17:改回溯行数,**立刻生效**,不必重连。
     ///
     /// 传的是用户诉求值,内部按当前列数夹紧。往小调时 alacritty 的
@@ -1232,6 +1245,27 @@ mod tests {
             "L0",
             "一千万行的诉求被原样放行了 —— 构造时没夹"
         );
+    }
+
+    /// F169:记账与预算必须同一个模型。
+    ///
+    /// 自证会变红:把 `scrollback_bytes` 里的 `BYTES_PER_CELL` 换成常量 `16`,
+    /// 或把 `cols()` 换成写死的 `80`。
+    #[test]
+    fn scrollback_bytes_shares_the_budget_model_with_clamp_history() {
+        let mut emu = Emulator::with_history(10, 2, 3);
+        for i in 0..10 {
+            emu.feed(format!("L{i}\r\n").as_bytes());
+        }
+        let lines = emu.history_lines();
+        assert!(lines > 0, "喂了 10 行,历史不该是空的");
+        assert_eq!(
+            emu.scrollback_bytes(),
+            lines * usize::from(emu.cols()) * BYTES_PER_CELL
+        );
+        // 空历史 = 0 字节,不是「每行保底」——空 pane 不该被记账。
+        let fresh = Emulator::with_history(10, 2, 3);
+        assert_eq!(fresh.scrollback_bytes(), 0);
     }
 
     /// **夹紧最容易失效的那条路径**:pane 是按 `Emulator::new(80, 24)` 的
