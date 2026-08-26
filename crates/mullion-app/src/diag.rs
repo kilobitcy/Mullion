@@ -644,12 +644,15 @@ pub fn start_watchdog(stall_ms: u64) {
     CLOCK.beat_us.store(0, Ordering::Relaxed);
     // **必须在这里建**:`start_watchdog` 由 `main` 在主线程上调用,而
     // `CpuProbe` 要在主线程上取主线程自己的句柄/tid。搬进 watchdog_loop
-    // 里建的话,拿到的是看门狗线程自己(静默错值)。
+    // 里建的话,拿到的是看门狗线程自己(静默错值)。`ThreadCpuProbe` 的
+    // `main_tid` 同理:搬进去的话排除的是看门狗自己、主线程反而被算进
+    // 「其他线程」的清单里,语义正好反了。
     let cpu = crate::sysprobe::CpuProbe::new_on_main_thread();
     let gpu = crate::sysprobe::GpuProbe::new();
+    let threads = crate::sysprobe::ThreadCpuProbe::new(crate::sysprobe::current_tid());
     let spawned = std::thread::Builder::new()
         .name("mullion-watchdog".into())
-        .spawn(move || watchdog_loop(stall_ms, cpu, gpu));
+        .spawn(move || watchdog_loop(stall_ms, cpu, gpu, threads));
     if let Err(e) = spawned {
         // 看门狗起不来不该拖垮程序,但必须留痕(否则日志里没有它的 WARN 会被误读成「没卡过」)。
         log::warn!(target: "mullion", "看门狗线程启动失败,自诊断降级: {e}");
@@ -663,6 +666,7 @@ fn watchdog_loop(
     stall_ms: u64,
     mut cpu: crate::sysprobe::CpuProbe,
     mut gpu: crate::sysprobe::GpuProbe,
+    mut threads: crate::sysprobe::ThreadCpuProbe,
 ) {
     let mut reported_ms = 0u64;
     let mut last_metrics = 0u64;
@@ -706,6 +710,22 @@ fn watchdog_loop(
             if let Some(g) = gpu.sample() {
                 snap.gpu_available = true;
                 snap.gpu_engines = g.engines;
+            }
+            match threads.sample() {
+                Some(list) => {
+                    snap.thread_available = true;
+                    let window_ns = window_ms.saturating_mul(1_000_000);
+                    let pcts: Vec<(String, u32)> = list
+                        .into_iter()
+                        .filter_map(|(name, delta)| {
+                            crate::profile::thread_group_pct(delta, window_ns).map(|p| (name, p))
+                        })
+                        .collect();
+                    let g = crate::profile::group_threads(&pcts);
+                    snap.thread_groups = g.groups;
+                    snap.thread_unmapped = g.unmapped;
+                }
+                None => snap.thread_available = false,
             }
             if log::log_enabled!(target: "mullion", log::Level::Info) {
                 if let Some(line) = crate::profile::render_line(&snap) {

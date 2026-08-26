@@ -202,6 +202,27 @@ fn read_cpu_ns(_p: &CpuProbe) -> Option<(u64, u64)> {
     None
 }
 
+/// 调用者自己的 tid。**必须在主线程上调**才能拿到主线程的
+/// (同 T12 的教训:谁调谁的语义)。给 [`ThreadCpuProbe::new`] 喂 main_tid 用。
+///
+/// 其他平台返回 `0`:那两个平台上 [`ThreadCpuProbe::sample`] 本来就恒
+/// 返回 `None`,`main_tid` 传什么都不影响任何行为。
+pub(crate) fn current_tid() -> u32 {
+    #[cfg(windows)]
+    {
+        // SAFETY: 无参数,返回调用者自己的 tid。
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_current_tid()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        0
+    }
+}
+
 /// F168:每线程 CPU 时间探针。有状态(差分),看门狗线程持有。
 ///
 /// 固有缺陷(如实写在这,别试图修):
