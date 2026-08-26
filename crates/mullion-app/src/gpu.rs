@@ -355,16 +355,23 @@ pub struct GpuTimer {
     period_ns: f32,
     /// 上一次采样还没回来。
     busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// F170:adapter 是否拿到了 `TIMESTAMP_QUERY_INSIDE_PASSES`。true 时槽位
+    /// 是 3(开始/终端趟完/pass 完),可以拆出 term/egui 分层;false 时退化回
+    /// F165 的 2 槽整帧耗时。
+    split: bool,
+    /// 查询集槽数:`split` 时 3,否则 2。
+    slots: u32,
 }
 
 impl GpuTimer {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, split: bool) -> Self {
+        let slots = if split { 3 } else { 2 };
         let set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("frame-timestamps"),
             ty: wgpu::QueryType::Timestamp,
-            count: 2,
+            count: slots,
         });
-        let size = 2 * std::mem::size_of::<u64>() as wgpu::BufferAddress;
+        let size = slots as u64 * std::mem::size_of::<u64>() as wgpu::BufferAddress;
         Self {
             set,
             resolve: device.create_buffer(&wgpu::BufferDescriptor {
@@ -381,6 +388,8 @@ impl GpuTimer {
             })),
             period_ns: queue.get_timestamp_period(),
             busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            split,
+            slots,
         }
     }
 
@@ -392,13 +401,21 @@ impl GpuTimer {
         Some(wgpu::RenderPassTimestampWrites {
             query_set: &self.set,
             beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: Some(1),
+            end_of_pass_write_index: Some(if self.split { 2 } else { 1 }),
         })
+    }
+
+    /// F170:终端趟结束的分界点。**必须在 `forget_lifetime` 之前**调
+    /// (之后原 pass 就没了);只在本帧真的挂了时间戳且支持分层时调。
+    pub fn mid_mark(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.split {
+            pass.write_timestamp(&self.set, 1);
+        }
     }
 
     /// 在 `submit` **之前**录进 encoder。只在本帧真的挂了时间戳时调。
     pub fn resolve(&self, enc: &mut wgpu::CommandEncoder) {
-        enc.resolve_query_set(&self.set, 0..2, &self.resolve, 0);
+        enc.resolve_query_set(&self.set, 0..self.slots, &self.resolve, 0);
         enc.copy_buffer_to_buffer(&self.resolve, 0, &self.staging, 0, self.staging.size());
     }
 
@@ -412,17 +429,33 @@ impl GpuTimer {
         let busy = self.busy.clone();
         let staging = self.staging.clone();
         let period = self.period_ns;
+        let split = self.split;
         self.staging
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |res| {
                 if res.is_ok() {
                     let view = staging.slice(..).get_mapped_range();
-                    let a = u64::from_le_bytes(view[0..8].try_into().unwrap_or_default());
-                    let b = u64::from_le_bytes(view[8..16].try_into().unwrap_or_default());
-                    drop(view);
-                    let ticks = b.saturating_sub(a);
-                    let us = (ticks as f64 * period as f64 / 1000.0) as u64;
-                    crate::diag::record_gpu_frame_us(us);
+                    let read_u64 = |i: usize| {
+                        u64::from_le_bytes(view[i * 8..i * 8 + 8].try_into().unwrap_or_default())
+                    };
+                    let to_us = |ticks: u64| (ticks as f64 * period as f64 / 1000.0) as u64;
+                    // split:t0=开始 t1=终端趟完 t2=pass 完;否则 t0/t1 首尾。
+                    if split {
+                        let t0 = read_u64(0);
+                        let t1 = read_u64(1);
+                        let t2 = read_u64(2);
+                        drop(view);
+                        crate::diag::record_gpu_frame_us(to_us(t2.saturating_sub(t0)));
+                        crate::diag::record_gpu_split_us(
+                            to_us(t1.saturating_sub(t0)),
+                            to_us(t2.saturating_sub(t1)),
+                        );
+                    } else {
+                        let a = read_u64(0);
+                        let b = read_u64(1);
+                        drop(view);
+                        crate::diag::record_gpu_frame_us(to_us(b.saturating_sub(a)));
+                    }
                 }
                 staging.unmap();
                 busy.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -469,13 +502,25 @@ impl Gpu {
         // 不支持的 feature,`request_device` 会直接失败 —— 那等于为了一个
         // 诊断指标让整个程序在老驱动上起不来。不支持就整块降级成 n/a。
         let has_ts = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        // F170:INSIDE_PASSES 按 wgpu 合约蕴含 TIMESTAMP_QUERY;两者都在才申请,
+        // 单独出现按都不支持处理(设计文档 §6 降级矩阵第三行,防御性)。
+        let has_split = has_ts
+            && adapter
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
         if !has_ts {
             log::info!(target: "mullion", "adapter 不支持 TIMESTAMP_QUERY,GPU 帧耗时降级为 n/a");
+        } else if !has_split {
+            log::info!(target: "mullion", "adapter 不支持 INSIDE_PASSES,GPU 分层降级为 n/a");
         }
+        crate::diag::set_gpu_split_supported(has_split);
         let (device, queue) = handle
             .block_on(adapter.request_device(
                 &wgpu::DeviceDescriptor {
-                    required_features: if has_ts {
+                    required_features: if has_split {
+                        wgpu::Features::TIMESTAMP_QUERY
+                            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                    } else if has_ts {
                         wgpu::Features::TIMESTAMP_QUERY
                     } else {
                         wgpu::Features::empty()
@@ -493,7 +538,7 @@ impl Gpu {
         device.set_device_lost_callback(|reason, msg| {
             log::error!(target: "mullion", "wgpu 设备丢失({reason:?}): {msg}");
         });
-        let gpu_timer = has_ts.then(|| GpuTimer::new(&device, &queue));
+        let gpu_timer = has_ts.then(|| GpuTimer::new(&device, &queue, has_split));
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps

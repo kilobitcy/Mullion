@@ -11048,6 +11048,14 @@ fn render_frame(
                 log::warn!(target: "mullion", "glyphon render 失败,跳过本帧文字层: {e:?}");
             }
         }
+        // F170:终端趟/egui 趟的分界时间戳。必须在 forget_lifetime 之前;放在
+        // terminal_draw 判空块之外——launcher 态(没有终端可画)那些帧也要打
+        // 这个分界点,否则那些帧的 t1 是垃圾值(残留的上一次采样)。
+        if sampling {
+            if let Some(t) = a.gpu.gpu_timer.as_ref() {
+                t.mid_mark(&mut pass);
+            }
+        }
         // egui 需要 `&mut RenderPass<'static>`。单 pass 方案:终端趟先在 `pass` 上
         // 录完命令,再 `forget_lifetime` 转 'static 给 egui——forget_lifetime 消费
         // `pass` 自身,之后不能再用原 `pass`,故终端趟必须写在它之前(两趟画进
@@ -19349,6 +19357,41 @@ mod tests {
             head.contains("full_output.textures_delta.set.is_empty()")
                 && head.contains("full_output.textures_delta.free.is_empty()"),
             "deltas_empty 没有同时看 set 和 free 两侧:{head}"
+        );
+    }
+
+    /// F170:`mid_mark` 必须夹在终端趟之后、`forget_lifetime` 之前 —— 放错
+    /// 位置分层就成了「全帧/0」,数字看着还挺合理,只有源码顺序能守。
+    ///
+    /// 同 `the_frame_profile_hooks_are_all_wired_into_the_event_loop`:只搜
+    /// `mod tests` 之前的那一段源码,否则 needle 会命中这条测试自己
+    /// (`"t.mid_mark(&mut pass);"` 这个字面串就写在这条测试里)。
+    ///
+    /// 自证会变红:把 `t.mid_mark(&mut pass);` 那段挪到 `forget_lifetime`
+    /// 之后。
+    #[test]
+    fn the_gpu_mid_mark_sits_between_terminal_and_egui() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面每条断言都会恒真"
+        );
+        let mid = prod
+            .find("t.mid_mark(&mut pass);")
+            .expect("mid_mark 调用点没找到");
+        let forget = prod
+            .find("let mut static_pass = pass.forget_lifetime();")
+            .expect("forget_lifetime 调用点没找到");
+        let term_draw = prod
+            .find("a.text.render(&mut pass)")
+            .expect("终端文字趟调用点没找到");
+        assert!(
+            term_draw < mid && mid < forget,
+            "顺序要求:终端趟 < mid_mark < forget_lifetime,实际 term_draw={term_draw} mid={mid} forget={forget}"
         );
     }
 }
