@@ -32,6 +32,7 @@ pub mod session_pump;
 pub mod shaped_cache;
 pub mod shell;
 pub mod shell_bootstrap;
+pub mod sysprobe;
 pub mod text;
 pub mod theme;
 pub mod tunnels;
