@@ -259,6 +259,10 @@ GPU 分层归**便宜类，Info 常开**：`write_timestamp` 是录进 command b
 | 传输队列逐 job 缓冲 | `profile.mem.xfer` | 队列深时行会很长 |
 | 记账与 RSS 的差额详情 | `profile.mem.delta` | 排查记账模型用 |
 
+> **`profile.mem.panes` / `profile.mem.xfer` 逐项明细：Task 10（`render_lines` 多行改造）本轮未接。**
+> 数据层只到总量 gauge（`mem_scroll_bytes`/`xfer_running` 等），没有 per-pane / per-job 明细，
+> 加它需要先给对应结构补逐项快照，超出本轮渲染改造的范围，延后。
+
 ## 8. 架构落点与不变量
 
 | 文件 | 加什么 | 可测性 |

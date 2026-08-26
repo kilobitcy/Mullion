@@ -566,13 +566,21 @@ pub fn scene_of(s: &Snapshot) -> Scene {
     Scene::Idle
 }
 
-/// 把一个窗口渲染成**一行**日志。`None` = 这个窗口空闲，不该写。
+/// 把一个窗口渲染成**一组行**日志：`profile` 概览 + `profile.load`/`cpu`/`mem`/
+/// `gpu` 各一行（`debug=true` 时再加 `profile.cpu.unmapped`/`profile.mem.delta`）。
+/// 空 `Vec` = 这个窗口空闲，不该写。
 ///
-/// 单行是硬要求：日志按行 grep，一条记录跨行就没法用
-/// `grep profile mullion.log` 拉出时间序列。
-pub fn render_line(s: &Snapshot) -> Option<String> {
+/// **每条记录单行**是硬要求（原「单行是硬要求」的措辞已改写，理由不变）：
+/// 日志按行 grep，一条记录跨行就没法用 `grep profile mullion.log` 拉出时间序列。
+/// 多行本身不违反这条——**每一行都是独立的一条记录**，各自带 `[时间][pid]`
+/// 前缀（F166）。拆成多行是因为单行已经 500+ 字符、人眼扫不动（用户拍板，
+/// 设计文档 §1）：概览行留给帧循环侧的全部段，资源侧的
+/// `mem=/cpu=/gpu=/vram=/gpu_us=` 五段移到各自的 `profile.cpu`/`profile.mem`/
+/// `profile.gpu` 行，`profile.load` 补上场景标签与分母
+/// （tabs/panes/hosts/scroll/xfer/key/in）。
+pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
     if s.is_idle() {
-        return None;
+        return Vec::new();
     }
     let secs = (s.window_ms as f64 / 1000.0).max(0.001);
     let bps = s.inbound_bytes as f64 / secs;
@@ -625,7 +633,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
 
     // GPU 帧耗时:样本数为 0 时报 n/a 而不是 p50=0 —— adapter 不支持
     // TIMESTAMP_QUERY 与「GPU 一帧只用了 0µs」必须在日志里长得不一样。
-    let gpu_us_part = {
+    let gpu_frame_part = {
         let n = total(&s.gpu_frame_us);
         if n == 0 {
             "n/a".to_string()
@@ -638,12 +646,16 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         }
     };
 
-    Some(format!(
+    let mut lines = Vec::new();
+
+    // 概览行:留给帧循环侧的全部段。`mem=/cpu=/gpu=/vram=/gpu_us=` 五段
+    // 移到各自的 profile.cpu/mem/gpu 行,tabs/panes/hosts 按 spec 规则保留。
+    lines.push(format!(
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
          reshape=hit:{}/miss:{} fp=hit:{}/miss:{} wake={}x/rr=sched:{},evt:{} dirty={} \
          egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
-         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB cpu={} gpu={} vram={} gpu_us={}",
+         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={}",
         secs,
         s.frames,
         fmt_us(quantile_us(&s.frame_us, 0.5)),
@@ -682,16 +694,113 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         s.tabs,
         s.panes,
         s.hosts,
-        s.mem_process_mb,
-        match (s.cpu_pct, s.main_cpu_pct) {
-            (None, None) => "n/a".to_string(),
-            (a, b) => format!("{}/主线程:{}", fmt_pct(a), fmt_pct(b)),
-        },
+    ));
+
+    // load 行:场景标签 + 分母。`scroll=` 来自 F169 记账同一次遍历的行数
+    // 汇总(gauge),与场景判据用的 `scroll_events`(事件计数)不是一回事。
+    // 同理,这里的 `xfer=` 是**队列还剩多少没传**,而 mem 行里的 `xfer:`
+    // 是**在途缓冲占了多少内存** —— 相邻两行同一个词,两个量,别看串。
+    let scroll_disp = if s.scroll_lines >= 1000 {
+        format!("{:.1}k行", s.scroll_lines as f64 / 1000.0)
+    } else {
+        format!("{}行", s.scroll_lines)
+    };
+    lines.push(format!(
+        "profile.load scene={} tabs={} panes={} hosts={} scroll={} xfer={}个/{}MB剩 key={}x in={}",
+        scene_of(s).label(),
+        s.tabs,
+        s.panes,
+        s.hosts,
+        scroll_disp,
+        s.xfer_jobs,
+        s.xfer_bytes_left >> 20,
+        s.keys,
+        rate,
+    ));
+
+    // cpu 行:线程枚举采不到(`thread_available == false`)必须报 n/a,
+    // 不能把各组渲染成 0 —— 那会把「没采到」读成「确实没占用」。
+    let groups = if !s.thread_available {
+        "n/a".to_string()
+    } else {
+        s.thread_groups
+            .iter()
+            .map(|(n, p)| format!("{n}:{p}%"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    lines.push(format!(
+        "profile.cpu total={} main={} | {}",
+        fmt_pct(s.cpu_pct),
+        fmt_pct(s.main_cpu_pct),
+        groups
+    ));
+
+    // mem 行:RSS == 0 是采样失败被揉成 0(既有债,见 diag.rs),一个跑着的
+    // 进程 RSS 不可能真的是 0 —— 挡在渲染层,不许编成 `0MB = … 其他:0`。
+    // 一个局部变量,mem 行和 debug 档的 mem.delta 行共用:两处各写一遍的话,
+    // 改了一处忘另一处就是「两行对不上」的静默错值。
+    let xfer_buf_bytes = s.xfer_running * XFER_CHUNK;
+    if s.mem_process_mb == 0 {
+        lines.push("profile.mem n/a(RSS 采不到)".to_string());
+    } else {
+        lines.push(format!(
+            "profile.mem {}",
+            mem_parts(
+                s.mem_process_mb,
+                s.mem_scroll_bytes,
+                xfer_buf_bytes,
+                s.mem_text_bytes
+            )
+        ));
+    }
+
+    // gpu 行:分层段三态 —— 不支持 `n/a`、支持但本窗口没采到样 `0x`、
+    // 有值列出来。三者长得不一样,理由与其余「采不到 ≠ 0」的处置一致。
+    let split = if !s.gpu_split_supported {
+        "分层:n/a".to_string()
+    } else if total(&s.gpu_term_us) == 0 {
+        "分层:0x".to_string()
+    } else {
+        format!(
+            "term:{} egui:{}",
+            fmt_us(quantile_us(&s.gpu_term_us, 0.5)),
+            fmt_us(quantile_us(&s.gpu_egui_us, 0.5))
+        )
+    };
+    lines.push(format!(
+        "profile.gpu util={} vram={} frame={} | {}",
         fmt_engines(&s.gpu_engines, s.gpu_available),
         s.vram_mb
             .map_or_else(|| "n/a".to_string(), |(u, b)| format!("{u}/{b}MB")),
-        gpu_us_part,
-    ))
+        gpu_frame_part,
+        split,
+    ));
+
+    if debug {
+        // 防「列举式分组表漏项」(F168):没进分组表的线程原名 + 各自百分比,
+        // 只在 Debug 档打,常开的话会把固定几行拖到没法一眼看完。
+        if !s.thread_unmapped.is_empty() {
+            let unmapped = s
+                .thread_unmapped
+                .iter()
+                .map(|(n, p)| format!("{n}:{p}%"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(format!("profile.cpu.unmapped {unmapped}"));
+        }
+        // 排查记账模型用的原始字节(mem 行报的是取整 MB)。`mem_process_mb`
+        // 换算回字节只是为了单位一致,不代表比 MB 口径更精确。
+        lines.push(format!(
+            "profile.mem.delta rss={}B scroll={}B xfer={}B text={}B",
+            s.mem_process_mb.saturating_mul(1024 * 1024),
+            s.mem_scroll_bytes,
+            xfer_buf_bytes,
+            s.mem_text_bytes
+        ));
+    }
+
+    lines
 }
 
 /// F168:线程 CPU 百分比,不归一(100 = 一个核)**且不封顶**(组内多线程
@@ -1340,15 +1449,23 @@ mod tests {
         s.frames = 10;
         s.cpu_pct = Some(8);
         s.main_cpu_pct = Some(96);
-        let line = render_line(&s).expect("非空闲窗口该出行");
-        assert!(line.contains("cpu=8%/主线程:96%"), "行里没有 CPU:{line}");
+        let lines = render_lines(&s, false);
+        let cpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.cpu "))
+            .expect("该有 cpu 行");
+        assert!(cpu.contains("total=8% main=96%"), "行里没有 CPU:{cpu}");
 
         s.cpu_pct = None;
         s.main_cpu_pct = None;
-        let line = render_line(&s).expect("非空闲窗口该出行");
+        let lines = render_lines(&s, false);
+        let cpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.cpu "))
+            .expect("该有 cpu 行");
         assert!(
-            line.contains("cpu=n/a"),
-            "采不到时该报 n/a 而不是编一个 0:{line}"
+            cpu.contains("total=n/a"),
+            "采不到时该报 n/a 而不是编一个 0:{cpu}"
         );
     }
 
@@ -1380,12 +1497,20 @@ mod tests {
         let mut s = Snapshot::empty();
         s.window_ms = 5_000;
         s.frames = 10;
-        let line = render_line(&s).expect("非空闲窗口该出行");
-        assert!(line.contains("vram=n/a"), "采不到却报了数字:{line}");
+        let lines = render_lines(&s, false);
+        let gpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.gpu "))
+            .expect("该有 gpu 行");
+        assert!(gpu.contains("vram=n/a"), "采不到却报了数字:{gpu}");
 
         s.vram_mb = Some((123, 4096));
-        let line = render_line(&s).expect("非空闲窗口该出行");
-        assert!(line.contains("vram=123/4096MB"), "显存没渲染出来:{line}");
+        let lines = render_lines(&s, false);
+        let gpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.gpu "))
+            .expect("该有 gpu 行");
+        assert!(gpu.contains("vram=123/4096MB"), "显存没渲染出来:{gpu}");
     }
 
     /// 没采到 GPU 帧耗时时报 `n/a`,不是 `p50=0`。
@@ -1393,19 +1518,114 @@ mod tests {
     /// adapter 不支持 TIMESTAMP_QUERY 与「GPU 一帧只用了 0µs」是两回事,
     /// 后者还会让人以为渲染是免费的。
     ///
-    /// 自证会变红:把 `gpu_us_part` 的 `n == 0` 分支删掉。
+    /// 自证会变红:把 `gpu_frame_part` 的 `n == 0` 分支删掉。
     #[test]
     fn a_gpu_timer_that_never_reported_says_n_a_instead_of_zero() {
         let mut s = Snapshot::empty();
         s.window_ms = 5_000;
         s.frames = 10;
-        let line = render_line(&s).expect("非空闲窗口该出行");
-        assert!(line.contains("gpu_us=n/a"), "没采到却报了数字:{line}");
+        let lines = render_lines(&s, false);
+        let gpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.gpu "))
+            .expect("该有 gpu 行");
+        assert!(gpu.contains("frame=n/a"), "没采到却报了数字:{gpu}");
 
         // `bucket_of` 是本模块私有的,`mod tests` 里有 `use super::*` 直接可用。
         s.gpu_frame_us[bucket_of(2_000)] = 3;
-        let line = render_line(&s).expect("非空闲窗口该出行");
-        assert!(line.contains("gpu_us=3x/"), "采到了却没报:{line}");
+        let lines = render_lines(&s, false);
+        let gpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.gpu "))
+            .expect("该有 gpu 行");
+        assert!(gpu.contains("frame=3x/"), "采到了却没报:{gpu}");
+    }
+
+    /// F167:多行契约 —— 空闲零行/前缀/五段移出概览/无内嵌换行/debug 行开关。
+    ///
+    /// 自证会变红:概览行忘删 `mem=` 段(移出那条),或 render_lines 用
+    /// `\n`.join 拼成单串(无换行那条),或 debug 行忘了 gate(开关那条)。
+    #[test]
+    fn render_lines_contract() {
+        assert!(
+            render_lines(&Snapshot::empty(), false).is_empty(),
+            "空闲必须零行"
+        );
+        let mut s = busy_snapshot();
+        s.thread_available = true;
+        s.thread_groups = vec![("tokio", 31), ("其他", 9)];
+        s.thread_unmapped = vec![("wgpu-poll".to_string(), 5)];
+        let lines = render_lines(&s, false);
+        // 非 debug 档行数是确定的常量五行。用 `==` 而不是 `>=`:`>=` 对
+        // 「意外多 push 了一行」完全失明(实测变异不会红)。
+        assert_eq!(lines.len(), 5, "概览+load+cpu+mem+gpu 恰好五行:{lines:?}");
+        for l in &lines {
+            assert!(!l.contains('\n'), "多行 = 多条独立记录,单行内禁止换行: {l}");
+        }
+        let overview = &lines[0];
+        assert!(overview.starts_with("profile "), "概览行前缀");
+        for gone in ["mem=", "cpu=", "gpu=", "vram=", "gpu_us="] {
+            assert!(!overview.contains(gone), "{gone} 该移去专属行了");
+        }
+        assert!(lines.iter().any(|l| l.starts_with("profile.load scene=")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("profile.cpu ") && l.contains("tokio:31%")));
+        assert!(lines.iter().any(|l| l.starts_with("profile.mem ")));
+        assert!(lines.iter().any(|l| l.starts_with("profile.gpu ")));
+        assert!(
+            !lines.iter().any(|l| l.starts_with("profile.cpu.unmapped")),
+            "info 档不出 unmapped"
+        );
+        let dbg = render_lines(&s, true);
+        assert!(
+            dbg.iter()
+                .any(|l| l.starts_with("profile.cpu.unmapped") && l.contains("wgpu-poll:5%")),
+            "debug 档要能看见没进分组表的线程"
+        );
+    }
+
+    /// F168:采不到线程 ≠ 各组为 0。
+    /// 自证会变红:把 cpu 行渲染里 thread_available 的分支删掉。
+    #[test]
+    fn an_unavailable_thread_probe_renders_na_not_zeros() {
+        let mut s = busy_snapshot();
+        s.thread_available = false;
+        let lines = render_lines(&s, false);
+        let cpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.cpu "))
+            .unwrap();
+        assert!(cpu.ends_with("| n/a"), "采不到必须是 n/a: {cpu}");
+        assert!(!cpu.contains("tokio:"));
+    }
+
+    /// F169(偏离一):RSS 采不到(=0)不许编成 `0MB = … 其他:0` —— 一个跑着的
+    /// 进程 RSS 不可能真的是 0,那是采样失败被揉成 0(`diag.rs` 的既有债,
+    /// 本任务不改那处,只在渲染层挡住这个假零值)。必须显式报 n/a,与
+    /// CPU/GPU/vram 的"采不到"处置同一套纪律。
+    ///
+    /// 自证会变红:把 mem 行渲染里 `s.mem_process_mb == 0` 的门删掉。
+    #[test]
+    fn an_unmeasured_rss_is_told_apart_from_a_process_that_uses_nothing() {
+        let mut s = busy_snapshot();
+        s.mem_process_mb = 0;
+        let lines = render_lines(&s, false);
+        let mem = lines
+            .iter()
+            .find(|l| l.starts_with("profile.mem "))
+            .expect("该有 mem 行");
+        assert!(mem.contains("n/a"), "RSS 采不到该报 n/a:{mem}");
+        assert!(
+            !mem.contains("0MB ="),
+            "RSS 采不到不许编成 0MB 的记账:{mem}"
+        );
+    }
+
+    /// 迁移垫片:概览行就是 `render_lines` 的第一行。既有那批只关心
+    /// 概览行内容的测试沿用它,避免为了改签名去动一堆与本任务无关的断言。
+    fn render_line(s: &Snapshot) -> Option<String> {
+        render_lines(s, false).into_iter().next()
     }
 
     /// 一条样本的直方图(桶 0 计 1)。场景判据只看 total>0,落哪个桶无关。

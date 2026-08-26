@@ -728,7 +728,8 @@ fn watchdog_loop(
                 None => snap.thread_available = false,
             }
             if log::log_enabled!(target: "mullion", log::Level::Info) {
-                if let Some(line) = crate::profile::render_line(&snap) {
+                // Task 11 接线 debug 档位判断,这里先固定传 false。
+                for line in crate::profile::render_lines(&snap, false) {
                     log::info!(target: "mullion", "{line}");
                 }
             }
