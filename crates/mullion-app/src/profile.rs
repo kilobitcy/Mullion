@@ -649,6 +649,96 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
     ))
 }
 
+/// F168:线程 CPU 百分比,不归一(100 = 一个核)**且不封顶**(组内多线程
+/// 烧多核是常态,封顶等于把最该看见的读数削掉)。这就是它不复用
+/// [`crate::sysprobe::cpu_pct`] 的原因 —— 那个按口径约定 `.min(100)`。
+pub fn thread_group_pct(delta_ns: u64, window_ns: u64) -> Option<u32> {
+    if window_ns == 0 {
+        return None;
+    }
+    // 饱和而非 `as u32` 截断:病态输入(上游给出荒谬的小窗口)下截断会绕回成一个
+    // 像模像样的小数字(恰好整除时甚至是 0),那是 T12 那类「静默错值」;爆表成
+    // u32::MAX 一眼就知道该查上游。
+    Some((((delta_ns as u128) * 100 / (window_ns as u128)).min(u32::MAX as u128)) as u32)
+}
+
+/// F168:前缀 → 组名。顺序即输出顺序。main 不在表里(由 F164 的主线程
+/// 口径另源,采样层按 tid 排除)。
+const THREAD_GROUPS: &[(&str, &str)] = &[
+    ("tokio-runtime-worker", "tokio"),
+    ("mullion-watchdog", "watchdog"),
+    ("mullion-file-dialog", "dialog"),
+    ("mullion-dragout", "dragout"),
+];
+
+/// Linux 的 `/proc/<tid>/comm` 上限:`TASK_COMM_LEN` 16 字节含 NUL,
+/// 实际能存 15 字节(本机实测:`tokio-runtime-worker` 读回来是
+/// `tokio-runtime-w`)。Windows 的 `GetThreadDescription` 没这个限制。
+const LINUX_COMM_MAX: usize = 15;
+
+/// 前缀 + 边界:`mullion-watchdog` 不匹配 `mullion-watchdog2`。
+/// (与 F165 PDH 的 `pid_1234` vs `pid_12345` 同族陷阱。)
+///
+/// 第二条分支认 Linux 的截断名:表里三个前缀超过 15 字节,不认的话
+/// tokio/watchdog/dialog 三组在 Linux 上恒为 0 且完全静默。
+/// **代价说清楚**:截断之后 `mullion-watchdog2` 也变成 `mullion-watchdo`,
+/// Linux 上串号防护随之失效 —— 那是内核已经把信息丢了,客户端补不回来;
+/// Windows(唯一一等公民)拿到的是完整名,防护完好。
+fn prefix_matches(name: &str, prefix: &str) -> bool {
+    if let Some(rest) = name.strip_prefix(prefix) {
+        return !rest.starts_with(|c: char| c.is_ascii_alphanumeric());
+    }
+    // Linux 截断名:整条名字恰好是前缀的前 15 字节。
+    match prefix.get(..LINUX_COMM_MAX) {
+        Some(head) => name == head,
+        None => false,
+    }
+}
+
+/// F168:线程分组结果。求和表(常开,进剖面行)与未映射原名表(只在 Debug
+/// 档打)分开返回 —— 前者是给人扫的固定几行,后者是防「列举式分组表漏了
+/// 一个新线程」时能在日志里认出丢在哪,混进同一份输出会让常开那行被
+/// 长度不定的原名列表拖到没法一眼看完。
+pub struct ThreadGroups {
+    /// 固定顺序:表内各组 + 末尾「其他」。0 也在列 —— watchdog:0% 是信息,
+    /// 省略掉的话「这个窗口 watchdog 确实没占用」和「压根没这一组」分不清。
+    pub groups: Vec<(&'static str, u32)>,
+    /// 落进「其他」的原名(空名记作 `unnamed`),Debug 档打出来。
+    pub unmapped: Vec<(String, u32)>,
+}
+
+/// F168:把逐线程 `(名字, CPU%)` 聚合成固定几组。
+///
+/// 输出顺序固定为 `THREAD_GROUPS` 的表内顺序 + 「其他」,不随输入顺序或
+/// 命中与否变化 —— 剖面行要能直接 diff 两次运行,顺序漂了就没法看。
+/// 未命中前缀表的线程(包括空名,记作 `unnamed`)计入「其他」的和,
+/// 原名连同各自的百分比另存进 `unmapped` 供 Debug 档核对分组表是否漏项。
+pub fn group_threads(threads: &[(String, u32)]) -> ThreadGroups {
+    let mut sums = vec![0u32; THREAD_GROUPS.len()];
+    let mut other = 0u32;
+    let mut unmapped = Vec::new();
+    for (name, pct) in threads {
+        match THREAD_GROUPS
+            .iter()
+            .position(|(p, _)| prefix_matches(name, p))
+        {
+            Some(i) => sums[i] = sums[i].saturating_add(*pct),
+            None => {
+                other = other.saturating_add(*pct);
+                let shown = if name.is_empty() { "unnamed" } else { name };
+                unmapped.push((shown.to_string(), *pct));
+            }
+        }
+    }
+    let mut groups: Vec<(&'static str, u32)> = THREAD_GROUPS
+        .iter()
+        .zip(sums)
+        .map(|((_, g), v)| (*g, v))
+        .collect();
+    groups.push(("其他", other));
+    ThreadGroups { groups, unmapped }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,5 +1430,61 @@ mod tests {
         z.window_ms = 5000;
         assert!(z.is_idle());
         assert_eq!(scene_of(&z), Scene::Idle);
+    }
+
+    /// F168:分组表 + 四个坑:前缀串号 / 空名 / 未匹配进其他但 Debug 可见 /
+    /// Linux 15 字节截断名。
+    ///
+    /// 自证会变红:把 prefix_matches 改成裸 starts_with(串号那条),或把
+    /// 空名分支删掉(unnamed 那条),或把 thread_group_pct 加 .min(100)
+    /// (超 100% 那条 —— 组内多线程烧多核是常态,封顶就看不见了),或删掉
+    /// prefix_matches 里认截断名的那个分支(截断那组断言变红),或把饱和转换
+    /// 换回裸 `as u32`(爆表那条)。
+    #[test]
+    fn thread_grouping_boundaries_and_the_uncapped_pct() {
+        let threads = vec![
+            ("tokio-runtime-worker".to_string(), 150u32),
+            ("tokio-runtime-worker".to_string(), 90u32),
+            ("mullion-watchdog".to_string(), 1u32),
+            ("mullion-watchdog2".to_string(), 7u32), // 串号陷阱:不是 watchdog
+            ("".to_string(), 3u32),                  // 空名(Windows 未命名线程)
+            ("wgpu-poll".to_string(), 5u32),
+        ];
+        let g = group_threads(&threads);
+        let get = |name: &str| g.groups.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert_eq!(get("tokio"), 240, "同组求和,且允许超 100%");
+        assert_eq!(get("watchdog"), 1, "watchdog2 不许被前缀串进来");
+        assert_eq!(get("其他"), 7 + 3 + 5);
+        let unmapped: Vec<&str> = g.unmapped.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(unmapped.contains(&"mullion-watchdog2"));
+        assert!(unmapped.contains(&"unnamed"), "空名要有占位标识");
+        assert!(unmapped.contains(&"wgpu-poll"));
+        // 不封顶换算:5 秒窗口烧了 12 秒 CPU(多线程组)= 240%。
+        assert_eq!(thread_group_pct(12_000_000_000, 5_000_000_000), Some(240));
+        assert_eq!(thread_group_pct(1, 0), None, "窗口为 0 = 采不到,不是 0%");
+        // 荒谬输入必须爆表,不许截断绕回:12.88 秒 / 3ns 恰好整除 2^32,
+        // `as u32` 会静默给出 0 —— 一个「看着完全正常」的错值。
+        assert_eq!(
+            thread_group_pct(12_884_901_888, 3),
+            Some(u32::MAX),
+            "截断绕回会把爆表读数伪装成 0"
+        );
+
+        // Linux 内核把线程名截断到 15 字节(本机实测),表里三个前缀超长。
+        // 不认截断名 = tokio/watchdog/dialog 三组在 Linux 上恒零且静默。
+        let truncated = vec![
+            ("tokio-runtime-w".to_string(), 40u32),
+            ("mullion-watchdo".to_string(), 2u32),
+            ("mullion-file-di".to_string(), 3u32),
+            ("mullion-dragout".to_string(), 4u32),
+        ];
+        let t = group_threads(&truncated);
+        let tget = |name: &str| t.groups.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert_eq!(tget("tokio"), 40, "Linux 截断名必须能认出来");
+        assert_eq!(tget("watchdog"), 2);
+        assert_eq!(tget("dialog"), 3);
+        assert_eq!(tget("dragout"), 4);
+        assert_eq!(tget("其他"), 0, "截断名不该漏进其他");
+        assert!(t.unmapped.is_empty());
     }
 }
