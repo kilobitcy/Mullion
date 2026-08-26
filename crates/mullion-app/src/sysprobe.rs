@@ -199,6 +199,52 @@ fn read_cpu_ns(_p: &CpuProbe) -> Option<(u64, u64)> {
     None
 }
 
+/// 一次 GPU 引擎占用采样。`engines` 已按占用倒序,最多两项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuSample {
+    pub engines: Vec<(String, u8)>,
+}
+
+/// PDH 的 `\GPU Engine(*)` 实例名 → 本进程的引擎类型。
+///
+/// 实例名形如
+/// `pid_1234_luid_0x00000000_0x0000C4C1_phys_0_eng_0_engtype_3D`。
+///
+/// 前缀带尾随下划线是必须的:`pid_1234` 会前缀匹配上 `pid_12345`,
+/// 把邻居进程的 GPU 占用算到自己头上 —— 串号比不匹配难查得多。
+///
+/// **纯函数,且不在 `#[cfg(windows)]` 里**:Linux 上也编译,这样解析
+/// 逻辑在开发机上就测得动。真正碰 PDH 的部分才 gate。
+pub fn engine_of(instance: &str, pid: u32) -> Option<&str> {
+    let rest = instance.strip_prefix(&format!("pid_{pid}_"))?;
+    let at = rest.rfind("_engtype_")?;
+    let ty = &rest[at + "_engtype_".len()..];
+    (!ty.is_empty()).then_some(ty)
+}
+
+/// 一批 (实例名, 占用率) → 本进程按引擎类型聚合的前两名。
+///
+/// **求和而非取最大**:同一个 engtype 会在多个 `eng_N` 实例上各报一部分,
+/// 取最大会系统性低报。求和之后可能超 100(多引擎并行),夹紧。
+///
+/// 只取前两名:全列出来一行放不下,而排在后面的恒定是零。
+pub fn aggregate_engines(items: &[(String, f64)], pid: u32) -> Vec<(String, u8)> {
+    let mut by_type: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
+    for (name, v) in items {
+        if let Some(ty) = engine_of(name, pid) {
+            *by_type.entry(ty).or_insert(0.0) += v;
+        }
+    }
+    let mut out: Vec<(String, u8)> = by_type
+        .into_iter()
+        .filter(|(_, v)| *v >= 0.5)
+        .map(|(k, v)| (k.to_string(), v.clamp(0.0, 100.0).round() as u8))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.truncate(2);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +321,86 @@ mod tests {
             "刚把主线程跑满 150ms,主线程口径只报了 {}%",
             s.main_thread_pct
         );
+    }
+
+    /// PDH 的 GPU Engine 实例名解析。
+    ///
+    /// 真实形状(Windows 11,任务管理器读的是同一批计数器):
+    /// `pid_1234_luid_0x00000000_0x0000C4C1_phys_0_eng_0_engtype_3D`
+    ///
+    /// 这一段是本切片里最容易写错、又最难发现的:解析错了 `gpu=` 恒为
+    /// `0%` 或 `n/a`,而那和「这台机器真的没在用 GPU」长得一模一样。
+    ///
+    /// 自证会变红:把 `engine_of` 里的 `_engtype_` 改成 `_eng_`。
+    #[test]
+    fn a_gpu_engine_instance_name_yields_its_engine_type() {
+        let n = "pid_1234_luid_0x00000000_0x0000C4C1_phys_0_eng_0_engtype_3D";
+        assert_eq!(engine_of(n, 1234), Some("3D"));
+        assert_eq!(
+            engine_of(
+                "pid_1234_luid_0x0_0x1_phys_0_eng_2_engtype_VideoDecode",
+                1234
+            ),
+            Some("VideoDecode")
+        );
+    }
+
+    /// **别的进程的实例必须被滤掉**。
+    ///
+    /// 不滤的话报出来的是整机 GPU 占用 —— 排障时会把「另一个程序在渲染」
+    /// 读成「mullion 在烧 GPU」。
+    ///
+    /// `pid_12345` 不能被 `pid_1234` 前缀匹配上:那是 10 倍的邻居 pid,
+    /// 这种串号比不匹配更难查。
+    ///
+    /// 自证会变红:把 `engine_of` 里的前缀改成 `format!("pid_{pid}")`(少个下划线)。
+    #[test]
+    fn another_process_engine_is_filtered_out_including_the_prefix_neighbour() {
+        let other = "pid_9999_luid_0x0_0x1_phys_0_eng_0_engtype_3D";
+        assert_eq!(engine_of(other, 1234), None);
+        let neighbour = "pid_12345_luid_0x0_0x1_phys_0_eng_0_engtype_3D";
+        assert_eq!(
+            engine_of(neighbour, 1234),
+            None,
+            "pid_12345 被 pid_1234 前缀匹配上了 —— 串号比不匹配更难查"
+        );
+    }
+
+    /// 按引擎类型聚合求和,倒序取前两名。
+    ///
+    /// 求和而非取最大:同一个 engtype 在多个 `eng_N` 实例上各报一部分,
+    /// 取最大会系统性低报。
+    ///
+    /// 自证会变红:把 `aggregate_engines` 里的 `+=` 改成 `=`。
+    #[test]
+    fn engines_of_the_same_type_are_summed_and_the_top_two_win() {
+        let items = vec![
+            ("pid_7_luid_a_b_phys_0_eng_0_engtype_3D".to_string(), 8.0),
+            ("pid_7_luid_a_b_phys_0_eng_1_engtype_3D".to_string(), 6.0),
+            ("pid_7_luid_a_b_phys_0_eng_2_engtype_Copy".to_string(), 3.0),
+            (
+                "pid_7_luid_a_b_phys_0_eng_3_engtype_VideoDecode".to_string(),
+                0.0,
+            ),
+            ("pid_8_luid_a_b_phys_0_eng_0_engtype_3D".to_string(), 90.0),
+        ];
+        let got = aggregate_engines(&items, 7);
+        assert_eq!(
+            got,
+            vec![("3D".to_string(), 14), ("Copy".to_string(), 3)],
+            "同类型没求和 / 没倒序 / 零值没滤掉 / 别的 pid 混进来了"
+        );
+    }
+
+    /// 百分比要夹紧到 100:多引擎求和很容易超。
+    ///
+    /// 自证会变红:把 `aggregate_engines` 里的 `.clamp(0.0, 100.0)` 删掉。
+    #[test]
+    fn a_summed_utilisation_over_one_hundred_is_clamped() {
+        let items = vec![
+            ("pid_7_luid_a_b_phys_0_eng_0_engtype_3D".to_string(), 80.0),
+            ("pid_7_luid_a_b_phys_0_eng_1_engtype_3D".to_string(), 70.0),
+        ];
+        assert_eq!(aggregate_engines(&items, 7), vec![("3D".to_string(), 100)]);
     }
 }
