@@ -159,7 +159,7 @@ pub fn repaint_bucket(d: std::time::Duration) -> RepaintBucket {
 /// 一个 5 秒窗口里采到的全部东西。
 ///
 /// **纯数据**：由 `diag.rs` 的周期线程从各个原子计数器 drain 出来填好，
-/// 再交给 [`render_line`]。分成两步是为了让「这一行长什么样」可以脱离
+/// 再交给 [`render_lines`]。分成两步是为了让「这些行长什么样」可以脱离
 /// 线程、时钟和全局状态单测 —— 剖面行本身是要被人读的产物，格式错了
 /// （单位漏了、零值省略了、跨行了）编译器一句话都不会说。
 #[derive(Debug, Clone)]
@@ -1539,6 +1539,56 @@ mod tests {
             .find(|l| l.starts_with("profile.gpu "))
             .expect("该有 gpu 行");
         assert!(gpu.contains("frame=3x/"), "采到了却没报:{gpu}");
+    }
+
+    /// F170:分层段三态必须两两不同 —— 「这台机器没有 INSIDE_PASSES」、
+    /// 「有但这个窗口一帧没采到」、「有值」是三件事。
+    ///
+    /// 归成一类的话,老驱动机器上的日志和「分层功能坏了」长得一模一样,
+    /// 排障时分不出该查驱动还是该查代码。
+    ///
+    /// adapter 特性探测那段(`Gpu::new`)无头环境测不了,但**这三态是纯函数**,
+    /// 没理由跟着一起放过。
+    ///
+    /// 自证会变红:把 `!s.gpu_split_supported` 分支删掉(不支持时掉进 `0x`),
+    /// 或把 `total(&s.gpu_term_us) == 0` 那条删掉(没采到时报 `term:0µs`)。
+    #[test]
+    fn the_gpu_split_tells_unsupported_apart_from_sampled_nothing() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        s.frames = 10;
+        let gpu_line = |s: &Snapshot| {
+            render_lines(s, false)
+                .into_iter()
+                .find(|l| l.starts_with("profile.gpu "))
+                .expect("该有 gpu 行")
+        };
+
+        // ① 不支持分层。
+        let unsupported = gpu_line(&s);
+        assert!(
+            unsupported.contains("分层:n/a"),
+            "不支持却没说 n/a:{unsupported}"
+        );
+
+        // ② 支持,但这个窗口一帧都没采到。
+        s.gpu_split_supported = true;
+        let idle = gpu_line(&s);
+        assert!(idle.contains("分层:0x"), "支持但没采到该是 0x:{idle}");
+        assert_ne!(unsupported, idle, "「不支持」与「没采到」长得一样了");
+
+        // ③ 真的有值。
+        s.gpu_term_us[bucket_of(800)] = 5;
+        s.gpu_egui_us[bucket_of(400)] = 5;
+        let sampled = gpu_line(&s);
+        assert!(
+            sampled.contains("term:") && sampled.contains("egui:"),
+            "有样本却没列出两段:{sampled}"
+        );
+        assert!(
+            !sampled.contains("分层:"),
+            "有值时不该再出现降级占位:{sampled}"
+        );
     }
 
     /// F167:多行契约 —— 空闲零行/前缀/五段移出概览/无内嵌换行/debug 行开关。

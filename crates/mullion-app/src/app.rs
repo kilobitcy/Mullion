@@ -19393,5 +19393,42 @@ mod tests {
             term_draw < mid && mid < forget,
             "顺序要求:终端趟 < mid_mark < forget_lifetime,实际 term_draw={term_draw} mid={mid} forget={forget}"
         );
+
+        // 契约二:还得在 `if let Some(terminal_draw)` 判空块**之外**。光比先后
+        // 位置管不住这条 —— 挪进块内、仍排在 `a.text.render` 之后,上面三个
+        // 位置的相对顺序一个都不变,测试照绿,而 launcher 态(没有终端可画)
+        // 那些帧的槽 1 就再没人写,`resolve` 读到上一次采样的残留值。
+        let block = prod
+            .find("if let Some((inst, n)) = &terminal_draw {")
+            .expect("终端趟判空块没找到");
+        let open = prod[block..].find('{').expect("判空块的左括号") + block;
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in prod[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.expect("判空块没有配对的右括号");
+        // 括号配平扫描的自守:那一段里唯一出现在字符串字面量里的花括号是
+        // `{e:?}`(自身配平),所以扫描可信。真配错了,收尾括号就不会落在
+        // 与 `if let` 同级的 8 空格缩进上 —— 当场报出来,而不是给下面那条
+        // 断言喂一个错的边界。
+        assert!(
+            prod[..close].ends_with("\n        "),
+            "括号配平扫到的收尾括号不在 8 空格缩进上,这条测试的边界不可信"
+        );
+        assert!(
+            mid > close,
+            "mid_mark 落进了 terminal_draw 判空块内(块 {block}..{close},mid={mid})"
+        );
     }
 }
