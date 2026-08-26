@@ -728,8 +728,13 @@ fn watchdog_loop(
                 None => snap.thread_available = false,
             }
             if log::log_enabled!(target: "mullion", log::Level::Info) {
-                // Task 11 接线 debug 档位判断,这里先固定传 false。
-                for line in crate::profile::render_lines(&snap, false) {
+                // 贵的那两行(线程未分组明细 / 记账原始字节)只在 Debug 档出,
+                // 常开会把固定五行拖到没法一眼看完(用户拍板的分层:Info 常开
+                // 便宜的,Debug 才开贵的)。
+                let debug = log::log_enabled!(target: "mullion", log::Level::Debug);
+                // **每行独立 log 一次**,各自带时间戳与 pid 前缀(F166)。
+                // 单条记录里嵌 `\n` 会让续行 grep 不到时间,设计文档 §2 明令禁止。
+                for line in crate::profile::render_lines(&snap, debug) {
                     log::info!(target: "mullion", "{line}");
                 }
             }
