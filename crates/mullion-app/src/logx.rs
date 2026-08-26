@@ -988,18 +988,26 @@ mod tests {
     /// 自证会变红:把 `prune_plan` 里的分组改成按 path 而不是按 instance_id。
     #[test]
     fn a_rotated_sibling_goes_with_its_main_file() {
+        // keep=2:配额卡在两个孤儿主文件的 mtime 之间(200 与 50 之间),这样
+        // 「按 instance_id 分组」与「按 path 分组」才会给出不同答案 ——
+        // 若按 path 分组,m.log(200)自己就能挤进配额、把 m.log.1(150)甩下,
+        // 装作「主文件在,轮转出来的 .1 没了」的孤儿假象。
         let files = vec![
-            lf("m.log", "100-1", 100),
-            lf("m.log.1", "100-1", 90),
-            lf("keep.log", "200-2", 5_000),
+            lf("a.log", "0-0", 300),
+            lf("m.log", "100-1", 200),
+            lf("m.log.1", "100-1", 150),
+            lf("c.log", "300-3", 50),
         ];
-        let plan = prune_plan(&files, &[], "999-9", 9_000, 1);
-        assert!(plan.contains(&PathBuf::from("m.log")));
+        let plan = prune_plan(&files, &[], "999-9", 9_000, 2);
         assert!(
-            plan.contains(&PathBuf::from("m.log.1")),
-            "轮转出来的 .log.1 成了孤儿,永远没人删"
+            !plan.contains(&PathBuf::from("m.log")),
+            "配额内的主文件被删了"
         );
-        assert!(!plan.contains(&PathBuf::from("keep.log")), "配额内的被删了");
+        assert!(
+            !plan.contains(&PathBuf::from("m.log.1")),
+            "轮转出来的 .log.1 跟主文件分开算配额,成了孤儿"
+        );
+        assert!(plan.contains(&PathBuf::from("c.log")), "该删的没删");
     }
 
     /// 配额按**实例**算而不是按文件算,且留最近的。
