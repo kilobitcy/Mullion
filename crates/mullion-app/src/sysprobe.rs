@@ -205,8 +205,8 @@ fn read_cpu_ns(_p: &CpuProbe) -> Option<(u64, u64)> {
 /// 调用者自己的 tid。**必须在主线程上调**才能拿到主线程的
 /// (同 T12 的教训:谁调谁的语义)。给 [`ThreadCpuProbe::new`] 喂 main_tid 用。
 ///
-/// 其他平台返回 `0`:那两个平台上 [`ThreadCpuProbe::sample`] 本来就恒
-/// 返回 `None`,`main_tid` 传什么都不影响任何行为。
+/// Windows / Linux 之外一律返回 `0`:那些平台上 [`ThreadCpuProbe::sample`]
+/// 本来就恒返回 `None`,`main_tid` 传什么都不影响任何行为。
 pub(crate) fn current_tid() -> u32 {
     #[cfg(windows)]
     {
@@ -254,8 +254,8 @@ impl ThreadCpuProbe {
     }
 
     /// 枚举全部线程,返回 (线程名, 这一窗口的 CPU ns 增量),**排除主线程**
-    /// (F164 已有更准的主线程口径)。首次调用建基线返回 `Some(空表)`。
-    /// 平台枚举失败返回 `None`(渲染层显示 n/a,不冒充 0)。
+    /// (F164 已有更准的主线程口径)。首次调用(只建基线,无差分可算)和
+    /// 平台枚举失败一律返回 `None`,渲染层显示 n/a —— **不冒充 0**。
     #[cfg(target_os = "linux")]
     pub fn sample(&mut self) -> Option<Vec<(String, u64)>> {
         let hz = 100u64; // 同 `read_cpu_ns`:USER_HZ 恒为 100,内核 ABI,不随 CONFIG_HZ 变。
@@ -294,10 +294,11 @@ impl ThreadCpuProbe {
                 .unwrap_or_default();
             cur.insert(tid, (name, ns));
         }
-        let out = match &self.prev {
-            None => Vec::new(), // 首次调用只建基线,不出数。
-            Some(prev) => cur
-                .iter()
+        // 没有基线(首次调用)就是 `None`,不是 `Some(空表)`:空表到了分组层
+        // 就是「各组 0%」,一个凭空编出来的 0 —— 本文件头部明令禁止的那种。
+        // 同文件 `CpuProbe::sample` 也是这个约定。
+        let out = self.prev.as_ref().map(|prev| {
+            cur.iter()
                 .map(|(tid, (name, ns))| {
                     let delta = match prev.get(tid) {
                         Some(p) => ns.saturating_sub(*p),
@@ -305,12 +306,12 @@ impl ThreadCpuProbe {
                     };
                     (name.clone(), delta)
                 })
-                .collect(),
-        };
+                .collect()
+        });
         // 整表替换,不是增量 merge:退出线程的旧 tid 就此从 `prev` 里消失,
         // 不然 HashMap 会随线程生灭无限涨。
         self.prev = Some(cur.into_iter().map(|(tid, (_, ns))| (tid, ns)).collect());
-        Some(out)
+        out
     }
 
     /// 同上,Windows 分支。已交叉编译 + clippy 验过(`--target
@@ -397,10 +398,9 @@ impl ThreadCpuProbe {
         // SAFETY: `snap` 是 CreateToolhelp32Snapshot 给的自有句柄。
         unsafe { CloseHandle(snap) };
 
-        let out = match &self.prev {
-            None => Vec::new(), // 首次调用只建基线,不出数。
-            Some(prev) => cur
-                .iter()
+        // 首次调用只建基线,给 `None`,理由同 Linux 分支。
+        let out = self.prev.as_ref().map(|prev| {
+            cur.iter()
                 .map(|(tid, (name, t))| {
                     let delta = match prev.get(tid) {
                         Some(p) => t.saturating_sub(*p),
@@ -408,10 +408,10 @@ impl ThreadCpuProbe {
                     };
                     (name.clone(), delta)
                 })
-                .collect(),
-        };
+                .collect()
+        });
         self.prev = Some(cur.into_iter().map(|(tid, (_, t))| (tid, t)).collect());
-        Some(out)
+        out
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -932,8 +932,9 @@ mod tests {
 
         let mut probe = ThreadCpuProbe::new(linux_current_tid());
         let mut probe_excl = ThreadCpuProbe::new(excl_tid);
-        assert_eq!(probe.sample(), Some(Vec::new()), "首次采样只建基线");
-        assert_eq!(probe_excl.sample(), Some(Vec::new()), "首次采样只建基线");
+        // 首次采样只建基线,没有差分可算 —— 必须是 n/a,不是「各组 0%」。
+        assert_eq!(probe.sample(), None, "首次采样无基线,不许编 0 出来");
+        assert_eq!(probe_excl.sample(), None, "首次采样无基线,不许编 0 出来");
 
         burn_done_rx.recv().unwrap();
         excl_done_rx.recv().unwrap();
