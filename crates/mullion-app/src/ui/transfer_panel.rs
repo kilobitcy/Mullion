@@ -247,6 +247,7 @@ mod tests {
             bytes_done: 0,
             bytes_total: 1000,
             busy: true,
+            active: 1,
         };
         assert!(eta(&s, 0.0).contains("--:--"), "速率未知时不该给数字");
         assert_eq!(eta(&s, 100.0), "剩余 00:10");

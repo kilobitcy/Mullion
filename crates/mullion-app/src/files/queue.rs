@@ -96,6 +96,8 @@ pub struct Summary {
     pub bytes_total: u64,
     /// 还有没有没收尾的活。折叠行显示什么看它。
     pub busy: bool,
+    /// F167:没收尾的条数(Pending + Running)。场景判据与 profile.load 的分母。
+    pub active: usize,
 }
 
 pub struct Queue {
@@ -291,6 +293,7 @@ impl Queue {
             s.bytes_done += j.done.min(j.total);
             if !j.state.is_finished() {
                 s.busy = true;
+                s.active += 1;
             }
         }
         s
@@ -553,5 +556,21 @@ mod tests {
         m.sample(1.0, 100);
         let r = m.sample(1.0, 500);
         assert!(r.is_finite(), "同一时刻两次采样不能算出 inf:{r}");
+    }
+
+    /// F167:场景判据「传输队列非空」用的是 active(未收尾条数),不是
+    /// running —— pending 的 job 也说明用户正等着传输。
+    ///
+    /// 自证会变红:把 `summary` 里 `s.active += 1` 挪进 `Running` 分支。
+    #[test]
+    fn active_counts_pending_and_running_but_not_finished() {
+        let mut q = Queue::new(1);
+        let a = q.push(job(Direction::Download));
+        let _b = q.push(job(Direction::Download)); // 并发 1,这条留在 Pending
+        assert_eq!(q.take_runnable(), vec![a]);
+        assert_eq!(q.summary().active, 2, "1 running + 1 pending");
+        q.progress(a, 100);
+        q.finish(a, Ok(()));
+        assert_eq!(q.summary().active, 1, "收尾的不算");
     }
 }
