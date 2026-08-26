@@ -11,6 +11,9 @@
 //! 由 `profile::render_line` 渲染成 `n/a`。**不许编一个 0 出来**:
 //! 「采不到」和「真的是 0」在排障时是两回事。
 
+#[cfg(windows)]
+use windows::core::Interface as _; // `cast::<IDXGIAdapter3>()`
+
 /// 一次 CPU 采样。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSample {
@@ -398,6 +401,94 @@ fn read_counter_array(counter: isize) -> Option<Vec<(String, f64)>> {
         }
     }
     Some(out)
+}
+
+/// 一次显存采样(本进程的本地显存)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VramSample {
+    pub used_mb: u64,
+    pub budget_mb: u64,
+}
+
+/// 显存探针。DXGI adapter **枚举一次常驻** —— 每 5 秒重新
+/// `CreateDXGIFactory1` + `EnumAdapters1` 是白花的系统调用。
+pub struct VramProbe {
+    #[cfg(windows)]
+    adapter: Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter3>,
+}
+
+// SAFETY: `IDXGIAdapter3` 是 free-threaded 的(DXGI 对象不属于 COM 单元),
+// 且这里只做只读查询。放进 `OnceLock` 需要这两个约束。
+#[cfg(windows)]
+unsafe impl Send for VramProbe {}
+#[cfg(windows)]
+unsafe impl Sync for VramProbe {}
+
+impl VramProbe {
+    /// `vendor`/`device` 来自 `wgpu::AdapterInfo`,用来在多显卡机器上
+    /// 认出 wgpu 实际在用的那一块。
+    #[cfg(windows)]
+    pub fn new(vendor: u32, device: u32) -> Self {
+        Self {
+            adapter: find_adapter(vendor, device),
+        }
+    }
+
+    /// 非 Windows 上这个结构体**没有字段**,所以构造器也得分开写 ——
+    /// 把 `adapter: None` 写在 `#[cfg(not(windows))]` 属性下是编不过的
+    /// (属性只能去掉字段初始化,去不掉「结构体没有这个字段」)。
+    #[cfg(not(windows))]
+    pub fn new(_vendor: u32, _device: u32) -> Self {
+        Self {}
+    }
+
+    #[cfg(windows)]
+    pub fn sample(&self) -> Option<VramSample> {
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO,
+        };
+        let a = self.adapter.as_ref()?;
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: `a` 是活着的 COM 接口;out 参数在栈上。
+        unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }.ok()?;
+        const MB: u64 = 1024 * 1024;
+        Some(VramSample {
+            used_mb: info.CurrentUsage / MB,
+            budget_mb: info.Budget / MB,
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub fn sample(&self) -> Option<VramSample> {
+        None
+    }
+}
+
+/// 按 vendor/device 找出 wgpu 在用的那块 adapter。
+///
+/// `QueryVideoMemoryInfo` 报的是**本进程**的用量,与 wgpu 实际选了 D3D12
+/// 还是 Vulkan 无关 —— DXGI 在驱动层统计,不看是哪个 API 申请的。
+///
+/// 已知限制:两块同型号 GPU 时取枚举到的第一块。
+#[cfg(windows)]
+fn find_adapter(vendor: u32, device: u32) -> Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter3> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory1};
+    // SAFETY: CreateDXGIFactory1 是 free-threaded 的,不需要先 CoInitialize。
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    for i in 0..16u32 {
+        // SAFETY: 索引越界时返回 DXGI_ERROR_NOT_FOUND,由 `ok()?` 收掉。
+        let Ok(a1) = (unsafe { factory.EnumAdapters1(i) }) else {
+            break;
+        };
+        // SAFETY: `a1` 刚由 EnumAdapters1 返回,有效。
+        let Ok(desc) = (unsafe { a1.GetDesc1() }) else {
+            continue;
+        };
+        if desc.VendorId == vendor && desc.DeviceId == device {
+            return a1.cast::<IDXGIAdapter3>().ok();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

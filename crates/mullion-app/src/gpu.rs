@@ -369,6 +369,9 @@ impl Gpu {
             info.name, info.device_type, info.backend, info.vendor, info.device,
             info.driver, info.driver_info,
         );
+        // F165:显存探针要按 vendor/device 在 DXGI 里认出同一块卡。
+        // adapter 枚举一次常驻,交给 diag 存着。
+        crate::diag::set_vram_probe(crate::sysprobe::VramProbe::new(info.vendor, info.device));
         let (device, queue) = handle
             .block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
             .expect("request_device");

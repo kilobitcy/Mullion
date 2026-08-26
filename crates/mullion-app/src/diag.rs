@@ -270,6 +270,15 @@ static HOSTS: AtomicU64 = AtomicU64::new(0);
 
 static FRAME_US: crate::profile::Histogram = crate::profile::Histogram::new();
 static ECHO_US: crate::profile::Histogram = crate::profile::Histogram::new();
+
+/// F165:显存探针。`Gpu::new` 建好后放进来 —— 看门狗线程比 GPU 早启动,
+/// 拿不到 adapter info,只能反过来由 GPU 那边推给它。
+static VRAM_PROBE: std::sync::OnceLock<crate::sysprobe::VramProbe> = std::sync::OnceLock::new();
+
+/// F165:`Gpu::new` 调一次。重复调用忽略(只有一个窗口)。
+pub fn set_vram_probe(p: crate::sysprobe::VramProbe) {
+    let _ = VRAM_PROBE.set(p);
+}
 /// 最后一次按键的时刻(µs)。0 = 还没按过 / 已被下一段入站字节消费掉。
 static LAST_KEY_US: AtomicU64 = AtomicU64::new(0);
 
@@ -713,6 +722,10 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.panes = PANES.load(Ordering::Relaxed);
     s.hosts = HOSTS.load(Ordering::Relaxed);
     s.mem_process_mb = sample_memory().map_or(0, |m| m.process_bytes / (1024 * 1024));
+    s.vram_mb = VRAM_PROBE
+        .get()
+        .and_then(|p| p.sample())
+        .map(|v| (v.used_mb, v.budget_mb));
     s
 }
 

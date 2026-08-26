@@ -77,6 +77,8 @@ windows = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_SystemServices",
+    # F165:IDXGIAdapter3::QueryVideoMemoryInfo,读本进程显存占用。
+    "Win32_Graphics_Dxgi",
 ] }
 
 [dev-dependencies]
