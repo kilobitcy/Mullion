@@ -268,14 +268,40 @@ static TABS: AtomicU64 = AtomicU64::new(0);
 static PANES: AtomicU64 = AtomicU64::new(0);
 static HOSTS: AtomicU64 = AtomicU64::new(0);
 
+// F167:滚动事件(计次,swap 清零)。
+static SCROLL_EVENTS: AtomicU64 = AtomicU64::new(0);
+// F167/F169:传输与内存 gauge(状态量,load 读)。
+static XFER_JOBS: AtomicU64 = AtomicU64::new(0);
+static XFER_RUNNING: AtomicU64 = AtomicU64::new(0);
+static XFER_BYTES_LEFT: AtomicU64 = AtomicU64::new(0);
+static MEM_SCROLL_BYTES: AtomicU64 = AtomicU64::new(0);
+static SCROLL_LINES: AtomicU64 = AtomicU64::new(0);
+static MEM_TEXT_BYTES: AtomicU64 = AtomicU64::new(0);
+
 static FRAME_US: crate::profile::Histogram = crate::profile::Histogram::new();
 static ECHO_US: crate::profile::Histogram = crate::profile::Histogram::new();
 /// F165:GPU 帧耗时(微秒)。与 `FRAME_US` 共用一套桶,好横向比。
 static GPU_FRAME_US: crate::profile::Histogram = crate::profile::Histogram::new();
+/// F170:分层耗时(微秒)。终端趟(槽1-槽0)与 egui 趟(槽2-槽1)。
+static GPU_TERM_US: crate::profile::Histogram = crate::profile::Histogram::new();
+static GPU_EGUI_US: crate::profile::Histogram = crate::profile::Histogram::new();
+/// F170:`INSIDE_PASSES` 时间戳查询这一路是否拿到过。
+static GPU_SPLIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 /// F165:记一次 GPU 帧耗时。由 wgpu 的 map 回调调用(不在主线程上)。
 pub fn record_gpu_frame_us(us: u64) {
     GPU_FRAME_US.record_us(us);
+}
+
+/// F170:一次分层采样(µs)。由 GpuTimer 回读回调调用(wgpu 内部线程)。
+pub fn record_gpu_split_us(term_us: u64, egui_us: u64) {
+    GPU_TERM_US.record_us(term_us);
+    GPU_EGUI_US.record_us(egui_us);
+}
+
+/// F170:GPU 初始化时报告 `INSIDE_PASSES` 是否拿到。
+pub fn set_gpu_split_supported(v: bool) {
+    GPU_SPLIT_SUPPORTED.store(v, Ordering::Relaxed);
 }
 
 /// F165:显存探针。`Gpu::new` 建好后放进来 —— 看门狗线程比 GPU 早启动,
@@ -473,6 +499,25 @@ pub fn set_scale(tabs: usize, panes: usize, hosts: usize) {
     TABS.store(tabs as u64, Ordering::Relaxed);
     PANES.store(panes as u64, Ordering::Relaxed);
     HOSTS.store(hosts as u64, Ordering::Relaxed);
+}
+
+/// F167:用户滚了一下(滚轮一档/一次翻页/拖拽自滚一帧都算一次)。
+pub fn count_scroll() {
+    SCROLL_EVENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// F167/F169:传输队列规模。relaxed 原子存,帧路径可调(与 set_scale 同款)。
+pub fn set_xfer_gauges(active: u64, running: u64, bytes_left: u64) {
+    XFER_JOBS.store(active, Ordering::Relaxed);
+    XFER_RUNNING.store(running, Ordering::Relaxed);
+    XFER_BYTES_LEFT.store(bytes_left, Ordering::Relaxed);
+}
+
+/// F169:内存记账 gauge。
+pub fn set_mem_gauges(scroll_bytes: u64, scroll_lines: u64, text_bytes: u64) {
+    MEM_SCROLL_BYTES.store(scroll_bytes, Ordering::Relaxed);
+    SCROLL_LINES.store(scroll_lines, Ordering::Relaxed);
+    MEM_TEXT_BYTES.store(text_bytes, Ordering::Relaxed);
 }
 
 /// 卡住多久之后才第一次报警。低于这个值的都是正常的长帧。
@@ -734,6 +779,16 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
         .and_then(|p| p.sample())
         .map(|v| (v.used_mb, v.budget_mb));
     s.gpu_frame_us = GPU_FRAME_US.drain();
+    s.scroll_events = SCROLL_EVENTS.swap(0, Ordering::Relaxed);
+    s.xfer_jobs = XFER_JOBS.load(Ordering::Relaxed);
+    s.xfer_running = XFER_RUNNING.load(Ordering::Relaxed);
+    s.xfer_bytes_left = XFER_BYTES_LEFT.load(Ordering::Relaxed);
+    s.mem_scroll_bytes = MEM_SCROLL_BYTES.load(Ordering::Relaxed);
+    s.scroll_lines = SCROLL_LINES.load(Ordering::Relaxed);
+    s.mem_text_bytes = MEM_TEXT_BYTES.load(Ordering::Relaxed);
+    s.gpu_term_us = GPU_TERM_US.drain();
+    s.gpu_egui_us = GPU_EGUI_US.drain();
+    s.gpu_split_supported = GPU_SPLIT_SUPPORTED.load(Ordering::Relaxed);
     s
 }
 
@@ -928,5 +983,27 @@ mod tests {
         t.note(42);
         assert_eq!(t.drain().0, vec![(42, 1)]);
         assert!(t.drain().0.is_empty(), "取走之后窗口该是空的");
+    }
+
+    /// F167:计次量与状态量的清零语义不能弄反。
+    ///
+    /// `SCROLL_EVENTS`/`XFER_JOBS` 是本文件新加的 static,截至目前没有
+    /// 别的测试碰它们(其余 `#[test]` 都不调 `count_scroll`/`set_xfer_gauges`/
+    /// `take_snapshot`),所以不需要串行锁 —— 并行 runner 下不会有别的用例
+    /// 往这两个 static 里写。若以后有测试也调用它们,需要重新评估是否要
+    /// 上锁。
+    ///
+    /// 自证会变红:把 take_snapshot 里 SCROLL_EVENTS 的 `swap(0,..)` 改成
+    /// `load(..)`,或把 XFER_JOBS 的 `load` 改成 `swap(0,..)`。
+    #[test]
+    fn scroll_is_drained_but_xfer_gauge_survives_the_snapshot() {
+        count_scroll();
+        set_xfer_gauges(2, 1, 48 << 20);
+        let a = take_snapshot(5000);
+        assert_eq!(a.scroll_events, 1);
+        assert_eq!(a.xfer_jobs, 2);
+        let b = take_snapshot(5000);
+        assert_eq!(b.scroll_events, 0, "计次量必须随窗口清零");
+        assert_eq!(b.xfer_jobs, 2, "状态量描述此刻,不许被清");
     }
 }

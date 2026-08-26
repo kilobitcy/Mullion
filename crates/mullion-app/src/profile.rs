@@ -258,6 +258,33 @@ pub struct Snapshot {
     pub vram_mb: Option<(u64, u64)>,
     /// F165:GPU 帧耗时分布。样本数为 0 = 不支持或本窗口没采到。
     pub gpu_frame_us: Counts,
+    /// F167:本窗口的用户滚动事件数(滚轮/翻页键/拖拽自动滚,计次量)。
+    pub scroll_events: u64,
+    /// F167/F169:传输队列此刻未收尾条数(状态量,读而不清)。
+    pub xfer_jobs: u64,
+    /// F169:未传完的字节(total - done,状态量)。
+    pub xfer_bytes_left: u64,
+    /// F169:在跑的传输条数(在途缓冲 = running × 64KiB chunk)。
+    pub xfer_running: u64,
+    /// F169:全部 pane 的 scrollback 记账字节(gauge,主线程每帧更新)。
+    pub mem_scroll_bytes: u64,
+    /// F167/F169:全部 pane 的回溯总行数(profile.load 的分母)。来自 F169
+    /// 内存记账那次遍历,与 `scroll_events`(用户滚动计次)不是一回事。
+    pub scroll_lines: u64,
+    /// F169:TextLayer 的 Buffer 估算字节(gauge)。
+    pub mem_text_bytes: u64,
+    /// F168:线程组 CPU(组名, 不归一不封顶百分比)。固定顺序,见 `group_threads`。
+    pub thread_groups: Vec<(&'static str, u32)>,
+    /// F168:没进分组表的线程原名(Debug 档打出来,防列举式漏项)。
+    pub thread_unmapped: Vec<(String, u32)>,
+    /// F168:线程枚举这一窗口成功过。false → profile.cpu 的分组段渲染 n/a。
+    pub thread_available: bool,
+    /// F170:终端趟 GPU 耗时分布(槽1-槽0)。
+    pub gpu_term_us: Counts,
+    /// F170:egui 趟 GPU 耗时分布(槽2-槽1)。
+    pub gpu_egui_us: Counts,
+    /// F170:INSIDE_PASSES 拿到了。false → 分层渲染 `分层:n/a`。
+    pub gpu_split_supported: bool,
 }
 
 /// 逐阶段计数。长度与 `diag::Stage` 的变体数一致。
@@ -319,6 +346,19 @@ impl Snapshot {
             gpu_available: false,
             vram_mb: None,
             gpu_frame_us: [0; BUCKETS],
+            scroll_events: 0,
+            xfer_jobs: 0,
+            xfer_bytes_left: 0,
+            xfer_running: 0,
+            mem_scroll_bytes: 0,
+            scroll_lines: 0,
+            mem_text_bytes: 0,
+            thread_groups: Vec::new(),
+            thread_unmapped: Vec::new(),
+            thread_available: false,
+            gpu_term_us: [0; BUCKETS],
+            gpu_egui_us: [0; BUCKETS],
+            gpu_split_supported: false,
         }
     }
 
