@@ -82,9 +82,48 @@ pub fn instance_id() -> &'static str {
     })
 }
 
-/// 日志文件路径:`<config_dir>/mullion.log`(Windows `%APPDATA%\mullion\config\mullion.log`)。
+/// 日志文件所在目录。给清理逻辑用。
+pub fn log_dir() -> Option<PathBuf> {
+    crate::shell::store::config_dir()
+}
+
+/// 某个实例的日志文件名。
+pub fn log_file_name(instance_id: &str) -> String {
+    format!("mullion-{instance_id}.log")
+}
+
+/// 这个字符串是不是一个 F148 形状的 instance id(`{纯数字}-{纯数字}`)。
+///
+/// **严格校验不是洁癖**:配置目录里还躺着 F155 导出的
+/// `mullion-redacted.log`。宽松匹配会把它认成 id 为 `redacted` 的实例日志,
+/// 判死之后由清理逻辑删掉 —— 删的正是用户刚导出准备发过来的那份。
+fn is_instance_id(s: &str) -> bool {
+    let mut parts = s.split('-');
+    let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let numeric = |x: &str| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit());
+    numeric(a) && numeric(b)
+}
+
+/// 文件名 → instance id。认 `mullion-<id>.log` 与轮转出来的
+/// `mullion-<id>.log.1`;其余(含上一版的 `mullion.log`)一律 `None`。
+pub fn parse_log_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("mullion-")?;
+    let id = rest
+        .strip_suffix(".log.1")
+        .or_else(|| rest.strip_suffix(".log"))?;
+    is_instance_id(id).then_some(id)
+}
+
+/// 本实例的日志文件路径:`<config_dir>/mullion-<instance_id>.log`
+/// (Windows `%APPDATA%\mullion\config\mullion-<id>.log`)。
+///
+/// **一实例一文件**:多开时所有实例 append 进同一个文件的话,profile 行里
+/// 的 CPU%/GPU%/显存全是 per-process 数字,混流之后会读成「一个进程在
+/// 6% 和 94% 之间抽风」—— 比没有日志更糟。
 pub fn log_path() -> Option<PathBuf> {
-    crate::shell::store::config_dir().map(|d| d.join("mullion.log"))
+    log_dir().map(|d| d.join(log_file_name(instance_id())))
 }
 
 /// 解析级别字符串。无法识别或缺省时回落到 `default`。纯函数,可单测。
@@ -226,7 +265,8 @@ pub fn init(version: &str, stored: mullion_store::LogLevel) {
 
     match path {
         Some(p) => line(&format!(
-            "==== mullion {version} 启动;日志: {} (app={app} deps={deps}) ====",
+            "==== mullion {version} 启动;日志: {} (app={app} deps={deps}) ====\n\
+             (一实例一文件;上一版的 mullion.log 若还在,已不再写入)",
             p.display()
         )),
         None => line(&format!(
@@ -636,5 +676,46 @@ mod tests {
     fn the_pid_sits_between_the_timestamp_and_the_message() {
         let line = format_line("TS", 7, "MSG");
         assert_eq!(line, "[TS] [7] MSG\n");
+    }
+
+    /// 文件名 ⇄ instance id 的往返。
+    ///
+    /// 自证会变红:把 `log_file_name` 里的 `mullion-` 前缀去掉。
+    #[test]
+    fn a_log_file_name_round_trips_to_its_instance_id() {
+        let name = log_file_name("1755000000123-4242");
+        assert_eq!(name, "mullion-1755000000123-4242.log");
+        assert_eq!(parse_log_name(&name), Some("1755000000123-4242"));
+        assert_eq!(
+            parse_log_name("mullion-1755000000123-4242.log.1"),
+            Some("1755000000123-4242"),
+            "轮转出来的 .log.1 必须认得出属于哪个实例,否则它成孤儿"
+        );
+    }
+
+    /// **解析器必须严格**:只认 F148 的 `{纯数字}-{纯数字}`。
+    ///
+    /// 宽松匹配会把 F155 导出的 `mullion-redacted.log` 认成 instance id
+    /// 为 `redacted` 的日志 —— 它没有心跳,会被判死,然后被清理逻辑
+    /// **删掉用户刚导出准备发给我们的那个文件**。
+    ///
+    /// 老的 `mullion.log`(无 id)也必须返回 None:那是上一版留下的,
+    /// 用户可能正开着看,不归我们管。
+    ///
+    /// 自证会变红:把 `parse_log_name` 里的 `is_instance_id(id)` 判断删掉。
+    #[test]
+    fn only_a_real_instance_id_is_recognised_so_other_files_are_never_touched() {
+        for bad in [
+            "mullion-redacted.log",          // F155 导出的脱敏副本
+            "mullion-redacted-1-2.log",      // 带 id 的脱敏副本
+            "mullion.log",                   // 上一版的遗留日志
+            "mullion.log.1",                 // 上一版的遗留轮转
+            "mullion-.log",                  // 空 id
+            "mullion-abc-def.log",           // 非数字
+            "mullion-1-2-3.log",             // 三段
+            "notes.txt",                     // 完全无关
+        ] {
+            assert_eq!(parse_log_name(bad), None, "{bad} 不该被当成实例日志");
+        }
     }
 }
