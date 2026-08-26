@@ -10983,6 +10983,10 @@ fn render_frame(
             label: Some("frame"),
         });
 
+    // F165:GPU 帧耗时抽样。上一次回读还没回来就跳过本帧(传 None,零开销)。
+    let ts_writes = a.gpu.gpu_timer.as_ref().and_then(|t| t.writes());
+    let sampling = ts_writes.is_some();
+
     // egui 纹理上传/顶点缓冲更新须在 begin_render_pass 之前:update_buffers 要
     // `&mut enc` 记录拷贝命令,而 render pass 开始后 `enc` 会被 pass 借用/锁定。
     for (id, delta) in &full_output.textures_delta.set {
@@ -11005,7 +11009,7 @@ fn render_frame(
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
             occlusion_query_set: None,
         });
         if let Some((inst, n)) = &terminal_draw {
@@ -11025,9 +11029,23 @@ fn render_frame(
             .render(&mut static_pass, &paint_jobs, &screen);
     }
 
+    // resolve 必须在 submit 之前录进同一个 encoder。
+    if sampling {
+        if let Some(t) = a.gpu.gpu_timer.as_ref() {
+            t.resolve(&mut enc);
+        }
+    }
+
     a.gpu
         .queue
         .submit(egui_cmds.into_iter().chain(std::iter::once(enc.finish())));
+
+    // 回读在 submit 之后发起:map_async 要等 GPU 跑完这批命令。
+    if sampling {
+        if let Some(t) = a.gpu.gpu_timer.as_ref() {
+            t.read_back();
+        }
+    }
     // present 在 Fifo 下会等 vsync;它和上面的 acquire 是最可能长阻塞的两步,
     // 分开打点才能区分「等交换链」和「等驱动」。
     diag::mark(diag::Stage::Present);

@@ -335,6 +335,99 @@ pub struct Gpu {
     quad_pipeline: wgpu::RenderPipeline,
     resolution_buf: wgpu::Buffer,
     resolution_bind: wgpu::BindGroup,
+    /// F165:GPU 帧耗时采样。adapter 不支持 TIMESTAMP_QUERY 时是 `None`。
+    pub gpu_timer: Option<GpuTimer>,
+}
+
+/// F165:一帧 GPU 耗时的采样器。
+///
+/// **抽样而非每帧**:回读要走 `map_async`,一个 staging buffer 同时只能
+/// 服务一次采样。忙的时候本帧就不挂 `timestamp_writes`(传 `None`,零开销),
+/// 等上一次回读完再采下一次。诊断指标不该反过来影响被诊断的对象。
+pub struct GpuTimer {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    /// **必须是 `Arc`**:`map_async` 的回调是 `'static` 的,要把 buffer
+    /// move 进去才能在里面 `get_mapped_range` / `unmap`。而 wgpu 23 的
+    /// `wgpu::Buffer` **没有实现 `Clone`**(只 derive 了 `Debug`),
+    /// 直接 `.clone()` 编不过。
+    staging: std::sync::Arc<wgpu::Buffer>,
+    period_ns: f32,
+    /// 上一次采样还没回来。
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GpuTimer {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("frame-timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let size = 2 * std::mem::size_of::<u64>() as wgpu::BufferAddress;
+        Self {
+            set,
+            resolve: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts-resolve"),
+                size,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            staging: std::sync::Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ts-staging"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })),
+            period_ns: queue.get_timestamp_period(),
+            busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// 这一帧要不要采。`None` = 上一次还没回来,本帧不挂时间戳。
+    pub fn writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        if self.busy.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        Some(wgpu::RenderPassTimestampWrites {
+            query_set: &self.set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        })
+    }
+
+    /// 在 `submit` **之前**录进 encoder。只在本帧真的挂了时间戳时调。
+    pub fn resolve(&self, enc: &mut wgpu::CommandEncoder) {
+        enc.resolve_query_set(&self.set, 0..2, &self.resolve, 0);
+        enc.copy_buffer_to_buffer(&self.resolve, 0, &self.staging, 0, self.staging.size());
+    }
+
+    /// `submit` **之后**发起回读。
+    ///
+    /// 回调要等后续 `poll`/`submit` 才触发 —— 长空闲时样本会停在半路。
+    /// **那不是泄漏**:`busy` 一直是 true,下一次渲染自然收割,只是这段
+    /// 时间里不再采新样本。
+    pub fn read_back(&self) {
+        self.busy.store(true, std::sync::atomic::Ordering::Relaxed);
+        let busy = self.busy.clone();
+        let staging = self.staging.clone();
+        let period = self.period_ns;
+        self.staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |res| {
+                if res.is_ok() {
+                    let view = staging.slice(..).get_mapped_range();
+                    let a = u64::from_le_bytes(view[0..8].try_into().unwrap_or_default());
+                    let b = u64::from_le_bytes(view[8..16].try_into().unwrap_or_default());
+                    drop(view);
+                    let ticks = b.saturating_sub(a);
+                    let us = (ticks as f64 * period as f64 / 1000.0) as u64;
+                    crate::diag::record_gpu_frame_us(us);
+                }
+                staging.unmap();
+                busy.store(false, std::sync::atomic::Ordering::Relaxed);
+            });
+    }
 }
 
 /// 传给着色器的每实例数据:像素矩形 + 归一化颜色。
@@ -372,8 +465,25 @@ impl Gpu {
         // F165:显存探针要按 vendor/device 在 DXGI 里认出同一块卡。
         // adapter 枚举一次常驻,交给 diag 存着。
         crate::diag::set_vram_probe(crate::sysprobe::VramProbe::new(info.vendor, info.device));
+        // F165:GPU 帧耗时要 TIMESTAMP_QUERY。**条件申请**:请求 adapter
+        // 不支持的 feature,`request_device` 会直接失败 —— 那等于为了一个
+        // 诊断指标让整个程序在老驱动上起不来。不支持就整块降级成 n/a。
+        let has_ts = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        if !has_ts {
+            log::info!(target: "mullion", "adapter 不支持 TIMESTAMP_QUERY,GPU 帧耗时降级为 n/a");
+        }
         let (device, queue) = handle
-            .block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .block_on(adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    required_features: if has_ts {
+                        wgpu::Features::TIMESTAMP_QUERY
+                    } else {
+                        wgpu::Features::empty()
+                    },
+                    ..Default::default()
+                },
+                None,
+            ))
             .expect("request_device");
         // 设备级故障自报:TDR / 驱动重置 / 校验层错误由 wgpu 直接告诉我们,
         // 不用再从「Explorer 崩了」反推。回调在 wgpu 内部线程调用,只写日志。
@@ -383,6 +493,7 @@ impl Gpu {
         device.set_device_lost_callback(|reason, msg| {
             log::error!(target: "mullion", "wgpu 设备丢失({reason:?}): {msg}");
         });
+        let gpu_timer = has_ts.then(|| GpuTimer::new(&device, &queue));
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -488,6 +599,7 @@ impl Gpu {
             quad_pipeline,
             resolution_buf,
             resolution_bind,
+            gpu_timer,
         }
     }
 

@@ -256,6 +256,8 @@ pub struct Snapshot {
     pub gpu_available: bool,
     /// F165:本进程显存 (已用 MB, 预算 MB)。`None` = 采不到。
     pub vram_mb: Option<(u64, u64)>,
+    /// F165:GPU 帧耗时分布。样本数为 0 = 不支持或本窗口没采到。
+    pub gpu_frame_us: Counts,
 }
 
 /// 逐阶段计数。长度与 `diag::Stage` 的变体数一致。
@@ -316,6 +318,7 @@ impl Snapshot {
             gpu_engines: Vec::new(),
             gpu_available: false,
             vram_mb: None,
+            gpu_frame_us: [0; BUCKETS],
         }
     }
 
@@ -446,12 +449,27 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         dirty_parts.join(",")
     };
 
+    // GPU 帧耗时:样本数为 0 时报 n/a 而不是 p50=0 —— adapter 不支持
+    // TIMESTAMP_QUERY 与「GPU 一帧只用了 0µs」必须在日志里长得不一样。
+    let gpu_us_part = {
+        let n = total(&s.gpu_frame_us);
+        if n == 0 {
+            "n/a".to_string()
+        } else {
+            format!(
+                "{n}x/p50={}/p95={}",
+                fmt_us(quantile_us(&s.gpu_frame_us, 0.5)),
+                fmt_us(quantile_us(&s.gpu_frame_us, 0.95))
+            )
+        }
+    };
+
     Some(format!(
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
          reshape=hit:{}/miss:{} fp=hit:{}/miss:{} wake={}x/rr=sched:{},evt:{} dirty={} \
          egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
-         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB cpu={} gpu={} vram={}",
+         conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={} mem={}MB cpu={} gpu={} vram={} gpu_us={}",
         secs,
         s.frames,
         fmt_us(quantile_us(&s.frame_us, 0.5)),
@@ -498,6 +516,7 @@ pub fn render_line(s: &Snapshot) -> Option<String> {
         fmt_engines(&s.gpu_engines, s.gpu_available),
         s.vram_mb
             .map_or_else(|| "n/a".to_string(), |(u, b)| format!("{u}/{b}MB")),
+        gpu_us_part,
     ))
 }
 
@@ -1103,5 +1122,25 @@ mod tests {
         s.vram_mb = Some((123, 4096));
         let line = render_line(&s).expect("非空闲窗口该出行");
         assert!(line.contains("vram=123/4096MB"), "显存没渲染出来:{line}");
+    }
+
+    /// 没采到 GPU 帧耗时时报 `n/a`,不是 `p50=0`。
+    ///
+    /// adapter 不支持 TIMESTAMP_QUERY 与「GPU 一帧只用了 0µs」是两回事,
+    /// 后者还会让人以为渲染是免费的。
+    ///
+    /// 自证会变红:把 `gpu_us_part` 的 `n == 0` 分支删掉。
+    #[test]
+    fn a_gpu_timer_that_never_reported_says_n_a_instead_of_zero() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        s.frames = 10;
+        let line = render_line(&s).expect("非空闲窗口该出行");
+        assert!(line.contains("gpu_us=n/a"), "没采到却报了数字:{line}");
+
+        // `bucket_of` 是本模块私有的,`mod tests` 里有 `use super::*` 直接可用。
+        s.gpu_frame_us[bucket_of(2_000)] = 3;
+        let line = render_line(&s).expect("非空闲窗口该出行");
+        assert!(line.contains("gpu_us=3x/"), "采到了却没报:{line}");
     }
 }

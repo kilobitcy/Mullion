@@ -270,6 +270,13 @@ static HOSTS: AtomicU64 = AtomicU64::new(0);
 
 static FRAME_US: crate::profile::Histogram = crate::profile::Histogram::new();
 static ECHO_US: crate::profile::Histogram = crate::profile::Histogram::new();
+/// F165:GPU 帧耗时(微秒)。与 `FRAME_US` 共用一套桶,好横向比。
+static GPU_FRAME_US: crate::profile::Histogram = crate::profile::Histogram::new();
+
+/// F165:记一次 GPU 帧耗时。由 wgpu 的 map 回调调用(不在主线程上)。
+pub fn record_gpu_frame_us(us: u64) {
+    GPU_FRAME_US.record_us(us);
+}
 
 /// F165:显存探针。`Gpu::new` 建好后放进来 —— 看门狗线程比 GPU 早启动,
 /// 拿不到 adapter info,只能反过来由 GPU 那边推给它。
@@ -726,6 +733,7 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
         .get()
         .and_then(|p| p.sample())
         .map(|v| (v.used_mb, v.budget_mb));
+    s.gpu_frame_us = GPU_FRAME_US.drain();
     s
 }
 
