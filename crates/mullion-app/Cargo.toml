@@ -56,6 +56,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Performance",
     # F164:DuplicateHandle 拿主线程真句柄(GetCurrentThread 是伪句柄)。
     "Win32_Foundation",
+    # F168:ThreadCpuProbe 按线程枚举 CPU 时间要用的
+    # CreateToolhelp32Snapshot/Thread32First/Thread32Next/THREADENTRY32。
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 # F59 拖出到资源管理器:要**实现** COM 接口(IDataObject/IStream/IDropSource),
 # 而 windows-sys 只给裸 FFI 声明,给不出 vtable。所以这里额外要带 `implement`

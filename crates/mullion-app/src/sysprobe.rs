@@ -202,6 +202,203 @@ fn read_cpu_ns(_p: &CpuProbe) -> Option<(u64, u64)> {
     None
 }
 
+/// F168:每线程 CPU 时间探针。有状态(差分),看门狗线程持有。
+///
+/// 固有缺陷(如实写在这,别试图修):
+///
+/// 1. 两次采样之间生灭的短命线程漏账。5 秒窗口 + 本项目线程全是长命线程,
+///    可接受;真要精确得 hook 线程生命周期,超出日志的本分。
+/// 2. **tid 复用**:线程退出后 tid 被新线程拿走,新线程的累计值从 0 起,
+///    比 `prev` 里那个记录小,`saturating_sub` 把这一窗口的 delta 静默夹成 0
+///    ——一个「看着正常」的假零值。Windows 回收 tid 比 Linux 积极,而
+///    Windows 是本项目唯一的一等公民,所以这条不是纯理论。判为可接受:
+///    只影响复用发生的那**一个**窗口,下一窗口差分就自愈了,而要根治得按
+///    (tid, 线程创建时间)做键,那是给日志加一整套线程身份追踪。
+pub struct ThreadCpuProbe {
+    /// tid → 上一窗口的累计 CPU ns。`None` = 还没建过基线(首次采样)。
+    prev: Option<std::collections::HashMap<u32, u64>>,
+    main_tid: u32,
+}
+
+impl ThreadCpuProbe {
+    /// `main_tid` 必须是主线程的 tid —— 在主线程上调
+    /// [`linux_current_tid`](自身,Linux)/`GetCurrentThreadId`(Windows)取好
+    /// 传进来(同 T12 的教训:谁调谁的语义,存下来跨线程用就错了)。主线程
+    /// 口径已有 `CpuProbe`(F164)更准地覆盖,这里的清单**排除**它,不重复计。
+    pub fn new(main_tid: u32) -> Self {
+        Self {
+            prev: None,
+            main_tid,
+        }
+    }
+
+    /// 枚举全部线程,返回 (线程名, 这一窗口的 CPU ns 增量),**排除主线程**
+    /// (F164 已有更准的主线程口径)。首次调用建基线返回 `Some(空表)`。
+    /// 平台枚举失败返回 `None`(渲染层显示 n/a,不冒充 0)。
+    #[cfg(target_os = "linux")]
+    pub fn sample(&mut self) -> Option<Vec<(String, u64)>> {
+        let hz = 100u64; // 同 `read_cpu_ns`:USER_HZ 恒为 100,内核 ABI,不随 CONFIG_HZ 变。
+        let dir = std::fs::read_dir("/proc/self/task").ok()?;
+        let mut cur: std::collections::HashMap<u32, (String, u64)> =
+            std::collections::HashMap::new();
+        for entry in dir.flatten() {
+            let Some(tid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if tid == self.main_tid {
+                continue;
+            }
+            // 线程可能在枚举途中退出,读不到就跳过它,不让整次采样失败。
+            let Some(ns) = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    // comm 字段可能含空格和括号,从最后一个 ')' 之后开始切,
+                    // 手法照抄 `read_cpu_ns` 的 Linux 分支。
+                    let rest = &s[s.rfind(')')? + 1..];
+                    let f: Vec<&str> = rest.split_whitespace().collect();
+                    // 从 ')' 之后数:索引 0 = state(第 3 字段),故 utime(14) = 索引 11。
+                    let utime: u64 = f.get(11)?.parse().ok()?;
+                    let stime: u64 = f.get(12)?.parse().ok()?;
+                    Some((utime + stime) * 1_000_000_000 / hz)
+                })
+            else {
+                continue;
+            };
+            let name = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
+                .map(|s| s.trim_end().to_string())
+                .unwrap_or_default();
+            cur.insert(tid, (name, ns));
+        }
+        let out = match &self.prev {
+            None => Vec::new(), // 首次调用只建基线,不出数。
+            Some(prev) => cur
+                .iter()
+                .map(|(tid, (name, ns))| {
+                    let delta = match prev.get(tid) {
+                        Some(p) => ns.saturating_sub(*p),
+                        None => *ns, // 窗口内新出现的线程,从 0 起,全额算。
+                    };
+                    (name.clone(), delta)
+                })
+                .collect(),
+        };
+        // 整表替换,不是增量 merge:退出线程的旧 tid 就此从 `prev` 里消失,
+        // 不然 HashMap 会随线程生灭无限涨。
+        self.prev = Some(cur.into_iter().map(|(tid, (_, ns))| (tid, ns)).collect());
+        Some(out)
+    }
+
+    /// 同上,Windows 分支。已交叉编译 + clippy 验过(`--target
+    /// x86_64-pc-windows-gnu`),但**没在真机上跑过**——FFI 编译过不等于
+    /// 调用序列对,数字是否合理留 Windows 实机验收。
+    #[cfg(windows)]
+    pub fn sample(&mut self) -> Option<Vec<(String, u64)>> {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, LocalFree, FILETIME, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcessId, GetThreadDescription, GetThreadTimes, OpenThread,
+            THREAD_QUERY_LIMITED_INFORMATION,
+        };
+
+        // FILETIME 的单位是 100 纳秒(照抄 `read_cpu_ns` 的 Windows 分支)。
+        fn ns(ft: FILETIME) -> u64 {
+            (((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64) * 100
+        }
+
+        // SAFETY: 0 表示不限定单个线程/堆/模块;TH32CS_SNAPTHREAD 下第二个
+        // 参数(通常用于指定进程)被忽略,快照的是调用者自己的进程。
+        let snap: HANDLE = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // SAFETY: 无参数,返回调用者自己的进程 id。
+        let pid = unsafe { GetCurrentProcessId() };
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        // 必须先填 dwSize,否则 Thread32First 直接失败。
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+
+        let mut cur: std::collections::HashMap<u32, (String, u64)> =
+            std::collections::HashMap::new();
+        // SAFETY: `entry.dwSize` 已按结构体大小填好,`snap` 刚创建有效。
+        let mut ok = unsafe { Thread32First(snap, &mut entry) };
+        while ok != 0 {
+            if entry.th32OwnerProcessID == pid && entry.th32ThreadID != self.main_tid {
+                let tid = entry.th32ThreadID;
+                // SAFETY: `tid` 来自本进程的快照。
+                let h: HANDLE = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid) };
+                if !h.is_null() {
+                    let mut c = FILETIME {
+                        dwLowDateTime: 0,
+                        dwHighDateTime: 0,
+                    };
+                    let mut e = c;
+                    let mut k = c;
+                    let mut u = c;
+                    // SAFETY: `h` 刚 OpenThread 得到,四个 out 参数在栈上。
+                    let times_ok = unsafe { GetThreadTimes(h, &mut c, &mut e, &mut k, &mut u) };
+                    if times_ok != 0 {
+                        let mut desc: *mut u16 = std::ptr::null_mut();
+                        // SAFETY: `h` 有效,`desc` 是本地栈变量。
+                        let hr = unsafe { GetThreadDescription(h, &mut desc) };
+                        let name = if hr >= 0 && !desc.is_null() {
+                            // SAFETY: `desc` 是 GetThreadDescription 成功时给出的
+                            // NUL 结尾宽串,读完立刻用 LocalFree 释放。
+                            let s = unsafe {
+                                let mut len = 0usize;
+                                while *desc.add(len) != 0 {
+                                    len += 1;
+                                }
+                                String::from_utf16_lossy(std::slice::from_raw_parts(desc, len))
+                            };
+                            // SAFETY: `desc` 是 GetThreadDescription 分配的,用完释放。
+                            unsafe { LocalFree(desc as HLOCAL) };
+                            s
+                        } else {
+                            String::new() // 空名原样返回,分组层管占位。
+                        };
+                        cur.insert(tid, (name, ns(k) + ns(u)));
+                    }
+                    // SAFETY: `h` 是 OpenThread 给的自有句柄。
+                    unsafe { CloseHandle(h) };
+                }
+            }
+            // SAFETY: `snap` 仍有效,`entry` 复用同一块栈内存,由 Thread32Next 重填。
+            ok = unsafe { Thread32Next(snap, &mut entry) };
+        }
+        // SAFETY: `snap` 是 CreateToolhelp32Snapshot 给的自有句柄。
+        unsafe { CloseHandle(snap) };
+
+        let out = match &self.prev {
+            None => Vec::new(), // 首次调用只建基线,不出数。
+            Some(prev) => cur
+                .iter()
+                .map(|(tid, (name, t))| {
+                    let delta = match prev.get(tid) {
+                        Some(p) => t.saturating_sub(*p),
+                        None => *t, // 窗口内新出现的线程,从 0 起,全额算。
+                    };
+                    (name.clone(), delta)
+                })
+                .collect(),
+        };
+        self.prev = Some(cur.into_iter().map(|(tid, (_, t))| (tid, t)).collect());
+        Some(out)
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    pub fn sample(&mut self) -> Option<Vec<(String, u64)>> {
+        None
+    }
+}
+
 /// 一次 GPU 引擎占用采样。`engines` 已按占用倒序,最多两项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuSample {
@@ -648,5 +845,99 @@ mod tests {
             ("pid_7_luid_a_b_phys_0_eng_1_engtype_3D".to_string(), 70.0),
         ];
         assert_eq!(aggregate_engines(&items, 7), vec![("3D".to_string(), 100)]);
+    }
+
+    /// F168:线程枚举必须真的按线程分账。在一条命名线程里烧 CPU,
+    /// 采样结果里该线程的 delta 必须显著大于零,且**主线程不在清单里**。
+    ///
+    /// 排除主线程的证法:另起一条命名线程,把它自己的 tid 当作
+    /// `main_tid` 传给一个**独立的第二个 probe**,让它也烧 CPU —— 如果
+    /// 排除逻辑是错的,它必然会在自己那个 probe 的清单里看见自己。
+    /// 用同一个 probe 校验「自己的 tid 不在清单里」不够直接:测试线程
+    /// 的 comm 名不可控(测试框架起的),没法按名字断言。
+    ///
+    /// 命名限制:Linux `comm` 只有 15 个可见字符(TASK_COMM_LEN=16 含
+    /// NUL),线程名必须短于它,否则 `Builder::name` 起的名字会被截断,
+    /// 名字比对必然对不上。
+    ///
+    /// 自证会变红:把 `sample` 里「跳过 main_tid」的判断删掉(主线程混入),
+    /// 或把 delta 计算的新旧值弄反(全是 0)。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_burning_named_thread_shows_up_with_its_name_and_main_is_excluded() {
+        use std::sync::mpsc;
+
+        fn burn_for(dur: std::time::Duration) {
+            let start = std::time::Instant::now();
+            let mut x = 0u64;
+            while start.elapsed() < dur {
+                x = x.wrapping_add(1);
+            }
+            std::hint::black_box(x);
+        }
+
+        // 线程 1:待验证对象,烧 CPU 后清单里必须看得见它。
+        let (burn_tid_tx, burn_tid_rx) = mpsc::channel::<u32>();
+        let (burn_done_tx, burn_done_rx) = mpsc::channel::<()>();
+        let (release_burn_tx, release_burn_rx) = mpsc::channel::<()>();
+        let burner = std::thread::Builder::new()
+            .name("mullion-burn".to_string())
+            .spawn(move || {
+                burn_tid_tx.send(linux_current_tid()).unwrap();
+                burn_for(std::time::Duration::from_millis(300));
+                burn_done_tx.send(()).unwrap();
+                // 烧完之后阻塞等主线程放行,保证 sample 时它(以及
+                // /proc/self/task/<tid>)还活着,不会被 join 提前收尸。
+                let _ = release_burn_rx.recv();
+            })
+            .unwrap();
+        let _burn_tid = burn_tid_rx.recv().unwrap(); // 只用来确认线程已起跑,tid 本身不需要。
+
+        // 线程 2:排除对象,自己烧 CPU 却不该出现在以自己为 main_tid
+        // 的 probe 清单里。
+        let (excl_tid_tx, excl_tid_rx) = mpsc::channel::<u32>();
+        let (excl_done_tx, excl_done_rx) = mpsc::channel::<()>();
+        let (release_excl_tx, release_excl_rx) = mpsc::channel::<()>();
+        let excluded = std::thread::Builder::new()
+            .name("mullion-excl".to_string())
+            .spawn(move || {
+                excl_tid_tx.send(linux_current_tid()).unwrap();
+                burn_for(std::time::Duration::from_millis(300));
+                excl_done_tx.send(()).unwrap();
+                let _ = release_excl_rx.recv();
+            })
+            .unwrap();
+        let excl_tid = excl_tid_rx.recv().unwrap();
+
+        let mut probe = ThreadCpuProbe::new(linux_current_tid());
+        let mut probe_excl = ThreadCpuProbe::new(excl_tid);
+        assert_eq!(probe.sample(), Some(Vec::new()), "首次采样只建基线");
+        assert_eq!(probe_excl.sample(), Some(Vec::new()), "首次采样只建基线");
+
+        burn_done_rx.recv().unwrap();
+        excl_done_rx.recv().unwrap();
+
+        let list = probe.sample().expect("Linux 分支应该采得到");
+        let list_excl = probe_excl.sample().expect("Linux 分支应该采得到");
+
+        release_burn_tx.send(()).unwrap();
+        release_excl_tx.send(()).unwrap();
+        burner.join().unwrap();
+        excluded.join().unwrap();
+
+        let entry = list
+            .iter()
+            .find(|(name, _)| name == "mullion-burn")
+            .unwrap_or_else(|| panic!("清单里没找到 mullion-burn,得到:{list:?}"));
+        assert!(
+            entry.1 > 50_000_000,
+            "烧了 300ms CPU,delta 只有 {} ns",
+            entry.1
+        );
+
+        assert!(
+            !list_excl.iter().any(|(name, _)| name == "mullion-excl"),
+            "main_tid 对应的线程不该出现在清单里,得到:{list_excl:?}"
+        );
     }
 }
