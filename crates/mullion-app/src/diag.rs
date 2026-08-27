@@ -1166,8 +1166,16 @@ mod tests {
         let _ = take_snapshot(5_000);
         count_bands(&[plan(7, 70, true)], 1);
         let s = take_snapshot(5_000);
-        let p = s.pane_detail.iter().find(|p| p.id == 7).expect("pane 7 没进表");
-        assert_eq!(p.dirty_bands, 1 << 63, "第 70 带该折进最高位,而不是绕回低位");
+        let p = s
+            .pane_detail
+            .iter()
+            .find(|p| p.id == 7)
+            .expect("pane 7 没进表");
+        assert_eq!(
+            p.dirty_bands,
+            1 << 63,
+            "第 70 带该折进最高位,而不是绕回低位"
+        );
     }
 
     #[test]
@@ -1527,6 +1535,26 @@ mod tests {
         assert_eq!(panes[0].id, 1);
     }
 
+    /// F173:`PaneId(0)` 是真实 pane,不是空槽哨兵 —— 后来者不许抢它的槽。
+    ///
+    /// `KeyTable` 拿 `id == 0` 当空槽是安全的(那里 0 被禁用作真实键),照抄
+    /// 到这里就成了静默丢账:pane 0 占着槽、字节在涨,下一个 pane 扫到这个
+    /// 槽看见 `id == 0` 判成空,`fetch_add` 一并把 pane 0 的字节吃进自己名下。
+    /// 而 `Node::Leaf(PaneId(0))` 是第一个 pane —— 丢的总是它。
+    ///
+    /// 自证会变红:把 `slot` 的 quiet 判据加回 `self.id[i].load(..) == 0 ||`。
+    #[test]
+    fn pane_zero_holds_its_slot_against_the_next_comer() {
+        let t = PaneTable::new();
+        t.add_in(0, 100);
+        t.add_in(5, 7);
+        let (panes, other) = t.drain();
+        assert_eq!(other, 0);
+        let of = |id: u32| panes.iter().find(|p| p.id == id).map(|p| p.in_bytes);
+        assert_eq!(of(0), Some(100), "pane 0 的字节被后来者抢走了:{panes:?}");
+        assert_eq!(of(5), Some(7), "后来者不该顺走别人的账:{panes:?}");
+    }
+
     /// F173:脏带要按 pane 分开记,且**一个窗口里多帧的脏带取并集**。
     ///
     /// 并集而不是累加:要答的问题是「屏幕的**哪一块**在动」,那是位置,不是
@@ -1595,8 +1623,23 @@ mod tests {
 
         let s = take_snapshot(5_000);
         assert_eq!(s.inbound_bytes, 150, "全局 in= 没记上");
-        let of = |id: u32| s.pane_detail.iter().find(|p| p.id == id).map(|p| p.in_bytes);
-        assert_eq!(of(1), Some(100), "pane 1 的字节没归到它名下:{:?}", s.pane_detail);
-        assert_eq!(of(2), Some(50), "pane 2 的字节没归到它名下:{:?}", s.pane_detail);
+        let of = |id: u32| {
+            s.pane_detail
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.in_bytes)
+        };
+        assert_eq!(
+            of(1),
+            Some(100),
+            "pane 1 的字节没归到它名下:{:?}",
+            s.pane_detail
+        );
+        assert_eq!(
+            of(2),
+            Some(50),
+            "pane 2 的字节没归到它名下:{:?}",
+            s.pane_detail
+        );
     }
 }

@@ -1866,7 +1866,13 @@ mod tests {
         );
     }
 
-    fn detail(id: u32, in_bytes: u64, dirty_bands: u64, band_total: u32, frames: u64) -> PaneDetail {
+    fn detail(
+        id: u32,
+        in_bytes: u64,
+        dirty_bands: u64,
+        band_total: u32,
+        frames: u64,
+    ) -> PaneDetail {
         PaneDetail {
             id,
             in_bytes,
@@ -1895,8 +1901,7 @@ mod tests {
             .find(|l| l.starts_with("profile.pane "))
             .expect("没有 profile.pane 行");
         assert_eq!(
-            line,
-            "profile.pane p1 in=6.5KB@b11,b23/24 frames=5 | p2 in=6.5KB@b23/24 frames=5",
+            line, "profile.pane p1 in=6.5KB@b11,b23/24 frames=5 | p2 in=6.5KB@b23/24 frames=5",
             "格式或排序不对"
         );
     }
@@ -1910,7 +1915,10 @@ mod tests {
     #[test]
     fn a_window_where_no_pane_moved_has_no_pane_line() {
         let s = busy_snapshot();
-        assert!(s.pane_detail.is_empty(), "前提：busy_snapshot 不带 per-pane");
+        assert!(
+            s.pane_detail.is_empty(),
+            "前提：busy_snapshot 不带 per-pane"
+        );
         assert!(
             !render_lines(&s, false)
                 .iter()
