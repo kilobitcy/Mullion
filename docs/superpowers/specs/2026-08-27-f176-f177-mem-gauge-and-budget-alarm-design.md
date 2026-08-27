@@ -155,6 +155,13 @@ F155 的既有债（`profile.rs:908` 的注释自己承认了），不再复制�
 /// 计进工作集（N5 切片实测 165MB WriteCombine 全在账内）。独显机器上同样的
 /// 代码会低一大截。看到读数逼近上限时，先问「核显还是独显」再下结论。
 pub const N5_BUDGET_MB: u64 = 300;
+
+/// 报告步长：越界后，比上次报告值又高这么多才再报一次（§3.3）。
+pub const MEM_REPORT_STEP_MB: u64 = 64;
+
+/// 回落滞回带。**删掉它不会有任何测试以外的报错**，但空闲进程会因为
+/// ws 在阈值附近抖动而每几个窗口写两行日志——硬盘永不休眠（§3.3）。
+pub const MEM_HYSTERESIS_MB: u64 = 16;
 ```
 
 **阈值不随 pane 数浮动**（曾考虑 `160 + 18 × panes`）：那会凭空引入一个拍脑袋的
@@ -164,7 +171,7 @@ pub const N5_BUDGET_MB: u64 = 300;
 ### 3.2 输出
 
 ```
-WARN  profile.mem.over ws=428MB > N5 300MB (commit 512, 其他 423)
+WARN  profile.mem.over ws=428MB > N5 300MB (commit 512, 其他 507)
 INFO  profile.mem.over 回落 ws=180MB
 ```
 
@@ -180,6 +187,23 @@ INFO  profile.mem.over 回落 ws=180MB
 
 **首次越界报一次；之后只在比上次报告值又高 ≥ `MEM_REPORT_STEP_MB`（64）时再报；
 跌回阈值以下报一次 `回落` 并复位。**
+
+**边界写死**：`Cross` 判 `ws > N5_BUDGET_MB`（严格大于，恰好 300 不算超）。
+
+**`Recover` 判 `ws <= N5_BUDGET_MB - MEM_HYSTERESIS_MB`（16），不是简单的
+「跌回阈值以下」——不加这条滞回带，§3.4 拿来绕开空闲门的那个理由当场作废。**
+
+ws 在阈值附近抖动（299↔301）是常态：Windows 会主动裁剪工作集，进程自己
+一次分配释放也能跨过去。没有滞回时每一次穿越都产出一对 `Cross`/`Recover`，
+两行日志每几个窗口来一遍——**一个空闲进程被这条警告永远吵醒**，正是
+§3.4 承诺「O(1) 不是 O(每 5 秒)」时排除掉的那件事。
+
+加了 16MB 滞回后：抖在 284~301 之间时首次 `Cross` 一次，之后保持越界态、
+全程 `Quiet`；真回落（428→180 那种）照常报 `回落`。
+
+**代价要说清**：ws 长期停在 290 时不会出「回落」行，日志上停留在
+「越界中」。可接受——之前那条 WARN 报的数就是 301，读者不会被带偏多少；
+而反过来（不加滞回）的代价是硬盘永不休眠，量级完全不同。
 
 不复用 `diag::should_report`（`diag.rs:821`）那套翻倍：内存从 300 翻到 600 才吭
 第二声，中间一条几百 MB 的慢泄漏全程静默。固定步长对内存更合适。
@@ -214,12 +238,15 @@ N5 那次要查的场景一行都不写。
 
 | 测试 | 钉住什么 | 变异 |
 |---|---|---|
-| `budget_verdict` 状态机四条 | 首次越界 `Cross`；同值再来 `Quiet`；+64MB 再 `Cross`；跌回后 `Recover` 且复位后能再 `Cross` | 去掉步长、改成每窗口都报 |
+| `budget_verdict` 状态机四条 | 首次越界 `Cross`；同值再来 `Quiet`；+64MB 再 `Cross`；跌回滞回带下沿后 `Recover` 且复位后能再 `Cross` | 去掉步长、改成每窗口都报 |
+| `jitter_around_the_threshold_does_not_wake_the_disk` | 喂 `301 → 299 → 301 → 299`，断言只有第一个出 `Cross`、其余全 `Quiet`（**一条 `Recover` 都不许有**） | `Recover` 的边界去掉滞回、改回 `ws <= N5_BUDGET_MB` |
+| `the_threshold_is_strictly_greater_than` | 恰好 `ws == 300` 判 `Quiet` | `>` 改 `>=` |
 | `no_reading_means_no_alarm` | `ws_mb: None` 恒 `Quiet` | `is_some_and` 改 `is_none_or` |
 | `an_idle_process_that_is_over_budget_still_gets_a_warning` | **接线**：空闲快照 + 超预算 ws → 仍出警告行 | 把 `budget_verdict` 挪进 `render_lines` 的 `is_idle` 之后 |
 
-第三条是整个 F177 最容易在日后重构中被悄悄埋掉的一点：挪进去之后编译过、
-测试若只测纯函数也全绿，只有实机空载时才发现它不响。
+**最后一条（`an_idle_process_…`）是整个 F177 最容易在日后重构中被悄悄埋掉的一点**：
+把 `budget_verdict` 挪进 `is_idle` 之后，编译过、测试若只测纯函数也全绿，
+只有实机空载时才发现它不响。
 
 ---
 
