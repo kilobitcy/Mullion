@@ -257,9 +257,15 @@ pub struct TextLayer {
     /// 自动覆盖(这正是「判在结果上」的收益),而新开的带 `fp` 是 `None`、
     /// 本来就会重建。多加一个列举式 hook 就是多一处日后会漏的地方。
     force_full: bool,
-    /// F12:跨帧的整形缓存,按 `(PaneId, row)` 分槽。取代了原来那个
-    /// "每帧从头填一遍"的 `Vec<Buffer>`。
+    /// F12:跨帧的整形缓存。F174 起按 [`crate::shaped_cache::ShapeKey`]
+    /// (内容 + `term_w`)**内容寻址**分槽,取代了原来那个按 `(PaneId, row)`
+    /// 位置寻址的键 —— 滚动时后者会让整块 pane 全部 miss。
     cache: crate::shaped_cache::ShapedCache<Buffer>,
+    /// F174:位置寻址的行指纹台账,**只喂 `seg=` 这个诊断量**。
+    ///
+    /// 缓存改内容寻址之后,「哪些行的内容变了」问不到 `cache` 了(它只知道
+    /// 「这份内容见没见过」)。两张表职责切开,理由见 [`crate::row_fp`]。
+    row_fp: crate::row_fp::RowFingerprints,
     /// 空闲的 `Buffer` 回收池。缓存逐出、重整形、清空时的旧 buffer 都进这里,
     /// 整形时优先从这里取 —— 每帧新建上千个 `Buffer` 就是陷阱 T3,而且滚动
     /// 场景(每帧每行都变)不回收会比改之前更慢。
@@ -324,8 +330,9 @@ fn shape_run(
 /// 本帧某个 `TextArea` 的 buffer 存在哪。
 #[derive(Clone, Copy)]
 enum BufSrc {
-    /// 在跨帧缓存里:`(键, 这一行第几个 run)`。
-    Cached((mullion_core::layout::PaneId, u16), usize),
+    /// 在跨帧缓存里:`(内容键, 这一行第几个 run)`。F174 起是内容寻址,
+    /// 同一条目会被本帧多处 `Placement` 共同引用(所有空行共用一条)。
+    Cached(crate::shaped_cache::ShapeKey, usize),
     /// 在临时槽里(IME 组字)。
     Temp(usize),
 }
@@ -364,6 +371,7 @@ impl TextLayer {
             frame: 0,
             force_full: false,
             cache: crate::shaped_cache::ShapedCache::new(),
+            row_fp: crate::row_fp::RowFingerprints::new(),
             pool: Vec::new(),
             temp: Vec::new(),
             cell_w,
@@ -504,22 +512,29 @@ impl TextLayer {
         // 合法;写成 `self.xxx` 穿插调用就借不出来了。
         let fs = &mut self.font_system;
         let cache = &mut self.cache;
+        let row_fp = &mut self.row_fp;
         let pool = &mut self.pool;
         let temp = &mut self.temp;
         let (cell_w, cell_h) = (self.cell_w, self.cell_h);
 
         cache.begin_frame();
+        row_fp.begin_frame();
         let mut plan: Vec<Placement> = Vec::new();
         let mut temp_n = 0usize;
         let (mut hits, mut misses) = (0u64, 0u64);
         // F172 诊断:本帧内容变了的行号,按 pane 内行序升序累加(段数只统计
         // 局部性,跨 pane 拼在一起会把 pane 边界算成一次断裂 —— 那正是我们
         // 想知道的「变化散不散」,不必分 pane 统计)。
+        //
+        // F174:这里**必须**问位置寻址的 `row_fp`,不能拿整形 miss 集合顶替。
+        // 内容寻址之后 miss 的含义是「这份内容没见过」:滚一行只 miss 一行,
+        // 而屏幕上每一行显示的内容都换了 —— 拿 miss 当「变了的行」会报出
+        // 「局部性极好」,而带差分的调参依据静默失真(见 `row_fp` 模块文档)。
         let mut changed_rows: Vec<u16> = Vec::new();
         let mut segments = 0u32;
 
         for (pane_ix, p) in panes.iter().enumerate() {
-            // 缓存键必须是稳定身份。`pane_ix` 是当帧下标,关掉中间一块
+            // `row_fp` 的键必须是稳定身份。`pane_ix` 是当帧下标,关掉中间一块
             // pane 会让它挪位 —— 拿它当键会张冠李戴。
             let pane_id = p.geom.id;
             let term_w = p.geom.term_px.w;
@@ -529,10 +544,16 @@ impl TextLayer {
                 // 不然背景 quad 盖不住排在它后面的文字层,拼音会和原字符的
                 // 字形叠在一起。
                 let hidden = hidden_span_for_row(p, row);
-                let key = (pane_id, row);
                 let hash = p.snap.row_hash(row);
-                match crate::shaped_cache::plan_row(cache.get(key), hash, term_w, hidden.is_some())
-                {
+                // 内容寻址的整形缓存键:整形结果只取决于(内容, term_w, 字体),
+                // 字体那一维走 `set_font` 里的显式 clear。
+                let key = crate::shaped_cache::ShapeKey { hash, term_w };
+                // 诊断记账对**每一行**都做,组字行也不例外:问的是「这一行的
+                // 正文内容变了吗」,与它这一帧走不走缓存无关。
+                if row_fp.note((pane_id, row), hash) {
+                    changed_rows.push(row);
+                }
+                match crate::shaped_cache::plan_row(cache.get(key), hidden.is_some()) {
                     RowPlan::Reuse => {
                         hits += 1;
                         cache.touch(key);
@@ -549,10 +570,9 @@ impl TextLayer {
                     }
                     RowPlan::Reshape => {
                         misses += 1;
-                        changed_rows.push(row);
-                        // 先把旧载荷收回池子再整形,否则滚动场景每帧新建
-                        // 上千个 `Buffer`(T3),比改之前还慢。
-                        cache.recycle_row(key, pool);
+                        // 内容寻址下这一档意味着「这份内容没见过」,同键旧载荷
+                        // 不存在,不必先摘再整形。旧 buffer 的回收全部收口在
+                        // `cache.end_frame`(滚出视野时),稳态是平的。
                         let mut runs: Vec<CachedRun<Buffer>> = Vec::new();
                         for run in row_to_runs(p.snap.row(row), hidden) {
                             let mut buf = pool.pop().unwrap_or_else(|| Buffer::new(fs, metrics));
@@ -573,7 +593,7 @@ impl TextLayer {
                         }
                         // 空 `runs` 也要写:整行空白的产物就是空集,不写条目
                         // 的话空行永远 miss,而空行是空闲画面的大头。
-                        cache.insert(key, hash, term_w, runs);
+                        cache.insert(key, runs);
                     }
                     RowPlan::Temporary => {
                         for run in row_to_runs(p.snap.row(row), hidden) {
@@ -638,9 +658,11 @@ impl TextLayer {
             }
         }
 
-        // 帧末逐出:本帧没访问过的键(pane 关了、行数缩了、切了标签)全删,
-        // 载荷回池子。刻意不在 `close_pane` 之类的地方各加清理 hook。
+        // 帧末逐出:本帧没访问过的键(pane 关了、行数缩了、切了标签、滚出
+        // 视野)全删,载荷回池子。刻意不在 `close_pane` 之类的地方各加清理
+        // hook。两张表同一条判据,一起逐。
         cache.end_frame(pool);
+        row_fp.end_frame();
         crate::diag::count_reshape(hits, misses);
         segments += crate::bands::segments(&changed_rows);
 
