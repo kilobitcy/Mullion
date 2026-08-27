@@ -69,7 +69,9 @@ exe 映像、mmap 进来的字体（N5 那轮 VMMap 量到 98.8MB Mapped File）
 拿它对照任务管理器照样对不上，只是差到另一个方向去。
 
 要的是 `PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize`
-（`windows-sys-0.60.2` 的 `Windows/Win32/System/ProcessStatus/mod.rs:143`）。
+（本项目锁定的 **`windows-sys 0.59.0`** 里已有：
+`Windows/Win32/System/ProcessStatus/mod.rs:138`，与 `EX` 同属已开的
+`Win32_System_ProcessStatus` feature，**不必新开 feature**）。
 
 **仍是同一个 `K32GetProcessMemoryInfo` 调用**，只把 `cb` 换成 `EX2` 的尺寸——
 零额外系统调用。代价：`EX2` 需要 Windows 11 / Server 2022。
