@@ -300,6 +300,14 @@ pub struct Snapshot {
     /// F173:槽位用完之后落在外面的入站字节(不是 pane 数)。
     pub pane_other_bytes: u64,
     pub mem_process_mb: u64,
+    /// F176:`mem_process_mb` 的口径(Windows commit / Linux rss)。
+    pub mem_kind: crate::diag::MemKind,
+    /// F176:专用工作集(MB)。`None` = 采不到。**不参与记账减法**,
+    /// 理由见 `mem_parts` 的文档注释;它是 F177 预算闸的判据。
+    ///
+    /// 用 `Option` 而不是沿用 `mem_process_mb` 那个 0 哨兵:0 哨兵是 F155
+    /// 的既有债(见本文件 `render_lines` 里 mem 行上方的注释),不再复制第二份。
+    pub mem_ws_mb: Option<u64>,
     /// F164:整个进程的 CPU 占用,**按核数归一**。`None` = 采不到。
     pub cpu_pct: Option<u8>,
     /// F164:主线程的 CPU 占用,**不归一**(一个核跑满 = 100)。
@@ -410,6 +418,8 @@ impl Snapshot {
             panes: 0,
             hosts: 0,
             mem_process_mb: 0,
+            mem_kind: crate::diag::MemKind::Rss,
+            mem_ws_mb: None,
             cpu_pct: None,
             main_cpu_pct: None,
             gpu_engines: Vec::new(),
@@ -476,6 +486,16 @@ impl Snapshot {
     fn cpu_is_busy(&self) -> bool {
         self.cpu_pct.is_some_and(|p| p >= IDLE_CPU_PCT)
             || self.main_cpu_pct.is_some_and(|p| p >= IDLE_MAIN_CPU_PCT)
+    }
+
+    /// F177:这一窗口「其他」栏的 MB 数,与 `profile.mem` 行同源
+    /// (共用 [`mem_accounted_mb`])。预算闸的告警行要带上它。
+    pub fn mem_other_mb(&self) -> u64 {
+        self.mem_process_mb.saturating_sub(mem_accounted_mb(
+            self.mem_scroll_bytes,
+            self.xfer_running * XFER_CHUNK,
+            self.mem_text_bytes,
+        ))
     }
 }
 
@@ -577,6 +597,15 @@ fn fmt_engines(engines: &[(String, u8)], available: bool) -> String {
         .join("/")
 }
 
+/// F169/F176:记账合计(MB)。三块各自 `>> 20` 向下取整再相加。
+///
+/// **抽出来是为了让 `mem_parts` 与 `Snapshot::mem_other_mb` 同源** ——
+/// 两处各算一遍的话,「日志里的其他」与「预算闸报的其他」迟早对不上,
+/// 而那种不一致没有任何东西会报错。
+pub fn mem_accounted_mb(scroll_b: u64, xfer_b: u64, text_b: u64) -> u64 {
+    (scroll_b >> 20) + (xfer_b >> 20) + (text_b >> 20)
+}
+
 /// F169:`profile.mem` 正文的纯渲染。手工记账三个已知大块 + 显式余量
 /// （用户拍板：不做自定义分配器）。
 ///
@@ -596,28 +625,44 @@ fn fmt_engines(engines: &[(String, u8)], available: bool) -> String {
 ///
 /// 余量为负时**显式报超出量**：静默夹 0（`saturating_sub` 一把梭）会让
 /// 「记账模型错了」永远不被发现（spec §5）。
-pub fn mem_parts(process_mb: u64, scroll_b: u64, xfer_b: u64, text_b: u64) -> String {
+///
+/// **F176:`ws_mb` 不参与减法。** 工作集会被系统裁剪(窗口最小化时尤其
+/// 激进),而三个记账块是 Rust 堆上的 `Vec`、字节数不因页被换出而变小。
+/// 拿 ws 做被减数,用户一最小化就会刷屏「记账超出」——把一个正常的系统
+/// 行为报成记账模型崩了。`primary_mb`(Windows 是 commit)不被裁剪、恒 ≥
+/// 我们的堆量,减法才成立。ws 的职责是另外两件:它是任务管理器里那个数,
+/// 以及 F177 预算闸的判据。守护:
+/// `tests::the_remainder_is_computed_against_commit_not_the_working_set`。
+pub fn mem_parts(
+    kind: crate::diag::MemKind,
+    primary_mb: u64,
+    ws_mb: Option<u64>,
+    scroll_b: u64,
+    xfer_b: u64,
+    text_b: u64,
+) -> String {
     let scroll = scroll_b >> 20;
     let xfer = xfer_b >> 20;
     let text = text_b >> 20;
-    let accounted = scroll + xfer + text;
-    if accounted <= process_mb {
+    let accounted = mem_accounted_mb(scroll_b, xfer_b, text_b);
+    // F176:ws 段只有 Commit 口径(Windows)才印 —— Linux 的 rss 本身就是
+    // 常驻量,再括一个 ws 是同义反复。采不到印 `n/a`,不许静默印 0。
+    let ws = match (kind, ws_mb) {
+        (crate::diag::MemKind::Commit, Some(mb)) => format!("(ws {mb})"),
+        (crate::diag::MemKind::Commit, None) => "(ws n/a)".to_string(),
+        (crate::diag::MemKind::Rss, _) => String::new(),
+    };
+    let label = kind.label();
+    if accounted <= primary_mb {
         format!(
-            "{}MB = scroll:{} xfer:{} text:{} 其他:{}",
-            process_mb,
-            scroll,
-            xfer,
-            text,
-            process_mb - accounted
+            "{label}={primary_mb}MB{ws} = scroll:{scroll} xfer:{xfer} text:{text} 其他:{}",
+            primary_mb - accounted
         )
     } else {
         format!(
-            "{}MB = scroll:{} xfer:{} text:{} 其他:0(记账超出RSS {}MB)",
-            process_mb,
-            scroll,
-            xfer,
-            text,
-            accounted - process_mb
+            "{label}={primary_mb}MB{ws} = scroll:{scroll} xfer:{xfer} text:{text} \
+             其他:0(记账超出{label} {}MB)",
+            accounted - primary_mb
         )
     }
 }
@@ -916,7 +961,9 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         lines.push(format!(
             "profile.mem {}",
             mem_parts(
+                s.mem_kind,
                 s.mem_process_mb,
+                s.mem_ws_mb,
                 s.mem_scroll_bytes,
                 xfer_buf_bytes,
                 s.mem_text_bytes
@@ -2247,26 +2294,128 @@ mod tests {
     /// 「超出」字样那条断言会抓住;把分支判据 `<=` 写成 `<`,边界那条会抓住。
     #[test]
     fn mem_parts_reports_the_remainder_honestly() {
+        use crate::diag::MemKind;
         // 正常:340 = 128 + 0 + 16 + 196。
         assert_eq!(
-            mem_parts(340, 128 << 20, 0, 16 << 20),
-            "340MB = scroll:128 xfer:0 text:16 其他:196"
+            mem_parts(MemKind::Rss, 340, None, 128 << 20, 0, 16 << 20),
+            "rss=340MB = scroll:128 xfer:0 text:16 其他:196"
         );
         // 全零记账:全进其他。
         assert_eq!(
-            mem_parts(50, 0, 0, 0),
-            "50MB = scroll:0 xfer:0 text:0 其他:50"
+            mem_parts(MemKind::Rss, 50, None, 0, 0, 0),
+            "rss=50MB = scroll:0 xfer:0 text:0 其他:50"
         );
-        // 负余量:记账 168MB > RSS 100MB,超出 68 要显式打出来。
+        // 负余量:记账 168MB > 主数 100MB,超出 68 要显式打出来。
         assert_eq!(
-            mem_parts(100, 128 << 20, 24 << 20, 16 << 20),
-            "100MB = scroll:128 xfer:24 text:16 其他:0(记账超出RSS 68MB)"
+            mem_parts(MemKind::Rss, 100, None, 128 << 20, 24 << 20, 16 << 20),
+            "rss=100MB = scroll:128 xfer:24 text:16 其他:0(记账超出rss 68MB)"
         );
-        // 分支边界:记账恰好等于 RSS。余量 0 是**如实的 0**,不是「超出 0MB」
+        // 分支边界:记账恰好等于主数。余量 0 是**如实的 0**,不是「超出 0MB」
         // —— 少了这条,把 `<=` 写成 `<` 三条断言全不变红(恒绿缺口)。
         assert_eq!(
-            mem_parts(144, 128 << 20, 0, 16 << 20),
-            "144MB = scroll:128 xfer:0 text:16 其他:0"
+            mem_parts(MemKind::Rss, 144, None, 128 << 20, 0, 16 << 20),
+            "rss=144MB = scroll:128 xfer:0 text:16 其他:0"
         );
+    }
+
+    /// F176:Windows 形态 —— 主数是 commit,ws 括在后面做交叉核对。
+    ///
+    /// 数字取自 N5 切片的实机日志(428MB commit / 289MB 专用工作集,
+    /// 同一时刻),不是编的。
+    #[test]
+    fn mem_parts_renders_commit_and_ws_on_windows() {
+        assert_eq!(
+            mem_parts(crate::diag::MemKind::Commit, 428, Some(289), 0, 0, 5 << 20),
+            "commit=428MB(ws 289) = scroll:0 xfer:0 text:5 其他:423"
+        );
+    }
+
+    /// F176:Linux 形态 —— 主数是 rss,**不印** `(ws …)`。
+    ///
+    /// 自证会变红:让 `MemKind::Rss` 也走 `(ws n/a)` 那条分支。
+    #[test]
+    fn mem_parts_renders_a_single_number_when_there_is_no_working_set() {
+        assert_eq!(
+            mem_parts(crate::diag::MemKind::Rss, 155, None, 0, 0, 5 << 20),
+            "rss=155MB = scroll:0 xfer:0 text:5 其他:150"
+        );
+    }
+
+    /// F176:Windows 老系统回落到 `EX` 之后 ws 采不到 —— 印 `n/a`,
+    /// 不许静默印 0(印 0 会被读成「专用工作集真的是 0」)。
+    #[test]
+    fn mem_parts_says_n_a_when_the_working_set_could_not_be_sampled() {
+        assert_eq!(
+            mem_parts(crate::diag::MemKind::Commit, 428, None, 0, 0, 5 << 20),
+            "commit=428MB(ws n/a) = scroll:0 xfer:0 text:5 其他:423"
+        );
+    }
+
+    /// F176 的承重条:**减法算在主数(commit)上,不算在 ws 上**。
+    ///
+    /// 喂一个 ws(100) < 记账(168) < commit(400) 的组合:算 commit 时余量
+    /// 232、正常分支;算 ws 时会走「记账超出」。断言必须落在正常分支上。
+    ///
+    /// 自证会变红:把 `mem_parts` 里的被减数换成 `ws_mb`。这正是这段代码
+    /// 日后最可能被「顺手统一成一个数」重构掉的方式,而那么改之后日志照写、
+    /// 数字照有,只在用户最小化窗口时才暴露。
+    #[test]
+    fn the_remainder_is_computed_against_commit_not_the_working_set() {
+        assert_eq!(
+            mem_parts(
+                crate::diag::MemKind::Commit,
+                400,
+                Some(100),
+                128 << 20,
+                24 << 20,
+                16 << 20
+            ),
+            "commit=400MB(ws 100) = scroll:128 xfer:24 text:16 其他:232"
+        );
+    }
+
+    /// F176:`profile.mem` 行按快照的口径渲染,两个新字段确实接到了行上。
+    ///
+    /// 自证会变红:把 `render_lines` 里传给 `mem_parts` 的 `s.mem_ws_mb`
+    /// 写死成 `None` —— 行里会变成 `(ws n/a)`,断言当场抓住。
+    #[test]
+    fn the_mem_line_carries_the_working_set_from_the_snapshot() {
+        let mut s = busy_snapshot();
+        s.mem_process_mb = 428;
+        s.mem_kind = crate::diag::MemKind::Commit;
+        s.mem_ws_mb = Some(289);
+        s.mem_scroll_bytes = 0;
+        s.xfer_running = 0;
+        s.mem_text_bytes = 5 << 20;
+        let lines = render_lines(&s, false);
+        let mem = lines
+            .iter()
+            .find(|l| l.starts_with("profile.mem "))
+            .expect("应有 profile.mem 行");
+        assert_eq!(
+            mem,
+            "profile.mem commit=428MB(ws 289) = scroll:0 xfer:0 text:5 其他:423"
+        );
+    }
+
+    /// F177 的分母:`Snapshot::mem_other_mb` 与 `profile.mem` 行里的
+    /// `其他:` **必须同源**。两处各算一遍的话,预算闸报的数和日志上一行
+    /// 报的数会对不上,而没有任何东西会报错。
+    ///
+    /// 自证会变红:把 `mem_other_mb` 改成直接返回 `mem_process_mb`。
+    #[test]
+    fn the_other_bucket_is_the_same_number_in_the_line_and_in_the_alarm() {
+        let mut s = busy_snapshot();
+        s.mem_process_mb = 428;
+        s.mem_kind = crate::diag::MemKind::Commit;
+        s.mem_ws_mb = Some(289);
+        s.mem_scroll_bytes = 0;
+        s.xfer_running = 0;
+        s.mem_text_bytes = 5 << 20;
+        assert_eq!(s.mem_other_mb(), 423);
+        let lines = render_lines(&s, false);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("profile.mem ") && l.ends_with("其他:423")));
     }
 }

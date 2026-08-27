@@ -1166,7 +1166,13 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.tabs = TABS.load(Ordering::Relaxed);
     s.panes = PANES.load(Ordering::Relaxed);
     s.hosts = HOSTS.load(Ordering::Relaxed);
-    s.mem_process_mb = sample_memory().map_or(0, |m| m.process_bytes / (1024 * 1024));
+    // F176:一次采样喂三个字段。**分三次调 `sample_memory()` 会让三个数
+    // 来自不同时刻**,而它们随后要一起做减法。
+    if let Some(m) = sample_memory() {
+        s.mem_process_mb = m.process_bytes / (1024 * 1024);
+        s.mem_kind = m.kind;
+        s.mem_ws_mb = m.ws_bytes.map(|b| b / (1024 * 1024));
+    }
     s.vram_mb = VRAM_PROBE
         .get()
         .and_then(|p| p.sample())
