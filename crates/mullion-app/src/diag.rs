@@ -1187,15 +1187,29 @@ mod tests {
     ///
     /// 自证会变红:把 take_snapshot 里 SCROLL_EVENTS 的 `swap(0,..)` 改成
     /// `load(..)`,或把 XFER_JOBS 的 `load` 改成 `swap(0,..)`。
+    ///
+    /// **F172 的一条一并挂在这里**(而不是另开一个 `#[test]`):`take_snapshot`
+    /// 会把 static 取空,两个用例并行跑会互相偷计数。
     #[test]
     fn scroll_is_drained_but_xfer_gauge_survives_the_snapshot() {
         count_scroll();
         set_xfer_gauges(2, 1, 48 << 20);
+        // F172:`dirty == 0` 是**全带命中**,是这条差分生效时最常见的读数,
+        // 也是最有意义的那个。判空只许看 `total` —— 写成 `dirty == 0` 的话
+        // 差分越有效、日志里越是一片 `bands=0/0`,看着跟「这个版本没统计」
+        // 一模一样(F167 踩过三次的静默假零)。
+        count_bands(0, 60, 2);
         let a = take_snapshot(5000);
         assert_eq!(a.scroll_events, 1);
         assert_eq!(a.xfer_jobs, 2);
+        assert_eq!(
+            (a.band_dirty, a.band_total, a.band_segments),
+            (0, 60, 2),
+            "全带命中的一帧被 count_bands 判空丢掉了"
+        );
         let b = take_snapshot(5000);
         assert_eq!(b.scroll_events, 0, "计次量必须随窗口清零");
         assert_eq!(b.xfer_jobs, 2, "状态量描述此刻,不许被清");
+        assert_eq!(b.band_total, 0, "带计数是计次量,必须随窗口清零");
     }
 }

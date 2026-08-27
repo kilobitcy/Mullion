@@ -1327,12 +1327,15 @@ mod tests {
         );
         let i = at[0];
         let gate = concat!("may", "_trim(");
+        // 判据是**紧邻的上一行是 `if …may_trim(…) {`**,不是「附近出现过
+        // may_trim」——后者对「把闸算进一个变量、trim 照样无条件调」这个
+        // 变异恒绿(实测过)。
+        let prev = lines.get(i.wrapping_sub(1)).map_or("", |l| l.trim_start());
         assert!(
-            lines[i.saturating_sub(3)..i]
-                .iter()
-                .any(|l| l.contains(gate)),
-            "图集 trim 的调用点前三行内没有全量重建闸 —— trim 脱离了\
-             「本帧全部带都重建了」这个前提"
+            prev.starts_with("if ") && prev.contains(gate),
+            "图集 trim 的上一行不是全量重建闸(`if …may_trim(…) {{`),而是 `{prev}` \
+             —— trim 脱离了「本帧全部带都重建了」这个前提,干净带的字形会被\
+             图集踢掉、那一带画出别的字"
         );
     }
 
