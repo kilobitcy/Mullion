@@ -1028,6 +1028,10 @@ fn watchdog_loop(
     mut threads: crate::sysprobe::ThreadCpuProbe,
 ) {
     let mut reported_ms = 0u64;
+    // F177:预算闸的状态 —— 上一次报 `Cross` 时的 ws(MB)。
+    // `None` = 当前不在越界态。与 `reported_ms` 一样是本线程私有的,
+    // 不需要原子量。
+    let mut reported_mb: Option<u64> = None;
     let mut last_metrics = 0u64;
     loop {
         std::thread::sleep(Duration::from_millis(1_000));
@@ -1085,6 +1089,31 @@ fn watchdog_loop(
                     snap.thread_unmapped = g.unmapped;
                 }
                 None => snap.thread_available = false,
+            }
+            // F177:预算闸问在 Info 日志门**之外**,两个理由:
+            // 这是 `warn!`(warn 档下也该响),且它必须绕开 `render_lines`
+            // 开头那道空闲门 —— 空载正是 N5 那次要查的场景,而空闲门会
+            // 让那种窗口一行都不写。每次越界只写一行,是 O(1) 不是
+            // O(每5秒),不违反「别吵醒笔记本硬盘」那条初衷。
+            // 守护:tests::the_budget_gate_is_asked_before_the_info_log_gate。
+            match crate::profile::budget_verdict(snap.mem_ws_mb, reported_mb) {
+                crate::profile::BudgetVerdict::Quiet => {}
+                crate::profile::BudgetVerdict::Cross(mb) => {
+                    log::warn!(
+                        target: "mullion",
+                        "{}",
+                        crate::profile::over_budget_line(
+                            mb,
+                            snap.mem_process_mb,
+                            snap.mem_other_mb()
+                        )
+                    );
+                    reported_mb = Some(mb);
+                }
+                crate::profile::BudgetVerdict::Recover(mb) => {
+                    log::info!(target: "mullion", "{}", crate::profile::recovered_line(mb));
+                    reported_mb = None;
+                }
             }
             if log::log_enabled!(target: "mullion", log::Level::Info) {
                 // 贵的那两行(线程未分组明细 / 记账原始字节)只在 Debug 档出,
@@ -1735,6 +1764,38 @@ mod tests {
             Some(50),
             "pane 2 的字节没归到它名下:{:?}",
             s.pane_detail
+        );
+    }
+
+    /// F177 的承重条:预算闸的调用点必须在 **`log_enabled!(Info)` 那个门
+    /// 之外**,也就是在 `render_lines` 之前。
+    ///
+    /// 两件事同时挂在这个位置上:
+    /// 1. **穿透空闲门** —— `render_lines` 开头 `is_idle()` 直接返回空,
+    ///    而空载正是 N5 那次要查的场景。挪进去之后编译过、纯函数测试
+    ///    全绿,只有实机空载时才发现它不响。
+    /// 2. **穿透 Info 门** —— 这条是 `warn!`,warn 档下也该响;关进
+    ///    Info 门里等于「把日志调低就听不见警报」。
+    ///
+    /// 判据用**行序**而不是「文件里包含 budget_verdict」:后者对「整段
+    /// 挪进门里」恒绿。
+    ///
+    /// 自证会变红:把 `budget_verdict(` 那一段剪切到
+    /// `if log::log_enabled!(target: "mullion", log::Level::Info) {` 之后。
+    #[test]
+    fn the_budget_gate_is_asked_before_the_info_log_gate() {
+        let src = include_str!("diag.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("diag.rs 应有测试模块")];
+        let gate = src
+            .find("if log::log_enabled!(target: \"mullion\", log::Level::Info) {")
+            .expect("应有 Info 日志门");
+        let call = src
+            .find("crate::profile::budget_verdict(")
+            .expect("应有预算闸调用点");
+        assert!(
+            call < gate,
+            "预算闸必须问在 Info 日志门之前:关在门里的话,warn 档听不见警报,\
+             且它会连带被 render_lines 的空闲门挡掉 —— 而空载正是要查的场景"
         );
     }
 }
