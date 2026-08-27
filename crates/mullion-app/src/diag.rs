@@ -825,11 +825,43 @@ pub fn should_report(stuck_ms: u64, stall_ms: u64, reported_ms: u64) -> bool {
     reported_ms == 0 || stuck_ms >= reported_ms.saturating_mul(2)
 }
 
+/// F176:`MemSample::process_bytes` 那个主数**量的是什么**。
+///
+/// 这个枚举存在的唯一理由是让渲染层不带 `#[cfg]`:平台差异在采样处就
+/// 消化掉,`profile.rs` 只认这个标签,于是 Windows 那种输出能在 Linux
+/// 开发机上直接单测(架构不变量:布局/渲染 bug 要能脱离窗口复现)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemKind {
+    /// Windows `PrivateUsage` —— **提交量**,含已保留未驻留的页。
+    Commit,
+    /// Linux `/proc/self/statm` 的常驻集。
+    Rss,
+}
+
+impl MemKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            MemKind::Commit => "commit",
+            MemKind::Rss => "rss",
+        }
+    }
+}
+
 /// 内存快照。判断卡死时是否伴随内存压力(reflow 爆内存 / 泄漏 / 系统整体吃紧)。
 #[derive(Debug, Clone, Copy)]
 pub struct MemSample {
-    /// 本进程私有提交量(Windows PrivateUsage / Linux RSS)。
+    /// 本进程主数(Windows PrivateUsage / Linux RSS),口径见 `kind`。
     pub process_bytes: u64,
+    /// F176:`process_bytes` 的口径。
+    pub kind: MemKind,
+    /// F176:**专用**工作集 —— 任务管理器进程页「内存」列的那个数。
+    /// `None` = 这台机器采不到(Linux;或 Windows 老系统回落到了 `EX`)。
+    ///
+    /// **它不参与 `mem_parts` 的减法**:工作集会被系统裁剪(窗口最小化时
+    /// 尤其激进),而记账块是 Rust 堆上的 `Vec`、字节数不因页被换出而变小。
+    /// 拿它做被减数,用户一最小化就会刷屏「记账超出」—— 把正常的系统行为
+    /// 报成记账模型崩了。减法算在 `process_bytes` 上,它才不被裁剪。
+    pub ws_bytes: Option<u64>,
     pub sys_avail_bytes: u64,
     pub sys_total_bytes: u64,
 }
@@ -851,21 +883,50 @@ impl std::fmt::Display for MemSample {
 pub fn sample_memory() -> Option<MemSample> {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        PROCESS_MEMORY_COUNTERS_EX2,
     };
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    // SAFETY:两个调用都只写入我们自己栈上的、已按 API 要求填好 cb/dwLength 的结构体。
-    // K32GetProcessMemoryInfo 按 cb 判断实际结构体大小,传 _EX 的尺寸即可拿到 PrivateUsage
-    // (这是 Win32 文档给出的标准用法)。失败一律回落 None,不 panic。
+    // SAFETY:三个调用都只写入我们自己栈上的、已按 API 要求填好 cb/dwLength
+    // 的结构体。K32GetProcessMemoryInfo 按 cb 判断实际结构体大小,传哪个
+    // 尺寸就填到哪。失败一律回落,不 panic。
     unsafe {
-        let mut pmc = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX>();
-        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        let ok_proc = K32GetProcessMemoryInfo(
+        // F176:**先按 EX2 要**。它比 EX 多一个 `PrivateWorkingSetSize`,
+        // 那正是任务管理器进程页「内存」列的数。
+        //
+        // **别用 `EX.WorkingSetSize`**:那是**总**工作集,含共享页(系统 DLL、
+        // exe 映像、mmap 进来的字体 —— N5 那轮 VMMap 量到 98.8MB Mapped File)。
+        // 拿它对照任务管理器照样对不上,只是差到另一个方向去。
+        //
+        // EX2 要 Windows 11 / Server 2022;老系统上这次调用会失败,回落 EX
+        // (此时 ws 报 n/a)。Windows 11 是本项目一等公民,回落只为兜底。
+        let mut ex2 = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX2>();
+        ex2.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        let ok2 = K32GetProcessMemoryInfo(
             GetCurrentProcess(),
-            std::ptr::addr_of_mut!(pmc).cast::<PROCESS_MEMORY_COUNTERS>(),
-            pmc.cb,
+            std::ptr::addr_of_mut!(ex2).cast::<PROCESS_MEMORY_COUNTERS>(),
+            ex2.cb,
         ) != 0;
+
+        let (private_usage, ws_bytes, ok_proc) = if ok2 {
+            // **`PrivateWorkingSetSize == 0` 一律当采不到。** 结构体是
+            // `zeroed()` 出来的,若某个系统上 EX2 返回成功却没填这个字段,
+            // 读到的就是 0;而一个跑着的进程专用工作集不可能真为 0。
+            // 这是本项目「采不到不许编成 0」规矩的**反向**用法 —— 这里的 0
+            // 不是我们伪造的读数,而是「没被填写」的唯一可辨识痕迹。
+            let ws = ex2.PrivateWorkingSetSize as u64;
+            (ex2.PrivateUsage as u64, (ws != 0).then_some(ws), true)
+        } else {
+            let mut ex = std::mem::zeroed::<PROCESS_MEMORY_COUNTERS_EX>();
+            ex.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            let ok = K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                std::ptr::addr_of_mut!(ex).cast::<PROCESS_MEMORY_COUNTERS>(),
+                ex.cb,
+            ) != 0;
+            (ex.PrivateUsage as u64, None, ok)
+        };
 
         let mut ms = std::mem::zeroed::<MEMORYSTATUSEX>();
         ms.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
@@ -875,7 +936,9 @@ pub fn sample_memory() -> Option<MemSample> {
             return None;
         }
         Some(MemSample {
-            process_bytes: pmc.PrivateUsage as u64,
+            process_bytes: private_usage,
+            kind: MemKind::Commit,
+            ws_bytes,
             sys_avail_bytes: ms.ullAvailPhys,
             sys_total_bytes: ms.ullTotalPhys,
         })
@@ -900,6 +963,9 @@ pub fn sample_memory() -> Option<MemSample> {
     };
     Some(MemSample {
         process_bytes: rss_pages * page,
+        kind: MemKind::Rss,
+        // Linux 的主数本身就是常驻量,再单开一个 ws 是同义反复。
+        ws_bytes: None,
         sys_avail_bytes: kb("MemAvailable:"),
         sys_total_bytes: kb("MemTotal:"),
     })
