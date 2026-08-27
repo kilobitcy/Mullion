@@ -133,6 +133,15 @@
   项目里有**两个** configure 调用点,天各一方:`render_frame` 的 `Lost`/`Outdated` 分支
   (`app.rs`)、`Gpu::resize`(`gpu.rs`,唯一调用方 `App::apply_resize`)。F159 落地时只堵住了
   前者,后者漏了整整一轮复核才被挖出来。
+- **`DeviceDescriptor.memory_hints` 默认 `Performance` = Vulkan 后端起手一整块 128MB
+  (N5,2026-08-27 实测)。** wgpu-hal 按这个 hint 定 gpu_alloc 次分配器的 chunk:
+  `Performance` 起始 128MB/上限 512MB,`MemoryUsage` 起始 8MB/上限 64MB。核显(UMA)
+  没有独立显存,这块 WriteCombine 内存**全额计入进程私有工作集**——空载 289MB 里
+  它一家 44%,任务管理器看得见,编译/测试/日志全静默。改 `MemoryUsage` 后实测空载
+  289→174MB(Radeon 780M),滚动/中文上屏手感无回退。两个次生陷阱:①Windows 上
+  wgpu 默认选的是 **Vulkan** 不是 DX12(强改 `Backends::DX12` 反而 505MB,AMD 的
+  D3D12 驱动更吃);②这行删掉不报错,静默回落 Performance。
+  **守护**:`gpu::tests::the_memory_hint_stays_memory_usage`。
   **症状**:窗口最小化后还原到**原尺寸**(多数窗管的默认行为)—— `apply_resize` 以不变的
   `(w, h)` 调 `gpu.resize`,surface 被重新 configure,而 `(config.width, config.height)` 是
   整帧指纹里唯一的几何项、值没变,空闲时其余项也不变 → 指纹命中 → 在内容未定义的交换链上
@@ -435,6 +444,14 @@
   当前只在建窗口时取一次 `scale_factor`,**未跟随 `ScaleFactorChanged`**——跨不同 DPI 显示器不更新(F21 待做)。
 - **`Family::Name("Google Sans Code")` 须系统已装**,否则 cosmic-text 回退默认字体(不崩,对齐可能差)。
   字体族/字号当前硬编码,可配置见 spec **F21**。
+- **egui 的 CJK 回退字体必须 `FontData::from_static`,不许 `from_owned`(N5)。**
+  epaint 不接受文件路径(要兼容 wasm),只吃字节;而 0.30 的 `ab_glyph_font_from_font_data`
+  对 `Cow::Owned` 分支是 `bytes.clone()` **再复制一整份**——msyh.ttc 约 19MB,双份
+  37.6MB 私有堆,渲染结果一模一样,只有任务管理器看得出来。`fs::read` 出来的 `Vec`
+  用 `Box::leak` 转 `&'static [u8]` 走 `from_static`(零拷贝 FontRef);leak 是刻意的,
+  字体本来就活到进程结束。对照:终端侧 cosmic-text/fontdb 走 memmap,file-backed
+  共享页,私有内存为 0——**两条字体链成本模型完全不同**。
+  **守护**:`ui::tests::the_cjk_font_is_installed_once`。
 
 ## egui 字形覆盖面(F143,豆腐块)
 

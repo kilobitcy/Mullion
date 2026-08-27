@@ -525,6 +525,15 @@ impl Gpu {
                     } else {
                         wgpu::Features::empty()
                     },
+                    // N5:wgpu-hal 的 Vulkan 后端按这个 hint 定次分配器的 chunk
+                    // (其 `vulkan/adapter.rs` 的 gpu_alloc::Config)。默认
+                    // `Performance` 起手就是一整块 128MB;核显(UMA)没有独立显存,
+                    // 这一块直接落进进程私有工作集——空载 289MB 里它一家占 44%。
+                    // 改 `MemoryUsage`(起始 8MB/上限 64MB)后实测空载 289→174MB
+                    // (Radeon 780M,2026-08-27),滚动/中文上屏手感无回退。
+                    // **这行删掉不报错**——静默回落 Performance,只有任务管理器
+                    // 看得出来。守护:tests::the_memory_hint_stays_memory_usage。
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
                     ..Default::default()
                 },
                 None,
@@ -1613,6 +1622,31 @@ mod tests {
         assert!(
             quads.is_empty(),
             "term_px.w=0 时 bg quad 应被整体丢弃(clamp 后 w<=0),不应留下退化 quad: {quads:?}"
+        );
+    }
+
+    /// N5:`request_device` 的 `memory_hints` 不写就静默回落 `Performance`——
+    /// wgpu 的 Vulkan 次分配器起手一整块 128MB,核显(UMA)机器上空载内存直接
+    /// +115MB,而编译、测试、日志全绿,只有任务管理器看得出来。
+    ///
+    /// 按行匹配且跳过注释行:整行注释掉(`// memory_hints: …`)必须一样变红,
+    /// 光 `src.contains(…)` 对这种变异恒绿。
+    /// 自证会变红:删掉那一行,或把 `MemoryUsage` 改回 `Performance`。
+    #[test]
+    fn the_memory_hint_stays_memory_usage() {
+        let src = include_str!("gpu.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("gpu.rs 应有测试模块")];
+        let hits: Vec<&str> = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.starts_with("memory_hints:"))
+            .collect();
+        assert_eq!(
+            hits,
+            ["memory_hints: wgpu::MemoryHints::MemoryUsage,"],
+            "DeviceDescriptor 必须显式写 MemoryHints::MemoryUsage\
+             (不写 = Performance = Vulkan 后端起手 128MB chunk,空载 289MB 的主犯)"
         );
     }
 }
