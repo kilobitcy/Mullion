@@ -512,6 +512,9 @@ impl Workspace {
             // 粘性置位。必须在 `continue` **之后** —— 放前面的话每个 pane 每帧
             // 都会被置位,自动化会在一条还没说过话的 channel 上开跑。
             p.saw_first_byte = true;
+            // F155/F173:吞吐 + per-pane 归因,一个写入点两笔账。挂在这里而不是
+            // `session_pump::pump` 里,因为那是不认识 `PaneId` 的纯件。
+            crate::diag::count_inbound(p.id.0, inbound.iter().map(Vec::len).sum());
             let out = session_pump::pump(&mut p.emulator, &inbound);
             if !out.is_empty() {
                 let _ = p.pty.write(out);

@@ -266,6 +266,149 @@ impl KeyTable {
 static DIRTY: KeyTable = KeyTable::new();
 /// F171:窗口事件类型归因表。键 = `wev::kind_of` 的码。
 static WEV: KeyTable = KeyTable::new();
+/// F173:per-pane 归因表。**不是** `PANES`(那是 F155 的 pane 数 gauge)。
+static PANE_TABLE: PaneTable = PaneTable::new();
+
+/// F173:per-pane 归因表:定长、无锁、不分配、不格式化(T3)。
+///
+/// **没有复用 `KeyTable`** —— 那张表是「键 → 一个计次量」,而这里一个 pane
+/// 要挂四个字段,且合并语义各不相同(字节 `+=`、帧数 `+1`、脏带位图 `|=`、
+/// 带总数取最新)。硬塞进 `KeyTable` 要给它三套 merge,反而把那条微妙的
+/// 「槽位归还」时序约定搞浑;这里照抄约定、不共享实现。
+///
+/// 键 = **裸 `PaneId.0`,不加偏移**。`KeyTable` 那条「0 不许当真实键」的
+/// 禁令在这里**不适用**,而 `PaneId(0)` 恰恰是真实 pane 号
+/// (`layout.rs` 的 `Node::Leaf(PaneId(0))`、`shaped_cache` 的 `P0`):
+///
+/// - 认领判据落在 `in_bytes` 而不是 `id` 上(第二轮的 `in_bytes == 0`),
+///   所以 `id == 0` 的空槽被 pane 0 在第一轮直接命中,语义恰好自洽;
+/// - `drain` 只在 `in_bytes > 0` 时出账,空槽不可能被误报成「pane 0 收了 0 字节」。
+///
+/// `KeyTable` 需要那条禁令是因为它的 `drain` 会把 `(0, N)` 交给消费方,
+/// 而消费方分不出「行号 0」与「空槽」——这里没有那个歧义。
+struct PaneTable {
+    /// 0 既是空槽、也是 `PaneId(0)`——见结构体文档,这里不需要哨兵偏移。
+    id: [AtomicU32; TABLE_SLOTS],
+    in_bytes: [AtomicU64; TABLE_SLOTS],
+    /// 这一窗口该 pane 的脏带**并集**位图,bit n = 第 n 带。取并集不是累加:
+    /// 要答的是「屏幕的哪一块在动」,那是位置不是次数。
+    dirty_bands: [AtomicU64; TABLE_SLOTS],
+    /// 该 pane 最近一帧的总带数(取最新,不累加)。没有它的话 `@b23` 说不出
+    /// 「末带」还是「中间某带」,而 tmux status-line 恰恰只认末带。
+    band_total: [AtomicU32; TABLE_SLOTS],
+    /// 该 pane 参与重建的帧数。主行的 `frame=` 是整窗口的,分不出
+    /// 「三个 pane 各画一帧」与「一个 pane 画了三帧」。
+    frames: [AtomicU64; TABLE_SLOTS],
+    /// 槽位用完之后落在外面的**字节数**(不是 pane 数):
+    /// 报成 `profile.pane ... other:N` —— 不报的话「这几个就是全部」与
+    /// 「还有一堆没槽位」在日志里长得一样。
+    other: AtomicU64,
+}
+
+impl PaneTable {
+    const fn new() -> Self {
+        Self {
+            id: [const { AtomicU32::new(0) }; TABLE_SLOTS],
+            in_bytes: [const { AtomicU64::new(0) }; TABLE_SLOTS],
+            dirty_bands: [const { AtomicU64::new(0) }; TABLE_SLOTS],
+            band_total: [const { AtomicU32::new(0) }; TABLE_SLOTS],
+            frames: [const { AtomicU64::new(0) }; TABLE_SLOTS],
+            other: AtomicU64::new(0),
+        }
+    }
+
+    /// 找 `id` 的槽:先命中已有的,再抢一个安静槽。返回 `None` 表示满了。
+    ///
+    /// 「安静」= 这一窗口既没收字节、也没画过帧。**两个条件缺一不可**:
+    /// 只看字节的话,一个不收字节但一直在重画的 pane(移动/换主题/组字)
+    /// 会被后来者反复抢走槽位,它的脏带位图每次都从头攒、报出来永远残缺。
+    ///
+    /// 判据里**没有 `id == 0` 这一项**(`KeyTable` 有):这里 `PaneId(0)` 是
+    /// 真实 pane,把它的占用槽当空槽的话,后来者会连它这一窗口攒的字节一起
+    /// 抢走 —— 那是静默丢账,而丢的恰好总是 pane 0。空槽本来就满足
+    /// 「零字节零帧」,不需要额外的哨兵。
+    fn slot(&self, id: u32) -> Option<usize> {
+        for i in 0..TABLE_SLOTS {
+            if self.id[i].load(Ordering::Relaxed) == id {
+                return Some(i);
+            }
+        }
+        for i in 0..TABLE_SLOTS {
+            let quiet = self.in_bytes[i].load(Ordering::Relaxed) == 0
+                && self.frames[i].load(Ordering::Relaxed) == 0;
+            if quiet {
+                self.id[i].store(id, Ordering::Relaxed);
+                // 上一任占用者留下的总带数要抹掉:这一窗口只收字节没重画的
+                // pane 会照着它报出「共 24 带、一带没脏」,而 24 是别人的。
+                self.band_total[i].store(0, Ordering::Relaxed);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// 记「pane `id` 这一帧重建了 `dirty` 这些带,它一共 `total` 带」。
+    ///
+    /// **单写者**(渲染发生在主线程),同 `add_in`。位图取并集、帧数累加、
+    /// 总带数取最新 —— 三种合并语义各不相同,这也正是没有复用 `KeyTable`
+    /// 的原因(见结构体文档)。
+    fn note_bands(&self, id: u32, dirty: u64, total: u32) {
+        let Some(i) = self.slot(id) else {
+            // 满了。脏带没有「落在 other 里」的合理表示(位图不能跨 pane 合并
+            // ——那会画出一块根本没人动过的区域),所以这里**只丢脏带**,
+            // 不污染 `other`(那是字节账)。
+            return;
+        };
+        self.dirty_bands[i].fetch_or(dirty, Ordering::Relaxed);
+        self.band_total[i].store(total, Ordering::Relaxed);
+        self.frames[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记「pane `id` 收到了 `bytes` 字节」。**单写者**(主线程),同 `KeyTable::note`。
+    ///
+    /// 两轮线性扫,第二轮的「空槽**或**这一窗口还没收过字节的槽」与
+    /// `KeyTable::note` 是同一条约定:一个会话开开关关很容易累计超过
+    /// `TABLE_SLOTS` 个 `PaneId`,不让位的话当下真正在收字节的那个只能
+    /// 落进 `other`。
+    fn add_in(&self, id: u32, bytes: u64) {
+        let Some(i) = self.slot(id) else {
+            self.other.fetch_add(bytes, Ordering::Relaxed);
+            return;
+        };
+        self.in_bytes[i].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 取走这一窗口的内容。
+    ///
+    /// **必须先读 `id` 再 `swap(in_bytes)`** —— 与 `KeyTable::drain` 同一条
+    /// 承重顺序,理由见那里:反过来的话 `add_in` 会在缝隙里把这个槽当成
+    /// 安静槽抢走,报出来的是「新 pane 命中了旧 pane 积攒的字节」。
+    fn drain(&self) -> (Vec<crate::profile::PaneDetail>, u64) {
+        let mut out = Vec::new();
+        for i in 0..TABLE_SLOTS {
+            let id = self.id[i].load(Ordering::Relaxed);
+            let in_bytes = self.in_bytes[i].swap(0, Ordering::Relaxed);
+            let frames = self.frames[i].swap(0, Ordering::Relaxed);
+            let dirty_bands = self.dirty_bands[i].swap(0, Ordering::Relaxed);
+            // 判据是「收过字节**或**重画过」:只看字节的话,没有远端字节但
+            // 顶点在重建的那几类帧(pane 移动/换主题/组字)会被整段丢掉,
+            // 而它们正是 F172 差分最容易漏的场景。
+            if in_bytes > 0 || frames > 0 {
+                out.push(crate::profile::PaneDetail {
+                    id,
+                    in_bytes,
+                    dirty_bands,
+                    band_total: self.band_total[i].load(Ordering::Relaxed),
+                    frames,
+                });
+            } else {
+                self.id[i].store(0, Ordering::Relaxed);
+                self.band_total[i].store(0, Ordering::Relaxed);
+            }
+        }
+        (out, self.other.swap(0, Ordering::Relaxed))
+    }
+}
 
 /// F171:指针位置去重。
 ///
@@ -429,8 +572,15 @@ pub fn count_present() {
 pub fn count_skipped() {
     SKIPPED.fetch_add(1, Ordering::Relaxed);
 }
-pub fn count_inbound(bytes: usize) {
+/// F155/F173:远端来的字节。**全局总量与 per-pane 归因是同一个写入点** ——
+/// 分成两个函数的话,漏调其中一个就会让「`in=` 有数但 `profile.pane` 是空的」
+/// (或反过来)在日志里长成「这个 pane 没说话」,而那正是这条埋点要答的问题。
+///
+/// 挂在 `Workspace::pump` 而不是 `session_pump::pump`:后者是纯件
+/// (「不碰网络/GPU,可无窗口单测」),不认识 `PaneId`,也不该为了埋点认识。
+pub fn count_inbound(pane: u32, bytes: usize) {
     INBOUND_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    PANE_TABLE.add_in(pane, bytes as u64);
 }
 
 /// 整帧耗时(从 redraw 入口到 present 结束)。
@@ -579,14 +729,40 @@ pub fn count_reshape(hits: u64, misses: u64) {
 /// 也在 relaxed 原子上打转 —— 与 `count_reshape` 同款。
 ///
 /// **`dirty` 为 0 是有意义的读数**(全带命中,一帧顶点都没重建),所以判空
-/// 只看 `total`。
-pub fn count_bands(dirty: u64, total: u64, segments: u64) {
-    if total == 0 {
+/// 只看 `total`(= `plans` 是否为空)。
+///
+/// F173:收 `plans` 切片而不是三个标量 —— `BandPlan::key` 本来就是
+/// `(PaneId.0, 带号)`,per-pane 归因是**现成数据**,以前在调用方被
+/// `plans.len()` 拍平扔掉了。切片没有所有权、不分配,这里只线性扫一遍(T3)。
+pub fn count_bands(plans: &[crate::bands::BandPlan], segments: u64) {
+    if plans.is_empty() {
         return;
     }
+    let dirty = plans.iter().filter(|p| p.dirty).count() as u64;
     BAND_DIRTY.fetch_add(dirty, Ordering::Relaxed);
-    BAND_TOTAL.fetch_add(total, Ordering::Relaxed);
+    BAND_TOTAL.fetch_add(plans.len() as u64, Ordering::Relaxed);
     BAND_SEGMENTS.fetch_add(segments, Ordering::Relaxed);
+
+    // 按 pane 折叠。`plan_bands` 保证「带的排布顺序即 pane 的顺序,pane 内
+    // 按带号升序」,所以同一个 pane 的带一定连续 —— 一次扫描、零分配,
+    // 不需要 map。**这条依赖写在这里是因为它会静默失效**:排布若哪天改成
+    // 交错,per-pane 的 `frames` 会按段数虚增,而日志照样能读。
+    let mut i = 0;
+    while i < plans.len() {
+        let pane = plans[i].key.0;
+        let mut bits = 0u64;
+        let mut total = 0u32;
+        while i < plans.len() && plans[i].key.0 == pane {
+            if plans[i].dirty {
+                // 超过 64 带的折进最高位:`1 << 70` 在 release 下会绕回去,
+                // 把第 70 带报成第 6 带 —— 指着一块根本没动过的地方。
+                bits |= 1u64 << u32::from(plans[i].key.1).min(63);
+            }
+            total += 1;
+            i += 1;
+        }
+        PANE_TABLE.note_bands(pane, bits, total);
+    }
 }
 
 /// 此刻的规模。App 每帧调一次(三条 relaxed 原子存,可忽略)。
@@ -860,6 +1036,7 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.presents = PRESENTS.swap(0, Ordering::Relaxed);
     s.skipped = SKIPPED.swap(0, Ordering::Relaxed);
     s.inbound_bytes = INBOUND_BYTES.swap(0, Ordering::Relaxed);
+    (s.pane_detail, s.pane_other_bytes) = PANE_TABLE.drain();
     s.redraw_terminal = REDRAW_TERMINAL.swap(0, Ordering::Relaxed);
     s.redraw_ui = REDRAW_UI.swap(0, Ordering::Relaxed);
     s.redraw_both = REDRAW_BOTH.swap(0, Ordering::Relaxed);
@@ -923,6 +1100,75 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 走 [`take_snapshot`] 的用例必须串行:它把进程级 static **取空**,
+    /// 并行 runner 下两条用例会互相偷计数(概率性假红,重跑还好了 —— 最难
+    /// 查的那一类)。
+    ///
+    /// 中毒也要拿到锁(`unwrap_or_else(into_inner)`):某条用例 panic 之后
+    /// 其余的应该照常报出自己的失败,而不是全被 `PoisonError` 盖成一样的红。
+    static SNAPSHOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 一条排期。`fp` 与归因无关(这里只关心「谁的第几带、脏没脏」),给个常数。
+    fn plan(pane: u32, band: u16, dirty: bool) -> crate::bands::BandPlan {
+        crate::bands::BandPlan {
+            key: (pane, band),
+            fp: 1,
+            dirty,
+        }
+    }
+
+    /// F173:一帧的行带排期要拆到**它属于的那个 pane** 名下。
+    ///
+    /// 全局 `bands=4/72` 是跨 pane 拍平的:实机静置日志里那 4 条脏带到底是
+    /// 「三个 pane 各动了一点」还是「一个 pane 动了 4 带」,它答不了,而这
+    /// 两种的根因(各自的 tmux status vs 某个 pane 在刷屏)完全不同。
+    ///
+    /// 自证会变红:把 `count_bands` 里的 `PANE_TABLE.note_bands(..)` 删掉,
+    /// 或把 `p.key.0` 写成常数。
+    #[test]
+    fn a_frame_of_band_plans_is_split_across_the_panes_that_own_them() {
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_snapshot(5_000);
+        count_bands(
+            &[
+                plan(1, 0, false),
+                plan(1, 1, false),
+                plan(1, 2, true),
+                plan(2, 0, false),
+                plan(2, 1, false),
+            ],
+            3,
+        );
+        let s = take_snapshot(5_000);
+        assert_eq!(
+            (s.band_dirty, s.band_total, s.band_segments),
+            (1, 5, 3),
+            "全局那三个读数不许因为改签名而变味"
+        );
+        let of = |id: u32| s.pane_detail.iter().find(|p| p.id == id).cloned();
+        let p1 = of(1).expect("pane 1 没进归因表");
+        assert_eq!(p1.dirty_bands, 0b100, "pane 1 脏的是第 2 带");
+        assert_eq!(p1.band_total, 3, "pane 1 共 3 带");
+        let p2 = of(2).expect("pane 2 没进归因表 —— 一带没脏也要在,那是「它没动」的证据");
+        assert_eq!(p2.dirty_bands, 0, "pane 2 一带都没脏");
+        assert_eq!(p2.band_total, 2);
+    }
+
+    /// F173:带号超过 64 的折进最高位,**不许绕回去污染低位**。
+    ///
+    /// 64 带 × 16 行 = 1024 行,比任何真实窗口都高,所以这条只是兜底。但
+    /// `1u64 << 70` 在 Rust 里是溢出 panic(debug)/绕回(release) —— 绕回的话
+    /// 第 70 带会报成第 6 带,指着屏幕上一块根本没动过的地方。
+    #[test]
+    fn a_band_beyond_the_bitmap_folds_into_the_top_bit_instead_of_wrapping() {
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_snapshot(5_000);
+        count_bands(&[plan(7, 70, true)], 1);
+        let s = take_snapshot(5_000);
+        let p = s.pane_detail.iter().find(|p| p.id == 7).expect("pane 7 没进表");
+        assert_eq!(p.dirty_bands, 1 << 63, "第 70 带该折进最高位,而不是绕回低位");
+    }
 
     #[test]
     fn stage_names_cover_every_variant() {
@@ -1190,15 +1436,20 @@ mod tests {
     ///
     /// **F172 的一条一并挂在这里**(而不是另开一个 `#[test]`):`take_snapshot`
     /// 会把 static 取空,两个用例并行跑会互相偷计数。
+    ///
+    /// F173 起不再够用 —— 又多了一条要走 `take_snapshot` 的用例,靠
+    /// 「都挂在同一个 `#[test]` 里」已经堆不下了,改由 [`SNAPSHOT_LOCK`] 串行。
     #[test]
     fn scroll_is_drained_but_xfer_gauge_survives_the_snapshot() {
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         count_scroll();
         set_xfer_gauges(2, 1, 48 << 20);
         // F172:`dirty == 0` 是**全带命中**,是这条差分生效时最常见的读数,
         // 也是最有意义的那个。判空只许看 `total` —— 写成 `dirty == 0` 的话
         // 差分越有效、日志里越是一片 `bands=0/0`,看着跟「这个版本没统计」
         // 一模一样(F167 踩过三次的静默假零)。
-        count_bands(0, 60, 2);
+        let all_clean: Vec<_> = (0..60).map(|b| plan(9, b, false)).collect();
+        count_bands(&all_clean, 2);
         let a = take_snapshot(5000);
         assert_eq!(a.scroll_events, 1);
         assert_eq!(a.xfer_jobs, 2);
@@ -1211,5 +1462,141 @@ mod tests {
         assert_eq!(b.scroll_events, 0, "计次量必须随窗口清零");
         assert_eq!(b.xfer_jobs, 2, "状态量描述此刻,不许被清");
         assert_eq!(b.band_total, 0, "带计数是计次量,必须随窗口清零");
+    }
+
+    /// F173:字节要落到**发它的那个 pane** 名下。
+    ///
+    /// 这是整条归因的地基:全局 `in=` 答不了「三个 pane 各说一点」与
+    /// 「一个 pane 说了全部」的区别,而这两种情况的根因完全不同。
+    ///
+    /// 自证会变红:把 `PaneTable::add_in` 里的 `self.id[i].store(id, ..)`
+    /// 删掉(字节记进了槽位但认不出主人),或把两个 pane 的字节并进同一槽。
+    #[test]
+    fn inbound_bytes_are_attributed_to_the_pane_that_received_them() {
+        let t = PaneTable::new();
+        t.add_in(1, 6_500);
+        t.add_in(2, 6_500);
+        t.add_in(1, 500);
+        let (panes, _other) = t.drain();
+        let of = |id: u32| panes.iter().find(|p| p.id == id).map(|p| p.in_bytes);
+        assert_eq!(of(1), Some(7_000), "pane 1 的两笔没累加到一起:{panes:?}");
+        assert_eq!(of(2), Some(6_500), "pane 2 的字节记错了:{panes:?}");
+    }
+
+    /// F173:**关过的 pane 要把槽位让出来**,否则第 9 个 pane 永远进不了表。
+    ///
+    /// 与 `KeyTable` 那条同构、理由也同构:一个会话开开关关很容易累计超过
+    /// `TABLE_SLOTS` 个 `PaneId`(每次分屏/换节点都发新号)。槽位被历史 pane
+    /// 占死之后,当下真正在收字节的那个只能落进 `other` —— 一整趟实机往返
+    /// 白跑,且日志看起来一切正常(`other` 有数,但指不出是谁)。
+    ///
+    /// 自证会变红:把 `add_in` 第二轮判定里的 `|| self.in_bytes[i].load(..) == 0`
+    /// 去掉,只留 `self.id[i].load(..) == 0`。
+    #[test]
+    fn a_pane_that_went_quiet_hands_its_slot_back() {
+        let t = PaneTable::new();
+        // 启动期开开关关,把槽位占满。
+        for id in 1..=(TABLE_SLOTS as u32) {
+            t.add_in(id, 100);
+        }
+        let _ = t.drain();
+        // 下一个窗口:只有一个新 pane 在收字节。
+        t.add_in(9999, 19_500);
+        let (panes, other) = t.drain();
+        assert_eq!(
+            panes.iter().find(|p| p.id == 9999).map(|p| p.in_bytes),
+            Some(19_500),
+            "当下唯一在收字节的 pane 没抢到槽位:{panes:?} other={other}"
+        );
+        assert_eq!(other, 0, "它本该抢到槽位,不该落进 other");
+    }
+
+    /// F173:这一窗口一个字节都没收的 pane **不进行**。
+    ///
+    /// 静置时 13 个窗口里有 11 个是全体 pane 零字节,逐个报 `in=0B` 只会
+    /// 把行撑满噪声;「这个 pane 存在」已经由概览行的 `panes=` 答了。
+    ///
+    /// 自证会变红:把 `drain` 的 `in_bytes > 0` 改成 `id != 0`。
+    #[test]
+    fn a_pane_with_no_traffic_is_left_out_of_the_line() {
+        let t = PaneTable::new();
+        t.add_in(1, 6_500);
+        t.add_in(2, 0);
+        let (panes, _) = t.drain();
+        assert_eq!(panes.len(), 1, "零流量的 pane 不该占一段:{panes:?}");
+        assert_eq!(panes[0].id, 1);
+    }
+
+    /// F173:脏带要按 pane 分开记,且**一个窗口里多帧的脏带取并集**。
+    ///
+    /// 并集而不是累加:要答的问题是「屏幕的**哪一块**在动」,那是位置,不是
+    /// 次数。累加的话「第 23 带脏了 5 次」和「第 5 带各脏一次」在日志里
+    /// 长得一样,而前者是 tmux status-line、后者是内容在滚。
+    ///
+    /// 自证会变红:把 `note_bands` 里的 `|=` 改成 `=`(只剩最后一帧的带)。
+    #[test]
+    fn dirty_bands_from_several_frames_are_unioned_per_pane() {
+        let t = PaneTable::new();
+        t.note_bands(1, 0b0000_1000, 24); // 第一帧:第 3 带
+        t.note_bands(1, 0b1000_0000, 24); // 第二帧:第 7 带
+        t.note_bands(2, 0b0000_0001, 24);
+        let (panes, _) = t.drain();
+        let of = |id: u32| panes.iter().find(|p| p.id == id);
+        assert_eq!(
+            of(1).map(|p| p.dirty_bands),
+            Some(0b1000_1000),
+            "两帧的脏带没取并集:{panes:?}"
+        );
+        assert_eq!(of(1).map(|p| p.band_total), Some(24));
+        assert_eq!(of(1).map(|p| p.frames), Some(2), "帧数该数两帧");
+        assert_eq!(of(2).map(|p| p.dirty_bands), Some(0b0000_0001));
+    }
+
+    /// F173:一帧都没重画、一个字节都没收的 pane 才算安静。
+    ///
+    /// 只看字节的话,「pane 移动/换主题/组字」这类**没有远端字节但顶点在
+    /// 重建**的帧会被整段丢掉 —— 那正是 F172 列的三类漏网场景。
+    ///
+    /// 自证会变红:把 `drain` 的判据缩回 `in_bytes > 0`。
+    #[test]
+    fn a_pane_that_redrew_without_receiving_bytes_still_gets_a_segment() {
+        let t = PaneTable::new();
+        t.note_bands(1, 0b0100, 24);
+        let (panes, _) = t.drain();
+        assert_eq!(panes.len(), 1, "零字节但重画过的 pane 被丢了:{panes:?}");
+        assert_eq!(panes[0].in_bytes, 0);
+        assert_eq!(panes[0].frames, 1);
+    }
+
+    /// F173:接线自证 —— 真实的 `Workspace::pump` 收到字节之后,
+    /// **全局 `in=` 与 per-pane 两笔账必须同时记上**。
+    ///
+    /// 这条盯的是「埋点接没接上」,不是表本身的逻辑(那由上面几条盯)。
+    /// 两笔账走的是 `count_inbound` 这**一个**写入点,所以它们不可能
+    /// 记成不同的数 —— 这条只需要证明那个写入点确实在 pump 的路径上。
+    ///
+    /// 自证会变红:把 `workspace/mod.rs` 里的 `diag::count_inbound(..)` 删掉。
+    ///
+    /// `await_holding_lock` 在这里是**要的行为**:锁的职责就是把「清空 →
+    /// 喂字节 → 取快照」整段圈起来,提前放手等于没锁。`#[tokio::test]` 默认
+    /// 单线程 runtime,这几个 `await` 不会把执行权交给另一条也要这把锁的
+    /// 用例,不存在死锁面。换 `tokio::sync::Mutex` 的话上面那几条同步用例
+    /// 就锁不了同一把 —— 那才是真漏。
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn pumping_a_pane_charges_the_bytes_to_both_the_global_and_that_pane() {
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_snapshot(5_000); // 清掉别的用例可能留下的残值
+        let (mut ws, probes) = crate::shell::workspace::tests_support::ws_with(2);
+        probes[0].tx.send(vec![b'x'; 100]).await.unwrap();
+        probes[1].tx.send(vec![b'y'; 50]).await.unwrap();
+        tokio::task::yield_now().await;
+        ws.pump(0);
+
+        let s = take_snapshot(5_000);
+        assert_eq!(s.inbound_bytes, 150, "全局 in= 没记上");
+        let of = |id: u32| s.pane_detail.iter().find(|p| p.id == id).map(|p| p.in_bytes);
+        assert_eq!(of(1), Some(100), "pane 1 的字节没归到它名下:{:?}", s.pane_detail);
+        assert_eq!(of(2), Some(50), "pane 2 的字节没归到它名下:{:?}", s.pane_detail);
     }
 }

@@ -11165,9 +11165,18 @@ mod tests {
                 || prod.contains("diag::note_inbound_for_echo()"),
             "入站那一端没接 —— 回显往返永远配不上对"
         );
+        // F173:计数点从 `session_pump.rs` 搬到了 `Workspace::pump` —— 它现在
+        // 要按 pane 归因,而 `PaneId` 是那个纯件不认识的东西。**搜的文件跟着
+        // 搬**:留在原地的话这条断言看不到新调用点,删掉接线也不会红
+        // (「源码切片测试与搬运天然冲突」,F153 那次踩过)。
+        //
+        // 判据带上第一个实参而不是裸 `count_inbound(`:裸前缀连
+        // 「per-pane 那一半被摘掉、退回全局单参」都拦不住。
+        let ws_src = include_str!("shell/workspace/mod.rs");
         assert!(
-            pump_src.contains("count_inbound(") || prod.contains("diag::count_inbound("),
-            "入站字节没计数 —— 剖面里吞吐恒为 0B/s,看着像远端一个字节都没发过来"
+            ws_src.contains("diag::count_inbound(p.id.0,"),
+            "入站字节没按 pane 计数 —— 剖面里吞吐恒为 0B/s、profile.pane 恒为空,\
+             看着像远端一个字节都没发过来"
         );
     }
 

@@ -663,7 +663,7 @@ impl TextLayer {
             force_full,
         );
         let dirty_n = plans.iter().filter(|b| b.dirty).count();
-        crate::diag::count_bands(dirty_n as u64, plans.len() as u64, u64::from(segments));
+        crate::diag::count_bands(&plans, u64::from(segments));
 
         // --- F172 第二步:trim。**只在全带重建的帧做**,理由见 `bands::may_trim`。---
         //

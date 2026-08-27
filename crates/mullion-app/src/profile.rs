@@ -156,6 +156,30 @@ pub fn repaint_bucket(d: std::time::Duration) -> RepaintBucket {
     }
 }
 
+/// F173：一个 pane 在这一窗口里的归因读数。
+///
+/// 存在的理由是全局 `in=`／`bands=脏/总` 都是**跨 pane 拍平的标量**：
+/// 实机静置日志里每 60 秒来一次 `in=3.9KB/s bands=4/72 seg=3`，看得见有
+/// 东西在动，指不出是谁在动、动在屏幕的哪一块。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneDetail {
+    /// `PaneId.0`。0 是真实 pane 号，不是空槽哨兵（见 `diag::PaneTable`）。
+    pub id: u32,
+    /// 这一窗口该 pane 收到的远端字节。
+    pub in_bytes: u64,
+    /// 这一窗口该 pane 重建过的行带**并集**，bit n = 第 n 带（F172 的带号）。
+    ///
+    /// 并集而非计次：要答的是「屏幕的哪一块在动」。超过 64 带的折进最高位
+    /// （64 带 × 16 行 = 1024 行，比任何真实窗口都高）。
+    pub dirty_bands: u64,
+    /// 该 pane 最近一帧的总带数。没有它，`@b23` 说不出「末带」还是中间某带，
+    /// 而 tmux status-line 恰恰只动末带。
+    pub band_total: u32,
+    /// 该 pane 参与顶点重建的帧数。主行 `frame=` 是整窗口的，分不出
+    /// 「三个 pane 各画一帧」与「一个 pane 画了三帧」。
+    pub frames: u64,
+}
+
 /// 一个 5 秒窗口里采到的全部东西。
 ///
 /// **纯数据**：由 `diag.rs` 的周期线程从各个原子计数器 drain 出来填好，
@@ -270,6 +294,11 @@ pub struct Snapshot {
     pub tabs: u64,
     pub panes: u64,
     pub hosts: u64,
+    /// F173:per-pane 归因。全局 `in=` 只是聚合速率,答不了「三个 pane 各说
+    /// 一点」与「一个 pane 说了全部」的区别,而这两种的根因完全不同。
+    pub pane_detail: Vec<PaneDetail>,
+    /// F173:槽位用完之后落在外面的入站字节(不是 pane 数)。
+    pub pane_other_bytes: u64,
     pub mem_process_mb: u64,
     /// F164:整个进程的 CPU 占用,**按核数归一**。`None` = 采不到。
     pub cpu_pct: Option<u8>,
@@ -336,6 +365,8 @@ impl Snapshot {
             presents: 0,
             skipped: 0,
             inbound_bytes: 0,
+            pane_detail: Vec::new(),
+            pane_other_bytes: 0,
             redraw_terminal: 0,
             redraw_ui: 0,
             redraw_both: 0,
@@ -470,6 +501,53 @@ fn render_key_table(items: &[(u32, u64)], other: u64, label: impl Fn(u32) -> Str
 }
 
 /// 百分比渲染。`None` → `n/a`(不是 0:「采不到」和「真的是 0」是两回事)。
+/// 一个绝对字节数。**不是速率** —— `profile.load` 的 `in=` 带 `/s`,这里
+/// 的是这一窗口的实收量,两者相邻出现,单位必须自己把话说清。
+fn fmt_bytes(b: u64) -> String {
+    if b >= 1 << 20 {
+        format!("{:.1}MB", b as f64 / (1 << 20) as f64)
+    } else if b >= 1024 {
+        format!("{:.1}KB", b as f64 / 1024.0)
+    } else {
+        format!("{b}B")
+    }
+}
+
+/// 一个 pane 报几条脏带号。再多就读不动了,超出的折成 `+N`。
+const PANE_BANDS_SHOWN: usize = 4;
+
+/// `p1 in=6.5KB@b11,b23/24 frames=5`。
+///
+/// `@` 那一段在**从没重建过顶点**(`band_total == 0`)时整段省掉:那时候
+/// 分母是编不出来的,印 `@-/0` 只会让人以为窗口高度是 0。
+fn render_pane_detail(p: &PaneDetail) -> String {
+    let mut s = format!("p{} in={}", p.id, fmt_bytes(p.in_bytes));
+    if p.band_total > 0 {
+        let all: Vec<u32> = (0..64).filter(|b| p.dirty_bands >> b & 1 == 1).collect();
+        let shown = if all.is_empty() {
+            // 一带没脏是**好消息**(差分全命中),但必须印出来 —— 省略的话
+            // 它跟「这个 pane 压根没被记上」长得一模一样。
+            "-".to_string()
+        } else {
+            let mut t = all
+                .iter()
+                .take(PANE_BANDS_SHOWN)
+                .map(|b| format!("b{b}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            if all.len() > PANE_BANDS_SHOWN {
+                // 截断要留痕:「脏了 4 带」与「脏了 40 带」不留痕就一样长,
+                // 而后者意味着差分基本失效 —— 正是这条埋点最该抓的情况。
+                t.push_str(&format!("+{}", all.len() - PANE_BANDS_SHOWN));
+            }
+            t
+        };
+        s.push_str(&format!("@{shown}/{}", p.band_total));
+    }
+    s.push_str(&format!(" frames={}", p.frames));
+    s
+}
+
 fn fmt_pct(v: Option<u8>) -> String {
     v.map_or_else(|| "n/a".to_string(), |p| format!("{p}%"))
 }
@@ -766,6 +844,20 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         s.keys,
         rate,
     ));
+
+    // pane 行:per-pane 归因。**没有读数就整行不印** —— 静置日志的价值一半
+    // 在于安静,每 5 秒印一条空行会把「真的没人说话」淹掉。
+    if !s.pane_detail.is_empty() {
+        // 按 id 排序:表里的槽位顺序是抢占出来的,不排的话相邻两个窗口的
+        // pane 会换位置,肉眼对不上、diff 也没法用。
+        let mut panes = s.pane_detail.clone();
+        panes.sort_by_key(|p| p.id);
+        let mut segs: Vec<String> = panes.iter().map(render_pane_detail).collect();
+        if s.pane_other_bytes > 0 {
+            segs.push(format!("其他 in={}", fmt_bytes(s.pane_other_bytes)));
+        }
+        lines.push(format!("profile.pane {}", segs.join(" | ")));
+    }
 
     // cpu 行:线程枚举采不到(`thread_available == false`)必须报 n/a,
     // 不能把各组渲染成 0 —— 那会把「没采到」读成「确实没占用」。
@@ -1772,6 +1864,109 @@ mod tests {
                 .any(|l| l.starts_with("profile.cpu.unmapped") && l.contains("wgpu-poll:5%")),
             "debug 档要能看见没进分组表的线程"
         );
+    }
+
+    fn detail(id: u32, in_bytes: u64, dirty_bands: u64, band_total: u32, frames: u64) -> PaneDetail {
+        PaneDetail {
+            id,
+            in_bytes,
+            dirty_bands,
+            band_total,
+            frames,
+        }
+    }
+
+    /// F173：`profile.pane` 行要能指名道姓地答「静置时是谁在说话、动在哪一块」。
+    ///
+    /// 实机静置日志每 60 秒来一次 `in=3.9KB/s bands=4/72 seg=3`，那是三个 pane
+    /// 拍平后的和。这条行拆开之后，「三个 pane 各自的 tmux status-line 在跳」
+    /// 与「某一个 pane 在刷屏」才区分得开 —— 两者的修法完全不同。
+    ///
+    /// 自证会变红：把 `render_lines` 里 push pane 行的那一段删掉。
+    #[test]
+    fn the_pane_line_names_who_talked_and_which_bands_moved() {
+        let mut s = busy_snapshot();
+        s.pane_detail = vec![
+            detail(2, 6656, 1 << 23, 24, 5),
+            detail(1, 6656, (1 << 11) | (1 << 23), 24, 5),
+        ];
+        let line = render_lines(&s, false)
+            .into_iter()
+            .find(|l| l.starts_with("profile.pane "))
+            .expect("没有 profile.pane 行");
+        assert_eq!(
+            line,
+            "profile.pane p1 in=6.5KB@b11,b23/24 frames=5 | p2 in=6.5KB@b23/24 frames=5",
+            "格式或排序不对"
+        );
+    }
+
+    /// F173：一个 pane 都没动的窗口不出这行。
+    ///
+    /// 静置日志的价值一半在于**安静**：每 5 秒印一条 `profile.pane`（哪怕是空的）
+    /// 会把「真的没人说话」淹掉，而那正是这条埋点要看的基线。
+    ///
+    /// 自证会变红：把渲染里的 `is_empty()` 早退删掉。
+    #[test]
+    fn a_window_where_no_pane_moved_has_no_pane_line() {
+        let s = busy_snapshot();
+        assert!(s.pane_detail.is_empty(), "前提：busy_snapshot 不带 per-pane");
+        assert!(
+            !render_lines(&s, false)
+                .iter()
+                .any(|l| l.starts_with("profile.pane")),
+            "没有 per-pane 读数时不许印空行"
+        );
+    }
+
+    /// F173：零字节但重画过的 pane 也要出现，且脏带为空时印 `-` 而不是省略。
+    ///
+    /// 省略的话「这个 pane 一帧都没重建」（差分生效，好消息）与「它根本没被
+    /// 记上」（埋点漏了，坏消息）在日志里长得一模一样 —— F167 踩过三次的
+    /// 静默假零。
+    #[test]
+    fn a_pane_that_drew_nothing_dirty_still_shows_its_band_denominator() {
+        let mut s = busy_snapshot();
+        s.pane_detail = vec![detail(0, 0, 0, 24, 3)];
+        let line = render_lines(&s, false)
+            .into_iter()
+            .find(|l| l.starts_with("profile.pane "))
+            .expect("没有 profile.pane 行");
+        assert_eq!(line, "profile.pane p0 in=0B@-/24 frames=3");
+    }
+
+    /// F173：脏带多到读不动时截断，但**必须说出截了多少**。
+    ///
+    /// 直接截断不留痕的话，「脏了 4 带」与「脏了 40 带」在日志里一样长 ——
+    /// 而后者意味着差分基本失效，是这条埋点最该抓的那种情况。
+    #[test]
+    fn a_pane_with_too_many_dirty_bands_says_how_many_it_left_out() {
+        let mut s = busy_snapshot();
+        s.pane_detail = vec![detail(1, 0, 0b111_1111, 24, 1)];
+        let line = render_lines(&s, false)
+            .into_iter()
+            .find(|l| l.starts_with("profile.pane "))
+            .unwrap();
+        assert!(
+            line.contains("@b0,b1,b2,b3+3/24"),
+            "截断没报剩余条数：{line}"
+        );
+    }
+
+    /// F173：槽位用完之后落在外面的字节要报出来。
+    ///
+    /// 不报的话「表里这几个就是全部」与「还有一堆没槽位」看不出区别，
+    /// 而后者说明归因表已经不可信了。
+    #[test]
+    fn bytes_that_missed_a_slot_are_reported_instead_of_vanishing() {
+        let mut s = busy_snapshot();
+        s.pane_detail = vec![detail(1, 100, 0, 24, 1)];
+        s.pane_other_bytes = 2048;
+        let line = render_lines(&s, false)
+            .into_iter()
+            .find(|l| l.starts_with("profile.pane "))
+            .unwrap();
+        assert!(line.ends_with("| 其他 in=2.0KB"), "溢出字节没报：{line}");
     }
 
     /// F168:采不到线程 ≠ 各组为 0。

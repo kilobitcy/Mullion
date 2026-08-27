@@ -6,10 +6,12 @@ use mullion_term::emulator::Emulator;
 /// 喂入若干段远端字节,推进仿真器,返回需回写 SSH channel 的出站字节(T1)。
 /// app 每帧:先 drain SSH 接收端得到 `inbound`,调 `pump`,再把返回值交 `SshSession::write`。
 pub fn pump(emu: &mut Emulator, inbound: &[Vec<u8>]) -> Vec<u8> {
-    // F155:吞吐 + 回显往返。这是 `pump` 在生产代码里唯一的调用点
+    // F155:回显往返。这是 `pump` 在生产代码里唯一的调用点
     // (`Workspace::pump`),且调用方已经判过 `inbound` 非空才会走到这里,
     // 所以挂在这里既不重复计数也不漏路径。
-    crate::diag::count_inbound(inbound.iter().map(Vec::len).sum());
+    //
+    // F173:**吞吐计数搬去了调用方** —— 它现在要按 pane 归因,而 `PaneId`
+    // 是这个纯件不认识、也不该为了埋点去认识的东西(见模块头两行)。
     crate::diag::note_inbound_for_echo();
     for chunk in inbound {
         emu.feed(chunk);
