@@ -1422,6 +1422,63 @@ mod tests {
         );
     }
 
+    /// F174:整形缓存键的两个字段都必须由**当帧的活值**填,只许用字段简写。
+    ///
+    /// `shaped_cache` 那边的单测扎的是「键不同则 miss」,扎不到这一层的接线:
+    /// 把宽度那一维写死成常量,`shaped_cache::tests` 全绿、编译全绿、静置画面
+    /// 也全对 —— 只有分屏拖动改了 pane 宽度那一刻才会犯病:内容没变,于是永远
+    /// 命中按旧宽度整形出来的那份产物,文字**永久**按旧列宽排,且没有自愈路径
+    /// (实测:这条变异原先没有任何测试能杀掉)。
+    ///
+    /// `prepare_panes` 需要真实 wgpu Device/Queue,这一层跑不起来,所以只能从
+    /// 源码上扎。判据是字段简写(`hash, term_w` 紧跟大括号),`term_w: 0` 这类
+    /// 显式赋值一律不认。
+    ///
+    /// 针在运行时拼:写成字面量的话这条测试自己的源码会匹配上自己,恒绿。
+    #[test]
+    fn the_shape_key_is_built_from_this_frames_live_hash_and_width() {
+        let lines = code_lines();
+        let ctor = concat!("Shape", "Key { ");
+        let at: Vec<&str> = lines.iter().copied().filter(|l| l.contains(ctor)).collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "text.rs 里构造整形缓存键的代码行有 {} 处,只许有一处 —— 多一处就是\
+             多一条可能填错维度的路",
+            at.len()
+        );
+        let shorthand = concat!("hash, ", "term_w }");
+        assert!(
+            at[0].contains(shorthand),
+            "整形缓存键没有用字段简写填,而是 `{}` —— 任何一维被写死成常量,\
+             那一维的失效就静默失灵(宽度那维的症状是分屏改宽后文字永久按旧\
+             列宽排,且不会自愈)",
+            at[0].trim()
+        );
+    }
+
+    /// F174:行指纹台账按 `PaneId` 记账,不按当帧下标。
+    ///
+    /// 关掉中间一块 pane 会让其后每块 pane 的当帧下标挪位,A 的指纹被当成 B 的
+    /// 用 —— `seg=` 在分屏变动那一帧彻底乱掉。`row_fp` 自己的单测扎了「键是
+    /// 稳定身份」,但扎不到调用点传进来的到底是哪个值。
+    ///
+    /// 自证会变红:把调用点的 `pane_id` 换成 `pane_ix`(能编过,因为下标只是
+    /// 另一个整数,套进 `PaneId` 也不报错)。
+    #[test]
+    fn the_row_fingerprint_ledger_is_keyed_by_pane_id_at_the_call_site() {
+        let lines = code_lines();
+        let call = concat!("row_fp.", "note((");
+        let at: Vec<&str> = lines.iter().copied().filter(|l| l.contains(call)).collect();
+        assert_eq!(at.len(), 1, "行指纹记账点只许有一处");
+        assert!(
+            at[0].contains(concat!("pane", "_id, row")),
+            "行指纹记账用的不是稳定身份,而是 `{}` —— 分屏关掉中间一块之后\
+             下标会挪位,A 的指纹被当成 B 的用,`seg=` 静默失真",
+            at[0].trim()
+        );
+    }
+
     /// F126:拼音串从光标格开始逐格摆,ASCII 一格一个。
     #[test]
     fn preedit_starts_at_the_cursor_cell() {
