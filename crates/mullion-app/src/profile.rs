@@ -201,6 +201,16 @@ pub struct Snapshot {
     /// **这一对是差分整形唯一的运行期守护**:判据写错导致永远 miss 时,
     /// 画面完全正确、日志一切正常,只有这里的比值会掉下去。
     pub reshape_miss: u64,
+    /// F172:本窗口内**重建了顶点**的行带数。
+    pub band_dirty: u64,
+    /// F172:本窗口内一共有多少带(所有画过的帧累加)。
+    ///
+    /// **这一对是行带差分唯一的运行期守护**:判据写错导致每帧全带重建时,
+    /// 画面完全正确、日志一切正常、性能悄悄回到改之前,只有这个比值会顶到 1。
+    pub band_total: u64,
+    /// F172:变化行分成几个连通段。判「带宽 16 选得对不对」用 ——
+    /// 段数远小于脏带数说明变化集中(可以放大带),逼近脏带数说明变化分散。
+    pub band_segments: u64,
     /// F159:本窗口内整帧指纹命中(没提交 GPU)的帧数。
     pub fp_hit: u64,
     /// F159:未命中(真的画了一帧)的帧数。
@@ -342,6 +352,9 @@ impl Snapshot {
             sync_timeouts: 0,
             reshape_hit: 0,
             reshape_miss: 0,
+            band_dirty: 0,
+            band_total: 0,
+            band_segments: 0,
             fp_hit: 0,
             fp_miss: 0,
             wakes: 0,
@@ -683,7 +696,8 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
     lines.push(format!(
         "profile {:.1}s frame={}x/p50={}/p95={}/max={} present={} skip={} throttle={} \
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
-         reshape=hit:{}/miss:{} fp=hit:{}/miss:{} wake={}x/rr=sched:{},evt:{} dirty={} \
+         reshape=hit:{}/miss:{} bands={}/{} seg={} fp=hit:{}/miss:{} \
+         wake={}x/rr=sched:{},evt:{} dirty={} \
          wev={} curdup={} egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
          conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={}",
         secs,
@@ -706,6 +720,9 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         stage_part,
         s.reshape_hit,
         s.reshape_miss,
+        s.band_dirty,
+        s.band_total,
+        s.band_segments,
         s.fp_hit,
         s.fp_miss,
         s.wakes,
@@ -1062,6 +1079,9 @@ mod tests {
             sync_timeouts: 3,
             reshape_hit: 900,
             reshape_miss: 100,
+            band_dirty: 3,
+            band_total: 60,
+            band_segments: 2,
             fp_hit: 250,
             fp_miss: 50,
             wakes: 340,
@@ -1274,6 +1294,34 @@ mod tests {
             line.contains("reshape=hit:900/miss:100"),
             "没报整形缓存命中率:{line}"
         );
+    }
+
+    /// F172:行带差分的脏带数/总带数/连通段数必须进剖面行。
+    ///
+    /// 与上面那条同理,这是"顶点层差分悄悄退化回全量"的**唯一**运行期守护
+    /// —— 判据写错时画面完全正确、测试全绿,只有这个比值顶到 1 才看得出来。
+    /// `seg=` 则回答"16 行一带选得对不对"。
+    ///
+    /// 自证会变红:把 `render_line` 里 `bands=`/`seg=` 那一段删掉。
+    #[test]
+    fn the_band_diff_counts_reach_the_line() {
+        let line = render_line(&busy_snapshot()).expect("忙窗口该有一行");
+        assert!(line.contains("bands=3/60"), "没报脏带/总带数:{line}");
+        assert!(line.contains("seg=2"), "没报连通段数:{line}");
+    }
+
+    /// 零脏带是**最有意义的那个读数**(全带命中、一帧顶点都没重建),
+    /// 必须显式写出来 —— 省略掉的话"完美命中"与"这个版本忘了统计"在日志里
+    /// 长得一模一样。
+    ///
+    /// 自证会变红:给 `render_line` 里的 `bands=` 段加上
+    /// `if s.band_dirty > 0` 之类的条件。
+    #[test]
+    fn a_zero_dirty_band_count_is_printed_rather_than_omitted() {
+        let mut s = busy_snapshot();
+        s.band_dirty = 0;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        assert!(line.contains("bands=0/60"), "全带命中被省略了:{line}");
     }
 
     /// 零命中同样要**显式写出来**:"这个窗口一次都没命中"与"这个版本

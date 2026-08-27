@@ -216,13 +216,47 @@ pub const DEFAULT_FONT_FAMILY: &str = "Google Sans Code";
 /// 数成正比」这一层。
 pub const BUFFER_EST_BYTES: usize = 4096;
 
+/// F172:一条行带的顶点槽。
+///
+/// `fp` 是**上一次 prepare 成功之后**这一带的指纹。`None` 表示这一带的
+/// `renderer` 里没有可信顶点(刚建、或上一帧 prepare 失败),必须重建。
+struct BandSlot {
+    renderer: TextRenderer,
+    fp: Option<u64>,
+    /// 帧序号,帧末逐出用。与 `ShapedCache` 同一手法:不每帧新建访问集合
+    /// (帧路径上不分配,T3)。
+    last_seen: u64,
+    /// F172 影子校验(debug 档)专用:上一帧这一带**实际**交给 glyphon 的
+    /// `TextArea` 摘要。与 `fp` 是两条独立的推导路径 —— `fp` 从输入算,
+    /// 这个从结果算,对不上就说明指纹漏了输入项。
+    shadow: Option<u64>,
+}
+
 /// glyphon 文字资源 + 每行一个 Buffer。GPU 胶水:无单测。
 pub struct TextLayer {
     font_system: FontSystem,
     swash: SwashCache,
     atlas: TextAtlas,
     viewport: Viewport,
-    renderer: TextRenderer,
+    /// F172:一带一个 `TextRenderer`,按 `(PaneId, 带号)` 分槽,共用上面那个
+    /// `atlas`(glyphon 支持:`render` 收 `&TextAtlas`,只有 `prepare` 要 `&mut`)。
+    ///
+    /// 用 `BTreeMap` 而不是 `HashMap`:遍历顺序稳定,`render` 的 draw 顺序
+    /// 因此可复现。各带互不重叠,顺序本身不影响画面,但可复现的顺序让实机
+    /// 出问题时的对比有意义。
+    /// 键是 **`(PaneId.0, 带号)`** 而不是 `(PaneId, 带号)` —— `PaneId` 只
+    /// 派生了 `Eq/Hash`,没派生 `Ord`。为了这里给 core 加 `Ord` 是把渲染层的
+    /// 需要漏进布局层,不值当;拆成裸 `u32` 顺序一样确定。
+    bands: std::collections::BTreeMap<(u32, u16), BandSlot>,
+    /// 帧序号,喂 `BandSlot::last_seen`。
+    frame: u64,
+    /// F172:下一帧强制全量重建。**唯一的置真来源是 `AtlasFull`** ——
+    /// 那时图集里哪些坐标还有效已经说不清了,指纹相同也不能信。
+    ///
+    /// 别的失效源不需要在这里加 hook:字体/字号/主题/几何/组字全部由带指纹
+    /// 自动覆盖(这正是「判在结果上」的收益),而新开的带 `fp` 是 `None`、
+    /// 本来就会重建。多加一个列举式 hook 就是多一处日后会漏的地方。
+    force_full: bool,
     /// F12:跨帧的整形缓存,按 `(PaneId, row)` 分槽。取代了原来那个
     /// "每帧从头填一遍"的 `Vec<Buffer>`。
     cache: crate::shaped_cache::ShapedCache<Buffer>,
@@ -317,9 +351,7 @@ impl TextLayer {
         let swash = SwashCache::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
-        let mut atlas = TextAtlas::new(device, queue, &cache, format);
-        let renderer =
-            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let atlas = TextAtlas::new(device, queue, &cache, format);
         let line_h = (font_px * 1.25).ceil();
         // 用 'M' 的 advance 估等宽单元格宽度。
         let cell_w = measure_cell_w(&mut font_system, font_px, line_h, family);
@@ -328,7 +360,9 @@ impl TextLayer {
             swash,
             atlas,
             viewport,
-            renderer,
+            bands: std::collections::BTreeMap::new(),
+            frame: 0,
+            force_full: false,
             cache: crate::shaped_cache::ShapedCache::new(),
             pool: Vec::new(),
             temp: Vec::new(),
@@ -437,6 +471,18 @@ impl TextLayer {
     /// 第二遍建 `TextArea`:glyphon 的 `prepare` 要求 buffer 借用活到
     /// `render`,所以两遍不能合成一遍。`left`/`top`/`bounds` 每帧现算,
     /// 因此**拖动分屏、移动 pane 不需要重整形**,只有宽度变了才需要。
+    ///
+    /// # F172 行带差分
+    ///
+    /// 第二遍按 [`crate::bands`] 的带号分桶,**只把脏带交给 `prepare`**。
+    /// 干净带的 `TextRenderer` 留着上一帧的顶点缓冲,`render` 时照画。
+    ///
+    /// 收益的来源:glyphon 0.7.0 的 `prepare` 开头就 `glyph_vertices.clear()`,
+    /// 把传进去的每个字形重走一遍 LRU 查找 + 顶点 push,成本与**传进去的
+    /// 字形数**成正比,与「有没有变」无关。整形缓存省不到这一笔。
+    ///
+    /// **`trim` 必须与全量重建绑死**,理由见 [`crate::bands::may_trim`] ——
+    /// 这是本路径唯一会静默画错字的地方。
     pub fn prepare_panes(
         &mut self,
         device: &wgpu::Device,
@@ -466,6 +512,11 @@ impl TextLayer {
         let mut plan: Vec<Placement> = Vec::new();
         let mut temp_n = 0usize;
         let (mut hits, mut misses) = (0u64, 0u64);
+        // F172 诊断:本帧内容变了的行号,按 pane 内行序升序累加(段数只统计
+        // 局部性,跨 pane 拼在一起会把 pane 边界算成一次断裂 —— 那正是我们
+        // 想知道的「变化散不散」,不必分 pane 统计)。
+        let mut changed_rows: Vec<u16> = Vec::new();
+        let mut segments = 0u32;
 
         for (pane_ix, p) in panes.iter().enumerate() {
             // 缓存键必须是稳定身份。`pane_ix` 是当帧下标,关掉中间一块
@@ -498,6 +549,7 @@ impl TextLayer {
                     }
                     RowPlan::Reshape => {
                         misses += 1;
+                        changed_rows.push(row);
                         // 先把旧载荷收回池子再整形,否则滚动场景每帧新建
                         // 上千个 `Buffer`(T3),比改之前还慢。
                         cache.recycle_row(key, pool);
@@ -590,72 +642,215 @@ impl TextLayer {
         // 载荷回池子。刻意不在 `close_pane` 之类的地方各加清理 hook。
         cache.end_frame(pool);
         crate::diag::count_reshape(hits, misses);
+        segments += crate::bands::segments(&changed_rows);
 
-        // 第二遍:建 TextArea,bounds 用**该 pane 的**矩形而不是整窗。
-        // `left` 加上 `col × cell_w` —— 这一项就是 CJK 对齐的落点:与
-        // `gpu::quads_for` 画底色/光标用的是同一个式子。
-        let mut areas: Vec<TextArea> = Vec::with_capacity(plan.len());
-        for pl in &plan {
-            let Some(p) = panes.get(pl.pane_ix) else {
-                continue;
-            };
-            let buffer = match pl.src {
-                BufSrc::Cached(key, ix) => match self.cache.get(key).and_then(|r| r.runs.get(ix)) {
-                    Some(run) => &run.payload,
-                    None => continue,
-                },
-                BufSrc::Temp(i) => match self.temp.get(i) {
-                    Some(b) => b,
-                    None => continue,
-                },
-            };
-            let (left, top, right, bottom) = pane_bounds_ltrb(p.geom.term_px);
-            areas.push(TextArea {
-                buffer,
-                left: p.geom.term_px.x as f32 + f32::from(pl.col) * self.cell_w,
-                top: p.geom.term_px.y as f32 + f32::from(pl.row) * self.cell_h,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left,
-                    top,
-                    right,
-                    bottom,
-                },
-                default_color: glyphon::Color::rgb(
-                    self.default_fg.r,
-                    self.default_fg.g,
-                    self.default_fg.b,
-                ),
-                custom_glyphs: &[],
-            });
+        self.frame = self.frame.wrapping_add(1);
+        let style = crate::frame_fp::style_digest(self.style_key());
+        let force_full = std::mem::take(&mut self.force_full);
+
+        // --- F172 第一步:算每一带的指纹,定出脏带集合。---
+        //
+        // 指纹从**输入**算(行指纹 + pane 几何 + 样式 + 组字),不从「哪一行
+        // 走了 Reshape」算 —— 后者是原因侧,漏掉 pane 移动/换主题/组字三类。
+        // 整条判据收口在 `bands::plan_bands`(纯函数,无头可测)。
+        let slots_ro = &self.bands;
+        let plans = crate::bands::plan_bands(
+            panes,
+            &|k| slots_ro.get(&k).and_then(|s| s.fp),
+            style,
+            self.default_fg,
+            preedit_fg,
+            force_full,
+        );
+        let dirty_n = plans.iter().filter(|b| b.dirty).count();
+        crate::diag::count_bands(dirty_n as u64, plans.len() as u64, u64::from(segments));
+
+        // --- F172 第二步:trim。**只在全带重建的帧做**,理由见 `bands::may_trim`。---
+        //
+        // 必须排在 prepare 之前:trim 清空 `glyphs_in_use`,随后的 prepare 把
+        // 本帧用到的字形重新填回去。反过来的话本帧刚填的标记当场被清掉。
+        if crate::bands::may_trim(dirty_n, plans.len()) {
+            self.atlas.trim();
         }
 
-        self.renderer.prepare(
-            device,
-            queue,
-            &mut self.font_system,
-            &mut self.atlas,
-            &self.viewport,
-            areas,
-            &mut self.swash,
-        )
+        // --- F172 第三步:第二遍建 TextArea,按带分桶,只把脏带交给 prepare。---
+        //
+        // bounds 用**该 pane 的**矩形而不是整窗。`left` 加上 `col × cell_w`
+        // —— 这一项就是 CJK 对齐的落点:与 `gpu::quads_for` 画底色/光标用的是
+        // 同一个式子。
+        let mut buckets: Vec<Vec<&Placement>> = vec![Vec::new(); plans.len()];
+        // (pane_ix, 带号) → 桶下标。带按 pane 顺序连续排开,所以记下每个 pane
+        // 的起始下标就够,不必建 HashMap(帧路径上不分配哈希表,T3)。
+        let mut pane_base: Vec<usize> = Vec::with_capacity(panes.len());
+        {
+            let mut acc = 0usize;
+            for p in panes {
+                pane_base.push(acc);
+                acc += crate::bands::band_count(p.snap.rows) as usize;
+            }
+        }
+        for pl in &plan {
+            let Some(base) = pane_base.get(pl.pane_ix) else {
+                continue;
+            };
+            let b = crate::bands::band_of(pl.row) as usize;
+            // 越界只可能来自「光标行号 ≥ 快照行数」这类不一致,丢弃而不是
+            // panic:渲染路径不许 panic。
+            if let Some(bucket) = buckets.get_mut(base + b) {
+                bucket.push(pl);
+            }
+        }
+
+        let shadow_on = log::log_enabled!(target: "mullion", log::Level::Debug);
+        // 字段级借用分割:`bands` 要 `&mut`,而 `cache`/`temp` 只要 `&`。
+        // 写成 `self.xxx` 穿插调用就借不出来了。
+        let cache = &self.cache;
+        let temp = &self.temp;
+        let (cell_w, cell_h, default_fg) = (self.cell_w, self.cell_h, self.default_fg);
+        let slots = &mut self.bands;
+        let atlas = &mut self.atlas;
+        let fs = &mut self.font_system;
+        let swash = &mut self.swash;
+        let viewport = &self.viewport;
+        let frame = self.frame;
+
+        for (i, b) in plans.iter().enumerate() {
+            let slot = slots.entry(b.key).or_insert_with(|| BandSlot {
+                renderer: TextRenderer::new(atlas, device, wgpu::MultisampleState::default(), None),
+                fp: None,
+                last_seen: 0,
+                shadow: None,
+            });
+            slot.last_seen = frame;
+            if !b.dirty && !shadow_on {
+                continue;
+            }
+            let mut areas: Vec<TextArea> = Vec::with_capacity(buckets[i].len());
+            for pl in &buckets[i] {
+                let Some(p) = panes.get(pl.pane_ix) else {
+                    continue;
+                };
+                let buffer = match pl.src {
+                    BufSrc::Cached(k, ix) => match cache.get(k).and_then(|r| r.runs.get(ix)) {
+                        Some(run) => &run.payload,
+                        None => continue,
+                    },
+                    BufSrc::Temp(t) => match temp.get(t) {
+                        Some(b) => b,
+                        None => continue,
+                    },
+                };
+                let (left, top, right, bottom) = pane_bounds_ltrb(p.geom.term_px);
+                areas.push(TextArea {
+                    buffer,
+                    left: p.geom.term_px.x as f32 + f32::from(pl.col) * cell_w,
+                    top: p.geom.term_px.y as f32 + f32::from(pl.row) * cell_h,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    },
+                    default_color: glyphon::Color::rgb(default_fg.r, default_fg.g, default_fg.b),
+                    custom_glyphs: &[],
+                });
+            }
+
+            // F172 影子校验(debug 档):从**结果**侧再推一遍这一带长什么样,
+            // 与从**输入**侧算的指纹互为独立证据。指纹漏了输入项时,判成干净
+            // 的带的实际 TextArea 会与上一帧不同 —— 这里当场喊出来。
+            if shadow_on {
+                let d = shadow_digest(&areas);
+                if !b.dirty && slot.shadow != Some(d) {
+                    log::error!(
+                        target: "mullion",
+                        "F172 影子校验失配:带 {:?} 判为干净,实际 TextArea 变了 \
+                         ({:?} → {d:x}) —— 带指纹漏了输入项,屏幕上这一块会留着陈旧的字",
+                        b.key,
+                        slot.shadow,
+                    );
+                }
+                slot.shadow = Some(d);
+            }
+            if !b.dirty {
+                continue;
+            }
+
+            if let Err(e) = slot
+                .renderer
+                .prepare(device, queue, fs, atlas, viewport, areas, swash)
+            {
+                // 图集满了:哪些坐标还有效已经说不清,**全部带的指纹一律作废**,
+                // 下一帧强制全量重建 + trim 自愈。只把当前这一带作废是不够的
+                // —— grow/淘汰是全图集范围的。
+                for s in slots.values_mut() {
+                    s.fp = None;
+                    s.shadow = None;
+                }
+                self.force_full = true;
+                return Err(e);
+            }
+            slot.fp = Some(b.fp);
+        }
+
+        // 帧末逐出:本帧没出现过的带(pane 关了、行数缩了、切了标签)连同它的
+        // 顶点缓冲一起丢掉。与 `ShapedCache::end_frame` 同一手法。
+        slots.retain(|_, s| s.last_seen == frame);
+        Ok(())
     }
 
     /// 把已 `prepare` 的文字画进 `pass`。失败(如图集条目在 prepare 之后被淘汰)
     /// 不 panic,交调用方决定跳过。
+    ///
+    /// F172:一带一次 draw call。带之间不重叠,顺序不影响画面;`BTreeMap`
+    /// 保证顺序可复现。
     pub fn render<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
     ) -> Result<(), glyphon::RenderError> {
-        self.renderer.render(&self.atlas, &self.viewport, pass)
+        for slot in self.bands.values() {
+            slot.renderer.render(&self.atlas, &self.viewport, pass)?;
+        }
+        Ok(())
     }
+}
 
-    /// 清理图集里不再被引用的字形条目。glyphon 的 LRU 只有 `trim()` 才会真正淘汰;
-    /// 不调用的话长会话(尤其中文/高频刷新)迟早把图集喂满,`prepare` 返回
-    /// `PrepareError::AtlasFull`。每帧 present 之后调用一次(T3 之外的又一道守护)。
-    pub fn trim(&mut self) {
-        self.atlas.trim();
+/// F172 影子校验用的摘要:这一带**实际**交给 glyphon 的东西长什么样。
+///
+/// 刻意从 `TextArea` 与已 shape 的字形推,而不是从行指纹推 —— 它要当带指纹
+/// 的独立证人,共用输入就失去意义了。**只在 debug 档调用**:它要走一遍每个
+/// 字形,那正是本切片要省掉的开销。
+fn shadow_digest(areas: &[TextArea<'_>]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    let mut eat = |v: u64| {
+        for b in v.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(PRIME);
+        }
+    };
+    eat(areas.len() as u64);
+    for a in areas {
+        eat(u64::from(a.left.to_bits()));
+        eat(u64::from(a.top.to_bits()));
+        eat(a.bounds.left as u64);
+        eat(a.bounds.top as u64);
+        eat(a.bounds.right as u64);
+        eat(a.bounds.bottom as u64);
+        eat(u64::from(a.default_color.0));
+        for run in a.buffer.layout_runs() {
+            eat(u64::from(run.line_top.to_bits()));
+            for g in run.glyphs {
+                eat(u64::from(g.glyph_id));
+                eat(u64::from(g.x.to_bits()));
+                eat(u64::from(g.y.to_bits()));
+                eat(u64::from(g.color_opt.map_or(0, |c| c.0)));
+            }
+        }
     }
+    h
 }
 
 /// 终端网格的排版度量。**唯一来源** —— 量 `cell_w` 的那次和真正排版的那次
@@ -1087,6 +1282,118 @@ mod tests {
             "text.rs 里构造 Metrics 的代码行出现了 {n} 次,应该只有 \
              `grid_metrics` 内部那一次 —— 别的地方直接构造 Metrics 就绕开了\
              唯一来源,排版字号和 cell_w 会再次不同源"
+        );
+    }
+
+    /// 本文件里去掉 `///` 注释行之后的源码。源码切片守护共用。
+    fn code_lines() -> Vec<&'static str> {
+        include_str!("text.rs")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("///") && !t.starts_with("//!") && !t.starts_with("//")
+            })
+            .collect()
+    }
+
+    /// F172:**整个 crate 里只许有一处 `atlas.trim()`,且必须挂在
+    /// `bands::may_trim` 的闸下**。
+    ///
+    /// 这是本切片唯一会静默画错字的地方(理由见 `bands::may_trim`):trim 清空
+    /// `glyphs_in_use`,只有本帧真的 prepare 过的带才会把自己的字形标回去;
+    /// 干净带的字形失去保护,图集满时被踢掉、槽位让给新字形,而那些带的顶点
+    /// 还指着旧坐标 —— **屏幕上画出别的字,不报错、不 panic、日志一片正常**。
+    ///
+    /// 判据用**行下标邻近**而不是「文件里包含 may_trim」:后者对
+    /// 「把 trim 挪出 if、may_trim 那句留在别处」这个变异恒绿。
+    ///
+    /// 自证会变红:把 `self.atlas.trim()` 挪出那个 `if`,或再加一处。
+    #[test]
+    fn the_atlas_is_trimmed_only_behind_the_full_rebuild_gate() {
+        let lines = code_lines();
+        let needle = concat!("atlas", ".trim()");
+        let at: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "图集 trim 的调用点出现了 {} 次,只许有一处 —— 多一处就是多一条\
+             绕过全量重建闸的路,症状是屏幕上某一带画出别的字",
+            at.len()
+        );
+        let i = at[0];
+        let gate = concat!("may", "_trim(");
+        assert!(
+            lines[i.saturating_sub(3)..i]
+                .iter()
+                .any(|l| l.contains(gate)),
+            "图集 trim 的调用点前三行内没有全量重建闸 —— trim 脱离了\
+             「本帧全部带都重建了」这个前提"
+        );
+    }
+
+    /// F172:干净带**必须**在 `prepare` 之前被 `continue` 掉。
+    ///
+    /// 这是本切片的全部收益所在。漏了这道 `continue` 的话画面完全正确、
+    /// 测试全绿、日志一切正常,只有实机剖面的 `bands=N/N`(比值顶到 1)
+    /// 看得出来性能悄悄回到了改之前。
+    ///
+    /// 自证会变红:把 `prepare` 之前那句 `if !b.dirty { continue; }` 删掉。
+    #[test]
+    fn a_clean_band_never_reaches_prepare() {
+        let lines = code_lines();
+        let call = concat!(
+            ".pre",
+            "pare(device, queue, fs, atlas, viewport, areas, swash)"
+        );
+        let i = lines
+            .iter()
+            .position(|l| l.contains(call))
+            .expect("找不到 glyphon prepare 的调用点 —— 改了签名就把这条守护一起更新");
+        let guard = concat!("if !b.", "dirty {");
+        assert!(
+            lines[i.saturating_sub(12)..i]
+                .iter()
+                .any(|l| l.contains(guard)),
+            "prepare 调用点上方十二行内没有 `if !b.dirty {{ continue }}` —— \
+             干净带也被交给 prepare 了,F172 的收益归零而画面完全正确"
+        );
+    }
+
+    /// F172:`AtlasFull` 之后必须让**每一带**的指纹作废,而不只是当前这一带。
+    ///
+    /// 图集的 grow/淘汰是全图集范围的,撞满之后哪些坐标还有效说不清。只作废
+    /// 当前带的话,别的带留着「指纹匹配」的旧顶点,指向已经被别人占用的图集
+    /// 槽位 —— 自愈路径反而变成永久画错。
+    ///
+    /// 自证会变红:把错误分支里的 `for s in slots.values_mut()` 循环删掉,
+    /// 或把 `self.force_full = true` 删掉。
+    #[test]
+    fn an_atlas_full_invalidates_every_band_not_just_the_one_that_hit_it() {
+        let lines = code_lines();
+        let ret = concat!("return Err(", "e);");
+        let i = lines
+            .iter()
+            .position(|l| l.contains(ret))
+            .expect("找不到 prepare 失败的返回点");
+        let window = &lines[i.saturating_sub(8)..i];
+        assert!(
+            window
+                .iter()
+                .any(|l| l.contains(concat!("slots.", "values_mut()"))),
+            "prepare 失败时没有遍历全部带作废指纹 —— 别的带会留着指向乱掉的\
+             图集槽位的旧顶点,自愈路径变成永久画错"
+        );
+        assert!(
+            window
+                .iter()
+                .any(|l| l.contains(concat!("force_", "full = true"))),
+            "prepare 失败时没有置 `force_full` —— 下一帧不会全量重建 + trim,\
+             图集永远满着,画面冻在最后一次成功帧"
         );
     }
 

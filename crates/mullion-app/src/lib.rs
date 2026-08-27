@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod automation;
+pub mod bands;
 pub mod cli;
 pub mod clipboard;
 pub mod diag;

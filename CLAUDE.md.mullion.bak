@@ -7,7 +7,8 @@
 ## 背景：有多台ubuntu 服务器，已安装了claude code，进行开发，原先在Windows11中，用powershell+ssh，连接到ubuntu。tmux只用来保持claude code连接（ssh离线后保活）
 
 ## 项目是什么
-原生 GPU 加速的 SSH 客户端。核心场景：**在 Windows 上，通过高延迟代理链路，操作跑在远端 tmux 里的 Claude Code TUI**，支持多开。
+原生 GPU 加速的 SSH 客户端。核心场景：**在 Windows 上，通过高延迟代理链路，
+操作跑在远端 tmux 里的 Claude Code TUI**。
 
 需求细节见 `spec.md`。功能要有 spec 里的编号（F1/N3…），提交信息和测试名都引用它。
 

@@ -134,6 +134,17 @@ pub fn frame_fingerprint(
     FrameFp::Hash(h.0)
 }
 
+/// 样式量单独取指纹(F172 行带差分用)。
+///
+/// **刻意复用 `hash_style`** 而不是另写一遍:那个函数是穷尽解构的,
+/// `StyleKey` 加字段时它编译报错。复制一份的话新字段只会漏进行带指纹里
+/// —— 换字体后某些带留着旧字号的字,而**编译、测试、日志全静默**。
+pub fn style_digest(style: StyleKey<'_>) -> u64 {
+    let mut h = Fnv::new();
+    hash_style(&mut h, style);
+    h.0
+}
+
 fn hash_style(h: &mut Fnv, style: StyleKey<'_>) {
     // 穷尽解构 —— 加字段时这里编译报错,强迫作者对「进不进指纹」表态。
     let StyleKey {

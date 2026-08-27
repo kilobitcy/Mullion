@@ -138,6 +138,12 @@ static SYNC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// F12 剖面:整形缓存这一窗口命中/未命中了多少行。
 static RESHAPE_HIT: AtomicU64 = AtomicU64::new(0);
 static RESHAPE_MISS: AtomicU64 = AtomicU64::new(0);
+/// F172 剖面:顶点层行带差分这一窗口重建了多少带 / 一共多少带 / 变化行分成
+/// 几个连通段。**段数是判「带宽 16 是不是选对了」的量**:段数远小于脏带数
+/// 说明变化集中,带可以放大;段数逼近脏带数说明变化分散,再放大就白重建。
+static BAND_DIRTY: AtomicU64 = AtomicU64::new(0);
+static BAND_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BAND_SEGMENTS: AtomicU64 = AtomicU64::new(0);
 
 /// F157:本窗口收到多少次 `RedrawRequested`。唤醒率的直接读数。
 static WAKES: AtomicU64 = AtomicU64::new(0);
@@ -569,6 +575,20 @@ pub fn count_reshape(hits: u64, misses: u64) {
     RESHAPE_MISS.fetch_add(misses, Ordering::Relaxed);
 }
 
+/// F172:本帧行带差分的账。`total == 0`(这一帧没画)时直接返回,免得静止时
+/// 也在 relaxed 原子上打转 —— 与 `count_reshape` 同款。
+///
+/// **`dirty` 为 0 是有意义的读数**(全带命中,一帧顶点都没重建),所以判空
+/// 只看 `total`。
+pub fn count_bands(dirty: u64, total: u64, segments: u64) {
+    if total == 0 {
+        return;
+    }
+    BAND_DIRTY.fetch_add(dirty, Ordering::Relaxed);
+    BAND_TOTAL.fetch_add(total, Ordering::Relaxed);
+    BAND_SEGMENTS.fetch_add(segments, Ordering::Relaxed);
+}
+
 /// 此刻的规模。App 每帧调一次(三条 relaxed 原子存,可忽略)。
 pub fn set_scale(tabs: usize, panes: usize, hosts: usize) {
     TABS.store(tabs as u64, Ordering::Relaxed);
@@ -858,6 +878,9 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.sync_timeouts = SYNC_TIMEOUTS.swap(0, Ordering::Relaxed);
     s.reshape_hit = RESHAPE_HIT.swap(0, Ordering::Relaxed);
     s.reshape_miss = RESHAPE_MISS.swap(0, Ordering::Relaxed);
+    s.band_dirty = BAND_DIRTY.swap(0, Ordering::Relaxed);
+    s.band_total = BAND_TOTAL.swap(0, Ordering::Relaxed);
+    s.band_segments = BAND_SEGMENTS.swap(0, Ordering::Relaxed);
     let (dirty_sites, dirty_other) = DIRTY.drain();
     s.dirty_sites = dirty_sites;
     s.dirty_other = dirty_other;

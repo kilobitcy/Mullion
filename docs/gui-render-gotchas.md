@@ -82,13 +82,29 @@
 
 ## glyphon / 文字
 
-- **`TextAtlas::trim()` 必须每帧调、且要「可达」，否则长会话卡死。**
-  glyphon 的 `glyphs_in_use` 只有 `trim()` 会清；不调则 LRU 永远淘汰不掉，图集迟早满 →
-  `prepare()` 返回 `PrepareError::AtlasFull`。**坑中坑**：若 `trim()` 放在 `render_frame`
-  末尾，而 `prepare` 失败会提前 `return`——于是它本该自愈的那条路径反而到不了，一次
-  AtlasFull 后**永久卡死冻屏**。**规则**：`trim()` 放 `render_frame` **最开头**（任何
-  early-return 之前);渲染路径的 `prepare/render` 失败**记录并跳过本帧,不 panic**。
-  （GPU 胶水,无单测,只能读码推断。)
+- **`TextAtlas::trim()` 与「本帧重建了全部顶点」必须绑死（F172 起）。**
+  glyphon 的图集淘汰（`text_atlas.rs` 的 `try_allocate`）只保护 `glyphs_in_use` 里的
+  字形，而 `trim()` 把这张表**整个清空**、靠随后的 `prepare` 重新填回去。F172 把顶点
+  按 16 行一带分开、只重建脏带之后，这个前提不再成立：**没重新 prepare 的带的字形不在
+  表里 → 图集满时被踢掉、槽位让给新字形 → 那一带的旧顶点指向别的字形的图集坐标，
+  屏幕上画出别的字，不报错、不 panic、日志一片正常**。
+  **规则**：`atlas.trim()` 全 crate 只许有一处，且必须挂在 `bands::may_trim(脏, 总)`
+  的闸下（`dirty == total`）。平时不 trim，图集只涨不缩；换字体/字号/主题、窗口 resize、
+  pane 几何变、切标签、滚动本来就会让全带脏，自然就 trim 了。真撞 `AtlasFull` 时靠
+  「全带指纹作废 + `force_full` → 下一帧全量重建 + trim」自愈。
+  **注意 F172 之前的旧规则「trim 放 `render_frame` 最开头」已作废**——它当时是为了
+  绕开「`prepare` 失败提前 `return` 导致 trim 永远到不了、一次 AtlasFull 后永久冻屏」
+  这个坑中坑；现在自愈走 `force_full`，而 trim 挪进了 `prepare_panes` 内部。
+  渲染路径的 `prepare/render` 失败仍是**记录并跳过本帧，不 panic**。
+  **守护**：`text::tests::the_atlas_is_trimmed_only_behind_the_full_rebuild_gate`
+  （判据是**行下标邻近**——「文件里包含 `may_trim`」对「把 trim 挪出 `if`、那句留在
+  别处」这个变异恒绿）、`bands::tests::trimming_the_atlas_is_only_allowed_when_every_band_was_rebuilt`。
+- **多个 `TextRenderer` 共用一个 `TextAtlas` 是 glyphon 支持的用法（F172 靠它）。**
+  `render` 收 `&TextAtlas`、`prepare` 收 `&mut`，所以只要不并发就成立；`TextRenderer::new`
+  只分配 `next_copy_buffer_size(4096)` 字节，一带一个不算贵。更关键的是
+  `shader.wgsl:98` 用 `textureDimensions()` **在运行时**归一化 UV，**图集 grow
+  不会让别的带的旧顶点失效**——这条不成立的话整个分带方案都不成立。
+  `render()` 在 `glyph_vertices.is_empty()` 时会提前返回，空带不用特殊处理。
 - **glyphon 逐行 shape ≠ 我们的等宽网格。** 我们按 `col*cell_w` 自画背景块,文字却由
   cosmic-text 按字形 advance 排——纯等宽 ASCII 能对齐,CJK/字体回退时字形 x 未必落在格上,
   可能与背景块错位。这是 [adr-001](adr-001-glyph-rendering.md) 已拍板的 v0.1 取舍(通用文本路径),

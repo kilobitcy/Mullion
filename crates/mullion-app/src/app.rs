@@ -10933,20 +10933,20 @@ fn render_frame(
         // `Duration::MAX`):egui 可能正在推进一段动画,那一路的排期不能被
         // 「这一帧画面没变」吃掉。
         //
-        // `a.text.trim()` 被跳过是安全的:`trim` 存在的意义是让下一次
-        // `prepare` 能淘汰旧字形,本帧既然不 `prepare`,也就不会有新字形进
-        // 图集,图集不会增长。(原注释强调 `trim` 必须排在 `AtlasFull` 的
-        // 提前 return 之前 —— 那是因为那条路径**已经 prepare 过了**。)
+        // 跳过整段文字层是安全的:F172 之后 `trim` 只在 `prepare_panes` 内部
+        // 且只在全带重建的帧发生,本帧既然不 `prepare`,图集既不增长也不被清。
         return (repaint_delay, actions);
     }
     diag::count_frame_fp(false);
 
-    // 每帧先 trim:清掉上一帧的 glyphs_in_use,让本帧 prepare 能按需淘汰旧字形。
-    // 必须在 prepare/get_current_texture 的 early-return 之前——挪到函数末尾会导致
-    // 一旦 AtlasFull 触发提前 return,trim 永远到不了,图集永远不被清理,
-    // 下一帧 prepare 还是 AtlasFull,画面冻在最后一次成功帧且无法自愈。
-    // trim 只清 in_use 标记不删纹理,首帧对空图集是 no-op,正常帧语义不变。
-    a.text.trim();
+    // F172:trim 挪进了 `TextLayer::prepare_panes`,不再每帧无条件调。
+    //
+    // 原因是不变量变了:行带差分之后,一帧只重建**脏带**的顶点。`trim` 清空
+    // `glyphs_in_use`,而只有本帧真的 prepare 过的带才会把自己用到的字形重新
+    // 标回去 —— 干净带的字形就此失去保护,下一次图集淘汰会把它们扔掉,而那些
+    // 带的顶点还指着旧坐标:**屏幕上画出别的字,不报错、不 panic**。
+    // 判据(以及 `AtlasFull` 的自愈路径)收口在 `bands::may_trim` 与
+    // `prepare_panes` 内部,这里不能再有第二个调用点。
 
     // --- 终端趟:仅 panes 非空(终端态)才生成 quads/prepare 文字;launcher 态
     // (panes 为空)没有终端可画,跳过,只画上面的 egui。每个 pane 自带 term_px
