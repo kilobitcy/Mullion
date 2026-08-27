@@ -606,6 +606,90 @@ pub fn mem_accounted_mb(scroll_b: u64, xfer_b: u64, text_b: u64) -> u64 {
     (scroll_b >> 20) + (xfer_b >> 20) + (text_b >> 20)
 }
 
+/// F177:spec.md 的 N5 —— 常驻内存(8 pane,10000 行回溯)< 300MB。
+///
+/// **这个数在核显机器上含义更严**:UMA 没有独立显存,wgpu 的每一份分配都
+/// 计进工作集(N5 切片实测 165MB WriteCombine 全在账内)。独显机器上同样的
+/// 代码会低一大截。看到读数逼近上限时,先问「核显还是独显」再下结论。
+pub const N5_BUDGET_MB: u64 = 300;
+
+/// F177:报告步长。越界之后,比上次报告值又高这么多才再报一次。
+///
+/// **刻意不用 `diag::should_report` 那套翻倍**:内存从 300 翻到 600 才吭
+/// 第二声,中间一条几百 MB 的慢泄漏全程静默。固定步长对内存更合适。
+pub const MEM_REPORT_STEP_MB: u64 = 64;
+
+/// F177:回落滞回带。
+///
+/// **删掉它不会有任何测试以外的报错**,但 ws 在阈值附近抖动(299↔301,
+/// Windows 主动裁剪工作集时很常见)会让每一次穿越都产出一对
+/// `Cross`/`Recover` —— 空闲进程每几个窗口写两行日志,硬盘永不休眠,
+/// 正是「这条警告可以穿透空闲门」所依据的前提被推翻。
+/// 守护:`tests::jitter_around_the_threshold_does_not_wake_the_disk`。
+pub const MEM_HYSTERESIS_MB: u64 = 16;
+
+/// F177:这一窗口预算闸该不该出声。
+///
+/// 两个变体携带的都是**触发本次判定的那个 `ws_mb`**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetVerdict {
+    Quiet,
+    /// 越界(首次,或比上次报告值又涨了一个步长)。调用方置
+    /// `reported_mb = Some(mb)`。
+    Cross(u64),
+    /// 跌回滞回带下沿以下。调用方置 `reported_mb = None`。
+    Recover(u64),
+}
+
+/// F177:纯判定。调用方持有 `reported_mb: Option<u64>`
+/// (语义:上一次报 `Cross` 时的 ws;`None` = 当前不在越界态)。
+///
+/// **`ws_mb == None` 一律 `Quiet`**:读不到工作集的机器上不能凭空报警,
+/// 同 `Snapshot::cpu_is_busy` 里那条 `is_some_and` 的道理(那是私有方法,
+/// 这里刻意用普通代码体而非 intra-doc 链接,免得 `cargo doc` 报私有链接)。
+pub fn budget_verdict(ws_mb: Option<u64>, reported_mb: Option<u64>) -> BudgetVerdict {
+    let Some(ws) = ws_mb else {
+        return BudgetVerdict::Quiet;
+    };
+    match reported_mb {
+        // 不在越界态:严格大于才算越界(恰好等于预算不算超)。
+        None => {
+            if ws > N5_BUDGET_MB {
+                BudgetVerdict::Cross(ws)
+            } else {
+                BudgetVerdict::Quiet
+            }
+        }
+        // 已在越界态:先看回落(带滞回),再看有没有涨够一个步长。
+        Some(prev) => {
+            if ws <= N5_BUDGET_MB.saturating_sub(MEM_HYSTERESIS_MB) {
+                BudgetVerdict::Recover(ws)
+            } else if ws >= prev.saturating_add(MEM_REPORT_STEP_MB) {
+                BudgetVerdict::Cross(ws)
+            } else {
+                BudgetVerdict::Quiet
+            }
+        }
+    }
+}
+
+/// F177:越界告警的正文。带上 commit 与「其他」,让读日志的人不必再去
+/// 翻同一窗口的 `profile.mem` 行。
+pub fn over_budget_line(ws_mb: u64, commit_mb: u64, other_mb: u64) -> String {
+    format!(
+        "profile.mem.over ws={ws_mb}MB > N5 {N5_BUDGET_MB}MB \
+         (commit {commit_mb}, 其他 {other_mb})"
+    )
+}
+
+/// F177:回落行。
+///
+/// **这行必须存在**:否则读日志的人看到一条越界警告,无从判断它是
+/// 「当时闪了一下」还是「从那以后一直这样」。
+pub fn recovered_line(ws_mb: u64) -> String {
+    format!("profile.mem.over 回落 ws={ws_mb}MB")
+}
+
 /// F169:`profile.mem` 正文的纯渲染。手工记账三个已知大块 + 显式余量
 /// （用户拍板：不做自定义分配器）。
 ///
@@ -2417,5 +2501,94 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.starts_with("profile.mem ") && l.ends_with("其他:423")));
+    }
+
+    /// F177:预算闸状态机 —— 首次越界报、同值静默、涨够步长再报、
+    /// 跌到滞回带下沿才算回落且复位后能再报。
+    ///
+    /// 自证会变红:去掉步长判据(改成越界态每窗口都 `Cross`),第二条断言抓住。
+    #[test]
+    fn budget_verdict_reports_once_then_only_on_a_real_climb() {
+        // 首次越界。
+        assert_eq!(budget_verdict(Some(428), None), BudgetVerdict::Cross(428));
+        // 同值再来:安静。
+        assert_eq!(budget_verdict(Some(428), Some(428)), BudgetVerdict::Quiet);
+        // 涨了 63:还不够一个步长(64),安静。
+        assert_eq!(budget_verdict(Some(491), Some(428)), BudgetVerdict::Quiet);
+        // 涨够 64:再报一次。
+        assert_eq!(
+            budget_verdict(Some(492), Some(428)),
+            BudgetVerdict::Cross(492)
+        );
+        // 跌到滞回带下沿(300-16=284)以下:回落。
+        assert_eq!(
+            budget_verdict(Some(180), Some(428)),
+            BudgetVerdict::Recover(180)
+        );
+        // 复位之后还能再报。
+        assert_eq!(budget_verdict(Some(500), None), BudgetVerdict::Cross(500));
+    }
+
+    /// F177 的承重条:阈值附近抖动(299↔301)**一行都不许写**。
+    ///
+    /// 没有滞回带时,每一次穿越都产出一对 Cross/Recover,两行日志每几个
+    /// 窗口来一遍 —— 一个空闲进程被这条警告永远吵醒,正是「穿透空闲门」
+    /// 时拿「O(1) 不是 O(每5秒)」当理由所排除掉的那件事。
+    ///
+    /// 自证会变红:把 Recover 判据的 `- MEM_HYSTERESIS_MB` 去掉。
+    #[test]
+    fn jitter_around_the_threshold_does_not_wake_the_disk() {
+        let mut reported: Option<u64> = None;
+        let mut lines = 0;
+        for ws in [301u64, 299, 301, 299, 300, 301] {
+            match budget_verdict(Some(ws), reported) {
+                BudgetVerdict::Quiet => {}
+                BudgetVerdict::Cross(mb) => {
+                    lines += 1;
+                    reported = Some(mb);
+                }
+                BudgetVerdict::Recover(_) => {
+                    lines += 1;
+                    reported = None;
+                }
+            }
+        }
+        assert_eq!(lines, 1, "阈值附近抖动只该在第一次越界时写一行");
+    }
+
+    /// F177:恰好等于预算不算超 —— 判据是严格大于。
+    ///
+    /// 自证会变红:把 `>` 写成 `>=`。
+    #[test]
+    fn the_threshold_is_strictly_greater_than() {
+        assert_eq!(
+            budget_verdict(Some(N5_BUDGET_MB), None),
+            BudgetVerdict::Quiet
+        );
+        assert_eq!(
+            budget_verdict(Some(N5_BUDGET_MB + 1), None),
+            BudgetVerdict::Cross(N5_BUDGET_MB + 1)
+        );
+    }
+
+    /// F177:采不到读数的机器上不许凭空报警。
+    ///
+    /// 同 `cpu_is_busy` 那条 `is_some_and` 的道理。
+    /// 自证会变红:把 `let Some(ws) = ws_mb else { … }` 换成
+    /// `ws_mb.unwrap_or(u64::MAX)`。
+    #[test]
+    fn no_reading_means_no_alarm() {
+        assert_eq!(budget_verdict(None, None), BudgetVerdict::Quiet);
+        assert_eq!(budget_verdict(None, Some(428)), BudgetVerdict::Quiet);
+    }
+
+    /// F177:两种告警行的正文。
+    #[test]
+    fn the_alarm_lines_say_which_number_tripped_and_what_else_is_on_the_books() {
+        assert_eq!(
+            over_budget_line(428, 512, 507),
+            "profile.mem.over ws=428MB > N5 300MB (commit 512, 其他 507)"
+        );
+        assert_eq!(recovered_line(180), "profile.mem.over 回落 ws=180MB");
     }
 }
