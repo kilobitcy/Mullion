@@ -47,11 +47,18 @@ pub fn install_cjk_font(ctx: &egui::Context) {
     let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
         return;
     };
+    // `Box::leak` 是刻意的:这份字体本来就要活到进程结束,leak 换来
+    // `&'static [u8]` 才能走 `from_static`(Cow::Borrowed → epaint 用零拷贝的
+    // FontRef)。`from_owned`(Cow::Owned)那条分支在 epaint 0.30 里是
+    // `bytes.clone()` **再复制一整份**——msyh.ttc 约 19MB,双份 37.6MB
+    // (VMMap 实测两个 18.79MB 堆块,N5)。本函数每进程只调一次(app.rs 建
+    // egui_ctx 处),不存在反复泄漏。守护:tests::the_cjk_font_is_installed_once。
+    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     // 从 default 出发:保留内嵌拉丁字体作主字体,只把 CJK 追加为末位回退。
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "system-cjk".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
+        Arc::new(egui::FontData::from_static(bytes)),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts
@@ -2235,6 +2242,41 @@ mod tests {
             text.contains("local-tab-only.txt"),
             "本地栏没画出来 —— build_ui 传了 files_content 却没真的接上 \
              files_panel::content,实际画出来的文本: {text}"
+        );
+    }
+
+    /// N5:`install_cjk_font` 必须走 `FontData::from_static`(零拷贝 FontRef)。
+    /// `from_owned` 在 epaint 0.30 里是 `bytes.clone()` 再复制一整份——
+    /// msyh.ttc 约 19MB,双份 37.6MB,而编译、测试、渲染结果全部一样,
+    /// 只有任务管理器看得出来。
+    ///
+    /// 只扫 `#[cfg(test)]` 之前的正文(测试模块自己会提到这两个名字,不切
+    /// 的话本测试恒绿);按行跳过注释。
+    /// 自证会变红:把 install_cjk_font 里的 from_static 改回 from_owned。
+    #[test]
+    fn the_cjk_font_is_installed_once() {
+        let src = include_str!("mod.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("mod.rs 应有测试模块")];
+        let code_lines: Vec<&str> = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .collect();
+        assert_eq!(
+            code_lines
+                .iter()
+                .filter(|l| l.contains("FontData::from_owned"))
+                .count(),
+            0,
+            "ui/mod.rs 正文不许用 FontData::from_owned——epaint 会把字体整份再复制一遍(+18.8MB)"
+        );
+        assert_eq!(
+            code_lines
+                .iter()
+                .filter(|l| l.contains("FontData::from_static"))
+                .count(),
+            1,
+            "install_cjk_font 必须恰好走一次 FontData::from_static(零拷贝)"
         );
     }
 }
