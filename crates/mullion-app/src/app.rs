@@ -7968,7 +7968,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // 里的 `request_redraw()` 立刻又生成一个 `RedrawRequested`,
                 // 闭环自激。判据与理由见 `egui_should_see_window_event`。
                 if shell::input_route::egui_should_see_window_event(&event) {
-                    let resp = active.egui_state.on_window_event(&active.window, &event);
+                    // F175:只包住这一次调用。窗口事件在 v0.1.75 的实机剖面里是
+                    // `937x/p95=1.0ms`,但那段含路由判定与标脏,拆不开就没法判断
+                    // 该去掉帧还是该去掉这一趟。埋点,不改任何门控。
+                    let resp = diag::timed_egui_window_event(|| {
+                        active.egui_state.on_window_event(&active.window, &event)
+                    });
                     if resp.repaint {
                         // F171:归因埋在 `resp.repaint` **之内** —— 这张表回答的是
                         // 「凭什么出帧」,不是「收到了什么」。挪到 if 外面就把
@@ -15758,6 +15763,58 @@ mod tests {
         assert!(
             gate < feed,
             "门控排在了 on_window_event 之后 —— 排在后面等于没门控"
+        );
+    }
+
+    /// **接线守护 / F175**:喂 egui 的计时闭包里**只许有那一次调用**。
+    ///
+    /// 这个数字的整个用途是把 `window_event=` 那段拆开(它含路由判定、终端
+    /// 分支、标脏),据此判断该去掉帧还是该去掉这一趟处理。往闭包里多包一行,
+    /// 量到的就不再是它声称的东西 —— 而日志里长得一模一样,只会把下一轮的
+    /// 优化方向带偏。反过来,把 `timed_` 拿掉则 `egui_feed=` 恒报 `n/a`,
+    /// 看起来像「这台机器采不到」。
+    ///
+    /// 用**行下标紧邻**而不是「函数体里出现过 timed_」:后者对「计时闭包挪到
+    /// 别处、调用点裸着」这个变异恒绿(F172 的同款判据实测过)。
+    ///
+    /// 自证会变红:把 `mark_ui_dirty!` 那句挪进闭包,或把 `timed_` 那层去掉。
+    #[test]
+    fn the_egui_feed_timer_wraps_that_one_call_and_nothing_else() {
+        let src = include_str!("app.rs");
+        let at = src
+            .find("\n    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {")
+            .expect("找不到 window_event 的定义");
+        let after = &src[at + 1..];
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 window_event 的函数结尾")];
+        let code: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let timer = concat!("timed_egui_", "window_event(");
+        let at: Vec<usize> = code
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(timer))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "喂 egui 的计时点有 {} 处,只许有一处 —— 多一处就是把同一趟记了两遍",
+            at.len()
+        );
+        let next = code[at[0] + 1].trim();
+        assert!(
+            next.starts_with(concat!("active.egui_state.on_", "window_event(")),
+            "计时闭包的第一行不是那次调用,而是 `{next}` —— 计时范围与它声称的\
+             范围不符,而日志里看不出来"
+        );
+        assert!(
+            code[at[0] + 2].trim().starts_with("})"),
+            "计时闭包里不止那一次调用 —— 多包进来的开销会被算进 `egui_feed=`,\
+             下一轮据此做的取舍就是错的"
         );
     }
 

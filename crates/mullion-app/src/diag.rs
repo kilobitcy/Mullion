@@ -512,9 +512,31 @@ static GPU_EGUI_US: crate::profile::Histogram = crate::profile::Histogram::new()
 /// F170:`INSIDE_PASSES` 时间戳查询这一路是否拿到过。
 static GPU_SPLIT_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
+/// F175:`egui_state.on_window_event` 单独一趟的耗时(微秒)。
+///
+/// 与 `window_event` 这个 Stage 的关系:后者量的是**整段**窗口事件处理
+/// (路由判定 + 喂 egui + 终端分支 + 标脏),v0.1.75 的实机剖面里它是
+/// `937x/p95=1.0ms`。要判断该去掉帧还是该去掉喂 egui 这一趟,得知道这一趟
+/// 单独占多少 —— 拿 Stage 拆是不行的:`mark()` 记的是「离开上一阶段」,在
+/// 中间插一次 mark 会让 `window_event=` 的样本数凭空翻倍,把一个已有的
+/// 归因数字的含义改掉。所以另开一支直方图,`window_event=` 原样不动。
+static EGUI_FEED_US: crate::profile::Histogram = crate::profile::Histogram::new();
+
 /// F165:记一次 GPU 帧耗时。由 wgpu 的 map 回调调用(不在主线程上)。
 pub fn record_gpu_frame_us(us: u64) {
     GPU_FRAME_US.record_us(us);
+}
+
+/// F175:量一趟「把窗口事件喂给 egui-winit」。
+///
+/// 包住调用而不是让调用方自己读两次时钟,是为了让「计时范围 = 那一次调用」
+/// 这件事在类型上成立 —— 调用方多包一行进去,数字就不再是它声称的东西,
+/// 而这种偏差在日志里完全看不出来。
+pub fn timed_egui_window_event<R>(f: impl FnOnce() -> R) -> R {
+    let t0 = elapsed_us();
+    let r = f();
+    EGUI_FEED_US.record_us(elapsed_us().saturating_sub(t0));
+    r
 }
 
 /// F170:一次分层采样(µs)。由 GpuTimer 回读回调调用(wgpu 内部线程)。
@@ -1084,6 +1106,7 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
         .and_then(|p| p.sample())
         .map(|v| (v.used_mb, v.budget_mb));
     s.gpu_frame_us = GPU_FRAME_US.drain();
+    s.egui_feed_us = EGUI_FEED_US.drain();
     s.scroll_events = SCROLL_EVENTS.swap(0, Ordering::Relaxed);
     s.xfer_jobs = XFER_JOBS.load(Ordering::Relaxed);
     s.xfer_running = XFER_RUNNING.load(Ordering::Relaxed);

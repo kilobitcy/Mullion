@@ -315,6 +315,11 @@ pub struct Snapshot {
     pub vram_mb: Option<(u64, u64)>,
     /// F165:GPU 帧耗时分布。样本数为 0 = 不支持或本窗口没采到。
     pub gpu_frame_us: Counts,
+    /// F175:`egui_state.on_window_event` 单独一趟的耗时分布。
+    ///
+    /// 与 `stage_us[window_event]` 是包含关系(后者含前者),两者一起看才能
+    /// 判断「窗口事件贵」贵在喂 egui 还是贵在别的地方。
+    pub egui_feed_us: Counts,
     /// F167:本窗口的用户滚动事件数(滚轮/翻页键/拖拽自动滚,计次量)。
     pub scroll_events: u64,
     /// F167/F169:传输队列此刻未收尾条数(状态量,读而不清)。
@@ -411,6 +416,7 @@ impl Snapshot {
             gpu_available: false,
             vram_mb: None,
             gpu_frame_us: [0; BUCKETS],
+            egui_feed_us: [0; BUCKETS],
             scroll_events: 0,
             xfer_jobs: 0,
             xfer_bytes_left: 0,
@@ -735,18 +741,39 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         .collect();
     stages.sort_by_key(|(_, n, p95)| std::cmp::Reverse(n.saturating_mul(*p95)));
     stages.truncate(4);
+    // p50 与 p95 一起报:桶是 log2 的,光有 p95 时「937 次 × p95=1.0ms」的总账
+    // 落在 0 到 19% 之间的任何位置都说得通 —— 那个区间宽到没法据此决定该去掉
+    // 帧还是该去掉这一趟处理(F175 埋点的直接动机)。
     let stage_part = stages
         .iter()
         .map(|(k, n, p95)| {
             format!(
-                "{}={}x/p95={}",
+                "{}={}x/p50={}/p95={}",
                 crate::diag::stage_name(*k as u8),
                 n,
+                fmt_us(quantile_us(&s.stage_us[*k], 0.5)),
                 fmt_us(*p95)
             )
         })
         .collect::<Vec<_>>()
         .join(" ");
+
+    // F175:喂给 egui-winit 那一趟单独的账。它被 `window_event` 那段**包含**,
+    // 两者相减才是「路由判定 + 终端分支 + 标脏」的开销。
+    let egui_feed_part = {
+        let n = total(&s.egui_feed_us);
+        if n == 0 {
+            // 采不到与「快到量不出来」必须长得不一样(同 gpu_frame 的 n/a)。
+            "n/a".to_string()
+        } else {
+            format!(
+                "{n}x/p50={}/p95={}/max={}",
+                fmt_us(quantile_us(&s.egui_feed_us, 0.5)),
+                fmt_us(quantile_us(&s.egui_feed_us, 0.95)),
+                fmt_us(quantile_us(&s.egui_feed_us, 1.0))
+            )
+        }
+    };
 
     let dirty_part = render_key_table(&s.dirty_sites, s.dirty_other, |k| k.to_string());
     // F171:事件类型码要翻成短名再上日志 —— 光有码得回源码查表,归因就废了。
@@ -776,7 +803,7 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
          redraw=term:{}/ui:{}/both:{} 同步块={}x/超时={}x in={} key={}x/echo={}x/p95={} {} \
          reshape=hit:{}/miss:{} bands={}/{} seg={} fp=hit:{}/miss:{} \
          wake={}x/rr=sched:{},evt:{} dirty={} \
-         wev={} curdup={} egui_ev={}x/f:{} rdelay=z:{}/f:{}/m:{} \
+         wev={} curdup={} egui_ev={}x/f:{} egui_feed={} rdelay=z:{}/f:{}/m:{} \
          conn=ok:{}/err:{}/re:{} sftp={} tabs={} panes={} hosts={}",
         secs,
         s.frames,
@@ -811,6 +838,7 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         s.cursor_dup,
         s.egui_events,
         s.egui_event_frames,
+        egui_feed_part,
         s.rdelay_zero,
         s.rdelay_finite,
         s.rdelay_max,
@@ -1371,6 +1399,74 @@ mod tests {
         let line = render_line(&measured).expect("有一行");
         assert!(line.contains("echo=7x"), "回显样本数不对:{line}");
         assert!(!line.contains("p95=0us"), "量到了却报 0:{line}");
+    }
+
+    /// F175:阶段段必须同时报 p50 和 p95。
+    ///
+    /// 桶是 log2 的,单看 p95 定不出总账:`window_event=937x/p95=1.0ms` 意味着
+    /// 这一窗口花在窗口事件上的时间在 0 到 19% 之间的**任何位置**都说得通,
+    /// 而「该去掉帧还是该去掉这一趟处理」正好取决于落在区间哪一端。
+    ///
+    /// 自证会变红:把 `stage_part` 里的 `/p50={}` 那一截删掉。
+    #[test]
+    fn a_stage_reports_both_the_median_and_the_tail() {
+        let mut s = busy_snapshot();
+        // 绝大多数很快、偶尔卡一下 —— p50 与 p95 分家的典型形状。
+        s.stage_us[crate::diag::Stage::WindowEvent as usize][bucket_of(50)] = 99;
+        s.stage_us[crate::diag::Stage::WindowEvent as usize][bucket_of(1_000_000)] = 1;
+        let line = render_line(&s).expect("忙窗口该有一行");
+        let seg = line
+            .split_whitespace()
+            .find(|w| w.starts_with("window_event="))
+            .unwrap_or_else(|| panic!("没报窗口事件阶段:{line}"));
+        assert!(
+            seg.contains("/p50=") && seg.contains("/p95="),
+            "阶段段只报了一个分位数(`{seg}`)—— 光有 p95 时总账的可能区间宽到\
+             没法据此决定优化方向"
+        );
+    }
+
+    /// F175:喂 egui-winit 那一趟的耗时必须进剖面行,且「没采到」与「快到
+    /// 量不出来」长得不一样。
+    ///
+    /// 这一段存在的全部理由是把 `window_event=` 那段**拆开**:它含路由判定、
+    /// 终端分支、标脏,不拆就分不出窗口事件贵在哪。归成 `0us` 一类的话,
+    /// 「埋点没接上」和「这一趟确实很快」在日志里没有区别 —— 而这两种情况
+    /// 的下一步动作正好相反。
+    ///
+    /// 自证会变红:把 `egui_feed_part` 换成常量,或把 `n == 0` 那个分支删掉。
+    #[test]
+    fn the_egui_feed_cost_is_told_apart_from_never_measured() {
+        let line = render_line(&busy_snapshot()).expect("忙窗口该有一行");
+        assert!(
+            line.contains("egui_feed=n/a"),
+            "没采到样本却没报 n/a:{line}"
+        );
+
+        let mut measured = busy_snapshot();
+        measured.egui_feed_us[bucket_of(300)] = 5;
+        let line = render_line(&measured).expect("有一行");
+        let seg = line
+            .split_whitespace()
+            .find(|w| w.starts_with("egui_feed="))
+            .unwrap_or_else(|| panic!("没报喂 egui 的耗时:{line}"));
+        assert!(seg.contains("5x"), "样本数不对:{seg}");
+        assert!(!seg.contains("p50=0us"), "量到了却报 0:{seg}");
+    }
+
+    /// F175:`egui_feed=` 与 `egui_ev=` 是两件事,不能在日志里认串。
+    ///
+    /// 前者是「喂 egui 花了多久」(耗时),后者是「egui 收了几个事件」(计数)。
+    /// 名字长得像,而 `line.contains("egui_ev=")` 这种前缀匹配会把两者混起来
+    /// —— 本文件里就有几条守护是这么写的。
+    #[test]
+    fn the_egui_feed_segment_does_not_collide_with_the_egui_event_count() {
+        let line = render_line(&busy_snapshot()).expect("有一行");
+        let n = line
+            .split_whitespace()
+            .filter(|w| w.starts_with("egui_ev="))
+            .count();
+        assert_eq!(n, 1, "`egui_ev=` 前缀匹配到了 {n} 段,两个字段认串了:{line}");
     }
 
     /// F12:整形缓存的命中/未命中必须进剖面行。
