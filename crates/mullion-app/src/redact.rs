@@ -421,7 +421,10 @@ mod tests {
     /// F180:`-` 是三处埋点明定的空表占位符,一旦被收进假名表,
     /// `replace_known_bare_tokens` 会把**整份日志里所有孤立的 `-`** 换掉。
     ///
-    /// 自证会变红:把 `collectible` 的 `>= 2` 改成 `>= 1`。
+    /// 自证会变红:把 `looks_like_user_at_host` 里的 `&&` 改成 `||`(只否掉
+    /// 一边)。**注意不是**把 `collectible` 的 `>= 2` 放宽 —— 那一处有字节量
+    /// 判据兜着,这条测试照绿,而单字符那条会红:两层各有各的守护,别把自证
+    /// 注释写到隔壁那层去(实测四条变异逐一核对过谁杀谁)。
     #[test]
     fn the_empty_table_placeholder_never_becomes_a_fake_host() {
         let mut r = Redactor::new();
