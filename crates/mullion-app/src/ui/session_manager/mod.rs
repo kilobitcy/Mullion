@@ -28,8 +28,8 @@ pub(crate) mod tunnel_list;
 pub(crate) mod validate;
 
 pub(crate) use buffer::{
-    build_draft, clear_key, connect_string, import_icon_file, import_key_file, is_dirty,
-    merge_secret, secret_fields, set_color_target, sync_has_passphrase,
+    bookmark_table_touched, build_draft, clear_key, connect_string, import_icon_file,
+    import_key_file, is_dirty, merge_secret, secret_fields, set_color_target, sync_has_passphrase,
 };
 pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
 pub use buffer::{
@@ -816,6 +816,11 @@ pub fn show(
             match build_draft(buf) {
                 Ok(draft) => {
                     let (password, passphrase, proxy_password, private_key) = secret_fields(buf);
+                    // F189:书签表只有**真的被动过**才写回去。判据用的就是
+                    // 表单自己那条脏基线 —— 没动过时写回去,等于拿编辑器打开
+                    // 那一刻的快照顶掉路径条 ☆ 后来收藏的目录(见 `SaveIntent`)。
+                    let bookmarks = bookmark_table_touched(buf, ui_state.editor_baseline.as_ref())
+                        .then(|| draft.sftp.bookmarks.clone());
                     ui_state.save_request = Some(SaveIntent {
                         editing_id: ui_state.editor_id,
                         draft,
@@ -824,6 +829,7 @@ pub fn show(
                         proxy_password,
                         private_key,
                         then_connect,
+                        bookmarks,
                     });
                     // 保存成功后基线要跟上,否则刚存完就被判成脏。
                     ui_state.editor_baseline = ui_state.editor.clone();

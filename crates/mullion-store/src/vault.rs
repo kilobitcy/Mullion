@@ -32,6 +32,21 @@ pub struct Vault {
     /// 与 `key` 永远同源同步 —— 两者不一致的后果是「用 A 的密钥写出声称 B 的
     /// 文件」,下次打开时所有凭据永久解不开。
     scheme: crate::secrets_file::Scheme,
+    /// F189:上一次与盘同步时,`sessions.toml` 里**实际是什么字节**。
+    ///
+    /// 与 `synced_toml` 分两份存,不是一份:刚 `open` 完这两者完全可能不等
+    /// (迁移、手改过的排版、`skip_serializing_if` 的取舍),合成一份的话
+    /// 「我们有没有没落盘的改动」这个判据一开机就恒真,重读永远不会发生。
+    disk_toml: String,
+    /// F189:上一次与盘同步时,**我们自己**序列化出来是什么。
+    ///
+    /// 「手上有没有还没落盘的改动」= 现在序列化一遍跟它比。**结构式判据,
+    /// 不是每个 mutator 各自举手的脏标记** —— 后者在加新 mutator 时必然漏
+    /// (本项目「列举式门控」已经踩过三次),而漏掉的后果是重读把用户刚改的
+    /// 东西静默丢掉。
+    synced_toml: String,
+    /// F189:重读时发生过什么,留给 app 记日志(store 零 UI,也不依赖 `log`)。
+    reload_notes: Vec<String>,
 }
 
 /// 打开保险库时用什么开锁(F71,设计 D9/D10)。
@@ -209,7 +224,7 @@ impl Vault {
             }
         }
 
-        let vault = Self {
+        let mut vault = Self {
             dir,
             groups,
             sessions,
@@ -218,7 +233,11 @@ impl Vault {
             secrets,
             key,
             scheme,
+            disk_toml: fs::read_to_string(&sessions_path).unwrap_or_default(),
+            synced_toml: String::new(),
+            reload_notes: Vec::new(),
         };
+        vault.synced_toml = vault.sessions_toml()?;
         if migrated {
             // 立即写回 v2,避免下次打开重复迁移并覆盖掉备份。
             vault.save()?;
@@ -226,8 +245,10 @@ impl Vault {
         Ok(vault)
     }
 
-    /// 落盘:两文件各自原子写。
-    pub fn save(&self) -> Result<(), StoreError> {
+    /// 现在这份内存状态序列化出来是什么 —— `save()` 写出去的正文,以及
+    /// 「有没有还没落盘的改动」那个判据的左边。两处必须**同一个函数**算:
+    /// 各算各的话,某天有人只改了其中一处,重读的判据就悄悄失准了。
+    fn sessions_toml(&self) -> Result<String, StoreError> {
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,
             group: self.groups.clone(),
@@ -235,7 +256,12 @@ impl Vault {
             tunnel: self.tunnels.clone(),
             credential: self.credentials.clone(),
         };
-        let toml_text = toml::to_string_pretty(&file)?;
+        Ok(toml::to_string_pretty(&file)?)
+    }
+
+    /// 落盘:两文件各自原子写。
+    pub fn save(&mut self) -> Result<(), StoreError> {
+        let toml_text = self.sessions_toml()?;
         write_atomic(&self.sessions_path(), toml_text.as_bytes())?;
 
         let secret_text = toml::to_string_pretty(&self.secrets)?;
@@ -243,7 +269,106 @@ impl Vault {
         // F71:`Keyring` 方案下 `encode` 是恒等,写出的字节与本片之前完全一致。
         let blob = crate::secrets_file::encode(&self.scheme, &payload);
         write_atomic(&self.secrets_path(), &blob)?;
+        // 刚写出去的就是盘上那份,两个基准一起对齐 —— 漏了这一步,下一次
+        // 改动会把**自己**刚写的内容当成「别的实例动过」再读一遍。
+        self.disk_toml = toml_text.clone();
+        self.synced_toml = toml_text;
         Ok(())
+    }
+
+    /// F189:动手改之前,先看看盘上那份是不是被**别的实例**写过了。
+    ///
+    /// 用户报的问题 1(升级后收藏夹全没了)的机制:多开是本项目的主场景,
+    /// 而每个实例都在 `open` 那一刻把整个库读进内存,此后任何一次 `save()`
+    /// 都是**整份覆盖**。A 实例开着不动,B 实例收藏了几个目录,A 这边随手
+    /// 点一下保存 —— B 写进去的东西当场消失,全程没有任何报错。
+    ///
+    /// **有没落盘的改动时一律不读**:导入 ssh config(F2)那条路径是「连着
+    /// `add` 十几条,最后统一 `save`」,中途读回来等于把前面几条静默丢掉。
+    /// 判据是「现在序列化一遍 == 上次同步时序列化的那份」——**结构式**的,
+    /// 新加 mutator 自动算进来,不靠每个 mutator 记得举手。
+    ///
+    /// 全程**不报错**:重读只是尽力而为,失败(文件被删/正被写/内容坏了)
+    /// 就守着内存里这份继续用,和本片之前的行为完全一样。硬失败会把「点一下
+    /// 收藏」变成「整个库打不开」,不成比例。
+    ///
+    /// `secrets.enc` 跟着一起重读:只读 sessions 的话,别的实例新建的会话
+    /// 会指向一份我们手上没有的密文,表现是「明明存了密码却每次都问」。
+    /// 解不开(别的实例设了主密码)时**保留内存里那份**并记一条 note ——
+    /// 那种情况下两边的密钥已经分叉,这里做不了更多。
+    fn sync_from_disk_if_untouched(&mut self) {
+        let Ok(mine) = self.sessions_toml() else {
+            return;
+        };
+        if mine != self.synced_toml {
+            return;
+        }
+        let path = self.sessions_path();
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        if text == self.disk_toml {
+            return;
+        }
+        let Ok(loaded) = load_sessions(&path) else {
+            self.reload_notes.push(format!(
+                "{} 被别的实例改成了读不懂的样子,继续用内存里那份",
+                path.display()
+            ));
+            return;
+        };
+        self.groups = loaded.groups;
+        self.sessions = loaded.sessions;
+        self.tunnels = loaded.tunnels;
+        self.credentials = loaded.credentials;
+        match self.read_secrets() {
+            Ok(Some(secrets)) => self.secrets = secrets,
+            // 文件还不存在 = 新库,内存里那份(空的)就是对的。
+            Ok(None) => {}
+            Err(()) => self
+                .reload_notes
+                .push("secrets.enc 解不开(别的实例改过主密码?),密文继续用内存里那份".into()),
+        }
+        self.trim_orphan_secrets();
+        self.disk_toml = text;
+        self.synced_toml = self.sessions_toml().unwrap_or_default();
+        self.reload_notes
+            .push("sessions.toml 被别的实例改过,已重新读入再改".into());
+    }
+
+    /// 拿当前的 `key`/`scheme` 把 `secrets.enc` 读回来。`Ok(None)` = 文件还不在。
+    ///
+    /// **不重新派生密钥**:`open` 时派生的那把还在手上(主密码方案下重新派生
+    /// 意味着再问用户要一次密码,而 store 是零 UI 的)。
+    fn read_secrets(&self) -> Result<Option<SecretMap>, ()> {
+        let path = self.secrets_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let blob = fs::read(&path).map_err(|_| ())?;
+        let payload = crate::secrets_file::parse(&blob).map_err(|_| ())?.1;
+        let plain = crypto::decrypt(&self.key, payload).map_err(|_| ())?;
+        let text = String::from_utf8(plain).map_err(|_| ())?;
+        toml::from_str::<SecretMap>(&text).map(Some).map_err(|_| ())
+    }
+
+    /// 裁剪孤儿密文。判据与 `open_with` 里那段同源(见其注释:少了凭据那一支,
+    /// 凭据口令会被当成孤儿静默删掉)。
+    fn trim_orphan_secrets(&mut self) {
+        let live: std::collections::BTreeSet<String> = self
+            .sessions
+            .iter()
+            .map(|s| s.id.0.to_string())
+            .chain(self.credentials.iter().map(|c| cred_key(c.id)))
+            .collect();
+        self.secrets.retain(|k, _| live.contains(k));
+    }
+
+    /// F189:把重读期间攒下的说明取走(取完就清)。app 拿去写日志 ——
+    /// 这类事件必须留痕:用户看到的现象是「我明明收藏过」,而没有这行日志
+    /// 就没法把它和「另一个实例覆盖了」对上。
+    pub fn take_reload_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.reload_notes)
     }
 
     /// 当前是不是主密码方案(UI 显示「已设定 / 未设定」)。
@@ -258,6 +383,7 @@ impl Vault {
     /// **不动钥匙串条目**(设计 D6):删除是不可逆的,而它的存在完全无害
     /// (没有文件再引用它),留着还让「撤销主密码」有一条不必重新生成密钥的路。
     pub fn set_master_password(&mut self, password: &str) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         if password.is_empty() {
             return Err(StoreError::Kdf("主密码不能为空".into()));
         }
@@ -279,6 +405,7 @@ impl Vault {
         &mut self,
         key_source: &dyn MasterKeySource,
     ) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let key = key_source.load_or_create()?;
         self.key = key;
         self.scheme = crate::secrets_file::Scheme::Keyring;
@@ -299,6 +426,7 @@ impl Vault {
 
     /// 新增会话。id 取现有 max+1(空库从 1 起);modified_at 由调用方注入。
     pub fn add(&mut self, draft: SessionDraft, now_rfc3339: &str) -> SessionId {
+        self.sync_from_disk_if_untouched();
         let id = SessionId(
             self.sessions
                 .iter()
@@ -336,6 +464,7 @@ impl Vault {
         draft: SessionDraft,
         now_rfc3339: &str,
     ) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let rec = self
             .sessions
             .iter_mut()
@@ -348,7 +477,18 @@ impl Vault {
         rec.appearance = draft.appearance;
         rec.network = draft.network;
         rec.automation = draft.automation;
+        // F189:**书签不跟着整份 draft 覆盖**。draft 里那份是「编辑器打开
+        // 那一刻」的快照,而路径条上的 ☆(`add_bookmark`/`remove_bookmark`)
+        // 是同一份数据的另一条写入口 —— 编辑器开着的时候收藏的目录,点一下
+        // 「保存」就被那份旧快照顶掉了,而且没有任何提示。
+        //
+        // 编辑器里那张书签表要生效,走 `set_bookmarks`(只在用户真的动过
+        // 它时才调,判据在 app 侧的 `is_dirty` 基线上)。
+        let bookmarks = std::mem::take(&mut rec.sftp.bookmarks);
+        let local_bookmarks = std::mem::take(&mut rec.sftp.local_bookmarks);
         rec.sftp = draft.sftp;
+        rec.sftp.bookmarks = bookmarks;
+        rec.sftp.local_bookmarks = local_bookmarks;
         rec.modified_at = now_rfc3339.to_string();
         match draft.secret {
             Some(sec) => {
@@ -363,6 +503,7 @@ impl Vault {
 
     /// 删除会话,并**连带清除**其密文(守 id 完整性,见 spec §3.1)。
     pub fn delete(&mut self, id: SessionId) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let before = self.sessions.len();
         self.sessions.retain(|s| s.id != id);
         if self.sessions.len() == before {
@@ -381,6 +522,7 @@ impl Vault {
     /// **不重打 `modified_at`**:换分组是组织动作,不是内容变更;把它算成「修改」
     /// 会让按修改时间排序/审阅的人看到一堆没改过内容的会话浮到最前面。
     pub fn set_group(&mut self, id: SessionId, group: Option<GroupId>) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let rec = self
             .sessions
             .iter_mut()
@@ -405,6 +547,7 @@ impl Vault {
         group: Option<GroupId>,
         before: Option<SessionId>,
     ) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         if before == Some(id) {
             return Ok(());
         }
@@ -445,6 +588,7 @@ impl Vault {
         id: SessionId,
         mark: crate::sftp::Bookmark,
     ) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let rec = self
             .sessions
             .iter_mut()
@@ -457,12 +601,35 @@ impl Vault {
     /// F139:取消收藏。按路径相等匹配 —— 书签的身份就是路径,名字可以重复
     /// 也可以为空。
     pub fn remove_bookmark(&mut self, id: SessionId, path: &str) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let rec = self
             .sessions
             .iter_mut()
             .find(|s| s.id == id)
             .ok_or(StoreError::NotFound(id))?;
         rec.sftp.bookmarks.retain(|b| b.path != path);
+        Ok(())
+    }
+
+    /// F189:把会话编辑器里那张书签表**整份**写回去。
+    ///
+    /// 与 `update` 分开,是因为两者的触发条件不同:`update` 是「点了保存」,
+    /// 而这个是「点了保存**并且**真的动过书签表」。合在一起的话,任何一次
+    /// 保存都会拿编辑器打开那一刻的快照覆盖掉路径条 ☆ 后来收藏的东西。
+    ///
+    /// **不重打 `modified_at`**:同 `add_bookmark`,收藏是组织动作。
+    pub fn set_bookmarks(
+        &mut self,
+        id: SessionId,
+        marks: Vec<crate::sftp::Bookmark>,
+    ) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
+        let rec = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(StoreError::NotFound(id))?;
+        rec.sftp.bookmarks = marks;
         Ok(())
     }
 
@@ -476,6 +643,7 @@ impl Vault {
     /// 旧 id 的会话 `group_id` 变成悬空引用(`resolve_for` 会静默按「无分组」
     /// 降级处理,不会报错提醒)。
     pub fn group_mut(&mut self, id: GroupId) -> Option<&mut GroupRecord> {
+        self.sync_from_disk_if_untouched();
         self.groups.iter_mut().find(|g| g.id == id)
     }
 
@@ -487,6 +655,7 @@ impl Vault {
     /// 删中间的 `2` 后下一个是 `4`,不复用)。不要拿 `GroupId` 做撤销栈、
     /// 外部持久引用等需要「旧 id 永不重现」语义的用途。
     pub fn add_group(&mut self, name: String) -> GroupId {
+        self.sync_from_disk_if_untouched();
         let id = GroupId(
             self.groups
                 .iter()
@@ -509,6 +678,7 @@ impl Vault {
     /// 删除分组。归属该组的会话**不删除**,只把 `group_id` 置 `None`
     /// ——分组是组织手段,不是会话的所有者。
     pub fn delete_group(&mut self, id: GroupId) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let before = self.groups.len();
         self.groups.retain(|g| g.id != id);
         if self.groups.len() == before {
@@ -541,6 +711,7 @@ impl Vault {
 
     /// 新增凭据。id 取现有 max+1(空库从 1 起),**与会话/隧道号池互不影响**。
     pub fn add_credential(&mut self, draft: CredentialDraft) -> CredentialId {
+        self.sync_from_disk_if_untouched();
         let id = CredentialId(
             self.credentials
                 .iter()
@@ -563,6 +734,7 @@ impl Vault {
         id: CredentialId,
         draft: CredentialDraft,
     ) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let rec = self
             .credentials
             .iter_mut()
@@ -581,6 +753,7 @@ impl Vault {
     /// 凭据是身份,悄悄解绑等于把一堆会话变成连不上的废配置,而用户要到
     /// 下次连接时才发现。
     pub fn delete_credential(&mut self, id: CredentialId) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         if self.credential(id).is_none() {
             return Err(StoreError::CredentialNotFound(id));
         }
@@ -668,6 +841,7 @@ impl Vault {
     /// 也不注入 `modified_at` —— 隧道不进「按修改时间排序」的视图,
     /// 存一个没人读的时间戳只会让人以为它有语义。
     pub fn add_tunnel(&mut self, draft: TunnelDraft) -> TunnelId {
+        self.sync_from_disk_if_untouched();
         let id = TunnelId(
             self.tunnels
                 .iter()
@@ -687,6 +861,7 @@ impl Vault {
     }
 
     pub fn update_tunnel(&mut self, id: TunnelId, draft: TunnelDraft) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let rec = self
             .tunnels
             .iter_mut()
@@ -701,6 +876,7 @@ impl Vault {
     }
 
     pub fn delete_tunnel(&mut self, id: TunnelId) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
         let before = self.tunnels.len();
         self.tunnels.retain(|t| t.id != id);
         if self.tunnels.len() == before {
@@ -1566,7 +1742,7 @@ has_passphrase = true
     #[test]
     fn save_writes_both_files_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        let vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let mut vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
         vault.save().unwrap();
         assert!(dir.path().join("sessions.toml").exists());
         assert!(dir.path().join("secrets.enc").exists());
@@ -2073,11 +2249,15 @@ port = 7891
             Some("/opt/data"),
             "update 没把 SFTP 偏好写回去 —— 用户改了保存,下次打开还是旧值"
         );
-        assert!(
-            rec.sftp.bookmarks.is_empty(),
-            "update 是整体覆盖语义(与 terminal/network 那几节一致):\
-             这一版 draft 没带书签,存回去就该是空的"
+        // F189 起这里**反过来**了:书签不再跟着整份 draft 覆盖(见 `update`
+        // 里那段注释 —— draft 带的是编辑器打开那一刻的快照,而路径条上的 ☆
+        // 是同一份数据的另一条写入口)。编辑器里那张表要生效走 `set_bookmarks`。
+        assert_eq!(
+            rec.sftp.bookmarks.len(),
+            1,
+            "update 把书签一起覆盖了 —— 编辑器开着时收藏的目录会被旧快照顶掉"
         );
+        assert_eq!(rec.sftp.bookmarks[0].path, "/var/log");
     }
 
     /// F139:路径条上的 ☆ 收藏必须**存得进盘**,而不是只改内存里那份 ——
@@ -2128,6 +2308,160 @@ port = 7891
         assert!(
             v.get(id).unwrap().sftp.bookmarks.is_empty(),
             "取消收藏没存盘 —— 删掉的书签重启后会回来"
+        );
+    }
+
+    /// F189 / 用户报的问题 1:**多开是本项目的主场景**,而每个实例都在
+    /// `open` 那一刻把整个库读进内存,此后任何一次 `save()` 都是整份覆盖。
+    ///
+    /// 现象:A 实例开着不动,B 实例收藏了几个目录并存盘,A 这边随手点一下
+    /// 保存 —— B 写进去的东西当场消失,全程没有任何报错。
+    ///
+    /// 自证会变红:把 `set_group`(或任何一个 mutator)开头那句
+    /// `self.sync_from_disk_if_untouched();` 删掉。
+    #[test]
+    fn another_instances_bookmarks_survive_our_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let mut seed = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            id = seed.add(draft(), "2026-08-28T00:00:00Z");
+            seed.save().unwrap();
+        }
+        // A:开着,手上是这一刻的快照。
+        let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        // B:另一个实例收藏了一个目录并存盘。
+        {
+            let mut b = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            b.add_bookmark(
+                id,
+                crate::sftp::Bookmark {
+                    name: "日志".into(),
+                    path: "/var/log".into(),
+                },
+            )
+            .unwrap();
+            b.save().unwrap();
+        }
+        // A 这边随手改点别的再存。
+        a.set_group(id, None).unwrap();
+        a.save().unwrap();
+        assert!(
+            !a.take_reload_notes().is_empty(),
+            "重读这件事必须留痕 —— 没有日志的话,用户报「我明明收藏过」时无从对账"
+        );
+
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let rec = v.get(id).unwrap();
+        assert_eq!(
+            rec.sftp.bookmarks.len(),
+            1,
+            "另一个实例收藏的目录被我们这份开机快照整份覆盖掉了"
+        );
+        assert_eq!(rec.sftp.bookmarks[0].path, "/var/log");
+    }
+
+    /// 重读的**反面**:手上有还没落盘的改动时一律不读。
+    ///
+    /// 导入 ssh config(F2)那条路径是「连着 `add` 十几条,最后统一 `save`」——
+    /// 中途重读一次,前面几条只在内存里的会话就被静默丢掉了,用户看到的是
+    /// 「导入了 20 条,只进来最后 1 条」。
+    ///
+    /// 自证会变红:把 `sync_from_disk_if_untouched` 里那句
+    /// `if mine != self.synced_toml { return; }` 删掉。
+    #[test]
+    fn a_batch_of_unsaved_adds_is_never_reloaded_out_from_under_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        a.add(draft(), "2026-08-28T00:00:00Z");
+        // 中途别的实例写了盘(A 手上那两条还没落盘)。
+        {
+            let mut b = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            b.add(draft(), "2026-08-28T00:00:01Z");
+            b.save().unwrap();
+        }
+        a.add(draft(), "2026-08-28T00:00:02Z");
+        a.save().unwrap();
+        let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert_eq!(
+            v.list().len(),
+            2,
+            "这一批只进来了一部分 —— 中途被重读吞掉了"
+        );
+    }
+
+    /// 自己刚写出去的那份**不算「别人动过」**。对不齐的话每次改动都要多读
+    /// 一遍整个库,而且会往日志里刷一行假警报。
+    ///
+    /// 自证会变红:把 `save()` 结尾那两句 `self.disk_toml = ...` /
+    /// `self.synced_toml = ...` 删掉。
+    #[test]
+    fn our_own_save_is_not_mistaken_for_another_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add(draft(), "2026-08-28T00:00:00Z");
+        v.save().unwrap();
+        let _ = v.take_reload_notes();
+        v.set_group(id, None).unwrap();
+        assert!(
+            v.take_reload_notes().is_empty(),
+            "把自己刚写的内容当成了别的实例的改动"
+        );
+    }
+
+    /// **机械完备性守护**:`Vault` 上每一个会改状态的 `pub fn` 都必须以
+    /// `sync_from_disk_if_untouched()` 开头。
+    ///
+    /// 这条守的不是今天的 18 个方法,而是**明天新加的那个**:漏掉一个的后果
+    /// 是「只有走那条入口时才会覆盖掉别的实例」,概率性、无报错、极难复现
+    /// (「列举式门控在加档时必然漏」,本项目已踩过三次)。
+    ///
+    /// 自证会变红:随便删掉一句 `self.sync_from_disk_if_untouched();`。
+    #[test]
+    fn every_mutating_entry_point_reloads_before_it_writes() {
+        // `save` 自己就是落盘那一步 —— 它前面不该再读(读了等于把要写的
+        // 东西丢掉);它在结尾对齐两个基准。`take_reload_notes` 动的是
+        // 「重读时留下的说明」这本账,不是库的内容。
+        const EXEMPT: &[&str] = &["save", "take_reload_notes"];
+        let src = include_str!("vault.rs");
+        let (prod, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("vault.rs 的测试模块分界变了,这条断言的锚点失效了");
+        let mut checked = 0;
+        for (i, _) in prod.match_indices("\n    pub fn ") {
+            let rest = &prod[i + 1..];
+            let name = rest["    pub fn ".len()..]
+                .split(['(', '<'])
+                .next()
+                .expect("函数名")
+                .to_string();
+            // 签名可能跨多行:找到函数体的左大括号(第一条以 `{` 结尾的行)。
+            let mut at = 0;
+            let head = loop {
+                let eol = rest[at..].find('\n').expect("函数没有结尾") + at;
+                if rest[at..eol].trim_end().ends_with('{') {
+                    break eol;
+                }
+                at = eol + 1;
+            };
+            if !rest[..head].contains("&mut self") || EXEMPT.contains(&name.as_str()) {
+                continue;
+            }
+            let first = rest[head + 1..]
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            assert_eq!(
+                first.trim(),
+                "self.sync_from_disk_if_untouched();",
+                "`Vault::{name}` 改状态却没先重读 —— 走这条入口时会把别的实例\
+                 刚写进去的东西整份覆盖掉,且完全静默"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 18,
+            "只扫到 {checked} 个 mutator,切片逻辑多半失效了(退化成恒绿)"
         );
     }
 

@@ -10678,6 +10678,7 @@ fn apply_save(
         proxy_password,
         private_key,
         then_connect: _,
+        bookmarks,
     } = save;
 
     // 先把已存凭据 clone 出来,释放对 store 的不可变借用,下面才能 &mut。
@@ -10697,10 +10698,19 @@ fn apply_save(
             store
                 .update(id, draft, now)
                 .map_err(|e| format!("保存失败:{e}"))?;
+            // F189:`update` **不碰**书签(它拿到的那份是编辑器打开那一刻的
+            // 快照)。表单里那张表真被动过时,才由这一句整份写回去。
+            if let Some(marks) = bookmarks {
+                store
+                    .set_bookmarks(id, marks)
+                    .map_err(|e| format!("保存失败:{e}"))?;
+            }
             store.save().map_err(|e| format!("保存失败:{e}"))?;
             Ok(id)
         }
         None => {
+            // 新建这条路径上 `add` 就是整份写入,书签跟着 draft 进去,
+            // 不需要(也没有)第二次写。
             let id = store.add(draft, now);
             store.save().map_err(|e| format!("保存失败:{e}"))?;
             Ok(id)
@@ -17739,6 +17749,7 @@ mod tests {
                 proxy_password: crate::ui::session_manager::SecretField::Keep,
                 private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
+                bookmarks: None,
             },
             "2026-08-03T00:00:00Z",
         )
@@ -17763,6 +17774,7 @@ mod tests {
                 proxy_password: crate::ui::session_manager::SecretField::Keep,
                 private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
+                bookmarks: None,
             },
             "2026-08-03T00:01:00Z",
         )
@@ -17772,6 +17784,83 @@ mod tests {
             store.secret(id).and_then(|s| s.password.clone()).as_deref(),
             Some("pw"),
             "没碰密码框就保存,已存密码必须原样留着(F73)"
+        );
+    }
+
+    /// F189 端到端红线(用户报的问题 1 的另一半):**路径条 ☆ 收的目录,
+    /// 不能被会话编辑器的一次「保存」抹掉。**
+    ///
+    /// 两条写入口指着同一份数据:`add_bookmark`(随手收藏)与编辑器里那张
+    /// 表。编辑器手上那份是打开那一刻的快照,无条件写回去就是拿旧的顶掉新的
+    /// —— 而这正是「每次改点配置,收藏夹就少几条」的机制。
+    ///
+    /// 两段都要走到:`bookmarks: None`(没动过书签表)必须保住盘上那份;
+    /// `Some(..)`(真动过)必须写得进去 —— 只测前一半的话,把
+    /// `set_bookmarks` 那一支整个删掉也照样绿。
+    ///
+    /// 自证会变红:
+    /// - 把 `Vault::update` 里保住 `bookmarks` 那三句删掉 → 第 1 段红
+    /// - 把 `apply_save` 里 `if let Some(marks) = bookmarks` 那一支删掉 → 第 2 段红
+    #[test]
+    fn saving_the_editor_does_not_wipe_a_bookmark_added_from_the_path_bar() {
+        let (_dir, mut store) = tmp_store();
+        let buf = crate::ui::session_manager::EditorBuffer {
+            name: "dev".into(),
+            host: "192.0.2.10".into(),
+            user: "user".into(),
+            ..Default::default()
+        };
+        let intent = |id, bookmarks| crate::ui::session_manager::SaveIntent {
+            editing_id: id,
+            draft: crate::ui::session_manager::build_draft(&buf).expect("build"),
+            password: crate::ui::session_manager::SecretField::Clear,
+            passphrase: crate::ui::session_manager::SecretField::Clear,
+            proxy_password: crate::ui::session_manager::SecretField::Clear,
+            private_key: crate::ui::session_manager::SecretField::Keep,
+            then_connect: false,
+            bookmarks,
+        };
+        let id = apply_save(&mut store, intent(None, None), "2026-08-28T00:00:00Z").expect("新建");
+
+        // 用户在文件面板路径条上收了一个目录。
+        store
+            .add_bookmark(
+                id,
+                mullion_store::Bookmark {
+                    name: "日志".into(),
+                    path: "/var/log".into(),
+                },
+            )
+            .expect("收藏");
+        store.save().expect("落盘");
+
+        // 然后回会话编辑器改了点别的(书签表没动)并保存。
+        apply_save(&mut store, intent(Some(id), None), "2026-08-28T00:01:00Z").expect("保存");
+        assert_eq!(
+            store
+                .list()
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.sftp.bookmarks.len()),
+            Some(1),
+            "编辑器的一次保存把路径条收的目录抹掉了"
+        );
+
+        // 对照:真在表单里动过书签表时,那张表必须写得进去。
+        apply_save(
+            &mut store,
+            intent(Some(id), Some(Vec::new())),
+            "2026-08-28T00:02:00Z",
+        )
+        .expect("保存");
+        assert_eq!(
+            store
+                .list()
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.sftp.bookmarks.len()),
+            Some(0),
+            "在表单里删掉的书签又回来了"
         );
     }
 
@@ -17799,6 +17888,7 @@ mod tests {
                 proxy_password: crate::ui::session_manager::SecretField::Clear,
                 private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
+                bookmarks: None,
             },
             "2026-08-03T00:00:00Z",
         )
@@ -17930,6 +18020,7 @@ mod tests {
                 proxy_password: crate::ui::session_manager::SecretField::Set("old-proxy".into()),
                 private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
+                bookmarks: None,
             },
             "2026-08-03T00:00:00Z",
         )
@@ -17958,6 +18049,7 @@ mod tests {
                 proxy_password: crate::ui::session_manager::SecretField::Clear,
                 private_key: crate::ui::session_manager::SecretField::Keep,
                 then_connect: false,
+                bookmarks: None,
             },
             "2026-08-03T00:01:00Z",
         )

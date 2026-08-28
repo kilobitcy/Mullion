@@ -205,6 +205,19 @@ pub(crate) fn is_dirty(buf: &EditorBuffer, baseline: &EditorBuffer) -> bool {
     buf != baseline
 }
 
+/// F189:这次保存该不该把表单里那张书签表写回库里。
+///
+/// **只比书签这一格,不复用 `is_dirty`**:用户改个端口号也算脏,而那次保存
+/// 里的书签表还是编辑器打开那一刻的快照 —— 一起写回去就会顶掉路径条 ☆
+/// 在这中间收藏的目录(见 `SaveIntent::bookmarks` / `Vault::update`)。
+///
+/// 没有基线(理论上到不了:`editor` 和 `editor_baseline` 是一起置的)时按
+/// 「动过」处理:那种情况下没有任何依据说它没动过,而少写一次的后果是
+/// 用户在表单里删掉的书签又回来了,比多写一次更难自圆其说。
+pub(crate) fn bookmark_table_touched(buf: &EditorBuffer, baseline: Option<&EditorBuffer>) -> bool {
+    baseline.is_none_or(|b| b.sftp_bookmarks != buf.sftp_bookmarks)
+}
+
 /// 勾选 / 取消一个颜色落点。
 ///
 /// **只增删指定的那一个**：`apply_to` 里可能有编辑器当下没展示勾选框的落点
@@ -630,6 +643,14 @@ pub struct SaveIntent {
     pub private_key: SecretField,
     /// 保存成功后立刻连接(右栏底部的「保存并连接」)。
     pub then_connect: bool,
+    /// F189:表单里那张书签表 —— **只在用户真的动过它时才是 `Some`**。
+    ///
+    /// `None` 不是「一条也没有」,是「这次保存不管书签」。两者必须分得开:
+    /// `draft.sftp.bookmarks` 里那份是编辑器打开那一刻的快照,而路径条上的
+    /// ☆ 是同一份数据的另一条写入口 —— 无条件写回去的话,编辑器开着的时候
+    /// 收藏的目录,点一下「保存」就被旧快照顶掉了,且没有任何提示
+    /// (见 `Vault::update` / `Vault::set_bookmarks`)。
+    pub bookmarks: Option<Vec<mullion_store::Bookmark>>,
 }
 
 /// 表单缓冲 → `SessionDraft`。纯函数,不碰 egui,可脱离 GUI 单测。
@@ -1817,6 +1838,35 @@ mod tests {
         assert!(
             is_dirty(&bookmarks_changed, &baseline),
             "改了书签列表必须判脏"
+        );
+    }
+
+    /// F189:改了别的字段(端口)**不算动过书签表**。
+    ///
+    /// 判据要是复用 `is_dirty`,这条就是红的 —— 而后果正是用户报的问题 1:
+    /// 表单里那份书签快照是编辑器打开那一刻的,改个端口点保存,就把路径条 ☆
+    /// 在这中间收藏的目录顶掉了,且没有任何提示。
+    ///
+    /// 自证会变红:把 `bookmark_table_touched` 改成 `is_dirty(buf, b)`。
+    #[test]
+    fn editing_another_field_does_not_count_as_touching_the_bookmark_table() {
+        let baseline = buf();
+        let mut edited = baseline.clone();
+        edited.port = "2222".into();
+        assert!(
+            is_dirty(&edited, &baseline),
+            "脚手架前提不成立:改端口本来就该判脏,下面那条分不出对错"
+        );
+        assert!(
+            !bookmark_table_touched(&edited, Some(&baseline)),
+            "改端口被当成动过书签表 —— 保存时会拿旧快照顶掉路径条 ☆ 收的目录"
+        );
+
+        let mut marked = baseline.clone();
+        marked.sftp_bookmarks = vec![("日志".into(), "/var/log".into())];
+        assert!(
+            bookmark_table_touched(&marked, Some(&baseline)),
+            "在表单里真的改了书签表,却不写回去 —— 用户删掉的书签会原样回来"
         );
     }
 

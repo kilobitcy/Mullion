@@ -152,8 +152,27 @@ impl SessionStore {
         self.vault.move_session(id, group, before)
     }
 
-    pub fn save(&self) -> Result<(), StoreError> {
+    /// F189:落盘。顺带把 `Vault` 重读时攒下的说明写进日志 —— 那件事必须
+    /// 留痕:用户看到的现象是「我明明收藏过」,没有这行日志就没法把它和
+    /// 「另一个实例覆盖了」对上。
+    ///
+    /// 排水口选在这里而不是各个 mutator 边上:mutator 有十几个,漏一个就
+    /// 少一类痕迹,而 `save` 是它们**共同**的下一步。
+    pub fn save(&mut self) -> Result<(), StoreError> {
+        for note in self.vault.take_reload_notes() {
+            log::warn!(target: "mullion", "会话库:{note}");
+        }
         self.vault.save()
+    }
+
+    /// F189:把会话编辑器里那张书签表整份写回去。见 `Vault::set_bookmarks`
+    /// —— 只有用户**真的动过**那张表时才该调。
+    pub fn set_bookmarks(
+        &mut self,
+        id: SessionId,
+        marks: Vec<mullion_store::Bookmark>,
+    ) -> Result<(), StoreError> {
+        self.vault.set_bookmarks(id, marks)
     }
 
     pub fn groups(&self) -> &[mullion_store::GroupRecord] {
