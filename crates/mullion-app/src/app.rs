@@ -495,6 +495,25 @@ fn finish_attach_check(
     true
 }
 
+/// F188:这次拨号是「用户点标题条换节点」还是「F162 恢复现场的首次挂载」。
+///
+/// 两者复用同一条拨号链路(D10:不新写第二条,第二条一定会漏掉防连点的闸),
+/// 但**落地语义相反**,而且分不清的后果都是静默的:
+///
+/// - 首次挂载的那块叶子是 `apply_saved_tree` 刚分配的 id,树上有位、
+///   **没有 `PaneState`**。按换节点那套「找不到 `PaneState` 就放弃」处理,
+///   已经拨通的连接会被原地丢掉,那一格永远停在「N · 连接中…」。
+/// - 焦点:换节点是用户刚亲手指定的,焦点该跟过去(F156-b);恢复现场是
+///   后台批量拨号,抢焦点会把 `apply_saved_tree` 刚按 `focus_leaf` 摆好的
+///   焦点顶掉 —— 最后落在「碰巧最后一个拨通」的那块 pane 上。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RehostKind {
+    /// 用户在 pane 标题条上点的「换节点」。
+    UserPicked,
+    /// F162 串行恢复队列:这块叶子还没有 `PaneState`,这是它的第一条 channel。
+    RestoreFirstMount,
+}
+
 /// 一次在途的换节点。真正换挂要等 `PaneRehosted` 抵达,而那条事件带不动
 /// 这些东西 —— 标题条要的名字/地址、外观要的 `SessionId`、以及新节点的登录后
 /// 命令,全都得在**用户选中那一帧**算好存下来。
@@ -518,6 +537,10 @@ struct PendingRehost {
     /// 不带的话,换过节点的那条连接断线时只剩标签级 `last_cfg` 可取,
     /// 而那是**最初**那台机器的(见 `HostConn::cfg` 的文档)。
     cfg: SshConfig,
+    /// F188:发起这次拨号的是谁。**在发起那一帧定死**,不能等事件回来再猜
+    /// ——「有没有 `PaneState`」不是判据:恢复途中用户完全可能对着同一块
+    /// 已经摆成占位态(D6)的 pane 手点换节点。
+    kind: RehostKind,
 }
 
 /// F141:断线重连时,把**哪块 pane** 接回**哪个 tmux 会话**。
@@ -6423,12 +6446,16 @@ impl App {
     /// `drive_restore_dial` 靠这个判断串行闸该不该在**这里**就复位 ——
     /// 分不清这两种「失败」的话,同步早退命中一次,闸就永久停在 `true`,
     /// 队列里这条之后的叶子(可能跨多个标签)一个都不会再拨,且完全静默。
+    ///
+    /// `kind` 由调用方给,理由见 `RehostKind`:同一条链路的两个调用点语义相反,
+    /// 而事件回来时已经分不出是谁发起的。
     #[must_use]
     fn spawn_rehost_on(
         &mut self,
         generation: u64,
         pane: PaneId,
         session: mullion_store::SessionId,
+        kind: RehostKind,
     ) -> bool {
         let Some(store) = self.store.as_ref() else {
             self.ui.set_error("配置库不可用,无法换节点".to_string());
@@ -6466,6 +6493,7 @@ impl App {
             session_id: session,
             plan,
             cfg: cfg.clone(),
+            kind,
         });
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
@@ -6573,6 +6601,7 @@ impl App {
                 Box::new(ssh.clone()),
                 rx,
                 scrollback,
+                pending.kind,
             ) {
                 attached = Some(ssh);
                 // F162:这块 pane 从此有了自己的 `HostConn`,身份改由运行时实测。
@@ -6858,7 +6887,9 @@ impl App {
             self.restore_dial_busy = true;
             // 复用「换节点」那条链路(D10)。不新写第二条拨号路径 —— 第二条
             // 一定会漏掉 `pending_rehost` 那道防连点的闸。
-            if self.spawn_rehost_on(generation, pane, session) {
+            // F188:恢复队列拨的这块叶子还**没有** `PaneState`(`apply_saved_tree`
+            // 只分配了 id),而且不能抢焦点 —— 详见 `RehostKind`。
+            if self.spawn_rehost_on(generation, pane, session, RehostKind::RestoreFirstMount) {
                 return;
             }
             // 同步早退(配置库不可用 / dial_plan_for 失败 / SFTP 节点):
@@ -9497,7 +9528,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(g) = self.active_ws().map(|ws| ws.generation()) {
                         // 用户手点「换节点」,同步早退时 `spawn_rehost_on` 已经
                         // `set_error` 给了 toast,这里的返回值只有串行队列才需要看。
-                        let _ = self.spawn_rehost_on(g, pane, session);
+                        let _ = self.spawn_rehost_on(g, pane, session, RehostKind::UserPicked);
                     } else {
                         // 活动标签不是终端(文件标签 / launcher)。到不了:换节点的
                         // 入口是 pane 标题条,而标题条只有终端标签才画。
@@ -9943,6 +9974,10 @@ fn place_dead_pane_of(
 /// **不在这里清 `leaf_wanted`/`leaf_detach`**:那两张表挂在 `TerminalTab` 上,
 /// 这个函数只碰 `&mut Workspace`(理由见上面「纯函数」那句)。清理放在
 /// `clear_leaf_attach_intent`,由 `on_pane_rehosted`/`on_pane_rehost_err` 调用。
+// 每个参数都是「必须由调用方现算、这里造不出来」的那类(`host_ix` 见上,
+// `scrollback` 要查 store,`kind` 见 `RehostKind`)。打包成结构体只是把同样
+// 几个值换个地方写,换不来任何检查。
+#[allow(clippy::too_many_arguments)]
 fn rehost_pane(
     ws: &mut Workspace,
     id: PaneId,
@@ -9951,16 +9986,44 @@ fn rehost_pane(
     pty: Box<dyn crate::shell::workspace::PtyWriter>,
     rx: Receiver<Vec<u8>>,
     scrollback: usize,
+    kind: RehostKind,
 ) -> bool {
     if !pane_still_wanted(ws, id, generation) {
         return false;
     }
-    let Some(p) = ws.pane_mut(id) else {
-        // `pane_still_wanted` 只保证 id 在**树**上;`PaneState` 是另一回事
-        // (分屏刚切出来、channel 还没开好的叶子就没有)。换节点的入口是
-        // pane 标题条,只有画得出来的 pane 才有标题条,所以实际到不了这里。
-        return false;
-    };
+    if ws.pane(id).is_none() {
+        // F188:`pane_still_wanted` 只保证 id 在**树**上;`PaneState` 是另一
+        // 回事。F162 的恢复队列拨的正是这种叶子 —— `apply_saved_tree` 给它
+        // 分配了 id、占好了树上的位,但 `PaneState` 要等第一条 channel 开好
+        // 才有。这不是「pane 没了」,而是「pane 还没生出来」,拿到手的连接
+        // 必须挂上去,丢掉就是那一格永远停在「N · 连接中…」。
+        //
+        // (原先这里写死了「换节点的入口是标题条,只有画得出来的 pane 才有
+        // 标题条,所以到不了这里」—— F162 让恢复队列也走这条链路之后,那个
+        // 不变量就不成立了。)
+        ws.attach_pane(crate::shell::workspace::PaneState {
+            id,
+            host_ix,
+            emulator: new_pane_emulator(scrollback),
+            pty,
+            rx,
+            pacer: SyncFramePacer::new(),
+            status: crate::shell::workspace::PaneStatus::Live,
+            saw_first_byte: false,
+            last_grid: (0, 0),
+            cwd: None,
+            tmux: None,
+            history_reported: 0,
+            // 这条 channel 就是它自己那台机器的,身份不再是「照抄盘上那份」。
+            host_pending: false,
+            notice: None,
+        });
+        focus_after_rehost(ws, id, kind);
+        return true;
+    }
+    let p = ws
+        .pane_mut(id)
+        .expect("上一句刚判过 `ws.pane(id).is_none()`,这里必有");
     // F17:回溯行数跟**新节点**那条会话走,与下面清 `cwd`/`tmux` 同一个道理
     // ——这一格从此属于另一台机器了。
     p.emulator = new_pane_emulator(scrollback);
@@ -9975,20 +10038,32 @@ fn rehost_pane(
     p.cwd = None;
     p.tmux = None;
     swap_pane_channel(p, host_ix, pty, rx);
-    // F156-b:焦点跟到这块 pane。用户刚在标题条上亲手指定了新节点,下一步
-    // 必然是往它里面敲东西。
-    //
-    // **放在这个自由函数里、不放事件分支里**:这里能拿真实构造的 `Workspace`
-    // 直接断言 `ws.focus()`;放事件分支只能写「读 `app.rs` 源码找字符串」式的
-    // 断言,那是本项目反复踩到的恒绿模式。
-    //
-    // `reattach_pane`(F128 断线自动重连)**刻意不跟着改**,理由见
-    // `rehosting_moves_the_focus_to_that_pane_but_reattaching_never_does`。
-    //
-    // 只动分屏焦点,不动 egui 的输入焦点:此刻输入焦点若在文件侧栏,本片不
-    // 把它抢回终端(那是另一类语义,用户没要)。
-    ws.set_focus(id);
+    focus_after_rehost(ws, id, kind);
     true
+}
+
+/// F156-b/F188:挂完之后焦点该不该跟到这块 pane。
+///
+/// - `UserPicked`:跟。用户刚在标题条上亲手指定了新节点,下一步必然是往
+///   它里面敲东西,不跟他得再点一下。
+/// - `RestoreFirstMount`:**不跟**。恢复现场是后台批量拨号,`apply_saved_tree`
+///   已经按存盘的 `focus_leaf` 摆好焦点了;这里再抢,焦点最后会落在「碰巧
+///   最后一个拨通」的那块 pane 上 —— 拨通顺序取决于网络,同一份现场每次
+///   恢复出来的焦点还不一样。
+///
+/// **放在自由函数里、不放事件分支里**:这里能拿真实构造的 `Workspace` 直接
+/// 断言 `ws.focus()`;放事件分支只能写「读 `app.rs` 源码找字符串」式的断言,
+/// 那是本项目反复踩到的恒绿模式。
+///
+/// `reattach_pane`(F128 断线自动重连)**刻意不跟着改**,理由见
+/// `rehosting_moves_the_focus_to_that_pane_but_reattaching_never_does`。
+///
+/// 只动分屏焦点,不动 egui 的输入焦点:此刻输入焦点若在文件侧栏,本片不
+/// 把它抢回终端(那是另一类语义,用户没要)。
+fn focus_after_rehost(ws: &mut Workspace, id: PaneId, kind: RehostKind) {
+    if kind == RehostKind::UserPicked {
+        ws.set_focus(id);
+    }
 }
 
 /// F160/F161:换节点作废这块 pane 原来的「该接回哪个 tmux 会话」记录。
@@ -11210,8 +11285,8 @@ mod tests {
         place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback, should_check_attach,
         snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
         take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
-        wind_down, AttachCheck, AttachVerdict, Modal, RestoredTab, SyncPlan, Tab, TabContent,
-        TerminalTab, TmuxAttach, UserEvent,
+        wind_down, AttachCheck, AttachVerdict, Modal, RehostKind, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -12838,6 +12913,7 @@ mod tests {
                 Box::new(NullPty),
                 rx,
                 mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+                RehostKind::UserPicked,
             ),
             "pane 在、世代也对,换节点该成功"
         );
@@ -12882,6 +12958,7 @@ mod tests {
                 Box::new(NullPty),
                 rx,
                 mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+                RehostKind::UserPicked,
             ),
             "这是上一个世代发起的换节点,必须拒绝"
         );
@@ -12940,7 +13017,8 @@ mod tests {
             0,
             pty,
             rx,
-            mullion_term::emulator::Emulator::DEFAULT_HISTORY
+            mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+            RehostKind::UserPicked,
         ));
         let text: String = ws
             .pane(PaneId(1))
@@ -12999,11 +13077,149 @@ mod tests {
             pty,
             rx,
             mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+            RehostKind::UserPicked,
         ));
         assert_eq!(
             ws.focus(),
             PaneId(2),
             "换完节点焦点还留在原来那块 pane 上,用户得再点一下才能打字"
+        );
+    }
+
+    /// 三叶子的现场,只有一块 pane 是「已经连上的那块」,另外两片叶子由
+    /// `apply_saved_tree` 分配 id、走 F162 的串行队列各自拨号。**它们此刻
+    /// 没有 `PaneState`** —— 用户报的问题 5(三屏必有一屏永远卡在
+    /// 「连接中…」)的真根因就在这:换节点那条路径原先看到
+    /// `ws.pane_mut(id) == None` 就返回 `false`,`on_pane_rehosted` 于是
+    /// `hosts.pop()` 把**已经拨通的连接**原地丢掉,只留一行 warn。
+    ///
+    /// 拿 `apply_saved_tree` 真跑一遍(而不是手搓一个缺 `PaneState` 的
+    /// `Workspace`):缺的那块必须是恢复路径**自己**产出的,手搓等于把
+    /// 「恢复路径会不会造出这种叶子」这个前提假设掉,而它正是 bug 的一半。
+    ///
+    /// 自证会变红:把 `rehost_pane` 里 `ws.pane(id).is_none()` 那个分支
+    /// 改回 `return false`。
+    #[test]
+    fn a_restored_leaf_with_no_pane_state_yet_gets_one_instead_of_being_thrown_away() {
+        use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
+        use mullion_store::{SavedDir, SavedNodeEntry};
+        let (mut ws, _probes) = ws_with(1);
+        let generation = ws.generation();
+        // 左边一片叶子 + 右边再对半分:三个叶子,前序 = [已连的那块, 新, 新]。
+        let entries = vec![
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::split(SavedDir::Vertical, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::leaf(),
+        ];
+        let fresh = ws.apply_saved_tree(&entries, 0, 0).expect("结构完整");
+        assert_eq!(
+            fresh.len(),
+            2,
+            "三叶子里该有两片是新分配、还没有 PaneState 的"
+        );
+        let leaf = fresh[0];
+        assert!(
+            ws.pane(leaf).is_none(),
+            "脚手架前提就不成立:这块叶子已经有 PaneState 了,测不出那个 bug"
+        );
+
+        let (pty, rx) = fresh_pipe();
+        assert!(
+            rehost_pane(
+                &mut ws,
+                leaf,
+                generation,
+                1,
+                pty,
+                rx,
+                mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+                RehostKind::RestoreFirstMount,
+            ),
+            "返回 false 的话调用方会把刚拨通的连接 pop 掉,这一格永远是「连接中…」"
+        );
+        let p = ws.pane(leaf).expect("首次挂载必须把 PaneState 建出来");
+        assert_eq!(p.host_ix, 1, "指向错的机器,键盘输入会写到另一台上去");
+        assert_eq!(
+            p.status,
+            crate::shell::workspace::PaneStatus::Live,
+            "刚拨通的 channel 不该是断开态"
+        );
+        assert!(
+            !p.host_pending,
+            "身份已经由这条真连接坐实了,还挂着「照抄盘上那份」标题条会一直是灰的"
+        );
+    }
+
+    /// F188:恢复现场是**后台批量拨号**,焦点必须停在存盘时的那一格。
+    ///
+    /// `apply_saved_tree` 已经按 `focus_leaf` 摆好焦点了;首次挂载再抢一次的话,
+    /// 焦点最后会落在「碰巧最后一个拨通」的那块 pane 上 —— 拨通顺序取决于
+    /// 网络,同一份现场每次恢复出来的焦点还不一样。
+    ///
+    /// **对照**着写(同一个 `Workspace`、两片同样缺 `PaneState` 的叶子、只有
+    /// `kind` 不同):两条各测各的话,「`kind` 被整个忽略掉」这类变异总有一条
+    /// 还是绿的。
+    ///
+    /// 自证会变红:
+    /// - 把 `focus_after_rehost` 的 `if` 去掉、恒 `set_focus` → 第 1 条断言红
+    /// - 把它整个改成空函数 → 第 2 条断言红
+    #[test]
+    fn a_first_mount_keeps_the_saved_focus_but_a_user_picked_rehost_still_takes_it() {
+        use crate::shell::workspace::tests_support::{fresh_pipe, ws_with};
+        use mullion_store::{SavedDir, SavedNodeEntry};
+        let (mut ws, _probes) = ws_with(1);
+        let generation = ws.generation();
+        let entries = vec![
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::split(SavedDir::Vertical, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::leaf(),
+        ];
+        // `focus_leaf = 0` = 存盘时焦点在已连上的那块(前序第 0 片叶子)。
+        let fresh = ws.apply_saved_tree(&entries, 0, 0).expect("结构完整");
+        let saved_focus = ws.focus();
+        assert!(
+            !fresh.contains(&saved_focus),
+            "脚手架前提就不成立:存盘焦点落在了待拨号的叶子上,下面分不出对错"
+        );
+
+        // 恢复队列挂上第一片:焦点不动。
+        let (pty, rx) = fresh_pipe();
+        assert!(rehost_pane(
+            &mut ws,
+            fresh[0],
+            generation,
+            1,
+            pty,
+            rx,
+            mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+            RehostKind::RestoreFirstMount,
+        ));
+        assert_eq!(
+            ws.focus(),
+            saved_focus,
+            "后台拨号把焦点从存盘时的那一格抢走了"
+        );
+
+        // 对照:用户亲手换节点到第二片,焦点跟过去。
+        let (pty, rx) = fresh_pipe();
+        assert!(rehost_pane(
+            &mut ws,
+            fresh[1],
+            generation,
+            2,
+            pty,
+            rx,
+            mullion_term::emulator::Emulator::DEFAULT_HISTORY,
+            RehostKind::UserPicked,
+        ));
+        assert_eq!(
+            ws.focus(),
+            fresh[1],
+            "用户刚亲手指定的节点,焦点该跟过去(F156-b)"
         );
     }
 
@@ -15376,6 +15592,45 @@ mod tests {
             .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("app.rs 的测试模块分界变了,所有源码切片断言的锚点都失效了");
         prod
+    }
+
+    /// F188:两个调用点各自传的 `RehostKind` 是**接线**,`rehost_pane` 的
+    /// 那两条行为测试够不着它 —— 把两处的实参对调,行为测试全绿,而现象是
+    /// 「恢复现场的叶子照旧永远卡在连接中」加「手点换节点焦点不跟过去」。
+    ///
+    /// 先剥掉注释行再断言:判据自己的说明文字里就带着这两个变体名,不剥的话
+    /// 注释就能把断言喂饱(本项目反复踩到的恒绿模式)。
+    ///
+    /// 自证会变红:把两处的 `RehostKind::` 实参对调。
+    #[test]
+    fn the_restore_queue_asks_for_a_first_mount_and_the_title_bar_asks_for_a_user_pick() {
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+        };
+        let prod = prod_src();
+        let queue = strip(body_of(prod, "fn drive_restore_dial(&mut self) {"));
+        assert!(
+            queue.contains("RehostKind::RestoreFirstMount"),
+            "恢复队列拨的叶子还没有 PaneState,按「换节点」处理会被原地丢掉"
+        );
+        assert!(
+            !queue.contains("RehostKind::UserPicked"),
+            "恢复队列抢焦点,焦点会落在碰巧最后一个拨通的那块 pane 上"
+        );
+        let bar = strip(body_of(
+            prod,
+            "if let Some((pane, session)) = self.ui.rehost_request.take()",
+        ));
+        assert!(
+            bar.contains("RehostKind::UserPicked"),
+            "用户手点的换节点,焦点必须跟过去(F156-b)"
+        );
+        assert!(
+            !bar.contains("RehostKind::RestoreFirstMount"),
+            "手点换节点被当成首次挂载,焦点不跟过去了"
+        );
     }
 
     /// **T3 守护**:进度事件是高频的(一个 100MB 的文件几千条),那条 arm 里
