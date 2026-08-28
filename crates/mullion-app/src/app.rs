@@ -12071,6 +12071,35 @@ mod tests {
         );
     }
 
+    /// F187:全局收藏夹的推送必须遍历**所有**标签,不能只推活动那个。
+    ///
+    /// 同 `drive_reconnects_walks_every_tab_not_just_the_active_one` 那条纪律。
+    /// 只推活动标签的症状:在标签 1 收了个目录,切到标签 2 一看没有 —— 要
+    /// 重开标签才出现。收藏夹是全局的,这在用户眼里就是「☆ 时灵时不灵」。
+    ///
+    /// **补的是一个实测漏掉的口子**:上一条(`bookmarking_writes_…`)只钉了
+    /// 「add/remove 里调了 sync」,把 `sync` 的函数体本身换成只改活动标签之后
+    /// `cargo test --workspace` 全绿。调用点和实现各扎一次。
+    ///
+    /// 自证会变红:把 `sync_local_bookmarks_to_tabs` 里的 `self.tabs.iter_mut()`
+    /// 换成 `self.tabs.active_mut()`。
+    #[test]
+    fn the_global_bookmark_list_is_pushed_to_every_tab_not_just_the_active_one() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        let body = body_of(production, "fn sync_local_bookmarks_to_tabs(");
+        assert!(
+            body.contains("self.tabs.iter_mut()"),
+            "没有遍历全部标签 —— 在标签 1 收的目录,标签 2 要重开才看得见"
+        );
+        assert!(
+            !body.contains("active"),
+            "只推了活动标签 —— 收藏夹是全局的,用户会觉得 ☆ 时灵时不灵"
+        );
+    }
+
     /// F139/F187:☆ 收藏必须**当场存盘**,而且两栏各存各的地方。
     ///
     /// 漏掉存盘的症状是「收藏了、星星也变实心了,关掉客户端再开就没了」——
