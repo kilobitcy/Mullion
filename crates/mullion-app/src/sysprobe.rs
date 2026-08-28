@@ -1179,6 +1179,46 @@ mod tests {
         assert!(needs_rescan(Some(0), true), "读数失败要立刻重扫,不等到期");
     }
 
+    /// F182:枚举失败(缓存为空)必须报 `n/a`,不能让它走到差分层变成
+    /// 「各组 0.00%」。
+    ///
+    /// **为什么是源码切片而不是行为测试**:这行早退在 `#[cfg(windows)]` 里,
+    /// 开发机上一个字节都不编译 —— 实测把它改成 `if false` 之后
+    /// `cargo test --workspace` **全绿**。这个位置只有两种守护够得着:
+    /// 源码切片,或者交叉编译到 Windows 再在真机上跑,而后者不是本地能做的事。
+    ///
+    /// 判据是**位置**(早退在 `diff_and_rebase` 之前),不是「文件里出现过
+    /// `is_empty`」:后者对「把早退挪到差分之后」恒绿,而那正好等于没改。
+    ///
+    /// 自证会变红:把 `if self.cached.is_empty()` 改成 `if false`(实测红),
+    /// 或删掉整个早退块,或把它挪到 `diff_and_rebase` 那行之后。
+    #[test]
+    fn an_empty_thread_cache_reports_n_a_instead_of_a_screenful_of_zeroes() {
+        let src = include_str!("sysprobe.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("sysprobe.rs 应有测试模块")];
+        // 剥注释:不剥的话本条判据会被自己的说明文字命中(diag.rs 那边
+        // 的顺序判据就是这么第一次写红的)。
+        let code = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("if needs_rescan(")
+            .expect("Windows 分支应有重扫判定");
+        let body = &code[start..];
+        let body = &body[..body.find("fn rescan(").expect("重扫判定之后应是 rescan")];
+        let guard = body
+            .find("if self.cached.is_empty()")
+            .expect("缓存为空必须早退报 n/a —— 否则分组层会印出一屏凭空的 0.00%");
+        let diff = body.find("diff_and_rebase").expect("应有差分调用");
+        assert!(
+            guard < diff,
+            "早退必须在差分之前:挪到之后就等于没改,而症状是一屏 0.00% \
+             被读成「确实没占用」"
+        );
+    }
+
     /// F182:**一分钟才发现一次新线程,那它进表的第一个窗口只能建基线。**
     ///
     /// 照 Linux 那样「新 tid 全额算」的话,一条 59 秒前创建、期间烧了 3 秒
