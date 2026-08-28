@@ -64,13 +64,20 @@ impl SortDir {
     }
 }
 
-/// 就地排序。**目录恒在前**,倒序只翻同组内部的顺序(设计 D21)——
-/// 把目录一起翻到底下从来不是任何人想要的。
+/// 就地排序。**除时间列外目录恒在前**,倒序只翻同组内部的顺序(设计 D21)——
+/// 按名字/大小/权限/属主找东西时,把目录一起翻到底下从来不是任何人想要的。
+///
+/// **时间列是例外**(F184):按修改时间排是在问「最近动过什么」,而答案里
+/// 目录和文件同样重要 —— 分组之后「刚建的目录」永远沉在文件堆上面一整段,
+/// 与「最新的排最前」这个唯一诉求直接冲突。
 pub fn sort(entries: &mut [Entry], key: SortKey, dir: SortDir) {
+    let group_dirs_first = !matches!(key, SortKey::Mtime);
     entries.sort_by(|a, b| {
-        let group = is_dir(b).cmp(&is_dir(a)); // 目录(true)排前
-        if group != std::cmp::Ordering::Equal {
-            return group;
+        if group_dirs_first {
+            let group = is_dir(b).cmp(&is_dir(a)); // 目录(true)排前
+            if group != std::cmp::Ordering::Equal {
+                return group;
+            }
         }
         let ord = match key {
             // 不分大小写:分了的话 `Gamma` 会跑到 `alpha` 前面。
@@ -236,12 +243,49 @@ mod tests {
     fn sorting_by_mtime_orders_by_time_not_by_name() {
         let mut v = sample();
         sort(&mut v, SortKey::Mtime, SortDir::Asc);
-        // 目录仍在前(alpha=100 早于 Gamma=500),文件按时间:
-        // beta.txt=200 < zeta.txt=300 < .hidden=400。
+        // 纯按时间:alpha=100 < beta.txt=200 < zeta.txt=300 < .hidden=400
+        //          < Gamma=500。
         assert_eq!(
             names(&v),
-            vec!["alpha", "Gamma", "beta.txt", "zeta.txt", ".hidden"]
+            vec!["alpha", "beta.txt", "zeta.txt", ".hidden", "Gamma"]
         );
+    }
+
+    /// F184:**时间列不分组** —— 目录和文件混在同一条时间轴上。
+    ///
+    /// 「最近动过什么」这个问题的答案里目录和文件同样重要;分组之后
+    /// 刚建的目录永远沉在文件堆上面一整段,与「最新的排最前」冲突。
+    ///
+    /// 自证会变红:把 `group_dirs_first` 改成常量 `true`。
+    #[test]
+    fn the_mtime_column_interleaves_directories_with_files() {
+        let mut v = sample();
+        sort(&mut v, SortKey::Mtime, SortDir::Desc);
+        assert_eq!(
+            names(&v),
+            vec!["Gamma", ".hidden", "zeta.txt", "beta.txt", "alpha"],
+            "时间倒序该是纯时间轴,目录不该被拎到最前"
+        );
+    }
+
+    /// 上一条只钉了时间列;这条钉**其余四列不受影响** —— 一起改掉的话
+    /// 「按名字找目录」会当场坏掉,而那是最常用的一列。
+    ///
+    /// 自证会变红:把 `group_dirs_first` 改成常量 `false`。
+    #[test]
+    fn every_column_other_than_mtime_still_groups_directories_first() {
+        for key in [SortKey::Name, SortKey::Size, SortKey::Perm, SortKey::Owner] {
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let mut v = sample();
+                sort(&mut v, key, dir);
+                let dirs: Vec<String> = names(&v).into_iter().take(2).collect();
+                assert!(
+                    dirs.contains(&"alpha".to_string()) && dirs.contains(&"Gamma".to_string()),
+                    "{key:?}/{dir:?} 下目录该仍在最前,实际:{:?}",
+                    names(&v)
+                );
+            }
+        }
     }
 
     /// 权限排序只看低 9 位 —— 与 `perm_string` 画出来的那 9 位对齐。
