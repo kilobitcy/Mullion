@@ -2330,10 +2330,20 @@ port = 7891
         }
         // A:开着,手上是这一刻的快照。
         let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
-        // A 先自己存过一次。**这一步是必要的**:`save` 结尾若不把两个基准
-        // 对齐到刚写出去那份,`synced_toml` 就永远停在开机那一刻,此后
-        // 「有没落盘的改动」恒为真 —— 重读从此静默停摆,而不是报错。
-        a.set_group(id, None).unwrap();
+        // A 先自己收藏一个目录并存盘。**这一步是必要的,而且必须真的改动
+        // 内容**:`save` 结尾若不把两个基准对齐到刚写出去那份,`synced_toml`
+        // 就永远停在开机那一刻,此后「手上有没落盘的改动」恒为真 —— 重读
+        // 从此静默停摆(不是报错)。用一句改不动任何东西的 `set_group`
+        // (值本来就是 `None`)当这一步的话,序列化结果没变,基准对不对齐
+        // 都一样,这条变异就逃掉了 —— 已实测。
+        a.add_bookmark(
+            id,
+            crate::sftp::Bookmark {
+                name: "我的".into(),
+                path: "/srv".into(),
+            },
+        )
+        .unwrap();
         a.save().unwrap();
         let _ = a.take_reload_notes();
         // B:另一个实例收藏了一个目录并存盘。
@@ -2358,13 +2368,19 @@ port = 7891
         );
 
         let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
-        let rec = v.get(id).unwrap();
-        assert_eq!(
-            rec.sftp.bookmarks.len(),
-            1,
-            "另一个实例收藏的目录被我们这份开机快照整份覆盖掉了"
+        let paths: Vec<&str> = v
+            .get(id)
+            .unwrap()
+            .sftp
+            .bookmarks
+            .iter()
+            .map(|b| b.path.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"/var/log"),
+            "另一个实例收藏的目录被我们这份快照整份覆盖掉了:{paths:?}"
         );
-        assert_eq!(rec.sftp.bookmarks[0].path, "/var/log");
+        assert!(paths.contains(&"/srv"), "我们自己收的那条也丢了:{paths:?}");
     }
 
     /// 重读的**反面**:手上有还没落盘的改动时一律不读。
