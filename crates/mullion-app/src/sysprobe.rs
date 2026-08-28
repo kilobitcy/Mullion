@@ -71,6 +71,15 @@ pub struct CpuProbe {
 #[cfg(windows)]
 struct MainThreadHandle(windows_sys::Win32::Foundation::HANDLE);
 
+/// FILETIME(单位 100 纳秒)→ 纳秒。
+///
+/// 一份而不是三份:`read_cpu_ns`、线程枚举、缓存句柄读数都要它,各抄一遍
+/// 的话「乘 100」这个换算就有三个改点。
+#[cfg(windows)]
+fn filetime_ns(ft: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64) * 100
+}
+
 // SAFETY: HANDLE 是个内核对象句柄,跨线程使用是 Win32 的正常用法;
 // 这里只读(GetThreadTimes),不改状态。
 #[cfg(windows)]
@@ -141,10 +150,7 @@ fn read_cpu_ns(p: &CpuProbe) -> Option<(u64, u64)> {
         GetCurrentProcess, GetProcessTimes, GetThreadTimes,
     };
 
-    // FILETIME 的单位是 100 纳秒。
-    fn ns(ft: FILETIME) -> u64 {
-        (((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64) * 100
-    }
+    let ns = filetime_ns;
 
     let mut c = FILETIME {
         dwLowDateTime: 0,
@@ -249,10 +255,83 @@ pub(crate) fn current_tid() -> u32 {
 ///    Windows 是本项目唯一的一等公民,所以这条不是纯理论。判为可接受:
 ///    只影响复用发生的那**一个**窗口,下一窗口差分就自愈了,而要根治得按
 ///    (tid, 线程创建时间)做键,那是给日志加一整套线程身份追踪。
+/// 3. **F182,只在 Windows 上**:线程清单每 [`RESCAN_EVERY_WINDOWS`] 个窗口
+///    才重扫一次,所以新线程最长要一分钟才进表,而且它进表的第一个窗口只
+///    建基线、不报账(见 [`NewThread`])。代价是新线程头一分钟的 CPU 记不到,
+///    换来的是不必每 5 秒快照一次全系统线程 —— 后者实测占了写盘窗口全部
+///    CPU 的一大块。本项目的线程全是长命线程(tokio 池、看门狗、对话框、
+///    拖出 STA),一分钟的发现延迟对「谁在烧」这个问题没有影响。
 pub struct ThreadCpuProbe {
     /// tid → 上一窗口的累计 CPU ns。`None` = 还没建过基线(首次采样)。
     prev: Option<std::collections::HashMap<u32, u64>>,
     main_tid: u32,
+    /// F182:缓存下来的线程清单(tid + 自有句柄 + 名字)。
+    #[cfg(windows)]
+    cached: Vec<CachedThread>,
+    /// F182:距上次重扫过了几个窗口。`None` = 从没扫过。
+    ///
+    /// 用 `Option` 而不是「`u32::MAX` 当哨兵」:哨兵值迟早会被某个
+    /// `>= RESCAN_EVERY_WINDOWS` 的比较悄悄吃掉,而 `None` 是编译器盯着的。
+    #[cfg(windows)]
+    since_rescan: Option<u32>,
+    /// F182:上一窗口有线程读数失败(多半是句柄失效),下一窗口强制重扫。
+    #[cfg(windows)]
+    read_failed: bool,
+}
+
+/// F182:重扫线程清单的间隔(窗口数)。5 秒一个窗口 → 一分钟一次。
+///
+/// 这个数是**发现延迟**与**采样开销**的兑换比:调小则新线程更快进表,
+/// 调大则全系统快照更少。一分钟的依据是「本项目的线程都是长命线程,
+/// 且它们全在启动/连接的头几秒里创建完」。
+pub const RESCAN_EVERY_WINDOWS: u32 = 12;
+
+/// F182:重扫线程清单的判据。**纯函数,不 gate 在 `#[cfg(windows)]` 里**
+/// —— 只有这样它才在开发机(Linux)上测得动,而这正是唯一容易写错的一段。
+///
+/// `read_failed` 优先于计数:句柄失效说明清单已经和现实对不上了,
+/// 等满一分钟等于明知有错还继续报一分钟的错数。
+pub fn needs_rescan(since_rescan: Option<u32>, read_failed: bool) -> bool {
+    match since_rescan {
+        None => true,
+        Some(n) => read_failed || n >= RESCAN_EVERY_WINDOWS,
+    }
+}
+
+/// F182:一个缓存下来的线程。
+///
+/// **名字只在重扫时取一次**:`GetThreadDescription` 每次都要让系统分配一段
+/// 宽串再 `LocalFree`,而线程名从创建到退出不会变 —— 每 5 秒重取一遍是纯浪费。
+#[cfg(windows)]
+struct CachedThread {
+    tid: u32,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    name: String,
+}
+
+// SAFETY: 同 `MainThreadHandle` —— 线程句柄跨线程只读使用是 Win32 的正常
+// 用法,这里只 `GetThreadTimes`,不改状态。整个 probe 由看门狗线程独占。
+#[cfg(windows)]
+unsafe impl Send for CachedThread {}
+
+/// F182:重扫时**新出现**的 tid 该怎么记账。
+///
+/// 两个平台的答案不一样,而这正是最容易抄错的地方:
+///
+/// - Linux 每个窗口都重新 readdir(`/proc/self/task` 只列自己进程,本来就
+///   便宜),「新出现」= 这 5 秒里刚创建 —— 它的累计时间就是这一窗口的账,
+///   [`ChargeFull`](NewThread::ChargeFull)。
+/// - Windows 一分钟才重扫一次,「新出现」可能是 59 秒前创建的。照 Linux
+///   那样全额算,会把一分钟的 CPU 塞进一个 5 秒窗口,报出 `1180%` 这种
+///   **看着像着火了的假值**。所以只建基线、这一窗口记 0,
+///   [`BaselineOnly`](NewThread::BaselineOnly)。
+enum NewThread {
+    ChargeFull,
+    /// **只有 Windows 分支构造它。** 开发机(Linux)上 `cargo build` 会把它
+    /// 判成 dead_code,而 `-D warnings` 把 dead_code 当错 —— 测试里的构造点
+    /// 只在 `--all-targets` 下算数,救不了普通 build。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    BaselineOnly,
 }
 
 impl ThreadCpuProbe {
@@ -264,7 +343,42 @@ impl ThreadCpuProbe {
         Self {
             prev: None,
             main_tid,
+            #[cfg(windows)]
+            cached: Vec::new(),
+            #[cfg(windows)]
+            since_rescan: None,
+            #[cfg(windows)]
+            read_failed: false,
         }
+    }
+
+    /// 拿这一窗口的读数与 `prev` 做差,然后整表换基线。
+    ///
+    /// **整表替换,不是增量 merge**:退出线程的旧 tid 就此从 `prev` 里消失,
+    /// 不然 HashMap 会随线程生灭无限涨。
+    ///
+    /// 没有基线(首次调用)返回 `None`,不是 `Some(空表)`:空表到了分组层
+    /// 就是「各组 0%」,一个凭空编出来的 0 —— 本文件头部明令禁止的那种。
+    /// 同文件 `CpuProbe::sample` 也是这个约定。
+    fn diff_and_rebase(
+        &mut self,
+        cur: std::collections::HashMap<u32, (String, u64)>,
+        new_thread: NewThread,
+    ) -> Option<Vec<(String, u64)>> {
+        let out = self.prev.as_ref().map(|prev| {
+            cur.iter()
+                .map(|(tid, (name, ns))| {
+                    let delta = match (prev.get(tid), &new_thread) {
+                        (Some(p), _) => ns.saturating_sub(*p),
+                        (None, NewThread::ChargeFull) => *ns,
+                        (None, NewThread::BaselineOnly) => 0,
+                    };
+                    (name.clone(), delta)
+                })
+                .collect()
+        });
+        self.prev = Some(cur.into_iter().map(|(tid, (_, ns))| (tid, ns)).collect());
+        out
     }
 
     /// 枚举全部线程,返回 (线程名, 这一窗口的 CPU ns 增量),**排除主线程**
@@ -308,52 +422,86 @@ impl ThreadCpuProbe {
                 .unwrap_or_default();
             cur.insert(tid, (name, ns));
         }
-        // 没有基线(首次调用)就是 `None`,不是 `Some(空表)`:空表到了分组层
-        // 就是「各组 0%」,一个凭空编出来的 0 —— 本文件头部明令禁止的那种。
-        // 同文件 `CpuProbe::sample` 也是这个约定。
-        let out = self.prev.as_ref().map(|prev| {
-            cur.iter()
-                .map(|(tid, (name, ns))| {
-                    let delta = match prev.get(tid) {
-                        Some(p) => ns.saturating_sub(*p),
-                        None => *ns, // 窗口内新出现的线程,从 0 起,全额算。
-                    };
-                    (name.clone(), delta)
-                })
-                .collect()
-        });
-        // 整表替换,不是增量 merge:退出线程的旧 tid 就此从 `prev` 里消失,
-        // 不然 HashMap 会随线程生灭无限涨。
-        self.prev = Some(cur.into_iter().map(|(tid, (_, ns))| (tid, ns)).collect());
-        out
+        // Linux 每个窗口都重新列一遍,所以「新出现」就是这 5 秒里刚创建的,
+        // 全额算(理由见 `NewThread`)。
+        self.diff_and_rebase(cur, NewThread::ChargeFull)
     }
 
-    /// 同上,Windows 分支。已交叉编译 + clippy 验过(`--target
-    /// x86_64-pc-windows-gnu`),但**没在真机上跑过**——FFI 编译过不等于
-    /// 调用序列对,数字是否合理留 Windows 实机验收。
+    /// 同上,Windows 分支。**已在 Windows 11 实机验证过**(v0.1.79,2026-08-28
+    /// 的 331 个窗口):分组读数合理(`tokio:0.00% watchdog:0.92%`,空闲时
+    /// 只有看门狗在动),FFI 调用序列成立。
+    ///
+    /// **F182:每个窗口只读缓存句柄,不再重新枚举。** 原实现每 5 秒调一次
+    /// `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)` —— 那**快照的是全系统
+    /// 所有线程**(见 `rescan` 里的注释),典型 Windows 桌面上几千个,而我们
+    /// 只要自己进程的十几个。线程句柄和线程名都不随窗口变,存下来即可;
+    /// 只有「发现新线程」需要重扫,而那按 [`RESCAN_EVERY_WINDOWS`] 的节奏走。
     #[cfg(windows)]
     pub fn sample(&mut self) -> Option<Vec<(String, u64)>> {
+        if needs_rescan(self.since_rescan, self.read_failed) {
+            self.rescan();
+        }
+        // **空表只可能是枚举失败**:本进程恒有 tokio 池这些长命线程,
+        // 「一个别的线程都没有」不是真实状态。走到 `diff_and_rebase` 的话
+        // 它会给出 `Some(空表)`,到分组层就是「各组 0.00%」—— 本文件头部
+        // 明令禁止的那种凭空的 0,而且它比 `n/a` 更难发现:一整屏 0.00%
+        // 看着就像「确实没占用」。
+        if self.cached.is_empty() {
+            return None;
+        }
+
+        let mut cur: std::collections::HashMap<u32, (String, u64)> =
+            std::collections::HashMap::new();
+        let mut failed = false;
+        for t in &self.cached {
+            match thread_cpu_ns(t.handle) {
+                Some(ns) => {
+                    cur.insert(t.tid, (t.name.clone(), ns));
+                }
+                // 句柄失效(理论上不该发生:句柄本身让线程对象活着,线程
+                // 退出后 GetThreadTimes 照样返回最终值)。真发生了就下一窗口
+                // 重扫,而不是把这个线程静默从表里漏掉。
+                None => failed = true,
+            }
+        }
+        self.read_failed = failed;
+        self.since_rescan = Some(self.since_rescan.map_or(1, |n| n.saturating_add(1)));
+
+        // Windows 一分钟才重扫一次,新 tid 只建基线不报账(理由见 `NewThread`)。
+        self.diff_and_rebase(cur, NewThread::BaselineOnly)
+    }
+
+    /// F182:重建线程清单。**这是唯一贵的一步**,按 [`RESCAN_EVERY_WINDOWS`]
+    /// 的节奏调用。
+    #[cfg(windows)]
+    fn rescan(&mut self) {
         use windows_sys::Win32::Foundation::{
-            CloseHandle, LocalFree, FILETIME, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+            CloseHandle, LocalFree, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
         };
         use windows_sys::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
         };
         use windows_sys::Win32::System::Threading::{
-            GetCurrentProcessId, GetThreadDescription, GetThreadTimes, OpenThread,
-            THREAD_QUERY_LIMITED_INFORMATION,
+            GetCurrentProcessId, GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
         };
 
-        // FILETIME 的单位是 100 纳秒(照抄 `read_cpu_ns` 的 Windows 分支)。
-        fn ns(ft: FILETIME) -> u64 {
-            (((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64) * 100
-        }
+        // 先把上一轮的句柄还回去,再建新表 —— 不还的话每分钟泄漏一批
+        // 内核对象,一天下来是几千个。
+        self.close_cached();
 
-        // SAFETY: 0 表示不限定单个线程/堆/模块;TH32CS_SNAPTHREAD 下第二个
-        // 参数(通常用于指定进程)被忽略,快照的是调用者自己的进程。
+        // SAFETY: `TH32CS_SNAPTHREAD` 下第二个参数被忽略,传 0。
+        //
+        // **它快照的是「全系统所有线程」,不是本进程的。** MSDN 明写着要靠
+        // `THREADENTRY32::th32OwnerProcessID` 自己筛(下面那个 `== pid` 就是),
+        // 而这一条正是 F182 要躲开的开销:典型 Windows 桌面几千个线程,
+        // 内核要遍历每个进程的线程链表,系统越忙越慢。别把这行挪回每窗口。
         let snap: HANDLE = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
         if snap == INVALID_HANDLE_VALUE {
-            return None;
+            // 扫不到就保持空表 —— 下一窗口 `needs_rescan` 会因为
+            // `since_rescan` 归零而**不**立刻重试,一分钟后再试一次。
+            // 这里不 return 前先记账,免得变成每窗口重试(那就是改回原样了)。
+            self.since_rescan = Some(0);
+            return;
         }
         // SAFETY: 无参数,返回调用者自己的进程 id。
         let pid = unsafe { GetCurrentProcessId() };
@@ -361,49 +509,40 @@ impl ThreadCpuProbe {
         // 必须先填 dwSize,否则 Thread32First 直接失败。
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
 
-        let mut cur: std::collections::HashMap<u32, (String, u64)> =
-            std::collections::HashMap::new();
         // SAFETY: `entry.dwSize` 已按结构体大小填好,`snap` 刚创建有效。
         let mut ok = unsafe { Thread32First(snap, &mut entry) };
         while ok != 0 {
             if entry.th32OwnerProcessID == pid && entry.th32ThreadID != self.main_tid {
                 let tid = entry.th32ThreadID;
-                // SAFETY: `tid` 来自本进程的快照。
+                // SAFETY: `tid` 来自本进程的快照。句柄**存下来**跨窗口用 ——
+                // 这与 T12 那条不冲突:T12 禁的是伪句柄,这里是 OpenThread
+                // 给的自有句柄,指名道姓地指着那个 tid。
                 let h: HANDLE = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid) };
                 if !h.is_null() {
-                    let mut c = FILETIME {
-                        dwLowDateTime: 0,
-                        dwHighDateTime: 0,
-                    };
-                    let mut e = c;
-                    let mut k = c;
-                    let mut u = c;
-                    // SAFETY: `h` 刚 OpenThread 得到,四个 out 参数在栈上。
-                    let times_ok = unsafe { GetThreadTimes(h, &mut c, &mut e, &mut k, &mut u) };
-                    if times_ok != 0 {
-                        let mut desc: *mut u16 = std::ptr::null_mut();
-                        // SAFETY: `h` 有效,`desc` 是本地栈变量。
-                        let hr = unsafe { GetThreadDescription(h, &mut desc) };
-                        let name = if hr >= 0 && !desc.is_null() {
-                            // SAFETY: `desc` 是 GetThreadDescription 成功时给出的
-                            // NUL 结尾宽串,读完立刻用 LocalFree 释放。
-                            let s = unsafe {
-                                let mut len = 0usize;
-                                while *desc.add(len) != 0 {
-                                    len += 1;
-                                }
-                                String::from_utf16_lossy(std::slice::from_raw_parts(desc, len))
-                            };
-                            // SAFETY: `desc` 是 GetThreadDescription 分配的,用完释放。
-                            unsafe { LocalFree(desc as HLOCAL) };
-                            s
-                        } else {
-                            String::new() // 空名原样返回,分组层管占位。
+                    let mut desc: *mut u16 = std::ptr::null_mut();
+                    // SAFETY: `h` 有效,`desc` 是本地栈变量。
+                    let hr = unsafe { GetThreadDescription(h, &mut desc) };
+                    let name = if hr >= 0 && !desc.is_null() {
+                        // SAFETY: `desc` 是 GetThreadDescription 成功时给出的
+                        // NUL 结尾宽串,读完立刻用 LocalFree 释放。
+                        let s = unsafe {
+                            let mut len = 0usize;
+                            while *desc.add(len) != 0 {
+                                len += 1;
+                            }
+                            String::from_utf16_lossy(std::slice::from_raw_parts(desc, len))
                         };
-                        cur.insert(tid, (name, ns(k) + ns(u)));
-                    }
-                    // SAFETY: `h` 是 OpenThread 给的自有句柄。
-                    unsafe { CloseHandle(h) };
+                        // SAFETY: `desc` 是 GetThreadDescription 分配的,用完释放。
+                        unsafe { LocalFree(desc as HLOCAL) };
+                        s
+                    } else {
+                        String::new() // 空名原样返回,分组层管占位。
+                    };
+                    self.cached.push(CachedThread {
+                        tid,
+                        handle: h,
+                        name,
+                    });
                 }
             }
             // SAFETY: `snap` 仍有效,`entry` 复用同一块栈内存,由 Thread32Next 重填。
@@ -412,26 +551,55 @@ impl ThreadCpuProbe {
         // SAFETY: `snap` 是 CreateToolhelp32Snapshot 给的自有句柄。
         unsafe { CloseHandle(snap) };
 
-        // 首次调用只建基线,给 `None`,理由同 Linux 分支。
-        let out = self.prev.as_ref().map(|prev| {
-            cur.iter()
-                .map(|(tid, (name, t))| {
-                    let delta = match prev.get(tid) {
-                        Some(p) => t.saturating_sub(*p),
-                        None => *t, // 窗口内新出现的线程,从 0 起,全额算。
-                    };
-                    (name.clone(), delta)
-                })
-                .collect()
-        });
-        self.prev = Some(cur.into_iter().map(|(tid, (_, t))| (tid, t)).collect());
-        out
+        self.since_rescan = Some(0);
+        self.read_failed = false;
+    }
+
+    #[cfg(windows)]
+    fn close_cached(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        for t in self.cached.drain(..) {
+            // SAFETY: `t.handle` 是本结构体从 OpenThread 拿到的自有句柄,
+            // 只在这里关,关完立刻从 `cached` 里移走(drain)。
+            unsafe { CloseHandle(t.handle) };
+        }
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
     pub fn sample(&mut self) -> Option<Vec<(String, u64)>> {
         None
     }
+}
+
+// F182:句柄要跟着 probe 一起还回去。看门狗线程活到进程结束,所以这个 Drop
+// 实际上极少跑 —— 写它是因为单测里 probe 会反复构造析构,而泄漏的句柄
+// 在测试进程里同样是泄漏。
+#[cfg(windows)]
+impl Drop for ThreadCpuProbe {
+    fn drop(&mut self) {
+        self.close_cached();
+    }
+}
+
+/// F182:读一个已缓存句柄的累计 CPU 纳秒。
+///
+/// 线程退出后这里**照样成功**并返回最终值(句柄让线程对象活着),于是它的
+/// delta 恒为 0、在表里显示 0% —— 直到下次重扫把它清掉。这是有意的:
+/// 报一个不再变化的 0,好过让它从表里静默消失。
+#[cfg(windows)]
+fn thread_cpu_ns(h: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetThreadTimes;
+    let mut c = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut e = c;
+    let mut k = c;
+    let mut u = c;
+    // SAFETY: `h` 是 `rescan` 里 OpenThread 得到的自有句柄,四个 out 参数在栈上。
+    let ok = unsafe { GetThreadTimes(h, &mut c, &mut e, &mut k, &mut u) };
+    (ok != 0).then(|| filetime_ns(k) + filetime_ns(u))
 }
 
 /// 一次 GPU 引擎占用采样。`engines` 已按占用倒序,最多两项。
@@ -978,6 +1146,87 @@ mod tests {
         assert!(
             !list_excl.iter().any(|(name, _)| name == "mullion-excl"),
             "main_tid 对应的线程不该出现在清单里,得到:{list_excl:?}"
+        );
+    }
+
+    /// F182:重扫节奏的判据。**这段是 Windows 分支唯一容易写错、又刚好
+    /// 平台无关的逻辑**,所以它没 gate 在 `#[cfg(windows)]` 里 —— gate 进去
+    /// 的话开发机上一行都跑不到,只能靠交叉编译过不过来「验证」,而那验的
+    /// 是语法不是判据。
+    ///
+    /// 三条各管一件事:
+    /// - 从没扫过必须扫(否则清单永远是空的,整表 n/a,静默)。
+    /// - 没到期就别扫(这条**就是** F182 的全部价值:每 5 秒一次全系统
+    ///   线程快照,实测占了写盘窗口全部 CPU 的一大块)。
+    /// - 读数失败要立刻扫,不等到期(清单已经和现实对不上了,等满一分钟
+    ///   等于明知有错还继续报一分钟的错数)。
+    ///
+    /// 自证会变红:把 `needs_rescan` 里的 `read_failed ||` 删掉(第三条红),
+    /// 或把 `n >= RESCAN_EVERY_WINDOWS` 改成 `true`(第二条红),
+    /// 或把 `None => true` 改成 `None => false`(第一条红)。
+    #[test]
+    fn the_thread_list_is_rescanned_on_a_slow_cadence_not_every_window() {
+        assert!(needs_rescan(None, false), "从没扫过必须扫");
+        assert!(
+            !needs_rescan(Some(0), false),
+            "刚扫完不该再扫 —— 每窗口重扫就是 F182 要去掉的那件事"
+        );
+        assert!(
+            !needs_rescan(Some(RESCAN_EVERY_WINDOWS - 1), false),
+            "没到期不该扫"
+        );
+        assert!(needs_rescan(Some(RESCAN_EVERY_WINDOWS), false), "到期该扫");
+        assert!(needs_rescan(Some(0), true), "读数失败要立刻重扫,不等到期");
+    }
+
+    /// F182:**一分钟才发现一次新线程,那它进表的第一个窗口只能建基线。**
+    ///
+    /// 照 Linux 那样「新 tid 全额算」的话,一条 59 秒前创建、期间烧了 3 秒
+    /// CPU 的线程,会把这 3 秒塞进一个 5 秒窗口 —— 报出 `60%` 这种**看着
+    /// 像着火了的假值**,而它其实只是被发现得晚。这类假值比漏账危险得多:
+    /// 漏账让人以为没事,假值让人去修一个不存在的问题。
+    ///
+    /// 两种取法在同一份输入上必须给出不同答案,否则这条判据是空的。
+    ///
+    /// 自证会变红:把 `diff_and_rebase` 里 `(None, NewThread::BaselineOnly)`
+    /// 那一臂的 `0` 改成 `*ns`(两种取法就此同义,第一段断言红)。
+    #[test]
+    fn a_thread_found_late_only_sets_a_baseline_instead_of_reporting_a_minute_at_once() {
+        let cur = || {
+            let mut m = std::collections::HashMap::new();
+            m.insert(77u32, ("迟到的线程".to_string(), 3_000_000_000u64));
+            m
+        };
+
+        // 已有基线(不是首次采样),但 77 号是这一窗口才出现的 tid。
+        let mut late = ThreadCpuProbe::new(1);
+        late.prev = Some(std::collections::HashMap::new());
+        assert_eq!(
+            late.diff_and_rebase(cur(), NewThread::BaselineOnly),
+            Some(vec![("迟到的线程".to_string(), 0)]),
+            "晚发现的线程该只建基线,不该把攒了一分钟的 CPU 记成这一窗口的"
+        );
+
+        let mut fresh = ThreadCpuProbe::new(1);
+        fresh.prev = Some(std::collections::HashMap::new());
+        assert_eq!(
+            fresh.diff_and_rebase(cur(), NewThread::ChargeFull),
+            Some(vec![("迟到的线程".to_string(), 3_000_000_000)]),
+            "Linux 每窗口都重列,新出现就是这 5 秒里刚创建的,该全额算"
+        );
+
+        // 建完基线之后,下一窗口的差分照常 —— 只吞第一窗口,不是永远吞。
+        assert_eq!(
+            late.diff_and_rebase(
+                {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(77u32, ("迟到的线程".to_string(), 3_500_000_000u64));
+                    m
+                },
+                NewThread::BaselineOnly
+            ),
+            Some(vec![("迟到的线程".to_string(), 500_000_000)]),
+            "建过基线之后必须正常差分,否则这条线程永远报 0"
         );
     }
 }
