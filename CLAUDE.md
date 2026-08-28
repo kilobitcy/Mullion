@@ -181,6 +181,8 @@ ADR 放 `docs/adr-NNN-*.md`，一个决策一个文件；brainstorm/writing-plan
 `docs/` 关键非 ADR 文件：
 - `cross-compile-windows.md` —— Linux 交叉编译 Windows exe 的运行手册（代理/mingw/objdump/live 验证/发布 Release）
 - `gui-render-gotchas.md` —— GUI/渲染/输入层「编译过跑起来才崩」的坑（动那几个文件前必读）
+- `field-capture.md` —— 实机采集与验收运行手册（性能切片留下的「待人工验」怎么一次性回收：
+  静置 A/B、Debug 档目视表、N1/N5 判据、日志各段怎么读）
 - `ui-form-guidelines.md` —— 表单布局规范（分节/宽度三档/间距五档/危险措辞/空态文案），
   写任何 egui 表单前先扫一眼；机械守护在 `crates/mullion-app/tests/form_guidelines.rs`
 - ADR 全在 `docs/adr-NNN-*.md`，按需读原文；碰架构决策前先查有没有对应 ADR。
