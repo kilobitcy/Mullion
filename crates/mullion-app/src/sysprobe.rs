@@ -326,6 +326,10 @@ unsafe impl Send for CachedThread {}
 ///   **看着像着火了的假值**。所以只建基线、这一窗口记 0,
 ///   [`BaselineOnly`](NewThread::BaselineOnly)。
 enum NewThread {
+    /// 只有 Linux 分支构造它(理由同下,方向相反 —— 交叉编译到 Windows 时
+    /// 它才是那个 dead_code,而**开发机上的 clippy 看不见这一侧**:发版
+    /// 前跑 `cargo build --target x86_64-pc-windows-gnu` 才会露出来)。
+    #[cfg_attr(windows, allow(dead_code))]
     ChargeFull,
     /// **只有 Windows 分支构造它。** 开发机(Linux)上 `cargo build` 会把它
     /// 判成 dead_code,而 `-D warnings` 把 dead_code 当错 —— 测试里的构造点
