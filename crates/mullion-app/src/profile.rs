@@ -308,13 +308,20 @@ pub struct Snapshot {
     /// 用 `Option` 而不是沿用 `mem_process_mb` 那个 0 哨兵:0 哨兵是 F155
     /// 的既有债(见本文件 `render_lines` 里 mem 行上方的注释),不再复制第二份。
     pub mem_ws_mb: Option<u64>,
-    /// F164:整个进程的 CPU 占用,**按核数归一**。`None` = 采不到。
-    pub cpu_pct: Option<u8>,
-    /// F164:主线程的 CPU 占用,**不归一**(一个核跑满 = 100)。
+    /// F164/F179:整个进程的 CPU 占用,[单核万分比](crate::sysprobe::cpu_bp)。
+    /// `None` = 采不到。
+    pub cpu_bp: Option<u32>,
+    /// F164/F179:主线程的 CPU 占用,同口径。
     ///
-    /// 与 `cpu_pct` 口径不同是有意的:F158 那次的症状是「烧满一个核」,
-    /// 在多核机上归一化之后只有个位数,会淹没在噪声里。
-    pub main_cpu_pct: Option<u8>,
+    /// 单独一份是有意的:F158 那次的症状是「烧满一个核」,而进程口径在
+    /// 多核机上还要摊进 tokio 那一堆线程,单看它认不出「事件循环在忙转」。
+    pub main_cpu_bp: Option<u32>,
+    /// F179:这台机器的逻辑核数,0 = 未知。**只用于渲染**,不参与任何判据。
+    ///
+    /// 报出来是为了让读日志的人能把单核口径换算回归一口径 —— 否则
+    /// 「180% 单核」在 4 核机和 32 核机上是完全不同的两件事,而日志里
+    /// 看不出是哪台。
+    pub cpu_cores: u32,
     /// F165:GPU 引擎占用,按类型聚合的前两名。空 = 采不到或全零。
     pub gpu_engines: Vec<(String, u8)>,
     /// F165:GPU 探针可用吗。区分「可用但为 0」与「采不到」。
@@ -360,14 +367,25 @@ pub struct Snapshot {
 /// 逐阶段计数。长度与 `diag::Stage` 的变体数一致。
 pub type StageCounts = [Counts; crate::diag::STAGE_COUNT];
 
-/// F164:进程 CPU 超过这个百分比(按核数归一)就不算空闲。
-const IDLE_CPU_PCT: u8 = 5;
-
-/// F164:主线程 CPU 超过这个百分比(不归一)就不算空闲。
+/// F164/F179:进程 CPU 超过这个数([单核万分比](crate::sysprobe::cpu_bp),
+/// = 半个核)就不算空闲。
 ///
-/// 比进程阈值高:主线程本来就承担事件循环,偶尔的一次唤醒会打到十几。
-/// 20 以上意味着事件循环在真忙 —— 那正是要抓的。
-const IDLE_MAIN_CPU_PCT: u8 = 20;
+/// **F179 把它从「归一后 5%」改成了与核数无关的绝对值。** 旧写法在 16 核
+/// 机器上等于 0.8 个核 —— 同一行代码在 4 核机上是 0.2 个核,**这道保险的
+/// 灵敏度悄悄取决于机器**,而实机 286 个窗口里它一次都没触发过。
+///
+/// **这道门不是 N1 的证据。** 它比 N1(1% 单核 = 100bp)松五十倍,存在的
+/// 理由只是「看着空闲、实则在烧」(F158 那种烧满一个核的量级)别在日志里
+/// 彻底消失。所以**「这一窗口没写盘」推不出「这一窗口达标 N1」**——任何拿
+/// 未写盘窗口数当 N1 达标证据的推理都是错的,守护
+/// `a_window_ten_times_over_n1_still_counts_as_idle_so_silence_is_not_evidence`。
+const IDLE_CPU_BP: u32 = 5_000;
+
+/// F164/F179:主线程 CPU 超过这个数(同口径,= 五分之一个核)就不算空闲。
+///
+/// 比进程阈值低:主线程本来就承担事件循环,它单独烧掉五分之一个核就说明
+/// 事件循环在真忙 —— 那正是要抓的(F158 的自激)。
+const IDLE_MAIN_CPU_BP: u32 = 2_000;
 
 impl Snapshot {
     /// 一份全零的快照。
@@ -420,8 +438,9 @@ impl Snapshot {
             mem_process_mb: 0,
             mem_kind: crate::diag::MemKind::Rss,
             mem_ws_mb: None,
-            cpu_pct: None,
-            main_cpu_pct: None,
+            cpu_bp: None,
+            main_cpu_bp: None,
+            cpu_cores: 0,
             gpu_engines: Vec::new(),
             gpu_available: false,
             vram_mb: None,
@@ -484,8 +503,8 @@ impl Snapshot {
     /// 「不忙」。反过来的话,任何一台读不到 CPU 的机器上,空闲的 mullion
     /// 会每 5 秒写一次盘 —— 正是 `is_idle` 这条判据当初要防的事。
     fn cpu_is_busy(&self) -> bool {
-        self.cpu_pct.is_some_and(|p| p >= IDLE_CPU_PCT)
-            || self.main_cpu_pct.is_some_and(|p| p >= IDLE_MAIN_CPU_PCT)
+        self.cpu_bp.is_some_and(|p| p >= IDLE_CPU_BP)
+            || self.main_cpu_bp.is_some_and(|p| p >= IDLE_MAIN_CPU_BP)
     }
 
     /// F177:这一窗口「其他」栏的 MB 数,与 `profile.mem` 行同源
@@ -574,8 +593,21 @@ fn render_pane_detail(p: &PaneDetail) -> String {
     s
 }
 
-fn fmt_pct(v: Option<u8>) -> String {
-    v.map_or_else(|| "n/a".to_string(), |p| format!("{p}%"))
+/// F179:[单核万分比](crate::sysprobe::cpu_bp) → 两位小数的百分比。
+///
+/// **两位小数不是好看,是判据**:N1 要求空闲 < 1% 单核,取整到百分点的话
+/// 达标(0.6%)、超标十倍(9.9%)、超标一百倍(99%)里前两者会印成同一个
+/// `0%` 和 `9%` —— 旧口径就是这么把 286 个实机窗口全印成 `0%` 的。
+///
+/// 位数固定,不做「整数就省掉小数」的美化:变宽的字段没法按列 grep,而这几行
+/// 的唯一读者是 grep。
+fn fmt_bp(v: Option<u32>) -> String {
+    v.map_or_else(|| "n/a".to_string(), fmt_bp_value)
+}
+
+/// 同 [`fmt_bp`],但读数一定有(线程分组表里「采不到」是整表 `n/a`)。
+fn fmt_bp_value(bp: u32) -> String {
+    format!("{}.{:02}%", bp / 100, bp % 100)
 }
 
 /// F165:GPU 引擎占用渲染成 `3D:14%/Copy:3%`。
@@ -1023,14 +1055,22 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
     } else {
         s.thread_groups
             .iter()
-            .map(|(n, p)| format!("{n}:{p}%"))
+            .map(|(n, p)| format!("{n}:{}", fmt_bp_value(*p)))
             .collect::<Vec<_>>()
             .join(" ")
     };
+    // F179:`cores=` 报出来,单核口径才换算得回归一口径。0 = 探针没给出核数,
+    // 同样按「采不到 ≠ 0」处置 —— 印一个 0 会被读成「零核」这种不可能的事实。
+    let cores = if s.cpu_cores == 0 {
+        "n/a".to_string()
+    } else {
+        s.cpu_cores.to_string()
+    };
     lines.push(format!(
-        "profile.cpu total={} main={} | {}",
-        fmt_pct(s.cpu_pct),
-        fmt_pct(s.main_cpu_pct),
+        "profile.cpu total={} main={} cores={} | {}",
+        fmt_bp(s.cpu_bp),
+        fmt_bp(s.main_cpu_bp),
+        cores,
         groups
     ));
 
@@ -1084,7 +1124,7 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
             let unmapped = s
                 .thread_unmapped
                 .iter()
-                .map(|(n, p)| format!("{n}:{p}%"))
+                .map(|(n, p)| format!("{n}:{}", fmt_bp_value(*p)))
                 .collect::<Vec<_>>()
                 .join(" ");
             lines.push(format!("profile.cpu.unmapped {unmapped}"));
@@ -1101,19 +1141,6 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
     }
 
     lines
-}
-
-/// F168:线程 CPU 百分比,不归一(100 = 一个核)**且不封顶**(组内多线程
-/// 烧多核是常态,封顶等于把最该看见的读数削掉)。这就是它不复用
-/// [`crate::sysprobe::cpu_pct`] 的原因 —— 那个按口径约定 `.min(100)`。
-pub fn thread_group_pct(delta_ns: u64, window_ns: u64) -> Option<u32> {
-    if window_ns == 0 {
-        return None;
-    }
-    // 饱和而非 `as u32` 截断:病态输入(上游给出荒谬的小窗口)下截断会绕回成一个
-    // 像模像样的小数字(恰好整除时甚至是 0),那是 T12 那类「静默错值」;爆表成
-    // u32::MAX 一眼就知道该查上游。
-    Some((((delta_ns as u128) * 100 / (window_ns as u128)).min(u32::MAX as u128)) as u32)
 }
 
 /// F168:前缀 → 组名。顺序即输出顺序。main 不在表里(由 F164 的主线程
@@ -1859,15 +1886,49 @@ mod tests {
         s.window_ms = 5_000;
         assert!(s.is_idle(), "全零快照该算空闲");
 
-        s.main_cpu_pct = Some(96);
+        s.main_cpu_bp = Some(9_600);
         assert!(
             !s.is_idle(),
             "主线程烧满一个核却仍判空闲 —— 这一行不会写盘,故障在日志里不存在"
         );
 
-        s.main_cpu_pct = None;
-        s.cpu_pct = Some(40);
-        assert!(!s.is_idle(), "进程 CPU 40% 却仍判空闲");
+        s.main_cpu_bp = None;
+        s.cpu_bp = Some(40_000);
+        assert!(!s.is_idle(), "进程烧掉四个核却仍判空闲");
+    }
+
+    /// **F179:空闲门的灵敏度不许取决于机器有几个核。**
+    ///
+    /// 旧阈值是「归一后 5%」,16 核机上 = 0.8 个核、4 核机上 = 0.2 个核 ——
+    /// 同一行代码在两台机器上是两道不同的门,而实机 286 个窗口里它一次都
+    /// 没触发过。绝对值口径下,「烧掉三分之二个核」在任何机器上都必须写盘。
+    ///
+    /// 自证会变红:把 `IDLE_CPU_BP` 改回等价于旧行为的 8_000(16 核机上的
+    /// 0.8 个核)。
+    #[test]
+    fn burning_two_thirds_of_a_core_breaks_the_idle_gate_on_any_machine() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        s.cpu_bp = Some(6_600);
+        assert!(!s.is_idle(), "烧掉三分之二个核仍判空闲,故障不会写盘");
+    }
+
+    /// **空闲门不是 N1 的证据**(F179 明写的一条负面判据)。
+    ///
+    /// 这道门比 N1(1% 单核 = 100bp)松五十倍。一个超标十倍的窗口照样安静
+    /// 地不写盘 —— 所以「日志里没有这一窗口」既可能是达标、也可能是超标
+    /// 十倍,**「未写盘窗口数」永远不能当 N1 的达标证据**。
+    ///
+    /// 这条测试的价值在反方向:哪天有人为了「让 N1 可验」把这道门收紧到
+    /// N1 附近,它会当场变红,逼那个人先去想清楚「空闲时每 5 秒写一次盘」
+    /// 的代价 —— 那正是 `is_idle` 当初存在的理由。
+    #[test]
+    fn a_window_ten_times_over_n1_still_counts_as_idle_so_silence_is_not_evidence() {
+        let mut s = Snapshot::empty();
+        s.window_ms = 5_000;
+        s.cpu_bp = Some(1_000); // 10% 单核 = N1 阈值的十倍
+        s.main_cpu_bp = Some(1_000);
+        assert!(s.is_idle(), "空闲门收紧到 N1 附近了?先看这条注释");
     }
 
     /// **采不到(None)不打破空闲门**。
@@ -1880,49 +1941,72 @@ mod tests {
     fn a_cpu_probe_that_reports_nothing_does_not_wake_the_disk() {
         let mut s = Snapshot::empty();
         s.window_ms = 5_000;
-        s.cpu_pct = None;
-        s.main_cpu_pct = None;
+        s.cpu_bp = None;
+        s.main_cpu_bp = None;
         assert!(s.is_idle(), "采不到 CPU 被当成了忙");
     }
 
     /// 真空闲(CPU 接近 0)照旧不写盘。
     ///
-    /// 自证会变红:把 `IDLE_CPU_PCT` 改成 0。
+    /// 自证会变红:把 `IDLE_CPU_BP` 改成 0。
     #[test]
     fn a_genuinely_idle_window_is_still_skipped() {
         let mut s = Snapshot::empty();
         s.window_ms = 5_000;
-        s.cpu_pct = Some(0);
-        s.main_cpu_pct = Some(1);
+        s.cpu_bp = Some(0);
+        s.main_cpu_bp = Some(100);
         assert!(s.is_idle(), "真空闲也写盘了,硬盘睡不下去");
     }
 
     /// 渲染行里带 CPU,采不到时是 `n/a` 而不是 0。
     ///
-    /// 自证会变红:把 `fmt_pct` 的 `None` 分支改成返回 `"0%"`。
+    /// F179 加了两条:两位小数(否则 N1 的达标与超标十倍同形)、`cores=`
+    /// (否则单核口径换算不回归一口径)。
+    ///
+    /// 自证会变红:把 `fmt_bp` 的 `None` 分支改成返回 `"0%"`(n/a 那条),
+    /// 或把 `fmt_bp_value` 的小数位删掉(`0.63%` 那条),或把 `cores=` 从
+    /// 行里拿掉。
     #[test]
     fn the_line_shows_cpu_and_says_n_a_when_it_could_not_be_read() {
         let mut s = Snapshot::empty();
         s.window_ms = 5_000;
         s.frames = 10;
-        s.cpu_pct = Some(8);
-        s.main_cpu_pct = Some(96);
-        let lines = render_lines(&s, false);
-        let cpu = lines
-            .iter()
-            .find(|l| l.starts_with("profile.cpu "))
-            .expect("该有 cpu 行");
-        assert!(cpu.contains("total=8% main=96%"), "行里没有 CPU:{cpu}");
-
-        s.cpu_pct = None;
-        s.main_cpu_pct = None;
+        s.cpu_bp = Some(63); // 0.63% 单核 —— N1 的达标侧
+        s.main_cpu_bp = Some(9_600);
+        s.cpu_cores = 16;
         let lines = render_lines(&s, false);
         let cpu = lines
             .iter()
             .find(|l| l.starts_with("profile.cpu "))
             .expect("该有 cpu 行");
         assert!(
-            cpu.contains("total=n/a"),
+            cpu.contains("total=0.63% main=96.00% cores=16"),
+            "行里没有 CPU:{cpu}"
+        );
+        // 同一行里必须读得出 N1 的判决,不用换算、不用知道机器几个核。
+        let over = {
+            let mut t = s.clone();
+            t.cpu_bp = Some(410); // 4.10% 单核 —— 超标四倍
+            render_lines(&t, false)
+                .into_iter()
+                .find(|l| l.starts_with("profile.cpu "))
+                .expect("该有 cpu 行")
+        };
+        assert!(
+            !over.contains("total=0.63%") && over.contains("total=4.10%"),
+            "超标四倍与达标印成了同一个数,F179 白修:{over}"
+        );
+
+        s.cpu_bp = None;
+        s.main_cpu_bp = None;
+        s.cpu_cores = 0;
+        let lines = render_lines(&s, false);
+        let cpu = lines
+            .iter()
+            .find(|l| l.starts_with("profile.cpu "))
+            .expect("该有 cpu 行");
+        assert!(
+            cpu.contains("total=n/a") && cpu.contains("cores=n/a"),
             "采不到时该报 n/a 而不是编一个 0:{cpu}"
         );
     }
@@ -2061,8 +2145,8 @@ mod tests {
         );
         let mut s = busy_snapshot();
         s.thread_available = true;
-        s.thread_groups = vec![("tokio", 31), ("其他", 9)];
-        s.thread_unmapped = vec![("wgpu-poll".to_string(), 5)];
+        s.thread_groups = vec![("tokio", 3_100), ("其他", 900)];
+        s.thread_unmapped = vec![("wgpu-poll".to_string(), 500)];
         let lines = render_lines(&s, false);
         // 非 debug 档行数是确定的常量五行。用 `==` 而不是 `>=`:`>=` 对
         // 「意外多 push 了一行」完全失明(实测变异不会红)。
@@ -2078,7 +2162,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("profile.load scene=")));
         assert!(lines
             .iter()
-            .any(|l| l.starts_with("profile.cpu ") && l.contains("tokio:31%")));
+            .any(|l| l.starts_with("profile.cpu ") && l.contains("tokio:31.00%")));
         assert!(lines.iter().any(|l| l.starts_with("profile.mem ")));
         assert!(lines.iter().any(|l| l.starts_with("profile.gpu ")));
         assert!(
@@ -2088,7 +2172,7 @@ mod tests {
         let dbg = render_lines(&s, true);
         assert!(
             dbg.iter()
-                .any(|l| l.starts_with("profile.cpu.unmapped") && l.contains("wgpu-poll:5%")),
+                .any(|l| l.starts_with("profile.cpu.unmapped") && l.contains("wgpu-poll:5.00%")),
             "debug 档要能看见没进分组表的线程"
         );
     }
@@ -2297,7 +2381,7 @@ mod tests {
     fn a_window_that_burns_cpu_without_frames_is_not_called_idle() {
         let mut s = Snapshot::empty();
         s.window_ms = 5000;
-        s.main_cpu_pct = Some(96);
+        s.main_cpu_bp = Some(9_600);
         assert!(!s.is_idle(), "前提:这一行会写盘");
         assert_eq!(scene_of(&s), Scene::Unattributed);
         // 同族:重绘全被帧闸挡下、T2 同步块超时,都归不出因但都得写盘。
@@ -2319,11 +2403,14 @@ mod tests {
     /// F168:分组表 + 四个坑:前缀串号 / 空名 / 未匹配进其他但 Debug 可见 /
     /// Linux 15 字节截断名。
     ///
+    /// 组内求和**不封顶**(组内多线程烧多核是常态,封顶就看不见了)。换算
+    /// 本身的边界(不封顶 / 饱和 / 采不到)在 F179 之后与 `total=` 同源,
+    /// 判据在 `sysprobe::tests`。
+    ///
     /// 自证会变红:把 prefix_matches 改成裸 starts_with(串号那条),或把
-    /// 空名分支删掉(unnamed 那条),或把 thread_group_pct 加 .min(100)
-    /// (超 100% 那条 —— 组内多线程烧多核是常态,封顶就看不见了),或删掉
-    /// prefix_matches 里认截断名的那个分支(截断那组断言变红),或把饱和转换
-    /// 换回裸 `as u32`(爆表那条)。
+    /// 空名分支删掉(unnamed 那条),或给 `group_threads` 的求和加 `.min(100)`
+    /// (超 100% 那条),或删掉 prefix_matches 里认截断名的那个分支(截断
+    /// 那组断言变红)。
     #[test]
     fn thread_grouping_boundaries_and_the_uncapped_pct() {
         let threads = vec![
@@ -2343,16 +2430,6 @@ mod tests {
         assert!(unmapped.contains(&"mullion-watchdog2"));
         assert!(unmapped.contains(&"unnamed"), "空名要有占位标识");
         assert!(unmapped.contains(&"wgpu-poll"));
-        // 不封顶换算:5 秒窗口烧了 12 秒 CPU(多线程组)= 240%。
-        assert_eq!(thread_group_pct(12_000_000_000, 5_000_000_000), Some(240));
-        assert_eq!(thread_group_pct(1, 0), None, "窗口为 0 = 采不到,不是 0%");
-        // 荒谬输入必须爆表,不许截断绕回:12.88 秒 / 3ns 恰好整除 2^32,
-        // `as u32` 会静默给出 0 —— 一个「看着完全正常」的错值。
-        assert_eq!(
-            thread_group_pct(12_884_901_888, 3),
-            Some(u32::MAX),
-            "截断绕回会把爆表读数伪装成 0"
-        );
 
         // Linux 内核把线程名截断到 15 字节(本机实测),表里三个前缀超长。
         // 不认截断名 = tokio/watchdog/dialog 三组在 Linux 上恒零且静默。

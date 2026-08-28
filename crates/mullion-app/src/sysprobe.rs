@@ -14,32 +14,38 @@
 #[cfg(windows)]
 use windows::core::Interface as _; // `cast::<IDXGIAdapter3>()`
 
-/// 一次 CPU 采样。
+/// 一次 CPU 采样。两个读数都是[单核万分比](cpu_bp)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuSample {
-    /// 整个进程的 CPU 占用,**按核数归一**(所有核跑满 = 100)。
-    pub process_pct: u8,
-    /// 主线程的 CPU 占用,**不归一**(一个核跑满 = 100)。
-    pub main_thread_pct: u8,
+    /// 整个进程的 CPU 占用。**不归一、不封顶**:16 核全跑满 = 160_000。
+    pub process_bp: u32,
+    /// 主线程的 CPU 占用。同口径(一个线程占不满两个核,天然 ≤ 10_000)。
+    pub main_thread_bp: u32,
 }
 
-/// CPU 时间差 → 百分比。
+/// CPU 时间差 → **单核万分比**(一个核跑满一整个窗口 = 10_000)。
 ///
-/// `cores` 是归一化的除数:进程口径传真实核数,主线程口径传 1。
+/// **F179:口径和分辨率都是判据的一部分。** 旧版按核数归一成整数百分点,
+/// 于是 16 核机器上 1 个显示百分点 = 0.16 个核 —— 单核 16% 以下**全部显示
+/// 0%**,而 N1 要求的「空闲 < 1% 单核」比那个最小刻度还小 16 倍。实机 34
+/// 分钟 286 个窗口的 p50/p95/max 全是 0%,**达标与超标十五倍长得一模一样**。
+/// 万分比让 N1 的阈值(= 100)有两位有效数字,而单核口径让它不必知道核数
+/// 就能直接读:`total=0.63%` 达标,`total=4.10%` 不达标,一眼可判。
 ///
-/// **两个口径故意不同**。F158 那次故障的症状原文是「空闲不再烧满一个核」,
-/// 在 16 核机器上按核数归一之后它只有 6% —— 淹没在噪声里,而这个功能存在
-/// 的全部理由就是让它跳出来。主线程不归一,一个核跑满就是 100%。
+/// 归一口径没有丢:`profile.cpu` 行同时报 `cores=`,除一下即可。
+///
+/// 饱和而非截断(同 [`crate::profile::thread_group_pct`]):病态的小窗口下
+/// `as u32` 会绕回成一个像模像样的小数字,爆表成 `u32::MAX` 才一眼看得出
+/// 该查上游。
 ///
 /// `window_ns` 为 0(时钟没走 / 首次采样无基线)返回 `None`,不是 0 ——
 /// 「采不到」和「真的是 0」在排障时是两回事,而且 `None` 不会打破空闲门。
-pub fn cpu_pct(delta_ns: u64, window_ns: u64, cores: u32) -> Option<u8> {
-    if window_ns == 0 || cores == 0 {
+pub fn cpu_bp(delta_ns: u64, window_ns: u64) -> Option<u32> {
+    if window_ns == 0 {
         return None;
     }
-    let denom = (window_ns as u128) * (cores as u128);
-    let pct = (delta_ns as u128) * 100 / denom;
-    Some(pct.min(100) as u8)
+    let bp = (delta_ns as u128) * 10_000 / (window_ns as u128);
+    Some(bp.min(u32::MAX as u128) as u32)
 }
 
 /// CPU 探针。**有状态**:百分比是两次采样的差分,必须记住上一窗口。
@@ -85,6 +91,14 @@ impl CpuProbe {
         }
     }
 
+    /// 这台机器的逻辑核数。**不参与百分比换算**(F179 之后两个读数都是单核
+    /// 口径),只是渲染层要把它印进 `profile.cpu` 行,好让读日志的人能换算回
+    /// 归一口径 —— 不印的话「180% 单核」在 4 核机和 32 核机上意味着完全不同
+    /// 的两件事,而日志里看不出是哪台。
+    pub fn cores(&self) -> u32 {
+        self.cores
+    }
+
     /// 采一次。首次调用没有基线,返回 `None`。
     pub fn sample(&mut self, window_ns: u64) -> Option<CpuSample> {
         let (proc_ns, main_ns) = read_cpu_ns(self)?;
@@ -93,8 +107,8 @@ impl CpuProbe {
         self.prev_process_ns = Some(proc_ns);
         self.prev_main_ns = Some(main_ns);
         Some(CpuSample {
-            process_pct: cpu_pct(d_proc?, window_ns, self.cores)?,
-            main_thread_pct: cpu_pct(d_main?, window_ns, 1)?,
+            process_bp: cpu_bp(d_proc?, window_ns)?,
+            main_thread_bp: cpu_bp(d_main?, window_ns)?,
         })
     }
 }
@@ -713,49 +727,53 @@ fn find_adapter(vendor: u32, device: u32) -> Option<windows::Win32::Graphics::Dx
 mod tests {
     use super::*;
 
-    /// 进程口径按核数归一,主线程口径不归一。
+    /// **F179:分辨率必须容得下 N1。**
     ///
-    /// 这是本模块唯一一条「写错了也全绿、只有真机看得出」的判据:
-    /// 两个口径混用的话,「烧满一个核」在多核机上会被压成个位数百分比。
+    /// 这是本模块唯一一条「写错了也全绿、只有真机看得出」的判据 —— 而且
+    /// 它已经真的发生过一次:旧口径(按核数归一的整数百分点)在 16 核机上
+    /// 把 N1 的整个达标区间和它十五倍的超标区间一起量化成了 `0%`,286 个
+    /// 实机窗口无一例外。**指标显示 0% 和指标测不了长得一样。**
     ///
-    /// 自证会变红:把 `cpu_pct` 里的 `* (cores as u128)` 去掉。
+    /// 自证会变红:把 `cpu_bp` 里的 `10_000` 改成 `100`(退回整数百分点),
+    /// 或给它乘回 `cores` 那个归一除数(N1 阈值会掉到 6bp,与十分之一档
+    /// 无法区分)。
     #[test]
-    fn the_process_is_normalised_by_cores_while_the_main_thread_is_not() {
-        // 一个核被跑满一整个窗口。
+    fn the_n1_threshold_is_still_ten_ticks_above_zero() {
         let window = 5_000_000_000u64; // 5s
-        let one_core = 5_000_000_000u64;
-        assert_eq!(
-            cpu_pct(one_core, window, 16),
-            Some(6),
-            "16 核机上跑满一个核 ≈ 6%(进程口径)"
-        );
-        assert_eq!(
-            cpu_pct(one_core, window, 1),
-            Some(100),
-            "主线程口径下跑满一个核就是 100%"
-        );
+                                       // N1 的阈值本身:1% 单核。
+        assert_eq!(cpu_bp(window / 100, window), Some(100), "1% 单核该是 100bp");
+        // 十分之一个 N1 仍然不能被量化成 0 —— 否则「达标」与「测不到」同形。
+        assert_eq!(cpu_bp(window / 1_000, window), Some(10));
+        // 一个核跑满一整个窗口 = 10_000bp,与核数无关。
+        assert_eq!(cpu_bp(window, window), Some(10_000));
     }
 
-    /// 超出 100 要夹紧,不能溢出成小数字。
+    /// 进程口径**不封顶**:多核并行是常态,夹到一个核就把最该看见的读数削掉了。
     ///
-    /// `GetProcessTimes` 在多核上很容易给出 > window 的累计值(多线程并行),
-    /// 不夹紧的话 u8 转换会回绕 —— 200% 变成一个看起来正常的数。
-    ///
-    /// 自证会变红:把 `.min(100)` 删掉。
+    /// 自证会变红:给 `cpu_bp` 加 `.min(10_000)`。
     #[test]
-    fn a_multi_core_burst_is_clamped_instead_of_wrapping() {
-        assert_eq!(cpu_pct(40_000_000_000, 5_000_000_000, 1), Some(100));
+    fn eight_cores_of_work_reads_as_eight_hundred_percent() {
+        assert_eq!(cpu_bp(40_000_000_000, 5_000_000_000), Some(80_000));
+    }
+
+    /// 荒谬输入要爆表,不许截断绕回(同 `thread_group_pct` 的理由)。
+    ///
+    /// 自证会变红:把 `.min(u32::MAX as u128)` 换成裸 `as u32`。
+    #[test]
+    fn a_pathological_window_saturates_instead_of_wrapping() {
+        // 恰好整除 2^32 的一组:裸 `as u32` 会静默给出 0,一个「看着完全
+        // 正常」的错值。
+        assert_eq!(cpu_bp(429_496_729_600_000, 1_000_000), Some(u32::MAX));
     }
 
     /// 采不到时是 `None` 而不是 0。
     ///
     /// 0 会被空闲门读成「真空闲」,而 `None` 不打破空闲门也不冒充数据。
     ///
-    /// 自证会变红:把 `cpu_pct` 的两处 `return None` 改成 `return Some(0)`。
+    /// 自证会变红:把 `cpu_bp` 的 `return None` 改成 `return Some(0)`。
     #[test]
     fn an_unusable_window_yields_nothing_rather_than_a_fake_zero() {
-        assert_eq!(cpu_pct(1_000, 0, 4), None);
-        assert_eq!(cpu_pct(1_000, 5_000_000_000, 0), None);
+        assert_eq!(cpu_bp(1_000, 0), None);
     }
 
     /// 本平台真的采得到 CPU 时间,且第二次采样能算出百分比。
@@ -781,9 +799,9 @@ mod tests {
         let window_ns = start.elapsed().as_nanos() as u64;
         let s = p.sample(window_ns).expect("第二次采样该有值");
         assert!(
-            s.main_thread_pct > 50,
-            "刚把主线程跑满 150ms,主线程口径只报了 {}%",
-            s.main_thread_pct
+            s.main_thread_bp > 5_000,
+            "刚把主线程跑满 150ms,主线程口径只报了 {}bp",
+            s.main_thread_bp
         );
     }
 

@@ -1068,8 +1068,11 @@ fn watchdog_loop(
             // 最坏的一类坑。渲染(格式化)才是贵的那步,只有它需要关在门里。
             let cpu_sample = cpu.sample(window_ms.saturating_mul(1_000_000));
             let mut snap = take_snapshot(window_ms);
-            snap.cpu_pct = cpu_sample.map(|c| c.process_pct);
-            snap.main_cpu_pct = cpu_sample.map(|c| c.main_thread_pct);
+            snap.cpu_bp = cpu_sample.map(|c| c.process_bp);
+            snap.main_cpu_bp = cpu_sample.map(|c| c.main_thread_bp);
+            // 核数与采样成不成功无关(首个窗口没有基线,但核数早就知道),
+            // 所以不挂在 `cpu_sample` 上 —— 挂上去的话第一行会报 `cores=n/a`。
+            snap.cpu_cores = cpu.cores();
             if let Some(g) = gpu.sample() {
                 snap.gpu_available = true;
                 snap.gpu_engines = g.engines;
@@ -1078,10 +1081,12 @@ fn watchdog_loop(
                 Some(list) => {
                     snap.thread_available = true;
                     let window_ns = window_ms.saturating_mul(1_000_000);
+                    // F179:与 `total=`/`main=` 同一个换算,不许另起一份 ——
+                    // 同一行里两个数不同口径正是这条要修的东西。
                     let pcts: Vec<(String, u32)> = list
                         .into_iter()
                         .filter_map(|(name, delta)| {
-                            crate::profile::thread_group_pct(delta, window_ns).map(|p| (name, p))
+                            crate::sysprobe::cpu_bp(delta, window_ns).map(|p| (name, p))
                         })
                         .collect();
                     let g = crate::profile::group_threads(&pcts);
