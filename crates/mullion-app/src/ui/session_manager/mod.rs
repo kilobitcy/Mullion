@@ -1367,6 +1367,42 @@ mod tunnel_ui_tests {
         );
     }
 
+    /// F189 **接线守护**:保存意图里那份书签表必须过
+    /// `bookmark_table_touched` 这道闸。
+    ///
+    /// 闸门本身在 `buffer.rs` 有行为测试,`apply_save` 两条分支也各有一条 ——
+    /// 唯独「这里到底传了什么」够不着:这段在 `show` 里,要驱动到它得先把
+    /// 整个会话管理器画出来再点中保存按钮。把 `bookmarks` 改成恒 `Some(..)`
+    /// 时,那两处行为测试**全绿**(已实测),而现象正是用户报的问题 1。
+    ///
+    /// 先剥掉注释行:判据自己的说明文字里就带着这个函数名,不剥的话注释
+    /// 就能把断言喂饱(本项目反复踩到的恒绿模式)。
+    ///
+    /// 自证会变红:把那句改成 `let bookmarks = Some(draft.sftp.bookmarks.clone());`。
+    #[test]
+    fn the_save_intent_only_carries_the_bookmark_table_when_it_was_touched() {
+        let src = include_str!("mod.rs");
+        let (prod, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("mod.rs 的测试模块分界变了,这条断言的锚点失效了");
+        let at = prod
+            .find("ui_state.save_request = Some(SaveIntent {")
+            .expect("找不到保存意图的构造点 —— 锚点失效了");
+        let head: String = prod[..at]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 只看构造点**紧邻的上文**:扫全文件的话,`use` 那一行的函数名就够
+        // 把断言喂饱,改成恒 `Some(..)` 也照样绿。
+        let near = &head[head.len().saturating_sub(600)..];
+        assert!(
+            near.contains("bookmark_table_touched("),
+            "保存意图里的书签表没过脏判据 —— 每次保存都会拿编辑器打开那一刻的\
+             快照顶掉路径条 ☆ 后来收藏的目录:\n{near}"
+        );
+    }
+
     /// 在哪一档按「+ 新建」,建出来的就是哪一类节点。协议此后只读(D3),
     /// 所以这是它唯一的决定点 —— 漏了这里,SFTP 页新建的节点会是 ssh,
     /// 保存后当场从 SFTP 页消失。

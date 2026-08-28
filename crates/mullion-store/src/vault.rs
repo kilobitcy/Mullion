@@ -2330,6 +2330,12 @@ port = 7891
         }
         // A:开着,手上是这一刻的快照。
         let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        // A 先自己存过一次。**这一步是必要的**:`save` 结尾若不把两个基准
+        // 对齐到刚写出去那份,`synced_toml` 就永远停在开机那一刻,此后
+        // 「有没落盘的改动」恒为真 —— 重读从此静默停摆,而不是报错。
+        a.set_group(id, None).unwrap();
+        a.save().unwrap();
+        let _ = a.take_reload_notes();
         // B:另一个实例收藏了一个目录并存盘。
         {
             let mut b = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
@@ -2371,22 +2377,29 @@ port = 7891
     /// `if mine != self.synced_toml { return; }` 删掉。
     #[test]
     fn a_batch_of_unsaved_adds_is_never_reloaded_out_from_under_itself() {
+        let named = |n: &str| {
+            let mut d = draft();
+            d.identity.name = n.into();
+            d
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
-        a.add(draft(), "2026-08-28T00:00:00Z");
-        // 中途别的实例写了盘(A 手上那两条还没落盘)。
+        a.add(named("导入-1"), "2026-08-28T00:00:00Z");
+        // 中途别的实例写了盘(A 手上那条还没落盘)。
         {
             let mut b = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
-            b.add(draft(), "2026-08-28T00:00:01Z");
+            b.add(named("别人的"), "2026-08-28T00:00:01Z");
             b.save().unwrap();
         }
-        a.add(draft(), "2026-08-28T00:00:02Z");
+        a.add(named("导入-2"), "2026-08-28T00:00:02Z");
         a.save().unwrap();
         let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
-        assert_eq!(
-            v.list().len(),
-            2,
-            "这一批只进来了一部分 —— 中途被重读吞掉了"
+        // **按名字点名,不数条数**:只数条数的话,「A 的第一条被吞掉、
+        // 换成了 B 那条」同样是 2,断言照样绿(实测过)。
+        let names: Vec<&str> = v.list().iter().map(|r| r.identity.name.as_str()).collect();
+        assert!(
+            names.contains(&"导入-1") && names.contains(&"导入-2"),
+            "这一批里有会话被中途的重读吞掉了:{names:?}"
         );
     }
 
