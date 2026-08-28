@@ -1241,6 +1241,10 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.mem_scroll_bytes = MEM_SCROLL_BYTES.load(Ordering::Relaxed);
     s.scroll_lines = SCROLL_LINES.load(Ordering::Relaxed);
     s.mem_text_bytes = MEM_TEXT_BYTES.load(Ordering::Relaxed);
+    // F190:堆用量不走 gauge —— 计数器是分配器自己在维护的,这里直接读。
+    // 走 `set_mem_gauges` 那条路的话就得有人每帧去抄一遍,而漏抄的症状是
+    // 「堆=0MB」,和「一个字节都没分配」长得一样。
+    s.mem_heap_bytes = crate::heapgauge::live_bytes();
     s.gpu_term_us = GPU_TERM_US.drain();
     s.gpu_egui_us = GPU_EGUI_US.drain();
     s.gpu_split_supported = GPU_SPLIT_SUPPORTED.load(Ordering::Relaxed);

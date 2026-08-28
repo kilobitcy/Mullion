@@ -18,6 +18,7 @@ pub mod frame;
 pub mod frame_fp;
 pub mod gpu;
 pub mod grid;
+pub mod heapgauge;
 pub mod host_key;
 pub mod icon_res;
 pub mod input;
@@ -41,3 +42,12 @@ pub mod theme;
 pub mod tunnels;
 pub mod ui;
 pub mod wev;
+
+/// F190:全局分配器换成带记账的那层。
+///
+/// **必须挂在 lib 上,不能挂在 `main.rs`**:测试链接的是这个 lib、不是那个
+/// bin,挂错地方的话 `heapgauge` 的计数器在整个测试进程里恒为 0,四条守护
+/// 全部退化成「0 落在 0 附近」式的恒绿 —— 而生产里它照样能工作,于是这个
+/// 错误不会有任何症状,直到某天有人依赖那几条测试。
+#[global_allocator]
+static GLOBAL: heapgauge::CountingAlloc = heapgauge::CountingAlloc(&heapgauge::GLOBAL);

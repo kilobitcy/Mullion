@@ -350,6 +350,12 @@ pub struct Snapshot {
     pub scroll_lines: u64,
     /// F169:TextLayer 的 Buffer 估算字节(gauge)。
     pub mem_text_bytes: u64,
+    /// F190:Rust 堆此刻的存活字节(gauge,见 [`crate::heapgauge`])。
+    ///
+    /// **它与上面三笔记账不是并列关系,是包含关系** —— `scroll`/`text` 本身
+    /// 就在这个数里面。它存在的唯一理由是把 `其他:` 那个减法残差按「在不在
+    /// Rust 堆上」切一刀:`primary - 堆` = 驱动/图集/代码段/线程栈那一半。
+    pub mem_heap_bytes: u64,
     /// F168:线程组 CPU(组名, 不归一不封顶百分比)。固定顺序,见 `group_threads`。
     pub thread_groups: Vec<(&'static str, u32)>,
     /// F168:没进分组表的线程原名(Debug 档打出来,防列举式漏项)。
@@ -480,6 +486,7 @@ impl Snapshot {
             mem_scroll_bytes: 0,
             scroll_lines: 0,
             mem_text_bytes: 0,
+            mem_heap_bytes: 0,
             thread_groups: Vec::new(),
             thread_unmapped: Vec::new(),
             thread_available: false,
@@ -759,8 +766,12 @@ pub fn recovered_line(ws_mb: u64) -> String {
     format!("profile.mem.over 回落 ws={ws_mb}MB")
 }
 
-/// F169:`profile.mem` 正文的纯渲染。手工记账三个已知大块 + 显式余量
-/// （用户拍板：不做自定义分配器）。
+/// F169:`profile.mem` 正文的纯渲染。手工记账三个已知大块 + 显式余量。
+///
+/// **F190 推翻了 F169 当初「不上自定义分配器」那条**:那是在没有证据时做的
+/// 成本权衡,而 v0.1.80 的实机日志里 `其他:` 52 分钟单调涨了 86MB 且从不
+/// 回落 —— 而 `其他:` 是个减法残差,里面「我们自己的堆」和「驱动/图集/
+/// 代码段」长得一模一样,两者的下一步却完全相反。`堆=` 段就是那一刀。
 ///
 /// **单位不对称，调用方容易传反**：`process_mb` 已经是 **MB**（进程 RSS，
 /// 整数）；`scroll_b`/`xfer_b`/`text_b` 三个记账块是**字节**，函数内部按
@@ -790,6 +801,7 @@ pub fn mem_parts(
     kind: crate::diag::MemKind,
     primary_mb: u64,
     ws_mb: Option<u64>,
+    heap_b: u64,
     scroll_b: u64,
     xfer_b: u64,
     text_b: u64,
@@ -806,15 +818,21 @@ pub fn mem_parts(
         (crate::diag::MemKind::Rss, _) => String::new(),
     };
     let label = kind.label();
+    // F190:`堆=` **不进减法**,它与三笔记账是包含关系不是并列关系(见
+    // `Snapshot::mem_heap_bytes`)。摆在 `=` 左边、跟 commit/ws 一起,是为了
+    // 让「读者拿它去减 primary」这件事看起来天经地义,而拿它去减 `其他:`
+    // 则一眼就不对 —— 后者会把 scroll/text 减掉两次。
+    let heap = heap_b >> 20;
     if accounted <= primary_mb {
         format!(
-            "{label}={primary_mb}MB{ws} = scroll:{scroll} xfer:{xfer} text:{text} 其他:{}",
+            "{label}={primary_mb}MB{ws} 堆={heap}MB = scroll:{scroll} xfer:{xfer} \
+             text:{text} 其他:{}",
             primary_mb - accounted
         )
     } else {
         format!(
-            "{label}={primary_mb}MB{ws} = scroll:{scroll} xfer:{xfer} text:{text} \
-             其他:0(记账超出{label} {}MB)",
+            "{label}={primary_mb}MB{ws} 堆={heap}MB = scroll:{scroll} xfer:{xfer} \
+             text:{text} 其他:0(记账超出{label} {}MB)",
             accounted - primary_mb
         )
     }
@@ -1135,6 +1153,7 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
                 s.mem_kind,
                 s.mem_process_mb,
                 s.mem_ws_mb,
+                s.mem_heap_bytes,
                 s.mem_scroll_bytes,
                 xfer_buf_bytes,
                 s.mem_text_bytes
@@ -1179,8 +1198,9 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         // 排查记账模型用的原始字节(mem 行报的是取整 MB)。`mem_process_mb`
         // 换算回字节只是为了单位一致,不代表比 MB 口径更精确。
         lines.push(format!(
-            "profile.mem.delta rss={}B scroll={}B xfer={}B text={}B",
+            "profile.mem.delta rss={}B heap={}B scroll={}B xfer={}B text={}B",
             s.mem_process_mb.saturating_mul(1024 * 1024),
+            s.mem_heap_bytes,
             s.mem_scroll_bytes,
             xfer_buf_bytes,
             s.mem_text_bytes
@@ -2551,24 +2571,32 @@ mod tests {
         use crate::diag::MemKind;
         // 正常:340 = 128 + 0 + 16 + 196。
         assert_eq!(
-            mem_parts(MemKind::Rss, 340, None, 128 << 20, 0, 16 << 20),
-            "rss=340MB = scroll:128 xfer:0 text:16 其他:196"
+            mem_parts(MemKind::Rss, 340, None, 200 << 20, 128 << 20, 0, 16 << 20),
+            "rss=340MB 堆=200MB = scroll:128 xfer:0 text:16 其他:196"
         );
         // 全零记账:全进其他。
         assert_eq!(
-            mem_parts(MemKind::Rss, 50, None, 0, 0, 0),
-            "rss=50MB = scroll:0 xfer:0 text:0 其他:50"
+            mem_parts(MemKind::Rss, 50, None, 0, 0, 0, 0),
+            "rss=50MB 堆=0MB = scroll:0 xfer:0 text:0 其他:50"
         );
         // 负余量:记账 168MB > 主数 100MB,超出 68 要显式打出来。
         assert_eq!(
-            mem_parts(MemKind::Rss, 100, None, 128 << 20, 24 << 20, 16 << 20),
-            "rss=100MB = scroll:128 xfer:24 text:16 其他:0(记账超出rss 68MB)"
+            mem_parts(
+                MemKind::Rss,
+                100,
+                None,
+                170 << 20,
+                128 << 20,
+                24 << 20,
+                16 << 20
+            ),
+            "rss=100MB 堆=170MB = scroll:128 xfer:24 text:16 其他:0(记账超出rss 68MB)"
         );
         // 分支边界:记账恰好等于主数。余量 0 是**如实的 0**,不是「超出 0MB」
         // —— 少了这条,把 `<=` 写成 `<` 三条断言全不变红(恒绿缺口)。
         assert_eq!(
-            mem_parts(MemKind::Rss, 144, None, 128 << 20, 0, 16 << 20),
-            "rss=144MB = scroll:128 xfer:0 text:16 其他:0"
+            mem_parts(MemKind::Rss, 144, None, 144 << 20, 128 << 20, 0, 16 << 20),
+            "rss=144MB 堆=144MB = scroll:128 xfer:0 text:16 其他:0"
         );
     }
 
@@ -2579,8 +2607,16 @@ mod tests {
     #[test]
     fn mem_parts_renders_commit_and_ws_on_windows() {
         assert_eq!(
-            mem_parts(crate::diag::MemKind::Commit, 428, Some(289), 0, 0, 5 << 20),
-            "commit=428MB(ws 289) = scroll:0 xfer:0 text:5 其他:423"
+            mem_parts(
+                crate::diag::MemKind::Commit,
+                428,
+                Some(289),
+                96 << 20,
+                0,
+                0,
+                5 << 20
+            ),
+            "commit=428MB(ws 289) 堆=96MB = scroll:0 xfer:0 text:5 其他:423"
         );
     }
 
@@ -2590,8 +2626,16 @@ mod tests {
     #[test]
     fn mem_parts_renders_a_single_number_when_there_is_no_working_set() {
         assert_eq!(
-            mem_parts(crate::diag::MemKind::Rss, 155, None, 0, 0, 5 << 20),
-            "rss=155MB = scroll:0 xfer:0 text:5 其他:150"
+            mem_parts(
+                crate::diag::MemKind::Rss,
+                155,
+                None,
+                40 << 20,
+                0,
+                0,
+                5 << 20
+            ),
+            "rss=155MB 堆=40MB = scroll:0 xfer:0 text:5 其他:150"
         );
     }
 
@@ -2600,8 +2644,16 @@ mod tests {
     #[test]
     fn mem_parts_says_n_a_when_the_working_set_could_not_be_sampled() {
         assert_eq!(
-            mem_parts(crate::diag::MemKind::Commit, 428, None, 0, 0, 5 << 20),
-            "commit=428MB(ws n/a) = scroll:0 xfer:0 text:5 其他:423"
+            mem_parts(
+                crate::diag::MemKind::Commit,
+                428,
+                None,
+                96 << 20,
+                0,
+                0,
+                5 << 20
+            ),
+            "commit=428MB(ws n/a) 堆=96MB = scroll:0 xfer:0 text:5 其他:423"
         );
     }
 
@@ -2620,24 +2672,29 @@ mod tests {
                 crate::diag::MemKind::Commit,
                 400,
                 Some(100),
+                200 << 20,
                 128 << 20,
                 24 << 20,
                 16 << 20
             ),
-            "commit=400MB(ws 100) = scroll:128 xfer:24 text:16 其他:232"
+            "commit=400MB(ws 100) 堆=200MB = scroll:128 xfer:24 text:16 其他:232"
         );
     }
 
-    /// F176:`profile.mem` 行按快照的口径渲染,两个新字段确实接到了行上。
+    /// F176/F190:`profile.mem` 行按快照的口径渲染,三个新字段确实接到了
+    /// 行上。
     ///
     /// 自证会变红:把 `render_lines` 里传给 `mem_parts` 的 `s.mem_ws_mb`
-    /// 写死成 `None` —— 行里会变成 `(ws n/a)`,断言当场抓住。
+    /// 写死成 `None`(行里会变成 `(ws n/a)`),或把 `s.mem_heap_bytes` 写死
+    /// 成 `0` —— 后者是 F190 唯一测得着的接线点,而它写死之后日志照写、
+    /// 格式照对,只是那个数恒为 `堆=0MB`,与「一个字节都没分配」长得一样。
     #[test]
-    fn the_mem_line_carries_the_working_set_from_the_snapshot() {
+    fn the_mem_line_carries_the_working_set_and_the_heap_from_the_snapshot() {
         let mut s = busy_snapshot();
         s.mem_process_mb = 428;
         s.mem_kind = crate::diag::MemKind::Commit;
         s.mem_ws_mb = Some(289);
+        s.mem_heap_bytes = 96 << 20;
         s.mem_scroll_bytes = 0;
         s.xfer_running = 0;
         s.mem_text_bytes = 5 << 20;
@@ -2648,7 +2705,7 @@ mod tests {
             .expect("应有 profile.mem 行");
         assert_eq!(
             mem,
-            "profile.mem commit=428MB(ws 289) = scroll:0 xfer:0 text:5 其他:423"
+            "profile.mem commit=428MB(ws 289) 堆=96MB = scroll:0 xfer:0 text:5 其他:423"
         );
     }
 
