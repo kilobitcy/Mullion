@@ -1716,19 +1716,13 @@ pub fn content(
     out
 }
 
-/// SFTP v3 的 mtime 是 Unix 秒。用 `time` crate 格式化 —— 它已在依赖里。
+/// SFTP v3 的 mtime 是 Unix 秒,按**本机时区**画(F186)。
+///
+/// 偏移取自 `localtime::offset()`(进程启动时取的那一次),换算与格式化在
+/// `localtime::format_unix` 里 —— 那边是纯函数,时区相关的判据在开发机上
+/// 才测得着。
 fn mtime_text(secs: u32) -> String {
-    match time::OffsetDateTime::from_unix_timestamp(secs as i64) {
-        Ok(dt) => format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}",
-            dt.year(),
-            dt.month() as u8,
-            dt.day(),
-            dt.hour(),
-            dt.minute()
-        ),
-        Err(_) => "—".into(),
-    }
+    crate::localtime::format_unix(secs, crate::localtime::offset())
 }
 
 #[cfg(test)]

@@ -43,7 +43,11 @@ egui = "0.30"
 egui-wgpu = "0.30"
 egui-winit = "0.30"
 rfd = "0.15"
-time = { version = "0.3", features = ["formatting"] }
+# `local-offset` 是 F186(SFTP 修改时间按本机时区显示)要的。它在 **Unix 上
+# 只在单线程进程里返回得出值**(取 `localtime_r` 的 soundness 保护),所以
+# `main` 必须在建 tokio 运行时、起看门狗**之前**取一次 —— 见 `localtime.rs`。
+# Windows 走 `GetTimeZoneInformation`,没有这个限制。
+time = { version = "0.3", features = ["formatting", "local-offset"] }
 # 日志 facade(0 依赖)。接了它,wgpu/wgpu-hal/naga/winit/glyphon/russh 的内部诊断
 # 才会落进我们自己的 mullion.log —— GUI 子系统没控制台、Windows 事件日志又不记录
 # 进程挂起,这是唯一能拿到的现场。见 ADR-008。

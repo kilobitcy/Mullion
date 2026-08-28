@@ -21,6 +21,7 @@ pub mod grid;
 pub mod host_key;
 pub mod icon_res;
 pub mod input;
+pub mod localtime;
 pub mod logx;
 pub mod pane;
 pub mod profile;

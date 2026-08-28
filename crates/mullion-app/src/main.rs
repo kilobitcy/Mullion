@@ -22,6 +22,12 @@ fn main() {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
+    // F186:本机时区偏移。**必须在起任何线程之前取** —— Unix 上
+    // `current_local_offset()` 只在单线程进程里成功(见 `localtime` 模块文档),
+    // 起了 tokio 运行时或看门狗之后再取恒返回 Err,SFTP 的修改时间就会退回
+    // UTC 显示。这一步不写日志(logx 还没 init),说明留到下面补记。
+    let tz_note = mullion_app::localtime::init();
+
     // F155:日志档位来自 settings.toml。**必须在 logx::init 之前读** ——
     // 档位决定了 facade 的 max_level,init 之后再改就晚了。
     //
@@ -42,6 +48,7 @@ fn main() {
     if let Some(note) = settings_note {
         mullion_app::logx::line(&format!("settings.toml:{note}"));
     }
+    mullion_app::logx::line(&tz_note);
     // 环境快照 + 看门狗:卡死时靠它说出「卡在哪个阶段、卡了多久、内存多少」,
     // 不必去翻 Windows 事件日志(它根本不记录 GUI 进程挂起)。
     mullion_app::diag::log_startup_env(env!("CARGO_PKG_VERSION"));
