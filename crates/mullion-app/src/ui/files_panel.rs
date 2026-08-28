@@ -1721,7 +1721,7 @@ pub fn content(
 /// 偏移取自 `localtime::offset()`(进程启动时取的那一次),换算与格式化在
 /// `localtime::format_unix` 里 —— 那边是纯函数,时区相关的判据在开发机上
 /// 才测得着。
-fn mtime_text(secs: u32) -> String {
+pub(crate) fn mtime_text(secs: u32) -> String {
     crate::localtime::format_unix(secs, crate::localtime::offset())
 }
 

@@ -142,12 +142,32 @@ mod tests {
         }
     }
 
-    /// 没 `init` 过时回落 UTC —— 不 panic。文件面板画不出来比时间差几小时
-    /// 严重得多。
+    /// 文件面板那一列**真的走记下来的偏移**,不是自己另开一条 UTC 的路。
+    ///
+    /// 这条补的是一个实测漏掉的口子:上面两条只钉 `format_unix` 这个纯函数,
+    /// 把 `mtime_text` 改成 `format_unix(secs, UtcOffset::UTC)` 之后
+    /// `cargo test --workspace` **全绿** —— 而那正好等于这次修复没做。
+    /// 前后两层的判据必须各扎一次。
+    ///
+    /// **本测试二进制里唯一一处动全局 `OFFSET` 的地方。** `OnceLock` 只能设
+    /// 一次、测试又是并行跑的,多一处就会互相抢、按调度顺序随机红。别的用例
+    /// 要不同偏移就调 `format_unix` 那个纯函数版本。
+    ///
+    /// 自证会变红:把 `mtime_text` 里的 `crate::localtime::offset()` 换成
+    /// `time::UtcOffset::UTC`。
     #[test]
-    fn a_process_that_never_captured_an_offset_falls_back_to_utc() {
-        // 注意:这条**不调** `init()`。`OnceLock` 是进程级的,调了会污染
-        // 同一个测试二进制里别的用例(而且顺序不可控)。
-        assert_eq!(offset(), UtcOffset::UTC);
+    fn the_files_panel_column_renders_through_the_captured_offset() {
+        // 设之前:没 `init` 过就是 UTC —— 时区取不着只该让时间戳差几小时,
+        // 不该 panic 让整个文件面板画不出来。
+        assert_eq!(offset(), UtcOffset::UTC, "没设过时该回落 UTC");
+
+        let east8 = UtcOffset::from_hms(8, 0, 0).expect("UTC+8");
+        OFFSET.set(east8).expect("本二进制里只该有这一处设它");
+        assert_eq!(offset(), east8);
+        assert_eq!(
+            crate::ui::files_panel::mtime_text(1_787_963_400),
+            "2026-08-29 08:30",
+            "面板那一列没走记下来的偏移 —— 东八区用户看到的每个文件都早 8 小时"
+        );
     }
 }
