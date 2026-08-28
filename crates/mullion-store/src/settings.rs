@@ -107,6 +107,60 @@ pub struct Settings {
     /// 存在时应覆盖这里 —— 排障时不必先进 GUI 改设置。
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
+    /// F187:文件面板**本地栏**的收藏夹。**全局一份,不挂会话。**
+    ///
+    /// 与远端书签(`SftpPrefs::bookmarks`,挂在 `SessionRecord` 上)相反:
+    /// `D:\work` 是**这台 Windows 机器**上的目录,跟连的是哪台远端毫无关系。
+    /// 挂在会话下的代价是同一个本地目录要在每条会话里各收一次,而用户的心智
+    /// 模型是「我的常用文件夹」(F154 当初照着远端书签的样子做,是错的)。
+    ///
+    /// **为什么放这里而不是 `sessions.toml`**:同 `font_family` 那条理由 ——
+    /// 本地路径是本机偏好,导出会话给同事(F46)不该把 `D:\我的项目` 带走。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_bookmarks: Vec<crate::sftp::Bookmark>,
+    /// F187:老库里各会话名下的 `SftpPrefs::local_bookmarks` 已经并进来了没有。
+    ///
+    /// **必须有这个标记,不能靠「每次启动都合一遍」**:那样确实幂等,但用户
+    /// 取消收藏之后,下次启动会从没清理的会话记录里原样长回来 —— 一个删不掉
+    /// 的收藏,而且看不出原因。
+    #[serde(default)]
+    pub local_bookmarks_migrated: bool,
+}
+
+impl Settings {
+    /// F187:收一个本地目录。去重判据与会话书签共用 `vault::push_deduped`
+    /// (按 `path`)—— 分叉的话点「取消收藏」会看起来没反应。
+    pub fn add_local_bookmark(&mut self, mark: crate::sftp::Bookmark) {
+        crate::vault::push_deduped(&mut self.local_bookmarks, mark);
+    }
+
+    /// F187:取消收藏。按路径相等匹配,同 [`Self::add_local_bookmark`]。
+    pub fn remove_local_bookmark(&mut self, path: &str) {
+        self.local_bookmarks.retain(|b| b.path != path);
+    }
+
+    /// F187:把老库里各会话名下的本地书签并进全局列表,**只做一次**。
+    ///
+    /// 返回真正并进来的条数;已经并过则**一条都不看**,直接返回 0。
+    ///
+    /// 调用方在「返回值 > 0」**或**「调用前标记本来是假」时都要存盘 —— 只看
+    /// 条数的话,一个从来没收藏过本地目录的用户永远置不上标记,每次启动都白
+    /// 跑一趟(而且哪天他在老版本里收过的东西被别的机器同步过来,又会被当成
+    /// 首次迁移)。
+    pub fn merge_local_bookmarks(
+        &mut self,
+        old: impl IntoIterator<Item = crate::sftp::Bookmark>,
+    ) -> usize {
+        if self.local_bookmarks_migrated {
+            return 0;
+        }
+        let before = self.local_bookmarks.len();
+        for mark in old {
+            self.add_local_bookmark(mark);
+        }
+        self.local_bookmarks_migrated = true;
+        self.local_bookmarks.len() - before
+    }
 }
 
 fn default_font_pt() -> f32 {
@@ -130,6 +184,10 @@ impl Default for Settings {
             tmux_bootstrap: true,
             shell_osc7_bootstrap: true,
             log_level: LogLevel::Info,
+            local_bookmarks: Vec::new(),
+            // 全新用户没有老数据要并,但标记仍从 `false` 起 —— 让首次启动
+            // 走一遍(空)迁移再置上,两条路(有老库/没老库)不分叉。
+            local_bookmarks_migrated: false,
         }
     }
 }
@@ -460,6 +518,106 @@ mod tests {
         let back = load(dir.path());
         assert_eq!(back.settings.log_level, LogLevel::Info);
         assert!(back.note.is_some(), "档位名不认识却一声不吭");
+    }
+
+    fn mark(name: &str, path: &str) -> crate::sftp::Bookmark {
+        crate::sftp::Bookmark {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+
+    /// F187:本地收藏夹存在**全局**设置里,写盘再读回还在。
+    ///
+    /// 这是本片的正事 —— 改之前它挂在 `SessionRecord` 下,同一个 `D:\work`
+    /// 要在每条会话里各收一次。
+    #[test]
+    fn local_bookmarks_are_global_and_survive_a_round_trip() {
+        let dir = tmp();
+        let mut s = Settings::default();
+        s.add_local_bookmark(mark("工程", r"D:\work"));
+        s.add_local_bookmark(mark("另一个名字", r"D:\work")); // 同路径 → 去重
+        s.add_local_bookmark(mark("下载", r"C:\Users\me\Downloads"));
+        save(dir.path(), &s).expect("写盘");
+
+        let back = load(dir.path()).settings;
+        assert_eq!(back.local_bookmarks.len(), 2, "同一路径收两次该去重");
+        assert_eq!(back.local_bookmarks[0].path, r"D:\work");
+        assert_eq!(back.local_bookmarks[0].name, "工程", "去重该留先来的那条");
+        assert_eq!(back.local_bookmarks[1].path, r"C:\Users\me\Downloads");
+    }
+
+    /// 取消收藏按路径匹配,且**要留得住** —— 光有上一条的话,「remove 是空
+    /// 实现」这种错法照样全绿。
+    #[test]
+    fn removing_a_local_bookmark_sticks_across_a_round_trip() {
+        let dir = tmp();
+        let mut s = Settings::default();
+        s.add_local_bookmark(mark("工程", r"D:\work"));
+        s.add_local_bookmark(mark("下载", r"C:\dl"));
+        s.remove_local_bookmark(r"D:\work");
+        save(dir.path(), &s).expect("写盘");
+        let back = load(dir.path()).settings;
+        assert_eq!(back.local_bookmarks.len(), 1);
+        assert_eq!(back.local_bookmarks[0].path, r"C:\dl");
+    }
+
+    /// F187 迁移:老库里各会话名下的本地书签并进来一次,**跨路径去重**。
+    ///
+    /// 自证会变红:把 `merge_local_bookmarks` 里的 `add_local_bookmark`
+    /// 换成 `self.local_bookmarks.push(mark)`(第二条断言:两条会话各收过
+    /// 同一个 `D:\work`,不去重就会并出两条)。
+    #[test]
+    fn the_old_per_session_lists_are_merged_in_once() {
+        let mut s = Settings::default();
+        let n = s.merge_local_bookmarks([
+            mark("工程", r"D:\work"),
+            mark("下载", r"C:\dl"),
+            // 另一条会话下重复收过的同一个目录
+            mark("工程", r"D:\work"),
+        ]);
+        assert_eq!(n, 2, "并进来两条(第三条与第一条同路径)");
+        assert!(s.local_bookmarks_migrated, "迁移完必须置标记");
+    }
+
+    /// **迁移只做一次。** 已经并过之后,用户取消掉的收藏不许从没清理的会话
+    /// 记录里长回来 —— 那是一个删不掉的收藏,而且看不出原因。
+    ///
+    /// 自证会变红:删掉 `merge_local_bookmarks` 开头那个
+    /// `if self.local_bookmarks_migrated { return 0; }`。
+    #[test]
+    fn a_bookmark_the_user_deleted_does_not_grow_back_on_the_next_launch() {
+        let mut s = Settings::default();
+        s.merge_local_bookmarks([mark("工程", r"D:\work")]);
+        s.remove_local_bookmark(r"D:\work");
+        // 下次启动:会话库里那份老数据还在(我们不改 sessions.toml)。
+        let n = s.merge_local_bookmarks([mark("工程", r"D:\work")]);
+        assert_eq!(n, 0);
+        assert!(
+            s.local_bookmarks.is_empty(),
+            "取消掉的收藏又长回来了 —— 用户删不掉它,也看不出为什么"
+        );
+    }
+
+    /// 老的 `settings.toml`(没有这两个键)读得进来:空列表 + **未迁移**。
+    ///
+    /// 标记要是默认 `true`,所有老用户的本地收藏在升级那一刻静默清零 ——
+    /// 而这正是用户报的第 1 条。
+    #[test]
+    fn a_settings_file_written_before_local_bookmarks_existed_is_not_yet_migrated() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "schema_version = 1\nfont_pt = 10.0\n",
+        )
+        .expect("写老格式文件");
+        let back = load(dir.path());
+        assert!(back.note.is_none(), "老文件不该有 note:{:?}", back.note);
+        assert!(back.settings.local_bookmarks.is_empty());
+        assert!(
+            !back.settings.local_bookmarks_migrated,
+            "老文件必须被当成「还没迁移」,否则升级那一刻本地收藏静默清零"
+        );
     }
 
     /// 档位的磁盘写法是小写英文单词 —— 这是要被人手改的文件,形态本身是契约。

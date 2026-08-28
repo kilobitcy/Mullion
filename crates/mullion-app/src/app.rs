@@ -2342,6 +2342,7 @@ impl App {
     ///
     /// **F148 起不再自动摆回标签**(D1):启动摆什么由用户在恢复列表里选。
     fn finish_store_open(&mut self, history: Vec<mullion_store::HistoryEntry>) {
+        self.migrate_local_bookmarks_into_settings();
         // 启动时先算一次,否则第一次打开会话管理器全是无色。
         self.refresh_appearance();
 
@@ -2360,6 +2361,64 @@ impl App {
             self.ui.session_manager_open = true;
         } else {
             self.ui.history = Some(crate::ui::history::HistoryDraft::new(rows));
+        }
+    }
+
+    /// F187:把老库里挂在各会话下的本地书签并进全局设置,**只做一次**。
+    ///
+    /// 放在 `finish_store_open` 里而不是 `resumed`:老数据在会话库里,而库到
+    /// 那一刻才刚打开(主密码那条路上更晚)。
+    ///
+    /// **库没打开就一步都不做。** 库打不开(主密码错、文件损坏)时照样置上
+    /// 「已迁移」标记的话,用户手上那份老收藏就永久没人再看一眼了 —— 而这
+    /// 恰恰是本次要修的那类丢数据。
+    fn migrate_local_bookmarks_into_settings(&mut self) {
+        if self.settings.local_bookmarks_migrated {
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let old: Vec<mullion_store::Bookmark> = store
+            .list()
+            .iter()
+            .flat_map(|r| r.sftp.local_bookmarks.iter().cloned())
+            .collect();
+        let n = self.settings.merge_local_bookmarks(old);
+        // 标记本身也要落盘,否则下次启动又来一遍(那样用户取消掉的收藏会
+        // 从没清理的会话记录里长回来)。条数为 0 时也存。
+        match self.save_settings() {
+            Ok(()) => crate::logx::line(&format!("F187:本地收藏夹已并入全局设置,{n} 条")),
+            // 不打断启动、也不弹错:这是后台迁移,用户没主动点过什么。下次
+            // 启动会再试一次(标记没存下来,内存里的置位随进程一起消失)。
+            Err(e) => {
+                crate::logx::line(&format!("F187:本地收藏夹迁移没能存下来({e}),下次启动重试"))
+            }
+        }
+    }
+
+    /// 写 `settings.toml`。`apply_settings_action` 与 F187 的书签写入共用 ——
+    /// 各写一遍的话,以后往里加一步(比如夹紧某个字段)必然漏改一处。
+    fn save_settings(&self) -> Result<(), String> {
+        crate::shell::store::config_dir()
+            .ok_or_else(|| "定位不到配置目录".to_string())
+            .and_then(|d| {
+                mullion_store::settings::save(&d, &self.settings).map_err(|e| e.to_string())
+            })
+    }
+
+    /// F187:把全局本地收藏夹推给**每一个**已开标签的面板副本。
+    ///
+    /// 收藏夹是全局的,但每个标签的 `PanelFrame` 各持一份画图用的副本 ——
+    /// 只更新当前标签的话,在标签 1 收的目录要等标签 2 重开才看得见,而
+    /// 用户完全有理由以为「☆ 点了没反应」。遍历全部标签,不挑活动的那个
+    /// (同 `drive_*` 那条纪律)。
+    fn sync_local_bookmarks_to_tabs(&mut self) {
+        let list = self.settings.local_bookmarks.clone();
+        for tab in self.tabs.iter_mut() {
+            if let Some(files) = tab.content.files_panel_mut() {
+                files.local_bookmarks = list.clone();
+            }
         }
     }
 
@@ -2507,11 +2566,7 @@ impl App {
                 self.take_settings_draft();
                 self.apply_font();
                 self.apply_log_level();
-                let saved = crate::shell::store::config_dir()
-                    .ok_or_else(|| "定位不到配置目录".to_string())
-                    .and_then(|d| {
-                        mullion_store::settings::save(&d, &self.settings).map_err(|e| e.to_string())
-                    });
+                let saved = self.save_settings();
                 // 写失败要说 —— 设置是用户刚点了确定的显式动作,静默失败
                 // = 这次改了、下次启动又变回去,而他不知道为什么。
                 if let Err(e) = saved {
@@ -3813,9 +3868,14 @@ impl App {
     /// 存盘立刻做(`store.save()`),不攒着 —— 收藏是随手动作,用户不会为它
     /// 去点「保存」;攒到退出再写的话,一次崩溃就全没了。
     ///
-    /// F154:`column` 决定落在哪一份列表上。两栏的路径空间毫无关系
+    /// F154/F187:`column` 决定落在哪一份列表上。两栏的路径空间毫无关系
     /// (`D:\work` 和 `/var/log`),混着存会让路径条那句「当前 cwd 在不在
     /// 列表里」的现算判据在两栏之间串味。
+    ///
+    /// **两栏的存放位置也不同**(F187):远端书签挂会话(`/srv/app` 是那台
+    /// 机器上的东西),本地书签是**全局**的、存 `settings.toml` —— `D:\work`
+    /// 在这台 Windows 上跟连的是谁没有关系。于是本地那一支不需要
+    /// `SessionId`,快速连接开的标签也能收藏。
     fn add_bookmark(
         &mut self,
         generation: u64,
@@ -3823,28 +3883,35 @@ impl App {
         name: String,
         column: crate::files::PanelColumn,
     ) {
+        let mark = mullion_store::Bookmark {
+            name,
+            path: path.clone(),
+        };
+        if column == crate::files::PanelColumn::Local {
+            self.settings.add_local_bookmark(mark);
+            if let Err(e) = self.save_settings() {
+                self.ui.set_error(format!("收藏没能存下来:{e}"));
+                return;
+            }
+            self.sync_local_bookmarks_to_tabs();
+            mark_ui_dirty!(self.ui_dirty);
+            return;
+        }
         let Some(sid) = self
             .tabs
             .by_generation(generation)
             .and_then(|t| t.session_id)
         else {
-            // UI 已经按 `BookmarkView::can_edit` 把 ☆ 置灰了,走到这儿说明
-            // 接线被改坏了 —— 不静默吞。
-            log::warn!("收到 BookmarkAdd 但标签没有 SessionId,已忽略");
+            // UI 已经按 `BookmarkView::can_edit` 把远端栏的 ☆ 置灰了,走到
+            // 这儿说明接线被改坏了 —— 不静默吞。
+            log::warn!("收到远端 BookmarkAdd 但标签没有 SessionId,已忽略");
             return;
         };
-        let mark = mullion_store::Bookmark {
-            name,
-            path: path.clone(),
-        };
-        let local = column == crate::files::PanelColumn::Local;
         if let Some(store) = self.store.as_mut() {
-            let r = if local {
-                store.add_local_bookmark(sid, mark.clone())
-            } else {
-                store.add_bookmark(sid, mark.clone())
-            };
-            if let Err(e) = r.and_then(|_| store.save()) {
+            if let Err(e) = store
+                .add_bookmark(sid, mark.clone())
+                .and_then(|_| store.save())
+            {
                 self.ui.set_error(e.to_string());
                 return;
             }
@@ -3854,43 +3921,42 @@ impl App {
             .by_generation_mut(generation)
             .and_then(|t| t.content.files_panel_mut())
         {
-            let list = if local {
-                &mut files.local_bookmarks
-            } else {
-                &mut files.bookmarks
-            };
             // 去重判据与 store 侧同一条(按路径),两边不许分叉。
-            if !list.iter().any(|b| b.path == mark.path) {
-                list.push(mark);
+            if !files.bookmarks.iter().any(|b| b.path == mark.path) {
+                files.bookmarks.push(mark);
             }
         }
         mark_ui_dirty!(self.ui_dirty);
     }
 
-    /// F139/F154:取消收藏。按路径相等匹配 —— 书签的身份就是路径。
-    /// `column` 的含义同 `add_bookmark`。
+    /// F139/F154/F187:取消收藏。按路径相等匹配 —— 书签的身份就是路径。
+    /// `column` 的含义同 `add_bookmark`(含两栏存放位置不同那条)。
     fn remove_bookmark(
         &mut self,
         generation: u64,
         path: String,
         column: crate::files::PanelColumn,
     ) {
+        if column == crate::files::PanelColumn::Local {
+            self.settings.remove_local_bookmark(&path);
+            if let Err(e) = self.save_settings() {
+                self.ui.set_error(format!("取消收藏没能存下来:{e}"));
+                return;
+            }
+            self.sync_local_bookmarks_to_tabs();
+            mark_ui_dirty!(self.ui_dirty);
+            return;
+        }
         let Some(sid) = self
             .tabs
             .by_generation(generation)
             .and_then(|t| t.session_id)
         else {
-            log::warn!("收到 BookmarkRemove 但标签没有 SessionId,已忽略");
+            log::warn!("收到远端 BookmarkRemove 但标签没有 SessionId,已忽略");
             return;
         };
-        let local = column == crate::files::PanelColumn::Local;
         if let Some(store) = self.store.as_mut() {
-            let r = if local {
-                store.remove_local_bookmark(sid, &path)
-            } else {
-                store.remove_bookmark(sid, &path)
-            };
-            if let Err(e) = r.and_then(|_| store.save()) {
+            if let Err(e) = store.remove_bookmark(sid, &path).and_then(|_| store.save()) {
                 self.ui.set_error(e.to_string());
                 return;
             }
@@ -3900,11 +3966,7 @@ impl App {
             .by_generation_mut(generation)
             .and_then(|t| t.content.files_panel_mut())
         {
-            if local {
-                files.local_bookmarks.retain(|b| b.path != path);
-            } else {
-                files.bookmarks.retain(|b| b.path != path);
-            }
+            files.bookmarks.retain(|b| b.path != path);
         }
         mark_ui_dirty!(self.ui_dirty);
     }
@@ -5996,7 +6058,9 @@ impl App {
                     files: crate::ui::files_panel::PanelFrame::new(
                         sftp_prefs.default_local.as_deref(),
                         sftp_prefs.bookmarks,
-                        sftp_prefs.local_bookmarks,
+                        // F187:本地收藏夹是全局的,来自 settings.toml ——
+                        // 不再从会话记录里取(那份老数据启动时已并进来了)。
+                        self.settings.local_bookmarks.clone(),
                         // F139:没有会话记录就没地方存书签,☆ 置灰。
                         session_id.is_some(),
                     ),
@@ -6100,7 +6164,8 @@ impl App {
                 files: crate::ui::files_panel::PanelFrame::new(
                     sftp_prefs.default_local.as_deref(),
                     sftp_prefs.bookmarks,
-                    sftp_prefs.local_bookmarks,
+                    // F187:同上,全局收藏夹。
+                    self.settings.local_bookmarks.clone(),
                     // F139:没有会话记录就没地方存书签,☆ 置灰。
                     session_id.is_some(),
                 ),
@@ -11955,16 +12020,72 @@ mod tests {
         );
     }
 
-    /// F139:☆ 收藏必须**当场存盘**。这两个方法各写两处(store 一份、
-    /// `PanelFrame` 内存一份),漏掉 `store.save()` 的症状是「收藏了、星星也
-    /// 变实心了,关掉客户端再开就没了」——全程零报错,只有重启才发现。
+    /// F187:老库里各会话名下的本地书签,迁移必须挂在**会话库打开之后**,
+    /// 而且**库没打开就一步都不做**。
+    ///
+    /// 两条各有一种坏法,都静默:
+    /// - 挂在 `resumed` 里 → 那时 `self.store` 还是 `None`(主密码那条路上更晚),
+    ///   一条老书签都读不到;
+    /// - 库打不开(密码错、文件损坏)时照样置上「已迁移」标记并存盘 →
+    ///   用户手上那份老收藏从此再没人看一眼,而这正是本次要修的那类丢数据。
+    ///
+    /// 源码切片:这两条都要一个真的 `App` + 一个真的会话库才跑得起来。
+    /// **先剥注释行** —— 上面这段和函数里的说明都写着这几个标识符。
+    ///
+    /// 自证会变红:把 `finish_store_open` 里那句迁移调用删掉;或把
+    /// `migrate_local_bookmarks_into_settings` 里的 `let Some(store)` 早退
+    /// 挪到 `merge_local_bookmarks` 之后。
+    #[test]
+    fn the_local_bookmark_migration_waits_for_the_store_and_gives_up_if_it_never_opened() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let opened = strip(body_of(production, "fn finish_store_open("));
+        assert!(
+            opened.contains("self.migrate_local_bookmarks_into_settings();"),
+            "迁移没挂在会话库打开之后 —— 老书签一条都读不到,而标记会照置"
+        );
+
+        let mig = strip(body_of(
+            production,
+            "fn migrate_local_bookmarks_into_settings(",
+        ));
+        let guard = mig
+            .find("let Some(store) = self.store.as_ref() else {")
+            .expect("库没打开时必须一步都不做");
+        let merge = mig
+            .find("merge_local_bookmarks(")
+            .expect("迁移没调 merge_local_bookmarks —— 那它什么都没干");
+        assert!(
+            guard < merge,
+            "「库没打开」的早退排在合并之后 —— 库打不开时会置上已迁移标记,\
+             用户那份老收藏从此没人再看一眼"
+        );
+    }
+
+    /// F139/F187:☆ 收藏必须**当场存盘**,而且两栏各存各的地方。
+    ///
+    /// 漏掉存盘的症状是「收藏了、星星也变实心了,关掉客户端再开就没了」——
+    /// 全程零报错,只有重启才发现。F187 之后这件事有**两条**路径:远端书签
+    /// 走会话库(`store.save()`),本地书签走全局设置(`save_settings()`)。
+    /// 只钉其中一条的话,另一条整个删掉照样绿。
     ///
     /// 跟 `touched_store` 那几条同款扎源码:这两个方法要一个真的 `App` 才调
     /// 得动,而 `App` 在无头环境里造不出来。切片必须先切到函数体内 ——
     /// `include_str!("app.rs")` 读的是同一个文件,本测试自己也含
     /// `store.save()` 这个串,不缩范围就永远绿(第五类恒绿模式)。
     ///
-    /// 自证会变红:把 `add_bookmark` 里的 `.and_then(|_| store.save())` 删掉。
+    /// 自证会变红:把 `add_bookmark` 里的 `.and_then(|_| store.save())` 删掉;
+    /// 或把本地那一支的 `self.save_settings()` 删掉;或把
+    /// `sync_local_bookmarks_to_tabs()` 换成只改当前标签。
     #[test]
     fn bookmarking_writes_through_to_disk_immediately() {
         let src = include_str!("app.rs");
@@ -11982,17 +12103,22 @@ mod tests {
             );
             assert!(
                 body.contains("store.save()"),
-                "{f} 只改了内存没存盘:收藏在重启后消失(F139)"
+                "{f} 的远端那一支只改了内存没存盘:收藏在重启后消失(F139)"
             );
-            // F154:两栏各有一条 store 路径和一份帧内镜像,漏掉任何一条的
-            // 症状都是「某一栏的 ☆ 点了没反应 / 重启后没了」,且不报错。
+            // F154/F187:两栏各有一条持久化路径和一份帧内镜像,漏掉任何
+            // 一条的症状都是「某一栏的 ☆ 点了没反应 / 重启后没了」,不报错。
             assert!(
                 body.contains("PanelColumn::Local"),
                 "{f} 没有按栏分流 —— 本地栏的收藏会写进远端那份列表"
             );
             assert!(
-                body.contains("local_bookmarks"),
-                "{f} 没碰本地那份镜像 —— 本地栏收藏后这一帧不会变实心"
+                body.contains("self.save_settings()"),
+                "{f} 的本地那一支没存 settings.toml —— 本地收藏重启后消失(F187)"
+            );
+            assert!(
+                body.contains("self.sync_local_bookmarks_to_tabs()"),
+                "{f} 没把全局收藏夹推给其余标签 —— 在标签 1 收的目录,\
+                 标签 2 要重开才看得见(F187)"
             );
         }
     }

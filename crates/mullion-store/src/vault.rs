@@ -466,36 +466,6 @@ impl Vault {
         Ok(())
     }
 
-    /// F154:给一条会话加一个**本地**书签(文件面板本地栏路径条上的 ☆)。
-    ///
-    /// 与 `add_bookmark` 的差别只有落在哪个列表上,去重规则(按 `path`)
-    /// 共用 `push_deduped` —— 两边分叉的话,一边改了去重判据另一边不改,
-    /// 症状是某一栏点「取消收藏」看起来没反应。
-    pub fn add_local_bookmark(
-        &mut self,
-        id: SessionId,
-        mark: crate::sftp::Bookmark,
-    ) -> Result<(), StoreError> {
-        let rec = self
-            .sessions
-            .iter_mut()
-            .find(|s| s.id == id)
-            .ok_or(StoreError::NotFound(id))?;
-        push_deduped(&mut rec.sftp.local_bookmarks, mark);
-        Ok(())
-    }
-
-    /// F154:取消收藏本地目录。按路径相等匹配,同 `remove_bookmark`。
-    pub fn remove_local_bookmark(&mut self, id: SessionId, path: &str) -> Result<(), StoreError> {
-        let rec = self
-            .sessions
-            .iter_mut()
-            .find(|s| s.id == id)
-            .ok_or(StoreError::NotFound(id))?;
-        rec.sftp.local_bookmarks.retain(|b| b.path != path);
-        Ok(())
-    }
-
     pub fn groups(&self) -> &[GroupRecord] {
         &self.groups
     }
@@ -927,7 +897,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> 
 ///
 /// 远端与本地两份列表共用这一条:分叉的话,一边改了去重判据另一边不改,
 /// 症状是某一栏点「取消收藏」看起来没反应。
-fn push_deduped(list: &mut Vec<crate::sftp::Bookmark>, mark: crate::sftp::Bookmark) {
+///
+/// F187 之后 `settings.rs` 里那份全局本地书签也用它 —— 同上,判据只能有一条。
+pub(crate) fn push_deduped(list: &mut Vec<crate::sftp::Bookmark>, mark: crate::sftp::Bookmark) {
     if !list.iter().any(|b| b.path == mark.path) {
         list.push(mark);
     }
@@ -2159,67 +2131,39 @@ port = 7891
         );
     }
 
-    /// F154:本地栏的书签是**另一份列表**,和远端那份互不干扰,而且同样要
-    /// 存得进盘 —— 只改内存的症状是「收藏了,重开客户端没了」,全程不报错。
+    /// F187:每条会话名下那份老的本地书签**必须仍然读得出来** —— 迁移
+    /// (`Settings::merge_local_bookmarks`)的输入就是它。
     ///
-    /// 自证会变红(实测过):把 `add_local_bookmark` 里的
-    /// `rec.sftp.local_bookmarks` 写成 `rec.sftp.bookmarks`(复制粘贴改漏一个
-    /// 字段名的那类真实失误)—— 「同一路径收藏两次该去重」当场断言失败。
+    /// F154 当初把本地书签挂在会话下,F187 把它搬去了全局 `settings.toml`。
+    /// 写入侧的两个方法(`add_local_bookmark`/`remove_local_bookmark`)随之
+    /// 删掉了,**但字段留着**:老库里的数据要在首次启动时被读一遍并进去。
+    /// 这条钉的就是那个读取口。
+    ///
+    /// 自证会变红:把 `SftpPrefs::local_bookmarks` 上的 `#[serde(default)]`
+    /// 连同字段一起删掉(反序列化当场失败)。
     #[test]
-    fn local_bookmarks_are_a_separate_list_that_survives_save_and_reopen() {
+    fn the_old_per_session_local_bookmarks_are_still_readable_for_the_migration() {
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
             let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
             id = v.add(draft(), "2026-08-21T00:00:00Z");
-            v.add_bookmark(
-                id,
-                crate::sftp::Bookmark {
-                    name: "远端日志".into(),
-                    path: "/var/log".into(),
-                },
-            )
-            .unwrap();
-            v.add_local_bookmark(
-                id,
-                crate::sftp::Bookmark {
-                    name: "工程".into(),
-                    path: r"D:\work".into(),
-                },
-            )
-            .unwrap();
-            // 同一路径再来一次:去重规则与远端同一条(按 path)。
-            v.add_local_bookmark(
-                id,
-                crate::sftp::Bookmark {
-                    name: "另一个名字".into(),
-                    path: r"D:\work".into(),
-                },
-            )
-            .unwrap();
-            v.save().unwrap();
-        }
-        {
-            let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
-            let rec = v.get(id).unwrap();
-            assert_eq!(rec.sftp.local_bookmarks.len(), 1, "同一路径收藏两次该去重");
-            assert_eq!(rec.sftp.local_bookmarks[0].path, r"D:\work");
-            assert_eq!(
-                rec.sftp.local_bookmarks[0].name, "工程",
-                "去重要留先来的那条,不是拿后来的覆盖"
-            );
-            assert_eq!(rec.sftp.bookmarks.len(), 1, "本地收藏动作污染了远端列表");
-            assert_eq!(rec.sftp.bookmarks[0].path, "/var/log");
-            v.remove_local_bookmark(id, r"D:\work").unwrap();
+            // 写入侧的方法已随 F187 删掉,直接摆字段 —— 这条测的是**读**。
+            let rec = v.sessions.iter_mut().find(|r| r.id == id).unwrap();
+            rec.sftp.local_bookmarks.push(crate::sftp::Bookmark {
+                name: "工程".into(),
+                path: r"D:\work".into(),
+            });
             v.save().unwrap();
         }
         let v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
         let rec = v.get(id).unwrap();
-        assert!(
-            rec.sftp.local_bookmarks.is_empty(),
-            "取消收藏没存盘 —— 删掉的本地书签重启后会回来"
+        assert_eq!(
+            rec.sftp.local_bookmarks.len(),
+            1,
+            "老数据读不出来了 —— 升级时用户的本地收藏会静默清零"
         );
-        assert_eq!(rec.sftp.bookmarks.len(), 1, "删本地书签把远端那条也删了");
+        assert_eq!(rec.sftp.local_bookmarks[0].path, r"D:\work");
     }
 
     /// F154:老的 TOML(没有 `local_bookmarks` 这个键)读得进来,且是空列表。

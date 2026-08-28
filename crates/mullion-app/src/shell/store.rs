@@ -137,19 +137,10 @@ impl SessionStore {
         self.vault.remove_bookmark(id, path)
     }
 
-    /// F154:**本地**栏路径条上的 ☆。另一份列表,见 `Vault::add_local_bookmark`。
-    pub fn add_local_bookmark(
-        &mut self,
-        id: SessionId,
-        mark: mullion_store::Bookmark,
-    ) -> Result<(), StoreError> {
-        self.vault.add_local_bookmark(id, mark)
-    }
-
-    /// F154:取消收藏本地目录。见 `Vault::remove_local_bookmark`。
-    pub fn remove_local_bookmark(&mut self, id: SessionId, path: &str) -> Result<(), StoreError> {
-        self.vault.remove_local_bookmark(id, path)
-    }
+    // F187:本地栏的 ☆ 不再走会话库 —— 它是全局的,存 `settings.toml`
+    // (见 `mullion_store::Settings::local_bookmarks`)。原先这里的
+    // `add_local_bookmark` / `remove_local_bookmark` 一并删掉:留着的话,
+    // 谁顺手调一次就往一份**再也没人读**的列表里写,而且不报错。
 
     /// F121:左栏拖拽排序。见 `Vault::move_session`。
     pub fn move_session(

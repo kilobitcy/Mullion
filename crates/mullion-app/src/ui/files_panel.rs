@@ -1533,7 +1533,9 @@ pub fn sidebar(
                         panel_focused && frame.active_column == PanelColumn::Local,
                         BookmarkView {
                             list: &frame.local_bookmarks,
-                            can_edit: frame.session_bound,
+                            // F187:同 `content()` 里本地栏那处 —— 全局收藏夹,
+                            // 没有 `SessionId` 也能收。两处必须一起改。
+                            can_edit: true,
                         },
                         0,
                         &mut ui_state.files_cols,
@@ -1685,7 +1687,10 @@ pub fn content(
                     panel_focused && frame.active_column == PanelColumn::Local,
                     BookmarkView {
                         list: &frame.local_bookmarks,
-                        can_edit: frame.session_bound,
+                        // F187:本地收藏夹是**全局**的(存 settings.toml),
+                        // 不挂会话 —— 所以没有 `SessionId` 也照样能收。
+                        // 快速连接开的标签、SFTP 独立标签都该能用 ☆。
+                        can_edit: true,
                     },
                     0,
                     cols,
@@ -2927,6 +2932,59 @@ mod tests {
         assert!(
             star.x < mid,
             "实心星画在了右半边(远端栏)—— 本地栏读的不是本地那份列表"
+        );
+    }
+
+    /// F187:**本地栏的 ☆ 不看 `session_bound`。** 本地收藏夹是全局的
+    /// (存 `settings.toml`),没有 `SessionId` 也有地方存 —— 快速连接开的
+    /// 标签、SFTP 独立标签都该能收藏本机目录。
+    ///
+    /// 远端栏相反:`/srv/app` 只能挂在那条会话记录下,没有记录就没地方存,
+    /// ☆ 仍要置灰。**一条测试同时钉两栏** —— 分两条写的话,把
+    /// `can_edit: true` 一路刷到远端栏也只红一条,而那是另一个方向的 bug。
+    ///
+    /// 自证会变红:把本地栏的 `can_edit: true` 改回 `frame.session_bound`。
+    #[test]
+    fn the_local_star_works_without_a_session_while_the_remote_one_stays_greyed() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = PanelFrame {
+            remote: PaneState::new(RemotePath::from_bytes(b"/srv".to_vec())),
+            local: PaneState::new(RemotePath::from_bytes(b"/home/me".to_vec())),
+            bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
+            // 关键前提:这个标签**没绑会话记录**(快速连接)。
+            session_bound: false,
+            active_column: PanelColumn::default(),
+        };
+        frame.remote.load = Load::Ready;
+        frame.local.load = Load::Ready;
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+                })
+                .shapes;
+        }
+        let star = find_text_pos(&shapes, "☆").expect("两栏都该画出空心星");
+        let mid = ctx.screen_rect().center().x;
+        assert!(
+            star.x < mid,
+            "找到的第一颗星不在左半边(本地栏)—— 断言会打偏"
+        );
+
+        // 点本地栏的 ☆:`can_edit` 为假的话 egui 会把按钮禁用,点了没动作。
+        let mut out = (None, None);
+        let _ = ctx.run(click_at(star), |ctx| {
+            out = content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+        });
+        let (_remote_out, local_out) = out;
+        assert!(
+            matches!(local_out, Some(FileAction::BookmarkAdd { .. })),
+            "没绑会话时本地栏的 ☆ 点不动 —— 而本地收藏夹是全局的,有地方存;\
+             实际收到:{local_out:?}"
         );
     }
 
