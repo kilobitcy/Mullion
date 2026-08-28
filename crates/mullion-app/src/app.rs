@@ -5187,6 +5187,27 @@ impl App {
             .map(|g| g.id)
     }
 
+    /// 「点哪块就切到哪块」(F33)。左键划选(F18)与右键粘贴(F185)共用。
+    ///
+    /// 提成函数**是为了让两个入口不会各写各的**:两边都得在「按键要干的正事」
+    /// 之前切焦点(锚点 / 落点都取 `effective_focus()`),而右键那一支此前
+    /// 压根没切,分屏下右键会把剪贴板贴进上一块 pane —— 没有报错、没有日志,
+    /// 只有内容出现在错的地方。
+    ///
+    /// 指针不在任何 pane 上(点在分界线 / 内缩留白上)则什么都不做:那种时候
+    /// 把焦点清掉或乱指一块都比保持原样更糟。
+    fn focus_pane_under_cursor(&mut self) {
+        let Some(id) = self.pane_at(self.cursor_px) else {
+            return;
+        };
+        if let Some(ws) = self.active_ws_mut() {
+            if ws.focus() != id {
+                ws.set_focus(id);
+                mark_ui_dirty!(self.ui_dirty);
+            }
+        }
+    }
+
     /// 焦点 pane 的几何。鼠标格换算、划选都基于它。
     fn focused_geom(&self) -> Option<PaneGeom> {
         let a = self.active.as_ref()?;
@@ -8187,19 +8208,18 @@ impl ApplicationHandler<UserEvent> for App {
                 (MouseButton::Left, ElementState::Pressed) => {
                     // 点哪块就切到哪块(F33)。必须在 selection_press 之前:
                     // 划选的锚点要落在新焦点 pane 的坐标系里。
-                    if let Some(id) = self.pane_at(self.cursor_px) {
-                        if let Some(ws) = self.active_ws_mut() {
-                            if ws.focus() != id {
-                                ws.set_focus(id);
-                                mark_ui_dirty!(self.ui_dirty);
-                            }
-                        }
-                    }
+                    self.focus_pane_under_cursor();
                     self.selection_press();
                 }
                 (MouseButton::Left, ElementState::Released) => self.selection_release(),
                 // 右键直接贴,不弹菜单(Windows 终端习惯,F18 交互口径)。
-                (MouseButton::Right, ElementState::Pressed) => self.request_paste(),
+                (MouseButton::Right, ElementState::Pressed) => {
+                    // F185:切焦点必须在 `request_paste` **之前** —— 粘贴的落点是
+                    // `effective_focus()`,顺序反了就会把内容贴进上一块 pane,
+                    // 而用户看到的是自己刚点过的这一块。分屏下这是静默错投。
+                    self.focus_pane_under_cursor();
+                    self.request_paste();
+                }
                 _ => {}
             },
             WindowEvent::Resized(size) => {
@@ -11241,6 +11261,41 @@ mod tests {
     }
 
     // ------------------------------------------------ F18 划选自动滚动
+
+    /// F185:右键粘贴前必须先把焦点切到指针底下那块 pane,**且顺序不能反**。
+    ///
+    /// 改这条之前右键那一支压根没切焦点:分屏下在 pane 2 上右键,内容贴进
+    /// 上一次有焦点的 pane 1。没有报错、没有日志,只有字出现在错的地方。
+    /// 顺序反过来同样坏 —— `request_paste` 的落点取 `effective_focus()`,
+    /// 先贴再切焦点等于一次都没修。
+    ///
+    /// 源码切片是因为整条路在 `WindowEvent::MouseInput` 里,要真窗口才发得出。
+    /// **必须先剥注释行**:上面这段说明和分支里的注释都写着这两个函数名,
+    /// 不剥的话断言拿自己的解释当证据,把两句调用全删掉照样绿。
+    ///
+    /// 自证会变红:删掉右键分支里的 `self.focus_pane_under_cursor();`,
+    /// 或把它挪到 `self.request_paste();` 之后。
+    #[test]
+    fn a_right_click_takes_focus_before_it_pastes_so_the_text_lands_where_you_clicked() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        let arm = arm_of(production, "(MouseButton::Right, ElementState::Pressed)");
+        let code = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let focus = code
+            .find("self.focus_pane_under_cursor();")
+            .expect("右键没切焦点 —— 分屏下会把剪贴板贴进上一块 pane");
+        let paste = code.find("self.request_paste();").expect("右键不粘贴了?");
+        assert!(
+            focus < paste,
+            "切焦点排在粘贴之后 —— 落点取的是切之前的 effective_focus(),等于没修"
+        );
+    }
 
     /// F18:拖拽出界的自动滚动,判据必须是**焦点 pane 的终端区**,不是整个窗口。
     ///
