@@ -101,7 +101,7 @@ impl Redactor {
             let after = &tail[1..];
             let host_end = after.find(|c: char| !is_host(c)).unwrap_or(after.len());
             let host = &after[..host_end];
-            if user.is_empty() || host.is_empty() {
+            if !looks_like_user_at_host(user, host) {
                 out.push_str(&rest[..at + 1]);
                 rest = &rest[at + 1..];
                 continue;
@@ -205,6 +205,44 @@ impl Redactor {
     }
 }
 
+/// F180:这个 `@` 两边真的是一对「用户名 @ 主机名」吗。
+///
+/// **这道判据存在的理由是自家格式与自家启发式同形。** `profile.pane` 的段是
+/// `in=<字节量>@<脏带表>/<总带数>`(F173),`in=0B@-/6` 与 `in=6.5KB@b11,b23/24`
+/// 长得就是 `user@host` —— 实测 34 分钟的日志里,`0B`/`6.5KB` 被收成用户假名、
+/// 空脏带占位符 `-` 与带号 `b5` 被收成主机假名,184 处 `wev=-`、184 处 `dirty=-`
+/// 全变成同一个 `host#2`,**凭空多出一台主机**;而 `-` 恰恰是三处埋点明定的
+/// 「这一栏是空的」占位符,脱敏正好摧毁了它存在的理由。
+///
+/// **不匹配时整对放行,不许只否掉一边**:一边像字节量就说明这个 `@` 压根不是
+/// 地址,另一边的 `b11` 同样是带号而不是主机名。分开判的话带号照样会被收进
+/// 假名表,换汤不换药。
+///
+/// **单字符 token 一律不收**:即便真有一台单字母主机,泄露量是零,而它与
+/// 占位符 / 分隔符在字符层面不可区分 —— 宁可漏一个零信息量的字符,也不能
+/// 把占位符换成假主机名。
+fn looks_like_user_at_host(user: &str, host: &str) -> bool {
+    collectible(user) && collectible(host) && !is_byte_magnitude(user)
+}
+
+/// 值得进假名表的 token:两个字符以上,且至少含一个 ASCII 字母数字。
+fn collectible(t: &str) -> bool {
+    t.chars().count() >= 2 && t.chars().any(|c| c.is_ascii_alphanumeric())
+}
+
+/// `0B` / `6.5KB` / `180MB` —— 我们自己打出来的字节量。
+///
+/// **只堵 `-` 是不够的**:字节量每个窗口都不一样,每出现一个新值就多分配一个
+/// 用户假名,实测日志里 `user#265`→`#266`→`#267` 逐窗口递增。**假名编号单调
+/// 跑飞本身就是模式匹配抓错东西的信号。**
+fn is_byte_magnitude(t: &str) -> bool {
+    let digits_end = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(digits_end);
+    !num.is_empty() && num.parse::<f64>().is_ok() && matches!(unit, "B" | "KB" | "MB" | "GB" | "TB")
+}
+
 fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
 }
@@ -286,9 +324,18 @@ mod tests {
     #[test]
     fn different_hosts_get_different_aliases() {
         let mut r = Redactor::new();
-        let out = r.line("a@one 与 b@two");
+        let out = r.line("ann@one 与 bob@two");
         assert!(out.contains("host#1") && out.contains("host#2"), "{out}");
         assert!(out.contains("user#1") && out.contains("user#2"), "{out}");
+    }
+
+    /// F180 的**已知代价**,明写出来免得以后被当成 bug 报回来:单字符
+    /// 用户名/主机名不再换假名。真实 SSH 用户名不会只有一个字符,而单个
+    /// 字符的泄露量是零;换来的是占位符 `-`、带号、字节量不再被冒充成主机。
+    #[test]
+    fn a_single_letter_name_is_left_alone_and_that_is_the_deliberate_trade() {
+        let mut r = Redactor::new();
+        assert_eq!(r.line("a@one"), "a@one");
     }
 
     /// 剖面行里全是数字,不该被误伤 —— 误伤了的话这份副本就没法用来
@@ -319,6 +366,75 @@ mod tests {
         let mut r = Redactor::new();
         assert_eq!(r.line("写入 /tmp"), "写入 /tmp");
         assert!(r.line("读取 /home/alice/.ssh/config").contains("path#1"));
+    }
+
+    /// **F180:我们自己打出来的剖面行,脱敏后必须逐字节不变。**
+    ///
+    /// 判据不是手编的字符串,而是**生产渲染器的真实输出** —— 手编的行踩不中
+    /// 「自家格式与自家启发式同形」这种碰撞,那正是这个 bug 从 F155 一路活到
+    /// F173 都没被既有测试抓住的原因(既有的
+    /// `a_profile_line_of_pure_numbers_is_left_alone` 用的就是手编行,而且恰好
+    /// 挑了一条不含 `@` 的)。这条测试也因此不会随格式演进而失效:`profile.pane`
+    /// 以后再加字段,它跟着变。
+    ///
+    /// 自证会变红:把 `looks_like_user_at_host` 换回原来的
+    /// `!user.is_empty() && !host.is_empty()`。
+    #[test]
+    fn every_line_our_own_profiler_emits_survives_redaction_byte_for_byte() {
+        use crate::profile::{PaneDetail, Snapshot};
+        let mut r = Redactor::new();
+        // 三种真实形态:空脏带(`@-/24`)、单带、多带 —— 前两种是实测里被
+        // 吃掉的那两种(184 处 `-` 和一批带号变成了假主机)。
+        for (bands, total, bytes) in [(0u64, 24u32, 0u64), (1 << 5, 24, 6656), (0b1010, 24, 512)] {
+            let mut s = Snapshot::empty();
+            s.window_ms = 5_000;
+            s.frames = 5;
+            s.cpu_bp = Some(63);
+            s.main_cpu_bp = Some(240);
+            s.cpu_cores = 16;
+            s.mem_process_mb = 180;
+            s.thread_available = true;
+            s.thread_groups = vec![("tokio", 3_100), ("其他", 900)];
+            s.thread_unmapped = vec![("wgpu-poll".to_string(), 500)];
+            s.pane_detail = vec![PaneDetail {
+                id: 1,
+                in_bytes: bytes,
+                dirty_bands: bands,
+                band_total: total,
+                frames: 5,
+            }];
+            for line in crate::profile::render_lines(&s, true) {
+                assert_eq!(
+                    r.line(&line),
+                    line,
+                    "剖面行被脱敏器改写了 —— 这份副本的唯一用途就是读这些行"
+                );
+            }
+        }
+        assert!(
+            r.map.is_empty(),
+            "剖面行里不该有任何东西值得起假名,却收了:{:?}",
+            r.map
+        );
+    }
+
+    /// F180:`-` 是三处埋点明定的空表占位符,一旦被收进假名表,
+    /// `replace_known_bare_tokens` 会把**整份日志里所有孤立的 `-`** 换掉。
+    ///
+    /// 自证会变红:把 `collectible` 的 `>= 2` 改成 `>= 1`。
+    #[test]
+    fn the_empty_table_placeholder_never_becomes_a_fake_host() {
+        let mut r = Redactor::new();
+        let pane = r.line("profile.pane p0 in=0B@-/24 frames=3");
+        assert_eq!(pane, "profile.pane p0 in=0B@-/24 frames=3");
+        // 就算它先在别处出现过,后面那些 `dirty=-`/`wev=-` 也必须留着 ——
+        // 「后面什么都没有」= 埋点根本没接上,与「这一窗口确实一次没响」
+        // 必须在日志里长得不一样。
+        let overview = r.line("wake=1x/rr=sched:0,evt:1 dirty=- wev=- curdup=0");
+        assert!(
+            overview.contains("dirty=- wev=-"),
+            "空表占位符被换成了假主机名:{overview}"
+        );
     }
 
     /// 说明头必须点明「这是假名」且「可能漏」。收到日志的人要知道自己
