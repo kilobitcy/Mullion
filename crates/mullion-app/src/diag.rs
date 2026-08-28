@@ -1066,21 +1066,27 @@ fn watchdog_loop(
             // 档位。挂在门里的话,error 档下计数器一路累积,而停滞报警行读的
             // 是同一批 static —— 同一个数字在不同档位下含义不同,是排障时
             // 最坏的一类坑。渲染(格式化)才是贵的那步,只有它需要关在门里。
-            let cpu_sample = cpu.sample(window_ms.saturating_mul(1_000_000));
             let mut snap = take_snapshot(window_ms);
-            snap.cpu_bp = cpu_sample.map(|c| c.process_bp);
-            snap.main_cpu_bp = cpu_sample.map(|c| c.main_thread_bp);
-            // 核数与采样成不成功无关(首个窗口没有基线,但核数早就知道),
-            // 所以不挂在 `cpu_sample` 上 —— 挂上去的话第一行会报 `cores=n/a`。
-            snap.cpu_cores = cpu.cores();
+            let window_ns = window_ms.saturating_mul(1_000_000);
+
+            // F183:**`cpu.sample()` 必须排在其余探针之后。**
+            //
+            // 它读的是进程累计 CPU,读点决定了 `total=` 覆盖哪一段。排在前面
+            // 的话,本窗口 GPU/线程枚举的开销要到下一个窗口才被 `total=` 算
+            // 进去,而线程表里 watchdog 那一项**当场**就含着它 —— 于是同一
+            // 行里出现「某个线程比整个进程还忙」。v0.1.79 实机 331 个窗口里
+            // 有 63 个(19%)是这个倒挂,最坏一处 watchdog 8.65% 对 total 2.47%。
+            // 归因表在尖峰窗口上不可读,而尖峰窗口正是要读它的时候。
+            // 守护:tests::the_process_cpu_is_read_after_the_probes_it_should_account_for。
+            let t0 = elapsed_us();
             if let Some(g) = gpu.sample() {
                 snap.gpu_available = true;
                 snap.gpu_engines = g.engines;
             }
+            let t_gpu = elapsed_us();
             match threads.sample() {
                 Some(list) => {
                     snap.thread_available = true;
-                    let window_ns = window_ms.saturating_mul(1_000_000);
                     // F179:与 `total=`/`main=` 同一个换算,不许另起一份 ——
                     // 同一行里两个数不同口径正是这条要修的东西。
                     let pcts: Vec<(String, u32)> = list
@@ -1095,6 +1101,21 @@ fn watchdog_loop(
                 }
                 None => snap.thread_available = false,
             }
+            let t_threads = elapsed_us();
+            let cpu_sample = cpu.sample(window_ns);
+            snap.cpu_bp = cpu_sample.map(|c| c.process_bp);
+            snap.main_cpu_bp = cpu_sample.map(|c| c.main_thread_bp);
+            // 核数与采样成不成功无关(首个窗口没有基线,但核数早就知道),
+            // 所以不挂在 `cpu_sample` 上 —— 挂上去的话第一行会报 `cores=n/a`。
+            snap.cpu_cores = cpu.cores();
+            // F181:三段自陈。**用 `Some` 而不是留 `None`** —— 这三趟都跑过了,
+            // 「跑了但快到量不出来」是 0us,与「没跑」是两回事(同本文件
+            // 其余「采不到 ≠ 0」的处置,只是这里反过来:确实跑了就得报数)。
+            snap.probe_us = crate::profile::ProbeCost {
+                cpu_us: Some(elapsed_us().saturating_sub(t_threads)),
+                gpu_us: Some(t_gpu.saturating_sub(t0)),
+                threads_us: Some(t_threads.saturating_sub(t_gpu)),
+            };
             // F177:预算闸问在 Info 日志门**之外**,两个理由:
             // 这是 `warn!`(warn 档下也该响),且它必须绕开 `render_lines`
             // 开头那道空闲门 —— 空载正是 N5 那次要查的场景,而空闲门会
@@ -1802,5 +1823,83 @@ mod tests {
             "预算闸必须问在 Info 日志门之前:关在门里的话,warn 档听不见警报,\
              且它会连带被 render_lines 的空闲门挡掉 —— 而空载正是要查的场景"
         );
+    }
+
+    /// 本文件的**代码**部分(剥掉注释、切掉测试模块),给源码切片判据用。
+    ///
+    /// **剥注释不是洁癖,是这类判据的必要条件。** 下面那条顺序判据第一次
+    /// 写出来就是红的:它 `find("cpu.sample(")` 找到的是解释这条规矩的那句
+    /// 注释里的 `cpu.sample()`,位置在真正的调用点之前几十行 —— 于是「判据
+    /// 本身」被「判据的说明文字」判成了违规。反过来更坏:注释里随手写一句
+    /// `gpu.sample()` 就能让顺序判据永远绿。
+    fn code_before_tests() -> String {
+        let src = include_str!("diag.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("diag.rs 应有测试模块")];
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// F183:`cpu.sample()` 必须排在 `gpu.sample()` / `threads.sample()` **之后**。
+    ///
+    /// 它读的是进程累计 CPU,读点决定了 `total=` 覆盖哪一段。排在前面的话,
+    /// 本窗口两个探针的开销要到**下一个**窗口才被 `total=` 算进去,而线程表
+    /// 里 watchdog 那一项当场就含着它 —— 同一行里出现「某个线程比整个进程
+    /// 还忙」。v0.1.79 实机 331 个窗口里有 63 个(19%)是这个倒挂,最坏一处
+    /// `watchdog:8.65%` 对 `total=2.47%`,而尖峰窗口恰恰是要读归因表的时候。
+    ///
+    /// **判据用行序,不用「文件里有没有出现某个调用」**:后者对「把两段
+    /// 调换位置」完全恒绿 —— 而调换位置正是唯一会犯的那个错。
+    ///
+    /// `expect` 而不是 `unwrap_or(0)`:三个调用点里任何一个被改名/改签名时,
+    /// 这条判据必须当场炸,而不是拿两个 0 比出个「顺序正确」。
+    ///
+    /// 自证会变红:把 `let cpu_sample = cpu.sample(window_ns);` 连同它下面
+    /// 两行赋值剪切到 `if let Some(g) = gpu.sample()` 之前。
+    #[test]
+    fn the_process_cpu_is_read_after_the_probes_it_should_account_for() {
+        let src = code_before_tests();
+        let gpu = src.find("gpu.sample()").expect("应有 GPU 探针调用点");
+        let threads = src.find("threads.sample()").expect("应有线程探针调用点");
+        let cpu = src.find("cpu.sample(").expect("应有进程 CPU 探针调用点");
+        assert!(
+            cpu > gpu && cpu > threads,
+            "cpu.sample() 必须排在另外两个探针之后:排前面的话本窗口的采样\
+             开销落到下一窗口的 total= 里,而线程表当场就含着它,于是同一行\
+             出现「某个线程比整个进程还忙」(实机 19% 的窗口是这个倒挂)"
+        );
+    }
+
+    /// F181:三段自陈必须落在**各自那一趟**上,不能全挂在同一个起点上。
+    ///
+    /// 这是本轮唯一「写错了照样全绿、日志照样有数、只是数全错」的地方:
+    /// 三个 `saturating_sub` 的被减数抄错一个,读出来就是「GPU 探针 53ms」
+    /// 而真凶是线程枚举 —— 而这三个数存在的**全部理由**就是指认真凶。
+    ///
+    /// 判据:三个减法的被减数必须互不相同,且按 t0 → t_gpu → t_threads
+    /// 顺次推进。源码切片是唯一测得到它的手段(运行期三个数都合法)。
+    ///
+    /// 自证会变红:把 `gpu_us` 那行的 `t_gpu.saturating_sub(t0)` 改成
+    /// `t_threads.saturating_sub(t0)`(复制粘贴时最容易犯的那个错)。
+    #[test]
+    fn each_probe_is_timed_against_its_own_start_not_a_shared_one() {
+        let src = code_before_tests();
+        let block = &src[src.find("snap.probe_us = ").expect("应有自陈赋值")..];
+        let block = &block[..block.find("};").expect("自陈赋值应有结尾")];
+        for (field, expected) in [
+            ("cpu_us", "elapsed_us().saturating_sub(t_threads)"),
+            ("gpu_us", "t_gpu.saturating_sub(t0)"),
+            ("threads_us", "t_threads.saturating_sub(t_gpu)"),
+        ] {
+            let line = block
+                .lines()
+                .find(|l| l.trim_start().starts_with(field))
+                .unwrap_or_else(|| panic!("自陈里没有 {field}:{block}"));
+            assert!(
+                line.contains(expected),
+                "{field} 该量的是它自己那一趟({expected}),得到:{line}"
+            );
+        }
     }
 }

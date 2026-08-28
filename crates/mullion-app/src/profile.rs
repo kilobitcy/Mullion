@@ -362,6 +362,33 @@ pub struct Snapshot {
     pub gpu_egui_us: Counts,
     /// F170:INSIDE_PASSES 拿到了。false → 分层渲染 `分层:n/a`。
     pub gpu_split_supported: bool,
+    /// F181:这一窗口三个探针各自花了多久。
+    pub probe_us: ProbeCost,
+}
+
+/// F181:看门狗三个探针各自的采样耗时(µs)。`None` = 这一趟没跑成。
+///
+/// **看门狗是被测对象的一部分。** 它和事件循环在同一个进程里,`total=` 把
+/// 它算在内 —— v0.1.79 的实机日志(331 个窗口)里 watchdog 线程占了写盘
+/// 窗口全部 CPU 的 32%,p95 4.32%、max 8.65%,而空闲窗口里它**就是** `total=`
+/// 的全部(main 与 tokio 都是 0.00%)。也就是说 N1 那条指标当时量的是
+/// 「应用 + 量它的东西」,后者还占大头。
+///
+/// 但没有任何一行能答「那些毫秒花在哪个探针上」:三个探针里有两个是全系统
+/// 枚举(线程用 `CreateToolhelp32Snapshot`,GPU 用 PDH 的 `\GPU Engine(*)`
+/// 通配),光读源码分不出谁贵 —— 而**猜错就等于白改一版**。这一段就是让
+/// 下一份实机日志自己回答这个问题,不必再编排一次人工测量。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeCost {
+    /// `CpuProbe::sample`(两次 GetProcessTimes/GetThreadTimes,本该极便宜)。
+    pub cpu_us: Option<u64>,
+    /// `GpuProbe::sample`(PDH 通配采集 + 两趟格式化,全系统实例)。
+    pub gpu_us: Option<u64>,
+    /// `ThreadCpuProbe::sample`(F182 之后:大多数窗口只读缓存句柄,
+    /// 每 [`RESCAN_EVERY_WINDOWS`](crate::sysprobe::RESCAN_EVERY_WINDOWS)
+    /// 个窗口才重扫一次 —— 所以这一列**periodic 尖峰是预期的**,
+    /// 尖峰值就是那次全系统快照的价钱)。
+    pub threads_us: Option<u64>,
 }
 
 /// 逐阶段计数。长度与 `diag::Stage` 的变体数一致。
@@ -459,6 +486,7 @@ impl Snapshot {
             gpu_term_us: [0; BUCKETS],
             gpu_egui_us: [0; BUCKETS],
             gpu_split_supported: false,
+            probe_us: ProbeCost::default(),
         }
     }
 
@@ -608,6 +636,15 @@ fn fmt_bp(v: Option<u32>) -> String {
 /// 同 [`fmt_bp`],但读数一定有(线程分组表里「采不到」是整表 `n/a`)。
 fn fmt_bp_value(bp: u32) -> String {
     format!("{}.{:02}%", bp / 100, bp % 100)
+}
+
+/// F181:一个探针的耗时。`None` = 这一趟没跑成 → `n/a`,不是 `0us`。
+///
+/// 复用 [`fmt_us`] 而不是自己写一份:这三个数要跟 `frame=`/`text_prepare=`
+/// 那些段放在一起心算(「探针 41ms 抵得上 20 帧」),两套单位格式会让那种
+/// 对照每次都得先愣一下。
+fn fmt_probe(v: Option<u64>) -> String {
+    v.map_or_else(|| "n/a".to_string(), fmt_us)
 }
 
 /// F165:GPU 引擎占用渲染成 `3D:14%/Copy:3%`。
@@ -1066,11 +1103,21 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
     } else {
         s.cpu_cores.to_string()
     };
+    // F181:采样器自陈。放在 `profile.cpu` 行而不是新起一行,是因为它解释的
+    // 正是同一行的 `total=` —— 看门狗的开销就在那个数里面。另起一行的话
+    // 固定五行变六行,而这三个数脱离 `total=` 也没法读。
+    let probe = format!(
+        "probe=cpu:{}/gpu:{}/thr:{}",
+        fmt_probe(s.probe_us.cpu_us),
+        fmt_probe(s.probe_us.gpu_us),
+        fmt_probe(s.probe_us.threads_us),
+    );
     lines.push(format!(
-        "profile.cpu total={} main={} cores={} | {}",
+        "profile.cpu total={} main={} cores={} {} | {}",
         fmt_bp(s.cpu_bp),
         fmt_bp(s.main_cpu_bp),
         cores,
+        probe,
         groups
     ));
 
@@ -2174,6 +2221,52 @@ mod tests {
             dbg.iter()
                 .any(|l| l.starts_with("profile.cpu.unmapped") && l.contains("wgpu-poll:5.00%")),
             "debug 档要能看见没进分组表的线程"
+        );
+    }
+
+    /// F181:采样器要在自己那一行里报出自己花了多少。
+    ///
+    /// **为什么这条值得一个测试**:实机 v0.1.79 的日志里空闲窗口
+    /// `total=0.92% main=0.00% | watchdog:0.92%` —— 应用本体是 0,那 0.92%
+    /// 全是采样器自己。当时没有任何一行能答「花在三个探针里的哪一个」,
+    /// 于是只能靠读源码猜(两个探针都在做全系统枚举,猜错就是白改一版)。
+    ///
+    /// 判据有两半,少哪半都能让这段静默失效:
+    /// 1. 三个数**分开**报。合成一个总数的话,「该优化线程枚举还是 PDH」
+    ///    这个唯一要回答的问题当场答不了。
+    /// 2. 没跑成报 `n/a` 而不是 `0us`。这条 crate 全局的规矩在这里格外要紧:
+    ///    `0us` 恰好就是「便宜得量不出来」的正常读数,两者同形等于把
+    ///    「探针挂了」伪装成「探针很快」。
+    ///
+    /// 自证会变红:把 `fmt_probe` 的 `None` 分支改成 `"0us"`(第二半红),
+    /// 或把 `probe=` 那段三个数换成一个和(第一半红)。
+    #[test]
+    fn the_sampler_reports_what_each_probe_cost_it_separately() {
+        let mut s = busy_snapshot();
+        s.probe_us = ProbeCost {
+            cpu_us: Some(3),
+            gpu_us: Some(41_000),
+            threads_us: Some(12_500),
+        };
+        let line = render_lines(&s, false)
+            .into_iter()
+            .find(|l| l.starts_with("profile.cpu "))
+            .expect("没有 profile.cpu 行");
+        assert!(
+            line.contains("probe=cpu:3us/gpu:41.0ms/thr:12.5ms"),
+            "三个探针要分开报,合成一个总数就答不了「该优化哪个」:{line}"
+        );
+
+        let mut none = busy_snapshot();
+        none.probe_us = ProbeCost::default();
+        let line = render_lines(&none, false)
+            .into_iter()
+            .find(|l| l.starts_with("profile.cpu "))
+            .expect("没有 profile.cpu 行");
+        assert!(
+            line.contains("probe=cpu:n/a/gpu:n/a/thr:n/a"),
+            "没采到必须是 n/a —— `0us` 恰好是「快得量不出来」的正常读数,\
+             同形等于把探针挂了伪装成探针很快:{line}"
         );
     }
 
