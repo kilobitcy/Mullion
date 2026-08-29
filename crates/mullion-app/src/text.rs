@@ -39,14 +39,74 @@ pub struct RowRun {
     pub spans: Vec<(String, Color)>,
 }
 
-/// 一格的字形 advance 是否可信等于 `cell_w`。
+/// F195:合并判据的容差 —— 一格的 advance 与 `width × cell_w` 的最大允许偏差,
+/// 按 `cell_w` 的比例给。
 ///
-/// 判据是"ASCII 可打印且不是宽字符":等宽字体对这段码位一定有字形、且 advance
-/// 就是我们按 'M' 量出来的那个值。任何别的字符(CJK、制表符号、emoji、带重音的
-/// 拉丁字母)都可能触发 cosmic-text 的字体回退,回退字体的 advance 与 `cell_w`
-/// 没有任何关系 —— 那正是错位的来源,所以它们各自单独定位。
-fn advance_is_cell_wide(cell: &SnapCell) -> bool {
-    cell.width <= 1 && cell.ch.is_ascii() && !cell.ch.is_ascii_control()
+/// 与 [`MAX_MERGED_CELLS`] 是**一对**:偏差逐格累加,最坏漂移是两者之积。
+/// 单看任何一个都判断不了「用户会不会看出来」,守护
+/// `tests::the_tolerance_and_the_cap_keep_worst_case_drift_well_under_a_cell`
+/// 钉的是那个积。
+pub const ADVANCE_EPS_RATIO: f32 = 0.001;
+
+/// F195:一个 run 最多并多少格。见 [`ADVANCE_EPS_RATIO`]。
+pub const MAX_MERGED_CELLS: usize = 128;
+
+/// F195:这一格的字形 advance 是不是**量出来就等于** `width × cell_w`。
+///
+/// # 为什么换掉「是不是 ASCII」
+///
+/// 老判据是"ASCII 可打印且非宽字",其余每格自成一个 run。它安全但过度保守:
+/// 在 tmux 里跑 Claude Code 是满屏框线 `─│┌└`,而这些字符在等宽字体里
+/// **本来就有字形、advance 就是 `cell_w`** —— 却被一律拆成一格一个
+/// `glyphon::Buffer`,一行 120 列就是 120 个。按实测的两项定价,一行
+/// 239KB → 33KB(7.2 倍)。
+///
+/// 新判据直接问那个真正要紧的问题:这个字形排出来占的宽度,跟格子对得上吗。
+/// 对得上就并,对不上就单独站开(回退字体的 advance 与 `cell_w` 没有任何
+/// 关系,并进去就是从那一列起整段错位)。
+///
+/// # 记忆化
+///
+/// 量一次要建一个 `Buffer` 并整形,不能每格都来 —— 按字符记进 `memo`
+/// (同一字符的 `SnapCell::width` 由 unicode-width 决定,是字符的函数,
+/// 所以键只用 char 就够)。换字体族/字号/DPI 时 `cell_w` 变了,全部结论
+/// 作废,`TextLayer::set_font` 里连同整形缓存一起清。
+///
+/// 新字符第一次出现时会在帧路径上整形一次(T3)。这是有界的:一个会话里
+/// 不同字符就那么多,且每个只付一次。
+///
+/// # 配置的字体装不上时会退化成「一格一个 run」
+///
+/// 判据问的是「字形宽度对不对得上格子」。字体族不存在时 cosmic-text 会回退,
+/// 而回退的多半是**比例字体** —— 本机(无 Google Sans Code)实测:
+/// `M` 13.80、`i` 4.44、`x` 9.47、`─` 9.63。一格都对不上,于是**连 ASCII 都
+/// 不再合并**,一行 120 列就是 120 个 buffer。
+///
+/// 这不是判据写错了:那种情况下逐格定位才是**对**的(合并会让整行错位,
+/// 那正是 F195 之前 CJK 的老毛病)。但它是一道性能悬崖,且触发条件
+/// (字体没装)在日志里不显眼。实机若见 `text:` 与 `reshape=miss:` 同时
+/// 异常高,先查字体族名拼对没有。
+fn advance_fits_its_cells(
+    fs: &mut FontSystem,
+    memo: &mut std::collections::HashMap<char, bool>,
+    font_px: f32,
+    line_h: f32,
+    family: &str,
+    cell_w: f32,
+    cell: &SnapCell,
+) -> bool {
+    // 期望宽是 `width × cell_w`;width 为 0 时期望 0,而真画出东西的格
+    // advance 不可能是 0 —— 与其让它走一遍必然为假的测量,不如在这里挡住,
+    // 顺便让「有人为了放宽判据把 0 宽放进来」这件事需要显式删掉这一行。
+    if cell.width < 1 {
+        return false;
+    }
+    let want = f32::from(cell.width) * cell_w;
+    let eps = cell_w * ADVANCE_EPS_RATIO;
+    *memo.entry(cell.ch).or_insert_with(|| {
+        let got = measure_advance(fs, font_px, line_h, Some(family), cell.ch);
+        (got - want).abs() <= eps
+    })
 }
 
 /// 把一行切成逐格对齐的 run(**CJK 对齐的核心**)。
@@ -58,8 +118,14 @@ fn advance_is_cell_wide(cell: &SnapCell) -> bool {
 /// 字体,那个字体的 advance 与我们按 'M' 量的 `cell_w` 无关,于是从那一列起
 /// **整行的字与格子全线错开**(用户报的"粘贴的内容和光标之间有空白")。
 ///
-/// 切法:[`advance_is_cell_wide`] 为真的连续格并成一个 run(纯 ASCII 的一行
-/// 仍然只有一个 run,不增加 buffer 数);其余每格自成一个 run。
+/// 切法:`fits` 为真的连续格并成一个 run,其余每格自成一个 run。run 长度
+/// 封顶在 [`MAX_MERGED_CELLS`](累积漂移要有界)。
+///
+/// `fits` **注入**而不是写死:生产传的是 [`advance_fits_its_cells`](要一个
+/// `FontSystem`),而这个函数的一批纯单测扎的是**切分机制**(断在哪、列号
+/// 怎么算、空白怎么剪、组字区间怎么劈),与判据是什么无关。写成方法或
+/// 直接调 `advance_fits_its_cells`,那批断言就得各自背一个字体系统 ——
+/// 本项目的架构约束(无头可测)第一条就是不许这么干。
 ///
 /// 列号取**枚举下标**而不是"已输出字符数":宽字符占两格,后者会让宽字之后的
 /// 所有内容左移一格。
@@ -77,7 +143,11 @@ fn advance_is_cell_wide(cell: &SnapCell) -> bool {
 /// 直白),这会把跨区间的 run 自然劈成两段。宽字符只要有一列落在区间内就整字
 /// 都不画(半个宽字是花屏),用**列区间重叠**判定而不是单列包含,这样宽字左
 /// 半未被区间直接命中、但右半(spacer 对应的那一列)被命中时,仍能整字剔除。
-pub fn row_to_runs(cells: &[SnapCell], hidden: Option<(u16, u16)>) -> Vec<RowRun> {
+pub fn row_to_runs(
+    cells: &[SnapCell],
+    hidden: Option<(u16, u16)>,
+    fits: &mut impl FnMut(&SnapCell) -> bool,
+) -> Vec<RowRun> {
     let mut runs: Vec<RowRun> = Vec::new();
     // 当前正在攒的 run:(起始列, 该 run 覆盖的格)。
     let mut open: Option<(u16, Vec<SnapCell>)> = None;
@@ -109,7 +179,15 @@ pub fn row_to_runs(cells: &[SnapCell], hidden: Option<(u16, u16)>) -> Vec<RowRun
                 continue;
             }
         }
-        if advance_is_cell_wide(cell) {
+        if fits(cell) {
+            // 满了就先收掉再另起:漂移逐格累加,不封顶的话一行几百列能漂过
+            // 半格,而画面只是「行尾那几个字有点歪」,没有任何东西会报错。
+            if open
+                .as_ref()
+                .is_some_and(|(_, g)| g.len() >= MAX_MERGED_CELLS)
+            {
+                flush(&mut open, &mut runs);
+            }
             match open.as_mut() {
                 Some((_, group)) => group.push(*cell),
                 None => open = Some((col, vec![*cell])),
@@ -309,6 +387,11 @@ pub struct TextLayer {
     /// 整形时优先从这里取 —— 每帧新建上千个 `Buffer` 就是陷阱 T3,而且滚动
     /// 场景(每帧每行都变)不回收会比改之前更慢。
     pool: Vec<(Buffer, u32)>,
+    /// F195:`advance_fits_its_cells` 的记忆化表(字符 → 这一格并不并得进
+    /// run)。量一次要建 `Buffer` 并整形,不记住就是每帧每格来一遍。
+    ///
+    /// `cell_w` 变了全部结论作废 —— 与整形缓存一起在 `set_font` 里清。
+    advance_memo: std::collections::HashMap<char, bool>,
     /// 临时槽:IME 组字行的正文 + 拼音串 overlay。**它们绝不进 `cache`**
     /// (理由见 `shaped_cache::plan_row` 的文档)。当池子用,不每帧清空。
     temp: Vec<(Buffer, u32)>,
@@ -416,6 +499,7 @@ impl TextLayer {
             cache: crate::shaped_cache::ShapedCache::new(),
             row_fp: crate::row_fp::RowFingerprints::new(),
             pool: Vec::new(),
+            advance_memo: std::collections::HashMap::new(),
             temp: Vec::new(),
             cell_w,
             cell_h: line_h,
@@ -458,6 +542,10 @@ impl TextLayer {
         // `pool` / `temp` 不必清:整形路径每次都调 `set_metrics`,池里的
         // buffer 不会带着陈旧 metrics 上屏。
         self.cache.clear(&mut self.pool);
+        // F195:合并判据是拿旧的 `cell_w` 和旧字体量出来的,一条都不能留 ——
+        // 留着的话新字体下该断开的地方仍然并着,整行从那一列起错位,而内容
+        // 没变、指纹不变,**没有自愈路径**。
+        self.advance_memo.clear();
     }
 
     /// 当前生效的族名,交给 cosmic-text 的那一份(`None` 时是内置默认)。
@@ -559,7 +647,9 @@ impl TextLayer {
         let row_fp = &mut self.row_fp;
         let pool = &mut self.pool;
         let temp = &mut self.temp;
+        let advance_memo = &mut self.advance_memo;
         let (cell_w, cell_h) = (self.cell_w, self.cell_h);
+        let font_px = self.font_px;
 
         cache.begin_frame();
         row_fp.begin_frame();
@@ -618,7 +708,24 @@ impl TextLayer {
                         // 不存在,不必先摘再整形。旧 buffer 的回收全部收口在
                         // `cache.end_frame`(滚出视野时),稳态是平的。
                         let mut runs: Vec<CachedRun<Buffer>> = Vec::new();
-                        for run in row_to_runs(p.snap.row(row), hidden) {
+                        // F195:合并判据现建现丢 —— 它借着 `fs`,而下面
+                        // `shape_run` 也要 `fs`。`row_to_runs` 返回的是自有的
+                        // `Vec<RowRun>`,借用到这一句就结束了。
+                        let row_runs = {
+                            let mut fits = |c: &SnapCell| {
+                                advance_fits_its_cells(
+                                    fs,
+                                    advance_memo,
+                                    font_px,
+                                    cell_h,
+                                    &family_owned,
+                                    cell_w,
+                                    c,
+                                )
+                            };
+                            row_to_runs(p.snap.row(row), hidden, &mut fits)
+                        };
+                        for run in row_runs {
                             let mut buf = pool
                                 .pop()
                                 .map_or_else(|| Buffer::new(fs, metrics), |(b, _)| b);
@@ -643,7 +750,21 @@ impl TextLayer {
                         cache.insert(key, runs);
                     }
                     RowPlan::Temporary => {
-                        for run in row_to_runs(p.snap.row(row), hidden) {
+                        let row_runs = {
+                            let mut fits = |c: &SnapCell| {
+                                advance_fits_its_cells(
+                                    fs,
+                                    advance_memo,
+                                    font_px,
+                                    cell_h,
+                                    &family_owned,
+                                    cell_w,
+                                    c,
+                                )
+                            };
+                            row_to_runs(p.snap.row(row), hidden, &mut fits)
+                        };
+                        for run in row_runs {
                             if temp_n == temp.len() {
                                 temp.push((Buffer::new(fs, metrics), 0));
                             }
@@ -1088,7 +1209,7 @@ mod tests {
             cell(' ', w, true),
             cell('x', w, false),
         ];
-        let runs = row_to_runs(&row, None);
+        let runs = row_to_runs(&row, None, &mut ascii_only);
         let cols: Vec<u16> = runs.iter().map(|r| r.col).collect();
         let texts: Vec<String> = runs
             .iter()
@@ -1102,6 +1223,331 @@ mod tests {
         );
     }
 
+    /// F195 之前的判据(「ASCII 可打印且非宽字」)。**只给纯单测用。**
+    ///
+    /// 生产走的是量出来的 advance([`advance_fits_its_cells`])—— 那个要
+    /// `FontSystem`,而这一批测试扎的是 `row_to_runs` 的**切分机制**
+    /// (断在哪、列号怎么算、空白怎么剪、组字区间怎么劈),与判据是什么无关。
+    /// 谓词做成注入的,正是为了这批断言不必背上一个字体系统。
+    fn ascii_only(c: &SnapCell) -> bool {
+        c.width == 1 && c.ch.is_ascii() && !c.ch.is_ascii_control()
+    }
+
+    /// F195:判据说「这一格的 advance 就是 `width × cell_w`」时,连续的
+    /// **非 ASCII** 也并成一个 run。
+    ///
+    /// 这是本切片的收益来源。改之前每个非 ASCII 字符自成一个 run —— 在 tmux
+    /// 里跑 Claude Code 是满屏框线 `─│┌└`,一行 120 列就是 120 个
+    /// `glyphon::Buffer`。实测按两项模型算,合并后 239KB → 33KB(7.2 倍)。
+    ///
+    /// 自证会变红:把 `row_to_runs` 里「谓词为真就并进当前 run」改回
+    /// 「只有 ASCII 才并」。
+    #[test]
+    fn cells_whose_advance_matches_the_grid_merge_into_one_run() {
+        let w = Rgb::new(0xcc, 0xcc, 0xcc);
+        let row: Vec<SnapCell> = "┌──────┐".chars().map(|c| cell(c, w, false)).collect();
+        let mut all_fit = |_: &SnapCell| true;
+        let runs = row_to_runs(&row, None, &mut all_fit);
+        assert_eq!(runs.len(), 1, "框线 advance 对得上格子时该并成一个 run");
+        assert_eq!(runs[0].col, 0);
+    }
+
+    /// F195:判据说不对得上的那一格照旧单独站开,**并把两边劈断**。
+    ///
+    /// 这是安全侧:回退字体的 advance 与 `cell_w` 没有任何关系,并进去就是
+    /// 从那一列起整段错位(用户报过的「粘贴的内容和光标之间有空白」)。
+    ///
+    /// 自证会变红:让 `row_to_runs` 忽略谓词、无条件合并。
+    #[test]
+    fn a_cell_whose_advance_is_off_still_stands_alone() {
+        let w = Rgb::new(0xcc, 0xcc, 0xcc);
+        let row: Vec<SnapCell> = "aa😀aa".chars().map(|c| cell(c, w, false)).collect();
+        let mut fits = |c: &SnapCell| c.ch != '😀';
+        let texts: Vec<String> = row_to_runs(&row, None, &mut fits)
+            .iter()
+            .map(|r| r.spans.iter().map(|(s, _)| s.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec!["aa", "😀", "aa"]);
+    }
+
+    /// F195:run 有长度上限 —— 累积漂移必须封顶。
+    ///
+    /// 判据是「advance 与 `width × cell_w` 之差在容差内」,不是「相等」。
+    /// 差值会**逐格累加**:k 格之后最坏偏 `k × 容差`。不封顶的话一行 300 列
+    /// 就能漂过半格,而画面只是「行尾那几个字有点歪」—— 没有任何东西会报错。
+    ///
+    /// 自证会变红:把 `MAX_MERGED_CELLS` 那条分支删掉。
+    #[test]
+    fn a_merged_run_is_capped_so_drift_cannot_accumulate() {
+        let w = Rgb::new(0xcc, 0xcc, 0xcc);
+        let n = MAX_MERGED_CELLS * 2 + 3;
+        let row: Vec<SnapCell> = (0..n).map(|_| cell('x', w, false)).collect();
+        let mut all_fit = |_: &SnapCell| true;
+        let runs = row_to_runs(&row, None, &mut all_fit);
+        assert_eq!(runs.len(), 3, "{n} 格该切成 3 段");
+        let widest: usize = runs
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|(s, _)| s.chars().count())
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(widest <= MAX_MERGED_CELLS, "有一段 {widest} 格,超了上限");
+    }
+
+    /// F195:容差 × 上限 = 最坏漂移,必须远小于一格。
+    ///
+    /// 两个常数单看都合理,乘起来才是用户看得见的那个量。任何一个被调大时
+    /// 这条会拦住。
+    ///
+    /// 自证会变红:把 `ADVANCE_EPS_RATIO` 或 `MAX_MERGED_CELLS` 调大十倍。
+    #[test]
+    fn the_tolerance_and_the_cap_keep_worst_case_drift_well_under_a_cell() {
+        let worst = ADVANCE_EPS_RATIO * MAX_MERGED_CELLS as f32;
+        assert!(
+            worst < 0.25,
+            "最坏漂移 {worst} 格,超过四分之一格就该看得见了"
+        );
+    }
+
+    /// F195:`width == 0` 的格永远不并。
+    ///
+    /// 期望 advance 是 `width × cell_w`,width 为 0 时期望值是 0 —— 而那一格
+    /// 真画出东西时 advance 必然不是 0,于是「不等」→ 不并。这条是把它写死,
+    /// 免得日后有人为了「让判据更宽松」把 0 宽也放进来:那会让整段的期望位置
+    /// 与实际位置从这一格起彻底脱钩。
+    ///
+    /// 这一条不需要字体 —— 守卫在量之前就返回了。
+    ///
+    /// 自证会变红:把 `cell.width < 1` 那条守卫删掉(会变成去量 advance,
+    /// 在无字体的机器上行为不定)。
+    #[test]
+    fn a_zero_width_cell_never_merges() {
+        let mut fs = FontSystem::new();
+        let mut memo = std::collections::HashMap::new();
+        let c = SnapCell {
+            ch: 'x',
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0, 0, 0),
+            width: 0,
+            spacer: false,
+            selected: false,
+        };
+        assert!(!advance_fits_its_cells(
+            &mut fs,
+            &mut memo,
+            16.0,
+            20.0,
+            DEFAULT_FONT_FAMILY,
+            10.0,
+            &c
+        ));
+        assert!(memo.is_empty(), "守卫该在量之前就返回,不留缓存条目");
+    }
+
+    /// F195:`cell_w` 就是拿 'M' 量出来的 —— 所以 'M' 一定并得进去。
+    ///
+    /// 这条与平台无关:不管系统上最终挑中哪个字体,`measure_cell_w` 与
+    /// 这里量的是**同一个字符、同一套 metrics**,差值恒为 0。它扎的是
+    /// 「判据的方向没写反」(比如把 `<=` 写成 `>=`,或忘了乘 `width`)。
+    ///
+    /// 自证会变红:把判据里的 `<=` 改成 `>`。
+    #[test]
+    fn the_character_the_cell_width_came_from_always_merges() {
+        let mut fs = FontSystem::new();
+        let mut memo = std::collections::HashMap::new();
+        let (font_px, line_h) = (16.0, 20.0);
+        let cell_w = measure_cell_w(&mut fs, font_px, line_h, None);
+        let c = SnapCell {
+            ch: 'M',
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0, 0, 0),
+            width: 1,
+            spacer: false,
+            selected: false,
+        };
+        assert!(advance_fits_its_cells(
+            &mut fs,
+            &mut memo,
+            font_px,
+            line_h,
+            DEFAULT_FONT_FAMILY,
+            cell_w,
+            &c
+        ));
+        assert_eq!(
+            memo.len(),
+            1,
+            "量过的字符该进缓存 —— 不然每帧每格都要整形一次"
+        );
+    }
+
+    /// F195:走一遍真实 VT —— 字节流喂 `Emulator`,快照喂 `row_to_runs`,
+    /// 用**生产那个量出来的判据**。断言两件事:
+    ///
+    /// 1. **不丢字、不错位**:把各 run 按 `col` 摆回网格,必须还原成原行。
+    ///    这一条与平台无关,是合并的安全底线 —— 合并把「一格一个 buffer」
+    ///    的天然对齐拿掉了,列号一旦算错就是整段错位,而画面上只是「字挤在
+    ///    一起」,没有任何东西会报错。
+    /// 2. **真的并起来了**:判据接受 `─` 时,那一行框线必须是一个 run 而不是
+    ///    十几个。写成条件断言是因为收益取决于本机字体有没有框线字形
+    ///    (Linux 开发机与 Windows 不同);但只要它接受了,合并就必须发生 ——
+    ///    「忽略谓词、照旧一格一个」这个变异照样被杀。
+    ///
+    /// 字节流是**合成**的(无头容器里录不到真 TUI),不是
+    /// `tests/fixtures/*.bin` 那种录制品。真机录一份仍然欠着。
+    ///
+    /// 自证会变红:让 `row_to_runs` 忽略 `fits`,或把 run 的 `col` 改成
+    /// 「已输出字符数」(宽字之后整体左移一格)。
+    #[test]
+    fn a_real_vt_row_of_box_drawing_and_cjk_survives_the_round_trip() {
+        use mullion_term::emulator::Emulator;
+        const COLS: u16 = 40;
+        let mut em = Emulator::new(COLS, 4);
+        // 第 0 行纯框线,第 1 行中英混排 —— 这正是 tmux 里 Claude Code 的画面。
+        em.feed("┌──────────────┐\r\n".as_bytes());
+        em.feed("│ 中文 abc 混排 │\r\n".as_bytes());
+        let snap = em.snapshot();
+
+        let mut fs = FontSystem::new();
+        let mut memo = std::collections::HashMap::new();
+        let (font_px, line_h) = (16.0, 20.0);
+        let cell_w = measure_cell_w(&mut fs, font_px, line_h, None);
+
+        for row in 0..2u16 {
+            let cells = snap.row(row);
+            let runs = {
+                let mut fits = |c: &SnapCell| {
+                    advance_fits_its_cells(
+                        &mut fs,
+                        &mut memo,
+                        font_px,
+                        line_h,
+                        DEFAULT_FONT_FAMILY,
+                        cell_w,
+                        c,
+                    )
+                };
+                row_to_runs(cells, None, &mut fits)
+            };
+
+            // 契约一:按 col 摆回网格,原样还原。
+            let mut grid: Vec<char> = vec![' '; COLS as usize];
+            for r in &runs {
+                let mut col = usize::from(r.col);
+                for ch in r.spans.iter().flat_map(|(s, _)| s.chars()) {
+                    grid[col] = ch;
+                    col += usize::from(cells[col].width.max(1));
+                }
+            }
+            let want: String = cells
+                .iter()
+                .map(|c| if c.spacer { ' ' } else { c.ch })
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            let got: String = grid.iter().collect::<String>().trim_end().to_string();
+            assert_eq!(got, want, "第 {row} 行按 col 摆回去对不上");
+        }
+
+        // 契约二:判据接受框线就必须真并起来。
+        let box_cell = SnapCell {
+            ch: '─',
+            fg: Rgb::new(0xcc, 0xcc, 0xcc),
+            bg: Rgb::new(0, 0, 0),
+            width: 1,
+            spacer: false,
+            selected: false,
+        };
+        let accepts = advance_fits_its_cells(
+            &mut fs,
+            &mut memo,
+            font_px,
+            line_h,
+            DEFAULT_FONT_FAMILY,
+            cell_w,
+            &box_cell,
+        );
+        let mut fits = |c: &SnapCell| {
+            advance_fits_its_cells(
+                &mut fs,
+                &mut memo,
+                font_px,
+                line_h,
+                DEFAULT_FONT_FAMILY,
+                cell_w,
+                c,
+            )
+        };
+        let n = row_to_runs(snap.row(0), None, &mut fits).len();
+        if accepts {
+            assert_eq!(n, 1, "判据接受框线却没并起来 —— F195 的收益没落地");
+        } else {
+            println!("本机字体不接受 `─`(advance 与 cell_w 对不上),那一行仍是 {n} 个 run");
+        }
+    }
+
+    /// F195:`set_font` 必须**同时**清整形缓存和合并判据的记忆化表。
+    ///
+    /// 两张表都建在旧的 `cell_w` / 旧字体上。只清一张的症状是静默且**无自愈
+    /// 路径**:换字体后 `advance_memo` 里那些「这一格并得进去」的旧结论继续
+    /// 生效,该断开的地方仍然并着 → 整行从那一列起错位;而内容没变、行指纹
+    /// 不变、整形缓存刚清过会重整形一次然后就一直命中 —— 除非用户再换一次
+    /// 字体,否则永远回不来。
+    ///
+    /// `set_font` 要真实 wgpu Device 才跑得起来,只能从源码上扎。判据是
+    /// **行下标邻近**:`memo` 那一句必须紧跟在 `cache.clear` 后面 ——
+    /// 「挪到某个提前 return 之上/之下」这类变异,靠「函数体里包含」是
+    /// 抓不住的(F181 的 cfg 分支 early-return 盲区就是这么来的)。
+    ///
+    /// 自证会变红:删掉 `self.advance_memo.clear();`,或把它挪走。
+    #[test]
+    fn changing_the_font_clears_the_merge_verdicts_next_to_the_shaping_cache() {
+        let lines = prod_lines();
+        let cache_clear = concat!("self.cache", ".clear(&mut self.pool);");
+        let memo_clear = concat!("self.advance_", "memo.clear();");
+        let at = lines
+            .iter()
+            .position(|l| l.trim() == cache_clear)
+            .expect("set_font 里应有一处清整形缓存");
+        // 紧邻的下一条**代码**行(注释已被 prod_lines 滤掉)。
+        assert_eq!(
+            lines.get(at + 1).map(|l| l.trim()),
+            Some(memo_clear),
+            "清完整形缓存的下一句不是清 advance_memo —— 换字体后合并判据仍用\
+             旧 cell_w 的结论,整行错位且没有自愈路径"
+        );
+    }
+
+    /// F195:整形用的 `Attrs` 不许带 `.weight(` / `.style(`。
+    ///
+    /// 合并成一个 run 的前提是**整段共用一套字体选择**。粗体/斜体会换 face,
+    /// 换了 face 的 advance 与 `cell_w` 没有关系 —— 而判据是**逐字符**量的,
+    /// 量的时候用的是不带 weight/style 的 `Attrs`。两边不一致,合并出来的
+    /// 长 run 会整段错位,且**只在那一行恰好有 SGR 粗体时**才犯病。
+    ///
+    /// (顺带解释了为什么 SGR 的 bold 目前是靠颜色表达而不是换 face。)
+    ///
+    /// 自证会变红:在 `prepare_panes` 的 `attrs` 上挂一个 `.weight(...)`。
+    #[test]
+    fn shaping_attrs_carry_no_weight_or_style_so_a_merged_run_keeps_one_face() {
+        let lines = prod_lines();
+        let bad: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(concat!("Attrs", "::new()")))
+            .filter(|l| l.contains(concat!(".weight", "(")) || l.contains(concat!(".style", "(")))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "整形 Attrs 带上了 weight/style:{bad:?} —— 换 face 就换 advance,\
+             而合并判据是按不带它们的 Attrs 量的,长 run 会整段错位"
+        );
+    }
+
     /// 纯 ASCII 的一行(绝大多数情况)仍然只有一个 run:等宽字体里它们的
     /// advance 就是 cell_w,拆开只是白白多建 buffer(T3)。
     ///
@@ -1110,7 +1556,7 @@ mod tests {
     fn a_plain_ascii_line_is_still_a_single_run() {
         let w = Rgb::new(0xcc, 0xcc, 0xcc);
         let row: Vec<SnapCell> = "hello world".chars().map(|c| cell(c, w, false)).collect();
-        let runs = row_to_runs(&row, None);
+        let runs = row_to_runs(&row, None, &mut ascii_only);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].col, 0);
     }
@@ -1123,7 +1569,11 @@ mod tests {
     fn runs_still_split_spans_by_color() {
         let white = Rgb::new(0xcc, 0xcc, 0xcc);
         let red = Rgb::new(205, 0, 0);
-        let runs = row_to_runs(&[cell('a', white, false), cell('b', red, false)], None);
+        let runs = row_to_runs(
+            &[cell('a', white, false), cell('b', red, false)],
+            None,
+            &mut ascii_only,
+        );
         assert_eq!(runs.len(), 1, "同为 ASCII,仍是一个 run");
         assert_eq!(runs[0].spans.len(), 2, "run 内部要按颜色切成两段");
         assert_eq!(runs[0].spans[0].1, to_color(white));
@@ -1142,7 +1592,10 @@ mod tests {
             cell('中', w, false),
             cell(' ', w, true),
         ];
-        let cols: Vec<u16> = row_to_runs(&row, None).iter().map(|r| r.col).collect();
+        let cols: Vec<u16> = row_to_runs(&row, None, &mut ascii_only)
+            .iter()
+            .map(|r| r.col)
+            .collect();
         assert_eq!(cols, vec![0, 2]);
     }
 
@@ -1154,7 +1607,7 @@ mod tests {
     fn a_blank_line_produces_no_runs() {
         let w = Rgb::new(0xcc, 0xcc, 0xcc);
         let row: Vec<SnapCell> = std::iter::repeat_n(cell(' ', w, false), 80).collect();
-        assert!(row_to_runs(&row, None).is_empty());
+        assert!(row_to_runs(&row, None, &mut ascii_only).is_empty());
     }
 
     /// 选中的空白格**必须**保留 —— 它的字色被反成了 bg,底色那趟也画了反色块;
@@ -1173,7 +1626,7 @@ mod tests {
             spacer: false,
             selected: true,
         }];
-        assert_eq!(row_to_runs(&row, None).len(), 1);
+        assert_eq!(row_to_runs(&row, None, &mut ascii_only).len(), 1);
     }
 
     /// F126(spec 复核挖出的真 bug):`hidden` 区间要让正文 run 完全让路,
@@ -1188,7 +1641,7 @@ mod tests {
     fn hidden_span_splits_a_run_and_drops_the_covered_columns() {
         let w = Rgb::new(0xcc, 0xcc, 0xcc);
         let row: Vec<SnapCell> = "abcdef".chars().map(|c| cell(c, w, false)).collect();
-        let runs = row_to_runs(&row, Some((2, 4)));
+        let runs = row_to_runs(&row, Some((2, 4)), &mut ascii_only);
         let cols: Vec<u16> = runs.iter().map(|r| r.col).collect();
         let texts: Vec<String> = runs
             .iter()
@@ -1223,7 +1676,7 @@ mod tests {
             cell('x', w, false),
         ];
         for hidden in [(2, 4), (3, 4)] {
-            let runs = row_to_runs(&row, Some(hidden));
+            let runs = row_to_runs(&row, Some(hidden), &mut ascii_only);
             let texts: Vec<String> = runs
                 .iter()
                 .flat_map(|r| r.spans.iter().map(|(s, _)| s.clone()))
@@ -2113,7 +2566,7 @@ mod tests {
                     let top = if scrolling { f as usize } else { 0 };
                     let mut n = 0usize;
                     for row in &lines[top..top + usize::from(ROWS)] {
-                        for run in row_to_runs(row, None) {
+                        for run in row_to_runs(row, None, &mut ascii_only) {
                             if n == bufs.len() {
                                 bufs.push(Buffer::new(fs, metrics));
                             }
