@@ -49,6 +49,12 @@ pub struct ShapeKey {
 pub struct CachedRun<T> {
     pub col: u16,
     pub payload: T,
+    /// F192:这个载荷里排了多少个字形。**只喂内存记账**,渲染一路不看它。
+    ///
+    /// 存下来而不是用时现算,是因为唯一算得准的地方是整形完那一刻
+    /// (`Buffer::layout_runs`),而记账发生在几秒后的 gauge 采样里,那时
+    /// 再遍历上千个 `Buffer` 就跑到帧路径上去了(T3)。
+    pub glyphs: u32,
 }
 
 /// 缓存里的一行。
@@ -165,26 +171,55 @@ impl<T> ShapedCache<T> {
     /// 时会每帧新建上千个 `glyphon::Buffer` —— 那是陷阱 T3,且**比不做差分
     /// 还慢**。稳态是平的:第 N 帧滚出去的行在帧末回池,第 N+1 帧新露出的行
     /// 从池里取(滚动起步那一帧会多分配一次,之后收敛)。
-    pub fn end_frame(&mut self, recycle: &mut Vec<T>) {
+    /// F192:回收出去的是 `(载荷, 字形数)`。字形数必须一起走 —— 池子里躺的
+    /// 多半是长行退下来的 buffer,按固定价计会低报一个数量级(见
+    /// `text::bytes_estimate_of` 的两项模型)。
+    pub fn end_frame(&mut self, recycle: &mut Vec<(T, u32)>) {
         let f = self.frame;
         self.rows.retain(|_, r| {
             if r.last_seen == f {
                 return true;
             }
-            recycle.extend(r.runs.drain(..).map(|x| x.payload));
+            recycle.extend(r.runs.drain(..).map(|x| (x.payload, x.glyphs)));
             false
         });
     }
 
     /// 全清(换字体族/字号/DPI)。载荷同样回收。
-    pub fn clear(&mut self, recycle: &mut Vec<T>) {
+    pub fn clear(&mut self, recycle: &mut Vec<(T, u32)>) {
         for (_, mut r) in self.rows.drain() {
-            recycle.extend(r.runs.drain(..).map(|x| x.payload));
+            recycle.extend(r.runs.drain(..).map(|x| (x.payload, x.glyphs)));
         }
     }
 
     pub fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// F192:缓存里**载荷**的个数(各行 `runs` 之和),不是行数。
+    ///
+    /// **记账与容量决策一律用这个,不要用 [`len`](Self::len)。** 一行装的是
+    /// `Vec<CachedRun<T>>`,而 `text::row_to_runs` 会把每个非 ASCII 字符单独
+    /// 切成一个 run —— 满屏框线的 TUI 下一行 120 列就是 120 个载荷,拿行数
+    /// 当口径低报一个数量级(F192 修的正是这个)。
+    ///
+    /// 两处用它:`TextLayer::bytes_estimate` 的记账,和 F196 的 `pool` cap。
+    /// **一处实现两处用**是有意的 —— 各写一遍的话,改了一个忘另一个,
+    /// 而两者不一致没有任何东西会报错。
+    pub fn payload_count(&self) -> usize {
+        self.rows.values().map(|r| r.runs.len()).sum()
+    }
+
+    /// F192:缓存里**字形**的总数。与 [`payload_count`](Self::payload_count)
+    /// 是两个维度,记账两项都要(`buffers × 固定价 + glyphs × 边际价`)。
+    ///
+    /// 一个中文字的 run 值 2.4KB、一个 200 格的 ASCII 行值 56KB —— 24 倍的
+    /// 跨度,任何单常数模型在其中一端必错一个数量级。
+    pub fn glyph_count(&self) -> usize {
+        self.rows
+            .values()
+            .map(|r| r.runs.iter().map(|x| x.glyphs as usize).sum::<usize>())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -207,9 +242,14 @@ mod tests {
     }
 
     fn run() -> CachedRun<()> {
+        run_of(1)
+    }
+
+    fn run_of(glyphs: u32) -> CachedRun<()> {
         CachedRun {
             col: 0,
             payload: (),
+            glyphs,
         }
     }
 
@@ -250,6 +290,67 @@ mod tests {
             runs: Vec::new(),
         };
         assert_eq!(plan_row(Some(&c), true), RowPlan::Temporary);
+    }
+
+    /// F192:`payload_count` 数的是**载荷个数**,不是行数。
+    ///
+    /// 这两个数在本项目里差一个数量级:`row_to_runs` 把每个非 ASCII 字符
+    /// 单独切成一个 run,满屏框线的 TUI 下一行 120 列就是 120 个载荷。
+    /// `len()`(行数)当记账口径用会低报同一个数量级 —— 那正是 F192 要修的病。
+    ///
+    /// 自证会变红:让 `payload_count` 返回 `self.rows.len()`。
+    #[test]
+    fn payload_count_counts_runs_not_rows() {
+        let mut c = ShapedCache::<()>::new();
+        c.begin_frame();
+        c.insert(k(1, 80), vec![run(), run(), run()]);
+        c.insert(k(2, 80), vec![run(), run()]);
+        assert_eq!(c.len(), 2, "行数");
+        assert_eq!(c.payload_count(), 5, "载荷数 = 各行 runs 之和");
+    }
+
+    /// F192:`glyph_count` 数的是**字形**,与载荷个数是两个维度。
+    ///
+    /// 实测(`text.rs` 的校准测试)一个整形完的 `Buffer` 值
+    /// `1770 + 269 × 字形数` 字节 —— 一个中文字的 run 2.4KB,一个 200 格的
+    /// ASCII 行 56KB,差 24 倍。**只数 buffer 个数的记账在这两种画面上会各错
+    /// 一个方向**,所以两个维度都得报。
+    ///
+    /// 自证会变红:让 `glyph_count` 返回 `payload_count()`。
+    #[test]
+    fn glyph_count_sums_glyphs_not_buffers() {
+        let mut c = ShapedCache::<()>::new();
+        c.begin_frame();
+        c.insert(k(1, 80), vec![run_of(200), run_of(1)]);
+        c.insert(k(2, 80), vec![run_of(1)]);
+        assert_eq!(c.payload_count(), 3, "载荷数");
+        assert_eq!(c.glyph_count(), 202, "字形数 = 各 run 的字形之和");
+    }
+
+    /// F192:逐出时字形数**跟着载荷一起**进回收池。
+    ///
+    /// 池子里躺的多半是长 ASCII 行退下来的 buffer(单个值 56KB),丢了字形数
+    /// 就只能按固定价 1.8KB 计 —— 池子越大低报越狠,而池子恰恰是没有上限的
+    /// 那一个(F196 才给它加 cap)。
+    ///
+    /// 自证会变红:把 `end_frame` 里 `map` 的 `(x.payload, x.glyphs)` 改成
+    /// `(x.payload, 0)`。
+    #[test]
+    fn an_evicted_run_carries_its_glyph_count_to_the_pool() {
+        let mut c = ShapedCache::<()>::new();
+        let mut pool: Vec<((), u32)> = Vec::new();
+
+        c.begin_frame();
+        c.insert(k(1, 80), vec![run_of(200)]);
+        c.end_frame(&mut pool);
+        c.begin_frame();
+        c.end_frame(&mut pool);
+
+        assert_eq!(pool.len(), 1);
+        assert_eq!(
+            pool[0].1, 200,
+            "回池的 buffer 丢了字形数 → 之后按固定价低报"
+        );
     }
 
     /// 内容变了 → 查不到 → 整形。
@@ -445,30 +546,38 @@ mod tests {
         // 载荷用 `u32` 而不是 `()`:要能区分「取到的是回收来的那一个」和
         // 「又新建了一个」,单位类型区分不了。这正是载荷做成泛型的用处。
         let mut c: ShapedCache<u32> = ShapedCache::new();
-        let mut pool: Vec<u32> = Vec::new();
+        let mut pool: Vec<(u32, u32)> = Vec::new();
         const N: u64 = 8;
         const W: u32 = 800;
         let mut allocated = 0u32;
 
-        let frame = |c: &mut ShapedCache<u32>, pool: &mut Vec<u32>, top: u64, alloc: &mut u32| {
-            c.begin_frame();
-            for r in 0..N {
-                let content = top + r;
-                match plan_row(c.get(k(content, W)), false) {
-                    RowPlan::Reuse => c.touch(k(content, W)),
-                    RowPlan::Reshape => {
-                        // 整形路径:优先从池里取,取不到才新建。
-                        let payload = pool.pop().unwrap_or_else(|| {
-                            *alloc += 1;
-                            *alloc
-                        });
-                        c.insert(k(content, W), vec![CachedRun { col: 0, payload }]);
+        let frame =
+            |c: &mut ShapedCache<u32>, pool: &mut Vec<(u32, u32)>, top: u64, alloc: &mut u32| {
+                c.begin_frame();
+                for r in 0..N {
+                    let content = top + r;
+                    match plan_row(c.get(k(content, W)), false) {
+                        RowPlan::Reuse => c.touch(k(content, W)),
+                        RowPlan::Reshape => {
+                            // 整形路径:优先从池里取,取不到才新建。
+                            let payload = pool.pop().map(|(p, _)| p).unwrap_or_else(|| {
+                                *alloc += 1;
+                                *alloc
+                            });
+                            c.insert(
+                                k(content, W),
+                                vec![CachedRun {
+                                    col: 0,
+                                    payload,
+                                    glyphs: 1,
+                                }],
+                            );
+                        }
+                        RowPlan::Temporary => unreachable!(),
                     }
-                    RowPlan::Temporary => unreachable!(),
                 }
-            }
-            c.end_frame(pool);
-        };
+                c.end_frame(pool);
+            };
 
         // 首帧:池子空,N 行全新建。
         frame(&mut c, &mut pool, 0, &mut allocated);

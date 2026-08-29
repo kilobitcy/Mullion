@@ -210,11 +210,50 @@ pub fn hidden_span_for_row(p: &PaneRender<'_>, row: u16) -> Option<(u16, u16)> {
 /// 没设时仍是这一款。
 pub const DEFAULT_FONT_FAMILY: &str = "Google Sans Code";
 
-/// F169:一个整形完的 Buffer(一行终端文字)的估算驻留字节。
-/// 粗估:一行 ~200 格,每字形的 layout/shaping 结果按几十字节算。
-/// 这是**估算**(spec §5),精度要求是量级正确,守护测试只钉「与 Buffer
-/// 数成正比」这一层。
-pub const BUFFER_EST_BYTES: usize = 4096;
+/// F192:一个整形完的 `Buffer` 的**固定**开销(`BufferLine` / `Vec` 头 /
+/// shape 与 layout 两层 cache 的空壳),与它里面排了几个字形无关。
+///
+/// 与 [`GLYPH_EST_BYTES`] 一起构成两项模型 `固定 + 边际 × 字形数`。这两个数
+/// 是实测拟合出来的(四个点:1→2371、20→7580、60→16900、200→55920 字节,
+/// 最小二乘,误差 ≤16%),标定测试见
+/// `the_shaped_buffer_price_model_matches_what_it_actually_costs`。
+///
+/// **为什么不能用单常数。** F169 当初写的是一个 4096。但单字 run 值 2.4KB、
+/// 200 格的 ASCII 行值 56KB —— 24 倍跨度,单常数在其中一端必错一个数量级。
+/// 更要命的是它会**倒过来误导优化**:F195 要把满屏 CJK 的 120 个单字 run
+/// 合成 1 个,单常数模型报「省 120 倍」,两项模型报「省 7.2 倍」——
+/// 后者才是真的。拿前者立项就是照着一个错的尺子调优。
+pub const BUFFER_FIXED_BYTES: usize = 1770;
+
+/// F192:每多排一个字形的**边际**堆开销(cluster / glyph / layout 三处各一份
+/// 定长结构)。见 [`BUFFER_FIXED_BYTES`] 的文档。
+pub const GLYPH_EST_BYTES: usize = 269;
+
+/// F192:文字层驻留内存估算的**算术本体**。抽成自由函数 + 对载荷泛型,
+/// 是为了让它能在没有 GPU 的机器上被断言 —— `TextLayer` 要真实 wgpu
+/// `Device` 才构造得出来,把这段算术留在方法里等于永远测不到。
+///
+/// **计的是 Buffer 数,不是行数。** `cache` 一行装的是 `Vec<CachedRun<T>>`,
+/// 而 `row_to_runs` 把每个非 ASCII 字符单独切成一个 run —— 满屏框线的 TUI 下
+/// 一行 120 列就是 120 个 Buffer。F169 当初写的 `cache.len()` 是行数,
+/// 在这种画面上低报整整一个数量级(实机 v0.1.81:三笔记账合计 27MB,
+/// 而 `堆=98MB`,71MB 无处归因)。
+///
+/// **两项定价**:`buffers × 固定价 + glyphs × 边际价`。单常数模型在长短两端
+/// 各错一个方向,理由见 [`BUFFER_FIXED_BYTES`]。
+///
+/// `pool` / `temp` 收 `(载荷, 字形数)`:池子里躺的多半是长行退下来的 buffer,
+/// 只数个数会把它们按 1.8KB 计,而它们单个值 56KB。
+pub fn bytes_estimate_of<T>(
+    cache: &crate::shaped_cache::ShapedCache<T>,
+    pool: &[(T, u32)],
+    temp: &[(T, u32)],
+) -> usize {
+    let loose_glyphs = |v: &[(T, u32)]| v.iter().map(|(_, g)| *g as usize).sum::<usize>();
+    let buffers = cache.payload_count() + pool.len() + temp.len();
+    let glyphs = cache.glyph_count() + loose_glyphs(pool) + loose_glyphs(temp);
+    buffers * BUFFER_FIXED_BYTES + glyphs * GLYPH_EST_BYTES
+}
 
 /// F172:一条行带的顶点槽。
 ///
@@ -269,10 +308,10 @@ pub struct TextLayer {
     /// 空闲的 `Buffer` 回收池。缓存逐出、重整形、清空时的旧 buffer 都进这里,
     /// 整形时优先从这里取 —— 每帧新建上千个 `Buffer` 就是陷阱 T3,而且滚动
     /// 场景(每帧每行都变)不回收会比改之前更慢。
-    pool: Vec<Buffer>,
+    pool: Vec<(Buffer, u32)>,
     /// 临时槽:IME 组字行的正文 + 拼音串 overlay。**它们绝不进 `cache`**
     /// (理由见 `shaped_cache::plan_row` 的文档)。当池子用,不每帧清空。
-    temp: Vec<Buffer>,
+    temp: Vec<(Buffer, u32)>,
     pub cell_w: f32,
     pub cell_h: f32,
     /// F21:当前生效的字体族。`None` = [`DEFAULT_FONT_FAMILY`]。
@@ -316,7 +355,7 @@ fn shape_run(
     cell_w: f32,
     cell_h: f32,
     attrs: Attrs<'_>,
-) {
+) -> u32 {
     buf.set_metrics(fs, metrics);
     let avail = term_w
         .saturating_sub((f32::from(col) * cell_w) as u32)
@@ -325,6 +364,10 @@ fn shape_run(
     let iter = spans.iter().map(|(s, c)| (s.as_str(), attrs.color(*c)));
     buf.set_rich_text(fs, iter, attrs, Shaping::Advanced);
     buf.shape_until_scroll(fs, false);
+    // F192:字形数只有在这里数得准(排完版才知道回退/合字之后到底几个字形),
+    // 而记账发生在几秒后的 gauge 采样里 —— 那时再遍历上千个 `Buffer` 就跑到
+    // 帧路径上去了(T3)。所以整形完顺手数一次,存进 `CachedRun::glyphs`。
+    buf.layout_runs().map(|r| r.glyphs.len()).sum::<usize>() as u32
 }
 
 /// 本帧某个 `TextArea` 的 buffer 存在哪。
@@ -383,8 +426,9 @@ impl TextLayer {
     }
 
     /// F169:文字层驻留内存估算 = (缓存 + 池 + 临时槽)的 Buffer 数 × 单价。
+    /// 算术在 [`bytes_estimate_of`](crate::text::bytes_estimate_of),那里能单测。
     pub fn bytes_estimate(&self) -> usize {
-        (self.cache.len() + self.pool.len() + self.temp.len()) * BUFFER_EST_BYTES
+        bytes_estimate_of(&self.cache, &self.pool, &self.temp)
     }
 
     /// F21:换字体族 / 字号。重算单元格尺寸,**不重建 `TextLayer`**。
@@ -575,8 +619,10 @@ impl TextLayer {
                         // `cache.end_frame`(滚出视野时),稳态是平的。
                         let mut runs: Vec<CachedRun<Buffer>> = Vec::new();
                         for run in row_to_runs(p.snap.row(row), hidden) {
-                            let mut buf = pool.pop().unwrap_or_else(|| Buffer::new(fs, metrics));
-                            shape_run(
+                            let mut buf = pool
+                                .pop()
+                                .map_or_else(|| Buffer::new(fs, metrics), |(b, _)| b);
+                            let glyphs = shape_run(
                                 &mut buf, fs, metrics, &run.spans, run.col, term_w, cell_w, cell_h,
                                 attrs,
                             );
@@ -589,6 +635,7 @@ impl TextLayer {
                             runs.push(CachedRun {
                                 col: run.col,
                                 payload: buf,
+                                glyphs,
                             });
                         }
                         // 空 `runs` 也要写:整行空白的产物就是空集,不写条目
@@ -598,10 +645,10 @@ impl TextLayer {
                     RowPlan::Temporary => {
                         for run in row_to_runs(p.snap.row(row), hidden) {
                             if temp_n == temp.len() {
-                                temp.push(Buffer::new(fs, metrics));
+                                temp.push((Buffer::new(fs, metrics), 0));
                             }
-                            shape_run(
-                                &mut temp[temp_n],
+                            temp[temp_n].1 = shape_run(
+                                &mut temp[temp_n].0,
                                 fs,
                                 metrics,
                                 &run.spans,
@@ -634,11 +681,11 @@ impl TextLayer {
             };
             for c in &preedit_cells {
                 if temp_n == temp.len() {
-                    temp.push(Buffer::new(fs, metrics));
+                    temp.push((Buffer::new(fs, metrics), 0));
                 }
                 let spans = [(c.ch.to_string(), to_color(preedit_fg))];
-                shape_run(
-                    &mut temp[temp_n],
+                temp[temp_n].1 = shape_run(
+                    &mut temp[temp_n].0,
                     fs,
                     metrics,
                     &spans,
@@ -758,7 +805,7 @@ impl TextLayer {
                         None => continue,
                     },
                     BufSrc::Temp(t) => match temp.get(t) {
-                        Some(b) => b,
+                        Some((b, _)) => b,
                         None => continue,
                     },
                 };
@@ -1318,6 +1365,22 @@ mod tests {
             .collect()
     }
 
+    /// 只要**生产代码**那一段(测试模块之前)。
+    ///
+    /// 给「全文件只许有 N 处 X」这类计数型判据用。计数扎的是生产代码里的
+    /// 岔路数,而测试自己为了构造被测对象难免要写同一个字面量 —— 拿全文件
+    /// 去数,加一条测试就把守护打红,唯一的"修法"是把断言的数字往上调,
+    /// 那条守护就此报废。针照旧在运行时拼(见下)。
+    fn prod_lines() -> Vec<&'static str> {
+        let marker = concat!("#[cfg", "(test)]");
+        let all = code_lines();
+        let end = all
+            .iter()
+            .position(|l| l.trim() == marker)
+            .unwrap_or(all.len());
+        all[..end].to_vec()
+    }
+
     /// F172:**整个 crate 里只许有一处 `atlas.trim()`,且必须挂在
     /// `bands::may_trim` 的闸下**。
     ///
@@ -1437,7 +1500,9 @@ mod tests {
     /// 针在运行时拼:写成字面量的话这条测试自己的源码会匹配上自己,恒绿。
     #[test]
     fn the_shape_key_is_built_from_this_frames_live_hash_and_width() {
-        let lines = code_lines();
+        // 只数生产代码:测试要构造 `ShapeKey` 才能断言别的事,拿全文件去数
+        // 等于每加一条测试就得把上面那个 `1` 往上调,守护就此报废。
+        let lines = prod_lines();
         let ctor = concat!("Shape", "Key { ");
         let at: Vec<&str> = lines.iter().copied().filter(|l| l.contains(ctor)).collect();
         assert_eq!(
@@ -1707,6 +1772,192 @@ mod tests {
 
     /// 把一串文本铺成一行 `SnapCell`,不足 `cols` 的用空格补满 —— 与
     /// `Emulator::snapshot` 出来的行同形(宽字符后面跟一个 spacer 格)。
+    /// F192:记账按**每个 Buffer** 计价,不是每行。
+    ///
+    /// 这两个口径在本项目里差一个数量级 —— `row_to_runs` 把每个非 ASCII
+    /// 字符单独切成一个 run,满屏框线的 TUI 下一行 120 列就是 120 个 Buffer。
+    /// 按行计价会让 `profile.mem` 的 `text:` 低报同一个数量级(实机 v0.1.81:
+    /// 记账 27MB / 堆 98MB,71MB 无处归因)。
+    ///
+    /// 泛型化 `T` 就是为了这条能在无头机器上跑:`Buffer` 要 `FontSystem`
+    /// 才构造得出来,而这里要断言的是**计数口径**,与载荷是什么无关。
+    ///
+    /// 自证会变红:把 `bytes_estimate_of` 里的 `payload_count()` 换回 `len()`。
+    #[test]
+    fn the_text_gauge_prices_every_buffer_not_every_row() {
+        use crate::shaped_cache::{ShapeKey, ShapedCache};
+        let mut c = ShapedCache::<()>::new();
+        c.begin_frame();
+        c.insert(
+            ShapeKey {
+                hash: 1,
+                term_w: 80,
+            },
+            vec![run_of(1), run_of(1), run_of(1)],
+        );
+        c.insert(
+            ShapeKey {
+                hash: 2,
+                term_w: 80,
+            },
+            vec![run_of(1), run_of(1)],
+        );
+        assert_eq!(
+            bytes_estimate_of(&c, &[], &[]),
+            5 * (BUFFER_FIXED_BYTES + GLYPH_EST_BYTES),
+            "两行装了 5 个 Buffer,按行记就只算 2 —— 差的正是 F192 那一个数量级"
+        );
+    }
+
+    fn run_of(glyphs: u32) -> crate::shaped_cache::CachedRun<()> {
+        crate::shaped_cache::CachedRun {
+            col: 0,
+            payload: (),
+            glyphs,
+        }
+    }
+
+    /// F192:同样多的字形,摊在 200 个 Buffer 里比装在 1 个里贵 —— 但只贵
+    /// **7.2 倍**,不是 200 倍。
+    ///
+    /// 这条钉的是两项模型的形状本身。单常数模型(F169 的 4096)会说 200 倍,
+    /// 而实测是 33KB vs 239KB。差别不是精度问题,是**会把优化立项引到错误方向**:
+    /// F195 的 run 合并按单常数算「省两个数量级」,按实测算「省 7.2 倍」——
+    /// 后者仍然值得做,但不该拿前者去排优先级。
+    ///
+    /// 自证会变红:把 `bytes_estimate_of` 的 `glyphs × GLYPH_EST_BYTES` 那项
+    /// 删掉(退回单常数),两边就变成整 200 倍。
+    #[test]
+    fn the_text_gauge_charges_for_glyphs_on_top_of_buffers() {
+        use crate::shaped_cache::{ShapeKey, ShapedCache};
+        const G: usize = 200;
+
+        let mut merged = ShapedCache::<()>::new();
+        merged.begin_frame();
+        merged.insert(
+            ShapeKey {
+                hash: 1,
+                term_w: 80,
+            },
+            vec![run_of(u32::try_from(G).unwrap())],
+        );
+
+        let mut split = ShapedCache::<()>::new();
+        split.begin_frame();
+        split.insert(
+            ShapeKey {
+                hash: 1,
+                term_w: 80,
+            },
+            (0..G).map(|_| run_of(1)).collect(),
+        );
+
+        assert_eq!(
+            bytes_estimate_of(&merged, &[], &[]),
+            BUFFER_FIXED_BYTES + G * GLYPH_EST_BYTES,
+            "合并成一个 run:一份固定价 + 200 份边际价"
+        );
+        assert_eq!(
+            bytes_estimate_of(&split, &[], &[]),
+            G * BUFFER_FIXED_BYTES + G * GLYPH_EST_BYTES,
+            "切成 200 个 run:多的只是 199 份固定价,字形那部分一分不省"
+        );
+    }
+
+    /// F192:池子里的 buffer 按**它自己的**字形数计价,不是按固定价。
+    ///
+    /// 池子恰恰是没有上限的那一个(F196 才给它加 cap),里面躺的多半是长
+    /// ASCII 行退下来的 buffer,单个值 56KB。丢了字形数就按 1.8KB 计 ——
+    /// 池子越大低报越狠,而且**完全静默**。
+    ///
+    /// 自证会变红:让 `bytes_estimate_of` 里 `pool`/`temp` 那两项只数 `len()`。
+    #[test]
+    fn the_text_gauge_prices_a_pooled_buffer_by_the_glyphs_it_holds() {
+        use crate::shaped_cache::ShapedCache;
+        let empty = ShapedCache::<()>::new();
+        let fat: Vec<((), u32)> = vec![((), 200)];
+        let thin: Vec<((), u32)> = vec![((), 1)];
+        assert_eq!(
+            bytes_estimate_of(&empty, &fat, &[]),
+            BUFFER_FIXED_BYTES + 200 * GLYPH_EST_BYTES
+        );
+        assert_eq!(
+            bytes_estimate_of(&empty, &[], &thin),
+            BUFFER_FIXED_BYTES + GLYPH_EST_BYTES
+        );
+    }
+
+    /// F192:两项定价模型的实测标定。**在长短两端各量一次。**
+    ///
+    /// 为什么必须两端都量:一开始只量了单字 run(2371 字节),照它标一个单常数
+    /// 看着挺准 —— 直到把 run 拉长才发现 200 格的 ASCII 行值 55920 字节。
+    /// 24 倍跨度,单常数在另一端必错一个数量级。两项模型是从这四个实测点
+    /// (1→2371、20→7580、60→16900、200→55920)最小二乘拟出来的。
+    ///
+    /// **不能照抄 F190 那套私有计数器的手法** —— 那对分配器不可见,而这里要量
+    /// 的正是「一个已整形 `Buffer` 实际吃掉多少堆」,只能读进程全局的
+    /// `heapgauge::GLOBAL`。而 F190 自己记着的教训是:1600+ 条测试并行跑,
+    /// 全局计数上的绝对增量测不准。
+    ///
+    /// 三条对策一起上,让这条既测得准又不 flaky:
+    ///
+    /// 1. **信号做大到噪声之上**:一次整形并**持有** N 个 buffer(`held` 必须
+    ///    活到第二次读数之后,否则量到的是 0)。两端各自把 N 调到总量 ~25MB。
+    /// 2. **多轮取中位数**:第一轮含 `FontSystem` 的一次性增长(字体数据、
+    ///    shape cache),是必然的离群值,中位数把它削掉。
+    /// 3. **只断言量级**(`[预测/4, 预测×4]`):精度要求是量级正确。要打红一个
+    ///    4 倍带宽的中位数断言,邻居测试得在同一个窗口里**净**漂几十 MB。
+    ///
+    /// 两端合起来才钉得住两个常数:短端主要约束 [`BUFFER_FIXED_BYTES`],
+    /// 长端主要约束 [`GLYPH_EST_BYTES`]。**少任何一端,另一个常数就自由了。**
+    ///
+    /// 平台漂是明知的:Linux 开发机的回退字体与 Windows 不同,实测值会差。
+    /// 断言只钉量级正是为此 —— 常数漂出一个量级时逼人回来重标,日常波动不红。
+    ///
+    /// 自证会变红:把 `GLYPH_EST_BYTES` 改成 1(长端立刻红,短端仍绿 ——
+    /// 这正是"少一端就钉不住"的现场)。
+    #[test]
+    fn the_shaped_buffer_price_model_matches_what_it_actually_costs() {
+        // (一个 run 里的字形数, 持有多少个 run)。乘积按总量 ~25MB 选。
+        const POINTS: [(usize, usize); 2] = [(1, 10_000), (200, 500)];
+        let mut fs = FontSystem::new();
+        let metrics = grid_metrics(16.0, 20.0);
+
+        for (glyphs, n) in POINTS {
+            let text = "x".repeat(glyphs);
+            let mut rounds = [0usize; 3];
+            for slot in &mut rounds {
+                let before = crate::heapgauge::GLOBAL.live();
+                let mut held: Vec<Buffer> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let mut b = Buffer::new(&mut fs, metrics);
+                    b.set_text(
+                        &mut fs,
+                        &text,
+                        Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY)),
+                        Shaping::Advanced,
+                    );
+                    b.shape_until_scroll(&mut fs, false);
+                    held.push(b);
+                }
+                let after = crate::heapgauge::GLOBAL.live();
+                *slot = after.saturating_sub(before) as usize / n;
+                drop(held);
+            }
+            rounds.sort_unstable();
+            let measured = rounds[1];
+            let predicted = BUFFER_FIXED_BYTES + glyphs * GLYPH_EST_BYTES;
+            println!(
+                "{glyphs} 字形/run:实测中位数 {measured} 字节,模型 {predicted}(三轮 {rounds:?})"
+            );
+            assert!(
+                measured >= predicted / 4 && measured <= predicted * 4,
+                "{glyphs} 字形的 run:模型报 {predicted}、实测 {measured},差了一个量级\
+                 以上,该重新标定 BUFFER_FIXED_BYTES/GLYPH_EST_BYTES 了(三轮 {rounds:?})"
+            );
+        }
+    }
+
     fn bench_row(text: &str, cols: u16) -> Vec<SnapCell> {
         use unicode_width::UnicodeWidthChar;
         let fg = Rgb::new(0xcc, 0xcc, 0xcc);

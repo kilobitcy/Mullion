@@ -823,10 +823,24 @@ pub fn mem_parts(
     // 让「读者拿它去减 primary」这件事看起来天经地义,而拿它去减 `其他:`
     // 则一眼就不对 —— 后者会把 scroll/text 减掉两次。
     let heap = heap_b >> 20;
+    // F192:记账 > 堆是**物理上不可能**的读数(三块全是 Rust 堆上的 `Vec`,
+    // 而 `堆=` 是同一个堆的活跃总量)。超了只可能是记账模型高估。
+    //
+    // 单开一档而不是靠下面那个兜底:兜底的被减数是 `primary_mb`(commit,
+    // 实机 346MB),堆才 98MB —— 中间 248MB 的区间里一个荒谬的 `text:` 读数
+    // 没有任何东西会吭声。F192 把 `text:` 的计价改对之后它会往上跳一个
+    // 数量级,正是最需要这层哨兵的时候。
+    //
+    // 只标记不夹值:这是诊断行,夹了就又回到「静默」那条老路。
+    let over_heap = if accounted > heap {
+        format!("(!记账 {accounted} > 堆 {heap})")
+    } else {
+        String::new()
+    };
     if accounted <= primary_mb {
         format!(
             "{label}={primary_mb}MB{ws} 堆={heap}MB = scroll:{scroll} xfer:{xfer} \
-             text:{text} 其他:{}",
+             text:{text} 其他:{}{over_heap}",
             primary_mb - accounted
         )
     } else {
@@ -2681,6 +2695,40 @@ mod tests {
         );
     }
 
+    /// F192:记账三块之和**超过 `堆=`** 时行里要出现一个惊叹号。
+    ///
+    /// 这是物理上不可能的读数:scroll/xfer/text 三块全是 Rust 堆上的 `Vec`,
+    /// 而 `堆=` 是同一个堆的活跃总量,前者必然 ≤ 后者。超了只有一种解释 ——
+    /// **记账模型高估了**(F192 之前是反过来:`text:` 按行计价低报一个数量级)。
+    ///
+    /// 为什么非要单开一档:已有的「记账超出」兜底判的是 `accounted >
+    /// primary_mb`,而 `primary_mb` 是 commit(实机 346MB)。堆才 98MB,
+    /// 记账要涨到 346 才触发得了那一档 —— 中间 248MB 的区间里,一个荒谬的
+    /// `text:` 读数没有任何东西会吭声。F192 把计价改对之后 `text:` 会往上跳
+    /// 一个数量级,正是最需要这层哨兵的时候。
+    ///
+    /// **标记而不是断言**:这是诊断行,不是控制流。印个惊叹号让人看得见,
+    /// 不 panic、不夹值 —— 夹了就又回到「静默」那条老路上。
+    ///
+    /// 自证会变红:把 `mem_parts` 里那个 `accounted > heap` 分支删掉。
+    #[test]
+    fn accounting_that_exceeds_the_heap_is_flagged_because_it_is_impossible() {
+        // commit 400(远大于记账 168,老兜底不会触发)、堆只有 100。
+        let line = mem_parts(
+            crate::diag::MemKind::Commit,
+            400,
+            Some(300),
+            100 << 20,
+            128 << 20,
+            24 << 20,
+            16 << 20,
+        );
+        assert_eq!(
+            line,
+            "commit=400MB(ws 300) 堆=100MB = scroll:128 xfer:24 text:16 其他:232(!记账 168 > 堆 100)"
+        );
+    }
+
     /// F176/F190:`profile.mem` 行按快照的口径渲染,三个新字段确实接到了
     /// 行上。
     ///
@@ -2723,6 +2771,11 @@ mod tests {
         s.mem_scroll_bytes = 0;
         s.xfer_running = 0;
         s.mem_text_bytes = 5 << 20;
+        // F192:堆得给个真值。`busy_snapshot` 默认 0,而「记账 5MB / 堆 0MB」
+        // 会触发那条不可能读数的标记 —— 行尾多个惊叹号,下面的 `ends_with`
+        // 就对不上了。(顺带:`堆=0MB` 正是自定义分配器没挂上时的症状,
+        // 那条标记顺手也把它兜住了。)
+        s.mem_heap_bytes = 96 << 20;
         assert_eq!(s.mem_other_mb(), 423);
         let lines = render_lines(&s, false);
         assert!(lines
