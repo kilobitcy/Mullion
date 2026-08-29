@@ -112,8 +112,14 @@ pub enum CursorShape {
     /// 留着是为了让 `map_shape` 能穷尽匹配。(渲染层"非焦点 pane 画空心框"
     /// 是 `gpu.rs` 自己的另一套判断,不读这个字段。)
     HollowBlock,
-    /// 远端要求不画光标。**当前不可达**:DECTCEM 走的是 `Cursor::visible`,
-    /// `cursor_style()` 不看它。同样只为穷尽匹配而留。
+    /// 远端要求不画光标(DECTCEM `CSI ?25 l`,F197)。
+    ///
+    /// **不走 `Cursor::visible`**:那个字段的语义是「光标在可视区里」(F17
+    /// 回溯),下游还拿它当组字串画不画的判据 —— 把「远端要求隐藏」并进去的话,
+    /// 在常驻 `?25l` 自绘光标的 TUI(Claude Code)里打拼音会整个不上屏。
+    ///
+    /// `Term::cursor_style()` 不吐这个值(它只管 DECSCUSR/vi-mode),由
+    /// `Emulator::cursor_shape` 判 `TermMode::SHOW_CURSOR` 补上。
     Hidden,
 }
 

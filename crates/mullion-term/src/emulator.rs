@@ -398,13 +398,36 @@ impl Emulator {
             Cursor {
                 row: cursor_row.max(0) as u16,
                 col: p.column.0 as u16,
-                // MVP 未接 DECTCEM(`\x1b[?25l`/`\x1b[?25h`)光标隐藏/显示;
-                // 这里只处理「滚出可视区」这一种不可见(F17)。
+                // `visible` 只管「在不在可视区」(F17 回溯)。远端 DECTCEM 要求
+                // 隐藏走的是 `shape: Hidden`(F197)—— 不能并进这里:下游拿
+                // `visible` 当**组字串画不画**的判据,并进来的话在常驻 `?25l`
+                // 自绘光标的 TUI 里打拼音会整个不上屏。
                 visible: cursor_row >= 0 && (cursor_row as usize) < rows,
-                shape: map_shape(style.shape),
+                shape: self.cursor_shape(),
                 blinking: style.blinking,
             },
         )
+    }
+
+    /// F197:这一刻该画成什么形状,**DECTCEM 在内**。
+    ///
+    /// alacritty 的 `Term::cursor_style()` 只吐 DECSCUSR/vi-mode 选的形状,
+    /// 不看 `TermMode::SHOW_CURSOR`(0.26.0 源码已确认;它自家 UI 层是在
+    /// `renderable_content` 里另判一次的)。所以「远端要求隐藏」这件事只能
+    /// 在这里判 —— 漏掉的症状是全屏 TUI(Claude Code / tmux)自绘期间常驻
+    /// `?25l`、把真光标停在最后写字那一格,我们照画,画面里就随机冒出一个
+    /// 位置不固定、还跟着相位闪的光标。
+    ///
+    /// **隐藏不抹形状**:`cursor_style()` 记着的 DECSCUSR 结果原样留着,
+    /// `?25h` 回来时还是那个形状。
+    ///
+    /// [`Self::snapshot`] 与 [`Self::cursor`] 都走这里,不许各判一份。
+    fn cursor_shape(&self) -> CursorShape {
+        if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            map_shape(self.term.cursor_style().shape)
+        } else {
+            CursorShape::Hidden
+        }
     }
 
     /// 光标在**可视区**里的位置。[`Emulator::snapshot`] 里那份 `cursor` 的
@@ -423,7 +446,7 @@ impl Emulator {
             row: cursor_row.max(0) as u16,
             col: p.column.0 as u16,
             visible: cursor_row >= 0 && (cursor_row as usize) < grid.screen_lines(),
-            shape: map_shape(style.shape),
+            shape: self.cursor_shape(),
             blinking: style.blinking,
         }
     }
@@ -1155,6 +1178,90 @@ mod tests {
             assert_eq!(c.shape, want_shape, "Ps={} 的形状", ps[0] as char);
             assert_eq!(c.blinking, want_blink, "Ps={} 的闪烁位", ps[0] as char);
         }
+    }
+
+    /// F197:远端 DECTCEM(`CSI ?25 l` / `CSI ?25 h`)要求隐藏光标时,快照
+    /// 必须报 `Hidden`。
+    ///
+    /// 不接这一条的症状就是本项目主场景的报障:Claude Code / tmux 这类全屏
+    /// TUI 在自绘期间常驻 `?25l`,并把真光标停在最后写字的那一格上(表格线
+    /// 中间、行尾……哪儿都可能)。我们照画,于是画面里随机位置冒出一个光标,
+    /// 位置每次不同,还跟着 530ms 相位闪。
+    ///
+    /// **注意 alacritty 帮不上忙**:`Term::cursor_style()` 只吐 DECSCUSR/vi-mode
+    /// 的形状,压根不看 `TermMode::SHOW_CURSOR`(0.26.0 源码已确认),隐藏这件事
+    /// 只能自己判。
+    ///
+    /// 自证会变红:把 `cursor_shape()` 里的 `SHOW_CURSOR` 判据删掉。
+    #[test]
+    fn dectcem_hides_the_cursor_so_a_tui_that_parks_it_mid_screen_draws_nothing() {
+        let mut emu = Emulator::new(20, 5);
+        assert_eq!(emu.snapshot().cursor.shape, CursorShape::Beam, "默认显示");
+
+        emu.feed(b"\x1b[?25l");
+        assert_eq!(
+            emu.snapshot().cursor.shape,
+            CursorShape::Hidden,
+            "远端要求隐藏光标,仍报可画的形状 → 画面里冒出随机位置的光标"
+        );
+
+        emu.feed(b"\x1b[?25h");
+        assert_eq!(
+            emu.snapshot().cursor.shape,
+            CursorShape::Beam,
+            "远端要求显示回来了,光标该回到 DECSCUSR 的形状"
+        );
+    }
+
+    /// F197:DECSCUSR 选的形状必须在隐藏期间原样留着 —— 隐藏只是「这一刻别
+    /// 画」,不是把远端选过的形状抹掉。`?25h` 之后要回到它选的那个形状,
+    /// 而不是默认的 Beam。
+    ///
+    /// 自证会变红:把 `cursor_shape()` 的隐藏分支改成 `self.term.cursor_style()`
+    /// 之外的写死值,或在隐藏时顺手把 `cursor_style` 清掉。
+    #[test]
+    fn hiding_the_cursor_does_not_forget_the_shape_the_app_asked_for() {
+        let mut emu = Emulator::new(20, 5);
+        emu.feed(b"\x1b[4 q"); // 稳定下划线
+        emu.feed(b"\x1b[?25l");
+        assert_eq!(emu.snapshot().cursor.shape, CursorShape::Hidden);
+        emu.feed(b"\x1b[?25h");
+        let c = emu.snapshot().cursor;
+        assert_eq!(c.shape, CursorShape::Underline, "形状被隐藏顺手抹掉了");
+        assert!(!c.blinking, "闪烁位也该原样留着");
+    }
+
+    /// F197:**DECTCEM 走 `shape`,不许混进 `visible`。**
+    ///
+    /// `visible` 的语义是「光标在可视区里」(F17 回溯),下游拿它当**组字串
+    /// 画不画**的判据(`text::hidden_span_for_row`、`gpu::quads_for_panes`)。
+    /// 把「远端要求隐藏」并进 `visible` 的话,在 Claude Code 这种常驻 `?25l`
+    /// 自绘光标的 TUI 里打中文,拼音串**整个不上屏** —— 而这正是本项目的
+    /// 主场景。两件事必须分两个字段。
+    ///
+    /// 自证会变红:在 `snapshot()`/`cursor()` 的 `visible` 上 AND 一个
+    /// `SHOW_CURSOR` 判据。
+    #[test]
+    fn dectcem_does_not_touch_visible_because_the_preedit_hangs_off_it() {
+        let mut emu = Emulator::new(20, 5);
+        emu.feed(b"\x1b[?25l");
+        assert!(
+            emu.snapshot().cursor.visible,
+            "光标就在可视区里,`visible` 该是 true —— 组字串靠它才画得出来"
+        );
+        assert!(emu.cursor().visible, "轻量版同理");
+    }
+
+    /// F197:隐藏这件事在 `cursor()` 与 `snapshot().cursor` 之间也必须同源。
+    /// 只在一处判的话,IME 候选框定位那条路径看到的是另一套状态。
+    ///
+    /// 自证会变红:把 `cursor()` 里的 `self.cursor_shape()` 换回
+    /// `map_shape(style.shape)`。
+    #[test]
+    fn lightweight_cursor_agrees_on_hiding_too() {
+        let mut emu = Emulator::new(20, 5);
+        emu.feed(b"\x1b[?25l");
+        assert_eq!(emu.cursor(), emu.snapshot().cursor);
     }
 
     /// `cursor()` 是 `snapshot().cursor` 的轻量同源版,新加的两个字段同样必须同源

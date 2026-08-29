@@ -38,8 +38,13 @@ pub const BAR_PX: f32 = 2.0;
 /// 这一帧该怎么画这个 pane 的光标(F125)。**唯一判据源**——`quads_for_panes`
 /// 与测试都走它,不许各写一份。
 ///
+/// - 远端要求隐藏(DECTCEM `?25l` → `Hidden`):恒不画,**这一条压过下面两条**。
 /// - 非焦点 pane:恒 `Hollow`,不看远端形状、不看闪烁相位。
 /// - 焦点 pane:远端要什么形状给什么;闪到「灭」的半周期就不画。
+///
+/// F197 的顺序不是风格问题:`Hidden` 若排在非焦点那支后面,非焦点 pane 会在
+/// 远端明说「别画」的时候画出空心框 —— 而全屏 TUI 自绘期间常驻 `?25l`、把
+/// 真光标停在最后写字那一格,于是画面里随机位置冒出一个光标。
 ///
 /// 两个裸 `bool` 相邻,**顺序是 `focused` 在前、`blink_on` 在后**,传反不会
 /// 编译报错、只会静默画错(非焦点跟着闪、焦点恒空心)。加调用点时照抄这一行。
@@ -49,6 +54,9 @@ pub fn style_for(
     blink_on: bool,
 ) -> CursorStyle {
     use mullion_term::snapshot::CursorShape as S;
+    if shape == S::Hidden {
+        return CursorStyle::None;
+    }
     if !focused {
         return CursorStyle::Hollow;
     }
@@ -1313,6 +1321,9 @@ mod tests {
     /// F125:**非焦点 pane 恒空心框、且不看快照里的形状**。
     /// 4 块分屏一起闪 / 一起画竖线的话,用户看不出键盘输入进了哪一块(§7.1)。
     ///
+    /// `Hidden` 不在这个列表里 —— 它不是「一种形状」而是「别画」,见
+    /// [`a_hidden_cursor_stays_hidden_even_on_an_unfocused_pane`]。
+    ///
     /// 自证会变红:把 `style_for` 里非焦点那一支改成跟焦点一样走 `from_shape`。
     #[test]
     fn unfocused_pane_is_always_hollow_regardless_of_remote_shape() {
@@ -1321,12 +1332,39 @@ mod tests {
             CursorShape::Block,
             CursorShape::Underline,
             CursorShape::HollowBlock,
-            CursorShape::Hidden,
         ] {
             assert_eq!(
                 style_for(shape, false, true),
                 CursorStyle::Hollow,
                 "{shape:?} 在非焦点 pane 上必须是空心框"
+            );
+        }
+    }
+
+    /// F197:**`Hidden` 压过「非焦点恒空心框」这一条**。
+    ///
+    /// 这两条的优先级顺序不是风格问题:`Hidden` 是远端明说「这一刻别画光标」
+    /// (DECTCEM `?25l`),而全屏 TUI 自绘期间常驻这个状态、把真光标停在最后
+    /// 写字那一格。非焦点分支若抢在前面 return,那一格上就画出一个空心框 ——
+    /// 位置随远端最后写到哪儿跳,看着就是「画面里随机冒出个光标」。
+    ///
+    /// 焦点 pane 那支不会撞上这个坑(`Hidden` 会落到 `match` 的 `S::Hidden`),
+    /// 所以症状**只在非焦点 pane 上出现** —— 分屏时格外明显。
+    ///
+    /// 自证会变红:把 `style_for` 里的 `S::Hidden` 提前判那一句删掉
+    /// (退回 `if !focused` 先 return 的顺序)。
+    #[test]
+    fn a_hidden_cursor_stays_hidden_even_on_an_unfocused_pane() {
+        for blink_on in [true, false] {
+            assert_eq!(
+                style_for(CursorShape::Hidden, false, blink_on),
+                CursorStyle::None,
+                "远端要求隐藏,非焦点 pane 也不许画空心框"
+            );
+            assert_eq!(
+                style_for(CursorShape::Hidden, true, blink_on),
+                CursorStyle::None,
+                "焦点 pane 同理"
             );
         }
     }
