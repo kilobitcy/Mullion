@@ -112,6 +112,20 @@ pub fn plan_row<T>(cached: Option<&CachedRow<T>>, is_preedit_row: bool) -> RowPl
     }
 }
 
+/// F196:回收池的地板容量。上限跟着缓存规模走,但小画面/刚启动时缓存本身
+/// 很小,给个地板免得每帧都在临界点上抖。
+pub const POOL_CAP_FLOOR: usize = 256;
+
+/// F196:回收池的上限 —— 缓存里载荷数的两倍,不低于地板。
+///
+/// **两倍不是随手取的**:池子的用途是「第 N 帧滚出去的行,第 N+1 帧新露出
+/// 的行取来用」,而一帧最多回收的量就是缓存规模本身。留两倍 = 留一整帧的
+/// 余量。低于一倍会让滚动稳态退化成每帧新建 —— 那是陷阱 T3,而且**比不做
+/// 差分还慢**,画面却完全正确。
+pub fn pool_cap_for(payloads: usize) -> usize {
+    payloads.saturating_mul(2).max(POOL_CAP_FLOOR)
+}
+
 /// 按 [`ShapeKey`](内容 + `term_w`)分槽的跨帧整形缓存。
 ///
 /// **键是内容不是位置**,理由见模块文档。行号与 `PaneId` 都不在键里:整形
@@ -183,6 +197,11 @@ impl<T> ShapedCache<T> {
             recycle.extend(r.runs.drain(..).map(|x| (x.payload, x.glyphs)));
             false
         });
+        // F196:池子封顶。改之前它只进不出、卡在历史峰值 —— 开过一次八分屏、
+        // 滚过一屏 CJK,那批 buffer 就一直躺着,而长行退下来的单个值 56KB。
+        // 池里的条目彼此可替换(取出来都要重新整形),丢哪一头都一样,
+        // 所以用 O(1) 的 `truncate`。
+        recycle.truncate(pool_cap_for(self.payload_count()));
     }
 
     /// 全清(换字体族/字号/DPI)。载荷同样回收。
@@ -351,6 +370,65 @@ mod tests {
             pool[0].1, 200,
             "回池的 buffer 丢了字形数 → 之后按固定价低报"
         );
+    }
+
+    /// F196:回收池有上限,超出的直接丢。
+    ///
+    /// 改之前 `pool` 只进不出、没有上限,卡在历史峰值:开过一次八分屏、
+    /// 滚过一屏 CJK,那批 buffer 就一直躺着 —— 而按 F192 的实测定价,长 ASCII
+    /// 行退下来的单个值 56KB。稳态需要的量与缓存规模同阶,给两倍就够。
+    ///
+    /// 自证会变红:把 `end_frame` 末尾那句 `truncate` 删掉。
+    #[test]
+    fn the_recycle_pool_is_capped_so_it_cannot_sit_at_the_historic_peak() {
+        let mut c = ShapedCache::<()>::new();
+        let mut pool: Vec<((), u32)> = Vec::new();
+
+        // 一帧塞满,下一帧全不碰 → 全部回池。
+        c.begin_frame();
+        let n = POOL_CAP_FLOOR * 4;
+        for i in 0..n {
+            c.insert(k(i as u64, 80), vec![run()]);
+        }
+        c.end_frame(&mut pool);
+        c.begin_frame();
+        c.end_frame(&mut pool);
+
+        // 此刻缓存空了,上限就是地板。
+        assert_eq!(pool.len(), POOL_CAP_FLOOR, "{n} 个载荷全留着 = 只进不出");
+    }
+
+    /// F196:上限跟着缓存规模走,不是一个拍脑袋的定值。
+    ///
+    /// 稳态下每帧滚出去多少行就滚进来多少行,池子需要的量与缓存里的载荷数
+    /// 同阶。定值上限要么在大画面下不够用(每帧新建,T3),要么在小画面下
+    /// 白留一堆。
+    ///
+    /// 自证会变红:把 `pool_cap_for` 改成返回常量。
+    #[test]
+    fn the_pool_cap_scales_with_the_cache_not_a_magic_number() {
+        assert_eq!(pool_cap_for(0), POOL_CAP_FLOOR);
+        assert_eq!(pool_cap_for(POOL_CAP_FLOOR), POOL_CAP_FLOOR * 2);
+        assert_eq!(pool_cap_for(POOL_CAP_FLOOR * 5), POOL_CAP_FLOOR * 10);
+    }
+
+    /// F196:上限不能低到把**当前这一帧刚回收的**都装不下。
+    ///
+    /// 池子的用途是「第 N 帧滚出去的行,第 N+1 帧新露出的行取来用」。上限
+    /// 卡在缓存规模的两倍,而一帧最多回收的量就是缓存规模本身 —— 两倍留了
+    /// 一帧的余量。低于一倍的话滚动稳态会退化成每帧新建(T3,**比不做差分
+    /// 还慢**),而画面完全正确。
+    ///
+    /// 自证会变红:把倍数从 2 改成 1 以下(如 `payloads / 2`)。
+    #[test]
+    fn the_pool_cap_leaves_room_for_a_whole_frames_worth_of_recycling() {
+        for payloads in [1, 10, POOL_CAP_FLOOR, POOL_CAP_FLOOR * 7] {
+            assert!(
+                pool_cap_for(payloads) >= payloads * 2,
+                "{payloads} 个载荷的缓存,池上限只有 {} —— 滚动稳态会退化成每帧新建",
+                pool_cap_for(payloads)
+            );
+        }
     }
 
     /// 内容变了 → 查不到 → 整形。

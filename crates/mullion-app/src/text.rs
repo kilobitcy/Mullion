@@ -986,6 +986,15 @@ impl TextLayer {
 
         // 帧末逐出:本帧没出现过的带(pane 关了、行数缩了、切了标签)连同它的
         // 顶点缓冲一起丢掉。与 `ShapedCache::end_frame` 同一手法。
+        //
+        // **F196:这一条是安全不变量,不是可调的回收策略。** 有人提过改成
+        // 「N 帧未见才回收」以省一批 GPU 分配 churn —— 不能改:`TextRenderer`
+        // 缓存的顶点里存的是**图集坐标**,而图集会 grow/淘汰/`trim`。休眠的带
+        // 不参与上面的 `prepare`,它那份坐标没人续租也没人作废,等它某帧醒来
+        // 时按陈旧坐标取到的是**别的字形**。症状是画面上出现串字,编译、测试、
+        // 日志全静默,只有人眼能看见(同族的坑见 `docs/gui-render-gotchas.md`
+        // 的 `atlas.trim` 条)。要省 churn 得先给休眠带做坐标续租,那是另一个
+        // 设计,不是把 `== frame` 放宽成 `+ N`。
         slots.retain(|_, s| s.last_seen == frame);
         Ok(())
     }
@@ -1832,6 +1841,26 @@ mod tests {
             .position(|l| l.trim() == marker)
             .unwrap_or(all.len());
         all[..end].to_vec()
+    }
+
+    /// F196:**行带的帧末逐出判据必须是「本帧没出现过就丢」,一帧都不许宽限。**
+    ///
+    /// 这一条被人正经提议过放宽(「N 帧未见才回收,省一批 GPU 分配 churn」),
+    /// 所以它需要的不是一句注释而是一条会变红的断言。休眠的带不参与 `prepare`,
+    /// 它缓存的顶点里那份**图集坐标**没人续租也没人作废;图集 grow/淘汰/`trim`
+    /// 之后那份坐标指向的是别的字形。醒来那一帧画出来的是串字 —— 编译、测试、
+    /// 日志全静默,只有人眼能看见。
+    ///
+    /// 自证会变红:把判据改成 `s.last_seen + 300 >= frame`,或整句删掉。
+    #[test]
+    fn a_band_that_missed_one_frame_is_evicted_because_its_atlas_coords_are_unrenewed() {
+        let needle = concat!("slots.retain(|_, s| s.last_seen ", "== frame);");
+        let hits = prod_lines().iter().filter(|l| l.contains(needle)).count();
+        assert_eq!(
+            hits, 1,
+            "行带逐出那句必须原样存在且判据是「等于本帧」。放宽成 N 帧宽限会让\
+             休眠带拿陈旧图集坐标画出别的字形,而且完全静默。"
+        );
     }
 
     /// F172:**整个 crate 里只许有一处 `atlas.trim()`,且必须挂在
