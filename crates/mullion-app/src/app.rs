@@ -11156,8 +11156,8 @@ fn render_frame(
             diag::count_skipped();
             return (std::time::Duration::MAX, actions);
         }
-        let inst = a.gpu.quad_instances(&quads);
-        Some((inst, quads.len() as u32))
+        // F193:填进常驻实例缓冲,只把实例数带出去 —— 缓冲归 `Gpu` 自己持有。
+        Some(a.gpu.upload_quads(&quads))
     };
 
     diag::mark(diag::Stage::Acquire);
@@ -11223,10 +11223,10 @@ fn render_frame(
             timestamp_writes: ts_writes,
             occlusion_query_set: None,
         });
-        if let Some((inst, n)) = &terminal_draw {
-            a.gpu.draw_quads(&mut pass, inst, *n); // 背景趟
-                                                   // 前景趟:失败(如条目在 prepare 之后被图集淘汰)不 panic,记录并跳过文字层,
-                                                   // 背景色块这帧仍照常提交。
+        if let Some(n) = &terminal_draw {
+            a.gpu.draw_quads(&mut pass, *n); // 背景趟
+                                             // 前景趟:失败(如条目在 prepare 之后被图集淘汰)不 panic,记录并跳过文字层,
+                                             // 背景色块这帧仍照常提交。
             if let Err(e) = a.text.render(&mut pass) {
                 log::warn!(target: "mullion", "glyphon render 失败,跳过本帧文字层: {e:?}");
             }
@@ -20085,7 +20085,7 @@ mod tests {
         // 位置的相对顺序一个都不变,测试照绿,而 launcher 态(没有终端可画)
         // 那些帧的槽 1 就再没人写,`resolve` 读到上一次采样的残留值。
         let block = prod
-            .find("if let Some((inst, n)) = &terminal_draw {")
+            .find("if let Some(n) = &terminal_draw {")
             .expect("终端趟判空块没找到");
         let open = prod[block..].find('{').expect("判空块的左括号") + block;
         let mut depth = 0usize;

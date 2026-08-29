@@ -335,6 +335,15 @@ pub struct Gpu {
     quad_pipeline: wgpu::RenderPipeline,
     resolution_buf: wgpu::Buffer,
     resolution_bind: wgpu::BindGroup,
+    /// F193:**常驻**的 quad 实例缓冲。改之前每帧建一个新的、用完即弃 ——
+    /// gpu_alloc 的 free-list 只涨不还给驱动,那正是把它撑到峰值的机制。
+    /// 容量不够时才按 [`quad_capacity_for`] 翻倍重建。
+    quad_buf: wgpu::Buffer,
+    /// `quad_buf` 现在能装几个 `QuadInstance`。
+    quad_cap: u32,
+    /// F193:CPU 侧暂存,同样常驻。每帧 `clear` + `extend`,容量留着 ——
+    /// 每帧新建一个 `Vec` 就是帧路径上的分配(T3)。
+    quad_staging: Vec<QuadInstance>,
     /// F165:GPU 帧耗时采样。adapter 不支持 TIMESTAMP_QUERY 时是 `None`。
     pub gpu_timer: Option<GpuTimer>,
 }
@@ -645,6 +654,13 @@ impl Gpu {
             cache: None,
         });
 
+        let quad_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quad-instances"),
+            size: u64::from(QUAD_CAP_FLOOR) * std::mem::size_of::<QuadInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             surface,
             device,
@@ -653,6 +669,9 @@ impl Gpu {
             quad_pipeline,
             resolution_buf,
             resolution_bind,
+            quad_buf,
+            quad_cap: QUAD_CAP_FLOOR,
+            quad_staging: Vec::with_capacity(QUAD_CAP_FLOOR as usize),
             gpu_timer,
         }
     }
@@ -684,43 +703,70 @@ impl Gpu {
         );
     }
 
-    /// 把色块转成实例缓冲(每帧一次性上传)。
-    pub fn quad_instances(&self, quads: &[Quad]) -> wgpu::Buffer {
-        let data: Vec<QuadInstance> = quads
-            .iter()
-            .map(|q| QuadInstance {
-                rect: [q.x, q.y, q.w, q.h],
-                color: [
-                    q.color[0] as f32 / 255.0,
-                    q.color[1] as f32 / 255.0,
-                    q.color[2] as f32 / 255.0,
-                    1.0,
-                ],
-            })
-            .collect();
-        self.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    /// F193:把色块填进**常驻**实例缓冲,返回实例数。
+    ///
+    /// 改之前是每帧 `create_buffer_init` 一个新 buffer、用完即弃。单帧的量不大
+    /// (典型 ~200 个 quad × 32 字节 ≈ 6.4KB),**所以别指望 `vram=` 有变化**
+    /// —— 收益在别处:gpu_alloc 的 free-list 只涨不还给驱动,每帧 create/drop
+    /// 正是把它撑到峰值的机制;而 CPU 侧那个每帧新建的 `Vec<QuadInstance>`
+    /// 是实打实的帧路径分配(T3)。两者都由这个函数收口。
+    pub fn upload_quads(&mut self, quads: &[Quad]) -> u32 {
+        self.quad_staging.clear();
+        self.quad_staging.extend(quads.iter().map(|q| QuadInstance {
+            rect: [q.x, q.y, q.w, q.h],
+            color: [
+                q.color[0] as f32 / 255.0,
+                q.color[1] as f32 / 255.0,
+                q.color[2] as f32 / 255.0,
+                1.0,
+            ],
+        }));
+        let n = u32::try_from(self.quad_staging.len()).unwrap_or(u32::MAX);
+        if n == 0 {
+            return 0;
+        }
+        let cap = quad_capacity_for(self.quad_cap, n);
+        if cap != self.quad_cap {
+            self.quad_cap = cap;
+            self.quad_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("quad-instances"),
-                contents: bytemuck::cast_slice(&data),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
+                size: u64::from(cap) * std::mem::size_of::<QuadInstance>() as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.quad_buf, 0, bytemuck::cast_slice(&self.quad_staging));
+        n
     }
 
-    /// 在已开的 render pass 里画所有色块。
-    pub fn draw_quads<'a>(
-        &'a self,
-        pass: &mut wgpu::RenderPass<'a>,
-        inst: &'a wgpu::Buffer,
-        n: u32,
-    ) {
+    /// 在已开的 render pass 里画所有色块。实例数据来自上一句
+    /// [`upload_quads`](Self::upload_quads) 填进常驻缓冲的那一批。
+    pub fn draw_quads<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, n: u32) {
         if n == 0 {
             return;
         }
         pass.set_pipeline(&self.quad_pipeline);
         pass.set_bind_group(0, &self.resolution_bind, &[]);
-        pass.set_vertex_buffer(0, inst.slice(..));
+        pass.set_vertex_buffer(0, self.quad_buf.slice(..));
         pass.draw(0..4, 0..n);
     }
+}
+
+/// F193:实例缓冲的地板容量。`size: 0` 的 wgpu buffer 建不出来,而且几百个
+/// quad 是终端画面的常态 —— 512 × 32 字节 = 16KB,起手就一步到位。
+pub const QUAD_CAP_FLOOR: u32 = 512;
+
+/// F193:实例缓冲的扩容策略。**纯函数** —— `Gpu` 要真实 Device 才构造得
+/// 出来,把这段判断留在方法里等于永远测不到。
+///
+/// 装得下就原样返回(**不重建**,收益全在这一句);不够则至少翻倍摊还,
+/// 免得「每帧多一个 quad」退化成每帧重建。
+pub fn quad_capacity_for(current: u32, needed: u32) -> u32 {
+    if needed <= current && current >= QUAD_CAP_FLOOR {
+        return current;
+    }
+    needed.max(current.saturating_mul(2)).max(QUAD_CAP_FLOOR)
 }
 
 const QUAD_WGSL: &str = r#"
@@ -1622,6 +1668,77 @@ mod tests {
         assert!(
             quads.is_empty(),
             "term_px.w=0 时 bg quad 应被整体丢弃(clamp 后 w<=0),不应留下退化 quad: {quads:?}"
+        );
+    }
+
+    /// F193:装得下就**不重建**。这是整个改动的收益所在。
+    ///
+    /// 改之前每帧 `create_buffer_init` 一个新 buffer 用完即弃,而 gpu_alloc 的
+    /// free-list 只涨不还给驱动 —— 每帧 create/drop 正是把 free-list 撑到峰值的
+    /// 机制。稳态下这个函数必须原样返回当前容量,否则常驻就是白做的。
+    ///
+    /// 自证会变红:让它无条件返回 `needed.next_power_of_two().max(地板)`。
+    /// **第三条断言才杀得掉这个变异** —— 前两条挑的数恰好让变异体算出同一个
+    /// 值(300 和 512 的 `next_power_of_two` 都是 512)。缓冲一旦涨过 1024,
+    /// 变异体会在下一帧把它缩回 512,也就是又开始每帧重建了。
+    #[test]
+    fn a_quad_buffer_that_already_fits_is_not_regrown() {
+        assert_eq!(quad_capacity_for(512, 300), 512);
+        assert_eq!(quad_capacity_for(512, 512), 512, "正好装满也不该重建");
+        assert_eq!(quad_capacity_for(1024, 300), 1024, "涨上去的容量不该缩回来");
+    }
+
+    /// F193:不够时至少翻倍 —— 摊还,免得「每帧多一个 quad」退化成每帧重建。
+    ///
+    /// 自证会变红:把扩容改成 `needed`(刚好够)。
+    #[test]
+    fn a_quad_buffer_grows_at_least_double_so_growth_is_amortized() {
+        assert!(quad_capacity_for(512, 513) >= 1024);
+        assert!(quad_capacity_for(512, 5000) >= 5000, "一次要得多就一步到位");
+    }
+
+    /// F193:起手不低于地板,且地板不为 0(`size: 0` 的 wgpu buffer 建不出来)。
+    ///
+    /// 自证会变红:把 `.max(QUAD_CAP_FLOOR)` 去掉。
+    #[test]
+    fn the_quad_buffer_never_sizes_below_the_floor() {
+        assert_eq!(quad_capacity_for(0, 1), QUAD_CAP_FLOOR);
+        // `size: 0` 的 wgpu buffer 建不出来 —— 地板为 0 时 `Gpu::new` 直接崩。
+        const { assert!(QUAD_CAP_FLOOR > 0) };
+    }
+
+    /// F193:`upload_quads` 里那次 `create_buffer` 必须**紧挨在容量判据下面**。
+    ///
+    /// 这条扎的是「常驻」本身。把 create 挪出那个 `if`(或者判据写成恒真),
+    /// 画面完全正确、测试全绿、日志一片正常 —— 只有 free-list 在后台继续涨,
+    /// 而那正是 F193 要根除的东西。判据用**行下标邻近**而不是「函数体里包含
+    /// quad_cap」:后者对「判据留在别处、create 裸奔」这个变异恒绿(F172 踩过)。
+    ///
+    /// 自证会变红:把 `create_buffer` 那句挪出 `if cap != self.quad_cap`。
+    #[test]
+    fn the_quad_buffer_is_only_recreated_behind_the_capacity_check() {
+        let src = include_str!("gpu.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("gpu.rs 应有测试模块")];
+        let start = src
+            .find(concat!("fn upload_", "quads"))
+            .expect("找不到 upload_quads");
+        // 只扫这一个方法体:第一行 4 空格缩进的 `}` 就是它的收尾。扫过头的话
+        // 会捡到别处的 `create_buffer`,判据就飘了。
+        let body: Vec<&str> = src[start..]
+            .lines()
+            .take_while(|l| *l != "    }")
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//") && !l.is_empty())
+            .collect();
+        let at = body
+            .iter()
+            .position(|l| l.contains(concat!("create_", "buffer(")))
+            .expect("upload_quads 里应有且仅有一处建 buffer");
+        assert!(
+            at > 0 && body[at - 1].contains("quad_cap"),
+            "建 buffer 那句的上一行是 `{}`,不是容量判据 —— 常驻失效了,\
+             每帧照旧新建,而画面完全正确、测试全绿",
+            body.get(at.wrapping_sub(1)).copied().unwrap_or("<无>")
         );
     }
 
