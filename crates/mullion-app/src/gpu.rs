@@ -523,6 +523,19 @@ impl Gpu {
             log::info!(target: "mullion", "adapter 不支持 INSIDE_PASSES,GPU 分层降级为 n/a");
         }
         crate::diag::set_gpu_split_supported(has_split);
+        // F194:GPU 次分配器块大小的旋钮。在 `request_device` 之前读,顺手把
+        // 生效档打进日志 —— 实机对比时得能从日志认出这一趟跑的是哪一档。
+        let block = std::env::var("MULLION_GPU_BLOCK").ok();
+        match gpu_memory_hints(block.as_deref()) {
+            wgpu::MemoryHints::Manual {
+                suballocated_device_memory_block_size: r,
+            } => log::info!(
+                target: "mullion",
+                "GPU 次分配器块 {}..{}MiB(MULLION_GPU_BLOCK={})",
+                r.start >> 20, r.end >> 20, block.as_deref().unwrap_or("")
+            ),
+            h => log::info!(target: "mullion", "GPU 次分配器块 默认档 {h:?}"),
+        }
         let (device, queue) = handle
             .block_on(adapter.request_device(
                 &wgpu::DeviceDescriptor {
@@ -534,15 +547,12 @@ impl Gpu {
                     } else {
                         wgpu::Features::empty()
                     },
-                    // N5:wgpu-hal 的 Vulkan 后端按这个 hint 定次分配器的 chunk
-                    // (其 `vulkan/adapter.rs` 的 gpu_alloc::Config)。默认
-                    // `Performance` 起手就是一整块 128MB;核显(UMA)没有独立显存,
-                    // 这一块直接落进进程私有工作集——空载 289MB 里它一家占 44%。
-                    // 改 `MemoryUsage`(起始 8MB/上限 64MB)后实测空载 289→174MB
-                    // (Radeon 780M,2026-08-27),滚动/中文上屏手感无回退。
-                    // **这行删掉不报错**——静默回落 Performance,只有任务管理器
-                    // 看得出来。守护:tests::the_memory_hint_stays_memory_usage。
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    // N5/F194:wgpu-hal 的 Vulkan 后端按这个 hint 定次分配器的
+                    // chunk(其 `vulkan/adapter.rs` 的 gpu_alloc::Config)。判据
+                    // 全在 `gpu_memory_hints` 里,守护拆成两条(默认档 + 这一行
+                    // 确实走那个函数)。**这行删掉不报错** —— 静默回落
+                    // `Performance`(起手一整块 128MB),只有任务管理器看得出来。
+                    memory_hints: gpu_memory_hints(block.as_deref()),
                     ..Default::default()
                 },
                 None,
@@ -750,6 +760,37 @@ impl Gpu {
         pass.set_bind_group(0, &self.resolution_bind, &[]);
         pass.set_vertex_buffer(0, self.quad_buf.slice(..));
         pass.draw(0..4, 0..n);
+    }
+}
+
+/// F194:GPU 次分配器块大小的旋钮 —— `MULLION_GPU_BLOCK=起手,上限`(MiB)。
+///
+/// **默认档不变**(`MemoryUsage`,起手 8MiB / 上限 64MiB)。这个旋钮是给实机
+/// A/B 用的:核显上更小的块**可能**更省,但没有实测就不该换默认值。
+///
+/// # `Manual` 不是「更紧的 MemoryUsage」
+///
+/// wgpu-hal 23 把 `Manual` 的其余字段填成 `..perf_cfg`(见
+/// `wgpu-hal/src/vulkan/adapter.rs`),也就是 **`Performance` 那一套**:
+/// `dedicated_threshold` 32MiB(`MemoryUsage` 是 8MiB)、
+/// `transient_dedicated_threshold` 128MiB(`MemoryUsage` 是 16MiB)。
+/// 所以 `Manual{4..16}` 在块大小上更紧、在专用分配阈值上反而更松 ——
+/// 实测有可能不降反升。这正是它只当旋钮、不当默认值的原因。
+///
+/// 解析失败一律回默认档:这是给人在命令行上敲的,敲错是常态,不该 panic。
+pub fn gpu_memory_hints(raw: Option<&str>) -> wgpu::MemoryHints {
+    let parse = |raw: &str| -> Option<std::ops::Range<u64>> {
+        let (a, b) = raw.split_once(',')?;
+        let start: u64 = a.trim().parse().ok()?;
+        let end: u64 = b.trim().parse().ok()?;
+        // `0` 起手和 start >= end 都会给 gpu_alloc 一个没人验过的配置,不如不给。
+        (start > 0 && start < end).then_some((start << 20)..(end << 20))
+    };
+    match raw.and_then(parse) {
+        Some(suballocated_device_memory_block_size) => wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size,
+        },
+        None => wgpu::MemoryHints::MemoryUsage,
     }
 }
 
@@ -1671,6 +1712,80 @@ mod tests {
         );
     }
 
+    /// F194:不设旋钮时**默认档不变**,仍是 `MemoryUsage`。
+    ///
+    /// N5 那一刀(289→155MB)的一半就在这个默认值上:不写 `memory_hints` 就
+    /// 静默回落 `Performance`,Vulkan 后端起手一整块 128MB。旋钮是给实机对比
+    /// 用的,不是拿来换默认值的 —— 换默认值得先有实测数据。
+    ///
+    /// 自证会变红:把 `None` 分支改成 `Performance` 或 `Manual`。
+    #[test]
+    fn the_default_memory_hint_is_still_memory_usage() {
+        assert!(matches!(
+            gpu_memory_hints(None),
+            wgpu::MemoryHints::MemoryUsage
+        ));
+    }
+
+    /// F194:`MULLION_GPU_BLOCK=4,16` → 起手 4MiB、上限 16MiB。
+    ///
+    /// 自证会变红:把两个数的顺序调换,或忘了 `<< 20`(按字节解释)。
+    #[test]
+    fn the_gpu_block_knob_reads_two_numbers_as_mib() {
+        let wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: r,
+        } = gpu_memory_hints(Some("4,16"))
+        else {
+            panic!("设了旋钮就该走 Manual 档");
+        };
+        assert_eq!(r.start, 4 << 20);
+        assert_eq!(r.end, 16 << 20);
+    }
+
+    /// F194:旋钮写坏了**回默认档**,不 panic、不静默用半个值。
+    ///
+    /// 这是给人在实机命令行上敲的东西,敲错是常态。start > end 也算坏 ——
+    /// gpu_alloc 拿一个空 Range 会怎样没人验过,不如不给它。
+    ///
+    /// 自证会变红:把解析改成 `.unwrap()`,或去掉 `start < end` 那一条。
+    #[test]
+    fn a_malformed_gpu_block_knob_falls_back_to_the_default() {
+        for bad in ["", "4", "4,", "a,16", "4,16,64", "16,4", "0,16"] {
+            assert!(
+                matches!(gpu_memory_hints(Some(bad)), wgpu::MemoryHints::MemoryUsage),
+                "`{bad}` 该回默认档"
+            );
+        }
+    }
+
+    /// F194:`DeviceDescriptor` 的 `memory_hints` 必须走那个具名函数。
+    ///
+    /// 这一条与 `the_default_memory_hint_is_still_memory_usage` 是**一对**:
+    /// 那条钉住函数的默认分支,这条钉住接线确实经过它。原先只有一条按整行
+    /// 字面量匹配 `MemoryHints::MemoryUsage,` 的守护,加了旋钮之后那行不再
+    /// 是字面量,单靠它就不成立了 —— 拆成两条各扎一头。
+    ///
+    /// 自证会变红:在 `DeviceDescriptor` 里把字面量写回去(绕开函数)。
+    #[test]
+    fn the_device_descriptor_gets_its_hint_from_the_named_function() {
+        let src = include_str!("gpu.rs");
+        let src = &src[..src.find("#[cfg(test)]").expect("gpu.rs 应有测试模块")];
+        let hits: Vec<&str> = src
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.starts_with("memory_hints:"))
+            .collect();
+        assert_eq!(
+            hits,
+            [concat!(
+                "memory_hints: gpu_memory_",
+                "hints(block.as_deref()),"
+            )],
+            "memory_hints 没走具名函数 —— 默认档那条守护就扎不到真实接线点了"
+        );
+    }
+
     /// F193:装得下就**不重建**。这是整个改动的收益所在。
     ///
     /// 改之前每帧 `create_buffer_init` 一个新 buffer 用完即弃,而 gpu_alloc 的
@@ -1739,31 +1854,6 @@ mod tests {
             "建 buffer 那句的上一行是 `{}`,不是容量判据 —— 常驻失效了,\
              每帧照旧新建,而画面完全正确、测试全绿",
             body.get(at.wrapping_sub(1)).copied().unwrap_or("<无>")
-        );
-    }
-
-    /// N5:`request_device` 的 `memory_hints` 不写就静默回落 `Performance`——
-    /// wgpu 的 Vulkan 次分配器起手一整块 128MB,核显(UMA)机器上空载内存直接
-    /// +115MB,而编译、测试、日志全绿,只有任务管理器看得出来。
-    ///
-    /// 按行匹配且跳过注释行:整行注释掉(`// memory_hints: …`)必须一样变红,
-    /// 光 `src.contains(…)` 对这种变异恒绿。
-    /// 自证会变红:删掉那一行,或把 `MemoryUsage` 改回 `Performance`。
-    #[test]
-    fn the_memory_hint_stays_memory_usage() {
-        let src = include_str!("gpu.rs");
-        let src = &src[..src.find("#[cfg(test)]").expect("gpu.rs 应有测试模块")];
-        let hits: Vec<&str> = src
-            .lines()
-            .map(str::trim_start)
-            .filter(|l| !l.starts_with("//"))
-            .filter(|l| l.starts_with("memory_hints:"))
-            .collect();
-        assert_eq!(
-            hits,
-            ["memory_hints: wgpu::MemoryHints::MemoryUsage,"],
-            "DeviceDescriptor 必须显式写 MemoryHints::MemoryUsage\
-             (不写 = Performance = Vulkan 后端起手 128MB chunk,空载 289MB 的主犯)"
         );
     }
 }
