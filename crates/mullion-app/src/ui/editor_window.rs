@@ -52,6 +52,10 @@ pub struct EditorState {
     /// 不这样做的话,停止钉满屏几何后 egui 会把上一帧的全屏尺寸当成窗口
     /// 当前状态一直留着,「还原」等于没按。
     pub restore_to: Option<egui::Rect>,
+    /// F208:上一帧实测的「外壳」尺寸(外框减内容区)= 标题栏 + 四圈边距。
+    /// `Window::max_size` 管内容区,而尺寸预算说的是外框,差的就是这一截。
+    /// 首帧还没量到,按零算,第二帧收敛。见 `max_size`。
+    pub chrome: egui::Vec2,
     /// F204:还要摆正几帧。开窗时是 2,每帧减一,归零后位置归用户拖。
     ///
     /// **不能只靠 `Window::default_pos`**:egui 把窗口位置记在 `Memory` 里,
@@ -89,6 +93,7 @@ impl EditorState {
             maximized: false,
             last_rect: None,
             restore_to: None,
+            chrome: egui::Vec2::ZERO,
             centre_frames: 2,
         }
     }
@@ -136,7 +141,37 @@ impl EditorState {
 
 /// 窗口的默认大小。`centred_rect` 与 `Window::default_size` 共用一份 ——
 /// 两处各写一遍的话,首帧钉的框和 egui 自己算的框会差一点,窗口开出来抖一下。
-const DEFAULT_SIZE: egui::Vec2 = egui::vec2(720.0, 480.0);
+///
+/// F208:从 720×480 提到 1100×760。480 点高的窗口里,减掉标题行/只读提示/
+/// 换行选择/两条分隔线/底部按钮行之后正文只剩十来行,编辑一个配置文件都要
+/// 一直滚。宽度提到 1100 是为了让 100 列以内的行不折行(远端配置和日志的
+/// 常见宽度)。
+const DEFAULT_SIZE: egui::Vec2 = egui::vec2(1100.0, 760.0);
+
+/// F208:窗口上限占主窗口客户区的比例。
+///
+/// 用户实报「编辑器底部被 Windows 11 任务栏遮挡」。根因是 egui 的 `Resize`
+/// 每帧都做 `desired_size = desired_size.max(last_content_size)`(0.30 的
+/// `containers/resize.rs:258`),而本窗口的正文高度又是从窗口可用高度反推的
+/// —— 两者互为因果,一帧涨一点,直到撞上 egui 的约束框(= 主窗口客户区,
+/// 它本身可能就压在任务栏底下)。`default_size` 治不了:它只在这个窗口 id
+/// **第一次出现**那一帧生效,之后 `Resize` 从 `Memory` 里读老尺寸。
+///
+/// 留 15% 的余量,窗口四周始终看得见底下的终端,「这是个浮窗、可以关掉」
+/// 一眼就成立。
+const MAX_SIZE_RATIO: f32 = 0.85;
+
+/// F208:这一帧交给 `Window::max_size` 的上限。
+///
+/// **`max_size` 管的是内容区,而挡住任务栏的是外框** —— 两者差着标题栏加
+/// 四圈边距(默认样式下约 50 点,随字号/DPI 变)。所以预算要先把外壳那一截
+/// 扣掉;`chrome` 由上一帧实测(外框尺寸减内容区尺寸)得来,首帧没有,按
+/// 零估,下一帧就收敛。**不照抄 egui 内部那套 `title_bar_height + margins`
+/// 的算法**:那是私有实现,版本一变就静默算错,而实测的差值永远是对的。
+fn max_size(screen: egui::Rect, chrome: egui::Vec2) -> egui::Vec2 {
+    // 夹一个下界,免得极小窗口 + 大 chrome 算出负数(egui 会拿它当 min 用)。
+    (screen.size() * MAX_SIZE_RATIO - chrome).max(egui::vec2(320.0, 240.0))
+}
 
 /// F204:一打开就摆在屏幕正中 —— 窗口左上角该落在哪。
 ///
@@ -214,20 +249,38 @@ pub fn show(
     let mut win = egui::Window::new("编辑文件")
         .collapsible(false)
         .resizable(true)
-        .default_size(DEFAULT_SIZE);
+        .default_size(DEFAULT_SIZE)
+        // F208:上限 —— 这一条才是「不再撑到任务栏底下」的判据,见 `max_size`。
+        .max_size(max_size(screen, s.chrome))
+        // F206:焦点描边三处同源。编辑器是模态(`Modal::Editor`),永远持有
+        // 键盘,所以这里**不做条件判断** —— 条件恒真的边框写成 `if` 只会
+        // 让人以为它会灭。egui 默认的窗口边框是白 6%、圆角 6,与 pane 的
+        // 焦点线不是一回事。
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .stroke(theme::focus_ring(t))
+                .rounding(theme::FOCUS_RING_ROUNDING),
+        );
     if let Some(r) = pin {
         win = win.current_pos(r.min).fixed_size(r.size());
     } else if let Some(p) = centre {
         // 最大化/还原优先:那两个也在钉几何,同一帧里抢起来会打架。
-        win = win.current_pos(p);
+        //
+        // F208:开窗那两帧**连尺寸一起钉**,把 `Resize` 存在 `Memory` 里的
+        // 老尺寸冲掉 —— 上一次被撑大的那个值否则会一直传下去,用户每次
+        // 打开都得手动拖回来。钉完就放手,拖拽/最大化照旧。
+        win = win.current_pos(p).fixed_size(DEFAULT_SIZE);
     }
     if !was_maximized {
         // 还原信号只用这一帧。
         s.restore_to = None;
     }
 
+    // F208:量这一帧的内容区,配着外框算出「外壳」有多厚(见 `max_size`)。
+    let mut content = egui::Vec2::ZERO;
     let resp = win.show(ctx, |ui| {
         crate::ui::annotate::mark(ui.ctx(), "内置编辑器".to_string(), ui.max_rect());
+        content = ui.max_rect().size();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&title).color(theme::c32(t.fg_mid)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -282,6 +335,15 @@ pub fn show(
             ui.add(
                 egui::TextEdit::multiline(&mut s.text)
                     .code_editor()
+                    // F207:正文区底色 = 终端底色 `term_bg`。用户看的是远端
+                    // 文件,底色跟终端一致才连得上「这就是那台机器上的东西」;
+                    // 而窗口壳仍是 `modal_bg`(#3f3f3f),两层色差本身就是
+                    // 「哪块能打字」的边界。
+                    //
+                    // 走 `background_color` 而不是改 `Visuals::extreme_bg_color`
+                    // ——后者是全局量,一改所有 `TextEdit`(会话表单、路径条、
+                    // 改名框)跟着变,而那些贴在 `panel_bg` 上、本来就配好了。
+                    .background_color(theme::c32(t.term_bg))
                     .desired_width(f32::INFINITY)
                     .desired_rows(20)
                     // 只读一律靠这一条落地。靠「保存按钮置灰」是不够的:
@@ -328,6 +390,11 @@ pub fn show(
         if let Some(r) = &resp {
             s.last_rect = Some(r.response.rect);
         }
+    }
+    // F208:外框减内容区 = 外壳。跟 `last_rect` 分开更新 —— 最大化的那些帧
+    // 内容区照样量得准,而 `last_rect` 是故意不更新的(它是「还原」的目标)。
+    if let Some(r) = &resp {
+        s.chrome = (r.response.rect.size() - content).max(egui::Vec2::ZERO);
     }
 
     if close {
@@ -627,12 +694,65 @@ mod tests {
         );
     }
 
+    /// F208:装一个很长的文件也不许把窗口撑出屏幕。
+    ///
+    /// 用户实报「编辑器底部被 Windows 11 任务栏遮挡」。egui 的 `Resize` 每帧
+    /// `desired_size = desired_size.max(last_content_size)`,而本窗口的正文
+    /// 高度又是从窗口可用高度反推的 —— 两者互为因果,一帧涨一点。跑够帧数
+    /// 才看得见:只跑三帧的话涨幅还没超过默认尺寸,断言会空过。
+    ///
+    /// 自证会变红:把 `.max_size(max_size(screen, s.chrome))` 那一行删掉
+    /// (实测 1038.7 点 > 918 点预算)。
+    #[test]
+    fn a_long_file_cannot_ratchet_the_window_past_the_screen_budget() {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let mut s = editable();
+        // 两千行 —— 远超任何窗口高度,正文的自然高度稳稳撑满可用空间。
+        s.as_mut().unwrap().text = "x\n".repeat(2000);
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        for _ in 0..40 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .values_mut()
+                .for_each(|v| v.inner_rect = Some(screen));
+            let _ = ctx.run(input, |ctx| {
+                show(ctx, &t, &mut s);
+            });
+        }
+        let r = s.as_ref().unwrap().last_rect.expect("窗口几何没落定");
+        // 判据直接写「外框不超过屏幕的 85%」,不拿 `max_size` 反推 ——
+        // 反推等于把被测函数抄一遍,它算错了这里也跟着错。
+        let cap = screen.size() * MAX_SIZE_RATIO;
+        assert!(
+            r.height() <= cap.y + 1.0,
+            "窗口高 {} 超了预算 {} —— 底边会压到任务栏底下",
+            r.height(),
+            cap.y
+        );
+        assert!(
+            r.width() <= cap.x + 1.0,
+            "窗口宽 {} 超了预算 {}",
+            r.width(),
+            cap.x
+        );
+        // 反面:窗口得真的画出来了,否则上面两条在一个零尺寸的框上也成立。
+        assert!(
+            r.height() > 100.0 && r.width() > 100.0,
+            "窗口压根没铺开({r:?})—— 上面两条断言什么也没守住"
+        );
+    }
+
     /// F204:`centred_pos` 是「摆哪儿」的唯一出口,纯函数,用具体数字锁死。
     #[test]
     fn centred_pos_puts_the_window_in_the_middle_using_the_measured_size() {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
-        // 第一帧没量到尺寸 —— 按 DEFAULT_SIZE(720×480)估。
-        assert_eq!(centred_pos(screen, None), egui::pos2(600.0, 300.0));
+        // 第一帧没量到尺寸 —— 按 DEFAULT_SIZE(F208 起 1100×760)估。
+        assert_eq!(centred_pos(screen, None), egui::pos2(410.0, 160.0));
         // 第二帧拿真实尺寸重摆:窗口比默认矮,左上角就该往下挪。
         assert_eq!(
             centred_pos(screen, Some(egui::vec2(732.0, 388.0))),

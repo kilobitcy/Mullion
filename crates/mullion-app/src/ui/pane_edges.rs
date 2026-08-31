@@ -55,9 +55,9 @@ pub fn divider_lines_of(g: &PaneGeom, ppp: f32) -> (Option<PxRect>, Option<PxRec
     (right, bottom)
 }
 
-/// 焦点描边的宽度(逻辑点)。1 点 —— 再粗就从「提示」变成「装饰」,
-/// 用户明确要的是「不干扰视觉重点」。
-const RING_W: f32 = 1.0;
+/// 焦点描边的宽度(逻辑点)。F206 起搬进 `theme`,三处共用一份 ——
+/// 这里只是个转发别名,`shrink(RING_W / 2)` 那句读起来才不至于换行。
+const RING_W: f32 = theme::FOCUS_RING_W;
 
 /// 画分界线 + 焦点描边。
 ///
@@ -90,8 +90,8 @@ pub fn paint(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) {
             // 不缩的话有半个像素落在 pane 之外、压到邻居身上。
             p.rect_stroke(
                 to_pt(v.geom.px).shrink(RING_W / 2.0),
-                0.0,
-                egui::Stroke::new(RING_W, theme::c32(t.accent)),
+                theme::FOCUS_RING_ROUNDING,
+                theme::focus_ring(t),
             );
         }
     }

@@ -91,7 +91,11 @@ mod tests {
         let a = led.issue("会话A");
         let b = led.issue("会话B");
         assert_ne!(a, b, "两次拨号必须拿到不同票号,否则后一张会顶掉前一张");
-        assert_eq!(led.claim(a), Some("会话A"), "先发起的那条认领到了别人的身份");
+        assert_eq!(
+            led.claim(a),
+            Some("会话A"),
+            "先发起的那条认领到了别人的身份"
+        );
         assert_eq!(led.claim(b), Some("会话B"), "后发起的那条也要认得回自己");
     }
 

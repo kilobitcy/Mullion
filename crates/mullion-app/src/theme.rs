@@ -331,6 +331,25 @@ pub fn c32(c: Rgb) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
+/// F206:焦点描边的宽度(逻辑点)。1 点 —— 再粗就从「提示」变成「装饰」。
+pub const FOCUS_RING_W: f32 = 1.0;
+
+/// F206:焦点描边的圆角。**直角**。
+///
+/// 用户实报:pane 的焦点线是直角细线,文件面板却是 2 点圆角框,同一个语义
+/// (「键盘现在归我」)在屏幕上有两种长相,眼睛得学两遍。
+pub const FOCUS_RING_ROUNDING: egui::Rounding = egui::Rounding::ZERO;
+
+/// F206:焦点描边。**三处(pane 边框 / 文件面板 / 内置编辑器窗口)共用这一个
+/// 出口**,`FOCUS_RING_ROUNDING` 一起用。
+///
+/// 各处自己 `Stroke::new(w, c32(t.accent))` 的写法必然漂移 —— 走查前它已经
+/// 漂成了三套(1.0 直角 / 2.0 圆角 4 / egui 默认的白 6% 圆角 6)。机械守护见
+/// `tests::focus_rings_all_come_from_one_place`。
+pub fn focus_ring(t: &Theme) -> egui::Stroke {
+    egui::Stroke::new(FOCUS_RING_W, c32(t.accent))
+}
+
 /// 主题描边(白 + 低 alpha)。
 pub fn stroke(t: &Theme) -> egui::Stroke {
     egui::Stroke::new(1.0, egui::Color32::from_white_alpha(t.stroke_alpha))

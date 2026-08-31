@@ -496,11 +496,16 @@ pub fn show(
     annotate::mark(ui.ctx(), format!("文件面板/{id}"), ui.max_rect());
     // 焦点在场才画——常亮等于没有信息量(协调者复核 #2)。颜色取既有语义色
     // `t.accent`(选中态同款),不新造色值(UI 视觉规格已冻结,见 spec §4.6)。
+    //
+    // F206:线宽/圆角改走 `theme::focus_ring` 一个出口 —— 从前这里是
+    // 2 点圆角框、pane 那边是 1 点直角线,同一个语义两种长相。下面那两处
+    // 也画整栏描边,但**语义不同**(拖放落点,不是焦点),故意留粗留圆角:
+    // 两者能同时出现,长得一样的话用户分不出「键盘归我」和「松手会落这儿」。
     if focused {
         ui.painter().rect_stroke(
             ui.max_rect(),
-            egui::Rounding::same(4.0),
-            egui::Stroke::new(2.0, theme::c32(t.accent)),
+            theme::FOCUS_RING_ROUNDING,
+            theme::focus_ring(t),
         );
     }
 
@@ -2734,7 +2739,8 @@ mod tests {
 
     /// 在渲染结果的形状树里数「描边颜色是 `color`、宽度 > 0」的矩形个数 ——
     /// 焦点边框就是这么画的(`show` 里 `ui.painter().rect_stroke(...,
-    /// Stroke::new(2.0, theme::c32(t.accent)))`)。跟 `find_text_pos` 一样
+    /// theme::focus_ring(t))`,F206 起线宽/圆角走 theme 一个出口)。跟
+    /// `find_text_pos` 一样
     /// 要递归 `Shape::Vec`,egui 把子控件的形状树套在里面一层。
     fn count_stroked_rects(shapes: &[egui::epaint::ClippedShape], color: egui::Color32) -> usize {
         fn walk(shape: &egui::Shape, color: egui::Color32, n: &mut usize) {
@@ -2755,6 +2761,32 @@ mod tests {
             walk(&cs.shape, color, &mut n);
         }
         n
+    }
+
+    /// 同上,但把矩形本身收出来 —— 判「画了几个」不够时(F206 要判线宽和
+    /// 圆角)拿这个。
+    fn collect_stroked_rects(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+    ) -> Vec<egui::epaint::RectShape> {
+        fn walk(shape: &egui::Shape, color: egui::Color32, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, color, out);
+                    }
+                }
+                egui::Shape::Rect(r) if r.stroke.color == color && r.stroke.width > 0.0 => {
+                    out.push(*r);
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for cs in shapes {
+            walk(&cs.shape, color, &mut out);
+        }
+        out
     }
 
     /// 数一数有多少个指定填充色的矩形。`w_range` 用来把宽窄不同的两种矩形
@@ -2875,6 +2907,57 @@ mod tests {
             "面板没有键盘焦点时不该画任何焦点边框(常亮 = 没有信息量)"
         );
         assert_eq!(render(true), 1, "面板持有键盘焦点时必须画出焦点边框");
+    }
+
+    /// F206:文件面板的焦点框跟 pane 的焦点线**长得一样** —— 细线、直角。
+    ///
+    /// 用户实报:同一个语义(「键盘现在归我」)在屏幕上有两种长相。走查前
+    /// 这里是 2 点、圆角 4,pane 那边是 1 点、直角。判据钉在 `theme` 的常量
+    /// 上而不是抄一遍数字:换了那个常量,三处该一起变。
+    ///
+    /// 自证会变红:把 `show` 里的 `theme::focus_ring(t)` 换回
+    /// `egui::Stroke::new(2.0, theme::c32(t.accent))`,或者把
+    /// `theme::FOCUS_RING_ROUNDING` 换回 `egui::Rounding::same(4.0)`。
+    #[test]
+    fn the_files_panel_focus_ring_is_the_same_thin_square_line_as_a_pane_edge() {
+        let t = crate::theme::MULLION_DARK;
+        let accent = theme::c32(t.accent);
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut rings = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        true,
+                        BookmarkView::none(),
+                        0,
+                        &mut cols,
+                    );
+                });
+            });
+            rings = collect_stroked_rects(&out.shapes, accent);
+        }
+        assert_eq!(rings.len(), 1, "焦点框没画出来 —— 下面两条断言会空过");
+        assert_eq!(
+            rings[0].stroke.width,
+            crate::theme::FOCUS_RING_W,
+            "焦点框的线宽跟 pane 的焦点线不一致"
+        );
+        assert_eq!(
+            rings[0].rounding,
+            crate::theme::FOCUS_RING_ROUNDING,
+            "焦点框是圆角的 —— pane 那条是直角,同一个语义两种长相"
+        );
     }
 
     /// 代码复核挖出的真 bug:`ScrollArea` 的持久化 id 若只拼 `id`
