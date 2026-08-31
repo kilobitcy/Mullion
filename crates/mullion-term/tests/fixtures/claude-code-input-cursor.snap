@@ -1,0 +1,33 @@
+cursor row=25 col=4 visible=true shape=Hidden blinking=true
+inverse cells: [25,4]
+--- grid ---
+00|
+01|╭─── Claude Code v2.1.236 ─────────────────────────────────────────────────────────────────────────╮
+02|│                                                    │ Tips for getting started                    │
+03|│                Welcome back tester!                │ Run /init to create a CLAUDE.md file with … │
+04|│                                                    │ ─────────────────────────────────────────── │
+05|│                       ▐▛███▛█                      │ What's new                                  │
+06|│                      ▝▜██████▀                     │ Introducing Claude Fable 5: a Mythos-class… │
+07|│                        ▝▝ ▝▝                       │ Fixed sessions not saving transcripts (and… │
+08|│       Opus 5 with high effort · Claude Max ·       │ Self-hosted runner: added a `post-session`… │
+09|│       devs@example.invalid's Organization          │ /release-notes for more                     │
+10|│                        /tmp                        │                                             │
+11|╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+12|
+13|
+14|
+15|
+16|
+17|
+18|
+19|
+20|
+21|
+22|
+23|
+24|────────────────────────────────────────────────────────────────────────────────────────────────────
+25|❯ hi
+26|────────────────────────────────────────────────────────────────────────────────────────────────────
+27|   ORG  | tmp | tmux:p:0 | Opus 5·300K·high
+28|  ctx:-- | bg:0
+29|  ⏵⏵ auto mode on (shift+tab to cycle)

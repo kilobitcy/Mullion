@@ -365,15 +365,31 @@ impl Emulator {
                 // SGR 1 把前景基色提到亮色(判据与理由见 `palette::bold_brighten`)。
                 // **只动前景**:`\e[1;44m` 里的 bold 说的是前景,背景一起提亮会让
                 // 反色块整体发光。
-                let fg = if flags.contains(Flags::BOLD) {
+                let base_fg = if flags.contains(Flags::BOLD) {
                     palette::bold_brighten(cell.fg)
                 } else {
                     cell.fg
                 };
+                let mut fg = palette::resolve(base_fg, colors, self.defaults);
+                let mut bg = palette::resolve(cell.bg, colors, self.defaults);
+                // SGR 7 反显:对调前景/背景(F198)。**在解析之后对调**,与
+                // alacritty 的 `RenderableCell::new` 同序 —— 上面的 bold 提亮
+                // 说的是「程序选的那个前景」,先提亮再整体对调才和真终端一致。
+                //
+                // 这一条是本项目主场景的刚需:隐掉真光标(`?25l`)、改用一格
+                // 反显块自绘输入位置是 Ink/readline 系 TUI 的标准做法,Claude
+                // Code 的输入框正是如此。不认 SGR 7 的话那格退化成普通空格,
+                // 输入框里没有任何光标指示。
+                //
+                // 只接 SGR 7;DECSCNM(`?5h` 整屏反显)未接,那是 `TermMode` 上
+                // 的另一件事,真机未见需求。
+                if flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
                 cells.push(SnapCell {
                     ch: cell.c,
-                    fg: palette::resolve(fg, colors, self.defaults),
-                    bg: palette::resolve(cell.bg, colors, self.defaults),
+                    fg,
+                    bg,
                     width: if flags.contains(Flags::WIDE_CHAR) {
                         2
                     } else {
@@ -652,6 +668,74 @@ mod tests {
             Rgb::new(0x00, 0x37, 0xda),
             "背景不该跟着 bold 提亮"
         );
+    }
+
+    /// F198:**SGR 7(反显)必须交换前景/背景。**
+    ///
+    /// 这不是个"锦上添花的属性":隐掉真光标(DECTCEM `?25l`)、改用一格反显块
+    /// 自绘输入位置,是 Ink / readline 这类 TUI 的标准做法 —— **Claude Code 的
+    /// 输入框就是这么画的**(实录字节流:每帧 `❯ …\x1b[7m \x1b[0m`,全程 `?25l`
+    /// 不再 `?25h`)。不认 SGR 7 的症状是那格反显空格退化成普通空格,于是输入框
+    /// 里**没有任何光标指示**,用户不知道下一个字打在哪儿 —— 而这正是本项目的
+    /// 主场景。
+    ///
+    /// 交换发生在**颜色解析之后**(与 alacritty 的 `RenderableCell::new` 同序),
+    /// 所以 bold 提亮先作用在前景上,再整体对调。
+    ///
+    /// 自证会变红:把 `snapshot` 里 `Flags::INVERSE` 那一段删掉。
+    #[test]
+    fn inverse_swaps_fg_and_bg_because_that_is_the_cursor_claude_code_draws() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[7m ");
+        let c = emu.snapshot().row(0)[0];
+        assert_eq!(
+            c.bg,
+            crate::palette::DEFAULT_FG,
+            "反显格的底该是默认前景色,否则输入框里那个光标块整个消失"
+        );
+        assert_eq!(
+            c.fg,
+            crate::palette::DEFAULT_BG,
+            "反显格的字色该是默认背景色"
+        );
+    }
+
+    /// F198:`SGR 27` 关掉反显之后必须复原。属性是有状态的,只在开的那一侧
+    /// 接一半的话,反显块之后的整行都会顶着对调过的颜色画下去。
+    ///
+    /// 自证会变红:把 `Flags::INVERSE` 的判据换成"这一行出现过反显"之类的
+    /// 粘滞写法。
+    #[test]
+    fn turning_inverse_off_restores_the_normal_colors() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[7mA\x1b[27mB");
+        let snap = emu.snapshot();
+        assert_eq!(snap.row(0)[0].bg, crate::palette::DEFAULT_FG, "A 仍是反显");
+        assert_eq!(
+            snap.row(0)[1].bg,
+            crate::palette::DEFAULT_BG,
+            "SGR 27 之后该回到正常底色"
+        );
+        assert_eq!(snap.row(0)[1].fg, crate::palette::DEFAULT_FG);
+    }
+
+    /// F198:反显作用在**解析后**的颜色上,bold 提亮先发生。
+    ///
+    /// 顺序反了(先对调再提亮)的症状是:提亮会落到"原本的背景色"上,`\e[1;7;34m`
+    /// 这类写法画出来的底色和真终端不是同一个 —— 而 TUI 的高亮条大量用它。
+    ///
+    /// 自证会变红:把 `snapshot` 里的对调挪到 `bold_brighten` 之前。
+    #[test]
+    fn inverse_happens_after_bold_brightening_not_before() {
+        let mut emu = Emulator::new(4, 1);
+        emu.feed(b"\x1b[1;7;34mD");
+        let c = emu.snapshot().row(0)[0];
+        assert_eq!(
+            c.bg,
+            Rgb::new(0x3b, 0x78, 0xff),
+            "bold+blue 该先提亮成 bright blue,再对调到背景上"
+        );
+        assert_eq!(c.fg, crate::palette::DEFAULT_BG);
     }
 
     #[test]
