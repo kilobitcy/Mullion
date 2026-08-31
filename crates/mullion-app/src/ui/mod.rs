@@ -531,6 +531,17 @@ pub struct UiActions {
     /// egui 的 discard 趟被静默吃掉,而且默认没有任何测试会变红。
     pub files_remote: Option<files_panel::FileAction>,
     pub files_local: Option<files_panel::FileAction>,
+    /// F199:这一帧用户在文件面板里按下了鼠标 —— 键盘焦点该跟到面板上。
+    ///
+    /// 活动栏(远端/本地)由面板自己就地改在 `PanelFrame::active_column` 上;
+    /// 这条只带「焦点归属」这一件 `app.rs` 才管得了的事。
+    ///
+    /// 在这之前 `App::focus` 只有 F6 改得动:用户点开侧栏、点了个文件、按
+    /// F5,那个 F5 一路发给了远端的 Claude Code(v0.1.84 用户实报)。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话这次切焦点会在
+    /// egui 的 discard 趟被静默吃掉,表现为「有时候点了没用」。
+    pub files_focus_click: bool,
     /// F52:这一帧从资源管理器**松手**扔进窗口的绝对路径。空 = 没扔。
     ///
     /// 不是 `Option<..>` 而是 `Vec`:一次拖放天然是一批,空 `Vec` 就是
@@ -735,6 +746,7 @@ pub fn build_ui(
             frame.files_focused,
             files,
             hovering,
+            &mut actions.files_focus_click,
         );
         actions.files_remote = r;
         actions.files_local = l;
@@ -890,6 +902,7 @@ pub fn build_ui(
             hovering,
             &mut ui_state.files_cols,
             &mut ui_state.files_panel_rect,
+            &mut actions.files_focus_click,
         );
         actions.files_remote = r;
         actions.files_local = l;

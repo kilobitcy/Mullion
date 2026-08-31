@@ -1071,6 +1071,16 @@ fn files_path_editing_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> bool {
         .is_some_and(|f| f.remote.path_edit.is_some() || f.local.path_edit.is_some())
 }
 
+/// `files_renaming` 的纯逻辑核心,理由同 `files_path_editing_of`。
+///
+/// **只看远端栏**:本地栏根本进不了改名编辑态(设计 D5)。
+fn files_renaming_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> bool {
+    files_owner_generation_of(tabs, sidebar_open)
+        .and_then(|g| tabs.by_generation(g))
+        .and_then(|t| t.content.files_panel())
+        .is_some_and(|f| f.remote.rename_edit.is_some())
+}
+
 /// `App::effective_focus` 的纯逻辑核心,理由同上。三条分支里前两条(活动标签
 /// 是 Terminal、侧栏开/关)能用真实构造的 `TerminalTab` 单测;第三条(活动
 /// 标签是 Files)测不到——`FilesTab::conn` 是 `Arc<SshConnection>`,
@@ -2195,6 +2205,12 @@ enum Modal {
     ///
     /// **不进 `touched_store`**:它一行 store 都不写(同 `Rehost` 的姿态)。
     FilesPathEdit,
+    /// F200:文件面板里有一行正在**就地改名**。理由与 `FilesPathEdit`
+    /// 逐字相同 —— 那个输入框收不到任何键(T8),而 Backspace 还会被
+    /// `handle_panel_key` 解释成「回上级目录」,一按就跳走。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写(同 `FilesPathEdit`)。
+    FilesRename,
     /// F148:「恢复上次的现场」弹窗。里面没有输入框,但有一颗一按就摆回
     /// 整个标签栏的「恢复」按钮,而空格/回车在 egui 里是按钮的激活键 ——
     /// 同 `Modal::Import` 的理由(T8)。
@@ -2217,6 +2233,7 @@ impl Modal {
         Modal::ExitConfirm,
         Modal::Rehost,
         Modal::FilesPathEdit,
+        Modal::FilesRename,
         Modal::History,
     ];
 }
@@ -3378,6 +3395,8 @@ impl App {
             Modal::Rehost => self.ui.rehost.is_some(),
             // F131:见 `Modal::FilesPathEdit` 的说明。
             Modal::FilesPathEdit => self.files_path_editing(),
+            // F200:见 `Modal::FilesRename` 的说明。
+            Modal::FilesRename => self.files_renaming(),
             // F148:见 `Modal::History` 的说明(T8)。
             Modal::History => self.ui.history.is_some(),
         })
@@ -3407,6 +3426,11 @@ impl App {
     /// 干净的编辑缓冲就把整个窗口判成模态。纯逻辑核心是 `files_path_editing_of`。
     fn files_path_editing(&self) -> bool {
         files_path_editing_of(&self.tabs, self.ui.files_sidebar_open)
+    }
+
+    /// F200:文件面板里有没有一行正在就地改名(`Modal::FilesRename` 的判据)。
+    fn files_renaming(&self) -> bool {
+        files_renaming_of(&self.tabs, self.ui.files_sidebar_open)
     }
 
     /// 这一帧真正生效的键盘焦点(协调者修订 2)。裸的 `self.focus` 只是用户
@@ -3705,6 +3729,12 @@ impl App {
                 log::warn!("本地栏收到了写操作请求 {ask:?},已忽略(D5)");
                 return;
             }
+            // F200:同上 —— 本地栏根本进不了改名编辑态(`begin_rename` 的
+            // 调用点只在远端那条路上)。
+            FileAction::Rename { .. } => {
+                log::warn!("本地栏收到了改名请求,已忽略(D5)");
+                return;
+            }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
             FileAction::Transfer
             | FileAction::Drop(_)
@@ -3815,6 +3845,17 @@ impl App {
                 self.remove_bookmark(generation, path.clone(), crate::files::PanelColumn::Remote);
                 return;
             }
+            // F200:就地改名提交。两条路径已经在面板里拼好、名字也已经过
+            // `validate_name`(见 `FileAction::Rename` 的文档),这里只管发。
+            // 同 `Ask`,在借出 `files` 之前分流 —— `apply_file_op` 要 `&mut self`。
+            FileAction::Rename { from, to } => {
+                let op = crate::ui::files_dialog::FileOp::Rename {
+                    from: from.clone(),
+                    to: to.clone(),
+                };
+                self.apply_file_op(generation, op);
+                return;
+            }
             _ => {}
         }
         let client = {
@@ -3873,7 +3914,8 @@ impl App {
             | FileAction::EditInline
             | FileAction::Reconnect
             | FileAction::BookmarkAdd { .. }
-            | FileAction::BookmarkRemove { .. } => return,
+            | FileAction::BookmarkRemove { .. }
+            | FileAction::Rename { .. } => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
@@ -4073,6 +4115,29 @@ impl App {
                 if column != Some(crate::ui::files_panel::PanelColumn::Remote) {
                     return;
                 }
+                // F202:Shift+Delete 跳过确认框直接删 —— 设计 D17
+                // (远端删除不可逆、必须确认)**唯一的明示例外**,用户拿它
+                // 清一批临时文件。裸 Delete 那条腿一个字都不能动。
+                if matches!(key, WinitKey::Named(NamedKey::Delete)) && mods.shift_key() {
+                    let targets = self
+                        .tabs
+                        .by_generation(generation)
+                        .and_then(|t| t.content.files_panel())
+                        .map(|f| f.remote.delete_targets())
+                        .unwrap_or_default();
+                    if targets.is_empty() {
+                        return;
+                    }
+                    // 没有确认框,这句吐司就是用户唯一的回执 —— 它说的是
+                    // 「正在」,成败等 `SftpOpDone`。
+                    self.ui
+                        .set_toast(crate::ui::files_dialog::deleting_toast(&targets));
+                    self.apply_file_op(
+                        generation,
+                        crate::ui::files_dialog::FileOp::Delete { targets },
+                    );
+                    return;
+                }
                 let ask = if matches!(key, WinitKey::Named(NamedKey::Delete)) {
                     crate::ui::files_panel::FileAsk::Delete
                 } else {
@@ -4128,10 +4193,20 @@ impl App {
                 parent: state.cwd.clone(),
                 name: String::new(),
             }),
-            FileAsk::Rename => state.cursor.as_ref().map(|cur| FilesDialog::Rename {
-                from: state.cwd.join(cur.as_bytes()),
-                name: cur.display().to_string(),
-            }),
+            // F200:改名**不弹框**,直接让那一行进编辑态。走到这里的两个
+            // 入口(F2、右键「重命名」)都归它,不再有第二条路。
+            FileAsk::Rename => {
+                if let Some(files) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.files_panel_mut())
+                {
+                    if files.remote.begin_rename() {
+                        self.request_ui_redraw();
+                    }
+                }
+                return;
+            }
             FileAsk::Chmod => state.cursor.as_ref().and_then(|cur| {
                 let e = state.entries.iter().find(|e| &e.name == cur)?;
                 Some(FilesDialog::Chmod {
@@ -4140,29 +4215,10 @@ impl App {
                 })
             }),
             FileAsk::Delete => {
-                // 选中集为空时退化成「删光标那一条」—— 用户按 Delete 时
-                // 多半就是想删高亮那条,弹一个「没有选中任何条目」的空框
-                // 只会让人以为程序坏了。
-                let picked = if state.selected.is_empty() {
-                    state.cursor.iter().cloned().collect::<Vec<_>>()
-                } else {
-                    state.selected_paths()
-                };
-                let targets: Vec<(mullion_ssh::sftp::RemotePath, bool)> = picked
-                    .iter()
-                    .filter_map(|name| {
-                        let e = state.entries.iter().find(|e| &e.name == name)?;
-                        // 发不出去的名字不许进删除列表 —— 请求打不中那个文件,
-                        // 而它会在确认框里让用户以为「删了 5 条」。
-                        if !name.is_operable() {
-                            return None;
-                        }
-                        Some((
-                            state.cwd.join(name.as_bytes()),
-                            e.kind == mullion_ssh::sftp::EntryKind::Dir,
-                        ))
-                    })
-                    .collect();
+                // F202:与免确认的 Shift+Delete **共用同一个算法**。各算一遍
+                // 的话,确认框上列的和实际删掉的可以不是一回事,而免确认那条
+                // 路上没有任何东西会让用户发现。
+                let targets = state.delete_targets();
                 if targets.is_empty() {
                     None
                 } else {
@@ -5285,6 +5341,12 @@ impl App {
         let Some(id) = self.pane_at(self.cursor_px) else {
             return;
         };
+        // F199:点中了一块 pane,键盘焦点就该从文件面板回到终端。
+        // 在这之前只有 F6 改得动 `self.focus`:用户点一下侧栏再回头点终端接着
+        // 打字,每一个字都进了面板的按键处理,远端一个字都收不到,而画面上
+        // 光标还在闪。**放在 `pane_at` 之后**:指针落在分界线/内缩留白上时
+        // 什么都不改,同这个函数原本的口径。
+        self.focus = shell::input_route::Focus::Terminal;
         if let Some(ws) = self.active_ws_mut() {
             if ws.focus() != id {
                 ws.set_focus(id);
@@ -9180,6 +9242,14 @@ impl ApplicationHandler<UserEvent> for App {
                             if actions.reconnect_all {
                                 self.reconnect_next_restored();
                             }
+                            // F199:面板上按了一下鼠标 —— 键盘焦点跟过去。
+                            // 放在下面 `files_owner_generation` 那个 `if let`
+                            // **之外**:焦点是 `App` 级的一份状态,不按标签
+                            // 路由;而且面板画得出来就说明属主标签在场,再判
+                            // 一遍只会多一条永远走不到的分支。
+                            if actions.files_focus_click {
+                                self.focus = shell::input_route::Focus::FilesPanel;
+                            }
                             // F50:本地栏动作同步施加,远端栏动作走 D6 的 sftp
                             // 打开/加载链路(见 `apply_local_file_action`/
                             // `apply_remote_file_action` 的文档注释)。两者都按
@@ -10934,6 +11004,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.annotate_export.is_some()
         || a.files_remote.is_some()
         || a.files_local.is_some()
+        || a.files_focus_click
         || !a.files_drop_in.is_empty()
         || a.files_drag_out
         || a.files_op.is_some()
@@ -11447,6 +11518,180 @@ mod tests {
         );
     }
 
+    /// F199:点终端 pane,键盘焦点要从文件面板**抢回来**。
+    ///
+    /// 在这之前 `self.focus` 只有 F6 改得动。用户点一下侧栏(F199 的另一半会把
+    /// 焦点给面板)再回头点终端接着打字,如果这里不抢回来,他敲的每一个字都
+    /// 进了面板的按键处理 —— 远端一个字都收不到,而画面上光标还在闪。
+    ///
+    /// 源码切片:整条路在 `WindowEvent::MouseInput` 里,要真窗口才发得出;
+    /// `App` 在无头环境下也造不出来。**先剥注释行**,否则上面这段说明本身
+    /// 就能让断言通过(本仓库记过的恒绿模式)。
+    ///
+    /// 自证会变红:把 `focus_pane_under_cursor` 里那句赋值删掉。
+    #[test]
+    fn clicking_a_pane_takes_the_keyboard_focus_back_from_the_files_panel() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        let after = production
+            .split("fn focus_pane_under_cursor(&mut self) {")
+            .nth(1)
+            .expect("找不到 focus_pane_under_cursor");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("self.focus = shell::input_route::Focus::Terminal;"),
+            "点 pane 没把焦点抢回终端 —— 点过一次文件面板之后,打字再也到不了远端"
+        );
+    }
+
+    /// F199:面板上的一次点击必须真的被消费掉,并且不能在 discard 趟被吃掉。
+    ///
+    /// 三处缺一不可:UI 侧报出来、`app.rs` 收下改 `self.focus`、
+    /// `has_real_action` 认得它。少最后一条的症状最刁 —— 「有时候点了没用」。
+    ///
+    /// 自证会变红:删掉 `if actions.files_focus_click {` 那一段,
+    /// 或删掉 `has_real_action` 里对应那一行。
+    #[test]
+    fn a_click_in_the_files_panel_moves_the_keyboard_focus_onto_it() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        let code = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("if actions.files_focus_click {")
+            .expect("面板上的点击没人收 —— F5/F2/Del 永远轮不到文件面板");
+        assert!(
+            code[at..at + 200].contains("self.focus = shell::input_route::Focus::FilesPanel;"),
+            "收下了但没改焦点"
+        );
+        let after = code
+            .split("fn has_real_action(")
+            .nth(1)
+            .expect("找不到 has_real_action");
+        let body = &after[..after.find("\n}\n").expect("找不到 has_real_action 的结尾")];
+        assert!(
+            body.contains("a.files_focus_click"),
+            "切焦点会在 egui 的 discard 趟被静默吃掉 —— 表现为「有时候点了没用」"
+        );
+    }
+
+    /// **接线守护 / F200**:就地改名的输入框必须算模态(T8)。
+    ///
+    /// 不算的话它**一个字都收不到** —— 面板拿着键盘焦点时键根本不喂给
+    /// egui(`input_route::egui_should_see_focused`),而 Backspace 还会被
+    /// `handle_panel_key` 解释成「回上级目录」:用户按 F2、看见框亮起来、
+    /// 打字没反应、退格直接跳走了。同 `Modal::Editor`/`FilesPathEdit` 的坑。
+    ///
+    /// 自证会变红:把 `Modal::FilesRename` 从 `Modal::ALL` 里删掉,
+    /// 或把它并进别的臂。
+    #[test]
+    fn the_in_place_rename_box_counts_as_a_modal_so_it_can_receive_keys() {
+        assert!(
+            Modal::ALL.contains(&Modal::FilesRename),
+            "FilesRename 没登记进 Modal::ALL(T8)"
+        );
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open");
+        let body = &after[..after.find("\n    }\n").expect("找不到 modal_open 的结尾")];
+        assert!(
+            body.contains("Modal::FilesRename => self.files_renaming()"),
+            "modal_open 里没有 FilesRename 独立的那一臂(T8)"
+        );
+    }
+
+    /// F200:F2 / 右键「重命名」**不再弹对话框**,而是让那一行进编辑态。
+    ///
+    /// 「就在 SFTP 里改名」是这条需求的全部内容 —— 走回对话框等于没做。
+    ///
+    /// 自证会变红:把 `FileAsk::Rename` 那一臂换回构造 `FilesDialog`。
+    #[test]
+    fn asking_to_rename_starts_an_in_place_edit_instead_of_a_dialog() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        let after = production
+            .split("fn open_files_dialog(")
+            .nth(1)
+            .expect("找不到 open_files_dialog");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code.find("FileAsk::Rename =>").expect("重命名那一臂没了");
+        assert!(
+            code[at..at + 300].contains("begin_rename()"),
+            "重命名还在走对话框那条路"
+        );
+        assert!(
+            !code.contains("FilesDialog::Rename"),
+            "改名对话框还在 —— 两条入口并存,用户按 F2 会看见弹框"
+        );
+    }
+
+    /// F202:`Shift+Delete` 跳过确认框直接删,裸 `Delete` **仍然要弹框**。
+    ///
+    /// 这是设计 D17(远端删除不可逆、必须确认)唯一的例外,所以两条路必须在
+    /// 同一个 `match` 臂里显式分叉、看得见:哪天有人把 `mods` 那个判断顺手
+    /// 删掉,后果是**裸 Delete 也不弹框了** —— 一个手滑就没了整棵目录,
+    /// 而界面上什么都不会变,没有任何东西提示判据丢了。
+    ///
+    /// 免确认那条路还必须报一句带计数的吐司:用户没看见确认框,这是唯一
+    /// 能让他知道刚才打中了什么的东西。
+    ///
+    /// 自证会变红:把 `mods.shift_key()` 改成 `false`(免确认路死掉),
+    /// 或改成 `true`(裸 Delete 也不弹框了),或删掉那句 `set_toast`。
+    #[test]
+    fn shift_delete_skips_the_confirmation_but_a_bare_delete_still_asks() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+        let after = production
+            .split("fn handle_panel_key(")
+            .nth(1)
+            .expect("找不到 handle_panel_key");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at = code
+            .find("mods.shift_key()")
+            .expect("Delete 没按 Shift 分叉 —— 要么免确认路没接,要么裸 Delete 也不弹框了");
+        let arm = &code[at..];
+        assert!(
+            arm.contains("delete_targets()"),
+            "免确认那条路没用与确认框同源的目标算法,两边会删得不一样"
+        );
+        assert!(
+            arm.contains("deleting_toast"),
+            "免确认删完一声不吭 —— 用户没看见确认框,不知道刚才打中了什么"
+        );
+        assert!(
+            arm.contains("FileAsk::Delete"),
+            "Shift 分叉之后裸 Delete 那条腿丢了 —— 手滑一下就没了整棵目录"
+        );
+    }
+
     /// F18:拖拽出界的自动滚动,判据必须是**焦点 pane 的终端区**,不是整个窗口。
     ///
     /// 用窗口边界的后果就是用户报的那条:「左键按住不动往上拉,选不到上一屏」。
@@ -11955,6 +12200,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::FilesPathEdit),
                     "FilesPathEdit 没登记进 Modal::ALL(T8/F131)"
                 ),
+                Modal::FilesRename => assert!(
+                    Modal::ALL.contains(&Modal::FilesRename),
+                    "FilesRename 没登记进 Modal::ALL(T8/F200)"
+                ),
                 Modal::History => assert!(
                     Modal::ALL.contains(&Modal::History),
                     "History 没登记进 Modal::ALL(T8/F148)"
@@ -11978,6 +12227,7 @@ mod tests {
             // 那条 `assert!` 是死代码(F148 复核顺带发现)。
             Modal::Rehost,
             Modal::FilesPathEdit,
+            Modal::FilesRename,
             Modal::History,
         ] {
             check(m);

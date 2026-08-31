@@ -20,6 +20,25 @@ pub enum Load {
     Disconnected,
 }
 
+/// F200:一次就地改名的编辑态。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameEdit {
+    /// 正在改的那一行的**原名**(不含目录)。
+    ///
+    /// 存名字而不是行下标:点一次列头 `entries` 就重排了,下标会让输入框
+    /// 跳到另一个文件上 —— 与 `PaneState::selected` 存身份是同一条理由,
+    /// 而改名同样是「对错文件下手」那一类不可逆操作。
+    pub from: RemotePath,
+    /// 输入框内容。
+    pub buf: String,
+    /// 刚进编辑态、**还没把键盘焦点要过来**。渲染那侧要一次就清掉。
+    ///
+    /// 用一次性标志而不是「每帧发现没焦点就抢回来」:F131 时实测过,
+    /// 无条件每帧 `request_focus()` 会让两栏互抢,先进编辑态的那栏永远
+    /// `lost_focus()` 不了、退不出来(见 `PaneState::path_edit` 的文档)。
+    pub focus_pending: bool,
+}
+
 pub struct PaneState {
     pub cwd: RemotePath,
     pub entries: Vec<Entry>,
@@ -60,6 +79,12 @@ pub struct PaneState {
     /// 重复请求——这个前提不成立的话,这里就不是「不需要额外互斥」,而是
     /// 「谁都退不出去」。
     pub path_edit: Option<String>,
+    /// F200:就地改名的编辑缓冲。`None` = 没在改名(默认)。
+    ///
+    /// **只有远端栏用得上**(设计 D5:本地文件管理外包给资源管理器),
+    /// 但字段放在 `PaneState` 上而不是 `PanelFrame` 上 —— 与 `path_edit`
+    /// 一致,「哪一栏在编辑」这件事本来就是每栏各自的事。
+    pub rename_edit: Option<RenameEdit>,
     /// F142:这条连接上的 uid/gid → 名字缓存。**本地栏那份永远是空的**
     /// (本地栏属主列恒画 `—`,见 `ui::files_panel::owner_text`)。
     ///
@@ -82,6 +107,7 @@ impl PaneState {
             anchor: None,
             request_seq: 0,
             path_edit: None,
+            rename_edit: None,
             owners: super::owners::OwnerNames::default(),
         }
     }
@@ -92,6 +118,9 @@ impl PaneState {
         self.cwd = cwd;
         self.load = Load::Loading;
         self.clear_selection();
+        // F200:换目录了 —— 那个输入框会浮在另一个目录的某一行上,而回车
+        // 拼出来的路径用的是新 cwd,改的是另一个文件。
+        self.rename_edit = None;
         self.request_seq += 1;
         self.request_seq
     }
@@ -112,6 +141,8 @@ impl PaneState {
     pub fn invalidate(&mut self) {
         self.load = Load::Idle;
         self.clear_selection();
+        // F200:同 `begin_load` —— 换的还是另一台机器,更不能留。
+        self.rename_edit = None;
         self.request_seq += 1;
     }
 
@@ -129,6 +160,16 @@ impl PaneState {
                 // 删除确认框会列出远端已经没有的路径,用户点确认后收到
                 // 一条 NoSuchFile,完全不知道自己删的是什么。
                 self.prune_selection();
+                // F200:改名途中那一行没了(别人删了 / 传输完自动刷新),
+                // 编辑态跟着消失。留着的话回车会拿一个已经不存在的原名去拼
+                // 请求,而那个输入框还浮在某一行上、指着的已经是别的文件。
+                if self
+                    .rename_edit
+                    .as_ref()
+                    .is_some_and(|r| !self.entries.iter().any(|e| e.name == r.from))
+                {
+                    self.rename_edit = None;
+                }
             }
             Err(msg) => {
                 self.entries.clear();
@@ -238,6 +279,44 @@ impl PaneState {
         self.rows()
             .into_iter()
             .filter(|e| picked.contains(&e.name))
+            .collect()
+    }
+
+    /// F200:开始就地改名**光标那一行**。返回是否真的进了编辑态。
+    ///
+    /// 单目标(认光标行而不是选择集)与 `FileAsk::Chmod` 同一条既有约定 ——
+    /// 多选了 5 条时「改哪一条的名字」没有答案。
+    ///
+    /// 名字发不出去(`is_operable` 为假)的行直接不让开始:`rename` 请求打
+    /// 不中那个文件,让用户敲半天再报一句 `NoSuchFile` 只是把失败推后。
+    pub fn begin_rename(&mut self) -> bool {
+        let Some(cur) = self.cursor.clone() else {
+            return false;
+        };
+        if !cur.is_operable() || !self.entries.iter().any(|e| e.name == cur) {
+            return false;
+        }
+        self.rename_edit = Some(RenameEdit {
+            buf: cur.display().to_string(),
+            from: cur,
+            focus_pending: true,
+        });
+        true
+    }
+
+    /// F202:这一栏按下 Delete 要删的东西 —— 绝对路径配一个「是不是目录」。
+    ///
+    /// 抽成一个函数是因为它有**两个调用方、判据必须逐字一致**:确认框
+    /// (裸 Delete)和免确认的 Shift+Del。各算一遍的话,免确认那条路上没有
+    /// 任何东西会让用户发现两边算得不一样 —— 而这一片不可逆。
+    ///
+    /// 发不出去的名字(收包时已被 lossy 成 `U+FFFD`,见 `RemotePath::as_wire`)
+    /// 直接剔掉:请求打不中那个文件,留着只会让计数多出一条。
+    pub fn delete_targets(&self) -> Vec<(RemotePath, bool)> {
+        self.picked_entries()
+            .into_iter()
+            .filter(|e| e.name.is_operable())
+            .map(|e| (self.cwd.join(e.name.as_bytes()), e.kind == EntryKind::Dir))
             .collect()
     }
 
@@ -361,6 +440,131 @@ mod tests {
         let picked = s.picked_entries();
         assert_eq!(picked.len(), 1, "该退化成光标那一条:{picked:?}");
         assert_eq!(picked[0].name.display(), "b.txt");
+    }
+
+    /// F200:F2 就地改名 —— 进编辑态时缓冲要**预填当前名字**。
+    /// 空着的话用户得从零打一遍,而改名十有八九只改末尾几个字。
+    ///
+    /// 自证会变红:把 `buf` 初值改成 `String::new()`。
+    #[test]
+    fn f2_starts_renaming_the_cursor_row_seeded_with_its_current_name() {
+        let mut s = state();
+        s.accept(s.request_seq, Ok(vec![e("notes.txt", EntryKind::File)]));
+        s.cursor = Some(RemotePath::from_bytes(b"notes.txt".to_vec()));
+        assert!(s.begin_rename(), "光标行在,该进得了编辑态");
+        let r = s.rename_edit.as_ref().expect("没进编辑态");
+        assert_eq!(r.from.display(), "notes.txt");
+        assert_eq!(r.buf, "notes.txt", "缓冲没预填原名");
+    }
+
+    /// 发不出去的名字改不了名:`rename` 请求打不中那个文件,让用户进编辑态
+    /// 敲半天再报一句 `NoSuchFile`,不如一开始就不让开始(与 `row()` 把这类
+    /// 行画成 dim 是同一条判据)。
+    ///
+    /// 自证会变红:去掉 `begin_rename` 里的 `is_operable` 判断。
+    #[test]
+    fn a_name_we_cannot_send_cannot_be_renamed_in_place() {
+        let mut s = state();
+        let bad = Entry {
+            name: RemotePath::from_bytes(vec![0xff, 0xfe]),
+            ..e("x", EntryKind::File)
+        };
+        let name = bad.name.clone();
+        s.accept(s.request_seq, Ok(vec![bad]));
+        s.cursor = Some(name);
+        assert!(!s.begin_rename(), "发不出去的名字不该能进编辑态");
+        assert!(s.rename_edit.is_none());
+    }
+
+    /// 改名途中目录刷新、那一行没了(别人删了 / 传输完自动刷新)——
+    /// 编辑态必须自己消失。留着的话回车会拿一个**已经不存在的原名**去
+    /// 拼请求,而界面上那个输入框还浮在某一行上,指着的已经是另一个文件。
+    /// 与 `selected`/`anchor` 存身份而不是下标是同一套自愈思路。
+    ///
+    /// 自证会变红:把 `accept` 里清 `rename_edit` 那一句删掉。
+    #[test]
+    fn a_refresh_that_loses_the_row_drops_the_rename_so_it_cannot_hit_another_file() {
+        let mut s = state();
+        s.accept(s.request_seq, Ok(vec![e("a.txt", EntryKind::File)]));
+        s.cursor = Some(RemotePath::from_bytes(b"a.txt".to_vec()));
+        assert!(s.begin_rename());
+        s.accept(s.request_seq, Ok(vec![e("b.txt", EntryKind::File)]));
+        assert!(s.rename_edit.is_none(), "那一行没了,编辑态还赖着");
+    }
+
+    /// 换目录 / 换机器时改名编辑态也要没。`begin_load` 之后列表是**另一个
+    /// 目录**的,那个输入框会浮在一条毫不相干的行上,而回车拼出来的路径
+    /// 用的是新 cwd —— 改的是另一台机器上的另一个文件。
+    ///
+    /// 自证会变红:把 `begin_load`/`invalidate` 里清 `rename_edit` 的那句删掉。
+    #[test]
+    fn leaving_the_directory_drops_the_rename_edit() {
+        for nav in [0, 1] {
+            let mut s = state();
+            s.accept(s.request_seq, Ok(vec![e("a.txt", EntryKind::File)]));
+            s.cursor = Some(RemotePath::from_bytes(b"a.txt".to_vec()));
+            assert!(s.begin_rename());
+            if nav == 0 {
+                s.begin_load(RemotePath::from_bytes(b"/tmp".to_vec()));
+            } else {
+                s.invalidate();
+            }
+            assert!(s.rename_edit.is_none(), "换目录/换机器后编辑态还赖着");
+        }
+    }
+
+    /// F202:删除目标是**绝对路径 + 是不是目录**。抽成一个函数是因为它有
+    /// 两个调用方(确认框走的裸 Delete、免确认的 Shift+Del),两边算得
+    /// 不一样的话,免确认那条路上没有任何东西会让用户发现 —— 而删除不可逆。
+    ///
+    /// 自证会变红:把 `cwd.join` 换成只给名字(路径就打到当前工作目录去了),
+    /// 或者把 `EntryKind::Dir` 那个判断写反(递归删会落到普通文件上)。
+    #[test]
+    fn delete_targets_are_absolute_paths_paired_with_dir_flags() {
+        let mut s = state();
+        s.accept(
+            s.request_seq,
+            Ok(vec![e("a.txt", EntryKind::File), e("d", EntryKind::Dir)]),
+        );
+        s.selected = ["a.txt", "d"]
+            .iter()
+            .map(|n| RemotePath::from_bytes(n.as_bytes().to_vec()))
+            .collect();
+        let got: Vec<(String, bool)> = s
+            .delete_targets()
+            .into_iter()
+            .map(|(p, d)| (p.display().to_string(), d))
+            .collect();
+        assert_eq!(
+            got,
+            // 顺序 = 可见行序(目录排在文件前),与确认框上逐条列出的
+            // 顺序同源 —— 对账要对得上。
+            vec![
+                ("/home/u/d".to_string(), true),
+                ("/home/u/a.txt".to_string(), false),
+            ],
+            "删除目标算错了"
+        );
+    }
+
+    /// 发不出去的名字(收包时已被 lossy,`as_wire` 挡下)不许进删除列表:
+    /// 请求打不中那个文件,留着只会让确认框上的计数多一条 —— 用户以为
+    /// 删了 2 个,实际 1 个。
+    ///
+    /// 自证会变红:去掉 `is_operable` 那道过滤。
+    #[test]
+    fn a_name_we_cannot_send_never_becomes_a_delete_target() {
+        let mut s = state();
+        let bad = Entry {
+            name: RemotePath::from_bytes(vec![0xff, 0xfe, b'.', b't', b'x', b't']),
+            ..e("x", EntryKind::File)
+        };
+        assert!(!bad.name.is_operable(), "这个名字本该是发不出去的");
+        s.accept(s.request_seq, Ok(vec![e("ok.txt", EntryKind::File), bad]));
+        s.selected = s.entries.iter().map(|e| e.name.clone()).collect();
+        let got = s.delete_targets();
+        assert_eq!(got.len(), 1, "发不出去的名字混进来了:{got:?}");
+        assert_eq!(got[0].0.display(), "/home/u/ok.txt");
     }
 
     /// 有选中集时**光标不额外算一条** —— 否则用户选了 3 个、光标停在第 4 个

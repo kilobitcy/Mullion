@@ -52,6 +52,16 @@ pub struct EditorState {
     /// 不这样做的话,停止钉满屏几何后 egui 会把上一帧的全屏尺寸当成窗口
     /// 当前状态一直留着,「还原」等于没按。
     pub restore_to: Option<egui::Rect>,
+    /// F204:还要摆正几帧。开窗时是 2,每帧减一,归零后位置归用户拖。
+    ///
+    /// **不能只靠 `Window::default_pos`**:egui 把窗口位置记在 `Memory` 里,
+    /// 同一个窗口 id 第二次打开时 `default_pos` 早就不生效了 —— 用户在副屏
+    /// 上把它拖走过一次,之后拔掉副屏,这个窗口就再也见不到了。
+    ///
+    /// **为什么是 2 帧而不是 1**:第一帧还不知道窗口实际有多高(内容撑出来
+    /// 的高度和 `DEFAULT_SIZE` 不一样),只能先按默认尺寸估着摆;第二帧拿
+    /// 上一帧量到的真实尺寸重摆一次才准。
+    pub centre_frames: u8,
 }
 
 impl EditorState {
@@ -79,6 +89,7 @@ impl EditorState {
             maximized: false,
             last_rect: None,
             restore_to: None,
+            centre_frames: 2,
         }
     }
 
@@ -123,6 +134,19 @@ impl EditorState {
     }
 }
 
+/// 窗口的默认大小。`centred_rect` 与 `Window::default_size` 共用一份 ——
+/// 两处各写一遍的话,首帧钉的框和 egui 自己算的框会差一点,窗口开出来抖一下。
+const DEFAULT_SIZE: egui::Vec2 = egui::vec2(720.0, 480.0);
+
+/// F204:一打开就摆在屏幕正中 —— 窗口左上角该落在哪。
+///
+/// `measured` 是上一帧量到的窗口实际尺寸,第一帧还没有,按 `DEFAULT_SIZE` 估。
+/// **只钉位置不钉尺寸**:钉了尺寸的话,量到的就是被钉的那个值,等放手那一帧
+/// 窗口缩回内容自然高度,又偏了一半的差额。
+fn centred_pos(screen: egui::Rect, measured: Option<egui::Vec2>) -> egui::Pos2 {
+    screen.center() - measured.unwrap_or(DEFAULT_SIZE) / 2.0
+}
+
 /// C 组:窗口这一帧要不要钉几何、钉到哪。
 /// - 最大化:每帧钉满屏(不每帧钉的话,用户在最大化状态下拖边缘,egui 会
 ///   记住那个尺寸,再按「还原」就还原不回去了)。
@@ -156,7 +180,31 @@ pub fn show(
     let mut close = false;
     let title = format!("{}{}", if s.dirty() { "● " } else { "" }, s.path);
 
+    // F204:Ctrl+S = 「保存到远端」那颗按钮,**包括它按不动的时候**。
+    // `consume_key` 会把这次按键从事件流里取走,正文那个 `TextEdit` 就
+    // 看不见它了(否则 S 会被当成一个字符打进去)。
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+        if s.can_save() {
+            action = Some(EditorAction::Save);
+        } else if let Some(why) = s.read_only {
+            // 「只读」「换行没选」是用户**必须先做点别的**才能存 ——
+            // 沉默的话他只会一直按,以为程序坏了。
+            s.notice = Some(format!("只读,存不了:{why}"));
+        } else if s.eol == Eol::Mixed && s.eol_choice.is_none() {
+            s.notice = Some("换行符混用,先在上面选一种再保存。".into());
+        }
+        // 剩下两种(没改过 / 正在回传)是按早了或按重了,静默 —— 弹话只会吵。
+    }
+
     let screen = ctx.screen_rect();
+    // F204:开窗头两帧把窗口摆到屏幕正中。见 `EditorState::centre_frames` 里
+    // 为什么不能只靠 `default_pos`、以及为什么要两帧。
+    let centre = if s.centre_frames > 0 {
+        s.centre_frames -= 1;
+        Some(centred_pos(screen, s.last_rect.map(|r| r.size())))
+    } else {
+        None
+    };
     // 用「进入这一帧时」的状态决定钉不钉、钉到哪 —— 本帧里用户点击
     // 最大化/还原会改 `s.maximized`/`s.restore_to`,但那个改动到下一帧
     // 才生效,不然「点还原的这一帧」会把刚被点掉的满屏矩形误记成
@@ -166,9 +214,12 @@ pub fn show(
     let mut win = egui::Window::new("编辑文件")
         .collapsible(false)
         .resizable(true)
-        .default_size(egui::vec2(720.0, 480.0));
+        .default_size(DEFAULT_SIZE);
     if let Some(r) = pin {
         win = win.current_pos(r.min).fixed_size(r.size());
+    } else if let Some(p) = centre {
+        // 最大化/还原优先:那两个也在钉几何,同一帧里抢起来会打架。
+        win = win.current_pos(p);
     }
     if !was_maximized {
         // 还原信号只用这一帧。
@@ -180,8 +231,23 @@ pub fn show(
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&title).color(theme::c32(t.fg_mid)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if s.maximized { "还原" } else { "最大化" };
-                if ui.small_button(label).clicked() {
+                use crate::ui::icon::{icon_button, Glyph};
+                // F204:`□` 和 `✕` 都是 T9 的豆腐块风险,一律自绘。
+                // right_to_left 布局里先加的在最右边 —— ✕ 要在最外侧。
+                if icon_button(ui, Glyph::Cross, true, "关闭") {
+                    if s.dirty() {
+                        s.confirm_close = true;
+                    } else {
+                        action = Some(EditorAction::Close(s.key));
+                        close = true;
+                    }
+                }
+                let (g, tip) = if s.maximized {
+                    (Glyph::Restore, "还原")
+                } else {
+                    (Glyph::Maximize, "最大化")
+                };
+                if icon_button(ui, g, true, tip) {
                     if s.maximized {
                         // 还原:钉回最大化之前记下的矩形。
                         s.maximized = false;
@@ -204,7 +270,7 @@ pub fn show(
             });
         }
         if let Some(n) = &s.notice {
-            ui.colored_label(theme::c32(t.fg_dim), n);
+            ui.colored_label(theme::c32(t.fg_muted), n);
         }
 
         ui.separator();
@@ -249,14 +315,7 @@ pub fn show(
             {
                 action = Some(EditorAction::Save);
             }
-            if ui.button("关闭").clicked() {
-                if s.dirty() {
-                    s.confirm_close = true;
-                } else {
-                    action = Some(EditorAction::Close(s.key));
-                    close = true;
-                }
-            }
+            // F204:关闭挪到标题栏的 ✕ 上了 —— 底下不再重复一颗。
             ui.checkbox(&mut s.backup, "写前留一份 .mullion.bak");
         });
     });
@@ -451,7 +510,7 @@ mod tests {
     fn closing_a_dirty_editor_asks_before_throwing_the_changes_away() {
         let mut s = editable();
         s.as_mut().unwrap().text = "changed\n".into();
-        let act = click(&mut s, "关闭");
+        let act = click_icon(&mut s, "关闭");
         assert_eq!(act, None, "脏着关不该直接关掉");
         assert!(s.is_some(), "窗口该还在");
         assert!(s.as_ref().unwrap().confirm_close);
@@ -466,7 +525,7 @@ mod tests {
     #[test]
     fn closing_a_clean_editor_needs_no_confirmation() {
         let mut s = editable();
-        assert_eq!(click(&mut s, "关闭"), Some(EditorAction::Close(1)));
+        assert_eq!(click_icon(&mut s, "关闭"), Some(EditorAction::Close(1)));
         assert!(s.is_none());
     }
 
@@ -483,7 +542,7 @@ mod tests {
             Eol::Lf,
             false,
         ));
-        let act = click(&mut s, "关闭");
+        let act = click_icon(&mut s, "关闭");
         assert!(s.is_none(), "前提:show 已经把状态清掉了");
         assert_eq!(
             act,
@@ -492,34 +551,149 @@ mod tests {
         );
     }
 
-    /// C 组:标题行的最大化/还原按钮真的能点、真的会翻转状态,
-    /// **而且按钮上的文字真的跟着变**。
+    /// C 组 / F204:标题行的最大化按钮真的能点、真的会翻转状态,
+    /// **而且它的自述真的跟着变**。
     ///
-    /// 单靠后面这行 `texts()` 断言之前,「文案跟着变」只是被
-    /// `click()` 内部的 `find_button_pos` 间接测住:文案不对的话它就找不到
-    /// 叫「还原」的按钮而直接 panic —— 失败信息说的是「找不到按钮」,
-    /// 不是「文案不对」,诊断性差。这里显式断言画面上出现的文字。
+    /// F204 把它从写字的 `small_button` 换成了自绘图标(`□`/`✕` 都是 T9
+    /// 的豆腐块字符,自绘这条路不问字体)。图标不画文字,于是判据从
+    /// 「画面上出现哪个词」改成「accesskit 里那颗按钮报的名字是什么」——
+    /// 后者同时也是屏幕阅读器听到的东西。
+    ///
+    /// 自证会变红:把 `label` 那一行改成恒为 `"最大化"`。
     #[test]
-    fn the_maximize_button_toggles_state_and_flips_its_own_label() {
+    fn the_maximize_icon_toggles_state_and_flips_what_it_calls_itself() {
         let mut s = editable();
         assert!(!s.as_ref().unwrap().maximized, "前提:默认不是最大化");
-        assert!(
-            texts(&mut s).iter().any(|x| x == "最大化"),
-            "初始态按钮该写着「最大化」"
-        );
 
-        assert_eq!(click(&mut s, "最大化"), None, "最大化不产生 EditorAction");
+        assert_eq!(
+            click_icon(&mut s, "最大化"),
+            None,
+            "最大化不产生 EditorAction"
+        );
         assert!(s.as_ref().unwrap().maximized, "点了最大化,状态该翻转");
-        assert!(
-            texts(&mut s).iter().any(|x| x == "还原"),
-            "最大化之后按钮该改写成「还原」"
-        );
 
-        assert_eq!(click(&mut s, "还原"), None);
+        assert_eq!(click_icon(&mut s, "还原"), None);
         assert!(!s.as_ref().unwrap().maximized, "再点一次该还原");
+    }
+
+    /// F204:关闭挪到标题栏的 ✕ 上之后,底下那一行**不能再留一颗**
+    /// 「关闭」—— 两颗做同一件事的按钮,用户会以为它们不一样。
+    #[test]
+    fn the_bottom_row_no_longer_repeats_the_close_button() {
+        let mut s = editable();
+        let seen = texts(&mut s);
         assert!(
-            texts(&mut s).iter().any(|x| x == "最大化"),
-            "还原之后按钮该改回「最大化」"
+            !seen.iter().any(|x| x == "关闭"),
+            "底部还画着「关闭」按钮:{seen:?}"
+        );
+        // 反面:保存按钮必须还在,否则上面那条断言在一个空窗口上也成立。
+        assert!(
+            seen.iter().any(|x| x == "保存到远端"),
+            "连保存按钮都没画出来 —— 上一条断言什么也没守住:{seen:?}"
+        );
+    }
+
+    /// F204:窗口每次打开都摆在屏幕正中。
+    ///
+    /// egui 把窗口位置记在 `Memory` 里,不主动摆的话第二次打开还停在上次
+    /// 拖走的地方 —— 用户在副屏上拖过一次、之后拔掉副屏,这个窗口就再也
+    /// 见不到了,而它是模态的,等于程序卡死。
+    #[test]
+    fn the_editor_opens_centred_on_screen() {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let mut s = editable();
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .values_mut()
+                .for_each(|v| v.inner_rect = Some(screen));
+            let _ = ctx.run(input, |ctx| {
+                show(ctx, &t, &mut s);
+            });
+        }
+        let r = s.as_ref().unwrap().last_rect.expect("窗口几何没落定");
+        let d = (r.center() - screen.center()).abs();
+        assert!(
+            d.x < 4.0 && d.y < 4.0,
+            "窗口中心 {:?} 离屏幕中心 {:?} 太远 —— 没摆正",
+            r.center(),
+            screen.center()
+        );
+    }
+
+    /// F204:`centred_pos` 是「摆哪儿」的唯一出口,纯函数,用具体数字锁死。
+    #[test]
+    fn centred_pos_puts_the_window_in_the_middle_using_the_measured_size() {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        // 第一帧没量到尺寸 —— 按 DEFAULT_SIZE(720×480)估。
+        assert_eq!(centred_pos(screen, None), egui::pos2(600.0, 300.0));
+        // 第二帧拿真实尺寸重摆:窗口比默认矮,左上角就该往下挪。
+        assert_eq!(
+            centred_pos(screen, Some(egui::vec2(732.0, 388.0))),
+            egui::pos2(594.0, 346.0)
+        );
+        // 屏幕原点非零时也得跟着走(多显示器 / 客户区有偏移)。
+        let off = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(1920.0, 1080.0));
+        assert_eq!(centred_pos(off, None) + DEFAULT_SIZE / 2.0, off.center());
+    }
+
+    /// F204:Ctrl+S 与「保存到远端」是同一件事 —— 包括**不能存的时候
+    /// 也一样不存**。热键绕过 `can_save()` 的话,一个换行混用的文件会被
+    /// 静默统一,而用户根本没做那个选择。
+    #[test]
+    fn ctrl_s_saves_exactly_when_the_save_button_would() {
+        let mut s = editable();
+        assert!(!s.as_ref().unwrap().can_save(), "前提:没改过,存不了");
+        assert_eq!(press_ctrl_s(&mut s), None, "没改过就按 Ctrl+S,不该回传");
+
+        s.as_mut().unwrap().text = "changed\n".into();
+        assert!(s.as_ref().unwrap().can_save());
+        assert_eq!(
+            press_ctrl_s(&mut s),
+            Some(EditorAction::Save),
+            "改过之后 Ctrl+S 该回传"
+        );
+    }
+
+    /// F204:按了 Ctrl+S 却存不了,得**说出为什么**。
+    ///
+    /// 「不脏 / 正忙」两种情况静默忽略:那是用户按早了或按重了,弹话反而吵。
+    /// 「只读 / 换行没选」则是他改不掉现状、必须先做点别的 —— 沉默的话
+    /// 他只会一直按,以为程序坏了。
+    #[test]
+    fn ctrl_s_on_a_file_that_cannot_be_saved_says_why() {
+        let mut ro = editable();
+        {
+            let st = ro.as_mut().unwrap();
+            st.read_only = Some("内容不是 UTF-8");
+        }
+        assert_eq!(press_ctrl_s(&mut ro), None);
+        let n = ro.as_ref().unwrap().notice.clone().unwrap_or_default();
+        assert!(n.contains("只读"), "只读文件按 Ctrl+S 没说明原因:{n:?}");
+
+        let mut mixed = editable();
+        {
+            let st = mixed.as_mut().unwrap();
+            st.eol = Eol::Mixed;
+            st.text = "a\r\nb\n".into();
+        }
+        assert_eq!(press_ctrl_s(&mut mixed), None);
+        let n = mixed.as_ref().unwrap().notice.clone().unwrap_or_default();
+        assert!(n.contains("换行"), "换行没选就按 Ctrl+S 没说明原因:{n:?}");
+
+        // 不脏的那种必须**保持沉默** —— 否则上面两条只是「总会写点什么」。
+        let mut clean = editable();
+        assert_eq!(press_ctrl_s(&mut clean), None);
+        assert_eq!(
+            clean.as_ref().unwrap().notice,
+            None,
+            "没改过就按 Ctrl+S,不该弹话"
         );
     }
 
@@ -551,12 +725,21 @@ mod tests {
     #[test]
     fn restoring_records_the_pre_maximize_rect_not_the_full_screen_one() {
         let mut s = editable();
+        // 全程共用一个 ctx:窗口几何记在它的 Memory 里,换 ctx 等于重开窗口
+        // (F204 的居中也只在开窗头两帧生效,换 ctx 后位置会跳)。
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let t = crate::theme::MULLION_DARK;
         // 热身,让非最大化状态下的 last_rect 先落定。
-        let _ = texts(&mut s);
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |c| {
+                show(c, &t, &mut s);
+            });
+        }
         let before_max = s.as_ref().unwrap().last_rect;
         assert!(before_max.is_some(), "热身之后 last_rect 该有值了");
 
-        assert_eq!(click(&mut s, "最大化"), None);
+        assert_eq!(click_icon_in(&ctx, &mut s, "最大化"), None);
         assert!(s.as_ref().unwrap().maximized);
         // 最大化期间不该再更新 last_rect —— 它应该还是最大化前记的那个。
         assert_eq!(
@@ -565,7 +748,7 @@ mod tests {
             "最大化期间 last_rect 不该被满屏矩形覆盖"
         );
 
-        assert_eq!(click(&mut s, "还原"), None);
+        assert_eq!(click_icon_in(&ctx, &mut s, "还原"), None);
         assert!(!s.as_ref().unwrap().maximized);
         assert_eq!(
             s.as_ref().unwrap().restore_to,
@@ -631,6 +814,90 @@ mod tests {
         let _ = ctx.run(typing, |ctx| {
             show(ctx, &t, state);
         });
+    }
+
+    /// F204:点标题栏上那两颗自绘图标。它们不画文字,只能靠 accesskit 定位 ——
+    /// 这同时也验了「屏幕阅读器听得见它叫什么」。
+    fn click_icon(state: &mut Option<EditorState>, tooltip: &str) -> Option<EditorAction> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        click_icon_in(&ctx, state, tooltip)
+    }
+
+    /// 同上,但在**调用方给的**那个 `Context` 里点。
+    ///
+    /// 窗口几何(位置、尺寸、居中用掉的帧数)全都记在 `Context` 的 `Memory`
+    /// 里。一串动作要连起来看几何怎么变时,必须共用同一个 ctx —— 每次新建
+    /// 一个等于把窗口重新开了一遍。
+    fn click_icon_in(
+        ctx: &egui::Context,
+        state: &mut Option<EditorState>,
+        tooltip: &str,
+    ) -> Option<EditorAction> {
+        let t = crate::theme::MULLION_DARK;
+        let mut update = None;
+        // 两帧:egui `Window` 首帧只记 `Shape::Noop`,几何也还没落定。
+        for _ in 0..2 {
+            update = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    show(ctx, &t, state);
+                })
+                .platform_output
+                .accesskit_update;
+        }
+        let b = update
+            .expect("没有 accesskit 输出")
+            .nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(tooltip))
+            .and_then(|(_, n)| n.bounds())
+            .unwrap_or_else(|| panic!("标题栏上找不到自述为「{tooltip}」的图标按钮"));
+        let pos = egui::pos2(
+            (b.x0 as f32 + b.x1 as f32) / 2.0,
+            (b.y0 as f32 + b.y1 as f32) / 2.0,
+        );
+        let mut input = egui::RawInput::default();
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let mut act = None;
+        let _ = ctx.run(input, |ctx| {
+            act = show(ctx, &t, state);
+        });
+        act
+    }
+
+    /// F204:敲一次 Ctrl+S,返回这一帧的动作。
+    fn press_ctrl_s(state: &mut Option<EditorState>) -> Option<EditorAction> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(ctx, &t, state);
+            });
+        }
+        let m = egui::Modifiers::COMMAND;
+        let mut input = egui::RawInput {
+            modifiers: m,
+            ..Default::default()
+        };
+        input.events.push(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        });
+        let mut act = None;
+        let _ = ctx.run(input, |ctx| {
+            act = show(ctx, &t, state);
+        });
+        act
     }
 
     /// 点一下写着 `label` 的按钮,返回这一帧的动作。

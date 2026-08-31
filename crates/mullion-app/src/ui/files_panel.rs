@@ -64,6 +64,16 @@ pub enum FileAction {
     /// F139:取消收藏。按 `path` 相等匹配 —— 书签的身份就是路径(重名允许,
     /// 同路径不允许重复收藏)。
     BookmarkRemove { path: String },
+    /// F200:就地改名提交。**两条都是绝对路径**,在面板里用同一个 `cwd`
+    /// 拼好 —— 不像 `GotoInput` 那样把原文丢给 app 侧解析:改名从开始编辑
+    /// 到敲回车中间可能隔着好几秒,期间用户完全可能换了目录,app 侧再拿
+    /// 「当前 cwd」去拼就是改另一个目录里的同名文件。
+    ///
+    /// 名字已经过 `files_dialog::validate_name`(挡 `/`、`.`、`..`、空)。
+    Rename {
+        from: mullion_ssh::sftp::RemotePath,
+        to: mullion_ssh::sftp::RemotePath,
+    },
 }
 
 /// F139:画书签相关控件要的两样东西。
@@ -175,7 +185,9 @@ pub fn menu_items_for(column: PanelColumn, target: Option<MenuTarget>) -> Vec<Me
                         .then_some("超过 1 MB,请用「用默认程序编辑」"),
                 });
             }
-            out.push(on("重命名…", MenuItem::Ask(FileAsk::Rename)));
+            // F200:**没有省略号** —— 省略号在这套界面里的意思是「会弹个框」
+            // (「新建文件夹…」「删除…」都弹),而改名现在是就地编辑。
+            out.push(on("重命名", MenuItem::Ask(FileAsk::Rename)));
             out.push(on("属性(权限)…", MenuItem::Ask(FileAsk::Chmod)));
             out.push(on("删除…", MenuItem::Ask(FileAsk::Delete)));
         }
@@ -389,6 +401,29 @@ fn path_label_id(id: &str) -> egui::Id {
 /// 编辑框自己的 id。同上。
 fn path_edit_id(id: &str) -> egui::Id {
     egui::Id::new(("files-path-edit", id))
+}
+
+/// F200:就地改名那个输入框的 id。**每栏一个固定 id,不掺行名**:
+/// 同一时刻一栏里最多只有一行在改名,而掺了行名的话 egui 会把它当成
+/// 另一个部件 —— 改名途中列表重排(点了列头 / 自动刷新)会让输入框
+/// 连同键盘焦点一起消失。
+fn rename_edit_id(id: &str) -> egui::Id {
+    egui::Id::new(("files-rename-edit", id))
+}
+
+/// F201:让 `id` 那个编辑框下一帧一进来就整条选中。
+///
+/// 路径条这个框的用途几乎全是「整条换掉」,而不是「在中间改一个字」——
+/// 不全选的话光标停在末尾,用户得先按住退格删掉三四十个字符。
+///
+/// 只在**进入编辑态那一刻**调一次。每帧调的话用户拖出来的选区会被反复
+/// 覆盖,鼠标一放开就跳回全选,框里根本选不中任何一段。
+fn select_all(ctx: &egui::Context, id: egui::Id, len: usize) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut s = egui::text_edit::TextEditState::default();
+    s.cursor
+        .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(len))));
+    s.store(ctx, id);
 }
 
 /// F131:退出编辑态。`commit` = 这一下是回车(要跳),否则是 Esc / 失焦
@@ -689,6 +724,10 @@ pub fn show(
                 );
                 let hit = ui.interact(row_rect, path_label_id(id), egui::Sense::click());
                 if hit.clicked() {
+                    // F201:进编辑态就整条选中,敲第一个字直接换掉。
+                    // 长度按**字符**数,不是字节 —— 路径里有中文时按字节
+                    // 算出来的选区末端会落到某个字的中间。
+                    select_all(ui.ctx(), path_edit_id(id), path.chars().count());
                     state.path_edit = Some(path);
                     ui.ctx().memory_mut(|m| m.request_focus(path_edit_id(id)));
                 }
@@ -748,6 +787,12 @@ pub fn show(
         egui::Sense::hover(),
     );
 
+    // F200:改名缓冲**先挪出来**。闭包里 `state` 只借得到不可变(要调
+    // `enter_target`),而输入框要 `&mut String`。收尾时按 `rename_done`
+    // 决定放回去还是丢掉。
+    let mut renaming = state.rename_edit.take();
+    // `None` = 还在编辑;`Some(None)` = 放弃;`Some(Some(name))` = 提交。
+    let mut rename_done: Option<Option<String>> = None;
     let rows = state.rows();
     // `rows` 借着 `&state.entries` 不放(它是 `Vec<&Entry>`),闭包里不能再
     // 借一次 `&mut state`——新选中的那条先记局部变量,出了闭包再落回 `state`。
@@ -799,6 +844,15 @@ pub fn show(
             ui.set_min_width(total_w);
             for ix in range {
                 let e = rows[ix];
+                // F200:这一行正在改名 —— 画输入框,别的交互一概不接
+                // (拖拽/双击/右键落在输入框上没有意义)。
+                if renaming.as_ref().is_some_and(|r| r.from == e.name) {
+                    let r = renaming.as_mut().expect("上一行刚判过是 Some");
+                    if let Some(done) = rename_row(ui, t, id, cols, column, r) {
+                        rename_done = Some(done);
+                    }
+                    continue;
+                }
                 let resp = row(ui, t, e, column, selected.contains(&e.name), cols, owners);
                 // F58:行既是拖源也是落点。
                 if resp.drag_started() {
@@ -861,6 +915,23 @@ pub fn show(
                 }
             }
         });
+    // F200:改名的收尾。放在 `click_row` 之前 —— 提交那一下同时也是
+    // 「点了别处」,先把动作定下来再让点击去改选中态。
+    match rename_done {
+        // 还在编辑:原样放回去。
+        None => state.rename_edit = renaming,
+        // 放弃:什么都不发,编辑态就此消失(`renaming` 出作用域即丢)。
+        Some(None) => {}
+        Some(Some(name)) => {
+            let from = renaming.expect("提交必然来自一个存在的编辑态").from;
+            // **两条路径在这里一起拼**,用的是同一个 `state.cwd` ——
+            // 见 `FileAction::Rename` 的文档。
+            action = Some(FileAction::Rename {
+                from: state.cwd.join(from.as_bytes()),
+                to: state.cwd.join(name.as_bytes()),
+            });
+        }
+    }
     if let Some(name) = drag_start {
         state.select_only(&name);
     }
@@ -1053,6 +1124,81 @@ fn header_at(
     if let Some(k) = hit {
         state.click_header(k);
     }
+}
+
+/// F200:改名态下的那一行 —— 名称列换成一个输入框,其余列不画
+/// (右边那几列会被输入框挤走大半,画出来只是干扰)。
+///
+/// 返回这一帧的去向:`None` = 还在编辑;`Some(None)` = 放弃;
+/// `Some(Some(name))` = 提交这个名字(**已经过 `validate_name`**)。
+fn rename_row(
+    ui: &mut Ui,
+    t: &Theme,
+    id: &str,
+    cols: &ColWidths,
+    column: PanelColumn,
+    r: &mut crate::files::state::RenameEdit,
+) -> Option<Option<String>> {
+    // 行宽与 `row()` 同源(见那里的说明:总宽与视口宽取大者)。
+    let w = content_w(cols, column).max(ui.available_width());
+    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
+    // 整行铺一层选中底:输入框只占名称列,右边那截空着的行也得看得出
+    // 「改的是这一行」。
+    ui.painter()
+        .rect_filled(row_rect, 2.0, theme::selection_fill(t));
+    let err = crate::ui::files_dialog::validate_name(&r.buf).err();
+    // 输入框对齐名称列 —— 用户眼里那个名字**原地**变成可编辑的,视线不用挪。
+    //
+    // **高度必须正好是 `ROW_H`**:`Ui::put` 收尾会按子 ui 的 `min_rect`
+    // 推进布局光标(`centered_and_justified` 让 `TextEdit` 填满给它的矩形,
+    // 所以那就是 `name_rect`)。矮一点点,下面每一行就整体上移一点点 ——
+    // 而 `show_rows` 的虚拟滚动只管起始偏移,不检查行与行之间怎么排,
+    // 编译/测试/日志全不吭声。
+    let name_rect = egui::Rect::from_min_size(
+        row_rect.min + egui::vec2(name_start_x_offset(), 0.0),
+        egui::vec2((cols.name - name_start_x_offset()).max(60.0), ROW_H),
+    );
+    let resp = ui.put(
+        name_rect,
+        egui::TextEdit::singleline(&mut r.buf)
+            .id(rename_edit_id(id))
+            .margin(egui::Margin::symmetric(2.0, 0.0)),
+    );
+    if r.focus_pending {
+        r.focus_pending = false;
+        // F200:预选中主干、留下扩展名。只在**进编辑态那一刻**调一次 ——
+        // 每帧调的话用户拖出来的选区会被反复覆盖(同 `select_all` 的文档)。
+        select_all(ui.ctx(), rename_edit_id(id), rename_stem_len(&r.buf));
+        resp.request_focus();
+    }
+    if let Some(why) = err {
+        // 非法名字画红框 + 悬停说原因。**不置灰不消失** —— 用户敲到一半
+        // 名字暂时非法是常态,把框收走等于把他敲的字扔了。
+        ui.painter().rect_stroke(
+            name_rect,
+            egui::Rounding::same(2.0),
+            egui::Stroke::new(1.0, theme::c32(t.danger)),
+        );
+        resp.clone().on_hover_text(why);
+    }
+    // 收口条件与路径条同源(见 `finish_path_edit` 调用处的说明):
+    // 光凭 `lost_focus()` 覆盖不了「点了别处」。
+    if resp.lost_focus() || resp.clicked_elsewhere() {
+        if !ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            // Esc / 点别处 / 焦点被抢:**默认丢弃**。失焦最常见的原因是
+            // 用户去点了别处,那不是「确认」。
+            return Some(None);
+        }
+        if err.is_some() {
+            // 回车但名字非法:不提交、也不退出 —— 但焦点已经被 `TextEdit`
+            // 交出去了,得抢回来,否则用户接着敲字一个都进不去(而框还在,
+            // 看上去像是键盘坏了)。
+            resp.request_focus();
+            return None;
+        }
+        return Some(Some(r.buf.trim().to_string()));
+    }
+    None
 }
 
 fn row(
@@ -1297,6 +1443,16 @@ fn elide(text: &str, max_w: f32, mode: Elide, measure: impl Fn(&str) -> f32) -> 
     format!("{head}{ELLIPSIS}")
 }
 
+/// F200:进就地改名时该预选中前几个字符 —— **主干,不含扩展名**。
+///
+/// 整条全选的话用户敲第一个字连 `.tar.gz` 一起没了,而丢掉扩展名在远端
+/// 只能靠他自己发现。判据复用 `ext_tail`,与列表里「截断也要留住扩展名」
+/// 同一套规则,不另起一份。
+fn rename_stem_len(name: &str) -> usize {
+    let ext = ext_tail(name).map_or(0, |e| e.chars().count());
+    name.chars().count() - ext
+}
+
 /// 从右往左取至多 **2 段**扩展名,总长(字符数)不超过 10。
 ///
 /// `a.tar.gz` → `.tar.gz`;`a.txt` → `.txt`;`x.20260819.backup` → `.backup`
@@ -1478,6 +1634,18 @@ fn column_pad() -> egui::Vec2 {
     egui::vec2(crate::ui::metrics::SP_XS, crate::ui::metrics::SP_XS)
 }
 
+/// F199:这一帧有没有在 `rect` 里按下鼠标。
+///
+/// 用 `ui.rect_contains_pointer` 而不是 `rect.contains(pos)`:前者还要求这一层
+/// **没被别的东西盖住** —— 删除确认框正好浮在面板上,拿裸矩形判的话点确认框
+/// 也会被算成「点了面板」。
+///
+/// `any_pressed` 不区分左右键:右键弹菜单同样是在跟这一栏打交道,焦点该跟过来。
+fn pressed_inside(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(rect)
+}
+
+#[allow(clippy::too_many_arguments)] // 同 `show`/`content`:一帧要画的东西天然多
 pub fn sidebar(
     ctx: &egui::Context,
     t: &Theme,
@@ -1486,8 +1654,10 @@ pub fn sidebar(
     panel_focused: bool,
     frame: &mut PanelFrame,
     drop_in: usize,
+    focus_click: &mut bool,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
+    let mut hit: Option<PanelColumn> = None;
     let default_w = if ui_state.files_sidebar_w > 0.0 {
         ui_state.files_sidebar_w
     } else {
@@ -1522,6 +1692,11 @@ pub fn sidebar(
                 // 见那里那段长注释;两处必须一起改,否则同一个控件在标签
                 // 宿主里不缺角、在侧栏里缺角。
                 let inner = ui.max_rect().shrink2(column_pad());
+                // F199:判在 `show()` **之前** —— 面板内的控件会消费掉这次按下,
+                // 之后再问 `any_pressed` 就问不出来了。
+                if pressed_inside(ui, inner) {
+                    hit = Some(PanelColumn::Local);
+                }
                 ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
                     out.1 = show(
                         ui,
@@ -1555,6 +1730,10 @@ pub fn sidebar(
                 ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
                 // F144:同本地栏,见上面。
                 let inner = ui.max_rect().shrink2(column_pad());
+                // F199:同本地栏,判在 `show()` 之前。
+                if pressed_inside(ui, inner) {
+                    hit = Some(PanelColumn::Remote);
+                }
                 ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
                     out.0 = show(
                         ui,
@@ -1584,6 +1763,11 @@ pub fn sidebar(
     ui_state.files_sidebar_w = resp.response.rect.width();
     // F59:把外框矩形留给下一帧的拖出交接判据(见 `UiState::files_panel_rect`)。
     ui_state.files_panel_rect = Some(resp.response.rect);
+    // F199:点了哪一栏就切到哪一栏,并告诉 `app.rs` 键盘焦点该跟到面板上。
+    if let Some(c) = hit {
+        frame.active_column = c;
+        *focus_click = true;
+    }
     out
 }
 
@@ -1626,8 +1810,10 @@ pub fn content(
     drop_in: usize,
     cols: &mut ColWidths,
     panel_rect: &mut Option<egui::Rect>,
+    focus_click: &mut bool,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
+    let mut hit: Option<PanelColumn> = None;
     egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
@@ -1668,6 +1854,15 @@ pub fn content(
             let left = egui::Rect::from_min_size(full.min, egui::vec2(half, full.height()));
             let right =
                 egui::Rect::from_min_max(egui::pos2(full.max.x - half, full.min.y), full.max);
+            // F199:两栏的命中判在 `show()` 之前一次判完 —— 面板里的控件会
+            // 消费掉这次按下,之后再问 `any_pressed` 就问不出来了。判据用两栏
+            // 各自的**裁剪矩形**(`left`/`right`),不用内缩后的布局预算:
+            // 点在那一圈 SP_XS 留白上,用户的意思也是「我在点这一栏」。
+            if pressed_inside(ui, left) {
+                hit = Some(PanelColumn::Local);
+            } else if pressed_inside(ui, right) {
+                hit = Some(PanelColumn::Remote);
+            }
             ui.scope_builder(egui::UiBuilder::new().max_rect(left.shrink2(pad)), |ui| {
                 // B1:**必须显式裁剪**。`max_rect` 只是布局预算,子 ui 的
                 // `clip_rect` 默认原样继承父 painter(`egui-0.30.0`
@@ -1718,6 +1913,11 @@ pub fn content(
                 );
             });
         });
+    // F199:同 `sidebar()`,见那里的注释。
+    if let Some(c) = hit {
+        frame.active_column = c;
+        *focus_click = true;
+    }
     out
 }
 
@@ -1995,6 +2195,240 @@ mod tests {
         );
     }
 
+    /// F200:进就地改名时**预选中主干、留下扩展名**。
+    ///
+    /// 整条全选的话,用户敲第一个字连 `.tar.gz` 一起没了 —— 改名十有八九
+    /// 是改主干,而丢掉扩展名在远端是要靠他自己发现的(界面上那一行只是
+    /// 图标变了)。
+    ///
+    /// 自证会变红:把 `rename_stem_len` 改成返回整串长度(退化成全选)。
+    #[test]
+    fn the_rename_editor_preselects_the_stem_and_keeps_the_extension() {
+        assert_eq!(rename_stem_len("notes.txt"), 5, "notes");
+        assert_eq!(rename_stem_len("a.tar.gz"), 1, "两段扩展名也要整段留住");
+        // 点在开头的不是扩展名,是名字本身(与 `ext_tail` 同源)。
+        assert_eq!(rename_stem_len(".bashrc"), 7);
+        assert_eq!(rename_stem_len("no-ext"), 6);
+        // 长度按**字符**,不是字节 —— 按字节算出来的选区末端会落到某个
+        // 中文字的中间。
+        assert_eq!(rename_stem_len("备份文件.tar.gz"), 4);
+    }
+
+    /// F200 的驱动脚手架:远端栏摆一个目录、进改名编辑态、跑若干帧。
+    /// 返回 `(ctx, frame, run)` —— `run` 收一批事件、跑一帧、给回远端栏动作。
+    #[allow(clippy::type_complexity)]
+    fn rename_harness() -> (
+        egui::Context,
+        PanelFrame,
+        impl FnMut(&egui::Context, &mut PanelFrame, Vec<egui::Event>) -> Option<FileAction>,
+    ) {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = PanelFrame {
+            remote: PaneState::new(RemotePath::from_bytes(b"/var/log".to_vec())),
+            local: PaneState::new(RemotePath::from_bytes(b"/home/u".to_vec())),
+            bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
+            session_bound: false,
+            active_column: PanelColumn::Remote,
+        };
+        let seq = frame.remote.request_seq;
+        frame.remote.accept(
+            seq,
+            Ok(vec![
+                entry(b"notes.txt", EntryKind::File),
+                entry(b"other.txt", EntryKind::File),
+            ]),
+        );
+        frame.local.load = Load::Ready;
+        frame.remote.cursor = Some(RemotePath::from_bytes(b"notes.txt".to_vec()));
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut cols = ColWidths::default();
+        let mut clock = 0.0_f64;
+        let run = move |ctx: &egui::Context, frame: &mut PanelFrame, events: Vec<egui::Event>| {
+            clock += 1.0;
+            let mut out = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(clock),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    out = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false).0;
+                },
+            );
+            out
+        };
+        (ctx, frame, run)
+    }
+
+    /// F200:F2 就地改名 —— 那一行画的是**输入框**,回车发出的是一对
+    /// **绝对路径**(原路径 → 新路径),两条都在同一个目录里拼。
+    ///
+    /// 「就在列表里改」是这条需求的全部内容:弹一个只有一个输入框的对话框,
+    /// 用户还得把视线从那一行挪到屏幕中间去。
+    ///
+    /// 自证会变红:把 `rename_row` 里那个 `TextEdit` 换回静态文字
+    /// (读不到响应),或把回车那一支不发动作。
+    #[test]
+    fn f2_renames_in_place_and_enter_sends_both_absolute_paths() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        assert!(frame.remote.begin_rename(), "前提:该进得了编辑态");
+        for _ in 0..2 {
+            assert_eq!(run(&ctx, &mut frame, vec![]), None, "光渲染不该发动作");
+        }
+        assert!(
+            ctx.read_response(rename_edit_id("远端")).is_some(),
+            "那一行没画出输入框 —— 改名还是得去别处敲"
+        );
+        frame.remote.rename_edit.as_mut().unwrap().buf = "renamed.txt".into();
+        let act = run(
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(
+            act,
+            Some(FileAction::Rename {
+                from: RemotePath::from_bytes(b"/var/log/notes.txt".to_vec()),
+                to: RemotePath::from_bytes(b"/var/log/renamed.txt".to_vec()),
+            }),
+            "回车没发出改名"
+        );
+        assert!(frame.remote.rename_edit.is_none(), "提交后还留在编辑态");
+    }
+
+    /// Esc 放弃:**什么都不发**,而且要退出编辑态。
+    ///
+    /// 自证会变红:把 Esc 那一支也当成提交。
+    #[test]
+    fn escape_abandons_the_rename_without_sending_anything() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        assert!(frame.remote.begin_rename());
+        for _ in 0..2 {
+            run(&ctx, &mut frame, vec![]);
+        }
+        frame.remote.rename_edit.as_mut().unwrap().buf = "renamed.txt".into();
+        let act = run(
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(act, None, "Esc 竟然把改名发出去了");
+        assert!(frame.remote.rename_edit.is_none(), "Esc 之后没退出编辑态");
+    }
+
+    /// 名字非法(含 `/`)时回车**不提交、也不退出编辑态**。
+    ///
+    /// 退出的话用户敲了半天的名字直接没了,而他还不知道为什么 —— 而放行
+    /// 的后果更重:`RemotePath::join` 不做归一化,`../../etc/passwd` 会真的
+    /// 打到 `/etc` 上去(与 `files_dialog::validate_name` 同一条判据)。
+    ///
+    /// 自证会变红:去掉 `rename_row` 里的 `validate_name` 判断(动作被发出),
+    /// 或在校验失败时也 `take()` 掉编辑态(编辑框消失)。
+    #[test]
+    fn an_invalid_name_neither_commits_nor_throws_away_what_was_typed() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        assert!(frame.remote.begin_rename());
+        for _ in 0..2 {
+            run(&ctx, &mut frame, vec![]);
+        }
+        frame.remote.rename_edit.as_mut().unwrap().buf = "../etc/passwd".into();
+        let act = run(
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(act, None, "含 / 的名字被放行了 —— 会打到另一个目录去");
+        assert_eq!(
+            frame.remote.rename_edit.as_ref().map(|r| r.buf.as_str()),
+            Some("../etc/passwd"),
+            "校验失败却把编辑态和用户敲的字一起丢了"
+        );
+    }
+
+    /// 改名那一行**不能把它下面的行挤上来**。
+    ///
+    /// `Ui::put` 按子 ui 的 `min_rect` 推进布局光标,而那就是给 `TextEdit`
+    /// 的 `name_rect` —— 它的高度不等于 `ROW_H` 的话,下面每一行都跟着错位。
+    /// 症状全在画面上:点哪一行都差一点,而**编译、测试、日志一声不吭**
+    /// (`show_rows` 只管起始偏移,不检查行与行怎么排)。
+    ///
+    /// 判据落在「点得中下一行」上,不是像素:点不中才是用户真正会遇到的。
+    /// 代价是分辨率只有半行 —— 一两个点的错位这条测试看不出来,所以
+    /// `name_rect` 那里写死 `ROW_H` 并配了注释,别改成「差不多」的值。
+    ///
+    /// 自证会变红:把 `name_rect` 的高度从 `ROW_H` 改成 `ROW_H * 2.0`。
+    #[test]
+    fn the_row_being_renamed_does_not_swallow_the_row_below_it() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        assert!(frame.remote.begin_rename(), "前提:改的是第一行 notes.txt");
+        for _ in 0..2 {
+            run(&ctx, &mut frame, vec![]);
+        }
+        let box_rect = ctx
+            .read_response(rename_edit_id("远端"))
+            .expect("没画出改名输入框")
+            .rect;
+        // 输入框比整行内缩 1pt(见 `rename_row`),下一行的中心因此是
+        // 「框顶 - 1 + 一行高 + 半行高」。
+        let next_row_y = box_rect.top() - 1.0 + ROW_H * 1.5;
+        let pos = egui::pos2(box_rect.center().x, next_row_y);
+        let m = egui::Modifiers::default();
+        run(
+            &ctx,
+            &mut frame,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: m,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: m,
+                },
+            ],
+        );
+        assert_eq!(
+            frame
+                .remote
+                .cursor
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            Some("other.txt".to_string()),
+            "第二行没画在它该在的位置上 —— 被改名那一行盖住了"
+        );
+    }
+
     /// F137 的验收判据(列头):`row()` 那条只守行体,列头没有对应守护——
     /// 补的这一条。把「修改时间」列拖到窄于标题本身的宽度,标题必须被
     /// 截断到不超列宽,不能横穿到隔壁列头上面。
@@ -2116,7 +2550,7 @@ mod tests {
     }
 
     /// 没有光标行时不给传输入口 —— 点了没反应的菜单项比没有更让人困惑
-    /// (与 `重命名…`/`删除…` 同一条口径)。
+    /// (与 `新建文件夹…`/`删除…` 同一条口径)。
     #[test]
     fn no_cursor_means_no_transfer_entry_at_all() {
         for column in [PanelColumn::Remote, PanelColumn::Local] {
@@ -2278,7 +2712,9 @@ mod tests {
         for _ in 0..2 {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+                content(
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                );
             });
             for shape in out.shapes.iter() {
                 if let egui::epaint::Shape::Text(ts) = &shape.shape {
@@ -2358,7 +2794,9 @@ mod tests {
         let mut render = |frame: &mut PanelFrame| {
             let mut out = None;
             let o = ctx.run(raw(None), |ctx| {
-                out = Some(content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None));
+                out = Some(content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false,
+                ));
             });
             let _ = out;
             o
@@ -2923,7 +3361,9 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
-                    content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+                    content(
+                        ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    );
                 })
                 .shapes;
         }
@@ -2964,7 +3404,9 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
-                    content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+                    content(
+                        ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    );
                 })
                 .shapes;
         }
@@ -2978,7 +3420,9 @@ mod tests {
         // 点本地栏的 ☆:`can_edit` 为假的话 egui 会把按钮禁用,点了没动作。
         let mut out = (None, None);
         let _ = ctx.run(click_at(star), |ctx| {
-            out = content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+            out = content(
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+            );
         });
         let (_remote_out, local_out) = out;
         assert!(
@@ -3204,11 +3648,15 @@ mod tests {
         // 三帧:egui 的 Panel 首帧是 sizing pass,rect 还没稳定。面板外框和
         // 「↑」的位置**必须取自同一帧**,否则比的是两套布局。
         let mut out = ctx.run(raw(None), |ctx| {
-            content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+            content(
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+            );
         });
         for _ in 0..2 {
             out = ctx.run(raw(None), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+                content(
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                );
             });
         }
         let mut lefts: Vec<f32> = out
@@ -3269,11 +3717,15 @@ mod tests {
         let mut cols = ColWidths::default();
         // 三帧,理由同上面那条:首帧是 sizing pass。
         let mut out = ctx.run(raw(None), |ctx| {
-            content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+            content(
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+            );
         });
         for _ in 0..2 {
             out = ctx.run(raw(None), |ctx| {
-                content(ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None);
+                content(
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                );
             });
         }
         let up = find_text_pos(&out.shapes, "↑").expect("路径条的「↑」没画出来");
@@ -3389,7 +3841,7 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             })
         };
         let _ = render(raw(None), &mut frame);
@@ -3441,7 +3893,7 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             })
         };
         let _ = render(raw(None), &mut frame);
@@ -3482,7 +3934,7 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             })
         };
         // 两帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop,同本文件
@@ -3527,7 +3979,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             });
             (acts, out)
         };
@@ -3566,7 +4018,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             });
             (acts, out)
         };
@@ -3605,7 +4057,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             });
             (acts, out)
         };
@@ -3646,7 +4098,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             });
             (acts, out)
         };
@@ -3690,7 +4142,7 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             })
         };
         let _ = render(raw(None), &mut frame);
@@ -3726,7 +4178,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None);
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
             });
             (acts, out)
         };
@@ -4106,6 +4558,143 @@ mod tests {
         );
     }
 
+    /// F199:点哪一栏,键盘焦点就跟到面板、活动栏就换成那一栏。
+    ///
+    /// 在这之前 `App::focus` 只有 F6 改得动、`active_column` 只有 Tab 改得动。
+    /// 用户开着侧栏、点了一个远端文件、按 F5 —— 那个 F5 一路发给了远端的
+    /// Claude Code(用户实报)。F5/F2/Del 的代码从 D1 起就在,只是这一整片
+    /// 键永远轮不到面板。
+    ///
+    /// **本地栏那半条尤其要紧**:Del/F2「只在远端栏生效」的判据就是
+    /// `active_column`。点了本地栏却没把它切过去的话,用户看着本地栏按
+    /// Delete、删掉的是远端文件 —— 这一片能造成的最坏后果。
+    ///
+    /// 自证会变红:把 `content()` 里两处 `pressed_inside` 的结果丢掉不用。
+    #[test]
+    fn clicking_a_column_focuses_the_panel_and_makes_that_column_active() {
+        let ctx = egui::Context::default();
+        annotate::toggle(&ctx);
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = PanelFrame::default();
+        let mut cols = ColWidths::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let click_at =
+            |pos: Option<egui::Pos2>, frame: &mut PanelFrame, cols: &mut ColWidths| -> bool {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                if let Some(p) = pos {
+                    for pressed in [true, false] {
+                        input.events.push(egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        });
+                    }
+                }
+                let mut took = false;
+                let _ = ctx.run(input, |ctx| {
+                    content(ctx, &t, 7, true, frame, 0, cols, &mut None, &mut took);
+                });
+                took
+            };
+
+        // 先跑几帧让几何落定,顺便确认「没点」时什么都不发生。
+        for _ in 0..3 {
+            assert!(
+                !click_at(None, &mut frame, &mut cols),
+                "一帧都没点就报了焦点点击"
+            );
+        }
+        let local = annotate::spot_rect(&ctx, "文件面板/本地").expect("本地栏没画");
+        let remote = annotate::spot_rect(&ctx, "文件面板/远端").expect("远端栏没画");
+
+        assert!(
+            click_at(Some(remote.center()), &mut frame, &mut cols),
+            "点了远端栏,没报「面板拿走了焦点」"
+        );
+        assert_eq!(frame.active_column, PanelColumn::Remote);
+
+        assert!(
+            click_at(Some(local.center()), &mut frame, &mut cols),
+            "点了本地栏,没报「面板拿走了焦点」"
+        );
+        assert_eq!(
+            frame.active_column,
+            PanelColumn::Local,
+            "点了本地栏,活动栏没跟过去 —— 此刻按 Delete 删的是远端文件"
+        );
+
+        // 点在面板之外(屏幕右下角空地)不该抢焦点,也不该动活动栏。
+        let outside = egui::pos2(screen.max.x - 1.0, screen.max.y - 1.0);
+        assert!(
+            !click_at(Some(outside), &mut frame, &mut cols),
+            "点在两栏之外也抢焦点了"
+        );
+        assert_eq!(frame.active_column, PanelColumn::Local, "活动栏被无端改了");
+    }
+
+    /// F199 的侧栏那一半。侧栏是用户实报的那个场景(终端标签 + 右侧文件栏),
+    /// 两个宿主各写一遍布局,所以各测一遍 —— 只测标签宿主的话,侧栏漏接
+    /// 完全无人知晓。
+    #[test]
+    fn clicking_a_sidebar_column_focuses_the_panel_too() {
+        let ctx = egui::Context::default();
+        annotate::toggle(&ctx);
+        let t = crate::theme::MULLION_DARK;
+        let mut ui_state = crate::ui::UiState::default();
+        let mut frame = PanelFrame::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 700.0));
+        let click_at = |pos: Option<egui::Pos2>,
+                        ui_state: &mut crate::ui::UiState,
+                        frame: &mut PanelFrame|
+         -> bool {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            if let Some(p) = pos {
+                for pressed in [true, false] {
+                    input.events.push(egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+            let mut took = false;
+            let _ = ctx.run(input, |ctx| {
+                sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut took);
+            });
+            took
+        };
+
+        for _ in 0..3 {
+            assert!(!click_at(None, &mut ui_state, &mut frame));
+        }
+        let local = annotate::spot_rect(&ctx, "文件面板/本地").expect("本地栏没画");
+        let remote = annotate::spot_rect(&ctx, "文件面板/远端").expect("远端栏没画");
+        // 上下堆叠时两栏的 `max_rect` 是**重叠**的:本地栏拿的是四成高的
+        // 布局预算,但 `allocate_ui` 只按内容实际高度推进游标,远端栏于是
+        // 从本地栏内容的下沿开始 —— 目录为空时它一路盖到本地栏预算的
+        // 中间。所以取点要取「用户眼里确实属于那一栏」的位置:本地取顶部
+        // (路径条那一行),远端取底部。重叠处判给远端,与 egui 自己的命中
+        // 顺序一致(后注册者在上)。
+        let top_of_local = egui::pos2(local.center().x, local.min.y + 4.0);
+        let bottom_of_remote = egui::pos2(remote.center().x, remote.max.y - 4.0);
+        assert!(
+            click_at(Some(top_of_local), &mut ui_state, &mut frame),
+            "侧栏点了本地栏,没报「面板拿走了焦点」"
+        );
+        assert_eq!(frame.active_column, PanelColumn::Local);
+
+        assert!(click_at(Some(bottom_of_remote), &mut ui_state, &mut frame));
+        assert_eq!(frame.active_column, PanelColumn::Remote);
+    }
+
     /// A 组:两栏方位是「本地在前、远端在后」—— 标签宿主左本地右远端,
     /// 侧栏上本地下远端。两个宿主用**同一条**规则。
     ///
@@ -4131,7 +4720,9 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
+                    content(
+                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    );
                 },
             );
         }
@@ -4157,7 +4748,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame2, 0);
+                    sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame2, 0, &mut false);
                 },
             );
         }
@@ -4238,7 +4829,7 @@ mod tests {
             |input: egui::RawInput, frame: &mut PanelFrame, ui_state: &mut crate::ui::UiState| {
                 let mut acts = (None, None);
                 let out = ctx.run(input, |ctx| {
-                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0);
+                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut false);
                 });
                 (acts, out)
             };
@@ -4311,7 +4902,7 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame, 0);
+                        sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame, 0, &mut false);
                     },
                 )
                 .shapes;
@@ -4413,7 +5004,9 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
+                        content(
+                            ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                        );
                     },
                 ));
             }
@@ -4478,7 +5071,9 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
+                    content(
+                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    );
                 },
             ));
         }
@@ -4500,7 +5095,9 @@ mod tests {
             ..Default::default()
         };
         let mut out = Some(ctx.run(scroll_input, |ctx| {
-            content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
+            content(
+                ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+            );
         }));
         // 再跑两帧,让滚动状态稳定下来(smooth scroll 有插值)。
         for _ in 0..2 {
@@ -4510,7 +5107,9 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    content(ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None);
+                    content(
+                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    );
                 },
             ));
         }
@@ -4896,6 +5495,114 @@ mod tests {
         );
     }
 
+    /// F201:一进路径编辑态,整条路径默认全选 —— 敲第一个字就把它整条换掉。
+    ///
+    /// 不全选的话光标停在末尾,用户想换个路径得先按住退格删掉三四十个字符
+    /// (这个框的用途几乎全是「整条换掉」,而不是「在中间改一个字」)。
+    ///
+    /// 判据取**打进去之后缓冲区剩什么**,不是去读 egui 的选区结构:选区是
+    /// 实现细节,「敲一个字会不会覆盖掉原文」才是用户看见的事。
+    ///
+    /// 自证会变红:删掉 `hit.clicked()` 分支里那句 `select_all(..)`。
+    #[test]
+    fn entering_the_path_editor_selects_the_whole_path_so_typing_replaces_it() {
+        let mut state = PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+            b"/var/log".to_vec(),
+        ));
+        state.load = Load::Ready;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let mut cols = ColWidths::default();
+        let mut run = |input: egui::RawInput, state: &mut PaneState| {
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &crate::theme::MULLION_DARK,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        true,
+                        BookmarkView::none(),
+                        0,
+                        &mut cols,
+                    );
+                });
+            });
+        };
+        for t in [0.0_f64, 1.0] {
+            run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..base()
+                },
+                &mut state,
+            );
+        }
+        let pos = ctx
+            .read_response(path_label_id("远端"))
+            .expect("路径条没有可交互的响应 —— 它点不动")
+            .rect
+            .center();
+        let m = egui::Modifiers::default();
+        run(
+            egui::RawInput {
+                time: Some(2.0),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: m,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: m,
+                    },
+                ],
+                ..base()
+            },
+            &mut state,
+        );
+        assert_eq!(
+            state.path_edit.as_deref(),
+            Some("/var/log"),
+            "前提:得先进得去编辑态"
+        );
+        // 编辑框这一帧才第一次画出来并拿到焦点;下一帧才收得到键。
+        run(
+            egui::RawInput {
+                time: Some(3.0),
+                ..base()
+            },
+            &mut state,
+        );
+        run(
+            egui::RawInput {
+                time: Some(4.0),
+                events: vec![egui::Event::Text("~".into())],
+                ..base()
+            },
+            &mut state,
+        );
+        assert_eq!(
+            state.path_edit.as_deref(),
+            Some("~"),
+            "敲第一个字没把原路径整条替掉 —— 进编辑态时没全选"
+        );
+    }
+
     /// F131:退出编辑态**不跳转**是默认;只有回车才跳。反过来的话
     /// (失焦即提交)用户点别处就会被莫名其妙带走。
     ///
@@ -4966,7 +5673,9 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut run = |input: egui::RawInput, frame: &mut PanelFrame| {
             let _ = ctx.run(input, |ctx| {
-                content(ctx, &t, 1, false, frame, 0, &mut cols, &mut None);
+                content(
+                    ctx, &t, 1, false, frame, 0, &mut cols, &mut None, &mut false,
+                );
             });
         };
         let mut clock = 0.0_f64;

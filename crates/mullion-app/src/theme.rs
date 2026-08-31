@@ -29,6 +29,17 @@ pub struct Theme {
     /// 将来真需要一条工具栏(如 F50 SFTP 的操作栏)时用。
     pub bar_tool: Rgb,
     pub bar_status: Rgb,
+    /// F203:模态弹窗(全部 `egui::Window`)的底色。
+    ///
+    /// **F80 冻结色表里没有这一项**,和 `divider`/`sel_alpha` 一样是新增项。
+    /// 原先弹窗蹭的是 `bar_status`(#181b26),与 `term_bg`(#14161f)只差
+    /// 7/255 —— 删除确认框弹在终端上,用户实报「淹没在 pane 的黑色背景里,
+    /// 不容易找到」。
+    ///
+    /// **不复用 `bar_status` 并把它调亮**:状态栏与会话管理器内框也用它,
+    /// 那两处贴在 `panel_bg` 上、本来就分得清,跟着变灰纯属误伤。
+    /// 守护:`dialogs_get_their_own_fill_so_brightening_them_does_not_drag_the_status_bar_along`。
+    pub modal_bg: Rgb,
     pub panel_bg: Rgb,
     /// pane 标题条(F83,随分屏切片)。
     pub panel_head: Rgb,
@@ -128,6 +139,9 @@ pub const MULLION_DARK: Theme = Theme {
     bar_menu: Rgb::new(0x18, 0x1a, 0x22),
     bar_tool: Rgb::new(0x15, 0x18, 0x22),
     bar_status: Rgb::new(0x18, 0x1b, 0x26),
+    // F203:用户指定的 rgb(63,63,63)。中性灰,与色板的冷调蓝紫不同源 ——
+    // 这一点是明知的取舍:实报的问题是「找不到」,而醒目度优先。
+    modal_bg: Rgb::new(0x3f, 0x3f, 0x3f),
     panel_bg: Rgb::new(0x14, 0x16, 0x1f),
     panel_head: Rgb::new(0x19, 0x1c, 0x27),
     sunken_bg: Rgb::new(0x0e, 0x10, 0x18),
@@ -342,7 +356,8 @@ pub fn apply_egui(ctx: &egui::Context, t: &Theme) {
     let mut v = egui::Visuals::dark();
 
     v.panel_fill = c32(t.bar_menu);
-    v.window_fill = c32(t.bar_status);
+    // F203:弹窗有自己的底色,不再蹭 `bar_status` —— 见 `Theme::modal_bg`。
+    v.window_fill = c32(t.modal_bg);
     v.extreme_bg_color = c32(t.sunken_bg);
     v.faint_bg_color = c32(t.panel_head);
     v.window_stroke = stroke(t);
@@ -769,5 +784,85 @@ mod tests {
                  低于 16 眼睛看不见(等于没画),高于 64 是一条抢眼的白线"
             );
         }
+    }
+
+    /// F203:弹窗底色走**自己的 token**,不再蹭 `bar_status`。
+    ///
+    /// 用户实报:删除/权限确认框弹在近黑的终端上「淹没在 pane 的黑色背景里,
+    /// 不容易找到」。根因是所有 `egui::Window` 共用
+    /// `window_fill = bar_status`(#181b26),与 `term_bg`(#14161f)只差
+    /// 几个亮度单位。
+    ///
+    /// **不能直接把 `bar_status` 调亮**:状态栏(`ui::chrome`)和会话管理器
+    /// 的内框也用它,改了那两处会跟着一起变灰 —— 而它们本来就贴在
+    /// `panel_bg` 上,不存在「找不到」的问题。所以必须是一个新 token。
+    ///
+    /// 自证会变红:把 `v.window_fill` 改回 `c32(t.bar_status)`。
+    #[test]
+    fn dialogs_get_their_own_fill_so_brightening_them_does_not_drag_the_status_bar_along() {
+        let t = MULLION_DARK;
+        assert_ne!(
+            t.modal_bg, t.bar_status,
+            "modal_bg 与 bar_status 同值 —— 那这个 token 什么也没分开"
+        );
+        let ctx = egui::Context::default();
+        apply_egui(&ctx, &t);
+        assert_eq!(
+            ctx.style().visuals.window_fill,
+            c32(t.modal_bg),
+            "弹窗底色没接到 modal_bg 上"
+        );
+    }
+
+    /// F203:弹窗底色必须比终端底色亮得**足以一眼分辨**。
+    ///
+    /// 判据用亮度差而不是「等于某个具体色值」:后者只是把常量抄两遍,
+    /// 改坏了两边一起错。下界 32 是实报那条 bug 的量化 —— 原先
+    /// `bar_status`(#181b26)对 `term_bg`(#14161f)最大只抬 7/255,
+    /// 用户看不出来。
+    ///
+    /// 自证会变红:把 `modal_bg` 改回 `#181b26`。
+    #[test]
+    fn the_dialog_fill_stands_off_the_terminal_background_by_more_than_the_old_one_did() {
+        let t = MULLION_DARK;
+        let lift = i32::from(t.modal_bg.r) - i32::from(t.term_bg.r);
+        assert!(
+            lift >= 32,
+            "modal_bg 只比 term_bg 抬了 {lift}/255 —— 用户实报「淹没在黑背景里」\
+             时的差值是 7,抬得不够等于没修"
+        );
+        // 反面:亮到接近前景灰阶就没法在上面写字了。
+        assert!(
+            t.modal_bg.r < t.fg_faint.r,
+            "modal_bg 比 fg_faint 还亮 —— 弹窗里的次要文字将彻底不可读"
+        );
+    }
+
+    /// F203 的连带账:底色抬亮,**贴在它上面的次要文字对比度是往下走的**。
+    ///
+    /// 原先弹窗里的说明文字用 `fg_dim`(#9aa0b8),在 `bar_status` 上约
+    /// 5.5:1 过 AA;搬到 `modal_bg`(#3f3f3f)上掉到约 4.1:1,不过了。
+    /// 提一档到 `fg_muted`(#a9aec2)才回到 5.0:1。
+    ///
+    /// 两条断言缺一不可:只断言 `fg_muted` 达标的话,把调用点改回 `fg_dim`
+    /// 这条测试照样绿(它压根没看调用点用的是哪个)。第二条断言钉的是
+    /// 「这次换档确有必要」—— 哪天有人把 `modal_bg` 调暗回去,它会红,
+    /// 提醒把文字档一起调回来。
+    ///
+    /// 自证会变红:把 `modal_bg` 改回 `#181b26`(第二条红)。
+    #[test]
+    fn the_secondary_text_token_used_in_dialogs_still_clears_aa_on_the_new_fill() {
+        let t = MULLION_DARK;
+        let muted = contrast_ratio(t.fg_muted, t.modal_bg);
+        assert!(
+            muted >= 4.5,
+            "fg_muted 在 modal_bg 上只有 {muted:.2}:1,不到 WCAG AA 的 4.5:1"
+        );
+        let dim = contrast_ratio(t.fg_dim, t.modal_bg);
+        assert!(
+            dim < 4.5,
+            "fg_dim 在 modal_bg 上是 {dim:.2}:1、已经达标 —— 那么弹窗里换档这件事\
+             失去了理由,`dialogs_use_the_brighter_secondary_token` 该一并撤掉"
+        );
     }
 }

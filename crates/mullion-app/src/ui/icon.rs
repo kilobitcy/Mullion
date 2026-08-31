@@ -28,6 +28,12 @@ pub enum Glyph {
     TriangleDown,
     /// 实心右三角:折叠面板的**折起**态。顶掉 U+25B8(GBK 外)。
     TriangleRight,
+    /// F204:空心方框 —— 窗口「最大化」。顶掉 U+25A1:那个字符**可能**在
+    /// GBK 内,但按 `ui::glyphs` 的纪律,登记白名单要先在 Windows 实机上
+    /// 画出来看一眼,而自绘这条路根本不问字体。
+    Maximize,
+    /// F204:两个错位方框 —— 窗口「还原」。Windows 上的既有心智。
+    Restore,
 }
 
 impl Glyph {
@@ -42,6 +48,8 @@ impl Glyph {
         Glyph::Refresh,
         Glyph::TriangleDown,
         Glyph::TriangleRight,
+        Glyph::Maximize,
+        Glyph::Restore,
     ];
 }
 
@@ -150,6 +158,45 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
             stroke.color,
             Stroke::NONE,
         )],
+        // 一个闭合方框。用 `Shape::line` 首尾同点而不是 `rect_stroke`:
+        // 后者产出 `Shape::Rect`,`points_of` 认不得,越界守护会当场 panic。
+        Glyph::Maximize => vec![Shape::line(
+            vec![
+                pos2(c.x - h, c.y - h),
+                pos2(c.x + h, c.y - h),
+                pos2(c.x + h, c.y + h),
+                pos2(c.x - h, c.y + h),
+                pos2(c.x - h, c.y - h),
+            ],
+            stroke,
+        )],
+        // 前框(左下)整个画完,后框(右上)只画露出来的那个「Γ」——
+        // 被前框挡住的两条边不画,否则 12px 见方里六条线糊成一坨。
+        Glyph::Restore => {
+            let d = h * 0.5;
+            vec![
+                Shape::line(
+                    vec![
+                        pos2(c.x - h, c.y - d),
+                        pos2(c.x + d, c.y - d),
+                        pos2(c.x + d, c.y + h),
+                        pos2(c.x - h, c.y + h),
+                        pos2(c.x - h, c.y - d),
+                    ],
+                    stroke,
+                ),
+                Shape::line(
+                    vec![
+                        pos2(c.x - d, c.y - d),
+                        pos2(c.x - d, c.y - h),
+                        pos2(c.x + h, c.y - h),
+                        pos2(c.x + h, c.y + d),
+                        pos2(c.x + d, c.y + d),
+                    ],
+                    stroke,
+                ),
+            ]
+        }
     }
 }
 
@@ -183,6 +230,10 @@ pub fn icon_button(ui: &mut Ui, glyph: Glyph, enabled: bool, tooltip: &str) -> b
     // 而 `on_disabled_hover_text` 只对 `add_enabled` 造出来的 Response 生效,
     // 这里的 Response 来自 `allocate_exact_size`,它永远算「启用」。
     let resp: Response = resp.on_hover_text(tooltip);
+    // 图标按钮**一个字都不画**,不报的话它在 accesskit 树里是个没有名字的
+    // 空节点 —— 屏幕阅读器只念得出「按钮」,F100 的自动候选也认不出它是谁。
+    // 拿 tooltip 当名字:它本来就是这颗按钮的自述,不会另起一套说法走岔。
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
 
     if ui.is_rect_visible(rect) {
         let (rounding, weak_bg, bg_stroke, fg) = if enabled {
@@ -450,6 +501,43 @@ mod tests {
                 "{g:?} 与 ALL 里另一个变体画得一模一样"
             );
             seen.push(pts);
+        }
+    }
+
+    /// F204:最大化 = **一个**方框,还原 = **两个错位**方框(Windows 惯例)。
+    ///
+    /// 两个都必须存在且长得不一样,否则用户按下「最大化」之后,那颗按钮
+    /// 看上去什么都没变 —— 而它此刻的含义已经反过来了。
+    ///
+    /// 判据是「还原比最大化画得多」而不是「恰好 8 个点」:后者把实现细节
+    /// (方框用一条闭合折线还是四段线)抄进了测试,换个画法就假红。
+    ///
+    /// 自证会变红:把 `Glyph::Restore` 的分支改成与 `Maximize` 同一份形状。
+    #[test]
+    fn restore_draws_two_offset_squares_so_it_reads_differently_from_maximize() {
+        let max = points_of(&shapes(r(), Glyph::Maximize, s()));
+        let res = points_of(&shapes(r(), Glyph::Restore, s()));
+        assert!(!max.is_empty(), "Maximize 什么都没画");
+        assert!(
+            res.len() > max.len(),
+            "Restore 画的点({})不比 Maximize({})多 —— 那它多半不是「两个方框」",
+            res.len(),
+            max.len()
+        );
+        // 最大化那一个必须是**闭合**的方框:四个角都得出现,缺一条边看着
+        // 像个「L」,认不出是窗口。
+        let (l, t, rr, b) = (
+            max.iter().map(|p| p.x).fold(f32::MAX, f32::min),
+            max.iter().map(|p| p.y).fold(f32::MAX, f32::min),
+            max.iter().map(|p| p.x).fold(f32::MIN, f32::max),
+            max.iter().map(|p| p.y).fold(f32::MIN, f32::max),
+        );
+        for corner in [(l, t), (rr, t), (l, b), (rr, b)] {
+            assert!(
+                max.iter()
+                    .any(|p| (p.x - corner.0).abs() < 0.01 && (p.y - corner.1).abs() < 0.01),
+                "Maximize 的方框缺了角 {corner:?} —— 画出来不是一个闭合的框"
+            );
         }
     }
 

@@ -1,4 +1,5 @@
-//! 远端写操作的四个对话框(F54/D17/D21):新建文件夹、重命名、删除确认、权限。
+//! 远端写操作的三个对话框(F54/D17/D21):新建文件夹、删除确认、权限。
+//! **重命名不在这里** —— F200 起改成列表里就地编辑(`ui::files_panel::rename_row`)。
 //!
 //! **一律要用户确认之后才动远端**。右键点一下就删文件这种事不该存在,
 //! 而删除在 SFTP 上**没有回收站、不可逆**(设计 D17)。
@@ -6,6 +7,13 @@
 //! 危险措辞按 F119 表单规范:列出「将删除 N 个文件 / M 个目录」+ 完整远端
 //! 路径,按钮写「删除」不写「确定」——「确定」在一个列着 40 条路径的框里
 //! 说明不了用户到底确定了什么。
+//!
+//! **D17 唯一的明示例外(F202)**:`Shift+Delete` 直接删,不弹这个框,
+//! 文件和目录一视同仁 —— 用户拿它清一批临时文件,一条条确认反而会让他
+//! 养成"闭眼点确定"的习惯,那比没有框更危险。代价是手滑按到 Shift
+//! 就真的没了,所以那条路必须报一句带计数的吐司([`deleting_toast`]),
+//! 而**裸 `Delete` 仍旧弹框**(守护:`app::tests::
+//! shift_delete_skips_the_confirmation_but_a_bare_delete_still_asks`)。
 
 use mullion_ssh::sftp::RemotePath;
 
@@ -19,12 +27,6 @@ pub enum FilesDialog {
         /// 在哪个目录里建。
         parent: RemotePath,
         /// 输入框内容。
-        name: String,
-    },
-    Rename {
-        /// 完整的原路径。
-        from: RemotePath,
-        /// 输入框内容(只是**名字**,不含目录)。
         name: String,
     },
     Delete {
@@ -103,18 +105,37 @@ pub enum EditResolve {
 /// 删除确认框的那句话。抽成纯函数是因为它是**这一片唯一一句会直接导致
 /// 数据丢失的文案** —— 数错了(比如把目录也算进「文件」)用户就会低估后果。
 pub fn delete_summary(targets: &[(RemotePath, bool)]) -> String {
+    counted(targets, "将删除")
+}
+
+/// F202:Shift+Del 免确认时的那句吐司。用户没看见确认框,这是**唯一**
+/// 能告诉他刚才那一下打中了什么的东西,所以计数照样要分开数。
+///
+/// 措辞是「正在删除」而不是「已删除」:字节这会儿才刚发出去,成败要等
+/// `UserEvent::SftpOpDone` 回来(成了另有「已完成」,败了是错误卡片)。
+/// 在发出的那一刻宣布「已删除」,链路一断就成了假消息。
+pub fn deleting_toast(targets: &[(RemotePath, bool)]) -> String {
+    counted(targets, "正在删除")
+}
+
+/// 上面两句共用的计数。**只写一遍**:数错了(比如把目录也算进「文件」)
+/// 用户就会低估后果,而免确认那条路上没有第二次确认能兜住。
+fn counted(targets: &[(RemotePath, bool)], verb: &str) -> String {
     let dirs = targets.iter().filter(|(_, is_dir)| *is_dir).count();
     let files = targets.len() - dirs;
     match (files, dirs) {
         (0, 0) => "没有选中任何条目".to_string(),
-        (f, 0) => format!("将删除 {f} 个文件"),
-        (0, d) => format!("将删除 {d} 个目录(连同其中全部内容)"),
-        (f, d) => format!("将删除 {f} 个文件、{d} 个目录(连同其中全部内容)"),
+        (f, 0) => format!("{verb} {f} 个文件"),
+        (0, d) => format!("{verb} {d} 个目录(连同其中全部内容)"),
+        (f, d) => format!("{verb} {f} 个文件、{d} 个目录(连同其中全部内容)"),
     }
 }
 
-/// 校验一个用户输入的**名字段**(新建 / 重命名共用)。
-/// 返回 `Err` 时对话框的确认按钮置灰并显示这条原因。
+/// 校验一个用户输入的**名字段**。新建文件夹的对话框与 F200 的就地改名
+/// 共用这一份判据 —— 两处各写一遍的话,迟早有一处忘了挡 `/`。
+///
+/// 返回 `Err` 时:对话框那边把确认按钮置灰并显示这条原因;就地改名那边
+/// 画红框 + 悬停显示,且**不退出编辑态**。
 ///
 /// 这里挡的是**会打到别的路径上**的输入,不是「不好看的名字」:
 /// - 空 / 全空白:拼出来是父目录本身。
@@ -156,10 +177,48 @@ pub fn bits_from_mode(mode: u32) -> [bool; 9] {
     out
 }
 
-/// 四个框共用的外壳。模态框的属性(不可折叠、不可缩放、居中)只写一处 ——
-/// 四份复制粘贴里总有一份会漏掉 `.collapsible(false)`。
-fn modal<R>(ctx: &egui::Context, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) {
+/// F203:「取消这个框」要发出的处置。`None` = 只关框就行。
+///
+/// 抽成纯函数是因为它有**两个入口**:框里那颗「取消」按钮,和 F203 加在
+/// 标题栏上的 ✕。两处各写一遍的话,迟早有一处漏掉后两个变体那条
+/// 「不能只关框」的规矩 —— 而漏掉的症状是传输队列静静地永远走不动。
+///
+/// 前四个框没有在途状态,关掉就完了;后两个框各自代表一条**挂起的工作**
+/// (一条 job / 一条编辑),不给出处置它们就永远挂着。
+pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
+    match d {
+        FilesDialog::NewDir { .. } | FilesDialog::Delete { .. } | FilesDialog::Chmod { .. } => None,
+        // 取消 = 保留远端。**不能只关框**:那条编辑会一直挂在 `Conflict` 上,
+        // 每次轮询都想回传、每次都撞冲突,而快照永远不动 —— 界面上只看得出
+        // 「这个文件一直红着」。
+        FilesDialog::EditConflict { key, .. } => Some(FileOp::ResolveEdit {
+            key: *key,
+            choice: EditResolve::KeepRemote,
+        }),
+        // 同上,按跳过算。`apply_all` 恒 `false` —— 取消是「这一条别传了」,
+        // 不是「以后都别问了」,哪怕框里勾着那个复选框。
+        FilesDialog::Conflict { job, .. } => Some(FileOp::Resolve {
+            job: *job,
+            choice: crate::files::queue::Conflict::Skip,
+            apply_all: false,
+        }),
+    }
+}
+
+/// 五个框共用的外壳。模态框的属性(不可折叠、不可缩放、居中、标题栏上有
+/// ✕)只写一处 —— 五份复制粘贴里总有一份会漏掉 `.collapsible(false)`。
+///
+/// 返回 **`true` = 用户点了标题栏上那颗 ✕**(F203)。不在这里直接收口,是
+/// 因为「取消该干什么」按框而异(见 [`cancel_op`]),而 `body` 闭包这会儿
+/// 还借着调用方的 `op`;返回之后借用结束,调用方再落处置。
+///
+/// ✕ 走 `egui::Window::open()` 而不是自己在正文里画一颗:egui 把它画在
+/// **标题栏**上(正文里画只能低一行),而且那是两条直线不是字形,
+/// 没有 T9 的豆腐块风险。
+fn modal<R>(ctx: &egui::Context, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> bool {
+    let mut open = true;
     egui::Window::new(title)
+        .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -167,9 +226,11 @@ fn modal<R>(ctx: &egui::Context, title: &str, body: impl FnOnce(&mut egui::Ui) -
             crate::ui::annotate::mark(ui.ctx(), format!("{title}对话框"), ui.max_rect());
             body(ui)
         });
+    !open
 }
 
-/// 名字输入框 + 校验提示,新建与重命名共用。返回「现在能不能确认」。
+/// 名字输入框 + 校验提示。返回「现在能不能确认」。
+/// (F200 之后只剩「新建文件夹」一个用户 —— 重命名改成列表里就地编辑了。)
 fn name_field(ui: &mut egui::Ui, t: &Theme, name: &mut String) -> bool {
     ui.add(egui::TextEdit::singleline(name).desired_width(260.0));
     match validate_name(name) {
@@ -189,13 +250,24 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
     let d = dialog.as_mut()?;
     let mut op = None;
     let mut close = false;
+    // F203:✕ 与各框那颗「取消」按钮共用同一条处置。**必须在进 `match`
+    // 之前算好** —— 各臂已经把 `d` 的字段借出去了,臂内再借整个 `d` 借不出来。
+    let on_cancel = cancel_op(d);
+    // 各臂共用的收口:点了 ✕ / 点了「取消」都走这里。
+    macro_rules! cancelled {
+        () => {{
+            op = on_cancel.clone();
+            close = true;
+        }};
+    }
 
     match d {
         FilesDialog::NewDir { parent, name } => {
             let parent_disp = parent.display().to_string();
-            modal(ctx, "新建文件夹", |ui| {
+            let x = modal(ctx, "新建文件夹", |ui| {
                 ui.label(
-                    egui::RichText::new(format!("位置:{parent_disp}")).color(theme::c32(t.fg_dim)),
+                    egui::RichText::new(format!("位置:{parent_disp}"))
+                        .color(theme::c32(t.fg_muted)),
                 );
                 let ok = name_field(ui, t, name);
                 ui.horizontal(|ui| {
@@ -204,42 +276,22 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                         close = true;
                     }
                     if ui.button("取消").clicked() {
-                        close = true;
+                        cancelled!();
                     }
                 });
             });
-        }
-        FilesDialog::Rename { from, name } => {
-            let from_disp = from.display().to_string();
-            modal(ctx, "重命名", |ui| {
-                ui.label(
-                    egui::RichText::new(format!("原名:{from_disp}")).color(theme::c32(t.fg_dim)),
-                );
-                let ok = name_field(ui, t, name);
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(ok, egui::Button::new("重命名")).clicked() {
-                        // 目标路径在**原路径的父目录**里拼 —— 重命名不该顺带
-                        // 换目录,而 `name` 已经被 `validate_name` 挡掉了 `/`。
-                        let to = from.parent().join(name.trim().as_bytes());
-                        op = Some(FileOp::Rename {
-                            from: from.clone(),
-                            to,
-                        });
-                        close = true;
-                    }
-                    if ui.button("取消").clicked() {
-                        close = true;
-                    }
-                });
-            });
+            if x {
+                cancelled!();
+            }
         }
         FilesDialog::Delete { targets } => {
-            modal(ctx, "删除", |ui| {
+            let x = modal(ctx, "删除", |ui| {
                 ui.colored_label(theme::c32(t.danger), delete_summary(targets));
                 // 「没有回收站」必须写在框里。用户在本地删东西是有后悔药的,
                 // 那个心智模型会被原样带到这儿来(设计 D17)。
                 ui.label(
-                    egui::RichText::new("远端删除不可逆,没有回收站。").color(theme::c32(t.fg_dim)),
+                    egui::RichText::new("远端删除不可逆,没有回收站。")
+                        .color(theme::c32(t.fg_muted)),
                 );
                 egui::ScrollArea::vertical()
                     .max_height(180.0)
@@ -262,15 +314,18 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                         close = true;
                     }
                     if ui.button("取消").clicked() {
-                        close = true;
+                        cancelled!();
                     }
                 });
             });
+            if x {
+                cancelled!();
+            }
         }
         FilesDialog::Chmod { path, mode } => {
             let path_disp = path.display().to_string();
-            modal(ctx, "属性", |ui| {
-                ui.label(egui::RichText::new(&path_disp).color(theme::c32(t.fg_dim)));
+            let x = modal(ctx, "属性", |ui| {
+                ui.label(egui::RichText::new(&path_disp).color(theme::c32(t.fg_muted)));
                 let mut bits = bits_from_mode(*mode);
                 egui::Grid::new("chmod-grid").show(ui, |ui| {
                     ui.label("");
@@ -297,19 +352,22 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                         close = true;
                     }
                     if ui.button("取消").clicked() {
-                        close = true;
+                        cancelled!();
                     }
                 });
             });
+            if x {
+                cancelled!();
+            }
         }
         FilesDialog::EditConflict { name, key } => {
             let key = *key;
             let name_disp = name.clone();
-            modal(ctx, "远端文件已被改动", |ui| {
+            let x = modal(ctx, "远端文件已被改动", |ui| {
                 ui.label(format!("你在编辑「{name_disp}」期间,远端那一份变了。"));
                 ui.label(
                     egui::RichText::new("直接覆盖会丢掉对方的改动,不可撤销。")
-                        .color(theme::c32(t.fg_dim)),
+                        .color(theme::c32(t.fg_muted)),
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -341,15 +399,15 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                     // 「取消」= 保留远端,**不能只关框**:那条编辑会一直挂在
                     // `Conflict` 上,每次轮询都想回传、每次都撞冲突,而快照
                     // 永远不动 —— 界面上只看得出「这个文件一直红着」。
+                    // 处置本体在 `cancel_op`,与标题栏那颗 ✕ 共用一份。
                     if ui.button("取消").clicked() {
-                        op = Some(FileOp::ResolveEdit {
-                            key,
-                            choice: EditResolve::KeepRemote,
-                        });
-                        close = true;
+                        cancelled!();
                     }
                 });
             });
+            if x {
+                cancelled!();
+            }
         }
         FilesDialog::Conflict {
             name,
@@ -358,11 +416,11 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
         } => {
             let job = *job;
             let name_disp = name.clone();
-            modal(ctx, "文件已存在", |ui| {
+            let x = modal(ctx, "文件已存在", |ui| {
                 ui.label(format!("目标位置已经有「{name_disp}」了。"));
                 ui.label(
                     egui::RichText::new("覆盖会丢掉目标端现有的内容,不可撤销。")
-                        .color(theme::c32(t.fg_dim)),
+                        .color(theme::c32(t.fg_muted)),
                 );
                 ui.add_space(6.0);
                 ui.checkbox(apply_all, "对本批后续冲突都这么办");
@@ -399,17 +457,16 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                     }
                     // 「取消」也要发出一个处置(按跳过算),**不能只关框** ——
                     // 那条 job 会永远挂在 `Conflict` 上,整个队列再也走不动,
-                    // 而界面上看起来只是「卡住了」。
+                    // 而界面上看起来只是「卡住了」。处置本体在 `cancel_op`,
+                    // 与标题栏那颗 ✕ 共用一份。
                     if ui.button("取消").clicked() {
-                        op = Some(FileOp::Resolve {
-                            job,
-                            choice: crate::files::queue::Conflict::Skip,
-                            apply_all: false,
-                        });
-                        close = true;
+                        cancelled!();
                     }
                 });
             });
+            if x {
+                cancelled!();
+            }
         }
     }
 
@@ -423,8 +480,181 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
 mod tests {
     use super::*;
 
+    /// F203:弹窗里的次要文字必须用比 `fg_dim` 亮一档的 `fg_muted`。
+    ///
+    /// 底色从 `bar_status` 抬到 `modal_bg` 之后,`fg_dim` 在上面只剩约
+    /// 4.1:1、掉出 WCAG AA(算式见
+    /// `theme::tests::the_secondary_text_token_used_in_dialogs_still_clears_aa_on_the_new_fill`)。
+    /// 这条盯的是**调用点**——色板那条只证明「亮一档的那个 token 达标」,
+    /// 证明不了这两个文件真的换过去了。
+    ///
+    /// 扎源码而不是数像素:两个文件里这些标签的实际颜色要从 egui 的形状树
+    /// 里反解,得先知道每句文案,那等于把文案抄进测试,改一个字就红。
+    ///
+    /// 自证会变红:把任意一处 `t.fg_muted` 改回 `t.fg_dim`。
+    #[test]
+    fn dialogs_use_the_brighter_secondary_token_because_the_fill_got_lighter() {
+        for (name, src) in [
+            ("files_dialog.rs", include_str!("files_dialog.rs")),
+            ("editor_window.rs", include_str!("editor_window.rs")),
+        ] {
+            let prod = src.split("#[cfg(test)]").next().expect("源码切歪了");
+            assert!(
+                !prod.contains("t.fg_dim"),
+                "{name} 的弹窗正文还在用 fg_dim/fg_dimmer —— 在 modal_bg(#3f3f3f)\
+                 上它掉到 4.1:1,不到 AA"
+            );
+            assert!(
+                prod.contains("t.fg_muted"),
+                "{name} 一处 fg_muted 都没有 —— 上一条断言于是什么也没守住\
+                 (把颜色全删光同样能让它绿)"
+            );
+        }
+    }
+
     fn rp(s: &str) -> RemotePath {
         RemotePath::from_bytes(s.as_bytes().to_vec())
+    }
+
+    /// F203:`cancel_op` 是「取消这件事」的唯一真值 —— 六个变体一个不落。
+    ///
+    /// 前四个只关框(没有在途状态要收);后两个**必须发出处置**:只关框的话
+    /// 那条 job / 那条编辑会永远挂在 `Conflict` 上,传输队列再也走不动、
+    /// 文件一直红着,而界面上只看得出「卡住了」。
+    ///
+    /// 用 `match` 穷尽而不是列举六个 `assert`:加了第七个变体,编译器会在
+    /// `cancel_op` 那边逼你处理,这条测试也会因为 `match` 不穷尽而编不过。
+    #[test]
+    fn cancelling_settles_the_two_dialogs_that_own_in_flight_work_and_only_closes_the_rest() {
+        let all = [
+            FilesDialog::NewDir {
+                parent: rp("/srv"),
+                name: "x".into(),
+            },
+            FilesDialog::Delete {
+                targets: vec![(rp("/srv/a"), false)],
+            },
+            FilesDialog::Chmod {
+                path: rp("/srv/a"),
+                mode: 0o644,
+            },
+            FilesDialog::EditConflict {
+                name: "/srv/a".into(),
+                key: 9,
+            },
+            FilesDialog::Conflict {
+                name: "a.bin".into(),
+                job: 3,
+                apply_all: true,
+            },
+        ];
+        for d in &all {
+            let got = cancel_op(d);
+            let want = match d {
+                FilesDialog::NewDir { .. }
+                | FilesDialog::Delete { .. }
+                | FilesDialog::Chmod { .. } => None,
+                FilesDialog::EditConflict { .. } => Some(FileOp::ResolveEdit {
+                    key: 9,
+                    choice: EditResolve::KeepRemote,
+                }),
+                FilesDialog::Conflict { .. } => Some(FileOp::Resolve {
+                    job: 3,
+                    choice: crate::files::queue::Conflict::Skip,
+                    // 取消是「这一条别传了」,不是「以后都别问了」——
+                    // 哪怕框里勾着「对本批后续冲突都这么办」。
+                    apply_all: false,
+                }),
+            };
+            assert_eq!(got, want, "取消 {d:?} 的处置不对");
+        }
+    }
+
+    /// F203:六个框的标题栏上都要有一个 ✕,而且**它就是「取消」**。
+    ///
+    /// 用户实报:确认框弹在近黑的终端上,「右上角有 ✕,表示关闭」是他找得到
+    /// 的第一个出口。走 `egui::Window::open()` 而不是自己在正文里画一颗 ——
+    /// 那样画出来的按钮低于标题栏一行,而且六份复制粘贴里总有一份会漏。
+    ///
+    /// 点击靠 accesskit 定位(egui 给这颗按钮登记的 label 是 "Close window",
+    /// `egui-0.30.0/src/containers/window.rs:1213`);它是**画出来的两条线**,
+    /// 不是字形,所以按 T9 的口径没有豆腐块风险,也没法用文本定位。
+    ///
+    /// 自证会变红:把 `modal()` 里的 `.open(&mut open)` 去掉。
+    #[test]
+    fn every_dialog_offers_a_close_cross_that_means_cancel() {
+        for (label, mut d) in [
+            (
+                "删除",
+                Some(FilesDialog::Delete {
+                    targets: vec![(rp("/srv/a"), false)],
+                }),
+            ),
+            (
+                "属性",
+                Some(FilesDialog::Chmod {
+                    path: rp("/srv/a"),
+                    mode: 0o644,
+                }),
+            ),
+            (
+                "新建文件夹",
+                Some(FilesDialog::NewDir {
+                    parent: rp("/srv"),
+                    name: "x".into(),
+                }),
+            ),
+            ("编辑冲突", edit_conflict()),
+            ("传输冲突", conflict(true)),
+        ] {
+            let want = cancel_op(d.as_ref().expect("前提:框是开着的"));
+            let op =
+                click_close_cross(&mut d).unwrap_or_else(|| panic!("{label}框的标题栏上找不到 ✕"));
+            assert_eq!(op, want, "{label}框的 ✕ 和「取消」不是同一件事");
+            assert!(d.is_none(), "{label}框按了 ✕ 之后没关掉");
+        }
+    }
+
+    /// 找到标题栏上那颗 ✕ 并点它。返回这一帧的 `FileOp`;找不到按钮就返回
+    /// `None`(与「点了但没有 op」区分不开,所以调用方先用 `cancel_op` 算好
+    /// 期望值,期望值为 `None` 的框另靠 `d.is_none()` 判定点没点着)。
+    fn click_close_cross(dialog: &mut Option<FilesDialog>) -> Option<Option<FileOp>> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut update = None;
+        // 两帧:egui `Window` 首帧只记 `Shape::Noop`,几何也还没落定。
+        for _ in 0..2 {
+            update = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    show(ctx, &t, dialog);
+                })
+                .platform_output
+                .accesskit_update;
+        }
+        let b = update?
+            .nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Close window"))
+            .and_then(|(_, n)| n.bounds())?;
+        let pos = egui::pos2(
+            (b.x0 as f32 + b.x1 as f32) / 2.0,
+            (b.y0 as f32 + b.y1 as f32) / 2.0,
+        );
+        let mut input = egui::RawInput::default();
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let mut op = None;
+        let _ = ctx.run(input, |ctx| {
+            op = show(ctx, &t, dialog);
+        });
+        Some(op)
     }
 
     fn conflict(apply_all: bool) -> Option<FilesDialog> {
@@ -562,6 +792,27 @@ mod tests {
             s.contains("连同其中全部内容"),
             "有目录时必须说清是连内容一起删: {s}"
         );
+    }
+
+    /// F202:Shift+Del **不弹确认框**,那句「将删除…」用户根本看不到 ——
+    /// 唯一能告诉他刚才那一下打中了什么的就是这句吐司,所以它必须带上
+    /// 同样分开数的计数。
+    ///
+    /// 而措辞必须是「正在」不是「已」:字节这会儿才刚发出去,成败要等
+    /// `SftpOpDone` 回来。在发出的那一刻宣布「已删除」,链路一断就成了
+    /// 假消息 —— 而这一片不可逆,用户会据此以为不用再管了。
+    ///
+    /// 自证会变红:把 `deleting_toast` 转发给 `delete_summary`。
+    #[test]
+    fn the_no_confirm_toast_says_it_is_under_way_not_that_it_is_done() {
+        let s = deleting_toast(&[(rp("/a"), false), (rp("/b"), true)]);
+        assert!(s.contains("1 个文件"), "实际: {s}");
+        assert!(s.contains("1 个目录"), "实际: {s}");
+        assert!(
+            !s.contains("已删除") && !s.contains("将删除"),
+            "免确认那条路上还没有结果,不能说「已」也不该说「将」: {s}"
+        );
+        assert!(s.contains("正在删除"), "实际: {s}");
     }
 
     /// 只有文件时不该冒出「0 个目录」这种话。
@@ -774,23 +1025,6 @@ mod tests {
             "点「删除」该发出 Delete"
         );
         assert!(d.is_none(), "确认之后框必须关掉");
-    }
-
-    /// 重命名的目标路径要在**原路径的父目录**里拼。拼错成「当前目录」或者
-    /// 直接拿名字当绝对路径,都会把文件搬到另一个地方去。
-    #[test]
-    fn renaming_keeps_the_file_in_its_own_parent_directory() {
-        let mut d = Some(FilesDialog::Rename {
-            from: rp("/srv/app/old.txt"),
-            name: "new.txt".into(),
-        });
-        assert_eq!(
-            click_button(&mut d, "重命名"),
-            Some(FileOp::Rename {
-                from: rp("/srv/app/old.txt"),
-                to: rp("/srv/app/new.txt"),
-            })
-        );
     }
 
     /// 新建文件夹的目标路径 = 当前目录 + 名字,且首尾空白要去掉 ——
