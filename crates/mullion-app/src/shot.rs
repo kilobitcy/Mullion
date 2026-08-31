@@ -276,7 +276,6 @@ pub fn clipboard_dib() -> Option<Vec<u8>> {
 
 #[cfg(windows)]
 mod win {
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     };
@@ -298,7 +297,10 @@ mod win {
             }
             // 剪贴板被别的进程占着是 Windows 上的常态(输入法、剪贴板管理器),
             // 打不开就当这次没有图 —— 不弹窗、不重试。
-            if OpenClipboard(HWND::default()).is_err() {
+            // `None` = 把剪贴板关联到当前任务(等价于传 NULL 窗口句柄)。
+            // `windows` 0.59 把这个参数改成了 `Option<HWND>`,写 `HWND::default()`
+            // 在 Linux 上根本不编译到、只有交叉编译那一刀才会炸。
+            if OpenClipboard(None).is_err() {
                 log::debug!(target: "mullion", "剪贴板被占用,这次不取图");
                 return None;
             }
