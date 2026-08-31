@@ -60,6 +60,9 @@ arboard = { version = "3.6", default-features = false }
 # `arboard` 注释里写过的理由仍然成立(N6 exe 体积)。`ico` 只拉 byteorder + png,
 # png 的 miniz_oxide 是纯 Rust,交叉编译不引入新的 C 依赖。
 ico = "0.5"
+# F209:剪贴板截图编码成 PNG。**不是新依赖** —— `ico` 本来就把它拉进来了
+# (Cargo.lock 里 0.17),这里只是加一条直接依赖好点名用。同理由不用 `image`。
+png = "0.17"
 # 图标正文按 base64 内嵌进 sessions.toml(用户选定的存储方式:换机器拷配置
 # 就带着走)。0.22.1 本来就在 Cargo.lock 里(传递依赖),加直接依赖不引入新版本。
 base64 = "0.22"

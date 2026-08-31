@@ -2534,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-app"
-version = "0.1.86"
+version = "0.1.87"
 dependencies = [
  "arboard",
  "base64",
@@ -2553,6 +2553,7 @@ dependencies = [
  "mullion-ssh",
  "mullion-store",
  "mullion-term",
+ "png 0.17.16",
  "pollster",
  "proc-macro2",
  "rfd",
@@ -2570,11 +2571,11 @@ dependencies = [
 
 [[package]]
 name = "mullion-core"
-version = "0.1.86"
+version = "0.1.87"
 
 [[package]]
 name = "mullion-ssh"
-version = "0.1.86"
+version = "0.1.87"
 dependencies = [
  "log",
  "russh",
@@ -2584,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-store"
-version = "0.1.86"
+version = "0.1.87"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -2596,7 +2597,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-term"
-version = "0.1.86"
+version = "0.1.87"
 dependencies = [
  "alacritty_terminal",
  "vte",

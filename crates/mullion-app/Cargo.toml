@@ -40,6 +40,7 @@ time.workspace = true
 log.workspace = true
 arboard.workspace = true
 ico.workspace = true
+png.workspace = true
 base64.workspace = true
 unicode-width.workspace = true
 
