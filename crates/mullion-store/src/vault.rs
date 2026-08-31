@@ -2218,6 +2218,7 @@ port = 7891
             d.sftp = crate::sftp::SftpPrefs {
                 default_remote: Some("/srv/app".into()),
                 default_local: None,
+                screenshot_dir: Some("/srv/shots".into()),
                 bookmarks: vec![crate::sftp::Bookmark {
                     name: "日志".into(),
                     path: "/var/log".into(),

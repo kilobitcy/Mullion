@@ -150,6 +150,8 @@ pub struct EditorBuffer {
     pub sftp_default_local: String,
     /// F120:远端书签 `(名称, 路径)`。顺序即用户排的顺序,保存时不许重排。
     pub sftp_bookmarks: Vec<(String, String)>,
+    /// F209:终端里 `Ctrl+V` 贴截图时,PNG 落到远端哪个目录。空 = `/tmp`。
+    pub sftp_screenshot_dir: String,
 }
 
 impl Default for EditorBuffer {
@@ -191,6 +193,7 @@ impl Default for EditorBuffer {
             sftp_default_remote: String::new(),
             sftp_default_local: String::new(),
             sftp_bookmarks: Vec::new(),
+            sftp_screenshot_dir: String::new(),
         }
     }
 }
@@ -286,6 +289,7 @@ impl std::fmt::Debug for EditorBuffer {
             .field("sftp_default_remote", &self.sftp_default_remote)
             .field("sftp_default_local", &self.sftp_default_local)
             .field("sftp_bookmarks", &self.sftp_bookmarks)
+            .field("sftp_screenshot_dir", &self.sftp_screenshot_dir)
             .finish()
     }
 }
@@ -356,6 +360,7 @@ impl EditorBuffer {
                 .iter()
                 .map(|b| (b.name.clone(), b.path.clone()))
                 .collect(),
+            sftp_screenshot_dir: rec.sftp.screenshot_dir.clone().unwrap_or_default(),
             ..Self::default()
         };
         match &rec.network.proxy {
@@ -756,6 +761,10 @@ pub(crate) fn build_draft(buf: &EditorBuffer) -> Result<SessionDraft, String> {
                 .collect(),
             // F154:表单里没有这一项,原样带回去(同 `preserved_automation`)。
             local_bookmarks: buf.preserved_local_bookmarks.clone(),
+            screenshot_dir: {
+                let v = buf.sftp_screenshot_dir.trim();
+                (!v.is_empty()).then(|| v.to_string())
+            },
         },
         secret: None,
     };
@@ -1046,6 +1055,7 @@ mod tests {
                 path: "/var/log".into(),
             }],
             local_bookmarks: Vec::new(),
+            screenshot_dir: Some("/srv/shots".into()),
         };
         let buf = EditorBuffer::from_record(&rec);
         let draft = build_draft(&buf).unwrap();
@@ -1073,6 +1083,7 @@ mod tests {
                 name: "工程".into(),
                 path: r"D:\work\proj".into(),
             }],
+            screenshot_dir: None,
         };
         let buf = EditorBuffer::from_record(&rec);
         let draft = build_draft(&buf).expect("表单该能转回草稿");

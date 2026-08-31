@@ -1794,6 +1794,16 @@ pub(super) fn sftp(ui: &mut Ui, t: &Theme, buf: &mut EditorBuffer, first: &mut b
                 .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0)),
         );
         ui.end_row();
+
+        // F209:跟上面两个分开一行,不合并 —— 这是临时图的落脚点,不是
+        // 工作目录(理由见 `SftpPrefs::screenshot_dir` 的注释)。
+        ui.label("截图上传目录");
+        ui.add(
+            egui::TextEdit::singleline(&mut buf.sftp_screenshot_dir)
+                .hint_text(crate::theme::hint_text(t, "留空 = /tmp"))
+                .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0)),
+        );
+        ui.end_row();
     });
 
     section(ui, t, "会话管理器/右栏", "书签", first);

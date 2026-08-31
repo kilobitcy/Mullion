@@ -234,6 +234,18 @@ pub enum UserEvent {
         generation: u64,
         result: Result<(), String>,
     },
+    /// F209:一张截图传完了。`Ok` 是**远端绝对路径**,由接收方打进那块 pane
+    /// 的输入行;`Err` 是已经格式化好的原因,只弹提示。
+    ///
+    /// **必须同时带 `generation` 和 `pane`**,不能到时候取「当前活动标签的
+    /// 焦点分屏」:高延迟链路上传一张 3MB 的图要好几秒,用户完全可能已经切
+    /// 标签、切分屏了 —— 那时把路径打进别的 shell 里,是一句凭空冒出来的
+    /// 乱码(T11 同族:判据要跟着字节走,不是跟着「此刻谁在焦点」走)。
+    ShotUploaded {
+        generation: u64,
+        pane: PaneId,
+        result: Result<String, String>,
+    },
     /// F52:一批传输展开完了(目录已经递归成一条条文件级 job),可以入队。
     /// **展开在后台做**:远端目录要走网络列目录,本地目录要走磁盘遍历,
     /// 都不能压在窗口线程上。`Err` = 展开阶段就失败(目录读不了 / 落点名在
@@ -694,6 +706,9 @@ struct TerminalTab {
     /// 建标签时从 `store` 读一次存进来,之后不再变——跟 `last_cfg` 同理,
     /// 不随会话记录后续被编辑而变化(那是下一次连接才会生效的东西)。
     sftp_default_remote: Option<String>,
+    /// F209:这个标签对应会话配置的「截图上传目录」。`None` = 用
+    /// `shot::DEFAULT_DIR`。取值时机同 `sftp_default_remote`(建标签时读一次)。
+    sftp_screenshot_dir: Option<String>,
     /// F123:这条 sftp 连接的**真登录目录**(`canonicalize(".")` 的结果)。
     /// `None` = sftp 还没开好。用来把标题里报的 `~/Mullion` 展开成绝对路径
     /// (`sftp-server` 不展开 `~`)。
@@ -2011,6 +2026,11 @@ pub struct App {
     ime_cursor_area: Option<(u32, u32, u32, u32)>,
     /// 待用户确认的多行粘贴(F18)。`Some` = 弹窗开着,计入 `modal`(T8)。
     pending_paste: Option<String>,
+    /// F209:本进程内传过的截图张数,进文件名当序号。
+    ///
+    /// **不用时间戳兜底撞名**:`/tmp` 是所有用户共用的,同一秒里连贴两张
+    /// (完全正常的操作)会静默互相覆盖 —— 用户看到的是「第一张图不见了」。
+    shot_seq: u64,
     /// F61/F62:会话外观的解析缓存。**只在会话/分组变更后 rebuild**,
     /// 绝不在渲染里现算(陷阱 T3,见 `ui::badge::AppearanceCache`)。
     appearance: crate::ui::badge::AppearanceCache,
@@ -2331,6 +2351,7 @@ impl App {
             ime: Default::default(),
             ime_cursor_area: None,
             pending_paste: None,
+            shot_seq: 0,
             appearance: Default::default(),
             probe_epoch: 0,
             probe_task: None,
@@ -5629,6 +5650,136 @@ impl App {
         self.user_took_over();
     }
 
+    /// F209:终端里裸 `Ctrl+V`,剪贴板里是一张位图 —— 编码、传远端、把绝对
+    /// 路径打进这块 pane 的输入行。
+    ///
+    /// 解码 + PNG 编码就在窗口线程上做:一张 4K 图几十毫秒,比开一条 channel
+    /// 的一次 RTT 还便宜(本项目的主场景是高延迟代理链路),不值得为它再搬
+    /// 一个线程。**上传**才是慢的那一段,那一段在后台 task 上。
+    ///
+    /// **另开一条 sftp channel,不蹭侧栏那条。** 侧栏那条记在
+    /// `sftp_host_ix` 上,而它未必是焦点分屏此刻所在的那台机器(F132);蹭错
+    /// 的后果是图传到了另一台机器上,而打进输入行的路径看起来完全正常。
+    fn paste_screenshot(&mut self, dib: &[u8]) {
+        let png = match crate::shot::dib_to_bitmap(dib).and_then(|bm| crate::shot::encode_png(&bm))
+        {
+            Ok(png) => png,
+            Err(e) => {
+                self.ui.set_error(format!("这张截图读不出来:{e}"));
+                return;
+            }
+        };
+        if png.len() > crate::shot::MAX_PNG_BYTES {
+            self.ui.set_error(format!(
+                "截图编码后 {:.1} MB,超过 {} MB 上限,没有上传",
+                png.len() as f64 / (1024.0 * 1024.0),
+                crate::shot::MAX_PNG_BYTES / (1024 * 1024)
+            ));
+            return;
+        }
+
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let generation = tab.content.generation();
+        // 只有终端标签有输入行可以回填。文件标签/占位标签上按 Ctrl+V 什么都
+        // 不做 —— 传上去也没有地方把路径交给用户。
+        let Some(pane) = tab.content.as_terminal().map(|t| t.ws.focus()) else {
+            return;
+        };
+        let host_ix = tab.content.focused_pane_host_ix();
+        let Some(conn) = tab.content.sftp_connection_for(host_ix) else {
+            return;
+        };
+        let dir = tab
+            .content
+            .as_terminal()
+            .and_then(|t| t.sftp_screenshot_dir.clone())
+            .unwrap_or_default();
+
+        self.shot_seq += 1;
+        let stamp = crate::shot::stamp(
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+            crate::localtime::offset(),
+        );
+        let path = crate::shot::remote_join(&dir, &crate::shot::file_name(&stamp, self.shot_seq));
+
+        let proxy = self.proxy.clone();
+        let bytes = png.len();
+        let task = self._runtime.spawn(async move {
+            let remote = mullion_ssh::sftp::RemotePath::from_bytes(path.clone().into_bytes());
+            let result = async {
+                let client = mullion_ssh::sftp::SftpClient::open(conn)
+                    .await
+                    .map_err(|e| format!("开 SFTP 通道失败:{e}"))?;
+                client
+                    .write_all_truncate(&remote, &png)
+                    .await
+                    .map_err(|e| format!("截图上传失败:{e}"))?;
+                Ok(path)
+            }
+            .await;
+            let _ = proxy.send_event(UserEvent::ShotUploaded {
+                generation,
+                pane,
+                result,
+            });
+        });
+        self.track_sftp_task(generation, task);
+        // 用户按了键就是接管(同 `send_paste`)。**在这里掐,不在结果回来时
+        // 掐**:那时字节早发出去了,而自动化可能已经往同一个 shell 里灌了
+        // 半条命令(T11 同族)。
+        self.user_took_over();
+        self.ui
+            .set_toast(format!("正在上传截图({} KB)…", bytes / 1024));
+    }
+
+    /// F209:截图传完了。成功才往终端里打路径,失败只提示 —— **绝不把半截
+    /// 路径发下去**,那会在用户的输入行里留下一段他没打过、又必须手动删掉的
+    /// 垃圾。
+    fn accept_shot_uploaded(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        result: Result<String, String>,
+    ) {
+        let path = match result {
+            Ok(p) => p,
+            Err(msg) => {
+                self.ui.set_error(msg);
+                self.request_ui_redraw();
+                return;
+            }
+        };
+        // F125:光标相位复位——这一下之后输入行会动,光标该是亮的。
+        self.last_input_at = Instant::now();
+        let landed = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.as_terminal_mut())
+            .and_then(|t| t.ws.pane_mut(pane))
+            .map(|p| {
+                // 绝对路径 + 一个空格,不带回车:用户接着打字就是自然的下一
+                // 句话,要不要发是他自己的事。
+                let mut out = path.clone().into_bytes();
+                out.push(b' ');
+                // 与粘贴同理(F17):先回底部,否则「贴了但看不到」。
+                p.emulator.scroll_to_bottom();
+                let _ = p.pty.write(out);
+            })
+            .is_some();
+        // 这里**不再** `user_took_over()`:那一下在 `paste_screenshot` 按键
+        // 当时就做过了(而且这块 pane 未必还是焦点,在这里掐会掐错人)。
+        if landed {
+            self.ui.set_toast(format!("截图已传到 {path}"));
+        } else {
+            // 标签或分屏在这几秒里没了。图确实传上去了,路径只能靠提示给他。
+            self.ui
+                .set_toast(format!("截图已传到 {path}(原来那块分屏不在了)"));
+        }
+        self.request_ui_redraw();
+    }
+
     /// 从 Minimized 自愈:凡是「窗口本该看得见」的信号都拿实测尺寸复查一次,
     /// 别指望对方一定会补发非零 `Resized`(理由见 `shell::window_state`)。
     fn recheck_visibility(&mut self) {
@@ -6309,6 +6460,7 @@ impl App {
                 sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: sftp_prefs.default_remote,
+                sftp_screenshot_dir: sftp_prefs.screenshot_dir,
                 sftp_home: None,
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
@@ -8032,6 +8184,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.request_ui_redraw();
             }
+            UserEvent::ShotUploaded {
+                generation,
+                pane,
+                result,
+            } => {
+                self.accept_shot_uploaded(generation, pane, result);
+            }
             UserEvent::TransferPlanned { generation, result } => {
                 match result {
                     Ok(jobs) => {
@@ -8538,6 +8697,38 @@ impl ApplicationHandler<UserEvent> for App {
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                        // F209:裸 `Ctrl+V`。**两样都读**再交给
+                        // `shot::clip_paste` 判 —— 把「有文本时就别看图」写成
+                        // 提前 return 的话,那个函数的「两样都有」分支在产品
+                        // 代码里永远走不到,守住它的测试就成了摆设。
+                        // `clipboard_dib` 自己先问 `IsClipboardFormatAvailable`,
+                        // 没有图时连剪贴板都不开。
+                        if mods.ctrl
+                            && !mods.shift
+                            && !mods.alt
+                            && matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(&'v'))
+                        {
+                            let text = self.clipboard.get();
+                            let dib = crate::shot::clipboard_dib();
+                            match crate::shot::clip_paste(text.is_some(), dib.is_some()) {
+                                crate::shot::ClipPaste::Text => {
+                                    // 走 F18 原路(多行仍然弹确认),它自己会
+                                    // 再读一次剪贴板。
+                                    self.request_paste();
+                                    self.request_ui_redraw();
+                                    return;
+                                }
+                                crate::shot::ClipPaste::Image => {
+                                    self.paste_screenshot(&dib.unwrap_or_default());
+                                    self.request_ui_redraw();
+                                    return;
+                                }
+                                // 剪贴板里两样都没有:**不吞这一下**,照旧编码
+                                // 成 `^V` 发下去 —— readline 的 quoted-insert
+                                // 靠它输控制字符。
+                                crate::shot::ClipPaste::Neither => {}
                             }
                         }
                         // F17:Shift+PageUp/PageDown 是本地翻页,截住不转发对端
@@ -10740,6 +10931,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | SftpListed { .. }
         | OwnerNames { .. }
         | SftpOpDone { .. }
+        | ShotUploaded { .. }
         | TransferPlanned { .. }
         | TransferDone { .. }
         | EditOpened { .. }
@@ -15501,6 +15693,7 @@ mod tests {
                 sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
+                sftp_screenshot_dir: None,
                 sftp_home: None,
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
@@ -15678,6 +15871,7 @@ mod tests {
                 sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
+                sftp_screenshot_dir: None,
                 sftp_home: None,
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
@@ -16413,6 +16607,7 @@ mod tests {
             sftp_host_ix: None,
             sftp_tasks: Vec::new(),
             sftp_default_remote: None,
+            sftp_screenshot_dir: None,
             sftp_home: None,
             reconnect_tasks: Vec::new(),
             leaf_wanted: vec![
@@ -16481,10 +16676,13 @@ mod tests {
             .expect("split 至少有一段");
         let calls = prod.matches("self.user_took_over();").count();
         assert_eq!(
-            calls, 5,
-            "用户意图写入点的取消调用应为 5 处(粘贴/滚轮/键盘/输入法提交/\
-             合成文本,滚轮两个分支共用一次),实际 {calls} 处 —— 少了会让自动化\
-             在用户打字时继续发命令,多了说明新增了输入路径但没复核这条不变量"
+            calls, 6,
+            "用户意图写入点的取消调用应为 6 处(粘贴/滚轮/键盘/输入法提交/\
+             合成文本/截图直传,滚轮两个分支共用一次),实际 {calls} 处 —— 少了\
+             会让自动化在用户打字时继续发命令,多了说明新增了输入路径但没复核\
+             这条不变量。F209 那一处在 `paste_screenshot` 里、按键当时就掐,\
+             **不在** `accept_shot_uploaded`:那时字节早发出去了,而且那块 pane\
+             未必还是焦点(T11 同族)"
         );
     }
 
@@ -17567,6 +17765,7 @@ mod tests {
                 sftp_host_ix: None,
                 sftp_tasks: vec![task],
                 sftp_default_remote: None,
+                sftp_screenshot_dir: None,
                 sftp_home: None,
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
@@ -17647,6 +17846,7 @@ mod tests {
                 sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
+                sftp_screenshot_dir: None,
                 sftp_home: None,
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
@@ -17727,6 +17927,7 @@ mod tests {
                 sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: None,
+                sftp_screenshot_dir: None,
                 sftp_home: None,
                 reconnect_tasks: vec![task],
                 leaf_wanted: Vec::new(),
@@ -18560,6 +18761,7 @@ mod tests {
                 sftp_host_ix: None,
                 sftp_tasks: Vec::new(),
                 sftp_default_remote: configured.map(|s| s.to_string()),
+                sftp_screenshot_dir: None,
                 sftp_home: None,
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
@@ -19482,6 +19684,100 @@ mod tests {
             "drive_reconnects 只驱动了活动标签 —— 后台标签断线要等用户切回去\
              才会开始重拨"
         );
+    }
+
+    /// **接线守护 / F209**:裸 `Ctrl+V` 的判定同样要排在 `encode_key`
+    /// **之前**。挪到之后就是 `0x16` 先发下去,截图那条路整条作废,而
+    /// `shot::clip_paste` 的纯函数单测全是绿的 —— 与 F129 那条同一类静默。
+    ///
+    /// 锚点拆开拼,理由同上一条(第五类恒绿模式)。
+    ///
+    /// 自证会变红:把 F209 那段接线整体挪到 `encode_key(...)` 之后。
+    #[test]
+    fn the_bare_ctrl_v_is_decided_before_the_key_gets_encoded() {
+        let src = include_str!("app.rs");
+        let start = concat!("WindowEvent::Keyboard", "Input { event, .. } => {");
+        let after = src.split(start).nth(1).expect("找不到 KeyboardInput 分支");
+        let body = &after[..after
+            .find(concat!("WindowEvent::Redraw", "Requested"))
+            .expect("找不到 KeyboardInput 分支的结尾")];
+        let clip_at = body
+            .find(concat!("clip_", "paste(text.is_some()"))
+            .expect("找不到 F209 的 Ctrl+V 接线");
+        let encode_at = body
+            .find(concat!("encode_", "key(key, mods"))
+            .expect("找不到 encode_key 调用");
+        assert!(
+            clip_at < encode_at,
+            "裸 Ctrl+V 的判定跑到 encode_key 后面了 —— 它会被编成 0x16 发下去,\
+             截图直传永远走不到"
+        );
+    }
+
+    /// **F209:失败时一个字节都不许进终端。**
+    ///
+    /// 判据扎在函数体的顺序上:`Err` 那一支必须在任何 `pty.write` 之前
+    /// `return`。写成「有没有 `set_error`」是抓不住的 —— 把 `return` 删掉
+    /// 之后提示照弹,而用户的输入行里会多出一段他没打过的半截路径,还得
+    /// 自己删掉。
+    ///
+    /// 自证会变红:把 `accept_shot_uploaded` 里 `Err` 分支的 `return;` 删掉。
+    #[test]
+    fn a_failed_screenshot_upload_never_writes_to_the_terminal() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
+        assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
+        let err_at = body.find("Err(msg) => {").expect("失败分支不见了");
+        let write_at = body.find("p.pty.write(out)").expect("成功分支不写终端了?");
+        assert!(err_at < write_at, "锚点顺序反了,这条测试的前提不成立");
+        assert!(
+            body[err_at..write_at].contains("return;"),
+            "失败分支没有 return —— 半截路径会被打进用户的输入行"
+        );
+    }
+
+    /// **F209:路径回给发起它的那块 pane,不是「此刻的焦点」。**
+    ///
+    /// 高延迟链路上传一张图要好几秒,用户完全可能已经切标签、切分屏。拿
+    /// 当前焦点接的话,那串路径会凭空出现在**另一台机器**的 shell 里 ——
+    /// 而且没有任何报错(T11 同族:判据跟着字节走,不跟着「谁在焦点」走)。
+    ///
+    /// 自证会变红:把 `by_generation_mut(generation)` 换成 `active_term_mut()`
+    /// 、把 `ws.pane_mut(pane)` 换成 `ws.focused_mut()`。
+    #[test]
+    fn the_screenshot_path_goes_back_to_the_pane_that_asked_for_it() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
+        assert!(
+            body.contains("by_generation_mut(generation)") && body.contains("ws.pane_mut(pane)"),
+            "回填不是按 generation + PaneId 路由的"
+        );
+        assert!(
+            !body.contains("active_term")
+                && !body.contains("active_ws")
+                && !body.contains("focused_mut"),
+            "回填走了「当前活动标签/焦点分屏」—— 用户切走之后路径会打进别的 shell"
+        );
+    }
+
+    /// **F209:体积闸在发字节之前。**
+    ///
+    /// 闸放到 task 里(或者干脆没有)的话,一张几百 MB 的图会在没有进度条的
+    /// 情况下慢慢传,用户看到的只是程序「卡住了」——这条路是一次按键的副作用,
+    /// 不是文件面板的传输队列,没有任何地方能显示它的进度或让人取消。
+    ///
+    /// 自证会变红:把 `paste_screenshot` 里那段 `MAX_PNG_BYTES` 判断删掉,
+    /// 或挪到 `self._runtime.spawn` 之后。
+    #[test]
+    fn an_oversized_screenshot_is_rejected_before_anything_goes_out() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "paste_screenshot(&mut self"));
+        assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
+        let gate_at = body.find("MAX_PNG_BYTES").expect("体积闸不见了");
+        let spawn_at = body
+            .find(concat!("_runtime", ".spawn("))
+            .expect("找不到上传 task");
+        assert!(gate_at < spawn_at, "体积闸排在上传之后 —— 等于没有闸");
     }
 
     /// **接线守护 / F129**:Ctrl+D 的判定必须排在 `encode_key` **之前**。

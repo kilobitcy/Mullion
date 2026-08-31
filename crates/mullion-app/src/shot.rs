@@ -138,12 +138,13 @@ pub fn dib_to_bitmap(dib: &[u8]) -> Result<Bitmap, String> {
     let bytes_per_px = (bit_count / 8) as usize;
     // 每行按 4 字节对齐 —— 24 位图最常见的解错点,漏了它整张图会斜。
     let stride = (w as usize * bytes_per_px).div_ceil(4) * 4;
-    let need = stride
-        .checked_mul(h as usize)
-        .ok_or("位图尺寸大到算不下")?;
-    let pixels = dib
-        .get(offset..offset + need)
-        .ok_or_else(|| format!("位图数据被截断(要 {need} 字节,只有 {})", dib.len().saturating_sub(offset)))?;
+    let need = stride.checked_mul(h as usize).ok_or("位图尺寸大到算不下")?;
+    let pixels = dib.get(offset..offset + need).ok_or_else(|| {
+        format!(
+            "位图数据被截断(要 {need} 字节,只有 {})",
+            dib.len().saturating_sub(offset)
+        )
+    })?;
 
     let sr = mask_shift_scale(mr);
     let sg = mask_shift_scale(mg);
@@ -204,6 +205,65 @@ pub fn file_name(stamp: &str, seq: u64) -> String {
 /// `/tmp` 而不是家目录:这些是**说完话就没用**的临时图,堆在家目录里迟早
 /// 要人手动清;`/tmp` 由系统自己回收。
 pub const DEFAULT_DIR: &str = "/tmp";
+
+/// Unix 秒 + 时区 → 文件名里那段 `20260831-142530`。
+///
+/// 与 `localtime::format_unix` 分开写而不是复用:那个是**给人看的**
+/// `2026-08-31 14:25`(带空格和冒号),直接拿来当文件名,远端一个
+/// `mullion-2026-08-31 14:25:30-1.png` 会让用户每次引用都得加引号 ——
+/// 而这条路的全部意义就是「路径直接打进输入行」。
+pub fn stamp(secs: i64, offset: time::UtcOffset) -> String {
+    let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(secs) else {
+        return "unknown".into();
+    };
+    let dt = dt.to_offset(offset);
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
+}
+
+/// 目录 + 文件名 → 远端绝对路径。空目录落回 [`DEFAULT_DIR`]。
+///
+/// 尾斜杠要吃掉:用户在表单里敲 `/tmp/` 是完全正常的写法,拼出
+/// `/tmp//mullion-….png` 虽然 POSIX 上照样能打开,但**那串路径会原样打进
+/// 输入行**,看起来像个 bug。
+pub fn remote_join(dir: &str, name: &str) -> String {
+    let dir = dir.trim();
+    let dir = if dir.is_empty() { DEFAULT_DIR } else { dir };
+    format!("{}/{name}", dir.trim_end_matches('/'))
+}
+
+/// 终端里裸 `Ctrl+V` 这一下该干什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipPaste {
+    /// 照旧走 F18 那条文本粘贴(多行仍然弹确认)。
+    Text,
+    /// 剪贴板里只有位图 —— 编码上传,把远端路径打进输入行。
+    Image,
+    /// 两样都没有:**不要吞掉这一下按键**,原样编码成 `^V` 发下去
+    /// (readline 的 quoted-insert 靠它,吞了就再也输不出控制字符)。
+    Neither,
+}
+
+/// 文本优先。
+///
+/// 顺序不是随手定的:从浏览器/IDE 复制**图片**时,很多程序会同时往剪贴板里
+/// 放一份文本(图片 URL、HTML 片段)。若图优先,用户复制一段代码后按
+/// `Ctrl+V`,得到的会是一次莫名其妙的截图上传。反过来,Win+Shift+S 截屏
+/// **只放位图不放文本**,文本优先不会挡住截图这条路。
+pub fn clip_paste(has_text: bool, has_image: bool) -> ClipPaste {
+    match (has_text, has_image) {
+        (true, _) => ClipPaste::Text,
+        (false, true) => ClipPaste::Image,
+        (false, false) => ClipPaste::Neither,
+    }
+}
 
 #[cfg(windows)]
 pub use win::clipboard_dib;
@@ -377,10 +437,59 @@ mod tests {
         assert!(dib_to_bitmap(&[0xff; 64]).is_err());
     }
 
+    /// 时间戳里不许出现空格和冒号 —— 那串路径要**直接打进终端输入行**,
+    /// 带空格就得加引号,这条路的全部意义就没了。
+    ///
+    /// 自证会变红:把 `stamp` 改成复用 `localtime::format_unix`。
+    #[test]
+    fn the_stamp_is_shell_safe_and_follows_the_local_zone() {
+        let secs = 1_787_963_400i64; // 2026-08-29T00:30:00Z
+        let east8 = time::UtcOffset::from_hms(8, 0, 0).expect("UTC+8");
+        let s = stamp(secs, east8);
+        assert_eq!(s, "20260829-083000");
+        assert!(
+            !s.contains(' ') && !s.contains(':'),
+            "时间戳里有空格或冒号:{s}"
+        );
+        assert_eq!(stamp(secs, time::UtcOffset::UTC), "20260829-003000");
+    }
+
+    /// 尾斜杠不许拼出 `//`。
+    #[test]
+    fn a_trailing_slash_in_the_configured_dir_does_not_double_up() {
+        assert_eq!(remote_join("/tmp/", "a.png"), "/tmp/a.png");
+        assert_eq!(remote_join("/srv/shots", "a.png"), "/srv/shots/a.png");
+        assert_eq!(
+            remote_join("  ", "a.png"),
+            "/tmp/a.png",
+            "空目录该落回 /tmp"
+        );
+    }
+
+    /// **文本优先**:复制一段代码时剪贴板里常常同时躺着一份位图
+    /// (浏览器/IDE 的常态),图优先会把一次普通粘贴变成一次截图上传。
+    ///
+    /// 自证会变红:把 `clip_paste` 的第一条 match 臂换成
+    /// `(_, true) => ClipPaste::Image`。
+    #[test]
+    fn text_wins_when_the_clipboard_holds_both() {
+        assert_eq!(clip_paste(true, true), ClipPaste::Text);
+        assert_eq!(clip_paste(true, false), ClipPaste::Text);
+        assert_eq!(clip_paste(false, true), ClipPaste::Image);
+        // 两样都没有时**不能**当成「处理过了」——那会吞掉 `^V`。
+        assert_eq!(clip_paste(false, false), ClipPaste::Neither);
+    }
+
     /// 文件名带序号 —— `/tmp` 是共用目录,同一秒贴两张不能撞名。
     #[test]
     fn two_shots_in_the_same_second_get_different_names() {
-        assert_ne!(file_name("20260831-142530", 1), file_name("20260831-142530", 2));
-        assert_eq!(file_name("20260831-142530", 7), "mullion-20260831-142530-7.png");
+        assert_ne!(
+            file_name("20260831-142530", 1),
+            file_name("20260831-142530", 2)
+        );
+        assert_eq!(
+            file_name("20260831-142530", 7),
+            "mullion-20260831-142530-7.png"
+        );
     }
 }

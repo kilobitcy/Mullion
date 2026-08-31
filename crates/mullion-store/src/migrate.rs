@@ -441,6 +441,7 @@ kind = "password"
         let prefs = crate::sftp::SftpPrefs {
             default_remote: Some("/srv/app".into()),
             default_local: Some(r"D:\work".into()),
+            screenshot_dir: Some("/srv/shots".into()),
             bookmarks: vec![
                 crate::sftp::Bookmark {
                     name: "日志".into(),

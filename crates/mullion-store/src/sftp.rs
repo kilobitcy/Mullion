@@ -46,4 +46,15 @@ pub struct SftpPrefs {
     /// 各的(设计 ③ 已认下)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_bookmarks: Vec<Bookmark>,
+    /// F209:终端里 `Ctrl+V` 贴截图时,PNG 传到这台机器的哪个目录。
+    ///
+    /// 留空 = `/tmp`(`shot::DEFAULT_DIR`)。**不加 schema 版本**:
+    /// `Option` + `skip_serializing_if`,老配置读进来是 `None`、写回去
+    /// 不多这一行,新老两向都兼容。
+    ///
+    /// 跟 `default_remote` **分成两个字段**:那个是文件面板打开时落脚的
+    /// 地方(用户会去翻的工作目录),这个是临时图的垃圾桶。合成一个的话,
+    /// 用户把面板默认目录设成 `/srv/app` 之后,截图就开始往生产目录里扔。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_dir: Option<String>,
 }
