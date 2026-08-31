@@ -2240,6 +2240,7 @@ port = 7891
             let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
             let mut d = draft();
             d.sftp.default_remote = Some("/opt/data".into());
+            d.sftp.screenshot_dir = Some("/srv/shots".into());
             v.update(id, d, "2026-08-13T01:00:00Z").unwrap();
             v.save().unwrap();
         }
@@ -2249,6 +2250,13 @@ port = 7891
             rec.sftp.default_remote.as_deref(),
             Some("/opt/data"),
             "update 没把 SFTP 偏好写回去 —— 用户改了保存,下次打开还是旧值"
+        );
+        // F209:新加的字段走的是同一条整份覆盖,漏了序列化同样是「配了等于
+        // 没配」,而且**没有任何报错** —— 截图会一直往 /tmp 里扔。
+        assert_eq!(
+            rec.sftp.screenshot_dir.as_deref(),
+            Some("/srv/shots"),
+            "截图上传目录没存住"
         );
         // F189 起这里**反过来**了:书签不再跟着整份 draft 覆盖(见 `update`
         // 里那段注释 —— draft 带的是编辑器打开那一刻的快照,而路径条上的 ☆
