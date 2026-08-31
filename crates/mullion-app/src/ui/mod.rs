@@ -135,10 +135,6 @@ pub struct UiState {
     pub pending_delete: Option<SessionId>,
     /// 双击行 / 点「连接」→ app 事后据此 `ssh_config_for` + `spawn_connect`。
     pub connect_request: Option<SessionId>,
-    /// 最后一次发起连接的会话 id。`UserEvent::ConnectOk`/`ConnectErr` 都不带
-    /// SessionId,自动化计划和 pane 的 `session_id` 要知道「是哪条连上了」,
-    /// 只能在发起时记下来。
-    pub connect_request_last: Option<SessionId>,
     /// F44:本次连接一次性跳过自动化(右键菜单)。app.rs 消费后立即清零 ——
     /// 右键跳过一次之后,普通双击连接若还静默跳过,用户会以为自动化坏了。
     pub connect_skip_automation: bool,

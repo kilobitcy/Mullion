@@ -61,17 +61,24 @@ pub enum UserEvent {
     /// `Clone`,只有 `Drop`(释放即断连)。
     ///
     /// D1/F50:`wants_sftp` 是点击那一刻(`spawn_connect` 调用点)就算好的 ——
-    /// 这个事件本身不带 `SessionId`,没法在这里回头再查一次协议字段。为 `true`
-    /// 时 `pty` 恒 `None`(SFTP 节点不开 PTY,`spawn_connect` 内部直接跳过
-    /// `open_pty`);为 `false` 时 `pty` 恒 `Some`(`open_pty` 失败会走
+    /// 为 `true` 时 `pty` 恒 `None`(SFTP 节点不开 PTY,`spawn_connect` 内部
+    /// 直接跳过 `open_pty`);为 `false` 时 `pty` 恒 `Some`(`open_pty` 失败会走
     /// `ConnectErr`,不会发一个「两者皆无」的 `ConnectOk`)。
+    ///
+    /// F205:`dial` 是这次拨号的票号。**「这次连上的是哪条会话」只认它** ——
+    /// 从前靠 `App` 上一个单槽记,两条拨号同时在途时后者会把前者盖掉,详见
+    /// `shell::dial_ledger` 的模块文档。
     ConnectOk {
+        dial: crate::shell::dial_ledger::DialId,
         handle: Arc<SshConnection>,
         wants_sftp: bool,
         pty: Option<(SshSession, Receiver<Vec<u8>>)>,
     },
     /// 异步 connect 失败,已格式化的可操作错误(F6 分类由 `session::connect` 内部给)。
-    ConnectErr(String),
+    ///
+    /// F205:同样带票号 —— 失败也要把台账上那张票摘掉,否则票里那份
+    /// `SshConfig` 永远不释放,而且台账只涨不落。
+    ConnectErr(crate::shell::dial_ledger::DialId, String),
     /// 私钥文件对话框结束。`None` = 用户取消/对话框失败——也要回送,否则
     /// `PickerBusy::key` 永远清不掉,以后再点「选择…」就没反应了。
     KeyPathPicked(Option<PathBuf>),
@@ -1890,10 +1897,11 @@ pub struct App {
     /// 另一次连接(会话管理器双击/点连接),就清为 `false`,进入交互态语义——
     /// 否则断线后从会话管理器连别的会话失败会把整个 GUI 一并 exit(1)(复核 #1)。
     cli_direct: bool,
-    /// **在途**那一次连接用的配置。`ConnectOk` 抵达时移交给新建的标签
-    /// (`TerminalTab::last_cfg`)。留在 `App` 上是因为发起连接的那一刻还没有
-    /// 标签可放 —— 与 `pending_automation` 同理,一次只连一个。
-    pending_cfg: Option<SshConfig>,
+    /// F205:**在途**拨号的台账。发起连接的那一刻还没有标签可放,随行数据
+    /// 只能寄存在 `App` 上;从前寄存成几个单槽,于是「一次只许连一个」成了
+    /// 一条谁也没写、也没人守的隐含前提 —— 而 `spawn_connect` 从来没有闸。
+    /// 见 `shell::dial_ledger` 的模块文档。
+    dials: crate::shell::dial_ledger::DialLedger<DialTicket>,
     /// egui UI 侧状态(菜单/状态栏/弹窗/中央区像素),与连接状态解耦(Task 4)。
     ui: crate::ui::UiState,
     /// 会话保险库(Task 6)。`resumed` 末尾打开;keyring/库打开失败时留 `None`,
@@ -2012,9 +2020,6 @@ pub struct App {
     /// 在途拨测任务。退出或取消时 abort —— 20 秒的 timeout 悬着不管,
     /// 关窗后进程还要多活 20 秒。
     probe_task: Option<tokio::task::JoinHandle<()>>,
-    /// F40~F44/F141:一次「点连接」那一帧算好、等 `ConnectOk` 抵达时消费的
-    /// 自动化待决包,见 `PendingAutomationState`。
-    pending_automation: PendingAutomationState,
     /// 换节点在途的那些。`Vec` 而不是 `Option`:两块 pane 可以同时在换
     /// (弹窗一次只开一个,但拨号是异步的,第一次还没回来就能发起第二次),
     /// 用 `Option` 的话后发的会把先发的元信息顶掉 —— 现象是换好之后标题条
@@ -2081,14 +2086,33 @@ struct PickerBusy {
     import: bool,
 }
 
+/// F205:一次拨号的**全部**随行数据。发起时装好、`ConnectOk`/`ConnectErr`
+/// 凭票号取回。台账在 `shell::dial_ledger`。
+///
+/// 这四样从前是 `App` 上的四个独立单槽(`ui.connect_request_last`、
+/// `pending_cfg`、`pending_automation` 的三项)。它们的生命周期是**同一条**
+/// —— 都从「点连接」那一帧起、到那次拨号有结果为止 —— 却散着放,于是
+/// 第二次拨号会把第一次的四样一起盖掉,而两条拨号同时在途在高延迟代理
+/// 链路上是常态。收成一个结构之后,「这次拨号的东西」只有一份、只能整份
+/// 取走,漏拿一样是编译错误而不是静默串台。
+struct DialTicket {
+    /// 这次拨的是哪条会话。`None` = CLI 直连(`mullion user@host`),
+    /// 没有会话记录可查 —— 书签/默认目录/自动化一律按「没配置」处理。
+    session_id: Option<SessionId>,
+    /// 这次连接用的配置。`ConnectOk` 抵达时移交给新标签的
+    /// `TerminalTab::last_cfg`(F35 分屏 `open_pty` 靠它)。
+    cfg: SshConfig,
+    /// F40~F44/F141:自动化待决包,见 `PendingAutomationState`。
+    automation: PendingAutomationState,
+}
+
 /// F40~F44/F141:一次「点连接」在**那一帧**算好、等 `ConnectOk` 抵达时
 /// 消费的自动化待决包。
 ///
 /// 四项由同一次点击、同一次 `store.resolved()` 算出,也在同一处消费。
-/// **都是在点击帧算而不是 `ConnectOk` 里算**:`ConnectOk` 不携带
-/// `SessionId`,到那时只能回头读库,而连接在途期间用户完全可能改了配置、
-/// 把会话改名、甚至删掉它 —— 那样分屏发出去的字节就跟他点「连接」时
-/// 看到的对不上了。
+/// **都是在点击帧算而不是 `ConnectOk` 里算**:连接在途期间用户完全可能
+/// 改了配置、把会话改名、甚至删掉它 —— 那样分屏发出去的字节就跟他点
+/// 「连接」时看到的对不上了。
 #[derive(Default)]
 struct PendingAutomationState {
     /// 等 `ConnectOk` 抵达时启用的计划。
@@ -2271,7 +2295,7 @@ impl App {
             known_hosts,
             pending_host_key: None,
             host_key_since: None,
-            pending_cfg: initial.clone(),
+            dials: crate::shell::dial_ledger::DialLedger::default(),
             initial,
             cli_direct,
             ui: crate::ui::UiState::default(),
@@ -2310,7 +2334,6 @@ impl App {
             appearance: Default::default(),
             probe_epoch: 0,
             probe_task: None,
-            pending_automation: PendingAutomationState::default(),
             pending_rehost: Vec::new(),
             restore_dial: std::collections::VecDeque::new(),
             restore_dial_busy: false,
@@ -2389,7 +2412,7 @@ impl App {
         // CLI 直连(路径①)→ 立刻发起连接,进终端态。
         if let Some(cfg) = self.initial.take() {
             // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
-            self.spawn_connect(cfg, false);
+            self.spawn_connect(cfg, false, None, false);
             return;
         }
         // F148 D9:无参启动 → 有历史就先给恢复列表,没有就照旧弹会话管理器。
@@ -3023,12 +3046,11 @@ impl App {
         {
             r.dialing = true;
         }
-        // `connect_request_last` 是 `ConnectOk` 认「是哪条会话连上了」的唯一
-        // 依据(事件本身不带 SessionId),跟双击连接那条路径一样要设。
-        self.ui.connect_request_last = Some(session_id);
         self.cli_direct = false;
         mark_ui_dirty!(self.ui_dirty);
-        self.spawn_connect(cfg, wants_sftp);
+        // F205:会话身份随票走 —— 重连是在**已经有别的连接在途**时最容易被
+        // 触发的一条路径,单槽在这里被盖掉的概率最高。
+        self.spawn_connect(cfg, wants_sftp, Some(session_id), false);
         true
     }
 
@@ -5990,11 +6012,21 @@ impl App {
     /// 另开 channel,必须拿到 `establish` 返回的 `Handle` 本身——`connect` 内部
     /// 会把它吞掉不外露。
     ///
-    /// D1/F50:`wants_sftp` 由调用方(点击那一刻)算好传入——`ConnectOk` 不带
-    /// `SessionId`,没法在收到结果时回头再查协议字段。为 `true` 时**跳过
+    /// D1/F50:`wants_sftp` 由调用方(点击那一刻)算好传入。为 `true` 时**跳过
     /// `open_pty`**:SFTP 节点没有 PTY 这个概念,`establish` 一成功就直接
     /// 回送(`pty: None`),不做那趟本来就用不上的 shell 握手。
-    fn spawn_connect(&mut self, cfg: SshConfig, wants_sftp: bool) {
+    ///
+    /// F205:`session_id`/`skip_automation` 同样由调用方在点击那一帧给定,
+    /// 与这次拨号的其余随行数据一起**装进一张票**存进 `self.dials`,票号
+    /// 随任务走。从前这些都写在 `App` 的单槽上,第二次拨号会把第一次的
+    /// 整体盖掉 —— 见 `shell::dial_ledger` 的模块文档。
+    fn spawn_connect(
+        &mut self,
+        cfg: SshConfig,
+        wants_sftp: bool,
+        session_id: Option<SessionId>,
+        skip_automation: bool,
+    ) {
         // F40~F44:此刻才确定「是哪条会话」。连接在途期间用户可能改配置甚至
         // 删会话,所以计划必须在用户点击的这一帧定死。
         // 上一次的结论到此为止:新连接开始了,旧结论就是误导信息。
@@ -6009,7 +6041,7 @@ impl App {
         // F141:同一次解析里把会话名也留一份 —— 重连要按**当初**那个名字把
         // tmux 会话接回来(见 `PendingAutomationState::session_name`)。
         let mut fallback_name: Option<String> = None;
-        let plan = crate::automation::pending_for(self.ui.connect_request_last, |id| {
+        let plan = crate::automation::pending_for(session_id, |id| {
             let store = self.store.as_ref()?;
             let resolved = store.resolved(id).ok()?;
             // `ResolvedConfig` 不含会话名,而 `build_plan` 要它做 tmux 的
@@ -6025,13 +6057,19 @@ impl App {
             fallback_name = Some(name.clone());
             Some((resolved.automation, name))
         });
-        self.pending_automation.plan = plan;
-        self.pending_automation.template = tpl;
-        self.pending_automation.session_name = fallback_name;
-        // 会话管理器发起的连接也要记下,否则第二次连接后开分屏会用上一台
-        // 主机的 term/尺寸(F35 的 open_pty 靠它)。`ConnectOk` 抵达时移交给
-        // 新建的标签。
-        self.pending_cfg = Some(cfg.clone());
+        // F205:这次拨号的随行数据整份装票。`cfg` 也在票里 —— 不装的话
+        // 第二次连接后在第一个标签上开分屏,会用上一台主机的 term/尺寸
+        // (F35 的 `open_pty` 靠 `TerminalTab::last_cfg`)。
+        let dial = self.dials.issue(DialTicket {
+            session_id,
+            cfg: cfg.clone(),
+            automation: PendingAutomationState {
+                plan,
+                template: tpl,
+                session_name: fallback_name,
+                skip: skip_automation,
+            },
+        });
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
         // 每次连接现建一个策略:它只持有两个 Arc/Sender 的克隆,构造成本可忽略,
@@ -6048,12 +6086,13 @@ impl App {
             let handle = match mullion_ssh::session::establish(&cfg, policy).await {
                 Ok(h) => Arc::new(h),
                 Err(e) => {
-                    let _ = proxy.send_event(UserEvent::ConnectErr(e.to_string()));
+                    let _ = proxy.send_event(UserEvent::ConnectErr(dial, e.to_string()));
                     return;
                 }
             };
             if wants_sftp {
                 let _ = proxy.send_event(UserEvent::ConnectOk {
+                    dial,
                     handle,
                     wants_sftp: true,
                     pty: None,
@@ -6063,13 +6102,14 @@ impl App {
             match mullion_ssh::session::open_pty(handle.clone(), &cfg, wake).await {
                 Ok((ssh, rx)) => {
                     let _ = proxy.send_event(UserEvent::ConnectOk {
+                        dial,
                         handle,
                         wants_sftp: false,
                         pty: Some((ssh, rx)),
                     });
                 }
                 Err(e) => {
-                    let _ = proxy.send_event(UserEvent::ConnectErr(e.to_string()));
+                    let _ = proxy.send_event(UserEvent::ConnectErr(dial, e.to_string()));
                 }
             }
         });
@@ -6085,10 +6125,18 @@ impl App {
     /// 代码,「从分支返回」和「从函数返回」本来就等价。
     fn accept_connect_ok(
         &mut self,
+        dial: crate::shell::dial_ledger::DialId,
         handle: Arc<SshConnection>,
         wants_sftp: bool,
         pty: Option<(SshSession, Receiver<Vec<u8>>)>,
     ) {
+        // F205:先认票。认不到说明这张票已经被别的结局消费过(或标签早被关掉,
+        // 任务被 abort 后事件迟到抵达)—— 宁可整条丢掉,也不能拿别人的身份
+        // 往下走,那正是这个 bug 的样子。
+        let Some(ticket) = self.dials.claim(dial) else {
+            log::warn!(target: "mullion", "ConnectOk 认领不到拨号票 {dial:?},忽略");
+            return;
+        };
         // 一旦连上就进入交互态:后续(哪怕是本次会话断开后)的连接失败
         // 不再是「CLI 直连首次失败」,不该导致整个 GUI exit(1)(复核 #1)。
         self.cli_direct = false;
@@ -6101,8 +6149,11 @@ impl App {
         // F37:这次连接是不是某个占位标签按「重连」发起的。**取出即
         // 消费**:留着的话下一次正常连接会跑去顶替一个早就连上的标签。
         let pending = self.pending_restore.take();
-        let cfg = self.pending_cfg.clone();
-        let session_id = self.ui.connect_request_last;
+        // F205:身份与随行数据一律从**这张票**里取,不再读 `App` 上的单槽 ——
+        // 单槽会被在途的第二条拨号整体盖掉(见 `shell::dial_ledger` 的文档)。
+        let session_id = ticket.session_id;
+        let cfg = Some(ticket.cfg);
+        let mut automation = ticket.automation;
         // E2:标签标题优先取会话名,退回 `user@host`(见 `tab_title`
         // 的文档)——过去这里恒取 `user@host`,标签属性弹窗改的名字
         // 要等到**下一次**重连同一条会话才用得上,现在改完立刻生效。
@@ -6117,8 +6168,8 @@ impl App {
             cfg.as_ref().map(|c| (c.user.as_str(), c.host.as_str())),
         );
         // F120:这个标签对应会话在编辑器「SFTP」分节配置的默认目录/书签。
-        // 没有 `session_id`(理论上不可达,`connect_request_last` 由发起
-        // 连接那一刻设好)或 store 里查不到(会话已被删)都落回全空默认——
+        // 没有 `session_id`(CLI 直连没有会话记录)或 store 里查不到(会话
+        // 已被删)都落回全空默认——
         // 跟「没配置」等价,不阻断连接本身。
         let sftp_prefs = session_id
             .and_then(|id| {
@@ -6319,15 +6370,12 @@ impl App {
         mark_ui_dirty!(self.ui_dirty);
         // 模板与计划**不再同进同退**(F161,见 `tab_keeps_template`)。
         // 「右键跳过一次」仍然不留模板 —— 用户明确说了这次不跑。
-        let tpl = self.pending_automation.template.take();
-        let tmux_name = self.pending_automation.session_name.take();
+        let tpl = automation.template.take();
+        let tmux_name = automation.session_name.take();
         // 跳过标志被 `take_pending` 消费掉,想知道「这次是不是被跳过的」
         // 只能在它之前读一次。
-        let user_skipped = self.pending_automation.skip;
-        let plan = crate::automation::take_pending(
-            &mut self.pending_automation.plan,
-            &mut self.pending_automation.skip,
-        );
+        let user_skipped = automation.skip;
+        let plan = crate::automation::take_pending(&mut automation.plan, &mut automation.skip);
         if plan.is_some() {
             // S1:挂回**属主标签**(按世代号查),不用「活动标签」——
             // `open` 刚把新标签设为活动,今天两者等价,但那是巧合:
@@ -7650,12 +7698,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ConnectOk {
+                dial,
                 handle,
                 wants_sftp,
                 pty,
             } => {
                 diag::count_connect(true);
-                self.accept_connect_ok(handle, wants_sftp, pty);
+                self.accept_connect_ok(dial, handle, wants_sftp, pty);
                 // F153:**在分派点推进而不是在 `accept_connect_ok` 里面** ——
                 // 那个函数有多条早退 return(SFTP 标签、缺 pty 的异常路径),
                 // 写在里面会漏掉其中一条,症状是自动拨号连到某个 SFTP 标签
@@ -7902,8 +7951,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pending_host_key = Some(prompt);
                 self.request_ui_redraw();
             }
-            UserEvent::ConnectErr(msg) => {
+            UserEvent::ConnectErr(dial, msg) => {
                 diag::count_connect(false);
+                // F205:失败也要认票 —— 不认的话票留在台账上,里面装着
+                // `SshConfig`(含主机/端口/认证方式)一直不释放。
+                self.dials.claim(dial);
                 // 待定 F:CLI 直连从未成功连过时,保留可脚本化的 exit(1) 语义;
                 // launcher 态(或已连过又断开)只记错误,交 UI 展示(ui.last_error)。
                 crate::logx::line(&format!("连接失败: {msg}"));
@@ -9792,7 +9844,6 @@ impl ApplicationHandler<UserEvent> for App {
                 // 点了又关掉菜单),也不能让它漂到下一次连接上。
                 let skip_automation = std::mem::take(&mut self.ui.connect_skip_automation);
                 if let Some(id) = self.ui.connect_request.take() {
-                    self.ui.connect_request_last = Some(id);
                     // D1/F50:`dial_plan_for` 多带回 `wants_sftp`——点「连接」
                     // 要靠它决定 `ConnectOk` 抵达时开终端标签还是文件标签。
                     match self.store.as_ref().map(|s| s.dial_plan_for(id)) {
@@ -9800,13 +9851,11 @@ impl ApplicationHandler<UserEvent> for App {
                             // 用户主动发起的连接是交互态,不该继承 CLI 直连的
                             // exit(1) 语义(复核 #1)。
                             self.cli_direct = false;
-                            // 跳过标志必须跟 `pending_automation` 同进同退 ——
-                            // 后者只在 `spawn_connect` 里写。写在 match 外面的话,
-                            // 一次**失败**的连接尝试(配置坏了走 Err 支)会把标志
-                            // 留给另一条还在途的连接:用户没点过跳过,那条连接的
-                            // 自动化却被 `take_pending` 静默丢掉。
-                            self.pending_automation.skip = skip_automation;
-                            self.spawn_connect(cfg, wants_sftp);
+                            // F205:跳过标志跟这次拨号的其余随行数据一起装进票里
+                            // (从前它是 `App` 上的单槽,得靠「只在 `spawn_connect`
+                            // 里写」这条约定才不会漂到另一条在途连接上)。失败支
+                            // (配置坏了走 Err)压根不发票,自然也带不走它。
+                            self.spawn_connect(cfg, wants_sftp, Some(id), skip_automation);
                         }
                         Some(Err(e)) => self.ui.set_error(e.to_string()),
                         None => {}
@@ -10671,7 +10720,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         EditTick { .. } => false,
         // ——— 其余一律标脏 ———
         ConnectOk { .. }
-        | ConnectErr(_)
+        | ConnectErr(..)
         | KeyPathPicked(_)
         | CredentialKeyPathPicked(_)
         | IconPathPicked(_)
@@ -15581,7 +15630,7 @@ mod tests {
     fn both_outcomes_advance_the_auto_dial_queue() {
         let src = include_str!("app.rs");
         let err = src
-            .split("UserEvent::ConnectErr(msg) => {")
+            .split("UserEvent::ConnectErr(dial, msg) => {")
             .nth(1)
             .expect("找不到 ConnectErr 分支");
         let err_body = &err[..err.find("\n            UserEvent::").unwrap_or(err.len())];
@@ -17053,6 +17102,57 @@ mod tests {
         );
     }
 
+    /// **接线守护 / F205**:一次拨号的两种结局都必须**认票**。
+    ///
+    /// 类型系统只逼到「事件里带上票号」为止 —— 把 `dial` 绑成 `_dial` 照样编过。
+    /// 不认的话票永远挂在 `self.dials` 上:里面装着 `SshConfig`(主机/端口/
+    /// 认证方式)和整份自动化计划,长时间跑下来全是死票;更要命的是 `claim`
+    /// 的「取出即消费」语义失效,同一张票能被认第二次,两个标签共用一份随行
+    /// 数据 —— 那正是 F205 要根治的症状,只是换了个入口。
+    ///
+    /// **扎的是源码结构**:`App` 要 `EventLoopProxy` 才能构造,单测里跑不动
+    /// 真实拨号。验证边界:挡得住「分支里压根没有 `claim`」,挡不住「认了却
+    /// 把结果丢了」之类更隐蔽的走样(那种由 `accept_connect_ok` 开头的
+    /// `let Some(ticket) = .. else { return }` 兜着)。
+    ///
+    /// 自证会变红:删掉 `ConnectErr` 分支里那句 `self.dials.claim(dial);`。
+    #[test]
+    fn both_outcomes_claim_the_dial_ticket_so_the_ledger_can_empty() {
+        let src = include_str!("app.rs");
+        // 锚点拆开拼,免得 `split` 撞上这行字面量自身(理由同上一条守护)。
+        let after_ok = src
+            .split(concat!("fn accept_", "connect_ok("))
+            .nth(1)
+            .expect("找不到 accept_connect_ok");
+        let ok_body = &after_ok[..after_ok
+            .find("\n    }\n")
+            .expect("找不到 accept_connect_ok 的结尾")];
+        assert!(
+            ok_body.contains("let session_id = ticket.session_id;"),
+            "ConnectOk 的身份不再来自票 —— 下面那条断言会空过"
+        );
+        assert!(
+            ok_body.contains("self.dials.claim(dial)"),
+            "ConnectOk 没认票 —— 票留在台账上,同一张能被认第二次"
+        );
+
+        let after_err = src
+            .split(concat!("UserEvent::Connect", "Err(dial, msg) => {"))
+            .nth(1)
+            .expect("找不到 ConnectErr 分支");
+        let err_body = &after_err[..after_err
+            .find("\n            }\n")
+            .expect("找不到 ConnectErr 分支的结尾")];
+        assert!(
+            err_body.contains("self.ui.set_error(msg);"),
+            "切片切到的不是 ConnectErr 的处理分支 —— 下面那条断言会空过"
+        );
+        assert!(
+            err_body.contains("self.dials.claim(dial);"),
+            "拨号失败没认票 —— 台账只涨不落,SshConfig 和自动化计划一直不释放"
+        );
+    }
+
     /// **接线守护 / Task 5**:`ConnectOk` 必须**开新标签**,不许再顶掉活动标签。
     ///
     /// Task 2 的过渡实现是 `close_active()` + `open()`(单标签下与迁移前逐帧
@@ -17139,7 +17239,7 @@ mod tests {
     fn a_failed_dial_releases_the_reconnect_latch_and_re_enables_the_button() {
         let src = include_str!("app.rs");
         let after = src
-            .split("UserEvent::ConnectErr(msg) => {")
+            .split("UserEvent::ConnectErr(dial, msg) => {")
             .nth(1)
             .expect("找不到 ConnectErr 分支");
         let body = &after[..after
@@ -17239,7 +17339,7 @@ mod tests {
     fn spawn_connect_skips_open_pty_when_the_target_wants_sftp() {
         let src = include_str!("app.rs");
         let after = src
-            .split("fn spawn_connect(&mut self, cfg: SshConfig, wants_sftp: bool) {")
+            .split("fn spawn_connect(")
             .nth(1)
             .expect("找不到 spawn_connect 的定义");
         let body = &after[..after
@@ -20115,7 +20215,10 @@ mod tests {
         );
         // 其余一律标脏 —— 挑三种最容易漏、且漏了症状最难查的。
         assert!(
-            user_event_marks_dirty(&UserEvent::ConnectErr("boom".into())),
+            user_event_marks_dirty(&UserEvent::ConnectErr(
+                crate::shell::dial_ledger::DialId(1),
+                "boom".into()
+            )),
             "连接失败不标脏 = 用户点了连接,错误提示要等他动鼠标才出现"
         );
         assert!(
