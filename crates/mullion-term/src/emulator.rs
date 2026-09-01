@@ -1090,19 +1090,23 @@ mod tests {
 
     /// F212 兜底:显式清除比「还按着」强。丢了 `Released` 事件时,挂住的 hold
     /// 会让远端此后永远擦不掉这个 pane 的选区,`selection_clear` 是唯一的解。
+    ///
+    /// 判据故意让**擦掉的行不是选区的全部**(选 alpha+bravo 只擦 bravo):
+    /// 若两者重合,补偿回来的选区罩着的是一片刚被擦空的格子,`selection_text`
+    /// 把空串折叠成 `None`,断言分不出「hold 撤了」和「hold 没撤」——恒绿。
     #[test]
     fn clearing_the_selection_also_lets_go_of_the_hold() {
         let mut emu = Emulator::new(20, 2);
         emu.feed(b"alpha\r\nbravo");
         emu.selection_start(0, 0, SelectionKind::Simple, CellSide::Left);
-        emu.selection_update(4, 0, CellSide::Right);
+        emu.selection_update(4, 1, CellSide::Right);
         emu.hold_selection(true);
         emu.selection_clear();
         // 重新划一段但**不**再按住,擦行就该正常把它冲掉。
         emu.selection_start(0, 0, SelectionKind::Simple, CellSide::Left);
-        emu.selection_update(4, 0, CellSide::Right);
-        assert!(emu.selection_text().is_some());
-        emu.feed(b"\x1b[1;1H\x1b[K");
+        emu.selection_update(4, 1, CellSide::Right);
+        assert_eq!(emu.selection_text().as_deref(), Some("alpha\nbravo"));
+        emu.feed(b"\x1b[2;1H\x1b[K");
         assert_eq!(emu.selection_text(), None, "hold 没被 clear 撤掉");
     }
 
