@@ -16318,6 +16318,36 @@ mod tests {
         prod
     }
 
+    /// F214:`start_edit` 必须把**列目录时已经知道的大小**传给读循环。
+    ///
+    /// 这是纯接线,`sftp_edit.rs` 那三条行为测试够不着它:`read_all` 那边
+    /// 拿不到 hint 时的兜底路径是**正确**的(照常读到 EOF),所以接线断了
+    /// 一切照常工作 —— 只是每次打开文件白白多一次串行往返,而这正是用户
+    /// 实报的那个「等好几秒」。零报错、本机零症状。
+    ///
+    /// 先剥注释再断言:本条判据的说明文字里就带着这几个名字。
+    ///
+    /// 自证会变红:把 `start_edit` 里那句取大小的改成 `None`。**改的时候
+    /// 别用整行替换**——那串字面量在本测试里也有一份,一并被改掉就成了
+    /// 自我圆场的假绿(本仓库记过的「变异锚点用裸前缀」)。
+    #[test]
+    fn the_size_we_already_know_is_handed_down_so_the_read_need_not_ask_for_eof() {
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+        };
+        let body = strip(body_of(prod_src(), "fn start_edit(&mut self,"));
+        assert!(
+            body.contains("let expect = Some(e.size);"),
+            "start_edit 没把已知大小取出来 —— 读循环只能靠多问一次 EOF 收尾"
+        );
+        assert!(
+            body.contains("read_for_edit(&client, &path, limit, expect)"),
+            "取出来了却没传下去,等于没取"
+        );
+    }
+
     /// F188:两个调用点各自传的 `RehostKind` 是**接线**,`rehost_pane` 的
     /// 那两条行为测试够不着它 —— 把两处的实参对调,行为测试全绿,而现象是
     /// 「恢复现场的叶子照旧永远卡在连接中」加「手点换节点焦点不跟过去」。
