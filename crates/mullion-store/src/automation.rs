@@ -225,23 +225,55 @@ pub fn tmux_session_name(a: &ResolvedAutomation, fallback_name: &str) -> Option<
     (!name.is_empty()).then_some(name)
 }
 
+/// F211:pty 请求的 TERM 名。**必须与 `SshConfig::term` 同源** ——
+/// [`sync_feature_command`] 拿它去 tmux 里按 TERM 匹配特性,报的和登记的对不上
+/// 就静默不生效。跨 crate 的守护测试在 `mullion-app`(store 不依赖 ssh)。
+pub const SYNC_TERM: &str = "xterm-256color";
+
+/// F211:往远端 tmux server 登记 `sync` 特性的那条命令。
+///
+/// **为什么非要有这一句**:tmux 只在外层终端登记了 `sync` 特性时,才把内层程序
+/// (Claude Code 就在发)的 DEC 2026 同步块往外转发;没登记就**整个吞掉**
+/// (实测 BSU 恒 0)。我们报的 TERM 不在 tmux 内置 `terminal-features` 表里
+/// ——**⇒ T2/F11 的攒帧在本项目主场景(tmux)下从来没生效过**,登记之后每一轮
+/// 远端重绘才会原子到达。
+///
+/// 三条实测出来的硬约束,少一条都不行:
+/// - **必须在 attach 之前**。运行期改 `terminal-features` 对**已经 attach 的
+///   client 不生效**(实测 BSU 恒 0),tmux 只在 client 建立时按 TERM 匹配一次
+///   特性表。这也是它不能挂在 F124 `remote_bootstrap`(attach 之后才跑)上的原因。
+/// - **必须是独立的一条 shell 语句**,不能写成 `tmux set … \; attach` 串进同一次
+///   tmux 调用:老 tmux(< 3.2 没有 `terminal-features`)上 set 会失败,而**组合
+///   命令里前一条失败会中止后面全部命令**(实测),连会话都建不起来。拆开 + 吞掉
+///   stderr,老 tmux 上就只是这一句白跑。
+/// - **必须用固定数组下标**,不能用 `set -a` 追加:tmux 对 `-a` 不去重(实测设 4
+///   次就留 4 条),每次重连都让 `terminal-features` 长一条。写死下标 → 重复执行
+///   恒等于覆盖同一个槽,天然幂等。99 远离 tmux 内置项(3.7b 用到 4)和用户
+///   `.tmux.conf` 里 `-a` 追加的增长区。
+///
+/// 只用 `;` / `&&` / `||`,不用 `{ }` 分组:远端登录 shell 可能是 fish。
+pub fn sync_feature_command() -> String {
+    format!("tmux set -g 'terminal-features[99]' '{SYNC_TERM}:sync' 2>/dev/null")
+}
+
 /// tmux 分支那一行命令。`detach_others` = attach 时带 `-d`(见
 /// [`build_plan_reattach`])。
 ///
 /// `name` 必须已经过 `sanitize_tmux_name`(调用方都是从 `tmux_session_name`
 /// 拿的)。
+///
+/// F211 起新建走 `new-session -d` 再单独 attach,而不是前台 `new-session`:
+/// [`sync_feature_command`] 必须夹在「server 已经起来」和「client attach」之间,
+/// 前台 new-session 把这两件事并成了一步,没有插入点。代价是新会话先以 tmux 默认
+/// 尺寸建立、attach 时再 resize(TUI 多收一次 SIGWINCH);换来的是新建路径也能
+/// 拿到同步块 —— 首连恰恰是最常走的那条。
 fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> String {
     let q = shell_quote(name);
-    // `||` 的回落条件是 `has-session` 探测失败(会话不存在 → 新建),这条路径
-    // 实测正常。但 `exec` 会替换进程镜像:一旦 `attach` 起来了、之后才运行时
-    // 失败(例如会话在探测与 attach 之间被别的客户端 kill),原 shell 已不
-    // 存在,**不会**回落去新建——远端控制进程直接退出、channel 随之关闭。
+    // 探测失败(会话不存在)→ 新建。但 `exec` 会替换进程镜像:一旦 `attach` 起来
+    // 了、之后才运行时失败(例如会话在探测与 attach 之间被别的客户端 kill),原
+    // shell 已不存在,**不会**回落去新建——远端控制进程直接退出、channel 随之关闭。
     // 已知且接受:竞态窗口极小,「多开一个意外的新会话」也并不比「掉线重连」更好。
-    let d = if detach_others { " -d" } else { "" };
-    let mut cmd = format!(
-        "tmux has-session -t {q} 2>/dev/null && exec tmux attach{d} -t {q} \
-         || exec tmux new-session -s {q}"
-    );
+    let mut cmd = format!("tmux has-session -t {q} 2>/dev/null || tmux new-session -d -s {q}");
     if let Some(dir) = non_empty(a.work_dir.as_deref()) {
         // 只挂在 new-session 上:附着已有会话时改它的工作目录是越权。
         cmd.push_str(&format!(" -c {}", shell_quote(dir)));
@@ -251,7 +283,20 @@ fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> Stri
         cmd.push(' ');
         cmd.push_str(&shell_quote(&start));
     }
+    // 新建失败时后面那道 `has-session` 守门同样拦得住 attach,shell 原地活着。
+    cmd.push_str(&format!("; {}; ", sync_feature_command()));
+    cmd.push_str(&attach_guarded(&q, detach_others));
     cmd
+}
+
+/// `has-session` 守门 + `exec tmux attach` 的公共尾巴。
+///
+/// **守门必须留着**:裸的 `exec tmux attach -t X` 在会话不存在时,`exec` 已经把
+/// shell 替换成 tmux 进程,tmux 报错退出 → channel 关闭 → **pane 当场死掉**。
+/// 守门之后 `&&` 短路,shell 原地活着,D4 的「挂提示」和 D8 的「停在裸 shell」才成立。
+fn attach_guarded(quoted_name: &str, detach_others: bool) -> String {
+    let d = if detach_others { " -d" } else { "" };
+    format!("tmux has-session -t {quoted_name} 2>/dev/null && exec tmux attach{d} -t {quoted_name}")
 }
 
 /// F161/D1+D2:按**实测**会话名接回 tmux 的那一行命令。
@@ -261,18 +306,22 @@ fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> Stri
 /// 它不在了就说明远端重启过或用户自己 kill 了,凭空造一个同名空会话只会让
 /// 用户以为现场回来了。**永不替用户在远端造东西。**
 ///
-/// **`has-session` 守门必须留着**,砍掉的只是 `||` 后半段:裸的
-/// `exec tmux attach -t X` 在会话不存在时,`exec` 已经把 shell 替换成 tmux
-/// 进程,tmux 报错退出 → channel 关闭 → **pane 当场死掉**,D4 的「挂提示」和
-/// D8 的「停在裸 shell」全部落空。守门之后 `&&` 短路,shell 原地活着。
-/// 探测与 attach 之间的竞态窗口沿用 [`tmux_command`] 里「已知且接受」的结论。
+/// **`has-session` 守门必须留着**(理由见 [`attach_guarded`]),砍掉的只是
+/// `||` 后半段。探测与 attach 之间的竞态窗口沿用 [`tmux_command`] 里「已知且
+/// 接受」的结论。
 ///
 /// `name` **不过 `sanitize_tmux_name`**:那是给「拿配置里的名字去新建」用的,
 /// 会把 `@` 之类合法字符改掉。实测名是远端 tmux 自己报的 `#S`,已经合法。
+///
+/// F211 的 [`sync_feature_command`] 放在守门**之前**、不受守门保护:它自己吞掉
+/// stderr,server 不在时白跑一次而已;放到守门里反而要多一次 `has-session`。
 pub fn attach_only_command(name: &str, detach_others: bool) -> String {
     let q = shell_quote(name);
-    let d = if detach_others { " -d" } else { "" };
-    format!("tmux has-session -t {q} 2>/dev/null && exec tmux attach{d} -t {q}")
+    format!(
+        "{}; {}",
+        sync_feature_command(),
+        attach_guarded(&q, detach_others)
+    )
 }
 
 /// F161:按实测会话名接回 tmux 的一步计划。空计划 = 不发任何字节。
@@ -597,8 +646,8 @@ mod tests {
             "存在则 attach: {line}"
         );
         assert!(
-            line.contains("|| exec tmux new-session -s 'web01'"),
-            "不存在则新建: {line}"
+            line.contains("|| tmux new-session -d -s 'web01'"),
+            "不存在则新建(F211 起先 -d 建好、再单独 attach): {line}"
         );
         assert!(
             !line.contains("new-session -A"),
@@ -695,7 +744,7 @@ mod tests {
             "重连要踢掉断线残留的旧 client: {again}"
         );
         assert!(
-            !first.contains(" -d"),
+            !first.contains("attach -d"),
             "首次连接不该踢掉别处正 attach 着的 client: {first}"
         );
         assert_eq!(
@@ -710,22 +759,36 @@ mod tests {
         );
     }
 
-    /// F141:`-d` 对 `new-session` 是「建好但**不** attach」——加错地方的后果是
-    /// 远端 shell 立刻返回,用户对着一个空会话发呆,而且看不出成因。
+    /// F141:`detach_others` 那个 `-d` 只许落在 `attach` 上。落到 `new-session`
+    /// 上是另一个意思(「建好但**不** attach」),后果是远端 shell 立刻返回,
+    /// 用户对着一个空会话发呆,而且看不出成因。
     ///
-    /// 自证会变红:把 `tmux_command` 里的 `-d` 从 `attach{d}` 挪到
-    /// `new-session{d}`。
+    /// F211 之后 `new-session -d` 本身恒成立(先建好、再单独 attach,好让 sync
+    /// 登记有插入点),所以判据不能再是「不含 new-session -d」——改成拿首连与
+    /// 重连的**新建段**做差:`detach_others` 一旦渗进去,两段就不再逐字相同。
+    ///
+    /// 自证会变红:把 `tmux_command` 里的 `-d` 从 `attach_guarded` 挪到
+    /// `new-session -d{d}`。
     #[test]
     fn reattach_never_puts_the_detach_flag_on_new_session() {
         let a = resolved(Some(TmuxChoice::Attach { session_name: None }));
-        let line = text_of(&build_plan_reattach(&a, "web01")[0]);
+        let create_seg = |detach: bool| {
+            let line = if detach {
+                text_of(&build_plan_reattach(&a, "web01")[0])
+            } else {
+                text_of(&build_plan(&a, "web01")[0])
+            };
+            line.split("; tmux set ").next().unwrap().to_string()
+        };
+        let first = create_seg(false);
         assert!(
-            line.contains("|| exec tmux new-session -s 'web01'"),
-            "会话不在了仍要新建: {line}"
+            first.contains("|| tmux new-session -d -s 'web01'"),
+            "会话不在了仍要新建: {first}"
         );
-        assert!(
-            !line.contains("new-session -d"),
-            "-d 加在 new-session 上等于「建了不进去」: {line}"
+        assert_eq!(
+            create_seg(true),
+            first,
+            "detach_others 不许改动新建段,它只作用于 attach"
         );
     }
 
@@ -830,14 +893,15 @@ mod tests {
         a.work_dir = Some("/srv/app".into());
         let line = text_of(&build_plan(&a, "web01")[0]);
         assert!(
-            line.contains("new-session -s 'web01' -c '/srv/app'"),
+            line.contains("new-session -d -s 'web01' -c '/srv/app'"),
             "{line}"
         );
-        // attach 分支绝不能带工作目录:附着已有会话时改它的目录是越权。
-        let attach_part = line.split("||").next().unwrap();
+        // attach 那一段绝不能带工作目录:附着已有会话时改它的目录是越权。
+        // F211 之后 attach 是命令的最后一段(不再是 `||` 的左半边)。
+        let attach_part = line.split("&& exec tmux attach").nth(1).unwrap();
         assert!(
             !attach_part.contains("/srv/app"),
-            "attach 分支不得带 -c: {line}"
+            "attach 段不得带 -c: {line}"
         );
     }
 
@@ -1222,17 +1286,16 @@ mod tests {
     /// 「挂提示」和 D8 的「停在裸 shell」全部落空 —— shell 都没了。
     /// 有守门则 `&&` 短路,shell 原地活着。
     ///
-    /// 自证会变红:把 `attach_only_command` 改成 `format!("exec tmux attach{d} -t {q}")`。
+    /// 自证会变红:把 `attach_guarded` 改成 `format!("exec tmux attach{d} -t {q}")`。
     #[test]
     fn a_failed_attach_leaves_the_shell_alive() {
         let cmd = attach_only_command("web01", false);
+        // 判据是「守门与 attach 紧邻」而不是「命令以守门开头」:F211 在前面插了
+        // 一条 sync 登记语句,开头判据会连带失效;而紧邻判据同时挡住「守门在,
+        // 但中间被 `;` 断开、attach 其实没被它保护」这种更隐蔽的坏法。
         assert!(
-            cmd.starts_with("tmux has-session -t "),
-            "没有 has-session 守门,attach 失败会连 shell 一起带走:{cmd}"
-        );
-        assert!(
-            cmd.contains("2>/dev/null &&"),
-            "守门必须用 `&&` 短路(探测失败就什么都不做):{cmd}"
+            cmd.contains("tmux has-session -t 'web01' 2>/dev/null && exec tmux attach -t 'web01'"),
+            "没有 has-session 守门(或没紧挨着 attach),attach 失败会连 shell 一起带走:{cmd}"
         );
     }
 
@@ -1322,5 +1385,135 @@ mod tests {
             ready_timeout_ms: 15_000,
         };
         assert!(build_plan_attach_measured(&a, "web01", true).is_empty());
+    }
+
+    // ---- F211:让 tmux 真的把 DEC 2026 同步块转发过来 ----
+    //
+    // 背景(实测,见 `sync_feature_command` 文档):tmux 只在外层终端登记了 `sync`
+    // 特性时才转发内层程序的 BSU/ESU,否则整个吞掉 —— T2/F11 的攒帧在 tmux 下
+    // 从来没生效过。下面四条守的是「登记这件事**做对**」的四个必要条件,
+    // 每一条单独破掉都会让登记静默失效或者反过来把连接搞坏。
+
+    /// 每条要发给远端的 tmux 命令,拿去逐条过 F211 的四个必要条件。
+    fn tmux_lines() -> Vec<(&'static str, String)> {
+        let a = resolved(Some(TmuxChoice::Attach { session_name: None }));
+        vec![
+            ("build_plan", text_of(&build_plan(&a, "web01")[0])),
+            (
+                "build_plan_reattach",
+                text_of(&build_plan_reattach(&a, "web01")[0]),
+            ),
+            ("attach_only_command", attach_only_command("web01", true)),
+        ]
+    }
+
+    /// 条件一:登记必须在 attach **之前**。
+    ///
+    /// 运行期改 `terminal-features` 对已经 attach 的 client 不生效(实测 BSU 恒
+    /// 0)——tmux 只在 client 建立时按 TERM 匹配一次特性表。这也正是它不能挂在
+    /// F124 `remote_bootstrap`(attach 之后才跑)上的原因。挪到 attach 后面
+    /// **不会报任何错**,只是同步块永远不来。
+    ///
+    /// 自证会变红:把 `attach_only_command` 里两段的拼接顺序对调。
+    #[test]
+    fn the_sync_feature_is_registered_before_the_client_attaches() {
+        for (who, line) in tmux_lines() {
+            let set = line
+                .find("tmux set -g 'terminal-features[99]'")
+                .unwrap_or_else(|| panic!("{who} 没有登记 sync 特性: {line}"));
+            let attach = line
+                .find("exec tmux attach")
+                .unwrap_or_else(|| panic!("{who} 没有 attach: {line}"));
+            assert!(
+                set < attach,
+                "{who}:登记必须在 attach 之前,否则对已 attach 的 client 不生效: {line}"
+            );
+        }
+    }
+
+    /// 条件二:登记必须是**独立的一条 shell 语句**,失败不能牵连后面。
+    ///
+    /// 两种致命的写法:(a) `tmux set … \; attach` 串进同一次 tmux 调用——老 tmux
+    /// (< 3.2 没有 `terminal-features`)上 set 失败会**中止后面全部命令**(实测),
+    /// 连会话都建不起来;(b) 用 `&&` 串——同样被 set 的非零退出码短路。
+    /// 正确写法是 `;` 分隔 + 自带 `2>/dev/null`,老 tmux 上就只是这一句白跑。
+    ///
+    /// 自证会变红:把 `tmux_command`/`attach_only_command` 里 sync 后面的 `; `
+    /// 改成 ` && `。
+    #[test]
+    fn a_tmux_too_old_to_know_the_option_cannot_take_the_attach_down_with_it() {
+        for (who, line) in tmux_lines() {
+            assert!(
+                !line.contains(r"\;"),
+                "{who}:不许把 set 串进同一次 tmux 调用,前一条失败会中止后面全部: {line}"
+            );
+            let set = line.find("tmux set -g").unwrap();
+            let tail = &line[set..];
+            let stmt_end = tail.find("; ").unwrap_or_else(|| {
+                panic!("{who}:登记语句后面必须是 `; ` 而不是 `&&`/`||`: {line}")
+            });
+            assert!(
+                tail[..stmt_end].ends_with("2>/dev/null"),
+                "{who}:登记语句必须自己吞掉 stderr,老 tmux 上会往用户屏幕上吐报错: {line}"
+            );
+        }
+    }
+
+    /// 条件三:重复登记必须**幂等**。
+    ///
+    /// tmux 对 `set -a` 追加**不去重**(实测设 4 次就留 4 条),而这条命令每次
+    /// 连接/重连都会跑一遍 —— 用追加的话 `terminal-features` 会随重连次数无限
+    /// 变长。写死数组下标 → 重复执行恒等于覆盖同一个槽。
+    ///
+    /// 自证会变红:把 `sync_feature_command` 改回
+    /// `tmux set -as terminal-features ',xterm-256color:sync'`。
+    #[test]
+    fn re_registering_on_every_reconnect_does_not_grow_the_feature_list() {
+        for (who, line) in tmux_lines() {
+            assert!(
+                line.contains("tmux set -g 'terminal-features[99]'"),
+                "{who}:必须写死数组下标才幂等: {line}"
+            );
+            assert!(
+                !line.contains("set -a"),
+                "{who}:`-a` 追加不去重,每次重连都会让特性表长一条: {line}"
+            );
+        }
+    }
+
+    /// 条件四:新建那条路径也得拿得到同步块。
+    ///
+    /// 前台 `tmux new-session` 把「起 server」和「client attach」并成了一步,
+    /// 登记语句没有插入点 —— 首连(最常走的那条)就永远没有同步块,而且症状
+    /// 只是「偶尔闪一下」,没人会怀疑到这里。所以新建改成 `-d` 建好、登记、
+    /// 再单独 attach。
+    ///
+    /// 自证会变红:把 `tmux_command` 里的 `new-session -d` 改回
+    /// `exec tmux new-session`(前台)。
+    #[test]
+    fn a_freshly_created_session_gets_the_sync_feature_too() {
+        let a = resolved(Some(TmuxChoice::Attach { session_name: None }));
+        let line = text_of(&build_plan(&a, "web01")[0]);
+        let create = line
+            .find("tmux new-session -d -s 'web01'")
+            .unwrap_or_else(|| panic!("新建必须 detached,否则登记无处可插: {line}"));
+        let set = line.find("tmux set -g 'terminal-features[99]'").unwrap();
+        assert!(create < set, "先建好 server,登记才有对象: {line}");
+        assert!(
+            !line.contains("exec tmux new-session"),
+            "前台 new-session 会把「起 server」和「attach」并成一步,登记没有插入点: {line}"
+        );
+    }
+
+    /// 登记时报的 TERM 必须是我们**真的**向 pty 请求的那个。
+    ///
+    /// tmux 按 client 的 TERM 做模式匹配,报的和登记的对不上就静默不生效
+    /// (没有任何报错,只是同步块不来)。`mullion-store` 不依赖 `mullion-ssh`,
+    /// 两边只能各写一份字面量,所以在这儿钉住常量、由 `mullion-app` 的
+    /// 跨 crate 测试钉住两份字面量相等。
+    #[test]
+    fn the_registered_term_is_the_one_we_ask_the_pty_for() {
+        assert_eq!(SYNC_TERM, "xterm-256color");
+        assert!(sync_feature_command().contains("'xterm-256color:sync'"));
     }
 }

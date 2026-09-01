@@ -162,6 +162,33 @@ mod tests {
         assert!(matches!(cfg.auth, AuthMethod::Password(p) if p == "pw"));
     }
 
+    /// F211:登记 tmux `sync` 特性时报的 TERM,必须与我们真的向 pty 请求的那个
+    /// 一字不差。
+    ///
+    /// tmux 按 client 的 TERM 做模式匹配来决定要不要转发 DEC 2026 同步块。对不
+    /// 上的后果是**静默不生效**:没有任何报错,只是同步块永远不来、T2 的攒帧
+    /// 继续空转,而这只有人眼在真机上才看得出来。`mullion-store` 不依赖
+    /// `mullion-ssh`(架构不变量),两边只能各写一份字面量 —— 这条跨 crate 断言
+    /// 就是那两份字面量之间唯一的锁。
+    ///
+    /// 自证会变红:把 `SshConfig.term` 改成 `"xterm-256color-truecolor"`。
+    #[test]
+    fn the_term_we_ask_the_pty_for_is_the_one_we_register_tmux_sync_against() {
+        let r = rec(AuthKind::Password, Protocol::Ssh);
+        let sec = SecretEntry {
+            password: Some("pw".into()),
+            passphrase: None,
+            proxy_password: None,
+            private_key: None,
+        };
+        let cfg = to_ssh_config(&r, &resolved(&r, Some(&sec))).unwrap();
+        assert_eq!(
+            cfg.term,
+            mullion_store::automation::SYNC_TERM,
+            "TERM 与 tmux sync 登记的模式对不上,同步块会静默不来"
+        );
+    }
+
     #[test]
     fn password_without_secret_errors() {
         let r = rec(AuthKind::Password, Protocol::Ssh);
