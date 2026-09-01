@@ -56,6 +56,10 @@ pub struct EditorState {
     /// `Window::max_size` 管内容区,而尺寸预算说的是外框,差的就是这一截。
     /// 首帧还没量到,按零算,第二帧收敛。见 `max_size`。
     pub chrome: egui::Vec2,
+    /// F215:语法高亮缓存。**懒建**:它要 `Theme` 才能拼主题,而 `new` 拿不到
+    /// (调用方在 `app.rs` 的 IO 回调里,那儿没有 UI 上下文);顺带也省掉了
+    /// 「打开一个从没滚到的文件也要先加载 368 KiB 语法表」的启动成本。
+    pub hl: Option<crate::ui::highlight::Cache>,
     /// F204:还要摆正几帧。开窗时是 2,每帧减一,归零后位置归用户拖。
     ///
     /// **不能只靠 `Window::default_pos`**:egui 把窗口位置记在 `Memory` 里,
@@ -94,6 +98,7 @@ impl EditorState {
             last_rect: None,
             restore_to: None,
             chrome: egui::Vec2::ZERO,
+            hl: None,
             centre_frames: 2,
         }
     }
@@ -331,10 +336,24 @@ pub fn show(
         // `ScrollArea` 会把可用高度吃光,保存/关闭那一行被挤出窗口。
         let reserve = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0;
         let h = (ui.available_height() - reserve).max(80.0);
+        // F215:高亮缓存懒建。文件大小是**开窗那一刻**的 —— 门槛判的是
+        // 「这个文件值不值得高亮」,不是「此刻的缓冲区有多长」;每帧按当前
+        // 长度重判的话,用户在一个 256 KB 边缘的文件里删一行,高亮会突然
+        // 亮起来、再敲回去又灭掉。
+        if s.hl.is_none() {
+            s.hl = Some(crate::ui::highlight::Cache::new(&s.path, t, s.text.len()));
+        }
+        // `hl` 与 `text` 是同一个结构体的两个字段,分别借用互不冲突;
+        // 合成一个 `&mut s` 传进去就借冲突了。
+        let hl = s.hl.as_mut().expect("上一行刚建好");
+        let mut layouter = |ui: &egui::Ui, text: &str, w: f32| hl.layout(ui, text, w);
         egui::ScrollArea::vertical().max_height(h).show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut s.text)
                     .code_editor()
+                    // F215:语法高亮。`layouter` 每帧都跑,增量与缓存全在
+                    // `highlight::Cache` 里 —— 见那个模块的头注释。
+                    .layouter(&mut layouter)
                     // F207:正文区底色 = 终端底色 `term_bg`。用户看的是远端
                     // 文件,底色跟终端一致才连得上「这就是那台机器上的东西」;
                     // 而窗口壳仍是 `modal_bg`(#3f3f3f),两层色差本身就是
@@ -379,6 +398,26 @@ pub fn show(
             }
             // F204:关闭挪到标题栏的 ✕ 上了 —— 底下不再重复一颗。
             ui.checkbox(&mut s.backup, "写前留一份 .mullion.bak");
+            // F215:认出来的语法要报出来。高亮猜错(或压根没高亮)时,用户
+            // 看到的只是「颜色不太对」,而这一行直接说明是按什么语法上的色。
+            if let Some(hl) = &s.hl {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if hl.too_big {
+                        ui.colored_label(
+                            theme::c32(t.warn),
+                            format!(
+                                "超过 {} KB,已关掉语法高亮",
+                                crate::ui::highlight::MAX_BYTES / 1024
+                            ),
+                        );
+                    } else {
+                        ui.colored_label(
+                            theme::c32(t.fg_muted),
+                            format!("语法:{}", hl.syntax_name()),
+                        );
+                    }
+                });
+            }
         });
     });
 
@@ -428,6 +467,65 @@ mod tests {
         assert!(
             !prod.contains("max_height(360.0)"),
             "编辑区高度还写死在 360 —— 窗口放大了它也不跟着长"
+        );
+    }
+
+    /// F215:正文真的按语法上了色,而且窗口说得出它按的是哪套语法。
+    ///
+    /// 这条盯的是**接线**:`highlight` 那边九条测试全绿,而 `.layouter(..)`
+    /// 漏了一行的话,编辑器照常打开、照常能编辑、照常能存 —— 只是一整片
+    /// 同色。零报错,只有人眼看得见。
+    ///
+    /// 判据是「这一块 galley 里出现了不止一种颜色」,不是「某个词是什么色」
+    /// —— 后者等于把 syntect 的语法表抄进断言里,人家小版本一升就假红。
+    ///
+    /// 自证会变红:把 `.layouter(&mut layouter)` 那一行删掉。
+    #[test]
+    fn the_body_is_coloured_by_syntax_and_the_window_names_the_syntax() {
+        fn colours(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| colours(s, needle, out)),
+                egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                    out.extend(ts.galley.job.sections.iter().map(|s| s.format.color));
+                }
+                _ => {}
+            }
+        }
+        let mut s = Some(EditorState::new(
+            1,
+            "/srv/app/src/main.rs".into(),
+            "// 说明\nfn main() {\n    let s = \"hi\";\n}\n".into(),
+            None,
+            Eol::Lf,
+            false,
+        ));
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    show(ctx, &t, &mut s);
+                })
+                .shapes;
+        }
+        let mut seen = Vec::new();
+        for cs in &shapes {
+            colours(&cs.shape, "fn main", &mut seen);
+        }
+        assert!(!seen.is_empty(), "形状树里找不到正文 —— 测试的定位写坏了");
+        seen.sort_by_key(|c| c.to_array());
+        seen.dedup();
+        assert!(
+            seen.len() > 1,
+            "正文只有一种颜色({seen:?})—— 语法高亮没接上"
+        );
+        // 认出来的语法要报给用户,否则「颜色不太对」时他无从判断是猜错了
+        // 语法还是我们画错了色。
+        let joined = texts(&mut s).join(" ");
+        assert!(
+            joined.contains("语法:Rust"),
+            "窗口没说按什么语法上的色:{joined}"
         );
     }
 

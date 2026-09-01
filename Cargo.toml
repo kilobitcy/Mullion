@@ -71,6 +71,17 @@ base64 = "0.22"
 # `default-features = false` + 只开 `alloc`:默认特性会带上 `rand`,而我们的熵
 # 已经走 chacha20poly1305 的 OsRng,不需要第二条随机源(N6 exe 体积)。
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# F215:内置编辑器的语法高亮。**特性砍到只剩解析** —— 默认的 `default-onig`
+# 会拉进 `onig_sys`(C 库,交叉编译要 mingw 那边也有一份),换成
+# `regex-fancy`(纯 Rust 的 `fancy-regex`,Sublime 语法要的反向引用/后顾它支持)。
+# 另外三样一律不开:`default-themes`/`plist-load`(主题是我们自己按色板拼的,
+# 不从 .tmTheme 读)、`yaml-load`(只吃预编译的 packdump,不在运行期编语法)、
+# `html`(不出 HTML)。N6 的 exe 体积盯着这几条。
+syntect = { version = "5.3", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "regex-fancy",
+] }
 
 # N6(安装包 < 25MB)。在这之前 release 用的是 cargo 默认值,交叉编译出来的
 # exe 是 38.6 MiB —— 超标 54%,而且从来没有任何自动化盯着它。

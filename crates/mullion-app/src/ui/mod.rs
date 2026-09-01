@@ -9,6 +9,7 @@ pub mod files_dialog;
 pub mod files_panel;
 pub mod glyphs;
 pub mod group_manager;
+pub mod highlight;
 pub mod history;
 pub mod host_key;
 pub mod ico;
