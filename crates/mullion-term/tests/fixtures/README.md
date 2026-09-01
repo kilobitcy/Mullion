@@ -35,6 +35,7 @@
 | 名字 | 录自 | 钉住的事实 |
 |---|---|---|
 | `claude-code-input-cursor` | `tmux new-session -x 100 -y 30 claude`,输入 `hi` 后停在输入框 | Claude Code 全程 `?25l`(`?25h` 只在启动出现一次),输入位置**全靠一格 SGR 7 反显块**自绘(F197 / F198) |
+| `claude-code-compact-repaint` | `tmux -x 120 -y 30` 里跑 Claude Code 执行 `/compact` | 重绘流里那一处 `CSI K`(擦转圈行)会把**整段跨行选区**丢掉,连没被碰过的行一起 —— 按住左键时必须补回(F212) |
 
 ## 规则
 
