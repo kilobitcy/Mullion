@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use mullion_core::layout::PaneId;
 use mullion_term::keymap::{Key, Mods};
 use mullion_term::selection::{CellSide, SelectionKind};
 use winit::event::{KeyEvent, MouseScrollDelta};
@@ -88,25 +89,73 @@ pub struct ImeState {
     /// 就是「这串空不空」,不另留一个 bool:两份状态迟早会在某条结束边上失步,
     /// 而失步的那一半正好是「永久吞键」这种最难查的故障。
     text: String,
+    /// F210:组字**开始**那一刻,焦点 pane 的光标格 `(pane, col, row)`。
+    ///
+    /// 组字期间内联拼音和系统候选框都钉在这里,**不再每帧跟着终端真光标走**。
+    /// 见 [`ImeState::anchored_cursor`] 的说明。
+    anchor: Option<(PaneId, (u16, u16))>,
 }
 
 impl ImeState {
     /// 收到 `Ime::Preedit`。空串 = 候选被取消,组字结束。
-    pub fn on_preedit(&mut self, text: &str) {
+    ///
+    /// `at` 是这一刻焦点 pane 的真光标格 `(pane, (col, row))`,`None` = 当前
+    /// 没有焦点 pane。它**只在组字开始那一次**被记成锚点(F210)。
+    pub fn on_preedit(&mut self, text: &str, at: Option<(PaneId, (u16, u16))>) {
         // 复用已分配的堆缓冲:组字期间每敲一个字母就来一次,`= text.to_owned()`
         // 会一路分配再释放。
         self.text.clear();
         self.text.push_str(text);
+        if self.text.is_empty() {
+            self.anchor = None;
+        } else if self.anchor.is_none() {
+            self.anchor = at;
+        }
     }
 
     /// 收到 `Ime::Commit`,组字结束。
     pub fn on_commit(&mut self) {
         self.text.clear();
+        self.anchor = None;
     }
 
     /// 收到 `Ime::Disabled`(切走输入法 / 失焦),组字结束。
     pub fn on_disabled(&mut self) {
         self.text.clear();
+        self.anchor = None;
+    }
+
+    /// F210:组字期间光标该钉在哪一格,夹紧到 `dims`(cols, rows)。
+    ///
+    /// **为什么不能跟着真光标走。** 远端 TUI(tmux 里的 Claude Code)重绘时会
+    /// 把光标挪到正在重画的那一段,画完再挪回输入行。这些中间态本不该被看见,
+    /// 但经 tmux 转发时 DEC 2026 同步块被 tmux 吃掉(它只在外层终端登记了
+    /// `sync` 特性时才转发,而我们报的 TERM 是 `xterm-256color`),T2 的攒帧
+    /// 因此不生效 —— 我们会实打实地画出重绘中间帧。跟着走的话,内联拼音和系统
+    /// 候选框每次远端重绘都会瞬移一次再弹回来:`/compact` 这类持续刷进度的场景
+    /// 下就是肉眼可见的连续闪烁(候选框还额外滞后一帧,一次瞬移闪两下)。
+    ///
+    /// 钉住是安全的:组字期间用户敲的字母**一个都没发给远端**,远端光标没有
+    /// 任何理由因为用户而移动。
+    ///
+    /// **已知取舍**:组字期间画面若真的整屏上滚(裸 shell 下背景输出刷屏),
+    /// 锚点会停在原地、拼音跟着画错位置。相对「每次重绘必闪」这是划算的,而且
+    /// 一次提交就自愈。
+    ///
+    /// `pane` 不匹配就退回真光标:分屏里组字中途点到另一块 pane 时,锚点属于
+    /// 上一块,照用会把拼音画到新 pane 的错误格子上。
+    /// (跨标签页切换后 `PaneId` 可能重号,那种情形不覆盖。)
+    pub fn anchored_cursor(&self, pane: PaneId, live: (u16, u16), dims: (u16, u16)) -> (u16, u16) {
+        let Some((anchor_pane, (col, row))) = self.anchor else {
+            return live;
+        };
+        if anchor_pane != pane {
+            return live;
+        }
+        (
+            col.min(dims.0.saturating_sub(1)),
+            row.min(dims.1.saturating_sub(1)),
+        )
     }
 
     /// 这一刻的按键该不该被吞掉(组字中 = 该吞)。
@@ -307,6 +356,14 @@ pub fn autoscroll_lines(px_y: f32, win_h: f32, cell_h: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F210 组字锚点测试用的 pane 号。取哪个值不重要,前后一致即可。
+    const P: PaneId = PaneId(1);
+
+    /// F210:「组字在这一格开始」。
+    fn at(col: u16, row: u16) -> Option<(PaneId, (u16, u16))> {
+        Some((P, (col, row)))
+    }
     use std::time::Duration;
     use winit::dpi::PhysicalPosition;
     use winit::event::MouseScrollDelta;
@@ -403,7 +460,7 @@ mod tests {
         // 不拦的话打「你好」会先往远端送一串 "nihao",再送「你好」。
         let mut ime = ImeState::default();
         assert!(!ime.swallows_key(), "没在组字时不该吞键");
-        ime.on_preedit("ni");
+        ime.on_preedit("ni", at(3, 7));
         assert!(ime.swallows_key(), "组字中必须吞掉拼音字母");
         ime.on_commit();
         assert!(
@@ -417,8 +474,8 @@ mod tests {
         // 用户按 Esc 取消候选:winit 发的是空 preedit,不是 commit。只认 commit
         // 的话组字状态永远挂着,此后**一个键都进不了终端**。
         let mut ime = ImeState::default();
-        ime.on_preedit("ni");
-        ime.on_preedit("");
+        ime.on_preedit("ni", at(3, 7));
+        ime.on_preedit("", at(3, 7));
         assert!(!ime.swallows_key());
     }
 
@@ -427,7 +484,7 @@ mod tests {
         // 切走输入法 / 失焦时 winit 发 `Ime::Disabled`,同样要解除吞键,
         // 否则用户切回英文输入法后键盘整个失灵。
         let mut ime = ImeState::default();
-        ime.on_preedit("ni");
+        ime.on_preedit("ni", at(3, 7));
         ime.on_disabled();
         assert!(!ime.swallows_key());
     }
@@ -436,7 +493,7 @@ mod tests {
     #[test]
     fn preedit_text_is_kept_for_rendering() {
         let mut ime = ImeState::default();
-        ime.on_preedit("gang'jin");
+        ime.on_preedit("gang'jin", at(3, 7));
         assert_eq!(ime.preedit(), "gang'jin");
         assert!(ime.swallows_key(), "组字中照旧吞键");
     }
@@ -451,15 +508,98 @@ mod tests {
     fn every_end_of_composition_clears_the_text() {
         for end in ["commit", "empty-preedit", "disabled"] {
             let mut ime = ImeState::default();
-            ime.on_preedit("nihao");
+            ime.on_preedit("nihao", at(3, 7));
             match end {
                 "commit" => ime.on_commit(),
-                "empty-preedit" => ime.on_preedit(""),
+                "empty-preedit" => ime.on_preedit("", at(3, 7)),
                 _ => ime.on_disabled(),
             }
             assert_eq!(ime.preedit(), "", "{end} 之后必须没有残留");
             assert!(!ime.swallows_key(), "{end} 之后不该继续吞键");
         }
+    }
+
+    /// F210:**这条是修「`/compact` 时打中文闪烁」的判据。**
+    ///
+    /// 远端 TUI 重绘时会把光标挪到正在重画的那一段,画完再挪回输入行。经 tmux
+    /// 转发时 DEC 2026 同步块被 tmux 吃掉(见 `anchored_cursor` 文档),T2 攒帧
+    /// 不生效,我们会实打实画出这些中间态。锚点若跟着走,内联拼音和候选框每次
+    /// 重绘都瞬移一次 —— `/compact` 持续刷进度条,就是连续闪烁。
+    ///
+    /// 自证会变红:把 `on_preedit` 里那句 `else if self.anchor.is_none()` 的
+    /// `is_none()` 判断去掉(每次 preedit 都重记锚点)—— 那样第二次断言会拿到
+    /// 远端重绘中间态的 `(0, 5)`。
+    #[test]
+    fn the_composition_anchor_is_latched_at_the_start_and_does_not_chase_the_remote_cursor() {
+        let mut ime = ImeState::default();
+        let grid = (80, 40);
+        ime.on_preedit("d", at(30, 38)); // 用户在输入行按下第一个拼音字母
+                                         // 远端正在重绘,真光标此刻在别处
+        assert_eq!(
+            ime.anchored_cursor(P, (0, 5), grid),
+            (30, 38),
+            "组字期间必须钉在开始那一格,不能跟着远端重绘的中间态跑"
+        );
+        // 用户接着敲第二个字母,这一刻真光标又恰好在中间态上
+        ime.on_preedit("du", at(0, 5));
+        assert_eq!(
+            ime.anchored_cursor(P, (0, 5), grid),
+            (30, 38),
+            "锚点只在组字开始记一次,后续 preedit 不许改写它"
+        );
+    }
+
+    /// F210:没在组字(或组字刚结束)就得原样退回真光标 —— 钉住是组字期间的
+    /// 特权,常态下光标必须跟着远端走,否则光标会永久停在最后一次组字的位置。
+    ///
+    /// 自证会变红:把 `anchored_cursor` 开头那个 `let Some(..) else { return live }`
+    /// 改成 `unwrap_or(live_as_anchor)` 之类恒返回锚点的写法。
+    #[test]
+    fn without_a_composition_the_cursor_is_the_live_one() {
+        let mut ime = ImeState::default();
+        let grid = (80, 40);
+        assert_eq!(
+            ime.anchored_cursor(P, (7, 9), grid),
+            (7, 9),
+            "没组字 = 真光标"
+        );
+        for end in ["commit", "empty-preedit", "disabled"] {
+            ime.on_preedit("d", at(30, 38));
+            match end {
+                "commit" => ime.on_commit(),
+                "empty-preedit" => ime.on_preedit("", at(30, 38)),
+                _ => ime.on_disabled(),
+            }
+            assert_eq!(
+                ime.anchored_cursor(P, (7, 9), grid),
+                (7, 9),
+                "{end} 之后锚点必须撤掉,否则光标永久钉死在那一格"
+            );
+        }
+    }
+
+    /// F210:锚点属于组字开始时那块 pane。分屏里组字中途点到另一块,照用锚点
+    /// 会把拼音画到新 pane 的错误格子上(新 pane 的真光标才是对的)。
+    ///
+    /// 自证会变红:把 `anchored_cursor` 里 `if anchor_pane != pane` 那一支删掉。
+    #[test]
+    fn the_anchor_only_applies_to_the_pane_it_was_taken_in() {
+        let mut ime = ImeState::default();
+        ime.on_preedit("d", at(30, 38));
+        assert_eq!(ime.anchored_cursor(PaneId(2), (7, 9), (80, 40)), (7, 9));
+    }
+
+    /// F210:reflow 把网格缩小后,锚点会越界。不夹紧的话 `preedit_quads` 会按
+    /// 越界行号算 `row × cell_h`,把组字串的底色/下划线画到邻居 pane 上。
+    ///
+    /// 自证会变红:把 `anchored_cursor` 末尾那两处 `.min(..)` 去掉。
+    #[test]
+    fn the_anchor_is_clamped_into_the_grid_after_a_reflow() {
+        let mut ime = ImeState::default();
+        ime.on_preedit("d", at(100, 38));
+        assert_eq!(ime.anchored_cursor(P, (0, 0), (40, 20)), (39, 19));
+        // 退化到零格网格也不能算出越界值(0 列 0 行时夹到 (0, 0))。
+        assert_eq!(ime.anchored_cursor(P, (0, 0), (0, 0)), (0, 0));
     }
 
     #[test]

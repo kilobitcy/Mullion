@@ -473,6 +473,12 @@ impl Emulator {
         self.term.columns() as u16
     }
 
+    /// 网格行数。存在的理由与 [`Self::cols`] 一字不差(轻量路径,不建整格
+    /// 快照)—— F210 要把组字锚点夹紧在当前网格里,而候选框定位每帧都算一次。
+    pub fn rows(&self) -> u16 {
+        self.term.grid().screen_lines() as u16
+    }
+
     /// 改变网格尺寸(F34:分屏 reflow / 窗口 resize 时调用)。
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.term.resize(GridSize { cols, rows });
@@ -833,6 +839,19 @@ mod tests {
         let mut emu = Emulator::new(10, 3);
         emu.resize(20, 5);
         assert_eq!(emu.cols(), emu.snapshot().cols);
+    }
+
+    /// F210:`rows()` 同理 —— 组字锚点要夹紧在网格里,拿它当上界时若与
+    /// `snapshot().rows` 不同源,夹出来的行号会指到别人那一格。
+    ///
+    /// 自证会变红:把 `rows()` 改成 `self.term.grid().total_lines() as u16`
+    /// (回溯历史算进去,和可视区行数不是一回事)。
+    #[test]
+    fn rows_agrees_with_the_full_snapshot() {
+        let mut emu = Emulator::with_history(10, 3, 100);
+        emu.feed(b"a\r\nb\r\nc\r\nd\r\ne\r\nf"); // 滚出几行历史,把 total_lines 撑开
+        emu.resize(20, 5);
+        assert_eq!(emu.rows(), emu.snapshot().rows);
     }
 
     #[test]

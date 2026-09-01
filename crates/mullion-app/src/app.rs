@@ -5405,6 +5405,15 @@ impl App {
         a.geoms.iter().find(|g| g.id == f).copied()
     }
 
+    /// F210:焦点 pane 的 id + 它这一刻的**真**光标格 `(col, row)`。
+    /// 只在组字开始时被 [`input::ImeState::on_preedit`] 记成锚点。
+    fn focused_cursor_cell(&self) -> Option<(PaneId, (u16, u16))> {
+        let ws = self.active_ws()?;
+        let id = ws.focus();
+        let c = ws.focused()?.emulator.cursor();
+        Some((id, (c.col, c.row)))
+    }
+
     /// 指针相对**焦点 pane 终端区**左上角的像素。原点用 `term_px` 而不是中央区:
     /// 分屏后 pane 2 的第 0 列不在窗口左边,用中央区原点算会整体偏一个 pane 宽。
     fn cursor_in_grid(&self) -> (f32, f32) {
@@ -5536,13 +5545,17 @@ impl App {
         // F126:组字中候选框要跟拼音串末尾走,不是原始光标列 —— 与
         // `gpu::quads_for_panes`/`text::prepare_panes` 摆字用的是同一个
         // `preedit_cursor_col`,否则候选框和内联拼音的视觉光标位置对不上。
-        let cols = self
+        let dims = self
             .active_ws()
             .and_then(Workspace::focused)
-            .map(|p| p.emulator.cols())
-            .unwrap_or(cur.col + 1);
-        let col = crate::text::preedit_cursor_col(cols, cur.col, self.ime.preedit());
-        let area = ime_cursor_area(g.term_px, (col, cur.row), cell_w, cell_h);
+            .map(|p| (p.emulator.cols(), p.emulator.rows()))
+            .unwrap_or((cur.col + 1, cur.row + 1));
+        // F210:组字期间钉在锚点上,不跟远端重绘时乱跑的真光标 —— 与下面
+        // 渲染路径喂给 `PaneRender` 的那份光标**必须**是同一个
+        // `anchored_cursor`,不同源的话候选框和内联拼音会分家。
+        let (acol, arow) = self.ime.anchored_cursor(g.id, (cur.col, cur.row), dims);
+        let col = crate::text::preedit_cursor_col(dims.0, acol, self.ime.preedit());
+        let area = ime_cursor_area(g.term_px, (col, arow), cell_w, cell_h);
         if self.ime_cursor_area == Some(area) {
             return;
         }
@@ -8624,7 +8637,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if to_terminal {
                     match &ime {
                         winit::event::Ime::Preedit(text, _) => {
-                            self.ime.on_preedit(text);
+                            // F210:锚点只在组字**开始**那一次被记下,之后整段
+                            // 组字都钉住(见 `ImeState::anchored_cursor`)。
+                            let at = self.focused_cursor_cell();
+                            self.ime.on_preedit(text, at);
                             // F125:拼音现在内联上屏,组字中敲字母也算「输入」——
                             // 不重置的话光标可能闪到暗周期,用户敲拼音时观感是丢帧。
                             self.last_input_at = Instant::now();
@@ -9060,7 +9076,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                             // 快照要先全部取出来:PaneRender 借着它们,而 render_frame
                             // 同时要 &mut self.ui。
-                            let snaps: Vec<_> = self
+                            let mut snaps: Vec<_> = self
                                 .active_ws()
                                 .map(|ws| {
                                     geoms
@@ -9072,6 +9088,24 @@ impl ApplicationHandler<UserEvent> for App {
                                 })
                                 .unwrap_or_default();
                             let focus = self.active_ws().map(Workspace::focus);
+                            // F210:组字期间把焦点 pane 的光标钉回锚点。**改在
+                            // 快照上**是有意的:内联拼音的位置、让路区间、光标
+                            // quad、整帧指纹全都只读 `snap.cursor`,一处改完下游
+                            // 天然同源;逐个消费点各判一份迟早漏掉一个,而漏掉的
+                            // 那一个就是「拼音和候选框分家」。夹紧到本帧网格是因为
+                            // reflow 会让锚点越界,越界的行会把 quad 画到邻居 pane 上。
+                            for (g, s) in snaps.iter_mut() {
+                                if Some(g.id) != focus {
+                                    continue;
+                                }
+                                let cell = self.ime.anchored_cursor(
+                                    g.id,
+                                    (s.cursor.col, s.cursor.row),
+                                    (s.cols, s.rows),
+                                );
+                                s.cursor.col = cell.0;
+                                s.cursor.row = cell.1;
+                            }
                             let renders: Vec<crate::gpu::PaneRender<'_>> = snaps
                                 .iter()
                                 .map(|(g, s)| {
@@ -15967,6 +16001,68 @@ mod tests {
         assert!(
             !ime_goes_to_terminal_of(Focus::Terminal, true, false),
             "模态弹窗开着 → 一切归 egui"
+        );
+    }
+
+    /// F210:组字锚点的**两个**消费点必须都走 `ImeState::anchored_cursor`。
+    ///
+    /// 一个是系统候选框定位(`apply_ime_cursor_area`),一个是渲染快照
+    /// (内联拼音 / 让路区间 / 光标 quad / 整帧指纹全读 `snap.cursor`)。
+    /// 只改其中一个的现象是**候选框和内联拼音分家** —— 拼音钉住不动、候选框
+    /// 仍跟着远端重绘乱跳,比原来的「一起跳」更难看,而且编译、测试全绿。
+    ///
+    /// 锚点逻辑本身的行为判据在 `input::tests` 那四条;这里只钉「接线没掉」,
+    /// 因为 `App` 在无头环境造不出来。切片写法与
+    /// `ime_that_is_not_for_the_terminal_clears_composition_and_invalidates_the_candidate_box`
+    /// 同一套:锚点唯一性显式断言,并自检确实切窄了(否则退化成扫全文件、恒绿)。
+    #[test]
+    fn both_the_candidate_box_and_the_rendered_snapshot_take_the_composition_anchor() {
+        let src = include_str!("app.rs");
+        // needle 必须**拼**出来:写成整串字面量的话,本测试自己这几行也会被
+        // `include_str!` 数进去,`count()` 永远大于 2,断言变成纯噪声。
+        let anchored = concat!("self.ime.", "anchored_cursor(");
+        assert_eq!(
+            src.matches(anchored).count(),
+            2,
+            "锚点该有且只有两个消费点(候选框定位 + 渲染快照);少一个就是分家,\
+             多一个说明又冒出了一条没被本测试钉住的路"
+        );
+
+        // ① 候选框定位。
+        let head = "\n    fn apply_ime_cursor_area(&mut self) {";
+        assert_eq!(src.matches(head).count(), 1, "锚点必须唯一");
+        let after = src.split(head).nth(1).expect("找不到候选框定位函数");
+        let body = &after[..after.find("\n    }").expect("找不到函数结尾")];
+        assert!(
+            body.len() < after.len(),
+            "没切出函数体,断言会退化成扫全文件"
+        );
+        assert!(
+            body.contains(&format!("let (acol, arow) = {anchored}")),
+            "候选框定位必须取锚点,不能直接用远端真光标:{body}"
+        );
+        assert!(
+            body.contains("preedit_cursor_col(dims.0, acol,")
+                && body.contains("ime_cursor_area(g.term_px, (col, arow),"),
+            "锚点算出来了却没喂进去,等于没改:{body}"
+        );
+
+        // ② 渲染快照。
+        let head = "\n                            let mut snaps: Vec<_> = self";
+        assert_eq!(src.matches(head).count(), 1, "锚点必须唯一");
+        let after = src.split(head).nth(1).expect("找不到渲染快照的取用点");
+        let region = &after[..after
+            .find("\n                            let renders: Vec<crate::gpu::PaneRender<'_>> = snaps")
+            .expect("找不到 PaneRender 组装点")];
+        assert!(
+            region.len() < after.len(),
+            "没切出快照组装段,断言会退化成扫全文件"
+        );
+        assert!(
+            region.contains(anchored)
+                && region.contains("s.cursor.col = cell.0;")
+                && region.contains("s.cursor.row = cell.1;"),
+            "渲染快照的光标必须在喂给 PaneRender **之前**被钉回锚点:{region}"
         );
     }
 
