@@ -5462,10 +5462,20 @@ impl App {
             self.press_anchor = Some(((col, row), kind));
             if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
                 pane.emulator.selection_start(col, row, kind, side);
+                // F212:进入「按住划选」态,远端重绘不得抹掉这段选区。
+                pane.emulator.hold_selection(true);
             }
         }
         self.dragging = true;
         self.request_ui_redraw();
+    }
+
+    /// 松开「按住划选」态(F212)。**每一条让 `dragging` 落回 false 的路径都要调它**,
+    /// 否则挂住的 hold 会让远端此后永远擦不掉这个 pane 的选区。
+    fn release_selection_hold(&mut self) {
+        if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
+            pane.emulator.hold_selection(false);
+        }
     }
 
     /// 更新选区终点 + 重算出界滚动量。**不请求重绘**:自动滚动那条路径要在
@@ -5504,6 +5514,7 @@ impl App {
         let was_dragging = self.dragging;
         self.dragging = false;
         self.autoscroll = 0;
+        self.release_selection_hold();
         let anchor = self.press_anchor.take();
         if !was_dragging {
             return;
@@ -8486,6 +8497,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // 会永久卡住、自动滚动停不下来。失焦就当拖拽结束。
                     self.dragging = false;
                     self.autoscroll = 0;
+                    self.release_selection_hold();
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -11757,6 +11769,52 @@ mod tests {
     }
 
     // ------------------------------------------------ F18 划选自动滚动
+
+    /// F212:「按住左键」这个态**每一条出口都要还回去**,一条不落。
+    ///
+    /// hold 开着时远端擦行擦不掉选区(那正是它存在的理由)。所以它一旦挂住,
+    /// 这个 pane 的选区就再也冲不掉了 —— 用户看到一段永远赖着不走的高亮,
+    /// 没有任何报错,只能重开标签。`dragging` 落回 false 的路不止一条
+    /// (`selection_release` 与失焦兜底),漏掉任意一条都是这个下场。
+    ///
+    /// 判据按「每一处 `dragging = false` 附近都要有归还」写,而不是「全文件里
+    /// 搜得到一次 `release_selection_hold`」:后者在有两个出口时,删掉其中任意
+    /// 一个都仍然搜得到,断言恒绿(本仓库记过的恒绿模式)。
+    ///
+    /// 源码切片是因为这两条路一条在 `WindowEvent` 里、一条要真指针事件,
+    /// 无头环境造不出 `App`。**先剥注释行**,否则上面这段说明就能喂饱断言。
+    ///
+    /// 自证会变红:删掉任意一处 `self.release_selection_hold();`。
+    #[test]
+    fn every_path_that_ends_the_drag_also_hands_the_selection_hold_back() {
+        let prod = prod_src()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let exits: Vec<usize> = prod
+            .match_indices("self.dragging = false;")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            exits.len() >= 2,
+            "拖拽出口少于两条 —— 要么这条测试的锚点失效了,要么真丢了一条出口"
+        );
+        for at in exits {
+            let after = &prod[at..(at + 200).min(prod.len())];
+            assert!(
+                after.contains("self.release_selection_hold();"),
+                "有一条拖拽出口没归还 hold,那个 pane 的选区将永远擦不掉。上下文:\n{after}"
+            );
+        }
+
+        let press = body_of(&prod, "fn selection_press(&mut self) {");
+        assert!(
+            press.contains("hold_selection(true)"),
+            "按下没进入 hold 态 —— 远端一擦行,拖到一半的高亮就没了(F212 的实报症状)"
+        );
+    }
 
     /// F185:右键粘贴前必须先把焦点切到指针底下那块 pane,**且顺序不能反**。
     ///

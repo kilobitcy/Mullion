@@ -9,18 +9,22 @@ use std::path::PathBuf;
 
 use mullion_term::emulator::Emulator;
 use mullion_term::palette;
+use mullion_term::selection::{CellSide, SelectionKind};
 use mullion_term::snapshot::{CursorShape, GridSnapshot};
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+fn fixture_bytes(name: &str) -> Vec<u8> {
+    let path = fixtures_dir().join(format!("{name}.bin"));
+    std::fs::read(&path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()))
+}
+
 /// 把 `<名字>.bin` 喂进一个 `cols×rows` 的仿真器。
 fn play(name: &str, cols: u16, rows: u16) -> GridSnapshot {
-    let path = fixtures_dir().join(format!("{name}.bin"));
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
     let mut emu = Emulator::new(cols, rows);
-    emu.feed(&bytes);
+    emu.feed(&fixture_bytes(name));
     emu.snapshot()
 }
 
@@ -128,4 +132,91 @@ fn claude_code_draws_its_input_cursor_with_an_inverse_cell_while_the_real_one_st
     );
 
     assert_snapshot("claude-code-input-cursor", &render(&snap));
+}
+
+/// `/compact` 期间的重绘流。用来钉 F212。
+const COMPACT: &str = "claude-code-compact-repaint";
+const COMPACT_COLS: u16 = 120;
+const COMPACT_ROWS: u16 = 30;
+/// 流里那一帧「任务转完、把转圈行擦掉」的同步块的起点。
+/// 它内含唯一一处会命中选区的 `CSI K`(在第 22 行)。
+const ERASING_BLOCK: &[u8] = b"\x1b[?2026h\x1b[H\r\x1b[16B";
+
+/// 把 fixture 切成「擦行之前 / 擦行及其之后」两段。
+fn compact_split() -> (Vec<u8>, Vec<u8>) {
+    let bytes = fixture_bytes(COMPACT);
+    let at = bytes
+        .windows(ERASING_BLOCK.len())
+        .position(|w| w == ERASING_BLOCK)
+        .expect("fixture 里应当有那个擦行的同步块");
+    (bytes[..at].to_vec(), bytes[at..].to_vec())
+}
+
+/// 在第 18~24 行上拉一段跨行选区(转圈行 22 落在中间)。
+fn drag_across_the_spinner(emu: &mut Emulator) -> String {
+    emu.selection_start(2, 18, SelectionKind::Simple, CellSide::Left);
+    emu.selection_update(20, 24, CellSide::Right);
+    emu.selection_text().expect("这几行上应当有可选的文本")
+}
+
+/// F212:**擦一行会把整段跨行选区全丢掉,连没被碰过的行一起。**
+///
+/// 字节流录自 `tmux -x 120 -y 30` 里跑 Claude Code 执行 `/compact`(pipe-pane 抓
+/// pane 输出)。流里唯一一处 `CSI K` 落在第 22 行——那是转圈提示行,任务转完就
+/// 擦掉。而用户此刻按着左键从第 18 行拖到第 24 行想复制上面的输出。
+///
+/// alacritty 的 `clear_line` 判据是 `!s.intersects_range(擦掉的那几格)`:**沾边
+/// 就整段丢**。于是 18~21 行那些根本没被碰过的高亮也一起没了,用户看到的就是
+/// 「高亮出现又被冲掉」。更要命的是 [`Emulator::selection_update`] 在 `None` 上是
+/// 静默 no-op —— 拖到天涯海角也回不来,只能松手重按;而 `/compact` 期间它每秒
+/// 擦好几次,等于**整个划选功能在这段时间里不可用**。
+///
+/// 自证会变红:把 `Emulator::feed` 里那段补回逻辑删掉,下半场立刻退化成上半场。
+#[test]
+fn a_repaint_that_erases_one_line_must_not_take_the_whole_held_selection_with_it() {
+    let (before, after) = compact_split();
+
+    // 上半场:不按住 —— 这是 alacritty 的原生行为,钉住它才知道补偿在补什么。
+    let mut loose = Emulator::new(COMPACT_COLS, COMPACT_ROWS);
+    loose.feed(&before);
+    let wanted = drag_across_the_spinner(&mut loose);
+    loose.feed(&after);
+    assert_eq!(
+        loose.selection_text(),
+        None,
+        "上游 alacritty 的行为变了(不再因擦行丢选区),F212 的补偿要重新评估"
+    );
+
+    // 下半场:按住左键 —— 选区是本地意图,远端擦行无权取消。
+    let mut held = Emulator::new(COMPACT_COLS, COMPACT_ROWS);
+    held.feed(&before);
+    let same = drag_across_the_spinner(&mut held);
+    assert_eq!(same, wanted, "两场的起点必须一致,否则下面比的不是同一件事");
+    held.hold_selection(true);
+    held.feed(&after);
+    let survived = held
+        .selection_text()
+        .expect("按住左键时,远端擦掉一行不该把整段选区冲掉");
+
+    // 第 22 行确实被擦空了,所以文本不会与擦行前逐字相同;但没被碰过的
+    // 第 18 行必须原样还在——这正是用户丢掉的那部分。
+    let first_line = wanted.lines().next().unwrap();
+    assert!(
+        survived.contains(first_line),
+        "没被擦到的行也丢了。期望仍含 {first_line:?},实得 {survived:?}"
+    );
+}
+
+/// F212 的边界:松手之后远端再擦行,选区就该正常消失 —— 补偿只在按住期间生效,
+/// 不是「选区从此永生」。挂住的 hold 会让这个 pane 的选区再也擦不掉。
+#[test]
+fn once_the_button_is_up_an_erase_clears_the_selection_again() {
+    let (before, after) = compact_split();
+    let mut emu = Emulator::new(COMPACT_COLS, COMPACT_ROWS);
+    emu.feed(&before);
+    drag_across_the_spinner(&mut emu);
+    emu.hold_selection(true);
+    emu.hold_selection(false);
+    emu.feed(&after);
+    assert_eq!(emu.selection_text(), None, "松手后不该再兜底");
 }

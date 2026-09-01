@@ -129,6 +129,8 @@ pub struct Emulator {
     /// 夹过的值当基准,历史就被单向砍没了、回不来。所以原始诉求要留着,
     /// 每次列数变化都拿它重夹一次。
     requested_history: usize,
+    /// F212:用户此刻正按着左键划选。见 [`Emulator::hold_selection`]。
+    selection_held: bool,
 }
 
 impl Emulator {
@@ -184,6 +186,7 @@ impl Emulator {
             osc7: Osc7Sniffer::default(),
             cwd: None,
             requested_history: history,
+            selection_held: false,
         }
     }
 
@@ -258,7 +261,38 @@ impl Emulator {
         if let Some(cwd) = self.osc7.feed(bytes) {
             self.cwd = Some(cwd);
         }
+        // F212:按住左键期间给选区留底。alacritty 在 EL/ED(`CSI K` 等)命中
+        // 选区所跨的**任意**一行时,会把整段选区丢成 `None` —— 连没被碰过的行
+        // 一起。全屏 TUI 每次重绘都擦几行,用户拖着拖着高亮就没了。
+        // 见 [`Emulator::hold_selection`]。
+        let saved = if self.selection_held {
+            self.term.selection.clone()
+        } else {
+            None
+        };
         self.parser.advance(&mut self.term, bytes);
+        // 只在被丢空时补回:滚动路径上 alacritty 走的是 `rotate`,结果仍是
+        // `Some`,那是**正确**的跟随行为,不能拿旧坐标盖掉。
+        if saved.is_some() && self.term.selection.is_none() {
+            self.term.selection = saved;
+        }
+    }
+
+    /// 告诉仿真器「用户此刻正按着左键划选」。
+    ///
+    /// **F212。** 划选是纯本地意图,远端输出无权取消它。但 alacritty 把「这行被
+    /// 擦过」等同于「整段选区作废」:`clear_line`/`clear_screen` 一律
+    /// `take().filter(|s| !s.intersects_range(..))` —— **沾边就整段丢**。
+    /// Claude Code 这类 TUI 重绘时每秒要擦好几行(`/compact` 的转圈行就是),
+    /// 于是拖拽中的选区被反复清空;而 [`Emulator::selection_update`] 在 `None`
+    /// 上是**静默 no-op**,拖再远也回不来,用户只能松手重按。开着这个开关,
+    /// [`Emulator::feed`] 会在被丢空时把选区补回去。
+    ///
+    /// 已知取舍:同一次 `feed` 里**既滚屏又擦行**时,补回去的是没跟着滚的旧
+    /// 坐标,会错位一行。接受它 —— 这类全屏 TUI 用绝对定位重绘、不滚屏;而
+    /// 漏掉这个补偿的代价(整段划选在重绘期间不可用)大得多。
+    pub fn hold_selection(&mut self, held: bool) {
+        self.selection_held = held;
     }
 
     /// 当前同步块(DEC 2026)的超时时刻。`None` = 没有在进行中的同步块。
@@ -548,6 +582,7 @@ impl Emulator {
     /// 清除选区(点空白、按键、断开连接时调)。
     pub fn selection_clear(&mut self) {
         self.term.selection = None;
+        self.selection_held = false;
     }
 
     /// 当前选区文本。宽字符、行尾空格裁剪、跨 scrollback 拼接都由上游
@@ -1030,6 +1065,45 @@ mod tests {
         assert!(emu.selection_text().is_some());
         emu.selection_clear();
         assert_eq!(emu.selection_text(), None);
+    }
+
+    /// F212:补偿只能补「被丢成 `None`」这一种,不能盖掉 alacritty 的**跟随滚动**。
+    ///
+    /// 新行推上来时 alacritty 走 `selection.take().and_then(|s| s.rotate(..))`,
+    /// 结果仍是 `Some`,只是坐标往上挪了一行——那是正确行为。留底若无条件盖回去,
+    /// 选区就会钉死在屏幕位置上,滚一行就选中别的文本(F18 头号坑的另一种走法)。
+    #[test]
+    fn holding_the_button_does_not_freeze_the_selection_against_scrolling() {
+        let mut emu = Emulator::new(20, 2);
+        emu.feed(b"alpha\r\nbravo");
+        emu.selection_start(0, 0, SelectionKind::Simple, CellSide::Left);
+        emu.selection_update(4, 0, CellSide::Right);
+        assert_eq!(emu.selection_text().as_deref(), Some("alpha"));
+        emu.hold_selection(true);
+        emu.feed(b"\r\ncharlie");
+        assert_eq!(
+            emu.selection_text().as_deref(),
+            Some("alpha"),
+            "选区该跟着内容滚上去;盖回旧坐标的话选中的会是 bravo"
+        );
+    }
+
+    /// F212 兜底:显式清除比「还按着」强。丢了 `Released` 事件时,挂住的 hold
+    /// 会让远端此后永远擦不掉这个 pane 的选区,`selection_clear` 是唯一的解。
+    #[test]
+    fn clearing_the_selection_also_lets_go_of_the_hold() {
+        let mut emu = Emulator::new(20, 2);
+        emu.feed(b"alpha\r\nbravo");
+        emu.selection_start(0, 0, SelectionKind::Simple, CellSide::Left);
+        emu.selection_update(4, 0, CellSide::Right);
+        emu.hold_selection(true);
+        emu.selection_clear();
+        // 重新划一段但**不**再按住,擦行就该正常把它冲掉。
+        emu.selection_start(0, 0, SelectionKind::Simple, CellSide::Left);
+        emu.selection_update(4, 0, CellSide::Right);
+        assert!(emu.selection_text().is_some());
+        emu.feed(b"\x1b[1;1H\x1b[K");
+        assert_eq!(emu.selection_text(), None, "hold 没被 clear 撤掉");
     }
 
     #[test]
