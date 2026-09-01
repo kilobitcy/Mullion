@@ -339,6 +339,10 @@ impl russh_sftp::server::Handler for SftpHandler {
         len: u32,
     ) -> Result<russh_sftp::protocol::Data, Self::Error> {
         let path = self.files.get(&handle).ok_or(StatusCode::Failure)?.clone();
+        // F214:READ 也记探针。READ 在客户端是**串行**的,次数就是往返数 ——
+        // 「打开一个文件要好几秒」这类实报只能从这个数上被证伪或坐实,
+        // 而本机往返为零,不数次数就永远量不到。
+        self.note("read", &path);
         let (dir, name) = split_last(path.as_bytes());
         let tree = self.tree.lock().unwrap();
         let node = tree

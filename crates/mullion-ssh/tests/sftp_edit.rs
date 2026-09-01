@@ -77,12 +77,16 @@ async fn reading_a_whole_file_yields_every_byte_across_many_chunks() {
         common::spawn_sftp_server(tree_with(vec![Node::file_with(b"conf.txt", &want)])).await;
     let sftp = client(addr).await;
 
-    let got = sftp
-        .read_all(&rp("/home/testuser/conf.txt"), 1024 * 1024)
+    let (got, timing) = sftp
+        .read_all(&rp("/home/testuser/conf.txt"), 1024 * 1024, None)
         .await
         .expect("read_all");
     assert_eq!(got.len(), want.len(), "长度对不上说明分块循环漏了一段");
     assert_eq!(got, want);
+    assert!(
+        timing.reads >= 2,
+        "300 KB 一次 READ 读不完,分块循环没跑起来"
+    );
 }
 
 /// 上限必须**边读边判**:读完再看长度的话,一个几 GB 的文件会在「拒绝」
@@ -95,7 +99,7 @@ async fn a_file_over_the_limit_is_refused_with_a_reason_instead_of_filling_memor
     let sftp = client(addr).await;
 
     let err = sftp
-        .read_all(&rp("/home/testuser/huge.bin"), 64 * 1024)
+        .read_all(&rp("/home/testuser/huge.bin"), 64 * 1024, None)
         .await
         .expect_err("超限该拒绝");
     assert!(
@@ -104,8 +108,8 @@ async fn a_file_over_the_limit_is_refused_with_a_reason_instead_of_filling_memor
     );
     // 反面:同一个文件在上限之内必须读得回来 —— 判据写反了(比如恒拒绝)
     // 上面那条照样绿。
-    let ok = sftp
-        .read_all(&rp("/home/testuser/huge.bin"), 1024 * 1024)
+    let (ok, _) = sftp
+        .read_all(&rp("/home/testuser/huge.bin"), 1024 * 1024, None)
         .await
         .expect("上限之内该读得回来");
     assert_eq!(ok, big);
@@ -163,7 +167,10 @@ async fn a_remote_changed_behind_our_back_is_refused_without_touching_a_single_b
     let path = rp("/home/testuser/nginx.conf");
 
     // 打开:内容 + 那一刻的戳。
-    let got = sftp.read_all(&path, 1024 * 1024).await.expect("read_all");
+    let (got, _) = sftp
+        .read_all(&path, 1024 * 1024, None)
+        .await
+        .expect("read_all");
     assert_eq!(got, orig);
     let st = sftp.stat(&path).await.expect("stat");
     let snapshot = (st.mtime, st.size);
@@ -259,4 +266,101 @@ async fn writing_back_a_large_buffer_stores_every_byte() {
     let got = stored(&tree, b"data.bin");
     assert_eq!(got.len(), want.len());
     assert_eq!(got, want);
+}
+
+/// F214:**知道大小就少发一次 READ。**
+///
+/// SFTP 的 READ 在 `russh_sftp` 里是串行的(对照 WRITE 有
+/// `max_concurrent_writes`,READ 没有对应项)。本项目的主场景是高延迟代理
+/// 链路,于是「打开一个几十 KB 的配置文件要等好几秒」几乎完全等于**发了几次
+/// READ** —— 与文件大小无关。而其中有一次是纯浪费:不告诉读循环文件多大,
+/// 它只能一直读到服务端回 `EOF` 才知道到头了,那次什么都没读到的往返和一次
+/// 真读一样贵。
+///
+/// 判据是**服务端见过几次 READ**,不是返回值。只断言「内容对」是恒绿的:
+/// 多问一次 EOF 的实现同样把每个字节都读回来了。
+///
+/// 自证会变红:把 `read_all` 里 `expect == Some(out.len() as u64)` 那条提前
+/// 收手的分支删掉 —— 带 hint 那一轮立刻变回 2 次。
+#[tokio::test]
+async fn knowing_the_size_up_front_saves_the_round_trip_that_only_asks_for_eof() {
+    let want = payload(30_000, 251);
+    let (addr, probe, _tree) =
+        common::spawn_sftp_server(tree_with(vec![Node::file_with(b"app.conf", &want)])).await;
+    let sftp = client(addr).await;
+    let path = rp("/home/testuser/app.conf");
+
+    // 不给 hint:一次读回全部,再多问一次才知道是 EOF。
+    let (blind, t_blind) = sftp
+        .read_all(&path, 1024 * 1024, None)
+        .await
+        .expect("read_all");
+    assert_eq!(blind, want);
+    assert_eq!(
+        t_blind.reads, 2,
+        "没有 hint 时必须多问一次 EOF,不然下面没得比"
+    );
+    let blind_reads = probe.lock().unwrap().paths_for("read").len();
+
+    // 给 hint:读满就收手。
+    let (hinted, t_hinted) = sftp
+        .read_all(&path, 1024 * 1024, Some(want.len() as u64))
+        .await
+        .expect("read_all");
+    assert_eq!(hinted, want, "省掉那次往返不能少读一个字节");
+    assert_eq!(t_hinted.reads, 1, "知道大小之后一次 READ 就该够");
+    let total_reads = probe.lock().unwrap().paths_for("read").len();
+    assert_eq!(
+        total_reads - blind_reads,
+        1,
+        "服务端侧也要少收一次 READ —— 只信客户端自报的计数,埋点错了看不出来"
+    );
+}
+
+/// F214 的兜底:`expect` 会过期。列目录之后文件被改**大**了,提前收手就会
+/// 静默截断 —— 判据写成 `>=` 而不是 `==` 时正是这样炸的(第一次读满就收手,
+/// 后面的字节永远拿不到,而用户看到的是一份「打开成功」的残文件)。
+#[tokio::test]
+async fn a_stale_size_hint_never_truncates_because_it_must_match_exactly() {
+    let actual = payload(300_000, 251);
+    let (addr, _probe, _tree) =
+        common::spawn_sftp_server(tree_with(vec![Node::file_with(b"grown.bin", &actual)])).await;
+    let sftp = client(addr).await;
+
+    // 列目录时它还只有 100 KB。
+    let (got, _) = sftp
+        .read_all(&rp("/home/testuser/grown.bin"), 1024 * 1024, Some(100_000))
+        .await
+        .expect("read_all");
+    assert_eq!(got.len(), actual.len(), "hint 过期时必须照常读到 EOF");
+    assert_eq!(got, actual);
+}
+
+/// F214:缓冲区必须够大,否则每次往返只捞回四分之一。
+///
+/// `File::poll_read` 取 `min(buf.remaining(), max_read_len)`,而 `max_read_len`
+/// 默认是 `max_packet_len - 9` = 262135。缓冲区留在 64 KiB 的话,一个 300 KB
+/// 的文件要 5 次串行 READ;给到 256 KiB 只要 2 次。
+///
+/// 自证会变红:把 `read_all` 里的 `256 * 1024` 改回 `64 * 1024`。
+#[tokio::test]
+async fn one_round_trip_hauls_a_whole_packet_not_a_quarter_of_one() {
+    let want = payload(300_000, 251);
+    let (addr, _probe, _tree) =
+        common::spawn_sftp_server(tree_with(vec![Node::file_with(b"big.conf", &want)])).await;
+    let sftp = client(addr).await;
+
+    let (got, timing) = sftp
+        .read_all(
+            &rp("/home/testuser/big.conf"),
+            1024 * 1024,
+            Some(want.len() as u64),
+        )
+        .await
+        .expect("read_all");
+    assert_eq!(got, want);
+    assert_eq!(
+        timing.reads, 2,
+        "300 KB 该是「读满一包 + 读完尾巴」两次往返;变多说明缓冲区又被调小了"
+    );
 }

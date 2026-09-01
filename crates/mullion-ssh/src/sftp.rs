@@ -438,19 +438,59 @@ impl SftpClient {
     ///
     /// 与传输通路的分块循环刻意分开:那条要报进度、要能取消、要落盘;
     /// 这条只服务「打开来改一改」,全量在内存里反而让调用方简单一个数量级。
-    pub async fn read_all(&self, path: &RemotePath, limit: u64) -> Result<Vec<u8>, SftpError> {
+    ///
+    /// # F214:往返数才是成本
+    ///
+    /// SFTP 的 READ 在 `russh_sftp` 里是**串行**的(没有 `max_concurrent_reads`,
+    /// 对照 WRITE 有 `max_concurrent_writes` —— 这正是设计 D8 说「下载受串行
+    /// READ 拖累」的由来)。本项目的主场景是高延迟代理链路,于是「打开一个
+    /// 文件要等多久」几乎完全等于**发了几次 READ**,与文件大小基本无关。
+    /// 两处各省一大截:
+    ///
+    /// - **缓冲区 64 KiB → 256 KiB**。`File::poll_read`
+    ///   (`russh-sftp-2.4.0/src/client/fs/file.rs:179`)取
+    ///   `min(buf.remaining(), max_read_len)`,而 `max_read_len` 默认是
+    ///   `max_packet_len - 9` = 262135(OpenSSH 通过 `limits@openssh.com` 报
+    ///   255 KiB)。缓冲区给成 64 KiB 等于自愿把每次往返的收获砍掉四分之三 ——
+    ///   一个 1 MB 的文件要 16 次串行 READ。
+    /// - **`expect` 省掉「只为问一句 EOF」的那次空往返**。不给它,循环只能一直
+    ///   读到服务端回 `EOF` 才知道到头了,而那次什么都没读到的 READ 在慢链路上
+    ///   和一次真读一样贵。几十 KB 的配置文件因此从 2 次 READ 降到 1 次。
+    ///
+    /// `expect` 是调用方从目录列表里已经知道的大小,**可以过期**。所以只在读到
+    /// 的字节数与它**严丝合缝**时才提前收手:列目录之后文件被改大的话,
+    /// `out.len()` 会停在某次读满的位置、对不上 `expect`,于是照常读到 EOF。
+    /// 判据写成 `>=` 就会在「文件变大了、而第一次读恰好读满」时静默截断 ——
+    /// 用户拿到的是一份「打开成功」的残文件,存回去就把尾巴削掉了。
+    pub async fn read_all(
+        &self,
+        path: &RemotePath,
+        limit: u64,
+        expect: Option<u64>,
+    ) -> Result<(Vec<u8>, ReadTiming), SftpError> {
+        let t_open = std::time::Instant::now();
         let mut file = self.open_read(path).await?;
+        let mut timing = ReadTiming {
+            open_us: t_open.elapsed().as_micros() as u64,
+            ..Default::default()
+        };
         let mut out = Vec::new();
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; 256 * 1024];
+        let t_read = std::time::Instant::now();
         loop {
             let n = file.read_chunk(&mut buf).await?;
+            timing.reads += 1;
+            timing.read_us = t_read.elapsed().as_micros() as u64;
             if n == 0 {
-                return Ok(out);
+                return Ok((out, timing));
             }
             if out.len() as u64 + n as u64 > limit {
                 return Err(SftpError::TooLarge(limit));
             }
             out.extend_from_slice(&buf[..n]);
+            if n < buf.len() && expect == Some(out.len() as u64) {
+                return Ok((out, timing));
+            }
         }
     }
 
@@ -528,6 +568,23 @@ impl SftpClient {
 /// **必须 `finish()` 收尾**:`russh_sftp` 的 `File` 有 Drop 兜底
 /// (`close_nowait`),但那条关闭请求没人等应答 —— 上传完立刻去 rename
 /// 会撞上「文件还开着」,而失败信息只会说「改名失败」,查不到根上。
+/// 一次 [`SftpClient::read_all`] 的分段耗时(F214)。
+///
+/// 存在的理由是「打开一个远端文件要好几秒」这类实报**在本机永远复现不了**:
+/// 慢的是往返,而无头容器里往返是零。把段落时间和**往返次数**一起报出来,
+/// 用户在真机上跑一次就能指认是哪一段 —— 而不是我们隔空猜。
+///
+/// `reads` 是这里面最要紧的那个数:READ 串行,次数即往返数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadTiming {
+    /// OPEN 那一次往返。
+    pub open_us: u64,
+    /// 全部 READ 合计。
+    pub read_us: u64,
+    /// 发出去的 READ 次数。
+    pub reads: u32,
+}
+
 pub struct RemoteFile {
     file: russh_sftp::client::fs::File,
 }

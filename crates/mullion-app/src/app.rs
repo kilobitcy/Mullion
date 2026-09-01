@@ -4563,6 +4563,9 @@ impl App {
             mark_ui_dirty!(self.ui_dirty);
             return;
         }
+        // F214:列目录时已经知道的大小。带上它,读循环就不必再多发一次
+        // 「问 EOF」的空往返 —— 高延迟链路上那一次和一次真读一样贵。
+        let expect = Some(e.size);
         let remote = state.cwd.join(cur.as_bytes());
         let Some(client) = tab.content.sftp_client() else {
             self.ui
@@ -4573,7 +4576,7 @@ impl App {
         let proxy = self.proxy.clone();
         let path = remote.clone();
         let task = self._runtime.spawn(async move {
-            let result = read_for_edit(&client, &path, limit).await;
+            let result = read_for_edit(&client, &path, limit, expect).await;
             let _ = proxy.send_event(UserEvent::EditOpened {
                 generation,
                 kind,
@@ -10815,19 +10818,38 @@ async fn write_back(
 /// 描述我们手上这份内容对应的那个版本。读之前 stat 的话,读的过程中(几十
 /// MB 走高延迟链路可能好几秒)对方改了文件,我们会拿着旧戳 + 撕裂的内容,
 /// 回传时判定「没人动过」直接覆盖 —— 那正是这套机制要防的事。
+/// F214:`expect` 是列目录时已经知道的大小,用来省掉「问一次 EOF」那次空往返
+/// (判据与兜底见 [`mullion_ssh::sftp::SftpClient::read_all`])。
 async fn read_for_edit(
     client: &mullion_ssh::sftp::SftpClient,
     path: &mullion_ssh::sftp::RemotePath,
     limit: u64,
+    expect: Option<u64>,
 ) -> Result<(Vec<u8>, crate::edit::sessions::RemoteStamp), String> {
-    let bytes = client
-        .read_all(path, limit)
+    let t0 = std::time::Instant::now();
+    let (bytes, timing) = client
+        .read_all(path, limit, expect)
         .await
         .map_err(|e| format!("读取文件失败:{e}"))?;
+    let t_stat = std::time::Instant::now();
     let st = client
         .stat(path)
         .await
         .map_err(|e| format!("读取文件属性失败:{e}"))?;
+    // F214 埋点:「打开一个几十 KB 的文件要好几秒」这类实报在无头容器里
+    // 复现不了 —— 慢的是往返,而本机往返是零。把段落 + **往返次数**一起报,
+    // 用户在真机上跑一次就能指认是哪一段。`reads` 是关键:READ 串行,
+    // 次数即往返数;它没降下来,说明 `expect` 那条捷径没走上。
+    log::info!(
+        target: "mullion",
+        "编辑打开:open={}ms read={}ms×{} stat={}ms total={}ms bytes={}",
+        timing.open_us / 1000,
+        timing.read_us / 1000,
+        timing.reads,
+        t_stat.elapsed().as_millis(),
+        t0.elapsed().as_millis(),
+        bytes.len(),
+    );
     Ok((bytes, (st.mtime, st.size)))
 }
 
