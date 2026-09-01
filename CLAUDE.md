@@ -48,6 +48,7 @@ mullion-app      winit + wgpu + glyphon(终端自绘)+ egui(外壳:菜单/状态
 |---|---|---|---|
 | T1 | `Event::PtyWrite` 没回写 SSH channel | 同步输出探测无应答 → 全屏 TUI 闪；鼠标全废；光标查询永久卡死 | `emulator::tests::pty_write_is_collected` |
 | T2 | 收到 `CSI ? 2026 h` 后没攒帧 | 流式输出时撕裂、抖动 | `render::tests::sync_update_defers_present` |
+| T2' | 以为「实现了攒帧」就等于攒帧生效了 | **tmux 只在外层终端登记了 `sync` 特性时才把内层的 BSU/ESU 往外发，否则整个吞掉**。我们报 `xterm-256color`，不在 tmux 内置特性表里 —— T2 的攒帧在主场景（tmux）下**从来没生效过**，而且客户端侧一切正常、零报错，只有拿 `script` 抓字节流数 BSU 才看得见。登记必须在 attach **之前**（运行期改对已 attach 的 client 无效），必须是独立 shell 语句（串进同一次 tmux 调用的话，老 tmux 上 set 失败会中止后面全部命令），必须写死数组下标（`set -a` 不去重，每次重连长一条） | `automation::tests` 四条（`the_sync_feature_is_registered_before_the_client_attaches` 等）；`session_map::tests::the_term_we_ask_the_pty_for_is_the_one_we_register_tmux_sync_against` |
 | T3 | 喂数据和重绘没解耦 | 每秒几千次重绘，GPU 空转、风扇起飞 | `app::tests::redraw_is_frame_capped` |
 | T4 | 分屏后没发 `window_change` | tmux 里的 TUI 按旧列数排版，全屏直接错行 | `app::tests::reflow_emits_resize` |
 | T5 | 鼠标上报没有 Shift 逃生门 | `/tui fullscreen` 下用户永远无法划选复制 | `keymap::tests::shift_blocks_mouse_report_so_user_can_copy` |
