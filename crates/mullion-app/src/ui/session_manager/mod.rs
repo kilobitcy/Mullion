@@ -632,7 +632,7 @@ pub fn show(
             // §3.1 降级:没有会话库时不画双栏,只给一句话,避免用户对着空表单填半天。
             if !store_available {
                 ui.colored_label(
-                    theme::c32(t.danger),
+                    theme::c32(t.danger_text),
                     "会话库不可用,无法读写会话(详见状态栏错误)。",
                 );
                 return;
@@ -1040,6 +1040,8 @@ pub(super) fn secret_edit(
         if *touched && value.is_empty() {
             ui.colored_label(theme::c32(t.warn), "留空 = 清除已存凭据");
         } else if !*touched && has_stored {
+            // 弹窗外:这一句画在会话管理器主窗里,那个窗自带
+            // `.frame(..fill(bar_status))`(#181b26),`fg_dimmer` 在它上面 5.71:1。
             ui.colored_label(theme::c32(t.fg_dimmer), "已设置(不修改则保持不变)");
         }
     });
@@ -1576,7 +1578,7 @@ mod tunnel_ui_tests {
     /// 正是他接下来唯一要做的事。
     ///
     /// 自证变红的方式:把 `credential_editor::show` 里那句
-    /// `ui.colored_label(theme::c32(t.danger), msg)` 删掉。
+    /// `ui.colored_label(theme::c32(t.danger_text), msg)` 删掉。
     #[test]
     fn deleting_a_referenced_credential_is_blocked_and_names_the_holders() {
         use mullion_store::{Auth, CredentialId};

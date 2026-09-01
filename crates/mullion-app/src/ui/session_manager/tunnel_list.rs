@@ -203,7 +203,7 @@ fn row(
                 ui_state.tunnel_editor = Some(buf);
             }
             let sub_color = if dangling {
-                theme::c32(t.danger)
+                theme::c32(t.danger_text)
             } else {
                 theme::c32(t.fg_dimmer)
             };
@@ -214,7 +214,7 @@ fn row(
                 let color = match state {
                     Some(TunnelState::Running) => theme::c32(t.ok),
                     Some(TunnelState::Failed(_)) | Some(TunnelState::Stopped) => {
-                        theme::c32(t.danger)
+                        theme::c32(t.danger_text)
                     }
                     _ => theme::c32(t.warn),
                 };

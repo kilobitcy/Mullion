@@ -354,10 +354,10 @@ pub fn show(
         ui.separator();
 
         if s.confirm_close {
-            ui.colored_label(theme::c32(t.danger), "有未保存的修改,关掉就没了。");
+            ui.colored_label(theme::c32(t.danger_text), "有未保存的修改,关掉就没了。");
             ui.horizontal(|ui| {
                 if ui
-                    .button(egui::RichText::new("丢弃并关闭").color(theme::c32(t.danger)))
+                    .button(egui::RichText::new("丢弃并关闭").color(theme::c32(t.danger_text)))
                     .clicked()
                 {
                     action = Some(EditorAction::Close(s.key));

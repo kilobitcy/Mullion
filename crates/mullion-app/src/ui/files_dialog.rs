@@ -236,7 +236,7 @@ fn name_field(ui: &mut egui::Ui, t: &Theme, name: &mut String) -> bool {
     match validate_name(name) {
         Ok(()) => true,
         Err(why) => {
-            ui.colored_label(theme::c32(t.danger), why);
+            ui.colored_label(theme::c32(t.danger_text), why);
             false
         }
     }
@@ -286,7 +286,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
         }
         FilesDialog::Delete { targets } => {
             let x = modal(ctx, "删除", |ui| {
-                ui.colored_label(theme::c32(t.danger), delete_summary(targets));
+                ui.colored_label(theme::c32(t.danger_text), delete_summary(targets));
                 // 「没有回收站」必须写在框里。用户在本地删东西是有后悔药的,
                 // 那个心智模型会被原样带到这儿来(设计 D17)。
                 ui.label(
@@ -305,7 +305,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                     // 按钮写「删除」不写「确定」(F119 危险措辞)——「确定」
                     // 在一个列着 40 条路径的框里说明不了用户到底确定了什么。
                     if ui
-                        .button(egui::RichText::new("删除").color(theme::c32(t.danger)))
+                        .button(egui::RichText::new("删除").color(theme::c32(t.danger_text)))
                         .clicked()
                     {
                         op = Some(FileOp::Delete {
@@ -387,7 +387,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                     }
                     // 「覆盖远端」标危险色(F119):三条里唯一会毁数据的。
                     if ui
-                        .button(egui::RichText::new("覆盖远端").color(theme::c32(t.danger)))
+                        .button(egui::RichText::new("覆盖远端").color(theme::c32(t.danger_text)))
                         .clicked()
                     {
                         op = Some(FileOp::ResolveEdit {
@@ -429,7 +429,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 ui.horizontal(|ui| {
                     // 「覆盖」标危险色(F119):它是这四个里唯一会毁数据的。
                     if ui
-                        .button(egui::RichText::new("覆盖").color(theme::c32(t.danger)))
+                        .button(egui::RichText::new("覆盖").color(theme::c32(t.danger_text)))
                         .clicked()
                     {
                         op = Some(FileOp::Resolve {
@@ -480,37 +480,21 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
 mod tests {
     use super::*;
 
-    /// F203:弹窗里的次要文字必须用比 `fg_dim` 亮一档的 `fg_muted`。
+    /// F203 那条「弹窗次要文字必须用 `fg_muted`」的闸门**搬走了**,不在这里了。
     ///
-    /// 底色从 `bar_status` 抬到 `modal_bg` 之后,`fg_dim` 在上面只剩约
-    /// 4.1:1、掉出 WCAG AA(算式见
-    /// `theme::tests::the_secondary_text_token_used_in_dialogs_still_clears_aa_on_the_new_fill`)。
-    /// 这条盯的是**调用点**——色板那条只证明「亮一档的那个 token 达标」,
-    /// 证明不了这两个文件真的换过去了。
+    /// 原版是列举式的:一个写死的 `[("files_dialog.rs", ..), ("editor_window.rs", ..)]`
+    /// 数组。写下它的时候只有这两个文件用了 `fg_muted`,于是另外五个弹窗文件
+    /// (settings / import_dialog / edit_panel / history / host_key)共 13 处
+    /// 一直漏在闸门外,一年后还是老样子 —— 「列举式门控在加档时必然漏」。
     ///
-    /// 扎源码而不是数像素:两个文件里这些标签的实际颜色要从 egui 的形状树
-    /// 里反解,得先知道每句文案,那等于把文案抄进测试,改一个字就红。
+    /// F213 改成从源码现算弹窗清单的穷尽式守护:
+    /// `tests/dialog_contrast.rs::nothing_drawn_on_the_dialog_fill_uses_a_token_that_fails_aa_on_it`。
+    /// 这里只留这句指路,别再往回加文件名数组。
     ///
-    /// 自证会变红:把任意一处 `t.fg_muted` 改回 `t.fg_dim`。
-    #[test]
-    fn dialogs_use_the_brighter_secondary_token_because_the_fill_got_lighter() {
-        for (name, src) in [
-            ("files_dialog.rs", include_str!("files_dialog.rs")),
-            ("editor_window.rs", include_str!("editor_window.rs")),
-        ] {
-            let prod = src.split("#[cfg(test)]").next().expect("源码切歪了");
-            assert!(
-                !prod.contains("t.fg_dim"),
-                "{name} 的弹窗正文还在用 fg_dim/fg_dimmer —— 在 modal_bg(#3f3f3f)\
-                 上它掉到 4.1:1,不到 AA"
-            );
-            assert!(
-                prod.contains("t.fg_muted"),
-                "{name} 一处 fg_muted 都没有 —— 上一条断言于是什么也没守住\
-                 (把颜色全删光同样能让它绿)"
-            );
-        }
-    }
+    /// 色板侧的算式仍在
+    /// `theme::tests::the_secondary_text_token_used_in_dialogs_still_clears_aa_on_the_new_fill`。
+    #[allow(dead_code)]
+    const F203_GATE_MOVED_TO_DIALOG_CONTRAST_TEST: () = ();
 
     fn rp(s: &str) -> RemotePath {
         RemotePath::from_bytes(s.as_bytes().to_vec())

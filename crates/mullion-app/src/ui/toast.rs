@@ -13,9 +13,40 @@ use crate::theme::{self, Theme};
 /// 一条 toast 的存活时长(秒)。
 pub const TTL: f64 = 3.0;
 
+/// F213:这一条说的是哪一档事。
+///
+/// 原来边框无论内容一律画 `ok` 绿 —— 「正在上传截图…」(还没落地)和
+/// 「隧道已停止:连接被拒」(降级了)都镶一圈成功色,颜色在说谎。
+/// 三档都是**非文字**元素(1px 边框),判据是 3:1,不是 4.5:1。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// 进行中,结果未知(「正在打开…」)。
+    Busy,
+    /// 干成了。
+    Ok,
+    /// 做完了,但有失败或降级(「3 条已连接,1 条失败」)。
+    ///
+    /// 注意与 `set_error` 的分工:要用户**处理**的失败走错误卡片,飘一下就
+    /// 没了的这里只管「结果打了折,你知道一下」。
+    Warn,
+}
+
+impl Kind {
+    /// 边框色。三档在 `modal_bg`(#3f3f3f)上分别是 4.11 / 6.17 / 5.59,
+    /// 都过了非文字 3:1 的门槛。
+    pub fn stroke(self, t: &Theme) -> mullion_term::snapshot::Rgb {
+        match self {
+            Kind::Busy => t.info,
+            Kind::Ok => t.ok,
+            Kind::Warn => t.warn,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Toast {
     pub text: String,
+    pub kind: Kind,
     /// 进场时的帧时间。
     pub born: f64,
 }
@@ -33,12 +64,16 @@ pub fn remaining(toast: &Toast, now: f64) -> f64 {
 pub fn show(
     ctx: &egui::Context,
     t: &Theme,
-    pending: &mut Option<String>,
+    pending: &mut Option<(Kind, String)>,
     live: &mut Option<Toast>,
 ) {
     let now = ctx.input(|i| i.time);
-    if let Some(text) = pending.take() {
-        *live = Some(Toast { text, born: now });
+    if let Some((kind, text)) = pending.take() {
+        *live = Some(Toast {
+            text,
+            kind,
+            born: now,
+        });
     }
     let Some(toast) = live.as_ref() else {
         return;
@@ -59,9 +94,12 @@ pub fn show(
         .interactable(false)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
+            // F213:底色与弹窗同源。原来蹭的是 `sunken_bg`(#0e1018),在
+            // 终端底色(#14161f)上只有 1.05:1 —— 一块飘在正文之上、却几乎
+            // 看不出边界的浮层。F203 把弹窗从这个坑里捞出来时漏了 toast。
             egui::Frame::none()
-                .fill(theme::c32(t.sunken_bg))
-                .stroke(egui::Stroke::new(1.0, theme::c32(t.ok)))
+                .fill(theme::c32(t.modal_bg))
+                .stroke(egui::Stroke::new(1.0, theme::c32(toast.kind.stroke(t))))
                 .rounding(8.0)
                 .inner_margin(egui::vec2(14.0, 8.0))
                 .show(ui, |ui| {
@@ -74,7 +112,12 @@ pub fn show(
 mod tests {
     use super::*;
 
-    fn run(ctx: &egui::Context, time: f64, pending: &mut Option<String>, live: &mut Option<Toast>) {
+    fn run(
+        ctx: &egui::Context,
+        time: f64,
+        pending: &mut Option<(Kind, String)>,
+        live: &mut Option<Toast>,
+    ) {
         let t = crate::theme::MULLION_DARK;
         let _ = ctx.run(
             egui::RawInput {
@@ -92,7 +135,7 @@ mod tests {
     #[test]
     fn a_toast_stamps_the_frame_clock_and_expires_on_its_own() {
         let ctx = egui::Context::default();
-        let mut pending = Some("已保存".to_string());
+        let mut pending = Some((Kind::Ok, "已保存".to_string()));
         let mut live = None;
 
         run(&ctx, 10.0, &mut pending, &mut live);
@@ -118,12 +161,12 @@ mod tests {
     #[test]
     fn a_live_toast_schedules_its_own_wakeup_but_an_empty_slot_does_not() {
         let ctx = egui::Context::default();
-        let mut pending = Some("已保存".to_string());
+        let mut pending = Some((Kind::Ok, "已保存".to_string()));
         let mut live = None;
         let t = crate::theme::MULLION_DARK;
         let frame = |ctx: &egui::Context,
                      time: f64,
-                     pending: &mut Option<String>,
+                     pending: &mut Option<(Kind, String)>,
                      live: &mut Option<Toast>| {
             let out = ctx.run(
                 egui::RawInput {

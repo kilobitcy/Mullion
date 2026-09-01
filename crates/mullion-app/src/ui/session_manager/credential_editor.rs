@@ -246,11 +246,11 @@ pub(super) fn show(
                     let (text, color) = if buf.key_touched && !buf.key_data.is_empty() {
                         ("已导入(未保存)", t.fg)
                     } else if buf.key_touched {
-                        ("已清除(未保存)", t.danger)
+                        ("已清除(未保存)", t.danger_text)
                     } else if presence.private_key {
                         ("已导入", t.fg)
                     } else {
-                        ("未设置 —— 请导入私钥文件", t.danger)
+                        ("未设置 —— 请导入私钥文件", t.danger_text)
                     };
                     ui.colored_label(theme::c32(color), text);
                 });
@@ -304,7 +304,7 @@ pub(super) fn show(
     // 红字列在按钮下面而不是 tooltip 里:tooltip 要悬停才看得到,而「谁在用」
     // 正是用户接下来要去改的清单。
     if let Some(msg) = blocked {
-        ui.colored_label(theme::c32(t.danger), msg);
+        ui.colored_label(theme::c32(t.danger_text), msg);
     }
 }
 

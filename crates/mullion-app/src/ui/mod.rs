@@ -297,7 +297,7 @@ pub struct UiState {
     /// 走查 13:等着进场的 toast 文本。生产端(`app.rs` 施加意图那一段)拿不到
     /// `egui::Context`,也就拿不到帧时间,所以只放文本,时间戳由
     /// `toast::show` 盖。
-    pub pending_toast: Option<String>,
+    pub pending_toast: Option<(toast::Kind, String)>,
     /// 当前正在飘着的那条 toast。
     pub toast: Option<toast::Toast>,
 
@@ -374,8 +374,11 @@ impl UiState {
     /// 报告一条错误。**所有**错误写入都必须走这里,不要直接赋值 `last_error`。
     /// 报一条「刚才那一下生效了」的短提示(走查 13)。三秒自散,不占位置。
     /// **失败一律走 `set_error`**:那是要用户处理的,不能飘一下就没了。
-    pub fn set_toast(&mut self, msg: impl Into<String>) {
-        self.pending_toast = Some(msg.into());
+    /// F213:档位是**必填参数**,不给默认值。给了默认(比如省略即 `Ok`)的话,
+    /// 新加的调用点会静默按成功色画一圈绿边 —— 「列举式门控在加档时必然漏」
+    /// 在本仓库已经踩过三次,这里把闸门交给编译器:少一个参数就编不过。
+    pub fn set_toast(&mut self, kind: toast::Kind, msg: impl Into<String>) {
+        self.pending_toast = Some((kind, msg.into()));
     }
 
     pub fn set_error(&mut self, msg: String) {

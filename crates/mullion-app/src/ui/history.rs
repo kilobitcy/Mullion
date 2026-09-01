@@ -186,7 +186,7 @@ pub fn show(
                             egui::Align2::LEFT_TOP,
                             &row.summary,
                             egui::FontId::proportional(12.0),
-                            theme::c32(t.fg_dim),
+                            theme::c32(t.fg_muted),
                         );
                         // F153-b:**单击即恢复**。原来是「单击选中 + 双击恢复」,
                         // 用户报的是「点了没反应」—— 双击在高延迟远程桌面/触控板

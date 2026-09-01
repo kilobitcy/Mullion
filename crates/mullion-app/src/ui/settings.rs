@@ -317,7 +317,7 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
                  那台机器上 attach 同一个 tmux 的其它终端,窗口标题也会跟着变成这个格式。",
             )
             .size(11.0)
-            .color(theme::c32(t.fg_dim)),
+            .color(theme::c32(t.fg_muted)),
         );
         ui.end_row();
 
@@ -343,7 +343,7 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
                  那种情况请关掉这个开关。",
             )
             .size(11.0)
-            .color(theme::c32(t.fg_dim)),
+            .color(theme::c32(t.fg_muted)),
         );
         ui.end_row();
     });
@@ -386,7 +386,7 @@ fn diagnostics(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mu
                  环境变量 MULLION_LOG 若设了，会盖过这里的选择。",
             )
             .size(11.0)
-            .color(theme::c32(t.fg_dim)),
+            .color(theme::c32(t.fg_muted)),
         );
         ui.end_row();
     });
@@ -401,7 +401,7 @@ fn diagnostics(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mu
             "脱敏是尽力而为的模式匹配，覆盖不到的写法会漏，对外发送前请自己再看一眼。",
         )
         .size(11.0)
-        .color(theme::c32(t.fg_dim)),
+        .color(theme::c32(t.fg_muted)),
     );
     ui.add_space(SP_M);
 }
@@ -448,7 +448,7 @@ fn security(
         ui.label(
             egui::RichText::new("忘记主密码没有找回途径 —— 已保存的密码与私钥将永久无法解开")
                 .size(11.0)
-                .color(theme::c32(t.danger)),
+                .color(theme::c32(t.danger_text)),
         );
         ui.end_row();
     });

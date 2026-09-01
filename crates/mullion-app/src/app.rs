@@ -1786,11 +1786,15 @@ fn tab_keeps_template(_has_plan: bool, user_skipped: bool) -> bool {
 
 /// F153:自动串行拨号收尾那条 toast。抽成纯函数 —— 文案是这条路径上唯一
 /// 有分支的东西,跑一整轮拨号去测它是拿最贵的手段测最便宜的。
-fn auto_dial_summary(ok: usize, err: usize) -> String {
+fn auto_dial_summary(ok: usize, err: usize) -> (crate::ui::toast::Kind, String) {
+    use crate::ui::toast::Kind;
     if err == 0 {
-        format!("已自动连上 {ok} 个标签")
+        (Kind::Ok, format!("已自动连上 {ok} 个标签"))
     } else {
-        format!("{ok} 条已连接,{err} 条失败(点「重连」可再试)")
+        (
+            Kind::Warn,
+            format!("{ok} 条已连接,{err} 条失败(点「重连」可再试)"),
+        )
     }
 }
 
@@ -3162,7 +3166,8 @@ impl App {
                 // 一条都没试过就到头了(恢复出来的标签全被筛掉)——不报
                 // 「已自动连上 0 个标签」,那只会让人以为出了什么事。
                 if !auto.tried.is_empty() {
-                    self.ui.set_toast(auto_dial_summary(auto.ok, auto.err));
+                    let (kind, msg) = auto_dial_summary(auto.ok, auto.err);
+                    self.ui.set_toast(kind, msg);
                 }
                 mark_ui_dirty!(self.ui_dirty);
                 return;
@@ -3276,7 +3281,8 @@ impl App {
             .unwrap_or_default();
         let rows = self.history_rows(&entries);
         if rows.is_empty() {
-            self.ui.set_toast("没有可恢复的现场");
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Warn, "没有可恢复的现场");
             return;
         }
         self.ui.history = Some(crate::ui::history::HistoryDraft::new(rows));
@@ -3307,7 +3313,8 @@ impl App {
             .find(|e| e.id == id)
         else {
             // 两次启动之间被别的实例裁掉了(D5)。不是错误,说一声就行。
-            self.ui.set_toast("那条现场已经不在了");
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Warn, "那条现场已经不在了");
             return;
         };
         self.restore_tabs(entry.layout);
@@ -4173,8 +4180,10 @@ impl App {
                     }
                     // 没有确认框,这句吐司就是用户唯一的回执 —— 它说的是
                     // 「正在」,成败等 `SftpOpDone`。
-                    self.ui
-                        .set_toast(crate::ui::files_dialog::deleting_toast(&targets));
+                    self.ui.set_toast(
+                        crate::ui::toast::Kind::Busy,
+                        crate::ui::files_dialog::deleting_toast(&targets),
+                    );
                     self.apply_file_op(
                         generation,
                         crate::ui::files_dialog::FileOp::Delete { targets },
@@ -4573,7 +4582,7 @@ impl App {
             });
         });
         self.track_sftp_task(generation, task);
-        self.ui.set_toast("正在打开…");
+        self.ui.set_toast(crate::ui::toast::Kind::Busy, "正在打开…");
         mark_ui_dirty!(self.ui_dirty);
     }
 
@@ -4626,8 +4635,10 @@ impl App {
                     .add(generation, kind, remote, local.clone(), snapshot);
                 self.edit.originals.insert(key, bytes);
                 self.watch_edit(key, local);
-                self.ui
-                    .set_toast(format!("已交给默认程序:{label}。存盘后自动回传"));
+                self.ui.set_toast(
+                    crate::ui::toast::Kind::Ok,
+                    format!("已交给默认程序:{label}。存盘后自动回传"),
+                );
             }
             EditKind::Inline => {
                 let probe = crate::edit::text::probe(&bytes);
@@ -4786,7 +4797,8 @@ impl App {
                 if let Some(ed) = self.edit.editor.as_mut().filter(|ed| ed.key == key) {
                     ed.finish_save(Ok(()));
                 }
-                self.ui.set_toast(format!("已回传:{label}"));
+                self.ui
+                    .set_toast(crate::ui::toast::Kind::Ok, format!("已回传:{label}"));
                 // 远端那一栏要刷 —— 大小/时间变了,不刷用户会以为没传上去。
                 self.dispatch_panel_action_for(
                     generation,
@@ -4835,7 +4847,8 @@ impl App {
                 // 冲突,这个框永远关不掉。
                 self.edit.sessions.keep_remote(key, remote_now);
                 self.edit.conflicts.remove(&key);
-                self.ui.set_toast("已保留远端那一份");
+                self.ui
+                    .set_toast(crate::ui::toast::Kind::Ok, "已保留远端那一份");
             }
             EditResolve::Overwrite => {
                 // 把比对基准换成远端当前值,再走同一条回传 —— 于是这一次
@@ -4885,7 +4898,8 @@ impl App {
                     let _ = proxy.send_event(UserEvent::SftpOpDone { generation, result });
                 });
                 self.track_sftp_task(generation, task);
-                self.ui.set_toast(format!("已另存为 {name}"));
+                self.ui
+                    .set_toast(crate::ui::toast::Kind::Ok, format!("已另存为 {name}"));
             }
         }
     }
@@ -5295,11 +5309,14 @@ impl App {
                 match hk {
                     Hotkey::Toggle => {
                         let now = annotate::toggle(&ctx);
-                        self.ui.set_toast(if now {
-                            "标注模式:点选位置,Ctrl+Shift+E 导出"
-                        } else {
-                            "已退出标注模式"
-                        });
+                        self.ui.set_toast(
+                            crate::ui::toast::Kind::Ok,
+                            if now {
+                                "标注模式:点选位置,Ctrl+Shift+E 导出"
+                            } else {
+                                "已退出标注模式"
+                            },
+                        );
                     }
                     Hotkey::Export => annotate::request_export(&ctx),
                     Hotkey::CycleDetail => {
@@ -5307,7 +5324,8 @@ impl App {
                     }
                     Hotkey::Exit => {
                         annotate::exit(&ctx);
-                        self.ui.set_toast("已退出标注模式");
+                        self.ui
+                            .set_toast(crate::ui::toast::Kind::Ok, "已退出标注模式");
                     }
                 }
                 self.request_ui_redraw();
@@ -5754,8 +5772,10 @@ impl App {
         // 掐**:那时字节早发出去了,而自动化可能已经往同一个 shell 里灌了
         // 半条命令(T11 同族)。
         self.user_took_over();
-        self.ui
-            .set_toast(format!("正在上传截图({} KB)…", bytes / 1024));
+        self.ui.set_toast(
+            crate::ui::toast::Kind::Busy,
+            format!("正在上传截图({} KB)…", bytes / 1024),
+        );
     }
 
     /// F209:截图传完了。成功才往终端里打路径,失败只提示 —— **绝不把半截
@@ -5795,11 +5815,14 @@ impl App {
         // 这里**不再** `user_took_over()`:那一下在 `paste_screenshot` 按键
         // 当时就做过了(而且这块 pane 未必还是焦点,在这里掐会掐错人)。
         if landed {
-            self.ui.set_toast(format!("截图已传到 {path}"));
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Ok, format!("截图已传到 {path}"));
         } else {
             // 标签或分屏在这几秒里没了。图确实传上去了,路径只能靠提示给他。
-            self.ui
-                .set_toast(format!("截图已传到 {path}(原来那块分屏不在了)"));
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("截图已传到 {path}(原来那块分屏不在了)"),
+            );
         }
         self.request_ui_redraw();
     }
@@ -6921,7 +6944,7 @@ impl App {
             // 用户拍板:换过节点的 pane 要跑**新节点**的登录后命令,
             // 规则同分屏新开的那些 —— 跳过 tmux,其余照跑。
             self.on_pane_ready(generation, pane, sink, pending.plan, true);
-            self.ui.set_toast("已换节点");
+            self.ui.set_toast(crate::ui::toast::Kind::Ok, "已换节点");
             mark_ui_dirty!(self.ui_dirty);
             self.request_ui_redraw();
         }
@@ -7148,7 +7171,7 @@ impl App {
         // 零个 pane 真接上却弹「已重新连接」是名不副实——那种情况下
         // 上面已经把刚 push 的 `HostConn` 撤掉了,用户什么都没得到。
         if reconnected {
-            self.ui.set_toast("已重新连接");
+            self.ui.set_toast(crate::ui::toast::Kind::Ok, "已重新连接");
         }
         mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
@@ -7626,7 +7649,8 @@ impl App {
             )
         };
         self.tunnels.insert(id, handle);
-        self.ui.set_toast("隧道启动中…");
+        self.ui
+            .set_toast(crate::ui::toast::Kind::Busy, "隧道启动中…");
     }
 
     /// F114/F115:收下一次隧道状态上报。
@@ -7652,7 +7676,10 @@ impl App {
                 .and_then(|s| s.tunnels().iter().find(|t| t.id == id))
                 .map(crate::ui::session_manager::tunnel_list::row_title)
                 .unwrap_or_else(|| format!("隧道 {}", id.0));
-            self.ui.set_toast(format!("{title} 已停止:{cause}"));
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("{title} 已停止:{cause}"),
+            );
         }
         mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
@@ -8195,7 +8222,7 @@ impl ApplicationHandler<UserEvent> for App {
                 diag::count_sftp_op();
                 match result {
                     Ok(()) => {
-                        self.ui.set_toast("已完成");
+                        self.ui.set_toast(crate::ui::toast::Kind::Ok, "已完成");
                         // 写操作不带回新的目录内容 —— 不刷新的话界面上那个
                         // 文件「还在」,用户会以为没生效然后再删一次。
                         self.dispatch_panel_action_for(
@@ -9653,7 +9680,10 @@ impl ApplicationHandler<UserEvent> for App {
                             // 那一层只画不做 IO,所以在这里发起(同 F18 的复制路径)。
                             if let Some(md) = actions.annotate_export {
                                 self.clipboard.set(&md);
-                                self.ui.set_toast("标注已复制,粘进 Claude Code");
+                                self.ui.set_toast(
+                                    crate::ui::toast::Kind::Ok,
+                                    "标注已复制,粘进 Claude Code",
+                                );
                                 mark_ui_dirty!(self.ui_dirty);
                             }
                             // F83 标题条开关:改的是行数,下一帧 compute_geoms
@@ -9821,7 +9851,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // 走查 13:落盘成功要有一句反馈。删除尤其需要 ——
                             // 那一行从列表里消失了,但「是真删了还是我看花眼」
                             // 只有这句话能回答。
-                            Ok(()) => self.ui.set_toast("已删除会话"),
+                            Ok(()) => self.ui.set_toast(crate::ui::toast::Kind::Ok, "已删除会话"),
                             Err(e) => self.ui.set_error(format!("删除失败:{e}")),
                         }
                     }
@@ -9831,7 +9861,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some((id, gid)) = self.ui.move_to_group.take() {
                     if let Some(store) = self.store.as_mut() {
                         match store.set_group(id, gid).and_then(|_| store.save()) {
-                            Ok(()) => self.ui.set_toast("已移动到分组"),
+                            Ok(()) => self
+                                .ui
+                                .set_toast(crate::ui::toast::Kind::Ok, "已移动到分组"),
                             Err(e) => self.ui.set_error(format!("移动分组失败:{e}")),
                         }
                     }
@@ -9843,7 +9875,7 @@ impl ApplicationHandler<UserEvent> for App {
                             .move_session(i.id, i.group, i.before)
                             .and_then(|_| store.save())
                         {
-                            Ok(()) => self.ui.set_toast("已调整顺序"),
+                            Ok(()) => self.ui.set_toast(crate::ui::toast::Kind::Ok, "已调整顺序"),
                             Err(e) => self.ui.set_error(format!("调整顺序失败:{e}")),
                         }
                     }
@@ -9861,7 +9893,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 if then_connect {
                                     self.ui.connect_request = Some(id);
                                 } else {
-                                    self.ui.set_toast("已保存");
+                                    self.ui.set_toast(crate::ui::toast::Kind::Ok, "已保存");
                                 }
                             }
                             Err(msg) => self.ui.set_error(msg),
@@ -9910,7 +9942,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui.tunnel_editor = None;
                                     self.ui.tunnel_editor_baseline = None;
                                 }
-                                self.ui.set_toast("已删除隧道");
+                                self.ui.set_toast(crate::ui::toast::Kind::Ok, "已删除隧道");
                             }
                             Err(e) => self.ui.set_error(format!("删除隧道失败:{e}")),
                         }
@@ -9920,7 +9952,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // tokio runtime、要 bind 端口,三样在闭包里都够不着。
                 if let Some(id) = self.ui.tunnel_stop_request.take() {
                     self.tunnels.stop(id);
-                    self.ui.set_toast("已停止隧道");
+                    self.ui.set_toast(crate::ui::toast::Kind::Ok, "已停止隧道");
                 }
                 if let Some(id) = self.ui.tunnel_start_request.take() {
                     self.start_tunnel(id);
@@ -9937,7 +9969,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 「保存」会**又新建一条**。
                                 self.ui.tunnel_editor_id = Some(id);
                                 self.ui.tunnel_editor_baseline = self.ui.tunnel_editor.clone();
-                                self.ui.set_toast("已保存隧道");
+                                self.ui.set_toast(crate::ui::toast::Kind::Ok, "已保存隧道");
                             }
                             Err(e) => self.ui.set_error(format!("保存隧道失败:{e}")),
                         }
@@ -9957,7 +9989,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         self.ui.credential_editor = None;
                                         self.ui.credential_editor_baseline = None;
                                     }
-                                    self.ui.set_toast("已删除凭据");
+                                    self.ui.set_toast(crate::ui::toast::Kind::Ok, "已删除凭据");
                                 }
                                 Err(e) => self.ui.set_error(format!("删除凭据失败:{e}")),
                             },
@@ -9976,7 +10008,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.ui.credential_editor_id = Some(id);
                                 self.ui.credential_editor_baseline =
                                     self.ui.credential_editor.clone();
-                                self.ui.set_toast("已保存凭据");
+                                self.ui.set_toast(crate::ui::toast::Kind::Ok, "已保存凭据");
                             }
                             Err(msg) => self.ui.set_error(msg),
                         }
@@ -9990,7 +10022,10 @@ impl ApplicationHandler<UserEvent> for App {
                             .format(&time::format_description::well_known::Rfc3339)
                             .unwrap_or_default();
                         match apply_import(store, &rows, &now) {
-                            Ok(n) => self.ui.set_toast(format!("已导入 {n} 条会话")),
+                            Ok(n) => self.ui.set_toast(
+                                crate::ui::toast::Kind::Ok,
+                                format!("已导入 {n} 条会话"),
+                            ),
                             Err(msg) => self.ui.set_error(msg),
                         }
                     }
@@ -15288,10 +15323,20 @@ mod tests {
     /// 知道「有几条要自己点」。
     #[test]
     fn the_auto_dial_summary_tells_failures_apart_from_a_clean_run() {
-        assert_eq!(auto_dial_summary(3, 0), "已自动连上 3 个标签");
+        assert_eq!(
+            auto_dial_summary(3, 0),
+            (
+                crate::ui::toast::Kind::Ok,
+                "已自动连上 3 个标签".to_string()
+            )
+        );
         assert_eq!(
             auto_dial_summary(2, 1),
-            "2 条已连接,1 条失败(点「重连」可再试)"
+            (
+                crate::ui::toast::Kind::Warn,
+                "2 条已连接,1 条失败(点「重连」可再试)".to_string()
+            ),
+            "有失败时 toast 不能报成功色(F213)"
         );
     }
 

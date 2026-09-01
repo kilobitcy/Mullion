@@ -410,7 +410,7 @@ pub(super) fn show(
             // 措辞与语气见纯函数 `expose_warning`(它自己有穷举测试)。
             if let Some((tone, text)) = expose_warning(buf) {
                 let color = match tone {
-                    ExposeTone::Danger => t.danger,
+                    ExposeTone::Danger => t.danger_text,
                     ExposeTone::Unverifiable => t.warn,
                 };
                 ui.label("");

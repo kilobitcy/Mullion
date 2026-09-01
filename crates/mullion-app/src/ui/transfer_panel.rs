@@ -136,7 +136,7 @@ fn state_text(j: &Job) -> String {
 
 fn state_color(t: &Theme, j: &Job) -> egui::Color32 {
     theme::c32(match j.state {
-        JobState::Failed(_) => t.danger,
+        JobState::Failed(_) => t.danger_text,
         JobState::Conflict => t.warn,
         JobState::Done => t.ok,
         _ => t.fg_dim,

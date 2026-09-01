@@ -754,11 +754,11 @@ pub fn show(
             return action;
         }
         Load::Failed(msg) => {
-            ui.colored_label(theme::c32(t.danger), msg.clone());
+            ui.colored_label(theme::c32(t.danger_text), msg.clone());
             return action;
         }
         Load::Disconnected => {
-            ui.colored_label(theme::c32(t.danger), "连接已断开");
+            ui.colored_label(theme::c32(t.danger_text), "连接已断开");
             if ui.button("重连").clicked() {
                 action = Some(FileAction::Reconnect);
             }

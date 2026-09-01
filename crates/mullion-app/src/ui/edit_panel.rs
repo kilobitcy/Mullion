@@ -55,7 +55,7 @@ pub fn show_exit_confirm(
                 egui::RichText::new(
                     "现在退出,这些改动就只剩本地临时文件那一份,而临时目录会被一并清掉。",
                 )
-                .color(theme::c32(t.fg_dim)),
+                .color(theme::c32(t.fg_muted)),
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -64,7 +64,8 @@ pub fn show_exit_confirm(
                 }
                 if ui
                     .button(
-                        egui::RichText::new("仍然退出(丢弃这些改动)").color(theme::c32(t.danger)),
+                        egui::RichText::new("仍然退出(丢弃这些改动)")
+                            .color(theme::c32(t.danger_text)),
                     )
                     .clicked()
                 {
@@ -130,6 +131,8 @@ pub fn show(
                 .show(ui, |ui| {
                     for e in edits.iter() {
                         ui.horizontal(|ui| {
+                            // 弹窗外:这一栏是上面那个 `TopBottomPanel::bottom`,
+                            // 底色 `panel_bg`(#14161f),`fg_dim` 在它上面 8.05:1。
                             ui.colored_label(
                                 theme::c32(t.fg_dim),
                                 match e.kind {
@@ -173,10 +176,13 @@ fn state_text(e: &EditEntry) -> String {
 
 fn state_color(t: &Theme, e: &EditEntry) -> egui::Color32 {
     theme::c32(match e.state {
-        EditState::Failed(_) => t.danger,
+        EditState::Failed(_) => t.danger_text,
         EditState::Conflict => t.warn,
         EditState::Uploading => t.fg_mid,
-        EditState::Watching => t.fg_dim,
+        // 两个宿主共用这个函数(退出确认弹窗 + 底部「编辑中列表」面板),
+        // 所以取两边都读得到的那一档 —— `fg_muted` 在 modal_bg 上 4.77、
+        // 在 panel_bg 上 9.44。
+        EditState::Watching => t.fg_muted,
     })
 }
 

@@ -8,7 +8,10 @@
 const LOGIN_GRACE_SECS: u64 = 120;
 
 /// 危险/警告色。比纯 `Color32::RED` 柔和,适合大段警示文字。
-const DANGER: egui::Color32 = egui::Color32::from_rgb(200, 40, 40);
+// F213:原来是写死的 #c82828,在 `modal_bg`(#3f3f3f,`egui::Modal` 的底色)
+// 上只有 1.9:1 —— 全 app 后果最重的那句「⚠ 主机密钥已变更」几乎看不清。
+// 改走色板的 `danger_text`(4.84:1),别再另写常量。
+const DANGER: egui::Color32 = crate::theme::c32(crate::theme::MULLION_DARK.danger_text);
 
 /// 把协议 wire 名(`key.algorithm().to_string()`,如 `ssh-ed25519`/`rsa-sha2-256`/
 /// `ecdsa-sha2-nistp256`)映射成服务器上对应的公钥文件名,供用户在服务器本机核对。
@@ -131,7 +134,7 @@ pub fn show(ctx: &egui::Context, view: &HostKeyView<'_>, reply: &mut Option<bool
         if !view.persist {
             ui.add_space(6.0);
             ui.colored_label(
-                crate::theme::c32(crate::theme::MULLION_DARK.fg_dim),
+                crate::theme::c32(crate::theme::MULLION_DARK.fg_muted),
                 "本次测试不会记住此指纹,正式连接时会再次询问。",
             );
         }

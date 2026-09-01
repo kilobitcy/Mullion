@@ -251,7 +251,8 @@ pub(super) fn show(
                             // 直接写字段而不是 `set_toast()`:方法调用要 `&mut`
                             // 整个 `UiState`,而这里 `buf` 正借着 `editor` 字段
                             // (字段级不相交借用只对字段访问成立)。
-                            ui_state.pending_toast = Some("错误信息已复制".to_string());
+                            ui_state.pending_toast =
+                                Some((crate::ui::toast::Kind::Ok, "错误信息已复制".to_string()));
                         }
                         if has_more {
                             let label = if ui_state.error_expanded {
@@ -430,7 +431,7 @@ pub(super) fn show(
                 },
             );
             if let Some((sym, color)) = match badge {
-                super::tab_badge::Badge::Missing => Some(("●", theme::c32(t.danger))),
+                super::tab_badge::Badge::Missing => Some(("●", theme::c32(t.danger_text))),
                 super::tab_badge::Badge::Configured => Some(("·", theme::c32(t.fg_dimmer))),
                 super::tab_badge::Badge::None => None,
             } {
@@ -1361,8 +1362,8 @@ mod tests {
         let job = find_galley_job(&out.shapes, "连接").expect("没找到「连接」这个 Tab");
         assert_eq!(
             job.sections[1].format.color,
-            crate::theme::c32(t.danger),
-            "缺项角标应该是 danger 红,且压过灰点"
+            crate::theme::c32(t.danger_text),
+            "缺项角标应该是 danger_text 红,且压过灰点"
         );
     }
 

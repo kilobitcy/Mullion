@@ -466,7 +466,7 @@ pub(crate) fn appearance(
             }
 
             if let Some(err) = icon_error.as_ref() {
-                ui.colored_label(crate::theme::c32(t.danger), err);
+                ui.colored_label(crate::theme::c32(t.danger_text), err);
             }
 
             if has_ico {
@@ -741,7 +741,7 @@ fn chain_editor(
                     // **硬失败**(设计 §6),用户得先看见是哪一跳没了。
                     None => {
                         ui.colored_label(
-                            crate::theme::c32(t.danger),
+                            crate::theme::c32(t.danger_text),
                             format!("#{} 会话已删除", id.0),
                         );
                     }
@@ -822,7 +822,7 @@ fn chain_editor(
             super::jump_preview::preview(&buf.jump_chain, sessions, proxy, target),
         );
         if let Some(msg) = super::jump_preview::check(&buf.jump_chain, sessions) {
-            ui.colored_label(crate::theme::c32(t.danger), msg);
+            ui.colored_label(crate::theme::c32(t.danger_text), msg);
         }
     }
 
@@ -976,11 +976,11 @@ pub(super) fn auth(
                     let (text, color) = if buf.key_touched && !buf.key_data.is_empty() {
                         ("已导入(未保存)", t.fg)
                     } else if buf.key_touched {
-                        ("已清除(未保存)", t.danger)
+                        ("已清除(未保存)", t.danger_text)
                     } else if presence.private_key {
                         ("已导入", t.fg)
                     } else {
-                        ("未设置 —— 请导入私钥文件", t.danger)
+                        ("未设置 —— 请导入私钥文件", t.danger_text)
                     };
                     ui.colored_label(crate::theme::c32(color), text);
                 });

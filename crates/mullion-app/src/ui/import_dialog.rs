@@ -168,7 +168,7 @@ pub fn show(ctx: &egui::Context, t: &crate::theme::Theme, ui_state: &mut crate::
         .default_width(560.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            ui.colored_label(crate::theme::c32(t.fg_dimmer), &st.path);
+            ui.colored_label(crate::theme::c32(t.fg_muted), &st.path);
             ui.add_space(SP_S);
 
             if st.rows.is_empty() {
@@ -212,7 +212,7 @@ pub fn show(ctx: &egui::Context, t: &crate::theme::Theme, ui_state: &mut crate::
             if !st.skipped.is_empty() {
                 ui.add_space(SP_S);
                 for line in &st.skipped {
-                    ui.colored_label(crate::theme::c32(t.fg_dimmer), line);
+                    ui.colored_label(crate::theme::c32(t.fg_muted), line);
                 }
             }
 
@@ -252,7 +252,7 @@ fn row_ui(ui: &mut egui::Ui, t: &crate::theme::Theme, r: &mut ImportRow) {
             r.entry.user.clone()
         };
         ui.colored_label(
-            crate::theme::c32(t.fg_dimmer),
+            crate::theme::c32(t.fg_muted),
             format!("{}@{}:{}", user, r.entry.hostname, r.entry.port),
         );
         match r.status {
@@ -269,7 +269,7 @@ fn row_ui(ui: &mut egui::Ui, t: &crate::theme::Theme, r: &mut ImportRow) {
         }
         if !r.entry.proxy_jump.is_empty() {
             ui.colored_label(
-                crate::theme::c32(t.fg_dimmer),
+                crate::theme::c32(t.fg_muted),
                 format!("跳板 {}", r.entry.proxy_jump.join(" → ")),
             );
         }

@@ -71,7 +71,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, draft: &mut UnlockDraft) -> UnlockOu
                 ui.label(
                     egui::RichText::new("密码不对,再试一次")
                         .size(11.0)
-                        .color(theme::c32(t.danger)),
+                        .color(theme::c32(t.danger_text)),
                 );
             }
             ui.add_space(SP_L);

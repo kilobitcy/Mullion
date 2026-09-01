@@ -78,7 +78,7 @@ pub(crate) fn section(ui: &mut Ui, t: &Theme, scope: &str, title: &str, first: &
 pub(super) fn required(ui: &mut Ui, t: &Theme, text: &str) {
     ui.horizontal(|ui| {
         ui.label(text);
-        ui.colored_label(crate::theme::c32(t.danger), "*");
+        ui.colored_label(crate::theme::c32(t.danger_text), "*");
     });
 }
 
@@ -94,7 +94,7 @@ pub(crate) fn field_error(ui: &mut Ui, t: &Theme, show: bool, msg: &str) {
     ui.label(
         egui::RichText::new(msg)
             .size(11.0)
-            .color(crate::theme::c32(t.danger)),
+            .color(crate::theme::c32(t.danger_text)),
     );
     ui.end_row();
 }

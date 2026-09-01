@@ -495,7 +495,7 @@ pub fn status_bar(
                 // last_error 必须可见:右对齐区先画它,再画常规右栏。
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(err) = last_error {
-                        ui.colored_label(theme::c32(t.danger), err);
+                        ui.colored_label(theme::c32(t.danger_text), err);
                         ui.separator();
                     }
                     // F40~F44:自动化状态排在错误之后、常规右栏之前。

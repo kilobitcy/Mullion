@@ -97,6 +97,17 @@ pub struct Theme {
     /// 错误**卡片/横幅**底纹用的柔和红(F90 会话管理器 §5.2)。`danger` 是
     /// Windows 系统红 #e81123,用作大面积底色太刺眼;两者不互相替代。
     pub danger_soft: Rgb,
+    /// F213:危险语义的**文字**色。
+    ///
+    /// `danger`(#e81123)是 Windows 系统红,亮度很低:在 `modal_bg`(#3f3f3f)
+    /// 上只有 **2.27:1**,在 `bar_status`(#181b26)上 3.71:1 —— 两处都读不到
+    /// 4.5:1。而它承载的恰恰是全 app 后果最重的几句话(「删除 3 个目录(连同
+    /// 其中全部内容)」「有未保存的修改,关掉就没了」),看不清的代价是误操作。
+    ///
+    /// 不去动 `danger` 本身:它还要当**填充/描边**用(非文字判据 3:1,#e81123
+    /// 在深色面板上够),而且要把一个纯红提到 4.5:1 只能提到接近粉,填充语义
+    /// 就散了。分成两个 token,各自守各自的门槛。
+    pub danger_text: Rgb,
 
     // --- F127 文件类型图标色(§2.3 的延伸) ---
     /// 目录:蓝。与 `accent`(偏紫)刻意拉开,不然选中行的强调色和图标糊在一起。
@@ -165,6 +176,9 @@ pub const MULLION_DARK: Theme = Theme {
     info: Rgb::new(0x7c, 0x9e, 0xff),
     danger: Rgb::new(0xe8, 0x11, 0x23),
     danger_soft: Rgb::new(0xe0, 0x67, 0x67),
+    // modal_bg 上 4.84:1、panel_bg 上 8.28:1。同色相(0°),只是把明度抬到
+    // 文字判据之上 —— 见 `Theme::danger_text`。
+    danger_text: Rgb::new(0xff, 0x90, 0x90),
 
     icon_dir: Rgb::new(0x6f, 0xa8, 0xff),
     icon_archive: Rgb::new(0xe0, 0x9a, 0x4a),
@@ -327,7 +341,10 @@ pub fn hint_text(t: &Theme, s: impl Into<String>) -> egui::RichText {
 }
 
 /// `Rgb` → egui 颜色。
-pub fn c32(c: Rgb) -> egui::Color32 {
+///
+/// `const`:`host_key.rs` 的 `DANGER` 要在常量位置由色板推出来,不能另写字面量
+/// (F213 —— 原来那个写死的 #c82828 在弹窗底色上只有 1.9:1)。
+pub const fn c32(c: Rgb) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
@@ -881,7 +898,68 @@ mod tests {
         assert!(
             dim < 4.5,
             "fg_dim 在 modal_bg 上是 {dim:.2}:1、已经达标 —— 那么弹窗里换档这件事\
-             失去了理由,`dialogs_use_the_brighter_secondary_token` 该一并撤掉"
+             失去了理由,`tests/dialog_contrast.rs` 那条闸门该一并撤掉"
         );
+    }
+
+    /// F213:危险语义的**文字**在弹窗底色上也要过 4.5:1。
+    ///
+    /// `danger`(Windows 系统红 #e81123)只有 2.27:1 —— 而它承载的是「删除 3 个
+    /// 目录(连同其中全部内容)」这种后果最重的句子。两件事一起钉:新 token
+    /// 达标,且**老 token 确实不达标**(否则加它没有理由,该退回去)。
+    ///
+    /// 自证会变红:把 `danger_text` 改回 `Rgb::new(0xe8, 0x11, 0x23)`。
+    #[test]
+    fn the_danger_text_token_is_readable_on_the_dialog_fill_but_the_fill_token_is_not() {
+        let t = MULLION_DARK;
+        for (name, bg) in [
+            ("modal_bg", t.modal_bg),
+            ("panel_bg", t.panel_bg),
+            ("bar_status", t.bar_status),
+        ] {
+            let r = contrast_ratio(t.danger_text, bg);
+            assert!(r >= 4.5, "danger_text 在 {name} 上只有 {r:.2}:1");
+        }
+        let old = contrast_ratio(t.danger, t.modal_bg);
+        assert!(
+            old < 4.5,
+            "danger 在 modal_bg 上是 {old:.2}:1、已经达标 —— 那 `danger_text` 没有\
+             存在理由,该合并回去"
+        );
+        // 填充/描边判据是 3:1(WCAG 1.4.11)。`danger` 留着干这个,别顺手删掉。
+        assert!(
+            contrast_ratio(t.danger, t.panel_bg) >= 3.0,
+            "danger 连非文字的 3:1 都不到了,那它当填充也不成立"
+        );
+    }
+
+    /// F213:toast 的底色必须与弹窗同源,不能蹭 `sunken_bg`。
+    ///
+    /// 它是飘在终端正文之上的浮层。原来用 `sunken_bg`(#0e1018),与终端底色
+    /// (#14161f)只有 **1.05:1** —— 边界几乎看不出来,整块提示像是印在正文里的。
+    /// F203 把弹窗从这个坑里捞出来时漏掉了它。
+    ///
+    /// 自证会变红:把 `toast.rs` 里的 `t.modal_bg` 改回 `t.sunken_bg`。
+    #[test]
+    fn the_toast_floats_on_the_dialog_fill_so_it_stands_off_the_terminal_behind_it() {
+        let t = MULLION_DARK;
+        let src = include_str!("ui/toast.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("源码切歪了");
+        assert!(
+            prod.contains(".fill(theme::c32(t.modal_bg))"),
+            "toast 的底色不是 modal_bg 了"
+        );
+        let stands_off = contrast_ratio(t.modal_bg, t.term_bg);
+        let old = contrast_ratio(t.sunken_bg, t.term_bg);
+        assert!(
+            stands_off > old * 1.5,
+            "换过之后 toast 与终端底的对比只有 {stands_off:.2}:1(原来 {old:.2}:1),\
+             等于白换"
+        );
+        // 三档边框都是**非文字**元素,判据 3:1。
+        for (name, c) in [("info", t.info), ("ok", t.ok), ("warn", t.warn)] {
+            let r = contrast_ratio(c, t.modal_bg);
+            assert!(r >= 3.0, "toast 的 {name} 边框在 modal_bg 上只有 {r:.2}:1");
+        }
     }
 }
