@@ -2026,6 +2026,80 @@ mod tests {
         );
     }
 
+    /// F216:开一个**内置**编辑,中央区尺寸必须一点都不变。
+    ///
+    /// 用户实报「点『在 Mullion 里编辑』,后面的 pane 整体抖一次、像刷了屏,
+    /// 关掉编辑窗再抖一次」。根因不在渲染,在这里:底部「编辑中」列表是
+    /// `TopBottomPanel::bottom`,列表从空变非空就把中央区吃矮三四十点 →
+    /// `central_px` → `compute_geoms` → `apply_geometry` 发一次
+    /// `window_change`(T4)→ 远端 tmux 整屏重排。
+    ///
+    /// 反面那一半是必需的:只断言「内置不影响」的话,一个**压根不画这个面板**
+    /// 的实现同样全绿,而外部编辑的可见性就跟着一起没了。
+    ///
+    /// 自证会变红:把 `edit_panel::listed` 的过滤条件去掉(改回 `edits.iter()`)。
+    #[test]
+    fn opening_an_inline_edit_does_not_move_the_central_area() {
+        use crate::edit::sessions::{EditKind, EditSessions};
+
+        fn central(edits: &EditSessions) -> (u32, u32) {
+            let frame = UiFrame {
+                connected: true,
+                ..base_frame()
+            };
+            let ctx = egui::Context::default();
+            let mut st = UiState::default();
+            // 两帧:panel 首帧 fade_in 只记 `Shape::Noop`,尺寸还没落定。
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    build_ui(
+                        ctx,
+                        &crate::theme::MULLION_DARK,
+                        &mut st,
+                        frame,
+                        None,
+                        None,
+                        0,
+                        &crate::files::queue::Queue::new(4),
+                        edits,
+                        // 编辑器窗口本身是浮窗(`egui::Window`),不参与 Panel
+                        // 的空间分配 —— 这条测的是**列表面板**偷不偷行数,
+                        // 所以这里恒 `None`,免得把两件事混在一个断言里。
+                        &mut None,
+                    );
+                });
+            }
+            st.central_px
+        }
+
+        fn one(kind: EditKind) -> EditSessions {
+            let mut s = EditSessions::new();
+            s.add(
+                1,
+                kind,
+                mullion_ssh::sftp::RemotePath::from_bytes(b"/etc/hosts".to_vec()),
+                std::path::PathBuf::from("/tmp/hosts"),
+                (1, 1),
+            );
+            s
+        }
+
+        let none = central(&EditSessions::new());
+        let inline = central(&one(EditKind::Inline));
+        assert_eq!(
+            inline, none,
+            "开内置编辑后中央区变了({none:?} → {inline:?})—— 那一次 window_change \
+             就是用户看到的刷屏"
+        );
+
+        let external = central(&one(EditKind::External));
+        assert!(
+            external.1 < none.1,
+            "外部编辑必须让中央区变矮({none:?} → {external:?})—— 不变的话说明\
+             面板压根没画,上一条断言什么也没守住"
+        );
+    }
+
     /// D1/D4:标签宿主(`files_content`)跟侧栏是两种不同的占位方式。侧栏是
     /// `SidePanel`,会挤占 egui 的 Panel 空间分配,让 `central_px` 变窄
     /// (见上一条测试);标签宿主画的是 `CentralPanel`,天然铺满**已经**

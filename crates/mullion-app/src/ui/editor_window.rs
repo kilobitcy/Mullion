@@ -153,6 +153,18 @@ impl EditorState {
 /// 常见宽度)。
 const DEFAULT_SIZE: egui::Vec2 = egui::vec2(1100.0, 760.0);
 
+/// F217:窗口内容区的下界。
+///
+/// 在此之前「拖不再小」是**副作用**:正文那个 `TextEdit` 的
+/// `desired_rows(20)` 把内容高度坠住,而窗口又被棘轮顶到不小于内容高度。
+/// F217 把棘轮拆掉之后那个地板一起没了 —— 不显式写死的话,`Resize` 的默认
+/// 下界是 16×16,用户能把编辑器拖成一条缝,里面什么都看不见也点不到按钮,
+/// 而这个尺寸还会被 egui `Memory` 记住带到下一次打开。
+///
+/// 480×320 大致是「标题行 + 十来行正文 + 底部按钮行」。与 `max_size` 同口径:
+/// 管的是内容区,外框还要大一圈 `chrome`。
+const MIN_SIZE: egui::Vec2 = egui::vec2(480.0, 320.0);
+
 /// F208:窗口上限占主窗口客户区的比例。
 ///
 /// 用户实报「编辑器底部被 Windows 11 任务栏遮挡」。根因是 egui 的 `Resize`
@@ -257,6 +269,8 @@ pub fn show(
         .default_size(DEFAULT_SIZE)
         // F208:上限 —— 这一条才是「不再撑到任务栏底下」的判据,见 `max_size`。
         .max_size(max_size(screen, s.chrome))
+        // F217:下界。棘轮拆掉之后没有别的东西拦着往小拖了,见 `MIN_SIZE`。
+        .min_size(MIN_SIZE)
         // F206:焦点描边三处同源。编辑器是模态(`Modal::Editor`),永远持有
         // 键盘,所以这里**不做条件判断** —— 条件恒真的边框写成 `if` 只会
         // 让人以为它会灭。egui 默认的窗口边框是白 6%、圆角 6,与 pane 的
@@ -271,10 +285,12 @@ pub fn show(
     } else if let Some(p) = centre {
         // 最大化/还原优先:那两个也在钉几何,同一帧里抢起来会打架。
         //
-        // F208:开窗那两帧**连尺寸一起钉**,把 `Resize` 存在 `Memory` 里的
-        // 老尺寸冲掉 —— 上一次被撑大的那个值否则会一直传下去,用户每次
-        // 打开都得手动拖回来。钉完就放手,拖拽/最大化照旧。
-        win = win.current_pos(p).fixed_size(DEFAULT_SIZE);
+        // F217:**只钉位置,不钉尺寸**。F208 当初连尺寸一起钉,是为了把
+        // `Resize` 记在 `Memory` 里那个被棘轮顶大的老尺寸冲掉;棘轮拆掉之后
+        // `Memory` 里存的就是用户自己拖出来的值,冲掉它等于每次打开都把
+        // 用户刚做的调整扔了。首次打开(`Memory` 里还没有)仍走上面那句
+        // `default_size(DEFAULT_SIZE)`。
+        win = win.current_pos(p);
     }
     if !was_maximized {
         // 还原信号只用这一帧。
@@ -332,10 +348,6 @@ pub fn show(
         }
 
         ui.separator();
-        // C 组:高度跟着窗口走。**减去底部按钮行的预算** —— 不减的话
-        // `ScrollArea` 会把可用高度吃光,保存/关闭那一行被挤出窗口。
-        let reserve = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0;
-        let h = (ui.available_height() - reserve).max(80.0);
         // F215:高亮缓存懒建。文件大小是**开窗那一刻**的 —— 门槛判的是
         // 「这个文件值不值得高亮」,不是「此刻的缓冲区有多长」;每帧按当前
         // 长度重判的话,用户在一个 256 KB 边缘的文件里删一行,高亮会突然
@@ -343,81 +355,117 @@ pub fn show(
         if s.hl.is_none() {
             s.hl = Some(crate::ui::highlight::Cache::new(&s.path, t, s.text.len()));
         }
-        // `hl` 与 `text` 是同一个结构体的两个字段,分别借用互不冲突;
-        // 合成一个 `&mut s` 传进去就借冲突了。
-        let hl = s.hl.as_mut().expect("上一行刚建好");
-        let mut layouter = |ui: &egui::Ui, text: &str, w: f32| hl.layout(ui, text, w);
-        egui::ScrollArea::vertical().max_height(h).show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut s.text)
-                    .code_editor()
-                    // F215:语法高亮。`layouter` 每帧都跑,增量与缓存全在
-                    // `highlight::Cache` 里 —— 见那个模块的头注释。
-                    .layouter(&mut layouter)
-                    // F207:正文区底色 = 终端底色 `term_bg`。用户看的是远端
-                    // 文件,底色跟终端一致才连得上「这就是那台机器上的东西」;
-                    // 而窗口壳仍是 `modal_bg`(#3f3f3f),两层色差本身就是
-                    // 「哪块能打字」的边界。
-                    //
-                    // 走 `background_color` 而不是改 `Visuals::extreme_bg_color`
-                    // ——后者是全局量,一改所有 `TextEdit`(会话表单、路径条、
-                    // 改名框)跟着变,而那些贴在 `panel_bg` 上、本来就配好了。
-                    .background_color(theme::c32(t.term_bg))
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(20)
-                    // 只读一律靠这一条落地。靠「保存按钮置灰」是不够的:
-                    // 用户改了半天才发现存不了,那些改动全白费。
-                    .interactive(s.read_only.is_none()),
-            );
-        });
-        ui.separator();
-
-        if s.confirm_close {
-            ui.colored_label(theme::c32(t.danger_text), "有未保存的修改,关掉就没了。");
-            ui.horizontal(|ui| {
-                if ui
-                    .button(egui::RichText::new("丢弃并关闭").color(theme::c32(t.danger_text)))
-                    .clicked()
-                {
-                    action = Some(EditorAction::Close(s.key));
-                    close = true;
-                }
-                if ui.button("继续编辑").clicked() {
-                    s.confirm_close = false;
-                }
-            });
-            return;
-        }
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(s.can_save(), egui::Button::new("保存到远端"))
-                .clicked()
-            {
-                action = Some(EditorAction::Save);
-            }
-            // F204:关闭挪到标题栏的 ✕ 上了 —— 底下不再重复一颗。
-            ui.checkbox(&mut s.backup, "写前留一份 .mullion.bak");
-            // F215:认出来的语法要报出来。高亮猜错(或压根没高亮)时,用户
-            // 看到的只是「颜色不太对」,而这一行直接说明是按什么语法上的色。
-            if let Some(hl) = &s.hl {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if hl.too_big {
-                        ui.colored_label(
-                            theme::c32(t.warn),
-                            format!(
-                                "超过 {} KB,已关掉语法高亮",
-                                crate::ui::highlight::MAX_BYTES / 1024
-                            ),
-                        );
-                    } else {
-                        ui.colored_label(
-                            theme::c32(t.fg_muted),
-                            format!("语法:{}", hl.syntax_name()),
-                        );
+        // F217:**底部先摆,正文吃掉剩下的全部**。这一条是「窗口高度调不动」
+        // 的根治,不是排版偏好。
+        //
+        // egui 的 `Resize` 每帧做 `desired_size = desired_size.max(
+        // last_content_size)`(0.30 的 `containers/resize.rs:258`),只涨不缩。
+        // 原先正文高度是 `available_height - reserve` 反推的,而 `reserve` 是
+        // 照着底部按钮行**猜**的一个常数 —— 猜小的那点差额每帧累积:窗口
+        // 自己往上长(用户看到的「打开时那段高度增长动画」,与文件载入无关,
+        // 是帧数),长到 `max_size` 天花板之后,往外拖被夹住、往里拖被下一帧
+        // 顶回去,于是「高度调不动」;四角对角拖里的竖向分量同样被吃掉,
+        // 看起来就成了「角上只能改宽」。
+        //
+        // 改成这个结构之后,内容高度**恒等于**窗口内容区高度,那句 `max()`
+        // 永远是 no-op。猜出来的 `reserve` 一并删掉,顺带治好「脏了多出一条
+        // 确认行就把窗口顶高一截、且再也降不回来」。
+        //
+        // 两层 `with_layout` 都不带尺寸参数是有意的:`Ui::with_layout` 走
+        // `allocate_new_ui`,子 `Ui` 的 `max_rect` 直接取父的
+        // `available_rect_before_wrap()`,不会在中间掺进一份 item_spacing ——
+        // 自己算矩形再减间距就又回到「猜一个常数」的老路上了。
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            if s.confirm_close {
+                // `bottom_up` 里**先加的在最下面** —— 按钮行先加,说明那句话
+                // 后加,画出来才是「先看见解释、再看见按钮」。
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("丢弃并关闭").color(theme::c32(t.danger_text)))
+                        .clicked()
+                    {
+                        action = Some(EditorAction::Close(s.key));
+                        close = true;
+                    }
+                    if ui.button("继续编辑").clicked() {
+                        s.confirm_close = false;
+                    }
+                });
+                ui.colored_label(theme::c32(t.danger_text), "有未保存的修改,关掉就没了。");
+            } else {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(s.can_save(), egui::Button::new("保存到远端"))
+                        .clicked()
+                    {
+                        action = Some(EditorAction::Save);
+                    }
+                    // F204:关闭挪到标题栏的 ✕ 上了 —— 底下不再重复一颗。
+                    ui.checkbox(&mut s.backup, "写前留一份 .mullion.bak");
+                    // F215:认出来的语法要报出来。高亮猜错(或压根没高亮)时,
+                    // 用户看到的只是「颜色不太对」,而这一行直接说明是按什么
+                    // 语法上的色。
+                    if let Some(hl) = &s.hl {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if hl.too_big {
+                                ui.colored_label(
+                                    theme::c32(t.warn),
+                                    format!(
+                                        "超过 {} KB,已关掉语法高亮",
+                                        crate::ui::highlight::MAX_BYTES / 1024
+                                    ),
+                                );
+                            } else {
+                                ui.colored_label(
+                                    theme::c32(t.fg_muted),
+                                    format!("语法:{}", hl.syntax_name()),
+                                );
+                            }
+                        });
                     }
                 });
             }
+            ui.separator();
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                // `hl` 与 `text` 是同一个结构体的两个字段,分别借用互不冲突;
+                // 合成一个 `&mut s` 传进去就借冲突了。
+                let hl = s.hl.as_mut().expect("上面刚建好");
+                let mut layouter = |ui: &egui::Ui, text: &str, w: f32| hl.layout(ui, text, w);
+                egui::ScrollArea::vertical()
+                    // F217:**不许 auto_shrink**。缩到内容自然高度的话,窗口
+                    // 内容就比窗口本身矮一截,而短文件下这一截可以很大 ——
+                    // 用户拖高的窗口在下一帧被 `Resize` 按 `last_content_size`
+                    // 收回去,拖了等于没拖。
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut s.text)
+                                .code_editor()
+                                // F215:语法高亮。`layouter` 每帧都跑,增量与
+                                // 缓存全在 `highlight::Cache` 里 —— 见那个
+                                // 模块的头注释。
+                                .layouter(&mut layouter)
+                                // F207:正文区底色 = 终端底色 `term_bg`。用户
+                                // 看的是远端文件,底色跟终端一致才连得上「这
+                                // 就是那台机器上的东西」;而窗口壳仍是
+                                // `modal_bg`(#3f3f3f),两层色差本身就是
+                                // 「哪块能打字」的边界。
+                                //
+                                // 走 `background_color` 而不是改
+                                // `Visuals::extreme_bg_color` —— 后者是全局量,
+                                // 一改所有 `TextEdit`(会话表单、路径条、改名
+                                // 框)跟着变,而那些贴在 `panel_bg` 上、本来
+                                // 就配好了。
+                                .background_color(theme::c32(t.term_bg))
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(20)
+                                // 只读一律靠这一条落地。靠「保存按钮置灰」是
+                                // 不够的:用户改了半天才发现存不了,那些改动
+                                // 全白费。
+                                .interactive(s.read_only.is_none()),
+                        );
+                    });
+            });
         });
     });
 
@@ -792,37 +840,35 @@ mod tests {
         );
     }
 
-    /// F208:装一个很长的文件也不许把窗口撑出屏幕。
+    /// F208:窗口不许撑出屏幕预算 —— 无论是自己长出去,还是被用户拖出去。
     ///
-    /// 用户实报「编辑器底部被 Windows 11 任务栏遮挡」。egui 的 `Resize` 每帧
-    /// `desired_size = desired_size.max(last_content_size)`,而本窗口的正文
-    /// 高度又是从窗口可用高度反推的 —— 两者互为因果,一帧涨一点。跑够帧数
-    /// 才看得见:只跑三帧的话涨幅还没超过默认尺寸,断言会空过。
+    /// 用户实报「编辑器底部被 Windows 11 任务栏遮挡」。当时的成因是棘轮
+    /// (`desired_size.max(last_content_size)` 每帧涨一点),F217 已把那个正
+    /// 反馈拆掉,于是「跑够帧数看它长多大」这个手法**再也逼不出超限**——
+    /// 这条测试会恒绿。所以改成**拖**:往屏幕右下角狠拽一把,天花板得夹住它。
+    ///
+    /// 两段都留着:长文件那一段还守着「窗口不会自己长过预算」(万一哪天又有
+    /// 谁把内容高度接回可用高度),拖的那一段守 `max_size` 本身。
     ///
     /// 自证会变红:把 `.max_size(max_size(screen, s.chrome))` 那一行删掉
-    /// (实测 1038.7 点 > 918 点预算)。
+    /// (拖完实测 1080 点 > 918 点预算)。
     #[test]
     fn a_long_file_cannot_ratchet_the_window_past_the_screen_budget() {
-        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let screen = SCREEN;
         let mut s = editable();
         // 两千行 —— 远超任何窗口高度,正文的自然高度稳稳撑满可用空间。
         s.as_mut().unwrap().text = "x\n".repeat(2000);
-        let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
-        for _ in 0..40 {
-            let mut input = egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            };
-            input
-                .viewports
-                .values_mut()
-                .for_each(|v| v.inner_rect = Some(screen));
-            let _ = ctx.run(input, |ctx| {
-                show(ctx, &t, &mut s);
-            });
-        }
-        let r = s.as_ref().unwrap().last_rect.expect("窗口几何没落定");
+        crate::theme::apply_egui(&ctx, &crate::theme::MULLION_DARK);
+        let grown = settle(&ctx, &mut s, 40);
+        // 再往屏幕右下角拖 —— 用户能做到的最极端的一下。
+        drag(
+            &ctx,
+            &mut s,
+            grown.right_bottom(),
+            screen.right_bottom() - grown.right_bottom(),
+        );
+        let r = settle(&ctx, &mut s, 3);
         // 判据直接写「外框不超过屏幕的 85%」,不拿 `max_size` 反推 ——
         // 反推等于把被测函数抄一遍,它算错了这里也跟着错。
         let cap = screen.size() * MAX_SIZE_RATIO;
@@ -842,6 +888,228 @@ mod tests {
         assert!(
             r.height() > 100.0 && r.width() > 100.0,
             "窗口压根没铺开({r:?})—— 上面两条断言什么也没守住"
+        );
+    }
+
+    /// 一帧的输入。屏幕矩形要同时给 `screen_rect` 和 viewport 的 `inner_rect`
+    /// —— `Window` 的约束框取的是后者,只给前一个的话窗口会被夹在默认尺寸里。
+    fn frame_input(screen: egui::Rect) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .values_mut()
+            .for_each(|v| v.inner_rect = Some(screen));
+        input
+    }
+
+    const SCREEN: egui::Rect = egui::Rect {
+        min: egui::pos2(0.0, 0.0),
+        max: egui::pos2(1920.0, 1080.0),
+    };
+
+    /// 空跑几帧,让窗口几何落定。返回最后一帧的窗口外框。
+    fn settle(ctx: &egui::Context, s: &mut Option<EditorState>, n: usize) -> egui::Rect {
+        let t = crate::theme::MULLION_DARK;
+        for _ in 0..n {
+            let _ = ctx.run(frame_input(SCREEN), |c| {
+                show(c, &t, s);
+            });
+        }
+        s.as_ref().unwrap().last_rect.expect("窗口几何没落定")
+    }
+
+    /// 在 `from` 按下左键、拖到 `from + delta`、松手。
+    ///
+    /// **必须分帧发,而且中间那一帧只移动、不松手** —— 按下和松开挤进同一帧
+    /// 的话 egui 认出来的是一次点击,`Response::dragged()` 全程为假,窗口
+    /// 几何一动不动,而断言会把这当成「拖拽被吃掉了」。
+    fn drag(ctx: &egui::Context, s: &mut Option<EditorState>, from: egui::Pos2, delta: egui::Vec2) {
+        let t = crate::theme::MULLION_DARK;
+        let to = from + delta;
+        let press = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(from), press(from, true)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![press(to, false)],
+        ] {
+            let mut input = frame_input(SCREEN);
+            input.events = events;
+            let _ = ctx.run(input, |c| {
+                show(c, &t, s);
+            });
+        }
+    }
+
+    /// F217:窗口高度不许自己逐帧往上爬。
+    ///
+    /// 用户实报「编辑窗随着文件载入高度变化、有增长动画」。与载入无关,是帧数:
+    /// egui 的 `Resize` 每帧 `desired_size = desired_size.max(last_content_size)`
+    /// (0.30 的 `containers/resize.rs:258`,只涨不缩),而正文高度过去是
+    /// `available_height - reserve` 反推的、`reserve` 又是猜的常数 —— 猜小
+    /// 多少,窗口每帧就长多少,一路长到 `max_size` 天花板。
+    ///
+    /// 判据分两半,缺一条都会恒绿:
+    /// - **稳定**:第 5 帧到第 40 帧的高度必须一样。只有这一条的话,一个已经
+    ///   顶到天花板的窗口同样满足它(它长不动了,所以"稳定")。
+    /// - **没爬到天花板**:稳定值必须还在默认尺寸附近。只有这一条的话,
+    ///   一个爬到一半的窗口在第 5 帧就能通过。
+    ///
+    /// 自证会变红:把正文那个 `ScrollArea` 的 `.auto_shrink([false, false])`
+    /// 删掉,或者把 `with_layout(bottom_up)` 那层拆回「先正文、后按钮行」。
+    #[test]
+    fn the_window_height_does_not_creep_upward_frame_after_frame() {
+        let mut s = editable();
+        // 两千行 —— 正文的自然高度远超任何窗口,过去正是这种文件把窗口顶大的。
+        s.as_mut().unwrap().text = "x\n".repeat(2000);
+        let ctx = egui::Context::default();
+        let early = settle(&ctx, &mut s, 5).height();
+        let late = settle(&ctx, &mut s, 35).height();
+        assert!(
+            (late - early).abs() < 1.0,
+            "窗口自己长高了:第 5 帧 {early} → 第 40 帧 {late}(每帧涨一点 = 用户\
+             看到的那段「载入时高度增长动画」)"
+        );
+        // 天花板是屏幕的 85%(1080 × 0.85 = 918)。默认 760 加上外壳约 50,
+        // 落在 810 上下;留一档余量,但要离天花板足够远,爬上去必然被抓住。
+        assert!(
+            early < 860.0,
+            "稳定高度 {early} 已经贴到 85% 天花板({})上了 —— 说明它照样爬满了,\
+             只是被夹住之后看起来「稳定」",
+            SCREEN.height() * MAX_SIZE_RATIO
+        );
+        // 反面:窗口得真的按默认尺寸铺开了,否则上面两条在一条缝上也成立。
+        assert!(early > 700.0, "窗口压根没铺开(高 {early})");
+    }
+
+    /// F217:底边拖得动,而且拖完不弹回去。
+    ///
+    /// 用户实报「无法手动调节高度」。根因同上:拖矮了下一帧就被
+    /// `desired_size.max(last_content_size)` 顶回去,拖高了被 `max_size` 夹住
+    /// (窗口早就爬到天花板了)。所以**必须测「拖完之后再跑几帧还是矮的」**
+    /// —— 只断言拖拽当帧变矮的话,那个被顶回去的实现照样绿。
+    ///
+    /// 自证会变红:把 `.auto_shrink([false, false])` 删掉(正文缩回自然高度、
+    /// 短文件下窗口当场被拉回内容高度);或把 `min_size(MIN_SIZE)` 改成
+    /// `fixed_size(..)`(整个拖不动)。
+    #[test]
+    fn dragging_the_bottom_edge_shortens_the_window_and_it_stays_short() {
+        let mut s = editable();
+        s.as_mut().unwrap().text = "x\n".repeat(2000);
+        let ctx = egui::Context::default();
+        let before = settle(&ctx, &mut s, 5);
+        // 底边中点。`resize_grab_radius_side` 默认 5 点,正中最稳。
+        drag(&ctx, &mut s, before.center_bottom(), egui::vec2(0.0, -150.0));
+        let dragged = s.as_ref().unwrap().last_rect.expect("拖完没有几何");
+        assert!(
+            (dragged.height() - (before.height() - 150.0)).abs() < 6.0,
+            "底边拖了 150 点,高度却从 {} 变成 {}",
+            before.height(),
+            dragged.height()
+        );
+        // 松手之后再跑几帧 —— 这才是「调不动」的那一半。
+        let after = settle(&ctx, &mut s, 6);
+        assert!(
+            (after.height() - dragged.height()).abs() < 1.0,
+            "松手后高度自己弹回去了:{} → {}",
+            dragged.height(),
+            after.height()
+        );
+        // 宽度不该被这一拖捎带上 —— 捎带了说明拖的根本不是底边。
+        assert!(
+            (after.width() - before.width()).abs() < 1.0,
+            "只拖底边却把宽度也改了:{} → {}",
+            before.width(),
+            after.width()
+        );
+    }
+
+    /// F217:四个角上按住拖,宽高**同时**变。
+    ///
+    /// 用户实报「四角拖不了对角」。egui 0.30 的 `Window` 本来就支持
+    /// (`containers/window.rs:914` 起,corner 会同时置 left/right 与
+    /// top/bottom 位)—— 之前失效是因为竖向那一半每帧被棘轮吃掉,于是看起来
+    /// 「角上只能改宽」。这条因此是**回归锁**:哪天有人给窗口加了
+    /// `resizable([true, false])` 之类的东西,竖向分量会再次静默消失。
+    ///
+    /// 自证会变红:把 `.resizable(true)` 改成 `.resizable([true, false])`。
+    #[test]
+    fn dragging_a_corner_changes_both_width_and_height() {
+        let mut s = editable();
+        s.as_mut().unwrap().text = "x\n".repeat(2000);
+        let ctx = egui::Context::default();
+        // F217:四角的抓取半径是 `theme::apply_egui` 调好的(见
+        // `theme::RESIZE_CORNER_GRAB`)—— 不上主题的裸 `Context` 用 egui 默认
+        // 值,正角上边带永远赢,这条测的就不是产品里的行为了。
+        crate::theme::apply_egui(&ctx, &crate::theme::MULLION_DARK);
+        let before = settle(&ctx, &mut s, 5);
+        // 往里拖:往外拖会撞上 85% 天花板,测出来的就不是「拖得动」了。
+        drag(
+            &ctx,
+            &mut s,
+            before.right_bottom(),
+            egui::vec2(-200.0, -120.0),
+        );
+        let after = settle(&ctx, &mut s, 3);
+        assert!(
+            (after.width() - (before.width() - 200.0)).abs() < 6.0,
+            "对角拖的横向分量丢了:宽 {} → {}",
+            before.width(),
+            after.width()
+        );
+        assert!(
+            (after.height() - (before.height() - 120.0)).abs() < 6.0,
+            "对角拖的竖向分量丢了(用户报的就是这一条):高 {} → {}",
+            before.height(),
+            after.height()
+        );
+    }
+
+    /// F217:拖不到比 `MIN_SIZE` 更小。
+    ///
+    /// 棘轮拆掉之前,「拖不再小」是正文 `desired_rows(20)` 坠出来的**副作用**;
+    /// 拆掉之后那个地板一起没了,而 `Resize` 的默认下界是 16×16 —— 用户能把
+    /// 编辑器拖成一条缝(什么都看不见、按钮也点不到),而这个尺寸还会被 egui
+    /// `Memory` 记住带到下一次打开。
+    ///
+    /// 自证会变红:把 `.min_size(MIN_SIZE)` 那一行删掉。
+    #[test]
+    fn the_window_cannot_be_dragged_smaller_than_the_floor() {
+        let mut s = editable();
+        s.as_mut().unwrap().text = "x\n".repeat(2000);
+        let ctx = egui::Context::default();
+        let before = settle(&ctx, &mut s, 5);
+        // 往左上狠拖一把,远超下界。
+        drag(
+            &ctx,
+            &mut s,
+            before.right_bottom(),
+            egui::vec2(-1600.0, -1000.0),
+        );
+        let after = settle(&ctx, &mut s, 3);
+        // `MIN_SIZE` 管的是内容区,外框还要大一圈外壳,所以断言写成「不小于」。
+        assert!(
+            after.width() >= MIN_SIZE.x && after.height() >= MIN_SIZE.y,
+            "窗口被拖到了 {}×{},比下界 {}×{} 还小",
+            after.width(),
+            after.height(),
+            MIN_SIZE.x,
+            MIN_SIZE.y
+        );
+        // 反面:那一拖得真的起作用了,否则上面那条在一个纹丝不动的窗口上也成立。
+        assert!(
+            after.height() < before.height() - 100.0,
+            "窗口根本没被拖小({} → {})—— 上一条断言什么也没守住",
+            before.height(),
+            after.height()
         );
     }
 

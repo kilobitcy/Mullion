@@ -438,8 +438,35 @@ pub fn apply_egui(ctx: &egui::Context, t: &Theme) {
     v.widgets.open.rounding = round;
 
     ctx.set_visuals(v);
-    ctx.style_mut(|s| s.spacing.scroll = scroll_style());
+    ctx.style_mut(|s| {
+        s.spacing.scroll = scroll_style();
+        s.interaction.resize_grab_radius_corner = RESIZE_CORNER_GRAB;
+    });
 }
+
+/// F217:窗口四角的抓取半径。**这个值是按 egui 的命中判定倒推出来的,
+/// 不是审美取舍**。
+///
+/// 症状:在窗口正角上按住拖,只改得动宽或高中的一个,拖不出对角。
+///
+/// 根因在 `hit_test.rs:416` 的 `should_prioritizie_hits_on_back` —— 距离打平时
+/// egui 会「优先选细的那个命中目标」(为了让细长的 resize 边带好抓),判据是
+/// `back <= 0.5 * front && back <= 16`,量的是各自的短边。而边带的短边是
+/// `2 × resize_grab_radius_side` = **10**,角的短边是
+/// `2 × resize_grab_radius_corner` = **20** —— `10 <= 0.5 × 20` 正好取等,
+/// 于是正角上永远是边带赢,角本身一次也轮不到。egui 在那儿自己也写着
+/// 「hard-coded heuristics that could surely be improved」。
+///
+/// 把角的半径压到 9(短边 18)就打破了这个取等:`10 <= 9` 为假,角赢。
+/// 抓取区从 20×20 缩到 18×18,仍比画出来的角标(`resize_corner_size` = 12)大。
+///
+/// **不去动 `resize_grab_radius_side`**:那个值 `TopBottomPanel`/`SidePanel`
+/// 的分隔条也在读(`panel.rs:309`/`801`),动它会连带改掉文件侧栏分界线的
+/// 手感,而那跟本次问题无关。
+///
+/// 守护:`ui::editor_window::tests::dragging_a_corner_changes_both_width_and_height`
+/// (egui 哪天改了那套启发式,这条会红)。
+const RESIZE_CORNER_GRAB: f32 = 9.0;
 
 /// 滚动条样式。**唯一改动是让静止状态的滑块可见**。
 ///

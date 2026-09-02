@@ -5,6 +5,8 @@
 //!
 //! 与传输面板同一条纪律:**列表空时整个面板不画** —— 常驻一条空条只是在
 //! 偷终端的行数。
+//!
+//! F216:内置编辑(`EditKind::Inline`)**不进这个列表**。见 `listed`。
 
 use crate::edit::sessions::{EditEntry, EditKind, EditSessions, EditState};
 use crate::theme::{self, Theme};
@@ -76,18 +78,37 @@ pub fn show_exit_confirm(
     choice
 }
 
+/// F216:这个面板该列出哪些条目 —— **只列外部编辑**。
+///
+/// 内置编辑的窗口本身就开着,列表里那一行是纯冗余;而它带来的代价是实打实的:
+/// 这个面板是 `TopBottomPanel::bottom`,从无到有会让中央区矮三四十点,
+/// `central_px` → `compute_geoms` → `apply_geometry` 发一次 `window_change`
+/// (T4),远端 tmux 整屏重排 —— 用户看到的就是「一开编辑窗,后面的 pane
+/// 刷了一次屏」,关窗时列表变空再刷一次。
+///
+/// 外部编辑相反:它没有窗口,这一行是「我还欠着一次回传」的**唯一**可见性
+/// 来源,那一次 `window_change` 是它该付的代价。
+///
+/// **只滤显示,不动 `sessions`**:退出确认(D3-12)与临时文件清理仍要看见
+/// 内置那几条 —— 它们照样会走到 `Uploading`/`Conflict`/`Failed`。
+fn listed(edits: &EditSessions) -> impl Iterator<Item = &EditEntry> {
+    edits.iter().filter(|e| e.kind != EditKind::Inline)
+}
+
 pub fn show(
     ctx: &egui::Context,
     t: &Theme,
     edits: &EditSessions,
     expanded: &mut bool,
 ) -> Option<EditUiAction> {
-    if edits.is_empty() {
+    let total = listed(edits).count();
+    // 判据是「**要列出来的**有没有」,不是 `edits.is_empty()` —— 后者在只有
+    // 内置编辑时仍为假,面板照样画出来,那一次刷屏就白省了。
+    if total == 0 {
         return None;
     }
     let mut action = None;
-    let total = edits.iter().count();
-    let pending = edits.iter().filter(|e| e.has_unsent_changes()).count();
+    let pending = listed(edits).filter(|e| e.has_unsent_changes()).count();
     egui::TopBottomPanel::bottom("edit-list")
         .frame(
             egui::Frame::none()
@@ -129,12 +150,15 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .max_height(140.0)
                 .show(ui, |ui| {
-                    for e in edits.iter() {
+                    for e in listed(edits) {
                         ui.horizontal(|ui| {
                             // 弹窗外:这一栏是上面那个 `TopBottomPanel::bottom`,
                             // 底色 `panel_bg`(#14161f),`fg_dim` 在它上面 8.05:1。
                             ui.colored_label(
                                 theme::c32(t.fg_dim),
+                                // F216 起 `listed` 只放外部编辑进来,这个 match
+                                // 于是恒走上面那一支。**仍写穷尽**:哪天放宽了
+                                // 过滤,编译器会逼着这里一起想清楚。
                                 match e.kind {
                                     EditKind::External => "外部",
                                     EditKind::Inline => "内置",
