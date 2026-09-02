@@ -367,8 +367,9 @@ pub fn show(
         // 顶回去,于是「高度调不动」;四角对角拖里的竖向分量同样被吃掉,
         // 看起来就成了「角上只能改宽」。
         //
-        // 改成这个结构之后,内容高度**恒等于**窗口内容区高度,那句 `max()`
-        // 永远是 no-op。猜出来的 `reserve` 一并删掉,顺带治好「脏了多出一条
+        // 改成这个结构之后,内容高度**永远不超过**窗口内容区高度(底部按钮行
+        // 由布局摆到底,正文在剩下的矩形里长,长不出去),那句 `max()` 再也
+        // 抬不高窗口。猜出来的 `reserve` 一并删掉,顺带治好「脏了多出一条
         // 确认行就把窗口顶高一截、且再也降不回来」。
         //
         // 两层 `with_layout` 都不带尺寸参数是有意的:`Ui::with_layout` 走
@@ -431,12 +432,12 @@ pub fn show(
                 // 合成一个 `&mut s` 传进去就借冲突了。
                 let hl = s.hl.as_mut().expect("上面刚建好");
                 let mut layouter = |ui: &egui::Ui, text: &str, w: f32| hl.layout(ui, text, w);
+                // 这里**不要**加 `auto_shrink([false, false])`。试过,是空操作:
+                // 画面上那块 `term_bg` 是 `TextEdit` 自己的底(高度由
+                // `desired_rows(20)` 与正文行数决定),不是 `ScrollArea` 的外框,
+                // 缩不缩外框一个像素都不差(实测两组矩形逐位相同)。加了只是让
+                // 后来人以为它在守什么。
                 egui::ScrollArea::vertical()
-                    // F217:**不许 auto_shrink**。缩到内容自然高度的话,窗口
-                    // 内容就比窗口本身矮一截,而短文件下这一截可以很大 ——
-                    // 用户拖高的窗口在下一帧被 `Resize` 按 `last_content_size`
-                    // 收回去,拖了等于没拖。
-                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut s.text)
@@ -963,8 +964,9 @@ mod tests {
     /// - **没爬到天花板**:稳定值必须还在默认尺寸附近。只有这一条的话,
     ///   一个爬到一半的窗口在第 5 帧就能通过。
     ///
-    /// 自证会变红:把正文那个 `ScrollArea` 的 `.auto_shrink([false, false])`
-    /// 删掉,或者把 `with_layout(bottom_up)` 那层拆回「先正文、后按钮行」。
+    /// 自证会变红:把正文那层 `with_layout(bottom_up)` 拆回旧写法 ——
+    /// 先摆正文、再摆按钮行,正文高度用 `available_height() - reserve` 反推
+    /// (`reserve` 是猜的常数,猜小多少每帧就爬多少)。
     #[test]
     fn the_window_height_does_not_creep_upward_frame_after_frame() {
         let mut s = editable();
@@ -997,9 +999,9 @@ mod tests {
     /// (窗口早就爬到天花板了)。所以**必须测「拖完之后再跑几帧还是矮的」**
     /// —— 只断言拖拽当帧变矮的话,那个被顶回去的实现照样绿。
     ///
-    /// 自证会变红:把 `.auto_shrink([false, false])` 删掉(正文缩回自然高度、
-    /// 短文件下窗口当场被拉回内容高度);或把 `min_size(MIN_SIZE)` 改成
-    /// `fixed_size(..)`(整个拖不动)。
+    /// 自证会变红:把 `.min_size(MIN_SIZE)` 改成 `.fixed_size(..)`
+    /// —— 后者会把 `resizable` 一起置成 `Vec2b::FALSE`(egui 0.30
+    /// `containers/window.rs`),拖拽整个消失。
     #[test]
     fn dragging_the_bottom_edge_shortens_the_window_and_it_stays_short() {
         let mut s = editable();
