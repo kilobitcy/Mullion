@@ -964,9 +964,15 @@ mod tests {
     /// - **没爬到天花板**:稳定值必须还在默认尺寸附近。只有这一条的话,
     ///   一个爬到一半的窗口在第 5 帧就能通过。
     ///
-    /// 自证会变红:把正文那层 `with_layout(bottom_up)` 拆回旧写法 ——
-    /// 先摆正文、再摆按钮行,正文高度用 `available_height() - reserve` 反推
-    /// (`reserve` 是猜的常数,猜小多少每帧就爬多少)。
+    /// 自证会变红(**实测**,804.7 → 918 一路爬到天花板):把这段布局整体
+    /// 拆回旧写法 —— 外层改 `top_down`、正文摆在按钮行**前面**、正文高度用
+    /// `available_height() - reserve` 反推。这条与下面「底边拖」「对角拖」
+    /// 两条会同时红,因为用户报的那三件事本来就是同一个根因。
+    ///
+    /// 注意**没有哪个单行变异杀得掉它**:`ScrollArea` 自己就 `at_most(可用
+    /// 空间)`,往它身上加 `max_height(可用 + 20)`、或在正文前面
+    /// `allocate_space` 一段,都会被它吸收掉,窗口纹丝不动(两个都试过)。
+    /// 守住这条的是**结构**(底部先摆、正文吃剩下的),不是某一行参数。
     #[test]
     fn the_window_height_does_not_creep_upward_frame_after_frame() {
         let mut s = editable();
@@ -999,9 +1005,10 @@ mod tests {
     /// (窗口早就爬到天花板了)。所以**必须测「拖完之后再跑几帧还是矮的」**
     /// —— 只断言拖拽当帧变矮的话,那个被顶回去的实现照样绿。
     ///
-    /// 自证会变红:把 `.min_size(MIN_SIZE)` 改成 `.fixed_size(..)`
-    /// —— 后者会把 `resizable` 一起置成 `Vec2b::FALSE`(egui 0.30
-    /// `containers/window.rs`),拖拽整个消失。
+    /// 自证会变红(**实测**):把布局拆回旧写法(见上一条),或把
+    /// `.min_size(MIN_SIZE)` 换成 `.fixed_size(..)` —— 后者会把 `resizable`
+    /// 一起置成 `Vec2b::FALSE`(egui 0.30 `containers/window.rs`),拖拽整个
+    /// 消失。
     #[test]
     fn dragging_the_bottom_edge_shortens_the_window_and_it_stays_short() {
         let mut s = editable();
@@ -1042,7 +1049,9 @@ mod tests {
     /// 「角上只能改宽」。这条因此是**回归锁**:哪天有人给窗口加了
     /// `resizable([true, false])` 之类的东西,竖向分量会再次静默消失。
     ///
-    /// 自证会变红:把 `.resizable(true)` 改成 `.resizable([true, false])`。
+    /// 自证会变红(**实测**):把 `theme::RESIZE_CORNER_GRAB` 改回 egui 默认
+    /// 的 10.0(正角上边带重新赢过角,竖向分量丢光),或把布局拆回旧写法
+    /// (见上面那条爬升测试)。
     #[test]
     fn dragging_a_corner_changes_both_width_and_height() {
         let mut s = editable();
