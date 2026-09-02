@@ -437,35 +437,34 @@ pub fn show(
                 // `desired_rows(20)` 与正文行数决定),不是 `ScrollArea` 的外框,
                 // 缩不缩外框一个像素都不差(实测两组矩形逐位相同)。加了只是让
                 // 后来人以为它在守什么。
-                egui::ScrollArea::vertical()
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut s.text)
-                                .code_editor()
-                                // F215:语法高亮。`layouter` 每帧都跑,增量与
-                                // 缓存全在 `highlight::Cache` 里 —— 见那个
-                                // 模块的头注释。
-                                .layouter(&mut layouter)
-                                // F207:正文区底色 = 终端底色 `term_bg`。用户
-                                // 看的是远端文件,底色跟终端一致才连得上「这
-                                // 就是那台机器上的东西」;而窗口壳仍是
-                                // `modal_bg`(#3f3f3f),两层色差本身就是
-                                // 「哪块能打字」的边界。
-                                //
-                                // 走 `background_color` 而不是改
-                                // `Visuals::extreme_bg_color` —— 后者是全局量,
-                                // 一改所有 `TextEdit`(会话表单、路径条、改名
-                                // 框)跟着变,而那些贴在 `panel_bg` 上、本来
-                                // 就配好了。
-                                .background_color(theme::c32(t.term_bg))
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(20)
-                                // 只读一律靠这一条落地。靠「保存按钮置灰」是
-                                // 不够的:用户改了半天才发现存不了,那些改动
-                                // 全白费。
-                                .interactive(s.read_only.is_none()),
-                        );
-                    });
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut s.text)
+                            .code_editor()
+                            // F215:语法高亮。`layouter` 每帧都跑,增量与
+                            // 缓存全在 `highlight::Cache` 里 —— 见那个
+                            // 模块的头注释。
+                            .layouter(&mut layouter)
+                            // F207:正文区底色 = 终端底色 `term_bg`。用户
+                            // 看的是远端文件,底色跟终端一致才连得上「这
+                            // 就是那台机器上的东西」;而窗口壳仍是
+                            // `modal_bg`(#3f3f3f),两层色差本身就是
+                            // 「哪块能打字」的边界。
+                            //
+                            // 走 `background_color` 而不是改
+                            // `Visuals::extreme_bg_color` —— 后者是全局量,
+                            // 一改所有 `TextEdit`(会话表单、路径条、改名
+                            // 框)跟着变,而那些贴在 `panel_bg` 上、本来
+                            // 就配好了。
+                            .background_color(theme::c32(t.term_bg))
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(20)
+                            // 只读一律靠这一条落地。靠「保存按钮置灰」是
+                            // 不够的:用户改了半天才发现存不了,那些改动
+                            // 全白费。
+                            .interactive(s.read_only.is_none()),
+                    );
+                });
             });
         });
     });
@@ -1016,7 +1015,12 @@ mod tests {
         let ctx = egui::Context::default();
         let before = settle(&ctx, &mut s, 5);
         // 底边中点。`resize_grab_radius_side` 默认 5 点,正中最稳。
-        drag(&ctx, &mut s, before.center_bottom(), egui::vec2(0.0, -150.0));
+        drag(
+            &ctx,
+            &mut s,
+            before.center_bottom(),
+            egui::vec2(0.0, -150.0),
+        );
         let dragged = s.as_ref().unwrap().last_rect.expect("拖完没有几何");
         assert!(
             (dragged.height() - (before.height() - 150.0)).abs() < 6.0,
