@@ -74,7 +74,7 @@ pub enum FileAction {
         from: mullion_ssh::sftp::RemotePath,
         to: mullion_ssh::sftp::RemotePath,
     },
-    /// F219:请求进入就地新建态(右键菜单;`Ctrl+N` 尚未接线,留给 A5)。
+    /// F219:请求进入就地新建态(右键菜单 / `Ctrl+N`)。
     /// 真正的写操作要等用户在那一行里敲完名字回车,由 `NewFile` 发出。
     BeginNewFile,
     /// F219:就地新建文件提交。**绝对路径**,在面板里用同一个 `cwd` 拼好 ——

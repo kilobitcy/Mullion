@@ -4229,8 +4229,7 @@ impl App {
                 return;
             }
             // F219:同 `Rename` —— 本地栏根本进不了新建态(`menu_items_for`
-            // 不给这一项;`Ctrl+N` 快捷键还没接线,是 A5 的活,接的时候
-            // 也只会在远端栏放行)。
+            // 不给这一项,`handle_panel_key` 的 Ctrl+N 也只在远端栏放行)。
             FileAction::BeginNewFile | FileAction::NewFile(_) => {
                 log::warn!("本地栏收到了新建文件请求,已忽略(D5)");
                 return;
