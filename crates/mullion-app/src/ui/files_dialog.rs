@@ -1218,9 +1218,16 @@ mod tests {
     /// I1 复核:三条出路里只有「覆盖」不可逆吃数据(正文说明里也写了
     /// 「不可逆」),必须标危险色(F119)——同惯例见 `Conflict`(469 行
     /// 附近)/`Delete`(346 行附近)两处一样的写法。`dialog_texts` 只查
-    /// 文案在不在,查不出颜色,这里另开一条扫源码的:PasteConflict 那段
-    /// 模态体里,「覆盖」和 `danger_text` 必须挨在一起,且要排在「跳过
-    /// 同名」之前(避免扫到下一个按钮头上去)。
+    /// 文案在不在,查不出颜色,这里另开一条扫源码的。
+    ///
+    /// **不能**只查「覆盖」和 `danger_text` 是否同时出现在批量冲突框那段
+    /// 模态体里——这段模态体开头的警示行(`有 {n} 项与目标目录里的同名`)
+    /// 本来就用 `danger_text` 上色,跟按钮本身有没有标色是两回事,第一版
+    /// 守护就是被这个假阳性坑了(把按钮的 `.color(..)` 删掉之后,守护\
+    /// 仍然读到警示行那个 `danger_text` 而不报警,自证时才发现)。这里改
+    /// 成从 `"覆盖"` 这个按钮标签的字面位置起,只看紧跟着到 `.clicked()`
+    /// 之间的一小段 —— 这才是按钮自己的样式,不会被前面不相干的
+    /// `danger_text` 顶替。
     #[test]
     fn the_paste_conflict_overwrite_button_is_marked_danger() {
         let src = include_str!("files_dialog.rs");
@@ -1233,11 +1240,18 @@ mod tests {
             .find("跳过同名")
             .unwrap_or_else(|| panic!("批量冲突框里没找到「跳过同名」—— 这条测试的锚点失效了"));
         let before_skip = &after[..skip_end];
+        let btn_at = before_skip
+            .find("\"覆盖\"")
+            .unwrap_or_else(|| panic!("批量冲突框里没找到「覆盖」按钮 —— 这条测试的锚点失效了"));
+        let from_btn = &before_skip[btn_at..];
+        let clicked_at = from_btn.find(".clicked()").unwrap_or(from_btn.len());
+        let btn_chain = &from_btn[..clicked_at];
         assert!(
-            before_skip.contains("\"覆盖\"") && before_skip.contains("danger_text"),
-            "批量冲突框的「覆盖」按钮没有标危险色(F119)——它是三条出路里\
-             唯一不可逆吃数据的那条,同惯例见 `Conflict`/`Delete` 两处:\
-             {before_skip}"
+            btn_chain.contains("danger_text"),
+            "批量冲突框的「覆盖」按钮自己的样式链(从标签到 .clicked() 之间)\
+             没有标危险色(F119)——它是三条出路里唯一不可逆吃数据的那条,\
+             同惯例见 `Conflict`/`Delete` 两处;查的是按钮自己的样式,不是\
+             这段模态体里随便哪处的 danger_text:{btn_chain}"
         );
     }
 
