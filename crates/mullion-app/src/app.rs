@@ -1158,6 +1158,16 @@ fn files_renaming_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> bool {
         .is_some_and(|f| f.remote.rename_edit.is_some())
 }
 
+/// `files_new_file_editing` 的纯逻辑核心,理由同 `files_renaming_of`。
+///
+/// **只看远端栏**:本地栏根本进不了就地新建态(设计 D5)。
+fn files_new_file_editing_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> bool {
+    files_owner_generation_of(tabs, sidebar_open)
+        .and_then(|g| tabs.by_generation(g))
+        .and_then(|t| t.content.files_panel())
+        .is_some_and(|f| f.remote.new_edit.is_some())
+}
+
 /// `App::effective_focus` 的纯逻辑核心,理由同上。三条分支里前两条(活动标签
 /// 是 Terminal、侧栏开/关)能用真实构造的 `TerminalTab` 单测;第三条(活动
 /// 标签是 Files)测不到——`FilesTab::conn` 是 `Arc<SshConnection>`,
@@ -2319,6 +2329,12 @@ enum Modal {
     ///
     /// **不进 `touched_store`**:它一行 store 都不写(同 `FilesPathEdit`)。
     FilesRename,
+    /// F219:文件面板里有一行正在**就地新建**。理由与 `FilesRename` 逐字
+    /// 相同 —— 那个输入框收不到任何键(T8),Backspace 还会被
+    /// `handle_panel_key` 解释成「回上级目录」,一按就跳走。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写(同 `FilesPathEdit`)。
+    FilesNewName,
     /// F148:「恢复上次的现场」弹窗。里面没有输入框,但有一颗一按就摆回
     /// 整个标签栏的「恢复」按钮,而空格/回车在 egui 里是按钮的激活键 ——
     /// 同 `Modal::Import` 的理由(T8)。
@@ -2342,6 +2358,7 @@ impl Modal {
         Modal::Rehost,
         Modal::FilesPathEdit,
         Modal::FilesRename,
+        Modal::FilesNewName,
         Modal::History,
     ];
 }
@@ -3508,6 +3525,8 @@ impl App {
             Modal::FilesPathEdit => self.files_path_editing(),
             // F200:见 `Modal::FilesRename` 的说明。
             Modal::FilesRename => self.files_renaming(),
+            // F219:见 `Modal::FilesNewName` 的说明。
+            Modal::FilesNewName => self.files_new_file_editing(),
             // F148:见 `Modal::History` 的说明(T8)。
             Modal::History => self.ui.history.is_some(),
         })
@@ -3542,6 +3561,11 @@ impl App {
     /// F200:文件面板里有没有一行正在就地改名(`Modal::FilesRename` 的判据)。
     fn files_renaming(&self) -> bool {
         files_renaming_of(&self.tabs, self.ui.files_sidebar_open)
+    }
+
+    /// F219:文件面板里有没有一行正在就地新建(`Modal::FilesNewName` 的判据)。
+    fn files_new_file_editing(&self) -> bool {
+        files_new_file_editing_of(&self.tabs, self.ui.files_sidebar_open)
     }
 
     /// 这一帧真正生效的键盘焦点(协调者修订 2)。裸的 `self.focus` 只是用户
@@ -4554,7 +4578,7 @@ impl App {
         key: &winit::keyboard::Key,
         mods: ModifiersState,
     ) {
-        use crate::ui::files_panel::FileAction;
+        use crate::ui::files_panel::{FileAction, PanelColumn};
         use winit::keyboard::{Key as WinitKey, NamedKey};
 
         // Ctrl+H:切隐藏文件。得先判——它落进 `WinitKey::Character("h")` 分支,
@@ -4563,6 +4587,19 @@ impl App {
             if let WinitKey::Character(s) = key {
                 if s.as_str() == "h" {
                     self.dispatch_panel_action(generation, FileAction::ToggleHidden);
+                    return;
+                }
+                // F219:Ctrl+N 就地新建文件。**只在远端栏**(D5)——焦点在
+                // 本地栏时静默不动,不是转投远端栏,理由同 Delete/F2。
+                if s.as_str() == "n" {
+                    let column = self
+                        .tabs
+                        .by_generation(generation)
+                        .and_then(|t| t.content.files_panel())
+                        .map(|f| f.active_column);
+                    if column == Some(PanelColumn::Remote) {
+                        self.dispatch_panel_action(generation, FileAction::BeginNewFile);
+                    }
                     return;
                 }
             }
@@ -12526,6 +12563,53 @@ mod tests {
         );
     }
 
+    /// F219/T8:就地新建的输入框必须登记成模态 —— 不登记的话面板持有键盘
+    /// 焦点时那个框**一个键都收不到**,而 Backspace 还会被 `handle_panel_key`
+    /// 解释成「回上级目录」,一按就跳走。
+    ///
+    /// 自证会变红:把 `Modal::FilesNewName` 从 `Modal::ALL` 里删掉。
+    #[test]
+    fn the_new_file_editor_is_registered_as_a_modal_so_it_can_receive_keys() {
+        assert!(
+            Modal::ALL.contains(&Modal::FilesNewName),
+            "FilesNewName 没登记进 Modal::ALL(T8)"
+        );
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self)")
+            .nth(1)
+            .expect("找不到 modal_open");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            body.contains("Modal::FilesNewName => self.files_new_file_editing()"),
+            "modal_open 里没有 FilesNewName 独立的那一臂(T8)"
+        );
+    }
+
+    /// F219:`Ctrl+N` 只在**远端栏**放行。焦点在本地栏时静默不动,不是转投
+    /// 远端栏 —— 用户看着本地栏按键、结果动了远端,是这一片最坏的后果
+    /// (与 Delete/F2 同一条判据)。
+    ///
+    /// 自证会变红:把 `handle_panel_key` 里 Ctrl+N 那段的栏判断删掉。
+    #[test]
+    fn ctrl_n_only_starts_a_new_file_on_the_remote_column() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn handle_panel_key(")
+            .nth(1)
+            .expect("找不到 handle_panel_key");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let at = body
+            .find("\"n\"")
+            .expect("Ctrl+N 没接上 —— 键盘那条入口不存在");
+        let arm = &body[at..at + 400.min(body.len() - at)];
+        assert!(
+            arm.contains("PanelColumn::Remote"),
+            "Ctrl+N 没判栏 —— 在本地栏按会动到远端(D5)"
+        );
+        assert!(arm.contains("BeginNewFile"), "Ctrl+N 没派发 BeginNewFile");
+    }
+
     /// F200:F2 / 右键「重命名」**不再弹对话框**,而是让那一行进编辑态。
     ///
     /// 「就在 SFTP 里改名」是这条需求的全部内容 —— 走回对话框等于没做。
@@ -13116,6 +13200,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::FilesRename),
                     "FilesRename 没登记进 Modal::ALL(T8/F200)"
                 ),
+                Modal::FilesNewName => assert!(
+                    Modal::ALL.contains(&Modal::FilesNewName),
+                    "FilesNewName 没登记进 Modal::ALL(T8/F219)"
+                ),
                 Modal::History => assert!(
                     Modal::ALL.contains(&Modal::History),
                     "History 没登记进 Modal::ALL(T8/F148)"
@@ -13140,6 +13228,7 @@ mod tests {
             Modal::Rehost,
             Modal::FilesPathEdit,
             Modal::FilesRename,
+            Modal::FilesNewName,
             Modal::History,
         ] {
             check(m);
