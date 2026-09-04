@@ -526,9 +526,19 @@ fn scroll_id_salt(id: &str, generation: u64) -> String {
 /// - `clip.mode == Cut` 才有值,`Copy` 恒空集(复制的源行不该变淡)。
 /// - **只在远端栏算**(D5:剪贴板只在远端出现),本地栏恒空集,不会被
 ///   同名文件误伤。
+/// - **逐条比较父目录 == `cwd`**,不是整批信一个目录(代码质量复核挖出
+///   的缺口):剪贴板里的路径可能横跨好几个目录被攒下(今天调用方总是
+///   一批同目录选中项,但那是调用方的巧合,不是这份函数能假设的前提 ——
+///   本切片已经吃过一次「隐含前提不成立就静默失效」的亏,见 `mullion-ssh`
+///   那道覆盖闸的尾斜杠)。在 `/a` 剪切 `foo` 后切到 `/b`,`/b` 里那个从没
+///   被剪切过的 `foo` 不该被画淡——那是谎报「已剪走待落地」的假信号。
+///
+/// 末段名字复用 `clip::last_segment`(权威定义处,`unique_name`/
+/// `conflicts`/`plan_paste` 都靠它),不在这里另拷一份。
 fn cut_names_for(
     clip: Option<&RemoteClip>,
     column: PanelColumn,
+    cwd: &mullion_ssh::sftp::RemotePath,
 ) -> std::collections::BTreeSet<Vec<u8>> {
     if column != PanelColumn::Remote {
         return std::collections::BTreeSet::new();
@@ -537,13 +547,8 @@ fn cut_names_for(
         .map(|c| {
             c.items
                 .iter()
-                .map(|(p, _)| {
-                    p.as_bytes()
-                        .rsplit(|b| *b == b'/')
-                        .next()
-                        .unwrap_or_default()
-                        .to_vec()
-                })
+                .filter(|(p, _)| &p.parent() == cwd)
+                .map(|(p, _)| crate::files::clip::last_segment(p))
                 .collect()
         })
         .unwrap_or_default()
@@ -935,7 +940,7 @@ pub fn show(
     let owners = &state.owners;
     // F220:剪切源要画淡的那批**末段名字**。抽成纯函数(见 `cut_names_for`
     // 的文档)——没有 egui 依赖,可以脱离渲染直接单测判据本身。
-    let cut_names = cut_names_for(clip, column);
+    let cut_names = cut_names_for(clip, column, &state.cwd);
     /// 点中的那一条 + 当时按着的修饰键(ctrl, shift)。F54 的多选语义在
     /// `PaneState::click_row` 里,这里只负责把「点了什么、按着什么」带出闭包。
     type Click = (mullion_ssh::sftp::RemotePath, bool, bool);
@@ -1528,15 +1533,18 @@ fn row(
         theme::c32(t.fg)
     };
     // D1/F127:类型图标。判类看 `EntryKind` + 扩展名 + x 位,颜色跟
-    // 可操作性同源(不可操作 → 与文字一样是 dim),不另算一套 —— 否则会
-    // 出现「文字灰了图标还亮着」这种自相矛盾的行。排在名称文字之前画,
-    // 视觉上图标在名字左边。
+    // 可操作性、剪切降色都同源(不可操作/已剪切 → 与文字一样是 dim),
+    // 不另算一套 —— 否则会出现「文字灰了图标还亮着」这种自相矛盾的行
+    // (F220 代码质量复核挖出:图标原来没跟着 `dimmed` 走)。排在名称文字
+    // 之前画,视觉上图标在名字左边。
     let icon_kind = crate::ui::file_icon::classify(e.kind, e.name.display().as_ref(), e.mode);
     crate::ui::file_icon::paint(
         p,
         icon_rect(rect),
         icon_kind,
-        theme::c32(crate::ui::file_icon::color_for(icon_kind, usable, t)),
+        theme::c32(crate::ui::file_icon::color_for(
+            icon_kind, usable, dimmed, t,
+        )),
     );
 
     let mut label = e.name.display().to_string();
@@ -3208,6 +3216,7 @@ mod tests {
     /// 删掉(复制的源行也跟着变淡)。
     #[test]
     fn cut_names_for_is_empty_for_copy_and_for_the_local_column() {
+        let a = RemotePath::from_bytes(b"/a".to_vec());
         let cut = RemoteClip {
             mode: ClipMode::Cut,
             items: vec![(RemotePath::from_bytes(b"/a/b.txt".to_vec()), false)],
@@ -3217,7 +3226,7 @@ mod tests {
             items: vec![(RemotePath::from_bytes(b"/a/b.txt".to_vec()), false)],
         };
 
-        let names = cut_names_for(Some(&cut), PanelColumn::Remote);
+        let names = cut_names_for(Some(&cut), PanelColumn::Remote, &a);
         assert_eq!(
             names,
             [b"b.txt".to_vec()].into_iter().collect(),
@@ -3225,16 +3234,47 @@ mod tests {
         );
 
         assert!(
-            cut_names_for(Some(&copy), PanelColumn::Remote).is_empty(),
+            cut_names_for(Some(&copy), PanelColumn::Remote, &a).is_empty(),
             "Copy 模式不该有任何名字变淡——源文件还在原地,不是「已挪走待落地」"
         );
         assert!(
-            cut_names_for(Some(&cut), PanelColumn::Local).is_empty(),
+            cut_names_for(Some(&cut), PanelColumn::Local, &a).is_empty(),
             "本地栏恒空集(D5:剪贴板只在远端出现),不然会被同名文件误伤"
         );
         assert!(
-            cut_names_for(None, PanelColumn::Remote).is_empty(),
+            cut_names_for(None, PanelColumn::Remote, &a).is_empty(),
             "没有剪贴板时自然是空集"
+        );
+    }
+
+    /// F220 代码质量复核挖出的真缺口:`cut_names_for` 原来只按末段名字
+    /// 判,全程没比较 `cwd` —— 在 `/a` 剪切 `foo` 后切到 `/b`,`/b` 里那个
+    /// 从没被剪切过的 `foo` 会被一起画淡,谎报「已剪走待落地」。
+    ///
+    /// **逐条比较**(不是整批信一个目录):剪贴板里混着 `/a/foo`(当前目录
+    /// 之外)和 `/b/bar`(当前目录之内)时,只有 `bar` 该出现在集合里。
+    ///
+    /// 自证会变红:把 `.filter(|(p, _)| &p.parent() == cwd)` 删掉。
+    #[test]
+    fn cut_names_for_only_dims_entries_whose_parent_is_the_current_cwd() {
+        let cut = RemoteClip {
+            mode: ClipMode::Cut,
+            items: vec![
+                (RemotePath::from_bytes(b"/a/foo".to_vec()), false),
+                (RemotePath::from_bytes(b"/b/bar".to_vec()), false),
+            ],
+        };
+        let cwd = RemotePath::from_bytes(b"/b".to_vec());
+
+        let names = cut_names_for(Some(&cut), PanelColumn::Remote, &cwd);
+        assert!(
+            !names.contains(b"foo".as_slice()),
+            "foo 是 /a 底下剪的,切到 /b 之后不该跟着变淡——/b 里同名的 foo\
+             (如果有)从没被剪切过"
+        );
+        assert!(
+            names.contains(b"bar".as_slice()),
+            "bar 就在当前目录 /b 底下,该出现在集合里"
         );
     }
 

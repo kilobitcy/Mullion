@@ -394,13 +394,23 @@ pub fn paint(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, color: e
 
 /// F127:类型 → 颜色。**不可操作的行恒 `fg_dimmer`**,与名称文字同源 ——
 /// 两套判据会出现「文字灰了图标还亮着」这种自相矛盾的行(D1 定的闸门)。
+/// F220 代码质量复核挖出的缺口:剪切后文字降成 `fg_muted`,图标却还是
+/// 彩色的「文字灰了图标还亮着」——`dimmed` 复用的是**同一个** `fg_muted`
+/// token,跟 `row()` 里文字用的那份同源,没有新造色值(UI 视觉规格已冻结,
+/// 新色值要设计拍板)。判据顺序同 `row()` 的 `fg`:`!usable` 优先于
+/// `dimmed`——名字本身发不出 wire 请求这件事,比「已剪切待落地」更该被
+/// 看见。
 pub fn color_for(
     kind: IconKind,
     usable: bool,
+    dimmed: bool,
     t: &crate::theme::Theme,
 ) -> mullion_term::snapshot::Rgb {
     if !usable {
         return t.fg_dimmer;
+    }
+    if dimmed {
+        return t.fg_muted;
     }
     match kind {
         IconKind::Dir => t.icon_dir,
@@ -558,8 +568,35 @@ mod tests {
     #[test]
     fn unusable_rows_stay_dim_even_with_type_colors() {
         let t = crate::theme::MULLION_DARK;
-        assert_eq!(color_for(IconKind::Archive, true, &t), t.icon_archive);
-        assert_eq!(color_for(IconKind::Archive, false, &t), t.fg_dimmer);
+        assert_eq!(
+            color_for(IconKind::Archive, true, false, &t),
+            t.icon_archive
+        );
+        assert_eq!(color_for(IconKind::Archive, false, false, &t), t.fg_dimmer);
+    }
+
+    /// F220 代码质量复核挖出的缺口:剪切后文字降成 `fg_muted`,图标原来
+    /// 没跟着走,还是类型色 —— 出现「文字灰了图标还亮着」这种自相矛盾的
+    /// 行,正是上面那条测试守的同一条原则,只是换了个触发轴(`dimmed`
+    /// 而不是 `usable`)。判据顺序同 `row()` 的 `fg`:`!usable` 优先于
+    /// `dimmed`。
+    ///
+    /// 自证会变红:
+    /// - 删掉 `color_for` 里 `if dimmed` 那一支 → 断言 1 红。
+    /// - 把 `if dimmed` 挪到 `if !usable` 前面 → 断言 2 红(不可操作该赢)。
+    #[test]
+    fn cut_dimming_reaches_the_icon_too_but_yields_to_unusable() {
+        let t = crate::theme::MULLION_DARK;
+        assert_eq!(
+            color_for(IconKind::Archive, true, true, &t),
+            t.fg_muted,
+            "可操作 + 已剪切:图标该降成 fg_muted,跟文字同一个 token"
+        );
+        assert_eq!(
+            color_for(IconKind::Archive, false, true, &t),
+            t.fg_dimmer,
+            "不可操作 + 已剪切:不可操作优先,图标该是 fg_dimmer 不是 fg_muted"
+        );
     }
 
     /// F134:「不认识的普通文件」和「设备/socket 这类特殊类型」必须是两种

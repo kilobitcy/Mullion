@@ -43,7 +43,11 @@ pub struct PastePlan {
 }
 
 /// 路径的末段(不含目录)。空路径 / 结尾是 `/` 时给空切片。
-fn last_segment(p: &RemotePath) -> Vec<u8> {
+///
+/// `pub(crate)`:F220 代码质量复核挖出 `ui::files_panel::cut_names_for`
+/// 内联了逐字等价的一份 —— 这条路径解析规则的权威定义在这儿
+/// (`unique_name`/`conflicts`/`plan_paste` 都靠它),不该在 crate 里拷第二份。
+pub(crate) fn last_segment(p: &RemotePath) -> Vec<u8> {
     p.as_bytes()
         .rsplit(|b| *b == b'/')
         .next()

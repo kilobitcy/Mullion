@@ -4409,6 +4409,11 @@ impl App {
                 } else {
                     crate::files::clip::ClipMode::Copy
                 };
+                let verb = if mode == crate::files::clip::ClipMode::Cut {
+                    "剪切"
+                } else {
+                    "复制"
+                };
                 if let Some(files) = self
                     .tabs
                     .by_generation_mut(generation)
@@ -4422,15 +4427,22 @@ impl App {
                     // `delete_targets_are_absolute_paths_paired_with_dir_flags`)。
                     let items = files.remote.delete_targets();
                     if items.is_empty() {
+                        // F220 代码质量复核挖出的缺口:右键「复制」/「剪切」
+                        // 只按 `target.is_some()` 置灰(见 `menu_items_for`),
+                        // 不看这一行能不能操作 —— 名字非 UTF-8 的行照样可点。
+                        // `delete_targets()` 把这类行过滤掉后 `items` 为空,
+                        // 原来这里悄悄 `return`,用户会以为拷进去了。同一臂
+                        // 的成功路径明确飘了吐司,空集分支不能什么都不做。
+                        self.ui.set_toast(
+                            crate::ui::toast::Kind::Warn,
+                            format!("选中的项无法{verb}——名称含程序处理不了的字符"),
+                        );
+                        mark_ui_dirty!(self.ui_dirty);
+                        self.request_ui_redraw();
                         return;
                     }
                     let n = items.len();
                     files.clip = Some(crate::files::clip::RemoteClip { mode, items });
-                    let verb = if mode == crate::files::clip::ClipMode::Cut {
-                        "剪切"
-                    } else {
-                        "复制"
-                    };
                     self.ui
                         .set_toast(crate::ui::toast::Kind::Ok, format!("已{verb} {n} 项"));
                     mark_ui_dirty!(self.ui_dirty);
@@ -12871,6 +12883,39 @@ mod tests {
         assert!(
             arm.contains("delete_targets()"),
             "ClipCopy/ClipCut 没有复用 delete_targets() —— 又在别处重新拼了一份路径"
+        );
+    }
+
+    /// F220 代码质量复核挖出的缺口:全部选中项都不可操作(比如名字非
+    /// UTF-8)时,`delete_targets()` 过滤完是空集。右键菜单的「复制」/
+    /// 「剪切」只按 `target.is_some()` 置灰(`menu_items_for`),不看这一行
+    /// 能不能操作 —— 用户点得下去,点了却什么反馈都没有,会以为拷进去了。
+    /// 同一臂的成功路径明确飘了吐司,空集分支不能什么都不做。
+    ///
+    /// 窗口卡在下一句 `let n = items.len();`(空集分支执行不到那句,
+    /// 成功分支才会走到),不用固定字符数——避免读到后面成功分支自己的
+    /// `set_toast` 调用,把「空集分支没反馈」的坏改动错判成绿。
+    ///
+    /// 自证会变红:把空集分支里 `self.ui.set_toast(...)` 那句删掉。
+    #[test]
+    fn clip_copy_with_nothing_operable_still_tells_the_user() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("FileAction::ClipCopy | FileAction::ClipCut => {")
+            .nth(1)
+            .expect("找不到 ClipCopy/ClipCut 那一臂");
+        let end = after
+            .find("FileAction::ClipPaste =>")
+            .expect("找不到 ClipCopy/ClipCut 那一臂的结尾");
+        let arm = &after[..end];
+        let empty_at = arm.find("items.is_empty()").expect("找不到空集判断");
+        let branch_end = arm
+            .find("let n = items.len();")
+            .expect("找不到成功分支的起点(用来给空集分支的窗口封顶)");
+        let empty_branch = &arm[empty_at..branch_end];
+        assert!(
+            empty_branch.contains("set_toast"),
+            "全部选中项都不可操作时该有个吐司告诉用户,不是悄悄 return"
         );
     }
 
