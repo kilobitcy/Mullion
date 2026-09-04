@@ -9172,17 +9172,6 @@ impl ApplicationHandler<UserEvent> for App {
                             crate::ui::files_panel::PanelColumn::Remote,
                             crate::ui::files_panel::FileAction::Refresh,
                         );
-                        // F219:`reveal_pick` 必须写在这次 `Refresh` **之后**。
-                        // 现在的 `PaneState::begin_load` 并不清 `reveal_pick`
-                        // (它只清 selected/cursor/anchor 与
-                        // rename_edit/new_edit),所以今天写在前面不会被
-                        // 立刻冲掉;但 `reveal_pick` 的语义是「等**下一次
-                        // 刷新**回来之后选中这一条」,顺序颠倒就是把因果写反
-                        // ——而且 `invalidate()` 已经把 `reveal_pick` 归进了
-                        // 「一次全新导航就该扔掉的瞬态 UI 状态」那一类
-                        // (与 rename_edit/new_edit 同列),`begin_load` 将来
-                        // 补上同款清理是很自然的演进,写在前面的话那一刻会
-                        // 静默失效(F218 同款顺序陷阱)。
                         // F220:剪切落地了 —— 清空剪贴板。**在这里**而不是
                         // 发出那一刻:非成功意味着东西压根没挪走(T11)。
                         // 判据放在 `if let OpFollow::Reveal` **之前**——那条
