@@ -2617,15 +2617,23 @@ git commit -m "feat(app): 粘贴同名的批量冲突框,取消即整批不动 (
     /// F220:**剪切成功之后才清剪贴板**。发出那一刻就清是拿假前提改状态 ——
     /// 链路一断,用户的剪贴板没了、东西也没挪走(T11 同族)。
     ///
-    /// 自证会变红:把清剪贴板那句挪进 `dispatch_paste`(发出那一刻)。
+    /// B6 已经把 `dispatch_paste` 拆成「只取 client 就转发」+ 自由函数
+    /// `spawn_paste_task`(复核 C1 逼出来的形状:后者没有 `&self`,真正
+    /// 决定 `follow`、发起传输的逻辑必须写在这个自由函数里,不能写回
+    /// `dispatch_paste`——那样又会长出一条摸得到 `self.tabs` 的路)。所以
+    /// 这条测试扫的是 `spawn_paste_task` 的函数体,不是 `dispatch_paste`。
+    ///
+    /// 自证会变红:把清剪贴板那句挪到 `dispatch_paste` 里、发出那一刻就清
+    /// (而 `dispatch_paste` 根本摸不到 `self.tabs...files_panel_mut()`
+    /// 之外的清空路径,一挪就会发现要么编译不过、要么绕回 C1 的老问题)。
     #[test]
     fn the_clipboard_is_cleared_only_after_a_cut_actually_lands() {
         let src = include_str!("app.rs");
         let after = src
-            .split("fn dispatch_paste(")
+            .split("fn spawn_paste_task(")
             .nth(1)
-            .expect("找不到 dispatch_paste");
-        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+            .expect("找不到 spawn_paste_task");
+        let body = &after[..after.find("\n}\n").expect("找不到函数结尾")];
         assert!(
             !body.contains("clip = None"),
             "在发出那一刻就清了剪贴板 —— 链路一断东西没挪走、剪贴板也没了"
@@ -2639,15 +2647,15 @@ git commit -m "feat(app): 粘贴同名的批量冲突框,取消即整批不动 (
 
     /// F220:复制粘贴成功**不清**剪贴板 —— 连着粘几个目录是常见用法。
     ///
-    /// 自证会变红:`dispatch_paste` 里给 Copy 也挂 `ClearClip`。
+    /// 自证会变红:`spawn_paste_task` 里给 Copy 也挂 `ClearClip`。
     #[test]
     fn a_copy_paste_keeps_the_clipboard_so_it_can_be_pasted_again() {
         let src = include_str!("app.rs");
         let after = src
-            .split("fn dispatch_paste(")
+            .split("fn spawn_paste_task(")
             .nth(1)
-            .expect("找不到 dispatch_paste");
-        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+            .expect("找不到 spawn_paste_task");
+        let body = &after[..after.find("\n}\n").expect("找不到函数结尾")];
         let at = body
             .find("ClearClip")
             .expect("剪切那条腿丢了 —— 剪完源还在剪贴板里");
@@ -2671,57 +2679,111 @@ git commit -m "feat(app): 粘贴同名的批量冲突框,取消即整批不动 (
     ClearClip,
 ```
 
-(b) `FileOp` 里给粘贴一个「已经算好」的形态。`FileOp::Paste { policy }` 是界面送回来的**选择**,`apply_file_op` 收到它时现算 plan —— 但 `apply_file_op` 已经借了 `tab`,拿得到剪贴板与 cwd。在 `apply_file_op` 的开头(与 `Resolve`/`ResolveEdit` 同一段提前分流)加:
+(b) 复核 C1 已经把这一段提前搬到了 B6:`FileOp::Paste` 不是界面送回来的单一「选择」,而是 `accept_paste_check` 那一刻就冻结好的一整批值(`dst`/`clip`/`seq`/`policy`/`existing`,`existing` 是预检查时**服务器现读**的目标目录列表,不是面板缓存——理由见 `FileOp::Paste` 的文档注释)。`apply_file_op` 开头(与 `Resolve`/`ResolveEdit` 同一段提前分流)现状已经是:
 
 ```rust
-        // F220:粘贴要用到剪贴板与当前目录,先在这里算成一批 (源→目标),
-        // 再走下面那条通用的写操作路径。
-        if let FileOp::Paste { policy } = op {
-            self.dispatch_paste(generation, policy);
+        // 要不要开 SFTP 通道(B7 的活),不走下面这条通用「先拿 client 再判
+        // op 是什么」的路径。`dst`/`clip`/`seq`/`existing` 原样转发,不在
+        // 这里重新读面板状态(复核 C1/I2 的教训)。
+        if let FileOp::Paste {
+            dst,
+            clip,
+            seq,
+            policy,
+            existing,
+        } = op
+        {
+            self.dispatch_paste(generation, dst, clip, seq, policy, existing);
             return;
         }
 ```
 
-(c) `dispatch_paste`:
+这一段 B7 不用再改,照抄现状即可 —— **别把它退化回单字段 `FileOp::Paste { policy }`,那正是复核 C1 要防的写法**。
+
+(c) `dispatch_paste` + `spawn_paste_task`:B6 已经把「取 client」和「真正发起传输」拆成了两层,后者是一个**没有 `&self`/`&Tabs` 参数的自由函数**(复核 C1 的类型层保证:这个函数的作用域里连 `self`/`tab` 这两个标识符都不存在,想现读面板状态是编译错误,不是靠约定挡)。`dispatch_paste` 现状:
 
 ```rust
-    /// F220:把剪贴板 + 处置算成一批 (源 → 目标),发出去。
-    ///
-    /// **重新列过的 `existing` 已经用掉了**(在 `accept_paste_check` 里判的
-    /// 冲突),这里按同一份 `policy` 再算一次 `pairs` —— 计划本身是纯函数,
-    /// 两次算的结果一致。
-    fn dispatch_paste(&mut self, generation: u64, policy: crate::files::clip::Policy) {
-        use crate::files::clip::{plan_paste, ClipMode};
-        let Some(tab) = self.tabs.by_generation(generation) else {
+    fn dispatch_paste(
+        &mut self,
+        generation: u64,
+        dst: mullion_ssh::sftp::RemotePath,
+        clip: crate::files::clip::RemoteClip,
+        seq: u64,
+        policy: crate::files::clip::Policy,
+        existing: std::collections::BTreeSet<Vec<u8>>,
+    ) {
+        let Some(client) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.sftp_client())
+        else {
+            self.ui.set_error("SFTP 通道还没建立,粘贴没能执行".into());
             return;
         };
-        let Some(files) = tab.content.files_panel() else {
-            return;
-        };
-        let (Some(clip), dst) = (files.clip.clone(), files.remote.cwd.clone()) else {
-            return;
-        };
-        let Some(client) = tab.content.sftp_client() else {
-            self.ui
-                .set_error("SFTP 通道还没建立,请先等目录加载完".into());
-            return;
-        };
-        let conn = tab.content.sftp_connection_for(tab.content.sftp_host_ix());
-        // 目标目录现有的名字:这一刻面板里那份就够了 —— 冲突判定已经在
-        // `accept_paste_check` 里用**刚列回来**的那份做过,这里只是把
-        // 「保留两者」的新名字算出来。
-        let existing: std::collections::BTreeSet<Vec<u8>> = files
-            .remote
-            .entries
-            .iter()
-            .map(|e| e.name.as_bytes().to_vec())
-            .collect();
+        let task = spawn_paste_task(
+            &self._runtime,
+            &self.proxy,
+            generation,
+            client,
+            dst,
+            clip,
+            seq,
+            policy,
+            existing,
+        );
+        self.track_sftp_task(generation, task);
+    }
+```
+
+这一段 B7 也不用改。B7 要填的是 `spawn_paste_task`(紧跟在 `dispatch_paste` 下面,靠近 `spawn_sftp_stat` 那一片自由函数)现在的桩身体:
+
+```rust
+#[allow(clippy::too_many_arguments)]
+fn spawn_paste_task(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    _client: Arc<mullion_ssh::sftp::SftpClient>,
+    dst: mullion_ssh::sftp::RemotePath,
+    clip: crate::files::clip::RemoteClip,
+    seq: u64,
+    policy: crate::files::clip::Policy,
+    existing: std::collections::BTreeSet<Vec<u8>>,
+) -> tokio::task::JoinHandle<()> {
+    let _ = proxy;
+    runtime.spawn(async move {
+        log::warn!("F220:粘贴执行尚未接通(…),留给 B7");
+    })
+}
+```
+
+换成真正执行,大致形状(`conn` 的取法照 `apply_file_op` 里那一句现读现抄;toast 措辞、`seq` 陈旧校验照 `decide_paste_drops_a_result_whose_sequence_has_gone_stale` 已经钉死的规矩,不要另起一套;`_client` 要用上就去掉下划线):
+
+```rust
+#[allow(clippy::too_many_arguments)] // 见 B6 已加的注释,原样保留
+fn spawn_paste_task(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    client: Arc<mullion_ssh::sftp::SftpClient>,
+    dst: mullion_ssh::sftp::RemotePath,
+    clip: crate::files::clip::RemoteClip,
+    seq: u64,
+    policy: crate::files::clip::Policy,
+    existing: std::collections::BTreeSet<Vec<u8>>,
+) -> tokio::task::JoinHandle<()> {
+    use crate::files::clip::{plan_paste, ClipMode};
+    let proxy = proxy.clone();
+    // `existing` 是 `accept_paste_check` 那一刻服务器现读的实况,原样冻结
+    // 带到这里(复核 C1)——不再现读面板缓存。`plan_paste` 是纯函数,拿
+    // 它跟同一份 `policy` 再算一次「保留两者」的新名字,与预检查判冲突
+    // 用的是同一份 `existing`,不会因为两次读的时机不同而对不上。
+    runtime.spawn(async move {
         let plan = plan_paste(&clip.items, &dst, policy, &existing);
         if plan.pairs.is_empty() {
-            self.ui.set_toast(
-                crate::ui::toast::Kind::Warn,
-                format!("{} 项都与目标同名,已全部跳过", plan.skipped),
-            );
+            // 全部跳过:没有传输要等,不发 SftpOpDone,直接开一张 toast
+            // 收尾;`seq` 在这里怎么核对陈旧 UI 状态,参照上面提到的那条
+            // 已经定规矩的测试。
             return;
         }
         let mode = match clip.mode {
@@ -2729,38 +2791,37 @@ git commit -m "feat(app): 粘贴同名的批量冲突框,取消即整批不动 (
             ClipMode::Cut => mullion_ssh::copy_tree::CopyMode::Move,
         };
         let overwrite = policy == crate::files::clip::Policy::Overwrite;
-        // 剪切成功之后要清剪贴板;复制不清(连着粘几个目录是常见用法)。
+        // 剪切成功之后才清剪贴板;复制不清(连着粘几个目录是常见用法)。
+        // 这里只算 `follow` 传出去,真正清空的动作在 `SftpOpDone` 的成功
+        // 分支里做(见下面 (d))——**不能**在这个自由函数里直接碰
+        // `self.tabs`,它压根没有 `self` 可碰(复核 C1 的类型层保证)。
         let follow = if clip.mode == ClipMode::Cut {
             OpFollow::ClearClip
         } else {
             OpFollow::None
         };
-        let verb = if clip.mode == ClipMode::Cut { "移动" } else { "复制" };
-        let n = plan.pairs.len();
-        // 措辞不用完成时态 —— 字节这会儿才刚出去,成败要等事件回来。
-        self.ui.set_toast(
-            crate::ui::toast::Kind::Busy,
-            format!("正在{verb} {n} 项…"),
-        );
-        let proxy = self.proxy.clone();
-        let pairs = plan.pairs;
-        let task = self._runtime.spawn(async move {
-            let result =
-                mullion_ssh::copy_tree::transfer_into(&client, &conn, &pairs, mode, overwrite)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
-            let _ = proxy.send_event(UserEvent::SftpOpDone {
-                generation,
-                result,
-                follow,
-            });
+        let conn = /* 照 apply_file_op 里取 conn 的写法现读现抄 */;
+        let result = mullion_ssh::copy_tree::transfer_into(
+            &client,
+            &conn,
+            &plan.pairs,
+            mode,
+            overwrite,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = proxy.send_event(UserEvent::SftpOpDone {
+            generation,
+            result,
+            follow,
         });
-        self.track_sftp_task(generation, task);
-    }
+        let _ = seq; // 陈旧校验接上,别漏掉
+    })
+}
 ```
 
-(`conn` 的取法照 `apply_file_op` 里那一句;`Option` 的解构写法按编译器实际要求调整 —— 上面 `let (Some(clip), dst) = …` 那种写法要拆成两句。)
+进度提示(`正在{verb} {n} 项…` 那条 toast)在这个自由函数里发不出去 —— 它没有 `&mut self.ui`。要么在 `dispatch_paste` 派发之前、还在 `&mut self` 作用域里先发一次(这时候 `plan.pairs` 还没算出来,只能用 `clip.items.len()` 估个数,跟最终 `plan.pairs.len()` 会因为跳过/去重差一点,措辞上说清楚是「打算处理几项」不是「正在处理几项」);要么把 `SftpOpDone` 之外再加一个进度事件。两种都行,写代码时挑一种、别悄悄两种都不做。
 
 (d) `SftpOpDone` 的成功分支里,`OpFollow::Reveal` 那段旁边补:
 

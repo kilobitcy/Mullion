@@ -69,14 +69,20 @@ pub enum FilesDialog {
     /// 「选完了」那一刻才回头去读面板当下的 `cwd`/`clip`,等于在一个比
     /// 预检查往返宽得多的窗口上重新打开 B5 刚堵上的那个洞(目标目录被
     /// 换成源自身的子孙、剪贴板被换成另一批文件,而这个框上显示的
-    /// `names` 是按旧的那份算出来的)。选完之后原样把这三个值带回
+    /// `names` 是按旧的那份算出来的)。选完之后原样把这几个值带回
     /// `FileOp::Paste`,不在这里重新派生。
+    ///
+    /// 复核 C1:`existing` 是预检查那一刻服务器 `list_dir` 现读回来的
+    /// 目标目录条目,同样原样冻结带下去 —— **不是**面板缓存的那份(那份
+    /// 可能已经跟服务器不一致),留给 B7 算「保留两者」的新名字时用,
+    /// 理由见 `FileOp::Paste` 的文档。
     PasteConflict {
         names: Vec<String>,
         mode_is_cut: bool,
         dst: RemotePath,
         clip: crate::files::clip::RemoteClip,
         seq: u64,
+        existing: std::collections::BTreeSet<Vec<u8>>,
     },
 }
 
@@ -112,14 +118,22 @@ pub enum FileOp {
         choice: crate::files::queue::Conflict,
         apply_all: bool,
     },
-    /// F220:批量冲突框里选完了。`dst`/`clip`/`seq` 原样带回
-    /// `FilesDialog::PasteConflict` 冻结的那三个值 —— `app.rs` 用它们
+    /// F220:批量冲突框里选完了。`dst`/`clip`/`seq`/`existing` 原样带回
+    /// `FilesDialog::PasteConflict` 冻结的那几个值 —— `app.rs` 用它们
     /// 派发真正的写,不回头去读面板当下的状态(理由同该变体的文档)。
+    ///
+    /// 复核 C1:`existing` 是预检查那一刻服务器 `list_dir` 现读回来的
+    /// 目标目录里**已有的名字**,不是面板缓存的那份陈旧列表 —— 那份可能
+    /// 已经跟服务器不一致(用户在别处新建了同名文件、或者面板还没刷新)。
+    /// B7 算「保留两者」的新名字(`a.txt` → `a (副本).txt`)要避开的是
+    /// **服务器上实际存在**的名字,用面板那份陈旧列表算的话,撞上一个
+    /// 服务器有、面板没有的名字时,新名字会悄悄盖掉那一份。
     Paste {
         dst: RemotePath,
         clip: crate::files::clip::RemoteClip,
         seq: u64,
         policy: crate::files::clip::Policy,
+        existing: std::collections::BTreeSet<Vec<u8>>,
     },
 }
 
@@ -216,7 +230,7 @@ pub fn bits_from_mode(mode: u32) -> [bool; 9] {
 /// 标题栏上的 ✕。两处各写一遍的话,迟早有一处漏掉后两个变体那条
 /// 「不能只关框」的规矩 —— 而漏掉的症状是传输队列静静地永远走不动。
 ///
-/// 前五个框没有在途状态,关掉就完了;后两个框各自代表一条**挂起的工作**
+/// 前四个框没有在途状态,关掉就完了;后两个框各自代表一条**挂起的工作**
 /// (一条 job / 一条编辑),不给出处置它们就永远挂着。
 pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
     match d {
@@ -512,13 +526,17 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
             dst,
             clip,
             seq,
+            existing,
         } => {
             let verb = if *mode_is_cut { "移动" } else { "复制" };
             let n = names.len();
-            let list = names.clone();
-            let dst = dst.clone();
-            let clip = clip.clone();
             let seq = *seq;
+            // N1:`modal` 的 body 是 `impl FnOnce(&mut Ui) -> R`,不要求
+            // `'static`,借用进闭包就够 —— 不必在这里(每帧都跑)先把
+            // `dst`/`clip`/`existing`/`names` 整体克隆一份,克隆只在真的
+            // 点了某个按钮那一帧才发生(各分支自己 `.clone()`)。
+            // `RemoteClip`/`existing` 没有条目数上限,选中几千个文件时
+            // 这份省下来的克隆量跟条目数走。
             let x = modal(ctx, "目标目录里已有同名项", |ui| {
                 ui.colored_label(
                     theme::c32(t.danger_text),
@@ -533,17 +551,23 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 egui::ScrollArea::vertical()
                     .max_height(180.0)
                     .show(ui, |ui| {
-                        for name in &list {
+                        for name in names.iter() {
                             ui.label(name);
                         }
                     });
                 ui.horizontal(|ui| {
-                    if ui.button("覆盖").clicked() {
+                    // 「覆盖」标危险色(F119):三条出路里唯一不可逆吃数据的
+                    // 那条,同惯例见上面 `Conflict`/`Delete` 两处。
+                    if ui
+                        .button(egui::RichText::new("覆盖").color(theme::c32(t.danger_text)))
+                        .clicked()
+                    {
                         op = Some(FileOp::Paste {
                             dst: dst.clone(),
                             clip: clip.clone(),
                             seq,
                             policy: crate::files::clip::Policy::Overwrite,
+                            existing: existing.clone(),
                         });
                         close = true;
                     }
@@ -553,6 +577,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                             clip: clip.clone(),
                             seq,
                             policy: crate::files::clip::Policy::Skip,
+                            existing: existing.clone(),
                         });
                         close = true;
                     }
@@ -562,6 +587,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                             clip: clip.clone(),
                             seq,
                             policy: crate::files::clip::Policy::KeepBoth,
+                            existing: existing.clone(),
                         });
                         close = true;
                     }
@@ -615,6 +641,12 @@ mod tests {
         }
     }
 
+    /// 复核 C1:测试用的一份 `existing` 快照,同 `sample_clip()` 一样只是
+    /// 要让 `PasteConflict`/`FileOp::Paste` 里的 `existing` 字段有内容可比。
+    fn sample_existing() -> std::collections::BTreeSet<Vec<u8>> {
+        [b"a.txt".to_vec()].into_iter().collect()
+    }
+
     /// F203:`cancel_op` 是「取消这件事」的唯一真值 —— 六个变体一个不落。
     ///
     /// 前四个只关框(没有在途状态要收);后两个**必须发出处置**:只关框的话
@@ -653,6 +685,7 @@ mod tests {
                 dst: rp("/dst"),
                 clip: sample_clip(),
                 seq: 1,
+                existing: sample_existing(),
             },
         ];
         for d in &all {
@@ -781,6 +814,7 @@ mod tests {
             dst: rp("/dst"),
             clip: sample_clip(),
             seq: 1,
+            existing: sample_existing(),
         })
     }
 
@@ -1170,6 +1204,7 @@ mod tests {
             dst: rp("/dst"),
             clip: sample_clip(),
             seq: 1,
+            existing: sample_existing(),
         });
         let texts = dialog_texts(&mut d);
         for want in ["覆盖", "跳过同名", "保留两者", "a.txt", "b.txt"] {
@@ -1178,6 +1213,32 @@ mod tests {
                 "冲突框里没有「{want}」,实际:{texts:?}"
             );
         }
+    }
+
+    /// I1 复核:三条出路里只有「覆盖」不可逆吃数据(正文说明里也写了
+    /// 「不可逆」),必须标危险色(F119)——同惯例见 `Conflict`(469 行
+    /// 附近)/`Delete`(346 行附近)两处一样的写法。`dialog_texts` 只查
+    /// 文案在不在,查不出颜色,这里另开一条扫源码的:PasteConflict 那段
+    /// 模态体里,「覆盖」和 `danger_text` 必须挨在一起,且要排在「跳过
+    /// 同名」之前(避免扫到下一个按钮头上去)。
+    #[test]
+    fn the_paste_conflict_overwrite_button_is_marked_danger() {
+        let src = include_str!("files_dialog.rs");
+        let anchor = "目标目录里已有同名项";
+        let at = src
+            .find(anchor)
+            .unwrap_or_else(|| panic!("找不到批量冲突框的标题 —— 这条测试的锚点失效了"));
+        let after = &src[at..];
+        let skip_end = after
+            .find("跳过同名")
+            .unwrap_or_else(|| panic!("批量冲突框里没找到「跳过同名」—— 这条测试的锚点失效了"));
+        let before_skip = &after[..skip_end];
+        assert!(
+            before_skip.contains("\"覆盖\"") && before_skip.contains("danger_text"),
+            "批量冲突框的「覆盖」按钮没有标危险色(F119)——它是三条出路里\
+             唯一不可逆吃数据的那条,同惯例见 `Conflict`/`Delete` 两处:\
+             {before_skip}"
+        );
     }
 
     /// F220:取消 / ✕ = **整批不动**。粘贴还没发出去,没有挂起的工作要处置
@@ -1192,6 +1253,7 @@ mod tests {
             dst: rp("/dst"),
             clip: sample_clip(),
             seq: 1,
+            existing: sample_existing(),
         };
         assert_eq!(cancel_op(&d), None, "取消粘贴不该发出任何处置");
     }
@@ -1208,10 +1270,11 @@ mod tests {
     }
 
     /// F220:三颗按钮各自送回对应的处置,且**原样带回冻结的 `dst`/`clip`/
-    /// `seq`** —— 不是只送回 `policy`。这是复核 C1/I2 那条「不许到时候
-    /// 现算,必须用冻结值」在渲染层这一端的落地:用不同于「随手写一个」
-    /// 的 `dst`/`clip`/`seq`(与 `sample_clip()`/`1` 精确核对),任何一处
-    /// 把这三个字段漏传、传错、或者干脆现造一份,这条测试都会先炸。
+    /// `seq`/`existing`** —— 不是只送回 `policy`。这是复核 C1/I2 那条
+    /// 「不许到时候现算,必须用冻结值」在渲染层这一端的落地:用不同于
+    /// 「随手写一个」的 `dst`/`clip`/`seq`/`existing`(与
+    /// `sample_clip()`/`1`/`sample_existing()` 精确核对),任何一处把这
+    /// 几个字段漏传、传错、或者干脆现造一份,这条测试都会先炸。
     #[test]
     fn each_button_sends_back_its_own_policy() {
         for (label, want) in [
@@ -1225,6 +1288,7 @@ mod tests {
                 dst: rp("/dst"),
                 clip: sample_clip(),
                 seq: 1,
+                existing: sample_existing(),
             });
             assert_eq!(
                 click_button(&mut d, label),
@@ -1233,6 +1297,7 @@ mod tests {
                     clip: sample_clip(),
                     seq: 1,
                     policy: want,
+                    existing: sample_existing(),
                 }),
                 "「{label}」送回的处置不对"
             );

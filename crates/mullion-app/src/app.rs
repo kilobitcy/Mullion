@@ -4665,12 +4665,16 @@ impl App {
                 );
             }
             PasteDecision::Dispatch { policy } => {
-                self.dispatch_paste(generation, dst, clip, seq, policy);
+                self.dispatch_paste(generation, dst, clip, seq, policy, existing);
             }
-            // F220 B6:批量冲突框携带的是**这一刻冻结的** `dst`/`clip`/`seq`,
-            // 不是等用户选完之后再回头读面板状态 —— 这个框比一次预检查
-            // 往返活得久得多(用户思考是几秒到几分钟),按名字算好的
-            // `names` 才对得上框里显示的和最终要粘的是同一批东西。
+            // F220 B6:批量冲突框携带的是**这一刻冻结的** `dst`/`clip`/`seq`/
+            // `existing`,不是等用户选完之后再回头读面板状态 —— 这个框比
+            // 一次预检查往返活得久得多(用户思考是几秒到几分钟),按名字
+            // 算好的 `names` 才对得上框里显示的和最终要粘的是同一批东西。
+            //
+            // 复核 C1:`existing` 也原样冻结带下去 —— 它是这次 `list_dir`
+            // 现读回来的服务器实况,不是面板缓存的那份陈旧列表,B7 算
+            // 「保留两者」的新名字要靠它,理由见 `FileOp::Paste` 的文档。
             PasteDecision::Conflict { names, mode_is_cut } => {
                 self.ui.files_dialog = Some(crate::ui::files_dialog::FilesDialog::PasteConflict {
                     names,
@@ -4678,6 +4682,7 @@ impl App {
                     dst,
                     clip,
                     seq,
+                    existing,
                 });
                 self.request_ui_redraw();
             }
@@ -4686,14 +4691,16 @@ impl App {
 
     /// F220:真正执行一次粘贴(`cp -a` 快路径 / SFTP 逐文件回退)。
     ///
-    /// **本任务(B6)仍是桩** —— 整个函数体到 Task B7 会被替换掉。刻意不是
-    /// 静默空函数:什么都不做又不吭声,用户选完冲突处置会以为粘贴丢了。
+    /// 复核 C1:这个方法只负责从 `self` 取出真正干活的 `spawn_paste_task`
+    /// 需要、但它自己拿不到的资源(SFTP client)——同 `spawn_sftp_list_dir`/
+    /// `spawn_sftp_stat` 那两个自由函数的既有分工。`dst`/`clip`/`seq`/
+    /// `policy`/`existing` 全部原样转发,不在这里现读面板状态。
     ///
-    /// `dst`/`clip`/`seq` 由调用方传入(冻结自 `start_paste`,冲突框那条路
-    /// 上经 `FilesDialog::PasteConflict` → `FileOp::Paste` 原样带回),B7
-    /// 接手时**不要**改成在这里重新读面板状态 —— 那正是复核 C1/I2 打回来
-    /// 的那个错。`seq` 留给 B7 判断要不要在真正派发前再核一遍是否过期
-    /// (冲突框开着的这段时间比一次网络往返宽得多)。
+    /// **真正的写逻辑(本任务 B6 仍是桩)在 `spawn_paste_task`,不是这个
+    /// 方法** —— B7 要改的是那个自由函数。它的签名里没有 `&Tabs`/
+    /// `TabContent`,这不是约定,是类型层强制:那个函数的作用域里压根
+    /// 没有 `self`/`tab` 这两个名字,B7 接手时想在里面重新读面板状态,
+    /// 编译都过不了。守护见 `spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs`。
     fn dispatch_paste(
         &mut self,
         generation: u64,
@@ -4701,11 +4708,28 @@ impl App {
         clip: crate::files::clip::RemoteClip,
         seq: u64,
         policy: crate::files::clip::Policy,
+        existing: std::collections::BTreeSet<Vec<u8>>,
     ) {
-        log::warn!(
-            "F220:粘贴执行尚未接通(generation={generation},dst={dst:?},items={},seq={seq},policy={policy:?},留给 B7)",
-            clip.items.len()
+        let Some(client) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.sftp_client())
+        else {
+            self.ui.set_error("SFTP 通道还没建立,粘贴没能执行".into());
+            return;
+        };
+        let task = spawn_paste_task(
+            &self._runtime,
+            &self.proxy,
+            generation,
+            client,
+            dst,
+            clip,
+            seq,
+            policy,
+            existing,
         );
+        self.track_sftp_task(generation, task);
     }
 
     /// F139:把一条书签写进会话配置,并同步这个标签的内存副本。
@@ -5093,16 +5117,17 @@ impl App {
         }
         // F220:批量冲突框选完了。同上提前分流 —— `dispatch_paste` 自己管
         // 要不要开 SFTP 通道(B7 的活),不走下面这条通用「先拿 client 再判
-        // op 是什么」的路径。`dst`/`clip`/`seq` 原样转发,不在这里重新读
-        // 面板状态(复核 C1/I2 的教训)。
+        // op 是什么」的路径。`dst`/`clip`/`seq`/`existing` 原样转发,不在
+        // 这里重新读面板状态(复核 C1/I2 的教训)。
         if let FileOp::Paste {
             dst,
             clip,
             seq,
             policy,
+            existing,
         } = op
         {
-            self.dispatch_paste(generation, dst, clip, seq, policy);
+            self.dispatch_paste(generation, dst, clip, seq, policy, existing);
             return;
         }
 
@@ -5137,8 +5162,17 @@ impl App {
                     .map_err(|e| e.to_string()),
                 FileOp::Delete { targets } => delete_all(&client, conn.as_ref(), &targets).await,
                 // 函数开头已经分流走了,走到这里说明分流被删了。
+                //
+                // 复核 I2:曾经是 `unreachable!()`,但这段代码跑在
+                // `self._runtime.spawn(async move { .. })` 里,`track_sftp_task`
+                // 只存 `JoinHandle` 从不 `.await` —— tokio 把 panic 关在 task
+                // 边界内,没人看。真出现这个分支(比如加了新 `FileOp` 变体、
+                // 只改了这个 match 忘了在函数开头补分流)不是崩溃,是**静默
+                // 挂起**:框关了、没 toast、没错误、没 `SftpOpDone`,正是
+                // T11 一族最忌讳的那种。改成走正常的 `Err`,至少用户能看见
+                // 一张错误卡片。
                 FileOp::Resolve { .. } | FileOp::ResolveEdit { .. } | FileOp::Paste { .. } => {
-                    unreachable!("冲突处置 / 粘贴不该走远端写操作这条路")
+                    Err("内部错误:冲突处置/粘贴不该走到这里".to_string())
                 }
             };
             let _ = proxy.send_event(UserEvent::SftpOpDone {
@@ -11859,6 +11893,54 @@ fn spawn_sftp_stat(
     })
 }
 
+/// F220 复核 C1:粘贴真正落地的地方(`cp -a` 快路径 / SFTP 逐文件回退,
+/// B7 要写的部分)。跟 `spawn_sftp_list_dir`/`spawn_sftp_stat` 同一个理由
+/// 用自由函数,额外的收获是它把「不许在这里重新读面板状态」这条判据从
+/// 约定变成了**类型层强制**:这个函数没有 `&self`/`&Tabs`,它的作用域里
+/// 压根没有 `self`/`tab` 这两个名字 —— B7 接手时想现读面板状态顶替
+/// `dst`/`clip`,编译都过不了,不用再靠源码切片猜有没有绕开(复核 C1
+/// 证伪了上一版「files_panel 是唯一入口」的假设:直接 `match &tab.content`
+/// 摸字段就能绕开那道黑名单,黑名单这条路走到头了)。
+///
+/// `existing` 是预检查那一刻服务器 `list_dir` 现读回来的目标目录条目——
+/// **不是**面板缓存的那份(那份可能已经跟服务器不一致),`decide_paste`
+/// 已经拿它判过一次冲突,这里原样带下来给 B7 算「保留两者」的新名字用,
+/// 避免正巧撞上一个面板里没有、但服务器上已经有的名字。
+///
+/// `generation`/`seq` 只用来在完成时把结果事件路由回发起这次粘贴的标签、
+/// 并校验有没有过期(同 `spawn_sftp_list_dir`),不是拿来查 tab 的 ——
+/// 这个函数没有 `&Tabs` 可查。
+///
+/// **本任务(B6)仍是桩**:函数体只记一句警告日志。`_client`/`proxy`
+/// 是 B7 要用的(真正发起写请求、把结果经 `UserEvent::SftpOpDone` 送
+/// 回去),`_client` 先留着下划线前缀不参与编译警告,B7 补真正的读写时
+/// 去掉。
+#[allow(clippy::too_many_arguments)] // 9 个都是已经冻结好的独立值,不
+                                     // 是能自然拼成一个结构体的一组东西
+                                     // ——同 11348/12427 两处既有先例。
+fn spawn_paste_task(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    _client: Arc<mullion_ssh::sftp::SftpClient>,
+    dst: mullion_ssh::sftp::RemotePath,
+    clip: crate::files::clip::RemoteClip,
+    seq: u64,
+    policy: crate::files::clip::Policy,
+    existing: std::collections::BTreeSet<Vec<u8>>,
+) -> tokio::task::JoinHandle<()> {
+    // 桩阶段用不上 `proxy`(没有结果要回送),先不 `.clone()` 进
+    // `async move` —— B7 补真正的读写、要发 `SftpOpDone` 时再加。
+    let _ = proxy;
+    runtime.spawn(async move {
+        log::warn!(
+            "F220:粘贴执行尚未接通(generation={generation},dst={dst:?},items={},seq={seq},policy={policy:?},existing={},留给 B7)",
+            clip.items.len(),
+            existing.len()
+        );
+    })
+}
+
 /// F142:异步问一批 uid/gid 的名字。结果经 `UserEvent::OwnerNames` 回送
 /// (`App::accept_owner_names` 接)。
 ///
@@ -13349,21 +13431,33 @@ mod tests {
     /// 这一段接线。
     ///
     /// 复核者构造的退化(编译过、`cargo test --workspace` 全绿):把
-    /// `if let FileOp::Paste { dst, clip, seq, policy } = op` 改成
+    /// `if let FileOp::Paste { dst, clip, seq, policy, existing } = op` 改成
     /// `if let FileOp::Paste { seq, policy, .. } = op`,块内另起
     /// `self.tabs.by_generation(generation).and_then(|t| t.content
     /// .files_panel())` 现读 `files.remote.cwd`/`files.clip` 顶替
     /// `dst`/`clip`。这正是约束 1 要防的 Critical 在这一段的完整复现,
     /// 窗口是用户在冲突框前思考的几秒到几分钟。
     ///
-    /// 判据:①解构模式必须字面绑定 `dst`/`clip`(不能退化成 `..`);
-    /// ②这个分流块体里不许出现 `files_panel`——它是取『活面板状态』的
-    /// **唯一入口**,不管现读出来的东西转手起什么新名字,这一步躲不掉
-    /// (与上面那条「防换名字」的教训不同:这里防的不是「跟着 `files.`
-    /// 前缀找字段」,而是直接堵调用点本身,所以不怕整体改名)。**这道
-    /// 守护只管这一个 if-let 分流块**,不覆盖整个 `apply_file_op`——那个
-    /// 函数别的分支合法地要用 `files_panel()`(通用写操作要拿
-    /// `sftp_client()`),不能整函数禁掉这个调用。
+    /// 判据:①解构模式必须字面绑定 `dst`/`clip`/`existing`(不能退化成
+    /// `..`);②这个分流块体里不许出现字面调用名 `files_panel`。
+    ///
+    /// **复核 C1 证伪了这条守护上一版的过度承诺**(「files_panel 是唯一
+    /// 入口,不管转手起什么新名字都躲不掉」):`match &tab.content {
+    /// TabContent::Terminal(t) => t.files.remote.cwd.clone(), .. }` 直接摸
+    /// 字段,完全不含 `files_panel` 这个词,一样能绕开这道黑名单、编译
+    /// 通过、全量测试绿。所以判据②的真实能力只是**挡字面 `files_panel()`
+    /// 这一种写法**,挡不住任何不出现这个词的重新派生 —— 这个 if-let
+    /// 分流块本身仍是 `apply_file_op(&mut self, ..)` 方法体的一部分,
+    /// `self.tabs` 一直在作用域里,没有办法把这一层也做成编译期不可写。
+    /// 真正**类型层**的防线在下游的 `spawn_paste_task`(见其文档 + 守护
+    /// `spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs`)——
+    /// 那个自由函数的作用域里压根没有 `self`/`tab`,想现读面板,编译都
+    /// 过不了。这条测试留着,是因为它确实挡住了「直接调 `files_panel()`」
+    /// 这种最省事的写法,而且**这道分流只应该转发,不应该有任何理由碰
+    /// `files_panel`**——但不要把它读成完整防线。**这道守护只管这一个
+    /// if-let 分流块**,不覆盖整个 `apply_file_op`——那个函数别的分支
+    /// 合法地要用 `files_panel()`(通用写操作要拿 `sftp_client()`),
+    /// 不能整函数禁掉这个调用。
     ///
     /// 自证会变红:按复核者给的写法改一遍(解构改成 `{ seq, policy, .. }`,
     /// 块内加 `let dst = ...files_panel()...`)。
@@ -13374,7 +13468,7 @@ mod tests {
         let at = body.find(anchor).unwrap_or_else(|| {
             panic!("找不到 apply_file_op 里 FileOp::Paste 的分流 —— 这条测试的锚点失效了")
         });
-        // 模式块:从解构的 `{` 到配平的 `}`(`{ dst, clip, seq, policy }`)。
+        // 模式块:从解构的 `{` 到配平的 `}`(`{ dst, clip, seq, policy, existing }`)。
         let pattern_rest = &body[at + anchor.len() - 1..];
         let pattern_block = brace_balanced_arm(pattern_rest);
         assert!(
@@ -13382,10 +13476,13 @@ mod tests {
             "FileOp::Paste 的解构模式没截到闭合大括号,断言会退化成扫全文件"
         );
         assert!(
-            pattern_block.contains("dst") && pattern_block.contains("clip"),
-            "apply_file_op 对 FileOp::Paste 的解构模式没有字面绑定 dst/clip\
-             (退化成了 `{{ .., seq, policy }}`?)—— 拿不到调用方冻结的这两个\
-             值,后面只能现读面板状态顶替,实际模式:{pattern_block}"
+            pattern_block.contains("dst")
+                && pattern_block.contains("clip")
+                && pattern_block.contains("existing"),
+            "apply_file_op 对 FileOp::Paste 的解构模式没有字面绑定\
+             dst/clip/existing(退化成了 `{{ .., seq, policy }}`?)—— 拿不到\
+             调用方冻结的这几个值,后面只能现读面板状态顶替,实际模式:\
+             {pattern_block}"
         );
         // 模式块后面紧跟 ` = op` 再接一对花括号,是这个分流真正的函数体。
         let after_pattern = &pattern_rest[pattern_block.len()..];
@@ -13401,9 +13498,11 @@ mod tests {
         assert!(
             !arm_body.contains("files_panel"),
             "apply_file_op 对 FileOp::Paste 的分流块里出现了 files_panel()\
-             —— 这是取『活面板状态』的唯一入口,这个分流只该转发解构出来的\
-             dst/clip/seq/policy,不许现读面板重新拼一份(不管现读出来的\
-             东西叫什么新名字,这个调用点躲不掉):{arm_body}"
+             —— 这个分流只该转发解构出来的 dst/clip/seq/policy/existing,\
+             没有理由碰这个调用(注意:这条只挡字面 files_panel() 这个\
+             调用名,挡不住 `match &tab.content {{ .. }}` 这类不出现这个\
+             词的重新派生,复核 C1 已经证伪「这一步躲不掉」这个说法——\
+             真正的类型层防线在 spawn_paste_task):{arm_body}"
         );
         assert!(
             arm_body.contains("self.dispatch_paste("),
@@ -13412,17 +13511,18 @@ mod tests {
         );
     }
 
-    /// F220 复核问题 1(续):`dispatch_paste` 是 B7 要整个重写的桩,这条
-    /// 守护写成「函数体重写之后依然有意义」的形态,不绑在桩当前这句
-    /// `log::warn!` 的文本上——不管 B7 怎么实现真正的写(`cp -a` 快路径 /
-    /// SFTP 逐文件回退),`dst`/`clip` 都已经是**形参**,函数体永远不该
-    /// 再调 `files_panel()` 现读面板状态顶替它们。
+    /// F220 复核问题 1(续):`dispatch_paste` 现在只是取 SFTP client 的
+    /// 薄方法(真正的写逻辑已经搬进自由函数 `spawn_paste_task`,复核 C1
+    /// 之后的结构),这条守护认的是这个方法体本身不出现 `files_panel`
+    /// 这个字面调用名。
     ///
-    /// **这条是留给 B7 的绊线**:B7 的计划原文(写在约束 1 之前,还没
-    /// 跟上)就是从面板现读 `files.clip`/`files.remote.cwd` 来实现这个
-    /// 函数——照抄的话这条测试会先炸,断言消息点名「`dst`/`clip` 必须用
-    /// 形参、粘贴目标在用户按下 Ctrl+V 那一刻就已确定」,不是判据写错了
-    /// 要绕过去。
+    /// **诚实标注局限**(同上一条问题 1 的教训):这只挡字面拼写,挡不住
+    /// `match &tab.content {{ .. }}` 这类不含这个词的重新派生 —— 这个
+    /// 方法仍然是 `&mut self` 的一部分,`self.tabs` 一直在作用域里。
+    /// 这条测试的价值是「挡住最省事的写法、留一个显式的红线注释」,
+    /// 不是「证明这一步不可能写坏」——那件事只有对 `spawn_paste_task`
+    /// 才成立(它没有 `self`/`tab` 可用,见
+    /// `spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs`)。
     ///
     /// 自证会变红:在函数体里加回 `let _x = self.tabs.by_generation(generation)
     /// .and_then(|t| t.content.files_panel());`(取到就足够触发 —— 判据
@@ -13433,10 +13533,109 @@ mod tests {
         assert!(
             !body.contains("files_panel"),
             "dispatch_paste 里出现了 files_panel() —— dst/clip 已经是形参,\
-             用户按下 Ctrl+V 那一刻粘贴的目标和内容就已经定了,实现真正的\
-             写时不许回头现读面板状态顶替这两个形参(哪怕现读出来的东西\
-             叫别的名字,这个调用点躲不掉);要用 dst/clip 的话直接用参数,\
-             不要经 self.tabs...files_panel() 绕一趟:{body}"
+             用户按下 Ctrl+V 那一刻粘贴的目标和内容就已经定了,这个方法\
+             没有理由再调它去顶替形参(哪怕现读出来的东西叫别的名字,\
+             这条只挡这一种写法,不是完整防线,见本测试文档);要用\
+             dst/clip 的话直接用参数,不要经 self.tabs...files_panel()\
+             绕一趟:{body}"
+        );
+    }
+
+    /// 复核 C1:锁住 `spawn_paste_task` 的**结构**——它必须是顶格的自由
+    /// 函数(不是 `impl App` 里缩进的方法),参数列表里不能出现
+    /// `self`/`Tabs`/`TabContent` 这几个能摸到活面板的名字。这不是重复
+    /// 造一个「黑名单扫描」:上面两条问题 1 的守护挡的是**函数体里写了
+    /// 什么**(天生防不住换个写法就绕开),这条挡的是**函数的作用域里
+    /// 有没有 `self`/`tab` 这两个名字可用**——只要它是自由函数且不接收
+    /// 这几个参数,复核者给的两个退化变异(`match &tab.content {{ .. }}`
+    /// 现读 `cwd`)在这个函数体内根本写不出来,编译器会报
+    /// `cannot find value \`self\`` / `cannot find value \`tab\``,不需要
+    /// 猜有没有别的绕法。
+    ///
+    /// 这条测试守的不是「函数体有没有写坏代码」(那个不用猜,写了就编译
+    /// 不过),守的是**下一个人把这个自由函数改回 `&mut self` 方法**这
+    /// 一步——改回去的话,原先的类型层保证瞬间失效,而且这一步改动本身
+    /// 编译照样通过、`cargo test --workspace` 照样全绿,只有这条测试能
+    /// 拦住(不改这条测试,没人会注意到防线已经没了)。
+    ///
+    /// 自证会变红:把 `spawn_paste_task` 的签名从 `fn spawn_paste_task(` +
+    /// 一堆值参数,改成 `impl App { fn spawn_paste_task(&mut self, ..)`。
+    #[test]
+    fn spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs() {
+        let src = prod_src();
+        let anchor = "fn spawn_paste_task(";
+        let at = src
+            .find(anchor)
+            .unwrap_or_else(|| panic!("找不到 spawn_paste_task —— 这条测试的锚点失效了"));
+        // 自由函数顶格写(0 缩进),`impl App` 块里的方法缩进 4 空格 ——
+        // 判据看这一行 `fn` 前面是不是只有换行、没有别的字符。
+        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        assert_eq!(
+            &src[line_start..at],
+            "",
+            "spawn_paste_task 前面出现了缩进,说明它被挪进了某个 impl 块里\
+             当成了方法(很可能是 `&mut self`)—— 复核 C1 要求它必须是\
+             顶格的自由函数,类型层的保证建立在「这个函数的作用域里没有\
+             self/tab」上,一旦它变回方法,这条保证就没了:{:?}",
+            &src[line_start..at]
+        );
+        // 参数列表:从函数名后的 `(` 找到第一个 `)`。已知这份参数列表里
+        // 每个类型都用 `<...>` 不用 `(...)`(`Arc<..>`/`BTreeSet<..>` 之类),
+        // 不会有嵌套括号,第一个右括号就是参数列表的收尾。
+        let params_start = at + anchor.len();
+        let params_end = src[params_start..]
+            .find(')')
+            .map(|i| params_start + i)
+            .unwrap_or_else(|| panic!("spawn_paste_task 的参数列表没找到右括号"));
+        let params = &src[params_start..params_end];
+        for banned in ["self", "Tabs", "TabContent"] {
+            assert!(
+                !params.contains(banned),
+                "spawn_paste_task 的参数列表里出现了 {banned:?} —— 一旦它能\
+                 摸到 self/Tabs/TabContent,复核 C1 要的类型层保证就没了,\
+                 实际参数列表:{params}"
+            );
+        }
+    }
+
+    /// 复核 I2:`apply_file_op` 里 `Resolve`/`ResolveEdit`/`Paste` 的兜底
+    /// 分支曾经是 `unreachable!()`,但它跑在 `self._runtime.spawn(async
+    /// move {{ .. }})` 内部,`track_sftp_task` 只存 `JoinHandle` 从不
+    /// `.await` —— tokio 把 panic 关在 task 边界里,没人看。真出现这个
+    /// 分支(比如加了新的 `FileOp` 变体、只改了这个 match 忘了在函数开头
+    /// 补分流)不是崩溃,是**静默挂起**:框关了、没 toast、没错误、没
+    /// `SftpOpDone`,正是 T11 一族最忌讳的那种。改成走正常的 `Err`,至少
+    /// 用户能看见一张错误卡片。
+    ///
+    /// 自证会变红:把 `Err(..)` 改回 `unreachable!(..)`。
+    #[test]
+    fn the_dead_arm_in_apply_file_op_returns_an_error_instead_of_panicking_inside_a_detached_task()
+    {
+        let body = body_of(prod_src(), "fn apply_file_op(");
+        let anchor =
+            "FileOp::Resolve { .. } | FileOp::ResolveEdit { .. } | FileOp::Paste { .. } =>";
+        let at = body.find(anchor).unwrap_or_else(|| {
+            panic!("找不到 Resolve/ResolveEdit/Paste 的兜底分支 —— 这条测试的锚点失效了")
+        });
+        let arm_rest = &body[at + anchor.len()..];
+        let brace_at = arm_rest
+            .find('{')
+            .unwrap_or_else(|| panic!("兜底分支没有块体:{arm_rest}"));
+        let arm_body = brace_balanced_arm(&arm_rest[brace_at..]);
+        assert!(
+            arm_body.len() < arm_rest[brace_at..].len(),
+            "兜底分支没截到闭合大括号,断言会退化成扫全文件"
+        );
+        assert!(
+            !arm_body.contains("unreachable!"),
+            "兜底分支又用回了 unreachable!() —— 它跑在 spawn 出去的 task 里,\
+             panic 会被 JoinHandle 悄悄吞掉,用户看到的是点了按钮之后什么\
+             都不发生(复核 I2):{arm_body}"
+        );
+        assert!(
+            arm_body.contains("Err("),
+            "兜底分支得走 Err(..) 让 SftpOpDone 把错误带回界面,不能只是\
+             return 或者别的静默处置:{arm_body}"
         );
     }
 
