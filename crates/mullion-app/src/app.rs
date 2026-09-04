@@ -4697,10 +4697,13 @@ impl App {
     /// `policy`/`existing` 全部原样转发,不在这里现读面板状态。
     ///
     /// **真正的写逻辑(本任务 B6 仍是桩)在 `spawn_paste_task`,不是这个
-    /// 方法** —— B7 要改的是那个自由函数。它的签名里没有 `&Tabs`/
-    /// `TabContent`,这不是约定,是类型层强制:那个函数的作用域里压根
-    /// 没有 `self`/`tab` 这两个名字,B7 接手时想在里面重新读面板状态,
-    /// 编译都过不了。守护见 `spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs`。
+    /// 方法** —— B7 要改的是那个自由函数。当前签名里没有 `self`/`&Tabs`/
+    /// `TabContent`,那个函数的作用域里压根没有这几个名字可用,B7 接手
+    /// 时想在里面重新读面板状态,编译过不了。这份保证靠的是「当前签名 +
+    /// 一条白名单守护」的组合,不是无条件的类型层铁律 —— 单靠约定挡不
+    /// 住换个不撞词的参数(比如加一个 `app: &App`),这条守护见
+    /// `spawn_paste_task_params_are_locked_to_an_explicit_whitelist`,加
+    /// 新参数类型必须先进它的白名单。
     fn dispatch_paste(
         &mut self,
         generation: u64,
@@ -13450,7 +13453,7 @@ mod tests {
     /// 分流块本身仍是 `apply_file_op(&mut self, ..)` 方法体的一部分,
     /// `self.tabs` 一直在作用域里,没有办法把这一层也做成编译期不可写。
     /// 真正**类型层**的防线在下游的 `spawn_paste_task`(见其文档 + 守护
-    /// `spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs`)——
+    /// `spawn_paste_task_params_are_locked_to_an_explicit_whitelist`)——
     /// 那个自由函数的作用域里压根没有 `self`/`tab`,想现读面板,编译都
     /// 过不了。这条测试留着,是因为它确实挡住了「直接调 `files_panel()`」
     /// 这种最省事的写法,而且**这道分流只应该转发,不应该有任何理由碰
@@ -13522,7 +13525,7 @@ mod tests {
     /// 这条测试的价值是「挡住最省事的写法、留一个显式的红线注释」,
     /// 不是「证明这一步不可能写坏」——那件事只有对 `spawn_paste_task`
     /// 才成立(它没有 `self`/`tab` 可用,见
-    /// `spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs`)。
+    /// `spawn_paste_task_params_are_locked_to_an_explicit_whitelist`)。
     ///
     /// 自证会变红:在函数体里加回 `let _x = self.tabs.by_generation(generation)
     /// .and_then(|t| t.content.files_panel());`(取到就足够触发 —— 判据
@@ -13542,26 +13545,31 @@ mod tests {
     }
 
     /// 复核 C1:锁住 `spawn_paste_task` 的**结构**——它必须是顶格的自由
-    /// 函数(不是 `impl App` 里缩进的方法),参数列表里不能出现
-    /// `self`/`Tabs`/`TabContent` 这几个能摸到活面板的名字。这不是重复
-    /// 造一个「黑名单扫描」:上面两条问题 1 的守护挡的是**函数体里写了
-    /// 什么**(天生防不住换个写法就绕开),这条挡的是**函数的作用域里
-    /// 有没有 `self`/`tab` 这两个名字可用**——只要它是自由函数且不接收
-    /// 这几个参数,复核者给的两个退化变异(`match &tab.content {{ .. }}`
-    /// 现读 `cwd`)在这个函数体内根本写不出来,编译器会报
-    /// `cannot find value \`self\`` / `cannot find value \`tab\``,不需要
-    /// 猜有没有别的绕法。
+    /// 函数(不是 `impl App` 里缩进的方法),参数列表里出现的每一个类型
+    /// 都必须在下面 `ALLOWED_PARAM_TYPES` 这份显式白名单里。
     ///
-    /// 这条测试守的不是「函数体有没有写坏代码」(那个不用猜,写了就编译
-    /// 不过),守的是**下一个人把这个自由函数改回 `&mut self` 方法**这
-    /// 一步——改回去的话,原先的类型层保证瞬间失效,而且这一步改动本身
-    /// 编译照样通过、`cargo test --workspace` 照样全绿,只有这条测试能
-    /// 拦住(不改这条测试,没人会注意到防线已经没了)。
+    /// **这条判据曾经是黑名单**(参数列表里不能出现 `self`/`Tabs`/
+    /// `TabContent` 这几个字面词),复核时被实证绕过:给函数加一个
+    /// `app: &App` 参数——不撞任何一个禁词,编译照样过、
+    /// `cargo test --workspace` 照样全绿,函数体里照样摸得到活面板。
+    /// 黑名单挡的是**已知的几种写法**,挡不住「换一个不撞词的参数名」
+    /// 这种最自然的绕法。改成白名单之后,任何**新加的参数类型**——不管
+    /// 叫什么名字——只要不在 `ALLOWED_PARAM_TYPES` 里就会让这条测试变
+    /// 红,逼着改的人回来把新类型显式加进白名单、顺带看一眼这条守护在
+    /// 防什么。这是复核闸门,不是自动挡下所有绕法的保证。
     ///
-    /// 自证会变红:把 `spawn_paste_task` 的签名从 `fn spawn_paste_task(` +
-    /// 一堆值参数,改成 `impl App { fn spawn_paste_task(&mut self, ..)`。
+    /// 这条测试**不**断言函数体本身摸不到活面板(那件事只要看参数列表就
+    /// 够——凡是拿不到 `self`/`Tabs`/`TabContent` 也拿不到能间接访问它们
+    /// 的类型,函数体内自然引用不到;函数体是否真的这么写,归上面两条
+    /// 问题 1 的浅层扫描管,这条只管**签名**)。它守的是**当前签名 + 这
+    /// 条白名单守护**这个组合——离开这条测试单独看签名或单独看白名单,
+    /// 都不构成保证。
+    ///
+    /// 自证会变红(两种):(1)把 `spawn_paste_task` 挪进 `impl App`、签名
+    /// 加 `&mut self`;(2)按复核者的实证,加一个 `app: &App` 参数
+    /// (类型 `&App` 不在白名单里)。
     #[test]
-    fn spawn_paste_task_is_a_free_function_with_no_way_to_reach_the_tabs() {
+    fn spawn_paste_task_params_are_locked_to_an_explicit_whitelist() {
         let src = prod_src();
         let anchor = "fn spawn_paste_task(";
         let at = src
@@ -13575,8 +13583,7 @@ mod tests {
             "",
             "spawn_paste_task 前面出现了缩进,说明它被挪进了某个 impl 块里\
              当成了方法(很可能是 `&mut self`)—— 复核 C1 要求它必须是\
-             顶格的自由函数,类型层的保证建立在「这个函数的作用域里没有\
-             self/tab」上,一旦它变回方法,这条保证就没了:{:?}",
+             顶格的自由函数:{:?}",
             &src[line_start..at]
         );
         // 参数列表:从函数名后的 `(` 找到第一个 `)`。已知这份参数列表里
@@ -13588,12 +13595,63 @@ mod tests {
             .map(|i| params_start + i)
             .unwrap_or_else(|| panic!("spawn_paste_task 的参数列表没找到右括号"));
         let params = &src[params_start..params_end];
-        for banned in ["self", "Tabs", "TabContent"] {
+        // 按顶层逗号切分成一个个 `name: Type`(泛型里的 `<..>` 不算顶层
+        // 逗号的边界,深度计数跳过它)。
+        const ALLOWED_PARAM_TYPES: &[&str] = &[
+            "&Runtime",
+            "&EventLoopProxy<UserEvent>",
+            "u64",
+            "Arc<mullion_ssh::sftp::SftpClient>",
+            "mullion_ssh::sftp::RemotePath",
+            "crate::files::clip::RemoteClip",
+            "crate::files::clip::Policy",
+            "std::collections::BTreeSet<Vec<u8>>",
+        ];
+        let mut depth = 0i32;
+        let mut field = String::new();
+        let mut fields = Vec::new();
+        for ch in params.chars() {
+            match ch {
+                '<' => {
+                    depth += 1;
+                    field.push(ch);
+                }
+                '>' => {
+                    depth -= 1;
+                    field.push(ch);
+                }
+                ',' if depth == 0 => {
+                    fields.push(std::mem::take(&mut field));
+                }
+                _ => field.push(ch),
+            }
+        }
+        if !field.trim().is_empty() {
+            fields.push(field);
+        }
+        assert!(
+            !fields.is_empty(),
+            "spawn_paste_task 的参数列表解析成了空列表 —— 这条测试的解析\
+             逻辑失效了,实际参数列表:{params}"
+        );
+        for raw in &fields {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let ty = trimmed
+                .split_once(':')
+                .unwrap_or_else(|| panic!("参数 {trimmed:?} 没有 `:` 分隔的类型标注 —— 解析失败"))
+                .1
+                .trim();
             assert!(
-                !params.contains(banned),
-                "spawn_paste_task 的参数列表里出现了 {banned:?} —— 一旦它能\
-                 摸到 self/Tabs/TabContent,复核 C1 要的类型层保证就没了,\
-                 实际参数列表:{params}"
+                ALLOWED_PARAM_TYPES.contains(&ty),
+                "spawn_paste_task 出现了不在白名单里的参数类型 {ty:?}\
+                 (完整参数:{trimmed:?})—— 这条守护是白名单,不是黑名单:\
+                 任何新参数类型都必须显式加进 ALLOWED_PARAM_TYPES 才能\
+                 过,逼着改的人回来看一眼这条守护在防什么(旧的黑名单只\
+                 挡 self/Tabs/TabContent 三个字面词,加一个 `app: &App`\
+                 就绕过去了,复核已经实证过)。完整参数列表:{params}"
             );
         }
     }
