@@ -19968,6 +19968,60 @@ mod tests {
         );
     }
 
+    /// F218:`stat` 回来的两条判据,各自都能静默出事。
+    ///
+    /// - **失败那条必须原地返回**:一次误划(选区里那串根本不是远端路径)
+    ///   要是照样发 `Goto`,用户正在看的目录就被冲掉了 —— 比不跳更糟,而且
+    ///   他刚才在面板里的选中、滚动位置一起没。掉进去只会得到一条
+    ///   `NoSuchFile` 的空目录。
+    /// - **`set_reveal_pick` 必须排在 `Goto` 之后**:`Goto` 会走
+    ///   `begin_load` → `clear_selection`,写在前面的话那一条被自己清掉,
+    ///   症状是「跳过去了但什么都没选中」—— 编译、测试、日志全不报。
+    ///
+    /// 扎源码结构:真正验它要一条活 sftp 连接,这个容器里造不出来。
+    ///
+    /// 自证会变红:
+    /// - 把 `Err` 分支里的 `return;` 换成 `false`(往下走,当成「不是目录」)
+    ///   —— 第一条断言红。**光删掉编译不过**(match 两条臂类型对不上),
+    ///   所以这里换的是那个真会被写出来的形态。
+    /// - 把 `set_reveal_pick` 那行挪到 `apply_remote_file_action` 之前
+    ///   —— 第二条断言红。
+    #[test]
+    fn a_failed_stat_leaves_the_panel_where_it_was_and_the_pick_is_written_after_the_goto() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(prod.len() < src.len(), "范围没切到 mod tests 之前");
+        let at = prod
+            .find("    fn accept_reveal_stat(")
+            .expect("缺 accept_reveal_stat —— stat 结果没人收,跳转永远不发生");
+        let body = &prod[at..];
+        let end = body.find("\n    }\n").expect("找不到函数结尾");
+        let body = &body[..end];
+
+        let err_at = body.find("Err(msg) => {").expect("没处理 stat 失败");
+        let goto_at = body
+            .find("self.apply_remote_file_action(")
+            .expect("成功那条没发 Goto —— 面板根本不会动");
+        let err_arm = &body[err_at..goto_at];
+        assert!(
+            err_arm.contains("return;"),
+            "stat 失败没有原地返回 —— 会带着 `is_dir = false` 往下走,\
+             把用户正在看的目录换成一个不存在的路径的父目录"
+        );
+
+        let pick_at = body
+            .find("self.set_reveal_pick(")
+            .expect("没写待亮的那一条 —— 跳到父目录却什么都不选中");
+        assert!(
+            goto_at < pick_at,
+            "待亮的那一条写在 Goto 之前 —— begin_load 的 clear_selection 会\
+             把它清掉,症状是「跳过去了但什么都没选中」且完全静默"
+        );
+    }
+
     /// F131:路径条的编辑态必须算模态。**不算的话那个输入框里一个字都打不
     /// 出来** —— 面板拿着键盘焦点时,键不会喂给 egui
     /// (`input_route::egui_should_see_focused` 是 T8 的注入点),而是被

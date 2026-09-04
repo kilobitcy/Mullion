@@ -944,6 +944,28 @@ mod tests {
         );
     }
 
+    /// F218:换机器时那条「待亮的文件」也要作废 —— 它是**另一台**上的文件名。
+    ///
+    /// `invalidate` 递增了序号,所以旧那次列目录进不来;但新连接的**下一次**
+    /// 列目录序号是对的,待办留着就会在新机器上找同名文件,恰好有一个就被
+    /// 莫名其妙地选中并滚到跟前,而用户压根没在这台机器上按过那个键。
+    ///
+    /// 自证会变红:把 `invalidate` 里的 `self.reveal_pick = None;` 删掉。
+    #[test]
+    fn a_reveal_pick_does_not_survive_a_host_switch() {
+        let mut s = state();
+        s.reveal_pick = Some(rp("same-name.txt"));
+
+        s.invalidate();
+        let seq = s.begin_load(rp("/srv"));
+        assert!(s.accept(seq, Ok(vec![e("same-name.txt", EntryKind::File)])));
+
+        assert!(
+            s.selected_paths().is_empty() && s.scroll_to.is_none(),
+            "新机器上的同名文件被当成上一台的跳转目标亮起来了"
+        );
+    }
+
     #[test]
     fn a_failed_load_clears_the_rows_and_keeps_the_reason() {
         let mut s = state();
