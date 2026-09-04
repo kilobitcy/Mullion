@@ -5,6 +5,7 @@
 
 use mullion_ssh::sftp::{Entry, EntryKind};
 
+pub mod clip;
 pub mod drag;
 pub mod fail;
 pub mod local;
