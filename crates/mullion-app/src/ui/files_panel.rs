@@ -74,6 +74,9 @@ pub enum FileAction {
         from: mullion_ssh::sftp::RemotePath,
         to: mullion_ssh::sftp::RemotePath,
     },
+    /// F219:请求进入就地新建态(右键菜单 / `Ctrl+N`)。真正的写操作要等
+    /// 用户在那一行里敲完名字回车,由 `NewFile` 发出。
+    BeginNewFile,
     /// F219:就地新建文件提交。**绝对路径**,在面板里用同一个 `cwd` 拼好 ——
     /// 理由与 `Rename` 逐字相同:从开始输入到敲回车中间用户完全可能换了
     /// 目录,app 侧再拿「当前 cwd」去拼就是在另一个目录里建文件。
@@ -135,6 +138,9 @@ pub enum MenuItem {
     Transfer,
     EditExternal,
     EditInline,
+    /// F219:就地新建文件。**不是 `Ask`** —— 它不弹框,是让列表首行长出一个
+    /// 输入框(同 F200 的改名)。
+    NewFile,
 }
 
 /// 右键那一刻的光标行。**只有「是不是普通文件」和大小** —— 那一刻手上
@@ -174,6 +180,7 @@ pub fn menu_items_for(column: PanelColumn, target: Option<MenuTarget>) -> Vec<Me
     let mut out: Vec<MenuEntry> = Vec::new();
     if column == PanelColumn::Remote {
         out.push(on("新建文件夹…", MenuItem::Ask(FileAsk::NewDir)));
+        out.push(on("新建文件", MenuItem::NewFile));
         if let Some(tg) = target {
             out.push(on("下载到本地", MenuItem::Transfer));
             // F53:只对普通文件出现。目录/链接上给一个「编辑」纯属误导。
@@ -216,6 +223,7 @@ impl MenuItem {
             MenuItem::Transfer => FileAction::Transfer,
             MenuItem::EditExternal => FileAction::EditExternal,
             MenuItem::EditInline => FileAction::EditInline,
+            MenuItem::NewFile => FileAction::BeginNewFile,
         }
     }
 }
@@ -4185,6 +4193,29 @@ mod tests {
         assert!(
             local.iter().any(|e| e.item == MenuItem::OpenInExplorer),
             "本地栏该有「在资源管理器中打开」"
+        );
+    }
+
+    /// F219:「新建文件」只在远端栏出现(D5),且**不带省略号** ——
+    /// 省略号在这套界面里的意思是「会弹框」(F200 定的),而它是就地编辑。
+    #[test]
+    fn the_new_file_item_is_remote_only_and_carries_no_ellipsis() {
+        let labels: Vec<&str> = menu_items_for(PanelColumn::Remote, None)
+            .iter()
+            .map(|e| e.label)
+            .collect();
+        assert!(labels.contains(&"新建文件"), "远端栏没有「新建文件」");
+        assert!(
+            !labels.iter().any(|l| l.starts_with("新建文件…")),
+            "「新建文件」带了省略号 —— 那是弹框的记号"
+        );
+        let local: Vec<&str> = menu_items_for(PanelColumn::Local, None)
+            .iter()
+            .map(|e| e.label)
+            .collect();
+        assert!(
+            !local.contains(&"新建文件"),
+            "本地栏出现了写操作(D5:本地文件管理外包给资源管理器)"
         );
     }
 

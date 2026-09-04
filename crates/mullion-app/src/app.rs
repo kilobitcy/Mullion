@@ -4204,9 +4204,9 @@ impl App {
                 log::warn!("本地栏收到了改名请求,已忽略(D5)");
                 return;
             }
-            // F219:同上 —— 本地栏根本进不了新建编辑态(`begin_new_file` 的
-            // 调用点只在远端那条路上,D5)。真正的分派在 Task A4 接。
-            FileAction::NewFile(_) => {
+            // F219:同 `Rename` —— 本地栏根本进不了新建态(`menu_items_for`
+            // 不给这一项,`handle_panel_key` 的 Ctrl+N 也只在远端栏放行)。
+            FileAction::BeginNewFile | FileAction::NewFile(_) => {
                 log::warn!("本地栏收到了新建文件请求,已忽略(D5)");
                 return;
             }
@@ -4334,6 +4334,27 @@ impl App {
                 self.apply_file_op(generation, op);
                 return;
             }
+            // F219:请求进入就地新建态。纯 UI 状态,不发任何请求 ——
+            // 与 `Ask` 一样在借出 `files` 之前分流。
+            FileAction::BeginNewFile => {
+                if let Some(files) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.files_panel_mut())
+                {
+                    files.remote.begin_new_file();
+                    mark_ui_dirty!(self.ui_dirty);
+                    self.request_ui_redraw();
+                }
+                return;
+            }
+            // F219:名字定了 —— 路径已经在面板里拼好、也过了两道校验闸
+            // (见 `FileAction::NewFile` 的文档),这里只管发。
+            FileAction::NewFile(path) => {
+                let op = crate::ui::files_dialog::FileOp::NewFile(path.clone());
+                self.apply_file_op(generation, op);
+                return;
+            }
             _ => {}
         }
         let client = {
@@ -4393,9 +4414,9 @@ impl App {
             | FileAction::Reconnect
             | FileAction::BookmarkAdd { .. }
             | FileAction::BookmarkRemove { .. }
-            | FileAction::Rename { .. } => return,
-            // F219:真正的分派在 Task A4 接。
-            FileAction::NewFile(_) => return,
+            | FileAction::Rename { .. }
+            | FileAction::BeginNewFile
+            | FileAction::NewFile(_) => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
@@ -4756,6 +4777,7 @@ impl App {
         let task = self._runtime.spawn(async move {
             let result = match op {
                 FileOp::NewDir(p) => client.create_dir(&p).await.map_err(|e| e.to_string()),
+                FileOp::NewFile(p) => client.create_file(&p).await.map_err(|e| e.to_string()),
                 FileOp::Rename { from, to } => {
                     client.rename(&from, &to).await.map_err(|e| e.to_string())
                 }
@@ -13374,6 +13396,29 @@ mod tests {
                  标签 2 要重开才看得见(F187)"
             );
         }
+    }
+
+    /// F219:远端栏收到 `NewFile` 要**直接发写操作**,不绕对话框。
+    ///
+    /// 自证会变红:把那一臂删掉(落进 `_ => {}` 之后它会掉进下面
+    /// 那个 `target` 的 match,编译不过 —— 所以真正要防的是有人把它接进
+    /// `Ask`,那样就静默多弹一个框)。
+    #[test]
+    fn the_remote_column_sends_new_file_straight_to_a_write_op() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn apply_remote_file_action")
+            .nth(1)
+            .expect("找不到 apply_remote_file_action");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let at = body
+            .find("FileAction::NewFile")
+            .expect("远端栏没接 NewFile —— 回车之后什么都不会发生");
+        let arm = &body[at..at + 400.min(body.len() - at)];
+        assert!(
+            arm.contains("FileOp::NewFile"),
+            "NewFile 没落到写操作上(接成弹框的话会多一个没人要的对话框)"
+        );
     }
 
     /// F154 接线守护:本地栏收到书签动作要**真处理**,不是记一条 warn 扔掉。

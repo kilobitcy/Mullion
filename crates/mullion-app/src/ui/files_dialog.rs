@@ -64,6 +64,8 @@ pub enum FilesDialog {
 pub enum FileOp {
     /// 完整的目标路径(已经拼好,`app.rs` 不再拼一次 —— 拼两遍就有一遍会错)。
     NewDir(RemotePath),
+    /// F219:新建一个空文件。完整的目标路径(已经拼好,同 `NewDir`)。
+    NewFile(RemotePath),
     Rename {
         from: RemotePath,
         to: RemotePath,
