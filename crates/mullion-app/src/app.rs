@@ -12026,10 +12026,11 @@ fn spawn_paste_task(
 ) -> tokio::task::JoinHandle<()> {
     let proxy = proxy.clone();
     runtime.spawn(async move {
-        let result = mullion_ssh::copy_tree::transfer_into(&client, &conn, &plan.pairs, mode, overwrite)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string());
+        let result =
+            mullion_ssh::copy_tree::transfer_into(&client, &conn, &plan.pairs, mode, overwrite)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
         let _ = proxy.send_event(UserEvent::SftpOpDone {
             generation,
             result,
