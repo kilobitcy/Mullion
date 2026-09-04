@@ -823,11 +823,16 @@ pub fn show(
     let rows = state.rows();
     // F219:本地判重用。**按 `entries` 而不是 `rows`** —— 隐藏文件也占名字,
     // 关着隐藏开关时建一个 `.env` 照样会撞上服务端那条。
-    let taken: std::collections::BTreeSet<Vec<u8>> = state
-        .entries
-        .iter()
-        .map(|e| e.name.as_bytes().to_vec())
-        .collect();
+    //
+    // 质量复核修复:**门在 `new_row == 1` 后面**,不新建态时压根不构建。
+    // 只有下面 `ix == 0 && new_row == 1` 那一个分支用得到它——`show_rows`
+    // 的虚拟滚动保护不了这一段:它跑在虚拟滚动**外面**,对
+    // `state.entries` 全量扫描 + 每个名字堆分配一次,不看这一帧实际画了
+    // 几行。用户 99% 的时间不在新建文件,不门住的话每一帧都要为一个用
+    // 不上的集合付这份开销(本项目为空载 CPU/内存专门做过 N1/N5 几个
+    // 切片,这类回归在意)。借 `&[u8]` 不 `.to_vec()`,顺手把复制也省掉。
+    let taken: Option<std::collections::BTreeSet<&[u8]>> =
+        (new_row == 1).then(|| state.entries.iter().map(|e| e.name.as_bytes()).collect());
     // F218:把待滚动的那一条换算成视口偏移。`show_rows` 是虚拟滚动,目标行
     // 多半根本没被画出来,拿不到 `Response` 去 `scroll_to_rect` —— 行高恒定,
     // 直接算偏移是这里唯一可行的办法。
@@ -911,7 +916,10 @@ pub fn show(
                 if ix == 0 && new_row == 1 {
                     let n = newing.as_mut().expect("new_row == 1 时 newing 必为 Some");
                     let trimmed = n.buf.trim().as_bytes();
-                    let extra_err = (!trimmed.is_empty() && taken.contains(trimmed))
+                    let taken_ref = taken
+                        .as_ref()
+                        .expect("new_row == 1 时 taken 必为 Some(同上 newing)");
+                    let extra_err = (!trimmed.is_empty() && taken_ref.contains(trimmed))
                         .then_some("已经有同名的文件/目录了");
                     if let Some(done) = name_edit_row(
                         ui,
@@ -1232,7 +1240,12 @@ fn header_at(
 /// 各写一遍必然漂移(改对了改名那边,新建那边悄悄漏改)。
 ///
 /// `preselect_stem`:改名要预选中主干、留下扩展名(见 `rename_stem_len`);
-/// 新建的缓冲进来是空的,没有「主干」这回事,原样选中(空选区)即可。
+/// `false` 时选中的是**整个缓冲**(`buf.chars().count()`),不是「不选」——
+/// 这是全选,只是**当前唯一调用方**(`begin_new_file` 传入 `buf: String::new()`)
+/// 恰好在进编辑态那一刻缓冲是空的,全选一个空串等价于空选区。这条前提由
+/// 调用方保证,不是这个参数的通用语义:将来要是有第三个调用方带着非空
+/// 初始值传 `preselect_stem: false`,实际会选中那段已有文字,不是「原样
+/// 不动」。
 ///
 /// `extra_err`:调用方自己那道额外校验(新建那条路上是「目录里已经有同名
 /// 的」)。与 `validate_name` 的错**一样处理**:画红框、悬停说原因、回车
@@ -1281,10 +1294,12 @@ fn name_edit_row(
     );
     if *focus_pending {
         *focus_pending = false;
-        // 预选中主干、留下扩展名(改名);新建的空缓冲没有主干,原样选中
-        // (空缓冲选区长度恒为 0,等价于什么都不选)。只在**进编辑态那一刻**
-        // 调一次 —— 每帧调的话用户拖出来的选区会被反复覆盖(同 `select_all`
-        // 的文档)。
+        // 预选中主干、留下扩展名(改名);`preselect_stem == false` 选的是
+        // **整个缓冲**——新建态的调用方保证这一刻 `buf` 是空串,全选一个
+        // 空串才等价于「什么都没选」,不是这个分支本身在做「原样不选」
+        // (通用语义见函数文档 `preselect_stem` 那条)。只在**进编辑态那
+        // 一刻**调一次 —— 每帧调的话用户拖出来的选区会被反复覆盖(同
+        // `select_all` 的文档)。
         let sel_len = if preselect_stem {
             rename_stem_len(buf)
         } else {
@@ -3023,6 +3038,40 @@ mod tests {
             // (走 `show_rows` 而不是全量扫描)不变。
             production.contains(".show_rows(ui, ROW_H, rows.len() + new_row,"),
             "渲染必须走 show_rows 虚拟滚动,否则两万项目录会把帧时间打穿"
+        );
+    }
+
+    /// 质量复核修复(F219):`taken`(新建态判重集合)必须建在 `new_row == 1`
+    /// 门控**里面**——它只在 `ix == 0 && new_row == 1` 那一个分支里用得到
+    /// (见 `taken_ref.contains` 那一行),`show_rows` 的虚拟滚动保护不了它:
+    /// 它跑在虚拟滚动**外面**,对 `state.entries` 全量扫描 + 每个名字借一次
+    /// 引用建树,不看这一帧实际画了几行。用户 99% 的时间不在新建文件,不
+    /// 门住的话每一帧都要白付这份开销(N1/N5 那几个切片专门为空载
+    /// CPU/内存立的规矩,这类回归在意)。
+    ///
+    /// 判据不是「这段构建代码存在」(那种判据在把它整段搬到门控外面之后
+    /// 照样绿——字面串原样还在,只是挪了位置);是「它跟门控写成**同一条
+    /// 表达式**」:`(new_row == 1)` 后面紧跟 `.then(`,这个相邻关系本身就是
+    /// 门控——把构建挪到门控外面(改回无条件收集),这一整串连续字面文本
+    /// 会跟着门控一起从源码里消失,不是「还在只是搬了家」。同一份源码切片
+    /// 手法照抄 `a_huge_directory_is_rendered_with_show_rows_not_a_full_scan`:
+    /// 用 `#[cfg(test)]` 之前的部分匹配,避免匹配到测试自身这句字面串。
+    ///
+    /// 自证会变红:把 `(new_row == 1).then(|| state.entries.iter()....collect())`
+    /// 改回无条件的 `state.entries.iter()....collect()`。
+    #[test]
+    fn the_dedup_set_for_new_file_naming_is_built_only_inside_the_ghost_row_gate() {
+        let src = include_str!("files_panel.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        assert!(
+            production.contains(
+                "(new_row == 1).then(|| state.entries.iter().map(|e| e.name.as_bytes()).collect());"
+            ),
+            "taken 判重集合的构建必须跟 `new_row == 1` 门控写成同一条表达式 \
+             —— 不然不新建态时(用户 99% 的时间)每帧都要为一个用不上的集合 \
+             付一次整目录遍历 + 堆分配"
         );
     }
 
