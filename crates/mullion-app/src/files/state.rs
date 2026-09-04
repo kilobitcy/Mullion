@@ -684,7 +684,10 @@ mod tests {
         s.cursor = Some(RemotePath::from_bytes(b"a.txt".to_vec()));
         assert!(s.begin_rename(), "前提:进得了改名态");
         assert!(s.begin_new_file());
-        assert!(s.rename_edit.is_none(), "改名态还赖着 —— 两个输入框会互抢焦点");
+        assert!(
+            s.rename_edit.is_none(),
+            "改名态还赖着 —— 两个输入框会互抢焦点"
+        );
 
         let mut s = state();
         s.accept(s.request_seq, Ok(vec![e("a.txt", EntryKind::File)]));
