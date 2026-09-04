@@ -45,7 +45,19 @@ pub enum TransferReport {
 /// `files::clip::is_within`(`crates/mullion-app/src/files/clip.rs`)的写法——
 /// 光比前缀会把 `/a/bb` 误判成 `/a/b` 的子孙:那是两个不相干的目录,合法的
 /// 「拷贝 `/a/b` → `/a/bb`」不能被冤枉挡掉。
+///
+/// `a` 侧先剥掉末尾斜杠再比:`RemotePath` 不做归一化(`sftp.rs` 里
+/// `join` 的文档 + 既有测试 `joining_keeps_bytes_and_uses_a_single_slash`
+/// 都实证末尾斜杠会被原样保留,是代码库承认的合法状态),`a` 一旦带着
+/// 末尾斜杠不剥,`b[a.len()]` 落的就不是分隔符而是子项名字的第一个字符,
+/// 边界判断永远不成立,这道闸会被整个绕过(2026-09 复核第二轮追加)。
+/// 根 `/` 是特例:不能剥成空串——剥空之后 `a == b""` 永远不成立,照样
+/// 绕过,所以剥到只剩一个字符就停。`b` 侧的判定不动,已经过独立验证。
 fn is_ancestor_or_self(a: &[u8], b: &[u8]) -> bool {
+    let mut a = a;
+    while a.len() > 1 && a.ends_with(b"/") {
+        a = &a[..a.len() - 1];
+    }
     if a == b || a == b"/" {
         return true;
     }
@@ -174,11 +186,13 @@ async fn try_exec(
 /// 不同的取舍,2026-09 复核 I1):这里的拷贝要等子项全部拷完、算出目标
 /// 目录的最终内容之后,才轮到给这一层的父目录 `set_permissions`——
 /// 后序语义,换成显式栈要把「哪一层轮到设权限」这份状态搬到调用方手里
-/// 自己维护,复杂度在这个切片里不值当。代价是 `Box::pin` 只解决了
-/// 「递归 async fn 类型无限大、编译不过」,poll 时的调用栈深度一点没
-/// 减——父 future 的 `poll()` 仍然同步调子 future 的 `poll()`,深目录树
-/// 有栈溢出风险,与 `remove_tree.rs:73-74` 那条注释说的是同一个模式,
-/// 这里只是选了不同的应对(即:没应对,只是记在这里别让人以为两边一样安全)。
+/// 自己维护。`remove_tree.rs` 已经证明这条路是走得通的(BFS 收集 + 逆序
+/// 处理那一套),这里没照搬,单纯是这一片还没花那个功夫,不是说它不可行。
+/// 代价是 `Box::pin` 只解决了「递归 async fn 类型无限大、编译不过」,
+/// poll 时的调用栈深度一点没减——父 future 的 `poll()` 仍然同步调子
+/// future 的 `poll()`,深目录树有栈溢出风险,与 `remove_tree.rs:73-74`
+/// 那条注释说的是同一个模式,这里只是选了不同的应对(即:没应对,只是
+/// 记在这里别让人以为两边一样安全)。
 async fn copy_one(sftp: &SftpClient, from: &RemotePath, to: &RemotePath) -> Result<(), SftpError> {
     let meta = sftp.stat(from).await?;
     match meta.kind {

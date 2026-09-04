@@ -1217,3 +1217,93 @@ async fn a_paste_refuses_a_named_pipe_instead_of_silently_copying_it_as_an_empty
         "FIFO 不该被当成普通文件拷出一份(内容为空的)副本"
     );
 }
+
+// ---- 代码质量复核第二轮追加(2026-09):C1 闸的两个新洞 ---------------------
+
+/// F220/B3 复核第二轮·1:`is_ancestor_or_self` 被 `from` 的末尾斜杠静默
+/// 绕过。`RemotePath` 不做归一化(`joining_keeps_bytes_and_uses_a_single_slash`
+/// 已证明末尾斜杠会被原样保留),带斜杠是代码库承认的合法状态——修复前,
+/// `from="/home/testuser/box/"` 时 `b[a.len()]` 落的是 `to` 里子项名字的
+/// 第一个字符而不是分隔符,边界判断永远不成立,C1 那道闸整个失效。
+///
+/// 场景与下面 `pasting_a_directory_into_its_own_subdirectory_...` 同构
+/// (把目录粘贴进它自己的子目录),唯一区别是 `from` 带一个末尾斜杠。
+#[tokio::test]
+async fn pasting_a_source_with_a_trailing_slash_into_its_own_subdirectory_is_still_refused() {
+    let (addr, probe, tree_h) = common::spawn_sftp_server(nested_tree()).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+    let from = RemotePath::from_bytes(b"/home/testuser/box/".to_vec());
+    let result = transfer_into(
+        &sftp,
+        &conn,
+        &[(from, rp("/home/testuser/box/sub"))],
+        CopyMode::Copy,
+        true,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "from 带末尾斜杠也不该绕过 C1 那道闸 —— 这个粘贴必须被拒绝"
+    );
+
+    let t = tree_h.lock().unwrap();
+    assert!(exists(&t, b"/home/testuser/box"), "源不该被动");
+    assert!(
+        exists(&t, b"/home/testuser/box/sub/deep.txt"),
+        "目标目录里原有的内容不该被清空"
+    );
+    drop(t);
+    let p = probe.lock().unwrap();
+    assert!(
+        p.execs.is_empty() && p.seen.is_empty(),
+        "挡下来的操作不该发出任何请求:execs={:?} seen={:?}",
+        p.execs,
+        p.seen
+    );
+}
+
+/// F220/B3 复核第二轮·2:`is_ancestor_or_self(f, t) || is_ancestor_or_self(t, f)`
+/// 两支各防一个方向。上面的 `pasting_into_an_ancestor_of_the_source_...`
+/// 测的是「`to` 是 `from` 的祖先」(`is_ancestor_or_self(t, f)` 那一支);
+/// 这条补相反方向——「`from` 是 `to` 的祖先」(`is_ancestor_or_self(f, t)`
+/// 那一支):把一个目录粘贴进它自己的子目录,`from=box`,`to=box/sub`。
+/// 复核者用真实靶向变异实测过:把两支砍成只留 `is_ancestor_or_self(t, f)`
+/// 那一支,29 条测试全绿——这个方向此前零覆盖。
+#[tokio::test]
+async fn pasting_a_directory_into_its_own_subdirectory_is_refused_before_any_request() {
+    let (addr, probe, tree_h) = common::spawn_sftp_server(nested_tree()).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+    let result = transfer_into(
+        &sftp,
+        &conn,
+        &[(rp("/home/testuser/box"), rp("/home/testuser/box/sub"))],
+        CopyMode::Copy,
+        true,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "from 是 to 的祖先(把目录粘贴进它自己的子目录),这个粘贴必须被拒绝"
+    );
+
+    let t = tree_h.lock().unwrap();
+    assert!(exists(&t, b"/home/testuser/box"), "源不该被动");
+    assert!(
+        exists(&t, b"/home/testuser/box/sub"),
+        "目标(同时也是源的子孙)不该被动"
+    );
+    assert!(
+        exists(&t, b"/home/testuser/box/sub/deep.txt"),
+        "目标目录里原有的内容不该被清空"
+    );
+    drop(t);
+    let p = probe.lock().unwrap();
+    assert!(
+        p.execs.is_empty() && p.seen.is_empty(),
+        "挡下来的操作不该发出任何请求:execs={:?} seen={:?}",
+        p.execs,
+        p.seen
+    );
+}
