@@ -962,6 +962,106 @@ async fn overwriting_an_existing_directory_replaces_it_instead_of_nesting_into_i
     }
 }
 
+/// F220/B3 缺口 3(复核靶向变异追加):上面那条覆盖测试只走了
+/// `CopyMode::Copy`。全套测试里 `CopyMode::Move` 只出现两处
+/// (`a_cut_paste_moves_the_entry_instead_of_copying_it` 和
+/// `a_cut_falls_back_to_copy_and_delete_when_rename_reports_exdev`),两处
+/// 传的都是 `overwrite=false` —— `Move + overwrite=true` 这个组合此前零
+/// 覆盖:实测把 `try_exec` 的条件改成
+/// `if overwrite && matches!(mode, CopyMode::Copy)`(让「漏加 rm -rf 前缀」
+/// 只在 Move 分支退化)→ 25/25 全绿,没有任何测试变红。这条组合有明确的
+/// 产品路径:B7 剪切一批文件、粘贴到有同名条目的目录、批量冲突框里选覆盖,
+/// 走的正是 `Move + overwrite=true`。
+///
+/// 结构照抄 `overwriting_an_existing_directory_replaces_it_instead_of_nesting_into_it`,
+/// 只把 `CopyMode::Copy` 换成 `CopyMode::Move`:判据同构 ——
+/// 树状态是「替换」不是「嵌套」,exec 命令串必须 `rm -rf -- ` 开头 + 含
+/// ` && mv -- `,外加剪切语义本身(源没了)。
+#[tokio::test]
+async fn overwriting_an_existing_directory_with_a_cut_replaces_it_instead_of_nesting_into_it() {
+    for without_exec in [true, false] {
+        let mut t0 = nested_tree();
+        // 目标已存在,且里面有一个源里没有的文件:覆盖后这个文件必须消失,
+        // 不然就是「嵌进去」而不是「替换」。
+        t0.entry(b"/home/testuser".to_vec())
+            .or_default()
+            .push(Node::dir(b"box-copy"));
+        t0.insert(
+            b"/home/testuser/box-copy".to_vec(),
+            vec![Node::file(b"stale.txt", 1)],
+        );
+
+        let (addr, probe, tree_h) = if without_exec {
+            common::spawn_sftp_server_without_exec(t0).await
+        } else {
+            common::spawn_sftp_server(t0).await
+        };
+        let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+        let report = transfer_into(
+            &sftp,
+            &conn,
+            &[(rp("/home/testuser/box"), rp("/home/testuser/box-copy"))],
+            CopyMode::Move,
+            true,
+        )
+        .await
+        .expect("覆盖剪切该成功");
+        assert_eq!(
+            report,
+            if without_exec {
+                TransferReport::Sftp
+            } else {
+                TransferReport::Exec
+            },
+            "without_exec={without_exec} 时走的路不对"
+        );
+
+        let t = tree_h.lock().unwrap();
+        assert!(
+            !exists(&t, b"/home/testuser/box"),
+            "源还在(without_exec={without_exec}) —— 剪切变成了复制"
+        );
+        let names: std::collections::BTreeSet<_> = names_in(&t, b"/home/testuser/box-copy")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            names,
+            [b"f1".to_vec(), b"sub".to_vec(), b"lnk".to_vec()]
+                .into_iter()
+                .collect(),
+            "覆盖后目标目录该只剩源的内容(without_exec={without_exec}):实际 {names:?}"
+        );
+        assert!(
+            !names.contains(b"stale.txt".as_slice()),
+            "旧内容没被清掉,说明是嵌进去了而不是替换(without_exec={without_exec})"
+        );
+        drop(t);
+        if !without_exec {
+            let p = probe.lock().unwrap();
+            assert!(
+                p.paths_for("write").is_empty() && p.paths_for("mkdir").is_empty(),
+                "覆盖走了 exec 就不该再发 SFTP 写请求:{:?}",
+                p.seen
+            );
+            assert_eq!(p.execs.len(), 1, "覆盖剪切该只发一条命令");
+            let cmd = &p.execs[0];
+            assert!(
+                cmd.starts_with(b"rm -rf -- "),
+                "覆盖命令必须先 rm -rf 清场,不能是裸 mv -f(mv 撞上已存在的目录是嵌进去,\
+                 不是替换): {}",
+                String::from_utf8_lossy(cmd)
+            );
+            let needle: &[u8] = b" && mv -- ";
+            assert!(
+                cmd.windows(needle.len()).any(|w| w == needle),
+                "覆盖命令必须是 rm -rf -- <dst> && mv -- <src> <dst> 这个形状: {}",
+                String::from_utf8_lossy(cmd)
+            );
+        }
+    }
+}
+
 /// F220/B3 缺口 2:SFTP 回退路径里「`rename` 失败(EXDEV)→ 拷贝 + 删源」
 /// 这条分支。真实 sshd 上跨设备重命名会失败,`transfer_into` 那时才退成
 /// 「`copy_one` 之后 `remove_tree(from)`」——假服务端的 `rename` 平时从不
