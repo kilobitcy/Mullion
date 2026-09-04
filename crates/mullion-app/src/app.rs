@@ -338,6 +338,10 @@ pub enum OpFollow {
     None,
     /// F219:刷新之后把光标落到这一条上(**末段名字**,不含目录)。
     Reveal(mullion_ssh::sftp::RemotePath),
+    /// F220:剪切粘贴成功 —— 清空这个标签的远端剪贴板。**只在成功之后**:
+    /// 发出那一刻就清的话,链路一断用户的剪贴板没了、东西也没挪走(T11)。
+    /// 复制粘贴不带这个后续,连着粘几个目录是常见用法。
+    ClearClip,
 }
 
 /// F53:一次回传到底发生了什么。
@@ -4692,16 +4696,33 @@ impl App {
     /// F220:真正执行一次粘贴(`cp -a` 快路径 / SFTP 逐文件回退)。
     ///
     /// 复核 C1:这个方法只负责从 `self` 取出真正干活的 `spawn_paste_task`
-    /// 需要、但它自己拿不到的资源(SFTP client)——同 `spawn_sftp_list_dir`/
-    /// `spawn_sftp_stat` 那两个自由函数的既有分工。`dst`/`clip`/`seq`/
-    /// `policy`/`existing` 全部原样转发,不在这里现读面板状态。
+    /// 需要、但它自己拿不到的资源(SFTP client / 连接句柄)——同
+    /// `spawn_sftp_list_dir`/`spawn_sftp_stat` 那两个自由函数的既有分工。
+    /// `dst`/`clip`/`policy`/`existing` 只在这里被读**一次**,喂给纯函数
+    /// `plan_paste` 算出 `PastePlan`(源目标配对 + 跳过数),算完就把这批
+    /// 冻结值消化掉——不转发给 `spawn_paste_task`,那边不需要、也不该
+    /// 重新推导「粘成什么样」这件事。
     ///
-    /// **真正的写逻辑(本任务 B6 仍是桩)在 `spawn_paste_task`,不是这个
-    /// 方法** —— B7 要改的是那个自由函数。当前签名里没有 `self`/`&Tabs`/
-    /// `TabContent`,那个函数的作用域里压根没有这几个名字可用,B7 接手
-    /// 时想在里面重新读面板状态,编译过不了。这份保证靠的是「当前签名 +
-    /// 一条白名单守护」的组合,不是无条件的类型层铁律 —— 单靠约定挡不
-    /// 住换个不撞词的参数(比如加一个 `app: &App`),这条守护见
+    /// B7 复核修正 1:计划原稿把 `plan_paste` 放进 `spawn_paste_task`
+    /// 的 async 体里,但那样做不到三件事——取 `conn`(需要 `tab`)、算空
+    /// 到没有传输时开一张 toast(需要 `&mut self.ui`)、`seq` 陈旧校验
+    /// (需要 `PaneState::paste_seq`)。挪到这儿之后,`spawn_paste_task`
+    /// 收到的是已经算完的既成事实,连误用的余地都没有。
+    ///
+    /// `seq` 陈旧校验:目前唯一能推进 `paste_seq` 的入口是 `start_paste`,
+    /// 而它要求键盘/指针路由到文件面板——`shell::input_route::route`/
+    /// `route_focused` 在 `modal_open()` 为真时把一切都判给 egui,批量
+    /// 冲突框本身就是一个模态(`Modal::FilesDialog`)。按现有代码,`seq`
+    /// 冻结之后到这个方法被调用之间,没有已知路径能让它变陈旧——这里
+    /// 仍然显式核一遍,防的是这道模态闸以后被悄悄打破,不是当前已知有洞。
+    /// 核验只读 `files.remote.paste_seq`,不碰 `dst`/`clip`/`existing`,
+    /// 同 `accept_paste_check` 那道同款闸门的分工(见其文档)。
+    ///
+    /// **真正的网络写逻辑在 `spawn_paste_task`,不是这个方法** —— 当前
+    /// 签名里没有 `self`/`&Tabs`/`TabContent`,那个函数的作用域里压根
+    /// 没有这几个名字可用。这份保证靠的是「当前签名 + 一条白名单守护」
+    /// 的组合,不是无条件的类型层铁律 —— 单靠约定挡不住换个不撞词的
+    /// 参数(比如加一个 `app: &App`),这条守护见
     /// `spawn_paste_task_params_are_locked_to_an_explicit_whitelist`,加
     /// 新参数类型必须先进它的白名单。
     fn dispatch_paste(
@@ -4713,24 +4734,70 @@ impl App {
         policy: crate::files::clip::Policy,
         existing: std::collections::BTreeSet<Vec<u8>>,
     ) {
-        let Some(client) = self
+        let Some(files) = self
             .tabs
             .by_generation(generation)
-            .and_then(|t| t.content.sftp_client())
+            .and_then(|t| t.content.files_panel())
         else {
+            return;
+        };
+        if files.remote.paste_seq != seq {
+            return;
+        }
+
+        let plan = crate::files::clip::plan_paste(&clip.items, &dst, policy, &existing);
+
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let Some(client) = tab.content.sftp_client() else {
             self.ui.set_error("SFTP 通道还没建立,粘贴没能执行".into());
             return;
         };
+        let Some(conn) = tab.content.sftp_connection_for(tab.content.sftp_host_ix()) else {
+            self.ui.set_error("SFTP 通道还没建立,粘贴没能执行".into());
+            return;
+        };
+
+        if plan.pairs.is_empty() {
+            // 全部撞名又选了「跳过」—— 没有传输要等,不发 SftpOpDone,
+            // 一张 toast 收尾即可。
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("{} 项都与目标同名,已全部跳过", plan.skipped),
+            );
+            return;
+        }
+
+        let mode = match clip.mode {
+            crate::files::clip::ClipMode::Copy => mullion_ssh::copy_tree::CopyMode::Copy,
+            crate::files::clip::ClipMode::Cut => mullion_ssh::copy_tree::CopyMode::Move,
+        };
+        let overwrite = policy == crate::files::clip::Policy::Overwrite;
+        // F220:只在这里**决定**要不要清剪贴板,不在这里执行——真正的
+        // 赋值要等 `SftpOpDone` 的成功分支(T11):链路一断,东西压根没
+        // 挪走,提前清就是剪贴板没了、东西还在原地。
+        let follow = follow_for_clip_mode(clip.mode);
+
+        let verb = match clip.mode {
+            crate::files::clip::ClipMode::Cut => "剪切",
+            crate::files::clip::ClipMode::Copy => "复制",
+        };
+        let n = plan.pairs.len();
+        // 异步派发别用完成时态:字节刚要发出去,成败还没揭晓。
+        self.ui
+            .set_toast(crate::ui::toast::Kind::Busy, format!("正在{verb} {n} 项…"));
+
         let task = spawn_paste_task(
             &self._runtime,
             &self.proxy,
             generation,
             client,
-            dst,
-            clip,
-            seq,
-            policy,
-            existing,
+            conn,
+            plan,
+            mode,
+            overwrite,
+            follow,
         );
         self.track_sftp_task(generation, task);
     }
@@ -9116,6 +9183,33 @@ impl ApplicationHandler<UserEvent> for App {
                         // (与 rename_edit/new_edit 同列),`begin_load` 将来
                         // 补上同款清理是很自然的演进,写在前面的话那一刻会
                         // 静默失效(F218 同款顺序陷阱)。
+                        // F220:剪切落地了 —— 清空剪贴板。**在这里**而不是
+                        // 发出那一刻:非成功意味着东西压根没挪走(T11)。
+                        // 判据放在 `if let OpFollow::Reveal` **之前**——那条
+                        // 按值把 `RemotePath` 从 `follow` 里挪出来,`follow`
+                        // 这个 `enum` 之后就不能再整体读了(枚举字段一旦
+                        // 按值挪出,壳子本身失去良定义,与结构体的部分移动
+                        // 不同);`==` 只借用,先做不影响后面。
+                        if follow == OpFollow::ClearClip {
+                            if let Some(files) = self
+                                .tabs
+                                .by_generation_mut(generation)
+                                .and_then(|t| t.content.files_panel_mut())
+                            {
+                                files.clip = None;
+                            }
+                        }
+                        // F219:`reveal_pick` 必须写在这次 `Refresh` **之后**。
+                        // 现在的 `PaneState::begin_load` 并不清 `reveal_pick`
+                        // (它只清 selected/cursor/anchor 与
+                        // rename_edit/new_edit),所以今天写在前面不会被
+                        // 立刻冲掉;但 `reveal_pick` 的语义是「等**下一次
+                        // 刷新**回来之后选中这一条」,顺序颠倒就是把因果写反
+                        // ——而且 `invalidate()` 已经把 `reveal_pick` 归进了
+                        // 「一次全新导航就该扔掉的瞬态 UI 状态」那一类
+                        // (与 rename_edit/new_edit 同列),`begin_load` 将来
+                        // 补上同款清理是很自然的演进,写在前面的话那一刻会
+                        // 静默失效(F218 同款顺序陷阱)。
                         if let OpFollow::Reveal(name) = follow {
                             if let Some(files) = self
                                 .tabs
@@ -11896,28 +11990,37 @@ fn spawn_sftp_stat(
     })
 }
 
-/// F220 复核 C1:粘贴真正落地的地方(`cp -a` 快路径 / SFTP 逐文件回退,
-/// B7 要写的部分)。跟 `spawn_sftp_list_dir`/`spawn_sftp_stat` 同一个理由
-/// 用自由函数,额外的收获是它把「不许在这里重新读面板状态」这条判据从
-/// 约定变成了**类型层强制**:这个函数没有 `&self`/`&Tabs`,它的作用域里
-/// 压根没有 `self`/`tab` 这两个名字 —— B7 接手时想现读面板状态顶替
-/// `dst`/`clip`,编译都过不了,不用再靠源码切片猜有没有绕开(复核 C1
-/// 证伪了上一版「files_panel 是唯一入口」的假设:直接 `match &tab.content`
-/// 摸字段就能绕开那道黑名单,黑名单这条路走到头了)。
+/// F220:剪切粘贴成功后要不要清空这个标签的远端剪贴板。复制粘贴不清——
+/// 连着粘几个目录是常见用法。
 ///
-/// `existing` 是预检查那一刻服务器 `list_dir` 现读回来的目标目录条目——
-/// **不是**面板缓存的那份(那份可能已经跟服务器不一致),`decide_paste`
-/// 已经拿它判过一次冲突,这里原样带下来给 B7 算「保留两者」的新名字用,
-/// 避免正巧撞上一个面板里没有、但服务器上已经有的名字。
+/// **纯函数,按值断言**:源码切片扫「哪个分支在哪」防不住 if/else 分支
+/// 互换的变异(两支文字都在,顺序对不对光扫文本次序看不出来),只有真的
+/// 按值跑一遍才挡得住,见 `cut_gets_clear_clip_and_copy_keeps_the_clipboard`。
+fn follow_for_clip_mode(mode: crate::files::clip::ClipMode) -> OpFollow {
+    match mode {
+        crate::files::clip::ClipMode::Cut => OpFollow::ClearClip,
+        crate::files::clip::ClipMode::Copy => OpFollow::None,
+    }
+}
+
+/// F220 复核 C1:粘贴真正落地的地方(`cp -a` 快路径 / SFTP 逐文件回退)。
+/// 跟 `spawn_sftp_list_dir`/`spawn_sftp_stat` 同一个理由用自由函数,
+/// 额外的收获是它把「不许在这里重新读面板状态」这条判据从约定变成了
+/// **类型层强制**:这个函数没有 `&self`/`&Tabs`,它的作用域里压根没有
+/// `self`/`tab` 这两个名字。
 ///
-/// `generation`/`seq` 只用来在完成时把结果事件路由回发起这次粘贴的标签、
-/// 并校验有没有过期(同 `spawn_sftp_list_dir`),不是拿来查 tab 的 ——
-/// 这个函数没有 `&Tabs` 可查。
+/// B7 复核修正 1:`plan`(`plan_paste` 算好的源目标配对)、`mode`、
+/// `overwrite`、`follow` 全部由 `dispatch_paste` 算完再传进来 —— 这个
+/// 函数收到的是已经算完的既成事实,不重新推导「粘成什么样」「清不清
+/// 剪贴板」这两件事,连误用的余地都没有。`plan` 传整个 `PastePlan`
+/// 而不是拆开的 `pairs`:白名单守护
+/// `spawn_paste_task_params_are_locked_to_an_explicit_whitelist` 按顶层
+/// 逗号切参数类型,`Vec<(RemotePath, RemotePath)>` 里那对圆括号会把它的
+/// 简单解析器带偏,`PastePlan` 是个不带圆括号的具名类型,绕开这个限制。
 ///
-/// **本任务(B6)仍是桩**:函数体只记一句警告日志。`_client`/`proxy`
-/// 是 B7 要用的(真正发起写请求、把结果经 `UserEvent::SftpOpDone` 送
-/// 回去),`_client` 先留着下划线前缀不参与编译警告,B7 补真正的读写时
-/// 去掉。
+/// `generation` 只用来在完成时把结果事件路由回发起这次粘贴的标签
+/// (同 `spawn_sftp_list_dir`),不是拿来查 tab 的 —— 这个函数没有
+/// `&Tabs` 可查。
 #[allow(clippy::too_many_arguments)] // 9 个都是已经冻结好的独立值,不
                                      // 是能自然拼成一个结构体的一组东西
                                      // ——同 11348/12427 两处既有先例。
@@ -11925,22 +12028,24 @@ fn spawn_paste_task(
     runtime: &Runtime,
     proxy: &EventLoopProxy<UserEvent>,
     generation: u64,
-    _client: Arc<mullion_ssh::sftp::SftpClient>,
-    dst: mullion_ssh::sftp::RemotePath,
-    clip: crate::files::clip::RemoteClip,
-    seq: u64,
-    policy: crate::files::clip::Policy,
-    existing: std::collections::BTreeSet<Vec<u8>>,
+    client: Arc<mullion_ssh::sftp::SftpClient>,
+    conn: Arc<SshConnection>,
+    plan: crate::files::clip::PastePlan,
+    mode: mullion_ssh::copy_tree::CopyMode,
+    overwrite: bool,
+    follow: OpFollow,
 ) -> tokio::task::JoinHandle<()> {
-    // 桩阶段用不上 `proxy`(没有结果要回送),先不 `.clone()` 进
-    // `async move` —— B7 补真正的读写、要发 `SftpOpDone` 时再加。
-    let _ = proxy;
+    let proxy = proxy.clone();
     runtime.spawn(async move {
-        log::warn!(
-            "F220:粘贴执行尚未接通(generation={generation},dst={dst:?},items={},seq={seq},policy={policy:?},existing={},留给 B7)",
-            clip.items.len(),
-            existing.len()
-        );
+        let result = mullion_ssh::copy_tree::transfer_into(&client, &conn, &plan.pairs, mode, overwrite)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let _ = proxy.send_event(UserEvent::SftpOpDone {
+            generation,
+            result,
+            follow,
+        });
     })
 }
 
@@ -12768,13 +12873,14 @@ mod tests {
         blink_on_at, blink_wake_at, clear_leaf_attach_intent, credential_delete_error,
         decide_paste, download_job, drive_attach_checks_of, effective_focus_of, expand_tilde,
         files_owner_generation_of, files_path_editing_of, files_start_dir, finish_password_change,
-        font_px_for, has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
-        new_pane_emulator, next_auto_dial, next_panel_selection_index, pane_still_wanted,
-        place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback, should_check_attach,
-        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
-        take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
-        wind_down, AttachCheck, AttachVerdict, Modal, PasteDecision, RehostKind, RestoredTab,
-        SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
+        follow_for_clip_mode, font_px_for, has_real_action, ime_cursor_area,
+        ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
+        next_panel_selection_index, pane_still_wanted, place_dead_pane_of, reattach_pane,
+        rehost_pane, resolved_scrollback, should_check_attach, snapshot_tabs_of, sync_plan_of,
+        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
+        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -13514,33 +13620,58 @@ mod tests {
         );
     }
 
-    /// F220 复核问题 1(续):`dispatch_paste` 现在只是取 SFTP client 的
-    /// 薄方法(真正的写逻辑已经搬进自由函数 `spawn_paste_task`,复核 C1
-    /// 之后的结构),这条守护认的是这个方法体本身不出现 `files_panel`
-    /// 这个字面调用名。
+    /// F220 复核问题 1(续)/B7:`dispatch_paste` 曾经完全不碰
+    /// `files_panel`(那时真正的写逻辑整个在 `spawn_paste_task` 里,这里
+    /// 只是取 SFTP client 的薄方法)。B7 把 `plan_paste` 从那个自由函数
+    /// 挪回这里之后,多担了一件 `spawn_paste_task` 做不到的事——`seq`
+    /// 陈旧校验,需要读 `PaneState::paste_seq`(理由见 `dispatch_paste`
+    /// 文档)。于是判据从「绝不碰 `files_panel`」放宽成同
+    /// `accept_paste_check_never_rereads_the_live_panel_state` 一样的
+    /// 白名单:允许经 `files` 绑定读、且**仅**读 `files.remote.paste_seq`,
+    /// `dst`/`clip`/`existing` 仍然只许用形参,不许经这条路顶替——这正是
+    /// 约束 1 要防的 Critical。
     ///
-    /// **诚实标注局限**(同上一条问题 1 的教训):这只挡字面拼写,挡不住
-    /// `match &tab.content {{ .. }}` 这类不含这个词的重新派生 —— 这个
-    /// 方法仍然是 `&mut self` 的一部分,`self.tabs` 一直在作用域里。
-    /// 这条测试的价值是「挡住最省事的写法、留一个显式的红线注释」,
-    /// 不是「证明这一步不可能写坏」——那件事只有对 `spawn_paste_task`
-    /// 才成立(它没有 `self`/`tab` 可用,见
+    /// **诚实标注局限**(同 `accept_paste_check` 那条的教训):只挡「沿用
+    /// `files` 这个绑定名转手读」这一种回归形状,挡不住把 `files` 整体
+    /// 改名字绕过去;真正的类型层防线仍在 `spawn_paste_task`(它没有
+    /// `self`/`tab` 可用,见
     /// `spawn_paste_task_params_are_locked_to_an_explicit_whitelist`)。
     ///
-    /// 自证会变红:在函数体里加回 `let _x = self.tabs.by_generation(generation)
-    /// .and_then(|t| t.content.files_panel());`(取到就足够触发 —— 判据
-    /// 认的是调用点本身,不需要真的把返回值用出去)。
+    /// 自证会变红:在 `if files.remote.paste_seq != seq` 那句旁边加一句
+    /// `let _live_dst = files.remote.cwd.clone();`(经 `files.` 前缀读了
+    /// `paste_seq` 之外的东西)。
     #[test]
-    fn dispatch_paste_never_reaches_back_into_the_live_files_panel() {
+    fn dispatch_paste_only_reads_paste_seq_from_the_live_panel() {
         let body = body_of(prod_src(), "fn dispatch_paste(");
+        const ALLOWED: &str = "files.remote.paste_seq";
+        let mut idx = 0;
+        let mut checked_at_least_once = false;
+        while let Some(rel) = body[idx..].find("files.") {
+            let at = idx + rel;
+            let prev = if at == 0 {
+                None
+            } else {
+                Some(body.as_bytes()[at - 1])
+            };
+            let word_boundary = prev.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
+            if word_boundary {
+                checked_at_least_once = true;
+                let window = &body[at..(at + ALLOWED.len().max(40)).min(body.len())];
+                assert!(
+                    body[at..].starts_with(ALLOWED),
+                    "dispatch_paste 里有一处经 `files` 绑定的访问不是唯一\
+                     允许的 `{ALLOWED}`(在「{window}」附近)—— 这个方法只准\
+                     用 `files` 读 `paste_seq` 判过期,dst/clip/existing 一律\
+                     用形参,不许沿用 `files.` 这个前缀重新读(把 `files`\
+                     整体改名字绕过去的话,这道扫描逮不住,见本测试文档)"
+                );
+            }
+            idx = at + "files.".len();
+        }
         assert!(
-            !body.contains("files_panel"),
-            "dispatch_paste 里出现了 files_panel() —— dst/clip 已经是形参,\
-             用户按下 Ctrl+V 那一刻粘贴的目标和内容就已经定了,这个方法\
-             没有理由再调它去顶替形参(哪怕现读出来的东西叫别的名字,\
-             这条只挡这一种写法,不是完整防线,见本测试文档);要用\
-             dst/clip 的话直接用参数,不要经 self.tabs...files_panel()\
-             绕一趟:{body}"
+            checked_at_least_once,
+            "一次 `files.` 访问都没扫到 —— 判据本身失效了(锚点漂移?),\
+             不是「函数写对了」"
         );
     }
 
@@ -13597,15 +13728,23 @@ mod tests {
         let params = &src[params_start..params_end];
         // 按顶层逗号切分成一个个 `name: Type`(泛型里的 `<..>` 不算顶层
         // 逗号的边界,深度计数跳过它)。
+        // B7:`dst`/`clip`/`seq`/`policy`/`existing` 全部在 B7 里被
+        // `dispatch_paste` 消化掉(算 `PastePlan`、判过期、算 `follow`),
+        // 换成了这批已经算完的既成事实——`plan` 用整个 `PastePlan` 而
+        // 不是拆开的 `pairs: Vec<(RemotePath, RemotePath)>`:那个元组类型
+        // 带圆括号,会把上面那段「不会有嵌套括号」的参数列表解析器带偏
+        // (`params_end` 会在元组的 `)` 处提前截断)。`PastePlan` 是个不
+        // 带圆括号的具名类型,天然绕开这个限制。
         const ALLOWED_PARAM_TYPES: &[&str] = &[
             "&Runtime",
             "&EventLoopProxy<UserEvent>",
             "u64",
             "Arc<mullion_ssh::sftp::SftpClient>",
-            "mullion_ssh::sftp::RemotePath",
-            "crate::files::clip::RemoteClip",
-            "crate::files::clip::Policy",
-            "std::collections::BTreeSet<Vec<u8>>",
+            "Arc<SshConnection>",
+            "crate::files::clip::PastePlan",
+            "mullion_ssh::copy_tree::CopyMode",
+            "bool",
+            "OpFollow",
         ];
         let mut depth = 0i32;
         let mut field = String::new();
@@ -13654,6 +13793,111 @@ mod tests {
                  就绕过去了,复核已经实证过)。完整参数列表:{params}"
             );
         }
+    }
+
+    /// F220 B7:剪切成功之后才清剪贴板 —— 发出那一刻就清是拿假前提改
+    /// 状态,链路一断,用户的剪贴板没了、东西也没挪走(T11 同族)。
+    ///
+    /// 这条只盯 `dispatch_paste`:它决定要不要清(算出 `follow`),但
+    /// 绝不能自己动手赋值 `files.clip = None`——真正的赋值只能挂在
+    /// `SftpOpDone` 的成功分支上,见
+    /// `sftp_op_done_clears_clip_only_when_flagged_and_always_refreshes`。
+    ///
+    /// 自证会变红:在 `dispatch_paste` 里加一句 `files.clip = None;`
+    /// (比如挂在算 `follow`那段旁边,模拟"提前清"的错误实现)。
+    #[test]
+    fn the_clipboard_is_cleared_only_after_a_cut_actually_lands() {
+        let src = prod_src();
+        let body = body_of(src, "fn dispatch_paste(");
+        assert!(
+            !body.contains("clip = None"),
+            "dispatch_paste 里出现了 `clip = None` —— 在发出那一刻就清了\
+             剪贴板,链路一断东西没挪走、剪贴板也没了:{body}"
+        );
+        assert!(
+            src.contains("OpFollow::ClearClip"),
+            "没有「成功之后清剪贴板」这条后续动作"
+        );
+    }
+
+    /// F220 B7:剪切粘贴成功后清剪贴板,复制粘贴不清 —— 连着粘几个目录
+    /// 是常见用法。
+    ///
+    /// 按值断言,不扫源码文本次序:`if/else`(或 `match`)两支的文字都在
+    /// 源码里,谁在前谁在后光看文本次序看不出来,`if/else` 分支互换的
+    /// 变异(比如把 `Cut => ClearClip, Copy => None` 换成
+    /// `Cut => None, Copy => ClearClip`)会让任何「找到 ClearClip 之前有
+    /// 没有出现 Cut 字样」这类顺序判据继续认为文本合规——文字确实都在,
+    /// 只是绑错了分支。只有真的按值跑一遍才挡得住。
+    ///
+    /// 自证会变红:把 `follow_for_clip_mode` 两个分支的返回值互换。
+    #[test]
+    fn a_copy_paste_keeps_the_clipboard_so_it_can_be_pasted_again() {
+        assert_eq!(
+            follow_for_clip_mode(crate::files::clip::ClipMode::Cut),
+            OpFollow::ClearClip,
+            "剪切粘贴成功后必须清剪贴板"
+        );
+        assert_eq!(
+            follow_for_clip_mode(crate::files::clip::ClipMode::Copy),
+            OpFollow::None,
+            "复制粘贴不该清剪贴板 —— 剪切那一支的变异如果绑到了这里,\
+             连着粘几个目录时第二次会发现剪贴板已经空了"
+        );
+    }
+
+    /// F220 B7:粘贴/剪切成功后,目标目录必须刷新(新文件才会出现);
+    /// 清剪贴板必须挂在 `follow == OpFollow::ClearClip` 上,且**不能**
+    /// 连累刷新——刷新是所有成功写操作共用的收尾(F53/F54 起就有),纯
+    /// 复制粘贴走的是 `OpFollow::None`,如果刷新被误塞进了 `ClearClip`
+    /// 那个 `if` 块里,复制粘贴完面板还是旧内容,而且不报错、不提示。
+    ///
+    /// 自证会变红(两种,各覆盖一半的判据):
+    /// 1. 把 `if follow == OpFollow::ClearClip` 删掉,直接无条件
+    ///    `files.clip = None;`——第二条 `assert` 会因为找不到这个判据串
+    ///    而红。
+    /// 2. 把 `FileAction::Refresh` 那句挪进 `if follow ==
+    ///    OpFollow::ClearClip` 的花括号里——第一条 `assert` 会因为
+    ///    "guard_block 里出现了 Refresh" 而红。
+    #[test]
+    fn sftp_op_done_clears_clip_only_when_flagged_and_always_refreshes() {
+        let arm = multiline_arm_of(prod_src(), "UserEvent::SftpOpDone {");
+        let ok_marker = "Ok(()) => {";
+        let ok_at = arm
+            .find(ok_marker)
+            .unwrap_or_else(|| panic!("找不到 SftpOpDone 的成功分支:{arm}"));
+        let brace_at = ok_at + ok_marker.len() - 1;
+        let ok_rest = &arm[brace_at..];
+        let ok_body = brace_balanced_arm(ok_rest);
+        assert!(
+            ok_body.len() < ok_rest.len(),
+            "Ok(()) 分支没截到闭合大括号,断言会退化成扫全文件"
+        );
+        assert!(
+            ok_body.contains("FileAction::Refresh"),
+            "成功分支里刷新目标目录这一步不见了 —— 写操作不带回新的目录\
+             内容,不刷新的话新文件不出现,用户会以为没生效:{ok_body}"
+        );
+        let guard_marker = "if follow == OpFollow::ClearClip {";
+        let guard_at = ok_body
+            .find(guard_marker)
+            .unwrap_or_else(|| panic!("找不到清剪贴板的判据 `{guard_marker}`:{ok_body}"));
+        let guard_rest = &ok_body[guard_at + guard_marker.len() - 1..];
+        let guard_block = brace_balanced_arm(guard_rest);
+        assert!(
+            guard_block.len() < guard_rest.len(),
+            "清剪贴板的 if 块没截到闭合大括号,断言会退化成扫全文件"
+        );
+        assert!(
+            !guard_block.contains("FileAction::Refresh"),
+            "刷新被塞进了清剪贴板的 if 块里 —— follow 不是 ClearClip 时\
+             (比如纯复制粘贴)目录刷新会被跳过,面板还是旧内容且没有任何\
+             报错:{guard_block}"
+        );
+        assert!(
+            guard_block.contains("clip = None"),
+            "清剪贴板的 if 块里没有真的把 clip 置空:{guard_block}"
+        );
     }
 
     /// 复核 I2:`apply_file_op` 里 `Resolve`/`ResolveEdit`/`Paste` 的兜底
