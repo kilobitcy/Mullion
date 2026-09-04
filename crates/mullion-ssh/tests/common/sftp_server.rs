@@ -36,6 +36,11 @@ pub enum NodeKind {
     File,
     /// 符号链接及其目标(用于「删除不跟随」类测试;D1 只用来显示)。
     Symlink(Vec<u8>),
+    /// 设备 / FIFO / socket(F220/B3 缺口 I3 的守护测试用):既不是目录、
+    /// 普通文件也不是符号链接。`attrs()` 里只置 FIFO 位、不置 REG/DIR/LNK
+    /// 中的任何一个,客户端 `sftp.stat()` 的判定顺序落不进前三个分支,
+    /// 落到 `EntryKind::Other`。
+    Other,
 }
 
 impl Node {
@@ -84,6 +89,21 @@ impl Node {
         }
     }
 
+    /// 一个具名管道(FIFO)—— F220/B3 缺口 I3 的守护测试用。真实场景里
+    /// 设备文件/socket 也是同一条分支,FIFO 只是最容易在内存树里表达的一种。
+    pub fn fifo(name: &[u8]) -> Self {
+        Self {
+            name: name.to_vec(),
+            kind: NodeKind::Other,
+            size: 0,
+            mtime: 1_700_000_300,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            data: Vec::new(),
+        }
+    }
+
     fn attrs(&self) -> FileAttributes {
         let mut a = FileAttributes {
             size: Some(self.size),
@@ -106,6 +126,9 @@ impl Node {
                 a.set_symlink(true);
                 a.set_dir(true);
             }
+            // 故意**不**置 DIR/REG/LNK 中的任何一位:置 FIFO 位只是让它
+            // 看起来像点什么,客户端只关心「三种已知类型一个都不是」。
+            NodeKind::Other => a.set_fifo(true),
         }
         a
     }

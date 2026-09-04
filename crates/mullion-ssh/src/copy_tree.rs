@@ -41,6 +41,17 @@ pub enum TransferReport {
     Sftp,
 }
 
+/// `a` 是 `b` 的祖先,或两者相等。字节前缀 + `/` 边界判定,照
+/// `files::clip::is_within`(`crates/mullion-app/src/files/clip.rs`)的写法——
+/// 光比前缀会把 `/a/bb` 误判成 `/a/b` 的子孙:那是两个不相干的目录,合法的
+/// 「拷贝 `/a/b` → `/a/bb`」不能被冤枉挡掉。
+fn is_ancestor_or_self(a: &[u8], b: &[u8]) -> bool {
+    if a == b || a == b"/" {
+        return true;
+    }
+    b.len() > a.len() && b.starts_with(a) && b[a.len()] == b'/'
+}
+
 /// 把 `pairs` 里的每一条(源绝对路径 → 目标绝对路径)拷 / 挪过去。
 ///
 /// `overwrite` 为真时目标可以已存在(命令先 `rm -rf` 目标、回退路上也先删
@@ -58,6 +69,26 @@ pub async fn transfer_into(
     for (a, b) in pairs {
         let _ = a.as_wire()?;
         let _ = b.as_wire()?;
+    }
+    // C1(2026-09 复核追加):`to` 是 `from` 的祖先(或反过来)时,「先
+    // rm -rf 清目标再拷」(exec 覆盖分支)与「先 remove_tree(to) 再拷」
+    // (SFTP 回退,下面那个循环)都会把 `from` 所在的那棵树连根删掉——
+    // 真实 `cp -a /a/p/p /a/p` 自己会因为「不能把目录拷进它自身」拒绝,
+    // 是我们加的「先删目标」把一个本该被拒绝的操作变成了不可逆的数据
+    // 摧毁。`files::clip::is_within` 只判「`dst` 是 `src` 的子孙」这一个
+    // 方向,管的是 app 层的 UX 提示;这里是 exec 和 SFTP 两条路都必经的
+    // 唯一位置,一道纯内存比较同时保护两条路,成本是零往返——即使上游
+    // 忘了挡,这里也不许把源删掉。挡住就一个请求都不发,失败方式同上面
+    // `as_wire()` 那道门一致。
+    for (from, to) in pairs {
+        let (f, t) = (from.as_bytes(), to.as_bytes());
+        if is_ancestor_or_self(f, t) || is_ancestor_or_self(t, f) {
+            return Err(SftpError::Protocol(format!(
+                "{} 与 {} 存在包含关系,不能互相覆盖",
+                from.display(),
+                to.display()
+            )));
+        }
     }
     if pairs.is_empty() {
         return Ok(TransferReport::Exec);
@@ -78,6 +109,10 @@ pub async fn transfer_into(
     for (from, to) in pairs {
         if overwrite {
             // 目标可能是个非空目录 —— `rename`/逐文件写都盖不掉它。
+            // 结果**故意丢弃**(M1):清场没做干净的话,残留会被随后的
+            // `create_dir`(目标还在会报「已存在」)或 `open_write` 的
+            // TRUNCATE 语义自然暴露出来,不会静默产出一份半新半旧的
+            // 合并结果——不需要在这里就把错误值攥住。
             let _ = crate::remove_tree::remove_tree(sftp, conn, to).await;
         }
         match mode {
@@ -134,6 +169,16 @@ async fn try_exec(
 }
 
 /// SFTP 回退:拷一条(文件 / 链接 / 整棵目录树)。**不跟随链接**。
+///
+/// **递归用 `Box::pin`,不是显式栈**(与 `remove_tree::remove_via_sftp`
+/// 不同的取舍,2026-09 复核 I1):这里的拷贝要等子项全部拷完、算出目标
+/// 目录的最终内容之后,才轮到给这一层的父目录 `set_permissions`——
+/// 后序语义,换成显式栈要把「哪一层轮到设权限」这份状态搬到调用方手里
+/// 自己维护,复杂度在这个切片里不值当。代价是 `Box::pin` 只解决了
+/// 「递归 async fn 类型无限大、编译不过」,poll 时的调用栈深度一点没
+/// 减——父 future 的 `poll()` 仍然同步调子 future 的 `poll()`,深目录树
+/// 有栈溢出风险,与 `remove_tree.rs:73-74` 那条注释说的是同一个模式,
+/// 这里只是选了不同的应对(即:没应对,只是记在这里别让人以为两边一样安全)。
 async fn copy_one(sftp: &SftpClient, from: &RemotePath, to: &RemotePath) -> Result<(), SftpError> {
     let meta = sftp.stat(from).await?;
     match meta.kind {
@@ -157,9 +202,19 @@ async fn copy_one(sftp: &SftpClient, from: &RemotePath, to: &RemotePath) -> Resu
             let target = sftp.read_link(from).await?;
             sftp.symlink(to, &target).await?;
         }
-        _ => {
+        EntryKind::File => {
             copy_file_bytes(sftp, from, to).await?;
             sftp.set_permissions(to, meta.mode & 0o7777).await?;
+        }
+        // 设备 / FIFO / socket(2026-09 复核 I3):`open_read` 对一个没有
+        // 写端的具名管道会永久阻塞在第一次 `read_chunk`,这个 await 没有
+        // 超时,用户唯一的出路是断开整条连接。明确拒绝好过悄悄挂起——
+        // 同「认不出的 exec 命令行回 127」那条哲学一致。
+        EntryKind::Other => {
+            return Err(SftpError::Protocol(format!(
+                "远端 {} 不是普通文件、目录或符号链接,已跳过",
+                from.display()
+            )));
         }
     }
     Ok(())

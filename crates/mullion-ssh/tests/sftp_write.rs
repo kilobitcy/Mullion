@@ -1095,3 +1095,125 @@ async fn a_cut_falls_back_to_copy_and_delete_when_rename_reports_exdev() {
         "源还在 —— EXDEV 回退里的删源那一步没做,剪切退化成了复制"
     );
 }
+
+// ---- 代码质量复核追加(2026-09):C1 数据安全 + I3 挂起 ---------------------
+
+/// F220/B3 复核 C1(Critical):`to` 是 `from` 的祖先时,「覆盖前先删目标」
+/// 会把源所在的整棵树一起摧毁。复现与复核者一致:`src=/home/testuser/p/p`,
+/// `dst=/home/testuser/p`,`overwrite=true`——UI 上完全可达(复制嵌套同名
+/// 目录 `p/p`,粘到上一级,目标 `p` 已存在,选覆盖)。真实 `cp -a p/p p`
+/// 自己会因为「不能把目录拷进它自身」拒绝;是我们加的「先 rm -rf 清目标」
+/// 把一个本该被拒绝的操作变成了不可逆的数据摧毁。
+///
+/// 判据:返回 `Err`;服务端的树**完好无损**(目标、源、源里的文件都还在);
+/// 探针**一条请求都没收到**——证明是在发出任何 exec/SFTP 请求之前就被挡下,
+/// 不是「先删了一半才发现不对」。
+#[tokio::test]
+async fn pasting_into_an_ancestor_of_the_source_is_refused_before_any_request() {
+    let mut t = Tree::new();
+    t.insert(b"/home/testuser".to_vec(), vec![Node::dir(b"p")]);
+    t.insert(b"/home/testuser/p".to_vec(), vec![Node::dir(b"p")]);
+    t.insert(
+        b"/home/testuser/p/p".to_vec(),
+        vec![Node::file_with(b"payload.txt", b"precious")],
+    );
+
+    let (addr, probe, tree_h) = common::spawn_sftp_server(t).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+    let result = transfer_into(
+        &sftp,
+        &conn,
+        &[(rp("/home/testuser/p/p"), rp("/home/testuser/p"))],
+        CopyMode::Copy,
+        true,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "dst 是 src 的祖先,这个覆盖粘贴必须被拒绝,而不是执行"
+    );
+
+    let t = tree_h.lock().unwrap();
+    assert!(
+        exists(&t, b"/home/testuser/p"),
+        "目标(同时也是源的祖先)不该被删"
+    );
+    assert!(exists(&t, b"/home/testuser/p/p"), "源不该被删");
+    assert!(
+        exists(&t, b"/home/testuser/p/p/payload.txt"),
+        "源里的内容不该被删掉 —— 这正是复核挖出的那个数据摧毁"
+    );
+    drop(t);
+    let p = probe.lock().unwrap();
+    assert!(
+        p.execs.is_empty() && p.seen.is_empty(),
+        "挡下来的操作不该发出任何请求(exec 或 SFTP):execs={:?} seen={:?}",
+        p.execs,
+        p.seen
+    );
+}
+
+/// F220/B3 复核 C1 的反面:`box_sibling` 与 `box` 只是共享字节前缀,不是
+/// 它的子孙(`box_sibling` 与 `box` 之间隔着 `_`,不是 `/`)——合法的
+/// 「拷贝 box → box_sibling」不该被这道新闸冤枉挡掉。这条测试专门用来
+/// 杀「把 `/` 边界判断去掉、改成裸前缀比较」那一类变异。
+#[tokio::test]
+async fn pasting_to_a_sibling_that_merely_shares_a_byte_prefix_is_not_blocked() {
+    let (addr, _probe, tree_h) = common::spawn_sftp_server(nested_tree()).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+    let report = transfer_into(
+        &sftp,
+        &conn,
+        &[(rp("/home/testuser/box"), rp("/home/testuser/box_sibling"))],
+        CopyMode::Copy,
+        false,
+    )
+    .await
+    .expect("box_sibling 只是共享字节前缀,不是 box 的子孙,不该被 C1 那道闸挡下");
+    assert_eq!(report, TransferReport::Exec, "exec 可用时该走快路径");
+
+    let t = tree_h.lock().unwrap();
+    assert!(
+        exists(&t, b"/home/testuser/box_sibling"),
+        "目标没建出来 —— 说明合法操作被误伤了"
+    );
+}
+
+/// F220/B3 复核 I3:目录里混进一条 FIFO/设备/socket(`EntryKind::Other`)时,
+/// `copy_one` 必须显式报错,不能把它当成普通文件悄悄拷一份。
+///
+/// 诚实说明测试能力的边界:真实远端上 `open_read` 对一个没有写端的具名
+/// 管道会永久阻塞(`read_chunk` 那个 await 没有超时),但这个假服务端是
+/// 纯内存实现,`read_chunk` 不会真的阻塞——这里测不出「挂起」本身,能测
+/// 的只是「代码是不是走了显式拒绝这条分支,而不是把它当空文件拷走」。
+#[tokio::test]
+async fn a_paste_refuses_a_named_pipe_instead_of_silently_copying_it_as_an_empty_file() {
+    let mut t = nested_tree();
+    t.entry(b"/home/testuser/box".to_vec())
+        .or_default()
+        .push(Node::fifo(b"a-fifo"));
+
+    let (addr, _probe, tree_h) = common::spawn_sftp_server_without_exec(t).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+    let outcome = transfer_into(
+        &sftp,
+        &conn,
+        &[(rp("/home/testuser/box"), rp("/home/testuser/box-copy"))],
+        CopyMode::Copy,
+        false,
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "目录里有一条 FIFO,粘贴该报错,而不是悄悄跳过或悄悄成功"
+    );
+
+    let t = tree_h.lock().unwrap();
+    assert!(
+        !exists(&t, b"/home/testuser/box-copy/a-fifo"),
+        "FIFO 不该被当成普通文件拷出一份(内容为空的)副本"
+    );
+}
