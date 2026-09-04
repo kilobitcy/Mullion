@@ -74,8 +74,8 @@ pub enum FileAction {
         from: mullion_ssh::sftp::RemotePath,
         to: mullion_ssh::sftp::RemotePath,
     },
-    /// F219:请求进入就地新建态(右键菜单 / `Ctrl+N`)。真正的写操作要等
-    /// 用户在那一行里敲完名字回车,由 `NewFile` 发出。
+    /// F219:请求进入就地新建态(右键菜单;`Ctrl+N` 尚未接线,留给 A5)。
+    /// 真正的写操作要等用户在那一行里敲完名字回车,由 `NewFile` 发出。
     BeginNewFile,
     /// F219:就地新建文件提交。**绝对路径**,在面板里用同一个 `cwd` 拼好 ——
     /// 理由与 `Rename` 逐字相同:从开始输入到敲回车中间用户完全可能换了
@@ -4200,21 +4200,21 @@ mod tests {
     /// 省略号在这套界面里的意思是「会弹框」(F200 定的),而它是就地编辑。
     #[test]
     fn the_new_file_item_is_remote_only_and_carries_no_ellipsis() {
-        let labels: Vec<&str> = menu_items_for(PanelColumn::Remote, None)
+        // 按 `MenuItem::NewFile` 这个枚举身份定位那一条 entry,而不是按
+        // 标签字符串找 —— 这样「存在性」和「格式(不带省略号)」两件事
+        // 才能各自独立变红,不会被字符串精确匹配捆在一起。
+        let remote = menu_items_for(PanelColumn::Remote, None);
+        let entry = remote
             .iter()
-            .map(|e| e.label)
-            .collect();
-        assert!(labels.contains(&"新建文件"), "远端栏没有「新建文件」");
+            .find(|e| e.item == MenuItem::NewFile)
+            .expect("远端栏没有「新建文件」");
         assert!(
-            !labels.iter().any(|l| l.starts_with("新建文件…")),
+            !entry.label.ends_with('…'),
             "「新建文件」带了省略号 —— 那是弹框的记号"
         );
-        let local: Vec<&str> = menu_items_for(PanelColumn::Local, None)
-            .iter()
-            .map(|e| e.label)
-            .collect();
+        let local = menu_items_for(PanelColumn::Local, None);
         assert!(
-            !local.contains(&"新建文件"),
+            !local.iter().any(|e| e.item == MenuItem::NewFile),
             "本地栏出现了写操作(D5:本地文件管理外包给资源管理器)"
         );
     }

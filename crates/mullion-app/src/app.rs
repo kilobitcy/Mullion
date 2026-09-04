@@ -4205,7 +4205,8 @@ impl App {
                 return;
             }
             // F219:同 `Rename` —— 本地栏根本进不了新建态(`menu_items_for`
-            // 不给这一项,`handle_panel_key` 的 Ctrl+N 也只在远端栏放行)。
+            // 不给这一项;`Ctrl+N` 快捷键还没接线,是 A5 的活,接的时候
+            // 也只会在远端栏放行)。
             FileAction::BeginNewFile | FileAction::NewFile(_) => {
                 log::warn!("本地栏收到了新建文件请求,已忽略(D5)");
                 return;
@@ -13400,9 +13401,12 @@ mod tests {
 
     /// F219:远端栏收到 `NewFile` 要**直接发写操作**,不绕对话框。
     ///
-    /// 自证会变红:把那一臂删掉(落进 `_ => {}` 之后它会掉进下面
-    /// 那个 `target` 的 match,编译不过 —— 所以真正要防的是有人把它接进
-    /// `Ask`,那样就静默多弹一个框)。
+    /// 自证会变红:第一个 `match &action` 自带 `_ => {}` 兜底(非穷尽),
+    /// 把这一臂删掉**照样编译通过**——`target` 那个穷尽 match 里独立列了
+    /// `FileAction::NewFile(_) => return`,接住了类型层面的要求。也就是说
+    /// 删掉这一臂是**静默回归**(回车之后什么都不发生),编译器不会拦,
+    /// 这条测试是唯一的防线。同理,有人把它接成 `Ask`(弹框)也只有这条
+    /// 测试能拦住。
     #[test]
     fn the_remote_column_sends_new_file_straight_to_a_write_op() {
         let src = include_str!("app.rs");
