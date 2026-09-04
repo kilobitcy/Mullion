@@ -2634,24 +2634,75 @@ mod tests {
         assert!(other_pos.y > notes_pos.y, "other.txt 该排在 notes.txt 下面");
     }
 
+    /// 按谓词找文字的**左上角** `ts.pos`(不是 `find_text_pos` 给的中心点)。
+    /// 跟 `painted_row_names` 内部用的是同一套坐标——找锚点和判断分属两把
+    /// 不同的尺子,量出来的 x 会永远差半个字宽,过滤阈值怎么调都不对。
+    fn find_text_pos_raw(
+        shapes: &[egui::epaint::ClippedShape],
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, pred: &dyn Fn(&str) -> bool) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, pred)),
+                egui::Shape::Text(ts) if pred(ts.galley.text()) => Some(ts.pos),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, &pred))
+    }
+
+    /// F219 复核修复:把这一帧**自上而下画出来的名字序列**摊平出来,判据
+    /// 独立于 `row()` 内部那个可能算错下标的 `e` —— 不经过 `resp.clicked()`,
+    /// 直接读渲染输出里的 `Shape::Text`。
+    ///
+    /// 只保留 x 落在名称列(`name_x` 左右 1pt 内)的文字:列头「名称」、
+    /// 路径条上的当前目录、按钮提示这些不相关的文字画在别的 x 上,筛掉
+    /// 它们才不会在序列最前面混进几条不属于任何一行的干扰项。
+    ///
+    /// 幽灵行的 `TextEdit` 缓冲是空的:egui 对空字符串可能干脆不产生
+    /// `Shape::Text`,也可能产生一个空串,且 `TextEdit` 的内边距会让它的
+    /// x 比 `row()` 画的名称列多出 2pt、天然落在筛选阈值之外 —— 两种情况
+    /// 都不会混进结果里,不用去赌 egui 内部选了哪种。
+    fn painted_row_names(shapes: &[egui::epaint::ClippedShape], name_x: f32) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(f32, f32, String)>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => {
+                    out.push((ts.pos.y, ts.pos.x, ts.galley.text().to_string()))
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut texts));
+        texts.retain(|(_, x, s)| (x - name_x).abs() < 1.0 && !s.is_empty());
+        texts.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("y 坐标不会是 NaN"));
+        texts.into_iter().map(|(_, _, s)| s).collect()
+    }
+
     /// F219 最容易静默错行的一处:幽灵行占了第 0 行之后,**下面每一行的
     /// 索引都要 -1**。错了就是点第二行选中第一个文件 —— 而删除不可逆。
     ///
-    /// 判据是「点哪一行、光标落到谁身上」,不是「画了几行」——后者在索引
-    /// 错位时照样绿。技术上照抄 `a_row_in_the_tab_host_can_actually_be_clicked`:
-    /// 从真实渲染结果里找到文字的屏幕坐标,点下去看光标停在哪条身份上——
-    /// 比按几何公式推算下一行的 y 坐标更直接,不会因为输入框的内边距/描边
-    /// 差一点点就跟着算错。
+    /// 判据是「屏幕上第 k 行画的是哪个 entry」,不是「点哪一行、光标落到谁
+    /// 身上」:后一种写法里,画这一行用的 `e` 和 `resp.clicked()` 记录的
+    /// `e` 是 `files_panel.rs:931` 起同一次循环里的**同一个变量**——`ix`
+    /// 无论怎么错位,「画在哪」与「点中谁」永远互相自洽,这个判据在设计上
+    /// 就杜绝了发现索引错位的可能(复核意见)。也不是「画了几行」——那更
+    /// 弱,索引错位时行数不变,照样绿。
     ///
-    /// 自证会变红:把行体里的 `rows[ix - new_row]` 改回 `rows[ix]`。
+    /// 样本 60 条:`show_rows` 只画得下一屏(复核实测阈值 25~30 条),条数
+    /// 不够大的话,`rows[ix - new_row]` 误改回 `rows[ix]` 会在还没画到越界
+    /// 的那一行之前就整屏画完——虚拟滚动压根碰不到越界那一下,变异反而绿
+    /// (复核拿 2 条样本的旧版重放过,遇到的就是这个)。60 条留出足够余量,
+    /// 逼错误的偏移在**可见范围内**就露出来:画出来的是「错了一格」的名字,
+    /// 不是一次崩溃。
     #[test]
     fn rows_below_the_ghost_row_still_map_to_the_right_entry() {
         let t = crate::theme::MULLION_DARK;
         let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
-        state.entries = vec![
-            entry(b"notes.txt", EntryKind::File),
-            entry(b"other.txt", EntryKind::File),
-        ];
+        state.entries = (0..60)
+            .map(|i| entry(format!("f{i:02}.txt").as_bytes(), EntryKind::File))
+            .collect();
         state.load = Load::Ready;
         assert!(state.begin_new_file(), "前提:该进得了新建态");
 
@@ -2681,37 +2732,47 @@ mod tests {
         let _ = render(raw(None), &mut state);
         let (_, out) = render(raw(None), &mut state);
 
-        let other_pos = find_text_pos(&out.shapes, "other.txt")
-            .expect("other.txt 该被画出来(幽灵行下面第二条)");
+        // 名称列的 x:借**任意**一条 `.txt` 结尾的真实行反查,不猜图标格
+        // 宽度/间隙这些几何常量(那些已经在别处测过)。故意不钉死具体是
+        // 哪一条(比如 `f00.txt`)——索引偏移错了的话第一条真实行画的
+        // 根本不是 `f00.txt` 而是 `f01.txt`,钉死名字反查会先在这里
+        // `.expect()` 炸掉,把本该由下面 `assert_eq!` 给出的「序列错位」
+        // 挡在半路,报出一个报不出具体错在哪的 panic。所有行用的是同一个
+        // 名称列 x,认哪一条不重要,只要认得出「这是名称列」。
+        let name_x = find_text_pos_raw(&out.shapes, |s| s.ends_with(".txt"))
+            .expect("目录里一条 .txt 名字都没画出来(幽灵行下面该有真实行)")
+            .x;
 
-        // 只点**一下**、点在最靠下的那一行(other.txt,rows 里下标 1、
-        // 画在幽灵行下面第二格,ix == 2):
-        // 点别处会让空缓冲的幽灵行判定成「放弃编辑」而消失(`name_edit_row`
-        // 的 `clicked_elsewhere` 分支),消失之后行号偏移跟着变,第二下点
-        // 击就测不出「幽灵行还在时偏移对不对」了 —— 一步到位才压得住
-        // `rows[ix - new_row]` 这处偏移。
-        //
-        // 按/松在**同一帧**里发出(同 `right_clicking_the_remote_column_
-        // opens_a_menu_that_can_dispatch_an_ask` 那条直接调 `show()` 的既有
-        // 测试同款手法)。
-        let mut input = raw(None);
-        input.events.push(egui::Event::PointerButton {
-            pos: other_pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: Default::default(),
-        });
-        input.events.push(egui::Event::PointerButton {
-            pos: other_pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        });
-        let _ = render(input, &mut state);
+        let painted = painted_row_names(&out.shapes, name_x);
+        let expected: Vec<String> = state
+            .rows()
+            .iter()
+            .map(|e| e.name.display().into_owned())
+            .collect();
+
+        // 样本必须大到「一屏画不完」——否则下面的比对测不出复核提到的
+        // 那种「小样本靠越界 panic 蹭红,样本一大变异反而存活」。
+        assert!(
+            painted.len() < state.entries.len(),
+            "画出来的行数(:{})跟样本条数(:{})一样多,说明这一屏装得下全部 \
+             entry——样本不够大,测不出「靠越界蹭红」这条路是不是已经堵死",
+            painted.len(),
+            state.entries.len()
+        );
+        assert!(
+            painted.len() >= 20,
+            "画出来的行太少,样本或视口不对,测不出偏移:{painted:?}"
+        );
+
+        // 虚拟滚动只画得下一屏,画出来的是期望序列的**前缀**——按实际画出
+        // 的条数截取期望序列再比;但截取只发生在这一步,比较本身是把
+        // 「画出来的每一条」跟「期望序列同位置那一条」逐条 `assert_eq!`,
+        // 不允许退化成「至少前几条对上就行」这种弱判据。
         assert_eq!(
-            state.cursor.as_ref().map(|p| p.display().into_owned()),
-            Some("other.txt".to_string()),
-            "点在画出来的 other.txt 上,光标却没落到它身上 —— 索引偏移算错了"
+            painted.as_slice(),
+            &expected[..painted.len()],
+            "幽灵行下面第 k 行画的名字,跟 state.rows() 里第 k 条对不上 —— \
+             索引偏移算错了"
         );
     }
 
