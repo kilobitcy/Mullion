@@ -311,6 +311,14 @@ pub enum UserEvent {
         key: u64,
         result: Result<EditWriteOutcome, String>,
     },
+    /// F220:粘贴前的目标目录预检查回来了。`Ok` 是那个目录里**现有的名字**。
+    ///
+    /// 按世代路由(S1):高延迟链路上列一次目录要好几百毫秒,用户完全可能
+    /// 已经切了标签 —— 结果必须回到发起它的那个标签。标签没了就丢弃。
+    PasteChecked {
+        generation: u64,
+        result: Result<Vec<mullion_ssh::sftp::RemotePath>, String>,
+    },
 }
 
 /// F219:一次远端写操作**成功之后**还要做的事。
@@ -4528,14 +4536,122 @@ impl App {
         mark_ui_dirty!(self.ui_dirty);
     }
 
-    /// F220:粘贴编排的桩。**跨任务临时占位** —— 真正的编排(列目标目录做
-    /// 冲突预检查、按用户选的策略走 `mullion_ssh::copy_tree` 或 SFTP 回退)
-    /// 是下一个任务(B5)的活,整个函数体到时候会被替换掉。
-    ///
-    /// 这里刻意不是静默空函数:什么都不做又不吭声,用户会以为按下的
-    /// 粘贴丢了。先给一条看得见的日志,把「还没接通」这件事说出来。
+    /// F220:发起一次粘贴。**三步里的前两步**:自身/子孙闸门 → 预检查。
+    /// 第三步(弹框 / 直接执行)在 `UserEvent::PasteChecked` 里
+    /// (`accept_paste_check` 接)。
     fn start_paste(&mut self, generation: u64) {
-        log::warn!("F220:粘贴编排尚未接通(generation={generation},留给 B5)");
+        let Some(tab) = self.tabs.by_generation(generation) else {
+            return;
+        };
+        let Some(files) = tab.content.files_panel() else {
+            return;
+        };
+        let Some(clip) = files.clip.clone() else {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                "剪贴板是空的 —— 先在远端栏复制或剪切",
+            );
+            return;
+        };
+        let dst = files.remote.cwd.clone();
+
+        // **闸门排在任何请求之前**:目标是源自身或它的子孙时,SFTP 回退那条
+        // 路会边列源边往源里写,一直递归到把磁盘写满。远端 `cp` 自己会拦,
+        // 但我们不能只靠远端兜底 —— 回退路上没有 `cp`。
+        if clip
+            .items
+            .iter()
+            .any(|(src, _)| crate::files::clip::is_within(src, &dst))
+        {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                "不能粘到源目录自己或它的子目录里",
+            );
+            return;
+        }
+        // 同目录剪切是空操作 —— 一个请求都不用发。
+        if clip.mode == crate::files::clip::ClipMode::Cut
+            && clip.items.iter().all(|(src, _)| src.parent() == dst)
+        {
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Warn, "源和目标是同一个目录");
+            return;
+        }
+
+        let Some(client) = tab.content.sftp_client() else {
+            self.ui
+                .set_error("SFTP 通道还没建立,请先等目录加载完".into());
+            return;
+        };
+        let proxy = self.proxy.clone();
+        let task = self._runtime.spawn(async move {
+            let result = client
+                .list_dir(&dst)
+                .await
+                .map(|v| v.into_iter().map(|e| e.name).collect())
+                .map_err(|e| e.to_string());
+            let _ = proxy.send_event(UserEvent::PasteChecked { generation, result });
+        });
+        self.track_sftp_task(generation, task);
+        self.ui
+            .set_toast(crate::ui::toast::Kind::Busy, "正在检查目标目录…");
+    }
+
+    /// F220:预检查回来了 —— 有冲突就弹批量框,没有就直接发。
+    ///
+    /// **同目录复制必然全撞** → 直接走「保留两者」,不弹框:问用户
+    /// 「要不要覆盖自己」没有意义。
+    fn accept_paste_check(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<mullion_ssh::sftp::RemotePath>, String>,
+    ) {
+        use crate::files::clip::{self, Policy};
+        let existing: std::collections::BTreeSet<Vec<u8>> = match result {
+            Ok(v) => v.into_iter().map(|n| n.as_bytes().to_vec()).collect(),
+            Err(msg) => {
+                self.ui.set_error(msg);
+                return;
+            }
+        };
+        let Some(files) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+        else {
+            return;
+        };
+        let Some(clip) = files.clip.clone() else {
+            return;
+        };
+        let dst = files.remote.cwd.clone();
+        let same_dir = clip.items.iter().all(|(src, _)| src.parent() == dst);
+        let hits = clip::conflicts(&clip.items, &existing);
+        if hits.is_empty() || (same_dir && clip.mode == clip::ClipMode::Copy) {
+            let policy = if same_dir {
+                Policy::KeepBoth
+            } else {
+                Policy::Overwrite
+            };
+            self.dispatch_paste(generation, policy);
+            return;
+        }
+        self.ui.files_dialog = Some(crate::ui::files_dialog::FilesDialog::PasteConflict {
+            names: hits
+                .iter()
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .collect(),
+            mode_is_cut: clip.mode == clip::ClipMode::Cut,
+        });
+        self.request_ui_redraw();
+    }
+
+    /// F220:真正执行一次粘贴(`cp -a` 快路径 / SFTP 逐文件回退)。
+    ///
+    /// **本任务(B5)的桩** —— 整个函数体到 Task B7 会被替换掉。刻意不是
+    /// 静默空函数:什么都不做又不吭声,用户选完冲突处置会以为粘贴丢了。
+    fn dispatch_paste(&mut self, generation: u64, policy: crate::files::clip::Policy) {
+        log::warn!("F220:粘贴执行尚未接通(generation={generation},policy={policy:?},留给 B7)");
     }
 
     /// F139:把一条书签写进会话配置,并同步这个标签的内存副本。
@@ -9004,6 +9120,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_edit_saved(key, result);
                 self.request_ui_redraw();
             }
+            UserEvent::PasteChecked { generation, result } => {
+                self.accept_paste_check(generation, result);
+                self.request_ui_redraw();
+            }
         }
     }
 
@@ -11757,7 +11877,8 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | TransferPlanned { .. }
         | TransferDone { .. }
         | EditOpened { .. }
-        | EditSaved { .. } => true,
+        | EditSaved { .. }
+        | PasteChecked { .. } => true,
     }
 }
 
@@ -12916,6 +13037,80 @@ mod tests {
         assert!(
             empty_branch.contains("set_toast"),
             "全部选中项都不可操作时该有个吐司告诉用户,不是悄悄 return"
+        );
+    }
+
+    /// F220:粘贴**必须先列一次目标目录**再动手 —— 面板里那份 `entries`
+    /// 可能是几分钟前的,而覆盖不可逆。
+    ///
+    /// **扎的是源码结构**:`App` 要 `EventLoopProxy` 才能构造,单测里造不出来
+    /// (同 `sftp_opened_is_routed_by_generation_not_by_the_active_tab` 的边界)。
+    ///
+    /// 自证会变红:把 `start_paste` 里那次列目录删掉、直接发写操作
+    /// (`dispatch_paste`)。
+    #[test]
+    fn a_paste_checks_the_destination_before_it_writes_anything() {
+        let body = body_of(prod_src(), "fn start_paste(");
+        assert!(
+            body.contains("list_dir"),
+            "粘贴没做预检查 —— 会直接盖掉目标目录里的同名文件"
+        );
+        // 真正的写操作(cp -a 快路径 / SFTP 回退)要等 `UserEvent::PasteChecked`
+        // 回来之后由 `accept_paste_check` 经 `dispatch_paste` 发出;`start_paste`
+        // 里出现 `dispatch_paste` 就说明预检查被跳过、写操作提前发了。
+        assert!(
+            !body.contains("dispatch_paste"),
+            "粘贴在预检查回来之前就把写操作发出去了"
+        );
+    }
+
+    /// F220 最重要的一条闸门:目标是源自身或其子孙 → **一个请求都不发**。
+    /// SFTP 回退那条路是我们自己写的递归,会一直递归到把磁盘写满。
+    ///
+    /// 自证会变红:把 `start_paste` 里那句 `is_within` 判断删掉。
+    #[test]
+    fn pasting_into_your_own_subtree_is_refused_before_any_request() {
+        let body = body_of(prod_src(), "fn start_paste(");
+        let gate = body
+            .find("is_within")
+            .expect("没有自身/子孙闸门 —— SFTP 回退会无限递归");
+        let check = body.find("list_dir").expect("找不到预检查");
+        assert!(gate < check, "闸门排在预检查之后 —— 请求已经发出去了");
+    }
+
+    /// F220:同目录剪切是空操作(源和目标是同一个目录)—— 一个请求都不该发。
+    ///
+    /// 自证会变红:把 `start_paste` 里那句同目录剪切短路删掉。
+    #[test]
+    fn cutting_into_the_same_directory_is_a_no_op_before_any_request() {
+        let body = body_of(prod_src(), "fn start_paste(");
+        let gate = body
+            .find("ClipMode::Cut")
+            .expect("没有同目录剪切短路 —— 会对着自己发一次没有意义的请求");
+        let check = body.find("list_dir").expect("找不到预检查");
+        assert!(
+            gate < check,
+            "同目录剪切短路排在预检查之后 —— 请求已经发出去了"
+        );
+    }
+
+    /// F220:`PasteChecked` 按世代路由(S1)——高延迟链路上列一次目录要
+    /// 好几百毫秒,用户完全可能已经切了标签,结果必须回到发起它的那个
+    /// 标签,标签没了就丢弃,不能落到"当前活动标签"上。
+    ///
+    /// **扎的是源码结构**:`App` 要 `EventLoopProxy` 才能构造,单测里造
+    /// 不出来(同 `sftp_opened_is_routed_by_generation_not_by_the_active_tab`
+    /// 的边界)。
+    ///
+    /// 自证会变红:把 `accept_paste_check` 里 `self.tabs.by_generation(generation)`
+    /// 换成 `self.tabs.active()`。
+    #[test]
+    fn paste_checked_is_routed_by_generation_not_by_the_active_tab() {
+        let body = body_of(prod_src(), "fn accept_paste_check(");
+        assert!(
+            body.contains(".by_generation(generation)"),
+            "accept_paste_check 没按世代查属主标签 —— 迟到的预检查结果会\
+             落到当前活动标签,而不是发起粘贴的那个标签"
         );
     }
 

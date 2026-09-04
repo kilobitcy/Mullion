@@ -56,6 +56,19 @@ pub enum FilesDialog {
         /// 「对本批后续冲突都这么办」勾选框的状态。
         apply_all: bool,
     },
+    /// F220:粘贴前的预检查发现目标目录里已经有同名的了。**批量问一次**
+    /// (整批统一选覆盖/跳过/保留两者,不逐条问)——`app::accept_paste_check`
+    /// 只在真的有撞名时才开这个框,没撞名直接走「保留两者」的等价路径。
+    ///
+    /// `names` 是撞了名的那些**末段名字**(给用户看,不参与拼路径)。
+    /// `mode_is_cut` 决定按钮文案说的是「移动」还是「复制」。
+    ///
+    /// 渲染是 Task B6 的活 —— 这一步还没有,`show` 里先接一个空臂,
+    /// `cancel_op` 先当成「没有在途工作,取消就是只关框」。
+    PasteConflict {
+        names: Vec<String>,
+        mode_is_cut: bool,
+    },
 }
 
 /// 用户在对话框里**确认**之后要执行的写操作。到这一步就没有回头路了 ——
@@ -189,7 +202,12 @@ pub fn bits_from_mode(mode: u32) -> [bool; 9] {
 /// (一条 job / 一条编辑),不给出处置它们就永远挂着。
 pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
     match d {
-        FilesDialog::NewDir { .. } | FilesDialog::Delete { .. } | FilesDialog::Chmod { .. } => None,
+        FilesDialog::NewDir { .. }
+        | FilesDialog::Delete { .. }
+        | FilesDialog::Chmod { .. }
+        // F220:预检查回来之后才开这个框,这一步还没有发出任何写请求 ——
+        // 取消就是只关框,没有需要收口的在途工作。
+        | FilesDialog::PasteConflict { .. } => None,
         // 取消 = 保留远端。**不能只关框**:那条编辑会一直挂在 `Conflict` 上,
         // 每次轮询都想回传、每次都撞冲突,而快照永远不动 —— 界面上只看得出
         // 「这个文件一直红着」。
@@ -470,6 +488,10 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 cancelled!();
             }
         }
+        // F220:变体本任务(B5)就加进来了(`accept_paste_check` 要构造它),
+        // 渲染是 Task B6 的活 —— 在那之前这个框开着也画不出来,`modal_open`
+        // 仍然会因为 `files_dialog.is_some()` 而判定「有模态盖着」。
+        FilesDialog::PasteConflict { .. } => {}
     }
 
     if close {
@@ -533,13 +555,19 @@ mod tests {
                 job: 3,
                 apply_all: true,
             },
+            // F220:预检查回来之后才开这个框,取消时没有任何在途请求要收口。
+            FilesDialog::PasteConflict {
+                names: vec!["a.txt".into()],
+                mode_is_cut: false,
+            },
         ];
         for d in &all {
             let got = cancel_op(d);
             let want = match d {
                 FilesDialog::NewDir { .. }
                 | FilesDialog::Delete { .. }
-                | FilesDialog::Chmod { .. } => None,
+                | FilesDialog::Chmod { .. }
+                | FilesDialog::PasteConflict { .. } => None,
                 FilesDialog::EditConflict { .. } => Some(FileOp::ResolveEdit {
                     key: 9,
                     choice: EditResolve::KeepRemote,
