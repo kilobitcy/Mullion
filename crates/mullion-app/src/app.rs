@@ -246,6 +246,8 @@ pub enum UserEvent {
     SftpOpDone {
         generation: u64,
         result: Result<(), String>,
+        /// F219:成功之后还要做的事,见 `OpFollow`。
+        follow: OpFollow,
     },
     /// F209:一张截图传完了。`Ok` 是**远端绝对路径**,由接收方打进那块 pane
     /// 的输入行;`Err` 是已经格式化好的原因,只弹提示。
@@ -309,6 +311,18 @@ pub enum UserEvent {
         key: u64,
         result: Result<EditWriteOutcome, String>,
     },
+}
+
+/// F219:一次远端写操作**成功之后**还要做的事。
+///
+/// 挂在完成事件上而不是在发出那一刻就做:非成功(链路断了 / 权限不足 /
+/// 撞名)意味着那件事压根没发生,提前做就是拿一个假前提改状态(T11 同族)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpFollow {
+    /// 没有后续(删除 / 改名 / 改权限)。
+    None,
+    /// F219:刷新之后把光标落到这一条上(**末段名字**,不含目录)。
+    Reveal(mullion_ssh::sftp::RemotePath),
 }
 
 /// F53:一次回传到底发生了什么。
@@ -4811,6 +4825,14 @@ impl App {
         };
         let conn = tab.content.sftp_connection_for(tab.content.sftp_host_ix());
         let proxy = self.proxy.clone();
+        // F219:建完之后把光标落到新文件上。**必须在这里算**——到了完成事件
+        // 那一刻,`op` 已经被 move 进下面的后台 task 了。
+        let follow = match &op {
+            FileOp::NewFile(p) => OpFollow::Reveal(mullion_ssh::sftp::RemotePath::from_bytes(
+                crate::files::reveal::base_name(p.as_bytes(), crate::files::PanelColumn::Remote),
+            )),
+            _ => OpFollow::None,
+        };
         let task = self._runtime.spawn(async move {
             let result = match op {
                 FileOp::NewDir(p) => client.create_dir(&p).await.map_err(|e| e.to_string()),
@@ -4828,7 +4850,11 @@ impl App {
                     unreachable!("冲突处置不该走远端写操作这条路")
                 }
             };
-            let _ = proxy.send_event(UserEvent::SftpOpDone { generation, result });
+            let _ = proxy.send_event(UserEvent::SftpOpDone {
+                generation,
+                result,
+                follow,
+            });
         });
         self.track_sftp_task(generation, task);
     }
@@ -5387,7 +5413,11 @@ impl App {
                         .write_all_truncate(&copy, &bytes)
                         .await
                         .map_err(|e| format!("另存副本失败:{e}"));
-                    let _ = proxy.send_event(UserEvent::SftpOpDone { generation, result });
+                    let _ = proxy.send_event(UserEvent::SftpOpDone {
+                        generation,
+                        result,
+                        follow: OpFollow::None,
+                    });
                 });
                 self.track_sftp_task(generation, task);
                 self.ui
@@ -8731,7 +8761,11 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_owner_names(generation, query, stdout);
             }
-            UserEvent::SftpOpDone { generation, result } => {
+            UserEvent::SftpOpDone {
+                generation,
+                result,
+                follow,
+            } => {
                 diag::count_sftp_op();
                 match result {
                     Ok(()) => {
@@ -8743,6 +8777,26 @@ impl ApplicationHandler<UserEvent> for App {
                             crate::ui::files_panel::PanelColumn::Remote,
                             crate::ui::files_panel::FileAction::Refresh,
                         );
+                        // F219:`reveal_pick` 必须写在这次 `Refresh` **之后**。
+                        // 现在的 `PaneState::begin_load` 并不清 `reveal_pick`
+                        // (它只清 selected/cursor/anchor 与
+                        // rename_edit/new_edit),所以今天写在前面不会被
+                        // 立刻冲掉;但 `reveal_pick` 的语义是「等**下一次
+                        // 刷新**回来之后选中这一条」,顺序颠倒就是把因果写反
+                        // ——而且 `invalidate()` 已经把 `reveal_pick` 归进了
+                        // 「一次全新导航就该扔掉的瞬态 UI 状态」那一类
+                        // (与 rename_edit/new_edit 同列),`begin_load` 将来
+                        // 补上同款清理是很自然的演进,写在前面的话那一刻会
+                        // 静默失效(F218 同款顺序陷阱)。
+                        if let OpFollow::Reveal(name) = follow {
+                            if let Some(files) = self
+                                .tabs
+                                .by_generation_mut(generation)
+                                .and_then(|t| t.content.files_panel_mut())
+                            {
+                                files.remote.reveal_pick = Some(name);
+                            }
+                        }
                     }
                     Err(msg) => self.ui.set_error(msg),
                 }
@@ -12366,16 +12420,19 @@ mod tests {
         let (production, _) = src
             .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
-        for (pattern, what) in [
-            ("UserEvent::SftpOpDone { generation, result }", "目录操作"),
-            ("UserEvent::TransferDone { job, result }", "传输完成"),
-        ] {
-            let arm = arm_of(production, pattern);
-            assert!(
-                arm.contains("diag::count_sftp_op();"),
-                "{what}那一路没计数 —— 剖面里的 SFTP 列会少算一半"
-            );
-        }
+        // F219:`SftpOpDone` 加了 `follow` 字段之后,rustfmt 把模式拆成了
+        // 多行,`arm_of` 那套单行 `"模式 => {"` 找不到,单独用
+        // `multiline_arm_of` 取。
+        let sftp_op_done_arm = multiline_arm_of(production, "UserEvent::SftpOpDone {");
+        assert!(
+            sftp_op_done_arm.contains("diag::count_sftp_op();"),
+            "目录操作那一路没计数 —— 剖面里的 SFTP 列会少算一半"
+        );
+        let transfer_done_arm = arm_of(production, "UserEvent::TransferDone { job, result }");
+        assert!(
+            transfer_done_arm.contains("diag::count_sftp_op();"),
+            "传输完成那一路没计数 —— 剖面里的 SFTP 列会少算一半"
+        );
         let progress = arm_of(production, "UserEvent::TransferProgress { job, done }");
         assert!(
             !progress.contains("count_sftp_op"),
@@ -16946,6 +17003,39 @@ mod tests {
         arm
     }
 
+    /// F219:同 `arm_of`,但给**三个字段以上**的变体用 ——
+    /// rustfmt 会把这种模式强制拆成多行(`generation,`/`result,`/`follow,`
+    /// 各占一行),`arm_of` 假设的单行 `"模式 => {"` 找不到,会直接 panic。
+    ///
+    /// 只给**变体名 + 左花括号**(如 `"UserEvent::SftpOpDone {"`),这里按
+    /// 大括号配平跳过模式自己的花括号(不管它跨几行),再要求跳过之后
+    /// **中间只隔空白**就是 `"=> {"` —— 构造点(`send_event(Foo { .. })`)
+    /// 跳过模式之后紧跟的是 `);`,中间不是空白,天然被挡在外面,不会跟
+    /// `arm_of` 文档里说的那个坑(命中构造处)一样误中。
+    fn multiline_arm_of<'a>(production: &'a str, variant_open: &str) -> &'a str {
+        let mut search_from = 0usize;
+        loop {
+            let rel = production[search_from..]
+                .find(variant_open)
+                .unwrap_or_else(|| panic!("找不到 {variant_open} 的处理分支"));
+            let brace_at = search_from + rel + variant_open.len() - 1;
+            let pattern_and_rest = &production[brace_at..];
+            let pattern = brace_balanced_arm(pattern_and_rest);
+            assert!(
+                pattern.len() < pattern_and_rest.len(),
+                "{variant_open} 的模式没截到闭合大括号"
+            );
+            let after_pattern = &pattern_and_rest[pattern.len()..];
+            if let Some(arrow_rel) = after_pattern.find("=> {") {
+                if after_pattern[..arrow_rel].trim().is_empty() {
+                    let rest = &after_pattern[arrow_rel..];
+                    return brace_balanced_arm(rest);
+                }
+            }
+            search_from = brace_at + 1;
+        }
+    }
+
     /// 取一个**具名函数**的块体。与 `arm_of` 同源(共用 `brace_balanced_arm`),
     /// 只是锚点从 `模式 => {` 换成函数签名的开头。
     ///
@@ -17198,48 +17288,38 @@ mod tests {
     /// `SftpOpDone` 的处理分支里确实发了一次 `Refresh`。
     #[test]
     fn a_successful_write_triggers_a_refresh_so_the_list_is_not_stale() {
-        let src = include_str!("app.rs");
-        // 只看生产代码那一半 —— 断言字符串写在本测试里,连自己这行都算
-        // 命中的话就是一条自证自伪的假测试(同 `files_panel` 里那条)。
-        let (production, _) = src
-            .split_once("#[cfg(test)]")
-            .expect("找不到 #[cfg(test)] 边界");
-        // 定位到**处理分支**(`match event` 里那个),不是枚举定义处 ——
-        // 后者在前面,取到它的话后面截出来的一段根本不含处理代码。
-        let at = production
-            .find("UserEvent::SftpOpDone { generation, result } => {")
-            .expect("找不到 SftpOpDone 的处理分支");
-        // **从 `=> {` 起算**,不是从 `UserEvent::` 起算:模式里那对
-        // `{ generation, result }` 花括号会让配平在第一步就归零,截出来的
-        // 「arm」只有模式本身、一行代码都不含(断言于是恒红)。
-        let rest = &production[at + production[at..].find("=> {").expect("arm 没有块体")..];
-        // 按大括号配平截出这一条 arm。**不能拿「下一个 `UserEvent::`」当边界**:
-        // 这是 `match` 的最后一条分支,那样截会一路截到文件末尾,把别处
-        // (F5 那条)的 `FileAction::Refresh` 也算进来 —— 断言于是恒绿
-        // (删掉整段刷新代码它照样过,变异验收当场逮到)。
-        let mut depth = 0usize;
-        let mut end = rest.len();
-        for (i, c) in rest.char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let arm = &rest[..end];
-        assert!(
-            arm.len() < rest.len(),
-            "没截到 arm 的闭合大括号,下面的断言会退化成扫全文件"
-        );
+        let arm = multiline_arm_of(prod_src(), "UserEvent::SftpOpDone {");
         assert!(
             arm.contains("FileAction::Refresh"),
             "写操作成功后没有刷新目录 —— 界面会一直显示已经删掉的那一行"
+        );
+    }
+
+    /// F219:建完之后光标要落到那个新文件上 —— 用户下一步多半是编辑它 /
+    /// 改权限,让他在刷新后的列表里重新找一遍等于白建了一半。
+    ///
+    /// **顺序是死的**:`reveal_pick` 必须写在那次 `Refresh` **之后**。
+    /// 今天的 `PaneState::begin_load` 并不会清 `reveal_pick`(它只清
+    /// selected/cursor/anchor 与 rename_edit/new_edit,`reveal_pick` 靠
+    /// `PaneState::accept` 里的 `take_reveal_pick` 延后消费,不吃这一茬)——
+    /// 但 `reveal_pick` 的语义是「等**下一次刷新**回来之后选中这一条」,
+    /// 写在 `Refresh` 之前就是把因果关系写反;而且 `invalidate()` 已经把
+    /// `reveal_pick` 归进了「一次全新导航就该扔掉的瞬态 UI 状态」那一类
+    /// (与 rename_edit/new_edit 同列),`begin_load` 将来补上同款清理是很
+    /// 自然的演进,到那时候写在前面的代码会静默失效(F218 同款顺序陷阱)。
+    ///
+    /// 自证会变红:把落 `reveal_pick` 那句挪到 `Refresh` 之前。
+    #[test]
+    fn a_freshly_created_file_is_revealed_after_the_refresh_not_before() {
+        let arm = multiline_arm_of(prod_src(), "UserEvent::SftpOpDone {");
+        let refresh_at = arm.find("FileAction::Refresh").expect("成功之后没刷新目录");
+        let reveal_at = arm
+            .find("reveal_pick")
+            .expect("建完之后没有把光标落到新文件上");
+        assert!(
+            reveal_at > refresh_at,
+            "reveal_pick 写在 Refresh 之前 —— 因果被写反,且一旦 begin_load 将来学 F218 \
+             把 reveal_pick 也归进清理范围,这里会静默失效"
         );
     }
 
