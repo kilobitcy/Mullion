@@ -217,6 +217,9 @@ impl PaneState {
                 {
                     self.rename_edit = None;
                 }
+                // F219:`new_edit` 故意不跟着上面那段一起判 —— 它不绑定任何
+                // 一行(见 `NewEdit` 的文档),没有「那一行没了」这回事,清掉
+                // 只会把用户正在打的字吞掉。
                 self.take_reveal_pick();
             }
             Err(msg) => {
@@ -713,6 +716,24 @@ mod tests {
             }
             assert!(s.new_edit.is_none(), "换目录/换机器后新建态还赖着");
         }
+    }
+
+    /// F219:`begin_rename` 清 `new_edit` 那句在**函数体第一句**,在
+    /// 「有没有光标行」那道闸门之前 —— 空目录里打了一半新文件名,误按
+    /// 或连按 F2(此时没有光标行,`begin_rename` 会返回 `false`),新建框
+    /// 也该跟着让位,不能因为改名没进得去就赖着不走。
+    ///
+    /// 自证会变红:把 `begin_rename` 里 `self.new_edit = None;` 挪到
+    /// `let Some(cur) = self.cursor.clone() else { return false; }` 之后。
+    #[test]
+    fn begin_rename_clears_the_new_file_edit_even_when_it_fails_to_start() {
+        let mut s = state();
+        assert!(s.begin_new_file(), "前提:进得了新建态");
+        assert!(
+            !s.begin_rename(),
+            "前提:没有光标行,改名该失败 —— 否则这条测的是成功路径,缺口原样存在"
+        );
+        assert!(s.new_edit.is_none(), "改名失败也不该让新建框继续赖着");
     }
 
     /// F219:**刷新不清新建态** —— 它不绑任何已有行,清掉会把用户正在打的字
