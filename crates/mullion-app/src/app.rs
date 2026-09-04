@@ -4578,7 +4578,7 @@ impl App {
         key: &winit::keyboard::Key,
         mods: ModifiersState,
     ) {
-        use crate::ui::files_panel::{FileAction, PanelColumn};
+        use crate::ui::files_panel::FileAction;
         use winit::keyboard::{Key as WinitKey, NamedKey};
 
         // Ctrl+H:切隐藏文件。得先判——它落进 `WinitKey::Character("h")` 分支,
@@ -4597,7 +4597,7 @@ impl App {
                         .by_generation(generation)
                         .and_then(|t| t.content.files_panel())
                         .map(|f| f.active_column);
-                    if column == Some(PanelColumn::Remote) {
+                    if column == Some(crate::ui::files_panel::PanelColumn::Remote) {
                         self.dispatch_panel_action(generation, FileAction::BeginNewFile);
                     }
                     return;
@@ -12602,7 +12602,16 @@ mod tests {
         let at = body
             .find("\"n\"")
             .expect("Ctrl+N 没接上 —— 键盘那条入口不存在");
-        let arm = &body[at..at + 400.min(body.len() - at)];
+        // 窗口不能是定长字节切片:`app.rs` 满是 CJK 注释,固定字节数容易切在
+        // 多字节字符中间(`str` 按字节切片会直接 panic,而不是给出断言消息 ——
+        // 那种「红」没有证明判据被真正执行到,是假红)。改成搜到这个分支自己
+        // 的 `return;` 为止,窗口跟着代码走,不会因为附近多写一行注释就失效。
+        let end = at
+            + body[at..]
+                .find("return;")
+                .expect("Ctrl+N 那支没有以 return 收尾 —— 窗口定位不到")
+            + "return;".len();
+        let arm = &body[at..end];
         assert!(
             arm.contains("PanelColumn::Remote"),
             "Ctrl+N 没判栏 —— 在本地栏按会动到远端(D5)"
@@ -13507,7 +13516,16 @@ mod tests {
         let at = body
             .find("FileAction::NewFile")
             .expect("远端栏没接 NewFile —— 回车之后什么都不会发生");
-        let arm = &body[at..at + 400.min(body.len() - at)];
+        // 窗口不能是定长字节切片:`app.rs` 满是 CJK 注释,固定字节数容易切在
+        // 多字节字符中间(`str` 按字节切片会直接 panic,而不是给出断言消息 ——
+        // 那种「红」没有证明判据被真正执行到,是假红)。改成搜到这个分支自己
+        // 的 `return;` 为止,窗口跟着代码走,不会因为附近多写一行注释就失效。
+        let end = at
+            + body[at..]
+                .find("return;")
+                .expect("NewFile 那支没有以 return 收尾 —— 窗口定位不到")
+            + "return;".len();
+        let arm = &body[at..end];
         assert!(
             arm.contains("FileOp::NewFile"),
             "NewFile 没落到写操作上(接成弹框的话会多一个没人要的对话框)"
