@@ -11,6 +11,7 @@ pub mod local;
 pub mod owners;
 pub mod path_input;
 pub mod queue;
+pub mod reveal;
 pub mod state;
 pub mod transfer;
 

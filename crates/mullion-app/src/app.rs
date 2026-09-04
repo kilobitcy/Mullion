@@ -210,6 +210,19 @@ pub enum UserEvent {
         seq: u64,
         result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
     },
+    /// F218:一次「这条路径是目录还是文件」问完了。`Ok(true)` = 目录。
+    ///
+    /// `path` **原样带回来**:失败时那句 toast 要报出「解析成了什么」——
+    /// 这个键的相对路径基准是猜的(pane 报的 cwd),猜错时把结果摊开给用户看
+    /// 才有得查,只说一句「跳转失败」等于什么都没说。
+    ///
+    /// `seq` 与 `PendingReveal::seq` 对齐,对不上就丢(同 `SftpListed`)。
+    RevealStat {
+        generation: u64,
+        seq: u64,
+        path: mullion_ssh::sftp::RemotePath,
+        result: Result<bool, String>,
+    },
     /// F142:一次 `getent` 查完了(属主列要显示的用户名/组名)。
     ///
     /// **失败也要送回来**(`stdout: None`):发出去那一刻这批 id 已经记进了
@@ -737,6 +750,48 @@ struct TerminalTab {
     /// F161:这块 pane 下一次「就绪」时,attach 要不要带 `-d`(D5)。
     /// 与 `leaf_wanted` 同进同退,拆成两个表只是因为前者要参与落盘、后者不要。
     leaf_detach: Vec<(PaneId, bool)>,
+    /// F218:一次在途的「跳到选区里那条路径去」。`None` = 没有。
+    ///
+    /// **挂在标签上,不挂在 `App` 上**:标签关掉它就跟着没了,不需要额外的
+    /// 回收路径 —— 这是 F160 栽过的那类坑(意图表换节点没人清)。
+    ///
+    /// 只有终端标签有:这个意图的源头是终端选区,而 SFTP 节点标签
+    /// (`FilesTab`)根本没有 pane,划不出选区。
+    pending_reveal: Option<PendingReveal>,
+}
+
+/// F218:按下 `Ctrl+Shift+B` 那一刻算出来的全部事实。
+///
+/// `arrived` 在这里就算好:判「已到达」要读面板的 cwd 和选中集,而派发那几个
+/// 方法拿的是 `&mut self`,再借一次面板就借不出来了。
+struct RevealTarget {
+    /// 文件面板属主标签的世代号(S1 路由键)。
+    generation: u64,
+    column: crate::files::PanelColumn,
+    /// **发起时**焦点分屏所在的机器。远端栏才有意义。
+    host_ix: Option<usize>,
+    /// 已经解析规整过的绝对路径。
+    path: mullion_ssh::sftp::RemotePath,
+    /// 面板已经停在这儿了吗(判据见 `files::reveal::arrived`)。
+    arrived: bool,
+}
+
+/// F218:一次在途的「跳到那条路径去」。
+///
+/// 从按下键到真正跳过去中间可能隔着两次网络往返(异机要先重开 sftp
+/// channel,再 `stat` 目标),意图得在这期间活着。
+#[derive(Debug, Clone)]
+struct PendingReveal {
+    /// **发起时**焦点分屏挂在哪台机器上。重开回来时拿它对账 ——
+    /// 等待期间用户可能又把焦点切到了第三台。
+    host_ix: Option<usize>,
+    /// 已经解析成绝对路径的目标(可能是目录,也可能是文件,`stat` 才知道)。
+    path: mullion_ssh::sftp::RemotePath,
+    /// 这一轮的序号。`stat` 结果回来时对不上就丢 —— 用户按得比网络快时
+    /// 会有后发先至(同 `PaneState::request_seq` 那套判据)。
+    seq: u64,
+    /// `stat` 已经发出去了吗。发过就不再因为「sftp 重开好了」而重发一次。
+    stat_sent: bool,
 }
 
 /// D1/D6:一个「SFTP 节点」标签的全部状态——**独占**自己的连接(跟隧道同一个
@@ -1946,6 +2001,11 @@ pub struct App {
     /// Ctrl+Shift+B 开侧栏就永远同步不到焦点 pane 的目录。跨帧字段 + 判据
     /// 放在 `render_frame` 调用之后,两条路径才都覆盖得到。
     files_sidebar_was_open: bool,
+    /// F218:跳转意图的发号器。每按一次 `Ctrl+Shift+B`(且认出了路径)+1,
+    /// `stat` 结果回来时对账 —— 用户按得比网络快时会有后发先至。
+    ///
+    /// 放 `App` 上而不是标签上:它只需要**单调**,不需要按标签分号段。
+    reveal_seq: u64,
     /// 指针最近一次的物理像素坐标。`MouseWheel` 事件本身不带坐标,鼠标上报
     /// (F17 alt screen 档)要的 (col,row) 只能靠 `CursorMoved` 记着。
     cursor_px: (f32, f32),
@@ -2328,6 +2388,7 @@ impl App {
             picker_busy: PickerBusy::default(),
             ui_dirty: true, // 首帧必须画出来
             files_sidebar_was_open: false,
+            reveal_seq: 0,
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
             // 与日志文件名同源(logx::instance_id):两边共用一个 id,
@@ -3533,6 +3594,9 @@ impl App {
     /// 同 `tab_hotkey_event`:必须在 `window_event` 里输入分流**之前**调用
     /// (T8 纪律)——不然 `Ctrl+Shift+B` 会先被喂给 egui 的焦点系统,`B` 也会
     /// 被编码进 PTY 写给远端。
+    ///
+    /// F218 起这个键**叠加**了「跳到选区里那条路径去」。判定表在
+    /// `files::reveal::plan`,这里只接线。
     fn files_hotkey_event(&mut self, event: &WindowEvent) -> bool {
         let WindowEvent::KeyboardInput { event: ke, .. } = event else {
             return false;
@@ -3549,9 +3613,360 @@ impl App {
         if !matches!(key, Key::Char('b' | 'B')) {
             return false;
         }
-        self.ui.files_sidebar_open = !self.ui.files_sidebar_open;
+        self.apply_files_hotkey();
         self.request_ui_redraw();
         true
+    }
+
+    /// F218:`Ctrl+Shift+B` 按下之后到底做什么。
+    ///
+    /// 判定全在 `files::reveal::plan` 那张表里 —— 这里只负责取数据、按结果
+    /// 派发。选区里认不出路径时 `plan` 给的正好是原来的开关行为,叠加不改
+    /// 老路径的语义。
+    fn apply_files_hotkey(&mut self) {
+        let target = self.reveal_target();
+        let arrived = target.as_ref().map(|t| t.arrived);
+        match crate::files::reveal::plan(self.ui.files_sidebar_open, arrived) {
+            crate::files::reveal::Plan::Open => self.ui.files_sidebar_open = true,
+            crate::files::reveal::Plan::Close => self.ui.files_sidebar_open = false,
+            crate::files::reveal::Plan::OpenAndReveal => {
+                self.ui.files_sidebar_open = true;
+                if let Some(t) = target {
+                    self.start_reveal(t);
+                }
+            }
+            crate::files::reveal::Plan::Reveal => {
+                if let Some(t) = target {
+                    self.start_reveal(t);
+                }
+            }
+        }
+    }
+
+    /// F218:焦点 pane 的选区里认出一条路径,解析成绝对路径,再看面板是不是
+    /// 已经在那儿了。`None` = 这一下没有跳转目标(退化成纯开关)。
+    ///
+    /// **侧栏此刻开没开不影响属主标签的判定**(`files_owner_generation_of`
+    /// 第二参写死 `true`):这个键多半是在侧栏关着的时候按的,按关着算的话
+    /// 属主恒 `None`,「关→开并跳过去」这条路永远走不通。
+    ///
+    /// 相对路径的基准是**焦点 pane 报出来的 cwd**(与 `files_start_dir` 同
+    /// 一条腿,含 `~` 展开):用户划的 `src/app.rs` 就是相对那个 shell 的当前
+    /// 目录说的。拿不到时退回面板当前目录 —— 猜错的结果是 `stat` 报「不存在」
+    /// 并原地不动,不会静默跳到别处。
+    fn reveal_target(&self) -> Option<RevealTarget> {
+        use crate::files::{reveal, PanelColumn};
+        let sel = self
+            .active_ws()
+            .and_then(Workspace::focused)
+            .and_then(|p| p.emulator.selection_text())?;
+        let parsed = reveal::parse(&sel)?;
+        let generation = files_owner_generation_of(&self.tabs, true)?;
+        let tab = self.tabs.by_generation(generation)?;
+        let files = tab.content.files_panel()?;
+        let path = match parsed.column {
+            PanelColumn::Remote => {
+                let home = tab.content.sftp_home();
+                // 基准优先用 pane 报的 cwd,退回面板当前目录。`files_start_dir`
+                // 只认绝对路径(以及能展开的 `~`),给不出就是给不出。
+                let base = tab
+                    .content
+                    .focused_pane_cwd()
+                    .and_then(|c| files_start_dir(Some(&c), None, home.as_deref()))
+                    .map(|s| mullion_ssh::sftp::RemotePath::from_bytes(s.into_bytes()))
+                    .unwrap_or_else(|| files.remote.cwd.clone());
+                crate::files::path_input::resolve_remote_input(&parsed.raw, &base, home.as_deref())?
+            }
+            PanelColumn::Local => crate::files::path_input::resolve_local_input(
+                &parsed.raw,
+                &files.local.cwd,
+                crate::files::local::home_dir().as_ref(),
+            )?,
+        };
+        let pane = match parsed.column {
+            PanelColumn::Remote => &files.remote,
+            PanelColumn::Local => &files.local,
+        };
+        let parent = match parsed.column {
+            PanelColumn::Remote => path.parent(),
+            PanelColumn::Local => crate::files::local::parent_local(&path),
+        };
+        let base = reveal::base_name(path.as_bytes(), parsed.column);
+        // 「唯一选中项」才算数:选了三条时「已经站在它上面」无从谈起。
+        let only = if pane.selected.len() == 1 {
+            pane.selected.iter().next().map(|p| p.as_bytes().to_vec())
+        } else {
+            None
+        };
+        let arrived = reveal::arrived(
+            pane.cwd.as_bytes(),
+            only.as_deref(),
+            &reveal::Where {
+                target: path.as_bytes(),
+                parent: parent.as_bytes(),
+                base: &base,
+            },
+        );
+        Some(RevealTarget {
+            generation,
+            column: parsed.column,
+            host_ix: tab.content.focused_pane_host_ix(),
+            path,
+            arrived,
+        })
+    }
+
+    /// F218:真正把面板带过去。
+    ///
+    /// 两栏走两条完全不同的路:本地栏是本机文件系统,`metadata` 是同步的,
+    /// 一路做完;远端栏要一次 `stat` 往返才知道末段是文件还是目录
+    /// (`docs/superpowers` 没有扩展名却是目录,`Cargo.lock` 有扩展名是文件
+    /// —— 纯语法猜不出来,猜错就是进错目录)。
+    fn start_reveal(&mut self, target: RevealTarget) {
+        match target.column {
+            crate::files::PanelColumn::Local => self.reveal_local(target),
+            crate::files::PanelColumn::Remote => self.reveal_remote(target),
+        }
+    }
+
+    /// F218:本地栏 —— 全同步,一帧之内做完。
+    fn reveal_local(&mut self, target: RevealTarget) {
+        let path = crate::files::local::to_path(&target.path);
+        let is_dir = match std::fs::metadata(&path) {
+            Ok(md) => md.is_dir(),
+            Err(e) => {
+                self.ui.set_toast(
+                    crate::ui::toast::Kind::Warn,
+                    format!("跳转失败:{}({e})", target.path.display()),
+                );
+                return;
+            }
+        };
+        let (goto, pick) = self.reveal_destination(&target, is_dir);
+        self.apply_local_file_action(
+            target.generation,
+            crate::ui::files_panel::FileAction::Goto(goto),
+        );
+        self.set_reveal_pick(&target, pick);
+    }
+
+    /// F218:远端栏 —— 先把意图挂在标签上,再看这一刻能不能直接发 `stat`。
+    ///
+    /// 三种情形:
+    /// - 焦点分屏就在这条 sftp channel 所在的机器上:直接发。
+    /// - 焦点分屏在**另一台**:走 F132 那条腿把 channel 换过去,`stat` 等
+    ///   `accept_sftp_opened` 再发(意图在那之前活在 `pending_reveal` 里)。
+    /// - channel 还没开:同上,先开。
+    fn reveal_remote(&mut self, target: RevealTarget) {
+        let generation = target.generation;
+        self.reveal_seq += 1;
+        let seq = self.reveal_seq;
+        let tab = self.tabs.by_generation(generation);
+        let client = tab.and_then(|t| t.content.sftp_client());
+        let sftp_host_ix = tab.and_then(|t| t.content.sftp_host_ix());
+        let same_host = client.is_some() && sftp_host_ix == target.host_ix;
+        if let Some(slot) = self.pending_reveal_mut(generation) {
+            *slot = Some(PendingReveal {
+                host_ix: target.host_ix,
+                path: target.path.clone(),
+                seq,
+                stat_sent: same_host,
+            });
+        } else {
+            // 只有终端标签存得下这个意图,而选区也只可能来自终端标签 ——
+            // 走到这儿说明属主判定被改坏了,老实记一条,不静默吞。
+            log::warn!("F218:世代 {generation} 存不下跳转意图,已放弃");
+            return;
+        }
+        match (client, same_host) {
+            (Some(client), true) => {
+                let task = spawn_sftp_stat(
+                    &self._runtime,
+                    &self.proxy,
+                    generation,
+                    client,
+                    target.path,
+                    seq,
+                );
+                self.track_sftp_task(generation, task);
+            }
+            (Some(_), false) => self.reopen_sftp_on_focused_host(generation),
+            (None, _) => self.trigger_sftp_open(generation),
+        }
+    }
+
+    /// F218:`stat` 结果回来了 —— 目录就进去,文件就进它的父目录并把它亮出来。
+    ///
+    /// `seq` 对不上就丢(用户按得比网络快时的后发先至,同 `PaneState::accept`
+    /// 那套判据)。失败**不动当前目录**:一次误划就把用户正在看的目录冲掉,
+    /// 比不跳更糟。
+    fn accept_reveal_stat(
+        &mut self,
+        generation: u64,
+        seq: u64,
+        path: mullion_ssh::sftp::RemotePath,
+        result: Result<bool, String>,
+    ) {
+        let host_ix = match self.pending_reveal_mut(generation) {
+            Some(slot) if slot.as_ref().is_some_and(|p| p.seq == seq) => {
+                slot.take().expect("上一行刚判过是 Some").host_ix
+            }
+            _ => return,
+        };
+        let is_dir = match result {
+            Ok(is_dir) => is_dir,
+            Err(msg) => {
+                self.ui.set_toast(
+                    crate::ui::toast::Kind::Warn,
+                    format!("跳转失败:{}({msg})", path.display()),
+                );
+                self.request_ui_redraw();
+                return;
+            }
+        };
+        let target = RevealTarget {
+            generation,
+            column: crate::files::PanelColumn::Remote,
+            host_ix,
+            path,
+            arrived: false,
+        };
+        let (goto, pick) = self.reveal_destination(&target, is_dir);
+        self.apply_remote_file_action(generation, crate::ui::files_panel::FileAction::Goto(goto));
+        self.set_reveal_pick(&target, pick);
+        self.request_ui_redraw();
+    }
+
+    /// F218:目标是目录就进它本身、不亮任何一条;是文件就进父目录、亮它。
+    fn reveal_destination(
+        &self,
+        target: &RevealTarget,
+        is_dir: bool,
+    ) -> (
+        mullion_ssh::sftp::RemotePath,
+        Option<mullion_ssh::sftp::RemotePath>,
+    ) {
+        if is_dir {
+            return (target.path.clone(), None);
+        }
+        let parent = match target.column {
+            crate::files::PanelColumn::Remote => target.path.parent(),
+            crate::files::PanelColumn::Local => crate::files::local::parent_local(&target.path),
+        };
+        let base = crate::files::reveal::base_name(target.path.as_bytes(), target.column);
+        (
+            parent,
+            Some(mullion_ssh::sftp::RemotePath::from_bytes(base)),
+        )
+    }
+
+    /// F218:把「列完目录之后要亮哪一条」写进面板。
+    ///
+    /// **必须在 `Goto` 之后调用**:`PaneState::begin_load` 会 `clear_selection`,
+    /// 写在它前面的话这一条会被自己清掉,而症状是「跳过去了但什么都没选中」
+    /// —— 看着像没生效,查起来却查不到任何错误。
+    fn set_reveal_pick(
+        &mut self,
+        target: &RevealTarget,
+        pick: Option<mullion_ssh::sftp::RemotePath>,
+    ) {
+        let Some(pick) = pick else {
+            return;
+        };
+        let Some(files) = self
+            .tabs
+            .by_generation_mut(target.generation)
+            .and_then(|t| t.content.files_panel_mut())
+        else {
+            return;
+        };
+        match target.column {
+            crate::files::PanelColumn::Remote => files.remote.reveal_pick = Some(pick),
+            crate::files::PanelColumn::Local => files.local.reveal_pick = Some(pick),
+        }
+    }
+
+    /// F218:某个标签那份「在途跳转意图」的槽位。终端标签之外恒 `None`
+    /// —— 这个意图的源头是终端选区。
+    fn pending_reveal_mut(&mut self, generation: u64) -> Option<&mut Option<PendingReveal>> {
+        self.tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.as_terminal_mut())
+            .map(|t| &mut t.pending_reveal)
+    }
+
+    /// F218:撤掉在途的跳转意图。
+    ///
+    /// 调用点有三类,少一类就是一个粘住的意图:用户自己动了面板(等半秒
+    /// 之后画面被拽走)、sftp 开失败或连接判死(等一个永远不来的事件)、
+    /// 回来的 channel 不是当初那台(会在错误的机器上执行)。标签被关掉那一类
+    /// 不需要调用点 —— 意图存在标签里,标签没了它就没了。
+    fn cancel_pending_reveal(&mut self, generation: u64) {
+        if let Some(slot) = self.pending_reveal_mut(generation) {
+            *slot = None;
+        }
+    }
+
+    /// F218:sftp channel 刚开好 —— 有等着它的跳转意图就把 `stat` 发出去。
+    ///
+    /// **回来的这条 channel 必须是当初那台机器上的**(`reveal::consume`)。
+    /// 等待重开的那半秒里用户完全可能又把焦点切到第三台;而
+    /// `/home/ubuntu/...` 在几台机器上大概率都存在,不校验就是一次
+    /// 「面板显示得好好的、其实是别人的文件」的误连。
+    ///
+    /// `stat_sent` 挡的是另一头:意图是在**同机**情形下建的(`stat` 当场就
+    /// 发了),之后恰好来了一次断线重连 —— 那时不该再发第二次。
+    fn resume_pending_reveal(&mut self, generation: u64, host_ix: Option<usize>) {
+        let mut stale = false;
+        let pending = {
+            let Some(slot) = self.pending_reveal_mut(generation) else {
+                return;
+            };
+            match slot.as_mut() {
+                None => return,
+                Some(p) if p.stat_sent => return,
+                Some(p) if !crate::files::reveal::consume(p.host_ix, host_ix) => {
+                    *slot = None;
+                    stale = true;
+                    None
+                }
+                Some(p) => {
+                    p.stat_sent = true;
+                    Some((p.path.clone(), p.seq))
+                }
+            }
+        };
+        if stale {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                "跳转已取消:焦点已经换到别的节点",
+            );
+            return;
+        }
+        let Some((path, seq)) = pending else {
+            return;
+        };
+        let Some(client) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.sftp_client())
+        else {
+            return;
+        };
+        let task = spawn_sftp_stat(&self._runtime, &self.proxy, generation, client, path, seq);
+        self.track_sftp_task(generation, task);
+    }
+
+    /// F218:这个标签此刻正等着一次跳转吗。
+    ///
+    /// 「侧栏关→开」那一帧的 `sync_files_to_focused_pane` 要看它:同一帧里
+    /// 两个人都想改当前目录,同步那个会先把面板拽到 pane 的 cwd,跳转结果
+    /// 半秒后再把它拽走 —— 用户看见的是一次莫名其妙的闪跳,还白费一次列目录。
+    fn reveal_pending(&self, generation: u64) -> bool {
+        self.tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.as_terminal())
+            .is_some_and(|t| t.pending_reveal.is_some())
     }
 
     /// ②:把远端栏带到焦点 pane 报出来的目录。
@@ -3703,6 +4118,10 @@ impl App {
     ) {
         use crate::files::local;
         use crate::ui::files_panel::FileAction;
+        // F218:用户自己动了面板 —— 撤掉在途的跳转意图,不然他手点到一半,
+        // 半秒后画面被那次跳转拽走。F218 自己发的 `Goto` 走到这里时意图
+        // 已经消费掉了(`accept_reveal_stat` 先 `take` 再派发),不会自伤。
+        self.cancel_pending_reveal(generation);
         // F52:上传。**在借出 `files` 之前分流** —— `start_transfer` 要
         // `&mut self`,借着 `tab.content.files_panel_mut()` 是调不了的。
         if matches!(action, FileAction::Transfer) {
@@ -3825,6 +4244,9 @@ impl App {
         action: crate::ui::files_panel::FileAction,
     ) {
         use crate::ui::files_panel::FileAction;
+        // F218:同 `apply_local_file_action` —— 用户自己动了面板就撤掉在途的
+        // 跳转意图。理由见那边。
+        self.cancel_pending_reveal(generation);
         // D2:这两个不发网络请求,在借出 `files` 之前就分流掉 —— 借着
         // `tab.content.files_panel_mut()` 是没法再调 `&mut self` 方法的。
         match &action {
@@ -5139,12 +5561,18 @@ impl App {
                 let task =
                     spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, dir, seq);
                 self.track_sftp_task(generation, task);
+                // F218:有等着这条 channel 的跳转意图就在这儿接上。
+                self.resume_pending_reveal(generation, host_ix);
             }
             Err(msg) => {
                 if let Some(tab) = self.tabs.by_generation_mut(generation) {
                     if let Some(files) = tab.content.files_panel_mut() {
                         files.remote.load = crate::files::state::Load::Failed(msg);
                     }
+                    // F218:channel 没开成,那个意图等的事件永远不会来了。
+                    // 不撤的话它会一直粘着,顺带把「侧栏关→开」的目录同步
+                    // 也一直压着(`reveal_pending`)。
+                    self.cancel_pending_reveal(generation);
                 } else {
                     log::debug!(target: "mullion", "丢弃过期世代 {generation} 的 SFTP 打开结果");
                 }
@@ -5224,6 +5652,12 @@ impl App {
                     for t in tasks.drain(..) {
                         t.abort();
                     }
+                }
+                // F218:连接已经证实死亡 —— 在途的跳转意图等的那个
+                // `SftpOpened` 不会来了(它的 `stat` 也刚被 abort 掉)。
+                // 不撤就是一个永远粘着的意图。
+                if let TabContent::Terminal(t) = &mut tab.content {
+                    t.pending_reveal = None;
                 }
             }
             // F142:连接刚被判定死亡时**不问** —— 那条命令一定失败,徒增一次
@@ -6515,6 +6949,7 @@ impl App {
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
                 leaf_detach: Vec::new(),
+                pending_reveal: None,
             })),
         );
         // F37/F160:是重连一个占位标签 → 把上次的分屏形状搭回来,给每个叶子
@@ -8214,6 +8649,14 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_sftp_listed(generation, seq, result);
             }
+            UserEvent::RevealStat {
+                generation,
+                seq,
+                path,
+                result,
+            } => {
+                self.accept_reveal_stat(generation, seq, path, result);
+            }
             UserEvent::OwnerNames {
                 generation,
                 query,
@@ -9408,7 +9851,17 @@ impl ApplicationHandler<UserEvent> for App {
                             // ②:侧栏「关→开」跃迁才同步一次。一直跟着焦点
                             // pane 走的话,用户在面板里点开的目录会被反复
                             // 拽回终端所在目录,完全没法浏览。
-                            if self.ui.files_sidebar_open && !self.files_sidebar_was_open {
+                            //
+                            // F218:这一帧要是有在途的跳转意图,同步得让位
+                            // —— 两个人都想改当前目录,同步会先把面板拽到
+                            // pane 的 cwd,跳转结果半秒后再把它拽走:一次
+                            // 莫名其妙的闪跳,外加白费一次列目录往返。
+                            let revealing =
+                                files_owner_generation.is_some_and(|gen| self.reveal_pending(gen));
+                            if self.ui.files_sidebar_open
+                                && !self.files_sidebar_was_open
+                                && !revealing
+                            {
                                 self.sync_files_to_focused_pane();
                             }
                             self.files_sidebar_was_open = self.ui.files_sidebar_open;
@@ -10883,6 +11336,43 @@ fn spawn_sftp_list_dir(
     })
 }
 
+/// F218:异步问一条路径「你是目录还是文件」。结果经 `UserEvent::RevealStat`
+/// 回送(`App::accept_reveal_stat` 接)。
+///
+/// **必须问,不能按扩展名猜**:`docs/superpowers` 没有扩展名却是目录,
+/// `Cargo.lock` 有扩展名是文件,`target/x86_64-pc-windows-gnu` 看着像扩展名
+/// 也是目录 —— 猜错就是进错目录或者停在父目录里选不中任何东西。
+///
+/// `stat` 是 **lstat 语义**(不跟随链接,见 `SftpClient::stat` 的文档),所以
+/// 指向目录的软链接会被当成「文件」在父目录里亮出来 —— 那是对的:用户按回车
+/// 才跟进去(`PaneState::enter_target` 负责跟随),这里不替他决定。
+///
+/// 同样**返回 `JoinHandle`,调用方必须存进 `sftp_tasks`** —— 理由同
+/// `spawn_sftp_list_dir`。
+fn spawn_sftp_stat(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    client: Arc<mullion_ssh::sftp::SftpClient>,
+    path: mullion_ssh::sftp::RemotePath,
+    seq: u64,
+) -> tokio::task::JoinHandle<()> {
+    let proxy = proxy.clone();
+    runtime.spawn(async move {
+        let result = client
+            .stat(&path)
+            .await
+            .map(|e| e.kind == mullion_ssh::sftp::EntryKind::Dir)
+            .map_err(|e| format!("{e}"));
+        let _ = proxy.send_event(UserEvent::RevealStat {
+            generation,
+            seq,
+            path,
+            result,
+        });
+    })
+}
+
 /// F142:异步问一批 uid/gid 的名字。结果经 `UserEvent::OwnerNames` 回送
 /// (`App::accept_owner_names` 接)。
 ///
@@ -11032,6 +11522,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | TunnelState { .. }
         | SftpOpened { .. }
         | SftpListed { .. }
+        | RevealStat { .. }
         | OwnerNames { .. }
         | SftpOpDone { .. }
         | ShotUploaded { .. }
@@ -15857,6 +16348,7 @@ mod tests {
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
                 leaf_detach: Vec::new(),
+                pending_reveal: None,
             })),
         );
         tabs
@@ -16035,6 +16527,7 @@ mod tests {
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
                 leaf_detach: Vec::new(),
+                pending_reveal: None,
             })),
         );
         tabs
@@ -16878,6 +17371,7 @@ mod tests {
                 ),
             ],
             leaf_detach: vec![(PaneId(1), true), (PaneId(2), false)],
+            pending_reveal: None,
         };
 
         clear_leaf_attach_intent(&mut tab, PaneId(1));
@@ -18021,6 +18515,7 @@ mod tests {
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
                 leaf_detach: Vec::new(),
+                pending_reveal: None,
             })),
         };
 
@@ -18102,6 +18597,7 @@ mod tests {
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
                 leaf_detach: Vec::new(),
+                pending_reveal: None,
             })),
         };
         wind_down(tab);
@@ -18183,6 +18679,7 @@ mod tests {
                 reconnect_tasks: vec![task],
                 leaf_wanted: Vec::new(),
                 leaf_detach: Vec::new(),
+                pending_reveal: None,
             })),
         };
 
@@ -19017,6 +19514,7 @@ mod tests {
                 reconnect_tasks: Vec::new(),
                 leaf_wanted: Vec::new(),
                 leaf_detach: Vec::new(),
+                pending_reveal: None,
             }))
         }
 
@@ -19435,6 +19933,7 @@ mod tests {
     ///   第二条断言红。
     /// - 删掉帧尾 `self.files_sidebar_was_open = self.ui.files_sidebar_open;`
     ///   —— 第三条断言红。
+    /// - F218:把 `&& !revealing` 那半句去掉 —— 第四条断言红。
     #[test]
     fn the_files_sidebar_syncs_to_the_terminal_only_on_the_closed_to_open_edge() {
         let src = include_str!("app.rs");
@@ -19453,7 +19952,7 @@ mod tests {
             "缺 sync_files_to_focused_pane —— ② 在侧栏已开着时会静默不生效"
         );
         assert!(
-            prod.contains("if self.ui.files_sidebar_open && !self.files_sidebar_was_open {"),
+            prod.contains("&& !self.files_sidebar_was_open"),
             "同步的判据不是「关→开」跃迁 —— 每帧都同步会把用户在面板里点开的\
              目录反复拽回终端所在目录"
         );
@@ -19461,6 +19960,11 @@ mod tests {
             prod.contains("self.files_sidebar_was_open = self.ui.files_sidebar_open;"),
             "没有在帧尾记下这一帧的开合状态 —— 下一帧判不出跃迁,\
              而且热键那条路(在另一次事件回调里改标志)会永远同步不到"
+        );
+        assert!(
+            prod.contains("&& !revealing"),
+            "F218:同步没给在途的跳转意图让位 —— 两个人同一帧都改当前目录,\
+             面板会先被拽到 pane 的 cwd、半秒后再被跳转结果拽走"
         );
     }
 

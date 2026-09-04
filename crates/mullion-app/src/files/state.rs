@@ -91,6 +91,20 @@ pub struct PaneState {
     /// 挂在栏上而不是标签上:一栏对应一条连接,换连接时只需清这一份
     /// (`OwnerNames::clear`,调用点在 `app.rs` 拿到新 SFTP client 那一刻)。
     pub owners: super::owners::OwnerNames,
+    /// F218:这次加载完之后要**选中并滚动到**的那一条(末段名字,不含目录)。
+    ///
+    /// 由 `app.rs` 在发出 `Goto(父目录)` **之后**写入 —— `begin_load` 会
+    /// `clear_selection`,写在它之前的话选中会被自己清掉。
+    ///
+    /// 只在 `accept` 里消费一次,不留:留着的话下一次刷新会把用户手点的
+    /// 选中再改回来。
+    pub reveal_pick: Option<RemotePath>,
+    /// F218:下一帧要把视口滚到哪一条上。由 [`PaneState::accept`] 消费
+    /// `reveal_pick` 时置上,画面那侧 `take()` 掉。
+    ///
+    /// 存名字不存行号:行号要等 `rows()`(排序 + 隐藏过滤)算完才知道,
+    /// 而那是画面那一侧的事。
+    pub scroll_to: Option<RemotePath>,
 }
 
 impl PaneState {
@@ -109,6 +123,8 @@ impl PaneState {
             path_edit: None,
             rename_edit: None,
             owners: super::owners::OwnerNames::default(),
+            reveal_pick: None,
+            scroll_to: None,
         }
     }
 
@@ -143,6 +159,10 @@ impl PaneState {
         self.clear_selection();
         // F200:同 `begin_load` —— 换的还是另一台机器,更不能留。
         self.rename_edit = None;
+        // F218:同理 —— 那一条是**另一台**机器上的文件名。留着的话,新机器上
+        // 恰好有个同名文件就会被莫名其妙地选中并滚到跟前。
+        self.reveal_pick = None;
+        self.scroll_to = None;
         self.request_seq += 1;
     }
 
@@ -170,6 +190,7 @@ impl PaneState {
                 {
                     self.rename_edit = None;
                 }
+                self.take_reveal_pick();
             }
             Err(msg) => {
                 self.entries.clear();
@@ -177,6 +198,26 @@ impl PaneState {
             }
         }
         true
+    }
+
+    /// F218:目录刚列完 —— 把「要亮给用户看的那一条」落到选中 + 光标 +
+    /// 待滚动上。没有待办、或那一条不在这批 entries 里就什么都不做。
+    ///
+    /// **隐藏文件要顺手打开开关**:`.gitignore`/`.env` 这类是常划的路径,
+    /// 而 `rows()` 会把它们过滤掉 —— 不打开的话,选中和滚动都落在一条
+    /// **画不出来**的行上,用户看到的是「按了没反应」。
+    fn take_reveal_pick(&mut self) {
+        let Some(pick) = self.reveal_pick.take() else {
+            return;
+        };
+        if !self.entries.iter().any(|e| e.name == pick) {
+            return;
+        }
+        if pick.as_bytes().starts_with(b".") {
+            self.show_hidden = true;
+        }
+        self.select_only(&pick);
+        self.scroll_to = Some(pick);
     }
 
     /// 点列头:同一列再点一次翻方向,换列则回到升序。
@@ -422,6 +463,72 @@ mod tests {
 
     fn state() -> PaneState {
         PaneState::new(RemotePath::from_bytes(b"/home/u".to_vec()))
+    }
+
+    /// F218:目录列完之后,待亮的那一条要成为**唯一选中项 + 光标**,并留下
+    /// 待滚动标记。
+    ///
+    /// 自证会变红:把 `accept` 里的 `self.take_reveal_pick()` 删掉。
+    #[test]
+    fn a_revealed_file_becomes_the_only_selection_and_asks_to_be_scrolled_to() {
+        let mut s = state();
+        s.reveal_pick = Some(RemotePath::from_bytes(b"b.txt".to_vec()));
+        s.accept(
+            s.request_seq,
+            Ok(vec![
+                e("a.txt", EntryKind::File),
+                e("b.txt", EntryKind::File),
+            ]),
+        );
+        assert_eq!(s.selected_paths().len(), 1, "该只选中一条:{:?}", s.selected);
+        assert!(s.is_selected(&RemotePath::from_bytes(b"b.txt".to_vec())));
+        assert_eq!(
+            s.cursor.as_ref().map(|c| c.display().to_string()),
+            Some("b.txt".into())
+        );
+        assert_eq!(
+            s.scroll_to.as_ref().map(|c| c.display().to_string()),
+            Some("b.txt".into()),
+            "没留下待滚动标记 —— 大目录里那一条会被选中在视口外,用户看不见"
+        );
+        assert!(
+            s.reveal_pick.is_none(),
+            "待办该被消费掉,留着下次刷新会再改一次选中"
+        );
+    }
+
+    /// F218:待亮的是隐藏文件时,**顺手打开隐藏文件开关** —— `rows()` 会把
+    /// 它过滤掉,选中和滚动都落在一条画不出来的行上,用户看到的是「按了没反应」。
+    ///
+    /// 自证会变红:把 `take_reveal_pick` 里那句 `self.show_hidden = true` 删掉。
+    #[test]
+    fn revealing_a_dotfile_turns_the_hidden_switch_on_so_it_is_actually_visible() {
+        let mut s = state();
+        assert!(!s.show_hidden, "前提:默认不显示隐藏文件");
+        s.reveal_pick = Some(RemotePath::from_bytes(b".gitignore".to_vec()));
+        s.accept(
+            s.request_seq,
+            Ok(vec![
+                e(".gitignore", EntryKind::File),
+                e("a.txt", EntryKind::File),
+            ]),
+        );
+        assert!(s.show_hidden);
+        assert!(
+            s.rows().iter().any(|r| r.name.display() == ".gitignore"),
+            "那一条仍然被过滤在可见行之外"
+        );
+    }
+
+    /// F218:待亮的那一条这批里没有(被别人删了 / 传输途中刷新)——
+    /// 什么都不动,不去乱选一条。
+    #[test]
+    fn a_reveal_target_that_is_not_in_the_listing_changes_nothing() {
+        let mut s = state();
+        s.reveal_pick = Some(RemotePath::from_bytes(b"gone.txt".to_vec()));
+        s.accept(s.request_seq, Ok(vec![e("a.txt", EntryKind::File)]));
+        assert!(s.selected.is_empty());
+        assert!(s.scroll_to.is_none());
     }
 
     /// F52:没选中任何东西时,操作目标退化成光标那一条 —— 右键一条没选中的

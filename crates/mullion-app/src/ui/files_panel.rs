@@ -798,7 +798,20 @@ pub fn show(
     let mut renaming = state.rename_edit.take();
     // `None` = 还在编辑;`Some(None)` = 放弃;`Some(Some(name))` = 提交。
     let mut rename_done: Option<Option<String>> = None;
+    // F218:待滚动的那一条。**必须在 `state.rows()` 之前 `take`** —— `rows`
+    // 借着 `&state.entries` 不放,之后再动 `&mut state` 借用检查就过不了。
+    let scroll_to = state.scroll_to.take();
     let rows = state.rows();
+    // F218:把待滚动的那一条换算成视口偏移。`show_rows` 是虚拟滚动,目标行
+    // 多半根本没被画出来,拿不到 `Response` 去 `scroll_to_rect` —— 行高恒定,
+    // 直接算偏移是这里唯一可行的办法。
+    //
+    // 减半屏是刻意的:贴着视口顶端的那一条看着像「列表就是从这儿开始的」,
+    // 摆在中间才看得出上下文。`max(0)` 兜住短目录(算出来是负的)。
+    let scroll_offset = scroll_to.and_then(|name| {
+        let ix = rows.iter().position(|e| e.name == name)?;
+        Some((ix as f32 * ROW_H - body_h / 2.0).max(0.0))
+    });
     // `rows` 借着 `&state.entries` 不放(它是 `Vec<&Entry>`),闭包里不能再
     // 借一次 `&mut state`——新选中的那条先记局部变量,出了闭包再落回 `state`。
     let selected = state.selected.clone();
@@ -832,9 +845,15 @@ pub fn show(
     .unwrap_or_default()
     .offset
     .x;
-    egui::ScrollArea::both()
+    let mut area = egui::ScrollArea::both()
         .id_salt(scroll_id_salt(id, generation))
-        .max_height(body_h)
+        .max_height(body_h);
+    // F218:只在**有待办的那一帧**钉偏移。无条件钉的话滚轮就废了 ——
+    // 每帧都被拽回同一个位置。
+    if let Some(y) = scroll_offset {
+        area = area.vertical_scroll_offset(y);
+    }
+    area
         // F58:**必须关掉**。`drag_to_scroll` 默认开着,它在视口上注册一个
         // 吃 drag 的部件,把按在行上的那一下抢去当滚动手势 —— 行的
         // `drag_started()` 永远为假,拖拽整个功能安静地不存在。桌面端本来
