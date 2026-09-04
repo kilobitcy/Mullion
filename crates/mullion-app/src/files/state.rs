@@ -126,6 +126,15 @@ pub struct PaneState {
     /// 存名字不存行号:行号要等 `rows()`(排序 + 隐藏过滤)算完才知道,
     /// 而那是画面那一侧的事。
     pub scroll_to: Option<RemotePath>,
+    /// F220:每发起一次粘贴预检查 +1。**不是布尔"正在粘贴中"标记** ——
+    /// `wind_down`/断线重连会直接 `abort()` 在途任务(T11),标记会永久卡住、
+    /// 这一栏的粘贴从此彻底失效。序号法没有这个问题:卡住的旧值不挡任何
+    /// 东西,下一次 Ctrl+V 自然把序号推进,`PasteChecked` 回来时对不上就丢。
+    ///
+    /// 与 `request_seq` 分开是两件不相干的事:一个管"这份目录列表是不是
+    /// 最新的",一个管"这次粘贴请求是不是最新的" —— 混用会让换目录和
+    /// 重复粘贴互相误伤对方的去重。
+    pub paste_seq: u64,
 }
 
 impl PaneState {
@@ -147,6 +156,7 @@ impl PaneState {
             owners: super::owners::OwnerNames::default(),
             reveal_pick: None,
             scroll_to: None,
+            paste_seq: 0,
         }
     }
 
@@ -228,6 +238,14 @@ impl PaneState {
             }
         }
         true
+    }
+
+    /// F220:开始一次粘贴预检查,返回本次的序号。调用方把它随
+    /// `UserEvent::PasteChecked` 带走,结果回来时跟这里比对 ——
+    /// 对不上就是过期结果(用户又按了一次 Ctrl+V,或换了目录/标签)。
+    pub fn begin_paste(&mut self) -> u64 {
+        self.paste_seq += 1;
+        self.paste_seq
     }
 
     /// F218:目录刚列完 —— 把「要亮给用户看的那一条」落到选中 + 光标 +

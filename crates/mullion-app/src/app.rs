@@ -315,8 +315,15 @@ pub enum UserEvent {
     ///
     /// 按世代路由(S1):高延迟链路上列一次目录要好几百毫秒,用户完全可能
     /// 已经切了标签 —— 结果必须回到发起它的那个标签。标签没了就丢弃。
+    ///
+    /// `seq`/`dst`/`clip` 是复核 C1/I2/I1 之后补的:**发起那一刻冻结**的
+    /// 序号 / 目标目录 / 剪贴板快照,而不是让 `accept_paste_check` 在结果
+    /// 回来时重新去读面板此刻的状态。理由见 `start_paste` 的文档。
     PasteChecked {
         generation: u64,
+        seq: u64,
+        dst: mullion_ssh::sftp::RemotePath,
+        clip: crate::files::clip::RemoteClip,
         result: Result<Vec<mullion_ssh::sftp::RemotePath>, String>,
     },
 }
@@ -4539,11 +4546,18 @@ impl App {
     /// F220:发起一次粘贴。**三步里的前两步**:自身/子孙闸门 → 预检查。
     /// 第三步(弹框 / 直接执行)在 `UserEvent::PasteChecked` 里
     /// (`accept_paste_check` 接)。
+    ///
+    /// 复核 C1/I2:`dst`/`clip` 在**这里**冻结,原样随事件带走 ——
+    /// `accept_paste_check` 不再去读 `files.remote.cwd`/`files.clip`。
+    /// 用户按 Ctrl+V 那一刻,这次操作往哪儿粘、粘什么就已经定了;之后他
+    /// 在界面上怎么走(换目录、甚至点进源目录自己的子树),都不该改变一次
+    /// 已经发出去的操作的语义 —— 也让「预检查的对象」和「实际写入的对象」
+    /// 在结构上不可能不一致。
     fn start_paste(&mut self, generation: u64) {
-        let Some(tab) = self.tabs.by_generation(generation) else {
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
-        let Some(files) = tab.content.files_panel() else {
+        let Some(files) = tab.content.files_panel_mut() else {
             return;
         };
         let Some(clip) = files.clip.clone() else {
@@ -4578,6 +4592,13 @@ impl App {
             return;
         }
 
+        // 复核 I1:重入闸门。**不用布尔"正在检查中"标记** —— `wind_down`/
+        // 断线重连会直接 `abort()` 在途任务(T11),标记会永久卡住、这一栏
+        // 的粘贴从此彻底失效且没有自愈路径。序号法没有这个问题:卡住的旧
+        // 值不挡任何东西,`accept_paste_check` 只认「序号 == 面板当前值」
+        // 的结果,旧结果自然被丢弃。
+        let seq = files.remote.begin_paste();
+
         let Some(client) = tab.content.sftp_client() else {
             self.ui
                 .set_error("SFTP 通道还没建立,请先等目录加载完".into());
@@ -4590,7 +4611,13 @@ impl App {
                 .await
                 .map(|v| v.into_iter().map(|e| e.name).collect())
                 .map_err(|e| e.to_string());
-            let _ = proxy.send_event(UserEvent::PasteChecked { generation, result });
+            let _ = proxy.send_event(UserEvent::PasteChecked {
+                generation,
+                seq,
+                dst,
+                clip,
+                result,
+            });
         });
         self.track_sftp_task(generation, task);
         self.ui
@@ -4599,14 +4626,22 @@ impl App {
 
     /// F220:预检查回来了 —— 有冲突就弹批量框,没有就直接发。
     ///
-    /// **同目录复制必然全撞** → 直接走「保留两者」,不弹框:问用户
-    /// 「要不要覆盖自己」没有意义。
+    /// 只用**事件里冻结的** `dst`/`clip`(见 `start_paste` 的文档),不再
+    /// 去读 `files.remote.cwd`/`files.clip`:面板此刻的状态可能已经跟
+    /// 发起这次预检查时不一样了(复核 C1/I2)。`files` 在这里只用来读
+    /// `paste_seq` 校验这份结果有没有过期。
+    ///
+    /// 判定逻辑本身在 `decide_paste` 里(纯函数,值级可测 —— `App` 要
+    /// `EventLoopProxy` 才能构造,单测里造不出来,这个函数就是为了把能测
+    /// 的部分摘出来,不必受这条限制)。
     fn accept_paste_check(
         &mut self,
         generation: u64,
+        seq: u64,
+        dst: mullion_ssh::sftp::RemotePath,
+        clip: crate::files::clip::RemoteClip,
         result: Result<Vec<mullion_ssh::sftp::RemotePath>, String>,
     ) {
-        use crate::files::clip::{self, Policy};
         let existing: std::collections::BTreeSet<Vec<u8>> = match result {
             Ok(v) => v.into_iter().map(|n| n.as_bytes().to_vec()).collect(),
             Err(msg) => {
@@ -4621,37 +4656,45 @@ impl App {
         else {
             return;
         };
-        let Some(clip) = files.clip.clone() else {
-            return;
-        };
-        let dst = files.remote.cwd.clone();
-        let same_dir = clip.items.iter().all(|(src, _)| src.parent() == dst);
-        let hits = clip::conflicts(&clip.items, &existing);
-        if hits.is_empty() || (same_dir && clip.mode == clip::ClipMode::Copy) {
-            let policy = if same_dir {
-                Policy::KeepBoth
-            } else {
-                Policy::Overwrite
-            };
-            self.dispatch_paste(generation, policy);
-            return;
+        match decide_paste(files.remote.paste_seq, seq, &dst, &clip, &existing) {
+            PasteDecision::Stale => {}
+            PasteDecision::Refused => {
+                self.ui.set_toast(
+                    crate::ui::toast::Kind::Warn,
+                    "不能粘到源目录自己或它的子目录里",
+                );
+            }
+            PasteDecision::Dispatch { policy } => {
+                self.dispatch_paste(generation, dst, clip, policy);
+            }
+            PasteDecision::Conflict { names, mode_is_cut } => {
+                self.ui.files_dialog = Some(crate::ui::files_dialog::FilesDialog::PasteConflict {
+                    names,
+                    mode_is_cut,
+                });
+                self.request_ui_redraw();
+            }
         }
-        self.ui.files_dialog = Some(crate::ui::files_dialog::FilesDialog::PasteConflict {
-            names: hits
-                .iter()
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .collect(),
-            mode_is_cut: clip.mode == clip::ClipMode::Cut,
-        });
-        self.request_ui_redraw();
     }
 
     /// F220:真正执行一次粘贴(`cp -a` 快路径 / SFTP 逐文件回退)。
     ///
     /// **本任务(B5)的桩** —— 整个函数体到 Task B7 会被替换掉。刻意不是
     /// 静默空函数:什么都不做又不吭声,用户选完冲突处置会以为粘贴丢了。
-    fn dispatch_paste(&mut self, generation: u64, policy: crate::files::clip::Policy) {
-        log::warn!("F220:粘贴执行尚未接通(generation={generation},policy={policy:?},留给 B7)");
+    ///
+    /// `dst`/`clip` 由调用方传入(冻结自 `start_paste`),B7 接手时**不要**
+    /// 改成在这里重新读面板状态 —— 那正是复核 C1/I2 打回来的那个错。
+    fn dispatch_paste(
+        &mut self,
+        generation: u64,
+        dst: mullion_ssh::sftp::RemotePath,
+        clip: crate::files::clip::RemoteClip,
+        policy: crate::files::clip::Policy,
+    ) {
+        log::warn!(
+            "F220:粘贴执行尚未接通(generation={generation},dst={dst:?},items={},policy={policy:?},留给 B7)",
+            clip.items.len()
+        );
     }
 
     /// F139:把一条书签写进会话配置,并同步这个标签的内存副本。
@@ -9120,8 +9163,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.on_edit_saved(key, result);
                 self.request_ui_redraw();
             }
-            UserEvent::PasteChecked { generation, result } => {
-                self.accept_paste_check(generation, result);
+            UserEvent::PasteChecked {
+                generation,
+                seq,
+                dst,
+                clip,
+                result,
+            } => {
+                self.accept_paste_check(generation, seq, dst, clip, result);
                 self.request_ui_redraw();
             }
         }
@@ -11019,6 +11068,70 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// F220:`accept_paste_check` 落地一次预检查结果该怎么办 —— 摘成纯函数
+/// 只是为了能单测(`App` 要 `EventLoopProxy` 才能构造,见上面
+/// `apply_layout_actions` 同样的理由)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasteDecision {
+    /// 复核 I1:序号对不上,这份结果已经过期(用户又按了一次 Ctrl+V,
+    /// 或换了目录/标签)—— 静默丢弃,不落地。
+    Stale,
+    /// 复核 C1:纵深防御。命中说明目标是源自身或其子孙 —— 理论上冻结
+    /// 之后这里恒不触发(`start_paste` 已经拦过一次),但不能只信一次
+    /// 上游判断。
+    Refused,
+    /// 没有撞名(或同目录复制,那样必然全撞、问「要不要覆盖自己」没意义)——
+    /// 直接派发。
+    Dispatch { policy: crate::files::clip::Policy },
+    /// 撞名了,要弹批量框问一次。
+    Conflict {
+        names: Vec<String>,
+        mode_is_cut: bool,
+    },
+}
+
+/// F220:纯决策 —— **只吃事件里冻结的 `dst`/`clip`,不吃任何"面板现在的
+/// 状态"**:这个签名本身就是「不许重新读」这条判据的类型层强制,它压根
+/// 没拿到 `PanelFrame`,想重新读都读不到(复核 C1/I2)。
+///
+/// `current_seq` 是面板此刻的 `PaneState::paste_seq`,`seq` 是这份结果
+/// 发起时冻结的那个值(复核 I1)。
+fn decide_paste(
+    current_seq: u64,
+    seq: u64,
+    dst: &mullion_ssh::sftp::RemotePath,
+    clip: &crate::files::clip::RemoteClip,
+    existing: &std::collections::BTreeSet<Vec<u8>>,
+) -> PasteDecision {
+    use crate::files::clip::{conflicts, is_within, ClipMode, Policy};
+    if seq != current_seq {
+        return PasteDecision::Stale;
+    }
+    let same_dir = clip.items.iter().all(|(src, _)| src.parent() == *dst);
+    let hits = conflicts(&clip.items, existing);
+    if hits.is_empty() || (same_dir && clip.mode == ClipMode::Copy) {
+        // 复核 C1:`dispatch_paste` 之前再跑一遍 `is_within`。冻结之后这里
+        // 理论上恒不命中,但这道闸门本来就是本切片挖出来的教训(远端 `cp`
+        // 会拦,SFTP 回退没有)——不能只靠一次上游判断管到底。
+        if clip.items.iter().any(|(src, _)| is_within(src, dst)) {
+            return PasteDecision::Refused;
+        }
+        let policy = if same_dir {
+            Policy::KeepBoth
+        } else {
+            Policy::Overwrite
+        };
+        return PasteDecision::Dispatch { policy };
+    }
+    PasteDecision::Conflict {
+        names: hits
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect(),
+        mode_is_cut: clip.mode == ClipMode::Cut,
+    }
+}
+
 /// 本帧 UI 产生的布局动作(点了工具栏的预设按钮 / 点了某个 pane 标题条的 ×)
 /// 路由到 `Workspace` 上。只碰 `&mut Workspace`,不碰 `App` 的 `_runtime`/
 /// `proxy` 字段 —— 这是刻意的:`EventLoopProxy` 在本仓库的无头测试容器里
@@ -12543,15 +12656,15 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         attach_check_verdict, auto_dial_summary, automation_for_leaf, autoscroll_for_pane,
         blink_on_at, blink_wake_at, clear_leaf_attach_intent, credential_delete_error,
-        download_job, drive_attach_checks_of, effective_focus_of, expand_tilde,
+        decide_paste, download_job, drive_attach_checks_of, effective_focus_of, expand_tilde,
         files_owner_generation_of, files_path_editing_of, files_start_dir, finish_password_change,
         font_px_for, has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
         new_pane_emulator, next_auto_dial, next_panel_selection_index, pane_still_wanted,
         place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback, should_check_attach,
         snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
         take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
-        wind_down, AttachCheck, AttachVerdict, Modal, RehostKind, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent,
+        wind_down, AttachCheck, AttachVerdict, Modal, PasteDecision, RehostKind, RestoredTab,
+        SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -13111,6 +13224,88 @@ mod tests {
             body.contains(".by_generation(generation)"),
             "accept_paste_check 没按世代查属主标签 —— 迟到的预检查结果会\
              落到当前活动标签,而不是发起粘贴的那个标签"
+        );
+    }
+
+    /// 复核 C1/I2:`accept_paste_check` 只能用 `PasteChecked` 事件里冻结的
+    /// `dst`/`clip`,不许再去读 `files.remote.cwd`/`files.clip` —— 等待
+    /// 预检查回来的这段时间里,用户完全可能已经换了目录(甚至换成源目录
+    /// 自己的子树)或改了剪贴板,重新读会让"预检查检验的对象"和"实际
+    /// 派发的对象"不是同一个,`is_within` 闸门形同虚设。
+    ///
+    /// **扎的是源码结构**:判定逻辑本身已经摘成 `decide_paste`(纯函数,
+    /// 见下面两条值级测试),但"`accept_paste_check` 到底把哪个 `dst`/
+    /// `clip` 递给它"是一个纯粹的接线问题 —— 没有 `PanelFrame` 就没法从
+    /// 值级测试的角度构造"面板状态被改过"这件事本身,`App` 又造不出来,
+    /// 只能退回源码切片核对接线没有重新搭回旧路。
+    ///
+    /// 自证会变红:在 `accept_paste_check` 里加回
+    /// `let dst = files.remote.cwd.clone();` 或 `files.clip.clone()`。
+    #[test]
+    fn accept_paste_check_never_rereads_the_live_panel_state() {
+        let body = body_of(prod_src(), "fn accept_paste_check(");
+        assert!(
+            !body.contains("files.remote.cwd"),
+            "accept_paste_check 又在从面板重新读目标目录 —— 应该用事件里\
+             冻结的那个 dst"
+        );
+        assert!(
+            !body.contains("files.clip"),
+            "accept_paste_check 又在从面板重新读剪贴板 —— 应该用事件里\
+             冻结的那份 clip"
+        );
+    }
+
+    /// 复核 I1:重入闸门。序号过期(用户又按了一次 Ctrl+V,或换了目录/
+    /// 标签)的 `PasteChecked` 必须被丢弃,不能落地成弹框或派发 —— 哪怕
+    /// 它带的 `dst`/`clip`/`existing` 单看都合法。
+    ///
+    /// 值级测试:`decide_paste` 是纯函数,不需要 `App`。
+    ///
+    /// 自证会变红:把 `decide_paste` 里 `if seq != current_seq` 那句删掉。
+    #[test]
+    fn decide_paste_drops_a_result_whose_sequence_has_gone_stale() {
+        let dst = mullion_ssh::sftp::RemotePath::from_bytes(b"/data/dst".to_vec());
+        let clip = crate::files::clip::RemoteClip {
+            mode: crate::files::clip::ClipMode::Copy,
+            items: vec![(
+                mullion_ssh::sftp::RemotePath::from_bytes(b"/data/src/a.txt".to_vec()),
+                false,
+            )],
+        };
+        let existing = std::collections::BTreeSet::new();
+        assert_eq!(
+            decide_paste(5, 3, &dst, &clip, &existing),
+            PasteDecision::Stale,
+            "序号(3)跟面板当前值(5)对不上,这份结果已经过期,应该被丢弃"
+        );
+    }
+
+    /// 复核 C1:纵深防御。`dispatch_paste` 前要再对"即将真正写入的那个
+    /// `dst`"跑一遍 `is_within` —— 冻结之后这里理论上恒不命中,但不能只
+    /// 信 `start_paste` 那一次判断。构造一个"没有撞名"(会让 `hits.is_empty()`
+    /// 直接放行)但目标其实落在源目录子树里的场景,验证这道闸门真的拦下来了。
+    ///
+    /// 值级测试:`decide_paste` 是纯函数,不需要 `App`。
+    ///
+    /// 自证会变红:把 `decide_paste` 里那次 `is_within` 重跑删掉。
+    #[test]
+    fn decide_paste_refuses_a_frozen_destination_inside_the_source_subtree() {
+        let src = mullion_ssh::sftp::RemotePath::from_bytes(b"/data/src".to_vec());
+        // dst 落在 src 的子树里 —— 冻结前 start_paste 本该拦下,这里假设
+        // 它万一没拦住,验证 decide_paste 自己这道闸门补得上。
+        let dst = mullion_ssh::sftp::RemotePath::from_bytes(b"/data/src/sub".to_vec());
+        let clip = crate::files::clip::RemoteClip {
+            mode: crate::files::clip::ClipMode::Copy,
+            items: vec![(src, true)],
+        };
+        // 目标目录里空空如也 —— 没有 `is_within` 这道闸门的话,`hits.is_empty()`
+        // 会直接放行成 `Dispatch`。
+        let existing = std::collections::BTreeSet::new();
+        assert_eq!(
+            decide_paste(1, 1, &dst, &clip, &existing),
+            PasteDecision::Refused,
+            "目标目录在源目录自己的子树里,即使没有撞名也不该放行"
         );
     }
 
