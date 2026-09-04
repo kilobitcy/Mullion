@@ -74,6 +74,12 @@ pub enum FileAction {
         from: mullion_ssh::sftp::RemotePath,
         to: mullion_ssh::sftp::RemotePath,
     },
+    /// F219:就地新建文件提交。**绝对路径**,在面板里用同一个 `cwd` 拼好 ——
+    /// 理由与 `Rename` 逐字相同:从开始输入到敲回车中间用户完全可能换了
+    /// 目录,app 侧再拿「当前 cwd」去拼就是在另一个目录里建文件。
+    ///
+    /// 名字已经过 `files_dialog::validate_name` 与「目录里没有同名」两道闸。
+    NewFile(mullion_ssh::sftp::RemotePath),
 }
 
 /// F139:画书签相关控件要的两样东西。
@@ -409,6 +415,13 @@ fn path_edit_id(id: &str) -> egui::Id {
 /// 连同键盘焦点一起消失。
 fn rename_edit_id(id: &str) -> egui::Id {
     egui::Id::new(("files-rename-edit", id))
+}
+
+/// F219:新建输入框的 egui id。与 `rename_edit_id` 分开 —— 同 id 的两个
+/// `TextEdit` 会共享 egui 的 `TextEditState`(选区/光标位置),互相把对方的
+/// 选区改掉。
+fn new_edit_id(id: &str) -> egui::Id {
+    egui::Id::new(("files-new", id))
 }
 
 /// F201:让 `id` 那个编辑框下一帧一进来就整条选中。
@@ -798,19 +811,35 @@ pub fn show(
     let mut renaming = state.rename_edit.take();
     // `None` = 还在编辑;`Some(None)` = 放弃;`Some(Some(name))` = 提交。
     let mut rename_done: Option<Option<String>> = None;
+    // F219:新建缓冲同理先挪出来 —— 与改名互斥,同一帧最多一个是 `Some`。
+    let mut newing = state.new_edit.take();
+    let mut new_done: Option<Option<String>> = None;
+    // 幽灵行占不占第 0 行。**行数与索引偏移共用这一个值** —— 两处各写一遍
+    // 必然有一处漏改,而漏改的症状是点某一行打到另一个文件上。
+    let new_row = usize::from(newing.is_some());
     // F218:待滚动的那一条。**必须在 `state.rows()` 之前 `take`** —— `rows`
     // 借着 `&state.entries` 不放,之后再动 `&mut state` 借用检查就过不了。
     let scroll_to = state.scroll_to.take();
     let rows = state.rows();
+    // F219:本地判重用。**按 `entries` 而不是 `rows`** —— 隐藏文件也占名字,
+    // 关着隐藏开关时建一个 `.env` 照样会撞上服务端那条。
+    let taken: std::collections::BTreeSet<Vec<u8>> = state
+        .entries
+        .iter()
+        .map(|e| e.name.as_bytes().to_vec())
+        .collect();
     // F218:把待滚动的那一条换算成视口偏移。`show_rows` 是虚拟滚动,目标行
     // 多半根本没被画出来,拿不到 `Response` 去 `scroll_to_rect` —— 行高恒定,
     // 直接算偏移是这里唯一可行的办法。
     //
     // 减半屏是刻意的:贴着视口顶端的那一条看着像「列表就是从这儿开始的」,
     // 摆在中间才看得出上下文。`max(0)` 兜住短目录(算出来是负的)。
+    //
+    // F219:目标行前面可能多了一条幽灵行,行号要加上 `new_row` 才对得上
+    // `show_rows` 实际画出来的位置。
     let scroll_offset = scroll_to.and_then(|name| {
         let ix = rows.iter().position(|e| e.name == name)?;
-        Some((ix as f32 * ROW_H - body_h / 2.0).max(0.0))
+        Some(((ix + new_row) as f32 * ROW_H - body_h / 2.0).max(0.0))
     });
     // `rows` 借着 `&state.entries` 不放(它是 `Vec<&Entry>`),闭包里不能再
     // 借一次 `&mut state`——新选中的那条先记局部变量,出了闭包再落回 `state`。
@@ -853,6 +882,14 @@ pub fn show(
     if let Some(y) = scroll_offset {
         area = area.vertical_scroll_offset(y);
     }
+    // F219:输入行在第一行 —— 用户此刻多半滚在目录中段,不钉的话他看不见
+    // 自己刚打开的那个框。**只在进新建态那一帧钉**(`focus_pending` 恰好
+    // 就是那一帧的标记),无条件钉的话新建态期间滚轮就废了。放在 F218 那条
+    // 之后:两者都命中时(理论上不会同时发生,`new_edit`/`reveal_pick` 没有
+    // 共同触发点),新建态优先。
+    if newing.as_ref().is_some_and(|n| n.focus_pending) {
+        area = area.vertical_scroll_offset(0.0);
+    }
     area
         // F58:**必须关掉**。`drag_to_scroll` 默认开着,它在视口上注册一个
         // 吃 drag 的部件,把按在行上的那一下抢去当滚动手势 —— 行的
@@ -860,14 +897,38 @@ pub fn show(
         // 也没人用鼠标拖内容滚动(滚轮 + 滚动条都在),关掉不损失什么。
         .drag_to_scroll(false)
         .auto_shrink([false, false])
-        .show_rows(ui, ROW_H, rows.len(), |ui, range| {
+        .show_rows(ui, ROW_H, rows.len() + new_row, |ui, range| {
             // F136:**必须显式要这个宽度**。egui 0.30 的 `show_rows` 只
             // `set_height`,宽度全看内容自己撑 —— 空目录(range 为空)时一行
             // 都不画,`content_size.x` 恒等于视口宽,水平滚动条不出现,
             // 右边那几列的列头就永远滚不到。
             ui.set_min_width(total_w);
             for ix in range {
-                let e = rows[ix];
+                // F219:第 0 行是幽灵行(仅当 `new_row == 1`)—— 画新建输入框,
+                // 不接任何别的交互,也不去 `rows` 里取(它压根不对应任何条目)。
+                // 下面每一条真实行的下标都要减去 `new_row` 才对得上 ——
+                // 漏改的症状是点第二行选中第一个文件,而删除不可逆。
+                if ix == 0 && new_row == 1 {
+                    let n = newing.as_mut().expect("new_row == 1 时 newing 必为 Some");
+                    let trimmed = n.buf.trim().as_bytes();
+                    let extra_err = (!trimmed.is_empty() && taken.contains(trimmed))
+                        .then_some("已经有同名的文件/目录了");
+                    if let Some(done) = name_edit_row(
+                        ui,
+                        t,
+                        new_edit_id(id),
+                        cols,
+                        column,
+                        &mut n.buf,
+                        &mut n.focus_pending,
+                        false,
+                        extra_err,
+                    ) {
+                        new_done = Some(done);
+                    }
+                    continue;
+                }
+                let e = rows[ix - new_row];
                 // F200:这一行正在改名 —— 画输入框,别的交互一概不接
                 // (拖拽/双击/右键落在输入框上没有意义)。
                 if renaming.as_ref().is_some_and(|r| r.from == e.name) {
@@ -939,6 +1000,19 @@ pub fn show(
                 }
             }
         });
+    // F219:新建的收尾。放在改名收尾与 `click_row` 之前 —— 两个输入框互斥,
+    // 同一帧最多一个有结果;提交那一下同时也是「点了别处」,先把动作定下来
+    // 再让点击去改选中态。
+    match new_done {
+        // 还在编辑:原样放回去。
+        None => state.new_edit = newing,
+        // 放弃:什么都不发,新建态就此消失。
+        Some(None) => {}
+        Some(Some(name)) => {
+            // **路径在这里拼**,用的是这一帧的 `state.cwd`。
+            action = Some(FileAction::NewFile(state.cwd.join(name.as_bytes())));
+        }
+    }
     // F200:改名的收尾。放在 `click_row` 之前 —— 提交那一下同时也是
     // 「点了别处」,先把动作定下来再让点击去改选中态。
     match rename_done {
@@ -1150,18 +1224,33 @@ fn header_at(
     }
 }
 
-/// F200:改名态下的那一行 —— 名称列换成一个输入框,其余列不画
+/// F200/F219:就地编辑一行的名字 —— 名称列换成一个输入框,其余列不画
 /// (右边那几列会被输入框挤走大半,画出来只是干扰)。
 ///
+/// 改名(`rename_row`)与新建(F219 幽灵行)共用这一份实现,而不是各写
+/// 一遍:「焦点一次性消费」「高度必须正好 `ROW_H`」这两条前提两边都要,
+/// 各写一遍必然漂移(改对了改名那边,新建那边悄悄漏改)。
+///
+/// `preselect_stem`:改名要预选中主干、留下扩展名(见 `rename_stem_len`);
+/// 新建的缓冲进来是空的,没有「主干」这回事,原样选中(空选区)即可。
+///
+/// `extra_err`:调用方自己那道额外校验(新建那条路上是「目录里已经有同名
+/// 的」)。与 `validate_name` 的错**一样处理**:画红框、悬停说原因、回车
+/// 不提交也不退出编辑态。
+///
 /// 返回这一帧的去向:`None` = 还在编辑;`Some(None)` = 放弃;
-/// `Some(Some(name))` = 提交这个名字(**已经过 `validate_name`**)。
-fn rename_row(
+/// `Some(Some(name))` = 提交这个名字(**已经过 `validate_name` 与 `extra_err`**)。
+#[allow(clippy::too_many_arguments)] // 两个调用方各自的校验/预选策略不同,拆不掉
+fn name_edit_row(
     ui: &mut Ui,
     t: &Theme,
-    id: &str,
+    edit_id: egui::Id,
     cols: &ColWidths,
     column: PanelColumn,
-    r: &mut crate::files::state::RenameEdit,
+    buf: &mut String,
+    focus_pending: &mut bool,
+    preselect_stem: bool,
+    extra_err: Option<&'static str>,
 ) -> Option<Option<String>> {
     // 行宽与 `row()` 同源(见那里的说明:总宽与视口宽取大者)。
     let w = content_w(cols, column).max(ui.available_width());
@@ -1170,7 +1259,9 @@ fn rename_row(
     // 「改的是这一行」。
     ui.painter()
         .rect_filled(row_rect, 2.0, theme::selection_fill(t));
-    let err = crate::ui::files_dialog::validate_name(&r.buf).err();
+    let err = crate::ui::files_dialog::validate_name(buf)
+        .err()
+        .or(extra_err);
     // 输入框对齐名称列 —— 用户眼里那个名字**原地**变成可编辑的,视线不用挪。
     //
     // **高度必须正好是 `ROW_H`**:`Ui::put` 收尾会按子 ui 的 `min_rect`
@@ -1184,15 +1275,22 @@ fn rename_row(
     );
     let resp = ui.put(
         name_rect,
-        egui::TextEdit::singleline(&mut r.buf)
-            .id(rename_edit_id(id))
+        egui::TextEdit::singleline(buf)
+            .id(edit_id)
             .margin(egui::Margin::symmetric(2.0, 0.0)),
     );
-    if r.focus_pending {
-        r.focus_pending = false;
-        // F200:预选中主干、留下扩展名。只在**进编辑态那一刻**调一次 ——
-        // 每帧调的话用户拖出来的选区会被反复覆盖(同 `select_all` 的文档)。
-        select_all(ui.ctx(), rename_edit_id(id), rename_stem_len(&r.buf));
+    if *focus_pending {
+        *focus_pending = false;
+        // 预选中主干、留下扩展名(改名);新建的空缓冲没有主干,原样选中
+        // (空缓冲选区长度恒为 0,等价于什么都不选)。只在**进编辑态那一刻**
+        // 调一次 —— 每帧调的话用户拖出来的选区会被反复覆盖(同 `select_all`
+        // 的文档)。
+        let sel_len = if preselect_stem {
+            rename_stem_len(buf)
+        } else {
+            buf.chars().count()
+        };
+        select_all(ui.ctx(), edit_id, sel_len);
         resp.request_focus();
     }
     if let Some(why) = err {
@@ -1220,9 +1318,32 @@ fn rename_row(
             resp.request_focus();
             return None;
         }
-        return Some(Some(r.buf.trim().to_string()));
+        return Some(Some(buf.trim().to_string()));
     }
     None
+}
+
+/// F200:改名态下的那一行 —— 转发给共用实现 `name_edit_row`。见那里的
+/// 文档注释。
+fn rename_row(
+    ui: &mut Ui,
+    t: &Theme,
+    id: &str,
+    cols: &ColWidths,
+    column: PanelColumn,
+    r: &mut crate::files::state::RenameEdit,
+) -> Option<Option<String>> {
+    name_edit_row(
+        ui,
+        t,
+        rename_edit_id(id),
+        cols,
+        column,
+        &mut r.buf,
+        &mut r.focus_pending,
+        true,
+        None,
+    )
 }
 
 fn row(
@@ -2453,6 +2574,242 @@ mod tests {
         );
     }
 
+    /// F219:新建态下列表**第一行**是输入框 —— 看不见的输入框等于没有。
+    ///
+    /// 直接调 `show()`(同 `a_long_name_is_elided_so_it_cannot_reach_the_size_column`
+    /// 的驱动方式,不经 `content()`)才能拿到渲染出的 `FullOutput::shapes`
+    /// 去找文字 —— `rename_harness` 的 `run` 只把 `Option<FileAction>` 带出来。
+    ///
+    /// 只查输入框存在还不够(那样测不出「占的是第一行」):还要求
+    /// `notes.txt`/`other.txt` 两条真实行都还画得出来,且都排在幽灵行**下面**。
+    ///
+    /// 自证会变红:把 `show_rows` 的行数从 `rows.len() + new_row` 改回
+    /// `rows.len()`——幽灵行会占用本该属于 `other.txt` 的那个槽位,
+    /// `other.txt` 从渲染结果里彻底消失。
+    #[test]
+    fn the_new_file_editor_occupies_the_first_row_of_the_list() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![
+            entry(b"notes.txt", EntryKind::File),
+            entry(b"other.txt", EntryKind::File),
+        ];
+        state.load = Load::Ready;
+        assert!(state.begin_new_file(), "前提:该进得了新建态");
+
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(raw(None), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        BookmarkView::none(),
+                        0,
+                        &mut cols,
+                    );
+                });
+            }));
+        }
+        let out = out.expect("跑了两帧");
+        let ghost_rect = ctx
+            .read_response(new_edit_id("远端"))
+            .expect("第一行没画出新建输入框 —— 看不见的输入框等于没有")
+            .rect;
+        let notes_pos =
+            find_text_pos(&out.shapes, "notes.txt").expect("notes.txt 该被画出来(没被幽灵行顶掉)");
+        let other_pos =
+            find_text_pos(&out.shapes, "other.txt").expect("other.txt 该被画出来(没被幽灵行顶掉)");
+        assert!(
+            notes_pos.y > ghost_rect.top(),
+            "notes.txt 没有被排在幽灵行下面"
+        );
+        assert!(other_pos.y > notes_pos.y, "other.txt 该排在 notes.txt 下面");
+    }
+
+    /// F219 最容易静默错行的一处:幽灵行占了第 0 行之后,**下面每一行的
+    /// 索引都要 -1**。错了就是点第二行选中第一个文件 —— 而删除不可逆。
+    ///
+    /// 判据是「点哪一行、光标落到谁身上」,不是「画了几行」——后者在索引
+    /// 错位时照样绿。技术上照抄 `a_row_in_the_tab_host_can_actually_be_clicked`:
+    /// 从真实渲染结果里找到文字的屏幕坐标,点下去看光标停在哪条身份上——
+    /// 比按几何公式推算下一行的 y 坐标更直接,不会因为输入框的内边距/描边
+    /// 差一点点就跟着算错。
+    ///
+    /// 自证会变红:把行体里的 `rows[ix - new_row]` 改回 `rows[ix]`。
+    #[test]
+    fn rows_below_the_ghost_row_still_map_to_the_right_entry() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![
+            entry(b"notes.txt", EntryKind::File),
+            entry(b"other.txt", EntryKind::File),
+        ];
+        state.load = Load::Ready;
+        assert!(state.begin_new_file(), "前提:该进得了新建态");
+
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, state: &mut PaneState| {
+            let mut action = None;
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        BookmarkView::none(),
+                        0,
+                        &mut cols,
+                    );
+                });
+            });
+            (action, out)
+        };
+        // 两帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop)。
+        let _ = render(raw(None), &mut state);
+        let (_, out) = render(raw(None), &mut state);
+
+        let other_pos = find_text_pos(&out.shapes, "other.txt")
+            .expect("other.txt 该被画出来(幽灵行下面第二条)");
+
+        // 只点**一下**、点在最靠下的那一行(other.txt,rows 里下标 1、
+        // 画在幽灵行下面第二格,ix == 2):
+        // 点别处会让空缓冲的幽灵行判定成「放弃编辑」而消失(`name_edit_row`
+        // 的 `clicked_elsewhere` 分支),消失之后行号偏移跟着变,第二下点
+        // 击就测不出「幽灵行还在时偏移对不对」了 —— 一步到位才压得住
+        // `rows[ix - new_row]` 这处偏移。
+        //
+        // 按/松在**同一帧**里发出(同 `right_clicking_the_remote_column_
+        // opens_a_menu_that_can_dispatch_an_ask` 那条直接调 `show()` 的既有
+        // 测试同款手法)。
+        let mut input = raw(None);
+        input.events.push(egui::Event::PointerButton {
+            pos: other_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos: other_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let _ = render(input, &mut state);
+        assert_eq!(
+            state.cursor.as_ref().map(|p| p.display().into_owned()),
+            Some("other.txt".to_string()),
+            "点在画出来的 other.txt 上,光标却没落到它身上 —— 索引偏移算错了"
+        );
+    }
+
+    /// F219:名字非法(空 / 含 `/` / `.` / `..`)时**不提交**,输入框留着。
+    ///
+    /// 自证会变红:去掉 `name_edit_row` 里的 `validate_name` 判断(动作被
+    /// 发出),或校验失败时也 `take()` 掉新建态(输入框和用户敲的字一起消失)。
+    #[test]
+    fn an_invalid_new_name_is_not_submitted() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        assert!(frame.remote.begin_new_file(), "前提:该进得了新建态");
+        for _ in 0..2 {
+            run(&ctx, &mut frame, vec![]);
+        }
+        frame.remote.new_edit.as_mut().unwrap().buf = "../etc/passwd".into();
+        let act = run(
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(act, None, "含 / 的名字被放行了 —— 会打到另一个目录去");
+        assert_eq!(
+            frame.remote.new_edit.as_ref().map(|n| n.buf.as_str()),
+            Some("../etc/passwd"),
+            "校验失败却把新建态和用户敲的字一起丢了"
+        );
+    }
+
+    /// F219:目录里已经有同名的 → 也不提交。这件事本地就知道,不必往返
+    /// 一趟等服务端回 Failure(A1 的 `create_file` 带 `EXCLUDE`,撞名会失败,
+    /// 但让用户敲完字才发现,不如客户端直接挡)。
+    ///
+    /// 自证会变红:去掉传给幽灵行的 `taken` 判重(`extra_err` 恒 `None`)。
+    #[test]
+    fn a_new_name_that_collides_with_an_existing_entry_is_not_submitted() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        assert!(frame.remote.begin_new_file(), "前提:该进得了新建态");
+        for _ in 0..2 {
+            run(&ctx, &mut frame, vec![]);
+        }
+        // 前提:`notes.txt` 已经在 `rename_harness` 建好的目录里。
+        frame.remote.new_edit.as_mut().unwrap().buf = "notes.txt".into();
+        let act = run(
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(act, None, "撞名的新建被放行了");
+        assert_eq!(
+            frame.remote.new_edit.as_ref().map(|n| n.buf.as_str()),
+            Some("notes.txt"),
+            "撞名判定却把新建态和用户敲的字一起丢了"
+        );
+    }
+
+    /// F219:合法名字回车 → 发出 `NewFile`,路径是**当前 cwd 拼出来的绝对
+    /// 路径**(同 `Rename` 的理由:从开始输入到敲回车之间用户可能换过目录)。
+    #[test]
+    fn submitting_a_new_name_dispatches_new_file_with_an_absolute_path() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        assert!(frame.remote.begin_new_file(), "前提:该进得了新建态");
+        for _ in 0..2 {
+            run(&ctx, &mut frame, vec![]);
+        }
+        frame.remote.new_edit.as_mut().unwrap().buf = "fresh.txt".into();
+        let act = run(
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(
+            act,
+            Some(FileAction::NewFile(RemotePath::from_bytes(
+                b"/var/log/fresh.txt".to_vec()
+            ))),
+            "回车没发出新建"
+        );
+        assert!(frame.remote.new_edit.is_none(), "提交后还留在新建态");
+    }
+
     /// F137 的验收判据(列头):`row()` 那条只守行体,列头没有对应守护——
     /// 补的这一条。把「修改时间」列拖到窄于标题本身的宽度,标题必须被
     /// 截断到不超列宽,不能横穿到隔壁列头上面。
@@ -2600,7 +2957,10 @@ mod tests {
             .split_once("#[cfg(test)]")
             .expect("找不到 #[cfg(test)] 边界");
         assert!(
-            production.contains(".show_rows(ui, ROW_H, rows.len(),"),
+            // F219:幽灵行占位之后行数变成 `rows.len() + new_row`,不再是
+            // 裸的 `rows.len()`——更新这条守护匹配的字面串,理由与判据本身
+            // (走 `show_rows` 而不是全量扫描)不变。
+            production.contains(".show_rows(ui, ROW_H, rows.len() + new_row,"),
             "渲染必须走 show_rows 虚拟滚动,否则两万项目录会把帧时间打穿"
         );
     }

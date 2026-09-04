@@ -4204,6 +4204,12 @@ impl App {
                 log::warn!("本地栏收到了改名请求,已忽略(D5)");
                 return;
             }
+            // F219:同上 —— 本地栏根本进不了新建编辑态(`begin_new_file` 的
+            // 调用点只在远端那条路上,D5)。真正的分派在 Task A4 接。
+            FileAction::NewFile(_) => {
+                log::warn!("本地栏收到了新建文件请求,已忽略(D5)");
+                return;
+            }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
             FileAction::Transfer
             | FileAction::Drop(_)
@@ -4388,6 +4394,8 @@ impl App {
             | FileAction::BookmarkAdd { .. }
             | FileAction::BookmarkRemove { .. }
             | FileAction::Rename { .. } => return,
+            // F219:真正的分派在 Task A4 接。
+            FileAction::NewFile(_) => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
