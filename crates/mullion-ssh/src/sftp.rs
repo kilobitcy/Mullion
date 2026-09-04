@@ -392,6 +392,32 @@ impl SftpClient {
         })
     }
 
+    /// 读一条符号链接指向哪里(F220)。**只对已知是链接的路径调用**——
+    /// `stat`(lstat 语义)恒返回 `link_target: None`,只有 `list_dir` 的
+    /// readdir 顺带做过一次 `readlink`;这里补的是「拿到的路径不是来自
+    /// 某次 `list_dir`」的那种场景(比如粘贴的源就是一条链接本身)。
+    pub async fn read_link(&self, path: &RemotePath) -> Result<RemotePath, SftpError> {
+        let wire = path.as_wire()?;
+        let target = self
+            .inner
+            .read_link(wire)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        Ok(RemotePath::from_bytes(target.into_bytes()))
+    }
+
+    /// 建一条符号链接(F220):在 `path` 处新建一条指向 `target` 的链接。
+    /// `target` 原样写入,不做任何解析或归一化——它可以是相对路径,
+    /// 也可以指向一个当前并不存在的位置,这些都是符号链接本身允许的
+    /// 语义。**两个路径都要能发得出去**,理由同 [`SftpClient::rename`]。
+    pub async fn symlink(&self, path: &RemotePath, target: &RemotePath) -> Result<(), SftpError> {
+        let (p, t) = (path.as_wire()?, target.as_wire()?);
+        self.inner
+            .symlink(p, t)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))
+    }
+
     /// 打开一个远端文件**读**(F52)。
     ///
     /// 返回的 [`RemoteFile`] 分块读,进度由调用方按 `read_chunk` 的返回值

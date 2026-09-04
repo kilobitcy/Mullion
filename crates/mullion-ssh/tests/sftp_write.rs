@@ -660,3 +660,283 @@ fn copy_recursively_mirrors_the_tree_but_never_follows_a_symlink() {
         "源目录的链接不该被复制操作带走"
     );
 }
+
+// ---- 远端内复制/移动(F220/B3)---------------------------------------------
+
+use mullion_ssh::copy_tree::{transfer_into, CopyMode, TransferReport};
+
+/// F220 快路径:exec 可用时走一条 `cp -a`,**一条 SFTP 写请求都不发**。
+#[tokio::test]
+async fn a_paste_uses_the_exec_fast_path_when_it_is_allowed() {
+    let (addr, probe, tree_h) = common::spawn_sftp_server(nested_tree()).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+    let pairs = vec![(rp("/home/testuser/box"), rp("/home/testuser/box-copy"))];
+    let report = transfer_into(&sftp, &conn, &pairs, CopyMode::Copy, false)
+        .await
+        .expect("复制该成功");
+    assert_eq!(report, TransferReport::Exec);
+
+    let t = tree_h.lock().unwrap();
+    assert!(exists(&t, b"/home/testuser/box-copy"), "目标没建出来");
+    assert!(exists(&t, b"/home/testuser/box"), "复制不该动源");
+    let p = probe.lock().unwrap();
+    assert!(
+        p.paths_for("write").is_empty() && p.paths_for("mkdir").is_empty(),
+        "走了 exec 就不该再发逐文件的 SFTP 写请求:{:?}",
+        p.seen
+    );
+}
+
+/// F220 的核心:**exec 被拒时回退到 SFTP 逐文件递归**,而不是报错收场
+/// (sftp-only 账号上功能不能残缺)。
+#[tokio::test]
+async fn a_paste_falls_back_to_sftp_when_exec_is_refused() {
+    let (addr, _probe, tree_h) = common::spawn_sftp_server_without_exec(nested_tree()).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+    let pairs = vec![(rp("/home/testuser/box"), rp("/home/testuser/box-copy"))];
+    let report = transfer_into(&sftp, &conn, &pairs, CopyMode::Copy, false)
+        .await
+        .expect("回退该成功");
+    assert_eq!(report, TransferReport::Sftp);
+    let t = tree_h.lock().unwrap();
+    assert!(exists(&t, b"/home/testuser/box-copy"), "回退没把树建出来");
+}
+
+/// F220:文件内容要真的一样。只看「路径存在」是恒绿的 —— 一个建空文件的
+/// 实现照样通过。`nested_tree()` 里的文件节点都是 `Node::file`(标称
+/// 大小、无真实内容),这里现改一个真有内容的进去。
+#[tokio::test]
+async fn the_sftp_fallback_copies_the_bytes_not_just_the_names() {
+    let mut t0 = nested_tree();
+    let sub = t0
+        .get_mut(b"/home/testuser/box/sub".as_slice())
+        .expect("nested_tree() 该有 box/sub");
+    let deep = sub
+        .iter_mut()
+        .find(|n| n.name == b"deep.txt")
+        .expect("nested_tree() 的 box/sub 该有 deep.txt");
+    *deep = Node::file_with(b"deep.txt", b"deep content, not just a name");
+
+    let (addr, _probe, tree_h) = common::spawn_sftp_server_without_exec(t0).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+    let src = rp("/home/testuser/box/sub/deep.txt");
+    let dst = rp("/home/testuser/deep-copy.txt");
+    let before = {
+        let t = tree_h.lock().unwrap();
+        t.get(b"/home/testuser/box/sub".as_slice())
+            .expect("源目录该在")
+            .iter()
+            .find(|n| n.name == b"deep.txt")
+            .expect("源文件该在")
+            .data
+            .clone()
+    };
+    assert!(!before.is_empty(), "前提:源文件有内容");
+    transfer_into(&sftp, &conn, &[(src, dst)], CopyMode::Copy, false)
+        .await
+        .expect("复制该成功");
+    let t = tree_h.lock().unwrap();
+    let after = t
+        .get(b"/home/testuser".as_slice())
+        .expect("目标目录该在")
+        .iter()
+        .find(|n| n.name == b"deep-copy.txt")
+        .expect("目标文件该在")
+        .data
+        .clone();
+    assert_eq!(after, before, "拷过去的字节不一样");
+}
+
+/// F220:**绝不跟随符号链接** —— 跟进去等于把链接指向的整个目录复制一遍。
+/// 两条路都要验(同 F57 的那条守护)。
+///
+/// 只断言「没有把链接当目录跟进去」是不够的:「跟进去了」和「压根什么都
+/// 没建」都能让那条断言通过(B3 复核挖出的一个恒绿)。所以这里还要断言
+/// 「确实建出来一条符号链接,且目标与源链接一致」——一个把 `Symlink` 分支
+/// 改成空操作的实现会在这一条上真的红。
+#[tokio::test]
+async fn a_paste_never_follows_a_symlink_on_either_path() {
+    for without_exec in [true, false] {
+        let (addr, _probe, tree_h) = if without_exec {
+            common::spawn_sftp_server_without_exec(nested_tree()).await
+        } else {
+            common::spawn_sftp_server(nested_tree()).await
+        };
+        let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+        // nested_tree() 里 box 下那条指向 victim 的链接叫 `lnk`(不是 `link`)。
+        let link = rp("/home/testuser/box/lnk");
+        let report = transfer_into(
+            &sftp,
+            &conn,
+            &[(link, rp("/home/testuser/link-copy"))],
+            CopyMode::Copy,
+            false,
+        )
+        .await
+        .expect("复制链接本身该成功");
+        assert_eq!(
+            report,
+            if without_exec {
+                TransferReport::Sftp
+            } else {
+                TransferReport::Exec
+            },
+            "without_exec={without_exec} 时走的路不对,后面两条分支的判据就对不上号了"
+        );
+
+        let t = tree_h.lock().unwrap();
+        assert!(
+            !t.contains_key(&b"/home/testuser/link-copy".to_vec()),
+            "链接被当目录跟进去了(without_exec={without_exec}) —— 整个目标目录被复制了一遍"
+        );
+        let copied = t
+            .get(b"/home/testuser".as_slice())
+            .expect("父目录该在")
+            .iter()
+            .find(|n| n.name == b"link-copy")
+            .unwrap_or_else(|| {
+                panic!("目标该真的建出来,而不是什么都没做(without_exec={without_exec})")
+            });
+        assert_eq!(
+            copied.kind,
+            common::sftp_server::NodeKind::Symlink(b"/home/testuser/victim".to_vec()),
+            "复制出来的该是一条指向原目标的符号链接(without_exec={without_exec})"
+        );
+    }
+}
+
+/// F220:剪切 = 移动。源没了、目标有了。
+#[tokio::test]
+async fn a_cut_paste_moves_the_entry_instead_of_copying_it() {
+    for without_exec in [true, false] {
+        let (addr, _probe, tree_h) = if without_exec {
+            common::spawn_sftp_server_without_exec(nested_tree()).await
+        } else {
+            common::spawn_sftp_server(nested_tree()).await
+        };
+        let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+        let report = transfer_into(
+            &sftp,
+            &conn,
+            &[(rp("/home/testuser/box"), rp("/home/testuser/moved"))],
+            CopyMode::Move,
+            false,
+        )
+        .await
+        .expect("移动该成功");
+        if !without_exec {
+            assert_eq!(report, TransferReport::Exec, "exec 可用时该走快路径");
+        }
+        let t = tree_h.lock().unwrap();
+        assert!(exists(&t, b"/home/testuser/moved"), "目标没出现");
+        assert!(
+            !exists(&t, b"/home/testuser/box"),
+            "源还在(without_exec={without_exec}) —— 剪切变成了复制"
+        );
+    }
+}
+
+/// F220:脏名字(空格 / 单引号 / `$`)必须原样打到那条路径上 ——
+/// 引号漏一个就是远端任意命令执行。这条走的是 exec 快路径:显式断言
+/// `report == Exec`,否则「引号错了 → 假服务端解析失败 → 回 127 → 静默
+/// 退到 SFTP」也能让这条测试通过,而 exec 路径的转义从没被真正验过。
+#[tokio::test]
+async fn the_paste_fast_path_quotes_nasty_names_correctly() {
+    let mut t0 = nested_tree();
+    let key = b"/home/testuser/it's a $(x) file".to_vec();
+    t0.entry(b"/home/testuser".to_vec())
+        .or_default()
+        .push(common::sftp_server::Node::file(b"it's a $(x) file", 2));
+    let (addr, probe, tree_h) = common::spawn_sftp_server(t0).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+    let report = transfer_into(
+        &sftp,
+        &conn,
+        &[(RemotePath::from_bytes(key), rp("/home/testuser/copied"))],
+        CopyMode::Copy,
+        false,
+    )
+    .await
+    .expect("脏名字也该复制成功");
+    assert_eq!(report, TransferReport::Exec, "这条该走 exec 快路径");
+    let t = tree_h.lock().unwrap();
+    assert!(exists(&t, b"/home/testuser/copied"), "脏名字的引号处理错了");
+    let p = probe.lock().unwrap();
+    assert!(
+        p.paths_for("write").is_empty() && p.paths_for("mkdir").is_empty(),
+        "断言走了 exec 就不该有 SFTP 写请求,否则上面 report==Exec 的判据本身就没验实:{:?}",
+        p.seen
+    );
+}
+
+/// F220/B3 缺陷 2:`overwrite == true` 时,`cp -a`/`mv` 撞上一个**已存在的
+/// 非空目录**要整个替换掉它,而不是把源嵌进目标目录里
+/// (`cp -a src dst` 在 `dst` 已存在且是目录时的默认行为是拷成
+/// `dst/basename(src)`,`-f` 救不了这一种)。exec 快路径与 SFTP 回退
+/// 两条路的覆盖语义必须一致 —— 都验。
+#[tokio::test]
+async fn overwriting_an_existing_directory_replaces_it_instead_of_nesting_into_it() {
+    for without_exec in [true, false] {
+        let mut t0 = nested_tree();
+        // 目标已存在,且里面有一个源里没有的文件:覆盖后这个文件必须消失,
+        // 不然就是「嵌进去」而不是「替换」。
+        t0.entry(b"/home/testuser".to_vec())
+            .or_default()
+            .push(Node::dir(b"box-copy"));
+        t0.insert(
+            b"/home/testuser/box-copy".to_vec(),
+            vec![Node::file(b"stale.txt", 1)],
+        );
+
+        let (addr, probe, tree_h) = if without_exec {
+            common::spawn_sftp_server_without_exec(t0).await
+        } else {
+            common::spawn_sftp_server(t0).await
+        };
+        let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+        let report = transfer_into(
+            &sftp,
+            &conn,
+            &[(rp("/home/testuser/box"), rp("/home/testuser/box-copy"))],
+            CopyMode::Copy,
+            true,
+        )
+        .await
+        .expect("覆盖复制该成功");
+        assert_eq!(
+            report,
+            if without_exec {
+                TransferReport::Sftp
+            } else {
+                TransferReport::Exec
+            },
+            "without_exec={without_exec} 时走的路不对"
+        );
+
+        let t = tree_h.lock().unwrap();
+        let names: std::collections::BTreeSet<_> = names_in(&t, b"/home/testuser/box-copy")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            names,
+            [b"f1".to_vec(), b"sub".to_vec(), b"lnk".to_vec()]
+                .into_iter()
+                .collect(),
+            "覆盖后目标目录该只剩源的内容(without_exec={without_exec}):实际 {names:?}"
+        );
+        assert!(
+            !names.contains(b"stale.txt".as_slice()),
+            "旧内容没被清掉,说明是嵌进去了而不是替换(without_exec={without_exec})"
+        );
+        drop(t);
+        if !without_exec {
+            let p = probe.lock().unwrap();
+            assert!(
+                p.paths_for("write").is_empty() && p.paths_for("mkdir").is_empty(),
+                "覆盖走了 exec 就不该再发 SFTP 写请求:{:?}",
+                p.seen
+            );
+        }
+    }
+}

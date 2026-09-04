@@ -412,6 +412,26 @@ impl russh_sftp::server::Handler for SftpHandler {
         }
     }
 
+    /// F220 的 SFTP 回退路径要用它重建链接:`linkpath` 处新建一条指向
+    /// `targetpath` 的链接。父目录不存在就拒,与 `mkdir`/`open` 一致。
+    async fn symlink(
+        &mut self,
+        id: u32,
+        linkpath: String,
+        targetpath: String,
+    ) -> Result<Status, Self::Error> {
+        self.note("symlink", &linkpath);
+        let (dir, name) = split_last(linkpath.as_bytes());
+        let mut tree = self.tree.lock().unwrap();
+        if !tree.contains_key(&dir) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        tree.entry(dir)
+            .or_default()
+            .push(Node::link(&name, targetpath.as_bytes()));
+        Ok(ok_status(id))
+    }
+
     async fn lstat(
         &mut self,
         id: u32,

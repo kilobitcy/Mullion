@@ -3,6 +3,7 @@
 //! 架构不变量:本 crate 不依赖 core/term/app。
 
 pub mod config;
+pub mod copy_tree;
 pub mod dial;
 pub mod error;
 pub mod exec;

@@ -197,10 +197,14 @@ impl Handler for SftpSshHandler {
 
     /// 记下命令行;`allow_exec == false` 时直接拒(见该字段的文档)。
     ///
-    /// 允许执行时认两种形状:`rm -rf -- <路径…>`(F57)以及 `cp -a[f] --`/
-    /// `mv [-f] --`(F220,单对,或用 ` && ` 串起来的多对),并真的在内存树上
-    /// 执行。起一个真 shell 来解析命令行既不可能也没必要 —— 要验的是
-    /// 「转义对不对 + 回退判定对不对」,不是 shell 的实现。
+    /// 允许执行时认三种形状:`rm -rf -- <路径…>`(F57);`cp -a[f] --`/
+    /// `mv [-f] --`(F220 非覆盖,单对,或用 ` && ` 串起来的多对);以及
+    /// `rm -rf -- <dst> && cp -a -- <src> <dst>`(或 `mv`)这种「先清目标
+    /// 再放」的覆盖形状(F220,B3 修正——`cp -a`/`mv` 撞上已存在的目标
+    /// 目录时是嵌进去而不是替换,`-f` 救不了这一种,见 `copy_tree.rs` 模块
+    /// 文档),并真的在内存树上执行。起一个真 shell 来解析命令行既不可能
+    /// 也没必要 —— 要验的是「转义对不对 + 回退判定对不对」,不是 shell
+    /// 的实现。
     async fn exec_request(
         &mut self,
         channel: ChannelId,
@@ -232,8 +236,23 @@ impl Handler for SftpSshHandler {
                     }
                     0
                 }
-                // 认不出来的命令 —— 与真 shell 的 "command not found" 同码。
-                None => 127,
+                None => match parse_overwriting_copy_or_move(data) {
+                    Some((is_move, pairs)) => {
+                        let mut tree = self.tree.lock().unwrap();
+                        for (from, to) in pairs {
+                            // 先清目标再放,与 `rm -rf -- <dst> && cp/mv …`
+                            // 这条命令自己说的语义一致。
+                            remove_recursively(&mut tree, &to);
+                            copy_recursively(&mut tree, &from, &to);
+                            if is_move {
+                                remove_recursively(&mut tree, &from);
+                            }
+                        }
+                        0
+                    }
+                    // 认不出来的命令 —— 与真 shell 的 "command not found" 同码。
+                    None => 127,
+                },
             },
         };
         session.exit_status_request(channel, code)?;
@@ -348,6 +367,57 @@ pub(crate) fn parse_copy_or_move(cmd: &[u8]) -> Option<(bool, Vec<(Vec<u8>, Vec<
     Some((is_move?, out))
 }
 
+/// F220/B3:认覆盖形状 —— `rm -rf -- '<dst>' && cp -a -- '<src>' '<dst>'`
+/// (或同形的 `mv`),多对是同样两段一组、彼此再用 ` && ` 串起来。
+///
+/// 存在的理由:`cp -a src dst` / `mv src dst` 撞上一个已存在的目标目录时
+/// 是把 src 拷成 `dst/basename(src)`(嵌进去),不是替换 `dst`——`-f` 只
+/// 救得了「目标是已存在的文件」这一种。B3 的 `try_exec` 因此在
+/// `overwrite == true` 时不再走单纯的 `cp -af`/`mv -f`,而是先删目标、
+/// 再放,与 SFTP 回退路径(先 `remove_tree` 再拷)语义对齐。这里没有
+/// 复用 `parse_copy_or_move`:那个函数的一段对一对 `(src, dst)`,而这里
+/// 是两段对一对,混在一起解析容易两头都解错还看不出来,分开更看得清楚。
+///
+/// 每组第二段(cp/mv)的目标路径必须与第一段(rm)删的路径逐字节相同——
+/// 不同就说明拼错了,不认,回 127(与 `parse_copy_or_move` 认不出的命令
+/// 同样的失败方式)。
+#[allow(dead_code, clippy::type_complexity)]
+fn parse_overwriting_copy_or_move(cmd: &[u8]) -> Option<(bool, Vec<(Vec<u8>, Vec<u8>)>)> {
+    let segs = split_on(cmd, b" && ");
+    if segs.is_empty() || !segs.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut is_move = None;
+    let mut out = Vec::new();
+    for pair in segs.chunks_exact(2) {
+        let rm_rest = pair[0].strip_prefix(b"rm -rf -- ")?;
+        let rm_args = parse_quoted_args(rm_rest)?;
+        if rm_args.len() != 1 {
+            return None;
+        }
+        let (mv, rest) = if let Some(r) = strip_any(pair[1], &[b"mv -f -- ", b"mv -- "]) {
+            (true, r)
+        } else if let Some(r) = strip_any(pair[1], &[b"cp -af -- ", b"cp -a -- "]) {
+            (false, r)
+        } else {
+            return None;
+        };
+        if *is_move.get_or_insert(mv) != mv {
+            return None; // 一条命令里混着 cp 和 mv —— 实现出错了
+        }
+        let args = parse_quoted_args(rest)?;
+        if args.len() != 2 {
+            return None;
+        }
+        if args[1] != rm_args[0] {
+            // rm 删的和 cp/mv 写的目标不是同一条路径 —— 拼错了,不认。
+            return None;
+        }
+        out.push((args[0].clone(), args[1].clone()));
+    }
+    Some((is_move?, out))
+}
+
 /// 在内存树里递归删掉一条(目录连同整棵子树)。
 ///
 /// **不跟随符号链接**:只按树上的目录键往下走,链接节点没有自己的目录键,
@@ -382,12 +452,14 @@ fn remove_recursively(tree: &mut sftp_server::Tree, path: &[u8]) {
 /// 建出目标这一层的目录键,并对每个孩子递归。父目录/名字的切法用
 /// `sftp_server::split_last_pub` —— 自己再写一遍切法就会两边不一致。
 ///
-/// **目标已存在同名节点时的行为是未定义的**,B2 一条测试都没覆盖:实测会
-/// 在目标父目录里 push 出**同名双节点**(而 `exists()` 是 `.any()` 查找,
-/// 看不见双节点),目标是目录时还会被 `tree.insert(to, vec![])` 把原有内容
-/// **整个清空**。故意留着不补 —— 该怎么补取决于 B3 的 `try_exec` 最终怎么
-/// 拼覆盖命令(加 `-T`,还是先 `rm -rf` 再 `cp`),那两种真实语义要的树操作
-/// 是相反的,现在猜一个等于给还不存在的命令形状凭空建模。
+/// **目标已存在同名节点时,这个函数自己不做任何清理**:实测会在目标父
+/// 目录里 push 出同名双节点(而 `exists()` 是 `.any()` 查找,看不见双
+/// 节点),目标是目录时还会被 `tree.insert(to, vec![])` 把原有内容整个
+/// 清空。B3 落地后已经把这一层责任挪到了调用方:`exec_request` 在覆盖
+/// 形状(`rm -rf -- <dst> && cp/mv …`,见 `parse_overwriting_copy_or_move`)
+/// 下,会在调用这个函数**之前**先 `remove_recursively(&mut tree, &to)`
+/// 把目标清空,所以调用到这里时 `to` 已经不存在同名节点了 —— 这个函数
+/// 本身仍然不处理「目标已存在」这种输入,谁调用谁负责先清场。
 ///
 /// `pub(crate)`:B2 的守护测试要在 `sftp_write.rs` 里直接对内存树验它的
 /// 树操作(目录树 + 符号链接不跟随),不必等 B3 的协议层落地。
