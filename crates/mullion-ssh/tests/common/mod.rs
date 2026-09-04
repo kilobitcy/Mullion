@@ -322,8 +322,12 @@ fn strip_any<'a>(s: &'a [u8], prefixes: &[&[u8]]) -> Option<&'a [u8]> {
 pub(crate) fn parse_copy_or_move(cmd: &[u8]) -> Option<(bool, Vec<(Vec<u8>, Vec<u8>)>)> {
     let mut is_move = None;
     let mut out = Vec::new();
-    // ` && ` 分段。**按字节找**,路径里可能有奇怪字符,但 `shell_quote`
-    // 保证它们都在单引号里,不会构造出假的 ` && `。
+    // ` && ` 分段,**按字节找、不感知引号**。已知的失真:`shell_quote` 只
+    // 转义单引号本身,不转义空格和 `&`,所以文件名字面就含 ` && ` 时(真 shell
+    // 照样跑得好好的)这里会从引号中间切开、解析失败 → 假服务端回 127。
+    // 落到 B3 就是「以为对端没有 cp」的**假红**,不是假绿。现在不修:引号
+    // 感知的切法没有任何测试扎得住(没有调用方产得出这种输入),补了也是
+    // 一段没人验的代码;等真撞上再连着守护一起加。
     for seg in split_on(cmd, b" && ") {
         let (mv, rest) = if let Some(r) = strip_any(seg, &[b"mv -f -- ", b"mv -- "]) {
             (true, r)
@@ -377,6 +381,13 @@ fn remove_recursively(tree: &mut sftp_server::Tree, path: &[u8]) {
 /// 的末段,插进 `to` 的父目录;源是目录的话再 `tree.insert(to, vec![])`
 /// 建出目标这一层的目录键,并对每个孩子递归。父目录/名字的切法用
 /// `sftp_server::split_last_pub` —— 自己再写一遍切法就会两边不一致。
+///
+/// **目标已存在同名节点时的行为是未定义的**,B2 一条测试都没覆盖:实测会
+/// 在目标父目录里 push 出**同名双节点**(而 `exists()` 是 `.any()` 查找,
+/// 看不见双节点),目标是目录时还会被 `tree.insert(to, vec![])` 把原有内容
+/// **整个清空**。故意留着不补 —— 该怎么补取决于 B3 的 `try_exec` 最终怎么
+/// 拼覆盖命令(加 `-T`,还是先 `rm -rf` 再 `cp`),那两种真实语义要的树操作
+/// 是相反的,现在猜一个等于给还不存在的命令形状凭空建模。
 ///
 /// `pub(crate)`:B2 的守护测试要在 `sftp_write.rs` 里直接对内存树验它的
 /// 树操作(目录树 + 符号链接不跟随),不必等 B3 的协议层落地。
