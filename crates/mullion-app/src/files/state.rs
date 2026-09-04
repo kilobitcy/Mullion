@@ -39,6 +39,21 @@ pub struct RenameEdit {
     pub focus_pending: bool,
 }
 
+/// F219:一次就地**新建**的编辑态。
+///
+/// 与 `RenameEdit` 分开而不是加个 `kind` 字段:改名绑着一条**已存在的行**
+/// (`from` 是它的原名,`accept` 里那一行没了就得清掉),新建谁都不绑 ——
+/// 塞进同一个结构体的话,`from` 对新建就是个必须编出来的假值,而编译器
+/// 对这种「一半字段没意义」的类型一声不吭。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewEdit {
+    /// 输入框内容。进来时是空的。
+    pub buf: String,
+    /// 刚进新建态、**还没把键盘焦点要过来**。渲染那侧要一次就清掉
+    /// (每帧无条件 `request_focus()` 会让两栏互抢,见 `RenameEdit` 的文档)。
+    pub focus_pending: bool,
+}
+
 pub struct PaneState {
     pub cwd: RemotePath,
     pub entries: Vec<Entry>,
@@ -85,6 +100,12 @@ pub struct PaneState {
     /// 但字段放在 `PaneState` 上而不是 `PanelFrame` 上 —— 与 `path_edit`
     /// 一致,「哪一栏在编辑」这件事本来就是每栏各自的事。
     pub rename_edit: Option<RenameEdit>,
+    /// F219:就地新建文件的输入缓冲。`None` = 没在新建(默认)。
+    ///
+    /// **与 `rename_edit` 互斥**:两个 `TextEdit` 同时活着会互抢键盘焦点,
+    /// 先进编辑态那个永远退不出来(F131 实测过的同款事故)。互斥在
+    /// `begin_new_file` / `begin_rename` 两个入口各清一次对方。
+    pub new_edit: Option<NewEdit>,
     /// F142:这条连接上的 uid/gid → 名字缓存。**本地栏那份永远是空的**
     /// (本地栏属主列恒画 `—`,见 `ui::files_panel::owner_text`)。
     ///
@@ -122,6 +143,7 @@ impl PaneState {
             request_seq: 0,
             path_edit: None,
             rename_edit: None,
+            new_edit: None,
             owners: super::owners::OwnerNames::default(),
             reveal_pick: None,
             scroll_to: None,
@@ -137,6 +159,9 @@ impl PaneState {
         // F200:换目录了 —— 那个输入框会浮在另一个目录的某一行上,而回车
         // 拼出来的路径用的是新 cwd,改的是另一个文件。
         self.rename_edit = None;
+        // F219:同上 —— 那个输入框回车拼出来的路径用的是**新** cwd,
+        // 建出来的文件会落在用户根本没在看的目录里。
+        self.new_edit = None;
         self.request_seq += 1;
         self.request_seq
     }
@@ -159,6 +184,8 @@ impl PaneState {
         self.clear_selection();
         // F200:同 `begin_load` —— 换的还是另一台机器,更不能留。
         self.rename_edit = None;
+        // F219:同上 —— 换的还是另一台机器,更不能留。
+        self.new_edit = None;
         // F218:同理 —— 那一条是**另一台**机器上的文件名。留着的话,新机器上
         // 恰好有个同名文件就会被莫名其妙地选中并滚到跟前。
         self.reveal_pick = None;
@@ -331,6 +358,8 @@ impl PaneState {
     /// 名字发不出去(`is_operable` 为假)的行直接不让开始:`rename` 请求打
     /// 不中那个文件,让用户敲半天再报一句 `NoSuchFile` 只是把失败推后。
     pub fn begin_rename(&mut self) -> bool {
+        // F219:两个就地输入框互斥,见 `PaneState::new_edit` 的文档。
+        self.new_edit = None;
         let Some(cur) = self.cursor.clone() else {
             return false;
         };
@@ -340,6 +369,20 @@ impl PaneState {
         self.rename_edit = Some(RenameEdit {
             buf: cur.display().to_string(),
             from: cur,
+            focus_pending: true,
+        });
+        true
+    }
+
+    /// F219:开始在**当前目录**里就地新建一个文件。返回是否真的进了新建态。
+    ///
+    /// 不像 `begin_rename` 那样需要光标行 —— 新建不针对任何一条已有的行,
+    /// 空目录里同样成立(那正是用户最需要它的时候)。
+    pub fn begin_new_file(&mut self) -> bool {
+        // 互斥,见 `new_edit` 的文档。
+        self.rename_edit = None;
+        self.new_edit = Some(NewEdit {
+            buf: String::new(),
             focus_pending: true,
         });
         true
@@ -618,6 +661,73 @@ mod tests {
             }
             assert!(s.rename_edit.is_none(), "换目录/换机器后编辑态还赖着");
         }
+    }
+
+    /// F219:进新建态之后,缓冲是空的、焦点待办是真。
+    #[test]
+    fn beginning_a_new_file_opens_an_empty_buffer_asking_for_focus() {
+        let mut s = state();
+        assert!(s.begin_new_file(), "该进得了新建态");
+        let n = s.new_edit.as_ref().expect("没进新建态");
+        assert_eq!(n.buf, "", "新建的输入框该是空的");
+        assert!(n.focus_pending, "没要焦点 —— 用户得先拿鼠标点一下才能打字");
+    }
+
+    /// F219:两个就地输入框**不能同时活着** —— egui 里两个 `TextEdit` 会互抢
+    /// 键盘焦点,先进编辑态那个永远 `lost_focus()` 不了、退不出来(F131 实测)。
+    ///
+    /// 自证会变红:把 `begin_new_file` 里清 `rename_edit` 的那句删掉。
+    #[test]
+    fn starting_a_new_file_cancels_an_in_flight_rename_and_the_other_way_round() {
+        let mut s = state();
+        s.accept(s.request_seq, Ok(vec![e("a.txt", EntryKind::File)]));
+        s.cursor = Some(RemotePath::from_bytes(b"a.txt".to_vec()));
+        assert!(s.begin_rename(), "前提:进得了改名态");
+        assert!(s.begin_new_file());
+        assert!(s.rename_edit.is_none(), "改名态还赖着 —— 两个输入框会互抢焦点");
+
+        let mut s = state();
+        s.accept(s.request_seq, Ok(vec![e("a.txt", EntryKind::File)]));
+        s.cursor = Some(RemotePath::from_bytes(b"a.txt".to_vec()));
+        assert!(s.begin_new_file());
+        assert!(s.begin_rename(), "前提:进得了改名态");
+        assert!(s.new_edit.is_none(), "新建态还赖着 —— 同上");
+    }
+
+    /// F219:换目录 / 换机器之后,那个输入框回车拼出来的是**另一个目录**里的
+    /// 路径 —— 必须清掉。
+    ///
+    /// 自证会变红:把 `begin_load`/`invalidate` 里清 `new_edit` 的那句删掉。
+    #[test]
+    fn leaving_the_directory_drops_the_new_file_edit() {
+        for leave in [0u8, 1] {
+            let mut s = state();
+            assert!(s.begin_new_file());
+            if leave == 0 {
+                s.begin_load(RemotePath::from_bytes(b"/tmp".to_vec()));
+            } else {
+                s.invalidate();
+            }
+            assert!(s.new_edit.is_none(), "换目录/换机器后新建态还赖着");
+        }
+    }
+
+    /// F219:**刷新不清新建态** —— 它不绑任何已有行,清掉会把用户正在打的字
+    /// 吞掉(与 `rename_edit` 的处置故意不同:那个绑着一条具体的行)。
+    ///
+    /// 自证会变红:在 `accept` 里加一句 `self.new_edit = None;`。
+    #[test]
+    fn a_refresh_keeps_the_new_file_edit_because_it_is_not_tied_to_any_row() {
+        let mut s = state();
+        assert!(s.begin_new_file());
+        s.new_edit.as_mut().unwrap().buf = "half-typed".into();
+        let seq = s.request_seq;
+        assert!(s.accept(seq, Ok(vec![e("a.txt", EntryKind::File)])));
+        assert_eq!(
+            s.new_edit.as_ref().map(|n| n.buf.as_str()),
+            Some("half-typed"),
+            "刷新把用户正在打的字吞了"
+        );
     }
 
     /// F202:删除目标是**绝对路径 + 是不是目录**。抽成一个函数是因为它有
