@@ -516,3 +516,147 @@ async fn creating_a_file_that_already_exists_fails_instead_of_truncating_it() {
         .clone();
     assert_eq!(after, before, "文件内容被动过了 —— EXCLUDE 没生效");
 }
+
+/// F220/B2:`common::parse_copy_or_move` 要认得出**真实 `shell_quote`** 拼出来
+/// 的命令行 —— 这是这个假服务端唯一有价值的地方。B3 的 `try_exec` 会拼
+/// `cp -a[f] -- <quoted src> <quoted dst>` / `mv [-f] -- …`,多对用 ` && ` 串。
+/// 这里不等 B3 落地,直接照它的拼法自己拼一遍,拿真实 `shell_quote` 喂给
+/// 解析器 —— 不这样测的话,解析器认不出真实输出这件事只会在 B3 落地后
+/// 表现为「静默走了 SFTP 回退,exec 快路径其实一次都没被验过」,测试
+/// 还是绿的。
+#[test]
+fn parse_copy_or_move_understands_what_shell_quote_actually_produces() {
+    use mullion_ssh::exec::shell_quote;
+
+    fn cmd_for(head: &[u8], pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut cmd = Vec::new();
+        for (from, to) in pairs {
+            if !cmd.is_empty() {
+                cmd.extend_from_slice(b" && ");
+            }
+            cmd.extend_from_slice(head);
+            cmd.extend_from_slice(&shell_quote(from));
+            cmd.push(b' ');
+            cmd.extend_from_slice(&shell_quote(to));
+        }
+        cmd
+    }
+
+    // 四种 head:cp(非覆盖/覆盖)、mv(非覆盖/覆盖)。
+    let cases: &[(&[u8], bool)] = &[
+        (b"cp -a -- ", false),
+        (b"cp -af -- ", false),
+        (b"mv -- ", true),
+        (b"mv -f -- ", true),
+    ];
+    for (head, expect_move) in cases {
+        let cmd = cmd_for(head, &[(b"/home/testuser/box", b"/home/testuser/box-copy")]);
+        let (is_move, pairs) = common::parse_copy_or_move(&cmd)
+            .unwrap_or_else(|| panic!("解不出 head={:?} 拼出来的命令", head));
+        assert_eq!(is_move, *expect_move, "head={:?} 的移动标志判错了", head);
+        assert_eq!(
+            pairs,
+            vec![(
+                b"/home/testuser/box".to_vec(),
+                b"/home/testuser/box-copy".to_vec()
+            )],
+            "head={:?} 解出来的路径对不上",
+            head
+        );
+    }
+
+    // 多对用 ` && ` 串:B3 一次粘贴多个条目走的是这条形状。
+    let multi = cmd_for(
+        b"cp -a -- ",
+        &[
+            (b"/home/testuser/a", b"/home/testuser/dst/a"),
+            (b"/home/testuser/b", b"/home/testuser/dst/b"),
+        ],
+    );
+    let (is_move, pairs) = common::parse_copy_or_move(&multi).expect("多对该能解出来");
+    assert!(!is_move, "cp 不该被认成移动");
+    assert_eq!(
+        pairs,
+        vec![
+            (
+                b"/home/testuser/a".to_vec(),
+                b"/home/testuser/dst/a".to_vec()
+            ),
+            (
+                b"/home/testuser/b".to_vec(),
+                b"/home/testuser/dst/b".to_vec()
+            ),
+        ],
+        "多对的顺序或路径解错了"
+    );
+
+    // 脏名字(单引号 + `$` + 空格):`shell_quote` 是唯一的转义来源,
+    // 解析器要能把它原样解回来。
+    let nasty: &[u8] = b"it's a $(x) file";
+    let dirty = cmd_for(b"mv -- ", &[(nasty, b"/home/testuser/dst")]);
+    let (is_move, pairs) = common::parse_copy_or_move(&dirty).expect("脏名字也该解出来");
+    assert!(is_move);
+    assert_eq!(
+        pairs,
+        vec![(nasty.to_vec(), b"/home/testuser/dst".to_vec())]
+    );
+}
+
+/// F220/B2:`common::copy_recursively` 要镜像 `remove_recursively` 的行为 ——
+/// 拷整棵目录树,但**遇到符号链接原样复制成叶子,不跟进去**(与 B3 的
+/// `copy_one` 承诺的不变量一致)。不等 B3 落地就直接对内存树验这一条,
+/// 免得「跟进符号链接」这个错要等到 B3 的集成测试才可能被撞见。
+#[test]
+fn copy_recursively_mirrors_the_tree_but_never_follows_a_symlink() {
+    let mut t = nested_tree();
+
+    common::copy_recursively(&mut t, b"/home/testuser/box", b"/home/testuser/box-copy");
+
+    // 目标目录本身、以及它的直接孩子(文件/子目录/链接)都该出现。
+    assert!(exists(&t, b"/home/testuser/box-copy"), "目标目录没建出来");
+    let copied_names: std::collections::BTreeSet<_> = names_in(&t, b"/home/testuser/box-copy")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        copied_names,
+        [b"f1".to_vec(), b"sub".to_vec(), b"lnk".to_vec()]
+            .into_iter()
+            .collect(),
+        "拷贝出来的直接孩子名字不对"
+    );
+
+    // 子目录要递归拷:sub/deep.txt 也该在。
+    assert!(
+        exists(&t, b"/home/testuser/box-copy/sub"),
+        "子目录没有递归拷"
+    );
+    assert!(
+        names_in(&t, b"/home/testuser/box-copy/sub").contains(&b"deep.txt".to_vec()),
+        "子目录里的文件没跟着拷"
+    );
+
+    // 核心不变量:lnk 是符号链接,复制后必须仍是叶子 —— 不能在树上
+    // 长出 `/home/testuser/box-copy/lnk` 这个目录键(那就是跟进去了)。
+    assert!(
+        !t.contains_key(b"/home/testuser/box-copy/lnk".as_slice()),
+        "符号链接被当成目录跟进去了 —— 整个链接目标被复制了一遍"
+    );
+    let lnk = t
+        .get(b"/home/testuser/box-copy".as_slice())
+        .unwrap()
+        .iter()
+        .find(|n| n.name == b"lnk")
+        .expect("lnk 节点该在");
+    assert_eq!(
+        lnk.kind,
+        common::sftp_server::NodeKind::Symlink(b"/home/testuser/victim".to_vec()),
+        "lnk 复制后该仍是指向原目标的符号链接"
+    );
+
+    // 复制不该动源:box 和它的孩子都该原封不动还在。
+    assert!(exists(&t, b"/home/testuser/box"), "复制不该动源目录");
+    assert!(
+        names_in(&t, b"/home/testuser/box").contains(&b"lnk".to_vec()),
+        "源目录的链接不该被复制操作带走"
+    );
+}

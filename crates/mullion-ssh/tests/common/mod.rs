@@ -197,8 +197,9 @@ impl Handler for SftpSshHandler {
 
     /// 记下命令行;`allow_exec == false` 时直接拒(见该字段的文档)。
     ///
-    /// 允许执行时**只认 `rm -rf -- <路径…>` 这一种**,并真的在内存树上删掉。
-    /// 起一个真 shell 来解析命令行既不可能也没必要 —— 要验的是
+    /// 允许执行时认两种形状:`rm -rf -- <路径…>`(F57)以及 `cp -a[f] --`/
+    /// `mv [-f] --`(F220,单对,或用 ` && ` 串起来的多对),并真的在内存树上
+    /// 执行。起一个真 shell 来解析命令行既不可能也没必要 —— 要验的是
     /// 「转义对不对 + 回退判定对不对」,不是 shell 的实现。
     async fn exec_request(
         &mut self,
@@ -220,8 +221,20 @@ impl Handler for SftpSshHandler {
                 }
                 0
             }
-            // 认不出来的命令 —— 与真 shell 的 "command not found" 同码。
-            None => 127,
+            None => match parse_copy_or_move(data) {
+                Some((is_move, pairs)) => {
+                    let mut tree = self.tree.lock().unwrap();
+                    for (from, to) in pairs {
+                        copy_recursively(&mut tree, &from, &to);
+                        if is_move {
+                            remove_recursively(&mut tree, &from);
+                        }
+                    }
+                    0
+                }
+                // 认不出来的命令 —— 与真 shell 的 "command not found" 同码。
+                None => 127,
+            },
         };
         session.exit_status_request(channel, code)?;
         session.close(channel)?;
@@ -229,16 +242,11 @@ impl Handler for SftpSshHandler {
     }
 }
 
-/// 认 `rm -rf -- '<路径>' '<路径>'…`,把单引号字面量解回原始字节。
+/// 解一串 `'a' 'b' 'c'` 形式的单引号参数,把单引号字面量解回原始字节。
 /// 认不出来返回 `None` —— 在测试里就是「命令没跑成」,正好扎住
 /// 「转义漏了导致命令行结构不对」这一类错。
 #[allow(dead_code)]
-fn parse_rm_rf(cmd: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let prefix = b"rm -rf -- ";
-    if !cmd.starts_with(prefix) {
-        return None;
-    }
-    let mut rest = &cmd[prefix.len()..];
+fn parse_quoted_args(mut rest: &[u8]) -> Option<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     while !rest.is_empty() {
         if rest[0] == b' ' {
@@ -274,6 +282,68 @@ fn parse_rm_rf(cmd: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
+/// 认 `rm -rf -- '<路径>' '<路径>'…`。
+#[allow(dead_code)]
+fn parse_rm_rf(cmd: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let prefix = b"rm -rf -- ";
+    parse_quoted_args(cmd.strip_prefix(prefix)?)
+}
+
+/// 按字节串分隔符切分 `haystack`(不做转义感知 —— 调用方要保证分隔符不会
+/// 出现在被引号包住的内容里;`shell_quote` 保证了这一点,见调用点注释)。
+#[allow(dead_code)]
+fn split_on<'a>(haystack: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    let mut rest = haystack;
+    while let Some(pos) = rest.windows(sep.len()).position(|w| w == sep) {
+        out.push(&rest[..pos]);
+        rest = &rest[pos + sep.len()..];
+    }
+    out.push(rest);
+    out
+}
+
+/// 依次试每个前缀,命中就剥掉返回剩余部分;都不命中给 `None`。
+#[allow(dead_code)]
+fn strip_any<'a>(s: &'a [u8], prefixes: &[&[u8]]) -> Option<&'a [u8]> {
+    prefixes.iter().find_map(|p| s.strip_prefix(*p))
+}
+
+/// F220:认 `cp -a[f] -- '<src>' '<dst>'`(单对,多对用 ` && ` 串),
+/// 以及同形状的 `mv`。返回(是不是移动、一串 (src, dst))。
+///
+/// 起一个真 shell 来解析命令行既不可能也没必要 —— 要验的是「转义对不对 +
+/// 回退判定对不对」,不是 shell 的实现(同 `parse_rm_rf` 的理由)。
+/// `pub(crate)`(而不是私有):B2 的守护测试要在 `sftp_write.rs` 里直接拿
+/// 真实的 `shell_quote` 拼一条命令,断言这个解析器认得出来 —— 不然
+/// `parse_copy_or_move` 认不出 B3 真实发的命令这件事,要等 B3 落地才会
+/// 被测试撞见(而且撞见的方式是「静默回退到 SFTP,exec 快路径从没被验过」)。
+#[allow(dead_code, clippy::type_complexity)]
+pub(crate) fn parse_copy_or_move(cmd: &[u8]) -> Option<(bool, Vec<(Vec<u8>, Vec<u8>)>)> {
+    let mut is_move = None;
+    let mut out = Vec::new();
+    // ` && ` 分段。**按字节找**,路径里可能有奇怪字符,但 `shell_quote`
+    // 保证它们都在单引号里,不会构造出假的 ` && `。
+    for seg in split_on(cmd, b" && ") {
+        let (mv, rest) = if let Some(r) = strip_any(seg, &[b"mv -f -- ", b"mv -- "]) {
+            (true, r)
+        } else if let Some(r) = strip_any(seg, &[b"cp -af -- ", b"cp -a -- "]) {
+            (false, r)
+        } else {
+            return None;
+        };
+        if *is_move.get_or_insert(mv) != mv {
+            return None; // 一条命令里混着 cp 和 mv —— 实现出错了
+        }
+        let args = parse_quoted_args(rest)?;
+        if args.len() != 2 {
+            return None;
+        }
+        out.push((args[0].clone(), args[1].clone()));
+    }
+    Some((is_move?, out))
+}
+
 /// 在内存树里递归删掉一条(目录连同整棵子树)。
 ///
 /// **不跟随符号链接**:只按树上的目录键往下走,链接节点没有自己的目录键,
@@ -296,6 +366,56 @@ fn remove_recursively(tree: &mut sftp_server::Tree, path: &[u8]) {
     let (dir, name) = sftp_server::split_last_pub(path);
     if let Some(v) = tree.get_mut(&dir) {
         v.retain(|n| n.name != name);
+    }
+}
+
+/// 在内存树里把一条(文件、链接或整棵目录树)拷到新路径。
+/// **不跟随符号链接**:链接节点原样复制(连同它的目标字符串)。
+///
+/// 镜像 `remove_recursively` 的结构(它是同一套树操作的反向):先在源的
+/// 父目录里找到节点,找不到就什么都不做;否则克隆一份、名字换成 `to`
+/// 的末段,插进 `to` 的父目录;源是目录的话再 `tree.insert(to, vec![])`
+/// 建出目标这一层的目录键,并对每个孩子递归。父目录/名字的切法用
+/// `sftp_server::split_last_pub` —— 自己再写一遍切法就会两边不一致。
+///
+/// `pub(crate)`:B2 的守护测试要在 `sftp_write.rs` 里直接对内存树验它的
+/// 树操作(目录树 + 符号链接不跟随),不必等 B3 的协议层落地。
+#[allow(dead_code)]
+pub(crate) fn copy_recursively(tree: &mut sftp_server::Tree, from: &[u8], to: &[u8]) {
+    let (from_dir, from_name) = sftp_server::split_last_pub(from);
+    let Some(node) = tree
+        .get(&from_dir)
+        .and_then(|v| v.iter().find(|n| n.name == from_name))
+        .cloned()
+    else {
+        return;
+    };
+    let is_dir = node.kind == sftp_server::NodeKind::Dir;
+
+    let (to_dir, to_name) = sftp_server::split_last_pub(to);
+    let mut cloned = node;
+    cloned.name = to_name;
+    tree.entry(to_dir).or_default().push(cloned);
+
+    if is_dir {
+        let children: Vec<Vec<u8>> = tree
+            .get(from)
+            .map(|v| v.iter().map(|n| n.name.clone()).collect())
+            .unwrap_or_default();
+        tree.insert(to.to_vec(), Vec::new());
+        for name in children {
+            let mut child_from = from.to_vec();
+            if !child_from.ends_with(b"/") {
+                child_from.push(b'/');
+            }
+            child_from.extend_from_slice(&name);
+            let mut child_to = to.to_vec();
+            if !child_to.ends_with(b"/") {
+                child_to.push(b'/');
+            }
+            child_to.extend_from_slice(&name);
+            copy_recursively(tree, &child_from, &child_to);
+        }
     }
 }
 
