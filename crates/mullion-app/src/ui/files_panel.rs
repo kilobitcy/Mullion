@@ -518,6 +518,37 @@ fn scroll_id_salt(id: &str, generation: u64) -> String {
     format!("files-{generation}-{id}")
 }
 
+/// F220:剪切源要画淡的那批**末段名字**。抽成纯函数只为了能脱离 egui
+/// 单测(同 `scroll_id_salt` 的理由)——原来这段逻辑埋在 `show()` 里,
+/// 复核挖出「删掉 `row()` 里的 `dimmed` 分支,`cargo test --workspace`
+/// 全绿」,得先能单独测这份算法本身。
+///
+/// - `clip.mode == Cut` 才有值,`Copy` 恒空集(复制的源行不该变淡)。
+/// - **只在远端栏算**(D5:剪贴板只在远端出现),本地栏恒空集,不会被
+///   同名文件误伤。
+fn cut_names_for(
+    clip: Option<&RemoteClip>,
+    column: PanelColumn,
+) -> std::collections::BTreeSet<Vec<u8>> {
+    if column != PanelColumn::Remote {
+        return std::collections::BTreeSet::new();
+    }
+    clip.filter(|c| c.mode == ClipMode::Cut)
+        .map(|c| {
+            c.items
+                .iter()
+                .map(|(p, _)| {
+                    p.as_bytes()
+                        .rsplit(|b| *b == b'/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_vec()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 画一栏。返回本帧的动作(至多一个 —— 一帧里用户点不了两下)。
 ///
 /// `generation`:调用方(`sidebar`/`content`)所属那个标签的世代号,只用来
@@ -902,26 +933,9 @@ pub fn show(
     // F142:属主名字表。跟 `rows` 一样是不可变借用,两者共存没问题;
     // **不 clone** —— 一份表可能有上百个条目,每帧复制一遍纯属浪费。
     let owners = &state.owners;
-    // F220:剪切源要画淡的那批**末段名字**。只在远端栏算(D5:剪贴板只在
-    // 远端出现),本地栏恒空集,不会被同名文件误伤。
-    let cut_names: std::collections::BTreeSet<Vec<u8>> = if column == PanelColumn::Remote {
-        clip.filter(|c| c.mode == ClipMode::Cut)
-            .map(|c| {
-                c.items
-                    .iter()
-                    .map(|(p, _)| {
-                        p.as_bytes()
-                            .rsplit(|b| *b == b'/')
-                            .next()
-                            .unwrap_or_default()
-                            .to_vec()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        std::collections::BTreeSet::new()
-    };
+    // F220:剪切源要画淡的那批**末段名字**。抽成纯函数(见 `cut_names_for`
+    // 的文档)——没有 egui 依赖,可以脱离渲染直接单测判据本身。
+    let cut_names = cut_names_for(clip, column);
     /// 点中的那一条 + 当时按着的修饰键(ctrl, shift)。F54 的多选语义在
     /// `PaneState::click_row` 里,这里只负责把「点了什么、按着什么」带出闭包。
     type Click = (mullion_ssh::sftp::RemotePath, bool, bool);
@@ -2213,6 +2227,26 @@ mod tests {
         shapes.iter().find_map(|cs| walk(&cs.shape, needle))
     }
 
+    /// 同 `find_text_pos`,但取的是画这段文字用的**颜色**。`row()` 每一列
+    /// 各自一次 `Painter::text(...)` 调用,产生的 `LayoutJob` 只有一个
+    /// section、整段文字同一个颜色 —— 取第一个 section 的 `format.color`
+    /// 就是那次调用传的 `fg`。F220 剪切降色的判据顺序守护在用。
+    fn find_text_color(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Option<egui::Color32> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Color32> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                    ts.galley.job.sections.first().map(|sec| sec.format.color)
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
     /// 同 `find_text_pos`,但给的是整块文字的**矩形**。判「贴着某条边」
     /// 这类事得用边界:拿中心点判要先猜字宽,猜出来的阈值不算判据。
     fn find_text_rect(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Rect> {
@@ -3161,6 +3195,120 @@ mod tests {
             .find(|e| e.label == "粘贴")
             .expect("剪贴板空时「粘贴」不该消失,该置灰");
         assert!(paste.disabled.is_some(), "剪贴板空时「粘贴」没置灰");
+    }
+
+    /// F220 质量复核挖出的缺口:剪切源行画淡这件事(`row()` 里的
+    /// `dimmed` 分支)之前完全没有守护——删掉那个分支 `cargo test
+    /// --workspace` 全绿。这条守住算「哪些名字要淡」的那一半
+    /// (`cut_names_for`,纯函数,见其文档);下面
+    /// `cut_dimming_yields_to_unusable_but_beats_dir_color` 守另一半
+    /// (`row()` 里颜色判据本身的分支顺序)。
+    ///
+    /// 自证会变红:把 `cut_names_for` 里 `.filter(|c| c.mode == ClipMode::Cut)`
+    /// 删掉(复制的源行也跟着变淡)。
+    #[test]
+    fn cut_names_for_is_empty_for_copy_and_for_the_local_column() {
+        let cut = RemoteClip {
+            mode: ClipMode::Cut,
+            items: vec![(RemotePath::from_bytes(b"/a/b.txt".to_vec()), false)],
+        };
+        let copy = RemoteClip {
+            mode: ClipMode::Copy,
+            items: vec![(RemotePath::from_bytes(b"/a/b.txt".to_vec()), false)],
+        };
+
+        let names = cut_names_for(Some(&cut), PanelColumn::Remote);
+        assert_eq!(
+            names,
+            [b"b.txt".to_vec()].into_iter().collect(),
+            "Cut 模式下该拿到那批条目的末段名字"
+        );
+
+        assert!(
+            cut_names_for(Some(&copy), PanelColumn::Remote).is_empty(),
+            "Copy 模式不该有任何名字变淡——源文件还在原地,不是「已挪走待落地」"
+        );
+        assert!(
+            cut_names_for(Some(&cut), PanelColumn::Local).is_empty(),
+            "本地栏恒空集(D5:剪贴板只在远端出现),不然会被同名文件误伤"
+        );
+        assert!(
+            cut_names_for(None, PanelColumn::Remote).is_empty(),
+            "没有剪贴板时自然是空集"
+        );
+    }
+
+    /// F220 质量复核挖出的缺口(另一半):`row()` 里 `fg` 颜色判据的分支
+    /// 顺序是 `!usable → dimmed → EntryKind::Dir → 普通文件`,谁排前面
+    /// 谁赢。只测「`dimmed=true` 单独一种输入」测不出顺序被打乱——把
+    /// `dimmed` 分支挪到 `!usable` 前面、或挪到 `Dir` 后面,那种测法照样
+    /// 全绿。这里用两组「相邻分支都满足」的输入分别钉住两条边界。
+    ///
+    /// 自证会变红:
+    /// - 删掉 `row()` 里整个 `dimmed` 分支 → 两个断言都红。
+    /// - 把 `dimmed` 分支挪到 `!usable` 判断之前 → 「不可操作」那组断言红
+    ///   (不可操作的名字会显示成 `fg_muted` 而不是更暗的 `fg_dimmer`)。
+    #[test]
+    fn cut_dimming_yields_to_unusable_but_beats_dir_color() {
+        fn text_color(entries: &[Entry], dimmed: bool, needle: &str) -> egui::Color32 {
+            let t = crate::theme::MULLION_DARK;
+            let e = entries[0].clone();
+            let cols = ColWidths::default();
+            let width = content_w(&cols, PanelColumn::Remote);
+            let ctx = egui::Context::default();
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let rect =
+                            egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(width, ROW_H));
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            row(
+                                ui,
+                                &t,
+                                &e,
+                                PanelColumn::Remote,
+                                false,
+                                &cols,
+                                &crate::files::owners::OwnerNames::default(),
+                                dimmed,
+                            );
+                        });
+                    });
+            });
+            find_text_color(&out.shapes, needle)
+                .unwrap_or_else(|| panic!("没画出「{needle}」对应的文字"))
+        }
+
+        let t = crate::theme::MULLION_DARK;
+
+        // 边界 1:`!usable` 必须赢过 `dimmed`——两者都满足时,颜色该是
+        // `fg_dimmer`,不是 `fg_muted`(否则「这名字动不了」这条既有信号
+        // 会被剪切降色悄悄盖掉)。
+        let unusable = vec![entry(
+            &[0xd6, 0xd0, b'.', b't', b'x', b't'],
+            EntryKind::File,
+        )];
+        assert_eq!(
+            text_color(&unusable, true, "\u{fffd}"),
+            theme::c32(t.fg_dimmer),
+            "不可操作 + 已剪切:颜色该是 fg_dimmer(不可操作优先),而不是 fg_muted"
+        );
+
+        // 边界 2:`dimmed` 必须赢过 `EntryKind::Dir`——两者都满足时,颜色
+        // 该是 `fg_muted`,不是目录专属的 `fg_strong`。
+        let cut_dir = vec![entry(b"d", EntryKind::Dir)];
+        assert_eq!(
+            text_color(&cut_dir, true, "d"),
+            theme::c32(t.fg_muted),
+            "目录 + 已剪切:颜色该是 fg_muted(剪切降色优先于目录高亮)"
+        );
+        assert_eq!(
+            text_color(&cut_dir, false, "d"),
+            theme::c32(t.fg_strong),
+            "前提对照:同一个目录不剪切时该是 fg_strong,证明上一条真的是\
+             因为 dimmed 才变的色,不是这个目录本来就该是 fg_muted"
+        );
     }
 
     #[test]
