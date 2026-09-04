@@ -174,16 +174,31 @@ pub struct SftpHandler {
     /// 要等 close 才成立,而传输测试恰恰想在中途看。
     files: HashMap<String, String>,
     next_handle: u64,
+    /// F220/B3 缺口 2:`true` = `rename` 一律失败,模拟真实 EXDEV(跨设备
+    /// 重命名)。`copy_tree.rs` 的 `sftp.rename(..).is_err()` 那条「退成拷贝
+    /// +删源」的分支——假服务端的 `rename` 平时从不失败,那个分支原本零
+    /// 覆盖。照 `allow_exec`(见 `common/mod.rs`)那个既有开关的写法来。
+    reject_rename: bool,
 }
 
 impl SftpHandler {
     pub fn new(tree: Arc<Mutex<Tree>>, probe: Arc<Mutex<Probe>>) -> Self {
+        Self::new_with_rename_policy(tree, probe, false)
+    }
+
+    /// `reject_rename = true` 时 `rename` 一律报错,见该字段的文档。
+    pub fn new_with_rename_policy(
+        tree: Arc<Mutex<Tree>>,
+        probe: Arc<Mutex<Probe>>,
+        reject_rename: bool,
+    ) -> Self {
         Self {
             tree,
             probe,
             dirs: HashMap::new(),
             files: HashMap::new(),
             next_handle: 0,
+            reject_rename,
         }
     }
 
@@ -521,6 +536,11 @@ impl russh_sftp::server::Handler for SftpHandler {
         newpath: String,
     ) -> Result<Status, Self::Error> {
         self.note("rename", &format!("{oldpath} -> {newpath}"));
+        if self.reject_rename {
+            // 模拟 EXDEV(跨设备重命名失败):不动树,直接报错,逼调用方
+            // 走「拷贝 + 删源」回退(`reject_rename` 字段文档)。
+            return Err(StatusCode::Failure);
+        }
         let (od, on) = split_last(oldpath.as_bytes());
         let (nd, nn) = split_last(newpath.as_bytes());
         let mut tree = self.tree.lock().unwrap();

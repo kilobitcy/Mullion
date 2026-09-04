@@ -131,6 +131,10 @@ pub struct SftpSshHandler {
     /// `ChrootDirectory`)那样**拒绝** exec。F57 的回退分支靠它触发 ——
     /// 没有这个开关,「exec 被拒时回退」那条路径在测试里永远走不到。
     allow_exec: bool,
+    /// `true` = 底下的 `SftpHandler` 一律拒绝 `rename`(模拟 EXDEV)。
+    /// F220/B3 缺口 2:没有这个开关,`copy_tree.rs` 里「rename 失败 →
+    /// 拷贝+删源」那条分支在测试里永远走不到(假服务端的 rename 从不失败)。
+    reject_rename: bool,
 }
 
 impl Handler for SftpSshHandler {
@@ -186,7 +190,11 @@ impl Handler for SftpSshHandler {
             // `run` 内部自己 spawn,立即返回;别在这儿 await 到天荒地老。
             russh_sftp::server::run(
                 ch.into_stream(),
-                sftp_server::SftpHandler::new(self.tree.clone(), self.probe.clone()),
+                sftp_server::SftpHandler::new_with_rename_policy(
+                    self.tree.clone(),
+                    self.probe.clone(),
+                    self.reject_rename,
+                ),
             )
             .await;
         } else {
@@ -512,7 +520,7 @@ pub async fn spawn_sftp_server(
     Arc<std::sync::Mutex<sftp_server::Probe>>,
     Arc<std::sync::Mutex<sftp_server::Tree>>,
 ) {
-    spawn_sftp_server_with(tree, true).await
+    spawn_sftp_server_with(tree, true, false).await
 }
 
 /// 像 sftp-only 账号那样**拒绝 exec** 的变体(F57 回退分支的测试用)。
@@ -524,13 +532,29 @@ pub async fn spawn_sftp_server_without_exec(
     Arc<std::sync::Mutex<sftp_server::Probe>>,
     Arc<std::sync::Mutex<sftp_server::Tree>>,
 ) {
-    spawn_sftp_server_with(tree, false).await
+    spawn_sftp_server_with(tree, false, false).await
+}
+
+/// **拒绝 exec 且 `rename` 一律失败**(模拟 EXDEV)的变体。F220/B3 缺口 2:
+/// `copy_tree.rs` 的 SFTP 回退路径里「rename 失败 → 拷贝+删源」那条分支,
+/// 靠这个变体逼 `sftp.rename` 报错才走得到 —— 单开 `allow_exec=false`
+/// 不够,普通假服务端的 rename 从不失败。
+#[allow(dead_code)]
+pub async fn spawn_sftp_server_without_exec_and_rename(
+    tree: sftp_server::Tree,
+) -> (
+    std::net::SocketAddr,
+    Arc<std::sync::Mutex<sftp_server::Probe>>,
+    Arc<std::sync::Mutex<sftp_server::Tree>>,
+) {
+    spawn_sftp_server_with(tree, false, true).await
 }
 
 #[allow(dead_code)]
 async fn spawn_sftp_server_with(
     tree: sftp_server::Tree,
     allow_exec: bool,
+    reject_rename: bool,
 ) -> (
     std::net::SocketAddr,
     Arc<std::sync::Mutex<sftp_server::Probe>>,
@@ -560,6 +584,7 @@ async fn spawn_sftp_server_with(
                 tree: t.clone(),
                 probe: p.clone(),
                 allow_exec,
+                reject_rename,
             };
             tokio::spawn(async move {
                 let _ = russh::server::run_stream(config, stream, handler).await;

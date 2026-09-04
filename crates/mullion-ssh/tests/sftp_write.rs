@@ -937,6 +937,61 @@ async fn overwriting_an_existing_directory_replaces_it_instead_of_nesting_into_i
                 "覆盖走了 exec 就不该再发 SFTP 写请求:{:?}",
                 p.seen
             );
+            // 缺口 1:上面那堆断言只看服务端的树变成了什么样 —— 假服务端的
+            // `parse_overwriting_copy_or_move` 分支自己会先 `remove_recursively`
+            // 清空目标再拷,所以哪怕 `try_exec` 发出去的是裸 `cp -af -- `(没有
+            // `rm -rf --` 前缀,落到假服务端会走 `parse_copy_or_move` 那条
+            // 「非覆盖」解析分支,而它同样会 `tree.insert(to, Vec::new())`
+            // 清空重建),最终树状态也会长得一样,树状态断言测不出命令串本身
+            // 错没错。这里直接核对发出去的命令串。
+            assert_eq!(p.execs.len(), 1, "覆盖粘贴该只发一条命令");
+            let cmd = &p.execs[0];
+            assert!(
+                cmd.starts_with(b"rm -rf -- "),
+                "覆盖命令必须先 rm -rf 清场,不能是裸 cp -af/mv -f(cp -a 撞上已存在的\
+                 目录是嵌进去,不是替换): {}",
+                String::from_utf8_lossy(cmd)
+            );
+            let needle: &[u8] = b" && cp -a -- ";
+            assert!(
+                cmd.windows(needle.len()).any(|w| w == needle),
+                "覆盖命令必须是 rm -rf -- <dst> && cp -a -- <src> <dst> 这个形状: {}",
+                String::from_utf8_lossy(cmd)
+            );
         }
     }
+}
+
+/// F220/B3 缺口 2:SFTP 回退路径里「`rename` 失败(EXDEV)→ 拷贝 + 删源」
+/// 这条分支。真实 sshd 上跨设备重命名会失败,`transfer_into` 那时才退成
+/// 「`copy_one` 之后 `remove_tree(from)`」——假服务端的 `rename` 平时从不
+/// 失败,这条分支原本零覆盖。用 `spawn_sftp_server_without_exec_and_rename`
+/// (`reject_rename` 开关,仿 `allow_exec` 的写法)逼 `sftp.rename` 报错,
+/// 断言剪切仍然成功,且源真的没了、目标真的建出来了。
+#[tokio::test]
+async fn a_cut_falls_back_to_copy_and_delete_when_rename_reports_exdev() {
+    let (addr, _probe, tree_h) =
+        common::spawn_sftp_server_without_exec_and_rename(nested_tree()).await;
+    let (conn, sftp) = (conn_of(addr).await, client(addr).await);
+
+    let report = transfer_into(
+        &sftp,
+        &conn,
+        &[(rp("/home/testuser/box"), rp("/home/testuser/moved"))],
+        CopyMode::Move,
+        false,
+    )
+    .await
+    .expect("rename 失败时该退成拷贝+删源,而不是直接报错收场");
+    assert_eq!(report, TransferReport::Sftp, "exec 被拒时该走 SFTP 回退");
+
+    let t = tree_h.lock().unwrap();
+    assert!(
+        exists(&t, b"/home/testuser/moved"),
+        "目标没出现 —— EXDEV 回退里的拷贝那一步没做"
+    );
+    assert!(
+        !exists(&t, b"/home/testuser/box"),
+        "源还在 —— EXDEV 回退里的删源那一步没做,剪切退化成了复制"
+    );
 }
