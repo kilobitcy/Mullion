@@ -2008,6 +2008,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: files_panel::PanelColumn::default(),
+            clip: None,
         };
         for _ in 0..2 {
             run_frame(
@@ -2144,6 +2145,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: files_panel::PanelColumn::default(),
+            clip: None,
         };
         for _ in 0..2 {
             run_frame_content(
@@ -2288,6 +2290,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: files_panel::PanelColumn::default(),
+            clip: None,
         };
         fn entry(name: &[u8]) -> mullion_ssh::sftp::Entry {
             mullion_ssh::sftp::Entry {

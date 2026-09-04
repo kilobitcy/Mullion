@@ -4268,6 +4268,13 @@ impl App {
                 }
                 return;
             }
+            // F220:剪贴板只在远端栏(D5)。`menu_items_for` 不给本地栏这几项,
+            // `handle_panel_key` 的 Ctrl+C/X/V 也只在远端栏放行,到这儿说明
+            // 接线被改坏了,不静默吞。
+            FileAction::ClipCopy | FileAction::ClipCut | FileAction::ClipPaste => {
+                log::warn!("本地栏收到了剪贴板操作,已忽略(只在远端)");
+                return;
+            }
         };
         let seq = files.local.begin_load(target.clone());
         let result = local::list_dir(&local::to_path(&target));
@@ -4393,6 +4400,49 @@ impl App {
                 self.apply_file_op(generation, op);
                 return;
             }
+            // F220:复制 / 剪切。**只记路径,不发任何请求** —— 真正的动作
+            // 在粘贴那一刻。路径在这里就拼成绝对路径:用户接着换目录、
+            // 换排序都不该影响剪贴板指向谁。
+            FileAction::ClipCopy | FileAction::ClipCut => {
+                let mode = if matches!(action, FileAction::ClipCut) {
+                    crate::files::clip::ClipMode::Cut
+                } else {
+                    crate::files::clip::ClipMode::Copy
+                };
+                if let Some(files) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.files_panel_mut())
+                {
+                    // 同 `FileAsk::Delete` 那条路复用**同一个**目标算法
+                    // (`PaneState::delete_targets`):`cwd.join(单段名字)` +
+                    // 「名字发不出去 wire 请求的不收」两道判据不该在这儿
+                    // 另起一份 —— 两处各写一遍,改对了一处、漏改另一处
+                    // 就会静默分叉(见 `delete_targets` 自己的文档与测试
+                    // `delete_targets_are_absolute_paths_paired_with_dir_flags`)。
+                    let items = files.remote.delete_targets();
+                    if items.is_empty() {
+                        return;
+                    }
+                    let n = items.len();
+                    files.clip = Some(crate::files::clip::RemoteClip { mode, items });
+                    let verb = if mode == crate::files::clip::ClipMode::Cut {
+                        "剪切"
+                    } else {
+                        "复制"
+                    };
+                    self.ui
+                        .set_toast(crate::ui::toast::Kind::Ok, format!("已{verb} {n} 项"));
+                    mark_ui_dirty!(self.ui_dirty);
+                    self.request_ui_redraw();
+                }
+                return;
+            }
+            // F220:粘贴。编排见 `start_paste`(要先列一次目标目录做预检查)。
+            FileAction::ClipPaste => {
+                self.start_paste(generation);
+                return;
+            }
             _ => {}
         }
         let client = {
@@ -4454,13 +4504,26 @@ impl App {
             | FileAction::BookmarkRemove { .. }
             | FileAction::Rename { .. }
             | FileAction::BeginNewFile
-            | FileAction::NewFile(_) => return,
+            | FileAction::NewFile(_)
+            | FileAction::ClipCopy
+            | FileAction::ClipCut
+            | FileAction::ClipPaste => return,
         };
         let seq = files.remote.begin_load(target.clone());
         let task =
             spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, target, seq);
         self.track_sftp_task(generation, task);
         mark_ui_dirty!(self.ui_dirty);
+    }
+
+    /// F220:粘贴编排的桩。**跨任务临时占位** —— 真正的编排(列目标目录做
+    /// 冲突预检查、按用户选的策略走 `mullion_ssh::copy_tree` 或 SFTP 回退)
+    /// 是下一个任务(B5)的活,整个函数体到时候会被替换掉。
+    ///
+    /// 这里刻意不是静默空函数:什么都不做又不吭声,用户会以为按下的
+    /// 粘贴丢了。先给一条看得见的日志,把「还没接通」这件事说出来。
+    fn start_paste(&mut self, generation: u64) {
+        log::warn!("F220:粘贴编排尚未接通(generation={generation},留给 B5)");
     }
 
     /// F139:把一条书签写进会话配置,并同步这个标签的内存副本。
@@ -4585,13 +4648,24 @@ impl App {
     /// 不再假设"就是当前活动的那个"。
     ///
     /// D2:`Delete`/`F2` 打开删除 / 重命名对话框,**只在远端栏**(设计 D5)。
+    ///
+    /// F220:给剪贴板三键(Ctrl+C/X/V)复用的小工具——查这个标签当前
+    /// 焦点在哪一栏。只在这里用,没有改动既有 Ctrl+N/Delete/F2 那几处
+    /// 各自内联的同款查法(Scope Discipline:不顺手重构无关代码)。
+    fn panel_active_column(&self, generation: u64) -> Option<crate::ui::files_panel::PanelColumn> {
+        self.tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+            .map(|f| f.active_column)
+    }
+
     fn handle_panel_key(
         &mut self,
         generation: u64,
         key: &winit::keyboard::Key,
         mods: ModifiersState,
     ) {
-        use crate::ui::files_panel::FileAction;
+        use crate::ui::files_panel::{FileAction, PanelColumn};
         use winit::keyboard::{Key as WinitKey, NamedKey};
 
         // Ctrl+H:切隐藏文件。得先判——它落进 `WinitKey::Character("h")` 分支,
@@ -4612,6 +4686,27 @@ impl App {
                         .map(|f| f.active_column);
                     if column == Some(crate::ui::files_panel::PanelColumn::Remote) {
                         self.dispatch_panel_action(generation, FileAction::BeginNewFile);
+                    }
+                    return;
+                }
+                // F220:剪贴板三键。**只在远端栏**(用户明确要的「只在远端」),
+                // 写法同上面 Ctrl+N——每个键各自判栏,不共用一个 match,
+                // 免得漏判某一个。
+                if s.as_str() == "c" {
+                    if self.panel_active_column(generation) == Some(PanelColumn::Remote) {
+                        self.dispatch_panel_action(generation, FileAction::ClipCopy);
+                    }
+                    return;
+                }
+                if s.as_str() == "x" {
+                    if self.panel_active_column(generation) == Some(PanelColumn::Remote) {
+                        self.dispatch_panel_action(generation, FileAction::ClipCut);
+                    }
+                    return;
+                }
+                if s.as_str() == "v" {
+                    if self.panel_active_column(generation) == Some(PanelColumn::Remote) {
+                        self.dispatch_panel_action(generation, FileAction::ClipPaste);
                     }
                     return;
                 }
@@ -12673,6 +12768,103 @@ mod tests {
             "Ctrl+N 没判栏 —— 在本地栏按会动到远端(D5)"
         );
         assert!(arm.contains("BeginNewFile"), "Ctrl+N 没派发 BeginNewFile");
+    }
+
+    /// F220:三个剪贴板快捷键只在**远端栏**放行(D5 + 用户明确要的
+    /// 「只在远端」)。焦点在本地栏时静默不动。
+    ///
+    /// 自证会变红:把 `handle_panel_key` 里那段的栏判断删掉。
+    #[test]
+    fn the_clipboard_shortcuts_are_remote_only() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn handle_panel_key(")
+            .nth(1)
+            .expect("找不到 handle_panel_key");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        for (key, action) in [
+            ("\"c\"", "ClipCopy"),
+            ("\"x\"", "ClipCut"),
+            ("\"v\"", "ClipPaste"),
+        ] {
+            let at = body
+                .find(key)
+                .unwrap_or_else(|| panic!("Ctrl+{key} 没接上"));
+            let arm = &body[at..(at + 400).min(body.len())];
+            assert!(
+                arm.contains("PanelColumn::Remote"),
+                "Ctrl+{key} 没判栏 —— 在本地栏按会动到远端"
+            );
+            assert!(arm.contains(action), "Ctrl+{key} 没派发 {action}");
+        }
+    }
+
+    /// F220:剪贴板记录的路径必须是 `cwd.join(单段名字)`,不能整段塞
+    /// `cwd` 自己 —— `mullion_ssh::copy_tree` 那道「目标不能是源的祖先/
+    /// 子孙」的闸判据是字节前缀 + `/` 边界,路径一旦以 `/` 收尾就会被
+    /// 静默绕过(C1 闸修过的那个洞,见 `RemoteClip` 的文档)。
+    ///
+    /// `ClipCopy`/`ClipCut` 复用的是 `PaneState::delete_targets`(与
+    /// `FileAsk::Delete` 同一份判据,见 `apply_remote_file_action` 里的
+    /// 注释),这里直接测那份函数在**根目录**下的输出 —— 根目录最容易
+    /// 暴露「整段塞 cwd」这类退化(非根 cwd 下同样的错误不会撞上这条
+    /// 断言,但会被 `state.rs` 里 `delete_targets_are_absolute_paths_
+    /// paired_with_dir_flags` 那条既有测试的精确路径比对逮到)。
+    ///
+    /// 自证会变红:把 `delete_targets` 里 `self.cwd.join(e.name.as_bytes())`
+    /// 改成 `self.cwd.clone()`。
+    #[test]
+    fn clip_copy_paths_never_end_in_a_slash_or_collapse_to_the_root() {
+        let mut s = crate::files::state::PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(
+            b"/".to_vec(),
+        ));
+        s.entries = vec![mullion_ssh::sftp::Entry {
+            name: mullion_ssh::sftp::RemotePath::from_bytes(b"a.txt".to_vec()),
+            kind: mullion_ssh::sftp::EntryKind::File,
+            size: 0,
+            mtime: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            link_target: None,
+        }];
+        s.selected = [mullion_ssh::sftp::RemotePath::from_bytes(b"a.txt".to_vec())]
+            .into_iter()
+            .collect();
+        let targets = s.delete_targets();
+        assert_eq!(targets.len(), 1, "前提:选中的那一条该被算进去");
+        let path = targets[0].0.as_bytes();
+        assert!(
+            !path.ends_with(b"/"),
+            "路径不该以 / 收尾:{:?}",
+            targets[0].0
+        );
+        assert_ne!(path, b"/", "路径不该塌缩成根目录本身:{:?}", targets[0].0);
+    }
+
+    /// F220:上一条测的是 `delete_targets` 本身安全;这条测的是
+    /// `ClipCopy`/`ClipCut` **真的在用**那份函数,而不是自己另起一份
+    /// 拼路径的逻辑(拆成两条测试的理由同 `delete_targets` 自己的两层
+    /// 判据 —— 各变各的,不许合并成一条,合并了就可能有一半没被真正
+    /// 执行到)。
+    ///
+    /// 自证会变红:把 `apply_remote_file_action` 里 `ClipCopy | ClipCut`
+    /// 那一臂换成手写的 `picked_entries()` + `.map(...)` 拼路径。
+    #[test]
+    fn clip_copy_reuses_delete_targets_instead_of_re_deriving_paths() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("FileAction::ClipCopy | FileAction::ClipCut => {")
+            .nth(1)
+            .expect("找不到 ClipCopy/ClipCut 那一臂");
+        let end = after
+            .find("FileAction::ClipPaste =>")
+            .expect("找不到 ClipCopy/ClipCut 那一臂的结尾");
+        let arm = &after[..end];
+        assert!(
+            arm.contains("delete_targets()"),
+            "ClipCopy/ClipCut 没有复用 delete_targets() —— 又在别处重新拼了一份路径"
+        );
     }
 
     /// F200:F2 / 右键「重命名」**不再弹对话框**,而是让那一行进编辑态。

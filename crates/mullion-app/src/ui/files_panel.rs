@@ -7,6 +7,7 @@
 
 use egui::Ui;
 
+use crate::files::clip::{ClipMode, RemoteClip};
 use crate::files::state::{Load, PaneState};
 use crate::files::{human_size, perm_string, SortKey};
 use crate::theme::{self, Theme};
@@ -60,10 +61,15 @@ pub enum FileAction {
     Reconnect,
     /// F139:把当前目录收进书签。`name` 由 UI 按路径末段算好 —— app 侧只管
     /// 落盘,不重复一遍命名规则。
-    BookmarkAdd { path: String, name: String },
+    BookmarkAdd {
+        path: String,
+        name: String,
+    },
     /// F139:取消收藏。按 `path` 相等匹配 —— 书签的身份就是路径(重名允许,
     /// 同路径不允许重复收藏)。
-    BookmarkRemove { path: String },
+    BookmarkRemove {
+        path: String,
+    },
     /// F200:就地改名提交。**两条都是绝对路径**,在面板里用同一个 `cwd`
     /// 拼好 —— 不像 `GotoInput` 那样把原文丢给 app 侧解析:改名从开始编辑
     /// 到敲回车中间可能隔着好几秒,期间用户完全可能换了目录,app 侧再拿
@@ -83,6 +89,11 @@ pub enum FileAction {
     ///
     /// 名字已经过 `files_dialog::validate_name` 与「目录里没有同名」两道闸。
     NewFile(mullion_ssh::sftp::RemotePath),
+    /// F220:把选中集放进这个标签的远端剪贴板。
+    ClipCopy,
+    ClipCut,
+    /// F220:粘到当前目录。剪贴板空时这一项是置灰的。
+    ClipPaste,
 }
 
 /// F139:画书签相关控件要的两样东西。
@@ -141,6 +152,11 @@ pub enum MenuItem {
     /// F219:就地新建文件。**不是 `Ask`** —— 它不弹框,是让列表首行长出一个
     /// 输入框(同 F200 的改名)。
     NewFile,
+    /// F220:把选中集放进这个标签的远端剪贴板。
+    ClipCopy,
+    ClipCut,
+    /// F220:粘到当前目录。剪贴板空时这一项是置灰的。
+    ClipPaste,
 }
 
 /// 右键那一刻的光标行。**只有「是不是普通文件」和大小** —— 那一刻手上
@@ -176,7 +192,14 @@ fn on(label: &'static str, item: MenuItem) -> MenuEntry {
 /// - `column`:远端栏才有写操作(设计 D5:本地文件管理外包给资源管理器)。
 /// - `target`:光标行。`None` 就不给单目标操作 ——
 ///   给一个点了没反应的菜单项比不给更让人困惑。
-pub fn menu_items_for(column: PanelColumn, target: Option<MenuTarget>) -> Vec<MenuEntry> {
+/// - `clip_ready`:这个标签的远端剪贴板里有东西没(F220)。空的时候
+///   「粘贴」**置灰并说明理由**,不是消失 —— 悄悄少一项,用户只会以为
+///   程序坏了(D3-2)。
+pub fn menu_items_for(
+    column: PanelColumn,
+    target: Option<MenuTarget>,
+    clip_ready: bool,
+) -> Vec<MenuEntry> {
     let mut out: Vec<MenuEntry> = Vec::new();
     if column == PanelColumn::Remote {
         out.push(on("新建文件夹…", MenuItem::Ask(FileAsk::NewDir)));
@@ -204,6 +227,15 @@ pub fn menu_items_for(column: PanelColumn, target: Option<MenuTarget>) -> Vec<Me
             out.push(on("属性(权限)…", MenuItem::Ask(FileAsk::Chmod)));
             out.push(on("删除…", MenuItem::Ask(FileAsk::Delete)));
         }
+        if target.is_some() {
+            out.push(on("复制", MenuItem::ClipCopy));
+            out.push(on("剪切", MenuItem::ClipCut));
+        }
+        out.push(MenuEntry {
+            label: "粘贴",
+            item: MenuItem::ClipPaste,
+            disabled: (!clip_ready).then_some("剪贴板是空的 —— 先在远端栏复制或剪切"),
+        });
     } else {
         if target.is_some() {
             out.push(on("上传到远端", MenuItem::Transfer));
@@ -224,6 +256,9 @@ impl MenuItem {
             MenuItem::EditExternal => FileAction::EditExternal,
             MenuItem::EditInline => FileAction::EditInline,
             MenuItem::NewFile => FileAction::BeginNewFile,
+            MenuItem::ClipCopy => FileAction::ClipCopy,
+            MenuItem::ClipCut => FileAction::ClipCut,
+            MenuItem::ClipPaste => FileAction::ClipPaste,
         }
     }
 }
@@ -235,10 +270,11 @@ fn menu_body(
     id: &str,
     column: PanelColumn,
     target: Option<MenuTarget>,
+    clip_ready: bool,
     hit: &mut Option<MenuItem>,
 ) {
     annotate::mark(ui.ctx(), format!("文件面板/{id}/右键菜单"), ui.max_rect());
-    for e in menu_items_for(column, target) {
+    for e in menu_items_for(column, target, clip_ready) {
         match e.disabled {
             // 置灰项仍然画出来,并且把理由挂成 hover —— 灰着不说话等于没说。
             Some(why) => {
@@ -500,6 +536,10 @@ fn scroll_id_salt(id: &str, generation: u64) -> String {
 /// `drop_in`:F52 —— 此刻从资源管理器往窗口里拖着几个文件。调用方只给
 /// **远端栏**传非零值(本地栏恒 `0`):拖进来的东西一律上传,本地栏收下
 /// 只会是「把本地文件复制到本地」,那是资源管理器自己的事(D5)。
+///
+/// `clip`:F220 —— 这个标签的远端剪贴板(挂在 `PanelFrame` 上,per-tab)。
+/// 只用来算「粘贴」置不置灰、以及剪切源行要不要画淡,本地栏传的这份
+/// 与远端栏共用同一个值也无妨 —— 本地栏压根不画剪贴板相关的项/效果。
 #[allow(clippy::too_many_arguments)] // 跟 session_manager 那批 egui 渲染函数同款,一帧要画的东西天然多
 pub fn show(
     ui: &mut Ui,
@@ -512,8 +552,10 @@ pub fn show(
     bookmarks: BookmarkView<'_>,
     drop_in: usize,
     cols: &mut ColWidths,
+    clip: Option<&RemoteClip>,
 ) -> Option<FileAction> {
     let mut action = None;
+    let clip_ready = clip.is_some();
     annotate::mark(ui.ctx(), format!("文件面板/{id}"), ui.max_rect());
     // 焦点在场才画——常亮等于没有信息量(协调者复核 #2)。颜色取既有语义色
     // `t.accent`(选中态同款),不新造色值(UI 视觉规格已冻结,见 spec §4.6)。
@@ -547,7 +589,7 @@ pub fn show(
         ui.id().with(("files-bg-menu", id, generation)),
         egui::Sense::click(),
     );
-    bg.context_menu(|ui| menu_body(ui, id, column, bg_target, &mut menu_hit));
+    bg.context_menu(|ui| menu_body(ui, id, column, bg_target, clip_ready, &mut menu_hit));
     // F58:对面栏正拖着东西过来 —— 整栏描边,让「松手会传到这儿」在松手
     // **之前**就看得见。判据是「载荷来自另一栏」而不是「有载荷」:同栏内
     // 拖不成立(`drag::drop_target`),给它描边等于承诺一个不会发生的动作。
@@ -860,6 +902,26 @@ pub fn show(
     // F142:属主名字表。跟 `rows` 一样是不可变借用,两者共存没问题;
     // **不 clone** —— 一份表可能有上百个条目,每帧复制一遍纯属浪费。
     let owners = &state.owners;
+    // F220:剪切源要画淡的那批**末段名字**。只在远端栏算(D5:剪贴板只在
+    // 远端出现),本地栏恒空集,不会被同名文件误伤。
+    let cut_names: std::collections::BTreeSet<Vec<u8>> = if column == PanelColumn::Remote {
+        clip.filter(|c| c.mode == ClipMode::Cut)
+            .map(|c| {
+                c.items
+                    .iter()
+                    .map(|(p, _)| {
+                        p.as_bytes()
+                            .rsplit(|b| *b == b'/')
+                            .next()
+                            .unwrap_or_default()
+                            .to_vec()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        std::collections::BTreeSet::new()
+    };
     /// 点中的那一条 + 当时按着的修饰键(ctrl, shift)。F54 的多选语义在
     /// `PaneState::click_row` 里,这里只负责把「点了什么、按着什么」带出闭包。
     type Click = (mullion_ssh::sftp::RemotePath, bool, bool);
@@ -954,7 +1016,17 @@ pub fn show(
                     }
                     continue;
                 }
-                let resp = row(ui, t, e, column, selected.contains(&e.name), cols, owners);
+                let dimmed = cut_names.contains(e.name.as_bytes());
+                let resp = row(
+                    ui,
+                    t,
+                    e,
+                    column,
+                    selected.contains(&e.name),
+                    cols,
+                    owners,
+                    dimmed,
+                );
                 // F58:行既是拖源也是落点。
                 if resp.drag_started() {
                     // 拖一条**没选中**的行:先让它成为唯一选中项。不这么做的话
@@ -998,7 +1070,9 @@ pub fn show(
                 // 目标直接取被右键的这一行 —— 不走 `state.cursor`,那个要等
                 // 出了闭包才更新,这一帧里还是上一条。
                 let tg = menu_target(e);
-                resp.context_menu(|ui| menu_body(ui, id, column, Some(tg), &mut menu_hit));
+                resp.context_menu(|ui| {
+                    menu_body(ui, id, column, Some(tg), clip_ready, &mut menu_hit)
+                });
                 if resp.double_clicked() {
                     match state.enter_target(e) {
                         Some(target) => goto = Some(target),
@@ -1369,6 +1443,7 @@ fn rename_row(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // 同 `show`:一帧要画的东西天然多
 fn row(
     ui: &mut Ui,
     t: &Theme,
@@ -1377,6 +1452,9 @@ fn row(
     selected: bool,
     cols: &ColWidths,
     owners: &crate::files::owners::OwnerNames,
+    // F220:这一行是不是「已经剪切、等着落到别处」的源。只降前景色一档
+    // (`t.fg_muted`),不新造色值(UI 视觉规格已冻结)。
+    dimmed: bool,
 ) -> egui::Response {
     // `click_and_drag` 而不是 `click`(F58):行要能起拖。`clicked()` /
     // `double_clicked()` 在这个 Sense 下照旧 —— egui 只有在指针真的移出
@@ -1428,6 +1506,8 @@ fn row(
     let usable = e.name.is_operable();
     let fg = if !usable {
         theme::c32(t.fg_dimmer)
+    } else if dimmed {
+        theme::c32(t.fg_muted)
     } else if e.kind == EntryKind::Dir {
         theme::c32(t.fg_strong)
     } else {
@@ -1698,6 +1778,15 @@ pub struct PanelFrame {
     /// 移动选中)作用在哪一栏。纯 UI 状态,安全默认值(`Remote`),同样符合
     /// 上面那条「加字段前先想清楚」的约束。
     pub active_column: PanelColumn,
+    /// F220:这个标签的远端剪贴板。`None` = 空。
+    ///
+    /// **per-tab**(设计 B4):里面装的是绝对路径,只对当前这条连接有意义。
+    /// 挂在这里而不是 `App` 上,语义就零歧义 —— 切到别的标签自然是空的。
+    ///
+    /// 默认 `None` 是安全值,符合这个结构体 `Default` 那条「加字段前先想
+    /// 清楚」的约束(它同时当新标签初值和借用过桥的占位):过桥期间被
+    /// `mem::take` 换成 `None` 又原样放回,窗口极短、期间没人读它。
+    pub clip: Option<RemoteClip>,
 }
 
 impl Default for PanelFrame {
@@ -1722,6 +1811,7 @@ impl Default for PanelFrame {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::default(),
+            clip: None,
         }
     }
 }
@@ -1882,6 +1972,7 @@ pub fn sidebar(
                         },
                         0,
                         &mut ui_state.files_cols,
+                        frame.clip.as_ref(),
                     );
                 });
             });
@@ -1917,6 +2008,7 @@ pub fn sidebar(
                         },
                         drop_in,
                         &mut ui_state.files_cols,
+                        frame.clip.as_ref(),
                     );
                 });
             });
@@ -2057,6 +2149,7 @@ pub fn content(
                     },
                     0,
                     cols,
+                    frame.clip.as_ref(),
                 );
             });
             ui.painter()
@@ -2078,6 +2171,7 @@ pub fn content(
                     },
                     drop_in,
                     cols,
+                    frame.clip.as_ref(),
                 );
             });
         });
@@ -2347,6 +2441,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             }));
@@ -2398,6 +2493,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::Remote,
+            clip: None,
         };
         let seq = frame.remote.request_seq;
         frame.remote.accept(
@@ -2637,6 +2733,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             }));
@@ -2746,6 +2843,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -2949,6 +3047,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             }));
@@ -2998,8 +3097,8 @@ mod tests {
     /// 永远不出现远端写操作(加入口时最容易顺手把整套菜单抄过去)。
     #[test]
     fn both_columns_offer_a_transfer_entry_but_only_the_remote_one_can_write() {
-        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()));
-        let local = menu_items_for(PanelColumn::Local, Some(a_file()));
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false);
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false);
         assert!(
             remote.iter().any(|e| e.label == "下载到本地"),
             "远端栏该有下载:{remote:?}"
@@ -3019,12 +3118,49 @@ mod tests {
     #[test]
     fn no_cursor_means_no_transfer_entry_at_all() {
         for column in [PanelColumn::Remote, PanelColumn::Local] {
-            let items = menu_items_for(column, None);
+            let items = menu_items_for(column, None, false);
             assert!(
                 !items.iter().any(|e| e.item == MenuItem::Transfer),
                 "{column:?} 栏在没有光标行时给出了传输入口:{items:?}"
             );
         }
+    }
+
+    /// F220:复制/剪切/粘贴只在远端栏出现(D5:只在远端)。
+    #[test]
+    fn the_clipboard_items_are_remote_only() {
+        let tg = Some(MenuTarget {
+            is_file: true,
+            size: 10,
+        });
+        let remote: Vec<&str> = menu_items_for(PanelColumn::Remote, tg, true)
+            .iter()
+            .map(|e| e.label)
+            .collect();
+        for want in ["复制", "剪切", "粘贴"] {
+            assert!(remote.contains(&want), "远端栏少了「{want}」");
+        }
+        let local: Vec<&str> = menu_items_for(PanelColumn::Local, tg, true)
+            .iter()
+            .map(|e| e.label)
+            .collect();
+        for never in ["复制", "剪切", "粘贴"] {
+            assert!(!local.contains(&never), "本地栏出现了「{never}」(只在远端)");
+        }
+    }
+
+    /// F220:剪贴板空的时候「粘贴」**置灰并说出理由**,不是消失 ——
+    /// 悄悄少一项,用户只会以为程序坏了(D3-2)。
+    ///
+    /// 自证会变红:把那一项改成「剪贴板空就不 push」。
+    #[test]
+    fn paste_is_greyed_out_with_a_reason_when_the_clipboard_is_empty() {
+        let items = menu_items_for(PanelColumn::Remote, None, false);
+        let paste = items
+            .iter()
+            .find(|e| e.label == "粘贴")
+            .expect("剪贴板空时「粘贴」不该消失,该置灰");
+        assert!(paste.disabled.is_some(), "剪贴板空时「粘贴」没置灰");
     }
 
     #[test]
@@ -3110,6 +3246,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                     );
                 });
             });
@@ -3202,6 +3339,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::default(),
+            clip: None,
         };
         frame.remote.entries = vec![entry(b"remote-only.txt", EntryKind::File)];
         frame.remote.load = Load::Ready;
@@ -3390,6 +3528,7 @@ mod tests {
                             BookmarkView::none(),
                             0,
                             &mut cols,
+                            None,
                         );
                     });
                 });
@@ -3439,6 +3578,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -3517,6 +3657,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                     );
                 });
             })
@@ -3615,6 +3756,7 @@ mod tests {
                     BookmarkView::none(),
                     0,
                     &mut cols,
+                    None,
                 );
             });
         });
@@ -3644,6 +3786,7 @@ mod tests {
                     BookmarkView::none(),
                     0,
                     &mut cols,
+                    None,
                 );
             });
         });
@@ -3660,6 +3803,7 @@ mod tests {
                     BookmarkView::none(),
                     0,
                     &mut cols,
+                    None,
                 );
             });
         });
@@ -3705,6 +3849,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::Remote,
+            clip: None,
         };
         assert_eq!(frame.active_state().0, PanelColumn::Remote);
         assert_eq!(
@@ -3758,6 +3903,7 @@ mod tests {
                     },
                     0,
                     cols,
+                    None,
                 );
             });
         });
@@ -3791,6 +3937,7 @@ mod tests {
                     },
                     0,
                     cols,
+                    None,
                 );
             });
         });
@@ -3931,6 +4078,7 @@ mod tests {
             }],
             session_bound: true,
             active_column: PanelColumn::default(),
+            clip: None,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;
@@ -3975,6 +4123,7 @@ mod tests {
             // 关键前提:这个标签**没绑会话记录**(快速连接)。
             session_bound: false,
             active_column: PanelColumn::default(),
+            clip: None,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;
@@ -4173,8 +4322,8 @@ mod tests {
     /// (egui 的 `context_menu` 要一次右键 + 一帧才展开,测起来又脆又慢)。
     #[test]
     fn the_local_column_never_offers_a_write_operation() {
-        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()));
-        let local = menu_items_for(PanelColumn::Local, Some(a_file()));
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false);
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false);
         for ask in [
             FileAsk::NewDir,
             FileAsk::Rename,
@@ -4203,7 +4352,7 @@ mod tests {
         // 按 `MenuItem::NewFile` 这个枚举身份定位那一条 entry,而不是按
         // 标签字符串找 —— 这样「存在性」和「格式(不带省略号)」两件事
         // 才能各自独立变红,不会被字符串精确匹配捆在一起。
-        let remote = menu_items_for(PanelColumn::Remote, None);
+        let remote = menu_items_for(PanelColumn::Remote, None, false);
         let entry = remote
             .iter()
             .find(|e| e.item == MenuItem::NewFile)
@@ -4212,7 +4361,7 @@ mod tests {
             !entry.label.ends_with('…'),
             "「新建文件」带了省略号 —— 那是弹框的记号"
         );
-        let local = menu_items_for(PanelColumn::Local, None);
+        let local = menu_items_for(PanelColumn::Local, None, false);
         assert!(
             !local.iter().any(|e| e.item == MenuItem::NewFile),
             "本地栏出现了写操作(D5:本地文件管理外包给资源管理器)"
@@ -4223,7 +4372,7 @@ mod tests {
     /// 给一个「点了没反应」的菜单项比不给更让人困惑。
     #[test]
     fn single_target_operations_are_absent_without_a_cursor_row() {
-        let items = menu_items_for(PanelColumn::Remote, None);
+        let items = menu_items_for(PanelColumn::Remote, None, false);
         for ask in [FileAsk::Rename, FileAsk::Chmod, FileAsk::Delete] {
             assert!(
                 !items.iter().any(|e| e.item == MenuItem::Ask(ask)),
@@ -4828,6 +4977,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -4883,7 +5033,7 @@ mod tests {
     /// 本地文件本来就该在资源管理器里双击。
     #[test]
     fn the_local_column_never_offers_a_remote_edit_entry() {
-        let local = menu_items_for(PanelColumn::Local, Some(a_file()));
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false);
         assert!(
             !local
                 .iter()
@@ -4891,7 +5041,7 @@ mod tests {
             "本地栏冒出了远端编辑入口:{local:?}"
         );
         // 反面:远端栏必须有,否则上一条断言在「谁都没有」时也是绿的。
-        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()));
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false);
         assert!(
             remote
                 .iter()
@@ -4907,7 +5057,7 @@ mod tests {
             is_file: false,
             size: 4096,
         };
-        let items = menu_items_for(PanelColumn::Remote, Some(dir));
+        let items = menu_items_for(PanelColumn::Remote, Some(dir), false);
         assert!(
             !items
                 .iter()
@@ -4926,7 +5076,7 @@ mod tests {
             is_file: true,
             size: crate::edit::INLINE_LIMIT + 1,
         };
-        let items = menu_items_for(PanelColumn::Remote, Some(big));
+        let items = menu_items_for(PanelColumn::Remote, Some(big), false);
         let inline = items
             .iter()
             .find(|e| e.item == MenuItem::EditInline)
@@ -4946,7 +5096,7 @@ mod tests {
             is_file: true,
             size: crate::edit::EXTERNAL_LIMIT + 1,
         };
-        let items = menu_items_for(PanelColumn::Remote, Some(huge));
+        let items = menu_items_for(PanelColumn::Remote, Some(huge), false);
         assert!(
             items
                 .iter()
@@ -4986,6 +5136,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -5056,6 +5207,7 @@ mod tests {
                             BookmarkView::none(),
                             0,
                             &mut cols,
+                            None,
                         );
                     });
                 });
@@ -5148,6 +5300,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -5491,6 +5644,7 @@ mod tests {
             }],
             session_bound: true,
             active_column: PanelColumn::default(),
+            clip: None,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;
@@ -5592,6 +5746,7 @@ mod tests {
                 local_bookmarks: Vec::new(),
                 session_bound: false,
                 active_column: active,
+                clip: None,
             };
             frame.local.entries = vec![entry(b"local-a.txt", EntryKind::File)];
             frame.local.load = Load::Ready;
@@ -5648,6 +5803,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::Local,
+            clip: None,
         };
         frame.local.entries = (0..200)
             .map(|i| entry(format!("local-{i}.txt").as_bytes(), EntryKind::File))
@@ -5842,6 +5998,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             }));
@@ -5977,6 +6134,7 @@ mod tests {
                             false,
                             &cols,
                             &crate::files::owners::OwnerNames::default(),
+                            false,
                         );
                     });
                 });
@@ -6050,6 +6208,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -6137,6 +6296,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -6260,6 +6420,7 @@ mod tests {
             local_bookmarks: Vec::new(),
             session_bound: false,
             active_column: PanelColumn::default(),
+            clip: None,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;
@@ -6421,6 +6582,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             });
@@ -6500,6 +6662,7 @@ mod tests {
                             BookmarkView::none(),
                             0,
                             cols,
+                            None,
                         );
                     });
                 }));
@@ -6562,6 +6725,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                     );
                 });
             })
@@ -6656,6 +6820,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                     );
                 });
             })
@@ -6740,6 +6905,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                     );
                 });
             })
@@ -6824,6 +6990,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                     );
                 });
             })
@@ -6884,6 +7051,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                     );
                 });
             })
@@ -6966,6 +7134,7 @@ mod tests {
                                 BookmarkView::none(),
                                 0,
                                 c,
+                                None,
                             );
                         });
                     })
@@ -7025,6 +7194,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                     );
                 });
             })
