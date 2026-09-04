@@ -113,6 +113,13 @@ pub fn unique_name(
 }
 
 /// 一次粘贴的计划。`existing` = 目标目录里现有的名字(预检查列回来的)。
+///
+/// **调用方要保证**:`items` 里的路径既不以 `/` 结尾、也不是根 `/`。两者的
+/// 末段都是空的(见 `last_segment`),`dst_dir.join(&[])` 拼出来就是 `dst_dir`
+/// **自己** —— 源会被当成「写进目标目录本身」,静默不报错。按既有惯例拼
+/// (`cwd.join(readdir 给的单段名)`,同 `state.rs` 的 `delete_targets`)结构上
+/// 就不可能拼出这种路径,所以这里不设补偿分支:在这一层补,只写得出恒绿的
+/// 守护(它挡的输入没有任何调用方产得出来)。
 pub fn plan_paste(
     items: &[(RemotePath, bool)],
     dst_dir: &RemotePath,
