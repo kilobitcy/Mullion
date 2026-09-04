@@ -440,3 +440,70 @@ async fn a_non_operable_path_is_refused_by_recursive_delete_without_any_request(
     assert!(p.execs.is_empty(), "一条 exec 都不该发: {:?}", p.execs);
     assert!(p.paths_for("remove").is_empty() && p.paths_for("rmdir").is_empty());
 }
+
+// ---- 新建空文件(F219)------------------------------------------------------
+
+/// `tree()` 里 `a.txt` 是 `Node::file`,`data` 字段是空的(`size` 只是标称值)
+/// —— 检验「EXCLUDE 撞上已存在不许改动内容」时需要一个**真有内容**的既存
+/// 文件,否则「内容没被动过」这条断言在改坏之前就已经是真的,测试就是恒绿的。
+fn tree_with_real_content() -> Tree {
+    let mut t = tree();
+    let entries = t.get_mut(b"/home/testuser".as_slice()).unwrap();
+    if let Some(n) = entries.iter_mut().find(|n| n.name == b"a.txt") {
+        *n = Node::file_with(b"a.txt", b"hello, this is real content");
+    }
+    t
+}
+
+/// F219:新建一个空文件 —— 服务端上真的多出这一条,且大小为 0。
+///
+/// 判据是**服务端的树**,不是「客户端返回了 Ok」:后者恒绿,一个什么都
+/// 不做的实现照样通过。
+#[tokio::test]
+async fn creating_a_file_makes_an_empty_one_appear_on_the_server() {
+    let (addr, _probe, tree_h) = common::spawn_sftp_server(tree()).await;
+    let sftp = client(addr).await;
+    sftp.create_file(&rp("/home/testuser/notes.txt"))
+        .await
+        .expect("新建文件该成功");
+    let t = tree_h.lock().unwrap();
+    assert!(
+        exists(&t, b"/home/testuser/notes.txt"),
+        "服务端上没有这个文件,实际:{:?}",
+        names_in(&t, b"/home/testuser")
+    );
+}
+
+/// F219 的核心闸门:**撞上已存在必须失败**,不能把别人的文件截断成 0 字节。
+///
+/// 自证会变红:把 `create_file` 里的 `OpenFlags::EXCLUDE` 去掉。
+#[tokio::test]
+async fn creating_a_file_that_already_exists_fails_instead_of_truncating_it() {
+    let (addr, _probe, tree_h) = common::spawn_sftp_server(tree_with_real_content()).await;
+    let sftp = client(addr).await;
+    let before = {
+        let t = tree_h.lock().unwrap();
+        t.get(&b"/home/testuser".to_vec())
+            .expect("父目录该在")
+            .iter()
+            .find(|n| n.name == b"a.txt")
+            .expect("a.txt 该在")
+            .data
+            .clone()
+    };
+    assert!(!before.is_empty(), "前提:这个文件本来有内容");
+
+    let err = sftp.create_file(&rp("/home/testuser/a.txt")).await;
+    assert!(err.is_err(), "撞上已存在的文件该失败,而不是悄悄覆盖");
+
+    let t = tree_h.lock().unwrap();
+    let after = t
+        .get(&b"/home/testuser".to_vec())
+        .expect("父目录该在")
+        .iter()
+        .find(|n| n.name == b"a.txt")
+        .expect("a.txt 该在")
+        .data
+        .clone();
+    assert_eq!(after, before, "文件内容被动过了 —— EXCLUDE 没生效");
+}

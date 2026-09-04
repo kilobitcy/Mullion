@@ -430,6 +430,28 @@ impl SftpClient {
         Ok(RemoteFile { file })
     }
 
+    /// 新建一个**空文件**。已存在就失败(F219)。
+    ///
+    /// flags 带 `EXCLUDE` —— 与 `open_write` 刻意不带的理由正好相反:
+    /// 传输通路要不要覆盖由上层的冲突策略决定(设计 D19),而「新建」撞上
+    /// 已存在必须当场失败。不带的话,用户在一个已有 `config.yaml` 的目录里
+    /// 手滑建了个同名文件,那份配置会被**静默截断成 0 字节** —— 没有任何
+    /// 报错,而远端删除/覆盖不可逆。
+    pub async fn create_file(&self, path: &RemotePath) -> Result<(), SftpError> {
+        let wire = path.as_wire()?;
+        let flags = russh_sftp::protocol::OpenFlags::WRITE
+            | russh_sftp::protocol::OpenFlags::CREATE
+            | russh_sftp::protocol::OpenFlags::EXCLUDE;
+        let file = self
+            .inner
+            .open_with_flags(wire, flags)
+            .await
+            .map_err(|e| SftpError::Protocol(e.to_string()))?;
+        // finish() 里做 flush + close;句柄不收尾的话服务端那边会一直
+        // 挂着一个打开的文件(见 `RemoteFile` 文档)。
+        RemoteFile { file }.finish().await
+    }
+
     /// 一次把整个远端文件读进内存(F53 编辑用)。**带上限**。
     ///
     /// 编辑通路的两条大小闸门(内置 1 MB / 外部 64 MB)最终都落在这里。
