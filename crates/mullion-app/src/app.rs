@@ -4665,12 +4665,19 @@ impl App {
                 );
             }
             PasteDecision::Dispatch { policy } => {
-                self.dispatch_paste(generation, dst, clip, policy);
+                self.dispatch_paste(generation, dst, clip, seq, policy);
             }
+            // F220 B6:批量冲突框携带的是**这一刻冻结的** `dst`/`clip`/`seq`,
+            // 不是等用户选完之后再回头读面板状态 —— 这个框比一次预检查
+            // 往返活得久得多(用户思考是几秒到几分钟),按名字算好的
+            // `names` 才对得上框里显示的和最终要粘的是同一批东西。
             PasteDecision::Conflict { names, mode_is_cut } => {
                 self.ui.files_dialog = Some(crate::ui::files_dialog::FilesDialog::PasteConflict {
                     names,
                     mode_is_cut,
+                    dst,
+                    clip,
+                    seq,
                 });
                 self.request_ui_redraw();
             }
@@ -4679,20 +4686,24 @@ impl App {
 
     /// F220:真正执行一次粘贴(`cp -a` 快路径 / SFTP 逐文件回退)。
     ///
-    /// **本任务(B5)的桩** —— 整个函数体到 Task B7 会被替换掉。刻意不是
+    /// **本任务(B6)仍是桩** —— 整个函数体到 Task B7 会被替换掉。刻意不是
     /// 静默空函数:什么都不做又不吭声,用户选完冲突处置会以为粘贴丢了。
     ///
-    /// `dst`/`clip` 由调用方传入(冻结自 `start_paste`),B7 接手时**不要**
-    /// 改成在这里重新读面板状态 —— 那正是复核 C1/I2 打回来的那个错。
+    /// `dst`/`clip`/`seq` 由调用方传入(冻结自 `start_paste`,冲突框那条路
+    /// 上经 `FilesDialog::PasteConflict` → `FileOp::Paste` 原样带回),B7
+    /// 接手时**不要**改成在这里重新读面板状态 —— 那正是复核 C1/I2 打回来
+    /// 的那个错。`seq` 留给 B7 判断要不要在真正派发前再核一遍是否过期
+    /// (冲突框开着的这段时间比一次网络往返宽得多)。
     fn dispatch_paste(
         &mut self,
         generation: u64,
         dst: mullion_ssh::sftp::RemotePath,
         clip: crate::files::clip::RemoteClip,
+        seq: u64,
         policy: crate::files::clip::Policy,
     ) {
         log::warn!(
-            "F220:粘贴执行尚未接通(generation={generation},dst={dst:?},items={},policy={policy:?},留给 B7)",
+            "F220:粘贴执行尚未接通(generation={generation},dst={dst:?},items={},seq={seq},policy={policy:?},留给 B7)",
             clip.items.len()
         );
     }
@@ -5080,6 +5091,20 @@ impl App {
             self.resolve_edit(key, choice);
             return;
         }
+        // F220:批量冲突框选完了。同上提前分流 —— `dispatch_paste` 自己管
+        // 要不要开 SFTP 通道(B7 的活),不走下面这条通用「先拿 client 再判
+        // op 是什么」的路径。`dst`/`clip`/`seq` 原样转发,不在这里重新读
+        // 面板状态(复核 C1/I2 的教训)。
+        if let FileOp::Paste {
+            dst,
+            clip,
+            seq,
+            policy,
+        } = op
+        {
+            self.dispatch_paste(generation, dst, clip, seq, policy);
+            return;
+        }
 
         let Some(tab) = self.tabs.by_generation(generation) else {
             return;
@@ -5112,8 +5137,8 @@ impl App {
                     .map_err(|e| e.to_string()),
                 FileOp::Delete { targets } => delete_all(&client, conn.as_ref(), &targets).await,
                 // 函数开头已经分流走了,走到这里说明分流被删了。
-                FileOp::Resolve { .. } | FileOp::ResolveEdit { .. } => {
-                    unreachable!("冲突处置不该走远端写操作这条路")
+                FileOp::Resolve { .. } | FileOp::ResolveEdit { .. } | FileOp::Paste { .. } => {
+                    unreachable!("冲突处置 / 粘贴不该走远端写操作这条路")
                 }
             };
             let _ = proxy.send_event(UserEvent::SftpOpDone {
@@ -13239,20 +13264,56 @@ mod tests {
     /// 值级测试的角度构造"面板状态被改过"这件事本身,`App` 又造不出来,
     /// 只能退回源码切片核对接线没有重新搭回旧路。
     ///
-    /// 自证会变红:在 `accept_paste_check` 里加回
-    /// `let dst = files.remote.cwd.clone();` 或 `files.clip.clone()`。
+    /// **判据是白名单而不是黑名单**(F220 B6 复核挖出的真绕法)——旧版本
+    /// 只黑两个字面串(`"files.remote.cwd"`/`"files.clip"`),而
+    /// ```ignore
+    /// let panel = &files.remote;
+    /// let _live_cwd = panel.cwd.clone();
+    /// ```
+    /// 经 `panel` 这个新名字转一手,原样复现了「重新读活状态」这个 bug,
+    /// 却不含那两个字面串,黑名单版本照样绿。新判据扫 `files` 这个绑定
+    /// 在函数体里的**每一处**字段访问,要求全都恰好是
+    /// `files.remote.paste_seq`(这是本函数唯一允许经 `files` 读的东西,
+    /// 用来判定这份预检查结果有没有过期)——不管绕道换几次名字,只要最终
+    /// 是从 `files.` 起手的访问,就逃不过这道扫描;真正堵住"换名字转一手"
+    /// 这条路的是它不再认"字面串出现过没有",而是"`files.` 后面接的是不是
+    /// 那唯一允许的路径"。
+    ///
+    /// 自证会变红(两种独立验证过的绕法都试过,见下面测试体):
+    /// 1. 原黑名单版本测不出来的转手读:插入
+    ///    `let panel = &files.remote; let _c = panel.cwd.clone();`。
+    /// 2. 直接加回 `files.remote.cwd.clone()` 或 `files.clip.clone()`。
     #[test]
     fn accept_paste_check_never_rereads_the_live_panel_state() {
         let body = body_of(prod_src(), "fn accept_paste_check(");
+        const ALLOWED: &str = "files.remote.paste_seq";
+        let mut idx = 0;
+        let mut checked_at_least_once = false;
+        while let Some(rel) = body[idx..].find("files.") {
+            let at = idx + rel;
+            let prev = if at == 0 {
+                None
+            } else {
+                Some(body.as_bytes()[at - 1])
+            };
+            let word_boundary = prev.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_'));
+            if word_boundary {
+                checked_at_least_once = true;
+                let window = &body[at..(at + ALLOWED.len().max(40)).min(body.len())];
+                assert!(
+                    body[at..].starts_with(ALLOWED),
+                    "accept_paste_check 里有一处经 `files` 绑定的访问不是唯一\
+                     允许的 `{ALLOWED}`(在「{window}」附近)—— 这个函数只准\
+                     用 `files` 读 `paste_seq` 判过期,`dst`/`clip` 一律用事件\
+                     里冻结的那两份,不许经 `files`(哪怕转个名字)重新读"
+                );
+            }
+            idx = at + "files.".len();
+        }
         assert!(
-            !body.contains("files.remote.cwd"),
-            "accept_paste_check 又在从面板重新读目标目录 —— 应该用事件里\
-             冻结的那个 dst"
-        );
-        assert!(
-            !body.contains("files.clip"),
-            "accept_paste_check 又在从面板重新读剪贴板 —— 应该用事件里\
-             冻结的那份 clip"
+            checked_at_least_once,
+            "一次 `files.` 访问都没扫到 —— 判据本身失效了(锚点漂移?),\
+             不是「函数写对了」"
         );
     }
 

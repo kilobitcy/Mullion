@@ -63,11 +63,20 @@ pub enum FilesDialog {
     /// `names` 是撞了名的那些**末段名字**(给用户看,不参与拼路径)。
     /// `mode_is_cut` 决定按钮文案说的是「移动」还是「复制」。
     ///
-    /// 渲染是 Task B6 的活 —— 这一步还没有,`show` 里先接一个空臂,
-    /// `cancel_op` 先当成「没有在途工作,取消就是只关框」。
+    /// `dst`/`clip`/`seq` 是 `start_paste` 那一刻冻结的目标目录、剪贴板与
+    /// 序号(原样带过来,见 `FileOp::Paste` 的文档)。**这个框比一次网络
+    /// 往返活得更久**——用户在它前面思考的时间是几秒到几分钟,如果到
+    /// 「选完了」那一刻才回头去读面板当下的 `cwd`/`clip`,等于在一个比
+    /// 预检查往返宽得多的窗口上重新打开 B5 刚堵上的那个洞(目标目录被
+    /// 换成源自身的子孙、剪贴板被换成另一批文件,而这个框上显示的
+    /// `names` 是按旧的那份算出来的)。选完之后原样把这三个值带回
+    /// `FileOp::Paste`,不在这里重新派生。
     PasteConflict {
         names: Vec<String>,
         mode_is_cut: bool,
+        dst: RemotePath,
+        clip: crate::files::clip::RemoteClip,
+        seq: u64,
     },
 }
 
@@ -102,6 +111,15 @@ pub enum FileOp {
         job: u64,
         choice: crate::files::queue::Conflict,
         apply_all: bool,
+    },
+    /// F220:批量冲突框里选完了。`dst`/`clip`/`seq` 原样带回
+    /// `FilesDialog::PasteConflict` 冻结的那三个值 —— `app.rs` 用它们
+    /// 派发真正的写,不回头去读面板当下的状态(理由同该变体的文档)。
+    Paste {
+        dst: RemotePath,
+        clip: crate::files::clip::RemoteClip,
+        seq: u64,
+        policy: crate::files::clip::Policy,
     },
 }
 
@@ -198,7 +216,7 @@ pub fn bits_from_mode(mode: u32) -> [bool; 9] {
 /// 标题栏上的 ✕。两处各写一遍的话,迟早有一处漏掉后两个变体那条
 /// 「不能只关框」的规矩 —— 而漏掉的症状是传输队列静静地永远走不动。
 ///
-/// 前四个框没有在途状态,关掉就完了;后两个框各自代表一条**挂起的工作**
+/// 前五个框没有在途状态,关掉就完了;后两个框各自代表一条**挂起的工作**
 /// (一条 job / 一条编辑),不给出处置它们就永远挂着。
 pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
     match d {
@@ -225,8 +243,8 @@ pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
     }
 }
 
-/// 五个框共用的外壳。模态框的属性(不可折叠、不可缩放、居中、标题栏上有
-/// ✕)只写一处 —— 五份复制粘贴里总有一份会漏掉 `.collapsible(false)`。
+/// 六个框共用的外壳。模态框的属性(不可折叠、不可缩放、居中、标题栏上有
+/// ✕)只写一处 —— 六份复制粘贴里总有一份会漏掉 `.collapsible(false)`。
 ///
 /// 返回 **`true` = 用户点了标题栏上那颗 ✕**(F203)。不在这里直接收口,是
 /// 因为「取消该干什么」按框而异(见 [`cancel_op`]),而 `body` 闭包这会儿
@@ -488,10 +506,74 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 cancelled!();
             }
         }
-        // F220:变体本任务(B5)就加进来了(`accept_paste_check` 要构造它),
-        // 渲染是 Task B6 的活 —— 在那之前这个框开着也画不出来,`modal_open`
-        // 仍然会因为 `files_dialog.is_some()` 而判定「有模态盖着」。
-        FilesDialog::PasteConflict { .. } => {}
+        FilesDialog::PasteConflict {
+            names,
+            mode_is_cut,
+            dst,
+            clip,
+            seq,
+        } => {
+            let verb = if *mode_is_cut { "移动" } else { "复制" };
+            let n = names.len();
+            let list = names.clone();
+            let dst = dst.clone();
+            let clip = clip.clone();
+            let seq = *seq;
+            let x = modal(ctx, "目标目录里已有同名项", |ui| {
+                ui.colored_label(
+                    theme::c32(t.danger_text),
+                    format!("有 {n} 项与目标目录里的同名"),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "选「覆盖」会用{verb}过去的那份盖掉原有内容,不可逆。"
+                    ))
+                    .color(theme::c32(t.fg_muted)),
+                );
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for name in &list {
+                            ui.label(name);
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button("覆盖").clicked() {
+                        op = Some(FileOp::Paste {
+                            dst: dst.clone(),
+                            clip: clip.clone(),
+                            seq,
+                            policy: crate::files::clip::Policy::Overwrite,
+                        });
+                        close = true;
+                    }
+                    if ui.button("跳过同名").clicked() {
+                        op = Some(FileOp::Paste {
+                            dst: dst.clone(),
+                            clip: clip.clone(),
+                            seq,
+                            policy: crate::files::clip::Policy::Skip,
+                        });
+                        close = true;
+                    }
+                    if ui.button("保留两者").clicked() {
+                        op = Some(FileOp::Paste {
+                            dst: dst.clone(),
+                            clip: clip.clone(),
+                            seq,
+                            policy: crate::files::clip::Policy::KeepBoth,
+                        });
+                        close = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancelled!();
+                    }
+                });
+            });
+            if x {
+                cancelled!();
+            }
+        }
     }
 
     if close {
@@ -522,6 +604,15 @@ mod tests {
 
     fn rp(s: &str) -> RemotePath {
         RemotePath::from_bytes(s.as_bytes().to_vec())
+    }
+
+    /// 测试用的一份剪贴板快照 —— 只是要让 `PasteConflict`/`FileOp::Paste`
+    /// 里的 `clip` 字段有内容可比,具体路径不重要。
+    fn sample_clip() -> crate::files::clip::RemoteClip {
+        crate::files::clip::RemoteClip {
+            mode: crate::files::clip::ClipMode::Copy,
+            items: vec![(rp("/src/a.txt"), false)],
+        }
     }
 
     /// F203:`cancel_op` 是「取消这件事」的唯一真值 —— 六个变体一个不落。
@@ -559,6 +650,9 @@ mod tests {
             FilesDialog::PasteConflict {
                 names: vec!["a.txt".into()],
                 mode_is_cut: false,
+                dst: rp("/dst"),
+                clip: sample_clip(),
+                seq: 1,
             },
         ];
         for d in &all {
@@ -620,6 +714,7 @@ mod tests {
             ),
             ("编辑冲突", edit_conflict()),
             ("传输冲突", conflict(true)),
+            ("粘贴冲突", paste_conflict()),
         ] {
             let want = cancel_op(d.as_ref().expect("前提:框是开着的"));
             let op =
@@ -676,6 +771,16 @@ mod tests {
             name: "a.bin".into(),
             job: 3,
             apply_all,
+        })
+    }
+
+    fn paste_conflict() -> Option<FilesDialog> {
+        Some(FilesDialog::PasteConflict {
+            names: vec!["a.txt".into(), "b.txt".into()],
+            mode_is_cut: false,
+            dst: rp("/dst"),
+            clip: sample_clip(),
+            seq: 1,
         })
     }
 
@@ -1053,5 +1158,85 @@ mod tests {
             click_button(&mut d, "新建"),
             Some(FileOp::NewDir(rp("/srv/app/日志")))
         );
+    }
+
+    /// F220:冲突框给三条出路,且**列出撞了哪几条** —— 只说「有冲突」
+    /// 用户没法判断该选哪个。
+    #[test]
+    fn the_paste_conflict_dialog_offers_three_ways_out_and_names_the_collisions() {
+        let mut d = Some(FilesDialog::PasteConflict {
+            names: vec!["a.txt".into(), "b.txt".into()],
+            mode_is_cut: false,
+            dst: rp("/dst"),
+            clip: sample_clip(),
+            seq: 1,
+        });
+        let texts = dialog_texts(&mut d);
+        for want in ["覆盖", "跳过同名", "保留两者", "a.txt", "b.txt"] {
+            assert!(
+                texts.iter().any(|s| s.contains(want)),
+                "冲突框里没有「{want}」,实际:{texts:?}"
+            );
+        }
+    }
+
+    /// F220:取消 / ✕ = **整批不动**。粘贴还没发出去,没有挂起的工作要处置
+    /// (与 `Conflict`/`EditConflict` 那两个框正相反)。
+    ///
+    /// 自证会变红:把 `cancel_op` 里 `PasteConflict` 归到 `Some(..)` 那一组。
+    #[test]
+    fn cancelling_a_paste_conflict_does_nothing_at_all() {
+        let d = FilesDialog::PasteConflict {
+            names: vec!["a.txt".into()],
+            mode_is_cut: false,
+            dst: rp("/dst"),
+            clip: sample_clip(),
+            seq: 1,
+        };
+        assert_eq!(cancel_op(&d), None, "取消粘贴不该发出任何处置");
+    }
+
+    /// F220:框里那颗「取消」按钮(不是标题栏的 ✕,那条走
+    /// `every_dialog_offers_a_close_cross_that_means_cancel`)也要关框、
+    /// 不发处置 —— 光测 `cancel_op` 这个纯函数测不出 `show()` 里的
+    /// `cancelled!()` 是不是真的接在这颗按钮上。
+    #[test]
+    fn clicking_the_in_dialog_cancel_button_closes_without_an_op() {
+        let mut d = paste_conflict();
+        assert_eq!(click_button(&mut d, "取消"), None, "取消不该发出任何写操作");
+        assert!(d.is_none(), "点「取消」之后框必须关掉");
+    }
+
+    /// F220:三颗按钮各自送回对应的处置,且**原样带回冻结的 `dst`/`clip`/
+    /// `seq`** —— 不是只送回 `policy`。这是复核 C1/I2 那条「不许到时候
+    /// 现算,必须用冻结值」在渲染层这一端的落地:用不同于「随手写一个」
+    /// 的 `dst`/`clip`/`seq`(与 `sample_clip()`/`1` 精确核对),任何一处
+    /// 把这三个字段漏传、传错、或者干脆现造一份,这条测试都会先炸。
+    #[test]
+    fn each_button_sends_back_its_own_policy() {
+        for (label, want) in [
+            ("覆盖", crate::files::clip::Policy::Overwrite),
+            ("跳过同名", crate::files::clip::Policy::Skip),
+            ("保留两者", crate::files::clip::Policy::KeepBoth),
+        ] {
+            let mut d = Some(FilesDialog::PasteConflict {
+                names: vec!["a.txt".into()],
+                mode_is_cut: false,
+                dst: rp("/dst"),
+                clip: sample_clip(),
+                seq: 1,
+            });
+            assert_eq!(
+                click_button(&mut d, label),
+                Some(FileOp::Paste {
+                    dst: rp("/dst"),
+                    clip: sample_clip(),
+                    seq: 1,
+                    policy: want,
+                }),
+                "「{label}」送回的处置不对"
+            );
+            assert!(d.is_none(), "点完「{label}」框没关");
+        }
     }
 }
