@@ -13271,18 +13271,42 @@ mod tests {
     /// let _live_cwd = panel.cwd.clone();
     /// ```
     /// 经 `panel` 这个新名字转一手,原样复现了「重新读活状态」这个 bug,
-    /// 却不含那两个字面串,黑名单版本照样绿。新判据扫 `files` 这个绑定
-    /// 在函数体里的**每一处**字段访问,要求全都恰好是
+    /// 却不含那两个字面串,黑名单版本照样绿。新判据扫**字面前缀
+    /// `files.`** 在函数体里的每一处出现,要求全都恰好是
     /// `files.remote.paste_seq`(这是本函数唯一允许经 `files` 读的东西,
-    /// 用来判定这份预检查结果有没有过期)——不管绕道换几次名字,只要最终
-    /// 是从 `files.` 起手的访问,就逃不过这道扫描;真正堵住"换名字转一手"
-    /// 这条路的是它不再认"字面串出现过没有",而是"`files.` 后面接的是不是
-    /// 那唯一允许的路径"。
+    /// 用来判定这份预检查结果有没有过期)。
     ///
-    /// 自证会变红(两种独立验证过的绕法都试过,见下面测试体):
-    /// 1. 原黑名单版本测不出来的转手读:插入
+    /// **这道扫描的边界要说清楚,别再重蹈这条注释上一版的覆辙**
+    /// (上一版写的「不管绕道换几次名字都逃不过」被复核实证证伪了)——
+    /// 它防得住的是**沿用 `files` 这个绑定名、只在字段链后半段转手**的
+    /// 那一种回归形状(比如上面的 `panel = &files.remote` 例子,`files.`
+    /// 前缀还在,后面接的字段不对就会被抓到)。它防不住**把 `files`
+    /// 整体改名**:
+    /// ```ignore
+    /// let f2 = files;
+    /// let live_dst = f2.remote.cwd.clone();
+    /// ```
+    /// 一改名,后续访问全都不含 `files.` 子串,这道扫描一次也碰不到——
+    /// 复核实测过,`checked_at_least_once` 依然是 `true`(唯一合法的
+    /// `files.remote.paste_seq` 还在),于是判定「全部访问都合法」,
+    /// `cargo test --workspace` 照样全绿。这是**假阴性**,不是「真的没有
+    /// 非法访问」。
+    ///
+    /// 真正的防线不在这道扫描上,在 `decide_paste` 的**签名**:它是纯函数,
+    /// 类型层面就没有 `PanelFrame` 可读,想重新读都读不到(见下面两条
+    /// 值级测试)。这道源码切片只是「`accept_paste_check` 到底把哪个
+    /// `dst`/`clip` 递给 `decide_paste`」这个纯接线问题的补充判据,专治
+    /// 「沿用同一个绑定名转手读」这一种具体回归形状,不是完整证明——
+    /// 没有 `PanelFrame`/`App` 就没法从值级测试的角度把「接线搭错」这件事
+    /// 本身构造出来,只能退回源码切片,而源码切片天然只能防「认识的写法」。
+    ///
+    /// 自证会变红(两种独立验证过的绕法,均已被这道扫描逮到 —— 见测试体):
+    /// 1. 沿用 `files` 转手读:插入
     ///    `let panel = &files.remote; let _c = panel.cwd.clone();`。
     /// 2. 直接加回 `files.remote.cwd.clone()` 或 `files.clip.clone()`。
+    ///
+    /// （第三种 —— 把 `files` 整体改名 —— 不在这道扫描的覆盖范围内,
+    /// 上面已经说明为什么,不重复验证一个已知测不出来的东西。）
     #[test]
     fn accept_paste_check_never_rereads_the_live_panel_state() {
         let body = body_of(prod_src(), "fn accept_paste_check(");
@@ -13305,7 +13329,9 @@ mod tests {
                     "accept_paste_check 里有一处经 `files` 绑定的访问不是唯一\
                      允许的 `{ALLOWED}`(在「{window}」附近)—— 这个函数只准\
                      用 `files` 读 `paste_seq` 判过期,`dst`/`clip` 一律用事件\
-                     里冻结的那两份,不许经 `files`(哪怕转个名字)重新读"
+                     里冻结的那两份,不许沿用 `files.` 这个前缀重新读(把\
+                     `files` 整体改名字绕过去的话,这道扫描逮不住,见函数\
+                     文档的边界说明)"
                 );
             }
             idx = at + "files.".len();
@@ -13314,6 +13340,103 @@ mod tests {
             checked_at_least_once,
             "一次 `files.` 访问都没扫到 —— 判据本身失效了(锚点漂移?),\
              不是「函数写对了」"
+        );
+    }
+
+    /// F220 复核问题 1:`apply_file_op` 对 `FileOp::Paste` 的分流,在这条
+    /// 测试之前**完全没有守护**——之前跑绿的三条 `each_button_sends_back_
+    /// its_own_policy` 之类摸的是 `files_dialog::show`,够不到 `app.rs`
+    /// 这一段接线。
+    ///
+    /// 复核者构造的退化(编译过、`cargo test --workspace` 全绿):把
+    /// `if let FileOp::Paste { dst, clip, seq, policy } = op` 改成
+    /// `if let FileOp::Paste { seq, policy, .. } = op`,块内另起
+    /// `self.tabs.by_generation(generation).and_then(|t| t.content
+    /// .files_panel())` 现读 `files.remote.cwd`/`files.clip` 顶替
+    /// `dst`/`clip`。这正是约束 1 要防的 Critical 在这一段的完整复现,
+    /// 窗口是用户在冲突框前思考的几秒到几分钟。
+    ///
+    /// 判据:①解构模式必须字面绑定 `dst`/`clip`(不能退化成 `..`);
+    /// ②这个分流块体里不许出现 `files_panel`——它是取『活面板状态』的
+    /// **唯一入口**,不管现读出来的东西转手起什么新名字,这一步躲不掉
+    /// (与上面那条「防换名字」的教训不同:这里防的不是「跟着 `files.`
+    /// 前缀找字段」,而是直接堵调用点本身,所以不怕整体改名)。**这道
+    /// 守护只管这一个 if-let 分流块**,不覆盖整个 `apply_file_op`——那个
+    /// 函数别的分支合法地要用 `files_panel()`(通用写操作要拿
+    /// `sftp_client()`),不能整函数禁掉这个调用。
+    ///
+    /// 自证会变红:按复核者给的写法改一遍(解构改成 `{ seq, policy, .. }`,
+    /// 块内加 `let dst = ...files_panel()...`)。
+    #[test]
+    fn apply_file_op_forwards_the_frozen_paste_snapshot_without_rereading_the_panel() {
+        let body = body_of(prod_src(), "fn apply_file_op(");
+        let anchor = "if let FileOp::Paste {";
+        let at = body.find(anchor).unwrap_or_else(|| {
+            panic!("找不到 apply_file_op 里 FileOp::Paste 的分流 —— 这条测试的锚点失效了")
+        });
+        // 模式块:从解构的 `{` 到配平的 `}`(`{ dst, clip, seq, policy }`)。
+        let pattern_rest = &body[at + anchor.len() - 1..];
+        let pattern_block = brace_balanced_arm(pattern_rest);
+        assert!(
+            pattern_block.len() < pattern_rest.len(),
+            "FileOp::Paste 的解构模式没截到闭合大括号,断言会退化成扫全文件"
+        );
+        assert!(
+            pattern_block.contains("dst") && pattern_block.contains("clip"),
+            "apply_file_op 对 FileOp::Paste 的解构模式没有字面绑定 dst/clip\
+             (退化成了 `{{ .., seq, policy }}`?)—— 拿不到调用方冻结的这两个\
+             值,后面只能现读面板状态顶替,实际模式:{pattern_block}"
+        );
+        // 模式块后面紧跟 ` = op` 再接一对花括号,是这个分流真正的函数体。
+        let after_pattern = &pattern_rest[pattern_block.len()..];
+        let body_brace = after_pattern
+            .find('{')
+            .unwrap_or_else(|| panic!("FileOp::Paste 分流没有块体:{after_pattern}"));
+        let arm_rest = &after_pattern[body_brace..];
+        let arm_body = brace_balanced_arm(arm_rest);
+        assert!(
+            arm_body.len() < arm_rest.len(),
+            "FileOp::Paste 分流块没截到闭合大括号,断言会退化成扫全文件"
+        );
+        assert!(
+            !arm_body.contains("files_panel"),
+            "apply_file_op 对 FileOp::Paste 的分流块里出现了 files_panel()\
+             —— 这是取『活面板状态』的唯一入口,这个分流只该转发解构出来的\
+             dst/clip/seq/policy,不许现读面板重新拼一份(不管现读出来的\
+             东西叫什么新名字,这个调用点躲不掉):{arm_body}"
+        );
+        assert!(
+            arm_body.contains("self.dispatch_paste("),
+            "FileOp::Paste 分流没有转发给 dispatch_paste —— 粘贴选完冲突\
+             处置会悄悄丢:{arm_body}"
+        );
+    }
+
+    /// F220 复核问题 1(续):`dispatch_paste` 是 B7 要整个重写的桩,这条
+    /// 守护写成「函数体重写之后依然有意义」的形态,不绑在桩当前这句
+    /// `log::warn!` 的文本上——不管 B7 怎么实现真正的写(`cp -a` 快路径 /
+    /// SFTP 逐文件回退),`dst`/`clip` 都已经是**形参**,函数体永远不该
+    /// 再调 `files_panel()` 现读面板状态顶替它们。
+    ///
+    /// **这条是留给 B7 的绊线**:B7 的计划原文(写在约束 1 之前,还没
+    /// 跟上)就是从面板现读 `files.clip`/`files.remote.cwd` 来实现这个
+    /// 函数——照抄的话这条测试会先炸,断言消息点名「`dst`/`clip` 必须用
+    /// 形参、粘贴目标在用户按下 Ctrl+V 那一刻就已确定」,不是判据写错了
+    /// 要绕过去。
+    ///
+    /// 自证会变红:在函数体里加回 `let _x = self.tabs.by_generation(generation)
+    /// .and_then(|t| t.content.files_panel());`(取到就足够触发 —— 判据
+    /// 认的是调用点本身,不需要真的把返回值用出去)。
+    #[test]
+    fn dispatch_paste_never_reaches_back_into_the_live_files_panel() {
+        let body = body_of(prod_src(), "fn dispatch_paste(");
+        assert!(
+            !body.contains("files_panel"),
+            "dispatch_paste 里出现了 files_panel() —— dst/clip 已经是形参,\
+             用户按下 Ctrl+V 那一刻粘贴的目标和内容就已经定了,实现真正的\
+             写时不许回头现读面板状态顶替这两个形参(哪怕现读出来的东西\
+             叫别的名字,这个调用点躲不掉);要用 dst/clip 的话直接用参数,\
+             不要经 self.tabs...files_panel() 绕一趟:{body}"
         );
     }
 
