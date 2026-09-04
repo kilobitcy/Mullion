@@ -12790,7 +12790,14 @@ mod tests {
             let at = body
                 .find(key)
                 .unwrap_or_else(|| panic!("Ctrl+{key} 没接上"));
-            let arm = &body[at..(at + 400).min(body.len())];
+            // 窗口卡在这个 if 块自己的收尾(`return;` 后的那个 `}`)——不能
+            // 用固定字符数,不然窗口会越界读到*下一个*键的判栏,把「这个键
+            // 自己没判栏」的坏改动错判成绿的(源码切片的经典恒绿陷阱)。
+            let end = body[at..]
+                .find("\n                }\n")
+                .map(|d| at + d)
+                .unwrap_or(body.len());
+            let arm = &body[at..end];
             assert!(
                 arm.contains("PanelColumn::Remote"),
                 "Ctrl+{key} 没判栏 —— 在本地栏按会动到远端"
