@@ -434,9 +434,12 @@ impl SftpClient {
     ///
     /// flags 带 `EXCLUDE` —— 与 `open_write` 刻意不带的理由正好相反:
     /// 传输通路要不要覆盖由上层的冲突策略决定(设计 D19),而「新建」撞上
-    /// 已存在必须当场失败。不带的话,用户在一个已有 `config.yaml` 的目录里
-    /// 手滑建了个同名文件,那份配置会被**静默截断成 0 字节** —— 没有任何
-    /// 报错,而远端删除/覆盖不可逆。
+    /// 已存在必须当场失败。这里没带 `TRUNCATE`,所以不带 `EXCLUDE` 并不会
+    /// 把已有内容清空 —— 真实后果是 open **静默成功**,拿到的句柄指向那份
+    /// **既存文件**:用户在一个已有 `config.yaml` 的目录里手滑建了个同名
+    /// 文件,界面会以为「新建成功」并把光标落上去,用户点开编辑、改的其实
+    /// 是别人的文件,保存时才会覆盖对方原有内容 —— 同样不可逆,但触发点
+    /// 在后续的编辑/保存,不是这次 open 本身。
     pub async fn create_file(&self, path: &RemotePath) -> Result<(), SftpError> {
         let wire = path.as_wire()?;
         let flags = russh_sftp::protocol::OpenFlags::WRITE

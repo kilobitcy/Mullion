@@ -472,6 +472,15 @@ async fn creating_a_file_makes_an_empty_one_appear_on_the_server() {
         "服务端上没有这个文件,实际:{:?}",
         names_in(&t, b"/home/testuser")
     );
+    let data = t
+        .get(b"/home/testuser".as_slice())
+        .expect("父目录该在")
+        .iter()
+        .find(|n| n.name == b"notes.txt")
+        .expect("notes.txt 该在")
+        .data
+        .clone();
+    assert!(data.is_empty(), "新建的文件不该带内容,实际:{data:?}");
 }
 
 /// F219 的核心闸门:**撞上已存在必须失败**,不能把别人的文件截断成 0 字节。
