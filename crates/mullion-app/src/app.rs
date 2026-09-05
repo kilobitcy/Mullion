@@ -13975,9 +13975,8 @@ mod tests {
                 _ => {}
             }
         }
-        let args_end = args_end.unwrap_or_else(|| {
-            panic!("spawn_paste_task 调用的实参列表没找到收尾的右括号:{body}")
-        });
+        let args_end = args_end
+            .unwrap_or_else(|| panic!("spawn_paste_task 调用的实参列表没找到收尾的右括号:{body}"));
         let args = &body[args_start..args_end];
         assert!(
             args.contains("follow_for_clip_mode("),
@@ -14153,8 +14152,8 @@ mod tests {
                     _ => {}
                 }
             }
-            let err_end = err_end
-                .unwrap_or_else(|| panic!("Err 分支没找到收尾的顶层逗号:{err_rest}"));
+            let err_end =
+                err_end.unwrap_or_else(|| panic!("Err 分支没找到收尾的顶层逗号:{err_rest}"));
             &err_rest[..err_end]
         };
         assert!(
