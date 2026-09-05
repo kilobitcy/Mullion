@@ -201,6 +201,15 @@ impl PaneState {
         self.reveal_pick = None;
         self.scroll_to = None;
         self.request_seq += 1;
+        // F220 复核(跨任务交叉面,F132 换节点静默剪到错误主机):这条连接
+        // 要换机器了(或断线重连、连接被推倒重来),任何在这一刻**之前**
+        // 冻结下来的 `paste_seq`(预检查在途 `list_dir` 往返 / `PasteConflict`
+        // 冲突框开着等用户选)都必须变成过期 —— `decide_paste`/`dispatch_paste`
+        // 两处都只认「跟 `PaneState::paste_seq` 此刻的值一致」,不推进这个
+        // 序号的话,旧连接冻结的 `dst`/`clip` 会原样派发到新连接的 client
+        // 上:B 上若恰好存在同名路径,`cp -a`/`mv` 会静默命中一个跟用户意图
+        // 无关的文件,剪切模式下是不可逆误挪/误删。
+        self.paste_seq += 1;
     }
 
     /// 收下一次加载结果。序号对不上返回 `false`(结果被丢弃)。
@@ -734,6 +743,26 @@ mod tests {
             }
             assert!(s.new_edit.is_none(), "换目录/换机器后新建态还赖着");
         }
+    }
+
+    /// F220 复核(跨任务交叉面,F132 换节点静默剪到错误主机):`invalidate()`
+    /// 必须推进 `paste_seq`,不能只碰 `request_seq`。这一栏要换机器了
+    /// (或断线重连)—— 任何在这一刻**之前**冻结下来的 `paste_seq`(`Ctrl+V`
+    /// 预检查的 `list_dir` 还在飞、或 `PasteConflict` 冲突框正开着等用户
+    /// 选)都必须变成过期,否则 `decide_paste`/`dispatch_paste` 会认为它还
+    /// 是最新的,把旧连接冻结的 `dst`/`clip` 派发到新连接的 client 上。
+    ///
+    /// 自证会变红:把 `invalidate()` 里新加的 `self.paste_seq += 1;` 删掉。
+    #[test]
+    fn switching_hosts_invalidates_any_in_flight_paste_sequence() {
+        let mut s = state();
+        let seq = s.begin_paste();
+        s.invalidate();
+        assert_ne!(
+            s.paste_seq, seq,
+            "invalidate() 之后 paste_seq 跟换机器之前冻结的那个值还一样 —— \
+             换节点/断线重连不会让在途的粘贴预检查或还开着的冲突框变成过期"
+        );
     }
 
     /// F219:`begin_rename` 清 `new_edit` 那句在**函数体第一句**,在

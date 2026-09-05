@@ -4112,6 +4112,14 @@ impl App {
             }
             if let Some(files) = tab.content.files_panel_mut() {
                 files.remote.invalidate();
+                // F220 复核(跨任务交叉面):`invalidate()` 只够得着
+                // `PaneState`,`clip` 挂在更外层的 `PanelFrame` 上,结构上
+                // 天然摸不到 —— 换机器之后 `clip` 原样留着旧机器的绝对
+                // 路径,`clip.rs` 自己的文档写着这些路径永远只属于当前
+                // 这条连接。`invalidate()` 递增的 `paste_seq` 挡住了「派发
+                // 到新连接」这一步(预检查在途 / 冲突框开着两条路都靠它),
+                // 但界面上剪贴板状态本身还是错的,必须在这里单独清掉。
+                files.clip = None;
             }
         }
         self.trigger_sftp_open(generation);
@@ -22500,6 +22508,128 @@ mod tests {
             "没作废远端栏 —— load 留在 Loading 会让紧接着的 trigger_sftp_open\
              撞 already_loading 早退,而那之后 has_client 是 false、判定首行就\
              短路,没有任何自愈路径"
+        );
+    }
+
+    /// F220 复核(跨任务交叉面,F132 换节点静默剪到错误主机的 Critical):
+    /// `invalidate()` 只够得着 `PaneState`,`clip` 挂在更外层的 `PanelFrame`
+    /// 上,结构上天然摸不到 —— 换机器之后 `clip` 原样留着旧机器的绝对路径,
+    /// 而 `clip.rs` 的文档写着这些路径永远只属于当前这条连接。
+    ///
+    /// 判据是**结构深度**,不是"某句话在不在"的存在性黑名单(本切片已经被
+    /// 存在性判据绕过四次)——`files.clip = None;` 必须跟`files.remote.
+    /// invalidate();`处在**同一层花括号深度**,即直属于`if let Some(files)
+    /// = ..`这个块本身、不被包进任何一层新的 `if`/`match` 子块。包一层条件
+    /// 就可能被"看似清了、其实条件恒假"悄悄绕开。
+    ///
+    /// 自证会变红:把 `files.clip = None;` 包进 `if false { .. }`(深度
+    /// +1,不再跟 invalidate 同层),或者整句删掉(锚点直接找不到)。
+    #[test]
+    fn reopening_sftp_also_clears_the_clipboard_so_it_never_points_at_the_wrong_host() {
+        let body = body_of(prod_src(), "fn reopen_sftp_on_focused_host(");
+        let depth_of = |at: usize| -> i32 {
+            body[..at].chars().fold(0i32, |d, ch| match ch {
+                '{' => d + 1,
+                '}' => d - 1,
+                _ => d,
+            })
+        };
+        let invalidate_at = body.find("files.remote.invalidate();").unwrap_or_else(|| {
+            panic!(
+                "锚点失效:reopen_sftp_on_focused_host 不再调用 files.remote.invalidate() 了:{body}"
+            )
+        });
+        let clip_at = body.find("files.clip = None;").unwrap_or_else(|| {
+            panic!(
+                "reopen_sftp_on_focused_host 没有清 files.clip —— 换节点后\
+                 剪贴板原样留着上一台机器的绝对路径,Ctrl+V 会把 A 上冻结的\
+                 源路径喂给 B 的 client,B 上若恰好有同名路径就是静默误剪/\
+                 误挪(clip.rs 的文档写着 clip 里的路径永远只属于当前这条\
+                 连接):{body}"
+            )
+        });
+        let invalidate_depth = depth_of(invalidate_at);
+        let clip_depth = depth_of(clip_at);
+        assert_eq!(
+            clip_depth, invalidate_depth,
+            "files.clip = None 跟 files.remote.invalidate() 不在同一层花括号\
+             深度(clip 深度 {clip_depth},invalidate 深度 {invalidate_depth})\
+             —— 两者该是同一个 `if let Some(files) = ..` 块里并列的无条件\
+             语句,包一层条件就可能被悄悄跳过:{body}"
+        );
+        // 自己想的绕法(自证过会绕过上面两条深度/存在性判据):清之前先
+        // `let old_clip = files.clip.clone();` 存一份,清完再
+        // `files.clip = old_clip;` 原样恢复 —— `files.clip = None;` 原封
+        // 不动地留在同一深度,两条判据都读不出这里其实什么都没变。堵法是
+        // 数 `files.clip` 这个字段在函数体里一共出现几次:正确实现只应该
+        // 写它一次(赋值本身),多出来的读/写都是在留后门。
+        let occurrences = body.matches("files.clip").count();
+        assert_eq!(
+            occurrences, 1,
+            "reopen_sftp_on_focused_host 里 files.clip 出现了 {occurrences} 次\
+             (预期只有赋值本身这一次)—— 多出来的读/写很可能是「先存一份\
+             旧值、清完再原样恢复」这类绕法,表面上有 `files.clip = None;`\
+             这句话、深度也对,实际上剪贴板压根没被清掉:{body}"
+        );
+    }
+
+    /// F220 复核(跨任务交叉面,F132 换节点 Critical 的 (a)(b) 两条隐蔽路):
+    /// 光清 `files.clip` 只堵住"切完焦点、之后再按一次 Ctrl+V"这一条路。
+    /// 还有两条更隐蔽的,清 `clip` 够不着 ——
+    /// - (a) 预检查在途时换节点:`Ctrl+V` 在 A 上发出、`list_dir` 预检查
+    ///   还在飞,用户切到 B 的分屏,`PasteChecked` 回来时冻结的 `dst`/`clip`
+    ///   是 A 的,`client` 已经是 B 的。
+    /// - (b) `PasteConflict` 冲突框开着时换节点:冻结快照在对话框里,这个
+    ///   窗口是"人在框前想几秒到几分钟",比一次网络往返宽得多。
+    ///
+    /// 这两条的正解是让 `paste_seq` 真的起作用:`accept_paste_check` 里的
+    /// `decide_paste`(覆盖 (a))和 `dispatch_paste` 自己（覆盖 (b),`FileOp::
+    /// Paste` 原样转发冻结的 `seq`)都只认"跟 `PaneState::paste_seq` 此刻的
+    /// 值一致"——`invalidate()` 现在会推进这个序号(见 `state.rs` 里的
+    /// `switching_hosts_invalidates_any_in_flight_paste_sequence`),这条测试
+    /// 把"序号确实推进了"跟"`decide_paste` 确实认这个序号"接起来,直接验证
+    /// 端到端的判决结果,而不只是分别验证两截。
+    ///
+    /// `dispatch_paste` 自己那道复核(同一个字段、同一个语义)结构上已经由
+    /// `dispatch_paste_only_reads_paste_seq_from_the_live_panel` 钉住 ——
+    /// 它验证 `dispatch_paste` 只从活的 `files.remote.paste_seq` 读、不碰
+    /// 事件里冻结的任何别的字段;那条测试没变。`dispatch_paste` 本身要真的
+    /// 端到端跑一遍需要一个能发 `EventLoopProxy` 的活 `App`,这在无头测试
+    /// 容器里造不出来(`decide_paste` 当初被摘成纯函数就是为了绕开这同一条
+    /// 限制)——这里诚实地只到"`PaneState` 状态转换 + `decide_paste` 纯函数"
+    /// 这一层为止,够不到再往下一层的 `App::dispatch_paste` 方法体本身。
+    ///
+    /// 自证会变红:把 `state.rs` 的 `invalidate()` 里 `self.paste_seq += 1;`
+    /// 删掉(序号不再推进,`decide_paste` 会判定还是 `Dispatch`/`Conflict`
+    /// 而不是 `Stale`)。
+    #[test]
+    fn a_paste_frozen_before_a_host_switch_comes_back_stale_after_it() {
+        let mut pane = crate::files::state::PaneState::new(
+            mullion_ssh::sftp::RemotePath::from_bytes(b"/".to_vec()),
+        );
+        // 冻结 seq 的那一刻:(a) 发起预检查 `list_dir`(`start_paste` 里的
+        // `begin_paste`),或 (b) 冲突框开着(它带的 `seq` 同样来自更早一次
+        // `begin_paste`)——两条路冻结的都是同一个 `paste_seq` 取值,这里
+        // 统一用 `begin_paste()` 模拟。
+        let frozen_seq = pane.begin_paste();
+        // 换节点(`reopen_sftp_on_focused_host`)或断线重连
+        // (`on_pane_reconnected`)都会调用它。
+        pane.invalidate();
+        let dst = mullion_ssh::sftp::RemotePath::from_bytes(b"/tmp/dst".to_vec());
+        let clip = crate::files::clip::RemoteClip {
+            mode: crate::files::clip::ClipMode::Cut,
+            items: vec![(
+                mullion_ssh::sftp::RemotePath::from_bytes(b"/tmp/src/a.txt".to_vec()),
+                false,
+            )],
+        };
+        let existing = std::collections::BTreeSet::new();
+        assert_eq!(
+            decide_paste(pane.paste_seq, frozen_seq, &dst, &clip, &existing),
+            PasteDecision::Stale,
+            "换节点之后,这份在换节点之前冻结的粘贴请求应该被判定过期 —— \
+             否则会把旧连接上的 dst/clip 派发到新连接的 client 上,B 主机\
+             若恰好有同名路径就是静默误剪/误挪"
         );
     }
 
