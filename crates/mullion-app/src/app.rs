@@ -4797,8 +4797,15 @@ impl App {
         // `OpFollow::ClearClip` 带到完成事件里,完成时按值比对「此刻的
         // 活剪贴板还是不是这一份」(复核问题3,见
         // `clip_still_matches_what_was_pasted`)。
-        let follow = follow_for_clip_mode(clip);
-
+        //
+        // 复核问题1 第二轮:这里**不经过任何局部变量**,直接把
+        // `follow_for_clip_mode(clip)` 写在 `spawn_paste_task` 的实参
+        // 位置上——上一轮的守护只认"某句 `follow` 绑定存不存在",
+        // 被"先合规调用、再另起一行重新绑定同名的 `follow` 变量"绕过了
+        // (纯 Copy 粘贴也会被误清)。没有 `follow` 这个名字可绑定,就没有
+        // 东西可以 shadow;守护相应改成断言实参列表里出现
+        // `follow_for_clip_mode(`,见
+        // `dispatch_paste_actually_uses_follow_for_clip_modes_result`。
         let task = spawn_paste_task(
             &self._runtime,
             &self.proxy,
@@ -4808,7 +4815,7 @@ impl App {
             plan.pairs,
             mode,
             overwrite,
-            follow,
+            follow_for_clip_mode(clip),
         );
         self.track_sftp_task(generation, task);
     }
@@ -13913,31 +13920,71 @@ mod tests {
     }
 
     /// 复核问题1:`follow_for_clip_mode` 这个纯函数本身测得再全,也挡
-    /// 不住调用点"算出正确结果但不用它"这种退化——复核者实证过的变异:
+    /// 不住调用点"算出正确结果但不用它"这种退化。
+    ///
+    /// **第一轮**的守护只认"`let follow = follow_for_clip_mode(` 这句话
+    /// 存不存在",被复核者证实可以绕过——先合规调用一次满足这条字面
+    /// 判据,再紧跟着 shadow 掉:
     /// ```ignore
-    /// let _ = follow_for_clip_mode(clip.clone());
+    /// let follow = follow_for_clip_mode(clip.clone());
     /// let follow = OpFollow::ClearClip(clip);
     /// ```
-    /// 这样改之后,`follow_for_clip_mode` 本身的单测和只扫文本存在性的
-    /// `the_clipboard_is_cleared_only_after_a_cut_actually_lands` 全部
-    /// 继续绿,因为它们都够不着"调用点有没有真的用这次调用的返回值"。
+    /// 效果是**所有粘贴(含纯 Copy)都会清剪贴板**——正是 Copy 不该清的
+    /// 那条真实回归,而第一轮的判据只查字面子串在不在,这次没删那句、
+    /// 只是紧跟着 shadow 了一次,继续绿。
     ///
-    /// 判据:`dispatch_paste` 函数体里必须原样出现
-    /// `let follow = follow_for_clip_mode(` 这个子串——上面那种"丢弃结果、
-    /// 另起一行赋值"的写法产生的是 `let _ = follow_for_clip_mode(` +
-    /// 另一行 `let follow = OpFollow::`,两个子串分别命中不了这条判据。
+    /// **第二轮**把这个面直接消掉:生产代码不再有 `follow` 这个局部
+    /// 变量,`follow_for_clip_mode(clip)` 直接写在 `spawn_paste_task(..)`
+    /// 调用的**实参位置**上——没有名字可以绑定,就没有东西可以 shadow。
+    /// 守护相应收紧成两条:(1) `dispatch_paste` 函数体里不能出现任何
+    /// `let follow` 绑定(没有名字可 shadow 的结构性保证,堵死"内联又加
+    /// 回一个中间变量"这条回头路);(2) `spawn_paste_task(` 调用的实参
+    /// 列表里必须原样出现 `follow_for_clip_mode(`——这是值真正流向
+    /// `spawn_paste_task` 的地方,比"某句话在不在"紧一档。
     ///
-    /// 自证会变红:把 `dispatch_paste` 里的
-    /// `let follow = follow_for_clip_mode(clip);` 原样换成复核者给的那两行。
+    /// 自证会变红:把复核者给的那两行(先合规调用、再 `let follow =` 覆盖)
+    /// 原样敲回去。
     #[test]
     fn dispatch_paste_actually_uses_follow_for_clip_modes_result() {
         let body = body_of(prod_src(), "fn dispatch_paste(");
         assert!(
-            body.contains("let follow = follow_for_clip_mode("),
-            "dispatch_paste 里没有把 follow_for_clip_mode 的返回值直接绑给\
-             `follow`——如果是 `let _ = follow_for_clip_mode(..)` 之后另起\
-             一行手写 `let follow = OpFollow::..`,纯函数本身测得再全也挡\
-             不住:{body}"
+            !body.contains("let follow"),
+            "dispatch_paste 里出现了 `let follow` 绑定 —— 复核问题1 第二轮\
+             证实这种中间绑定挡不住紧跟着的一次 shadow(先合规调用、再\
+             `let follow = OpFollow::..` 覆盖,纯 Copy 粘贴也会被误清)。\
+             `follow_for_clip_mode(clip)` 应该直接写在 `spawn_paste_task(..)`\
+             调用的实参位置上,不经过任何局部变量:{body}"
+        );
+        let call_marker = "spawn_paste_task(";
+        let call_at = body
+            .find(call_marker)
+            .unwrap_or_else(|| panic!("找不到 spawn_paste_task 的调用点:{body}"));
+        let args_start = call_at + call_marker.len();
+        let mut depth = 1i32;
+        let mut args_end = None;
+        for (i, ch) in body[args_start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        args_end = Some(args_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args_end = args_end.unwrap_or_else(|| {
+            panic!("spawn_paste_task 调用的实参列表没找到收尾的右括号:{body}")
+        });
+        let args = &body[args_start..args_end];
+        assert!(
+            args.contains("follow_for_clip_mode("),
+            "spawn_paste_task 调用的实参列表里没有原样出现\
+             follow_for_clip_mode(..)——这是值真正流向 spawn_paste_task 的\
+             地方,follow 不能经过任何中间局部变量(那样会给 shadow 留出\
+             空子):{args}"
         );
     }
 
@@ -14059,6 +14106,62 @@ mod tests {
         assert!(
             clear_block.contains("clip = None"),
             "ClearClip 分支里没有真的把 clip 置空:{clear_block}"
+        );
+    }
+
+    /// F220 B7 复核问题5:`SftpOpDone` 的失败分支(链路断了/服务端拒绝)
+    /// 结构上不该有任何机会碰 `clip`/`follow`——失败意味着东西压根没挪走
+    /// (T11),既不该清剪贴板也不该消费 `follow` 里带的那份快照。今天的
+    /// 实现只是`self.ui.set_error(msg)` 一行,天然摸不到这两个名字;这条
+    /// 补的是"保证一直对"而不是"现在对"——本切片的教训全是这条。
+    ///
+    /// 自证会变红:把 `Err(msg) => self.ui.set_error(msg),` 改成
+    /// `Err(msg) => { self.ui.set_error(msg); let _ = &follow; },`
+    /// (模拟以后有人往失败分支里加了一段碰 `follow`/`clip` 的代码)。
+    #[test]
+    fn sftp_op_done_err_branch_never_touches_clip_or_follow() {
+        let arm = multiline_arm_of(prod_src(), "UserEvent::SftpOpDone {");
+        let err_marker = "Err(msg) => ";
+        let err_at = arm
+            .find(err_marker)
+            .unwrap_or_else(|| panic!("找不到 SftpOpDone 的失败分支:{arm}"));
+        let err_rest = &arm[err_at + err_marker.len()..];
+        // 两种形状都要认:今天是单行表达式(`self.ui.set_error(msg),`,
+        // 到顶层逗号为止),但分支体一旦被改成块(`{ .. }`,没有强制的
+        // 收尾逗号)就得靠配平大括号来截——只认逗号的话,变异成块之后
+        // `err_end` 找不到逗号直接 panic 在解析步骤上,断言本体压根没
+        // 跑到,红是红了但没红在"碰到了 clip/follow"这条真正想守的判据上。
+        let err_body: &str = if err_rest.trim_start().starts_with('{') {
+            let block_start = err_rest.trim_start();
+            let block = brace_balanced_arm(block_start);
+            assert!(
+                block.len() < block_start.len(),
+                "Err 分支的块没有截到闭合大括号,断言会退化成扫全文件:{block_start}"
+            );
+            block
+        } else {
+            let mut depth = 0i32;
+            let mut err_end = None;
+            for (i, ch) in err_rest.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        err_end = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let err_end = err_end
+                .unwrap_or_else(|| panic!("Err 分支没找到收尾的顶层逗号:{err_rest}"));
+            &err_rest[..err_end]
+        };
+        assert!(
+            !err_body.contains("clip") && !err_body.contains("follow"),
+            "SftpOpDone 的失败分支碰到了 clip/follow —— 失败/断线意味着东西\
+             压根没挪走(T11),这个分支结构上不该有机会读写剪贴板状态或\
+             消费 follow:{err_body}"
         );
     }
 
