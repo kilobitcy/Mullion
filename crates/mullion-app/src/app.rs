@@ -4756,7 +4756,7 @@ impl App {
         else {
             return;
         };
-        if files.remote.paste_seq != seq {
+        if paste_seq_is_stale(files.remote.paste_seq, seq) {
             return;
         }
 
@@ -11266,6 +11266,23 @@ enum PasteDecision {
     },
 }
 
+/// F220 复核挖出的守护盲区:粘贴的"陈旧序号"判定原本在 `decide_paste`(纯
+/// 函数,有行为测试)和 `dispatch_paste`(`&mut self` 方法,只有源码切片
+/// 白名单守护)里各写了一遍裸比较 `seq != current_seq`。`dispatch_paste`
+/// 那处没有行为测试兜底——复核实证:把它的运算符从 `!=` 悄悄改成 `==`
+/// (语义整个反过来,变成"只对新鲜请求提前退出、对陈旧请求反而放行执行"),
+/// `cargo test --workspace` 依然全绿零失败,因为源码切片守护只白名单字面
+/// 串 `files.remote.paste_seq`,看不见运算符方向。
+///
+/// 把判定抽成这一个共享纯函数,让两个调用点都走它,运算符方向就落到了
+/// `decide_paste` 那侧已有的行为测试上(`decide_paste_drops_a_result_
+/// whose_sequence_has_gone_stale` 等),`dispatch_paste` 侧再退回内联裸
+/// 比较会被结构性守护挡住。**两个调用点必须都走它**,不许有任何一处
+/// 悄悄绕回 `!=`/`==` 的裸写法。
+fn paste_seq_is_stale(current_seq: u64, frozen_seq: u64) -> bool {
+    frozen_seq != current_seq
+}
+
 /// F220:纯决策 —— **只吃事件里冻结的 `dst`/`clip`,不吃任何"面板现在的
 /// 状态"**:这个签名本身就是「不许重新读」这条判据的类型层强制,它压根
 /// 没拿到 `PanelFrame`,想重新读都读不到(复核 C1/I2)。
@@ -11280,7 +11297,7 @@ fn decide_paste(
     existing: &std::collections::BTreeSet<Vec<u8>>,
 ) -> PasteDecision {
     use crate::files::clip::{conflicts, is_within, ClipMode, Policy};
-    if seq != current_seq {
+    if paste_seq_is_stale(current_seq, seq) {
         return PasteDecision::Stale;
     }
     let same_dir = clip.items.iter().all(|(src, _)| src.parent() == *dst);
@@ -12922,11 +12939,12 @@ mod tests {
         files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
         has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
         new_pane_emulator, next_auto_dial, next_panel_selection_index, pane_still_wanted,
-        place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback, should_check_attach,
-        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
-        take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
-        wind_down, AttachCheck, AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind,
-        RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
+        paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback,
+        should_check_attach, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
+        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
+        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, Modal, OpFollow,
+        PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
+        UserEvent,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -13683,9 +13701,9 @@ mod tests {
     /// `self`/`tab` 可用,见
     /// `spawn_paste_task_params_are_locked_to_an_explicit_whitelist`)。
     ///
-    /// 自证会变红:在 `if files.remote.paste_seq != seq` 那句旁边加一句
-    /// `let _live_dst = files.remote.cwd.clone();`(经 `files.` 前缀读了
-    /// `paste_seq` 之外的东西)。
+    /// 自证会变红:在 `if paste_seq_is_stale(files.remote.paste_seq, seq)`
+    /// 那句旁边加一句 `let _live_dst = files.remote.cwd.clone();`(经
+    /// `files.` 前缀读了 `paste_seq` 之外的东西)。
     #[test]
     fn dispatch_paste_only_reads_paste_seq_from_the_live_panel() {
         let body = body_of(prod_src(), "fn dispatch_paste(");
@@ -14219,7 +14237,8 @@ mod tests {
     ///
     /// 值级测试:`decide_paste` 是纯函数,不需要 `App`。
     ///
-    /// 自证会变红:把 `decide_paste` 里 `if seq != current_seq` 那句删掉。
+    /// 自证会变红:把 `decide_paste` 里 `if paste_seq_is_stale(current_seq, seq)`
+    /// 那句删掉。
     #[test]
     fn decide_paste_drops_a_result_whose_sequence_has_gone_stale() {
         let dst = mullion_ssh::sftp::RemotePath::from_bytes(b"/data/dst".to_vec());
@@ -14263,6 +14282,63 @@ mod tests {
             decide_paste(1, 1, &dst, &clip, &existing),
             PasteDecision::Refused,
             "目标目录在源目录自己的子树里,即使没有撞名也不该放行"
+        );
+    }
+
+    /// F220:`paste_seq_is_stale` 现在是 `decide_paste`/`dispatch_paste` 共享
+    /// 的唯一判定点(见其文档里的盲区说明)。两个方向都要断——只断一个
+    /// 方向的话,`!=`/`==` 之间的变异必然有一个逃得掉。
+    #[test]
+    fn paste_seq_is_stale_tells_fresh_from_frozen() {
+        assert!(
+            paste_seq_is_stale(5, 3),
+            "冻结值(3)跟当前值(5)对不上,应该判过期"
+        );
+        assert!(!paste_seq_is_stale(5, 5), "冻结值跟当前值一致,不该判过期");
+    }
+
+    /// F220 复核盲区:`dispatch_paste` 曾经是唯一一处只有源码切片白名单守护、
+    /// 没有行为测试兜底的陈旧判定 —— 把 `!=` 悄悄改成 `==`,
+    /// `cargo test --workspace` 依然全绿(白名单只认字面串
+    /// `files.remote.paste_seq`,看不见运算符方向)。抽出 `paste_seq_is_stale`
+    /// 之后,这条测试钉住"真的经它判",不是又内联回裸比较、也不是取反着用——
+    /// 这两种绕法都会让运算符方向重新失守,而 `paste_seq_is_stale` 自己的行为
+    /// 测试也就白搭了。
+    ///
+    /// 自证会变红:
+    /// 1. 把 `if paste_seq_is_stale(files.remote.paste_seq, seq)` 改回
+    ///    `if files.remote.paste_seq != seq`(内联裸比较,绕开共享函数)。
+    /// 2. 改成 `if !paste_seq_is_stale(files.remote.paste_seq, seq)`(取反)。
+    #[test]
+    fn dispatch_paste_judges_staleness_through_the_shared_helper() {
+        let body = body_of(prod_src(), "fn dispatch_paste(");
+        assert!(
+            body.contains("paste_seq_is_stale(files.remote.paste_seq, seq)"),
+            "dispatch_paste 里找不到对共享函数 paste_seq_is_stale 的调用 ——\
+             是不是又内联回了裸比较?"
+        );
+        assert!(
+            !body.contains("!paste_seq_is_stale("),
+            "dispatch_paste 取反调用了 paste_seq_is_stale —— 语义整个反过来,\
+             变成只对新鲜请求提前退出、对陈旧请求反而放行执行"
+        );
+    }
+
+    /// F220:同上,钉住 `decide_paste` 那一侧不许退回裸比较。它的判定结果
+    /// 本身已经有 `decide_paste_drops_a_result_whose_sequence_has_gone_stale`
+    /// 等值级测试兜底,这条只加一道"确实经过共享函数"的结构保险,避免以后
+    /// 有人为了"省一次函数调用"悄悄写回 `seq != current_seq`。
+    #[test]
+    fn decide_paste_judges_staleness_through_the_shared_helper() {
+        let body = body_of(prod_src(), "fn decide_paste(");
+        assert!(
+            body.contains("paste_seq_is_stale(current_seq, seq)"),
+            "decide_paste 里找不到对共享函数 paste_seq_is_stale 的调用 ——\
+             是不是又内联回了裸比较?"
+        );
+        assert!(
+            !body.contains("!paste_seq_is_stale("),
+            "decide_paste 取反调用了 paste_seq_is_stale —— 语义整个反过来"
         );
     }
 
