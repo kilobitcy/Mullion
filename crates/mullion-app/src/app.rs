@@ -27,7 +27,7 @@ use crate::frame::{FrameLimiter, RedrawAction};
 use crate::gpu::{quads_for_panes, Gpu};
 use crate::render::SyncFramePacer;
 use crate::shell::tabs::{Tab, TabPayload, Tabs};
-use crate::shell::workspace::{PaneGeom, PaneState, Preset, Workspace};
+use crate::shell::workspace::{PaneGeom, PaneState, Workspace};
 use crate::text::TextLayer;
 use crate::theme::{self, MULLION_DARK};
 use crate::{diag, input, shell};
@@ -727,9 +727,6 @@ fn tmux_attach_for_connect(
 /// 留在 `App`。
 struct TerminalTab {
     ws: Workspace,
-    /// 当前生效的布局预设(预设按钮组画选中态用)。手动关 pane 之后置 `None`
-    /// (布局不再对应任何预设)。
-    current_preset: Option<Preset>,
     /// 这个标签是用什么配置连上的。`open_pty`(F35 分屏复用连接)要它的
     /// `term`/`cols`/`rows`,标题条要 `user`/`host`/`port`。
     ///
@@ -7792,7 +7789,6 @@ impl App {
             session_id,
             TabContent::Terminal(Box::new(TerminalTab {
                 ws,
-                current_preset: Some(Preset::Single),
                 last_cfg: cfg,
                 automation: Vec::new(),
                 automation_template: None,
@@ -7846,9 +7842,6 @@ impl App {
                     .and_then(|tab| tab.content.as_terminal_mut())
                     .and_then(|t| {
                         let fresh = t.ws.apply_saved_tree(&p.tree, p.focus_leaf, p.main_leaf)?;
-                        // 恢复出来的形状一般不对应任何预设按钮;单叶子
-                        // 例外(它就是 Single)。
-                        t.current_preset = (p.tree.len() == 1).then_some(Preset::Single);
                         // 叶子(前序)→ pane id。`leaves` 与 `to_entries` /
                         // `leaf_identities` 共用同一条前序约定,不许在这里
                         // 另写一遍遍历。
@@ -10885,7 +10878,9 @@ impl ApplicationHandler<UserEvent> for App {
                                     .active()
                                     .is_some_and(|t| !matches!(t.content, TabContent::Restored(_))),
                                 panes: self.active_ws().map_or(1, Workspace::pane_count),
-                                preset: self.active_term().and_then(|t| t.current_preset),
+                                preset: self.active_ws().and_then(|ws| {
+                                    crate::shell::workspace::preset::preset_of(ws.tree())
+                                }),
                                 titles: &titles,
                                 tabs: &tab_views,
                                 host_key: host_key_view,
@@ -11099,10 +11094,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // runtime/proxy 单测);真正开新 channel 需要 runtime/proxy,
                             // 落在 `spawn_fresh_panes`。
                             if let Some(t) = self.active_term_mut() {
-                                if let Some((fresh, preset_out)) =
-                                    apply_layout_actions(&mut t.ws, &actions)
-                                {
-                                    t.current_preset = preset_out;
+                                if let Some(fresh) = apply_layout_actions(&mut t.ws, &actions) {
                                     mark_ui_dirty!(self.ui_dirty);
                                     self.spawn_fresh_panes(fresh);
                                 }
@@ -11983,39 +11975,31 @@ fn decide_paste(
 /// 逻辑摘出来单独放在这个自由函数里,才能拿一个真实构造的 `Workspace` 直接
 /// 单测,而不必伪造一个绕开被测代码的假测试。
 ///
-/// 返回 `None` 表示这一帧没有布局动作,调用方不需要动 `current_preset`/标脏/
-/// 开新 channel。返回 `Some((新增待开 channel 的 pane id, 新的 current_preset))`——
-/// 后者在只点了预设时是 `Some(preset)`,在点了关闭(不论是否同帧还点了预设)时
-/// 是 `None`:手动关掉一个 pane 后,布局不再对应任何预设。真正开 channel 需要
+/// 返回 `None` 表示这一帧没有布局动作,调用方不需要标脏/开新 channel。
+/// 返回 `Some(新增待开 channel 的 pane id)`——真正开 channel 需要
 /// `_runtime`/`proxy`,留给调用方的 `App::spawn_fresh_panes`。
-fn apply_layout_actions(
-    ws: &mut Workspace,
-    actions: &crate::ui::UiActions,
-) -> Option<(Vec<PaneId>, Option<Preset>)> {
+///
+/// F232:不再返回"新的 current_preset"。工具栏高亮改由 `preset_of(ws.tree())`
+/// 每帧现算 —— 影子状态唯一的更新规则("关了 pane 就清空")本身就是那个 bug:
+/// 两屏关掉一块之后剩下的形状其实**就是**单屏,单屏按钮却不亮。
+fn apply_layout_actions(ws: &mut Workspace, actions: &crate::ui::UiActions) -> Option<Vec<PaneId>> {
     if actions.preset.is_none() && actions.close_pane.is_none() {
         return None;
     }
     let mut fresh = Vec::new();
-    let mut preset_out = None;
     let mut changed = false;
     if let Some(preset) = actions.preset {
         fresh = ws.apply_preset(preset);
-        preset_out = Some(preset);
         changed = true;
     }
     if let Some(id) = actions.close_pane {
-        // close_pane 在「只剩最后一个 pane」时会拒绝并返回 false、树不变——这种
-        // 情况下不该清掉 preset_out,否则工具栏的当前预设高亮会被平白抹掉,
-        // 而树其实什么都没变。
+        // close_pane 在「只剩最后一个 pane」时会拒绝并返回 false、树不变——
+        // 那一帧就是纯粹的 noop,不该标脏(白标一次脏 = 一次无意义重绘,T3)。
         if ws.close_pane(id) {
-            preset_out = None;
             changed = true;
         }
     }
-    if !changed {
-        return None;
-    }
-    Some((fresh, preset_out))
+    changed.then_some(fresh)
 }
 
 /// 晚到的 `PaneOpened` 是否还该被 attach。两个独立的理由都会让答案是"不该":
@@ -16282,7 +16266,7 @@ mod tests {
     #[test]
     fn preset_click_switches_to_the_specific_preset_clicked() {
         let mut ws = Workspace::new(test_pane(1), 0);
-        let (fresh, preset_out) = apply_layout_actions(
+        let fresh = apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
@@ -16291,8 +16275,10 @@ mod tests {
             },
         )
         .expect("点了预设,动作不该是 None");
+        // F232:「当前是哪个预设」不再由这个函数报告,改从树现算 —— 判据因此
+        // 直接落在树的形状上,比原来的"函数说它切到了 X"更硬。
         assert_eq!(
-            preset_out,
+            crate::shell::workspace::preset::preset_of(ws.tree()),
             Some(Preset::ThreeColumns),
             "必须切到点击的那个预设,不是别的"
         );
@@ -16311,7 +16297,7 @@ mod tests {
         }
 
         // 再点一个不同的预设,确认不是写死指向 ThreeColumns。
-        let (_, preset_out2) = apply_layout_actions(
+        apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoTopBottom),
@@ -16320,7 +16306,10 @@ mod tests {
             },
         )
         .expect("点了预设,动作不该是 None");
-        assert_eq!(preset_out2, Some(Preset::TwoTopBottom));
+        assert_eq!(
+            crate::shell::workspace::preset::preset_of(ws.tree()),
+            Some(Preset::TwoTopBottom)
+        );
         assert_eq!(mullion_core::layout::leaves(ws.tree()).len(), 2);
     }
 
@@ -16330,7 +16319,7 @@ mod tests {
     #[test]
     fn close_pane_click_closes_the_specific_pane_clicked() {
         let mut ws = Workspace::new(test_pane(1), 0);
-        let (fresh, _) = apply_layout_actions(
+        let fresh = apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
@@ -16351,7 +16340,7 @@ mod tests {
             .expect("三个 pane 里总有一个不是焦点");
         let others: Vec<PaneId> = all_ids.iter().copied().filter(|&id| id != target).collect();
 
-        let (fresh2, preset_out2) = apply_layout_actions(
+        let fresh2 = apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: None,
@@ -16361,7 +16350,14 @@ mod tests {
         )
         .expect("点了关闭,动作不该是 None");
         assert!(fresh2.is_empty(), "关 pane 不该产生待开的新 channel");
-        assert_eq!(preset_out2, None, "手动关闭后不再对应任何预设");
+        // F232:三等分关掉中间一块,剩下的是 1/3 : 2/3,不等于任何预设 —— 高亮
+        // 该熄灭。注意这不是「关了就一律熄灭」(那正是本片修掉的 bug):换成
+        // 两屏关掉一块,`preset_of` 会认出 Single 并重新点亮。
+        assert_eq!(
+            crate::shell::workspace::preset::preset_of(ws.tree()),
+            None,
+            "1/3 : 2/3 不对应任何预设"
+        );
         assert!(
             ws.pane(target).is_none(),
             "点击关闭的那个 pane 必须真的没了"
@@ -16371,7 +16367,7 @@ mod tests {
         }
     }
 
-    /// 没有任何动作的一帧:不该无中生有地改 current_preset / 触发重绘。
+    /// 没有任何动作的一帧:不该无中生有地改布局 / 触发重绘。
     #[test]
     fn no_ui_action_means_no_layout_change() {
         let mut ws = Workspace::new(test_pane(1), 0);
@@ -16390,7 +16386,7 @@ mod tests {
         let mut ws = Workspace::new(test_pane(1), 0);
         // 切到 ThreeColumns:多出 2 个待开的新叶子。特意不 attach——模拟它们的
         // SSH channel 还在网络上跑,尚未收到 PaneOpened。
-        let (fresh, _) = apply_layout_actions(
+        let fresh = apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
@@ -16402,7 +16398,7 @@ mod tests {
         assert_eq!(fresh.len(), 2, "ThreeColumns 比原来的 1 屏多 2 个新叶子");
 
         // 在那 2 个 channel 回来之前,用户又切回 Single——把刚才的叶子从树上摘掉。
-        let (fresh2, _) = apply_layout_actions(
+        let fresh2 = apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::Single),
@@ -16436,13 +16432,18 @@ mod tests {
     }
 
     /// 复核 Minor #3:`close_pane` 在"只剩最后一个 pane"时会拒绝并返回
-    /// false、树不变。这种情况下 `apply_layout_actions` 不该无脑清掉
-    /// `preset_out`,否则工具栏的当前预设高亮被平白抹掉,但树其实什么都
-    /// 没变——对用户来说是一次"点了没反应,但高亮还消失了"的诡异体验。
+    /// false、树不变。这一帧必须是**纯粹的 noop** —— 返回 `Some(..)` 的话
+    /// 调用方会标脏并触发一次无意义重绘(T3 红线)。
+    ///
+    /// F232:原来这条还守着"不许清掉 current_preset"。那个字段已经删了,高亮
+    /// 由 `preset_of` 现算 —— 树没变,高亮自然不会变,那半条守护随字段一起消失。
+    ///
+    /// 自证会变红:把 `apply_layout_actions` 里 `if ws.close_pane(id)` 的条件
+    /// 去掉(无条件 `changed = true`),本条红。
     #[test]
-    fn closing_the_last_pane_is_a_noop_and_does_not_clear_current_preset() {
+    fn closing_the_last_pane_is_a_pure_noop() {
         let mut ws = Workspace::new(test_pane(1), 0);
-        let (_, preset_out) = apply_layout_actions(
+        apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::Single),
@@ -16451,7 +16452,6 @@ mod tests {
             },
         )
         .expect("点了预设,动作不该是 None");
-        assert_eq!(preset_out, Some(Preset::Single));
 
         let only_id = mullion_core::layout::leaves(ws.tree())[0];
         let result = apply_layout_actions(
@@ -16673,7 +16673,7 @@ mod tests {
     fn pane_still_wanted_rejects_a_stale_generations_pane_even_if_the_id_is_reused() {
         // 新世代(重连后的第二个 Workspace,世代号 1)。
         let mut ws = Workspace::new(test_pane(1), 1);
-        let (fresh, _) = apply_layout_actions(
+        let fresh = apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoLeftRight),
@@ -18811,7 +18811,7 @@ mod tests {
         let mut ws = Workspace::new(test_pane(1), generation);
         // 切成两屏:多出一个待开的新叶子,特意不 attach —— 模拟它那条会话
         // 已经被用户删了(D3)/ 拨号还没回来(D6)。
-        let (fresh, _) = apply_layout_actions(
+        let fresh = apply_layout_actions(
             &mut ws,
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoLeftRight),
@@ -19162,7 +19162,6 @@ mod tests {
     fn second_terminal_tab(generation: u64) -> TabContent {
         TabContent::Terminal(Box::new(TerminalTab {
             ws: Workspace::new(test_pane(1), generation),
-            current_preset: None,
             last_cfg: None,
             automation: Vec::new(),
             automation_template: None,
@@ -19437,7 +19436,6 @@ mod tests {
             None,
             TabContent::Terminal(Box::new(TerminalTab {
                 ws: Workspace::new(test_pane(1), 7),
-                current_preset: None,
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
@@ -20289,7 +20287,6 @@ mod tests {
         let generation = 3;
         let mut tab = TerminalTab {
             ws: Workspace::new(test_pane(1), generation),
-            current_preset: None,
             last_cfg: None,
             automation: Vec::new(),
             automation_template: None,
@@ -21452,7 +21449,6 @@ mod tests {
             color_override: None,
             content: TabContent::Terminal(Box::new(TerminalTab {
                 ws: Workspace::new(test_pane(1), 0),
-                current_preset: None,
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
@@ -21534,7 +21530,6 @@ mod tests {
             color_override: None,
             content: TabContent::Terminal(Box::new(TerminalTab {
                 ws,
-                current_preset: None,
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
@@ -21616,7 +21611,6 @@ mod tests {
             color_override: None,
             content: TabContent::Terminal(Box::new(TerminalTab {
                 ws: Workspace::new(test_pane(1), 0),
-                current_preset: None,
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,
@@ -22451,7 +22445,6 @@ mod tests {
         fn make_tab(configured: Option<&str>) -> TabContent {
             TabContent::Terminal(Box::new(TerminalTab {
                 ws: Workspace::new(test_pane(1), 0),
-                current_preset: None,
                 last_cfg: None,
                 automation: Vec::new(),
                 automation_template: None,

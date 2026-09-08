@@ -10,8 +10,8 @@ use super::PaneStatus;
 /// 工具栏上的布局预设。一排平铺,全部可见(§3)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
-    /// 1 屏满窗。工具栏第一个按钮,也是「刚连上、只有一个 pane」这个状态的
-    /// `current_preset` 初始值。
+    /// 1 屏满窗。工具栏第一个按钮,也是「刚连上、只有一个 pane」时
+    /// `preset_of` 会认出的形状。
     Single,
     TwoLeftRight,
     TwoTopBottom,
