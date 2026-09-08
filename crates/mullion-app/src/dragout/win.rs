@@ -297,6 +297,11 @@ struct Items {
     items: Vec<DragOutItem>,
     runtime: tokio::runtime::Handle,
     sftp: Arc<SftpClient>,
+    /// F230:Mullion 私有格式的 id。`0` = 这一份不带私有载荷(拖出走的就是
+    /// 这一支 —— 拖到别的 Mullion 不在 F230 范围里)。
+    private_format: u16,
+    /// F230:私有格式的字节(`clipboard_remote::wrap` 过的信封)。
+    private_payload: Vec<u8>,
 }
 
 impl Items {
@@ -304,6 +309,15 @@ impl Items {
     fn accepts(&self, fe: &FORMATETC) -> Result<Wanted, HRESULT> {
         if fe.dwAspect != DVASPECT_CONTENT.0 {
             return Err(DV_E_FORMATETC);
+        }
+        // F230:私有格式排在最前面。`private_format == 0` 是「这一份没有私有
+        // 载荷」的哨兵 —— 不判它的话,一个 `cfFormat == 0` 的探询会被当成
+        // 私有格式应答,给回去一个空 HGLOBAL。
+        if self.private_format != 0 && fe.cfFormat == self.private_format {
+            if fe.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+                return Err(DV_E_TYMED);
+            }
+            return Ok(Wanted::Private);
         }
         if fe.cfFormat == self.formats.descriptor {
             if fe.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
@@ -328,6 +342,8 @@ impl Items {
 enum Wanted {
     Descriptor,
     Contents(usize),
+    /// F230:Mullion 私有格式(远端路径 + 源端主机指纹)。
+    Private,
 }
 
 /// 把一段字节搬进 `GMEM_MOVEABLE` 的全局内存 —— `TYMED_HGLOBAL` 要的就是它,
@@ -353,6 +369,15 @@ impl IDataObject_Impl for Items_Impl {
         }
         let fe = unsafe { *pformatetcin };
         match self.accepts(&fe) {
+            Ok(Wanted::Private) => {
+                log::debug!(target: LOG, "对面取私有格式({} 字节)", self.private_payload.len());
+                let h = to_hglobal(&self.private_payload).map_err(windows::core::Error::from)?;
+                Ok(STGMEDIUM {
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                    u: STGMEDIUM_0 { hGlobal: h },
+                    pUnkForRelease: std::mem::ManuallyDrop::new(None),
+                })
+            }
             Ok(Wanted::Descriptor) => {
                 log::debug!(target: LOG, "目标程序取描述符({} 项)", self.items.len());
                 let h = to_hglobal(&self.descriptor).map_err(windows::core::Error::from)?;
@@ -435,7 +460,7 @@ impl IDataObject_Impl for Items_Impl {
             // 写方向没有任何格式。
             return Err(E_NOTIMPL.into());
         }
-        Ok(FormatEnum::new(self.formats, self.items.len()).into())
+        Ok(FormatEnum::new(self.formats, self.items.len(), self.private_format).into())
     }
 
     fn DAdvise(
@@ -468,14 +493,27 @@ struct FormatEnum {
 }
 
 impl FormatEnum {
-    fn new(formats: Formats, n: usize) -> Self {
-        let mut all = vec![FORMATETC {
+    fn new(formats: Formats, n: usize, private: u16) -> Self {
+        let mut all = Vec::new();
+        // F230:私有格式也要**列**出来。只在 `GetData`/`QueryGetData` 里认它,
+        // 而枚举里不列的话,先枚举再取数的对面根本不知道有这个格式 ——
+        // 粘不出来且完全静默(本仓库管这叫「列举式门控在加档时必然漏」)。
+        if private != 0 {
+            all.push(FORMATETC {
+                cfFormat: private,
+                ptd: std::ptr::null_mut(),
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+            });
+        }
+        all.push(FORMATETC {
             cfFormat: formats.descriptor,
             ptd: std::ptr::null_mut(),
             dwAspect: DVASPECT_CONTENT.0,
             lindex: -1,
             tymed: TYMED_HGLOBAL.0 as u32,
-        }];
+        });
         all.extend((0..n).map(|i| FORMATETC {
             cfFormat: formats.contents,
             ptd: std::ptr::null_mut(),
@@ -618,6 +656,9 @@ fn run(runtime: tokio::runtime::Handle, sftp: Arc<SftpClient>, items: Vec<DragOu
         items,
         runtime,
         sftp,
+        // 拖出不带私有载荷:F230 只做「复制粘贴」跨实例,拖拽跨实例是另一件事。
+        private_format: 0,
+        private_payload: Vec::new(),
     }
     .into();
     let source: IDropSource = DropSource.into();
@@ -633,4 +674,291 @@ fn run(runtime: tokio::runtime::Handle, sftp: Arc<SftpClient>, items: Vec<DragOu
         started.elapsed().as_millis()
     );
     unsafe { OleUninitialize() };
+}
+
+// ------------------------------------------- F230:系统剪贴板(常驻 STA 线程)
+
+/// 从系统剪贴板读回来的东西。两种格式**一次取完** —— 每问一次
+/// `OleGetClipboard` 都是一次跨进程往返,而 Ctrl+V 是同步手势。
+#[derive(Debug, Default)]
+pub struct ClipRead {
+    /// Mullion 私有格式的正文(信封已拆)。`None` = 板上没有我们认识的东西。
+    pub private: Option<Vec<u8>>,
+    /// `CF_HDROP` —— 用户在资源管理器里 Ctrl+C 的本地文件。
+    pub hdrop: Vec<std::path::PathBuf>,
+}
+
+/// 发给常驻 STA 线程的活。
+enum ClipJob {
+    /// 把这一批远端文件放进系统剪贴板。
+    Set {
+        payload: Vec<u8>,
+        items: Vec<DragOutItem>,
+        runtime: tokio::runtime::Handle,
+        sftp: Arc<SftpClient>,
+    },
+    /// 读一次系统剪贴板,结果回传。
+    Read(std::sync::mpsc::Sender<ClipRead>),
+}
+
+/// 常驻 STA 线程的投递口。**必须常驻**:`OleSetClipboard` 之后,延迟渲染的
+/// `GetData` 回调会回到**放剪贴板的那条线程**。F59 那种一次性线程在
+/// `DoDragDrop` 返回后就退出了 —— 用它放剪贴板,用户按 Ctrl+V 时没人接
+/// 回调,粘出来是空的,而且完全静默(我们这边一条日志都不会有,失败发生
+/// 在别人的进程里)。
+static CLIP_TX: std::sync::OnceLock<std::sync::mpsc::Sender<ClipJob>> = std::sync::OnceLock::new();
+
+/// 取(必要时启动)常驻 STA 线程的投递口。
+fn clip_tx() -> &'static std::sync::mpsc::Sender<ClipJob> {
+    CLIP_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ClipJob>();
+        let spawned = std::thread::Builder::new()
+            .name("mullion-clipboard".into())
+            .spawn(move || clip_thread(&rx));
+        if let Err(e) = spawned {
+            log::error!(target: LOG, "起剪贴板 STA 线程失败:{e}");
+        }
+        tx
+    })
+}
+
+fn clip_thread(rx: &std::sync::mpsc::Receiver<ClipJob>) {
+    if let Err(e) = unsafe { OleInitialize(None) } {
+        log::error!(target: LOG, "剪贴板线程 OleInitialize 失败:{e}");
+        return;
+    }
+    // **不 `OleUninitialize`**:这条线程活到进程结束。提前 uninit 会让已经
+    // 放进剪贴板的 `IDataObject` 失效,用户按 Ctrl+V 粘出来是空的。
+    loop {
+        // 等活,但要在等的间隙抽消息泵 —— STA 线程不抽泵,跨进程的
+        // `GetData` 编组会死等(而延迟渲染的回调正是这么调进来的)。
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(ClipJob::Set {
+                payload,
+                items,
+                runtime,
+                sftp,
+            }) => set_clipboard(payload, items, runtime, sftp),
+            Ok(ClipJob::Read(reply)) => {
+                // 读失败也要回一份空的:调用方在等这条回音,不回它就一直
+                // 卡到超时,Ctrl+V 变成「按下去愣半秒才有反应」。
+                let _ = reply.send(read_clipboard());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        pump_messages();
+    }
+}
+
+/// 抽干这条线程当前排队的窗口消息。
+fn pump_messages() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    let mut msg = MSG::default();
+    while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// 私有格式的 id。`RegisterClipboardFormatW` 幂等(同名同 id),这正是
+/// 「两个 Mullion 互通」要的 —— 两个进程各自登记同一个名字拿到同一个号。
+fn private_format_id() -> u16 {
+    unsafe { RegisterClipboardFormatW(w(crate::clipboard_remote::FORMAT_NAME).as_pcwstr()) as u16 }
+}
+
+fn set_clipboard(
+    payload: Vec<u8>,
+    items: Vec<DragOutItem>,
+    runtime: tokio::runtime::Handle,
+    sftp: Arc<SftpClient>,
+) {
+    use windows::Win32::System::Ole::OleSetClipboard;
+    let formats = Formats::register();
+    let private_format = private_format_id();
+    let described: Vec<descriptor::Described<'_>> = items
+        .iter()
+        .map(|i| descriptor::Described {
+            name: &i.name,
+            size: i.size,
+            // 虚拟文件这一侧只放普通文件:目录展开要在 Ctrl+C 那一刻递归列
+            // 远端目录(可能几十秒)。粘到别的 Mullion 里走私有格式,那条
+            // 路上目录是远端自己 `copy_tree`,不需要展开。
+            is_dir: false,
+        })
+        .collect();
+    let descriptor_bytes = descriptor::file_group_descriptor(&described);
+    log::info!(
+        target: LOG,
+        "放剪贴板:{} 个虚拟文件,私有载荷 {} 字节,格式 id 私有={} 描述符={}",
+        items.len(), payload.len(), private_format, formats.descriptor
+    );
+    let data: IDataObject = Items {
+        formats,
+        descriptor: descriptor_bytes,
+        items,
+        runtime,
+        sftp,
+        private_format,
+        private_payload: crate::clipboard_remote::wrap(&payload),
+    }
+    .into();
+    match unsafe { OleSetClipboard(&data) } {
+        Ok(()) => log::info!(target: LOG, "已放入系统剪贴板"),
+        Err(e) => log::error!(target: LOG, "OleSetClipboard 失败:{e}"),
+    }
+    // **不调 `OleFlushClipboard`**:那会把所有延迟渲染的内容立刻拉下来 ——
+    // 一棵几百 MB 的远端目录树会当场下载完。代价是「Mullion 一关剪贴板就
+    // 失效」,这是与用户确认过、明确接受的取舍(F230)。
+}
+
+/// 一个 `TYMED_HGLOBAL` 的 `FORMATETC`。
+fn hglobal_formatetc(cf: u16) -> FORMATETC {
+    FORMATETC {
+        cfFormat: cf,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+/// 取一个 `TYMED_HGLOBAL` 格式的原始字节。**长度按 `GlobalSize` 量** ——
+/// 它允许比对面申请的大,所以尾部可能有填充,拆信封那一步负责裁掉
+/// (见 `clipboard_remote::wrap`)。
+fn hglobal_bytes(data: &IDataObject, cf: u16) -> Option<Vec<u8>> {
+    use windows::Win32::System::Ole::ReleaseStgMedium;
+    let fe = hglobal_formatetc(cf);
+    // 先问一句:对面不认这个格式时 `GetData` 也会失败,但 `QueryGetData`
+    // 便宜得多,而 Ctrl+V 每按一次都要问两种格式。
+    if unsafe { data.QueryGetData(&fe) } != S_OK {
+        return None;
+    }
+    let mut medium = unsafe { data.GetData(&fe) }.ok()?;
+    let out = read_medium(&medium);
+    // `GetData` 拿回来的 medium 归**我们**释放,漏了就是每按一次 Ctrl+V
+    // 泄一块全局内存,而且不会有任何报错。
+    unsafe { ReleaseStgMedium(&mut medium) };
+    return out;
+
+    fn read_medium(medium: &STGMEDIUM) -> Option<Vec<u8>> {
+        use windows::Win32::System::Memory::GlobalSize;
+        if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+            return None;
+        }
+        let h = unsafe { medium.u.hGlobal };
+        let size = unsafe { GlobalSize(h) };
+        if size == 0 {
+            return None;
+        }
+        let p = unsafe { GlobalLock(h) };
+        if p.is_null() {
+            return None;
+        }
+        let v = unsafe { std::slice::from_raw_parts(p as *const u8, size) }.to_vec();
+        let _ = unsafe { GlobalUnlock(h) };
+        Some(v)
+    }
+}
+
+/// 解 `CF_HDROP`:资源管理器里 Ctrl+C 的本地文件清单。
+fn hdrop_paths(data: &IDataObject) -> Vec<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Ole::{ReleaseStgMedium, CF_HDROP};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    let fe = hglobal_formatetc(CF_HDROP.0);
+    if unsafe { data.QueryGetData(&fe) } != S_OK {
+        return Vec::new();
+    }
+    let Ok(mut medium) = (unsafe { data.GetData(&fe) }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if medium.tymed == TYMED_HGLOBAL.0 as u32 {
+        let hdrop = HDROP(unsafe { medium.u.hGlobal }.0);
+        // `0xFFFF_FFFF` 是「告诉我一共几个」的约定值,不是第 42 亿项。
+        let n = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+        for i in 0..n {
+            let len = unsafe { DragQueryFileW(hdrop, i, None) } as usize;
+            // `DragQueryFileW` 报的长度**不含**结尾 NUL,而带缓冲那一路要
+            // 有位置放它 —— 少给一格的话名字会被截掉最后一个字符。
+            let mut buf = vec![0u16; len + 1];
+            let got = unsafe { DragQueryFileW(hdrop, i, Some(&mut buf)) } as usize;
+            buf.truncate(got);
+            out.push(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                &buf,
+            )));
+        }
+    }
+    // **不调 `DragFinish`**:这个 `HDROP` 是 medium 的一部分,归
+    // `ReleaseStgMedium` 释放。两个都调就是双重释放。
+    unsafe { ReleaseStgMedium(&mut medium) };
+    out
+}
+
+fn read_clipboard() -> ClipRead {
+    use windows::Win32::System::Ole::OleGetClipboard;
+    // 用 `OleGetClipboard` 而不是 `OpenClipboard`+`GetClipboardData`:
+    // 后者只看得见「已经落板」的数据,而 OLE 放进去的是延迟渲染的对象 ——
+    // 必须走 OLE 这条路才会回调到源进程去要内容。
+    let data = match unsafe { OleGetClipboard() } {
+        Ok(d) => d,
+        Err(e) => {
+            log::debug!(target: LOG, "读剪贴板失败:{e}");
+            return ClipRead::default();
+        }
+    };
+    let fmt = private_format_id();
+    let private = (fmt != 0)
+        .then(|| hglobal_bytes(&data, fmt))
+        .flatten()
+        .and_then(|b| crate::clipboard_remote::unwrap_blob(&b).map(<[u8]>::to_vec));
+    let hdrop = hdrop_paths(&data);
+    log::debug!(
+        target: LOG,
+        "读剪贴板:私有={} 字节,CF_HDROP={} 项",
+        private.as_ref().map_or(0, Vec::len), hdrop.len()
+    );
+    ClipRead { private, hdrop }
+}
+
+/// 把一批远端文件放进系统剪贴板。**立刻返回** —— 真正的活在常驻 STA 线程里。
+pub fn set(
+    runtime: tokio::runtime::Handle,
+    sftp: Arc<SftpClient>,
+    items: Vec<DragOutItem>,
+    payload: Vec<u8>,
+) {
+    if let Err(e) = clip_tx().send(ClipJob::Set {
+        payload,
+        items,
+        runtime,
+        sftp,
+    }) {
+        log::error!(target: LOG, "投递剪贴板任务失败:{e}");
+    }
+}
+
+/// 同步读一次系统剪贴板。**会阻塞 UI 线程**,所以带硬超时:读要走常驻 STA
+/// 线程(OLE 的套间规矩),而那一跳的对面是**别人的进程** —— 源程序卡住时
+/// `GetData` 可以一直不返回,不设上限的话整个窗口跟着一起僵住。
+///
+/// 超时(或线程没起来)就返回空 —— 调用方据此退回进程内那份剪贴板。
+pub fn read() -> ClipRead {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if clip_tx().send(ClipJob::Read(tx)).is_err() {
+        log::error!(target: LOG, "投递读剪贴板任务失败");
+        return ClipRead::default();
+    }
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!(target: LOG, "读剪贴板超时({e}),按「板上没有我们认识的东西」处理");
+            ClipRead::default()
+        }
+    }
 }

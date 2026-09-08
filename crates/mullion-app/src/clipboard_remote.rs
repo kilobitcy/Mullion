@@ -107,6 +107,26 @@ pub fn decode(bytes: &[u8]) -> Option<RemoteClipboard> {
     })
 }
 
+/// 把载荷装进「4 字节小端长度 + 正文」的信封。
+///
+/// 需要这一层是因为 `HGLOBAL` **量不出准确长度**:`GlobalSize` 明确允许比申请
+/// 的大(MSDN 原话「may be larger than the size requested」),读回来的缓冲区
+/// 尾部会多出一截填充字节。而 [`decode`] 对多余字节一律整份作废(那条严格是
+/// 故意的)—— 没有信封的话跨进程粘贴会以「格式不认识」的样子静默失败,而且
+/// 只在某些分配尺寸上才复现,几乎不可能靠现场复现定位。
+pub fn wrap(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 拆信封。**允许尾部有填充**(见 [`wrap`]),但长度字段说的那一段必须完整。
+pub fn unwrap_blob(bytes: &[u8]) -> Option<&[u8]> {
+    let len = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    bytes.get(4..4 + len)
+}
+
 /// 这次粘贴该走哪条路。`here` = 本标签当前连接那台机器在 `known_hosts` 里的
 /// 指纹;`None` = 取不到(TOFU 时用户选了「只信任这一次」,没写盘)。
 ///
@@ -181,6 +201,26 @@ mod tests {
         let mut extra = good.clone();
         extra.push(0);
         assert!(decode(&extra).is_none(), "末尾多出字节的载荷不许解开");
+    }
+
+    /// F230:信封必须扛得住 `HGLOBAL` 尾部的填充字节。`GlobalSize` 允许比申请
+    /// 的大,而 `decode` 对多余字节整份作废 —— 没有信封的话跨进程粘贴会以
+    /// 「格式不认识」的样子静默失败,且只在某些分配尺寸上才复现。
+    ///
+    /// 自证会变红:让 `unwrap_blob` 返回 `bytes.get(4..)`(即不按长度截断)。
+    #[test]
+    fn the_envelope_survives_the_padding_hglobal_may_add() {
+        let payload = encode("SHA256:abc", &clip(ClipMode::Cut));
+        let mut blob = wrap(&payload);
+        blob.extend_from_slice(&[0u8; 13]); // GlobalAlloc 多给的那一截
+        let got = unwrap_blob(&blob).expect("信封必须拆得开");
+        assert_eq!(got, &payload[..]);
+        assert!(decode(got).is_some(), "拆出来的正文必须还能解码");
+        assert!(
+            unwrap_blob(b"\x10\x00\x00\x00ab").is_none(),
+            "长度字段说的那段不完整,不许拆出半份"
+        );
+        assert!(unwrap_blob(b"ab").is_none());
     }
 
     /// F230 的核心判据:指纹相同才走快路径(远端直接 copy/rename,零传输)。
