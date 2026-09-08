@@ -4397,8 +4397,11 @@ impl App {
             }
             // F219:同 `Rename` —— 本地栏根本进不了新建态(`menu_items_for`
             // 不给这一项,`handle_panel_key` 的 Ctrl+N 也只在远端栏放行)。
-            FileAction::BeginNewFile | FileAction::NewFile(_) => {
-                log::warn!("本地栏收到了新建文件请求,已忽略(D5)");
+            FileAction::BeginNewFile
+            | FileAction::NewFile(_)
+            | FileAction::BeginNewDir
+            | FileAction::NewDir(_) => {
+                log::warn!("本地栏收到了新建文件/文件夹请求,已忽略(D5)");
                 return;
             }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
@@ -4534,13 +4537,18 @@ impl App {
             }
             // F219:请求进入就地新建态。纯 UI 状态,不发任何请求 ——
             // 与 `Ask` 一样在借出 `files` 之前分流。
-            FileAction::BeginNewFile => {
+            FileAction::BeginNewFile | FileAction::BeginNewDir => {
                 if let Some(files) = self
                     .tabs
                     .by_generation_mut(generation)
                     .and_then(|t| t.content.files_panel_mut())
                 {
-                    files.remote.begin_new_file();
+                    // F226:两种就地新建共用一个槽,进哪一种由动作决定。
+                    if matches!(action, FileAction::BeginNewDir) {
+                        files.remote.begin_new_dir();
+                    } else {
+                        files.remote.begin_new_file();
+                    }
                     mark_ui_dirty!(self.ui_dirty);
                     self.request_ui_redraw();
                 }
@@ -4550,6 +4558,12 @@ impl App {
             // (见 `FileAction::NewFile` 的文档),这里只管发。
             FileAction::NewFile(path) => {
                 let op = crate::ui::files_dialog::FileOp::NewFile(path.clone());
+                self.apply_file_op(generation, op);
+                return;
+            }
+            // F226:同上,只是发 `NewDir`。模态框那条路已经删了,这是唯一入口。
+            FileAction::NewDir(path) => {
+                let op = crate::ui::files_dialog::FileOp::NewDir(path.clone());
                 self.apply_file_op(generation, op);
                 return;
             }
@@ -4670,6 +4684,8 @@ impl App {
             | FileAction::Rename { .. }
             | FileAction::BeginNewFile
             | FileAction::NewFile(_)
+            | FileAction::BeginNewDir
+            | FileAction::NewDir(_)
             | FileAction::ClipCopy
             | FileAction::ClipCut
             | FileAction::ClipPaste => return,
@@ -5259,10 +5275,6 @@ impl App {
             return;
         };
         let dialog = match ask {
-            FileAsk::NewDir => Some(FilesDialog::NewDir {
-                parent: state.cwd.clone(),
-                name: String::new(),
-            }),
             // F200:改名**不弹框**,直接让那一行进编辑态。走到这里的两个
             // 入口(F2、右键「重命名」)都归它,不再有第二条路。
             FileAsk::Rename => {

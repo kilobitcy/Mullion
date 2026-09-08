@@ -23,12 +23,6 @@ use crate::theme::{self, Theme};
 /// 同一套做法):egui 闭包借不到 `&mut App`,意图必须落在状态里。
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilesDialog {
-    NewDir {
-        /// 在哪个目录里建。
-        parent: RemotePath,
-        /// 输入框内容。
-        name: String,
-    },
     Delete {
         /// 要删的完整路径 + 它是不是目录(确认文案要分开数)。
         targets: Vec<(RemotePath, bool)>,
@@ -234,8 +228,7 @@ pub fn bits_from_mode(mode: u32) -> [bool; 9] {
 /// (一条 job / 一条编辑),不给出处置它们就永远挂着。
 pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
     match d {
-        FilesDialog::NewDir { .. }
-        | FilesDialog::Delete { .. }
+        FilesDialog::Delete { .. }
         | FilesDialog::Chmod { .. }
         // F220:预检查回来之后才开这个框,这一步还没有发出任何写请求 ——
         // 取消就是只关框,没有需要收口的在途工作。
@@ -281,19 +274,6 @@ fn modal<R>(ctx: &egui::Context, title: &str, body: impl FnOnce(&mut egui::Ui) -
     !open
 }
 
-/// 名字输入框 + 校验提示。返回「现在能不能确认」。
-/// (F200 之后只剩「新建文件夹」一个用户 —— 重命名改成列表里就地编辑了。)
-fn name_field(ui: &mut egui::Ui, t: &Theme, name: &mut String) -> bool {
-    ui.add(egui::TextEdit::singleline(name).desired_width(260.0));
-    match validate_name(name) {
-        Ok(()) => true,
-        Err(why) => {
-            ui.colored_label(theme::c32(t.danger_text), why);
-            false
-        }
-    }
-}
-
 /// 画当前开着的那个对话框。返回用户确认的写操作(没确认就是 `None`)。
 ///
 /// `dialog` 传 `&mut Option<..>`:用户点「取消」或确认之后要把它清成
@@ -314,28 +294,6 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
     }
 
     match d {
-        FilesDialog::NewDir { parent, name } => {
-            let parent_disp = parent.display().to_string();
-            let x = modal(ctx, "新建文件夹", |ui| {
-                ui.label(
-                    egui::RichText::new(format!("位置:{parent_disp}"))
-                        .color(theme::c32(t.fg_muted)),
-                );
-                let ok = name_field(ui, t, name);
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(ok, egui::Button::new("新建")).clicked() {
-                        op = Some(FileOp::NewDir(parent.join(name.trim().as_bytes())));
-                        close = true;
-                    }
-                    if ui.button("取消").clicked() {
-                        cancelled!();
-                    }
-                });
-            });
-            if x {
-                cancelled!();
-            }
-        }
         FilesDialog::Delete { targets } => {
             let x = modal(ctx, "删除", |ui| {
                 ui.colored_label(theme::c32(t.danger_text), delete_summary(targets));
@@ -658,10 +616,6 @@ mod tests {
     #[test]
     fn cancelling_settles_the_two_dialogs_that_own_in_flight_work_and_only_closes_the_rest() {
         let all = [
-            FilesDialog::NewDir {
-                parent: rp("/srv"),
-                name: "x".into(),
-            },
             FilesDialog::Delete {
                 targets: vec![(rp("/srv/a"), false)],
             },
@@ -691,8 +645,7 @@ mod tests {
         for d in &all {
             let got = cancel_op(d);
             let want = match d {
-                FilesDialog::NewDir { .. }
-                | FilesDialog::Delete { .. }
+                FilesDialog::Delete { .. }
                 | FilesDialog::Chmod { .. }
                 | FilesDialog::PasteConflict { .. } => None,
                 FilesDialog::EditConflict { .. } => Some(FileOp::ResolveEdit {
@@ -736,13 +689,6 @@ mod tests {
                 Some(FilesDialog::Chmod {
                     path: rp("/srv/a"),
                     mode: 0o644,
-                }),
-            ),
-            (
-                "新建文件夹",
-                Some(FilesDialog::NewDir {
-                    parent: rp("/srv"),
-                    name: "x".into(),
                 }),
             ),
             ("编辑冲突", edit_conflict()),
@@ -1178,20 +1124,6 @@ mod tests {
             "点「删除」该发出 Delete"
         );
         assert!(d.is_none(), "确认之后框必须关掉");
-    }
-
-    /// 新建文件夹的目标路径 = 当前目录 + 名字,且首尾空白要去掉 ——
-    /// 「 新文件夹 」在远端会变成一个名字带空格、命令行里极难处理的目录。
-    #[test]
-    fn creating_a_directory_joins_the_trimmed_name_onto_the_current_directory() {
-        let mut d = Some(FilesDialog::NewDir {
-            parent: rp("/srv/app"),
-            name: "  日志  ".into(),
-        });
-        assert_eq!(
-            click_button(&mut d, "新建"),
-            Some(FileOp::NewDir(rp("/srv/app/日志")))
-        );
     }
 
     /// F220:冲突框给三条出路,且**列出撞了哪几条** —— 只说「有冲突」

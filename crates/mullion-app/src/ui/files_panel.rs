@@ -89,6 +89,12 @@ pub enum FileAction {
     ///
     /// 名字已经过 `files_dialog::validate_name` 与「目录里没有同名」两道闸。
     NewFile(mullion_ssh::sftp::RemotePath),
+    /// F226:请求进入就地**新建文件夹**态(右键菜单 / `Ctrl+Shift+N`)。
+    /// 同 `BeginNewFile`,纯 UI 状态,不发任何请求。
+    BeginNewDir,
+    /// F226:就地新建文件夹提交。**绝对路径**,在面板里用同一个 `cwd` 拼好 ——
+    /// 与 `NewFile` 同一条约定(拼在面板侧,app 侧只管发),理由见那一条。
+    NewDir(mullion_ssh::sftp::RemotePath),
     /// F220:把选中集放进这个标签的远端剪贴板。
     ClipCopy,
     ClipCut,
@@ -127,8 +133,6 @@ impl BookmarkView<'_> {
 /// 要打开哪个对话框。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileAsk {
-    /// 在当前目录里新建文件夹。**不需要选中任何东西**。
-    NewDir,
     /// 重命名**光标行**(单目标)。
     Rename,
     /// 删除**选中集**(可多条)。
@@ -152,6 +156,8 @@ pub enum MenuItem {
     /// F219:就地新建文件。**不是 `Ask`** —— 它不弹框,是让列表首行长出一个
     /// 输入框(同 F200 的改名)。
     NewFile,
+    /// F226:就地新建**文件夹**。同 `NewFile`,不是 `Ask` —— 它不弹框。
+    NewDir,
     /// F220:把选中集放进这个标签的远端剪贴板。
     ClipCopy,
     ClipCut,
@@ -202,7 +208,7 @@ pub fn menu_items_for(
 ) -> Vec<MenuEntry> {
     let mut out: Vec<MenuEntry> = Vec::new();
     if column == PanelColumn::Remote {
-        out.push(on("新建文件夹…", MenuItem::Ask(FileAsk::NewDir)));
+        out.push(on("新建文件夹", MenuItem::NewDir));
         out.push(on("新建文件", MenuItem::NewFile));
         if let Some(tg) = target {
             out.push(on("下载到本地", MenuItem::Transfer));
@@ -256,6 +262,7 @@ impl MenuItem {
             MenuItem::EditExternal => FileAction::EditExternal,
             MenuItem::EditInline => FileAction::EditInline,
             MenuItem::NewFile => FileAction::BeginNewFile,
+            MenuItem::NewDir => FileAction::BeginNewDir,
             MenuItem::ClipCopy => FileAction::ClipCopy,
             MenuItem::ClipCut => FileAction::ClipCut,
             MenuItem::ClipPaste => FileAction::ClipPaste,
@@ -1004,6 +1011,9 @@ pub fn show(
                 // 漏改的症状是点第二行选中第一个文件,而删除不可逆。
                 if ix == 0 && new_row == 1 {
                     let n = newing.as_mut().expect("new_row == 1 时 newing 必为 Some");
+                    // F226:kind 要在借 `&mut n.buf` 之前取出来 —— 同时可变借
+                    // 用 `n` 编不过。`NewKind` 是 Copy,取一份不花什么。
+                    let new_kind = n.kind;
                     let trimmed = n.buf.trim().as_bytes();
                     let taken_ref = taken
                         .as_ref()
@@ -1020,6 +1030,8 @@ pub fn show(
                         &mut n.focus_pending,
                         false,
                         extra_err,
+                        (new_kind == crate::files::state::NewKind::Dir)
+                            .then_some(crate::ui::file_icon::IconKind::Dir),
                     ) {
                         new_done = Some(done);
                     }
@@ -1119,7 +1131,14 @@ pub fn show(
         Some(None) => {}
         Some(Some(name)) => {
             // **路径在这里拼**,用的是这一帧的 `state.cwd`。
-            action = Some(FileAction::NewFile(state.cwd.join(name.as_bytes())));
+            let path = state.cwd.join(name.as_bytes());
+            // F226:发哪一种由**当时那个编辑态的 kind** 决定 —— `newing` 是这
+            // 一帧开头 take 出来的那份,提交这一刻它还在手上(这条分支没有把
+            // 它 move 掉)。不看 `state.new_edit`:那里已经是 `None` 了。
+            action = Some(match newing.as_ref().map(|n| n.kind) {
+                Some(crate::files::state::NewKind::Dir) => FileAction::NewDir(path),
+                _ => FileAction::NewFile(path),
+            });
         }
     }
     // F200:改名的收尾。放在 `click_row` 之前 —— 提交那一下同时也是
@@ -1365,6 +1384,7 @@ fn name_edit_row(
     focus_pending: &mut bool,
     preselect_stem: bool,
     extra_err: Option<&'static str>,
+    icon: Option<crate::ui::file_icon::IconKind>,
 ) -> Option<Option<String>> {
     // 行宽与 `row()` 同源(见那里的说明:总宽与视口宽取大者)。
     let w = content_w(cols, column).max(ui.available_width());
@@ -1387,6 +1407,20 @@ fn name_edit_row(
         row_rect.min + egui::vec2(name_start_x_offset(), 0.0),
         egui::vec2((cols.name - name_start_x_offset()).max(60.0), ROW_H),
     );
+    // F226:新建**文件夹**的幽灵行画一个文件夹图标 —— 输入框里还什么都没有,
+    // 图标是用户判断"我在建文件还是建文件夹"的唯一线索。改名行不画(那一行
+    // 的图标本来就由 `row()` 画着),新建文件也不画(维持 F219 的样子)。
+    //
+    // 必须排在 `ui.put` **之前**:`put` 会推进布局光标,之后再画就叠到下一行
+    // 的位置上去了(而编译/测试全不吭声,只有人眼看得见)。
+    if let Some(kind) = icon {
+        crate::ui::file_icon::paint(
+            ui.painter(),
+            icon_rect(row_rect),
+            kind,
+            theme::c32(crate::ui::file_icon::color_for(kind, true, false, t)),
+        );
+    }
     let resp = ui.put(
         name_rect,
         egui::TextEdit::singleline(buf)
@@ -1458,6 +1492,9 @@ fn rename_row(
         &mut r.buf,
         &mut r.focus_pending,
         true,
+        None,
+        // F226:改名行不画图标 —— 那一行的图标本来就由 `row()` 画着,
+        // 再画一个会叠在上面。
         None,
     )
 }
@@ -4536,6 +4573,56 @@ mod tests {
         );
     }
 
+    /// F226:「新建文件夹」改成就地编辑,所以**不带省略号** —— 省略号在这套
+    /// 界面里专指「会弹个框」(「删除…」「属性(权限)…」还带着)。带着它
+    /// 而实际不弹框,用户会以为点错了。
+    ///
+    /// 自证会变红:把标签改回带省略号的写法。
+    #[test]
+    fn new_dir_is_an_inline_edit_so_it_carries_no_ellipsis() {
+        let remote = menu_items_for(PanelColumn::Remote, None, false);
+        let e = remote
+            .iter()
+            .find(|e| e.item == MenuItem::NewDir)
+            .expect("远端栏没有「新建文件夹」");
+        assert_eq!(e.label, "新建文件夹");
+        assert!(
+            !e.label.contains('…'),
+            "「新建文件夹」带了省略号 —— 那是弹框的记号"
+        );
+        assert_eq!(
+            MenuItem::NewDir.into_action(),
+            FileAction::BeginNewDir,
+            "菜单项必须发就地新建,不能再发弹框那条路"
+        );
+
+        // D5:本地栏一概没有写操作。
+        let local = menu_items_for(PanelColumn::Local, None, false);
+        assert!(!local.iter().any(|e| e.item == MenuItem::NewDir));
+    }
+
+    /// F226:弹框那条路必须**真的删掉**,不能只是没人调。留着的话下一个人
+    /// 照着旧代码又接一个入口回去,两套交互再次并存。
+    ///
+    /// 针要拼出来:整串直接写在这个文件里的话,`include_str!` 会扫到断言
+    /// 自己,测试恒红。
+    ///
+    /// 自证会变红:把那个变体加回 `FileAsk` 枚举。
+    #[test]
+    fn the_new_dir_modal_is_gone_not_merely_unreachable() {
+        let src = include_str!("files_dialog.rs");
+        assert!(
+            !src.contains("NewDir {"),
+            "files_dialog.rs 里还留着新建文件夹的模态(F226 已改成就地编辑)"
+        );
+        let needle = concat!("FileAsk", "::NewDir");
+        let panel = include_str!("files_panel.rs");
+        assert!(
+            !panel.contains(needle),
+            "还有人在发弹框式的新建文件夹 —— 那个变体已经删了(F226)"
+        );
+    }
+
     /// D5:**本地栏没有写操作入口**。菜单项的存在与否是纯结构的事,
     /// 用 `menu_items_for` 这个纯函数验,不必真去点开右键菜单
     /// (egui 的 `context_menu` 要一次右键 + 一帧才展开,测起来又脆又慢)。
@@ -4543,12 +4630,7 @@ mod tests {
     fn the_local_column_never_offers_a_write_operation() {
         let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false);
         let local = menu_items_for(PanelColumn::Local, Some(a_file()), false);
-        for ask in [
-            FileAsk::NewDir,
-            FileAsk::Rename,
-            FileAsk::Delete,
-            FileAsk::Chmod,
-        ] {
+        for ask in [FileAsk::Rename, FileAsk::Delete, FileAsk::Chmod] {
             assert!(
                 remote.iter().any(|e| e.item == MenuItem::Ask(ask)),
                 "远端栏该有 {ask:?}"
@@ -4558,6 +4640,15 @@ mod tests {
                 "本地栏不该出现 {ask:?}(D5:本地文件管理外包给资源管理器)"
             );
         }
+        // F226:新建文件夹已经不是 `Ask`(不弹框了),单独验一遍两栏。
+        assert!(
+            remote.iter().any(|e| e.item == MenuItem::NewDir),
+            "远端栏该有「新建文件夹」"
+        );
+        assert!(
+            !local.iter().any(|e| e.item == MenuItem::NewDir),
+            "本地栏不该出现「新建文件夹」(D5)"
+        );
         assert!(
             local.iter().any(|e| e.item == MenuItem::OpenInExplorer),
             "本地栏该有「在资源管理器中打开」"
@@ -4599,9 +4690,7 @@ mod tests {
             );
         }
         // 「新建文件夹」不需要选中任何东西 —— 空目录里也得能建。
-        assert!(items
-            .iter()
-            .any(|e| e.item == MenuItem::Ask(FileAsk::NewDir)));
+        assert!(items.iter().any(|e| e.item == MenuItem::NewDir));
     }
 
     /// 摆一份「远端有个 logs 目录 + 一个 b.txt,本地有个 a.txt」的两栏。
@@ -5224,9 +5313,9 @@ mod tests {
         let _ = render(input, &mut state);
         let (_, out) = render(egui::RawInput::default(), &mut state);
         let target =
-            find_text_pos(&out.shapes, "新建文件夹").expect("右键之后菜单里该有「新建文件夹…」");
+            find_text_pos(&out.shapes, "新建文件夹").expect("右键之后菜单里该有「新建文件夹」");
 
-        // 点它 → 发出 Ask(NewDir)。
+        // F226:点它 → 发出 BeginNewDir(就地编辑),不再是弹框的 Ask。
         let mut input = egui::RawInput::default();
         input.events.push(egui::Event::PointerButton {
             pos: target,
@@ -5243,8 +5332,8 @@ mod tests {
         let (action, _) = render(input, &mut state);
         assert_eq!(
             action,
-            Some(FileAction::Ask(FileAsk::NewDir)),
-            "点菜单里的「新建文件夹…」该发出 Ask(NewDir)"
+            Some(FileAction::BeginNewDir),
+            "点菜单里的「新建文件夹」该发出 BeginNewDir(F226:就地编辑,不弹框)"
         );
     }
 
