@@ -5113,16 +5113,26 @@ impl App {
                     self.dispatch_panel_action(generation, FileAction::ToggleHidden);
                     return;
                 }
-                // F219:Ctrl+N 就地新建文件。**只在远端栏**(D5)——焦点在
-                // 本地栏时静默不动,不是转投远端栏,理由同 Delete/F2。
-                if s.as_str() == "n" {
+                // F219/F226:Ctrl+N 就地新建文件,Ctrl+Shift+N 就地新建文件夹。
+                // **只在远端栏**(D5)——焦点在本地栏时静默不动,不是转投远端栏,
+                // 理由同 Delete/F2。
+                //
+                // 用 `eq_ignore_ascii_case`:按住 Shift 时 winit 给的
+                // `logical_key` 是大写的 "N",只比小写 "n" 会让 Ctrl+Shift+N
+                // 整个落空(静默,像这个键根本没绑过)。
+                if s.eq_ignore_ascii_case("n") {
                     let column = self
                         .tabs
                         .by_generation(generation)
                         .and_then(|t| t.content.files_panel())
                         .map(|f| f.active_column);
                     if column == Some(crate::ui::files_panel::PanelColumn::Remote) {
-                        self.dispatch_panel_action(generation, FileAction::BeginNewFile);
+                        let action = if mods.shift_key() {
+                            FileAction::BeginNewDir
+                        } else {
+                            FileAction::BeginNewFile
+                        };
+                        self.dispatch_panel_action(generation, action);
                     }
                     return;
                 }
@@ -5371,9 +5381,12 @@ impl App {
         // F219:建完之后把光标落到新文件上。**必须在这里算**——到了完成事件
         // 那一刻,`op` 已经被 move 进下面的后台 task 了。
         let follow = match &op {
-            FileOp::NewFile(p) => OpFollow::Reveal(mullion_ssh::sftp::RemotePath::from_bytes(
-                crate::files::reveal::base_name(p.as_bytes(), crate::files::PanelColumn::Remote),
-            )),
+            FileOp::NewFile(p) | FileOp::NewDir(p) => OpFollow::Reveal(
+                mullion_ssh::sftp::RemotePath::from_bytes(crate::files::reveal::base_name(
+                    p.as_bytes(),
+                    crate::files::PanelColumn::Remote,
+                )),
+            ),
             _ => OpFollow::None,
         };
         let task = self._runtime.spawn(async move {
@@ -14089,6 +14102,66 @@ mod tests {
             "Ctrl+N 没判栏 —— 在本地栏按会动到远端(D5)"
         );
         assert!(arm.contains("BeginNewFile"), "Ctrl+N 没派发 BeginNewFile");
+    }
+
+    /// F226:`Ctrl+Shift+N` = 新建文件夹,`Ctrl+N` = 新建文件。两者共用一个
+    /// 分支,所以必须**在分支里按 shift 分流** —— 少了那道分流,用户按
+    /// Ctrl+Shift+N 建出来的是个文件,而且界面上看不出哪里错了。
+    ///
+    /// 还要 `eq_ignore_ascii_case`:按住 Shift 时 winit 给的 `logical_key`
+    /// 是大写的 `"N"`,只比小写 `"n"` 会让 Ctrl+Shift+N 整个落空(静默,像
+    /// 这个键根本没绑过)。
+    ///
+    /// 窗口的取法同上一条(搜到本分支自己的 `return;`),不用定长字节切片。
+    ///
+    /// 自证会变红:把 shift 那个三目去掉、恒发 `BeginNewFile`。
+    #[test]
+    fn ctrl_shift_n_creates_a_directory_while_ctrl_n_creates_a_file() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn handle_panel_key(")
+            .nth(1)
+            .expect("找不到 handle_panel_key");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let at = body
+            .find("eq_ignore_ascii_case(\"n\")")
+            .expect("Ctrl+N 那支没有忽略大小写 —— Ctrl+Shift+N 会整个落空");
+        let end = at
+            + body[at..]
+                .find("return;")
+                .expect("Ctrl+N 那支没有以 return 收尾 —— 窗口定位不到")
+            + "return;".len();
+        let arm = &body[at..end];
+        assert!(
+            arm.contains("mods.shift_key()"),
+            "Ctrl+N / Ctrl+Shift+N 没按 shift 分流(F226)"
+        );
+        assert!(
+            arm.contains("FileAction::BeginNewDir"),
+            "Ctrl+Shift+N 没接上"
+        );
+        assert!(arm.contains("FileAction::BeginNewFile"), "Ctrl+N 被改坏了");
+    }
+
+    /// F226:建完之后光标要落到新目录上(同 F219 建文件)。`follow` **必须在
+    /// 发请求之前算好** —— 到了完成事件那一刻 `op` 已经被 move 进后台 task,
+    /// 拿不回路径了(F219 已经踩过一次,这里是同一条约定的第二个用户)。
+    ///
+    /// 漏掉 `NewDir` 的表现是「目录建出来了,但列表刷新后光标不知道在哪」,
+    /// **画面上像是没生效**。
+    ///
+    /// 自证会变红:把 `FileOp::NewDir(p)` 从那个 match 的臂里去掉。
+    #[test]
+    fn a_freshly_created_directory_is_revealed_just_like_a_new_file() {
+        let src = include_str!("app.rs");
+        let anchor = "let follow = match &op {";
+        let at = src.find(anchor).expect("找不到 follow 的计算点");
+        let seg = &src[at..];
+        let seg = &seg[..seg.find("\n        };").expect("找不到 follow 的收尾")];
+        assert!(
+            seg.contains("FileOp::NewFile(p) | FileOp::NewDir(p)"),
+            "新建目录也要 OpFollow::Reveal(F226),否则建完光标不知道落在哪"
+        );
     }
 
     /// F220:三个剪贴板快捷键只在**远端栏**放行(D5 + 用户明确要的
