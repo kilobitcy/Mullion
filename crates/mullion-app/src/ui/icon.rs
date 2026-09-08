@@ -34,6 +34,15 @@ pub enum Glyph {
     Maximize,
     /// F204:两个错位方框 —— 窗口「还原」。Windows 上的既有心智。
     Restore,
+    /// F224:项目灯**亮**(实心圆)—— 有 pane 正 attach 在它的 tmux 上。
+    LampLit,
+    /// F224:项目灯**灭**(空心圆)—— 全部 pane 都上报过且无一命中。
+    LampDark,
+    /// F224:项目灯**未知**(空心圆 + 圆心一点)—— 还有 pane 没上报过。
+    ///
+    /// 三态**不许退化成两态**:把「未知」画成「灭」的话,用户会以为项目
+    /// 没在跑而去开第二份 —— 同一个目录两个 Claude Code,正是这盏灯要防的。
+    LampUnknown,
 }
 
 impl Glyph {
@@ -50,6 +59,9 @@ impl Glyph {
         Glyph::TriangleRight,
         Glyph::Maximize,
         Glyph::Restore,
+        Glyph::LampLit,
+        Glyph::LampDark,
+        Glyph::LampUnknown,
     ];
 }
 
@@ -197,6 +209,24 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
                 ),
             ]
         }
+        // F224 三态灯。半径取 `h * 0.7`:圆是三个里最「胖」的形状,贴着 `h`
+        // 画的话描边的外半宽会越出 rect(`every_glyph_stays_inside_its_rect`
+        // 拦的正是这个)。
+        //
+        // 实心用 `circle_filled`、空心用 `circle_stroke`,**不是同一个圈换
+        // 颜色**:换颜色在深色底上几乎看不出差别,而这盏灯的全部价值就是
+        // 一眼分辨。
+        Glyph::LampLit => vec![Shape::circle_filled(c, h * 0.7, stroke.color)],
+        Glyph::LampDark => vec![Shape::circle_stroke(c, h * 0.7, stroke)],
+        // 空心圈 + 圆心一点。点画成一段极短的竖线而不是小实心圆,理由同
+        // `Glyph::Info`:小尺寸下填充小圆会被反走样抹成一团灰。
+        Glyph::LampUnknown => vec![
+            Shape::circle_stroke(c, h * 0.7, stroke),
+            Shape::LineSegment {
+                points: [pos2(c.x, c.y - h * 0.12), pos2(c.x, c.y + h * 0.12)],
+                stroke: stroke.into(),
+            },
+        ],
     }
 }
 
@@ -320,6 +350,30 @@ mod tests {
         // 尖端必须在水平中线附近,否则画出来是个斜杠不是箭头。
         assert!((apex_up.x - r().center().x).abs() < 1.0);
         assert!((apex_down.x - r().center().x).abs() < 1.0);
+    }
+
+    /// **F224 三态灯必须互相画得出区别。** 三个画成同一个圈的话,这盏灯
+    /// 等于不存在 —— 而编译、测试、日志全静默,只有人眼能看出来(T9 同族)。
+    ///
+    /// 自证会变红:把 `Glyph::LampDark` 的分支照抄成 `LampLit` 的。
+    #[test]
+    fn the_three_lamp_states_are_actually_drawn_differently() {
+        let filled = |sh: &[egui::Shape]| {
+            sh.iter().any(|s| match s {
+                egui::Shape::Circle(c) => c.fill != Color32::TRANSPARENT,
+                _ => false,
+            })
+        };
+        let lit = shapes(r(), Glyph::LampLit, s());
+        let dark = shapes(r(), Glyph::LampDark, s());
+        let unknown = shapes(r(), Glyph::LampUnknown, s());
+        assert!(filled(&lit), "亮着的灯该是实心的");
+        assert!(!filled(&dark), "灭的灯不该是实心的,否则跟「亮」一个样");
+        assert_ne!(
+            dark.len(),
+            unknown.len(),
+            "「灭」和「未知」画成了同一个东西 —— 三态退化成两态"
+        );
     }
 
     /// 叉必须是两条**相交**的线,不是两条平行线也不是一条。
@@ -484,23 +538,36 @@ mod tests {
     /// `Glyph::ALL` 必须真的列全 —— 漏一个,`every_glyph_stays_inside_its_rect`
     /// 就悄悄不覆盖它了(本项目记过的「列举式门控在加档时必然漏」)。
     ///
-    /// 没有办法让编译器数枚举变体,所以判据取「每个变体画出来的点集**互不
-    /// 相同**」:至少能保证 ALL 里没有重复填充、凑数目。真正的闸门是
-    /// `shapes()` 那个穷尽 `match` —— 加变体不补分支直接编译不过。
+    /// 没有办法让编译器数枚举变体,所以判据取「每个变体画出来的**点集 +
+    /// 各圆的实心与否**互不相同」:至少能保证 ALL 里没有重复填充、凑数目。
+    /// 真正的闸门是 `shapes()` 那个穷尽 `match` —— 加变体不补分支直接编译不过。
+    ///
+    /// **填充维度不是装饰**:`points_of` 对 `circle_filled` 与 `circle_stroke`
+    /// 给出完全相同的点集,而 F224 的「亮」与「灭」正是同一个圆的实心/空心
+    /// 两态 —— 只比点集的话,这条会把一对**确实不同**的图标误判成重复。
     ///
     /// 自证会变红:把 `ALL` 里的 `Glyph::TriangleRight` 改成再写一遍
     /// `Glyph::TriangleDown`。
     #[test]
     fn every_glyph_in_all_draws_something_distinct() {
-        let mut seen: Vec<Vec<egui::Pos2>> = Vec::new();
+        let mut seen: Vec<(Vec<egui::Pos2>, Vec<bool>)> = Vec::new();
         for g in Glyph::ALL.iter().copied() {
-            let pts = points_of(&shapes(r(), g, s()));
+            let sh = shapes(r(), g, s());
+            let fills: Vec<bool> = sh
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Circle(c) => Some(c.fill != Color32::TRANSPARENT),
+                    _ => None,
+                })
+                .collect();
+            let pts = points_of(&sh);
             assert!(!pts.is_empty(), "{g:?} 什么都没画");
+            let key = (pts, fills);
             assert!(
-                !seen.contains(&pts),
+                !seen.contains(&key),
                 "{g:?} 与 ALL 里另一个变体画得一模一样"
             );
-            seen.push(pts);
+            seen.push(key);
         }
     }
 

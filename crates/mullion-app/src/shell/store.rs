@@ -209,6 +209,11 @@ impl SessionStore {
         self.vault.delete_project(id)
     }
 
+    /// F224:记一笔访问时间。调用时机是**跃迁**,见 `App::drive_project_visits`。
+    pub fn touch_project_accessed(&mut self, id: mullion_store::ProjectId, now_rfc3339: &str) {
+        self.vault.touch_project_accessed(id, now_rfc3339);
+    }
+
     /// 共享凭据表(F74)。UI 拿它显示「有效用户名」与凭据档列表。
     pub fn credentials(&self) -> &[mullion_store::CredentialRecord] {
         self.vault.credentials()

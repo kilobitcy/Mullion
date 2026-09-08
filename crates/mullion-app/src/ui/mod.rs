@@ -462,6 +462,11 @@ pub struct UiFrame<'a> {
     pub credentials: &'a [mullion_store::CredentialRecord],
     /// F221 项目表。store 不可用时传 `&[]`。
     pub projects: &'a [mullion_store::ProjectRecord],
+    /// F224:每个项目此刻的运行灯。**由调用方算好**(它要遍历全部标签的
+    /// pane 加上别的实例的在场文件,两样 UI 层都够不着)。查不到的项目按
+    /// [`crate::project::Lamp::Unknown`] 显示 —— 不是「灭」,见那个枚举。
+    pub project_lamps:
+        &'a std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
     /// F222:`known_hosts` 指纹表。**只在项目管理器开着时才是 `Some`** ——
     /// 它在 `App` 里是 `Arc<Mutex<_>>`,SSH 线程握手时也要拿;每帧无条件锁
     /// 会让一次握手白等一帧。`None` 时项目节点一律标「待核」,不会误判同机。
@@ -878,6 +883,7 @@ pub fn build_ui(
             t,
             ui_state,
             frame.projects,
+            frame.project_lamps,
             frame.sessions,
             frame.known_hosts,
         );
@@ -1155,6 +1161,12 @@ mod tests {
             groups: &[],
             credentials: &[],
             projects: &[],
+            project_lamps: {
+                static EMPTY: std::sync::OnceLock<
+                    std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
+                > = std::sync::OnceLock::new();
+                EMPTY.get_or_init(Default::default)
+            },
             known_hosts: None,
             tunnels: &[],
             tunnel_states: &[],

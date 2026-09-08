@@ -525,6 +525,25 @@ fn drive_attach_checks_of(
     (pending, dirty)
 }
 
+/// F224:本实例**全部标签、全部 pane** 的 `(是否上报过, tmux 名)`。
+///
+/// **遍历全部标签,不只是活动标签**(同 `drive_reconnects` 那条纪律):
+/// 用户在标签 1 里开着项目 A、切到标签 2 干别的,只看活动标签的话 A 的灯
+/// 就灭了 —— 于是他去开第二份,同一个目录两个 Claude Code,而那正是这盏灯
+/// 存在的理由。
+///
+/// 拆成自由函数的理由同 `drive_attach_checks_of`:`App::new` 要
+/// `EventLoopProxy`,测试容器里造不出真的 `App`。
+/// **借用不克隆**:这条每帧都跑(`drive_project_visits` + 灯),每块 pane
+/// 克隆一次 `String` 就是每帧几次堆分配 —— 正是 T3 那类「每帧重活」。
+fn pane_reports_of(tabs: &Tabs<TabContent>) -> Vec<(bool, Option<&str>)> {
+    tabs.iter()
+        .filter_map(|t| t.content.as_terminal())
+        .flat_map(|t| t.ws.panes())
+        .map(|p| (p.title_ever_seen, p.tmux.as_deref()))
+        .collect()
+}
+
 /// F163:一条校验有结论了。返回这块 pane 的 `notice` 是否被真的改动过。
 ///
 /// **D8:失败之后不补跑配置的登录后命令。** 结论是在「发完等几秒」之后
@@ -2170,6 +2189,17 @@ pub struct App {
     /// 存在这张表里的 host 这一帧不再发起 —— 帧循环 60fps,不去重就是
     /// 一秒六十条连接(判据在 `reconnect::hosts_to_redial`)。
     reconnecting: Vec<(u64, usize, u32)>,
+    /// F224:上一帧**正命中**的项目集合(有 pane 报出了它的 tmux 名)。
+    ///
+    /// 记账用途只有一个:跟这一帧的集合比,取「新进来的」。上报每几秒一批,
+    /// 没有这本上一帧的账就只能按电平写盘 —— 每几秒往 `sessions.toml` 写
+    /// 一次(切片 T-b 的同一个坑)。判据见 `crate::project::newly_entered`。
+    project_hits: std::collections::BTreeSet<mullion_store::ProjectId>,
+    /// F224:**别的实例**此刻报出来的 tmux 名(`projects/*.alive`)。
+    ///
+    /// 缓存下来、跟着心跳那一下才重读:每帧去 `read_dir` 整个目录是标准的
+    /// T3 违规,而在场文件本来就 15 秒才写一次,读得再勤也不会更新。
+    project_others: Vec<String>,
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
     /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
     tunnels: crate::tunnels::TunnelRuntime,
@@ -2496,6 +2526,8 @@ impl App {
             restore_dial: std::collections::VecDeque::new(),
             restore_dial_busy: false,
             reconnecting: Vec::new(),
+            project_hits: std::collections::BTreeSet::new(),
+            project_others: Vec::new(),
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
             // F56:默认 4 条并发。可配 UI 是 D2-c 的欠账,先按设计定的默认值走。
@@ -3027,11 +3059,31 @@ impl App {
         let Some(dir) = crate::shell::store::config_dir() else {
             return;
         };
-        if let Err(e) =
-            mullion_store::touch_alive(&dir, &self.instance_id, mullion_store::now_secs())
-        {
+        let now = mullion_store::now_secs();
+        if let Err(e) = mullion_store::touch_alive(&dir, &self.instance_id, now) {
             log::debug!(target: "mullion", "心跳写入失败: {e}");
         }
+        // F224:顺带发布「这个实例此刻开着哪些项目」。
+        //
+        // **搭心跳的车,不另起一个定时器**:在场文件的过期判定用的正是心跳
+        // 那套阈值(`ALIVE_GRACE_SECS` = 写入间隔的 3 倍),两个周期一错开,
+        // 别的实例那边的灯就会周期性地闪。
+        //
+        // 无条件写(哪怕一个项目都没开着):不写的话,上一轮那份带名字的旧
+        // 文件会在宽限期内继续点灯,用户看着一盏灯亮了 45 秒才灭。
+        let mut names: Vec<String> = pane_reports_of(&self.tabs)
+            .into_iter()
+            .filter(|(seen, _)| *seen)
+            .filter_map(|(_, n)| n.map(str::to_string))
+            .collect();
+        names.sort();
+        names.dedup();
+        if let Err(e) = mullion_store::publish_presence(&dir, &self.instance_id, now, &names) {
+            log::debug!(target: "mullion", "项目在场文件写入失败: {e}");
+        }
+        // 同一下把别人的读回来。每帧 `read_dir` 一次整个目录是标准的 T3
+        // 违规,而这些文件本来就 15 秒才写一次。
+        self.project_others = mullion_store::read_other_presence(&dir, &self.instance_id, now);
     }
 
     /// F124:该配的连接配一遍 tmux 状态上报。
@@ -6876,6 +6928,49 @@ impl App {
         }
         self.drive_automation();
         self.drive_attach_checks();
+        self.drive_project_visits();
+    }
+
+    /// F224:项目的「最后访问时间」。每帧调,但**只在跃迁那一帧写盘**。
+    ///
+    /// 判据是「有 pane 报出了这个项目的 tmux 名」,不是「走没走项目入口」——
+    /// 用户直接连会话 attach 进那个 tmux 会话,一样算一次访问(设计 P7)。
+    /// 两套记账才会出现「明明在用、列表里却显示从未打开」。
+    ///
+    /// **跃迁触发**:上报每几秒一批,照字面「命中就更新」等于每几秒往
+    /// `sessions.toml` 写一次盘(切片 T-b 的同一个坑)。
+    fn drive_project_visits(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if store.projects().is_empty() && self.project_hits.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = pane_reports_of(&self.tabs)
+            .into_iter()
+            .filter(|(seen, _)| *seen)
+            .filter_map(|(_, n)| n)
+            .collect();
+        let now_hits = crate::project::hits(store.projects(), &names);
+        let fresh = crate::project::newly_entered(&self.project_hits, &now_hits);
+        self.project_hits = now_hits;
+        if fresh.is_empty() {
+            return;
+        }
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        for id in fresh {
+            store.touch_project_accessed(id, &now);
+        }
+        // 写不进去**只记日志**:访问时间不是用户资产,为它弹一张错误卡片
+        // 不成比例,而这条路径在用户每次开项目时都会走一遍。
+        if let Err(e) = store.save() {
+            log::debug!(target: "mullion", "项目访问时间落盘失败: {e}");
+        }
     }
 
     /// F163:每帧推进在途的 attach 校验。挂在 `drive_*` 那一组里。
@@ -8806,6 +8901,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if dropped > 0 {
                     crate::logx::line(&format!("F148:裁掉了 {dropped} 条旧记录"));
                 }
+                // F224:同一条纪律 —— 过期的在场文件也只在启动时清一次
+                // (每帧去删别人的文件,会与那个实例自己的写入撞上)。
+                mullion_store::sweep_presence(&d, &self.instance_id, now);
                 mullion_store::list_records(&d, now)
             })
             .unwrap_or_default();
@@ -10439,6 +10537,29 @@ impl ApplicationHandler<UserEvent> for App {
                             let tunnel_states = self.tunnels.snapshot();
                             let projects: &[mullion_store::ProjectRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.projects());
+                            // F224:每个项目一盏灯。**只在有人会看见时才算** ——
+                            // 项目管理器开着,或者处在 launcher 态(F225① 的
+                            // 列表)。两处都不在时算了也没人读,而这段每帧跑。
+                            let project_lamps =
+                                if self.ui.project_manager_open || self.tabs.is_empty() {
+                                    let panes = pane_reports_of(&self.tabs);
+                                    projects
+                                        .iter()
+                                        .map(|p| {
+                                            let name = mullion_store::project_tmux_name(p);
+                                            (
+                                                p.id,
+                                                crate::project::lamp(
+                                                    &name,
+                                                    &panes,
+                                                    &self.project_others,
+                                                ),
+                                            )
+                                        })
+                                        .collect()
+                                } else {
+                                    std::collections::BTreeMap::new()
+                                };
                             // F222:**只在项目管理器开着时才上锁**。这把锁 SSH
                             // 线程握手时也要拿,每帧无条件锁会让一次握手白等一帧,
                             // 而这个弹窗一天开不了几次。
@@ -10456,6 +10577,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 groups,
                                 credentials,
                                 projects,
+                                project_lamps: &project_lamps,
                                 known_hosts: known_hosts_guard.as_deref(),
                                 tunnels,
                                 tunnel_states: &tunnel_states,
@@ -13151,13 +13273,13 @@ mod tests {
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
         has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
-        new_pane_emulator, next_auto_dial, next_panel_selection_index, pane_still_wanted,
-        paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback,
-        should_check_attach, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
-        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
-        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, Modal, OpFollow,
-        PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
-        UserEvent,
+        new_pane_emulator, next_auto_dial, next_panel_selection_index, pane_reports_of,
+        pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane,
+        resolved_scrollback, should_check_attach, snapshot_tabs_of, sync_plan_of,
+        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
+        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -17924,6 +18046,27 @@ mod tests {
         );
     }
 
+    /// **接线守护 / F224**:启动时清一次过期的在场文件。
+    ///
+    /// 不清的话,一个崩溃退出(没来得及删自己那份)的实例会在 `projects/`
+    /// 目录里留下一个文件;文件本身会过期、不再点灯,但目录会随着每次崩溃
+    /// 无限增长,而 `read_others` 每 15 秒读一遍整个目录。
+    ///
+    /// **只在启动时扫一次**,理由同 F148 的 `prune`(D5/X6):每帧去删别人的
+    /// 文件,会与那个实例自己的写入撞上。
+    ///
+    /// 自证会变红:删掉 `resumed` 里那句 `mullion_store::sweep_presence(`。
+    #[test]
+    fn startup_sweeps_the_stale_project_presence_files_once() {
+        let src = include_str!("app.rs");
+        let after = src.split("fn resumed(").nth(1).expect("找不到 resumed");
+        let body = &after[..after.find("\n    }\n").expect("找不到 resumed 的结尾")];
+        assert!(
+            body.contains("mullion_store::sweep_presence("),
+            "启动不清扫在场文件 —— projects 目录会随每次崩溃退出增长"
+        );
+    }
+
     /// `snapshot_tabs_of` 的脚手架:一个占位标签。`leaves` = 上次的分屏数,
     /// 用**左右均分的扁平前序编码**摆出来(跟真实存盘同一套编码)。
     fn restored_tab(session_id: u64, leaves: usize) -> TabContent {
@@ -18524,31 +18667,32 @@ mod tests {
     /// `drive_attach_checks_of` 摸得到的那部分)。
     fn tabs_with_one_pane(generation: u64) -> Tabs<TabContent> {
         let mut tabs: Tabs<TabContent> = Tabs::default();
-        tabs.open(
-            "test".into(),
-            None,
-            TabContent::Terminal(Box::new(TerminalTab {
-                ws: Workspace::new(test_pane(1), generation),
-                current_preset: None,
-                last_cfg: None,
-                automation: Vec::new(),
-                automation_template: None,
-                tmux_attach: None,
-                automation_status: None,
-                files: Default::default(),
-                sftp: None,
-                sftp_host_ix: None,
-                sftp_tasks: Vec::new(),
-                sftp_default_remote: None,
-                sftp_screenshot_dir: None,
-                sftp_home: None,
-                reconnect_tasks: Vec::new(),
-                leaf_wanted: Vec::new(),
-                leaf_detach: Vec::new(),
-                pending_reveal: None,
-            })),
-        );
+        tabs.open("test".into(), None, second_terminal_tab(generation));
         tabs
+    }
+
+    /// 同上,只给出 `TabContent` —— 多标签的用例要往同一个 `Tabs` 里再塞一个。
+    fn second_terminal_tab(generation: u64) -> TabContent {
+        TabContent::Terminal(Box::new(TerminalTab {
+            ws: Workspace::new(test_pane(1), generation),
+            current_preset: None,
+            last_cfg: None,
+            automation: Vec::new(),
+            automation_template: None,
+            tmux_attach: None,
+            automation_status: None,
+            files: Default::default(),
+            sftp: None,
+            sftp_host_ix: None,
+            sftp_tasks: Vec::new(),
+            sftp_default_remote: None,
+            sftp_screenshot_dir: None,
+            sftp_home: None,
+            reconnect_tasks: Vec::new(),
+            leaf_wanted: Vec::new(),
+            leaf_detach: Vec::new(),
+            pending_reveal: None,
+        }))
     }
 
     /// **接线守护(F163)**:这是「push 进队列 → 驱动 → notice 落到
@@ -18637,6 +18781,97 @@ mod tests {
             "属主标签已经不在了,这条校验该被丢掉,不该继续留在队列里"
         );
         assert!(!dirty, "标签都没了,没有 pane 可挂 notice,不该打脏");
+    }
+
+    /// **F224 / 遍历全部标签**:项目灯与访问时间的输入是**本实例所有 pane**
+    /// 的上报,不只是活动标签那块。
+    ///
+    /// 只看活动标签的话:用户在标签 1 里开着项目 A、切到标签 2 干别的,
+    /// A 的灯就灭了 —— 于是他去开第二份,同一个目录两个 Claude Code。
+    /// 这是记忆里那条「`drive_*` 每帧驱动函数必须遍历全部标签」的同源教训。
+    ///
+    /// 自证会变红:把 `pane_reports_of` 改成只看 `tabs.active()`。
+    #[test]
+    fn the_project_lamp_reads_every_tab_not_just_the_active_one() {
+        let mut tabs = tabs_with_one_pane(1);
+        if let Some(p) = tabs
+            .by_generation_mut(1)
+            .and_then(|t| t.content.as_terminal_mut())
+            .and_then(|t| t.ws.pane_mut(PaneId(1)))
+        {
+            p.title_ever_seen = true;
+            p.tmux = Some("proj-背景".into());
+        }
+        // 第二个标签是活动的那个,而项目开在第一个里。
+        tabs.open("别的".into(), None, second_terminal_tab(2));
+
+        let reports = pane_reports_of(&tabs);
+        assert!(
+            reports
+                .iter()
+                .any(|(_, n)| n.as_deref() == Some("proj-背景")),
+            "非活动标签里那块 pane 的上报被漏掉了:{reports:?}"
+        );
+        assert_eq!(reports.len(), 2, "两个标签各一块 pane");
+    }
+
+    /// **接线守护 / F224**:访问时间走的是 `newly_entered`(跃迁),
+    /// 不是「命中就写」。
+    ///
+    /// 这条是防「每几秒往 `sessions.toml` 写一次盘」的**唯一**闸 ——
+    /// 纯函数那条(`project::tests::two_consecutive_batches_of_the_same_hit_only_record_one_visit`)
+    /// 保证不了驱动处真的用了它。
+    ///
+    /// 自证会变红:把 `drive_project_visits` 里的 `newly_entered(` 换成
+    /// 直接遍历 `now_hits`。
+    #[test]
+    fn visits_are_recorded_on_the_transition_not_on_every_batch_of_reports() {
+        let src = include_str!("app.rs");
+        let (prod, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了");
+        let after = prod
+            .split("\n    fn drive_project_visits(")
+            .nth(1)
+            .expect("找不到 drive_project_visits");
+        let body: String = after[..after
+            .find("\n    }\n")
+            .expect("找不到 drive_project_visits 的结尾")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("newly_entered("),
+            "驱动处没走跃迁判据 —— 每批上报都会写一次盘"
+        );
+        assert!(
+            body.contains("touch_project_accessed("),
+            "驱动处压根没记访问时间"
+        );
+    }
+
+    /// **接线守护 / F224**:心跳那一下要顺带发布在场文件。
+    ///
+    /// 单独起一个定时器的话,两个周期会互相错开,而在场文件的过期判定用的
+    /// 正是心跳那套阈值(`ALIVE_GRACE_SECS` = 写入间隔的 3 倍)—— 周期一错,
+    /// 别的实例的灯就会周期性地闪。
+    ///
+    /// 自证会变红:把 `tick_heartbeat` 里那句 `publish_presence` 删掉。
+    #[test]
+    fn the_heartbeat_also_publishes_which_projects_this_instance_is_running() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn tick_heartbeat(")
+            .nth(1)
+            .expect("找不到 tick_heartbeat");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 tick_heartbeat 的结尾")];
+        assert!(
+            body.contains("publish_presence("),
+            "心跳没发布在场文件 —— 别的实例永远看不到这边开着哪些项目"
+        );
     }
 
     /// **接线守护 / F153**:恢复现场之后要自己开始拨号,不能等用户挨个点。
