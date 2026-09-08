@@ -10,24 +10,6 @@
 
 use mullion_store::{ProjectId, ProjectRecord, SessionRecord};
 
-/// 一行的副标题:`目录 · 节点名`。
-///
-/// 节点名解析不出来(会话被删了、或项目还没勾节点)时**只显示目录**,
-/// 不显示「(未知)」一类占位:那句话对用户没有任何可操作性,而目录本身
-/// 已经足以认出这是哪个活。
-///
-/// 选节点走 [`crate::project::node_for`] —— 和 `plan_open` 真拨号时用的是
-/// **同一个函数**。各写一份的话,列表上写着 A、点下去连的是 B。
-pub(super) fn row_subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
-    let name = crate::project::node_for(p)
-        .and_then(|id| sessions.iter().find(|s| s.id == id))
-        .map(|s| s.identity.name.as_str());
-    match name {
-        Some(n) => format!("{} · {}", p.dir, n),
-        None => p.dir.clone(),
-    }
-}
-
 /// 画 launcher 中央区。点中某一行就把「打开这个项目」写进 `ui_state`。
 ///
 /// **必须是本帧最后一个 panel 类部件**(同 `restored::show` / `files_panel`):
@@ -43,7 +25,9 @@ pub fn show(
     lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
     sessions: &[SessionRecord],
 ) {
-    use crate::ui::metrics::{SP_L, SP_M, SP_S};
+    use crate::ui::metrics::{field_w, FIELD_W_M, SP_L, SP_M, SP_S};
+    // 「现在几点」一帧取一次,不是每行取一次(同 `project_manager::show`)。
+    let now = time::OffsetDateTime::now_utc();
     let panel = egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(crate::theme::c32(t.window_bg)))
         .show(ctx, |ui| {
@@ -66,17 +50,62 @@ pub fn show(
                 });
                 return;
             }
+            // 搜索框居中,取 M 档宽:整宽的搜索框在宽屏上拉成一条几百像素的
+            // 缝,而搜索词通常只有几个字。
+            //
+            // T8:这个框在 `CentralPanel` 里,**不需要**新增 `Modal` 项 ——
+            // launcher 态一块 pane 都没有(`show` 的 `pane` 恒传 `None`),
+            // 没有终端跟它抢键盘。
+            ui.vertical_centered(|ui| {
+                let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut ui_state.launcher_search)
+                        .hint_text(crate::theme::hint_text(t, "搜索项目名 / 目录 / 节点"))
+                        .desired_width(w),
+                );
+                crate::ui::annotate::mark(ui.ctx(), "启动页/搜索框", r.rect);
+            });
+            ui.add_space(SP_M);
+            // 顺序**复用** `by_recent_access`、过滤**复用** `project::matches`
+            // —— 三处列表各写一份的话,同一个搜索词在两个界面给出不同结果,
+            // 而用户几分钟内就会都看到一遍。
+            let rows: Vec<&ProjectRecord> = crate::ui::project_manager::by_recent_access(projects)
+                .into_iter()
+                .filter(|p| crate::project::matches(p, &ui_state.launcher_search, sessions))
+                .collect();
+            if rows.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.label(crate::theme::hint_text(t, "没有匹配的项目"));
+                    ui.add_space(SP_S);
+                    if ui.button("清空搜索").clicked() {
+                        ui_state.launcher_search.clear();
+                    }
+                });
+                return;
+            }
             egui::ScrollArea::vertical()
                 .id_salt("launcher_projects")
                 .show(ui, |ui| {
-                    // 顺序**复用** `by_recent_access`,不另写一份:项目管理器
-                    // 左栏用的是同一个函数,两处顺序不一样用户第一眼就看得出来。
-                    for p in crate::ui::project_manager::by_recent_access(projects) {
+                    for p in rows {
                         let lamp = lamps
                             .get(&p.id)
                             .copied()
                             .unwrap_or(crate::project::Lamp::Unknown);
-                        if row(ui, t, p, lamp, sessions).clicked() {
+                        let r = crate::ui::project_row::show(
+                            ui,
+                            t,
+                            &crate::ui::project_row::Row {
+                                project: p,
+                                lamp,
+                                sessions,
+                                query: &ui_state.launcher_search,
+                                // 启动页没有「正在编辑哪一个」的概念。
+                                selected: false,
+                                now,
+                                list: "launcher",
+                            },
+                        );
+                        if r.clicked() {
                             ui_state.project_open_request = Some((p.id, None));
                         }
                         ui.add_space(SP_S);
@@ -86,38 +115,12 @@ pub fn show(
     crate::ui::annotate::mark(ctx, "项目列表(启动页)", panel.response.rect);
 }
 
-/// 一行:灯 + 项目名 + `目录 · 节点名`。**整行**可点。
-fn row(
-    ui: &mut egui::Ui,
-    t: &crate::theme::Theme,
-    p: &ProjectRecord,
-    lamp: crate::project::Lamp,
-    sessions: &[SessionRecord],
-) -> egui::Response {
-    use crate::ui::metrics::{SP_M, SP_S};
-    // 整行画完再 `interact` 一次:**不能**靠里面某个 label 的 `sense`,那样
-    // 只有字上那几十个像素点得中(F141 那条「侧栏本地栏一行都点不中」就是
-    // 这么来的)。
-    let r = egui::Frame::none()
-        .inner_margin(egui::Margin::symmetric(SP_M, SP_S))
-        .fill(crate::theme::c32(t.panel_bg))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                crate::ui::project_manager::lamp_dot(ui, t, lamp);
-                ui.add_space(SP_S);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(&p.name).color(crate::theme::c32(t.fg_strong)));
-                    ui.label(crate::theme::hint_text(t, row_subtitle(p, sessions)));
-                });
-                ui.allocate_space(egui::vec2(ui.available_width(), 0.0));
-            });
-        })
-        .response;
-    let resp = ui.interact(r.rect, ui.id().with(p.id.0), egui::Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    resp
+/// 一行的副标题:`目录 · 节点名`。
+///
+/// F233 起真正的实现在 [`crate::ui::project_row::subtitle`](三处列表共用)。
+/// 这里留一层转发是因为 `project_pick` 还按老名字调它,而改调用点属于另一件事。
+pub(super) fn row_subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
+    crate::ui::project_row::subtitle(p, sessions)
 }
 
 #[cfg(test)]
@@ -310,9 +313,62 @@ mod tests {
         }
     }
 
+    /// 启动页也能搜(F233)。这个页面的标题就叫「继续上次的活」,项目一多
+    /// 就只能靠滚,而用户心里已经知道自己要哪一个。
+    ///
+    /// 自证会变红:把 `show` 里的 `.filter(|p| crate::project::matches(..))` 删掉。
+    #[test]
+    fn the_launcher_filters_by_the_search_box_too() {
+        let ps = vec![
+            proj(1, "接口", "/srv/api", None),
+            proj(2, "数据库", "/srv/db", None),
+        ];
+        let texts = texts_with(&ps, "数据");
+        assert!(
+            texts.iter().any(|s| s == "数据库"),
+            "命中的行不见了:{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|s| s == "接口"),
+            "没命中的行还在:{texts:?}"
+        );
+    }
+
+    /// 搜不到时给一句话 + 一个回到全部列表的出口。一整片空白让用户分不清
+    /// 「没有匹配」和「项目都没了」。
+    ///
+    /// 自证会变红:把 `rows.is_empty()` 那个分支删掉。
+    #[test]
+    fn a_launcher_query_that_matches_nothing_says_so_and_offers_a_way_back() {
+        let ps = vec![proj(1, "接口", "/srv/api", None)];
+        let joined = texts_with(&ps, "根本没有").join(" ");
+        assert!(joined.contains("没有匹配的项目"), "没给空态说明:{joined}");
+        assert!(
+            joined.contains("清空搜索"),
+            "没给回到全部列表的出口:{joined}"
+        );
+    }
+
+    /// 启动页每一行要显示最后打开时间(F234)—— 这个页面标题是「继续上次
+    /// 的活」,却不告诉你上次是什么时候。
+    ///
+    /// 自证会变红:把 `project_row::show` 换回原来那个只画名字和副标题的
+    /// `row` 实现。
+    #[test]
+    fn each_launcher_row_says_when_it_was_last_opened() {
+        let ps = vec![proj(1, "接口", "/srv/api", None)];
+        let joined = texts_with(&ps, "").join(" ");
+        assert!(joined.contains("从未打开"), "没显示最后打开时间:{joined}");
+    }
+
     /// 跑两帧收文字。**两帧**:`CentralPanel` 首帧 `fade_in` 只记
     /// `Shape::Noop`(同 `restored` / `files_panel` 那边)。
     fn texts(projects: &[ProjectRecord]) -> Vec<String> {
+        texts_with(projects, "")
+    }
+
+    /// 同上,但先把搜索词填进 `launcher_search`。
+    fn texts_with(projects: &[ProjectRecord], query: &str) -> Vec<String> {
         fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
@@ -322,7 +378,10 @@ mod tests {
         }
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
-        let mut ui_state = crate::ui::UiState::default();
+        let mut ui_state = crate::ui::UiState {
+            launcher_search: query.to_string(),
+            ..Default::default()
+        };
         let lamps = std::collections::BTreeMap::new();
         let sessions = vec![sess(7, "web01")];
         let mut shapes = Vec::new();
