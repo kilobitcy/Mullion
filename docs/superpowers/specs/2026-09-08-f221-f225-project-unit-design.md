@@ -105,15 +105,29 @@ pub fn project_tmux_name(p: &ProjectRecord) -> String {
 
 ### 落盘
 
-`Vault` 新增的 mutator(`add_project`/`update_project`/`remove_project`/
-`touch_project_accessed`)**必须**第一句就 `sync_from_disk_if_untouched()`,
+`Vault` 新增的 mutator **必须**第一句就 `sync_from_disk_if_untouched()`,
 并被 F189 那条机械完备性测试 `every_mutating_entry_point_reloads_before_it_writes`
 覆盖 —— 那条测试是列举式门控在加档时必然漏的第五道保险。
 
-**守护**:`project_toml_round_trips`;`tmux_name_falls_back_to_project_name_not_session_name`
-(变异:改成回退会话名 → 变红);`two_projects_cannot_resolve_to_the_same_tmux_name`;
-`deleting_a_session_empties_the_node_list_but_keeps_the_project`;
-v9 文件读进来项目表为空且写回不丢别的表。
+**已实现(2026-09-08)**:`add_project` / `update_project` / `set_project_nodes` /
+`delete_project`,外加 `delete`(删会话)里摘节点那一段。完备性测试的下界
+随之 18→22。`touch_project_accessed` 留给 F224 —— 它的触发时机(跃迁)
+是那一片的判据,不在本片。
+
+`update_project`/`set_project_nodes` **先校验、通过了才写**:半途改一半再报错
+的话,用户看到「保存失败」而配置已经变了一部分。
+
+**守护(13 条,全部经变异验证)**:`a_blank_tmux_name_falls_back_to_the_project_name`
+(变异:回退改成别的 → 变红)、`two_projects_whose_names_sanitize_to_the_same_tmux_name_clash`、
+`a_project_clashes_with_a_tmux_name_a_session_spells_out`、
+`a_session_name_that_merely_derives_the_same_tmux_name_is_not_checked`(钉住那个
+有意的缺口)、`the_preferred_node_must_be_one_of_the_listed_nodes`、
+`an_sftp_session_cannot_be_a_project_node`、`project_toml_round_trips`、
+`unset_optional_fields_are_not_written_out`、`a_v9_file_without_projects_reads_as_an_empty_table`、
+`deleting_a_session_unlists_it_but_never_deletes_the_project`、
+`a_rejected_update_leaves_the_stored_project_untouched`、
+`a_new_project_is_readable_and_ids_start_at_one`、
+`migrate::tests::current_schema_is_ten`。
 
 ---
 
@@ -131,11 +145,24 @@ v9 文件读进来项目表为空且写回不丢别的表。
 不一致 → 弹一次告警 + 该节点在项目编辑界面标红。**不自动踢出** —— 服务器
 重装换 key、指纹表被清这类情形下,自动踢会把用户的配置无声改掉。
 
-判定本身是 `mullion-store` 的纯函数(输入:两条会话的 host:port + 一张指纹表),
-**可纯单测**。取指纹与弹告警在 app 侧。
+判定本身是 `mullion-store` 的纯函数,**可纯单测**。取指纹与弹告警在 app 侧。
 
-**守护**:三态各一条;「同机不同端口指纹相同 → 判同机」(这条与「按 host 串
-判」结论相反,是 P2 决策的自证);「表被清空后全部退化成待核而不是异机」。
+**签名**(已实现 2026-09-08):`can_join(existing: &[String], candidate: &str,
+table: &KnownHostsFile) -> SameMachine`。收的是**已拼好的 `known_hosts` 键**
+而不是 host+port —— 拼键的 `host_key_id` 在 `mullion-ssh` 里,store 不能依赖它
+(架构不变量)。同一条判定既用于「候选加入」也用于「待核节点事后核对」
+(后者把刚握手拿到的指纹先记进表,再拿它当 candidate 跑一遍)。
+
+**守护(8 条,全部经变异验证)**:三态各一条;
+`the_same_machine_reached_on_two_ports_is_still_the_same_machine`(与「按 host 串
+判」结论相反,是 P2 决策的自证;变异:判据换成「两个键相等」→ 变红);
+`an_empty_table_degrades_everything_to_pending_not_different`;
+`conflicting_with_any_existing_node_is_enough_to_reject`(变异:对上一个就放行 → 变红);
+`an_unverified_existing_node_does_not_mask_a_real_conflict`;
+`a_candidate_with_no_verified_peer_to_compare_against_is_still_pending`
+—— **最后这条是变异验证挖出来的**:函数尾巴那条分支原先没有任何测试走得到
+(空表那条在函数头就早退了),把尾巴改成无条件 `Same` 全绿。那是伪阳性的
+安全结论:一个都没比对过却报「已核实同机」,UI 上待核标记也不会出现。
 
 ---
 
