@@ -140,6 +140,50 @@ pub fn preset_tree(preset: Preset, ids: &[PaneId]) -> Node {
     }
 }
 
+/// 比例相等的判定阈值。预设里出现的比例只有 0.5 和 1/3,两者相差 1/6,
+/// 1e-3 远小于它 —— 既认得出 `1.0 / 3.0` 的浮点表示,又不会把用户拖出来的
+/// 0.49 误判成 0.5(拖动的最小可见增量远大于 1e-3)。
+const RATIO_EPS: f32 = 1e-3;
+
+/// 当前这棵树的形状是否**正好**等于某个预设。是则返回它,用于工具栏高亮(F232)。
+///
+/// 这是个**派生量**,不是被保存的状态:曾经有一个 `TerminalTab::current_preset`
+/// 字段影子跟踪它,而"关掉一个 pane 就无条件清空高亮"是那份影子状态唯一的
+/// 更新规则 —— 于是「两屏关掉一块后其实就是单屏」这种情况下,单屏按钮不亮。
+/// 从树现算就没有这类漂移:形状是什么就是什么。
+///
+/// 代价是拖动分隔条会熄灭高亮(比例不再是预设值)。这是对的:高亮的含义是
+/// "当前形状就是这个预设",不是"上次点了哪个按钮"。
+pub fn preset_of(tree: &Node) -> Option<Preset> {
+    Preset::ALL.into_iter().find(|p| {
+        let ids: Vec<PaneId> = (1..=p.pane_count() as u32).map(PaneId).collect();
+        same_shape(tree, &preset_tree(*p, &ids))
+    })
+}
+
+/// 两棵树形状是否一致:方向与比例逐层比,**叶子上的 `PaneId` 一律不看** ——
+/// id 是运行期分配的,跟"这是哪个预设"无关。
+fn same_shape(a: &Node, b: &Node) -> bool {
+    match (a, b) {
+        (Node::Leaf(_), Node::Leaf(_)) => true,
+        (
+            Node::Split {
+                dir: d1,
+                ratio: r1,
+                a: a1,
+                b: b1,
+            },
+            Node::Split {
+                dir: d2,
+                ratio: r2,
+                a: a2,
+                b: b2,
+            },
+        ) => d1 == d2 && (r1 - r2).abs() < RATIO_EPS && same_shape(a1, a2) && same_shape(b1, b2),
+        _ => false,
+    }
+}
+
 /// 套用预设的重排计划(§5.2/§5.3)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetPlan {
@@ -453,6 +497,96 @@ mod tests {
     #[test]
     fn focus_falls_back_to_first_survivor() {
         assert_eq!(next_focus(PaneId(9), &[PaneId(2), PaneId(5)]), PaneId(2));
+    }
+
+    /// F232:每个预设自己的树必须被认回自己。这条是 `preset_of` 的自反性 ——
+    /// 认不回来的话工具栏点完预设当场就不高亮。
+    #[test]
+    fn every_preset_tree_is_recognised_as_itself() {
+        for p in Preset::ALL {
+            assert_eq!(
+                preset_of(&preset_tree(p, &ids(p.pane_count() as u32))),
+                Some(p),
+                "{p:?} 认不回自己"
+            );
+        }
+    }
+
+    /// F232:`preset_of` 只看**形状**,不看 pane id —— 树上的 id 是运行期分配的,
+    /// 跟预设无关。
+    ///
+    /// 自证会变红:把 `same_shape` 的 `(Node::Leaf(_), Node::Leaf(_)) => true`
+    /// 改成 `(Node::Leaf(a), Node::Leaf(b)) => a == b`,本条红。
+    #[test]
+    fn preset_of_ignores_pane_ids() {
+        let tree = preset_tree(Preset::TwoLeftRight, &[PaneId(77), PaneId(9)]);
+        assert_eq!(preset_of(&tree), Some(Preset::TwoLeftRight));
+    }
+
+    /// F232 的全部意义:关掉一块 pane 之后,如果剩下的形状**正好**等于某个预设,
+    /// 工具栏那个按钮就该重新亮起来。旧实现在这里无条件把高亮清成 None。
+    ///
+    /// 自证会变红:让 `preset_of` 恒返回 `None`,四条 assert_eq 全红。
+    #[test]
+    fn closing_a_pane_can_relight_a_preset_button() {
+        use mullion_core::layout::close_pane;
+
+        // 两屏左右,关掉右边 → 单屏。
+        let mut t = preset_tree(Preset::TwoLeftRight, &ids(2));
+        assert!(close_pane(&mut t, PaneId(2)));
+        assert_eq!(preset_of(&t), Some(Preset::Single));
+
+        // 两屏上下,关掉下面 → 单屏。
+        let mut t = preset_tree(Preset::TwoTopBottom, &ids(2));
+        assert!(close_pane(&mut t, PaneId(2)));
+        assert_eq!(preset_of(&t), Some(Preset::Single));
+
+        // 左满高三屏,关掉通高的那块 → 右侧上下两块顶替 → 两屏上下。
+        let mut t = preset_tree(Preset::ThreeBigLeft, &ids(3));
+        assert!(close_pane(&mut t, PaneId(1)));
+        assert_eq!(preset_of(&t), Some(Preset::TwoTopBottom));
+
+        // 左满高三屏,关掉右上那块 → 左通高 + 右一块 → 两屏左右。
+        let mut t = preset_tree(Preset::ThreeBigLeft, &ids(3));
+        assert!(close_pane(&mut t, PaneId(2)));
+        assert_eq!(preset_of(&t), Some(Preset::TwoLeftRight));
+    }
+
+    /// F232 的另一半:剩下的形状**不**等于任何预设时必须老实返回 `None`,
+    /// 不许"就近凑一个"。凑错了会让用户以为当前是某个预设,再点一次同名按钮
+    /// 反而重排整棵树、真的关掉 pane。
+    ///
+    /// 这两例是从 `preset_tree` 原文推出来的,不是猜的:
+    /// - `ThreeColumns` = `split(h, 1/3, l0, split(h, 0.5, l1, l2))`,关掉中间
+    ///   那块后外层 ratio 仍是 1/3,不等于 `TwoLeftRight` 的 0.5。
+    /// - `FourGrid` 外层是**竖**分(上下两行),关掉右下后剩「上行左右分 + 下行
+    ///   通宽」,横竖方向对不上任何三屏预设。
+    ///
+    /// 自证会变红:把 `RATIO_EPS` 从 1e-3 放大到 0.2,第一条红。
+    #[test]
+    fn a_shape_that_matches_no_preset_reports_none() {
+        use mullion_core::layout::close_pane;
+
+        let mut t = preset_tree(Preset::ThreeColumns, &ids(3));
+        assert!(close_pane(&mut t, PaneId(2)));
+        assert_eq!(preset_of(&t), None, "1/3 : 2/3 不是任何预设");
+
+        let mut t = preset_tree(Preset::FourGrid, &ids(4));
+        assert!(close_pane(&mut t, PaneId(4)));
+        assert_eq!(preset_of(&t), None, "上行左右分 + 下行通宽,不是任何预设");
+    }
+
+    /// F232:用户拖了分隔条 → 比例不再是预设值 → 高亮熄灭。这是**有意**的:
+    /// 高亮的含义是"当前形状就是这个预设",不是"上次点了这个按钮"。
+    #[test]
+    fn dragging_a_splitter_extinguishes_the_highlight() {
+        let mut t = preset_tree(Preset::TwoLeftRight, &ids(2));
+        if let Node::Split { ratio, .. } = &mut t {
+            *ratio = 0.7;
+        } else {
+            panic!("两屏预设的根必须是 Split");
+        }
+        assert_eq!(preset_of(&t), None);
     }
 
     /// 声明式:路径不影响结果。
