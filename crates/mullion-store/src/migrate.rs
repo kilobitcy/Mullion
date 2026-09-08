@@ -128,6 +128,9 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
         // 同理:v1 文件里不存在共享凭据。**不在迁移里做去重提取**(那是 F75,
         // 且必须用户点头),迁移后凭据表恒为空。
         credential: Vec::new(),
+        // 同理:v1 文件里不存在「项目」。空数组是**永久**正确的 —— 项目要
+        // 引用会话、要用户填目录与 tmux 名,没有任何东西可以从 v1 推出来。
+        project: Vec::new(),
     })
 }
 
@@ -251,12 +254,12 @@ kind = "password"
     }
 
     /// 版本号是**故意**钉死的:动它就意味着用户的库要迁移一次,不该被
-    /// 顺手改掉。v9 的理由见 `CURRENT_SCHEMA` 文档 —— 新增 `[[credential]]`
-    /// 与 `[session.auth].source`,旧客户端读 v9 会把 `credential_id` 当未知
-    /// 字段丢掉、把 `user`/`kind` 当缺失,拒绝比装作能用好。
+    /// 顺手改掉。v10 的理由见 `CURRENT_SCHEMA` 文档 —— 新增 `[[project]]`
+    /// (F221),旧客户端读 v10 会把整张项目表当未知字段丢掉再写回,
+    /// **用户的项目静默消失**,拒绝比装作能用好。
     #[test]
-    fn current_schema_is_nine() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 9);
+    fn current_schema_is_ten() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 10);
     }
 
     /// v5 的库里存的 emoji 图标**必须原样读得出来**。

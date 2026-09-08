@@ -26,6 +26,7 @@ pub struct Vault {
     sessions: Vec<SessionRecord>,
     tunnels: Vec<TunnelRecord>,
     credentials: Vec<CredentialRecord>,
+    projects: Vec<crate::project::ProjectRecord>,
     secrets: SecretMap,
     key: [u8; 32],
     /// `secrets.enc` 用的密钥方案(F71)。**`save()` 按它决定写不写文件头**,
@@ -158,6 +159,7 @@ impl Vault {
             sessions,
             tunnels,
             credentials,
+            projects,
             migrated,
             legacy_key_paths,
         } = load_sessions(&sessions_path)?;
@@ -230,6 +232,7 @@ impl Vault {
             sessions,
             tunnels,
             credentials,
+            projects,
             secrets,
             key,
             scheme,
@@ -255,6 +258,7 @@ impl Vault {
             session: self.sessions.clone(),
             tunnel: self.tunnels.clone(),
             credential: self.credentials.clone(),
+            project: self.projects.clone(),
         };
         Ok(toml::to_string_pretty(&file)?)
     }
@@ -501,7 +505,11 @@ impl Vault {
         Ok(())
     }
 
-    /// 删除会话,并**连带清除**其密文(守 id 完整性,见 spec §3.1)。
+    /// 删除会话,并**连带清除**其密文(守 id 完整性,见 spec §3.1)
+    /// 与各项目里对它的引用(F221)。
+    ///
+    /// 摘引用但**不删项目**:哪怕节点摘空了,目录和 tmux 名也是用户手打的,
+    /// 不能因为一次删会话就蒸发。空节点的项目在 UI 上是「无可用节点」态。
     pub fn delete(&mut self, id: SessionId) -> Result<(), StoreError> {
         self.sync_from_disk_if_untouched();
         let before = self.sessions.len();
@@ -510,6 +518,12 @@ impl Vault {
             return Err(StoreError::NotFound(id));
         }
         self.secrets.remove(&id.0.to_string());
+        for p in &mut self.projects {
+            p.nodes.retain(|n| *n != id);
+            if p.preferred == Some(id) {
+                p.preferred = None;
+            }
+        }
         Ok(())
     }
 
@@ -689,6 +703,96 @@ impl Vault {
                 s.identity.group_id = None;
             }
         }
+        Ok(())
+    }
+
+    // ---- F221 项目 ------------------------------------------------------
+
+    pub fn projects(&self) -> &[crate::project::ProjectRecord] {
+        &self.projects
+    }
+
+    /// 新建项目。id 取现有 max+1(空库从 1 起),与 `add_group` 同一姿态
+    /// (含 id 会被复用那条告诫)。
+    ///
+    /// **不收节点**:刚建的项目还没挂路线,`nodes` 空、`preferred` 为 `None`
+    /// 是合法的「无可用节点」态。挂路线走 [`Self::set_project_nodes`]。
+    ///
+    /// 名字撞车由调用方先过 [`crate::project::validate`] —— 这里不校验,
+    /// 因为「新建」在 UI 上是先给一个默认名再让用户改,建的那一刻撞车很正常。
+    pub fn add_project(
+        &mut self,
+        name: String,
+        dir: String,
+        now_rfc3339: &str,
+    ) -> crate::project::ProjectId {
+        self.sync_from_disk_if_untouched();
+        let id = crate::project::ProjectId(
+            self.projects
+                .iter()
+                .map(|p| p.id.0)
+                .max()
+                .map_or(1, |m| m + 1),
+        );
+        self.projects.push(crate::project::ProjectRecord {
+            id,
+            name,
+            note: String::new(),
+            nodes: Vec::new(),
+            preferred: None,
+            dir,
+            tmux_name: None,
+            created_at: now_rfc3339.to_string(),
+            last_accessed_at: None,
+        });
+        id
+    }
+
+    /// 整份替换一个项目。**校验先跑、通过了才写** —— 半途改一半再报错的话,
+    /// 用户看到「保存失败」而配置已经变了一部分。
+    ///
+    /// `draft.id` 被忽略,以参数 `id` 为准(否则改 id 会产生重复主键)。
+    pub fn update_project(
+        &mut self,
+        id: crate::project::ProjectId,
+        draft: crate::project::ProjectRecord,
+    ) -> Result<(), crate::project::ProjectIssue> {
+        self.sync_from_disk_if_untouched();
+        let next = crate::project::ProjectRecord { id, ..draft };
+        crate::project::validate(&next, &self.projects, &self.sessions)?;
+        if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
+            *slot = next;
+        }
+        Ok(())
+    }
+
+    /// 只改节点列表与首选节点,别的字段一律不动(同 `set_group` 的理由:
+    /// 为改两个字段去凭空重建整份记录,漏填任何一个都是静默改掉用户的配置)。
+    pub fn set_project_nodes(
+        &mut self,
+        id: crate::project::ProjectId,
+        nodes: Vec<SessionId>,
+        preferred: Option<SessionId>,
+    ) -> Result<(), crate::project::ProjectIssue> {
+        self.sync_from_disk_if_untouched();
+        let Some(cur) = self.projects.iter().find(|p| p.id == id) else {
+            return Ok(());
+        };
+        let next = crate::project::ProjectRecord {
+            nodes,
+            preferred,
+            ..cur.clone()
+        };
+        crate::project::validate(&next, &self.projects, &self.sessions)?;
+        if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
+            *slot = next;
+        }
+        Ok(())
+    }
+
+    pub fn delete_project(&mut self, id: crate::project::ProjectId) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
+        self.projects.retain(|p| p.id != id);
         Ok(())
     }
 
@@ -963,6 +1067,7 @@ struct Loaded {
     sessions: Vec<SessionRecord>,
     tunnels: Vec<TunnelRecord>,
     credentials: Vec<CredentialRecord>,
+    projects: Vec<crate::project::ProjectRecord>,
     /// 版本落后、已就地升级 → 必须立刻 `save()` 写回,否则下次打开重复迁移
     /// 并覆盖掉备份。
     migrated: bool,
@@ -980,6 +1085,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
             sessions: Vec::new(),
             tunnels: Vec::new(),
             credentials: Vec::new(),
+            projects: Vec::new(),
             migrated: false,
             legacy_key_paths: BTreeMap::new(),
         });
@@ -1016,6 +1122,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
             sessions: file.session,
             tunnels: file.tunnel,
             credentials: file.credential,
+            projects: file.project,
             migrated: true,
             legacy_key_paths,
         })
@@ -1026,6 +1133,7 @@ fn load_sessions(sessions_path: &Path) -> Result<Loaded, StoreError> {
             sessions: file.session,
             tunnels: file.tunnel,
             credentials: file.credential,
+            projects: file.project,
             migrated: false,
             legacy_key_paths: BTreeMap::new(),
         })
@@ -1526,7 +1634,14 @@ has_passphrase = true
             "升级前必须留备份"
         );
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
-        assert!(now.contains("schema_version = 9"), "磁盘上应已升到 v9");
+        // 钉的是「迁移后写回的是**当前**版本」这个不变量,不是某个具体数字
+        // ——版本号本身由 `migrate::tests::current_schema_is_ten` 单独钉,
+        // 两条各钉一件事,升版本时只需要改那一条。
+        let want = format!("schema_version = {CURRENT_SCHEMA}");
+        assert!(
+            now.contains(&want),
+            "磁盘上应已升到当前版本({want}),实得:{now}"
+        );
     }
 
     /// 引用凭据的会话存盘再读回,引用关系不能丢(丢了就是悄悄变回自带认证,
@@ -2498,7 +2613,7 @@ port = 7891
             checked += 1;
         }
         assert!(
-            checked >= 18,
+            checked >= 22,
             "只扫到 {checked} 个 mutator,切片逻辑多半失效了(退化成恒绿)"
         );
     }
@@ -2571,6 +2686,77 @@ path = "/var/log"
 
     /// 最小合法 draft:不带密钥、不分组。计划文档假定本文件已有同名辅助函数,
     /// 实际只有 `draft_pw`;这里补上,风格与 `draft_pw` 保持一致。
+    /// F221:新建的项目能读回来,id 从 1 起(同 `add_group` 的姿态)。
+    #[test]
+    fn a_new_project_is_readable_and_ids_start_at_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_project(
+            "Mullion".into(),
+            "/data/Mullion".into(),
+            "2026-09-08T00:00:00Z",
+        );
+        assert_eq!(id, crate::project::ProjectId(1));
+        let p = v.projects().iter().find(|p| p.id == id).expect("读得回来");
+        assert_eq!(p.name, "Mullion");
+        assert_eq!(p.dir, "/data/Mullion");
+        assert_eq!(p.created_at, "2026-09-08T00:00:00Z");
+        assert_eq!(p.last_accessed_at, None, "刚建的项目没有访问记录");
+    }
+
+    /// **F221 的关键行为**:删会话把它从各项目的节点列表里摘掉,
+    /// 但**项目本身留着**——哪怕摘空了。
+    ///
+    /// 目录和 tmux 名是用户手打的东西,不能因为一次删会话就蒸发
+    /// (同 `IconKind` 历史变体不敢删的思路:别让一次操作静默销毁用户输入)。
+    ///
+    /// 自证会变红:把 `delete` 里那段摘节点的代码删掉(悬垂引用留在项目里),
+    /// 或者改成「摘空就连项目一起删」。
+    #[test]
+    fn deleting_a_session_unlists_it_but_never_deletes_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let sid = v.add(draft(), "2026-09-08T00:00:00Z");
+        let pid = v.add_project(
+            "Mullion".into(),
+            "/data/Mullion".into(),
+            "2026-09-08T00:00:00Z",
+        );
+        v.set_project_nodes(pid, vec![sid], Some(sid)).unwrap();
+
+        v.delete(sid).unwrap();
+
+        let p = v
+            .projects()
+            .iter()
+            .find(|p| p.id == pid)
+            .expect("项目必须还在 —— 目录和 tmux 名是用户手打的");
+        assert!(p.nodes.is_empty(), "被删的会话要从节点列表里摘掉");
+        assert_eq!(p.preferred, None, "首选节点指向已删会话时必须清空");
+        assert_eq!(p.dir, "/data/Mullion", "用户手打的目录不能跟着蒸发");
+    }
+
+    /// 撞名的更新必须被拒绝,**且库里的值一点没动**(拒绝要是原子的)。
+    ///
+    /// 半途改一半再报错的话,用户看到「保存失败」但配置已经变了一部分。
+    #[test]
+    fn a_rejected_update_leaves_the_stored_project_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let a = v.add_project("web".into(), "/srv/web".into(), "t");
+        let b = v.add_project("api".into(), "/srv/api".into(), "t");
+
+        let mut draft = v.projects().iter().find(|p| p.id == b).unwrap().clone();
+        draft.name = "web".into(); // 撞 a
+        draft.dir = "/srv/changed".into();
+        let err = v.update_project(b, draft).unwrap_err();
+        assert_eq!(err, crate::project::ProjectIssue::DuplicateName { with: a });
+
+        let stored = v.projects().iter().find(|p| p.id == b).unwrap();
+        assert_eq!(stored.name, "api", "被拒的更新不该改掉名字");
+        assert_eq!(stored.dir, "/srv/api", "被拒的更新不该改掉目录");
+    }
+
     fn draft() -> SessionDraft {
         SessionDraft {
             identity: Identity {

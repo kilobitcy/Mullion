@@ -16,6 +16,7 @@ pub mod master_key;
 pub mod migrate;
 pub mod model;
 pub mod network;
+pub mod project;
 pub mod secrets_file;
 pub mod settings;
 pub mod sftp;
@@ -50,6 +51,10 @@ pub use model::{
     Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
+pub use project::{
+    project_tmux_name, validate as validate_project, ProjectId, ProjectIssue, ProjectRecord,
+    TmuxNameOwner,
+};
 pub use secrets_file::Scheme;
 pub use settings::{LogLevel, Settings, CURRENT_SETTINGS_SCHEMA, MAX_FONT_PT, MIN_FONT_PT};
 pub use sftp::{Bookmark, SftpPrefs};

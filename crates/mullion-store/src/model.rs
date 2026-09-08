@@ -218,6 +218,12 @@ pub struct AppearancePrefs {
 /// `session.sftp` 是同一条理由:旧客户端读 v8 会把整个分节丢掉再写回,拒绝
 /// 比静默吃掉好。
 ///
+/// v10 = v9 + `[[project]]`:「项目」成为一等对象(F221~F225)。
+///
+/// v10 同样**没有一行迁移转换代码**(旧文件没这个键 → `serde(default)` 补空表)。
+/// 升号的理由与 v8/v9 完全一致:旧客户端读 v10 会把整个 `[[project]]` 表当
+/// 未知字段丢掉再写回,**用户的项目静默消失**。拒绝比装作能用好。
+///
 /// v9 **没有一行迁移转换代码**:v8 的 auth 分节没有 `source` 键 → 直接读成
 /// `Inline`,`[[credential]]` 缺失 → `serde(default)` 补空。版本号照升,因为
 /// v9 文件里可能有 `source = "ref"` 的会话 —— 旧客户端会把 `credential_id`
@@ -225,7 +231,7 @@ pub struct AppearancePrefs {
 ///
 /// **号段归属**:F74(凭据实体)原定 v3→v4,被 F40~F44 先落地拿走了 4,再被本次
 /// 「私钥入库」拿走了 5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
-pub const CURRENT_SCHEMA: u32 = 9;
+pub const CURRENT_SCHEMA: u32 = 10;
 
 fn schema_v1() -> u32 {
     1
@@ -248,6 +254,9 @@ pub struct SessionsFile {
     /// 把重复的 `(用户名, 私钥)` 提取成共享凭据是 F75,且只在用户点头后做。
     #[serde(default)]
     pub credential: Vec<crate::credential::CredentialRecord>,
+    /// v10 新增(F221)。同上:旧文件没有 → 空表,无需迁移代码。
+    #[serde(default)]
+    pub project: Vec<crate::project::ProjectRecord>,
 }
 
 #[cfg(test)]
@@ -290,6 +299,7 @@ mod tests {
             session: vec![rec.clone()],
             tunnel: Vec::new(),
             credential: Vec::new(),
+            project: Vec::new(),
         };
         let s = toml::to_string_pretty(&file).unwrap();
         let back: SessionsFile = toml::from_str(&s).unwrap();
@@ -325,6 +335,7 @@ mod tests {
             session: vec![rec],
             tunnel: Vec::new(),
             credential: Vec::new(),
+            project: Vec::new(),
         };
         let s = toml::to_string_pretty(&file).unwrap();
         assert!(s.contains("[session.auth]"), "应有 auth 分节: {s}");
