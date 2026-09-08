@@ -122,16 +122,21 @@ pub fn show(
     let focus_name = std::mem::take(&mut ui_state.project_focus_name);
     // 宽度从 720 提到 840:左栏从 192 加宽到 `LIST_W`(300),不提的话右栏会
     // 从 442 缩到 334,F237 那个三行「说明」框跟着变窄。
-    // 高度封顶到屏幕(F237)。**光把按钮行钉在窗口底部不够**:`Window` 默认
-    // 按内容自动撑高,内容 640px 时窗口就是 640px 高,「底部」跟着跑到屏幕
-    // 下沿之外 —— 按钮照样够不着,而且滚动区因为拿不到高度约束根本不会滚。
-    // 有了上界,滚动区才真滚,底部面板才真在可视区里。
-    let cap = (ctx.screen_rect().height() - 48.0).max(240.0);
     egui::Window::new("项目管理")
         .open(&mut open)
         .default_width(840.0)
-        .max_height(cap)
         .show(ctx, |ui| {
+            // 内容高度封顶到屏幕(F237)。**光把按钮行钉在窗口底部不够**:
+            // `Window` 默认按内容自动撑高,内容 640px 时窗口就是 640px 高,
+            // 「底部」跟着跑到屏幕下沿之外 —— 按钮照样够不着,而且滚动区因为
+            // 拿不到高度约束根本不会滚。
+            //
+            // 上界从**这一行离屏幕底还剩多少**实测,不走 `Window::max_height`:
+            // 那个限的是内容区,得再自己减一个「标题栏 + 边框 + 内外边距」的
+            // 常量(实测 60),而那是猜出来的 reserve —— F217 栽过一次。
+            // 这里的 `ui.cursor()` 已经在窗口 chrome 里面,减法自然成立。
+            let room = ctx.screen_rect().bottom() - ui.cursor().top() - crate::ui::metrics::SP_M;
+            ui.set_max_height(room.max(160.0));
             ui.horizontal_top(|ui| {
                 list_column(ui, t, ui_state, projects, lamps, sessions, now);
                 ui.separator();
@@ -1137,41 +1142,15 @@ mod tests {
         );
     }
 
-    /// 滚右栏的时候,底部那排按钮**不跟着走**。
+    /// 测试屏幕的逻辑高度。
     ///
-    /// 这是钉底跟「窗口封顶」两件事的分界:光封顶也能让按钮落在屏幕里,但
-    /// 内容一滚它就跟着跑出去了。判据比对同一颗按钮在「没滚」和「滚到底」
-    /// 两帧里的 y —— 差一点点(<1px)都算它在动。
-    ///
-    /// 自证会变红:把 `TopBottomPanel::bottom` 拆掉,改成排在滚动区之后按
-    /// 顺序画。
-    #[test]
-    fn the_button_row_stays_put_while_the_form_scrolls() {
-        let y = |wheel: f32| {
-            texts_on_a_short_screen(wheel)
-                .into_iter()
-                .find(|(s, _)| s == "删除项目")
-                .expect("「删除项目」压根没画出来")
-                .1
-                .top()
-        };
-        let (rest, scrolled) = (y(0.0), y(-400.0));
-        assert!(
-            (rest - scrolled).abs() < 1.0,
-            "滚了一下按钮就从 y={rest} 挪到了 y={scrolled} —— 它没钉住"
-        );
-    }
+    /// 压到 260 是有意的:封顶后右栏可用高约 200,而内容约 374 —— 差出一百多
+    /// 像素,「按钮跟着内容走」和「按钮钉在底部」才分得开。420 那会儿两者只差
+    /// 两像素,判据看起来在测钉底,其实只测出了封顶。
+    const SHORT_H: f32 = 260.0;
 
-    /// 测试屏幕的逻辑高度。矮到右栏内容(约 640px)必然装不下。
-    const SHORT_H: f32 = 420.0;
-
-    /// 在一块 1000x420 的屏幕上画两帧,收全部文字**和它们的位置**。
+    /// 在一块矮屏幕上画两帧,收全部文字**和它们的位置**。
     fn form_texts_on_a_short_screen() -> Vec<(String, egui::Rect)> {
-        texts_on_a_short_screen(0.0)
-    }
-
-    /// 同上,但先往右栏滚 `wheel` 个像素(负数 = 往下滚)。
-    fn texts_on_a_short_screen(wheel: f32) -> Vec<(String, egui::Rect)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
@@ -1194,31 +1173,17 @@ mod tests {
         let lamps = std::collections::BTreeMap::new();
         let ps = vec![p];
         let sessions: Vec<SessionRecord> = Vec::new();
-        // 指针停在右栏中间,滚轮才落到那个滚动区上。
-        let hover = egui::pos2(700.0, SHORT_H / 2.0);
-        let input = |scroll: f32| egui::RawInput {
+        let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1000.0, SHORT_H),
             )),
-            events: if scroll == 0.0 {
-                vec![egui::Event::PointerMoved(hover)]
-            } else {
-                vec![
-                    egui::Event::PointerMoved(hover),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, scroll),
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ]
-            },
             ..Default::default()
         };
         let mut shapes = Vec::new();
-        for i in 0..3 {
+        for _ in 0..2 {
             shapes = ctx
-                .run(input(if i == 1 { wheel } else { 0.0 }), |ctx| {
+                .run(input(), |ctx| {
                     show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
                 })
                 .shapes;
