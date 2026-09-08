@@ -73,6 +73,65 @@ pub fn node_for(p: &mullion_store::ProjectRecord) -> Option<mullion_store::Sessi
         .or_else(|| p.nodes.first().copied())
 }
 
+/// F233:一个项目是否命中搜索词。空查询(trim 后为空)放行全部。
+///
+/// 匹配**项目名 / 目录 / 每一条节点会话的名字与主机**,大小写不敏感。
+/// 收节点是因为用户记得住的常是机器名或 IP 尾数,不是当初给活起的名字 ——
+/// 与 `session_manager::list::matches` 收 host/tags 是同一条理由。
+///
+/// 收**全部** `nodes` 而不只是首选:多节点正是「同一台机器的等价路线」,
+/// 用户搜哪条路线的名字都该找到这个活。
+///
+/// 只看这个项目自己的节点(`s.id == *id`)。丢掉 id 比对的话,任意一条会话名
+/// 都能把全部项目一起捞出来 —— 搜索仍然「有反应」,但等于失效。
+///
+/// **不收 `note`**:F237 把说明改成了多行,长文本参与匹配会让搜索命中一堆
+/// 用户在列表上看不见的东西。
+///
+/// 三处列表(项目管理器左栏 / 启动页 / pane 切换弹窗)共用这一份 —— 各写一份
+/// 的话,同一个搜索词在两个界面给出不同结果,而用户几分钟内就会都看到一遍。
+pub fn matches(
+    p: &mullion_store::ProjectRecord,
+    query: &str,
+    sessions: &[mullion_store::SessionRecord],
+) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    if p.name.to_lowercase().contains(&q) || p.dir.to_lowercase().contains(&q) {
+        return true;
+    }
+    p.nodes.iter().any(|id| {
+        sessions.iter().any(|s| {
+            s.id == *id
+                && (s.identity.name.to_lowercase().contains(&q)
+                    || s.connection.host.to_lowercase().contains(&q))
+        })
+    })
+}
+
+/// F236:「+ 添加项目」用的默认名。
+///
+/// 「新项目」,撞名就往后找**第一个空号**(「新项目 2」「新项目 3」…)。
+/// 不是 max+1:删掉「新项目」再点添加,给出的应该是「新项目」,而不是跳过
+/// 一堆空号变成「新项目 7」。
+///
+/// 为什么必须去重:`mullion_store::validate_project` 要求项目名全局唯一,而
+/// `ProjectIntent::Add` 是**立刻落盘**的。不去重就会在盘上建出一条必然存不
+/// 进去的记录 —— 列表里两行同名、右栏「保存」灰着,用户看不出为什么。
+pub fn fresh_project_name(existing: &[mullion_store::ProjectRecord]) -> String {
+    const BASE: &str = "新项目";
+    let taken = |cand: &str| existing.iter().any(|p| p.name == cand);
+    if !taken(BASE) {
+        return BASE.to_string();
+    }
+    (2..)
+        .map(|n| format!("{BASE} {n}"))
+        .find(|cand| !taken(cand))
+        .expect("2.. 是无穷序列,find 必然返回")
+}
+
 /// 打开项目的决策。零 IO 纯函数 —— 把「选哪条路线」和「要不要先问」这两件
 /// 各自会出错的事从事件循环里摘出来。
 ///
@@ -583,5 +642,109 @@ mod tests {
             ),
             OpenStep::Refuse(_)
         ));
+    }
+
+    // ---- matches / fresh_project_name ----------------------------------
+
+    fn sess(id: u64, name: &str, host: &str) -> mullion_store::SessionRecord {
+        mullion_store::SessionRecord {
+            id: mullion_store::SessionId(id),
+            modified_at: "t".into(),
+            identity: mullion_store::Identity {
+                name: name.into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: mullion_store::Connection {
+                host: host.into(),
+                port: 22,
+                protocol: mullion_store::Protocol::Ssh,
+            },
+            auth: mullion_store::Auth::inline("u", mullion_store::AuthKind::Password),
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+            sftp: Default::default(),
+        }
+    }
+
+    fn pr(name: &str, dir: &str, nodes: &[u64]) -> mullion_store::ProjectRecord {
+        mullion_store::ProjectRecord {
+            id: mullion_store::ProjectId(1),
+            name: name.into(),
+            note: String::new(),
+            nodes: nodes.iter().map(|n| mullion_store::SessionId(*n)).collect(),
+            preferred: None,
+            dir: dir.into(),
+            tmux_name: None,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            last_accessed_at: None,
+        }
+    }
+
+    /// 空查询放行全部 —— 调用方不用特判「还没输字」。
+    #[test]
+    fn an_empty_query_lets_every_project_through() {
+        assert!(matches(&pr("接口", "/srv/api", &[]), "", &[]));
+        assert!(matches(&pr("接口", "/srv/api", &[]), "   ", &[]));
+    }
+
+    #[test]
+    fn name_and_directory_both_match_case_insensitively() {
+        let p = pr("API 网关", "/srv/Api", &[]);
+        assert!(matches(&p, "api", &[]));
+        assert!(matches(&p, "/SRV", &[]));
+        assert!(!matches(&p, "数据库", &[]));
+    }
+
+    /// 用户记得住的常是机器名或 IP 尾数,不是当初给活起的名字 —— 与
+    /// `session_manager::list::matches` 收 host/tags 是同一条理由。
+    ///
+    /// 自证会变红:把 `p.nodes.iter().any(..)` 那一整段删掉。
+    #[test]
+    fn a_project_is_found_by_the_name_or_host_of_any_node_it_can_dial() {
+        let ss = vec![sess(7, "web01", "10.0.0.9"), sess(8, "web02", "10.0.0.10")];
+        let p = pr("接口", "/srv/api", &[7, 8]);
+        assert!(matches(&p, "web02", &ss), "按节点会话名没搜到");
+        assert!(matches(&p, "0.0.10", &ss), "按节点主机没搜到");
+    }
+
+    /// 只收**这个项目自己的**节点。收全表的话,任意一条会话名都能把所有项目
+    /// 一起捞出来 —— 搜索仍然「有反应」,但等于失效。
+    ///
+    /// 自证会变红:把 `s.id == *id &&` 那一段判断去掉。
+    #[test]
+    fn a_session_that_is_not_a_node_of_this_project_never_makes_it_match() {
+        let ss = vec![sess(7, "web01", "10.0.0.9"), sess(9, "db01", "10.0.0.20")];
+        let p = pr("接口", "/srv/api", &[7]);
+        assert!(!matches(&p, "db01", &ss), "不是这个项目的节点也命中了");
+    }
+
+    /// 一个项目都没有时就是「新项目」,不带后缀。
+    #[test]
+    fn the_first_new_project_has_no_suffix() {
+        assert_eq!(fresh_project_name(&[]), "新项目");
+    }
+
+    /// `validate_project` 要求项目名全局唯一。不去重就会在盘上建出一条**必然
+    /// 存不进去**的记录:列表里两行同名、右栏「保存」灰着,而用户看不出为什么。
+    ///
+    /// 自证会变红:把整个函数改成恒返回 `"新项目".to_string()`。
+    #[test]
+    fn a_clashing_name_gets_the_next_free_number() {
+        let ps = vec![pr("新项目", "/a", &[])];
+        assert_eq!(fresh_project_name(&ps), "新项目 2");
+    }
+
+    /// 找**第一个空号**,不是 max+1:删掉「新项目」再点添加,给出的应该是
+    /// 「新项目」,而不是跳过一堆空号变成「新项目 4」。
+    ///
+    /// 自证会变红:把实现改成先数出最大后缀再 +1。
+    #[test]
+    fn the_lowest_free_number_is_reused_after_a_deletion() {
+        let ps = vec![pr("新项目 2", "/a", &[]), pr("新项目 3", "/b", &[])];
+        assert_eq!(fresh_project_name(&ps), "新项目");
     }
 }
