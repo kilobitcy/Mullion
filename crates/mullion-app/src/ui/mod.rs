@@ -150,6 +150,13 @@ pub struct UiState {
     /// 右键菜单手上只有一个 id,为了改一个 `group_id` 去凭空造一份 draft,一旦
     /// 哪个字段填漏就是静默地把用户的配置改掉。
     pub move_to_group: Option<(SessionId, Option<GroupId>)>,
+    /// F229:右键「克隆」的意图。同 `move_to_group` —— UI 只写意图,真正动
+    /// store 在 `app.rs` 的统一施加点(egui 闭包里借不到 `&mut self.store`)。
+    ///
+    /// 深拷贝**必须**在 store 层做:这里造一份草稿再走 `save_request` 的话,
+    /// `EditorBuffer` 里的凭据字段恒为空,新 id 没有 `existing` 可 merge,
+    /// 静默产出一份没有密码的会话(见 `Vault::clone_session` 的文档)。
+    pub clone_request: Option<SessionId>,
     /// F121:左栏拖拽排序的结论。同 `move_to_group`:UI 只写意图,
     /// `app.rs` 才碰 store。
     pub reorder_request: Option<session_manager::reorder::ReorderIntent>,

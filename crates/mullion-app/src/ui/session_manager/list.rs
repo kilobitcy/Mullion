@@ -900,6 +900,12 @@ fn row(ui: &mut Ui, ui_state: &mut UiState, pending_delete_rendered: &mut bool, 
                 }
             }
         });
+        // F229:克隆。整份配置(含密文)复制成一条新会话 —— 手工抄十几个字段
+        // 又慢又容易漏,而漏掉的多半是代理/自动化这种「不连上根本发现不了」的。
+        if ui.button("克隆").clicked() {
+            ui_state.clone_request = Some(rec.id);
+            ui.close_menu();
+        }
         if ui.button("删除").clicked() {
             ui_state.pending_delete = Some(rec.id);
             ui.close_menu();
@@ -2034,6 +2040,110 @@ mod tests {
         assert!(
             !ui_state.connect_skip_automation,
             "普通「连接」不该跳过自动化——那是另一条菜单项的语义"
+        );
+    }
+
+    /// F229:右键菜单里要有「克隆」,位置在「移动到分组」与「删除」之间 ——
+    /// 紧挨着删除是有意的:两者都是「对这一行整体」的操作;排在连接类之后
+    /// 是因为它不是日常动作。
+    ///
+    /// 驱动方式照抄 `right_click_offers_connect_and_move_to_group`(它已经
+    /// 解决了「`context_menu` 要一次右键 + 一帧 sizing pass 才展开」这个难点;
+    /// 本仓库为预热帧数不足吃过两次静默假绿)。
+    ///
+    /// 自证会变红:把 `ui_state.clone_request = Some(rec.id);` 那一行删掉,
+    /// 末尾的 `assert_eq` 报 `None`。
+    #[test]
+    fn right_click_offers_clone_between_move_to_group_and_delete() {
+        let t = crate::theme::MULLION_DARK;
+        let sessions = vec![rec(1, "session-clone-target", "192.0.2.11", &[])];
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        ui_state,
+                        &sessions,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &crate::ui::badge::AppearanceCache::default(),
+                        mullion_store::Protocol::Ssh,
+                    );
+                });
+            })
+        };
+        let secondary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let primary_click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let row_pos =
+            find_text_pos(&out.shapes, "session-clone-target").expect("这一行应该已经画出来了");
+        let row_click_pos = egui::pos2(row_pos.x - 20.0, row_pos.y + 15.0);
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(row_click_pos),
+                    secondary_click(row_click_pos, true),
+                    secondary_click(row_click_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+        // 菜单是 `Area`,首帧先做一趟不可见的 sizing pass。
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+
+        // 顺序:「移动到分组」在上、「删除」在下,「克隆」夹在中间。
+        let y = |label: &str| {
+            find_text_pos(&out.shapes, label)
+                .unwrap_or_else(|| panic!("菜单里应该有「{label}」"))
+                .y
+        };
+        let (move_y, clone_y, del_y) = (y("移动到分组"), y("克隆"), y("删除"));
+        assert!(
+            move_y < clone_y && clone_y < del_y,
+            "「克隆」不在「移动到分组」与「删除」之间(move={move_y} clone={clone_y} del={del_y})"
+        );
+
+        let clone_pos = find_text_pos(&out.shapes, "克隆").expect("菜单里应该有「克隆」");
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(clone_pos),
+                    primary_click(clone_pos, true),
+                    primary_click(clone_pos, false),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ui_state.clone_request,
+            Some(SessionId(1)),
+            "点「克隆」必须落下克隆意图,否则点了没反应"
+        );
+        assert!(
+            ui_state.pending_delete.is_none(),
+            "克隆不该顺带把这一行推进删除确认"
         );
     }
 

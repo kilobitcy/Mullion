@@ -11458,11 +11458,15 @@ impl ApplicationHandler<UserEvent> for App {
                     // F225②:项目管理器写 `sessions.toml` 的 `[[project]]`。
                     // 它本身不改外观,但 `refresh_appearance` 顺带做的是
                     // 「store 变了就重算」,漏登记的症状是别的地方难查。
-                    || self.ui.project_intent.is_some();
+                    || self.ui.project_intent.is_some()
+                    // F229:克隆会新增一行会话,外观缓存必须跟着重算 ——
+                    // 漏掉的话新行画的是默认色/默认图标。
+                    || self.ui.clone_request.is_some();
                 if self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
                     || self.ui.move_to_group.is_some()
                     || self.ui.reorder_request.is_some()
+                    || self.ui.clone_request.is_some()
                 {
                     // keyring/TOML 是同步 IO,在事件回调里可能阻塞(Windows 凭据管理器
                     // 偶发几百 ms),打点让看门狗能指认。
@@ -11502,6 +11506,32 @@ impl ApplicationHandler<UserEvent> for App {
                                 .ui
                                 .set_toast(crate::ui::toast::Kind::Ok, "已移动到分组"),
                             Err(e) => self.ui.set_error(format!("移动分组失败:{e}")),
+                        }
+                    }
+                }
+                // F229:右键「克隆」。深拷贝在 store 层(见 `Vault::clone_session`
+                // 的文档:UI 层那条捷径会静默丢掉凭据),这里只负责落盘、报结果、
+                // 把新行选中并把光标送进名称框 —— 克隆出来第一件事必然是改名。
+                //
+                // 走 `pending_switch` 而不是自己写 `editor_id`:那条路顺带重置
+                // `editor_baseline`/`editor_tab`,漏了基线的话刚克隆出来的表单
+                // 立刻被判成脏,下一次切换会弹一个莫名其妙的确认。
+                if let Some(id) = self.ui.clone_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        let now = time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default();
+                        match store
+                            .clone_session(id, &now)
+                            .and_then(|new_id| store.save().map(|()| new_id))
+                        {
+                            Ok(new_id) => {
+                                self.ui.pending_switch =
+                                    Some(crate::ui::session_manager::SwitchTarget::Session(new_id));
+                                self.ui.focus_name_request = true;
+                                self.ui.set_toast(crate::ui::toast::Kind::Ok, "已克隆会话");
+                            }
+                            Err(e) => self.ui.set_error(format!("克隆失败:{e}")),
                         }
                     }
                 }

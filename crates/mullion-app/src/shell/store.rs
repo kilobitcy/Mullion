@@ -114,6 +114,15 @@ impl SessionStore {
         self.vault.delete(id)
     }
 
+    /// F229:右键「克隆」。深拷贝连密文一起,见 `Vault::clone_session`。
+    pub fn clone_session(
+        &mut self,
+        id: SessionId,
+        now_rfc3339: &str,
+    ) -> Result<SessionId, StoreError> {
+        self.vault.clone_session(id, now_rfc3339)
+    }
+
     /// 走查 3:右键「移动到分组」。只改 `group_id`,见 `Vault::set_group`。
     pub fn set_group(
         &mut self,
