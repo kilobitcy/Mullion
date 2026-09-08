@@ -22,6 +22,7 @@ pub mod pane_title;
 pub mod paste;
 pub mod project_manager;
 pub mod project_pick;
+pub mod project_row;
 pub mod rehost;
 pub mod restored;
 pub mod session_manager;
