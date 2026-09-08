@@ -433,6 +433,21 @@ impl UiState {
         self.error_expanded = false;
     }
 
+    /// F228:发起一次拨测。**所有**发起点都必须走这里,不要直接赋值
+    /// `probe_click` —— 这里顺带把粘性的 `last_error` 卡片收起来。
+    ///
+    /// 为什么在**点击**时收而不是在结果回来时收:两张卡片互斥且 `last_error`
+    /// 优先(见 `editor.rs` 的 `error_shown`),不收的话连"正在测试连接…"都
+    /// 不画,用户看到的是一个点了毫无反应的按钮 —— 20 秒后才突然出结果。
+    ///
+    /// 内容**不清**:那条错误多半是刚才保存失败,还需要用户处理,清掉等于
+    /// 把一条待办悄悄吞了。这里只把它折起来给结果让位。
+    pub fn begin_probe(&mut self, form: session_manager::EditorBuffer) {
+        self.probe_click = true;
+        self.probe_form = Some(form);
+        self.error_dismissed = true;
+    }
+
     /// 关闭会话管理器。**所有**关闭点都必须走这里,不要直接赋值
     /// `session_manager_open = false`:关闭时要顺带清空只属于它的、可能残留
     /// 的临时状态(目前是 `pending_delete`)——否则下次打开时,待确认删除的
@@ -1183,6 +1198,54 @@ mod tests {
         assert!(
             st.probe_form.is_none(),
             "关闭会话管理器必须清空 probe_form,否则含明文凭据的表单副本会滞留内存"
+        );
+    }
+
+    /// F228:拨测结果卡片与 `last_error` 卡片互斥,而 `last_error` 是**粘性**的
+    /// (只有用户点 × 才 dismiss)。上一次失败留下的错误会把整张拨测卡片压住 ——
+    /// 连"正在测试连接…"都不画,按钮看起来像坏了。发起拨测这一刻必须让旧错误
+    /// 让位:`error_dismissed = true`,但**内容不清**(它可能是保存失败,还得留着)。
+    ///
+    /// 自证会变红:把 `begin_probe` 里的 `self.error_dismissed = true;` 删掉,
+    /// 第二条断言立刻报「旧错误仍展开着」。
+    #[test]
+    fn starting_a_probe_folds_away_the_stale_error_so_the_verdict_is_visible() {
+        let mut st = UiState::default();
+        st.set_error("保存失败:权限不足".to_owned());
+        assert!(!st.error_dismissed, "前提:刚报的错是展开着的");
+
+        st.begin_probe(session_manager::EditorBuffer::default());
+
+        assert!(st.probe_click, "必须把点击意图传下去");
+        assert!(st.probe_form.is_some(), "必须冻结当时的表单副本");
+        assert!(
+            st.error_dismissed,
+            "点「测试连接」必须让旧错误卡片让位,否则拨测卡片整张不画"
+        );
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("保存失败:权限不足"),
+            "只是收起来,内容不许清 —— 那条错误可能还没被处理"
+        );
+    }
+
+    /// F228:置 `probe_click` 只许发生在 `begin_probe` 里。绕过它直接赋值的
+    /// 调用点不会折叠旧错误,于是 bug 原样复发,而且**画面上看不出来** ——
+    /// 只有在「上一次报过错」这个前提下才复现。
+    ///
+    /// 判据用裸赋值串而不是函数名:检查的就是"有没有人手写这一句"。
+    ///
+    /// 自证会变红:把 `begin_probe` 的实现搬回 `editor.rs` 的按钮体内。
+    #[test]
+    fn probe_click_is_only_ever_set_inside_begin_probe() {
+        let src = include_str!("session_manager/editor.rs");
+        assert!(
+            !src.contains("probe_click = true"),
+            "editor.rs 不许直接置 probe_click,必须走 UiState::begin_probe(F228)"
+        );
+        assert!(
+            src.contains("begin_probe("),
+            "editor.rs 的测试连接按钮必须调 begin_probe"
         );
     }
 

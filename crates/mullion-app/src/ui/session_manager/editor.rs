@@ -475,6 +475,9 @@ pub(super) fn show(
     // 走查 14:「保存」比其它按钮多一个禁用原因。缺项优先 —— 表单都没填齐时
     // 说「没有需要保存的改动」是在误导。
     let save_tip = missing_tip.or(unchanged.then_some("没有需要保存的改动"));
+    // F228:「点了测试连接」这件事在按钮体内只能攒着,不能当场发起 —— 理由见
+    // 按钮体内的注释。
+    let mut probe_form_snapshot: Option<super::EditorBuffer> = None;
     let bottom_bar = egui::TopBottomPanel::bottom(ui.id().with("sm_editor_bottom"))
         .frame(egui::Frame::none())
         .show_separator_line(false)
@@ -503,11 +506,15 @@ pub(super) fn show(
                     !disable_connect,
                     probe_tip.as_deref(),
                 ) {
-                    ui_state.probe_click = true;
                     // F92:记下发起这一刻的表单快照,供拨测结果返回后判定
                     // 「表单有没有改过」——不能拿 `editor_baseline`(上次保存
                     // 基线),见 `UiState::probe_form` 的文档注释。
-                    ui_state.probe_form = Some(buf.clone());
+                    // F228:发起动作收在 `UiState::begin_probe` 里(它顺带折叠
+                    // 粘性的旧错误卡片)。但那是个 `&mut self` 方法,要借整个
+                    // `UiState`,而 `buf` 正借着 `ui_state.editor` 且借用活到
+                    // ScrollArea 之后 —— 在这里直接调会 E0500。所以只把快照攒
+                    // 下来,等借用结束再发起(见函数末尾)。
+                    probe_form_snapshot = Some(buf.clone());
                 }
                 if super::labeled_button(
                     ui,
@@ -605,6 +612,12 @@ pub(super) fn show(
     // F92:表单一改,上一次的成功/失败结论就不再可信 —— 但**不动世代号**:
     // 在途那次仍是针对这份表单发起的,让它跑完;世代号只在切会话/关窗时才变
     //(`cancel_probe`,app.rs)。这里够不着世代号,也不该够得着。
+    // F228:此刻 `buf` 的借用已经结束,可以拿整个 `&mut UiState` 了。必须排在
+    // `expire_verdict_if_form_changed` **之前**:先写进 `probe_form`,那句比对
+    // 才会拿它跟当前表单比出"没改过",否则刚发起的拨测会被自己作废。
+    if let Some(form) = probe_form_snapshot {
+        ui_state.begin_probe(form);
+    }
     expire_verdict_if_form_changed(ui_state);
 }
 
