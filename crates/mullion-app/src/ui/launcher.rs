@@ -115,14 +115,6 @@ pub fn show(
     crate::ui::annotate::mark(ctx, "项目列表(启动页)", panel.response.rect);
 }
 
-/// 一行的副标题:`目录 · 节点名`。
-///
-/// F233 起真正的实现在 [`crate::ui::project_row::subtitle`](三处列表共用)。
-/// 这里留一层转发是因为 `project_pick` 还按老名字调它,而改调用点属于另一件事。
-pub(super) fn row_subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
-    crate::ui::project_row::subtitle(p, sessions)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,27 +156,6 @@ mod tests {
             automation: Default::default(),
             sftp: Default::default(),
         }
-    }
-
-    /// 一行必须同时说清**在哪台机器上的哪个目录** —— 只有项目名的话,
-    /// 「api」和「api(测试机)」这种命名在列表里根本分不出来。
-    #[test]
-    fn a_row_names_both_the_directory_and_the_node_it_will_dial() {
-        let s = vec![sess(7, "web01")];
-        assert_eq!(
-            row_subtitle(&proj(1, "接口", "/srv/api", None), &s),
-            "/srv/api · web01"
-        );
-    }
-
-    /// 节点解析不出来(会话被别的实例删了)只显示目录,**不显示占位文字**。
-    /// 那句话对用户没有任何可操作性,而目录已经够认出这是哪个活。
-    #[test]
-    fn a_row_whose_node_is_gone_still_says_which_directory_it_is() {
-        assert_eq!(
-            row_subtitle(&proj(1, "接口", "/srv/api", None), &[]),
-            "/srv/api"
-        );
     }
 
     /// 列表顺序**复用** `by_recent_access`(最近访问的在最上面)。

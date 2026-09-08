@@ -15,7 +15,7 @@
 //! 而那时还没有任何图标功能 —— 正是项目一贯反对的「对用户没有可操作性的占位」。
 //! 代价:F238 会让行内坐标整体右移,本文件的落点测试要跟着改。
 
-use mullion_store::{ProjectRecord, SessionRecord};
+use mullion_store::{ProjectId, ProjectRecord, SessionRecord};
 
 use crate::theme::{self, Theme};
 
@@ -94,6 +94,48 @@ pub fn time_text(p: &ProjectRecord, now: time::OffsetDateTime) -> String {
     }
 }
 
+/// 一盏灯长什么样、以及它是什么意思。
+///
+/// 颜色**不承担区分职责**,形状才是:实心/空心/带点各不相同。色觉障碍、以及
+/// 深色底上绿灰难辨的情况下,这盏灯仍然读得出来。**不写字符**:●/○/◐ 都在
+/// GBK 外,egui 的两级字体链画不出来就是豆腐块,而那在 Linux 开发机上多半是
+/// 正常的(T9)。
+fn lamp_look(
+    lamp: crate::project::Lamp,
+    t: &Theme,
+) -> (
+    crate::ui::icon::Glyph,
+    mullion_term::snapshot::Rgb,
+    &'static str,
+) {
+    use crate::project::Lamp;
+    use crate::ui::icon::Glyph;
+    match lamp {
+        Lamp::Lit => (
+            Glyph::LampLit,
+            t.ok,
+            "正在跑:有终端接在这个项目的 tmux 会话上",
+        ),
+        Lamp::Dark => (
+            Glyph::LampDark,
+            t.fg_muted,
+            "没在跑:本机所有终端都已上报,没有一个接在它上面",
+        ),
+        Lamp::Unknown => (
+            Glyph::LampUnknown,
+            t.warn,
+            "还不确定:有终端还没上报过状态,它可能正接在这个项目上",
+        ),
+    }
+}
+
+/// 一行的交互 id。**按项目主键 + 列表名推**,不用自动 id:自动 id 由控件在
+/// `Ui` 里的出现次序算出来,测试要点某一行就只能猜坐标。带上 `list` 是因为
+/// 同一个项目会同时出现在三处列表里,共用一个 id 的话 egui 会认成同一个控件。
+pub fn row_id(list: &'static str, id: ProjectId) -> egui::Id {
+    egui::Id::new(("project_row", list, id.0))
+}
+
 /// 画一行,返回它的 `Response`。调用方自己判 `clicked()`。
 pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     let w = ui.available_width();
@@ -101,7 +143,7 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     // 几十个像素点得中 —— F141 那条「侧栏本地栏一行都点不中」就是这么来的,
     // 而它的症状**完全静默**:界面画得好好的,点了没反应。
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
-    let id = egui::Id::new(("project_row", row.list, row.project.id.0));
+    let id = row_id(row.list, row.project.id);
     let resp = ui.interact(rect, id, egui::Sense::click());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -125,24 +167,33 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
 
     let p = ui.painter();
 
-    // 灯。走 `ui::icon` 自绘、**不写字符**:●/○/◐ 都在 GBK 外,egui 的两级字体
-    // 链画不出来就是豆腐块,而那在 Linux 开发机上多半是正常的(T9)。颜色不承担
-    // 区分职责,形状才是(同 `project_manager::lamp_dot`)。
+    // 灯。形状与含义见 `lamp_look`。
     let side = ROW_H * 0.28;
     let dot = egui::Rect::from_center_size(
         egui::pos2(rect.left() + LAMP_X, rect.center().y),
         egui::vec2(side, side),
     );
-    let (glyph, color) = match row.lamp {
-        crate::project::Lamp::Lit => (crate::ui::icon::Glyph::LampLit, t.ok),
-        crate::project::Lamp::Dark => (crate::ui::icon::Glyph::LampDark, t.fg_muted),
-        crate::project::Lamp::Unknown => (crate::ui::icon::Glyph::LampUnknown, t.warn),
-    };
+    let (glyph, color, tip) = lamp_look(row.lamp, t);
     p.extend(crate::ui::icon::shapes(
         dot,
         glyph,
         egui::Stroke::new(1.4, theme::c32(color)),
     ));
+    // 三态各配一句话。「未知」尤其需要说明 —— 一个既不亮也不灭的圈,不解释的话
+    // 用户只会当它坏了(F224 定的)。
+    //
+    // 手画 tooltip、**不新建部件**:在灯上再 `interact` 一次会跟整行那个判定
+    // 矩形重叠,而整行可点是这一行存在的理由(F141)。
+    if resp.hovered()
+        && ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|q| dot.expand(4.0).contains(q))
+    {
+        egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), id.with("lamp"), |ui| {
+            ui.label(tip);
+        });
+    }
 
     let text_left = rect.left() + TEXT_X;
     let text_avail = (rect.right() - TEXT_RIGHT_PAD - text_left).max(0.0);
@@ -425,5 +476,29 @@ mod tests {
                 .any(|s| s.format.color == accent),
             _ => false,
         }
+    }
+
+    /// 三盏灯各自有一句**互不相同**的说明。
+    ///
+    /// 「未知」尤其需要它:一个既不亮也不灭的圈,不解释的话用户只会当它坏了
+    /// (F224 定的)。这条判据钉的是「说明还在、且三态确实说的是三件事」——
+    /// 原来那份说明挂在 `project_manager::lamp_dot` 上,换成共享行的时候差点
+    /// 连着那个函数一起被删掉,而丢了它**画面上完全看不出来**。
+    ///
+    /// 自证会变红:把任意两臂的 tip 写成同一句。
+    #[test]
+    fn all_three_lamps_explain_themselves_differently() {
+        use crate::project::Lamp;
+        let t = &crate::theme::MULLION_DARK;
+        let tips: Vec<&str> = [Lamp::Lit, Lamp::Dark, Lamp::Unknown]
+            .into_iter()
+            .map(|l| lamp_look(l, t).2)
+            .collect();
+        assert!(
+            tips.iter().all(|s| !s.is_empty()),
+            "有一盏灯没有说明:{tips:?}"
+        );
+        let uniq: std::collections::BTreeSet<_> = tips.iter().collect();
+        assert_eq!(uniq.len(), 3, "三态的说明重了:{tips:?}");
     }
 }

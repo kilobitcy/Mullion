@@ -18,13 +18,6 @@ use mullion_store::{ProjectId, ProjectRecord, SessionRecord};
 
 use crate::theme::{self, Theme};
 
-/// 列表里一行的 id。**必须按项目主键推**,理由同 `rehost::row_id`:
-/// 自动 id 下「点第 N 行」在测试里只能靠猜坐标,而这个弹窗唯一的功能
-/// 就是「点对行」。
-fn row_id(id: ProjectId) -> egui::Id {
-    egui::Id::new(("project_pick_row", id.0))
-}
-
 /// 取消按钮的 id。同上,手写 id 才点得到。
 fn cancel_id() -> egui::Id {
     egui::Id::new("project_pick_cancel")
@@ -40,6 +33,11 @@ const INSET: f32 = 8.0;
 
 /// 固定部分(说明行 + 搜索框 + 分隔线 + 取消按钮 + 边框内边距)的高度预算。
 /// 宁可估大:估小了列表会把取消按钮顶出 pane 外面,而那是唯一的退出口。
+///
+/// F233:行从「一行拼接文本」换成 `project_row`(两行 + 时间列,`ROW_H` = 48)
+/// 之后,同一块 pane 里能放下的行数少了一半多。这个常量本身只管**固定部分**、
+/// 不随行高变 —— 但下面 `list_h` 的下界必须按新行高走,否则最后一行会被切掉
+/// 一半,看起来像渲染坏了。
 const CHROME_H: f32 = 120.0;
 
 /// 弹窗的状态。`Some` = 开着。
@@ -70,16 +68,6 @@ pub enum PickAction {
     Cancel,
 }
 
-/// 一个项目是否匹配搜索词。大小写不敏感;**名字和目录都算** —— 用户记得住
-/// 的往往是路径(`/srv/api`)而不是自己当初起的项目名。
-fn matches(p: &ProjectRecord, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    let n = needle.to_lowercase();
-    p.name.to_lowercase().contains(&n) || p.dir.to_lowercase().contains(&n)
-}
-
 /// 画弹窗。`draft` 是唯一真值来源:`None` = 关着。返回本帧的结论。
 ///
 /// `pane_rect` 是**发起它的那块 pane** 的矩形(逻辑点)。理由同 `rehost`:
@@ -96,6 +84,8 @@ pub fn show(
 ) -> Option<PickAction> {
     let d = draft.as_mut()?;
     let pane = d.pane;
+    // 一帧取一次(同另外两处列表)。
+    let now = time::OffsetDateTime::now_utc();
     let mut action = None;
     let host = pane_rect.unwrap_or_else(|| ctx.screen_rect());
     let avail = host.shrink(INSET);
@@ -104,7 +94,8 @@ pub fn show(
         crate::ui::metrics::FIELD_W_M,
         2.0 * crate::ui::metrics::SP_M,
     );
-    let list_h = (avail.height() - CHROME_H).clamp(48.0, 260.0);
+    // 下界取一整行:放不下一整行的话最后那行会被切一半,看起来像渲染坏了。
+    let list_h = (avail.height() - CHROME_H).clamp(crate::ui::project_row::ROW_H, 260.0);
     // `Area` 而不是 `Window`:`Window` 的位置记在 egui memory 里、还能被拖走,
     // 「永远在这块 pane 里」就守不住了。同 `rehost::show`。
     egui::Area::new(area_id(pane))
@@ -124,7 +115,7 @@ pub fn show(
                     ui.add_space(crate::ui::metrics::SP_S);
                     ui.add(
                         egui::TextEdit::singleline(&mut d.filter)
-                            .hint_text("搜索项目名或目录")
+                            .hint_text("搜索项目名 / 目录 / 节点")
                             .desired_width(field_w),
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
@@ -132,7 +123,11 @@ pub fn show(
                     // 管理器左栏同一个函数。
                     let rows: Vec<_> = crate::ui::project_manager::by_recent_access(projects)
                         .into_iter()
-                        .filter(|p| matches(p, &d.filter))
+                        // 判据**复用** `crate::project::matches` —— 另外两处
+                        // 列表用的是同一个函数。各写一份的话,同一个搜索词在
+                        // 两个界面给出不同结果。原来这里那份私有实现只查
+                        // name/dir,搜机器名一条都搜不到。
+                        .filter(|p| crate::project::matches(p, &d.filter, sessions))
                         .collect();
                     if rows.is_empty() {
                         ui.label(
@@ -153,7 +148,21 @@ pub fn show(
                                     .get(&p.id)
                                     .copied()
                                     .unwrap_or(crate::project::Lamp::Unknown);
-                                if row(ui, t, p, lamp, sessions) {
+                                let r = crate::ui::project_row::show(
+                                    ui,
+                                    t,
+                                    &crate::ui::project_row::Row {
+                                        project: p,
+                                        lamp,
+                                        sessions,
+                                        query: &d.filter,
+                                        // 这个弹窗没有「正在编辑哪一个」的概念。
+                                        selected: false,
+                                        now,
+                                        list: "pick",
+                                    },
+                                );
+                                if r.clicked() {
                                     action = Some(PickAction::Pick {
                                         pane,
                                         project: p.id,
@@ -201,60 +210,11 @@ pub fn show(
     action
 }
 
-/// 画一行:灯 + 项目名 + 目录。手写而不是 `ui.add(Button)`:egui 0.30 的
-/// `Button` 没有任何指定 id 的接口,而稳定 id 是「点对行」可测的前提。
-fn row(
-    ui: &mut egui::Ui,
-    t: &Theme,
-    p: &ProjectRecord,
-    lamp: crate::project::Lamp,
-    sessions: &[SessionRecord],
-) -> bool {
-    let sub = crate::ui::launcher::row_subtitle(p, sessions);
-    let font = egui::FontId::proportional(14.0);
-    let galley = ui.painter().layout_no_wrap(
-        format!("{}  ({sub})", p.name),
-        font,
-        theme::c32(t.fg_strong),
-    );
-    let w = ui.available_width().max(galley.size().x + 28.0);
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(w, galley.size().y + 8.0), egui::Sense::hover());
-    let resp = ui.interact(rect, row_id(p.id), egui::Sense::click());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 3.0, theme::c32(t.panel_head));
-    }
-    // 灯画在最左边。走 `icon` 自绘、颜色不承担区分职责(形状才是)——
-    // 同 `project_manager::lamp_dot` 的判据,这里是它的 painter 版:
-    // 那个要 `&mut Ui` 并自己 allocate,与本行「整行一个 rect」冲突。
-    let side = rect.height() * 0.7;
-    let dot = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 10.0, rect.center().y),
-        egui::vec2(side, side),
-    );
-    let (glyph, color) = match lamp {
-        crate::project::Lamp::Lit => (crate::ui::icon::Glyph::LampLit, t.ok),
-        crate::project::Lamp::Dark => (crate::ui::icon::Glyph::LampDark, t.fg_dim),
-        crate::project::Lamp::Unknown => (crate::ui::icon::Glyph::LampUnknown, t.fg_muted),
-    };
-    ui.painter().extend(crate::ui::icon::shapes(
-        dot,
-        glyph,
-        egui::Stroke::new(1.2, theme::c32(color)),
-    ));
-    ui.painter().galley(
-        rect.min + egui::vec2(22.0, 4.0),
-        galley,
-        theme::c32(t.fg_strong),
-    );
-    resp.clicked()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::theme::MULLION_DARK;
+    use mullion_store::SessionId;
 
     fn proj(id: u64, name: &str, dir: &str, accessed: Option<&str>) -> ProjectRecord {
         ProjectRecord {
@@ -277,13 +237,100 @@ mod tests {
         ]
     }
 
-    /// 搜索词只认名字就漏掉一半:用户记得住的常常是路径。
+    /// 切换弹窗的行也要带最后打开时间(F234)—— 这个弹窗回答的问题和启动页
+    /// 完全一样(「切到哪个活」),两处一个有时间一个没有,用户会以为其中
+    /// 一处坏了。
+    ///
+    /// 自证会变红:把 `project_row::show` 换回原来那个把名字和副标题拼成
+    /// 一行的私有 `row`。
     #[test]
-    fn the_search_box_matches_the_directory_too_not_just_the_name() {
-        let p = proj(1, "接口", "/srv/payments", None);
-        assert!(matches(&p, "PAY"), "目录没参与匹配");
-        assert!(matches(&p, "接口"));
-        assert!(!matches(&p, "完全不沾边"));
+    fn each_pick_row_says_when_it_was_last_opened() {
+        let joined = pick_texts(&[proj(1, "接口", "/srv/api", None)], "").join(" ");
+        assert!(joined.contains("从未打开"), "没显示最后打开时间:{joined}");
+    }
+
+    /// 搜索匹配判据与另外两处**同一个函数**(F233)。各写一份的话,同一个
+    /// 搜索词在两个界面给出不同结果。这里钉的是「按节点名也搜得到」,那正是
+    /// 原来那份私有实现做不到的 —— 它只查 name/dir。
+    ///
+    /// 自证会变红:把 `crate::project::matches` 换回只查 name/dir 的判据。
+    #[test]
+    fn the_pick_dialog_finds_a_project_by_its_node_name_like_the_other_two_lists() {
+        let mut p = proj(1, "接口", "/srv/api", None);
+        p.nodes = vec![SessionId(7)];
+        let joined = pick_texts(&[p], "web01").join(" ");
+        assert!(joined.contains("接口"), "按节点名搜不到:{joined}");
+    }
+
+    /// 跑两帧,把弹窗画出来的全部文字收上来。姿态同 `launcher::tests::texts_with`。
+    fn pick_texts(ps: &[ProjectRecord], query: &str) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let lamps = std::collections::BTreeMap::new();
+        let sessions = vec![node_session()];
+        let mut draft = Some(ProjectPickDraft {
+            pane: PaneId(7),
+            filter: query.to_string(),
+        });
+        let mut shapes = Vec::new();
+        for time in [0.0_f64, 1.0] {
+            shapes = ctx
+                .run(
+                    egui::RawInput {
+                        time: Some(time),
+                        ..base_input()
+                    },
+                    |ctx| {
+                        show(
+                            ctx,
+                            &MULLION_DARK,
+                            &mut draft,
+                            ps,
+                            &lamps,
+                            &sessions,
+                            Some(pane()),
+                        );
+                    },
+                )
+                .shapes;
+        }
+        let mut out = Vec::new();
+        for cs in &shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    /// 一条能当项目节点的 SSH 会话。
+    fn node_session() -> SessionRecord {
+        SessionRecord {
+            id: SessionId(7),
+            modified_at: "t".into(),
+            identity: mullion_store::Identity {
+                name: "web01".into(),
+                note: String::new(),
+                group_id: None,
+                tags: Vec::new(),
+            },
+            connection: mullion_store::Connection {
+                host: "h".into(),
+                port: 22,
+                protocol: mullion_store::Protocol::Ssh,
+            },
+            auth: mullion_store::Auth::inline("u", mullion_store::AuthKind::Password),
+            terminal: Default::default(),
+            appearance: Default::default(),
+            network: Default::default(),
+            automation: Default::default(),
+            sftp: Default::default(),
+        }
     }
 
     /// 点某一行 = 选定那个项目,**并且带上发起它的那块 pane**。
@@ -296,7 +343,11 @@ mod tests {
     fn picking_a_row_reports_both_the_project_and_the_pane_it_was_opened_for() {
         let ps = some_projects();
         let mut draft = Some(ProjectPickDraft::new(PaneId(7)));
-        let got = click(&mut draft, &ps, row_id(ProjectId(2)));
+        let got = click(
+            &mut draft,
+            &ps,
+            crate::ui::project_row::row_id("pick", ProjectId(2)),
+        );
         assert_eq!(
             got,
             Some(PickAction::Pick {
@@ -316,11 +367,11 @@ mod tests {
         let mut draft = Some(ProjectPickDraft::new(PaneId(7)));
         let ctx = draw(&mut draft, &ps);
         let first = ctx
-            .read_response(row_id(ProjectId(2)))
+            .read_response(crate::ui::project_row::row_id("pick", ProjectId(2)))
             .expect("列表里没有最近那个项目")
             .rect;
         let second = ctx
-            .read_response(row_id(ProjectId(1)))
+            .read_response(crate::ui::project_row::row_id("pick", ProjectId(1)))
             .expect("列表里没有老那个项目")
             .rect;
         assert!(

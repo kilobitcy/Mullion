@@ -307,47 +307,6 @@ fn add_button(ui: &mut egui::Ui) -> egui::Response {
     resp
 }
 
-/// F224:一盏项目灯。**自绘 + tooltip**,不写字符(T9)。
-///
-/// 三态各配一句话:「未知」尤其需要说明 —— 一个既不亮也不灭的圈,不解释的话
-/// 用户只会当它坏了。
-///
-/// 颜色**不承担区分职责**,形状才是:实心/空心/带点各不相同。色觉障碍、
-/// 以及深色底上绿灰难辨的情况下,这盏灯仍然读得出来。
-pub(super) fn lamp_dot(ui: &mut egui::Ui, t: &crate::theme::Theme, lamp: crate::project::Lamp) {
-    use crate::project::Lamp;
-    let (glyph, color, tip) = match lamp {
-        Lamp::Lit => (
-            crate::ui::icon::Glyph::LampLit,
-            t.ok,
-            "正在跑:有终端接在这个项目的 tmux 会话上",
-        ),
-        Lamp::Dark => (
-            crate::ui::icon::Glyph::LampDark,
-            t.fg_muted,
-            "没在跑:本机所有终端都已上报,没有一个接在它上面",
-        ),
-        Lamp::Unknown => (
-            crate::ui::icon::Glyph::LampUnknown,
-            t.warn,
-            "还不确定:有终端还没上报过状态,它可能正接在这个项目上",
-        ),
-    };
-    let size = egui::Vec2::splat(ui.spacing().interact_size.y * 0.6);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let resp = resp.on_hover_text(tip);
-    // 自绘图形在 accesskit 树里是个没名字的空节点 —— 拿 tooltip 当名字,
-    // 同 `icon_button` 的理由(屏幕阅读器 + F100 自动候选)。
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, tip));
-    if ui.is_rect_visible(rect) {
-        ui.painter().extend(crate::ui::icon::shapes(
-            rect,
-            glyph,
-            egui::Stroke::new(1.4, crate::theme::c32(color)),
-        ));
-    }
-}
-
 /// 右栏:选中项目的表单。
 fn form_column(
     ui: &mut egui::Ui,
