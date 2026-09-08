@@ -39,14 +39,21 @@ pub const FD_NAME_CAP: usize = 260;
 /// `FD_PROGRESSUI` 是在告诉目标程序「这东西可能要读很久,请自己画进度」——
 /// 拖一个 200MB 的远端文件到桌面,没有这一位的话资源管理器会白着脸卡住。
 const FD_FLAGS: u32 = 0x0000_0004 | 0x0000_0040 | 0x0000_4000;
-/// `FILE_ATTRIBUTE_NORMAL`。目录不拖(设计 N2),所以恒是这个。
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+/// `FILE_ATTRIBUTE_NORMAL`。普通文件项写这个。
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+/// `FILE_ATTRIBUTE_DIRECTORY`。F230 的剪贴板会把目录展开成一批相对路径,
+/// 其中的目录项要带这一位。
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 
 /// 一项描述符要的全部信息。
 pub struct Described<'a> {
-    /// **已经净化并去重过**的落地名(见 `super::name`)。
+    /// **已经净化并去重过**的落地名(见 `super::name`)。展开目录树时这里是
+    /// 反斜杠分隔的相对路径(`sub\dir\file.txt`)。
     pub name: &'a str,
     pub size: u64,
+    /// 这一项是不是目录。拖出(F59)恒为 `false`——起拖那一刻不能卡几十秒
+    /// 去递归列目录(设计 N2);剪贴板(F230)会把目录也放进来。
+    pub is_dir: bool,
 }
 
 /// 把一批文件拼成 `CFSTR_FILEDESCRIPTORW` 的内容。
@@ -62,7 +69,15 @@ pub fn file_group_descriptor(items: &[Described<'_>]) -> Vec<u8> {
 
 fn write_one(fd: &mut [u8], it: &Described<'_>) {
     fd[0..4].copy_from_slice(&FD_FLAGS.to_le_bytes());
-    fd[36..40].copy_from_slice(&FILE_ATTRIBUTE_NORMAL.to_le_bytes());
+    // F230:目录项必须带 `FILE_ATTRIBUTE_DIRECTORY` —— 否则空子目录不会被
+    // 建出来(资源管理器只按「有内容的文件」补父目录),用户拖一棵树过去,
+    // 空目录静默消失。
+    let attrs = if it.is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    fd[36..40].copy_from_slice(&attrs.to_le_bytes());
     // 高位在前一个字段、低位在后 —— 这是结构体的顺序,不是数值的顺序。
     // 写反的话 4GB 以下的文件全变成 0 字节(高位恒 0 被当成低位),而
     // 小文件占绝大多数,「拖下来全是空文件」会被当成传输坏了。
@@ -97,7 +112,11 @@ mod tests {
     use super::*;
 
     fn d<'a>(name: &'a str, size: u64) -> Described<'a> {
-        Described { name, size }
+        Described {
+            name,
+            size,
+            is_dir: false,
+        }
     }
 
     fn u16_at(buf: &[u8], off: usize) -> u16 {
@@ -106,6 +125,65 @@ mod tests {
 
     fn u32_at(buf: &[u8], off: usize) -> u32 {
         u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    }
+
+    fn read_attrs(buf: &[u8], i: usize) -> u32 {
+        let base = 4 + FD_SIZE * i;
+        u32::from_le_bytes(buf[base + 36..base + 40].try_into().unwrap())
+    }
+
+    fn read_name(buf: &[u8], i: usize) -> String {
+        let base = 4 + FD_SIZE * i + FD_NAME_OFF;
+        let mut u = Vec::new();
+        for k in 0..FD_NAME_CAP {
+            let c = u16::from_le_bytes(buf[base + k * 2..base + k * 2 + 2].try_into().unwrap());
+            if c == 0 {
+                break;
+            }
+            u.push(c);
+        }
+        String::from_utf16(&u).unwrap()
+    }
+
+    /// F230:目录展开之后,项的名字是**反斜杠分隔的相对路径**。`cFileName`
+    /// 本来就允许相对路径 —— 但只认反斜杠;写成正斜杠资源管理器会把整串当成
+    /// 一个文件名,而 `/` 在 Windows 上不是合法文件名字符,结果是一堆
+    /// `sub_dir_file.txt` 平铺在目标目录里,目录结构整个丢掉。
+    ///
+    /// 自证会变红:让 `write_one` 写名字前把 `\` 换成 `/`。
+    #[test]
+    fn a_nested_item_keeps_its_relative_path_with_backslashes() {
+        let items = [Described {
+            name: r"sub\dir\file.txt",
+            size: 7,
+            is_dir: false,
+        }];
+        let buf = file_group_descriptor(&items);
+        assert_eq!(read_name(&buf, 0), r"sub\dir\file.txt");
+    }
+
+    /// F230:目录项要带 `FILE_ATTRIBUTE_DIRECTORY`,否则空目录不会被建出来
+    /// (资源管理器只按「有内容的文件」补父目录)—— 用户拖一棵树过去,
+    /// 空子目录静默消失。
+    ///
+    /// 自证会变红:让 `write_one` 恒写 `FILE_ATTRIBUTE_NORMAL`。
+    #[test]
+    fn directory_entries_carry_the_directory_attribute() {
+        let items = [
+            Described {
+                name: "empty",
+                size: 0,
+                is_dir: true,
+            },
+            Described {
+                name: "a.txt",
+                size: 3,
+                is_dir: false,
+            },
+        ];
+        let buf = file_group_descriptor(&items);
+        assert_eq!(read_attrs(&buf, 0), FILE_ATTRIBUTE_DIRECTORY);
+        assert_eq!(read_attrs(&buf, 1), FILE_ATTRIBUTE_NORMAL);
     }
 
     #[test]

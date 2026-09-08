@@ -601,6 +601,8 @@ fn run(runtime: tokio::runtime::Handle, sftp: Arc<SftpClient>, items: Vec<DragOu
         .map(|i| descriptor::Described {
             name: &i.name,
             size: i.size,
+            // 拖出仍然跳过目录(设计 N2):起拖那一刻不能卡几十秒去递归列目录。
+            is_dir: false,
         })
         .collect();
     let bytes = descriptor::file_group_descriptor(&described);
