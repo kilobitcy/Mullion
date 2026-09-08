@@ -183,6 +183,32 @@ impl SessionStore {
         self.vault.add_group(name)
     }
 
+    /// F221 项目表。与凭据/隧道同姿态:写完由调用方 `save()` 落盘。
+    pub fn projects(&self) -> &[mullion_store::ProjectRecord] {
+        self.vault.projects()
+    }
+
+    pub fn add_project(
+        &mut self,
+        name: String,
+        dir: String,
+        now_rfc3339: &str,
+    ) -> mullion_store::ProjectId {
+        self.vault.add_project(name, dir, now_rfc3339)
+    }
+
+    pub fn update_project(
+        &mut self,
+        id: mullion_store::ProjectId,
+        draft: mullion_store::ProjectRecord,
+    ) -> Result<(), mullion_store::ProjectIssue> {
+        self.vault.update_project(id, draft)
+    }
+
+    pub fn delete_project(&mut self, id: mullion_store::ProjectId) -> Result<(), StoreError> {
+        self.vault.delete_project(id)
+    }
+
     /// 共享凭据表(F74)。UI 拿它显示「有效用户名」与凭据档列表。
     pub fn credentials(&self) -> &[mullion_store::CredentialRecord] {
         self.vault.credentials()
