@@ -12034,6 +12034,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 目录留空:新建那一刻还不知道要落在哪个目录,
                                 // 逼用户在一个单行输入框里先想好路径是本末倒置。
                                 // 右栏的「保存」按钮会拦住空目录。
+                                //
+                                // F236:名字由 `project::fresh_project_name` 在
+                                // UI 侧现算好塞进意图里,这里只消费。原来左栏
+                                // 那个「新建项目」输入框已经改成搜索框 ——
+                                // 任何「从 UI 缓冲里读名字」的写法在这之后都会
+                                // 建出名字为空的项目,而 `validate_project` 会
+                                // 拒掉它:右栏「保存」永远灰着且没有解释。
                                 let now = time::OffsetDateTime::now_utc()
                                     .format(&time::format_description::well_known::Rfc3339)
                                     .unwrap_or_default();
@@ -12041,6 +12048,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.ui.project_selected = Some(id);
                                 self.ui.project_draft =
                                     store.projects().iter().find(|p| p.id == id).cloned();
+                                // 新建之后唯一要做的事就是起名字 —— 把焦点直接
+                                // 送过去,省掉一次「用鼠标点进那个框」。
+                                self.ui.project_focus_name = true;
                             }
                             crate::ui::project_manager::ProjectIntent::Save(id, draft) => {
                                 if let Err(e) = store.update_project(id, *draft) {

@@ -111,6 +111,15 @@ pub fn show(
     // 「现在几点」一帧取一次,不是每行取一次 —— 每行各调一次 `now_utc()`
     // 等于每帧几十次系统调用,而这个项目为了空闲期的 CPU 花了整整八个切片。
     let now = time::OffsetDateTime::now_utc();
+    // F236:焦点标志**在这里就消费掉**,按值传给右栏。
+    //
+    // 留着不清的话每帧都抢一次焦点,用户点右栏任何别的输入框都会被当场弹回
+    // 名称框 —— 而这个状态没有自愈路径,只能关窗重开。在 `show` 顶层 take 也
+    // 让「它被消费了」这件事一眼可见,不用翻到右栏深处去确认。
+    //
+    // `show` 只在 `project_manager_open` 为真时被调用(见 `ui::show_shell`),
+    // 所以这里不会在弹窗关着的时候把标志白白吃掉。
+    let focus_name = std::mem::take(&mut ui_state.project_focus_name);
     // 宽度从 720 提到 840:左栏从 192 加宽到 `LIST_W`(300),不提的话右栏会
     // 从 442 缩到 334,F237 那个三行「说明」框跟着变窄。
     egui::Window::new("项目管理")
@@ -121,7 +130,7 @@ pub fn show(
                 list_column(ui, t, ui_state, projects, lamps, sessions, now);
                 ui.separator();
                 ui.vertical(|ui| {
-                    form_column(ui, t, ui_state, projects, sessions, table);
+                    form_column(ui, t, ui_state, projects, sessions, table, focus_name);
                 });
             });
         });
@@ -169,13 +178,7 @@ fn list_column(
             .frame(egui::Frame::none())
             .show_inside(ui, |ui| {
                 ui.add_space(SP_S);
-                // 撞满整宽:视觉重点靠**位置和尺寸**,不靠颜色。全场唯一一个
-                // accent 实心按钮是会话编辑器的「保存并连接」,再加一颗会把那个
-                // 层级搅浑。
-                let b = ui.add_sized(
-                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
-                    egui::Button::new("+ 添加项目"),
-                );
+                let b = add_button(ui);
                 crate::ui::annotate::mark(ui.ctx(), "项目管理器/左栏/添加项目", b.rect);
                 if b.clicked() {
                     ui_state.project_intent = Some(ProjectIntent::Add(
@@ -236,6 +239,54 @@ fn list_column(
     });
 }
 
+/// 「+ 添加项目」按钮的 id。
+///
+/// 挂显式 id 而不是用 `ui.button()` 的自动 id:自动 id 由控件在 `Ui` 里的出现
+/// 次序算出来,测试要点它就只能靠「猜它画在哪个坐标」—— 布局一动判据就假红/
+/// 假绿。同 `session_manager::list::new_button_id()` 的理由。
+pub(crate) fn add_button_id() -> egui::Id {
+    egui::Id::new("mullion_pm_add_button")
+}
+
+/// 手绘「+ 添加项目」按钮,挂 [`add_button_id`],撞满整条左栏宽。
+///
+/// **视觉重点靠位置和尺寸,不靠颜色**:全场唯一一个 accent 实心按钮是会话
+/// 编辑器的「保存并连接」,再加一颗会把那个层级搅浑。撞满整宽 + 独占底栏
+/// 已经足够显眼。
+///
+/// 视觉规则取 `ui.style().interact(&resp)` —— 与 `egui::Button::ui()` 内部算
+/// `frame_fill`/`frame_stroke` 用的是同一套(见 egui-0.30.0 `widgets/button.rs`),
+/// 所以外观跟默认按钮基本一致。
+///
+/// `allocate_space` 只预留布局空间、不注册交互(不像 `allocate_exact_size` 会
+/// 顺带用自动 id 注册一次 `Sense::hover`),避免同一块矩形被注册成两个互相
+/// 打架的部件。
+fn add_button(ui: &mut egui::Ui) -> egui::Response {
+    let galley = egui::WidgetText::from("+ 添加项目").into_galley(
+        ui,
+        None,
+        ui.available_width(),
+        egui::TextStyle::Button,
+    );
+    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    let (_auto_id, rect) = ui.allocate_space(size);
+    let resp = ui.interact(rect, add_button_id(), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&resp);
+        ui.painter().rect(
+            rect.expand(visuals.expansion),
+            visuals.rounding,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+        );
+        let text_pos = egui::Align2::CENTER_CENTER
+            .align_size_within_rect(galley.size(), rect)
+            .min;
+        ui.painter().galley(text_pos, galley, visuals.text_color());
+    }
+    resp
+}
+
 /// F224:一盏项目灯。**自绘 + tooltip**,不写字符(T9)。
 ///
 /// 三态各配一句话:「未知」尤其需要说明 —— 一个既不亮也不灭的圈,不解释的话
@@ -285,6 +336,7 @@ fn form_column(
     projects: &[ProjectRecord],
     sessions: &[SessionRecord],
     table: Option<&mullion_store::known_hosts::KnownHostsFile>,
+    focus_name: bool,
 ) {
     use crate::ui::metrics::{field_w, FIELD_W_L, FIELD_W_M, SP_M, SP_S, SP_XS};
     let Some(draft) = ui_state.project_draft.as_mut() else {
@@ -299,7 +351,25 @@ fn form_column(
     crate::ui::session_manager::form::grid(ui, "project_basic", |ui| {
         ui.label("名称");
         let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
-        ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(w));
+        let name_resp = ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(w));
+        // F236:刚点完「+ 添加项目」—— 把焦点送进来并全选。
+        //
+        // 全选的理由:默认名「新项目」是占位,用户第一个动作必然是把它删掉重打。
+        // `TextEditState` 的游标区间是 egui 里唯一能表达「全选」的地方
+        // (`TextEdit` 自己没有 select-all 的构造项)。
+        if focus_name {
+            name_resp.request_focus();
+            if let Some(mut st) =
+                egui::widgets::text_edit::TextEditState::load(ui.ctx(), name_resp.id)
+            {
+                let n = draft.name.chars().count();
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(n),
+                )));
+                st.store(ui.ctx(), name_resp.id);
+            }
+        }
         ui.end_row();
         ui.label("说明");
         let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
@@ -822,6 +892,114 @@ mod tests {
     fn the_add_button_spells_out_that_it_makes_a_project() {
         let joined = window_texts(&[], "").join(" ");
         assert!(joined.contains("+ 添加项目"), "按钮文案不对:{joined}");
+    }
+
+    /// 跑三帧,真点一次「+ 添加项目」,返回它发出的意图。
+    ///
+    /// 靠显式 `add_button_id()` 定位按钮矩形,不靠「猜它画在哪个坐标」——
+    /// 布局一动,坐标式判据就假红/假绿。
+    fn intent_after_clicking_add(projects: &[ProjectRecord]) -> Option<ProjectIntent> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let draw = |input: egui::RawInput, ui_state: &mut crate::ui::UiState| {
+            let _ = ctx.run(input, |ctx| {
+                show(ctx, &t, ui_state, projects, &lamps, &sessions, None);
+            });
+        };
+        for _ in 0..2 {
+            draw(egui::RawInput::default(), &mut ui_state);
+        }
+        let rect = ctx
+            .read_response(add_button_id())
+            .expect("「+ 添加项目」没被登记 —— 它的 id 变了还是根本没画?")
+            .rect;
+        let pos = rect.center();
+        let mut input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        };
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        draw(input, &mut ui_state);
+        ui_state.project_intent
+    }
+
+    /// 点一下就建出项目,**不用先在哪个框里打字**。
+    ///
+    /// 名字由 `project::fresh_project_name` 现算 —— 原来左栏那个「新建项目」
+    /// 输入框已经改成搜索框了,任何「从 UI 缓冲里读名字」的写法在这之后都会
+    /// 建出名字为空的项目,而 `validate_project` 会拒掉它:右栏「保存」永远
+    /// 灰着,而且没有任何解释。
+    ///
+    /// 自证会变红:把 `list_column` 里的
+    /// `ProjectIntent::Add(crate::project::fresh_project_name(projects))`
+    /// 换成 `ProjectIntent::Add(ui_state.project_search.clone())`。
+    #[test]
+    fn clicking_add_creates_a_project_straight_away_with_a_generated_name() {
+        assert_eq!(
+            intent_after_clicking_add(&[]),
+            Some(ProjectIntent::Add("新项目".into()))
+        );
+    }
+
+    /// 连点两次不会撞名 —— 第二次给的是下一个空号。
+    ///
+    /// 撞名的记录**存不进去**(`validate_project` 要求项目名全局唯一),而
+    /// `Add` 是立刻落盘的:列表里会出现两行同名、右栏「保存」灰着。
+    #[test]
+    fn a_second_click_picks_the_next_free_number_instead_of_clashing() {
+        let ps = vec![proj(1, "新项目", None)];
+        assert_eq!(
+            intent_after_clicking_add(&ps),
+            Some(ProjectIntent::Add("新项目 2".into()))
+        );
+    }
+
+    /// 新建完之后焦点要落到右栏「名称」框上 —— 否则用户得先用鼠标点进去才能
+    /// 给这个活起名字,而「起名字」正是新建之后唯一要做的事。
+    ///
+    /// 自证会变红:把 `form_column` 里那段 `request_focus()` 删掉。
+    #[test]
+    fn right_after_adding_a_project_the_name_field_takes_focus() {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let p = proj(1, "新项目", None);
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(p.id),
+            project_draft: Some(p.clone()),
+            project_focus_name: true,
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![p];
+        let sessions: Vec<SessionRecord> = Vec::new();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
+            });
+        }
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "新建之后没有任何部件拿到焦点 —— 用户得先用鼠标点进名称框才能起名"
+        );
+        assert!(
+            !ui_state.project_focus_name,
+            "焦点标志没被消费 —— 会每帧抢一次焦点,用户点右栏别的框都会被弹回来,\
+             而且这个状态没有自愈路径"
+        );
     }
 
     /// 一个项目都没有时,「+ 添加项目」**仍然要在**。
