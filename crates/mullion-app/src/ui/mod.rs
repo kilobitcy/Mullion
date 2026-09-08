@@ -274,8 +274,22 @@ pub struct UiState {
     /// 项目管理弹窗是否展示。**必须同时登记进 `app.rs` 的 `Modal` 表**
     /// (里面有文本输入框,不登记的话敲的字会同时漏给远端 shell,T8)。
     pub project_manager_open: bool,
-    /// 「新建项目」输入框的跨帧缓冲。
-    pub project_name_buf: String,
+    /// F233:项目管理器左栏搜索框的跨帧缓冲。
+    ///
+    /// 这个字段原来是「新建项目」的名字输入框(`project_name_buf`)。F236 把
+    /// 新建改成了一键「+ 添加项目」—— 名字由 `project::fresh_project_name`
+    /// 现算,那个输入框整个让位给搜索。
+    pub project_search: String,
+    /// F233:启动页项目列表的搜索词。
+    ///
+    /// 与上面那份**分开**:项目管理器是弹窗、启动页是整页,两个界面在会话
+    /// 生命周期里都存在,共用一份的话在一边打字会静默改掉另一边的过滤结果。
+    pub launcher_search: String,
+    /// F236:下一帧要把焦点打到右栏「名称」框上(刚新建完)。
+    ///
+    /// 用一位标志而不是在 app 侧直接 `request_focus`:那个 `Response` 只在
+    /// 渲染闭包里存在,而新建是在闭包外施加的。
+    pub project_focus_name: bool,
     /// 右栏正在编辑哪个项目。`None` = 还没选。
     pub project_selected: Option<mullion_store::ProjectId>,
     /// 右栏那份编辑草稿。**改动只活在这里**,点保存才变成意图 ——

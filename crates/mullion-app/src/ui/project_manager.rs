@@ -108,12 +108,17 @@ pub fn show(
             ui_state.project_draft = None;
         }
     }
+    // 「现在几点」一帧取一次,不是每行取一次 —— 每行各调一次 `now_utc()`
+    // 等于每帧几十次系统调用,而这个项目为了空闲期的 CPU 花了整整八个切片。
+    let now = time::OffsetDateTime::now_utc();
+    // 宽度从 720 提到 840:左栏从 192 加宽到 `LIST_W`(300),不提的话右栏会
+    // 从 442 缩到 334,F237 那个三行「说明」框跟着变窄。
     egui::Window::new("项目管理")
         .open(&mut open)
-        .default_width(720.0)
+        .default_width(840.0)
         .show(ctx, |ui| {
             ui.horizontal_top(|ui| {
-                list_column(ui, t, ui_state, projects, lamps);
+                list_column(ui, t, ui_state, projects, lamps, sessions, now);
                 ui.separator();
                 ui.vertical(|ui| {
                     form_column(ui, t, ui_state, projects, sessions, table);
@@ -128,36 +133,57 @@ pub fn show(
     }
 }
 
-/// 左栏:新建 + 项目列表。
+/// 左栏:搜索框 / 列表 / 底部「+ 添加项目」三段式。
+///
+/// 与会话管理器左栏同构(那边是搜索框 / 分组树 / 底部「+ 新建」)。底部按钮走
+/// `TopBottomPanel::bottom(..).show_inside(ui)` **先占位**:egui 的面板布局保证
+/// 面板先分配自己的高度、再把外层 `ui` 的可用区底边收缩到面板上沿 —— 直接按
+/// 顺序画的话,项目一多列表就会把按钮顶出可视区,而那是唯一的新建入口。
+///
+/// 宽度从原来的 `FIELD_W_S * 2`(192)提到 `LIST_W`(300):行里现在有副标题和
+/// 右对齐的时间列,192 装不下,长项目名会被截成一两个字。
 fn list_column(
     ui: &mut egui::Ui,
     t: &crate::theme::Theme,
     ui_state: &mut crate::ui::UiState,
     projects: &[ProjectRecord],
     lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
+    sessions: &[SessionRecord],
+    now: time::OffsetDateTime,
 ) {
-    use crate::ui::metrics::{FIELD_W_S, SP_S};
+    use crate::ui::metrics::{field_w, FIELD_W_L, SP_S};
     ui.vertical(|ui| {
-        // 列表列取「两个 S 档」宽:项目名比会话名短,不需要 M 档。
-        ui.set_width(FIELD_W_S * 2.0);
-        ui.horizontal(|ui| {
-            let w = crate::ui::metrics::field_w(ui.available_width(), FIELD_W_S, 56.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut ui_state.project_name_buf)
-                    .hint_text("新建项目")
-                    .desired_width(w),
-            );
-            let name = ui_state.project_name_buf.trim().to_string();
-            let dup = projects.iter().any(|p| p.name == name);
-            if ui
-                .add_enabled(!name.is_empty() && !dup, egui::Button::new("添加"))
-                .clicked()
-            {
-                ui_state.project_intent = Some(ProjectIntent::Add(name));
-                ui_state.project_name_buf.clear();
-            }
-        });
+        ui.set_width(crate::ui::session_manager::LIST_W);
+        // 搜索框独占一整行:原来它旁边挂着「添加」按钮,只剩 96px,一个路径
+        // 片段都打不下。
+        let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
+        let search = ui.add(
+            egui::TextEdit::singleline(&mut ui_state.project_search)
+                .hint_text(crate::theme::hint_text(t, "搜索项目名 / 目录 / 节点"))
+                .desired_width(w),
+        );
+        crate::ui::annotate::mark(ui.ctx(), "项目管理器/左栏/搜索框", search.rect);
         ui.add_space(SP_S);
+
+        egui::TopBottomPanel::bottom("project_list_bottom")
+            .frame(egui::Frame::none())
+            .show_inside(ui, |ui| {
+                ui.add_space(SP_S);
+                // 撞满整宽:视觉重点靠**位置和尺寸**,不靠颜色。全场唯一一个
+                // accent 实心按钮是会话编辑器的「保存并连接」,再加一颗会把那个
+                // 层级搅浑。
+                let b = ui.add_sized(
+                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                    egui::Button::new("+ 添加项目"),
+                );
+                crate::ui::annotate::mark(ui.ctx(), "项目管理器/左栏/添加项目", b.rect);
+                if b.clicked() {
+                    ui_state.project_intent = Some(ProjectIntent::Add(
+                        crate::project::fresh_project_name(projects),
+                    ));
+                }
+            });
+
         if projects.is_empty() {
             ui.label(
                 egui::RichText::new("还没有项目。项目 = 一台机器上的一个开发目录 + 一个专属 tmux 会话,打开它就回到那个活。")
@@ -165,26 +191,46 @@ fn list_column(
             );
             return;
         }
+        // 顺序**复用** `by_recent_access`、过滤**复用** `project::matches` ——
+        // 三处列表各写一份的话,同一个搜索词在两个界面给出不同结果,而用户
+        // 几分钟内就会都看到一遍。
+        let rows: Vec<&ProjectRecord> = by_recent_access(projects)
+            .into_iter()
+            .filter(|p| crate::project::matches(p, &ui_state.project_search, sessions))
+            .collect();
+        if rows.is_empty() {
+            ui.label(egui::RichText::new("没有匹配的项目").color(crate::theme::c32(t.fg_muted)));
+            ui.add_space(SP_S);
+            if ui.button("清空搜索").clicked() {
+                ui_state.project_search.clear();
+            }
+            return;
+        }
         egui::ScrollArea::vertical()
             .id_salt("project_list")
-            .max_height(360.0)
             .show(ui, |ui| {
-                for p in by_recent_access(projects) {
-                    let selected = ui_state.project_selected == Some(p.id);
-                    ui.horizontal(|ui| {
-                        // F224:灯走 `ui::icon` 自绘,**不写字符**。●/○/◐
-                        // 都在 GBK 外,egui 的两级字体链画不出来就是豆腐块,
-                        // 而那在 Linux 开发机上多半是正常的(T9)。
-                        let lamp = lamps
-                            .get(&p.id)
-                            .copied()
-                            .unwrap_or(crate::project::Lamp::Unknown);
-                        lamp_dot(ui, t, lamp);
-                        if ui.selectable_label(selected, &p.name).clicked() {
-                            ui_state.project_selected = Some(p.id);
-                            ui_state.project_draft = Some(p.clone());
-                        }
-                    });
+                for p in rows {
+                    let lamp = lamps
+                        .get(&p.id)
+                        .copied()
+                        .unwrap_or(crate::project::Lamp::Unknown);
+                    let r = crate::ui::project_row::show(
+                        ui,
+                        t,
+                        &crate::ui::project_row::Row {
+                            project: p,
+                            lamp,
+                            sessions,
+                            query: &ui_state.project_search,
+                            selected: ui_state.project_selected == Some(p.id),
+                            now,
+                            list: "manager",
+                        },
+                    );
+                    if r.clicked() {
+                        ui_state.project_selected = Some(p.id);
+                        ui_state.project_draft = Some(p.clone());
+                    }
                 }
             });
     });
@@ -692,6 +738,106 @@ mod tests {
             node_verdict(&[SessionId(1)], &ss[0], &ss, Some(&table)),
             mullion_store::SameMachine::Pending,
             "只有它自己一条时没有可比对的对象,应是待核"
+        );
+    }
+
+    // ---- 左栏三段式(F233/F236)-------------------------------------------
+
+    /// 跑两帧,把弹窗画出来的全部文字收上来。
+    ///
+    /// **两帧**:第一帧 `egui::Window` 还在量自己的尺寸,内容矩形没定,行会被
+    /// 裁掉。
+    fn window_texts(projects: &[ProjectRecord], query: &str) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_search: query.to_string(),
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    show(ctx, &t, &mut ui_state, projects, &lamps, &sessions, None);
+                })
+                .shapes;
+        }
+        let mut out = Vec::new();
+        for cs in &shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    /// 搜索词把不匹配的行滤掉。
+    ///
+    /// 自证会变红:把 `list_column` 里的
+    /// `.filter(|p| crate::project::matches(..))` 那一行删掉。
+    #[test]
+    fn the_left_column_hides_projects_that_do_not_match_the_query() {
+        let ps = vec![proj(1, "接口", None), proj(2, "数据库", None)];
+        let texts = window_texts(&ps, "接口");
+        assert!(
+            texts.iter().any(|s| s == "接口"),
+            "命中的行不见了:{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|s| s == "数据库"),
+            "没命中的行还在:{texts:?}"
+        );
+    }
+
+    /// 搜不到任何东西时列表是一整片空白 —— 用户分不清「没有匹配」和「项目都
+    /// 没了」。给一句话 + 一个回到全部列表的出口(走查 22)。
+    ///
+    /// 自证会变红:把那个 `rows.is_empty()` 分支删掉。
+    #[test]
+    fn a_query_that_matches_nothing_says_so_and_offers_a_way_back() {
+        let ps = vec![proj(1, "接口", None)];
+        let joined = window_texts(&ps, "根本没有这个").join(" ");
+        assert!(joined.contains("没有匹配的项目"), "没给空态说明:{joined}");
+        assert!(
+            joined.contains("清空搜索"),
+            "没给回到全部列表的出口:{joined}"
+        );
+    }
+
+    /// 新建按钮写「+ 添加项目」,不是「添加」——「添加」什么?旁边原来那个
+    /// 输入框已经改成搜索框了,不说清楚就读成「添加搜索结果」。
+    ///
+    /// 判据读的是**渲染出来的文字**,不是源码里的字面量 —— 后者换个拼法就恒绿。
+    ///
+    /// 自证会变红:把按钮文案改回「添加」。
+    #[test]
+    fn the_add_button_spells_out_that_it_makes_a_project() {
+        let joined = window_texts(&[], "").join(" ");
+        assert!(joined.contains("+ 添加项目"), "按钮文案不对:{joined}");
+    }
+
+    /// 一个项目都没有时,「+ 添加项目」**仍然要在**。
+    ///
+    /// 空态那一支是 `return` —— 按钮如果排在它后面就永远画不出来,而那时正是
+    /// 用户最需要它的时候(界面上只有一句「还没有项目」和一个点不了的搜索框)。
+    ///
+    /// 自证会变红:把 `TopBottomPanel::bottom(..)` 那一整段挪到
+    /// `if projects.is_empty() { .. return; }` 之后。
+    #[test]
+    fn the_add_button_is_still_there_when_there_are_no_projects_at_all() {
+        let joined = window_texts(&[], "").join(" ");
+        assert!(joined.contains("还没有项目"), "空态说明不见了:{joined}");
+        assert!(
+            joined.contains("+ 添加项目"),
+            "空手上门时反而没有新建入口:{joined}"
         );
     }
 }

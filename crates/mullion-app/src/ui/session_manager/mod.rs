@@ -96,6 +96,8 @@ pub(crate) fn tab_title(i: usize) -> &'static str {
 /// 设计稿 §3:880×560 单窗,左栏定宽 300。
 pub(crate) const WINDOW_W: f32 = 880.0;
 pub(crate) const WINDOW_H: f32 = 560.0;
+/// F233:项目管理器左栏也用这一档 —— 两个左栏在同一个程序里,宽度不一样会
+/// 显得像两个软件。
 pub(crate) const LIST_W: f32 = 300.0;
 /// 左栏能拖到的最窄宽度。= 32px 图标 + 左右各 12px 呼吸。必须**严格小于**
 /// `list::ICONS_BELOW`(88),否则纯图标档永远拖不出来。
