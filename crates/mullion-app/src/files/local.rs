@@ -159,18 +159,51 @@ pub fn home_dir() -> Option<RemotePath> {
     directories::BaseDirs::new().map(|b| RemotePath::from_bytes(path_bytes(b.home_dir())))
 }
 
-/// 默认本地目录:配置里填了就用它,留空用用户主目录,再拿不到就用
-/// 当前工作目录 —— 任何一步都不 panic,面板宁可开在一个奇怪的地方
-/// 也不能开不出来。
-pub fn default_local(configured: Option<&str>) -> RemotePath {
-    if let Some(s) = configured.filter(|s| !s.trim().is_empty()) {
+/// 默认本地目录该开在哪 —— **纯选择逻辑**,零 IO,四个候选全由调用方给进来。
+///
+/// 优先级:会话配置 > 本地收藏首条 > 用户主目录 > 当前工作目录。任何一步都不
+/// panic,面板宁可开在一个奇怪的地方也不能开不出来。
+///
+/// 拆成纯函数是因为这里唯一容易写错的是**优先级**,而优先级恰恰是唯一用不着
+/// 碰文件系统就能验的东西。掺进 `is_dir()` / `home_dir()` 之后,这几条分支就
+/// 只能靠"在开发机上跑一下看看开在哪"来确认了。
+///
+/// `bookmark_exists`:收藏首条指向的目录当下是否真的存在(调用方查)。不存在
+/// 时**直接回退主目录**,不试第二条 —— 试下去的话用户会开在一个自己完全没
+/// 预期的目录里,而且没有任何提示解释为什么(F231 与用户确认的取舍)。
+pub fn pick_default_local(
+    configured: Option<&str>,
+    bookmark: Option<&str>,
+    bookmark_exists: bool,
+    home: Option<RemotePath>,
+    cwd: RemotePath,
+) -> RemotePath {
+    // 只有空白等于没填:面板不能开在一个名叫「   」的目录上。
+    let usable = |s: &&str| !s.trim().is_empty();
+    if let Some(s) = configured.filter(usable) {
         return RemotePath::from_bytes(s.as_bytes().to_vec());
     }
-    if let Some(h) = home_dir() {
-        return h;
+    if let Some(s) = bookmark.filter(usable).filter(|_| bookmark_exists) {
+        return RemotePath::from_bytes(s.as_bytes().to_vec());
     }
+    home.unwrap_or(cwd)
+}
+
+/// [`pick_default_local`] 的带 IO 版本:自己去查主目录、cwd,以及收藏首条
+/// 存不存在。`bookmark` 是**本地收藏的第一条**(F231),由调用方从
+/// `Settings::local_bookmarks` 取。
+pub fn default_local(configured: Option<&str>, bookmark: Option<&str>) -> RemotePath {
+    let bookmark_exists = bookmark
+        .filter(|s| !s.trim().is_empty())
+        .is_some_and(|s| to_path(&RemotePath::from_bytes(s.as_bytes().to_vec())).is_dir());
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    RemotePath::from_bytes(path_bytes(&cwd))
+    pick_default_local(
+        configured,
+        bookmark,
+        bookmark_exists,
+        home_dir(),
+        RemotePath::from_bytes(path_bytes(&cwd)),
+    )
 }
 
 /// 用系统文件管理器打开一个本地目录(设计 D5:本地文件管理外包出去)。
@@ -348,7 +381,7 @@ mod tests {
     /// 就成了重言式:实现怎么错,测试跟着怎么错)。
     #[test]
     fn the_default_local_directory_falls_back_to_the_home_directory() {
-        let d = default_local(None);
+        let d = default_local(None, None);
         assert!(
             to_path(&d).is_dir(),
             "默认目录得真的存在,否则面板一开就是一条读不出来的错误:{}",
@@ -404,9 +437,85 @@ mod tests {
     /// (它照样返回一个存在的主目录)。
     #[test]
     fn a_configured_local_directory_is_used_verbatim() {
-        let d = default_local(Some("/srv/incoming"));
+        let d = default_local(Some("/srv/incoming"), None);
         assert_eq!(d.as_bytes(), b"/srv/incoming");
         // 只有空白等于没填:面板不能开在一个名叫「   」的目录上。
-        assert_ne!(default_local(Some("   ")).as_bytes(), b"   ");
+        assert_ne!(default_local(Some("   "), None).as_bytes(), b"   ");
+    }
+
+    /// F231:优先级是「会话配置 > 收藏首条 > 主目录 > cwd」。会话里明确填了
+    /// 默认本地目录,收藏就不该越过它 —— 那是用户对**这条会话**的明确表态。
+    #[test]
+    fn a_configured_default_beats_the_first_bookmark() {
+        let d = pick_default_local(
+            Some("/srv/incoming"),
+            Some("/home/me/proj"),
+            true,
+            Some(RemotePath::from_bytes(b"/home/me".to_vec())),
+            RemotePath::from_bytes(b"/tmp".to_vec()),
+        );
+        assert_eq!(d.as_bytes(), b"/srv/incoming");
+    }
+
+    /// F231 的正事:会话没填 → 开在收藏的第一条。
+    ///
+    /// 自证会变红:把 `pick_default_local` 里那一段收藏分支删掉,本条落到
+    /// 主目录 `/home/me`,断言红。
+    #[test]
+    fn an_unconfigured_panel_opens_at_the_first_bookmark() {
+        let d = pick_default_local(
+            None,
+            Some("/home/me/proj"),
+            true,
+            Some(RemotePath::from_bytes(b"/home/me".to_vec())),
+            RemotePath::from_bytes(b"/tmp".to_vec()),
+        );
+        assert_eq!(d.as_bytes(), b"/home/me/proj");
+    }
+
+    /// F231:收藏首条指向一个已经不存在的目录(换机器、盘符变了)时,面板必须
+    /// 回到主目录 —— 而**不是**去试第二条。试第二条的话,用户看到的是一个
+    /// 自己完全没预期的目录,而且没有任何提示解释为什么。
+    ///
+    /// 自证会变红:把 `pick_default_local` 里的 `.filter(|_| bookmark_exists)`
+    /// 去掉,本条返回 `/mnt/gone`,断言红。
+    #[test]
+    fn a_missing_first_bookmark_falls_straight_back_to_home() {
+        let d = pick_default_local(
+            None,
+            Some("/mnt/gone"),
+            false,
+            Some(RemotePath::from_bytes(b"/home/me".to_vec())),
+            RemotePath::from_bytes(b"/tmp".to_vec()),
+        );
+        assert_eq!(d.as_bytes(), b"/home/me");
+    }
+
+    /// F231:空白路径的收藏等于没有(同 `configured` 的既有约定) —— 面板不能
+    /// 开在一个名叫「   」的目录上。
+    #[test]
+    fn a_blank_bookmark_path_counts_as_no_bookmark() {
+        let d = pick_default_local(
+            None,
+            Some("   "),
+            true,
+            Some(RemotePath::from_bytes(b"/home/me".to_vec())),
+            RemotePath::from_bytes(b"/tmp".to_vec()),
+        );
+        assert_eq!(d.as_bytes(), b"/home/me");
+    }
+
+    /// F231:主目录都拿不到时(`directories` 在某些精简环境返回 None)落到 cwd。
+    /// 任何一步都不 panic —— 面板宁可开在奇怪的地方也不能开不出来。
+    #[test]
+    fn everything_missing_falls_back_to_the_working_directory() {
+        let d = pick_default_local(
+            None,
+            None,
+            false,
+            None,
+            RemotePath::from_bytes(b"/tmp".to_vec()),
+        );
+        assert_eq!(d.as_bytes(), b"/tmp");
     }
 }

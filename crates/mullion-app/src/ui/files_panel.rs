@@ -1828,7 +1828,7 @@ impl Default for PanelFrame {
     fn default() -> Self {
         Self {
             remote: PaneState::new(mullion_ssh::sftp::RemotePath::from_bytes(b"/".to_vec())),
-            local: PaneState::new(crate::files::local::default_local(None)),
+            local: PaneState::new(crate::files::local::default_local(None, None)),
             bookmarks: Vec::new(),
             local_bookmarks: Vec::new(),
             session_bound: false,
@@ -1855,7 +1855,15 @@ impl PanelFrame {
         session_bound: bool,
     ) -> Self {
         Self {
-            local: PaneState::new(crate::files::local::default_local(default_local)),
+            // F231:会话没配默认本地目录时,开在本地收藏的第一条。收藏顺序即
+            // 数组顺序(F121 的既有约定),所以"第一条"就是 `first()`。
+            //
+            // 这一行必须排在 `local_bookmarks` **之前**:字段初始化顺序就是
+            // 求值顺序,写反了 `local_bookmarks` 已经被移动进结构体,借不到。
+            local: PaneState::new(crate::files::local::default_local(
+                default_local,
+                local_bookmarks.first().map(|b| b.path.as_str()),
+            )),
             bookmarks,
             local_bookmarks,
             session_bound,
@@ -2218,6 +2226,29 @@ pub(crate) fn mtime_text(secs: u32) -> String {
 mod tests {
     use super::*;
     use mullion_ssh::sftp::{Entry, RemotePath};
+
+    /// F231:`PanelFrame::new` 必须真的把收藏首条喂给 `default_local`。纯函数
+    /// 那几条测试守的是"优先级对",守不住"根本没接上" —— 而没接上的表现是
+    /// 面板照旧开在主目录,画面上完全看不出是 bug 还是"我没设收藏"。
+    ///
+    /// 判据只在 `PanelFrame::new` 那一段切片里查,**不拿整份文件做 contains**:
+    /// 本测试自己也在这份文件里,断言里的判据串会命中它自己,恒绿(本仓库已经
+    /// 踩过这类源码切片自命中)。
+    ///
+    /// 自证会变红:把 `PanelFrame::new` 里第二个实参改回 `None`。
+    #[test]
+    fn the_new_panel_feeds_the_first_local_bookmark_into_default_local() {
+        let src = include_str!("files_panel.rs");
+        let at = src.find("pub fn new(").expect("找不到 PanelFrame::new");
+        let seg = &src[at..(at + 900).min(src.len())];
+        let call = seg
+            .find("default_local(")
+            .expect("PanelFrame::new 必须调 default_local");
+        assert!(
+            seg[call..].contains("local_bookmarks.first()"),
+            "PanelFrame::new 必须把本地收藏首条喂给 default_local(F231)"
+        );
+    }
 
     /// 在渲染结果的形状树里找**第一处**含 `needle` 的文字中心点,用来给点击
     /// 事件定位。抄自 `session_manager` 几处同名测试辅助(那边是私有的,没有
