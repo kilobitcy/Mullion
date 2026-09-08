@@ -2351,6 +2351,13 @@ enum Modal {
     /// **同时进 `touched_store`**:它写 `sessions.toml` 的 `[[project]]`。
     /// 切片 I 的教训是「弹窗要同时进两张表」,少任何一张都静默。
     ProjectManager,
+    /// F223:打开项目前的确认框。里面没有输入框,但有一颗一按就把当前 pane
+    /// 从现在这条连接上摘下来的「继续打开」按钮,而空格/回车在 egui 里是
+    /// 按钮的激活键 —— 同 `Modal::History` 的理由(T8)。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写(F224 的访问时间是连上
+    /// 之后才记的,不在这里)。
+    ProjectOpenConfirm,
     /// E2/E3:标签属性弹窗(改名 + 配色)。里面有名字输入框 —— 不算模态的话
     /// 敲的字会同时发给远端 shell(T8)。
     TabProps,
@@ -2400,6 +2407,7 @@ impl Modal {
         Modal::FilesDialog,
         Modal::GroupManager,
         Modal::ProjectManager,
+        Modal::ProjectOpenConfirm,
         Modal::TabProps,
         Modal::ExitConfirm,
         Modal::Rehost,
@@ -3561,6 +3569,7 @@ impl App {
             Modal::FilesDialog => self.ui.files_dialog.is_some(),
             Modal::GroupManager => self.ui.group_manager_open,
             Modal::ProjectManager => self.ui.project_manager_open,
+            Modal::ProjectOpenConfirm => self.ui.project_open_confirm.is_some(),
             // E2/E3:标签属性弹窗里有名字输入框 —— 不算模态的话,敲的字会
             // 同时被发给远端 shell(T8)。
             Modal::TabProps => self.ui.tab_props.is_some(),
@@ -7723,6 +7732,95 @@ impl App {
     ///
     /// `kind` 由调用方给,理由见 `RehostKind`:同一条链路的两个调用点语义相反,
     /// 而事件回来时已经分不出是谁发起的。
+    /// F223 第一段:点了「打开项目」之后,先算该拨哪条路线、要不要先问。
+    ///
+    /// 判据全在 `crate::project::plan_open`(纯函数),这里只负责**采集现状**
+    /// 并把结论摆进 `UiState`。采集口径:
+    /// - 未保存编辑 / 在途传输是**全局**的(与退出确认同一口径)。偏保守 ——
+    ///   多问一次的代价是一次点击,少问一次的代价是用户的改动没了。
+    /// - 裸 shell 只看**目标那块 pane**,判据是
+    ///   `crate::project::bare_shell`,不是裸 `tmux.is_none()`(T11 同族:
+    ///   「还没上报」不是「没有 tmux」)。
+    fn decide_project_open(&mut self, id: mullion_store::ProjectId, pane: Option<PaneId>) {
+        let Some(p) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.projects().iter().find(|p| p.id == id).cloned())
+        else {
+            self.ui.set_error("这个项目已经不在了".to_string());
+            return;
+        };
+        let target = pane.or_else(|| self.active_ws().map(Workspace::focus));
+        let bare = target
+            .and_then(|pid| self.active_ws().and_then(|ws| ws.pane(pid)))
+            .is_some_and(|st| crate::project::bare_shell(st.title_ever_seen, st.tmux.as_deref()));
+        let risk = crate::project::AtRisk {
+            unsaved_edits: self.edit.sessions.blocks_exit(),
+            transfer_in_flight: self.transfer.queue.summary().busy,
+            bare_shell: bare,
+        };
+        let ask = crate::ui::project_manager::OpenAsk {
+            project: id,
+            node: mullion_store::SessionId(0),
+            pane,
+            reasons: Vec::new(),
+        };
+        match crate::project::plan_open(&p, risk) {
+            crate::project::OpenStep::Go(node) => {
+                self.ui.project_open_go = Some(crate::ui::project_manager::OpenAsk { node, ..ask });
+            }
+            crate::project::OpenStep::Ask(node, reasons) => {
+                self.ui.project_open_confirm = Some(crate::ui::project_manager::OpenAsk {
+                    node,
+                    reasons,
+                    ..ask
+                });
+            }
+            crate::project::OpenStep::Refuse(why) => self.ui.set_error(why.to_string()),
+        }
+        mark_ui_dirty!(self.ui_dirty);
+        self.request_ui_redraw();
+    }
+
+    /// F223 第二段:真正把目标 pane 挂到项目节点上。
+    ///
+    /// `ask.node` 是**第一段就定死的**,这里不重新算 —— 确认框开着的那段时间
+    /// 里配置完全可能变了(F189 别的实例、或用户自己),重算等于用户确认的是
+    /// A、实际连的是 B。
+    fn dial_project(&mut self, ask: &crate::ui::project_manager::OpenAsk) {
+        let Some(p) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.projects().iter().find(|p| p.id == ask.project).cloned())
+        else {
+            self.ui.set_error("这个项目已经不在了".to_string());
+            return;
+        };
+        let Some((g, focus)) = self.active_ws().map(|ws| (ws.generation(), ws.focus())) else {
+            // 活动标签不是终端(文件标签 / launcher)。F225① 的 launcher 入口
+            // 落地前到不了这里 —— 那时它得先开一个终端标签,不是往这条路走。
+            self.ui
+                .set_error("当前标签不是终端,没法在这里打开项目".to_string());
+            return;
+        };
+        let pane = ask.pane.unwrap_or(focus);
+        // F223:文件面板的**兜底**落脚点改成项目目录 —— 项目是更具体的上下文,
+        // 盖掉会话那份更泛的 `SftpPrefs.default_remote`。运行期覆盖,不写回
+        // 配置(同 F122 的姿态)。
+        //
+        // 只是兜底:`files_start_dir` 里 pane 报出来的 cwd 优先级更高,而项目
+        // 一连上就会报出项目目录。真正用到这一份的是「远端还没报过」的那段
+        // 窗口期,以及 tmux 会话早就存在、当前 shell 停在别处的情形。
+        if let Some(t) = self
+            .tabs
+            .by_generation_mut(g)
+            .and_then(|tab| tab.content.as_terminal_mut())
+        {
+            t.sftp_default_remote = Some(p.dir.clone());
+        }
+        let _ = self.spawn_rehost_on(g, pane, ask.node, RehostKind::UserPicked, Some(p));
+    }
+
     #[must_use]
     fn spawn_rehost_on(
         &mut self,
@@ -7730,6 +7828,10 @@ impl App {
         pane: PaneId,
         session: mullion_store::SessionId,
         kind: RehostKind,
+        // F223:非 `None` = 这是一次「打开项目」。**在发起那一帧定死并克隆**
+        // ——理由同 `PendingRehost` 的其余字段:拨号是真实网络往返,这期间
+        // 用户完全可能去项目管理器把它改了甚至删了。
+        project: Option<mullion_store::ProjectRecord>,
     ) -> bool {
         let Some(store) = self.store.as_ref() else {
             self.ui.set_error("配置库不可用,无法换节点".to_string());
@@ -7755,10 +7857,30 @@ impl App {
             .iter()
             .find(|r| r.id == session)
             .map_or_else(|| cfg.host.clone(), |r| r.identity.name.clone());
-        let plan = store
-            .resolved(session)
-            .ok()
-            .and_then(|r| crate::automation::pending_for_extra_pane(&r.automation));
+        // F223:打开项目走**含 tmux 的全套 plan**;普通换节点仍跳过 tmux。
+        // 照抄 `pending_for_extra_pane` 的话,打开项目会 cd 到目录但永远不
+        // attach 项目 tmux,而客户端零报错(见 `pending_for_project` 的文档)。
+        let resolved = store.resolved(session).ok();
+        // F223:项目强行开了 tmux,而这条会话自己配的是「不用 tmux」——
+        // **必须留一条可见痕迹**。不说的话用户会以为自己的设置坏了,而这是
+        // 本次连接的一次性覆盖,配置里那份原样没动。
+        let overrode_tmux_off = project.is_some()
+            && resolved.as_ref().is_some_and(|r| {
+                !r.automation.enabled
+                    || matches!(
+                        r.automation.tmux,
+                        None | Some(mullion_store::TmuxChoice::Off)
+                    )
+            });
+        let plan = resolved
+            .as_ref()
+            .and_then(|r| crate::automation::plan_for_rehost(&r.automation, project.as_ref()));
+        if overrode_tmux_off {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                "这条会话本来不用 tmux;打开项目会为它单独 attach 一个,配置没改",
+            );
+        }
         self.pending_rehost.push(PendingRehost {
             generation,
             pane,
@@ -8163,7 +8285,13 @@ impl App {
             // 一定会漏掉 `pending_rehost` 那道防连点的闸。
             // F188:恢复队列拨的这块叶子还**没有** `PaneState`(`apply_saved_tree`
             // 只分配了 id),而且不能抢焦点 —— 详见 `RehostKind`。
-            if self.spawn_rehost_on(generation, pane, session, RehostKind::RestoreFirstMount) {
+            if self.spawn_rehost_on(
+                generation,
+                pane,
+                session,
+                RehostKind::RestoreFirstMount,
+                None,
+            ) {
                 return;
             }
             // 同步早退(配置库不可用 / dial_plan_for 失败 / SFTP 节点):
@@ -10978,12 +11106,21 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(g) = self.active_ws().map(|ws| ws.generation()) {
                         // 用户手点「换节点」,同步早退时 `spawn_rehost_on` 已经
                         // `set_error` 给了 toast,这里的返回值只有串行队列才需要看。
-                        let _ = self.spawn_rehost_on(g, pane, session, RehostKind::UserPicked);
+                        let _ =
+                            self.spawn_rehost_on(g, pane, session, RehostKind::UserPicked, None);
                     } else {
                         // 活动标签不是终端(文件标签 / launcher)。到不了:换节点的
                         // 入口是 pane 标题条,而标题条只有终端标签才画。
                         log::warn!(target: "mullion", "换节点:活动标签不是终端,忽略");
                     }
+                }
+                // F223:打开项目。两段 —— 先判要不要问,问完(或不用问)再拨。
+                // 与换节点同一条理由放在这里:渲染闭包里 `self.ui` 正被借出去。
+                if let Some((id, pane)) = self.ui.project_open_request.take() {
+                    self.decide_project_open(id, pane);
+                }
+                if let Some(ask) = self.ui.project_open_go.take() {
+                    self.dial_project(&ask);
                 }
                 // F110 隧道 CRUD 的施加点。与会话侧同构:UI 只写意图,这里才碰
                 // store。**不复用** `save_request`/`delete_request` 那两条通道 ——
@@ -13339,6 +13476,43 @@ mod tests {
             body.contains("Modal::ProjectManager => self.ui.project_manager_open"),
             "modal_open 里没有 ProjectManager 独立的那一臂(T8)"
         );
+        assert!(
+            body.contains("Modal::ProjectOpenConfirm => self.ui.project_open_confirm.is_some()"),
+            "modal_open 里没有 ProjectOpenConfirm 独立的那一臂(T8)"
+        );
+    }
+
+    /// F223:「打开项目」必须**带着项目**去拨号。
+    ///
+    /// 传 `None` 的话 `plan_for_rehost` 会走普通换节点那一支(跳过 tmux):
+    /// 打开项目会连过去、会 cd,但**永远不 attach 项目 tmux** —— P5 静默落空,
+    /// F224 的灯永远不亮,而客户端零报错、日志正常、画面正常。
+    ///
+    /// 源码切片:`dial_project` 要真 `App` + 真连接才跑得起来。**先剥注释行**
+    /// (上面这段说明本身就含 `Some(p)` 这几个字)。
+    ///
+    /// 自证会变红:把 `dial_project` 里那个 `Some(p)` 改成 `None`。
+    #[test]
+    fn opening_a_project_hands_the_project_down_to_the_dialer() {
+        let src = include_str!("app.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了")
+            .0;
+        let body = production
+            .split_once("fn dial_project(")
+            .expect("找不到 dial_project")
+            .1;
+        let body = &body[..body.find("\n    }\n").expect("找不到 dial_project 的结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("RehostKind::UserPicked, Some(p))"),
+            "dial_project 没把项目传给 spawn_rehost_on —— 打开项目不会 attach tmux"
+        );
     }
 
     /// F225②:项目管理器**写 store**,必须进 `touched_store`。
@@ -15041,6 +15215,10 @@ mod tests {
                 Modal::ProjectManager => assert!(
                     Modal::ALL.contains(&Modal::ProjectManager),
                     "ProjectManager 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::ProjectOpenConfirm => assert!(
+                    Modal::ALL.contains(&Modal::ProjectOpenConfirm),
+                    "ProjectOpenConfirm 没登记进 Modal::ALL(T8)"
                 ),
                 Modal::TabProps => assert!(
                     Modal::ALL.contains(&Modal::TabProps),

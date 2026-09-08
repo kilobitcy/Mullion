@@ -156,6 +156,21 @@ pub fn pending_for_project(
     })
 }
 
+/// F223:换节点(含「打开项目」)那块 pane 该跑什么。
+///
+/// **这个分岔本身就是守护对象**:普通换节点跳过 tmux,打开项目走全套。
+/// 写成一支的话,两种场景里必有一种静默失效 —— 要么项目不 attach tmux
+/// (P5 落空),要么普通换节点和原 pane attach 同一个 session 内容镜像。
+pub fn plan_for_rehost(
+    tpl: &ResolvedAutomation,
+    project: Option<&mullion_store::ProjectRecord>,
+) -> Option<PendingAutomation> {
+    match project {
+        Some(p) => pending_for_project(tpl, p),
+        None => pending_for_extra_pane(tpl),
+    }
+}
+
 /// F141:**断线重连**回来的那块 pane 该跑什么 —— 前提是它当初就是 attach 了
 /// tmux 的那一块(判据在 `App::tmux_attach`,不在这里)。
 ///
@@ -415,6 +430,35 @@ mod tests {
         assert!(line.contains("exec tmux attach"), "{line}");
         assert!(line.contains("'/srv/app'"), "目录得是项目的: {line}");
         assert!(!line.contains("/home/me"), "会话的目录不该出现: {line}");
+    }
+
+    /// **两种换节点必须分岔。** 同一份会话配置,带项目走 tmux、不带项目跳过。
+    ///
+    /// 自证会变红:把 `plan_for_rehost` 的 `match` 换成无条件
+    /// `pending_for_extra_pane(tpl)`(第一段红)或无条件
+    /// `pending_for_project(tpl, ...)`(第二段红)。
+    #[test]
+    fn a_plain_rehost_skips_tmux_while_a_project_open_insists_on_it() {
+        let mut base = bare();
+        base.commands = vec![AutomationCommand {
+            text: "claude".into(),
+            delay_ms: None,
+        }];
+        let p = project("我的项目", "/srv/app");
+
+        let with_project = plan_for_rehost(&base, Some(&p)).unwrap();
+        let line = String::from_utf8(with_project.steps[0].bytes.clone()).unwrap();
+        assert!(
+            line.contains("exec tmux attach"),
+            "带项目必须 attach: {line}"
+        );
+
+        let plain = plan_for_rehost(&base, None).unwrap();
+        let line = String::from_utf8(plain.steps[0].bytes.clone()).unwrap();
+        assert!(
+            !line.contains("tmux"),
+            "普通换节点仍跳过 tmux(防两块 pane 内容镜像): {line}"
+        );
     }
 
     /// 项目名 sanitize 之后为空 → 宁可什么都不发,也不发 `attach -t ''`。

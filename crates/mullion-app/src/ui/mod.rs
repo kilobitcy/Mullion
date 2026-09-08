@@ -274,6 +274,23 @@ pub struct UiState {
     /// 项目管理弹窗里点了新建/保存/删除 → app 事后据此调 `store`。
     pub project_intent: Option<crate::ui::project_manager::ProjectIntent>,
 
+    // --- F223:打开项目。---
+    /// 「打开这个项目」的请求。`PaneId` 为 `None` = 落在当前焦点 pane 上
+    /// (项目管理器里点的);F225③ 从 pane 标题条发起时带上那块 pane 自己
+    /// —— 点标题条的按钮**不等于**把焦点切过去。
+    pub project_open_request: Option<(
+        mullion_store::ProjectId,
+        Option<mullion_core::layout::PaneId>,
+    )>,
+    /// F223:开之前要问的那一下。`None` = 没什么可丢的,直接开。
+    /// 判据在 `crate::project::plan_open`,不在 UI 里。
+    pub project_open_confirm: Option<crate::ui::project_manager::OpenAsk>,
+    /// F223:**已经定下来**的一次打开(要么压根没什么可问,要么用户点了继续)。
+    /// app.rs 消费后复位,直接拿里面的 `node` 去拨号 —— **不重新算一遍**:
+    /// 确认框开着的那段时间里配置可能已经变了,重算等于用户确认的是 A、
+    /// 实际连的是 B。
+    pub project_open_go: Option<crate::ui::project_manager::OpenAsk>,
+
     // --- P1-b:测试连接(F92)。与 save_click 同构 —— UI 只写意图,
     // 拨测在 app.rs 的施加点起 tokio 任务。---
     /// 「测试连接」被点了。app.rs 消费后复位,按当前表单起一次拨测。
@@ -864,6 +881,23 @@ pub fn build_ui(
             frame.sessions,
             frame.known_hosts,
         );
+    }
+    // F223:打开项目前的确认框。排在项目管理器**之后** —— 它是从那里发起的
+    // 模态,该盖在上面。
+    if let Some(ask) = ui_state.project_open_confirm.clone() {
+        let name = frame
+            .projects
+            .iter()
+            .find(|p| p.id == ask.project)
+            .map_or("(已删除)", |p| p.name.as_str());
+        match project_manager::show_open_confirm(ctx, t, &ask, name) {
+            Some(true) => {
+                ui_state.project_open_confirm = None;
+                ui_state.project_open_go = Some(ask);
+            }
+            Some(false) => ui_state.project_open_confirm = None,
+            None => {}
+        }
     }
     // F2:ssh config 导入预览。排在会话管理器之后 —— 它是从菜单发起的模态,
     // 该盖在会话管理器上面(用户可能是开着管理器时想起来要导入的)。

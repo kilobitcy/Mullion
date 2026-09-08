@@ -322,6 +322,12 @@ fn form_column(
         ui.add_space(SP_XS);
     }
     let blank = draft.name.trim().is_empty() || draft.dir.trim().is_empty();
+    // F223:「打开」拿的是**库里那份**,不是右栏这份草稿 —— 草稿改了没保存
+    // 就打开的话,连过去的是草稿里的目录/tmux 名,而配置库里根本没这回事,
+    // 下次再打开又变回去。所以草稿脏了就先不让开。
+    let stored = projects.iter().find(|p| p.id == id);
+    let dirty = stored != Some(&*draft);
+    let openable = stored.is_some_and(|p| !p.nodes.is_empty()) && !dirty;
     ui.horizontal(|ui| {
         if ui
             .add_enabled(issue.is_none() && !blank, egui::Button::new("保存"))
@@ -330,10 +336,77 @@ fn form_column(
             ui_state.project_intent = Some(ProjectIntent::Save(id, Box::new(draft.clone())));
         }
         ui.add_space(SP_S);
+        if ui
+            .add_enabled(openable, egui::Button::new("打开"))
+            .clicked()
+        {
+            ui_state.project_open_request = Some((id, None));
+        }
+        ui.add_space(SP_S);
         if ui.button("删除项目").clicked() {
             ui_state.project_intent = Some(ProjectIntent::Delete(id));
         }
     });
+    if dirty {
+        ui.add_space(SP_XS);
+        ui.label(
+            egui::RichText::new("有未保存的改动,先保存再打开。")
+                .color(crate::theme::c32(t.fg_muted)),
+        );
+    }
+}
+
+/// F223:开之前要问的那一下。
+///
+/// **节点在问之前就选定了**(`plan_open` 返回时带出来的)—— 确认框开着的那段
+/// 时间里配置完全可能被改(F189 别的实例、或用户自己在管理器里改),问完再
+/// 算一遍就会拨到别处,而用户以为自己确认的是刚才那一下。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenAsk {
+    pub project: ProjectId,
+    pub node: SessionId,
+    pub pane: Option<mullion_core::layout::PaneId>,
+    /// 逐条理由,来自 `crate::project::confirm_reasons`。
+    pub reasons: Vec<&'static str>,
+}
+
+/// F223:打开项目前的确认框。返回 `true` = 用户点了「继续」。
+///
+/// 只在**真有东西会丢**时才会被调用(判据在 `crate::project::plan_open`)。
+/// 高频路径上的无谓确认会被用户练成闭眼点确定,那时它对真正危险的几种也失效。
+pub fn show_open_confirm(
+    ctx: &egui::Context,
+    t: &crate::theme::Theme,
+    ask: &OpenAsk,
+    name: &str,
+) -> Option<bool> {
+    use crate::ui::metrics::{SP_M, SP_S};
+    let mut out = None;
+    egui::Window::new("打开项目前先确认")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            crate::ui::annotate::mark(ui.ctx(), "打开项目确认框".to_string(), ui.max_rect());
+            ui.label(format!(
+                "打开「{name}」会把当前 pane 从现在这条连接上摘下来。"
+            ));
+            ui.add_space(SP_S);
+            for r in &ask.reasons {
+                ui.colored_label(crate::theme::c32(t.danger_text), *r);
+            }
+            ui.add_space(SP_M);
+            ui.horizontal(|ui| {
+                if ui.button("继续打开").clicked() {
+                    out = Some(true);
+                }
+                ui.add_space(SP_S);
+                if ui.button("取消").clicked() {
+                    out = Some(false);
+                }
+            });
+        });
+    out
 }
 
 /// 把校验失败翻成人话。**逐条指出撞在谁身上** —— 只说「名字重复」的话
