@@ -52,8 +52,8 @@ pub use model::{
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
 pub use project::{
-    can_join, project_tmux_name, validate as validate_project, ProjectId, ProjectIssue,
-    ProjectRecord, SameMachine, TmuxNameOwner,
+    can_join, overlay_project, project_tmux_name, validate as validate_project, ProjectId,
+    ProjectIssue, ProjectRecord, SameMachine, TmuxNameOwner,
 };
 pub use secrets_file::Scheme;
 pub use settings::{LogLevel, Settings, CURRENT_SETTINGS_SCHEMA, MAX_FONT_PT, MIN_FONT_PT};

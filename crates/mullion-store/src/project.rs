@@ -58,6 +58,9 @@ pub enum ProjectIssue {
     PreferredNotInNodes,
     /// 节点不是 SSH 会话(SFTP 没有 PTY,attach 过去是一块永远不出字的黑屏)。
     NonSshNode { node: crate::model::SessionId },
+    /// 最终 tmux 名 sanitize 之后是空的。放过去 = 打开项目一个字节都不发
+    /// (`build_plan` 对空名返回空计划),且全程零报错。
+    TmuxNameEmpty,
 }
 
 /// tmux 名撞在谁身上。
@@ -92,6 +95,9 @@ pub fn validate(
         }
     }
     let mine = project_tmux_name(candidate);
+    if mine.is_empty() {
+        return Err(ProjectIssue::TmuxNameEmpty);
+    }
     for other in all.iter().filter(|o| o.id != candidate.id) {
         if other.name == candidate.name {
             return Err(ProjectIssue::DuplicateName { with: other.id });
@@ -112,6 +118,37 @@ pub fn validate(
         }
     }
     Ok(())
+}
+
+// ---- F223 打开项目 = 一次性覆盖 ---------------------------------------
+
+/// F223:把项目的上下文一次性盖在这次连接的自动化配置上。零 IO 纯函数。
+///
+/// **只盖三样**,其余(登录后命令 / env / 各档延时)全留会话自己的:
+///
+/// | 字段 | 覆盖成 | 为什么非盖不可 |
+/// |---|---|---|
+/// | `enabled` | `true` | 会话把总开关关了的话,`build_plan` 直接返回空计划 —— 「打开项目」会静默退化成一次普通换节点,tmux 永远不 attach |
+/// | `tmux` | 项目的 `Attach` | 项目一律走 tmux(设计 P5);会话配的 `Off` 或别的名字都得让位,项目 tmux 是**另一个** session |
+/// | `work_dir` | `p.dir` | 项目是更具体的上下文,盖掉更泛的会话默认值 |
+///
+/// **一次性,绝不写回会话记录**(同 F122 标签覆盖不落盘的姿态):同一台机器
+/// 用户明天可能不带项目直接连,那时候该拿回他自己配的那份。
+///
+/// 会话名不参与:`session_name` 填的是 [`project_tmux_name`],它自己已经在
+/// 「项目没配 tmux 名」时回落到**项目名**而不是会话名(理由见那边)。
+pub fn overlay_project(
+    p: &ProjectRecord,
+    base: &crate::automation::ResolvedAutomation,
+) -> crate::automation::ResolvedAutomation {
+    crate::automation::ResolvedAutomation {
+        enabled: true,
+        tmux: Some(crate::automation::TmuxChoice::Attach {
+            session_name: Some(project_tmux_name(p)),
+        }),
+        work_dir: Some(p.dir.clone()),
+        ..base.clone()
+    }
 }
 
 // ---- F222 同机指纹核对 -------------------------------------------------
@@ -453,6 +490,117 @@ mod tests {
     #[test]
     fn the_schema_version_is_bumped_so_old_clients_refuse_instead_of_dropping_projects() {
         assert_eq!(crate::model::CURRENT_SCHEMA, 10);
+    }
+
+    // ---- F223 打开项目 = 一次性覆盖 -------------------------------------
+
+    /// F223:tmux 名 sanitize 之后是空的,必须在**保存那一刻**拦下来。
+    ///
+    /// 放过去的后果全程静默:`tmux_session_name` 对空名返回 `None`
+    /// → `build_plan` 返回空计划(「宁可什么都不做,也不发 `attach -t ''`」)
+    /// → 打开项目连字节都不发,pane 停在裸 shell。日志、界面、测试全都正常,
+    /// 用户只会觉得「这个项目点了没反应」。
+    ///
+    /// 撞不上 `TmuxNameClash`:那条要有**第二个**同名对象才触发,而第一个
+    /// 空名项目谁也不撞。
+    #[test]
+    fn a_project_whose_tmux_name_sanitizes_to_nothing_is_rejected_at_save_time() {
+        let mut p = helpers::project("我的项目", Some("   "));
+        assert_eq!(project_tmux_name(&p), "", "前提:这个名字确实 sanitize 成空");
+        assert_eq!(
+            crate::validate_project(&p, &[], &[]),
+            Err(crate::ProjectIssue::TmuxNameEmpty)
+        );
+        // 名字本身为空、又没配 tmux 名,同样落到这条上。
+        p = helpers::project("", None);
+        assert_eq!(
+            crate::validate_project(&p, &[], &[]),
+            Err(crate::ProjectIssue::TmuxNameEmpty)
+        );
+    }
+
+    /// 项目一律走 tmux(设计 P5)。会话把自动化总开关关了、或显式配了
+    /// `Off`,**都不能**让项目的 tmux 落空 —— `build_plan` 在 `enabled=false`
+    /// 时直接返回空计划,那时候「打开项目」就退化成一次普通换节点:cd 也不做、
+    /// tmux 也不 attach,而客户端零报错。
+    #[test]
+    fn opening_a_project_forces_tmux_even_when_the_session_switched_automation_off() {
+        for base in [
+            with(false, Some(crate::TmuxChoice::Off)),
+            with(true, Some(crate::TmuxChoice::Off)),
+            with(true, None),
+        ] {
+            let a = crate::overlay_project(&helpers::project("我的项目", None), &base);
+            let plan = crate::build_plan(&a, "web01");
+            assert_eq!(plan.len(), 1, "项目打开必须恰好一步 tmux 计划");
+            let line = String::from_utf8(plan[0].bytes.clone()).unwrap();
+            assert!(line.contains("exec tmux attach"), "{line}");
+        }
+    }
+
+    /// 会话自己配了 tmux 名也得让位:项目的 tmux 是**另一个** session。
+    #[test]
+    fn the_project_tmux_name_wins_over_whatever_the_session_configured() {
+        let base = with(
+            true,
+            Some(crate::TmuxChoice::Attach {
+                session_name: Some("会话自己的".into()),
+            }),
+        );
+        let a = crate::overlay_project(&helpers::project("我的项目", Some("proj-x")), &base);
+        assert_eq!(
+            crate::tmux_session_name(&a, "web01").as_deref(),
+            Some("proj-x")
+        );
+    }
+
+    /// 目录同理:项目是更具体的上下文,盖掉更泛的会话默认值。
+    #[test]
+    fn the_project_directory_replaces_the_session_work_dir() {
+        let mut base = with(true, None);
+        base.work_dir = Some("/home/me".into());
+        let mut p = helpers::project("我的项目", None);
+        p.dir = "/srv/app".into();
+        assert_eq!(
+            crate::overlay_project(&p, &base).work_dir.as_deref(),
+            Some("/srv/app")
+        );
+    }
+
+    /// **只盖这三样。** 用户配在会话上的登录后命令 / env / 各档延时是他自己
+    /// 的东西,项目不该顺手吃掉 —— 那会让「打开项目」和「直接连这台机」跑出
+    /// 两套不同的环境,而差异无处可查。
+    #[test]
+    fn the_overlay_leaves_the_sessions_own_commands_env_and_delays_alone() {
+        let mut base = with(true, None);
+        base.commands = vec![crate::AutomationCommand {
+            text: "claude".into(),
+            delay_ms: None,
+        }];
+        base.env = vec![crate::EnvVar {
+            key: "RUST_LOG".into(),
+            value: "debug".into(),
+        }];
+        base.initial_delay_ms = 777;
+        let a = crate::overlay_project(&helpers::project("我的项目", None), &base);
+        assert_eq!(a.commands, base.commands);
+        assert_eq!(a.env, base.env);
+        assert_eq!(a.initial_delay_ms, 777);
+        assert_eq!(a.inter_delay_ms, base.inter_delay_ms);
+        assert_eq!(a.ready_timeout_ms, base.ready_timeout_ms);
+    }
+
+    fn with(enabled: bool, tmux: Option<crate::TmuxChoice>) -> crate::ResolvedAutomation {
+        crate::ResolvedAutomation {
+            enabled,
+            tmux,
+            commands: Vec::new(),
+            work_dir: None,
+            env: Vec::new(),
+            initial_delay_ms: 300,
+            inter_delay_ms: 200,
+            ready_timeout_ms: 15_000,
+        }
     }
 
     pub(super) mod helpers {

@@ -275,7 +275,6 @@ fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> Stri
     // 已知且接受:竞态窗口极小,「多开一个意外的新会话」也并不比「掉线重连」更好。
     let mut cmd = format!("tmux has-session -t {q} 2>/dev/null || tmux new-session -d -s {q}");
     if let Some(dir) = non_empty(a.work_dir.as_deref()) {
-        // 只挂在 new-session 上:附着已有会话时改它的工作目录是越权。
         cmd.push_str(&format!(" -c {}", shell_quote(dir)));
     }
     let start = start_command(a);
@@ -285,7 +284,7 @@ fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> Stri
     }
     // 新建失败时后面那道 `has-session` 守门同样拦得住 attach,shell 原地活着。
     cmd.push_str(&format!("; {}; ", sync_feature_command()));
-    cmd.push_str(&attach_guarded(&q, detach_others));
+    cmd.push_str(&attach_guarded(&q, detach_others, a.work_dir.as_deref()));
     cmd
 }
 
@@ -294,9 +293,16 @@ fn tmux_command(a: &ResolvedAutomation, name: &str, detach_others: bool) -> Stri
 /// **守门必须留着**:裸的 `exec tmux attach -t X` 在会话不存在时,`exec` 已经把
 /// shell 替换成 tmux 进程,tmux 报错退出 → channel 关闭 → **pane 当场死掉**。
 /// 守门之后 `&&` 短路,shell 原地活着,D4 的「挂提示」和 D8 的「停在裸 shell」才成立。
-fn attach_guarded(quoted_name: &str, detach_others: bool) -> String {
+///
+/// F223:`work_dir` 也挂在 attach 上。`attach-session -c` 改的是 **session 的
+/// 默认工作目录(供新开 window 用)**,不动已经在跑的 shell —— 不这么做的话,
+/// 会话一旦建起来,之后改目录就永远走不到 `new-session -c` 那一支,静默失效。
+fn attach_guarded(quoted_name: &str, detach_others: bool, work_dir: Option<&str>) -> String {
     let d = if detach_others { " -d" } else { "" };
-    format!("tmux has-session -t {quoted_name} 2>/dev/null && exec tmux attach{d} -t {quoted_name}")
+    let c = non_empty(work_dir).map_or_else(String::new, |dir| format!(" -c {}", shell_quote(dir)));
+    format!(
+        "tmux has-session -t {quoted_name} 2>/dev/null && exec tmux attach{d}{c} -t {quoted_name}"
+    )
 }
 
 /// F161/D1+D2:按**实测**会话名接回 tmux 的那一行命令。
@@ -320,7 +326,9 @@ pub fn attach_only_command(name: &str, detach_others: bool) -> String {
     format!(
         "{}; {}",
         sync_feature_command(),
-        attach_guarded(&q, detach_others)
+        // F223 的 `-c` 不给这条路:实测名恢复没有「项目目录」这个上下文,
+        // 凭空塞一个目录进去会改掉用户那个会话此后新开 window 的落点。
+        attach_guarded(&q, detach_others, None)
     )
 }
 
@@ -740,7 +748,8 @@ mod tests {
         let first = text_of(&build_plan(&a, "web01")[0]);
         let again = text_of(&build_plan_reattach(&a, "web01")[0]);
         assert!(
-            again.contains("&& exec tmux attach -d -t 'web01'"),
+            // F223 起 attach 也带 `-c`,`-d` 排在它前面。
+            again.contains("&& exec tmux attach -d -c '/srv' -t 'web01'"),
             "重连要踢掉断线残留的旧 client: {again}"
         );
         assert!(
@@ -748,7 +757,7 @@ mod tests {
             "首次连接不该踢掉别处正 attach 着的 client: {first}"
         );
         assert_eq!(
-            again.replace("attach -d -t", "attach -t"),
+            again.replace("attach -d -c", "attach -c"),
             first,
             "除了 attach 的 -d,重连计划必须与首连计划逐字相同"
         );
@@ -887,8 +896,23 @@ mod tests {
         );
     }
 
+    /// F223:工作目录必须**两支都挂** —— `new-session` 和 `attach`。
+    ///
+    /// 这条推翻了原先「attach 不带 `-c`,附着已有会话时改它的目录是越权」的
+    /// 判断。推翻的依据是 tmux 3.7b man 里 `attach-session -c` 的语义:
+    ///
+    /// > `-c` will set the session working directory (used for new windows)
+    /// > to working-directory.
+    ///
+    /// 它改的是 session 的**默认工作目录**,只影响此后新开的 window/pane,
+    /// 不动已经在跑的那个 shell —— 谈不上越权。
+    ///
+    /// 而只挂 `new-session` 的后果在 F223 下是实打实的坑:项目第一次在
+    /// `/srv/app` 建了会话,之后把目录改成 `/srv/app2`,**下次打开毫无变化**
+    /// —— 走的是 `has-session` 命中 → `attach`,`-c` 那一支根本没执行,
+    /// 而日志、测试、界面全都正常。
     #[test]
-    fn work_dir_becomes_new_session_c_flag_only() {
+    fn work_dir_rides_along_on_attach_too_or_a_changed_dir_never_takes_effect() {
         let mut a = resolved(Some(TmuxChoice::Attach { session_name: None }));
         a.work_dir = Some("/srv/app".into());
         let line = text_of(&build_plan(&a, "web01")[0]);
@@ -896,12 +920,31 @@ mod tests {
             line.contains("new-session -d -s 'web01' -c '/srv/app'"),
             "{line}"
         );
-        // attach 那一段绝不能带工作目录:附着已有会话时改它的目录是越权。
         // F211 之后 attach 是命令的最后一段(不再是 `||` 的左半边)。
         let attach_part = line.split("&& exec tmux attach").nth(1).unwrap();
         assert!(
-            !attach_part.contains("/srv/app"),
-            "attach 段不得带 -c: {line}"
+            attach_part.contains("-c '/srv/app'"),
+            "attach 段也得带 -c,否则改目录对已存在的会话永远不生效: {line}"
+        );
+    }
+
+    /// F223:断线重连那条路径同样要带 `-c`。
+    ///
+    /// 只补首次 attach 的话,重连回来之后新开的 window 又落回旧目录 ——
+    /// 用户看到的是「有时生效有时不生效」,比压根不生效更难查。
+    #[test]
+    fn the_reattach_path_carries_the_working_directory_as_well() {
+        let mut a = resolved(Some(TmuxChoice::Attach { session_name: None }));
+        a.work_dir = Some("/srv/app".into());
+        let line = text_of(&build_plan_reattach(&a, "web01")[0]);
+        let attach_part = line.split("&& exec tmux attach").nth(1).unwrap();
+        assert!(
+            attach_part.contains("-d"),
+            "重连必须踢掉残骸 client: {line}"
+        );
+        assert!(
+            attach_part.contains("-c '/srv/app'"),
+            "重连路径的 attach 也得带 -c: {line}"
         );
     }
 

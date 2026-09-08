@@ -26,6 +26,7 @@ pub mod localtime;
 pub mod logx;
 pub mod pane;
 pub mod profile;
+pub mod project;
 pub mod reconnect;
 pub mod redact;
 pub mod reflow;

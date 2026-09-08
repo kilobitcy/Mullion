@@ -205,6 +205,12 @@ pub struct PaneState {
     /// 发自己的标题,这时必须把会话名清掉,否则标题条上会永久挂着一个已经
     /// 不存在的会话名。
     pub tmux: Option<String>,
+    /// F223:远端**报过标题没有**。粘性置位,只增不清。
+    ///
+    /// 与 `tmux` 分开记,因为 `tmux == None` 是二义的:「上报过、确实不在
+    /// tmux 里」和「还没收到任何上报」在它上面长得一模一样。F223 的断开确认
+    /// 只该拦前一种(判据在 `crate::project::bare_shell`)。
+    pub title_ever_seen: bool,
     /// F17:上一次**报告过**的实际 scrollback 行数,只用于日志去重。
     ///
     /// 拖窗口会连续产生几十次列数变化,每次都落一行「已夹紧」会把日志刷爆;
@@ -504,6 +510,7 @@ impl Workspace {
                 }
                 if st.title_seen {
                     p.tmux = st.tmux;
+                    p.title_ever_seen = true;
                 }
             }
             if inbound.is_empty() {
@@ -688,6 +695,7 @@ pub mod tests_support {
                 last_grid: (80, 24),
                 cwd: None,
                 tmux: None,
+                title_ever_seen: false,
                 history_reported: 0,
                 host_pending: false,
                 notice: None,
@@ -1286,6 +1294,39 @@ mod tests {
             mullion_core::layout::leaves(ws.tree()),
             vec![PaneId(1)],
             "失败时树不该被动"
+        );
+    }
+
+    /// F223:「远端到底报过没有」必须**单独记一笔**,不能拿 `tmux.is_none()`
+    /// 反推。
+    ///
+    /// `tmux == None` 是二义的:既可能是「上报过、确实不在 tmux 里」,也可能
+    /// 是「还没收到任何上报」。F223 的断开确认只该拦前一种;混起来的话,
+    /// 高延迟链路上(本项目主场景)每次打开项目都会在首字节回来之前先弹一个
+    /// 确认框,而 pane 明明好端端在 tmux 里。
+    ///
+    /// 自证会变红:把 `pump` 里的 `p.title_ever_seen = true;` 删掉。
+    #[test]
+    fn whether_the_remote_ever_reported_is_recorded_separately_from_the_tmux_name() {
+        let (first, _probe) = fake_pane(1);
+        let mut ws = Workspace::new(first, 0);
+        let id = PaneId(1);
+
+        assert!(
+            !ws.pane(id).unwrap().title_ever_seen,
+            "一个字节都没收到时,不能声称远端报过"
+        );
+        // 裸 shell 的标题:bash 自己发的 `user@host: dir`,不含 tmux 会话名
+        // (`parse_title` 只在第二段是纯数字窗口号时才认 tmux)。
+        ws.pane_mut(id)
+            .unwrap()
+            .emulator
+            .feed(b"\x1b]2;dev@host: ~/work\x07");
+        ws.pump(0);
+        assert!(ws.pane(id).unwrap().tmux.is_none(), "这条标题里没有 tmux");
+        assert!(
+            ws.pane(id).unwrap().title_ever_seen,
+            "报过了 —— 这才是「确定不在 tmux 里」"
         );
     }
 

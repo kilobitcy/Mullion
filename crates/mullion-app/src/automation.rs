@@ -122,6 +122,40 @@ pub fn pending_for_extra_pane(tpl: &ResolvedAutomation) -> Option<PendingAutomat
     })
 }
 
+/// F223:**打开项目**时那块 pane 该跑什么。`None` = 项目算不出可用的 tmux 名。
+///
+/// 与 [`pending_for_extra_pane`] 只差一件事,但那件事是整个 F223 的命根子:
+/// **走含 tmux 的全套 plan**。换节点骨架现在拿的是 `pending_for_extra_pane`
+/// (故意跳过 tmux,防两块 pane attach 同一 session 内容镜像),照抄过来的话
+/// 打开项目会 cd 到目录、但永远不 attach 项目 tmux —— 设计 P5 静默落空、
+/// F224 的灯永远不亮、访问时间永远不记,**客户端零报错**。
+///
+/// 原「防镜像」的理由在这里不成立:项目 tmux 是**另一个** session,不是本
+/// 标签当初 attach 的那个。
+///
+/// 收 `&ResolvedAutomation` 而不是 `SessionId`+lookup:理由同
+/// [`pending_for_extra_pane`] —— 拨号是真实网络往返,这期间用户完全可能改了
+/// 配置甚至删了会话。项目那份同理,在用户点「打开」那一帧定死。
+///
+/// fallback 名传空串是**刻意**的:[`mullion_store::overlay_project`] 恒把
+/// `session_name` 填成 `Some(project_tmux_name(p))`,回落分支走不到;真传个
+/// 会话名进去反而给「项目名算空了就悄悄用会话名」留了口子,而那正是
+/// `project_tmux_name` 明令禁止的(两个项目共用一个 Claude Code)。
+pub fn pending_for_project(
+    tpl: &ResolvedAutomation,
+    p: &mullion_store::ProjectRecord,
+) -> Option<PendingAutomation> {
+    let overlaid = mullion_store::overlay_project(p, tpl);
+    let steps = mullion_store::build_plan(&overlaid, "");
+    if steps.is_empty() {
+        return None;
+    }
+    Some(PendingAutomation {
+        steps,
+        ready_timeout_ms: overlaid.ready_timeout_ms,
+    })
+}
+
 /// F141:**断线重连**回来的那块 pane 该跑什么 —— 前提是它当初就是 attach 了
 /// tmux 的那一块(判据在 `App::tmux_attach`,不在这里)。
 ///
@@ -319,6 +353,76 @@ mod tests {
         DEFAULT_INITIAL_DELAY_MS, DEFAULT_INTER_DELAY_MS, DEFAULT_READY_TIMEOUT_MS,
     };
     use mullion_store::{AutomationCommand, ResolvedAutomation, SessionId, TmuxChoice};
+
+    // ---- F223 打开项目 -------------------------------------------------
+
+    fn project(name: &str, dir: &str) -> mullion_store::ProjectRecord {
+        mullion_store::ProjectRecord {
+            id: mullion_store::ProjectId(1),
+            name: name.into(),
+            note: String::new(),
+            nodes: Vec::new(),
+            preferred: None,
+            dir: dir.into(),
+            tmux_name: None,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            last_accessed_at: None,
+        }
+    }
+
+    fn bare() -> ResolvedAutomation {
+        ResolvedAutomation {
+            enabled: true,
+            tmux: None,
+            commands: Vec::new(),
+            work_dir: None,
+            env: Vec::new(),
+            initial_delay_ms: 300,
+            inter_delay_ms: 200,
+            ready_timeout_ms: 15_000,
+        }
+    }
+
+    /// **F223 最要命的一条。** 打开项目复用换节点的骨架,而换节点现在拿的是
+    /// `pending_for_extra_pane` —— 那条**故意跳过 tmux**(防两块 pane attach
+    /// 同一 session 内容镜像)。照抄的话:打开项目会 cd 到目录、但**永远不
+    /// attach 项目 tmux**,P5 静默落空、F224 的灯永远不亮、访问时间永远不记,
+    /// 而客户端零报错、日志正常、画面正常。
+    ///
+    /// 原「防镜像」的理由在这里不成立:项目 tmux 是**另一个** session,不是
+    /// 本标签当初 attach 的那个;同一项目开两块 pane 的镜像风险由 F224 的
+    /// attach 前核对兜住。
+    ///
+    /// 自证会变红:把 `pending_for_project` 的函数体换成
+    /// `pending_for_extra_pane(tpl)`。
+    #[test]
+    fn opening_a_project_attaches_its_tmux_instead_of_silently_skipping_it() {
+        let p = pending_for_project(&bare(), &project("我的项目", "/srv/app")).unwrap();
+        assert_eq!(p.steps.len(), 1, "tmux 分支恒一步");
+        let line = String::from_utf8(p.steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("exec tmux attach"), "必须真的 attach: {line}");
+    }
+
+    /// 会话显式关了 tmux 也照样走 attach 分支 —— 项目一律走 tmux(P5)。
+    /// 顺带钉住:`work_dir` 是项目的那份,不是会话的。
+    #[test]
+    fn a_session_that_turned_tmux_off_still_gets_the_projects_tmux_and_directory() {
+        let mut base = bare();
+        base.tmux = Some(TmuxChoice::Off);
+        base.work_dir = Some("/home/me".into());
+        let p = pending_for_project(&base, &project("我的项目", "/srv/app")).unwrap();
+        let line = String::from_utf8(p.steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("exec tmux attach"), "{line}");
+        assert!(line.contains("'/srv/app'"), "目录得是项目的: {line}");
+        assert!(!line.contains("/home/me"), "会话的目录不该出现: {line}");
+    }
+
+    /// 项目名 sanitize 之后为空 → 宁可什么都不发,也不发 `attach -t ''`。
+    /// (保存那一刻已被 `ProjectIssue::TmuxNameEmpty` 拦下,这里是第二道。)
+    #[test]
+    fn a_project_with_no_usable_tmux_name_yields_no_plan_at_all() {
+        assert!(pending_for_project(&bare(), &project("   ", "/srv/app")).is_none());
+    }
 
     /// F128 回归:链路刚死、还在退避重连的那段时间里,在跑的自动化必须**当场**
     /// 取消。判据写成 `== Disconnected` 的话(F128 之前唯一的"死法"),

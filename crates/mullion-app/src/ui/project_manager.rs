@@ -368,6 +368,9 @@ fn issue_text(
         } => format!("tmux 名「{name}」与会话「{}」写死的名字撞车。", sname(*s)),
         I::PreferredNotInNodes => "首选节点不在已勾选的节点里。".to_string(),
         I::NonSshNode { node } => format!("「{}」不是 SSH 会话,不能当项目节点。", sname(*node)),
+        I::TmuxNameEmpty => {
+            "tmux 名去掉非法字符后是空的,请另起一个名字(否则打开项目不会有任何反应)。".to_string()
+        }
     }
 }
 
