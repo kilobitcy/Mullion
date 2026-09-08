@@ -1137,11 +1137,41 @@ mod tests {
         );
     }
 
+    /// 滚右栏的时候,底部那排按钮**不跟着走**。
+    ///
+    /// 这是钉底跟「窗口封顶」两件事的分界:光封顶也能让按钮落在屏幕里,但
+    /// 内容一滚它就跟着跑出去了。判据比对同一颗按钮在「没滚」和「滚到底」
+    /// 两帧里的 y —— 差一点点(<1px)都算它在动。
+    ///
+    /// 自证会变红:把 `TopBottomPanel::bottom` 拆掉,改成排在滚动区之后按
+    /// 顺序画。
+    #[test]
+    fn the_button_row_stays_put_while_the_form_scrolls() {
+        let y = |wheel: f32| {
+            texts_on_a_short_screen(wheel)
+                .into_iter()
+                .find(|(s, _)| s == "删除项目")
+                .expect("「删除项目」压根没画出来")
+                .1
+                .top()
+        };
+        let (rest, scrolled) = (y(0.0), y(-400.0));
+        assert!(
+            (rest - scrolled).abs() < 1.0,
+            "滚了一下按钮就从 y={rest} 挪到了 y={scrolled} —— 它没钉住"
+        );
+    }
+
     /// 测试屏幕的逻辑高度。矮到右栏内容(约 640px)必然装不下。
     const SHORT_H: f32 = 420.0;
 
     /// 在一块 1000x420 的屏幕上画两帧,收全部文字**和它们的位置**。
     fn form_texts_on_a_short_screen() -> Vec<(String, egui::Rect)> {
+        texts_on_a_short_screen(0.0)
+    }
+
+    /// 同上,但先往右栏滚 `wheel` 个像素(负数 = 往下滚)。
+    fn texts_on_a_short_screen(wheel: f32) -> Vec<(String, egui::Rect)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
@@ -1164,17 +1194,31 @@ mod tests {
         let lamps = std::collections::BTreeMap::new();
         let ps = vec![p];
         let sessions: Vec<SessionRecord> = Vec::new();
-        let input = || egui::RawInput {
+        // 指针停在右栏中间,滚轮才落到那个滚动区上。
+        let hover = egui::pos2(700.0, SHORT_H / 2.0);
+        let input = |scroll: f32| egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1000.0, SHORT_H),
             )),
+            events: if scroll == 0.0 {
+                vec![egui::Event::PointerMoved(hover)]
+            } else {
+                vec![
+                    egui::Event::PointerMoved(hover),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, scroll),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            },
             ..Default::default()
         };
         let mut shapes = Vec::new();
-        for _ in 0..2 {
+        for i in 0..3 {
             shapes = ctx
-                .run(input(), |ctx| {
+                .run(input(if i == 1 { wheel } else { 0.0 }), |ctx| {
                     show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
                 })
                 .shapes;
