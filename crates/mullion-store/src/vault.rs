@@ -790,6 +790,20 @@ impl Vault {
         Ok(())
     }
 
+    /// F224:记一笔访问时间。`now` 由调用方给(store 不持有时钟)。
+    ///
+    /// **只改这一个字段**,且不跑 `validate` —— 记一笔访问不该因为库里
+    /// 别处有个撞名的老项目就失败;真要拦,拦在保存那一刻,不是这里。
+    ///
+    /// 调用时机见 `app::project::newly_entered`:**跃迁触发**。照字面
+    /// 「命中就记」会变成每几秒往 `sessions.toml` 写一次盘。
+    pub fn touch_project_accessed(&mut self, id: crate::project::ProjectId, now: &str) {
+        self.sync_from_disk_if_untouched();
+        if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
+            slot.last_accessed_at = Some(now.to_string());
+        }
+    }
+
     pub fn delete_project(&mut self, id: crate::project::ProjectId) -> Result<(), StoreError> {
         self.sync_from_disk_if_untouched();
         self.projects.retain(|p| p.id != id);
@@ -2613,7 +2627,7 @@ port = 7891
             checked += 1;
         }
         assert!(
-            checked >= 22,
+            checked >= 24,
             "只扫到 {checked} 个 mutator,切片逻辑多半失效了(退化成恒绿)"
         );
     }
@@ -2755,6 +2769,46 @@ path = "/var/log"
         let stored = v.projects().iter().find(|p| p.id == b).unwrap();
         assert_eq!(stored.name, "api", "被拒的更新不该改掉名字");
         assert_eq!(stored.dir, "/srv/api", "被拒的更新不该改掉目录");
+    }
+
+    /// F224:记一笔访问时间。**只动这一个字段**,别的一律不碰 ——
+    /// 这条入口每次真实开项目都会走一遍,顺手重建整份记录的话,用户在别处
+    /// 改的配置会被这一下静默盖回去。
+    #[test]
+    fn recording_a_visit_writes_only_the_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_project("web".into(), "/srv/web".into(), "2026-09-01T00:00:00Z");
+        let before = v.projects().iter().find(|p| p.id == id).unwrap().clone();
+        assert_eq!(before.last_accessed_at, None, "刚建的项目没有访问时间");
+
+        v.touch_project_accessed(id, "2026-09-08T10:00:00Z");
+
+        let after = v.projects().iter().find(|p| p.id == id).unwrap();
+        assert_eq!(
+            after.last_accessed_at.as_deref(),
+            Some("2026-09-08T10:00:00Z")
+        );
+        assert_eq!(
+            after,
+            &crate::project::ProjectRecord {
+                last_accessed_at: after.last_accessed_at.clone(),
+                ..before
+            },
+            "除了访问时间以外的字段被动过了"
+        );
+    }
+
+    /// 记到一个已经被删掉的项目上是 no-op,不是 panic —— 上报是异步到达的,
+    /// 用户完全可能在 attach 落地前就把项目删了。
+    #[test]
+    fn recording_a_visit_on_a_deleted_project_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_project("web".into(), "/srv/web".into(), "2026-09-01T00:00:00Z");
+        v.delete_project(id).unwrap();
+        v.touch_project_accessed(id, "2026-09-08T10:00:00Z");
+        assert!(v.projects().is_empty());
     }
 
     fn draft() -> SessionDraft {

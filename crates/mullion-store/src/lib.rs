@@ -16,6 +16,7 @@ pub mod master_key;
 pub mod migrate;
 pub mod model;
 pub mod network;
+pub mod presence;
 pub mod project;
 pub mod secrets_file;
 pub mod settings;
@@ -51,6 +52,10 @@ pub use model::{
     Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
+pub use presence::{
+    presence_dir, presence_path, publish as publish_presence, read_others as read_other_presence,
+    sweep as sweep_presence, PRESENCE_DIR,
+};
 pub use project::{
     can_join, overlay_project, project_tmux_name, validate as validate_project, ProjectId,
     ProjectIssue, ProjectRecord, SameMachine, TmuxNameOwner,

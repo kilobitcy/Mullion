@@ -83,6 +83,81 @@ pub fn plan_open(p: &mullion_store::ProjectRecord, risk: AtRisk) -> OpenStep {
     }
 }
 
+/// F224:项目的运行指示灯。**三态,「灭」不许拿来冒充「未知」**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lamp {
+    /// 有 pane(本实例或别的实例)正 attach 在这个项目的 tmux 会话上。
+    Lit,
+    /// 本地所有实例的 pane **都已上报**且无一命中。
+    Dark,
+    /// 还有 pane 没上报过 —— 它可能正 attach 在这个项目里。
+    Unknown,
+}
+
+/// F224:一盏灯。`panes` 是本机**所有实例**每块 pane 的
+/// `(是否上报过, 上报的 tmux 名)`;`others` 是别的实例心跳文件里那批
+/// tmux 名(它们的 pane 我们看不见,只能信心跳)。
+///
+/// 判据就是 P7 的那张三态表,**不另造一套记账**:「项目 X 在跑」= 有 pane
+/// 报出的 tmux 名等于 `project_tmux_name(X)`。这样一来,用户不走项目入口、
+/// 直接连会话 attach 进那个会话,灯照样亮 —— 两套记账才会出现「明明在跑
+/// 灯却不亮」。
+///
+/// 「灭」**故意不要求远端核对过**:核对只在 attach 前那一刻发生,要求它的话
+/// 「灭」永远不可达,三态实际退化成两态。它的已知盲区(非 Mullion 的 client,
+/// 比如 PowerShell 直接 ssh 上去 attach)由 attach 前的远端核对兜底 ——
+/// 那才是产生后果的时刻。
+pub fn lamp(project_tmux: &str, panes: &[(bool, Option<&str>)], others: &[String]) -> Lamp {
+    if project_tmux.is_empty() {
+        return Lamp::Dark;
+    }
+    if others.iter().any(|n| n == project_tmux) {
+        return Lamp::Lit;
+    }
+    if panes.iter().any(|(_, name)| *name == Some(project_tmux)) {
+        return Lamp::Lit;
+    }
+    if panes.iter().any(|(seen, _)| !seen) {
+        return Lamp::Unknown;
+    }
+    Lamp::Dark
+}
+
+/// F224:此刻**正命中**的项目集合。
+///
+/// `reports` 是各 pane 上报的 tmux 名(只收上报过的那些)。
+pub fn hits(
+    projects: &[mullion_store::ProjectRecord],
+    reports: &[&str],
+) -> std::collections::BTreeSet<mullion_store::ProjectId> {
+    projects
+        .iter()
+        .filter(|p| {
+            let name = mullion_store::project_tmux_name(p);
+            !name.is_empty() && reports.iter().any(|r| *r == name)
+        })
+        .map(|p| p.id)
+        .collect()
+}
+
+/// F224:该给哪些项目记一笔访问时间。
+///
+/// **跃迁触发,不是电平触发。** 上报是持续的(每几秒一批),照字面「命中就
+/// 更新」等于**每几秒往 `sessions.toml` 写一次盘** —— 切片 T-b 的原话是
+/// 「播报判据是跃迁不是当前状态」,这里是同一个坑。
+///
+/// pane 断开再接回、或从项目 A 的 tmux 切到项目 B,都会先离开集合再进来,
+/// 于是各自是一次新的跃迁 —— 该记的都记得上。
+///
+/// 「非 `Completed` 的结局不记」(等首字节超时 / 用户接管 / 断线,T11)被这条
+/// 判据**自动蕴含**:那些结局下 attach 压根没发生,命中上报永远到不了。
+pub fn newly_entered(
+    prev: &std::collections::BTreeSet<mullion_store::ProjectId>,
+    now: &std::collections::BTreeSet<mullion_store::ProjectId>,
+) -> Vec<mullion_store::ProjectId> {
+    now.difference(prev).copied().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +303,120 @@ mod tests {
                 })
             )
         );
+    }
+
+    // ---- F224 灯与访问时间 ----------------------------------------------
+
+    /// 三态各一条。
+    ///
+    /// 自证会变红:把 `lamp` 里 `panes.iter().any(|(seen, _)| !seen)` 那一段
+    /// 删掉(第三段红 —— 「未知」会被冒充成「灭」)。
+    #[test]
+    fn the_lamp_has_three_states_and_unknown_is_not_allowed_to_masquerade_as_dark() {
+        // 亮:有 pane 报出这个名字。
+        assert_eq!(
+            lamp("proj-x", &[(true, Some("proj-x")), (true, None)], &[]),
+            Lamp::Lit
+        );
+        // 灭:所有 pane 都上报过,无一命中。
+        assert_eq!(
+            lamp("proj-x", &[(true, Some("别的")), (true, None)], &[]),
+            Lamp::Dark
+        );
+        // 未知:还有 pane 没上报过 —— 它可能正 attach 在这个项目里。
+        assert_eq!(
+            lamp("proj-x", &[(false, None), (true, Some("别的"))], &[]),
+            Lamp::Unknown
+        );
+    }
+
+    /// 一块 pane 都没有(刚启动、只有 launcher)也是**灭**,不是未知 ——
+    /// 没有任何「可能正 attach 着」的候选。
+    #[test]
+    fn no_panes_at_all_is_dark_not_unknown() {
+        assert_eq!(lamp("proj-x", &[], &[]), Lamp::Dark);
+    }
+
+    /// 别的实例的心跳同样点亮 —— 多开是本项目的主场景,只看自己那几块 pane
+    /// 的话,另一个窗口里正跑着的项目在这边显示为「灭」,用户会去开第二份。
+    ///
+    /// 而且它**盖过「未知」**:心跳是确凿证据,不该被一块还没上报的 pane 拖成未知。
+    #[test]
+    fn another_instances_heartbeat_lights_the_lamp_even_while_our_own_panes_are_silent() {
+        assert_eq!(
+            lamp("proj-x", &[(false, None)], &["proj-x".to_string()]),
+            Lamp::Lit
+        );
+    }
+
+    /// **P7 的自证**:判据是「上报的 tmux 名」,不是「我们从项目入口打开过」。
+    ///
+    /// 用户不走项目入口、直接连会话 attach 进那个 tmux 会话,一样算命中。
+    /// 只钉项目入口那条路的话这条恒绿 —— 所以这里刻意不经过任何项目入口。
+    #[test]
+    fn a_tmux_session_entered_the_ordinary_way_still_counts_as_the_project_running() {
+        let mut p = proj(&[7], None);
+        p.name = "我的项目".into();
+        p.tmux_name = Some("proj-x".into());
+        assert_eq!(
+            hits(std::slice::from_ref(&p), &["proj-x"]),
+            [p.id].into_iter().collect()
+        );
+    }
+
+    /// tmux 名算空的项目**不许命中** —— `reports` 里混进一个空串(远端报了
+    /// 一条怪标题)就会把所有空名项目一起点亮。
+    #[test]
+    fn a_project_with_an_empty_tmux_name_never_matches_anything() {
+        let mut p = proj(&[7], None);
+        p.name = "   ".into();
+        assert!(mullion_store::project_tmux_name(&p).is_empty(), "前提");
+        assert!(hits(std::slice::from_ref(&p), &[""]).is_empty());
+    }
+
+    /// **跃迁触发,不是电平触发。** 这条是防「每几秒往 `sessions.toml` 写
+    /// 一次盘」的唯一闸(切片 T-b 的原话:播报判据是跃迁不是当前状态)。
+    ///
+    /// 自证会变红:把 `newly_entered` 改成 `now.iter().copied().collect()`。
+    #[test]
+    fn two_consecutive_batches_of_the_same_hit_only_record_one_visit() {
+        use std::collections::BTreeSet;
+        let a: BTreeSet<_> = [mullion_store::ProjectId(1)].into_iter().collect();
+        assert_eq!(
+            newly_entered(&BTreeSet::new(), &a),
+            vec![mullion_store::ProjectId(1)],
+            "第一批命中要记一笔"
+        );
+        assert!(
+            newly_entered(&a, &a).is_empty(),
+            "同一个项目连续命中只记一笔,否则每几秒写一次盘"
+        );
+    }
+
+    /// 断开再接回 / 从项目 A 切到项目 B,都是**新的**跃迁,各记各的。
+    #[test]
+    fn leaving_and_coming_back_is_a_fresh_visit() {
+        use std::collections::BTreeSet;
+        let a: BTreeSet<_> = [mullion_store::ProjectId(1)].into_iter().collect();
+        let none = BTreeSet::new();
+        assert!(newly_entered(&a, &none).is_empty(), "离开不记");
+        assert_eq!(
+            newly_entered(&none, &a),
+            vec![mullion_store::ProjectId(1)],
+            "回来再记一笔"
+        );
+    }
+
+    /// **钉住 T11 的那条蕴含关系。** 等首字节超时 / 用户接管 / 断线这些结局下
+    /// attach 压根没发出去,于是远端永远不会报出项目的 tmux 名 —— 命中集合恒空,
+    /// 访问时间自然不记。不必为它单独接线,但这条推论要有守护,否则日后有人
+    /// 「顺手」把访问时间挂到点击那一刻,列表就会被失败的尝试污染。
+    #[test]
+    fn an_attach_that_never_went_out_leaves_no_hit_and_therefore_no_visit() {
+        let p = proj(&[7], None);
+        // 没发出去 = 远端没报过这个名字。上报里全是别的东西(或干脆没有)。
+        assert!(hits(std::slice::from_ref(&p), &[]).is_empty());
+        assert!(hits(std::slice::from_ref(&p), &["别的会话"]).is_empty());
     }
 
     /// 没节点时**先拒绝,不问** —— 反过来的话用户点完「确定」才被告知
