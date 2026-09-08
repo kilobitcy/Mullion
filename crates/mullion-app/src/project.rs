@@ -738,13 +738,27 @@ mod tests {
         assert_eq!(fresh_project_name(&ps), "新项目 2");
     }
 
-    /// 找**第一个空号**,不是 max+1:删掉「新项目」再点添加,给出的应该是
-    /// 「新项目」,而不是跳过一堆空号变成「新项目 4」。
-    ///
-    /// 自证会变红:把实现改成先数出最大后缀再 +1。
+    /// 「新项目」被删了就把它让出来的号补回去,不是接着往后排。
     #[test]
-    fn the_lowest_free_number_is_reused_after_a_deletion() {
+    fn the_base_name_is_reused_once_it_is_free_again() {
         let ps = vec![pr("新项目 2", "/a", &[]), pr("新项目 3", "/b", &[])];
         assert_eq!(fresh_project_name(&ps), "新项目");
+    }
+
+    /// 找**第一个空号**,不是 max+1、也不是 len+1。
+    ///
+    /// **中间有空号**才分得出这几种实现:`["新项目", "新项目 3"]` 下补空号给
+    /// 「新项目 2」,而 max+1 给「新项目 4」、len+1 给「新项目 3」—— 后者直接
+    /// 撞名,建出来的记录必然存不进去。
+    ///
+    /// 这条是补上来的:原来那两条用例里,`len()+1` 一条走早退分支、一条数值
+    /// 恰好撞巧,变异**杀不掉** —— 判据看着有,其实是恒绿的。
+    ///
+    /// 自证会变红:把实现的 `(2..)...find` 换成
+    /// `format!("{BASE} {}", existing.len() + 1)`。
+    #[test]
+    fn the_lowest_free_number_is_picked_not_the_highest_plus_one() {
+        let ps = vec![pr("新项目", "/a", &[]), pr("新项目 3", "/b", &[])];
+        assert_eq!(fresh_project_name(&ps), "新项目 2");
     }
 }
