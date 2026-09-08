@@ -9,6 +9,7 @@ pub mod automation;
 pub mod bands;
 pub mod cli;
 pub mod clipboard;
+pub mod clipboard_remote;
 pub mod diag;
 pub mod dragout;
 pub mod edit;
