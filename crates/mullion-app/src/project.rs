@@ -158,9 +158,101 @@ pub fn newly_entered(
     now.difference(prev).copied().collect()
 }
 
+// ---- F224 attach 前的远端二次核对 --------------------------------------
+
+/// 核对命令:这个 tmux 会话此刻挂着几个 client。
+///
+/// 走**独立的 exec channel**,不进 PTY —— PTY 那边此刻是一个干净的 shell
+/// 停在提示符上,往里写字节会破坏「恰好一个 Step」这条不变量。
+///
+/// `2>/dev/null`:会话不存在时 tmux 往 stderr 喷一行错,而「不存在」正是
+/// 最常见的正常情况(第一次打开这个项目),不该在日志里当异常记。
+pub fn list_clients_command(tmux: &str) -> Vec<u8> {
+    let mut out = b"tmux list-clients -t ".to_vec();
+    out.extend_from_slice(&mullion_ssh::exec::shell_quote(tmux.as_bytes()));
+    out.extend_from_slice(b" 2>/dev/null");
+    out
+}
+
+/// 上面那条命令的输出里有几个 client。
+///
+/// **一行一个 client**。空行不算 —— 会话不存在时 tmux 什么都不输出,而
+/// `"".lines()` 给出零行、`"\n".lines()` 给出一个空行,后者会被数成 1
+/// 然后弹一个「已在别处打开」的确认框,而实际上一个人都没有。
+pub fn clients_in_output(stdout: &str) -> usize {
+    stdout.lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// 核对结论 → 要不要停下来问用户。`Some(n)` = 有 n 个客户端挂着,得问;
+/// `None` = 直接按现状(不带 `-d`)发。
+///
+/// 入参的 `None` 是「核对本身没跑成」,**按无人处理**(fail-open),
+/// 理由见 `a_check_that_could_not_run_is_treated_as_nobody_being_attached`。
+pub fn takeover_needed(clients: Option<usize>) -> Option<usize> {
+    clients.filter(|n| *n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 核对失败(exec 起不来 / 账号被 `ForceCommand` 挡住 / 远端根本没有
+    /// tmux)必须**按无人处理**,而不是当成「有人」去弹确认框。
+    ///
+    /// 这里刻意 fail-open,与本项目其余安全判据(TOFU 那类)相反,理由是
+    /// 两边的失败代价不对称:fail-closed 的话,凡是 exec 通不了的环境
+    /// (sftp-only 账号、老 tmux)每次打开项目都要被问一句「已在别处打开
+    /// (0 个客户端)」——一句我们根本没证据支持的话,而用户唯一学得会的
+    /// 反应是闭眼点继续,那时它对真有人挂着的那次也一起失效。
+    ///
+    /// 自证会变红:把 `takeover_needed` 的 `None` 分支改成 `Some(0)` 之外
+    /// 的任何值。
+    #[test]
+    fn a_check_that_could_not_run_is_treated_as_nobody_being_attached() {
+        assert_eq!(takeover_needed(None), None);
+        assert_eq!(takeover_needed(Some(0)), None);
+        assert_eq!(takeover_needed(Some(2)), Some(2));
+    }
+
+    /// 核对命令必须把会话名**引起来**:tmux 名允许空格与 CJK
+    /// (`sanitize_tmux_name` 只滤控制字符和几个定址前缀),不引的话
+    /// `我的 项目` 会被 shell 拆成两个参数,核对恒查错东西。
+    #[test]
+    fn the_check_command_quotes_the_session_name() {
+        let cmd = String::from_utf8(list_clients_command("我的 项目")).unwrap();
+        assert_eq!(cmd, "tmux list-clients -t '我的 项目' 2>/dev/null");
+    }
+
+    /// 名字里的单引号不许越出参数边界 —— 越出去就是远端任意命令执行。
+    #[test]
+    fn a_single_quote_in_the_name_cannot_escape_the_argument() {
+        let cmd = String::from_utf8(list_clients_command("a'; id; echo '")).unwrap();
+        assert_eq!(
+            cmd,
+            r#"tmux list-clients -t 'a'\''; id; echo '\''' 2>/dev/null"#
+        );
+    }
+
+    /// **空输出 = 没人**,不是一个人。
+    ///
+    /// 自证会变红:把 `clients_in_output` 改成 `stdout.lines().count()`
+    /// (第二段红:一个尾随换行会被数成 1,于是每次打开一个**没人用**的
+    /// 项目都弹一次「已在别处打开」)。
+    #[test]
+    fn an_empty_listing_means_nobody_is_attached() {
+        assert_eq!(clients_in_output(""), 0);
+        assert_eq!(clients_in_output("\n"), 0);
+        assert_eq!(clients_in_output("   \n \n"), 0);
+    }
+
+    #[test]
+    fn each_line_of_the_listing_is_one_client() {
+        assert_eq!(clients_in_output("/dev/pts/3: 0 [80x24 xterm]\n"), 1);
+        assert_eq!(
+            clients_in_output("/dev/pts/3: 0 [80x24]\n/dev/pts/9: 0 [120x40]\n"),
+            2
+        );
+    }
 
     #[test]
     fn nothing_at_risk_means_no_confirmation_at_all() {

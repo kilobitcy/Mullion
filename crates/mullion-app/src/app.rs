@@ -237,6 +237,25 @@ pub enum UserEvent {
         query: crate::files::owners::Query,
         stdout: Option<Vec<u8>>,
     },
+    /// F224:一次 `tmux list-clients` 核对回来了 —— attach 项目 tmux **之前**
+    /// 先问远端「这个会话此刻还挂着谁」。
+    ///
+    /// **计划和 sink 随事件一起走**,不在 `App` 上开一张在途表:这次核对的
+    /// 寿命完全挂在这条事件上,而 `wind_down`(关整个标签)对在途 task 直接
+    /// `abort()` —— 那条事件永远不会抵达(T11 的配套教训:凡是把生命周期挂在
+    /// `AutomationDone` 一类事件上的队列,都要在驱动处按世代号兜底回收)。
+    /// 带在事件里就没有队列可堆:标签没了,这条事件的世代号对不上,原地丢掉。
+    ///
+    /// `clients: None` = 核对本身没跑成,**按无人处理**(见
+    /// `project::takeover_needed`)。`Box`:`PendingAutomation` 比其余变体
+    /// 大得多,不装箱会撑大整个枚举(同 `HostKeyPrompt`)。
+    ProjectClientsChecked {
+        generation: u64,
+        pane: PaneId,
+        clients: Option<usize>,
+        plan: Box<crate::automation::PendingAutomation>,
+        sink: Arc<mullion_ssh::session::SshSession>,
+    },
     /// D2/F54:一次远端写操作跑完了。`Ok(())` = 成功,`Err` = 已经格式化好的
     /// 可读原因。**按世代路由**(S1):用户在一次网络往返期间切了标签,结果
     /// 也要回到发起它的那个标签,不是当前活动标签。
@@ -402,6 +421,18 @@ struct AutomationHandle {
     disconnect: Option<tokio::sync::oneshot::Sender<()>>,
     /// 换新连接时 abort:旧那次的结论对新连接没有意义。
     task: tokio::task::JoinHandle<()>,
+}
+
+/// F224:核对到「已在别处打开」、正等用户拍板的那次打开。
+///
+/// **单槽而不是队列**:它一挂上就是模态(`Modal::ProjectTakeoverConfirm`),
+/// 用户不答复就发不起第二次打开,天然只有一个在途。槽里那份被新的一次盖掉
+/// 也不会静默走样 —— 拍板时按 `generation`/`pane` 路由,对不上就丢。
+struct ProjectTakeover {
+    generation: u64,
+    pane: PaneId,
+    plan: crate::automation::PendingAutomation,
+    sink: Arc<mullion_ssh::session::SshSession>,
 }
 
 /// F163:发完 attach 之后再宽限这么久才下「没接上」的结论。
@@ -2213,6 +2244,8 @@ pub struct App {
     edit: EditState,
     /// F163:在途的 attach 校验,`drive_attach_checks` 每帧推进。
     attach_checks: Vec<AttachCheck>,
+    /// F224:正等用户拍板要不要把别处的客户端踢下线的那次打开。
+    project_takeover: Option<ProjectTakeover>,
 }
 
 /// F55:一条传输 job 从入队到落地牵扯到的全部状态。
@@ -2388,6 +2421,12 @@ enum Modal {
     /// **不进 `touched_store`**:它一行 store 都不写(F224 的访问时间是连上
     /// 之后才记的,不在这里)。
     ProjectOpenConfirm,
+    /// F224:「项目已在别处打开」的踢人确认框。里面没有输入框,但有一颗
+    /// 一按就把别人的 tmux 客户端踢下线的按钮,而空格/回车在 egui 里是按钮
+    /// 的激活键 —— 同 `Modal::ProjectOpenConfirm` 的理由(T8)。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写。
+    ProjectTakeoverConfirm,
     /// E2/E3:标签属性弹窗(改名 + 配色)。里面有名字输入框 —— 不算模态的话
     /// 敲的字会同时发给远端 shell(T8)。
     TabProps,
@@ -2438,6 +2477,7 @@ impl Modal {
         Modal::GroupManager,
         Modal::ProjectManager,
         Modal::ProjectOpenConfirm,
+        Modal::ProjectTakeoverConfirm,
         Modal::TabProps,
         Modal::ExitConfirm,
         Modal::Rehost,
@@ -2534,6 +2574,7 @@ impl App {
             transfer: TransferState::new(),
             edit: EditState::new(),
             attach_checks: Vec::new(),
+            project_takeover: None,
         }
     }
 
@@ -3622,6 +3663,7 @@ impl App {
             Modal::GroupManager => self.ui.group_manager_open,
             Modal::ProjectManager => self.ui.project_manager_open,
             Modal::ProjectOpenConfirm => self.ui.project_open_confirm.is_some(),
+            Modal::ProjectTakeoverConfirm => self.ui.project_takeover.is_some(),
             // E2/E3:标签属性弹窗里有名字输入框 —— 不算模态的话,敲的字会
             // 同时被发给远端 shell(T8)。
             Modal::TabProps => self.ui.tab_props.is_some(),
@@ -7052,8 +7094,175 @@ impl App {
             None => plan,
         };
         if let Some(plan) = plan {
+            // F224:带闸的计划(只有「打开项目」填得出来)先问一句远端
+            // 「这个 tmux 还挂着谁」,问完、必要时等用户拍板,**才**发字节。
+            // 这里的 `return` 不能省:省了就是核对照跑、字节照发,而那一支
+            // 恒不带 `-d` —— 弹窗承诺的「踢下线」永远不会发生,且全程静默。
+            //
+            // 上面那段 OSC 7 注入不在闸内:它跟 attach 哪个 tmux 无关,而且
+            // 用户就算取消,这块 pane 也已经落在新连接上了(换节点本身撤不
+            // 回来),那条 shell 该报目录还是要报。
+            if plan.gate.is_some() {
+                self.check_project_clients(generation, pane, plan, sink);
+                return;
+            }
             self.start_automation(generation, pane, plan, sink);
         }
+    }
+
+    /// F224:问远端「项目那个 tmux 此刻挂着几个 client」,结果经
+    /// `UserEvent::ProjectClientsChecked` 回送。
+    ///
+    /// 走**独立的 exec channel**,不进 PTY:PTY 那头此刻是一个干净的 shell
+    /// 停在提示符上,「恰好一个 Step」这条不变量要求这期间没人往里写。等用户
+    /// 确认可以任意长 —— 那只是一个 bash 提示符在远端闲着。
+    ///
+    /// 拿不到连接句柄就**直接发**(不带 `-d`),不是卡住也不是报错:核对是
+    /// 一道好意的提醒,把「打开项目」整个卡死在提醒失败上,代价比它防的那件事
+    /// 大得多(同 `takeover_needed` 的 fail-open 姿态)。
+    fn check_project_clients(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        plan: crate::automation::PendingAutomation,
+        sink: Arc<mullion_ssh::session::SshSession>,
+    ) {
+        let tmux = plan.gate.as_ref().map_or(String::new(), |g| g.tmux.clone());
+        let Some(conn) = self.pane_connection(generation, pane) else {
+            log::debug!(target: "mullion", "项目 attach 前核对:拿不到连接句柄,按无人处理");
+            self.resume_gated_open(
+                generation,
+                pane,
+                crate::automation::GateVerdict::Nobody,
+                plan,
+                sink,
+            );
+            return;
+        };
+        let proxy = self.proxy.clone();
+        self._runtime.spawn(async move {
+            let cmd = crate::project::list_clients_command(&tmux);
+            let clients = match mullion_ssh::exec::exec(&conn, cmd).await {
+                // 退出码**不看**:会话不存在时 tmux 返回 1,而那正是最常见的
+                // 正常情况(第一次打开这个项目)——输出为空,数出来就是 0。
+                Ok(out) => Some(crate::project::clients_in_output(&String::from_utf8_lossy(
+                    &out.stdout,
+                ))),
+                Err(e) => {
+                    log::debug!(target: "mullion", "项目 attach 前核对没跑成:{e}");
+                    None
+                }
+            };
+            let _ = proxy.send_event(UserEvent::ProjectClientsChecked {
+                generation,
+                pane,
+                clients,
+                plan: Box::new(plan),
+                sink,
+            });
+        });
+    }
+
+    /// F224:核对回来了 —— 没人挂着就直接发,有人就停下来问。
+    ///
+    /// 标签在这次往返期间被关掉了 → 原地丢掉,一个字节都不发。
+    fn accept_project_clients(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        clients: Option<usize>,
+        plan: crate::automation::PendingAutomation,
+        sink: Arc<mullion_ssh::session::SshSession>,
+    ) {
+        if self.tabs.by_generation(generation).is_none() {
+            return;
+        }
+        match crate::project::takeover_needed(clients) {
+            None => self.resume_gated_open(
+                generation,
+                pane,
+                crate::automation::GateVerdict::Nobody,
+                plan,
+                sink,
+            ),
+            Some(n) => {
+                self.ui.project_takeover = Some(crate::ui::project_manager::TakeoverAsk {
+                    project: plan
+                        .gate
+                        .as_ref()
+                        .map_or(String::new(), |g| g.project.clone()),
+                    clients: n,
+                });
+                self.project_takeover = Some(ProjectTakeover {
+                    generation,
+                    pane,
+                    plan,
+                    sink,
+                });
+                mark_ui_dirty!(self.ui_dirty);
+            }
+        }
+    }
+
+    /// F224:用户在「已在别处打开」确认框里拍了板。
+    ///
+    /// 取消 → 槽一取就丢,一个字节都不发,访问时间也不记(那条由命中上报
+    /// 驱动,attach 没发生就永远不命中)。这块 pane 停在一个干净的 shell 上
+    /// —— 换节点本身撤不回来,但项目 tmux 确实没被碰。
+    ///
+    /// 确认 → `apply_gate` 换上带 `-d` 的那一支再发,与弹窗里那句
+    /// 「会把对方踢下线」一致。
+    fn finish_project_takeover(&mut self, confirmed: bool) {
+        let Some(t) = self.project_takeover.take() else {
+            return;
+        };
+        let verdict = if confirmed {
+            crate::automation::GateVerdict::TakeOver
+        } else {
+            crate::automation::GateVerdict::Cancel
+        };
+        self.resume_gated_open(t.generation, t.pane, verdict, t.plan, t.sink);
+    }
+
+    /// F224:闸过完了 —— 把定稿的计划交回 `on_pane_ready`。
+    ///
+    /// **不直接调 `self.start_automation`**:那条「整个文件里只有一个调用点」
+    /// 的守护(`every_pane_ready_path_goes_through_on_pane_ready`)是本项目
+    /// 防「新的 pane 建立路径漏掉 OSC 7 注入」的唯一闸门,在这儿多开一个
+    /// 调用点等于顺手把闸门拆了。
+    ///
+    /// `may_clear_screen = false`:OSC 7 那段在第一遍就已经发过了,再发一次
+    /// 会把这期间远端已经输出的东西清掉(同 F156-c 断线重连不清屏的理由)。
+    ///
+    /// 递归终止靠 `apply_gate` 恒把 `gate` 摘掉 —— 第二遍走不进闸。
+    fn resume_gated_open(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        verdict: crate::automation::GateVerdict,
+        plan: crate::automation::PendingAutomation,
+        sink: Arc<mullion_ssh::session::SshSession>,
+    ) {
+        // 等待期间标签被关掉了 → 丢,一个字节都不发。
+        if self.tabs.by_generation(generation).is_none() {
+            return;
+        }
+        let Some(plan) = crate::automation::apply_gate(plan, verdict) else {
+            return;
+        };
+        self.on_pane_ready(generation, pane, sink, Some(plan), false);
+    }
+
+    /// F224:这块 pane 所在那台机器的连接句柄。
+    ///
+    /// 按 pane 自己的 `host_ix` 取,**不是** `hosts[0]`:换过节点的 pane 与
+    /// 同标签里别的 pane 完全可能在两台不同的机器上,取错的话核对问的是
+    /// 另一台的 tmux —— 答案永远是 0,弹窗永远不弹(同
+    /// `sftp_connection_for` 那条错配教训)。
+    fn pane_connection(&self, generation: u64, pane: PaneId) -> Option<Arc<SshConnection>> {
+        let t = self.tabs.by_generation(generation)?.content.as_terminal()?;
+        let ix = t.ws.pane(pane)?.host_ix;
+        t.ws.hosts.get(ix).map(|h| h.handle.clone())
     }
 
     /// F161:取走这块 pane 的「该接回哪个 tmux 会话」记录并算成计划。
@@ -9418,6 +9627,15 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_owner_names(generation, query, stdout);
             }
+            UserEvent::ProjectClientsChecked {
+                generation,
+                pane,
+                clients,
+                plan,
+                sink,
+            } => {
+                self.accept_project_clients(generation, pane, clients, *plan, sink);
+            }
             UserEvent::SftpOpDone {
                 generation,
                 result,
@@ -11244,6 +11462,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(ask) = self.ui.project_open_go.take() {
                     self.dial_project(&ask);
                 }
+                // F224:「已在别处打开」确认框的拍板。与上面两条同一条理由
+                // 放在这里 —— 渲染闭包里 `self.ui` 正被借出去,而这里要动
+                // `self.project_takeover` 并起自动化。
+                if let Some(confirmed) = self.ui.project_takeover_go.take() {
+                    self.finish_project_takeover(confirmed);
+                }
                 // F110 隧道 CRUD 的施加点。与会话侧同构:UI 只写意图,这里才碰
                 // store。**不复用** `save_request`/`delete_request` 那两条通道 ——
                 // 它们带的是 `SessionDraft`/`SessionId`,类型不同,挤在一起只能靠
@@ -12598,6 +12822,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | SftpListed { .. }
         | RevealStat { .. }
         | OwnerNames { .. }
+        | ProjectClientsChecked { .. }
         | SftpOpDone { .. }
         | ShotUploaded { .. }
         | TransferPlanned { .. }
@@ -13601,6 +13826,10 @@ mod tests {
         assert!(
             body.contains("Modal::ProjectOpenConfirm => self.ui.project_open_confirm.is_some()"),
             "modal_open 里没有 ProjectOpenConfirm 独立的那一臂(T8)"
+        );
+        assert!(
+            body.contains("Modal::ProjectTakeoverConfirm => self.ui.project_takeover.is_some()"),
+            "modal_open 里没有 ProjectTakeoverConfirm 独立的那一臂(T8)"
         );
     }
 
@@ -15341,6 +15570,10 @@ mod tests {
                 Modal::ProjectOpenConfirm => assert!(
                     Modal::ALL.contains(&Modal::ProjectOpenConfirm),
                     "ProjectOpenConfirm 没登记进 Modal::ALL(T8)"
+                ),
+                Modal::ProjectTakeoverConfirm => assert!(
+                    Modal::ALL.contains(&Modal::ProjectTakeoverConfirm),
+                    "ProjectTakeoverConfirm 没登记进 Modal::ALL(T8)"
                 ),
                 Modal::TabProps => assert!(
                     Modal::ALL.contains(&Modal::TabProps),
@@ -18067,6 +18300,107 @@ mod tests {
         );
     }
 
+    /// 源码切片前先剥注释:本条判据里的几个关键词(`return` / 函数名)在
+    /// **产品代码的注释里**也写着,不剥的话注释就能把断言喂饱,变异改掉代码
+    /// 却留着注释一样是绿的(记忆里那条「源码切片守护不剥注释」)。
+    fn without_comments(s: &str) -> String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **F224 最要命的一条。** 带闸的计划(只有「打开项目」有)必须先问远端
+    /// 「这个 tmux 还挂着谁」,**并且就此打住** —— 那句 `return` 少了的话,
+    /// 核对照跑、字节也照发,而先发的那一支恒**不带** `-d`:确认框承诺的
+    /// 「把对方踢下线」永远不会发生,两个客户端照样同挂、`window-size latest`
+    /// 互相 resize 打架,恰是这道闸要防的事。全程零报错。
+    ///
+    /// 自证会变红:删掉闸分支里的 `return;`(第三段红);把整个
+    /// `if plan.gate.is_some()` 分支删掉(第一段红)。
+    #[test]
+    fn a_gated_open_asks_the_remote_and_stops_there() {
+        let body = without_comments(body_of(prod_src(), "fn on_pane_ready("));
+        let gate = body
+            .find("if plan.gate.is_some() {")
+            .expect("on_pane_ready 里没有 F224 的闸 —— 打开项目会直接 attach,从不核对");
+        let send = body
+            .find("self.start_automation(")
+            .expect("on_pane_ready 里没起自动化");
+        assert!(gate < send, "闸排在了发字节之后,等于没有闸");
+        let between = &body[gate..send];
+        assert!(
+            between.contains("self.check_project_clients("),
+            "闸分支没去核对:{between}"
+        );
+        assert!(
+            between.contains("return;"),
+            "闸分支没有 `return` —— 核对照跑、字节也照发,而先发的那一支不带 `-d`:{between}"
+        );
+    }
+
+    /// 核对**跑不成也必须回送事件**。不回送的症状:PTY 那头停着一个干净的
+    /// shell,项目永远不 attach,画面上什么都不会发生、日志里什么都没有,
+    /// 用户只能重开一个标签(同 F142 那条「失败也要送回来」的形状)。
+    ///
+    /// 判据落在「这个 spawn 出去的任务里有且只有一条回送路径,且没有提前
+    /// 返回」——这是唯一能钉住「Err 分支不许溜走」的写法。
+    ///
+    /// 自证会变红:把 `Err(e) =>` 那一档改成 `return`(第二段红);
+    /// 或把回送整句删掉(第一段红)。
+    #[test]
+    fn a_check_that_cannot_run_still_reports_back() {
+        let body = without_comments(body_of(prod_src(), "fn check_project_clients("));
+        let at = body
+            .find("self._runtime.spawn(")
+            .expect("核对没起异步任务 —— 它要么在窗口线程上阻塞,要么压根没跑");
+        let task = &body[at..];
+        assert_eq!(
+            task.matches("send_event(UserEvent::ProjectClientsChecked")
+                .count(),
+            1,
+            "核对任务里的回送不是恰好一条:{task}"
+        );
+        assert!(
+            !task.contains("return"),
+            "核对任务里有提前返回 —— 走那条路事件就不回送,这次打开永久悬着:{task}"
+        );
+    }
+
+    /// 核对要问的是**这块 pane 自己那台机器**。换过节点的 pane 与同标签里
+    /// 别的 pane 完全可能在两台不同机器上,取 `hosts[0]` 的话问的是另一台的
+    /// tmux —— 答案恒 0,确认框永远不弹,而用户以为它在保护自己
+    /// (同 `sftp_connection_for` 记着的那条错配教训)。
+    ///
+    /// 自证会变红:把 `pane_connection` 里那句取下标的改成
+    /// `t.ws.hosts.first()`。
+    #[test]
+    fn the_check_asks_the_machine_this_pane_is_actually_on() {
+        let body = without_comments(body_of(prod_src(), "fn pane_connection("));
+        assert!(
+            body.contains("host_ix"),
+            "核对没按 pane 自己的 host_ix 取连接:{body}"
+        );
+    }
+
+    /// 确认框的拍板必须**真的被消费**。UI 层只写一个 `Option<bool>`,没人取
+    /// 的话:用户点了「踢下线并打开」,弹窗关掉,然后什么都不发生 —— 而且
+    /// 那份计划连同 sink 一直挂在 `App::project_takeover` 上,再也不会走。
+    ///
+    /// 自证会变红:把施加点那两行删掉。
+    #[test]
+    fn the_verdict_from_the_takeover_dialog_is_actually_consumed() {
+        let prod = without_comments(prod_src());
+        assert!(
+            prod.contains("self.ui.project_takeover_go.take()"),
+            "没人取用户的拍板 —— 点了继续之后什么都不会发生"
+        );
+        assert!(
+            prod.contains("self.finish_project_takeover("),
+            "拍板取了却没人施加"
+        );
+    }
+
     /// `snapshot_tabs_of` 的脚手架:一个占位标签。`leaves` = 上次的分屏数,
     /// 用**左右均分的扁平前序编码**摆出来(跟真实存盘同一套编码)。
     fn restored_tab(session_id: u64, leaves: usize) -> TabContent {
@@ -18871,6 +19205,13 @@ mod tests {
         assert!(
             body.contains("publish_presence("),
             "心跳没发布在场文件 —— 别的实例永远看不到这边开着哪些项目"
+        );
+        // 写和读是**两件事**,少任何一件症状都一样静默:只写不读,这边的灯
+        // 永远看不见别人;只读不写,别人看不见这边。
+        assert!(
+            body.contains("read_other_presence("),
+            "心跳没把别的实例的在场文件读回来 —— `project_others` 恒空,\
+             多开时另一个窗口里正跑着的项目在这边显示为「灭」"
         );
     }
 

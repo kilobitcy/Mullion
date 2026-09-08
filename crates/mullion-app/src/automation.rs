@@ -69,6 +69,25 @@ use mullion_store::{build_plan, ResolvedAutomation, SessionId, Step};
 pub struct PendingAutomation {
     pub steps: Vec<Step>,
     pub ready_timeout_ms: u32,
+    /// F224:发字节**之前**要不要先问一句远端「这个 tmux 还有谁挂着」。
+    /// 只有「打开项目」填得出来(见 [`ProjectGate`])。
+    pub gate: Option<ProjectGate>,
+}
+
+/// F224:attach 前的远端核对闸。
+///
+/// 两支计划在算 plan 的那一刻就一起定死,而不是「先发不带 `-d` 的、用户确认
+/// 后再重算」:重算那一刻要么回头查库(拨号是真实网络往返,这期间配置完全
+/// 可能被改),要么复制一份构造逻辑 —— 两条都是 F223 已经写在
+/// [`pending_for_project`] 文档里的坑。
+pub struct ProjectGate {
+    /// 要拿去 `tmux list-clients -t` 的会话名。
+    pub tmux: String,
+    /// 弹窗文案里的项目名(与 `tmux` 可能不同:后者被 sanitize 过)。
+    pub project: String,
+    /// 核对到有人、且用户按下「继续」之后**改用**的步骤 —— 带 `-d`,
+    /// 与弹窗里「会把对方踢下线」这句承诺一致。
+    pub detaching: Vec<Step>,
 }
 
 /// 算这条会话的待办计划。`None` = 不跑自动化。
@@ -95,6 +114,7 @@ pub fn pending_for(
     Some(PendingAutomation {
         steps,
         ready_timeout_ms: resolved.ready_timeout_ms,
+        gate: None,
     })
 }
 
@@ -119,6 +139,7 @@ pub fn pending_for_extra_pane(tpl: &ResolvedAutomation) -> Option<PendingAutomat
     Some(PendingAutomation {
         steps,
         ready_timeout_ms: tpl.ready_timeout_ms,
+        gate: None,
     })
 }
 
@@ -153,6 +174,52 @@ pub fn pending_for_project(
     Some(PendingAutomation {
         steps,
         ready_timeout_ms: overlaid.ready_timeout_ms,
+        // F224:带 `-d` 的那一支现在就一起算好(`build_plan_reattach` 与
+        // `build_plan` 的唯一差别正是 `detach_others`),等用户在弹窗里按下
+        // 「继续」时直接换上,不重新查库、不复制构造逻辑。
+        gate: Some(ProjectGate {
+            tmux: mullion_store::project_tmux_name(p),
+            project: p.name.clone(),
+            detaching: mullion_store::build_plan_reattach(&overlaid, ""),
+        }),
+    })
+}
+
+/// F224:一次 attach 前核对的结局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateVerdict {
+    /// 没人挂着(或核对本身没跑成,见 `project::takeover_needed`)。
+    Nobody,
+    /// 有人挂着,用户在确认框里点了「踢下线并打开」。
+    TakeOver,
+    /// 用户点了取消。
+    Cancel,
+}
+
+/// F224:闸过完之后,这次打开该发什么。`None` = 取消,一个字节都不发
+/// (此时也**不记**访问时间 —— 那条由 `drive_project_visits` 的命中上报
+/// 驱动,attach 没发生就永远不命中)。
+///
+/// `TakeOver` 时**换掉** `steps` 而不是在后面追加:两条 attach 叠着发的话,
+/// 第一条 `exec` 之后 shell 已经不在了,第二条打进的是刚 attach 上的那个 TUI。
+///
+/// 三支都把 `gate` 摘掉:`App::resume_gated_open` 靠「gate 没了」终止递归
+/// (它会把过完闸的计划重新交给 `on_pane_ready`),留着就是无限核对。
+pub fn apply_gate(plan: PendingAutomation, verdict: GateVerdict) -> Option<PendingAutomation> {
+    let PendingAutomation {
+        steps,
+        ready_timeout_ms,
+        gate,
+    } = plan;
+    let steps = match verdict {
+        GateVerdict::Nobody => steps,
+        GateVerdict::TakeOver => gate.map_or(steps, |g| g.detaching),
+        GateVerdict::Cancel => return None,
+    };
+    Some(PendingAutomation {
+        steps,
+        ready_timeout_ms,
+        gate: None,
     })
 }
 
@@ -190,6 +257,7 @@ pub fn pending_for_reattach(tpl: &ResolvedAutomation, name: &str) -> Option<Pend
     Some(PendingAutomation {
         steps,
         ready_timeout_ms: tpl.ready_timeout_ms,
+        gate: None,
     })
 }
 
@@ -217,6 +285,7 @@ pub fn pending_for_measured_attach(
     Some(PendingAutomation {
         steps,
         ready_timeout_ms: tpl.ready_timeout_ms,
+        gate: None,
     })
 }
 
@@ -466,6 +535,101 @@ mod tests {
     #[test]
     fn a_project_with_no_usable_tmux_name_yields_no_plan_at_all() {
         assert!(pending_for_project(&bare(), &project("   ", "/srv/app")).is_none());
+    }
+
+    /// **F224 attach 前的远端核对。** 承诺与行为必须一致:弹窗对用户说的是
+    /// 「继续会把对方踢下线」,那么确认之后发出去的那一行就**必须**带 `-d`;
+    /// 而核对到没人时**绝不能**带 —— 带了的话,同一项目在别处正常开着的
+    /// 客户端会被无声踢掉,而我们一句话都没问过。
+    ///
+    /// 两支必须由同一个 `pending_for_project` 一次算好:分成「先发不带 -d、
+    /// 用户确认后再重算」的话,重算那一刻要么回头查库(配置可能已被改)、要么
+    /// 复制一份构造逻辑,两条都是 F223 已经踩过的坑。
+    ///
+    /// 自证会变红:把 `gate.detaching` 改成 `steps.clone()`(确认后不踢人,
+    /// 第二段红),或把 `steps` 改成 `build_plan_reattach(...)`(没问就踢人,
+    /// 第一段红)。
+    #[test]
+    fn a_confirmed_takeover_attaches_with_detach_while_an_untaken_session_does_not() {
+        let p = pending_for_project(&bare(), &project("我的项目", "/srv/app")).unwrap();
+        let gate = p.gate.as_ref().expect("打开项目必须带远端核对闸");
+        assert_eq!(gate.tmux, "我的项目", "核对的是项目自己的 tmux 名");
+
+        let polite = String::from_utf8(p.steps[0].bytes.clone()).unwrap();
+        assert!(
+            polite.contains("exec tmux attach"),
+            "还是得 attach: {polite}"
+        );
+        assert!(
+            !polite.contains("attach -d"),
+            "没人在场时不该踢人: {polite}"
+        );
+
+        let forced = String::from_utf8(gate.detaching[0].bytes.clone()).unwrap();
+        assert!(
+            forced.contains("exec tmux attach -d"),
+            "确认踢人后必须真的带 -d: {forced}"
+        );
+    }
+
+    /// 闸的三种结局各发什么:没人 → 原样(不带 `-d`);确认踢人 → **换上**
+    /// 带 `-d` 的那一支;取消 → 一个字节都不发。
+    ///
+    /// 「换上」而不是「在原来那支后面再补一条」:两条 attach 叠着发,第一条
+    /// `exec` 之后 shell 已经不在了,第二条打进的是刚 attach 上的那个 TUI。
+    ///
+    /// 三种结局都必须把 `gate` 摘掉 —— 调用方靠「gate 没了」终止递归
+    /// (`App::resume_gated_open` 会重新走一遍 `on_pane_ready`),留着就是
+    /// 无限核对。
+    ///
+    /// 自证会变红:把 `TakeOver` 分支改成原样返回 `plan`(承诺了踢人却不踢,
+    /// 第二段红);把 `Cancel` 分支改成 `Some(plan)`(点了取消照样 attach,
+    /// 第三段红);把 `Nobody` 分支改成走 `detaching`(没问就踢人,第一段红)。
+    #[test]
+    fn each_verdict_sends_exactly_what_the_dialog_promised() {
+        let plan = || pending_for_project(&bare(), &project("我的项目", "/srv/app")).unwrap();
+
+        let nobody = apply_gate(plan(), GateVerdict::Nobody).expect("没人在场照样要 attach");
+        let line = String::from_utf8(nobody.steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("exec tmux attach"), "还是得 attach: {line}");
+        assert!(!line.contains("attach -d"), "没问过就踢人: {line}");
+        assert!(nobody.gate.is_none(), "闸只过一次,否则会无限核对");
+
+        let took = apply_gate(plan(), GateVerdict::TakeOver).expect("确认之后必须还有东西可发");
+        let line = String::from_utf8(took.steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("exec tmux attach -d"), "确认了却没踢: {line}");
+        assert!(took.gate.is_none(), "闸只过一次,否则会无限核对");
+
+        assert!(
+            apply_gate(plan(), GateVerdict::Cancel).is_none(),
+            "取消 = 一个字节都不发"
+        );
+    }
+
+    /// 闸只属于项目。普通换节点 / 分屏 / 重连都不该带 —— 带了的话,每块新
+    /// pane 起来都要多跑一次 `list-clients` 并可能弹窗问用户,而那个会话本来
+    /// 就是他自己的。
+    ///
+    /// 自证会变红:给 `pending_for_extra_pane` 也填一个 `Some(gate)`。
+    #[test]
+    fn only_a_project_open_is_gated_on_who_else_is_attached() {
+        let mut base = bare();
+        base.tmux = Some(TmuxChoice::Attach {
+            session_name: Some("dev".into()),
+        });
+        base.commands = vec![AutomationCommand {
+            text: "claude".into(),
+            delay_ms: None,
+        }];
+        assert!(pending_for_extra_pane(&base).unwrap().gate.is_none());
+        assert!(pending_for_reattach(&base, "dev").unwrap().gate.is_none());
+        let cloned = base.clone();
+        assert!(
+            pending_for(Some(SessionId(1)), move |_| Some((cloned, "dev".into())))
+                .unwrap()
+                .gate
+                .is_none()
+        );
     }
 
     /// F128 回归:链路刚死、还在退避重连的那段时间里,在跑的自动化必须**当场**

@@ -423,6 +423,64 @@ pub struct OpenAsk {
     pub reasons: Vec<&'static str>,
 }
 
+/// F224:「项目已在别处打开」确认框要显示的那点数据。
+///
+/// 计划和 sink 不在这里 —— 它们在 `App::project_takeover` 上。UI 层拿不到
+/// 也不该拿:一份 `PendingAutomation` 漏进 `UiState` 就等于把「发什么字节」
+/// 的决定权分了一半给渲染层。
+#[derive(Clone)]
+pub struct TakeoverAsk {
+    pub project: String,
+    /// 远端此刻挂着几个客户端(`tmux list-clients` 数出来的)。
+    pub clients: usize,
+}
+
+/// F224:踢人确认框。返回 `Some(true)` = 用户认了「踢下线」。
+///
+/// **取消排在前面**:这是设计定的默认动作(「默认按钮是取消」)。egui 没有
+/// 「默认按钮」的概念,唯一能表达的就是位置与配色 —— 危险的那颗在右、用
+/// `danger_text` 上色并把后果写进按钮文字里,而不是叫「确定」。
+pub fn show_takeover_confirm(
+    ctx: &egui::Context,
+    t: &crate::theme::Theme,
+    ask: &TakeoverAsk,
+) -> Option<bool> {
+    use crate::ui::metrics::{SP_M, SP_S};
+    let mut out = None;
+    egui::Window::new("项目已在别处打开")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            crate::ui::annotate::mark(ui.ctx(), "项目踢人确认框".to_string(), ui.max_rect());
+            ui.label(format!(
+                "「{}」的 tmux 会话此刻挂着 {} 个客户端。",
+                ask.project, ask.clients
+            ));
+            ui.add_space(SP_S);
+            ui.colored_label(
+                crate::theme::c32(t.danger_text),
+                "继续会把对方全部踢下线(他们的画面当场断开,远端进程不受影响)。",
+            );
+            ui.add_space(SP_M);
+            ui.horizontal(|ui| {
+                if ui.button("取消").clicked() {
+                    out = Some(false);
+                }
+                ui.add_space(SP_S);
+                if ui
+                    .button(
+                        egui::RichText::new("踢下线并打开").color(crate::theme::c32(t.danger_text)),
+                    )
+                    .clicked()
+                {
+                    out = Some(true);
+                }
+            });
+        });
+    out
+}
+
 /// F223:打开项目前的确认框。返回 `true` = 用户点了「继续」。
 ///
 /// 只在**真有东西会丢**时才会被调用(判据在 `crate::project::plan_open`)。

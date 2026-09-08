@@ -290,6 +290,13 @@ pub struct UiState {
     /// 确认框开着的那段时间里配置可能已经变了,重算等于用户确认的是 A、
     /// 实际连的是 B。
     pub project_open_go: Option<crate::ui::project_manager::OpenAsk>,
+    /// F224:attach 前核对到「项目已在别处打开」,正等用户拍板。
+    /// **只放画弹窗要用的那点数据** —— 计划和 sink 在 `App::project_takeover`
+    /// 上,UI 层碰不到也不该碰。
+    pub project_takeover: Option<crate::ui::project_manager::TakeoverAsk>,
+    /// F224:用户的拍板。`Some(true)` = 踢下线继续,`Some(false)` = 取消。
+    /// app.rs 消费后复位。
+    pub project_takeover_go: Option<bool>,
 
     // --- P1-b:测试连接(F92)。与 save_click 同构 —— UI 只写意图,
     // 拨测在 app.rs 的施加点起 tokio 任务。---
@@ -903,6 +910,14 @@ pub fn build_ui(
             }
             Some(false) => ui_state.project_open_confirm = None,
             None => {}
+        }
+    }
+    // F224:踢人确认框。排在打开确认框**之后** —— 它是那条流程后半段才
+    // 出现的(拨号连上、PTY 就绪、核对回来),该盖在上面。
+    if let Some(ask) = ui_state.project_takeover.clone() {
+        if let Some(confirmed) = project_manager::show_takeover_confirm(ctx, t, &ask) {
+            ui_state.project_takeover = None;
+            ui_state.project_takeover_go = Some(confirmed);
         }
     }
     // F2:ssh config 导入预览。排在会话管理器之后 —— 它是从菜单发起的模态,
