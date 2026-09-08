@@ -52,6 +52,23 @@ pub struct NewEdit {
     /// 刚进新建态、**还没把键盘焦点要过来**。渲染那侧要一次就清掉
     /// (每帧无条件 `request_focus()` 会让两栏互抢,见 `RenameEdit` 的文档)。
     pub focus_pending: bool,
+    /// F226:建的是文件还是目录。
+    pub kind: NewKind,
+}
+
+/// F226:就地新建的是文件还是目录。
+///
+/// 放进 `NewEdit` 而不是另开一个 `new_dir_edit` 字段:两者的字段集合完全
+/// 一样(一个缓冲 + 一个焦点一次性标记),交互也完全一样,唯一的差别是
+/// 提交时发 `create_file` 还是 `create_dir`。另开字段的话「互斥」就变成三个
+/// 字段两两互清,漏一处就是两个 `TextEdit` 互抢焦点、谁都退不出去。
+///
+/// (这与 `NewEdit` 文档里"不和 `RenameEdit` 合并"的理由不冲突:那条反对的是
+/// 合并**字段集合不同**的两种编辑态 —— 改名多一个 `from`,对新建是假值。)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewKind {
+    File,
+    Dir,
 }
 
 pub struct PaneState {
@@ -409,11 +426,22 @@ impl PaneState {
     /// 不像 `begin_rename` 那样需要光标行 —— 新建不针对任何一条已有的行,
     /// 空目录里同样成立(那正是用户最需要它的时候)。
     pub fn begin_new_file(&mut self) -> bool {
+        self.begin_new(NewKind::File)
+    }
+
+    /// F226:同 [`Self::begin_new_file`],建的是目录。菜单/快捷键都走这里,
+    /// 不许各自拼一个 `NewEdit` —— 互斥那两行漏一处就是两个输入框互抢焦点。
+    pub fn begin_new_dir(&mut self) -> bool {
+        self.begin_new(NewKind::Dir)
+    }
+
+    fn begin_new(&mut self, kind: NewKind) -> bool {
         // 互斥,见 `new_edit` 的文档。
         self.rename_edit = None;
         self.new_edit = Some(NewEdit {
             buf: String::new(),
             focus_pending: true,
+            kind,
         });
         true
     }
@@ -781,6 +809,51 @@ mod tests {
             "前提:没有光标行,改名该失败 —— 否则这条测的是成功路径,缺口原样存在"
         );
         assert!(s.new_edit.is_none(), "改名失败也不该让新建框继续赖着");
+    }
+
+    /// F226:新建文件夹与新建文件共用同一个槽 —— 它们是**同一种交互的两个
+    /// kind**,不是两套状态。共用槽让「互斥」成为类型上的事实,而不是两个
+    /// 字段互相记得清对方(F219 已经为 rename/new 各写了一次清对方,再来
+    /// 一个字段就是三处两两互清,漏一处就是两个 TextEdit 互抢焦点、
+    /// 谁都退不出去)。
+    ///
+    /// 自证会变红:让 `begin_new_dir` 也传 `NewKind::File`。
+    #[test]
+    fn new_file_and_new_dir_share_one_slot_and_carry_their_kind() {
+        let mut s = state();
+
+        assert!(s.begin_new_file());
+        assert_eq!(s.new_edit.as_ref().map(|n| n.kind), Some(NewKind::File));
+
+        assert!(s.begin_new_dir());
+        assert_eq!(
+            s.new_edit.as_ref().map(|n| n.kind),
+            Some(NewKind::Dir),
+            "新建文件夹必须顶掉新建文件,而不是并存"
+        );
+        assert_eq!(s.new_edit.as_ref().map(|n| n.buf.as_str()), Some(""));
+    }
+
+    /// F226:新建文件夹同样与改名互斥,两个方向都要成立。
+    ///
+    /// 自证会变红:把 `begin_new` 里 `self.rename_edit = None;` 删掉(第一段红);
+    /// 把 `begin_rename` 里 `self.new_edit = None;` 删掉(第二段红)。
+    #[test]
+    fn new_dir_and_rename_are_mutually_exclusive_both_ways() {
+        let mut s = state();
+        s.entries = vec![e("a.txt", EntryKind::File)];
+        s.cursor = Some(RemotePath::from_bytes(b"a.txt".to_vec()));
+
+        assert!(s.begin_rename(), "前提:进得了改名态");
+        assert!(s.begin_new_dir());
+        assert!(
+            s.rename_edit.is_none(),
+            "改名态还赖着 —— 两个输入框会互抢焦点"
+        );
+
+        assert!(s.begin_new_dir());
+        assert!(s.begin_rename(), "前提:进得了改名态");
+        assert!(s.new_edit.is_none(), "新建文件夹态还赖着 —— 同上");
     }
 
     /// F219:**刷新不清新建态** —— 它不绑任何已有行,清掉会把用户正在打的字
