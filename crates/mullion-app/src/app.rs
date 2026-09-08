@@ -16991,6 +16991,35 @@ mod tests {
         assert!(ws.pane(only_id).is_some(), "最后一个 pane 不该被真的关掉");
     }
 
+    /// F232 的接线:工具栏拿到的 `preset` 必须是**每帧从布局树现算的**。
+    ///
+    /// 这条是变异挖出来的实打实的缺口:把那一行改成 `preset: None`,全套
+    /// 1991 条测试**一条都不红** —— `preset_of` 自己被测得很扎实,但"有没有
+    /// 人把它接上去"以前没人看着。症状是分屏按钮永远不高亮,而画面上没有
+    /// 任何报错,只有人眼能发现。
+    ///
+    /// 判据落在「`panes:` 的**紧邻下一行**」而不是扫全文件:`preset_of` 在
+    /// `app.rs` 里出现好几处(测试自己就写了三处),裸搜的话删掉接线照样绿。
+    ///
+    /// 自证会变红:把那一行改成 `preset: None,`。
+    #[test]
+    fn the_toolbar_highlight_is_derived_from_the_tree_every_frame() {
+        let src = prod_src();
+        let at = src
+            .find("panes: self.active_ws().map_or(1, Workspace::pane_count),")
+            .expect("工具栏的 panes 字段变了,这条测试的锚点失效了");
+        let next = src[at..]
+            .lines()
+            .skip(1)
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//"))
+            .expect("panes 之后没有下一行?");
+        assert!(
+            next.trim_start().starts_with("preset: self.active_ws()"),
+            "工具栏高亮必须现算(F232),当前是:{}",
+            next.trim()
+        );
+    }
+
     /// 复核 Important #2/T2:没有 pane 卡在同步块里时,不该无中生有排一个
     /// `WaitUntil`(否则就是新开了一条会忙转的唤醒路径,踩 T3/T7)。
     #[test]
