@@ -268,6 +268,22 @@ mod tests {
         );
     }
 
+    /// 候选**有**指纹、但已有节点一个都没连过 —— 仍是**待核**,不是同机。
+    ///
+    /// 空表那条测不到这里(候选也查不到,在函数头就早退了)。少了这条,
+    /// 「一个都没比对过」会被报成「已核实同机」——判定给出的是伪阳性的
+    /// 安全结论,而 UI 上待核标记不会出现,用户以为核过了。
+    ///
+    /// 自证会变红:把函数尾巴改成无条件 `SameMachine::Same`。
+    #[test]
+    fn a_candidate_with_no_verified_peer_to_compare_against_is_still_pending() {
+        let t = table(&[("j", "SHA256:AAAA")]);
+        assert_eq!(
+            can_join(&["never-dialed".into()], "j", &t),
+            SameMachine::Pending
+        );
+    }
+
     /// 已有节点里有没连过的,不影响与**连过的**那个的判定 ——
     /// 待核只在「拿不到任何可比对的指纹」时才是结论。
     #[test]
