@@ -505,6 +505,51 @@ impl Vault {
         Ok(())
     }
 
+    /// F229:克隆一条会话。深拷贝**非敏感字段 + 密文**,落成一条新 id。
+    ///
+    /// 为什么必须在 store 层做:`EditorBuffer` 里的密码/口令/私钥恒为空
+    /// (store 不回吐明文),UI 层「填一份草稿再保存」那条路走到
+    /// `merge_secret(existing = None, ..)`,产出的是一份**没有凭据的会话**,
+    /// 而且完全静默 —— 用户要等到点「连接」被要密码时才发现。
+    ///
+    /// `Auth::Ref(_)` 原样带过去:那是**引用**,复制凭据实体会让
+    /// 「一份凭据多会话引用」(F74)当场失效。
+    pub fn clone_session(
+        &mut self,
+        id: SessionId,
+        now_rfc3339: &str,
+    ) -> Result<SessionId, StoreError> {
+        self.sync_from_disk_if_untouched();
+        let src = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or(StoreError::NotFound(id))?;
+        let mut rec = src.clone();
+        let new_id = SessionId(
+            self.sessions
+                .iter()
+                .map(|s| s.id.0)
+                .max()
+                .map_or(1, |m| m + 1),
+        );
+        let taken: Vec<&str> = self
+            .sessions
+            .iter()
+            .map(|s| s.identity.name.as_str())
+            .collect();
+        rec.identity.name = clone_name(&rec.identity.name, &taken);
+        rec.id = new_id;
+        rec.modified_at = now_rfc3339.to_string();
+        // 密文与非敏感部分**同进同出**。这里不 `{:?}` 打印它的任何一部分
+        // (`SecretEntry` 连 Debug 都没 derive,正是为了防这个)。
+        if let Some(sec) = self.secrets.get(&id.0.to_string()).cloned() {
+            self.secrets.insert(new_id.0.to_string(), sec);
+        }
+        self.sessions.push(rec);
+        Ok(new_id)
+    }
+
     /// 删除会话,并**连带清除**其密文(守 id 完整性,见 spec §3.1)
     /// 与各项目里对它的引用(F221)。
     ///
@@ -1197,6 +1242,25 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> 
 /// 症状是某一栏点「取消收藏」看起来没反应。
 ///
 /// F187 之后 `settings.rs` 里那份全局本地书签也用它 —— 同上,判据只能有一条。
+/// F229:给克隆出来的会话起名。撞名就往后编号 ——「prod 的副本」「prod 的副本 2」…
+///
+/// 纯函数:去重是这里唯一容易写错的地方,而它跟磁盘、时钟、加密都无关。
+/// 连克隆两次撞出两行同名会话的话,用户在列表里没有任何办法分辨。
+fn clone_name(base: &str, taken: &[&str]) -> String {
+    let first = format!("{base} 的副本");
+    if !taken.contains(&first.as_str()) {
+        return first;
+    }
+    // 从 2 起编号。上限只是防呆:名字撞到 u32 上限说明调用方在死循环。
+    for n in 2..u32::MAX {
+        let candidate = format!("{base} 的副本 {n}");
+        if !taken.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    first
+}
+
 pub(crate) fn push_deduped(list: &mut Vec<crate::sftp::Bookmark>, mark: crate::sftp::Bookmark) {
     if !list.iter().any(|b| b.path == mark.path) {
         list.push(mark);
@@ -1239,6 +1303,101 @@ mod tests {
                 private_key: None,
             }),
         }
+    }
+
+    /// F229:克隆必须**连密文一起**深拷贝。这是整个特性唯一真正危险的地方 ——
+    /// UI 层那条「填草稿再保存」的捷径走不通:`EditorBuffer` 里的密码字段恒为空
+    /// (store 不回吐明文),保存时靠 `merge_secret(existing, ..)` 挂回去,而新
+    /// id 的 `existing` 是 `None`。结果是一份**没有凭据的会话**,而且完全静默 ——
+    /// 用户要等到点「连接」被要密码时才发现。
+    ///
+    /// 自证会变红:把 `clone_session` 里复制 secret 那一段删掉。
+    #[test]
+    fn cloning_a_session_deep_copies_its_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let src = v.add(draft_pw("prod", "hunter2"), "2026-09-08T00:00:00Z");
+
+        let dst = v
+            .clone_session(src, "2026-09-08T00:00:01Z")
+            .expect("克隆该成功");
+
+        assert_ne!(dst, src, "克隆必须是一条新会话");
+        assert_eq!(
+            v.secret(dst).and_then(|s| s.password.clone()),
+            Some("hunter2".to_owned()),
+            "克隆出来的会话没有凭据 —— 用户要到点「连接」时才会发现"
+        );
+        assert_eq!(
+            v.secret(src).and_then(|s| s.password.clone()),
+            Some("hunter2".to_owned()),
+            "源会话的凭据不该被搬走"
+        );
+    }
+
+    /// F229:名字要一眼看得出是副本,且**连克隆两次不撞名** —— 列表里两行
+    /// 一模一样的名字,用户没有任何办法分辨哪条是哪条。
+    ///
+    /// 自证会变红:把 `clone_name` 里的去重循环删掉(恒返回「… 的副本」)。
+    #[test]
+    fn cloning_twice_yields_distinct_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let src = v.add(draft_pw("prod", "p"), "2026-09-08T00:00:00Z");
+
+        let a = v.clone_session(src, "2026-09-08T00:00:01Z").unwrap();
+        let b = v.clone_session(src, "2026-09-08T00:00:02Z").unwrap();
+
+        let name = |v: &Vault, id| {
+            v.list()
+                .iter()
+                .find(|r| r.id == id)
+                .expect("刚建的会话找得到")
+                .identity
+                .name
+                .clone()
+        };
+        assert_eq!(name(&v, a), "prod 的副本");
+        assert_eq!(name(&v, b), "prod 的副本 2");
+    }
+
+    /// F229:克隆保留分组,并且**共享凭据仍然是引用**,不复制凭据实体 ——
+    /// 复制一份的话,以后改那条凭据只会改到其中一份,而两条会话在界面上
+    /// 长得一模一样(F74 的整个意义就是「一份凭据多会话引用」)。
+    ///
+    /// 自证会变红:把 `clone_session` 里 `rec` 的 `identity.group_id` 抹成
+    /// `None`(第一条红);把 `auth` 改成重建一份 inline(第二条红)。
+    #[test]
+    fn cloning_keeps_the_group_and_still_references_the_shared_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let g = v.add_group("生产".into());
+        let cred = v.add_credential(cred_draft("共享", "u", Some("p")));
+        let mut draft = draft_pw("prod", "p");
+        draft.identity.group_id = Some(g);
+        draft.auth = Auth::Ref(cred);
+        let src = v.add(draft, "2026-09-08T00:00:00Z");
+
+        let dst = v.clone_session(src, "2026-09-08T00:00:01Z").unwrap();
+        let rec = v.list().iter().find(|r| r.id == dst).unwrap();
+        assert_eq!(rec.identity.group_id, Some(g));
+        assert_eq!(rec.auth, Auth::Ref(cred), "共享凭据必须仍是引用");
+        assert_eq!(
+            v.credentials().len(),
+            1,
+            "凭据实体被复制了一份 —— F74 的一份多引用被破坏"
+        );
+    }
+
+    /// F229:克隆不存在的会话要报 `NotFound`,不能静默造一条空会话出来。
+    #[test]
+    fn cloning_a_missing_session_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        assert!(matches!(
+            v.clone_session(SessionId(42), "2026-09-08T00:00:00Z"),
+            Err(StoreError::NotFound(SessionId(42)))
+        ));
     }
 
     fn tunnel_draft(session: SessionId, port: u16) -> TunnelDraft {
@@ -2627,7 +2786,7 @@ port = 7891
             checked += 1;
         }
         assert!(
-            checked >= 24,
+            checked >= 25,
             "只扫到 {checked} 个 mutator,切片逻辑多半失效了(退化成恒绿)"
         );
     }
