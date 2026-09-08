@@ -18,7 +18,7 @@ use mullion_store::{ProjectId, ProjectRecord, SessionRecord};
 ///
 /// 选节点走 [`crate::project::node_for`] —— 和 `plan_open` 真拨号时用的是
 /// **同一个函数**。各写一份的话,列表上写着 A、点下去连的是 B。
-fn row_subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
+pub(super) fn row_subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
     let name = crate::project::node_for(p)
         .and_then(|id| sessions.iter().find(|s| s.id == id))
         .map(|s| s.identity.name.as_str());

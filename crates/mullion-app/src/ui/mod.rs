@@ -21,6 +21,7 @@ pub mod pane_edges;
 pub mod pane_title;
 pub mod paste;
 pub mod project_manager;
+pub mod project_pick;
 pub mod rehost;
 pub mod restored;
 pub mod session_manager;
@@ -409,6 +410,10 @@ pub struct UiState {
     /// `tab_props_save`:`UiActions` 是渲染闭包里的局部量,而发起连接要
     /// `&mut self`(runtime / proxy),得等闭包对 `self.ui` 的借用释放。
     pub rehost_request: Option<(mullion_core::layout::PaneId, mullion_store::SessionId)>,
+
+    /// F225③:切项目弹窗(点了 pane 标题条的项目按钮)。`None` = 关着。
+    /// 里面有搜索框 —— 必须同步登记进 `app.rs::modal_open`(T8)。
+    pub project_pick: Option<project_pick::ProjectPickDraft>,
 }
 
 impl UiState {
@@ -569,6 +574,8 @@ pub struct UiActions {
     /// 点了 pane 标题条上的「换节点」。只是**请求**——选哪个节点由 App
     /// 弹出的会话列表决定。
     pub rehost_pane: Option<mullion_core::layout::PaneId>,
+    /// F225③:点了 pane 标题条上的「项目」。同上,只是请求。
+    pub pick_project_pane: Option<mullion_core::layout::PaneId>,
     /// F36:点了标签栏(切换 / 关闭 / `+`)。
     pub tab: Option<chrome::TabAction>,
     /// F100:标注模式导出的 Markdown,等着送剪贴板。
@@ -638,6 +645,10 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话选中的那一下
     /// 会在 egui 的 discard 趟被静默吃掉,现象是「点了节点毫无反应」。
     pub rehost: Option<rehost::RehostAction>,
+    /// F225③:切项目弹窗这一帧的结论(选定 / 取消)。`None` = 还在挑。
+    ///
+    /// 同 `rehost`:加字段时记得同步 `app.rs::has_real_action`。
+    pub project_pick: Option<project_pick::PickAction>,
     /// F148:恢复列表这一帧的结论(恢复某条 / 不恢复)。`None` = 没动过。
     ///
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话「恢复」按下去
@@ -958,6 +969,28 @@ pub fn build_ui(
         frame.appearance,
         rehost_rect,
     );
+    // F225③:切项目弹窗。与换节点弹窗同形态、同定位方式(钉在发起它的那块
+    // pane 里),但**是两个弹窗**:两件事的用户心智不同,见 `project_pick`
+    // 的模块文档。
+    let pick_rect = ui_state.project_pick.as_ref().and_then(|d| {
+        let ppp = ctx.pixels_per_point();
+        frame.titles.iter().find(|v| v.geom.id == d.pane).map(|v| {
+            let p = v.geom.px;
+            egui::Rect::from_min_size(
+                egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp),
+                egui::vec2(p.w as f32 / ppp, p.h as f32 / ppp),
+            )
+        })
+    });
+    actions.project_pick = project_pick::show(
+        ctx,
+        t,
+        &mut ui_state.project_pick,
+        frame.projects,
+        frame.project_lamps,
+        frame.sessions,
+        pick_rect,
+    );
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
     actions.editor = editor_window::show(ctx, t, editor);
     // F53/D3-12:退出确认。排在最后一个模态 —— 它一旦开着,别的都不重要了。
@@ -1032,6 +1065,7 @@ pub fn build_ui(
     let title_action = pane_title::show(ctx, t, frame.titles);
     actions.close_pane = title_action.close;
     actions.rehost_pane = title_action.rehost;
+    actions.pick_project_pane = title_action.pick_project;
 
     // F100 标注模式:**必须是最后一步**。它要读的是本帧所有 `annotate::mark()`
     // 登记完之后的候选表,而且铺的那层「吃指针」Area 得盖在包括 toast 在内的
@@ -1658,6 +1692,7 @@ mod tests {
                 grid: (80, 28),
             },
             index: 1,
+            project: None,
             host: Some(host),
             status: PaneStatus::Live,
             focused: true,
@@ -1846,6 +1881,51 @@ mod tests {
         assert!(
             pane.contains_rect(got),
             "换节点弹窗没落在那块 pane 里:pane={pane:?} 弹窗={got:?}"
+        );
+    }
+
+    /// F225③:切项目弹窗同理 —— `project_pick.rs` 自己那条只证了「`show`
+    /// 收到矩形会用」,证不了 `build_ui` 真的把矩形算出来传下去。
+    ///
+    /// 破坏性验证:把 `build_ui` 里传给 `project_pick::show` 的 `pick_rect`
+    /// 改成硬编码 `None`,弹窗退回整窗左上角,本测试红。
+    #[test]
+    fn build_ui_puts_the_project_picker_inside_that_panes_geometry() {
+        let mut view = title_view("h");
+        view.geom.px = PxRect {
+            x: 300,
+            y: 200,
+            w: 460,
+            h: 360,
+        };
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut ui_state = UiState {
+            project_pick: Some(crate::ui::project_pick::ProjectPickDraft::new(PaneId(1))),
+            ..Default::default()
+        };
+        for time in [0.0_f64, 1.0] {
+            let _ = run_frame(
+                &ctx,
+                &mut ui_state,
+                UiFrame {
+                    titles: std::slice::from_ref(&view),
+                    ..base_frame()
+                },
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+        let got = ctx
+            .memory(|m| m.area_rect(crate::ui::project_pick::area_id(PaneId(1))))
+            .expect("切项目弹窗开着却没有 Area");
+        let pane = egui::Rect::from_min_size(egui::pos2(300.0, 200.0), egui::vec2(460.0, 360.0));
+        assert!(
+            pane.contains_rect(got),
+            "切项目弹窗没落在那块 pane 里:pane={pane:?} 弹窗={got:?}"
         );
     }
 

@@ -34,6 +34,14 @@ pub struct TitleView<'a> {
     /// 拼进左区那一整串 `序号 · 节点名 · 目录名 · tmux名`(`title_text`),
     /// 不再是独立右区。
     pub tmux: Option<&'a str>,
+    /// F225③:这块 pane 属于哪个项目的**项目名**。`None` = 不属于任何项目
+    /// (或上报还没到)。
+    ///
+    /// **推导出来的,不是存的**:判据与 F224 同一条(上报 tmux 名 ==
+    /// `project_tmux_name`),由构造方现算。存一份 `pane→项目` 映射的话,
+    /// 用户手动 detach / 换 tmux 之后没人清(F160~F163 的「意图表换节点
+    /// 没人清」同形)。
+    pub project: Option<&'a str>,
     /// F163/D4:挂在这块 pane 上的一句说明(attach 失败 / 会话已删 / 连不上)。
     /// 来自 `PaneState::notice`。**不弹窗** —— 多块 pane 同时失败会连弹好几次。
     pub notice: Option<&'a str>,
@@ -69,6 +77,7 @@ pub fn title_text(
     host: Option<&str>,
     dir: Option<&str>,
     tmux: Option<&str>,
+    project: Option<&str>,
     status: PaneStatus,
     notice: Option<&str>,
 ) -> String {
@@ -90,8 +99,22 @@ pub fn title_text(
         return tail(format!("{index} · {h} (已断开)"));
     }
     let mut parts = vec![index.to_string(), h.to_string()];
-    parts.extend(dir.map(str::to_string));
-    parts.extend(tmux.map(str::to_string));
+    // F225③:认出项目就用 `项目名 · 目录名`,**顶掉 tmux 名**。项目的 tmux
+    // 名按 P5 是从项目名推导的,两个一起显示是同一个信息说两遍。
+    //
+    // 「属于哪个项目」由调用方按 F224 那条判据现推(上报 tmux 名 ==
+    // `project_tmux_name`),这里不记账 —— 记一份 `pane→项目` 的映射,用户
+    // 手动 detach / 换 tmux 之后没人清(F160~F163 同形)。
+    match project {
+        Some(pj) => {
+            parts.push(pj.to_string());
+            parts.extend(dir.map(str::to_string));
+        }
+        None => {
+            parts.extend(dir.map(str::to_string));
+            parts.extend(tmux.map(str::to_string));
+        }
+    }
     tail(parts.join(" · "))
 }
 
@@ -165,6 +188,9 @@ fn close_id(id: PaneId) -> egui::Id {
 fn rehost_id(id: PaneId) -> egui::Id {
     egui::Id::new(("pane_title_rehost", id.0))
 }
+fn project_id(id: PaneId) -> egui::Id {
+    egui::Id::new(("pane_title_project", id.0))
+}
 
 /// 标题条小按钮的字号,也是自绘图标的边长。
 const BUTTON_SIZE: f32 = 13.0;
@@ -175,6 +201,10 @@ enum Mark {
     /// 一个字形。**只用于码位一定存在的字符** —— `×` 是 U+00D7(Latin-1
     /// Supplement),任何拉丁字体都有。
     Glyph(&'static str),
+    /// F225③:走 [`crate::ui::icon`] 自绘的图标。同 [`Mark::SwapArrows`]
+    /// 的理由 —— 零字体依赖;区别只是那一个的形状只此一处用得上,不值得
+    /// 进公共图标表。
+    Icon(crate::ui::icon::Glyph),
     /// 自绘的「换节点」双向箭头。
     ///
     /// 原来写的是 `⇆`(U+21C6),实机上是个 tofu 方框 □:egui 内嵌的
@@ -201,7 +231,7 @@ fn small_action_button(ui: &mut egui::Ui, id: egui::Id, mark: Mark, t: &Theme) -
             egui::FontId::proportional(BUTTON_SIZE),
             theme::c32(t.fg_muted),
         )),
-        Mark::SwapArrows => None,
+        Mark::SwapArrows | Mark::Icon(_) => None,
     };
     let content = galley
         .as_ref()
@@ -223,7 +253,14 @@ fn small_action_button(ui: &mut egui::Ui, id: egui::Id, mark: Mark, t: &Theme) -
             let at = rect.center() - g.size() / 2.0;
             ui.painter().galley(at, g, color);
         }
-        None => paint_swap_arrows(ui.painter(), rect, color),
+        None => match mark {
+            Mark::Icon(g) => {
+                let stroke = egui::Stroke::new((BUTTON_SIZE * 0.10).max(1.0), color);
+                ui.painter()
+                    .extend(crate::ui::icon::shapes(rect, g, stroke));
+            }
+            _ => paint_swap_arrows(ui.painter(), rect, color),
+        },
     }
     resp
 }
@@ -256,6 +293,11 @@ pub struct TitleAction {
     pub close: Option<PaneId>,
     /// 点了「换节点」——只是**请求**,选哪个节点由 App 弹窗决定。
     pub rehost: Option<PaneId>,
+    /// F225③:点了「项目」——把这块 pane 切到另一个活。同上,只是请求。
+    ///
+    /// **和 `rehost` 分开两个字段、两个按钮**:底层机制共享,用户心智是两件
+    /// 事,合并成一个带 tab 的弹窗会让每次普通换节点都先撞见一个不相干的 tab。
+    pub pick_project: Option<PaneId>,
 }
 
 pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAction {
@@ -341,6 +383,19 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     {
                         action.rehost = Some(v.geom.id);
                     }
+                    // F225③:第三个按钮 —— 切到另一个活。摆在换节点左边,
+                    // 危险程度从右往左递减(× 最右)。
+                    if small_action_button(
+                        ui,
+                        project_id(v.geom.id),
+                        Mark::Icon(crate::ui::icon::Glyph::Project),
+                        t,
+                    )
+                    .on_hover_text("把这块分屏切到另一个项目")
+                    .clicked()
+                    {
+                        action.pick_project = Some(v.geom.id);
+                    }
                     // 剩下的空间(已扣掉 × / 换节点按钮)左对齐摆状态点 + 一整串标题文字;
                     // 排版用的 available_width 到这里已经是扣掉 × 之后的余量。
                     // × 不被顶出条外,靠的是 right_to_left 先占位 + 外层 set_clip_rect
@@ -387,6 +442,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                     v.host,
                                     v.cwd_leaf.as_deref(),
                                     v.tmux,
+                                    v.project,
                                     v.status,
                                     v.notice,
                                 ))
@@ -422,10 +478,33 @@ mod tests {
                 Some("build-01"),
                 Some("Mullion"),
                 Some("main"),
+                None,
                 PaneStatus::Live,
                 None
             ),
             "2 · build-01 · Mullion · main"
+        );
+    }
+
+    /// F225③:认出这块 pane 属于某个项目时,`项目名 · 目录名` **顶掉 tmux 名**。
+    ///
+    /// 项目的 tmux 名按 P5 就是从项目名推导的,两个一起显示是同一个信息
+    /// 说两遍 —— 而标题条那一行本来就不够用。
+    ///
+    /// 自证会变红:把实现里的 `project` 分支删掉(退回 `dir · tmux`)。
+    #[test]
+    fn a_pane_that_belongs_to_a_project_shows_the_project_instead_of_the_tmux_name() {
+        assert_eq!(
+            title_text(
+                2,
+                Some("build-01"),
+                Some("api"),
+                Some("mullion-我的项目"),
+                Some("我的项目"),
+                PaneStatus::Live,
+                None
+            ),
+            "2 · build-01 · 我的项目 · api"
         );
     }
 
@@ -441,6 +520,7 @@ mod tests {
                 Some("build-01"),
                 Some("Mullion"),
                 None,
+                None,
                 PaneStatus::Live,
                 None
             ),
@@ -452,13 +532,22 @@ mod tests {
                 Some("build-01"),
                 None,
                 Some("main"),
+                None,
                 PaneStatus::Live,
                 None
             ),
             "4 · build-01 · main"
         );
         assert_eq!(
-            title_text(5, Some("build-01"), None, None, PaneStatus::Live, None),
+            title_text(
+                5,
+                Some("build-01"),
+                None,
+                None,
+                None,
+                PaneStatus::Live,
+                None
+            ),
             "5 · build-01"
         );
     }
@@ -477,6 +566,7 @@ mod tests {
             Some("build-01"),
             Some("Mullion"),
             Some("main"),
+            None,
             PaneStatus::Disconnected,
             None,
         );
@@ -492,6 +582,7 @@ mod tests {
                 None,
                 Some("Mullion"),
                 Some("main"),
+                None,
                 PaneStatus::Live,
                 None
             ),
@@ -510,6 +601,7 @@ mod tests {
             Some("prod"),
             Some("srv"),
             None,
+            None,
             PaneStatus::Live,
             Some("当初的会话 web01 已不存在"),
         );
@@ -524,6 +616,7 @@ mod tests {
         let got = title_text(
             1,
             Some("prod"),
+            None,
             None,
             None,
             PaneStatus::Disconnected,
@@ -542,6 +635,7 @@ mod tests {
     fn a_pane_with_no_host_of_its_own_still_shows_why() {
         let got = title_text(
             2,
+            None,
             None,
             None,
             None,
@@ -597,6 +691,7 @@ mod tests {
             let mut view = TitleView {
                 geom: geom_800x600_title32(1, 1.0),
                 index: 1,
+                project: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -652,6 +747,7 @@ mod tests {
             let views = [TitleView {
                 geom: geom_800x600_title32(1, ppp),
                 index: 1,
+                project: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -713,6 +809,7 @@ mod tests {
         let views = [TitleView {
             geom,
             index: 1,
+            project: None,
             host: Some("this-is-a-ridiculously-long-hostname-that-will-never-fit.example.com"),
             status: PaneStatus::Live,
             focused: true,
@@ -767,6 +864,7 @@ mod tests {
         let views = [TitleView {
             geom: geom_800x600_title32(1, 1.0),
             index: 1,
+            project: None,
             host: Some("dev@build-01"),
             status: PaneStatus::Live,
             focused: true,
@@ -819,6 +917,30 @@ mod tests {
         let a = click_button(rehost_id(PaneId(1)));
         assert_eq!(a.rehost, Some(PaneId(1)), "点「换节点」应报告这块 pane");
         assert_eq!(a.close, None, "点「换节点」不该顺带把 pane 关了");
+    }
+
+    /// F225③:标题条第三个按钮 —— 把手上这块 pane 切到另一个活。
+    ///
+    /// 与「换节点」**分开两个按钮**(设计拍板):底层机制共享,但用户心智是
+    /// 两件事 ——「换一条路线到同一台机器」vs「切到另一个活」。合并成 tab 会
+    /// 让每次普通换节点都先撞见一个不相干的 tab。
+    ///
+    /// 自证会变红:把 `show` 里 `pick_project = Some(..)` 删掉。
+    #[test]
+    fn clicking_the_project_button_asks_to_switch_this_pane_to_another_project() {
+        let a = click_button(project_id(PaneId(1)));
+        assert_eq!(a.pick_project, Some(PaneId(1)), "点「项目」应报告这块 pane");
+        assert_eq!(a.rehost, None, "点「项目」不该弹换节点");
+        assert_eq!(a.close, None, "点「项目」不该把 pane 关了");
+    }
+
+    /// 三个按钮挨在一起,串一个就是一次误操作。上面两条各自钉了自己那一个,
+    /// 这条从**另一头**钉:点 × 不许顺带触发另外两个。
+    #[test]
+    fn clicking_close_triggers_nothing_else() {
+        let a = click_button(close_id(PaneId(1)));
+        assert_eq!(a.close, Some(PaneId(1)));
+        assert_eq!(a.pick_project, None, "点 × 不该弹项目选择");
     }
 
     /// 标题条上的按钮**不许**用超出 Latin-1 的字符画。
@@ -910,6 +1032,7 @@ mod tests {
         let views = [TitleView {
             geom,
             index: 1,
+            project: None,
             host: Some("h"),
             status: PaneStatus::Live,
             focused: true,
@@ -954,6 +1077,7 @@ mod tests {
         let views = [TitleView {
             geom: geom_800x600_title32(1, 1.0),
             index: 1,
+            project: None,
             host: Some("dev@build-01"),
             status: PaneStatus::Live,
             focused: true,
@@ -1038,6 +1162,7 @@ mod tests {
             let views = [TitleView {
                 geom: geom_800x600_title32(1, ppp),
                 index: 1,
+                project: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -1103,6 +1228,7 @@ mod tests {
             let views = [TitleView {
                 geom: geom_800x600_title32(1, 1.0),
                 index: 1,
+                project: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -1200,6 +1326,7 @@ mod tests {
             let views = [TitleView {
                 geom: geom_800x600_title32(id.0, ppp),
                 index: 1,
+                project: None,
                 host: Some("h"),
                 status: PaneStatus::Live,
                 focused: false,
@@ -1266,6 +1393,7 @@ mod tests {
         let views = [TitleView {
             geom: geom_800x600_title32(id.0, 1.0),
             index: 1,
+            project: None,
             host: Some("dev@a-very-long-hostname-that-eats-the-whole-row-by-itself"),
             status: PaneStatus::Live,
             focused: true,
@@ -1380,6 +1508,7 @@ mod tests {
             let views = [TitleView {
                 geom: g,
                 index: 1,
+                project: None,
                 host: Some("h"),
                 status: PaneStatus::Live,
                 focused,
@@ -1510,6 +1639,7 @@ mod tests {
             let views = [TitleView {
                 geom: g,
                 index: 1,
+                project: None,
                 host: Some("dev@a-very-long-hostname-that-eats-the-row"),
                 status: PaneStatus::Live,
                 focused: true,

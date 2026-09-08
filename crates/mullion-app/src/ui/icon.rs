@@ -43,6 +43,11 @@ pub enum Glyph {
     /// 三态**不许退化成两态**:把「未知」画成「灭」的话,用户会以为项目
     /// 没在跑而去开第二份 —— 同一个目录两个 Claude Code,正是这盏灯要防的。
     LampUnknown,
+    /// F225③:文件夹轮廓 —— pane 标题条上的「切到另一个项目」。
+    ///
+    /// 自绘而不是找一个文件夹字符:同 [`Glyph::Maximize`] 的理由,字形缺失
+    /// 只有人眼能发现,而 F21 允许用户换显示字体,换一次就可能再缺一次。
+    Project,
 }
 
 impl Glyph {
@@ -62,6 +67,7 @@ impl Glyph {
         Glyph::LampLit,
         Glyph::LampDark,
         Glyph::LampUnknown,
+        Glyph::Project,
     ];
 }
 
@@ -227,6 +233,21 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
                 stroke: stroke.into(),
             },
         ],
+        // 文件夹轮廓:左上角一个凸起的标签,其余是个盒子。首尾同点的
+        // `Shape::line`,同 `Maximize` 的理由(`rect_stroke` 产出的
+        // `Shape::Rect` 越界守护认不得)。
+        Glyph::Project => vec![Shape::line(
+            vec![
+                pos2(c.x - h, c.y + h),
+                pos2(c.x - h, c.y - h),
+                pos2(c.x - h * 0.1, c.y - h),
+                pos2(c.x + h * 0.15, c.y - h * 0.55),
+                pos2(c.x + h, c.y - h * 0.55),
+                pos2(c.x + h, c.y + h),
+                pos2(c.x - h, c.y + h),
+            ],
+            stroke,
+        )],
     }
 }
 

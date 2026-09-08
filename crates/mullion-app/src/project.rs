@@ -147,6 +147,22 @@ pub fn hits(
         .collect()
 }
 
+/// F225③:这块 pane 属于哪个项目 —— 判据与 [`hits`] 同一条(上报的 tmux 名
+/// == `project_tmux_name`),只是这里要的是**那一个**而不是一整个集合。
+///
+/// `report` 是这块 pane 上报的 tmux 名。`None`(还没上报)一律不属于任何项目
+/// —— 把「还不知道」当成命中的话,刚开的 pane 会先顶着一个错项目名。
+pub fn project_of<'a>(
+    report: Option<&str>,
+    projects: &'a [mullion_store::ProjectRecord],
+) -> Option<&'a mullion_store::ProjectRecord> {
+    let report = report?;
+    projects.iter().find(|p| {
+        let name = mullion_store::project_tmux_name(p);
+        !name.is_empty() && name == report
+    })
+}
+
 /// F224:该给哪些项目记一笔访问时间。
 ///
 /// **跃迁触发,不是电平触发。** 上报是持续的(每几秒一批),照字面「命中就
@@ -202,6 +218,41 @@ pub fn takeover_needed(clients: Option<usize>) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(id: u64, name: &str) -> mullion_store::ProjectRecord {
+        mullion_store::ProjectRecord {
+            id: mullion_store::ProjectId(id),
+            name: name.into(),
+            note: String::new(),
+            nodes: Vec::new(),
+            preferred: None,
+            dir: "/srv/api".into(),
+            tmux_name: None,
+            created_at: "t".into(),
+            last_accessed_at: None,
+        }
+    }
+
+    /// F225③:「这块 pane 属于哪个项目」由**上报的 tmux 名**现推,与 F224
+    /// 那盏灯同一条判据。同一条的好处是:用户绕过项目入口、自己 attach 进
+    /// 那个会话,标题条照样认得出来。
+    #[test]
+    fn a_pane_belongs_to_the_project_whose_tmux_session_it_reports() {
+        let ps = [named(1, "我的项目"), named(2, "别的活")];
+        let name = mullion_store::project_tmux_name(&ps[1]);
+        assert_eq!(project_of(Some(&name), &ps).map(|p| p.id.0), Some(2));
+    }
+
+    /// 还没上报(刚连上)/ 报的是别的会话 —— 都**不属于**任何项目。
+    ///
+    /// 尤其是 `None`:不许把「还不知道」当成命中某个项目,否则刚开的 pane
+    /// 会先顶着一个错项目名,几秒后才跳回去。
+    #[test]
+    fn a_pane_that_has_not_reported_yet_belongs_to_nothing() {
+        let ps = [named(1, "我的项目")];
+        assert!(project_of(None, &ps).is_none());
+        assert!(project_of(Some("随便一个会话"), &ps).is_none());
+    }
 
     /// 核对失败(exec 起不来 / 账号被 `ForceCommand` 挡住 / 远端根本没有
     /// tmux)必须**按无人处理**,而不是当成「有人」去弹确认框。

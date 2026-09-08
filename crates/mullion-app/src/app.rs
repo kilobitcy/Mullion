@@ -2442,6 +2442,11 @@ enum Modal {
     /// 换节点弹窗(pane 标题条上的换节点按钮)。里面有搜索框 —— 不算模态的话敲的
     /// 字会同时发给远端 shell(T8)。
     Rehost,
+    /// F225③:切项目弹窗(pane 标题条上的项目按钮)。理由与 `Rehost` 逐字
+    /// 相同 —— 里面有搜索框。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写(同 `Rehost` 的姿态)。
+    ProjectPick,
     /// F131:文件面板的路径条正在被编辑。**不算模态的话那个输入框收不到
     /// 任何键** —— 面板持有键盘焦点时键根本不喂 egui(T8 的注入点在
     /// `input_route::egui_should_see_focused`),Backspace 还会被
@@ -2485,6 +2490,7 @@ impl Modal {
         Modal::TabProps,
         Modal::ExitConfirm,
         Modal::Rehost,
+        Modal::ProjectPick,
         Modal::FilesPathEdit,
         Modal::FilesRename,
         Modal::FilesNewName,
@@ -3676,6 +3682,7 @@ impl App {
             Modal::ExitConfirm => self.ui.exit_pending,
             // 换节点弹窗里有搜索框 —— 同 `TabProps` 的理由(T8)。
             Modal::Rehost => self.ui.rehost.is_some(),
+            Modal::ProjectPick => self.ui.project_pick.is_some(),
             // F131:见 `Modal::FilesPathEdit` 的说明。
             Modal::FilesPathEdit => self.files_path_editing(),
             // F200:见 `Modal::FilesRename` 的说明。
@@ -10685,6 +10692,11 @@ impl ApplicationHandler<UserEvent> for App {
                             // 同 `active_ws_of` 的说明:这里借出去的 `titles` 一直
                             // 活到下面 `render_frame`,走方法会连 `self.active` /
                             // `self.ui` 一起锁住。
+                            // F225③:标题条要认项目,而项目表借自 `self.store`
+                            // —— 和 `titles` 一样要活到 `render_frame`,所以在
+                            // 借出 `titles` 之前先取好。
+                            let projects_now: &[mullion_store::ProjectRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.projects());
                             let titles: Vec<crate::ui::pane_title::TitleView<'_>> =
                                 active_ws_of(&self.tabs)
                                     .map(|ws| {
@@ -10731,6 +10743,16 @@ impl ApplicationHandler<UserEvent> for App {
                                                     .and_then(|p| p.cwd.as_deref())
                                                     .and_then(crate::ui::pane_title::dir_leaf),
                                                 tmux: ws.pane(g.id).and_then(|p| p.tmux.as_deref()),
+                                                // F225③:属不属于某个项目
+                                                // **现推**,判据与 F224 那盏灯
+                                                // 同一条。不记 `pane→项目` 的
+                                                // 映射:用户手动 detach / 换
+                                                // tmux 之后没人清它。
+                                                project: crate::project::project_of(
+                                                    ws.pane(g.id).and_then(|p| p.tmux.as_deref()),
+                                                    projects_now,
+                                                )
+                                                .map(|p| p.name.as_str()),
                                                 // F163/D4:attach 失败 / 会话已删 /
                                                 // 连不上的说明,挂在这块 pane 自己
                                                 // 的标题条上。
@@ -11053,6 +11075,24 @@ impl ApplicationHandler<UserEvent> for App {
                                 actions.rehost
                             {
                                 self.ui.rehost_request = Some((pane, session));
+                            }
+                            // F225③:点了 pane 标题条的「项目」:开弹窗。
+                            if let Some(pane) = actions.pick_project_pane {
+                                self.ui.project_pick =
+                                    Some(crate::ui::project_pick::ProjectPickDraft::new(pane));
+                                mark_ui_dirty!(self.ui_dirty);
+                            }
+                            // 切项目弹窗的结论。**汇进 F223 那条既有链路**
+                            // (`project_open_request`),不另开一条:确认框、
+                            // 远端核对、踢人、SFTP 跟目录全在那条路上,绕过去
+                            // 等于把它们统统丢掉。带上弹窗记下的那块 pane ——
+                            // 不是当前焦点:用户等待期间可能点了别处。
+                            if let Some(crate::ui::project_pick::PickAction::Pick {
+                                pane,
+                                project,
+                            }) = actions.project_pick
+                            {
+                                self.ui.project_open_request = Some((project, Some(pane)));
                             }
                             // 布局动作:点了预设 / 点了标题条的 ×。路由逻辑在自由函数
                             // `apply_layout_actions`(只碰 &mut Workspace,可脱离
@@ -13207,6 +13247,8 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.tab_props.is_some()
         || a.rehost.is_some()
         || a.rehost_pane.is_some()
+        || a.project_pick.is_some()
+        || a.pick_project_pane.is_some()
         || a.history.is_some()
 }
 
@@ -13883,6 +13925,59 @@ mod tests {
         assert!(
             body.contains("Modal::ProjectTakeoverConfirm => self.ui.project_takeover.is_some()"),
             "modal_open 里没有 ProjectTakeoverConfirm 独立的那一臂(T8)"
+        );
+    }
+
+    /// F225③/T8:切项目弹窗里有搜索框,理由与项目管理器那条逐字相同。
+    ///
+    /// 自证会变红:把 `Modal::ProjectPick` 从 `Modal::ALL` 里删掉,
+    /// 或把它那一臂并进 `Modal::Rehost`。
+    #[test]
+    fn the_project_picker_is_a_modal_so_typing_cannot_leak_to_the_remote_shell() {
+        assert!(
+            Modal::ALL.contains(&Modal::ProjectPick),
+            "ProjectPick 没登记进 Modal::ALL(T8)"
+        );
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open");
+        let body = &after[..after.find("\n    }\n").expect("找不到 modal_open 的结尾")];
+        assert!(
+            body.contains("Modal::ProjectPick => self.ui.project_pick.is_some()"),
+            "modal_open 里没有 ProjectPick 独立的那一臂(T8)"
+        );
+    }
+
+    /// F225③:标题条上选中的项目必须**汇进 F223 那条既有链路**
+    /// (`project_open_request`),不许另开一条。
+    ///
+    /// 另开一条的话,确认框(F223)、attach 前的远端核对与踢人(F224)、
+    /// SFTP 侧栏跟目录 —— 全部静默失效,而画面上「切过去了」看着一切正常。
+    ///
+    /// 源码切片:这一段要真 `App` + 真渲染帧才跑得起来。**先剥注释行**
+    /// (上面这段说明本身就含判据里的关键词)。
+    ///
+    /// 自证会变红:把那一句改成任何别的赋值目标(比如直接 `self.ui.rehost_request`)。
+    #[test]
+    fn a_project_picked_from_the_title_bar_goes_through_the_same_open_path() {
+        let src = include_str!("app.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("找不到生产代码那一半")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after = production
+            .split("PickAction::Pick {")
+            .nth(1)
+            .expect("没接切项目弹窗的结论");
+        assert!(
+            after.contains("self.ui.project_open_request = Some((project, Some(pane)))"),
+            "切项目没汇进 F223 那条链路 —— 确认框/远端核对/踢人全部静默失效"
         );
     }
 
@@ -15640,6 +15735,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::Rehost),
                     "Rehost 没登记进 Modal::ALL(T8)"
                 ),
+                Modal::ProjectPick => assert!(
+                    Modal::ALL.contains(&Modal::ProjectPick),
+                    "ProjectPick 没登记进 Modal::ALL(T8/F225③)"
+                ),
                 Modal::FilesPathEdit => assert!(
                     Modal::ALL.contains(&Modal::FilesPathEdit),
                     "FilesPathEdit 没登记进 Modal::ALL(T8/F131)"
@@ -15675,6 +15774,7 @@ mod tests {
             // 补漏:这一项过去缺席 —— `match` 有它那一臂,但循环从不喂它,
             // 那条 `assert!` 是死代码(F148 复核顺带发现)。
             Modal::Rehost,
+            Modal::ProjectPick,
             Modal::FilesPathEdit,
             Modal::FilesRename,
             Modal::FilesNewName,
