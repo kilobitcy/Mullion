@@ -57,22 +57,29 @@ pub enum OpenStep {
     Refuse(&'static str),
 }
 
+/// 这个项目会往哪台机器上拨。
+///
+/// `preferred` 优先,**但必须真在 `nodes` 里** —— 用户把首选那条从列表里去掉、
+/// `preferred` 却没跟着清的话(F189 下别的实例改了配置就会发生),拿它去拨号会
+/// 连到一台已经不属于这个项目的机器上。`validate_project` 那道闸只管保存路径,
+/// 读回来的旧数据不受它管。
+///
+/// 单独摘出来是因为**列表上写着的节点名必须和点下去真连的那台是同一条判据**
+/// (F225① launcher 每行都写着节点名)。各写一份的话,「显示 A、连上 B」是这类
+/// 界面里最难查的一种错。
+pub fn node_for(p: &mullion_store::ProjectRecord) -> Option<mullion_store::SessionId> {
+    p.preferred
+        .filter(|id| p.nodes.contains(id))
+        .or_else(|| p.nodes.first().copied())
+}
+
 /// 打开项目的决策。零 IO 纯函数 —— 把「选哪条路线」和「要不要先问」这两件
 /// 各自会出错的事从事件循环里摘出来。
-///
-/// 选路线:`preferred` 优先,**但必须真在 `nodes` 里** —— 用户把首选那条从
-/// 列表里去掉、`preferred` 却没跟着清的话(F189 下别的实例改了配置就会发生),
-/// 拿它去拨号会连到一台已经不属于这个项目的机器上。`validate_project` 那道
-/// 闸只管保存路径,读回来的旧数据不受它管。
 ///
 /// **没有自动故障转移**(设计拍板):首选连不上就报错,由用户自己决定换哪条。
 /// 悄悄换一条的话,用户以为自己在 A 机器上干活,其实在 B 机器上。
 pub fn plan_open(p: &mullion_store::ProjectRecord, risk: AtRisk) -> OpenStep {
-    let node = p
-        .preferred
-        .filter(|id| p.nodes.contains(id))
-        .or_else(|| p.nodes.first().copied());
-    let Some(node) = node else {
+    let Some(node) = node_for(p) else {
         return OpenStep::Refuse("这个项目还没有节点,先在项目管理器里勾一条。");
     };
     let reasons = confirm_reasons(risk);

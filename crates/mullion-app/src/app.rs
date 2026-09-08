@@ -2301,6 +2301,10 @@ struct DialTicket {
     cfg: SshConfig,
     /// F40~F44/F141:自动化待决包,见 `PendingAutomationState`。
     automation: PendingAutomationState,
+    /// F225①:这次拨号是「从 launcher 打开项目」时,项目的目录。
+    /// `ConnectOk` 抵达时拿它盖掉会话那份更泛的 `SftpPrefs.default_remote`
+    /// —— 项目是更具体的上下文(同 `dial_project` 走换节点那条路的处置)。
+    project_dir: Option<String>,
 }
 
 /// F40~F44/F141:一次「点连接」在**那一帧**算好、等 `ConnectOk` 抵达时
@@ -2643,7 +2647,7 @@ impl App {
         // CLI 直连(路径①)→ 立刻发起连接,进终端态。
         if let Some(cfg) = self.initial.take() {
             // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
-            self.spawn_connect(cfg, false, None, false);
+            self.spawn_connect(cfg, false, None, false, None);
             return;
         }
         // F148 D9:无参启动 → 有历史就先给恢复列表,没有就照旧弹会话管理器。
@@ -3301,7 +3305,7 @@ impl App {
         mark_ui_dirty!(self.ui_dirty);
         // F205:会话身份随票走 —— 重连是在**已经有别的连接在途**时最容易被
         // 触发的一条路径,单槽在这里被盖掉的概率最高。
-        self.spawn_connect(cfg, wants_sftp, Some(session_id), false);
+        self.spawn_connect(cfg, wants_sftp, Some(session_id), false, None);
         true
     }
 
@@ -7494,12 +7498,17 @@ impl App {
     /// 与这次拨号的其余随行数据一起**装进一张票**存进 `self.dials`,票号
     /// 随任务走。从前这些都写在 `App` 的单槽上,第二次拨号会把第一次的
     /// 整体盖掉 —— 见 `shell::dial_ledger` 的模块文档。
+    ///
+    /// F225①:`project` 非 `None` = 这次拨号是「从 launcher 打开项目」。
+    /// **在点击那一帧克隆好传进来**,理由同票里其余各样 —— 拨号是真实网络
+    /// 往返,这期间用户完全可能去项目管理器把它改了甚至删了。
     fn spawn_connect(
         &mut self,
         cfg: SshConfig,
         wants_sftp: bool,
         session_id: Option<SessionId>,
         skip_automation: bool,
+        project: Option<&mullion_store::ProjectRecord>,
     ) {
         // F40~F44:此刻才确定「是哪条会话」。连接在途期间用户可能改配置甚至
         // 删会话,所以计划必须在用户点击的这一帧定死。
@@ -7531,6 +7540,11 @@ impl App {
             fallback_name = Some(name.clone());
             Some((resolved.automation, name))
         });
+        // F225①:带项目的拨号改用项目那份计划(含 tmux attach + 项目目录
+        // + F224 的核对闸)。不改的话标签照样连上、目录还是会话自己的、
+        // tmux 要么不 attach 要么 attach 到**别的** session —— 灯永远不亮、
+        // 访问时间永远不记,而客户端零报错。
+        let plan = crate::automation::plan_for_dial(plan, tpl.as_ref(), project);
         // F205:这次拨号的随行数据整份装票。`cfg` 也在票里 —— 不装的话
         // 第二次连接后在第一个标签上开分屏,会用上一台主机的 term/尺寸
         // (F35 的 `open_pty` 靠 `TerminalTab::last_cfg`)。
@@ -7543,6 +7557,7 @@ impl App {
                 session_name: fallback_name,
                 skip: skip_automation,
             },
+            project_dir: project.map(|p| p.dir.clone()),
         });
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
@@ -7645,7 +7660,7 @@ impl App {
         // 没有 `session_id`(CLI 直连没有会话记录)或 store 里查不到(会话
         // 已被删)都落回全空默认——
         // 跟「没配置」等价,不阻断连接本身。
-        let sftp_prefs = session_id
+        let mut sftp_prefs = session_id
             .and_then(|id| {
                 self.store
                     .as_ref()
@@ -7653,6 +7668,13 @@ impl App {
             })
             .map(|rec| rec.sftp.clone())
             .unwrap_or_default();
+        // F225①:从 launcher 打开项目 —— 文件面板的**兜底**落脚点改成项目
+        // 目录。运行期覆盖,不写回配置(同 F122 的姿态);换节点那条路在
+        // `dial_project` 里做同一件事,两处必须一致,否则同一个项目从两个
+        // 入口打开会落在两个目录。
+        if let Some(dir) = ticket.project_dir {
+            sftp_prefs.default_remote = Some(dir);
+        }
 
         if wants_sftp {
             // D1/D6:SFTP 节点——独占标签、独占连接(`handle`),不开
@@ -8101,10 +8123,10 @@ impl App {
             return;
         };
         let Some((g, focus)) = self.active_ws().map(|ws| (ws.generation(), ws.focus())) else {
-            // 活动标签不是终端(文件标签 / launcher)。F225① 的 launcher 入口
-            // 落地前到不了这里 —— 那时它得先开一个终端标签,不是往这条路走。
-            self.ui
-                .set_error("当前标签不是终端,没法在这里打开项目".to_string());
+            // F225①:活动标签不是终端(launcher 态一块 pane 都没有,或当前是
+            // 文件标签)—— **开一个新标签**,而不是报错。launcher 上那份项目
+            // 列表正是本功能的主入口,那里恒走这一支。
+            self.open_project_in_new_tab(&p, ask.node);
             return;
         };
         let pane = ask.pane.unwrap_or(focus);
@@ -8123,6 +8145,34 @@ impl App {
             t.sftp_default_remote = Some(p.dir.clone());
         }
         let _ = self.spawn_rehost_on(g, pane, ask.node, RehostKind::UserPicked, Some(p));
+    }
+
+    /// F225①:launcher(或文件标签)上点项目 —— 拨一条**新**连接、开新标签。
+    ///
+    /// 与 `dial_project` 那条换节点路的差别只有「往哪儿放」:计划都是
+    /// `plan_for_dial`/`plan_for_rehost` 里项目那一支(含 tmux attach + 项目
+    /// 目录 + F224 的核对闸),两条路发的字节是同一份。
+    fn open_project_in_new_tab(&mut self, p: &mullion_store::ProjectRecord, node: SessionId) {
+        let Some(store) = self.store.as_ref() else {
+            self.ui.set_error("配置库不可用,无法打开项目".to_string());
+            return;
+        };
+        let (cfg, wants_sftp) = match store.dial_plan_for(node) {
+            Ok(v) => v,
+            Err(e) => {
+                self.ui.set_error(e.to_string());
+                return;
+            }
+        };
+        // SFTP 节点没有 PTY,attach 过去是一块永远不出字的黑屏。保存那一道
+        // (`validate_project`)与勾选列表(`selectable_nodes`)都拦过它,
+        // 这是第三道:旧数据、或别的实例刚把那条会话改成 SFTP。
+        if wants_sftp {
+            self.ui
+                .set_error("项目节点必须是 SSH 会话,这条是 SFTP 节点".to_string());
+            return;
+        }
+        self.spawn_connect(cfg, false, Some(node), false, Some(p));
     }
 
     #[must_use]
@@ -10796,6 +10846,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 credentials,
                                 projects,
                                 project_lamps: &project_lamps,
+                                // F225①:一个标签都没有 = launcher 态,中央区
+                                // 画项目列表。判据与上面算灯的那一半同源。
+                                launcher: self.tabs.is_empty(),
                                 known_hosts: known_hosts_guard.as_deref(),
                                 tunnels,
                                 tunnel_states: &tunnel_states,
@@ -11713,7 +11766,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // (从前它是 `App` 上的单槽,得靠「只在 `spawn_connect`
                             // 里写」这条约定才不会漂到另一条在途连接上)。失败支
                             // (配置坏了走 Err)压根不发票,自然也带不走它。
-                            self.spawn_connect(cfg, wants_sftp, Some(id), skip_automation);
+                            self.spawn_connect(cfg, wants_sftp, Some(id), skip_automation, None);
                         }
                         Some(Err(e)) => self.ui.set_error(e.to_string()),
                         None => {}
@@ -21043,8 +21096,10 @@ mod tests {
         let body = &after[..after
             .find("\n    }\n")
             .expect("找不到 accept_connect_ok 的结尾")];
+        // 锚点不含 `let`:F225① 之后这个绑定是 `let mut`(项目目录要盖上去)。
+        // 钉到 `= session_id` 反而更紧 —— 它同时钉住了「偏好来自这条会话」。
         assert!(
-            body.contains("let sftp_prefs ="),
+            body.contains("sftp_prefs = session_id"),
             "ConnectOk 没有从 store 读配置的 SFTP 偏好"
         );
         assert_eq!(

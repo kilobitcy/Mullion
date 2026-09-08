@@ -223,6 +223,29 @@ pub fn apply_gate(plan: PendingAutomation, verdict: GateVerdict) -> Option<Pendi
     })
 }
 
+/// F225①:这次**拨号**(开新标签)该用哪份计划。
+///
+/// 与 [`plan_for_rehost`] 同一个分岔、不同的默认支:那条的「不带项目」是
+/// 「分屏/换节点,跳过 tmux」,这条的「不带项目」是 `spawn_connect` 原本
+/// 就算好的会话计划(含 tmux,那是建标签的第一块 pane)。
+///
+/// 带项目时**整个换掉**而不是在会话计划上打补丁:项目要盖的三样
+/// (`enabled`/`tmux`/`work_dir`)在 `overlay_project` 里已经定死一处,
+/// 这里再拼一遍就是第二份判据,迟早漂移。
+///
+/// `tpl` 为 `None`(会话解析不出来)时只能退回会话那份 —— 没有底板就
+/// 盖不了。项目那条路走到这儿已经是异常,由拨号本身去报错。
+pub fn plan_for_dial(
+    session_plan: Option<PendingAutomation>,
+    tpl: Option<&ResolvedAutomation>,
+    project: Option<&mullion_store::ProjectRecord>,
+) -> Option<PendingAutomation> {
+    match (project, tpl) {
+        (Some(p), Some(tpl)) => pending_for_project(tpl, p),
+        _ => session_plan,
+    }
+}
+
 /// F223:换节点(含「打开项目」)那块 pane 该跑什么。
 ///
 /// **这个分岔本身就是守护对象**:普通换节点跳过 tmux,打开项目走全套。
@@ -604,6 +627,43 @@ mod tests {
             apply_gate(plan(), GateVerdict::Cancel).is_none(),
             "取消 = 一个字节都不发"
         );
+    }
+
+    /// **F225①。** 从 launcher 点项目开出来的**新标签**,发的必须是项目那份
+    /// 计划(含 tmux attach + 项目目录 + F224 的闸),不是这条会话自己那份。
+    ///
+    /// 走错的现象跟 F223 那条一模一样、也一样静默:标签连上了、目录可能还是
+    /// 会话自己的、tmux 要么不 attach 要么 attach 到会话名那个**别的** session
+    /// —— 灯永远不亮、访问时间永远不记,而客户端零报错。这里尤其容易走错:
+    /// launcher 那条路复用的是 `spawn_connect`,而它原本只认会话。
+    ///
+    /// 自证会变红:把 `plan_for_dial` 的项目分支删掉,恒返回 `session_plan`。
+    #[test]
+    fn opening_a_project_from_the_launcher_dials_with_the_projects_plan() {
+        let mut base = bare();
+        // 这条会话自己把 tmux 关了、目录也是别处 —— 项目那份必须整个盖过去。
+        base.tmux = Some(TmuxChoice::Off);
+        base.work_dir = Some("/home/me".into());
+        let p = project("我的项目", "/srv/app");
+        let session_plan =
+            pending_for(Some(SessionId(1)), |_| Some((base.clone(), "web01".into())));
+
+        let plain = plan_for_dial(session_plan, Some(&base), None);
+        assert!(
+            plain.is_none()
+                || !String::from_utf8(plain.unwrap().steps[0].bytes.clone())
+                    .unwrap()
+                    .contains("tmux"),
+            "不带项目的拨号不该凭空多出 tmux"
+        );
+
+        let session_plan =
+            pending_for(Some(SessionId(1)), |_| Some((base.clone(), "web01".into())));
+        let opened = plan_for_dial(session_plan, Some(&base), Some(&p)).expect("项目必须有计划");
+        let line = String::from_utf8(opened.steps[0].bytes.clone()).unwrap();
+        assert!(line.contains("exec tmux attach"), "项目没 attach: {line}");
+        assert!(line.contains("'/srv/app'"), "目录得是项目的: {line}");
+        assert!(opened.gate.is_some(), "项目计划必须带 F224 的核对闸");
     }
 
     /// 闸只属于项目。普通换节点 / 分屏 / 重连都不该带 —— 带了的话,每块新

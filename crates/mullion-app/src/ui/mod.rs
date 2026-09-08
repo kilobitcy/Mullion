@@ -15,6 +15,7 @@ pub mod host_key;
 pub mod ico;
 pub mod icon;
 pub mod import_dialog;
+pub mod launcher;
 pub mod metrics;
 pub mod pane_edges;
 pub mod pane_title;
@@ -474,6 +475,10 @@ pub struct UiFrame<'a> {
     /// [`crate::project::Lamp::Unknown`] 显示 —— 不是「灭」,见那个枚举。
     pub project_lamps:
         &'a std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
+    /// F225①:中央区画不画项目列表 —— 一个标签都没有(launcher 态)时为真。
+    /// 与 [`Self::restored`] 和文件面板**互斥**:那两个各自也是 `CentralPanel`,
+    /// 而 launcher 态压根不存在标签,谈不上占位标签或文件标签。
+    pub launcher: bool,
     /// F222:`known_hosts` 指纹表。**只在项目管理器开着时才是 `Some`** ——
     /// 它在 `App` 里是 `Arc<Mutex<_>>`,SSH 线程握手时也要拿;每帧无条件锁
     /// 会让一次握手白等一帧。`None` 时项目节点一律标「待核」,不会误判同机。
@@ -979,6 +984,18 @@ pub fn build_ui(
     if let Some(v) = frame.restored {
         actions.reconnect_tab = restored::show(ctx, t, v);
     }
+    // F225①:launcher 态的项目列表。同样是 `CentralPanel`,与上面两支互斥
+    // ——「一个标签都没有」和「当前标签是占位/文件标签」不可能同时成立。
+    if frame.launcher {
+        launcher::show(
+            ctx,
+            t,
+            ui_state,
+            frame.projects,
+            frame.project_lamps,
+            frame.sessions,
+        );
+    }
     if let Some(files) = files_content {
         let (r, l) = files_panel::content(
             ctx,
@@ -1182,6 +1199,7 @@ mod tests {
                 > = std::sync::OnceLock::new();
                 EMPTY.get_or_init(Default::default)
             },
+            launcher: false,
             known_hosts: None,
             tunnels: &[],
             tunnel_states: &[],
@@ -2260,6 +2278,45 @@ mod tests {
             (content_w, content_h),
             (closed_w, closed_h),
             "标签宿主应铺满跟终端一样的中央区,不该被额外挤窄:关闭态 {closed_w}x{closed_h}px,标签宿主 {content_w}x{content_h}px"
+        );
+    }
+
+    /// F225①:同上一条的形状 —— `build_ui` 收了 `frame.launcher` 却没接
+    /// `launcher::show`,编译期完全无感:launcher 态中央区**本来就是空的**
+    /// (终端 GPU 自绘,egui 在那儿一个部件都没有),漏接的症状和「本来就
+    /// 没这个功能」一模一样,`central_px` 也分毫不差。
+    ///
+    /// 破坏性验证:把 `build_ui` 里 `if frame.launcher { .. }` 整段删掉 ——
+    /// 项目名画不出来,断言变红。
+    #[test]
+    fn build_ui_actually_draws_the_project_launcher_when_asked_to() {
+        let ps = [mullion_store::ProjectRecord {
+            id: mullion_store::ProjectId(1),
+            name: "启动页上的项目".into(),
+            note: String::new(),
+            nodes: Vec::new(),
+            preferred: None,
+            dir: "/srv/api".into(),
+            tmux_name: None,
+            created_at: "2026-09-01T00:00:00Z".into(),
+            last_accessed_at: None,
+        }];
+        let frame = UiFrame {
+            launcher: true,
+            projects: &ps,
+            ..base_frame()
+        };
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut text = String::new();
+        for _ in 0..2 {
+            let (out, _) = run_frame(&ctx, &mut ui_state, frame, egui::RawInput::default(), None);
+            text = collect_text(&out);
+        }
+        assert!(
+            text.contains("启动页上的项目"),
+            "launcher 中央区没画出来 —— build_ui 收了 frame.launcher 却没接上 \
+             launcher::show,实际画出来的文本: {text}"
         );
     }
 

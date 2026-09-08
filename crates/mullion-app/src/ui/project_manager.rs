@@ -197,7 +197,7 @@ fn list_column(
 ///
 /// 颜色**不承担区分职责**,形状才是:实心/空心/带点各不相同。色觉障碍、
 /// 以及深色底上绿灰难辨的情况下,这盏灯仍然读得出来。
-fn lamp_dot(ui: &mut egui::Ui, t: &crate::theme::Theme, lamp: crate::project::Lamp) {
+pub(super) fn lamp_dot(ui: &mut egui::Ui, t: &crate::theme::Theme, lamp: crate::project::Lamp) {
     use crate::project::Lamp;
     let (glyph, color, tip) = match lamp {
         Lamp::Lit => (
