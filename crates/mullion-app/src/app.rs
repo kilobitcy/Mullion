@@ -8414,6 +8414,32 @@ impl App {
             self.ui.set_error("这个项目已经不在了".to_string());
             return;
         };
+        // F235:记一笔访问时间。**在这里、在任何分支之前** —— 下面那条开新
+        // 标签的支线是 early return,记在它后面的话从 launcher 点开的项目一条
+        // 都不会记,而 launcher 正是主入口。
+        //
+        // 为什么不只靠 F224 的上报跃迁:那条链路是「pane 上报远端 tmux 名 →
+        // `project::hits` 匹配 → 跃迁时写盘」,中间任何一环没成(上报自举没跑、
+        // 连接失败、远端会话名对不上)时间戳就永远是 `None`,列表退化成按 id
+        // 排 —— 用户看到的就是「排序坏了」,且零报错。
+        //
+        // 上报那条**保留**:它还负责「用户不走项目入口、直接连会话 attach 进
+        // 那个 tmux」的情形(F224①)。两条写的都是「刚刚」,谁后写谁赢都对。
+        //
+        // 与 F224② 的「跃迁才写」不冲突:那条约束防的是「每几秒写一次盘」,
+        // 而这里一次点击只走一遍。
+        //
+        // 写不进去**只记日志**:访问时间不是用户资产,为它弹一张错误卡片不成
+        // 比例(同 `drive_project_visits`)。
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        if let Some(store) = self.store.as_mut() {
+            store.touch_project_accessed(ask.project, &now);
+            if let Err(e) = store.save() {
+                log::debug!(target: "mullion", "项目访问时间落盘失败: {e}");
+            }
+        }
         let Some((g, focus)) = self.active_ws().map(|ws| (ws.generation(), ws.focus())) else {
             // F225①:活动标签不是终端(launcher 态一块 pane 都没有,或当前是
             // 文件标签)—— **开一个新标签**,而不是报错。launcher 上那份项目
@@ -14363,6 +14389,54 @@ mod tests {
         assert!(
             code.contains("RehostKind::UserPicked, Some(p))"),
             "dial_project 没把项目传给 spawn_rehost_on —— 打开项目不会 attach tmux"
+        );
+    }
+
+    /// F235:点开项目那一刻就记一笔访问时间。
+    ///
+    /// 改之前唯一的写入点是 `drive_project_visits` 的上报跃迁 —— 链路是
+    /// 「pane 上报远端 tmux 名 → `project::hits` 匹配 → 跃迁时写盘」,中间
+    /// 任何一环没成(上报自举没跑、连接失败、远端会话名对不上),时间戳就
+    /// 永远是 `None`:右栏显示「从未」、列表退化成按 id 排,用户看到的就是
+    /// 「排序坏了」,且零报错。
+    ///
+    /// 上报那条**保留**:它还负责「用户不走项目入口、直接连会话 attach 进
+    /// 那个 tmux」的情形(F224①)。两条写的都是「刚刚」,谁后写谁赢都对。
+    ///
+    /// 源码切片:`dial_project` 要真 `App` + 真连接才跑得起来。**先剥注释行**
+    /// (实现里那段说明本身就含这两个函数名)。
+    ///
+    /// 自证会变红:把那句记账删掉;或把它整段挪到 `active_ws()` 那个 `else`
+    /// 之后(第二条断言红)。
+    #[test]
+    fn opening_a_project_records_the_visit_right_away_not_only_when_the_report_lands() {
+        let src = include_str!("app.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了")
+            .0;
+        let body = production
+            .split_once("fn dial_project(")
+            .expect("找不到 dial_project")
+            .1;
+        let body = &body[..body.find("\n    }\n").expect("找不到 dial_project 的结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let touch = code
+            .find("touch_project_accessed(")
+            .expect("dial_project 没记访问时间 —— 上报链路断掉时列表会永远显示「从未」");
+        // 必须排在两条分支**之前**:`open_project_in_new_tab` 那一支是 early
+        // return,记在它后面的话从 launcher 点开的项目一条都不记 —— 而
+        // launcher 正是这个功能的主入口。
+        let branch = code
+            .find("open_project_in_new_tab(")
+            .expect("找不到开新标签那一支");
+        assert!(
+            touch < branch,
+            "记账排在 open_project_in_new_tab 之后 —— 从 launcher 点开的项目一条都不会记"
         );
     }
 
