@@ -30,6 +30,12 @@ const EXTRA: &[&str] = &[
     // F225② 的项目管理器：`use` 了 `session_manager::form` 的 section/grid，
     // 同样吃 `metrics` 的刻度。不登记的话规范对它一条都管不住。
     concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/project_manager.rs"),
+    // F233:三处项目列表共用的行 + 启动页 + pane 切换弹窗。它们同样吃
+    // `metrics` 的间距/宽度刻度。漏登记的话规范对它们一条都管不住 ——
+    // 而这三个文件是本切片新写/大改的,正是最容易漏进裸数字的地方。
+    concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/project_row.rs"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/launcher.rs"),
+    concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/project_pick.rs"),
 ];
 
 /// 既有违规的行级白名单。
