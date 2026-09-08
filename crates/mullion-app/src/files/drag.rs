@@ -53,28 +53,57 @@ impl Landing {
     }
 }
 
-/// 从 `from` 栏拖到 `onto` 栏、松手时指针底下是 `over_dir`,该传到哪儿。
-///
-/// `None` = 这一拖不成立。
+/// F227:一次拖拽落地之后到底要做什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropKind {
+    /// 跨栏 —— 上传 / 下载(F58 的既有语义)。
+    Transfer,
+    /// 远端栏内 —— 移动(默认)或复制(按住 Ctrl)。走 F220 的粘贴流水线,
+    /// **不走传输通路**。
+    Within(crate::files::clip::ClipMode),
+}
+
+/// 从 `from` 栏拖到 `onto` 栏、松手时指针底下是 `over_dir`、当时按着 Ctrl 没有,
+/// 该做什么、落到哪儿。`None` = 这一拖不成立。
 ///
 /// `over_dir`:松手那一刻指针底下那一行的名字,**且那一行是目录**。文件行与
 /// 空白都给 `None` —— 落在文件上不解释成「覆盖那个文件」:拖拽没有二次确认,
 /// 一个手抖就能把远端文件盖掉,而「覆盖某个具体文件」这个需求本来就罕见。
-pub fn drop_target(
+///
+/// # 为什么栏内拖不能走传输通路
+///
+/// 远端栏内把 a 拖到 b,如果解释成「把 a 上传到远端 b」,源和目标是同一条
+/// SFTP 连接上的同一棵树 —— `open_write` 截断在前、读在后,**文件直接清零**。
+/// 所以栏内拖走的是完全不同的一条路:合成一份 `RemoteClip` 交给 F220 的
+/// 粘贴流水线(`is_within` 自嵌套闸、冲突弹框、序号过期闸全在那条路上)。
+///
+/// 本地栏内拖仍然一律拒绝:本机文件管理外包给资源管理器(设计 D5)。
+pub fn drop_intent(
     from: PanelColumn,
     onto: PanelColumn,
     over_dir: Option<Vec<u8>>,
-) -> Option<Landing> {
-    // 同栏内拖 = 移动/改名,本切片不做。**必须在这里挡住**:放过去的话,
-    // 远端栏内把 a 拖到 b 会变成「把 a 上传到远端 b」,即自己传给自己 ——
-    // 源和目标同一个路径,`open_write` 截断在前、读在后,文件直接清零。
+    ctrl: bool,
+) -> Option<(DropKind, Landing)> {
+    use crate::files::clip::ClipMode;
     if from == onto {
-        return None;
+        if onto == PanelColumn::Local {
+            return None;
+        }
+        // 只有落在**目录行**上才成立。落在空白/路径条/文件行上,目标就是
+        // 当前目录 —— 那等于「原地移动」,一个无操作;当成一次真的粘贴发
+        // 出去,用户会以为自己干了点什么。
+        let name = over_dir?;
+        let mode = if ctrl { ClipMode::Copy } else { ClipMode::Cut };
+        return Some((DropKind::Within(mode), Landing::Sub(name)));
     }
-    Some(match over_dir {
-        Some(name) => Landing::Sub(name),
-        None => Landing::Cwd,
-    })
+    // 跨栏:Ctrl 不改变语义 —— 上传/下载本来就是复制。
+    Some((
+        DropKind::Transfer,
+        match over_dir {
+            Some(name) => Landing::Sub(name),
+            None => Landing::Cwd,
+        },
+    ))
 }
 
 /// 把拖进窗口的一批**绝对路径**按父目录分组,每组给 `(父目录, 名字列表)`。
@@ -115,18 +144,28 @@ pub fn drop_in_hint(remote_cwd: &RemotePath, n: usize) -> String {
     format!("松开上传 {n} 项到 {}", remote_cwd.display())
 }
 
-/// F151:拖拽途中跟着指针走的那个小胶囊上写什么。
+/// F151/F227:拖拽途中跟着指针走的那个小胶囊上写什么。
 ///
 /// `Response::dnd_set_drag_payload` 只挂载荷、不画预览 —— 没有这一条的话
 /// 拖起来指针底下什么都没有,用户分不清「拖没拖着」「拖了几项」。
 ///
+/// `into`:栏内拖时指针正压着的目标目录 + 这一拖是移动还是复制。有它就必须
+/// 写出来 —— 栏内拖**不弹二次确认框**,松手前这句话是用户唯一的提示,而
+/// 「移动」是破坏性的。跨栏拖给 `None`,维持 F151 原样。
+///
 /// 单项显名字(用户要确认拖的是哪一个),多项显条数(名字列表在指针边上
 /// 铺不下,而且这时用户关心的是「有没有把该选的都带上」)。
-pub fn preview_label(n: usize, first: &str) -> String {
-    if n <= 1 {
-        first.to_owned()
-    } else {
-        format!("拖动 {n} 项")
+pub fn preview_label(
+    n: usize,
+    first: &str,
+    into: Option<(&str, crate::files::clip::ClipMode)>,
+) -> String {
+    use crate::files::clip::ClipMode;
+    match into {
+        Some((dir, ClipMode::Cut)) => format!("移动 {n} 项到 {dir}"),
+        Some((dir, ClipMode::Copy)) => format!("复制 {n} 项到 {dir}"),
+        None if n <= 1 => first.to_owned(),
+        None => format!("拖动 {n} 项"),
     }
 }
 
@@ -134,41 +173,85 @@ pub fn preview_label(n: usize, first: &str) -> String {
 mod tests {
     use super::*;
 
+    /// F227:本地栏内拖仍然不成立 —— 本机文件管理外包给资源管理器(D5)。
     #[test]
-    fn dragging_within_the_same_column_is_not_a_transfer() {
-        // 远端栏内部把一条拖到另一条 —— 那是移动/改名,本切片不做。放过去
-        // 就是「把远端文件上传到它自己」,截断在读之前,文件会被清零。
+    fn dragging_within_the_local_column_is_still_refused() {
         assert_eq!(
-            drop_target(PanelColumn::Remote, PanelColumn::Remote, None),
-            None
-        );
-        assert_eq!(
-            drop_target(
+            drop_intent(
                 PanelColumn::Local,
                 PanelColumn::Local,
-                Some(b"sub".to_vec())
+                Some(b"sub".to_vec()),
+                false
             ),
             None
         );
     }
 
+    /// F227:远端栏内拖到目录行 = **移动**;按住 Ctrl = 复制。
+    ///
+    /// 这两条必须分开断言:共用一条的话,把 `ctrl` 那个三目写反了(移动/复制
+    /// 对调)照样只有一条断言在管,而**移动是破坏性的** —— 用户以为复制了一份,
+    /// 源目录里那份其实已经没了。
+    ///
+    /// 自证会变红:把 `ctrl` 的两个分支对调,两条各自红一半。
     #[test]
-    fn dropping_on_a_directory_row_targets_that_subdirectory() {
+    fn dragging_within_the_remote_column_moves_and_ctrl_copies() {
+        use crate::files::clip::ClipMode;
         assert_eq!(
-            drop_target(
+            drop_intent(
+                PanelColumn::Remote,
+                PanelColumn::Remote,
+                Some(b"logs".to_vec()),
+                false
+            ),
+            Some((
+                DropKind::Within(ClipMode::Cut),
+                Landing::Sub(b"logs".to_vec())
+            ))
+        );
+        assert_eq!(
+            drop_intent(
+                PanelColumn::Remote,
+                PanelColumn::Remote,
+                Some(b"logs".to_vec()),
+                true
+            ),
+            Some((
+                DropKind::Within(ClipMode::Copy),
+                Landing::Sub(b"logs".to_vec())
+            ))
+        );
+    }
+
+    /// F227:远端栏内落在空白 / 路径条 / 文件行上一律不成立 —— 目标会是
+    /// 「当前目录」,那等于原地移动,一个无操作。当成一次真的粘贴发出去,
+    /// 用户会以为自己干了点什么(而且会真的收到一句「源和目标是同一个目录」)。
+    ///
+    /// 自证会变红:把 `let name = over_dir?;` 改成 `unwrap_or_default()`。
+    #[test]
+    fn dropping_inside_the_remote_column_on_anything_but_a_directory_is_a_noop() {
+        assert_eq!(
+            drop_intent(PanelColumn::Remote, PanelColumn::Remote, None, false),
+            None
+        );
+    }
+
+    /// F227:跨栏的语义一个字没变(F58) —— 目录行进子目录,空白进当前目录。
+    #[test]
+    fn cross_column_drops_keep_their_transfer_semantics() {
+        assert_eq!(
+            drop_intent(
                 PanelColumn::Local,
                 PanelColumn::Remote,
-                Some(b"logs".to_vec())
+                Some(b"logs".to_vec()),
+                false
             ),
-            Some(Landing::Sub(b"logs".to_vec()))
+            Some((DropKind::Transfer, Landing::Sub(b"logs".to_vec())))
         );
-    }
-
-    #[test]
-    fn dropping_on_blank_space_targets_the_current_directory() {
         assert_eq!(
-            drop_target(PanelColumn::Remote, PanelColumn::Local, None),
-            Some(Landing::Cwd)
+            drop_intent(PanelColumn::Remote, PanelColumn::Local, None, true),
+            Some((DropKind::Transfer, Landing::Cwd)),
+            "跨栏时 Ctrl 不改变语义 —— 上传/下载本来就是复制"
         );
     }
 
@@ -222,14 +305,31 @@ mod tests {
     /// 在此之前拖起来指针底下空空如也,用户分不清「拖没拖着」和「拖了几项」。
     #[test]
     fn the_drag_preview_names_a_single_file_but_counts_a_multi_selection() {
-        assert_eq!(preview_label(1, "a.txt"), "a.txt");
-        assert_eq!(preview_label(3, "a.txt"), "拖动 3 项");
+        assert_eq!(preview_label(1, "a.txt", None), "a.txt");
+        assert_eq!(preview_label(3, "a.txt", None), "拖动 3 项");
+    }
+
+    /// F227:胶囊在栏内拖时要说清**是移动还是复制、落到哪** —— 这两件事都是
+    /// 松手之前唯一的提示(不弹二次确认框)。
+    ///
+    /// 自证会变红:把 `Cut`/`Copy` 两臂的文案对调。
+    #[test]
+    fn the_drag_capsule_spells_out_move_versus_copy_and_the_target() {
+        use crate::files::clip::ClipMode;
+        assert_eq!(
+            preview_label(3, "a.txt", Some(("logs", ClipMode::Cut))),
+            "移动 3 项到 logs"
+        );
+        assert_eq!(
+            preview_label(3, "a.txt", Some(("logs", ClipMode::Copy))),
+            "复制 3 项到 logs"
+        );
     }
 
     /// 0 项是拖不起来的(起拖时没选中会先把那条选上),真走到这儿也不能
     /// 印成「拖动 0 项」——那是在报告一个不存在的动作。
     #[test]
     fn an_empty_drag_falls_back_to_the_name_instead_of_claiming_zero_items() {
-        assert_eq!(preview_label(0, "a.txt"), "a.txt");
+        assert_eq!(preview_label(0, "a.txt", None), "a.txt");
     }
 }

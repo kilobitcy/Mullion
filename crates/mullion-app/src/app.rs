@@ -4404,6 +4404,12 @@ impl App {
                 log::warn!("本地栏收到了新建文件/文件夹请求,已忽略(D5)");
                 return;
             }
+            // F227:本地栏内拖不成立(`drop_intent` 挡在前面,D5)。走到这儿
+            // 说明那道闸被改坏了 —— 不静默吞。
+            FileAction::DropWithin { .. } => {
+                log::warn!("本地栏收到了栏内拖放,已忽略(D5)");
+                return;
+            }
             // 上面已经分流走了(那里不需要借 `files`),走到这儿说明分流被删了。
             FileAction::Transfer
             | FileAction::Drop(_)
@@ -4480,6 +4486,40 @@ impl App {
                     crate::files::drag::direction_for_drop(crate::files::PanelColumn::Remote),
                     landing.clone().sub(),
                 );
+                return;
+            }
+            // F227:远端栏内拖到目录行。合成一份**一次性**的剪贴板交给粘贴
+            // 流水线 —— 不写回 `files.clip`,用户手上真正的 Ctrl+C 内容不许
+            // 被一次拖拽顶掉。
+            //
+            // 目标集合走 `delete_targets()`,与 `ClipCopy` 同一份算法:
+            // 「`cwd.join(单段名字)` + 名字发不出 wire 请求的不收」两道判据
+            // 不该在这儿另起一份(改对一处、漏改另一处会静默分叉)。
+            FileAction::DropWithin { into, mode } => {
+                let (clip, dst) = {
+                    let Some(files) = self
+                        .tabs
+                        .by_generation(generation)
+                        .and_then(|t| t.content.files_panel())
+                    else {
+                        return;
+                    };
+                    let items = files.remote.delete_targets();
+                    if items.is_empty() {
+                        self.ui.set_toast(
+                            crate::ui::toast::Kind::Warn,
+                            "选中的项无法移动——名称含程序处理不了的字符",
+                        );
+                        mark_ui_dirty!(self.ui_dirty);
+                        self.request_ui_redraw();
+                        return;
+                    }
+                    (
+                        crate::files::clip::RemoteClip { mode: *mode, items },
+                        files.remote.cwd.join(into),
+                    )
+                };
+                self.start_paste_of(generation, clip, dst);
                 return;
             }
             // F53:编辑。同上,`start_edit` 要 `&mut self`。
@@ -4676,6 +4716,7 @@ impl App {
             | FileAction::OpenInExplorer
             | FileAction::Transfer
             | FileAction::Drop(_)
+            | FileAction::DropWithin { .. }
             | FileAction::EditExternal
             | FileAction::EditInline
             | FileAction::Reconnect
@@ -4708,10 +4749,11 @@ impl App {
     /// 已经发出去的操作的语义 —— 也让「预检查的对象」和「实际写入的对象」
     /// 在结构上不可能不一致。
     fn start_paste(&mut self, generation: u64) {
-        let Some(tab) = self.tabs.by_generation_mut(generation) else {
-            return;
-        };
-        let Some(files) = tab.content.files_panel_mut() else {
+        let Some(files) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+        else {
             return;
         };
         let Some(clip) = files.clip.clone() else {
@@ -4722,7 +4764,26 @@ impl App {
             return;
         };
         let dst = files.remote.cwd.clone();
+        self.start_paste_of(generation, clip, dst);
+    }
 
+    /// F220/F227:把**已经冻结好的** `clip` 粘到**已经冻结好的** `dst`。
+    ///
+    /// 两个来源:Ctrl+V(`start_paste`,取面板的剪贴板与当前目录)和栏内拖放
+    /// (F227,合成一份一次性的 `RemoteClip`、目标是指针底下那个目录)。
+    /// 共用这一层是有意的 —— 下面三道闸(自嵌套、同目录剪切空操作、序号过期)
+    /// 各写一遍的话,拖放那条路上没有任何东西会让用户发现两边算得不一样,
+    /// 而**头一道漏了会把远端磁盘写满**。
+    ///
+    /// 复核 C1/I2:`dst`/`clip` 原样随事件带走 —— `accept_paste_check` 不再去
+    /// 读 `files.remote.cwd`/`files.clip`。之后用户在界面上怎么走,都不该改变
+    /// 一次已经发出去的操作的语义。
+    fn start_paste_of(
+        &mut self,
+        generation: u64,
+        clip: crate::files::clip::RemoteClip,
+        dst: mullion_ssh::sftp::RemotePath,
+    ) {
         // **闸门排在任何请求之前**:目标是源自身或它的子孙时,SFTP 回退那条
         // 路会边列源边往源里写,一直递归到把磁盘写满。远端 `cp` 自己会拦,
         // 但我们不能只靠远端兜底 —— 回退路上没有 `cp`。
@@ -4751,6 +4812,12 @@ impl App {
         // 的粘贴从此彻底失效且没有自愈路径。序号法没有这个问题:卡住的旧
         // 值不挡任何东西,`accept_paste_check` 只认「序号 == 面板当前值」
         // 的结果,旧结果自然被丢弃。
+        let Some(tab) = self.tabs.by_generation_mut(generation) else {
+            return;
+        };
+        let Some(files) = tab.content.files_panel_mut() else {
+            return;
+        };
         let seq = files.remote.begin_paste();
 
         let Some(client) = tab.content.sftp_client() else {
@@ -14337,17 +14404,17 @@ mod tests {
     /// **扎的是源码结构**:`App` 要 `EventLoopProxy` 才能构造,单测里造不出来
     /// (同 `sftp_opened_is_routed_by_generation_not_by_the_active_tab` 的边界)。
     ///
-    /// 自证会变红:把 `start_paste` 里那次列目录删掉、直接发写操作
+    /// 自证会变红:把 `start_paste_of` 里那次列目录删掉、直接发写操作
     /// (`dispatch_paste`)。
     #[test]
     fn a_paste_checks_the_destination_before_it_writes_anything() {
-        let body = body_of(prod_src(), "fn start_paste(");
+        let body = body_of(prod_src(), "fn start_paste_of(");
         assert!(
             body.contains("list_dir"),
             "粘贴没做预检查 —— 会直接盖掉目标目录里的同名文件"
         );
         // 真正的写操作(cp -a 快路径 / SFTP 回退)要等 `UserEvent::PasteChecked`
-        // 回来之后由 `accept_paste_check` 经 `dispatch_paste` 发出;`start_paste`
+        // 回来之后由 `accept_paste_check` 经 `dispatch_paste` 发出;`start_paste_of`
         // 里出现 `dispatch_paste` 就说明预检查被跳过、写操作提前发了。
         assert!(
             !body.contains("dispatch_paste"),
@@ -14355,13 +14422,62 @@ mod tests {
         );
     }
 
+    /// F227:栏内拖放**必须**走 F220 的粘贴流水线,不能自己再写一条。走那条路
+    /// 白拿三道已经验过的闸:`is_within`(把目录拖进自己的子目录会边列边写,
+    /// 递归到写满磁盘)、冲突弹框、`paste_seq` 过期闸。自己写一条的话这三道
+    /// 要重新实现一遍,而**头一道漏了会写满远端磁盘**。
+    ///
+    /// 判据是调用形态:`DropWithin` 的处理必须落到 `start_paste_of`,且**不许**
+    /// 出现 `start_transfer_into` —— 那是「把远端文件上传给它自己」,
+    /// `open_write` 截断在读之前,文件会被清零。
+    ///
+    /// 窗口搜到本分支自己的 `return;` 为止(不用定长字节切片:`app.rs` 满是
+    /// CJK 注释,按字节切会切在多字节字符中间直接 panic —— 那种「红」没有
+    /// 证明判据被执行到)。
+    ///
+    /// 自证会变红:把那个分支里的 `start_paste_of` 改成 `start_transfer_into`。
+    #[test]
+    fn a_within_column_drop_goes_through_the_paste_pipeline() {
+        let src = prod_src();
+        let anchor = "FileAction::DropWithin { into, mode } => {";
+        let at = src.find(anchor).expect("找不到 DropWithin 的处理");
+        let end = at + src[at..].find("\n            }\n").expect("那一臂没有收尾");
+        let seg = &src[at..end];
+        assert!(
+            seg.contains("start_paste_of("),
+            "栏内拖放没走粘贴流水线 —— is_within 自嵌套闸会一并丢掉(F227)"
+        );
+        assert!(
+            !seg.contains("start_transfer_into("),
+            "栏内拖放走了传输通路 —— 那是「把远端文件上传给它自己」,文件会被清零"
+        );
+    }
+
+    /// F227:合成的那份剪贴板**不许**写进 `files.clip` —— 用户手上真正的
+    /// Ctrl+C 内容会被一次拖拽悄悄顶掉,而他下一次 Ctrl+V 粘出来的是拖过的
+    /// 那批文件。
+    ///
+    /// 自证会变红:在 `DropWithin` 分支里加一句 `files.clip = Some(clip.clone());`。
+    #[test]
+    fn a_drag_does_not_clobber_the_users_clipboard() {
+        let src = prod_src();
+        let anchor = "FileAction::DropWithin { into, mode } => {";
+        let at = src.find(anchor).expect("找不到 DropWithin 的处理");
+        let end = at + src[at..].find("\n            }\n").expect("那一臂没有收尾");
+        let seg = &src[at..end];
+        assert!(
+            !seg.contains("clip = Some("),
+            "拖拽合成的临时剪贴板被写进了面板 —— 用户的 Ctrl+C 内容会被顶掉"
+        );
+    }
+
     /// F220 最重要的一条闸门:目标是源自身或其子孙 → **一个请求都不发**。
     /// SFTP 回退那条路是我们自己写的递归,会一直递归到把磁盘写满。
     ///
-    /// 自证会变红:把 `start_paste` 里那句 `is_within` 判断删掉。
+    /// 自证会变红:把 `start_paste_of` 里那句 `is_within` 判断删掉。
     #[test]
     fn pasting_into_your_own_subtree_is_refused_before_any_request() {
-        let body = body_of(prod_src(), "fn start_paste(");
+        let body = body_of(prod_src(), "fn start_paste_of(");
         let gate = body
             .find("is_within")
             .expect("没有自身/子孙闸门 —— SFTP 回退会无限递归");
@@ -14371,10 +14487,10 @@ mod tests {
 
     /// F220:同目录剪切是空操作(源和目标是同一个目录)—— 一个请求都不该发。
     ///
-    /// 自证会变红:把 `start_paste` 里那句同目录剪切短路删掉。
+    /// 自证会变红:把 `start_paste_of` 里那句同目录剪切短路删掉。
     #[test]
     fn cutting_into_the_same_directory_is_a_no_op_before_any_request() {
-        let body = body_of(prod_src(), "fn start_paste(");
+        let body = body_of(prod_src(), "fn start_paste_of(");
         let gate = body
             .find("ClipMode::Cut")
             .expect("没有同目录剪切短路 —— 会对着自己发一次没有意义的请求");

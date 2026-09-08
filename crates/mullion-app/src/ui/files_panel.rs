@@ -52,6 +52,15 @@ pub enum FileAction {
     /// 「把我这栏选中的送出去」,`Drop` 是「把对面栏选中的收进来」。源永远是
     /// 另一栏的选中集(载荷里只带栏,见 `drag::DragFrom`)。
     Drop(crate::files::drag::Landing),
+    /// F227:远端栏**栏内**拖放。`into` 是当前目录下那个目标子目录的名字,
+    /// `mode` 是移动还是复制。
+    ///
+    /// **不是 `Drop`** —— 它走的是 F220 的粘贴流水线,不是传输通路
+    /// (「把远端文件上传给它自己」会把文件清零,理由见 `drag::drop_intent`)。
+    DropWithin {
+        into: Vec<u8>,
+        mode: crate::files::clip::ClipMode,
+    },
     /// B3:这一栏所在的连接断了,用户按了「重连」。
     ///
     /// **不带参数**:重连的目标是「这个标签」,而标签是谁由 app 侧知道
@@ -648,28 +657,6 @@ pub fn show(
     // 常规层,画在当前 `ui` 的 painter 上会被另一栏的背景盖掉。
     let outgoing = egui::DragAndDrop::payload::<crate::files::drag::DragFrom>(ui.ctx())
         .is_some_and(|f| f.0 == column);
-    if outgoing {
-        if let Some(p) = ui.ctx().pointer_latest_pos() {
-            let first = state
-                .selected_paths()
-                .first()
-                .map(|n| n.display().into_owned())
-                .unwrap_or_default();
-            let label = crate::files::drag::preview_label(state.selected.len(), &first);
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(
-                egui::Order::Tooltip,
-                egui::Id::new(("files-drag-preview", id)),
-            ));
-            let font = egui::FontId::proportional(12.0);
-            let galley = painter.layout_no_wrap(label, font, theme::c32(t.accent_fg));
-            // 偏移一点,别让胶囊压在指针尖底下(挡住落点行的高亮)。
-            let at = p + egui::vec2(crate::ui::metrics::SP_M, crate::ui::metrics::SP_M);
-            let pad = egui::vec2(crate::ui::metrics::SP_S, crate::ui::metrics::SP_XS);
-            let bg = egui::Rect::from_min_size(at, galley.size() + pad * 2.0);
-            painter.rect_filled(bg, 4.0, theme::c32(t.accent));
-            painter.galley(at + pad, galley, theme::c32(t.accent_fg));
-        }
-    }
     if incoming && bg.contains_pointer() {
         ui.painter().rect_stroke(
             ui.max_rect(),
@@ -957,7 +944,10 @@ pub fn show(
     // F58:起拖的那一条如果还没选中,要先让它成为唯一选中项(同右键那条约定)。
     // 借用规则同 `clicked` —— 闭包里改不了 `state`,出了闭包再落。
     let mut drag_start: Option<mullion_ssh::sftp::RemotePath> = None;
-    let mut landing: Option<crate::files::drag::Landing> = None;
+    let mut intent: Option<(crate::files::drag::DropKind, crate::files::drag::Landing)> = None;
+    // F227:胶囊要报「落到哪」,得知道指针此刻压着哪个目录行。只在**栏内拖**
+    // 时有意义(跨栏时源栏这边的指针根本不在本栏)。
+    let mut hover_dir: Option<String> = None;
     let total_w = content_w(cols, column);
     // F136:列头要用的偏移是「这一帧的行体实际拿去排版的那份」,不是
     // 「这一帧滚动结束后要存给下一帧用的那份」——egui 的 `ScrollArea` 内部
@@ -1076,13 +1066,22 @@ pub fn show(
                         egui::Stroke::new(1.0, theme::c32(t.accent)),
                     );
                 }
+                // F227:记下指针此刻压着的目录行,给胶囊报目标用。**必须排在
+                // `dnd_release_payload` 之前** —— 那一句会把载荷取走,`outgoing`
+                // 随之变假,这一行就再也记不上了。
+                if outgoing && resp.contains_pointer() && e.kind == EntryKind::Dir {
+                    hover_dir = Some(e.name.display().into_owned());
+                }
                 if let Some(from) = resp.dnd_release_payload::<crate::files::drag::DragFrom>() {
                     // 目录行 → 传进那个子目录;文件行 → 落到当前目录(不解释成
-                    // 「覆盖那个文件」,理由见 `drag::drop_target`)。名字送不上线
+                    // 「覆盖那个文件」,理由见 `drag::drop_intent`)。名字送不上线
                     // 的目录当没这一行 —— 拼出来的路径请求发不出去。
                     let over = (e.kind == EntryKind::Dir && e.name.is_operable())
                         .then(|| e.name.as_bytes().to_vec());
-                    landing = crate::files::drag::drop_target(from.0, column, over);
+                    // Ctrl 只在**松手那一刻**读一次 —— 拖动途中按下又松开不该
+                    // 改变已经决定的语义。
+                    let ctrl = ui.input(|i| i.modifiers.ctrl);
+                    intent = crate::files::drag::drop_intent(from.0, column, over, ctrl);
                 }
                 if resp.clicked() {
                     // `command` 而不是 `ctrl`:egui 已经把 macOS 的 ⌘ 归一化
@@ -1194,16 +1193,61 @@ pub fn show(
         ui.set_clip_rect(header_band);
         header_at(ui, t, id, column, state, cols, header_band, header_offset_x);
     });
+    // F227:**必须排在行循环之后** —— `hover_dir` 只有跑完行循环才有值,画在
+    // 原来那个位置(ScrollArea 之前)读到的永远是 `None`,胶囊照旧显示「拖动
+    // 3 项」,而这看起来跟「我没悬在目录上」一模一样,静默。
+    if outgoing {
+        if let Some(p) = ui.ctx().pointer_latest_pos() {
+            let first = state
+                .selected_paths()
+                .first()
+                .map(|n| n.display().into_owned())
+                .unwrap_or_default();
+            // F227:栏内拖时把「移动/复制 + 目标目录」写在胶囊上 —— 栏内拖
+            // 不弹二次确认框,这句话是松手之前唯一的提示。
+            let ctrl = ui.input(|i| i.modifiers.ctrl);
+            let mode = if ctrl {
+                crate::files::clip::ClipMode::Copy
+            } else {
+                crate::files::clip::ClipMode::Cut
+            };
+            let into = hover_dir.as_deref().map(|d| (d, mode));
+            let label = crate::files::drag::preview_label(state.selected.len(), &first, into);
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new(("files-drag-preview", id)),
+            ));
+            let font = egui::FontId::proportional(12.0);
+            let galley = painter.layout_no_wrap(label, font, theme::c32(t.accent_fg));
+            // 偏移一点,别让胶囊压在指针尖底下(挡住落点行的高亮)。
+            let at = p + egui::vec2(crate::ui::metrics::SP_M, crate::ui::metrics::SP_M);
+            let pad = egui::vec2(crate::ui::metrics::SP_S, crate::ui::metrics::SP_XS);
+            let bg = egui::Rect::from_min_size(at, galley.size() + pad * 2.0);
+            painter.rect_filled(bg, 4.0, theme::c32(t.accent));
+            painter.galley(at + pad, galley, theme::c32(t.accent_fg));
+        }
+    }
     // F58:落在空白处(行与行之间、列头下方的空白)。**必须排在行之后** ——
     // `dnd_release_payload` 会把载荷取走,背景先问的话落在目录行上的那一下
     // 会被背景吃掉,「传进子目录」永远走不到。
-    if landing.is_none() {
+    if intent.is_none() {
         if let Some(from) = bg.dnd_release_payload::<crate::files::drag::DragFrom>() {
-            landing = crate::files::drag::drop_target(from.0, column, None);
+            let ctrl = ui.input(|i| i.modifiers.ctrl);
+            intent = crate::files::drag::drop_intent(from.0, column, None, ctrl);
         }
     }
-    if let Some(l) = landing {
-        action = Some(FileAction::Drop(l));
+    match intent {
+        Some((crate::files::drag::DropKind::Transfer, l)) => action = Some(FileAction::Drop(l)),
+        // 栏内拖只可能落在目录行上(`drop_intent` 已经挡掉了其余情况),
+        // `Landing::Cwd` 走到这里说明那道闸被改坏了 —— 不静默吞。
+        Some((crate::files::drag::DropKind::Within(mode), l)) => {
+            if let Some(into) = l.sub() {
+                action = Some(FileAction::DropWithin { into, mode });
+            } else {
+                log::warn!("栏内拖放落到了当前目录,已忽略(F227:只接目录行)");
+            }
+        }
+        None => {}
     }
     if let Some(g) = goto {
         action = Some(FileAction::Goto(g));
@@ -5143,10 +5187,17 @@ mod tests {
         );
     }
 
-    /// 同一栏内部拖 = 移动/改名,本切片不做。放过去的话「把远端文件上传到
-    /// 它自己」会先截断再读,文件直接清零。
+    /// F227:远端栏内把一条拖到目录行上 = **移动**,而且必须发 `DropWithin`
+    /// (走粘贴流水线)、**不能**发 `Drop`(那是传输通路 —— 「把远端文件上传
+    /// 给它自己」,`open_write` 截断在读之前,文件直接清零)。
+    ///
+    /// 判据卡在具体变体上,不是「发了点什么」:两者在界面上都表现为「东西
+    /// 动了」,但一条是安全的,另一条会清零文件。
+    ///
+    /// 自证会变红:把 `content()` 里 `DropKind::Within` 那臂改成发
+    /// `FileAction::Drop(l)`。
     #[test]
-    fn dragging_inside_one_column_dispatches_nothing() {
+    fn dragging_onto_a_directory_inside_the_remote_column_moves_it_through_the_paste_path() {
         let t = crate::theme::MULLION_DARK;
         let mut frame = two_columns();
         frame
@@ -5170,15 +5221,63 @@ mod tests {
         let _ = render(press(src, 1.0, true), &mut frame);
         let _ = render(moved(dst, 1.1), &mut frame);
         // 先自证「这一拖真的发生了」—— 少了这句,哪天拖拽整个不工作了,
-        // 下面那两条 `None` 照样全绿。
+        // 下面的断言照样全绿。
         assert!(
             egui::DragAndDrop::has_any_payload(&ctx),
             "拖都没拖起来,下面的断言就什么也证明不了"
         );
         let (acts, _) = render(press(dst, 1.2, false), &mut frame);
 
-        assert_eq!(acts.0, None, "同栏内拖不该发出任何传输");
-        assert_eq!(acts.1, None);
+        assert_eq!(acts.1, None, "本地栏不该收到任何东西");
+        assert_eq!(
+            acts.0,
+            Some(FileAction::DropWithin {
+                into: b"logs".to_vec(),
+                mode: crate::files::clip::ClipMode::Cut,
+            }),
+            "远端栏内拖到目录行该发 DropWithin(移动),而不是走传输通路"
+        );
+    }
+
+    /// F227:远端栏内落在**文件行**上仍然什么都不发 —— 目标会退化成当前
+    /// 目录,那等于原地移动,一个无操作。发出去的话用户会以为自己干了点
+    /// 什么(而且会收到一句莫名其妙的「源和目标是同一个目录」)。
+    ///
+    /// 自证会变红:把 `drop_intent` 里的 `let name = over_dir?;` 改成
+    /// `unwrap_or_default()`。
+    #[test]
+    fn dragging_onto_a_file_row_inside_the_remote_column_still_dispatches_nothing() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = two_columns();
+        frame.remote.entries.push(entry(b"c.txt", EntryKind::File));
+        frame
+            .remote
+            .selected
+            .insert(RemotePath::from_bytes(b"b.txt".to_vec()));
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
+            let mut acts = (None, None);
+            let out = ctx.run(input, |ctx| {
+                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+            });
+            (acts, out)
+        };
+        let _ = render(raw(None), &mut frame);
+        let (_, out) = render(raw(None), &mut frame);
+        let src = find_text_pos(&out.shapes, "b.txt").expect("远端栏该画出 b.txt");
+        let dst = find_text_pos(&out.shapes, "c.txt").expect("远端栏该画出 c.txt");
+
+        let _ = render(press(src, 1.0, true), &mut frame);
+        let _ = render(moved(dst, 1.1), &mut frame);
+        assert!(
+            egui::DragAndDrop::has_any_payload(&ctx),
+            "拖都没拖起来,下面的断言就什么也证明不了"
+        );
+        let (acts, _) = render(press(dst, 1.2, false), &mut frame);
+
+        assert_eq!(acts.0, None);
+        assert_eq!(acts.1, None, "落在文件行上是无操作");
     }
 
     /// F151:多选拖拽途中,指针旁边该跟着画出「拖动 N 项」。
