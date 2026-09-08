@@ -14,7 +14,14 @@ mod editor;
 mod env_hint;
 pub(crate) mod fields;
 pub(crate) mod form;
-mod highlight;
+/// F233:项目列表也要标出命中片段,所以这个模块从 `mod` 提到 `pub(crate) mod`。
+///
+/// **只提可见性,不搬家**:搬到一个中立模块更干净,但这个 crate 里有一大批
+/// 「读源码断言」式的守护测试,搬运会把它们成批打红,而本切片的范围不是重构
+/// 会话管理器(Scope Discipline)。代价是 `ui::project_row` 要
+/// `use crate::ui::session_manager::highlight` —— 依赖方向上看着别扭,但那是
+/// 真实的复用关系,不是错误。
+pub(crate) mod highlight;
 mod inherit_row;
 mod jump_preview;
 mod keys;

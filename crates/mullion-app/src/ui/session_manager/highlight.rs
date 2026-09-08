@@ -16,7 +16,7 @@
 /// `to_lowercase()` 的**第一个** char:少数字符(如 'İ')小写成两个 char,
 /// 逐 char 一一对应就没了。取首个 char 会让这类字符的匹配退化成近似,
 /// 但绝不会错位或 panic —— 高亮标偏一个字远比崩掉可接受。
-pub(super) fn segments(text: &str, query: &str) -> Vec<(String, bool)> {
+pub(crate) fn segments(text: &str, query: &str) -> Vec<(String, bool)> {
     let chars: Vec<char> = text.chars().collect();
     let hay: Vec<char> = chars.iter().map(|c| fold(*c)).collect();
     let needle: Vec<char> = query.trim().chars().map(fold).collect();

@@ -369,8 +369,11 @@ fn paint_row_body(
 ///
 /// `TextWrapping::truncate_at_width` 带 `break_anywhere: true` —— 对 hostname 和
 /// CJK 都对:不该为了凑词边界而把断点提前一大截。
+///
+/// F233:项目列表(`ui::project_row`)也用这一份。两处各画一遍分段着色的话,
+/// 命中色、截断策略、CJK 混排的对齐会各错一次。
 #[allow(clippy::too_many_arguments)]
-fn paint_highlighted(
+pub(crate) fn paint_highlighted(
     p: &egui::Painter,
     pos: egui::Pos2,
     text: &str,
