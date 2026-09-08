@@ -122,9 +122,15 @@ pub fn show(
     let focus_name = std::mem::take(&mut ui_state.project_focus_name);
     // 宽度从 720 提到 840:左栏从 192 加宽到 `LIST_W`(300),不提的话右栏会
     // 从 442 缩到 334,F237 那个三行「说明」框跟着变窄。
+    // 高度封顶到屏幕(F237)。**光把按钮行钉在窗口底部不够**:`Window` 默认
+    // 按内容自动撑高,内容 640px 时窗口就是 640px 高,「底部」跟着跑到屏幕
+    // 下沿之外 —— 按钮照样够不着,而且滚动区因为拿不到高度约束根本不会滚。
+    // 有了上界,滚动区才真滚,底部面板才真在可视区里。
+    let cap = (ctx.screen_rect().height() - 48.0).max(240.0);
     egui::Window::new("项目管理")
         .open(&mut open)
         .default_width(840.0)
+        .max_height(cap)
         .show(ctx, |ui| {
             ui.horizontal_top(|ui| {
                 list_column(ui, t, ui_state, projects, lamps, sessions, now);
@@ -1109,28 +1115,40 @@ mod tests {
         assert!(h > 40.0, "「说明」框只有 {h} 高 —— 还是单行的");
     }
 
-    /// 屏幕矮到装不下右栏全部内容时,「删除项目」那一行**仍然画得出来**。
+    /// 屏幕矮到装不下右栏全部内容时,「删除项目」那一行**仍然落在屏幕里**。
     ///
-    /// 判据读的是渲染结果:egui 的 `Ui::is_rect_visible` 会把落在裁剪区外的
-    /// 控件整个跳过不画,所以按钮行一旦被内容顶出可视区,它的文字就从 shape
-    /// 里消失 —— 这正是 1080p + 150% 缩放(逻辑高 720)下的真实症状,而那是
-    /// 这个界面唯一的出口。
+    /// 判据是它画出来的**位置**,不是「画没画」——按顺序画时 egui 照样会把
+    /// 按钮的 shape 交出来,只是坐标在屏幕下沿之外,人根本够不着。这正是
+    /// 1080p + 150% 缩放(逻辑高 720)下的真实症状,而那是这个界面唯一的出口。
     ///
-    /// 自证会变红:把 `TopBottomPanel::bottom` 那一段搬回滚动区**之后**按
-    /// 顺序画。
+    /// 自证会变红:把 `TopBottomPanel::bottom` 那一段拆掉,改成排在滚动区
+    /// **之后**按顺序画。
     #[test]
     fn the_way_out_survives_a_screen_too_short_for_the_form() {
-        let joined = form_texts_on_a_short_screen().join(" ");
-        assert!(joined.contains("删除项目"), "按钮行被顶出可视区了:{joined}");
-        assert!(joined.contains("保存"), "「保存」也没了:{joined}");
+        let spots = form_texts_on_a_short_screen();
+        let del = spots
+            .iter()
+            .find(|(s, _)| s == "删除项目")
+            .expect("「删除项目」压根没画出来");
+        assert!(
+            del.1.bottom() <= SHORT_H,
+            "「删除项目」画在 y={} —— 屏幕只有 {SHORT_H} 高,够不着",
+            del.1.bottom()
+        );
     }
 
-    /// 在一块 1000x420 的屏幕上画两帧,收全部文字。
-    fn form_texts_on_a_short_screen() -> Vec<String> {
-        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+    /// 测试屏幕的逻辑高度。矮到右栏内容(约 640px)必然装不下。
+    const SHORT_H: f32 = 420.0;
+
+    /// 在一块 1000x420 的屏幕上画两帧,收全部文字**和它们的位置**。
+    fn form_texts_on_a_short_screen() -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                egui::Shape::Text(ts) => out.push((
+                    ts.galley.text().to_string(),
+                    egui::Rect::from_min_size(ts.pos, ts.galley.size()),
+                )),
                 _ => {}
             }
         }
@@ -1149,7 +1167,7 @@ mod tests {
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1000.0, 420.0),
+                egui::vec2(1000.0, SHORT_H),
             )),
             ..Default::default()
         };
