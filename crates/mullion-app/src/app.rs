@@ -288,6 +288,17 @@ pub enum UserEvent {
         generation: u64,
         result: Result<Vec<PlannedJob>, String>,
     },
+    /// F230 慢路径:系统剪贴板上那批虚拟文件已经从**源进程**拉到本地临时
+    /// 目录了,可以上传到 `dst`。
+    ///
+    /// `dst` 随事件带走而不是回头读 `files.remote.cwd`:拉内容要走源端的
+    /// SFTP,可能几十秒,期间用户完全可能换了目录(同 `PasteChecked` 的
+    /// C1/I2 纪律)。
+    ClipboardFetched {
+        generation: u64,
+        dst: mullion_ssh::sftp::RemotePath,
+        result: Result<Vec<std::path::PathBuf>, String>,
+    },
     /// F59:一条传输的进度。**高频**(一个 100MB 的文件几千条)——
     /// 接它的地方绝不能每条都请求重绘(T3),只更队列数据,重绘交给帧闸。
     TransferProgress {
@@ -4649,7 +4660,15 @@ impl App {
                         return;
                     }
                     let n = items.len();
-                    files.clip = Some(crate::files::clip::RemoteClip { mode, items });
+                    let clip = crate::files::clip::RemoteClip { mode, items };
+                    // F230:虚拟文件那一侧只放普通文件(目录展开要在这一刻递归
+                    // 列远端目录)。跟 F59 拖出复用同一份挑选/净化/去重。
+                    let dragout_items = crate::dragout::items_for(&files.remote).0;
+                    files.clip = Some(clip.clone());
+                    // F230:同一份内容也放进**系统**剪贴板 —— 另一个 Mullion
+                    // 实例、资源管理器、别的程序都只看得见它。`files.clip` 从此
+                    // 只剩「把剪切源画淡」这一个用途,粘贴一律以系统剪贴板为准。
+                    self.push_clipboard_to_system(generation, &clip, dragout_items);
                     self.ui
                         .set_toast(crate::ui::toast::Kind::Ok, format!("已{verb} {n} 项"));
                     mark_ui_dirty!(self.ui_dirty);
@@ -4756,6 +4775,56 @@ impl App {
         else {
             return;
         };
+        let dst_now = files.remote.cwd.clone();
+        // F230:**系统剪贴板是唯一真值**。`files.clip` 从此只负责把剪切源画淡
+        // —— 两份真值并存的话,用户在另一个 Mullion 里 Ctrl+C 之后回到这边粘,
+        // 粘出来的是自己上次复制的旧东西,而且界面上看不出哪里不对。
+        #[cfg(windows)]
+        {
+            let board = crate::dragout::win::read();
+            if let Some(rc) = board
+                .private
+                .as_deref()
+                .and_then(crate::clipboard_remote::decode)
+            {
+                let here = self.host_fingerprint_for(generation);
+                let route = crate::clipboard_remote::route_for(&rc.fingerprint, here.as_deref());
+                let mode = crate::clipboard_remote::effective_mode(route, rc.clip.mode);
+                if mode != rc.clip.mode {
+                    self.ui.set_toast(
+                        crate::ui::toast::Kind::Warn,
+                        "跨机器粘贴按复制处理:源端文件保留,请确认无误后手动删除",
+                    );
+                }
+                match route {
+                    crate::clipboard_remote::Route::Fast => {
+                        let clip = crate::files::clip::RemoteClip {
+                            mode,
+                            items: rc.clip.items,
+                        };
+                        self.start_paste_of(generation, clip, dst_now);
+                    }
+                    crate::clipboard_remote::Route::Slow => {
+                        self.start_cross_host_paste(generation, &rc.clip.items, dst_now);
+                    }
+                }
+                return;
+            }
+            // 只有 `CF_HDROP` —— 用户在资源管理器里 Ctrl+C 的本地文件。走 F52
+            // 那条上传通路,一个字都不用改。
+            if !board.hdrop.is_empty() {
+                self.start_upload_of(generation, board.hdrop, dst_now);
+                return;
+            }
+        }
+        // 非 Windows / 系统剪贴板上没有我们认识的东西:退回 F220 的进程内行为。
+        let Some(files) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+        else {
+            return;
+        };
         let Some(clip) = files.clip.clone() else {
             self.ui.set_toast(
                 crate::ui::toast::Kind::Warn,
@@ -4763,8 +4832,55 @@ impl App {
             );
             return;
         };
-        let dst = files.remote.cwd.clone();
-        self.start_paste_of(generation, clip, dst);
+        self.start_paste_of(generation, clip, dst_now);
+    }
+
+    /// F230 慢路径:源在**另一台机器**上,本进程没有到它的连接。唯一拿得到
+    /// 字节的途径是让**源进程**按延迟渲染的约定把内容吐出来(它那边自己去
+    /// SFTP 拉),落到本地临时目录,再走 F52 那条上传通路发到 `dst`。
+    ///
+    /// 目录取不了:虚拟文件那一侧只登记普通文件(展开目录要在 Ctrl+C 那一刻
+    /// 递归列远端目录,那是一次可能几十秒的网络往返,卡在快捷键里)。跳过
+    /// **不是静默的** —— 用户选了目录却只收到文件,不说一句他会以为传丢了。
+    // 非 Windows 上没有调用点(F230 整片挂在 OLE 剪贴板上),但**照样编译** ——
+    // 加 `#[cfg(windows)]` 会让本机的 `cargo test` 完全看不见这段代码。
+    #[cfg_attr(not(windows), allow(unused_variables, dead_code))]
+    fn start_cross_host_paste(
+        &mut self,
+        generation: u64,
+        items: &[(mullion_ssh::sftp::RemotePath, bool)],
+        dst: mullion_ssh::sftp::RemotePath,
+    ) {
+        let dirs = items.iter().filter(|(_, is_dir)| *is_dir).count();
+        if dirs > 0 {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("跨机器粘贴跳过了 {dirs} 个目录,只传文件"),
+            );
+        }
+        if dirs == items.len() {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let dir = cross_host_staging_dir();
+            log::info!(target: "mullion", "跨机器粘贴:临时目录 {}", dir.display());
+            let proxy = self.proxy.clone();
+            crate::dragout::win::fetch_into(dir, move |result| {
+                let _ = proxy.send_event(UserEvent::ClipboardFetched {
+                    generation,
+                    dst,
+                    result,
+                });
+            });
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Busy, "正在从源端取文件…");
+        }
+        #[cfg(not(windows))]
+        {
+            self.ui
+                .set_error("跨机器粘贴只在 Windows 上实现(F230)".into());
+        }
     }
 
     /// F220/F227:把**已经冻结好的** `clip` 粘到**已经冻结好的** `dst`。
@@ -5578,11 +5694,30 @@ impl App {
     /// 一个本地目录的名字」。按父目录分组后逐组发一次 —— **上传那条通路
     /// 一个字不用改**(改它等于同时动右键上传那条已经验过的路)。
     fn start_drop_in(&mut self, generation: u64, paths: Vec<std::path::PathBuf>) {
-        use crate::files::queue::Direction;
-        let Some(tab) = self.tabs.by_generation(generation) else {
+        let Some(remote_cwd) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+            .map(|f| f.remote.cwd.clone())
+        else {
             return;
         };
-        let Some(remote_cwd) = tab.content.files_panel().map(|f| f.remote.cwd.clone()) else {
+        self.start_upload_of(generation, paths, remote_cwd);
+    }
+
+    /// F52/F230:把一批**本地绝对路径**上传到 `remote_cwd`。
+    ///
+    /// 落点由调用方给:拖入(F52)给的是「远端栏当前目录」,跨机器粘贴
+    /// (F230 慢路径)给的是**按 Ctrl+V 那一刻冻结下来的**目录 —— 从源进程
+    /// 拉内容可能要几十秒,期间用户完全可能已经换了目录。
+    fn start_upload_of(
+        &mut self,
+        generation: u64,
+        paths: Vec<std::path::PathBuf>,
+        remote_cwd: mullion_ssh::sftp::RemotePath,
+    ) {
+        use crate::files::queue::Direction;
+        let Some(tab) = self.tabs.by_generation(generation) else {
             return;
         };
         let Some(client) = tab.content.sftp_client() else {
@@ -5663,6 +5798,71 @@ impl App {
             mark_ui_dirty!(self.ui_dirty);
         }
         crate::dragout::start(self._runtime.handle().clone(), client, items);
+    }
+
+    /// F230:这个标签当前连的那台机器在 `known_hosts` 里的指纹。
+    ///
+    /// **不从 `SshConnection` 上取**:`check_server_key` 算过指纹但没存下来,
+    /// 而给 `mullion-ssh` 加一个字段是跨 crate 改动,为一个纯 app 侧的特性
+    /// 不值当(Scope Discipline)。两者等价:`check_server_key` 过了就意味着
+    /// 「实测指纹 == 记录指纹」。
+    ///
+    /// 主机取的是 **sftp channel 真正开在哪台**(`sftp_host_ix`),不是焦点
+    /// pane 那台 —— 用户「换节点」之后两者可以是不同机器,报错那台的指纹会
+    /// 让「同机」判据把远端 `copy_tree` 打到另一台的同名路径上(F132 同一个
+    /// 理由)。
+    ///
+    /// 取不到(TOFU 时用户选了「只信任这一次」,没写盘 / 占位标签)返回
+    /// `None` —— 调用方据此走慢路径,不猜。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn host_fingerprint_for(&self, generation: u64) -> Option<String> {
+        let tab = self.tabs.by_generation(generation)?;
+        let (host, port) = match &tab.content {
+            TabContent::Terminal(t) => {
+                let ix = t
+                    .sftp_host_ix
+                    .or_else(|| t.ws.focused().map(|p| p.host_ix))?;
+                let cfg = t.ws.hosts.get(ix)?.cfg.as_ref()?;
+                (cfg.host.clone(), cfg.port)
+            }
+            // `Files` 标签独占自己那条连接(ADR-010),没有 `ws`,也就没有
+            // 「换节点」—— 建它时那条会话记录就是它连的那台。
+            TabContent::Files(_) => {
+                let id = tab.session_id?;
+                let s = self.store.as_ref()?.list().iter().find(|s| s.id == id)?;
+                (s.connection.host.clone(), s.connection.port)
+            }
+            TabContent::Restored(_) => return None,
+        };
+        let id = mullion_ssh::known_hosts::host_key_id(&host, port);
+        let known = self.known_hosts.lock().ok()?;
+        Some(known.get(&id)?.fingerprint.clone())
+    }
+
+    /// F230:把这一份剪贴板也放进**系统**剪贴板。非 Windows 上什么都不做
+    /// (那两个平台的剪贴板协议完全不同,本项目对它们只要求「能编过」)。
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    fn push_clipboard_to_system(
+        &self,
+        generation: u64,
+        clip: &crate::files::clip::RemoteClip,
+        dragout_items: Vec<crate::dragout::DragOutItem>,
+    ) {
+        #[cfg(windows)]
+        {
+            let Some(sftp) = self
+                .tabs
+                .by_generation(generation)
+                .and_then(|t| t.content.sftp_client())
+            else {
+                return;
+            };
+            // 指纹取不到就给空串 —— 对面必然判成不匹配(`route_for` 把空串
+            // 当不匹配),于是走慢路径。宁可慢,不许猜。
+            let fp = self.host_fingerprint_for(generation).unwrap_or_default();
+            let payload = crate::clipboard_remote::encode(&fp, clip);
+            crate::dragout::win::set(self._runtime.handle().clone(), sftp, dragout_items, payload);
+        }
     }
 
     /// F53:开始编辑光标行那个远端文件。
@@ -9847,6 +10047,26 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_shot_uploaded(generation, pane, result);
             }
+            UserEvent::ClipboardFetched {
+                generation,
+                dst,
+                result,
+            } => {
+                match result {
+                    // 拉回来的是**本地临时文件**,接下来跟 F52 拖入完全同路:
+                    // 交给 `start_upload_of` 展开+入队。目标目录用事件带回来的
+                    // `dst`,不读当下的 `files.remote.cwd` —— 取内容可能几十秒,
+                    // 期间用户完全可能换了目录(T11 同族)。
+                    Ok(paths) if !paths.is_empty() => self.start_upload_of(generation, paths, dst),
+                    // 源端一个字节都没给出来。多半是那个实例已经关了 ——
+                    // 延迟渲染的内容由**源进程**提供,进程没了内容就没了。
+                    Ok(_) => self
+                        .ui
+                        .set_error("跨机器粘贴没取到内容 —— 源端的 Mullion 可能已经关了".into()),
+                    Err(e) => self.ui.set_error(format!("跨机器粘贴取内容失败:{e}")),
+                }
+                self.request_ui_redraw();
+            }
             UserEvent::TransferPlanned { generation, result } => {
                 match result {
                     Ok(jobs) => {
@@ -12981,6 +13201,21 @@ fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> 
 /// 10 个既有测试从「测真分支」变成「测到这段的空隙」)。裸变体名不含那个
 /// 前缀,不会命中那些锚点——出于同一原因,这条注释也刻意不把前缀和变体名
 /// 拼在一起写出来。
+/// F230 跨机器粘贴的落脚点:`%TEMP%\mullion-clip-<pid>-<序号>\`。
+///
+/// 名字里同时要 pid **和**序号:pid 分开不同实例(两个 Mullion 同时粘贴),
+/// 序号分开同一实例里的连续几次粘贴 —— 少哪个都会让第二次粘贴撞进第一次
+/// 还在传的目录里,同名文件被覆盖成另一台机器的内容。
+///
+/// **不自动清理**:传输是异步的,删早了就腰斩(F132 同一个教训);而这里
+/// 不留守护进程去等。交给 Windows 的存储感知回收 —— 发版说明里明说。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cross_host_staging_dir() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("mullion-clip-{}-{n}", std::process::id()))
+}
+
 fn user_event_marks_dirty(e: &UserEvent) -> bool {
     use UserEvent::*;
     match e {
@@ -13025,6 +13260,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | SftpOpDone { .. }
         | ShotUploaded { .. }
         | TransferPlanned { .. }
+        | ClipboardFetched { .. }
         | TransferDone { .. }
         | EditOpened { .. }
         | EditSaved { .. }
@@ -14395,6 +14631,60 @@ mod tests {
         assert!(
             empty_branch.contains("set_toast"),
             "全部选中项都不可操作时该有个吐司告诉用户,不是悄悄 return"
+        );
+    }
+
+    /// F230:粘贴必须**先看系统剪贴板**,进程内那份 `files.clip` 只剩显示用
+    /// (把剪切源画淡)。两份真值并存的话,用户在另一个 Mullion 里 Ctrl+C
+    /// 之后回来粘,粘出来的是自己上次复制的旧东西 —— 而且界面上看不出哪里
+    /// 不对,不会有任何报错。
+    ///
+    /// **必须先剥注释行**:`start_paste` 开头那段说明里就把 `files.clip` 和
+    /// 「系统剪贴板」按相反的顺序写了一遍,不剥的话这条顺序判据拿自己的
+    /// 解释当证据,恒红。
+    ///
+    /// 自证会变红:把 `start_paste` 里那个 `#[cfg(windows)]` 块整段挪到读
+    /// `files.clip` 的兜底段之后。
+    #[test]
+    fn pasting_consults_the_system_clipboard_before_the_in_process_one() {
+        let body = body_of(prod_src(), "fn start_paste(&mut self, generation: u64)");
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sys = code
+            .find("clipboard_remote::decode")
+            .expect("start_paste 没有读系统剪贴板 —— F230 的跨进程粘贴不成立");
+        let local = code
+            .find("files.clip")
+            .expect("兜底那段读 files.clip 的代码没了?");
+        assert!(
+            sys < local,
+            "系统剪贴板必须排在 files.clip 之前(F230)—— 否则别的实例复制的东西永远粘不过来"
+        );
+    }
+
+    /// F230:剪切降级成复制时**必须说出来**。用户按的是剪切,跨机器时源端
+    /// 文件其实还在(我们不敢替他删另一台机器上的东西),不说一句他会以为
+    /// 源已经没了,而实际上两边各留了一份。
+    ///
+    /// 窗口卡在 `match route` —— 不用固定字符数(`app.rs` 满是中文注释,
+    /// 按字节切会切在字符中间直接 panic,那是假红,证明不了判据跑过)。
+    ///
+    /// 自证会变红:把降级分支里的 `set_toast` 那句删掉。
+    #[test]
+    fn a_degraded_cut_tells_the_user_why_the_source_is_still_there() {
+        let body = body_of(prod_src(), "fn start_paste(&mut self, generation: u64)");
+        let at = body
+            .find("clipboard_remote::effective_mode(")
+            .expect("找不到降级判据的调用点");
+        let end = body[at..]
+            .find("match route {")
+            .expect("找不到分流点(用来给降级分支的窗口封顶)");
+        assert!(
+            body[at..at + end].contains("set_toast"),
+            "剪切降级成复制没有任何提示 —— 用户会以为源已经被移走了"
         );
     }
 

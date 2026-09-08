@@ -90,6 +90,44 @@ fn write_one(fd: &mut [u8], it: &Described<'_>) {
     }
 }
 
+/// 反过来:从一份 `CFSTR_FILEDESCRIPTORW` 里读出每一项的名字与「是不是目录」。
+///
+/// F230 的慢路径要用 —— 源端在另一台机器上,我们没有到它的连接,只能顺着
+/// **对方**登记的虚拟文件把内容拉过来,而拉之前得知道有几项、各叫什么。
+///
+/// 缓冲区来自**别的进程**,所以每一步都按长度校验:短了就当读完
+/// (返回已经读到的那些),不 panic 也不读越界。
+pub fn parse(buf: &[u8]) -> Vec<(String, bool)> {
+    let Some(count) = buf.get(0..4) else {
+        return Vec::new();
+    };
+    let count = u32::from_le_bytes(count.try_into().expect("刚切的 4 字节")) as usize;
+    let mut out = Vec::new();
+    for i in 0..count {
+        let base = 4 + FD_SIZE * i;
+        let Some(fd) = buf.get(base..base + FD_SIZE) else {
+            break;
+        };
+        let attrs = u32::from_le_bytes(fd[36..40].try_into().expect("刚切的 4 字节"));
+        let mut units = Vec::new();
+        for k in 0..FD_NAME_CAP {
+            let off = FD_NAME_OFF + k * 2;
+            let c = u16::from_le_bytes(fd[off..off + 2].try_into().expect("刚切的 2 字节"));
+            if c == 0 {
+                break;
+            }
+            units.push(c);
+        }
+        // 名字解不出来的项**整条跳过**而不是给个替换字符的名字:后者会变成
+        // 一个落在磁盘上的乱码文件,而用户根本不知道那是哪一项。
+        let Ok(name) = String::from_utf16(&units) else {
+            continue;
+        };
+        out.push((name, attrs & FILE_ATTRIBUTE_DIRECTORY != 0));
+    }
+    out
+}
+
 /// 名字编成定长的 UTF-16,**留一个 NUL 的位置**。
 ///
 /// 超长时按码元截断,但**不能把代理对劈成两半** —— 劈了的话末尾是一个孤儿
@@ -184,6 +222,43 @@ mod tests {
         let buf = file_group_descriptor(&items);
         assert_eq!(read_attrs(&buf, 0), FILE_ATTRIBUTE_DIRECTORY);
         assert_eq!(read_attrs(&buf, 1), FILE_ATTRIBUTE_NORMAL);
+    }
+
+    /// F230:慢路径要顺着**对方**登记的虚拟文件把内容拉过来 —— 拉之前得先
+    /// 从描述符里读回有几项、各叫什么、哪些是目录。写回来读不回去的话,跨
+    /// 机器粘贴会一项都取不到,而且没有任何报错(描述符是别人写的,我们只是
+    /// 解不开)。
+    ///
+    /// 自证会变红:让 `parse` 从 `FD_NAME_OFF + 2` 开始读名字。
+    #[test]
+    fn a_descriptor_round_trips_back_into_names_and_dir_flags() {
+        let items = [
+            Described {
+                name: r"sub\dir",
+                size: 0,
+                is_dir: true,
+            },
+            Described {
+                name: "a.txt",
+                size: 9,
+                is_dir: false,
+            },
+        ];
+        let buf = file_group_descriptor(&items);
+        assert_eq!(
+            parse(&buf),
+            vec![(r"sub\dir".to_owned(), true), ("a.txt".to_owned(), false)]
+        );
+    }
+
+    /// F230:描述符来自**别的进程**。截断的缓冲区必须当「读完了」处理,
+    /// 不能 panic —— COM 回调是 FFI 边界,panic 穿过去是未定义行为。
+    #[test]
+    fn a_truncated_descriptor_yields_what_it_can_instead_of_panicking() {
+        let buf = file_group_descriptor(&[d("a", 1), d("b", 2)]);
+        assert_eq!(parse(&buf[..4 + FD_SIZE + 10]).len(), 1);
+        assert!(parse(&buf[..3]).is_empty());
+        assert!(parse(&[]).is_empty());
     }
 
     #[test]

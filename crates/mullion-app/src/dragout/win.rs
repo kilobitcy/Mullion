@@ -699,6 +699,15 @@ enum ClipJob {
     },
     /// 读一次系统剪贴板,结果回传。
     Read(std::sync::mpsc::Sender<ClipRead>),
+    /// F230 慢路径:把板上的虚拟文件内容拉到 `into` 目录下。
+    ///
+    /// 回调而不是事件:`dragout` 不认识 `UserEvent`(它是 app 的类型),
+    /// 让它认识就等于把 UI 的类型漏进这一层。
+    Fetch {
+        into: std::path::PathBuf,
+        #[allow(clippy::type_complexity)]
+        done: Box<dyn FnOnce(Result<Vec<std::path::PathBuf>, String>) + Send>,
+    },
 }
 
 /// 常驻 STA 线程的投递口。**必须常驻**:`OleSetClipboard` 之后,延迟渲染的
@@ -744,6 +753,7 @@ fn clip_thread(rx: &std::sync::mpsc::Receiver<ClipJob>) {
                 // 卡到超时,Ctrl+V 变成「按下去愣半秒才有反应」。
                 let _ = reply.send(read_clipboard());
             }
+            Ok(ClipJob::Fetch { into, done }) => done(fetch_virtual_files(&into)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -924,6 +934,106 @@ fn read_clipboard() -> ClipRead {
         private.as_ref().map_or(0, Vec::len), hdrop.len()
     );
     ClipRead { private, hdrop }
+}
+
+/// F230 慢路径:把板上登记的**虚拟文件**内容拉到 `into` 目录里,返回落地的
+/// 本地路径。
+///
+/// 为什么必须走这条路:源端在另一台机器上,本进程根本没有到它的连接 ——
+/// 唯一拿得到字节的途径就是让**源进程**按延迟渲染的约定把内容吐出来
+/// (`CFSTR_FILECONTENTS` 的 `IStream`,它那边自己去 SFTP 拉)。
+///
+/// 目录不取:虚拟文件那一侧只登记普通文件(展开目录要在 Ctrl+C 那一刻递归
+/// 列远端目录)。调用方负责把「跳过了几个目录」说出来。
+fn fetch_virtual_files(into: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    use windows::Win32::System::Ole::OleGetClipboard;
+    let data = unsafe { OleGetClipboard() }.map_err(|e| format!("读剪贴板失败:{e}"))?;
+    let formats = Formats::register();
+    let bytes = hglobal_bytes(&data, formats.descriptor)
+        .ok_or_else(|| "剪贴板上没有可取的文件内容".to_string())?;
+    let listed = descriptor::parse(&bytes);
+    std::fs::create_dir_all(into).map_err(|e| format!("建临时目录失败:{e}"))?;
+    let mut out = Vec::new();
+    for (i, (name, is_dir)) in listed.iter().enumerate() {
+        if *is_dir {
+            continue;
+        }
+        // 名字里的反斜杠是相对路径(见 `descriptor::parse`),落地时要连
+        // 父目录一起建出来。
+        let path = into.join(name.replace('\\', std::path::MAIN_SEPARATOR_STR));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("建临时目录失败:{e}"))?;
+        }
+        pull_one(&data, formats.contents, i as i32, &path)
+            .map_err(|e| format!("取「{name}」失败:{e}"))?;
+        out.push(path);
+    }
+    if out.is_empty() {
+        return Err("剪贴板上没有可取的文件内容".into());
+    }
+    log::info!(target: LOG, "慢路径:已从源端取回 {} 项到 {}", out.len(), into.display());
+    Ok(out)
+}
+
+/// 把第 `lindex` 项的 `IStream` 抽干写进 `path`。
+fn pull_one(
+    data: &IDataObject,
+    contents: u16,
+    lindex: i32,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::Write;
+    use windows::Win32::System::Ole::ReleaseStgMedium;
+    let fe = FORMATETC {
+        cfFormat: contents,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex,
+        tymed: TYMED_ISTREAM.0 as u32,
+    };
+    let mut medium = unsafe { data.GetData(&fe) }.map_err(|e| e.to_string())?;
+    let result = (|| {
+        if medium.tymed != TYMED_ISTREAM.0 as u32 {
+            return Err("源端给的不是流".to_string());
+        }
+        let stream = unsafe { &*medium.u.pstm }
+            .clone()
+            .ok_or_else(|| "源端给了一个空流".to_string())?;
+        let mut f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        // 64 KiB 一块:再大也只是多占内存,`IStream::Read` 那边一次往返的
+        // 收益早就平了。
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let mut got = 0u32;
+            unsafe { stream.Read(buf.as_mut_ptr().cast(), buf.len() as u32, Some(&mut got)) }
+                .ok()
+                .map_err(|e| e.to_string())?;
+            if got == 0 {
+                break;
+            }
+            f.write_all(&buf[..got as usize])
+                .map_err(|e| e.to_string())?;
+        }
+        // `File::flush` 在 std 里是 no-op,真正的收口是 Drop 时的 close ——
+        // 但错误在 Drop 里会被吞掉,所以显式 sync 一次把它捞出来。
+        f.sync_all().map_err(|e| e.to_string())
+    })();
+    unsafe { ReleaseStgMedium(&mut medium) };
+    result
+}
+
+/// F230 慢路径的入口。**立刻返回** —— 拉内容要走源进程的 SFTP,可能很久,
+/// 所以整段在常驻 STA 线程上跑,完了回调。
+pub fn fetch_into(
+    into: std::path::PathBuf,
+    done: impl FnOnce(Result<Vec<std::path::PathBuf>, String>) + Send + 'static,
+) {
+    if let Err(e) = clip_tx().send(ClipJob::Fetch {
+        into,
+        done: Box::new(done),
+    }) {
+        log::error!(target: LOG, "投递取虚拟文件任务失败:{e}");
+    }
 }
 
 /// 把一批远端文件放进系统剪贴板。**立刻返回** —— 真正的活在常驻 STA 线程里。
