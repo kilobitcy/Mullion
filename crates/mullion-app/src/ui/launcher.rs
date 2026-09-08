@@ -225,25 +225,67 @@ mod tests {
     /// 或改成给一个 `Some(PaneId(..))`(第二段红)。
     #[test]
     fn clicking_a_row_asks_to_open_that_project_with_no_pane() {
+        assert_eq!(
+            request_after_click(|name_at| name_at),
+            Some((ProjectId(3), None)),
+            "点了一行却没请求打开(或编了一个 pane 出来)"
+        );
+    }
+
+    /// **整行**可点,不是只有那几个字可点。
+    ///
+    /// 列表里一行有一大片空白(名字右边到行尾),用户瞄准的是「那一条」,
+    /// 落点几乎不可能正好在字上。F141 那条「侧栏本地栏一行都点不中」就是
+    /// 判定矩形只罩住了内容 —— 而它当时的症状是**完全静默**:界面画得好好
+    /// 的,点了没反应。
+    ///
+    /// 自证会变红:把 `ui.interact(r.rect, ..)` 的矩形换成
+    /// `Rect::from_min_size(r.rect.min, vec2(200.0, r.rect.height()))`
+    /// —— 名字仍在里面,上一条照样绿,只有这一条红。
+    #[test]
+    fn the_whole_row_is_clickable_not_just_the_name() {
+        let far_right = request_after_click(|name_at| egui::pos2(SCREEN_W - 24.0, name_at.y));
+        assert_eq!(
+            far_right,
+            Some((ProjectId(3), None)),
+            "点在行的右半边(名字右边的空白)没反应 —— 判定矩形没罩住整行"
+        );
+    }
+
+    const SCREEN_W: f32 = 800.0;
+
+    /// 画两帧、找到项目名的位置、按 `aim` 换算出真正的落点、点下去,
+    /// 返回这一下产生的打开请求。
+    fn request_after_click(
+        aim: impl Fn(egui::Pos2) -> egui::Pos2,
+    ) -> Option<(ProjectId, Option<mullion_core::layout::PaneId>)> {
         let ps = vec![proj(3, "接口", "/srv/api", None)];
         let mut ui_state = crate::ui::UiState::default();
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let lamps = std::collections::BTreeMap::new();
         let sessions = vec![sess(7, "web01")];
+        // 窗口尺寸写死:落点是按它算的,用默认值的话这条断言会随 egui 版本
+        // 改默认窗口而漂。
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SCREEN_W, 600.0));
+        let base = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
         let mut shapes = Vec::new();
         for _ in 0..2 {
             shapes = ctx
-                .run(egui::RawInput::default(), |ctx| {
+                .run(base(), |ctx| {
                     show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions);
                 })
                 .shapes;
         }
-        let pos = shapes
+        let name_at = shapes
             .iter()
             .find_map(|cs| find(&cs.shape, "接口"))
             .expect("列表里没有这个项目");
-        let mut input = egui::RawInput::default();
+        let pos = aim(name_at);
+        let mut input = base();
         for pressed in [true, false] {
             input.events.push(egui::Event::PointerButton {
                 pos,
@@ -255,11 +297,7 @@ mod tests {
         let _ = ctx.run(input, |ctx| {
             show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions);
         });
-        assert_eq!(
-            ui_state.project_open_request,
-            Some((ProjectId(3), None)),
-            "点了一行却没请求打开(或编了一个 pane 出来)"
-        );
+        ui_state.project_open_request
     }
 
     fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
