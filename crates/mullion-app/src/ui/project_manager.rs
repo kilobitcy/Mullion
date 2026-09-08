@@ -239,6 +239,15 @@ fn list_column(
     });
 }
 
+/// 「说明」多行框的 id。
+///
+/// 同 [`add_button_id`] 的理由:测试要量它有多高,自动 id 定位不到,只能靠
+/// 「猜它画在哪个坐标」—— 而 galley 的高度量的是**文字**,单行内容的多行框
+/// 跟单行框一样高,量文字根本分不出来。
+pub(crate) fn note_field_id() -> egui::Id {
+    egui::Id::new("mullion_pm_note_field")
+}
+
 /// 「+ 添加项目」按钮的 id。
 ///
 /// 挂显式 id 而不是用 `ui.button()` 的自动 id:自动 id 由控件在 `Ui` 里的出现
@@ -346,150 +355,10 @@ fn form_column(
         return;
     };
     let id = draft.id;
-    let mut first = true;
-    crate::ui::session_manager::form::section(ui, t, "项目管理器", "基本", &mut first);
-    crate::ui::session_manager::form::grid(ui, "project_basic", |ui| {
-        ui.label("名称");
-        let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
-        let name_resp = ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(w));
-        // F236:刚点完「+ 添加项目」—— 把焦点送进来并全选。
-        //
-        // 全选的理由:默认名「新项目」是占位,用户第一个动作必然是把它删掉重打。
-        // `TextEditState` 的游标区间是 egui 里唯一能表达「全选」的地方
-        // (`TextEdit` 自己没有 select-all 的构造项)。
-        if focus_name {
-            name_resp.request_focus();
-            if let Some(mut st) =
-                egui::widgets::text_edit::TextEditState::load(ui.ctx(), name_resp.id)
-            {
-                let n = draft.name.chars().count();
-                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(0),
-                    egui::text::CCursor::new(n),
-                )));
-                st.store(ui.ctx(), name_resp.id);
-            }
-        }
-        ui.end_row();
-        ui.label("说明");
-        let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
-        ui.add(egui::TextEdit::singleline(&mut draft.note).desired_width(w));
-        ui.end_row();
-        ui.label("目录");
-        let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut draft.dir)
-                .hint_text("/srv/app")
-                .desired_width(w),
-        );
-        ui.end_row();
-        ui.label("tmux 名");
-        let mut spelled = draft.tmux_name.clone().unwrap_or_default();
-        let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut spelled)
-                    .hint_text("留空 = 用项目名")
-                    .desired_width(w),
-            )
-            .changed()
-        {
-            draft.tmux_name = (!spelled.trim().is_empty()).then(|| spelled.trim().to_string());
-        }
-        ui.end_row();
-    });
-    ui.add_space(SP_XS);
-    ui.label(
-        egui::RichText::new(format!(
-            "会 attach 的 tmux 会话:{}",
-            mullion_store::project_tmux_name(draft)
-        ))
-        .color(crate::theme::c32(t.fg_muted)),
-    );
-    // 设计里明写要让用户看见的那条:`-c` 只对新建会话生效。
-    ui.label(
-        egui::RichText::new(
-            "改目录只影响新建的 tmux 会话;已经存在的那个不会移动,需先在远端结束它。",
-        )
-        .color(crate::theme::c32(t.fg_muted)),
-    );
-
-    crate::ui::session_manager::form::section(ui, t, "项目管理器", "节点", &mut first);
-    ui.label(
-        egui::RichText::new("同一台机器的等价路线(不同凭据 / 端口 / 跳板)。只列 SSH 会话。")
-            .color(crate::theme::c32(t.fg_muted)),
-    );
-    ui.add_space(SP_XS);
-    let candidates = selectable_nodes(sessions);
-    if candidates.is_empty() {
-        ui.label(
-            egui::RichText::new("还没有 SSH 会话可选。先在会话管理器里建一条。")
-                .color(crate::theme::c32(t.fg_muted)),
-        );
-    }
-    egui::ScrollArea::vertical()
-        .id_salt("project_nodes")
-        .max_height(180.0)
-        .show(ui, |ui| {
-            for s in &candidates {
-                ui.horizontal(|ui| {
-                    let mut on = draft.nodes.contains(&s.id);
-                    if ui.checkbox(&mut on, &s.identity.name).changed() {
-                        if on {
-                            draft.nodes.push(s.id);
-                        } else {
-                            draft.nodes.retain(|n| *n != s.id);
-                            if draft.preferred == Some(s.id) {
-                                draft.preferred = None;
-                            }
-                        }
-                    }
-                    if on {
-                        let verdict = node_verdict(&draft.nodes, s, sessions, table);
-                        let (text, color) = match verdict {
-                            mullion_store::SameMachine::Same => {
-                                ("已核实同机", crate::theme::c32(t.fg_muted))
-                            }
-                            mullion_store::SameMachine::Pending => {
-                                ("待核", crate::theme::c32(t.fg_muted))
-                            }
-                            mullion_store::SameMachine::Different { .. } => {
-                                ("指纹与其他节点不一致", crate::theme::c32(t.danger_text))
-                            }
-                        };
-                        ui.label(egui::RichText::new(text).size(11.0).color(color));
-                        let mut pref = draft.preferred == Some(s.id);
-                        if ui.radio(pref, "首选").clicked() {
-                            pref = true;
-                        }
-                        if pref {
-                            draft.preferred = Some(s.id);
-                        }
-                    }
-                });
-            }
-        });
-
-    crate::ui::session_manager::form::section(ui, t, "项目管理器", "记录", &mut first);
-    ui.label(
-        egui::RichText::new(format!(
-            "创建于 {} · 最后打开 {}",
-            draft.created_at,
-            draft.last_accessed_at.as_deref().unwrap_or("从未")
-        ))
-        .color(crate::theme::c32(t.fg_muted)),
-    );
-
-    ui.add_space(SP_M);
-    // 校验一律走 store 的那份判据 —— 这里重写一遍就必然与落盘那侧漂移。
+    // 校验与「能不能开」在**画之前**先算好:按钮行下面搬进了
+    // `TopBottomPanel::bottom`,那一段的闭包排在滚动区之前,拿不到滚动区里
+    // 那份 `draft` 的可变借用 —— 所以先 clone/copy 成局部量。
     let issue = mullion_store::validate_project(draft, projects, sessions).err();
-    if let Some(ref e) = issue {
-        ui.label(
-            egui::RichText::new(issue_text(e, projects, sessions))
-                .color(crate::theme::c32(t.danger_text)),
-        );
-        ui.add_space(SP_XS);
-    }
     let blank = draft.name.trim().is_empty() || draft.dir.trim().is_empty();
     // F223:「打开」拿的是**库里那份**,不是右栏这份草稿 —— 草稿改了没保存
     // 就打开的话,连过去的是草稿里的目录/tmux 名,而配置库里根本没这回事,
@@ -497,32 +366,210 @@ fn form_column(
     let stored = projects.iter().find(|p| p.id == id);
     let dirty = stored != Some(&*draft);
     let openable = stored.is_some_and(|p| !p.nodes.is_empty()) && !dirty;
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(issue.is_none() && !blank, egui::Button::new("保存"))
-            .clicked()
-        {
-            ui_state.project_intent = Some(ProjectIntent::Save(id, Box::new(draft.clone())));
-        }
-        ui.add_space(SP_S);
-        if ui
-            .add_enabled(openable, egui::Button::new("打开"))
-            .clicked()
-        {
-            ui_state.project_open_request = Some((id, None));
-        }
-        ui.add_space(SP_S);
-        if ui.button("删除项目").clicked() {
-            ui_state.project_intent = Some(ProjectIntent::Delete(id));
-        }
-    });
-    if dirty {
-        ui.add_space(SP_XS);
-        ui.label(
-            egui::RichText::new("有未保存的改动,先保存再打开。")
+    let save_draft = draft.clone();
+
+    // 按钮行钉在底部,**不跟着内容滚**(F237)。右栏加了三行说明之后内容约
+    // 640px,在 1080p + 150% 缩放(逻辑高 720)下,按顺序画的话「保存 / 打开 /
+    // 删除项目」会被顶出可视区 —— 而那是这个界面唯一的出口。
+    egui::TopBottomPanel::bottom("project_form_bottom")
+        .frame(egui::Frame::none())
+        .show_inside(ui, |ui| {
+            ui.add_space(SP_M);
+            if let Some(ref e) = issue {
+                ui.label(
+                    egui::RichText::new(issue_text(e, projects, sessions))
+                        .color(crate::theme::c32(t.danger_text)),
+                );
+                ui.add_space(SP_XS);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(issue.is_none() && !blank, egui::Button::new("保存"))
+                    .clicked()
+                {
+                    ui_state.project_intent =
+                        Some(ProjectIntent::Save(id, Box::new(save_draft.clone())));
+                }
+                ui.add_space(SP_S);
+                if ui
+                    .add_enabled(openable, egui::Button::new("打开"))
+                    .clicked()
+                {
+                    ui_state.project_open_request = Some((id, None));
+                }
+                ui.add_space(SP_S);
+                if ui.button("删除项目").clicked() {
+                    ui_state.project_intent = Some(ProjectIntent::Delete(id));
+                }
+            });
+            if dirty {
+                ui.add_space(SP_XS);
+                ui.label(
+                    egui::RichText::new("有未保存的改动,先保存再打开。")
+                        .color(crate::theme::c32(t.fg_muted)),
+                );
+            }
+        });
+
+    let mut first = true;
+    egui::ScrollArea::vertical()
+        .id_salt("project_form")
+        .show(ui, |ui| {
+            crate::ui::session_manager::form::section(ui, t, "项目管理器", "基本", &mut first);
+            crate::ui::session_manager::form::grid(ui, "project_basic", |ui| {
+                ui.label("名称");
+                let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
+                let name_resp =
+                    ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(w));
+                // F236:刚点完「+ 添加项目」—— 把焦点送进来并全选。
+                //
+                // 全选的理由:默认名「新项目」是占位,用户第一个动作必然是把它删掉重打。
+                // `TextEditState` 的游标区间是 egui 里唯一能表达「全选」的地方
+                // (`TextEdit` 自己没有 select-all 的构造项)。
+                if focus_name {
+                    name_resp.request_focus();
+                    if let Some(mut st) =
+                        egui::widgets::text_edit::TextEditState::load(ui.ctx(), name_resp.id)
+                    {
+                        let n = draft.name.chars().count();
+                        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(n),
+                        )));
+                        st.store(ui.ctx(), name_resp.id);
+                    }
+                }
+                ui.end_row();
+                // 说明改多行(F237)。标签**顶对齐**:`Grid` 每行默认 `Align::Center`,
+                // 3 行高的 multiline 旁边的短标签会被垂直居中,跟上面几行的标签对不齐。
+                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                    ui.label("说明");
+                });
+                let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut draft.note)
+                        .id(note_field_id())
+                        .desired_rows(3)
+                        .desired_width(w),
+                );
+                ui.end_row();
+                ui.label("目录");
+                let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.dir)
+                        .hint_text("/srv/app")
+                        .desired_width(w),
+                );
+                ui.end_row();
+                ui.label("tmux 名");
+                let mut spelled = draft.tmux_name.clone().unwrap_or_default();
+                let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut spelled)
+                            .hint_text("留空 = 用项目名")
+                            .desired_width(w),
+                    )
+                    .changed()
+                {
+                    draft.tmux_name =
+                        (!spelled.trim().is_empty()).then(|| spelled.trim().to_string());
+                }
+                ui.end_row();
+            });
+            ui.add_space(SP_XS);
+            ui.label(
+                egui::RichText::new(format!(
+                    "会 attach 的 tmux 会话:{}",
+                    mullion_store::project_tmux_name(draft)
+                ))
                 .color(crate::theme::c32(t.fg_muted)),
-        );
-    }
+            );
+            // 设计里明写要让用户看见的那条:`-c` 只对新建会话生效。
+            ui.label(
+                egui::RichText::new(
+                    "改目录只影响新建的 tmux 会话;已经存在的那个不会移动,需先在远端结束它。",
+                )
+                .color(crate::theme::c32(t.fg_muted)),
+            );
+
+            crate::ui::session_manager::form::section(ui, t, "项目管理器", "节点", &mut first);
+            ui.label(
+                egui::RichText::new(
+                    "同一台机器的等价路线(不同凭据 / 端口 / 跳板)。只列 SSH 会话。",
+                )
+                .color(crate::theme::c32(t.fg_muted)),
+            );
+            ui.add_space(SP_XS);
+            let candidates = selectable_nodes(sessions);
+            if candidates.is_empty() {
+                ui.label(
+                    egui::RichText::new("还没有 SSH 会话可选。先在会话管理器里建一条。")
+                        .color(crate::theme::c32(t.fg_muted)),
+                );
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("project_nodes")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for s in &candidates {
+                        ui.horizontal(|ui| {
+                            let mut on = draft.nodes.contains(&s.id);
+                            if ui.checkbox(&mut on, &s.identity.name).changed() {
+                                if on {
+                                    draft.nodes.push(s.id);
+                                } else {
+                                    draft.nodes.retain(|n| *n != s.id);
+                                    if draft.preferred == Some(s.id) {
+                                        draft.preferred = None;
+                                    }
+                                }
+                            }
+                            if on {
+                                let verdict = node_verdict(&draft.nodes, s, sessions, table);
+                                let (text, color) = match verdict {
+                                    mullion_store::SameMachine::Same => {
+                                        ("已核实同机", crate::theme::c32(t.fg_muted))
+                                    }
+                                    mullion_store::SameMachine::Pending => {
+                                        ("待核", crate::theme::c32(t.fg_muted))
+                                    }
+                                    mullion_store::SameMachine::Different { .. } => {
+                                        ("指纹与其他节点不一致", crate::theme::c32(t.danger_text))
+                                    }
+                                };
+                                ui.label(egui::RichText::new(text).size(11.0).color(color));
+                                let mut pref = draft.preferred == Some(s.id);
+                                if ui.radio(pref, "首选").clicked() {
+                                    pref = true;
+                                }
+                                if pref {
+                                    draft.preferred = Some(s.id);
+                                }
+                            }
+                        });
+                    }
+                });
+
+            crate::ui::session_manager::form::section(ui, t, "项目管理器", "记录", &mut first);
+            // 时间走本地时区,不把 RFC3339 的 UTC 原文糊在界面上:左栏那边说
+            // 「3 小时前」、这里说「…T05:00:00Z」的话,同一个字段在同一个弹窗里
+            // 分裂成两种读法。偏移取 `localtime::offset()`(进程启动时取的那一次,
+            // Windows 上来自 `GetTimeZoneInformation`,就是系统设置里的时区)。
+            let now = time::OffsetDateTime::now_utc();
+            let off = crate::localtime::offset();
+            ui.label(
+                egui::RichText::new(format!(
+                    "创建于 {} · 最后打开 {}",
+                    crate::localtime::relative(&draft.created_at, now, off),
+                    draft.last_accessed_at.as_deref().map_or_else(
+                        || "从未".to_string(),
+                        |s| crate::localtime::relative(s, now, off)
+                    )
+                ))
+                .color(crate::theme::c32(t.fg_muted)),
+            );
+        });
 }
 
 /// F223:开之前要问的那一下。
@@ -1017,5 +1064,107 @@ mod tests {
             joined.contains("+ 添加项目"),
             "空手上门时反而没有新建入口:{joined}"
         );
+    }
+
+    // ---- 右栏:说明多行 / 内容滚动 / 按钮钉底(F237)------------------------
+
+    /// 画两帧,量「说明」输入框**控件本身**的高度。
+    ///
+    /// 量的不是 galley —— 那是文字的高度,一行内容的多行框跟单行框一样高,
+    /// 分不出来。走 [`note_field_id`] 拿控件矩形才问得着「这个框有几行」。
+    fn note_field_height() -> f32 {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let p = proj(1, "接口", None);
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(p.id),
+            project_draft: Some(p.clone()),
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![p];
+        let sessions: Vec<SessionRecord> = Vec::new();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
+            });
+        }
+        ctx.read_response(note_field_id())
+            .expect("「说明」框没被登记 —— id 变了还是根本没画?")
+            .rect
+            .height()
+    }
+
+    /// F237:「说明」是多行框。
+    ///
+    /// 判据是**画出来的输入框高度**,不是源码里出现了 `multiline` ——
+    /// 后者换个写法就恒绿。单行框约 20 高(一行文字 + 内边距),三行框必然
+    /// 显著高于它,取 40 当阈值:两边各有一行的余量。
+    ///
+    /// 自证会变红:把 `multiline` 换回 `singleline`。
+    #[test]
+    fn the_note_field_is_tall_enough_to_hold_more_than_one_line() {
+        let h = note_field_height();
+        assert!(h > 40.0, "「说明」框只有 {h} 高 —— 还是单行的");
+    }
+
+    /// 屏幕矮到装不下右栏全部内容时,「删除项目」那一行**仍然画得出来**。
+    ///
+    /// 判据读的是渲染结果:egui 的 `Ui::is_rect_visible` 会把落在裁剪区外的
+    /// 控件整个跳过不画,所以按钮行一旦被内容顶出可视区,它的文字就从 shape
+    /// 里消失 —— 这正是 1080p + 150% 缩放(逻辑高 720)下的真实症状,而那是
+    /// 这个界面唯一的出口。
+    ///
+    /// 自证会变红:把 `TopBottomPanel::bottom` 那一段搬回滚动区**之后**按
+    /// 顺序画。
+    #[test]
+    fn the_way_out_survives_a_screen_too_short_for_the_form() {
+        let joined = form_texts_on_a_short_screen().join(" ");
+        assert!(joined.contains("删除项目"), "按钮行被顶出可视区了:{joined}");
+        assert!(joined.contains("保存"), "「保存」也没了:{joined}");
+    }
+
+    /// 在一块 1000x420 的屏幕上画两帧,收全部文字。
+    fn form_texts_on_a_short_screen() -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let p = proj(1, "接口", None);
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(p.id),
+            project_draft: Some(p.clone()),
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![p];
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 420.0),
+            )),
+            ..Default::default()
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(input(), |ctx| {
+                    show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
+                })
+                .shapes;
+        }
+        let mut out = Vec::new();
+        for cs in &shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
     }
 }
