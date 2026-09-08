@@ -114,6 +114,60 @@ pub fn validate(
     Ok(())
 }
 
+// ---- F222 同机指纹核对 -------------------------------------------------
+
+/// 候选节点与项目已有节点是否同机。**三态**,`Pending` 不是失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SameMachine {
+    /// 双方都有指纹且相同。
+    Same,
+    /// 双方都有指纹且不同。`with` 是**第一个**对不上的已有节点的键,
+    /// 拿去告诉用户「跟哪一条不一致」——多节点项目里没有它无从查起。
+    Different { with: String },
+    /// 至少一边没连过、拿不到指纹。**放行**并标待核,由 app 在该节点
+    /// 真握手拿到指纹那一刻再跑一次本函数。
+    Pending,
+}
+
+/// 判定候选端点能否加入一个项目。零 IO 纯函数。
+///
+/// `existing`/`candidate` 是 **`known_hosts` 的键**(由 app 侧的
+/// `mullion_ssh::known_hosts::host_key_id` 拼,非默认端口写成 `[host]:port`)。
+/// 键在这里只用来查表,**判据是查出来的指纹** —— 按键(即 host 串)判会把
+/// 「同一台机器换个端口/换个域名」直接判死,而那恰恰是项目要多节点的理由。
+///
+/// 拼键的函数在 `mullion-ssh` 里,store 不能依赖它(架构不变量),
+/// 所以收已拼好的键。**调用方必须用同一个拼法** —— 拼法漂移的后果与
+/// `KnownHostsFile::get` 的注释同款:同一台主机在表里占两条,判定形同虚设。
+///
+/// 只要与**任意一个**已有节点冲突就拒绝:项目的不变量是「所有节点同机」,
+/// 不是「跟某一个同机」。
+pub fn can_join(
+    existing: &[String],
+    candidate: &str,
+    table: &crate::known_hosts::KnownHostsFile,
+) -> SameMachine {
+    let Some(mine) = table.get(candidate) else {
+        return SameMachine::Pending;
+    };
+    let mut matched = false;
+    for key in existing {
+        let Some(other) = table.get(key) else {
+            continue;
+        };
+        if other.fingerprint == mine.fingerprint {
+            matched = true;
+        } else {
+            return SameMachine::Different { with: key.clone() };
+        }
+    }
+    if matched {
+        SameMachine::Same
+    } else {
+        SameMachine::Pending
+    }
+}
+
 /// 一条会话**显式写死**的 tmux 名(sanitize 后)。`None` = 没配 tmux、
 /// 显式 `Off`、或**配了 attach 但名字留空**。
 ///
@@ -130,7 +184,107 @@ fn explicit_session_tmux_name(s: &crate::model::SessionRecord) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use crate::project::project_tmux_name;
+    use crate::project::{can_join, project_tmux_name, SameMachine};
+
+    // ---- F222 同机指纹核对 ---------------------------------------------
+
+    /// 表用纯内存的 `KnownHostsFile::default()`(`path=None` → `save` 是
+    /// no-op),测试里不落盘。
+    fn table(rows: &[(&str, &str)]) -> crate::known_hosts::KnownHostsFile {
+        let mut t = crate::known_hosts::KnownHostsFile::default();
+        for (key, fp) in rows {
+            t.record(
+                key,
+                crate::known_hosts::HostKeyEntry {
+                    algo: "ssh-ed25519".into(),
+                    fingerprint: (*fp).into(),
+                },
+            );
+        }
+        t
+    }
+
+    #[test]
+    fn two_endpoints_with_the_same_fingerprint_are_the_same_machine() {
+        let t = table(&[("h", "SHA256:AAAA"), ("j", "SHA256:AAAA")]);
+        assert_eq!(can_join(&["h".into()], "j", &t), SameMachine::Same);
+    }
+
+    /// **P2 的自证**:同一台机器换个端口,`host_key_id` 拼出来的键完全不同
+    /// (`h` vs `[h]:2222`),按 host 串判会直接判成两台;按指纹判才是同一台。
+    ///
+    /// 这恰是「为什么项目要允许多节点」的那个场景 —— 判死了功能就没了。
+    ///
+    /// 自证会变红:把判据换成「两个键相等」→ 当场变红。
+    #[test]
+    fn the_same_machine_reached_on_two_ports_is_still_the_same_machine() {
+        let t = table(&[("h", "SHA256:AAAA"), ("[h]:2222", "SHA256:AAAA")]);
+        assert_eq!(can_join(&["h".into()], "[h]:2222", &t), SameMachine::Same);
+    }
+
+    #[test]
+    fn two_endpoints_with_different_fingerprints_are_rejected() {
+        let t = table(&[("h", "SHA256:AAAA"), ("j", "SHA256:BBBB")]);
+        assert_eq!(
+            can_join(&["h".into()], "j", &t),
+            SameMachine::Different { with: "h".into() },
+            "要指出跟哪个已有节点不一致,否则用户在多节点项目里无从查起"
+        );
+    }
+
+    /// 没连过的节点**放行并标待核**,不是拒绝 —— 否则「离线整理配置」
+    /// 会被一次强制连接卡住。
+    #[test]
+    fn an_endpoint_we_have_never_connected_to_is_pending_not_rejected() {
+        let t = table(&[("h", "SHA256:AAAA")]);
+        assert_eq!(
+            can_join(&["h".into()], "brand-new", &t),
+            SameMachine::Pending
+        );
+    }
+
+    /// 指纹表被清空(或 corrupt 当空表)后,全部退化成**待核**,
+    /// 不是「异机」—— 判成异机的话用户的项目会一夜之间全部报错。
+    #[test]
+    fn an_empty_table_degrades_everything_to_pending_not_different() {
+        let t = table(&[]);
+        assert_eq!(can_join(&["h".into()], "j", &t), SameMachine::Pending);
+    }
+
+    /// 多节点时**只要与任意一个已有节点冲突就拒绝**,不能因为跟另一个
+    /// 对得上就放行 —— 项目的不变量是「所有节点同机」,不是「跟某一个同机」。
+    ///
+    /// 自证会变红:把遍历改成 `any(相同)` 就放行 → 变红。
+    #[test]
+    fn conflicting_with_any_existing_node_is_enough_to_reject() {
+        let t = table(&[
+            ("h", "SHA256:AAAA"),
+            ("j", "SHA256:BBBB"),
+            ("k", "SHA256:AAAA"),
+        ]);
+        assert_eq!(
+            can_join(&["h".into(), "j".into()], "k", &t),
+            SameMachine::Different { with: "j".into() }
+        );
+    }
+
+    /// 已有节点里有没连过的,不影响与**连过的**那个的判定 ——
+    /// 待核只在「拿不到任何可比对的指纹」时才是结论。
+    #[test]
+    fn an_unverified_existing_node_does_not_mask_a_real_conflict() {
+        let t = table(&[("h", "SHA256:AAAA"), ("k", "SHA256:BBBB")]);
+        assert_eq!(
+            can_join(&["never-dialed".into(), "h".into()], "k", &t),
+            SameMachine::Different { with: "h".into() }
+        );
+    }
+
+    /// 候选就是已有节点自己(重新校验同一条),不该跟自己打架。
+    #[test]
+    fn revalidating_a_node_against_itself_is_the_same_machine() {
+        let t = table(&[("h", "SHA256:AAAA")]);
+        assert_eq!(can_join(&["h".into()], "h", &t), SameMachine::Same);
+    }
 
     /// tmux 名留空时回退到**项目名**,绝不回退到会话名。
     ///
