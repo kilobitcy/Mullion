@@ -299,7 +299,12 @@ mod tests {
         assert!(clicked_at(0.1), "点在行的左端没反应");
     }
 
-    /// 跑两帧,在行矩形宽度的 `frac` 处点一下,返回是否点中。
+    /// 跑两帧,在**行占位区**宽度的 `frac` 处点一下,返回是否点中。
+    ///
+    /// **落点必须从 `show` 调用之前的可用区算,不能从它返回的 `Response.rect`
+    /// 算。** 后者就是判定矩形本身:判定矩形一缩小,落点按比例跟着缩小,永远
+    /// 命中 —— 这条守护会变成恒绿。这不是假设,是本切片实测到的:第一版就是
+    /// 那么写的,把 `ui.interact` 的矩形砍成 60px 宽,测试照样全绿。
     ///
     /// **两帧**:`CentralPanel` 首帧只记 `Shape::Noop`,布局矩形要下一帧才稳。
     fn clicked_at(frac: f32) -> bool {
@@ -321,15 +326,20 @@ mod tests {
             now: now(),
             list: "test",
         };
-        let mut rect = egui::Rect::NOTHING;
+        // 这一行**应该**占住的地方:光标位置 + 整条可用宽 + `ROW_H`。
+        let mut slot = egui::Rect::NOTHING;
         for _ in 0..2 {
             let _ = ctx.run(base(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    rect = show(ui, &t, &row()).rect;
+                    slot = egui::Rect::from_min_size(
+                        ui.next_widget_position(),
+                        egui::vec2(ui.available_width(), ROW_H),
+                    );
+                    let _ = show(ui, &t, &row());
                 });
             });
         }
-        let pos = egui::pos2(rect.left() + rect.width() * frac, rect.center().y);
+        let pos = egui::pos2(slot.left() + slot.width() * frac, slot.center().y);
         let mut input = base();
         input.events.push(egui::Event::PointerMoved(pos));
         for pressed in [true, false] {
