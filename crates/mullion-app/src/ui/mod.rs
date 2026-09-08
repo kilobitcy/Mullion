@@ -260,6 +260,20 @@ pub struct UiState {
     /// 分组管理弹窗里点了新建/改名/删除 → app 事后据此调 `store` 对应方法。
     pub group_intent: Option<crate::ui::group_manager::GroupIntent>,
 
+    // --- F225②:项目管理弹窗。同上,只写意图。---
+    /// 项目管理弹窗是否展示。**必须同时登记进 `app.rs` 的 `Modal` 表**
+    /// (里面有文本输入框,不登记的话敲的字会同时漏给远端 shell,T8)。
+    pub project_manager_open: bool,
+    /// 「新建项目」输入框的跨帧缓冲。
+    pub project_name_buf: String,
+    /// 右栏正在编辑哪个项目。`None` = 还没选。
+    pub project_selected: Option<mullion_store::ProjectId>,
+    /// 右栏那份编辑草稿。**改动只活在这里**,点保存才变成意图 ——
+    /// 直接改 store 里那份的话,用户按 Esc 关窗等于「没保存也生效了」。
+    pub project_draft: Option<mullion_store::ProjectRecord>,
+    /// 项目管理弹窗里点了新建/保存/删除 → app 事后据此调 `store`。
+    pub project_intent: Option<crate::ui::project_manager::ProjectIntent>,
+
     // --- P1-b:测试连接(F92)。与 save_click 同构 —— UI 只写意图,
     // 拨测在 app.rs 的施加点起 tokio 任务。---
     /// 「测试连接」被点了。app.rs 消费后复位,按当前表单起一次拨测。
@@ -429,6 +443,12 @@ pub struct UiFrame<'a> {
     /// `user` 要从这里查 —— 引用凭据的会话自己身上没有用户名。
     /// store 不可用时传 `&[]`。
     pub credentials: &'a [mullion_store::CredentialRecord],
+    /// F221 项目表。store 不可用时传 `&[]`。
+    pub projects: &'a [mullion_store::ProjectRecord],
+    /// F222:`known_hosts` 指纹表。**只在项目管理器开着时才是 `Some`** ——
+    /// 它在 `App` 里是 `Arc<Mutex<_>>`,SSH 线程握手时也要拿;每帧无条件锁
+    /// 会让一次握手白等一帧。`None` 时项目节点一律标「待核」,不会误判同机。
+    pub known_hosts: Option<&'a mullion_store::known_hosts::KnownHostsFile>,
     /// 隧道列表(F110)。会话管理器「隧道」页的左栏读它;删会话的确认框也读它
     /// 来列受影响的隧道。store 不可用时传 `&[]`。
     pub tunnels: &'a [mullion_store::TunnelRecord],
@@ -834,6 +854,17 @@ pub fn build_ui(
     if ui_state.group_manager_open {
         group_manager::show(ctx, ui_state, frame.groups);
     }
+    // F225②:项目管理器。与分组管理器并列(同为「配置库里的持久实体」)。
+    if ui_state.project_manager_open {
+        project_manager::show(
+            ctx,
+            t,
+            ui_state,
+            frame.projects,
+            frame.sessions,
+            frame.known_hosts,
+        );
+    }
     // F2:ssh config 导入预览。排在会话管理器之后 —— 它是从菜单发起的模态,
     // 该盖在会话管理器上面(用户可能是开着管理器时想起来要导入的)。
     import_dialog::show(ctx, t, ui_state);
@@ -955,6 +986,8 @@ fn annotate_env(ctx: &egui::Context, ui_state: &UiState, frame: &UiFrame<'_>) ->
         }
     } else if ui_state.group_manager_open {
         "分组管理器".to_string()
+    } else if ui_state.project_manager_open {
+        "项目管理器".to_string()
     } else {
         "主界面(终端)".to_string()
     };
@@ -1087,6 +1120,8 @@ mod tests {
             sessions: &[],
             groups: &[],
             credentials: &[],
+            projects: &[],
+            known_hosts: None,
             tunnels: &[],
             tunnel_states: &[],
             store_available: false,

@@ -27,6 +27,9 @@ const EXTRA: &[&str] = &[
     concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/settings.rs"),
     // F71 的解锁框：同样吃 `metrics` 的宽度/间距刻度，同样得受管。
     concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/unlock.rs"),
+    // F225② 的项目管理器：`use` 了 `session_manager::form` 的 section/grid，
+    // 同样吃 `metrics` 的刻度。不登记的话规范对它一条都管不住。
+    concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui/project_manager.rs"),
 ];
 
 /// 既有违规的行级白名单。

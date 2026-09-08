@@ -52,6 +52,13 @@ pub fn top_menu(
                         ui_state.group_manager_open = true;
                         ui.close_menu();
                     }
+                    // F225②:与上面两个并列 —— 三者都是「配置库里的持久实体」。
+                    // 不放「配置」菜单:那里装的是本机偏好,混进去会把两类东西
+                    // 的边界糊掉。
+                    if ui.button("项目管理器").clicked() {
+                        ui_state.project_manager_open = true;
+                        ui.close_menu();
+                    }
                     // F2:导入是一次性动作,不做开机自动发现(设计 D7)。
                     if ui.button("导入 ssh config…").clicked() {
                         ui_state.import_pick_request = true;

@@ -2345,6 +2345,12 @@ enum Modal {
     /// F60:分组管理器。**过去漏了**(`modal_open` 的旧注释已承认)——
     /// 里面有分组名输入框。
     GroupManager,
+    /// F225②:项目管理器。里面有项目名/目录/tmux 名三个输入框 —— 不算模态
+    /// 的话敲的字会同时发给远端 shell(T8)。
+    ///
+    /// **同时进 `touched_store`**:它写 `sessions.toml` 的 `[[project]]`。
+    /// 切片 I 的教训是「弹窗要同时进两张表」,少任何一张都静默。
+    ProjectManager,
     /// E2/E3:标签属性弹窗(改名 + 配色)。里面有名字输入框 —— 不算模态的话
     /// 敲的字会同时发给远端 shell(T8)。
     TabProps,
@@ -2393,6 +2399,7 @@ impl Modal {
         Modal::Editor,
         Modal::FilesDialog,
         Modal::GroupManager,
+        Modal::ProjectManager,
         Modal::TabProps,
         Modal::ExitConfirm,
         Modal::Rehost,
@@ -3553,6 +3560,7 @@ impl App {
             Modal::Editor => self.edit.editor.is_some(),
             Modal::FilesDialog => self.ui.files_dialog.is_some(),
             Modal::GroupManager => self.ui.group_manager_open,
+            Modal::ProjectManager => self.ui.project_manager_open,
             // E2/E3:标签属性弹窗里有名字输入框 —— 不算模态的话,敲的字会
             // 同时被发给远端 shell(T8)。
             Modal::TabProps => self.ui.tab_props.is_some(),
@@ -10299,10 +10307,26 @@ impl ApplicationHandler<UserEvent> for App {
                             let tunnels: &[mullion_store::TunnelRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.tunnels());
                             let tunnel_states = self.tunnels.snapshot();
+                            let projects: &[mullion_store::ProjectRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.projects());
+                            // F222:**只在项目管理器开着时才上锁**。这把锁 SSH
+                            // 线程握手时也要拿,每帧无条件锁会让一次握手白等一帧,
+                            // 而这个弹窗一天开不了几次。
+                            // 先 clone `Arc` 再锁:直接 `self.known_hosts.lock()`
+                            // 的话,guard 会把 `&self` 的不可变借用一路拖到
+                            // 这一帧末尾,后面所有 `&mut self` 全部编译不过。
+                            let known_hosts_arc = self
+                                .ui
+                                .project_manager_open
+                                .then(|| Arc::clone(&self.known_hosts));
+                            let known_hosts_guard =
+                                known_hosts_arc.as_ref().and_then(|a| a.lock().ok());
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
                                 credentials,
+                                projects,
+                                known_hosts: known_hosts_guard.as_deref(),
                                 tunnels,
                                 tunnel_states: &tunnel_states,
                                 store_available,
@@ -10850,7 +10874,11 @@ impl ApplicationHandler<UserEvent> for App {
                     || self.ui.reorder_request.is_some()
                     // F2:导入一次能加进几十条会话,外观缓存必须跟着重算 ——
                     // 漏掉它的话新会话在列表里画的是默认色/默认图标。
-                    || self.ui.import_request.is_some();
+                    || self.ui.import_request.is_some()
+                    // F225②:项目管理器写 `sessions.toml` 的 `[[project]]`。
+                    // 它本身不改外观,但 `refresh_appearance` 顺带做的是
+                    // 「store 变了就重算」,漏登记的症状是别的地方难查。
+                    || self.ui.project_intent.is_some();
                 if self.ui.delete_request.is_some()
                     || self.ui.save_request.is_some()
                     || self.ui.move_to_group.is_some()
@@ -11080,6 +11108,50 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         if let Err(e) = store.save() {
                             self.ui.set_error(e.to_string());
+                        }
+                    }
+                }
+                // F225②:项目管理弹窗的 intent 施加点。校验在 store 那一侧
+                // (`update_project` 先校验后写),被拒时**一个字段都不改** ——
+                // 半途改一半再报错的话,用户看到「保存失败」而配置已经变了。
+                if let Some(intent) = self.ui.project_intent.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        let mut ok = true;
+                        match intent {
+                            crate::ui::project_manager::ProjectIntent::Add(name) => {
+                                // 目录留空:新建那一刻还不知道要落在哪个目录,
+                                // 逼用户在一个单行输入框里先想好路径是本末倒置。
+                                // 右栏的「保存」按钮会拦住空目录。
+                                let now = time::OffsetDateTime::now_utc()
+                                    .format(&time::format_description::well_known::Rfc3339)
+                                    .unwrap_or_default();
+                                let id = store.add_project(name, String::new(), &now);
+                                self.ui.project_selected = Some(id);
+                                self.ui.project_draft =
+                                    store.projects().iter().find(|p| p.id == id).cloned();
+                            }
+                            crate::ui::project_manager::ProjectIntent::Save(id, draft) => {
+                                if let Err(e) = store.update_project(id, *draft) {
+                                    ok = false;
+                                    self.ui.set_error(format!("项目保存失败:{e:?}"));
+                                }
+                            }
+                            crate::ui::project_manager::ProjectIntent::Delete(id) => {
+                                if let Err(e) = store.delete_project(id) {
+                                    ok = false;
+                                    self.ui.set_error(e.to_string());
+                                }
+                                self.ui.project_selected = None;
+                                self.ui.project_draft = None;
+                            }
+                        }
+                        // 被拒时不落盘:store 里那份没变,写回去只是把没变的
+                        // 东西重写一遍,但会顺带把别的实例刚写进去的东西的
+                        // 时序搅乱(F189 的重读只在 mutator 里)。
+                        if ok {
+                            if let Err(e) = store.save() {
+                                self.ui.set_error(e.to_string());
+                            }
                         }
                     }
                 }
@@ -13240,6 +13312,56 @@ mod tests {
         );
     }
 
+    /// F225②/T8:项目管理器里有项目名/目录/tmux 名三个输入框 —— 不登记成
+    /// 模态的话,敲的字会**同时**上屏和发给远端 shell(在 tmux 里跑 Claude
+    /// Code 时就是往它的输入框里灌半句路径),而且 `Ctrl+W` 还会把背后的
+    /// 标签关掉。
+    ///
+    /// 自证会变红:把 `Modal::ProjectManager` 从 `Modal::ALL` 里删掉,
+    /// 或把它那一臂并进别的弹窗。
+    #[test]
+    fn the_project_manager_is_a_modal_so_typing_cannot_leak_to_the_remote_shell() {
+        assert!(
+            Modal::ALL.contains(&Modal::ProjectManager),
+            "ProjectManager 没登记进 Modal::ALL(T8)"
+        );
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn modal_open(&self) -> bool {")
+            .nth(1)
+            .expect("找不到 modal_open");
+        let body = &after[..after.find("\n    }\n").expect("找不到 modal_open 的结尾")];
+        assert!(
+            body.contains("Modal::ProjectManager => self.ui.project_manager_open"),
+            "modal_open 里没有 ProjectManager 独立的那一臂(T8)"
+        );
+    }
+
+    /// F225②:项目管理器**写 store**,必须进 `touched_store`。
+    ///
+    /// 切片 I 的教训是「弹窗要同时进 `Modal` 和 `touched_store` 两张表」,
+    /// 少任何一张都静默:少 `Modal` 是键漏给远端(上一条钉着),
+    /// 少 `touched_store` 是 store 变了而 F61/F62 的外观缓存不重算。
+    ///
+    /// 自证会变红:把 `|| self.ui.project_intent.is_some()` 那一行删掉。
+    #[test]
+    fn project_edits_are_counted_as_touching_the_store() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("let touched_store = ")
+            .nth(1)
+            .expect("找不到 touched_store 的赋值");
+        let expr = &after[..after.find(";\n").expect("找不到该赋值的结尾")];
+        assert!(
+            expr.contains("self.ui.save_request"),
+            "touched_store 的表达式切歪了 —— 下面那条断言会空过"
+        );
+        assert!(
+            expr.contains("self.ui.project_intent"),
+            "项目编辑没算进 touched_store(F225②;切片 I 的两张表少了一张)"
+        );
+    }
+
     /// F219/T8:就地新建的输入框必须登记成模态 —— 不登记的话面板持有键盘
     /// 焦点时那个框**一个键都收不到**,而 Backspace 还会被 `handle_panel_key`
     /// 解释成「回上级目录」,一按就跳走。
@@ -14912,6 +15034,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::GroupManager),
                     "GroupManager 没登记进 Modal::ALL(T8)"
                 ),
+                Modal::ProjectManager => assert!(
+                    Modal::ALL.contains(&Modal::ProjectManager),
+                    "ProjectManager 没登记进 Modal::ALL(T8)"
+                ),
                 Modal::TabProps => assert!(
                     Modal::ALL.contains(&Modal::TabProps),
                     "TabProps 没登记进 Modal::ALL(T8)"
@@ -14953,6 +15079,7 @@ mod tests {
             Modal::Editor,
             Modal::FilesDialog,
             Modal::GroupManager,
+            Modal::ProjectManager,
             Modal::TabProps,
             Modal::ExitConfirm,
             // 补漏:这一项过去缺席 —— `match` 有它那一臂,但循环从不喂它,
