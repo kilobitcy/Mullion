@@ -78,11 +78,34 @@ pub const SHORTCUTS: &[Shortcut] = &[
         scope: "终端",
         what: "插入换行而不提交",
     },
-    // —— 文件面板(app.rs::files_hotkey_event)——
+    // —— 文件面板(app.rs::files_hotkey_event / handle_panel_key)——
     Shortcut {
         chord: "Ctrl+Shift+B",
         scope: "文件",
         what: "开关文件侧栏",
+    },
+    // 下面这几条只在**焦点落在文件面板**时生效,而且只认远端栏(D5)。
+    // 少了它们,一览表会显得 `Ctrl+Shift+N` 只有「项目」一个主人 ——
+    // F240 就是这么撞上 F226 的。
+    Shortcut {
+        chord: "Ctrl+H",
+        scope: "文件",
+        what: "显示 / 隐藏点文件",
+    },
+    Shortcut {
+        chord: "Ctrl+N",
+        scope: "文件",
+        what: "在远端栏就地新建文件",
+    },
+    Shortcut {
+        chord: "Ctrl+Shift+N",
+        scope: "文件",
+        what: "在远端栏就地新建文件夹(焦点在面板时压过「项目」那条)",
+    },
+    Shortcut {
+        chord: "Ctrl+C / Ctrl+X / Ctrl+V",
+        scope: "文件",
+        what: "远端栏内的复制 / 剪切 / 粘贴",
     },
     // —— 会话管理器(ui::session_manager::keys::scan)——
     Shortcut {
@@ -130,7 +153,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         chord: "Ctrl+Shift+N",
         scope: "项目",
-        what: "把当前分屏的目录和 tmux 会话收成一个新项目",
+        what: "把当前分屏的目录和 tmux 会话收成一个新项目(焦点在文件面板时让位)",
     },
 ];
 

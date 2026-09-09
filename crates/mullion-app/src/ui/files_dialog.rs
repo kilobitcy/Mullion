@@ -31,6 +31,9 @@ pub enum FilesDialog {
         path: RemotePath,
         /// 九宫格当前值(低 9 位)。
         mode: u32,
+        /// 开框那一刻的值。**只用来判脏**(F239「脏了不关」)——没有它的话
+        /// 勾了几格权限再点一下外面,勾选会被静默丢掉。
+        mode0: u32,
     },
     /// F53:回传前发现远端那份已经被别人改过(D3-8)。**必须问** ——
     /// 直接覆盖会悄悄吃掉别人的改动,而这是我们自己发起的写。
@@ -347,7 +350,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 cancelled!();
             }
         }
-        FilesDialog::Chmod { path, mode } => {
+        FilesDialog::Chmod { path, mode, .. } => {
             let path_disp = path.display().to_string();
             let x = modal(ctx, "属性", |ui| {
                 ui.label(egui::RichText::new(&path_disp).color(theme::c32(t.fg_muted)));
@@ -637,6 +640,7 @@ mod tests {
             FilesDialog::Chmod {
                 path: rp("/srv/a"),
                 mode: 0o644,
+                mode0: 0o644,
             },
             FilesDialog::EditConflict {
                 name: "/srv/a".into(),
@@ -704,6 +708,7 @@ mod tests {
                 Some(FilesDialog::Chmod {
                     path: rp("/srv/a"),
                     mode: 0o644,
+                    mode0: 0o644,
                 }),
             ),
             ("编辑冲突", edit_conflict()),
@@ -1277,6 +1282,7 @@ mod tests {
             FilesDialog::Chmod {
                 path: rp("/srv/a"),
                 mode: 0o644,
+                mode0: 0o644,
             },
             FilesDialog::EditConflict {
                 name: "/etc/nginx/nginx.conf".into(),

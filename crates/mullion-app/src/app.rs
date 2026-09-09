@@ -3945,6 +3945,13 @@ impl App {
                     crate::ui::import_dialog::picks_changed(&st.rows, &st.picked0)
                 })
             }
+            // 文件确认框里只有「属性」带草稿(九宫格勾选);另外几个框要么
+            // 只是问一句、要么本身就是在等一个处置,没有会被丢掉的输入。
+            Modal::FilesDialog => matches!(
+                self.ui.files_dialog,
+                Some(crate::ui::files_dialog::FilesDialog::Chmod { mode, mode0, .. })
+                    if mode != mode0
+            ),
             _ => false,
         }
     }
@@ -4605,6 +4612,16 @@ impl App {
     /// 编码进 PTY,给远端 shell 写一个字母。
     ///
     /// 判定全在 `project::hotkey_plan` 那张表里,这里只接线。
+    ///
+    /// **焦点在文件面板时整个让位**:F226 早就把 `Ctrl+Shift+N` 给了远端栏的
+    /// 「就地新建文件夹」(`handle_panel_key`),而那一段跑在通用分流**里面**,
+    /// 位置比这里晚。不让位的话,面板上按这个键再也建不出文件夹了 —— 而且
+    /// 完全静默:在带终端的标签里是弹出建项目表单,在纯文件标签里
+    /// (`effective_focus` 恒 `FilesPanel`、`focused_pane_cwd` 恒 `None`)是
+    /// 出一条驴唇不对马嘴的「这块分屏还没有当前目录」。
+    ///
+    /// 让位判据只看焦点、不看是哪一栏:本地栏 F226 是静默不动,那这个键在
+    /// 面板上就该一律不做事,而不是「按栏切换成两种完全不同的功能」。
     fn project_hotkey_event(&mut self, event: &WindowEvent) -> bool {
         let WindowEvent::KeyboardInput { event: ke, .. } = event else {
             return false;
@@ -4619,6 +4636,9 @@ impl App {
             return false;
         }
         if !matches!(key, Key::Char('n' | 'N')) {
+            return false;
+        }
+        if self.effective_focus() == shell::input_route::Focus::FilesPanel {
             return false;
         }
         self.apply_project_hotkey();
@@ -5949,6 +5969,7 @@ impl App {
                 Some(FilesDialog::Chmod {
                     path: state.cwd.join(cur.as_bytes()),
                     mode: e.mode & 0o777,
+                    mode0: e.mode & 0o777,
                 })
             }),
             FileAsk::Delete => {
@@ -15071,6 +15092,68 @@ mod tests {
             "Ctrl+Shift+N 没接上"
         );
         assert!(arm.contains("FileAction::BeginNewFile"), "Ctrl+N 被改坏了");
+    }
+
+    /// F240 × F226:`Ctrl+Shift+N` 有**两个**主人,分辨它俩的唯一判据是焦点。
+    ///
+    /// 建项目那条(`project_hotkey_event`)按 T8 必须拦在通用分流**之前**,
+    /// 而新建文件夹那条(`handle_panel_key`)跑在分流**里面** —— 位置天生
+    /// 分不出胜负,只能靠前者主动让位。少了那道让位,面板上再也建不出
+    /// 文件夹,且完全静默:带终端的标签里是弹出建项目表单,纯文件标签里
+    /// (焦点恒在面板、`focused_pane_cwd` 恒 `None`)是一条驴唇不对马嘴的
+    /// 「这块分屏还没有当前目录」。
+    ///
+    /// 这条测试同时钉住**顺序**和**让位**:只钉让位的话,以后有人把拦截点
+    /// 挪到分流之后,让位那行就变成了没有意义的死判据,而测试照绿。
+    ///
+    /// 注释先剥掉再搜:本仓已经吃过「判据关键词写在注释里让源码切片假绿」
+    /// 的亏,而上面这段注释里正好有 `Focus::FilesPanel` 要找的字样。
+    ///
+    /// 自证会变红:(a) 把 `project_hotkey_event` 里那句
+    /// `effective_focus() == ...FilesPanel` 去掉;(b) 把 `window_event` 里
+    /// `project_hotkey_event` 的调用挪到 `handle_panel_key` 之后。
+    #[test]
+    fn the_project_hotkey_yields_ctrl_shift_n_back_to_the_files_panel() {
+        let src = include_str!("app.rs");
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // (a) 让位:焦点在文件面板时不拦这个键。
+        let after = src
+            .split("fn project_hotkey_event(")
+            .nth(1)
+            .expect("找不到 project_hotkey_event");
+        let body = strip(&after[..after.find("\n    }\n").expect("找不到函数结尾")]);
+        assert!(
+            body.contains("Focus::FilesPanel"),
+            "project_hotkey_event 没给文件面板让位 —— F226 的新建文件夹被静默劫持"
+        );
+        assert!(
+            body.contains("self.effective_focus()"),
+            "让位判据不是 effective_focus —— 纯文件标签那种没有终端的宿主会漏掉"
+        );
+
+        // (b) 顺序:拦截点确实在 `handle_panel_key` 之前,让位才是必需的。
+        let wev = strip(
+            src.split("fn window_event(")
+                .nth(1)
+                .expect("找不到 window_event"),
+        );
+        let hotkey = wev
+            .find("self.project_hotkey_event(&event)")
+            .expect("window_event 里没接 project_hotkey_event");
+        let panel = wev
+            .find("self.handle_panel_key(gen")
+            .expect("window_event 里没接 handle_panel_key");
+        assert!(
+            hotkey < panel,
+            "project_hotkey_event 已经排到 handle_panel_key 之后 —— \
+             让位那行变成死判据了,请连同它一起重新想清楚"
+        );
     }
 
     /// F226:建完之后光标要落到新目录上(同 F219 建文件)。`follow` **必须在
