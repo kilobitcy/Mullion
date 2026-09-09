@@ -1080,6 +1080,9 @@ mod tests {
     /// 这块 pane 已经在某个项目的 tmux 里 → 打开**那个**项目的编辑表单,
     /// 不新建。再建一个的话,同一台机器同一个目录会有两条项目记录,而它们
     /// 会算出同一个 tmux 名 —— `validate_project` 会拦,但用户会一头雾水。
+    ///
+    /// 自证会变红:把 `hotkey_plan` 里 `if let Some(p) = project_of(..)` 那一支
+    /// 整段删掉。
     #[test]
     fn a_pane_already_in_a_project_opens_that_project_instead_of_making_a_new_one() {
         let mut p = named(1, "我的项目");
@@ -1097,11 +1100,13 @@ mod tests {
     }
 
     /// **判定顺序的钉子**:即使 cwd 也完全拿得到、能推出一份完好的草稿,
-    /// 「已属某项目」仍然赢——判定顺序反了,一块已经在项目里的 pane 会被
-    /// 拿去建第二个项目。
+    /// 「已属某项目」仍然赢——`project_of` 那一支必须不受 cwd/node 是否
+    /// 齐全影响,恒定执行。与上一条的区别只是 cwd 这里给的是一条更长、
+    /// 明显能推出草稿的路径,排除「碰巧两条判据都指向同一个结果」的巧合。
     ///
-    /// 自证会变红:把 `hotkey_plan` 里 `project_of` 那一支挪到 `cwd`/`node`
-    /// 两支判断之后。
+    /// 自证会变红:把 `hotkey_plan` 里 `if let Some(p) = project_of(..) { .. }`
+    /// 那一支整段删掉(与上一条同一处改动 —— 这条用不同的 cwd 值复核,防止
+    /// 两条测试凑巧靠同一份布景撞出同一个假绿)。
     #[test]
     fn the_membership_check_wins_over_a_perfectly_good_cwd() {
         let mut p = named(1, "我的项目");
@@ -1122,6 +1127,15 @@ mod tests {
 
     /// pane 从没上报过目录 → 出一条 toast 说清楚,不弹空表单。弹一个 `dir`
     /// 空着的表单等于这个键什么都没省下来,用户还得自己把路径抄过去。
+    ///
+    /// 断言**具体文案**而不是只判非空:`cwd` 缺失、`node` 缺失、`cwd` 推不出
+    /// 最后一级这三条 `Explain` 出口各自的话不一样,只判非空的话,`hotkey_plan`
+    /// 把 `cwd` 缺失当成别的缺失去报(说的是另一件事)也照样能通过。
+    ///
+    /// 自证会变红:把 `hotkey_plan` 里 `let Some(cwd) = cwd else { .. }` 那一支
+    /// 删掉,改成 `let cwd = cwd.unwrap_or_default();` 直通到下面 ——
+    /// `prefill_from_pane("", ..)` 同样返回 `None`,但走的是「这个目录没有
+    /// 可用的名字」那条文案,不是这里要钉住的「没有当前目录」。
     #[test]
     fn a_pane_that_never_reported_its_directory_gets_an_explanation_not_a_form() {
         let plan = hotkey_plan(
@@ -1131,24 +1145,37 @@ mod tests {
             &[],
         );
         match plan {
-            HotkeyPlan::Explain(msg) => assert!(!msg.is_empty(), "解释文案不能是空字符串"),
+            HotkeyPlan::Explain(msg) => {
+                assert_eq!(msg, "这块窗格还没有当前目录,建不了项目")
+            }
             other => panic!("cwd 拿不到时应该出 Explain,拿到了 {other:?}"),
         }
     }
 
     /// pane 还没连上机器(拿不到 `SessionId`)同样要出 Explain,而不是 panic
     /// 或者悄悄用一个假节点建草稿。
+    ///
+    /// 断言具体文案,理由同上一条。
+    ///
+    /// 自证会变红:把 `hotkey_plan` 里 `let Some(node) = node else { .. }`
+    /// 那一支删掉,改成 `let node = node.unwrap_or(mullion_store::SessionId(0));`
+    /// 直通到下面 —— 会静默用一个假节点建出一份 `NewDraft`,而不是报错。
     #[test]
     fn a_pane_with_no_node_yet_gets_an_explanation_not_a_panic() {
         let plan = hotkey_plan(Some("/srv/api"), None, None, &[]);
         match plan {
-            HotkeyPlan::Explain(msg) => assert!(!msg.is_empty()),
+            HotkeyPlan::Explain(msg) => {
+                assert_eq!(msg, "这块窗格还没连上机器,建不了项目")
+            }
             other => panic!("node 拿不到时应该出 Explain,拿到了 {other:?}"),
         }
     }
 
     /// 拿得到 cwd + node、且不属于任何项目 → 草稿,内容与 `prefill_from_pane`
     /// 完全一致(`dir` 完整、`name` 是最后一级、`tmux_name` 是上报的那个)。
+    ///
+    /// 自证会变红:把 `hotkey_plan` 里 `Some(draft) => HotkeyPlan::NewDraft(..)`
+    /// 那一支换成恒 `HotkeyPlan::Explain("…".to_string())`。
     #[test]
     fn a_pane_with_a_directory_and_a_node_yields_a_prefilled_draft() {
         let plan = hotkey_plan(
