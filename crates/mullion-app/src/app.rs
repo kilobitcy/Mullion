@@ -3945,13 +3945,11 @@ impl App {
                     crate::ui::import_dialog::picks_changed(&st.rows, &st.picked0)
                 })
             }
-            // 文件确认框里只有「属性」带草稿(九宫格勾选);另外几个框要么
-            // 只是问一句、要么本身就是在等一个处置,没有会被丢掉的输入。
-            Modal::FilesDialog => matches!(
-                self.ui.files_dialog,
-                Some(crate::ui::files_dialog::FilesDialog::Chmod { mode, mode0, .. })
-                    if mode != mode0
-            ),
+            Modal::FilesDialog => self
+                .ui
+                .files_dialog
+                .as_ref()
+                .is_some_and(crate::ui::files_dialog::is_dirty),
             _ => false,
         }
     }

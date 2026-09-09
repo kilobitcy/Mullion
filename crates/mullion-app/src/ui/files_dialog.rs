@@ -221,6 +221,21 @@ pub fn bits_from_mode(mode: u32) -> [bool; 9] {
     out
 }
 
+/// F239:这个框里有没有**会被丢掉的用户输入**(「脏了就不关」的判据)。
+///
+/// 只有「属性」带草稿:九宫格勾选活在框自己身上,点一下外面就没了。
+/// 另外几个框要么只是问一句(删除/粘贴撞名),要么本身就是在等一个处置
+/// (传输冲突/编辑冲突)—— 那些关掉不丢输入,而且 `cancel_op` 会给出处置。
+pub fn is_dirty(d: &FilesDialog) -> bool {
+    match d {
+        FilesDialog::Chmod { mode, mode0, .. } => mode != mode0,
+        FilesDialog::Delete { .. }
+        | FilesDialog::EditConflict { .. }
+        | FilesDialog::Conflict { .. }
+        | FilesDialog::PasteConflict { .. } => false,
+    }
+}
+
 /// F203:「取消这个框」要发出的处置。`None` = 只关框就行。
 ///
 /// 抽成纯函数是因为它有**两个入口**:框里那颗「取消」按钮,和 F203 加在
@@ -1328,6 +1343,44 @@ mod tests {
                 "{d:?} 的标题报成了 {:?},但这一帧根本没有这个窗口",
                 title_of(&d)
             );
+        }
+    }
+
+    /// F239:勾了权限格再点一下外面,勾选**不许**被静默丢掉。
+    ///
+    /// 「属性」是这五个框里唯一带草稿的,而它的草稿活在框自己身上 ——
+    /// 只关框就等于把用户刚勾的东西扔了,界面上不留任何痕迹。
+    ///
+    /// 自证会变红:把 `is_dirty` 的 `Chmod` 那臂改成 `false`。
+    #[test]
+    fn a_half_ticked_permission_grid_counts_as_dirty() {
+        let touched = FilesDialog::Chmod {
+            path: rp("/srv/a"),
+            mode: 0o755,
+            mode0: 0o644,
+        };
+        assert!(is_dirty(&touched), "改过的九宫格没被判脏 —— 点外面会丢");
+        let untouched = FilesDialog::Chmod {
+            path: rp("/srv/a"),
+            mode: 0o644,
+            mode0: 0o644,
+        };
+        assert!(!is_dirty(&untouched), "没动过的属性框判成了脏,关不掉了");
+    }
+
+    /// 另外四个框没有草稿:它们要么只是问一句,要么在等一个处置
+    /// (`cancel_op` 会给),关掉不丢用户输入。
+    ///
+    /// 判成脏的后果是**点外面永远关不掉**,而那是一种没有出错提示的卡死。
+    ///
+    /// 自证会变红:把 `is_dirty` 改成 `!matches!(d, Chmod{..})` 之类恒真的写法。
+    #[test]
+    fn the_dialogs_without_a_draft_never_block_the_click_outside() {
+        for d in every_dialog_variant() {
+            if matches!(d, FilesDialog::Chmod { .. }) {
+                continue;
+            }
+            assert!(!is_dirty(&d), "{d:?} 判成了脏 —— 点外面再也关不掉它");
         }
     }
 }
