@@ -17963,13 +17963,16 @@ mod tests {
         )
         .expect("点了关闭,动作不该是 None");
         assert!(fresh2.is_empty(), "关 pane 不该产生待开的新 channel");
-        // F232:三等分关掉中间一块,剩下的是 1/3 : 2/3,不等于任何预设 —— 高亮
-        // 该熄灭。注意这不是「关了就一律熄灭」(那正是本片修掉的 bug):换成
-        // 两屏关掉一块,`preset_of` 会认出 Single 并重新点亮。
+        // F241:三等分关掉一块,剩下两块重排成**等宽**的两屏左右,工具栏那个
+        // 按钮跟着亮。这一条钉的是**接线**——`layout_after_close` 的纯函数
+        // 单测保证不了 `apply_layout_actions` 这条路真的经过了它
+        // (F232 之前的旧行为是剩下 1/3 : 2/3、一个按钮都不亮)。
+        //
+        // 自证会变红:把 `Workspace::close_pane` 里那三行重排删掉。
         assert_eq!(
             crate::shell::workspace::preset::preset_of(ws.tree()),
-            None,
-            "1/3 : 2/3 不对应任何预设"
+            Some(Preset::TwoLeftRight),
+            "关掉一块之后剩下两块该是等宽的两屏左右"
         );
         assert!(
             ws.pane(target).is_none(),

@@ -420,6 +420,14 @@ impl Workspace {
     /// `ChannelWriteHalf` 没有 `Drop` 实现,不显式 `close()` 的话远端 shell
     /// 会一直挂着,channel slot 泄漏到 sshd 的 `MaxSessions` 上限(默认 10)
     /// 之后,同一条连接再也开不出新分屏(adr-009 已列的失效模式)。
+    /// F241:关完之后剩下的 pane **重排成 N 屏水平并列**(判据与理由见
+    /// [`preset::layout_after_close`])。兄弟顶替只补上了空出来的格子,补不了
+    /// 祖先那层的比例 —— 三等宽竖条关掉一块,剩下两块是 1/3 : 2/3。
+    ///
+    /// 存活 pane 按 `leaves` 的几何顺序填进新树,与点预设按钮时同一条约定
+    /// (§5.2)。`preset_tree` 的叶子顺序等于 `leaves` 的返回顺序
+    /// (`preset_tree_fills_leaves_in_geometric_order` 钉着),所以重排前后
+    /// `leaves` 一致,下面那句 `next_focus` 放在重排之后或之前都一样。
     pub fn close_pane(&mut self, id: PaneId) -> bool {
         if !close_pane(&mut self.tree, id) {
             return false;
@@ -428,6 +436,10 @@ impl Workspace {
             p.pty.close();
         }
         self.panes.retain(|p| p.id != id);
+        let ids = leaves(&self.tree);
+        if let Some(preset) = preset::layout_after_close(ids.len()) {
+            self.tree = preset_tree(preset, &ids);
+        }
         self.focus = next_focus(self.focus, &leaves(&self.tree));
         true
     }

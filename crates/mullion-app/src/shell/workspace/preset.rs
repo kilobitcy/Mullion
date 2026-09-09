@@ -184,6 +184,32 @@ fn same_shape(a: &Node, b: &Node) -> bool {
     }
 }
 
+/// F241:关掉一块 pane 之后,剩下的 `n` 块该排成哪个预设。`None` = 不重排。
+///
+/// **无条件重排成「N 屏水平并列」**,不看关闭前是什么形状。理由分两层:
+///
+/// 一是几何上非治不可。三等宽竖条在二叉树里只能是
+/// `split(h, 1/3, l0, split(h, 0.5, l1, l2))` —— 关掉中间或右边那块之后,
+/// `close_pane` 只做兄弟顶替,**外层那个 1/3 原封不动**,剩下两块变成
+/// 1/3 : 2/3。宽度不齐,而且 `preset_of` 认不出它,工具栏「两屏左右」不亮。
+///
+/// 二是这道规则**不能带条件**。曾经的备选是「只在关闭前正好是预设时才重排」
+/// (好处是保住用户手拖出来的比例),但那让「会不会重排」取决于一件**界面上
+/// 完全不可见**的事:三天前有没有拖过一次分隔条。同样的操作有时重排有时不,
+/// 用户无从解释。丢掉的比例再拖一次就有;而拖过之后关一块得到的 1/3 : 2/3,
+/// 是用户从来没要求过的比例。
+///
+/// `n > 3` 不重排:四屏只有 2×2 一种形态,不是「水平并列」,硬凑等于改语义。
+/// 这条只可能来自 F37 恢复一棵手改过的 `layout.toml`(UI 里点不出 5 屏)。
+pub fn layout_after_close(n: usize) -> Option<Preset> {
+    match n {
+        1 => Some(Preset::Single),
+        2 => Some(Preset::TwoLeftRight),
+        3 => Some(Preset::ThreeColumns),
+        _ => None,
+    }
+}
+
 /// 套用预设的重排计划(§5.2/§5.3)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresetPlan {
@@ -526,6 +552,12 @@ mod tests {
     /// F232 的全部意义:关掉一块 pane 之后,如果剩下的形状**正好**等于某个预设,
     /// 工具栏那个按钮就该重新亮起来。旧实现在这里无条件把高亮清成 None。
     ///
+    /// **注意这里调的是 core 的 `close_pane`,不是 `Workspace::close_pane`。**
+    /// 本条描述的是 `preset_of` 这一层:「形状对上了就认得出」。F241 之后
+    /// app 的实际行为多了一步重排(`layout_after_close`),下面第三例的
+    /// `TwoTopBottom` 在真实 app 里会被重排成 `TwoLeftRight` —— 那是**上一层**
+    /// 的策略,不该混进这条对 `preset_of` 的描述里。
+    ///
     /// 自证会变红:让 `preset_of` 恒返回 `None`,四条 assert_eq 全红。
     #[test]
     fn closing_a_pane_can_relight_a_preset_button() {
@@ -556,6 +588,11 @@ mod tests {
     /// 不许"就近凑一个"。凑错了会让用户以为当前是某个预设,再点一次同名按钮
     /// 反而重排整棵树、真的关掉 pane。
     ///
+    /// 同上条:这里调的是 core 的 `close_pane`,描述的是 `preset_of` 这一层。
+    /// F241 之后这两棵树在真实 app 里都到不了 —— `Workspace::close_pane` 会
+    /// 先把它们重排成水平并列。「就近凑」的禁令本身仍然成立:`preset_of` 只
+    /// 认精确形状,重排是**改树**而不是放宽识别。
+    ///
     /// 这两例是从 `preset_tree` 原文推出来的,不是猜的:
     /// - `ThreeColumns` = `split(h, 1/3, l0, split(h, 0.5, l1, l2))`,关掉中间
     ///   那块后外层 ratio 仍是 1/3,不等于 `TwoLeftRight` 的 0.5。
@@ -574,6 +611,85 @@ mod tests {
         let mut t = preset_tree(Preset::FourGrid, &ids(4));
         assert!(close_pane(&mut t, PaneId(4)));
         assert_eq!(preset_of(&t), None, "上行左右分 + 下行通宽,不是任何预设");
+    }
+
+    /// F241:关完之后剩下几块,就排成几屏水平并列。逐格钉住 —— 这张表写错
+    /// 一格就是「关掉一块之后布局变成另一种东西」,而且看起来像是随机的。
+    ///
+    /// 自证会变红:把 `3 => Some(Preset::ThreeColumns)` 改成
+    /// `Some(Preset::ThreeBigLeft)`(第三条红);把 `_ => None` 改成
+    /// `_ => Some(Preset::FourGrid)`(最后一条红)。
+    #[test]
+    fn what_is_left_after_a_close_is_always_n_panes_side_by_side() {
+        assert_eq!(layout_after_close(1), Some(Preset::Single));
+        assert_eq!(layout_after_close(2), Some(Preset::TwoLeftRight));
+        assert_eq!(layout_after_close(3), Some(Preset::ThreeColumns));
+        // 四屏没有「水平并列」形态,不重排 —— 只可能来自 F37 恢复一棵手改过
+        // 的 layout.toml,UI 里点不出 5 屏。
+        assert_eq!(layout_after_close(4), None);
+        assert_eq!(layout_after_close(9), None);
+    }
+
+    /// F241:重排是**无条件**的 —— 关闭前是不是预设、比例有没有被拖歪,
+    /// 一概不看。
+    ///
+    /// 这条单独立是因为「有条件」和「无条件」两种实现下,拿预设树做输入的
+    /// 测试**长得一模一样**:预设树本来就被 `preset_of` 认得出,两种实现都会
+    /// 重排。只有喂一棵比例已经歪掉的树,两者才分得开。
+    ///
+    /// 自证会变红:在 `Workspace::close_pane` 的重排前面加一道
+    /// `if preset_of(&before).is_some()` 的门(把关闭前的树先克隆出来判)。
+    #[test]
+    fn a_hand_dragged_layout_is_rearranged_on_close_just_like_a_preset_one() {
+        use mullion_core::layout::close_pane;
+
+        // 三等宽竖条被拖歪:外层 0.2、内层 0.7,`preset_of` 认不出它。
+        let mut t = preset_tree(Preset::ThreeColumns, &ids(3));
+        let Node::Split { ratio, b, .. } = &mut t else {
+            panic!("三等宽竖条的根必须是 Split");
+        };
+        *ratio = 0.2;
+        let Node::Split { ratio: inner, .. } = b.as_mut() else {
+            panic!("三等宽竖条的右子必须是 Split");
+        };
+        *inner = 0.7;
+        assert_eq!(preset_of(&t), None, "前提:这棵树已经不是任何预设");
+
+        // 走一遍 `Workspace::close_pane` 的两步:兄弟顶替 → 按剩余块数重排。
+        assert!(close_pane(&mut t, PaneId(2)));
+        let survivors = leaves(&t);
+        let p = layout_after_close(survivors.len()).expect("剩两块该有目标预设");
+        t = preset_tree(p, &survivors);
+
+        assert_eq!(preset_of(&t), Some(Preset::TwoLeftRight));
+        let widths: Vec<u16> = compute_rects(&t, AREA).iter().map(|(_, r)| r.cols).collect();
+        assert_eq!(widths, vec![600, 600], "拖歪过的比例照样被冲成等宽");
+    }
+
+    /// F241:重排**不改变 pane 的先后顺序** —— `preset_tree` 按几何顺序填叶子,
+    /// 而喂进去的正是 `leaves` 的返回顺序。顺序一乱,用户看到的是内容互相换位
+    /// (§5.2 警告过的那种「跳」)。
+    ///
+    /// 自证会变红:把重排那句改成 `preset_tree(p, &{ let mut v = survivors
+    /// .clone(); v.reverse(); v })`。
+    #[test]
+    fn rearranging_after_a_close_keeps_the_survivors_in_geometric_order() {
+        use mullion_core::layout::close_pane;
+
+        // 2×2 关掉右下 → 剩左上、右上、左下 → 三等宽竖条的左/中/右。
+        let mut t = preset_tree(Preset::FourGrid, &ids(4));
+        assert!(close_pane(&mut t, PaneId(4)));
+        let survivors = leaves(&t);
+        assert_eq!(survivors, vec![PaneId(1), PaneId(2), PaneId(3)]);
+        let p = layout_after_close(survivors.len()).expect("剩三块该有目标预设");
+        t = preset_tree(p, &survivors);
+
+        assert_eq!(preset_of(&t), Some(Preset::ThreeColumns));
+        assert_eq!(
+            leaves(&t),
+            vec![PaneId(1), PaneId(2), PaneId(3)],
+            "存活 pane 的先后顺序不该被重排打乱"
+        );
     }
 
     /// F232:用户拖了分隔条 → 比例不再是预设值 → 高亮熄灭。这是**有意**的:
