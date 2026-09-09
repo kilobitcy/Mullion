@@ -325,6 +325,19 @@ impl Vault {
         self.sessions = loaded.sessions;
         self.tunnels = loaded.tunnels;
         self.credentials = loaded.credentials;
+        // F244:**这一行原来漏了**。F189 写这段时项目表还不存在(F221 才加),
+        // 加的时候只补了 `sessions_toml()` 的序列化那一侧、没补这里 —— 后果比
+        // 「看不见」严重得多:重读把盘上的会话/分组换成了新的,`projects` 却
+        // 停在旧快照上,紧接着的 `save()` 是整份覆盖 —— **别的实例新建的项目
+        // 当场从盘上消失**,而且全程零报错。这正是本切片要修的那个现象最恶劣
+        // 的一种形态。
+        //
+        // 教训与 F189 那条完全同形:「重读了哪几张表」是一张**列举式**清单,
+        // 新加一张表时没人提醒你来这里补一笔。下面的
+        // `every_table_on_disk_is_reloaded_not_just_some_of_them` 把它改成机械
+        // 判据 —— 判的是「重读之后内存里那份序列化出来 == 盘上那份」,新加表
+        // 自动算进来。
+        self.projects = loaded.projects;
         match self.read_secrets() {
             Ok(Some(secrets)) => self.secrets = secrets,
             // 文件还不存在 = 新库,内存里那份(空的)就是对的。
@@ -366,6 +379,23 @@ impl Vault {
             .chain(self.credentials.iter().map(|c| cred_key(c.id)))
             .collect();
         self.secrets.retain(|k, _| live.contains(k));
+    }
+
+    /// F244:**读路径**的重读入口。
+    ///
+    /// F189 把重读挂在了 34 个 mutator 上,那条链只覆盖「我们要动手写之前」;
+    /// 画列表这条路一次都不重读 —— A 实例新建的项目,B 这边要等到自己下一次
+    /// **写**才看得见。多开是本项目的主场景,而「切过去建个活、切回来找不到」
+    /// 是零报错的。
+    ///
+    /// 行为与 mutator 那条链**完全同一份**(直接调它):判据、失败姿态、
+    /// 留痕全都一样。另写一份「只读版」的话,两条路会在某天分叉,而分叉的
+    /// 症状是「有时刷得出有时刷不出」。
+    ///
+    /// 手上有没落盘的改动时同样不读 —— 那一层判据在
+    /// [`Vault::sync_from_disk_if_untouched`] 里,调用方不用重复。
+    pub fn refresh_from_disk(&mut self) {
+        self.sync_from_disk_if_untouched();
     }
 
     /// F189:把重读期间攒下的说明取走(取完就清)。app 拿去写日志 ——
@@ -2679,6 +2709,86 @@ port = 7891
             "另一个实例收藏的目录被我们这份快照整份覆盖掉了:{paths:?}"
         );
         assert!(paths.contains(&"/srv"), "我们自己收的那条也丢了:{paths:?}");
+    }
+
+    /// F244:**每一张表**都要跟着重读,不是其中几张。
+    ///
+    /// 原来漏了 `projects`(F189 写那段时项目表还不存在)。后果不是「看不见」
+    /// 而是**丢数据**:重读把会话换成了盘上的新版、`projects` 停在旧快照,
+    /// 紧接着的 `save()` 整份覆盖 —— 别的实例新建的项目当场从盘上消失,
+    /// 零报错。
+    ///
+    /// 判据是**结构式**的:「重读之后内存里序列化出来的那份 == 盘上那份」。
+    /// 逐表点名的话,明天新加第六张表时这条照样绿(F189 那条列举式清单栽的
+    /// 就是这个跟头)。
+    ///
+    /// **B 必须把每一张表都动一遍**:少动一张,那张表两边都是空的、序列化
+    /// 结果一样,删掉它的重读这条断言照样绿 —— 实测过(去掉
+    /// `self.credentials = loaded.credentials;` 那一版恒绿)。
+    ///
+    /// 自证会变红:把 `sync_from_disk_if_untouched` 里任意一句
+    /// `self.<表> = loaded.<表>;` 删掉。
+    #[test]
+    fn every_table_on_disk_is_reloaded_not_just_some_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        // A 先写一笔并落盘,把两个基准对齐 —— 不对齐的话「手上有没落盘的
+        // 改动」恒为真,重读静默停摆,这条会因为别的原因变红。
+        a.add(draft(), "2026-09-09T00:00:00Z");
+        a.save().unwrap();
+        let _ = a.take_reload_notes();
+
+        // B 把每一张表都动一遍。
+        {
+            let mut b = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let sid = b.add(draft(), "2026-09-09T00:00:01Z");
+            b.add_group("B 的分组".into());
+            b.add_credential(cred_draft("B 的凭据", "u", Some("pw")));
+            b.add_tunnel(tunnel_draft(sid, 9001));
+            b.add_project("B 的项目".into(), "/srv/b".into(), "2026-09-09T00:00:02Z");
+            b.save().unwrap();
+        }
+
+        a.refresh_from_disk();
+        let mine = a.sessions_toml().expect("序列化");
+        let disk = fs::read_to_string(a.sessions_path()).expect("读盘");
+        assert_eq!(
+            mine, disk,
+            "重读之后内存里那份跟盘上对不上 —— 有表没跟着读回来,\
+             下一次 save() 会把它整份覆盖掉"
+        );
+    }
+
+    /// F244:读路径重读的**用户可见结果** —— A 实例新建的项目,B 这边刷一下
+    /// 就看得见,不用先去写点什么。
+    ///
+    /// 自证会变红:把 `refresh_from_disk` 的函数体清空。
+    #[test]
+    fn a_project_created_by_another_instance_shows_up_after_a_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        a.add(draft(), "2026-09-09T00:00:00Z");
+        a.save().unwrap();
+        let _ = a.take_reload_notes();
+        {
+            let mut b = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            b.add_project(
+                "另一个实例的活".into(),
+                "/srv/b".into(),
+                "2026-09-09T00:00:01Z",
+            );
+            b.save().unwrap();
+        }
+        assert!(
+            a.projects().is_empty(),
+            "还没刷就看见了 —— 这条测试的前提没成立"
+        );
+        a.refresh_from_disk();
+        let names: Vec<&str> = a.projects().iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names.contains(&"另一个实例的活"),
+            "刷了还是看不见:{names:?}"
+        );
     }
 
     /// 重读的**反面**:手上有还没落盘的改动时一律不读。

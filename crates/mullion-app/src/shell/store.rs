@@ -174,6 +174,18 @@ impl SessionStore {
         self.vault.save()
     }
 
+    /// F244:**读**路径的重读入口。见 `Vault::refresh_from_disk`。
+    ///
+    /// F189 只在**写**之前重读,所以另一个实例新建的项目/会话在这个实例里
+    /// 永远看不见 —— 除非它自己碰巧也写了一次。排水口与 `save` 同姿态:
+    /// 重读攒下的说明也得进日志,否则「我这边的改动没了」没有任何痕迹。
+    pub fn refresh_from_disk(&mut self) {
+        self.vault.refresh_from_disk();
+        for note in self.vault.take_reload_notes() {
+            log::warn!(target: "mullion", "会话库:{note}");
+        }
+    }
+
     /// F189:把会话编辑器里那张书签表整份写回去。见 `Vault::set_bookmarks`
     /// —— 只有用户**真的动过**那张表时才该调。
     pub fn set_bookmarks(

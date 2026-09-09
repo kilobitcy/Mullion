@@ -2596,6 +2596,49 @@ fn session_manager_dirty(ui: &crate::ui::UiState) -> bool {
     )
 }
 
+/// F244:这个弹窗的草稿,它的**基线**是不是躺在会话库(`sessions.toml`)里。
+///
+/// 只有这一类会被 `App::vault_draft_dirty` 拿去挡重读:重读换掉的是库里的
+/// 表,基线不在库里的草稿(编辑远端文件的正文、设置项、标签属性、文件面板
+/// 的就地输入框)重读之后一个字都不会变,没有理由陪着一起挡。
+///
+/// **写成穷尽 match 的自由函数**:新增一种弹窗时编译器强制表态,漏一项
+/// 编译不过 —— 「列举式门控在加档时必然漏」这个坑本项目已经踩过三次。
+/// 而且不收 `&self`,这条判据能单测(`app.rs` 的测试构造不出 `App`)。
+fn draft_baseline_is_in_vault(m: Modal) -> bool {
+    match m {
+        // 三套编辑缓冲的基线就是库里的会话/凭据/隧道记录。
+        Modal::SessionManager => true,
+        // 项目草稿比对的是 `store.projects()` 里的那一条。
+        Modal::ProjectManager => true,
+        // 「新建分组」输入框还没落库,但它一提交就往库里的分组表加一条;
+        // 重读期间正打着名字的话,提交时撞上的是另一份分组表。
+        Modal::GroupManager => true,
+        // 导入预览的每一行勾选,针对的都是「库里有没有这一条」。
+        Modal::Import => true,
+        // 以下基线都不在库里:编辑器比的是远端文件的正文,设置比的是
+        // `settings_backup`,标签属性比的是内存里的标签,文件面板的三个
+        // 就地输入框比的是远端目录项。其余变体压根没有草稿。
+        Modal::Editor
+        | Modal::Settings
+        | Modal::TabProps
+        | Modal::FilesDialog
+        | Modal::FilesPathEdit
+        | Modal::FilesRename
+        | Modal::FilesNewName
+        | Modal::About
+        | Modal::Unlock
+        | Modal::HostKey
+        | Modal::Paste
+        | Modal::ProjectOpenConfirm
+        | Modal::ProjectTakeoverConfirm
+        | Modal::ExitConfirm
+        | Modal::Rehost
+        | Modal::ProjectPick
+        | Modal::History => false,
+    }
+}
+
 /// F239:这个弹窗这一帧占着哪些 egui area。`None` = 没开着,或豁免。
 ///
 /// **返回一组而不是一个**:会话管理器会在自己上面另开「删除凭据」/
@@ -3906,7 +3949,11 @@ impl App {
     /// 一次误点就把改动清了。改回原样不算脏,这是快照比对白送的。
     ///
     /// 换节点/切项目弹窗恒**不脏**:它们没有任何要保存的数据(只有一个
-    /// 搜索词,丢了零成本),点外面永远能关掉。未列出的其余变体同理恒 `false`。
+    /// 搜索词,丢了零成本),点外面永远能关掉。
+    ///
+    /// F244:`match` 改**穷尽**,不留 `_ => false`。原先那条兜底的代价是
+    /// 「新增一种带输入框的弹窗时,它默认判不脏」—— 编译器一声不吭,而症状
+    /// 是用户打了半天字、点一下外面全没了。现在少写一个变体直接编译不过。
     fn dismiss_dirty(&self, m: Modal) -> bool {
         match m {
             Modal::SessionManager => session_manager_dirty(&self.ui),
@@ -3950,7 +3997,66 @@ impl App {
                 .files_dialog
                 .as_ref()
                 .is_some_and(crate::ui::files_dialog::is_dirty),
-            _ => false,
+            // F53:编辑器在 `DISMISS_EXEMPT` 里,关框这条路问不到它;穷尽
+            // match 逼它表态时给的是**真话**,不是 `false` —— 哪天它进了
+            // `DISMISS_ORDER`,照抄一个 `false` 就是「点外面把没传回远端的
+            // 正文丢了」。判据复用它自己的(标题上那颗 ● 用的就是这一个),
+            // 别在这里另写一份:两份迟早分叉。
+            Modal::Editor => self.edit.editor.as_ref().is_some_and(|e| e.dirty()),
+            // 以下各条恒**不脏**:要么整个框里一个可编辑的字都没有(只有
+            // 按钮),要么唯一的草稿是个搜索词 —— 丢了零成本,点外面永远
+            // 能关掉。
+            Modal::About
+            | Modal::Unlock
+            | Modal::HostKey
+            | Modal::Paste
+            | Modal::ProjectOpenConfirm
+            | Modal::ProjectTakeoverConfirm
+            | Modal::ExitConfirm
+            | Modal::Rehost
+            | Modal::ProjectPick
+            | Modal::History => false,
+            // 文件面板里的三个**就地**输入框不走「点外面关」这条路(它们
+            // 不在 `DISMISS_ORDER` 里,这个函数永远不会为它们被问到),
+            // 但穷尽 match 仍要求表态:它们各自的取消路径是按 Esc。
+            Modal::FilesPathEdit | Modal::FilesRename | Modal::FilesNewName => false,
+        }
+    }
+
+    /// F244:现在有没有「基线在会话库里」的草稿正开着且被改过。
+    ///
+    /// 这是重读磁盘的闸门:重读会把 `Vault` 里的表整份换掉,而草稿的
+    /// 「原记录」就在那些表里 —— 换完之后草稿比对的是另一份基线,用户看到
+    /// 的是「我没动过的字段自己变了」或者「保存键突然灰了」。
+    ///
+    /// **判据窄到只收基线在库里的那几个**(见 [`draft_baseline_is_in_vault`]):
+    /// 拿 `dismiss_dirty` 全表当闸门的话,「开着编辑器、边看 pane 边改远端
+    /// 文件」这个姿态会让重读**永久**停摆 —— 而那正是 F246 刚刚要支持的
+    /// 常见姿态,失效了还完全不报错。
+    fn vault_draft_dirty(&self) -> bool {
+        Modal::ALL
+            .iter()
+            .any(|m| draft_baseline_is_in_vault(*m) && self.dismiss_dirty(*m))
+    }
+
+    /// F244:窗口拿到焦点时把会话库重读一遍 —— 另一个实例新建的项目/会话
+    /// 就是在这一刻进来的。
+    ///
+    /// **挂在 `Focused(true)` 而不是各个列表的打开点**:列表有五六处入口
+    /// (项目管理器 / 切项目弹窗 / 会话管理器 / 换节点 / 左栏…),逐个挂就是
+    /// 又一张列举式的表,漏一处只表现为「这个列表看不见新项目」,没人会
+    /// 报错。而「切到另一个 exe 改完再切回来」是这件事**唯一**的发生方式,
+    /// 焦点回来就是它的天然同步点,一处覆盖全部列表。
+    ///
+    /// 有正在编辑的、基线在库里的草稿时**跳过**(见 [`Self::vault_draft_dirty`]):
+    /// 重读会把草稿比对的那份基线换掉。跳过的代价只是「这一次没同步上」,
+    /// 下次焦点回来还会再试。
+    fn refresh_vault_on_focus(&mut self) {
+        if self.vault_draft_dirty() {
+            return;
+        }
+        if let Some(store) = self.store.as_mut() {
+            store.refresh_from_disk();
         }
     }
 
@@ -10966,6 +11072,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // F125:失焦不闪,省掉后台窗口的周期唤醒。
                 self.window_focused = focused;
                 if focused {
+                    self.refresh_vault_on_focus();
                     self.recheck_visibility();
                     self.request_ui_redraw();
                 } else {
@@ -14582,17 +14689,17 @@ mod tests {
         attach_check_verdict, auto_dial_summary, automation_for_leaf, autoscroll_for_pane,
         blink_on_at, blink_wake_at, clear_leaf_attach_intent, clip_still_matches_what_was_pasted,
         credential_delete_error, decide_paste, dismiss_areas, dismiss_verdict, download_job,
-        drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
-        files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
-        font_px_for, has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
-        new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
-        pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane,
-        rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
-        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
-        take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
-        wind_down, AttachCheck, AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind,
-        RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT,
-        DISMISS_ORDER,
+        draft_baseline_is_in_vault, drive_attach_checks_of, effective_focus_of, expand_tilde,
+        files_owner_generation_of, files_path_editing_of, files_start_dir, finish_password_change,
+        follow_for_clip_mode, font_px_for, has_real_action, ime_cursor_area,
+        ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
+        next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
+        paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback,
+        session_manager_dirty, should_check_attach, snapshot_tabs_of, sync_plan_of,
+        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
+        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -17264,6 +17371,79 @@ mod tests {
     fn opt_buf_dirty_treats_a_mismatched_baseline_as_dirty() {
         assert!(opt_buf_dirty(Some(&1_i32), None, |_, _| false));
         assert!(opt_buf_dirty(None, Some(&1_i32), |_, _| false));
+    }
+
+    /// F244:重读闸门只收「基线在会话库里」的草稿。
+    ///
+    /// **`Modal::Editor` 必须是 `false`** —— 它是这条判据的整个理由所在:
+    /// 编辑器的基线是远端文件的正文,重读会话库一个字都动不到它。收进闸门
+    /// 的话,「开着编辑器、边看 pane 边改文件」这个姿态(正是 F246 刚刚
+    /// 要支持的那个)会让 F244 **永久**停摆,而且完全不报错 —— 用户只会
+    /// 觉得「跨实例同步时灵时不灵」。
+    ///
+    /// 完备性由编译器管(穷尽 match),这里只钉住几条会被改错的具体判断。
+    ///
+    /// 自证会变红:把 `draft_baseline_is_in_vault` 里的 `Modal::Editor`
+    /// 从 `false` 那一组挪进 `true` 那一组。
+    #[test]
+    fn the_reload_gate_only_counts_drafts_whose_baseline_lives_in_the_vault() {
+        assert!(!draft_baseline_is_in_vault(Modal::Editor));
+        assert!(!draft_baseline_is_in_vault(Modal::Settings));
+        assert!(!draft_baseline_is_in_vault(Modal::TabProps));
+        assert!(!draft_baseline_is_in_vault(Modal::FilesRename));
+        assert!(draft_baseline_is_in_vault(Modal::SessionManager));
+        assert!(draft_baseline_is_in_vault(Modal::ProjectManager));
+        assert!(draft_baseline_is_in_vault(Modal::GroupManager));
+        assert!(draft_baseline_is_in_vault(Modal::Import));
+    }
+
+    /// F244:重读挂在**窗口重新拿到焦点**那一刻 —— 这是「切到另一个 exe
+    /// 改完再切回来」唯一的天然同步点,一处覆盖全部列表。接线断了的症状
+    /// 就是用户实报的那条:另一个实例新建的项目在这边永远看不见,零报错。
+    ///
+    /// 这是纯接线,`Vault` 那两条行为测试(`a_project_created_by_another_
+    /// instance_shows_up_after_a_refresh` 等)够不着 —— 它们证明的是
+    /// 「调了就能看见」,证明不了「有人调」。
+    ///
+    /// 先剥注释再断言:本文件的说明文字里就带着这几个名字。
+    ///
+    /// 自证会变红:把 `Focused` 那一臂里的 `self.refresh_vault_on_focus();`
+    /// 删掉。
+    #[test]
+    fn regaining_focus_is_what_pulls_in_the_other_instances_changes() {
+        let src = without_comments(prod_src());
+        let after = src
+            .split("WindowEvent::Focused(focused)")
+            .nth(1)
+            .expect("找不到 Focused 分支 —— 这条测试的锚点失效了");
+        let arm = &after[..after
+            .find("WindowEvent::Occluded")
+            .expect("Focused 分支的下界找不到了")];
+        assert!(
+            arm.contains("self.refresh_vault_on_focus()"),
+            "窗口重新拿到焦点时没有重读会话库(F244)"
+        );
+    }
+
+    /// F244:重读必须先问闸门。少了这一句的话,用户正在会话管理器里改的
+    /// 那份草稿,基线会在他打字的中途被换掉 —— 表现成「我没动过的字段
+    /// 自己变了」,归因难到几乎不可能。
+    ///
+    /// 先剥注释再断言。
+    ///
+    /// 自证会变红:把 `refresh_vault_on_focus` 里的 `vault_draft_dirty`
+    /// 那个 early-return 删掉。
+    #[test]
+    fn the_reload_stands_down_while_a_vault_backed_draft_is_open() {
+        let body = without_comments(body_of(prod_src(), "fn refresh_vault_on_focus("));
+        let at = body
+            .find("vault_draft_dirty")
+            .expect("重读没问闸门(F244)——草稿的基线会被中途换掉");
+        assert!(body[at..].contains("return"), "问了闸门却没退出(F244)");
+        assert!(
+            at < body.find("refresh_from_disk").expect("重读根本没调"),
+            "闸门排在重读**后面**等于没有(F244)"
+        );
     }
 
     /// F239:`dismiss(Modal::Settings)` 必须走 `SettingsOut::Cancel`,不能
