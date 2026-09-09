@@ -597,6 +597,24 @@ impl Emulator {
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string().filter(|s| !s.is_empty())
     }
+
+    /// 当前选区是不是**只占一行**。没有选区时返回 `false`。
+    ///
+    /// F242:这是 [`Self::selection_text`] 的**前置闸门**,不是一个优化。
+    /// 「多行选区一概不当路径」本来就是 `files::reveal::parse` 的第一道门,
+    /// 但那道门开在 `selection_to_string()` **之后** —— 划中几百行回溯输出时,
+    /// 每帧先把几百 KB 拼成 `String`,再免费判死。状态栏要每帧问一次解析结果
+    /// (F242),这笔钱就会在拖拽期间(重绘最密集的时候)一直付。
+    ///
+    /// 这里只读 `Selection::to_range` 的起止行,不碰任何单元格内容,成本与
+    /// 选区大小无关。
+    pub fn selection_is_single_line(&self) -> bool {
+        self.term
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&self.term))
+            .is_some_and(|r| r.start.line == r.end.line)
+    }
 }
 
 /// 我们的 `CellSide` → alacritty 的 `Side`(= `Direction`)。
@@ -1054,6 +1072,41 @@ mod tests {
         // 返回空串会把用户剪贴板里原有的内容清掉。
         let emu = Emulator::new(20, 3);
         assert_eq!(emu.selection_text(), None);
+    }
+
+    /// F242:单行/跨行的判据必须和 `selection_text` 拼出来的东西一致 ——
+    /// 它是那个函数的前置闸门,判反了就是「多行选区照样被当成路径解析」
+    /// (闸门形同虚设)或「单行选区永远解析不出来」(功能静默失效)。
+    ///
+    /// 自证会变红:把 `selection_is_single_line` 里的 `==` 改成 `!=`,
+    /// 三条断言里的前两条同时红。
+    #[test]
+    fn a_selection_is_single_line_exactly_when_its_text_has_no_newline() {
+        let mut emu = Emulator::new(20, 3);
+        emu.feed(b"alpha\r\nbravo");
+
+        emu.selection_start(0, 0, SelectionKind::Simple, CellSide::Left);
+        emu.selection_update(4, 0, CellSide::Right);
+        assert!(emu.selection_is_single_line());
+        assert_eq!(emu.selection_text().as_deref(), Some("alpha"));
+
+        // 拖到下一行 —— 文本里出现换行,判据必须跟着翻。
+        emu.selection_update(4, 1, CellSide::Right);
+        assert!(!emu.selection_is_single_line());
+        assert!(emu
+            .selection_text()
+            .expect("跨行选区有文本")
+            .contains('\n'));
+    }
+
+    /// 没有选区时返回 `false`。调用方据此**跳过** `selection_text()`,
+    /// 而那一步在无选区时本来也只会给 `None` —— 语义一致,少一次调用。
+    ///
+    /// 自证会变红:把 `is_some_and` 换成 `is_none_or`。
+    #[test]
+    fn no_selection_is_not_a_single_line_selection() {
+        let emu = Emulator::new(20, 3);
+        assert!(!emu.selection_is_single_line());
     }
 
     #[test]
