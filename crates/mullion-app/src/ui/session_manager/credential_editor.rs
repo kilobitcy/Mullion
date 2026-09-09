@@ -51,6 +51,15 @@ impl CredentialEditorBuffer {
     }
 }
 
+/// F239:凭据表单是否相对基线快照有改动。
+///
+/// 整体比对而不是打脏标记 —— 同 `buffer::is_dirty` 那条 F37 教训:手工
+/// 标记必然漏一个赋值点,漏了的症状是「改了却判不脏」,一次误点(比如
+/// 「点外面即关」)就把改到一半的凭据静默清掉。
+pub(crate) fn is_dirty(buf: &CredentialEditorBuffer, baseline: &CredentialEditorBuffer) -> bool {
+    buf != baseline
+}
+
 /// 一次「保存凭据」的意图。`editing_id = None` 即新建。
 ///
 /// 三个密文走 `SecretField` 三态而不是 `Option<String>`:二态分不出

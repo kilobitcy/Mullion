@@ -2551,6 +2551,49 @@ const DISMISS_EXEMPT: &[Modal] = &[
     Modal::Paste,
 ];
 
+/// 单个跨帧编辑缓冲相对基线是否「脏」。
+///
+/// `(Some, None)` / `(None, Some)` 理论上到不了 —— 每套缓冲都是与基线
+/// 同时设、同时清(见 `EditorBuffer`/`CredentialEditorBuffer`/
+/// `TunnelEditorBuffer` 各自的字段注释)。到得了的话按**脏**处理:
+/// 少关一次弹窗,比「判定错误、静默把半份草稿清掉」便宜得多。
+fn opt_buf_dirty<T>(
+    cur: Option<&T>,
+    baseline: Option<&T>,
+    is_dirty: impl FnOnce(&T, &T) -> bool,
+) -> bool {
+    match (cur, baseline) {
+        (Some(c), Some(b)) => is_dirty(c, b),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+/// F239:会话管理器这一帧有没有未保存的改动。
+///
+/// 会话管理器有**三套独立的跨帧编辑缓冲**(会话 / 凭据 / 隧道各一套,
+/// 见 `ui::UiState` 对应字段),三路取或——只判会话那一套的话,用户在
+/// 「凭据」标签页改了半份没保存、切回「会话」标签页(此时会话缓冲是干净
+/// 的)再点弹窗外面,会被误判成「不脏」而静默丢掉凭据草稿。
+///
+/// **写成只收 `&UiState` 的自由函数**:`app.rs` 的测试从来构造不出一个
+/// `App`(要窗口/GPU),挂成 `&self` 方法的话这条判据根本没法单测。
+fn session_manager_dirty(ui: &crate::ui::UiState) -> bool {
+    opt_buf_dirty(
+        ui.editor.as_ref(),
+        ui.editor_baseline.as_ref(),
+        crate::ui::session_manager::is_dirty,
+    ) || opt_buf_dirty(
+        ui.credential_editor.as_ref(),
+        ui.credential_editor_baseline.as_ref(),
+        crate::ui::session_manager::credential_editor::is_dirty,
+    ) || opt_buf_dirty(
+        ui.tunnel_editor.as_ref(),
+        ui.tunnel_editor_baseline.as_ref(),
+        crate::ui::session_manager::tunnel_editor::is_dirty,
+    )
+}
+
 /// F239:这个弹窗这一帧占着哪些 egui area。`None` = 没开着,或豁免。
 ///
 /// **返回一组而不是一个**:会话管理器会在自己上面另开「删除凭据」/
@@ -3844,12 +3887,7 @@ impl App {
     #[allow(dead_code)]
     fn dismiss_dirty(&self, m: Modal) -> bool {
         match m {
-            Modal::SessionManager => {
-                match (self.ui.editor.as_ref(), self.ui.editor_baseline.as_ref()) {
-                    (Some(e), Some(b)) => crate::ui::session_manager::is_dirty(e, b),
-                    _ => false,
-                }
-            }
+            Modal::SessionManager => session_manager_dirty(&self.ui),
             // 设置是实时预览的:草稿一旦生效就写进了 `self.settings`,
             // 「打开那一刻的备份」才是原记录。
             Modal::Settings => self
@@ -14254,9 +14292,10 @@ mod tests {
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
         has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
-        new_pane_emulator, next_auto_dial, next_panel_selection_index, pane_reports_of,
-        pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane,
-        resolved_scrollback, should_check_attach, snapshot_tabs_of, sync_plan_of,
+        new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
+        pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane,
+        rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
+        snapshot_tabs_of, sync_plan_of,
         sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
         tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
         AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
@@ -16721,6 +16760,72 @@ mod tests {
             assert!(DISMISS_EXEMPT.contains(&m), "{m:?} 应该豁免");
         }
         assert_eq!(DISMISS_EXEMPT.len(), want.len());
+    }
+
+    /// F239:会话管理器有三套独立的跨帧编辑缓冲(会话/凭据/隧道),
+    /// `session_manager_dirty` 必须三路取或 —— 只判会话那一套的话,用户在
+    /// 「凭据」标签页改了半份没保存、切回「会话」标签页(此时会话缓冲干净)
+    /// 再点弹窗外面,会被误判成「不脏」而静默丢掉凭据草稿。这是复核挖出的
+    /// 真实丢数据场景,不是假设。
+    ///
+    /// 自证会变红:把 `session_manager_dirty` 里 `||` 后面两个
+    /// `opt_buf_dirty(...)` 调用删掉,只留会话那一路。
+    #[test]
+    fn session_manager_dirty_catches_an_unsaved_credential_even_when_the_session_buffer_is_clean()
+    {
+        let mut ui = crate::ui::UiState::default();
+        // 会话缓冲:没打开,恒不脏。
+        assert!(ui.editor.is_none());
+        // 凭据缓冲:相对基线有改动。
+        let baseline = crate::ui::session_manager::CredentialEditorBuffer::default();
+        let mut edited = baseline.clone();
+        edited.name = "改了一半的凭据".to_string();
+        ui.credential_editor = Some(edited);
+        ui.credential_editor_baseline = Some(baseline);
+
+        assert!(
+            session_manager_dirty(&ui),
+            "凭据表单有未保存改动,session_manager_dirty 必须报脏"
+        );
+    }
+
+    /// F239:同上,隧道那一路。
+    ///
+    /// 自证会变红:同上一条。
+    #[test]
+    fn session_manager_dirty_catches_an_unsaved_tunnel_even_when_the_session_buffer_is_clean() {
+        let mut ui = crate::ui::UiState::default();
+        assert!(ui.editor.is_none());
+        let baseline = crate::ui::session_manager::TunnelEditorBuffer::default();
+        let mut edited = baseline.clone();
+        edited.listen_port = "2222".to_string();
+        ui.tunnel_editor = Some(edited);
+        ui.tunnel_editor_baseline = Some(baseline);
+
+        assert!(
+            session_manager_dirty(&ui),
+            "隧道表单有未保存改动,session_manager_dirty 必须报脏"
+        );
+    }
+
+    /// F239:三套缓冲都干净(或都没打开)时,`session_manager_dirty` 必须
+    /// 是 `false` —— 不然「点外面关」会永久失效,退化成 `Modal::Editor`
+    /// 那种谁都关不掉的豁免状态。
+    #[test]
+    fn session_manager_dirty_is_false_when_all_three_buffers_are_clean() {
+        let ui = crate::ui::UiState::default();
+        assert!(!session_manager_dirty(&ui));
+    }
+
+    /// F239:`(Some, None)` / `(None, Some)` 这种理论上到不了的组合按「脏」
+    /// 处理 —— 少关一次弹窗,比静默丢数据便宜(`opt_buf_dirty` 的文档
+    /// 注释里写的那条理由)。
+    ///
+    /// 自证会变红:把 `opt_buf_dirty` 里 `_ => true` 改成 `_ => false`。
+    #[test]
+    fn opt_buf_dirty_treats_a_mismatched_baseline_as_dirty() {
+        assert!(opt_buf_dirty(Some(&1_i32), None, |_, _| false));
+        assert!(opt_buf_dirty(None, Some(&1_i32), |_, _| false));
     }
 
     /// **接线守护 / F148**:恢复列表弹窗必须算模态(T8)。

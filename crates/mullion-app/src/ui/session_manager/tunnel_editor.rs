@@ -107,6 +107,15 @@ impl TunnelEditorBuffer {
     }
 }
 
+/// F239:隧道表单是否相对基线快照有改动。
+///
+/// 整体比对而不是打脏标记 —— 同 `buffer::is_dirty` 那条 F37 教训:手工
+/// 标记必然漏一个赋值点,漏了的症状是「改了却判不脏」,一次误点(比如
+/// 「点外面即关」)就把改到一半的隧道配置静默清掉。
+pub(crate) fn is_dirty(buf: &TunnelEditorBuffer, baseline: &TunnelEditorBuffer) -> bool {
+    buf != baseline
+}
+
 /// 保存意图。`editing_id = None` 即新建。
 pub struct TunnelSaveIntent {
     pub editing_id: Option<TunnelId>,
