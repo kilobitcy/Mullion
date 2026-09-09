@@ -67,8 +67,12 @@ fn scan(ts: TokenStream, file: &Path, out: &mut Vec<Offence>) {
                     Some(TokenTree::Punct(p2)),
                     Some(TokenTree::Ident(new_id)),
                     Some(TokenTree::Group(g)),
-                ) = (toks.get(i + 1), toks.get(i + 2), toks.get(i + 3), toks.get(i + 4))
-                {
+                ) = (
+                    toks.get(i + 1),
+                    toks.get(i + 2),
+                    toks.get(i + 3),
+                    toks.get(i + 4),
+                ) {
                     if p1.as_char() == ':'
                         && p2.as_char() == ':'
                         && *new_id == "new"

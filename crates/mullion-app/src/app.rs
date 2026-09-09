@@ -2620,7 +2620,9 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
         | Modal::FilesRename
         | Modal::FilesNewName
         | Modal::Paste => None,
-        Modal::About => ui.about_open.then(|| vec![w(crate::ui::ABOUT_WINDOW_TITLE)]),
+        Modal::About => ui
+            .about_open
+            .then(|| vec![w(crate::ui::ABOUT_WINDOW_TITLE)]),
         Modal::Settings => ui
             .settings_open
             .then(|| vec![w(crate::ui::settings::WINDOW_TITLE)]),
@@ -14295,11 +14297,11 @@ mod tests {
         new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
         pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane,
         rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
-        snapshot_tabs_of, sync_plan_of,
-        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
-        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
-        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
+        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
+        take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
+        wind_down, AttachCheck, AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind,
+        RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT,
+        DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -16771,8 +16773,7 @@ mod tests {
     /// 自证会变红:把 `session_manager_dirty` 里 `||` 后面两个
     /// `opt_buf_dirty(...)` 调用删掉,只留会话那一路。
     #[test]
-    fn session_manager_dirty_catches_an_unsaved_credential_even_when_the_session_buffer_is_clean()
-    {
+    fn session_manager_dirty_catches_an_unsaved_credential_even_when_the_session_buffer_is_clean() {
         let mut ui = crate::ui::UiState::default();
         // 会话缓冲:没打开,恒不脏。
         assert!(ui.editor.is_none());
