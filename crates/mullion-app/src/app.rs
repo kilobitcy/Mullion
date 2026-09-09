@@ -16927,6 +16927,90 @@ mod tests {
         }
     }
 
+    /// F239:`DISMISS_ORDER` 必须是 `build_ui` 绘制顺序的**严格逆序**。
+    ///
+    /// 这张表决定「一次点击关谁」。egui 里后画的盖在上面,所以最上层那个
+    /// 就是 `build_ui` 里最后画的那个。排错了的症状很别扭:点一下把**底下**
+    /// 那个关掉了,上面那个还杵着 —— 而且完全静默(两张表各自都自洽,
+    /// 只是对不上)。
+    ///
+    /// 复核这个切片时实测过:把 `build_ui` 里两个弹窗的绘制顺序对调,
+    /// 全部测试一条不红。原先守着这条关系的只有 `DISMISS_ORDER` 上面
+    /// 那段注释,那不是守护。
+    ///
+    /// **判据扎在 `ui/mod.rs` 的源码上**:`build_ui` 要真 `egui::Context`
+    /// + 一整份 `FrameData` 才跑得起来,顺序这件事在运行期观察不到。
+    /// 每个弹窗认一个在 `build_ui` 里唯一的绘制调用点字面串,断言它们出现的
+    /// 先后与 `DISMISS_ORDER` 逆序一致。
+    ///
+    /// 用 `match` 而不是查表:新加一种弹窗时编译不过,作者必须表态它画在
+    /// 哪里 —— 与 `dismiss_areas` 同一道闸门。
+    ///
+    /// **剥掉 `//` 行注释**:本仓库记过的坑「源码切片守护不剥注释」——
+    /// `build_ui` 里的注释提到过好几个模块名,不剥的话注释自己就能把
+    /// `find` 喂饱,顺序断言会拿注释的位置去比。
+    ///
+    /// 验证边界:只挡得住「绘制顺序变了 / 某个弹窗不画了」,挡不住有人换一
+    /// 种不含这些字面串的写法(那时锚点 `expect` 会当场炸,不会静默)。
+    ///
+    /// 自证会变红:把 `build_ui` 里 `group_manager::show(..)` 那段挪到
+    /// `session_manager::show(..)` 之前。
+    #[test]
+    fn the_dismiss_order_is_the_exact_reverse_of_the_paint_order() {
+        /// 这个弹窗在 `build_ui` 里的绘制调用点。
+        fn marker(m: Modal) -> &'static str {
+            match m {
+                Modal::About => "if ui_state.about_open {",
+                Modal::Settings => "settings::show(",
+                Modal::History => "history::show(",
+                Modal::SessionManager => "session_manager::show(",
+                Modal::GroupManager => "group_manager::show(",
+                Modal::ProjectManager => "project_manager::show(",
+                Modal::ProjectOpenConfirm => "project_manager::show_open_confirm(",
+                Modal::ProjectTakeoverConfirm => "project_manager::show_takeover_confirm(",
+                Modal::Import => "import_dialog::show(",
+                Modal::FilesDialog => "files_dialog::show(",
+                Modal::TabProps => "tab_props::show(",
+                Modal::Rehost => "rehost::show(",
+                Modal::ProjectPick => "project_pick::show(",
+                Modal::ExitConfirm => "if ui_state.exit_pending {",
+                // 豁免的七类不参与「点外面即关」,也就不需要排序。
+                Modal::Unlock
+                | Modal::HostKey
+                | Modal::Editor
+                | Modal::FilesPathEdit
+                | Modal::FilesRename
+                | Modal::FilesNewName
+                | Modal::Paste => "",
+            }
+        }
+
+        let body: String = body_of(include_str!("ui/mod.rs"), "pub fn build_ui(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // `DISMISS_ORDER` 逆序 = 绘制顺序,位置必须严格递增。
+        let mut prev: Option<(Modal, usize)> = None;
+        for m in DISMISS_ORDER.iter().rev() {
+            let mk = marker(*m);
+            assert!(!mk.is_empty(), "{m:?} 在 DISMISS_ORDER 里却被当成豁免项");
+            let at = body.find(mk).unwrap_or_else(|| {
+                panic!("build_ui 里找不到 {m:?} 的绘制点「{mk}」—— 这条测试的锚点失效了")
+            });
+            if let Some((before, at_before)) = prev {
+                assert!(
+                    at_before < at,
+                    "绘制顺序与 DISMISS_ORDER 对不上:build_ui 里 {m:?} 画在 {before:?} \
+                     之前,而 DISMISS_ORDER 说 {m:?} 在下面。点一下会关掉底下那个,\
+                     上面那个还杵着"
+                );
+            }
+            prev = Some((*m, at));
+        }
+    }
+
     /// F239:豁免的是哪七类,写死在这里。
     ///
     /// **不是**「实现是什么就断言什么」——这七类各有各的理由,任何一个被
