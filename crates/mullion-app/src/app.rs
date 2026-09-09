@@ -4122,12 +4122,33 @@ impl App {
     /// 判定全在 `files::reveal::plan` 那张表里 —— 这里只负责取数据、按结果
     /// 派发。选区里认不出路径时 `plan` 给的正好是原来的开关行为,叠加不改
     /// 老路径的语义。
+    ///
+    /// F243:`plan` 之前先过 `reveal::step` 那两道前置门(SFTP 标签 / 焦点
+    /// 已经在面板上)。
     fn apply_files_hotkey(&mut self) {
-        let target = self.reveal_target();
-        let arrived = target.as_ref().map(|t| t.arrived);
-        match crate::files::reveal::plan(self.ui.files_sidebar_open, arrived) {
+        use crate::shell::input_route::Focus;
+        let mut target = None;
+        let plan = crate::files::reveal::step(
+            active_is_files_tab_of(&self.tabs),
+            self.effective_focus() == Focus::FilesPanel,
+            self.ui.files_sidebar_open,
+            || {
+                target = self.reveal_target();
+                target.as_ref().map(|t| t.arrived)
+            },
+        );
+        let Some(plan) = plan else { return };
+        match plan {
             crate::files::reveal::Plan::Open => self.ui.files_sidebar_open = true,
-            crate::files::reveal::Plan::Close => self.ui.files_sidebar_open = false,
+            crate::files::reveal::Plan::Close => {
+                self.ui.files_sidebar_open = false;
+                // F243:关栏要顺手撤掉在途的那次跳转。不撤的话它会在半秒后
+                // 回来,**把已经关起来的面板的当前目录改掉** —— 下次打开侧栏
+                // 用户看到的是一个自己没去过的目录,而且中间还白跑一次往返。
+                if let Some(g) = files_owner_generation_of(&self.tabs, true) {
+                    self.cancel_pending_reveal(g);
+                }
+            }
             crate::files::reveal::Plan::OpenAndReveal => {
                 self.ui.files_sidebar_open = true;
                 if let Some(t) = target {
@@ -18211,6 +18232,71 @@ mod tests {
                 .starts_with("selection_path: selection_path"),
             "状态栏那一格必须现算(F242),当前是:{}",
             next.trim()
+        );
+    }
+
+    /// `apply_files_hotkey` 的函数体(不含它上面的文档注释)。
+    ///
+    /// 下面两条 F243 守护共用。切到**下一个 `/// ` 开头的行**为止 ——
+    /// 不切的话「Close 那条臂里有没有撤销」会被后面几百行里别处的
+    /// `cancel_pending_reveal` 蹭绿。
+    fn files_hotkey_body() -> &'static str {
+        let src = prod_src();
+        let at = src
+            .find("fn apply_files_hotkey(&mut self) {")
+            .expect("apply_files_hotkey 不见了,这两条测试的锚点失效了");
+        let rest = &src[at..];
+        let end = rest.find("\n    /// ").expect("函数体后面没有下一项?");
+        &rest[..end]
+    }
+
+    /// F243 **接线守护**:两道前置门必须真的接在 `Ctrl+Shift+B` 上,而且喂
+    /// 进去的是这两个判据。
+    ///
+    /// `reveal::step` 那三条纯函数测试保证不了这一步:参数填反(比如把
+    /// `panel_focused` 写成 `self.focus == Focus::FilesPanel`,漏掉
+    /// `effective_focus_of` 里「侧栏关着时焦点一律算终端」那半条)编译照过、
+    /// 全套测试照绿。
+    ///
+    /// 自证会变红:把第二个实参改成 `false`。
+    #[test]
+    fn the_files_hotkey_asks_the_two_gates_before_it_looks_at_the_selection() {
+        let body = files_hotkey_body();
+        assert!(
+            body.contains("crate::files::reveal::step("),
+            "F243 的前置门没接上:{body}"
+        );
+        assert!(
+            body.contains("active_is_files_tab_of(&self.tabs),"),
+            "第一道门要问的是「活动标签是不是 SFTP 节点标签」:{body}"
+        );
+        assert!(
+            body.contains("self.effective_focus() == Focus::FilesPanel,"),
+            "第二道门要问 effective_focus(不是裸的 self.focus):{body}"
+        );
+    }
+
+    /// F243 **接线守护**:关栏要顺手撤掉在途的那次跳转。
+    ///
+    /// 不撤的话,`stat` 半秒后回来会把**已经关起来的**面板的当前目录改掉 ——
+    /// 用户下次打开侧栏,看到的是一个自己没去过的目录,中间还白跑一次往返。
+    /// 零报错、本机低延迟下几乎复现不出来(往返比按键快)。
+    ///
+    /// 自证会变红:把 `Plan::Close` 那条臂里的 `if let Some(g) = ...` 整块删掉。
+    #[test]
+    fn closing_the_sidebar_also_calls_off_the_reveal_that_is_still_in_flight() {
+        let body = files_hotkey_body();
+        let at = body
+            .find("Plan::Close => {")
+            .expect("Close 那条臂不见了,这条测试的锚点失效了");
+        let arm = &body[at..];
+        let end = arm
+            .find("Plan::OpenAndReveal")
+            .expect("Close 之后没有下一条臂?");
+        assert!(
+            arm[..end].contains("cancel_pending_reveal"),
+            "关栏没撤掉在途跳转(F243):{}",
+            &arm[..end]
         );
     }
 

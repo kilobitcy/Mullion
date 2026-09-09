@@ -217,6 +217,37 @@ pub fn plan(open: bool, target: Option<bool>) -> Plan {
     }
 }
 
+/// F243:两道前置门 + [`plan`]。`None` = 这一下什么都不做(键仍然**吃掉**,
+/// 不落到终端,但一个状态都不改)。
+///
+/// - `files_tab`(活动标签是 SFTP 节点标签):`files_sidebar_open` 是**终端
+///   标签**那条侧栏的全局开关;SFTP 标签整页就是文件面板,没有侧栏可开。
+///   照旧翻这个 flag 的话,用户按下去画面纹丝不动,而下次切回终端标签时侧栏
+///   是反的 —— 一次完全看不见的副作用。
+/// - `panel_focused`(焦点已经在文件面板上):此时用户按这个键的意图是
+///   「把面板收起来」。终端里可能还留着上一次的选区,照着它跳等于**面板
+///   自己跳走了**,而用户根本没在看终端。
+///
+/// 两条门都会被 `effective_focus_of` 判成 `Focus::FilesPanel`、在那一层分
+/// 不开,所以 `files_tab` 单独作为第一道门传进来。
+///
+/// `arrived` **是惰性的**:只在两道门都放行时才求值。它要走一整遍
+/// `reveal_target`(拼选区串、解析路径、比对面板当前目录),而门关着的时候
+/// 那个结果本来就该被忽略 —— 求了再扔不只是浪费,「有没有真的忽略选区」
+/// 也就再没有任何测得着的痕迹了。
+pub fn step(
+    files_tab: bool,
+    panel_focused: bool,
+    open: bool,
+    arrived: impl FnOnce() -> Option<bool>,
+) -> Option<Plan> {
+    if files_tab {
+        return None;
+    }
+    let target = if panel_focused { None } else { arrived() };
+    Some(plan(open, target))
+}
+
 /// 异机跳转:重开好的这条 sftp channel,是不是当初发起时那台机器?
 ///
 /// **不校验就是一次看不出错的误连**:等待重开的那半秒里用户可能又把焦点
@@ -483,6 +514,59 @@ mod tests {
         assert!(!consume(Some(1), Some(2)));
         assert!(!consume(Some(0), None));
         assert!(consume(None, None));
+    }
+
+    /// F243:SFTP 节点标签上按这个键**一个状态都不改**。
+    ///
+    /// `files_sidebar_open` 是终端标签那条侧栏的全局开关,在 SFTP 标签上翻
+    /// 它画面纹丝不动 —— 副作用要等用户切回终端标签才看得见,而那时他早就
+    /// 不记得自己按过这个键了。
+    ///
+    /// 顺带钉住**顺序**:`files_tab` 必须是第一道门。两道门都命中时若先判
+    /// `panel_focused`,结果会变成「只开关」,那正是上面那个副作用。
+    ///
+    /// 自证会变红:把 `step` 里 `if files_tab { return None; }` 那三行删掉。
+    #[test]
+    fn on_a_sftp_tab_the_key_changes_nothing_at_all() {
+        for open in [false, true] {
+            for focused in [false, true] {
+                assert_eq!(
+                    step(true, focused, open, || panic!("SFTP 标签上不该去看选区")),
+                    None,
+                    "open={open} focused={focused}"
+                );
+            }
+        }
+    }
+
+    /// F243:焦点已经在文件面板上时,这个键退化成**纯开关** —— 而且压根
+    /// 不去看终端里那片选区。
+    ///
+    /// 用户此时的意图是「把面板收起来」;终端里可能还留着上次划的路径,
+    /// 照着它跳等于面板自己跳走了,而他根本没在看终端。
+    ///
+    /// 闭包 panic 是这条判据**唯一测得着的痕迹**:先求值再扔掉的实现,结果
+    /// 完全一样(见 `step` 的文档注释)。
+    ///
+    /// 自证会变红:把 `step` 里的
+    /// `if panel_focused { None } else { arrived() }` 改成直接 `arrived()`。
+    #[test]
+    fn a_focused_panel_makes_the_key_a_plain_toggle_without_reading_the_selection() {
+        let peek = || panic!("焦点在面板上时不该去看终端的选区");
+        assert_eq!(step(false, true, false, peek), Some(Plan::Open));
+        assert_eq!(step(false, true, true, peek), Some(Plan::Close));
+    }
+
+    /// 反面:焦点在终端上时,选区照常算数(F218 的行为一点没变)。
+    #[test]
+    fn a_focused_terminal_still_gets_the_full_reveal_behaviour() {
+        assert_eq!(
+            step(false, false, false, || Some(false)),
+            Some(Plan::OpenAndReveal)
+        );
+        assert_eq!(step(false, false, true, || Some(false)), Some(Plan::Reveal));
+        assert_eq!(step(false, false, true, || Some(true)), Some(Plan::Close));
+        assert_eq!(step(false, false, false, || None), Some(Plan::Open));
     }
 
     fn sp(from: Option<&str>, to: Option<&str>, path: &str) -> StatusPath {
