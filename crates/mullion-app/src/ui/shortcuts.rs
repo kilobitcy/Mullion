@@ -126,6 +126,12 @@ pub const SHORTCUTS: &[Shortcut] = &[
         scope: "标注模式",
         what: "退出标注模式",
     },
+    // —— 项目(App::project_hotkey_event)——
+    Shortcut {
+        chord: "Ctrl+Shift+N",
+        scope: "项目",
+        what: "把当前分屏的目录和 tmux 会话收成一个新项目",
+    },
 ];
 
 #[cfg(test)]
@@ -169,7 +175,7 @@ mod tests {
     /// 自证会变红:删掉某个 scope 的全部行。
     #[test]
     fn every_module_that_has_shortcuts_is_represented() {
-        for want in ["标签", "终端", "文件", "会话管理器", "标注模式"] {
+        for want in ["标签", "终端", "文件", "会话管理器", "标注模式", "项目"] {
             assert!(
                 SHORTCUTS.iter().any(|s| s.scope == want),
                 "一览表里没有「{want}」这一档的任何快捷键"
