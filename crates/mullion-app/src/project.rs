@@ -73,6 +73,38 @@ pub fn node_for(p: &mullion_store::ProjectRecord) -> Option<mullion_store::Sessi
         .or_else(|| p.nodes.first().copied())
 }
 
+/// F238:这个项目该画哪张图标。
+///
+/// 项目自设的优先;没设就回落**首选节点**的已解析外观 —— 走
+/// [`node_for`],和 `plan_open` 真拨号、和列表副标题写的节点名是**同一个
+/// 函数**。各写一份的话,行上画着 A 的图标、副标题写着 B 的名字。
+///
+/// 回落而不是留空:项目列表和会话列表在同一个程序里挨着,一列空槽会被读成
+/// 「这个项目坏了」,而首选节点的图标本来就是用户为这台机器挑的那一张。
+pub fn icon_for<'a>(
+    p: &'a mullion_store::ProjectRecord,
+    appearance: &'a crate::ui::badge::AppearanceCache,
+) -> Option<&'a mullion_store::IconSpec> {
+    p.icon.as_ref().or_else(|| {
+        node_for(p)
+            .and_then(|id| appearance.get(id))
+            .and_then(|a| a.icon.as_ref())
+    })
+}
+
+/// F238:图标底色。**不做「项目色」** —— 同源回落首选节点的节点色,
+/// 与 pane 标题条/标签栏取色是同一份 `should_paint`,两处各算一遍的话
+/// 同一个项目在两个地方会是两种颜色。
+pub fn icon_bg(
+    p: &mullion_store::ProjectRecord,
+    appearance: &crate::ui::badge::AppearanceCache,
+    target: mullion_store::ColorTarget,
+) -> Option<egui::Color32> {
+    node_for(p)
+        .and_then(|id| appearance.get(id))
+        .and_then(|a| crate::ui::badge::should_paint(a, target))
+}
+
 /// F233:一个项目是否命中搜索词。空查询(trim 后为空)放行全部。
 ///
 /// 匹配**项目名 / 目录 / 每一条节点会话的名字与主机**,大小写不敏感。
@@ -763,5 +795,121 @@ mod tests {
     fn the_lowest_free_number_is_picked_not_the_highest_plus_one() {
         let ps = vec![pr("新项目", "/a", &[]), pr("新项目 3", "/b", &[])];
         assert_eq!(fresh_project_name(&ps), "新项目 2");
+    }
+
+    // ---- icon_for / icon_bg ----------------------------------------------
+
+    fn ico(v: &str) -> mullion_store::IconSpec {
+        mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: v.into(),
+            bg: None,
+        }
+    }
+
+    /// 带图标的会话。`AppearanceCache::rebuild` 只认 `SessionRecord.appearance`。
+    fn sess_with_icon(id: u64, icon_value: &str) -> mullion_store::SessionRecord {
+        let mut s = sess(id, "node", "10.0.0.1");
+        s.appearance.icon = Some(ico(icon_value));
+        s
+    }
+
+    /// 带节点色的会话,颜色作用到指定的 `ColorTarget` 集合。
+    fn sess_with_color(
+        id: u64,
+        hex: &str,
+        targets: &[mullion_store::ColorTarget],
+    ) -> mullion_store::SessionRecord {
+        let mut s = sess(id, "node", "10.0.0.1");
+        s.appearance.color = Some(mullion_store::ColorSpec {
+            hex: hex.into(),
+            apply_to: targets.to_vec(),
+        });
+        s
+    }
+
+    /// F238:项目自设了图标就用自己的。
+    #[test]
+    fn a_project_with_its_own_icon_uses_it() {
+        let mut cache = crate::ui::badge::AppearanceCache::default();
+        cache.rebuild(&[sess_with_icon(7, "node")], &[]);
+        let mut p = proj(&[7], Some(7));
+        p.icon = Some(ico("PROJECT"));
+        assert_eq!(
+            icon_for(&p, &cache).map(|i| i.value.as_str()),
+            Some("PROJECT"),
+            "项目自设的图标应该赢过节点的"
+        );
+    }
+
+    /// 没设就回落**首选节点**的已解析图标 —— 项目在列表里跟会话挨着,
+    /// 一个空槽会被读成「这个项目坏了」,而它本来就有一张现成的图可用。
+    ///
+    /// 自证会变红:把 `icon_for` 的 `.or_else(..)` 整段删掉。
+    #[test]
+    fn a_project_without_an_icon_falls_back_to_its_preferred_node() {
+        let mut cache = crate::ui::badge::AppearanceCache::default();
+        cache.rebuild(&[sess_with_icon(7, "NODE")], &[]);
+        let p = proj(&[7], Some(7));
+        assert_eq!(
+            icon_for(&p, &cache).map(|i| i.value.as_str()),
+            Some("NODE"),
+            "没设图标应回落首选节点的"
+        );
+    }
+
+    /// 一个节点都没勾的项目没有图标可回落,返回 `None` 而不是 panic。
+    #[test]
+    fn a_project_with_no_nodes_has_no_icon_to_fall_back_to() {
+        let cache = crate::ui::badge::AppearanceCache::default();
+        assert!(icon_for(&proj(&[], None), &cache).is_none());
+    }
+
+    /// F238:图标底色 —— 项目自己没有颜色概念(本批不加「项目色」),
+    /// 同源回落首选节点在指定 `ColorTarget` 上的节点色,判据与
+    /// `badge::should_paint` 完全一致(该落点没被 `apply_to` 勾中就是 `None`)。
+    #[test]
+    fn icon_bg_falls_back_to_the_preferred_nodes_color_for_the_target() {
+        let mut cache = crate::ui::badge::AppearanceCache::default();
+        cache.rebuild(
+            &[sess_with_color(
+                7,
+                "#e06767",
+                &[mullion_store::ColorTarget::ListItem],
+            )],
+            &[],
+        );
+        let p = proj(&[7], Some(7));
+        assert_eq!(
+            icon_bg(&p, &cache, mullion_store::ColorTarget::ListItem),
+            Some(egui::Color32::from_rgb(0xe0, 0x67, 0x67))
+        );
+        assert_eq!(
+            icon_bg(&p, &cache, mullion_store::ColorTarget::PaneTitle),
+            None,
+            "节点没勾这个落点就不该在这个落点上色"
+        );
+    }
+
+    /// 节点没设色 / 没有节点,底色都是 `None`,不 panic。
+    #[test]
+    fn icon_bg_is_none_without_a_color_or_without_any_node() {
+        let mut cache = crate::ui::badge::AppearanceCache::default();
+        cache.rebuild(&[sess_with_icon(7, "NODE")], &[]);
+        let p = proj(&[7], Some(7));
+        assert_eq!(
+            icon_bg(&p, &cache, mullion_store::ColorTarget::ListItem),
+            None,
+            "节点没设色就该是 None"
+        );
+        assert_eq!(
+            icon_bg(
+                &proj(&[], None),
+                &cache,
+                mullion_store::ColorTarget::ListItem
+            ),
+            None,
+            "没有节点就没有底色可回落"
+        );
     }
 }
