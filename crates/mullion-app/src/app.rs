@@ -4680,7 +4680,7 @@ impl App {
                     .expect("刚才在同一个 self.store 上判过 Some,中途没有别的代码能把它清空");
                 let id = store.add_project(name, String::new(), &now);
                 if let Err(e) = store.save() {
-                    self.ui.set_error(e.to_string());
+                    self.ui.set_error(format!("项目没能存下来:{e}"));
                 }
                 draft.id = id;
                 draft.created_at = now;

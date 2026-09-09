@@ -375,10 +375,10 @@ pub fn hotkey_plan(
         return HotkeyPlan::EditExisting(p.id);
     }
     let Some(cwd) = cwd else {
-        return HotkeyPlan::Explain("这块窗格还没有当前目录,建不了项目".to_string());
+        return HotkeyPlan::Explain("这块分屏还没有当前目录,建不了项目".to_string());
     };
     let Some(node) = node else {
-        return HotkeyPlan::Explain("这块窗格还没连上机器,建不了项目".to_string());
+        return HotkeyPlan::Explain("这块分屏还没连上机器,建不了项目".to_string());
     };
     match prefill_from_pane(cwd, tmux, node, existing) {
         Some(draft) => HotkeyPlan::NewDraft(Box::new(draft)),
@@ -1146,7 +1146,7 @@ mod tests {
         );
         match plan {
             HotkeyPlan::Explain(msg) => {
-                assert_eq!(msg, "这块窗格还没有当前目录,建不了项目")
+                assert_eq!(msg, "这块分屏还没有当前目录,建不了项目")
             }
             other => panic!("cwd 拿不到时应该出 Explain,拿到了 {other:?}"),
         }
@@ -1165,7 +1165,7 @@ mod tests {
         let plan = hotkey_plan(Some("/srv/api"), None, None, &[]);
         match plan {
             HotkeyPlan::Explain(msg) => {
-                assert_eq!(msg, "这块窗格还没连上机器,建不了项目")
+                assert_eq!(msg, "这块分屏还没连上机器,建不了项目")
             }
             other => panic!("node 拿不到时应该出 Explain,拿到了 {other:?}"),
         }
