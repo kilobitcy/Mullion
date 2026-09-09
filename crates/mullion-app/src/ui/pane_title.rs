@@ -42,6 +42,9 @@ pub struct TitleView<'a> {
     /// 用户手动 detach / 换 tmux 之后没人清(F160~F163 的「意图表换节点
     /// 没人清」同形)。
     pub project: Option<&'a str>,
+    /// F238:这块 pane 所属项目的图标(已由 `app.rs` 用
+    /// `crate::project::icon_for` 解析好)。`None` = 不属于任何项目。
+    pub project_icon: Option<&'a mullion_store::IconSpec>,
     /// F163/D4:挂在这块 pane 上的一句说明(attach 失败 / 会话已删 / 连不上)。
     /// 来自 `PaneState::notice`。**不弹窗** —— 多块 pane 同时失败会连弹好几次。
     pub notice: Option<&'a str>,
@@ -59,6 +62,19 @@ const FOCUS_TINT: f32 = 0.14;
 /// 减 2 点是给图标留呼吸空间,不让它顶到边距线上。
 pub fn icon_side(inner_h: f32) -> f32 {
     (inner_h - 2.0).clamp(10.0, 16.0)
+}
+
+/// F238:这块 pane 的标题条该画哪张图标。
+///
+/// 属于项目就用项目的 —— 同一台机器上开三个项目时,三块 pane 的会话图标
+/// 完全一样,那张图就不承担任何区分职责了。与 `title_text` 里「项目名顶掉
+/// tmux 名」是同一条判断,两处**必须同向**:一边写着项目名、一边画着会话
+/// 图标,用户读不出这块 pane 到底是什么。
+pub fn icon_of<'a>(
+    appearance: Option<&'a crate::ui::badge::Appearance>,
+    project_icon: Option<&'a mullion_store::IconSpec>,
+) -> Option<&'a mullion_store::IconSpec> {
+    project_icon.or_else(|| appearance.and_then(|a| a.icon.as_ref()))
 }
 
 /// 标题条上的文字。抽成纯函数是因为格式会被人反复调,而它是唯一能自动验的部分。
@@ -410,7 +426,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         // F61:图标画在状态点之前。`content` 是个 `new_child` +
                         // `set_clip_rect`,画多了只会被裁掉,不会把 `Area` 撑大。
-                        if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
+                        if let Some(icon) = icon_of(v.appearance, v.project_icon) {
                             // ⑤:边长按内容区高度算,不写死 —— 见 `icon_side`。
                             let side = icon_side(inner.height());
                             let (r, _) = ui
@@ -692,6 +708,7 @@ mod tests {
                 geom: geom_800x600_title32(1, 1.0),
                 index: 1,
                 project: None,
+                project_icon: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -748,6 +765,7 @@ mod tests {
                 geom: geom_800x600_title32(1, ppp),
                 index: 1,
                 project: None,
+                project_icon: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -810,6 +828,7 @@ mod tests {
             geom,
             index: 1,
             project: None,
+            project_icon: None,
             host: Some("this-is-a-ridiculously-long-hostname-that-will-never-fit.example.com"),
             status: PaneStatus::Live,
             focused: true,
@@ -865,6 +884,7 @@ mod tests {
             geom: geom_800x600_title32(1, 1.0),
             index: 1,
             project: None,
+            project_icon: None,
             host: Some("dev@build-01"),
             status: PaneStatus::Live,
             focused: true,
@@ -1033,6 +1053,7 @@ mod tests {
             geom,
             index: 1,
             project: None,
+            project_icon: None,
             host: Some("h"),
             status: PaneStatus::Live,
             focused: true,
@@ -1078,6 +1099,7 @@ mod tests {
             geom: geom_800x600_title32(1, 1.0),
             index: 1,
             project: None,
+            project_icon: None,
             host: Some("dev@build-01"),
             status: PaneStatus::Live,
             focused: true,
@@ -1163,6 +1185,7 @@ mod tests {
                 geom: geom_800x600_title32(1, ppp),
                 index: 1,
                 project: None,
+                project_icon: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -1229,6 +1252,7 @@ mod tests {
                 geom: geom_800x600_title32(1, 1.0),
                 index: 1,
                 project: None,
+                project_icon: None,
                 host: Some("dev@build-01"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -1327,6 +1351,7 @@ mod tests {
                 geom: geom_800x600_title32(id.0, ppp),
                 index: 1,
                 project: None,
+                project_icon: None,
                 host: Some("h"),
                 status: PaneStatus::Live,
                 focused: false,
@@ -1394,6 +1419,7 @@ mod tests {
             geom: geom_800x600_title32(id.0, 1.0),
             index: 1,
             project: None,
+            project_icon: None,
             host: Some("dev@a-very-long-hostname-that-eats-the-whole-row-by-itself"),
             status: PaneStatus::Live,
             focused: true,
@@ -1509,6 +1535,7 @@ mod tests {
                 geom: g,
                 index: 1,
                 project: None,
+                project_icon: None,
                 host: Some("h"),
                 status: PaneStatus::Live,
                 focused,
@@ -1640,6 +1667,7 @@ mod tests {
                 geom: g,
                 index: 1,
                 project: None,
+                project_icon: None,
                 host: Some("dev@a-very-long-hostname-that-eats-the-row"),
                 status: PaneStatus::Live,
                 focused: true,
@@ -1667,6 +1695,42 @@ mod tests {
                 "ppp={ppp}: Area 是 {:?},该是 {want_w}×{want_h}",
                 rect.size()
             );
+        }
+    }
+
+    /// F238:pane 属于某个项目时,标题条画的是**项目**的图标,不是会话的。
+    ///
+    /// 理由与 `title_text` 里「项目名顶掉 tmux 名」逐字相同:用户此刻的
+    /// 心智单位是项目,一台机器上开着三个项目时三块 pane 图标全一样,
+    /// 那个图标就不承担任何区分职责了。
+    ///
+    /// 自证会变红:把 `icon_of` 里 `project_icon` 那一支去掉。
+    #[test]
+    fn a_pane_that_belongs_to_a_project_shows_the_project_icon() {
+        let sess = title_test_ico("SESSION");
+        let proj = title_test_ico("PROJECT");
+        let a = crate::ui::badge::Appearance {
+            icon: Some(sess.clone()),
+            color: None,
+        };
+        assert_eq!(
+            icon_of(Some(&a), Some(&proj)).map(|i| i.value.as_str()),
+            Some("PROJECT"),
+            "属于项目时该用项目图标"
+        );
+        assert_eq!(
+            icon_of(Some(&a), None).map(|i| i.value.as_str()),
+            Some("SESSION"),
+            "不属于任何项目时仍用会话图标"
+        );
+        assert!(icon_of(None, None).is_none());
+    }
+
+    fn title_test_ico(v: &str) -> mullion_store::IconSpec {
+        mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: v.into(),
+            bg: None,
         }
     }
 }

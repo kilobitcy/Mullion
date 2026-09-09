@@ -11034,62 +11034,80 @@ impl ApplicationHandler<UserEvent> for App {
                                         geoms
                                             .iter()
                                             .enumerate()
-                                            .map(|(i, g)| crate::ui::pane_title::TitleView {
-                                                geom: *g,
-                                                index: i + 1,
-                                                // D3/D6:`host_pending` 时这块 pane
-                                                // 还没连上**它自己**那台机器,
-                                                // `host_ix` 指着主叶子(别人那台),
-                                                // 借它的名字会让一块占位 pane 显示成
-                                                // 一台其实连得好好的机器(见
-                                                // `PaneState::host_pending` 的文档)。
-                                                host: ws.pane(g.id).and_then(|p| {
-                                                    if p.host_pending {
-                                                        return None;
-                                                    }
-                                                    ws.hosts
-                                                        .get(p.host_ix)
-                                                        .map(|h| h.label.as_str())
-                                                }),
-                                                status: ws.pane(g.id).map_or(
-                                                    crate::shell::workspace::PaneStatus::Live,
-                                                    |p| p.status,
-                                                ),
-                                                focused: Some(g.id) == focus,
-                                                // 一条连接一个会话(ADR-009:多 pane
-                                                // 共用一条 SSH 连接,`host_ix` 目前恒 0)。
-                                                // 同上:`host_pending` 时 `host_ix`
-                                                // 不代表自己,外观也不能借。
-                                                appearance: ws
-                                                    .pane(g.id)
-                                                    .filter(|p| !p.host_pending)
-                                                    .and_then(|p| ws.hosts.get(p.host_ix))
-                                                    .and_then(|h| h.session_id)
-                                                    .and_then(|sid| self.appearance.get(sid)),
-                                                // ⑥:远端报出来的目录 / tmux 名。
-                                                // 拿不到就是 `None` —— 不显示,
-                                                // 不猜。
-                                                cwd_leaf: ws
-                                                    .pane(g.id)
-                                                    .and_then(|p| p.cwd.as_deref())
-                                                    .and_then(crate::ui::pane_title::dir_leaf),
-                                                tmux: ws.pane(g.id).and_then(|p| p.tmux.as_deref()),
-                                                // F225③:属不属于某个项目
-                                                // **现推**,判据与 F224 那盏灯
-                                                // 同一条。不记 `pane→项目` 的
-                                                // 映射:用户手动 detach / 换
-                                                // tmux 之后没人清它。
-                                                project: crate::project::project_of(
+                                            .map(|(i, g)| {
+                                                // F225③/F238:`project_of` 只算
+                                                // 一次,名字和图标同源 —— 各算
+                                                // 一遍的话,标题条上写着 A、
+                                                // 图标却画着 B。
+                                                let proj = crate::project::project_of(
                                                     ws.pane(g.id).and_then(|p| p.tmux.as_deref()),
                                                     projects_now,
-                                                )
-                                                .map(|p| p.name.as_str()),
-                                                // F163/D4:attach 失败 / 会话已删 /
-                                                // 连不上的说明,挂在这块 pane 自己
-                                                // 的标题条上。
-                                                notice: ws
-                                                    .pane(g.id)
-                                                    .and_then(|p| p.notice.as_deref()),
+                                                );
+                                                crate::ui::pane_title::TitleView {
+                                                    geom: *g,
+                                                    index: i + 1,
+                                                    // D3/D6:`host_pending` 时这块 pane
+                                                    // 还没连上**它自己**那台机器,
+                                                    // `host_ix` 指着主叶子(别人那台),
+                                                    // 借它的名字会让一块占位 pane 显示成
+                                                    // 一台其实连得好好的机器(见
+                                                    // `PaneState::host_pending` 的文档)。
+                                                    host: ws.pane(g.id).and_then(|p| {
+                                                        if p.host_pending {
+                                                            return None;
+                                                        }
+                                                        ws.hosts
+                                                            .get(p.host_ix)
+                                                            .map(|h| h.label.as_str())
+                                                    }),
+                                                    status: ws.pane(g.id).map_or(
+                                                        crate::shell::workspace::PaneStatus::Live,
+                                                        |p| p.status,
+                                                    ),
+                                                    focused: Some(g.id) == focus,
+                                                    // 一条连接一个会话(ADR-009:多 pane
+                                                    // 共用一条 SSH 连接,`host_ix` 目前恒 0)。
+                                                    // 同上:`host_pending` 时 `host_ix`
+                                                    // 不代表自己,外观也不能借。
+                                                    appearance: ws
+                                                        .pane(g.id)
+                                                        .filter(|p| !p.host_pending)
+                                                        .and_then(|p| ws.hosts.get(p.host_ix))
+                                                        .and_then(|h| h.session_id)
+                                                        .and_then(|sid| self.appearance.get(sid)),
+                                                    // ⑥:远端报出来的目录 / tmux 名。
+                                                    // 拿不到就是 `None` —— 不显示,
+                                                    // 不猜。
+                                                    cwd_leaf: ws
+                                                        .pane(g.id)
+                                                        .and_then(|p| p.cwd.as_deref())
+                                                        .and_then(crate::ui::pane_title::dir_leaf),
+                                                    tmux: ws
+                                                        .pane(g.id)
+                                                        .and_then(|p| p.tmux.as_deref()),
+                                                    // F225③:属不属于某个项目
+                                                    // **现推**,判据与 F224 那盏灯
+                                                    // 同一条。不记 `pane→项目` 的
+                                                    // 映射:用户手动 detach / 换
+                                                    // tmux 之后没人清它。
+                                                    project: proj.map(|p| p.name.as_str()),
+                                                    // F238:项目的图标顶掉会话的
+                                                    // —— 与上面 `project` 顶掉
+                                                    // tmux 名同一条判断,两处必须
+                                                    // 同向。
+                                                    project_icon: proj.and_then(|p| {
+                                                        crate::project::icon_for(
+                                                            p,
+                                                            &self.appearance,
+                                                        )
+                                                    }),
+                                                    // F163/D4:attach 失败 / 会话已删 /
+                                                    // 连不上的说明,挂在这块 pane 自己
+                                                    // 的标题条上。
+                                                    notice: ws
+                                                        .pane(g.id)
+                                                        .and_then(|p| p.notice.as_deref()),
+                                                }
                                             })
                                             .collect()
                                     })

@@ -1781,6 +1781,7 @@ mod tests {
             },
             index: 1,
             project: None,
+            project_icon: None,
             host: Some(host),
             status: PaneStatus::Live,
             focused: true,

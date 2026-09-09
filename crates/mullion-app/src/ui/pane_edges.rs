@@ -213,6 +213,7 @@ mod tests {
             geom: g,
             index,
             project: None,
+            project_icon: None,
             host: Some("h"),
             status: crate::shell::workspace::PaneStatus::Live,
             focused,
