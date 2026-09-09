@@ -122,6 +122,9 @@ pub fn show(
     // `show` 只在 `project_manager_open` 为真时被调用(见 `ui::show_shell`),
     // 所以这里不会在弹窗关着的时候把标志白白吃掉。
     let focus_name = std::mem::take(&mut ui_state.project_focus_name);
+    // F238:「导入 .ico…」被点了没有。放在窗口闭包外面接,原因同 F61 那条 ——
+    // 系统文件对话框是阻塞调用,只能在 egui 闭包之外另起线程开,这里先记一笔。
+    let mut pick_icon_clicked = false;
     // 宽度从 720 提到 840:左栏从 192 加宽到 `LIST_W`(300),不提的话右栏会
     // 从 442 缩到 334,F237 那个三行「说明」框跟着变窄。
     egui::Window::new("项目管理")
@@ -143,7 +146,16 @@ pub fn show(
                 list_column(ui, t, ui_state, projects, lamps, sessions, now, appearance);
                 ui.separator();
                 ui.vertical(|ui| {
-                    form_column(ui, t, ui_state, projects, sessions, table, focus_name);
+                    form_column(
+                        ui,
+                        t,
+                        ui_state,
+                        projects,
+                        sessions,
+                        table,
+                        focus_name,
+                        &mut pick_icon_clicked,
+                    );
                 });
             });
         });
@@ -152,6 +164,12 @@ pub fn show(
         // 关窗即丢草稿:留着的话下次打开会拿一份可能已经过期的内容盖上去。
         ui_state.project_draft = None;
         ui_state.project_selected = None;
+    }
+    // 「导入 .ico…」被点了 → 转成 `pick_icon_request`,由 `app.rs` 事后
+    // 另起线程开系统文件框(不能在 egui 闭包里同步阻塞)。同会话编辑器。
+    if std::mem::take(&mut pick_icon_clicked) {
+        ui_state.icon_target = crate::ui::IconTarget::Project;
+        ui_state.pick_icon_request = true;
     }
 }
 
@@ -318,6 +336,7 @@ fn add_button(ui: &mut egui::Ui) -> egui::Response {
 }
 
 /// 右栏:选中项目的表单。
+#[allow(clippy::too_many_arguments)]
 fn form_column(
     ui: &mut egui::Ui,
     t: &crate::theme::Theme,
@@ -326,6 +345,7 @@ fn form_column(
     sessions: &[SessionRecord],
     table: Option<&mullion_store::known_hosts::KnownHostsFile>,
     focus_name: bool,
+    pick_icon_clicked: &mut bool,
 ) {
     use crate::ui::metrics::{field_w, FIELD_W_L, FIELD_W_M, SP_M, SP_S, SP_XS};
     let Some(draft) = ui_state.project_draft.as_mut() else {
@@ -473,6 +493,15 @@ fn form_column(
                 .color(crate::theme::c32(t.fg_muted)),
             );
 
+            appearance_section(
+                ui,
+                t,
+                draft,
+                &mut ui_state.icon_error,
+                pick_icon_clicked,
+                &mut first,
+            );
+
             crate::ui::session_manager::form::section(ui, t, "项目管理器", "节点", &mut first);
             ui.label(
                 egui::RichText::new(
@@ -550,6 +579,49 @@ fn form_column(
                 .color(crate::theme::c32(t.fg_muted)),
             );
         });
+}
+
+/// F238:项目图标。与会话编辑器的「外观」分节(`session_manager::fields::appearance`)
+/// 同构 —— 两处长得不一样的话,用户会以为项目的图标是另一种东西。
+///
+/// 参数拆成几个 `&mut` 是因为 `ui_state` 整体传进去会跟 `draft`(借自
+/// `ui_state.project_draft.as_mut()`)撞借用检查。
+fn appearance_section(
+    ui: &mut egui::Ui,
+    t: &crate::theme::Theme,
+    draft: &mut ProjectRecord,
+    icon_error: &mut Option<String>,
+    pick_clicked: &mut bool,
+    first: &mut bool,
+) {
+    crate::ui::session_manager::form::section(ui, t, "项目管理器", "外观", first);
+    crate::ui::session_manager::form::grid(ui, "project_appearance", |ui| {
+        ui.label("图标");
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("导入 .ico…").clicked() {
+                    *pick_clicked = true;
+                }
+                if draft.icon.is_some() && ui.button("清除").clicked() {
+                    draft.icon = None;
+                    *icon_error = None;
+                }
+            });
+            if let Some(e) = icon_error.as_deref() {
+                ui.colored_label(crate::theme::c32(t.danger_text), e);
+            }
+            if let Some(icon) = draft.icon.as_ref() {
+                let side = crate::ui::ico::SMALL as f32;
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                crate::ui::badge::paint_icon(ui.painter(), rect, icon, None);
+            } else {
+                // 没设时说清回落到哪 —— 一片空白会被读成「这里坏了」。
+                ui.colored_label(crate::theme::c32(t.fg_muted), "没设:跟首选节点的图标走");
+            }
+        });
+        ui.end_row();
+    });
 }
 
 /// F223:开之前要问的那一下。
@@ -1155,8 +1227,12 @@ mod tests {
     /// 两像素,判据看起来在测钉底,其实只测出了封顶。
     const SHORT_H: f32 = 260.0;
 
-    /// 在一块矮屏幕上画两帧,收全部文字**和它们的位置**。
-    fn form_texts_on_a_short_screen() -> Vec<(String, egui::Rect)> {
+    /// 在给定高度的屏幕上画两帧,收全部文字**和它们的位置**。
+    /// `icon` 非空时把它塞进草稿的 `icon` 字段(F238 测试要看「已设图标」的样子)。
+    fn form_texts_at(
+        height: f32,
+        icon: Option<mullion_store::IconSpec>,
+    ) -> Vec<(String, egui::Rect)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
@@ -1169,7 +1245,8 @@ mod tests {
         }
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
-        let p = proj(1, "接口", None);
+        let mut p = proj(1, "接口", None);
+        p.icon = icon;
         let mut ui_state = crate::ui::UiState {
             project_manager_open: true,
             project_selected: Some(p.id),
@@ -1182,7 +1259,7 @@ mod tests {
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1000.0, SHORT_H),
+                egui::vec2(1000.0, height),
             )),
             ..Default::default()
         };
@@ -1208,5 +1285,70 @@ mod tests {
             walk(&cs.shape, &mut out);
         }
         out
+    }
+
+    /// 在一块矮屏幕上画两帧,收全部文字**和它们的位置**。
+    fn form_texts_on_a_short_screen() -> Vec<(String, egui::Rect)> {
+        form_texts_at(SHORT_H, None)
+    }
+
+    /// 屏幕够高、右栏能画到「外观」分节,草稿没设图标。
+    fn form_texts_with_selection() -> Vec<String> {
+        form_texts_at(900.0, None)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect()
+    }
+
+    /// 同上,但草稿已经设了一枚真实可解码的图标。
+    fn form_texts_with_icon() -> Vec<String> {
+        let icon = mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: crate::ui::ico::import(&crate::ui::ico::tests_support::solid_ico(
+                32,
+                [255, 0, 0, 255],
+            ))
+            .expect("测试用 ico 应能导入"),
+            bg: None,
+        };
+        form_texts_at(900.0, Some(icon))
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect()
+    }
+
+    /// F238:右栏有一个「外观」分节,能导入 .ico。
+    ///
+    /// 判据是**画面上的字**,不是「调了哪个函数」。
+    ///
+    /// 自证会变红:把 `appearance_section` 的调用注释掉。
+    #[test]
+    fn the_form_has_an_appearance_section_with_an_icon_import_button() {
+        let texts = form_texts_with_selection();
+        assert!(
+            texts.iter().any(|s| s == "外观"),
+            "右栏没有「外观」分节:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|s| s.contains("导入 .ico")),
+            "右栏没有导入 .ico 的入口:{texts:?}"
+        );
+    }
+
+    /// 已经设了图标才有「清除」—— 没设时摆一颗按不动的按钮,用户会以为
+    /// 自己漏看了什么(同会话侧「外观」页的判据)。
+    ///
+    /// 自证会变红:把 `draft.icon.is_some()` 那个条件去掉,让「清除」无条件出现。
+    #[test]
+    fn the_clear_button_only_shows_up_once_an_icon_is_set() {
+        assert!(
+            !form_texts_with_selection().iter().any(|s| s == "清除"),
+            "还没设图标就摆出了「清除」"
+        );
+        let texts = form_texts_with_icon();
+        assert!(
+            texts.iter().any(|s| s == "清除"),
+            "设了图标却没有「清除」:{texts:?}"
+        );
     }
 }

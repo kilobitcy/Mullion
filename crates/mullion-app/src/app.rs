@@ -9899,12 +9899,39 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::IconPathPicked(picked) => {
                 self.picker_busy.icon = false;
                 if let Some(p) = picked {
-                    if let Some(buf) = self.ui.editor.as_mut() {
-                        self.ui.icon_error =
-                            crate::ui::session_manager::import_icon_file(buf, &p, |p| {
-                                std::fs::read(p)
-                            })
-                            .err();
+                    // F238:文件框谁开的,导入结果就该写回谁的草稿。穷尽 `match`
+                    // 而非 `if let` + else —— 本项目吃过「列举式门控在加档时
+                    // 必然漏」的亏。
+                    match self.ui.icon_target {
+                        crate::ui::IconTarget::Session => {
+                            if let Some(buf) = self.ui.editor.as_mut() {
+                                self.ui.icon_error =
+                                    crate::ui::session_manager::import_icon_file(buf, &p, |p| {
+                                        std::fs::read(p)
+                                    })
+                                    .err();
+                            }
+                        }
+                        // 项目草稿。**只写草稿不落盘** —— 落盘是「保存」那颗
+                        // 按钮的事,在这里写等于绕开了 `validate_project`。
+                        crate::ui::IconTarget::Project => {
+                            if let Some(d) = self.ui.project_draft.as_mut() {
+                                self.ui.icon_error = match std::fs::read(&p) {
+                                    Err(e) => Some(format!("读不了 {}:{e}", p.display())),
+                                    Ok(bytes) => match crate::ui::ico::import(&bytes) {
+                                        Ok(b64) => {
+                                            d.icon = Some(mullion_store::IconSpec {
+                                                kind: mullion_store::IconKind::Ico,
+                                                value: b64,
+                                                bg: None,
+                                            });
+                                            None
+                                        }
+                                        Err(e) => Some(e.message()),
+                                    },
+                                };
+                            }
+                        }
                     }
                 }
                 self.request_ui_redraw();

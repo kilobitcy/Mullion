@@ -375,6 +375,12 @@ pub struct UiState {
     /// 会让「什么都没改成」的表单显示成脏的、切走时白弹一次确认 —— 触碰位
     /// (`touched`)当初也是为了这个搬到这里的。
     pub icon_error: Option<String>,
+    /// F238:文件对话框选完 `.ico` 之后,那份正文该落到哪。
+    ///
+    /// **一个 flag 两个去处**:会话编辑器和项目管理器共用
+    /// `pick_icon_request` 与系统文件框那条路(`picker_busy.icon`),各开
+    /// 一条的话「同时开着两个窗」时两条路会互相盖掉 `picker_busy`。
+    pub icon_target: IconTarget,
 
     // --- F50:文件侧栏(D1)。---
     /// 文件侧栏开着没有。**按会话记住**是 D1 的承诺,但记忆落在 `App` 那边
@@ -436,6 +442,16 @@ pub struct UiState {
     /// F225③:切项目弹窗(点了 pane 标题条的项目按钮)。`None` = 关着。
     /// 里面有搜索框 —— 必须同步登记进 `app.rs::modal_open`(T8)。
     pub project_pick: Option<project_pick::ProjectPickDraft>,
+}
+
+/// [`UiState::icon_target`] 的取值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IconTarget {
+    /// 会话编辑器的「外观」页(F61)。
+    #[default]
+    Session,
+    /// 项目管理器右栏的「外观」分节(F238)。
+    Project,
 }
 
 impl UiState {

@@ -877,6 +877,7 @@ pub fn show(
             ui_state.pick_key_request = true;
         }
         if std::mem::take(&mut buf.pick_icon_clicked) {
+            ui_state.icon_target = crate::ui::IconTarget::Session;
             ui_state.pick_icon_request = true;
         }
     }
