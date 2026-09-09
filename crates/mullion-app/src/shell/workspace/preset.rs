@@ -637,57 +637,65 @@ mod tests {
     /// 测试**长得一模一样**:预设树本来就被 `preset_of` 认得出,两种实现都会
     /// 重排。只有喂一棵比例已经歪掉的树,两者才分得开。
     ///
-    /// 自证会变红:在 `Workspace::close_pane` 的重排前面加一道
-    /// `if preset_of(&before).is_some()` 的门(把关闭前的树先克隆出来判)。
+    /// 自证会变红:在 `Workspace::close_pane` 的重排上加一道
+    /// `.filter(|_| preset_of(ws.tree()).is_some())` 的门(判关闭前的形状)。
+    ///
+    /// 必须驱动真的 [`Workspace::close_pane`]:在测试里自己拼「兄弟顶替 +
+    /// 按剩余块数重排」两步,验的只是 `layout_after_close` 这个纯函数,而
+    /// 「有条件 / 无条件」的差别全在调用方 —— 那样写是**恒绿**的(实测:
+    /// 加上门之后旧版本仍然全绿)。
     #[test]
-    fn a_hand_dragged_layout_is_rearranged_on_close_just_like_a_preset_one() {
-        use mullion_core::layout::close_pane;
+    fn a_layout_that_was_never_a_preset_is_rearranged_on_close_all_the_same() {
+        use crate::shell::workspace::tests_support::ws_with;
+        use mullion_store::{SavedDir, SavedNodeEntry};
 
-        // 三等宽竖条被拖歪:外层 0.2、内层 0.7,`preset_of` 认不出它。
-        let mut t = preset_tree(Preset::ThreeColumns, &ids(3));
-        let Node::Split { ratio, b, .. } = &mut t else {
-            panic!("三等宽竖条的根必须是 Split");
-        };
-        *ratio = 0.2;
-        let Node::Split { ratio: inner, .. } = b.as_mut() else {
-            panic!("三等宽竖条的右子必须是 Split");
-        };
-        *inner = 0.7;
-        assert_eq!(preset_of(&t), None, "前提:这棵树已经不是任何预设");
+        // 三竖条,但外层比例是 0.3 —— 不等于 1/3,`preset_of` 认不出。F37 恢复
+        // 一棵手改过的 layout.toml 是今天唯一能造出非预设比例的入口。
+        let (mut ws, _probes) = ws_with(1);
+        let entries = vec![
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.3),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::split(SavedDir::Horizontal, 0.5),
+            SavedNodeEntry::leaf(),
+            SavedNodeEntry::leaf(),
+        ];
+        ws.apply_saved_tree(&entries, 0, 0).expect("结构完整");
+        assert_eq!(preset_of(ws.tree()), None, "前提:这棵树不是任何预设");
 
-        // 走一遍 `Workspace::close_pane` 的两步:兄弟顶替 → 按剩余块数重排。
-        assert!(close_pane(&mut t, PaneId(2)));
-        let survivors = leaves(&t);
-        let p = layout_after_close(survivors.len()).expect("剩两块该有目标预设");
-        t = preset_tree(p, &survivors);
+        let survivors = leaves(ws.tree());
+        assert_eq!(survivors.len(), 3);
+        assert!(ws.close_pane(survivors[2]));
 
-        assert_eq!(preset_of(&t), Some(Preset::TwoLeftRight));
-        let widths: Vec<u16> = compute_rects(&t, AREA).iter().map(|(_, r)| r.cols).collect();
-        assert_eq!(widths, vec![600, 600], "拖歪过的比例照样被冲成等宽");
+        assert_eq!(preset_of(ws.tree()), Some(Preset::TwoLeftRight));
+        let widths: Vec<u16> = compute_rects(ws.tree(), AREA)
+            .iter()
+            .map(|(_, r)| r.cols)
+            .collect();
+        assert_eq!(widths, vec![600, 600], "0.3 的比例照样被冲成等宽");
     }
 
     /// F241:重排**不改变 pane 的先后顺序** —— `preset_tree` 按几何顺序填叶子,
     /// 而喂进去的正是 `leaves` 的返回顺序。顺序一乱,用户看到的是内容互相换位
     /// (§5.2 警告过的那种「跳」)。
     ///
-    /// 自证会变红:把重排那句改成 `preset_tree(p, &{ let mut v = survivors
-    /// .clone(); v.reverse(); v })`。
+    /// 自证会变红:在 `Workspace::close_pane` 里重排前加一句 `ids.reverse()`。
+    /// 同样必须驱动真的 `close_pane` —— 理由见上一条。
     #[test]
-    fn rearranging_after_a_close_keeps_the_survivors_in_geometric_order() {
-        use mullion_core::layout::close_pane;
+    fn closing_one_of_four_leaves_three_columns_in_the_original_order() {
+        use crate::shell::workspace::tests_support::ws_with;
 
         // 2×2 关掉右下 → 剩左上、右上、左下 → 三等宽竖条的左/中/右。
-        let mut t = preset_tree(Preset::FourGrid, &ids(4));
-        assert!(close_pane(&mut t, PaneId(4)));
-        let survivors = leaves(&t);
-        assert_eq!(survivors, vec![PaneId(1), PaneId(2), PaneId(3)]);
-        let p = layout_after_close(survivors.len()).expect("剩三块该有目标预设");
-        t = preset_tree(p, &survivors);
+        let (mut ws, _probes) = ws_with(1);
+        ws.apply_preset(Preset::FourGrid);
+        let all = leaves(ws.tree());
+        assert_eq!(all.len(), 4);
 
-        assert_eq!(preset_of(&t), Some(Preset::ThreeColumns));
+        assert!(ws.close_pane(all[3]), "关掉右下那块");
+
+        assert_eq!(preset_of(ws.tree()), Some(Preset::ThreeColumns));
         assert_eq!(
-            leaves(&t),
-            vec![PaneId(1), PaneId(2), PaneId(3)],
+            leaves(ws.tree()),
+            vec![all[0], all[1], all[2]],
             "存活 pane 的先后顺序不该被重排打乱"
         );
     }
