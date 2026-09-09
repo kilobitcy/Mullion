@@ -11,6 +11,15 @@
 /// **大小写不敏感**,与 `list::matches` 的判据一致:那边放行了这一行,这边
 /// 却标不出命中在哪,用户会以为搜索坏了。
 ///
+/// F245:查询**按词切**(走 [`crate::search::tokens`],与两处 `matches`
+/// 同一份),每个词各自的每一处出现都染。漏了这一步的话:匹配那边已经分词、
+/// 这边还拿整串去找,`web 01` 放行了 `web01` 这一行却**一个字都不高亮**,
+/// 而且不报错 —— F233 那个「让用户看见为什么这行会出现」的设计当场归零。
+///
+/// 实现走**逐字符的命中掩码**再合并连续段,不是「逐词各切一遍再拼」:
+/// 两个词的命中区间可能重叠(搜 `web eb01` 打在 `web01` 上),按区间拼会切出
+/// 交叉的段、拼回去就不是原文了。掩码天然没有这个问题。
+///
 /// 全程在 `char` 上比对、按 `char` 切,不碰字节下标 —— 中文会话名按字节切
 /// 会当场 panic,而中文名在这个项目里是常态。折叠大小写只取
 /// `to_lowercase()` 的**第一个** char:少数字符(如 'İ')小写成两个 char,
@@ -19,32 +28,32 @@
 pub(crate) fn segments(text: &str, query: &str) -> Vec<(String, bool)> {
     let chars: Vec<char> = text.chars().collect();
     let hay: Vec<char> = chars.iter().map(|c| fold(*c)).collect();
-    let needle: Vec<char> = query.trim().chars().map(fold).collect();
 
-    if needle.is_empty() || needle.len() > hay.len() {
+    let mut mask = vec![false; chars.len()];
+    let mut any = false;
+    for tok in crate::search::tokens(query) {
+        let needle: Vec<char> = tok.chars().map(fold).collect();
+        if needle.is_empty() || needle.len() > hay.len() {
+            continue;
+        }
+        for i in 0..=hay.len() - needle.len() {
+            if hay[i..i + needle.len()] == needle[..] {
+                mask[i..i + needle.len()].fill(true);
+                any = true;
+            }
+        }
+    }
+    if !any {
         return vec![(text.to_string(), false)];
     }
 
     let mut out: Vec<(String, bool)> = Vec::new();
-    let mut i = 0;
-    let mut plain_start = 0;
-    while i + needle.len() <= hay.len() {
-        if hay[i..i + needle.len()] == needle[..] {
-            if plain_start < i {
-                out.push((chars[plain_start..i].iter().collect(), false));
-            }
-            out.push((chars[i..i + needle.len()].iter().collect(), true));
-            i += needle.len();
-            plain_start = i;
-        } else {
-            i += 1;
+    let mut start = 0;
+    for i in 1..=chars.len() {
+        if i == chars.len() || mask[i] != mask[start] {
+            out.push((chars[start..i].iter().collect(), mask[start]));
+            start = i;
         }
-    }
-    if plain_start < chars.len() {
-        out.push((chars[plain_start..].iter().collect(), false));
-    }
-    if out.is_empty() {
-        out.push((text.to_string(), false));
     }
     out
 }
@@ -109,5 +118,47 @@ mod tests {
     fn a_query_longer_than_the_text_matches_nothing() {
         assert_eq!(seg("ab", "abcd"), vec![("ab".to_string(), false)]);
         assert_eq!(seg("", "a"), vec![(String::new(), false)]);
+    }
+
+    /// F245:查询**按词切**,每个词各自的每一处出现都要染。
+    ///
+    /// 两处 `matches` 已经分词了,这里还拿整串去找的话:`web 01` 放行了
+    /// `web01` 这一行,却**一个字都不高亮** —— 而且完全不报错,「让用户看见
+    /// 为什么这行会出现」的设计当场归零。
+    ///
+    /// 自证会变红:把 `segments` 里的 `crate::search::tokens(query)` 换成
+    /// `std::iter::once(query.trim())`。
+    #[test]
+    fn each_word_of_the_query_is_tinted_wherever_it_lands() {
+        let got = seg("web01 生产", "生产 web");
+        assert_eq!(
+            got,
+            vec![
+                ("web".to_string(), true),
+                ("01 ".to_string(), false),
+                ("生产".to_string(), true),
+            ]
+        );
+        let joined: String = got.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(joined, "web01 生产", "分段拼回去必须一字不差");
+    }
+
+    /// 两个词的命中区间**重叠**时不许切出交叉的段。逐词各切一遍再拼会在这里
+    /// 吐出乱序或重复的字,而画出来只是「有几个字看着怪」,极难归因。
+    #[test]
+    fn overlapping_words_merge_into_one_tinted_run() {
+        let got = seg("web01", "web eb0");
+        assert_eq!(
+            got,
+            vec![("web0".to_string(), true), ("1".to_string(), false)]
+        );
+        let joined: String = got.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(joined, "web01");
+    }
+
+    /// 一个词都没命中时整段不染 —— 不能因为「查询非空」就把整行标成命中。
+    #[test]
+    fn a_query_that_lands_nowhere_leaves_the_text_plain() {
+        assert_eq!(seg("web01", "db 生产"), vec![("web01".to_string(), false)]);
     }
 }

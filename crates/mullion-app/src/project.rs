@@ -105,9 +105,9 @@ pub fn icon_bg(
         .and_then(|a| crate::ui::badge::should_paint(a, target))
 }
 
-/// F233:一个项目是否命中搜索词。空查询(trim 后为空)放行全部。
+/// 项目身上**行里看得见**的那些字段:项目名 / 目录 / 每一条节点会话的名字与
+/// 主机(后两者进副标题)。
 ///
-/// 匹配**项目名 / 目录 / 每一条节点会话的名字与主机**,大小写不敏感。
 /// 收节点是因为用户记得住的常是机器名或 IP 尾数,不是当初给活起的名字 ——
 /// 与 `session_manager::list::matches` 收 host/tags 是同一条理由。
 ///
@@ -116,9 +116,41 @@ pub fn icon_bg(
 ///
 /// 只看这个项目自己的节点(`s.id == *id`)。丢掉 id 比对的话,任意一条会话名
 /// 都能把全部项目一起捞出来 —— 搜索仍然「有反应」,但等于失效。
+fn visible_fields<'a>(
+    p: &'a mullion_store::ProjectRecord,
+    sessions: &'a [mullion_store::SessionRecord],
+) -> Vec<&'a str> {
+    let mut out = vec![p.name.as_str(), p.dir.as_str()];
+    for id in &p.nodes {
+        if let Some(s) = sessions.iter().find(|s| s.id == *id) {
+            out.push(s.identity.name.as_str());
+            out.push(s.connection.host.as_str());
+        }
+    }
+    out
+}
+
+/// F245:项目身上**行里看不见**的那些字段:说明、以及最终会 attach 的 tmux 名。
 ///
-/// **不收 `note`**:F237 把说明改成了多行,长文本参与匹配会让搜索命中一堆
-/// 用户在列表上看不见的东西。
+/// 返回 `String` 而不是 `&str`:tmux 名要过 `project_tmux_name`(留空时回落
+/// 项目名 + `sanitize_tmux_name`),那是算出来的,借不出去。
+///
+/// 取**最终名**而不是裸 `p.tmux_name`:用户在远端 `tmux ls` 里看到、心里记着的
+/// 就是这个。裸字段的话,没显式设过 tmux 名的项目(默认就是 `None`)在这一维
+/// 上完全搜不到,而用户不知道自己搜的名字是显式设的还是推导出来的 —— 表现为
+/// 「有时搜得到有时搜不到」。
+fn hidden_fields(p: &mullion_store::ProjectRecord) -> Vec<String> {
+    vec![p.note.clone(), mullion_store::project_tmux_name(p)]
+}
+
+/// F233/F245:一个项目是否命中搜索词。空查询放行全部。
+///
+/// 分词与 AND/OR 的语义见 [`crate::search::matches_all`] —— 会话管理器共用
+/// 同一份,两处语义分叉的话同一个词在两个界面给出不同结果。
+///
+/// **F245 收了 `note` 与 tmux 名**,推翻了 F233 当初「不收 note」的决定。当初
+/// 的顾虑(多行长文本会命中一堆用户在列表上看不见的东西)是真的,所以这一片
+/// 同时补上了「看得见」那一半:见 [`hidden_hit_snippet`]。
 ///
 /// 三处列表(项目管理器左栏 / 启动页 / pane 切换弹窗)共用这一份 —— 各写一份
 /// 的话,同一个搜索词在两个界面给出不同结果,而用户几分钟内就会都看到一遍。
@@ -127,20 +159,82 @@ pub fn matches(
     query: &str,
     sessions: &[mullion_store::SessionRecord],
 ) -> bool {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return true;
-    }
-    if p.name.to_lowercase().contains(&q) || p.dir.to_lowercase().contains(&q) {
-        return true;
-    }
-    p.nodes.iter().any(|id| {
-        sessions.iter().any(|s| {
-            s.id == *id
-                && (s.identity.name.to_lowercase().contains(&q)
-                    || s.connection.host.to_lowercase().contains(&q))
-        })
+    let hidden = hidden_fields(p);
+    let mut fields = visible_fields(p, sessions);
+    fields.extend(hidden.iter().map(String::as_str));
+    crate::search::matches_all(query, &fields)
+}
+
+/// 片段里命中词**之前**保留多少个字符。
+const SNIPPET_BEFORE: usize = 8;
+/// 片段里命中词**之后**保留多少个字符。比前文给得多:命中词更可能靠句子前部,
+/// 后文比前文有信息量。
+const SNIPPET_AFTER: usize = 24;
+
+/// F245:这一行是不是**只**靠说明 / tmux 名才出现的;是的话,给出一段能解释
+/// 「凭什么」的正文片段。`None` = 行上看得见的字段已经解释得了,副标题照旧。
+///
+/// 判据是「**只有**隐藏字段命中」而不是「隐藏字段命中了」:后者会让普通搜索
+/// (打项目名)的行也平白变样。只有那些**凭空冒出来的行**才需要自己解释自己。
+///
+/// 逐词判、取第一个这样的词 —— 保证返回的片段里必定含有一处会被
+/// `highlight::segments` 染色的命中。从说明第一行开头截的话,画出来的可能是
+/// 一段不含高亮的文字:行变样了,却仍然没回答「为什么是这一行」。
+pub fn hidden_hit_snippet(
+    p: &mullion_store::ProjectRecord,
+    sessions: &[mullion_store::SessionRecord],
+    query: &str,
+) -> Option<String> {
+    let visible = visible_fields(p, sessions);
+    let hidden = hidden_fields(p);
+    crate::search::tokens(query).into_iter().find_map(|tok| {
+        if crate::search::token_hits(tok, &visible) {
+            return None;
+        }
+        hidden
+            .iter()
+            .find_map(|f| snippet_around(f, tok))
+            .filter(|s| !s.is_empty())
     })
+}
+
+/// 从 `text` 里截出 `tok` 命中处前后的一段。`None` = 没命中。
+///
+/// 全程在 `char` 上做:说明是中文,按字节切当场 panic(同
+/// `highlight::segments` 的理由)。
+///
+/// **控制字符换成空格**:说明是多行的(F237),片段跨行时直接画会在
+/// `LayoutJob` 里换行,把两行的行高撑成三行 —— 而 `project_row` 的
+/// `NAME_TOP`/`SUB_TOP` 是写死的常量、三处列表共用。
+fn snippet_around(text: &str, tok: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let hay: Vec<char> = chars.iter().map(|c| fold(*c)).collect();
+    let needle: Vec<char> = tok.chars().map(fold).collect();
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    let at = (0..=hay.len() - needle.len()).find(|i| hay[*i..i + needle.len()] == needle[..])?;
+    let start = at.saturating_sub(SNIPPET_BEFORE);
+    let end = (at + needle.len() + SNIPPET_AFTER).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(
+        chars[start..end]
+            .iter()
+            .map(|c| if c.is_control() { ' ' } else { *c }),
+    );
+    if end < chars.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+/// 折叠大小写。与 `highlight::segments` 同一条近似(只取 `to_lowercase()` 的
+/// 首个 char),这样片段里被截出来的那一段,一定也是那边会染色的那一段。
+fn fold(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 /// F236:「+ 添加项目」用的默认名。
@@ -817,7 +911,7 @@ mod tests {
     /// 用户记得住的常是机器名或 IP 尾数,不是当初给活起的名字 —— 与
     /// `session_manager::list::matches` 收 host/tags 是同一条理由。
     ///
-    /// 自证会变红:把 `p.nodes.iter().any(..)` 那一整段删掉。
+    /// 自证会变红:把 `visible_fields` 里那个 `for id in &p.nodes` 循环删掉。
     #[test]
     fn a_project_is_found_by_the_name_or_host_of_any_node_it_can_dial() {
         let ss = vec![sess(7, "web01", "10.0.0.9"), sess(8, "web02", "10.0.0.10")];
@@ -829,12 +923,115 @@ mod tests {
     /// 只收**这个项目自己的**节点。收全表的话,任意一条会话名都能把所有项目
     /// 一起捞出来 —— 搜索仍然「有反应」,但等于失效。
     ///
-    /// 自证会变红:把 `s.id == *id &&` 那一段判断去掉。
+    /// 自证会变红:把 `visible_fields` 里的 `sessions.iter().find(|s| s.id == *id)`
+    /// 换成 `sessions.first()`。
     #[test]
     fn a_session_that_is_not_a_node_of_this_project_never_makes_it_match() {
         let ss = vec![sess(7, "web01", "10.0.0.9"), sess(9, "db01", "10.0.0.20")];
         let p = pr("接口", "/srv/api", &[7]);
         assert!(!matches(&p, "db01", &ss), "不是这个项目的节点也命中了");
+    }
+
+    // ---- F245:说明 / tmux 名参与搜索 --------------------------------------
+
+    /// F245:说明(`note`)参与匹配。用户记得住的常是「那个跑爬虫的」,而项目名
+    /// 多半是个代号。
+    ///
+    /// 自证会变红:把 `hidden_fields` 里的 `p.note.clone()` 换成 `String::new()`。
+    #[test]
+    fn a_project_is_found_by_a_word_from_its_note() {
+        let mut p = pr("proj-7", "/srv/api", &[]);
+        p.note = "每天凌晨跑爬虫,产出丢到 oss".into();
+        assert!(matches(&p, "爬虫", &[]), "按说明没搜到");
+    }
+
+    /// F245:搜的是**最终会 attach 的** tmux 名,不是裸 `p.tmux_name`。
+    ///
+    /// 留空的项目(默认就是 `None`)会回落项目名 + `sanitize_tmux_name`,
+    /// 而用户从远端 `tmux ls` 抄出来的正是那个改造后的名字:项目名 `web:生产`
+    /// 的会话在 tmux 里叫 `web-生产`,拿裸字段的话永远搜不到。
+    ///
+    /// 自证会变红:把 `hidden_fields` 里的 `project_tmux_name(p)` 换成
+    /// `p.tmux_name.clone().unwrap_or_default()`。
+    #[test]
+    fn a_project_is_found_by_the_tmux_name_it_will_actually_attach_to() {
+        let explicit = {
+            let mut p = pr("接口", "/srv/api", &[]);
+            p.tmux_name = Some("claude-api".into());
+            p
+        };
+        assert!(matches(&explicit, "claude-api", &[]), "显式 tmux 名没搜到");
+
+        // 留空 → 回落项目名并 sanitize(`:` → `-`)。
+        let derived = pr("web:生产", "/srv/api", &[]);
+        assert!(
+            matches(&derived, "web-生产", &[]),
+            "推导出来的 tmux 名没搜到"
+        );
+    }
+
+    /// F245:词之间 AND、字段之间 OR —— 两个词可以分别落在说明和节点主机上。
+    #[test]
+    fn two_words_may_land_on_the_note_and_on_a_node_host() {
+        let ss = vec![sess(7, "web01", "10.0.2.219")];
+        let mut p = pr("proj-7", "/srv/api", &[7]);
+        p.note = "每天凌晨跑爬虫".into();
+        assert!(matches(&p, "爬虫 219", &ss));
+        assert!(!matches(&p, "爬虫 220", &ss), "有一个词落空还放行了");
+    }
+
+    /// F245:只有说明命中时,行要能自己解释「凭什么出现」—— 说明和 tmux 名
+    /// **行上一个字都不显示**,不给片段的话这一行完全没有线索。
+    ///
+    /// 自证会变红:把 `hidden_hit_snippet` 整个改成恒返回 `None`。
+    #[test]
+    fn a_row_that_only_matched_the_note_offers_a_snippet_of_it() {
+        let mut p = pr("proj-7", "/srv/api", &[]);
+        p.note = "每天凌晨跑爬虫,产出丢到 oss".into();
+        let got = hidden_hit_snippet(&p, &[], "爬虫").expect("只命中说明,该给片段");
+        assert!(got.contains("爬虫"), "片段里没有命中词本身:{got}");
+    }
+
+    /// **只有**隐藏字段命中才换副标题。普通搜索(打项目名 / 目录 / 节点名)的
+    /// 行不该平白变样 —— 目录和节点名比一段说明更能认出这是哪个活。
+    ///
+    /// 自证会变红:把 `hidden_hit_snippet` 里那句
+    /// `if crate::search::token_hits(tok, &visible) { return None; }` 删掉。
+    #[test]
+    fn a_row_whose_visible_fields_already_explain_it_keeps_its_subtitle() {
+        let mut p = pr("爬虫网关", "/srv/api", &[]);
+        p.note = "每天凌晨跑爬虫".into();
+        assert_eq!(
+            hidden_hit_snippet(&p, &[], "爬虫"),
+            None,
+            "项目名里就有这个词,不该换成说明片段"
+        );
+    }
+
+    /// 片段两端截断处要有省略号,**换行符要换成空格**。
+    ///
+    /// 说明是多行的(F237),片段跨行时直接画会在 `LayoutJob` 里换行,把两行
+    /// 的行高撑成三行 —— 而 `project_row` 的 `NAME_TOP`/`SUB_TOP` 是写死的
+    /// 常量、三处列表共用。
+    ///
+    /// 自证会变红:把 `snippet_around` 里的 `if c.is_control()` 那个 map 去掉。
+    #[test]
+    fn a_snippet_marks_where_it_was_cut_and_never_carries_a_newline() {
+        let text =
+            "0123456789ABCDEFGH 命中\n后面还有很长很长很长很长很长很长很长很长很长很长的一段话";
+        let got = snippet_around(text, "命中").expect("该命中");
+        assert!(got.starts_with('…'), "左端截断没加省略号:{got}");
+        assert!(got.ends_with('…'), "右端截断没加省略号:{got}");
+        assert!(!got.contains('\n'), "片段里带了换行:{got:?}");
+        assert!(got.contains("命中"), "片段里没有命中词:{got}");
+    }
+
+    /// 命中在开头 / 结尾时不加多余的省略号 —— 没截掉东西却画一个「…」,
+    /// 用户会以为前面还有内容。
+    #[test]
+    fn a_snippet_that_cut_nothing_has_no_ellipsis() {
+        assert_eq!(snippet_around("爬虫", "爬虫").as_deref(), Some("爬虫"));
+        assert_eq!(snippet_around("不相干", "爬虫"), None);
     }
 
     /// 一个项目都没有时就是「新项目」,不带后缀。

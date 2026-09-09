@@ -93,6 +93,21 @@ pub fn subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
     }
 }
 
+/// F245:这一行副标题最终画什么。
+///
+/// 默认是 [`subtitle`];但当某个查询词**只**在说明 / tmux 名里命中时,换成
+/// 那段正文的片段(见 [`crate::project::hidden_hit_snippet`])。
+///
+/// 为什么必须有这一层:F245 让搜索收了说明和 tmux 名,而这两样**行上一个字
+/// 都不显示**。不换的话,搜出来的行既没有高亮、也没有任何线索说明它凭什么
+/// 出现 —— 那正是 F233 当初否掉「收 note」的理由,原样吃回去等于确认了它。
+///
+/// **只在「只有隐藏字段命中」时换**:普通搜索(打项目名)的行不该平白变样,
+/// 目录和节点名比一段说明更能认出这是哪个活。
+pub fn subtitle_for_query(p: &ProjectRecord, sessions: &[SessionRecord], query: &str) -> String {
+    crate::project::hidden_hit_snippet(p, sessions, query).unwrap_or_else(|| subtitle(p, sessions))
+}
+
 /// 行尾那一列时间。
 ///
 /// 从没打开过的说「从未打开」,不留空 —— 空白会被读成「这一列坏了」,而
@@ -251,7 +266,7 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     crate::ui::session_manager::list::paint_highlighted(
         p,
         egui::pos2(text_left, rect.top() + SUB_TOP),
-        &subtitle(row.project, row.sessions),
+        &subtitle_for_query(row.project, row.sessions, row.query),
         row.query,
         egui::FontId::proportional(SUB_SIZE),
         theme::c32(t.fg_muted),
@@ -501,6 +516,95 @@ mod tests {
                 .any(|s| s.format.color == accent),
             _ => false,
         }
+    }
+
+    /// F245:只命中说明时,副标题换成那段说明的片段;否则照旧是「目录 · 节点名」。
+    #[test]
+    fn the_subtitle_falls_back_to_the_note_only_when_nothing_visible_matched() {
+        let ss = vec![sess(7, "web01")];
+        let mut p = proj(1, "proj-7", "/srv/api", None);
+        p.note = "每天凌晨跑爬虫".into();
+        assert!(
+            subtitle_for_query(&p, &ss, "爬虫").contains("爬虫"),
+            "只命中说明,副标题该换成说明片段"
+        );
+        assert_eq!(
+            subtitle_for_query(&p, &ss, "web01"),
+            "/srv/api · web01",
+            "命中的是节点名,副标题不该变样"
+        );
+        assert_eq!(
+            subtitle_for_query(&p, &ss, ""),
+            "/srv/api · web01",
+            "没在搜索时副标题不该变样"
+        );
+    }
+
+    /// F245:**行上真的画出了**那段说明片段。
+    ///
+    /// 判据是「画出来的文字里有说明的正文」,不是「`show` 里调了
+    /// `subtitle_for_query`」—— 后者是读源码,换个函数名就恒绿。这条守的正是
+    /// 「纯函数测得扎实、接线没人看着」那类缺口。
+    ///
+    /// 自证会变红:把 `show` 里的 `subtitle_for_query(row.project, row.sessions,
+    /// row.query)` 换回 `subtitle(row.project, row.sessions)`。
+    #[test]
+    fn a_row_that_only_matched_the_note_actually_paints_the_note() {
+        let mut p = proj(3, "proj-7", "/srv/api", None);
+        p.note = "每天凌晨跑爬虫".into();
+        let painted = painted_text(&p, "爬虫");
+        assert!(
+            painted.iter().any(|s| s.contains("爬虫")),
+            "行上没画出说明片段,用户看不出这一行凭什么出现:{painted:?}"
+        );
+    }
+
+    /// 跑两帧,收集这一行画出来的全部文字。
+    fn painted_text(p: &ProjectRecord, query: &str) -> Vec<String> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let ss = vec![sess(7, "web01")];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SCREEN_W, 400.0));
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            out = ctx
+                .run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show(
+                                ui,
+                                &t,
+                                &Row {
+                                    project: p,
+                                    lamp: crate::project::Lamp::Unknown,
+                                    sessions: &ss,
+                                    query,
+                                    selected: false,
+                                    now: now(),
+                                    list: "test",
+                                    icon: None,
+                                    icon_bg: None,
+                                },
+                            );
+                        });
+                    },
+                )
+                .shapes;
+        }
+        let mut texts = Vec::new();
+        fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.job.text.clone()),
+                _ => {}
+            }
+        }
+        out.iter().for_each(|cs| walk(&cs.shape, &mut texts));
+        texts
     }
 
     /// 三盏灯各自有一句**互不相同**的说明。

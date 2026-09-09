@@ -137,18 +137,15 @@ pub(crate) fn row_bg(
 
 /// 会话是否命中搜索。空查询放行全部。名称 / 主机 / 标签三处都查,
 /// 大小写不敏感 —— 用户记得住的常是 IP 尾数或标签,不是当初起的名字。
+///
+/// F245:分词走 [`crate::search::matches_all`],**和项目列表同一份**。只改
+/// 项目侧的话,同一个词 `web 01` 在项目列表找得到 `web01`、在这里找不到;而
+/// 这两个列表共用下面的 [`paint_highlighted`]/[`super::highlight::segments`],
+/// 高亮还会跟着这一侧的匹配语义脱钩。
 pub(crate) fn matches(rec: &SessionRecord, query: &str) -> bool {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return true;
-    }
-    rec.identity.name.to_lowercase().contains(&q)
-        || rec.connection.host.to_lowercase().contains(&q)
-        || rec
-            .identity
-            .tags
-            .iter()
-            .any(|t| t.to_lowercase().contains(&q))
+    let mut fields = vec![rec.identity.name.as_str(), rec.connection.host.as_str()];
+    fields.extend(rec.identity.tags.iter().map(String::as_str));
+    crate::search::matches_all(query, &fields)
 }
 
 /// 手绘一行会话。不用 `selectable_label`:设计稿要「图标 + 名称 + user@host
@@ -1018,6 +1015,21 @@ mod tests {
         assert!(matches(&r, "2.10"), "主机子串应匹配");
         assert!(matches(&r, "mysql"), "标签匹配应大小写不敏感");
         assert!(!matches(&r, "staging"), "无关词不该匹配");
+    }
+
+    /// F245:会话侧和项目侧共用同一份分词。只改项目侧的话,同一个词
+    /// `prod 2.10` 在项目列表找得到、在这里找不到 —— 而这两个列表还共用
+    /// `paint_highlighted`/`highlight::segments`,高亮会跟着这一侧的匹配语义
+    /// 脱钩(染不上色)。
+    ///
+    /// 自证会变红:把 `matches` 里的 `crate::search::matches_all` 换回
+    /// 「整串 `to_lowercase().contains()`」那一版。
+    #[test]
+    fn a_multi_word_query_may_spread_across_name_host_and_tags() {
+        let r = rec(1, "Prod-DB", "192.0.2.10", &["生产", "MySQL"]);
+        assert!(matches(&r, "prod 2.10"), "两个词分别落在名称和主机上");
+        assert!(matches(&r, "mysql 生产"), "两个词分别落在两个标签上");
+        assert!(!matches(&r, "prod staging"), "有一个词落空还放行了");
     }
 
     /// 复核坑:待确认删除的会话被搜索过滤掉后,`pending_delete` 必须清空。
