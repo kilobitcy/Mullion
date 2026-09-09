@@ -51,6 +51,10 @@ pub fn is_dirty(d: &TabPropsDraft, original_name: &str, color_override: Option<R
     d.name.trim() != original_name || to_rgb(d.color) != color_override
 }
 
+/// F239:窗口标题。`app.rs::dismiss_areas` 与这里的 `Window::new` 必须用
+/// 同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
+pub(crate) const WINDOW_TITLE: &str = "标签属性";
+
 /// 画标签属性弹窗。`draft` 是唯一的真值来源:`None` = 弹窗关着。
 /// 返回本帧用户按下的东西(保存 / 取消),`None` = 还在编辑。
 pub fn show(
@@ -61,7 +65,7 @@ pub fn show(
     let d = draft.as_mut()?;
     let mut action = None;
     let mut close = false;
-    egui::Window::new("标签属性")
+    egui::Window::new(WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
         .show(ctx, |ui| {

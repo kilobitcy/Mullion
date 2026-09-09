@@ -162,6 +162,10 @@ pub fn picks_changed(rows: &[ImportRow], picked0: &[bool]) -> bool {
     rows.len() != picked0.len() || rows.iter().zip(picked0).any(|(r, was)| r.selected != *was)
 }
 
+/// F239:窗口标题。`app.rs::dismiss_areas` 与这里的 `Window::new` 必须用
+/// 同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
+pub(crate) const WINDOW_TITLE: &str = "导入 ssh config";
+
 pub fn show(ctx: &egui::Context, t: &crate::theme::Theme, ui_state: &mut crate::ui::UiState) {
     use crate::ui::metrics::{SP_M, SP_S};
 
@@ -171,7 +175,7 @@ pub fn show(ctx: &egui::Context, t: &crate::theme::Theme, ui_state: &mut crate::
     let mut open = true;
     let mut confirm = false;
     let mut cancel = false;
-    let win = egui::Window::new("导入 ssh config")
+    let win = egui::Window::new(WINDOW_TITLE)
         .open(&mut open)
         .collapsible(false)
         .resizable(true)

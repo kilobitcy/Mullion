@@ -43,10 +43,14 @@ pub fn group_sessions<'a>(
     out
 }
 
+/// F239:窗口标题。`app.rs::dismiss_areas` 与这里的 `Window::new` 必须用
+/// 同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
+pub(crate) const WINDOW_TITLE: &str = "分组管理";
+
 /// 分组管理弹窗。只写意图,不碰 store。
 pub fn show(ctx: &egui::Context, ui_state: &mut crate::ui::UiState, groups: &[GroupRecord]) {
     let mut open = ui_state.group_manager_open;
-    egui::Window::new("分组管理")
+    egui::Window::new(WINDOW_TITLE)
         .open(&mut open)
         .resizable(false)
         .show(ctx, |ui| {

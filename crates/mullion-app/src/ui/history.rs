@@ -110,6 +110,10 @@ pub fn head_text(when: &str, tabs: usize, panes: usize) -> String {
     format!("{when} · {tabs} 个标签 · {panes} 块分屏")
 }
 
+/// F239:窗口标题。`app.rs::dismiss_areas` 与这里的 `Window::new` 必须用
+/// 同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
+pub(crate) const WINDOW_TITLE: &str = "恢复上次的现场";
+
 /// 画弹窗。返回 `Some` = 这一帧有结论(由 `app.rs` 负责把 `draft` 置 `None`)。
 ///
 /// `draft` 为 `None` = 弹窗关着,什么都不画。
@@ -128,7 +132,7 @@ pub fn show(
     // × 与底部的「不恢复」并存:后者是键盘路径的出口(Tab 够得到),
     // 前者是鼠标路径的直觉位置。删掉任一个都会让某一类用户找不到出口。
     let mut open = true;
-    egui::Window::new("恢复上次的现场")
+    egui::Window::new(WINDOW_TITLE)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)

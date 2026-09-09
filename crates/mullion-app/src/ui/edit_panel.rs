@@ -29,6 +29,10 @@ pub enum ExitChoice {
     Cancel,
 }
 
+/// F239:窗口标题。`app.rs::dismiss_areas` 与这里的 `Window::new` 必须用
+/// 同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
+pub(crate) const WINDOW_TITLE: &str = "还有改动没传回远端";
+
 /// F53/D3-12:有「改了没传上去」的编辑时,第一次点关闭要拦一下。
 ///
 /// **必须逐条列出是哪些文件**。只说「还有未保存的编辑」的话,用户没法判断
@@ -40,7 +44,7 @@ pub fn show_exit_confirm(
     edits: &EditSessions,
 ) -> Option<ExitChoice> {
     let mut choice = None;
-    egui::Window::new("还有改动没传回远端")
+    egui::Window::new(WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))

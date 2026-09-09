@@ -726,6 +726,12 @@ pub struct UiActions {
 /// 「在面板内」,宁可晚一帧交接,也不要在面板第一帧就把手势甩给 OS。
 /// 指针位置取不到时返回 `false`:指针都不知道在哪了,当然不在面板里,
 /// 这是旧「出了窗口」行为的超集。
+/// F239:「关于」弹窗的标题。`app.rs::dismiss_areas` 要用**同一个**常量算
+/// egui area id(`egui::Window::new(t)` 的 area id 恒为 `Id::new(t)`)——
+/// 各写一份字面串的话,标题以后一漂移,那个弹窗就永久点不外关掉,而且
+/// 编译和测试都不会报错。
+pub(crate) const ABOUT_WINDOW_TITLE: &str = "关于";
+
 fn pointer_inside_panel(ctx: &egui::Context, rect: Option<egui::Rect>) -> bool {
     let Some(rect) = rect else { return true };
     ctx.input(|i| i.pointer.latest_pos())
@@ -900,7 +906,7 @@ pub fn build_ui(
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
         let mut open = ui_state.about_open;
-        egui::Window::new("关于")
+        egui::Window::new(ABOUT_WINDOW_TITLE)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)

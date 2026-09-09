@@ -375,6 +375,12 @@ fn mode_bar(ui: &mut egui::Ui, ui_state: &mut UiState) -> egui::Rect {
 ///
 /// **能走到这里的凭据一定没人引用** —— 有引用者时按钮是真禁用的
 /// (`credential_editor::show`),这个框根本弹不出来。
+/// F239:两个二次确认窗各自的标题。`app.rs::dismiss_areas` 与对应的
+/// `Window::new` 必须用同一个常量算 egui area id,否则标题漂移后
+/// 「点外面关」会静默失效。
+pub(crate) const CREDENTIAL_DELETE_WINDOW_TITLE: &str = "删除凭据";
+pub(crate) const TUNNEL_DELETE_WINDOW_TITLE: &str = "删除隧道";
+
 fn credential_delete_confirm(
     ctx: &egui::Context,
     t: &Theme,
@@ -382,7 +388,7 @@ fn credential_delete_confirm(
     id: mullion_store::CredentialId,
     name: &str,
 ) {
-    egui::Window::new("删除凭据")
+    egui::Window::new(CREDENTIAL_DELETE_WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -407,7 +413,7 @@ fn tunnel_delete_confirm(
     id: mullion_store::TunnelId,
     title: &str,
 ) {
-    egui::Window::new("删除隧道")
+    egui::Window::new(TUNNEL_DELETE_WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))

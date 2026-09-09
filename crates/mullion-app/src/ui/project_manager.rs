@@ -86,6 +86,12 @@ pub fn node_verdict(
     mullion_store::can_join(&existing, &host_key_of(candidate), table)
 }
 
+/// F239:三个窗口各自的标题。`app.rs::dismiss_areas` 与对应的 `Window::new`
+/// 必须用同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
+pub(crate) const WINDOW_TITLE: &str = "项目管理";
+pub(crate) const TAKEOVER_WINDOW_TITLE: &str = "项目已在别处打开";
+pub(crate) const OPEN_CONFIRM_WINDOW_TITLE: &str = "打开项目前先确认";
+
 /// 项目管理弹窗。只写意图,不碰 store。
 ///
 /// `table` 是 `known_hosts` 指纹表(F222)。`None` = 拿不到 —— 此时所有节点
@@ -127,7 +133,7 @@ pub fn show(
     let mut pick_icon_clicked = false;
     // 宽度从 720 提到 840:左栏从 192 加宽到 `LIST_W`(300),不提的话右栏会
     // 从 442 缩到 334,F237 那个三行「说明」框跟着变窄。
-    egui::Window::new("项目管理")
+    egui::Window::new(WINDOW_TITLE)
         .open(&mut open)
         .default_width(840.0)
         .show(ctx, |ui| {
@@ -700,7 +706,7 @@ pub fn show_takeover_confirm(
 ) -> Option<bool> {
     use crate::ui::metrics::{SP_M, SP_S};
     let mut out = None;
-    egui::Window::new("项目已在别处打开")
+    egui::Window::new(TAKEOVER_WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -746,7 +752,7 @@ pub fn show_open_confirm(
 ) -> Option<bool> {
     use crate::ui::metrics::{SP_M, SP_S};
     let mut out = None;
-    egui::Window::new("打开项目前先确认")
+    egui::Window::new(OPEN_CONFIRM_WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))

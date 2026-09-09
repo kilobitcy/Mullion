@@ -2577,35 +2577,52 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
         | Modal::FilesRename
         | Modal::FilesNewName
         | Modal::Paste => None,
-        Modal::About => ui.about_open.then(|| vec![w("关于")]),
-        Modal::Settings => ui.settings_open.then(|| vec![w("设置")]),
-        Modal::History => ui.history.is_some().then(|| vec![w("恢复上次的现场")]),
+        Modal::About => ui.about_open.then(|| vec![w(crate::ui::ABOUT_WINDOW_TITLE)]),
+        Modal::Settings => ui
+            .settings_open
+            .then(|| vec![w(crate::ui::settings::WINDOW_TITLE)]),
+        Modal::History => ui
+            .history
+            .is_some()
+            .then(|| vec![w(crate::ui::history::WINDOW_TITLE)]),
         // 主窗 + 它自己另开的两个二次确认窗(删凭据/删隧道)——三者共属
         // 这一个弹窗,任何一个被点在外面都不该误判成「点在会话管理器外面」。
         Modal::SessionManager => ui.session_manager_open.then(|| {
             vec![
                 w(crate::ui::session_manager::WINDOW_TITLE),
-                w("删除凭据"),
-                w("删除隧道"),
+                w(crate::ui::session_manager::CREDENTIAL_DELETE_WINDOW_TITLE),
+                w(crate::ui::session_manager::TUNNEL_DELETE_WINDOW_TITLE),
             ]
         }),
-        Modal::GroupManager => ui.group_manager_open.then(|| vec![w("分组管理")]),
-        Modal::ProjectManager => ui.project_manager_open.then(|| vec![w("项目管理")]),
+        Modal::GroupManager => ui
+            .group_manager_open
+            .then(|| vec![w(crate::ui::group_manager::WINDOW_TITLE)]),
+        Modal::ProjectManager => ui
+            .project_manager_open
+            .then(|| vec![w(crate::ui::project_manager::WINDOW_TITLE)]),
         Modal::ProjectOpenConfirm => ui
             .project_open_confirm
             .is_some()
-            .then(|| vec![w("打开项目前先确认")]),
+            .then(|| vec![w(crate::ui::project_manager::OPEN_CONFIRM_WINDOW_TITLE)]),
         Modal::ProjectTakeoverConfirm => ui
             .project_takeover
             .is_some()
-            .then(|| vec![w("项目已在别处打开")]),
-        Modal::Import => ui.import.is_some().then(|| vec![w("导入 ssh config")]),
+            .then(|| vec![w(crate::ui::project_manager::TAKEOVER_WINDOW_TITLE)]),
+        Modal::Import => ui
+            .import
+            .is_some()
+            .then(|| vec![w(crate::ui::import_dialog::WINDOW_TITLE)]),
         Modal::FilesDialog => ui
             .files_dialog
             .as_ref()
             .map(|d| vec![w(crate::ui::files_dialog::title_of(d))]),
-        Modal::TabProps => ui.tab_props.is_some().then(|| vec![w("标签属性")]),
-        Modal::ExitConfirm => ui.exit_pending.then(|| vec![w("还有改动没传回远端")]),
+        Modal::TabProps => ui
+            .tab_props
+            .is_some()
+            .then(|| vec![w(crate::ui::tab_props::WINDOW_TITLE)]),
+        Modal::ExitConfirm => ui
+            .exit_pending
+            .then(|| vec![w(crate::ui::edit_panel::WINDOW_TITLE)]),
         Modal::Rehost => ui
             .rehost
             .as_ref()

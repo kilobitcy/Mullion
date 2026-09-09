@@ -138,6 +138,10 @@ pub enum SettingsOut {
     ExportLog,
 }
 
+/// F239:窗口标题。`app.rs::dismiss_areas` 与这里的 `Window::new` 必须用
+/// 同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
+pub(crate) const WINDOW_TITLE: &str = "设置";
+
 /// 画设置弹窗。返回这一帧的结论。
 pub fn show(
     ctx: &egui::Context,
@@ -146,7 +150,7 @@ pub fn show(
     env: SettingsEnv<'_>,
 ) -> SettingsOut {
     let mut out = SettingsOut::None;
-    egui::Window::new("设置")
+    egui::Window::new(WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
