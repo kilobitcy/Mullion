@@ -16828,6 +16828,69 @@ mod tests {
         assert!(opt_buf_dirty(None, Some(&1_i32), |_, _| false));
     }
 
+    /// F239:`dismiss(Modal::Settings)` 必须走 `SettingsOut::Cancel`,不能
+    /// 只把 `settings_open` 置 `false`。
+    ///
+    /// 复核实测过:改成裸 `self.ui.settings_open = false;`,
+    /// `cargo test --workspace` 全绿不变红 —— 设置弹窗是实时预览的,草稿
+    /// 一生效就已经写进 `self.settings`,不走 `Cancel` 的话
+    /// `settings_backup` 不会被倒回去,预览过的字体/日志档就永久留下了。
+    ///
+    /// 自证会变红:把这条分支换成
+    /// `Modal::Settings => self.ui.settings_open = false,`。
+    #[test]
+    fn dismiss_settings_goes_through_the_cancel_exit_not_a_bare_flag() {
+        let body = body_of(prod_src(), "fn dismiss(");
+        assert!(
+            body.contains(
+                "Modal::Settings => self.apply_settings_action(crate::ui::settings::SettingsOut::Cancel),"
+            ),
+            "dismiss(Settings) 没有走 SettingsOut::Cancel —— settings_backup 不会被倒回去"
+        );
+    }
+
+    /// F239:`dismiss(Modal::SessionManager)` 必须走
+    /// `close_session_manager()`,不能只把 `session_manager_open` 置
+    /// `false`。
+    ///
+    /// 复核实测过同上 —— 裸置 false 会漏清 `probe_form` 里那份明文凭据
+    /// 副本、在途拨测与 `pending_delete`,`cargo test --workspace` 依旧
+    /// 全绿。
+    ///
+    /// 自证会变红:把这条分支换成
+    /// `Modal::SessionManager => self.ui.session_manager_open = false,`。
+    #[test]
+    fn dismiss_session_manager_goes_through_close_session_manager_not_a_bare_flag() {
+        let body = body_of(prod_src(), "fn dismiss(");
+        assert!(
+            body.contains("Modal::SessionManager => self.ui.close_session_manager(),"),
+            "dismiss(SessionManager) 没有走 close_session_manager() —— \
+             probe_form 里的明文凭据副本不会被清掉"
+        );
+    }
+
+    /// F239:`dismiss(Modal::FilesDialog)` 必须先问过 `cancel_op` 再用
+    /// `apply_file_op` 施加处置,不能只把 `files_dialog` 清成 `None`。
+    ///
+    /// 复核实测过:改成只清 `None`,`cargo test --workspace` 全绿不变
+    /// 红 —— 有的框「取消」要撤掉一个已经发出去的意图(挂起的 job / 编辑
+    /// 冲突),光清引用不撤销的话那条意图永远卡在半当中。
+    ///
+    /// 自证会变红:把这条分支换成
+    /// `Modal::FilesDialog => self.ui.files_dialog = None,`。
+    #[test]
+    fn dismiss_files_dialog_applies_its_cancel_op_not_just_clearing_the_option() {
+        let arm = arm_of(prod_src(), "Modal::FilesDialog");
+        assert!(
+            arm.contains("crate::ui::files_dialog::cancel_op(d)"),
+            "dismiss(FilesDialog) 没有问过 cancel_op —— 某些框的取消处置被跳过了"
+        );
+        assert!(
+            arm.contains("self.apply_file_op(gen, op)"),
+            "dismiss(FilesDialog) 没有施加 cancel_op 给出的处置 —— 挂起的意图不会被撤销"
+        );
+    }
+
     /// **接线守护 / F148**:恢复列表弹窗必须算模态(T8)。
     ///
     /// 不算的话,它开着的时候 `Ctrl+W` 仍能关掉背后的标签、方向键仍被判给
