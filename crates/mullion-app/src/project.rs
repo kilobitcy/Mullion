@@ -306,6 +306,47 @@ pub fn takeover_needed(clients: Option<usize>) -> Option<usize> {
     clients.filter(|n| *n > 0)
 }
 
+/// F240:把一块 pane 眼下的现场收成一份**新项目草稿**。
+///
+/// `None` = 推不出来(cwd 没有可用的最后一级),调用方该出一条 toast 说
+/// 原因,而不是弹一个填了一半的表单。
+///
+/// **不落盘、不改名、不校验**:草稿原样交给项目管理器右栏,撞名由
+/// `validate_project` 当场报出来。自动改名的话用户多半不会注意到,过两天
+/// 库里多出一个莫名其妙的项目。
+///
+/// `id`/`created_at` 由调用方(拿得到 store 与时钟的那一层)填。
+pub fn prefill_from_pane(
+    cwd: &str,
+    tmux: Option<&str>,
+    node: mullion_store::SessionId,
+    // 有意保留、有意不用:它把「撞名不自作主张改名」这条决策钉在签名上,
+    // 有人想在这里加自动改名逻辑时会先看见这个参数,被迫想一想为什么它
+    // 现在没被用上。
+    _existing: &[mullion_store::ProjectRecord],
+) -> Option<mullion_store::ProjectRecord> {
+    // dir 取完整 cwd:它同时是终端 work_dir 和文件面板落脚点,截短了
+    // 打开项目会落到别处。name 取最后一级:那才是人认得出来的那个词。
+    let dir = cwd.trim_end_matches('/');
+    let name = dir.rsplit('/').next().filter(|s| !s.is_empty())?;
+    Some(mullion_store::ProjectRecord {
+        id: mullion_store::ProjectId(0),
+        name: name.to_string(),
+        note: String::new(),
+        nodes: vec![node],
+        preferred: Some(node),
+        dir: cwd.to_string(),
+        // 该 pane **当前上报的**那个 tmux 名。不在 tmux 里就留空
+        // (= 由项目名推导,见 `project_tmux_name`)——推一个新名字出来的话,
+        // 下次打开会 attach 到一个空会话,而用户眼前跑着的那个还在原地,
+        // 完全静默。
+        tmux_name: tmux.map(str::to_string),
+        created_at: String::new(),
+        last_accessed_at: None,
+        icon: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,5 +952,87 @@ mod tests {
             None,
             "没有节点就没有底色可回落"
         );
+    }
+
+    // ---- F240 prefill_from_pane ------------------------------------------
+
+    /// `dir` 取完整路径,`name` 取最后一级 —— `dir` 同时是终端 `work_dir`
+    /// 和文件面板落脚点,截短了打开项目会落到别处;最后一级才是人认得出来
+    /// 的那个词。
+    #[test]
+    fn a_draft_from_a_pane_takes_the_full_path_as_dir_and_the_leaf_as_name() {
+        let d = prefill_from_pane(
+            "/srv/api/web",
+            Some("claude-web"),
+            mullion_store::SessionId(7),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(d.dir, "/srv/api/web");
+        assert_eq!(d.name, "web");
+        assert_eq!(d.nodes, vec![mullion_store::SessionId(7)]);
+        assert_eq!(d.preferred, Some(mullion_store::SessionId(7)));
+    }
+
+    /// 草稿的 `tmux_name` 必须是这块 pane **当前上报的**那个,不能凭项目名
+    /// 重新推导 —— 推一个新名字出来,下次打开会 attach 到一个**空会话**,
+    /// 而用户眼前跑着的那个还在原地,完全静默。
+    ///
+    /// 自证会变红:把 `tmux_name` 那一支改成 `None`。
+    #[test]
+    fn the_draft_keeps_the_tmux_session_the_pane_is_actually_in() {
+        let d = prefill_from_pane(
+            "/srv/api",
+            Some("claude-api"),
+            mullion_store::SessionId(1),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(d.tmux_name.as_deref(), Some("claude-api"));
+    }
+
+    /// 不在 tmux 里的 pane,`tmux_name` 留空(= 由项目名推导)。编一个名字
+    /// 出来的话,那个名字跟眼前这个 shell 没有任何关系。
+    #[test]
+    fn a_pane_outside_tmux_leaves_the_tmux_name_unset() {
+        let d = prefill_from_pane("/srv/api", None, mullion_store::SessionId(1), &[]).unwrap();
+        assert_eq!(d.tmux_name, None);
+    }
+
+    /// 撞名不自作主张改名,原样填,交给右栏的 `validate_project` 当场说清楚
+    /// (「跟『接口』重名」)。自动改成「web 2」的话用户多半不会注意到,
+    /// 过两天库里多出一个莫名其妙的项目。
+    ///
+    /// 自证会变红:让 `prefill_from_pane` 在撞名时调 `fresh_project_name`。
+    #[test]
+    fn a_name_clash_is_left_for_the_form_to_complain_about() {
+        let existing = mullion_store::ProjectRecord {
+            id: mullion_store::ProjectId(1),
+            name: "web".into(),
+            note: String::new(),
+            nodes: Vec::new(),
+            preferred: None,
+            dir: "/elsewhere".into(),
+            tmux_name: None,
+            created_at: "t".into(),
+            last_accessed_at: None,
+            icon: None,
+        };
+        let d = prefill_from_pane(
+            "/srv/api/web",
+            None,
+            mullion_store::SessionId(7),
+            &[existing],
+        )
+        .unwrap();
+        assert_eq!(d.name, "web");
+    }
+
+    /// 根目录 / 空字符串没有可用的最后一级,推不出项目名 —— 调用方该出
+    /// 一条 toast 说原因,而不是弹一个填了一半的表单。
+    #[test]
+    fn a_root_directory_has_no_leaf_to_name_the_project_after() {
+        assert!(prefill_from_pane("/", None, mullion_store::SessionId(1), &[]).is_none());
+        assert!(prefill_from_pane("", None, mullion_store::SessionId(1), &[]).is_none());
     }
 }
