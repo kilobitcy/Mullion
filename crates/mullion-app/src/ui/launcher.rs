@@ -24,6 +24,7 @@ pub fn show(
     projects: &[ProjectRecord],
     lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
     sessions: &[SessionRecord],
+    appearance: &crate::ui::badge::AppearanceCache,
 ) {
     use crate::ui::metrics::{field_w, FIELD_W_M, SP_L, SP_M, SP_S};
     // 「现在几点」一帧取一次,不是每行取一次(同 `project_manager::show`)。
@@ -103,6 +104,12 @@ pub fn show(
                                 selected: false,
                                 now,
                                 list: "launcher",
+                                icon: crate::project::icon_for(p, appearance),
+                                icon_bg: crate::project::icon_bg(
+                                    p,
+                                    appearance,
+                                    mullion_store::ColorTarget::ListItem,
+                                ),
                             },
                         );
                         if r.clicked() {
@@ -251,7 +258,15 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(base(), |ctx| {
-                    show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions);
+                    show(
+                        ctx,
+                        &t,
+                        &mut ui_state,
+                        &ps,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
                 })
                 .shapes;
         }
@@ -270,7 +285,15 @@ mod tests {
             });
         }
         let _ = ctx.run(input, |ctx| {
-            show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions);
+            show(
+                ctx,
+                &t,
+                &mut ui_state,
+                &ps,
+                &lamps,
+                &sessions,
+                &crate::ui::badge::AppearanceCache::default(),
+            );
         });
         ui_state.project_open_request
     }
@@ -360,7 +383,15 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
-                    show(ctx, &t, &mut ui_state, projects, &lamps, &sessions);
+                    show(
+                        ctx,
+                        &t,
+                        &mut ui_state,
+                        projects,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
                 })
                 .shapes;
         }

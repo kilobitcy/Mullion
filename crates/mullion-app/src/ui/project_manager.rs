@@ -90,6 +90,7 @@ pub fn node_verdict(
 ///
 /// `table` 是 `known_hosts` 指纹表(F222)。`None` = 拿不到 —— 此时所有节点
 /// 一律标「待核」,**不会**因为拿不到证据就放行成「已核实同机」。
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     t: &crate::theme::Theme,
@@ -97,6 +98,7 @@ pub fn show(
     projects: &[ProjectRecord],
     lamps: &std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
     sessions: &[SessionRecord],
+    appearance: &crate::ui::badge::AppearanceCache,
     table: Option<&mullion_store::known_hosts::KnownHostsFile>,
 ) {
     let mut open = ui_state.project_manager_open;
@@ -138,7 +140,7 @@ pub fn show(
             let room = ctx.screen_rect().bottom() - ui.cursor().top() - crate::ui::metrics::SP_M;
             ui.set_max_height(room.max(160.0));
             ui.horizontal_top(|ui| {
-                list_column(ui, t, ui_state, projects, lamps, sessions, now);
+                list_column(ui, t, ui_state, projects, lamps, sessions, now, appearance);
                 ui.separator();
                 ui.vertical(|ui| {
                     form_column(ui, t, ui_state, projects, sessions, table, focus_name);
@@ -162,6 +164,7 @@ pub fn show(
 ///
 /// 宽度从原来的 `FIELD_W_S * 2`(192)提到 `LIST_W`(300):行里现在有副标题和
 /// 右对齐的时间列,192 装不下,长项目名会被截成一两个字。
+#[allow(clippy::too_many_arguments)]
 fn list_column(
     ui: &mut egui::Ui,
     t: &crate::theme::Theme,
@@ -170,6 +173,7 @@ fn list_column(
     lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
     sessions: &[SessionRecord],
     now: time::OffsetDateTime,
+    appearance: &crate::ui::badge::AppearanceCache,
 ) {
     use crate::ui::metrics::{field_w, FIELD_W_L, SP_S};
     ui.vertical(|ui| {
@@ -239,6 +243,12 @@ fn list_column(
                             selected: ui_state.project_selected == Some(p.id),
                             now,
                             list: "manager",
+                            icon: crate::project::icon_for(p, appearance),
+                            icon_bg: crate::project::icon_bg(
+                                p,
+                                appearance,
+                                mullion_store::ColorTarget::ListItem,
+                            ),
                         },
                     );
                     if r.clicked() {
@@ -856,7 +866,16 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
-                    show(ctx, &t, &mut ui_state, projects, &lamps, &sessions, None);
+                    show(
+                        ctx,
+                        &t,
+                        &mut ui_state,
+                        projects,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                        None,
+                    );
                 })
                 .shapes;
         }
@@ -927,7 +946,16 @@ mod tests {
         let sessions: Vec<SessionRecord> = Vec::new();
         let draw = |input: egui::RawInput, ui_state: &mut crate::ui::UiState| {
             let _ = ctx.run(input, |ctx| {
-                show(ctx, &t, ui_state, projects, &lamps, &sessions, None);
+                show(
+                    ctx,
+                    &t,
+                    ui_state,
+                    projects,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
             });
         };
         for _ in 0..2 {
@@ -1006,7 +1034,16 @@ mod tests {
         let sessions: Vec<SessionRecord> = Vec::new();
         for _ in 0..2 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &ps,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
             });
         }
         assert!(
@@ -1058,7 +1095,16 @@ mod tests {
         let sessions: Vec<SessionRecord> = Vec::new();
         for _ in 0..2 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &ps,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
             });
         }
         ctx.read_response(note_field_id())
@@ -1144,7 +1190,16 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(input(), |ctx| {
-                    show(ctx, &t, &mut ui_state, &ps, &lamps, &sessions, None);
+                    show(
+                        ctx,
+                        &t,
+                        &mut ui_state,
+                        &ps,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                        None,
+                    );
                 })
                 .shapes;
         }

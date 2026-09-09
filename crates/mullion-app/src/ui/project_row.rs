@@ -11,9 +11,9 @@
 //! 教训要求判定矩形罩住整行 —— 手绘天然是「先 `allocate_exact_size` 整行矩形,
 //! 再 `interact`」。
 //!
-//! **本批不留图标槽位**(F238 才加图标)。留着的话界面上会出现一列 32px 的空白,
-//! 而那时还没有任何图标功能 —— 正是项目一贯反对的「对用户没有可操作性的占位」。
-//! 代价:F238 会让行内坐标整体右移,本文件的落点测试要跟着改。
+//! F238:图标槽位已加上,画在灯之后、文字之前(见 `ICON_X`/`ICON_SIDE`)。
+//! 有图标就画、没有就空着 —— 槽位固定不收窄,理由同灯槽:有灯没灯的行文字
+//! 左边界必须对齐,不然搜索结果混排时名字会左右错开一截。
 
 use mullion_store::{ProjectId, ProjectRecord, SessionRecord};
 
@@ -27,9 +27,14 @@ pub const ROW_H: f32 = 48.0;
 
 /// 灯的槽位中心距行左边缘(逻辑点)。
 const LAMP_X: f32 = 14.0;
-/// 文字左边界 = 灯槽右沿 + 一点呼吸。**恒定**:灯是三态恒画的,有灯没灯的行
-/// 文字左边界必须对齐。
-const TEXT_X: f32 = 26.0;
+/// 图标槽左边缘距行左边缘。紧挨着灯槽右沿。
+const ICON_X: f32 = 24.0;
+/// 图标边长。走 F61 那套 32px 纹理档(`paint_icon` 按 `side <= 32` 选档),
+/// 比 32 略小一点是为了在 48 点行高里上下留出呼吸。
+const ICON_SIDE: f32 = 28.0;
+/// 文字左边界 = 图标槽右沿 + 一点呼吸。**恒定**:图标是「有就画、没有就
+/// 留空」的,有图标没图标的行文字左边界必须对齐(同灯槽那条理由)。
+const TEXT_X: f32 = ICON_X + ICON_SIDE + 6.0;
 /// 文字区距行右边缘的留白。
 const TEXT_RIGHT_PAD: f32 = 8.0;
 /// 名称行顶距行顶。
@@ -62,6 +67,12 @@ pub struct Row<'a> {
     /// **必须区分**:项目管理器是弹窗、启动页是 `CentralPanel`,同一个项目在
     /// 两处的行会算出同一个 egui id,交互互相打架。
     pub list: &'static str,
+    /// F238:这一行的图标。由调用方用 [`crate::project::icon_for`] 解析好
+    /// 传进来 —— 三处列表各解析一遍必然漂移。`None` = 项目没设、首选节点
+    /// 也没有,槽位留空但**不收窄**(文字左边界恒定)。
+    pub icon: Option<&'a mullion_store::IconSpec>,
+    /// 图标底色。走 [`crate::project::icon_bg`],同源回落首选节点的节点色。
+    pub icon_bg: Option<egui::Color32>,
 }
 
 /// 一行的副标题:`目录 · 节点名`。
@@ -193,6 +204,15 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
         egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), id.with("lamp"), |ui| {
             ui.label(tip);
         });
+    }
+
+    // 图标(F238)。**画在灯之后、文字之前**:槽位固定,有就画、没有就空着。
+    if let Some(icon) = row.icon {
+        let slot = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + ICON_X + ICON_SIDE / 2.0, rect.center().y),
+            egui::vec2(ICON_SIDE, ICON_SIDE),
+        );
+        crate::ui::badge::paint_icon(p, slot, icon, row.icon_bg);
     }
 
     let text_left = rect.left() + TEXT_X;
@@ -377,6 +397,8 @@ mod tests {
             selected: false,
             now: now(),
             list: "test",
+            icon: None,
+            icon_bg: None,
         };
         // 这一行**应该**占住的地方:光标位置 + 整条可用宽 + `ROW_H`。
         let mut slot = egui::Rect::NOTHING;
@@ -448,6 +470,8 @@ mod tests {
                                     selected: false,
                                     now: now(),
                                     list: "test",
+                                    icon: None,
+                                    icon_bg: None,
                                 },
                             );
                         });
@@ -501,5 +525,119 @@ mod tests {
         );
         let uniq: std::collections::BTreeSet<_> = tips.iter().collect();
         assert_eq!(uniq.len(), 3, "三态的说明重了:{tips:?}");
+    }
+
+    // ---- F238:图标 --------------------------------------------------------
+
+    /// F238:行上真的画出了那张图。
+    ///
+    /// 判据是「画面上出现了一张 `Shape::Mesh` 且纹理不是字体图集」,不是
+    /// 「调用了 `paint_icon`」—— 后者是读源码,换个函数名就恒绿。
+    ///
+    /// 自证会变红:把 `show` 里那段 `paint_icon` 删掉;或把 `ICON_SIDE`
+    /// 改成 `0.0`(矩形退化,`paint_icon` 走降级不画)。
+    #[test]
+    fn a_row_paints_the_icon_it_was_given() {
+        assert!(
+            has_image(&row_shapes(Some(&test_ico()))),
+            "给了图标却一张图都没画出来"
+        );
+        assert!(!has_image(&row_shapes(None)), "没给图标却凭空画了一张图");
+    }
+
+    /// 有图标没图标的行,**文字左边界必须一样** —— 两种行混在一列里,
+    /// 名字左右错开 30 点比缺一张图难看得多(同灯槽那条恒定判据)。
+    ///
+    /// 自证会变红:把 `show` 里的 `text_left` 改成
+    /// `rect.left() + if row.icon.is_some() { TEXT_X } else { LAMP_X + 12.0 }`。
+    #[test]
+    fn the_text_starts_at_the_same_x_whether_or_not_there_is_an_icon() {
+        let with = first_text_x(&row_shapes(Some(&test_ico())));
+        let without = first_text_x(&row_shapes(None));
+        assert_eq!(
+            with, without,
+            "有图标/没图标两种行的文字左边界不一样:{with:?} vs {without:?}"
+        );
+    }
+
+    fn test_ico() -> mullion_store::IconSpec {
+        // 一张真 ico:`paint_icon` 会先解码,解不开就整段不画,
+        // 拿假 base64 的话这条测试会因为「解码失败」而假红。
+        mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: crate::ui::ico::import(&crate::ui::ico::tests_support::solid_ico(
+                32,
+                [255, 0, 0, 255],
+            ))
+            .expect("测试用 ico 应能导入"),
+            bg: None,
+        }
+    }
+
+    /// 跑两帧,返回这一行画出来的全部 shape。
+    fn row_shapes(icon: Option<&mullion_store::IconSpec>) -> Vec<egui::epaint::ClippedShape> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let p = proj(3, "接口", "/srv/api", None);
+        let ss = vec![sess(7, "web01")];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SCREEN_W, 400.0));
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            out = ctx
+                .run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            show(
+                                ui,
+                                &t,
+                                &Row {
+                                    project: &p,
+                                    lamp: crate::project::Lamp::Unknown,
+                                    sessions: &ss,
+                                    query: "",
+                                    selected: false,
+                                    now: now(),
+                                    list: "test",
+                                    icon,
+                                    icon_bg: None,
+                                },
+                            );
+                        });
+                    },
+                )
+                .shapes;
+        }
+        out
+    }
+
+    fn has_image(shapes: &[egui::epaint::ClippedShape]) -> bool {
+        shapes.iter().any(|cs| contains_image(&cs.shape))
+    }
+
+    fn contains_image(s: &egui::Shape) -> bool {
+        match s {
+            egui::Shape::Vec(v) => v.iter().any(contains_image),
+            egui::Shape::Mesh(m) => m.texture_id != egui::TextureId::default(),
+            _ => false,
+        }
+    }
+
+    /// 这一行第一段文字的左边界 x。
+    fn first_text_x(shapes: &[egui::epaint::ClippedShape]) -> Option<u32> {
+        fn walk(s: &egui::Shape, out: &mut Vec<f32>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.pos.x),
+                _ => {}
+            }
+        }
+        let mut xs = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut xs));
+        // 时间列在最右,名称/副标题在左 —— 取最小的那个就是文字左边界。
+        xs.into_iter().map(|x| x.round() as u32).min()
     }
 }

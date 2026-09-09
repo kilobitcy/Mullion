@@ -80,6 +80,7 @@ pub fn show(
     projects: &[ProjectRecord],
     lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
     sessions: &[SessionRecord],
+    appearance: &crate::ui::badge::AppearanceCache,
     pane_rect: Option<egui::Rect>,
 ) -> Option<PickAction> {
     let d = draft.as_mut()?;
@@ -160,6 +161,12 @@ pub fn show(
                                         selected: false,
                                         now,
                                         list: "pick",
+                                        icon: crate::project::icon_for(p, appearance),
+                                        icon_bg: crate::project::icon_bg(
+                                            p,
+                                            appearance,
+                                            mullion_store::ColorTarget::ListItem,
+                                        ),
                                     },
                                 );
                                 if r.clicked() {
@@ -296,6 +303,7 @@ mod tests {
                             ps,
                             &lamps,
                             &sessions,
+                            &crate::ui::badge::AppearanceCache::default(),
                             Some(pane()),
                         );
                     },
@@ -440,7 +448,16 @@ mod tests {
                     ..base_input()
                 },
                 |ctx| {
-                    show(ctx, &MULLION_DARK, draft, ps, &lamps, &[], Some(pane()));
+                    show(
+                        ctx,
+                        &MULLION_DARK,
+                        draft,
+                        ps,
+                        &lamps,
+                        &[],
+                        &crate::ui::badge::AppearanceCache::default(),
+                        Some(pane()),
+                    );
                 },
             );
         }
@@ -482,7 +499,16 @@ mod tests {
                 ..base_input()
             },
             |ctx| {
-                out = show(ctx, &MULLION_DARK, draft, ps, &lamps, &[], Some(pane()));
+                out = show(
+                    ctx,
+                    &MULLION_DARK,
+                    draft,
+                    ps,
+                    &lamps,
+                    &[],
+                    &crate::ui::badge::AppearanceCache::default(),
+                    Some(pane()),
+                );
             },
         );
         out

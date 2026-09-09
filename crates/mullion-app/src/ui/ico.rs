@@ -242,21 +242,32 @@ fn resample(src: &Rgba, dst: u32) -> Rgba {
     Rgba { size: dn, px: out }
 }
 
+/// 只给同 crate 的测试用:造一张纯色的 `.ico` 原始字节。
+///
+/// 手写字节表的话,`ico` crate 一升版本就烂掉,而症状是别处的测试假红。
+#[cfg(test)]
+pub mod tests_support {
+    /// `side` 边长的纯色方图,打包成一个单帧 ico。
+    pub fn solid_ico(side: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let px: Vec<u8> = std::iter::repeat_n(rgba, (side * side) as usize)
+            .flatten()
+            .collect();
+        let img = ico::IconImage::from_rgba_data(side, side, px);
+        let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
+        dir.add_entry(ico::IconDirEntry::encode_as_png(&img).unwrap());
+        let mut out = Vec::new();
+        dir.write(&mut out).unwrap();
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// 造一个 `size` 边长的纯色 ico(单帧,PNG 编码)。
     fn solid_ico(size: u32, rgba: [u8; 4]) -> Vec<u8> {
-        let px: Vec<u8> = std::iter::repeat_n(rgba, (size * size) as usize)
-            .flatten()
-            .collect();
-        let img = ico::IconImage::from_rgba_data(size, size, px);
-        let mut dir = ico::IconDir::new(ico::ResourceType::Icon);
-        dir.add_entry(ico::IconDirEntry::encode_as_png(&img).unwrap());
-        let mut out = Vec::new();
-        dir.write(&mut out).unwrap();
-        out
+        tests_support::solid_ico(size, rgba)
     }
 
     /// 导入必须**永远**吐出 32 和 64 两帧,不管用户给的是多大的图 —— 列表的

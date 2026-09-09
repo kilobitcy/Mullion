@@ -945,6 +945,7 @@ pub fn build_ui(
             frame.projects,
             frame.project_lamps,
             frame.sessions,
+            frame.appearance,
             frame.known_hosts,
         );
     }
@@ -1026,6 +1027,7 @@ pub fn build_ui(
         frame.projects,
         frame.project_lamps,
         frame.sessions,
+        frame.appearance,
         pick_rect,
     );
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
@@ -1064,6 +1066,7 @@ pub fn build_ui(
             frame.projects,
             frame.project_lamps,
             frame.sessions,
+            frame.appearance,
         );
     }
     if let Some(files) = files_content {
