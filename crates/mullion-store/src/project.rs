@@ -32,6 +32,14 @@ pub struct ProjectRecord {
     /// `None` = 从未打开过。更新时机见 F224(**跃迁触发**,不是每批上报都写)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<String>,
+    /// F238:项目自设的图标。`None` = 回落首选节点的图标(解析在 app 侧的
+    /// `project::icon_for`,store 不认识 `SessionRecord` 的外观)。
+    ///
+    /// 复用会话侧同一个 `IconSpec` 而不是新开一个类型:导入归一化
+    /// (`ui::ico`)、渲染(`badge::paint_icon`)两条路径都只认它,新开类型
+    /// 等于把那两条路径各复制一遍。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<crate::model::IconSpec>,
 }
 
 /// 这个项目最终会 attach 的 tmux 会话名。
@@ -485,11 +493,39 @@ mod tests {
         assert!(f.project.is_empty());
     }
 
-    /// schema 必须升到 10:旧客户端读到 v10 会把整个 `[[project]]` 表当未知
-    /// 字段丢掉再写回 —— **用户的项目静默消失**。拒绝比装作能用好。
+    /// schema 必须升到 11:旧客户端读到 v11 会把 `[[project]].icon` 当未知
+    /// 字段丢掉再写回 —— **用户设的图标静默消失**。拒绝比装作能用好。
     #[test]
     fn the_schema_version_is_bumped_so_old_clients_refuse_instead_of_dropping_projects() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 10);
+        assert_eq!(crate::model::CURRENT_SCHEMA, 11);
+    }
+
+    /// F238:项目自设的图标要能原样往返。**跟着 `[[project]]` 存在一起**,
+    /// 不另开一张表 —— 图标是项目的一个属性,拆开存会让「删项目」多一处
+    /// 要记得清的地方,而漏清的症状是下一个拿到同一个 id 的项目莫名带上
+    /// 前任的图标。
+    ///
+    /// 自证会变红:把 `ProjectRecord.icon` 字段删掉(编译不过)或加上
+    /// `#[serde(skip)]`(读回来是 `None`)。
+    #[test]
+    fn a_project_icon_round_trips_through_toml() {
+        let mut p = super::tests::helpers::with_id(1, "web", None);
+        p.icon = Some(crate::model::IconSpec {
+            kind: crate::model::IconKind::Ico,
+            value: "AAAA".into(),
+            bg: None,
+        });
+        let s = toml::to_string_pretty(&p).expect("项目应能序列化");
+        let back: crate::project::ProjectRecord = toml::from_str(&s).expect("项目应能读回来");
+        assert_eq!(back.icon, p.icon, "图标没往返回来:{s}");
+    }
+
+    /// 没设图标的项目不该往 TOML 里写空键(同 `tmux_name`/`last_accessed_at`)。
+    #[test]
+    fn a_project_without_an_icon_writes_no_icon_key() {
+        let p = super::tests::helpers::with_id(1, "web", None);
+        let s = toml::to_string_pretty(&p).expect("项目应能序列化");
+        assert!(!s.contains("icon"), "没设图标不该写出 icon 键:{s}");
     }
 
     // ---- F223 打开项目 = 一次性覆盖 -------------------------------------
@@ -659,6 +695,7 @@ mod tests {
                 tmux_name: tmux.map(Into::into),
                 created_at: "2026-09-08T00:00:00Z".into(),
                 last_accessed_at: None,
+                icon: None,
             }
         }
     }

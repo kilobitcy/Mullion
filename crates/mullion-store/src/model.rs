@@ -231,7 +231,13 @@ pub struct AppearancePrefs {
 ///
 /// **号段归属**:F74(凭据实体)原定 v3→v4,被 F40~F44 先落地拿走了 4,再被本次
 /// 「私钥入库」拿走了 5(规则「谁先落地谁拿号」,见 `spec.md` F74)。
-pub const CURRENT_SCHEMA: u32 = 10;
+///
+/// v11 = v10 + `[[project]].icon`:项目可自设图标(F238)。
+///
+/// 同样**没有一行迁移转换代码**(旧文件没这个键 → `serde(default)` 补 `None`)。
+/// 升号的理由与 v10 一致:旧客户端读 v11 会把 `icon` 当未知字段丢掉再写回,
+/// **用户设的图标静默消失**。
+pub const CURRENT_SCHEMA: u32 = 11;
 
 fn schema_v1() -> u32 {
     1

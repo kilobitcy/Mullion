@@ -258,6 +258,7 @@ mod tests {
             tmux_name: None,
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: accessed.map(str::to_string),
+            icon: None,
         }
     }
 

@@ -289,6 +289,7 @@ mod tests {
             tmux_name: None,
             created_at: "t".into(),
             last_accessed_at: None,
+            icon: None,
         }
     }
 
@@ -446,6 +447,7 @@ mod tests {
             tmux_name: None,
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: None,
+            icon: None,
         }
     }
 
@@ -681,6 +683,7 @@ mod tests {
             tmux_name: None,
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: None,
+            icon: None,
         }
     }
 
