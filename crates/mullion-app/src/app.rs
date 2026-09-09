@@ -2506,6 +2506,117 @@ impl Modal {
     ];
 }
 
+/// F239:能「点外面关掉」的弹窗,**从上到下**排。
+///
+/// 与 `ui::build_ui` 的绘制顺序严格互逆(后画的盖在上面)。这张表决定
+/// 「一次点击关谁」,排错了的症状是点一下关掉了底下那个、上面那个还杵着。
+///
+/// **本 Task 只搭表 + 穷尽 match,不接线到 `window_event`**(留给下一个
+/// Task)——`#[allow(dead_code)]` 是过渡状态,接线之后即可去掉。
+#[allow(dead_code)]
+const DISMISS_ORDER: &[Modal] = &[
+    Modal::ExitConfirm,
+    Modal::ProjectPick,
+    Modal::Rehost,
+    Modal::TabProps,
+    Modal::FilesDialog,
+    Modal::Import,
+    Modal::ProjectTakeoverConfirm,
+    Modal::ProjectOpenConfirm,
+    Modal::ProjectManager,
+    Modal::GroupManager,
+    Modal::SessionManager,
+    Modal::History,
+    Modal::Settings,
+    Modal::About,
+];
+
+/// F239:**不**响应「点外面」的弹窗。每一条都有具体损失,不是「懒得接」。
+///
+/// - `Unlock`:关掉 = 回到无库状态,而用户没有别的路把它叫回来。
+/// - `HostKey`:TOFU 是一次必须**显式**回答的安全判断,不能被误点逃掉。
+/// - `Editor`:里面是还没传回远端的文件正文。
+/// - `FilesPathEdit`/`FilesRename`/`FilesNewName`:就地输入框,不是窗口,
+///   没有「外面」可言(它们的 area 就是文件面板本身)。
+/// - `Paste`:走 `egui::Modal` 自带的遮罩点击,在这里再接一遍等于同一个
+///   行为两条路。
+#[allow(dead_code)] // 过渡状态,见 `DISMISS_ORDER` 的说明
+const DISMISS_EXEMPT: &[Modal] = &[
+    Modal::Unlock,
+    Modal::HostKey,
+    Modal::Editor,
+    Modal::FilesPathEdit,
+    Modal::FilesRename,
+    Modal::FilesNewName,
+    Modal::Paste,
+];
+
+/// F239:这个弹窗这一帧占着哪些 egui area。`None` = 没开着,或豁免。
+///
+/// **返回一组而不是一个**:会话管理器会在自己上面另开「删除凭据」/
+/// 「删除隧道」两个独立的 `Order::Middle` 确认窗。只登记主窗的话,点那两个
+/// 确认框会先把底下的会话管理器关掉(判在按下那一刻),确认框**永远按不到**,
+/// 而且完全静默。
+///
+/// **穷尽 match**:新加一种弹窗时编译不过,作者必须表态。
+///
+/// **写成自由函数只收 `&UiState`**:本文件的测试从来构造不出一个 `App`
+/// (要窗口/GPU),挂成 `&self` 方法的话上面那条完备性闸门根本跑不起来。
+#[allow(dead_code)] // 过渡状态,见 `DISMISS_ORDER` 的说明
+fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
+    fn w(title: &str) -> egui::Id {
+        // `egui::Window::new(t)` 的 area id 恒为 `Id::new(t)`
+        // (egui-0.30.0/src/containers/window.rs:56)。
+        egui::Id::new(title)
+    }
+    match m {
+        Modal::Unlock
+        | Modal::HostKey
+        | Modal::Editor
+        | Modal::FilesPathEdit
+        | Modal::FilesRename
+        | Modal::FilesNewName
+        | Modal::Paste => None,
+        Modal::About => ui.about_open.then(|| vec![w("关于")]),
+        Modal::Settings => ui.settings_open.then(|| vec![w("设置")]),
+        Modal::History => ui.history.is_some().then(|| vec![w("恢复上次的现场")]),
+        // 主窗 + 它自己另开的两个二次确认窗(删凭据/删隧道)——三者共属
+        // 这一个弹窗,任何一个被点在外面都不该误判成「点在会话管理器外面」。
+        Modal::SessionManager => ui.session_manager_open.then(|| {
+            vec![
+                w(crate::ui::session_manager::WINDOW_TITLE),
+                w("删除凭据"),
+                w("删除隧道"),
+            ]
+        }),
+        Modal::GroupManager => ui.group_manager_open.then(|| vec![w("分组管理")]),
+        Modal::ProjectManager => ui.project_manager_open.then(|| vec![w("项目管理")]),
+        Modal::ProjectOpenConfirm => ui
+            .project_open_confirm
+            .is_some()
+            .then(|| vec![w("打开项目前先确认")]),
+        Modal::ProjectTakeoverConfirm => ui
+            .project_takeover
+            .is_some()
+            .then(|| vec![w("项目已在别处打开")]),
+        Modal::Import => ui.import.is_some().then(|| vec![w("导入 ssh config")]),
+        Modal::FilesDialog => ui
+            .files_dialog
+            .as_ref()
+            .map(|d| vec![w(crate::ui::files_dialog::title_of(d))]),
+        Modal::TabProps => ui.tab_props.is_some().then(|| vec![w("标签属性")]),
+        Modal::ExitConfirm => ui.exit_pending.then(|| vec![w("还有改动没传回远端")]),
+        Modal::Rehost => ui
+            .rehost
+            .as_ref()
+            .map(|d| vec![crate::ui::rehost::area_id(d.pane)]),
+        Modal::ProjectPick => ui
+            .project_pick
+            .as_ref()
+            .map(|d| vec![crate::ui::project_pick::area_id(d.pane)]),
+    }
+}
+
 /// F59:传输队列在跑时的界面刷新间隔(毫秒)。进度条 5Hz 已经够顺,
 /// 再密只是白烧 GPU —— 真实进度数据由 `TransferProgress` 事件实时更新,
 /// 这个值只决定「多久把它画出来一次」。
@@ -3700,6 +3811,122 @@ impl App {
             // F148:见 `Modal::History` 的说明(T8)。
             Modal::History => self.ui.history.is_some(),
         })
+    }
+
+    /// F239:这个弹窗有没有未保存的改动。
+    ///
+    /// 一律**快照比对**(草稿 vs 原记录),不打脏标记 —— F37 那条教训:
+    /// 手工标记必然漏一个赋值点,而漏了的症状是「改了却判不脏」,
+    /// 一次误点就把改动清了。改回原样不算脏,这是快照比对白送的。
+    ///
+    /// 换节点/切项目弹窗恒**不脏**:它们没有任何要保存的数据(只有一个
+    /// 搜索词,丢了零成本),点外面永远能关掉。未列出的其余变体同理恒 `false`。
+    ///
+    /// **本 Task 只搭判据,不接线到 `window_event`**(留给下一个 Task)——
+    /// `#[allow(dead_code)]` 是过渡状态,接线之后即可去掉。
+    #[allow(dead_code)]
+    fn dismiss_dirty(&self, m: Modal) -> bool {
+        match m {
+            Modal::SessionManager => {
+                match (self.ui.editor.as_ref(), self.ui.editor_baseline.as_ref()) {
+                    (Some(e), Some(b)) => crate::ui::session_manager::is_dirty(e, b),
+                    _ => false,
+                }
+            }
+            // 设置是实时预览的:草稿一旦生效就写进了 `self.settings`,
+            // 「打开那一刻的备份」才是原记录。
+            Modal::Settings => self
+                .settings_backup
+                .as_ref()
+                .is_some_and(|b| *b != self.settings),
+            Modal::ProjectManager => {
+                match (self.ui.project_draft.as_ref(), self.ui.project_selected) {
+                    (Some(d), Some(id)) => {
+                        let stored = self
+                            .store
+                            .as_ref()
+                            .map_or(&[][..], |s| s.projects())
+                            .iter()
+                            .find(|p| p.id == id);
+                        stored != Some(d)
+                    }
+                    _ => false,
+                }
+            }
+            // 分组管理器唯一的草稿就是那个「新建分组」输入框。
+            Modal::GroupManager => !self.ui.group_name_buf.trim().is_empty(),
+            Modal::TabProps => self.ui.tab_props.as_ref().is_some_and(|d| {
+                self.tabs
+                    .iter()
+                    .find(|t| t.id == d.tab_id)
+                    .is_some_and(|t| {
+                        crate::ui::tab_props::is_dirty(d, t.display_title(), t.color_override)
+                    })
+            }),
+            Modal::Import => {
+                self.ui.import.as_ref().is_some_and(|st| {
+                    crate::ui::import_dialog::picks_changed(&st.rows, &st.picked0)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// F239:把这个弹窗按它**既有的**「取消 / 不恢复 / 关闭」出口关掉。
+    ///
+    /// **不新增出口变体**:每一条都复用那个弹窗自己的取消路径,否则
+    /// 「点 × 关」和「点外面关」会变成两种语义,而差别只在某些状态没清。
+    ///
+    /// **本 Task 只搭出口,不接线到 `window_event`**(留给下一个 Task)——
+    /// `#[allow(dead_code)]` 是过渡状态,接线之后即可去掉。
+    #[allow(dead_code)]
+    fn dismiss(&mut self, m: Modal) {
+        match m {
+            Modal::About => self.ui.about_open = false,
+            // 走 `Cancel`:它要把 `settings_backup` 倒回去,只置 false
+            // 的话实时预览过的字体/日志档就永久留下了。
+            Modal::Settings => self.apply_settings_action(crate::ui::settings::SettingsOut::Cancel),
+            // 恢复列表弹窗没有专门的「不恢复」出口,`ui.history` 置 `None`
+            // 就是它唯一的取消路径(见 `history::show` 的调用处)。
+            Modal::History => self.ui.history = None,
+            // 必须走 `close_session_manager`:它顺带清 `pending_delete` /
+            // 在途拨测 / `probe_form` 里那份明文凭据副本。
+            Modal::SessionManager => self.ui.close_session_manager(),
+            Modal::GroupManager => self.ui.group_manager_open = false,
+            Modal::ProjectManager => self.ui.project_manager_open = false,
+            Modal::ProjectOpenConfirm => self.ui.project_open_confirm = None,
+            Modal::ProjectTakeoverConfirm => self.ui.project_takeover = None,
+            Modal::Import => self.ui.import = None,
+            // 文件写操作确认框的「取消」按框而异(`cancel_op`),不能只
+            // 清成 `None` —— 有的框取消时要撤掉一个已经发出去的意图
+            // (那条挂起的 job / 编辑冲突需要一个处置,否则永远卡住)。
+            // 拿不到 files owner generation 时(理论上不该发生,拿到这里说明
+            // `files_dialog` 是 `Some`,而它只能在文件面板可见时才会开)
+            // 就不施加处置,只关框 —— 宁可漏收一次口,不猜一个 generation
+            // (本项目吃过「无差别 abort 腰斩传输」的亏)。
+            Modal::FilesDialog => {
+                if let Some(d) = self.ui.files_dialog.as_ref() {
+                    if let Some(op) = crate::ui::files_dialog::cancel_op(d) {
+                        if let Some(gen) = self.files_owner_generation() {
+                            self.apply_file_op(gen, op);
+                        }
+                    }
+                }
+                self.ui.files_dialog = None;
+            }
+            Modal::TabProps => self.ui.tab_props = None,
+            Modal::ExitConfirm => self.ui.exit_pending = false,
+            Modal::Rehost => self.ui.rehost = None,
+            Modal::ProjectPick => self.ui.project_pick = None,
+            Modal::Unlock
+            | Modal::HostKey
+            | Modal::Editor
+            | Modal::FilesPathEdit
+            | Modal::FilesRename
+            | Modal::FilesNewName
+            | Modal::Paste => {}
+        }
+        mark_ui_dirty!(self.ui_dirty);
     }
 
     /// 活动标签本身是不是 `TabContent::Files`(D1 的标签宿主)。`files_owner_generation`
@@ -9884,10 +10111,13 @@ impl ApplicationHandler<UserEvent> for App {
                             let parsed = mullion_store::parse_ssh_config(&text);
                             let existing: &[mullion_store::SessionRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.list());
+                            let rows = crate::ui::import_dialog::build_rows(&parsed, existing);
+                            let picked0 = rows.iter().map(|r| r.selected).collect();
                             self.ui.import = Some(crate::ui::import_dialog::ImportState {
                                 path: p.display().to_string(),
-                                rows: crate::ui::import_dialog::build_rows(&parsed, existing),
+                                rows,
                                 skipped: crate::ui::import_dialog::skip_lines(&parsed),
+                                picked0,
                             });
                         }
                         // 读不出来就直接说,别开一个空弹窗让用户以为文件是空的。
@@ -14003,7 +14233,7 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         attach_check_verdict, auto_dial_summary, automation_for_leaf, autoscroll_for_pane,
         blink_on_at, blink_wake_at, clear_leaf_attach_intent, clip_still_matches_what_was_pasted,
-        credential_delete_error, decide_paste, download_job, drive_attach_checks_of,
+        credential_delete_error, decide_paste, dismiss_areas, download_job, drive_attach_checks_of,
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
         has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
@@ -14013,7 +14243,7 @@ mod tests {
         sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
         tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
         AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent,
+        TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -16412,6 +16642,68 @@ mod tests {
         for m in Modal::ALL {
             assert!(seen.insert(format!("{m:?}")), "Modal::ALL 里有重复项:{m:?}");
         }
+    }
+
+    /// F239:`DISMISS_ORDER` 必须恰好覆盖「非豁免」的每一个弹窗,一个不多
+    /// 一个不少。
+    ///
+    /// 这是本切片的**完备性闸门**。新加一种弹窗时,`dismiss_areas` 的
+    /// 穷尽 match 会逼作者表态(编译不过),但表了态之后忘了往
+    /// `DISMISS_ORDER` 里加一行,编译照样过 —— 症状是那个新弹窗点外面
+    /// 关不掉,而且完全静默。切片 I 的教训(「弹窗要同时进两张表」)
+    /// 这里是第三次踩。
+    ///
+    /// 自证会变红:从 `DISMISS_ORDER` 里删掉任意一行。
+    #[test]
+    fn every_dialog_is_either_in_the_dismiss_order_or_explicitly_exempt() {
+        let ui = crate::ui::UiState::default();
+        for m in Modal::ALL {
+            let in_order = DISMISS_ORDER.contains(m);
+            let is_exempt = DISMISS_EXEMPT.contains(m);
+            assert!(
+                in_order != is_exempt,
+                "{m:?} 既不在 DISMISS_ORDER 里也不在豁免表里(或两张表都进了)"
+            );
+        }
+        assert_eq!(
+            DISMISS_ORDER.len() + DISMISS_EXEMPT.len(),
+            Modal::ALL.len(),
+            "两张表加起来必须等于弹窗总数"
+        );
+        // 顺带钉住:豁免表里那几个,`dismiss_areas` 必须恒 `None` ——
+        // 它们的那一臂不读任何字段,所以拿一个默认 `UiState` 问就够。
+        for m in DISMISS_EXEMPT {
+            assert!(
+                dismiss_areas(&ui, *m).is_none(),
+                "{m:?} 在豁免表里,却报出了一个可判定的 area"
+            );
+        }
+    }
+
+    /// F239:豁免的是哪七类,写死在这里。
+    ///
+    /// **不是**「实现是什么就断言什么」——这七类各有各的理由,任何一个被
+    /// 顺手挪出豁免表都会造成真实损失:主密码框关掉 = 回到无库状态;
+    /// TOFU 框关掉 = 一次必须显式回答的安全判断被逃掉;编辑器关掉 =
+    /// 未回传的远端文件正文没了;三个就地输入框根本不是窗口,没有「外面」;
+    /// 粘贴确认框走 `egui::Modal` 自带的遮罩点击,不在这里重复接。
+    ///
+    /// 自证会变红:把任意一个变体从 `DISMISS_EXEMPT` 里挪走。
+    #[test]
+    fn the_exemptions_are_exactly_the_seven_that_would_lose_something() {
+        let want = [
+            Modal::Unlock,
+            Modal::HostKey,
+            Modal::Editor,
+            Modal::FilesPathEdit,
+            Modal::FilesRename,
+            Modal::FilesNewName,
+            Modal::Paste,
+        ];
+        for m in want {
+            assert!(DISMISS_EXEMPT.contains(&m), "{m:?} 应该豁免");
+        }
+        assert_eq!(DISMISS_EXEMPT.len(), want.len());
     }
 
     /// **接线守护 / F148**:恢复列表弹窗必须算模态(T8)。

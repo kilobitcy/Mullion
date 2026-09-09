@@ -229,7 +229,7 @@ fn window_chrome_reserve(ctx: &egui::Context) -> f32 {
 
 /// `egui::Window::new` 的标题文本。抽成常量是因为 `window_chrome_reserve` 要用
 /// **同一段文字**现算标题栏真实高度——标题变了这两处必须一起改,不能各写一份。
-const WINDOW_TITLE: &str = "会话管理器";
+pub(crate) const WINDOW_TITLE: &str = "会话管理器";
 
 /// 每个分组桶对应的 `CollapsingHeader` 构造。抽成独立函数**只为了能在测试里
 /// 直接调它**:`CollapsingHeader::new` 默认把标题文本本身当 id 源(见 egui 0.30

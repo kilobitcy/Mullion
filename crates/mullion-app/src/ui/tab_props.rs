@@ -30,6 +30,27 @@ pub enum TabPropsAction {
     Cancel,
 }
 
+/// `egui::Color32` → `Rgb`。抽成函数是因为它有**两处调用点**(`show` 里
+/// 保存时算一遍,F239 的 `is_dirty` 又要拿它跟已存的覆盖色比一遍)——
+/// 两份各写一遍的话,迟早有一处漂,症状是「颜色明明改了却判不脏」。
+fn to_rgb(c: Option<egui::Color32>) -> Option<Rgb> {
+    c.map(|c| Rgb::new(c.r(), c.g(), c.b()))
+}
+
+/// F239:草稿相对这个标签**当前**的两个字段脏不脏。
+///
+/// 走快照比对而不是手工打脏标记(F37 的教训):改了又改回来,不算脏。
+///
+/// **`original_name` 要传 `Tab::display_title()`,不是 `title_override`**:
+/// 弹窗打开那一刻,`TabPropsDraft::name` 就是拿 `display_title()` 填的
+/// (标签没配过名字时它等于 `Tab::title`,不是空串)。拿 `title_override`
+/// (`None` 时等于空串)去比的话,任何一个从没改过名字的标签一打开这个
+/// 弹窗就会被判成「脏」——纯 `is_dirty` 单测测不出来,只有跑一遍
+/// 「打开就没动、点外面」的完整场景才会现形。
+pub fn is_dirty(d: &TabPropsDraft, original_name: &str, color_override: Option<Rgb>) -> bool {
+    d.name.trim() != original_name || to_rgb(d.color) != color_override
+}
+
 /// 画标签属性弹窗。`draft` 是唯一的真值来源:`None` = 弹窗关着。
 /// 返回本帧用户按下的东西(保存 / 取消),`None` = 还在编辑。
 pub fn show(
@@ -73,7 +94,7 @@ pub fn show(
                     action = Some(TabPropsAction::Save {
                         tab_id: d.tab_id,
                         name: d.name.clone(),
-                        color: d.color.map(|c| Rgb::new(c.r(), c.g(), c.b())),
+                        color: to_rgb(d.color),
                     });
                     close = true;
                 }
@@ -87,4 +108,61 @@ pub fn show(
         *draft = None;
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(name: &str, color: Option<egui::Color32>) -> TabPropsDraft {
+        TabPropsDraft {
+            tab_id: TabId(0),
+            name: name.into(),
+            color,
+        }
+    }
+
+    /// 刚打开、什么都没动 —— 不脏。
+    #[test]
+    fn an_untouched_draft_is_not_dirty() {
+        let d = draft("生产", Some(egui::Color32::RED));
+        assert!(!is_dirty(&d, "生产", Some(Rgb::new(255, 0, 0))));
+    }
+
+    /// 改了名字 —— 脏。
+    #[test]
+    fn a_changed_name_is_dirty() {
+        let d = draft("测试", None);
+        assert!(is_dirty(&d, "生产", None));
+    }
+
+    /// 改了颜色 —— 脏。
+    #[test]
+    fn a_changed_color_is_dirty() {
+        let d = draft("生产", Some(egui::Color32::RED));
+        assert!(is_dirty(&d, "生产", None));
+    }
+
+    /// 改了又改回原样 —— 不脏。这是快照比对相对手工脏标记的全部价值:
+    /// 手工标记只会「碰过就标脏」,改回原样也摘不掉。
+    ///
+    /// 自证会变红:把 `to_rgb(d.color) != color_override` 改成恒 `false`。
+    #[test]
+    fn reverting_back_to_the_original_is_not_dirty() {
+        let mut d = draft("生产", Some(egui::Color32::RED));
+        d.name = "改一下".into();
+        d.color = Some(egui::Color32::BLUE);
+        assert!(is_dirty(&d, "生产", Some(Rgb::new(255, 0, 0))));
+        d.name = "生产".into();
+        d.color = Some(egui::Color32::RED);
+        assert!(!is_dirty(&d, "生产", Some(Rgb::new(255, 0, 0))));
+    }
+
+    /// 没配过名字的标签(`title_override` 是 `None`,草稿拿 `display_title()`
+    /// 填,等于 `Tab::title`)一打开这个弹窗,不该被当场判成脏。
+    #[test]
+    fn a_tab_that_never_had_a_name_override_opens_clean() {
+        let d = draft("会话A", None);
+        assert!(!is_dirty(&d, "会话A", None));
+    }
 }

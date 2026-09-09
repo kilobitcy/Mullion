@@ -24,7 +24,7 @@ fn cancel_id() -> egui::Id {
 }
 
 /// 弹窗那块 `Area` 的 id。按 pane 分:两块分屏各自开着的话不该互相抢位置。
-pub(super) fn area_id(pane: PaneId) -> egui::Id {
+pub(crate) fn area_id(pane: PaneId) -> egui::Id {
     egui::Id::new(("project_pick_area", pane.0))
 }
 

@@ -250,6 +250,21 @@ pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
     }
 }
 
+/// F239:当前开着的是哪个框 —— 它的窗口标题,也就是它的 egui area id。
+///
+/// **必须与 `show` 里传给 `modal()` 的那个字符串逐字一致**:两处漂了的话,
+/// 点外面永远关不掉这个框,而且完全静默。守护见
+/// `the_title_we_report_is_the_window_we_actually_draw`。
+pub fn title_of(d: &FilesDialog) -> &'static str {
+    match d {
+        FilesDialog::Delete { .. } => "删除",
+        FilesDialog::Chmod { .. } => "属性",
+        FilesDialog::EditConflict { .. } => "远端文件已被改动",
+        FilesDialog::Conflict { .. } => "文件已存在",
+        FilesDialog::PasteConflict { .. } => "目标目录里已有同名项",
+    }
+}
+
 /// 六个框共用的外壳。模态框的属性(不可折叠、不可缩放、居中、标题栏上有
 /// ✕)只写一处 —— 六份复制粘贴里总有一份会漏掉 `.collapsible(false)`。
 ///
@@ -1248,6 +1263,65 @@ mod tests {
                 "「{label}」送回的处置不对"
             );
             assert!(d.is_none(), "点完「{label}」框没关");
+        }
+    }
+
+    /// F239:五个变体各造一个。**逐个列出**而不是从 `Default` 推 ——
+    /// 漏一个的话 `the_title_we_report_is_the_window_we_actually_draw`
+    /// 就少罩一个框。
+    fn every_dialog_variant() -> Vec<FilesDialog> {
+        vec![
+            FilesDialog::Delete {
+                targets: vec![(rp("/srv/a"), false)],
+            },
+            FilesDialog::Chmod {
+                path: rp("/srv/a"),
+                mode: 0o644,
+            },
+            FilesDialog::EditConflict {
+                name: "/etc/nginx/nginx.conf".into(),
+                key: 9,
+            },
+            FilesDialog::Conflict {
+                name: "a.bin".into(),
+                job: 3,
+                apply_all: false,
+            },
+            FilesDialog::PasteConflict {
+                names: vec!["a.txt".into()],
+                mode_is_cut: false,
+                dst: rp("/dst"),
+                clip: sample_clip(),
+                seq: 1,
+                existing: sample_existing(),
+            },
+        ]
+    }
+
+    /// F239:`title_of` 报的标题必须真的是这一帧画出来的那个窗口的 id。
+    ///
+    /// 两处各写一遍标题字符串,漂了的话点外面永远关不掉那个框,**完全静默**
+    /// (`area_rect` 查不到就一律不判)。所以判据是「按 `title_of` 算出来的
+    /// area 这一帧确实存在」,不是「两个字符串常量相等」。
+    ///
+    /// 自证会变红:给 `title_of` 的任意一臂末尾加一个空格。
+    #[test]
+    fn the_title_we_report_is_the_window_we_actually_draw() {
+        for d in every_dialog_variant() {
+            let ctx = egui::Context::default();
+            let mut open = Some(d.clone());
+            let t = crate::theme::MULLION_DARK;
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    let _ = show(ctx, &t, &mut open);
+                });
+            }
+            let id = egui::Id::new(title_of(&d));
+            assert!(
+                ctx.memory(|m| m.area_rect(id)).is_some(),
+                "{d:?} 的标题报成了 {:?},但这一帧根本没有这个窗口",
+                title_of(&d)
+            );
         }
     }
 }

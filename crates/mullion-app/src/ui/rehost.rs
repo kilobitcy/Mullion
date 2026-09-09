@@ -26,7 +26,7 @@ fn row_id(id: SessionId) -> egui::Id {
 /// 弹窗那块 `Area` 的 id。`show` 与测试都从这里取(同 `pane_title::area_id`
 /// 的姿态)——`ctx.memory(|m| m.area_rect(id))` 是「它到底画在哪儿」唯一
 /// 能自动验的抓手。按 pane 分 id:两块分屏各自开着的话不该互相抢位置。
-pub(super) fn area_id(pane: PaneId) -> egui::Id {
+pub(crate) fn area_id(pane: PaneId) -> egui::Id {
     egui::Id::new(("rehost_area", pane.0))
 }
 

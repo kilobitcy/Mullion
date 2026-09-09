@@ -150,6 +150,16 @@ pub struct ImportState {
     /// `skip_lines` 的结果,解析时算一次存着(每帧重算等于每帧重新格式化
     /// 一批字符串)。
     pub skipped: Vec<String>,
+    /// F239:刚打开时每一行的勾选状态。用来判「用户动过没有」——
+    /// 走快照比对,不打脏标记(勾了又勾回来,不算脏)。
+    pub picked0: Vec<bool>,
+}
+
+/// F239:这批预览行相对刚打开那一刻的勾选状态,有没有被动过。
+///
+/// 走快照比对(`picked0`),不打脏标记 —— 勾了又勾回来,不算脏。
+pub fn picks_changed(rows: &[ImportRow], picked0: &[bool]) -> bool {
+    rows.len() != picked0.len() || rows.iter().zip(picked0).any(|(r, was)| r.selected != *was)
 }
 
 pub fn show(ctx: &egui::Context, t: &crate::theme::Theme, ui_state: &mut crate::ui::UiState) {
@@ -424,11 +434,13 @@ mod tests {
         const FRAMES: usize = 6;
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
+        let picked0 = rows.iter().map(|r| r.selected).collect();
         let mut ui_state = crate::ui::UiState {
             import: Some(ImportState {
                 path: "/home/u/.ssh/config".into(),
                 rows,
                 skipped: Vec::new(),
+                picked0,
             }),
             ..Default::default()
         };
@@ -565,5 +577,28 @@ Host b
                 .any(|t| t.contains("bastion") && t.contains("跳板会留空")),
             "批外跳板没在预览里说明:{texts:?}"
         );
+    }
+
+    /// F239:勾选状态相对刚打开那一刻(`picked0`)脏不脏,走快照比对 ——
+    /// 勾了又勾回来,不算脏。
+    ///
+    /// 自证会变红:把 `picks_changed` 的判据换成「本帧有没有点过任意
+    /// 复选框」这种手工脏标记。
+    #[test]
+    fn unchecking_and_rechecking_a_row_back_to_its_original_state_is_not_dirty() {
+        let rows = rows_of(
+            "Host a
+  User root
+",
+        );
+        let picked0: Vec<bool> = rows.iter().map(|r| r.selected).collect();
+        assert!(!picks_changed(&rows, &picked0), "刚打开就不该判脏");
+
+        let mut rows = rows;
+        rows[0].selected = !rows[0].selected;
+        assert!(picks_changed(&rows, &picked0), "勾选变了该判脏");
+
+        rows[0].selected = !rows[0].selected;
+        assert!(!picks_changed(&rows, &picked0), "勾回原样不该再判脏");
     }
 }
