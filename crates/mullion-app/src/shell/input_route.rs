@@ -168,6 +168,64 @@ pub fn route_focused(
     route(modal_open, egui_wants_keyboard, egui_wants_pointer, kind)
 }
 
+/// F246:**指针**事件的分流。键盘照旧走 [`route_focused`],两者在这里正式分家。
+///
+/// 与 [`route`] 的差别只有两条,每条都对应一个具体的坏掉的姿态:
+///
+/// **① 编辑器开着时不吃指针。** 内置编辑器是 `Modal::Editor`(它得算模态,
+/// 否则里面一个字都打不出来,T8),而 [`route`] 一见模态就把指针全判给 egui ——
+/// 于是「编辑远端文件」窗口一开,背后 pane 里的文字**一个字都划不动**。而用户
+/// 要往文件里写的内容,十有八九正是从那个 pane 里复制的。只放指针、不放键盘:
+/// 键盘仍然全归 egui,所以不会出现「以为在编辑文件、字却打进了远端 shell」。
+///
+/// 其余模态照旧全吃 —— 它们要么盖住整块屏(会话管理器),要么是必须显式回答的
+/// 安全判断(TOFU),让指针漏到背后的终端没有任何好处。
+///
+/// **② 划选中的指针被终端捕获。** 用户按住左键从 pane 里往外拖,指针会经过
+/// 编辑器窗口,那一瞬 `egui_wants_pointer` 变真 —— 不捕获的话选区当场冻住
+/// (`CursorMoved` 被 egui 收走,`update_selection_endpoint` 再也不被调),
+/// 而且松开那一下也判给 egui,`dragging` 与 F212 的 hold **永远还不回来**
+/// (T13:挂住之后这个 pane 的选区再也擦不掉)。捕获还顺带覆盖了「拖到一半
+/// 弹出个模态」这种情况,理由相同。
+///
+/// 捕获排在模态判断**之前**:反过来的话,拖拽中途冒出来的模态会截胡那一下
+/// `Released`,hold 照样挂死。
+pub fn pointer_route(
+    modal_open: bool,
+    editor_open: bool,
+    dragging: bool,
+    egui_wants_pointer: bool,
+) -> Route {
+    if dragging {
+        return Route::Terminal;
+    }
+    if modal_open && !editor_open {
+        return Route::Egui;
+    }
+    if egui_wants_pointer {
+        Route::Egui
+    } else {
+        Route::Terminal
+    }
+}
+
+/// F246:一次划选结束之后,该把 egui 的键盘焦点还给谁。`None` = 谁都不还。
+///
+/// 只在**编辑器开着**时还。用户点进 pane 划一段字,egui 会因为这一下点在
+/// 文本框外面而交出焦点 —— 复制完回头想按 `Ctrl+V`,得先再点一次编辑器,而
+/// 「点回去」本身可能又把刚划的选区弄没。还回去省掉这一步。
+///
+/// **编辑器没开就绝不还**:那等于凭空把键盘焦点塞给一个 egui 部件,
+/// `wants_keyboard_input()` 从此恒真,终端**永久**收不到任何键 —— T8 那条
+/// 「Tab 补全后键盘全废」的复发形态,只是触发源换成了鼠标。
+pub fn focus_to_restore<T>(editor_open: bool, saved: Option<T>) -> Option<T> {
+    if editor_open {
+        saved
+    } else {
+        None
+    }
+}
+
 /// [`egui_should_see`] 的带焦点版本。**T8 的注入点就是这个函数**——判给面板
 /// 的键在这里返回 `false`,于是它根本进不了 `egui_state.on_window_event`,
 /// egui 的焦点系统也就无从吞掉 Tab。
@@ -420,6 +478,77 @@ mod tests {
                 "{ev:?} 没喂给 egui —— egui 的状态会静默停在旧值"
             );
         }
+    }
+
+    /// F246:编辑器开着时,指针仍然落到终端 —— 否则背后 pane 里的文字
+    /// 一个字都划不动,而要往文件里写的内容多半正是从那儿复制的。
+    ///
+    /// 第一个参数给 `true`(编辑器确实是模态,T8 要求的)才是坏掉时的现场;
+    /// 给 `false` 的话实现写错了也能蒙对。
+    ///
+    /// 自证会变红:把 `pointer_route` 里的 `&& !editor_open` 删掉。
+    #[test]
+    fn an_open_editor_does_not_swallow_pointer_events_meant_for_the_pane() {
+        assert_eq!(
+            pointer_route(true, true, false, false),
+            Route::Terminal,
+            "编辑器开着就划不动 pane 了(F246)"
+        );
+        // 指针落在编辑器窗口自己身上时照旧归 egui。
+        assert_eq!(pointer_route(true, true, false, true), Route::Egui);
+    }
+
+    /// F246 的反面:**其余模态照旧全吃指针**。少了这一条,「编辑器豁免」
+    /// 写成「所有模态都豁免」也全绿 —— 而那意味着会话管理器开着时点一下
+    /// 背后的终端就开始划选,右键还会直接粘贴到远端。
+    ///
+    /// 自证会变红:把 `pointer_route` 里的 `if modal_open && !editor_open`
+    /// 整段删掉。
+    #[test]
+    fn every_other_modal_still_swallows_the_pointer() {
+        assert_eq!(pointer_route(true, false, false, false), Route::Egui);
+    }
+
+    /// F246/T13:按住左键划选期间,指针被终端**捕获**。拖过编辑器窗口时
+    /// `egui_wants_pointer` 会变真,不捕获的话选区当场冻住,而且松开那一下
+    /// 也判给 egui —— `dragging` 和 F212 的 hold 永远还不回来,这个 pane
+    /// 的选区从此再也擦不掉。
+    ///
+    /// 捕获必须压过模态:拖到一半冒出来的模态截胡 `Released` 是同一个死法。
+    ///
+    /// 自证会变红:把 `pointer_route` 开头的 `if dragging` 那段删掉。
+    #[test]
+    fn a_drag_in_progress_keeps_the_pointer_no_matter_who_wants_it() {
+        assert_eq!(pointer_route(false, true, true, true), Route::Terminal);
+        assert_eq!(
+            pointer_route(true, false, true, true),
+            Route::Terminal,
+            "拖拽中途冒出的模态截胡了 Released —— F212 的 hold 会挂死(T13)"
+        );
+    }
+
+    /// F246:没有任何模态时,指针分流与 [`route`] 逐字一致 —— 这条防的是
+    /// 「顺手把 `pointer_route` 写成恒返回 Terminal」,那样菜单和状态栏
+    /// 全都点不动。
+    #[test]
+    fn with_no_modal_the_pointer_still_follows_what_egui_wants() {
+        assert_eq!(pointer_route(false, false, false, true), Route::Egui);
+        assert_eq!(pointer_route(false, false, false, false), Route::Terminal);
+    }
+
+    /// F246/T8:划选结束后**只在编辑器开着时**把 egui 焦点还回去。
+    /// 编辑器没开还的话,等于凭空把键盘焦点塞给一个 egui 部件,
+    /// `wants_keyboard_input()` 从此恒真,终端永久收不到任何键。
+    ///
+    /// 自证会变红:把 `focus_to_restore` 的函数体改成 `saved`。
+    #[test]
+    fn focus_is_only_handed_back_while_the_editor_is_open() {
+        assert_eq!(focus_to_restore(true, Some(7)), Some(7));
+        assert_eq!(
+            focus_to_restore(false, Some(7)),
+            None,
+            "编辑器没开也还焦点 —— 终端会永久收不到键(T8)"
+        );
     }
 
     /// F129:断开的 pane 是标签里最后一块时,关掉整个标签。

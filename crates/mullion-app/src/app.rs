@@ -2180,6 +2180,13 @@ pub struct App {
     auto_dial: Option<AutoDial>,
     /// 左键是否按住(划选进行中)。松开即结束,不跨 focus 保留。
     dragging: bool,
+    /// F246:这次划选开始之前,egui 的键盘焦点在谁身上。
+    ///
+    /// 只在**编辑器开着**时记、也只在那时还(见
+    /// `shell::input_route::focus_to_restore`):点进 pane 划字会让编辑器的
+    /// 文本框交出焦点,复制完想按 `Ctrl+V` 还得再点一次,而那一下点回去
+    /// 又可能把刚划的选区弄没。
+    egui_focus_before_drag: Option<egui::Id>,
     /// 上一次左键按下的连击状态,喂 `input::click_kind` 判双击/三击。
     prev_click: Option<input::PrevClick>,
     /// 左键按下时的 0-based 锚点格与选区类型(F18)。松开时用来识别
@@ -2810,6 +2817,7 @@ impl App {
             pending_restore: None,
             auto_dial: None,
             dragging: false,
+            egui_focus_before_drag: None,
             prev_click: None,
             press_anchor: None,
             autoscroll: 0,
@@ -7514,7 +7522,38 @@ impl App {
             }
         }
         self.dragging = true;
+        // F246:记下这一下点击**之前**的 egui 焦点,松开时还回去。
+        //
+        // 这一下同样已经喂给过 egui 了(指针恒喂,T8),但 `on_window_event`
+        // 只把它攒进 raw input —— 焦点要等下一帧 `begin_pass` 才交出去,所以
+        // 此刻问到的仍是点击前的那个。换句话说这里读得早是**必需**的:
+        // 拖到松开时再问,拿到的已经是 `None`。
+        self.egui_focus_before_drag = shell::input_route::focus_to_restore(
+            self.edit.editor.is_some(),
+            self.active
+                .as_ref()
+                .and_then(|a| a.egui_ctx.memory(|m| m.focused())),
+        );
         self.request_ui_redraw();
+    }
+
+    /// F246:划选结束,把 egui 的键盘焦点还给划选开始前的那个部件。
+    ///
+    /// **无条件 `take()`**:记下的那个 id 只对这一次划选有效,留着的话下一次
+    /// 松开左键会把焦点甩给一个早就不存在的部件。取不取得回来都得清。
+    ///
+    /// 编辑器在拖拽中途被关掉的话就不还了 —— `focus_to_restore` 在这里再问
+    /// 一次(而不是只信按下那一刻的判断):还给一个已经消失的文本框,
+    /// `wants_keyboard_input()` 会恒真而终端永久收不到键(T8)。
+    fn restore_egui_focus_after_drag(&mut self) {
+        let saved = self.egui_focus_before_drag.take();
+        let editor_open = self.edit.editor.is_some();
+        let Some(id) = shell::input_route::focus_to_restore(editor_open, saved) else {
+            return;
+        };
+        if let Some(a) = self.active.as_ref() {
+            a.egui_ctx.memory_mut(|m| m.request_focus(id));
+        }
     }
 
     /// 松开「按住划选」态(F212)。**每一条让 `dragging` 落回 false 的路径都要调它**,
@@ -7562,6 +7601,7 @@ impl App {
         self.dragging = false;
         self.autoscroll = 0;
         self.release_selection_hold();
+        self.restore_egui_focus_after_drag();
         let anchor = self.press_anchor.take();
         if !was_dragging {
             return;
@@ -10924,6 +10964,9 @@ impl ApplicationHandler<UserEvent> for App {
         // 放进下面那个 `&mut self.active` 的作用域里借用检查过不去。
         let modal = self.modal_open();
         let focus = self.effective_focus();
+        // F246:指针分流多两个输入,同样得在借出 `self.active` 之前取好。
+        let editor_open = self.edit.editor.is_some();
+        let dragging = self.dragging;
         // Route::FilesPanel 判给面板的键记在这里,借用 `active` 的作用域结束
         // 之后再处理(`handle_panel_key` 要 `&mut self`,不能跟 `&mut self.active`
         // 同时活着)。
@@ -10992,13 +11035,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if is_ptr {
                     let wants_ptr = active.egui_ctx.wants_pointer_input();
+                    // F246:指针走 `pointer_route`,不再与键盘共用 `route` ——
+                    // 编辑器开着时指针要能落到背后的 pane 上,键盘不能。
                     if matches!(
-                        shell::input_route::route(
-                            modal,
-                            false,
-                            wants_ptr,
-                            shell::input_route::InputKind::Pointer,
-                        ),
+                        shell::input_route::pointer_route(modal, editor_open, dragging, wants_ptr),
                         shell::input_route::Route::Egui
                     ) {
                         return; // egui 已收下,不转终端
@@ -11082,6 +11122,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dragging = false;
                     self.autoscroll = 0;
                     self.release_selection_hold();
+                    // F246:这一路没有「松开」,记下的焦点也得跟着丢掉 ——
+                    // 留着的话下一次真的松开左键时,焦点会被甩给一个上一轮
+                    // 划选期间的部件。
+                    self.restore_egui_focus_after_drag();
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -17443,6 +17487,67 @@ mod tests {
         assert!(
             at < body.find("refresh_from_disk").expect("重读根本没调"),
             "闸门排在重读**后面**等于没有(F244)"
+        );
+    }
+
+    /// F246:指针分流必须走 `pointer_route`,而且真把「编辑器开着吗」和
+    /// 「正在划选吗」两个输入递进去。
+    ///
+    /// 这是纯接线,`input_route` 那几条行为测试够不着 —— 它们证明的是
+    /// 「这条规则算得对」,证明不了「有人按这条规则分流」。留着旧的
+    /// `route(modal, ..)` 一切照常编译、全套测试照绿,而编辑器一开
+    /// pane 里就一个字都划不动(用户实报的那条)。
+    ///
+    /// 先剥注释再断言:本文件的说明文字里就带着这几个名字。
+    ///
+    /// 自证会变红:把那句 `pointer_route(modal, editor_open, dragging, wants_ptr)`
+    /// 换回 `route(modal, false, wants_ptr, InputKind::Pointer)`。
+    #[test]
+    fn the_pointer_is_routed_by_the_rule_that_knows_about_the_editor() {
+        let prod = without_comments(prod_src());
+        let at = prod
+            .find("if is_ptr {")
+            .expect("找不到指针分流那一段 —— 这条测试的锚点失效了");
+        let arm = brace_balanced_arm(&prod[at + "if is_ptr ".len()..]);
+        assert!(
+            arm.contains("pointer_route("),
+            "指针还在跟键盘共用 route() —— 编辑器一开,pane 里一个字都划不动(F246)"
+        );
+        assert!(
+            arm.contains("editor_open"),
+            "指针分流没收「编辑器开着吗」—— F246 的豁免整个不存在"
+        );
+        assert!(
+            arm.contains("dragging"),
+            "指针分流没收「正在划选吗」—— 拖过编辑器窗口选区就冻住,松开那下也丢(T13)"
+        );
+    }
+
+    /// F246/T8:还焦点这一路必须经过 `focus_to_restore` 的闸门。
+    ///
+    /// 直接 `request_focus` 的话,编辑器没开时也会把键盘焦点凭空塞给一个
+    /// egui 部件 —— `wants_keyboard_input()` 从此恒真,终端**永久**收不到
+    /// 任何键(T8 的复发形态,触发源换成鼠标)。而且这一路没有自愈:
+    /// 用户只能重开 exe。
+    ///
+    /// 顺带钉住按下那一侧:不记的话整个功能静默不存在。
+    ///
+    /// 先剥注释再断言。
+    ///
+    /// 自证会变红:把 `restore_egui_focus_after_drag` 里的
+    /// `focus_to_restore(...)` 换成裸 `saved`。
+    #[test]
+    fn handing_the_focus_back_goes_through_the_gate_that_checks_the_editor() {
+        let prod = without_comments(prod_src());
+        let body = body_of(&prod, "fn restore_egui_focus_after_drag(&mut self) {");
+        assert!(
+            body.contains("focus_to_restore("),
+            "还焦点没过闸门 —— 编辑器没开也还的话,终端永久收不到键(T8)"
+        );
+        let press = body_of(&prod, "fn selection_press(&mut self) {");
+        assert!(
+            press.contains("egui_focus_before_drag"),
+            "按下没记住原先的 egui 焦点 —— F246 的「复制完直接 Ctrl+V」整个不存在"
         );
     }
 
