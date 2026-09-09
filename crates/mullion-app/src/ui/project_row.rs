@@ -621,7 +621,13 @@ mod tests {
     fn contains_image(s: &egui::Shape) -> bool {
         match s {
             egui::Shape::Vec(v) => v.iter().any(contains_image),
-            egui::Shape::Mesh(m) => m.texture_id != egui::TextureId::default(),
+            // 「有面积」这一半不是凑数:`paint_icon` 对退化矩形没有 early-return,
+            // 边长 0 的槽照样发出一个带真纹理的 `Mesh` —— 只判纹理的话,把
+            // `ICON_SIDE` 改成 0 这条变异杀不掉(实测过),而画面上一张图都看不见。
+            egui::Shape::Mesh(m) => {
+                let b = m.calc_bounds();
+                m.texture_id != egui::TextureId::default() && b.width() > 0.0 && b.height() > 0.0
+            }
             _ => false,
         }
     }
