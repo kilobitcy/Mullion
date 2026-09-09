@@ -1809,7 +1809,7 @@ has_passphrase = true
         );
         let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
         // 钉的是「迁移后写回的是**当前**版本」这个不变量,不是某个具体数字
-        // ——版本号本身由 `migrate::tests::current_schema_is_ten` 单独钉,
+        // ——版本号本身由 `migrate::tests::current_schema_is_eleven` 单独钉,
         // 两条各钉一件事,升版本时只需要改那一条。
         let want = format!("schema_version = {CURRENT_SCHEMA}");
         assert!(
