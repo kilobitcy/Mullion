@@ -590,9 +590,13 @@ pub(super) fn show(
                 let mut first = true;
                 super::fields::sftp(ui, t, buf, &mut first)
             }
-            super::TAB_APPEARANCE => {
-                super::fields::appearance(ui, t, buf, &mut ui_state.icon_error)
-            }
+            super::TAB_APPEARANCE => super::fields::appearance(
+                ui,
+                t,
+                buf,
+                &mut ui_state.icon_error,
+                ui_state.icon_target,
+            ),
             // `TAB_CONNECT` 与「越界值兜底」合并成同一个分支:`editor_tab`
             // 是既有的裸 usize 技术债,越界值落回首页比 panic 好。
             _ => super::fields::basic(

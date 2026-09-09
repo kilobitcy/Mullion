@@ -498,6 +498,7 @@ fn form_column(
                 t,
                 draft,
                 &mut ui_state.icon_error,
+                ui_state.icon_target,
                 pick_icon_clicked,
                 &mut first,
             );
@@ -581,6 +582,36 @@ fn form_column(
         });
 }
 
+/// F238:把选中的那份 `.ico` 正文装进项目草稿。返回错误文案(`None` = 成功)。
+///
+/// **只写草稿不落盘** —— 落盘是「保存」那颗按钮的事,在这里写等于绕开了
+/// `validate_project`。
+///
+/// 抽成自由函数是为了能单测:`app.rs` 里那条 `UserEvent` 分支在无窗口下
+/// 造不出来,内联的话这段「解码失败要不要动 icon」的判断没人看着。
+pub(crate) fn apply_picked_icon(
+    draft: &mut ProjectRecord,
+    path: &std::path::Path,
+    bytes: std::io::Result<Vec<u8>>,
+) -> Option<String> {
+    match bytes {
+        Err(e) => Some(format!("读不了 {}:{e}", path.display())),
+        Ok(bytes) => match crate::ui::ico::import(&bytes) {
+            Ok(value) => {
+                draft.icon = Some(mullion_store::IconSpec {
+                    kind: mullion_store::IconKind::Ico,
+                    value,
+                    bg: None,
+                });
+                None
+            }
+            // 解码失败绝不能碰 `draft.icon`:导入一张坏图不该把用户原来那张
+            // 好图抹掉。
+            Err(e) => Some(e.message()),
+        },
+    }
+}
+
 /// F238:项目图标。与会话编辑器的「外观」分节(`session_manager::fields::appearance`)
 /// 同构 —— 两处长得不一样的话,用户会以为项目的图标是另一种东西。
 ///
@@ -591,6 +622,7 @@ fn appearance_section(
     t: &crate::theme::Theme,
     draft: &mut ProjectRecord,
     icon_error: &mut Option<String>,
+    icon_target: crate::ui::IconTarget,
     pick_clicked: &mut bool,
     first: &mut bool,
 ) {
@@ -607,8 +639,14 @@ fn appearance_section(
                     *icon_error = None;
                 }
             });
-            if let Some(e) = icon_error.as_deref() {
-                ui.colored_label(crate::theme::c32(t.danger_text), e);
+            // F238:错误文案跟着「这次导入是替谁选的」走。`icon_error` 是两处
+            // 外观分节共用的一个字段,不按归属门控的话,在会话那边导入失败、
+            // 转头打开项目的外观分节,会看到一条与当前项目毫不相干的旧错误 ——
+            // 而它长得跟真错误一模一样。
+            if icon_target == crate::ui::IconTarget::Project {
+                if let Some(e) = icon_error.as_deref() {
+                    ui.colored_label(crate::theme::c32(t.danger_text), e);
+                }
             }
             if let Some(icon) = draft.icon.as_ref() {
                 let side = crate::ui::ico::SMALL as f32;
@@ -1350,5 +1388,206 @@ mod tests {
             texts.iter().any(|s| s == "清除"),
             "设了图标却没有「清除」:{texts:?}"
         );
+    }
+
+    /// 画两帧,`icon_error`/`icon_target` 按参数设定,收全部文字。
+    fn form_texts_with_icon_error(icon_target: crate::ui::IconTarget) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                _ => {}
+            }
+        }
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let p = proj(1, "接口", None);
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(p.id),
+            project_draft: Some(p.clone()),
+            icon_error: Some("会话那边导入失败的旧错误".to_string()),
+            icon_target,
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![p];
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(input(), |ctx| {
+                    show(
+                        ctx,
+                        &t,
+                        &mut ui_state,
+                        &ps,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                        None,
+                    );
+                })
+                .shapes;
+        }
+        let mut out = Vec::new();
+        for cs in &shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    /// F238:错误文案跟着归属走 —— 会话那边导入失败留下的话,不该出现在
+    /// 项目的「外观」分节里。
+    ///
+    /// `icon_error` 是两处共用的一个字段,不门控的话那句话会原样串过来,
+    /// 长得跟真错误一模一样。
+    ///
+    /// 自证会变红:把 `appearance_section` 里那道 `icon_target` 判据去掉。
+    #[test]
+    fn an_error_left_by_the_session_editor_does_not_show_up_in_the_project_form() {
+        let msg = "会话那边导入失败的旧错误";
+        let session_texts = form_texts_with_icon_error(crate::ui::IconTarget::Session);
+        assert!(
+            !session_texts.iter().any(|s| s.contains(msg)),
+            "icon_target = Session 时,项目的外观分节不该画出这句话:{session_texts:?}"
+        );
+        let project_texts = form_texts_with_icon_error(crate::ui::IconTarget::Project);
+        assert!(
+            project_texts.iter().any(|s| s.contains(msg)),
+            "icon_target = Project 时,这句话才该出现:{project_texts:?}"
+        );
+    }
+
+    /// 跑两帧把右栏画出来,真点一次「导入 .ico…」,返回点击后的 `UiState`。
+    ///
+    /// 定位按钮靠**渲染出的文字锚点**,不靠猜坐标(同 `intent_after_clicking_add`
+    /// 的手法)——按钮是普通 `ui.button(..)`,没有挂显式 id。
+    fn ui_state_after_clicking_import_icon() -> crate::ui::UiState {
+        fn find_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+            fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                    egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                        Some(ts.pos + ts.galley.size() / 2.0)
+                    }
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+        }
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let p = proj(1, "接口", None);
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(p.id),
+            project_draft: Some(p.clone()),
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![p];
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let draw = |input: egui::RawInput, ui_state: &mut crate::ui::UiState| {
+            ctx.run(input, |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    ui_state,
+                    &ps,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
+            })
+        };
+        let _ = draw(egui::RawInput::default(), &mut ui_state);
+        let out = draw(egui::RawInput::default(), &mut ui_state);
+        let pos = find_pos(&out.shapes, "导入 .ico").expect("「导入 .ico…」没画出来");
+        let mut input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        };
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        draw(input, &mut ui_state);
+        ui_state
+    }
+
+    /// F238:点「导入 .ico…」要同时置好**两件事** —— 请求开文件框,
+    /// 以及这次是替**谁**选的。
+    ///
+    /// 只置 `pick_icon_request` 而漏了 `icon_target` 的话,选完的那张图会被
+    /// 写进会话编辑器(默认档是 `Session`),项目这边一切正常、什么都不显示,
+    /// 而用户根本不知道自己刚把某条会话的图标改掉了。
+    ///
+    /// 自证会变红:把 `show` 里 `icon_target = IconTarget::Project` 那行删掉。
+    #[test]
+    fn clicking_import_says_the_icon_is_for_the_project_not_the_session() {
+        let ui_state = ui_state_after_clicking_import_icon();
+        assert!(
+            ui_state.pick_icon_request,
+            "点「导入 .ico…」没有请求打开文件框"
+        );
+        assert_eq!(
+            ui_state.icon_target,
+            crate::ui::IconTarget::Project,
+            "文件框选完之后,这次导入不知道该写回谁的草稿"
+        );
+    }
+
+    /// F238:导入成功 —— 草稿拿到解码后的图标,不报错。
+    #[test]
+    fn a_successfully_decoded_icon_is_written_into_the_draft() {
+        let mut draft = proj(1, "接口", None);
+        let bytes = crate::ui::ico::tests_support::solid_ico(32, [255, 0, 0, 255]);
+        let err = apply_picked_icon(&mut draft, std::path::Path::new("x.ico"), Ok(bytes));
+        assert_eq!(err, None, "能解码的 .ico 不该报错");
+        assert_eq!(
+            draft.icon.as_ref().map(|i| i.kind),
+            Some(mullion_store::IconKind::Ico),
+            "草稿没拿到解码后的图标"
+        );
+    }
+
+    /// F238:导入失败 —— 报错,且**不动**草稿里原来那张图。
+    ///
+    /// 这条尤其重要:导入一张坏图不该把用户原来那张好图抹掉。
+    ///
+    /// 自证会变红:把解码失败那一支改成顺手把 `draft.icon` 置 `None`。
+    #[test]
+    fn a_failed_decode_reports_an_error_and_leaves_the_existing_icon_untouched() {
+        let existing = mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: crate::ui::ico::import(&crate::ui::ico::tests_support::solid_ico(
+                32,
+                [0, 255, 0, 255],
+            ))
+            .expect("测试用 ico 应能导入"),
+            bg: None,
+        };
+        let mut draft = proj(1, "接口", None);
+        draft.icon = Some(existing.clone());
+        let err = apply_picked_icon(
+            &mut draft,
+            std::path::Path::new("bad.ico"),
+            Ok(b"not an ico".to_vec()),
+        );
+        assert!(err.is_some(), "解码失败该报错");
+        assert_eq!(draft.icon, Some(existing), "解码失败不该把原来那张好图抹掉");
     }
 }

@@ -1491,6 +1491,66 @@ mod tunnel_ui_tests {
         );
     }
 
+    /// F238(接线守护):在会话编辑器的「图标」页点「导入 .ico…」,这次导入
+    /// 必须记成 `IconTarget::Session` —— 它跟项目管理器共用同一个
+    /// `pick_icon_request`,漏记归属的话选完的图会被写进当时开着的项目草稿,
+    /// 用户毫无察觉地改错了地方。
+    ///
+    /// 手法同 `clicking_the_fourth_tab_in_sftp_mode_opens_appearance_not_automation`:
+    /// 先把 `editor_tab` 定到「图标」页,再用渲染出的文字锚点点「导入 .ico…」。
+    ///
+    /// 自证会变红:把 `ui_state.icon_target = crate::ui::IconTarget::Session;`
+    /// 那行(翻译 `buf.pick_icon_clicked` 的那一段)删掉。
+    #[test]
+    fn clicking_import_in_the_session_editor_says_the_icon_is_for_the_session() {
+        let sessions = vec![sess(1, "生产主控")];
+        let mut st = open(ManagerMode::Sessions);
+        st.editor_id = Some(SessionId(1));
+        st.editor = Some(EditorBuffer::from_record(&sessions[0]));
+        st.editor_baseline = st.editor.clone();
+        st.editor_tab = TAB_APPEARANCE;
+
+        let (ctx, out) = run(&mut st, &sessions, &[]);
+        let pos = find_text_pos(&out.shapes, "导入 .ico").expect("「导入 .ico…」没画出来");
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let t = crate::theme::MULLION_DARK;
+        let _ = ctx.run(input, |c| {
+            show(
+                c,
+                &t,
+                &mut st,
+                &sessions,
+                &[],
+                &[],
+                &[],
+                &[],
+                true,
+                SecretPresence::default(),
+                SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
+            );
+        });
+
+        assert!(st.pick_icon_request, "点「导入 .ico…」没有请求打开文件框");
+        assert_eq!(
+            st.icon_target,
+            crate::ui::IconTarget::Session,
+            "会话编辑器点导入,归属却不是 Session"
+        );
+    }
+
     /// 反查一段文字画在哪儿,用来给点击事件定位。**没有用 `ctx.graphics(...)`**
     /// (egui-0.30.0 的 `GraphicLayers` 没有公开的 `iter()`,编译不过)——改用
     /// `run()` 已经拿到的 `FullOutput::shapes`,同 `editor.rs::tests` 里

@@ -9912,24 +9912,15 @@ impl ApplicationHandler<UserEvent> for App {
                                     .err();
                             }
                         }
-                        // 项目草稿。**只写草稿不落盘** —— 落盘是「保存」那颗
-                        // 按钮的事,在这里写等于绕开了 `validate_project`。
+                        // 项目草稿。正文抽在 `project_manager::apply_picked_icon`
+                        // ——这里只负责取文件、分流。
                         crate::ui::IconTarget::Project => {
                             if let Some(d) = self.ui.project_draft.as_mut() {
-                                self.ui.icon_error = match std::fs::read(&p) {
-                                    Err(e) => Some(format!("读不了 {}:{e}", p.display())),
-                                    Ok(bytes) => match crate::ui::ico::import(&bytes) {
-                                        Ok(b64) => {
-                                            d.icon = Some(mullion_store::IconSpec {
-                                                kind: mullion_store::IconKind::Ico,
-                                                value: b64,
-                                                bg: None,
-                                            });
-                                            None
-                                        }
-                                        Err(e) => Some(e.message()),
-                                    },
-                                };
+                                self.ui.icon_error = crate::ui::project_manager::apply_picked_icon(
+                                    d,
+                                    &p,
+                                    std::fs::read(&p),
+                                );
                             }
                         }
                     }

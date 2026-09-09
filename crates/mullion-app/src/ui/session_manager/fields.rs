@@ -420,6 +420,7 @@ pub(crate) fn appearance(
     t: &Theme,
     buf: &mut EditorBuffer,
     icon_error: &mut Option<String>,
+    icon_target: crate::ui::IconTarget,
 ) {
     use mullion_store::{ColorSpec, ColorTarget, IconKind};
 
@@ -465,8 +466,14 @@ pub(crate) fn appearance(
                 );
             }
 
-            if let Some(err) = icon_error.as_ref() {
-                ui.colored_label(crate::theme::c32(t.danger_text), err);
+            // F238:错误文案跟着「这次导入是替谁选的」走。`icon_error` 是两处
+            // 外观分节共用的一个字段,不按归属门控的话,在项目那边导入失败、
+            // 转头打开会话编辑器的外观页,会看到一条与当前会话毫不相干的
+            // 旧错误 —— 而它长得跟真错误一模一样。
+            if icon_target == crate::ui::IconTarget::Session {
+                if let Some(err) = icon_error.as_ref() {
+                    ui.colored_label(crate::theme::c32(t.danger_text), err);
+                }
             }
 
             if has_ico {
@@ -2988,7 +2995,7 @@ mod tests {
 
     fn run_appearance(buf: &mut EditorBuffer) -> egui::FullOutput {
         let t = crate::theme::MULLION_DARK;
-        run_page(|ui| super::appearance(ui, &t, buf, &mut None))
+        run_page(|ui| super::appearance(ui, &t, buf, &mut None, crate::ui::IconTarget::Session))
     }
 
     /// 走查 4:「图标」页要有实时预览,否则用户设完颜色只能保存了去左栏看。
@@ -3243,7 +3250,7 @@ mod tests {
         let mut run = |ctx: &egui::Context, buf: &mut EditorBuffer, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    super::appearance(ui, &t, buf, &mut err);
+                    super::appearance(ui, &t, buf, &mut err, crate::ui::IconTarget::Session);
                 });
             })
         };
@@ -4538,7 +4545,7 @@ mod tests {
                 // 导入失败的红字是本页最长的一行文本,一并覆盖。
                 let mut err = Some(crate::ui::ico::ImportError::NotIco.message());
                 let out = run_page_at(width, ppp, |ui| {
-                    super::appearance(ui, &t, &mut buf, &mut err)
+                    super::appearance(ui, &t, &mut buf, &mut err, crate::ui::IconTarget::Session)
                 });
                 let right = max_right(&out.shapes);
                 assert!(
