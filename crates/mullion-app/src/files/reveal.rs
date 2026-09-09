@@ -226,6 +226,115 @@ pub fn consume(pending_host: Option<usize>, opened_host: Option<usize>) -> bool 
     pending_host == opened_host
 }
 
+/// F242:状态栏「当前选中的路径」那一格。
+///
+/// 存在的理由是 Ctrl+Shift+B **会把选区弄没**:开侧栏改变了终端的列数,
+/// alacritty 在换列时无条件 `self.selection = None`(陷阱 T13 同源)。用户
+/// 划完一条路径、按下键、选区消失 —— 在此之前他没有任何途径确认「我划中的
+/// 到底是哪一串、按下去会去哪台机」。这一格就是那个确认。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusPath {
+    /// 跨节点时的**起点**:文件面板此刻停在哪台。同节点 / 本地栏为 `None`。
+    pub from: Option<String>,
+    /// 目的地。`None` = 认出了一条路径,但落不到具体位置(面板还没开出
+    /// sftp、拿不到基准目录…),显示成 `?`。
+    pub to: Option<String>,
+    /// 显示用的路径。能解析就是绝对路径,否则是剥完壳的选区原文。
+    pub path: String,
+}
+
+/// 状态栏这一格的最小字符预算。低于这个数,省略号两边剩不下能认人的东西,
+/// 那就不如让它溢出。
+const MIN_BUDGET: usize = 16;
+
+/// F242:单行闸门 + [`parse`]。
+///
+/// `text` **是惰性的**,而这正是这个函数存在的全部理由:`single_line` 为假
+/// 时一次都不调用它。多行选区本来就会被 `parse` 的第一道门判死,但那道门
+/// 开在「已经拼成 `String`」之后 —— F242 要每帧问一次结果,用户按住左键往回
+/// 拖几百行回溯时,每帧先把几百 KB 拼出来再免费扔掉(陷阱 T3)。
+///
+/// `single_line` 的判据是 `Emulator::selection_is_single_line`,只读
+/// `Selection::to_range` 的起止行,成本与选区大小无关。
+pub fn parse_single_line(
+    single_line: bool,
+    text: impl FnOnce() -> Option<String>,
+) -> Option<Target> {
+    if !single_line {
+        return None;
+    }
+    parse(&text()?)
+}
+
+/// F242:跨节点时那一格要写的**起点**。
+///
+/// 同机(`from == to`)给 `None`:写成 `a → a` 是纯噪音,而这一格的宽度要跟
+/// 右侧四格抢。起点未知(`from` 为 `None`,面板还没开出 sftp)时也给 `None`
+/// —— `? → b` 说不出任何东西。
+pub fn crossing_from(from: Option<usize>, to: Option<usize>) -> Option<usize> {
+    if from == to {
+        None
+    } else {
+        from
+    }
+}
+
+/// `(状态栏那一格, 悬停全文)`。
+///
+/// 两串**同源**:悬停要给的正是被中段省略吃掉的那部分,各拼各的就会出现
+/// 「格子里写着 A、悬停显示 B」——而这种错只有把鼠标停上去才看得见。
+pub fn status_cell(v: &StatusPath, budget: usize) -> (String, String) {
+    let node = match (&v.from, &v.to) {
+        // 跨节点:按下去面板会**换机器**,这是这一格最该说的事。
+        (Some(f), Some(t)) => format!("{f} → {t}"),
+        (_, Some(t)) => t.clone(),
+        (_, None) => "?".to_string(),
+    };
+    (
+        format!("· {node} · {}", elide_middle(&v.path, budget)),
+        format!("{node} · {}", v.path),
+    )
+}
+
+/// 中段省略,保头保尾。
+///
+/// **不能掐尾**(egui `Label::truncate` 那种):路径两头都是信息 —— 头上是
+/// 根(哪个盘 / 家目录 / 仓库),尾上是文件名,而文件名正是用户唯一想确认的
+/// 那半截。掐尾等于把这一格的用途删掉。
+///
+/// 尾巴分到 2/3:`…/mullion-app/src/app.rs` 比 `/data/Mullion/crates/…` 更能
+/// 回答「我划中的是不是那一条」。
+pub fn elide_middle(s: &str, budget: usize) -> String {
+    let budget = budget.max(MIN_BUDGET);
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= budget {
+        return s.to_string();
+    }
+    let keep = budget - 1; // 让出 `…` 一个字位
+    let tail = keep * 2 / 3;
+    let head = keep - tail;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
+/// 这一格分到多少个**字符**。
+///
+/// 按字符而不是按像素排:状态栏用的不是等宽字体,量像素要走
+/// `Fonts::layout`,那要 `&egui::Context` —— 这条判据就再也没法在无头容器里
+/// 测了。估宽偏差的后果只是多截 / 少截几个字,不破版。
+///
+/// 一半留给右侧:错误、自动化、隧道、编码四格都在那边,它们比「我划中了
+/// 什么」更该被看见。
+pub fn char_budget(available_px: f32) -> usize {
+    /// UI 字体(14px 非等宽)ASCII 的平均字宽估计。
+    const APPROX_CHAR_PX: f32 = 7.0;
+    const MAX_BUDGET: usize = 120;
+    let n = (available_px * 0.5 / APPROX_CHAR_PX).max(0.0) as usize;
+    n.clamp(MIN_BUDGET, MAX_BUDGET)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +483,133 @@ mod tests {
         assert!(!consume(Some(1), Some(2)));
         assert!(!consume(Some(0), None));
         assert!(consume(None, None));
+    }
+
+    fn sp(from: Option<&str>, to: Option<&str>, path: &str) -> StatusPath {
+        StatusPath {
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+            path: path.to_string(),
+        }
+    }
+
+    /// F242:多行选区**根本不去取那个串**。这是 T3 那类每帧成本的闸门 ——
+    /// 判据在拼串之前还是之后,画面上完全一样,只有拖着几百行时风扇会响。
+    ///
+    /// 自证会变红:把 `parse_single_line` 里的 `if !single_line` 那三行删掉
+    /// (闭包会 panic)。
+    #[test]
+    fn a_multi_line_selection_is_never_even_turned_into_a_string() {
+        let got = parse_single_line(false, || panic!("多行选区不该被拼成串"));
+        assert_eq!(got, None);
+    }
+
+    /// 反面:单行时该照常走 `parse`,否则这个闸门就把功能一起关掉了。
+    #[test]
+    fn a_single_line_selection_still_goes_through_parse() {
+        let got = parse_single_line(true, || Some("src/app.rs".to_string()));
+        assert_eq!(got.map(|t| t.raw), Some("src/app.rs".to_string()));
+    }
+
+    /// F242:同机不写箭头,异机才写。
+    ///
+    /// 自证会变红:把 `crossing_from` 的两个分支对调。
+    #[test]
+    fn only_a_real_machine_change_gets_an_arrow() {
+        assert_eq!(crossing_from(Some(0), Some(0)), None, "同机没有起点");
+        assert_eq!(crossing_from(None, None), None, "两边都不知道也没有起点");
+        assert_eq!(crossing_from(Some(0), Some(1)), Some(0), "异机写起点");
+        assert_eq!(
+            crossing_from(None, Some(1)),
+            None,
+            "起点不知道时不写 `? → b`"
+        );
+    }
+
+    /// F242:三种前缀各自的样子。**逐格钉**——这一格是「按下去会发生什么」的
+    /// 唯一预告,写错一格就是预告错了。
+    ///
+    /// 自证会变红:把 `(Some(f), Some(t))` 那条臂删掉(第一条红);把
+    /// `(_, None)` 的 `"?"` 改成空串(第三条红)。
+    #[test]
+    fn the_cell_says_which_machine_the_key_would_take_you_to() {
+        let (cell, _) = status_cell(&sp(Some("node-a"), Some("node-b"), "/x/y.rs"), 64);
+        assert_eq!(cell, "· node-a → node-b · /x/y.rs");
+
+        let (cell, _) = status_cell(&sp(None, Some("node-b"), "/x/y.rs"), 64);
+        assert_eq!(cell, "· node-b · /x/y.rs");
+
+        let (cell, _) = status_cell(&sp(None, None, "crates/y.rs"), 64);
+        assert_eq!(cell, "· ? · crates/y.rs", "落不到具体位置时写 `?`");
+
+        let (cell, _) = status_cell(&sp(None, Some("本机"), r"C:\a\b.txt"), 64);
+        assert_eq!(cell, r"· 本机 · C:\a\b.txt");
+    }
+
+    /// F242:格子里省略了什么,悬停就得能找回什么 —— 两串必须同源。
+    ///
+    /// 自证会变红:把 `status_cell` 里 tooltip 那一行的 `v.path` 换成
+    /// `elide_middle(&v.path, budget)`。
+    #[test]
+    fn hovering_gives_back_exactly_what_the_ellipsis_ate() {
+        let long = "/data/Mullion/crates/mullion-app/src/shell/workspace/preset.rs";
+        let v = sp(None, Some("node-b"), long);
+        let (cell, full) = status_cell(&v, 32);
+        assert!(cell.contains('…'), "32 个字位装不下这条,应该省略");
+        assert!(!full.contains('…'), "悬停给的是全文");
+        assert!(full.ends_with(long));
+    }
+
+    /// F242:省略保**两头**。掐尾(egui `Label::truncate` 那种)会把文件名切
+    /// 掉,而文件名正是用户要确认的那半截 —— 这一格的用途就没了。
+    ///
+    /// 自证会变红:把 `elide_middle` 的 `out.extend(&chars[chars.len()-tail..])`
+    /// 删掉(尾巴没了);或把 `let tail = keep * 2 / 3` 改成 `keep / 3`
+    /// (`preset.rs` 这个末段就装不下了)。
+    #[test]
+    fn eliding_keeps_both_the_root_and_the_file_name() {
+        let long = "/data/Mullion/crates/mullion-app/src/shell/workspace/preset.rs";
+        let got = elide_middle(long, 32);
+        assert_eq!(got.chars().count(), 32, "省略之后正好用满预算");
+        assert!(got.starts_with('/'), "根还在");
+        assert!(got.ends_with("preset.rs"), "文件名还在");
+        assert!(got.contains('…'));
+    }
+
+    /// 装得下就一个字都不动 —— 省略号本身也是要占位的。
+    #[test]
+    fn a_path_that_fits_is_left_alone() {
+        assert_eq!(elide_middle("/x/y.rs", 32), "/x/y.rs");
+        // 正好等于预算:仍然不省略。
+        let exact = "a".repeat(32);
+        assert_eq!(elide_middle(&exact, 32), exact);
+    }
+
+    /// 预算低于下限时不省略成一堆点 —— 让它溢出比让它变成 `/…s` 有用。
+    ///
+    /// 自证会变红:把 `elide_middle` 里的 `budget.max(MIN_BUDGET)` 改成
+    /// `budget`。
+    #[test]
+    fn a_tiny_budget_is_lifted_to_the_floor_instead_of_shredding_the_path() {
+        let s = "/data/Mullion/src/app.rs";
+        assert_eq!(elide_middle(s, 0).chars().count(), MIN_BUDGET);
+        assert_eq!(elide_middle(s, 3), elide_middle(s, MIN_BUDGET));
+    }
+
+    /// F242:预算跟着可用宽度走,并且有上下界 —— 没有下界的话窄窗口下这一格
+    /// 会缩成一个省略号,没有上界的话超宽屏上它会把右侧四格挤出可视区。
+    ///
+    /// 自证会变红:把 `char_budget` 的 `clamp(MIN_BUDGET, MAX_BUDGET)` 去掉。
+    #[test]
+    fn the_budget_follows_the_width_but_stays_inside_its_bounds() {
+        assert_eq!(char_budget(0.0), MIN_BUDGET);
+        assert_eq!(char_budget(-1000.0), MIN_BUDGET, "宽度算成负数也不崩");
+        assert_eq!(char_budget(100_000.0), 120, "超宽屏封顶");
+        let mid = char_budget(1000.0);
+        assert!(
+            mid > MIN_BUDGET && mid < 120,
+            "中间那档确实跟着宽度走:{mid}"
+        );
+        assert!(char_budget(2000.0) > mid, "更宽就更长");
     }
 }

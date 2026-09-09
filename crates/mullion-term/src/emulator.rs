@@ -1093,10 +1093,7 @@ mod tests {
         // 拖到下一行 —— 文本里出现换行,判据必须跟着翻。
         emu.selection_update(4, 1, CellSide::Right);
         assert!(!emu.selection_is_single_line());
-        assert!(emu
-            .selection_text()
-            .expect("跨行选区有文本")
-            .contains('\n'));
+        assert!(emu.selection_text().expect("跨行选区有文本").contains('\n'));
     }
 
     /// 没有选区时返回 `false`。调用方据此**跳过** `selection_text()`,

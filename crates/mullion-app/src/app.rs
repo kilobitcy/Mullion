@@ -4154,12 +4154,23 @@ impl App {
     /// 目录说的。拿不到时退回面板当前目录 —— 猜错的结果是 `stat` 报「不存在」
     /// 并原地不动,不会静默跳到别处。
     fn reveal_target(&self) -> Option<RevealTarget> {
+        let parsed = self.selection_as_path()?;
+        self.reveal_target_of(&parsed)
+    }
+
+    /// F242:焦点 pane 的选区**语法上**是不是一条路径。零 IO,不看面板状态。
+    ///
+    /// 闸门与惰性取串的理由都在 `reveal::parse_single_line` 上。
+    fn selection_as_path(&self) -> Option<crate::files::reveal::Target> {
+        let pane = self.active_ws().and_then(Workspace::focused)?;
+        crate::files::reveal::parse_single_line(pane.emulator.selection_is_single_line(), || {
+            pane.emulator.selection_text()
+        })
+    }
+
+    /// F218:把认出来的那条路径解析成绝对路径,再看面板是不是已经在那儿了。
+    fn reveal_target_of(&self, parsed: &crate::files::reveal::Target) -> Option<RevealTarget> {
         use crate::files::{reveal, PanelColumn};
-        let sel = self
-            .active_ws()
-            .and_then(Workspace::focused)
-            .and_then(|p| p.emulator.selection_text())?;
-        let parsed = reveal::parse(&sel)?;
         let generation = files_owner_generation_of(&self.tabs, true)?;
         let tab = self.tabs.by_generation(generation)?;
         let files = tab.content.files_panel()?;
@@ -4212,6 +4223,50 @@ impl App {
             host_ix: tab.content.focused_pane_host_ix(),
             path,
             arrived,
+        })
+    }
+
+    /// F242:状态栏「当前选中的路径」这一格。`None` = 不占格。
+    ///
+    /// 目的地和路径**都走 `reveal_target_of`**,与 Ctrl+Shift+B 真正会去的
+    /// 地方同源。各算一份的话,状态栏写着 A、按下去到了 B —— 而这种错没有
+    /// 任何自动手段能发现,只有用户按下去才知道。
+    fn selection_status(&self) -> Option<crate::files::reveal::StatusPath> {
+        use crate::files::{reveal, PanelColumn};
+        let parsed = self.selection_as_path()?;
+        let Some(t) = self.reveal_target_of(&parsed) else {
+            // 认出了路径、但落不到具体位置(面板属主还没有、拿不到基准
+            // 目录…)。**仍然占格**:用户至少能确认「我划中的是这一串」,
+            // 这正是这一格存在的理由;不占格的话他会以为自己划歪了。
+            return Some(reveal::StatusPath {
+                from: None,
+                to: None,
+                path: parsed.raw,
+            });
+        };
+        let path = String::from_utf8_lossy(t.path.as_bytes()).into_owned();
+        if t.column == PanelColumn::Local {
+            return Some(reveal::StatusPath {
+                from: None,
+                to: Some("本机".to_string()),
+                path,
+            });
+        }
+        let tab = self.tabs.by_generation(t.generation)?;
+        let label = |ix: Option<usize>| {
+            tab.content
+                .as_terminal()
+                .and_then(|term| term.ws.hosts.get(ix?))
+                .map(|h| h.label.clone())
+        };
+        // 起点只在**确实要换机器**时才写:F132 那条腿会把 sftp channel 搬到
+        // 焦点分屏那台去,而「面板要换机器」是按下去之前最该被看见的事。
+        // 同机时写成 `a → a` 只是噪音。
+        let from_ix = reveal::crossing_from(tab.content.sftp_host_ix(), t.host_ix);
+        Some(reveal::StatusPath {
+            from: label(from_ix),
+            to: label(t.host_ix),
+            path,
         })
     }
 
@@ -11724,6 +11779,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 .then(|| Arc::clone(&self.known_hosts));
                             let known_hosts_guard =
                                 known_hosts_arc.as_ref().and_then(|a| a.lock().ok());
+                            // F242:借出去给 `UiFrame`(它是 `Copy`,装不下
+                            // 一个 `String`),所以先落个本地绑定。
+                            let selection_path = self.selection_status();
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
@@ -11750,6 +11808,10 @@ impl ApplicationHandler<UserEvent> for App {
                                 preset: self.active_ws().and_then(|ws| {
                                     crate::shell::workspace::preset::preset_of(ws.tree())
                                 }),
+                                // F242:每帧现算。前置是 `selection_is_single_line`
+                                // 这个 O(1) 判据,没选区 / 多行选区一律在拼串
+                                // 之前就返回(陷阱 T3)。
+                                selection_path: selection_path.as_ref(),
                                 titles: &titles,
                                 tabs: &tab_views,
                                 host_key: host_key_view,
@@ -18111,6 +18173,43 @@ mod tests {
         assert!(
             next.trim_start().starts_with("preset: self.active_ws()"),
             "工具栏高亮必须现算(F232),当前是:{}",
+            next.trim()
+        );
+    }
+
+    /// F242 **接线守护**:状态栏那一格必须每帧从 `selection_status()` 现算。
+    ///
+    /// 与 `the_toolbar_highlight_is_derived_from_the_tree_every_frame` 同形,
+    /// 理由也一样:`reveal::status_cell` / `chrome::status_bar` / `ui::show`
+    /// 三层各自有测试,但**「App 有没有把这一帧的选区递进 `UiFrame`」**这一步
+    /// 谁都够不着 —— 填成 `None` 编译照过、全套测试照绿,症状是这一格永远
+    /// 不出现,而画面上没有任何报错。
+    ///
+    /// 判据落在「`preset:` 那块之后的**下一个字段**」而不是裸搜字段名:
+    /// 裸搜的话把它挪到一个不生效的地方照样绿。
+    ///
+    /// 自证会变红:把那一行改成 `selection_path: None,`。
+    #[test]
+    fn the_status_bar_path_cell_is_computed_from_the_live_selection_every_frame() {
+        let src = prod_src();
+        let at = src
+            .find("preset: self.active_ws().and_then(|ws| {")
+            .expect("UiFrame 的 preset 字段变了,这条测试的锚点失效了");
+        let next = src[at..]
+            .lines()
+            .skip(1)
+            .find(|l| {
+                let l = l.trim_start();
+                !l.is_empty()
+                    && !l.starts_with("//")
+                    && !l.starts_with("crate::shell::workspace::preset")
+                    && l != "}),"
+            })
+            .expect("preset 之后没有下一个字段?");
+        assert!(
+            next.trim_start()
+                .starts_with("selection_path: selection_path"),
+            "状态栏那一格必须现算(F242),当前是:{}",
             next.trim()
         );
     }

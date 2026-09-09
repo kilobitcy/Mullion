@@ -554,6 +554,9 @@ pub struct UiFrame<'a> {
     pub panes: usize,
     /// 当前生效的布局预设(工具栏画选中态)。`None` = 不对应任何预设。
     pub preset: Option<crate::shell::workspace::Preset>,
+    /// F242:状态栏「当前选中的路径」那一格。`None` = 不占格(没选区、
+    /// 多行选区、或者选区里不是一条路径)。
+    pub selection_path: Option<&'a crate::files::reveal::StatusPath>,
     /// 每个 pane 的标题条(F83)。空 = 标题条关闭或 launcher 态。
     pub titles: &'a [pane_title::TitleView<'a>],
     pub host_key: Option<host_key::HostKeyView<'a>>,
@@ -902,6 +905,7 @@ pub fn build_ui(
             .find(|v| v.focused)
             .and_then(|v| v.appearance)
             .and_then(|a| badge::should_paint(a, mullion_store::ColorTarget::StatusBar)),
+        frame.selection_path,
     );
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
@@ -1352,6 +1356,7 @@ mod tests {
             connected: true,
             panes: 1,
             preset: None,
+            selection_path: None,
             titles: &[],
             tabs: &[],
             host_key: None,
@@ -1452,6 +1457,30 @@ mod tests {
     /// Shape,不是 `build_ui` 没接线,是 egui 自身的首帧行为。第二遍复用同一个
     /// `ctx`(memory 里已有上一遍存的 `AreaState`),`sizing_pass` 不再触发,
     /// 才能看到真实绘制内容。
+    /// F242 **接线守护**:`UiFrame.selection_path` 一路传到 `status_bar`。
+    ///
+    /// 这一层单独钉,是因为 `chrome::tests` 那条是**直接调** `status_bar` 的
+    /// —— 它证明不了 `ui::show` 把 frame 上那个字段递了进去。中间少递一个
+    /// 参数(填 `None`)编译照过、全套测试照绿,只有人眼在真机上看得出来。
+    ///
+    /// 自证会变红:把 `ui/mod.rs` 里 `status_bar(..)` 那个
+    /// `frame.selection_path` 实参改成 `None`。
+    #[test]
+    fn the_frames_selected_path_reaches_the_status_bar() {
+        let sp = crate::files::reveal::StatusPath {
+            from: None,
+            to: Some("node-b".to_string()),
+            path: "/data/only-here.rs".to_string(),
+        };
+        let mut frame = base_frame();
+        frame.selection_path = Some(&sp);
+        let (text, _) = rendered_text(frame);
+        assert!(
+            text.contains("/data/only-here.rs"),
+            "选中的路径没到状态栏:{text}"
+        );
+    }
+
     fn rendered_text(frame: UiFrame<'_>) -> (String, UiActions) {
         let ctx = egui::Context::default();
         let mut ui_state = UiState::default();

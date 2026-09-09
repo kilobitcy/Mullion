@@ -475,6 +475,8 @@ pub fn status_bar(
     // F62:当前聚焦 pane 所属会话的语义色。**只有勾了「状态栏」落点才是
     // `Some`**(过滤在 `badge::should_paint` 里做,这里只负责画)。
     session_color: Option<egui::Color32>,
+    // F242:当前选中的那条路径。`None` = 不占格,同 `tunnel` 那条的理由。
+    selection_path: Option<&crate::files::reveal::StatusPath>,
 ) {
     let (left, right) = status_text(panes, connected);
     let bar = egui::TopBottomPanel::bottom("status")
@@ -499,6 +501,21 @@ pub fn status_bar(
                 let dot = if connected { t.ok } else { t.fg_faint };
                 ui.colored_label(theme::c32(dot), "●");
                 ui.colored_label(theme::c32(t.fg_faint), left);
+                // F242:选中的路径接在左栏后面。比 `fg_faint` 亮一档 ——
+                // 它是「这一刻按 Ctrl+Shift+B 会发生什么」的唯一预告,而
+                // 屏数/连接态是常驻背景信息。
+                //
+                // 预算按**这一刻的剩余宽度**算,不是常数:窗口拉窄时右侧那
+                // 几格(错误/自动化/隧道)是右对齐画的,左边这一格再不让位
+                // 就会把它们挤出可视区。
+                if let Some(sp) = selection_path {
+                    let budget = crate::files::reveal::char_budget(ui.available_width());
+                    let (text, full) = crate::files::reveal::status_cell(sp, budget);
+                    let r = ui.colored_label(theme::c32(t.fg_muted), text);
+                    annotate::mark(ui.ctx(), "状态栏/选中路径", r.rect);
+                    // 中段被省略掉的那截只能靠悬停找回来。
+                    r.on_hover_text(full);
+                }
                 // last_error 必须可见:右对齐区先画它,再画常规右栏。
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(err) = last_error {
@@ -634,6 +651,7 @@ mod tests {
                 None,
                 None,
                 session_color,
+                None,
             );
         });
         let out = ctx.run(Default::default(), |ctx| {
@@ -646,6 +664,7 @@ mod tests {
                 None,
                 None,
                 session_color,
+                None,
             );
         });
         count_shapes(&out.shapes)
@@ -656,6 +675,7 @@ mod tests {
     fn status_texts(
         automation: Option<&str>,
         tunnel: Option<&crate::tunnels::Indicator>,
+        selection_path: Option<&crate::files::reveal::StatusPath>,
     ) -> Vec<String> {
         let ctx = egui::Context::default();
         let mut acc = Vec::new();
@@ -671,6 +691,7 @@ mod tests {
                     automation,
                     tunnel,
                     None,
+                    selection_path,
                 );
             });
             acc.clear();
@@ -694,7 +715,7 @@ mod tests {
             text: "隧道 1/2 ↻".to_string(),
             severity: crate::tunnels::Severity::Warn,
         };
-        let texts = status_texts(Some("自动化已就绪"), Some(&ind));
+        let texts = status_texts(Some("自动化已就绪"), Some(&ind), None);
         let pos = |needle: &str| {
             texts
                 .iter()
@@ -712,10 +733,51 @@ mod tests {
     /// 看见的机会;而「你配了但没开」这件事在会话管理器里看就够了。
     #[test]
     fn status_bar_has_no_tunnel_indicator_when_none_configured() {
-        let texts = status_texts(None, None);
+        let texts = status_texts(None, None, None);
         assert!(
             !texts.iter().any(|s| s.contains("隧道")),
             "没有在跑的隧道时不该占一格:{texts:?}"
+        );
+    }
+
+    /// F242 **接线守护**:`status_cell` 那对纯函数测得再扎实,也保证不了
+    /// 状态栏真的调了它 —— 「纯函数测得扎实、接线没人看着」是本项目反复踩中
+    /// 的恒绿形态。这一条盯的是「这一格真的画在了屏幕上,而且排在左栏之后、
+    /// 右侧几格之前」。
+    ///
+    /// 自证会变红:把 `status_bar` 里那个 `if let Some(sp) = selection_path`
+    /// 整块删掉。
+    #[test]
+    fn the_selected_path_is_painted_between_the_left_column_and_the_right_ones() {
+        let sp = crate::files::reveal::StatusPath {
+            from: None,
+            to: Some("node-b".to_string()),
+            path: "/data/x.rs".to_string(),
+        };
+        let texts = status_texts(None, None, Some(&sp));
+        let pos = |needle: &str| {
+            texts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("状态栏没画出「{needle}」:{texts:?}"))
+        };
+        assert!(pos("屏 ·") < pos("/data/x.rs"), "排在左栏之后:{texts:?}");
+        assert!(pos("/data/x.rs") < pos("UTF-8"), "排在编码之前:{texts:?}");
+        assert!(
+            texts.iter().any(|s| s.contains("node-b")),
+            "目的地节点名也要画出来:{texts:?}"
+        );
+    }
+
+    /// 没选中路径时**不占格**,理由同隧道那条:状态栏每多常驻一格,别的信息
+    /// 就少一分被看见的机会。
+    #[test]
+    fn nothing_selected_means_no_path_cell_at_all() {
+        let texts = status_texts(None, None, None);
+        assert_eq!(
+            texts.iter().filter(|s| s.contains('·')).count(),
+            1,
+            "只该有左栏那一处 `·`:{texts:?}"
         );
     }
 
@@ -745,6 +807,7 @@ mod tests {
                     &crate::theme::MULLION_DARK,
                     1,
                     true,
+                    None,
                     None,
                     None,
                     None,
