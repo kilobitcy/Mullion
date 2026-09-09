@@ -347,6 +347,45 @@ pub fn prefill_from_pane(
     })
 }
 
+/// F240:按下 `Ctrl+Shift+N` 之后该做什么。
+///
+/// 抽成纯函数是为了**测得着**:`App` 要真实窗口 + GPU + `EventLoopProxy`,
+/// `app.rs` 的测试从来构造不出一个,判定挂在方法上就等于没有守护。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyPlan {
+    /// 这块 pane 已经属于某个项目 → 打开那个项目的编辑表单。
+    EditExisting(mullion_store::ProjectId),
+    /// 拿得到现场 → 用这份草稿新建(`id`/`created_at` 由调用方填)。
+    NewDraft(Box<mullion_store::ProjectRecord>),
+    /// 推不出来 → 出一条 toast 说明原因,不弹空表单。
+    Explain(String),
+}
+
+/// F240:三条出口的判定顺序很重要 ——「已属某项目」必须排在最前:一块已经在
+/// 项目 tmux 里的 pane,cwd 也多半拿得到,顺序反了就会去建第二个项目(同一台
+/// 机器同一个目录建出两条记录,`project_tmux_name` 算出同一个名字,
+/// `validate_project` 会拦,但用户一头雾水)。
+pub fn hotkey_plan(
+    cwd: Option<&str>,
+    tmux: Option<&str>,
+    node: Option<mullion_store::SessionId>,
+    existing: &[mullion_store::ProjectRecord],
+) -> HotkeyPlan {
+    if let Some(p) = project_of(tmux, existing) {
+        return HotkeyPlan::EditExisting(p.id);
+    }
+    let Some(cwd) = cwd else {
+        return HotkeyPlan::Explain("这块窗格还没有当前目录,建不了项目".to_string());
+    };
+    let Some(node) = node else {
+        return HotkeyPlan::Explain("这块窗格还没连上机器,建不了项目".to_string());
+    };
+    match prefill_from_pane(cwd, tmux, node, existing) {
+        Some(draft) => HotkeyPlan::NewDraft(Box::new(draft)),
+        None => HotkeyPlan::Explain("这个目录没有可用的名字,建不了项目".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,5 +1073,96 @@ mod tests {
     fn a_root_directory_has_no_leaf_to_name_the_project_after() {
         assert!(prefill_from_pane("/", None, mullion_store::SessionId(1), &[]).is_none());
         assert!(prefill_from_pane("", None, mullion_store::SessionId(1), &[]).is_none());
+    }
+
+    // ---- F240 hotkey_plan --------------------------------------------------
+
+    /// 这块 pane 已经在某个项目的 tmux 里 → 打开**那个**项目的编辑表单,
+    /// 不新建。再建一个的话,同一台机器同一个目录会有两条项目记录,而它们
+    /// 会算出同一个 tmux 名 —— `validate_project` 会拦,但用户会一头雾水。
+    #[test]
+    fn a_pane_already_in_a_project_opens_that_project_instead_of_making_a_new_one() {
+        let mut p = named(1, "我的项目");
+        p.tmux_name = Some("claude-mine".into());
+        let name = mullion_store::project_tmux_name(&p);
+        assert_eq!(
+            hotkey_plan(
+                Some("/srv/api"),
+                Some(&name),
+                Some(mullion_store::SessionId(7)),
+                &[p]
+            ),
+            HotkeyPlan::EditExisting(mullion_store::ProjectId(1))
+        );
+    }
+
+    /// **判定顺序的钉子**:即使 cwd 也完全拿得到、能推出一份完好的草稿,
+    /// 「已属某项目」仍然赢——判定顺序反了,一块已经在项目里的 pane 会被
+    /// 拿去建第二个项目。
+    ///
+    /// 自证会变红:把 `hotkey_plan` 里 `project_of` 那一支挪到 `cwd`/`node`
+    /// 两支判断之后。
+    #[test]
+    fn the_membership_check_wins_over_a_perfectly_good_cwd() {
+        let mut p = named(1, "我的项目");
+        p.tmux_name = Some("claude-mine".into());
+        let name = mullion_store::project_tmux_name(&p);
+        let plan = hotkey_plan(
+            Some("/srv/api/web"),
+            Some(&name),
+            Some(mullion_store::SessionId(7)),
+            &[p],
+        );
+        assert_eq!(
+            plan,
+            HotkeyPlan::EditExisting(mullion_store::ProjectId(1)),
+            "cwd 齐全时判定顺序反了,会去建第二个项目而不是打开原来那个"
+        );
+    }
+
+    /// pane 从没上报过目录 → 出一条 toast 说清楚,不弹空表单。弹一个 `dir`
+    /// 空着的表单等于这个键什么都没省下来,用户还得自己把路径抄过去。
+    #[test]
+    fn a_pane_that_never_reported_its_directory_gets_an_explanation_not_a_form() {
+        let plan = hotkey_plan(
+            None,
+            Some("claude-mine"),
+            Some(mullion_store::SessionId(7)),
+            &[],
+        );
+        match plan {
+            HotkeyPlan::Explain(msg) => assert!(!msg.is_empty(), "解释文案不能是空字符串"),
+            other => panic!("cwd 拿不到时应该出 Explain,拿到了 {other:?}"),
+        }
+    }
+
+    /// pane 还没连上机器(拿不到 `SessionId`)同样要出 Explain,而不是 panic
+    /// 或者悄悄用一个假节点建草稿。
+    #[test]
+    fn a_pane_with_no_node_yet_gets_an_explanation_not_a_panic() {
+        let plan = hotkey_plan(Some("/srv/api"), None, None, &[]);
+        match plan {
+            HotkeyPlan::Explain(msg) => assert!(!msg.is_empty()),
+            other => panic!("node 拿不到时应该出 Explain,拿到了 {other:?}"),
+        }
+    }
+
+    /// 拿得到 cwd + node、且不属于任何项目 → 草稿,内容与 `prefill_from_pane`
+    /// 完全一致(`dir` 完整、`name` 是最后一级、`tmux_name` 是上报的那个)。
+    #[test]
+    fn a_pane_with_a_directory_and_a_node_yields_a_prefilled_draft() {
+        let plan = hotkey_plan(
+            Some("/srv/api/web"),
+            Some("claude-web"),
+            Some(mullion_store::SessionId(7)),
+            &[],
+        );
+        let HotkeyPlan::NewDraft(draft) = plan else {
+            panic!("现场齐全又不属于任何项目时应该出 NewDraft");
+        };
+        assert_eq!(draft.dir, "/srv/api/web");
+        assert_eq!(draft.name, "web");
+        assert_eq!(draft.tmux_name.as_deref(), Some("claude-web"));
+        assert_eq!(draft.nodes, vec![mullion_store::SessionId(7)]);
     }
 }

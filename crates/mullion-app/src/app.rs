@@ -4598,6 +4598,103 @@ impl App {
         true
     }
 
+    /// F240:`Ctrl+Shift+N` —— 从焦点分屏的现场建项目。
+    ///
+    /// 与另外几个快捷键同形状:判在 `input::translate_key`,闸门是
+    /// `modal_open()`,位置在输入分流**之前**(T8)—— 走到下面 `N` 会被
+    /// 编码进 PTY,给远端 shell 写一个字母。
+    ///
+    /// 判定全在 `project::hotkey_plan` 那张表里,这里只接线。
+    fn project_hotkey_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
+            return false;
+        };
+        if ke.state != ElementState::Pressed {
+            return false;
+        }
+        let Some((key, mods)) = input::translate_key(ke, self.mods) else {
+            return false;
+        };
+        if self.modal_open() || !mods.ctrl || !mods.shift || mods.alt || mods.sup {
+            return false;
+        }
+        if !matches!(key, Key::Char('n' | 'N')) {
+            return false;
+        }
+        self.apply_project_hotkey();
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F240:`Ctrl+Shift+N` 按下之后到底做什么。判定全在
+    /// `project::hotkey_plan`(纯函数),这里只负责取现场、按结果落地。
+    ///
+    /// 三条出口:
+    /// - 这块 pane 已属某个项目 → 打开那个项目的编辑表单(不新建)。
+    /// - 拿得到 cwd + 节点 → 先往库里落一条骨架(名字用
+    ///   `fresh_project_name` 保证不撞),再把预填内容**只写进草稿**——
+    ///   草稿相对库里那条天然是脏的,F239「脏了不关」保护自动生效,手一滑
+    ///   点到终端不会把预填清掉;撞名由右栏 `validate_project` 当场报出来。
+    /// - 拿不到现场 → 出一条 toast 说清原因,不弹空表单。
+    fn apply_project_hotkey(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Warn, "还没有打开会话库,建不了项目");
+            return;
+        };
+        let cwd = self
+            .tabs
+            .active()
+            .and_then(|t| t.content.focused_pane_cwd())
+            .map(|c| String::from_utf8_lossy(&c).into_owned());
+        // 一次性把 `ws` 借出来算完两个值,别调三次 `active_ws()`。
+        let (tmux, node) = match self
+            .active_ws()
+            .and_then(|ws| ws.focused().map(|p| (ws, p)))
+        {
+            Some((ws, p)) => (
+                p.tmux.clone(),
+                ws.hosts.get(p.host_ix).and_then(|h| h.session_id),
+            ),
+            None => (None, None),
+        };
+        match crate::project::hotkey_plan(cwd.as_deref(), tmux.as_deref(), node, store.projects()) {
+            crate::project::HotkeyPlan::EditExisting(id) => {
+                let draft = store.projects().iter().find(|p| p.id == id).cloned();
+                self.ui.project_manager_open = true;
+                self.ui.project_selected = Some(id);
+                self.ui.project_draft = draft;
+                self.ui.project_focus_name = true;
+            }
+            crate::project::HotkeyPlan::NewDraft(mut draft) => {
+                let now = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                let name = crate::project::fresh_project_name(store.projects());
+                // 上面的 `store` 是共享借用,到这里已经用完(不再引用它);
+                // 借用检查器按控制流而非词法作用域算活跃期,这里可以安全地
+                // 换成可变借用。
+                let store = self
+                    .store
+                    .as_mut()
+                    .expect("刚才在同一个 self.store 上判过 Some,中途没有别的代码能把它清空");
+                let id = store.add_project(name, String::new(), &now);
+                if let Err(e) = store.save() {
+                    self.ui.set_error(e.to_string());
+                }
+                draft.id = id;
+                draft.created_at = now;
+                self.ui.project_manager_open = true;
+                self.ui.project_selected = Some(id);
+                self.ui.project_draft = Some(*draft);
+                self.ui.project_focus_name = true;
+            }
+            crate::project::HotkeyPlan::Explain(msg) => {
+                self.ui.set_toast(crate::ui::toast::Kind::Warn, msg);
+            }
+        }
+    }
+
     /// F239:一次指针按下,如果落在最上层那个弹窗外面就把它关掉。
     ///
     /// 返回 `true` = 这一下已经被这条路径吃掉,调用方必须立刻 `return`。
@@ -10603,6 +10700,11 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // F6/T8:换焦点同样必须在分流之前截,理由同上。
         if self.focus_hotkey_event(&event) {
+            return;
+        }
+        // F240/T8:从终端区建项目同样必须在分流之前截 —— `N` 走到下面会被
+        // 编码进 PTY,给远端 shell 写一个字母。
+        if self.project_hotkey_event(&event) {
             return;
         }
         // F239:点在最上层弹窗外面 → 走它自己的取消出口关掉,并把这一下
@@ -21996,6 +22098,44 @@ mod tests {
         assert!(
             hotkey < routing,
             "focus_hotkey_event 排在了输入分流之后 —— 排在后面等于没截"
+        );
+    }
+
+    /// **接线守护 / T8**:F240 建项目快捷键(`Ctrl+Shift+N`)必须同样在输入
+    /// 分流**之前**被截走。与前三条同构:不截的话,`N` 会先被喂给 egui 的
+    /// 焦点系统,也会被下面的 `KeyboardInput` 分支编码进 PTY,写给远端一个
+    /// 字母。
+    ///
+    /// 用 `body_of`(先切出 `window_event` 的块体,再剥掉 `//` 行注释)而不是
+    /// 前三条用的裸 `include_str!` 子串查找 ——本仓库记过的坑「源码切片守护
+    /// 不剥注释」:本条判据说明文字里就带着 `self.project_hotkey_event` 这个
+    /// 名字,不剥注释的话文档注释自己就能把断言喂饱,恒绿。
+    ///
+    /// 验证边界同前三条:只挡得住「调用点跑到分流之后 / 整个没调」,挡不住
+    /// 有人在 `project_hotkey_event` 里返回恒 false。
+    ///
+    /// 自证会变红:把 `window_event` 里那句 `if self.project_hotkey_event(&event)`
+    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
+    #[test]
+    fn project_shortcut_is_swallowed_before_the_input_routing() {
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+        };
+        let body = strip(body_of(
+            prod_src(),
+            "fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {",
+        ));
+        let hotkey = body.find("self.project_hotkey_event(&event)").expect(
+            "window_event 里没调 project_hotkey_event —— Ctrl+Shift+N 会被喂给 egui(T8),\
+             还会被编码进 PTY 写给远端",
+        );
+        let routing = body.find("egui_should_see").expect("找不到输入分流那一段");
+        assert!(
+            hotkey < routing,
+            "project_hotkey_event 排在了输入分流之后 —— 排在后面等于没截:\
+             Ctrl+Shift+N 里的 N 已经被喂给 egui 的焦点系统了"
         );
     }
 
