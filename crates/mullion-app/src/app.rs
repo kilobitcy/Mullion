@@ -2510,10 +2510,6 @@ impl Modal {
 ///
 /// 与 `ui::build_ui` 的绘制顺序严格互逆(后画的盖在上面)。这张表决定
 /// 「一次点击关谁」,排错了的症状是点一下关掉了底下那个、上面那个还杵着。
-///
-/// **本 Task 只搭表 + 穷尽 match,不接线到 `window_event`**(留给下一个
-/// Task)——`#[allow(dead_code)]` 是过渡状态,接线之后即可去掉。
-#[allow(dead_code)]
 const DISMISS_ORDER: &[Modal] = &[
     Modal::ExitConfirm,
     Modal::ProjectPick,
@@ -2540,7 +2536,13 @@ const DISMISS_ORDER: &[Modal] = &[
 ///   没有「外面」可言(它们的 area 就是文件面板本身)。
 /// - `Paste`:走 `egui::Modal` 自带的遮罩点击,在这里再接一遍等于同一个
 ///   行为两条路。
-#[allow(dead_code)] // 过渡状态,见 `DISMISS_ORDER` 的说明
+///
+/// **这张表只作文档与完备性对照**(见下面
+/// `every_dialog_is_either_in_the_dismiss_order_or_explicitly_exempt`),
+/// 豁免的实际生效点是 `dismiss_areas` 里这七个变体各自的 `None` 那一臂——
+/// `dismiss_verdict` 只读 `DISMISS_ORDER`,一个弹窗没在 `DISMISS_ORDER`
+/// 里就永远问不到它,豁不豁免全看 `dismiss_areas` 答不答得出 area。
+#[allow(dead_code)]
 const DISMISS_EXEMPT: &[Modal] = &[
     Modal::Unlock,
     Modal::HostKey,
@@ -2605,7 +2607,6 @@ fn session_manager_dirty(ui: &crate::ui::UiState) -> bool {
 ///
 /// **写成自由函数只收 `&UiState`**:本文件的测试从来构造不出一个 `App`
 /// (要窗口/GPU),挂成 `&self` 方法的话上面那条完备性闸门根本跑不起来。
-#[allow(dead_code)] // 过渡状态,见 `DISMISS_ORDER` 的说明
 fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
     fn w(title: &str) -> egui::Id {
         // `egui::Window::new(t)` 的 area id 恒为 `Id::new(t)`
@@ -2677,6 +2678,29 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
             .as_ref()
             .map(|d| vec![crate::ui::project_pick::area_id(d.pane)]),
     }
+}
+
+/// F239:这一下该关掉哪个弹窗。`None` = 不关。
+///
+/// **写成只收纯参数的自由函数**:`App` 要窗口 + GPU + `EventLoopProxy` 才能
+/// 造出来,本文件的测试从来构造不出一个 `App`。`dirty` 用闭包传进来,把
+/// `App` 那半边(store / tabs / settings)整个隔在外面——这个函数本身只做
+/// 「按 `DISMISS_ORDER` 挨个问 `dismiss_areas`/`dirty`,交给 `dismiss::pick`
+/// 裁决」,不知道也不需要知道 `dirty` 是怎么算出来的。
+fn dismiss_verdict(
+    ctx: &egui::Context,
+    ui: &crate::ui::UiState,
+    dirty: &dyn Fn(Modal) -> bool,
+    pos: egui::Pos2,
+) -> Option<Modal> {
+    let candidates: Vec<crate::ui::dismiss::Candidate> = DISMISS_ORDER
+        .iter()
+        .map(|m| crate::ui::dismiss::Candidate {
+            hit: dismiss_areas(ui, *m).map(|ids| crate::ui::dismiss::locate(ctx, &ids, pos)),
+            dirty: dirty(*m),
+        })
+        .collect();
+    crate::ui::dismiss::pick(&candidates).map(|ix| DISMISS_ORDER[ix])
 }
 
 /// F59:传输队列在跑时的界面刷新间隔(毫秒)。进度条 5Hz 已经够顺,
@@ -3883,10 +3907,6 @@ impl App {
     ///
     /// 换节点/切项目弹窗恒**不脏**:它们没有任何要保存的数据(只有一个
     /// 搜索词,丢了零成本),点外面永远能关掉。未列出的其余变体同理恒 `false`。
-    ///
-    /// **本 Task 只搭判据,不接线到 `window_event`**(留给下一个 Task)——
-    /// `#[allow(dead_code)]` 是过渡状态,接线之后即可去掉。
-    #[allow(dead_code)]
     fn dismiss_dirty(&self, m: Modal) -> bool {
         match m {
             Modal::SessionManager => session_manager_dirty(&self.ui),
@@ -3933,10 +3953,6 @@ impl App {
     ///
     /// **不新增出口变体**:每一条都复用那个弹窗自己的取消路径,否则
     /// 「点 × 关」和「点外面关」会变成两种语义,而差别只在某些状态没清。
-    ///
-    /// **本 Task 只搭出口,不接线到 `window_event`**(留给下一个 Task)——
-    /// `#[allow(dead_code)]` 是过渡状态,接线之后即可去掉。
-    #[allow(dead_code)]
     fn dismiss(&mut self, m: Modal) {
         match m {
             Modal::About => self.ui.about_open = false,
@@ -4578,6 +4594,71 @@ impl App {
             return false;
         }
         self.focus = self.focus.toggled();
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F239:一次指针按下,如果落在最上层那个弹窗外面就把它关掉。
+    ///
+    /// 返回 `true` = 这一下已经被这条路径吃掉,调用方必须立刻 `return`。
+    ///
+    /// **判按下不判松开**:松开判的话,在设置里按住滑块一路拖出窗口再松手
+    /// 会把整个设置窗关掉,而那是个正常操作。
+    ///
+    /// 位置在输入分流**之前**(同标注/标签/文件/焦点四个快捷键,T8)。
+    ///
+    /// **取点位置不能用 `self.cursor_px`**:弹窗开着时,下面输入分流里
+    /// `WindowEvent::CursorMoved` 那一支会在 egui 已经收下指针的分支里
+    /// `return`(约在本文件 `wants_pointer_input()` 那段),走不到函数底部
+    /// `match event { WindowEvent::CursorMoved { .. } => self.cursor_px = .. }`
+    /// 那一句——`self.cursor_px` 会冻在打开弹窗之前的最后一个位置,和这一下
+    /// 实际点的地方毫无关系,而且没有任何报错。
+    ///
+    /// 位置改从 egui 自己攒的 `RawInput` 队列里取:这个函数在整段分流**之前**
+    /// 被调用,此刻 `active.egui_state` 里还没把事件交给 egui,队列里含紧邻
+    /// 这次点击的那次 `PointerMoved`(它是上一次 `window_event` 调用喂进去的,
+    /// 那次走的是 `on_window_event` 那条路,不受上面那个 early-return 影响)。
+    /// 不做手工 `/ ppp` 换算:`egui-winit` 已经把窗口像素换成了 egui 的逻辑
+    /// 点,而且 `pixels_per_point` 含 `zoom_factor`,手算会漂。
+    fn dismiss_on_outside_press(&mut self, event: &WindowEvent) -> bool {
+        if !matches!(
+            event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            }
+        ) {
+            return false;
+        }
+        let Some(active) = self.active.as_ref() else {
+            return false;
+        };
+        // clone:egui::Context 内部是 Arc,克隆代价可忽略——这里是为了在下面
+        // 调用 `self.dismiss(..)`(要 `&mut self`)之前结束对 `self.active`
+        // 的借用。
+        let ctx = active.egui_ctx.clone();
+        let pos = active
+            .egui_state
+            .egui_input()
+            .events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                egui::Event::PointerMoved(p) => Some(*p),
+                egui::Event::PointerButton { pos, .. } => Some(*pos),
+                _ => None,
+            })
+            // 回落:反映的是上一帧的输入,可能差一帧,只当兜底。
+            .or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+        let Some(pos) = pos else {
+            return false;
+        };
+        let is_dirty = |m: Modal| self.dismiss_dirty(m);
+        let Some(m) = dismiss_verdict(&ctx, &self.ui, &is_dirty, pos) else {
+            return false;
+        };
+        self.dismiss(m);
         self.request_ui_redraw();
         true
     }
@@ -10524,6 +10605,12 @@ impl ApplicationHandler<UserEvent> for App {
         if self.focus_hotkey_event(&event) {
             return;
         }
+        // F239:点在最上层弹窗外面 → 走它自己的取消出口关掉,并把这一下
+        // **吃掉**。必须在分流之前(理由见 `dismiss_on_outside_press` 的
+        // 文档)——放到下面的话,这一下会先被 egui 或终端收走。
+        if self.dismiss_on_outside_press(&event) {
+            return;
+        }
         // 输入分流(§4.5)。**键盘与指针的顺序是反的,不是笔误**:
         // - 指针:先喂 egui 再判。egui 要靠 `CursorMoved` 维护 hover,不喂就没有
         //   `wants_pointer_input()` 可言。
@@ -14290,10 +14377,10 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         attach_check_verdict, auto_dial_summary, automation_for_leaf, autoscroll_for_pane,
         blink_on_at, blink_wake_at, clear_leaf_attach_intent, clip_still_matches_what_was_pasted,
-        credential_delete_error, decide_paste, dismiss_areas, download_job, drive_attach_checks_of,
-        effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
-        files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
-        has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
+        credential_delete_error, decide_paste, dismiss_areas, dismiss_verdict, download_job,
+        drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
+        files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
+        font_px_for, has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
         new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
         pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane,
         rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
@@ -16889,6 +16976,146 @@ mod tests {
         assert!(
             arm.contains("self.apply_file_op(gen, op)"),
             "dismiss(FilesDialog) 没有施加 cancel_op 给出的处置 —— 挂起的意图不会被撤销"
+        );
+    }
+
+    /// F239:判在按下,不判松开。
+    ///
+    /// 松开判的话,在设置窗里按住滑块一路拖出窗口再松手,会把整个设置窗
+    /// 关掉,而那是个正常操作。
+    ///
+    /// **验证边界**:`dismiss_on_outside_press` 要 `&mut self` 才能跑(要真
+    /// `App`,本文件的测试从来构造不出一个),这里只扎源码结构 ——
+    /// 挡得住「把 `Pressed` 换成 `Released` 或去掉这个判据」,挡不住运行时
+    /// 才会暴露的问题。
+    ///
+    /// 自证会变红:把 `state: ElementState::Pressed` 换成
+    /// `state: ElementState::Released`。
+    #[test]
+    fn the_verdict_is_taken_on_press_not_on_release() {
+        let body = body_of(prod_src(), "fn dismiss_on_outside_press(");
+        assert!(
+            body.contains("state: ElementState::Pressed"),
+            "dismiss_on_outside_press 没有把判据钉在 Pressed 上 —— 松开也会被判定,\
+             会把正常的拖拽操作(例如设置里拖滑块拖出窗口再松手)误判成点外面关闭"
+        );
+        assert!(
+            !body.contains("ElementState::Released"),
+            "dismiss_on_outside_press 里出现了 Released —— 判定不该看松开"
+        );
+    }
+
+    /// F239:跑两帧把「关于」窗画出来,给下面几条 `dismiss_verdict` 测试用。
+    /// 照抄 `ui::dismiss::tests::probe` 的姿势(那边的 `probe` 是私有的,
+    /// 这里不能直接复用)。
+    fn probe_about<R>(probe: impl FnOnce(&egui::Context) -> R) -> R {
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::Window::new(crate::ui::ABOUT_WINDOW_TITLE)
+                    .fixed_pos(egui::pos2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label("about");
+                    });
+            });
+        }
+        probe(&ctx)
+    }
+
+    /// F239:点在最上层弹窗外面 → 挑出它来关;点在它自己身上 → 不关。
+    ///
+    /// 自证会变红:把 `dismiss_verdict` 里
+    /// `crate::ui::dismiss::pick(&candidates).map(|ix| DISMISS_ORDER[ix])`
+    /// 换成恒 `None`。
+    #[test]
+    fn a_click_outside_the_top_dialog_picks_it() {
+        let ui = crate::ui::UiState {
+            about_open: true,
+            ..Default::default()
+        };
+        let dirty = |_: Modal| false;
+
+        let outside =
+            probe_about(|ctx| dismiss_verdict(ctx, &ui, &dirty, egui::pos2(9000.0, 9000.0)));
+        assert_eq!(outside, Some(Modal::About));
+
+        let inside = probe_about(|ctx| {
+            let rect = ctx
+                .memory(|m| m.area_rect(egui::Id::new(crate::ui::ABOUT_WINDOW_TITLE)))
+                .expect("关于窗应有矩形");
+            dismiss_verdict(ctx, &ui, &dirty, rect.center())
+        });
+        assert_eq!(inside, None);
+    }
+
+    /// F239:脏了不关(草稿类弹窗点外面不能被静默清掉)。
+    ///
+    /// `About` 本身没有草稿,这里只是借它验证 `dismiss_verdict` 把
+    /// `dirty` 传导到了 `Candidate` 上 —— 真正「哪个弹窗脏不脏」的判据由
+    /// `dismiss_dirty`/`session_manager_dirty` 那几条测试守。
+    ///
+    /// 自证会变红:把 `dismiss_verdict` 里 `Candidate { .. dirty: dirty(*m) }`
+    /// 换成 `dirty: false`。
+    #[test]
+    fn a_dirty_dialog_survives_a_click_outside() {
+        let ui = crate::ui::UiState {
+            about_open: true,
+            ..Default::default()
+        };
+        let dirty = |m: Modal| m == Modal::About;
+
+        let verdict =
+            probe_about(|ctx| dismiss_verdict(ctx, &ui, &dirty, egui::pos2(9000.0, 9000.0)));
+        assert_eq!(verdict, None);
+    }
+
+    /// F239:关掉弹窗的这一下必须被**吃掉**,不能再落到下面的分流里。
+    ///
+    /// 不吃的话:弹窗在这一帧关掉 → 下面那段分流重新算 `modal_open()`
+    /// 得 `false` → 同一下点击被判给终端,「关掉弹窗」会顺带在终端里起一段
+    /// 划选甚至发一次鼠标上报。
+    ///
+    /// **验证边界**:`window_event` 要真 `App` + `EventLoopProxy` 才能跑,
+    /// 这里只扎源码结构 —— 挡得住「调用点被删掉/挪到分流之后/漏了
+    /// `return`」,挡不住 `dismiss_on_outside_press` 内部判定对不对(那部分
+    /// 由上面几条行为测试守)。
+    ///
+    /// 自证会变红:把
+    /// `if self.dismiss_on_outside_press(&event) { return; }`
+    /// 整段挪到 `let modal = self.modal_open();` 之后。
+    #[test]
+    fn the_click_that_closes_a_dialog_does_not_also_reach_the_terminal() {
+        let src = include_str!("app.rs");
+        let at = src
+            .find("\n    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {")
+            .expect("找不到 window_event 的定义");
+        let after = &src[at + 1..];
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 window_event 的函数结尾")];
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = "if self.dismiss_on_outside_press(&event) {";
+        let dismiss_at = code
+            .find(needle)
+            .expect("window_event 没有调用 dismiss_on_outside_press —— 点外面关弹窗这条路径没接上");
+        let modal_at = code
+            .find("let modal = self.modal_open();")
+            .expect("找不到分流前的 modal_open 调用");
+        assert!(
+            dismiss_at < modal_at,
+            "dismiss_on_outside_press 排在了分流判据之后 —— 这一下会先被 egui/终端\
+             收走,关弹窗的同时还会在终端里划一下选区"
+        );
+        let after_call = &code[dismiss_at + needle.len()..];
+        let next_line = after_call.lines().nth(1).unwrap_or("").trim();
+        assert_eq!(
+            next_line, "return;",
+            "dismiss_on_outside_press 命中后没有立刻 return —— 这一下会被同一次\
+             事件继续往下处理"
         );
     }
 
