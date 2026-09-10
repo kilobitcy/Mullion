@@ -152,6 +152,14 @@ pub struct PaneState {
     /// 最新的",一个管"这次粘贴请求是不是最新的" —— 混用会让换目录和
     /// 重复粘贴互相误伤对方的去重。
     pub paste_seq: u64,
+    /// F249:每发起一次**路径类型探测**(路径条敲完回车,先问一句「这是不是
+    /// 目录」)+1。同 `paste_seq`,与 `request_seq` 分开:那一个管「这份目录
+    /// 列表是不是最新的」,混用的话敲一次路径条就会把在途的列目录结果判成
+    /// 过期,整栏永远停在 `Loading`。
+    ///
+    /// 也是序号法而不是「正在探测中」的布尔:`wind_down`/断线会直接
+    /// `abort()` 在途任务(T11),标记会永久卡住、这一栏的路径条从此失效。
+    probe_seq: u64,
 }
 
 impl PaneState {
@@ -174,6 +182,7 @@ impl PaneState {
             reveal_pick: None,
             scroll_to: None,
             paste_seq: 0,
+            probe_seq: 0,
         }
     }
 
@@ -272,6 +281,19 @@ impl PaneState {
     pub fn begin_paste(&mut self) -> u64 {
         self.paste_seq += 1;
         self.paste_seq
+    }
+
+    /// F249:开始一次路径类型探测,返回本次的序号。调用方把它随异步任务
+    /// 带走,结果回来时用 [`PaneState::probe_is_current`] 校验。
+    pub fn begin_probe(&mut self) -> u64 {
+        self.probe_seq += 1;
+        self.probe_seq
+    }
+
+    /// F249:这条探测结果还作数吗。`false` = 用户在等待期间又敲了一次
+    /// (或换了目录/标签),这一条是后发先至的旧结果,丢掉。
+    pub fn probe_is_current(&self, seq: u64) -> bool {
+        seq == self.probe_seq
     }
 
     /// F218:目录刚列完 —— 把「要亮给用户看的那一条」落到选中 + 光标 +
@@ -1279,5 +1301,33 @@ mod tests {
         s.load = Load::Ready;
         s.selected.insert(rp("logs"));
         assert_eq!(s.status_text(), "已选 1 项");
+    }
+
+    /// F249:用户敲得比网络快 —— 后发先至的旧探测结果不能把新的顶掉。
+    ///
+    /// 自证会变红:把 `begin_probe` 里的 `self.probe_seq += 1;` 删掉。
+    #[test]
+    fn a_stale_path_probe_is_dropped() {
+        let mut s = PaneState::new(rp("/"));
+        let first = s.begin_probe();
+        let second = s.begin_probe();
+        assert!(!s.probe_is_current(first), "第一次的结果已经过期");
+        assert!(s.probe_is_current(second), "最后一次的结果该收下");
+    }
+
+    /// F249:路径探测的序号与**列目录**的序号是两件事。混用一个的话,
+    /// 「敲一次路径条」会把在途的列目录结果judge成过期、整栏卡在
+    /// `Loading`(同 `paste_seq` 与 `request_seq` 分开的理由)。
+    ///
+    /// 自证会变红:把 `begin_probe` 改成 `self.request_seq += 1; self.request_seq`。
+    #[test]
+    fn probing_a_path_does_not_disturb_the_directory_request_sequence() {
+        let mut s = PaneState::new(rp("/"));
+        let list = s.begin_load(rp("/a"));
+        s.begin_probe();
+        assert!(
+            s.accept(list, Ok(Vec::new())),
+            "探测序号动了列目录那一条的序号 —— 这一份目录列表被当成过期丢掉了"
+        );
     }
 }

@@ -223,6 +223,19 @@ pub enum UserEvent {
         path: mullion_ssh::sftp::RemotePath,
         result: Result<bool, String>,
     },
+    /// F249:路径条敲的那一串,末段是目录还是文件问完了。`Ok(true)` = 目录。
+    ///
+    /// 跟 `RevealStat` 问的是同一个问题,**事件分开是因为收方的序号空间不同**:
+    /// 那一条对齐 `PendingReveal::seq`(全 App 一份,而且只有终端标签存得下),
+    /// 这一条对齐 `PaneState::probe_seq`(每栏一份,SFTP 节点标签上也有 ——
+    /// 路径条在那种标签上是主要入口)。合成一个事件的话两套计数器会撞号,
+    /// 撞上就是「一次划选跳转被路径条的结果顶掉」,而且完全静默。
+    PathProbed {
+        generation: u64,
+        seq: u64,
+        path: mullion_ssh::sftp::RemotePath,
+        result: Result<bool, String>,
+    },
     /// F142:一次 `getent` 查完了(属主列要显示的用户名/组名)。
     ///
     /// **失败也要送回来**(`stdout: None`):发出去那一刻这批 id 已经记进了
@@ -4565,6 +4578,49 @@ impl App {
         self.request_ui_redraw();
     }
 
+    /// F249:路径条那次探测回来了 —— 目录就进去,文件就进它的父目录并把它
+    /// 亮出来。落地那三步跟 `accept_reveal_stat` 共用同一套
+    /// (`reveal_destination` + `Goto` + `set_reveal_pick`),两处不同源的话
+    /// 「划选跳过去」和「路径条敲过去」会落在不同的地方。
+    ///
+    /// **失败不原地返回**,这一点跟 `accept_reveal_stat` 相反:那边的源头是
+    /// 一次划选,划错了不该动用户正在看的目录;这边是用户亲手敲的一串,敲错
+    /// 了他要的反馈是「这个目录打不开」。所以当目录往下走,让列目录去报那条
+    /// 真正的错(`Load::Failed` 会把远端的原话显示出来)。
+    fn accept_path_probe(
+        &mut self,
+        generation: u64,
+        seq: u64,
+        path: mullion_ssh::sftp::RemotePath,
+        result: Result<bool, String>,
+    ) {
+        let Some(files) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+        else {
+            return;
+        };
+        // 后发先至:等待期间用户又敲了一次(或换了目录/机器),这一条是旧的。
+        if !files.remote.probe_is_current(seq) {
+            return;
+        }
+        let is_dir = result.unwrap_or(true);
+        let target = RevealTarget {
+            generation,
+            column: crate::files::PanelColumn::Remote,
+            // 路径条就长在这个标签这条 channel 上,不存在「发起时在另一台」
+            // 的情形(那是 F218 划选跳转独有的)。
+            host_ix: None,
+            path,
+            arrived: false,
+        };
+        let (goto, pick) = self.reveal_destination(&target, is_dir);
+        self.apply_remote_file_action(generation, crate::ui::files_panel::FileAction::Goto(goto));
+        self.set_reveal_pick(&target, pick);
+        self.request_ui_redraw();
+    }
+
     /// F218:目标是目录就进它本身、不亮任何一条;是文件就进父目录、亮它。
     fn reveal_destination(
         &self,
@@ -5082,6 +5138,9 @@ impl App {
         let Some(files) = tab.content.files_panel_mut() else {
             return;
         };
+        // F249:路径条敲的那一串末段是文件时,真正要去的是它的父目录,并把
+        // 它亮出来。算在这儿、写在 `begin_load` 之后 —— 见函数尾部。
+        let mut pick: Option<mullion_ssh::sftp::RemotePath> = None;
         let target = match &action {
             FileAction::Goto(target) => target.clone(),
             FileAction::Up => local::parent_local(&files.local.cwd),
@@ -5094,13 +5153,33 @@ impl App {
             // F131:同远端那条,只是 home 来自本机。
             FileAction::GotoInput(input) => {
                 let home = crate::files::local::home_dir();
-                match crate::files::path_input::resolve_local_input(
+                let p = match crate::files::path_input::resolve_local_input(
                     input,
                     &files.local.cwd,
                     home.as_ref(),
                 ) {
                     Some(p) => p,
                     None => return,
+                };
+                // F249:末段是文件就进它的父目录、把它亮出来。本机的
+                // `metadata` 是同步的,一帧之内分辨得完 —— 不像远端要一次
+                // `stat` 往返(见 `apply_remote_file_action` 那条)。
+                //
+                // 分辨不出来(路径根本不存在)**不在这里报错**:照旧当目录
+                // 往下走,让 `list_dir` 失败落成 `Load::Failed`。用户亲手
+                // 敲错一串,要的反馈是「这个目录打不开」,不是「按了回车
+                // 什么都没发生」。
+                match std::fs::metadata(local::to_path(&p)) {
+                    Ok(md) if !md.is_dir() => {
+                        pick = Some(mullion_ssh::sftp::RemotePath::from_bytes(
+                            crate::files::reveal::base_name(
+                                p.as_bytes(),
+                                crate::files::PanelColumn::Local,
+                            ),
+                        ));
+                        local::parent_local(&p)
+                    }
+                    _ => p,
                 }
             }
             // D5:本地栏不提供写操作,`menu_items_for` 也不会给出这些项 ——
@@ -5159,6 +5238,11 @@ impl App {
             }
         };
         let seq = files.local.begin_load(target.clone());
+        // F249:必须夹在 `begin_load` 和 `accept` 中间 —— `accept` 里就把它
+        // 取走用掉了(`take_reveal_pick`),写在后面等于写给下一次加载。
+        if pick.is_some() {
+            files.local.reveal_pick = pick;
+        }
         let result = local::list_dir(&local::to_path(&target));
         files.local.accept(seq, result);
         mark_ui_dirty!(self.ui_dirty);
@@ -5414,6 +5498,9 @@ impl App {
         let Some(files) = tab.content.files_panel_mut() else {
             return;
         };
+        // F249:`Some(seq)` = 这一趟不是去列目录,是去问一句「末段是目录还是
+        // 文件」。只有路径条那条分支会置上,见函数尾部的分岔。
+        let mut probe: Option<u64> = None;
         let target = match &action {
             FileAction::Goto(target) => target.clone(),
             // **`RemotePath::parent()`,不是 `local::parent_local`**——那是
@@ -5430,14 +5517,19 @@ impl App {
             // 真正跳不过去的路径交给远端报错(`spawn_sftp_list_dir` 失败会落
             // `Load::Failed`),不在客户端猜。
             FileAction::GotoInput(input) => {
-                match crate::files::path_input::resolve_remote_input(
+                let p = match crate::files::path_input::resolve_remote_input(
                     input,
                     &files.remote.cwd,
                     home.as_deref(),
                 ) {
                     Some(p) => p,
                     None => return,
-                }
+                };
+                // F249:末段可能是文件(`/data/bak/app.log`),纯语法分辨不出来
+                // —— 先问远端一句,`accept_path_probe` 收到答案才发真正的
+                // `Goto`。这一条**不列目录**。
+                probe = Some(files.remote.begin_probe());
+                p
             }
             // 这几个在函数开头就分流掉了(那里不需要借 `files`),走不到这儿。
             FileAction::Ask(_)
@@ -5459,9 +5551,25 @@ impl App {
             | FileAction::ClipCut
             | FileAction::ClipPaste => return,
         };
-        let seq = files.remote.begin_load(target.clone());
-        let task =
-            spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, target, seq);
+        // F249:探测那一趟不动 `cwd`、不进 `Loading` —— 它还不知道要去哪儿。
+        // 借 `files` 到此为止(下面几行只用 `self`),两条路各发各的请求。
+        let seq = match probe {
+            Some(seq) => seq,
+            None => files.remote.begin_load(target.clone()),
+        };
+        let task = match probe {
+            Some(_) => spawn_sftp_path_probe(
+                &self._runtime,
+                &self.proxy,
+                generation,
+                client,
+                target,
+                seq,
+            ),
+            None => {
+                spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, target, seq)
+            }
+        };
         self.track_sftp_task(generation, task);
         mark_ui_dirty!(self.ui_dirty);
     }
@@ -10752,6 +10860,14 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_reveal_stat(generation, seq, path, result);
             }
+            UserEvent::PathProbed {
+                generation,
+                seq,
+                path,
+                result,
+            } => {
+                self.accept_path_probe(generation, seq, path, result);
+            }
             UserEvent::OwnerNames {
                 generation,
                 query,
@@ -13846,6 +13962,40 @@ fn spawn_sftp_stat(
     })
 }
 
+/// F249:路径条按下回车之后,先问一句「这条路径末段是目录还是文件」。
+///
+/// 跟 `spawn_sftp_stat` 问的是同一句、同样是 **lstat 语义**(指向目录的软
+/// 链接算「文件」,亮在父目录里,用户再按一次回车才跟进去 —— 两个入口的
+/// 表现必须一致,否则同一条路径从划选跳过去和从路径条敲过去落点不同)。
+///
+/// 分成两个函数只为了发**不同的事件**:收方的序号空间不同,理由见
+/// `UserEvent::PathProbed` 的文档。
+///
+/// 同样**返回 `JoinHandle`,调用方必须存进 `sftp_tasks`**。
+fn spawn_sftp_path_probe(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    client: Arc<mullion_ssh::sftp::SftpClient>,
+    path: mullion_ssh::sftp::RemotePath,
+    seq: u64,
+) -> tokio::task::JoinHandle<()> {
+    let proxy = proxy.clone();
+    runtime.spawn(async move {
+        let result = client
+            .stat(&path)
+            .await
+            .map(|e| e.kind == mullion_ssh::sftp::EntryKind::Dir)
+            .map_err(|e| format!("{e}"));
+        let _ = proxy.send_event(UserEvent::PathProbed {
+            generation,
+            seq,
+            path,
+            result,
+        });
+    })
+}
+
 /// F220:剪切粘贴成功后要不要清空这个标签的远端剪贴板。复制粘贴不清——
 /// 连着粘几个目录是常见用法。**按值吃掉 `clip`**:`Cut` 时把它整个搬进
 /// `OpFollow::ClearClip` 带到完成事件里,完成时拿它跟*那时候*的
@@ -14096,6 +14246,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | SftpOpened { .. }
         | SftpListed { .. }
         | RevealStat { .. }
+        | PathProbed { .. }
         | OwnerNames { .. }
         | ProjectClientsChecked { .. }
         | SftpOpDone { .. }
@@ -19512,6 +19663,139 @@ mod tests {
                  {other_cwd})—— 大概率是复制粘贴时手滑抄错了栏"
             );
         }
+    }
+
+    /// F249 接线守护:远端路径条敲进来的一串,**末段可能是文件**,必须先
+    /// `stat` 一次再决定去哪儿 —— 直接拿去列目录的话,敲
+    /// `/data/bak/app.log` 只会得到一条 `NotADirectory`,整栏落
+    /// `Load::Failed`,而用户明明给的是一条存在的路径。
+    ///
+    /// 判据落在**这条分支不能自己去列目录**上:探测走的是 `begin_probe`
+    /// (`PaneState` 自己那份序号,与 `request_seq` 分开,理由见它的文档),
+    /// 结果回来才由 `accept_path_probe` 发真正的 `Goto`。
+    ///
+    /// 扎源码结构:验它要一条活 sftp 连接,这个容器里造不出来。
+    ///
+    /// 自证会变红:把 `GotoInput` 分支里的 `begin_probe(` 换回
+    /// `begin_load(` —— 第二条断言红。
+    #[test]
+    fn a_remote_path_bar_entry_is_probed_before_anyone_tries_to_list_it() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let after = production
+            .split("fn apply_remote_file_action")
+            .nth(1)
+            .expect("找不到 apply_remote_file_action 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let at = body
+            .find("FileAction::GotoInput")
+            .expect("远端栏没有 GotoInput 分支了 —— 路径条整个失效");
+        // 分支体止于下一个 arm 的注释/分支头。取到函数体尾就够:后面还有
+        // 一条断言专门盯住「分支里出现的是 begin_probe 而不是 begin_load」。
+        let arm = &body[at..];
+        let probe_at = arm
+            .find("begin_probe(")
+            .expect("GotoInput 分支没有开探测 —— 带文件名的路径会被直接拿去列目录");
+        let load_at = arm.find("begin_load(").unwrap_or(usize::MAX);
+        assert!(
+            probe_at < load_at,
+            "GotoInput 分支在探测之前就 begin_load 了 —— 那一次列目录会\
+             拿文件当目录发出去,整栏落 Load::Failed"
+        );
+        assert!(
+            body.contains("spawn_sftp_path_probe("),
+            "远端栏没有把探测发出去 —— begin_probe 只是攒了个序号,\
+             没人问远端那条路径是什么,路径条按下回车之后永远停在原地"
+        );
+    }
+
+    /// F249:探测回来之后的两条判据,方向跟 F218 的
+    /// `a_failed_stat_leaves_the_panel_where_it_was_and_the_pick_is_written_after_the_goto`
+    /// **一条相同、一条相反**。
+    ///
+    /// - **`set_reveal_pick` 仍必须排在 `Goto` 之后**(相同):理由见
+    ///   `set_reveal_pick` 自己的文档,写反了就是「跳过去了但什么都没选中」。
+    /// - **探测失败不原地返回**(相反):F218 的源头是一次划选,划错了不该
+    ///   动用户正在看的目录;而路径条是用户**亲手敲的**一串,敲错了他要的
+    ///   反馈是「这个目录打不开」,不是「按了回车什么都没发生」。所以失败
+    ///   时当目录往下走,让列目录去报那条真正的错。
+    ///
+    /// 自证会变红:
+    /// - 把 `unwrap_or(true)` 改成 `unwrap_or(false)` 或在失败分支加
+    ///   `return;` —— 第一条断言红。
+    /// - 把 `set_reveal_pick` 那行挪到 `apply_remote_file_action` 之前
+    ///   —— 第二条断言红。
+    #[test]
+    fn a_failed_path_probe_still_goes_where_the_user_typed_and_the_pick_follows_the_goto() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let after = production
+            .split("fn accept_path_probe")
+            .nth(1)
+            .expect("缺 accept_path_probe —— 探测结果没人收,路径条按下回车永远停在原地");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let goto_at = body
+            .find("self.apply_remote_file_action(")
+            .expect("没发 Goto —— 面板根本不会动");
+        // 只看「拿到探测结果」到「发 Goto」这一段。整个函数体扫 `return;`
+        // 会连开头那两条早退守卫(标签没了 / 序号过期)一起算进来 —— 那两条
+        // 是对的,扫上去就是假红。
+        let verdict_at = body.find("let is_dir").expect("没有从探测结果算出判定");
+        assert!(
+            body[verdict_at..goto_at].contains("unwrap_or(true)")
+                && !body[verdict_at..goto_at].contains("return;"),
+            "探测失败没有当目录往下走 —— 用户敲错一个路径只会「什么都没发生」,\
+             连一条「打不开」都看不到"
+        );
+        let pick_at = body
+            .find("self.set_reveal_pick(")
+            .expect("没写待亮的那一条 —— 跳到父目录却什么都不选中");
+        assert!(
+            goto_at < pick_at,
+            "待亮的那一条写在 Goto 之前 —— 会被 begin_load → clear_selection \
+             这条路上的重置吃掉,症状是「跳过去了但什么都没选中」且完全静默"
+        );
+    }
+
+    /// F249 本地栏:同一个功能,但本机 `metadata` 是同步的,一帧之内做完
+    /// (同 F218 的 `reveal_local`)。这里唯一会静默出事的是**写 pick 的
+    /// 位置**:本地栏 `begin_load` 之后紧跟着一句同步的 `accept`,而
+    /// `accept` 里就会把 `reveal_pick` 取走用掉 —— 写在 `accept` 之后
+    /// 等于写给下一次加载,这一次什么都不选中;写在 `begin_load` 之前则
+    /// 会被那条路上的重置吃掉。只有夹在两者中间是对的。
+    ///
+    /// 自证会变红:把 `files.local.reveal_pick = ` 那行挪到 `accept(` 之后
+    /// (或 `begin_load(` 之前)。
+    #[test]
+    fn the_local_path_bar_writes_its_pick_between_begin_load_and_accept() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let after = production
+            .split("fn apply_local_file_action")
+            .nth(1)
+            .expect("找不到 apply_local_file_action 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            body.contains("std::fs::metadata"),
+            "本地路径条没有分辨末段是不是目录 —— 敲一条带文件名的路径会被\
+             当成目录去 read_dir,得到一条「不是目录」的失败"
+        );
+        let load_at = body.find("begin_load(").expect("本地栏不列目录了?");
+        let pick_at = body
+            .find("files.local.reveal_pick = ")
+            .expect("本地栏没写待亮的那一条 —— 跳到父目录却什么都不选中");
+        let accept_at = body.find(".accept(").expect("本地栏不收列目录结果了?");
+        assert!(
+            load_at < pick_at && pick_at < accept_at,
+            "待亮的那一条没夹在 begin_load 和 accept 中间 —— 要么被这次加载\
+             的重置吃掉,要么迟到一整轮,两种都是「跳过去了但什么都没选中」"
+        );
     }
 
     /// 协调者修订 3:`handle_panel_key`(及其内部工具 `dispatch_panel_action`/
