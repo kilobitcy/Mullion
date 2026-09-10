@@ -342,6 +342,24 @@ pub fn set_levels(app: LevelFilter, deps: LevelFilter) {
     }
 }
 
+/// 当前生效的档位。F247:`apply_log_level` 拿它短路 —— 设置整份写盘从「用户
+/// 点确定」变成「每次点☆ 也走一遍」之后,不短路的话每颗☆ 都往日志里刷一行
+/// 「日志档位改为…」。
+///
+/// 日志还没接管(`init` 之前)时报当前 facade 的粗过滤,两路同值。
+pub fn levels() -> (LevelFilter, LevelFilter) {
+    match LOGGER.get() {
+        Some(l) => (
+            filter_from_usize(l.app.load(Ordering::Relaxed)),
+            filter_from_usize(l.deps.load(Ordering::Relaxed)),
+        ),
+        None => {
+            let m = log::max_level();
+            (m, m)
+        }
+    }
+}
+
 /// 把缓冲里的日志刷到盘上。`diag` 的周期线程每秒调一次 —— 没有它,
 /// info/debug 档下卡死时最后几秒的记录会随进程一起消失。
 pub fn flush_now() {

@@ -530,6 +530,15 @@ impl TextLayer {
         if !font_px.is_finite() || font_px <= 0.0 {
             return;
         }
+        // F247:同族同字号 = 什么都不用做。**判据放在这里,不放在调用方** ——
+        // 下面那两句清缓存是全 app 最贵的失效动作之一(整形缓存 + advance
+        // memo 一起清空),而 F247 之后「写一次设置」不再只发生在用户点确定
+        // 那一刻:每点一颗☆ 都会走一遍 `mutate_settings` → `apply_font`。
+        // 让调用方各自判「这次有没有换字体」是列举式的,加一个写入口就漏一处;
+        // 而漏掉的症状是「点一下☆ 画面顿一下」,没有任何报错。
+        if font_unchanged(self.family.as_deref(), self.font_px, family, font_px) {
+            return;
+        }
         self.family = family.map(str::to_string);
         self.font_px = font_px;
         self.cell_h = (font_px * 1.25).ceil();
@@ -1062,6 +1071,15 @@ fn shadow_digest(areas: &[TextArea<'_>]) -> u64 {
 /// `the_font_size_used_for_layout_is_the_one_cell_w_was_measured_with`。
 fn grid_metrics(font_px: f32, cell_h: f32) -> Metrics {
     Metrics::new(font_px, cell_h)
+}
+
+/// F247:这次 [`TextLayer::set_font`] 需不需要真的干活。
+///
+/// 单独抽出来是为了**测得着**:`TextLayer` 要一个 wgpu `Device` 才造得出来,
+/// 无头环境里没有;而这个判据错一半(比如把 `&&` 写成 `||`)的症状是「换了
+/// 字体族但字号没变时画面纹丝不动」,编译/测试/日志全静默。
+fn font_unchanged(cur_family: Option<&str>, cur_px: f32, family: Option<&str>, px: f32) -> bool {
+    cur_family == family && cur_px == px
 }
 
 /// 用 'M' 估等宽字符宽度。核对 cosmic-text 0.12 的 LayoutRun / glyph 结构后取宽度。
@@ -1741,6 +1759,62 @@ mod tests {
     /// `assert_eq!`:自证会变红,把 `grid_metrics` 的第一个参数改回
     /// `cell_h * 0.8`。位移断言本身仍然留着,它守的是另一件事——
     /// 「cosmic-text 排同一字符是线性的」这个前提,不能删。
+    /// F247:`set_font` 的短路判据 —— 四种组合各表态一次。
+    ///
+    /// 只有**族和字号都没变**才算没变。写成 `||` 的话「同族换字号」和
+    /// 「同字号换族」两种都会被当成没变直接返回,画面停在旧字体上、
+    /// 编译/测试/日志全静默(而这正是源码切片守护唯一逃得掉的那种变异)。
+    ///
+    /// 自证会变红:把 `font_unchanged` 里的 `&&` 改成 `||`。
+    #[test]
+    fn changing_either_the_family_or_the_size_counts_as_a_change() {
+        assert!(font_unchanged(None, 12.0, None, 12.0), "什么都没动");
+        assert!(
+            font_unchanged(Some("Cascadia"), 12.0, Some("Cascadia"), 12.0),
+            "同族同字号"
+        );
+        assert!(
+            !font_unchanged(Some("Cascadia"), 12.0, Some("Cascadia"), 14.0),
+            "同族换了字号 —— 必须真的换"
+        );
+        assert!(
+            !font_unchanged(Some("Cascadia"), 12.0, Some("Consolas"), 12.0),
+            "同字号换了族 —— 必须真的换"
+        );
+        assert!(
+            !font_unchanged(None, 12.0, Some("Consolas"), 12.0),
+            "从默认族换到具名族"
+        );
+    }
+
+    /// F247:短路必须排在**清缓存之前**,否则等于没短路。
+    ///
+    /// 上面那条纯函数测试证明不了「有人按这个判据提前返回了」——
+    /// `set_font` 要一个 wgpu `Device` 才调得动,无头环境里造不出 `TextLayer`,
+    /// 只能扎源码(「纯函数测得扎实、接线没人看着」)。
+    ///
+    /// 自证会变红:把 `set_font` 里那个 `if font_unchanged(..) { return; }`
+    /// 删掉,或把它挪到 `self.cache.clear(..)` 后面。
+    #[test]
+    fn set_font_bails_out_before_it_throws_the_shaping_cache_away() {
+        let src = include_str!("text.rs");
+        let after = src
+            .split("pub fn set_font(&mut self, family: Option<&str>, font_px: f32) {")
+            .nth(1)
+            .expect("set_font 的签名变了 —— 这条测试的锚点失效了");
+        let body = &after[..after.find("\n    /// ").expect("找不到 set_font 的结尾")];
+        let guard = body
+            .find("if font_unchanged(")
+            .expect("set_font 没有短路 —— 每点一颗☆ 都会清空整形缓存 + advance memo");
+        let clear = body
+            .find("self.cache.clear(")
+            .expect("set_font 不再清缓存了？F12 的唯一显式失效 hook 没了");
+        assert!(
+            guard < clear,
+            "短路排在清缓存之后 —— 缓存已经没了,提前返回一点用都没有"
+        );
+    }
+
     #[test]
     fn the_font_size_used_for_layout_is_the_one_cell_w_was_measured_with() {
         let mut fs = FontSystem::new();

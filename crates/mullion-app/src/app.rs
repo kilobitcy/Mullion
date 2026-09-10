@@ -2944,11 +2944,13 @@ impl App {
             .iter()
             .flat_map(|r| r.sftp.local_bookmarks.iter().cloned())
             .collect();
-        let n = self.settings.merge_local_bookmarks(old);
         // 标记本身也要落盘,否则下次启动又来一遍(那样用户取消掉的收藏会
         // 从没清理的会话记录里长回来)。条数为 0 时也存。
-        match self.save_settings() {
-            Ok(()) => crate::logx::line(&format!("F187:本地收藏夹已并入全局设置,{n} 条")),
+        //
+        // F247:合并动作要施加在**盘上那份**上 —— 另一个实例可能刚迁移完并
+        // 置上了标记,拿内存里这份未迁移的覆盖回去等于让迁移再跑一遍。
+        match self.mutate_settings(|s| s.merge_local_bookmarks(old)) {
+            Ok(n) => crate::logx::line(&format!("F187:本地收藏夹已并入全局设置,{n} 条")),
             // 不打断启动、也不弹错:这是后台迁移,用户没主动点过什么。下次
             // 启动会再试一次(标记没存下来,内存里的置位随进程一起消失)。
             Err(e) => {
@@ -2957,14 +2959,35 @@ impl App {
         }
     }
 
-    /// 写 `settings.toml`。`apply_settings_action` 与 F187 的书签写入共用 ——
-    /// 各写一遍的话,以后往里加一步(比如夹紧某个字段)必然漏改一处。
-    fn save_settings(&self) -> Result<(), String> {
-        crate::shell::store::config_dir()
-            .ok_or_else(|| "定位不到配置目录".to_string())
-            .and_then(|d| {
-                mullion_store::settings::save(&d, &self.settings).map_err(|e| e.to_string())
-            })
+    /// F247:改 `settings.toml` 的**唯一入口** —— 读盘、把 `f` 施加在盘上那份
+    /// 上、写回,再把合并后的整份换进 `self.settings`。
+    ///
+    /// 取代原来的 `save_settings`(拿 `self.settings` 整份覆盖)。开两个 exe 时
+    /// 整份覆盖会让另一个实例刚写的东西静默消失,而 `local_bookmarks`(F187)
+    /// 每点一次☆ 就写一次,这条路走得最勤。名字**换掉而不是保留**:留着旧名字
+    /// 等于留一个不合并的写入口,以后新加的调用点会随手用它 ——
+    /// `mullion_store::settings::save` 同批降成 `pub(crate)`,这件事由编译器管,
+    /// 不靠谁记得(「列举式门控在加档时必然漏」本仓库已踩三次)。
+    ///
+    /// 施加副作用**不设门控**:`apply_font` / `apply_log_level` 各自短路
+    /// (`TextLayer::set_font` 比族名+字号,`apply_log_level` 比当前档位),
+    /// 判据落在最接近成本的那一层,任何写入口都天然覆盖。
+    ///
+    /// 写失败时 `self.settings` **原样不动** —— 「没存上 = 没生效」,重启后
+    /// 所见即此刻所见;写失败却已经换了字体的话,用户下次启动会发现设置自己
+    /// 变回去了。
+    fn mutate_settings<R>(
+        &mut self,
+        f: impl FnOnce(&mut mullion_store::Settings) -> R,
+    ) -> Result<R, String> {
+        let dir =
+            crate::shell::store::config_dir().ok_or_else(|| "定位不到配置目录".to_string())?;
+        let (merged, r) =
+            mullion_store::settings::mutate(&dir, &self.settings, f).map_err(|e| e.to_string())?;
+        self.settings = merged;
+        self.apply_font();
+        self.apply_log_level();
+        Ok(r)
     }
 
     /// F187:把全局本地收藏夹推给**每一个**已开标签的面板副本。
@@ -3107,6 +3130,13 @@ impl App {
             env_app.as_deref(),
             env_deps.as_deref(),
         );
+        // F247:档位没变就一个字都不写。设置写盘从「用户点确定」变成「每次
+        // 点☆ 也走一遍」之后,不短路的话每颗☆ 都刷一行「日志档位改为…」——
+        // 日志里全是这句,真正的现场被顶出轮转窗口。判据放在这里而不是调用
+        // 方,同 `TextLayer::set_font`。
+        if crate::logx::levels() == (app, deps) {
+            return;
+        }
         crate::logx::set_levels(app, deps);
         crate::logx::line(&format!("日志档位改为 app={app} deps={deps}"));
     }
@@ -3124,9 +3154,18 @@ impl App {
                 // 也在这里再取一次草稿:用户完全可能什么都没动直接点确定,
                 // 那样一次 `Preview` 都没来过。
                 self.take_settings_draft();
-                self.apply_font();
-                self.apply_log_level();
-                let saved = self.save_settings();
+                // F247:三方合并 —— 只把用户在这个弹窗里**真的动过**的项写下去,
+                // 其余留盘上那份。开窗期间另一个实例点的☆ 才不会被这一下「确定」
+                // 抹掉。`base` 是开窗那一瞬的快照;拿不到(理论上开窗时必已置上)
+                // 就退回「草稿整份赢」,与改之前同义。
+                //
+                // 两份都要先克隆成局部量:闭包捕的是 `self.settings`,而
+                // `mutate_settings` 已经可变借用了 `self`。
+                let mine = self.settings.clone();
+                let base = self.settings_backup.clone().unwrap_or_else(|| mine.clone());
+                let saved = self.mutate_settings(|disk| {
+                    mullion_store::settings::graft_changed(&base, &mine, disk)
+                });
                 // 写失败要说 —— 设置是用户刚点了确定的显式动作,静默失败
                 // = 这次改了、下次启动又变回去,而他不知道为什么。
                 if let Err(e) = saved {
@@ -5845,8 +5884,9 @@ impl App {
             path: path.clone(),
         };
         if column == crate::files::PanelColumn::Local {
-            self.settings.add_local_bookmark(mark);
-            if let Err(e) = self.save_settings() {
+            // F247:加在**盘上那份**上,不是拿内存里整份覆盖 —— 另一个 exe
+            // 这期间点的☆ 否则会被这一下静默抹掉。
+            if let Err(e) = self.mutate_settings(|s| s.add_local_bookmark(mark)) {
                 self.ui.set_error(format!("收藏没能存下来:{e}"));
                 return;
             }
@@ -5895,8 +5935,8 @@ impl App {
         column: crate::files::PanelColumn,
     ) {
         if column == crate::files::PanelColumn::Local {
-            self.settings.remove_local_bookmark(&path);
-            if let Err(e) = self.save_settings() {
+            // F247:同 `add_bookmark` —— 删也要施加在盘上那份上。
+            if let Err(e) = self.mutate_settings(|s| s.remove_local_bookmark(&path)) {
                 self.ui.set_error(format!("取消收藏没能存下来:{e}"));
                 return;
             }
@@ -17954,8 +17994,8 @@ mod tests {
     ///
     /// 漏掉存盘的症状是「收藏了、星星也变实心了,关掉客户端再开就没了」——
     /// 全程零报错,只有重启才发现。F187 之后这件事有**两条**路径:远端书签
-    /// 走会话库(`store.save()`),本地书签走全局设置(`save_settings()`)。
-    /// 只钉其中一条的话,另一条整个删掉照样绿。
+    /// 走会话库(`store.save()`),本地书签走全局设置(F247 之后是
+    /// `mutate_settings(..)`)。只钉其中一条的话,另一条整个删掉照样绿。
     ///
     /// 跟 `touched_store` 那几条同款扎源码:这两个方法要一个真的 `App` 才调
     /// 得动,而 `App` 在无头环境里造不出来。切片必须先切到函数体内 ——
@@ -17963,7 +18003,7 @@ mod tests {
     /// `store.save()` 这个串,不缩范围就永远绿(第五类恒绿模式)。
     ///
     /// 自证会变红:把 `add_bookmark` 里的 `.and_then(|_| store.save())` 删掉;
-    /// 或把本地那一支的 `self.save_settings()` 删掉;或把
+    /// 或把本地那一支的 `self.mutate_settings(..)` 删掉;或把
     /// `sync_local_bookmarks_to_tabs()` 换成只改当前标签。
     #[test]
     fn bookmarking_writes_through_to_disk_immediately() {
@@ -17991,7 +18031,7 @@ mod tests {
                 "{f} 没有按栏分流 —— 本地栏的收藏会写进远端那份列表"
             );
             assert!(
-                body.contains("self.save_settings()"),
+                body.contains("self.mutate_settings("),
                 "{f} 的本地那一支没存 settings.toml —— 本地收藏重启后消失(F187)"
             );
             assert!(
@@ -20215,7 +20255,8 @@ mod tests {
     /// `tmux_bootstrap` 那条守护切的是同一个函数体(`take_settings_draft`);
     /// 施加部分切的是 `O::Commit` 这个match分支。
     ///
-    /// 自证会变红:删掉回写那一行,或删掉 `O::Commit` 里的 `apply_log_level()`。
+    /// 自证会变红:删掉回写那一行,或把 `O::Commit` 里的 `mutate_settings(..)`
+    /// 换成别的写法。
     #[test]
     fn committing_the_settings_stores_and_applies_the_new_log_level() {
         let src = include_str!("app.rs");
@@ -20233,7 +20274,11 @@ mod tests {
             "档位没存进设置 —— 重开设置显示的是旧档,再点确定就把选择覆盖回去了"
         );
 
-        // 施加:O::Commit 分支里要调用 apply_log_level()。
+        // 施加:F247 之后这一步搬进了 `mutate_settings`(写设置的唯一入口,
+        // 写完无条件施加),所以这里钉的是「O::Commit 走了那个入口」;
+        // 「那个入口真的施加了」由
+        // `writing_settings_always_applies_the_merged_result` 接着钉。
+        // 两条各钉一节,链子才是完整的。
         let commit_after = src
             .split("O::Commit => {")
             .nth(1)
@@ -20243,7 +20288,7 @@ mod tests {
             .next()
             .unwrap_or(commit_after);
         assert!(
-            commit_body.contains("self.apply_log_level();"),
+            commit_body.contains("self.mutate_settings("),
             "档位没当场施加到 log facade —— 设置存对了、日志却没变,重启才生效"
         );
     }
@@ -21881,6 +21926,93 @@ mod tests {
             .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("app.rs 的测试模块分界变了,所有源码切片断言的锚点都失效了");
         prod
+    }
+
+    /// F247:写完设置**一定**会把它施加出去,而且换进来的是**合并后**那份。
+    ///
+    /// 这一条守的是三件接线,少任何一件都编译照过、全套测试照绿:
+    /// ① `self.settings = merged` —— 不换的话内存里还是合并前那份,下一次
+    ///    `mutate_settings` 拿它当「盘上不可信时的底」,另一个实例的改动会在
+    ///    那时候被抹掉(错误会延迟一次写入才发作,更难查);
+    /// ② `apply_font` —— 设置弹窗点确定后字体不生效;
+    /// ③ `apply_log_level` —— 日志档位改了不生效。
+    ///
+    /// **刻意不断言「没有门控」**:门控已经下放进 `set_font` / `apply_log_level`
+    /// 自身(F247 的判据放在最接近成本的那一层),在这里再钉一次是冗余判据,
+    /// 而冗余判据杀不掉任何变异、只会变成恒绿。
+    ///
+    /// 自证会变红:把这三句里任何一句删掉。
+    #[test]
+    fn writing_settings_always_applies_the_merged_result() {
+        let body = body_of(prod_src(), "fn mutate_settings<R>(");
+        assert!(
+            body.contains("settings::mutate("),
+            "mutate_settings 的函数体切歪了 —— 下面几条断言会空过"
+        );
+        assert!(
+            body.contains("self.settings = merged"),
+            "没把合并后那份换进内存 —— 下一次写盘会拿陈旧的那份当底"
+        );
+        assert!(
+            body.contains("self.apply_font()"),
+            "写完设置没施加字体 —— 点确定后画面纹丝不动"
+        );
+        assert!(
+            body.contains("self.apply_log_level()"),
+            "写完设置没施加日志档位"
+        );
+    }
+
+    /// F247:换日志档之前先看**现在是不是已经这个档**。
+    ///
+    /// F247 之后 `apply_log_level` 不再只在用户点确定时跑 —— 每写一次
+    /// `settings.toml`(包括每点一颗☆)都会走一遍。不短路的话日志里每颗☆
+    /// 刷一行「日志档位改为 app=… deps=…」,真正的现场被顶出轮转窗口。
+    ///
+    /// 扎源码是因为这件事没有别的观测点:`logx` 的档位是进程全局的
+    /// `OnceLock`,在测试里既装不上也读不出真值。
+    ///
+    /// 自证会变红:把 `apply_log_level` 里那个 `if crate::logx::levels() == ..`
+    /// 删掉,或把它挪到 `set_levels` 后面。
+    #[test]
+    fn the_log_level_is_only_re_applied_when_it_actually_changed() {
+        let body = body_of(prod_src(), "fn apply_log_level(&self) {");
+        let guard = body
+            .find("crate::logx::levels()")
+            .expect("apply_log_level 没有短路 —— 每点一颗☆ 都会刷一行日志");
+        let set = body
+            .find("crate::logx::set_levels(")
+            .expect("apply_log_level 不再换档了？");
+        assert!(guard < set, "短路排在换档之后 —— 那一行日志照样会写出来");
+    }
+
+    /// F247:设置弹窗点「确定」写的是**三方合并**,不是草稿整份覆盖。
+    ///
+    /// 开着设置弹窗期间,另一个 exe 完全可能点了☆ 或换了日志档。整份覆盖会把
+    /// 那些改动一起抹掉,而用户在这个弹窗里根本没碰过它们。合并的基线只能是
+    /// **开窗那一瞬的快照**(`settings_backup`)—— 拿盘上那份当基线的话「用户
+    /// 没动过」和「别人刚改过」分不开。
+    ///
+    /// 接线断了(改回整份覆盖)编译照过、全套测试照绿,症状只在两个 exe 同时
+    /// 开着时出现。
+    ///
+    /// 自证会变红:把 `O::Commit` 那一臂的闭包换成 `|s| *s = mine.clone()`。
+    #[test]
+    fn committing_the_settings_dialog_grafts_instead_of_overwriting() {
+        let production = body_of(prod_src(), "fn apply_settings_action(&mut self,");
+        let arm = arm_of(production, "O::Commit");
+        assert!(
+            arm.contains("self.ui.settings_open = false"),
+            "O::Commit 那一臂切歪了 —— 下面几条断言会空过"
+        );
+        assert!(
+            arm.contains("graft_changed("),
+            "点确定是整份覆盖 —— 开窗期间另一个实例的改动被抹掉"
+        );
+        assert!(
+            arm.contains("self.settings_backup"),
+            "合并基线不是开窗那一瞬的快照 —— 「用户没动过」和「别人刚改过」分不开"
+        );
     }
 
     /// F214:`start_edit` 必须把**列目录时已经知道的大小**传给读循环。

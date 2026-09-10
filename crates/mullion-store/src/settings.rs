@@ -267,17 +267,108 @@ pub fn load(dir: &Path) -> Loaded {
     }
 }
 
+/// 落盘前的归一化。[`save`] 与 [`mutate`] 共用 —— 各写一遍的话,以后往里加
+/// 一步(再夹一个字段)必然漏改一处,而 `mutate` 交出去的那份就会与盘上那份
+/// 悄悄分叉。
+fn normalize(s: &mut Settings) {
+    s.schema_version = CURRENT_SETTINGS_SCHEMA;
+    s.font_pt = clamp_font_pt(s.font_pt);
+}
+
 /// 原子写 `<dir>/settings.toml`。
 ///
 /// **写失败要往上报**(与 `layout::save` 相反):布局是自动存的「上次的场景」,
 /// 设置是用户刚点了确定的显式动作,静默失败 = 改了没生效、而他不知道为什么。
-pub fn save(dir: &Path, settings: &Settings) -> Result<(), StoreError> {
+///
+/// F247:**只对 crate 内可见**。app 侧一律走 [`mutate`] —— 「整份覆盖」正是
+/// 多实例互相抹掉对方改动的那个 bug,留一个公开的整份覆盖入口等于把闸门
+/// 交给「以后的人记不记得」。改成 `pub(crate)` 之后这件事由编译器管。
+pub(crate) fn save(dir: &Path, settings: &Settings) -> Result<(), StoreError> {
     std::fs::create_dir_all(dir)?;
     let mut out = settings.clone();
-    out.schema_version = CURRENT_SETTINGS_SCHEMA;
-    out.font_pt = clamp_font_pt(out.font_pt);
+    normalize(&mut out);
     let text = toml::to_string_pretty(&out)?;
     crate::vault::write_atomic(&dir.join(SETTINGS_FILE), text.as_bytes())
+}
+
+/// F247:读-改-写。**唯一的写入口。**
+///
+/// 把 `f` 施加在**盘上那份**上再写回,而不是拿内存里那份整份覆盖。开两个 exe
+/// 时,A 点一颗☆、B 随后改字号,整份覆盖会让 A 那颗☆ 被 B 静默抹掉 ——
+/// `settings.toml` 里的 `local_bookmarks`(F187,全局收藏夹)每点一次☆ 就写一次,
+/// 这条路走得最勤。
+///
+/// `mine` 是调用方内存里那份,只在**盘上那份不可信**时当底用:[`load`] 永不
+/// 失败,读不出 / 解析失败 / schema 太新三种情形一律返回 `Settings::default()`
+/// 并留下 `note`。拿那份默认值当底会把用户的字体和全部☆ 整份抹掉 —— 比原来的
+/// 整份覆盖更狠。盘上没有可信内容时就没有可合并的对象,`mine` 是唯一的真值。
+///
+/// 交出去的是**合并并归一化后的整份**(调用方直接拿它替换自己内存里那份)加上
+/// `f` 的返回值(F187 的迁移条数要拿它写日志)。
+pub fn mutate<R>(
+    dir: &Path,
+    mine: &Settings,
+    f: impl FnOnce(&mut Settings) -> R,
+) -> Result<(Settings, R), StoreError> {
+    let loaded = load(dir);
+    let mut merged = if loaded.note.is_some() {
+        mine.clone()
+    } else {
+        loaded.settings
+    };
+    let r = f(&mut merged);
+    normalize(&mut merged);
+    save(dir, &merged)?;
+    Ok((merged, r))
+}
+
+/// F247:三方合并 —— 把「`mine` 相对 `base` 真的动过的那些项」嫁接到 `theirs` 上,
+/// 其余留 `theirs` 的。零 IO,纯函数。
+///
+/// 用在设置弹窗点「确定」那一刻:`base` = 开窗那一瞬的快照(`settings_backup`),
+/// `mine` = 用户的草稿,`theirs` = 盘上现在这份。用户在弹窗里没碰过的项,盘上
+/// 那份(可能是另一个实例刚写的)照旧保留。
+///
+/// **在 toml 表层比,不逐字段列举**:`Settings` 是普通结构体,Rust 里没法不写
+/// 宏就遍历它的字段;列举式的比对在加字段时必然漏(本仓库已踩过三次),而漏掉
+/// 的那一项表现为「弹窗里改了、点确定没生效」,零报错。
+///
+/// **必须遍历 `base ∪ mine` 的键,「键消失」也算一种值**:`font_family` 是
+/// `Option`、`local_bookmarks` 带 `skip_serializing_if = "Vec::is_empty"` ——
+/// 用户在弹窗里清空字体族、或把收藏夹删到一条不剩,在 toml 层的表现都是
+/// **这个键没了**。只遍历 `mine` 的键会把这两种「真的动过」静默丢掉。
+pub fn graft_changed(base: &Settings, mine: &Settings, theirs: &mut Settings) {
+    let (Some(b), Some(m), Some(mut t)) = (to_table(base), to_table(mine), to_table(theirs)) else {
+        // 走不到:三份都是构造良好的 `Settings`。留着是为了以后加字段时
+        // 这里退化成「用户的草稿赢」,而不是 panic。
+        *theirs = mine.clone();
+        return;
+    };
+    let keys: std::collections::BTreeSet<&String> = b.keys().chain(m.keys()).collect();
+    for k in keys {
+        match (b.get(k), m.get(k)) {
+            // 弹窗里没动过这一项 → 保留盘上那份(可能是另一个实例刚写的)
+            (x, y) if x == y => {}
+            (_, Some(v)) => {
+                t.insert(k.clone(), v.clone());
+            }
+            // 用户把它清空了 —— 同样是一次改动
+            (_, None) => {
+                t.remove(k);
+            }
+        }
+    }
+    // 同上:表里每个值都是从构造良好的 `Settings` 序列化出来的,反序列化不会败。
+    *theirs = toml::Value::Table(t)
+        .try_into()
+        .unwrap_or_else(|_| mine.clone());
+}
+
+fn to_table(s: &Settings) -> Option<toml::Table> {
+    match toml::Value::try_from(s) {
+        Ok(toml::Value::Table(t)) => Some(t),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +709,142 @@ mod tests {
             !back.settings.local_bookmarks_migrated,
             "老文件必须被当成「还没迁移」,否则升级那一刻本地收藏静默清零"
         );
+    }
+
+    /// F247:另一个实例刚写下的东西,必须在我这次写盘之后还在。
+    ///
+    /// 这是本条存在的全部理由:整份覆盖时 B 的字号改动会把 A 刚点的☆ 抹掉。
+    ///
+    /// 自证会变红:把 `mutate` 里的 `load(dir)` 换成 `mine.clone()`。
+    #[test]
+    fn what_another_instance_just_wrote_survives_my_write() {
+        let dir = tmp();
+        // A:点了一颗☆(盘上现在有它)
+        let mut a = Settings::default();
+        a.add_local_bookmark(mark("工程", r"D:\work"));
+        save(dir.path(), &a).expect("A 写盘");
+
+        // B:内存里那份还是 A 点☆ **之前**的样子,现在改字号
+        let b_memory = Settings::default();
+        let (merged, ()) = mutate(dir.path(), &b_memory, |s| s.font_pt = 14.0).expect("B 写盘");
+
+        assert_eq!(merged.font_pt, 14.0, "B 自己改的没生效");
+        assert_eq!(
+            merged.local_bookmarks.len(),
+            1,
+            "A 刚点的☆ 被 B 抹掉了 —— 这正是多实例互相吃改动的那个 bug"
+        );
+        // 盘上那份也要一致,不能只是返回值好看
+        assert_eq!(load(dir.path()).settings, merged);
+    }
+
+    /// F247:闭包的返回值原样透出 —— F187 的迁移条数要拿它写日志,吞掉的话
+    /// 那行日志永远报 0 条,而迁移本身是静默的。
+    ///
+    /// 自证会变红:把 `mutate` 的 `Ok((merged, r))` 改成返回一个新造的默认值。
+    #[test]
+    fn the_closure_result_comes_back_out() {
+        let dir = tmp();
+        let (_, n) = mutate(dir.path(), &Settings::default(), |s| {
+            s.merge_local_bookmarks([mark("工程", r"D:\work"), mark("下载", r"C:\dl")])
+        })
+        .expect("写盘");
+        assert_eq!(n, 2);
+    }
+
+    /// F247:**盘上那份读不出来时,底必须是调用方内存里那份,不是默认值。**
+    ///
+    /// `load` 永不失败,手改坏的文件会静默降级成 `Settings::default()`。拿它
+    /// 当底做读-改-写,用户的字体和全部☆ 会在下一次点☆ 时整份消失 —— 比这条
+    /// 要修的「整份覆盖」更狠。
+    ///
+    /// 自证会变红:把 `mutate` 里那个 `loaded.note.is_some()` 分支删掉。
+    #[test]
+    fn a_broken_file_on_disk_does_not_wipe_what_i_have_in_memory() {
+        let dir = tmp();
+        std::fs::write(dir.path().join(SETTINGS_FILE), "这不是 toml { [").expect("写坏文件");
+
+        let mut mine = Settings {
+            font_family: Some("Cascadia Mono".to_string()),
+            ..Settings::default()
+        };
+        mine.add_local_bookmark(mark("工程", r"D:\work"));
+
+        let (merged, ()) = mutate(dir.path(), &mine, |s| s.font_pt = 14.0).expect("写盘");
+        assert_eq!(
+            merged.font_family.as_deref(),
+            Some("Cascadia Mono"),
+            "盘上文件坏了就把用户的字体抹成默认 —— 无法自愈"
+        );
+        assert_eq!(merged.local_bookmarks.len(), 1, "☆ 也一起没了");
+        assert_eq!(merged.font_pt, 14.0);
+    }
+
+    /// F247:`mutate` 交出去的那份 = 盘上那份。夹紧/版本号只在 `save` 里做的话,
+    /// 调用方拿回去的是没夹过的值,内存与磁盘从此分叉。
+    ///
+    /// 自证会变红:把 `mutate` 里的 `normalize(&mut merged)` 删掉。
+    #[test]
+    fn what_mutate_hands_back_is_what_is_on_disk() {
+        let dir = tmp();
+        let (merged, ()) =
+            mutate(dir.path(), &Settings::default(), |s| s.font_pt = 999.0).expect("写盘");
+        assert_eq!(merged.font_pt, MAX_FONT_PT);
+        assert_eq!(load(dir.path()).settings, merged);
+    }
+
+    /// F247:弹窗里没动过的项留盘上那份,动过的用用户的。
+    ///
+    /// 自证会变红:把 `graft_changed` 里 `(x, y) if x == y => {}` 那一臂删掉
+    /// (于是整份草稿覆盖盘上那份,另一个实例的改动全没)。
+    #[test]
+    fn the_dialog_only_grafts_what_the_user_actually_touched() {
+        let base = Settings::default();
+        // 用户在弹窗里只改了字号
+        let mine = Settings {
+            font_pt: 14.0,
+            ..base.clone()
+        };
+        // 与此同时,另一个实例点了一颗☆、还换了日志档
+        let mut theirs = Settings {
+            log_level: LogLevel::Debug,
+            ..base.clone()
+        };
+        theirs.add_local_bookmark(mark("工程", r"D:\work"));
+
+        graft_changed(&base, &mine, &mut theirs);
+
+        assert_eq!(theirs.font_pt, 14.0, "用户改的字号没生效");
+        assert_eq!(theirs.log_level, LogLevel::Debug, "别人换的日志档被抹掉了");
+        assert_eq!(theirs.local_bookmarks.len(), 1, "别人点的☆ 被抹掉了");
+    }
+
+    /// F247:**「清空」也是一种改动。**`font_family` 是 `Option`、
+    /// `local_bookmarks` 带 `skip_serializing_if`,两者清空后在 toml 层的表现
+    /// 都是**键消失** —— 只遍历 `mine` 的键的话,用户在弹窗里清掉的东西会原样
+    /// 从盘上长回来,而且看不出原因。
+    ///
+    /// 自证会变红:把 `graft_changed` 的键并集改成只遍历 `m.keys()`。
+    #[test]
+    fn clearing_a_field_in_the_dialog_is_a_change_too() {
+        let mut base = Settings {
+            font_family: Some("Cascadia Mono".to_string()),
+            ..Settings::default()
+        };
+        base.add_local_bookmark(mark("工程", r"D:\work"));
+
+        // 用户在弹窗里把字体族清了、☆ 也删光了
+        let mine = Settings {
+            font_family: None,
+            local_bookmarks: Vec::new(),
+            ..base.clone()
+        };
+        let mut theirs = base.clone();
+
+        graft_changed(&base, &mine, &mut theirs);
+
+        assert_eq!(theirs.font_family, None, "清掉的字体族又长回来了");
+        assert!(theirs.local_bookmarks.is_empty(), "删光的☆ 又长回来了");
     }
 
     /// 档位的磁盘写法是小写英文单词 —— 这是要被人手改的文件,形态本身是契约。
