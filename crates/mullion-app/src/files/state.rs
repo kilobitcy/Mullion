@@ -971,7 +971,9 @@ mod tests {
                 bad,
             ]),
         );
-        s.selected = ["a.txt", "d"]
+        // **只选一条**:全选的话「看选中集」和「整目录全给」算出来一样,
+        // 那条变异就杀不掉了(第一次写这条测试时正是这么恒绿的)。
+        s.selected = ["a.txt"]
             .iter()
             .map(|n| RemotePath::from_bytes(n.as_bytes().to_vec()))
             .collect();
@@ -986,7 +988,11 @@ mod tests {
             .map(|(p, _)| p.display().to_string())
             .collect();
         assert_eq!(copied, deleted, "两处挑的行不一样了");
-        assert_eq!(copied, vec!["/home/u/d", "/home/u/a.txt"]);
+        assert_eq!(
+            copied,
+            vec!["/home/u/a.txt"],
+            "没按选中集挑 —— 用户选了一条,复制出来的却是整个目录"
+        );
     }
 
     /// F250:本地栏拼绝对路径必须走 `join_local`(平台分隔符),不是远端
