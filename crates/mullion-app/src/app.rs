@@ -1883,6 +1883,49 @@ fn snapshot_tabs_of(tabs: &Tabs<TabContent>) -> (Vec<mullion_store::SavedTab>, u
     (out, active_tab)
 }
 
+/// F148/F256:把一批现场记录做成「恢复上次的现场」弹窗要画的行。
+///
+/// **一条都不许少 —— 这就是 F256 的交付。** `known` 回答「这个会话 id 现在
+/// 还在库里吗」,`None` = store 没打开(那时我们没有能力回答,于是完全不按
+/// 会话存在性过滤;拿一张空表去问等于回答「全都不在」)。
+///
+/// 抽成自由函数是因为原来它是 `App` 的方法,而 `App` 在单测里造不出来 ——
+/// 于是三处「静默丢掉一整条记录」的 `continue` 一个守护都没有,同时
+/// `note_text` / `row_height` 那几条纯函数测试全绿。这正是本仓库反复出现的
+/// 「纯函数测得扎实、接线没人看着」那一族。
+fn history_rows_of(
+    entries: &[mullion_store::HistoryEntry],
+    known: Option<&[SessionId]>,
+    now: i64,
+) -> Vec<crate::ui::history::HistoryRow> {
+    let mut out = Vec::new();
+    for e in entries {
+        let usable = match known {
+            Some(k) => {
+                crate::shell::layout_snapshot::usable(e.layout.clone(), &|id| k.contains(&id))
+            }
+            None => e.layout.clone(),
+        };
+        // 丢了几个标签。**取差值而不是「有没有丢」**:用户要知道的是
+        // 「四个里没了一个」还是「四个全没了」,那是两个不同的决定。
+        let dropped = e.layout.tabs.len().saturating_sub(usable.tabs.len());
+        let titles: Vec<String> = usable.tabs.iter().map(|t| t.title.clone()).collect();
+        let panes: usize = usable
+            .tabs
+            .iter()
+            .map(|t| crate::shell::layout_snapshot::leaf_count(&t.tree).unwrap_or(1))
+            .sum();
+        let when = crate::ui::history::when_text(now, e.layout.updated_at);
+        out.push(crate::ui::history::HistoryRow {
+            id: e.id.clone(),
+            head: crate::ui::history::head_text(&when, usable.tabs.len(), panes),
+            summary: crate::ui::history::summary_text(&titles),
+            note: crate::ui::history::note_text(e.alive, dropped),
+        });
+    }
+    out
+}
+
 /// E2:`ConnectOk` 抵达时新标签该叫什么名字。**优先取会话名**,空名字
 /// (或压根没有会话记录,如快速连接)退回 `user@host`;两者都没有
 /// (理论上不可达,兜底)退回「远端」。
@@ -3889,43 +3932,20 @@ impl App {
     /// `store` 没打开(keyring 不可用)时**完全不按会话存在性过滤**:那时
     /// 我们没有能力回答「这个会话还在不在」,拿一张空表去问等于回答「全都
     /// 不在」。纵深防御 —— 就算上游哪天忘了先开 store,也不会让整个列表空掉。
+    ///
+    /// 本方法只负责**取那张会话表**;做行的逻辑在自由函数
+    /// [`history_rows_of`] 里,那才是「一条都不许丢」测得着的地方。
     fn history_rows(
         &self,
         entries: &[mullion_store::HistoryEntry],
     ) -> Vec<crate::ui::history::HistoryRow> {
-        // `None` = store 没打开,**不是**「一个会话都没有」。这两件事在这里
+        // `None` = store 没打开,**不是**「一个会话都没有」。这两件事在下面
         // 的处置完全相反,所以不能塌成一个空 `Vec`(原来就是那样)。
         let known: Option<Vec<SessionId>> = self
             .store
             .as_ref()
             .map(|s| s.list().iter().map(|r| r.id).collect());
-        let now = mullion_store::now_secs();
-        let mut out = Vec::new();
-        for e in entries {
-            let usable = match &known {
-                Some(k) => {
-                    crate::shell::layout_snapshot::usable(e.layout.clone(), &|id| k.contains(&id))
-                }
-                None => e.layout.clone(),
-            };
-            // 丢了几个标签。**取差值而不是「有没有丢」**:用户要知道的是
-            // 「四个里没了一个」还是「四个全没了」,那是两个不同的决定。
-            let dropped = e.layout.tabs.len().saturating_sub(usable.tabs.len());
-            let titles: Vec<String> = usable.tabs.iter().map(|t| t.title.clone()).collect();
-            let panes: usize = usable
-                .tabs
-                .iter()
-                .map(|t| crate::shell::layout_snapshot::leaf_count(&t.tree).unwrap_or(1))
-                .sum();
-            let when = crate::ui::history::when_text(now, e.layout.updated_at);
-            out.push(crate::ui::history::HistoryRow {
-                id: e.id.clone(),
-                head: crate::ui::history::head_text(&when, usable.tabs.len(), panes),
-                summary: crate::ui::history::summary_text(&titles),
-                note: crate::ui::history::note_text(e.alive, dropped),
-            });
-        }
-        out
+        history_rows_of(entries, known.as_deref(), mullion_store::now_secs())
     }
 
     /// F148:菜单里点了「恢复上次的现场…」—— 现读一次盘、建草稿。
@@ -15380,7 +15400,7 @@ mod tests {
         dismiss_verdict, download_job, draft_baseline_is_in_vault, drive_attach_checks_of,
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
-        has_real_action, host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of,
+        has_real_action, history_rows_of, host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of,
         leaf_identity_of, new_pane_emulator, next_auto_dial, next_panel_selection_index,
         opt_buf_dirty, pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
         reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
@@ -22634,6 +22654,106 @@ mod tests {
             body.contains("self.advance_auto_dial("),
             "恢复现场之后没有自动开始拨号(F153)"
         );
+    }
+
+    /// F256 的**交付本身**:列表里一条记录都不许少。
+    ///
+    /// 这一族缺陷(「纯函数测得扎实、接线没人看着」)在本仓库反复出现,而这
+    /// 里原本就是最坏的形态:三处 `continue` 各自静默丢掉一整条记录,而
+    /// `note_text` / `row_height` 那几条纯函数测试全绿 —— 用户看到的是空
+    /// 列表,代码看起来一切正常。所以判据必须落在**行数**上。
+    ///
+    /// 三条毛病一次给齐:另一个窗口在用的、全部标签的会话都被删过的、
+    /// 干净的。
+    #[test]
+    fn no_record_is_dropped_from_the_list_no_matter_what_is_wrong_with_it() {
+        let rows = history_rows_of(
+            &[
+                history_entry("live", 7, true),
+                history_entry("orphan", 8, false),
+                history_entry("clean", 9, false),
+            ],
+            // 只有 9 号会话还在库里 —— 另两条的标签都会被 E6 丢掉。
+            Some(&[SessionId(9)]),
+            1_000_000,
+        );
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["live", "orphan", "clean"],
+            "有记录被静默丢掉了 —— 用户报的「等多久都不出现」就是这么来的"
+        );
+        assert!(
+            !rows[0].note.is_empty() && !rows[1].note.is_empty(),
+            "列出来了但没说为什么可疑 —— 用户会以为它是好的,点开却是空的"
+        );
+        assert!(
+            rows[2].note.is_empty(),
+            "干净的记录也挂了一行说明 —— 那行字就不再是「有问题」的信号了"
+        );
+    }
+
+    /// F256:store 打不开(keyring 不可用)**不等于**「一个会话都没有」。
+    ///
+    /// 这两件事在这里的处置完全相反:前者只能不按会话存在性过滤,后者才该
+    /// 把标签丢掉。原来塌成同一个空 `Vec`,于是 keyring 一出问题,**每一条**
+    /// 记录的**每一个**标签都被判成「会话已删」,整个列表空掉。
+    #[test]
+    fn with_no_store_open_records_are_not_filtered_by_session_existence() {
+        let rows = history_rows_of(&[history_entry("x", 7, false)], None, 1_000_000);
+        assert_eq!(rows.len(), 1, "store 没打开就把记录整条丢了");
+        assert!(
+            rows[0].note.is_empty(),
+            "store 没打开时不该报告「丢了几个标签」—— 一个也没丢,是没法判"
+        );
+        assert!(
+            rows[0].summary.contains("s7"),
+            "标签被丢掉了(summary = {:?})—— store 打不开被当成了「会话全被删」",
+            rows[0].summary
+        );
+    }
+
+    /// **接线守护 / F256**:「store 没打开」要作为 `None` 传下去。
+    ///
+    /// 上面那条测的是纯函数在 `None` 上的行为,而这里是唯一的调用点:一个
+    /// `unwrap_or_default()` 就把 `None` 塌成 `Some(&[])`(= 「一个会话都没
+    /// 有」),纯函数那条照样绿,而 keyring 一出问题整个列表就空掉。
+    #[test]
+    fn a_store_that_is_not_open_is_passed_down_as_unknown_not_as_empty() {
+        let body = strip_comments(body_of(prod_src(), "fn history_rows("));
+        assert!(
+            body.contains("known.as_deref()"),
+            "会话表不是原样传下去的 —— 见本测试的说明"
+        );
+        for collapse in ["unwrap_or_default()", "unwrap_or_else", "unwrap_or("] {
+            assert!(
+                !body.contains(collapse),
+                "`{collapse}` 把「store 没打开」塌成了「一个会话都没有」,\
+                 那会让 keyring 出问题时整个列表空掉"
+            );
+        }
+    }
+
+    /// 一条记录:一个标签,挂在 `session_id` 上。
+    fn history_entry(id: &str, session_id: u64, alive: bool) -> mullion_store::HistoryEntry {
+        use mullion_store::{SavedNodeEntry, SavedTab, SavedTabKind};
+        mullion_store::HistoryEntry {
+            id: id.to_string(),
+            layout: mullion_store::SavedLayout {
+                schema_version: 1,
+                active_tab: 0,
+                updated_at: 999_000,
+                window: None,
+                tabs: vec![SavedTab {
+                    kind: SavedTabKind::Terminal,
+                    session_id: SessionId(session_id),
+                    title: format!("s{session_id}"),
+                    focus_leaf: 0,
+                    tree: vec![SavedNodeEntry::leaf()],
+                }],
+            },
+            alive,
+        }
     }
 
     /// **接线守护 / F256**:点了一条「另一个窗口正在使用」的现场,是把它的
