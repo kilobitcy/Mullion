@@ -2094,13 +2094,18 @@ impl PanelFrame {
     /// 事后赋值**:加参数的话编译器会逼每个调用点表态,漏一个就编译不过;
     /// 而 `frame.session_bound = ...` 那种写法漏了没人提醒,表现是某种标签
     /// 里的 ☆ 永远置灰,而用户只会觉得"这功能坏了"。
+    ///
+    /// `show_hidden`:F253 —— `Settings::show_hidden_files` 那个**初始值**。
+    /// 同 `session_bound` 的理由做成显式参数:漏一处的表现是「某种标签里
+    /// `.claude/` 就是不出现」,而那正是这一条要修的病。
     pub fn new(
         default_local: Option<&str>,
         bookmarks: Vec<mullion_store::Bookmark>,
         local_bookmarks: Vec<mullion_store::Bookmark>,
         session_bound: bool,
+        show_hidden: bool,
     ) -> Self {
-        Self {
+        let mut out = Self {
             // F231:会话没配默认本地目录时,开在本地收藏的第一条。收藏顺序即
             // 数组顺序(F121 的既有约定),所以"第一条"就是 `first()`。
             //
@@ -2114,7 +2119,22 @@ impl PanelFrame {
             local_bookmarks,
             session_bound,
             ..Self::default()
-        }
+        };
+        out.reseed_hidden(show_hidden);
+        out
+    }
+
+    /// F253:把「显示 `.` 开头的项」刷进**两栏**。
+    ///
+    /// 两个调用点:新开面板(`new`,种初始值)与设置弹窗点「确定」
+    /// (`App::take_settings_draft`,刷已经开着的面板)。抽成一份是因为
+    /// 「刷两栏」这个判据在两处一模一样,各写一遍就会漂。
+    ///
+    /// **不碰 `PaneState` 的其它字段**:选中集、滚动位置、加载态都跟这个
+    /// 开关无关 —— 顺手重置的话,用户在设置里勾一下,面板的选中就没了。
+    pub fn reseed_hidden(&mut self, on: bool) {
+        self.remote.show_hidden = on;
+        self.local.show_hidden = on;
     }
 
     /// 键盘焦点当前落在哪一栏,连同它的状态一起给(设计 D23:F6/Tab 换焦点)。
@@ -2480,6 +2500,52 @@ pub(crate) fn mtime_text(secs: u32) -> String {
 mod tests {
     use super::*;
     use mullion_ssh::sftp::{Entry, RemotePath};
+
+    /// F253:设置弹窗点「确定」后要刷已经开着的面板 —— 刷的是**两栏**。
+    ///
+    /// 只刷一栏不报错、也不难看,就是「本地栏怎么还是老样子」,而用户没有
+    /// 任何办法分辨这是 bug 还是"本地栏本来就这样"。
+    ///
+    /// 两个方向都测:只测 `true` 的话,「函数体写死 `= true`」这种错法照样绿。
+    ///
+    /// 自证会变红:把 `reseed_hidden` 里那两句赋值的任意一句删掉。
+    #[test]
+    fn reseeding_the_hidden_switch_moves_both_columns() {
+        let mut f = PanelFrame::new(None, Vec::new(), Vec::new(), false, false);
+        f.reseed_hidden(true);
+        assert!(f.remote.show_hidden && f.local.show_hidden, "开没刷到两栏");
+        f.reseed_hidden(false);
+        assert!(
+            !f.remote.show_hidden && !f.local.show_hidden,
+            "关没刷到两栏"
+        );
+    }
+
+    /// F253:`PanelFrame::new` 必须把隐藏项的初始值喂给**两栏**。
+    ///
+    /// 为什么断言两栏而不是一栏:F226 记下的那个恒绿模式 ——「纯函数测得扎实、
+    /// 接线没人看着」。`files::visible()` 的过滤规则自己有测试,`Settings` 的
+    /// 默认值也有测试,可**中间那一段赋值只喂了 remote 栏**的话,两头的测试
+    /// 全绿,而用户在本地栏里就是看不见 `.claude/` —— 而且他没有任何办法
+    /// 分辨这是 bug 还是"本地栏本来就这样"。
+    ///
+    /// 用 `false` 当被测值(而不是默认的 `true`):喂 `true` 的话,漏赋值的那栏
+    /// 因为 `PaneState::new` 本身就起于 `true`,断言照样通过 —— 那是这条测试
+    /// 唯一逃得掉的写法。
+    ///
+    /// 和上一条**都要**:`new` 内部复用 `reseed_hidden`,把 `new` 里那一句调用
+    /// 删掉的话上一条照样绿(它自己直接调 `reseed_hidden`)。
+    ///
+    /// 自证会变红:把 `PanelFrame::new` 结尾那句 `reseed_hidden(..)` 删掉。
+    #[test]
+    fn the_new_panel_seeds_both_columns_with_the_hidden_switch() {
+        let off = PanelFrame::new(None, Vec::new(), Vec::new(), false, false);
+        assert!(!off.remote.show_hidden, "远端栏没拿到种子");
+        assert!(!off.local.show_hidden, "本地栏没拿到种子");
+
+        let on = PanelFrame::new(None, Vec::new(), Vec::new(), false, true);
+        assert!(on.remote.show_hidden && on.local.show_hidden);
+    }
 
     /// F231:`PanelFrame::new` 必须真的把收藏首条喂给 `default_local`。纯函数
     /// 那几条测试守的是"优先级对",守不住"根本没接上" —— 而没接上的表现是

@@ -3348,6 +3348,10 @@ impl App {
     }
 
     /// 把草稿里的值搬进 `self.settings`(字号顺手夹紧)。
+    ///
+    /// F253:隐藏项开关**还要往回刷一遍已经开着的面板** —— 面板持有的是一份
+    /// 运行态镜像(`PaneState::show_hidden`),只搬 `settings` 的话新标签对了、
+    /// 用户眼前那个面板毫无变化,他只会以为这个开关坏了。
     fn take_settings_draft(&mut self) {
         if let Some(d) = self.ui.settings_draft.as_ref() {
             self.settings.font_family = d.family.clone();
@@ -3355,6 +3359,16 @@ impl App {
             self.settings.tmux_bootstrap = d.tmux_bootstrap;
             self.settings.log_level = d.log_level;
             self.settings.shell_osc7_bootstrap = d.shell_osc7_bootstrap;
+            self.settings.show_hidden_files = d.show_hidden_files;
+            let on = d.show_hidden_files;
+            // 遍历**全部**标签,不只活动那个:F125 记过的「`drive_*` 每帧驱动
+            // 函数必须遍历全部标签」是同一个形状 —— 只刷活动标签的话,用户
+            // 切回别的标签会发现那儿还是老样子。
+            for tab in self.tabs.iter_mut() {
+                if let Some(files) = tab.content.files_panel_mut() {
+                    files.reseed_hidden(on);
+                }
+            }
         }
     }
 
@@ -5109,9 +5123,44 @@ impl App {
         true
     }
 
+    /// F253:切换「显示 `.` 开头的项」,并把它**写穿落盘**。
+    ///
+    /// 抽成一个方法而不是在两栏的分支里各写一遍:两边的差别只有「取反哪一栏
+    /// 的运行态」,写穿那一段是同一份 —— 各写一遍就是「改对了一处、漏改另一
+    /// 处静默分叉」(`delete_targets` 那儿已经踩过一次)。
+    ///
+    /// 也因此**必须在借出 `files` 之前分流**:`mutate_settings` 要 `&mut self`,
+    /// 借着 `files_panel_mut()` 是调不了的(同 `CopyPath`/`BookmarkAdd` 那几条)。
+    /// 顺带修掉一个旧行为:远端栏原来把这个动作放在 `sftp_client()` 取不到就
+    /// `return` 的后面,SFTP 还没连上时按 `Ctrl+H` **什么都不发生**;而切换隐藏
+    /// 项跟远端连没连上毫无关系。
+    ///
+    /// 落盘失败只记日志、**不回滚运行态**:用户按了就该看见效果,存不住是下次
+    /// 启动的事,当场把画面弹回去更莫名。
+    fn toggle_hidden_and_persist(&mut self, generation: u64, column: crate::files::PanelColumn) {
+        let Some(files) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.files_panel_mut())
+        else {
+            return;
+        };
+        let pane = match column {
+            crate::files::PanelColumn::Local => &mut files.local,
+            crate::files::PanelColumn::Remote => &mut files.remote,
+        };
+        pane.show_hidden = !pane.show_hidden;
+        let on = pane.show_hidden;
+        mark_ui_dirty!(self.ui_dirty);
+        // F247:`settings.toml` 的写入唯一入口是 `mutate_settings`(读-改-写),
+        // 不许自己 clone 一份 settings 再整份覆盖 —— 那会抹掉别处刚写的字段。
+        if let Err(e) = self.mutate_settings(|s| s.show_hidden_files = on) {
+            log::warn!("隐藏项开关没存住:{e}");
+        }
+    }
+
     /// F50/D5:本地栏的一次同步导航。**本地 SSD 上的普通目录**读盘是微秒级,
-    /// 不值得像远端那样 spawn 异步任务(远端那条归 Task 10)。四个 `FileAction`
-    /// 里只有 `ToggleHidden` 不碰磁盘。
+    /// 不值得像远端那样 spawn 异步任务(远端那条归 Task 10)。
     ///
     /// **已知限制(未根治)**:这个前提在几类目录上不成立 —— 映射的网络盘
     /// (`Z:\`)、断连的 SMB 挂载、未联机的 OneDrive 文件夹、几万项的目录。
@@ -5184,6 +5233,11 @@ impl App {
                 );
                 return;
             }
+            // F253:同上,写穿落盘要 `&mut self`。见 `toggle_hidden_and_persist`。
+            FileAction::ToggleHidden => {
+                self.toggle_hidden_and_persist(generation, crate::files::PanelColumn::Local);
+                return;
+            }
             _ => {}
         }
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
@@ -5201,11 +5255,6 @@ impl App {
             FileAction::Goto(target) => target.clone(),
             FileAction::Up => local::parent_local(&files.local.cwd),
             FileAction::Refresh => files.local.cwd.clone(),
-            FileAction::ToggleHidden => {
-                files.local.show_hidden = !files.local.show_hidden;
-                mark_ui_dirty!(self.ui_dirty);
-                return;
-            }
             // F131:同远端那条,只是 home 来自本机。
             FileAction::GotoInput(input) => {
                 let home = crate::files::local::home_dir();
@@ -5291,6 +5340,12 @@ impl App {
             // 接线被改坏了,不静默吞。
             FileAction::ClipCopy | FileAction::ClipCut | FileAction::ClipPaste => {
                 log::warn!("本地栏收到了剪贴板操作,已忽略(只在远端)");
+                return;
+            }
+            // F253:前面那个 match 已经把它分流走了(写穿落盘要 `&mut self`)。
+            // 走到这儿说明分流被改坏了 —— 症状会是「按 Ctrl+H 没反应」,不静默吞。
+            FileAction::ToggleHidden => {
+                log::warn!("ToggleHidden 落到了导航分支,F253 的前置分流被改坏了");
                 return;
             }
         };
@@ -5542,6 +5597,13 @@ impl App {
                 self.start_paste(generation);
                 return;
             }
+            // F253:写穿落盘要 `&mut self`;而且这一条**不能**留在下面
+            // `sftp_client()` 取不到就 return 的后面 —— 见
+            // `toggle_hidden_and_persist` 的文档。
+            FileAction::ToggleHidden => {
+                self.toggle_hidden_and_persist(generation, crate::files::PanelColumn::Remote);
+                return;
+            }
             _ => {}
         }
         let client = {
@@ -5575,11 +5637,6 @@ impl App {
             // 本地栏用的,两套路径语义不通用(POSIX vs 本机)。
             FileAction::Up => files.remote.cwd.parent(),
             FileAction::Refresh => files.remote.cwd.clone(),
-            FileAction::ToggleHidden => {
-                files.remote.show_hidden = !files.remote.show_hidden;
-                mark_ui_dirty!(self.ui_dirty);
-                return;
-            }
             // F131:路径条敲的原文,在这里才解析 —— `~` 要用远端登录目录展开。
             // 解析不出来(空输入 / `~` 但还不知道登录目录)就什么都不做;
             // 真正跳不过去的路径交给远端报错(`spawn_sftp_list_dir` 失败会落
@@ -5619,6 +5676,11 @@ impl App {
             | FileAction::ClipCut
             | FileAction::ClipPaste
             | FileAction::CopyPath { .. } => return,
+            // F253:同本地栏那条 —— 前置分流已经处理掉了,落到这儿是接线坏了。
+            FileAction::ToggleHidden => {
+                log::warn!("ToggleHidden 落到了导航分支,F253 的前置分流被改坏了");
+                return;
+            }
         };
         // F249:探测那一趟不动 `cwd`、不进 `Loading` —— 它还不知道要去哪儿。
         // 借 `files` 到此为止(下面几行只用 `self`),两条路各发各的请求。
@@ -9031,6 +9093,8 @@ impl App {
                         self.settings.local_bookmarks.clone(),
                         // F139:没有会话记录就没地方存书签,☆ 置灰。
                         session_id.is_some(),
+                        // F253:隐藏项开关的初始值。
+                        self.settings.show_hidden_files,
                     ),
                     conn: handle,
                     generation,
@@ -9136,6 +9200,8 @@ impl App {
                     self.settings.local_bookmarks.clone(),
                     // F139:没有会话记录就没地方存书签,☆ 置灰。
                     session_id.is_some(),
+                    // F253:隐藏项开关的初始值。
+                    self.settings.show_hidden_files,
                 ),
                 sftp: None,
                 sftp_host_ix: None,
@@ -17430,6 +17496,7 @@ mod tests {
                 confirm_password: "hunter2".into(),
                 tmux_bootstrap: true,
                 shell_osc7_bootstrap: true,
+                show_hidden_files: true,
                 log_level: mullion_store::LogLevel::Info,
             };
             let _ = finish_password_change(Some(&mut d), r, "已生效");
@@ -21110,6 +21177,36 @@ mod tests {
         );
     }
 
+    /// F253:设置弹窗「确定」时,新开关要搬进 `self.settings`(同上一条的理由),
+    /// **而且**要把已经开着的面板一起刷过去。
+    ///
+    /// 后半句才是这一条的重点:只搬 `settings` 的话,新开的标签对了、用户眼前
+    /// 那个面板毫无变化 —— 他会以为这个开关坏了(仓库里 D3-2 那条「悄悄少一项,
+    /// 用户只会以为程序坏了」的同一个形状)。刷的动作本身是纯函数
+    /// (`PanelFrame::reseed_hidden`,有自己的测试);这里扎的是「有没有人调它」,
+    /// 也就是 F226 记下的那个恒绿模式的另一半。
+    ///
+    /// 自证会变红:把两句里的任意一句删掉。
+    #[test]
+    fn committing_the_settings_carries_the_hidden_switch_into_open_panels() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("\n    fn take_settings_draft(&mut self) {")
+            .nth(1)
+            .expect("找不到 take_settings_draft 的定义");
+        let body = &body[..body
+            .find("\n    }\n")
+            .expect("找不到 take_settings_draft 的函数结尾")];
+        assert!(
+            body.contains("self.settings.show_hidden_files = d.show_hidden_files;"),
+            "「确定」没把 F253 的开关搬进 settings:{body}"
+        );
+        assert!(
+            body.contains(concat!("reseed", "_hidden(")),
+            "「确定」没把 F253 的开关刷进已经开着的面板:{body}"
+        );
+    }
+
     /// **接线守护 / F124**:tick 的三件事都得在——判据走
     /// `remote_bootstrap::should_attempt`、发的是 `bootstrap_command()`、
     /// 结论按退出码写回 `finish(..)`。
@@ -24144,6 +24241,52 @@ mod tests {
     /// `ConnectOk` 里两条分支各建一次标签,单测里跑不动真实连接/`EventLoopProxy`,
     /// 只能扫源码确认两处都接上了配置读出来的 `sftp_prefs`。
     ///
+    /// F253:`Ctrl+H` 那两处切换(远端栏 / 本地栏)都必须**写穿落盘**,而且必须
+    /// 走 `mutate_settings`(F247 的读-改-写唯一入口),不许直接改
+    /// `self.settings` 再整份覆盖。
+    ///
+    /// **扎源码结构**的理由同 `connect_ok_wires_configured_sftp_prefs_into_both_new_tabs`:
+    /// `dispatch_panel_action` 要 `&mut self` + 一个真的 `App`,无头环境造不出来。
+    ///
+    /// 为什么断言**恰好两处**而不是「至少一处」:两栏各有一条分支,只接一条
+    /// 的表现是「在远端栏按 Ctrl+H 记得住、在本地栏按就记不住」—— 而这正是
+    /// 「列举式门控在加档时必然漏」在本仓库踩中的第四次。将来真加了第三栏,
+    /// 这条会立刻提醒,不会静默漏掉它。
+    ///
+    /// 判据分两层:两处分支都得走**同一个**方法,而那个方法体里得有
+    /// `mutate_settings`。只断言外层的话,把方法体掏空照样全绿;只断言内层
+    /// 的话,某一栏根本没接上照样全绿(F226 记的那个恒绿模式)。
+    ///
+    /// 锚点用 `concat!` 拆开拼:写成完整字面量的话,`match_indices` 会连**这条
+    /// 测试自己源码里的那一行**一起数进去,计数多一、断言恒假(本仓库已踩过
+    /// 这类源码切片自命中)。
+    ///
+    /// **这段注释自己不许出现被数的那个串**(连 `self.` 前缀一起):源码切片
+    /// 守护是拿整份 `app.rs` 原文数的,注释也在里面 —— 这一条在本仓库单独
+    /// 立过项。所以下面只描述、不照抄。
+    ///
+    /// 自证会变红:把任意一处调用换回原来的就地取反,或把那个方法体里的
+    /// `mutate_settings(..)` 那句删掉。
+    #[test]
+    fn both_toggle_hidden_branches_write_the_switch_through_to_disk() {
+        let src = include_str!("app.rs");
+        let call = concat!("self.toggle_hidden", "_and_persist(");
+        assert_eq!(
+            src.matches(call).count(),
+            2,
+            "切换隐藏项的调用点不是两处(远端栏 + 本地栏)—— 新增的那栏也要走这条路"
+        );
+        let after = src
+            .split(concat!("fn toggle_hidden", "_and_persist("))
+            .nth(1)
+            .expect("找不到 toggle_hidden_and_persist");
+        let body = &after[..after.find("\n    }\n").expect("找不到它的结尾")];
+        assert!(
+            body.contains("mutate_settings("),
+            "隐藏项开关没写穿落盘(F253),用户按了 Ctrl+H 下次开还是变回去"
+        );
+    }
+
     /// 自证会变红:把两处 `files: crate::ui::files_panel::PanelFrame::new(..)`
     /// 中的任意一处改回 `PanelFrame::default()`,或把 `sftp_default_remote:`
     /// 那一行删掉。

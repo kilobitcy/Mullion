@@ -77,6 +77,12 @@ pub struct PaneState {
     pub load: Load,
     pub sort_key: SortKey,
     pub sort_dir: SortDir,
+    /// F253:这一栏此刻要不要显示 `.` 开头的项。
+    ///
+    /// **这是运行态,不是配置** —— 初始值由 `PanelFrame::new` 从
+    /// `Settings::show_hidden_files` 喂进来,`Ctrl+H` 改这一份并写穿回配置。
+    /// 而 F218 reveal / F252 到达那两处「替用户掀开」只改这一份、**不写盘**:
+    /// 用户特意藏起来,一次 reveal 就把他的偏好翻回去,而且他不知道是谁翻的。
     pub show_hidden: bool,
     /// **选中集**(F54 多选)。存的是身份(`RemotePath`)不是下标。
     ///
@@ -176,6 +182,13 @@ pub struct PaneState {
 }
 
 impl PaneState {
+    /// F253:`show_hidden` 起于 [`mullion_store::Settings::show_hidden_files`]
+    /// 的默认值(**开**),而不是 `false`。
+    ///
+    /// **没有把它做成参数**是刻意的:这个构造器有 60 多个调用点、其中生产
+    /// 路径只有 `PanelFrame::new`/`PanelFrame::default` 两处。真正需要「编译器
+    /// 逼调用点表态」的是 `PanelFrame::new`(那里加了参数),在这一层再加一次
+    /// 只会换来 60 处纯机械 diff。
     pub fn new(cwd: RemotePath) -> Self {
         Self {
             cwd,
@@ -183,7 +196,7 @@ impl PaneState {
             load: Load::Idle,
             sort_key: SortKey::Name,
             sort_dir: SortDir::Asc,
-            show_hidden: false,
+            show_hidden: true,
             selected: std::collections::BTreeSet::new(),
             cursor: None,
             anchor: None,
@@ -695,11 +708,16 @@ mod tests {
     /// F218:待亮的是隐藏文件时,**顺手打开隐藏文件开关** —— `rows()` 会把
     /// 它过滤掉,选中和滚动都落在一条画不出来的行上,用户看到的是「按了没反应」。
     ///
+    /// F253 起 `show_hidden` **默认为真**,所以这条测试必须**先手工关掉它** ——
+    /// 不关的话断言恒真,这条守护就废了(它守的恰恰是「用户特意藏起来之后,
+    /// reveal 仍然掀得开」)。
+    ///
     /// 自证会变红:把 `take_reveal_pick` 里那句 `self.show_hidden = true` 删掉。
     #[test]
     fn revealing_a_dotfile_turns_the_hidden_switch_on_so_it_is_actually_visible() {
         let mut s = state();
-        assert!(!s.show_hidden, "前提:默认不显示隐藏文件");
+        s.show_hidden = false;
+        assert!(!s.show_hidden, "前提:用户特意把隐藏项藏起来了");
         s.reveal_pick = Some(RemotePath::from_bytes(b".gitignore".to_vec()));
         s.accept(
             s.request_seq,
@@ -1485,10 +1503,15 @@ mod tests {
     /// 同 `revealing_a_dotfile_turns_the_hidden_switch_on…` 的理由:
     /// `rows()` 会把它过滤掉,亮在一条画不出来的行上等于没亮。
     ///
+    /// F253 起 `show_hidden` **默认为真**,所以这条测试必须**先手工关掉它**。
+    /// 不关的话下面那句 `assert!(s.show_hidden)` 恒真 —— 删掉
+    /// `take_arrival_marks` 里的赋值它照样绿,这条守护就成了摆设。
+    ///
     /// 自证会变红:把 `take_arrival_marks` 里那句 `self.show_hidden = true` 删掉。
     #[test]
     fn an_arrived_dotfile_turns_the_hidden_switch_on_so_it_is_actually_visible() {
         let mut s = state();
+        s.show_hidden = false;
         s.arrival_marks.insert((rp("/home/u"), rp(".env")));
         let seq = s.begin_load(rp("/home/u"));
         assert!(s.accept(seq, Ok(vec![e(".env", EntryKind::File)])));
@@ -1529,9 +1552,14 @@ mod tests {
 
     /// 没选中时状态行报的是**可见行数**,不是 `entries.len()` ——
     /// 关着隐藏文件时两者不一样,报存储数就跟用户眼睛看到的对不上。
+    ///
+    /// F253 起默认显示隐藏项,所以要**先手工关掉**才制造得出「两者不一样」
+    /// 那个局面 —— 不关的话可见行数恒等于 `entries.len()`,这条守护测不动
+    /// 它要守的那件事。
     #[test]
     fn the_status_line_counts_visible_rows_when_nothing_is_selected() {
         let mut s = PaneState::new(rp("/"));
+        s.show_hidden = false;
         s.entries = vec![
             e("a", EntryKind::File),
             e("b", EntryKind::File),

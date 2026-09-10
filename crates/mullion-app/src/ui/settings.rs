@@ -24,6 +24,12 @@ const BOOTSTRAP_LABEL: &str = "自动配置远端 tmux 的状态上报";
 /// F156-c 那个开关的标签。同上,实现与测试**共用这一份**。
 const OSC7_LABEL: &str = "让远端 shell 报出当前目录(非 tmux 场景)";
 
+/// F253 那个开关的标签。同上,实现与测试**共用这一份**。
+///
+/// 文案不含 `.` 之外的任何非 ASCII 符号(T9 字形白名单:egui 的字体链只有
+/// 内置 + 微软雅黑两级,链外字形静默画成豆腐块)。
+const HIDDEN_FILES_LABEL: &str = "文件面板显示以 . 开头的项";
+
 /// 三档的中文标签。**实现与测试共用同一份** —— 各写一遍的话,改文案时
 /// 测试会静默地点不中,`interact` 里那句 panic 才是唯一的提示。
 const LEVEL_ERROR_LABEL: &str = "只记错误";
@@ -63,6 +69,12 @@ pub struct SettingsDraft {
     pub tmux_bootstrap: bool,
     /// F156-c:往远端 shell 注入一次 OSC 7 上报。
     pub shell_osc7_bootstrap: bool,
+    /// F253:文件面板显示 `.` 开头的项。
+    ///
+    /// 「确定」时除了落盘,还要把**已经开着的**面板两栏一起刷成这个值
+    /// (`App::take_settings_draft`)—— 不刷的话用户在这儿勾完、回面板毫无
+    /// 变化,只会以为程序坏了。
+    pub show_hidden_files: bool,
     /// F155:日志详细档位。回写进 `Settings` 与施加到 log facade 都在
     /// `app.rs` 的「确定」分支里做。
     pub log_level: mullion_store::LogLevel,
@@ -79,6 +91,7 @@ impl SettingsDraft {
             confirm_password: String::new(),
             tmux_bootstrap: s.tmux_bootstrap,
             shell_osc7_bootstrap: s.shell_osc7_bootstrap,
+            show_hidden_files: s.show_hidden_files,
             log_level: s.log_level,
         }
     }
@@ -161,6 +174,8 @@ pub fn show(
             appearance(ui, t, draft, env, &mut out);
             form::section(ui, t, "设置", "远端", &mut first);
             remote(ui, t, draft, &mut out);
+            form::section(ui, t, "设置", "文件面板", &mut first);
+            files(ui, t, draft, &mut out);
             form::section(ui, t, "设置", "诊断", &mut first);
             diagnostics(ui, t, draft, &mut out);
             form::section(ui, t, "设置", "安全", &mut first);
@@ -354,6 +369,40 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
     ui.add_space(SP_M);
 }
 
+/// 文件面板分节(F253):要不要显示 `.` 开头的项。
+///
+/// **单独一个分节**,没塞进「外观」:它不是配色/字号那类纯观感,它决定
+/// 「有些文件你根本看不见」——本项目主场景(在远端跑 Claude Code)的工作
+/// 目录里最要紧的东西恰好全是 `.` 开头的(`.claude/`、`.git/`、`.env`)。
+///
+/// 走 `form::grid` 两列骨架(规范 #1),复选框和灰字说明都挂**输入列**、
+/// 标签列留空(规范 #6)。
+fn files(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut SettingsOut) {
+    form::grid(ui, "settings_files", |ui| {
+        ui.label("");
+        if ui
+            .checkbox(&mut draft.show_hidden_files, HIDDEN_FILES_LABEL)
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
+
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "点「确定」后连已经开着的面板也会跟着变(远端栏和本地栏都变)。\
+                 面板里按 Ctrl+H 也能切,那一下同样存下来 —— 两个入口是同一个开关。\
+                 默认开着:远端工作目录里最要紧的东西多半就是 .claude/、.git/ 这些。",
+            )
+            .size(11.0)
+            .color(theme::c32(t.fg_muted)),
+        );
+        ui.end_row();
+    });
+    ui.add_space(SP_M);
+}
+
 /// 诊断分节(F155):日志详细度 + 导出脱敏日志。
 ///
 /// 走 `form::grid` 两列骨架(规范 #1),说明文字挂**输入列**、标签列留空
@@ -536,6 +585,7 @@ mod tests {
             confirm_password: String::new(),
             tmux_bootstrap: true,
             shell_osc7_bootstrap: true,
+            show_hidden_files: true,
             log_level: mullion_store::LogLevel::Info,
         }
     }
@@ -759,6 +809,7 @@ mod tests {
             confirm_password: String::new(),
             tmux_bootstrap: true,
             shell_osc7_bootstrap: true,
+            show_hidden_files: true,
             log_level: mullion_store::LogLevel::Info,
         };
         let (texts, _) = run(&mut d, false);
@@ -1009,6 +1060,76 @@ mod tests {
         assert!(!SettingsDraft::from_settings(&s).shell_osc7_bootstrap);
         assert!(
             SettingsDraft::from_settings(&mullion_store::Settings::default()).shell_osc7_bootstrap
+        );
+    }
+
+    // ---- F253 文件面板分节 ----
+
+    /// F253:点这个开关要当场回报 `Preview`(草稿变了、要重画)。回报 `None`
+    /// 的话用户点了没反应。用文件里既有的 `interact` 脚手架(跑满 `FRAMES`
+    /// 帧预热,再按标签文字找部件中心点下去;复选框要同帧松手)。
+    ///
+    /// 自证会变红:把这个复选框的 `.changed()` 分支删掉。
+    #[test]
+    fn toggling_the_hidden_files_checkbox_reports_a_preview() {
+        let mut d = draft();
+        assert!(d.show_hidden_files, "脚手架的初值该是开着的");
+        let out = interact(&mut d, HIDDEN_FILES_LABEL, egui::Vec2::ZERO, true);
+        assert!(
+            !d.show_hidden_files,
+            "复选框没被真的点到,这条测试测了个寂寞"
+        );
+        assert_eq!(out, SettingsOut::Preview);
+    }
+
+    /// F253:点这个不许把远端那两个开关带翻 —— 同一份 `draft` 上的字段名
+    /// 只差几个字母,复制粘贴写错第一个参数**不报错、只是两个开关联动**
+    /// (F156-c 那条测试就是为这个写的)。
+    #[test]
+    fn toggling_hidden_files_does_not_drag_the_remote_switches() {
+        let mut d = draft();
+        let _ = interact(&mut d, HIDDEN_FILES_LABEL, egui::Vec2::ZERO, true);
+        assert!(!d.show_hidden_files, "点的是隐藏项那个");
+        assert!(d.tmux_bootstrap && d.shell_osc7_bootstrap, "带翻了远端开关");
+    }
+
+    /// F253:草稿从**落盘的真值**起。起错了的症状是「用户关掉过,再打开设置
+    /// 弹窗又显示开着」—— 而只要他这时点了确定,关掉的选择就被覆盖回去。
+    ///
+    /// 自证会变红:把 `from_settings` 里那行改成 `show_hidden_files: true,`。
+    #[test]
+    fn the_hidden_files_draft_starts_from_the_stored_switch() {
+        let s = mullion_store::Settings {
+            show_hidden_files: false,
+            ..Default::default()
+        };
+        assert!(!SettingsDraft::from_settings(&s).show_hidden_files);
+        assert!(
+            SettingsDraft::from_settings(&mullion_store::Settings::default()).show_hidden_files
+        );
+    }
+
+    /// F253:灰字说明必须点明**已经开着的面板会跟着变**。
+    ///
+    /// 这不是凑文案:这一项和面板里的 `Ctrl+H` 是同一个真值的两个入口
+    /// (`Ctrl+H` 写穿这里、这里刷回所有已开面板)。不说的话,用户在设置里
+    /// 勾完、回到面板看见变了,会以为是别的什么东西在动。
+    #[test]
+    fn the_hidden_files_hint_says_open_panels_follow_along() {
+        let mut d = draft();
+        let (texts, _) = run(&mut d, false);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains(HIDDEN_FILES_LABEL),
+            "没画这个开关:{texts:?}"
+        );
+        assert!(
+            joined.contains("Ctrl+H"),
+            "说明里没提面板内的 Ctrl+H:{texts:?}"
+        );
+        assert!(
+            joined.contains("已经开着的"),
+            "说明里没交代已开面板会跟着变:{texts:?}"
         );
     }
 

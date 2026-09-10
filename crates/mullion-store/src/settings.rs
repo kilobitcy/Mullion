@@ -118,6 +118,15 @@ pub struct Settings {
     /// 本地路径是本机偏好,导出会话给同事(F46)不该把 `D:\我的项目` 带走。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_bookmarks: Vec<crate::sftp::Bookmark>,
+    /// F253:文件面板要不要显示 `.` 开头的项。**这是「新面板的初始值」,不是
+    /// 当前显示状态** —— 每个面板自己持有一份运行态,`Ctrl+H` 改那一份并写穿
+    /// 回这里(见 `files::state::PaneState::show_hidden`)。
+    ///
+    /// **默认开**:本项目的主场景是「在远端跑 Claude Code」,工作目录里最要紧
+    /// 的东西恰好全是 `.` 开头的(`.claude/`、`.git/`、`.env`)—— 默认藏起来
+    /// 等于默认藏掉主场景。
+    #[serde(default = "default_show_hidden_files")]
+    pub show_hidden_files: bool,
     /// F187:老库里各会话名下的 `SftpPrefs::local_bookmarks` 已经并进来了没有。
     ///
     /// **必须有这个标记,不能靠「每次启动都合一遍」**:那样确实幂等,但用户
@@ -175,6 +184,10 @@ fn default_shell_osc7_bootstrap() -> bool {
     true
 }
 
+fn default_show_hidden_files() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -184,6 +197,7 @@ impl Default for Settings {
             tmux_bootstrap: true,
             shell_osc7_bootstrap: true,
             log_level: LogLevel::Info,
+            show_hidden_files: default_show_hidden_files(),
             local_bookmarks: Vec::new(),
             // 全新用户没有老数据要并,但标记仍从 `false` 起 —— 让首次启动
             // 走一遍(空)迁移再置上,两条路(有老库/没老库)不分叉。
@@ -498,6 +512,40 @@ mod tests {
         let back = load(dir.path());
         assert!(back.note.is_none(), "老文件不该有 note:{:?}", back.note);
         assert!(back.settings.tmux_bootstrap, "老文件缺这个字段时该默认开");
+    }
+
+    /// F253:隐藏项开关默认**开**(= 显示 `.` 开头的项)。老的 settings.toml
+    /// 里没有这个字段,`serde(default)` 给 `false` 的话所有老用户升上来还是
+    /// 看不见 `.claude/`,而这正是这一条要修的病。
+    ///
+    /// 自证会变红:把 `default_show_hidden_files` 的返回值改成 `false`。
+    #[test]
+    fn show_hidden_files_defaults_to_on_for_files_written_before_it_existed() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            "schema_version = 1\nfont_pt = 10.0\n",
+        )
+        .expect("写老格式文件");
+        let back = load(dir.path());
+        assert!(back.note.is_none(), "老文件不该有 note:{:?}", back.note);
+        assert!(
+            back.settings.show_hidden_files,
+            "老文件缺这个字段时该默认显示隐藏项"
+        );
+    }
+
+    /// F253:关掉之后要能存住。光有上一条的话,「读不出用户关过」这种错法
+    /// 照样全绿(同 `tmux_bootstrap` 那一对的理由)。
+    #[test]
+    fn show_hidden_files_survives_a_round_trip_when_turned_off() {
+        let dir = tmp();
+        let s = Settings {
+            show_hidden_files: false,
+            ..Settings::default()
+        };
+        save(dir.path(), &s).expect("写盘");
+        assert!(!load(dir.path()).settings.show_hidden_files);
     }
 
     /// 关掉之后要能存住 —— 默认值是 `true`,写盘再读回必须仍是 `false`。
