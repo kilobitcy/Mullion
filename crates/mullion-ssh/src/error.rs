@@ -4,6 +4,30 @@ use std::fmt;
 
 use crate::known_hosts::Fingerprint;
 
+/// F254:开一条会话 channel 分三步走(`channel_open_session` → `request_pty`
+/// → `request_shell`),这里记的是**倒在哪一步**。
+///
+/// 三步的处置互不相干,所以不许并成一句话说。原来的
+/// `map_err(|_| ConnectError::PtyRequest)` 连服务端给的原因码一起扔了 ——
+/// 那个码是判断「是不是撞了 `MaxSessions`」的唯一客观依据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelStage {
+    /// 服务端明确回了 `CHANNEL_OPEN_FAILURE`。带的是 russh 给的原因码原文
+    /// (`ResourceShortage` / `AdministrativelyProhibited` / …)。
+    ///
+    /// **原因码原文透传,不翻译成「可能是…」**:服务端为什么拒只有它知道,
+    /// 客户端编一个理由出来就是在猜,而排查的人会当成事实。
+    OpenDenied(String),
+    /// 连 `channel_open_session` 都没走完(连接已断 / 发送失败)。跟 PTY
+    /// 一点关系都没有 —— 这一档的文案里**不许出现 PTY**。
+    OpenFailed(String),
+    /// 通道开出来了,`request_pty` 被拒。这一档才是真正的「对端不允许 PTY」。
+    Pty,
+    /// PTY 也拿到了,`request_shell` 被拒。典型是 sftp-only 账号
+    /// (`ForceCommand internal-sftp`)。
+    Shell,
+}
+
 /// 连接期的可操作错误(F6)。每个变体对应一类可区分的失败。
 #[derive(Debug)]
 pub enum ConnectError {
@@ -24,8 +48,13 @@ pub enum ConnectError {
     HostKeyUnknown { host: String, got: Fingerprint },
     /// 其余 IO 错误(网络 / 读私钥 / agent socket)。
     Io(String),
-    /// 开 channel / request_pty 失败。
-    PtyRequest,
+    /// F254:开一条会话 channel 的某一段失败了。`held` 是失败那一刻**这条
+    /// 连接**账上有几条会话 channel(口径见 [`crate::ledger`],**别拿它跟
+    /// `MaxSessions` 精确对账**)。
+    ///
+    /// **不合并成一句「开 PTY 失败」**:见 `ChannelStage` 各档的说明,以及
+    /// 测试 `the_four_ways_to_fail_opening_a_channel_each_say_their_own_thing`。
+    SessionChannel { stage: ChannelStage, held: usize },
     /// 连不上代理本身(F4)。区别于「连上了代理但代理连不上目标」。
     ProxyUnreachable { proxy: String, cause: String },
     /// 代理拒绝了我们的认证凭据(F4)。
@@ -80,7 +109,34 @@ impl fmt::Display for ConnectError {
                 )
             }
             ConnectError::Io(e) => write!(f, "网络 IO 错误:{e}"),
-            ConnectError::PtyRequest => write!(f, "开 PTY 失败 —— 对端可能不允许 PTY"),
+            // F254:四段各说各的。每一句都带上 `held`,因为「持有几条」是
+            // 判断该不该去看 MaxSessions 的唯一客观依据 —— 只在被拒那一段
+            // 带的话,用户看到别的三段就无从判断了。
+            ConnectError::SessionChannel { stage, held } => match stage {
+                ChannelStage::OpenDenied(reason) => write!(
+                    f,
+                    "服务端拒绝新开会话通道({reason});这条连接此刻持有 {held} 条 \
+                     —— 撞上 sshd 的 MaxSessions(默认 10)时报的就是这个,\
+                     关掉几个分屏或文件面板再试"
+                ),
+                ChannelStage::OpenFailed(cause) => write!(
+                    f,
+                    "开会话通道时连接已经断了:{cause};这条连接此刻持有 {held} 条 \
+                     —— 先看网络/代理链路,重连一次即可"
+                ),
+                ChannelStage::Pty => write!(
+                    f,
+                    "通道开出来了但服务端不给 PTY(request-pty 被拒);\
+                     这条连接此刻持有 {held} 条 —— 检查 sshd 的 PermitTTY,\
+                     或这个账号是不是配了强制命令"
+                ),
+                ChannelStage::Shell => write!(
+                    f,
+                    "PTY 拿到了但服务端不给 shell(request-shell 被拒);\
+                     这条连接此刻持有 {held} 条 —— 这个账号可能是 sftp-only\
+                     (ForceCommand internal-sftp)"
+                ),
+            },
             ConnectError::ProxyUnreachable { proxy, cause } => write!(
                 f,
                 "连不上代理 {proxy}:{cause} —— 检查代理是否在跑/地址端口是否写对"
@@ -145,7 +201,10 @@ mod tests {
                 got: Fingerprint(vec![3]),
             },
             ConnectError::Io("io".into()),
-            ConnectError::PtyRequest,
+            ConnectError::SessionChannel {
+                stage: ChannelStage::Pty,
+                held: 3,
+            },
             ConnectError::ProxyUnreachable {
                 proxy: "127.0.0.1:7891".into(),
                 cause: "connection refused".into(),
@@ -188,6 +247,64 @@ mod tests {
         .to_string();
         assert!(e.contains("127.0.0.1:7891"), "消息里必须点名代理: {e}");
         assert!(e.contains("代理"), "消息里必须说明这是代理侧失败: {e}");
+    }
+
+    /// F254:开会话 channel 的四种失败必须**各说各的**。
+    ///
+    /// 原来它们统统落在一句「开 PTY 失败 —— 对端可能不允许 PTY」上,而
+    /// 实际处置完全不同:
+    /// - 服务端拒绝开通道:多半撞了 `MaxSessions`,该关掉几个分屏;
+    /// - 通道请求都没发出去:连接已经断了,PTY 一点关系都没有;
+    /// - `request_pty` 被拒:才是真正的「对端不允许 PTY」(`PermitTTY no`);
+    /// - `request_shell` 被拒:sftp-only 账号,连不上跟 PTY 也没关系。
+    ///
+    /// 用户拿着「对端可能不允许 PTY」这句话去查 sshd 的 `PermitTTY`,而真
+    /// 原因是他开了 10 个分屏 —— 查一整晚也查不出来。
+    ///
+    /// 自证会变红:把 `Display` 里四个分支中的任意两个写成同一句。
+    #[test]
+    fn the_four_ways_to_fail_opening_a_channel_each_say_their_own_thing() {
+        let msgs: Vec<String> = [
+            ChannelStage::OpenDenied("ResourceShortage".into()),
+            ChannelStage::OpenFailed("connection closed".into()),
+            ChannelStage::Pty,
+            ChannelStage::Shell,
+        ]
+        .into_iter()
+        .map(|stage| ConnectError::SessionChannel { stage, held: 9 }.to_string())
+        .collect();
+        let mut uniq = msgs.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), msgs.len(), "四段的消息必须两两不同:{msgs:?}");
+        for m in &msgs {
+            assert!(m.contains("9"), "每一段都要带上持有条数:{m}");
+        }
+        assert!(
+            msgs[0].contains("ResourceShortage"),
+            "服务端给的原因码要原文透传,不许自己编一个理由:{}",
+            msgs[0]
+        );
+        assert!(
+            msgs[0].contains("MaxSessions"),
+            "被拒那一段要点名最可能的那个原因,否则「持有 9 条」没人看得懂:{}",
+            msgs[0]
+        );
+        assert!(
+            msgs[1].contains("connection closed"),
+            "发不出去那一段要带上根因:{}",
+            msgs[1]
+        );
+        assert!(
+            !msgs[1].contains("PTY"),
+            "连通道都没开出来,提 PTY 就是把人往错方向引:{}",
+            msgs[1]
+        );
+        assert!(
+            msgs[2].contains("PermitTTY"),
+            "request_pty 被拒才该指向 PermitTTY:{}",
+            msgs[2]
+        );
     }
 
     /// 跳板失败要说清是**哪一跳**——五跳链路里不说明等于没说。

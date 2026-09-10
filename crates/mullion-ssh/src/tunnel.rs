@@ -572,7 +572,10 @@ mod tests {
             ConnectError::ConnectionRefused("1.2.3.4:22".into()),
             ConnectError::Io("broken pipe".into()),
             ConnectError::DnsResolution("h".into()),
-            ConnectError::PtyRequest,
+            ConnectError::SessionChannel {
+                stage: crate::error::ChannelStage::OpenFailed("connection closed".into()),
+                held: 1,
+            },
             ConnectError::JumpFailed {
                 hop: "bastion:22".into(),
                 cause: "timeout".into(),

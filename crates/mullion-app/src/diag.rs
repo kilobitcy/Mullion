@@ -1221,6 +1221,10 @@ fn take_snapshot(window_ms: u64) -> crate::profile::Snapshot {
     s.tabs = TABS.load(Ordering::Relaxed);
     s.panes = PANES.load(Ordering::Relaxed);
     s.hosts = HOSTS.load(Ordering::Relaxed);
+    // F254:**直接读账本,不经 gauge**。它本来就是一个随时可读的当前值,再让
+    // App 每帧往一个原子里存一份镜像,只是多一处会漂的中间态 —— F167 那批
+    // 「静默假零」全是这么来的(某条路径忘了喂,数字长期是 0 而没人发现)。
+    s.ssh_channels = mullion_ssh::ledger::in_process() as u64;
     // F176:一次采样喂三个字段。**分三次调 `sample_memory()` 会让三个数
     // 来自不同时刻**,而它们随后要一起做减法。
     if let Some(m) = sample_memory() {
@@ -1262,6 +1266,35 @@ mod tests {
     /// 中毒也要拿到锁(`unwrap_or_else(into_inner)`):某条用例 panic 之后
     /// 其余的应该照常报出自己的失败,而不是全被 `PoisonError` 盖成一样的红。
     static SNAPSHOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// F254:快照里的会话 channel 数要**真的来自账本**。
+    ///
+    /// 这是 F226 记下那个恒绿模式的另一半:`ledger` 那边的加减有自己的测试、
+    /// `profile::render_lines` 那边的渲染也有自己的测试,可**中间没人把账本
+    /// 读进快照**的话,两头全绿,日志里那个 `chan=` 永远是 0 —— 而 0 看起来
+    /// 完全正常(「哦,现在没开通道」),不会有任何人怀疑它。
+    ///
+    /// 两条断言各挡一种错法:`>= 1` 挡「压根没填」,相等挡「填了但读的不是
+    /// 这本账」(比如接了个 gauge 镜像)。只留相等那条的话,两边都是 0 时
+    /// 照样绿。
+    ///
+    /// 串行:它调 `take_snapshot`(取空全局计数),而且相等那条要求两次读之间
+    /// 没人动进程级账本 —— `mullion-app` 里只有这条用例会 `check_out`。
+    ///
+    /// 自证会变红:把 `take_snapshot` 里那句 `s.ssh_channels = ..` 删掉。
+    #[test]
+    fn the_snapshot_reads_the_session_channel_count_from_the_ledger() {
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ledger = mullion_ssh::ledger::ChannelLedger::new();
+        let _slot = ledger.check_out();
+        let s = take_snapshot(5_000);
+        assert!(s.ssh_channels >= 1, "账上明明有一条,快照报的是 0");
+        assert_eq!(
+            s.ssh_channels,
+            mullion_ssh::ledger::in_process() as u64,
+            "快照里的通道数不是从账本读的"
+        );
+    }
 
     /// 一条排期。`fp` 与归因无关(这里只关心「谁的第几带、脏没脏」),给个常数。
     fn plan(pane: u32, band: u16, dirty: bool) -> crate::bands::BandPlan {

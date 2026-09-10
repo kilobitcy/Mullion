@@ -135,6 +135,9 @@ pub struct SshConnection {
     /// (例如 `establish` 里 `jumps.reverse()` 后再交给 `SshConnection::new`),
     /// 到时候先补一个能检测出错误顺序的测试再改。
     _jumps: Vec<Handle<ClientHandler>>,
+    /// F254:这条连接此刻持有几条**会话** channel(pane / sftp / exec)。
+    /// 口径与禁止事项见 [`crate::ledger`]。`direct-tcpip` 转发不进这本账。
+    ledger: crate::ledger::ChannelLedger,
 }
 
 impl SshConnection {
@@ -142,7 +145,20 @@ impl SshConnection {
         Self {
             handle,
             _jumps: jumps,
+            ledger: crate::ledger::ChannelLedger::new(),
         }
+    }
+
+    /// F254:这条连接的会话 channel 账本。开 channel 的三处
+    /// (`open_pty` / `exec` / `SftpClient::open`)各自 `check_out` 一格。
+    pub(crate) fn ledger(&self) -> &crate::ledger::ChannelLedger {
+        &self.ledger
+    }
+
+    /// F254:此刻账上有几条。**别拿它跟 sshd 的 `MaxSessions` 精确对账** ——
+    /// 理由见 [`crate::ledger`] 的模块文档。
+    pub fn channels_held(&self) -> usize {
+        self.ledger.held()
     }
 
     /// 目标主机的 Handle。跳板的 Handle **不外借**——外部拿不到就不会误 Drop。
@@ -504,11 +520,27 @@ pub async fn open_pty(
     cfg: &SshConfig,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(SshSession, mpsc::Receiver<Vec<u8>>), ConnectError> {
-    let channel = conn
-        .handle()
-        .channel_open_session()
-        .await
-        .map_err(|_| ConnectError::PtyRequest)?;
+    // F254:每一段失败都要说清是哪一段、服务端给了什么原因码、以及**这条
+    // 连接此刻账上有几条**。原来三段统统 `map_err(|_| PtyRequest)`,用户
+    // 拿到的永远是「对端可能不允许 PTY」——而分屏开多了撞 `MaxSessions`
+    // 报的也是这一句,那条线索被彻底掩埋。
+    let opened = conn.handle().channel_open_session().await;
+    let channel = opened.map_err(|e| ConnectError::SessionChannel {
+        // russh 只在服务端明确回 `CHANNEL_OPEN_FAILURE` 时给
+        // `ChannelOpenFailure`;别的都是「请求没发出去」。两者的处置完全
+        // 不同,所以在这里就分开,不在 UI 层猜。
+        stage: match e {
+            russh::Error::ChannelOpenFailure(r) => {
+                crate::error::ChannelStage::OpenDenied(format!("{r:?}"))
+            }
+            other => crate::error::ChannelStage::OpenFailed(other.to_string()),
+        },
+        held: conn.channels_held(),
+    })?;
+    // F254:**开出来之后**才记账 —— 提前记会让报错里那个数字虚高一条,
+    // 而看的人恰恰在拿它跟 `MaxSessions` 比。guard 一路移动到 `io_task`,
+    // 那条 channel 活多久账就记多久(见 `ledger::ChannelGuard`)。
+    let guard = conn.ledger().check_out();
     if channel
         .request_pty(true, &cfg.term, cfg.cols as u32, cfg.rows as u32, 0, 0, &[])
         .await
@@ -519,11 +551,23 @@ pub async fn open_pty(
         // handle 是共享 Arc,某个 pane 开失败不会关掉整条连接,泄漏会一直累积到
         // sshd 的 MaxSessions 上限,导致后续 pane 再也开不出来。
         let _ = channel.close().await;
-        return Err(ConnectError::PtyRequest);
+        // `held` 在 `guard` **还活着**的时候取:报的是「失败这一刻我们手上
+        // 有几条」,那条刚开出来又要关掉的也算 —— 服务端此刻也还在算它。
+        let held = conn.channels_held();
+        drop(guard);
+        return Err(ConnectError::SessionChannel {
+            stage: crate::error::ChannelStage::Pty,
+            held,
+        });
     }
     if channel.request_shell(true).await.is_err() {
         let _ = channel.close().await;
-        return Err(ConnectError::PtyRequest);
+        let held = conn.channels_held();
+        drop(guard);
+        return Err(ConnectError::SessionChannel {
+            stage: crate::error::ChannelStage::Shell,
+            held,
+        });
     }
 
     // 拆读写半:read.wait()(&mut) 与 write.data()(&) 同任务 select! 不冲突。
@@ -532,7 +576,7 @@ pub async fn open_pty(
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<SshCmd>(256);
 
-    tokio::spawn(io_task(read, write, cmd_rx, inbound_tx, wake, conn));
+    tokio::spawn(io_task(read, write, cmd_rx, inbound_tx, wake, conn, guard));
 
     Ok((SshSession { cmd_tx }, inbound_rx))
 }
@@ -547,6 +591,11 @@ async fn io_task(
     // 就断。多 pane 下每条 channel 的 io_task 各持一份,最后一个 io_task 结束时
     // 连接才关(§6.1)。
     _conn: Arc<SshConnection>,
+    // F254:这条 channel 在账上的那一格。**参数而不是函数体里 check_out**:
+    // 记账必须发生在 `channel_open_session` 成功之后、而且 `open_pty` 的
+    // 失败路径也要归还,所以 guard 在那边造、移动到这里来 —— 这个任务活多久
+    // 账就记多久,任务一结束(远端断线 / app 关掉这条 pane)自动归还。
+    _slot: crate::ledger::ChannelGuard,
 ) {
     loop {
         // 单任务顺序 select:inbound send().await 期间不处理 cmd(大 burst 下键入有延迟,非死锁)。

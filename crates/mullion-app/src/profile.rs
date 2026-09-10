@@ -294,6 +294,13 @@ pub struct Snapshot {
     pub tabs: u64,
     pub panes: u64,
     pub hosts: u64,
+    /// F254:这个进程此刻持有多少条 SSH **会话** channel(pane / sftp / exec
+    /// 加总,`direct-tcpip` 转发不算)。来自 `mullion_ssh::ledger::in_process`。
+    ///
+    /// 口径警告见那个模块的文档:**这是我们自己的账,不是服务端的**,别拿它
+    /// 跟 sshd 的 `MaxSessions` 精确对账。它在日志里的用途是看**趋势** ——
+    /// 「开分屏失败之前它是不是已经爬到 9 了」。
+    pub ssh_channels: u64,
     /// F173:per-pane 归因。全局 `in=` 只是聚合速率,答不了「三个 pane 各说
     /// 一点」与「一个 pane 说了全部」的区别,而这两种的根因完全不同。
     pub pane_detail: Vec<PaneDetail>,
@@ -468,6 +475,7 @@ impl Snapshot {
             tabs: 0,
             panes: 0,
             hosts: 0,
+            ssh_channels: 0,
             mem_process_mb: 0,
             mem_kind: crate::diag::MemKind::Rss,
             mem_ws_mb: None,
@@ -1091,11 +1099,15 @@ pub fn render_lines(s: &Snapshot, debug: bool) -> Vec<String> {
         format!("{}行", s.scroll_lines)
     };
     lines.push(format!(
-        "profile.load scene={} tabs={} panes={} hosts={} scroll={} xfer={}个/{}MB剩 key={}x in={}",
+        "profile.load scene={} tabs={} panes={} hosts={} chan={} \
+         scroll={} xfer={}个/{}MB剩 key={}x in={}",
         scene_of(s).label(),
         s.tabs,
         s.panes,
         s.hosts,
+        // F254:紧跟 `hosts=` —— 同一类分母,而且「几台机器 / 几条通道」
+        // 是要并着看的:一台机器上挂了 9 条通道跟九台各一条,完全两回事。
+        s.ssh_channels,
         scroll_disp,
         s.xfer_jobs,
         s.xfer_bytes_left >> 20,
@@ -1464,6 +1476,29 @@ mod tests {
         };
         s.frame_us[bucket_of(8_000)] = 300;
         s
+    }
+
+    /// F254:`profile.load` 行要报进程级会话 channel 数。
+    ///
+    /// **为什么必须进日志**:分屏开不出来是偶发的,用户报错时那一刻的账早就
+    /// 过去了。只有每 5 秒一行的时间序列能回答「失败之前它是不是已经爬到 9
+    /// 了」—— 而那正是「撞上 sshd 的 `MaxSessions`」与「服务端另有原因」的
+    /// 分水岭。事后问用户是问不出来的。
+    ///
+    /// 放在 `load` 行(而不是概览行):它是个**分母**,跟 `tabs=/panes=/hosts=`
+    /// 同一类 —— 概览行已经 500+ 字符,人眼扫不动(设计 §1)。
+    ///
+    /// 自证会变红:把 `render_lines` 里 load 行的 `chan={}` 那一段删掉。
+    #[test]
+    fn the_load_line_reports_how_many_session_channels_the_process_holds() {
+        let mut s = busy_snapshot();
+        s.ssh_channels = 9;
+        let lines = render_lines(&s, false);
+        let load = lines
+            .iter()
+            .find(|l| l.starts_with("profile.load "))
+            .expect("没有 load 行");
+        assert!(load.contains("chan=9"), "load 行没报会话 channel 数:{load}");
     }
 
     /// 空窗口（一帧没画、一个字节没收）**不该产出一行**。

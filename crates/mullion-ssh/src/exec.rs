@@ -82,6 +82,13 @@ pub async fn exec(conn: &Arc<SshConnection>, command: Vec<u8>) -> Result<ExecOut
         .channel_open_session()
         .await
         .map_err(|_| ExecError::Channel)?;
+    // F254:exec 用的也是**会话**类型的 channel,一样占 sshd 的 `MaxSessions`
+    // 槽位,所以一样要上账 —— 不记的话「这条连接持有 N 条」在跑着 F57 删除
+    // 之类的命令时会偏小,而那正是分屏开不出来的时刻。
+    //
+    // guard 就放在栈上:这个函数是「跑完一条命令再返回」,下面每个 `return`
+    // 与函数正常结束都会 drop 它,不会漏。
+    let _slot = conn.ledger().check_out();
     // `want_reply = true` 是必须的:回执才是 F57 判定「该回退了」的信号。
     // 设 false 的话拒绝是静默的,我们会误以为命令跑了而且成功了。
     //

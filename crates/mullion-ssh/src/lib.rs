@@ -9,6 +9,7 @@ pub mod error;
 pub mod exec;
 pub mod hop;
 pub mod known_hosts;
+pub mod ledger;
 pub mod proxy;
 pub mod remove_tree;
 pub mod schedule;

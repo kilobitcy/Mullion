@@ -207,6 +207,13 @@ impl From<NonUtf8Path> for SftpError {
 pub struct SftpClient {
     inner: russh_sftp::client::SftpSession,
     _conn: Arc<SshConnection>,
+    /// F254:这条 sftp channel 在账上的那一格。sftp 走的也是**会话**类型的
+    /// channel,一样占 sshd 的 `MaxSessions` 槽位 —— 用户开着文件面板时分屏
+    /// 上限确实少一条,那不是账错了。
+    ///
+    /// 字段而不是局部变量:面板一开就一直挂着,这个 client 被丢弃(关标签 /
+    /// 换节点)才归还。
+    _slot: crate::ledger::ChannelGuard,
 }
 
 impl SftpClient {
@@ -220,6 +227,8 @@ impl SftpClient {
             .channel_open_session()
             .await
             .map_err(|_| SftpError::Subsystem)?;
+        // F254:开出来之后才记账,理由同 `session::open_pty`。
+        let slot = conn.ledger().check_out();
         if channel.request_subsystem(true, "sftp").await.is_err() {
             // `Channel<Msg>` 没有自动发 CHANNEL_CLOSE 的 Drop,不显式关就是
             // 泄漏一个 channel slot,一直累积到 sshd 的 MaxSessions 上限
@@ -230,7 +239,11 @@ impl SftpClient {
         let inner = russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| SftpError::Protocol(e.to_string()))?;
-        Ok(Self { inner, _conn: conn })
+        Ok(Self {
+            inner,
+            _conn: conn,
+            _slot: slot,
+        })
     }
 
     /// 列目录。**不解引用符号链接**——`readdir` 给的就是 lstat 语义,
