@@ -104,6 +104,13 @@ pub enum UserEvent {
         /// **复用**,只查 id/树成员会误判为"还需要",顶掉新世代刚建好的
         /// `PaneState`。世代号是唯一能分辨"这事件到底是哪一代发出的"的信息。
         generation: u64,
+        /// F255:这条 channel 开在 `ws.hosts` 的**哪一台**上。
+        ///
+        /// 必须跟着事件走,不能在 handler 里重新取一次焦点:开 channel 是真实
+        /// 网络往返,期间用户完全可能把焦点挪到另一台上的 pane 去了 —— 那样
+        /// 挂出来的 `PaneState::host_ix` 指的是别人家,而后续的重连、换节点、
+        /// 文件面板跟随全认这个下标。原来这里硬编 `0`。
+        host_ix: usize,
     },
     /// 分屏 channel 开失败。树上的叶子位留着,标题条显示错误,用户可以再切布局。
     PaneOpenErr {
@@ -771,8 +778,10 @@ fn tmux_attach_for_connect(
         // 建标签的那一块 —— 与下面 `on_pane_ready(.., PaneId(1), ..)`
         // 是同一块 pane(`Workspace::new` 的第一块)。
         pane: PaneId(1),
-        // 这个 `ws` 是刚建的,`hosts` 里只有这一条(同 `PaneOpened` 里硬编的
-        // `host_ix: 0`)。
+        // 这个 `ws` 是刚建的,`hosts` 里**只有这一条** —— 这里的 `0` 因此是
+        // 确定的事实,不是缺省值。F255 把 `PaneOpened` 那处硬编的 `host_ix: 0`
+        // 改成了跟着事件走,这一处刻意没跟着改:那边有「开在第几台」这个问题,
+        // 这边压根还只有一台。
         host_ix: 0,
         session_name: mullion_store::tmux_session_name(tpl?, fallback_name?)?,
     })
@@ -9338,7 +9347,10 @@ impl App {
                 LeafPlan::Orphan => self.place_orphan_pane(generation, *id),
             }
         }
-        self.spawn_fresh_panes(same_host);
+        // F255:`Some(0)` 是写死的,**不是**「取焦点那台」—— `LeafPlan::SameHost`
+        // 的定义就是「跟这个标签的主连接同一台」,而主连接恒在 `hosts[0]`
+        // (F128 重连是就地替换,不 push)。恢复途中焦点在哪跟这件事无关。
+        self.spawn_fresh_panes(same_host, Some(0));
         self.drive_restore_dial();
     }
 
@@ -9389,7 +9401,31 @@ impl App {
     /// 哪些"的路由逻辑在自由函数 `apply_layout_actions`(可脱离 runtime/proxy
     /// 单测,见其文档注释);这里只管执行,天然依赖 `self._runtime`/`self.proxy`,
     /// 无头环境测不了,只能人工验收(F35 的实际 channel 复用效果)。
-    fn spawn_fresh_panes(&mut self, fresh: Vec<PaneId>) {
+    /// 布局动作(点了工具栏的预设 / 点了某个 pane 标题条的 ×)的落地。
+    ///
+    /// **抽成具名方法**(F255)是为了让「先问焦点挂在哪台、再改树」这个**顺序**
+    /// 落在一个量得出来的小范围里。`Workspace::apply_preset` 会顺手挪焦点
+    /// (`next_focus`),而且新分出来的那块此刻还**没有** `PaneState` —— 改完树
+    /// 再取焦点的话,`focused_pane_host_ix()` 十有八九是 `None`,新分屏会被
+    /// `host_for_fresh` 全部拒掉。症状是「点了预设,多出来的那格永远是一句
+    /// 『还在连接中』」,而且是**必然**发生,不是偶发。
+    fn land_layout_actions(&mut self, actions: &crate::ui::UiActions) {
+        // F255:**在 `apply_layout_actions` 之前**取 —— 见上面那段。
+        let focus_host_ix = self
+            .tabs
+            .active()
+            .and_then(|t| t.content.focused_pane_host_ix());
+        if let Some(t) = self.active_term_mut() {
+            if let Some(fresh) = apply_layout_actions(&mut t.ws, actions) {
+                mark_ui_dirty!(self.ui_dirty);
+                self.spawn_fresh_panes(fresh, focus_host_ix);
+            }
+        }
+    }
+
+    /// `focus_host_ix`(F255)= 发起这次分屏时**焦点那块挂在哪台**上。由调用方
+    /// 给,理由见 `host_for_fresh`(取的时机不是「现在」)。
+    fn spawn_fresh_panes(&mut self, fresh: Vec<PaneId>, focus_host_ix: Option<usize>) {
         if fresh.is_empty() {
             return;
         }
@@ -9397,15 +9433,40 @@ impl App {
         // 分屏会拿标签 B 的 term/尺寸去开 channel(S2 把 last_cfg 搬进标签的理由)。
         let Some(t) = self.active_term() else { return };
         let ws = &t.ws;
-        let Some(host) = ws.hosts.first() else { return };
         // C1:开 channel 是异步的,回来时用户可能已经断开重连、换了一个新
         // `Workspace`(`next_id` 重新从 2 计数,`id` 会撞号)。把发起时刻的
         // 世代一起带走,`PaneOpened`/`PaneOpenErr` 抵达时据此判断"这事件还
         // 是不是当前这个 Workspace 发出的"。
         let generation = ws.generation();
-        let handle = host.handle.clone();
-        let Some(cfg) = t.last_cfg.clone() else {
-            return;
+        // F255:开在**焦点那块挂着的那台**上,不是 `hosts.first()`。判据抽在
+        // `host_for_fresh`(纯函数,可单测);这里只负责按它的答案取材料。
+        let material = host_for_fresh(focus_host_ix, ws.hosts.len()).and_then(|ix| {
+            // 界已经在 `host_for_fresh` 里判过了,这里 `None` 只可能是将来
+            // 有人把那道判据改坏 —— 也**不静默回落 `hosts[0]`**。
+            let handle = ws
+                .hosts
+                .get(ix)
+                .map(|h| h.handle.clone())
+                .ok_or_else(|| format!("连接池里没有第 {} 台", ix + 1))?;
+            let cfg = t
+                .last_cfg
+                .clone()
+                .ok_or_else(|| "这个标签还没有过一次成功的连接,分屏无从复用".to_string())?;
+            Ok((ix, handle, cfg))
+        });
+        let (host_ix, handle, cfg) = match material {
+            Ok(v) => v,
+            Err(why) => {
+                // 树上的叶子位**已经占好了**(`apply_preset` 先改树、再由这里
+                // 开 channel)。不摆一块带说明的 pane,那一格就永远停在
+                // 「连接中」的空白上,而用户完全不知道发生了什么 —— 原来这三条
+                // 早退路径正是这么静默的。
+                let msg = format!("开分屏失败:{why}");
+                for id in fresh {
+                    self.place_dead_pane(generation, id, &msg);
+                }
+                return;
+            }
         };
         for id in fresh {
             let handle = handle.clone();
@@ -9423,6 +9484,7 @@ impl App {
                             ssh,
                             rx,
                             generation,
+                            host_ix,
                         });
                     }
                     Err(e) => {
@@ -9899,11 +9961,11 @@ impl App {
                 // **台机器**的当前连接」,不是「第 ix 次建立的连接」。
                 // push 一条新的会让 `hosts[0]` 不再是这个标签的主连接,
                 // 而认着这个下标的地方一个都不会跟着走 ——
-                // `TabContent::sftp_connection`(文件面板)、
-                // `spawn_fresh_panes`(分屏开 channel)、`PaneOpened` 里
-                // 硬编的 `host_ix: 0` 全都会指向刚断掉的那条死连接,
-                // 症状是重连之后文件面板永久打不开、新开的分屏必然失败,
-                // 而终端本身工作正常,用户完全看不出成因。
+                // `TabContent::sftp_connection`(文件面板)、每块 pane 自己
+                // 记着的 `PaneState::host_ix`(F255 之后新分屏也照它开)
+                // 全都会指向刚断掉的那条死连接,症状是重连之后文件面板
+                // 永久打不开、新开的分屏必然失败,而终端本身工作正常,
+                // 用户完全看不出成因。
                 //
                 // 旧的那条 `HostConn` 在这次赋值里 Drop —— Drop 即断连,
                 // 而它本来就已经死了(`rx_closed_action` 的重连判据就是
@@ -10793,6 +10855,7 @@ impl ApplicationHandler<UserEvent> for App {
                 ssh,
                 rx,
                 generation,
+                host_ix,
             } => {
                 // 初始网格给 80x24 占位,真实尺寸由下一帧 apply_geometry 校准
                 // (last_grid 给 (0,0),保证那一帧必然发一次 window_change)。
@@ -10838,7 +10901,9 @@ impl ApplicationHandler<UserEvent> for App {
                         attached = Some(ssh.clone());
                         ws.attach_pane(PaneState {
                             id,
-                            host_ix: 0,
+                            // F255:开在哪台就记哪台。原来硬编 `0`,焦点那块
+                            // 「换节点」搬走之后新分屏会记成第一台。
+                            host_ix,
                             emulator,
                             pty: Box::new(ssh),
                             rx,
@@ -12640,12 +12705,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // `apply_layout_actions`(只碰 &mut Workspace,可脱离
                             // runtime/proxy 单测);真正开新 channel 需要 runtime/proxy,
                             // 落在 `spawn_fresh_panes`。
-                            if let Some(t) = self.active_term_mut() {
-                                if let Some(fresh) = apply_layout_actions(&mut t.ws, &actions) {
-                                    mark_ui_dirty!(self.ui_dirty);
-                                    self.spawn_fresh_panes(fresh);
-                                }
-                            }
+                            self.land_layout_actions(&actions);
                             // F36:标签栏动作。切换只动 `active`(不碰任何 SSH
                             // 连接——守护测试
                             // `switching_tabs_does_not_touch_the_ssh_connections`);
@@ -13587,6 +13647,43 @@ fn apply_layout_actions(ws: &mut Workspace, actions: &crate::ui::UiActions) -> O
         }
     }
     changed.then_some(fresh)
+}
+
+/// F255:新开的分屏该在**哪台机器**上开 channel。
+///
+/// 原来是 `ws.hosts.first()` —— 恒定第一台。用户报的「分屏从 2 变 3 时新 pane
+/// 连不上,报开PTY失败」就在这上面:焦点那块用「换节点」搬到第二台之后,
+/// 新分屏仍然去第一台开,而第一台此刻完全可能已经不是用户以为的那台、甚至
+/// 那条连接已经死了(F128 重连是就地替换 `hosts[host_ix]`,别的下标不跟着走)。
+///
+/// **不回退到别的活连接**:回退的话新分屏静默出现在一台用户没选的机器上,
+/// 而画面上什么都看不出来 —— 那比开不出来糟得多(开不出来至少有一句话)。
+/// 这一条正是本仓库 `sftp_connection_for` 的**反例**:那里 `host_ix` 越界夹回
+/// `hosts[0]` 是对的(文件面板换台就是重开一个 client,代价是一次多余往返),
+/// 这里夹回去等于把用户的 shell 开到别人家。
+///
+/// `focus_host_ix` 由**调用方**给,不在这里从活动标签现取:预设路径必须在
+/// `apply_preset` 改树**之前**捕获(它会顺手挪焦点,见 `Workspace::apply_preset`
+/// 里的 `next_focus`),恢复路径给的是 `Some(0)`(那就是 `LeafPlan::SameHost`
+/// 的定义)。这两个时机没有一个是「现在」。
+///
+/// 收 `Option`:`None` = 焦点那块还没有 `PaneState`(上一次分屏还在空窗期)。
+/// 那时**没有**「新分屏该开在哪」的答案,不许拿 0 顶上。
+///
+/// 纯函数(只看一个下标和一个台数),可脱离 `HostConn`(无头环境造不出
+/// `Arc<SshConnection>`)单测 —— 判据放在测得着的那一层。
+fn host_for_fresh(focus_host_ix: Option<usize>, host_count: usize) -> Result<usize, String> {
+    let Some(ix) = focus_host_ix else {
+        return Err("焦点那块分屏还在连接中,判断不出新分屏该开在哪台机器上".into());
+    };
+    if ix >= host_count {
+        // 说「第几台」而不是下标:用户看不见 `host_ix`,但数得清标题条上有几块。
+        return Err(format!(
+            "焦点那块分屏挂的连接(第 {} 台,共 {host_count} 台)已经不在连接池里了",
+            ix + 1
+        ));
+    }
+    Ok(ix)
 }
 
 /// 晚到的 `PaneOpened` 是否还该被 attach。两个独立的理由都会让答案是"不该":
@@ -15215,15 +15312,15 @@ mod tests {
         dismiss_verdict, download_job, draft_baseline_is_in_vault, drive_attach_checks_of,
         effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
         files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
-        has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
-        new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
-        pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane,
-        rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
-        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
-        take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
-        wind_down, AttachCheck, AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind,
-        RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT,
-        DISMISS_ORDER,
+        has_real_action, host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of,
+        leaf_identity_of, new_pane_emulator, next_auto_dial, next_panel_selection_index,
+        opt_buf_dirty, pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
+        reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
+        should_check_attach, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
+        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
+        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, Modal, OpFollow,
+        PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
+        UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -18826,6 +18923,141 @@ mod tests {
             host_pending: false,
             notice: None,
         }
+    }
+
+    // ---- F255 新分屏开在哪台 ----
+
+    /// 焦点那块挂在第二台上,新分屏也开在第二台。
+    ///
+    /// 这条杀的是原来那句 `ws.hosts.first()`(恒第一台)—— 用户报的
+    /// 「分屏 2 变 3 时新 pane 连不上」就是它:焦点那块「换节点」搬走之后,
+    /// 新分屏仍去第一台开。
+    #[test]
+    fn a_new_split_opens_on_the_same_host_the_focused_pane_sits_on() {
+        assert_eq!(host_for_fresh(Some(1), 2), Ok(1));
+        assert_eq!(host_for_fresh(Some(2), 3), Ok(2));
+        // 焦点本来就在第一台上时答案当然还是 0 —— 但那不能是**唯一**能过的答案。
+        assert_eq!(host_for_fresh(Some(0), 3), Ok(0));
+    }
+
+    /// 焦点那块还没连上(没有 `PaneState`)时,**不开**,给一句话。
+    ///
+    /// 拿 0 顶上的话:上一次分屏还在空窗期、用户又点了一次预设,新分屏就会
+    /// 静默开到第一台上,而焦点那块最后连上的可能是另一台。
+    #[test]
+    fn a_split_started_while_the_focused_pane_is_still_connecting_is_refused() {
+        let e = host_for_fresh(None, 2).expect_err("焦点没有 PaneState 时不该给出一台");
+        assert!(!e.is_empty(), "拒了却没有一句能显示给用户的话");
+    }
+
+    /// 焦点那块挂的下标已经不在连接池里 → **不开**,尤其不许夹回 `hosts[0]`。
+    ///
+    /// 夹回去是 `sftp_connection_for` 的做法(那里对),这里夹回去等于把用户
+    /// 的 shell 开到另一台机器上,而画面上看不出任何异常。
+    #[test]
+    fn an_out_of_range_focus_host_is_refused_instead_of_clamped_to_the_first_one() {
+        assert!(
+            host_for_fresh(Some(3), 2).is_err(),
+            "越界的 host_ix 被夹回去了 —— 新分屏会静默开在别的机器上"
+        );
+        // 连接池空(还没连上任何一台)也一样是拒。
+        assert!(host_for_fresh(Some(0), 0).is_err());
+    }
+
+    /// **接线守护 / F255**:开 channel 那一段真的**用**了调用方给的那台。
+    ///
+    /// 上面三条把「该开在哪」测扎实了,可判据再对也挡不住「算了但没用」——
+    /// `spawn_fresh_panes` 里把参数换成 `Some(0)`、或干脆继续 `hosts.first()`,
+    /// 那三条纯函数测试照样全绿,而 bug 一字不改地留在原处。这一族(纯逻辑
+    /// 测得扎实、接线没人看着)在本仓库反复出现过。
+    ///
+    /// 注释行剥掉:上面那几段文档注释里就写着 `hosts.first()` 和
+    /// `focus_host_ix` 两个词,不剥的话这条测试是在考自己的注释。
+    ///
+    /// 自证会变红:把那句 `host_for_fresh(focus_host_ix, ..)` 的第一个实参
+    /// 换成 `Some(0)`(实测过),或把整段换回 `ws.hosts.first()`。
+    #[test]
+    fn opening_the_split_uses_the_host_the_caller_asked_for() {
+        let body = strip_comments(body_of(prod_src(), "fn spawn_fresh_panes("));
+        assert!(
+            body.contains(concat!("host_for", "_fresh(focus_host_ix,")),
+            "开分屏没有把调用方给的那台传进判据 —— 新分屏会开在别的机器上:{body}"
+        );
+        assert!(
+            !body.contains("hosts.first()"),
+            "开分屏又去取 hosts[0] 了 —— 焦点那块「换节点」搬走之后就必然开错台"
+        );
+        // 事件里也得带上「开在第几台」,否则 handler 只能再猜一次。
+        assert!(
+            body.contains("host_ix,"),
+            "`PaneOpened` 没带上开在哪台 —— handler 只能重新取焦点,而那时\
+             用户可能已经把焦点挪走了"
+        );
+    }
+
+    /// **接线守护 / F255**:`PaneOpened` 挂 `PaneState` 时记的是事件带来的那台,
+    /// 不是写死的 `0`。
+    ///
+    /// 记错的后果不在当场:这块 pane 的重连(F128 认 `host_ix` 就地换 handle)、
+    /// 换节点、文件面板跟随全认这个字段 —— 记成第一台,以后每一次重连都会去
+    /// 换**另一台**的 handle。画面上当场什么都看不出来。
+    ///
+    /// 自证会变红:把那句 `host_ix,` 换回 `host_ix: 0,`。
+    #[test]
+    fn attaching_the_opened_split_records_the_host_it_was_actually_opened_on() {
+        // 锚点**拆开拼**。两个理由,都实证过:
+        // ① 本文件里还有一条 `a_freshly_opened_pane_starts_its_own_automation`
+        //    用 `include_str!` 扫**全文**再 `rsplit` 取最后一处 —— 这里写一份
+        //    完整字面量,它就会切到本测试的源码上,断言全部落空(第一版就把
+        //    那条测试搞红了);
+        // ② 本测试自己若用全文而非 `prod_src()`,同样会自匹配。
+        let start = concat!("UserEvent::Pane", "Opened {");
+        let stop = concat!("UserEvent::Pane", "OpenErr {");
+        let src = prod_src();
+        let seg = src
+            .split(start)
+            .nth(2)
+            .expect("找不到 PaneOpened 的 handler(第一处是事件定义)");
+        let seg = &seg[..seg.find(stop).expect("找不到 handler 的结尾")];
+        let body = strip_comments(seg);
+        assert!(
+            !body.contains("host_ix: 0"),
+            "挂 PaneState 时把 host_ix 写死成 0 了(F255)—— 这块 pane 以后的\
+             重连/换节点/文件面板全会认错机器:{body}"
+        );
+        assert!(
+            body.contains("host_ix,"),
+            "挂 PaneState 时没用事件带来的 host_ix:{body}"
+        );
+    }
+
+    /// **接线守护 / F255**:焦点挂在哪台,必须在 `apply_layout_actions` 改树
+    /// **之前**问。
+    ///
+    /// `apply_preset` 会顺手挪焦点(`next_focus`),而且新分出来的那块此刻
+    /// 还没有 `PaneState` —— 改完树再问,答案十有八九是 `None`,新分屏会被
+    /// `host_for_fresh` 全部拒掉。症状是「点了预设,多出来的那格永远显示
+    /// 一句错误」,而且是**必然**发生,不是偶发,所以这条顺序不能靠自觉。
+    ///
+    /// 这也是把这段搬进 `land_layout_actions` 的唯一理由:顺序判据得落在一个
+    /// 量得出来的小范围里,散在 `window_event` 那个巨型函数里没法测。
+    ///
+    /// 自证会变红:把那句 `let focus_host_ix = ...` 挪到 `if let Some(t)` 里面
+    /// (实测过)。
+    #[test]
+    fn the_focused_host_is_captured_before_the_tree_gets_rearranged() {
+        let body = strip_comments(body_of(prod_src(), "fn land_layout_actions("));
+        let asked = body
+            .find(concat!("focused_pane", "_host_ix()"))
+            .expect("落地布局动作时压根没问焦点挂在哪台(F255)");
+        let rearranged = body
+            .find(concat!("apply_layout", "_actions(&mut t.ws"))
+            .expect("找不到改树那一句");
+        assert!(
+            asked < rearranged,
+            "改完树才问焦点挂在哪台 —— 那时焦点已经被 next_focus 挪到\
+             新分出来的、还没有 PaneState 的那块上了,答案恒 None:{body}"
+        );
     }
 
     /// 点工具栏上的预设按钮 X,树必须真的变成 X 对应的形状,不是停在原地、
@@ -22698,6 +22930,20 @@ mod tests {
         body
     }
 
+    /// 剥掉整行注释。**源码切片断言几乎都得先过这一道**:被扫的那段代码上方
+    /// 的文档注释里,往往正好写着断言要找的那几个词(它们本来就是在解释这件
+    /// 事),不剥的话测试是在考自己的注释 —— 已实证过好几次「只删代码、注释
+    /// 原样,测试照绿」。本仓库为此单独立过项(`app.rs` 里几十处共享这个手法)。
+    ///
+    /// 只剥**整行**注释:行尾注释剥掉需要认字符串字面量,得不偿失,而把判据
+    /// 写成整行注释里不会出现的形状是更省事的做法。
+    fn strip_comments(body: &str) -> String {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// `app.rs` 去掉测试模块之后的那一半。源码切片断言**必须**先切掉测试模块,
     /// 否则测试自己写的那句字面量就能把断言喂饱,恒绿。
     fn prod_src() -> &'static str {
@@ -26399,8 +26645,8 @@ mod tests {
     ///
     /// push 的写法会让 `hosts[0]` 不再是这个标签的主连接,而认着这个下标的
     /// 地方一个都不会跟着走:`TabContent::sftp_connection`(文件面板)、
-    /// `spawn_fresh_panes`(分屏开 channel)、`PaneOpened` 里硬编的
-    /// `host_ix: 0` 全都会继续指向刚断掉的那条**死**连接。症状是主链路
+    /// 每块 pane 自己记着的 `PaneState::host_ix`(F255 之后新分屏也照它开)
+    /// 全都会继续指向刚断掉的那条**死**连接。症状是主链路
     /// 自动重连之后文件面板永久打不开(`t.sftp = None` 让它每次重试、每次
     /// 失败)、新开的分屏必然失败,而终端本身工作正常 —— 用户完全看不出成因。
     /// 顺带:push 还会让 `hosts` 随每次断线单调增长,长期挂机攒下一堆死连接。
