@@ -116,17 +116,21 @@ impl KnownHostsFile {
             return Ok(());
         };
         if self.corrupt {
-            match std::fs::rename(&path, path.with_extension("toml.bak")) {
-                Ok(()) => {}
-                // 源文件已被外部删除 = 没有需要备份的东西,继续写新表;
-                // 若在这里 `?` 掉,corrupt 永远清不了,这个实例往后每次 save 都失败。
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
+            back_up(&path)?;
             self.corrupt = false;
         } else if let Some(dir) = path.parent() {
             let disk = Self::load(dir);
-            if !disk.corrupt {
+            if disk.corrupt {
+                // 我加载之后,盘上那份被写坏了。**不合并** —— 内容根本读不到,
+                // `load` 给的是空表,拿它当底毫无意义。但要走一遍 F3 的既有
+                // 规矩:先把坏字节另存 `.bak` 再覆盖。直接盖掉等于连取证现场
+                // 一起冲走,而 corrupt 的成因(磁盘错误 / 别的程序在写这个文件)
+                // 恰恰是最需要留证的。
+                //
+                // 这个分支是 F248 的重读**新看得见**的情形:在此之前我们压根
+                // 不知道文件在运行期变坏了。
+                back_up(&path)?;
+            } else {
                 let mut merged = disk.hosts;
                 // 自己的覆盖盘上的 —— 同键冲突取本次接受的那一份。
                 merged.extend(self.hosts.clone());
@@ -140,6 +144,24 @@ impl KnownHostsFile {
             hosts: self.hosts.clone(),
         })?;
         write_atomic(&path, text.as_bytes())
+    }
+}
+
+/// 把当前这份(读不出来的)文件另存 `known_hosts.toml.bak`,给取证留字节。
+///
+/// 两个调用点共用:「我加载时它就坏了」与「我加载之后它才坏」(F248 的重读
+/// 新看得见的那一种)。各写一遍的话,以后改备份策略必然漏改一处。
+///
+/// 连续两次从坏状态 save 时,第二次的 `.bak` 会**覆盖**第一次的
+/// (`fs::rename` 语义:目标已存在则替换),只丢最早一次的取证字节,不影响
+/// 当前活跃表。
+fn back_up(path: &Path) -> Result<(), StoreError> {
+    match std::fs::rename(path, path.with_extension("toml.bak")) {
+        Ok(()) => Ok(()),
+        // 源文件已被外部删除 = 没有需要备份的东西,继续写新表;
+        // 若在这里 `?` 掉,corrupt 永远清不了,这个实例往后每次 save 都失败。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -244,26 +266,33 @@ mod tests {
         );
     }
 
-    /// F248:盘上那份**刚被写坏**时不合并 —— 拿空表当合并底等于把盘上还认得的
-    /// 记录全丢掉,下次连每台机器都重弹 TOFU。
+    /// F248:**我加载之后**盘上那份才被写坏 —— 覆盖它之前要留 `.bak`。
     ///
-    /// 内存里那份必须原样写出去(这个实例的判断仍然可信),坏文件按既有规矩
-    /// 走 `.bak`……但**这一支不 corrupt**(是盘上那份坏了,不是我加载时坏的),
-    /// 所以只是不合并、照常整份覆盖。
+    /// 这是重读**新看得见**的情形:在此之前我们压根不知道文件在运行期变坏了,
+    /// 直接整份覆盖,坏字节连同成因(磁盘错误 / 别的程序在写)一起消失。
     ///
-    /// 自证会变红:把合并块里的 `if !disk.corrupt` 去掉。
+    /// 「不合并」本身**测不出来**:`load` 对 corrupt 一律给空表,合并空表与
+    /// 不合并结果完全一样。所以判据放在**看得见的那件事**上 —— 有没有留
+    /// `.bak`(实测过:只判「记录还在」的那版守护是恒绿的)。
+    ///
+    /// 自证会变红:把 `disk.corrupt` 那一支的 `back_up(&path)?` 删掉。
     #[test]
-    fn a_file_that_just_got_corrupted_is_not_merged_in_as_an_empty_table() {
+    fn a_file_that_got_corrupted_after_i_loaded_it_is_backed_up_before_i_overwrite_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut kh = KnownHostsFile::load(dir.path());
         kh.record("h1", entry("SHA256:AAAA"));
         kh.save().unwrap();
+        assert!(!kh.is_corrupt(), "这个实例自己加载时文件是好的");
 
         // 别的东西把文件写坏了
         std::fs::write(dir.path().join("known_hosts.toml"), b"not toml {{{").unwrap();
 
         kh.record("h2", entry("SHA256:BBBB"));
         kh.save().unwrap();
+
+        let bak = std::fs::read_to_string(dir.path().join("known_hosts.toml.bak"))
+            .expect("坏字节没留下来 —— 覆盖掉了取证现场");
+        assert!(bak.contains("not toml"), "留下来的不是那份坏文件:{bak}");
 
         let re = KnownHostsFile::load(dir.path());
         assert!(!re.is_corrupt(), "写完之后文件应当是好的");
