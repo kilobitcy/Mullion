@@ -96,6 +96,21 @@ impl KnownHostsFile {
     /// 连续两次都是从 corrupt 状态 save,第二次的 `.bak` 会**覆盖**第一次的
     /// (`fs::rename` 语义:目标已存在则替换),只丢最早一次的取证字节,不影响
     /// 当前活跃表。
+    ///
+    /// F248:**写之前先重读盘上那份并集合并。** 这张表只在启动时读一次,而
+    /// 开两个 exe 时 A 接受的主机键 B 完全不知道 —— 整份覆盖会让 A 那条被 B
+    /// 的下一次 `save` 抹掉,以后连那台机器又变回「首次连接」。同键指纹冲突
+    /// 时**本次的赢**:走到这里意味着用户刚刚在 TOFU 框上按了「接受」,那是
+    /// 这台机器上最新的人工判断;取盘上那份等于让他刚点的确认不生效,且完全
+    /// 静默。合并结果一并换进内存表,这个实例从此也看得见 A 那条。
+    ///
+    /// **corrupt 时不合并**(自己的或刚读到的盘上那份):`load` 对「文件在但
+    /// 读不出」一律给空表,拿空表当合并底等于把盘上还认得的记录全丢掉,下次
+    /// 连每台机器都重弹 TOFU —— 那正是 MITM 最想要的状态。
+    ///
+    /// **并集成立的前提是没有删除入口**:本类型只有 `get`/`record`/`save`。
+    /// 将来加「忘掉这台主机」时,并集会让被删的条目从另一个实例的内存里复活,
+    /// 届时必须改墓碑、或让删除也走一遍读-改-写。
     pub fn save(&mut self) -> Result<(), StoreError> {
         let Some(path) = self.path.clone() else {
             return Ok(());
@@ -109,6 +124,14 @@ impl KnownHostsFile {
                 Err(e) => return Err(e.into()),
             }
             self.corrupt = false;
+        } else if let Some(dir) = path.parent() {
+            let disk = Self::load(dir);
+            if !disk.corrupt {
+                let mut merged = disk.hosts;
+                // 自己的覆盖盘上的 —— 同键冲突取本次接受的那一份。
+                merged.extend(self.hosts.clone());
+                self.hosts = merged;
+            }
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -165,6 +188,87 @@ mod tests {
             KnownHostsFile::load(dir.path()).get("h1"),
             Some(&entry("SHA256:BBBB"))
         );
+    }
+
+    /// F248:另一个实例刚接受的主机键,不能被我这次写盘抹掉。
+    ///
+    /// 抹掉的症状是「连那台机器又变回首次连接」—— 用户会以为自己记错了,
+    /// 而这正是 MITM 想要的状态。
+    ///
+    /// 自证会变红:把 `save` 里那个 `else if let Some(dir) = path.parent()`
+    /// 合并块删掉。
+    #[test]
+    fn a_key_another_instance_just_accepted_survives_my_save() {
+        let dir = tempfile::tempdir().unwrap();
+        // 两个实例同时从空表起步
+        let mut a = KnownHostsFile::load(dir.path());
+        let mut b = KnownHostsFile::load(dir.path());
+
+        a.record("h1", entry("SHA256:AAAA"));
+        a.save().unwrap();
+
+        b.record("h2", entry("SHA256:BBBB"));
+        b.save().unwrap();
+
+        let re = KnownHostsFile::load(dir.path());
+        assert_eq!(re.get("h1"), Some(&entry("SHA256:AAAA")), "A 接受的键没了");
+        assert_eq!(re.get("h2"), Some(&entry("SHA256:BBBB")), "B 自己的键没了");
+        // 合并结果也要换进内存表,否则 B 这个实例仍旧看不见 h1
+        assert_eq!(b.get("h1"), Some(&entry("SHA256:AAAA")));
+    }
+
+    /// F248:同一台主机两边指纹不同时,**本次接受的赢**。
+    ///
+    /// 走到 `save` 意味着用户刚在 TOFU 框上按了「接受」,那是这台机器上最新的
+    /// 人工判断。取盘上那份等于让他刚点的确认不生效,而且完全静默。
+    ///
+    /// 自证会变红:把 `merged.extend(self.hosts.clone())` 反过来写成
+    /// 「盘上那份覆盖自己的」。
+    #[test]
+    fn on_a_conflict_the_key_i_just_accepted_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = KnownHostsFile::load(dir.path());
+        let mut b = KnownHostsFile::load(dir.path());
+
+        a.record("h1", entry("SHA256:OLD"));
+        a.save().unwrap();
+
+        // 用户在 B 上看到「主机密钥已变更」并按了接受
+        b.record("h1", entry("SHA256:NEW"));
+        b.save().unwrap();
+
+        assert_eq!(
+            KnownHostsFile::load(dir.path()).get("h1"),
+            Some(&entry("SHA256:NEW")),
+            "用户刚接受的指纹没生效 —— 静默失效,他会以为自己点错了"
+        );
+    }
+
+    /// F248:盘上那份**刚被写坏**时不合并 —— 拿空表当合并底等于把盘上还认得的
+    /// 记录全丢掉,下次连每台机器都重弹 TOFU。
+    ///
+    /// 内存里那份必须原样写出去(这个实例的判断仍然可信),坏文件按既有规矩
+    /// 走 `.bak`……但**这一支不 corrupt**(是盘上那份坏了,不是我加载时坏的),
+    /// 所以只是不合并、照常整份覆盖。
+    ///
+    /// 自证会变红:把合并块里的 `if !disk.corrupt` 去掉。
+    #[test]
+    fn a_file_that_just_got_corrupted_is_not_merged_in_as_an_empty_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kh = KnownHostsFile::load(dir.path());
+        kh.record("h1", entry("SHA256:AAAA"));
+        kh.save().unwrap();
+
+        // 别的东西把文件写坏了
+        std::fs::write(dir.path().join("known_hosts.toml"), b"not toml {{{").unwrap();
+
+        kh.record("h2", entry("SHA256:BBBB"));
+        kh.save().unwrap();
+
+        let re = KnownHostsFile::load(dir.path());
+        assert!(!re.is_corrupt(), "写完之后文件应当是好的");
+        assert_eq!(re.get("h1"), Some(&entry("SHA256:AAAA")));
+        assert_eq!(re.get("h2"), Some(&entry("SHA256:BBBB")));
     }
 
     #[test]
