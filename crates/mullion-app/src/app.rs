@@ -3477,6 +3477,37 @@ impl App {
         }
     }
 
+    /// F256:撤掉本实例的心跳。**只删 `.alive`,记录本身留着** —— 记录就是
+    /// 用户的现场,删了这一片修的就是它。
+    ///
+    /// 为什么优雅退出要主动撤,而不是等 45 秒宽限期自己过:
+    /// [`mullion_store::is_alive`] 用 `saturating_sub` 算年龄,于是「心跳时刻
+    /// 在未来」被算作**活着**(对 NTP 往后校时是对的判断)。而关机重启后
+    /// 系统时钟完全可能还没跟网络对齐 —— 一旦上一次的心跳落在了当前时钟的
+    /// 未来,那条记录就**永远**是「活着」的,宽限期根本不会到,用户报的
+    /// 「等多久都不出现」就是这个。留下心跳文件是这个卡死的唯一前提,退出时
+    /// 撤掉它就从源头上不给它机会。
+    fn release_alive(&self) {
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        mullion_store::remove_alive(&dir, &self.instance_id);
+    }
+
+    /// F256:离开事件循环前的收口。**每一处 `event_loop.exit()` 之前都要走**
+    /// (有守护成对数着,见 `every_way_out_of_the_event_loop_goes_through_the_wrap_up`)。
+    ///
+    /// 抽成具名方法是因为退出点有三处(关窗口 / 编辑中确认退出 / 菜单退出),
+    /// 而 F256 之前只有第一处落盘 —— 从菜单点「退出」(最正常的那条路)时,
+    /// 最后那几下操作一个字都没写出去。
+    ///
+    /// 两句的**顺序不能换**:心跳一撤,别的实例这一刻起就有权把这个槽位当成
+    /// 「没人用」并裁掉它(D5),而我们要写的那份布局还在内存里。
+    fn wrap_up_before_exit(&mut self) {
+        self.save_layout_if_changed();
+        self.release_alive();
+    }
+
     /// F148:到点就写一次心跳。**无条件**,不看布局脏不脏 —— 见
     /// `heartbeat_at` 字段的说明。
     fn tick_heartbeat(&mut self) {
@@ -3843,31 +3874,43 @@ impl App {
 
     /// F148:把一批记录做成弹窗要画的行(D10/D16)。
     ///
-    /// **会话已删的标签在这里就被滤掉**(沿用 `layout_snapshot::usable` 的
-    /// 规则):摘要里列一个已经不存在的会话名,用户点了恢复只会得到一个点了
-    /// 必然失败的「重连」。**整条记录一个可用标签都不剩时,这条记录不进列表**
-    /// —— 它恢复出来是个空窗口。
+    /// **F256:一条都不许静默丢掉。** 这里原来有三处 `continue`(别的实例还
+    /// 活着 / 一个可用标签都不剩 / —— 加上 `store` 没打开时 `known` 是空表,
+    /// 于是**每个**标签都被判成「会话已删」),三条都让那条现场从列表里彻底
+    /// 消失,而用户看到的只是「没有可恢复的现场」。用户报的「关掉 exe / 直接
+    /// 关 Windows,现场就丢了、等多久都不出现」只可能是第一条:`is_alive` 的
+    /// `saturating_sub` 把「心跳在未来」算作活着,而开机时系统时钟完全可能
+    /// 还没跟网络对齐 —— 上次关机写下的心跳恰好落在未来。
     ///
-    /// **活着的实例的记录不进列表**(D3):那个现场正被别人用着。
+    /// 改成「列出来 + 标一句」(`note_text`)之后,活性误判的代价从「永久看
+    /// 不见」降到「多一句灰字」。这一点很关键:活性判定用的是一段算术,它
+    /// **无论怎么改进都还会有误判窗口**,列表判据不该建在它无误的前提上。
+    ///
+    /// `store` 没打开(keyring 不可用)时**完全不按会话存在性过滤**:那时
+    /// 我们没有能力回答「这个会话还在不在」,拿一张空表去问等于回答「全都
+    /// 不在」。纵深防御 —— 就算上游哪天忘了先开 store,也不会让整个列表空掉。
     fn history_rows(
         &self,
         entries: &[mullion_store::HistoryEntry],
     ) -> Vec<crate::ui::history::HistoryRow> {
-        let known: Vec<SessionId> = self
+        // `None` = store 没打开,**不是**「一个会话都没有」。这两件事在这里
+        // 的处置完全相反,所以不能塌成一个空 `Vec`(原来就是那样)。
+        let known: Option<Vec<SessionId>> = self
             .store
             .as_ref()
-            .map_or(Vec::new(), |s| s.list().iter().map(|r| r.id).collect());
+            .map(|s| s.list().iter().map(|r| r.id).collect());
         let now = mullion_store::now_secs();
         let mut out = Vec::new();
         for e in entries {
-            if e.alive {
-                continue;
-            }
-            let usable =
-                crate::shell::layout_snapshot::usable(e.layout.clone(), &|id| known.contains(&id));
-            if usable.tabs.is_empty() {
-                continue;
-            }
+            let usable = match &known {
+                Some(k) => {
+                    crate::shell::layout_snapshot::usable(e.layout.clone(), &|id| k.contains(&id))
+                }
+                None => e.layout.clone(),
+            };
+            // 丢了几个标签。**取差值而不是「有没有丢」**:用户要知道的是
+            // 「四个里没了一个」还是「四个全没了」,那是两个不同的决定。
+            let dropped = e.layout.tabs.len().saturating_sub(usable.tabs.len());
             let titles: Vec<String> = usable.tabs.iter().map(|t| t.title.clone()).collect();
             let panes: usize = usable
                 .tabs
@@ -3879,6 +3922,7 @@ impl App {
                 id: e.id.clone(),
                 head: crate::ui::history::head_text(&when, usable.tabs.len(), panes),
                 summary: crate::ui::history::summary_text(&titles),
+                note: crate::ui::history::note_text(e.alive, dropped),
             });
         }
         out
@@ -3904,15 +3948,17 @@ impl App {
 
     /// F148:恢复一条记录(D12 接管槽位 / D13 追加进当前窗口)。
     ///
-    /// 三步,顺序不能换:
-    /// 1. 读出那条记录并摆回标签(**追加**在现有标签后面,不清空 —— 清空会
-    ///    断掉正在跑的连接);
-    /// 2. 删掉本实例原来的槽位文件(启动时它通常还不存在,删除是 no-op);
-    /// 3. 把本实例的身份换成那条记录的 id —— 此后就往那个文件写。
+    /// 先摆标签(**追加**在现有标签后面,不清空 —— 清空会断掉正在跑的
+    /// 连接),然后按「那个槽位还有人用吗」分两种语义(F256):
     ///
-    /// 第 3 步是「接管」的全部内容(D12):不接管的话,本实例仍在写自己的新
-    /// 槽位,而老记录原样躺着 —— 下次启动列表里就会出现两条内容几乎一样的
-    /// 记录,而且越滚越多。
+    /// - **没人用** → 接管:删掉本实例原来的槽位文件(启动时它通常还不存在,
+    ///   删除是 no-op)→ 把身份换成那条记录的 id → 立刻打一次心跳。这三步
+    ///   顺序不能换。接管是 D12 的全部内容:不接管的话,本实例仍在写自己的新
+    ///   槽位,而老记录原样躺着 —— 下次启动列表里就会出现两条内容几乎一样的
+    ///   记录,而且越滚越多。
+    /// - **还有人用** → 复制:只摆标签,槽位原样留着。F256 之前这类记录被
+    ///   静默滤掉、压根点不到;现在它们出现在列表里(带一行灰字说明),而对
+    ///   一个真在跑的实例执行接管 = 两个进程往同一个文件写。
     ///
     /// **窗口几何不套用**(X8/D13):窗口已经建好了,再跳一次位置只会让人
     /// 眼花。
@@ -3930,14 +3976,28 @@ impl App {
                 .set_toast(crate::ui::toast::Kind::Warn, "那条现场已经不在了");
             return;
         };
+        // F256:真值源是**现读**的这条 entry,不是弹窗里那份可能已经过期的
+        // 镜像 —— 弹窗开着的这段时间里,另一个窗口完全可能刚起来或刚退出。
+        let alive = entry.alive;
         self.restore_tabs(entry.layout);
-        // 2 → 3:先删旧槽位再改身份,顺序反了会把**刚接管的那个文件**删掉。
-        mullion_store::remove_record(&dir, &self.instance_id);
-        self.instance_id = id.to_string();
-        // 接管之后立刻打一次心跳:别的实例这一刻起就该把这个槽位看成「有人
-        // 在用」,否则第二个新实例会把它也列出来,两个进程往同一个文件写(D12
-        // 的残余竞态)。
-        let _ = mullion_store::touch_alive(&dir, &self.instance_id, now);
+        if alive {
+            // F256:那个槽位还有人用(或者它的主人没能撤掉心跳、或者开机时
+            // 钟没对齐让心跳落在了未来)。**复制语义**:标签摆过来,槽位
+            // 原样留着。接管的三步对一个真在跑的实例执行 = 两个进程往同一个
+            // 文件写,先落盘的那份现场被覆盖,而用户毫无提示。
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Ok,
+                "已把那个现场的标签复制过来;它的记录留给正在用它的窗口",
+            );
+        } else {
+            // 2 → 3:先删旧槽位再改身份,顺序反了会把**刚接管的那个文件**删掉。
+            mullion_store::remove_record(&dir, &self.instance_id);
+            self.instance_id = id.to_string();
+            // 接管之后立刻打一次心跳:别的实例这一刻起就该把这个槽位看成「有人
+            // 在用」,否则第二个新实例会把它也列出来,两个进程往同一个文件写(D12
+            // 的残余竞态)。
+            let _ = mullion_store::touch_alive(&dir, &self.instance_id, now);
+        }
         // 本实例的记录内容变了(标签栏多了一批),下次比对必须重来一遍 ——
         // 不清的话 `save_layout_if_changed` 会拿旧快照比出「没变」,新摆回来
         // 的标签永远不落盘。
@@ -11594,7 +11654,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // 操作(切了标签、拖了窗口)大概率落在上一次落盘之后的 2 秒
                 // 窗口里,不在这里补一次就永远丢了 —— 而"关窗口前那一刻的
                 // 样子"正是这个功能唯一要还原的东西。
-                self.save_layout_if_changed();
+                //
+                // F256:落盘 + 撤心跳一起走 `wrap_up_before_exit`,三处退出点
+                // 同一条路(以前只有这一处落盘)。
+                self.wrap_up_before_exit();
                 // F92:进程要走了,20 秒的 timeout 别悬着。
                 if let Some(h) = self.probe_task.take() {
                     h.abort();
@@ -12877,6 +12940,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     // `exit_pending` 已经清掉,这一下 CloseRequested
                                     // 就穿过拦截了(见那里的注释)。
                                     ExitChoice::Anyway => {
+                                        self.wrap_up_before_exit();
                                         if let Some(h) = self.probe_task.take() {
                                             h.abort();
                                         }
@@ -12920,6 +12984,10 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             if self.ui.request_quit {
                                 self.ui.request_quit = false;
+                                // F256:**在 `drain()` 之前**落盘 —— 快照是从
+                                // `self.tabs` 现算的,标签一排空快照就是空的,
+                                // 写出去等于亲手把现场清了。
+                                self.wrap_up_before_exit();
                                 // F36:逐个走同一条收口,不靠进程退出兜底。
                                 // `event_loop.exit()` 之后还要跑完本轮事件、
                                 // 析构顺序也不由我们定;自动化 task 持着
@@ -21081,8 +21149,13 @@ mod tests {
     /// 还原的东西——就永远丢了。
     ///
     /// **扎源码结构**:走到这条路要 `EventLoopProxy` + 真窗口,单测造不出来。
-    /// 自证会变红:删掉 `CloseRequested` 里那句 `self.save_layout_if_changed();`,
+    /// 自证会变红:删掉 `CloseRequested` 里那句 `self.wrap_up_before_exit();`,
     /// 或把它挪到 `event_loop.exit()` 后面。
+    ///
+    /// F256 起落盘走 `wrap_up_before_exit`(三处退出点同一条路)。**判据没有
+    /// 因此变松**:那个方法自己落不落盘、落盘在撤心跳之前不之前,由
+    /// `wrapping_up_before_exit_saves_the_layout_before_it_releases_the_heartbeat`
+    /// 盯着 —— 两条一起才等价于原来那一条。
     #[test]
     fn closing_the_window_writes_the_layout_even_inside_the_throttle_window() {
         let src = include_str!("app.rs");
@@ -21092,7 +21165,7 @@ mod tests {
             .expect("找不到 CloseRequested 分支");
         let body = &after[..after.find("event_loop.exit();").expect("找不到 exit()")];
         assert!(
-            body.contains("self.save_layout_if_changed();"),
+            body.contains("self.wrap_up_before_exit();"),
             "关窗口没补写布局 —— 最后 2 秒内的改动会永久丢失"
         );
     }
@@ -22560,6 +22633,117 @@ mod tests {
         assert!(
             body.contains("self.advance_auto_dial("),
             "恢复现场之后没有自动开始拨号(F153)"
+        );
+    }
+
+    /// **接线守护 / F256**:点了一条「另一个窗口正在使用」的现场,是把它的
+    /// 标签**复制**过来,不是接管它的槽位。
+    ///
+    /// 为什么这是必须的:F256 之后这类记录会**出现在列表里**(以前被静默
+    /// 滤掉)。而 [`mullion_store::is_alive`] 的 `saturating_sub` 把「心跳在
+    /// 未来」也算作活着 —— 开机时钟没对齐时,一条其实没人用的记录会显示成
+    /// 「正在使用」。这两种情形在这里都只能按「另有其人」处理,而接管的三步
+    /// (删旧槽位 / 改身份 / 打心跳)一旦对真在跑的实例执行,就是**两个进程
+    /// 往同一个文件写**,先落盘的那个现场直接被覆盖 —— 用户丢的是另一个
+    /// 窗口的现场,而且毫无提示。
+    ///
+    /// **扎源码结构**:走到这条路要真窗口 + 真 store,单测造不出来。
+    /// 判据是「三步全在 `else` 半边」,不是「有个 if」—— 后者被任何空分支
+    /// 满足。
+    #[test]
+    fn restoring_a_record_another_window_still_holds_does_not_seize_its_slot() {
+        let body = strip_comments(body_of(prod_src(), "fn restore_history("));
+        assert!(
+            body.contains("那条现场已经不在了"),
+            "切片切歪了 —— 下面几条断言会空过"
+        );
+        let (clone_half, take_over_half) = body
+            .split_once("} else {")
+            .expect("恢复现场没有按「那个槽位还有人用吗」分岔(F256)");
+        // 摆标签在分岔**之前** —— 两种语义都要把标签摆回来,这是用户点
+        // 「恢复」唯一确定想要的事。
+        assert!(
+            clone_half.contains("self.restore_tabs("),
+            "摆标签落进了某一个分支 —— 另一种情形下点了「恢复」什么都不会发生"
+        );
+        for step in ["remove_record(", "self.instance_id = ", "touch_alive("] {
+            assert!(
+                !clone_half.contains(step),
+                "接管的这一步 `{step}` 落在「另有其人」那半边 —— \
+                 会把别的窗口正在用的槽位抢过来,它的现场被覆盖且无提示"
+            );
+            assert!(
+                take_over_half.contains(step),
+                "接管的这一步 `{step}` 没了 —— 槽位不接管的话,下次启动会\
+                 多出一条内容几乎一样的记录,而且越滚越多(D12)"
+            );
+        }
+    }
+
+    /// **接线守护 / F256**:收口顺序 —— 先落盘,再撤心跳。
+    ///
+    /// 反了会开一个窗口:心跳一撤,别的实例立刻把这个槽位当成「没人用」并
+    /// 可能裁掉它(D5),而我们要写的那份布局还没落盘。
+    ///
+    /// 自证会变红:把 `wrap_up_before_exit` 里两句的顺序调过来。
+    #[test]
+    fn wrapping_up_before_exit_saves_the_layout_before_it_releases_the_heartbeat() {
+        let body = strip_comments(body_of(prod_src(), "fn wrap_up_before_exit("));
+        let saved = body
+            .find("self.save_layout_if_changed();")
+            .expect("退出收口没落盘 —— 最后 2 秒内的改动会永久丢失(F37)");
+        let released = body
+            .find("self.release_alive();")
+            .expect("退出收口没撤心跳 —— 下次开机时那条现场会被当成「另一个窗口正在用」");
+        assert!(
+            saved < released,
+            "先撤心跳后落盘:心跳一撤别的实例就可能裁掉这个槽位(D5),\
+             而这一份布局还没写出去"
+        );
+    }
+
+    /// **接线守护 / F256**:菜单里点「退出」时,落盘要排在**排空标签之前**。
+    ///
+    /// 布局快照是从 `self.tabs` 现算的(`snapshot_layout`),`drain()` 之后
+    /// 再落盘写出去的是一份**空布局** —— 那不是「丢了现场」,是亲手把盘上
+    /// 那份覆盖成空的,下次启动列表里那条记录点开什么都没有。这个顺序错了
+    /// 编译照过、全套测试照绿。
+    #[test]
+    fn quitting_from_the_menu_writes_the_layout_before_it_empties_the_tabs() {
+        let after = prod_src()
+            .split("if self.ui.request_quit {")
+            .nth(1)
+            .expect("找不到菜单退出那一段");
+        let body =
+            strip_comments(&after[..after.find("event_loop.exit();").expect("找不到 exit()")]);
+        let wrapped = body
+            .find("self.wrap_up_before_exit();")
+            .expect("菜单退出没落盘 —— 从菜单走的用户最后那几下操作全丢");
+        let drained = body
+            .find("self.tabs.drain()")
+            .expect("菜单退出不再排空标签了?这条的锚点该更新了");
+        assert!(
+            wrapped < drained,
+            "先排空标签后落盘 —— 写出去的是空布局,盘上那份现场被覆盖成空的"
+        );
+    }
+
+    /// **接线守护 / F256**:**每一条**离开事件循环的路都得走同一个收口。
+    ///
+    /// 这条守的是「列举式门控在加档时必然漏」这一族(本仓库踩过多次):
+    /// 退出点有三处(关窗口 / 编辑中确认退出 / 菜单退出),F256 之前只有第一
+    /// 处落盘,另两处走的用户是**菜单点的退出**——最正常的那条路——布局却
+    /// 一个字都没写。所以判据是**成对计数**,新加一处退出点不接收口就变红。
+    #[test]
+    fn every_way_out_of_the_event_loop_goes_through_the_wrap_up() {
+        // 只数生产半边:本测试自己写了这两个串。
+        let exits = prod_src().matches("event_loop.exit();").count();
+        let wraps = prod_src().matches("self.wrap_up_before_exit();").count();
+        assert!(exits >= 3, "退出点只找到 {exits} 处?锚点该更新了");
+        assert_eq!(
+            exits, wraps,
+            "{exits} 处退出点只有 {wraps} 处走了收口 —— 漏掉那处走出去的用户,\
+             布局停在上一次节流落盘的样子,心跳也留在盘上"
         );
     }
 

@@ -153,6 +153,24 @@ pub fn remove_record(dir: &Path, id: &str) {
     let _ = std::fs::remove_file(alive_path(dir, id));
 }
 
+/// F256:撤掉某个实例的心跳,**记录本身留着**。优雅退出时调。
+///
+/// 与 [`remove_record`] 的分工是这个模块里最容易搞反的一处:那条是「这个
+/// 槽位不要了」(接管别人的槽位时清掉自己的旧槽位),这条是「我走了,但我的
+/// 现场留给下次恢复」。写错成 `remove_record` 的后果正是用户报的那个 ——
+/// 关掉 exe,现场没了。
+///
+/// 为什么优雅退出要主动撤而不是等 45 秒宽限期:[`is_alive`] 的
+/// `saturating_sub` 把「心跳在未来」算作**活着**(那对 NTP 校时是对的),
+/// 而开机时系统时钟完全可能还没跟网络对齐 —— 上次关机写下的心跳于是落在
+/// 未来,那条记录被判成「有人在用」而迟迟不进列表。删掉文件就没有这个心跳
+/// 可读了([`read_heartbeat`] 给 `None` = 判死),整条路径不依赖任何时钟。
+///
+/// 找不到文件不算错:启动后立刻退出时它压根还没写过。
+pub fn remove_alive(dir: &Path, id: &str) {
+    let _ = std::fs::remove_file(alive_path(dir, id));
+}
+
 /// 列举目录里全部记录,**按 `updated_at` 倒序**(最近的在前)。
 ///
 /// **没有 `Result`,这是刻意的**(同 `layout::Loaded` 的理由):历史不是用户
@@ -493,6 +511,43 @@ mod tests {
             "心跳新鲜却被判死 —— 那个窗口的现场会被别人克隆走"
         );
         assert!(!dead.alive, "心跳早停了还判活 —— 那条记录会被永久隐藏");
+    }
+
+    /// F256:优雅退出时撤心跳,**记录本身留着**。
+    ///
+    /// 这是「关掉 exe 之后现场还在列表里」的整条链上唯一不依赖时钟的一环:
+    /// [`is_alive`] 的 `saturating_sub` 会把「心跳在未来」压成 0,也就是**判活**
+    /// —— 开机时系统时钟还没跟网络对齐(Windows 上很常见,双系统 RTC 口径不同
+    /// 能差好几小时)的话,上次关机写下的心跳就落在未来,那条记录会被判成
+    /// 「有人在用」而一直不进列表。文件删掉就没有这个心跳可读了。
+    ///
+    /// 反过来**绝不能顺手删记录**:那正是用户要恢复的东西。所以这条测试的
+    /// 重点是后面那个「记录还在」的断言 —— 少了它,一个手滑写成
+    /// `remove_record` 的实现照样能过。
+    #[test]
+    fn releasing_the_heartbeat_keeps_the_record_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        save_record(dir.path(), "me", &layout_at(1000, "x")).unwrap();
+        touch_alive(dir.path(), "me", 10_000).unwrap();
+        assert!(list_records(dir.path(), 10_000)[0].alive, "前提:此刻判活");
+
+        remove_alive(dir.path(), "me");
+
+        let got = list_records(dir.path(), 10_000);
+        assert_eq!(got.len(), 1, "撤心跳把记录本身也删了 —— 现场就这么丢了");
+        assert!(!got[0].alive, "心跳撤了还判活 —— 记录会被当成「别人在用」");
+        // 时钟往未来跳也没用了:没有心跳文件可读。
+        assert!(
+            !list_records(dir.path(), 0)[0].alive,
+            "撤了心跳之后连「心跳在未来」这条路也不该再判活"
+        );
+    }
+
+    /// 撤一个本来就没有的心跳不算错 —— 启动后立刻退出时它压根还没写过。
+    #[test]
+    fn releasing_a_heartbeat_that_was_never_written_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_alive(dir.path(), "never");
     }
 
     /// `.alive` 心跳、`write_atomic` 崩在 rename 之前留下的 `.tmp` 残骸,

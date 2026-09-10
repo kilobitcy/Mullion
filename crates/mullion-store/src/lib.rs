@@ -35,8 +35,9 @@ pub use error::StoreError;
 pub use group::GroupRecord;
 pub use history::{
     alive_path, history_dir, is_alive, list_records, migrate_legacy, new_instance_id, now_ms,
-    now_secs, plan_prune, prune, read_heartbeat, record_path, remove_record, save_record,
-    touch_alive, HistoryEntry, ALIVE_GRACE_SECS, HEARTBEAT_INTERVAL_SECS, HISTORY_DIR, MAX_RECORDS,
+    now_secs, plan_prune, prune, read_heartbeat, record_path, remove_alive, remove_record,
+    save_record, touch_alive, HistoryEntry, ALIVE_GRACE_SECS, HEARTBEAT_INTERVAL_SECS, HISTORY_DIR,
+    MAX_RECORDS,
 };
 pub use inherit::{resolve, PrefsLayer, ResolvedConfig, DEFAULT_SCROLLBACK};
 pub use kdf::{derive_key, KdfParams, SALT_LEN};

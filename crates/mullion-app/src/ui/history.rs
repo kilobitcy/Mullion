@@ -25,6 +25,23 @@ pub struct HistoryRow {
     pub head: String,
     /// 第二行:`prod-web-01 · nas · db-01 · +1`。
     pub summary: String,
+    /// F256:第三行的标注(`note_text` 算的)。**空串 = 这一行不画第三行**,
+    /// 行高也不加(见 `row_height`)—— 绝大多数记录都是这一种,不该为了少数
+    /// 几条把每一行都撑高。
+    pub note: String,
+}
+
+/// 一行占多高。带标注的要多留出一行的位置。
+///
+/// 不加高的后果在无头环境下**看不出来**:第三行的文字照样进 shape 树,
+/// 只是画到了下一条记录的地盘上,两条记录的字叠在一起。判据因此落在这个
+/// 纯函数上,而不是靠人眼。
+pub fn row_height(has_note: bool) -> f32 {
+    if has_note {
+        62.0
+    } else {
+        44.0
+    }
 }
 
 /// 弹窗自己的那点状态。
@@ -96,6 +113,40 @@ pub fn summary_text(titles: &[String]) -> String {
     )
 }
 
+/// F256:一条记录旁边那句标注。空串 = 没什么要说的(绝大多数行都是这一种)。
+///
+/// 这个函数存在的理由是「**不许再静默丢掉整条记录**」。原来 `history_rows` 里
+/// 有三处 `continue`:别的实例活着、可用标签为空、`store` 没打开 —— 三条都让
+/// 那条现场从列表里彻底消失,而用户看到的只是「没有可恢复的现场」。用户报的
+/// 「关掉 exe / 直接关 Windows,现场就丢了、等多久都不出现」只可能是第一条:
+/// `is_alive` 的 `saturating_sub` 把「心跳在未来」算作**活着**(那对 NTP 校时
+/// 是对的),而开机时系统时钟完全可能还没跟网络对齐,上次关机写下的心跳就落
+/// 在未来 —— 于是那条记录被判成「有人在用」而一直不进列表。
+///
+/// 改成「列出来 + 标一句」之后,判活误判的代价从「永久看不见」降到「多一句
+/// 灰字」,而这跟活性判定本身对不对**解耦** —— 那一条无论怎么改进都还会有
+/// 误判窗口,判据不该建在它准确无误的前提上。
+///
+/// 两个原因同时成立时合并成一句、「活着」在前:它决定用户点下去会发生什么
+/// (克隆一份 vs 接管那个槽位),缺几个标签只是内容少一点。
+///
+/// 纯字符串,零 IO —— 与 `when_text`/`summary_text` 同类。
+pub fn note_text(alive: bool, dropped_tabs: usize) -> String {
+    let lost = if dropped_tabs > 0 {
+        Some(format!("{dropped_tabs} 个标签的会话已删除"))
+    } else {
+        None
+    };
+    match (alive, lost) {
+        // 「其中」是必要的:没有它就读成两件平行的事,而实际上后一句说的是
+        // 前一句那个现场里的标签。
+        (true, Some(lost)) => format!("另一个窗口正在使用 · 其中 {lost}"),
+        (true, None) => "另一个窗口正在使用".into(),
+        (false, Some(lost)) => lost,
+        (false, None) => String::new(),
+    }
+}
+
 /// 第一行。`panes` 是所有标签的分屏数之和。
 ///
 /// 单标签单分屏时不啰嗦「1 个标签 · 1 块分屏」—— 那两句话没有信息量,
@@ -154,7 +205,7 @@ pub fn show(
                         // 会去点行的任何地方(J 片「标签宿主一行都点不中」的
                         // 同一个教训)。
                         let resp = ui.allocate_response(
-                            egui::vec2(ui.available_width(), 44.0),
+                            egui::vec2(ui.available_width(), row_height(!row.note.is_empty())),
                             egui::Sense::click(),
                         );
                         // 选中 / 悬停的底色与会话列表同源:那边是
@@ -192,6 +243,23 @@ pub fn show(
                             egui::FontId::proportional(12.0),
                             theme::c32(t.fg_muted),
                         );
+                        // F256:第三行的标注。**用 `warn` 而不是 `fg_muted`** ——
+                        // 跟摘要同色的话它读起来像摘要的续行,而这句话说的是
+                        // 「点下去会发生什么不一样的事」(克隆一份 vs 接管槽位)。
+                        // 色板已冻结,`warn` 是既有字段,不新增。
+                        //
+                        // 文案里除了 `·` 没有非 ASCII 符号 —— `·` 已在
+                        // `ui::glyphs::VERIFIED` 里(摘要那一行本来就用它分隔)。
+                        if !row.note.is_empty() {
+                            p.y += 18.0;
+                            ui.painter().text(
+                                p,
+                                egui::Align2::LEFT_TOP,
+                                &row.note,
+                                egui::FontId::proportional(12.0),
+                                theme::c32(t.warn),
+                            );
+                        }
                         // F153-b:**单击即恢复**。原来是「单击选中 + 双击恢复」,
                         // 用户报的是「点了没反应」—— 双击在高延迟远程桌面/触控板
                         // 上本来就不好按,而这个弹窗只有一件事可做。
@@ -286,6 +354,49 @@ mod tests {
         assert_eq!(when_text(1000, i64::MIN), "—");
     }
 
+    // ---- F256 一条记录旁边那句标注 ----
+
+    /// 没什么要说的就一个字都不说 —— 绝大多数行是这一种,多一句灰字只是噪声。
+    #[test]
+    fn an_ordinary_record_gets_no_note() {
+        assert_eq!(note_text(false, 0), "");
+    }
+
+    /// 别的窗口正开着那个现场 → 说一句,但**照样列出来**。
+    ///
+    /// 这是 F256 的核心:原来这一档是 `continue`(整条不进列表)。用户报的
+    /// 「关掉 exe / 直接关 Windows,现场就没了、等多久都不出现」只可能是这一档
+    /// —— `is_alive` 的 `saturating_sub` 把「心跳在未来」算作活着,而开机时
+    /// 系统时钟还没跟网络对齐时,上次关机写下的心跳恰好落在未来。
+    #[test]
+    fn a_record_another_window_is_using_says_so_and_still_shows_up() {
+        assert_eq!(note_text(true, 0), "另一个窗口正在使用");
+    }
+
+    /// 有几个标签的会话被删了 → 说清是**几个**,而不是把整条记录藏掉。
+    ///
+    /// 藏掉的后果:四个标签里删了一个会话,另外三个也一起消失,而用户完全
+    /// 不知道自己丢了什么。
+    #[test]
+    fn a_record_with_deleted_sessions_says_how_many_it_lost() {
+        assert_eq!(note_text(false, 1), "1 个标签的会话已删除");
+        assert_eq!(note_text(false, 3), "3 个标签的会话已删除");
+    }
+
+    /// 两个原因同时成立时**合并成一句**,「活着」在前。
+    ///
+    /// 分成两行的话行高要按原因个数变;而「活着」在前是因为它决定用户点下去
+    /// 会发生什么(克隆一份 vs 接管槽位),缺标签只是内容少一点。
+    ///
+    /// 自证会变红:把两段的拼接顺序换过来,或改成只报其中一个原因。
+    #[test]
+    fn both_reasons_merge_into_one_line_with_the_live_one_first() {
+        assert_eq!(
+            note_text(true, 2),
+            "另一个窗口正在使用 · 其中 2 个标签的会话已删除"
+        );
+    }
+
     #[test]
     fn a_short_summary_lists_every_session() {
         let t = vec!["a".to_string(), "b".to_string()];
@@ -331,11 +442,13 @@ mod tests {
                 id: "a".into(),
                 head: "刚刚 · 2 个标签".into(),
                 summary: "prod · nas".into(),
+                note: String::new(),
             },
             HistoryRow {
                 id: "b".into(),
                 head: "3 小时前".into(),
                 summary: "db-01".into(),
+                note: String::new(),
             },
         ]
     }
@@ -516,6 +629,68 @@ mod tests {
     fn a_closed_dialog_draws_nothing() {
         let mut draft = None;
         assert!(texts(&mut draft).is_empty());
+    }
+
+    /// F256:标注真的画出来了,而且画在摘要**下面**一行,不是盖在它上面。
+    ///
+    /// 这条是接线守护:`note_text` 那四条把文案测扎实了,可这一段要是没画,
+    /// 用户看到的仍然是一条来历不明的记录 —— 而 F256 的全部内容就是让他看见
+    /// 那句话(「另一个窗口正在使用」决定了点下去是克隆还是接管)。
+    ///
+    /// 自证会变红:把 `show` 里画 `row.note` 那一段删掉。
+    #[test]
+    fn a_noted_row_draws_its_note_below_the_summary() {
+        fn find_y(shape: &egui::Shape, want: &str) -> Option<f32> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find_y(s, want)),
+                egui::Shape::Text(ts) if ts.galley.text() == want => Some(ts.pos.y),
+                _ => None,
+            }
+        }
+        let mut rows = rows();
+        rows[0].note = "另一个窗口正在使用".into();
+        let mut draft = Some(HistoryDraft::new(rows));
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        // 两帧,理由同 `texts`。
+        for _ in 0..2 {
+            shapes = ctx
+                .run(egui::RawInput::default(), |ctx| {
+                    show(ctx, &t, &mut draft);
+                })
+                .shapes;
+        }
+        let y_of = |want: &str| {
+            shapes
+                .iter()
+                .find_map(|cs| find_y(&cs.shape, want))
+                .unwrap_or_else(|| panic!("弹窗里没画「{want}」"))
+        };
+        let note = y_of("另一个窗口正在使用");
+        let summary = y_of("prod · nas");
+        assert!(
+            note > summary,
+            "标注没画在摘要下面(标注 y={note},摘要 y={summary})—— 盖在一起两行都读不出来"
+        );
+    }
+
+    /// F256:带标注的行必须**更高**。
+    ///
+    /// 不加高的话第三行会画到下一条记录的地盘上,两条记录的字叠在一起 ——
+    /// 而这在无头环境下**看不出来**(文字照样进 shape 树,断言照样能找到它),
+    /// 所以判据落在这个纯函数上。
+    ///
+    /// 判据是「至少多留一行的位置」,不是「等于某个数」:拿常量去断言常量
+    /// 什么都测不到。
+    #[test]
+    fn a_noted_row_reserves_an_extra_line_of_height() {
+        assert!(
+            row_height(true) >= row_height(false) + 14.0,
+            "带标注的行没多留出一行的位置:{} vs {}",
+            row_height(true),
+            row_height(false)
+        );
     }
 
     /// 每一条记录的两行都要画出来:只画第一行的话,多开场景下两条记录的
