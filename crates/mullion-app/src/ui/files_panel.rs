@@ -3576,8 +3576,11 @@ mod tests {
     /// 连续没合并)。这里改成从档位算,畸形本身构造不出来 —— 这条测试守的
     /// 就是「算法还是算出来的,没被人改回去手插」。
     ///
-    /// 自证会变红:把 `separator_before` 里的 `i > 0` 去掉(第二条断言),
-    /// 或者把判据从 `!=` 改成 `==`(循环里那条)。
+    /// 自证会变红:把 `separator_before` 的判据改成 `i == 0 || …`(领头线,
+    /// 第二条断言),或者把 `!=` 改成 `==`(循环里那条)。
+    ///
+    /// 注意 `i > 0 &&` 换成 `items[i.saturating_sub(1)]` 是**等价变异** ——
+    /// 首项那次比的是它自己,照样是 `false`。杀不掉它不代表守护有缺口。
     #[test]
     fn a_separator_never_leads_the_menu_and_only_ever_sits_between_two_groups() {
         let items = menu_items_for(PanelColumn::Remote, Some(a_file()), true, true);
@@ -3676,6 +3679,15 @@ mod tests {
             body.contains("separator_before(&items)"),
             "分隔线必须从档位算(F251),不许在渲染里手插 —— 手插必然出现\
              领头/收尾/连成两条的畸形"
+        );
+        // 置灰项的图标必须**跟着灰**:图标照常亮着,那一行看上去像半启用。
+        //
+        // 眼下没有一项**既有图标又会置灰**(有图标的五项都不置灰),所以这
+        // 一支现在走不到 —— 守它正是因为走不到:哪天给「粘贴」或「在 Mullion
+        // 里编辑」补个图标,禁用态的颜色不会有任何东西提醒你。
+        assert!(
+            body.contains("weak_text_color()"),
+            "置灰项的图标没有跟着变灰 —— 那一行会看上去像半启用"
         );
     }
 
