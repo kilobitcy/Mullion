@@ -191,6 +191,41 @@ mod tests {
     /// 造不出「多还一次」的 guard(`check_out` 是唯一入口),所以直接对着
     /// 那个夹紧逻辑本身验:拿一本手动置 0 的账本 drop 一个 guard。
     ///
+    /// **每一处开会话通道的地方都得记账。**
+    ///
+    /// 上面四条测的是账本自己,而账本再对也挡不住「某条路径压根没调
+    /// `check_out`」—— 那条路径开出来的通道不上账,错误文案里的数字就偏小,
+    /// 而看的人正拿它跟 `MaxSessions` 比。这一族缺陷(纯逻辑测得扎实、接线
+    /// 没人看着)在本仓库反复出现过。
+    ///
+    /// 判据用**成对计数**而不是「逐个文件点名」:点名式的清单在**加**一处
+    /// 开点时必然漏(本仓库的「列举式门控」踩过多次),而成对计数对新增
+    /// 天然生效 —— 新开一处不记账,这条就红。
+    ///
+    /// 只数**会话**类型:`tunnel.rs` 走的是 `channel_open_direct_tcpip`,
+    /// sshd 的 `MaxSessions` 不算转发,故意不在这本账上(见本模块开头)。
+    ///
+    /// 自证会变红:删掉 `exec.rs` 里那句 `check_out()`(实测过)。
+    #[test]
+    fn every_place_that_opens_a_session_channel_also_puts_it_on_the_books() {
+        // 扫的是三个**兄弟文件**,不含本文件 —— 本测试自己写了这两个串,
+        // 连自己一起扫的话数字必然对不上(自匹配陷阱,本仓库单独立过项)。
+        for (name, src) in [
+            ("exec.rs", include_str!("exec.rs")),
+            ("session.rs", include_str!("session.rs")),
+            ("sftp.rs", include_str!("sftp.rs")),
+        ] {
+            let opens = src.matches("channel_open_session()").count();
+            let books = src.matches("ledger().check_out()").count();
+            assert!(opens > 0, "{name} 里一处会话通道都没开?锚点该更新了");
+            assert_eq!(
+                opens, books,
+                "{name}:开了 {opens} 处会话通道,只记了 {books} 处的账 —— \
+                 漏记的那处开出来的通道不上账,报错里的「持有 N 条」会偏小"
+            );
+        }
+    }
+
     /// 自证会变红:把 `Drop` 里的 `saturating_sub` 换成 `n - 1`(那会
     /// panic)或 `fetch_sub`(那会绕回)。
     #[test]
