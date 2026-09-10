@@ -202,6 +202,25 @@ pub struct MenuTarget {
     pub size: u64,
 }
 
+/// F251:菜单的功能分档。**分隔线不单独占一项,而是由相邻两项的档位差异
+/// 算出来**(见 [`separator_before`])。
+///
+/// 显式存一条「分隔线项」看着更直白,代价是必须另写一道「首尾折叠 + 连续
+/// 合并」:菜单里哪些项出现是随光标行/剪贴板变的,只要有一档整档消失,那条
+/// 线就会跑到开头、跑到结尾、或者跟另一条挨在一起。而那三种畸形编译得过、
+/// 跑得过,**只有人眼看得出来**。改成从档位算,它们根本构造不出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuGroup {
+    /// 把东西取过来 / 打开:下载、上传、编辑、在资源管理器中打开。
+    Fetch,
+    /// 剪贴板:复制、剪切、粘贴,以及 F250 的复制绝对/相对路径。
+    Clip,
+    /// 改**已有**的这一个:重命名、属性、删除。
+    Modify,
+    /// 造新的 / 重看一遍:新建文件夹、新建文件、刷新。
+    Make,
+}
+
 /// 菜单里的一项。带 `disabled` 是因为「这个文件太大所以编不了」必须**说出来**:
 /// 悄悄少一项,用户只会以为程序坏了(D3-2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,14 +229,50 @@ pub struct MenuEntry {
     pub item: MenuItem,
     /// 置灰的理由。`None` = 可点。
     pub disabled: Option<&'static str>,
+    /// F251:归哪一档。决定它前面画不画分隔线。
+    pub group: MenuGroup,
+    /// F251:行首的图标。`None` = 只留**等宽空位**,不是不缩进 ——
+    /// 有图标的行文字被推右、没图标的顶格,一份菜单就成了锯齿。
+    pub icon: Option<crate::ui::icon::Glyph>,
 }
 
-fn on(label: &'static str, item: MenuItem) -> MenuEntry {
+fn on(label: &'static str, item: MenuItem, group: MenuGroup) -> MenuEntry {
     MenuEntry {
         label,
         item,
         disabled: None,
+        group,
+        icon: None,
     }
+}
+
+impl MenuEntry {
+    /// 给这一项挂个图标。链式而不是加参数:绝大多数项**没有**图标
+    /// (共识:只给少数几个高频/高危的加,加满等于没加)。
+    fn with(mut self, glyph: crate::ui::icon::Glyph) -> Self {
+        self.icon = Some(glyph);
+        self
+    }
+
+    /// 置灰并说明理由。`None` = 可点。参数是 `Option` 而不是 `bool + &str`,
+    /// 是为了让调用处直接写 `(条件).then_some("理由")` —— 「灰」和「为什么灰」
+    /// 分不开,分成两个参数就能写出「灰了但没理由」。
+    fn grey(mut self, why: Option<&'static str>) -> Self {
+        self.disabled = why;
+        self
+    }
+}
+
+/// F251:第 `i` 项**前面**要不要画一条分隔线。长度与 `items` 一致。
+///
+/// 判据只有一条:档位跟上一项不同。首项没有「上一项」,所以永远是 `false`
+/// —— 菜单不会以一条横线开头。同理最后一项之后没有位置,也就不会收尾。
+pub fn separator_before(items: &[MenuEntry]) -> Vec<bool> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, e)| i > 0 && items[i - 1].group != e.group)
+        .collect()
 }
 
 /// 这一栏此刻该有哪些右键菜单项。
@@ -241,59 +296,69 @@ pub fn menu_items_for(
     clip_ready: bool,
     rel_ready: bool,
 ) -> Vec<MenuEntry> {
+    use crate::ui::icon::Glyph;
+    use MenuGroup::{Clip, Fetch, Make, Modify};
     let mut out: Vec<MenuEntry> = Vec::new();
     if column == PanelColumn::Remote {
-        out.push(on("新建文件夹", MenuItem::NewDir));
-        out.push(on("新建文件", MenuItem::NewFile));
+        // —— Fetch:把它取过来 / 打开它 ——
         if let Some(tg) = target {
-            out.push(on("下载到本地", MenuItem::Transfer));
+            out.push(on("下载到本地", MenuItem::Transfer, Fetch).with(Glyph::ArrowDown));
             // F53:只对普通文件出现。目录/链接上给一个「编辑」纯属误导。
             if tg.is_file {
-                out.push(MenuEntry {
-                    label: "用默认程序编辑",
-                    item: MenuItem::EditExternal,
-                    disabled: (tg.size > crate::edit::EXTERNAL_LIMIT)
-                        .then_some("文件太大,用「下载到本地」取回来再处理"),
-                });
-                out.push(MenuEntry {
-                    label: "在 Mullion 里编辑",
-                    item: MenuItem::EditInline,
-                    disabled: (tg.size > crate::edit::INLINE_LIMIT)
-                        .then_some("超过 1 MB,请用「用默认程序编辑」"),
-                });
+                out.push(
+                    on("用默认程序编辑", MenuItem::EditExternal, Fetch).grey(
+                        (tg.size > crate::edit::EXTERNAL_LIMIT)
+                            .then_some("文件太大,用「下载到本地」取回来再处理"),
+                    ),
+                );
+                out.push(
+                    on("在 Mullion 里编辑", MenuItem::EditInline, Fetch).grey(
+                        (tg.size > crate::edit::INLINE_LIMIT)
+                            .then_some("超过 1 MB,请用「用默认程序编辑」"),
+                    ),
+                );
             }
+        }
+        // —— Clip:剪贴板 ——
+        if target.is_some() {
+            out.push(on("复制", MenuItem::ClipCopy, Clip));
+            out.push(on("剪切", MenuItem::ClipCut, Clip));
+        }
+        out.push(
+            on("粘贴", MenuItem::ClipPaste, Clip)
+                .grey((!clip_ready).then_some("剪贴板是空的 —— 先在远端栏复制或剪切")),
+        );
+        if target.is_some() {
+            // F250:跟上面那两条只是名字像 —— 见 `MenuItem::CopyAbsPath`。
+            out.push(on("复制绝对路径", MenuItem::CopyAbsPath, Clip));
+            out.push(
+                on("复制相对路径", MenuItem::CopyRelPath, Clip)
+                    .grey((!rel_ready).then_some("当前分屏没报告它在哪个目录,或这一栏不在它下面")),
+            );
+        }
+        // —— Modify:改这一个 ——
+        if target.is_some() {
             // F200:**没有省略号** —— 省略号在这套界面里的意思是「会弹个框」
             // (「新建文件夹…」「删除…」都弹),而改名现在是就地编辑。
-            out.push(on("重命名", MenuItem::Ask(FileAsk::Rename)));
-            out.push(on("属性(权限)…", MenuItem::Ask(FileAsk::Chmod)));
-            out.push(on("删除…", MenuItem::Ask(FileAsk::Delete)));
+            out.push(on("重命名", MenuItem::Ask(FileAsk::Rename), Modify));
+            out.push(on("属性(权限)…", MenuItem::Ask(FileAsk::Chmod), Modify));
+            out.push(on("删除…", MenuItem::Ask(FileAsk::Delete), Modify).with(Glyph::Cross));
         }
-        if target.is_some() {
-            out.push(on("复制", MenuItem::ClipCopy));
-            out.push(on("剪切", MenuItem::ClipCut));
-            // F250:跟上面那两条只是名字像 —— 见 `MenuItem::CopyAbsPath`。
-            out.push(on("复制绝对路径", MenuItem::CopyAbsPath));
-            out.push(MenuEntry {
-                label: "复制相对路径",
-                item: MenuItem::CopyRelPath,
-                disabled: (!rel_ready).then_some("当前分屏没报告它在哪个目录,或这一栏不在它下面"),
-            });
-        }
-        out.push(MenuEntry {
-            label: "粘贴",
-            item: MenuItem::ClipPaste,
-            disabled: (!clip_ready).then_some("剪贴板是空的 —— 先在远端栏复制或剪切"),
-        });
+        // —— Make:造新的 ——
+        out.push(on("新建文件夹", MenuItem::NewDir, Make).with(Glyph::Project));
+        out.push(on("新建文件", MenuItem::NewFile, Make));
     } else {
         if target.is_some() {
-            out.push(on("上传到远端", MenuItem::Transfer));
+            out.push(on("上传到远端", MenuItem::Transfer, Fetch).with(Glyph::ArrowUp));
+        }
+        out.push(on("在资源管理器中打开", MenuItem::OpenInExplorer, Fetch));
+        if target.is_some() {
             // F250:本地栏只给绝对路径 —— 相对的基准是远端分屏报的目录,
             // 本机文件相对它没有意义(L1)。
-            out.push(on("复制绝对路径", MenuItem::CopyAbsPath));
+            out.push(on("复制绝对路径", MenuItem::CopyAbsPath, Clip));
         }
-        out.push(on("在资源管理器中打开", MenuItem::OpenInExplorer));
     }
-    out.push(on("刷新", MenuItem::Refresh));
+    out.push(on("刷新", MenuItem::Refresh, Make).with(Glyph::Refresh));
     out
 }
 
@@ -329,19 +394,55 @@ fn menu_body(
     hit: &mut Option<MenuItem>,
 ) {
     annotate::mark(ui.ctx(), format!("文件面板/{id}/右键菜单"), ui.max_rect());
-    for e in menu_items_for(column, target, clip_ready, rel_ready) {
-        match e.disabled {
+    let items = menu_items_for(column, target, clip_ready, rel_ready);
+    let lines = separator_before(&items);
+    // F251:图标不进按钮的文本,而是画进按钮**左内边距**里 —— 先量下原值
+    // (它决定图标画在哪),再把整份菜单的左内边距撑开一格图标的宽度。
+    //
+    // 这么绕是因为 egui 的 `Button` 只吃文本:想同时有图标和文字,要么找一
+    // 张纹理(我们的图标是 epaint 直接画的,没有纹理),要么自己手写一行 ——
+    // 而手写 clickable 行在这个项目里已经栽过两次「右半边点不中」。撑内边距
+    // 则把命中区、hover 高亮、禁用态全留给 `Button` 自己。
+    //
+    // 顺带解决「等宽空位」:整份菜单的左内边距是**同一个值**,没图标的行
+    // 那一格就是空的,文字左缘照样对齐。
+    let pad = ui.spacing().button_padding;
+    let cell = ui.spacing().interact_size.y * 0.75;
+    ui.spacing_mut().button_padding.x = pad.x * 2.0 + cell;
+    for (e, &line) in items.iter().zip(&lines) {
+        if line {
+            ui.separator();
+        }
+        let resp = match e.disabled {
             // 置灰项仍然画出来,并且把理由挂成 hover —— 灰着不说话等于没说。
-            Some(why) => {
-                ui.add_enabled(false, egui::Button::new(e.label))
-                    .on_disabled_hover_text(why);
-            }
+            Some(why) => ui
+                .add_enabled(false, egui::Button::new(e.label))
+                .on_disabled_hover_text(why),
             None => {
-                if ui.button(e.label).clicked() {
+                let r = ui.button(e.label);
+                if r.clicked() {
                     *hit = Some(e.item);
                     ui.close_menu();
                 }
+                r
             }
+        };
+        if let Some(g) = e.icon {
+            // 灰项的图标也得跟着灰:图标照常亮着的话,这一行看上去像半启用。
+            let color = if e.disabled.is_some() {
+                ui.visuals().weak_text_color()
+            } else {
+                ui.visuals().text_color()
+            };
+            let at = egui::Rect::from_center_size(
+                egui::pos2(resp.rect.left() + pad.x + cell * 0.5, resp.rect.center().y),
+                egui::Vec2::splat(cell),
+            );
+            ui.painter().extend(crate::ui::icon::shapes(
+                at,
+                g,
+                egui::Stroke::new(1.2, color),
+            ));
         }
     }
 }
@@ -3416,6 +3517,166 @@ mod tests {
             FileAction::CopyPath { relative: true }
         );
         assert_ne!(MenuItem::CopyAbsPath.into_action(), FileAction::ClipCopy);
+    }
+
+    /// F251:同一档功能必须是**一整段**,而且四档的先后是固定的。
+    ///
+    /// 分隔线是从「相邻两项的档位变了没」算出来的,所以「档位交错」直接等价
+    /// 于「同一类功能被一条横线劈成两半」——「复制」在上面、「复制绝对路径」
+    /// 被推到下一段去,正是这次要治的杂乱。这种错法**编译得过、跑得过、
+    /// 只有人眼看得出来**,只能靠这条守护。
+    ///
+    /// 自证会变红:把远端栏的 `刷新` 那一 push 挪到 `粘贴` 前面(Make 档
+    /// 出现两段),或者把 `新建文件` 改标成 `MenuGroup::Clip`。
+    #[test]
+    fn every_group_is_one_contiguous_run_and_the_four_always_come_in_the_same_order() {
+        const ORDER: [MenuGroup; 4] = [
+            MenuGroup::Fetch,
+            MenuGroup::Clip,
+            MenuGroup::Modify,
+            MenuGroup::Make,
+        ];
+        let dir = MenuTarget {
+            is_file: false,
+            size: 0,
+        };
+        for column in [PanelColumn::Remote, PanelColumn::Local] {
+            for target in [Some(a_file()), Some(dir), None] {
+                for clip in [false, true] {
+                    for rel in [false, true] {
+                        let items = menu_items_for(column, target, clip, rel);
+                        // 档位第一次出现的先后。同一档再次出现 = 被劈成两段。
+                        let mut runs: Vec<MenuGroup> = Vec::new();
+                        for e in &items {
+                            if runs.last() == Some(&e.group) {
+                                continue;
+                            }
+                            assert!(
+                                !runs.contains(&e.group),
+                                "{:?} 这一档在 {column:?} 栏出现了两段,中间会横插一条分隔线:{items:?}",
+                                e.group
+                            );
+                            runs.push(e.group);
+                        }
+                        let expect: Vec<MenuGroup> =
+                            ORDER.iter().copied().filter(|g| runs.contains(g)).collect();
+                        assert_eq!(
+                            runs, expect,
+                            "{column:?} 栏的档位顺序跟约定的四档不一致:{items:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// F251:分隔线**只**出现在两档之间 —— 不领头、不收尾、不会两条挨着。
+    ///
+    /// 这三种畸形都是「显式存一条分隔线项」那种写法的经典产物(首尾没折叠、
+    /// 连续没合并)。这里改成从档位算,畸形本身构造不出来 —— 这条测试守的
+    /// 就是「算法还是算出来的,没被人改回去手插」。
+    ///
+    /// 自证会变红:把 `separator_before` 里的 `i > 0` 去掉(第二条断言),
+    /// 或者把判据从 `!=` 改成 `==`(循环里那条)。
+    #[test]
+    fn a_separator_never_leads_the_menu_and_only_ever_sits_between_two_groups() {
+        let items = menu_items_for(PanelColumn::Remote, Some(a_file()), true, true);
+        let sep = separator_before(&items);
+        assert_eq!(sep.len(), items.len(), "分隔线表跟菜单项对不上号");
+        assert!(!sep[0], "菜单开头画了一条横线:{items:?}");
+        for i in 1..items.len() {
+            assert_eq!(
+                sep[i],
+                items[i].group != items[i - 1].group,
+                "第 {i} 项「{}」前的分隔线跟档位对不上:{items:?}",
+                items[i].label
+            );
+        }
+        assert!(
+            sep.iter().any(|&s| s),
+            "整份菜单一条分隔线都没有 —— F251 等于没做:{items:?}"
+        );
+        // 空菜单不许 panic(理论上到不了,但 `sep[0]` 这种写法很容易顺手抄进
+        // 生产代码里)。
+        assert!(separator_before(&[]).is_empty());
+    }
+
+    /// F251:传输那一项的箭头**朝字节流走的方向**。
+    ///
+    /// 两栏共用 `MenuItem::Transfer`,方向由栏决定 —— 图标写在同一个
+    /// `push` 里就必然搞反一个。而「↑ 画成了 ↓」不编译错、不 panic,
+    /// 只会让人点错(`ui::icon` 模块开篇写的正是这一类)。
+    ///
+    /// 自证会变红:把两栏的 `ArrowDown`/`ArrowUp` 对调。
+    #[test]
+    fn the_transfer_arrow_points_the_way_the_bytes_go_in_that_column() {
+        use crate::ui::icon::Glyph;
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false, false);
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false, false);
+        let icon_of = |items: &[MenuEntry], it: MenuItem| {
+            items
+                .iter()
+                .find(|e| e.item == it)
+                .unwrap_or_else(|| panic!("{it:?} 不在菜单里"))
+                .icon
+        };
+        assert_eq!(
+            icon_of(&remote, MenuItem::Transfer),
+            Some(Glyph::ArrowDown),
+            "远端栏是「下载到本地」,字节往下走"
+        );
+        assert_eq!(
+            icon_of(&local, MenuItem::Transfer),
+            Some(Glyph::ArrowUp),
+            "本地栏是「上传到远端」,字节往上走"
+        );
+        assert_eq!(
+            icon_of(&remote, MenuItem::Ask(FileAsk::Delete)),
+            Some(Glyph::Cross)
+        );
+        assert_eq!(icon_of(&remote, MenuItem::Refresh), Some(Glyph::Refresh));
+        assert_eq!(icon_of(&remote, MenuItem::NewDir), Some(Glyph::Project));
+    }
+
+    /// F251:图标画在按钮左内边距里,而那个内边距是**先量后撑** ——
+    /// 量到的原值决定图标画在哪,撑开的新值把文字推到图标右边。
+    ///
+    /// 顺序反过来(先撑再量)不会编译错、不会 panic:量到的是加宽后的值,
+    /// 图标于是往右挪整整一格,**正好压在文字上**。这是渲染层,人眼之外
+    /// 没有第二个判据,只能守源码里这两句的先后。
+    ///
+    /// 同 `a_huge_directory_is_rendered_with_show_rows_not_a_full_scan` 的
+    /// 切片手法:只看 `#[cfg(test)]` 之前的生产段,再切出 `menu_body` 一个
+    /// 函数的函数体 —— 不切函数的话,`button_padding` 在别处出现一次就够把
+    /// 判据搅浑。
+    ///
+    /// 自证会变红:把量 `pad` 那一行挪到撑宽那一行之后。
+    #[test]
+    fn the_menu_icon_sits_in_the_padding_we_measured_before_widening_it() {
+        let src = include_str!("files_panel.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let body = production
+            .split("fn menu_body")
+            .nth(1)
+            .expect("找不到 menu_body");
+        let body = &body[..body.find("\n}\n").expect("找不到 menu_body 的结尾")];
+        let measured = body
+            .find("let pad = ui.spacing().button_padding;")
+            .expect("menu_body 里没有量原始内边距 —— 图标不知道该画在哪");
+        let widened = body
+            .find("button_padding.x =")
+            .expect("menu_body 里没有撑宽内边距 —— 图标会压在文字上");
+        assert!(
+            measured < widened,
+            "量内边距排在撑宽之后了:量到的是加宽后的值,图标会往右挪一格、正好盖住文字"
+        );
+        assert!(
+            body.contains("separator_before(&items)"),
+            "分隔线必须从档位算(F251),不许在渲染里手插 —— 手插必然出现\
+             领头/收尾/连成两条的畸形"
+        );
     }
 
     /// 没有光标行时不给传输入口 —— 点了没反应的菜单项比没有更让人困惑
