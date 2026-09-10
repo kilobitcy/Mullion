@@ -109,6 +109,18 @@ pub enum FileAction {
     ClipCut,
     /// F220:粘到当前目录。剪贴板空时这一项是置灰的。
     ClipPaste,
+    /// F250:把选中集的路径写进**系统剪贴板**(一行纯文本)。
+    ///
+    /// 跟 `ClipCopy` 完全是两回事 —— 那个放的是「待粘贴的文件」,粘到别的
+    /// 目录会真的搬字节;这个放的是一行字,粘到哪儿都只是那行字。
+    ///
+    /// `relative = true` 时写成相对**当前分屏所在目录**(OSC 7 上报)的
+    /// 写法。基准从哪来面板不知道也不该知道(同 `GotoInput` 里 `~` 的
+    /// 理由):调用方按栏算好「能不能相对」传进 `menu_items_for`,真正的
+    /// 相对化在 app 侧做。
+    CopyPath {
+        relative: bool,
+    },
 }
 
 /// F139:画书签相关控件要的两样东西。
@@ -172,6 +184,12 @@ pub enum MenuItem {
     ClipCut,
     /// F220:粘到当前目录。剪贴板空时这一项是置灰的。
     ClipPaste,
+    /// F250:复制**绝对**路径(纯文本)。两栏都有 —— 本地栏虽然不做写操作
+    /// (D5),但「把这个文件的路径抄出去」跟改远端一点关系都没有。
+    CopyAbsPath,
+    /// F250:复制**相对**路径。只在远端栏 —— 基准是远端分屏 OSC 7 报的
+    /// 目录,本地栏的文件相对它没有意义。
+    CopyRelPath,
 }
 
 /// 右键那一刻的光标行。**只有「是不是普通文件」和大小** —— 那一刻手上
@@ -210,10 +228,18 @@ fn on(label: &'static str, item: MenuItem) -> MenuEntry {
 /// - `clip_ready`:这个标签的远端剪贴板里有东西没(F220)。空的时候
 ///   「粘贴」**置灰并说明理由**,不是消失 —— 悄悄少一项,用户只会以为
 ///   程序坏了(D3-2)。
+/// - `rel_ready`:F250 —— 这一栏的东西能不能写成相对路径。判据由调用方
+///   算(它才知道当前分屏报了哪个目录),不能不能就**置灰并说理由**,
+///   同 `clip_ready` 那条口径。
+///
+///   置灰文案是**固定的**,不把算出来的基准目录嵌进去:`MenuEntry` 的两个
+///   字段都是 `&'static str`,要嵌就得改成 `String`,让整份菜单每帧多几次
+///   分配 —— 而用户从这句话里真正需要的只有「为什么灰」,不是「基准是谁」。
 pub fn menu_items_for(
     column: PanelColumn,
     target: Option<MenuTarget>,
     clip_ready: bool,
+    rel_ready: bool,
 ) -> Vec<MenuEntry> {
     let mut out: Vec<MenuEntry> = Vec::new();
     if column == PanelColumn::Remote {
@@ -245,6 +271,13 @@ pub fn menu_items_for(
         if target.is_some() {
             out.push(on("复制", MenuItem::ClipCopy));
             out.push(on("剪切", MenuItem::ClipCut));
+            // F250:跟上面那两条只是名字像 —— 见 `MenuItem::CopyAbsPath`。
+            out.push(on("复制绝对路径", MenuItem::CopyAbsPath));
+            out.push(MenuEntry {
+                label: "复制相对路径",
+                item: MenuItem::CopyRelPath,
+                disabled: (!rel_ready).then_some("当前分屏没报告它在哪个目录,或这一栏不在它下面"),
+            });
         }
         out.push(MenuEntry {
             label: "粘贴",
@@ -254,6 +287,9 @@ pub fn menu_items_for(
     } else {
         if target.is_some() {
             out.push(on("上传到远端", MenuItem::Transfer));
+            // F250:本地栏只给绝对路径 —— 相对的基准是远端分屏报的目录,
+            // 本机文件相对它没有意义(L1)。
+            out.push(on("复制绝对路径", MenuItem::CopyAbsPath));
         }
         out.push(on("在资源管理器中打开", MenuItem::OpenInExplorer));
     }
@@ -275,6 +311,8 @@ impl MenuItem {
             MenuItem::ClipCopy => FileAction::ClipCopy,
             MenuItem::ClipCut => FileAction::ClipCut,
             MenuItem::ClipPaste => FileAction::ClipPaste,
+            MenuItem::CopyAbsPath => FileAction::CopyPath { relative: false },
+            MenuItem::CopyRelPath => FileAction::CopyPath { relative: true },
         }
     }
 }
@@ -287,10 +325,11 @@ fn menu_body(
     column: PanelColumn,
     target: Option<MenuTarget>,
     clip_ready: bool,
+    rel_ready: bool,
     hit: &mut Option<MenuItem>,
 ) {
     annotate::mark(ui.ctx(), format!("文件面板/{id}/右键菜单"), ui.max_rect());
-    for e in menu_items_for(column, target, clip_ready) {
+    for e in menu_items_for(column, target, clip_ready, rel_ready) {
         match e.disabled {
             // 置灰项仍然画出来,并且把理由挂成 hover —— 灰着不说话等于没说。
             Some(why) => {
@@ -605,9 +644,16 @@ pub fn show(
     drop_in: usize,
     cols: &mut ColWidths,
     clip: Option<&RemoteClip>,
+    rel_base: Option<&[u8]>,
 ) -> Option<FileAction> {
     let mut action = None;
     let clip_ready = clip.is_some();
+    // F250:判据是「**这一栏的当前目录**在不在基准之下」,不是逐条比选中项。
+    // 两者等价(选中项一律是 `cwd.join(单段名字)`,见 `delete_targets`),而
+    // 这一份是 O(路径长度)、每帧算得起 —— 逐条比要遍历整个 `entries`,
+    // 两万项的目录里每帧来一遍正是陷阱 T3 那类。
+    let rel_ready = rel_base
+        .is_some_and(|b| crate::files::copy_path::relative_to(b, state.cwd.as_bytes()).is_some());
     annotate::mark(ui.ctx(), format!("文件面板/{id}"), ui.max_rect());
     // 焦点在场才画——常亮等于没有信息量(协调者复核 #2)。颜色取既有语义色
     // `t.accent`(选中态同款),不新造色值(UI 视觉规格已冻结,见 spec §4.6)。
@@ -641,7 +687,17 @@ pub fn show(
         ui.id().with(("files-bg-menu", id, generation)),
         egui::Sense::click(),
     );
-    bg.context_menu(|ui| menu_body(ui, id, column, bg_target, clip_ready, &mut menu_hit));
+    bg.context_menu(|ui| {
+        menu_body(
+            ui,
+            id,
+            column,
+            bg_target,
+            clip_ready,
+            rel_ready,
+            &mut menu_hit,
+        )
+    });
     // F58:对面栏正拖着东西过来 —— 整栏描边,让「松手会传到这儿」在松手
     // **之前**就看得见。判据是「载荷来自另一栏」而不是「有载荷」:同栏内
     // 拖不成立(`drag::drop_target`),给它描边等于承诺一个不会发生的动作。
@@ -1101,7 +1157,15 @@ pub fn show(
                 // 出了闭包才更新,这一帧里还是上一条。
                 let tg = menu_target(e);
                 resp.context_menu(|ui| {
-                    menu_body(ui, id, column, Some(tg), clip_ready, &mut menu_hit)
+                    menu_body(
+                        ui,
+                        id,
+                        column,
+                        Some(tg),
+                        clip_ready,
+                        rel_ready,
+                        &mut menu_hit,
+                    )
                 });
                 if resp.double_clicked() {
                     match state.enter_target(e) {
@@ -2024,6 +2088,7 @@ pub fn sidebar(
     frame: &mut PanelFrame,
     drop_in: usize,
     focus_click: &mut bool,
+    rel_base: Option<&[u8]>,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     let mut hit: Option<PanelColumn> = None;
@@ -2084,6 +2149,8 @@ pub fn sidebar(
                         0,
                         &mut ui_state.files_cols,
                         frame.clip.as_ref(),
+                        // F250:本地栏不给相对路径 —— 基准是远端分屏报的目录(L1)。
+                        None,
                     );
                 });
             });
@@ -2120,6 +2187,7 @@ pub fn sidebar(
                         drop_in,
                         &mut ui_state.files_cols,
                         frame.clip.as_ref(),
+                        rel_base,
                     );
                 });
             });
@@ -2182,6 +2250,7 @@ pub fn content(
     cols: &mut ColWidths,
     panel_rect: &mut Option<egui::Rect>,
     focus_click: &mut bool,
+    rel_base: Option<&[u8]>,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     let mut hit: Option<PanelColumn> = None;
@@ -2261,6 +2330,8 @@ pub fn content(
                     0,
                     cols,
                     frame.clip.as_ref(),
+                    // F250:本地栏不给相对路径 —— 基准是远端分屏报的目录(L1)。
+                    None,
                 );
             });
             ui.painter()
@@ -2283,6 +2354,7 @@ pub fn content(
                     drop_in,
                     cols,
                     frame.clip.as_ref(),
+                    rel_base,
                 );
             });
         });
@@ -2596,6 +2668,7 @@ mod tests {
                         0,
                         &mut cols,
                         None,
+                        None,
                     );
                 });
             }));
@@ -2678,7 +2751,10 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    out = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false).0;
+                    out = content(
+                        ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    )
+                    .0;
                 },
             );
             out
@@ -2888,6 +2964,7 @@ mod tests {
                         0,
                         &mut cols,
                         None,
+                        None,
                     );
                 });
             }));
@@ -2997,6 +3074,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                     );
                 });
@@ -3202,6 +3280,7 @@ mod tests {
                         0,
                         &mut cols,
                         None,
+                        None,
                     );
                 });
             }));
@@ -3251,8 +3330,8 @@ mod tests {
     /// 永远不出现远端写操作(加入口时最容易顺手把整套菜单抄过去)。
     #[test]
     fn both_columns_offer_a_transfer_entry_but_only_the_remote_one_can_write() {
-        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false);
-        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false);
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false, false);
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false, false);
         assert!(
             remote.iter().any(|e| e.label == "下载到本地"),
             "远端栏该有下载:{remote:?}"
@@ -3267,12 +3346,84 @@ mod tests {
         );
     }
 
+    /// F250:两栏都能复制**绝对**路径,但**相对**只在远端栏 —— 基准是远端
+    /// 分屏 OSC 7 报的目录,本机文件相对它没有意义(L1)。
+    ///
+    /// 自证会变红:把本地栏那句 `复制绝对路径` 删掉(第二条),或者把远端
+    /// 那条 `CopyRelPath` 也 push 进本地栏那一支(第三条)。
+    #[test]
+    fn both_columns_can_copy_an_absolute_path_but_only_the_remote_one_a_relative_one() {
+        let tg = Some(a_file());
+        let remote = menu_items_for(PanelColumn::Remote, tg, false, true);
+        let local = menu_items_for(PanelColumn::Local, tg, false, true);
+        assert!(
+            remote.iter().any(|e| e.item == MenuItem::CopyAbsPath)
+                && remote.iter().any(|e| e.item == MenuItem::CopyRelPath),
+            "远端栏该有绝对 + 相对两项:{remote:?}"
+        );
+        assert!(
+            local.iter().any(|e| e.item == MenuItem::CopyAbsPath),
+            "本地栏该有「复制绝对路径」—— 抄一个本机路径跟改远端毫无关系:{local:?}"
+        );
+        assert!(
+            !local.iter().any(|e| e.item == MenuItem::CopyRelPath),
+            "本地栏冒出了「复制相对路径」,而它的基准是远端分屏的目录:{local:?}"
+        );
+    }
+
+    /// F250:基准不明(或这一栏不在基准之下)时,「复制相对路径」**置灰并
+    /// 说出理由**,不是消失 —— 同 F220「粘贴」那条口径(D3-2)。
+    ///
+    /// 悄悄少一项的症状最难查:用户记得昨天有这一项,今天没了,而程序
+    /// 一声不吭。
+    ///
+    /// 自证会变红:把 `disabled` 那一支改成 `None`(第二条断言),或者
+    /// 改成「`rel_ready` 为假就不 push」(第一条 `expect` 直接炸)。
+    #[test]
+    fn copying_a_relative_path_is_greyed_out_with_a_reason_rather_than_vanishing() {
+        let tg = Some(a_file());
+        let items = menu_items_for(PanelColumn::Remote, tg, false, false);
+        let rel = items
+            .iter()
+            .find(|e| e.item == MenuItem::CopyRelPath)
+            .expect("基准不明时「复制相对路径」不该消失,该置灰");
+        assert!(
+            rel.disabled.is_some(),
+            "基准不明时「复制相对路径」没置灰 —— 点下去只会得到一条吐司"
+        );
+        // 反过来:基准有了就不许还灰着。
+        let ok = menu_items_for(PanelColumn::Remote, tg, false, true);
+        let rel = ok
+            .iter()
+            .find(|e| e.item == MenuItem::CopyRelPath)
+            .expect("这一项不该消失");
+        assert!(rel.disabled.is_none(), "基准明明有,这一项还灰着");
+    }
+
+    /// F250:「复制路径」跟 F220 的「复制」是**两回事**,不能共用一个动作
+    /// —— 那个放的是待粘贴的文件(粘一下会真的搬字节),这个放的只是一行字。
+    ///
+    /// 自证会变红:把 `MenuItem::CopyAbsPath` 的 `into_action` 改成
+    /// `FileAction::ClipCopy`。
+    #[test]
+    fn copying_a_path_is_a_different_action_from_copying_the_file_itself() {
+        assert_eq!(
+            MenuItem::CopyAbsPath.into_action(),
+            FileAction::CopyPath { relative: false }
+        );
+        assert_eq!(
+            MenuItem::CopyRelPath.into_action(),
+            FileAction::CopyPath { relative: true }
+        );
+        assert_ne!(MenuItem::CopyAbsPath.into_action(), FileAction::ClipCopy);
+    }
+
     /// 没有光标行时不给传输入口 —— 点了没反应的菜单项比没有更让人困惑
     /// (与 `新建文件夹…`/`删除…` 同一条口径)。
     #[test]
     fn no_cursor_means_no_transfer_entry_at_all() {
         for column in [PanelColumn::Remote, PanelColumn::Local] {
-            let items = menu_items_for(column, None, false);
+            let items = menu_items_for(column, None, false, false);
             assert!(
                 !items.iter().any(|e| e.item == MenuItem::Transfer),
                 "{column:?} 栏在没有光标行时给出了传输入口:{items:?}"
@@ -3287,14 +3438,14 @@ mod tests {
             is_file: true,
             size: 10,
         });
-        let remote: Vec<&str> = menu_items_for(PanelColumn::Remote, tg, true)
+        let remote: Vec<&str> = menu_items_for(PanelColumn::Remote, tg, true, false)
             .iter()
             .map(|e| e.label)
             .collect();
         for want in ["复制", "剪切", "粘贴"] {
             assert!(remote.contains(&want), "远端栏少了「{want}」");
         }
-        let local: Vec<&str> = menu_items_for(PanelColumn::Local, tg, true)
+        let local: Vec<&str> = menu_items_for(PanelColumn::Local, tg, true, false)
             .iter()
             .map(|e| e.label)
             .collect();
@@ -3309,7 +3460,7 @@ mod tests {
     /// 自证会变红:把那一项改成「剪贴板空就不 push」。
     #[test]
     fn paste_is_greyed_out_with_a_reason_when_the_clipboard_is_empty() {
-        let items = menu_items_for(PanelColumn::Remote, None, false);
+        let items = menu_items_for(PanelColumn::Remote, None, false, false);
         let paste = items
             .iter()
             .find(|e| e.label == "粘贴")
@@ -3547,6 +3698,7 @@ mod tests {
                         0,
                         cols,
                         None,
+                        None,
                     );
                 });
             });
@@ -3653,7 +3805,7 @@ mod tests {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
                 content(
-                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                 );
             });
             for shape in out.shapes.iter() {
@@ -3762,7 +3914,7 @@ mod tests {
             let mut out = None;
             let o = ctx.run(raw(None), |ctx| {
                 out = Some(content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
                 ));
             });
             let _ = out;
@@ -3829,6 +3981,7 @@ mod tests {
                             0,
                             &mut cols,
                             None,
+                            None,
                         );
                     });
                 });
@@ -3878,6 +4031,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                     );
                 });
@@ -3957,6 +4111,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                         None,
                     );
                 });
@@ -4057,6 +4212,7 @@ mod tests {
                     0,
                     &mut cols,
                     None,
+                    None,
                 );
             });
         });
@@ -4087,6 +4243,7 @@ mod tests {
                     0,
                     &mut cols,
                     None,
+                    None,
                 );
             });
         });
@@ -4103,6 +4260,7 @@ mod tests {
                     BookmarkView::none(),
                     0,
                     &mut cols,
+                    None,
                     None,
                 );
             });
@@ -4204,6 +4362,7 @@ mod tests {
                     0,
                     cols,
                     None,
+                    None,
                 );
             });
         });
@@ -4237,6 +4396,7 @@ mod tests {
                     },
                     0,
                     cols,
+                    None,
                     None,
                 );
             });
@@ -4390,7 +4550,7 @@ mod tests {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
                     content(
-                        ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                        ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                     );
                 })
                 .shapes;
@@ -4434,7 +4594,7 @@ mod tests {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
                     content(
-                        ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                        ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                     );
                 })
                 .shapes;
@@ -4450,7 +4610,7 @@ mod tests {
         let mut out = (None, None);
         let _ = ctx.run(click_at(star), |ctx| {
             out = content(
-                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
             );
         });
         let (_remote_out, local_out) = out;
@@ -4624,7 +4784,7 @@ mod tests {
     /// 自证会变红:把标签改回带省略号的写法。
     #[test]
     fn new_dir_is_an_inline_edit_so_it_carries_no_ellipsis() {
-        let remote = menu_items_for(PanelColumn::Remote, None, false);
+        let remote = menu_items_for(PanelColumn::Remote, None, false, false);
         let e = remote
             .iter()
             .find(|e| e.item == MenuItem::NewDir)
@@ -4641,7 +4801,7 @@ mod tests {
         );
 
         // D5:本地栏一概没有写操作。
-        let local = menu_items_for(PanelColumn::Local, None, false);
+        let local = menu_items_for(PanelColumn::Local, None, false, false);
         assert!(!local.iter().any(|e| e.item == MenuItem::NewDir));
     }
 
@@ -4672,8 +4832,8 @@ mod tests {
     /// (egui 的 `context_menu` 要一次右键 + 一帧才展开,测起来又脆又慢)。
     #[test]
     fn the_local_column_never_offers_a_write_operation() {
-        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false);
-        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false);
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false, false);
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false, false);
         for ask in [FileAsk::Rename, FileAsk::Delete, FileAsk::Chmod] {
             assert!(
                 remote.iter().any(|e| e.item == MenuItem::Ask(ask)),
@@ -4706,7 +4866,7 @@ mod tests {
         // 按 `MenuItem::NewFile` 这个枚举身份定位那一条 entry,而不是按
         // 标签字符串找 —— 这样「存在性」和「格式(不带省略号)」两件事
         // 才能各自独立变红,不会被字符串精确匹配捆在一起。
-        let remote = menu_items_for(PanelColumn::Remote, None, false);
+        let remote = menu_items_for(PanelColumn::Remote, None, false, false);
         let entry = remote
             .iter()
             .find(|e| e.item == MenuItem::NewFile)
@@ -4715,7 +4875,7 @@ mod tests {
             !entry.label.ends_with('…'),
             "「新建文件」带了省略号 —— 那是弹框的记号"
         );
-        let local = menu_items_for(PanelColumn::Local, None, false);
+        let local = menu_items_for(PanelColumn::Local, None, false, false);
         assert!(
             !local.iter().any(|e| e.item == MenuItem::NewFile),
             "本地栏出现了写操作(D5:本地文件管理外包给资源管理器)"
@@ -4726,7 +4886,7 @@ mod tests {
     /// 给一个「点了没反应」的菜单项比不给更让人困惑。
     #[test]
     fn single_target_operations_are_absent_without_a_cursor_row() {
-        let items = menu_items_for(PanelColumn::Remote, None, false);
+        let items = menu_items_for(PanelColumn::Remote, None, false, false);
         for ask in [FileAsk::Rename, FileAsk::Chmod, FileAsk::Delete] {
             assert!(
                 !items.iter().any(|e| e.item == MenuItem::Ask(ask)),
@@ -4753,13 +4913,13 @@ mod tests {
         // 「↑」的位置**必须取自同一帧**,否则比的是两套布局。
         let mut out = ctx.run(raw(None), |ctx| {
             content(
-                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
             );
         });
         for _ in 0..2 {
             out = ctx.run(raw(None), |ctx| {
                 content(
-                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                 );
             });
         }
@@ -4822,13 +4982,13 @@ mod tests {
         // 三帧,理由同上面那条:首帧是 sizing pass。
         let mut out = ctx.run(raw(None), |ctx| {
             content(
-                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
             );
         });
         for _ in 0..2 {
             out = ctx.run(raw(None), |ctx| {
                 content(
-                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false,
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                 );
             });
         }
@@ -4945,7 +5105,9 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             })
         };
         let _ = render(raw(None), &mut frame);
@@ -4997,7 +5159,9 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             })
         };
         let _ = render(raw(None), &mut frame);
@@ -5038,7 +5202,9 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             })
         };
         // 两帧稳定布局(egui Panel 首帧 fade_in 只记 Shape::Noop,同本文件
@@ -5083,7 +5249,9 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                acts = content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             });
             (acts, out)
         };
@@ -5122,7 +5290,9 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                acts = content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             });
             (acts, out)
         };
@@ -5161,7 +5331,9 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                acts = content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             });
             (acts, out)
         };
@@ -5209,7 +5381,9 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                acts = content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             });
             (acts, out)
         };
@@ -5259,7 +5433,9 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                acts = content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             });
             (acts, out)
         };
@@ -5301,7 +5477,9 @@ mod tests {
         let mut cols = ColWidths::default();
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
-                content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             })
         };
         let _ = render(raw(None), &mut frame);
@@ -5337,7 +5515,9 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
-                acts = content(ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false);
+                acts = content(
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                );
             });
             (acts, out)
         };
@@ -5384,6 +5564,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                     );
                 });
@@ -5440,7 +5621,7 @@ mod tests {
     /// 本地文件本来就该在资源管理器里双击。
     #[test]
     fn the_local_column_never_offers_a_remote_edit_entry() {
-        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false);
+        let local = menu_items_for(PanelColumn::Local, Some(a_file()), false, false);
         assert!(
             !local
                 .iter()
@@ -5448,7 +5629,7 @@ mod tests {
             "本地栏冒出了远端编辑入口:{local:?}"
         );
         // 反面:远端栏必须有,否则上一条断言在「谁都没有」时也是绿的。
-        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false);
+        let remote = menu_items_for(PanelColumn::Remote, Some(a_file()), false, false);
         assert!(
             remote
                 .iter()
@@ -5464,7 +5645,7 @@ mod tests {
             is_file: false,
             size: 4096,
         };
-        let items = menu_items_for(PanelColumn::Remote, Some(dir), false);
+        let items = menu_items_for(PanelColumn::Remote, Some(dir), false, false);
         assert!(
             !items
                 .iter()
@@ -5483,7 +5664,7 @@ mod tests {
             is_file: true,
             size: crate::edit::INLINE_LIMIT + 1,
         };
-        let items = menu_items_for(PanelColumn::Remote, Some(big), false);
+        let items = menu_items_for(PanelColumn::Remote, Some(big), false, false);
         let inline = items
             .iter()
             .find(|e| e.item == MenuItem::EditInline)
@@ -5503,7 +5684,7 @@ mod tests {
             is_file: true,
             size: crate::edit::EXTERNAL_LIMIT + 1,
         };
-        let items = menu_items_for(PanelColumn::Remote, Some(huge), false);
+        let items = menu_items_for(PanelColumn::Remote, Some(huge), false, false);
         assert!(
             items
                 .iter()
@@ -5543,6 +5724,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                     );
                 });
@@ -5614,6 +5796,7 @@ mod tests {
                             BookmarkView::none(),
                             0,
                             &mut cols,
+                            None,
                             None,
                         );
                     });
@@ -5708,6 +5891,7 @@ mod tests {
                         0,
                         &mut cols,
                         None,
+                        None,
                     );
                 });
             });
@@ -5759,7 +5943,7 @@ mod tests {
                 }
                 let mut took = false;
                 let _ = ctx.run(input, |ctx| {
-                    content(ctx, &t, 7, true, frame, 0, cols, &mut None, &mut took);
+                    content(ctx, &t, 7, true, frame, 0, cols, &mut None, &mut took, None);
                 });
                 took
             };
@@ -5830,7 +6014,7 @@ mod tests {
             }
             let mut took = false;
             let _ = ctx.run(input, |ctx| {
-                sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut took);
+                sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut took, None);
             });
             took
         };
@@ -5884,7 +6068,7 @@ mod tests {
                 },
                 |ctx| {
                     content(
-                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                     );
                 },
             );
@@ -5911,7 +6095,17 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame2, 0, &mut false);
+                    sidebar(
+                        ctx,
+                        &t,
+                        &mut ui_state,
+                        7,
+                        true,
+                        &mut frame2,
+                        0,
+                        &mut false,
+                        None,
+                    );
                 },
             );
         }
@@ -5992,7 +6186,7 @@ mod tests {
             |input: egui::RawInput, frame: &mut PanelFrame, ui_state: &mut crate::ui::UiState| {
                 let mut acts = (None, None);
                 let out = ctx.run(input, |ctx| {
-                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut false);
+                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut false, None);
                 });
                 (acts, out)
             };
@@ -6066,7 +6260,17 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        sidebar(ctx, &t, &mut ui_state, 7, true, &mut frame, 0, &mut false);
+                        sidebar(
+                            ctx,
+                            &t,
+                            &mut ui_state,
+                            7,
+                            true,
+                            &mut frame,
+                            0,
+                            &mut false,
+                            None,
+                        );
                     },
                 )
                 .shapes;
@@ -6170,7 +6374,7 @@ mod tests {
                     },
                     |ctx| {
                         content(
-                            ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                            ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                         );
                     },
                 ));
@@ -6238,7 +6442,7 @@ mod tests {
                 },
                 |ctx| {
                     content(
-                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                     );
                 },
             ));
@@ -6262,7 +6466,7 @@ mod tests {
         };
         let mut out = Some(ctx.run(scroll_input, |ctx| {
             content(
-                ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
             );
         }));
         // 再跑两帧,让滚动状态稳定下来(smooth scroll 有插值)。
@@ -6274,7 +6478,7 @@ mod tests {
                 },
                 |ctx| {
                     content(
-                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                        ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
                     );
                 },
             ));
@@ -6405,6 +6609,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                     );
                 });
@@ -6616,6 +6821,7 @@ mod tests {
                         0,
                         &mut cols,
                         None,
+                        None,
                     );
                 });
             });
@@ -6703,6 +6909,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                     );
                 });
@@ -6845,7 +7052,7 @@ mod tests {
         let mut run = |input: egui::RawInput, frame: &mut PanelFrame| {
             let _ = ctx.run(input, |ctx| {
                 content(
-                    ctx, &t, 1, false, frame, 0, &mut cols, &mut None, &mut false,
+                    ctx, &t, 1, false, frame, 0, &mut cols, &mut None, &mut false, None,
                 );
             });
         };
@@ -6990,6 +7197,7 @@ mod tests {
                         0,
                         &mut cols,
                         None,
+                        None,
                     );
                 });
             });
@@ -7070,6 +7278,7 @@ mod tests {
                             0,
                             cols,
                             None,
+                            None,
                         );
                     });
                 }));
@@ -7132,6 +7341,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                         None,
                     );
                 });
@@ -7228,6 +7438,7 @@ mod tests {
                         0,
                         cols,
                         None,
+                        None,
                     );
                 });
             })
@@ -7312,6 +7523,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                         None,
                     );
                 });
@@ -7398,6 +7610,7 @@ mod tests {
                         0,
                         cols,
                         None,
+                        None,
                     );
                 });
             })
@@ -7458,6 +7671,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                         None,
                     );
                 });
@@ -7542,6 +7756,7 @@ mod tests {
                                 0,
                                 c,
                                 None,
+                                None,
                             );
                         });
                     })
@@ -7601,6 +7816,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                     );
                 });

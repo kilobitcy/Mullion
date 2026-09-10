@@ -484,6 +484,27 @@ impl PaneState {
             .collect()
     }
 
+    /// F250:这一栏此刻要「复制路径」的那些绝对路径。
+    ///
+    /// 挑选判据跟 [`PaneState::delete_targets`] 逐字同源 —— 选中集优先、
+    /// 没选中退回光标行、名字发不出 wire 请求的剔掉。**不在这儿另起一份**:
+    /// 两处各写一遍,改对一处漏改另一处就会静默分叉(那条自己的文档里
+    /// 说的正是这件事)。
+    ///
+    /// 差别只有一处:**怎么拼绝对路径**。远端按 POSIX(`/`),本地按平台
+    /// 分隔符 —— `C:\work/sub` 虽然打得开,粘进 PowerShell 就很难看,而
+    /// 「粘到别处去」正是这个功能的全部用途。
+    pub fn copy_targets(&self, column: super::PanelColumn) -> Vec<RemotePath> {
+        self.picked_entries()
+            .into_iter()
+            .filter(|e| e.name.is_operable())
+            .map(|e| match column {
+                super::PanelColumn::Remote => self.cwd.join(e.name.as_bytes()),
+                super::PanelColumn::Local => super::local::join_local(&self.cwd, e.name.as_bytes()),
+            })
+            .collect()
+    }
+
     /// 点了一行。`ctrl` = 切换单条,`shift` = 从锚点到这里的闭区间,
     /// 都不按 = 只选这一条。
     ///
@@ -927,6 +948,74 @@ mod tests {
                 ("/home/u/a.txt".to_string(), false),
             ],
             "删除目标算错了"
+        );
+    }
+
+    /// F250:「复制路径」的挑选判据跟删除逐字同源 —— 选中集优先、名字发不
+    /// 出去的剔掉、顺序按可见行序。两处各写一遍就会静默分叉。
+    ///
+    /// 自证会变红:把 `copy_targets` 里的 `picked_entries()` 换成
+    /// `rows()`(不看选中集,整目录全给),或者去掉 `is_operable` 那道过滤。
+    #[test]
+    fn copy_targets_pick_the_same_rows_delete_would() {
+        let mut s = state();
+        let bad = Entry {
+            name: RemotePath::from_bytes(vec![0xff, 0xfe, b'.', b't', b'x', b't']),
+            ..e("x", EntryKind::File)
+        };
+        s.accept(
+            s.request_seq,
+            Ok(vec![
+                e("a.txt", EntryKind::File),
+                e("d", EntryKind::Dir),
+                bad,
+            ]),
+        );
+        s.selected = ["a.txt", "d"]
+            .iter()
+            .map(|n| RemotePath::from_bytes(n.as_bytes().to_vec()))
+            .collect();
+        let copied: Vec<String> = s
+            .copy_targets(super::super::PanelColumn::Remote)
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let deleted: Vec<String> = s
+            .delete_targets()
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+        assert_eq!(copied, deleted, "两处挑的行不一样了");
+        assert_eq!(copied, vec!["/home/u/d", "/home/u/a.txt"]);
+    }
+
+    /// F250:本地栏拼绝对路径必须走 `join_local`(平台分隔符),不是远端
+    /// 那份 POSIX 的 `cwd.join`。
+    ///
+    /// **在 Linux 上按值断言是恒绿的** —— 两者结果一模一样,只有 Windows
+    /// 上才分得开(`C:\work/sub` vs `C:\work\sub`)。而这个功能的全部用途
+    /// 就是「粘到别处去」,粘进 PowerShell 的那条斜杠混排没人想看。所以
+    /// 这里扎的是源码结构:开发机上跑不出差别的判据,只能这么钉。
+    ///
+    /// 自证会变红:把 `Local` 那一支改成 `self.cwd.join(e.name.as_bytes())`。
+    #[test]
+    fn the_local_column_joins_with_the_platform_separator_not_a_posix_slash() {
+        let src = include_str!("state.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let after = production
+            .split("pub fn copy_targets")
+            .nth(1)
+            .expect("缺 copy_targets");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let local_at = body
+            .find("PanelColumn::Local")
+            .expect("copy_targets 不分栏了?");
+        assert!(
+            body[local_at..].contains("join_local"),
+            "本地栏用了 POSIX 的 join —— Linux 上跑不出差别,Windows 上会拼出\
+             `C:\\work/sub` 这种斜杠混排的路径"
         );
     }
 

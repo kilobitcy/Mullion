@@ -557,6 +557,15 @@ pub struct UiFrame<'a> {
     /// F242:状态栏「当前选中的路径」那一格。`None` = 不占格(没选区、
     /// 多行选区、或者选区里不是一条路径)。
     pub selection_path: Option<&'a crate::files::reveal::StatusPath>,
+    /// F250:当前**聚焦分屏**报的所在目录(OSC 7,`PaneState::cwd`)。
+    /// `None` = 没报过 / 这种标签压根没有分屏(SFTP 节点标签)。
+    ///
+    /// 文件面板右键菜单的「复制相对路径」拿它当基准 —— 用户嘴里的
+    /// 「相对路径」指的就是「相对我此刻在 shell 里待的地方」。
+    ///
+    /// 每帧现算的派生值,**不落任何持久状态**:存一份下来就是影子状态,
+    /// pane 换目录之后那一份不会自己变。
+    pub pane_cwd: Option<&'a [u8]>,
     /// 每个 pane 的标题条(F83)。空 = 标题条关闭或 launcher 态。
     pub titles: &'a [pane_title::TitleView<'a>],
     pub host_key: Option<host_key::HostKeyView<'a>>,
@@ -876,6 +885,7 @@ pub fn build_ui(
             files,
             hovering,
             &mut actions.files_focus_click,
+            frame.pane_cwd,
         );
         actions.files_remote = r;
         actions.files_local = l;
@@ -1107,6 +1117,7 @@ pub fn build_ui(
             &mut ui_state.files_cols,
             &mut ui_state.files_panel_rect,
             &mut actions.files_focus_click,
+            frame.pane_cwd,
         );
         actions.files_remote = r;
         actions.files_local = l;
@@ -1357,6 +1368,7 @@ mod tests {
             panes: 1,
             preset: None,
             selection_path: None,
+            pane_cwd: None,
             titles: &[],
             tabs: &[],
             host_key: None,

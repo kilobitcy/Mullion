@@ -5128,6 +5128,16 @@ impl App {
                 self.remove_bookmark(generation, path.clone(), crate::files::PanelColumn::Local);
                 return;
             }
+            // F250:同上,在借出 `files` 之前分流 —— 它要 `&mut self`
+            // (写系统剪贴板 + 可能飘一条吐司)。
+            FileAction::CopyPath { relative } => {
+                self.copy_paths_to_clipboard(
+                    generation,
+                    crate::files::PanelColumn::Local,
+                    *relative,
+                );
+                return;
+            }
             _ => {}
         }
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
@@ -5214,7 +5224,8 @@ impl App {
             | FileAction::Drop(_)
             | FileAction::Reconnect
             | FileAction::BookmarkAdd { .. }
-            | FileAction::BookmarkRemove { .. } => return,
+            | FileAction::BookmarkRemove { .. }
+            | FileAction::CopyPath { .. } => return,
             // D5:本地文件在资源管理器里双击就行,`menu_items_for` 也不给
             // 这两项。到这儿同样说明菜单构造被改坏了。
             FileAction::EditExternal | FileAction::EditInline => {
@@ -5276,6 +5287,15 @@ impl App {
             // 本地栏专属,远端栏收到就是接线接错了 —— 老实记一条,不静默吞。
             FileAction::OpenInExplorer => {
                 log::warn!("远端栏收到 OpenInExplorer,已忽略");
+                return;
+            }
+            // F250:同 `Ask`,在借出 `files` 之前分流(要 `&mut self`)。
+            FileAction::CopyPath { relative } => {
+                self.copy_paths_to_clipboard(
+                    generation,
+                    crate::files::PanelColumn::Remote,
+                    *relative,
+                );
                 return;
             }
             // F52:下载。同 `Ask`,在借出 `files` 之前分流。
@@ -5549,7 +5569,8 @@ impl App {
             | FileAction::NewDir(_)
             | FileAction::ClipCopy
             | FileAction::ClipCut
-            | FileAction::ClipPaste => return,
+            | FileAction::ClipPaste
+            | FileAction::CopyPath { .. } => return,
         };
         // F249:探测那一趟不动 `cwd`、不进 `Loading` —— 它还不知道要去哪儿。
         // 借 `files` 到此为止(下面几行只用 `self`),两条路各发各的请求。
@@ -5558,14 +5579,9 @@ impl App {
             None => files.remote.begin_load(target.clone()),
         };
         let task = match probe {
-            Some(_) => spawn_sftp_path_probe(
-                &self._runtime,
-                &self.proxy,
-                generation,
-                client,
-                target,
-                seq,
-            ),
+            Some(_) => {
+                spawn_sftp_path_probe(&self._runtime, &self.proxy, generation, client, target, seq)
+            }
             None => {
                 spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, target, seq)
             }
@@ -6692,6 +6708,94 @@ impl App {
     ///
     /// 目标取**光标行**,与 `FileAsk::Rename`/`Chmod` 同一条约定 ——
     /// 双击那条入口会先把光标挪到被双击的行上(见 `files_panel::show`)。
+    /// F250:把选中集的路径写进**系统剪贴板**(一行纯文本)。
+    ///
+    /// 跟 `push_clipboard_to_system`(F230)完全是两回事:那个放的是「待粘贴
+    /// 的文件」,会被另一个 Mullion 实例/资源管理器认成一批要搬的东西;
+    /// 这个放的只是一行字。
+    ///
+    /// `relative` 时基准取**焦点分屏**报的目录(OSC 7)。取不到就什么都不做
+    /// —— 菜单里那一项本来就是灰的(`menu_items_for` 的 `rel_ready`),走到
+    /// 这儿说明是键盘/别的入口绕过来的,不该退化成「悄悄给了绝对路径」:
+    /// 用户要的是相对路径,给成绝对的他不会发现,只会把命令粘错地方。
+    fn copy_paths_to_clipboard(
+        &mut self,
+        generation: u64,
+        column: crate::files::PanelColumn,
+        relative: bool,
+    ) {
+        // 按**属主标签**取,不落回活动标签 —— 同 `apply_remote_file_action`
+        // 那条既有约定(动作带着 generation 走)。
+        let base = if relative {
+            let found = self
+                .tabs
+                .by_generation(generation)
+                .and_then(|t| t.content.focused_pane_cwd());
+            let Some(b) = found else {
+                self.ui.set_toast(
+                    crate::ui::toast::Kind::Warn,
+                    "当前分屏没报告它在哪个目录,写不出相对路径",
+                );
+                mark_ui_dirty!(self.ui_dirty);
+                return;
+            };
+            Some(b)
+        } else {
+            None
+        };
+        let Some(files) = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+        else {
+            return;
+        };
+        let pane = match column {
+            crate::files::PanelColumn::Remote => &files.remote,
+            crate::files::PanelColumn::Local => &files.local,
+        };
+        let abs = pane.copy_targets(column);
+        if abs.is_empty() {
+            // 同 `ClipCopy` 那条空集分支:悄悄 return 的话用户会以为拷进去
+            // 了,直到粘出来才发现是空的。
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                "选中的项没有可复制的路径——名称含程序处理不了的字符",
+            );
+            mark_ui_dirty!(self.ui_dirty);
+            return;
+        }
+        let n = abs.len();
+        let paths: Vec<Vec<u8>> = match &base {
+            Some(base) => {
+                let mut out = Vec::with_capacity(abs.len());
+                for p in &abs {
+                    match crate::files::copy_path::relative_to(base, p.as_bytes()) {
+                        Some(r) => out.push(r),
+                        // 一条都不许退化成绝对路径:半相对半绝对的一行粘进
+                        // shell,错的那几条会打到别的目录去。
+                        None => {
+                            self.ui.set_toast(
+                                crate::ui::toast::Kind::Warn,
+                                "选中的项不在当前分屏所在目录之下,写不出相对路径",
+                            );
+                            mark_ui_dirty!(self.ui_dirty);
+                            return;
+                        }
+                    }
+                }
+                out
+            }
+            None => abs.iter().map(|p| p.as_bytes().to_vec()).collect(),
+        };
+        self.clipboard
+            .set(&crate::files::copy_path::join_for_clipboard(&paths));
+        // 成功不飘吐司:这个动作一天要按几十次,每次弹一条是噪音,而
+        // 「粘出来是什么」用户下一秒就自己验证了。计数只在日志里留一笔。
+        log::debug!("F250:已复制 {n} 条路径(relative={relative})");
+        mark_ui_dirty!(self.ui_dirty);
+    }
+
     fn start_edit(&mut self, generation: u64, kind: crate::edit::sessions::EditKind) {
         use crate::edit::sessions::EditKind;
         let Some(tab) = self.tabs.by_generation(generation) else {
@@ -12110,6 +12214,14 @@ impl ApplicationHandler<UserEvent> for App {
                             // F242:借出去给 `UiFrame`(它是 `Copy`,装不下
                             // 一个 `String`),所以先落个本地绑定。
                             let selection_path = self.selection_status();
+                            // F250:同 `selection_path` —— `UiFrame` 是 `Copy`,
+                            // 装不下 `Vec<u8>`,先落个本地绑定再借出去。
+                            // 每帧现算,不存任何地方(存下来就是影子状态:
+                            // pane 换了目录那一份不会自己变)。
+                            let pane_cwd = self
+                                .tabs
+                                .active()
+                                .and_then(|t| t.content.focused_pane_cwd());
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
@@ -12140,6 +12252,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 这个 O(1) 判据,没选区 / 多行选区一律在拼串
                                 // 之前就返回(陷阱 T3)。
                                 selection_path: selection_path.as_ref(),
+                                pane_cwd: pane_cwd.as_deref(),
                                 titles: &titles,
                                 tabs: &tab_views,
                                 host_key: host_key_view,
@@ -19663,6 +19776,76 @@ mod tests {
                  {other_cwd})—— 大概率是复制粘贴时手滑抄错了栏"
             );
         }
+    }
+
+    /// F250:相对化只要有**一条**落在基准之外,整次复制就该放弃。
+    ///
+    /// 退化成「那几条给绝对路径、其余给相对」的一行,粘进 shell 会执行 ——
+    /// 而且执行得很成功,只是有几条打到了别的目录去。这种半对半错的输出
+    /// 用户几乎不可能在粘贴前看出来,而它已经不可逆了(`rm`/`mv` 那一类)。
+    ///
+    /// 扎源码结构:验它要一份活的面板状态 + 系统剪贴板,这个容器里造不出来。
+    ///
+    /// 自证会变红:把 `None =>` 那一支从「飘吐司 + `return`」改成
+    /// 「`out.push(p.as_bytes().to_vec())`」(退化成绝对路径继续走)。
+    #[test]
+    fn one_path_outside_the_base_cancels_the_whole_relative_copy() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let after = production
+            .split("fn copy_paths_to_clipboard")
+            .nth(1)
+            .expect("缺 copy_paths_to_clipboard —— 菜单项点了没人接");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let at = body
+            .find("relative_to(")
+            .expect("没做相对化 —— 「复制相对路径」给出的其实是绝对路径");
+        let arm = &body[at..];
+        let none_at = arm.find("None => {").expect("相对化失败那一支没了");
+        let push_at = arm.find("out.push(").unwrap_or(usize::MAX);
+        assert!(
+            push_at < none_at,
+            "相对化失败那一支里还在往结果里塞东西 —— 半相对半绝对的一行\
+             粘进 shell 会执行成功,只是有几条打到了别的目录去"
+        );
+        assert!(
+            arm[none_at..].contains("return;"),
+            "相对化失败没有整次放弃 —— 理由同上"
+        );
+        // 写的是**系统**剪贴板(一行字),不是 F220 那个待粘贴的文件列表。
+        assert!(
+            body.contains("self.clipboard") && !body.contains("push_clipboard_to_system"),
+            "「复制路径」写错了剪贴板 —— 走 push_clipboard_to_system 的话,\
+             别的程序会把它认成一批要搬的文件"
+        );
+    }
+
+    /// F250:基准是**属主标签**的焦点分屏,不是「当前活动标签」的。
+    ///
+    /// 落回活动标签的症状在单标签下完全看不出来(两者恒等),多标签时才
+    /// 现形:在标签 A 的面板上右键复制相对路径,基准却是标签 B 的分屏
+    /// 所在目录 —— 拼出来的路径指向另一台机器上的另一个地方。这跟
+    /// `apply_remote_file_action`/`handle_panel_key` 那条既有约定同源。
+    ///
+    /// 自证会变红:把 `by_generation(generation)` 换成 `active()`。
+    #[test]
+    fn the_relative_base_comes_from_the_owning_tab_not_whichever_one_is_active() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let after = production
+            .split("fn copy_paths_to_clipboard")
+            .nth(1)
+            .expect("缺 copy_paths_to_clipboard");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            body.contains("by_generation(generation)") && !body.contains(".active()"),
+            "相对路径的基准落回了活动标签 —— 单标签下完全看不出来,\
+             多标签时会拿另一个标签的分屏目录当基准"
+        );
     }
 
     /// F249 接线守护:远端路径条敲进来的一串,**末段可能是文件**,必须先
