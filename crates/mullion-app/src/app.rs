@@ -413,6 +413,39 @@ pub struct PlannedJob {
     remote: mullion_ssh::sftp::RemotePath,
     total: u64,
     label: String,
+    /// F252:传完之后要点亮的那一条 —— `(落进哪个目录, 叫什么名字)`。
+    ///
+    /// 记的是**用户点中的那一条**(顶层),不是展开后的叶子:拖进来一个目录,
+    /// 该亮的是那个目录本身,而不是它里面几百个文件(而且那几百个根本不在
+    /// 当前这一屏里)。所以一次展开出来的所有 job 带的是**同一份**。
+    arrival: (mullion_ssh::sftp::RemotePath, mullion_ssh::sftp::RemotePath),
+}
+
+/// F252:这一条传完之后该在哪儿点亮它。上传落远端栏的当前目录,下载落本地栏的。
+///
+/// 抽成纯函数是因为它是这一路上唯一「两个目录都在手边、写反了不报错」的地方
+/// —— 反了的症状是高亮**静默不出现**,跟「传输本来就失败了」在界面上一模一样。
+/// F252:`PlannedJob::arrival` 的待填占位。**唯一的填法**是 `plan_transfer`
+/// 在展开完这一条 pick 之后统一回填 —— 那里才知道用户点中的是哪一条。
+///
+/// 名字取成「还没有」是想让漏填的地方读起来就不对劲:占位留着的话,标记
+/// 的落点是空目录,对不上任何一栏的位置,高亮静默不出现。
+fn no_arrival_yet() -> (mullion_ssh::sftp::RemotePath, mullion_ssh::sftp::RemotePath) {
+    let empty = || mullion_ssh::sftp::RemotePath::from_bytes(Vec::new());
+    (empty(), empty())
+}
+
+fn arrival_of(
+    dir: crate::files::queue::Direction,
+    name: &mullion_ssh::sftp::RemotePath,
+    remote_cwd: &mullion_ssh::sftp::RemotePath,
+    local_cwd: &mullion_ssh::sftp::RemotePath,
+) -> (mullion_ssh::sftp::RemotePath, mullion_ssh::sftp::RemotePath) {
+    let landing = match dir {
+        crate::files::queue::Direction::Upload => remote_cwd,
+        crate::files::queue::Direction::Download => local_cwd,
+    };
+    (landing.clone(), name.clone())
 }
 
 /// 一条传输的全部输入。**冲突处置后重跑读的是同一份** —— 重新算一遍的话
@@ -424,6 +457,9 @@ struct TransferSpec {
     generation: u64,
     local: std::path::PathBuf,
     remote: mullion_ssh::sftp::RemotePath,
+    /// F252:传完点亮哪一条。**计划那一刻就冻在这里**,收工时只照抄 ——
+    /// 传输可以跑很久,那时用户早换目录了(T11)。
+    arrival: (mullion_ssh::sftp::RemotePath, mullion_ssh::sftp::RemotePath),
 }
 
 /// 一次在途自动化的把手。三条通道都是 `Option`,因为每一条都是**一次性边**:
@@ -1390,6 +1426,10 @@ async fn plan_transfer(
     use crate::files::queue::Direction;
     let mut out = Vec::new();
     for (name, is_dir, size) in picked {
+        // F252:这一条展开出来的所有 job 共用同一个落点标记 —— 该亮的是用户
+        // 点中的那一条,不是它里面那几百个叶子。`first_of_this_pick` 之后的
+        // 都是它的后代。
+        let first_of_this_pick = out.len();
         match dir {
             Direction::Download => {
                 let remote = remote_cwd.join(name.as_bytes());
@@ -1412,6 +1452,10 @@ async fn plan_transfer(
                     out.push(upload_job(&local, &[], remote_cwd, name, *size));
                 }
             }
+        }
+        let arrival = arrival_of(dir, name, remote_cwd, local_cwd);
+        for j in &mut out[first_of_this_pick..] {
+            j.arrival = arrival.clone();
         }
     }
     if dir == Direction::Upload {
@@ -1458,6 +1502,7 @@ fn download_job(
         remote,
         total: size,
         label,
+        arrival: no_arrival_yet(),
     })
 }
 
@@ -1505,6 +1550,7 @@ fn upload_job(
         remote,
         total: size,
         label,
+        arrival: no_arrival_yet(),
     }
 }
 
@@ -5256,6 +5302,8 @@ impl App {
         }
         let result = local::list_dir(&local::to_path(&target));
         files.local.accept(seq, result);
+        // F252:**在 `accept` 之后** —— 传完那一次刷新正是要点亮的那一次。
+        self.drop_stale_arrival_marks(generation, crate::files::PanelColumn::Local);
         mark_ui_dirty!(self.ui_dirty);
     }
 
@@ -7434,6 +7482,41 @@ impl App {
         self.request_ui_redraw();
     }
 
+    /// F252:这一栏的活全干完了就把「刚传进来」的标记收掉。
+    ///
+    /// **现算,不靠计数**:计数器要在每个入口 +1、每个出口 -1,而出口有成功、
+    /// 失败、冲突跳过、用户取消,还有 `wind_down` 直接 `abort()` —— 那一条的
+    /// `TransferDone` 永远不会抵达(T11)。漏掉任一条就永久卡住,那一栏的高亮
+    /// 再也不灭。队列自己就是真值,问它一句便宜又不会走样。
+    ///
+    /// 调用点必须排在「收下目录列表」**之后**:传完那一次刷新正是要点亮的
+    /// 那一次,先清就等于传完永远看不到高亮。
+    fn drop_stale_arrival_marks(
+        &mut self,
+        generation: u64,
+        column: crate::ui::files_panel::PanelColumn,
+    ) {
+        use crate::files::queue::Direction;
+        use crate::ui::files_panel::PanelColumn;
+        let dir = match column {
+            PanelColumn::Local => Direction::Download,
+            PanelColumn::Remote => Direction::Upload,
+        };
+        if self.transfer.queue.still_busy(generation, dir) {
+            return;
+        }
+        if let Some(files) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.files_panel_mut())
+        {
+            match column {
+                PanelColumn::Local => files.local.arrival_marks.clear(),
+                PanelColumn::Remote => files.remote.arrival_marks.clear(),
+            }
+        }
+    }
+
     /// S1:`UserEvent::SftpListed` 同样按世代查属主标签。`seq` 对不上
     /// (用户点得比网络快时的后发先至)丢弃 —— `Ok` 分支复用
     /// `PaneState::accept` 内部的判据,`Err` 分支手工复一份同款判据,理由
@@ -7544,6 +7627,8 @@ impl App {
         } else {
             log::debug!(target: "mullion", "丢弃过期世代 {generation} 的目录列表(seq={seq})");
         }
+        // F252:**在 `accept` 之后** —— 传完那一次刷新正是要点亮的那一次。
+        self.drop_stale_arrival_marks(generation, crate::files::PanelColumn::Remote);
         mark_ui_dirty!(self.ui_dirty);
         self.request_ui_redraw();
     }
@@ -11094,6 +11179,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     generation,
                                     local: p.local,
                                     remote: p.remote,
+                                    arrival: p.arrival,
                                 },
                             );
                         }
@@ -11119,6 +11205,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
                 if let Some(spec) = self.transfer.specs.get(&job) {
                     let (generation, dir) = (spec.generation, spec.dir);
+                    // F252:落点在计划那一刻就冻好了(见 `TransferSpec::arrival`),
+                    // 这里**只照抄** —— 一次大传输能跑很久,收工时用户早换地方了
+                    // (T11);现读的话标记会记到一个跟这次传输无关的目录上,
+                    // 症状是那边凭空亮起一批文件。
+                    let arrival = spec.arrival.clone();
                     let column = match dir {
                         crate::files::queue::Direction::Download => {
                             crate::ui::files_panel::PanelColumn::Local
@@ -11127,6 +11218,24 @@ impl ApplicationHandler<UserEvent> for App {
                             crate::ui::files_panel::PanelColumn::Remote
                         }
                     };
+                    // 排在刷新**之前**:本地栏的刷新是**同步**的(列本机目录不
+                    // 走网络,`apply_local_file_action` 里当场 `accept`),写在
+                    // 后面的话点亮那一步早就跑完了 —— 下载方向的高亮从此永远
+                    // 不出现,而远端栏(异步)一切正常,一半的功能静默失踪。
+                    //
+                    // 标记本身不怕刷新:它是独立字段,`begin_load` 的
+                    // `clear_selection` 清的是选中集,碰不到它。
+                    if let Some(files) = self
+                        .tabs
+                        .by_generation_mut(generation)
+                        .and_then(|t| t.content.files_panel_mut())
+                    {
+                        let pane = match column {
+                            crate::ui::files_panel::PanelColumn::Local => &mut files.local,
+                            crate::ui::files_panel::PanelColumn::Remote => &mut files.remote,
+                        };
+                        pane.arrival_marks.insert(arrival);
+                    }
                     self.dispatch_panel_action_for(
                         generation,
                         column,
@@ -15034,20 +15143,21 @@ fn render_frame(
 mod tests {
     use super::{
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
-        attach_check_verdict, auto_dial_summary, automation_for_leaf, autoscroll_for_pane,
-        blink_on_at, blink_wake_at, clear_leaf_attach_intent, clip_still_matches_what_was_pasted,
-        credential_delete_error, decide_paste, dismiss_areas, dismiss_verdict, download_job,
-        draft_baseline_is_in_vault, drive_attach_checks_of, effective_focus_of, expand_tilde,
-        files_owner_generation_of, files_path_editing_of, files_start_dir, finish_password_change,
-        follow_for_clip_mode, font_px_for, has_real_action, ime_cursor_area,
-        ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
-        next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
-        paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback,
-        session_manager_dirty, should_check_attach, snapshot_tabs_of, sync_plan_of,
-        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
-        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
-        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
+        arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
+        autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
+        clip_still_matches_what_was_pasted, credential_delete_error, decide_paste, dismiss_areas,
+        dismiss_verdict, download_job, draft_baseline_is_in_vault, drive_attach_checks_of,
+        effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
+        files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
+        has_real_action, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
+        new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
+        pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, reattach_pane,
+        rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
+        snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title,
+        take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
+        wind_down, AttachCheck, AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind,
+        RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT,
+        DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -15162,6 +15272,112 @@ mod tests {
             !progress.contains("count_sftp_op"),
             "进度事件被计成了 SFTP 操作 —— 一个大文件几千条,这一列就废了"
         );
+    }
+
+    /// F252:传完之后要点亮的那一条,记在**收货那一栏的当前目录**下 ——
+    /// 上传记远端目录,下载记本地目录。
+    ///
+    /// 两个目录都在手边,写反不报错也不 panic:标记永远对不上任何一栏的
+    /// 当前位置,高亮**静默不出现**,而「传完没高亮」跟「这次传输压根没成」
+    /// 在界面上长得一模一样。
+    ///
+    /// 自证会变红:把 `arrival_of` 里两个方向的目录对调。
+    #[test]
+    fn what_just_arrived_is_recorded_against_the_receiving_columns_directory() {
+        use crate::files::queue::Direction;
+        use mullion_ssh::sftp::RemotePath;
+        let p = |s: &str| RemotePath::from_bytes(s.as_bytes().to_vec());
+        let (name, remote, local) = (p("thing"), p("/srv/data"), p("/home/me/dl"));
+        assert_eq!(
+            arrival_of(Direction::Upload, &name, &remote, &local),
+            (remote.clone(), name.clone()),
+            "上传的落点在远端栏"
+        );
+        assert_eq!(
+            arrival_of(Direction::Download, &name, &remote, &local),
+            (local, name),
+            "下载的落点在本地栏"
+        );
+    }
+
+    /// F252:标记写在那次自动刷新**之前**,而且照抄计划时冻结的那一份。
+    ///
+    /// 两条各守一个静默失效:
+    /// - **本地栏的刷新是同步的**(列本机目录不走网络,当场就 `accept`)。
+    ///   标记写在刷新之后的话,点亮那一步早已跑完 —— 下载方向的高亮从此
+    ///   永远不出现,而远端栏(异步)一切正常,一半功能静默失踪。
+    /// - 传输可以跑很久,收工那一刻用户早换了目录。读当下位置的话,标记会
+    ///   记在一个跟这次传输毫无关系的目录上,症状是**那边凭空亮起一批文件**
+    ///   (T11 那一族)。
+    ///
+    /// 自证会变红:把写标记那几行挪到 `dispatch_panel_action_for` 后面,
+    /// 或者把 `spec` 里冻结的落点换成从面板现读。
+    #[test]
+    fn the_arrival_mark_is_written_before_the_refresh_and_copied_from_the_frozen_plan() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let arm = arm_of(production, "UserEvent::TransferDone { job, result }");
+        let refresh = arm
+            .find("FileAction::Refresh")
+            .expect("传完没刷新目标那一栏");
+        let mark = arm
+            .find("arrival_marks.insert(")
+            .expect("传完没记下要点亮哪一条");
+        assert!(
+            mark < refresh,
+            "标记写在刷新之后了 —— 本地栏那一路是同步刷新,点亮那一步早跑完了"
+        );
+        assert!(
+            !arm.contains(".cwd"),
+            "传输收工那一支读了面板此刻的位置 —— 传输可以跑很久,\
+             那时用户早换目录了(T11);落点必须只从计划时冻结的那份里取"
+        );
+    }
+
+    /// F252:标记的熄灭要**两栏都接**,而且都排在收下目录列表之后。
+    ///
+    /// 两栏各有一条完全不同的加载路径(远端异步走事件、本地同步当场
+    /// `accept`),只接一边的症状是那一边的高亮**永远不灭** —— 用户一小时后
+    /// 再进这个目录,还有一批文件不明不白地选中着,而删除不可逆。
+    ///
+    /// 排在 `accept` 之后是因为这一次刷新正是要点亮的那一次:先清就等于
+    /// 传完永远看不到高亮。
+    ///
+    /// 自证会变红:把任一栏的 `drop_stale_arrival_marks` 调用删掉,或者把它
+    /// 挪到那一栏 `accept` 之前。
+    #[test]
+    fn both_columns_retire_their_arrival_marks_and_only_after_the_listing_landed() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        for (func, accept_call) in [
+            ("\n    fn accept_sftp_listed(", "pane.accept(seq,"),
+            (
+                "\n    fn apply_local_file_action(",
+                "files.local.accept(seq,",
+            ),
+        ] {
+            let after = production
+                .split(func)
+                .nth(1)
+                .unwrap_or_else(|| panic!("找不到 {func}"));
+            let body = &after[..after
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("找不到 {func} 的结尾"))];
+            let accepted = body
+                .find(accept_call)
+                .unwrap_or_else(|| panic!("{func} 里找不到 {accept_call}"));
+            let retired = body
+                .find("drop_stale_arrival_marks(")
+                .unwrap_or_else(|| panic!("{func} 没有熄灭传输高亮 —— 这一栏的高亮会永远赖着"));
+            assert!(
+                accepted < retired,
+                "{func} 在收下目录列表之前就把标记清了 —— 传完永远看不到高亮"
+            );
+        }
     }
 
     // ------------------------------------------------ F18 划选自动滚动

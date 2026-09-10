@@ -160,6 +160,19 @@ pub struct PaneState {
     /// 也是序号法而不是「正在探测中」的布尔:`wind_down`/断线会直接
     /// `abort()` 在途任务(T11),标记会永久卡住、这一栏的路径条从此失效。
     probe_seq: u64,
+    /// F252:刚**传进这一栏**的那些东西 —— `(落进哪个目录, 叫什么名字)`。
+    /// 上传落远端栏、下载落本地栏,两个方向同一套。
+    ///
+    /// 存的是「目录 + 名字」而不是一条绝对路径:比对时要回答的是「它是不是
+    /// 落在我现在看的这个目录里」,拆开存的话那就是一次整串相等 —— 拼成绝对
+    /// 路径再切回来的话,本地栏的分隔符是平台的(`C:\a\b`)、远端栏是 POSIX,
+    /// 一套切法必然错一边,而错法是**静默不亮**。
+    ///
+    /// 跟 `reveal_pick` 并存、分工不同:那一个决定选中 + 光标 + 滚动,一次性;
+    /// 这一份**只追加选中**,而且要一直留到队列跑完(用户传一个大目录的途中
+    /// 完全可以切走再切回来)。清空的两个时机:队列里再没有指向这一栏的活
+    /// (`app.rs` 每次收下目录列表时现算),以及 [`PaneState::invalidate`]。
+    pub arrival_marks: std::collections::BTreeSet<(RemotePath, RemotePath)>,
 }
 
 impl PaneState {
@@ -183,6 +196,7 @@ impl PaneState {
             scroll_to: None,
             paste_seq: 0,
             probe_seq: 0,
+            arrival_marks: std::collections::BTreeSet::new(),
         }
     }
 
@@ -226,6 +240,10 @@ impl PaneState {
         // 恰好有个同名文件就会被莫名其妙地选中并滚到跟前。
         self.reveal_pick = None;
         self.scroll_to = None;
+        // F252:同理,而且比 `reveal_pick` 更要紧 —— 那一个列一次就被消费掉,
+        // 这一份是**留着的**(要撑到队列跑完),不清就会一直挂在新机器上,
+        // 撞上同名文件就莫名其妙地亮着。
+        self.arrival_marks.clear();
         self.request_seq += 1;
         // F220 复核(跨任务交叉面,F132 换节点静默剪到错误主机):这条连接
         // 要换机器了(或断线重连、连接被推倒重来),任何在这一刻**之前**
@@ -266,6 +284,10 @@ impl PaneState {
                 // 一行(见 `NewEdit` 的文档),没有「那一行没了」这回事,清掉
                 // 只会把用户正在打的字吞掉。
                 self.take_reveal_pick();
+                // F252:**排在 `take_reveal_pick` 之后** —— 那一个走的是
+                // `select_only`(清掉别的),放它前面的话,凡是同一次刷新里
+                // 既有跳转又有传输完成,刚传进来的那些会被静默清光。
+                self.take_arrival_marks();
             }
             Err(msg) => {
                 self.entries.clear();
@@ -314,6 +336,35 @@ impl PaneState {
         }
         self.select_only(&pick);
         self.scroll_to = Some(pick);
+    }
+
+    /// F252:目录刚列完 —— 把「刚传进这个目录的那些」**追加**进选中。
+    ///
+    /// 三处跟 `take_reveal_pick` 有意不同:
+    /// - **不 `take`**:标记要撑到队列跑完(传一个大目录的途中用户可以切走
+    ///   再切回来),消费掉的话第二次回来就不亮了。清空归 `app.rs`(队列空了)
+    ///   和 `invalidate`(换机器)。
+    /// - **只碰 `selected`**:光标和滚动归用户亲手要求跳转的那一条。
+    /// - **比对目录**:标记记着自己落在哪儿,别的目录里的同名文件不跟着亮。
+    ///
+    /// 隐藏开关那一句照抄 `take_reveal_pick`:传上去的 `.env` 被 `rows()`
+    /// 过滤掉的话,亮在一条画不出来的行上等于没亮。
+    fn take_arrival_marks(&mut self) {
+        let here: Vec<RemotePath> = self
+            .arrival_marks
+            .iter()
+            .filter(|(dir, _)| *dir == self.cwd)
+            .map(|(_, name)| name.clone())
+            .collect();
+        for name in here {
+            if !self.entries.iter().any(|e| e.name == name) {
+                continue;
+            }
+            if name.as_bytes().starts_with(b".") {
+                self.show_hidden = true;
+            }
+            self.selected.insert(name);
+        }
     }
 
     /// 点列头:同一列再点一次翻方向,换列则回到升序。
@@ -1334,6 +1385,136 @@ mod tests {
         assert!(
             s.selected_paths().is_empty() && s.scroll_to.is_none(),
             "新机器上的同名文件被当成上一台的跳转目标亮起来了"
+        );
+    }
+
+    /// F252:刚传进来的那些东西,在**它们落进的那个目录**里被选中。
+    ///
+    /// 传完会自动刷一次目录(`TransferDone` 那一支),而 `begin_load` 会
+    /// `clear_selection` —— 高亮只能在刷新结果落地那一刻补上,不能提前写进
+    /// `selected`(会被自己清掉)。
+    ///
+    /// 自证会变红:把 `accept` 里的 `self.take_arrival_marks()` 删掉。
+    #[test]
+    fn things_that_just_arrived_are_highlighted_once_the_directory_comes_back() {
+        let mut s = state();
+        s.arrival_marks.insert((rp("/home/u"), rp("new.bin")));
+        let seq = s.begin_load(rp("/home/u"));
+        assert!(s.accept(
+            seq,
+            Ok(vec![
+                e("old.txt", EntryKind::File),
+                e("new.bin", EntryKind::File)
+            ])
+        ));
+        assert_eq!(
+            s.selected_paths()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            vec!["new.bin".to_string()],
+            "刚传进来的那一条没亮"
+        );
+    }
+
+    /// F252:标记记着**它落进的是哪个目录**。用户传完就切走了,别的目录里
+    /// 恰好有个同名文件不该跟着亮起来。
+    ///
+    /// 这跟 `reveal_pick` 只存末段名字不同 —— 那一个是「这次列完就消费掉」
+    /// 的一次性待办,而标记要在队列跑完之前一直留着(用户可以切走再切回来),
+    /// 留着就必须认得出自己是谁家的。
+    ///
+    /// 自证会变红:把 `take_arrival_marks` 里比对目录那一句去掉。
+    #[test]
+    fn a_mark_only_lights_up_in_the_directory_it_landed_in() {
+        let mut s = state();
+        s.arrival_marks.insert((rp("/home/u"), rp("new.bin")));
+        let seq = s.begin_load(rp("/srv/elsewhere"));
+        assert!(s.accept(seq, Ok(vec![e("new.bin", EntryKind::File)])));
+        assert!(
+            s.selected_paths().is_empty(),
+            "另一个目录里的同名文件被点亮了:{:?}",
+            s.selected
+        );
+    }
+
+    /// F252:标记是**追加**选中,不抢光标、不抢滚动 —— 那两样归 F218 的
+    /// `reveal_pick`(用户亲手要求跳过去的那一条)。
+    ///
+    /// 顺序是硬的:`take_reveal_pick` 走的是 `select_only`(**清掉别的**),
+    /// 标记必须在它之后追加。反过来写的话,凡是同一次刷新里既有跳转又有
+    /// 传输完成,传进来的那些会被静默清光 —— 而这正是「粘贴完顺便跳过去」
+    /// 的日常路径。
+    ///
+    /// 自证会变红:把 `accept` 里的 `take_arrival_marks()` 挪到
+    /// `take_reveal_pick()` 前面。
+    #[test]
+    fn a_mark_is_added_to_the_selection_rather_than_replacing_the_revealed_row() {
+        let mut s = state();
+        s.arrival_marks.insert((rp("/home/u"), rp("new.bin")));
+        s.reveal_pick = Some(rp("old.txt"));
+        let seq = s.begin_load(rp("/home/u"));
+        assert!(s.accept(
+            seq,
+            Ok(vec![
+                e("old.txt", EntryKind::File),
+                e("new.bin", EntryKind::File)
+            ])
+        ));
+        assert_eq!(
+            s.selected_paths()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            vec!["new.bin".to_string(), "old.txt".to_string()],
+            "两条该都亮着:跳转那条 + 刚传进来那条"
+        );
+        assert_eq!(
+            s.cursor.as_ref().map(|c| c.display().to_string()),
+            Some("old.txt".into()),
+            "光标被标记抢走了 —— 它归用户亲手要求跳转的那一条"
+        );
+        assert_eq!(
+            s.scroll_to.as_ref().map(|c| c.display().to_string()),
+            Some("old.txt".into()),
+            "待滚动标记被抢走了"
+        );
+    }
+
+    /// F252:传进来的是隐藏文件(`.env` 这类)时顺手打开隐藏开关 ——
+    /// 同 `revealing_a_dotfile_turns_the_hidden_switch_on…` 的理由:
+    /// `rows()` 会把它过滤掉,亮在一条画不出来的行上等于没亮。
+    ///
+    /// 自证会变红:把 `take_arrival_marks` 里那句 `self.show_hidden = true` 删掉。
+    #[test]
+    fn an_arrived_dotfile_turns_the_hidden_switch_on_so_it_is_actually_visible() {
+        let mut s = state();
+        s.arrival_marks.insert((rp("/home/u"), rp(".env")));
+        let seq = s.begin_load(rp("/home/u"));
+        assert!(s.accept(seq, Ok(vec![e(".env", EntryKind::File)])));
+        assert!(s.show_hidden, "隐藏开关没打开,那一条根本画不出来");
+        assert_eq!(s.selected_paths().len(), 1, "隐藏文件没亮:{:?}", s.selected);
+    }
+
+    /// F252:换机器时标记要作废 —— 同 `a_reveal_pick_does_not_survive_a_host_switch`
+    /// 的理由,那些路径说的是**另一台**上的东西。
+    ///
+    /// 标记比 `reveal_pick` 更需要这一条:它是**留着的**(要撑到队列跑完),
+    /// 不像 `reveal_pick` 列一次就被消费掉。
+    ///
+    /// 自证会变红:把 `invalidate` 里的 `self.arrival_marks.clear();` 删掉。
+    #[test]
+    fn arrival_marks_do_not_survive_a_host_switch() {
+        let mut s = state();
+        s.arrival_marks.insert((rp("/home/u"), rp("same-name.txt")));
+
+        s.invalidate();
+        let seq = s.begin_load(rp("/home/u"));
+        assert!(s.accept(seq, Ok(vec![e("same-name.txt", EntryKind::File)])));
+
+        assert!(
+            s.selected_paths().is_empty(),
+            "新机器上的同名文件被当成刚传进来的亮起来了"
         );
     }
 

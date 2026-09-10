@@ -150,6 +150,17 @@ impl Queue {
 
     /// 放行一批可以起跑的 job,并把它们就地置成 `Running`。
     /// **同一个 id 不会被放行两次** —— 状态已经改掉了。
+    /// F252:这个标签的这个方向上,还有没收尾的活吗。
+    ///
+    /// 判据是**没收尾**而不是「存在」:收了尾的 job 还留在队列里给用户看
+    /// 结果(`clear_finished` 之前不走),按「存在」算的话「传输完成的高亮」
+    /// 就永远等不到熄灭的时机。
+    pub fn still_busy(&self, generation: u64, dir: Direction) -> bool {
+        self.jobs
+            .iter()
+            .any(|j| j.generation == generation && j.dir == dir && !j.state.is_finished())
+    }
+
     pub fn take_runnable(&mut self) -> Vec<u64> {
         let running = self
             .jobs
@@ -363,6 +374,48 @@ mod tests {
 
     fn conflict() -> Result<(), String> {
         Err(JobError::Conflict.into())
+    }
+
+    /// F252:「这一栏还有活没干完吗」—— 判据是**没收尾的** job,不是「有没有
+    /// job」。
+    ///
+    /// 传输完成的高亮靠它决定活到什么时候:最后一条完成时 `finish` 已经把
+    /// 那条标成收尾,紧接着那次刷新点亮完就该收工。按「有没有 job」算的话,
+    /// 队列在 `clear_finished` 之前永远是忙的,高亮就一直留着 —— 用户过一小时
+    /// 再进这个目录,还有一批文件不明不白地选中着,而删除是不可逆的。
+    ///
+    /// 自证会变红:把 `still_busy` 里的 `!j.state.is_finished()` 去掉。
+    #[test]
+    fn a_column_counts_as_busy_only_while_something_there_is_still_unfinished() {
+        let mut q = q();
+        let id = q.push(job(Direction::Upload));
+        assert!(q.still_busy(7, Direction::Upload), "刚入队就说不忙");
+        q.finish(id, Ok(()));
+        assert!(
+            !q.still_busy(7, Direction::Upload),
+            "唯一一条已经收尾了还说忙 —— 高亮会永久留着"
+        );
+    }
+
+    /// F252:另一栏 / 另一个标签的活不算数。
+    ///
+    /// 两条路由键都要认:方向决定落哪一栏(上传→远端、下载→本地),世代决定
+    /// 落哪个标签。少认一条的症状是「A 标签在下载,B 标签的高亮跟着一直不灭」。
+    ///
+    /// 自证会变红:把 `still_busy` 里的 `j.dir == dir` 或 `j.generation == generation`
+    /// 任一条去掉。
+    #[test]
+    fn work_in_another_column_or_another_tab_does_not_keep_this_one_busy() {
+        let mut q = q();
+        q.push(job(Direction::Download)); // 同标签,另一栏
+        q.push(NewJob {
+            generation: 99, // 另一个标签
+            ..job(Direction::Upload)
+        });
+        assert!(
+            !q.still_busy(7, Direction::Upload),
+            "别处的活把这一栏也算成忙的了"
+        );
     }
 
     #[test]
