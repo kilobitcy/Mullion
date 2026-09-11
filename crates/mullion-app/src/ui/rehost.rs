@@ -639,6 +639,25 @@ mod tests {
         assert_eq!(got, vec![2, 3, 4], "取最近 3 条,按时间倒序");
     }
 
+    /// 同刻的两条按 **id 升序**兜底,**不能靠 `sort_by` 的稳定性** —— 靠稳定性
+    /// 的话顺序就取决于入参次序,而入参次序来自磁盘上 `[[session]]` 的书写
+    /// 顺序,用户手改一次配置文件这一段就重排了。
+    ///
+    /// 判据造成:入参次序**故意**与 id 升序相反(先 9 后 7)。两条时间戳完全
+    /// 相同,所以时间那一档比下来是平手,只剩兜底那一档说话 —— 靠稳定性的
+    /// 实现会原样吐出 `[9, 7]`。
+    ///
+    /// 自证会变红:把 `recent` 里 `.then(a.id.0.cmp(&b.id.0))` 整段删掉。
+    #[test]
+    fn two_sessions_connected_at_the_same_moment_fall_back_to_id_not_to_file_order() {
+        let all = vec![
+            sess(9, "后建的", Some("2026-09-04T00:00:00Z")),
+            sess(7, "先建的", Some("2026-09-04T00:00:00Z")),
+        ];
+        let got: Vec<u64> = recent(&all, "").iter().map(|r| r.id.0).collect();
+        assert_eq!(got, vec![7, 9], "同刻按 id 升序,不是按它们在文件里的次序");
+    }
+
     /// 从没连过的会话不进这一段 —— 那一段的名字就叫「最近连过」。
     #[test]
     fn a_session_never_connected_is_not_in_the_recent_section() {
