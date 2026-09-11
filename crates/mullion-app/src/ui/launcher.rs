@@ -182,13 +182,15 @@ mod tests {
         }
     }
 
-    /// 列表顺序**复用** `by_recent_access`(最近访问的在最上面)。
+    /// 列表顺序**复用** `project_list::rows`(内部按 `segment_order`/
+    /// `newest_first` 排序,最近访问的在最上面)——`show()` 里调的就是它
+    /// (见本文件 `show()` 里 `crate::ui::project_list::rows(..)` 那一行)。
     ///
     /// 自己再写一遍排序的话,项目管理器左栏和这里会给出两个顺序 —— 而这
     /// 两个列表用户几分钟内就会都看到一遍。
     ///
-    /// 自证会变红:把 `for p in by_recent_access(projects)` 换成
-    /// `for p in projects`。
+    /// 自证会变红:把 `project_list.rs` 里 `newest_first` 的
+    /// `y.cmp(x)` 改成 `x.cmp(y)`(比较方向反过来,最近访问的排到最后面)。
     #[test]
     fn the_launcher_puts_the_most_recently_used_project_first() {
         let ps = vec![
@@ -411,6 +413,12 @@ mod tests {
     /// 这种情况)会把搜索框那份也算进去,平白多算一条。改用 `read_response`
     /// 查每个项目那一行的 id 有没有被 `ui.interact` 过 —— 那才是「这一行
     /// 存在」的真凭据,姿态同 `project_pick::tests` 的 `draw`。
+    ///
+    /// **`read_response` 必须在 `ctx.run` 的闭包内部调用,在 `show(...)` 之后
+    /// 立刻读。** `run()` 返回之后再读,拿到的是上上一帧(N-2)的陈旧记录 ——
+    /// 原理和实测数字见 `session_manager/mod.rs:2448` 那条注释(`this_pass`/
+    /// `prev_pass` 在 `end_pass` 里 `mem::swap`,`read_response` 优先命中
+    /// `this_pass`,在闭包外读到的其实是 swap 之前的旧值)。
     fn names_drawn(projects: &[ProjectRecord], query: &str) -> Vec<String> {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
@@ -420,6 +428,7 @@ mod tests {
         };
         let lamps = std::collections::BTreeMap::new();
         let sessions = vec![sess(7, "web01")];
+        let mut drawn = Vec::new();
         for _ in 0..2 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 show(
@@ -431,16 +440,17 @@ mod tests {
                     &sessions,
                     &crate::ui::badge::AppearanceCache::default(),
                 );
+                drawn = projects
+                    .iter()
+                    .filter(|p| {
+                        ctx.read_response(crate::ui::project_row::row_id("launcher", p.id))
+                            .is_some()
+                    })
+                    .map(|p| p.name.clone())
+                    .collect();
             });
         }
-        projects
-            .iter()
-            .filter(|p| {
-                ctx.read_response(crate::ui::project_row::row_id("launcher", p.id))
-                    .is_some()
-            })
-            .map(|p| p.name.clone())
-            .collect()
+        drawn
     }
 
     /// 收全部画出来的文字、拼成一句话 —— 用来断言空态文案。

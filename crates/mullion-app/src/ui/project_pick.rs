@@ -296,6 +296,12 @@ mod tests {
     /// 就是这种情况)会把搜索框那份也算进去,平白多算一条。改用
     /// `read_response` 查每个项目那一行的 id 有没有被 `ui.interact` 过 ——
     /// 姿态同 `launcher::tests::names_drawn`。
+    ///
+    /// **`read_response` 必须在 `ctx.run` 的闭包内部调用,在 `show(...)` 之后
+    /// 立刻读。** `run()` 返回之后再读,拿到的是上上一帧(N-2)的陈旧记录 ——
+    /// 原理和实测数字见 `session_manager/mod.rs:2448` 那条注释(`this_pass`/
+    /// `prev_pass` 在 `end_pass` 里 `mem::swap`,`read_response` 优先命中
+    /// `this_pass`,在闭包外读到的其实是 swap 之前的旧值)。
     fn names_drawn(projects: &[ProjectRecord], query: &str) -> Vec<String> {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
@@ -305,6 +311,7 @@ mod tests {
             pane: PaneId(7),
             filter: query.to_string(),
         });
+        let mut drawn = Vec::new();
         for time in [0.0_f64, 1.0] {
             let _ = ctx.run(
                 egui::RawInput {
@@ -322,17 +329,18 @@ mod tests {
                         &crate::ui::badge::AppearanceCache::default(),
                         Some(pane()),
                     );
+                    drawn = projects
+                        .iter()
+                        .filter(|p| {
+                            ctx.read_response(crate::ui::project_row::row_id("pick", p.id))
+                                .is_some()
+                        })
+                        .map(|p| p.name.clone())
+                        .collect();
                 },
             );
         }
-        projects
-            .iter()
-            .filter(|p| {
-                ctx.read_response(crate::ui::project_row::row_id("pick", p.id))
-                    .is_some()
-            })
-            .map(|p| p.name.clone())
-            .collect()
+        drawn
     }
 
     /// 跑两帧,把弹窗画出来的全部文字收上来。姿态同 `launcher::tests::texts_with`。
@@ -432,9 +440,11 @@ mod tests {
         assert!(draft.is_none(), "选完了弹窗还开着");
     }
 
-    /// 顺序**复用** `by_recent_access`,与 launcher 列表、项目管理器左栏一致。
+    /// 顺序**复用** `project_list::rows`(内部按 `segment_order`/
+    /// `newest_first` 排序),与 launcher 列表、项目管理器左栏一致。
     ///
-    /// 自证会变红:把 `by_recent_access(projects)` 换成 `projects.iter()`。
+    /// 自证会变红:把 `project_list.rs` 里 `newest_first` 的
+    /// `y.cmp(x)` 改成 `x.cmp(y)`(比较方向反过来,最近访问的排到最后面)。
     #[test]
     fn the_list_puts_the_most_recently_used_project_first() {
         let ps = some_projects();
