@@ -19,8 +19,12 @@ use crate::theme::{self, Theme};
 /// 列表里一行的 id。**必须是稳定的、按会话主键推出来的** —— 由 egui 自动
 /// 分配的话,「点第 N 行」在测试里就只能靠猜坐标,而这个弹窗唯一的功能就是
 /// 「点对行」。
-fn row_id(id: SessionId) -> egui::Id {
-    egui::Id::new(("rehost_row", id.0))
+///
+/// `salt` 区分「最近连过」段与主段(F258):主段不去重,同一条会话可能在
+/// 两段各画一次,不带 salt 的话两处 id 相同,egui 会让其中一段整段点不动
+/// 且不报错(形状同 `project_row::row_id`——项目也要在三处列表里各画一次)。
+fn row_id(salt: &'static str, id: SessionId) -> egui::Id {
+    egui::Id::new(("rehost_row", salt, id.0))
 }
 
 /// 弹窗那块 `Area` 的 id。`show` 与测试都从这里取(同 `pane_title::area_id`
@@ -94,10 +98,55 @@ fn visible<'a>(
         .collect()
 }
 
+/// 「最近连过」段最多列几条。
+///
+/// **3 而不是 5**:这个弹窗按 pane 定位,列表高度上限 260pt ≈ 5~6 行。
+/// 5 条最近 + 一条分隔线就把主段挤没了,用户会以为下面没东西 —— 而主段
+/// (与会话管理器左栏同序)才是"照记忆找"的那一半。
+const RECENT_N: usize = 3;
+
+/// 顶部「最近连过」段列哪几条。
+///
+/// **搜索框非空时整段收起**(设计 D11):主段不去重,两段都过滤的话,一个
+/// 五行的框里会出现两个一模一样的行 —— 短列表里的视觉重复是实打实的代价,
+/// 而"我记得最近连过某台,搜个关键字"这个动作里时间序帮不上忙(用户已经
+/// 明确知道要找谁)。
+///
+/// 从没连上过的(`last_connected_at` 为 `None`)不进这一段 —— 段名就叫
+/// 「最近连过」。一条都没有时返回空,调用方连分隔线一起不画。
+///
+/// 只收 `Protocol::Ssh`,理由同 `visible`:SFTP 节点没有 PTY,换过去只有
+/// 一块永远不出字的黑屏。
+fn recent<'a>(sessions: &'a [SessionRecord], needle: &str) -> Vec<&'a SessionRecord> {
+    if !needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<&SessionRecord> = sessions
+        .iter()
+        .filter(|r| r.connection.protocol == Protocol::Ssh)
+        .filter(|r| r.last_connected_at.is_some())
+        .collect();
+    // 时间倒序;同刻按 id 升序兜底(不能靠 sort 的稳定性,那样顺序取决于
+    // 磁盘上 `[[session]]` 的书写次序)。
+    out.sort_by(|a, b| {
+        b.last_connected_at
+            .cmp(&a.last_connected_at)
+            .then(a.id.0.cmp(&b.id.0))
+    });
+    out.truncate(RECENT_N);
+    out
+}
+
 /// 画一行。手写而不是 `ui.add(Button)`:egui 0.30 的 `Button` 没有任何
 /// 指定 id 的接口,而稳定 id 是「点对行」可测的前提(同 `pane_title` 里
 /// 那个 `small_action_button`)。
-fn row(ui: &mut egui::Ui, rec: &SessionRecord, color: Option<egui::Color32>, t: &Theme) -> bool {
+fn row(
+    ui: &mut egui::Ui,
+    rec: &SessionRecord,
+    color: Option<egui::Color32>,
+    t: &Theme,
+    salt: &'static str,
+) -> bool {
     let text = if rec.connection.host.is_empty() {
         rec.identity.name.clone()
     } else {
@@ -110,7 +159,7 @@ fn row(ui: &mut egui::Ui, rec: &SessionRecord, color: Option<egui::Color32>, t: 
     let w = ui.available_width().max(galley.size().x + 16.0);
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(w, galley.size().y + 8.0), egui::Sense::hover());
-    let resp = ui.interact(rect, row_id(rec.id), egui::Sense::click());
+    let resp = ui.interact(rect, row_id(salt, rec.id), egui::Sense::click());
     if resp.hovered() {
         ui.painter()
             .rect_filled(rect, 3.0, theme::c32(t.panel_head));
@@ -182,6 +231,7 @@ pub fn show(
                             .desired_width(field_w),
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
+                    let recents = recent(sessions, &d.filter);
                     let rows = visible(sessions, groups, &d.filter);
                     if rows.is_empty() {
                         ui.label(
@@ -193,11 +243,34 @@ pub fn show(
                         .max_height(list_h)
                         .show(ui, |ui| {
                             ui.set_min_width(field_w);
+                            // F258:「最近连过」段。放在滚动区**里面**而不是
+                            // 上面 —— 放外面的话它会占掉 `CHROME_H` 没算过的
+                            // 高度,把取消按钮顶出 pane 外,而那是这个模态
+                            // 弹窗唯一的退出口。
+                            if !recents.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("最近连过")
+                                        .size(11.0)
+                                        .color(theme::c32(t.fg_muted)),
+                                );
+                                for rec in &recents {
+                                    let color = appearance.get(rec.id).and_then(|a| {
+                                        crate::ui::badge::should_paint(a, ColorTarget::ListItem)
+                                    });
+                                    if row(ui, rec, color, t, "recent") {
+                                        action = Some(RehostAction::Pick {
+                                            pane,
+                                            session: rec.id,
+                                        });
+                                    }
+                                }
+                                ui.separator();
+                            }
                             for rec in rows {
                                 let color = appearance.get(rec.id).and_then(|a| {
                                     crate::ui::badge::should_paint(a, ColorTarget::ListItem)
                                 });
-                                if row(ui, rec, color, t) {
+                                if row(ui, rec, color, t, "main") {
                                     action = Some(RehostAction::Pick {
                                         pane,
                                         session: rec.id,
@@ -246,6 +319,18 @@ mod tests {
             sftp: Default::default(),
             last_connected_at: None,
         }
+    }
+
+    /// F258 一批「最近连过」测试共用的最简构造 —— 只关心 id/name,主机和
+    /// 协议走 `rec` 的默认值。
+    fn base_session(id: u64, name: &str) -> SessionRecord {
+        rec(id, name, "", Protocol::Ssh)
+    }
+
+    fn sess(id: u64, name: &str, connected: Option<&str>) -> SessionRecord {
+        let mut r = base_session(id, name);
+        r.last_connected_at = connected.map(str::to_string);
+        r
     }
 
     /// 测试用的「那块分屏」。刻意不占满 900×700 的窗口,也刻意不从原点起:
@@ -392,13 +477,40 @@ mod tests {
             rec(9, "db", "10.0.0.2", Protocol::Ssh),
         ];
         let mut draft = Some(RehostDraft::new(PaneId(3)));
-        let out = click(&mut draft, &sessions, row_id(SessionId(9)));
+        let out = click(&mut draft, &sessions, row_id("main", SessionId(9)));
         assert_eq!(
             out,
             Some(RehostAction::Pick {
                 pane: PaneId(3),
                 session: SessionId(9)
             })
+        );
+        assert!(draft.is_none(), "选完节点弹窗该自己关上");
+    }
+
+    /// F258 接线层守护:光是 `recent()` 测得扎实守不住「`show` 真的把这一段
+    /// 画出来、点了真的发 `Pick`」—— 上一个任务就因为这类接线没人看着被
+    /// 打回过。这里真的走一遍 `ctx.run` → 点 `row_id("recent", ..)`,而不是
+    /// 只调纯函数。
+    ///
+    /// 自证会变红:把 `show` 里「最近连过」段那个 `for` 循环里的
+    /// `action = Some(...)` 删掉(或整段 if 块删掉)—— `row_id("recent", ..)`
+    /// 在 widget 表里就查不到了,`click` 会 panic 在 `unwrap_or_else`。
+    #[test]
+    fn clicking_a_row_in_the_recent_section_reports_a_pick_too() {
+        let sessions = vec![
+            sess(7, "web", Some("2026-09-01T00:00:00Z")),
+            sess(9, "db", Some("2026-09-02T00:00:00Z")),
+        ];
+        let mut draft = Some(RehostDraft::new(PaneId(3)));
+        let out = click(&mut draft, &sessions, row_id("recent", SessionId(9)));
+        assert_eq!(
+            out,
+            Some(RehostAction::Pick {
+                pane: PaneId(3),
+                session: SessionId(9)
+            }),
+            "「最近连过」段里的行没有真的接上 action"
         );
         assert!(draft.is_none(), "选完节点弹窗该自己关上");
     }
@@ -506,5 +618,74 @@ mod tests {
             vec![SessionId(8)],
             "按地址搜不到"
         );
+    }
+
+    /// D11:顶部「最近连过」段取 **3 条**,按最后连上时间倒序。
+    ///
+    /// 3 而不是 5:弹窗按 pane 定位,列表上限 260pt ≈ 5~6 行,5 条最近 +
+    /// 分隔线就把主段挤没了 —— 用户会以为下面没东西了。
+    ///
+    /// 自证会变红:把 `RECENT_N` 改成 5。
+    #[test]
+    fn the_recent_section_takes_the_three_most_recently_connected() {
+        let all = vec![
+            sess(1, "a", Some("2026-09-01T00:00:00Z")),
+            sess(2, "b", Some("2026-09-04T00:00:00Z")),
+            sess(3, "c", Some("2026-09-03T00:00:00Z")),
+            sess(4, "d", Some("2026-09-02T00:00:00Z")),
+            sess(5, "e", None),
+        ];
+        let got: Vec<u64> = recent(&all, "").iter().map(|r| r.id.0).collect();
+        assert_eq!(got, vec![2, 3, 4], "取最近 3 条,按时间倒序");
+    }
+
+    /// 从没连过的会话不进这一段 —— 那一段的名字就叫「最近连过」。
+    #[test]
+    fn a_session_never_connected_is_not_in_the_recent_section() {
+        let all = vec![sess(1, "a", None), sess(2, "b", None)];
+        assert!(recent(&all, "").is_empty(), "一条都没连过时整段不该出现");
+    }
+
+    /// 不足 3 条就有几条画几条。
+    #[test]
+    fn fewer_than_three_recent_sessions_just_draw_what_there_is() {
+        let all = vec![
+            sess(1, "a", Some("2026-09-01T00:00:00Z")),
+            sess(2, "b", None),
+        ];
+        let got: Vec<u64> = recent(&all, "").iter().map(|r| r.id.0).collect();
+        assert_eq!(got, vec![1]);
+    }
+
+    /// D11:**搜索框非空时整段收起**。两段都过滤的话,一个五行的框里会出现两个
+    /// 一模一样的行(主段不去重),用户会以为是 bug。
+    ///
+    /// 自证会变红:把 `recent` 里那句 `if !needle.is_empty() { return Vec::new(); }`
+    /// 删掉。
+    #[test]
+    fn searching_collapses_the_recent_section_so_no_row_appears_twice() {
+        let all = vec![sess(1, "alpha", Some("2026-09-01T00:00:00Z"))];
+        assert!(
+            recent(&all, "alpha").is_empty(),
+            "搜索时「最近连过」段必须整段收起 —— 否则同一条会在框里出现两次"
+        );
+    }
+
+    /// 主段**不去重**:下半段要与左栏严格同序,挖掉几条的话「照左栏记忆找」
+    /// 那条既有决策(F130)就又破了。
+    #[test]
+    fn the_main_section_still_lists_sessions_that_are_in_the_recent_section() {
+        let all = vec![sess(1, "a", Some("2026-09-01T00:00:00Z"))];
+        let main: Vec<u64> = visible(&all, &[], "").iter().map(|r| r.id.0).collect();
+        assert_eq!(main, vec![1], "主段不许把「最近连过」里那几条挖掉");
+    }
+
+    /// 同一条会话在两段各画一次,行 id 必须不同 —— 撞 id 的话 egui 会让其中
+    /// 一段整段点不动,而**不报错**。
+    ///
+    /// 自证会变红:把 `row_id` 的 `salt` 参数去掉。
+    #[test]
+    fn the_same_session_gets_different_ids_in_the_two_sections() {
+        assert_ne!(row_id("recent", SessionId(7)), row_id("main", SessionId(7)));
     }
 }
