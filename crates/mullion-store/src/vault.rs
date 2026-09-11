@@ -881,6 +881,26 @@ impl Vault {
         }
     }
 
+    /// F257:归档 / 取消归档。`now` 由调用方给(store 不持有时钟)。
+    ///
+    /// **只改这一个字段,且不跑 `validate`** —— 同 `touch_project_accessed`:
+    /// 收起一个项目不该因为库里别处有个撞名的老项目就失败。
+    ///
+    /// 取消归档传 `false`,把键清掉(而不是写一个空串)—— `skip_serializing_if`
+    /// 才能让文件里不留痕迹,否则每个撤销过的项目都会在 TOML 里留一行
+    /// `archived_at = ""`,而 `is_none()` 判据会把它当成"还在归档"。
+    pub fn set_project_archived(
+        &mut self,
+        id: crate::project::ProjectId,
+        archived: bool,
+        now: &str,
+    ) {
+        self.sync_from_disk_if_untouched();
+        if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
+            slot.archived_at = archived.then(|| now.to_string());
+        }
+    }
+
     pub fn delete_project(&mut self, id: crate::project::ProjectId) -> Result<(), StoreError> {
         self.sync_from_disk_if_untouched();
         self.projects.retain(|p| p.id != id);
@@ -3080,6 +3100,40 @@ path = "/var/log"
         v.delete_project(id).unwrap();
         v.touch_project_accessed(id, "2026-09-08T10:00:00Z");
         assert!(v.projects().is_empty());
+    }
+
+    /// F257:归档 / 取消归档只改这一个字段,**不跑 validate** —— 理由同
+    /// `touch_project_accessed`:收起一个项目不该因为库里别处有个撞名的老项目
+    /// 就失败。真要拦,拦在保存那一刻。
+    #[test]
+    fn archiving_flips_only_the_archive_field_and_can_be_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_project("web".into(), "/srv/web".into(), "2026-09-01T00:00:00Z");
+        let before = v.projects().iter().find(|p| p.id == id).unwrap().clone();
+
+        v.set_project_archived(id, true, "2026-09-11T08:00:00Z");
+        let after = v.projects().iter().find(|p| p.id == id).unwrap();
+        assert_eq!(after.archived_at.as_deref(), Some("2026-09-11T08:00:00Z"));
+        assert_eq!(
+            crate::project::ProjectRecord {
+                archived_at: None,
+                ..after.clone()
+            },
+            before,
+            "归档只许动 archived_at 一个字段"
+        );
+
+        v.set_project_archived(id, false, "2026-09-11T09:00:00Z");
+        assert_eq!(
+            v.projects()
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .archived_at,
+            None,
+            "取消归档要把键清掉"
+        );
     }
 
     fn draft() -> SessionDraft {

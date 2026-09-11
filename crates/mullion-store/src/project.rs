@@ -577,6 +577,41 @@ created_at = "2026-09-01T00:00:00Z"
         assert_eq!(back.archived_at, None);
     }
 
+    /// D5:归档**不**释放名字。归档一个项目之后再建一个同名的,仍然要被拒。
+    ///
+    /// 反过来的方案(归档退出校验)会让**取消归档**可能撞车 —— 而归档这个功能
+    /// 的全部安全感来自"随时能撤回来"。撞车放过去就是
+    /// 「两个项目共用一个 Claude Code」,本设计里后果最严重且完全静默的错误。
+    ///
+    /// 自证会变红:在 `validate` 的 `for other in all.iter()` 上加
+    /// `.filter(|o| o.archived_at.is_none())`。
+    #[test]
+    fn archiving_a_project_does_not_free_up_its_name() {
+        let mut old = helpers::with_id(1, "web", None);
+        old.archived_at = Some("2026-09-11T08:00:00Z".into());
+        let fresh = helpers::with_id(9, "web", None);
+        assert_eq!(
+            crate::project::validate(&fresh, &[old.clone(), fresh.clone()], &[]),
+            Err(crate::project::ProjectIssue::DuplicateName { with: old.id }),
+            "归档项目仍占着项目名 —— 否则取消归档时会撞车,而那时撤不回来"
+        );
+    }
+
+    /// tmux 名同理。项目名可以不同、tmux 名撞上也一样是「共用一个 tmux」。
+    #[test]
+    fn archiving_a_project_does_not_free_up_its_tmux_name() {
+        let mut old = helpers::with_id(1, "web", Some("shared"));
+        old.archived_at = Some("2026-09-11T08:00:00Z".into());
+        let fresh = helpers::with_id(9, "另一个", Some("shared"));
+        assert!(
+            matches!(
+                crate::project::validate(&fresh, &[old, fresh.clone()], &[]),
+                Err(crate::project::ProjectIssue::TmuxNameClash { .. })
+            ),
+            "归档项目仍占着 tmux 名"
+        );
+    }
+
     // ---- F223 打开项目 = 一次性覆盖 -------------------------------------
 
     /// F223:tmux 名 sanitize 之后是空的,必须在**保存那一刻**拦下来。
