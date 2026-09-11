@@ -2363,6 +2363,83 @@ kind = "password"
         );
     }
 
+    /// 真实 v11 的 `sessions.toml`(F238 的 `icon` 已存在,F257 的 `archived_at`
+    /// 还没有)。**都不含**新字段 —— 这正是判据:补出来的必须是 `None`,不是
+    /// 解析失败,也不是丢掉整条记录。
+    const V11_ON_DISK: &str = r#"
+schema_version = 11
+
+[[session]]
+id = 1
+modified_at = "2026-08-01T00:00:00Z"
+
+[session.identity]
+name = "web"
+
+[session.connection]
+host = "192.0.2.50"
+port = 22
+protocol = "ssh"
+
+[session.auth]
+user = "ops"
+kind = "password"
+
+[[project]]
+id = 1
+name = "Mullion"
+dir = "/srv/app"
+created_at = "2026-08-01T00:00:00Z"
+"#;
+
+    /// F257 补漏:`current_schema_is_twelve`(`migrate.rs`)一类的测试只断言
+    /// `CURRENT_SCHEMA` 这个常量是 12,从没有真的喂一份 v11 文件走一遍
+    /// 「读 → 存回去」。v9→v10→v11→v12 全程零迁移代码,靠 `#[serde(default)]`
+    /// 补空 —— 机制上风险低,但这条链条本身从没被实测过。
+    ///
+    /// 最后一个断言(存回去后磁盘上是 12)尤其要紧:升号的全部意义在于
+    /// **旧客户端下次打开时被拒绝**,而不是「这次打开时我们心里觉得它是 12」。
+    /// 如果写盘那处忘了用 `CURRENT_SCHEMA`,文件会一直停在 11,拒绝机制永远
+    /// 不会启动,归档态迟早被某个旧客户端悄悄丢掉 —— 只断言常量测不出这个。
+    ///
+    /// 自证会变红(两条都实跑过,见提交说明):
+    /// 1. 把 `ProjectRecord.archived_at` 的 `#[serde(default, ...)]` 去掉
+    ///    `default` → 编译过,这条测试因 v11 文件里没有 `archived_at` 键而
+    ///    解析失败变红。
+    /// 2. 把 `sessions_toml()` 里的 `schema_version: CURRENT_SCHEMA` 硬写成
+    ///    `11` → 存回去后的断言(磁盘上应是 12)变红。
+    #[test]
+    fn a_v11_file_reads_in_and_saves_forward_to_v12_without_losing_the_archived_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sessions.toml"), V11_ON_DISK).unwrap();
+
+        let mut vault = Vault::open(dir.path().to_path_buf(), &key())
+            .expect("真实 v11 文件必须能被 Vault::open 直接读出来,不能被 UnsupportedSchema 拒绝");
+
+        assert_eq!(vault.list().len(), 1, "v11 会话不能丢");
+        assert_eq!(
+            vault.list()[0].last_connected_at,
+            None,
+            "v11 文件没有这个键,应补 None 而不是解析失败"
+        );
+
+        assert_eq!(vault.projects().len(), 1, "v11 项目不能丢");
+        assert_eq!(
+            vault.projects()[0].archived_at,
+            None,
+            "v11 文件没有 archived_at,应补 None(不是丢掉整条项目,也不是 Some(\"\"))"
+        );
+
+        // 判据 4:再存回去之后,磁盘上的 schema_version 必须是 12。
+        vault.save().expect("存回去不该失败");
+        let now = std::fs::read_to_string(dir.path().join("sessions.toml")).unwrap();
+        assert!(
+            now.contains(&format!("schema_version = {CURRENT_SCHEMA}")),
+            "存回去之后磁盘上应是当前 schema(12),否则旧客户端下次打开这份文件\
+             仍会当成 v11 静默丢字段,归档态的拒绝机制形同虚设: {now}"
+        );
+    }
+
     #[test]
     fn opening_v2_file_does_not_create_backup() {
         let dir = tempfile::tempdir().unwrap();
