@@ -572,6 +572,10 @@ impl Vault {
         rec.identity.name = clone_name(&rec.identity.name, &taken);
         rec.id = new_id;
         rec.modified_at = now_rfc3339.to_string();
+        // F258:`last_connected_at` 是用量派生字段,记的是「这条身份最后连上
+        // 的时刻」,不随身份一起复制 —— 否则一条从没连过的副本会凭空排进
+        // 「最近连过」段。深拷贝(`src.clone()`)默认会把它带过来,必须显式清空。
+        rec.last_connected_at = None;
         // 密文与非敏感部分**同进同出**。这里不 `{:?}` 打印它的任何一部分
         // (`SecretEntry` 连 Debug 都没 derive,正是为了防这个)。
         if let Some(sec) = self.secrets.get(&id.0.to_string()).cloned() {
@@ -1408,6 +1412,53 @@ mod tests {
             v.secret(src).and_then(|s| s.password.clone()),
             Some("hunter2".to_owned()),
             "源会话的凭据不该被搬走"
+        );
+    }
+
+    /// F258:克隆一条**已经连过**的会话,副本不该顶着源会话的「最近连过」——
+    /// 副本从没被拨过号,`last_connected_at` 必须是 `None`。
+    ///
+    /// `clone_session` 是 `src.clone()` 深拷贝后逐字段覆盖(id/名字/修改时间),
+    /// 新加的字段默认不在覆盖清单里,会原样跟着深拷贝走。
+    ///
+    /// 断言形状:构造一份「预期」——以 `before`(克隆前的源记录)为底,把
+    /// 克隆本就该改的三个字段(id/身份/修改时间)换成 `after` 的实际值,
+    /// `last_connected_at` 写死成 `None`,再拿它跟 `after` 整体比较。
+    /// 这样既守住「目标字段被清空」(写死的 `None` 不是抄 `after` 的值,
+    /// 抄漏了就会跟 `after` 的真实值对不上而变红),也守住「没有顺手动别的
+    /// 字段」(其余字段全部继承自 `before`,少复制/多复制一个都会不等)。
+    ///
+    /// 自证会变红:把 `clone_session` 里新加的 `rec.last_connected_at = None;`
+    /// 删掉。
+    #[test]
+    fn cloning_a_session_does_not_carry_over_when_it_last_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let src = v.add(draft_pw("prod", "hunter2"), "2026-09-08T00:00:00Z");
+        v.touch_session_connected(src, "2026-09-08T00:00:01Z");
+        let before = v.list().iter().find(|s| s.id == src).unwrap().clone();
+        assert_eq!(
+            before.last_connected_at.as_deref(),
+            Some("2026-09-08T00:00:01Z"),
+            "测试前提:源会话得是「连过」的,否则测不出「带走」这件事"
+        );
+
+        let dst = v
+            .clone_session(src, "2026-09-08T00:00:02Z")
+            .expect("克隆该成功");
+        let after = v.list().iter().find(|s| s.id == dst).unwrap().clone();
+
+        let expected = SessionRecord {
+            id: after.id,
+            identity: after.identity.clone(),
+            modified_at: after.modified_at.clone(),
+            last_connected_at: None,
+            ..before.clone()
+        };
+        assert_eq!(
+            after, expected,
+            "副本从没连过,last_connected_at 该是 None —— 且除了 id/身份/\
+             修改时间外,其余字段不该跟着变"
         );
     }
 
