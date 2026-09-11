@@ -9171,8 +9171,10 @@ impl App {
                     .unwrap_or_default();
                 store.touch_session_connected(id, &now);
                 if let Err(e) = store.save() {
-                    // 记一笔失败不该拦住连接本身 —— 只落日志,不弹错。
-                    log::warn!(target: "mullion", "记录会话连接时间失败:{e}");
+                    // 记一笔失败不该拦住连接本身 —— 只落日志,不弹错。级别与
+                    // `touch_project_accessed` 那两处对齐(`debug` 不是 `warn`):
+                    // 同一类「派生字段落盘失败」,理由也是同一句,级别不该分岔。
+                    log::debug!(target: "mullion", "记录会话连接时间失败: {e}");
                 }
             }
         }
