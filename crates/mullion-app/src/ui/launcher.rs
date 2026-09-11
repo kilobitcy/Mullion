@@ -41,16 +41,6 @@ pub fn show(
                 );
             });
             ui.add_space(SP_M);
-            if projects.is_empty() {
-                ui.vertical_centered(|ui| {
-                    ui.label(crate::theme::hint_text(
-                        t,
-                        "还没有项目。一个项目 = 一台机器上的一个目录 + 一个专属 tmux 会话;\
-                         从菜单「会话 → 项目管理器」建一个,以后开机点一下就回到现场。",
-                    ));
-                });
-                return;
-            }
             // 搜索框居中,取 M 档宽:整宽的搜索框在宽屏上拉成一条几百像素的
             // 缝,而搜索词通常只有几个字。
             //
@@ -67,19 +57,37 @@ pub fn show(
                 crate::ui::annotate::mark(ui.ctx(), "启动页/搜索框", r.rect);
             });
             ui.add_space(SP_M);
-            // 顺序**复用** `by_recent_access`、过滤**复用** `project::matches`
-            // —— 三处列表各写一份的话,同一个搜索词在两个界面给出不同结果,
-            // 而用户几分钟内就会都看到一遍。
-            let rows: Vec<&ProjectRecord> = crate::ui::project_manager::by_recent_access(projects)
-                .into_iter()
-                .filter(|p| crate::project::matches(p, &ui_state.launcher_search, sessions))
-                .collect();
-            if rows.is_empty() {
+            // F257:列什么 / 空了说什么,与另外两处列表共用 `project_list`。
+            // 启动页恒传 `Tab::Active` —— 这里是干活入口,没有 tab(设计 D3);
+            // 但搜索穿透归档,搜得到。
+            let rows = crate::ui::project_list::rows(
+                projects,
+                crate::ui::project_list::Tab::Active,
+                &ui_state.launcher_search,
+                sessions,
+            );
+            if let Some(reason) = crate::ui::project_list::empty_reason(
+                projects,
+                crate::ui::project_list::Tab::Active,
+                &ui_state.launcher_search,
+                sessions,
+            ) {
                 ui.vertical_centered(|ui| {
-                    ui.label(crate::theme::hint_text(t, "没有匹配的项目"));
-                    ui.add_space(SP_S);
-                    if ui.button("清空搜索").clicked() {
-                        ui_state.launcher_search.clear();
+                    // `hint_text(t, s: impl Into<String>)` —— 传 `String` 本身,
+                    // **不要**传 `&String`:泛型参数上不发生 deref coercion,
+                    // `&String` 不实现 `Into<String>`,那样编译不过。
+                    ui.label(crate::theme::hint_text(
+                        t,
+                        crate::ui::project_list::empty_text(
+                            reason,
+                            crate::ui::project_list::Surface::Launcher,
+                        ),
+                    ));
+                    if reason == crate::ui::project_list::EmptyReason::NoMatch {
+                        ui.add_space(SP_S);
+                        if ui.button("清空搜索").clicked() {
+                            ui_state.launcher_search.clear();
+                        }
                     }
                 });
                 return;
@@ -141,6 +149,13 @@ mod tests {
             archived_at: None,
             icon: None,
         }
+    }
+
+    /// 同 `proj`,但归了档 —— F257 测试专用。
+    fn proj_archived(id: u64, name: &str, dir: &str) -> ProjectRecord {
+        let mut p = proj(id, name, dir, None);
+        p.archived_at = Some("2026-09-01T00:00:00Z".into());
+        p
     }
 
     fn sess(id: u64, name: &str) -> SessionRecord {
@@ -357,10 +372,76 @@ mod tests {
         assert!(joined.contains("从未打开"), "没显示最后打开时间:{joined}");
     }
 
+    /// 启动页默认只列「在用」的 —— 归档项目在干活入口里不该碍事(设计 D3)。
+    /// 但**搜得到**:搜索穿透归档(设计 D4)。
+    ///
+    /// 自证会变红:把 `Tab::Active` 换成把 `projects` 直接喂给 `project_row`。
+    #[test]
+    fn the_launcher_hides_archived_projects_until_you_search_for_them() {
+        let ps = vec![
+            proj_archived(1, "老活", "/data/old"),
+            proj(2, "在做的", "/data/now", None),
+        ];
+        assert_eq!(names_drawn(&ps, ""), vec!["在做的"], "归档的不该默认出现");
+        assert_eq!(names_drawn(&ps, "老活"), vec!["老活"], "搜索必须能搜到归档的");
+    }
+
+    /// 库里有项目、只是全归档了 —— 启动页不能喊「还没有项目,去建一个」。
+    #[test]
+    fn a_launcher_with_only_archived_projects_does_not_tell_you_to_create_one() {
+        let ps = vec![proj_archived(1, "老活", "/data/old")];
+        let text = drawn_text(&ps, "");
+        assert!(text.contains("没有在用的项目"), "{text}");
+        assert!(!text.contains("还没有项目"), "{text}");
+    }
+
     /// 跑两帧收文字。**两帧**:`CentralPanel` 首帧 `fade_in` 只记
     /// `Shape::Noop`(同 `restored` / `files_panel` 那边)。
     fn texts(projects: &[ProjectRecord]) -> Vec<String> {
         texts_with(projects, "")
+    }
+
+    /// 哪些项目的行**真被画出来了**——不靠比对画出来的文字:搜索框里的字
+    /// 本身也是一段 `Shape::Text`,查询词恰好等于项目名时(本文件的
+    /// `the_launcher_hides_archived_projects_until_you_search_for_them` 就是
+    /// 这种情况)会把搜索框那份也算进去,平白多算一条。改用 `read_response`
+    /// 查每个项目那一行的 id 有没有被 `ui.interact` 过 —— 那才是「这一行
+    /// 存在」的真凭据,姿态同 `project_pick::tests` 的 `draw`。
+    fn names_drawn(projects: &[ProjectRecord], query: &str) -> Vec<String> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState {
+            launcher_search: query.to_string(),
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let sessions = vec![sess(7, "web01")];
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    projects,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                );
+            });
+        }
+        projects
+            .iter()
+            .filter(|p| {
+                ctx.read_response(crate::ui::project_row::row_id("launcher", p.id))
+                    .is_some()
+            })
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// 收全部画出来的文字、拼成一句话 —— 用来断言空态文案。
+    fn drawn_text(projects: &[ProjectRecord], query: &str) -> String {
+        texts_with(projects, query).join(" ")
     }
 
     /// 同上,但先把搜索词填进 `launcher_search`。

@@ -120,23 +120,24 @@ pub fn show(
                             .desired_width(field_w),
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
-                    // 顺序复用 `by_recent_access` —— 与 launcher 列表、项目
-                    // 管理器左栏同一个函数。
-                    let rows: Vec<_> = crate::ui::project_manager::by_recent_access(projects)
-                        .into_iter()
-                        // 判据**复用** `crate::project::matches` —— 另外两处
-                        // 列表用的是同一个函数。各写一份的话,同一个搜索词在
-                        // 两个界面给出不同结果。原来这里那份私有实现只查
-                        // name/dir,搜机器名一条都搜不到。
-                        .filter(|p| crate::project::matches(p, &d.filter, sessions))
-                        .collect();
-                    if rows.is_empty() {
+                    // F257:同 launcher —— 恒 `Tab::Active`,搜索穿透归档。
+                    let rows = crate::ui::project_list::rows(
+                        projects,
+                        crate::ui::project_list::Tab::Active,
+                        &d.filter,
+                        sessions,
+                    );
+                    if let Some(reason) = crate::ui::project_list::empty_reason(
+                        projects,
+                        crate::ui::project_list::Tab::Active,
+                        &d.filter,
+                        sessions,
+                    ) {
                         ui.label(
-                            egui::RichText::new(if projects.is_empty() {
-                                "还没有项目。从「会话 → 项目管理器」建一个。"
-                            } else {
-                                "没有匹配的项目"
-                            })
+                            egui::RichText::new(crate::ui::project_list::empty_text(
+                                reason,
+                                crate::ui::project_list::Surface::Pick,
+                            ))
                             .color(theme::c32(t.fg_muted)),
                         );
                     }
@@ -239,11 +240,29 @@ mod tests {
         }
     }
 
+    /// 同 `proj`,但归了档 —— F257 测试专用。
+    fn proj_archived(id: u64, name: &str, dir: &str) -> ProjectRecord {
+        let mut p = proj(id, name, dir, None);
+        p.archived_at = Some("2026-09-01T00:00:00Z".into());
+        p
+    }
+
     fn some_projects() -> Vec<ProjectRecord> {
         vec![
             proj(1, "老活", "/srv/old", Some("2026-09-01T00:00:00Z")),
             proj(2, "昨天的活", "/srv/api", Some("2026-09-07T00:00:00Z")),
         ]
+    }
+
+    /// 切换项目弹窗同上:默认只列在用的,搜索穿透归档。
+    #[test]
+    fn the_pick_popup_hides_archived_projects_until_you_search_for_them() {
+        let ps = vec![
+            proj_archived(1, "老活", "/data/old"),
+            proj(2, "在做的", "/data/now", None),
+        ];
+        assert_eq!(names_drawn(&ps, ""), vec!["在做的"]);
+        assert_eq!(names_drawn(&ps, "老活"), vec!["老活"]);
     }
 
     /// 切换弹窗的行也要带最后打开时间(F234)—— 这个弹窗回答的问题和启动页
@@ -269,6 +288,51 @@ mod tests {
         p.nodes = vec![SessionId(7)];
         let joined = pick_texts(&[p], "web01").join(" ");
         assert!(joined.contains("接口"), "按节点名搜不到:{joined}");
+    }
+
+    /// 哪些项目的行**真被画出来了**——不靠比对画出来的文字:搜索框里的字
+    /// 本身也是一段 `Shape::Text`,查询词恰好等于项目名时(下面
+    /// `the_pick_popup_hides_archived_projects_until_you_search_for_them`
+    /// 就是这种情况)会把搜索框那份也算进去,平白多算一条。改用
+    /// `read_response` 查每个项目那一行的 id 有没有被 `ui.interact` 过 ——
+    /// 姿态同 `launcher::tests::names_drawn`。
+    fn names_drawn(projects: &[ProjectRecord], query: &str) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let lamps = std::collections::BTreeMap::new();
+        let sessions = vec![node_session()];
+        let mut draft = Some(ProjectPickDraft {
+            pane: PaneId(7),
+            filter: query.to_string(),
+        });
+        for time in [0.0_f64, 1.0] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..base_input()
+                },
+                |ctx| {
+                    show(
+                        ctx,
+                        &MULLION_DARK,
+                        &mut draft,
+                        projects,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                        Some(pane()),
+                    );
+                },
+            );
+        }
+        projects
+            .iter()
+            .filter(|p| {
+                ctx.read_response(crate::ui::project_row::row_id("pick", p.id))
+                    .is_some()
+            })
+            .map(|p| p.name.clone())
+            .collect()
     }
 
     /// 跑两帧,把弹窗画出来的全部文字收上来。姿态同 `launcher::tests::texts_with`。
