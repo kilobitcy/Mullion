@@ -2431,6 +2431,20 @@ struct DialTicket {
     /// `ConnectOk` 抵达时拿它盖掉会话那份更泛的 `SftpPrefs.default_remote`
     /// —— 项目是更具体的上下文(同 `dial_project` 走换节点那条路的处置)。
     project_dir: Option<String>,
+    /// F258:这次拨号是不是**用户当帧的动作**发起的。
+    ///
+    /// 只有它为真时,`ConnectOk` 才往 `last_connected_at` 记一笔。
+    ///
+    /// **随票走而不是在 `ConnectOk` 里猜来源**:猜的写法是列举式门控,
+    /// 加一条新的拨号入口就会漏,漏了的症状是「某条路径连上之后顺序不更新」,
+    /// 静默。同 `skip_automation` 装进票的理由。
+    ///
+    /// 传 `false` 的只有一处:`advance_auto_dial` 驱动的启动批量重连
+    /// —— 一口气重连 N 条会让它们拿到几乎相同的时间戳,把昨天攒下的先后
+    /// 顺序整体抹平。用户在占位标签上**手点**「重连」不走那条队列,照记。
+    ///
+    /// F128 断线自愈不经过这里(它走 `spawn_reconnect`,不发票),天然不记。
+    user_initiated: bool,
 }
 
 /// F40~F44/F141:一次「点连接」在**那一帧**算好、等 `ConnectOk` 抵达时
@@ -3020,7 +3034,8 @@ impl App {
         // CLI 直连(路径①)→ 立刻发起连接,进终端态。
         if let Some(cfg) = self.initial.take() {
             // CLI 直连恒是终端态——这条路径没有会话记录可查协议字段。
-            self.spawn_connect(cfg, false, None, false, None);
+            // F258:CLI 直连是命令行这一次调用发起的,算用户动作。
+            self.spawn_connect(cfg, false, None, false, None, true);
             return;
         }
         // F148 D9:无参启动 → 有历史就先给恢复列表,没有就照旧弹会话管理器。
@@ -3694,7 +3709,11 @@ impl App {
     /// 「等 `ConnectOk`/`ConnectErr` 回来推进」和「压根不会有事件回来,当场
     /// 记一笔失败接着试下一条」—— 缺凭据 / 库没打开时这个函数直接 return,
     /// 不返回这个真值的话队列会永远等一个不来的事件。
-    fn reconnect_tab(&mut self, tab_id: shell::tabs::TabId) -> bool {
+    ///
+    /// F258:`user_initiated` 原样透传给 `spawn_connect` 装进票——它自己
+    /// 不猜「谁在调我」。`advance_auto_dial` 驱动的启动批量重连传 `false`,
+    /// 其余(手点「重连」)传 `true`。
+    fn reconnect_tab(&mut self, tab_id: shell::tabs::TabId, user_initiated: bool) -> bool {
         if self.pending_restore.is_some() {
             return false;
         }
@@ -3762,7 +3781,14 @@ impl App {
         mark_ui_dirty!(self.ui_dirty);
         // F205:会话身份随票走 —— 重连是在**已经有别的连接在途**时最容易被
         // 触发的一条路径,单槽在这里被盖掉的概率最高。
-        self.spawn_connect(cfg, wants_sftp, Some(session_id), false, None);
+        self.spawn_connect(
+            cfg,
+            wants_sftp,
+            Some(session_id),
+            false,
+            None,
+            user_initiated,
+        );
         true
     }
 
@@ -3813,7 +3839,8 @@ impl App {
             color_override: None,
             content: old_content,
         });
-        let _ = self.reconnect_tab(tab_id);
+        // F258:这是用户按下的「重连」按钮,当帧动作。
+        let _ = self.reconnect_tab(tab_id, true);
     }
 
     /// F37:菜单里的「全部重连」。**一个一个来** —— `reconnect_tab` 里那道
@@ -3831,7 +3858,8 @@ impl App {
         }) else {
             return;
         };
-        let _ = self.reconnect_tab(id);
+        // F258:菜单上的「全部重连」是用户随手点的一次动作,当帧算数。
+        let _ = self.reconnect_tab(id, true);
     }
 
     /// F153:推进自动串行拨号。`outcome` = 刚结束那一条的结果
@@ -3860,7 +3888,9 @@ impl App {
                 return;
             };
             auto.tried.push(next);
-            if self.reconnect_tab(next) {
+            // F258:启动批量重连不是当帧的手动动作 —— 一口气重连 N 条会让
+            // 它们拿到几乎相同的时间戳,把昨天攒下的先后顺序整体抹平。
+            if self.reconnect_tab(next, false) {
                 self.auto_dial = Some(auto);
                 mark_ui_dirty!(self.ui_dirty);
                 return;
@@ -8996,6 +9026,7 @@ impl App {
         session_id: Option<SessionId>,
         skip_automation: bool,
         project: Option<&mullion_store::ProjectRecord>,
+        user_initiated: bool,
     ) {
         // F40~F44:此刻才确定「是哪条会话」。连接在途期间用户可能改配置甚至
         // 删会话,所以计划必须在用户点击的这一帧定死。
@@ -9045,6 +9076,7 @@ impl App {
                 skip: skip_automation,
             },
             project_dir: project.map(|p| p.dir.clone()),
+            user_initiated,
         });
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
@@ -9128,6 +9160,22 @@ impl App {
         // F205:身份与随行数据一律从**这张票**里取,不再读 `App` 上的单槽 ——
         // 单槽会被在途的第二条拨号整体盖掉(见 `shell::dial_ledger` 的文档)。
         let session_id = ticket.session_id;
+        // F258:记一笔「这条会话连上了」。判据来自**票**(设计 D10)——
+        // 在这里 `if` 猜来源的话,加一条新的拨号入口就会漏,而漏了没有任何报错。
+        //
+        // 排在 `wants_sftp` 那条 early-return **之前**:SFTP 节点也是「用过」。
+        if ticket.user_initiated {
+            if let (Some(id), Some(store)) = (session_id, self.store.as_mut()) {
+                let now = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                store.touch_session_connected(id, &now);
+                if let Err(e) = store.save() {
+                    // 记一笔失败不该拦住连接本身 —— 只落日志,不弹错。
+                    log::warn!(target: "mullion", "记录会话连接时间失败:{e}");
+                }
+            }
+        }
         let cfg = Some(ticket.cfg);
         let mut automation = ticket.automation;
         // E2:标签标题优先取会话名,退回 `user@host`(见 `tab_title`
@@ -9738,7 +9786,8 @@ impl App {
                 .set_error("项目节点必须是 SSH 会话,这条是 SFTP 节点".to_string());
             return;
         }
-        self.spawn_connect(cfg, false, Some(node), false, Some(p));
+        // F258:launcher 上点项目是用户当帧的点击。
+        self.spawn_connect(cfg, false, Some(node), false, Some(p), true);
     }
 
     #[must_use]
@@ -12851,7 +12900,8 @@ impl ApplicationHandler<UserEvent> for App {
                             // F37:占位标签上按了「重连」/菜单里按了「全部
                             // 重连」。两条走同一个 `reconnect_tab`,不分叉。
                             if let Some(id) = actions.reconnect_tab {
-                                let _ = self.reconnect_tab(id);
+                                // F258:占位标签上手点「重连」是当帧动作。
+                                let _ = self.reconnect_tab(id, true);
                             }
                             if actions.reconnect_all {
                                 self.reconnect_next_restored();
@@ -13562,7 +13612,15 @@ impl ApplicationHandler<UserEvent> for App {
                             // (从前它是 `App` 上的单槽,得靠「只在 `spawn_connect`
                             // 里写」这条约定才不会漂到另一条在途连接上)。失败支
                             // (配置坏了走 Err)压根不发票,自然也带不走它。
-                            self.spawn_connect(cfg, wants_sftp, Some(id), skip_automation, None);
+                            // F258:双击行/点「连接」按钮,当帧动作。
+                            self.spawn_connect(
+                                cfg,
+                                wants_sftp,
+                                Some(id),
+                                skip_automation,
+                                None,
+                                true,
+                            );
                         }
                         Some(Err(e)) => self.ui.set_error(e.to_string()),
                         None => {}
@@ -22336,6 +22394,44 @@ mod tests {
         let second = take_next_restore_dial(&mut q, false).expect("上一条收口后该轮到第二条");
         assert_eq!(second.1, PaneId(3));
         assert_eq!(take_next_restore_dial(&mut q, false), None);
+    }
+
+    /// D10:「记一笔连上了」的判据必须来自**票**,不能在 `ConnectOk` 分支里
+    /// `if` 猜来源。
+    ///
+    /// 猜来源的写法(比如 `if self.auto_dial.is_none()`)是列举式门控 ——
+    /// 加一条新的拨号入口就会漏,而漏了的症状是「某条路径连上之后顺序不更新」,
+    /// 静默。这个库里同款缺陷已经踩过多次。
+    ///
+    /// 自证会变红:把 `ticket.user_initiated` 换成任何一个读 `self` 的判据。
+    #[test]
+    fn whether_we_record_a_connection_comes_from_the_ticket_not_from_guessing() {
+        let body = strip_comments(body_of(prod_src(), "fn accept_connect_ok("));
+        assert!(
+            body.contains("ticket.user_initiated"),
+            "记一笔的判据必须读票上的 user_initiated"
+        );
+        assert!(
+            body.contains("touch_session_connected"),
+            "ConnectOk 里要真的记这一笔"
+        );
+    }
+
+    /// 恢复现场的**批量**重连不许记 —— 一口气重连 N 条会让它们拿到几乎相同的
+    /// 时间戳,把昨天攒下的先后顺序整体抹平,且全程无报错。
+    ///
+    /// 用户在占位标签上**手点**「重连」仍然算(那是当帧动作),所以判据挂在
+    /// `advance_auto_dial` 这个**队列驱动**上,而不是 `reconnect_tab` 本身。
+    ///
+    /// 自证会变红:把 `advance_auto_dial` 里那句 `reconnect_tab(next, false)`
+    /// 的 `false` 改成 `true`。
+    #[test]
+    fn the_startup_reconnect_queue_does_not_stamp_every_session_with_the_same_time() {
+        let body = strip_comments(body_of(prod_src(), "fn advance_auto_dial("));
+        assert!(
+            body.contains("reconnect_tab(next, false)"),
+            "批量重连必须传 user_initiated=false:{body}"
+        );
     }
 
     /// D6:一台机器连不上,**只有那块 pane** 变成断开态,其余照常用。
