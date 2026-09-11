@@ -2402,10 +2402,14 @@ created_at = "2026-08-01T00:00:00Z"
     /// 如果写盘那处忘了用 `CURRENT_SCHEMA`,文件会一直停在 11,拒绝机制永远
     /// 不会启动,归档态迟早被某个旧客户端悄悄丢掉 —— 只断言常量测不出这个。
     ///
-    /// 自证会变红(两条都实跑过,见提交说明):
-    /// 1. 把 `ProjectRecord.archived_at` 的 `#[serde(default, ...)]` 去掉
-    ///    `default` → 编译过,这条测试因 v11 文件里没有 `archived_at` 键而
-    ///    解析失败变红。
+    /// 自证会变红(两条都实跑过):
+    /// 1. 单去掉 `archived_at` 的 `#[serde(default, ...)]` 里的 `default` 仍是
+    ///    **恒绿**——serde 自己对 `Option<T>` 字段有内建规则:缺键无条件按
+    ///    `None` 处理,跟有没有 `#[serde(default)]` 无关(`serde` 源码
+    ///    `private::de::missing_field` 的文档原话)。真正压得到「读出来是不是
+    ///    正确的 `None`」这个判据的,是把 `default` 换成一个返回 `Some("oops")`
+    ///    的自定义函数(`#[serde(default = "...")]`)—— 这条会让本测试的
+    ///    `archived_at, None` 断言变红。
     /// 2. 把 `sessions_toml()` 里的 `schema_version: CURRENT_SCHEMA` 硬写成
     ///    `11` → 存回去后的断言(磁盘上应是 12)变红。
     #[test]
