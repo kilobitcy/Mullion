@@ -114,6 +114,18 @@ pub fn subtitle_for_query(p: &ProjectRecord, sessions: &[SessionRecord], query: 
 /// 「从未打开」本身就是用户要的信息(尤其在按时间排序的列表里,它解释了这些
 /// 行为什么都堆在最下面)。
 pub fn time_text(p: &ProjectRecord, now: time::OffsetDateTime) -> String {
+    // F257:归档态优先。搜索穿透两态之后结果里会混着两种行,不标的话用户点开
+    // 一个归档项目却不知道它是归档的。
+    //
+    // **占用时间列而不是新加一列**:行宽在弹窗里是最紧张的资源(pane 宽度减
+    // 内边距),新加一列会把名字挤掉一截;而归档项目的「最后打开时间」本来就是
+    // 这一行上最没用的信息。
+    if let Some(at) = p.archived_at.as_deref() {
+        return format!(
+            "已归档 · {}",
+            crate::localtime::relative(at, now, crate::localtime::offset())
+        );
+    }
     match p.last_accessed_at.as_deref() {
         Some(s) => crate::localtime::relative(s, now, crate::localtime::offset()),
         None => "从未打开".to_string(),
@@ -368,6 +380,47 @@ mod tests {
     fn a_project_opened_this_morning_shows_a_relative_time() {
         let p = proj(1, "接口", "/srv/api", Some("2026-09-08T09:00:00Z"));
         assert_eq!(time_text(&p, now()), "3 小时前");
+    }
+
+    /// F257:归档项目的时间列改写「已归档 · <相对时间>」。
+    ///
+    /// 搜索穿透两态之后,结果里会混着在用的和归档的 —— 不标的话用户点开一个
+    /// 归档项目却不知道它是归档的,而「为什么它在列表里」这个问题没人回答。
+    ///
+    /// 复用**时间列**而不是新加一列:行宽是弹窗里最紧张的资源(pane 宽度减去
+    /// 内边距),新加一列会把名字挤掉一截;而归档项目的「最后打开时间」本来就是
+    /// 这一行上最没用的信息。
+    ///
+    /// 自证会变红:把 `time_text` 里的归档分支删掉。
+    #[test]
+    fn an_archived_project_says_so_in_the_time_column() {
+        let now = time::OffsetDateTime::parse(
+            "2026-09-11T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let mut p = proj(1, "老活", "/data/old", Some("2026-09-01T00:00:00Z"));
+        assert!(!time_text(&p, now).contains("归档"), "在用的项目不该说归档");
+        p.archived_at = Some("2026-09-10T12:00:00Z".into());
+        let s = time_text(&p, now);
+        assert!(s.starts_with("已归档"), "归档态要一眼看得见:{s}");
+    }
+
+    /// 归档态的时间取的是**归档时间**,不是最后打开时间 —— 两者在这条判据里
+    /// 被造成不同的相对档位,取错会红。
+    #[test]
+    fn the_archived_row_shows_when_it_was_archived_not_when_it_was_opened() {
+        let now = time::OffsetDateTime::parse(
+            "2026-09-11T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let mut p = proj(1, "老活", "/data/old", Some("2026-01-01T00:00:00Z"));
+        p.archived_at = Some("2026-09-11T11:00:00Z".into());
+        let s = time_text(&p, now);
+        let opened =
+            crate::localtime::relative("2026-01-01T00:00:00Z", now, crate::localtime::offset());
+        assert!(!s.contains(&opened), "取成了最后打开时间:{s}");
     }
 
     /// **整行**可点,不是只有那几个字可点。
