@@ -3211,6 +3211,49 @@ path = "/var/log"
         );
     }
 
+    /// F257 同形状排查:`update_project` 是**整份覆盖**
+    /// (`*slot = ProjectRecord { id, ..draft }`),不是像 `update` 那样
+    /// 逐字段赋值。它对 `archived_at` 的安全来源和 `update` 对
+    /// `last_connected_at` 的安全来源不一样:`SessionDraft` 结构上物理没有
+    /// `last_connected_at` 字段,调用方传不出错值;而这里 `draft` 的类型就是
+    /// `ProjectRecord` 本身,归档态能不能保住完全靠调用方传进来的那份 draft
+    /// 本身就带着当前的 `archived_at`。
+    ///
+    /// app 层确实这么做:`ProjectIntent::Save` 的 draft 取自
+    /// `ui_state.project_draft`,而 `project_draft` 在 `SetArchived` 之后会
+    /// 被立刻刷新成 store 里最新那份(见 `app.rs` 里
+    /// `archiving_a_project_refreshes_the_draft_shown_in_the_form` 那条源码
+    /// 切片自证)。这条测试守的是 **store 这一层的契约**:只要调用方传进来的
+    /// draft 里 `archived_at` 是对的,`update_project` 就不会把它覆盖丢——
+    /// 同 `update` 旁边 F189 的教训一样,防的是「以后有人简化实现时不小心
+    /// 漏了某个派生字段」。
+    ///
+    /// 自证会变红:在 `update_project` 里 `let next = ...` 那行之后临时加一行
+    /// `next.archived_at = None;`。
+    #[test]
+    fn saving_other_project_edits_does_not_erase_archived_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_project("web".into(), "/srv/web".into(), "2026-09-01T00:00:00Z");
+        v.set_project_archived(id, true, "2026-09-11T08:00:00Z");
+
+        let mut draft = v.projects().iter().find(|p| p.id == id).unwrap().clone();
+        draft.note = "下线了,等清理".into();
+        v.update_project(id, draft).unwrap();
+
+        let after = v.projects().iter().find(|p| p.id == id).unwrap();
+        assert_eq!(
+            after.note, "下线了,等清理",
+            "确认这次 update_project 真的改了点别的字段,不是没生效"
+        );
+        assert_eq!(
+            after.archived_at.as_deref(),
+            Some("2026-09-11T08:00:00Z"),
+            "保存别的编辑不该把 archived_at 带走 —— 否则归档态会在项目\
+             管理器里静默消失"
+        );
+    }
+
     /// F258:记一笔「连上了」只改这一个字段,不跑任何校验 —— 同
     /// `touch_project_accessed`:记一笔访问不该因为库里别处有问题就失败。
     #[test]
@@ -3232,6 +3275,48 @@ path = "/var/log"
             before,
             "记一笔连接只许动 last_connected_at —— 碰了 modified_at 的话,\
              「上次编辑」会被每次连接刷掉"
+        );
+    }
+
+    /// F258 + F189 同形状:`update` 是逐字段赋值,`last_connected_at` 不在
+    /// 赋值列表里,所以保存别的编辑不会把它带走 —— 但这只是「当前实现恰好
+    /// 挨个赋值」这一隐性不变量,没有测试守着。真正的安全来源其实还更硬一层:
+    /// `SessionDraft` 结构上根本没有 `last_connected_at` 这个字段,调用方
+    /// 物理上传不出一个过期值。
+    ///
+    /// `update` 里紧挨着的注释记着 F189 那次事故:书签就是被「整份 draft
+    /// 覆盖」坑过一次 —— 编辑器开着时收藏的目录,点一下保存就被旧快照顶掉,
+    /// 且毫无提示。`last_connected_at` 如果哪天被人「简化」成结构体展开式
+    /// 整份覆盖(`*rec = SessionRecord { id: rec.id, ..从draft重建 }` 之类),
+    /// 会复现同一种事故,而且没有任何东西会变红,只会表现成「排序不对」,
+    /// 离真根因很远。
+    ///
+    /// 自证会变红:把 `update` 里那串逐字段赋值换成结构体展开式整份覆盖,
+    /// 或退而求其次,在赋值之后临时加一行 `rec.last_connected_at = None;`。
+    #[test]
+    fn saving_other_edits_does_not_erase_last_connected_at() {
+        let (mut v, _tmp) = vault_with_one_session();
+        let id = v.list()[0].id;
+        v.touch_session_connected(id, "2026-09-11T08:00:00Z");
+        assert_eq!(
+            v.get(id).unwrap().last_connected_at.as_deref(),
+            Some("2026-09-11T08:00:00Z")
+        );
+
+        let mut d = draft_pw("renamed", "hunter2");
+        d.connection.host = "newhost".into();
+        v.update(id, d, "2026-09-11T09:00:00Z").unwrap();
+
+        let rec = v.get(id).unwrap();
+        assert_eq!(
+            rec.identity.name, "renamed",
+            "确认这次 update 真的改了点别的字段,不是没生效"
+        );
+        assert_eq!(
+            rec.last_connected_at.as_deref(),
+            Some("2026-09-11T08:00:00Z"),
+            "保存别的编辑不该把 last_connected_at 带走 —— 否则会话管理器\
+             按「最近连接」排序会静默错乱"
         );
     }
 
