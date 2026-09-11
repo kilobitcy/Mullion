@@ -237,7 +237,19 @@ pub struct AppearancePrefs {
 /// 同样**没有一行迁移转换代码**(旧文件没这个键 → `serde(default)` 补 `None`)。
 /// 升号的理由与 v10 一致:旧客户端读 v11 会把 `icon` 当未知字段丢掉再写回,
 /// **用户设的图标静默消失**。
-pub const CURRENT_SCHEMA: u32 = 11;
+///
+/// v12 = v11 + `[[project]].archived_at`:项目可归档(F257)。
+///
+/// 同样**没有一行迁移转换代码**(旧文件没这个键 → `serde(default)` 补 `None`)。
+/// 升号的理由:旧客户端读 v12 会把 `archived_at` 当未知字段丢掉再写回,
+/// **用户归档过的项目会静默回到「在用」**。
+///
+/// 这条**不能类比 `last_accessed_at`**(那个字段没有升号):`last_accessed_at`
+/// 是可再生的派生数据,下次打开项目就会被重写,丢了自愈;`archived_at` 是
+/// **用户的决定**,丢了不会自愈,而是被系统悄悄推翻。判据是「丢了能不能自己长
+/// 回来」,不是「字段形状像不像」——下次再加姿态相似的字段,先问这句,别照抄
+/// `last_accessed_at` 不升号。
+pub const CURRENT_SCHEMA: u32 = 12;
 
 fn schema_v1() -> u32 {
     1

@@ -34,8 +34,11 @@ pub struct ProjectRecord {
     pub last_accessed_at: Option<String>,
     /// F257:归档时刻(RFC3339)。`None` = 在用。
     ///
-    /// 与 `last_accessed_at` **完全同姿态**:app 注入时钟(store 不持有时钟)、
-    /// 旧文件缺键即"未归档"、未归档不写出这个键 —— 所以**不需要升 schema**。
+    /// 与 `last_accessed_at` 同姿态的部分:app 注入时钟(store 不持有时钟)、
+    /// 旧文件缺键即"未归档"、未归档不写出这个键。但**升了 schema v12**——
+    /// 理由见 `CURRENT_SCHEMA` 文档:这是用户的决定,不是像 `last_accessed_at`
+    /// 那样可再生的派生数据,旧客户端把它当未知字段丢掉再写回,会让归档
+    /// 静默失效。
     ///
     /// 为什么不是 `bool`:归档 tab 要按「什么时候归的」倒序排(刚归错的在最上面,
     /// 马上能撤)。`bool` 只能回落 `last_accessed_at`,那样"上周归档的"和"半年前
@@ -507,11 +510,12 @@ mod tests {
         assert!(f.project.is_empty());
     }
 
-    /// schema 必须升到 11:旧客户端读到 v11 会把 `[[project]].icon` 当未知
-    /// 字段丢掉再写回 —— **用户设的图标静默消失**。拒绝比装作能用好。
+    /// schema 先升到 11(F238,`[[project]].icon`),又升到 12(F257,
+    /// `[[project]].archived_at`):旧客户端读到新版本会把新增键当未知字段
+    /// 丢掉再写回 —— **用户设的图标 / 归档判断静默消失**。拒绝比装作能用好。
     #[test]
     fn the_schema_version_is_bumped_so_old_clients_refuse_instead_of_dropping_projects() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 11);
+        assert_eq!(crate::model::CURRENT_SCHEMA, 12);
     }
 
     /// F238:项目自设的图标要能原样往返。**跟着 `[[project]]` 存在一起**,

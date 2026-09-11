@@ -254,12 +254,12 @@ kind = "password"
     }
 
     /// 版本号是**故意**钉死的:动它就意味着用户的库要迁移一次,不该被
-    /// 顺手改掉。v11 的理由见 `CURRENT_SCHEMA` 文档 —— `[[project]]` 多了
-    /// `icon` 键,旧客户端读 v11 会把它当未知字段丢掉再写回,**用户设的
-    /// 图标静默消失**,拒绝比装作能用好。
+    /// 顺手改掉。v12 的理由见 `CURRENT_SCHEMA` 文档 —— `[[project]]` 多了
+    /// `archived_at` 键,旧客户端读 v12 会把它当未知字段丢掉再写回,
+    /// **用户归档过的项目会静默回到「在用」**,拒绝比装作能用好。
     #[test]
-    fn current_schema_is_eleven() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 11);
+    fn current_schema_is_twelve() {
+        assert_eq!(crate::model::CURRENT_SCHEMA, 12);
     }
 
     /// v5 的库里存的 emoji 图标**必须原样读得出来**。
