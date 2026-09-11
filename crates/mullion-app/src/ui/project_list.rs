@@ -106,8 +106,13 @@ fn archived(p: &ProjectRecord) -> bool {
 
 /// 段内顺序。归档的按归档时间倒序,在用的按最后访问倒序;都以 id 升序兜底。
 ///
-/// 两个不同档的记录走到这里时(搜索态下不可能,上面那一比已经分开了)按
-/// 在用那套算,结果无害。
+/// 注意:`key` 闭包是按**各自**的 `archived(p)` 取字段的(归档的取
+/// `archived_at`、在用的取 `last_accessed_at`),不是统一按某一套算 ——
+/// 一个不归档、一个归档时,两边其实在比"归档时间"和"最后访问"这两个不同
+/// 语义的字段,是苹果比橘子。之所以没事:当前唯一调用点 `rows` 里
+/// `archived(a).cmp(&archived(b))` 已经先把两档分了开,混档的比较**到不了**
+/// 这里。这么写清楚是为了以后有人复用 `segment_order` 时不被"结果无害"
+/// 这种说法误导,以为它对混档输入也有意义。
 fn segment_order(a: &ProjectRecord, b: &ProjectRecord) -> std::cmp::Ordering {
     let key = |p: &ProjectRecord| -> Option<String> {
         if archived(p) {
@@ -166,6 +171,13 @@ pub fn empty_reason(
 ///
 /// 三处 `NoProjects` 文案**原样沿用**各界面现有的那句(不是新写),接线时
 /// (Task 6)两句要能对上,这里就是权威来源。
+///
+/// 匹配**不用 `_` 兜底**,四档 `EmptyReason` 各自把剩下的 `Surface` 用
+/// or-pattern 显式列全:`AllArchived`/`NoMatch`/`NoArchived` 那几句文案里
+/// 带着「到「会话 → 项目管理器 → 归档」」这种**指路**,对不对得看具体是
+/// 哪个界面在问。用 `_` 的话,将来加第 4 个 `Surface` 时这三档会静默吃进
+/// 通配分支,拿到一句写着别处路径的话,没人会去审;换成 or-pattern,加一个
+/// `Surface` 变体时这四档全部编译报错,逼着把每一句文案重新过一遍。
 pub fn empty_text(reason: EmptyReason, surface: Surface) -> String {
     match (reason, surface) {
         (EmptyReason::NoProjects, Surface::Launcher) => {
@@ -183,11 +195,13 @@ pub fn empty_text(reason: EmptyReason, surface: Surface) -> String {
         (EmptyReason::AllArchived(n), Surface::Manager) => {
             format!("没有在用的项目。归档里还有 {n} 个。")
         }
-        (EmptyReason::AllArchived(n), _) => {
+        (EmptyReason::AllArchived(n), Surface::Launcher | Surface::Pick) => {
             format!("没有在用的项目。归档里还有 {n} 个 —— 到「会话 → 项目管理器 → 归档」取消归档。")
         }
-        (EmptyReason::NoMatch, _) => "没有匹配的项目".to_string(),
-        (EmptyReason::NoArchived, _) => {
+        (EmptyReason::NoMatch, Surface::Manager | Surface::Launcher | Surface::Pick) => {
+            "没有匹配的项目".to_string()
+        }
+        (EmptyReason::NoArchived, Surface::Manager | Surface::Launcher | Surface::Pick) => {
             "还没有归档任何项目。归档 = 收起不再做的活,随时能取消。".to_string()
         }
     }
@@ -371,5 +385,38 @@ mod tests {
     fn a_non_empty_list_has_no_empty_reason() {
         let ps = vec![proj(1, "在用的", None, None)];
         assert_eq!(empty_reason(&ps, Tab::Active, "", &[]), None);
+    }
+
+    /// 库里一个项目都没有时,**即使搜索框里有字**也该说「还没有项目」——
+    /// 库是空的,说「没有匹配」是答非所问,而且把用户往"换个词再搜"引,
+    /// 那条路上什么都没有。
+    ///
+    /// 自证会变红:把 `empty_reason` 里 `projects.is_empty()` 和
+    /// `!query.trim().is_empty()` 两道判据互换顺序。
+    #[test]
+    fn an_empty_library_says_so_even_while_you_are_searching() {
+        assert_eq!(
+            empty_reason(&[], Tab::Active, "随便什么词", &[]),
+            Some(EmptyReason::NoProjects)
+        );
+    }
+
+    /// 纯空格不算搜索:tab 该照常起作用,归档的不该被搜出来。
+    ///
+    /// 这条钉的是一份**跨模块契约**:本模块用 `trim().is_empty()` 判"在不在
+    /// 搜索态",而命中判定在 `project::matches` → `search::tokens` 里用
+    /// `split_whitespace`。两边对"纯空格"的理解一旦分家,症状是「光标停在
+    /// 搜索框里没打字,归档项目却冒出来了」,没有任何报错。
+    #[test]
+    fn a_query_of_only_spaces_is_not_a_search() {
+        let ps = vec![
+            proj(1, "在用的", None, None),
+            proj(2, "归档的", None, Some("2026-09-01T00:00:00Z")),
+        ];
+        let got: Vec<u64> = rows(&ps, Tab::Active, "   ", &[])
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(got, vec![1], "纯空格不该被当成搜索、把归档的放进来");
     }
 }
