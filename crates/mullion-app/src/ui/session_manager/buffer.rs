@@ -835,6 +835,7 @@ mod tests {
             network: NetworkPrefs { proxy: None, jump },
             automation: AutomationPrefs::default(),
             sftp: Default::default(),
+            last_connected_at: None,
         }
     }
 
@@ -974,6 +975,7 @@ mod tests {
                 ..Default::default()
             },
             sftp: Default::default(),
+            last_connected_at: None,
         };
 
         let editor_buf = EditorBuffer::from_record(&rec);
@@ -1035,6 +1037,7 @@ mod tests {
             },
             automation: AutomationPrefs::default(),
             sftp: Default::default(),
+            last_connected_at: None,
         };
         let buf = EditorBuffer::from_record(&rec);
         let draft = build_draft(&buf).unwrap();

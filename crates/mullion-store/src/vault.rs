@@ -487,6 +487,7 @@ impl Vault {
             network: draft.network,
             automation: draft.automation,
             sftp: draft.sftp,
+            last_connected_at: None,
         });
         id
     }
@@ -878,6 +879,20 @@ impl Vault {
         self.sync_from_disk_if_untouched();
         if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
             slot.last_accessed_at = Some(now.to_string());
+        }
+    }
+
+    /// F258:记一笔「这条会话连上了」。`now` 由调用方给(store 不持有时钟)。
+    ///
+    /// **只改这一个字段、不跑校验、不碰 `modified_at`** —— 碰了的话
+    /// 「上次编辑」会被每次连接刷掉,而会话管理器右栏拿它当「这条改过没」的依据。
+    ///
+    /// 调用时机见 `app::accept_connect_ok`(Task 9):**只有 `DialTicket.user_initiated`
+    /// 为真的那次拨号**才记。
+    pub fn touch_session_connected(&mut self, id: SessionId, now: &str) {
+        self.sync_from_disk_if_untouched();
+        if let Some(slot) = self.sessions.iter_mut().find(|s| s.id == id) {
+            slot.last_connected_at = Some(now.to_string());
         }
     }
 
@@ -1328,6 +1343,14 @@ mod tests {
 
     fn key() -> InMemoryKey {
         InMemoryKey([5u8; 32])
+    }
+
+    /// F258:一个装了一条会话的库,给「记一笔连接」类测试复用。
+    fn vault_with_one_session() -> (Vault, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        v.add(draft_pw("prod", "hunter2"), "2026-09-08T00:00:00Z");
+        (v, dir)
     }
 
     fn draft_pw(name: &str, pw: &str) -> SessionDraft {
@@ -3134,6 +3157,30 @@ path = "/var/log"
                 .archived_at,
             None,
             "取消归档要把键清掉"
+        );
+    }
+
+    /// F258:记一笔「连上了」只改这一个字段,不跑任何校验 —— 同
+    /// `touch_project_accessed`:记一笔访问不该因为库里别处有问题就失败。
+    #[test]
+    fn touching_a_session_connection_flips_only_that_one_field() {
+        let (mut v, _tmp) = vault_with_one_session();
+        let id = v.list()[0].id;
+        let before = v.list()[0].clone();
+        v.touch_session_connected(id, "2026-09-11T08:00:00Z");
+        let after = v.list()[0].clone();
+        assert_eq!(
+            after.last_connected_at.as_deref(),
+            Some("2026-09-11T08:00:00Z")
+        );
+        assert_eq!(
+            SessionRecord {
+                last_connected_at: None,
+                ..after
+            },
+            before,
+            "记一笔连接只许动 last_connected_at —— 碰了 modified_at 的话,\
+             「上次编辑」会被每次连接刷掉"
         );
     }
 

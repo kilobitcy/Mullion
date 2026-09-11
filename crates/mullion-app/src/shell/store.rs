@@ -245,6 +245,11 @@ impl SessionStore {
         self.vault.set_project_archived(id, archived, now_rfc3339);
     }
 
+    /// F258:记一笔「这条会话连上了」。调用点见 `app::accept_connect_ok`。
+    pub fn touch_session_connected(&mut self, id: mullion_store::SessionId, now_rfc3339: &str) {
+        self.vault.touch_session_connected(id, now_rfc3339);
+    }
+
     /// 共享凭据表(F74)。UI 拿它显示「有效用户名」与凭据档列表。
     pub fn credentials(&self) -> &[mullion_store::CredentialRecord] {
         self.vault.credentials()
@@ -465,6 +470,7 @@ fn draft_to_record(d: &SessionDraft) -> SessionRecord {
         network: d.network.clone(),
         automation: d.automation.clone(),
         sftp: Default::default(),
+        last_connected_at: None,
     }
 }
 

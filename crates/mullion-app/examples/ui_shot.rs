@@ -505,6 +505,7 @@ fn sess(id: u64, name: &str, host: &str, group: Option<GroupId>) -> SessionRecor
         network: Default::default(),
         automation: Default::default(),
         sftp: Default::default(),
+        last_connected_at: None,
     }
 }
 

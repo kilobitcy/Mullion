@@ -78,6 +78,21 @@ pub struct SessionRecord {
     /// 补空,无需迁移代码。
     #[serde(default)]
     pub sftp: crate::sftp::SftpPrefs,
+    /// F258:最后一次**连上**的时刻(RFC3339)。`None` = 从没连上过。
+    ///
+    /// 与 `modified_at`(编辑时间)是**两回事**:改一次配置不等于用过它,
+    /// 而 rehost 弹窗要回答的是「我最后用的是哪台」。
+    ///
+    /// **只在「用户当帧动作发起的拨号」连上时记**(设计 D10):启动恢复现场的
+    /// 批量重连、F128 断线自愈都不记 —— 前者会让 N 条会话拿到几乎相同的
+    /// 时间戳,把昨天攒下的先后顺序一次开机整体抹平,且全程无报错。
+    ///
+    /// **不升 schema**:判据是「丢了能不能自己长回来」—— 这个字段是用量派生的,
+    /// 被老客户端丢掉之后下次连上就重新长出来,不需要靠升号去逼老客户端拒读。
+    /// (对比 `ProjectRecord.archived_at`:那是用户的决定,丢了不会自愈,所以
+    /// 本切片为它升了 v11→v12。)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_at: Option<String>,
 }
 
 /// 一条会话的**敏感**部分,加密后存 secrets.enc。
@@ -281,6 +296,63 @@ pub struct SessionsFile {
 mod tests {
     use super::*;
 
+    /// 与 `session_toml_round_trips` 用的同一套构造式,抽出来给别的测试复用。
+    fn sample_record() -> SessionRecord {
+        SessionRecord {
+            id: SessionId(7),
+            modified_at: "2026-07-25T00:00:00Z".into(),
+            identity: Identity {
+                name: "dev".into(),
+                note: "跳板后".into(),
+                group_id: Some(GroupId(2)),
+                tags: vec!["prod".into()],
+            },
+            connection: Connection {
+                host: "192.0.2.10".into(),
+                port: 22,
+                protocol: Protocol::Ssh,
+            },
+            auth: Auth::inline(
+                "user",
+                AuthKind::PublicKey {
+                    has_passphrase: false,
+                },
+            ),
+            terminal: TerminalPrefs {
+                scrollback: Some(5000),
+            },
+            appearance: AppearancePrefs::default(),
+            network: crate::network::NetworkPrefs::default(),
+            automation: crate::automation::AutomationPrefs::default(),
+            sftp: crate::sftp::SftpPrefs::default(),
+            last_connected_at: None,
+        }
+    }
+
+    /// F258:从没连上过的会话不该往 TOML 里写空键;连上过要能读回来。
+    ///
+    /// **自证方式**(本切片 Task 1 实测踩过的坑):锁定的 `toml 0.8.23` 对结构体里的
+    /// `Option::None` **本来就自动省略**,所以「删掉 `skip_serializing_if`」
+    /// 这条变异**不会**让它变红。有效的变异是加 `#[serde(skip)]` ——
+    /// 回读变 `None`,跟写入的 `Some` 对不上。跑变异时用这一条。
+    ///
+    /// (`skip_serializing_if` 仍然要写:同文件其它可选字段全是这个写法,
+    /// 一致性优先于「去掉当前冗余的属性」。)
+    #[test]
+    fn last_connected_at_round_trips_and_stays_out_of_the_file_when_unset() {
+        let mut rec = sample_record();
+        assert!(rec.last_connected_at.is_none());
+        let s = toml::to_string_pretty(&rec).unwrap();
+        assert!(
+            !s.contains("last_connected_at"),
+            "从没连过不该写出这个键: {s}"
+        );
+        rec.last_connected_at = Some("2026-09-11T08:00:00Z".into());
+        let s = toml::to_string_pretty(&rec).unwrap();
+        let back: SessionRecord = toml::from_str(&s).unwrap();
+        assert_eq!(back, rec);
+    }
+
     #[test]
     fn session_toml_round_trips() {
         let rec = SessionRecord {
@@ -310,6 +382,7 @@ mod tests {
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
             sftp: crate::sftp::SftpPrefs::default(),
+            last_connected_at: None,
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,
@@ -346,6 +419,7 @@ mod tests {
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
             sftp: crate::sftp::SftpPrefs::default(),
+            last_connected_at: None,
         };
         let file = SessionsFile {
             schema_version: CURRENT_SCHEMA,

@@ -108,6 +108,7 @@ mod tests {
             network: NetworkPrefs::default(),
             automation: Default::default(),
             sftp: Default::default(),
+            last_connected_at: None,
         }
     }
 

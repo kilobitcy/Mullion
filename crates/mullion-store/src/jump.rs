@@ -151,6 +151,7 @@ mod tests {
             },
             automation: crate::automation::AutomationPrefs::default(),
             sftp: crate::sftp::SftpPrefs::default(),
+            last_connected_at: None,
         }
     }
 

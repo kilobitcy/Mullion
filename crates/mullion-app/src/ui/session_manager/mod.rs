@@ -1090,6 +1090,7 @@ mod tunnel_ui_tests {
             network: Default::default(),
             automation: Default::default(),
             sftp: Default::default(),
+            last_connected_at: None,
         }
     }
 
@@ -2301,6 +2302,7 @@ mod tests {
             network: Default::default(),
             automation: Default::default(),
             sftp: Default::default(),
+            last_connected_at: None,
         };
         let sessions = vec![rec(1, "a"), rec(2, "b")];
         let key = |k: egui::Key, modifiers: egui::Modifiers| egui::Event::Key {
@@ -3332,6 +3334,7 @@ mod tests {
             network: Default::default(),
             automation: Default::default(),
             sftp: Default::default(),
+            last_connected_at: None,
         }];
         let groups: Vec<GroupRecord> = Vec::new();
         let mut ui_state = UiState {

@@ -760,6 +760,7 @@ created_at = "2026-09-01T00:00:00Z"
                     ..Default::default()
                 },
                 sftp: crate::sftp::SftpPrefs::default(),
+                last_connected_at: None,
             }
         }
 

@@ -117,6 +117,7 @@ pub fn migrate_v1(text: &str) -> Result<SessionsFile, StoreError> {
             network: crate::network::NetworkPrefs::default(),
             automation: crate::automation::AutomationPrefs::default(),
             sftp: crate::sftp::SftpPrefs::default(),
+            last_connected_at: None,
         })
         .collect();
     Ok(SessionsFile {
