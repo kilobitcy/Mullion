@@ -886,9 +886,10 @@ impl Vault {
     /// **只改这一个字段,且不跑 `validate`** —— 同 `touch_project_accessed`:
     /// 收起一个项目不该因为库里别处有个撞名的老项目就失败。
     ///
-    /// 取消归档传 `false`,把键清掉(而不是写一个空串)—— `skip_serializing_if`
-    /// 才能让文件里不留痕迹,否则每个撤销过的项目都会在 TOML 里留一行
-    /// `archived_at = ""`,而 `is_none()` 判据会把它当成"还在归档"。
+    /// 取消归档传 `false`,把值置回 `None` 而不是写一个空串 —— 判据是
+    /// `is_none()`,写成 `Some("")` 会被当成"还在归档"。字段上的
+    /// `skip_serializing_if` 只是显式声明这份意图的保险,不是"不写空串"
+    /// 这件事成立的原因。
     pub fn set_project_archived(
         &mut self,
         id: crate::project::ProjectId,

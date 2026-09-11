@@ -602,12 +602,14 @@ created_at = "2026-09-01T00:00:00Z"
     fn archiving_a_project_does_not_free_up_its_tmux_name() {
         let mut old = helpers::with_id(1, "web", Some("shared"));
         old.archived_at = Some("2026-09-11T08:00:00Z".into());
+        let old_id = old.id;
         let fresh = helpers::with_id(9, "另一个", Some("shared"));
-        assert!(
-            matches!(
-                crate::project::validate(&fresh, &[old, fresh.clone()], &[]),
-                Err(crate::project::ProjectIssue::TmuxNameClash { .. })
-            ),
+        assert_eq!(
+            crate::project::validate(&fresh, &[old, fresh.clone()], &[]),
+            Err(crate::project::ProjectIssue::TmuxNameClash {
+                name: "shared".into(),
+                with: crate::project::TmuxNameOwner::Project(old_id),
+            }),
             "归档项目仍占着 tmux 名"
         );
     }
