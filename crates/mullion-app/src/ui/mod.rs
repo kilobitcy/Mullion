@@ -21,6 +21,7 @@ pub mod metrics;
 pub mod pane_edges;
 pub mod pane_title;
 pub mod paste;
+pub mod project_list;
 pub mod project_manager;
 pub mod project_pick;
 pub mod project_row;
