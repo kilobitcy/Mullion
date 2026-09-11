@@ -1265,6 +1265,117 @@ mod tests {
         assert!(!tab_bar_visible("alpha"), "搜索时 tab 栏必须收起");
     }
 
+    /// F257:真点一次「归档」tab,核对**当帧**画出的行换了没有。
+    ///
+    /// 只守 tab 栏「在不在」不够 ——「点了『归档』→ `ui_state.project_tab`
+    /// 变成 `Archived` → 当帧 `rows(..)` 按新 tab 列行」这条接线此前没有测试
+    /// 顶着。纯函数 `project_list::rows` 单测很扎实,但纯函数测得扎实、
+    /// 接线没人看着是本仓库反复踩中的形状。
+    ///
+    /// 判据是**画出来的项目名**(`阿尔法`/`贝塔`,故意不含「归档」「在用」
+    /// 字样,不会被 tab 按钮文字或将来行上可能加的「已归档」标记污染)——
+    /// 不查 `ui_state.project_tab` 这个字段:只查字段的话,「字段变了但
+    /// `rows` 读的是别的东西」这种接线错照样绿。
+    ///
+    /// 手法照抄 `intent_after_clicking_add`:定位控件矩形 / 注入指针事件
+    /// 模拟真实点击,press+release 同一批事件喂进同一次 `ctx.run`,点击与
+    /// 重绘落在同一帧。
+    ///
+    /// 自证会变红:
+    /// - 变异 A:删掉 `list_column` 里 `ui_state.project_tab = tab;` 这行赋值
+    ///   (点了不生效,归档 tab 点了画面纹丝不动)。
+    /// - 变异 B:把 `let tab = ui_state.project_tab;` 挪到 tab 栏渲染那段
+    ///   **之前**(当帧读到的是点击前的旧值,画面慢一帧才换)。
+    #[test]
+    fn clicking_the_archived_tab_swaps_the_rows_drawn_this_frame() {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => {
+                    out.push((ts.galley.text().to_string(), ts.pos + ts.galley.size() / 2.0));
+                }
+                _ => {}
+            }
+        }
+        fn spots_of(out: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
+            let mut v = Vec::new();
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut v);
+            }
+            v
+        }
+
+        let mut active = proj(1, "阿尔法", None);
+        active.archived_at = None;
+        let mut archived = proj(2, "贝塔", None);
+        archived.archived_at = Some("2026-09-01T00:00:00Z".into());
+        let ps = vec![active, archived];
+
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let draw = |input: egui::RawInput, ui_state: &mut crate::ui::UiState| {
+            ctx.run(input, |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    ui_state,
+                    &ps,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
+            })
+        };
+
+        // 预热两帧:第一帧 `egui::Window` 还在量自己的尺寸,内容矩形没定。
+        let _ = draw(egui::RawInput::default(), &mut ui_state);
+        let out = draw(egui::RawInput::default(), &mut ui_state);
+        let spots = spots_of(&out);
+        assert!(
+            spots.iter().any(|(s, _)| s == "阿尔法"),
+            "初始(在用 tab)没画出在用项目:{spots:?}"
+        );
+        assert!(
+            !spots.iter().any(|(s, _)| s == "贝塔"),
+            "初始(在用 tab)不该看见归档项目:{spots:?}"
+        );
+
+        let pos = spots
+            .iter()
+            .find(|(s, _)| s == crate::ui::project_list::Tab::Archived.label())
+            .expect("「归档」tab 没画出来")
+            .1;
+        let mut input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        };
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let out = draw(input, &mut ui_state);
+        let spots = spots_of(&out);
+        assert!(
+            !spots.iter().any(|(s, _)| s == "阿尔法"),
+            "点了「归档」tab,在用项目当帧还留在画面里:{spots:?}"
+        );
+        assert!(
+            spots.iter().any(|(s, _)| s == "贝塔"),
+            "点了「归档」tab,归档项目当帧没画出来:{spots:?}"
+        );
+    }
+
     // ---- 右栏:说明多行 / 内容滚动 / 按钮钉底(F237)------------------------
 
     /// 画两帧,量「说明」输入框**控件本身**的高度。
