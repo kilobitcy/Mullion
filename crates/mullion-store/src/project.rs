@@ -32,6 +32,20 @@ pub struct ProjectRecord {
     /// `None` = 从未打开过。更新时机见 F224(**跃迁触发**,不是每批上报都写)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<String>,
+    /// F257:归档时刻(RFC3339)。`None` = 在用。
+    ///
+    /// 与 `last_accessed_at` **完全同姿态**:app 注入时钟(store 不持有时钟)、
+    /// 旧文件缺键即"未归档"、未归档不写出这个键 —— 所以**不需要升 schema**。
+    ///
+    /// 为什么不是 `bool`:归档 tab 要按「什么时候归的」倒序排(刚归错的在最上面,
+    /// 马上能撤)。`bool` 只能回落 `last_accessed_at`,那样"上周归档的"和"半年前
+    /// 归档的"混在一起,顺序取决于它们当年被打开的时间 —— 解释不通。
+    ///
+    /// **只由项目管理器右栏那两个按钮写**(设计 D6)。打开一个归档项目**不**自动
+    /// 撤销归档:系统看到的只是"你打开了它",而打开的理由可能只是去捞一个文件;
+    /// 让系统推翻用户的判断,错的时候是静默的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
     /// F238:项目自设的图标。`None` = 回落首选节点的图标(解析在 app 侧的
     /// `project::icon_for`,store 不认识 `SessionRecord` 的外观)。
     ///
@@ -528,6 +542,37 @@ mod tests {
         assert!(!s.contains("icon"), "没设图标不该写出 icon 键:{s}");
     }
 
+    /// 没归档的项目不该往 TOML 里写空键(同 `tmux_name`/`last_accessed_at`),
+    /// 归档了要能原样读回来。
+    ///
+    /// 自证会变红:把 `archived_at` 字段删掉(编译不过)或加上
+    /// `#[serde(skip)]`(读回来变成 `None`,跟写入的 `Some` 对不上)。
+    #[test]
+    fn archived_at_round_trips_and_stays_out_of_the_file_when_unset() {
+        let mut p = super::tests::helpers::with_id(3, "Mullion", None);
+        assert!(p.archived_at.is_none(), "新记录默认不是归档态");
+        let s = toml::to_string_pretty(&p).unwrap();
+        assert!(!s.contains("archived_at"), "未归档不应写出这个键: {s}");
+        p.archived_at = Some("2026-09-11T08:00:00Z".into());
+        let s = toml::to_string_pretty(&p).unwrap();
+        let back: crate::project::ProjectRecord = toml::from_str(&s).unwrap();
+        assert_eq!(back, p);
+    }
+
+    /// 旧文件里没有这个键,读回来必须是「未归档」而不是解析失败 ——
+    /// 失败的话用户升级一次客户端,整个项目表就读不出来了。
+    #[test]
+    fn a_file_written_before_f257_still_loads_as_not_archived() {
+        let text = r#"
+id = 3
+name = "Mullion"
+dir = "/data/Mullion"
+created_at = "2026-09-01T00:00:00Z"
+"#;
+        let back: crate::project::ProjectRecord = toml::from_str(text).unwrap();
+        assert_eq!(back.archived_at, None);
+    }
+
     // ---- F223 打开项目 = 一次性覆盖 -------------------------------------
 
     /// F223:tmux 名 sanitize 之后是空的,必须在**保存那一刻**拦下来。
@@ -695,6 +740,7 @@ mod tests {
                 tmux_name: tmux.map(Into::into),
                 created_at: "2026-09-08T00:00:00Z".into(),
                 last_accessed_at: None,
+                archived_at: None,
                 icon: None,
             }
         }

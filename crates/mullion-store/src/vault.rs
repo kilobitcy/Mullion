@@ -819,6 +819,7 @@ impl Vault {
             tmux_name: None,
             created_at: now_rfc3339.to_string(),
             last_accessed_at: None,
+            archived_at: None,
             icon: None,
         });
         id
