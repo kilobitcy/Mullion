@@ -757,6 +757,17 @@ mod tests {
         assert_eq!(lamp("proj-x", &[], &[]), Lamp::Dark);
     }
 
+    /// D13 的前提:**启动页上灯不可能是 `Unknown`**。
+    ///
+    /// launcher 态一块 pane 都没有(`launcher::show` 的 `pane` 恒传 `None`),
+    /// `panes` 是空切片。若这条不成立,启动页第一帧就会把全表的灯冻成
+    /// `Unknown`,Lit 置顶**在最需要它的场景下永远不生效且零报错**。
+    #[test]
+    fn with_no_panes_at_all_a_lamp_is_never_unknown() {
+        assert_eq!(lamp("proj-x", &[], &[]), Lamp::Dark);
+        assert_eq!(lamp("proj-x", &[], &["proj-x".to_string()]), Lamp::Lit);
+    }
+
     /// 别的实例的心跳同样点亮 —— 多开是本项目的主场景,只看自己那几块 pane
     /// 的话,另一个窗口里正跑着的项目在这边显示为「灭」,用户会去开第二份。
     ///

@@ -82,20 +82,56 @@ pub fn rows<'a>(
     tab: Tab,
     query: &str,
     sessions: &[SessionRecord],
+    frozen_lamps: &std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
 ) -> Vec<&'a ProjectRecord> {
     let searching = !query.trim().is_empty();
+    // F258:Lit 置顶**只在浏览态的「在用」tab**(设计 D13/D17)。
+    //
+    // 搜索态不置顶:用户已经明确知道要找谁,置顶只会打乱 —— 而且不置顶让
+    // 搜索态成为纯函数,不需要下面那份冻结灯,需要显式失效的状态只剩一处。
+    //
+    // 归档 tab 不置顶:归档项目正跑着是个异常情况,不该因此排到最上面
+    // (灯照常亮,那才是"它还没关干净"的提示)。
+    let float_lit = !searching && tab == Tab::Active;
     let mut out: Vec<&ProjectRecord> = projects
         .iter()
         .filter(|p| searching || in_tab(p, tab))
         .filter(|p| crate::project::matches(p, query, sessions))
         .collect();
     out.sort_by(|a, b| {
-        // 搜索态:在用的整段在前。非搜索态两边同档,这一比恒 Equal。
-        archived(a)
-            .cmp(&archived(b))
+        lit_rank(a, float_lit, frozen_lamps)
+            .cmp(&lit_rank(b, float_lit, frozen_lamps))
+            // 搜索态:在用的整段在前。非搜索态两边同档,这一比恒 Equal。
+            .then_with(|| archived(a).cmp(&archived(b)))
             .then_with(|| segment_order(a, b))
     });
     out
+}
+
+/// 置顶用的排名:`0` = 亮着要置顶,`1` = 其余。
+///
+/// 读的是**冻结的灯**(设计 D13):灯是异步变的(别的实例开/关项目、心跳超时),
+/// 每帧实时排的话,某一行会在你正要点它的那一瞬间跳到列表最上面、把目标挤下去
+/// —— 点错项目 = 连到另一台机器、attach 另一个 tmux,是本项目最不想要的那类
+/// 「看不出错的误操作」。行上画的灯仍然是**实时**的:灯变色,位置不动。
+///
+/// 冻结表里查不到 → 按 `Unknown` 处置 → 不置顶,按时间落位。列表开着的时候
+/// 新建的项目走这条,**不会消失**。
+///
+/// `Unknown` 不算亮:它的语义是"还有 pane 没上报过",拿它当亮的话启动那几帧
+/// 全表都被判成亮,置顶等于没置顶。
+fn lit_rank(
+    p: &ProjectRecord,
+    float_lit: bool,
+    frozen: &std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
+) -> u8 {
+    if !float_lit {
+        return 0;
+    }
+    match frozen.get(&p.id) {
+        Some(crate::project::Lamp::Lit) => 0,
+        _ => 1,
+    }
 }
 
 /// 这个项目属不属于这个 tab。
@@ -153,8 +189,9 @@ pub fn empty_reason(
     tab: Tab,
     query: &str,
     sessions: &[SessionRecord],
+    frozen_lamps: &std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
 ) -> Option<EmptyReason> {
-    if !rows(projects, tab, query, sessions).is_empty() {
+    if !rows(projects, tab, query, sessions, frozen_lamps).is_empty() {
         return None;
     }
     if projects.is_empty() {
@@ -217,7 +254,13 @@ pub fn empty_text(reason: EmptyReason, surface: Surface) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::Lamp;
     use mullion_store::{ProjectId, SessionId};
+    use std::collections::BTreeMap;
+
+    fn lamps(pairs: &[(u64, Lamp)]) -> BTreeMap<ProjectId, Lamp> {
+        pairs.iter().map(|(id, l)| (ProjectId(*id), *l)).collect()
+    }
 
     fn proj(id: u64, name: &str, accessed: Option<&str>, archived: Option<&str>) -> ProjectRecord {
         ProjectRecord {
@@ -247,7 +290,7 @@ mod tests {
                 Some("2026-09-11T01:00:00Z"),
             ),
         ];
-        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[])
+        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[], &BTreeMap::new())
             .iter()
             .map(|p| p.id.0)
             .collect();
@@ -275,7 +318,7 @@ mod tests {
                 Some("2026-09-09T00:00:00Z"),
             ),
         ];
-        let got: Vec<u64> = rows(&ps, Tab::Archived, "", &[])
+        let got: Vec<u64> = rows(&ps, Tab::Archived, "", &[], &BTreeMap::new())
             .iter()
             .map(|p| p.id.0)
             .collect();
@@ -297,7 +340,7 @@ mod tests {
             ),
         ];
         for tab in [Tab::Active, Tab::Archived] {
-            let got: Vec<u64> = rows(&ps, tab, "alpha", &[])
+            let got: Vec<u64> = rows(&ps, tab, "alpha", &[], &BTreeMap::new())
                 .iter()
                 .map(|p| p.id.0)
                 .collect();
@@ -317,7 +360,7 @@ mod tests {
             proj(1, "没开过的", None, None),
             proj(2, "开过的", Some("2026-09-01T00:00:00Z"), None),
         ];
-        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[])
+        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[], &BTreeMap::new())
             .iter()
             .map(|p| p.id.0)
             .collect();
@@ -335,7 +378,7 @@ mod tests {
             proj(9, "后写的", Some("2026-09-01T00:00:00Z"), None),
             proj(2, "先写的", Some("2026-09-01T00:00:00Z"), None),
         ];
-        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[])
+        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[], &BTreeMap::new())
             .iter()
             .map(|p| p.id.0)
             .collect();
@@ -348,7 +391,7 @@ mod tests {
     fn an_all_archived_library_does_not_claim_there_are_no_projects() {
         let ps = vec![proj(1, "老活", None, Some("2026-09-01T00:00:00Z"))];
         assert_eq!(
-            empty_reason(&ps, Tab::Active, "", &[]),
+            empty_reason(&ps, Tab::Active, "", &[], &BTreeMap::new()),
             Some(EmptyReason::AllArchived(1))
         );
         let text = empty_text(EmptyReason::AllArchived(1), Surface::Launcher);
@@ -361,7 +404,7 @@ mod tests {
     #[test]
     fn a_truly_empty_library_keeps_the_original_wording() {
         assert_eq!(
-            empty_reason(&[], Tab::Active, "", &[]),
+            empty_reason(&[], Tab::Active, "", &[], &BTreeMap::new()),
             Some(EmptyReason::NoProjects)
         );
     }
@@ -372,7 +415,7 @@ mod tests {
     fn a_search_with_no_hits_is_its_own_case_even_when_everything_is_archived() {
         let ps = vec![proj(1, "老活", None, Some("2026-09-01T00:00:00Z"))];
         assert_eq!(
-            empty_reason(&ps, Tab::Active, "找不到的词", &[]),
+            empty_reason(&ps, Tab::Active, "找不到的词", &[], &BTreeMap::new()),
             Some(EmptyReason::NoMatch)
         );
     }
@@ -382,7 +425,7 @@ mod tests {
     fn an_empty_archive_tab_says_so_instead_of_claiming_there_are_no_projects() {
         let ps = vec![proj(1, "在用的", None, None)];
         assert_eq!(
-            empty_reason(&ps, Tab::Archived, "", &[]),
+            empty_reason(&ps, Tab::Archived, "", &[], &BTreeMap::new()),
             Some(EmptyReason::NoArchived)
         );
     }
@@ -391,7 +434,10 @@ mod tests {
     #[test]
     fn a_non_empty_list_has_no_empty_reason() {
         let ps = vec![proj(1, "在用的", None, None)];
-        assert_eq!(empty_reason(&ps, Tab::Active, "", &[]), None);
+        assert_eq!(
+            empty_reason(&ps, Tab::Active, "", &[], &BTreeMap::new()),
+            None
+        );
     }
 
     /// 库里一个项目都没有时,**即使搜索框里有字**也该说「还没有项目」——
@@ -403,7 +449,7 @@ mod tests {
     #[test]
     fn an_empty_library_says_so_even_while_you_are_searching() {
         assert_eq!(
-            empty_reason(&[], Tab::Active, "随便什么词", &[]),
+            empty_reason(&[], Tab::Active, "随便什么词", &[], &BTreeMap::new()),
             Some(EmptyReason::NoProjects)
         );
     }
@@ -420,10 +466,121 @@ mod tests {
             proj(1, "在用的", None, None),
             proj(2, "归档的", None, Some("2026-09-01T00:00:00Z")),
         ];
-        let got: Vec<u64> = rows(&ps, Tab::Active, "   ", &[])
+        let got: Vec<u64> = rows(&ps, Tab::Active, "   ", &[], &BTreeMap::new())
             .iter()
             .map(|p| p.id.0)
             .collect();
         assert_eq!(got, vec![1], "纯空格不该被当成搜索、把归档的放进来");
+    }
+
+    /// 两个都访问过的项目按最后访问时间**倒序**排 —— 从
+    /// `project_manager::by_recent_access` 删掉的
+    /// `the_most_recently_opened_project_comes_first` 判据搬到这里
+    /// (那个函数已被 `project_list::rows` 取代)。
+    #[test]
+    fn the_most_recently_accessed_project_comes_first() {
+        let ps = vec![
+            proj(1, "旧", Some("2026-09-01T00:00:00Z"), None),
+            proj(2, "新", Some("2026-09-07T00:00:00Z"), None),
+        ];
+        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[], &BTreeMap::new())
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(got, vec![2, 1], "倒序:最近访问的排最上面");
+    }
+
+    /// D13:浏览态的「在用」tab 里,正亮着灯的项目**置顶**。
+    ///
+    /// 判据造成:亮灯那条的访问时间**更旧**。不置顶的话它排在后面。
+    #[test]
+    fn a_lit_project_floats_to_the_top_of_the_active_tab() {
+        let ps = vec![
+            proj(1, "亮着的老活", Some("2026-09-01T00:00:00Z"), None),
+            proj(2, "刚开过的", Some("2026-09-10T00:00:00Z"), None),
+        ];
+        let f = lamps(&[(1, Lamp::Lit), (2, Lamp::Dark)]);
+        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[], &f)
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(got, vec![1, 2], "亮着的要置顶");
+    }
+
+    /// `Unknown` **不算亮** —— 它的语义是"还有 pane 没上报过,可能在跑",
+    /// 拿它当亮的话启动那几帧全表都会被判成亮,置顶等于没置顶。
+    #[test]
+    fn an_unknown_lamp_does_not_count_as_lit() {
+        let ps = vec![
+            proj(1, "灯未知的老活", Some("2026-09-01T00:00:00Z"), None),
+            proj(2, "刚开过的", Some("2026-09-10T00:00:00Z"), None),
+        ];
+        // 只登记 1 号(`Unknown`)。2 号**不在**冻结表里,与 1 号一样落到
+        // `lit_rank` 的 `_ => 1` 分支 —— 这样才能把「值是 `Unknown`」和
+        // 「压根没查到」这两种都不算亮的路径**同时**钉住:如果 `lit_rank`
+        // 被错改成「查到什么值都算亮」(`Some(_) => 0`),1 号会被误判成
+        // 置顶而 2 号不会,顺序变成 `[1, 2]`,能与下面的期望值分得开。
+        // 之前的写法给两边都塞了值(`Unknown`/`Dark`),那样错改后两边会一起
+        // 被判成置顶、又被访问时间的顺序悄悄对上,变异杀不掉。
+        let f = lamps(&[(1, Lamp::Unknown)]);
+        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[], &f)
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(got, vec![2, 1], "Unknown 不该置顶");
+    }
+
+    /// D17:**搜索态不做 Lit 置顶**。搜的时候用户已经明确知道要找谁,
+    /// 置顶只会打乱;而且不置顶意味着搜索态是纯函数、不需要定格。
+    #[test]
+    fn searching_does_not_float_lit_projects() {
+        let ps = vec![
+            proj(1, "亮着的 alpha", Some("2026-09-01T00:00:00Z"), None),
+            proj(2, "刚开过的 alpha", Some("2026-09-10T00:00:00Z"), None),
+        ];
+        let f = lamps(&[(1, Lamp::Lit), (2, Lamp::Dark)]);
+        let got: Vec<u64> = rows(&ps, Tab::Active, "alpha", &[], &f)
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(got, vec![2, 1], "搜索态不该置顶");
+    }
+
+    /// 归档 tab 不做 Lit 置顶 —— 归档项目正跑着是个异常情况,不该因此排到
+    /// 最上面(灯照常亮,那是提示"它还没关干净")。
+    #[test]
+    fn the_archived_tab_does_not_float_lit_projects() {
+        let ps = vec![
+            proj(
+                1,
+                "亮着的",
+                Some("2026-09-30T00:00:00Z"),
+                Some("2026-09-01T00:00:00Z"),
+            ),
+            proj(
+                2,
+                "后归的",
+                Some("2026-09-01T00:00:00Z"),
+                Some("2026-09-09T00:00:00Z"),
+            ),
+        ];
+        let f = lamps(&[(1, Lamp::Lit), (2, Lamp::Dark)]);
+        let got: Vec<u64> = rows(&ps, Tab::Archived, "", &[], &f)
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(got, vec![2, 1], "归档 tab 按归档时间排,不置顶");
+    }
+
+    /// 冻结表里查不到的项目(列表开着的时候新建的)按 `Unknown` 处置 ——
+    /// **不能消失**,也不能被当成亮的。
+    #[test]
+    fn a_project_missing_from_the_frozen_lamps_still_shows_up() {
+        let ps = vec![proj(1, "新建的", None, None)];
+        let got: Vec<u64> = rows(&ps, Tab::Active, "", &[], &BTreeMap::new())
+            .iter()
+            .map(|p| p.id.0)
+            .collect();
+        assert_eq!(got, vec![1], "冻结表里没有它,也必须画出来");
     }
 }

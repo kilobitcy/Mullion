@@ -291,6 +291,17 @@ pub struct UiState {
     /// 与上面那份**分开**:项目管理器是弹窗、启动页是整页,两个界面在会话
     /// 生命周期里都存在,共用一份的话在一边打字会静默改掉另一边的过滤结果。
     pub launcher_search: String,
+    /// F258:项目管理器左栏这一次打开期间**冻结的灯**。`None` = 还没装填。
+    ///
+    /// 只冻结灯,不冻结整份顺序 —— `last_accessed_at` 只在"打开项目"时变,
+    /// 而那个动作本身就会关掉这个列表。整份顺序快照要显式失效,漏一处的症状
+    /// 是"顺序永远停在上次",静默;冻结灯的失效点只有"列表关掉"一处,且就写在
+    /// 开关那一行的 `else` 里。
+    pub pm_frozen_lamps:
+        Option<std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>>,
+    /// F258:启动页这一次显示期间冻结的灯。同上。
+    pub launcher_frozen_lamps:
+        Option<std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>>,
     /// F236:下一帧要把焦点打到右栏「名称」框上(刚新建完)。
     ///
     /// 用一位标志而不是在 app 侧直接 `request_focus`:那个 `Response` 只在
@@ -448,6 +459,19 @@ pub struct UiState {
     /// F225③:切项目弹窗(点了 pane 标题条的项目按钮)。`None` = 关着。
     /// 里面有搜索框 —— 必须同步登记进 `app.rs::modal_open`(T8)。
     pub project_pick: Option<project_pick::ProjectPickDraft>,
+}
+
+/// F258:第一次画的时候把当前的灯拷一份冻住,之后每帧都用这一份排序。
+///
+/// 「装填」而不是「打开时赋值」:装填点与使用点在同一行代码上,不可能漏 ——
+/// 而"打开时赋值"要在每一个能打开这个列表的入口上各写一次。
+pub fn freeze_lamps<'a>(
+    slot: &'a mut Option<
+        std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
+    >,
+    live: &std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
+) -> &'a std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp> {
+    slot.get_or_insert_with(|| live.clone())
 }
 
 /// [`UiState::icon_target`] 的取值。
@@ -990,6 +1014,12 @@ pub fn build_ui(
             frame.appearance,
             frame.known_hosts,
         );
+    } else {
+        // F258:关掉了就把冻结的灯扔掉 —— 下次打开按新灯重排。
+        // **写在这个 `else` 里**而不是各个关闭入口:关闭入口有好几个
+        // (× / Esc / 打开项目顺手关掉),逐个去清必漏一个,而漏了的症状是
+        // 「顺序永远停在上次打开那一刻」,静默。
+        ui_state.pm_frozen_lamps = None;
     }
     // F223:打开项目前的确认框。排在项目管理器**之后** —— 它是从那里发起的
     // 模态,该盖在上面。
@@ -1110,6 +1140,9 @@ pub fn build_ui(
             frame.sessions,
             frame.appearance,
         );
+    } else {
+        // F258:同上。离开启动页(第一个标签立起来)就扔掉。
+        ui_state.launcher_frozen_lamps = None;
     }
     if let Some(files) = files_content {
         let (r, l) = files_panel::content(
@@ -1216,6 +1249,40 @@ mod tests {
             "新错误必须重新展开卡片,否则用户再也看不到任何错误"
         );
         assert_eq!(st.last_error.as_deref(), Some("第二个错误"));
+    }
+
+    /// F258 的自证:`freeze_lamps` 装填一次之后,后续帧传入不同的 `live`
+    /// 表**不许**改动已经装填的那份 —— 这是「冻结」这件事本身唯一的直接
+    /// 判据。三处调用点(项目管理器 / 启动页 / 切换项目弹窗)现有的测试
+    /// 全是单帧,或者多帧但灯从没变过,一条都没有钉住「灯变了、顺序不该跟
+    /// 着变」这件事 —— 漏了这条,`freeze_lamps` 退化成透传实时表,冻结名存
+    /// 实亡,而且没有任何测试会因此变红。
+    ///
+    /// 自证会变红:把 `freeze_lamps` 每次都重新写入 `*slot`
+    /// (`*slot = Some(live.clone())`)而不是只在 `None` 时装填一次
+    /// (字面上「改成直接返回 `live`」这个版本连编译都过不了 —— `live` 的
+    /// 生命周期与 `slot` 无关,类型系统本身就先一步挡住了那个更直白的变异)。
+    #[test]
+    fn freeze_lamps_keeps_the_first_snapshot_even_after_live_changes() {
+        let mut slot = None;
+        let mut first = std::collections::BTreeMap::new();
+        first.insert(mullion_store::ProjectId(1), crate::project::Lamp::Dark);
+        {
+            let frozen = freeze_lamps(&mut slot, &first);
+            assert_eq!(
+                frozen.get(&mullion_store::ProjectId(1)),
+                Some(&crate::project::Lamp::Dark)
+            );
+        }
+
+        let mut second = std::collections::BTreeMap::new();
+        second.insert(mullion_store::ProjectId(1), crate::project::Lamp::Lit);
+        let frozen = freeze_lamps(&mut slot, &second);
+        assert_eq!(
+            frozen.get(&mullion_store::ProjectId(1)),
+            Some(&crate::project::Lamp::Dark),
+            "第二次传入变了的 live 表,冻结的那份不该跟着变"
+        );
     }
 
     /// 复核坑:关闭会话管理器时若只清 `session_manager_open`、不清

@@ -24,34 +24,6 @@ pub enum ProjectIntent {
     SetArchived(ProjectId, bool),
 }
 
-/// 列表顺序:**按最后访问时间倒序**,从没打开过的排在最后。
-///
-/// 用户开机后想干的第一件事是回到昨天那个活,不是从一堆项目里找 ——
-/// 所以「最近在干的」必须在最上面。F225① 的 launcher 列表用同一个函数,
-/// 两处顺序不许各写一份(写两份就会漂,而「顺序不一样」用户第一眼就看得出来)。
-///
-/// 时间是 RFC3339 字符串,同一时区下**字典序即时间序**;跨时区写入的记录
-/// (配置目录被搬到另一台机器,F48)可能排错位置 —— 后果有上限(列表顺序
-/// 不对,不影响任何数据),不值得为它引一个日期解析库。
-///
-/// 同一时间(或都没访问过)时按 `id` 升序兜底 —— **不能靠 `sort_by_key` 的
-/// 稳定性**:那样顺序就取决于入参顺序,而入参顺序来自磁盘上 `[[project]]`
-/// 的书写次序,用户手改一次配置文件列表就重排了。
-pub fn by_recent_access(projects: &[ProjectRecord]) -> Vec<&ProjectRecord> {
-    let mut out: Vec<&ProjectRecord> = projects.iter().collect();
-    out.sort_by(|a, b| {
-        match (&a.last_accessed_at, &b.last_accessed_at) {
-            (Some(x), Some(y)) => y.cmp(x),
-            // 访问过的一律排在没访问过的前面,与两者具体是什么值无关。
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }
-        .then(a.id.0.cmp(&b.id.0))
-    });
-    out
-}
-
 /// 能当项目节点的会话:**只有 SSH**。
 ///
 /// SFTP 节点没有 PTY,attach 过去是一块永远不出字的黑屏。`validate_project`
@@ -257,10 +229,22 @@ fn list_column(
         // F257:列什么 / 怎么排 / 空了说什么,一律走 `project_list` ——
         // 三处列表共用同一份判据(设计 D8)。
         let tab = ui_state.project_tab;
-        let rows = crate::ui::project_list::rows(projects, tab, &ui_state.project_search, sessions);
-        if let Some(reason) =
-            crate::ui::project_list::empty_reason(projects, tab, &ui_state.project_search, sessions)
-        {
+        // F258:排序读的是这次打开期间冻结的灯,画灯仍用实时的 `lamps`。
+        let frozen = crate::ui::freeze_lamps(&mut ui_state.pm_frozen_lamps, lamps);
+        let rows = crate::ui::project_list::rows(
+            projects,
+            tab,
+            &ui_state.project_search,
+            sessions,
+            frozen,
+        );
+        if let Some(reason) = crate::ui::project_list::empty_reason(
+            projects,
+            tab,
+            &ui_state.project_search,
+            sessions,
+            frozen,
+        ) {
             ui.label(
                 egui::RichText::new(crate::ui::project_list::empty_text(
                     reason,
@@ -911,50 +895,6 @@ mod tests {
             sftp: Default::default(),
             last_connected_at: None,
         }
-    }
-
-    #[test]
-    fn the_most_recently_opened_project_comes_first() {
-        let ps = vec![
-            proj(1, "旧", Some("2026-09-01T00:00:00Z")),
-            proj(2, "新", Some("2026-09-07T00:00:00Z")),
-        ];
-        let got = by_recent_access(&ps);
-        assert_eq!(got[0].name, "新", "倒序:最近访问的排最上面");
-        assert_eq!(got[1].name, "旧");
-    }
-
-    /// 从没打开过的排最后 —— 不管它的 id 多小、也不管它在磁盘上写在哪一行。
-    ///
-    /// 自证会变红:把 `(Some(_), None)` 那一臂改成 `Greater`。
-    #[test]
-    fn a_project_never_opened_sinks_below_every_opened_one() {
-        let ps = vec![
-            proj(1, "没打开过", None),
-            proj(2, "打开过", Some("2026-09-01T00:00:00Z")),
-        ];
-        let got = by_recent_access(&ps);
-        assert_eq!(got[0].name, "打开过");
-        assert_eq!(got[1].name, "没打开过");
-    }
-
-    /// 平局按 id 兜底,**不靠排序的稳定性**。
-    ///
-    /// 靠稳定性的话顺序就等于 `[[project]]` 在磁盘上的书写次序 ——
-    /// 用户手改一次配置文件、或哪天换成 `sort_unstable_by`,列表就重排了,
-    /// 而这两件事都不会有任何报错。
-    ///
-    /// 自证会变红:把 `.then(a.id.0.cmp(&b.id.0))` 去掉 —— 入参是逆序的,
-    /// 稳定排序会原样保留 `[b, a]`。
-    #[test]
-    fn projects_that_tie_are_ordered_by_id_not_by_input_order() {
-        let ps = vec![proj(9, "后写的", None), proj(2, "先写的", None)];
-        let got = by_recent_access(&ps);
-        assert_eq!(
-            got.iter().map(|p| p.id.0).collect::<Vec<_>>(),
-            vec![2, 9],
-            "平局要按 id,不能沿用入参顺序"
-        );
     }
 
     /// SFTP 会话根本不该出现在节点勾选列表里 —— 让用户勾一个注定被

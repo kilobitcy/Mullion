@@ -29,6 +29,8 @@ pub fn show(
     use crate::ui::metrics::{field_w, FIELD_W_M, SP_L, SP_M, SP_S};
     // 「现在几点」一帧取一次,不是每行取一次(同 `project_manager::show`)。
     let now = time::OffsetDateTime::now_utc();
+    // F258:排序读的是这次显示期间冻结的灯,画灯仍用实时的 `lamps`。
+    let frozen = crate::ui::freeze_lamps(&mut ui_state.launcher_frozen_lamps, lamps);
     let panel = egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(crate::theme::c32(t.window_bg)))
         .show(ctx, |ui| {
@@ -65,12 +67,14 @@ pub fn show(
                 crate::ui::project_list::Tab::Active,
                 &ui_state.launcher_search,
                 sessions,
+                frozen,
             );
             if let Some(reason) = crate::ui::project_list::empty_reason(
                 projects,
                 crate::ui::project_list::Tab::Active,
                 &ui_state.launcher_search,
                 sessions,
+                frozen,
             ) {
                 ui.vertical_centered(|ui| {
                     // `hint_text(t, s: impl Into<String>)` —— 传 `String` 本身,

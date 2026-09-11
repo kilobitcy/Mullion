@@ -45,6 +45,9 @@ pub struct ProjectPickDraft {
     pub pane: PaneId,
     /// 搜索框里的字。
     pub filter: String,
+    /// F258:这一次打开期间冻结的灯。**挂在 draft 上**:弹窗关掉 = draft 置
+    /// `None`,冻结的灯跟着没了,不需要任何额外的失效点。
+    pub frozen_lamps: Option<std::collections::BTreeMap<ProjectId, crate::project::Lamp>>,
 }
 
 impl ProjectPickDraft {
@@ -52,6 +55,7 @@ impl ProjectPickDraft {
         Self {
             pane,
             filter: String::new(),
+            frozen_lamps: None,
         }
     }
 }
@@ -87,6 +91,9 @@ pub fn show(
     let pane = d.pane;
     // 一帧取一次(同另外两处列表)。
     let now = time::OffsetDateTime::now_utc();
+    // F258:排序读的是这次打开期间冻结的灯 —— 先取出来,再进 `Area::show`
+    // 的闭包(闭包里还要再次可变借用 `d.filter`)。
+    let frozen = crate::ui::freeze_lamps(&mut d.frozen_lamps, lamps);
     let mut action = None;
     let host = pane_rect.unwrap_or_else(|| ctx.screen_rect());
     let avail = host.shrink(INSET);
@@ -121,17 +128,21 @@ pub fn show(
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
                     // F257:同 launcher —— 恒 `Tab::Active`,搜索穿透归档。
+                    // F258:排序读的是这次打开期间冻结的灯,不是 `lamps` 实时表 ——
+                    // 取在闭包外面,闭包里还要再借 `d.filter`。
                     let rows = crate::ui::project_list::rows(
                         projects,
                         crate::ui::project_list::Tab::Active,
                         &d.filter,
                         sessions,
+                        frozen,
                     );
                     if let Some(reason) = crate::ui::project_list::empty_reason(
                         projects,
                         crate::ui::project_list::Tab::Active,
                         &d.filter,
                         sessions,
+                        frozen,
                     ) {
                         ui.label(
                             egui::RichText::new(crate::ui::project_list::empty_text(
@@ -310,6 +321,7 @@ mod tests {
         let mut draft = Some(ProjectPickDraft {
             pane: PaneId(7),
             filter: query.to_string(),
+            frozen_lamps: None,
         });
         let mut drawn = Vec::new();
         for time in [0.0_f64, 1.0] {
@@ -359,6 +371,7 @@ mod tests {
         let mut draft = Some(ProjectPickDraft {
             pane: PaneId(7),
             filter: query.to_string(),
+            frozen_lamps: None,
         });
         let mut shapes = Vec::new();
         for time in [0.0_f64, 1.0] {
