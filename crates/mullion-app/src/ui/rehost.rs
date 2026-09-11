@@ -100,9 +100,13 @@ fn visible<'a>(
 
 /// 「最近连过」段最多列几条。
 ///
-/// **3 而不是 5**:这个弹窗按 pane 定位,列表高度上限 260pt ≈ 5~6 行。
-/// 5 条最近 + 一条分隔线就把主段挤没了,用户会以为下面没东西 —— 而主段
-/// (与会话管理器左栏同序)才是"照记忆找"的那一半。
+/// **3 而不是 5**:这个弹窗按 pane 定位,滚动区高度封顶 260pt。实测这一段
+/// 的开销是 段头 16 + 每行 27 + 分隔线 9;取 3 条占 106pt,主段还剩 154pt
+/// ≈ 5.7 行,取 5 条占 160pt,主段只剩 100pt ≈ 3.7 行。
+///
+/// 差的那两行**不是**"下面没东西了"(还在滚动区里,往下滚就有),而是主段
+/// (与会话管理器左栏同序)才是"照记忆找"的那一半 —— 一眼能扫到的行数从
+/// 5 掉到 3,靠记忆定位就得先滚动,而滚动时没有参照物。
 const RECENT_N: usize = 3;
 
 /// 顶部「最近连过」段列哪几条。
@@ -515,6 +519,34 @@ mod tests {
         assert!(draft.is_none(), "选完节点弹窗该自己关上");
     }
 
+    /// D11「主段不去重」的判据必须钉在**画出来的东西**上。
+    ///
+    /// 已有的 `the_main_section_still_lists_sessions_that_are_in_the_recent_section`
+    /// 断的是 `visible` 的返回值 —— 将来若有人改在 `show` 里对主段做去重
+    /// (`rows.retain(|r| !recents.contains(r))` 之类),那条照样绿,而「照左栏
+    /// 记忆找」已经破了。这条走真实渲染:同一条会话在两段**各有一行**,
+    /// 且两行都点得动。
+    ///
+    /// 顺带钉住 salt:两段的 `row_id` 若撞号,egui 会让其中一段整段点不动
+    /// 而**不报错**,这里会表现为其中一次 `click` 取到的是另一段那行。
+    ///
+    /// 自证会变红:在 `show` 里主段循环前加一句把 `recents` 里那几条从
+    /// `rows` 剔掉 —— `row_id("main", SessionId(9))` 就查不到了,`click`
+    /// panic 在 `unwrap_or_else`。
+    #[test]
+    fn a_session_in_both_sections_gets_two_rows_that_are_each_clickable() {
+        let sessions = vec![sess(9, "db", Some("2026-09-02T00:00:00Z"))];
+        let want = Some(RehostAction::Pick {
+            pane: PaneId(3),
+            session: SessionId(9),
+        });
+        for salt in ["recent", "main"] {
+            let mut draft = Some(RehostDraft::new(PaneId(3)));
+            let out = click(&mut draft, &sessions, row_id(salt, SessionId(9)));
+            assert_eq!(out, want, "「{salt}」段里这条会话没有自己那一行");
+        }
+    }
+
     /// SFTP 会话没有 PTY,换过去只会是一块永远不出字的黑屏。它连行都不该有,
     /// 所以 `row_id` 在 widget 表里查不到 —— 这是比「点了没反应」强得多的判据。
     ///
@@ -622,8 +654,8 @@ mod tests {
 
     /// D11:顶部「最近连过」段取 **3 条**,按最后连上时间倒序。
     ///
-    /// 3 而不是 5:弹窗按 pane 定位,列表上限 260pt ≈ 5~6 行,5 条最近 +
-    /// 分隔线就把主段挤没了 —— 用户会以为下面没东西了。
+    /// 3 而不是 5 的数值依据见 [`RECENT_N`] 的文档(实测:取 3 主段还剩
+    /// ≈5.7 行,取 5 只剩 ≈3.7 行)。
     ///
     /// 自证会变红:把 `RECENT_N` 改成 5。
     #[test]
