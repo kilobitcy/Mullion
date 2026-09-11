@@ -383,7 +383,11 @@ mod tests {
             proj(2, "在做的", "/data/now", None),
         ];
         assert_eq!(names_drawn(&ps, ""), vec!["在做的"], "归档的不该默认出现");
-        assert_eq!(names_drawn(&ps, "老活"), vec!["老活"], "搜索必须能搜到归档的");
+        assert_eq!(
+            names_drawn(&ps, "老活"),
+            vec!["老活"],
+            "搜索必须能搜到归档的"
+        );
     }
 
     /// 库里有项目、只是全归档了 —— 启动页不能喊「还没有项目,去建一个」。
