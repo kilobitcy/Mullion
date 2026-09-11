@@ -13449,6 +13449,24 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.ui.project_selected = None;
                                 self.ui.project_draft = None;
                             }
+                            // F257:归档 / 取消归档。**不跑 validate**(见
+                            // `ProjectIntent::SetArchived` 的文档),所以不会
+                            // 置 `ok = false`,照常落盘。
+                            crate::ui::project_manager::ProjectIntent::SetArchived(
+                                id,
+                                archived,
+                            ) => {
+                                let now = time::OffsetDateTime::now_utc()
+                                    .format(&time::format_description::well_known::Rfc3339)
+                                    .unwrap_or_default();
+                                store.set_project_archived(id, archived, &now);
+                                // 右栏那份草稿也要跟上 —— 不跟的话
+                                // `stored != Some(&*draft)` 恒真,「打开」按钮
+                                // 会永久灰着且解释是"有未保存的改动",而用户
+                                // 什么都没改。
+                                self.ui.project_draft =
+                                    store.projects().iter().find(|p| p.id == id).cloned();
+                            }
                         }
                         // 被拒时不落盘:store 里那份没变,写回去只是把没变的
                         // 东西重写一遍,但会顺带把别的实例刚写进去的东西的
@@ -15999,6 +16017,41 @@ mod tests {
         assert!(
             expr.contains("self.ui.project_intent"),
             "项目编辑没算进 touched_store(F225②;切片 I 的两张表少了一张)"
+        );
+    }
+
+    /// F257:归档 / 取消归档之后,右栏那份草稿必须跟着刷新。
+    ///
+    /// 不跟的话 `stored != Some(&*draft)` 恒真,「打开」按钮会永久灰着,
+    /// 且给出的解释是「有未保存的改动」—— 而用户什么都没改,离真根因很远,
+    /// 排查者会先去查草稿脏标记的逻辑,而不是这里少写一行。
+    ///
+    /// 这段逻辑埋在事件循环深处、经 `App` 的方法测不到(F253~F256 的教训),
+    /// 只能做源码切片:断言 `SetArchived` 那条分支的源码里出现了
+    /// `project_draft`。
+    ///
+    /// 自证会变红:把 `self.ui.project_draft = store.projects()...` 那两行删掉。
+    #[test]
+    fn archiving_a_project_refreshes_the_draft_shown_in_the_form() {
+        let prod = prod_src();
+        let at = prod
+            .find("ProjectIntent::SetArchived(")
+            .expect("找不到 SetArchived 的处理分支 —— 这条测试的锚点失效了");
+        let after = &prod[at..];
+        let arrow = after
+            .find("=> {")
+            .expect("SetArchived 分支没找到 `=> {`,这条测试的锚点失效了");
+        let rest = &after[arrow..];
+        let arm = brace_balanced_arm(rest);
+        assert!(
+            arm.len() < rest.len(),
+            "SetArchived 分支没截到闭合大括号,断言会退化成扫全文件"
+        );
+        let body = strip_comments(arm);
+        assert!(
+            body.contains("project_draft"),
+            "SetArchived 分支没有刷新 project_draft —— 归档之后「打开」按钮会\
+             永久灰着,且理由是「有未保存的改动」"
         );
     }
 

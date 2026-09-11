@@ -235,6 +235,16 @@ impl SessionStore {
         self.vault.touch_project_accessed(id, now_rfc3339);
     }
 
+    /// F257:归档 / 取消归档。调用点见 `ProjectIntent::SetArchived` 的消费处。
+    pub fn set_project_archived(
+        &mut self,
+        id: mullion_store::ProjectId,
+        archived: bool,
+        now_rfc3339: &str,
+    ) {
+        self.vault.set_project_archived(id, archived, now_rfc3339);
+    }
+
     /// 共享凭据表(F74)。UI 拿它显示「有效用户名」与凭据档列表。
     pub fn credentials(&self) -> &[mullion_store::CredentialRecord] {
         self.vault.credentials()

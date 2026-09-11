@@ -16,6 +16,12 @@ pub enum ProjectIntent {
     /// 整份保存。`ProjectRecord.id` 由 `app` 侧以第一个参数为准。
     Save(ProjectId, Box<ProjectRecord>),
     Delete(ProjectId),
+    /// F257:归档 / 取消归档。`bool` = 归档后的目标状态。
+    ///
+    /// **单独一条 intent,不走 `Save`**:`Save` 会跑 `validate_project`,而归档
+    /// 一个"名字跟别人撞了、右栏保存正灰着"的项目必须成立 —— 收起一个项目
+    /// 不该被别处的校验问题挡住(同 `touch_project_accessed` 的姿态)。
+    SetArchived(ProjectId, bool),
 }
 
 /// 列表顺序:**按最后访问时间倒序**,从没打开过的排在最后。
@@ -373,6 +379,10 @@ fn form_column(
     let dirty = stored != Some(&*draft);
     let openable = stored.is_some_and(|p| !p.nodes.is_empty()) && !dirty;
     let save_draft = draft.clone();
+    // F257:按钮上的字取**库里那份**的归档态,不是草稿 —— 草稿里的
+    // `archived_at` 永远不会被右栏任何一个控件改到(设计:只由这个按钮写),
+    // 但草稿是「保存前的编辑缓冲」,拿它当真值会在保存失败时给出过期的字。
+    let is_archived = stored.is_some_and(|p| p.archived_at.is_some());
 
     // 按钮行钉在底部,**不跟着内容滚**(F237)。右栏加了三行说明之后内容约
     // 640px,在 1080p + 150% 缩放(逻辑高 720)下,按顺序画的话「保存 / 打开 /
@@ -402,6 +412,15 @@ fn form_column(
                     .clicked()
                 {
                     ui_state.project_open_request = Some((id, None));
+                }
+                ui.add_space(SP_S);
+                // F257:归档摆在「删除项目」**左边** —— 危险程度从右往左递减,
+                // 同 `pane_title` 三个按钮的既有规矩。**不上确认框**:归档可逆、
+                // 撤销就在同一个按钮上,而「高频路径上的无谓确认会被用户练成
+                // 闭眼点确定,那时它对真正危险的几种也失效」(`show_open_confirm`
+                // 的原话)。
+                if ui.button(archive_button_label(is_archived)).clicked() {
+                    ui_state.project_intent = Some(ProjectIntent::SetArchived(id, !is_archived));
                 }
                 ui.add_space(SP_S);
                 if ui.button("删除项目").clicked() {
@@ -738,6 +757,16 @@ pub fn show_takeover_confirm(
             });
         });
     out
+}
+
+/// F257:归档按钮上的字。抽成函数只为了能单测 —— 写死「归档」的话,已归档的
+/// 项目右栏会给出一个点了看不出变化的按钮,而这是撤销归档的唯一入口。
+pub(crate) fn archive_button_label(archived: bool) -> &'static str {
+    if archived {
+        "取消归档"
+    } else {
+        "归档"
+    }
 }
 
 /// F223:打开项目前的确认框。返回 `true` = 用户点了「继续」。
@@ -1596,5 +1625,42 @@ mod tests {
         );
         assert!(err.is_some(), "解码失败该报错");
         assert_eq!(draft.icon, Some(existing), "解码失败不该把原来那张好图抹掉");
+    }
+
+    /// 高屏幕上「归档」与「删除项目」两个按钮画出来的矩形。
+    fn archive_and_delete_button_rects() -> (egui::Rect, egui::Rect) {
+        let spots = form_texts_at(900.0, None);
+        let find = |label: &str| {
+            spots
+                .iter()
+                .find(|(s, _)| s == label)
+                .unwrap_or_else(|| panic!("「{label}」压根没画出来"))
+                .1
+        };
+        (find("归档"), find("删除项目"))
+    }
+
+    /// 归档按钮摆在「删除项目」**左边** —— 危险程度从右往左递减,
+    /// 同 `pane_title` 那三个按钮的既有规矩(× 最右)。
+    ///
+    /// 量的是**画出来的横坐标**,不是源码里的书写顺序:`ui.horizontal` 里
+    /// 换个位置写、但用 `right_to_left` 布局的话,源码顺序会骗人。
+    ///
+    /// 自证会变红:把「归档」那个 `if ui.button(..)` 挪到「删除项目」后面。
+    #[test]
+    fn the_archive_button_sits_to_the_left_of_delete() {
+        let (archive, delete) = archive_and_delete_button_rects();
+        assert!(
+            archive.right() <= delete.left(),
+            "归档按钮({archive:?})必须整个在删除按钮({delete:?})左边"
+        );
+    }
+
+    /// 归档态决定按钮上的字。写死「归档」的话,已归档的项目右栏会给出一个
+    /// 点了没有任何变化的按钮 —— 而归档是可逆的,撤销入口就是这一个。
+    #[test]
+    fn the_button_says_undo_when_the_project_is_already_archived() {
+        assert_eq!(archive_button_label(false), "归档");
+        assert_eq!(archive_button_label(true), "取消归档");
     }
 }
