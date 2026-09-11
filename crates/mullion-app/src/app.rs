@@ -16027,10 +16027,16 @@ mod tests {
     /// 排查者会先去查草稿脏标记的逻辑,而不是这里少写一行。
     ///
     /// 这段逻辑埋在事件循环深处、经 `App` 的方法测不到(F253~F256 的教训),
-    /// 只能做源码切片:断言 `SetArchived` 那条分支的源码里出现了
-    /// `project_draft`。
+    /// 只能做源码切片:断言 `SetArchived` 那条分支里把 `project_draft`
+    /// 赋值为「从 store 里按 id 重新取的那份」,而不只是查 `project_draft`
+    /// 这个词出现过。
     ///
-    /// 自证会变红:把 `self.ui.project_draft = store.projects()...` 那两行删掉。
+    /// 自证会变红(两种):
+    /// 1. 把 `self.ui.project_draft = store.projects()...` 那两行整个删掉;
+    /// 2. 把它换成 `self.ui.project_draft = None;`——`project_draft` 这个词
+    ///    依然出现在分支里,原先「只查词出现」的断言对这种变异是恒绿的,
+    ///    而这正是它要挡的那个 bug(草稿被清空,`stored != Some(&*draft)`
+    ///    恒真,「打开」按钮永久灰着)。
     #[test]
     fn archiving_a_project_refreshes_the_draft_shown_in_the_form() {
         let prod = prod_src();
@@ -16048,10 +16054,13 @@ mod tests {
             "SetArchived 分支没截到闭合大括号,断言会退化成扫全文件"
         );
         let body = strip_comments(arm);
+        // rustfmt 把赋值折成了两行,先把连续空白折成单个空格再匹配,
+        // 否则连正确写法都会因为换行匹配不上。
+        let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            body.contains("project_draft"),
-            "SetArchived 分支没有刷新 project_draft —— 归档之后「打开」按钮会\
-             永久灰着,且理由是「有未保存的改动」"
+            normalized.contains("project_draft = store.projects()"),
+            "SetArchived 分支没有把 project_draft 重新赋值为 store 里的最新那份 \
+             —— 归档之后「打开」按钮会永久灰着,且理由是「有未保存的改动」"
         );
     }
 
