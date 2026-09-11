@@ -1292,7 +1292,10 @@ mod tests {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
                 egui::Shape::Text(ts) => {
-                    out.push((ts.galley.text().to_string(), ts.pos + ts.galley.size() / 2.0));
+                    out.push((
+                        ts.galley.text().to_string(),
+                        ts.pos + ts.galley.size() / 2.0,
+                    ));
                 }
                 _ => {}
             }
