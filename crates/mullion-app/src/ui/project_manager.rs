@@ -1763,4 +1763,88 @@ mod tests {
         assert_eq!(archive_button_label(false), "归档");
         assert_eq!(archive_button_label(true), "取消归档");
     }
+
+    /// D13 接线判据(复核 Critical):`list_column` 传给 `project_list::rows`
+    /// 的必须是**冻结的灯**(`ui_state.pm_frozen_lamps`),不是每帧的实时
+    /// `lamps` 表 —— 灯是异步变的(别处开/关项目、心跳超时),按实时灯排的话
+    /// 会在用户正要点某一行的那一瞬把它挤下去,点错项目=连错机器。
+    ///
+    /// 形状:先画到收敛,记下行序(灭灯全同档,按访问时间排,新在前)。
+    /// **只改活的灯表**(不碰 `ui_state`、不重开窗口),把老项目点亮,再画
+    /// 一帧 —— 行序不该变,因为排序读的是第一次打开时冻住的那份。
+    /// 最后清掉冻结槽(等价于关掉列表再打开),同一份活灯表下行序才该翻过来
+    /// —— 证明「冻结」不是「永远不更新」。
+    ///
+    /// **`ctx.read_response` 必须在 `ctx.run` 闭包内部读**:闭包外读到的是
+    /// 上一帧的陈旧记录(`session_manager/mod.rs:2448` 那条注释有原理和实测)。
+    ///
+    /// 自证会变红:把本文件 `list_column` 里 `project_list::rows(..)` 最后一个
+    /// 实参从 `frozen` 换成 `lamps`。
+    #[test]
+    fn the_manager_list_order_is_pinned_to_the_lamps_frozen_when_the_list_opened() {
+        let ps = vec![
+            proj(1, "老项目", Some("2026-09-01T00:00:00Z")),
+            proj(2, "新项目", Some("2026-09-10T00:00:00Z")),
+        ];
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            ..Default::default()
+        };
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let mut live: std::collections::BTreeMap<ProjectId, crate::project::Lamp> = [
+            (ProjectId(1), crate::project::Lamp::Dark),
+            (ProjectId(2), crate::project::Lamp::Dark),
+        ]
+        .into_iter()
+        .collect();
+
+        let order = |ctx: &egui::Context,
+                     ui_state: &mut crate::ui::UiState,
+                     live: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>|
+         -> Vec<u64> {
+            let mut rows: Vec<(u64, f32)> = Vec::new();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    ui_state,
+                    &ps,
+                    live,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
+                for id in [1u64, 2] {
+                    if let Some(r) =
+                        ctx.read_response(crate::ui::project_row::row_id("manager", ProjectId(id)))
+                    {
+                        rows.push((id, r.rect.top()));
+                    }
+                }
+            });
+            rows.sort_by(|a, b| a.1.total_cmp(&b.1));
+            rows.into_iter().map(|(id, _)| id).collect()
+        };
+
+        // 预热:窗口第一帧还在量自己的尺寸(同本文件 `window_texts` 的既有
+        // 注释),这一遍不改活灯表。
+        order(&ctx, &mut ui_state, &live);
+        let frame1 = order(&ctx, &mut ui_state, &live);
+        assert_eq!(frame1, vec![2, 1], "都灭灯时该按最近访问排,新的在前");
+
+        // 只改活的灯表,不碰 ui_state / 不重开面板。
+        live.insert(ProjectId(1), crate::project::Lamp::Lit);
+        let frame2 = order(&ctx, &mut ui_state, &live);
+        assert_eq!(
+            frame2, frame1,
+            "排序该读冻结的灯,活灯表变了不该让行序跟着跳"
+        );
+
+        // 反向断言:清掉冻结槽,等价于「关掉列表再打开」。
+        ui_state.pm_frozen_lamps = None;
+        let frame3 = order(&ctx, &mut ui_state, &live);
+        assert_eq!(frame3, vec![1, 2], "重新冻结后,亮着灯的项目该置顶");
+    }
 }
