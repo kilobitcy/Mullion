@@ -282,6 +282,10 @@ pub struct UiState {
     /// 新建改成了一键「+ 添加项目」—— 名字由 `project::fresh_project_name`
     /// 现算,那个输入框整个让位给搜索。
     pub project_search: String,
+    /// F257:项目管理器左栏当前在哪个 tab。**只有项目管理器有 tab**(设计 D3)。
+    ///
+    /// 搜索态下这个值仍然保留(不清零)—— 清空搜索要能回到你原来看的那一档。
+    pub project_tab: crate::ui::project_list::Tab,
     /// F233:启动页项目列表的搜索词。
     ///
     /// 与上面那份**分开**:项目管理器是弹窗、启动页是整页,两个界面在会话

@@ -232,25 +232,47 @@ fn list_column(
                 }
             });
 
-        if projects.is_empty() {
-            ui.label(
-                egui::RichText::new("还没有项目。项目 = 一台机器上的一个开发目录 + 一个专属 tmux 会话,打开它就回到那个活。")
-                    .color(crate::theme::c32(t.fg_muted)),
-            );
-            return;
-        }
-        // 顺序**复用** `by_recent_access`、过滤**复用** `project::matches` ——
-        // 三处列表各写一份的话,同一个搜索词在两个界面给出不同结果,而用户
-        // 几分钟内就会都看到一遍。
-        let rows: Vec<&ProjectRecord> = by_recent_access(projects)
-            .into_iter()
-            .filter(|p| crate::project::matches(p, &ui_state.project_search, sessions))
-            .collect();
-        if rows.is_empty() {
-            ui.label(egui::RichText::new("没有匹配的项目").color(crate::theme::c32(t.fg_muted)));
+        // F257:tab 栏。**搜索态整条收起**(设计 D4):搜索穿透两态,留着 tab
+        // 的话两个 tab 显示完全相同的结果,切过去画面不变 —— 那是那种
+        // 「编译过、跑起来看着像坏了」的 UI。
+        //
+        // 收起会让下面的列表上移约一行,布局跳一下 —— 接受:它由用户自己
+        // 打字触发,是有因果的位移。灰着一排点不动的 tab 反而更像 bug
+        // (同 `rehost.rs` 里那条「灰着一条永远点不动的项」的既有判断)。
+        if ui_state.project_search.trim().is_empty() {
+            ui.horizontal(|ui| {
+                for tab in [
+                    crate::ui::project_list::Tab::Active,
+                    crate::ui::project_list::Tab::Archived,
+                ] {
+                    let on = ui_state.project_tab == tab;
+                    if ui.selectable_label(on, tab.label()).clicked() {
+                        ui_state.project_tab = tab;
+                    }
+                }
+            });
             ui.add_space(SP_S);
-            if ui.button("清空搜索").clicked() {
-                ui_state.project_search.clear();
+        }
+
+        // F257:列什么 / 怎么排 / 空了说什么,一律走 `project_list` ——
+        // 三处列表共用同一份判据(设计 D8)。
+        let tab = ui_state.project_tab;
+        let rows = crate::ui::project_list::rows(projects, tab, &ui_state.project_search, sessions);
+        if let Some(reason) =
+            crate::ui::project_list::empty_reason(projects, tab, &ui_state.project_search, sessions)
+        {
+            ui.label(
+                egui::RichText::new(crate::ui::project_list::empty_text(
+                    reason,
+                    crate::ui::project_list::Surface::Manager,
+                ))
+                .color(crate::theme::c32(t.fg_muted)),
+            );
+            if reason == crate::ui::project_list::EmptyReason::NoMatch {
+                ui.add_space(SP_S);
+                if ui.button("清空搜索").clicked() {
+                    ui_state.project_search.clear();
+                }
             }
             return;
         }
@@ -1218,6 +1240,29 @@ mod tests {
             joined.contains("+ 添加项目"),
             "空手上门时反而没有新建入口:{joined}"
         );
+    }
+
+    // ---- F257:左栏 tab 栏 -------------------------------------------------
+
+    /// 跑两帧,画左栏,返回 tab 栏是否被画出来(按 [`crate::ui::project_list::Tab::label`]
+    /// 的文字找)。
+    ///
+    /// 不选中任何项目,与右栏那颗「归档」动作按钮(只在选中项目时才画)区分开。
+    fn tab_bar_visible(query: &str) -> bool {
+        let joined = window_texts(&[], query).join(" ");
+        joined.contains(crate::ui::project_list::Tab::Active.label())
+            && joined.contains(crate::ui::project_list::Tab::Archived.label())
+    }
+
+    /// D4:**搜索态没有 tab**。搜索框一非空,tab 栏整条收起 —— 留着的话两个
+    /// tab 会显示完全相同的结果(搜索穿透两态),切过去画面不变,用户会以为
+    /// 点坏了。
+    ///
+    /// 自证会变红:把 `if ui_state.project_search.trim().is_empty()` 那道闸删掉。
+    #[test]
+    fn the_tab_bar_disappears_while_searching_because_both_tabs_would_look_identical() {
+        assert!(tab_bar_visible(""), "不搜索时 tab 栏要在");
+        assert!(!tab_bar_visible("alpha"), "搜索时 tab 栏必须收起");
     }
 
     // ---- 右栏:说明多行 / 内容滚动 / 按钮钉底(F237)------------------------

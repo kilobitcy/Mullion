@@ -17,6 +17,13 @@ pub enum Tab {
     Archived,
 }
 
+impl Default for Tab {
+    /// 默认「在用」—— 打开项目管理器时该看见还在做的活。
+    fn default() -> Self {
+        Tab::Active
+    }
+}
+
 impl Tab {
     /// tab 上的字。**「在用」不叫「活跃」**:F258 把「最后活跃」定成了排序
     /// 判据,同一个词在同一个界面指两件事。也不叫「全部」(它不含归档的)、
