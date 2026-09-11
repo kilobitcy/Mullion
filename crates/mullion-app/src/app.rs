@@ -13460,12 +13460,23 @@ impl ApplicationHandler<UserEvent> for App {
                                     .format(&time::format_description::well_known::Rfc3339)
                                     .unwrap_or_default();
                                 store.set_project_archived(id, archived, &now);
-                                // 右栏那份草稿也要跟上 —— 不跟的话
-                                // `stored != Some(&*draft)` 恒真,「打开」按钮
-                                // 会永久灰着且解释是"有未保存的改动",而用户
-                                // 什么都没改。
-                                self.ui.project_draft =
-                                    store.projects().iter().find(|p| p.id == id).cloned();
+                                // 只同步归档这一个字段:整份替换会把用户在右栏
+                                // 改了还没保存的名字/说明静默吃掉。而这个字段
+                                // 必须同步 —— `update_project` 是整份覆盖
+                                // (`*slot = next`),草稿里若留着旧的
+                                // archived_at,下次点保存就把刚归的档撤销了,
+                                // 且全程无报错。`d.id == id` 这道闸不能省:
+                                // 草稿可能是另一个项目的,选错了会把归档态
+                                // 盖到不相干的项目上。
+                                if let Some(d) = self.ui.project_draft.as_mut() {
+                                    if d.id == id {
+                                        d.archived_at = store
+                                            .projects()
+                                            .iter()
+                                            .find(|p| p.id == id)
+                                            .and_then(|p| p.archived_at.clone());
+                                    }
+                                }
                             }
                         }
                         // 被拒时不落盘:store 里那份没变,写回去只是把没变的
@@ -16020,25 +16031,25 @@ mod tests {
         );
     }
 
-    /// F257:归档 / 取消归档之后,右栏那份草稿必须跟着刷新。
+    /// F257:归档 / 取消归档之后,右栏草稿里的 `archived_at` 必须跟着刷新,
+    /// 但**只能**同步这一个字段 —— 整份替换会把用户改了还没保存的名字/说明
+    /// 静默吃掉(这条测试之前的版本正是靠整份替换实现的,已改掉)。
     ///
-    /// 不跟的话 `stored != Some(&*draft)` 恒真,「打开」按钮会永久灰着,
-    /// 且给出的解释是「有未保存的改动」—— 而用户什么都没改,离真根因很远,
-    /// 排查者会先去查草稿脏标记的逻辑,而不是这里少写一行。
+    /// 不同步 `archived_at` 的后果:`update_project` 是整份覆盖
+    /// (`*slot = next`),草稿里留着旧值,下次点保存就把刚归的档撤销了,
+    /// 且全程无报错。
+    /// 整份替换的后果:用户在右栏改了还没保存的字段被静默丢弃。
     ///
     /// 这段逻辑埋在事件循环深处、经 `App` 的方法测不到(F253~F256 的教训),
-    /// 只能做源码切片:断言 `SetArchived` 那条分支里把 `project_draft`
-    /// 赋值为「从 store 里按 id 重新取的那份」,而不只是查 `project_draft`
-    /// 这个词出现过。
-    ///
-    /// 自证会变红(两种):
-    /// 1. 把 `self.ui.project_draft = store.projects()...` 那两行整个删掉;
-    /// 2. 把它换成 `self.ui.project_draft = None;`——`project_draft` 这个词
-    ///    依然出现在分支里,原先「只查词出现」的断言对这种变异是恒绿的,
-    ///    而这正是它要挡的那个 bug(草稿被清空,`stored != Some(&*draft)`
-    ///    恒真,「打开」按钮永久灰着)。
+    /// 只能做源码切片。两条断言各自对应一种变异,都已实跑自证(见提交说明):
+    /// 1. 正向 —— 把同步逻辑整段删掉:`d.archived_at = store...` 这个模式
+    ///    消失,断言变红;
+    /// 2. 反向 —— 改回整份替换
+    ///    `self.ui.project_draft = store.projects()...cloned();`:那种写法
+    ///    含有 `project_draft = store.projects()` 这个整体赋值模式,断言
+    ///    变红。
     #[test]
-    fn archiving_a_project_refreshes_the_draft_shown_in_the_form() {
+    fn archiving_syncs_only_the_archive_flag_into_the_draft() {
         let prod = prod_src();
         let at = prod
             .find("ProjectIntent::SetArchived(")
@@ -16054,13 +16065,23 @@ mod tests {
             "SetArchived 分支没截到闭合大括号,断言会退化成扫全文件"
         );
         let body = strip_comments(arm);
-        // rustfmt 把赋值折成了两行,先把连续空白折成单个空格再匹配,
+        // rustfmt 把长链式调用折成多行,先把连续空白折成单个空格再匹配,
         // 否则连正确写法都会因为换行匹配不上。
         let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        // 正向:确实把归档态同步进了草稿的那一个字段上。不同步的话,
+        // 下次保存会把刚归的档撤销(`update_project` 整份覆盖)。
         assert!(
-            normalized.contains("project_draft = store.projects()"),
-            "SetArchived 分支没有把 project_draft 重新赋值为 store 里的最新那份 \
-             —— 归档之后「打开」按钮会永久灰着,且理由是「有未保存的改动」"
+            normalized.contains("d.archived_at = store")
+                && normalized.contains("p.archived_at.clone()"),
+            "SetArchived 分支没有把 archived_at 同步进草稿 \
+             —— 下次点保存会把刚归的档悄悄撤销,且全程无报错"
+        );
+        // 反向:不是整份替换草稿。整份替换会把用户在右栏改了还没保存的
+        // 名字/说明一起静默丢掉。
+        assert!(
+            !normalized.contains("project_draft = store.projects()"),
+            "SetArchived 分支整份替换了 project_draft \
+             —— 会把用户未保存的编辑静默吃掉"
         );
     }
 
