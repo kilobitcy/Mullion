@@ -1375,6 +1375,14 @@ EOF
 
 ```rust
     /// F258:从没连上过的会话不该往 TOML 里写空键;连上过要能读回来。
+    ///
+    /// **自证方式**(Task 1 实测踩过的坑):锁定的 `toml 0.8.23` 对结构体里的
+    /// `Option::None` **本来就自动省略**,所以「删掉 `skip_serializing_if`」
+    /// 这条变异**不会**让它变红。有效的变异是加 `#[serde(skip)]` ——
+    /// 回读变 `None`,跟写入的 `Some` 对不上。跑变异时用这一条。
+    ///
+    /// (`skip_serializing_if` 仍然要写:同文件其它可选字段全是这个写法,
+    /// 一致性优先于「去掉当前冗余的属性」。)
     #[test]
     fn last_connected_at_round_trips_and_stays_out_of_the_file_when_unset() {
         let mut rec = sample_record();
