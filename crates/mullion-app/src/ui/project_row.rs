@@ -114,22 +114,48 @@ pub fn subtitle_for_query(p: &ProjectRecord, sessions: &[SessionRecord], query: 
 /// 「从未打开」本身就是用户要的信息(尤其在按时间排序的列表里,它解释了这些
 /// 行为什么都堆在最下面)。
 pub fn time_text(p: &ProjectRecord, now: time::OffsetDateTime) -> String {
-    // F257:归档态优先。搜索穿透两态之后结果里会混着两种行,不标的话用户点开
-    // 一个归档项目却不知道它是归档的。
+    // F257:归档态**短式** —— 只写「已归档」,不带相对时间。
     //
-    // **占用时间列而不是新加一列**:行宽在弹窗里是最紧张的资源(pane 宽度减
-    // 内边距),新加一列会把名字挤掉一截;而归档项目的「最后打开时间」本来就是
-    // 这一行上最没用的信息。
-    if let Some(at) = p.archived_at.as_deref() {
-        return format!(
-            "已归档 · {}",
-            crate::localtime::relative(at, now, crate::localtime::offset())
-        );
+    // 这一列不是固定宽度,`show()` 里名字的可用宽度是
+    // `text_avail - time_w - NAME_TIME_GAP`,时间列越宽,名字预算越小。实测
+    // (真实 `egui::Context::run` 铺排量出来的像素宽,不是估的):
+    // `"3 天前"` 30px,`"已归档 · 3 天前"` 70px,`"已归档"` 单独只有 33px。
+    // 长式比裸相对时间多吃 40px 的名字预算 —— 在三处调用方里,`project_pick`
+    // (pane 里的「切换项目」弹窗)的行宽随发起它的那块 pane 浮动,分屏窄到
+    // 200 逻辑点是常见场景。用本文件测试模块 `name_glyph_count` 那套 harness
+    // 实测:6 字项目名在 row_w=200 时,长式下在用态显示 6 字、归档态只剩 4 字;
+    // 短式(当前实现)两态都是 6 字,打平。短式 33px 只比裸相对时间(30px)
+    // 多 3px,对名字预算几乎没有额外挤压。完整的「归档于何时 + 最后打开于
+    // 何时」挪进 [`archived_hover_text`],hover 才看,不占这一列的常驻宽度。
+    if p.archived_at.is_some() {
+        return "已归档".to_string();
     }
     match p.last_accessed_at.as_deref() {
         Some(s) => crate::localtime::relative(s, now, crate::localtime::offset()),
         None => "从未打开".to_string(),
     }
+}
+
+/// 归档行的 hover 提示:归档时刻 + 最后打开时间。
+///
+/// 短式时间列(见 [`time_text`])把这两条信息从常驻文字里拿掉了 ——
+/// 但信息本身没有别的落点:`launcher` 和 `project_pick` 这两处调用方
+/// 只有行、没有详情面板(`project_manager` 右栏表单还留着),不挪进 hover
+/// 的话「最后打开」在这两处就彻底从界面上消失了。
+pub fn archived_hover_text(p: &ProjectRecord, now: time::OffsetDateTime) -> String {
+    let archived = p
+        .archived_at
+        .as_deref()
+        .map(|at| crate::localtime::relative(at, now, crate::localtime::offset()))
+        .unwrap_or_default();
+    let opened = match p.last_accessed_at.as_deref() {
+        Some(s) => format!(
+            "最后打开 · {}",
+            crate::localtime::relative(s, now, crate::localtime::offset())
+        ),
+        None => "从未打开".to_string(),
+    };
+    format!("已归档 · {archived}\n{opened}")
 }
 
 /// 一盏灯长什么样、以及它是什么意思。
@@ -254,14 +280,28 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
         theme::c32(t.fg_muted),
     );
     let time_w = time_galley.size().x;
-    p.galley(
-        egui::pos2(
-            rect.right() - TEXT_RIGHT_PAD - time_w,
-            rect.top() + NAME_TOP + (NAME_SIZE - SUB_SIZE) / 2.0,
-        ),
-        time_galley,
-        theme::c32(t.fg_muted),
+    let time_pos = egui::pos2(
+        rect.right() - TEXT_RIGHT_PAD - time_w,
+        rect.top() + NAME_TOP + (NAME_SIZE - SUB_SIZE) / 2.0,
     );
+    let time_rect = egui::Rect::from_min_size(time_pos, time_galley.size());
+    p.galley(time_pos, time_galley, theme::c32(t.fg_muted));
+
+    // 归档行的完整时间信息(归档于何时 + 最后打开于何时)挂在时间列这一小块
+    // 上,不挂整行:整行的 hover 已经被灯占了(见上面 `resp.hovered()` 那处
+    // `lamp` tooltip),两个 tooltip 抢同一块热区会互相打架。挂载点只在
+    // `time_rect` 而不是整行,判定精确到用户视线真正落的那几个字上。
+    if row.project.archived_at.is_some()
+        && resp.hovered()
+        && ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|q| time_rect.expand(4.0).contains(q))
+    {
+        egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), id.with("time"), |ui| {
+            ui.label(archived_hover_text(row.project, row.now));
+        });
+    }
 
     // 名称和副标题都过命中着色。副标题里就是目录和节点名 —— 搜「web01」命中的
     // 正是那里,不标出来的话用户完全不知道这一行为什么会出现。
@@ -382,14 +422,17 @@ mod tests {
         assert_eq!(time_text(&p, now()), "3 小时前");
     }
 
-    /// F257:归档项目的时间列改写「已归档 · <相对时间>」。
+    /// F257:归档项目的时间列要一眼看得见「已归档」。
     ///
     /// 搜索穿透两态之后,结果里会混着在用的和归档的 —— 不标的话用户点开一个
     /// 归档项目却不知道它是归档的,而「为什么它在列表里」这个问题没人回答。
     ///
-    /// 复用**时间列**而不是新加一列:行宽是弹窗里最紧张的资源(pane 宽度减去
-    /// 内边距),新加一列会把名字挤掉一截;而归档项目的「最后打开时间」本来就是
-    /// 这一行上最没用的信息。
+    /// 短式(不带相对时间):实测「已归档 · 3 天前」70px、「已归档」单独
+    /// 33px —— 长式比裸相对时间(30px)多吃 40px 的名字预算,在 `project_pick`
+    /// 那种行宽随分屏浮动的弹窗里,窄到 200 点时 6 字名字可见字数从 6 掉到 4
+    /// (见下面 `narrow_row_does_not_truncate_the_archived_name_more_than_the_active_one`
+    /// 的实测记录)。完整信息挪进 [`archived_hover_text`](见下面
+    /// `the_archived_hover_shows_when_it_was_archived_not_when_it_was_opened`)。
     ///
     /// 自证会变红:把 `time_text` 里的归档分支删掉。
     #[test]
@@ -406,10 +449,16 @@ mod tests {
         assert!(s.starts_with("已归档"), "归档态要一眼看得见:{s}");
     }
 
-    /// 归档态的时间取的是**归档时间**,不是最后打开时间 —— 两者在这条判据里
-    /// 被造成不同的相对档位,取错会红。
+    /// 归档态的「归档于」取的是**归档时间**,不是最后打开时间 —— 两者在这条
+    /// 判据里被造成不同的相对档位,取错会红。
+    ///
+    /// F257 挪窝:短式时间列(`time_text`)不再带相对时间,这条判据原来钉的
+    /// 「时间列里的相对时间取归档时间不取最后打开时间」现在没有落点了 ——
+    /// 完整的两段时间挪进了 [`archived_hover_text`],判据跟着挪过去:
+    /// hover 文本里「已归档 · …」那一段要对应 `archived_at`,不能混进
+    /// `last_accessed_at` 的相对档位。
     #[test]
-    fn the_archived_row_shows_when_it_was_archived_not_when_it_was_opened() {
+    fn the_archived_hover_shows_when_it_was_archived_not_when_it_was_opened() {
         let now = time::OffsetDateTime::parse(
             "2026-09-11T12:00:00Z",
             &time::format_description::well_known::Rfc3339,
@@ -417,10 +466,18 @@ mod tests {
         .unwrap();
         let mut p = proj(1, "老活", "/data/old", Some("2026-01-01T00:00:00Z"));
         p.archived_at = Some("2026-09-11T11:00:00Z".into());
-        let s = time_text(&p, now);
+        let s = archived_hover_text(&p, now);
         let opened =
             crate::localtime::relative("2026-01-01T00:00:00Z", now, crate::localtime::offset());
-        assert!(!s.contains(&opened), "取成了最后打开时间:{s}");
+        let archived_line = s.lines().next().unwrap_or_default();
+        assert!(
+            !archived_line.contains(&opened),
+            "「已归档」那一行取成了最后打开时间:{s}"
+        );
+        assert!(
+            s.contains("最后打开"),
+            "最后打开时间被短式挤掉之后应该挪进 hover,而不是彻底消失:{s}"
+        );
     }
 
     /// **整行**可点,不是只有那几个字可点。
@@ -803,5 +860,110 @@ mod tests {
         shapes.iter().for_each(|cs| walk(&cs.shape, &mut xs));
         // 时间列在最右,名称/副标题在左 —— 取最小的那个就是文字左边界。
         xs.into_iter().map(|x| x.round() as u32).min()
+    }
+
+    // ---- F257:归档短式时间列不该多吃名字预算 ------------------------------
+
+    /// 名字的可用宽度是从时间列宽度里扣出来的(见 `show()` 里
+    /// `text_avail - time_w - NAME_TIME_GAP`)。这条测试钉的是**回归本身**:
+    /// 拿真实 `egui::Context::run` 在窄行宽(row_w=200,`project_pick` 那种
+    /// 随分屏浮动的弹窗常见宽度)下铺排同一个 6 字项目名,分别量在用态和
+    /// 归档态的可见字形数。
+    ///
+    /// 实测(本用例里量到的真值,用的是下面 `name_glyph_count` 这套 harness,
+    /// 不是估的):短式(当前代码)下在用态 6 字、归档态 6 字,完全打平;
+    /// 把 `time_text` 的归档分支临时改回长式 `已归档 · <相对时间>` 之后
+    /// 重跑,在用态仍是 6 字,归档态掉到 4 字 —— 差值从 0 变成 2,自证确实
+    /// 变红了。
+    ///
+    /// 自证会变红:把 `time_text` 的归档分支改回长式
+    /// `format!("已归档 · {}", ...)`。
+    #[test]
+    fn narrow_row_does_not_truncate_the_archived_name_more_than_the_active_one() {
+        const NAME: &str = "接口服务测试"; // 6 个汉字
+        const ROW_W: f32 = 200.0;
+        let active = name_glyph_count(ROW_W, false, NAME);
+        let archived = name_glyph_count(ROW_W, true, NAME);
+        assert!(
+            active.abs_diff(archived) <= 1,
+            "row_w={ROW_W} 下,在用态可见 {active} 字、归档态可见 {archived} 字 \
+             —— 时间列变长又在挤名字预算了"
+        );
+    }
+
+    /// 铺排一行,量出**名称**那段文字实际画出来的可见字形数
+    /// (`galley.rows[].glyphs.len()`,不是 `job.text.len()` —— 后者恒是原串,
+    /// 截断只发生在 `rows`/`glyphs` 里,量 `text` 量不出回归,复核在这上头
+    /// 踩过一次)。
+    fn name_glyph_count(row_w: f32, archived: bool, name: &str) -> usize {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut p = proj(9, name, "/srv/x", Some("2026-09-01T00:00:00Z"));
+        if archived {
+            p.archived_at = Some("2026-09-05T00:00:00Z".into());
+        }
+        let ss = vec![sess(7, "web01")];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0));
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = ctx
+                .run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            // `CentralPanel` 的 `Frame::show` 在跑内容前先
+                            // `expand_to_include_rect(ui.max_rect())`,min_rect
+                            // 已经等于整块面板宽 —— 这时候再 `set_width`/
+                            // `set_max_width` 缩不下去(egui 文档写明「缩不到
+                            // 当前 min 以下」)。`allocate_ui` 另开一块**没有
+                            // 预先撑满**的子区域,宽度才真的是 `row_w`。
+                            ui.allocate_ui(egui::vec2(row_w, ROW_H), |ui| {
+                                let _ = show(
+                                    ui,
+                                    &t,
+                                    &Row {
+                                        project: &p,
+                                        lamp: crate::project::Lamp::Unknown,
+                                        sessions: &ss,
+                                        query: "",
+                                        selected: false,
+                                        now: now(),
+                                        list: "test",
+                                        icon: None,
+                                        icon_bg: None,
+                                    },
+                                );
+                            });
+                        });
+                    },
+                )
+                .shapes;
+        }
+        fn walk<'a>(s: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::TextShape>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut texts));
+        // 名称走 `NAME_SIZE`(14.0),副标题/时间都走 `SUB_SIZE`(11.0)—— 按
+        // 字号挑出名称那一段,不靠画的顺序猜。
+        let name_ts = texts
+            .iter()
+            .find(|ts| {
+                ts.galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|s| s.format.font_id.size)
+                    == Some(NAME_SIZE)
+            })
+            .expect("没找到名称那段文字");
+        name_ts.galley.rows.iter().map(|r| r.glyphs.len()).sum()
     }
 }
