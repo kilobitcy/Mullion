@@ -23917,12 +23917,18 @@ mod tests {
         let install = body
             .find("install_pack(")
             .expect("run_pack_import 的函数体切歪了 —— 下面几条断言会空过");
+        // 断言的是**换进去**那一句,不是「调用了 open」——「开一把扔掉」编译
+        // 照过、行为与没开完全一样,只断言调用的话这条守护杀不掉它(实测)。
         let reopen = body
-            .find("SessionStore::open(")
-            .expect("导入后没重开会话库 —— 用户不重启随手改一条,导入的配置被旧内存整份盖回去");
+            .find("self.store = Some(")
+            .expect("导入后没把重开的库换进内存 —— 用户不重启随手改一条,导入的配置被旧内存整份盖回去");
+        assert!(
+            body.contains("SessionStore::open("),
+            "换进去的不是重新打开的那一份"
+        );
         let known = body
-            .find("KnownHostsFile::load(")
-            .expect("导入后没重载 known_hosts —— TOFU 判据还是本机旧的那份");
+            .find("*k = KnownHostsFile::load(")
+            .expect("导入后没把重载的 known_hosts 换进去 —— TOFU 判据还是本机旧的那份");
         assert!(
             install < reopen && install < known,
             "在落盘之前就重开 —— 读回来的还是旧配置"
