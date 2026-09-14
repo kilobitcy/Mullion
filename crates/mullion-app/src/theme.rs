@@ -357,6 +357,19 @@ pub const FOCUS_RING_W: f32 = 1.0;
 /// (「键盘现在归我」)在屏幕上有两种长相,眼睛得学两遍。
 pub const FOCUS_RING_ROUNDING: egui::Rounding = egui::Rounding::ZERO;
 
+/// F261:焦点描边离内容的空隙(逻辑点)。
+///
+/// 用户实报「太紧逼了」—— 框正好贴着内容画,路径条、列头、行的描边和它挤在
+/// 同一像素带上,看着像内容被勒了一圈。往**外**扩而不是把内容往里推:内容
+/// 位置和列宽预算一点都不动,只借宿主那一圈留白。
+///
+/// 3.0 是硬上限,不是审美取值:两个宿主(侧栏 / 标签宿主)都是「裁剪区按原样、
+/// 布局预算 `shrink2(column_pad())`」,`column_pad` = `SP_XS` = 4 点。扩过 4
+/// 就顶到裁剪边被切掉半条线;要再宽只能动 `column_pad`,而那会把内容一起往里推。
+/// 守护:`files_panel::tests::the_focus_ring_stands_off_the_content_without_
+/// leaving_the_column`。
+pub const FOCUS_RING_GAP: f32 = 3.0;
+
 /// F206:焦点描边。**三处(pane 边框 / 文件面板 / 内置编辑器窗口)共用这一个
 /// 出口**,`FOCUS_RING_ROUNDING` 一起用。
 ///

@@ -763,9 +763,13 @@ pub fn show(
     // 2 点圆角框、pane 那边是 1 点直角线,同一个语义两种长相。下面那两处
     // 也画整栏描边,但**语义不同**(拖放落点,不是焦点),故意留粗留圆角:
     // 两者能同时出现,长得一样的话用户分不出「键盘归我」和「松手会落这儿」。
+    //
+    // F261:框画在**扩出去一圈**的矩形上(`FOCUS_RING_GAP`),不贴着内容。
+    // 借的是宿主 `shrink2(column_pad())` 让出来的那圈留白 —— 布局预算
+    // (`ui.max_rect()`)一点没动,内容位置和列宽预算因此零损失。
     if focused {
         ui.painter().rect_stroke(
-            ui.max_rect(),
+            ui.max_rect().expand(theme::FOCUS_RING_GAP),
             theme::FOCUS_RING_ROUNDING,
             theme::focus_ring(t),
         );
@@ -4387,6 +4391,79 @@ mod tests {
             rings[0].rounding,
             crate::theme::FOCUS_RING_ROUNDING,
             "焦点框是圆角的 —— pane 那条是直角,同一个语义两种长相"
+        );
+    }
+
+    /// F261:焦点框跟内容之间要有一圈空隙,而且**这圈空隙必须还在本栏之内**。
+    ///
+    /// 用户实报「太紧逼了」。修法是往外扩(`ui.max_rect().expand(GAP)`),不是
+    /// 把内容往里推 —— 内容位置和列宽预算因此一点不动。但往外扩有个天花板:
+    /// 两个宿主都是「裁剪区按原样、布局预算 `shrink2(column_pad())`」,能借的
+    /// 留白只有 `column_pad` 那一档(`SP_XS` = 4)。扩过头就顶到裁剪边被切掉
+    /// 半条线 —— 而**被裁掉这件事在 shape 里看不出来**(`rect_stroke` 照样记一
+    /// 个完整矩形,裁剪是 tessellate 之后的事),所以这条判据只能拿「框有没有
+    /// 跑出裁剪矩形」来钉,不能等着数形状。
+    ///
+    /// 脚手架照抄真实宿主的两层:外面是裁剪矩形,里面 `shrink2(column_pad())`
+    /// 才是 `show()` 拿到的 `max_rect`。直接在 `CentralPanel` 上跑测不出来 ——
+    /// 那里裁剪区和布局预算是同一个矩形,扩多少都"出界"。
+    ///
+    /// 自证会变红(三条各自):
+    /// 1. 把 `expand(theme::FOCUS_RING_GAP)` 去掉 → 空隙断言红;
+    /// 2. 把 `FOCUS_RING_GAP` 改成 0 → 空隙断言红;
+    /// 3. 把 `FOCUS_RING_GAP` 改成 6(> `column_pad`) → 出界断言红。
+    #[test]
+    fn the_focus_ring_stands_off_the_content_without_leaving_the_column() {
+        let t = crate::theme::MULLION_DARK;
+        let accent = theme::c32(t.accent);
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let ctx = egui::Context::default();
+        let mut cols = ColWidths::default();
+        // 这一栏的裁剪矩形(宿主给的),和 `show()` 实际拿到的布局预算。
+        let outer = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(400.0, 500.0));
+        let inner = outer.shrink2(column_pad());
+        let mut rings = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                        ui.set_clip_rect(outer);
+                        show(
+                            ui,
+                            &t,
+                            "远端",
+                            1,
+                            PanelColumn::Remote,
+                            &mut state,
+                            true,
+                            BookmarkView::none(),
+                            0,
+                            &mut cols,
+                            None,
+                            None,
+                        );
+                    });
+                });
+            });
+            rings = collect_stroked_rects(&out.shapes, accent);
+        }
+        assert_eq!(rings.len(), 1, "焦点框没画出来 —— 下面两条断言会空过");
+        let ring = rings[0].rect;
+        assert!(
+            ring.min.x <= inner.min.x - 1.0
+                && ring.min.y <= inner.min.y - 1.0
+                && ring.max.x >= inner.max.x + 1.0
+                && ring.max.y >= inner.max.y + 1.0,
+            "焦点框贴着内容画(框 {ring:?} vs 内容预算 {inner:?})—— 用户报的\
+             正是这个「太紧逼」"
+        );
+        assert!(
+            outer.contains_rect(ring),
+            "焦点框扩出了本栏的裁剪矩形(框 {ring:?} vs 裁剪 {outer:?})—— \
+             线会被切掉,屏幕上是个缺边的框。要再宽只能动 `column_pad`,\
+             而那会把内容一起往里推"
         );
     }
 
