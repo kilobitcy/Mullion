@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-app"
-version = "0.1.109"
+version = "0.1.110"
 dependencies = [
  "arboard",
  "base64",
@@ -2598,11 +2598,11 @@ dependencies = [
 
 [[package]]
 name = "mullion-core"
-version = "0.1.109"
+version = "0.1.110"
 
 [[package]]
 name = "mullion-ssh"
-version = "0.1.109"
+version = "0.1.110"
 dependencies = [
  "log",
  "russh",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-store"
-version = "0.1.109"
+version = "0.1.110"
 dependencies = [
  "argon2",
  "base64",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "mullion-term"
-version = "0.1.109"
+version = "0.1.110"
 dependencies = [
  "alacritty_terminal",
  "vte",
