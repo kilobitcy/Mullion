@@ -2164,6 +2164,80 @@ impl PanelFrame {
 /// 该字段用 `0.0` 当「还没拖过」的哨兵,真正的默认值代入在这里。
 const DEFAULT_SIDEBAR_W: f32 = 360.0;
 
+/// F262:侧栏的远端栏此刻**是从哪块分屏起来的**。
+///
+/// 用户实报:分屏多的时候,`Ctrl+Shift+B` 调出来的侧栏看不出归属 —— 它跟着
+/// 哪块 pane 的目录、上传下载又会落到谁那儿,屏幕上一个字都没写。
+pub struct OwnerTag {
+    /// 分屏序号,从 1 起。**跟标题条同源**(`TitleView::index`)—— 各算一遍
+    /// 的话,标题条写「分屏 2」、侧栏写「分屏 3」,用户两边对不上。
+    pub index: usize,
+    /// F62 语义色。`None` = 这条会话没设色(或没有会话记录),那就只写字、
+    /// 不画竖条 —— 编一个默认色等于凭空多一种颜色,而色是 F61/F62 的信道。
+    pub color: Option<egui::Color32>,
+}
+
+/// F262:从**这一帧的标题条真值**里认出侧栏的归属分屏。
+///
+/// `pane` 是 `app.rs` 在侧栏「关→开」那一帧记下的焦点 pane(远端栏正是在那
+/// 一帧被同步到它的目录上的,见 `App::sync_files_to_focused_pane`)。
+///
+/// 三种情况明确**不写**,因为都不是「唯一归属」:
+/// - 只有一块分屏(`titles.len() < 2`):没有别的 pane 可混淆,写出来是噪音;
+/// - 没记下(`pane == None`):标签宿主(SFTP 节点标签压根没有 pane)、
+///   或侧栏是上一个版本留下来就开着的;
+/// - 记下的那块 pane 已经不在这一帧的标题里(用户把它关了/换了标签)。
+///
+/// **拿 `titles` 当真值而不是自己存一份 `pane → 序号/颜色`**:那种映射表在
+/// 用户关掉 pane、换节点之后没人清(F160~F163 踩过的「意图表换节点没人清」
+/// 同一形状)。这里每帧现查,查不到就不写,天然自愈。
+pub fn owner_tag(
+    titles: &[crate::ui::pane_title::TitleView<'_>],
+    pane: Option<mullion_core::layout::PaneId>,
+) -> Option<OwnerTag> {
+    if titles.len() < 2 {
+        return None;
+    }
+    let pane = pane?;
+    let v = titles.iter().find(|v| v.geom.id == pane)?;
+    Some(OwnerTag {
+        index: v.index,
+        // 取 `PaneTitle` 这个落点:侧栏写的就是「那块 pane」,跟标题条是同一
+        // 条信道。用户在会话里没勾 `PaneTitle` 就说明他不想让这块色出现在
+        // 「pane 的身份」上,侧栏不该绕过这个意思。
+        color: v
+            .appearance
+            .and_then(|a| crate::ui::badge::should_paint(a, mullion_store::ColorTarget::PaneTitle)),
+    })
+}
+
+/// F262:栏头那句话。抽成纯函数是为了让守护钉在文本本身上 —— 「分屏 N」这
+/// 几个字要跟标题条对得上,是用户能不能把两处连起来的全部依据。
+pub fn owner_header_text(index: usize) -> String {
+    format!("远端 · 分屏 {index}")
+}
+
+/// F262:画栏头(一条 F62 语义色竖条 + 一句「远端 · 分屏 N」)。
+///
+/// **画在宿主里、`show()` 之前**,不进 `show()`:这是「这一栏属于谁」的外部
+/// 事实,`show()` 只认自己那份 `PaneState`。画在这里还顺带把布局光标往下推
+/// 一行,`show()` 里 `body_h` 用的是 `available_height()`,自己就让开了。
+fn owner_header(ui: &mut egui::Ui, t: &Theme, tag: &OwnerTag) {
+    ui.horizontal(|ui| {
+        if let Some(c) = tag.color {
+            // 竖条跟 pane 标题条、会话列表行用同一个出口(`badge`),不自己
+            // 画一个宽度/圆角都对不上的。
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(crate::ui::badge::EDGE_BAR_W, ROW_H),
+                egui::Sense::hover(),
+            );
+            crate::ui::badge::paint_edge_bar(ui.painter(), rect, crate::ui::badge::Side::Left, c);
+        }
+        // `fg_dim`:这是个身份标记,不是内容。跟栏底状态行同一档。
+        ui.colored_label(theme::c32(t.fg_dim), owner_header_text(tag.index));
+    });
+}
+
 /// 侧栏宿主(设计 D1 的宿主之一)。**上下堆叠**:侧栏典型宽 320~450px,
 /// 左右并排后每栏只剩 160~220px,四列排不下;而把侧栏加宽到 560px 会
 /// 压扁终端列数,让远端 TUI 重排得很难看(设计 D4)。
@@ -2214,6 +2288,7 @@ pub fn sidebar(
     drop_in: usize,
     focus_click: &mut bool,
     rel_base: Option<&[u8]>,
+    owner: Option<&OwnerTag>,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     let mut hit: Option<PanelColumn> = None;
@@ -2297,6 +2372,11 @@ pub fn sidebar(
                     hit = Some(PanelColumn::Remote);
                 }
                 ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                    // F262:栏头只给远端栏 —— 本地栏是**本机**的目录,跟哪块
+                    // 分屏没有关系,给它写「分屏 N」是假的。
+                    if let Some(tag) = owner {
+                        owner_header(ui, t, tag);
+                    }
                     out.0 = show(
                         ui,
                         t,
@@ -4467,6 +4547,175 @@ mod tests {
         );
     }
 
+    /// F262 的脚手架:造一块只有 `id` 有意义的 `PaneGeom`。
+    fn pane_geom(id: u32) -> crate::shell::workspace::PaneGeom {
+        use crate::shell::workspace::PxRect;
+        let px = PxRect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        crate::shell::workspace::PaneGeom {
+            id: mullion_core::layout::PaneId(id),
+            px,
+            title_px: px,
+            term_px: px,
+            grid: (80, 24),
+        }
+    }
+
+    /// F262 的脚手架:一块分屏的标题条视图,只填这条测试在乎的三样。
+    fn title_of(
+        id: u32,
+        index: usize,
+        appearance: Option<&crate::ui::badge::Appearance>,
+    ) -> crate::ui::pane_title::TitleView<'_> {
+        crate::ui::pane_title::TitleView {
+            geom: pane_geom(id),
+            index,
+            host: None,
+            status: crate::shell::workspace::PaneStatus::Live,
+            focused: false,
+            appearance,
+            cwd_leaf: None,
+            tmux: None,
+            project: None,
+            project_icon: None,
+            notice: None,
+        }
+    }
+
+    /// F262:归属分屏认得出来 —— 而且**三种「算不出唯一归属」的情况一律不写**。
+    ///
+    /// 宁可不写也不能写错:这行字的全部用途就是让用户把侧栏和某一块 pane
+    /// 对上,指错了比没有更糟(他会照着那块 pane 去理解上传下载落在哪儿)。
+    ///
+    /// 自证会变红(逐条):
+    /// - 去掉 `titles.len() < 2` 那道门 —— 「只有一块分屏」那条红;
+    /// - 把 `find(..)?` 换成 `titles.first()` —— 「pane 已经不在了」那条红;
+    /// - 把 `ColorTarget::PaneTitle` 换成别的落点 —— 颜色那条红。
+    #[test]
+    fn the_sidebar_only_names_its_owner_pane_when_that_owner_is_unambiguous() {
+        use mullion_core::layout::PaneId;
+        let a = crate::ui::badge::Appearance {
+            color: Some(mullion_store::ColorSpec {
+                hex: "#3b82f6".into(),
+                apply_to: vec![mullion_store::ColorTarget::PaneTitle],
+            }),
+            ..Default::default()
+        };
+
+        let two = [title_of(1, 1, None), title_of(2, 2, Some(&a))];
+        let tag = owner_tag(&two, Some(PaneId(2))).expect("两块分屏、归属在册,该认出来");
+        assert_eq!(tag.index, 2, "分屏号跟标题条对不上 —— 用户没法把两处连起来");
+        assert_eq!(
+            tag.color,
+            Some(egui::Color32::from_rgb(0x3b, 0x82, 0xf6)),
+            "没取到这块 pane 的 F62 语义色"
+        );
+
+        assert!(
+            owner_tag(&[title_of(1, 1, None)], Some(PaneId(1))).is_none(),
+            "只有一块分屏时还写「分屏 1」—— 没有别的 pane 可混淆,是纯噪音"
+        );
+        assert!(
+            owner_tag(&two, Some(PaneId(9))).is_none(),
+            "归属的那块 pane 已经不在这一帧的标题里(被关掉/换了标签),\
+             却照样写了 —— 序号会指到另一块 pane 上"
+        );
+        assert!(owner_tag(&two, None).is_none(), "压根没记下归属却写了字");
+
+        // 会话没把色勾到 `PaneTitle` 这个落点上 → 只写字、不画竖条。
+        let b = crate::ui::badge::Appearance {
+            color: Some(mullion_store::ColorSpec {
+                hex: "#3b82f6".into(),
+                apply_to: vec![mullion_store::ColorTarget::Tab],
+            }),
+            ..Default::default()
+        };
+        let other = [title_of(1, 1, None), title_of(2, 2, Some(&b))];
+        assert_eq!(
+            owner_tag(&other, Some(PaneId(2)))
+                .expect("归属仍然认得出")
+                .color,
+            None,
+            "用户没把色勾到「pane 的身份」这个落点上,侧栏不该绕过这个意思"
+        );
+    }
+
+    /// F262:栏头那句话真的画在**远端栏**里,而且归属算不出来时一个字都不画。
+    ///
+    /// 判据是「文字落在**远端栏自己那块矩形**里」,不是「在屏幕下半部」——
+    /// 侧栏两栏是 0.4 / 0.6 上下堆叠,远端栏的顶边在屏幕中线**上方**,拿中线
+    /// 当分界会把画对了的那一版判红(第一版就是这么错的)。两栏的矩形从
+    /// F100 的插桩点(`文件面板/本地`、`文件面板/远端`)拿,跟真实布局同源。
+    ///
+    /// 写在本地栏是个真实的错法 —— 本地栏是**本机**的目录,跟哪块分屏没关系。
+    ///
+    /// 自证会变红:
+    /// - 把 `owner_header` 的调用挪到本地栏那个 `scope_builder` 里 —— 归属栏判据红;
+    /// - 把 `if let Some(tag) = owner` 去掉(无条件画)—— 「不该有」那条红。
+    #[test]
+    fn the_owner_line_is_drawn_in_the_remote_column_and_only_when_there_is_an_owner() {
+        let t = crate::theme::MULLION_DARK;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+        let tag = OwnerTag {
+            index: 2,
+            color: Some(egui::Color32::from_rgb(0x3b, 0x82, 0xf6)),
+        };
+        let render = |owner: Option<&OwnerTag>| {
+            let ctx = egui::Context::default();
+            annotate::toggle(&ctx);
+            let mut ui_state = crate::ui::UiState::default();
+            let mut frame = two_columns();
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                shapes = ctx
+                    .run(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            sidebar(
+                                ctx,
+                                &t,
+                                &mut ui_state,
+                                7,
+                                true,
+                                &mut frame,
+                                0,
+                                &mut false,
+                                None,
+                                owner,
+                            );
+                        },
+                    )
+                    .shapes;
+            }
+            let local = annotate::spot_rect(&ctx, "文件面板/本地").expect("本地栏没画");
+            let remote = annotate::spot_rect(&ctx, "文件面板/远端").expect("远端栏没画");
+            (shapes, local, remote)
+        };
+
+        let needle = owner_header_text(2);
+        let (with, local, remote) = render(Some(&tag));
+        let pos = find_text_pos(&with, &needle)
+            .unwrap_or_else(|| panic!("侧栏里没找到「{needle}」—— 栏头压根没画"));
+        assert!(
+            remote.contains(pos) && !local.contains(pos),
+            "「{needle}」没画在远端栏里(pos={pos:?} 远端={remote:?} 本地={local:?})\
+             —— 本地栏是本机目录,跟哪块分屏无关"
+        );
+
+        let (without, _, _) = render(None);
+        assert!(
+            find_text_pos(&without, "分屏").is_none(),
+            "算不出归属时还是写了「分屏 …」—— 指错比没有更糟"
+        );
+    }
+
     /// 代码复核挖出的真 bug:`ScrollArea` 的持久化 id 若只拼 `id`
     /// (`"远端"`/`"本地"`),跟哪个标签无关——`egui::Context` 整窗口只建
     /// 一次、跨标签复用,两个 SFTP 标签的同一栏会撞出同一个 `Id`,标签 A
@@ -6430,7 +6679,7 @@ mod tests {
             }
             let mut took = false;
             let _ = ctx.run(input, |ctx| {
-                sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut took, None);
+                sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut took, None, None);
             });
             took
         };
@@ -6521,6 +6770,7 @@ mod tests {
                         0,
                         &mut false,
                         None,
+                        None,
                     );
                 },
             );
@@ -6602,7 +6852,7 @@ mod tests {
             |input: egui::RawInput, frame: &mut PanelFrame, ui_state: &mut crate::ui::UiState| {
                 let mut acts = (None, None);
                 let out = ctx.run(input, |ctx| {
-                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut false, None);
+                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut false, None, None);
                 });
                 (acts, out)
             };
@@ -6685,6 +6935,7 @@ mod tests {
                             &mut frame,
                             0,
                             &mut false,
+                            None,
                             None,
                         );
                     },

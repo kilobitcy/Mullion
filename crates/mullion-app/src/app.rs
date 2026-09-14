@@ -2220,6 +2220,19 @@ pub struct App {
     /// Ctrl+Shift+B 开侧栏就永远同步不到焦点 pane 的目录。跨帧字段 + 判据
     /// 放在 `render_frame` 调用之后,两条路径才都覆盖得到。
     files_sidebar_was_open: bool,
+    /// F262:侧栏是**从哪块分屏调出来的**(标签世代号 + `PaneId`)。
+    ///
+    /// 记的是「关→开」那一帧的焦点 pane —— 远端栏正是在那一帧被
+    /// `sync_files_to_focused_pane` 同步到它的目录上的,之后**不再跟随焦点**,
+    /// 所以「当前焦点 pane」不是这个问题的答案:用户开完侧栏再去点别的分屏,
+    /// 侧栏仍然停在原来那块的目录上。
+    ///
+    /// **带世代号**:`PaneId` 每个 `Workspace` 各自从 1 起编(见
+    /// `Workspace::new` 的说明),切到别的标签后同一个号多半也存在,不对世代
+    /// 就会把另一个标签的分屏认成归属 —— 而那种错是「看着完全合理」的。
+    /// 消费端(`ui::mod` → `files_panel::owner_tag`)还要再拿这一帧的标题条
+    /// 核一次,pane 关掉了就自动不写。
+    files_owner_pane: Option<(u64, mullion_core::layout::PaneId)>,
     /// F218:跳转意图的发号器。每按一次 `Ctrl+Shift+B`(且认出了路径)+1,
     /// `stat` 结果回来时对账 —— 用户按得比网络快时会有后发先至。
     ///
@@ -2920,6 +2933,7 @@ impl App {
             picker_busy: PickerBusy::default(),
             ui_dirty: true, // 首帧必须画出来
             files_sidebar_was_open: false,
+            files_owner_pane: None,
             reveal_seq: 0,
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
@@ -12277,6 +12291,26 @@ impl ApplicationHandler<UserEvent> for App {
                             // 留着,下面 `sidebar_arg`/`content_arg` 那段要用。
                             let active_is_files = self.active_is_files_tab();
                             let files_owner_generation = self.files_owner_generation();
+                            // F262:侧栏「关→开」这一帧,记下它是从哪块分屏起
+                            // 来的。判据跟下面那条同步(`sync_files_to_focused_
+                            // _pane`)**必须是同一个**:记的就是那次同步的目标,
+                            // 两处用不同判据的话,栏头写的分屏号会指向一块跟
+                            // 面板内容无关的 pane。
+                            //
+                            // 记在这里(`render_frame` **之前**)而不是跟同步一起
+                            // 放帧尾:放帧尾的话侧栏出现的那一帧栏头还是空的,
+                            // 要等下一次重绘才补上 —— 而「侧栏刚弹出来」恰好是
+                            // 用户唯一会去看这行字的时刻。跨帧标志
+                            // `files_sidebar_was_open` 在帧尾才更新,所以同一帧
+                            // 的开头和结尾判出来的跃迁是同一个。
+                            if self.ui.files_sidebar_open && !self.files_sidebar_was_open {
+                                self.files_owner_pane = files_owner_generation.and_then(|gen| {
+                                    self.tabs
+                                        .by_generation(gen)
+                                        .and_then(|t| t.content.as_terminal())
+                                        .map(|t| (gen, t.ws.focus()))
+                                });
+                            }
                             if let Some(gen) = files_owner_generation {
                                 if self.tabs.active().is_some_and(|t| {
                                     t.content.files_panel().is_some_and(|f| {
@@ -12677,6 +12711,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 ),
                                 files_focused: self.effective_focus()
                                     == shell::input_route::Focus::FilesPanel,
+                                // F262:世代号对不上就当没记 —— 用户切到别的
+                                // 标签时侧栏还开着,而那个 `PaneId` 是上一个
+                                // 标签的编号(每个 `Workspace` 各自从 1 起编)。
+                                files_owner_pane: self
+                                    .files_owner_pane
+                                    .filter(|(g, _)| Some(*g) == files_owner_generation)
+                                    .map(|(_, p)| p),
                             };
                             // F125:光标该不该画,得在借出 `self.active` 之前算——
                             // `blink_on` 要读 `self.window_focused`/`self.last_input_at`/
@@ -26753,6 +26794,69 @@ mod tests {
             prod.contains("&& !revealing"),
             "F218:同步没给在途的跳转意图让位 —— 两个人同一帧都改当前目录,\
              面板会先被拽到 pane 的 cwd、半秒后再被跳转结果拽走"
+        );
+    }
+
+    /// F262:侧栏归属分屏那三段接线,每一段错了都静默。
+    ///
+    /// - **记录判据必须跟同步判据是同一个**(「关→开」跃迁):同步把远端栏带
+    ///   到焦点 pane 的目录,栏头写的就该是那一次的目标。两处判据分了岔,
+    ///   栏头会指向一块跟面板内容无关的 pane —— 而那种错「看着完全合理」。
+    /// - **记录必须排在 `render_frame` 之前**:排在后面的话,侧栏弹出来那一帧
+    ///   栏头还是空的,要等下一次重绘才补上 —— 而「侧栏刚弹出来」正是用户唯一
+    ///   会去看这行字的时刻。
+    /// - **往 `UiFrame` 里传的时候必须按世代号过滤**:`PaneId` 每个 `Workspace`
+    ///   各自从 1 起编,切到别的标签后同一个号多半也存在,不过滤就会把另一个
+    ///   标签的分屏认成归属。
+    ///
+    /// 扎的是源码结构:真正验它要一条活 sftp 连接和真实一帧渲染,这个容器里
+    /// 造不出来(同上面几条接线守护的限制)。
+    ///
+    /// 自证会变红(逐条):
+    /// - 把记录处的判据改成 `if self.ui.files_sidebar_open {` —— 第一条红;
+    /// - 把记录那一段挪到帧尾(`files_sidebar_was_open` 赋值旁边)—— 第二条红;
+    /// - 去掉 `.filter(|(g, _)| Some(*g) == files_owner_generation)` —— 第三条红。
+    #[test]
+    fn the_sidebar_owner_pane_is_recorded_on_the_same_edge_that_syncs_it_and_before_the_frame() {
+        let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split 至少给一段");
+        assert!(prod.len() < src.len(), "范围没切到 mod tests 之前");
+
+        let at = prod
+            .find("self.files_owner_pane = files_owner_generation.and_then(")
+            .expect("F262:没人记侧栏是从哪块分屏起来的 —— 栏头永远空着");
+        // 判据向**上**找最近的那句 `if`:记录块的条件就写在它上面几行。
+        let head = &prod[..at];
+        let cond = head
+            .rfind("if self.ui.files_sidebar_open")
+            .expect("记录块外面没有「侧栏开着」这道门");
+        assert!(
+            prod[cond..at].contains("&& !self.files_sidebar_was_open"),
+            "记录的判据不是「关→开」跃迁 —— 跟同步(sync_files_to_focused_pane)\
+             不同源,栏头会指向一块跟面板内容无关的 pane"
+        );
+
+        let render = prod
+            .find("let (repaint_delay, mut actions) = render_frame(")
+            .expect("找不到 render_frame 的调用");
+        assert!(
+            at < render,
+            "记录排在 render_frame 之后 —— 侧栏弹出来那一帧栏头还是空的,\
+             而那正是用户唯一会看这行字的时刻"
+        );
+
+        let pass = prod
+            .find("files_owner_pane: self")
+            .expect("没往 UiFrame 里传归属 pane —— UI 层无从判断");
+        let tail = &prod[pass..];
+        let end = tail.find("},").unwrap_or(tail.len());
+        assert!(
+            tail[..end].contains(".filter(|(g, _)| Some(*g) == files_owner_generation)"),
+            "传给 UI 层时没按世代号过滤 —— PaneId 每个 Workspace 各自从 1 起编,\
+             切标签后会把另一个标签的分屏认成归属"
         );
     }
 

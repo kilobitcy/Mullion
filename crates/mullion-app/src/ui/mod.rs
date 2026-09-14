@@ -619,6 +619,13 @@ pub struct UiFrame<'a> {
     /// `files_panel::sidebar`/`content`,由它们再跟各自的 `active_column`
     /// 相与决定具体画在哪一栏。
     pub files_focused: bool,
+    /// F262:侧栏是**从哪块分屏调出来的**。`None` = 标签宿主(SFTP 节点标签
+    /// 压根没有分屏)、或这一帧算不出唯一归属。
+    ///
+    /// 只是一个 id,「第几块 / 什么色」由 `files_panel::owner_tag` 在这一帧的
+    /// [`Self::titles`] 里现查 —— 把序号和颜色一起存下来就是影子状态,用户
+    /// 关掉一块 pane 之后序号会全体前移,而存下来那份不会自己变。
+    pub files_owner_pane: Option<mullion_core::layout::PaneId>,
     /// F37:活动标签是**恢复出来的占位标签**时,它这一帧要画的东西。
     /// `None` = 活动标签是真连着的(或 launcher 态)。与 `files_content`
     /// 互斥 —— 占位标签既没有终端也没有 sftp channel。
@@ -915,6 +922,9 @@ pub fn build_ui(
             hovering,
             &mut actions.files_focus_click,
             frame.pane_cwd,
+            // F262:归属分屏**每帧从 `titles` 现查**(见 `owner_tag`)——
+            // 查不到就不写,不存一份会过期的映射。
+            files_panel::owner_tag(frame.titles, frame.files_owner_pane).as_ref(),
         );
         actions.files_remote = r;
         actions.files_local = l;
@@ -1452,6 +1462,7 @@ mod tests {
             // `'static` 引用——只在测试进程里泄漏一次,不是生产路径。
             appearance: Box::leak(Box::new(badge::AppearanceCache::default())),
             files_focused: false,
+            files_owner_pane: None,
             restored: None,
             restored_count: 0,
         }
