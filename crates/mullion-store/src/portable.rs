@@ -716,7 +716,13 @@ mod tests {
     /// 「导入成功」但少了几条会话,用户下次开机才发现。
     #[test]
     fn entries_that_cannot_be_placed_are_counted_not_swallowed() {
-        let dir = tempfile::tempdir().unwrap();
+        // 配置目录放在 tempdir **内部**:`../evil.toml` 逃出去要落在 `root` 里,
+        // 随 tempdir 一起删。直接拿 tempdir 当配置目录的话逃逸目标是
+        // `/tmp/evil.toml` —— 污染全局,而且下一次跑会被上一次留下的那个文件
+        // 判成假红(实测踩过:变异验证写出去之后,干净源码连红三次)。
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cfg");
+        std::fs::create_dir_all(&dir).unwrap();
         let pack = Pack {
             format_version: 1,
             app_version: String::new(),
@@ -733,10 +739,13 @@ mod tests {
                 },
             ],
         };
-        let r = install(dir.path(), &pack, b"c", "stamp").unwrap();
+        let r = install(&dir, &pack, b"c", "stamp").unwrap();
         assert_eq!(r.skipped, 2);
         assert_eq!(r.written, 1, "只有密文那一份写进去了");
-        assert!(!dir.path().parent().unwrap().join("evil.toml").exists());
+        assert!(
+            !root.path().join("evil.toml").exists(),
+            "白名单没拦住 —— 拿来的包能往配置目录外面写字节"
+        );
     }
 
     /// 端到端:导出一份、在另一个目录里导入,明文文件逐字节相同,密文经
