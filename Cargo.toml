@@ -105,3 +105,28 @@ syntect = { version = "5.3", default-features = false, features = [
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# dev 的调试信息降到 line-tables-only。**动机是磁盘，不是速度** —— 实测增量循环
+# （`touch app.rs` 后）是 7.15s 编译 + 15.01s 跑完 2205 条测试，链接根本不是瓶颈，
+# 所以「换 lld / 给依赖开 opt-level=1」那一类提速手段在这台机器上收益≈0，
+# 不做（每次量之前先量，别照搬别的项目的 profile 段）。
+#
+# 真问题是体积：`target/debug` 一度涨到 539 GB（deps 288 GB + incremental 222 GB），
+# 根分区 83% 满。`debug = 2` 是 dev 的默认值，deps 那 288 GB 的大头就是它。
+#
+# 实测（`cargo clean` 之后，同一份源码）：
+#   全量构建 + 跑完 2205 条测试   73.31 s，`target` 共 5.4 GB
+#   增量循环（touch app.rs）      5.49 s 编译 / 14.31 s 跑测试
+#                                （改之前是 7.15 s / 15.01 s —— 顺带快了一点，
+#                                 但那不是动机，别拿它当提速手段推广）
+# 对照之前的 563 GB：那 500 多 GB 绝大部分是**历史累积**（不同 fingerprint 的
+# 旧产物 + incremental 快照），不是单次构建的必需品。
+#
+# 代价：dev 下只剩**行号**，没有变量级调试信息。对「靠日志 + 测试、不挂 gdb」
+# 的用法够用；`logx.rs` 那个 panic 钩子要的 backtrace 函数名与行号都还在
+# （那条链路真正怕的是 strip，见上面 release 段的论证，与这里无关）。
+# 要挂调试器的时候临时 `RUSTFLAGS="-C debuginfo=2"` 即可，不必改回来。
+#
+# 注意 `incremental` 那部分 cargo **不会自己清**，攒够了还得手动 `cargo clean`。
+[profile.dev]
+debug = 1
