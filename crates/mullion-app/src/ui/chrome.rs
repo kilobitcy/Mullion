@@ -64,6 +64,16 @@ pub fn top_menu(
                         ui_state.import_pick_request = true;
                         ui.close_menu();
                     }
+                    // F46-a:整机迁移。两项挨着放 —— 它们是同一件事的两头,
+                    // 而用户在「换新电脑」这个语境下会一次用到两边。
+                    if ui.button("导出全部配置…").clicked() {
+                        ui_state.pack = Some(crate::ui::pack_dialog::PackDialog::export());
+                        ui.close_menu();
+                    }
+                    if ui.button("导入配置…").clicked() {
+                        ui_state.pack_pick_request = true;
+                        ui.close_menu();
+                    }
                     if ui
                         .add_enabled(connected, egui::Button::new("断开"))
                         .clicked()

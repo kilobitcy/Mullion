@@ -89,6 +89,10 @@ pub enum UserEvent {
     IconPathPicked(Option<PathBuf>),
     /// F2:「导入 ssh config…」选中的文件。`None` = 用户取消。
     SshConfigPicked(Option<PathBuf>),
+    /// F46-a:「导入配置…」选中的迁移包。`None` = 用户取消。
+    PackPicked(Option<PathBuf>),
+    /// F46-a:「导出全部配置…」选定的保存路径。`None` = 用户取消。
+    PackSavePicked(Option<PathBuf>),
     /// 主机密钥需要用户确认(F3)。握手线程正挂在 `reply` 上等回答,
     /// **必须**最终发一个 bool 回去或丢弃 sender(丢弃 = 拒绝,fail-closed)。
     /// `Box` 是因为 `HostKeyPrompt` 比其余变体大得多,不装箱会撑大整个枚举。
@@ -2205,6 +2209,17 @@ pub struct App {
     visible: shell::window_state::Visibility,
     /// 三个文件对话框各自的在跑标志,见 `PickerBusy`。
     picker_busy: PickerBusy,
+    /// F46-a:已经读出来、等着用户输口令的那份迁移包。`None` = 没在导入。
+    ///
+    /// 与 `ui.pack` 分开存:`ui/` 这一层零 IO,`Pack` 是 store 的类型,而
+    /// 弹窗只需要知道「里头有几个文件、要不要口令」(`PackInfo`)。
+    pending_pack: Option<mullion_store::Pack>,
+    /// F46-a:用户按下「选择保存位置…」那一刻的口令,存到文件对话框回来为止。
+    ///
+    /// **不在对话框回来时从 `ui.pack` 现读**:那个弹窗此刻还开着,用户完全
+    /// 可能一边挑位置一边回来改口令框里的字 —— 而包用哪一串是在他按下按钮
+    /// 那一刻定的。
+    pending_pack_pass: Option<String>,
     /// egui 侧有内容待画(菜单展开/hover/弹窗/错误提示)。与「终端来了新字节」是
     /// 两个独立脏源,`frame::frame_is_dirty` 取并集——只看终端字节的话,远端一安静
     /// egui 的交互就被 `RedrawAction::Idle` 吞掉,菜单点不开。
@@ -2420,6 +2435,17 @@ struct PickerBusy {
     icon: bool,
     /// F2:ssh config 文件对话框。
     import: bool,
+    /// F46-a:迁移包的打开 / 另存对话框。**两个方向共用一个** —— 一次只该
+    /// 开一个系统对话框,而这两条路都由同一个弹窗发起。
+    pack: bool,
+}
+
+/// F46-a:导入失败的两种。**分开**是因为用户的下一步动作完全不同:口令错
+/// 就地重打一遍,别的错要换一份包 —— 混成一条错误串的话,「口令不对」会
+/// 被冲进状态栏,而弹窗里那行内联红字永远不出现。
+enum PackImportError {
+    WrongPassword,
+    Failed(String),
 }
 
 /// F205:一次拨号的**全部**随行数据。发起时装好、`ConnectOk`/`ConnectErr`
@@ -2623,6 +2649,13 @@ enum Modal {
     /// 整个标签栏的「恢复」按钮,而空格/回车在 egui 里是按钮的激活键 ——
     /// 同 `Modal::Import` 的理由(T8)。
     History,
+    /// F46-a:整机迁移包弹窗。里面是**口令输入框** —— 不算模态的话,用户打的
+    /// 口令会一边进输入框、一边被原样发给远端 shell(T8),而那是一串密码。
+    ///
+    /// **不进 `touched_store`**:导入写的是磁盘上的配置文件,而此后**不热
+    /// 重载**(见 `ui::pack_dialog` 的「请重启」那一页)—— 内存里的 store
+    /// 一个字节都没变,让 F61/F62 的外观缓存去重算是假的。
+    Pack,
 }
 
 impl Modal {
@@ -2648,6 +2681,7 @@ impl Modal {
         Modal::FilesRename,
         Modal::FilesNewName,
         Modal::History,
+        Modal::Pack,
     ];
 }
 
@@ -2657,6 +2691,9 @@ impl Modal {
 /// 「一次点击关谁」,排错了的症状是点一下关掉了底下那个、上面那个还杵着。
 const DISMISS_ORDER: &[Modal] = &[
     Modal::ExitConfirm,
+    // F46-a:排在退出确认之后 —— 绘制顺序上它画在退出确认**之前**,
+    // 而这张表与绘制顺序严格互逆(后画的盖在上面、先被问到)。
+    Modal::Pack,
     Modal::ProjectPick,
     Modal::Rehost,
     Modal::TabProps,
@@ -2761,6 +2798,9 @@ fn draft_baseline_is_in_vault(m: Modal) -> bool {
         Modal::GroupManager => true,
         // 导入预览的每一行勾选,针对的都是「库里有没有这一条」。
         Modal::Import => true,
+        // F46-a:迁移包弹窗里只有一串口令,库里的表跟它没有任何对应关系
+        // (导入那一刻是整份替换磁盘文件,内存里的库根本不参与)。
+        Modal::Pack => false,
         // 以下基线都不在库里:编辑器比的是远端文件的正文,设置比的是
         // `settings_backup`,标签属性比的是内存里的标签,文件面板的三个
         // 就地输入框比的是远端目录项。其余变体压根没有草稿。
@@ -2854,6 +2894,10 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
             .tab_props
             .is_some()
             .then(|| vec![w(crate::ui::tab_props::WINDOW_TITLE)]),
+        Modal::Pack => ui
+            .pack
+            .is_some()
+            .then(|| vec![w(crate::ui::pack_dialog::WINDOW_TITLE)]),
         Modal::ExitConfirm => ui
             .exit_pending
             .then(|| vec![w(crate::ui::edit_panel::WINDOW_TITLE)]),
@@ -2931,6 +2975,8 @@ impl App {
             store: None,
             visible: shell::window_state::Visibility::default(),
             picker_busy: PickerBusy::default(),
+            pending_pack: None,
+            pending_pack_pass: None,
             ui_dirty: true, // 首帧必须画出来
             files_sidebar_was_open: false,
             files_owner_pane: None,
@@ -4185,6 +4231,8 @@ impl App {
             Modal::Rehost => self.ui.rehost.is_some(),
             Modal::ProjectPick => self.ui.project_pick.is_some(),
             // F131:见 `Modal::FilesPathEdit` 的说明。
+            // F46-a:口令输入框,见 `Modal::Pack` 的说明(T8)。
+            Modal::Pack => self.ui.pack.is_some(),
             Modal::FilesPathEdit => self.files_path_editing(),
             // F200:见 `Modal::FilesRename` 的说明。
             Modal::FilesRename => self.files_renaming(),
@@ -4210,6 +4258,11 @@ impl App {
     fn dismiss_dirty(&self, m: Modal) -> bool {
         match m {
             Modal::SessionManager => session_manager_dirty(&self.ui),
+            // F46-a:导出那一步打了一半的口令,丢了重打一遍就是(它不是数据,
+            // 是一次性的输入);导入完成那一页更没有任何东西可丢。**唯独不能
+            // 判脏的是「已经导入完」那一态** —— 判脏会让「点外面」关不掉,而
+            // 那一页除了「知道了」没有别的出口,用户会以为窗口卡住了。
+            Modal::Pack => false,
             // 设置是实时预览的:草稿一旦生效就写进了 `self.settings`,
             // 「打开那一刻的备份」才是原记录。
             Modal::Settings => self
@@ -4320,6 +4373,9 @@ impl App {
     fn dismiss(&mut self, m: Modal) {
         match m {
             Modal::About => self.ui.about_open = false,
+            // F46-a:走弹窗自己的 `Close` 出口 —— 它还要把解出来的包和暂存的
+            // 口令一起扔掉,只置 `None` 的话下一次导入会拿着**上一份**包。
+            Modal::Pack => self.apply_pack_action(crate::ui::pack_dialog::PackOut::Close),
             // 走 `Cancel`:它要把 `settings_backup` 倒回去,只置 false
             // 的话实时预览过的字体/日志档就永久留下了。
             Modal::Settings => self.apply_settings_action(crate::ui::settings::SettingsOut::Cancel),
@@ -10566,6 +10622,218 @@ impl App {
         }
     }
 
+    /// F46-a:开「另存为」对话框。与 [`Self::spawn_file_picker`] 同构 ——
+    /// 另起一条是因为 `rfd` 的 `save_file()` 与 `pick_file()` 是两个方法,
+    /// 而「取消」同样要回送事件,否则 `PickerBusy::pack` 永远清不掉。
+    fn spawn_file_saver(
+        &self,
+        title: &str,
+        file_name: String,
+        filter: (&str, &[&str]),
+        done: fn(Option<PathBuf>) -> UserEvent,
+    ) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(title)
+            .set_file_name(file_name)
+            .add_filter(filter.0, filter.1);
+        if let Some(a) = &self.active {
+            dialog = dialog.set_parent(a.window.as_ref());
+        }
+        let proxy = self.proxy.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mullion-file-dialog".into())
+            .spawn(move || {
+                let _ = proxy.send_event(done(dialog.save_file()));
+            });
+        if let Err(e) = spawned {
+            log::warn!(target: "mullion", "另存对话框线程创建失败: {e}");
+            let _ = self.proxy.send_event(done(None));
+        }
+    }
+
+    /// F46-a:UTC 时间戳,拿来当备份目录名和包里的 `exported_at`。
+    ///
+    /// 秒级截断 + 冒号换成短横:`2026-09-14T03-40-00`。Windows 的文件名不许
+    /// 有冒号,而这串要直接进目录名。
+    fn pack_stamp() -> String {
+        use time::format_description::well_known::Rfc3339;
+        let now = time::OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_default();
+        now.chars()
+            .take(19)
+            .map(|c| if c == ':' { '-' } else { c })
+            .collect()
+    }
+
+    /// F46-a:迁移包弹窗这一帧的结论。
+    fn apply_pack_action(&mut self, out: crate::ui::pack_dialog::PackOut) {
+        use crate::ui::pack_dialog::PackOut as O;
+        match out {
+            O::None => {}
+            O::Close => {
+                self.ui.pack = None;
+                // 包解出来的那份也一起扔掉:留着的话,下次点「导入配置…」
+                // 在文件对话框还没回来之前,`pending_pack` 里躺的是**上一份**包。
+                self.pending_pack = None;
+                self.pending_pack_pass = None;
+            }
+            O::Export => {
+                if self.picker_busy.pack {
+                    return;
+                }
+                // 口令暂存到对话框回来为止。**不从 `ui.pack` 现读** —— 那个弹窗
+                // 此刻还开着,用户完全可能在挑保存位置的时候回来改口令框里的字,
+                // 而包已经要用哪一串是在他按下按钮那一刻定的。
+                self.pending_pack_pass = self.ui.pack.as_ref().map(|d| d.pass.clone());
+                self.picker_busy.pack = true;
+                self.spawn_file_saver(
+                    "导出全部配置",
+                    format!(
+                        "mullion-config-{}.{}",
+                        Self::pack_stamp(),
+                        mullion_store::PACK_EXT
+                    ),
+                    ("Mullion 配置包", &[mullion_store::PACK_EXT]),
+                    UserEvent::PackSavePicked,
+                );
+            }
+            O::Import => self.run_pack_import(),
+        }
+    }
+
+    /// F46-a:把配置打成包写到 `path`。
+    ///
+    /// 同步读写、在主线程上做:配置目录只有几十 KB,而这是用户点了按钮等着
+    /// 看结果的动作(理由同 `drain_export_log_request`)。
+    fn write_pack_to(&mut self, path: PathBuf) {
+        let Some(pass) = self.pending_pack_pass.take() else {
+            return;
+        };
+        diag::mark(diag::Stage::StoreIo);
+        let done = (|| -> Result<(), String> {
+            let dir = crate::shell::store::config_dir().ok_or("定位不到配置目录")?;
+            // 内存里可能领先于盘(改了还没点保存),而 `collect` 读的是**盘上**
+            // 那份。先按既有的判据对齐一次:手上有未落盘改动时它自己不读。
+            if let Some(st) = self.store.as_mut() {
+                st.refresh_from_disk();
+            }
+            let plain = self
+                .store
+                .as_ref()
+                .ok_or("会话库还没打开")?
+                .secrets_plaintext()
+                .map_err(|e| e.to_string())?;
+            // 一条密码都没存过 → 不封空密文。封了的话包里会有一段解得开却
+            // 什么都没有的字节,而导入那头会照着它管用户要口令。
+            let blob = if plain.is_empty() {
+                Vec::new()
+            } else {
+                mullion_store::seal_secrets(plain.as_bytes(), &pass).map_err(|e| e.to_string())?
+            };
+            let text = mullion_store::write_pack(
+                mullion_store::collect_portable(&dir),
+                &blob,
+                env!("CARGO_PKG_VERSION"),
+                &time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            )
+            .map_err(|e| e.to_string())?;
+            std::fs::write(&path, text).map_err(|e| format!("写不出 {}:{e}", path.display()))
+        })();
+        match done {
+            Ok(()) => {
+                self.ui.pack = None;
+                let msg = format!("已导出全部配置:{}", path.display());
+                crate::logx::line(&msg);
+                self.ui.set_toast(crate::ui::toast::Kind::Ok, msg);
+            }
+            // 弹窗**留着**:用户重挑一个位置就能再试,关掉的话口令得重打两遍。
+            Err(e) => self.ui.set_error(format!("导出配置失败:{e}")),
+        }
+    }
+
+    /// F46-a:用弹窗里那串口令把 `pending_pack` 装进这台机器。
+    fn run_pack_import(&mut self) {
+        let Some(pass) = self.ui.pack.as_ref().map(|d| d.pass.clone()) else {
+            return;
+        };
+        diag::mark(diag::Stage::StoreIo);
+        let outcome = (|| -> Result<mullion_store::Installed, PackImportError> {
+            let dir = crate::shell::store::config_dir()
+                .ok_or_else(|| PackImportError::Failed("定位不到配置目录".into()))?;
+            let pack = self
+                .pending_pack
+                .as_ref()
+                .ok_or_else(|| PackImportError::Failed("包已经不在手上了,请重新选一次".into()))?;
+            let blob = mullion_store::portable::secrets_blob(pack)
+                .map_err(|e| PackImportError::Failed(e.to_string()))?;
+            let resealed = if blob.is_empty() {
+                Vec::new()
+            } else {
+                let plain = mullion_store::open_secrets(&blob, &pass).map_err(|e| match e {
+                    mullion_store::StoreError::WrongPassword => PackImportError::WrongPassword,
+                    other => PackImportError::Failed(other.to_string()),
+                })?;
+                // 用**这台机器**的钥匙串密钥重新封 —— 原样落盘的话下次启动
+                // 要的是一个用户根本不知道自己设过的口令。
+                mullion_store::reseal_for_target(&plain, &mullion_store::KeyringSource::new())
+                    .map_err(|e| PackImportError::Failed(e.to_string()))?
+            };
+            mullion_store::install_pack(&dir, pack, &resealed, &Self::pack_stamp())
+                .map_err(|e| PackImportError::Failed(e.to_string()))
+        })();
+        match outcome {
+            Ok(r) => {
+                crate::logx::line(&format!(
+                    "已导入迁移包:写入 {} 个文件,跳过 {},备份在 {}",
+                    r.written,
+                    r.skipped,
+                    r.backup.display()
+                ));
+                self.pending_pack = None;
+                // 盘上已经换成导入的那一份,而内存里这个 `Vault` 还指着旧内容 ——
+                // 用户不重启、随手改一条会话,`save()` 是整份覆盖,刚导入的配置
+                // 当场没了。重开一遍:此刻 `secrets.enc` 必然是钥匙串方案
+                // (`reseal_for_target` 刚写的),不需要问任何口令。开不起来宁可
+                // 把库置空(会话功能停摆、有报错),也不能让旧内存盖掉新盘。
+                if let Some(dir) = crate::shell::store::config_dir() {
+                    match crate::shell::store::SessionStore::open(
+                        dir.clone(),
+                        &mullion_store::KeyringSource::new(),
+                    ) {
+                        Ok(st) => self.store = Some(st),
+                        Err(e) => {
+                            self.store = None;
+                            self.ui
+                                .set_error(format!("配置已导入,但重开会话库失败:{e},请重启"));
+                        }
+                    }
+                    if let Ok(mut k) = self.known_hosts.lock() {
+                        *k = KnownHostsFile::load(&dir);
+                    }
+                }
+                if let Some(d) = self.ui.pack.as_mut() {
+                    d.pass.clear();
+                    d.failed = false;
+                    d.stage = crate::ui::pack_dialog::PackStage::Done {
+                        backup: r.backup.display().to_string(),
+                        written: r.written,
+                        skipped: r.skipped,
+                    };
+                }
+            }
+            // 口令错就地说,弹窗留着让他再打一遍(同解锁框的姿态)。
+            Err(PackImportError::WrongPassword) => {
+                if let Some(d) = self.ui.pack.as_mut() {
+                    d.failed = true;
+                }
+            }
+            Err(PackImportError::Failed(e)) => self.ui.set_error(format!("导入配置失败:{e}")),
+        }
+    }
+
     /// 自动化结束。**必须按世代过滤**:高延迟链路下用户完全可能在自动化还在
     /// 跑的时候断开重连,旧世代的「自动化已中止:连接已断开」落到新连接的
     /// 状态栏上,是一条与当前连接毫不相干的误导信息(判据同 `PaneOpenErr`)。
@@ -11212,6 +11480,45 @@ impl ApplicationHandler<UserEvent> for App {
                         // 读不出来就直接说,别开一个空弹窗让用户以为文件是空的。
                         Err(e) => self.ui.set_error(format!("读不了 {}:{e}", p.display())),
                     }
+                }
+                self.request_ui_redraw();
+            }
+            UserEvent::PackPicked(picked) => {
+                self.picker_busy.pack = false;
+                if let Some(p) = picked {
+                    match std::fs::read_to_string(&p)
+                        .map_err(|e| format!("读不了 {}:{e}", p.display()))
+                        .and_then(|text| mullion_store::read_pack(&text).map_err(|e| e.to_string()))
+                    {
+                        Ok(pack) => {
+                            let info = crate::ui::pack_dialog::PackInfo {
+                                app_version: pack.app_version.clone(),
+                                exported_at: pack.exported_at.clone(),
+                                files: pack.file.len(),
+                                has_secrets: !pack.secrets.is_empty(),
+                            };
+                            self.pending_pack = Some(pack);
+                            self.ui.pack = Some(crate::ui::pack_dialog::PackDialog::import(
+                                p.display().to_string(),
+                                info,
+                            ));
+                        }
+                        // 读不懂就直接说,别开一个空弹窗让用户对着它输口令。
+                        Err(e) => {
+                            self.pending_pack = None;
+                            self.ui.set_error(e);
+                        }
+                    }
+                }
+                self.request_ui_redraw();
+            }
+            UserEvent::PackSavePicked(picked) => {
+                self.picker_busy.pack = false;
+                match picked {
+                    Some(p) => self.write_pack_to(p),
+                    // 取消:口令不能留着 —— 下一次按「选择保存位置…」会重新
+                    // 存一份,而留着的那串属于上一次那个已经被放弃的意图。
+                    None => self.pending_pack_pass = None,
                 }
                 self.request_ui_redraw();
             }
@@ -12840,6 +13147,13 @@ impl ApplicationHandler<UserEvent> for App {
                             if std::mem::take(&mut self.ui.history_request) {
                                 self.open_history_dialog();
                             }
+                            // F46-a:迁移包弹窗的结论(导出去开另存框 / 导入 /
+                            // 关掉)。放在恢复列表之后 —— 两者都是「从菜单发起、
+                            // 自成一摊」的动作,没有先后依赖。
+                            if let Some(out) = actions.pack {
+                                self.apply_pack_action(out);
+                                mark_ui_dirty!(self.ui_dirty);
+                            }
                             // F155:导出脱敏日志。两个入口(菜单/设置)共用
                             // 这一条施加路径,见 `drain_export_log_request`。
                             self.drain_export_log_request();
@@ -13635,6 +13949,17 @@ impl ApplicationHandler<UserEvent> for App {
                         None,
                         crate::ui::session_manager::keyscan::default_ssh_dir(),
                         UserEvent::SshConfigPicked,
+                    );
+                }
+                // F46-a:导入配置。加扩展名过滤 —— 让用户在一堆文件里先看见
+                // 自己那个包;不设初始目录(包在 U 盘还是下载目录,猜不出来)。
+                if std::mem::take(&mut self.ui.pack_pick_request) && !self.picker_busy.pack {
+                    self.picker_busy.pack = true;
+                    self.spawn_file_picker(
+                        "选择 Mullion 配置包",
+                        Some(("Mullion 配置包", &[mullion_store::PACK_EXT])),
+                        None,
+                        UserEvent::PackPicked,
                     );
                 }
                 // 连接:双击行 / 点「连接」。必须在 store 的 &mut 借用结束后调
@@ -14835,6 +15160,8 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | CredentialKeyPathPicked(_)
         | IconPathPicked(_)
         | SshConfigPicked(_)
+        | PackPicked(_)
+        | PackSavePicked(_)
         | HostKeyPrompt(_)
         | PaneOpened { .. }
         | PaneOpenErr { .. }
@@ -15187,6 +15514,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.project_pick.is_some()
         || a.pick_project_pane.is_some()
         || a.history.is_some()
+        || a.pack.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -18052,6 +18380,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::About),
                     "About 没登记进 Modal::ALL(T8)"
                 ),
+                Modal::Pack => assert!(
+                    Modal::ALL.contains(&Modal::Pack),
+                    "Pack 没登记进 Modal::ALL(T8)"
+                ),
                 Modal::Settings => assert!(
                     Modal::ALL.contains(&Modal::Settings),
                     "Settings 没登记进 Modal::ALL(T8)"
@@ -18245,6 +18577,7 @@ mod tests {
                 Modal::Rehost => "rehost::show(",
                 Modal::ProjectPick => "project_pick::show(",
                 Modal::ExitConfirm => "if ui_state.exit_pending {",
+                Modal::Pack => "pack_dialog::show(",
                 // 豁免的七类不参与「点外面即关」,也就不需要排序。
                 Modal::Unlock
                 | Modal::HostKey
@@ -23536,6 +23869,64 @@ mod tests {
             .find("crate::logx::set_levels(")
             .expect("apply_log_level 不再换档了？");
         assert!(guard < set, "短路排在换档之后 —— 那一行日志照样会写出来");
+    }
+
+    /// F46-a:包里的密文是**重新封过**的,不是把 `secrets.enc` 原样搬走。
+    ///
+    /// 原样搬的症状极其难查:导入方一切正常、零报错,只是每条会话都要重新
+    /// 输一次密码 —— 因为那份密文的钥匙躺在**源机**的钥匙串里,跟着包走的
+    /// 只有密文本身。判据只能扎源码:这一段全是 IO,`App` 的方法测不了。
+    ///
+    /// 顺带钉住「一条密码都没存过就不封空密文」—— 封了的话包里有一段解得开
+    /// 却什么都没有的字节,导入那头会照着它管用户要一个毫无用处的口令。
+    ///
+    /// 自证会变红:把 `seal_secrets` 换成读 `secrets.enc` 的字节,
+    /// 或把 `plain.is_empty()` 那个分支删掉。
+    #[test]
+    fn a_pack_carries_secrets_resealed_with_the_one_time_password() {
+        let body = strip_comments(body_of(prod_src(), "fn write_pack_to(&mut self,"));
+        assert!(
+            body.contains("secrets_plaintext()"),
+            "没取明文 —— 多半是把 secrets.enc 原样塞进包了,导入方每条会话都要重输密码"
+        );
+        assert!(
+            body.contains("seal_secrets("),
+            "没用一次性口令重封 —— 密文的钥匙留在源机钥匙串里,包到了新机解不开"
+        );
+        let empty = body
+            .find("plain.is_empty()")
+            .expect("没有「一条密码都没存过」的分支 —— 会封一段空密文,导入那头照样问口令");
+        let seal = body.find("seal_secrets(").unwrap();
+        assert!(empty < seal, "空明文的判断排在封装之后 —— 空密文照样进包");
+    }
+
+    /// F46-a:导入落盘之后**必须**把内存里那份库换掉。
+    ///
+    /// 盘上已经是导入的配置,而 `Vault` / `KnownHostsFile` 还指着旧内容。
+    /// 用户看到「请重启」却没重启、随手改一条会话,`save()` 是**整份覆盖** ——
+    /// 刚导入的全部配置当场被旧内存盖回去,而且全程零报错。
+    ///
+    /// 重开这一步不需要问任何口令:落盘的 `secrets.enc` 是 `reseal_for_target`
+    /// 刚用本机钥匙串密钥封的。
+    ///
+    /// 自证会变红:把 `SessionStore::open` 或 `KnownHostsFile::load` 那句删掉,
+    /// 或把它们挪到 `install_pack` 之前。
+    #[test]
+    fn an_import_that_landed_swaps_the_in_memory_store_so_it_cannot_write_the_old_one_back() {
+        let body = strip_comments(body_of(prod_src(), "fn run_pack_import(&mut self) {"));
+        let install = body
+            .find("install_pack(")
+            .expect("run_pack_import 的函数体切歪了 —— 下面几条断言会空过");
+        let reopen = body
+            .find("SessionStore::open(")
+            .expect("导入后没重开会话库 —— 用户不重启随手改一条,导入的配置被旧内存整份盖回去");
+        let known = body
+            .find("KnownHostsFile::load(")
+            .expect("导入后没重载 known_hosts —— TOFU 判据还是本机旧的那份");
+        assert!(
+            install < reopen && install < known,
+            "在落盘之前就重开 —— 读回来的还是旧配置"
+        );
     }
 
     /// F247:设置弹窗点「确定」写的是**三方合并**,不是草稿整份覆盖。

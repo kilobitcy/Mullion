@@ -18,6 +18,7 @@ pub mod icon;
 pub mod import_dialog;
 pub mod launcher;
 pub mod metrics;
+pub mod pack_dialog;
 pub mod pane_edges;
 pub mod pane_title;
 pub mod paste;
@@ -111,6 +112,17 @@ pub struct UiState {
     /// **不在这里直接建草稿**:建草稿要读 `layouts` 目录、还要查会话库把
     /// 已删会话的标签滤掉(D16),而 `ui/` 这一层零 IO。
     pub history_request: bool,
+    /// F46-a:整机迁移包弹窗(导出设口令 / 导入输口令 / 导入完成)。
+    /// `Some` = 弹窗开着。
+    ///
+    /// **必须计进 `app.rs::modal_open`**:里面有口令输入框,不算模态的话
+    /// 敲进去的口令会同时被原样发给远端 shell(T8)。
+    pub pack: Option<pack_dialog::PackDialog>,
+    /// F46-a:菜单里点了「导入配置…」→ `app.rs` 事后开文件对话框、读包。
+    ///
+    /// **不在这里读文件**:要读一份几十 KB 的 TOML 再解 base64,而 `ui/`
+    /// 这一层零 IO(同 `history_request`)。
+    pub pack_pick_request: bool,
     /// F155:菜单/设置里点了「导出脱敏日志…」→ `app.rs` 事后读日志文件、
     /// 脱敏、另存。
     ///
@@ -756,6 +768,11 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话「恢复」按下去
     /// 毫无反应,而这个弹窗是启动后唯一能操作的东西。
     pub history: Option<history::HistoryOut>,
+    /// F46-a:迁移包弹窗这一帧的结论。`None` = 还在打字。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按「导入并替换」
+    /// 会在 egui 的 discard 趟被静默吃掉。
+    pub pack: Option<pack_dialog::PackOut>,
 }
 
 /// 指针此刻还在**文件面板**里没有(F59 / 设计 N1 的判据,2026-08-20 修正)。
@@ -1114,6 +1131,14 @@ pub fn build_ui(
     );
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
     actions.editor = editor_window::show(ctx, t, editor);
+    // F46-a:迁移包弹窗。排在编辑器之后 —— 它是从菜单发起的模态,该盖在
+    // 别的窗口上面;排在退出确认**之前** —— 那个一旦开着别的都不重要了。
+    if let Some(d) = ui_state.pack.as_mut() {
+        let out = pack_dialog::show(ctx, t, d);
+        if out != pack_dialog::PackOut::None {
+            actions.pack = Some(out);
+        }
+    }
     // F53/D3-12:退出确认。排在最后一个模态 —— 它一旦开着,别的都不重要了。
     if ui_state.exit_pending {
         actions.exit = edit_panel::show_exit_confirm(ctx, t, edits);
