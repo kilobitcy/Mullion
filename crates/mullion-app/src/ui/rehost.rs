@@ -100,9 +100,10 @@ fn visible<'a>(
 
 /// 「最近连过」段最多列几条。
 ///
-/// **3 而不是 5**:这个弹窗按 pane 定位,滚动区高度封顶 260pt。实测这一段
-/// 的开销是 段头 16 + 每行 27 + 分隔线 9;取 3 条占 106pt,主段还剩 154pt
-/// ≈ 5.7 行,取 5 条占 160pt,主段只剩 100pt ≈ 3.7 行。
+/// **3 而不是 5**:这个弹窗按 pane 定位,取值时滚动区高度封顶 260pt(F259
+/// 之后改成跟着 pane 走,但**小分屏仍然是这个量级**,取舍照旧)。实测这一段
+/// 的开销是 段头 16 + 每行 27 + 分隔线 9;按 260pt 算,取 3 条占 106pt,主段
+/// 还剩 154pt ≈ 5.7 行,取 5 条占 160pt,主段只剩 100pt ≈ 3.7 行。
 ///
 /// 差的那两行**不是**"下面没东西了"(还在滚动区里,往下滚就有),而是主段
 /// (与会话管理器左栏同序)才是"照记忆找"的那一半 —— 一眼能扫到的行数从
@@ -210,7 +211,11 @@ pub fn show(
         crate::ui::metrics::FIELD_W_M,
         2.0 * crate::ui::metrics::SP_M,
     );
-    let list_h = (avail.height() - CHROME_H).clamp(48.0, 260.0);
+    // F259:**只有下界,没有上界**。原来这里封顶 260 点 —— 分屏开得再高,
+    // 列表也只给那么长,下面一大片空着而会话要一条条滚。上界本来就由
+    // `avail.height()` 和 `constrain_to(host)` 管着,再叠一个常数封顶等于
+    // 把「这块 pane 有多高」这条真值扔掉。
+    let list_h = (avail.height() - CHROME_H).max(48.0);
     // 用 `Area` 而不是 `Window`:`Window` 的位置记在 egui memory 里、还能被拖走,
     // 「永远在这块 pane 里」就守不住了。`constrain_to` 保证内容比 pane 还大时
     // 是被推回边界内,而不是溢出到邻居分屏上。
@@ -220,6 +225,14 @@ pub fn show(
         .constrain_to(host)
         .show(ctx, |ui| {
             ui.set_max_width(field_w + 2.0 * crate::ui::metrics::SP_M);
+            // F259:**高度预算也得显式给**。`Area` 首帧走 sizing pass,拿的是
+            // `style.spacing.default_area_size`(600×400)再 `at_most` 这块
+            // pane —— 也就是说不说话的话高度被 400 点封着,里面的 `ScrollArea`
+            // 再怎么放宽 `max_height` 也长不出来;之后每帧的预算又变成上一帧
+            // 量到的尺寸(`Area::end` 里 `state.size = content_ui.min_size()`),
+            // 缩过去就再也涨不回来。光去掉 `list_h` 的 260 上限只能长到 400,
+            // 这一行才是把「这块 pane 有多高」真正接上去的地方。
+            ui.set_max_height(avail.height());
             egui::Frame::popup(&ctx.style())
                 .fill(theme::c32(t.panel_bg))
                 .stroke(theme::stroke(t))
@@ -738,5 +751,72 @@ mod tests {
     #[test]
     fn the_same_session_gets_different_ids_in_the_two_sections() {
         assert_ne!(row_id("recent", SessionId(7)), row_id("main", SessionId(7)));
+    }
+
+    /// 在给定的 pane 里把弹窗画出来,回报它的实际高度。顺带断言它没跑出
+    /// pane —— 取消按钮是这个模态弹窗唯一的出口,被顶出去就等于关不掉。
+    fn popup_height_in(pane_rect: egui::Rect, pane: PaneId, sessions: &[SessionRecord]) -> f32 {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let cache = crate::ui::badge::AppearanceCache::default();
+        let mut draft = Some(RehostDraft::new(pane));
+        for time in [0.0_f64, 1.0] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(
+                        ctx,
+                        &MULLION_DARK,
+                        &mut draft,
+                        sessions,
+                        &[],
+                        &cache,
+                        Some(pane_rect),
+                    );
+                },
+            );
+        }
+        let got = ctx
+            .memory(|m| m.area_rect(area_id(pane)))
+            .expect("弹窗开着却没有 Area —— 它根本没画出来");
+        assert!(
+            pane_rect.contains_rect(got),
+            "弹窗跑到 pane 外面去了(取消按钮是唯一出口):pane={pane_rect:?} 弹窗={got:?}"
+        );
+        got.height()
+    }
+
+    /// F259:列表高度**跟着这块分屏走**。分屏高一截,弹窗就该长一截。
+    ///
+    /// 原来 `list_h` 被 `clamp(.., 260.0)` 封顶 —— 分屏拉得再高,列表也停在
+    /// 260 点,下面一大片空着,而会话要一条条滚。
+    ///
+    /// 判据是**两块高度不同的 pane 之间的差值**,不是某个绝对高度:钉绝对
+    /// 值的话,chrome 那几行的高度一变(多一行说明、换字号)测试就假红。
+    /// 会话给够 40 条,保证两种高度下列表都是「内容比框长」,量到的才是框高
+    /// 本身而不是内容高。
+    ///
+    /// 自证会变红:把 `.max(48.0)` 改回 `.clamp(48.0, 260.0)` —— 高度差会从
+    /// 300 缩到 96(两边都顶在 260 那一段上)。
+    #[test]
+    fn the_list_grows_with_the_pane_instead_of_stopping_at_a_fixed_cap() {
+        let sessions: Vec<SessionRecord> = (0..40)
+            .map(|i| rec(i, &format!("node{i}"), "10.0.0.1", Protocol::Ssh))
+            .collect();
+        let at = |h: f32| egui::Rect::from_min_size(egui::pos2(120.0, 60.0), egui::vec2(520.0, h));
+        let short = popup_height_in(at(300.0), PaneId(1), &sessions);
+        let tall = popup_height_in(at(600.0), PaneId(2), &sessions);
+        assert!(
+            tall - short >= 250.0,
+            "分屏高了 300 点,弹窗只长了 {:.0} 点 —— 列表被封顶了",
+            tall - short
+        );
     }
 }

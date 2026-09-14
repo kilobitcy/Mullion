@@ -103,7 +103,9 @@ pub fn show(
         2.0 * crate::ui::metrics::SP_M,
     );
     // 下界取一整行:放不下一整行的话最后那行会被切一半,看起来像渲染坏了。
-    let list_h = (avail.height() - CHROME_H).clamp(crate::ui::project_row::ROW_H, 260.0);
+    // F259:**不再封顶**(理由同 `rehost::show` 那处)——项目行 `ROW_H` = 48,
+    // 封顶 260 时一屏只看得见五条,而这个弹窗的全部功能就是从列表里挑一条。
+    let list_h = (avail.height() - CHROME_H).max(crate::ui::project_row::ROW_H);
     // `Area` 而不是 `Window`:`Window` 的位置记在 egui memory 里、还能被拖走,
     // 「永远在这块 pane 里」就守不住了。同 `rehost::show`。
     egui::Area::new(area_id(pane))
@@ -112,6 +114,10 @@ pub fn show(
         .constrain_to(host)
         .show(ctx, |ui| {
             ui.set_max_width(field_w + 2.0 * crate::ui::metrics::SP_M);
+            // F259:高度预算也要显式给,否则 `Area` 的 sizing pass 把它封在
+            // `default_area_size` 的 400 点上,`list_h` 放得再宽也长不出来。
+            // 完整原理见 `rehost::show` 里同一行的注释。
+            ui.set_max_height(avail.height());
             egui::Frame::popup(&ctx.style())
                 .fill(theme::c32(t.panel_bg))
                 .stroke(theme::stroke(t))
@@ -683,5 +689,65 @@ mod tests {
         draft.as_mut().expect("弹窗不该被关掉").frozen_lamps = None;
         let frame3 = order(&ctx, &mut draft, &live, 3.0);
         assert_eq!(frame3, vec![1, 2], "重新冻结后,亮着灯的项目该置顶");
+    }
+
+    /// F259:项目列表也跟着分屏长。判据与理由同
+    /// `rehost::tests::the_list_grows_with_the_pane_instead_of_stopping_at_a_fixed_cap`
+    /// ——**两处各扎一条**:两个弹窗各写各的 `list_h`,只钉一处的话另一处
+    /// 改回封顶照样全绿,而项目行 `ROW_H` = 48,封顶 260 时一屏只看得见五条。
+    ///
+    /// 自证会变红:把 `list_h` 那行改回 `.clamp(ROW_H, 260.0)`,或者把
+    /// `ui.set_max_height(avail.height())` 删掉(后者单独就够把它压回 400)。
+    #[test]
+    fn the_project_list_grows_with_the_pane_instead_of_stopping_at_a_fixed_cap() {
+        let ps: Vec<ProjectRecord> = (0..40)
+            .map(|i| proj(i, &format!("活 {i}"), "/srv/x", None))
+            .collect();
+        let height_in = |pane_rect: egui::Rect, pane: PaneId| -> f32 {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(1.0);
+            let lamps = std::collections::BTreeMap::new();
+            let mut draft = Some(ProjectPickDraft::new(pane));
+            for t in [0.0_f64, 1.0] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(t),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        show(
+                            ctx,
+                            &MULLION_DARK,
+                            &mut draft,
+                            &ps,
+                            &lamps,
+                            &[],
+                            &crate::ui::badge::AppearanceCache::default(),
+                            Some(pane_rect),
+                        );
+                    },
+                );
+            }
+            let got = ctx
+                .memory(|m| m.area_rect(area_id(pane)))
+                .expect("弹窗没画出来");
+            assert!(
+                pane_rect.contains_rect(got.shrink(0.5)),
+                "弹窗跑出 pane(取消按钮是唯一出口):{got:?} 不在 {pane_rect:?} 里"
+            );
+            got.height()
+        };
+        let at = |h: f32| egui::Rect::from_min_size(egui::pos2(120.0, 60.0), egui::vec2(520.0, h));
+        let short = height_in(at(300.0), PaneId(1));
+        let tall = height_in(at(600.0), PaneId(2));
+        assert!(
+            tall - short >= 250.0,
+            "分屏高了 300 点,弹窗只长了 {:.0} 点 —— 列表被封顶了",
+            tall - short
+        );
     }
 }
