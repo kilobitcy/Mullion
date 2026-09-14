@@ -2168,13 +2168,26 @@ const DEFAULT_SIDEBAR_W: f32 = 360.0;
 ///
 /// 用户实报:分屏多的时候,`Ctrl+Shift+B` 调出来的侧栏看不出归属 —— 它跟着
 /// 哪块 pane 的目录、上传下载又会落到谁那儿,屏幕上一个字都没写。
-pub struct OwnerTag {
+pub struct OwnerTag<'a> {
     /// 分屏序号,从 1 起。**跟标题条同源**(`TitleView::index`)—— 各算一遍
     /// 的话,标题条写「分屏 2」、侧栏写「分屏 3」,用户两边对不上。
     pub index: usize,
     /// F62 语义色。`None` = 这条会话没设色(或没有会话记录),那就只写字、
     /// 不画竖条 —— 编一个默认色等于凭空多一种颜色,而色是 F61/F62 的信道。
     pub color: Option<egui::Color32>,
+    /// F265:节点名(会话名,或没有会话记录时的 `user@host`)。`None` = 这块
+    /// pane 还没连上。用户实报:序号答不出「这一栏通向哪台机器」,而那才是
+    /// 上传下载会落到谁那儿的判据。
+    ///
+    /// **借用而不是 `String`**:每帧都要建一次 `OwnerTag`,拷一个名字是白拷。
+    pub name: Option<&'a str>,
+    /// F265:图标。走 `pane_title::icon_of` 这同一个出口(属于项目就用项目的
+    /// 图标)—— 各挑各的话,侧栏画会话图标、标题条画项目图标,同一块 pane 在
+    /// 两处长得不一样。`None` = 没配图标,那就只空着,不编一个默认图形。
+    ///
+    /// **借用**:`IconSpec.value` 装的是 .ico 正文的 base64,每帧 clone 一份
+    /// 是几十 KB 的无谓拷贝(T3)。
+    pub icon: Option<&'a mullion_store::IconSpec>,
 }
 
 /// F262:从**这一帧的标题条真值**里认出侧栏的归属分屏。
@@ -2191,10 +2204,10 @@ pub struct OwnerTag {
 /// **拿 `titles` 当真值而不是自己存一份 `pane → 序号/颜色`**:那种映射表在
 /// 用户关掉 pane、换节点之后没人清(F160~F163 踩过的「意图表换节点没人清」
 /// 同一形状)。这里每帧现查,查不到就不写,天然自愈。
-pub fn owner_tag(
-    titles: &[crate::ui::pane_title::TitleView<'_>],
+pub fn owner_tag<'a>(
+    titles: &[crate::ui::pane_title::TitleView<'a>],
     pane: Option<mullion_core::layout::PaneId>,
-) -> Option<OwnerTag> {
+) -> Option<OwnerTag<'a>> {
     if titles.len() < 2 {
         return None;
     }
@@ -2208,16 +2221,24 @@ pub fn owner_tag(
         color: v
             .appearance
             .and_then(|a| crate::ui::badge::should_paint(a, mullion_store::ColorTarget::PaneTitle)),
+        name: v.host.filter(|s| !s.trim().is_empty()),
+        icon: crate::ui::pane_title::icon_of(v.appearance, v.project_icon),
     })
 }
 
-/// F262:栏头那句话。抽成纯函数是为了让守护钉在文本本身上 —— 「分屏 N」这
-/// 几个字要跟标题条对得上,是用户能不能把两处连起来的全部依据。
-pub fn owner_header_text(index: usize) -> String {
-    format!("远端 · 分屏 {index}")
+/// F262/F265:栏头那句话。抽成纯函数是为了让守护钉在文本本身上。
+///
+/// 有节点名就只写节点名 —— 那才是用户要的那条信息(「这一栏通向哪台机器」)。
+/// **拿不到名字才退回「远端 · 分屏 N」**:还没连上的 pane 没有名字,这时候
+/// 一个字都不写的话栏头会空掉,反而比原来更糟。
+pub fn owner_header_text(name: Option<&str>, index: usize) -> String {
+    match name {
+        Some(n) => n.to_string(),
+        None => format!("远端 · 分屏 {index}"),
+    }
 }
 
-/// F262:画栏头(一条 F62 语义色竖条 + 一句「远端 · 分屏 N」)。
+/// F262/F265:画栏头(一条 F62 语义色竖条 + 图标 + 节点名)。
 ///
 /// **画在宿主里、`show()` 之前**,不进 `show()`:这是「这一栏属于谁」的外部
 /// 事实,`show()` 只认自己那份 `PaneState`。画在这里还顺带把布局光标往下推
@@ -2233,8 +2254,15 @@ fn owner_header(ui: &mut egui::Ui, t: &Theme, tag: &OwnerTag) {
             );
             crate::ui::badge::paint_edge_bar(ui.painter(), rect, crate::ui::badge::Side::Left, c);
         }
+        // F265:图标。**底色用 `tag.color` 这同一个值**,不再算一遍 —— 标题条
+        // 那边垫的就是 `should_paint(a, PaneTitle)`,两处各求一次必然漂。
+        if let Some(icon) = tag.icon {
+            let side = crate::ui::pane_title::icon_side(ROW_H);
+            let (r, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+            crate::ui::badge::paint_icon(ui.painter(), r, icon, tag.color);
+        }
         // `fg_dim`:这是个身份标记,不是内容。跟栏底状态行同一档。
-        ui.colored_label(theme::c32(t.fg_dim), owner_header_text(tag.index));
+        ui.colored_label(theme::c32(t.fg_dim), owner_header_text(tag.name, tag.index));
     });
 }
 
@@ -4663,6 +4691,8 @@ mod tests {
         let tag = OwnerTag {
             index: 2,
             color: Some(egui::Color32::from_rgb(0x3b, 0x82, 0xf6)),
+            name: None,
+            icon: None,
         };
         let render = |owner: Option<&OwnerTag>| {
             let ctx = egui::Context::default();
@@ -4699,7 +4729,7 @@ mod tests {
             (shapes, local, remote)
         };
 
-        let needle = owner_header_text(2);
+        let needle = owner_header_text(None, 2);
         let (with, local, remote) = render(Some(&tag));
         let pos = find_text_pos(&with, &needle)
             .unwrap_or_else(|| panic!("侧栏里没找到「{needle}」—— 栏头压根没画"));
@@ -4713,6 +4743,90 @@ mod tests {
         assert!(
             find_text_pos(&without, "分屏").is_none(),
             "算不出归属时还是写了「分屏 …」—— 指错比没有更糟"
+        );
+    }
+
+    /// F265:连上了就写**节点名**,没连上才退回「远端 · 分屏 N」。
+    ///
+    /// 用户实报:序号答不出「这一栏通向哪台机器」,而那正是上传下载会落到
+    /// 谁那儿的判据。
+    ///
+    /// **反面那条(没名字才退回序号)不能省**:只断言「有名字时写名字」的话,
+    /// 一个「两样都写」的实现照样过,而那与用户要的「把序号换成名字」不是
+    /// 一回事;只断言「没名字时写序号」的话,`owner_header_text` 原封不动
+    /// 也能过。
+    ///
+    /// 自证会变红:把 `owner_header_text` 的 `Some(n) => n.to_string()` 分支
+    /// 删掉(恒返回「远端 · 分屏 N」)。
+    #[test]
+    fn the_owner_line_names_the_node_and_falls_back_to_the_index_only_when_unnamed() {
+        assert_eq!(owner_header_text(Some("内网跳板机"), 2), "内网跳板机");
+        assert!(
+            !owner_header_text(Some("内网跳板机"), 2).contains("分屏"),
+            "有节点名时还挂着序号 —— 要的是把序号换掉,不是两样都写"
+        );
+        assert_eq!(owner_header_text(None, 2), "远端 · 分屏 2");
+    }
+
+    /// F265:节点名和图标是从**这一帧的标题条真值**里取的,不是另找一条路。
+    ///
+    /// 图标走 `pane_title::icon_of` 这同一个出口 —— 各挑各的话,侧栏画会话
+    /// 图标、标题条画项目图标,同一块 pane 在两处长得不一样(F238 定的
+    /// 「属于项目就用项目的图标」在侧栏会失效)。
+    ///
+    /// 自证会变红:
+    /// - 把 `name: v.host.filter(..)` 换成 `None` —— 名字那条红;
+    /// - 把 `icon:` 那行换成 `appearance.and_then(|a| a.icon.as_ref())`
+    ///   (绕开 `icon_of`)—— 项目图标那条红。
+    #[test]
+    fn the_owner_tag_takes_its_name_and_icon_from_the_title_bar() {
+        use mullion_core::layout::PaneId;
+        let sess_icon = mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: "会话的".into(),
+            bg: None,
+        };
+        let proj_icon = mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: "项目的".into(),
+            bg: None,
+        };
+        let a = crate::ui::badge::Appearance {
+            icon: Some(sess_icon.clone()),
+            ..Default::default()
+        };
+        let mut two = [title_of(1, 1, None), title_of(2, 2, Some(&a))];
+        two[1].host = Some("内网跳板机");
+
+        let tag = owner_tag(&two, Some(PaneId(2))).expect("归属认得出");
+        assert_eq!(tag.name, Some("内网跳板机"), "没把节点名取出来");
+        assert_eq!(
+            tag.icon.map(|i| i.value.as_str()),
+            Some("会话的"),
+            "不属于任何项目时该用会话图标"
+        );
+
+        // 属于项目 → 用项目的那张(F238「属于项目就用项目的」)。
+        two[1].project_icon = Some(&proj_icon);
+        assert_eq!(
+            owner_tag(&two, Some(PaneId(2)))
+                .expect("归属认得出")
+                .icon
+                .map(|i| i.value.as_str()),
+            Some("项目的"),
+            "属于项目却画会话图标 —— 与标题条画的不是同一张"
+        );
+
+        // 还没连上(`host == None`)→ 名字留空,由 `owner_header_text` 退回序号。
+        assert_eq!(
+            owner_tag(
+                &[title_of(1, 1, None), title_of(2, 2, None)],
+                Some(PaneId(2))
+            )
+            .expect("归属认得出")
+            .name,
+            None,
+            "还没连上却编出了一个名字"
         );
     }
 
