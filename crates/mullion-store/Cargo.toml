@@ -11,6 +11,9 @@ toml.workspace = true
 chacha20poly1305.workspace = true
 keyring.workspace = true
 argon2.workspace = true
+# F46-a:整机迁移包把各配置文件的正文 base64 内嵌进一份 TOML。
+# 0.22.1 本来就在 Cargo.lock 里(app 的图标内嵌),加进这里不引入新版本。
+base64.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

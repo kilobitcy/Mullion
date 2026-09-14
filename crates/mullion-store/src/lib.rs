@@ -16,6 +16,7 @@ pub mod master_key;
 pub mod migrate;
 pub mod model;
 pub mod network;
+pub mod portable;
 pub mod presence;
 pub mod project;
 pub mod secrets_file;
@@ -53,6 +54,11 @@ pub use model::{
     Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
+pub use portable::{
+    collect as collect_portable, install as install_pack, open_secrets, read_pack,
+    reseal_for_target, seal_secrets, write_pack, Installed, Pack, PackFile, CURRENT_PACK_FORMAT,
+    PACK_EXT,
+};
 pub use presence::{
     presence_dir, presence_path, publish as publish_presence, read_others as read_other_presence,
     sweep as sweep_presence, PRESENCE_DIR,

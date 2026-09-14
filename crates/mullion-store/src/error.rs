@@ -57,6 +57,12 @@ pub enum StoreError {
     /// 凭据还被这些会话引用着,不能删(F74,设计 D7)。带上引用者便于 UI
     /// 直接列出「先去解绑这几条」。
     CredentialInUse(Vec<SessionId>),
+    /// F46-a:迁移包的格式版本高于本客户端。**不猜着解** —— 包里装的是凭据
+    /// 和会话,而导入会把整份配置替换掉。
+    UnsupportedPack(u32),
+    /// F46-a:迁移包的结构不对(base64 解不开 / 密文段没有口令头)。
+    /// **与 `WrongPassword` 分开**:那条说「钥匙不对」,这条说「拿来的不是包」。
+    CorruptPack(String),
     /// 会话引用的凭据不存在。**绝不回落到别的身份**——与 `JumpDangling`
     /// 同一条铁律:静默换一个身份去登录是安全事故(设计 D6)。
     DanglingCredential(CredentialId),
@@ -104,6 +110,12 @@ impl fmt::Display for StoreError {
                 f,
                 "隧道引用的会话 {id:?} 不存在 —— 它可能已被删除,请重新指定或删除此隧道"
             ),
+            StoreError::UnsupportedPack(v) => write!(
+                f,
+                "这份迁移包是 v{v} 格式写出来的(本版本认到 v{}) —— 请先把 Mullion 升到导出它的那个版本",
+                crate::portable::CURRENT_PACK_FORMAT
+            ),
+            StoreError::CorruptPack(e) => write!(f, "迁移包读不懂:{e}"),
             StoreError::CredentialNotFound(id) => write!(f, "凭据不存在:{id:?}"),
             StoreError::CredentialInUse(ids) => write!(
                 f,

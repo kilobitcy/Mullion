@@ -263,12 +263,24 @@ impl Vault {
         Ok(toml::to_string_pretty(&file)?)
     }
 
+    /// `secrets.enc` 的**明文载荷**:解开之后、加密之前的那份 TOML。
+    ///
+    /// F46-a(整机迁移包)要拿它用一次性口令重新封一遍 —— 原样拷贝密文的话,
+    /// 解它的密钥留在源机的钥匙串里(见 `portable.rs` 的模块文档)。
+    ///
+    /// 与 `save()` 写出去的正文**同一个函数**算,理由与 `sessions_toml()` 那条
+    /// 逐字相同:各算各的话,某天有人只改了其中一处,导出的包就悄悄与盘上那份
+    /// 不是同一种编码了。
+    pub fn secrets_plaintext(&self) -> Result<String, StoreError> {
+        Ok(toml::to_string_pretty(&self.secrets)?)
+    }
+
     /// 落盘:两文件各自原子写。
     pub fn save(&mut self) -> Result<(), StoreError> {
         let toml_text = self.sessions_toml()?;
         write_atomic(&self.sessions_path(), toml_text.as_bytes())?;
 
-        let secret_text = toml::to_string_pretty(&self.secrets)?;
+        let secret_text = self.secrets_plaintext()?;
         let payload = crypto::encrypt(&self.key, secret_text.as_bytes())?;
         // F71:`Keyring` 方案下 `encode` 是恒等,写出的字节与本片之前完全一致。
         let blob = crate::secrets_file::encode(&self.scheme, &payload);
