@@ -13,6 +13,31 @@ use crate::theme::{self, Theme};
 /// 一条 toast 的存活时长(秒)。
 pub const TTL: f64 = 3.0;
 
+/// F263:一条 toast 最宽多少(逻辑点)。
+///
+/// 480 ≈ 一行 60 个汉字,再宽眼睛要横扫,而这东西只在屏幕上停三秒。
+pub const MAX_W: f32 = 480.0;
+
+/// F263:这一帧 toast 的宽度预算。
+///
+/// # 为什么必须显式给,而不是让它自己长
+///
+/// 用户实报「toast 总是很竖长」。根因是 `egui::Area` 的**尺寸棘轮**:
+/// `Area::end` 每帧把 `state.size` 记成这一帧内容的 `min_size`,下一帧的
+/// `max_rect` 就从那个尺寸来(`egui-0.30.0/src/containers/area.rs`)。于是
+/// 上一条 toast 是「已保存」,这一条一百来字的失败原因就被压在那三个字的
+/// 宽度里换行 —— 十几行的一根竖条。`Id` 是固定的 `"mullion_toast"`,
+/// 这份状态在两条 toast 之间一直留着。
+///
+/// `Ui::set_max_width` 直接改 `max_rect.max.x`(`placer.set_max_width`),
+/// **可以把预算改大**,所以它切得断这根棘轮;光设一个上限是不够的。
+///
+/// 半屏那一档:窄窗口里 480 会顶到两边;下限 200 是防着极窄窗口把文字挤成
+/// 每行一个字 —— 那种窗口下 toast 宽过半屏也无所谓,它本来就是临时浮层。
+pub fn max_width(screen_w: f32) -> f32 {
+    MAX_W.min(screen_w * 0.5).max(200.0)
+}
+
 /// F213:这一条说的是哪一档事。
 ///
 /// 原来边框无论内容一律画 `ok` 绿 —— 「正在上传截图…」(还没落地)和
@@ -94,6 +119,8 @@ pub fn show(
         .interactable(false)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
+            // F263:宽度预算每帧显式给一份,不继承上一帧(见 `max_width`)。
+            ui.set_max_width(max_width(ctx.screen_rect().width()));
             // F213:底色与弹窗同源。原来蹭的是 `sunken_bg`(#0e1018),在
             // 终端底色(#14161f)上只有 1.05:1 —— 一块飘在正文之上、却几乎
             // 看不出边界的浮层。F203 把弹窗从这个坑里捞出来时漏了 toast。
@@ -151,6 +178,70 @@ mod tests {
 
         run(&ctx, 10.0 + TTL + 0.1, &mut pending, &mut live);
         assert!(live.is_none(), "过了 TTL 该自己消失,不用等用户动鼠标");
+    }
+
+    /// F263:长文案不许被**上一条**短 toast 的宽度压住。
+    ///
+    /// 用户实报「toast 总是很竖长」。判据必须是「先短后长」的两帧序列:单独
+    /// 画一条长的看不出问题(首帧的预算是 egui 的 `default_area_size`,600 点,
+    /// 够宽),病在 `Area` 把上一帧的尺寸留下来当下一帧的预算(见
+    /// `max_width` 的文档)。所以这里刻意先飘一条「已保存」,再换成长文案。
+    ///
+    /// 两条断言各管一头:够宽(棘轮切断了)、不过宽(上限还在)。
+    ///
+    /// 自证会变红:
+    /// - 删掉 `ui.set_max_width(..)` 那行 —— 「够宽」那条红(实测卡在 78 点
+    ///   左右,正是「已保存」三个字的宽度);
+    /// - 把 `max_width` 的 `MAX_W.min(..)` 换成一个大数(比如 4000)——
+    ///   「不过宽」那条红。
+    #[test]
+    fn a_long_toast_is_not_squeezed_into_the_width_of_the_short_one_before_it() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let t = crate::theme::MULLION_DARK;
+        let mut live = None;
+        let frame = |time: f64, pending: &mut Option<(Kind, String)>, live: &mut Option<Toast>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| show(ctx, &t, pending, live),
+            );
+            ctx.memory(|m| m.area_rect(egui::Id::new("mullion_toast")))
+        };
+
+        // 先飘一条很短的,让 `Area` 把那个窄尺寸记下来。
+        let mut short = Some((Kind::Ok, "已保存".to_string()));
+        for i in 0..3 {
+            let _ = frame(1.0 + i as f64 * 0.1, &mut short, &mut live);
+        }
+        // 再换成一条长的(同一个 Area id,状态还在)。
+        let mut long = Some((
+            Kind::Warn,
+            "隧道 127.0.0.1:8080 → build-01:80 已停止:连接被拒绝,\
+             已退避重连 3 次,下一次在 30 秒后"
+                .to_string(),
+        ));
+        let mut rect = None;
+        for i in 0..3 {
+            rect = frame(2.0 + i as f64 * 0.1, &mut long, &mut live);
+        }
+        let rect = rect.expect("toast 没画出来 —— 下面两条断言会空过");
+
+        let want = max_width(screen.width());
+        assert!(
+            rect.width() >= want - 40.0,
+            "长文案被压在 {} 点宽里换行(该有约 {want} 点)—— `Area` 把上一条\
+             短 toast 的尺寸当成了这一帧的预算,画出来就是用户报的那根竖条",
+            rect.width()
+        );
+        assert!(
+            rect.width() <= want + 40.0,
+            "toast 宽到了 {} 点(上限约 {want})—— 一行横跨整屏,眼睛要横扫",
+            rect.width()
+        );
     }
 
     /// 走查 13:toast 活着的时候必须主动排下一帧 —— 事件循环是帧率节流 +
