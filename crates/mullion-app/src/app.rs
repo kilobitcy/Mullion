@@ -23948,9 +23948,9 @@ mod tests {
             .expect("run_pack_import 的函数体切歪了 —— 下面几条断言会空过");
         // 断言的是**换进去**那一句,不是「调用了 open」——「开一把扔掉」编译
         // 照过、行为与没开完全一样,只断言调用的话这条守护杀不掉它(实测)。
-        let reopen = body
-            .find("self.store = Some(")
-            .expect("导入后没把重开的库换进内存 —— 用户不重启随手改一条,导入的配置被旧内存整份盖回去");
+        let reopen = body.find("self.store = Some(").expect(
+            "导入后没把重开的库换进内存 —— 用户不重启随手改一条,导入的配置被旧内存整份盖回去",
+        );
         assert!(
             body.contains("SessionStore::open("),
             "换进去的不是重新打开的那一份"
