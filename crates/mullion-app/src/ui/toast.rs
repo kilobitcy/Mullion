@@ -193,7 +193,8 @@ mod tests {
     /// - 删掉 `ui.set_max_width(..)` 那行 —— 「够宽」那条红(实测卡在 78 点
     ///   左右,正是「已保存」三个字的宽度);
     /// - 把 `max_width` 的 `MAX_W.min(..)` 换成一个大数(比如 4000)——
-    ///   「不过宽」那条红。
+    ///   实测「够宽」那条先红(实宽 525,离 4000 差得远);把 `MAX_W` 本身
+    ///   调大则由「不过宽」那条接住。
     #[test]
     fn a_long_toast_is_not_squeezed_into_the_width_of_the_short_one_before_it() {
         let ctx = egui::Context::default();
@@ -237,9 +238,11 @@ mod tests {
              短 toast 的尺寸当成了这一帧的预算,画出来就是用户报的那根竖条",
             rect.width()
         );
+        // 上界钉在 `MAX_W` 这个常量上,不钉 `want` —— `want` 是 `max_width`
+        // 自己算的,拿它当上界等于让被测函数给自己出题。
         assert!(
-            rect.width() <= want + 40.0,
-            "toast 宽到了 {} 点(上限约 {want})—— 一行横跨整屏,眼睛要横扫",
+            rect.width() <= MAX_W + 40.0,
+            "toast 宽到了 {} 点(上限 {MAX_W})—— 一行横跨整屏,眼睛要横扫",
             rect.width()
         );
     }
