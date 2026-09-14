@@ -313,12 +313,25 @@ pub fn format_line(ts: &str, pid: u32, msg: &str) -> String {
     format!("[{ts}] [{pid}] {msg}\n")
 }
 
-/// 真正落盘:带 UTC 时间戳 + pid,写文件 + stderr。`level` 决定要不要立刻
+/// F269:行首那个时间戳。**按本机时区写,格式仍是 RFC3339**
+/// (`2026-09-14T16:31:02.123456789+08:00`)。
+///
+/// 为什么不换成 `2026-09-14 16:31:02` 这种更好读的写法:偏移量留在串里,
+/// 一堆旧日志(全 UTC、后缀 `Z`)与新日志混在同一个目录时肉眼分得出来,
+/// 且仍然能被现成工具解析。
+///
+/// **偏移是参数不是全局读取**(同 `localtime::format_unix`):进程级
+/// `OnceLock` 一旦被别的测试设过就再也改不动,拿它当输入的测试会互相打架。
+///
+/// `now` 也是参数:写死才能让断言不随真实时钟变红。
+pub fn stamp(now: OffsetDateTime, offset: time::UtcOffset) -> String {
+    now.to_offset(offset).format(&Rfc3339).unwrap_or_default()
+}
+
+/// 真正落盘:带本机时区时间戳 + pid,写文件 + stderr。`level` 决定要不要立刻
 /// flush(见 [`flush_immediately`])。失败静默(日志绝不能反过来拖垮程序)。
 fn write_line_at(msg: &str, level: log::Level) {
-    let ts = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_default();
+    let ts = stamp(OffsetDateTime::now_utc(), crate::localtime::offset());
     let full = format_line(&ts, std::process::id(), msg);
     let _ = write!(std::io::stderr(), "{full}");
     if let Some(m) = SINK.get() {
@@ -863,6 +876,56 @@ mod tests {
     fn the_pid_sits_between_the_timestamp_and_the_message() {
         let line = format_line("TS", 7, "MSG");
         assert_eq!(line, "[TS] [7] MSG\n");
+    }
+
+    /// F269:时间戳按给定偏移换算,**且把偏移写进串里**。
+    ///
+    /// 两条断言缺一不可:只断言「含 +08:00」的话,把 `to_offset` 删掉、
+    /// 换成给 UTC 串硬拼一个后缀也能过;只断言「小时数是 16」的话,
+    /// 一个不带偏移的本地时间格式也能过,而那种串与旧日志混在一起认不出来。
+    ///
+    /// 自证会变红:把 `stamp` 里的 `.to_offset(offset)` 去掉。
+    #[test]
+    fn the_timestamp_is_rendered_in_the_given_zone_and_says_which_zone() {
+        // 2026-09-14T08:31:02Z。
+        let t = OffsetDateTime::from_unix_timestamp(1_789_374_662).unwrap();
+        assert!(
+            stamp(t, time::UtcOffset::UTC).starts_with("2026-09-14T08:31:02"),
+            "基准时刻都对不上,后面的换算断言就没有意义了"
+        );
+        let s = stamp(t, time::UtcOffset::from_hms(8, 0, 0).unwrap());
+        assert!(
+            s.starts_with("2026-09-14T16:31:02"),
+            "没按给定偏移换算 —— UTC+8 下该是 16:31:02:{s}"
+        );
+        assert!(s.ends_with("+08:00"), "时间戳没说自己是哪个时区:{s}");
+    }
+
+    /// F269:落盘那条路**真的**去读了本机偏移。
+    ///
+    /// `stamp` 是纯函数、测得很扎实,但「接线断了」照样全绿:
+    /// `write_line_at` 里传 `UtcOffset::UTC` 进去的话,上面那条测试一个字
+    /// 都不会变红,而日志仍然全是 UTC。扎在源码结构上是因为 `SINK` 是进程级
+    /// `OnceLock`,单测里跑不了真流程。
+    ///
+    /// **只切函数体、不含文档注释**:注释里写了关键词会让这条守护假绿。
+    ///
+    /// 自证会变红:把 `write_line_at` 里的 `crate::localtime::offset()`
+    /// 换成 `time::UtcOffset::UTC`。
+    #[test]
+    fn the_line_that_actually_hits_the_disk_asks_for_the_local_offset() {
+        let src = include_str!("logx.rs");
+        let body = src
+            .split("fn write_line_at(msg: &str, level: log::Level) {")
+            .nth(1)
+            .expect("write_line_at 没了？这条测试的锚点失效了")
+            .split("\n}\n")
+            .next()
+            .expect("write_line_at 的函数体没有闭合？");
+        assert!(
+            body.contains("crate::localtime::offset()"),
+            "落盘那条路没读本机时区 —— 日志会静默地继续按 UTC 写"
+        );
     }
 
     /// 文件名 ⇄ instance id 的往返。
