@@ -23900,6 +23900,35 @@ mod tests {
         assert!(empty < seal, "空明文的判断排在封装之后 —— 空密文照样进包");
     }
 
+    /// F46-a:封包用的是**按下按钮那一刻**的口令,不是保存对话框回来时
+    /// 输入框里还剩什么。
+    ///
+    /// 那个弹窗在挑保存位置的整段时间里一直开着,口令框可编辑。现读的话:
+    /// 用户按完按钮又把口令改了一半 → 包用的是改了一半那串,而他记住的是
+    /// 原来那串,下次导入时一个字都对不上,且没有任何地方能查出来。
+    ///
+    /// 自证会变红:把 `pending_pack_pass.take()` 换成 `self.ui.pack` 现读。
+    #[test]
+    fn the_password_that_seals_the_pack_is_the_one_typed_when_the_button_was_pressed() {
+        let body = strip_comments(body_of(prod_src(), "fn write_pack_to(&mut self,"));
+        assert!(
+            body.contains("self.pending_pack_pass.take()"),
+            "封包的口令不是按下按钮那一刻暂存的那串"
+        );
+        // 判据是「碰没碰弹窗里的口令字段」,不是「碰没碰弹窗」—— 导出成功后
+        // `self.ui.pack = None` 关窗那句是合法的,拿整个 `self.ui.pack` 当判据
+        // 会把它一起判死。函数里那个本地绑定叫 `pass`(不带点),不会自撞。
+        assert!(
+            !body.contains(".pass"),
+            "从还开着的弹窗现读口令 —— 用户在挑保存位置时改一个字,包就用的是那一串"
+        );
+        let stash = strip_comments(body_of(prod_src(), "fn apply_pack_action(&mut self,"));
+        assert!(
+            stash.contains("self.pending_pack_pass = self.ui.pack"),
+            "按钮那一刻没把口令暂存下来 —— take() 永远取到 None,导出一声不吭地什么都不做"
+        );
+    }
+
     /// F46-a:导入落盘之后**必须**把内存里那份库换掉。
     ///
     /// 盘上已经是导入的配置,而 `Vault` / `KnownHostsFile` 还指着旧内容。
