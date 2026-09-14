@@ -510,12 +510,13 @@ mod tests {
         assert!(f.project.is_empty());
     }
 
-    /// schema 先升到 11(F238,`[[project]].icon`),又升到 12(F257,
-    /// `[[project]].archived_at`):旧客户端读到新版本会把新增键当未知字段
-    /// 丢掉再写回 —— **用户设的图标 / 归档判断静默消失**。拒绝比装作能用好。
+    /// schema 先升到 11(F238,`[[project]].icon`),再升到 12(F257,
+    /// `[[project]].archived_at`),又升到 13(F268,`[[tunnel]].name`):
+    /// 旧客户端读到新版本会把新增键当未知字段丢掉再写回 —— **用户设的
+    /// 图标 / 归档判断 / 隧道名字静默消失**。拒绝比装作能用好。
     #[test]
     fn the_schema_version_is_bumped_so_old_clients_refuse_instead_of_dropping_projects() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 12);
+        assert_eq!(crate::model::CURRENT_SCHEMA, 13);
     }
 
     /// F238:项目自设的图标要能原样往返。**跟着 `[[project]]` 存在一起**,

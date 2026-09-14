@@ -302,6 +302,14 @@ impl SessionStore {
         self.vault.update_tunnel(id, draft)
     }
 
+    /// F268:右键「克隆」。整条带过去,见 `Vault::clone_tunnel`。
+    pub fn clone_tunnel(
+        &mut self,
+        id: mullion_store::TunnelId,
+    ) -> Result<mullion_store::TunnelId, StoreError> {
+        self.vault.clone_tunnel(id)
+    }
+
     pub fn delete_tunnel(&mut self, id: mullion_store::TunnelId) -> Result<(), StoreError> {
         self.vault.delete_tunnel(id)
     }

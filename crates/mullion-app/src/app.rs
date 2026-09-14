@@ -13749,6 +13749,37 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(id) = self.ui.tunnel_start_request.take() {
                     self.start_tunnel(id);
                 }
+                // F268:右键「克隆」。深拷贝在 store 层(`Vault::clone_tunnel`),
+                // 这里只落盘、报结果、把新那条选中并把缓冲换成它 —— 克隆出来
+                // 第一件事必然是改端口或改名。
+                //
+                // `tunnel_editor_baseline` 与 `tunnel_editor` **同时**设置:
+                // 漏了基线的话刚克隆出来的表单立刻被判成脏(F239),下一次切换
+                // 会弹一个莫名其妙的确认。
+                if let Some(id) = self.ui.tunnel_clone_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match store
+                            .clone_tunnel(id)
+                            .and_then(|new_id| store.save().map(|()| new_id))
+                        {
+                            Ok(new_id) => {
+                                if let Some(rec) =
+                                    store.tunnels().iter().find(|t| t.id == new_id).cloned()
+                                {
+                                    let buf =
+                                        crate::ui::session_manager::TunnelEditorBuffer::from_record(
+                                            &rec,
+                                        );
+                                    self.ui.tunnel_editor_id = Some(new_id);
+                                    self.ui.tunnel_editor_baseline = Some(buf.clone());
+                                    self.ui.tunnel_editor = Some(buf);
+                                }
+                                self.ui.set_toast(crate::ui::toast::Kind::Ok, "已克隆隧道");
+                            }
+                            Err(e) => self.ui.set_error(format!("克隆隧道失败:{e}")),
+                        }
+                    }
+                }
                 if let Some(intent) = self.ui.tunnel_save_request.take() {
                     if let Some(store) = self.store.as_mut() {
                         let result = match intent.editing_id {
@@ -18698,6 +18729,42 @@ mod tests {
             session_manager_dirty(&ui),
             "凭据表单有未保存改动,session_manager_dirty 必须报脏"
         );
+    }
+
+    /// F268:克隆隧道的施加点,`tunnel_editor` 与 `tunnel_editor_baseline`
+    /// **必须同时**换成新那条。
+    ///
+    /// 只换缓冲不换基线的症状:刚克隆出来的表单立刻被 `session_manager_dirty`
+    /// (F239,整体比对)判成脏 —— 用户什么都没改,下一次切换却弹一个
+    /// 「有未保存改动」的确认框,而且弹窗上说不出改了什么。反过来只换基线
+    /// 不换缓冲,右栏还停在源那条上,改一改点保存会改错对象。
+    ///
+    /// 这条只能从源码切:两个赋值都在事件循环的渲染回调之后,把整段 winit
+    /// 事件循环跑起来才够得着。
+    ///
+    /// 自证会变红:把那一段里的 `tunnel_editor_baseline = Some(buf.clone())`
+    /// 或 `tunnel_editor = Some(buf)` 任一行删掉。
+    #[test]
+    fn cloning_a_tunnel_swaps_the_buffer_and_its_baseline_together() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("找不到 #[cfg(test)] 边界");
+        let start = production
+            .find("if let Some(id) = self.ui.tunnel_clone_request.take() {")
+            .expect("找不到克隆隧道的施加点");
+        let block = &production[start..start + 1400];
+        for needle in [
+            "store.save()",
+            "self.ui.tunnel_editor_id = Some(new_id);",
+            "self.ui.tunnel_editor_baseline = Some(buf.clone());",
+            "self.ui.tunnel_editor = Some(buf);",
+        ] {
+            assert!(
+                block.contains(needle),
+                "克隆隧道那一段少了 `{needle}`:\n{block}"
+            );
+        }
     }
 
     /// F239:同上,隧道那一路。

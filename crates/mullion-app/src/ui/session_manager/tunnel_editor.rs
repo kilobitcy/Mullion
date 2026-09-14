@@ -41,6 +41,9 @@ impl TunnelKindUi {
 pub struct TunnelEditorBuffer {
     /// 提供拨号目标与凭据的会话。悬垂时**保持原值**,不静默跳到第一条。
     pub session_id: Option<SessionId>,
+    /// F268:用户自己起的名字。空串 = 没起名,列表行退回转发串当标题。
+    /// **不必填**:大多数隧道一眼就能从「本地 3306 → db:3306」认出来。
+    pub name: String,
     pub kind: TunnelKindUi,
     pub listen_port: String,
     pub target_host: String,
@@ -56,6 +59,7 @@ impl Default for TunnelEditorBuffer {
     fn default() -> Self {
         Self {
             session_id: None,
+            name: String::new(),
             kind: TunnelKindUi::Local,
             listen_port: String::new(),
             target_host: String::new(),
@@ -96,6 +100,7 @@ impl TunnelEditorBuffer {
         };
         Self {
             session_id: Some(rec.session_id),
+            name: rec.name.clone(),
             kind,
             listen_port: rec.listen_port.to_string(),
             target_host,
@@ -156,6 +161,7 @@ pub fn build_tunnel_draft(buf: &TunnelEditorBuffer) -> Result<TunnelDraft, Strin
     Ok(TunnelDraft {
         session_id,
         listen_port,
+        name: buf.name.trim().to_string(),
         note: buf.note.trim().to_string(),
         autostart: buf.autostart,
         kind,
@@ -462,9 +468,17 @@ pub(super) fn show(
         });
     }
 
-    form::section(ui, t, "会话管理器/右栏", "其他", &mut first);
+    form::section(ui, t, "会话管理器/右栏", "标识", &mut first);
     form::grid(ui, "tunnel_misc", |ui| {
-        ui.label("说明");
+        ui.label("名称");
+        ui.add(
+            egui::TextEdit::singleline(&mut buf.name)
+                .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
+                .hint_text(theme::hint_text(t, "这条隧道叫什么(可选)")),
+        );
+        ui.end_row();
+
+        ui.label("备注");
         ui.add(
             egui::TextEdit::singleline(&mut buf.note)
                 .desired_width(field_w(ui.available_width(), FIELD_W_L, 0.0))
@@ -491,6 +505,7 @@ mod tests {
     fn filled(kind: TunnelKindUi) -> TunnelEditorBuffer {
         TunnelEditorBuffer {
             session_id: Some(SessionId(7)),
+            name: String::new(),
             kind,
             listen_port: "3306".into(),
             target_host: "db.internal".into(),
@@ -637,6 +652,7 @@ mod tests {
             id: TunnelId(1),
             session_id: SessionId(7),
             listen_port: 8080,
+            name: "内网 web 转发".into(),
             note: "内网 web".into(),
             autostart: false,
             kind: TunnelKind::Remote {
@@ -649,8 +665,39 @@ mod tests {
         let draft = build_tunnel_draft(&buf).unwrap();
         assert_eq!(draft.session_id, rec.session_id);
         assert_eq!(draft.listen_port, rec.listen_port);
+        // F268:名字也要能原路回来。漏了回填的症状是「打开一条起过名的隧道、
+        // 什么都没改就点保存,名字没了」—— 全程零报错。
+        assert_eq!(draft.name, rec.name);
         assert_eq!(draft.note, rec.note);
         assert_eq!(draft.kind, rec.kind);
+    }
+
+    /// F268:名称两端的空白要 `trim` 掉。留着的话,列表行画出来左边多一块空,
+    /// 而 `row_title` 那边判空用的是 `trim()` —— 一串空格会被当成「起过名」
+    /// 落盘、又被当成「没起名」渲染,两边说法不一致。
+    ///
+    /// 自证会变红:把 `build_tunnel_draft` 里的 `buf.name.trim()` 改成 `buf.name`。
+    #[test]
+    fn a_tunnel_name_is_trimmed_on_the_way_into_the_draft() {
+        let mut buf = filled(TunnelKindUi::Local);
+        buf.name = "  生产库  ".into();
+        assert_eq!(build_tunnel_draft(&buf).unwrap().name, "生产库");
+    }
+
+    /// F268:「名称」「备注」两个框都得画出来,且旧标签「说明」不再出现 ——
+    /// 同一个字段在表单上叫「说明」、在别处被叫成「备注」,用户会以为是两样东西。
+    ///
+    /// 自证会变红:把「名称」那一栏整块删掉(第一条断言红),或把「备注」
+    /// 改回「说明」(后两条同时红)。
+    #[test]
+    fn the_identity_section_has_both_a_name_and_a_note_field() {
+        let texts = rendered_texts(filled(TunnelKindUi::Local), &[]);
+        assert!(has_exact(&texts, "名称"), "没画「名称」标签: {texts:?}");
+        assert!(has_exact(&texts, "备注"), "没画「备注」标签: {texts:?}");
+        assert!(
+            !has_exact(&texts, "说明"),
+            "旧标签「说明」还在,两个名字指同一个字段: {texts:?}"
+        );
     }
 
     use mullion_store::SessionRecord;
@@ -746,7 +793,7 @@ mod tests {
         texts.iter().any(|s| s.contains(needle))
     }
 
-    /// 精确匹配,不是 `contains`。四个分节标题("转发"/"侦听"/"目标"/"其他")
+    /// 精确匹配,不是 `contains`。四个分节标题("转发"/"侦听"/"目标"/"标识")
     /// 都只有两个字,而它们又恰好是相邻字段措辞里会用到的字:下拉框选中文本
     /// 是「本地转发 (-L)」、侦听端口标签是「本机侦听端口」、目标标签是
     /// 「目标(从远端看)」、暴露勾选文案是「允许同网段其他主机连这个端口」——
@@ -766,7 +813,7 @@ mod tests {
     #[test]
     fn the_form_is_grouped_into_named_sections() {
         let texts = rendered_texts(filled(TunnelKindUi::Local), &[]);
-        for s in ["转发", "侦听", "目标", "其他"] {
+        for s in ["转发", "侦听", "目标", "标识"] {
             assert!(has_exact(&texts, s), "分节「{s}」没画出来: {texts:?}");
         }
     }

@@ -272,6 +272,7 @@ mod tests {
                 id: TunnelId(id),
                 session_id: SessionId(session),
                 listen_port: 3306,
+                name: String::new(),
                 note: String::new(),
                 autostart: false,
                 kind: mullion_store::TunnelKind::Local {

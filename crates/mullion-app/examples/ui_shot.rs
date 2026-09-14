@@ -403,6 +403,7 @@ fn fixture(scene: &str) -> Fixture {
                 id: TunnelId(id),
                 session_id: SessionId(session),
                 listen_port: listen,
+                name: String::new(),
                 note: String::new(),
                 autostart: false,
                 kind,

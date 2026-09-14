@@ -229,6 +229,10 @@ pub struct UiState {
     pub tunnel_save_request: Option<session_manager::TunnelSaveIntent>,
     /// 二次确认后的删除意图 → app 事后据此调 `store.delete_tunnel`。
     pub tunnel_delete_request: Option<TunnelId>,
+    /// F268:右键「克隆」→ app 事后调 `store.clone_tunnel`。深拷贝在 store 层,
+    /// 理由同会话侧的 `clone_request`:UI 层「填一份草稿再保存」那条路会静默
+    /// 漏掉字段。
+    pub tunnel_clone_request: Option<TunnelId>,
     /// 点了删隧道但还没二次确认;确认后转成 `tunnel_delete_request`。
     pub pending_tunnel_delete: Option<TunnelId>,
     /// 隧道右栏「保存」被点了。中转一层的理由同 `save_click`。

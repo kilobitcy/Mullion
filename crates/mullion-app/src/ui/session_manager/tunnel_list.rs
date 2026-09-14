@@ -24,11 +24,11 @@ pub(crate) fn start_button_id(id: TunnelId) -> egui::Id {
     egui::Id::new(("mullion_tunnel_start", id.0))
 }
 
-/// 一行的主标题:`本地 3306 → db.internal:3306`。
+/// 转发串:`本地 3306 → db.internal:3306`。**不含名称**。
 ///
 /// 方向箭头照着**数据流向**写,不照配置字段顺序 —— 这个功能最常见的错误
 /// 就是把两端填反,标题里看不出方向等于把排查成本推到运行时。
-pub(crate) fn row_title(rec: &TunnelRecord) -> String {
+pub(crate) fn forward_summary(rec: &TunnelRecord) -> String {
     match &rec.kind {
         TunnelKind::Local {
             target_host,
@@ -44,13 +44,30 @@ pub(crate) fn row_title(rec: &TunnelRecord) -> String {
     }
 }
 
+/// F268:一行的主标题。起了名就用名字,没起名退回转发串。
+///
+/// 退回的是**转发串本身**而不是「未命名隧道」之类的占位:没起名的隧道恰恰
+/// 是靠「本地 3306 → db:3306」认出来的,拿一句占位把它盖掉,等于让所有
+/// 没起名的行长得一模一样。
+pub(crate) fn row_title(rec: &TunnelRecord) -> String {
+    let name = rec.name.trim();
+    if name.is_empty() {
+        forward_summary(rec)
+    } else {
+        name.to_string()
+    }
+}
+
 /// 一行的副标题:引用的会话。悬垂时说清楚是**引用**坏了,不是隧道配错了。
+///
+/// F268:起了名的行,转发串**降级到这里** —— 名字占了主标题,转发串仍然是
+/// 判断「这条是不是我要找的那条」的关键信息,不能因为起了名就看不见了。
 fn row_subtitle(
     rec: &TunnelRecord,
     sessions: &[SessionRecord],
     credentials: &[mullion_store::CredentialRecord],
 ) -> (String, bool) {
-    match sessions.iter().find(|s| s.id == rec.session_id) {
+    let (via, dangling) = match sessions.iter().find(|s| s.id == rec.session_id) {
         Some(s) => (
             format!(
                 "经 {} ({}@{})",
@@ -61,6 +78,11 @@ fn row_subtitle(
             false,
         ),
         None => ("引用的会话已删除".to_string(), true),
+    };
+    if rec.name.trim().is_empty() {
+        (via, dangling)
+    } else {
+        (format!("{} · {via}", forward_summary(rec)), dangling)
     }
 }
 
@@ -196,6 +218,15 @@ fn row(
         ui.vertical(|ui| {
             let title = row_title(rec);
             let resp = ui.add(egui::SelectableLabel::new(selected, title));
+            // F268:克隆。整条复制成新的一条 —— 同一台机器上再开一条转发
+            // (换个端口、换个目标)是最常见的动作,手工重填一遍类型/会话/
+            // 目标又慢又容易把方向填反。**端口不自动挪**,见 `Vault::clone_tunnel`。
+            resp.context_menu(|ui| {
+                if ui.button("克隆").clicked() {
+                    ui_state.tunnel_clone_request = Some(rec.id);
+                    ui.close_menu();
+                }
+            });
             if resp.clicked() {
                 ui_state.tunnel_editor_id = Some(rec.id);
                 let buf = super::TunnelEditorBuffer::from_record(rec);
@@ -347,6 +378,7 @@ mod tests {
             id: TunnelId(id),
             session_id: SessionId(7),
             listen_port: 3306,
+            name: String::new(),
             note: String::new(),
             autostart: false,
             kind,
@@ -480,5 +512,145 @@ mod tests {
     fn affected_lines_is_empty_when_nothing_references_the_session() {
         let list = vec![rec(1, local())];
         assert!(affected_lines(SessionId(99), &list).is_empty());
+    }
+
+    fn named(id: u64, name: &str) -> TunnelRecord {
+        let mut r = rec(id, local());
+        r.name = name.into();
+        r
+    }
+
+    /// F268:起了名的行,名字当主标题,**转发串降到副标题**而不是消失。
+    ///
+    /// 转发串是判断「这条是不是我要找的那条」的关键信息:名字可以撞、可以
+    /// 过期(改了端口忘了改名),而「本地 3306 → db:3306」是从配置现算出来的。
+    ///
+    /// 自证会变红:把 `row_title` 里的 `if name.is_empty()` 分支反过来
+    /// (第一条断言拿到转发串),或把 `row_subtitle` 末尾拼转发串那一段删掉
+    /// (第二条断言里副标题只剩「经 …」)。
+    #[test]
+    fn a_named_tunnel_shows_its_name_up_top_and_keeps_the_forward_string_below() {
+        let r = named(1, "生产库");
+        assert_eq!(row_title(&r), "生产库");
+        let (sub, dangling) = row_subtitle(&r, &[], &[]);
+        assert!(
+            sub.starts_with("本地 3306 → db.internal:3306"),
+            "实际: {sub}"
+        );
+        assert!(dangling, "引用的会话不在表里,仍然要判成悬垂");
+        assert!(sub.contains("引用的会话已删除"), "实际: {sub}");
+    }
+
+    /// 没起名的行**完全回到原来的样子** —— 不塞「未命名隧道」之类的占位,
+    /// 也不在副标题里把转发串再写一遍(那会变成同一句话画两行)。
+    ///
+    /// 自证会变红:把 `row_title` 的兜底改成 `"未命名隧道"`,或把
+    /// `row_subtitle` 里的 `if rec.name.trim().is_empty()` 判断去掉。
+    #[test]
+    fn an_unnamed_tunnel_renders_exactly_as_before() {
+        let r = rec(1, local());
+        assert_eq!(row_title(&r), "本地 3306 → db.internal:3306");
+        let (sub, _) = row_subtitle(&r, &[], &[]);
+        assert_eq!(sub, "引用的会话已删除", "没起名就别在副标题里多拼一段");
+    }
+
+    /// 名字只有空白 = 没起名。`build_tunnel_draft` 那边是 `trim()` 后落盘的,
+    /// 但手改 toml 塞一串空格进去照样读得回来 —— 渲染这边不能因此画出一行
+    /// 看上去什么都没写的标题。
+    ///
+    /// 自证会变红:把 `row_title` 里的 `rec.name.trim()` 改成 `rec.name`。
+    #[test]
+    fn a_whitespace_only_name_counts_as_unnamed() {
+        assert_eq!(
+            row_title(&named(1, "   ")),
+            "本地 3306 → db.internal:3306",
+            "只有空白的名字不能顶掉转发串"
+        );
+    }
+
+    fn find_text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(t) if t.galley.job.text.contains(needle) => Some(t.pos),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// F268:右键菜单里的「克隆」点下去要真的落下意图。
+    ///
+    /// 纯函数(`Vault::clone_tunnel`)测得再扎实也证不了这一条 —— 菜单项与
+    /// 施加点之间的那根线断了(没写 `ui_state.tunnel_clone_request`),症状是
+    /// 「点了没反应」,而所有纯函数测试照样全绿。
+    ///
+    /// 驱动方式照抄 `list::right_click_offers_clone_between_move_to_group_and_delete`
+    /// (它已经解决了「`context_menu` 要一次右键 + 一帧 sizing pass 才展开」;
+    /// 本仓库为预热帧数不足吃过两次静默假绿)。
+    ///
+    /// 自证会变红:把 `ui_state.tunnel_clone_request = Some(rec.id);` 那一行删掉。
+    #[test]
+    fn right_clicking_a_tunnel_row_offers_clone_and_it_lands_the_intent() {
+        let t = crate::theme::MULLION_DARK;
+        let tunnels = vec![named(4, "tunnel-clone-target")];
+        let mut ui_state = UiState::default();
+        let ctx = egui::Context::default();
+
+        let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(ui, &t, ui_state, &tunnels, &[], &[], &[]);
+                });
+            })
+        };
+        let click = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let _ = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let row_pos =
+            find_text_pos(&out.shapes, "tunnel-clone-target").expect("这一行应该已经画出来了");
+        let row_click_pos = egui::pos2(row_pos.x + 4.0, row_pos.y + 4.0);
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(row_click_pos),
+                    click(row_click_pos, egui::PointerButton::Secondary, true),
+                    click(row_click_pos, egui::PointerButton::Secondary, false),
+                ],
+                ..Default::default()
+            },
+        );
+        // 菜单是 `Area`,首帧先做一趟不可见的 sizing pass。
+        let out = run(&ctx, &mut ui_state, egui::RawInput::default());
+        let clone_pos = find_text_pos(&out.shapes, "克隆").expect("菜单里应该有「克隆」");
+        let _ = run(
+            &ctx,
+            &mut ui_state,
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(clone_pos),
+                    click(clone_pos, egui::PointerButton::Primary, true),
+                    click(clone_pos, egui::PointerButton::Primary, false),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ui_state.tunnel_clone_request,
+            Some(TunnelId(4)),
+            "点「克隆」必须落下克隆意图,否则点了没反应"
+        );
+        assert!(
+            ui_state.pending_tunnel_delete.is_none(),
+            "克隆不该顺带把这一行推进删除确认"
+        );
     }
 }

@@ -54,6 +54,14 @@ pub struct TunnelRecord {
     pub session_id: SessionId,
     /// 侦听端口:`Local`/`Dynamic` 在本机,`Remote` 在远端。
     pub listen_port: u16,
+    /// F268:用户自己起的名字。空串 = 没起名,列表行退回
+    /// `本地 3306 → db:3306` 那种由配置拼出来的标题。
+    ///
+    /// **不做唯一性校验**:名字是给人读的,撞名的代价是用户自己看着别扭;
+    /// 而强制唯一会让「克隆一条再慢慢改」这条路走不通(F229 的会话克隆
+    /// 之所以要去重编号,是因为会话名同时是拨号入口的显示名)。
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub note: String,
     /// 已落盘但本切片无 UI、无行为(设计 D6,欠账留给 T-b)。
@@ -106,6 +114,7 @@ mod tests {
             id: TunnelId(1),
             session_id: SessionId(7),
             listen_port: 3306,
+            name: String::new(),
             note: "本地连库".into(),
             autostart: false,
             kind: TunnelKind::Local {
@@ -146,6 +155,7 @@ mod tests {
                 id: TunnelId(2),
                 session_id: SessionId(7),
                 listen_port: 1080,
+                name: String::new(),
                 note: String::new(),
                 autostart: false,
                 kind: TunnelKind::Dynamic,
@@ -216,6 +226,7 @@ target_port = 3306
             id: TunnelId(id),
             session_id: SessionId(session),
             listen_port: 3306,
+            name: String::new(),
             note: String::new(),
             autostart: false,
             kind: TunnelKind::Dynamic,

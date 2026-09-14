@@ -84,6 +84,8 @@ pub struct SessionDraft {
 pub struct TunnelDraft {
     pub session_id: SessionId,
     pub listen_port: u16,
+    /// F268:用户自己起的名字。空串 = 没起名。
+    pub name: String,
     pub note: String,
     pub autostart: bool,
     pub kind: TunnelKind,
@@ -1100,6 +1102,7 @@ impl Vault {
             id,
             session_id: draft.session_id,
             listen_port: draft.listen_port,
+            name: draft.name,
             note: draft.note,
             autostart: draft.autostart,
             kind: draft.kind,
@@ -1116,10 +1119,43 @@ impl Vault {
             .ok_or(StoreError::TunnelNotFound(id))?;
         rec.session_id = draft.session_id;
         rec.listen_port = draft.listen_port;
+        rec.name = draft.name;
         rec.note = draft.note;
         rec.autostart = draft.autostart;
         rec.kind = draft.kind;
         Ok(())
+    }
+
+    /// F268:克隆一条隧道。整条深拷贝,只换 id 与名字。
+    ///
+    /// **端口原样带过去**,不自动 +1:两条隧道撞端口这件事本来就没有校验
+    /// (谁先起谁占上),而「克隆一条再改端口」恰恰是用户要走的路 ——
+    /// 悄悄替他挑一个端口,他反而要先发现被改了才能改回来。
+    ///
+    /// 没起名的隧道,副本**也没名字**:给它塞一个「 的副本」既难看又凭空
+    /// 造出一个用户没写过的名字,而列表行本来就会用转发串兜底。
+    pub fn clone_tunnel(&mut self, id: TunnelId) -> Result<TunnelId, StoreError> {
+        self.sync_from_disk_if_untouched();
+        let src = self
+            .tunnels
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or(StoreError::TunnelNotFound(id))?;
+        let mut rec = src.clone();
+        rec.id = TunnelId(
+            self.tunnels
+                .iter()
+                .map(|t| t.id.0)
+                .max()
+                .map_or(1, |m| m + 1),
+        );
+        if !rec.name.is_empty() {
+            let taken: Vec<&str> = self.tunnels.iter().map(|t| t.name.as_str()).collect();
+            rec.name = clone_name(&rec.name, &taken);
+        }
+        let new_id = rec.id;
+        self.tunnels.push(rec);
+        Ok(new_id)
     }
 
     pub fn delete_tunnel(&mut self, id: TunnelId) -> Result<(), StoreError> {
@@ -1543,6 +1579,7 @@ mod tests {
         TunnelDraft {
             session_id: session,
             listen_port: port,
+            name: String::new(),
             note: String::new(),
             autostart: false,
             kind: crate::tunnel::TunnelKind::Local {
