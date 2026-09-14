@@ -1689,10 +1689,25 @@ async fn run_transfer(
             if let Some(parent) = staging.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("建不了本地目录:{e}"))?;
             }
+            // F264 埋点:下载是**串行 READ**,每块一个 RTT —— 而这条路径上一直
+            // 没有计时。`ReadTiming` 只挂在 `read_all` 上,调用方只有「编辑打开」
+            // 那一条(F214),所以「下载慢在哪一段」在真机上一直答不出来,
+            // N10 说的「同链路改前/改后自比」也就无从谈起。
+            //
+            // 口径与 `read_all` 那边**不同**,别照着读:那边的 `read_us` 是整段
+            // 读循环的墙钟(含拼 Vec),这里是**逐次 await 累加**,把本地写盘单独
+            // 摘成 `write_us`。流水线化之后该降到 1/N 的正是 `read_us` 这个数,
+            // 混进写盘会把收益冲淡到看不出来。
+            // `reads` 把返回 0 的那一次也算进去:它同样是一个往返。
+            let t_all = std::time::Instant::now();
+            let mut timing = mullion_ssh::sftp::ReadTiming::default();
+            let mut write_us: u64 = 0;
+            let t_open = std::time::Instant::now();
             let mut src = client
                 .open_read(&spec.remote)
                 .await
                 .map_err(|e| e.to_string())?;
+            timing.open_us = t_open.elapsed().as_micros() as u64;
             {
                 use std::io::Write;
                 let mut f =
@@ -1702,12 +1717,17 @@ async fn run_transfer(
                         let _ = std::fs::remove_file(&staging);
                         return Err("已取消".into());
                     }
+                    let t_read = std::time::Instant::now();
                     let n = src.read_chunk(&mut buf).await.map_err(|e| e.to_string())?;
+                    timing.read_us += t_read.elapsed().as_micros() as u64;
+                    timing.reads += 1;
                     if n == 0 {
                         break;
                     }
+                    let t_write = std::time::Instant::now();
                     f.write_all(&buf[..n])
                         .map_err(|e| format!("写不了本地文件:{e}"))?;
+                    write_us += t_write.elapsed().as_micros() as u64;
                     done += n as u64;
                     let _ = proxy.send_event(UserEvent::TransferProgress { job, done });
                 }
@@ -1716,6 +1736,19 @@ async fn run_transfer(
             if staging != dst_local {
                 std::fs::rename(&staging, &dst_local).map_err(|e| format!("改名失败:{e}"))?;
             }
+            // 一次下载一行(不是每块一行 —— 那会把日志刷爆)。段落名与「编辑打开」
+            // 那条对齐,便于同一份日志里一起 grep。
+            log::info!(
+                target: "mullion",
+                "下载:open={}ms read={}ms×{} write={}ms total={}ms bytes={} chunk={}",
+                timing.open_us / 1000,
+                timing.read_us / 1000,
+                timing.reads,
+                write_us / 1000,
+                t_all.elapsed().as_millis(),
+                done,
+                crate::profile::XFER_CHUNK,
+            );
         }
         Direction::Upload => {
             use std::io::Read;
