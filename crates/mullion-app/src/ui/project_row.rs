@@ -49,6 +49,39 @@ const SUB_SIZE: f32 = 11.0;
 /// 名称与时间列之间的最小间隙 —— 顶到一起会读成一个词。
 const NAME_TIME_GAP: f32 = 8.0;
 
+/// F266:亮灯行上那个标签的字。
+///
+/// 用户实报:灯就是一个十几像素的小形状,**根本没注意到**。灯本身不动
+/// (色觉障碍下靠形状读它,见 `lamp_look`),这里补一条写字的信道。
+pub const RUNNING_LABEL: &str = "正在跑";
+
+/// 标签文字的字号。跟副标题同档 —— 它是个状态标记,不该比项目名还响。
+const RUNNING_SIZE: f32 = 11.0;
+/// 标签文字四周的内边距(左右各一份,上下各一份)。
+const RUNNING_PAD: egui::Vec2 = egui::vec2(6.0, 2.0);
+
+/// F266:亮灯行的底色。`t.ok` 压到极低不透明度 —— 再深就会跟选中态抢眼,
+/// 而「右栏正在编辑的是哪一条」是项目管理器左栏的主信道。
+///
+/// **抽成函数**:透明度调一次就会被人反复调,而它是三处列表共用的。
+pub fn lit_tint(t: &Theme) -> egui::Color32 {
+    let c = theme::c32(t.ok);
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 22)
+}
+
+/// F266:名称那一行还剩多宽。
+///
+/// **时间列和「正在跑」标签都要先扣掉**:不扣的话长项目名会一路铺到右边缘,
+/// 把标签和时间整列挤出行外 —— 整条看不见,而且没有任何报错(时间列那条
+/// 早就踩过一次,见下面 `time_w` 的注释)。
+fn name_avail(text_avail: f32, time_w: f32, badge_w: f32) -> f32 {
+    let mut left = text_avail - time_w - NAME_TIME_GAP;
+    if badge_w > 0.0 {
+        left -= badge_w + NAME_TIME_GAP;
+    }
+    left.max(0.0)
+}
+
 /// 画一行要的全部输入。
 pub struct Row<'a> {
     pub project: &'a ProjectRecord,
@@ -222,6 +255,11 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
         return resp;
     }
 
+    // F266:亮灯行的底色。**画在 `row_bg` 之前**(垫在最下面)—— 反过来的话
+    // 「正在跑」这层会盖在选中态上,用户就分不出右栏正在编辑的是哪一条。
+    if row.lamp == crate::project::Lamp::Lit {
+        ui.painter().rect_filled(rect, 4.0, lit_tint(t));
+    }
     // 底色走会话侧同一份 `row_bg`:选中/悬停两态的透明度在那里定死,两个列表
     // 各调一次的话同一种状态会有两种深浅。
     if let Some(bg) =
@@ -288,6 +326,31 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     let time_rect = egui::Rect::from_min_size(time_pos, time_galley.size());
     p.galley(time_pos, time_galley, theme::c32(t.fg_muted));
 
+    // F266:「正在跑」标签。**右对齐贴着时间列**,不跟在名字后面 ——
+    // 名字是截断过的,画完拿不回它的实际宽度,跟在后面就只能猜位置。
+    let badge = (row.lamp == crate::project::Lamp::Lit).then(|| {
+        p.layout_no_wrap(
+            RUNNING_LABEL.to_string(),
+            egui::FontId::proportional(RUNNING_SIZE),
+            theme::c32(t.ok),
+        )
+    });
+    let badge_w = badge
+        .as_ref()
+        .map_or(0.0, |g| g.size().x + 2.0 * RUNNING_PAD.x);
+    if let Some(g) = badge {
+        let size = g.size() + 2.0 * RUNNING_PAD;
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.right() - TEXT_RIGHT_PAD - time_w - NAME_TIME_GAP - size.x,
+                rect.top() + NAME_TOP + (NAME_SIZE - g.size().y) / 2.0 - RUNNING_PAD.y,
+            ),
+            size,
+        );
+        p.rect_filled(pill, 3.0, lit_tint(t));
+        p.galley(pill.min + RUNNING_PAD, g, theme::c32(t.ok));
+    }
+
     // 归档行的完整时间信息(归档于何时 + 最后打开于何时)挂在时间列这一小块
     // 上,不挂整行:整行的 hover 已经被灯占了(见上面 `resp.hovered()` 那处
     // `lamp` tooltip),两个 tooltip 抢同一块热区会互相打架。挂载点只在
@@ -314,7 +377,7 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
         egui::FontId::proportional(NAME_SIZE),
         theme::c32(t.fg_strong),
         t,
-        (text_avail - time_w - NAME_TIME_GAP).max(0.0),
+        name_avail(text_avail, time_w, badge_w),
     );
     crate::ui::session_manager::list::paint_highlighted(
         p,
@@ -793,6 +856,14 @@ mod tests {
 
     /// 跑两帧,返回这一行画出来的全部 shape。
     fn row_shapes(icon: Option<&mullion_store::IconSpec>) -> Vec<egui::epaint::ClippedShape> {
+        row_shapes_with(icon, crate::project::Lamp::Unknown)
+    }
+
+    /// 同 `row_shapes`,但指定灯的档位(F266)。
+    fn row_shapes_with(
+        icon: Option<&mullion_store::IconSpec>,
+        lamp: crate::project::Lamp,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let p = proj(3, "接口", "/srv/api", None);
@@ -813,7 +884,7 @@ mod tests {
                                 &t,
                                 &Row {
                                     project: &p,
-                                    lamp: crate::project::Lamp::Unknown,
+                                    lamp,
                                     sessions: &ss,
                                     query: "",
                                     selected: false,
@@ -864,6 +935,119 @@ mod tests {
         xs.into_iter().map(|x| x.round() as u32).min()
     }
 
+    // ---- F266:「正在跑」看得见 --------------------------------------------
+
+    /// F266:亮灯的行写「正在跑」,不亮的行一个字都不写。
+    ///
+    /// 用户实报:灯就是一个十几像素的小形状,**根本没注意到**。
+    ///
+    /// **「灭」和「未知」两态都要断**:只断「灭」的话,一个
+    /// `lamp != Dark` 的实现照样过 —— 而「未知」是最常见的那一态(有 pane
+    /// 还没上报),它要是也写「正在跑」,这个标签就成了谎话。
+    ///
+    /// 自证会变红:把 `show` 里那个 `(row.lamp == Lamp::Lit).then(..)` 的
+    /// 判据改成 `true`,或整段删掉。
+    #[test]
+    fn only_a_lit_row_says_it_is_running() {
+        use crate::project::Lamp;
+        assert!(
+            texts_of(&row_shapes_with(None, Lamp::Lit)).contains(&RUNNING_LABEL.to_string()),
+            "亮灯的行没写「{RUNNING_LABEL}」—— 灯太小,用户看不见"
+        );
+        for lamp in [Lamp::Dark, Lamp::Unknown] {
+            assert!(
+                !texts_of(&row_shapes_with(None, lamp)).contains(&RUNNING_LABEL.to_string()),
+                "{lamp:?} 的行也写了「{RUNNING_LABEL}」—— 这个标签就成了谎话"
+            );
+        }
+    }
+
+    /// F266:标签的宽度**真的从名字的预算里扣了**。
+    ///
+    /// 这条扎的是接线:`name_avail` 那条纯函数测得再扎实,`show` 里把
+    /// `badge_w` 传成 `0.0` 也一个字都不会变红,而症状是长项目名把标签和
+    /// 时间整列挤出行外 —— 整条看不见,且没有任何报错(时间列那条早踩过一次,
+    /// 见 `narrow_row_does_not_truncate_the_archived_name_more_than_the_active_one`)。
+    ///
+    /// 自证会变红:把 `show` 里传给 `name_avail` 的 `badge_w` 改成 `0.0`。
+    #[test]
+    fn the_running_badge_takes_its_width_out_of_the_name_budget() {
+        const NAME: &str = "接口服务测试项目"; // 8 个汉字,窄行下必被截
+        const ROW_W: f32 = 200.0;
+        let dark = name_glyph_count(ROW_W, false, NAME, crate::project::Lamp::Dark);
+        let lit = name_glyph_count(ROW_W, false, NAME, crate::project::Lamp::Lit);
+        assert!(
+            lit < dark,
+            "亮灯行的名字可见 {lit} 字、不亮的 {dark} 字 —— 标签的宽度没从名字预算里扣"
+        );
+    }
+
+    /// F266:预算函数本身。没标签时与原来逐字等价(`text_avail - time_w -
+    /// NAME_TIME_GAP`),有标签时再扣一份标签宽 + 一份间隙;且**永不为负**
+    /// —— 负数传给 `paint_highlighted` 会让整段名字消失。
+    ///
+    /// 自证会变红:把 `name_avail` 里的 `if badge_w > 0.0` 整块删掉。
+    #[test]
+    fn the_name_budget_subtracts_the_badge_and_never_goes_negative() {
+        assert_eq!(name_avail(300.0, 40.0, 0.0), 300.0 - 40.0 - NAME_TIME_GAP);
+        assert_eq!(
+            name_avail(300.0, 40.0, 30.0),
+            300.0 - 40.0 - NAME_TIME_GAP - 30.0 - NAME_TIME_GAP
+        );
+        assert_eq!(name_avail(10.0, 40.0, 30.0), 0.0, "预算算成了负数");
+    }
+
+    /// F266:亮灯的行**整行**垫一层底色,不亮的行不垫。
+    ///
+    /// 判据是「有一块 `lit_tint` 色的填充矩形,宽度跟整行一样宽」——
+    /// 只判颜色的话,标签那颗药丸用的是同一个色,把整行底色那句删掉也杀不掉。
+    ///
+    /// 自证会变红:把 `show` 里 `if row.lamp == Lamp::Lit { rect_filled(..) }`
+    /// 那句删掉。
+    #[test]
+    fn a_lit_row_is_tinted_across_its_whole_width() {
+        use crate::project::Lamp;
+        let tint = lit_tint(&crate::theme::MULLION_DARK);
+        let wide = |shapes: &[egui::epaint::ClippedShape]| {
+            fn walk(s: &egui::Shape, out: &mut Vec<(egui::Color32, f32)>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    egui::Shape::Rect(r) => out.push((r.fill, r.rect.width())),
+                    _ => {}
+                }
+            }
+            let mut rects = Vec::new();
+            shapes.iter().for_each(|cs| walk(&cs.shape, &mut rects));
+            // 整行宽度由 `ui.available_width()` 决定,这里只要求「远宽于那颗
+            // 药丸」—— 钉死具体像素值会让这条测试随主题内边距变红。
+            rects.iter().any(|(c, w)| *c == tint && *w > 200.0)
+        };
+        assert!(
+            wide(&row_shapes_with(None, Lamp::Lit)),
+            "亮灯的行没垫整行底色"
+        );
+        for lamp in [Lamp::Dark, Lamp::Unknown] {
+            assert!(
+                !wide(&row_shapes_with(None, lamp)),
+                "{lamp:?} 的行也垫了「正在跑」的底色"
+            );
+        }
+    }
+
+    /// 这一行画出来的全部文字。
+    fn texts_of(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push(ts.galley.job.text.clone()),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut out));
+        out
+    }
+
     // ---- F257:归档短式时间列不该多吃名字预算 ------------------------------
 
     /// 名字的可用宽度是从时间列宽度里扣出来的(见 `show()` 里
@@ -884,8 +1068,8 @@ mod tests {
     fn narrow_row_does_not_truncate_the_archived_name_more_than_the_active_one() {
         const NAME: &str = "接口服务测试"; // 6 个汉字
         const ROW_W: f32 = 200.0;
-        let active = name_glyph_count(ROW_W, false, NAME);
-        let archived = name_glyph_count(ROW_W, true, NAME);
+        let active = name_glyph_count(ROW_W, false, NAME, crate::project::Lamp::Unknown);
+        let archived = name_glyph_count(ROW_W, true, NAME, crate::project::Lamp::Unknown);
         assert!(
             active.abs_diff(archived) <= 1,
             "row_w={ROW_W} 下,在用态可见 {active} 字、归档态可见 {archived} 字 \
@@ -897,7 +1081,12 @@ mod tests {
     /// (`galley.rows[].glyphs.len()`,不是 `job.text.len()` —— 后者恒是原串,
     /// 截断只发生在 `rows`/`glyphs` 里,量 `text` 量不出回归,复核在这上头
     /// 踩过一次)。
-    fn name_glyph_count(row_w: f32, archived: bool, name: &str) -> usize {
+    fn name_glyph_count(
+        row_w: f32,
+        archived: bool,
+        name: &str,
+        lamp: crate::project::Lamp,
+    ) -> usize {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let mut p = proj(9, name, "/srv/x", Some("2026-09-01T00:00:00Z"));
@@ -928,7 +1117,7 @@ mod tests {
                                     &t,
                                     &Row {
                                         project: &p,
-                                        lamp: crate::project::Lamp::Unknown,
+                                        lamp,
                                         sessions: &ss,
                                         query: "",
                                         selected: false,
