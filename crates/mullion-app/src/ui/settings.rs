@@ -541,6 +541,17 @@ fn security(
 }
 
 /// 快捷键一览。只读表格,数据源是 `ui::shortcuts::SHORTCUTS`(那边有撞键守护)。
+///
+/// F260:组合键那一列**必须显式给色**。原来写的是 `RichText::new(..).strong()`,
+/// 而 egui 的 `strong` 不是「加粗」而是「换成 `Visuals::strong_text_color()`」,
+/// 后者取的是 `widgets.active.fg_stroke`——本项目把它设成了 `accent_fg`
+/// (#0d0f16,专门给亮色 accent 底做反白用的近黑)。落在弹窗底 #3f3f3f 上是
+/// **1.82:1**,正文门槛 4.5:1,于是一整列快捷键几乎看不见。
+///
+/// 显式 `.color(..)` 之后 `.strong()` 就只剩噪音了(`RichText::get_text_color`
+/// 里 `text_color` 排在 `strong` 前面,给了色 strong 一点效果都没有),所以
+/// 直接去掉;这一列的「更醒目」靠 `fg`(9.4:1)与另两列的 `fg_muted`(4.77:1)
+/// 分层。全库级的守护在 `tests/strong_text_color.rs`。
 fn shortcut_table(ui: &mut egui::Ui, t: &Theme) {
     egui::ScrollArea::vertical()
         .max_height(220.0)
@@ -550,7 +561,7 @@ fn shortcut_table(ui: &mut egui::Ui, t: &Theme) {
                 .spacing([SP_M, SP_S])
                 .show(ui, |ui| {
                     for s in SHORTCUTS {
-                        ui.label(egui::RichText::new(s.chord).strong());
+                        ui.label(egui::RichText::new(s.chord).color(theme::c32(t.fg)));
                         ui.label(theme::hint_text(t, s.scope));
                         ui.label(s.what);
                         ui.end_row();
