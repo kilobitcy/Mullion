@@ -341,11 +341,33 @@ meatshell 判定 RUSTSEC-2026-0154 不可达的理由是「**我们从不用 ssh
   （「Windows 请用 -i 指定私钥」）。Windows 是唯一的一等公民，所以主场景暴露面为零；
   但 Linux/macOS 上走 agent 认证的用户是暴露的。
 
-**因此第 5 条的实际待办不是建文件，是**：带代理跑一次 `cargo audit`，确认这条
-advisory 是否真实存在、影响面是什么，再决定是写「不可达」还是写「已知可达 +
-减轻因素 + 复查条件」。**别照抄它的结论**——判据不一样，结论就不一样。
+**已执行（2026-09-14）：`.cargo/audit.toml` 已建立，判据逐条写在里面。**
+
+装了 `cargo-audit` 0.22.2、带 `HTTPS_PROXY` 拉到 advisory-db，跑出来
+**6 条 vulnerability + 9 条 informational**。逐条核实后：
+
+| advisory | 判定 |
+|---|---|
+| RUSTSEC-2026-0195 / 0194 `quick-xml` 0.30 | **不可达**：引入链是 `accesskit_unix ← accesskit_winit ← egui-winit`，`cargo tree -i quick-xml@0.30.0 --target x86_64-pc-windows-gnu` → "nothing to print" |
+| RUSTSEC-2026-0257 `webbrowser` 1.2.1 | **不可达**：漏洞在 Unix 的 `BROWSER` 模板解析上，Windows 走 ShellExecute |
+| RUSTSEC-2023-0071 `rsa` Marvin | **无修复版本**；我们只拿 RSA 做认证签名，不做解密 |
+| RUSTSEC-2026-0154 `russh` agent 帧 | **低**：advisory 限定在 agent 帧，而 agent 认证**仅 Unix**（`session.rs:408`），且需本地 agent 已被控 |
+| **RUSTSEC-2026-0153 `russh-cryptovec`** | **可达，故意不 ignore** |
+
+**最后那条是这一趟真正的收获**，而且**恰恰是照抄 meatshell 抄不到的**：
+advisory 原文说 0.58.0 之前的 russh 把 `CryptoVec` 用在 **transport packet reads
+和 zlib 解压输出**上，「remote compressed payload expansion 导致分配失败时可以让
+进程 abort」。我们是 **russh 0.54.5**，而且 **显式开着 `flate2`**——压缩路径是开的。
+影响面只有 DoS（advisory 明写无 RCE / 完整性 / 机密性影响），但**不是不可达**，
+所以让它继续报红，直到做出决定。三条出路都有代价（升 russh 会拉 -rc 加密 crate；
+关 `flate2` 会丢掉高延迟链路上最值钱的压缩；或者接受现状等依赖出 -rc），
+够格单开一个 ADR。
+
+**顺带印证了「别照抄结论」**：meatshell 对 RUSTSEC-2026-0154 的判词是「我们从不用
+ssh-agent」，我们**用**——同一条 advisory、不同的判据，结论只是碰巧都落在低风险。
 
 **成本**：一次带代理的 `cargo audit`（需先 `cargo install cargo-audit`）+ 一个文件。
+**重跑记得带代理**，本机 DNS 解析不了 github，advisory-db 拉不下来。
 
 ---
 

@@ -1,0 +1,90 @@
+# `cargo audit` 的可达性登记（2026-09-14 首次建立）
+#
+# 为什么要有这个文件：`cargo audit` 现在报 6 条 vulnerability。没有这份登记的话，
+# 下一个人（或下一个我）看到满屏红字，只有两条路——盲目升版本捅穿交叉编译链，
+# 或者干脆不再跑 audit。两条都比「把判断写下来」差。
+#
+# **纪律**：`ignore` 只用于「在我们的目标平台/用法下走不到那条代码」的条目，
+# 每条都要写清**判据**和**复查条件**。真实可达的**不 ignore** —— 让它继续报红，
+# 那是它应得的待遇。
+#
+# 判据里反复用到的一条事实：**Windows 11 是唯一的一等公民**（见 CLAUDE.md），
+# 所以「只在 Unix 上编译/执行」的条目，对本项目的实际交付物不可达。
+# 核实方式不是看 `cargo tree`，是看 **`cargo tree --target x86_64-pc-windows-gnu`**
+# ——`cargo audit` 读的是 Cargo.lock，**不区分 target**，会把 Linux 专属的依赖
+# 一起报出来。这是本文件里一半条目的成因。
+#
+# 重跑：本机 DNS 解析不了 github，advisory-db 拉不下来，必须带代理：
+#   HTTPS_PROXY=http://127.0.0.1:7890 cargo audit
+#
+# ---------------------------------------------------------------------------
+# 已判定不可达（ignore）
+# ---------------------------------------------------------------------------
+#
+# RUSTSEC-2026-0195 / RUSTSEC-2026-0194  quick-xml 0.30.0（DoS：命名空间声明无界
+#   分配 / 重复属性名二次方耗时）
+#   判据：**Windows target 下这个 crate 根本不存在。**引入链是
+#     quick-xml ← zbus_xml ← zbus-lockstep ← atspi-common ← accesskit_atspi_common
+#              ← accesskit_unix ← accesskit_winit ← egui-winit
+#   `accesskit_unix` 顾名思义只在 Unix 上编译；`cargo tree -i quick-xml@0.30.0
+#   --target x86_64-pc-windows-gnu` 输出 "nothing to print"。
+#   注意 lock 里还有一个 quick-xml 0.41.0，那个版本**不受影响**（修复版就是 0.41）。
+#   复查条件：accesskit 把 atspi 那条链换掉、或它开始在 Windows 上也拉 zbus 时。
+#
+# RUSTSEC-2026-0257  webbrowser 1.2.1（Unix `BROWSER` 模板参数注入）
+#   判据：漏洞在**解析 `BROWSER` 环境变量模板**那条路径上，advisory 原文写明是
+#   Unix handling；Windows 走的是 ShellExecute 一路，不读 `BROWSER`。
+#   引入方是 egui-winit，只在点击超链接时才会被调到。
+#   复查条件：升 egui / egui-winit 时顺手看一眼有没有到 1.2.2；到了就删掉这条。
+#
+# RUSTSEC-2023-0071  rsa 0.9.10（Marvin Attack：RSA 时序侧信道）
+#   判据：**没有修复版本**（"No fixed upgrade is available!"），所以 ignore 不是
+#   在推迟修复，是在记录现状。用法上我们只拿 RSA 做**客户端认证签名**
+#   （russh 的 `rsa` feature，见 Cargo.toml），不做 RSA 解密；Marvin 针对的是
+#   PKCS#1 v1.5 解密 oracle，且需要攻击者能反复触发私钥运算并精确测时——
+#   本地已被攻陷才谈得上。
+#   复查条件：`rsa` crate 出修复版；或我们决定去掉 `rsa` feature（代价是
+#   不再支持 RSA 私钥，那是很多老服务器的唯一选项，不能轻易砍）。
+#
+# RUSTSEC-2026-0154  russh 0.54.5（SSH agent 帧长无界分配，CVE-2026-46673，CVSS 7.5）
+#   判据：advisory 原文限定在 **agent** 帧（"maliciously crafted agent frame"），
+#   不是 SSH transport。我们确实有 agent 认证路径
+#   （`crates/mullion-ssh/src/session.rs:397` 的 `authenticate_agent`），
+#   但它 **仅支持 Unix**（同文件 :408「Windows 请用 -i 指定私钥」），
+#   所以在一等公民平台上走不到；且恶意 agent 帧意味着**本地** ssh-agent 已被控，
+#   那时攻击者已经在你的会话里了。
+#   ⚠ 别照抄同赛道项目的判词：meatshell 的 audit.toml 写「我们从不用 ssh-agent」，
+#   我们**用**——同一条 advisory、不同的判据，结论只是碰巧都落在「低风险」。
+#   复查条件：升 russh 到 >=0.60.3（见下方那条的同一笔账）。
+#
+# ---------------------------------------------------------------------------
+# 已判定**可达**，故意不 ignore —— 让 `cargo audit` 继续为它报红
+# ---------------------------------------------------------------------------
+#
+# RUSTSEC-2026-0153  russh-cryptovec 0.52.0（`CryptoVec` 增长未校验）
+#   **这条对我们是真的。** advisory 原文：0.58.0 之前的 russh 里，
+#   `CryptoVec` 还被用在 **transport packet reads** 和 **zlib 解压输出** 上，
+#   「remote compressed payload expansion 导致分配失败时可以让进程 abort」。
+#   我们是 russh 0.54.5（< 0.58），**而且显式开了 `flate2` feature**
+#   （Cargo.toml：`features = ["ring", "flate2", "rsa"]`）——压缩路径是打开的。
+#   影响面：仅 DoS（进程终止），advisory 明确写了「无 RCE / 完整性 / 机密性影响」。
+#   威胁模型下的实际风险不高（用户连的是自己的服务器），但**不是不可达**，
+#   所以不 ignore。
+#
+#   三条出路，都有代价，需要一次正式决策（够格写 ADR）：
+#     a) 升 russh >= 0.60.3 —— 会拉进一批仍在 -rc 通道的加密 crate，
+#        且我们 pin 0.54 是有理由的（见 Cargo.toml 里那段注释）。
+#     b) 关掉 `flate2` feature —— 直接切断远程压缩路径，但压缩恰恰是
+#        **高延迟代理链路**（本项目主场景 G1）上最有价值的东西，不能白丢。
+#     c) 接受现状，等 a) 的依赖离开 -rc 通道。
+#   在做出决定之前，这条就该一直红着。
+
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0195", # quick-xml：Windows target 下不存在（accesskit_unix 专属）
+    "RUSTSEC-2026-0194", # 同上
+    "RUSTSEC-2026-0257", # webbrowser：Unix BROWSER 模板路径，Windows 不走
+    "RUSTSEC-2023-0071", # rsa Marvin：无修复版本；我们只做签名不做解密
+    "RUSTSEC-2026-0154", # russh agent 帧：agent 认证仅 Unix，且需本地 agent 被控
+    # RUSTSEC-2026-0153 **故意不在这里** —— 见上方说明，它对我们可达。
+]
