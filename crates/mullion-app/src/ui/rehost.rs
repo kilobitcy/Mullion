@@ -203,7 +203,11 @@ pub fn show(
 ) -> Option<RehostAction> {
     let d = draft.as_mut()?;
     let pane = d.pane;
-    let mut action = None;
+    // F267:Esc = 取消。理由与 `project_pick::show` 里同一行逐字相同 ——
+    // 关弹窗的唯一出口是函数末尾那句 `*draft = None`,早退就绕过去了。
+    let mut action = ctx
+        .input(|i| i.key_pressed(egui::Key::Escape))
+        .then_some(RehostAction::Cancel);
     let host = pane_rect.unwrap_or_else(|| ctx.screen_rect());
     let avail = host.shrink(INSET);
     let field_w = crate::ui::metrics::field_w(
@@ -481,6 +485,76 @@ mod tests {
             "换节点弹窗跑到 pane 外面去了:pane={:?} 弹窗={got:?}",
             pane()
         );
+    }
+
+    /// F267:Esc 关掉弹窗。
+    ///
+    /// **两条断言缺一不可**:只断言返回 `Cancel` 的话,把 `*draft = None`
+    /// 那句删掉也能过,而弹窗会留在屏幕上不走;只断言 `draft.is_none()` 的话,
+    /// 一个「Esc 直接早退、什么都不返回」的实现也能过,而 `app.rs` 那边就
+    /// 收不到结论。
+    ///
+    /// 自证会变红:把 `show` 开头那个 `key_pressed(Escape)` 分支删掉。
+    #[test]
+    fn escape_closes_the_rehost_picker() {
+        let sessions = vec![rec(7, "web", "10.0.0.1", Protocol::Ssh)];
+        let mut draft = Some(RehostDraft::new(PaneId(3)));
+        let out = press_escape(&mut draft, &sessions);
+        assert_eq!(out, Some(RehostAction::Cancel), "Esc 没被当成取消");
+        assert!(draft.is_none(), "Esc 之后弹窗还开着");
+    }
+
+    /// 跑两帧预热(同 `click`:`Area` 的 fade-in 没走完时内容不可交互),
+    /// 再在第三帧按一下 Esc。
+    fn press_escape(
+        draft: &mut Option<RehostDraft>,
+        sessions: &[SessionRecord],
+    ) -> Option<RehostAction> {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let cache = crate::ui::badge::AppearanceCache::default();
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = None;
+        for (t, events) in [
+            (0.0_f64, vec![]),
+            (1.0, vec![]),
+            (
+                2.0,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            ),
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(t),
+                    events,
+                    ..base()
+                },
+                |ctx| {
+                    out = show(
+                        ctx,
+                        &MULLION_DARK,
+                        draft,
+                        sessions,
+                        &[],
+                        &cache,
+                        Some(pane()),
+                    );
+                },
+            );
+        }
+        out
     }
 
     /// 用户点的是哪一行,换的就该是哪个节点。点第二行却连到第一行那台上,

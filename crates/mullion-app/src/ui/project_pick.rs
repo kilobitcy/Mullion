@@ -94,7 +94,13 @@ pub fn show(
     // F258:排序读的是这次打开期间冻结的灯 —— 先取出来,再进 `Area::show`
     // 的闭包(闭包里还要再次可变借用 `d.filter`)。
     let frozen = crate::ui::freeze_lamps(&mut d.frozen_lamps, lamps);
-    let mut action = None;
+    // F267:Esc = 取消。**取在这里、不早退**:关弹窗的唯一出口是函数末尾那句
+    // `if action.is_some() { *draft = None; }`,早退就绕过了它,弹窗会留在
+    // 屏幕上。同一帧里若还点中了某一行,下面的 `Pick` 会覆盖掉这个 `Cancel`
+    // —— 点击是更明确的意图。
+    let mut action = ctx
+        .input(|i| i.key_pressed(egui::Key::Escape))
+        .then_some(PickAction::Cancel);
     let host = pane_rect.unwrap_or_else(|| ctx.screen_rect());
     let avail = host.shrink(INSET);
     let field_w = crate::ui::metrics::field_w(
@@ -557,6 +563,50 @@ mod tests {
             );
         }
         ctx
+    }
+
+    /// F267:Esc 关掉弹窗。
+    ///
+    /// **两条断言缺一不可**:只断言返回 `Cancel` 的话,把末尾 `*draft = None`
+    /// 删掉也能过,而弹窗会留在屏幕上不走;只断言 `draft.is_none()` 的话,
+    /// 一个「Esc 直接早退、什么都不返回」的实现也能过,而 `app.rs` 那边就
+    /// 收不到结论。
+    ///
+    /// 自证会变红:把 `show` 开头那个 `key_pressed(Escape)` 分支删掉。
+    #[test]
+    fn escape_closes_the_project_picker() {
+        let ps = some_projects();
+        let mut draft = Some(ProjectPickDraft::new(PaneId(7)));
+        let ctx = draw(&mut draft, &ps);
+        let lamps = std::collections::BTreeMap::new();
+        let mut out = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(2.0),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..base_input()
+            },
+            |ctx| {
+                out = show(
+                    ctx,
+                    &MULLION_DARK,
+                    &mut draft,
+                    &ps,
+                    &lamps,
+                    &[],
+                    &crate::ui::badge::AppearanceCache::default(),
+                    Some(pane()),
+                );
+            },
+        );
+        assert_eq!(out, Some(PickAction::Cancel), "Esc 没被当成取消");
+        assert!(draft.is_none(), "Esc 之后弹窗还开着");
     }
 
     fn click(
