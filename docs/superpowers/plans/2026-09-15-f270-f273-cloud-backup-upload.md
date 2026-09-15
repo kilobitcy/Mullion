@@ -4127,31 +4127,44 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
         );
     }
 
-    /// 定时驱动必须**每帧都被调到**,而不是挂在某个偶尔才走的分支上。
+    /// F270:云端备份必须**每帧无条件驱动**,跟 `drive_automation` 那三位同族
+    /// 排在 `pump_io` 的同一层。
     ///
-    /// **判据扎在 `pump_io` 的函数体里,不是扫全篇找「出现过」。** 扫全篇只
-    /// 答得出「有人调过它」,答不出「每帧都调」—— 而把这句挪进任何一个偶尔
-    /// 才走的分支(比如某个 `if let Some(ws)` 里),扫全篇那条照样全绿,
-    /// 定时备份却变成了「碰运气才跑一次」。判据要放在**两种情形分得开**的
-    /// 那一层,这是本项目登记过的形状。
+    /// **判据是缩进,不是「body 里出现过」。** 只判出现过的话,把这句挪进
+    /// 某个偶尔才走的分支(例如 `if flushed { .. }`)照样全绿 —— 而定时备份
+    /// 就此变成碰运气才跑一次,且编译、clippy、日志、界面上都没有任何痕迹。
+    /// 这不是假想:判据锚到 `pump_io` 的 body 之后,这个变异**实测仍然逃得掉**,
+    /// 必须再往下推一层才拦得住(本项目登记过的「守护只推到一半」)。
     ///
     /// 选 `pump_io` 是因为它自己的文档就写着「**每帧**调」,而且
     /// `drive_automation` / `drive_attach_checks` / `drive_project_visits`
     /// 三个同族驱动都住在那里 —— 跟它们做邻居,以后谁搬家也会一起搬。
     ///
+    /// 参照物取 `drive_automation` 而不是写死「8 个空格」:写死的话,哪天
+    /// `pump_io` 换了嵌套层级,这条会变成假红,而它该测的东西一点没变。
+    ///
     /// 同样先 `strip_comments` —— 注释里写一句「这里调 `self.drive_cloud_backup(..)`」
     /// 就能让这条恒绿,而函数体里那句其实被注释掉了。
     ///
-    /// 自证会变红:把 `pump_io` 里 `self.drive_cloud_backup(now);` 那句注释掉,
-    /// 或者把它挪出 `pump_io`(哪怕挪到另一个每帧都走的地方,这条也会红 ——
-    /// 那时候要连同这条守护的锚点一起改,并在注释里说清新宿主为什么每帧走)。
+    /// 自证会变红:把那句注释掉;挪出 `pump_io`;或者挪进 `if flushed { .. }`。
     #[test]
-    fn the_cloud_backup_is_driven_every_frame() {
+    fn the_cloud_backup_is_driven_unconditionally_every_frame() {
         let body = strip_comments(body_of(prod_src(), "fn pump_io("));
-        assert!(
-            body.contains("self.drive_cloud_backup("),
-            "drive_cloud_backup 不在 pump_io 里 —— 它要么没人调(定时备份从来不发生),\
-             要么挂在某个偶尔才走的分支上(变成碰运气才跑一次):{body}"
+        let indent_of = |needle: &str| -> Option<usize> {
+            body.lines()
+                .find(|l| l.trim_start().starts_with(needle))
+                .map(|l| l.len() - l.trim_start().len())
+        };
+        let cloud = indent_of("self.drive_cloud_backup(").expect(
+            "`pump_io` 里没有 `self.drive_cloud_backup(` —— 定时备份从来不会发生",
+        );
+        let sibling = indent_of("self.drive_automation(")
+            .expect("`pump_io` 里连 `drive_automation` 都没了,这条测试的参照物失效了");
+        assert_eq!(
+            cloud, sibling,
+            "`drive_cloud_backup` 没跟 `drive_automation` 排在 `pump_io` 的同一层\
+             (缩进 {cloud} vs {sibling}) —— 它被套进了某个偶尔才走的分支,\
+             定时备份会变成碰运气才跑一次:\n{body}"
         );
     }
 
@@ -4449,10 +4462,13 @@ fn now_compact() -> String {
 **参数是 `now`，不是 `now_ms`** —— 那个局部量在 `pump_io` 开头就有
 （`app.rs:8581` 的 `let now = self.now_ms();`），直接用，别再取一次时间。
 
-**必须放在 `pump_io` 里，不是别处。** 它的文档写着「每帧调」，而那三个同族
-驱动都住在这儿；守护 `the_cloud_backup_is_driven_every_frame` 的锚点就钉在
-这个函数体上。挪到任何一个偶尔才走的分支里，定时备份就变成碰运气才跑一次，
-而扫全篇式的判据看不出这个差别。
+**必须放在 `pump_io` 里、且跟那三句并排在顶层，不能嵌进任何条件分支。**
+它的文档写着「每帧调」，而那三个同族驱动都住在这儿；守护
+`the_cloud_backup_is_driven_unconditionally_every_frame` 的判据就是
+**它与 `drive_automation` 的缩进相等**。挪到任何一个偶尔才走的分支里，
+定时备份就变成碰运气才跑一次——而「扫全篇找出现过」和「锚在 `pump_io` 的
+body 里找出现过」**两种判据都看不出这个差别**（后者是实测证伪的：把那句挪进
+`if flushed { .. }`，锚在 body 上的那版守护照样全绿）。
 
 菜单动作处理里接上手动入口 —— **必须 `take`，不能只读**：
 
@@ -4777,8 +4793,9 @@ git commit -m "feat(app): 云端备份的定时驱动与结果回收 (F273)
 | 去掉 `if self.cloud_in_flight { return; }` 那句 | `only_one_cloud_upload_is_in_flight_at_a_time`（`split_once` 的 `expect` 炸） |
 | 在途闸里删掉 `if manual { self.ui.set_error(..) }` | 同上（第二条断言）。**这条是新加的** —— 在途时手动点击会变回完全静默 |
 | `CloudBackupDone` 分支里删掉 `self.cloud_in_flight = false;` | `every_path_that_ends_a_cloud_upload_hands_the_in_flight_flag_back` |
-| `pump_io` 里注释掉 `self.drive_cloud_backup(now);` | `the_cloud_backup_is_driven_every_frame` |
-| 把那句从 `pump_io` 挪进一个偶尔才走的分支（例如 `if flushed { .. }` 里） | 同上。**这条是那条守护真正要挡的东西** —— 判据若写成「扫全篇找 `self.drive_cloud_backup(`」，这条逃得掉，而定时备份会变成碰运气才跑一次 |
+| `pump_io` 里注释掉 `self.drive_cloud_backup(now);` | `the_cloud_backup_is_driven_unconditionally_every_frame` |
+| 把那句从 `pump_io` 挪进一个偶尔才走的分支（例如 `if flushed { .. }` 里） | 同上。**这条是那条守护真正要挡的东西**，而且它连着证伪了两版判据：「扫全篇找 `self.drive_cloud_backup(`」逃得掉，**「锚在 `pump_io` 的 body 里找出现过」也逃得掉（实测，测试报 `ok`）**。判据必须推到缩进层（与 `drive_automation` 同级）才拦得住 —— 这就是本项目「守护只推到一半」的又一次现场 |
+| 注释里写一行 `// self.drive_cloud_backup(now);`，同时把真正那句删掉 | 同上（验 `strip_comments` 真在起作用，不是摆设） |
 | `drive_cloud_backup` 里把 `should_upload(..)` 换成手写的 `if since < u64::from(cfg.interval_min) { return; }` | `whether_to_back_up_is_decided_by_should_upload_not_by_a_hand_rolled_gate`（第一条断言） |
 | `minutes_since_last_ok` 的实参从 `&cfg.last_ok_at` 改成从 `cloud_last_check_ms` 折算 | 同上（第二条断言）——T11：起算点从「真的推成了」退回「本进程上次看盘」 |
 | `CLOUD_POLL_MS` 改成 `u64::from(cfg.interval_min) * 60_000` | **杀不掉**（两层节流合并之后行为差异只在"开开关关"的真机场景里才看得见）。**这条如实记下来，别硬编一条守护** —— 上面那两条断言钉的是「判据走 `should_upload`、起算点用 `last_ok_at`」，合并后两者仍然成立，只是轮询变懒。后果有限（最晚推迟一个 interval），不值得为它把常量结构复杂化 |
