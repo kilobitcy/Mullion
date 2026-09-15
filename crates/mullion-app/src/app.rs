@@ -25028,6 +25028,36 @@ mod tests {
         );
     }
 
+    /// F273:状态栏那一格是**常驻信号**,必须在去重闸**之前**无条件写掉。
+    ///
+    /// 这条钉的是**位置**,不是存在性:`cloud_status` 的赋值要排在
+    /// `if should_pop_cloud_error(` 之前。掉到闸里面或闸后面,就意味着
+    /// 「同一条失败第二次发生时状态栏不变红」—— 而那一格正是这次改动
+    /// 用来替代打断式卡片的那条通道,它一哑,整个改法就退化成了
+    /// 我明确否掉的「定时那条干脆别说话」。
+    ///
+    /// **它挡不住什么,要说清楚**:判的是文本先后,不是「无条件执行」。
+    /// 有人把赋值挪进一个无关的 `if manual { .. }` 里、而那个分支在文本上
+    /// 仍排在闸之前,这条照样绿,可「常驻信号被悄悄加了条件」这个真缺陷
+    /// 就溜过去了。要彻底验证得能真的调一次 `report_cloud_failure` 再断言
+    /// `self.ui.cloud_status` —— 那卡在本项目已登记的结构性限制上
+    /// (`App::new` 要 `EventLoopProxy`,无头环境建不出 `App`)。
+    /// 这条是「比零覆盖强」,不是「覆盖住了」,别拿它当护身符。
+    #[test]
+    fn the_status_bar_cell_is_written_before_the_dedup_gate() {
+        let body = strip_comments(body_of(prod_src(), "fn report_cloud_failure("));
+        let cell_at = body
+            .find("self.ui.cloud_status = Some(")
+            .expect("`report_cloud_failure` 没有更新状态栏那一格 —— 失败时常驻信号是哑的");
+        let gate_at = body
+            .find("if should_pop_cloud_error(")
+            .expect("`report_cloud_failure` 里没有去重闸,这条测试的参照物失效了");
+        assert!(
+            cell_at < gate_at,
+            "状态栏赋值出现在去重闸之后或里面 —— 同一条失败第二次发生时那一格不会变红"
+        );
+    }
+
     /// F270:云端备份必须**每帧无条件驱动**,跟 `drive_automation` 那三位同族
     /// 排在 `pump_io` 的同一层。
     ///
