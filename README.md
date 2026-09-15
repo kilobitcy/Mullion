@@ -10,6 +10,7 @@
 mullion-core     布局树（自研分屏）。零 UI、零 IO，可纯单测。
 mullion-term     alacritty_terminal 封装 + 按键/鼠标编码。
 mullion-ssh      russh：PTY channel actor，后续加 SFTP。
+mullion-cloud    S3 兼容对象存储客户端（云端备份）。只认字节与键名，零 async。
 mullion-app      winit + wgpu + glyphon：窗口、渲染、输入分发。
 ```
 
