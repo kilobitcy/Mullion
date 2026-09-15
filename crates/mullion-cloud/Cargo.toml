@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# 架构不变量:cloud 只认字节与键名,不认识 Pack/Session/UI,零 async。不得引 mullion-*。
 [dependencies]
 # ⚠️ TLS provider 必须显式钉死(设计 D4)。ureq 3 今天默认 rustls+ring,但官方
 # README 原话是 "does not guarantee defaulting to it indefinitely" —— 哪天默认
@@ -14,12 +15,12 @@ license.workspace = true
 # 不开 `gzip`:它会再拉一条 `flate2` 的路径,而 RUSTSEC-2026-0153 对本项目
 # 是**真可达**的(见 cargo audit 可达性登记),不主动加第二条。
 # 不开 `cookies`/`json`/`charset`:对象存储一条都用不上(N6 exe 体积)。
-ureq = { workspace = true }
+ureq.workspace = true
 # SigV4 要 HMAC-SHA256。两者本来就在 Cargo.lock 里(russh 拉的),加直接依赖
 # 不引入新版本 —— 同 `base64`/`argon2` 那两条的理由。
-sha2 = { workspace = true }
-hmac = { workspace = true }
-log = { workspace = true }
+sha2.workspace = true
+hmac.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 # 假 S3 server 只用 std::net,不需要 tokio。

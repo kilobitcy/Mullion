@@ -3,14 +3,26 @@
 
 use std::fmt;
 
+// `Transport`/`Malformed`/`Config` 都装 `String` 而不是保留原始错误——同
+// `mullion-store` 的 `StoreError` 一个风格(手写 Display,不引 thiserror,
+// 依赖清单越短越好)。代价是丢掉了错误的结构:`impl std::error::Error` 没有
+// `source()`,日志里只剩渲染好的消息;将来若要按「DNS 失败 / 超时 / TLS 握手
+// 失败」分类做重试策略,现在这个形状答不出来。
+//
+// 给后来人的红线:不要靠 match 这几个 `String` 里的错误消息文本做控制流——
+// 上游错误消息的措辞随时可能变,悄悄改一个词就会让分支静默失效。真需要分类时,
+// 把 `Transport` 换成 `Transport(Box<dyn std::error::Error + Send + Sync>)`
+// 并实现 `source()`,零新依赖。
 #[derive(Debug)]
 pub enum CloudError {
     /// 目标对象已经存在(`ForbidOverwrite` 生效)。**必须与别的错分开** ——
     /// 调用方要靠它决定「换个序号重试」而不是「报失败给用户」。
     AlreadyExists,
-    /// 服务端回了非 2xx。带上状态码与响应正文的前若干字节:对象存储的报错
-    /// 几乎全在正文的 `<Code>` 里(`SignatureDoesNotMatch` / `AccessDenied` /
-    /// `NoSuchBucket`),只报状态码等于把唯一有用的那条信息扔了。
+    /// 服务端回了非 2xx。带上状态码与响应正文:对象存储的报错几乎全在正文的
+    /// `<Code>` 里(`SignatureDoesNotMatch` / `AccessDenied` / `NoSuchBucket`),
+    /// 只报状态码等于把唯一有用的那条信息扔了。**截断由构造处负责**——这里的
+    /// `String` 不保证「只有前若干字节」,是 `s3.rs` 里 `status_err` 会
+    /// `.take(400)`;这是个调用约定,不是这个类型自身的不变量。
     Status { code: u16, body: String },
     /// 网络层(连不上 / 超时 / TLS 握手失败)。
     Transport(String),

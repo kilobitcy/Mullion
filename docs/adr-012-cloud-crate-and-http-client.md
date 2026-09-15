@@ -31,6 +31,12 @@ F270 要把配置推到用户自己的 S3 兼容对象存储。工作区原本�
 
 ## 代价
 - exe 体积增加(N6 盯着 25MB 上限,片一发版时必须重新量)。
+- **`base64` 两个版本并存**:`sha2`/`hmac` 核实过「工作区已有、不引入新版本」,
+  但没对 `ureq` 拉进来的依赖做同样的核对——`ureq` 自己的 manifest 钉了
+  `base64 = "0.23.1"`,而工作区（`mullion-store`/`mullion-app`)已经直接依赖
+  `base64 0.22`。两者今天在 `Cargo.lock` 里并存（`grep -A1 'name = "base64"'
+  Cargo.lock` 可见 0.22.1 与 0.23.1 两条)。这不是能修的:除非不用 `ureq`,
+  否则拿不掉这第二个版本,只能接受它算进 exe 体积里。
 - **TLS provider 必须在 `Cargo.toml` 里钉死**:ureq 官方 README 原话是
   "does not guarantee defaulting to it indefinitely"。默认哪天切到 aws-lc-rs,
   `x86_64-pc-windows-gnu` 交叉编译会在 aws-lc-sys 的 C/NASM 构建上炸——正是
