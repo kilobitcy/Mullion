@@ -69,26 +69,49 @@ pub fn query_string(params: &[(&str, &str)]) -> String {
 impl Endpoint {
     /// 算出访问 `key` 要用的 URL / Host / 签名 path。
     pub fn target(&self, key: &str) -> Target {
+        // bucket 名进 Host 头时不编码(下面 virtual-hosted 分支),所以这里
+        // 挡一道:含 `/` 或空白的 bucket 会拼出 authority 在半路被截断的
+        // URL,而签名里的 host 仍是完整串 —— 又是一条 403,且看不出来。
+        debug_assert!(
+            !self.bucket.contains(['/', ' ']),
+            "bucket 名不能含 `/` 或空格:{}",
+            self.bucket
+        );
         let base = self.base.trim_end_matches('/');
         // 用户没写 scheme 时补 https。**不要写成 `.map(|(s, h)| (s, h))`** ——
         // 那是 clippy 的 `map_identity`,`-D warnings` 下直接编不过。
-        let (scheme, host_only) = base.split_once("://").unwrap_or(("https", base));
-        let enc = encode_key(key);
-        if self.path_style {
-            let path = format!("/{}/{}", encode_component(&self.bucket), enc);
-            Target {
-                url: format!("{scheme}://{host_only}{path}"),
-                host: host_only.to_string(),
-                path,
-            }
+        let (scheme, authority) = base.split_once("://").unwrap_or(("https", base));
+        // **路径前缀必须从 host 里摘出来。** endpoint 被填成
+        // `https://host/prefix`(用户粘贴时多带一段是常事)时,若把
+        // `host/prefix` 整个当 Host 头去签名,而 HTTP 客户端按 RFC 3986
+        // 只把第一个 `/` 之前的部分当 authority 发出去 —— 签的头和发的头
+        // 不是同一个,必现 403 且零提示。摘出来并进 path,两边就始终同源,
+        // 顺带支持「对象存储挂在反代子路径下」这种真实部署。
+        let (host_only, prefix) = authority.split_once('/').unwrap_or((authority, ""));
+
+        // 按段拼:空段一律不进去 —— 否则会拼出 `//` 或尾随 `/`。
+        // 尤其是空 key(`list_keys` 列举 bucket 根时就是这么调的):
+        // path-style 下必须得到 `/bucket` 而不是 `/bucket/`,后者是
+        // 「键为空字符串的对象」而不是「bucket 根」,某些 S3 兼容实现
+        // (自建 MinIO 正是 path-style 的主要用户)会按前者解释,回空列表。
+        let mut segs: Vec<String> = Vec::new();
+        if !prefix.is_empty() {
+            segs.push(encode_key(prefix));
+        }
+        let host = if self.path_style {
+            segs.push(encode_component(&self.bucket));
+            host_only.to_string()
         } else {
-            let host = format!("{}.{}", self.bucket, host_only);
-            let path = format!("/{enc}");
-            Target {
-                url: format!("{scheme}://{host}{path}"),
-                host,
-                path,
-            }
+            format!("{}.{}", self.bucket, host_only)
+        };
+        if !key.is_empty() {
+            segs.push(encode_key(key));
+        }
+        let path = format!("/{}", segs.join("/"));
+        Target {
+            url: format!("{scheme}://{host}{path}"),
+            host,
+            path,
         }
     }
 }
@@ -128,8 +151,19 @@ mod tests {
         );
     }
 
-    /// 签名里的 path 与 URL 里的 path 是**同一个字符串**。这条钉住的是
-    /// 「有人以后为了省事在 s3.rs 里另拼一次 URL」。
+    /// 守的是「`url` 与 `path` 同源」这个结构性质——`url` 必须以 `path`
+    /// 收尾,不能是两个各拼一次、可能悄悄分叉的字符串。
+    ///
+    /// **独立杀伤力有限**:当前实现里 `url` 就是拿 `path` 字面拼出来的
+    /// (`format!("{scheme}://{host}{path}")`),所以只要 `path` 算对了,
+    /// 这条测试几乎必然跟着 `virtual_hosted_puts_the_bucket_in_the_host`
+    /// / `path_style_puts_the_bucket_in_the_path` 等精确断言同绿同红——
+    /// 复核者实测过:把 path-style 分支的 path 改成丢掉 bucket 段,这条
+    /// 依然全绿,真正抓到回归的是 `path_style_puts_the_bucket_in_the_path`。
+    /// 它守不住「有人以后在 `s3.rs` 里另拼一次 URL、两处从此不同源」这种
+    /// 跨文件回归——`url.rs` 这一层看不到 `s3.rs` 怎么用 `Target`。真要
+    /// 守住这条,得等 `s3.rs` 落地后在那边加断言(比如断言它只用
+    /// `t.url`/`t.path`,不自己再拼一次)。
     #[test]
     fn the_signed_path_is_the_tail_of_the_url() {
         for path_style in [false, true] {
@@ -167,5 +201,72 @@ mod tests {
     fn query_parameters_are_sorted_by_name() {
         let q = query_string(&[("prefix", "mullion/"), ("list-type", "2")]);
         assert_eq!(q, "list-type=2&prefix=mullion%2F");
+    }
+
+    /// endpoint 带路径前缀(virtual-hosted)。host 里混进路径 = 签的头
+    /// 与实际发出去的 Host 头不是同一个字符串(HTTP 客户端按 RFC 3986
+    /// 在第一个 `/` 处截断 authority)——必现 403,且 url.rs 这一层零提示。
+    /// 前缀必须摘出来并进 path,而不能留在 host 里。
+    #[test]
+    fn a_path_prefix_on_the_endpoint_moves_into_the_path_virtual_hosted() {
+        let e = Endpoint {
+            base: "https://host/p1/p2".into(),
+            bucket: "b".into(),
+            path_style: false,
+        };
+        let t = e.target("k");
+        assert_eq!(t.host, "b.host", "host 里不能再混进路径前缀");
+        assert_eq!(t.path, "/p1/p2/k");
+        assert_eq!(t.url, "https://b.host/p1/p2/k");
+    }
+
+    /// 同上,path-style:前缀排在 bucket 之前,host 只剩纯 authority。
+    #[test]
+    fn a_path_prefix_on_the_endpoint_moves_into_the_path_path_style() {
+        let e = Endpoint {
+            base: "https://host/p1/p2".into(),
+            bucket: "b".into(),
+            path_style: true,
+        };
+        let t = e.target("k");
+        assert_eq!(t.host, "host");
+        assert_eq!(t.path, "/p1/p2/b/k");
+    }
+
+    /// `list_keys` 列举 bucket 根时就是拿空 key 调 `target`。path-style
+    /// 下必须是 `/my-bucket`(不带尾斜杠)——带了会被部分 S3 兼容实现
+    /// (自建 MinIO)解释成「键为空字符串的对象」而不是 bucket 根,回空列表。
+    #[test]
+    fn an_empty_key_does_not_leave_a_trailing_slash() {
+        let mut e = oss();
+        e.path_style = true;
+        let t = e.target("");
+        assert_eq!(t.path, "/my-bucket");
+        assert!(!t.path.ends_with('/'));
+
+        let t = oss().target("");
+        assert_eq!(t.path, "/");
+    }
+
+    /// 非 ASCII key:逐字节 UTF-8 百分号编码、大写十六进制、`/` 保留
+    /// (不然多级目录的对象会存到一个名字里带 `%2F` 的键上)。
+    #[test]
+    fn non_ascii_keys_are_percent_encoded_byte_by_byte_with_slash_preserved() {
+        let t = oss().target("中文/文件.mpk");
+        assert_eq!(t.path, "/%E4%B8%AD%E6%96%87/%E6%96%87%E4%BB%B6.mpk");
+    }
+
+    /// bucket 名进 Host 头不能编码,所以含 `/` 的 bucket 只能在开发期
+    /// 就地炸掉——真编码了反而是错(Host 头里不能有百分号转义)。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "bucket 名不能含")]
+    fn a_bucket_name_containing_a_slash_panics_in_debug() {
+        let e = Endpoint {
+            base: "https://host".into(),
+            bucket: "b/evil".into(),
+            path_style: false,
+        };
+        e.target("k");
     }
 }
