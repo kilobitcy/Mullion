@@ -3159,9 +3159,16 @@ git commit -m "feat(app): 云端备份的上传编排 (F273)
     fn the_cloud_section_is_disabled_and_explains_itself_without_a_master_password() {
         let mut d = draft();
         let (texts, _) = run_env(&mut d, false, /* has_master_password */ false);
+        // **判据是精确相等,不是 `contains`。** 下面那句提示文案里也带着
+        // 「云端备份」四个字,用 `contains` 的话把 `form::section(.., "云端备份", ..)`
+        // 整行删掉这条照样绿 —— 而那时候云端那一堆字段会挂在「安全」分节底下,
+        // 看起来像是主密码设置的一部分。
+        // (已核实:`form::section` 把 title 原样画成一个独立的 `Shape::Text`,
+        // 而 `run_env` 收的是每个 `Shape::Text` 的 `galley.text()` 全文,
+        // 所以标题那一条就是「云端备份」这四个字本身。)
         assert!(
-            texts.iter().any(|t| t.contains("云端备份")),
-            "没有云端备份分节:{texts:?}"
+            texts.iter().any(|t| t == "云端备份"),
+            "没有「云端备份」分节标题 —— 那些字段会挂在「安全」底下:{texts:?}"
         );
         assert!(
             texts.iter().any(|t| t.contains("需要先设置主密码")),
@@ -3704,8 +3711,11 @@ git commit -m "feat(app): 设置弹窗加云端备份分节,未设主密码时�
 | 变异 | 应该变红的测试 |
 |---|---|
 | `let ready = ...` 改成 `true` | `the_cloud_section_is_disabled_and_explains_itself_without_a_master_password` |
+| `show()` 里删掉 `form::section(ui, t, "设置", "云端备份", &mut first);` 那一行 | 同上（**判据必须是精确相等**：提示文案里也带着「云端备份」四个字，用 `contains` 的话这条杀不掉） |
 | `.password(true)` 删掉 | `the_secret_key_field_is_masked` |
 | `from_settings_and_cloud` 里 `cloud_enabled` 改成 `false` | `the_cloud_draft_starts_from_the_stored_config_not_a_hardcoded_default` |
+| `from_settings` 改回穷尽字面量，云端字段填死值 | **杀不掉**（只要填的值恰好等于 `CloudConfig::default()`，就是等价变异）。**如实记下来，别硬编守护** —— 真正挡住漂移的是「`from_settings_and_cloud` 是唯一的穷尽字面量」这个结构，加字段时漏改当场编译不过 |
+| `checkbox` 的 `.changed()` 分支里不写 `*out = SettingsOut::Preview;` | `toggling_the_cloud_switch_reports_a_preview` |
 
 ---
 
