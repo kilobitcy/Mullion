@@ -36,6 +36,11 @@ const LEVEL_ERROR_LABEL: &str = "只记错误";
 const LEVEL_INFO_LABEL: &str = "常规（含性能剖面）";
 const LEVEL_DEBUG_LABEL: &str = "详细（排查用）";
 
+/// 云端备份开关的标签。实现与测试**共用这一份**(同 `BOOTSTRAP_LABEL` 的理由)。
+const CLOUD_ENABLED_LABEL: &str = "开启云端备份";
+/// path-style 开关的标签。
+const CLOUD_PATH_STYLE_LABEL: &str = "用 path-style 寻址（自建 MinIO 多半要打开）";
+
 fn level_label(lv: mullion_store::LogLevel) -> &'static str {
     match lv {
         mullion_store::LogLevel::Error => LEVEL_ERROR_LABEL,
@@ -78,11 +83,50 @@ pub struct SettingsDraft {
     /// F155:日志详细档位。回写进 `Settings` 与施加到 log facade 都在
     /// `app.rs` 的「确定」分支里做。
     pub log_level: mullion_store::LogLevel,
+    /// F271:云端备份的草稿。**与 `Settings` 分开** —— 它们落在两个文件里
+    /// (`cloud.toml` 不进迁移包,见 `mullion_store::cloud` 的模块文档),
+    /// 合成一份的话「确定」那一步会分不清该写哪个文件。
+    pub cloud_enabled: bool,
+    pub cloud_endpoint: String,
+    pub cloud_region: String,
+    pub cloud_bucket: String,
+    pub cloud_prefix: String,
+    pub cloud_path_style: bool,
+    pub cloud_keep: u32,
+    pub cloud_interval_min: u32,
+    /// SOCKS5 代理,空 = 直连。见 `CloudConfig::socks5` 上那段理由。
+    pub cloud_socks5: String,
+    pub cloud_access_key_id: String,
+    /// 新填的 SK。**空 = 不改**(不是「清空」):每次打开设置都要用户重打一遍
+    /// 一串 30 位的密钥,是在逼人把它记在别处。
+    pub cloud_secret_new: String,
 }
 
 impl SettingsDraft {
-    /// 从落盘的设置起一份草稿。
+    /// 从落盘的设置起一份草稿。云端那一节按 `CloudConfig::default()` 起手。
+    ///
+    /// **生产路径上没人该调它** —— 设置弹窗走
+    /// [`Self::from_settings_and_cloud`],因为这一个读不到 `cloud.toml`,
+    /// 拿它起的草稿云端字段全是默认值,而「确定」是会把草稿写回
+    /// `cloud.toml` 的:endpoint / bucket / AK 会被一次「打开设置再点确定」
+    /// 悄悄清空(本项目登记过的「整份覆盖」缺陷族,已经踩过五处)。
+    /// 留着它只为那些跟云端毫无关系的单测能少写一个参数;
+    /// `app.rs` 里有一条守护钉着生产代码不许出现它。
     pub fn from_settings(s: &mullion_store::Settings) -> Self {
+        Self::from_settings_and_cloud(s, &mullion_store::CloudConfig::default())
+    }
+
+    /// F271:从落盘的设置 + 落盘的云配置起一份草稿。
+    ///
+    /// **两个文件各读各的** —— 设置在 `settings.toml`,云配置在 `cloud.toml`,
+    /// 后者不进迁移包(见 `mullion_store::cloud` 的模块文档)。
+    ///
+    /// 这里是 `SettingsDraft` **唯一**的穷尽字面量。加字段时只有这一处要改,
+    /// 漏了当场编译不过 —— 而不是「有两处、改了一处、另一处悄悄给了错值」。
+    pub fn from_settings_and_cloud(
+        s: &mullion_store::Settings,
+        c: &mullion_store::CloudConfig,
+    ) -> Self {
         Self {
             family: s.font_family.clone(),
             font_pt: s.font_pt,
@@ -93,6 +137,18 @@ impl SettingsDraft {
             shell_osc7_bootstrap: s.shell_osc7_bootstrap,
             show_hidden_files: s.show_hidden_files,
             log_level: s.log_level,
+            cloud_enabled: c.enabled,
+            cloud_endpoint: c.endpoint.clone(),
+            cloud_region: c.region.clone(),
+            cloud_bucket: c.bucket.clone(),
+            cloud_prefix: c.prefix.clone(),
+            cloud_path_style: c.path_style,
+            cloud_keep: c.keep,
+            cloud_interval_min: c.interval_min,
+            cloud_socks5: c.socks5.clone(),
+            cloud_access_key_id: c.access_key_id.clone(),
+            // **空 = 不改**,不是「清空」。见字段上那段理由。
+            cloud_secret_new: String::new(),
         }
     }
 
@@ -180,6 +236,8 @@ pub fn show(
             diagnostics(ui, t, draft, &mut out);
             form::section(ui, t, "设置", "安全", &mut first);
             security(ui, t, draft, env, &mut out);
+            form::section(ui, t, "设置", "云端备份", &mut first);
+            cloud(ui, t, draft, env, &mut out);
             form::section(ui, t, "设置", "快捷键", &mut first);
             shortcut_table(ui, t);
             ui.add_space(SP_L);
@@ -540,6 +598,193 @@ fn security(
     });
 }
 
+/// 云端备份分节(F271)。
+///
+/// **未设主密码时整节置灰**(设计 D6):钥匙串方案下封出来的包换台机器解不开,
+/// 而云备份的主场景正是「换新电脑」。让用户填完一整屏 AK/SK、开了开关、
+/// 等半小时才在状态栏看见「需要主密码」,是最糟的那条路径。
+fn cloud(
+    ui: &mut egui::Ui,
+    t: &Theme,
+    draft: &mut SettingsDraft,
+    env: SettingsEnv<'_>,
+    out: &mut SettingsOut,
+) {
+    let ready = env.store_available && env.has_master_password;
+    let avail = ui.available_width();
+    let w = field_w(avail, FIELD_W_M, 0.0);
+
+    if !ready {
+        ui.label(
+            egui::RichText::new(
+                "云端备份需要先设置主密码 —— 钥匙串里的那把钥匙只在这台机器上有效，\
+                 用它封出来的备份换台电脑一个字也解不开。请先在上面的「安全」里设一个。",
+            )
+            .size(11.0)
+            .color(theme::c32(t.fg_muted)),
+        );
+        ui.add_space(SP_S);
+    }
+
+    ui.add_enabled_ui(ready, |ui| {
+        form::grid(ui, "settings_cloud", |ui| {
+            ui.label("");
+            if ui
+                .checkbox(&mut draft.cloud_enabled, CLOUD_ENABLED_LABEL)
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("Endpoint");
+            if ui
+                .add(egui::TextEdit::singleline(&mut draft.cloud_endpoint).desired_width(w))
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("Region");
+            if ui
+                .add(egui::TextEdit::singleline(&mut draft.cloud_region).desired_width(w))
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("Bucket");
+            if ui
+                .add(egui::TextEdit::singleline(&mut draft.cloud_bucket).desired_width(w))
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("前缀");
+            if ui
+                .add(egui::TextEdit::singleline(&mut draft.cloud_prefix).desired_width(w))
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("Access Key ID");
+            if ui
+                .add(egui::TextEdit::singleline(&mut draft.cloud_access_key_id).desired_width(w))
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("Access Key Secret");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut draft.cloud_secret_new)
+                        .password(true)
+                        .desired_width(w)
+                        .hint_text("留空 = 不改"),
+                )
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("");
+            if ui
+                .checkbox(&mut draft.cloud_path_style, CLOUD_PATH_STYLE_LABEL)
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("保留份数");
+            if ui
+                .add(egui::DragValue::new(&mut draft.cloud_keep).range(1..=200))
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            // **这一行不能省。** 片一完全不删云端对象(清理是片二的活),
+            // 这个数字存得下、也回得来,但没有任何代码会用它 —— 不说明的话
+            // 它就是一个假开关:用户设成 5,以为云上只会留 5 份,实际一直在涨,
+            // 直到有天发现 bucket 里几百个对象。这类「看得见摸不着的开关」
+            // 本项目在 F265 上刚吃过一次(「灯早就有了,用户根本没注意到」的
+            // 反面:控件早就有了,用户以为它在起作用)。
+            //
+            // 小字用 `.size(11.0)` + `c32(t.fg_muted)`,跟本分节另外两处说明
+            // 以及 `settings.rs` 里其余六处同形。**别改成 `theme::hint_text`**:
+            // 那一层是给 `TextEdit` 的 hint 用的(egui 派生的 weak 色达不到 AA),
+            // 它给的是 `fg_dimmer`,跟并排的两段说明会深浅不一。这个文件里两套
+            // 写法确实并存(6 处 vs 2 处),新写的一律跟多数那套走,
+            // 至少别在同一个分节里混用。
+            ui.label("");
+            ui.label(
+                egui::RichText::new("下一个版本生效：当前版本只往上传，不清理旧份")
+                    .size(11.0)
+                    .color(theme::c32(t.fg_muted)),
+            );
+            ui.end_row();
+
+            ui.label("检查间隔");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut draft.cloud_interval_min)
+                        .range(5..=1440)
+                        .suffix(" 分钟"),
+                )
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            // SOCKS5 代理。**不补这一格的话 `socks5` 参数就是条死线** ——
+            // `mullion-cloud` 为它开了 ureq 的 `socks-proxy` 特性、
+            // `S3Client::new` 专门收了这个参数,而设计 D15 把「SOCKS 代理
+            // 链路通不通」列进了片一的真机验收项。没有入口就永远传 `None`,
+            // 那条验收项验的是一条从没走过的路。
+            ui.label("SOCKS5 代理");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut draft.cloud_socks5)
+                        .desired_width(w)
+                        // **hint 里写清不带 `socks5://`**:`S3Client::new` 自己
+                        // 补前缀,用户照直觉填全 URL 的话会拼成
+                        // `socks5://socks5://…` 而当场报「配置不合法」。
+                        .hint_text("127.0.0.1:1080,留空 = 直连"),
+                )
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
+            ui.label("");
+            ui.label(
+                egui::RichText::new(
+                    "整份配置会用主密码派生的密钥加密之后再上传，云上那份是不可读的二进制；\
+                     内容没变就不上传。窗口布局与现场记录不上云（它们是这台机器的属性）。\
+                     建议用 RAM 子账号、只授权这一个 bucket 的这一个前缀。",
+                )
+                .size(11.0)
+                .color(theme::c32(t.fg_muted)),
+            );
+            ui.end_row();
+        });
+    });
+    ui.add_space(SP_M);
+}
+
 /// 快捷键一览。只读表格,数据源是 `ui::shortcuts::SHORTCUTS`(那边有撞键守护)。
 ///
 /// F260:组合键那一列**必须显式给色**。原来写的是 `RichText::new(..).strong()`,
@@ -588,16 +833,14 @@ mod tests {
     const FRAMES: usize = 8;
 
     fn draft() -> SettingsDraft {
+        // 只覆盖这一组测试真正在意的那几项,其余从构造器起手。
+        // **不要**把 11 个云端字段一个个补进来 —— 那样每加一个字段都要回来
+        // 改一次,而补错值的表现是这一整组测试悄悄测了别的东西。
         SettingsDraft {
             family: Some("Cascadia Mono".into()),
             font_pt: 10.0,
             typed: "Cascadia Mono".into(),
-            new_password: String::new(),
-            confirm_password: String::new(),
-            tmux_bootstrap: true,
-            shell_osc7_bootstrap: true,
-            show_hidden_files: true,
-            log_level: mullion_store::LogLevel::Info,
+            ..SettingsDraft::from_settings(&mullion_store::Settings::default())
         }
     }
 
@@ -816,12 +1059,7 @@ mod tests {
             family: Some("Comic Sans MS".into()),
             font_pt: 10.0,
             typed: "Comic Sans MS".into(),
-            new_password: String::new(),
-            confirm_password: String::new(),
-            tmux_bootstrap: true,
-            shell_osc7_bootstrap: true,
-            show_hidden_files: true,
-            log_level: mullion_store::LogLevel::Info,
+            ..draft()
         };
         let (texts, _) = run(&mut d, false);
         assert!(
@@ -1264,6 +1502,108 @@ mod tests {
             click(&mut d, "导出脱敏日志…"),
             SettingsOut::ExportLog,
             "按钮没有回报 ExportLog"
+        );
+    }
+
+    // ---- F271 云端备份分节 ----
+
+    /// 未设主密码时,整节必须**灰掉并说明原因**(设计 D6)。
+    ///
+    /// 钥匙串方案下封出来的包换台机器解不开 —— 让用户填完一整屏 AK/SK、
+    /// 开了开关、等了半小时,才在状态栏看见一句「需要主密码」,是最糟的路径。
+    #[test]
+    fn the_cloud_section_is_disabled_and_explains_itself_without_a_master_password() {
+        let mut d = draft();
+        let (texts, _) = run_env(&mut d, false, /* has_master_password */ false);
+        // **判据是精确相等,不是 `contains`。** 下面那句提示文案里也带着
+        // 「云端备份」四个字,用 `contains` 的话把 `form::section(.., "云端备份", ..)`
+        // 整行删掉这条照样绿 —— 而那时候云端那一堆字段会挂在「安全」分节底下,
+        // 看起来像是主密码设置的一部分。
+        // (已核实:`form::section` 把 title 原样画成一个独立的 `Shape::Text`,
+        // 而 `run_env` 收的是每个 `Shape::Text` 的 `galley.text()` 全文,
+        // 所以标题那一条就是「云端备份」这四个字本身。)
+        assert!(
+            texts.iter().any(|t| t == "云端备份"),
+            "没有「云端备份」分节标题 —— 那些字段会挂在「安全」底下:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("需要先设置主密码")),
+            "没说清楚为什么用不了:{texts:?}"
+        );
+    }
+
+    /// 设了主密码之后,开关必须真的可点,且点一下报 Preview(草稿变了,
+    /// 要等「确定」才落盘)。
+    ///
+    /// **最后两个 `true` 是 `store_available` / `has_master_password`** ——
+    /// 任一为 `false` 的话整节是 `add_enabled_ui(false)`,点不动,这条会红在
+    /// 一个跟它想测的东西无关的原因上。
+    #[test]
+    fn toggling_the_cloud_switch_reports_a_preview() {
+        let mut d = draft();
+        let out = interact_env(
+            &mut d,
+            CLOUD_ENABLED_LABEL,
+            egui::Vec2::ZERO,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(out, SettingsOut::Preview);
+        assert!(d.cloud_enabled, "开关没被点开");
+    }
+
+    /// 草稿必须从**落盘的那份**起,不是硬编码默认值。
+    /// 从默认值起的症状:打开设置弹窗、什么都没动、点「确定」,
+    /// 用户配好的云端备份被关掉了。
+    ///
+    // `CloudConfig::corrupt` 是私有的,`..Default::default()` 在 mullion-store
+    // 之外编不过(E0451)。只能 default 完再逐字段赋 —— 没有别的写法。
+    // **别为了这条 lint 把 `corrupt` 改成 pub**,它私有是 Task 8 的设计。
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn the_cloud_draft_starts_from_the_stored_config_not_a_hardcoded_default() {
+        let mut stored = mullion_store::CloudConfig::default();
+        stored.enabled = true;
+        stored.bucket = "my-bucket".into();
+        stored.keep = 7;
+        let d =
+            SettingsDraft::from_settings_and_cloud(&mullion_store::Settings::default(), &stored);
+        assert!(d.cloud_enabled);
+        assert_eq!(d.cloud_bucket, "my-bucket");
+        assert_eq!(d.cloud_keep, 7);
+    }
+
+    /// AK Secret 框必须是密码框。**不是洁癖**:这个弹窗会被截图发出来
+    /// (本项目的排查流程里「发个截图」是常规动作),明文摆在那儿就跟着走了。
+    #[test]
+    fn the_secret_key_field_is_masked() {
+        let src = include_str!("settings.rs");
+        // 先切掉测试模块:这条测试自己的正文里就字面写着 `fn cloud(`
+        // 与 `.password(true)`,不切的话锚点和判据都可能落在测试自己身上。
+        // (已核实:本文件只有 `settings.rs:573` 一处 `#[cfg(test)]`。)
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面会考到测试自己"
+        );
+        let body = prod.split("fn cloud(").nth(1).expect("没有 cloud 分节函数");
+        // 分节函数都在顶格,下一个 `\nfn ` 就是本节的结束。
+        let head = body.split("\nfn ").next().unwrap_or(body);
+        let idx = head
+            .find("cloud_secret")
+            .expect("cloud 分节里没有 SK 输入框");
+        // **按行取窗口,不要按字节切。** `head[idx..idx + 300]` 在这个满是中文
+        // 注释的文件里几乎必然切在 UTF-8 字符中间 —— 那是 panic,不是红,
+        // 报出来的信息跟「SK 没打码」毫无关系。`head[idx..]` 是安全的:
+        // `idx` 来自 `find`,一定在字符边界上,切到结尾永远合法。
+        let window: String = head[idx..].lines().take(12).collect::<Vec<_>>().join("\n");
+        assert!(
+            window.contains(".password(true)"),
+            "SK 输入框不是密码框 —— 截图发出去就跟着走了:{window}"
         );
     }
 }

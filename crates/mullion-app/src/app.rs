@@ -18254,16 +18254,15 @@ mod tests {
     #[test]
     fn a_password_change_always_clears_the_two_boxes() {
         for r in [Ok(()), Err(mullion_store::StoreError::WrongPassword)] {
+            // 这条测的是「改完密码两个框要清空」,跟别的字段一点关系都没有。
+            // **不要**在这里把新字段一个个补齐 —— 那样每加一个字段都要回来改一次,
+            // 而漏改的表现是编译失败(还好),补错值的表现是这条测试悄悄测了别的东西。
             let mut d = crate::ui::settings::SettingsDraft {
-                family: None,
-                font_pt: 10.0,
-                typed: String::new(),
                 new_password: "hunter2".into(),
                 confirm_password: "hunter2".into(),
-                tmux_bootstrap: true,
-                shell_osc7_bootstrap: true,
-                show_hidden_files: true,
-                log_level: mullion_store::LogLevel::Info,
+                ..crate::ui::settings::SettingsDraft::from_settings(
+                    &mullion_store::Settings::default(),
+                )
             };
             let _ = finish_password_change(Some(&mut d), r, "已生效");
             assert!(
