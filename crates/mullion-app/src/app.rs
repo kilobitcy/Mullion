@@ -24923,31 +24923,39 @@ mod tests {
         );
     }
 
-    /// 定时驱动必须**每帧都被调到**,而不是挂在某个偶尔才走的分支上。
+    /// F270:云端备份必须**每帧无条件驱动**,跟 `drive_automation` 那三位同族
+    /// 排在 `pump_io` 的同一层。
     ///
-    /// **判据扎在 `pump_io` 的函数体里,不是扫全篇找「出现过」。** 扫全篇只
-    /// 答得出「有人调过它」,答不出「每帧都调」—— 而把这句挪进任何一个偶尔
-    /// 才走的分支(比如某个 `if let Some(ws)` 里),扫全篇那条照样全绿,
-    /// 定时备份却变成了「碰运气才跑一次」。判据要放在**两种情形分得开**的
-    /// 那一层,这是本项目登记过的形状。
+    /// **判据是缩进,不是「body 里出现过」。** 只判出现过的话,把这句挪进
+    /// 某个偶尔才走的分支(例如 `if flushed { .. }`)照样全绿 —— 而定时备份
+    /// 就此变成碰运气才跑一次,且编译、clippy、日志、界面上都没有任何痕迹。
+    /// 这不是假想:判据锚到 `pump_io` 的 body 之后,这个变异**实测仍然逃得掉**,
+    /// 必须再往下推一层才拦得住(本项目登记过的「守护只推到一半」)。
     ///
-    /// 选 `pump_io` 是因为它自己的文档就写着「**每帧**调」,而且
-    /// `drive_automation` / `drive_attach_checks` / `drive_project_visits`
-    /// 三个同族驱动都住在那里 —— 跟它们做邻居,以后谁搬家也会一起搬。
+    /// 参照物取 `drive_automation` 而不是写死「8 个空格」:写死的话,哪天
+    /// `pump_io` 换了嵌套层级,这条会变成假红,而它该测的东西一点没变。
     ///
     /// 同样先 `strip_comments` —— 注释里写一句「这里调 `self.drive_cloud_backup(..)`」
     /// 就能让这条恒绿,而函数体里那句其实被注释掉了。
     ///
-    /// 自证会变红:把 `pump_io` 里 `self.drive_cloud_backup(now);` 那句注释掉,
-    /// 或者把它挪出 `pump_io`(哪怕挪到另一个每帧都走的地方,这条也会红 ——
-    /// 那时候要连同这条守护的锚点一起改,并在注释里说清新宿主为什么每帧走)。
+    /// 自证会变红:把那句注释掉;挪出 `pump_io`;或者挪进 `if flushed { .. }`。
     #[test]
-    fn the_cloud_backup_is_driven_every_frame() {
+    fn the_cloud_backup_is_driven_unconditionally_every_frame() {
         let body = strip_comments(body_of(prod_src(), "fn pump_io("));
-        assert!(
-            body.contains("self.drive_cloud_backup("),
-            "drive_cloud_backup 不在 pump_io 里 —— 它要么没人调(定时备份从来不发生),\
-             要么挂在某个偶尔才走的分支上(变成碰运气才跑一次):{body}"
+        let indent_of = |needle: &str| -> Option<usize> {
+            body.lines()
+                .find(|l| l.trim_start().starts_with(needle))
+                .map(|l| l.len() - l.trim_start().len())
+        };
+        let cloud = indent_of("self.drive_cloud_backup(")
+            .expect("`pump_io` 里没有 `self.drive_cloud_backup(` —— 定时备份从来不会发生");
+        let sibling = indent_of("self.drive_automation(")
+            .expect("`pump_io` 里连 `drive_automation` 都没了,这条测试的参照物失效了");
+        assert_eq!(
+            cloud, sibling,
+            "`drive_cloud_backup` 没跟 `drive_automation` 排在 `pump_io` 的同一层\
+             (缩进 {cloud} vs {sibling}) —— 它被套进了某个偶尔才走的分支,\
+             定时备份会变成碰运气才跑一次:\n{body}"
         );
     }
 
