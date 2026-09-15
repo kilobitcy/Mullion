@@ -236,17 +236,36 @@ const SEQ_WIDTH: usize = 6;
 const OBJ_EXT: &str = ".mpk";
 
 /// 一份备份的对象键。
+///
+/// **`prefix` 一旦生成过对象就不该再改。** 这里对它不做任何规整 ——
+/// `"mullion/"` 与 `"mullion"` 是两个不同的字符串。改掉之后,云上已有的
+/// 对象仍会被 `list_keys` 列出来(字符串前缀匹配得上),却再也过不了
+/// `parse_seq`:剩下的那截带着 `/`,不是纯数字。于是它们留在桶里但对
+/// 「下一个序号」和「最新一份」完全不可见 —— 不会被覆盖、不会被当成最新、
+/// 片二的「保留 N 份」也看不见,永久滞留占存储。
+/// 校验与「改前缀会孤立旧备份」的警告留给片二,**别在这里顺手加**。
 pub fn object_key(prefix: &str, seq: u64, stamp: &str) -> String {
     format!("{prefix}{seq:0SEQ_WIDTH$}-{stamp}{OBJ_EXT}")
 }
 
 /// 从对象键里抠出序号。不是我们生成的键 → `None`(跳过,不是错误:
 /// bucket 是用户自己的,里头有什么我们管不着)。
+///
+/// **位数判的是「不短于」而不是「恰好等于」。** `{:0SEQ_WIDTH$}` 是**最小
+/// 宽度**,序号越过 `10^SEQ_WIDTH` 之后 `object_key` 会照样输出更多位。
+/// 判「恰好等于」的话,那之后 `next_seq` 就永远只看得见旧的短键、每次返回
+/// 同一个值,连撞四次序号后云备份**永久失败**,而错误文案指向「别的机器在
+/// 频繁上传」这个根本不存在的原因。判「不短于」之后,越界只会让字典序不再
+/// 等于数值序(`next_seq` 用的是数值 `.max()`,推进仍然正确)—— 从硬失败
+/// 降级成观感问题。
 pub fn parse_seq(prefix: &str, key: &str) -> Option<u64> {
     let rest = key.strip_prefix(prefix)?;
     let rest = rest.strip_suffix(OBJ_EXT)?;
     let (seq, _stamp) = rest.split_once('-')?;
-    if seq.len() != SEQ_WIDTH || !seq.bytes().all(|b| b.is_ascii_digit()) {
+    // `is_ascii_digit` 这道**不是废话**:`u64::from_str` 接受前导 `+`
+    // (实测 `"+12345".parse::<u64>() == Ok(12345)`),光靠末尾那个
+    // `parse().ok()` 兜不住。删了它,`+12345-x.mpk` 会被认成序号 12345。
+    if seq.len() < SEQ_WIDTH || !seq.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     seq.parse().ok()
@@ -264,9 +283,18 @@ pub fn next_seq(prefix: &str, keys: &[String]) -> u64 {
 /// 这一轮该不该推。**纯函数** —— 时钟由调用方折算成
 /// `minutes_since_last_ok` 传进来(store 不持时钟)。
 ///
-/// 判据顺序是有意的:先看开关、再看配置完不完整、再看指纹、最后才看时间。
-/// 「配置没填完」与「指纹没变」在 UI 上要说不同的话,混成一条的话状态栏只能
-/// 报「备份失败」,把真正的原因吃掉。
+/// **`last_ok_at` 为空(从没成功推过)时,调用方传 `u64::MAX`。** 语义是
+/// 「已经过了任意久」,于是第一份备份到点就走。传 0 的话开了开关的用户
+/// 永远等不到第一份,且零报错 —— 折算那一步在调用方,这里只能把契约写死。
+///
+/// 四道闸缺一不可,尤其是**配置完整性**那道:少了它,开着开关但没填完的
+/// 用户每一轮都会发一次注定 403 的请求,而状态栏把它报成「备份失败」,
+/// 把真正的原因(「还没填完」)吃掉。
+///
+/// **但四道闸的先后顺序今天没有可观测的意义,也没有守护测试** ——
+/// 返回值只是个 `bool`,谁先谁后在它上面区分不出来(复核实跑确认:顺序
+/// 随便打乱,26 条测试全绿)。要让 UI 把「没填完」和「没变」说成两句话,
+/// 得把返回值换成一个带原因的枚举 —— 那是片二的事,别在这里假装已经做到了。
 pub fn should_upload(cfg: &CloudConfig, now_fingerprint: &str, minutes_since_last_ok: u64) -> bool {
     if !cfg.enabled {
         return false;
@@ -680,10 +708,73 @@ mod tests {
 
     /// 别人往同一个前缀下丢了别的文件时,不认识的键**跳过**而不是
     /// 让整次上传失败 —— bucket 是用户自己的,里头有什么我们管不着。
+    ///
+    /// 四种「长得像但不是」的形状各钉一条。复核实测:`parse_seq` 里那三道
+    /// 检查**各删一道都杀不掉原来那两条断言** —— 少哪一道,别人的文件就会被
+    /// 认成序号计进 `next_seq` 的 max,把我们自己的序号顶到一个没人写过的值上。
     #[test]
     fn a_key_we_do_not_recognise_is_skipped_not_fatal() {
         assert_eq!(parse_seq("mullion/", "mullion/readme.txt"), None);
         assert_eq!(parse_seq("mullion/", "other/000001-x.mpk"), None);
+        // 没零填充 —— 定宽是硬要求,认了它等于承认字典序可以乱。
+        assert_eq!(
+            parse_seq("mullion/", "mullion/1-x.mpk"),
+            None,
+            "没零填充的键被认成了合法序号"
+        );
+        // **`u64::from_str` 接受前导 `+`**,所以 `is_ascii_digit` 那道不是废话:
+        // 少了它,`+12345` 这种六字符会被解析成 12345。
+        assert_eq!(
+            parse_seq("mullion/", "mullion/+12345-x.mpk"),
+            None,
+            "带符号的「数字」被认成了序号 —— is_ascii_digit 那道检查没了"
+        );
+        // 扩展名不对 —— 用户放在同一前缀下的别的文件。
+        assert_eq!(
+            parse_seq("mullion/", "mullion/000005-whatever.txt"),
+            None,
+            "不是 .mpk 的对象被算进了序号"
+        );
+    }
+
+    /// 键的形状是**跟用户桶里已有对象的兼容契约**,不是实现细节。
+    ///
+    /// 改掉 `SEQ_WIDTH` / `OBJ_EXT` / 分隔符里的任何一个,之前推上去的对象
+    /// 对 `parse_seq` 就全不可见了 —— 不会被覆盖、不会被当成最新、片二的
+    /// 「保留 N 份」也看不见它们,永久滞留在桶里占钱,而这一切零报错。
+    ///
+    /// 今天这三个常量只被别的测试里硬编码的字面量**顺带**守着(复核实测),
+    /// 这条把它变成显式判据:改常量必须同时来改这一行,那一刻才会有人想起
+    /// 「云上已经有旧对象了」。
+    #[test]
+    fn a_key_has_the_exact_shape_we_already_wrote_to_peoples_buckets() {
+        assert_eq!(
+            object_key("mullion/", 1, "20260915T101500Z"),
+            "mullion/000001-20260915T101500Z.mpk"
+        );
+    }
+
+    /// 序号越过 `10^SEQ_WIDTH` 之后**只能是观感退化,不能是功能失效**。
+    ///
+    /// `{:0SEQ_WIDTH$}` 是最小宽度,越界后 `object_key` 输出 7 位。若
+    /// `parse_seq` 判的是「恰好 SEQ_WIDTH 位」,`next_seq` 从此看不见这些键、
+    /// 每次都返回同一个值,连撞四次之后云备份永久失败(错误文案还指向一个
+    /// 不存在的原因)。
+    ///
+    /// 自证会变红:把 `seq.len() < SEQ_WIDTH` 改回 `!=`。
+    #[test]
+    fn a_sequence_past_the_padding_width_still_advances() {
+        let k = object_key("mullion/", 1_000_000, "20260915T101500Z");
+        assert_eq!(
+            parse_seq("mullion/", &k),
+            Some(1_000_000),
+            "越界的键自己都认不出来了 —— next_seq 会从此卡在同一个值上"
+        );
+        assert_eq!(
+            next_seq("mullion/", &[k]),
+            1_000_001,
+            "越界之后序号不再推进 —— 连撞四次就永久失败"
+        );
     }
 
     /// 下一个序号 = 已有的最大值 + 1。**空列表从 1 起**,不是 0 ——
@@ -763,6 +854,12 @@ mod tests {
         let mut c = ready_cfg();
         c.last_fingerprint = String::new();
         assert!(should_upload(&c, "first", 30));
+        // `last_ok_at` 为空时调用方按契约传 `u64::MAX`(见 `should_upload`
+        // 文档)—— 这里补一条直接用这个契约值的用例,别只靠 30 绕过去。
+        assert!(
+            should_upload(&c, "first", u64::MAX),
+            "从没成功过的契约值被拒了"
+        );
     }
 
     /// 配置不全(endpoint/bucket/AK/SK 任一为空)时不推 —— 推了也只会拿到一条
