@@ -94,16 +94,6 @@ pub struct Pack {
     pub file: Vec<PackFile>,
 }
 
-/// 从配置目录读出要带走的明文文件。**不含 `secrets.enc`** —— 那条走
-/// [`seal_secrets`],理由见模块文档。
-///
-/// 不存在的文件直接跳过(新装的机器可能一个 `known_hosts.toml` 都还没有),
-/// 读不出来的也跳过:导出是尽力而为,为一个坏掉的布局记录把整次导出弄失败,
-/// 用户拿不到的是全部会话和凭据。
-///
-/// `layouts/` 只带 `.toml`,**不带 `.alive`**:心跳文件的含义是「这个实例此刻
-/// 正开着」。跟着包走到新电脑上,那几条现场会被判成「别人正在用」而永远不
-/// 出现在恢复列表里 —— 带着走反而等于没带。
 /// 只读顶层那三个文件。**云端载荷用的就是这个**(设计 D7:不带 `layouts/`)。
 ///
 /// 抽出来而不是给 `collect` 加一个布尔参数:调用点读起来是
@@ -122,6 +112,16 @@ pub fn collect_top_level(dir: &Path) -> Vec<PackFile> {
     out
 }
 
+/// 从配置目录读出要带走的明文文件。**不含 `secrets.enc`** —— 那条走
+/// [`seal_secrets`],理由见模块文档。
+///
+/// 不存在的文件直接跳过(新装的机器可能一个 `known_hosts.toml` 都还没有),
+/// 读不出来的也跳过:导出是尽力而为,为一个坏掉的布局记录把整次导出弄失败,
+/// 用户拿不到的是全部会话和凭据。
+///
+/// `layouts/` 只带 `.toml`,**不带 `.alive`**:心跳文件的含义是「这个实例此刻
+/// 正开着」。跟着包走到新电脑上,那几条现场会被判成「别人正在用」而永远不
+/// 出现在恢复列表里 —— 带着走反而等于没带。
 pub fn collect(dir: &Path) -> Vec<PackFile> {
     let mut out = collect_top_level(dir);
     let mut records: Vec<PathBuf> = match std::fs::read_dir(crate::history::history_dir(dir)) {
