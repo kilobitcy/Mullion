@@ -4083,20 +4083,27 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
             "定时那一路没走 should_upload —— 配置完整性那道闸永远不会跑,\
              没填完的用户会每轮发一次注定 403 的请求"
         );
+        // 拆成两条,**不要**写成一条带换行与缩进的整串:那样判据就绑死在
+        // rustfmt 当下的折行决定上 —— 谁加一句 `use` 把路径缩短,这一行就
+        // 折不起来了,守护当场假红。
         assert!(
-            body.contains("minutes_since_last_ok(\n            &cfg.last_ok_at,"),
+            body.contains("minutes_since_last_ok("),
+            "没做「距上次成功过了几分钟」的折算"
+        );
+        assert!(
+            body.contains("&cfg.last_ok_at"),
             "间隔不是从持久化的 last_ok_at 起算 —— 开开关关的用户每次启动都会推一份"
         );
     }
 ```
 
 **已核实的测试辅助**（`app.rs` 的 `mod tests` 里都有，直接用，别自己再造）：
-- `prod_src() -> &'static str`（23908 行）：`include_str!("app.rs")` 再切掉
+- `prod_src() -> &'static str`（23932 行）：`include_str!("app.rs")` 再切掉
   `\n#[cfg(test)]\nmod tests {` 之后的部分。
-- `body_of(production, sig) -> &str`（23879 行）：从 `sig` **第一次出现**处起，
+- `body_of(production, sig) -> &str`（23903 行）：从 `sig` **第一次出现**处起，
   取到第一个 `{` 之后的大括号配平块。注意「第一次出现」——锚点串必须是那段
   代码独有的形状。
-- `strip_comments(body) -> String`（23899 行）：剥掉**整行**注释（行尾注释不剥）。
+- `strip_comments(body) -> String`（23923 行）：剥掉**整行**注释（行尾注释不剥）。
   它的文档注释里原话是「源码切片断言几乎都得先过这一道…已实证过好几次
   『只删代码、注释原样，测试照绿』」。上面四条守护全部过了这一道。
 
@@ -4436,7 +4443,7 @@ fn now_compact() -> String {
 ```
 
 （`prod_src` / `body_of` / `strip_comments` 是 `app.rs` 测试模块里已有的源码切片
-辅助，见 `app.rs:23879` 一带。**必须过 `strip_comments`** —— 不然上面那段新写的
+辅助，见 `app.rs:23903`(`body_of`)/`23923`(`strip_comments`)/`23932`(`prod_src`)。**必须过 `strip_comments`** —— 不然上面那段新写的
 注释里就字面带着 `from_settings_and_cloud`，断言当场恒真。）
 
 - [ ] **Step 8b: 接「确定」时把云草稿落盘**
