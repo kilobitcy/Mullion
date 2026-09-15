@@ -138,6 +138,9 @@ mod tests {
     #[test]
     fn a_response_that_is_not_a_list_result_is_an_error_not_an_empty_list() {
         let r = parse_list("<Error><Code>AccessDenied</Code></Error>");
-        assert!(r.is_err(), "非 ListBucketResult 必须报错,不能静默返回空列表");
+        assert!(
+            r.is_err(),
+            "非 ListBucketResult 必须报错,不能静默返回空列表"
+        );
     }
 }
