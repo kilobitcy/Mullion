@@ -50,7 +50,10 @@ fn encode_component(s: &str) -> String {
 /// 斜杠是路径分隔符,转义掉之后对象会存到一个名字里带 `%2F` 的键上,而且
 /// 一切正常、零报错,只有在控制台里看才发现层级没了。
 fn encode_key(s: &str) -> String {
-    s.split('/').map(encode_component).collect::<Vec<_>>().join("/")
+    s.split('/')
+        .map(encode_component)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// 按名字排序后拼成 canonical query string。
@@ -152,7 +155,10 @@ mod tests {
             bucket: "b".into(),
             path_style: false,
         };
-        assert_eq!(e.target("k").url, "https://b.oss-cn-hangzhou.aliyuncs.com/k");
+        assert_eq!(
+            e.target("k").url,
+            "https://b.oss-cn-hangzhou.aliyuncs.com/k"
+        );
     }
 
     /// query 参数必须**按名字排序**后拼 —— SigV4 的 canonical query string
