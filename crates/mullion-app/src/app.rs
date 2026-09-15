@@ -3579,14 +3579,13 @@ impl App {
         let Some(dir) = crate::shell::store::config_dir() else {
             return;
         };
-        // 读-改-写:盘上那份打底,只翻 `enabled` 一项。游标与
-        // `secret_sealed` 原样留着 —— 整份覆盖是 F247/F248 的缺陷族,
-        // 而 SK 刚被 `reseal_cloud_secret` 重封过,覆盖掉就再也解不出来了。
-        let mut cfg = mullion_store::cloud::load(&dir);
-        if !cfg.enabled {
+        // 读-改-写:盘上那份打底,决策部分剥进纯函数(见
+        // `cloud_config_after_clearing_master_password` 的文档,理由是
+        // 「留在这里零守护,而它是 D12 修复的核心」)。
+        let cfg = mullion_store::cloud::load(&dir);
+        let Some(cfg) = cloud_config_after_clearing_master_password(cfg) else {
             return;
-        }
-        cfg.enabled = false;
+        };
         match mullion_store::cloud::save(&dir, &cfg) {
             Ok(()) => self.ui.set_error(
                 "主密码已取消,回到系统钥匙串。云端备份已一并关闭 —— \
@@ -15702,6 +15701,30 @@ fn cloud_backoff_ms(streak: u32) -> u64 {
     (CLOUD_POLL_MS << shift).min(CAP_MS)
 }
 
+/// 清掉主密码之后,盘上那份云配置要不要改、改成什么样。
+///
+/// `None` = 不用动(本来就没开)。`Some(cfg)` = 把这份写回去。
+///
+/// 剥成纯函数是为了**可测**:方法挂在 `App` 上,而 `App` 在无头环境建不出来
+/// (本项目已登记的结构性限制),留在方法里的话「把 `enabled` 翻成 false」
+/// 这一句删掉之后没有任何测试会红 —— 而那一句正是 D12 那条修复的核心,
+/// 删了就原样复现「用户被困在关不掉的云备份里」。
+///
+/// 只翻 `enabled` 一项,其余字段(游标、`secret_sealed`)原样带走 ——
+/// SK 刚被 `reseal_cloud_secret` 用新方案重封过,覆盖掉就再也解不出来了
+/// (整份覆盖是 F247/F248 的缺陷族)。**不用 `..cfg` 结构更新语法**:
+/// `CloudConfig::corrupt` 是私有字段,跨 crate 写不出这个语法;取 `mut cfg`
+/// 进来翻一项、原样返回,在「只改一处、其余不动」这件事上也更直白。
+fn cloud_config_after_clearing_master_password(
+    mut cfg: mullion_store::CloudConfig,
+) -> Option<mullion_store::CloudConfig> {
+    if !cfg.enabled {
+        return None;
+    }
+    cfg.enabled = false;
+    Some(cfg)
+}
+
 /// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
 /// 「距上次输入多少毫秒」,不碰 `&App`,理由同 `sync_timeout_wake_at`(`App`
 /// 在无 GPU/窗口的环境下构造不出来,这几条分支只能靠这条路径单测)。
@@ -16371,8 +16394,9 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
         autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
-        clip_still_matches_what_was_pasted, cloud_backoff_ms, credential_delete_error,
-        decide_paste, dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
+        clip_still_matches_what_was_pasted, cloud_backoff_ms,
+        cloud_config_after_clearing_master_password, credential_delete_error, decide_paste,
+        dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
         drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
         files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
         font_px_for, has_real_action, history_rows_of, host_for_fresh, ime_cursor_area,
@@ -25239,6 +25263,45 @@ mod tests {
         assert!(
             !body.contains("cloud_retry_after_ms"),
             "手动点也被退避挡住了 —— 用户明确要求的事情不该被退避拦下:{body}"
+        );
+    }
+
+    /// 清掉主密码之后,开着的云备份必须被翻成关闭。
+    ///
+    /// 这是 D12 那条修复的核心判据。不翻的后果:定时那条每 60 秒失败一次,
+    /// 而用户进设置也关不掉(那一节按 `has_master_password` 置灰),
+    /// 唯一出路是把刚清掉的主密码再设回来 —— 一个没有出口的陷阱。
+    ///
+    /// 三种情形分开钉:开着的要翻;没开的**不能**返回 `Some`(否则每次
+    /// 取消主密码都白写一次盘,还会给没开过云备份的用户弹一句莫名其妙的
+    /// 「云备份已关闭」);翻的时候**别的字段一个都不许动** —— SK 刚被
+    /// `reseal_cloud_secret` 重封过,覆盖掉就再也解不出来。
+    ///
+    /// 自证会变红:把 `cfg.enabled = false;` 那句删掉。
+    #[test]
+    fn clearing_the_master_password_turns_an_enabled_cloud_backup_off() {
+        let mut on = mullion_store::CloudConfig::default();
+        on.enabled = true;
+        on.bucket = "b".into();
+        on.secret_sealed = "重封过的密文".into();
+        on.last_seq = 7;
+
+        let off = cloud_config_after_clearing_master_password(on.clone())
+            .expect("开着的云备份没被翻成关闭 —— 用户会被困在一个关不掉的失败循环里");
+        assert!(!off.enabled, "`enabled` 没翻成 false");
+        // 其余字段原样:游标与重封过的 SK 必须带过去。
+        assert_eq!(
+            off.secret_sealed, on.secret_sealed,
+            "重封过的 SK 被覆盖了 —— 它再也解不出来"
+        );
+        assert_eq!(off.last_seq, on.last_seq, "游标被动了 —— 下次会撞号或重推");
+        assert_eq!(off.bucket, on.bucket, "bucket 被动了");
+
+        let mut offed = mullion_store::CloudConfig::default();
+        offed.enabled = false;
+        assert!(
+            cloud_config_after_clearing_master_password(offed).is_none(),
+            "没开过云备份的用户也被写了一次盘、弹了一句「云备份已关闭」"
         );
     }
 
