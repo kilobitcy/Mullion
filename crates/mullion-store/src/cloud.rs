@@ -226,6 +226,64 @@ pub fn save(dir: &Path, cfg: &CloudConfig) -> Result<(), StoreError> {
     crate::vault::write_atomic(&path, text.as_bytes())
 }
 
+/// 序号在键里占几位。6 位 = 一百万份,以每 30 分钟一份算够用 57 年。
+///
+/// **定宽零填充是硬要求**:「最新那份」= List 结果里序号最大的那条,而
+/// ListObjectsV2 按**字典序**返回 —— 不填充的话 `10` 会排在 `2` 前面。
+const SEQ_WIDTH: usize = 6;
+
+/// 云端对象的扩展名。
+const OBJ_EXT: &str = ".mpk";
+
+/// 一份备份的对象键。
+pub fn object_key(prefix: &str, seq: u64, stamp: &str) -> String {
+    format!("{prefix}{seq:0SEQ_WIDTH$}-{stamp}{OBJ_EXT}")
+}
+
+/// 从对象键里抠出序号。不是我们生成的键 → `None`(跳过,不是错误:
+/// bucket 是用户自己的,里头有什么我们管不着)。
+pub fn parse_seq(prefix: &str, key: &str) -> Option<u64> {
+    let rest = key.strip_prefix(prefix)?;
+    let rest = rest.strip_suffix(OBJ_EXT)?;
+    let (seq, _stamp) = rest.split_once('-')?;
+    if seq.len() != SEQ_WIDTH || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    seq.parse().ok()
+}
+
+/// 下一个该用的序号。**空列表从 1 起** —— 0 与「从没推过」的游标初值撞在
+/// 一起,那两种状态就再也分不开了。
+pub fn next_seq(prefix: &str, keys: &[String]) -> u64 {
+    keys.iter()
+        .filter_map(|k| parse_seq(prefix, k))
+        .max()
+        .map_or(1, |m| m + 1)
+}
+
+/// 这一轮该不该推。**纯函数** —— 时钟由调用方折算成
+/// `minutes_since_last_ok` 传进来(store 不持时钟)。
+///
+/// 判据顺序是有意的:先看开关、再看配置完不完整、再看指纹、最后才看时间。
+/// 「配置没填完」与「指纹没变」在 UI 上要说不同的话,混成一条的话状态栏只能
+/// 报「备份失败」,把真正的原因吃掉。
+pub fn should_upload(cfg: &CloudConfig, now_fingerprint: &str, minutes_since_last_ok: u64) -> bool {
+    if !cfg.enabled {
+        return false;
+    }
+    if cfg.endpoint.is_empty()
+        || cfg.bucket.is_empty()
+        || cfg.access_key_id.is_empty()
+        || cfg.secret_sealed.is_empty()
+    {
+        return false;
+    }
+    if cfg.last_fingerprint == now_fingerprint {
+        return false;
+    }
+    minutes_since_last_ok >= u64::from(cfg.interval_min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +661,126 @@ mod tests {
             "SK-VALUE",
             "重填 SK 也救不回来 —— 那条错误文案是在骗用户"
         );
+    }
+
+    /// 序号必须**零填充定宽**。不填充的话字典序是 `1, 10, 2` ——
+    /// 而「最新那份」= List 结果里序号最大的那条,靠的正是字典序。
+    #[test]
+    fn the_sequence_number_is_zero_padded_so_lexical_order_equals_numeric_order() {
+        let a = object_key("mullion/", 2, "20260915T101500Z");
+        let b = object_key("mullion/", 10, "20260915T101500Z");
+        assert!(a < b, "字典序与数值序不一致:{a} 应该排在 {b} 前面");
+    }
+
+    #[test]
+    fn a_key_round_trips_through_parse() {
+        let k = object_key("mullion/", 42, "20260915T101500Z");
+        assert_eq!(parse_seq("mullion/", &k), Some(42));
+    }
+
+    /// 别人往同一个前缀下丢了别的文件时,不认识的键**跳过**而不是
+    /// 让整次上传失败 —— bucket 是用户自己的,里头有什么我们管不着。
+    #[test]
+    fn a_key_we_do_not_recognise_is_skipped_not_fatal() {
+        assert_eq!(parse_seq("mullion/", "mullion/readme.txt"), None);
+        assert_eq!(parse_seq("mullion/", "other/000001-x.mpk"), None);
+    }
+
+    /// 下一个序号 = 已有的最大值 + 1。**空列表从 1 起**,不是 0 ——
+    /// 0 与「没推过」的游标初值撞在一起,分不出「从没推过」和「推过第 0 份」。
+    #[test]
+    fn the_next_sequence_is_one_past_the_largest_existing() {
+        assert_eq!(next_seq("mullion/", &[]), 1);
+        assert_eq!(
+            next_seq(
+                "mullion/",
+                &[
+                    "mullion/000001-a.mpk".to_string(),
+                    "mullion/000007-b.mpk".to_string(),
+                    "mullion/000003-c.mpk".to_string(),
+                ]
+            ),
+            8
+        );
+    }
+
+    /// 一份**填完整了**的配置。
+    ///
+    /// **`should_upload` 的测试一律用这个,不要用 `cfg()`。** `cfg()` 的
+    /// `access_key_id` / `secret_sealed` 是空的(前一个任务那几条测的是读写往返,
+    /// 不需要填),而 `should_upload` 的第一道闸就是「配置完不完整」——
+    /// 拿 `cfg()` 去测的话,`a_changed_fingerprint_...` 会直接红,而
+    /// `an_unchanged_fingerprint_...` 会**恒绿**:它返回 false 是因为「没填完」,
+    /// 跟指纹判据一点关系都没有,把指纹那一条整个删掉它照样绿。
+    fn ready_cfg() -> CloudConfig {
+        CloudConfig {
+            access_key_id: "AK".into(),
+            secret_sealed: "sealed".into(),
+            ..cfg()
+        }
+    }
+
+    /// 先钉住 `ready_cfg` 真的是「会推」的那一档 —— 否则下面每一条
+    /// `assert!(!should_upload(..))` 都可能是因为别的原因恒假。
+    #[test]
+    fn the_ready_config_is_actually_uploadable() {
+        assert!(
+            should_upload(&ready_cfg(), "brand-new", 999),
+            "ready_cfg 本身就推不动 —— 下面那几条「不推」的断言全都测不到自己想测的东西"
+        );
+    }
+
+    /// 关着的时候永远不推 —— 哪怕内容变了。
+    #[test]
+    fn a_disabled_config_never_uploads() {
+        let mut c = ready_cfg();
+        c.enabled = false;
+        assert!(!should_upload(&c, "new-fp", 999));
+    }
+
+    /// 指纹没变就不推。**这是保住 N 份历史窗口的全部** —— 不判的话每 30 分钟
+    /// 推一份一模一样的包,20 份历史会在 10 小时内被自己刷光。
+    #[test]
+    fn an_unchanged_fingerprint_does_not_upload() {
+        let mut c = ready_cfg();
+        c.last_fingerprint = "same".into();
+        assert!(!should_upload(&c, "same", 999));
+    }
+
+    #[test]
+    fn a_changed_fingerprint_uploads_once_the_interval_has_passed() {
+        let mut c = ready_cfg();
+        c.last_fingerprint = "old".into();
+        c.interval_min = 30;
+        assert!(!should_upload(&c, "new", 29), "还没到点就推了");
+        assert!(should_upload(&c, "new", 30), "到点了却不推");
+    }
+
+    /// 从没推过(指纹为空)时,**到点就推第一份**。
+    /// 若写成「指纹为空 → 不推」,开了开关的用户永远等不到第一份备份。
+    #[test]
+    fn a_config_that_never_uploaded_still_gets_its_first_push() {
+        let mut c = ready_cfg();
+        c.last_fingerprint = String::new();
+        assert!(should_upload(&c, "first", 30));
+    }
+
+    /// 配置不全(endpoint/bucket/AK/SK 任一为空)时不推 —— 推了也只会拿到一条
+    /// 网络错误,而状态栏会把它报成「备份失败」,掩盖真正的原因是「没填完」。
+    ///
+    /// **四个字段逐个试**,不是只试一个:少判任一个的症状都一样(开着开关、
+    /// 每轮都发一次注定 403 的请求),而只试一个的话漏掉的那几个零报错。
+    #[test]
+    fn an_incomplete_config_does_not_upload() {
+        for spoil in ["endpoint", "bucket", "ak", "sk"] {
+            let mut c = ready_cfg();
+            match spoil {
+                "endpoint" => c.endpoint = String::new(),
+                "bucket" => c.bucket = String::new(),
+                "ak" => c.access_key_id = String::new(),
+                _ => c.secret_sealed = String::new(),
+            }
+            assert!(!should_upload(&c, "fp", 999), "{spoil} 为空时不该推");
+        }
     }
 }
