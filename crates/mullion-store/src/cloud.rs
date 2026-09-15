@@ -134,7 +134,12 @@ mod tests {
             "文件名变了指纹没变"
         );
 
-        assert_ne!(fingerprint(&base, b"other"), base_fp, "密文变了指纹没变");
+        // **两份密文必须等长**。原先写的是 `b"secret"`(6) vs `b"other"`(5),
+        // 长度一不同,光靠长度前缀就把它们分开了 —— 于是「把 `h.update(secrets)`
+        // 整句删掉」这个真缺陷照样全绿。实测过这条变异在等长之前杀不掉。
+        // 症状:密文改了但字节数没变(vault 换个 nonce 重写就是这样),
+        // 指纹认为「没变」,这次改动永远推不上去且零报错。
+        assert_ne!(fingerprint(&base, b"secreT"), base_fp, "密文变了指纹没变");
     }
 
     /// 长度前缀**单独守一条**。
