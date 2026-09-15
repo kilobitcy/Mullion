@@ -1483,8 +1483,10 @@ Expected: FAIL，找不到 `seal_with_master` / `StoreError::NoMasterPassword`�
             StoreError::NoMasterPassword => write!(f, "这个操作需要先设置主密码"),
 ```
 
-（若 `StoreError` 用的是 `thiserror`，按该文件既有写法加 `#[error("...")]`，
-**以文件实际形态为准**。）
+（已核实：`error.rs` 是**手写** `Display` + `std::error::Error`，不引 `thiserror`，
+`#[derive(Debug)]` 只有 Debug。所以上面两段照抄即可，**不要**加 `#[error(..)]`。
+加变体后若 `mullion-app` 里某处穷尽 `match` 编不过，补一条分支，**不要**改成 `_ =>`
+把别的变体一起吞掉。）
 
 - [ ] **Step 4: 实现 `Vault` 的两个方法**
 
@@ -1652,6 +1654,24 @@ mod tests {
         assert_ne!(fingerprint(&base, b"other"), base_fp, "密文变了指纹没变");
     }
 
+    /// 长度前缀**单独守一条**。
+    ///
+    /// 上一条测试杀不掉「把三处长度前缀删了」这个变异:`sessions.toml`+`AAA`
+    /// 与 `settings.toml`+`AAA` 直接拼起来本来就不同,改动照样被看见。真正
+    /// 的漏洞是**边界歧义** —— 不加前缀时 `("a","bc")` 与 `("ab","c")` 喂进
+    /// 哈希的字节完全一样。症状:把一段内容从一个文件挪到另一个文件,指纹
+    /// 不变,这次改动永远推不上去且零报错。
+    #[test]
+    fn the_fingerprint_separates_the_name_from_the_body() {
+        let a = vec![crate::portable::PackFile { path: "a".into(), body: "bc".into() }];
+        let b = vec![crate::portable::PackFile { path: "ab".into(), body: "c".into() }];
+        assert_ne!(
+            fingerprint(&a, b"s"),
+            fingerprint(&b, b"s"),
+            "名字与正文的边界没进哈希 —— 内容在文件之间搬家会被漏掉"
+        );
+    }
+
     /// 文件顺序不该影响指纹。`collect_top_level` 今天是定序的,但指纹是
     /// 「内容一样吗」的判据,让它依赖一个可能被重构掉的顺序,等于埋一颗
     /// 「某次无关重构之后每轮都重推」的雷。
@@ -1765,7 +1785,7 @@ pub use cloud::{fingerprint as cloud_fingerprint, CloudConfig, CLOUD_FILE};
 - [ ] **Step 7: 跑测试确认通过**
 
 Run: `cargo test -p mullion-store cloud:: 2>&1 | grep -E "test result|FAILED"`
-Expected: 5 passed。
+Expected: 6 passed。
 
 - [ ] **Step 8: 跑全量确认没碰坏 F46-a**
 
@@ -1786,8 +1806,14 @@ git commit -m "feat(store): 云端载荷的范围与内容指纹 (F272)
 | 变异 | 应该变红的测试 |
 |---|---|
 | `fingerprint` 里 `sorted.sort_by(..)` 删掉 | `the_fingerprint_does_not_depend_on_file_order` |
-| `fingerprint` 里三处长度前缀全删 | `the_fingerprint_changes_when_any_part_changes`（把用例改成 `("ab","c")` vs `("a","bc")` 才杀得掉——若杀不掉就这么改） |
+| 只删 `h.update((f.path.len() ..))` 与 `h.update((f.body.len() ..))` 两处 | `the_fingerprint_separates_the_name_from_the_body` |
 | `h.update(secrets)` 删掉 | `the_fingerprint_changes_when_any_part_changes` |
+
+**`h.update((secrets.len() ..))` 那一处是等价变异,不要为它编守护。** 密文是喂进
+哈希的最后一段,前面每个文件的 path/body 都已带长度前缀,把它的长度删掉产不出
+任何一对可区分的输入 —— 留着它是为了「以后在密文后面再追加字段」时不必回头
+重想边界,不是因为今天有哪条输入靠它分开。跑这条变异会全绿,**那是正确的**,
+别改测试去凑红。
 | `collect_top_level` 里补上 layouts 那一段 | `the_cloud_payload_carries_no_layout_records` |
 | `TOP_LEVEL_FILES` 里加上 `CLOUD_FILE` | `the_cloud_config_file_is_not_in_the_pack_whitelist` |
 
