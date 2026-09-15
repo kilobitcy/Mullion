@@ -24,6 +24,11 @@ pub const CLOUD_FILE: &str = "cloud.toml";
 ///
 /// 排序之后再喂:指纹是「内容一样吗」的判据,让它依赖文件的枚举顺序,等于埋
 /// 一颗「某次无关重构之后每一轮都重推」的雷 —— 而那会把 N 份历史窗口刷光。
+///
+/// **调用方要保证 `path` 互不重复**。`sort_by` 是稳定排序,两条同名不同正文
+/// 的记录排完仍按传入顺序排列,指纹于是又跟顺序挂上钩。今天两个产出路径
+/// (`collect_top_level` 走互不相同的 `TOP_LEVEL_FILES`、`collect` 的
+/// `layouts/*.toml` 按文件名唯一)都构造不出这种输入,所以不加运行期防御。
 pub fn fingerprint(files: &[crate::portable::PackFile], secrets: &[u8]) -> String {
     let mut sorted: Vec<&crate::portable::PackFile> = files.iter().collect();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
