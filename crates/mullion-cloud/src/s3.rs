@@ -78,10 +78,7 @@ impl S3Client {
         // 阿里云 OSS 认 `x-oss-forbid-overwrite`;S3/R2/MinIO 认
         // `If-None-Match: *`。**两个都发** —— 不认识的那个会被忽略,而漏发
         // 任一个都意味着在对应的服务端上完全没有并发保护(且零报错)。
-        let extra = [
-            ("if-none-match", "*"),
-            ("x-oss-forbid-overwrite", "true"),
-        ];
+        let extra = [("if-none-match", "*"), ("x-oss-forbid-overwrite", "true")];
         let auth = sigv4::authorization(
             &sigv4::Request {
                 method: "PUT",
@@ -125,8 +122,11 @@ impl S3Client {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let mut params: Vec<(&str, &str)> =
-                vec![("list-type", "2"), ("prefix", prefix), ("max-keys", MAX_KEYS)];
+            let mut params: Vec<(&str, &str)> = vec![
+                ("list-type", "2"),
+                ("prefix", prefix),
+                ("max-keys", MAX_KEYS),
+            ];
             if let Some(t) = &token {
                 params.push(("continuation-token", t));
             }

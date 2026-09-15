@@ -39,7 +39,9 @@ fn serve(replies: Vec<(u16, String)>) -> (u16, mpsc::Receiver<Seen>) {
         let mut replies = replies.into_iter();
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { break };
-            let Some(seen) = read_request(&mut s) else { break };
+            let Some(seen) = read_request(&mut s) else {
+                break;
+            };
             let _ = tx.send(seen);
             let (code, body) = replies.next().unwrap_or((500, String::new()));
             let resp = format!(
@@ -87,7 +89,14 @@ fn read_request(s: &mut TcpStream) -> Option<Seen> {
     if len > 0 {
         r.read_exact(&mut body).ok()?;
     }
-    Some(Seen { method, path, authorization, body, forbid_overwrite, if_none_match })
+    Some(Seen {
+        method,
+        path,
+        authorization,
+        body,
+        forbid_overwrite,
+        if_none_match,
+    })
 }
 
 fn client(port: u16) -> S3Client {
@@ -99,7 +108,10 @@ fn client(port: u16) -> S3Client {
             // —— path-style 是本地测试唯一走得通的寻址方式。
             path_style: true,
         },
-        Credentials { access_key_id: "AK".into(), secret_access_key: "SK".into() },
+        Credentials {
+            access_key_id: "AK".into(),
+            secret_access_key: "SK".into(),
+        },
         "cn-hangzhou".into(),
         None,
     )
@@ -116,7 +128,8 @@ fn a_put_sends_the_bytes_and_signs_the_request() {
     assert_eq!(seen.path, "/b/mullion/000001-x.mpk");
     assert_eq!(seen.body, b"hello");
     assert!(
-        seen.authorization.starts_with("aws4-hmac-sha256 credential=ak/20260915/cn-hangzhou/s3/"),
+        seen.authorization
+            .starts_with("aws4-hmac-sha256 credential=ak/20260915/cn-hangzhou/s3/"),
         "Authorization 头不对:{}",
         seen.authorization
     );
@@ -149,7 +162,10 @@ fn a_put_always_asks_the_server_to_refuse_overwriting() {
 /// 调用方要靠这个分辨「换个序号重试」和「报失败给用户」。
 #[test]
 fn a_409_becomes_already_exists_not_a_generic_status_error() {
-    let (port, _rx) = serve(vec![(409, "<Error><Code>FileAlreadyExists</Code></Error>".into())]);
+    let (port, _rx) = serve(vec![(
+        409,
+        "<Error><Code>FileAlreadyExists</Code></Error>".into(),
+    )]);
     let e = client(port)
         .put_no_overwrite("k", b"x", "20260915T101500Z")
         .expect_err("409 应该报错");
@@ -164,7 +180,10 @@ fn a_409_becomes_already_exists_not_a_generic_status_error() {
 /// 只报状态码等于把唯一有用的信息扔了。
 #[test]
 fn an_error_response_carries_the_server_message() {
-    let (port, _rx) = serve(vec![(403, "<Error><Code>SignatureDoesNotMatch</Code></Error>".into())]);
+    let (port, _rx) = serve(vec![(
+        403,
+        "<Error><Code>SignatureDoesNotMatch</Code></Error>".into(),
+    )]);
     let e = client(port)
         .put_no_overwrite("k", b"x", "20260915T101500Z")
         .expect_err("403 应该报错");
@@ -187,13 +206,22 @@ fn listing_follows_the_continuation_token_until_it_is_gone() {
     let page2 = "<ListBucketResult><IsTruncated>false</IsTruncated>\
                  <Contents><Key>mullion/000002-b.mpk</Key></Contents></ListBucketResult>";
     let (port, rx) = serve(vec![(200, page1.into()), (200, page2.into())]);
-    let keys = client(port).list_keys("mullion/", "20260915T101500Z").expect("LIST 失败");
+    let keys = client(port)
+        .list_keys("mullion/", "20260915T101500Z")
+        .expect("LIST 失败");
     assert_eq!(
         keys,
-        vec!["mullion/000001-a.mpk".to_string(), "mullion/000002-b.mpk".to_string()]
+        vec![
+            "mullion/000001-a.mpk".to_string(),
+            "mullion/000002-b.mpk".to_string()
+        ]
     );
     let first = rx.recv().expect("第一页请求");
-    assert!(first.path.contains("list-type=2"), "不是 ListObjectsV2:{}", first.path);
+    assert!(
+        first.path.contains("list-type=2"),
+        "不是 ListObjectsV2:{}",
+        first.path
+    );
     let second = rx.recv().expect("没发第二页请求 —— 续页令牌被忽略了");
     assert!(
         second.path.contains("continuation-token=t2"),
