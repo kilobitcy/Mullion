@@ -2466,6 +2466,13 @@ pub struct App {
     /// `should_pop_cloud_error` 去重,不落盘。成功一次就清掉 —— 否则
     /// 「失败→修好→又坏了」的第二次失败会被当成重复而咽掉。
     cloud_last_err: Option<String>,
+    /// F273:连续失败次数。**不落盘** —— 重启清零,而重启是个用户动作,
+    /// 隐含「再试一次」的意思。
+    cloud_fail_streak: u32,
+    /// F273:退避到这个时刻之前不再自动重试(单调毫秒,与
+    /// `cloud_last_check_ms` 同源)。手动点不受它约束 —— 用户明确要求的
+    /// 事情不该被退避拦住。
+    cloud_retry_after_ms: u64,
 }
 
 /// F55:一条传输 job 从入队到落地牵扯到的全部状态。
@@ -3095,6 +3102,8 @@ impl App {
             cloud_in_flight: false,
             cloud_last_check_ms: 0,
             cloud_last_err: None,
+            cloud_fail_streak: 0,
+            cloud_retry_after_ms: 0,
         }
     }
 
@@ -3457,10 +3466,17 @@ impl App {
                 self.apply_password_change(|s| s.set_master_password(&pw), "主密码已生效");
             }
             O::ClearPassword => {
-                self.apply_password_change(
+                // F271/D12:只在**清除成功**之后才碰云配置 —— 清除本身失败的话
+                // (`apply_password_change` 返回 `false`),云端那份配置和密文
+                // 都还是原来能用的状态,不该动,也不能让下面这一步的提示盖掉
+                // 上面那句失败原因。
+                let cleared = self.apply_password_change(
                     crate::shell::store::SessionStore::clear_master_password,
                     "主密码已取消,回到系统钥匙串",
                 );
+                if cleared {
+                    self.disable_cloud_backup_after_clearing_master_password();
+                }
             }
             // F155:设置里点了导出。置位交给每帧的 `drain_export_log_request`
             // 统一处理 —— 两个入口(菜单/设置)共用同一条路径,不复制一遍。
@@ -3546,6 +3562,49 @@ impl App {
         }
     }
 
+    /// F271/D12:清掉主密码之后把云备份开关一起关掉,并明说。
+    ///
+    /// 退回钥匙串方案之后,云端那份包换台机器解不开 —— 云备份的主场景
+    /// 「换新电脑」当场失效,前提没了。不关的话会同时发生两件坏事:
+    /// 定时那条每 60 秒失败一次(状态栏常红),而用户**进设置也关不掉**
+    /// (那一节整节按 `has_master_password` 置灰,连复选框一起),唯一
+    /// 自救路径是把刚清掉的主密码再设回来 —— 一个没有出口的陷阱。
+    ///
+    /// 只在**本来就开着**的时候才动它并追加提示:没开过的用户不该看见
+    /// 一句莫名其妙的「云备份已关闭」。
+    ///
+    /// **只在清除主密码成功时才会被调用**(见调用点 `O::ClearPassword`)——
+    /// 清除失败时这个方法根本不会跑,不存在「盖掉失败提示」的问题。
+    fn disable_cloud_backup_after_clearing_master_password(&mut self) {
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        // 读-改-写:盘上那份打底,只翻 `enabled` 一项。游标与
+        // `secret_sealed` 原样留着 —— 整份覆盖是 F247/F248 的缺陷族,
+        // 而 SK 刚被 `reseal_cloud_secret` 重封过,覆盖掉就再也解不出来了。
+        let mut cfg = mullion_store::cloud::load(&dir);
+        if !cfg.enabled {
+            return;
+        }
+        cfg.enabled = false;
+        match mullion_store::cloud::save(&dir, &cfg) {
+            Ok(()) => self.ui.set_error(
+                "主密码已取消,回到系统钥匙串。云端备份已一并关闭 —— \
+                 钥匙串派生的密钥换台机器解不开,重新设主密码后可再开启"
+                    .into(),
+            ),
+            Err(e) => self.ui.set_error(format!(
+                "主密码已取消,但云端备份开关没关掉:{e} —— \
+                 它会持续尝试并失败,请重新设一次主密码后进设置关掉"
+            )),
+        }
+        // 草稿还开着的话也要跟着翻,否则用户接着点「确定」会把
+        // `enabled = true` 又写回去。
+        if let Some(d) = self.ui.settings_draft.as_mut() {
+            d.cloud_enabled = false;
+        }
+    }
+
     /// F273:起一次云端备份。
     ///
     /// **主线程只做纯 CPU 的那一半**(`cloudsync::prepare`:读四个文件、
@@ -3561,6 +3620,12 @@ impl App {
     /// 用户不知道它起没起作用)。
     fn spawn_cloud_backup(&mut self, manual: bool) {
         if self.cloud_in_flight {
+            // 手动点的那次要给个说法。静默 return 的话用户分不清
+            // 「点了没反应」和「正在传,拒绝了」—— 高延迟代理链路下
+            // 一次上传几十秒,这期间点一下是很自然的动作。
+            if manual {
+                self.ui.set_error("云端备份:上一次还在传,传完再试".into());
+            }
             return;
         }
         let Some(dir) = crate::shell::store::config_dir() else {
@@ -3620,6 +3685,13 @@ impl App {
             self.ui.set_error(format!("云端备份失败:{msg}"));
         }
         self.cloud_last_err = Some(msg);
+        // 退避:与 `drive_cloud_backup` 用同一个时基(`self.now_ms()`,
+        // 自 `self.start` 起算的相对毫秒),别混两种时钟。手动点也会走到
+        // 这里(失败一样要计入连续失败次数),但退避只在 `drive_cloud_backup`
+        // 里被检查 —— 手动那条不受它约束。
+        self.cloud_fail_streak = self.cloud_fail_streak.saturating_add(1);
+        let now_ms = self.now_ms();
+        self.cloud_retry_after_ms = now_ms.saturating_add(cloud_backoff_ms(self.cloud_fail_streak));
     }
 
     /// F273:每帧看一眼该不该起一次定时备份。
@@ -3644,6 +3716,10 @@ impl App {
     /// **T11 那条陷阱**:计时要从「事情真的成了」起算,不是从调用点起算。
     fn drive_cloud_backup(&mut self, now_ms: u64) {
         if self.cloud_in_flight {
+            return;
+        }
+        // 退避闸排在轮询闸之前:连续失败时连读盘算指纹都省了。
+        if now_ms < self.cloud_retry_after_ms {
             return;
         }
         if now_ms.saturating_sub(self.cloud_last_check_ms) < CLOUD_POLL_MS {
@@ -3749,18 +3825,25 @@ impl App {
     }
 
     /// F71:跑一次主密码改动,收尾交给 [`finish_password_change`]。
+    ///
+    /// 返回值:这次改动**是否成功**。F271/D12 的 `O::ClearPassword` 要凭它
+    /// 判断该不该接着去关云备份开关 —— 清除失败时不能碰云配置,也不能让
+    /// 后续的提示盖掉这里已经设好的失败原因。`O::SetPassword` 那一路不看
+    /// 这个返回值,行为一个字没变。
     fn apply_password_change(
         &mut self,
         f: impl FnOnce(&mut crate::shell::store::SessionStore) -> Result<(), mullion_store::StoreError>,
         ok_msg: &str,
-    ) {
+    ) -> bool {
         let Some(store) = self.store.as_mut() else {
             self.ui.set_error("会话库没打开,改不了主密码".to_string());
-            return;
+            return false;
         };
         let r = f(store);
+        let ok = r.is_ok();
         let msg = finish_password_change(self.ui.settings_draft.as_mut(), r, ok_msg);
         self.ui.set_error(msg);
+        ok
     }
 
     /// 把草稿里的值搬进 `self.settings`(字号顺手夹紧)。
@@ -12186,6 +12269,9 @@ impl ApplicationHandler<UserEvent> for App {
                         // 成功一次就把去重记忆清掉 —— 不清的话,
                         // 「失败→修好→又坏了」的第二次失败会被当成重复咽掉。
                         self.cloud_last_err = None;
+                        // 退避同理清零:连续失败次数只对「还没成功过」有意义。
+                        self.cloud_fail_streak = 0;
+                        self.cloud_retry_after_ms = 0;
                     }
                     crate::cloudsync::UploadOutcome::Unchanged => {
                         // 没变不是失败,不动状态栏那一格。
@@ -15598,6 +15684,24 @@ fn should_pop_cloud_error(last: Option<&str>, msg: &str, manual: bool) -> bool {
     manual || last != Some(msg)
 }
 
+/// 连续失败 `streak` 次之后,下一次自动重试要等多久(毫秒)。
+///
+/// 指数退避,封顶一小时。失败不推进游标,所以 `should_upload` 每轮都判真 ——
+/// 没有这道闸的话,一个 AK 填错了的用户会被我们每 60 秒对他自己的 bucket
+/// 发一次注定 403 的请求,永久持续。对象存储按请求计费,这是在花他的钱。
+///
+/// `streak == 0`(刚成功过)返回 0:退避只在连续失败时存在。
+fn cloud_backoff_ms(streak: u32) -> u64 {
+    if streak == 0 {
+        return 0;
+    }
+    const CAP_MS: u64 = 60 * 60 * 1000;
+    // `streak` 大到一定程度 `1 << streak` 会溢出 —— 夹在 20 以内,
+    // 那时早就顶到 CAP 了。
+    let shift = streak.min(20) - 1;
+    (CLOUD_POLL_MS << shift).min(CAP_MS)
+}
+
 /// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
 /// 「距上次输入多少毫秒」,不碰 `&App`,理由同 `sync_timeout_wake_at`(`App`
 /// 在无 GPU/窗口的环境下构造不出来,这几条分支只能靠这条路径单测)。
@@ -16267,19 +16371,20 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
         autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
-        clip_still_matches_what_was_pasted, credential_delete_error, decide_paste, dismiss_areas,
-        dismiss_verdict, download_job, draft_baseline_is_in_vault, drive_attach_checks_of,
-        effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
-        files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
-        has_real_action, history_rows_of, host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of,
-        leaf_identity_of, new_pane_emulator, next_auto_dial, next_panel_selection_index,
-        opt_buf_dirty, pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
-        reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
-        should_check_attach, should_pop_cloud_error, snapshot_tabs_of, sync_plan_of,
-        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        clip_still_matches_what_was_pasted, cloud_backoff_ms, credential_delete_error,
+        decide_paste, dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
+        drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
+        files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
+        font_px_for, has_real_action, history_rows_of, host_for_fresh, ime_cursor_area,
+        ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
+        next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
+        paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback,
+        session_manager_dirty, should_check_attach, should_pop_cloud_error, snapshot_tabs_of,
+        sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
         tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
         AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
+        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
+        DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -24936,6 +25041,31 @@ mod tests {
         );
     }
 
+    /// 在途时手动点不许静默吞掉。
+    ///
+    /// 自证会变红:把 `if manual { .. set_error .. }` 整块删掉,只留
+    /// 光秃秃的 `return`。旧判据(`body.contains("if self.cloud_in_flight {")`)
+    /// 杀不掉这个变异 —— 那道 guard 本身还在,只是不说话了。
+    #[test]
+    fn a_manual_click_while_a_cloud_upload_is_in_flight_says_so() {
+        let body = strip_comments(body_of(prod_src(), "fn spawn_cloud_backup("));
+        let guard = body
+            .find("if self.cloud_in_flight {")
+            .expect("`spawn_cloud_backup` 没有在途闸 —— 会并发起两次上传");
+        let unchanged = body
+            .find("Prepared::Unchanged")
+            .expect("`spawn_cloud_backup` 里没有 Unchanged 分支,这条测试的参照物失效了");
+        let tail = &body[guard..unchanged];
+        assert!(
+            tail.contains("上一次还在传"),
+            "在途闸里没有给手动那次任何说法 —— 用户分不清「点了没反应」和「正在传」:{tail}"
+        );
+        assert!(
+            tail.contains("if manual"),
+            "在途闸的提示没有按 manual 分流 —— 定时那条每 60 秒也会弹一次:{tail}"
+        );
+    }
+
     /// 结果回来时必须把在途标记**归还**。每条出口都要还。
     ///
     /// 这是本项目的常客形状(见 T13 的「hold 每条出口都要归还」):漏一条
@@ -25055,6 +25185,60 @@ mod tests {
         assert!(
             cell_at < gate_at,
             "状态栏赋值出现在去重闸之后或里面 —— 同一条失败第二次发生时那一格不会变红"
+        );
+    }
+
+    /// 退避必须随连续失败次数涨,且封顶,且成功后归零。
+    #[test]
+    fn a_failing_cloud_backup_backs_off_instead_of_hammering_the_bucket() {
+        assert_eq!(cloud_backoff_ms(0), 0, "刚成功过不该有退避");
+        assert_eq!(
+            cloud_backoff_ms(1),
+            CLOUD_POLL_MS,
+            "第一次失败等一个轮询周期"
+        );
+        assert!(
+            cloud_backoff_ms(2) > cloud_backoff_ms(1),
+            "第二次失败没有比第一次等得更久 —— 这不是退避"
+        );
+        assert!(
+            cloud_backoff_ms(5) > cloud_backoff_ms(4),
+            "中段没有继续增长"
+        );
+        // 封顶,且**不溢出、不回绕**:streak 很大时必须仍是那个上限,
+        // 不能变成 0 或一个小数字(那等于退避失效,而且是静默的)。
+        let cap = cloud_backoff_ms(20);
+        assert_eq!(cloud_backoff_ms(64), cap, "大 streak 没有稳在封顶值上");
+        assert_eq!(
+            cloud_backoff_ms(u32::MAX),
+            cap,
+            "streak 顶到 u32::MAX 时退避失效了"
+        );
+        assert!(cap <= 60 * 60 * 1000, "封顶超过一小时");
+    }
+
+    /// 退避闸必须真的接在自动那条路上。
+    ///
+    /// 「量具存在≠接在那条路上」:`cloud_backoff_ms` 写得再对,
+    /// `drive_cloud_backup` 不查 `cloud_retry_after_ms` 就等于没有。
+    #[test]
+    fn the_backoff_is_actually_checked_before_each_scheduled_attempt() {
+        let body = strip_comments(body_of(prod_src(), "fn drive_cloud_backup("));
+        assert!(
+            body.contains("self.cloud_retry_after_ms"),
+            "`drive_cloud_backup` 不看退避 —— 连续失败时照样每 60 秒打一次远端:{body}"
+        );
+    }
+
+    /// 手动那条**不受**退避约束。
+    ///
+    /// 自证会变红:把退避检查复制进 `spawn_cloud_backup`。
+    #[test]
+    fn a_manual_backup_is_not_blocked_by_the_backoff() {
+        let body = strip_comments(body_of(prod_src(), "fn spawn_cloud_backup("));
+        assert!(
+            !body.contains("cloud_retry_after_ms"),
+            "手动点也被退避挡住了 —— 用户明确要求的事情不该被退避拦下:{body}"
         );
     }
 

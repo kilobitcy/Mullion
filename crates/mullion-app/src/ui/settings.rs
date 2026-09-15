@@ -620,7 +620,8 @@ fn cloud(
         ui.label(
             egui::RichText::new(
                 "云端备份需要先设置主密码 —— 钥匙串里的那把钥匙只在这台机器上有效，\
-                 用它封出来的备份换台电脑一个字也解不开。请先在上面的「安全」里设一个。",
+                 用它封出来的备份换台电脑一个字也解不开。请先在上面的「安全」里设一个。\
+                 已经开着的备份仍可在这里关闭。",
             )
             .size(11.0)
             .color(theme::c32(t.fg_muted)),
@@ -628,161 +629,194 @@ fn cloud(
         ui.add_space(SP_S);
     }
 
-    ui.add_enabled_ui(ready, |ui| {
-        form::grid(ui, "settings_cloud", |ui| {
-            ui.label("");
-            if ui
-                .checkbox(&mut draft.cloud_enabled, CLOUD_ENABLED_LABEL)
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+    // F271/D12:门控是**逐控件**的,不是整节一起罩,而且「开启云端备份」
+    // 那颗复选框**故意不受 `ready` 门控**。原因:门控要挡的是「没有主密码
+    // 却填出一份注定失败的配置」,不是「已经开着的备份想关掉」——清掉
+    // 主密码之后云端那份密文换台机器解不开,前提没了,这时用户第一反应
+    // 是回来关掉开关,而这颗复选框要是也灰着,就成了一个没有出口的陷阱
+    // (进设置关不掉,唯一自救路径是把刚清掉的主密码再设回来)。
+    //
+    // 十个受控字段(除开关外全部)各自套 `ui.add_enabled(ready, ..)`;
+    // `ui.end_row()` 全部留在这一层 grid 里,行结构不变 ——
+    // Task 12 的三条守护(逐行绑定/仅 SK 掩码/逐控件带预览)按行数和
+    // 顺序判,换成"两层 grid"会把它们全部拆穿。
+    form::grid(ui, "settings_cloud", |ui| {
+        ui.label("");
+        if ui
+            .checkbox(&mut draft.cloud_enabled, CLOUD_ENABLED_LABEL)
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("Endpoint");
-            if ui
-                .add(egui::TextEdit::singleline(&mut draft.cloud_endpoint).desired_width(w))
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("Endpoint");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_endpoint).desired_width(w),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("Region");
-            if ui
-                .add(egui::TextEdit::singleline(&mut draft.cloud_region).desired_width(w))
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("Region");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_region).desired_width(w),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("Bucket");
-            if ui
-                .add(egui::TextEdit::singleline(&mut draft.cloud_bucket).desired_width(w))
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("Bucket");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_bucket).desired_width(w),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("前缀");
-            if ui
-                .add(egui::TextEdit::singleline(&mut draft.cloud_prefix).desired_width(w))
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("前缀");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_prefix).desired_width(w),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("Access Key ID");
-            if ui
-                .add(egui::TextEdit::singleline(&mut draft.cloud_access_key_id).desired_width(w))
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("Access Key ID");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_access_key_id).desired_width(w),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("Access Key Secret");
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut draft.cloud_secret_new)
-                        .password(true)
-                        .desired_width(w)
-                        .hint_text("留空 = 不改"),
-                )
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("Access Key Secret");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_secret_new)
+                    .password(true)
+                    .desired_width(w)
+                    .hint_text("留空 = 不改"),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("");
-            if ui
-                .checkbox(&mut draft.cloud_path_style, CLOUD_PATH_STYLE_LABEL)
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("");
+        if ui
+            .add_enabled(
+                ready,
+                egui::Checkbox::new(&mut draft.cloud_path_style, CLOUD_PATH_STYLE_LABEL),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            ui.label("保留份数");
-            if ui
-                .add(egui::DragValue::new(&mut draft.cloud_keep).range(1..=200))
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
+        ui.label("保留份数");
+        if ui
+            .add_enabled(
+                ready,
+                egui::DragValue::new(&mut draft.cloud_keep).range(1..=200),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
 
-            // **这一行不能省。** 片一完全不删云端对象(清理是片二的活),
-            // 这个数字存得下、也回得来,但没有任何代码会用它 —— 不说明的话
-            // 它就是一个假开关:用户设成 5,以为云上只会留 5 份,实际一直在涨,
-            // 直到有天发现 bucket 里几百个对象。这类「看得见摸不着的开关」
-            // 本项目在 F265 上刚吃过一次(「灯早就有了,用户根本没注意到」的
-            // 反面:控件早就有了,用户以为它在起作用)。
-            //
-            // 小字用 `.size(11.0)` + `c32(t.fg_muted)`,跟本分节另外两处说明
-            // 以及 `settings.rs` 里其余六处同形。**别改成 `theme::hint_text`**:
-            // 那一层是给 `TextEdit` 的 hint 用的(egui 派生的 weak 色达不到 AA),
-            // 它给的是 `fg_dimmer`,跟并排的两段说明会深浅不一。这个文件里两套
-            // 写法确实并存(6 处 vs 2 处),新写的一律跟多数那套走,
-            // 至少别在同一个分节里混用。
-            ui.label("");
-            ui.label(
-                egui::RichText::new("下一个版本生效：当前版本只往上传，不清理旧份")
-                    .size(11.0)
-                    .color(theme::c32(t.fg_muted)),
-            );
-            ui.end_row();
-
-            ui.label("检查间隔");
-            if ui
-                .add(
-                    egui::DragValue::new(&mut draft.cloud_interval_min)
-                        .range(5..=1440)
-                        .suffix(" 分钟"),
-                )
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
-
-            // SOCKS5 代理。**不补这一格的话 `socks5` 参数就是条死线** ——
-            // `mullion-cloud` 为它开了 ureq 的 `socks-proxy` 特性、
-            // `S3Client::new` 专门收了这个参数,而设计 D15 把「SOCKS 代理
-            // 链路通不通」列进了片一的真机验收项。没有入口就永远传 `None`,
-            // 那条验收项验的是一条从没走过的路。
-            ui.label("SOCKS5 代理");
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut draft.cloud_socks5)
-                        .desired_width(w)
-                        // **hint 里写清不带 `socks5://`**:`S3Client::new` 自己
-                        // 补前缀,用户照直觉填全 URL 的话会拼成
-                        // `socks5://socks5://…` 而当场报「配置不合法」。
-                        .hint_text("127.0.0.1:1080,留空 = 直连"),
-                )
-                .changed()
-            {
-                *out = SettingsOut::Preview;
-            }
-            ui.end_row();
-
-            ui.label("");
-            ui.label(
-                egui::RichText::new(
-                    "整份配置会用主密码派生的密钥加密之后再上传，云上那份是不可读的二进制；\
-                     内容没变就不上传。窗口布局与现场记录不上云（它们是这台机器的属性）。\
-                     建议用 RAM 子账号、只授权这一个 bucket 的这一个前缀。",
-                )
+        // **这一行不能省。** 片一完全不删云端对象(清理是片二的活),
+        // 这个数字存得下、也回得来,但没有任何代码会用它 —— 不说明的话
+        // 它就是一个假开关:用户设成 5,以为云上只会留 5 份,实际一直在涨,
+        // 直到有天发现 bucket 里几百个对象。这类「看得见摸不着的开关」
+        // 本项目在 F265 上刚吃过一次(「灯早就有了,用户根本没注意到」的
+        // 反面:控件早就有了,用户以为它在起作用)。
+        //
+        // 小字用 `.size(11.0)` + `c32(t.fg_muted)`,跟本分节另外两处说明
+        // 以及 `settings.rs` 里其余六处同形。**别改成 `theme::hint_text`**:
+        // 那一层是给 `TextEdit` 的 hint 用的(egui 派生的 weak 色达不到 AA),
+        // 它给的是 `fg_dimmer`,跟并排的两段说明会深浅不一。这个文件里两套
+        // 写法确实并存(6 处 vs 2 处),新写的一律跟多数那套走,
+        // 至少别在同一个分节里混用。
+        ui.label("");
+        ui.label(
+            egui::RichText::new("下一个版本生效：当前版本只往上传，不清理旧份")
                 .size(11.0)
                 .color(theme::c32(t.fg_muted)),
-            );
-            ui.end_row();
-        });
+        );
+        ui.end_row();
+
+        ui.label("检查间隔");
+        if ui
+            .add_enabled(
+                ready,
+                egui::DragValue::new(&mut draft.cloud_interval_min)
+                    .range(5..=1440)
+                    .suffix(" 分钟"),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
+
+        // SOCKS5 代理。**不补这一格的话 `socks5` 参数就是条死线** ——
+        // `mullion-cloud` 为它开了 ureq 的 `socks-proxy` 特性、
+        // `S3Client::new` 专门收了这个参数,而设计 D15 把「SOCKS 代理
+        // 链路通不通」列进了片一的真机验收项。没有入口就永远传 `None`,
+        // 那条验收项验的是一条从没走过的路。
+        ui.label("SOCKS5 代理");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_socks5)
+                    .desired_width(w)
+                    // **hint 里写清不带 `socks5://`**:`S3Client::new` 自己
+                    // 补前缀,用户照直觉填全 URL 的话会拼成
+                    // `socks5://socks5://…` 而当场报「配置不合法」。
+                    .hint_text("127.0.0.1:1080,留空 = 直连"),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
+
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "整份配置会用主密码派生的密钥加密之后再上传，云上那份是不可读的二进制；\
+                     内容没变就不上传。窗口布局与现场记录不上云（它们是这台机器的属性）。\
+                     建议用 RAM 子账号、只授权这一个 bucket 的这一个前缀。",
+            )
+            .size(11.0)
+            .color(theme::c32(t.fg_muted)),
+        );
+        ui.end_row();
     });
     ui.add_space(SP_M);
 }
@@ -1740,6 +1774,35 @@ mod tests {
                 row.contains("*out = SettingsOut::Preview;"),
                 "「{label}」改了不报 Preview —— 保存按钮不会亮,而且不报错:\n{row}"
             );
+        }
+    }
+
+    /// 门控是逐控件的,而且「开启云端备份」这颗**故意在门外**。
+    ///
+    /// 门控的目的是不让没有主密码的用户配出一个注定失败的备份,不是拦住
+    /// 他关掉已经开着的那个。两者一起锁的后果是:清掉主密码之后云备份每
+    /// 60 秒失败一次,而用户进设置也关不掉 —— 唯一出路是把刚清掉的主密码
+    /// 再设回来,一个没有出口的陷阱(设计 D12)。
+    ///
+    /// 遍历 `CLOUD_ROWS` 而不是逐个列举,所以**两种反向变异都杀得掉**:
+    /// 把开关也罩进门控(第一半红),以及将来加一个新字段却忘了给它门控
+    /// (第二半红)。「列举式门控在加档时必然漏」是本项目登记过三次的形状。
+    #[test]
+    fn only_the_enable_toggle_escapes_the_master_password_gate() {
+        let rows = cloud_rows();
+        for (label, field) in CLOUD_ROWS {
+            let row = row_of(&rows, label, field);
+            if *field == "cloud_enabled" {
+                assert!(
+                    !row.contains("add_enabled("),
+                    "「开启云端备份」被罩进了门控 —— 清掉主密码后用户再也关不掉它:{row}"
+                );
+            } else {
+                assert!(
+                    row.contains("add_enabled("),
+                    "`{field}` 这个控件没有门控 —— 没设主密码的用户能填出一份注定失败的配置:{row}"
+                );
+            }
         }
     }
 }
