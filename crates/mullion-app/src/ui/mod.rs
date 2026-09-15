@@ -129,7 +129,18 @@ pub struct UiState {
     /// **不在这里直接导出**:要读整个日志文件再写一个新文件,而 `ui/` 这一层
     /// 零 IO(同 `history_request`)。
     pub export_log_request: bool,
+    /// F273:菜单里点了「立刻备份到云」→ `app.rs` 事后起一次 spawn_blocking 上传。
+    pub cloud_backup_request: bool,
     pub last_error: Option<String>,
+    /// F273:最近一次云端备份的结论,状态栏那一格的数据源。
+    /// `None` = 从没备份过 → 不占格。
+    ///
+    /// **住在 `UiState` 而不是 `App`**:状态栏是从 `ui_state` 和 `UiFrame`
+    /// 两处取料画出来的,而 `ui/mod.rs:961` 那个调用点根本够不着 `App` 的字段。
+    /// 放 `App` 的话这一格只能先传 `None` 占位、等下一个任务再回来接 ——
+    /// 而「占位忘了接」正是本项目登记过的「量具存在≠接在那条路上」。
+    /// 它跟 `last_error` 同性质:一次性的、不落盘的、纯给人看的结论。
+    pub cloud_status: Option<chrome::CloudCell>,
     /// 用户是否关掉了当前这条错误卡片。**只该由 `set_error` 复位** ——
     /// 各处直接写 `last_error` 会绕过复位,导致关掉一次后再也看不到错误。
     pub error_dismissed: bool,
@@ -976,6 +987,8 @@ pub fn build_ui(
             .and_then(|v| v.appearance)
             .and_then(|a| badge::should_paint(a, mullion_store::ColorTarget::StatusBar)),
         frame.selection_path,
+        // F273:云端备份结论,住在 `UiState`(见 `cloud_status` 字段文档)。
+        ui_state.cloud_status.as_ref(),
     );
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
@@ -1288,6 +1301,29 @@ mod tests {
             "新错误必须重新展开卡片,否则用户再也看不到任何错误"
         );
         assert_eq!(st.last_error.as_deref(), Some("第二个错误"));
+    }
+
+    /// F273:状态栏那一格必须**真的接在** `ui_state.cloud_status` 上。
+    ///
+    /// `CloudCell` 画得再对,只要生产调用点传的是字面 `None`,用户就永远
+    /// 看不见备份结论 —— 而编译、测试、clippy 全干净。本项目已登记同一形状
+    /// (「量具存在≠接在那条路上」)。
+    ///
+    /// 扎在 `ui/mod.rs` 上而不是 `chrome.rs`:调用点在那边。
+    ///
+    /// 自证会变红:把那个实参改回 `None`。
+    #[test]
+    fn the_status_bar_is_actually_fed_the_cloud_cell() {
+        let src = include_str!("mod.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(prod.len() < src.len(), "没能切掉测试模块 —— 下面那条会恒真");
+        assert!(
+            prod.contains("ui_state.cloud_status.as_ref()"),
+            "状态栏没接上云备份结论 —— 那一格会永远空着"
+        );
     }
 
     /// F258 的自证:`freeze_lamps` 装填一次之后,后续帧传入不同的 `live`

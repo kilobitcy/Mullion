@@ -124,6 +124,13 @@ pub fn top_menu(
                         ui_state.export_log_request = true;
                         ui.close_menu();
                     }
+                    // F273:手动备份的常驻入口。只有定时的话,用户在
+                    // 「刚改完一堆会话、现在要重装系统」这个语境下没有任何
+                    // 办法让它立刻推一份 —— 而那正是最需要备份的一刻。
+                    if ui.button("立刻备份到云").clicked() {
+                        ui_state.cloud_backup_request = true;
+                        ui.close_menu();
+                    }
                     // F84:设置弹窗(外观 + 快捷键一览)。原先这里挂着两条
                     // 置灰占位,「快捷键」那条不再单独出现 —— 一览表就在设置
                     // 弹窗里,再给它一个入口只会让人以为是两个不同的东西。
@@ -465,6 +472,13 @@ pub fn status_text(panes: usize, connected: bool) -> (String, String) {
     (left, "UTF-8".to_string())
 }
 
+/// F273:状态栏上的云端备份格。`None` = 没配置,**不占格**
+/// (同隧道指示器:每多一格常驻信息,别的信息就少一分被看见的机会)。
+pub struct CloudCell {
+    pub text: String,
+    pub severity: crate::tunnels::Severity,
+}
+
 /// `last_error`(F3 落盘失败等)必须总有个展示位:它可能是在会话管理器/编辑器
 /// 都已关闭之后才产生的(如主机密钥确认后 `ConnectOk` 顺手关掉了会话管理器),
 /// 那两处的 `last_error` 渲染此时根本不会被调用到(复核 A4)。状态栏常驻,
@@ -487,6 +501,8 @@ pub fn status_bar(
     session_color: Option<egui::Color32>,
     // F242:当前选中的那条路径。`None` = 不占格,同 `tunnel` 那条的理由。
     selection_path: Option<&crate::files::reveal::StatusPath>,
+    // F273:云端备份结论。`None` = 没配置,不占格(同 `tunnel` 那条的理由)。
+    cloud: Option<&CloudCell>,
 ) {
     let (left, right) = status_text(panes, connected);
     let bar = egui::TopBottomPanel::bottom("status")
@@ -552,6 +568,19 @@ pub fn status_bar(
                         annotate::mark(ui.ctx(), "状态栏/隧道指示器", r.rect);
                         ui.separator();
                     }
+                    // F273:云端备份排在隧道之后。**失败必须看得见** ——
+                    // 「静默失败」是备份功能唯一致命的失败模式:用户以为有
+                    // 备份,直到需要它的那天才发现没有。
+                    if let Some(c) = cloud {
+                        let color = match c.severity {
+                            crate::tunnels::Severity::Calm => t.fg_muted,
+                            crate::tunnels::Severity::Warn => t.warn,
+                            crate::tunnels::Severity::Danger => t.danger,
+                        };
+                        let r = ui.colored_label(theme::c32(color), &c.text);
+                        annotate::mark(ui.ctx(), "状态栏/云端备份", r.rect);
+                        ui.separator();
+                    }
                     ui.colored_label(theme::c32(t.fg_faint), right);
                 });
             });
@@ -603,6 +632,39 @@ mod tests {
         assert!(
             prod.contains("if ui.button(\"导出脱敏日志…\").clicked() {"),
             "「配置」菜单里没有导出脱敏日志的常驻入口"
+        );
+    }
+
+    /// F273:「配置」菜单里必须有一个**常驻的手动备份入口**。
+    ///
+    /// 只有定时的话,用户在「我刚改完一堆会话，现在要重装系统」这个语境下
+    /// 没有任何办法让它立刻推一份 —— 而那正是最需要备份的一刻。
+    ///
+    /// **扎的是源码结构**(菜单项要展开 `menu_button` 才画得出来,跑帧测不到),
+    /// 且**先切掉测试模块**再找 needle —— `include_str!` 拿到的是含这条测试
+    /// 自己的全文。`str::split` 找不到分隔符时会把整串原样还回来,所以额外
+    /// 钉一条「切完确实变短了」的兜底。
+    ///
+    /// 照抄同文件 `the_settings_menu_has_a_permanent_entry_to_export_the_redacted_log`
+    /// 的形态。**刻意不用同文件另一条(F156 那条)的「靠行首缩进躲开自己」写法**:
+    /// 那招能成立只是因为测试体里的 needle 带反斜杠转义、字节恰好与生产代码不同,
+    /// 一旦有人把它抽成常量或改写成 raw string 就当场恒真。
+    ///
+    /// 自证会变红:把 `chrome.rs` 里「立刻备份到云」那个菜单项删掉。
+    #[test]
+    fn the_config_menu_has_a_permanent_entry_to_back_up_now() {
+        let src = include_str!("chrome.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面这条断言会恒真"
+        );
+        assert!(
+            prod.contains("if ui.button(\"立刻备份到云\").clicked() {"),
+            "「配置」菜单里没有手动备份入口"
         );
     }
 
@@ -662,6 +724,7 @@ mod tests {
                 None,
                 session_color,
                 None,
+                None,
             );
         });
         let out = ctx.run(Default::default(), |ctx| {
@@ -675,6 +738,7 @@ mod tests {
                 None,
                 session_color,
                 None,
+                None,
             );
         });
         count_shapes(&out.shapes)
@@ -686,6 +750,7 @@ mod tests {
         automation: Option<&str>,
         tunnel: Option<&crate::tunnels::Indicator>,
         selection_path: Option<&crate::files::reveal::StatusPath>,
+        cloud: Option<&CloudCell>,
     ) -> Vec<String> {
         let ctx = egui::Context::default();
         let mut acc = Vec::new();
@@ -702,6 +767,7 @@ mod tests {
                     tunnel,
                     None,
                     selection_path,
+                    cloud,
                 );
             });
             acc.clear();
@@ -725,7 +791,7 @@ mod tests {
             text: "隧道 1/2 ↻".to_string(),
             severity: crate::tunnels::Severity::Warn,
         };
-        let texts = status_texts(Some("自动化已就绪"), Some(&ind), None);
+        let texts = status_texts(Some("自动化已就绪"), Some(&ind), None, None);
         let pos = |needle: &str| {
             texts
                 .iter()
@@ -743,7 +809,7 @@ mod tests {
     /// 看见的机会;而「你配了但没开」这件事在会话管理器里看就够了。
     #[test]
     fn status_bar_has_no_tunnel_indicator_when_none_configured() {
-        let texts = status_texts(None, None, None);
+        let texts = status_texts(None, None, None, None);
         assert!(
             !texts.iter().any(|s| s.contains("隧道")),
             "没有在跑的隧道时不该占一格:{texts:?}"
@@ -764,7 +830,7 @@ mod tests {
             to: Some("node-b".to_string()),
             path: "/data/x.rs".to_string(),
         };
-        let texts = status_texts(None, None, Some(&sp));
+        let texts = status_texts(None, None, Some(&sp), None);
         let pos = |needle: &str| {
             texts
                 .iter()
@@ -783,11 +849,54 @@ mod tests {
     /// 就少一分被看见的机会。
     #[test]
     fn nothing_selected_means_no_path_cell_at_all() {
-        let texts = status_texts(None, None, None);
+        let texts = status_texts(None, None, None, None);
         assert_eq!(
             texts.iter().filter(|s| s.contains('·')).count(),
             1,
             "只该有左栏那一处 `·`:{texts:?}"
+        );
+    }
+
+    /// 状态栏的云指示器在**没配置时不占格**(同隧道指示器那条理由:
+    /// 每多一格常驻信息,别的信息就少一分被看见的机会)。
+    ///
+    /// **判据是两态的条数差,不只是「没有『云』字」。** 只判没有「云」字的话,
+    /// 「`None` 时画一个空标签」这条变异逃得掉 —— 空串里当然没有「云」,
+    /// 而格子实实在在占掉了。条数差把「根本没画」(差 0)、「画了」(差 1)、
+    /// 「跟着多画了别的」(差 ≥2)三种分开。
+    #[test]
+    fn the_cloud_cell_is_absent_when_cloud_backup_is_off() {
+        let off = status_texts(None, None, None, None);
+        let cell = CloudCell {
+            text: "云 已备份 #1".into(),
+            severity: crate::tunnels::Severity::Calm,
+        };
+        let on = status_texts(None, None, None, Some(&cell));
+        assert!(
+            !off.iter().any(|t| t.contains("云")),
+            "关着的时候还占了一格:{off:?}"
+        );
+        assert_eq!(
+            on.len(),
+            off.len() + 1,
+            "开关两态画出来的文字条数应该正好差一条。差 0 = 那一格根本没画;\
+             差 ≥2 = 有别的东西跟着变了。off={off:?} on={on:?}"
+        );
+    }
+
+    /// 配了就必须画出来,而且**失败要看得见**。
+    /// 「静默失败」是备份功能唯一致命的失败模式 —— 用户以为有备份,直到需要
+    /// 它的那天才发现没有。
+    #[test]
+    fn a_failing_cloud_backup_is_shown_in_the_status_bar() {
+        let cell = CloudCell {
+            text: "云 备份失败".into(),
+            severity: crate::tunnels::Severity::Danger,
+        };
+        let texts = status_texts(None, None, None, Some(&cell));
+        assert!(
+            texts.iter().any(|t| t.contains("备份失败")),
+            "备份失败没出现在状态栏:{texts:?}"
         );
     }
 
@@ -817,6 +926,7 @@ mod tests {
                     &crate::theme::MULLION_DARK,
                     1,
                     true,
+                    None,
                     None,
                     None,
                     None,
