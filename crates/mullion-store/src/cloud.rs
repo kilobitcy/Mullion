@@ -180,13 +180,18 @@ pub fn load(dir: &Path) -> CloudConfig {
 
 /// 写 `cloud.toml`。
 pub fn save(dir: &Path, cfg: &CloudConfig) -> Result<(), StoreError> {
+    let path = dir.join(CLOUD_FILE);
     if cfg.corrupt {
-        return Err(StoreError::CorruptSecrets(
-            "cloud.toml 读不懂,拒绝回写 —— 先把它改好或删掉".into(),
-        ));
+        // **文案里必须带完整路径**:这条错会直接显示在设置弹窗上,而用户唯一的
+        // 自救办法是去删掉这个文件。只说文件名的话,普通用户在 `%APPDATA%`
+        // 底下根本找不到它 —— 设置弹窗本身没有「重置云配置」这个动作(片二)。
+        return Err(StoreError::CorruptSecrets(format!(
+            "{} 读不懂,拒绝回写 —— 先把它改好或删掉",
+            path.display()
+        )));
     }
     let text = toml::to_string_pretty(cfg)?;
-    crate::vault::write_atomic(&dir.join(CLOUD_FILE), text.as_bytes())
+    crate::vault::write_atomic(&path, text.as_bytes())
 }
 
 #[cfg(test)]
@@ -375,9 +380,13 @@ mod tests {
         std::fs::write(dir.path().join(CLOUD_FILE), "这不是 toml { [").expect("写坏文件");
         let c = load(dir.path());
         assert!(!c.enabled, "读不懂的配置必须当成关着的");
+        let err =
+            save(dir.path(), &c).expect_err("读坏之后还允许回写 —— 那会把用户的 AK/SK 静默抹掉");
+        // 文案里必须有**目录**,不能只有文件名。断言写成 `contains(CLOUD_FILE)`
+        // 是恒绿的 —— 老文案里就字面写着 "cloud.toml"。
         assert!(
-            save(dir.path(), &c).is_err(),
-            "读坏之后还允许回写 —— 那会把用户的 AK/SK 静默抹掉"
+            err.to_string().contains(&dir.path().display().to_string()),
+            "错误文案里没有目录,用户在 %APPDATA% 底下找不到该删哪个文件:{err}"
         );
         // 标记**不许寄生在数据字段上**:设置弹窗把 `endpoint` 直接绑到文本框,
         // 用户改一下就把标记冲掉,`save` 当场放行、`secret_sealed` 被抹。
@@ -417,6 +426,45 @@ mod tests {
                     .unwrap()
                     .contains("last_seq"),
             "游标漏进了 settings.toml —— 那个文件会被导入的包整份替换掉"
+        );
+    }
+
+    /// 缺字段**必须**按默认值读进来,不算损坏 —— 这是**有意的**版本兼容合约。
+    ///
+    /// 复核时有人提议把关键字段改成「缺了就判 corrupt」,理由是「缺
+    /// `secret_sealed` 会被 `save` 写回空串」。那条修法是错的:我们每个切片都在
+    /// 往这个结构体加字段(`socks5` 就是这个切片加的),一旦缺字段判损坏,
+    /// **上一版写出来的 `cloud.toml` 在这一版眼里全是坏的** —— 用户升级一次就得
+    /// 把云配置重填一遍,而且报的是「读不懂,拒绝回写」这种看不出原因的话。
+    ///
+    /// 至于「写回空串会抹掉 SK」:那一行已经**不在盘上**了,`load` 本来就没东西
+    /// 可还原。这跟 F247/F248 不一样 —— 那里的前提是「另一份内存副本手上有更新
+    /// 的数据」,这里没有第二个写者(`vault::write_atomic` 是 tmp+rename,我们
+    /// 自己写不出半截文件)。
+    ///
+    /// 这条同时补上三个 serde 默认函数的覆盖:上面那条「没有文件」走的是
+    /// `CloudConfig::default()`,**碰不到 `#[serde(default = "..")]` 指的那几个
+    /// 函数**,于是把 `default_interval()` 改成返回 999999 也能全绿(复核实测过)。
+    #[test]
+    fn a_file_written_by_an_older_version_still_loads_with_defaults() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        // 只写两行 —— 模拟一份「还不认识后来才加的字段」的老文件。
+        std::fs::write(
+            dir.path().join(CLOUD_FILE),
+            "enabled = true\nbucket = \"b\"\n",
+        )
+        .expect("写老文件");
+        let c = load(dir.path());
+        assert!(
+            c.enabled,
+            "缺字段被当成了损坏 —— 老版本写的配置升级一次就全废了"
+        );
+        assert_eq!(c.bucket, "b");
+        assert_eq!(c.prefix, DEFAULT_PREFIX, "prefix 的 serde 默认没接上");
+        assert_eq!(c.keep, DEFAULT_KEEP, "keep 的 serde 默认没接上");
+        assert_eq!(
+            c.interval_min, DEFAULT_INTERVAL_MIN,
+            "interval_min 的 serde 默认没接上 —— 定时器周期会变成一个谁也没写过的值"
         );
     }
 }
