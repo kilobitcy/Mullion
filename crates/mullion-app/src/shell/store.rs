@@ -97,6 +97,15 @@ impl SessionStore {
         self.vault.list()
     }
 
+    /// F270:借出底下的 `Vault`,给云端备份封载荷用。
+    ///
+    /// **只读借用**(`&self`)。云备份那条路上要 vault 做两件纯 CPU 的事
+    /// (封整包、解 SK),都不写盘;开成 `&mut` 的话调用点会需要一个可变
+    /// 借用,而它跟同一帧里读 `store.list()` 的地方冲突。
+    pub fn vault(&self) -> &mullion_store::Vault {
+        &self.vault
+    }
+
     pub fn add(&mut self, draft: SessionDraft, now_rfc3339: &str) -> SessionId {
         self.vault.add(draft, now_rfc3339)
     }

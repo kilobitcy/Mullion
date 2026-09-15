@@ -380,6 +380,12 @@ pub enum UserEvent {
         clip: crate::files::clip::RemoteClip,
         result: Result<Vec<mullion_ssh::sftp::RemotePath>, String>,
     },
+    /// F273:一次云端备份跑完了(成功/没变/失败都走这一条)。
+    ///
+    /// **三种结局共用一个变体**:在途标记的归还只能有一处,分成三个变体
+    /// 就变成三处各归还一次 —— 而「漏一条出口」是本项目的常客形状,
+    /// 漏掉之后**永远**不再备份且零报错。
+    CloudBackupDone(crate::cloudsync::UploadOutcome),
 }
 
 /// F219:一次远端写操作**成功之后**还要做的事。
@@ -511,6 +517,14 @@ struct ProjectTakeover {
 /// 时长是**猜的**,要人工调:太短会在慢链路上误报,太长则提示来得毫无意义
 /// (用户早就自己看出来了)。
 const ATTACH_CHECK_GRACE: Duration = Duration::from_secs(4);
+
+/// F273:定时备份**多久看一眼盘**。与用户配的 `interval_min` 是两回事 ——
+/// 那个归 `cloud::should_upload` 管,这个只为不每帧去读那四个文件算指纹。
+///
+/// 取一分钟:算一次指纹是读几十 KB + 一次 sha256(微秒级),一分钟一次在
+/// profile 行里看不见;而它决定的是「到点之后最晚多久会真的推出去」,
+/// 再长就会让用户点完设置等半天看不到动静。
+const CLOUD_POLL_MS: u64 = 60_000;
 
 /// F163:一条在途的 attach 校验。
 struct AttachCheck {
@@ -2433,6 +2447,21 @@ pub struct App {
     attach_checks: Vec<AttachCheck>,
     /// F224:正等用户拍板要不要把别处的客户端踢下线的那次打开。
     project_takeover: Option<ProjectTakeover>,
+    /// F273:有一次云端备份在途。**必须有这道闸**:定时器每 30 分钟塞一个,
+    /// 而一次高延迟上传可能跑几分钟 —— 没闸的话手动点几下就能攒出一串
+    /// 并发上传,它们互相撞号(ForbidOverwrite),表现成「备份时好时坏」。
+    cloud_in_flight: bool,
+    /// F273:上次**看盘**的时刻。**是 `self.now_ms()` 的时基**(自 `self.start`
+    /// 起算的相对毫秒),不是 unix 时间。
+    ///
+    /// 它节流的只是 [`CLOUD_POLL_MS`] 这一层「多久读一次那四个文件算指纹」,
+    /// **不是用户配的备份间隔** —— 后者归 `cloud::should_upload` 管,
+    /// 从持久化的 `cfg.last_ok_at` 起算。
+    ///
+    /// 两者不能合并成一个:合并之后间隔的起算点就成了「本进程上次看盘」
+    /// 而不是「上次真的推成」,一个开开关关的用户每次启动都会立刻推一份,
+    /// 把 keep 份历史窗口按开机次数刷光(T11:计时从「事情真的成了」起算)。
+    cloud_last_check_ms: u64,
 }
 
 /// F55:一条传输 job 从入队到落地牵扯到的全部状态。
@@ -3059,6 +3088,8 @@ impl App {
             edit: EditState::new(),
             attach_checks: Vec::new(),
             project_takeover: None,
+            cloud_in_flight: false,
+            cloud_last_check_ms: 0,
         }
     }
 
@@ -3282,9 +3313,18 @@ impl App {
     fn sync_settings_dialog(&mut self) {
         if self.ui.settings_open {
             if self.ui.settings_draft.is_none() {
-                self.ui.settings_draft = Some(crate::ui::settings::SettingsDraft::from_settings(
-                    &self.settings,
-                ));
+                // F271:云配置在**另一个文件**里(`cloud.toml` 不进迁移包),
+                // 所以草稿要从两个来源起手。读不到配置目录时退回 `Default`——
+                // 那种情况下云端分节全空,而「确定」那一步同样拿不到目录、
+                // 不会写出任何东西,两端一致。
+                let cloud = crate::shell::store::config_dir()
+                    .map(|d| mullion_store::cloud::load(&d))
+                    .unwrap_or_default();
+                self.ui.settings_draft =
+                    Some(crate::ui::settings::SettingsDraft::from_settings_and_cloud(
+                        &self.settings,
+                        &cloud,
+                    ));
                 // 预览是真的改 `self.settings`,原值不另存一份,「取消」就回不去了。
                 self.settings_backup = Some(self.settings.clone());
                 self.settings_families = self
@@ -3390,6 +3430,7 @@ impl App {
                 if let Err(e) = saved {
                     self.ui.set_error(format!("设置没能存下来:{e}"));
                 }
+                self.save_cloud_draft();
                 self.ui.settings_open = false;
             }
             O::Cancel => {
@@ -3422,6 +3463,196 @@ impl App {
                 self.ui.export_log_request = true;
             }
         }
+    }
+
+    /// F271:把设置弹窗里的云端分节写进 `cloud.toml`。
+    ///
+    /// **单独一个方法,不是揉进 `O::Commit`**:这段要同时碰
+    /// `self.ui.settings_draft`(**可变** —— SK 存完必须清掉)、`self.store`
+    /// (借 vault)和 `self.ui.set_error`(又一次 `&mut self.ui`)。揉在一起
+    /// 会撞借用检查。先把要用的几项**克隆成局部量**,借用就都断干净了。
+    ///
+    /// 云配置落的是**另一个文件** —— `cloud.toml` 刻意不在
+    /// `portable::TOP_LEVEL_FILES` 里(设计 D11),所以它不跟着 `settings.toml`
+    /// 那条三方合并的路走。
+    fn save_cloud_draft(&mut self) {
+        let Some(d) = self.ui.settings_draft.as_ref() else {
+            return;
+        };
+        let enabled = d.cloud_enabled;
+        let endpoint = d.cloud_endpoint.clone();
+        let region = d.cloud_region.clone();
+        let bucket = d.cloud_bucket.clone();
+        let prefix = d.cloud_prefix.clone();
+        let path_style = d.cloud_path_style;
+        let keep = d.cloud_keep;
+        let interval_min = d.cloud_interval_min;
+        let socks5 = d.cloud_socks5.clone();
+        let access_key_id = d.cloud_access_key_id.clone();
+        let secret_new = d.cloud_secret_new.clone();
+
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        // 读-改-写:盘上那份打底,只盖弹窗管的那几项。游标
+        // (`last_seq` / `last_fingerprint` / `last_ok_at`)与已封好的
+        // `secret_sealed` 必须原样留着 —— 整份覆盖是 F247/F248 的缺陷族。
+        let mut cfg = mullion_store::cloud::load(&dir);
+        cfg.enabled = enabled;
+        cfg.endpoint = endpoint;
+        cfg.region = region;
+        cfg.bucket = bucket;
+        cfg.prefix = prefix;
+        cfg.path_style = path_style;
+        cfg.keep = keep;
+        cfg.interval_min = interval_min;
+        cfg.socks5 = socks5;
+        cfg.access_key_id = access_key_id;
+
+        // SK 空 = 不改 —— 每次打开设置都要重打一遍 30 位密钥,
+        // 等于在逼用户把它记在别处。
+        let mut sk_err = None;
+        if !secret_new.is_empty() {
+            match self.store.as_ref() {
+                Some(s) => {
+                    if let Err(e) =
+                        mullion_store::cloud::set_secret_key(&mut cfg, s.vault(), &secret_new)
+                    {
+                        sk_err = Some(format!("保存 Access Key Secret 失败:{e}"));
+                    }
+                }
+                None => sk_err = Some("会话库还没打开,Access Key Secret 没能保存".into()),
+            }
+            // **不管成没成都清掉**:失败时留着的话,下一次点确定会拿同一个
+            // 明文再试一遍,而用户以为自己早就改过了;而且那串明文会一直
+            // 躺在草稿里等着被截图。
+            if let Some(d) = self.ui.settings_draft.as_mut() {
+                d.cloud_secret_new.clear();
+            }
+        }
+
+        let save_err = mullion_store::cloud::save(&dir, &cfg)
+            .err()
+            .map(|e| format!("保存云端备份配置失败:{e}"));
+        // `set_error` 只留最后一条 —— 两条分别发的话第一条会被静默吃掉。
+        let msgs: Vec<String> = [sk_err, save_err].into_iter().flatten().collect();
+        if !msgs.is_empty() {
+            self.ui.set_error(msgs.join(" / "));
+        }
+    }
+
+    /// F273:起一次云端备份。
+    ///
+    /// **主线程只做纯 CPU 的那一半**(`cloudsync::prepare`:读四个文件、
+    /// 一次 sha256、一次 XChaCha20,微秒级),网络那一半挖进 `spawn_blocking`。
+    /// 拆两半的根由是 `Vault` 搬不进线程 —— 见 `cloudsync` 的模块文档。
+    ///
+    /// 已有在途的就**直接回**(不排队:排队等于把「已经过时的那一份」推上去,
+    /// 而下一轮会立刻再推一份新的)。
+    ///
+    /// `manual` = 用户从菜单点的。**只影响「没变」时说不说话**:定时那条
+    /// 每半小时静悄悄地不做事是对的,而用户主动点了「立刻备份到云」却什么
+    /// 都不发生,就是「点了没反应」(F265 记过同一形状:功能在那儿,
+    /// 用户不知道它起没起作用)。
+    fn spawn_cloud_backup(&mut self, manual: bool) {
+        if self.cloud_in_flight {
+            return;
+        }
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        let cfg = mullion_store::cloud::load(&dir);
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let stamp_rfc3339 = now_rfc3339();
+        let stamp_compact = now_compact();
+        let payload = match crate::cloudsync::prepare(&dir, store.vault(), &cfg, &stamp_rfc3339) {
+            crate::cloudsync::Prepared::Unchanged => {
+                if manual {
+                    self.ui
+                        .set_error("云端备份:内容没变,没有需要上传的改动".into());
+                }
+                return;
+            }
+            crate::cloudsync::Prepared::Failed(msg) => {
+                self.ui.set_error(format!("云端备份失败:{msg}"));
+                return;
+            }
+            crate::cloudsync::Prepared::Ready(p) => p,
+        };
+        self.cloud_in_flight = true;
+        let proxy = self.proxy.clone();
+        // **必须 spawn_blocking**:mullion-cloud 是阻塞式的,在事件循环里
+        // 同步跑一次高延迟往返就能把帧率打到零(T3/T7)。
+        //
+        // **走 `self._runtime` 这个句柄,不要用自由函数 `tokio::task::spawn_blocking`**:
+        // GUI 线程不在 runtime 上下文里(同 `app.rs:11017` 那处 `_runtime.enter()`
+        // 的理由),自由函数形态会在运行期直接 panic —— 而且编译得过、
+        // 测试全绿,只有真机上第一次备份才炸。
+        self._runtime.spawn_blocking(move || {
+            let outcome =
+                crate::cloudsync::upload_blocking(payload, &cfg, &stamp_compact, &stamp_rfc3339);
+            let _ = proxy.send_event(UserEvent::CloudBackupDone(outcome));
+        });
+    }
+
+    /// F273:每帧看一眼该不该起一次定时备份。
+    ///
+    /// **该不该推这个判断整个交给 [`mullion_store::cloud::should_upload`]**,
+    /// 这里不自己写闸。自己写的话必然只写到「开着 + 到点了」这两道 ——
+    /// 而它四道闸里最要紧的是**配置完整性**:开着开关但 endpoint 或 AK 没填完
+    /// 的用户,每一轮都会发一次注定 403 的请求,状态栏报一句「云端备份失败」,
+    /// 把真正的原因(「还没填完」)吃掉。少调它还有第二重后果:那个函数的
+    /// 六条测试会全部变成没人调用的死代码 —— 本项目登记过的
+    /// 「量具存在≠接在那条路上」。
+    ///
+    /// 两层节流是**两回事,别合并**:
+    ///
+    /// - [`CLOUD_POLL_MS`] 是「多久看一眼盘」,固定值,只为不每帧去读那四个
+    ///   文件算指纹。
+    /// - `cfg.interval_min` 是**用户配的备份间隔**,归 `should_upload` 管。
+    ///
+    /// 合成一个(照 `interval_min` 来轮询)的话,间隔的起算点就变成了
+    /// 「本进程上次看盘的时刻」,而不是「上次成功推上去的时刻」—— 一个开开
+    /// 关关的用户每次启动都会立刻推一份,把 keep 份历史窗口刷光。这正是
+    /// **T11 那条陷阱**:计时要从「事情真的成了」起算,不是从调用点起算。
+    fn drive_cloud_backup(&mut self, now_ms: u64) {
+        if self.cloud_in_flight {
+            return;
+        }
+        if now_ms.saturating_sub(self.cloud_last_check_ms) < CLOUD_POLL_MS {
+            return;
+        }
+        self.cloud_last_check_ms = now_ms;
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        let cfg = mullion_store::cloud::load(&dir);
+        // 开关那一道也在 `should_upload` 里,但这里先挡一下:关着的时候
+        // 连指纹都不必算(读四个文件),而绝大多数用户是关着的。
+        if !cfg.enabled {
+            return;
+        }
+        // 算不出指纹 = `secrets.enc` 在但读不出来。**这一轮跳过**,不能
+        // 按「secrets 为空」那一版指纹继续 —— 那会推一份密文段是空的备份
+        // 上去,还把游标推进了(见 `cloudsync::read_secrets`)。只记日志
+        // 不弹状态栏:多半是杀软/IO 的瞬时问题,下一轮就好了。
+        let fp = match crate::cloudsync::fingerprint_now(&dir) {
+            Ok(fp) => fp,
+            Err(e) => {
+                log::warn!("云端备份:算不出内容指纹,这一轮跳过:{e}");
+                return;
+            }
+        };
+        let since = crate::cloudsync::minutes_since_last_ok(
+            &cfg.last_ok_at,
+            time::OffsetDateTime::now_utc(),
+        );
+        if !mullion_store::cloud::should_upload(&cfg, &fp, since) {
+            return;
+        }
+        self.spawn_cloud_backup(false);
     }
 
     /// F155:把**本实例的**日志脱敏后另存一份,并把路径告诉用户。
@@ -8595,6 +8826,7 @@ impl App {
         self.drive_automation();
         self.drive_attach_checks();
         self.drive_project_visits();
+        self.drive_cloud_backup(now);
     }
 
     /// F224:项目的「最后访问时间」。每帧调,但**只在跃迁那一帧写盘**。
@@ -11900,6 +12132,46 @@ impl ApplicationHandler<UserEvent> for App {
                 self.accept_paste_check(generation, seq, dst, clip, result);
                 self.request_ui_redraw();
             }
+            UserEvent::CloudBackupDone(outcome) => {
+                // 在途标记**只在这一处归还**,且这个分支里没有任何提前 return
+                // —— 漏一条出口的后果是之后永远不再备份,且零报错(T13 同族)。
+                self.cloud_in_flight = false;
+                // **`App` 没有 `config_dir` 字段**,走自由函数(见本任务末尾
+                // 「已核实的字段来源」)。
+                let dir = crate::shell::store::config_dir();
+                match outcome {
+                    crate::cloudsync::UploadOutcome::Ok {
+                        fingerprint,
+                        seq,
+                        at,
+                    } => {
+                        if let Some(d) = dir {
+                            let mut cfg = mullion_store::cloud::load(&d);
+                            crate::cloudsync::record_success(&mut cfg, &fingerprint, seq, &at);
+                            if let Err(e) = mullion_store::cloud::save(&d, &cfg) {
+                                log::warn!("云端备份游标写回失败:{e}");
+                            }
+                        }
+                        // 结论写进 `self.ui`,不是 `App` —— 状态栏那一格
+                        // (`ui/mod.rs:961`)读的就是这里,Task 13 已经接死。
+                        self.ui.cloud_status = Some(crate::ui::chrome::CloudCell {
+                            text: format!("云 已备份 #{seq}"),
+                            severity: crate::tunnels::Severity::Calm,
+                        });
+                    }
+                    crate::cloudsync::UploadOutcome::Unchanged => {
+                        // 没变不是失败,不动状态栏那一格。
+                    }
+                    crate::cloudsync::UploadOutcome::Failed(msg) => {
+                        log::warn!("云端备份失败:{msg}");
+                        self.ui.cloud_status = Some(crate::ui::chrome::CloudCell {
+                            text: "云 备份失败".into(),
+                            severity: crate::tunnels::Severity::Danger,
+                        });
+                        self.ui.set_error(format!("云端备份失败:{msg}"));
+                    }
+                }
+            }
         }
     }
 
@@ -14026,6 +14298,12 @@ impl ApplicationHandler<UserEvent> for App {
                         UserEvent::PackPicked,
                     );
                 }
+                // F273:菜单里点的「立刻备份到云」。`take` 而不是只读:
+                // 只读的话这个 bool 永远是 `true`,在途标记一还回来下一帧
+                // 就再起一次,变成无限重传。同 `pack_pick_request` 的写法。
+                if std::mem::take(&mut self.ui.cloud_backup_request) {
+                    self.spawn_cloud_backup(true);
+                }
                 // 连接:双击行 / 点「连接」。必须在 store 的 &mut 借用结束后调
                 // (下面 `self.store.as_ref()` 的临时借用在 match 表达式求值完就
                 // 释放,故可紧接着调 self.spawn_connect)。
@@ -15250,8 +15528,32 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | TransferDone { .. }
         | EditOpened { .. }
         | EditSaved { .. }
-        | PasteChecked { .. } => true,
+        | PasteChecked { .. }
+        | CloudBackupDone(_) => true,
     }
+}
+
+/// F273:`YYYY-MM-DD'T'HH:MM:SS'Z'`。写进 `cloud.toml` 的 `last_ok_at`,
+/// 也进包头 —— 与 `app.rs` 里另外两处 `now_utc().format(&Rfc3339)` 同形。
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// F273:`YYYYMMDD'T'HHMMSS'Z'`。**SigV4 的 `x-amz-date` 与对象键里那一段
+/// 共用这一个** —— 两者同源,省得出现「键上写着 10 点、签名说 11 点」。
+fn now_compact() -> String {
+    let t = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
 }
 
 /// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
@@ -24538,6 +24840,244 @@ mod tests {
             body.contains("self.drive_automation()"),
             "pump_io 没有驱动 drive_automation —— 首字节/断线两条边就断了,\
              用户最小化着连上时自动化会一直等到超时,且不会有任何报错"
+        );
+    }
+
+    /// F273:上传**必须**在 `spawn_blocking` 里跑。
+    ///
+    /// `mullion-cloud` 是阻塞式的(ureq)。在事件循环里同步调用它,一次
+    /// 高延迟往返就能把帧率打到零 —— 而本项目的存在理由就是「不卡」
+    /// (T3/T7 红线)。
+    ///
+    /// **扎的是源码结构**:这条约束没有运行期的表现可以断言(测试环境里
+    /// 网络调用本来就不会发生),漏了也不报错,只有真机上卡给用户看。
+    ///
+    /// **必须先 `strip_comments`**:Step 6 的生产代码注释里就写着
+    /// 「必须 spawn_blocking」,不剥的话删掉真正那句调用测试照绿
+    /// (本项目已登记的坑,`app.rs` 里几十处共享这个手法)。
+    ///
+    /// **判据钉的是 `self._runtime.spawn_blocking(move ||`,不是
+    /// `tokio::task::spawn_blocking`。** 后者会在运行期 panic:GUI 线程
+    /// **不在** tokio runtime 上下文里(`app.rs:11017` 那句注释的原话是
+    /// 「GUI 线程不在 runtime 里,得显式进去一趟」),而自由函数形态的
+    /// `tokio::task::spawn_blocking` 要求调用处有 runtime 上下文。
+    /// 这条错**编译得过、全部测试照绿**,只有真机上第一次备份时当场崩。
+    ///
+    /// 自证会变红:把 `self._runtime.spawn_blocking(move || { .. })` 拆掉,
+    /// 直接同步调 `upload_blocking`。
+    #[test]
+    fn the_cloud_upload_runs_off_the_event_loop_thread() {
+        let body = strip_comments(body_of(prod_src(), "fn spawn_cloud_backup("));
+        assert!(
+            body.contains("self._runtime.spawn_blocking(move ||"),
+            "云端上传没走 runtime 句柄上的 spawn_blocking —— 要么把帧率打到零,\
+             要么(用自由函数形态时)因为 GUI 线程不在 runtime 上下文里当场 panic"
+        );
+    }
+
+    /// 同一时刻只许有一次上传在途。没有这道闸的话:定时器每 30 分钟塞一个,
+    /// 而一次高延迟上传可能跑几分钟 —— 手动点几下就能攒出一串并发的
+    /// `spawn_blocking`,它们会互相撞号(ForbidOverwrite),表现成
+    /// 「备份时好时坏」。
+    ///
+    /// 判据钉的是**那道闸**(`if self.cloud_in_flight {`),不是裸字段名:
+    /// 函数体里还有 `self.cloud_in_flight = true;` 那句,只搜字段名的话
+    /// 「把闸删掉」这条变异照样全绿。同样要先 `strip_comments`。
+    ///
+    /// 自证会变红:删掉 `if self.cloud_in_flight { return; }` 那三行。
+    #[test]
+    fn only_one_cloud_upload_is_in_flight_at_a_time() {
+        let body = strip_comments(body_of(prod_src(), "fn spawn_cloud_backup("));
+        assert!(
+            body.contains("if self.cloud_in_flight {"),
+            "没有在途闸 —— 定时与手动会攒出一串并发上传并互相撞号"
+        );
+    }
+
+    /// 结果回来时必须把在途标记**归还**。每条出口都要还。
+    ///
+    /// 这是本项目的常客形状(见 T13 的「hold 每条出口都要归还」):漏一条
+    /// 出口的后果是那之后**永远**不再备份,且没有任何报错。
+    ///
+    /// **锚点必须是 match 分支那一行**,不能用裸的 `UserEvent::CloudBackupDone(`:
+    /// `body_of` 取的是 `find` 的**第一次出现**,而 `UserEvent` 枚举定义在
+    /// `app.rs:57`、远在 `fn user_event`(11265 行)之前 —— 锚到变体定义上的话
+    /// 那一行连 `{` 都没有,`body_of` 会一路截到后面某个不相干的块,断言变成
+    /// 在考一段随机代码。
+    ///
+    /// 归还只允许有**一处**:多写一处就意味着有人在别的分支里补了个兜底,
+    /// 而那正是「三种结局共用一个变体」要避免的形状。
+    ///
+    /// 自证会变红:删掉 `self.cloud_in_flight = false;` 那句(第一条红),
+    /// 或者在某个分支里再补一句(第二条红)。
+    #[test]
+    fn every_path_that_ends_a_cloud_upload_hands_the_in_flight_flag_back() {
+        let body = strip_comments(body_of(
+            prod_src(),
+            "UserEvent::CloudBackupDone(outcome) => {",
+        ));
+        assert_eq!(
+            body.matches("self.cloud_in_flight = false").count(),
+            1,
+            "在途标记的归还不是恰好一处 —— 漏了之后永远不再备份,多了说明有分支在自己兜底"
+        );
+    }
+
+    /// 定时驱动必须**每帧都被调到**,而不是挂在某个偶尔才走的分支上。
+    ///
+    /// **判据扎在 `pump_io` 的函数体里,不是扫全篇找「出现过」。** 扫全篇只
+    /// 答得出「有人调过它」,答不出「每帧都调」—— 而把这句挪进任何一个偶尔
+    /// 才走的分支(比如某个 `if let Some(ws)` 里),扫全篇那条照样全绿,
+    /// 定时备份却变成了「碰运气才跑一次」。判据要放在**两种情形分得开**的
+    /// 那一层,这是本项目登记过的形状。
+    ///
+    /// 选 `pump_io` 是因为它自己的文档就写着「**每帧**调」,而且
+    /// `drive_automation` / `drive_attach_checks` / `drive_project_visits`
+    /// 三个同族驱动都住在那里 —— 跟它们做邻居,以后谁搬家也会一起搬。
+    ///
+    /// 同样先 `strip_comments` —— 注释里写一句「这里调 `self.drive_cloud_backup(..)`」
+    /// 就能让这条恒绿,而函数体里那句其实被注释掉了。
+    ///
+    /// 自证会变红:把 `pump_io` 里 `self.drive_cloud_backup(now);` 那句注释掉,
+    /// 或者把它挪出 `pump_io`(哪怕挪到另一个每帧都走的地方,这条也会红 ——
+    /// 那时候要连同这条守护的锚点一起改,并在注释里说清新宿主为什么每帧走)。
+    #[test]
+    fn the_cloud_backup_is_driven_every_frame() {
+        let body = strip_comments(body_of(prod_src(), "fn pump_io("));
+        assert!(
+            body.contains("self.drive_cloud_backup("),
+            "drive_cloud_backup 不在 pump_io 里 —— 它要么没人调(定时备份从来不发生),\
+             要么挂在某个偶尔才走的分支上(变成碰运气才跑一次):{body}"
+        );
+    }
+
+    /// 「该不该推」这个判断必须**真的走 `cloud::should_upload`**,不能在
+    /// 这里自己写闸。
+    ///
+    /// 自己写必然只写到「开着 + 到点了」这两道。它四道闸里最要紧的是
+    /// **配置完整性**:开着开关但 endpoint / AK 没填完的用户,每一轮都发一次
+    /// 注定 403 的请求,状态栏报一句「云端备份失败」,把真正的原因
+    /// (「还没填完」)吃掉。少调它还有第二重后果:`should_upload` 的六条
+    /// 测试全部变成没人调用的死代码 —— 本项目登记过的
+    /// **「量具存在≠接在那条路上」**(F264 那次是埋点没接,这次是判据没接)。
+    ///
+    /// 同时钉住**间隔从 `cfg.last_ok_at` 起算**。改成从内存里那个
+    /// `cloud_last_check_ms` 折算的话,起算点就变成「本进程上次看盘的时刻」
+    /// 而不是「上次真的推成的时刻」—— 一个开开关关的用户每次启动都会立刻
+    /// 推一份,把 keep 份历史窗口按开机次数刷光。这是 **T11**:计时要从
+    /// 「事情真的成了」起算,不是从调用点起算。
+    ///
+    /// 照例先 `strip_comments` —— 上面那段 `drive_cloud_backup` 的文档注释里
+    /// 就写着 `should_upload` 这个词,不剥的话把调用整段删掉测试照绿。
+    ///
+    /// 自证会变红:把 `should_upload(..)` 那一段换成
+    /// `if since < u64::from(cfg.interval_min) { return; }`(第一条红),
+    /// 或者把 `&cfg.last_ok_at` 换成别的来源(第二条红)。
+    #[test]
+    fn whether_to_back_up_is_decided_by_should_upload_not_by_a_hand_rolled_gate() {
+        let body = strip_comments(body_of(prod_src(), "fn drive_cloud_backup("));
+        assert!(
+            body.contains("cloud::should_upload(&cfg, &fp, since)"),
+            "定时那一路没走 should_upload —— 配置完整性那道闸永远不会跑,\
+             没填完的用户会每轮发一次注定 403 的请求"
+        );
+        // 拆成两条,**不要**写成一条带换行与缩进的整串:那样判据就绑死在
+        // rustfmt 当下的折行决定上 —— 谁加一句 `use` 把路径缩短,这一行就
+        // 折不起来了,守护当场假红。
+        assert!(
+            body.contains("minutes_since_last_ok("),
+            "没做「距上次成功过了几分钟」的折算"
+        );
+        assert!(
+            body.contains("&cfg.last_ok_at"),
+            "间隔不是从持久化的 last_ok_at 起算 —— 开开关关的用户每次启动都会推一份"
+        );
+    }
+
+    /// F271:设置弹窗里的云端分节必须显示**盘上那份** `cloud.toml`。
+    ///
+    /// 这条守的是接线,不是构造器本身。`from_settings_and_cloud` 写得再对,
+    /// 只要 `sync_settings_dialog` 还在调 `from_settings`,用户看到的就是一张
+    /// 空表 —— 而且编译、测试、clippy 全干净,只有人眼能发现。
+    ///
+    /// 自证会变红:把 `sync_settings_dialog` 里那两行改回
+    /// `SettingsDraft::from_settings(&self.settings)`。
+    #[test]
+    fn the_settings_dialog_starts_from_the_cloud_config_on_disk() {
+        let production = prod_src();
+        let body = body_of(production, "fn sync_settings_dialog(");
+        let body = strip_comments(body);
+        assert!(
+            body.contains("from_settings_and_cloud"),
+            "设置弹窗的草稿没接上云配置 —— 云端分节会永远显示空白:{body}"
+        );
+        // 这一条**故意扫全篇生产代码,不只是这个函数体**:
+        // `from_settings` 起的草稿云端字段全是默认值,而「确定」会把草稿写回
+        // `cloud.toml` —— 任何一个新冒出来的调用点都意味着 endpoint / bucket /
+        // AK 会被一次「打开设置再点确定」悄悄清空(「整份覆盖」缺陷族,
+        // 本项目已踩过五处)。只守着这一个函数体的话,新加的调用点照样溜过去。
+        //
+        // 注意 `from_settings_and_cloud(` **不含**子串 `from_settings(`
+        // (中间隔着 `_and_cloud`),所以这条不会误伤上面那句。
+        assert_eq!(
+            strip_comments(production)
+                .matches("SettingsDraft::from_settings(")
+                .count(),
+            0,
+            "生产代码里还有人在调只读 settings 的那个构造器 —— \
+             用它起的草稿云端字段全是默认值,一次「确定」就会把 AK/endpoint 清空"
+        );
+    }
+
+    /// F271:云配置写回必须是**读-改-写**,不是整份覆盖。
+    ///
+    /// 整份覆盖的症状:用户打开设置点一下确定,`last_seq` / `last_fingerprint`
+    /// 连同已封好的 `secret_sealed` 一起被草稿里的空值抹掉 —— 下一轮备份
+    /// 从序号 1 重来、SK 没了要重填,而这一切零报错(F247/F248 缺陷族)。
+    ///
+    /// 自证会变红:把 `let mut cfg = mullion_store::cloud::load(&dir);`
+    /// 改成 `let mut cfg = mullion_store::CloudConfig::default();`。
+    #[test]
+    fn the_cloud_draft_is_written_back_over_the_config_on_disk() {
+        let body = strip_comments(body_of(prod_src(), "fn save_cloud_draft("));
+        assert!(
+            body.contains("mullion_store::cloud::load(&dir)"),
+            "云配置写回没有先读盘 —— 游标与已封好的 SK 会被一次「确定」抹掉"
+        );
+        assert!(
+            !body.contains("CloudConfig::default()"),
+            "写回的底是 default() —— 那就是整份覆盖:{body}"
+        );
+    }
+
+    /// F271:SK 输入框**不管存成没存成都要清掉**。
+    ///
+    /// 留着的症状有两个,都静默:下次点确定会拿同一串明文再试一遍
+    /// (用户以为早就改过了),以及那串明文一直躺在草稿里等着被截图 ——
+    /// 本项目的排查流程里「发个截图」是常规动作。
+    ///
+    /// 判据有两半:**恰好一处** `clear()`,且它挂在 `match` **外面**的那个
+    /// `if let` 上 —— 塞进 `Some`/`None` 某条分支里的话另一条路上就不清了。
+    ///
+    /// 第二半钉的是**缩进**(12 格,即直接在 `if !secret_new.is_empty()` 里),
+    /// 不是先后顺序。「排在错误分支之后」是句废话:把 `clear()` 搬进错误分支,
+    /// 它照样排在后面 —— 那条断言杀不掉自己要挡的变异。`strip_comments` 只删
+    /// 整行注释、不动代码行的缩进,所以这个判据是稳的。
+    ///
+    /// 自证会变红:删掉那句 `clear()`;或者把那个 `if let` 整块搬进
+    /// `match` 的 `Some(s) =>` 分支里(缩进变 16 格)。
+    #[test]
+    fn the_secret_key_box_is_cleared_whether_or_not_it_saved() {
+        let body = strip_comments(body_of(prod_src(), "fn save_cloud_draft("));
+        assert_eq!(
+            body.matches(".cloud_secret_new.clear()").count(),
+            1,
+            "SK 框的清空不是恰好一处 —— 漏了会让明文留在草稿里,多了说明有分支在兜底"
+        );
+        assert!(
+            body.contains("\n            if let Some(d) = self.ui.settings_draft.as_mut() {"),
+            "清空没挂在 match 外层那个 if let 上(缩进对不上)—— 它得在存成/存砸\
+             两条路之后都执行:{body}"
         );
     }
 
