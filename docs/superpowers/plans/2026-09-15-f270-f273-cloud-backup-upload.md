@@ -2928,10 +2928,35 @@ pub fn minutes_since_last_ok(last_ok_at: &str, now: time::OffsetDateTime) -> u64
 /// 把真正的原因吃掉。
 ///
 /// 成本:读四个几十 KB 的文件 + 一次 sha256,每个轮询 tick 一次。微秒级。
-pub fn fingerprint_now(dir: &Path) -> String {
+///
+/// 返回 `Err` 的唯一原因是 `secrets.enc` **在但读不出来**(见 `read_secrets`)。
+/// 那种情况必须往上报而不是按空字节继续 —— 否则会算出「secrets 为空」那一版
+/// 指纹,让一份密文段是空的备份被正常加密、正常上传、正常推进游标。
+pub fn fingerprint_now(dir: &Path) -> Result<String, String> {
     let files = portable::collect_top_level(dir);
-    let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
-    cloud::fingerprint(&files, &secrets)
+    let secrets = read_secrets(dir)?;
+    Ok(cloud::fingerprint(&files, &secrets))
+}
+
+/// 读 `secrets.enc`。**「不存在」与「读不出来」必须分开。**
+///
+/// 不存在是合法状态(这台机器从没存过密码),按空字节继续。
+///
+/// 读不出来(权限 / IO / 被杀软短暂锁住 —— Windows 上这几样都不罕见)
+/// **必须报错**。静默当成空字节的话:指纹算成「secrets 为空」那一版、
+/// 包里密文段是空的,而这一份会被正常加密、正常上传、正常推进游标 ——
+/// 全程零报错。指纹推进之后,除非内容再变一次,这个空洞不会被下一轮覆盖
+/// 修掉。等到真要拿它恢复的那天,`portable` 把空密文段解释成「源机没有
+/// 密码」(那是**合法**状态,见 `portable.rs:229`),恢复流程也不报错,
+/// 只是恢复完发现所有会话都要重新输凭据。
+///
+/// 一路都在报成功 —— 这是备份功能最致命的失败模式。
+fn read_secrets(dir: &Path) -> Result<Vec<u8>, String> {
+    match std::fs::read(dir.join("secrets.enc")) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("读不出 secrets.enc:{e}")),
+    }
 }
 
 /// 一次上传的**主线程那一半**的产物。
@@ -2981,7 +3006,11 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
     // 上已经踩过一次)。`seal_with_master` 在钥匙串方案下会返回
     // `NoMasterPassword`,那是今天挡住这条路的东西,别把它绕过去。
     let files = portable::collect_top_level(dir);
-    let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
+    // 「读不出来」不能当成「没有」,见 `read_secrets` 的文档。
+    let secrets = match read_secrets(dir) {
+        Ok(b) => b,
+        Err(e) => return Prepared::Failed(e),
+    };
     let fp = cloud::fingerprint(&files, &secrets);
     // 定时那一路已经在 `drive_cloud_backup` 里问过 `should_upload` 了(其中
     // 一道闸就是指纹)。这里**还要再判一次**,因为**手动**那一路是绕过
@@ -4282,7 +4311,17 @@ Expected: FAIL。
         if !cfg.enabled {
             return;
         }
-        let fp = crate::cloudsync::fingerprint_now(&dir);
+        // 算不出指纹 = `secrets.enc` 在但读不出来。**这一轮跳过**,不能
+        // 按「secrets 为空」那一版指纹继续 —— 那会推一份密文段是空的备份
+        // 上去,还把游标推进了(见 `cloudsync::read_secrets`)。只记日志
+        // 不弹状态栏:多半是杀软/IO 的瞬时问题,下一轮就好了。
+        let fp = match crate::cloudsync::fingerprint_now(&dir) {
+            Ok(fp) => fp,
+            Err(e) => {
+                log::warn!("云端备份:算不出内容指纹,这一轮跳过:{e}");
+                return;
+            }
+        };
         let since = crate::cloudsync::minutes_since_last_ok(
             &cfg.last_ok_at,
             time::OffsetDateTime::now_utc(),
