@@ -53,6 +53,7 @@ pub fn fingerprint(files: &[crate::portable::PackFile], secrets: &[u8]) -> Strin
 
 use std::path::Path;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -176,6 +177,37 @@ pub fn load(dir: &Path) -> CloudConfig {
             ..CloudConfig::default()
         },
     }
+}
+
+fn b64() -> base64::engine::general_purpose::GeneralPurpose {
+    base64::engine::general_purpose::STANDARD
+}
+
+/// 把 SK 用 vault 的密钥封进 `cfg.secret_sealed`。
+///
+/// **用 `seal_local` 而不是 `seal_with_master`**:`cloud.toml` 是本机文件,
+/// 不跟着任何包走,所以钥匙串方案下也该能存 —— 用户可以先填好云配置,
+/// 再去设主密码。云备份**本身**要求主密码(设计 D6),但那道闸在上传那一步,
+/// 不该把「填配置」也一起挡掉。
+pub fn set_secret_key(
+    cfg: &mut CloudConfig,
+    vault: &crate::vault::Vault,
+    sk: &str,
+) -> Result<(), StoreError> {
+    cfg.secret_sealed = b64().encode(vault.seal_local(sk.as_bytes())?);
+    Ok(())
+}
+
+/// 取回 SK 明文。空 = 还没填过(**不是错误**)。
+pub fn secret_key(cfg: &CloudConfig, vault: &crate::vault::Vault) -> Result<String, StoreError> {
+    if cfg.secret_sealed.is_empty() {
+        return Ok(String::new());
+    }
+    let blob = b64()
+        .decode(&cfg.secret_sealed)
+        .map_err(|e| StoreError::CorruptSecrets(format!("cloud.toml 的密文不是合法 base64:{e}")))?;
+    let plain = vault.open_local(&blob)?;
+    String::from_utf8(plain).map_err(StoreError::from)
 }
 
 /// 写 `cloud.toml`。
@@ -466,5 +498,76 @@ mod tests {
             c.interval_min, DEFAULT_INTERVAL_MIN,
             "interval_min 的 serde 默认没接上 —— 定时器周期会变成一个谁也没写过的值"
         );
+    }
+
+    /// SK 落盘必须是密文。这条同 `tests/f70_no_plaintext.rs` 的姿态:
+    /// 在**文件字节**里搜明文,而不是相信调用链。
+    #[test]
+    fn the_secret_key_never_hits_the_disk_in_the_clear() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = crate::vault::Vault::open(
+            dir.path().to_path_buf(),
+            &crate::master_key::InMemoryKey([5u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+
+        let mut c = cfg();
+        set_secret_key(&mut c, &v, "TOP-SECRET-SK-VALUE").expect("封 SK");
+        save(dir.path(), &c).expect("写");
+
+        let bytes = std::fs::read(dir.path().join(CLOUD_FILE)).expect("读");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("TOP-SECRET-SK-VALUE"),
+            "SK 明文落到了 cloud.toml 里"
+        );
+        assert_eq!(secret_key(&c, &v).expect("解 SK"), "TOP-SECRET-SK-VALUE");
+    }
+
+    /// **改主密码必须连带重封 `cloud.toml`**(设计 D12)。
+    ///
+    /// 不重封的症状:AK/SK 当场解不开,云备份静默失效,而错误要等到几十分钟后
+    /// 的一次定时上传才冒出来 —— 那时候用户早就不记得自己改过主密码了。
+    #[test]
+    fn changing_the_master_password_reseals_the_cloud_secret() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = crate::vault::Vault::open(
+            dir.path().to_path_buf(),
+            &crate::master_key::InMemoryKey([5u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("old").expect("设旧密码");
+
+        let mut c = cfg();
+        set_secret_key(&mut c, &v, "SK-VALUE").expect("封");
+        save(dir.path(), &c).expect("写");
+
+        v.set_master_password("new").expect("改密码");
+
+        let after = load(dir.path());
+        assert_eq!(
+            secret_key(&after, &v).expect("改完密码之后应该还解得开"),
+            "SK-VALUE",
+            "改主密码没有重封 cloud.toml —— AK/SK 从此解不开且零报错"
+        );
+    }
+
+    /// `clear_master_password` 走同一条路:退回钥匙串方案之后,SK 必须仍然
+    /// 解得开(它改用钥匙串密钥封),否则用户只是「取消了主密码」,云配置
+    /// 却连带坏掉。
+    #[test]
+    fn clearing_the_master_password_also_reseals_the_cloud_secret() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let ks = crate::master_key::InMemoryKey([5u8; 32]);
+        let mut v = crate::vault::Vault::open(dir.path().to_path_buf(), &ks).expect("开库");
+        v.set_master_password("old").expect("设密码");
+        let mut c = cfg();
+        set_secret_key(&mut c, &v, "SK-VALUE").expect("封");
+        save(dir.path(), &c).expect("写");
+
+        v.clear_master_password(&ks).expect("取消主密码");
+
+        let after = load(dir.path());
+        assert_eq!(secret_key(&after, &v).expect("仍应解得开"), "SK-VALUE");
     }
 }

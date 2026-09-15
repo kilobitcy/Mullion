@@ -447,6 +447,22 @@ impl Vault {
         crypto::decrypt(&self.key, payload)
     }
 
+    /// F271:用本库当前的密钥封一段**本机文件**用的字节。
+    ///
+    /// 与 [`Self::seal_with_master`] 的区别只有一个:**不要求主密码方案**。
+    /// 封出来的东西只给本机的 `cloud.toml` 用,不跟着任何包走,所以钥匙串
+    /// 方案下也成立。
+    pub fn seal_local(&self, plain: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let payload = crypto::encrypt(&self.key, plain)?;
+        Ok(crate::secrets_file::encode(&self.scheme, &payload))
+    }
+
+    /// [`Self::seal_local`] 的逆。
+    pub fn open_local(&self, blob: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let (_, payload) = crate::secrets_file::parse(blob)?;
+        crypto::decrypt(&self.key, payload)
+    }
+
     /// F270:当前的密钥方案。云端备份要拿它的 salt 判断「这份是不是本机
     /// 当前主密码封的」(设计 D14 的清理判据)。
     pub fn scheme(&self) -> crate::secrets_file::Scheme {
@@ -464,12 +480,16 @@ impl Vault {
         if password.is_empty() {
             return Err(StoreError::Kdf("主密码不能为空".into()));
         }
+        // **必须在换 key 之前解**:换完就再也解不开了。放在空密码检查之后,
+        // 省掉一次注定作废的文件读。
+        let carried = self.take_cloud_secret_plain();
         let params = crate::kdf::KdfParams::default();
         let salt = crate::kdf::random_salt();
         let key = crate::kdf::derive_key(password, &salt, params)?;
         self.key = key;
         self.scheme = crate::secrets_file::Scheme::Argon2id { params, salt };
-        self.save()
+        self.save()?;
+        self.reseal_cloud_secret(carried)
     }
 
     /// 撤销主密码,回到钥匙串方案(F71)。
@@ -483,10 +503,52 @@ impl Vault {
         key_source: &dyn MasterKeySource,
     ) -> Result<(), StoreError> {
         self.sync_from_disk_if_untouched();
+        // 同上:`key_source.load_or_create()` 失败时会带着 `?` 提前返回,
+        // 那条路上 `carried` 直接被丢掉,本来也没东西要重封。
+        let carried = self.take_cloud_secret_plain();
         let key = key_source.load_or_create()?;
         self.key = key;
         self.scheme = crate::secrets_file::Scheme::Keyring;
-        self.save()
+        self.save()?;
+        self.reseal_cloud_secret(carried)
+    }
+
+    /// F271 / 设计 D12:密钥换了之后,把 `cloud.toml` 里的 SK 用新密钥重封。
+    ///
+    /// **两个改密码的入口共用这一份。** 各写一遍的话 `clear_master_password`
+    /// 那条迟早被漏掉,而漏掉的症状是:用户取消主密码之后云备份静默失效,
+    /// 报错要等几十分钟后的一次定时上传才冒出来。
+    ///
+    /// 失败只报 `Err` **不回滚主密码**:主密码已经换好并落盘了,回滚意味着
+    /// 再写一次文件,失败链条更长。云配置坏了是可修的(重填一次 AK/SK),
+    /// 主密码写到一半不是。
+    fn reseal_cloud_secret(&mut self, old_plain: Option<Vec<u8>>) -> Result<(), StoreError> {
+        let Some(plain) = old_plain else {
+            return Ok(());
+        };
+        let mut cfg = crate::cloud::load(&self.dir);
+        if cfg.secret_sealed.is_empty() {
+            return Ok(());
+        }
+        cfg.secret_sealed = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(self.seal_local(&plain)?)
+        };
+        crate::cloud::save(&self.dir, &cfg)
+    }
+
+    /// 换密钥**之前**把 SK 解出来。解不开(从没填过/文件坏了)一律 `None` ——
+    /// 那种情况下没有东西需要重封。
+    fn take_cloud_secret_plain(&self) -> Option<Vec<u8>> {
+        let cfg = crate::cloud::load(&self.dir);
+        if cfg.secret_sealed.is_empty() {
+            return None;
+        }
+        use base64::Engine as _;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(&cfg.secret_sealed)
+            .ok()?;
+        self.open_local(&blob).ok()
     }
 
     pub fn list(&self) -> &[SessionRecord] {
