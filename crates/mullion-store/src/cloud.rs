@@ -51,6 +51,138 @@ pub fn fingerprint(files: &[crate::portable::PackFile], secrets: &[u8]) -> Strin
     s
 }
 
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::StoreError;
+
+/// 对象键的默认前缀。
+pub const DEFAULT_PREFIX: &str = "mullion/";
+/// 默认保留几份。
+pub const DEFAULT_KEEP: u32 = 20;
+/// 默认多久算一次指纹(分钟)。
+pub const DEFAULT_INTERVAL_MIN: u32 = 30;
+
+/// 本机对云端的全部看法。**整份住 `cloud.toml`,不进迁移包**,见模块文档。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
+    /// `true` = `<endpoint>/<bucket>/<key>`。自建 MinIO 多半要打开。
+    #[serde(default)]
+    pub path_style: bool,
+    #[serde(default = "default_keep")]
+    pub keep: u32,
+    #[serde(default = "default_interval")]
+    pub interval_min: u32,
+    /// SOCKS5 代理,形如 `socks5://127.0.0.1:1080`。空 = 直连。
+    ///
+    /// **这个字段不补的话 `socks5` 参数就是条死线**:`mullion-cloud` 为它
+    /// 开了 ureq 的 `socks-proxy` 特性、`S3Client::new` 专门收了这个参数,
+    /// 而设计 D15 把「SOCKS 代理链路通不通」列进了片一的真机验收项 ——
+    /// 没有配置入口的话那条永远传 `None`,验收项验的是一条从没走过的路
+    /// (本项目登记过同一形状:「量具存在≠接在那条路上」)。
+    #[serde(default)]
+    pub socks5: String,
+    /// AK 是标识不是秘密,明文存。
+    #[serde(default)]
+    pub access_key_id: String,
+    /// SK **用 vault key 封过再 base64**(F271)。空 = 还没填。
+    #[serde(default)]
+    pub secret_sealed: String,
+    /// 上次成功推上去的那一份的内容指纹。
+    #[serde(default)]
+    pub last_fingerprint: String,
+    /// 上次成功推上去的序号。
+    #[serde(default)]
+    pub last_seq: u64,
+    /// 上次成功的时刻(RFC3339)。只给状态栏看。
+    #[serde(default)]
+    pub last_ok_at: String,
+    /// 这份是从**读不懂的文件**上来的。`save` 见到它就拒绝写。
+    ///
+    /// **不落盘**(`serde(skip)`),**私有**(只有 [`load`] 能置位)。
+    ///
+    /// 为什么标记住在结构体里而不是让 `load` 返回 `Result`:守护必须待在
+    /// `save` 内部。挪到调用方就成了「每个调用点都要记得判一下」,而这正是
+    /// 本项目已经踩过三次的「列举式门控在加档时必然漏」。
+    ///
+    /// 为什么**不**把标记塞进 `endpoint` 之类的数据字段:设置弹窗直接把
+    /// `endpoint` 绑到文本框(Task 12)。塞进去的话用户会在输入框里看见那串
+    /// 哨兵,而他只要改一下 endpoint 就把标记冲掉了 —— `save` 当场放行,
+    /// `secret_sealed` 连同别的字段一起被默认值抹掉。守护在它最该生效的
+    /// 那条路上恰好失效。
+    #[serde(skip)]
+    corrupt: bool,
+}
+
+fn default_prefix() -> String {
+    DEFAULT_PREFIX.to_string()
+}
+fn default_keep() -> u32 {
+    DEFAULT_KEEP
+}
+fn default_interval() -> u32 {
+    DEFAULT_INTERVAL_MIN
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            region: String::new(),
+            bucket: String::new(),
+            prefix: default_prefix(),
+            path_style: false,
+            keep: default_keep(),
+            interval_min: default_interval(),
+            socks5: String::new(),
+            access_key_id: String::new(),
+            secret_sealed: String::new(),
+            last_fingerprint: String::new(),
+            last_seq: 0,
+            last_ok_at: String::new(),
+            corrupt: false,
+        }
+    }
+}
+
+/// 读 `cloud.toml`。读不懂时返回一份**关着且不可回写**的配置。
+pub fn load(dir: &Path) -> CloudConfig {
+    let path = dir.join(CLOUD_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return CloudConfig::default();
+    };
+    match toml::from_str::<CloudConfig>(&text) {
+        Ok(c) => c,
+        Err(_) => CloudConfig {
+            corrupt: true,
+            ..CloudConfig::default()
+        },
+    }
+}
+
+/// 写 `cloud.toml`。
+pub fn save(dir: &Path, cfg: &CloudConfig) -> Result<(), StoreError> {
+    if cfg.corrupt {
+        return Err(StoreError::CorruptSecrets(
+            "cloud.toml 读不懂,拒绝回写 —— 先把它改好或删掉".into(),
+        ));
+    }
+    let text = toml::to_string_pretty(cfg)?;
+    crate::vault::write_atomic(&dir.join(CLOUD_FILE), text.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +320,97 @@ mod tests {
         ];
         let b = vec![a[1].clone(), a[0].clone()];
         assert_eq!(fingerprint(&a, b"s"), fingerprint(&b, b"s"));
+    }
+
+    fn cfg() -> CloudConfig {
+        CloudConfig {
+            enabled: true,
+            endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+            region: "cn-hangzhou".into(),
+            bucket: "my-bucket".into(),
+            prefix: "mullion/".into(),
+            path_style: false,
+            keep: 20,
+            interval_min: 30,
+            socks5: String::new(),
+            access_key_id: String::new(),
+            secret_sealed: String::new(),
+            last_fingerprint: String::new(),
+            last_seq: 0,
+            last_ok_at: String::new(),
+            corrupt: false,
+        }
+    }
+
+    #[test]
+    fn a_config_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        save(dir.path(), &cfg()).expect("写");
+        assert_eq!(load(dir.path()), cfg());
+    }
+
+    /// 没有文件时给一份**关着的**默认配置 —— 不是「开着但字段是空的」。
+    /// 后者会让定时器每一轮都尝试连一个空 endpoint,状态栏一直报错。
+    #[test]
+    fn a_missing_file_yields_a_disabled_default() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let c = load(dir.path());
+        assert!(!c.enabled, "默认必须是关着的");
+        assert_eq!(c.prefix, DEFAULT_PREFIX);
+        assert_eq!(c.keep, DEFAULT_KEEP);
+    }
+
+    /// 坏文件**不许当成默认值**(F247/F248 的「整份覆盖」缺陷族):
+    /// 照 default 兜底的话,下一次 `save` 会把用户手打的 endpoint/bucket
+    /// 连同 AK/SK 一起抹掉,而这一切零报错。
+    #[test]
+    fn a_corrupt_file_is_not_silently_replaced_by_defaults() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        std::fs::write(dir.path().join(CLOUD_FILE), "这不是 toml { [").expect("写坏文件");
+        let c = load(dir.path());
+        assert!(!c.enabled, "读不懂的配置必须当成关着的");
+        assert!(
+            save(dir.path(), &c).is_err(),
+            "读坏之后还允许回写 —— 那会把用户的 AK/SK 静默抹掉"
+        );
+        // 标记**不许寄生在数据字段上**:设置弹窗把 `endpoint` 直接绑到文本框,
+        // 用户改一下就把标记冲掉,`save` 当场放行、`secret_sealed` 被抹。
+        assert!(
+            c.endpoint.is_empty(),
+            "损坏标记污染了 endpoint:{:?} —— 它会出现在设置弹窗的输入框里,\
+             而用户改掉它就等于把守护关掉了",
+            c.endpoint
+        );
+    }
+
+    /// 坏标记**不能落盘**。写出去的话下次 `load` 会把一份好文件读成坏的,
+    /// 于是云备份从此永久拒绝回写,且没有任何办法自愈。
+    #[test]
+    fn the_corrupt_mark_never_reaches_the_file() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        save(dir.path(), &cfg()).expect("写");
+        let text = std::fs::read_to_string(dir.path().join(CLOUD_FILE)).expect("读");
+        assert!(!text.contains("corrupt"), "损坏标记落盘了:{text}");
+    }
+
+    /// 游标(`last_seq` / `last_fingerprint`)是写在这个文件里的,而这个文件
+    /// 不进包 —— 这条钉住的是「有人以后为了省事把游标挪进 settings.toml」。
+    #[test]
+    fn the_cursor_lives_in_the_file_that_the_pack_cannot_touch() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut c = cfg();
+        c.last_seq = 42;
+        c.last_fingerprint = "deadbeef".into();
+        save(dir.path(), &c).expect("写");
+        let text = std::fs::read_to_string(dir.path().join(CLOUD_FILE)).expect("读");
+        assert!(text.contains("last_seq"), "游标没落在 cloud.toml 里");
+        let settings = dir.path().join(crate::settings::SETTINGS_FILE);
+        assert!(
+            !settings.exists()
+                || !std::fs::read_to_string(&settings)
+                    .unwrap()
+                    .contains("last_seq"),
+            "游标漏进了 settings.toml —— 那个文件会被导入的包整份替换掉"
+        );
     }
 }

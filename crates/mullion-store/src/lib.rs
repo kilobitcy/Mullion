@@ -32,7 +32,10 @@ pub use automation::{
     build_plan_without_tmux, tmux_session_name, AutomationCommand, AutomationPrefs, EnvVar,
     ResolvedAutomation, Step, TmuxChoice,
 };
-pub use cloud::{fingerprint as cloud_fingerprint, CLOUD_FILE};
+pub use cloud::{
+    fingerprint as cloud_fingerprint, load as load_cloud_config, save as save_cloud_config,
+    CloudConfig, CLOUD_FILE, DEFAULT_INTERVAL_MIN, DEFAULT_KEEP, DEFAULT_PREFIX,
+};
 pub use credential::{display_user, Auth, CredentialId, CredentialRecord, InlineAuth};
 pub use error::StoreError;
 pub use group::GroupRecord;
