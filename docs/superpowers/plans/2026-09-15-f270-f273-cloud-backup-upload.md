@@ -4117,16 +4117,29 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
 
     /// 定时驱动必须**每帧都被调到**,而不是挂在某个偶尔才走的分支上。
     ///
-    /// 同样先 `strip_comments` —— 注释里写一句「这里调 `self.drive_cloud_backup(..)`」
-    /// 就能让这条恒绿,而事件循环里那句其实被注释掉了。
+    /// **判据扎在 `pump_io` 的函数体里,不是扫全篇找「出现过」。** 扫全篇只
+    /// 答得出「有人调过它」,答不出「每帧都调」—— 而把这句挪进任何一个偶尔
+    /// 才走的分支(比如某个 `if let Some(ws)` 里),扫全篇那条照样全绿,
+    /// 定时备份却变成了「碰运气才跑一次」。判据要放在**两种情形分得开**的
+    /// 那一层,这是本项目登记过的形状。
     ///
-    /// 自证会变红:把事件循环里 `self.drive_cloud_backup(now_ms);` 那句注释掉。
+    /// 选 `pump_io` 是因为它自己的文档就写着「**每帧**调」,而且
+    /// `drive_automation` / `drive_attach_checks` / `drive_project_visits`
+    /// 三个同族驱动都住在那里 —— 跟它们做邻居,以后谁搬家也会一起搬。
+    ///
+    /// 同样先 `strip_comments` —— 注释里写一句「这里调 `self.drive_cloud_backup(..)`」
+    /// 就能让这条恒绿,而函数体里那句其实被注释掉了。
+    ///
+    /// 自证会变红:把 `pump_io` 里 `self.drive_cloud_backup(now);` 那句注释掉,
+    /// 或者把它挪出 `pump_io`(哪怕挪到另一个每帧都走的地方,这条也会红 ——
+    /// 那时候要连同这条守护的锚点一起改,并在注释里说清新宿主为什么每帧走)。
     #[test]
     fn the_cloud_backup_is_driven_every_frame() {
-        let src = strip_comments(prod_src());
+        let body = strip_comments(body_of(prod_src(), "fn pump_io("));
         assert!(
-            src.contains("self.drive_cloud_backup("),
-            "drive_cloud_backup 没有被调用 —— 定时备份从来不会发生"
+            body.contains("self.drive_cloud_backup("),
+            "drive_cloud_backup 不在 pump_io 里 —— 它要么没人调(定时备份从来不发生),\
+             要么挂在某个偶尔才走的分支上(变成碰运气才跑一次):{body}"
         );
     }
 
@@ -4402,9 +4415,21 @@ fn now_compact() -> String {
 }
 ```
 
-在事件循环里每帧调用 `self.drive_cloud_backup(now_ms);`（放在
-`self.drive_automation();` / `self.drive_attach_checks();` 那一串旁边，
-`app.rs:8595` 附近；那里上一行就有 `let now = self.now_ms();`）。
+调用点在 **`fn pump_io(&mut self)`** 里，加在
+`self.drive_automation();` / `self.drive_attach_checks();` /
+`self.drive_project_visits();` 那一串**末尾**（已核实：`app.rs:8596`~`8598`）：
+
+```rust
+        self.drive_cloud_backup(now);
+```
+
+**参数是 `now`，不是 `now_ms`** —— 那个局部量在 `pump_io` 开头就有
+（`app.rs:8581` 的 `let now = self.now_ms();`），直接用，别再取一次时间。
+
+**必须放在 `pump_io` 里，不是别处。** 它的文档写着「每帧调」，而那三个同族
+驱动都住在这儿；守护 `the_cloud_backup_is_driven_every_frame` 的锚点就钉在
+这个函数体上。挪到任何一个偶尔才走的分支里，定时备份就变成碰运气才跑一次，
+而扫全篇式的判据看不出这个差别。
 
 菜单动作处理里接上手动入口 —— **必须 `take`，不能只读**：
 
@@ -4728,7 +4753,8 @@ git commit -m "feat(app): 云端备份的定时驱动与结果回收 (F273)
 | `self._runtime.spawn_blocking(` 改成 `tokio::task::spawn_blocking(` | 同上（这条变异**编译得过**，正是它要挡的那种：真机首次备份 panic） |
 | 去掉 `if self.cloud_in_flight { return; }` 那句 | `only_one_cloud_upload_is_in_flight_at_a_time` |
 | `CloudBackupDone` 分支里删掉 `self.cloud_in_flight = false;` | `every_path_that_ends_a_cloud_upload_hands_the_in_flight_flag_back` |
-| 事件循环里注释掉 `self.drive_cloud_backup(now_ms);` | `the_cloud_backup_is_driven_every_frame` |
+| `pump_io` 里注释掉 `self.drive_cloud_backup(now);` | `the_cloud_backup_is_driven_every_frame` |
+| 把那句从 `pump_io` 挪进一个偶尔才走的分支（例如 `if flushed { .. }` 里） | 同上。**这条是那条守护真正要挡的东西** —— 判据若写成「扫全篇找 `self.drive_cloud_backup(`」，这条逃得掉，而定时备份会变成碰运气才跑一次 |
 | `drive_cloud_backup` 里把 `should_upload(..)` 换成手写的 `if since < u64::from(cfg.interval_min) { return; }` | `whether_to_back_up_is_decided_by_should_upload_not_by_a_hand_rolled_gate`（第一条断言） |
 | `minutes_since_last_ok` 的实参从 `&cfg.last_ok_at` 改成从 `cloud_last_check_ms` 折算 | 同上（第二条断言）——T11：起算点从「真的推成了」退回「本进程上次看盘」 |
 | `CLOUD_POLL_MS` 改成 `u64::from(cfg.interval_min) * 60_000` | **杀不掉**（两层节流合并之后行为差异只在"开开关关"的真机场景里才看得见）。**这条如实记下来，别硬编一条守护** —— 上面那两条断言钉的是「判据走 `should_upload`、起算点用 `last_ok_at`」，合并后两者仍然成立，只是轮询变懒。后果有限（最晚推迟一个 interval），不值得为它把常量结构复杂化 |
