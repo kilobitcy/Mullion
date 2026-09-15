@@ -479,6 +479,20 @@ pub struct CloudCell {
     pub severity: crate::tunnels::Severity,
 }
 
+/// 三档严重度各自的颜色。状态栏的隧道格与云端格共用。
+///
+/// **抽出来是为了让它可测。** 内联在 `status_bar` 里的时候,把三档全写成
+/// 同一个色,25 条测试全绿 —— 而「有一条隧道挂了」「备份失败了」这两条
+/// 唯一需要被看见的信息就此消失,界面上、日志里、测试里都没有任何痕迹。
+/// 本项目在 F265 上刚吃过同族的亏(「灯早就有了,用户根本没注意到」)。
+fn severity_color(t: &Theme, s: crate::tunnels::Severity) -> egui::Color32 {
+    theme::c32(match s {
+        crate::tunnels::Severity::Calm => t.fg_muted,
+        crate::tunnels::Severity::Warn => t.warn,
+        crate::tunnels::Severity::Danger => t.danger,
+    })
+}
+
 /// `last_error`(F3 落盘失败等)必须总有个展示位:它可能是在会话管理器/编辑器
 /// 都已关闭之后才产生的(如主机密钥确认后 `ConnectOk` 顺手关掉了会话管理器),
 /// 那两处的 `last_error` 渲染此时根本不会被调用到(复核 A4)。状态栏常驻,
@@ -559,12 +573,7 @@ pub fn status_bar(
                     // (见 `tunnels::indicator`)—— 一律画成灰的,等于把
                     // 「有一条挂了」这条唯一需要被看见的信息藏起来。
                     if let Some(ind) = tunnel {
-                        let color = match ind.severity {
-                            crate::tunnels::Severity::Calm => t.fg_muted,
-                            crate::tunnels::Severity::Warn => t.warn,
-                            crate::tunnels::Severity::Danger => t.danger,
-                        };
-                        let r = ui.colored_label(theme::c32(color), &ind.text);
+                        let r = ui.colored_label(severity_color(t, ind.severity), &ind.text);
                         annotate::mark(ui.ctx(), "状态栏/隧道指示器", r.rect);
                         ui.separator();
                     }
@@ -572,12 +581,7 @@ pub fn status_bar(
                     // 「静默失败」是备份功能唯一致命的失败模式:用户以为有
                     // 备份,直到需要它的那天才发现没有。
                     if let Some(c) = cloud {
-                        let color = match c.severity {
-                            crate::tunnels::Severity::Calm => t.fg_muted,
-                            crate::tunnels::Severity::Warn => t.warn,
-                            crate::tunnels::Severity::Danger => t.danger,
-                        };
-                        let r = ui.colored_label(theme::c32(color), &c.text);
+                        let r = ui.colored_label(severity_color(t, c.severity), &c.text);
                         annotate::mark(ui.ctx(), "状态栏/云端备份", r.rect);
                         ui.separator();
                     }
@@ -897,6 +901,74 @@ mod tests {
         assert!(
             texts.iter().any(|t| t.contains("备份失败")),
             "备份失败没出现在状态栏:{texts:?}"
+        );
+    }
+
+    /// 三档严重度必须落在调色板的三格上,而且**三格必须真的分得开**。
+    ///
+    /// 前三条钉「取的是哪一格」:把三档全写成 `t.fg_muted`(实测过,
+    /// 这个变异能让 25 条测试全绿通过)会当场变红。
+    ///
+    /// 后三条钉「分得开」:只有前三条的话,哪天有人把调色板里的 `warn`
+    /// 调成跟 `fg_muted` 一样的值,映射条条正确而屏幕上三档还是一个样 ——
+    /// 判据落在「读回了源码」这一层,看不出用户那边有没有差别。
+    #[test]
+    fn the_three_severities_get_three_colors_that_are_actually_different() {
+        use crate::tunnels::Severity::{Calm, Danger, Warn};
+        let t = &crate::theme::MULLION_DARK;
+        assert_eq!(severity_color(t, Calm), theme::c32(t.fg_muted));
+        assert_eq!(severity_color(t, Warn), theme::c32(t.warn));
+        assert_eq!(severity_color(t, Danger), theme::c32(t.danger));
+        assert_ne!(
+            severity_color(t, Calm),
+            severity_color(t, Warn),
+            "正常与告警同色 —— 状态栏上分不出来"
+        );
+        assert_ne!(
+            severity_color(t, Warn),
+            severity_color(t, Danger),
+            "告警与危险同色 —— 状态栏上分不出来"
+        );
+        assert_ne!(
+            severity_color(t, Calm),
+            severity_color(t, Danger),
+            "正常与危险同色 —— 「备份失败」跟「已备份」长得一样"
+        );
+    }
+
+    /// 状态栏里**不许再出现裸的 severity match** —— 唯一合法的那份在
+    /// `severity_color` 里,它有守护。把 match 重新内联回 `status_bar`
+    /// 的话,上面那条纯函数测试照样全绿,而屏幕上两格又塌成一个色:
+    /// 这正是本项目登记过的「量具存在≠接在那条路上」。
+    ///
+    /// 自证会变红:把任一格的 `severity_color(t, ..)` 换回内联的三档 match。
+    #[test]
+    fn the_status_bar_cells_go_through_severity_color() {
+        let src = include_str!("chrome.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面会考到测试自己"
+        );
+        let body = prod
+            .split("pub fn status_bar(")
+            .nth(1)
+            .expect("没有 status_bar");
+        let body = body.split("\nfn ").next().unwrap_or(body);
+        assert!(
+            !body.contains("Severity::Danger =>"),
+            "`status_bar` 里又出现了裸的 severity match —— 它没有守护,\
+             三档塌成一档不会有任何测试变红:\n{body}"
+        );
+        assert_eq!(
+            body.matches("severity_color(t,").count(),
+            2,
+            "状态栏上该有两格按严重度上色(隧道、云端备份),实际 {} 处走了 \
+             `severity_color`。新加的格子也要走它,否则它天生没有守护。",
+            body.matches("severity_color(t,").count()
         );
     }
 
