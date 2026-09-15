@@ -27,16 +27,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
-    // `new_from_slice` 对 HMAC 只在密钥长度为 0 时才可能出错,而下面四次调用
-    // 的密钥都非空;真出错了也不该 panic 掉整个 app,退回一个不可能匹配的
-    // 空签名让服务端拒掉 —— 拿到的是一条 403,比进程没了强。
-    match HmacSha256::new_from_slice(key) {
-        Ok(mut m) => {
-            m.update(msg);
-            m.finalize().into_bytes().to_vec()
-        }
-        Err(_) => Vec::new(),
-    }
+    // `HmacSha256` = `Hmac<Sha256>` = `CoreWrapper<HmacCore<Sha256>>`。
+    // `CoreWrapper::new_from_slice` 直接转发给 `HmacCore::new_from_slice`
+    // (hmac-0.12.1 src/optim.rs),而后者对**任意长度**的密钥(含空密钥,
+    // 内部会做摘要压缩/填充)都无条件返回 `Ok`。这个 `Err` 分支不可达 ——
+    // `expect` 在这里不是偷懒,是把「不可能发生」写明,免得以后有人看见
+    // `Result` 就下意识补一条 `match` 或 `?`。
+    let mut m = HmacSha256::new_from_slice(key).expect("HMAC 接受任意长度的密钥");
+    m.update(msg);
+    m.finalize().into_bytes().to_vec()
 }
 
 /// 派生签名密钥。**四步的顺序是规范定死的**,见模块文档里那条症状。
@@ -67,22 +66,56 @@ pub struct Request<'a> {
     pub extra_headers: &'a [(&'a str, &'a str)],
 }
 
+/// canonical header value:去首尾空白 **且** 把内部连续空白压成一个空格。
+///
+/// **两半都要做。** 只 `trim()` 的话,值里带两个连续空格的头,我们签的串与
+/// 服务端重建出来的不一样 —— 又是一条什么都看不出来的 403。而只对
+/// `extra_headers` 做、不对三个必签头做,是更糟的版本:规则在同一个
+/// canonical 块里不一致。
+///
+/// 已知不覆盖的边角:SigV4 规定引号内的空白不压缩。我们签的头值只有
+/// host / hex 摘要 / 时间戳 / `*` / `true` 这几类,都不含引号 ——
+/// **别拿这个函数去处理带引号的头值。**
+fn canonical_value(v: &str) -> String {
+    v.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// 算出 `Authorization` 头的完整值。
 pub fn authorization(req: &Request<'_>, ak: &str, sk: &str, region: &str, service: &str) -> String {
+    debug_assert!(
+        req.amz_date.len() == 16
+            && req.amz_date.as_bytes()[8] == b'T'
+            && req.amz_date.ends_with('Z'),
+        "amz_date 格式不对:期望 YYYYMMDD'T'HHMMSS'Z'(16 字符),实际是 {:?} —— \
+         下面 `&req.amz_date[..8]` 会在过短输入上直接 panic",
+        req.amz_date
+    );
     let date = &req.amz_date[..8];
+
+    for (k, _) in req.extra_headers {
+        debug_assert!(
+            !k.bytes().any(|b| b.is_ascii_uppercase()),
+            "extra_headers 的头名必须已是小写:{k} —— 大写会静默算出错签名,服务端只回一条 403"
+        );
+        debug_assert!(
+            !matches!(*k, "host" | "x-amz-date" | "x-amz-content-sha256"),
+            "extra_headers 不能包含必签头 {k} —— 会在 canonical headers 里出现两行同名头、\
+             SignedHeaders 里出现两次同名条目,这是非法的 canonical request,服务端只回一条 403"
+        );
+    }
 
     // 三个必签头 + 调用方给的。排序在这里做一次,签名与 SignedHeaders 用的
     // 是**同一个已排序列表** —— 分两处各排一次,迟早漂开。
     let mut headers: Vec<(String, String)> = vec![
-        ("host".to_string(), req.host.to_string()),
+        ("host".to_string(), canonical_value(req.host)),
         (
             "x-amz-content-sha256".to_string(),
-            req.payload_sha256.to_string(),
+            canonical_value(req.payload_sha256),
         ),
-        ("x-amz-date".to_string(), req.amz_date.to_string()),
+        ("x-amz-date".to_string(), canonical_value(req.amz_date)),
     ];
     for (k, v) in req.extra_headers {
-        headers.push((k.to_string(), v.trim().to_string()));
+        headers.push((k.to_string(), canonical_value(v)));
     }
     headers.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -177,6 +210,12 @@ mod tests {
 
     /// signed headers 必须**按名字排序**,不是按调用方给的顺序。给的顺序反过来
     /// 也得算出同一个签名 —— 否则「加一个自定义头」就会随机地让签名失效。
+    ///
+    /// **这条只钉住「排列不变性」,不钉住「按名字排序」。** 排序键从名字换成
+    /// 值(`a.0.cmp(&b.0)` → `a.1.cmp(&b.1)`)这条依然会绿,因为它验的是
+    /// 「同一集合的两种排列产出相同结果」,对**任何**一致的全序都成立。
+    /// 真正钉住「按名字排序」的是上面那条官方向量测试 ——
+    /// 排序键一换,期望的 hex 签名就对不上了。
     #[test]
     fn header_order_from_the_caller_does_not_change_the_signature() {
         let mk = |extra: &'static [(&'static str, &'static str)]| Request {
@@ -203,5 +242,116 @@ mod tests {
             "s3",
         );
         assert_eq!(a, b, "signed headers 没排序 —— 调用方换个顺序签名就变了");
+    }
+
+    /// canonical header value 要去首尾空白 —— 值前后带空格,签的串就跟没带
+    /// 空格的不一样,而服务端收到的头值通常是去过空白的。
+    #[test]
+    fn leading_and_trailing_whitespace_in_a_header_value_does_not_change_the_signature() {
+        let mk = |extra: &'static [(&'static str, &'static str)]| Request {
+            method: "GET",
+            host: "b.example.com",
+            path: "/k",
+            query: "",
+            payload_sha256: "abc",
+            amz_date: "20260915T101500Z",
+            extra_headers: extra,
+        };
+        let a = authorization(
+            &mk(&[("range", "  bytes=0-9  ")]),
+            "AK",
+            "SK",
+            "cn-hangzhou",
+            "s3",
+        );
+        let b = authorization(
+            &mk(&[("range", "bytes=0-9")]),
+            "AK",
+            "SK",
+            "cn-hangzhou",
+            "s3",
+        );
+        assert_eq!(a, b, "首尾空白没被去掉 —— 签名跟着值里的空格一起变了");
+    }
+
+    /// canonical header value 要把内部连续空白压成一个空格。**这条是只做
+    /// `trim()` 的实现杀不掉的** —— `trim()` 只管首尾,内部的两个连续空格
+    /// 会原样签进去,与服务端按规范压缩后重建的串不一致。
+    #[test]
+    fn internal_whitespace_runs_in_a_header_value_are_collapsed_to_one_space() {
+        let mk = |extra: &'static [(&'static str, &'static str)]| Request {
+            method: "GET",
+            host: "b.example.com",
+            path: "/k",
+            query: "",
+            payload_sha256: "abc",
+            amz_date: "20260915T101500Z",
+            extra_headers: extra,
+        };
+        let a = authorization(
+            &mk(&[("x-custom", "a  b")]),
+            "AK",
+            "SK",
+            "cn-hangzhou",
+            "s3",
+        );
+        let b = authorization(&mk(&[("x-custom", "a b")]), "AK", "SK", "cn-hangzhou", "s3");
+        assert_eq!(a, b, "内部连续空白没被压缩 —— 签名跟着中间的空格数一起变了");
+    }
+
+    /// `extra_headers` 的头名必须是小写,大写会静默算出与服务端不一致的签名。
+    /// 这条守住「违约在开发期就能看见」,而不是留到真机 403 才发现。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "extra_headers 的头名必须已是小写")]
+    fn an_uppercase_extra_header_name_panics_in_debug_builds() {
+        let req = Request {
+            method: "GET",
+            host: "b.example.com",
+            path: "/k",
+            query: "",
+            payload_sha256: "abc",
+            amz_date: "20260915T101500Z",
+            extra_headers: &[("Range", "bytes=0-9")],
+        };
+        let _ = authorization(&req, "AK", "SK", "cn-hangzhou", "s3");
+    }
+
+    /// `extra_headers` 里不能再传三个必签头之一(这里用 `host`),否则
+    /// canonical headers 块里会出现两行同名头、SignedHeaders 里出现两次同名
+    /// 条目 —— 非法的 canonical request,服务端只回一条 403。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "extra_headers 不能包含必签头")]
+    fn passing_a_required_header_in_extra_headers_panics_in_debug_builds() {
+        let req = Request {
+            method: "GET",
+            host: "b.example.com",
+            path: "/k",
+            query: "",
+            payload_sha256: "abc",
+            amz_date: "20260915T101500Z",
+            extra_headers: &[("host", "evil.example.com")],
+        };
+        let _ = authorization(&req, "AK", "SK", "cn-hangzhou", "s3");
+    }
+
+    /// `amz_date` 太短会让 `&req.amz_date[..8]` 直接 panic,而且是一条与格式
+    /// 无关的字节索引越界信息。这条断言把它换成一条说明期望格式的消息,
+    /// 在开发期就能看出是「日期格式传错了」而不是别的什么崩溃。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "amz_date 格式不对")]
+    fn a_too_short_amz_date_panics_with_a_format_message_in_debug_builds() {
+        let req = Request {
+            method: "GET",
+            host: "b.example.com",
+            path: "/k",
+            query: "",
+            payload_sha256: "abc",
+            amz_date: "2026",
+            extra_headers: &[],
+        };
+        let _ = authorization(&req, "AK", "SK", "cn-hangzhou", "s3");
     }
 }
