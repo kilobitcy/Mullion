@@ -2603,6 +2603,7 @@ dependencies = [
  "ico",
  "image",
  "log",
+ "mullion-cloud",
  "mullion-core",
  "mullion-ssh",
  "mullion-store",

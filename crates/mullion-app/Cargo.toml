@@ -14,6 +14,9 @@ mullion-core = { path = "../mullion-core" }
 mullion-term = { path = "../mullion-term" }
 mullion-ssh = { path = "../mullion-ssh" }
 mullion-store = { path = "../mullion-store" }
+# F270:云端备份。`app` 是唯一允许同时知道 store 与 cloud 的地方 ——
+# cloud 只认字节与键名,不认识 Pack(架构不变量,见 mullion-cloud 的 lib.rs)。
+mullion-cloud = { path = "../mullion-cloud" }
 winit.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
