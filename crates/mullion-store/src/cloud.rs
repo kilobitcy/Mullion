@@ -570,4 +570,38 @@ mod tests {
         let after = load(dir.path());
         assert_eq!(secret_key(&after, &v).expect("仍应解得开"), "SK-VALUE");
     }
+
+    /// 重封失败之后的**自愈路径**:重填一次 SK 就好。
+    ///
+    /// 这条钉的是 `StoreError::CloudReseal` 那句文案里让用户做的事真的有效。
+    /// 文案说「去设置里把 Access Key Secret 重填一遍」,而 `set_secret_key`
+    /// 若用的不是**当前**密钥,那句话就是在骗人 —— 用户照做之后仍然解不开,
+    /// 从此再没有任何自愈路径(复核登记的 I1:第二次改密码时旧密文解不开,
+    /// 被 `.ok()` 吞成 `None`,重封永远不再发生)。
+    ///
+    /// 自证会变红:让 `set_secret_key` 用一把跟 `secret_key` 不同的密钥。
+    #[test]
+    fn refilling_the_secret_key_recovers_from_a_reseal_that_never_happened() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let ks = crate::master_key::InMemoryKey([5u8; 32]);
+        let mut v = crate::vault::Vault::open(dir.path().to_path_buf(), &ks).expect("开库");
+        let mut c = cfg();
+        set_secret_key(&mut c, &v, "SK-VALUE").expect("封");
+
+        // **故意不把 c 写进 cloud.toml** —— 于是改密码时 `take_cloud_secret_plain`
+        // 读不到东西、重封不会发生,手上这份 `c` 正好就是「一次失败过的 reseal
+        // 留下来的状态」:密文用旧密钥封,而 vault 已经换了新密钥。
+        v.set_master_password("new").expect("改密码");
+        assert!(
+            matches!(secret_key(&c, &v), Err(StoreError::Crypto)),
+            "构造失败:这份密文本该已经解不开了,否则下面测的是个假场景"
+        );
+
+        set_secret_key(&mut c, &v, "SK-VALUE").expect("重填");
+        assert_eq!(
+            secret_key(&c, &v).expect("重填之后必须解得开"),
+            "SK-VALUE",
+            "重填 SK 也救不回来 —— 那条错误文案是在骗用户"
+        );
+    }
 }

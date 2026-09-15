@@ -450,14 +450,26 @@ impl Vault {
     /// F271:用本库当前的密钥封一段**本机文件**用的字节。
     ///
     /// 与 [`Self::seal_with_master`] 的区别只有一个:**不要求主密码方案**。
-    /// 封出来的东西只给本机的 `cloud.toml` 用,不跟着任何包走,所以钥匙串
-    /// 方案下也成立。
+    ///
+    /// **禁止把它的产出放进任何会离开这台机器的东西里**(迁移包、云端载荷、
+    /// 导出文件)。钥匙串方案下封出来的密文只有这台机器解得开,换台机器一个
+    /// 字都读不出来,而症状是「每条会话都要重新输密码」且零报错 —— F46-a 上
+    /// 已经踩过一次。要跟着包走的一律用 [`Self::seal_with_master`],它会在
+    /// 钥匙串方案下直接拒绝。
+    ///
+    /// 今天唯一的调用者是 `cloud.toml` 里的 AK/SK,而 `cloud.toml` 刻意不在
+    /// [`crate::portable::TOP_LEVEL_FILES`] 里(有守护测试钉着)。
     pub fn seal_local(&self, plain: &[u8]) -> Result<Vec<u8>, StoreError> {
         let payload = crypto::encrypt(&self.key, plain)?;
         Ok(crate::secrets_file::encode(&self.scheme, &payload))
     }
 
     /// [`Self::seal_local`] 的逆。
+    ///
+    /// **解出来的 `Scheme` 是故意丢掉的**:能不能解开只取决于 `self.key`,
+    /// 头里那个方案标记纯粹是让这段密文自描述(跟 `secrets.enc` 同形,
+    /// 将来有人拿十六进制看见它时认得出是什么)。别把它「改进」成一道
+    /// 一致性检查 —— 那会在钥匙串↔主密码切换的窗口里拒掉本来解得开的密文。
     pub fn open_local(&self, blob: &[u8]) -> Result<Vec<u8>, StoreError> {
         let (_, payload) = crate::secrets_file::parse(blob)?;
         crypto::decrypt(&self.key, payload)
@@ -521,8 +533,9 @@ impl Vault {
     ///
     /// 失败只报 `Err` **不回滚主密码**:主密码已经换好并落盘了,回滚意味着
     /// 再写一次文件,失败链条更长。云配置坏了是可修的(重填一次 AK/SK),
-    /// 主密码写到一半不是。
-    fn reseal_cloud_secret(&mut self, old_plain: Option<Vec<u8>>) -> Result<(), StoreError> {
+    /// 主密码写到一半不是。**错误一律包成 `CloudReseal`** —— 见那个变体上的
+    /// 注释,调用方靠它把「密码没改成」和「密码改成了但云端密钥掉队」分开。
+    fn reseal_cloud_secret(&self, old_plain: Option<Vec<u8>>) -> Result<(), StoreError> {
         let Some(plain) = old_plain else {
             return Ok(());
         };
@@ -530,11 +543,17 @@ impl Vault {
         if cfg.secret_sealed.is_empty() {
             return Ok(());
         }
+        // **两条出口都要包成 `CloudReseal`**:到这一步主密码已经落盘了,
+        // 往上抛一个裸的 `Io`/`CorruptSecrets` 会被调用方报成「主密码没能改成」,
+        // 而那句话是错的 —— 密码改成了,掉队的是云端那把密钥。
         cfg.secret_sealed = {
             use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode(self.seal_local(&plain)?)
+            let sealed = self
+                .seal_local(&plain)
+                .map_err(|e| StoreError::CloudReseal(e.to_string()))?;
+            base64::engine::general_purpose::STANDARD.encode(sealed)
         };
-        crate::cloud::save(&self.dir, &cfg)
+        crate::cloud::save(&self.dir, &cfg).map_err(|e| StoreError::CloudReseal(e.to_string()))
     }
 
     /// 换密钥**之前**把 SK 解出来。解不开(从没填过/文件坏了)一律 `None` ——

@@ -21,6 +21,14 @@ pub enum StoreError {
     /// `secrets.enc` 的文件头读不懂:被截断 / KDF 或盐长本版本不认。
     /// **与 `Crypto` 分开**:这条说的是「结构不对」,那条说的是「钥匙不对」。
     CorruptSecrets(String),
+    /// 主密码**已经改好并落盘**了,但 `cloud.toml` 里的 AK/SK 没能用新密钥重封。
+    ///
+    /// **与别的改密码失败严格分开**:那些说的是「密码没改成」,这条说的是
+    /// 「密码改成了,云端备份的密钥掉队了」—— 用户的下一步完全不同。
+    /// 报成通用失败的话,用户会重试改密码,而第二次 `take_cloud_secret_plain`
+    /// 拿新密钥去解旧密文,解不开被 `.ok()` 吞成 `None`,重封从此再也不会发生;
+    /// 他还会以为密码仍是旧的,下次启动输旧密码打不开,以为整个库坏了。
+    CloudReseal(String),
     /// `secrets.enc` 由主密码加密,但调用方没给密码。
     PasswordRequired,
     /// 主密码不对。**与 `Crypto` 分开**:用户的下一步动作完全不同
@@ -83,6 +91,11 @@ impl fmt::Display for StoreError {
             StoreError::Crypto => write!(f, "加解密失败 —— 密钥错误或密文损坏"),
             StoreError::Kdf(e) => write!(f, "主密码派生失败:{e}"),
             StoreError::CorruptSecrets(e) => write!(f, "secrets.enc 的文件头读不懂:{e}"),
+            StoreError::CloudReseal(e) => write!(
+                f,
+                "主密码已经改好了,但云端备份的 Access Key Secret 没能用新密钥重封:{e} —— \
+                 不要重试改密码,去设置里的「云端备份」一节把 Access Key Secret 重填一遍即可"
+            ),
             StoreError::PasswordRequired => {
                 write!(f, "secrets.enc 由主密码加密 —— 需要先输入主密码")
             }

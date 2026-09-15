@@ -15545,6 +15545,11 @@ fn finish_password_change(
     }
     match r {
         Ok(()) => ok_msg.to_string(),
+        // F271:**这一条不能说「没能改成」** —— 主密码其实已经换好并落盘了,
+        // 掉队的只是 `cloud.toml` 里的 AK/SK。照通用文案报的话,用户以为密码
+        // 还是旧的,下次启动输旧密码打不开,会以为整个会话库坏了。
+        // `CloudReseal` 的 Display 自带一整句(含自愈动作),直接拿来用。
+        Err(e @ mullion_store::StoreError::CloudReseal(_)) => e.to_string(),
         Err(e) => format!("主密码没能改成:{e}"),
     }
 }
@@ -18266,6 +18271,25 @@ mod tests {
                 "密码留在框里了"
             );
         }
+    }
+
+    /// F271:重封失败**不能**报成「主密码没能改成」—— 那时候密码其实已经改好
+    /// 并落盘了。照通用文案报的话,用户以为密码还是旧的,下次启动输旧密码打不开,
+    /// 他会以为整个会话库坏了。
+    ///
+    /// 自证会变红:把 `finish_password_change` 里那条 `CloudReseal` 分支删掉。
+    #[test]
+    fn a_failed_cloud_reseal_does_not_claim_the_password_was_not_changed() {
+        let msg = finish_password_change(
+            None,
+            Err(mullion_store::StoreError::CloudReseal("盘满了".into())),
+            "主密码已生效",
+        );
+        assert!(
+            !msg.contains("没能改成"),
+            "把「密码已经改好了」报成了「没能改成」:{msg}"
+        );
+        assert!(msg.contains("重填"), "没告诉用户怎么自愈:{msg}");
     }
 
     /// 失败要说**为什么**失败,不能笼统一句「没能改成」——用户下一步是
