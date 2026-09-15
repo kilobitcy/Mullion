@@ -4006,9 +4006,10 @@ Expected: 全绿。
 - [ ] **Step 6: 提交并变异验证**
 
 ```bash
-# **本任务不动 `app.rs`** —— 状态栏那一格在这里先传 `None` 占位,
-# 数据源(`App::cloud_status`)是 Task 14 的事。把 app.rs 一起 add 进来
-# 只会夹带别的在途改动。
+# **本任务不动 `app.rs`**。状态栏那一格的数据源住在 `UiState::cloud_status`
+# (见 Step 4 的理由),生产调用点 `ui/mod.rs:961` **在本任务就真的接上**,
+# 不留占位。Task 14 只负责往 `cloud_status` 里写结论。
+# 把 app.rs 一起 add 进来只会夹带别的在途改动。
 git add crates/mullion-app/src/ui/chrome.rs crates/mullion-app/src/ui/mod.rs
 git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 (F273)
 
