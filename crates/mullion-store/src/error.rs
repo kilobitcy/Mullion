@@ -66,6 +66,12 @@ pub enum StoreError {
     /// 会话引用的凭据不存在。**绝不回落到别的身份**——与 `JumpDangling`
     /// 同一条铁律:静默换一个身份去登录是安全事故(设计 D6)。
     DanglingCredential(CredentialId),
+    /// F270:这个操作要求库是主密码方案,而当前是钥匙串方案。
+    ///
+    /// **不是「加密失败」** —— 加密本身完全能做,只是封出来的东西离不开这台
+    /// 机器。把它跟 `Crypto` 混成一条的话,UI 只能说「加密失败」,而用户需要
+    /// 知道的是「去设一个主密码」。
+    NoMasterPassword,
 }
 
 impl fmt::Display for StoreError {
@@ -126,6 +132,7 @@ impl fmt::Display for StoreError {
                 f,
                 "会话引用的凭据 {id:?} 不存在 —— 它可能已被删除,请重新指定认证方式"
             ),
+            StoreError::NoMasterPassword => write!(f, "这个操作需要先设置主密码"),
         }
     }
 }

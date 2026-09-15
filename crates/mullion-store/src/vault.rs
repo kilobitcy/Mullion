@@ -424,6 +424,35 @@ impl Vault {
         self.scheme.has_password()
     }
 
+    /// F270:用**当前库的密钥**封一段字节,产出带 `secrets_file` 文件头的 blob。
+    ///
+    /// 文件头里的盐与 KDF 参数是**另一台机器能解开它的全部前提**:对面只有
+    /// 主密码,盐得从 blob 里读回来。
+    ///
+    /// **钥匙串方案一律拒绝**(设计 D6):那把密钥躺在本机钥匙串里,封出来的
+    /// 东西换台机器一个字都解不开,而云备份的主场景正是「换新电脑」。
+    pub fn seal_with_master(&self, plain: &[u8]) -> Result<Vec<u8>, StoreError> {
+        if !self.scheme.has_password() {
+            return Err(StoreError::NoMasterPassword);
+        }
+        let payload = crypto::encrypt(&self.key, plain)?;
+        Ok(crate::secrets_file::encode(&self.scheme, &payload))
+    }
+
+    /// [`Self::seal_with_master`] 的逆。**只解本机自己封的那一份** ——
+    /// 用别的盐封的(换过主密码之前那些)在这里会失败,由调用方去解释成
+    /// 「需要旧主密码」而不是「文件坏了」(设计 D13)。
+    pub fn open_with_master(&self, blob: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let (_, payload) = crate::secrets_file::parse(blob)?;
+        crypto::decrypt(&self.key, payload)
+    }
+
+    /// F270:当前的密钥方案。云端备份要拿它的 salt 判断「这份是不是本机
+    /// 当前主密码封的」(设计 D14 的清理判据)。
+    pub fn scheme(&self) -> crate::secrets_file::Scheme {
+        self.scheme
+    }
+
     /// 设定或修改主密码(F71)。换新盐、重新派生、**立刻整文件重写**。
     ///
     /// 空密码不算密码:那会让「已设定」这个状态对应一个人人都能解开的库。
@@ -1395,6 +1424,60 @@ mod tests {
 
     fn key() -> InMemoryKey {
         InMemoryKey([5u8; 32])
+    }
+
+    /// 云端备份要把整包用**当前 vault 的密钥**封起来(设计 D5)。
+    ///
+    /// 封出来的字节必须带 `secrets_file` 的文件头(salt + KDF 参数),因为另一台
+    /// 机器只有主密码,盐得从包里读回来 —— 盐不随包走的话,对面拿主密码派生出
+    /// 的是另一把钥匙,症状是「主密码明明没错却解不开」。
+    #[test]
+    fn a_blob_sealed_with_the_master_key_carries_the_salt_so_another_machine_can_open_it() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+
+        let blob = v.seal_with_master(b"payload").expect("封装");
+        let (scheme, _) = crate::secrets_file::parse(&blob).expect("解析头");
+        assert!(
+            scheme.has_password(),
+            "封出来的东西没有口令头 —— 换台机器就解不开了"
+        );
+
+        // 「另一台机器」= 只有主密码,没有本机钥匙串。
+        let crate::secrets_file::Scheme::Argon2id { params, salt } = scheme else {
+            unreachable!()
+        };
+        let derived = crate::kdf::derive_key("hunter2", &salt, params).expect("派生");
+        let payload = crate::secrets_file::parse(&blob).unwrap().1;
+        assert_eq!(
+            crate::crypto::decrypt(&derived, payload).expect("解密"),
+            b"payload"
+        );
+    }
+
+    /// 没设主密码时**拒绝封装**,不是照封(设计 D6)。
+    ///
+    /// 钥匙串方案下 `key` 来自本机钥匙串,封出来的东西换台机器一个字都解不开 ——
+    /// 而云备份的主场景恰恰是「换新电脑」。照封的后果是用户以为自己有备份,
+    /// 直到真的换机那天才发现,且那时候旧机器可能已经不在了。
+    #[test]
+    fn sealing_is_refused_without_a_master_password_because_the_keyring_key_cannot_travel() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let v = Vault::open(dir.path().to_path_buf(), &key()).expect("开库");
+        assert!(
+            matches!(v.seal_with_master(b"x"), Err(StoreError::NoMasterPassword)),
+            "钥匙串方案下必须拒绝封装"
+        );
+    }
+
+    #[test]
+    fn a_blob_sealed_with_the_master_key_round_trips_locally() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+        let blob = v.seal_with_master(b"round trip").expect("封装");
+        assert_eq!(v.open_with_master(&blob).expect("解开"), b"round trip");
     }
 
     /// F258:一个装了一条会话的库,给「记一笔连接」类测试复用。
