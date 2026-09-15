@@ -4080,9 +4080,21 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
     #[test]
     fn only_one_cloud_upload_is_in_flight_at_a_time() {
         let body = strip_comments(body_of(prod_src(), "fn spawn_cloud_backup("));
+        let after = body
+            .split_once("if self.cloud_in_flight {")
+            .expect("没有在途闸 —— 定时与手动会攒出一串并发上传并互相撞号")
+            .1;
+        // 闸体到它那句 `return;` 为止。**用 `return;` 收尾,不用缩进或右大括号
+        // 收尾** —— 后两者把判据绑死在 rustfmt 当下的折行/缩进决定上,
+        // 谁把这个函数挪进另一层嵌套,守护就当场假红。
+        let gate = after
+            .split_once("return;")
+            .expect("在途闸里没有 return —— 它没在挡任何东西")
+            .0;
         assert!(
-            body.contains("if self.cloud_in_flight {"),
-            "没有在途闸 —— 定时与手动会攒出一串并发上传并互相撞号"
+            gate.contains("set_error"),
+            "在途时手动点「立刻备份到云」是完全静默的 —— 一次高延迟上传可能跑几分钟,\
+             用户会以为没点着,然后接着再点几下(F265 的形状:事情在做,只是没有信号通道):{gate}"
         );
     }
 
@@ -4270,12 +4282,23 @@ Expected: FAIL。
     /// 已有在途的就**直接回**(不排队:排队等于把「已经过时的那一份」推上去,
     /// 而下一轮会立刻再推一份新的)。
     ///
-    /// `manual` = 用户从菜单点的。**只影响「没变」时说不说话**:定时那条
-    /// 每半小时静悄悄地不做事是对的,而用户主动点了「立刻备份到云」却什么
-    /// 都不发生,就是「点了没反应」(F265 记过同一形状:功能在那儿,
+    /// `manual` = 用户从菜单点的。**只影响「什么都没发生时说不说话」**:
+    /// 定时那条每半小时静悄悄地不做事是对的,而用户主动点了「立刻备份到云」
+    /// 却什么都不发生,就是「点了没反应」(F265 记过同一形状:功能在那儿,
     /// 用户不知道它起没起作用)。
+    ///
+    /// 这样的出口有**两个**,两个都要说话:「上一次还在传」和「内容没变」。
+    /// 剩下那些出口(拿不到配置目录、库没打开)是真出了事,本来就会报错。
     fn spawn_cloud_backup(&mut self, manual: bool) {
         if self.cloud_in_flight {
+            // 定时那一路默默跳过就行。**手动点的必须说一句** —— 一次高延迟
+            // 上传可能跑几分钟,这期间用户再点一下「立刻备份到云」会是完全
+            // 静默的「点了没反应」,而他多半会接着再点几下。
+            // 这正是 F265 记过的形状:事情在做,只是没有信号通道。
+            if manual {
+                self.ui
+                    .set_error("云端备份:上一次还在传,传完再试".into());
+            }
             return;
         }
         let Some(dir) = crate::shell::store::config_dir() else {
@@ -4751,7 +4774,8 @@ git commit -m "feat(app): 云端备份的定时驱动与结果回收 (F273)
 |---|---|
 | `spawn_cloud_backup` 里去掉 `spawn_blocking`，直接同步调 | `the_cloud_upload_runs_off_the_event_loop_thread` |
 | `self._runtime.spawn_blocking(` 改成 `tokio::task::spawn_blocking(` | 同上（这条变异**编译得过**，正是它要挡的那种：真机首次备份 panic） |
-| 去掉 `if self.cloud_in_flight { return; }` 那句 | `only_one_cloud_upload_is_in_flight_at_a_time` |
+| 去掉 `if self.cloud_in_flight { return; }` 那句 | `only_one_cloud_upload_is_in_flight_at_a_time`（`split_once` 的 `expect` 炸） |
+| 在途闸里删掉 `if manual { self.ui.set_error(..) }` | 同上（第二条断言）。**这条是新加的** —— 在途时手动点击会变回完全静默 |
 | `CloudBackupDone` 分支里删掉 `self.cloud_in_flight = false;` | `every_path_that_ends_a_cloud_upload_hands_the_in_flight_flag_back` |
 | `pump_io` 里注释掉 `self.drive_cloud_backup(now);` | `the_cloud_backup_is_driven_every_frame` |
 | 把那句从 `pump_io` 挪进一个偶尔才走的分支（例如 `if flushed { .. }` 里） | 同上。**这条是那条守护真正要挡的东西** —— 判据若写成「扫全篇找 `self.drive_cloud_backup(`」，这条逃得掉，而定时备份会变成碰运气才跑一次 |
