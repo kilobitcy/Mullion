@@ -2400,10 +2400,36 @@ git commit -m "feat(store): AK/SK 用 vault key 封存,改主密码时连带重�
         );
     }
 
+    /// 一份**填完整了**的配置。
+    ///
+    /// **`should_upload` 的测试一律用这个,不要用 `cfg()`。** `cfg()` 的
+    /// `access_key_id` / `secret_sealed` 是空的(Task 8 那几条测的是读写往返,
+    /// 不需要填),而 `should_upload` 的第一道闸就是「配置完不完整」——
+    /// 拿 `cfg()` 去测的话,`a_changed_fingerprint_...` 会直接红,而
+    /// `an_unchanged_fingerprint_...` 会**恒绿**:它返回 false 是因为「没填完」,
+    /// 跟指纹判据一点关系都没有,把指纹那一条整个删掉它照样绿。
+    fn ready_cfg() -> CloudConfig {
+        CloudConfig {
+            access_key_id: "AK".into(),
+            secret_sealed: "sealed".into(),
+            ..cfg()
+        }
+    }
+
+    /// 先钉住 `ready_cfg` 真的是「会推」的那一档 —— 否则下面每一条
+    /// `assert!(!should_upload(..))` 都可能是因为别的原因恒假。
+    #[test]
+    fn the_ready_config_is_actually_uploadable() {
+        assert!(
+            should_upload(&ready_cfg(), "brand-new", 999),
+            "ready_cfg 本身就推不动 —— 下面那几条「不推」的断言全都测不到自己想测的东西"
+        );
+    }
+
     /// 关着的时候永远不推 —— 哪怕内容变了。
     #[test]
     fn a_disabled_config_never_uploads() {
-        let mut c = cfg();
+        let mut c = ready_cfg();
         c.enabled = false;
         assert!(!should_upload(&c, "new-fp", 999));
     }
@@ -2412,14 +2438,14 @@ git commit -m "feat(store): AK/SK 用 vault key 封存,改主密码时连带重�
     /// 推一份一模一样的包,20 份历史会在 10 小时内被自己刷光。
     #[test]
     fn an_unchanged_fingerprint_does_not_upload() {
-        let mut c = cfg();
+        let mut c = ready_cfg();
         c.last_fingerprint = "same".into();
         assert!(!should_upload(&c, "same", 999));
     }
 
     #[test]
     fn a_changed_fingerprint_uploads_once_the_interval_has_passed() {
-        let mut c = cfg();
+        let mut c = ready_cfg();
         c.last_fingerprint = "old".into();
         c.interval_min = 30;
         assert!(!should_upload(&c, "new", 29), "还没到点就推了");
@@ -2430,23 +2456,25 @@ git commit -m "feat(store): AK/SK 用 vault key 封存,改主密码时连带重�
     /// 若写成「指纹为空 → 不推」,开了开关的用户永远等不到第一份备份。
     #[test]
     fn a_config_that_never_uploaded_still_gets_its_first_push() {
-        let mut c = cfg();
+        let mut c = ready_cfg();
         c.last_fingerprint = String::new();
         assert!(should_upload(&c, "first", 30));
     }
 
-    /// 配置不全(endpoint/bucket/AK 任一为空)时不推 —— 推了也只会拿到一条
+    /// 配置不全(endpoint/bucket/AK/SK 任一为空)时不推 —— 推了也只会拿到一条
     /// 网络错误,而状态栏会把它报成「备份失败」,掩盖真正的原因是「没填完」。
+    ///
+    /// **四个字段逐个试**,不是只试一个:少判任一个的症状都一样(开着开关、
+    /// 每轮都发一次注定 403 的请求),而只试一个的话漏掉的那几个零报错。
     #[test]
     fn an_incomplete_config_does_not_upload() {
-        for spoil in ["endpoint", "bucket", "ak"] {
-            let mut c = cfg();
-            c.access_key_id = "AK".into();
-            c.secret_sealed = "x".into();
+        for spoil in ["endpoint", "bucket", "ak", "sk"] {
+            let mut c = ready_cfg();
             match spoil {
                 "endpoint" => c.endpoint = String::new(),
                 "bucket" => c.bucket = String::new(),
-                _ => c.access_key_id = String::new(),
+                "ak" => c.access_key_id = String::new(),
+                _ => c.secret_sealed = String::new(),
             }
             assert!(!should_upload(&c, "fp", 999), "{spoil} 为空时不该推");
         }
@@ -2538,7 +2566,13 @@ git commit -m "feat(store): 对象键命名、序号推进与上传决策 (F273)
 | `next_seq` 的 `map_or(1, ..)` 改成 `map_or(0, ..)` | `the_next_sequence_is_one_past_the_largest_existing` |
 | `should_upload` 里删掉指纹那条 | `an_unchanged_fingerprint_does_not_upload` |
 | `should_upload` 里删掉配置完整性那一段 | `an_incomplete_config_does_not_upload` |
+| 完整性那段里**只删 `secret_sealed.is_empty()` 一项** | `an_incomplete_config_does_not_upload`（`sk` 那一轮） |
 | `>=` 改成 `>` | `a_changed_fingerprint_uploads_once_the_interval_has_passed` |
+| `!cfg.enabled` 那条改成 `false`（即永不因开关拦下） | `a_disabled_config_never_uploads` |
+
+**`ready_cfg` 是这一组的前提，不是装饰。** 跑变异前先确认
+`the_ready_config_is_actually_uploadable` 是绿的；它一红，下面每条
+「不推」的断言都失去意义（会因为别的原因恒假），此时任何变异结果都不算数。
 
 ---
 
