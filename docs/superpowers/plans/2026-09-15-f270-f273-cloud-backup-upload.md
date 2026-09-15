@@ -2600,6 +2600,34 @@ git commit -m "feat(store): 对象键命名、序号推进与上传决策 (F273)
 
 ## Task 11: app —— 上传编排（`cloudsync.rs`）
 
+> **已完成**（`46214ca` `d4a912c` `b637967` `8f5d141` `10ec3fa`）。15 条测试，
+> 五条变异全部杀掉。两轮质量复核挖出的东西值得记下来：
+>
+> 1. **「读不出来」被当成「没有」**（原 `fs::read(..).unwrap_or_default()`，两处）。
+>    复核实跑证实非空 `secrets.enc` 读失败时算出的指纹与「文件不存在」逐字节相同 ——
+>    一次瞬时 IO 失败会让一份**密文段是空的**备份被正常加密、正常上传、正常推进游标，
+>    恢复那天 `portable` 还把空密文段解释成「源机没有密码」这个合法状态。
+>    修法是 `read_secrets` 把 `NotFound` 与其余错误分开。
+> 2. **守护只推到一半**。第一版只守住 `read_secrets` / `fingerprint_now` 这一层，
+>    把 `prepare` 里那一行单独退回 `unwrap_or_default()` 仍然 14/14 全绿 ——
+>    而 `prepare` 才是真正走到「打包 → 加密 → 上传」的那条路。守护必须
+>    **顺着调用链推到真正产出上传内容的那一层**。
+> 3. **测「读不出来」用同名目录，不用 `chmod 0o000`**（Windows 上 chmod 是 no-op）。
+>    但注意 `Vault::open_with` 自己就是 `if secrets_path.exists() { fs::read(..)? }`
+>    （`vault.rs:170`），同名目录会让开库先失败 —— 所以测试要**两个目录**：
+>    vault 开在干净的那个，`prepare` 指向放了同名目录的那个。
+> 4. **`msg.contains("主密码")` 挡不住分支合并**：`StoreError::NoMasterPassword`
+>    的 `Display` 本身就是「这个操作需要先设置主密码」，并进通用
+>    `Err(e) => Failed(format!("加密失败:{e}"))` 之后消息仍然含「主密码」。
+>    靠补一条 `!msg.starts_with("加密失败")` 才分得开。
+>
+> **遗留债（登记，不在本切片修）**：那条守护现在是两条字符串断言，判据搭在
+> `StoreError::NoMasterPassword` 的 `Display` 文案上。更稳的做法是在 `prepare`
+> 里先 `matches!(err, StoreError::NoMasterPassword)` 再格式化，但那要改
+> `Prepared::Failed(String)` 的错误传递结构。`mullion-cloud/src/error.rs` 的注释里
+> 已经为**控制流**画过同一条红线（「不要靠 match 错误消息文本做控制流」），
+> 这里是测试判据、性质轻一档，但同根。
+
 **Files:**
 - Create: `crates/mullion-app/src/cloudsync.rs`
 - Modify: `crates/mullion-app/src/lib.rs`
