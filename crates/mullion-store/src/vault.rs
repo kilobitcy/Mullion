@@ -1503,22 +1503,28 @@ mod tests {
         );
     }
 
-    /// 换过主密码之后,**旧 blob 解不开**且不 panic(设计 D13)。
+    /// 重设主密码之后,**旧 blob 解不开**且不 panic(设计 D13)。
     ///
-    /// 每次设主密码都会滚一把新盐,派生出来的是另一把钥匙。调用方要能把这个
-    /// 失败解释成「需要旧主密码」而不是「文件坏了」,前提是它真的走错误分支
-    /// 回来,而不是在解密那层炸掉。
+    /// **故意用同一个密码重设**:这样唯一变的就是盐,判据才真的扎在「每次
+    /// 都滚一把新盐」上。用不同密码写的话,密码不同本身就足以让 key 不同 ——
+    /// 实测过「重设时复用旧盐」这条变异在那种写法下全绿活下来。
+    ///
+    /// 调用方要能把这个失败解释成「需要旧主密码」而不是「文件坏了」,前提是
+    /// 它真的走错误分支回来,而不是在解密那层炸掉。
+    ///
+    /// 自证会变红:`set_master_password` 里把 `random_salt()` 换成沿用
+    /// `self.scheme` 里的旧盐。
     #[test]
-    fn a_blob_sealed_before_the_password_changed_no_longer_opens() {
+    fn a_blob_sealed_before_the_password_was_reset_no_longer_opens() {
         let dir = tempfile::tempdir().expect("临时目录");
         let mut v = Vault::open(dir.path().to_path_buf(), &key()).expect("开库");
         v.set_master_password("hunter2").expect("设主密码");
         let old = v.seal_with_master(b"payload").expect("封装");
 
-        v.set_master_password("hunter3").expect("换主密码");
+        v.set_master_password("hunter2").expect("重设同一个主密码");
         assert!(
             matches!(v.open_with_master(&old), Err(StoreError::Crypto)),
-            "换过密码后旧 blob 竟然还解得开,或者报成了别的错因"
+            "重设主密码后旧 blob 竟然还解得开 —— 盐没有轮换"
         );
     }
 
