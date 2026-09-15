@@ -3259,17 +3259,63 @@ Expected: FAIL。
     pub cloud_secret_new: String,
 ```
 
-并加一个构造器（保留原 `from_settings` 给别处用，新的是它的超集）：
+并**把现有的 `from_settings`（`settings.rs:84-97`）改成一行转发**，让新的
+`from_settings_and_cloud` 成为唯一那个穷尽字面量。今天它长这样：
 
 ```rust
+    /// 从落盘的设置起一份草稿。
+    pub fn from_settings(s: &mullion_store::Settings) -> Self {
+        Self {
+            family: s.font_family.clone(),
+            font_pt: s.font_pt,
+            typed: s.font_family.clone().unwrap_or_default(),
+            new_password: String::new(),
+            confirm_password: String::new(),
+            tmux_bootstrap: s.tmux_bootstrap,
+            shell_osc7_bootstrap: s.shell_osc7_bootstrap,
+            show_hidden_files: s.show_hidden_files,
+            log_level: s.log_level,
+        }
+    }
+```
+
+改成这两个（**注意方向**：新的是原始构造器，旧的转发给它）：
+
+```rust
+    /// 从落盘的设置起一份草稿。云端那一节按 `CloudConfig::default()` 起手。
+    ///
+    /// **生产路径上没人该调它** —— 设置弹窗走
+    /// [`Self::from_settings_and_cloud`],因为这一个读不到 `cloud.toml`,
+    /// 拿它起的草稿云端字段全是默认值,而「确定」是会把草稿写回
+    /// `cloud.toml` 的:endpoint / bucket / AK 会被一次「打开设置再点确定」
+    /// 悄悄清空(本项目登记过的「整份覆盖」缺陷族,已经踩过五处)。
+    /// 留着它只为那些跟云端毫无关系的单测能少写一个参数;
+    /// `app.rs` 里有一条守护钉着生产代码不许出现它。
+    pub fn from_settings(s: &mullion_store::Settings) -> Self {
+        Self::from_settings_and_cloud(s, &mullion_store::CloudConfig::default())
+    }
+
     /// F271:从落盘的设置 + 落盘的云配置起一份草稿。
     ///
-    /// **两个文件各读各的** —— 云配置在 `cloud.toml`,它不进迁移包。
+    /// **两个文件各读各的** —— 设置在 `settings.toml`,云配置在 `cloud.toml`,
+    /// 后者不进迁移包(见 `mullion_store::cloud` 的模块文档)。
+    ///
+    /// 这里是 `SettingsDraft` **唯一**的穷尽字面量。加字段时只有这一处要改,
+    /// 漏了当场编译不过 —— 而不是「有两处、改了一处、另一处悄悄给了错值」。
     pub fn from_settings_and_cloud(
         s: &mullion_store::Settings,
         c: &mullion_store::CloudConfig,
     ) -> Self {
         Self {
+            family: s.font_family.clone(),
+            font_pt: s.font_pt,
+            typed: s.font_family.clone().unwrap_or_default(),
+            new_password: String::new(),
+            confirm_password: String::new(),
+            tmux_bootstrap: s.tmux_bootstrap,
+            shell_osc7_bootstrap: s.shell_osc7_bootstrap,
+            show_hidden_files: s.show_hidden_files,
+            log_level: s.log_level,
             cloud_enabled: c.enabled,
             cloud_endpoint: c.endpoint.clone(),
             cloud_region: c.region.clone(),
@@ -3280,13 +3326,14 @@ Expected: FAIL。
             cloud_interval_min: c.interval_min,
             cloud_socks5: c.socks5.clone(),
             cloud_access_key_id: c.access_key_id.clone(),
+            // **空 = 不改**,不是「清空」。见字段上那段理由。
             cloud_secret_new: String::new(),
-            ..Self::from_settings(s)
         }
     }
 ```
 
-（`from_settings` 里对应的十个字段补上默认值，让它仍能单独编过。）
+**别反过来写**（`from_settings_and_cloud` 里用 `..Self::from_settings(s)`）——
+那是无限递归，而且会留下两处字面量。
 
 - [ ] **Step 4: 加常量与分节函数**
 
@@ -3529,8 +3576,7 @@ fn interact_env(d: &mut SettingsDraft, label: &str, offset: egui::Vec2, release:
     }
 ```
 
-Step 3 加了 11 个字段之后**这里当场编译不过**（`app.rs:18252` 是**另一处**同样的
-字面量，由 Step 6 收拾；两处都要改，漏一处就编不过）。改成：
+Step 3 加了 11 个字段之后**这里当场编译不过**。改成：
 
 ```rust
     fn draft() -> SettingsDraft {
@@ -3545,6 +3591,44 @@ Step 3 加了 11 个字段之后**这里当场编译不过**（`app.rs:18252` �
         }
     }
 ```
+
+**全库一共有三处穷尽的 `SettingsDraft` 字面量，三处都要改，漏一处就编不过**
+（已核实；其余五处都是 `..draft()`，不用动）：
+
+1. `settings.rs:590` `fn draft()` —— 就是上面这一处。
+2. `settings.rs:815`（测试 `a_font_family_that_is_not_installed_says_so`）—— 见下。
+3. `app.rs:18252`（测试 `a_password_change_always_clears_the_two_boxes`）—— Step 6。
+
+`settings.rs:815` 今天长这样：
+
+```rust
+        let mut d = SettingsDraft {
+            family: Some("Comic Sans MS".into()),
+            font_pt: 10.0,
+            typed: "Comic Sans MS".into(),
+            new_password: String::new(),
+            confirm_password: String::new(),
+            tmux_bootstrap: true,
+            shell_osc7_bootstrap: true,
+            show_hidden_files: true,
+            log_level: mullion_store::LogLevel::Info,
+        };
+```
+
+改成只覆盖它真正在意的那三项（这条测的是「选了没装的字体要提示」，跟别的字段
+一点关系都没有）：
+
+```rust
+        let mut d = SettingsDraft {
+            family: Some("Comic Sans MS".into()),
+            font_pt: 10.0,
+            typed: "Comic Sans MS".into(),
+            ..draft()
+        };
+```
+
+（`draft()` 就在同一个 `mod tests` 里，同文件另外四处 `SettingsDraft { .. }`
+用的都是它。）
 
 **注意语义变化**：`from_settings(&Settings::default())` 给的 `tmux_bootstrap` /
 `shell_osc7_bootstrap` / `show_hidden_files` / `log_level` 是 `Settings::default()`
@@ -4332,9 +4416,21 @@ fn now_compact() -> String {
             body.contains("from_settings_and_cloud"),
             "设置弹窗的草稿没接上云配置 —— 云端分节会永远显示空白:{body}"
         );
-        assert!(
-            !body.contains("SettingsDraft::from_settings("),
-            "还在调只读 settings 的那个构造器:{body}"
+        // 这一条**故意扫全篇生产代码,不只是这个函数体**:
+        // `from_settings` 起的草稿云端字段全是默认值,而「确定」会把草稿写回
+        // `cloud.toml` —— 任何一个新冒出来的调用点都意味着 endpoint / bucket /
+        // AK 会被一次「打开设置再点确定」悄悄清空(「整份覆盖」缺陷族,
+        // 本项目已踩过五处)。只守着这一个函数体的话,新加的调用点照样溜过去。
+        //
+        // 注意 `from_settings_and_cloud(` **不含**子串 `from_settings(`
+        // (中间隔着 `_and_cloud`),所以这条不会误伤上面那句。
+        assert_eq!(
+            strip_comments(&production)
+                .matches("SettingsDraft::from_settings(")
+                .count(),
+            0,
+            "生产代码里还有人在调只读 settings 的那个构造器 —— \
+             用它起的草稿云端字段全是默认值,一次「确定」就会把 AK/endpoint 清空"
         );
     }
 ```
