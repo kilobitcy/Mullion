@@ -3331,14 +3331,19 @@ fn cloud(
             // 直到有天发现 bucket 里几百个对象。这类「看得见摸不着的开关」
             // 本项目在 F265 上刚吃过一次(「灯早就有了,用户根本没注意到」的
             // 反面:控件早就有了,用户以为它在起作用)。
-            // 走 `theme::hint_text` 而不是 `RichText::new(..).small()`:
-            // egui 自己算的弱文本颜色达不到 AA 对比度,项目里所有提示小字
-            // 都必须过这一层(见 theme.rs 的 `hint_text` 与它那两条守护测试)。
+            //
+            // 小字用 `.size(11.0)` + `c32(t.fg_muted)`,跟本分节另外两处说明
+            // 以及 `settings.rs` 里其余六处同形。**别改成 `theme::hint_text`**:
+            // 那一层是给 `TextEdit` 的 hint 用的(egui 派生的 weak 色达不到 AA),
+            // 它给的是 `fg_dimmer`,跟并排的两段说明会深浅不一。这个文件里两套
+            // 写法确实并存(6 处 vs 2 处),新写的一律跟多数那套走,
+            // 至少别在同一个分节里混用。
             ui.label("");
-            ui.label(theme::hint_text(
-                t,
-                "下一个版本生效：当前版本只往上传，不清理旧份",
-            ));
+            ui.label(
+                egui::RichText::new("下一个版本生效：当前版本只往上传，不清理旧份")
+                    .size(11.0)
+                    .color(theme::c32(t.fg_muted)),
+            );
             ui.end_row();
 
             ui.label("检查间隔");
