@@ -67,6 +67,10 @@ pub fn record_success(cfg: &mut CloudConfig, fingerprint: &str, seq: u64, at: &s
 /// 失败之后**什么都不改**。单独写成一个函数而不是「在调用点什么都不写」:
 /// 有名字的空操作挡得住「顺手在这里记一下免得下次重试」那种改动,
 /// 而那种改动会让这次没推上去的改动永远推不上去。
+///
+/// **目前没有任何调用点** —— `CloudBackupDone` 的失败分支根本不加载
+/// `cfg`,比调一个空操作更彻底。哪天那条分支要碰 `cfg` 了,第一件事是
+/// 把它调起来。
 pub fn record_failure(_cfg: &mut CloudConfig) {}
 
 /// 把 `cloud.toml` 里的 `last_ok_at` 折算成 [`cloud::should_upload`] 要的

@@ -2462,6 +2462,10 @@ pub struct App {
     /// 而不是「上次真的推成」,一个开开关关的用户每次启动都会立刻推一份,
     /// 把 keep 份历史窗口按开机次数刷光(T11:计时从「事情真的成了」起算)。
     cloud_last_check_ms: u64,
+    /// F273:上一条**已经弹过卡片**的云备份失败文案。只用来给
+    /// `should_pop_cloud_error` 去重,不落盘。成功一次就清掉 —— 否则
+    /// 「失败→修好→又坏了」的第二次失败会被当成重复而咽掉。
+    cloud_last_err: Option<String>,
 }
 
 /// F55:一条传输 job 从入队到落地牵扯到的全部状态。
@@ -3090,6 +3094,7 @@ impl App {
             project_takeover: None,
             cloud_in_flight: false,
             cloud_last_check_ms: 0,
+            cloud_last_err: None,
         }
     }
 
@@ -3576,7 +3581,7 @@ impl App {
                 return;
             }
             crate::cloudsync::Prepared::Failed(msg) => {
-                self.ui.set_error(format!("云端备份失败:{msg}"));
+                self.report_cloud_failure(msg, manual);
                 return;
             }
             crate::cloudsync::Prepared::Ready(p) => p,
@@ -3595,6 +3600,26 @@ impl App {
                 crate::cloudsync::upload_blocking(payload, &cfg, &stamp_compact, &stamp_rfc3339);
             let _ = proxy.send_event(UserEvent::CloudBackupDone(outcome));
         });
+    }
+
+    /// F273:云备份失败的**唯一**出口。两条路都走它:预检失败
+    /// (`Prepared::Failed`,还没起线程)和上传失败(`UploadOutcome::Failed`)。
+    ///
+    /// 常驻信号永远更新,打断式信号去重 —— 理由见 `should_pop_cloud_error`。
+    /// 状态栏那一格的文案是**写死的中文**,不拼 `msg`:那一格是常驻的,
+    /// 而 `msg` 里可能有远端来的字节,机械守护 `tests/glyph_whitelist.rs`
+    /// 只扫源码字面量,扫不到运行时拼出来的值(陷阱 T9,豆腐块)。
+    /// 详细原因走错误卡片和日志,那两条不吃这个亏。
+    fn report_cloud_failure(&mut self, msg: String, manual: bool) {
+        log::warn!("云端备份失败:{msg}");
+        self.ui.cloud_status = Some(crate::ui::chrome::CloudCell {
+            text: "云 备份失败".into(),
+            severity: crate::tunnels::Severity::Danger,
+        });
+        if should_pop_cloud_error(self.cloud_last_err.as_deref(), &msg, manual) {
+            self.ui.set_error(format!("云端备份失败:{msg}"));
+        }
+        self.cloud_last_err = Some(msg);
     }
 
     /// F273:每帧看一眼该不该起一次定时备份。
@@ -12158,17 +12183,18 @@ impl ApplicationHandler<UserEvent> for App {
                             text: format!("云 已备份 #{seq}"),
                             severity: crate::tunnels::Severity::Calm,
                         });
+                        // 成功一次就把去重记忆清掉 —— 不清的话,
+                        // 「失败→修好→又坏了」的第二次失败会被当成重复咽掉。
+                        self.cloud_last_err = None;
                     }
                     crate::cloudsync::UploadOutcome::Unchanged => {
                         // 没变不是失败,不动状态栏那一格。
                     }
+                    // `false`:结果回来时已经分不出当初是手动点的还是定时的
+                    // 了 —— 手动那次的即时答复在 `spawn_cloud_backup` 的
+                    // 预检阶段(`Prepared::Failed`)就已经给过一次。
                     crate::cloudsync::UploadOutcome::Failed(msg) => {
-                        log::warn!("云端备份失败:{msg}");
-                        self.ui.cloud_status = Some(crate::ui::chrome::CloudCell {
-                            text: "云 备份失败".into(),
-                            severity: crate::tunnels::Severity::Danger,
-                        });
-                        self.ui.set_error(format!("云端备份失败:{msg}"));
+                        self.report_cloud_failure(msg, false);
                     }
                 }
             }
@@ -15556,6 +15582,22 @@ fn now_compact() -> String {
     )
 }
 
+/// 同一条云备份失败文案,要不要再弹一次**打断式**的错误卡片。
+///
+/// 定时那条每 60 秒重试一次,而持久性失败(没设主密码、网络长时间不通)
+/// 每次都失败在同一个地方。无条件弹的话,`set_error` 会把 `error_dismissed`
+/// 重置掉 —— 用户刚点掉的卡片 60 秒后原地复活,无限期,而且没有自愈路径。
+///
+/// **不能靠「定时那条干脆别说话」来治**:那会把这个功能推到它自己最怕的
+/// 那一头(静默失败是备份功能唯一致命的失败模式)。分工是:常驻信号
+/// (状态栏那一格)永远更新,打断式信号去重。
+///
+/// `manual` 恒为真:用户刚点了「立刻备份到云」,他等的就是一个即时答复,
+/// 哪怕跟上次一模一样。
+fn should_pop_cloud_error(last: Option<&str>, msg: &str, manual: bool) -> bool {
+    manual || last != Some(msg)
+}
+
 /// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
 /// 「距上次输入多少毫秒」,不碰 `&App`,理由同 `sync_timeout_wake_at`(`App`
 /// 在无 GPU/窗口的环境下构造不出来,这几条分支只能靠这条路径单测)。
@@ -16233,11 +16275,11 @@ mod tests {
         leaf_identity_of, new_pane_emulator, next_auto_dial, next_panel_selection_index,
         opt_buf_dirty, pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
         reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
-        should_check_attach, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
-        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
-        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, Modal, OpFollow,
-        PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
-        UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
+        should_check_attach, should_pop_cloud_error, snapshot_tabs_of, sync_plan_of,
+        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
+        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -24920,6 +24962,69 @@ mod tests {
             body.matches("self.cloud_in_flight = false").count(),
             1,
             "在途标记的归还不是恰好一处 —— 漏了之后永远不再备份,多了说明有分支在自己兜底"
+        );
+    }
+
+    /// F273:持久性失败不许把用户关掉的卡片一遍遍弹回来。
+    ///
+    /// 四种情形分开钉:同一条文案第二次不弹(这是本条存在的理由);
+    /// 换了条文案要弹(否则「修好一个又坏一个」被咽掉);手动点的永远弹
+    /// (用户刚点了按钮,等的就是即时答复);成功清空之后要弹。
+    #[test]
+    fn a_repeated_cloud_failure_does_not_keep_popping_the_same_card() {
+        assert!(should_pop_cloud_error(None, "需要先设置主密码", false));
+        assert!(!should_pop_cloud_error(
+            Some("需要先设置主密码"),
+            "需要先设置主密码",
+            false
+        ));
+        assert!(should_pop_cloud_error(
+            Some("需要先设置主密码"),
+            "连不上 endpoint",
+            false
+        ));
+        assert!(should_pop_cloud_error(
+            Some("需要先设置主密码"),
+            "需要先设置主密码",
+            true
+        ));
+    }
+
+    /// F273:两条失败路径都必须走 `report_cloud_failure`。
+    ///
+    /// 漏一条的后果不对称:预检失败那条漏了,状态栏永远不变红 —— 用户看到
+    /// 「一张关不掉的卡片 + 一个说一切正常的状态栏」,正好反了。这正是本项目
+    /// 登记过的「量具存在≠接在那条路上」。
+    ///
+    /// 数字写死成 2:将来多一条失败路径,这条会变红,逼人回来确认新那条
+    /// 也走了同一个出口。变红时改的是数字,不是判据。
+    #[test]
+    fn every_cloud_failure_goes_out_through_the_same_door() {
+        let prod = strip_comments(prod_src());
+        assert_eq!(
+            prod.matches("self.report_cloud_failure(").count(),
+            2,
+            "云备份的失败出口不是恰好两条(预检失败、上传失败)—— \
+             漏一条就有一条路不更新状态栏那一格,而卡片照样每轮弹"
+        );
+    }
+
+    /// F273:备份成功必须清掉去重记忆。
+    ///
+    /// 不清的话,「失败 → 用户修好 → 过一阵又坏了」的第二次失败跟第一次
+    /// 文案一样,会被 `should_pop_cloud_error` 当成重复咽掉 —— 用户再也
+    /// 收不到那张卡片,而状态栏那一格红着他未必看见。
+    ///
+    /// 自证会变红:把 `self.cloud_last_err = None;` 那句删掉。
+    #[test]
+    fn a_successful_backup_forgets_the_last_failure() {
+        let arm = strip_comments(multiline_arm_of(
+            prod_src(),
+            "crate::cloudsync::UploadOutcome::Ok {",
+        ));
+        assert!(
+            arm.contains("self.cloud_last_err = None;"),
+            "成功那条路没清掉失败去重记忆 —— 下一次同样的失败会被静默咽掉:{arm}"
         );
     }
 
