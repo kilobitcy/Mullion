@@ -2280,10 +2280,50 @@ pub fn secret_key(
     }
 ```
 
-然后在 `set_master_password` 的开头加 `let carried = self.take_cloud_secret_plain();`，
-在它原本 `Ok(())` 之前加 `self.reseal_cloud_secret(carried)?;`。`clear_master_password`
-同样处理。**具体插入位置以两个方法的实际结构为准**（它们内部有 `save()`，重封必须
-排在 `self.key`/`self.scheme` 都换完**之后**）。
+两个方法今天**都以 `self.save()` 收尾**（已核实），所以收尾那一行要改成先 `?`
+再重封。完整形状：
+
+```rust
+    pub fn set_master_password(&mut self, password: &str) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
+        if password.is_empty() {
+            return Err(StoreError::Kdf("主密码不能为空".into()));
+        }
+        // **必须在换 key 之前解**:换完就再也解不开了。放在空密码检查之后,
+        // 省掉一次注定作废的文件读。
+        let carried = self.take_cloud_secret_plain();
+        let params = crate::kdf::KdfParams::default();
+        let salt = crate::kdf::random_salt();
+        let key = crate::kdf::derive_key(password, &salt, params)?;
+        self.key = key;
+        self.scheme = crate::secrets_file::Scheme::Argon2id { params, salt };
+        self.save()?;
+        self.reseal_cloud_secret(carried)
+    }
+
+    pub fn clear_master_password(
+        &mut self,
+        key_source: &dyn MasterKeySource,
+    ) -> Result<(), StoreError> {
+        self.sync_from_disk_if_untouched();
+        // 同上:`key_source.load_or_create()` 失败时会带着 `?` 提前返回,
+        // 那条路上 `carried` 直接被丢掉,本来也没东西要重封。
+        let carried = self.take_cloud_secret_plain();
+        let key = key_source.load_or_create()?;
+        self.key = key;
+        self.scheme = crate::secrets_file::Scheme::Keyring;
+        self.save()?;
+        self.reseal_cloud_secret(carried)
+    }
+```
+
+**`self.save()?` 那个 `?` 是新加的**（原来是 `self.save()` 直接当返回值）。漏掉它
+的症状：`save` 失败时重封仍然照跑，`cloud.toml` 被新密钥重封而 `secrets.enc`
+还是老的——两个文件从此对不上。
+
+`sync_from_disk_if_untouched()` 保持在最前，位置别动——它碰的是 `sessions.toml`
+与 `secrets.enc`，与 `cloud.toml` 无关，两者独立；不动它单纯是 Scope Discipline
+（本任务没有理由改它的时机）。
 
 - [ ] **Step 6: 跑测试确认通过**
 
