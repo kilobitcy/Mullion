@@ -1480,6 +1480,48 @@ mod tests {
         assert_eq!(v.open_with_master(&blob).expect("解开"), b"round trip");
     }
 
+    /// `scheme()` 报的必须是**当前**的密钥方案(设计 D14 的清理判据靠它)。
+    ///
+    /// 上面三条都绕开了这个 getter、自己拿 `secrets_file::parse` 解文件头,
+    /// 所以把它改成恒返回 `Keyring` 也照样全绿 —— 复核时实测过这条变异能活。
+    ///
+    /// 自证会变红:把 `scheme()` 的方法体换成任意写死的值。
+    #[test]
+    fn the_reported_scheme_follows_the_current_key_source() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).expect("开库");
+        assert_eq!(
+            v.scheme(),
+            crate::secrets_file::Scheme::Keyring,
+            "刚开的库不是钥匙串方案"
+        );
+
+        v.set_master_password("hunter2").expect("设主密码");
+        assert!(
+            v.scheme().has_password(),
+            "设完主密码还报钥匙串方案 —— 清理逻辑会把自己刚传上去的那份当成别人的"
+        );
+    }
+
+    /// 换过主密码之后,**旧 blob 解不开**且不 panic(设计 D13)。
+    ///
+    /// 每次设主密码都会滚一把新盐,派生出来的是另一把钥匙。调用方要能把这个
+    /// 失败解释成「需要旧主密码」而不是「文件坏了」,前提是它真的走错误分支
+    /// 回来,而不是在解密那层炸掉。
+    #[test]
+    fn a_blob_sealed_before_the_password_changed_no_longer_opens() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+        let old = v.seal_with_master(b"payload").expect("封装");
+
+        v.set_master_password("hunter3").expect("换主密码");
+        assert!(
+            matches!(v.open_with_master(&old), Err(StoreError::Crypto)),
+            "换过密码后旧 blob 竟然还解得开,或者报成了别的错因"
+        );
+    }
+
     /// F258:一个装了一条会话的库,给「记一笔连接」类测试复用。
     fn vault_with_one_session() -> (Vault, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
