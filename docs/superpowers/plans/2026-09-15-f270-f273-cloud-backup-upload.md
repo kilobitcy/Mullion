@@ -2752,6 +2752,60 @@ mod tests {
         assert_eq!(cfg, before, "失败之后游标被动过了 —— 这次的改动会永远推不上去");
     }
 
+    /// 「从没成功推过」必须折算成**已经过了任意久**,不是 0。
+    ///
+    /// 折算成 0 的话,刚开启云备份的用户要等满一个 `interval_min` 才有
+    /// 第一份 —— 默认 30 分钟,而他刚点完「确定」正盯着状态栏看。
+    /// `should_upload` 的文档把这个契约写死成 `u64::MAX`,这里钉住它。
+    #[test]
+    fn a_config_that_never_succeeded_reads_as_overdue_not_as_just_now() {
+        assert_eq!(minutes_since_last_ok("", some_time()), u64::MAX);
+        assert_eq!(
+            minutes_since_last_ok("不是时间戳", some_time()),
+            u64::MAX,
+            "读不懂的时间戳被当成「刚刚推过」—— 那会永远推不出去且零报错"
+        );
+    }
+
+    /// **未来的 `last_ok_at` 要当成「到点了」,不是「刚刚才推过」。**
+    ///
+    /// 本项目在 F253~F256 上踩过同一形状:`is_alive` 把未来的心跳算成
+    /// 「永远活着」。这里若照那样写,一次时钟回拨(或者换台时区/时钟不准的
+    /// 机器推过一份)就会让这台机器**在那个未来时刻到来之前永不备份** ——
+    /// 可能是几个月,期间状态栏一片安静,零报错。
+    #[test]
+    fn a_timestamp_from_the_future_counts_as_overdue_not_as_fresh() {
+        let now = some_time();
+        let ahead = now + time::Duration::days(400);
+        let ahead_s = ahead
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("格式化");
+        assert_eq!(
+            minutes_since_last_ok(&ahead_s, now),
+            u64::MAX,
+            "未来的时间戳被当成「刚推过」—— 这台机器要等到那一刻才会再备份"
+        );
+    }
+
+    /// 正常情况按分钟折算,且**向下取整**(59 秒不算一分钟)。
+    #[test]
+    fn a_normal_gap_converts_to_whole_minutes() {
+        let now = some_time();
+        for (secs, want) in [(0_i64, 0_u64), (59, 0), (60, 1), (5400, 90)] {
+            let then = now - time::Duration::seconds(secs);
+            let s = then
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("格式化");
+            assert_eq!(minutes_since_last_ok(&s, now), want, "差 {secs} 秒");
+        }
+    }
+
+    /// 测试用的固定时刻。**不取 `now_utc()`** —— 拿真实时钟的测试会在
+    /// 某些时刻偶发地红,而那种红没人查得动。
+    fn some_time() -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(1_789_000_000).expect("固定时刻")
+    }
+
     /// `upload_blocking` **不许认识 `Vault`**。
     ///
     /// 它跑在 `spawn_blocking` 线程上,而 `Vault` 住在 `App.store` 里、
@@ -2837,6 +2891,49 @@ pub fn record_success(cfg: &mut CloudConfig, fingerprint: &str, seq: u64, at: &s
 /// 而那种改动会让这次没推上去的改动永远推不上去。
 pub fn record_failure(_cfg: &mut CloudConfig) {}
 
+/// 把 `cloud.toml` 里的 `last_ok_at` 折算成 [`cloud::should_upload`] 要的
+/// 「距上次成功过了几分钟」。**折算住在 app 这一侧** —— store 不持时钟,
+/// 也没有 `time` 依赖(别为这一个函数给它加一个)。
+///
+/// 两种输入都折算成 `u64::MAX`(「已经过了任意久」,该推):
+///
+/// - **空 / 读不懂** —— 从没成功推过。折算成 0 的话,刚开启云备份的用户
+///   要等满一个 `interval_min` 才见到第一份(默认 30 分钟),而他正盯着
+///   状态栏看。
+/// - **在未来** —— 时钟回拨,或者另一台时钟不准的机器推过一份。
+///   **本项目在 F253~F256 上踩过同一形状**(`is_alive` 把未来的心跳算成
+///   「永远活着」):照那样写,这台机器要等到那个未来时刻才会再备份,
+///   可能是几个月,期间一片安静、零报错。
+pub fn minutes_since_last_ok(last_ok_at: &str, now: time::OffsetDateTime) -> u64 {
+    let Ok(then) = time::OffsetDateTime::parse(
+        last_ok_at,
+        &time::format_description::well_known::Rfc3339,
+    ) else {
+        return u64::MAX;
+    };
+    let secs = (now - then).whole_seconds();
+    if secs < 0 {
+        return u64::MAX;
+    }
+    (secs as u64) / 60
+}
+
+/// 这一轮内容的指纹。[`prepare`] 里也要算一次 —— **这是有意的重复**。
+///
+/// 定时那一路必须先拿到指纹才问得了 [`cloud::should_upload`](「内容变没变」
+/// 是它四道闸里的一道),而 `prepare` 那次顺带还把载荷封好了、只在真要推的
+/// 时候才跑。省掉这里这次的唯一办法是把四道闸拆散塞进 `prepare`,那样
+/// `should_upload` 就没人调用了 —— 而配置完整性那道闸也就永远不会跑,
+/// 开着开关但没填完的用户每轮发一次注定 403 的请求,状态栏报「备份失败」,
+/// 把真正的原因吃掉。
+///
+/// 成本:读四个几十 KB 的文件 + 一次 sha256,每个轮询 tick 一次。微秒级。
+pub fn fingerprint_now(dir: &Path) -> String {
+    let files = portable::collect_top_level(dir);
+    let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
+    cloud::fingerprint(&files, &secrets)
+}
+
 /// 一次上传的**主线程那一半**的产物。
 pub struct Payload {
     /// 这一份的内容指纹。上传成功后由 `app.rs` 写回游标。
@@ -2886,6 +2983,10 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
     let files = portable::collect_top_level(dir);
     let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
     let fp = cloud::fingerprint(&files, &secrets);
+    // 定时那一路已经在 `drive_cloud_backup` 里问过 `should_upload` 了(其中
+    // 一道闸就是指纹)。这里**还要再判一次**,因为**手动**那一路是绕过
+    // `should_upload` 的 —— 用户点「立刻备份到云」时,「开关关着」「还没到点」
+    // 都不该拦他,但「内容没变」要拦(并且要说出这句话,见 `spawn_cloud_backup`)。
     if fp == cfg.last_fingerprint {
         return Prepared::Unchanged;
     }
@@ -3867,6 +3968,42 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
             "drive_cloud_backup 没有被调用 —— 定时备份从来不会发生"
         );
     }
+
+    /// 「该不该推」这个判断必须**真的走 `cloud::should_upload`**,不能在
+    /// 这里自己写闸。
+    ///
+    /// 自己写必然只写到「开着 + 到点了」这两道。它四道闸里最要紧的是
+    /// **配置完整性**:开着开关但 endpoint / AK 没填完的用户,每一轮都发一次
+    /// 注定 403 的请求,状态栏报一句「云端备份失败」,把真正的原因
+    /// (「还没填完」)吃掉。少调它还有第二重后果:`should_upload` 的六条
+    /// 测试全部变成没人调用的死代码 —— 本项目登记过的
+    /// **「量具存在≠接在那条路上」**(F264 那次是埋点没接,这次是判据没接)。
+    ///
+    /// 同时钉住**间隔从 `cfg.last_ok_at` 起算**。改成从内存里那个
+    /// `cloud_last_check_ms` 折算的话,起算点就变成「本进程上次看盘的时刻」
+    /// 而不是「上次真的推成的时刻」—— 一个开开关关的用户每次启动都会立刻
+    /// 推一份,把 keep 份历史窗口按开机次数刷光。这是 **T11**:计时要从
+    /// 「事情真的成了」起算,不是从调用点起算。
+    ///
+    /// 照例先 `strip_comments` —— 上面那段 `drive_cloud_backup` 的文档注释里
+    /// 就写着 `should_upload` 这个词,不剥的话把调用整段删掉测试照绿。
+    ///
+    /// 自证会变红:把 `should_upload(..)` 那一段换成
+    /// `if since < u64::from(cfg.interval_min) { return; }`(第一条红),
+    /// 或者把 `&cfg.last_ok_at` 换成别的来源(第二条红)。
+    #[test]
+    fn whether_to_back_up_is_decided_by_should_upload_not_by_a_hand_rolled_gate() {
+        let body = strip_comments(body_of(prod_src(), "fn drive_cloud_backup("));
+        assert!(
+            body.contains("cloud::should_upload(&cfg, &fp, since)"),
+            "定时那一路没走 should_upload —— 配置完整性那道闸永远不会跑,\
+             没填完的用户会每轮发一次注定 403 的请求"
+        );
+        assert!(
+            body.contains("minutes_since_last_ok(\n            &cfg.last_ok_at,"),
+            "间隔不是从持久化的 last_ok_at 起算 —— 开开关关的用户每次启动都会推一份"
+        );
+    }
 ```
 
 **已核实的测试辅助**（`app.rs` 的 `mod tests` 里都有，直接用，别自己再造）：
@@ -3891,10 +4028,16 @@ Expected: FAIL。
     /// 而一次高延迟上传可能跑几分钟 —— 没闸的话手动点几下就能攒出一串
     /// 并发上传,它们互相撞号(ForbidOverwrite),表现成「备份时好时坏」。
     cloud_in_flight: bool,
-    /// F273:上次算指纹的时刻。**是 `self.now_ms()` 的时基**(自 `self.start`
-    /// 起算的相对毫秒),不是 unix 时间 —— 初值 `0` 于是意味着「启动后
-    /// `interval_min` 分钟才第一次检查」,而不是「启动即传」。后者会让每次
-    /// 开 app 都推一份,把 keep 份历史窗口按开机次数消耗掉。
+    /// F273:上次**看盘**的时刻。**是 `self.now_ms()` 的时基**(自 `self.start`
+    /// 起算的相对毫秒),不是 unix 时间。
+    ///
+    /// 它节流的只是 [`CLOUD_POLL_MS`] 这一层「多久读一次那四个文件算指纹」,
+    /// **不是用户配的备份间隔** —— 后者归 `cloud::should_upload` 管,
+    /// 从持久化的 `cfg.last_ok_at` 起算。
+    ///
+    /// 两者不能合并成一个:合并之后间隔的起算点就成了「本进程上次看盘」
+    /// 而不是「上次真的推成」,一个开开关关的用户每次启动都会立刻推一份,
+    /// 把 keep 份历史窗口按开机次数刷光(T11:计时从「事情真的成了」起算)。
     cloud_last_check_ms: u64,
 ```
 
@@ -3994,27 +4137,63 @@ Expected: FAIL。
 
     /// F273:每帧看一眼该不该起一次定时备份。
     ///
-    /// 这里**不算指纹** —— `prepare` 已经算了,而且它顺带就把载荷封好了。
-    /// 在这儿再算一次等于每轮多读一遍那四个文件。这里只管三道闸:
-    /// 在途、没开、还没到点。
+    /// **该不该推这个判断整个交给 [`mullion_store::cloud::should_upload`]**,
+    /// 这里不自己写闸。自己写的话必然只写到「开着 + 到点了」这两道 ——
+    /// 而它四道闸里最要紧的是**配置完整性**:开着开关但 endpoint 或 AK 没填完
+    /// 的用户,每一轮都会发一次注定 403 的请求,状态栏报一句「云端备份失败」,
+    /// 把真正的原因(「还没填完」)吃掉。少调它还有第二重后果:那个函数的
+    /// 六条测试会全部变成没人调用的死代码 —— 本项目登记过的
+    /// 「量具存在≠接在那条路上」。
+    ///
+    /// 两层节流是**两回事,别合并**:
+    ///
+    /// - [`CLOUD_POLL_MS`] 是「多久看一眼盘」,固定值,只为不每帧去读那四个
+    ///   文件算指纹。
+    /// - `cfg.interval_min` 是**用户配的备份间隔**,归 `should_upload` 管。
+    ///
+    /// 合成一个(照 `interval_min` 来轮询)的话,间隔的起算点就变成了
+    /// 「本进程上次看盘的时刻」,而不是「上次成功推上去的时刻」—— 一个开开
+    /// 关关的用户每次启动都会立刻推一份,把 keep 份历史窗口刷光。这正是
+    /// **T11 那条陷阱**:计时要从「事情真的成了」起算,不是从调用点起算。
     fn drive_cloud_backup(&mut self, now_ms: u64) {
         if self.cloud_in_flight {
             return;
         }
+        if now_ms.saturating_sub(self.cloud_last_check_ms) < CLOUD_POLL_MS {
+            return;
+        }
+        self.cloud_last_check_ms = now_ms;
         let Some(dir) = crate::shell::store::config_dir() else {
             return;
         };
         let cfg = mullion_store::cloud::load(&dir);
+        // 开关那一道也在 `should_upload` 里,但这里先挡一下:关着的时候
+        // 连指纹都不必算(读四个文件),而绝大多数用户是关着的。
         if !cfg.enabled {
             return;
         }
-        let interval_ms = u64::from(cfg.interval_min) * 60_000;
-        if now_ms.saturating_sub(self.cloud_last_check_ms) < interval_ms {
+        let fp = crate::cloudsync::fingerprint_now(&dir);
+        let since = crate::cloudsync::minutes_since_last_ok(
+            &cfg.last_ok_at,
+            time::OffsetDateTime::now_utc(),
+        );
+        if !mullion_store::cloud::should_upload(&cfg, &fp, since) {
             return;
         }
-        self.cloud_last_check_ms = now_ms;
         self.spawn_cloud_backup(false);
     }
+```
+
+轮询间隔常量，放在 `app.rs` 的常量区：
+
+```rust
+/// F273:定时备份**多久看一眼盘**。与用户配的 `interval_min` 是两回事 ——
+/// 那个归 `cloud::should_upload` 管,这个只为不每帧去读那四个文件算指纹。
+///
+/// 取一分钟:算一次指纹是读几十 KB + 一次 sha256(微秒级),一分钟一次在
+/// profile 行里看不见;而它决定的是「到点之后最晚多久会真的推出去」,
+/// 再长就会让用户点完设置等半天看不到动静。
+const CLOUD_POLL_MS: u64 = 60_000;
 ```
 
 两个时间戳辅助（`app.rs` 里**没有**现成的，要新写；`localtime.rs` 里也没有
@@ -4360,7 +4539,9 @@ git commit -m "feat(app): 云端备份的定时驱动与结果回收 (F273)
 | 去掉 `if self.cloud_in_flight { return; }` 那句 | `only_one_cloud_upload_is_in_flight_at_a_time` |
 | `CloudBackupDone` 分支里删掉 `self.cloud_in_flight = false;` | `every_path_that_ends_a_cloud_upload_hands_the_in_flight_flag_back` |
 | 事件循环里注释掉 `self.drive_cloud_backup(now_ms);` | `the_cloud_backup_is_driven_every_frame` |
-| `sync_settings_dialog` 里改回 `SettingsDraft::from_settings(&self.settings)` | `the_settings_dialog_starts_from_the_cloud_config_on_disk` |
+| `drive_cloud_backup` 里把 `should_upload(..)` 换成手写的 `if since < u64::from(cfg.interval_min) { return; }` | `whether_to_back_up_is_decided_by_should_upload_not_by_a_hand_rolled_gate`（第一条断言） |
+| `minutes_since_last_ok` 的实参从 `&cfg.last_ok_at` 改成从 `cloud_last_check_ms` 折算 | 同上（第二条断言）——T11：起算点从「真的推成了」退回「本进程上次看盘」 |
+| `CLOUD_POLL_MS` 改成 `u64::from(cfg.interval_min) * 60_000` | **杀不掉**（两层节流合并之后行为差异只在"开开关关"的真机场景里才看得见）。**这条如实记下来，别硬编一条守护** —— 上面那两条断言钉的是「判据走 `should_upload`、起算点用 `last_ok_at`」，合并后两者仍然成立，只是轮询变懒。后果有限（最晚推迟一个 interval），不值得为它把常量结构复杂化 |
 | 菜单分支里 `std::mem::take(&mut self.ui.cloud_backup_request)` 改成只读 `self.ui.cloud_backup_request` | 见 Task 13 的表（无限重传） |
 
 **⚠️ 若某条变异杀不掉**：多半是源码切片守护匹配到了注释里的关键词（本项目已登记
