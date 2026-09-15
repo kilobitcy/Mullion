@@ -1636,13 +1636,46 @@ mod tests {
         rows
     }
 
+    /// 一个行块里绑了哪些 `cloud_*` 草稿字段。
+    ///
+    /// **按标识符取,不用 `contains("&mut draft.cloud_prefix")` 这种子串包含。**
+    /// 子串判据在字段名互为前缀时会误命中(真加一个 `cloud_prefix2`,
+    /// `cloud_prefix` 的判据就被它那一行接走了)。现有 11 个字段之间恰好没有
+    /// 前缀关系,而「恰好」不是判据该有的底气 —— 何况另一半的反列举能不能
+    /// 兜住这种误判,得靠一段绕来绕去的交叉论证才说得清,那本身就是上一轮
+    /// 栽的那种「判据放在看不出差别的那一层」。token 级精确匹配是自证的。
+    fn fields_in(row: &str) -> std::collections::BTreeSet<String> {
+        row.split("&mut draft.")
+            .skip(1)
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|i| i.starts_with("cloud_"))
+            .collect()
+    }
+
+    /// 找到「标签 + 绑了这个字段(token 级)」的那一块。三条测试共用同一套
+    /// 定位逻辑,省得各写一遍、改一处忘了改另外两处。
+    ///
+    /// **`each_cloud_control_is_bound_to_its_own_draft_field` 不走这个**:
+    /// 它要的判据是「恰好一块」而不是「找到第一块」,`find` 吞掉了「命中
+    /// 几块」这个信息,会把「恰好一块」这层判据弄没了。
+    fn row_of<'a>(rows: &'a [String], label: &str, field: &str) -> &'a str {
+        rows.iter()
+            .find(|r| r.contains(label) && fields_in(r).contains(field))
+            .unwrap_or_else(|| panic!("找不到「{label}」那一块"))
+    }
+
     /// 每一格控件都必须绑在**自己那个**草稿字段上。
     ///
-    /// **判据是「恰好一个行块同时含这句标签和这个字段」**,不是「整个分节里
-    /// 出现过这个字段」。后者是本项目恒绿清单里「判据放在看不出差别的那一层」:
-    /// 把 AK ID 与 AK Secret 的绑定互换,两个字段在分节里都还在,整段扫描
-    /// 全绿,而界面上真实的 Secret Key 明文显示。切到行块之后,互换会让
-    /// 「Access Key Secret」那一块里出现 `cloud_access_key_id`,当场变红。
+    /// **判据是「恰好一个行块同时含这句标签、且 token 级绑了这个字段」**,
+    /// 不是「整个分节里出现过这个字段」。后者是本项目恒绿清单里「判据放在
+    /// 看不出差别的那一层」:把 AK ID 与 AK Secret 的绑定互换,两个字段在
+    /// 分节里都还在,整段扫描全绿,而界面上真实的 Secret Key 明文显示。
+    /// 切到行块之后,互换会让「Access Key Secret」那一块里出现
+    /// `cloud_access_key_id`,当场变红。
     ///
     /// 第二半是**反列举**:分节里出现的每个 `&mut draft.cloud_*` 都必须在
     /// 登记表里。没有这一半的话,将来加第 12 个字段谁也不会想起来补守护
@@ -1651,10 +1684,9 @@ mod tests {
     fn each_cloud_control_is_bound_to_its_own_draft_field() {
         let rows = cloud_rows();
         for (label, field) in CLOUD_ROWS {
-            let needle = format!("&mut draft.{field}");
             let hits = rows
                 .iter()
-                .filter(|r| r.contains(label) && r.contains(&needle))
+                .filter(|r| r.contains(label) && fields_in(r).contains(*field))
                 .count();
             assert_eq!(
                 hits, 1,
@@ -1665,18 +1697,8 @@ mod tests {
 
         let registered: std::collections::BTreeSet<&str> =
             CLOUD_ROWS.iter().map(|(_, f)| *f).collect();
-        let mut seen = std::collections::BTreeSet::new();
-        for r in &rows {
-            for part in r.split("&mut draft.").skip(1) {
-                let ident: String = part
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if ident.starts_with("cloud_") {
-                    seen.insert(ident);
-                }
-            }
-        }
+        let seen: std::collections::BTreeSet<String> =
+            rows.iter().flat_map(|r| fields_in(r)).collect();
         let seen: std::collections::BTreeSet<&str> = seen.iter().map(String::as_str).collect();
         assert_eq!(
             seen, registered,
@@ -1697,11 +1719,7 @@ mod tests {
     fn only_the_secret_key_field_is_masked() {
         let rows = cloud_rows();
         for (label, field) in CLOUD_ROWS {
-            let needle = format!("&mut draft.{field}");
-            let row = rows
-                .iter()
-                .find(|r| r.contains(label) && r.contains(&needle))
-                .unwrap_or_else(|| panic!("找不到「{label}」那一块"));
+            let row = row_of(&rows, label, field);
             assert_eq!(
                 row.contains(".password(true)"),
                 *field == "cloud_secret_new",
@@ -1717,11 +1735,7 @@ mod tests {
     fn every_cloud_control_reports_a_preview() {
         let rows = cloud_rows();
         for (label, field) in CLOUD_ROWS {
-            let needle = format!("&mut draft.{field}");
-            let row = rows
-                .iter()
-                .find(|r| r.contains(label) && r.contains(&needle))
-                .unwrap_or_else(|| panic!("找不到「{label}」那一块"));
+            let row = row_of(&rows, label, field);
             assert!(
                 row.contains("*out = SettingsOut::Preview;"),
                 "「{label}」改了不报 Preview —— 保存按钮不会亮,而且不报错:\n{row}"
