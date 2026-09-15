@@ -529,6 +529,12 @@ mod tests {
     ///
     /// 自证会变红:把 `NoMasterPassword` 那条专门分支并进通用的
     /// `Err(e) => Failed(format!("加密失败:{e}"))`。
+    ///
+    /// **`msg.contains("主密码")` 不够**:`StoreError::NoMasterPassword` 自己的
+    /// `Display` 就是「这个操作需要先设置主密码」,并进通用分支后消息变成
+    /// 「加密失败:这个操作需要先设置主密码」—— 仍然 `contains("主密码")`,
+    /// 这条断言照绿。真正要拦的是「听起来像 bug 的『加密失败』前缀」,
+    /// 所以还要断言消息**不是**以它开头。
     #[test]
     fn a_vault_without_a_master_password_is_refused_with_the_real_reason() {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -539,10 +545,17 @@ mod tests {
         .expect("开库");
         let cfg = mullion_store::CloudConfig::default();
         match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
-            Prepared::Failed(msg) => assert!(
-                msg.contains("主密码"),
-                "拦是拦下了,但没说清是缺主密码:{msg}"
-            ),
+            Prepared::Failed(msg) => {
+                assert!(
+                    msg.contains("主密码"),
+                    "拦是拦下了,但没说清是缺主密码:{msg}"
+                );
+                assert!(
+                    !msg.starts_with("加密失败"),
+                    "专门分支被并进了通用的「加密失败」—— 用户会去查网络 / 查 AK-SK,\
+                     查不到一个前置条件:{msg}"
+                );
+            }
             Prepared::Ready(_) => panic!("钥匙串方案下封出了一份换台机器解不开的备份"),
             Prepared::Unchanged => panic!("被当成「内容没变」跳过了 —— 真正的原因被吃掉"),
         }
