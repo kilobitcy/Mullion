@@ -86,10 +86,7 @@ pub fn authorization(req: &Request<'_>, ak: &str, sk: &str, region: &str, servic
     }
     headers.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let canonical_headers: String = headers
-        .iter()
-        .map(|(k, v)| format!("{k}:{v}\n"))
-        .collect();
+    let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let signed_headers: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
     let signed_headers = signed_headers.join(";");
 
@@ -191,8 +188,20 @@ mod tests {
             amz_date: "20260915T101500Z",
             extra_headers: extra,
         };
-        let a = authorization(&mk(&[("x-a", "1"), ("x-b", "2")]), "AK", "SK", "cn-hangzhou", "s3");
-        let b = authorization(&mk(&[("x-b", "2"), ("x-a", "1")]), "AK", "SK", "cn-hangzhou", "s3");
+        let a = authorization(
+            &mk(&[("x-a", "1"), ("x-b", "2")]),
+            "AK",
+            "SK",
+            "cn-hangzhou",
+            "s3",
+        );
+        let b = authorization(
+            &mk(&[("x-b", "2"), ("x-a", "1")]),
+            "AK",
+            "SK",
+            "cn-hangzhou",
+            "s3",
+        );
         assert_eq!(a, b, "signed headers 没排序 —— 调用方换个顺序签名就变了");
     }
 }
