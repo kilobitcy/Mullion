@@ -1808,14 +1808,14 @@ git commit -m "feat(store): 云端载荷的范围与内容指纹 (F272)
 | `fingerprint` 里 `sorted.sort_by(..)` 删掉 | `the_fingerprint_does_not_depend_on_file_order` |
 | 只删 `h.update((f.path.len() ..))` 与 `h.update((f.body.len() ..))` 两处 | `the_fingerprint_separates_the_name_from_the_body` |
 | `h.update(secrets)` 删掉 | `the_fingerprint_changes_when_any_part_changes` |
+| `collect_top_level` 里补上 layouts 那一段 | `the_cloud_payload_carries_no_layout_records` |
+| `TOP_LEVEL_FILES` 里加上 `CLOUD_FILE` | `the_cloud_config_file_is_not_in_the_pack_whitelist` |
 
 **`h.update((secrets.len() ..))` 那一处是等价变异,不要为它编守护。** 密文是喂进
 哈希的最后一段,前面每个文件的 path/body 都已带长度前缀,把它的长度删掉产不出
 任何一对可区分的输入 —— 留着它是为了「以后在密文后面再追加字段」时不必回头
 重想边界,不是因为今天有哪条输入靠它分开。跑这条变异会全绿,**那是正确的**,
 别改测试去凑红。
-| `collect_top_level` 里补上 layouts 那一段 | `the_cloud_payload_carries_no_layout_records` |
-| `TOP_LEVEL_FILES` 里加上 `CLOUD_FILE` | `the_cloud_config_file_is_not_in_the_pack_whitelist` |
 
 ---
 
@@ -1844,6 +1844,7 @@ git commit -m "feat(store): 云端载荷的范围与内容指纹 (F272)
             last_fingerprint: String::new(),
             last_seq: 0,
             last_ok_at: String::new(),
+            corrupt: false,
         }
     }
 
@@ -1878,6 +1879,24 @@ git commit -m "feat(store): 云端载荷的范围与内容指纹 (F272)
             save(dir.path(), &c).is_err(),
             "读坏之后还允许回写 —— 那会把用户的 AK/SK 静默抹掉"
         );
+        // 标记**不许寄生在数据字段上**:设置弹窗把 `endpoint` 直接绑到文本框,
+        // 用户改一下就把标记冲掉,`save` 当场放行、`secret_sealed` 被抹。
+        assert!(
+            c.endpoint.is_empty(),
+            "损坏标记污染了 endpoint:{:?} —— 它会出现在设置弹窗的输入框里,\
+             而用户改掉它就等于把守护关掉了",
+            c.endpoint
+        );
+    }
+
+    /// 坏标记**不能落盘**。写出去的话下次 `load` 会把一份好文件读成坏的,
+    /// 于是云备份从此永久拒绝回写,且没有任何办法自愈。
+    #[test]
+    fn the_corrupt_mark_never_reaches_the_file() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        save(dir.path(), &cfg()).expect("写");
+        let text = std::fs::read_to_string(dir.path().join(CLOUD_FILE)).expect("读");
+        assert!(!text.contains("corrupt"), "损坏标记落盘了:{text}");
     }
 
     /// 游标(`last_seq` / `last_fingerprint`)是写在这个文件里的,而这个文件
@@ -1957,6 +1976,21 @@ pub struct CloudConfig {
     /// 上次成功的时刻(RFC3339)。只给状态栏看。
     #[serde(default)]
     pub last_ok_at: String,
+    /// 这份是从**读不懂的文件**上来的。`save` 见到它就拒绝写。
+    ///
+    /// **不落盘**(`serde(skip)`),**私有**(只有 [`load`] 能置位)。
+    ///
+    /// 为什么标记住在结构体里而不是让 `load` 返回 `Result`:守护必须待在
+    /// `save` 内部。挪到调用方就成了「每个调用点都要记得判一下」,而这正是
+    /// 本项目已经踩过三次的「列举式门控在加档时必然漏」。
+    ///
+    /// 为什么**不**把标记塞进 `endpoint` 之类的数据字段:设置弹窗直接把
+    /// `endpoint` 绑到文本框(Task 12)。塞进去的话用户会在输入框里看见那串
+    /// 哨兵,而他只要改一下 endpoint 就把标记冲掉了 —— `save` 当场放行,
+    /// `secret_sealed` 连同别的字段一起被默认值抹掉。守护在它最该生效的
+    /// 那条路上恰好失效。
+    #[serde(skip)]
+    corrupt: bool,
 }
 
 fn default_prefix() -> String {
@@ -1985,16 +2019,10 @@ impl Default for CloudConfig {
             last_fingerprint: String::new(),
             last_seq: 0,
             last_ok_at: String::new(),
+            corrupt: false,
         }
     }
 }
-
-/// 文件读不懂时,内存里那份的状态。
-///
-/// **必须与「文件不存在」分开**:两者的 `enabled` 都是 false,但前者
-/// **不许回写**——照写的话会把用户手打的 endpoint 与 AK/SK 静默抹掉
-/// (F247/F248 的「整份覆盖」缺陷族第六处)。
-static CORRUPT_MARK: &str = "\u{0}corrupt";
 
 /// 读 `cloud.toml`。读不懂时返回一份**关着且不可回写**的配置。
 pub fn load(dir: &Path) -> CloudConfig {
@@ -2005,9 +2033,7 @@ pub fn load(dir: &Path) -> CloudConfig {
     match toml::from_str::<CloudConfig>(&text) {
         Ok(c) => c,
         Err(_) => CloudConfig {
-            enabled: false,
-            // 标记「这份是从坏文件上来的」。`save` 见到它就拒绝写。
-            endpoint: CORRUPT_MARK.to_string(),
+            corrupt: true,
             ..CloudConfig::default()
         },
     }
@@ -2015,7 +2041,7 @@ pub fn load(dir: &Path) -> CloudConfig {
 
 /// 写 `cloud.toml`。
 pub fn save(dir: &Path, cfg: &CloudConfig) -> Result<(), StoreError> {
-    if cfg.endpoint == CORRUPT_MARK {
+    if cfg.corrupt {
         return Err(StoreError::CorruptSecrets(
             "cloud.toml 读不懂,拒绝回写 —— 先把它改好或删掉".into(),
         ));
@@ -2028,7 +2054,7 @@ pub fn save(dir: &Path, cfg: &CloudConfig) -> Result<(), StoreError> {
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p mullion-store cloud:: 2>&1 | grep -E "test result|FAILED"`
-Expected: 9 passed。
+Expected: 11 passed（Task 7 的 6 条 + 本任务的 5 条）。
 
 - [ ] **Step 5: 补导出**
 
@@ -2051,7 +2077,9 @@ git commit -m "feat(store): cloud.toml 的读-改-写,坏文件拒绝回写 (F27
 | 变异 | 应该变红的测试 |
 |---|---|
 | `load` 的 `Err` 分支改成 `CloudConfig::default()` | `a_corrupt_file_is_not_silently_replaced_by_defaults` |
-| `save` 里去掉 `CORRUPT_MARK` 检查 | 同上 |
+| `save` 里去掉 `if cfg.corrupt` 检查 | 同上 |
+| `corrupt` 字段上的 `#[serde(skip)]` 去掉 | `the_corrupt_mark_never_reaches_the_file` |
+| `load` 的 `Err` 分支改成 `endpoint: "\u{0}corrupt".into(), ..` 式的哨兵（即原设计） | `a_corrupt_file_is_not_silently_replaced_by_defaults`（endpoint 那条新断言） |
 | `default()` 里 `enabled: true` | `a_missing_file_yields_a_disabled_default` |
 
 ---
