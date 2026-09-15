@@ -15,6 +15,10 @@
 //! **这是片一唯一能证明 SigV4 被真实服务端接受的证据。** 假 server 不验签,
 //! 官方向量只证明我们与 AWS 的规范一致 —— 阿里云对 V4 的兼容细节没有一手
 //! 文档,只能靠这条测试。
+//!
+//! **`MULLION_CLOUD_STAMP` 每次跑都要重新生成,别 `export` 之后反复用**——
+//! 它同时是 SigV4 的签名时间和对象 key 的一部分,复用同一个 stamp 重跑会
+//! 让第一个 PUT 因为 key 已存在而被拒。
 
 use mullion_cloud::s3::{Credentials, S3Client};
 use mullion_cloud::url::Endpoint;
@@ -26,8 +30,11 @@ fn env(k: &str) -> Option<String> {
 #[test]
 #[ignore = "要真实 bucket 与 AK/SK,见模块文档"]
 fn a_real_bucket_accepts_our_signature_and_refuses_an_overwrite() {
-    if env("MULLION_CLOUD_LIVE").is_none() {
-        eprintln!("跳过:未设 MULLION_CLOUD_LIVE");
+    // 判据是**严格等于 `"1"`**,不是「非空」——`MULLION_CLOUD_LIVE=0` 是
+    // 「临时关掉」的直觉写法,按非空判会照样跑,真的往一个真实 bucket 里
+    // 写对象。与 `mullion-ssh/tests/live.rs` 的 `live_enabled` 同构。
+    if std::env::var("MULLION_CLOUD_LIVE").as_deref() != Ok("1") {
+        eprintln!("跳过:未设 MULLION_CLOUD_LIVE=1");
         return;
     }
     // `MULLION_CLOUD_SOCKS5` 是 `host:port`,**不带 `socks5://`**。
@@ -52,9 +59,16 @@ fn a_real_bucket_accepts_our_signature_and_refuses_an_overwrite() {
     let stamp = env("MULLION_CLOUD_STAMP").expect("MULLION_CLOUD_STAMP：date -u +%Y%m%dT%H%M%SZ");
     let key = format!("mullion-live-test/{stamp}.bin");
 
-    client
-        .put_no_overwrite(&key, b"mullion live probe", &stamp)
-        .expect("第一次 PUT 应该成功 —— 失败多半是签名或权限");
+    // 不要预设失败原因:`MULLION_CLOUD_STAMP` 一旦被 `export` 出去反复用,
+    // 第二次跑的这一发就会因为 key 已存在而被拒,真实原因是 `AlreadyExists`,
+    // 跟签名权限毫无关系。咬定「多半是签名或权限」会把人往错误方向带。
+    if let Err(e) = client.put_no_overwrite(&key, b"mullion live probe", &stamp) {
+        panic!(
+            "第一次 PUT 失败:{e:?} —— 若是 AlreadyExists,多半是 \
+             MULLION_CLOUD_STAMP 被复用、撞上了已存在的 key(重新 \
+             `date -u +%Y%m%dT%H%M%SZ` 生成一个);其它错误多半是签名或权限"
+        );
+    }
 
     // 第二次必须被拒。**这一条是追加式布局全部并发保护的真机证明** ——
     // 若真实服务端忽略了那两个头,本地假 server 是测不出来的。

@@ -10,11 +10,12 @@
 mullion-core     布局树（自研分屏）。零 UI、零 IO，可纯单测。
 mullion-term     alacritty_terminal 封装 + 按键/鼠标编码。
 mullion-ssh      russh：PTY channel actor，后续加 SFTP。
+mullion-store    会话/凭据持久化。TOML + keyring 加密。零 UI、零 async，可纯单测。
 mullion-cloud    S3 兼容对象存储客户端（云端备份）。只认字节与键名，零 async。
 mullion-app      winit + wgpu + glyphon：窗口、渲染、输入分发。
 ```
 
-依赖方向严格单向：`app → {core, term, ssh}`，其余互不依赖。
+依赖方向严格单向：`app → {core, term, ssh, store, cloud}`，其余互不依赖。
 这条约束的价值：布局 bug 和键码 bug 都能在**没有窗口**的情况下写测试复现。
 这两类 bug 是终端项目里最费时间的，值得为它牺牲一点便利。
 
