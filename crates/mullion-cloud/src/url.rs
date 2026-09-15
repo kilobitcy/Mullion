@@ -256,6 +256,40 @@ mod tests {
         assert_eq!(t.path, "/%E4%B8%AD%E6%96%87/%E6%96%87%E4%BB%B6.mpk");
     }
 
+    /// 路径前缀必须和 key 走同一条编码规则(`encode_key`):按 `/` 分段、
+    /// 每段用 [`encode_component`] 编码、`/` 本身保留。守两件事:
+    ///
+    /// - **前缀不能不编码**——若改成 `segs.push(prefix.to_string())`,
+    ///   原始字符会直接落进签名用的 `path` 和实际请求的 `url`;一旦底层
+    ///   HTTP 客户端对路径里的非法字符做自动转义再发送,签名用的 path
+    ///   与实际发出去的路径就分叉,回一条零提示的 403
+    ///   `SignatureDoesNotMatch`——与本模块开头「endpoint 路径前缀混进
+    ///   Host 头」是同一形状的坑。
+    /// - 前缀里的 `/` 不能被转义成 `%2F`——否则多级前缀被拍扁成一段。
+    ///
+    /// **必须用含空格 + 非 ASCII 的多级前缀**:纯 ASCII 前缀(如
+    /// `p1/p2`)编码前后字面完全相同,查不出「根本没编码」这条变异——
+    /// 这正是这条覆盖此前漏掉的原因。期望串用 `encode_key` 本身的规则
+    /// 手算(逐字节 UTF-8 百分号编码、大写十六进制)并用 Python 交叉核对
+    /// 过,不是凭记忆抄的。
+    #[test]
+    fn a_path_prefix_is_percent_encoded_just_like_a_key() {
+        let e = Endpoint {
+            base: "https://host/my proxy/中文段".into(),
+            bucket: "b".into(),
+            path_style: false,
+        };
+        let t = e.target("k");
+        assert_eq!(
+            t.path, "/my%20proxy/%E4%B8%AD%E6%96%87%E6%AE%B5/k",
+            "前缀必须和 key 一样逐段百分号编码,`/` 保留为分隔符"
+        );
+        assert_eq!(
+            t.url,
+            "https://b.host/my%20proxy/%E4%B8%AD%E6%96%87%E6%AE%B5/k"
+        );
+    }
+
     /// bucket 名进 Host 头不能编码,所以含 `/` 的 bucket 只能在开发期
     /// 就地炸掉——真编码了反而是错(Host 头里不能有百分号转义)。
     #[cfg(debug_assertions)]
