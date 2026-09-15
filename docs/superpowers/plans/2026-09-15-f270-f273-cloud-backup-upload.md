@@ -1651,7 +1651,12 @@ mod tests {
         path_changed[0].path = "settings.toml".into();
         assert_ne!(fingerprint(&path_changed, b"secret"), base_fp, "文件名变了指纹没变");
 
-        assert_ne!(fingerprint(&base, b"other"), base_fp, "密文变了指纹没变");
+        // **两份密文必须等长**。写成 `b"secret"`(6) vs `b"other"`(5) 的话,
+        // 长度一不同,光靠长度前缀就把它们分开了 —— 于是「把 `h.update(secrets)`
+        // 整句删掉」这个真缺陷照样全绿(实测过)。症状:密文改了但字节数没变
+        // (vault 换个 nonce 重写就是这样),指纹认为「没变」,这次改动永远
+        // 推不上去且零报错。
+        assert_ne!(fingerprint(&base, b"secreT"), base_fp, "密文变了指纹没变");
     }
 
     /// 长度前缀**单独守一条**。
@@ -1839,6 +1844,7 @@ git commit -m "feat(store): 云端载荷的范围与内容指纹 (F272)
             path_style: false,
             keep: 20,
             interval_min: 30,
+            socks5: String::new(),
             access_key_id: String::new(),
             secret_sealed: String::new(),
             last_fingerprint: String::new(),
@@ -1961,6 +1967,21 @@ pub struct CloudConfig {
     pub keep: u32,
     #[serde(default = "default_interval")]
     pub interval_min: u32,
+    /// SOCKS5 代理,形如 `127.0.0.1:1080`。空 = 直连。
+    ///
+    /// **不带 `socks5://` 前缀**:`S3Client::new` 收到的是 `host:port`,
+    /// 自己 `format!("socks5://{p}")` 补前缀(已核实 `s3.rs:69`)。带着前缀
+    /// 传进去会拼成 `socks5://socks5://…`,`ureq::Proxy::new` 直接报
+    /// `Config` 错。那条错误文案是清楚的,所以不在这里做容错剥前缀 ——
+    /// 加一段没有守护测试的容错,比让用户看见一条准确的报错更糟。
+    ///
+    /// **这个字段不补的话 `socks5` 参数就是条死线**:`mullion-cloud` 为它
+    /// 开了 ureq 的 `socks-proxy` 特性、`S3Client::new` 专门收了这个参数,
+    /// 而设计 D15 把「SOCKS 代理链路通不通」列进了片一的真机验收项 ——
+    /// 没有配置入口的话那条永远传 `None`,验收项验的是一条从没走过的路
+    /// (本项目登记过同一形状:「量具存在≠接在那条路上」)。
+    #[serde(default)]
+    pub socks5: String,
     /// AK 是标识不是秘密,明文存。
     #[serde(default)]
     pub access_key_id: String,
@@ -2014,6 +2035,7 @@ impl Default for CloudConfig {
             path_style: false,
             keep: default_keep(),
             interval_min: default_interval(),
+            socks5: String::new(),
             access_key_id: String::new(),
             secret_sealed: String::new(),
             last_fingerprint: String::new(),
@@ -2604,11 +2626,27 @@ Create `crates/mullion-app/src/cloudsync.rs`：
 //! 这里是唯一同时知道两者的地方**(架构不变量:app 是唯一允许知道其余
 //! 几个 crate 的地方)。
 //!
+//! # 一次上传拆成两半
+//!
+//! [`prepare`](主线程) → [`upload_blocking`](`spawn_blocking` 线程)。
+//!
+//! 拆的理由是 **`Vault` 搬不进线程**:它住在 `App.store` 里、没有 `Clone`,
+//! 而给它加 `Clone` 等于允许「两份 Vault 各自 `save()` 互相覆盖」——
+//! 正是 F247/F248 刚修完的「整份覆盖」缺陷族。于是凡是要 vault 的活
+//! (封载荷、解 SK)留在事件循环线程上,搬进线程的只有字节。
+//!
+//! 主线程那一半全是纯 CPU(读几十 KB、一次 sha256、一次 XChaCha20),微秒级。
+//! 内容没变时它直接回 `Unchanged`,连 `spawn_blocking` 都不起。
+//!
 //! # 阻塞
 //!
-//! `mullion-cloud` 是阻塞式的(ureq)。[`upload_blocking`] 必须在
-//! `tokio::task::spawn_blocking` 里调用 —— 在事件循环里同步跑网络会把帧率
-//! 打到零(T3/T7 红线)。这个约束靠 `app.rs` 那边的调用点守着。
+//! `mullion-cloud` 是阻塞式的(ureq)。[`upload_blocking`] 必须挖进
+//! `spawn_blocking` —— 在事件循环里同步跑网络会把帧率打到零(T3/T7 红线)。
+//!
+//! **调用点要走 `Runtime` 句柄上的 `spawn_blocking`,不是自由函数
+//! `tokio::task::spawn_blocking`**:GUI 线程不在 runtime 上下文里,自由函数
+//! 形态会在运行期直接 panic(编译得过、测试全绿,只有真机才炸)。
+//! 这个约束靠 `app.rs` 那边的调用点守着。
 
 #[cfg(test)]
 mod tests {
@@ -2681,6 +2719,14 @@ mod tests {
     /// 表现成「备份莫名其妙失败」。
     /// 只推序号的话:指纹永远对不上,每一轮都重推一份内容相同的包,
     /// N 份历史窗口在几小时内被自己刷光。
+    ///
+    // `CloudConfig` 的 `corrupt` 字段是私有的(Task 8 的设计),于是
+    // `CloudConfig { .., ..Default::default() }` 在 **mullion-store 之外**
+    // 编不过(E0451:field `corrupt` is private)。只能 default 完再逐字段赋,
+    // 而那正好是 `field_reassign_with_default` 要抓的形状 —— 这里没有别的写法,
+    // 不是懒。**别把 `corrupt` 改成 pub 来迎合这条 lint**:它私有的理由
+    // (守护必须待在 `save` 内部)比这条 style lint 重要得多。
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn a_successful_upload_advances_both_the_fingerprint_and_the_sequence() {
         let mut cfg = mullion_store::CloudConfig::default();
@@ -2694,6 +2740,8 @@ mod tests {
 
     /// 失败**不许推进游标**。推了的话下一轮 `should_upload` 会认为
     /// 「内容没变」,于是这次没推上去的改动永远推不上去了,且零报错。
+    // `#[allow]` 的理由同上一条:`corrupt` 私有,FRU 在本 crate 里编不过。
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn a_failed_upload_leaves_the_cursor_alone() {
         let mut cfg = mullion_store::CloudConfig::default();
@@ -2702,6 +2750,40 @@ mod tests {
         let before = cfg.clone();
         record_failure(&mut cfg);
         assert_eq!(cfg, before, "失败之后游标被动过了 —— 这次的改动会永远推不上去");
+    }
+
+    /// `upload_blocking` **不许认识 `Vault`**。
+    ///
+    /// 它跑在 `spawn_blocking` 线程上,而 `Vault` 住在 `App.store` 里、
+    /// 没有 `Clone` —— 今天靠借用检查挡着。但只要有人哪天给 `Vault` 加一个
+    /// `Clone`,「顺手把 vault 传进去」就编得过了,而那等于允许两份 Vault
+    /// 各自 `save()` 互相覆盖(F247/F248 刚修完的「整份覆盖」缺陷族)。
+    ///
+    /// 扎在**签名**上而不是整个函数体:函数体里出现 `Vault` 这个词的地方
+    /// 还有文档注释,而签名是唯一说明「什么东西跨了线程」的那一行。
+    ///
+    /// 自证会变红:把 `vault: &Vault` 加回 `upload_blocking` 的参数表。
+    #[test]
+    fn the_blocking_half_does_not_know_about_the_vault() {
+        let src = include_str!("cloudsync.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面这条断言会恒真"
+        );
+        let at = prod
+            .find("pub fn upload_blocking(")
+            .expect("找不到 upload_blocking");
+        let tail = &prod[at..];
+        let end = tail.find(") -> ").expect("签名没闭合");
+        let sig = &tail[..end];
+        assert!(
+            !sig.contains("Vault"),
+            "upload_blocking 的签名里出现了 Vault —— 它跑在别的线程上:{sig}"
+        );
     }
 }
 ```
@@ -2755,18 +2837,40 @@ pub fn record_success(cfg: &mut CloudConfig, fingerprint: &str, seq: u64, at: &s
 /// 而那种改动会让这次没推上去的改动永远推不上去。
 pub fn record_failure(_cfg: &mut CloudConfig) {}
 
-/// 组装载荷并推上去。**阻塞。必须在 `spawn_blocking` 里调用。**
+/// 一次上传的**主线程那一半**的产物。
+pub struct Payload {
+    /// 这一份的内容指纹。上传成功后由 `app.rs` 写回游标。
+    pub fingerprint: String,
+    /// 已经用 vault key 整体封好的字节。**云上那份就是它。**
+    pub sealed: Vec<u8>,
+    /// 解出来的 Access Key Secret。
+    pub secret_access_key: String,
+}
+
+/// [`prepare`] 的三种结局。
+pub enum Prepared {
+    /// 内容没变。**连线程都不用起** —— 更不用建 TCP。
+    Unchanged,
+    Ready(Payload),
+    /// 还没送出去就失败了(没设主密码、SK 读不出、打包失败)。
+    Failed(String),
+}
+
+/// 上传的**主线程那一半**:装 + 封 + 解 SK。
 ///
-/// `stamp_compact` = `YYYYMMDD'T'HHMMSS'Z'`(既当 SigV4 的 `x-amz-date`,
-/// 也当对象键里那一段 —— 两者同源,省得出现「键上写着 10 点、签名说 11 点」)。
-pub fn upload_blocking(
-    dir: &Path,
-    vault: &Vault,
-    cfg: &CloudConfig,
-    stamp_compact: &str,
-    stamp_rfc3339: &str,
-    socks5: Option<&str>,
-) -> UploadOutcome {
+/// # 为什么拆成两半
+///
+/// `Vault` **搬不进 `spawn_blocking`**:它住在 `App.store` 里、没有 `Clone`,
+/// 而给它加一个 `Clone` 等于允许「两份 Vault 各自 `save()` 互相覆盖」——
+/// 那正是 F247/F248 刚修完的「整份覆盖」缺陷族。于是凡是要 vault 的活
+/// (封载荷、解 SK)全留在事件循环线程上,搬进线程的只有**字节**。
+///
+/// 这一半**全是纯 CPU**:读四个几十 KB 的文件、一次 sha256、一次
+/// XChaCha20 —— 微秒级,不会卡帧。真正会卡的是网络,那一半在
+/// [`upload_blocking`] 里。
+///
+/// 顺带的好处:指纹比对也在这儿做,内容没变时连 `spawn_blocking` 都不起。
+pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str) -> Prepared {
     // ① 装:顶层三文件 + 密文。**不带 layouts**(设计 D7)。
     //
     // 这里把 `secrets.enc` **原样**放进包,而不是像 F46-a 的本地迁移包那样
@@ -2783,7 +2887,7 @@ pub fn upload_blocking(
     let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
     let fp = cloud::fingerprint(&files, &secrets);
     if fp == cfg.last_fingerprint {
-        return UploadOutcome::Unchanged;
+        return Prepared::Unchanged;
     }
     // 注意 `secrets.enc` 的字节**不是内容的函数**:`crypto::encrypt` 每次换
     // 一个随机 nonce,所以 vault 存一次盘、密文整个变一遍,哪怕里头一个字段
@@ -2797,26 +2901,48 @@ pub fn upload_blocking(
     let text = match portable::write_pack(files, &secrets, env!("CARGO_PKG_VERSION"), stamp_rfc3339)
     {
         Ok(t) => t,
-        Err(e) => return UploadOutcome::Failed(format!("打包失败:{e}")),
+        Err(e) => return Prepared::Failed(format!("打包失败:{e}")),
     };
     let sealed = match vault.seal_with_master(text.as_bytes()) {
         Ok(b) => b,
         Err(mullion_store::StoreError::NoMasterPassword) => {
-            return UploadOutcome::Failed(
+            return Prepared::Failed(
                 "云端备份需要先设置主密码 —— 钥匙串里的密钥换台机器解不开".into(),
             )
         }
-        Err(e) => return UploadOutcome::Failed(format!("加密失败:{e}")),
+        Err(e) => return Prepared::Failed(format!("加密失败:{e}")),
     };
 
-    // ③ 送。
+    // ③ 解 SK。**这是最后一件需要 vault 的事**,做完之后线程那一半就只剩字节了。
     let sk = match cloud::secret_key(cfg, vault) {
         Ok(s) if !s.is_empty() => s,
-        Ok(_) => return UploadOutcome::Failed("还没填 Access Key Secret".into()),
-        Err(e) => return UploadOutcome::Failed(format!("读不出 Access Key Secret:{e}")),
+        Ok(_) => return Prepared::Failed("还没填 Access Key Secret".into()),
+        Err(e) => return Prepared::Failed(format!("读不出 Access Key Secret:{e}")),
     };
+
+    Prepared::Ready(Payload {
+        fingerprint: fp,
+        sealed,
+        secret_access_key: sk,
+    })
+}
+
+/// 上传的**阻塞那一半**:只碰网络。**必须挖进 `spawn_blocking` 调用**
+/// (走 `Runtime` 句柄,见模块文档)。
+///
+/// **签名里不许出现 `Vault`**,见 [`prepare`] 的那段理由(有守护测试钉着)。
+///
+/// `stamp_compact` = `YYYYMMDD'T'HHMMSS'Z'`(既当 SigV4 的 `x-amz-date`,
+/// 也当对象键里那一段 —— 两者同源,省得出现「键上写着 10 点、签名说 11 点」)。
+pub fn upload_blocking(
+    payload: Payload,
+    cfg: &CloudConfig,
+    stamp_compact: &str,
+    stamp_rfc3339: &str,
+) -> UploadOutcome {
     // `S3Client::new` 返回 `Result`(代理串解析不了时报 `Config`)——
     // **不要写成 `.unwrap()`**:那条路上用户填错代理地址就是当场 panic。
+    let socks5 = (!cfg.socks5.is_empty()).then_some(cfg.socks5.as_str());
     let client = match S3Client::new(
         Endpoint {
             base: cfg.endpoint.clone(),
@@ -2825,7 +2951,7 @@ pub fn upload_blocking(
         },
         Credentials {
             access_key_id: cfg.access_key_id.clone(),
-            secret_access_key: sk,
+            secret_access_key: payload.secret_access_key,
         },
         cfg.region.clone(),
         socks5,
@@ -2839,10 +2965,10 @@ pub fn upload_blocking(
         Err(e) => return UploadOutcome::Failed(format!("列举云端对象失败:{e}")),
     };
     match put_with_retry(&cfg.prefix, start, stamp_compact, |key| {
-        client.put_no_overwrite(key, &sealed, stamp_compact)
+        client.put_no_overwrite(key, &payload.sealed, stamp_compact)
     }) {
         Ok(seq) => UploadOutcome::Ok {
-            fingerprint: fp,
+            fingerprint: payload.fingerprint,
             seq,
             at: stamp_rfc3339.to_string(),
         },
@@ -2888,7 +3014,7 @@ fn put_with_retry(
 - [ ] **Step 6: 跑测试确认通过**
 
 Run: `cargo test -p mullion-app cloudsync 2>&1 | grep -E "test result|FAILED"`
-Expected: 6 passed。
+Expected: 7 passed。
 
 - [ ] **Step 7: 提交并变异验证**
 
@@ -2909,6 +3035,7 @@ git commit -m "feat(app): 云端备份的上传编排 (F273)
 | `plan_after_collision` 改成 `Some(taken)` | `a_taken_sequence_number_is_retried_with_a_fresh_one`；`the_sequence_that_comes_back_is_the_one_that_actually_landed` |
 | `put_with_retry` 成功时 `return Ok(seq)` 改成 `return Ok(0)` | `the_sequence_that_comes_back_is_the_one_that_actually_landed` |
 | `Err(e) => return Err(..)` 那条改成跟 `AlreadyExists` 一样往前挪 | `a_non_collision_error_stops_immediately` |
+| 给 `upload_blocking` 的参数表加回 `vault: &Vault` | `the_blocking_half_does_not_know_about_the_vault` |
 | `for _ in 0..MAX_PUT_ATTEMPTS` 改成 `for _ in 0..8` | `retries_are_bounded_so_a_always_409_server_cannot_spin_forever`（次数断言） |
 
 ---
@@ -2943,10 +3070,21 @@ git commit -m "feat(app): 云端备份的上传编排 (F273)
 
     /// 设了主密码之后,开关必须真的可点,且点一下报 Preview(草稿变了,
     /// 要等「确定」才落盘)。
+    ///
+    /// **最后两个 `true` 是 `store_available` / `has_master_password`** ——
+    /// 任一为 `false` 的话整节是 `add_enabled_ui(false)`,点不动,这条会红在
+    /// 一个跟它想测的东西无关的原因上。
     #[test]
     fn toggling_the_cloud_switch_reports_a_preview() {
         let mut d = draft();
-        let out = interact_env(&mut d, CLOUD_ENABLED_LABEL, true);
+        let out = interact_env(
+            &mut d,
+            CLOUD_ENABLED_LABEL,
+            egui::Vec2::ZERO,
+            true,
+            true,
+            true,
+        );
         assert_eq!(out, SettingsOut::Preview);
         assert!(d.cloud_enabled, "开关没被点开");
     }
@@ -2954,6 +3092,11 @@ git commit -m "feat(app): 云端备份的上传编排 (F273)
     /// 草稿必须从**落盘的那份**起,不是硬编码默认值。
     /// 从默认值起的症状:打开设置弹窗、什么都没动、点「确定」,
     /// 用户配好的云端备份被关掉了。
+    ///
+    // `CloudConfig::corrupt` 是私有的,`..Default::default()` 在 mullion-store
+    // 之外编不过(E0451)。只能 default 完再逐字段赋 —— 没有别的写法。
+    // **别为了这条 lint 把 `corrupt` 改成 pub**,它私有是 Task 8 的设计。
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn the_cloud_draft_starts_from_the_stored_config_not_a_hardcoded_default() {
         let mut stored = mullion_store::CloudConfig::default();
@@ -3007,6 +3150,8 @@ Expected: FAIL。
     pub cloud_path_style: bool,
     pub cloud_keep: u32,
     pub cloud_interval_min: u32,
+    /// SOCKS5 代理,空 = 直连。见 `CloudConfig::socks5` 上那段理由。
+    pub cloud_socks5: String,
     pub cloud_access_key_id: String,
     /// 新填的 SK。**空 = 不改**(不是「清空」):每次打开设置都要用户重打一遍
     /// 一串 30 位的密钥,是在逼人把它记在别处。
@@ -3032,6 +3177,7 @@ Expected: FAIL。
             cloud_path_style: c.path_style,
             cloud_keep: c.keep,
             cloud_interval_min: c.interval_min,
+            cloud_socks5: c.socks5.clone(),
             cloud_access_key_id: c.access_key_id.clone(),
             cloud_secret_new: String::new(),
             ..Self::from_settings(s)
@@ -3208,6 +3354,27 @@ fn cloud(
             }
             ui.end_row();
 
+            // SOCKS5 代理。**不补这一格的话 `socks5` 参数就是条死线** ——
+            // `mullion-cloud` 为它开了 ureq 的 `socks-proxy` 特性、
+            // `S3Client::new` 专门收了这个参数,而设计 D15 把「SOCKS 代理
+            // 链路通不通」列进了片一的真机验收项。没有入口就永远传 `None`,
+            // 那条验收项验的是一条从没走过的路。
+            ui.label("SOCKS5 代理");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut draft.cloud_socks5)
+                        .desired_width(w)
+                        // **hint 里写清不带 `socks5://`**:`S3Client::new` 自己
+                        // 补前缀,用户照直觉填全 URL 的话会拼成
+                        // `socks5://socks5://…` 而当场报「配置不合法」。
+                        .hint_text("127.0.0.1:1080,留空 = 直连"),
+                )
+                .changed()
+            {
+                *out = SettingsOut::Preview;
+            }
+            ui.end_row();
+
             ui.label("");
             ui.label(
                 egui::RichText::new(
@@ -3225,24 +3392,110 @@ fn cloud(
 }
 ```
 
-- [ ] **Step 5: 扩测试辅助 `run_env` / `interact_env`**
+- [ ] **Step 5: 修 `settings.rs` 自己那个穷尽的 `draft()` 辅助**
 
-该文件已有的辅助函数签名里多半只有 `not_monospace`。按测试里的调用形态补一个
-`has_master_password` 参数，并让 `SettingsEnv` 照着填。**以文件实际签名为准**
-（若已有该参数就不用改）。
+**测试辅助的签名不用动，已核实过（别按印象改）：**
 
-- [ ] **Step 6: 跑测试确认通过**
+```rust
+fn run_env(d: &mut SettingsDraft, not_monospace: bool, has_master_password: bool)
+    -> (Vec<String>, SettingsOut)          // settings.rs:618，内部写死 store_available: true
+
+fn interact_env(d: &mut SettingsDraft, label: &str, offset: egui::Vec2, release: bool,
+                store_available: bool, has_master_password: bool) -> SettingsOut   // settings.rs:680
+```
+
+**要动的是 `fn draft()`（`settings.rs:590`）** —— 它是**穷尽结构体字面量**，
+今天列了 9 个字段、没有 `..`：
+
+```rust
+    fn draft() -> SettingsDraft {
+        SettingsDraft {
+            family: Some("Cascadia Mono".into()),
+            font_pt: 10.0,
+            typed: "Cascadia Mono".into(),
+            new_password: String::new(),
+            confirm_password: String::new(),
+            tmux_bootstrap: true,
+            shell_osc7_bootstrap: true,
+            show_hidden_files: true,
+            log_level: mullion_store::LogLevel::Info,
+        }
+    }
+```
+
+Step 3 加了 11 个字段之后**这里当场编译不过**（`app.rs:18252` 是**另一处**同样的
+字面量，由 Step 6 收拾；两处都要改，漏一处就编不过）。改成：
+
+```rust
+    fn draft() -> SettingsDraft {
+        // 只覆盖这一组测试真正在意的那几项,其余从构造器起手。
+        // **不要**把 11 个云端字段一个个补进来 —— 那样每加一个字段都要回来
+        // 改一次,而补错值的表现是这一整组测试悄悄测了别的东西。
+        SettingsDraft {
+            family: Some("Cascadia Mono".into()),
+            font_pt: 10.0,
+            typed: "Cascadia Mono".into(),
+            ..SettingsDraft::from_settings(&mullion_store::Settings::default())
+        }
+    }
+```
+
+**注意语义变化**：`from_settings(&Settings::default())` 给的 `tmux_bootstrap` /
+`shell_osc7_bootstrap` / `show_hidden_files` / `log_level` 是 `Settings::default()`
+的值，未必都等于原来写死的 `true`。**改完先跑整组 `settings` 测试**；若有测试因此
+变红，说明它依赖的是那几个写死的 `true`，把那一项在**该条测试内部**显式设回去，
+**不要**改回穷尽字面量。
+
+- [ ] **Step 6: 修 `app.rs` 里那个穷尽的 `SettingsDraft` 字面量**
+
+`crates/mullion-app/src/app.rs:18252`（测试 `a_password_change_always_clears_the_two_boxes`）
+用**穷尽结构体字面量**构造 `SettingsDraft`，今天列了 9 个字段、**没有 `..Default`**：
+
+```rust
+            let mut d = crate::ui::settings::SettingsDraft {
+                family: None,
+                font_pt: 10.0,
+                typed: String::new(),
+                new_password: "hunter2".into(),
+                confirm_password: "hunter2".into(),
+                tmux_bootstrap: true,
+                shell_osc7_bootstrap: true,
+                show_hidden_files: true,
+                log_level: mullion_store::LogLevel::Info,
+            };
+```
+
+Step 3 加了 11 个字段之后**这里当场编译不过**。把它改成从构造器起手、只覆盖这条
+测试真正关心的两个字段：
+
+```rust
+            // 这条测的是「改完密码两个框要清空」,跟别的字段一点关系都没有。
+            // **不要**在这里把新字段一个个补齐 —— 那样每加一个字段都要回来改一次,
+            // 而漏改的表现是编译失败(还好),补错值的表现是这条测试悄悄测了别的东西。
+            let mut d = crate::ui::settings::SettingsDraft {
+                new_password: "hunter2".into(),
+                confirm_password: "hunter2".into(),
+                ..crate::ui::settings::SettingsDraft::from_settings(
+                    &mullion_store::Settings::default(),
+                )
+            };
+```
+
+**别顺手给 `SettingsDraft` 加 `#[derive(Default)]`** —— `font_pt: 10.0` 之类的值
+不是 `Default` 该给的，`from_settings` 才是这个结构体唯一的正经起点。
+
+- [ ] **Step 7: 跑测试确认通过**
 
 Run: `cargo test -p mullion-app settings 2>&1 | grep -E "test result|FAILED"`
 Expected: 全绿。
 
-- [ ] **Step 7: 跑字形白名单与表单规范守护**
+- [ ] **Step 8: 跑字形白名单与表单规范守护**
 
 Run: `cargo test -p mullion-app --test glyph_whitelist --test form_guidelines --test dialog_contrast --test strong_text_color 2>&1 | grep -E "test result|FAILED"`
 Expected: 全绿。若 `glyph_whitelist` 报红，说明文案里混进了 GBK 外的字形 —— 改文案，
 **不要**去改白名单。
 
-- [ ] **Step 8: 提交并变异验证**
+- [ ] **Step 9: 提交并变异验证**
 
 ```bash
 git add crates/mullion-app/src/ui/settings.rs
@@ -3273,25 +3526,58 @@ git commit -m "feat(app): 设置弹窗加云端备份分节,未设主密码时�
     /// 只有定时的话,用户在「我刚改完一堆会话，现在要重装系统」这个语境下
     /// 没有任何办法让它立刻推一份 —— 而那正是最需要备份的一刻。
     ///
-    /// **扎的是源码结构**(菜单项要展开 `menu_button` 才画得出来,跑帧测不到)。
-    /// 判据串带上行首缩进,避免匹配到这条测试自己(第五类恒绿模式)。
+    /// **扎的是源码结构**(菜单项要展开 `menu_button` 才画得出来,跑帧测不到),
+    /// 且**先切掉测试模块**再找 needle —— `include_str!` 拿到的是含这条测试
+    /// 自己的全文。`str::split` 找不到分隔符时会把整串原样还回来,所以额外
+    /// 钉一条「切完确实变短了」的兜底。
+    ///
+    /// 照抄同文件 `the_settings_menu_has_a_permanent_entry_to_export_the_redacted_log`
+    /// 的形态。**刻意不用同文件另一条(F156 那条)的「靠行首缩进躲开自己」写法**:
+    /// 那招能成立只是因为测试体里的 needle 带反斜杠转义、字节恰好与生产代码不同,
+    /// 一旦有人把它抽成常量或改写成 raw string 就当场恒真。
+    ///
+    /// 自证会变红:把 `chrome.rs` 里「立刻备份到云」那个菜单项删掉。
     #[test]
     fn the_config_menu_has_a_permanent_entry_to_back_up_now() {
         let src = include_str!("chrome.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
         assert!(
-            src.contains("\n                    if ui.button(\"立刻备份到云\").clicked() {"),
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面这条断言会恒真"
+        );
+        assert!(
+            prod.contains("if ui.button(\"立刻备份到云\").clicked() {"),
             "「配置」菜单里没有手动备份入口"
         );
     }
 
     /// 状态栏的云指示器在**没配置时不占格**(同隧道指示器那条理由:
     /// 每多一格常驻信息,别的信息就少一分被看见的机会)。
+    ///
+    /// **判据是两态的条数差,不只是「没有『云』字」。** 只判没有「云」字的话,
+    /// 「`None` 时画一个空标签」这条变异逃得掉 —— 空串里当然没有「云」,
+    /// 而格子实实在在占掉了。条数差把「根本没画」(差 0)、「画了」(差 1)、
+    /// 「跟着多画了别的」(差 ≥2)三种分开。
     #[test]
     fn the_cloud_cell_is_absent_when_cloud_backup_is_off() {
-        let texts = status_texts_with_cloud(None);
+        let off = status_texts(None, None, None, None);
+        let cell = CloudCell {
+            text: "云 已备份 #1".into(),
+            severity: crate::tunnels::Severity::Calm,
+        };
+        let on = status_texts(None, None, None, Some(&cell));
         assert!(
-            !texts.iter().any(|t| t.contains("云")),
-            "关着的时候还占了一格:{texts:?}"
+            !off.iter().any(|t| t.contains("云")),
+            "关着的时候还占了一格:{off:?}"
+        );
+        assert_eq!(
+            on.len(),
+            off.len() + 1,
+            "开关两态画出来的文字条数应该正好差一条。差 0 = 那一格根本没画;\
+             差 ≥2 = 有别的东西跟着变了。off={off:?} on={on:?}"
         );
     }
 
@@ -3300,10 +3586,11 @@ git commit -m "feat(app): 设置弹窗加云端备份分节,未设主密码时�
     /// 它的那天才发现没有。
     #[test]
     fn a_failing_cloud_backup_is_shown_in_the_status_bar() {
-        let texts = status_texts_with_cloud(Some(&CloudCell {
+        let cell = CloudCell {
             text: "云 备份失败".into(),
             severity: crate::tunnels::Severity::Danger,
-        }));
+        };
+        let texts = status_texts(None, None, None, Some(&cell));
         assert!(
             texts.iter().any(|t| t.contains("备份失败")),
             "备份失败没出现在状态栏:{texts:?}"
@@ -3311,7 +3598,15 @@ git commit -m "feat(app): 设置弹窗加云端备份分节,未设主密码时�
     }
 ```
 
-并照该文件已有的 `status_texts` 辅助，加一个 `status_texts_with_cloud`。
+**已核实的接线**（写代码前不必再 grep，但要按这份改）：
+
+- 测试辅助 `status_texts` 已存在于 `chrome.rs:685`，签名是
+  `fn status_texts(automation, tunnel, selection_path) -> Vec<String>`。
+  **给它加第四个参数 `cloud: Option<&CloudCell>`**，不要新建一个
+  `status_texts_with_cloud` —— 两个辅助会有九成重复。既有的四处调用点
+  （`chrome.rs` 的 728 / 746 / 767 / 786 行）补一个 `None`。
+- 同文件还有 `run_status`（649 行）里两处 `status_bar(..)` 调用、
+  以及 `annotate` 那条测试（815 行）一处，同样补 `None`。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -3339,8 +3634,15 @@ Expected: FAIL。
     pub cloud_backup_request: bool,
 ```
 
-（该结构体若有 `has_real_action` 之类的完备性方法，**必须同步加一笔** ——
-F199 的注释里写过，漏了的话这次点击会被 egui 的 discard 趟静默吃掉。）
+**已核实**：`UiState`（`ui/mod.rs`）没有 `has_real_action` 之类的完备性方法，
+所以这里不需要额外补一笔。但它的同族字段各有各的消费点，形态有两种：
+`export_log_request` 走具名的 `drain_export_log_request()` 并配了一条守护
+`drain_export_log_request_is_both_defined_and_called`；`pack_pick_request`
+走 `app.rs:14020` 的内联 `std::mem::take(&mut self.ui.pack_pick_request)`。
+
+`cloud_backup_request` 的**消费点在 Task 14**（本任务只置位）。Task 14 里
+**必须**用 `std::mem::take` 消费 —— 只读不清的话这个 bool 永远是 `true`，
+在途标记一还回来下一帧就再起一次，变成无限重传。
 
 - [ ] **Step 4: 加状态栏格**
 
@@ -3374,7 +3676,61 @@ pub struct CloudCell {
                     }
 ```
 
-`status_bar` 的全部调用点（`app.rs` 里）补上新参数。
+**已核实**：`status_bar`（`chrome.rs:475`）现在是 9 个参数，头上已经挂了
+`#[allow(clippy::too_many_arguments)]`，加第十个不会撞 clippy。
+
+**数据源放 `UiState`，不放 `App`。** 在 `ui/mod.rs` 的 `UiState` 里
+（`last_error` 附近）加：
+
+```rust
+    /// F273:最近一次云端备份的结论,状态栏那一格的数据源。
+    /// `None` = 从没备份过 → 不占格。
+    ///
+    /// **住在 `UiState` 而不是 `App`**:状态栏是从 `ui_state` 和 `UiFrame`
+    /// 两处取料画出来的,而 `ui/mod.rs:961` 那个调用点根本够不着 `App` 的字段。
+    /// 放 `App` 的话这一格只能先传 `None` 占位、等下一个任务再回来接 ——
+    /// 而「占位忘了接」正是本项目登记过的「量具存在≠接在那条路上」。
+    /// 它跟 `last_error` 同性质:一次性的、不落盘的、纯给人看的结论。
+    pub cloud_status: Option<chrome::CloudCell>,
+```
+
+调用点一共五处，**`app.rs` 里一处都没有**（计划早先写错了）：
+- 生产：`crates/mullion-app/src/ui/mod.rs:961` 的 `chrome::status_bar(..)` ——
+  **这一处本任务就要真的接上**，传 `ui_state.cloud_status.as_ref()`，不留占位。
+- 测试：`chrome.rs` 的 `run_status` 里两处、`status_texts` 里一处、
+  `annotate` 那条测试里一处 —— 一律补 `None`。
+
+配套守护（加进 Step 1 那一批）：
+
+```rust
+    /// F273:状态栏那一格必须**真的接在** `ui_state.cloud_status` 上。
+    ///
+    /// `CloudCell` 画得再对,只要生产调用点传的是字面 `None`,用户就永远
+    /// 看不见备份结论 —— 而编译、测试、clippy 全干净。本项目已登记同一形状
+    /// (「量具存在≠接在那条路上」)。
+    ///
+    /// 扎在 `ui/mod.rs` 上而不是 `chrome.rs`:调用点在那边。
+    ///
+    /// 自证会变红:把那个实参改回 `None`。
+    #[test]
+    fn the_status_bar_is_actually_fed_the_cloud_cell() {
+        let src = include_str!("mod.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(prod.len() < src.len(), "没能切掉测试模块 —— 下面那条会恒真");
+        assert!(
+            prod.contains("ui_state.cloud_status.as_ref()"),
+            "状态栏没接上云备份结论 —— 那一格会永远空着"
+        );
+    }
+```
+
+**这条放 `ui/mod.rs` 自己的 `mod tests` 里**（已核实：`ui/mod.rs:1268` 有
+`#[cfg(test)] mod tests {`，且全文件只有这一处 `#[cfg(test)]`，所以
+`split(..).next()` 切得干净）。别放 `chrome.rs` —— 那样 `include_str!` 要写成
+`../mod.rs`，绕一圈没好处。
 
 - [ ] **Step 5: 跑测试确认通过**
 
@@ -3384,7 +3740,10 @@ Expected: 全绿。
 - [ ] **Step 6: 提交并变异验证**
 
 ```bash
-git add crates/mullion-app/src/ui/chrome.rs crates/mullion-app/src/ui/mod.rs crates/mullion-app/src/app.rs
+# **本任务不动 `app.rs`** —— 状态栏那一格在这里先传 `None` 占位,
+# 数据源(`App::cloud_status`)是 Task 14 的事。把 app.rs 一起 add 进来
+# 只会夹带别的在途改动。
+git add crates/mullion-app/src/ui/chrome.rs crates/mullion-app/src/ui/mod.rs
 git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 (F273)
 
 失败必须看得见 —— 静默失败是备份功能唯一致命的失败模式。"
@@ -3393,8 +3752,9 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
 | 变异 | 应该变红的测试 |
 |---|---|
 | 菜单项文案改成「备份到云」 | `the_config_menu_has_a_permanent_entry_to_back_up_now` |
-| 状态栏那段 `if let Some(c)` 改成 `if false` | `a_failing_cloud_backup_is_shown_in_the_status_bar` |
-| 那段改成无条件画（`None` 时画空串） | `the_cloud_cell_is_absent_when_cloud_backup_is_off` |
+| 状态栏那段 `if let Some(c)` 改成 `if false` | `a_failing_cloud_backup_is_shown_in_the_status_bar`；`the_cloud_cell_is_absent_when_cloud_backup_is_off`（条数差变 0） |
+| 那段改成无条件画（`None` 时画空串） | `the_cloud_cell_is_absent_when_cloud_backup_is_off`（条数差变 0；只判「没有『云』字」的话这条逃得掉，所以判据是条数差） |
+| `ui/mod.rs:961` 的实参改回字面 `None` | `the_status_bar_is_actually_fed_the_cloud_cell` |
 
 ---
 
@@ -3416,17 +3776,27 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
     ///
     /// **扎的是源码结构**:这条约束没有运行期的表现可以断言(测试环境里
     /// 网络调用本来就不会发生),漏了也不报错,只有真机上卡给用户看。
+    ///
+    /// **必须先 `strip_comments`**:Step 6 的生产代码注释里就写着
+    /// 「必须 spawn_blocking」,不剥的话删掉真正那句调用测试照绿
+    /// (本项目已登记的坑,`app.rs` 里几十处共享这个手法)。
+    ///
+    /// **判据钉的是 `self._runtime.spawn_blocking(move ||`,不是
+    /// `tokio::task::spawn_blocking`。** 后者会在运行期 panic:GUI 线程
+    /// **不在** tokio runtime 上下文里(`app.rs:11017` 那句注释的原话是
+    /// 「GUI 线程不在 runtime 里,得显式进去一趟」),而自由函数形态的
+    /// `tokio::task::spawn_blocking` 要求调用处有 runtime 上下文。
+    /// 这条错**编译得过、全部测试照绿**,只有真机上第一次备份时当场崩。
+    ///
+    /// 自证会变红:把 `self._runtime.spawn_blocking(move || { .. })` 拆掉,
+    /// 直接同步调 `upload_blocking`。
     #[test]
     fn the_cloud_upload_runs_off_the_event_loop_thread() {
-        let src = prod_src();
-        let body = body_of(src, "fn spawn_cloud_backup(");
+        let body = strip_comments(body_of(prod_src(), "fn spawn_cloud_backup("));
         assert!(
-            body.contains("spawn_blocking"),
-            "云端上传没走 spawn_blocking —— 一次高延迟往返就会把帧率打到零"
-        );
-        assert!(
-            !body.contains("upload_blocking(") || body.contains("spawn_blocking"),
-            "在事件循环里直接调用了 upload_blocking"
+            body.contains("self._runtime.spawn_blocking(move ||"),
+            "云端上传没走 runtime 句柄上的 spawn_blocking —— 要么把帧率打到零,\
+             要么(用自由函数形态时)因为 GUI 线程不在 runtime 上下文里当场 panic"
         );
     }
 
@@ -3434,13 +3804,18 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
     /// 而一次高延迟上传可能跑几分钟 —— 手动点几下就能攒出一串并发的
     /// `spawn_blocking`,它们会互相撞号(ForbidOverwrite),表现成
     /// 「备份时好时坏」。
+    ///
+    /// 判据钉的是**那道闸**(`if self.cloud_in_flight {`),不是裸字段名:
+    /// 函数体里还有 `self.cloud_in_flight = true;` 那句,只搜字段名的话
+    /// 「把闸删掉」这条变异照样全绿。同样要先 `strip_comments`。
+    ///
+    /// 自证会变红:删掉 `if self.cloud_in_flight { return; }` 那三行。
     #[test]
     fn only_one_cloud_upload_is_in_flight_at_a_time() {
-        let src = prod_src();
-        let body = body_of(src, "fn spawn_cloud_backup(");
+        let body = strip_comments(body_of(prod_src(), "fn spawn_cloud_backup("));
         assert!(
-            body.contains("self.cloud_in_flight"),
-            "没有在途标记 —— 定时与手动会攒出一串并发上传并互相撞号"
+            body.contains("if self.cloud_in_flight {"),
+            "没有在途闸 —— 定时与手动会攒出一串并发上传并互相撞号"
         );
     }
 
@@ -3448,26 +3823,40 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
     ///
     /// 这是本项目的常客形状(见 T13 的「hold 每条出口都要归还」):漏一条
     /// 出口的后果是那之后**永远**不再备份,且没有任何报错。
+    ///
+    /// **锚点必须是 match 分支那一行**,不能用裸的 `UserEvent::CloudBackupDone(`:
+    /// `body_of` 取的是 `find` 的**第一次出现**,而 `UserEvent` 枚举定义在
+    /// `app.rs:57`、远在 `fn user_event`(11265 行)之前 —— 锚到变体定义上的话
+    /// 那一行连 `{` 都没有,`body_of` 会一路截到后面某个不相干的块,断言变成
+    /// 在考一段随机代码。
+    ///
+    /// 归还只允许有**一处**:多写一处就意味着有人在别的分支里补了个兜底,
+    /// 而那正是「三种结局共用一个变体」要避免的形状。
+    ///
+    /// 自证会变红:删掉 `self.cloud_in_flight = false;` 那句(第一条红),
+    /// 或者在某个分支里再补一句(第二条红)。
     #[test]
     fn every_path_that_ends_a_cloud_upload_hands_the_in_flight_flag_back() {
-        let src = prod_src();
-        let body = body_of(src, "UserEvent::CloudBackupDone(");
-        let returns = body.matches("self.cloud_in_flight = false").count();
-        assert!(
-            returns >= 1,
-            "CloudBackupDone 的处理里没有归还在途标记 —— 之后永远不再备份"
-        );
-        // 三个分支(Ok/Unchanged/Failed)不许有任何一条提前 return 绕过归还。
-        assert!(
-            !body.contains("return"),
-            "CloudBackupDone 的处理里有提前 return,可能绕过在途标记的归还"
+        let body = strip_comments(body_of(
+            prod_src(),
+            "UserEvent::CloudBackupDone(outcome) => {",
+        ));
+        assert_eq!(
+            body.matches("self.cloud_in_flight = false").count(),
+            1,
+            "在途标记的归还不是恰好一处 —— 漏了之后永远不再备份,多了说明有分支在自己兜底"
         );
     }
 
     /// 定时驱动必须**每帧都被调到**,而不是挂在某个偶尔才走的分支上。
+    ///
+    /// 同样先 `strip_comments` —— 注释里写一句「这里调 `self.drive_cloud_backup(..)`」
+    /// 就能让这条恒绿,而事件循环里那句其实被注释掉了。
+    ///
+    /// 自证会变红:把事件循环里 `self.drive_cloud_backup(now_ms);` 那句注释掉。
     #[test]
     fn the_cloud_backup_is_driven_every_frame() {
-        let src = prod_src();
+        let src = strip_comments(prod_src());
         assert!(
             src.contains("self.drive_cloud_backup("),
             "drive_cloud_backup 没有被调用 —— 定时备份从来不会发生"
@@ -3475,9 +3864,15 @@ git commit -m "feat(app): 菜单「立刻备份到云」+ 状态栏云指示器 
     }
 ```
 
-（`prod_src()` / `body_of()` 是 `app.rs` 测试区已有的辅助，直接用。
-**注意本项目已登记的坑**：源码切片守护不剥注释，判据串里的关键词若同时出现在
-注释里会造成假绿 —— 写完这四条后按下面的变异表逐条验一遍。）
+**已核实的测试辅助**（`app.rs` 的 `mod tests` 里都有，直接用，别自己再造）：
+- `prod_src() -> &'static str`（23908 行）：`include_str!("app.rs")` 再切掉
+  `\n#[cfg(test)]\nmod tests {` 之后的部分。
+- `body_of(production, sig) -> &str`（23879 行）：从 `sig` **第一次出现**处起，
+  取到第一个 `{` 之后的大括号配平块。注意「第一次出现」——锚点串必须是那段
+  代码独有的形状。
+- `strip_comments(body) -> String`（23899 行）：剥掉**整行**注释（行尾注释不剥）。
+  它的文档注释里原话是「源码切片断言几乎都得先过这一道…已实证过好几次
+  『只删代码、注释原样，测试照绿』」。上面四条守护全部过了这一道。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -3491,11 +3886,16 @@ Expected: FAIL。
     /// 而一次高延迟上传可能跑几分钟 —— 没闸的话手动点几下就能攒出一串
     /// 并发上传,它们互相撞号(ForbidOverwrite),表现成「备份时好时坏」。
     cloud_in_flight: bool,
-    /// F273:上次算指纹的时刻(单调毫秒)。定时的起点。
+    /// F273:上次算指纹的时刻。**是 `self.now_ms()` 的时基**(自 `self.start`
+    /// 起算的相对毫秒),不是 unix 时间 —— 初值 `0` 于是意味着「启动后
+    /// `interval_min` 分钟才第一次检查」,而不是「启动即传」。后者会让每次
+    /// 开 app 都推一份,把 keep 份历史窗口按开机次数消耗掉。
     cloud_last_check_ms: u64,
-    /// F273:最近一次备份的结论,状态栏那一格的数据源。
-    cloud_status: Option<crate::ui::chrome::CloudCell>,
 ```
+
+**只加这两个字段。** 状态栏那一格的数据源是 `self.ui.cloud_status`
+（`UiState` 上，Task 13 已加并已接到 `ui/mod.rs:961`）——**别在 `App` 上再开一个**，
+两份状态必然有一天对不上（影子状态，本项目已踩过若干次）。
 
 - [ ] **Step 4: 加 `UserEvent` 变体**
 
@@ -3508,48 +3908,97 @@ Expected: FAIL。
     CloudBackupDone(crate::cloudsync::UploadOutcome),
 ```
 
-- [ ] **Step 5: 实现 `spawn_cloud_backup` 与 `drive_cloud_backup`**
+**加完会有一处编译不过**：`user_event_marks_dirty`（`app.rs:15202`）是穷尽
+`match`。把 `CloudBackupDone(_)` 加进底下「其余一律标脏」那一组（它会改状态栏
+那一格，不标脏的话结论要等下一次别的事件才显示出来）。**不要**为了省事改成
+`_ =>` —— 那会把以后新加的变体一起吞掉。
+
+- [ ] **Step 5: 给 `SessionStore` 开一个 vault 访问器**
+
+`crates/mullion-app/src/shell/store.rs`（`SessionStore` 是 `Vault` 的薄封装，
+`vault` 字段私有）：
 
 ```rust
-    /// F273:起一次云端备份。已有在途的就**直接回**(不排队:排队等于把
-    /// 「已经过时的那一份」推上去,而下一轮会立刻再推一份新的)。
-    fn spawn_cloud_backup(&mut self) {
+    /// F270:借出底下的 `Vault`,给云端备份封载荷用。
+    ///
+    /// **只读借用**(`&self`)。云备份那条路上要 vault 做两件纯 CPU 的事
+    /// (封整包、解 SK),都不写盘;开成 `&mut` 的话调用点会需要一个可变
+    /// 借用,而它跟同一帧里读 `store.list()` 的地方冲突。
+    pub fn vault(&self) -> &mullion_store::Vault {
+        &self.vault
+    }
+```
+
+- [ ] **Step 6: 实现 `spawn_cloud_backup` 与 `drive_cloud_backup`**
+
+```rust
+    /// F273:起一次云端备份。
+    ///
+    /// **主线程只做纯 CPU 的那一半**(`cloudsync::prepare`:读四个文件、
+    /// 一次 sha256、一次 XChaCha20,微秒级),网络那一半挖进 `spawn_blocking`。
+    /// 拆两半的根由是 `Vault` 搬不进线程 —— 见 `cloudsync` 的模块文档。
+    ///
+    /// 已有在途的就**直接回**(不排队:排队等于把「已经过时的那一份」推上去,
+    /// 而下一轮会立刻再推一份新的)。
+    ///
+    /// `manual` = 用户从菜单点的。**只影响「没变」时说不说话**:定时那条
+    /// 每半小时静悄悄地不做事是对的,而用户主动点了「立刻备份到云」却什么
+    /// 都不发生,就是「点了没反应」(F265 记过同一形状:功能在那儿,
+    /// 用户不知道它起没起作用)。
+    fn spawn_cloud_backup(&mut self, manual: bool) {
         if self.cloud_in_flight {
             return;
         }
-        let Some(dir) = self.config_dir.clone() else { return };
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        let cfg = mullion_store::cloud::load(&dir);
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let stamp_rfc3339 = now_rfc3339();
+        let stamp_compact = now_compact();
+        let payload = match crate::cloudsync::prepare(&dir, store.vault(), &cfg, &stamp_rfc3339) {
+            crate::cloudsync::Prepared::Unchanged => {
+                if manual {
+                    self.ui.set_error("云端备份:内容没变,没有需要上传的改动".into());
+                }
+                return;
+            }
+            crate::cloudsync::Prepared::Failed(msg) => {
+                self.ui.set_error(format!("云端备份失败:{msg}"));
+                return;
+            }
+            crate::cloudsync::Prepared::Ready(p) => p,
+        };
         self.cloud_in_flight = true;
         let proxy = self.proxy.clone();
-        let stamp_compact = crate::localtime::utc_compact();
-        let stamp_rfc3339 = crate::localtime::utc_rfc3339();
-        let socks5 = self.cloud_socks5.clone();
         // **必须 spawn_blocking**:mullion-cloud 是阻塞式的,在事件循环里
         // 同步跑一次高延迟往返就能把帧率打到零(T3/T7)。
-        tokio::task::spawn_blocking(move || {
-            // vault 不能跨线程搬,所以在这条线程上重新打开一份**只读**的。
-            // 具体怎么拿到 vault,依 `App` 当前持有的形态定 —— 若 `Vault`
-            // 是 `Arc<Mutex<..>>`,直接 clone 那个 Arc 进来即可。
-            let outcome = crate::cloudsync::upload_blocking(
-                &dir,
-                &vault,
-                &cfg,
-                &stamp_compact,
-                &stamp_rfc3339,
-                socks5.as_deref(),
-            );
+        //
+        // **走 `self._runtime` 这个句柄,不要用自由函数 `tokio::task::spawn_blocking`**:
+        // GUI 线程不在 runtime 上下文里(同 `app.rs:11017` 那处 `_runtime.enter()`
+        // 的理由),自由函数形态会在运行期直接 panic —— 而且编译得过、
+        // 测试全绿,只有真机上第一次备份才炸。
+        self._runtime.spawn_blocking(move || {
+            let outcome =
+                crate::cloudsync::upload_blocking(payload, &cfg, &stamp_compact, &stamp_rfc3339);
             let _ = proxy.send_event(UserEvent::CloudBackupDone(outcome));
         });
     }
 
     /// F273:每帧看一眼该不该起一次定时备份。
     ///
-    /// **判据是内容指纹,不是脏标记**(设计 D9)。算指纹要读四个文件,
-    /// 所以按 `interval_min` 限流 —— 每帧都算的话是每秒几十次读盘。
+    /// 这里**不算指纹** —— `prepare` 已经算了,而且它顺带就把载荷封好了。
+    /// 在这儿再算一次等于每轮多读一遍那四个文件。这里只管三道闸:
+    /// 在途、没开、还没到点。
     fn drive_cloud_backup(&mut self, now_ms: u64) {
         if self.cloud_in_flight {
             return;
         }
-        let Some(dir) = self.config_dir.clone() else { return };
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
         let cfg = mullion_store::cloud::load(&dir);
         if !cfg.enabled {
             return;
@@ -3559,27 +4008,63 @@ Expected: FAIL。
             return;
         }
         self.cloud_last_check_ms = now_ms;
-        let files = mullion_store::portable::collect_top_level(&dir);
-        let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
-        let fp = mullion_store::cloud::fingerprint(&files, &secrets);
-        if fp == cfg.last_fingerprint {
-            return;
-        }
-        self.spawn_cloud_backup();
+        self.spawn_cloud_backup(false);
     }
 ```
 
-在事件循环里每帧调用 `self.drive_cloud_backup(now_ms);`（放在 `drive_reconnects`
-之类的同伴旁边），并在菜单动作处理里接上 `if ui_state.cloud_backup_request { self.spawn_cloud_backup(); }`。
+两个时间戳辅助（`app.rs` 里**没有**现成的，要新写；`localtime.rs` 里也没有
+`utc_compact` / `utc_rfc3339` 这种东西，别去找）。放在 `app.rs` 的自由函数区：
 
-- [ ] **Step 6: 实现 `CloudBackupDone` 的处理**
+```rust
+/// F273:`YYYY-MM-DD'T'HH:MM:SS'Z'`。写进 `cloud.toml` 的 `last_ok_at`,
+/// 也进包头 —— 与 `app.rs` 里另外两处 `now_utc().format(&Rfc3339)` 同形。
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// F273:`YYYYMMDD'T'HHMMSS'Z'`。**SigV4 的 `x-amz-date` 与对象键里那一段
+/// 共用这一个** —— 两者同源,省得出现「键上写着 10 点、签名说 11 点」。
+fn now_compact() -> String {
+    let t = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+```
+
+在事件循环里每帧调用 `self.drive_cloud_backup(now_ms);`（放在
+`self.drive_automation();` / `self.drive_attach_checks();` 那一串旁边，
+`app.rs:8595` 附近；那里上一行就有 `let now = self.now_ms();`）。
+
+菜单动作处理里接上手动入口 —— **必须 `take`，不能只读**：
+
+```rust
+                // F273:菜单里点的「立刻备份到云」。`take` 而不是只读:
+                // 只读的话这个 bool 永远是 `true`,在途标记一还回来下一帧
+                // 就再起一次,变成无限重传。同 `pack_pick_request` 的写法。
+                if std::mem::take(&mut self.ui.cloud_backup_request) {
+                    self.spawn_cloud_backup(true);
+                }
+```
+
+- [ ] **Step 7: 实现 `CloudBackupDone` 的处理**
 
 ```rust
             UserEvent::CloudBackupDone(outcome) => {
                 // 在途标记**只在这一处归还**,且这个分支里没有任何提前 return
                 // —— 漏一条出口的后果是之后永远不再备份,且零报错(T13 同族)。
                 self.cloud_in_flight = false;
-                let dir = self.config_dir.clone();
+                // **`App` 没有 `config_dir` 字段**,走自由函数(见本任务末尾
+                // 「已核实的字段来源」)。
+                let dir = crate::shell::store::config_dir();
                 match outcome {
                     crate::cloudsync::UploadOutcome::Ok { fingerprint, seq, at } => {
                         if let Some(d) = dir {
@@ -3589,7 +4074,9 @@ Expected: FAIL。
                                 log::warn!("云端备份游标写回失败:{e}");
                             }
                         }
-                        self.cloud_status = Some(crate::ui::chrome::CloudCell {
+                        // 结论写进 `self.ui`,不是 `App` —— 状态栏那一格
+                        // (`ui/mod.rs:961`)读的就是这里,Task 13 已经接死。
+                        self.ui.cloud_status = Some(crate::ui::chrome::CloudCell {
                             text: format!("云 已备份 #{seq}"),
                             severity: crate::tunnels::Severity::Calm,
                         });
@@ -3599,7 +4086,7 @@ Expected: FAIL。
                     }
                     crate::cloudsync::UploadOutcome::Failed(msg) => {
                         log::warn!("云端备份失败:{msg}");
-                        self.cloud_status = Some(crate::ui::chrome::CloudCell {
+                        self.ui.cloud_status = Some(crate::ui::chrome::CloudCell {
                             text: "云 备份失败".into(),
                             severity: crate::tunnels::Severity::Danger,
                         });
@@ -3609,45 +4096,237 @@ Expected: FAIL。
             }
 ```
 
-- [ ] **Step 7: 接「确定」时把云草稿落盘**
+- [ ] **Step 8a: 把草稿的起点换成 `from_settings_and_cloud`**
 
-在设置弹窗 `SettingsOut::Commit` 的处理里，除了现有的 `settings::save`，加：
+**这一步漏了的话，Task 12 的整个云端分节永远显示空白**，而且编译、测试、clippy
+全都干净——本项目登记过同一形状：「量具存在≠接在那条路上」。
+
+`crates/mullion-app/src/app.rs:3285`（`fn sync_settings_dialog`）是 `SettingsDraft`
+**唯一的生产构造点**，今天写的是：
 
 ```rust
-                // F271:云配置落**另一个文件**(`cloud.toml` 不进迁移包)。
-                // SK 空 = 不改 —— 每次打开设置都要重打一遍 30 位密钥,
-                // 是在逼用户把它记在别处。
-                if let Some(d) = self.config_dir.clone() {
-                    let mut cfg = mullion_store::cloud::load(&d);
-                    cfg.enabled = draft.cloud_enabled;
-                    cfg.endpoint = draft.cloud_endpoint.clone();
-                    cfg.region = draft.cloud_region.clone();
-                    cfg.bucket = draft.cloud_bucket.clone();
-                    cfg.prefix = draft.cloud_prefix.clone();
-                    cfg.path_style = draft.cloud_path_style;
-                    cfg.keep = draft.cloud_keep;
-                    cfg.interval_min = draft.cloud_interval_min;
-                    cfg.access_key_id = draft.cloud_access_key_id.clone();
-                    if !draft.cloud_secret_new.is_empty() {
-                        if let Some(v) = self.vault.as_ref() {
-                            if let Err(e) =
-                                mullion_store::cloud::set_secret_key(&mut cfg, v, &draft.cloud_secret_new)
-                            {
-                                self.ui.set_error(format!("保存 Access Key Secret 失败:{e}"));
-                            }
-                        }
-                        draft.cloud_secret_new.clear();
-                    }
-                    if let Err(e) = mullion_store::cloud::save(&d, &cfg) {
-                        self.ui.set_error(format!("保存云端备份配置失败:{e}"));
-                    }
-                }
+                self.ui.settings_draft = Some(crate::ui::settings::SettingsDraft::from_settings(
+                    &self.settings,
+                ));
 ```
 
-**`self.vault` / `self.config_dir` / `self.proxy` 的实际名字以 `app.rs` 当前形态
-为准** —— 先 grep 一遍，不要照抄这里的字段名。
+换成：
 
-- [ ] **Step 8: 跑全量**
+```rust
+                // F271:云配置在**另一个文件**里(`cloud.toml` 不进迁移包),
+                // 所以草稿要从两个来源起手。读不到配置目录时退回 `Default`——
+                // 那种情况下云端分节全空,而「确定」那一步同样拿不到目录、
+                // 不会写出任何东西,两端一致。
+                let cloud = crate::shell::store::config_dir()
+                    .map(|d| mullion_store::cloud::load(&d))
+                    .unwrap_or_default();
+                self.ui.settings_draft =
+                    Some(crate::ui::settings::SettingsDraft::from_settings_and_cloud(
+                        &self.settings,
+                        &cloud,
+                    ));
+```
+
+配套守护（加进 Step 1 那一批测试里；**判据不能是「`from_settings_and_cloud` 存在」**，
+那是恒绿的——它必须扎在「弹窗真的显示了盘上那份配置」上）：
+
+```rust
+    /// F271:设置弹窗里的云端分节必须显示**盘上那份** `cloud.toml`。
+    ///
+    /// 这条守的是接线,不是构造器本身。`from_settings_and_cloud` 写得再对,
+    /// 只要 `sync_settings_dialog` 还在调 `from_settings`,用户看到的就是一张
+    /// 空表 —— 而且编译、测试、clippy 全干净,只有人眼能发现。
+    ///
+    /// 自证会变红:把 `sync_settings_dialog` 里那两行改回
+    /// `SettingsDraft::from_settings(&self.settings)`。
+    #[test]
+    fn the_settings_dialog_starts_from_the_cloud_config_on_disk() {
+        let production = prod_src();
+        let body = body_of(&production, "fn sync_settings_dialog(");
+        let body = strip_comments(&body);
+        assert!(
+            body.contains("from_settings_and_cloud"),
+            "设置弹窗的草稿没接上云配置 —— 云端分节会永远显示空白:{body}"
+        );
+        assert!(
+            !body.contains("SettingsDraft::from_settings("),
+            "还在调只读 settings 的那个构造器:{body}"
+        );
+    }
+```
+
+（`prod_src` / `body_of` / `strip_comments` 是 `app.rs` 测试模块里已有的源码切片
+辅助，见 `app.rs:23879` 一带。**必须过 `strip_comments`** —— 不然上面那段新写的
+注释里就字面带着 `from_settings_and_cloud`，断言当场恒真。）
+
+- [ ] **Step 8b: 接「确定」时把云草稿落盘**
+
+**已核实的现场**（`app.rs:3372` 的 `O::Commit` 分支）：那里**没有 `draft` 这个
+绑定**，只有 `self.take_settings_draft();` + 一段 `graft_changed` 三方合并 +
+`self.ui.settings_open = false;`。`take_settings_draft` 走的是 `as_ref()`，
+**不会清掉** `self.ui.settings_draft`，所以草稿在这一步仍然在。
+
+在 `O::Commit` 分支里、`self.ui.settings_open = false;` **之前**加一行：
+
+```rust
+                self.save_cloud_draft();
+```
+
+然后新写这个方法（放在 `apply_settings_action` 附近）：
+
+```rust
+    /// F271:把设置弹窗里的云端分节写进 `cloud.toml`。
+    ///
+    /// **单独一个方法,不是揉进 `O::Commit`**:这段要同时碰
+    /// `self.ui.settings_draft`(**可变** —— SK 存完必须清掉)、`self.store`
+    /// (借 vault)和 `self.ui.set_error`(又一次 `&mut self.ui`)。揉在一起
+    /// 会撞借用检查。先把要用的几项**克隆成局部量**,借用就都断干净了。
+    ///
+    /// 云配置落的是**另一个文件** —— `cloud.toml` 刻意不在
+    /// `portable::TOP_LEVEL_FILES` 里(设计 D11),所以它不跟着 `settings.toml`
+    /// 那条三方合并的路走。
+    fn save_cloud_draft(&mut self) {
+        let Some(d) = self.ui.settings_draft.as_ref() else {
+            return;
+        };
+        let enabled = d.cloud_enabled;
+        let endpoint = d.cloud_endpoint.clone();
+        let region = d.cloud_region.clone();
+        let bucket = d.cloud_bucket.clone();
+        let prefix = d.cloud_prefix.clone();
+        let path_style = d.cloud_path_style;
+        let keep = d.cloud_keep;
+        let interval_min = d.cloud_interval_min;
+        let socks5 = d.cloud_socks5.clone();
+        let access_key_id = d.cloud_access_key_id.clone();
+        let secret_new = d.cloud_secret_new.clone();
+
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        // 读-改-写:盘上那份打底,只盖弹窗管的那几项。游标
+        // (`last_seq` / `last_fingerprint` / `last_ok_at`)与已封好的
+        // `secret_sealed` 必须原样留着 —— 整份覆盖是 F247/F248 的缺陷族。
+        let mut cfg = mullion_store::cloud::load(&dir);
+        cfg.enabled = enabled;
+        cfg.endpoint = endpoint;
+        cfg.region = region;
+        cfg.bucket = bucket;
+        cfg.prefix = prefix;
+        cfg.path_style = path_style;
+        cfg.keep = keep;
+        cfg.interval_min = interval_min;
+        cfg.socks5 = socks5;
+        cfg.access_key_id = access_key_id;
+
+        // SK 空 = 不改 —— 每次打开设置都要重打一遍 30 位密钥,
+        // 等于在逼用户把它记在别处。
+        let mut sk_err = None;
+        if !secret_new.is_empty() {
+            match self.store.as_ref() {
+                Some(s) => {
+                    if let Err(e) =
+                        mullion_store::cloud::set_secret_key(&mut cfg, s.vault(), &secret_new)
+                    {
+                        sk_err = Some(format!("保存 Access Key Secret 失败:{e}"));
+                    }
+                }
+                None => sk_err = Some("会话库还没打开,Access Key Secret 没能保存".into()),
+            }
+            // **不管成没成都清掉**:失败时留着的话,下一次点确定会拿同一个
+            // 明文再试一遍,而用户以为自己早就改过了;而且那串明文会一直
+            // 躺在草稿里等着被截图。
+            if let Some(d) = self.ui.settings_draft.as_mut() {
+                d.cloud_secret_new.clear();
+            }
+        }
+
+        let save_err = mullion_store::cloud::save(&dir, &cfg)
+            .err()
+            .map(|e| format!("保存云端备份配置失败:{e}"));
+        // `set_error` 只留最后一条 —— 两条分别发的话第一条会被静默吃掉。
+        let msgs: Vec<String> = [sk_err, save_err].into_iter().flatten().collect();
+        if !msgs.is_empty() {
+            self.ui.set_error(msgs.join(" / "));
+        }
+    }
+```
+
+配套守护（加进 Step 1 那一批）：
+
+```rust
+    /// F271:云配置写回必须是**读-改-写**,不是整份覆盖。
+    ///
+    /// 整份覆盖的症状:用户打开设置点一下确定,`last_seq` / `last_fingerprint`
+    /// 连同已封好的 `secret_sealed` 一起被草稿里的空值抹掉 —— 下一轮备份
+    /// 从序号 1 重来、SK 没了要重填,而这一切零报错(F247/F248 缺陷族)。
+    ///
+    /// 自证会变红:把 `let mut cfg = mullion_store::cloud::load(&dir);`
+    /// 改成 `let mut cfg = mullion_store::CloudConfig::default();`。
+    #[test]
+    fn the_cloud_draft_is_written_back_over_the_config_on_disk() {
+        let body = strip_comments(body_of(prod_src(), "fn save_cloud_draft("));
+        assert!(
+            body.contains("mullion_store::cloud::load(&dir)"),
+            "云配置写回没有先读盘 —— 游标与已封好的 SK 会被一次「确定」抹掉"
+        );
+        assert!(
+            !body.contains("CloudConfig::default()"),
+            "写回的底是 default() —— 那就是整份覆盖:{body}"
+        );
+    }
+
+    /// F271:SK 输入框**不管存成没存成都要清掉**。
+    ///
+    /// 留着的症状有两个,都静默:下次点确定会拿同一串明文再试一遍
+    /// (用户以为早就改过了),以及那串明文一直躺在草稿里等着被截图 ——
+    /// 本项目的排查流程里「发个截图」是常规动作。
+    ///
+    /// 判据有两半:**恰好一处** `clear()`,且它挂在 `match` **外面**的那个
+    /// `if let` 上 —— 塞进 `Some`/`None` 某条分支里的话另一条路上就不清了。
+    ///
+    /// 第二半钉的是**缩进**(12 格,即直接在 `if !secret_new.is_empty()` 里),
+    /// 不是先后顺序。「排在错误分支之后」是句废话:把 `clear()` 搬进错误分支,
+    /// 它照样排在后面 —— 那条断言杀不掉自己要挡的变异。`strip_comments` 只删
+    /// 整行注释、不动代码行的缩进,所以这个判据是稳的。
+    ///
+    /// 自证会变红:删掉那句 `clear()`;或者把那个 `if let` 整块搬进
+    /// `match` 的 `Some(s) =>` 分支里(缩进变 16 格)。
+    #[test]
+    fn the_secret_key_box_is_cleared_whether_or_not_it_saved() {
+        let body = strip_comments(body_of(prod_src(), "fn save_cloud_draft("));
+        assert_eq!(
+            body.matches(".cloud_secret_new.clear()").count(),
+            1,
+            "SK 框的清空不是恰好一处 —— 漏了会让明文留在草稿里,多了说明有分支在兜底"
+        );
+        assert!(
+            body.contains("\n            if let Some(d) = self.ui.settings_draft.as_mut() {"),
+            "清空没挂在 match 外层那个 if let 上(缩进对不上)—— 它得在存成/存砸\
+             两条路之后都执行:{body}"
+        );
+    }
+```
+
+**`cloud.toml` 读坏时这条路是个死胡同,片一有意不修 —— 但要知道它长什么样。**
+`load` 读不懂时返回的那份 `CloudConfig` 带着私有的 `corrupt` 标记,设置弹窗于是
+显示一张**空表单**(用户会以为自己从没配过),填完点确定 → `save` 拒绝 → 每次
+都报同一条错。用户唯一的自救办法是去删那个文件。
+
+片一给到的程度:`save` 的错误文案里**带完整路径**(Task 8 已实现并有守护测试
+钉着),所以 `set_error` 出来的那句话里能看见该删哪个文件。**「重置云配置」
+按钮留给片二** —— 触发条件是手改 `%APPDATA%` 底下的 TOML 并改坏,能干这事的
+人也能把文件删掉,为它现在加一条 UI 路径不划算。**别在本任务里顺手加。**
+
+**已核实的字段来源**（`app.rs` 当前形态，别再去猜）：
+- 配置目录：**`App` 没有 `config_dir` 字段**，走自由函数
+  `crate::shell::store::config_dir() -> Option<PathBuf>`。
+- vault：**`App` 没有 `vault` 字段**。它在 `self.store: Option<SessionStore>`
+  里，且 `SessionStore.vault` 是私有的 —— Step 5 新开的 `vault()` 访问器就是
+  为这两个调用点开的。
+- `self.proxy: EventLoopProxy<UserEvent>`（`app.rs:2213`）确实存在，`Clone` 可用。
+
+- [ ] **Step 9: 跑全量**
 
 Run: `cargo test --workspace > /tmp/test.log 2>&1; grep -nE "test result|FAILED|panicked" /tmp/test.log`
 Expected: 全绿。
@@ -3658,7 +4337,7 @@ Expected: 无输出。
 Run: `cargo fmt --check`
 Expected: 无输出。
 
-- [ ] **Step 9: 提交并变异验证**
+- [ ] **Step 10: 提交并变异验证**
 
 ```bash
 git add crates/mullion-app/src/app.rs
@@ -3672,9 +4351,12 @@ git commit -m "feat(app): 云端备份的定时驱动与结果回收 (F273)
 | 变异 | 应该变红的测试 |
 |---|---|
 | `spawn_cloud_backup` 里去掉 `spawn_blocking`，直接同步调 | `the_cloud_upload_runs_off_the_event_loop_thread` |
+| `self._runtime.spawn_blocking(` 改成 `tokio::task::spawn_blocking(` | 同上（这条变异**编译得过**，正是它要挡的那种：真机首次备份 panic） |
 | 去掉 `if self.cloud_in_flight { return; }` 那句 | `only_one_cloud_upload_is_in_flight_at_a_time` |
 | `CloudBackupDone` 分支里删掉 `self.cloud_in_flight = false;` | `every_path_that_ends_a_cloud_upload_hands_the_in_flight_flag_back` |
 | 事件循环里注释掉 `self.drive_cloud_backup(now_ms);` | `the_cloud_backup_is_driven_every_frame` |
+| `sync_settings_dialog` 里改回 `SettingsDraft::from_settings(&self.settings)` | `the_settings_dialog_starts_from_the_cloud_config_on_disk` |
+| 菜单分支里 `std::mem::take(&mut self.ui.cloud_backup_request)` 改成只读 `self.ui.cloud_backup_request` | 见 Task 13 的表（无限重传） |
 
 **⚠️ 若某条变异杀不掉**：多半是源码切片守护匹配到了注释里的关键词（本项目已登记
 的坑）。把判据串改成带行首缩进的精确形态，或把它扎到一个注释里不会出现的形状上。
@@ -3734,8 +4416,12 @@ fn a_real_bucket_accepts_our_signature_and_refuses_an_overwrite() {
             secret_access_key: env("MULLION_CLOUD_SK").expect("MULLION_CLOUD_SK"),
         },
         env("MULLION_CLOUD_REGION").expect("MULLION_CLOUD_REGION"),
+        // `MULLION_CLOUD_SOCKS5` 是 `host:port`,**不带 `socks5://`**。
         env("MULLION_CLOUD_SOCKS5").as_deref(),
-    );
+    )
+    // `new` 返回 `Result`(代理地址解析不了时报 `Config`)—— 这里不能直接
+    // 当成 `S3Client` 用,那是编译不过的。
+    .expect("建不起客户端 —— 多半是 MULLION_CLOUD_SOCKS5 填错了");
     // 时间戳从 env 传 —— 本 crate 不持时钟。跑之前用 `date -u +%Y%m%dT%H%M%SZ`。
     let stamp = env("MULLION_CLOUD_STAMP").expect("MULLION_CLOUD_STAMP：date -u +%Y%m%dT%H%M%SZ");
     let key = format!("mullion-live-test/{stamp}.bin");
