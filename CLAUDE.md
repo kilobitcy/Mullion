@@ -27,10 +27,11 @@ mullion-core     布局树。零 UI、零 IO、零 async。可纯单测。
 mullion-term     VT 仿真封装 + 输入编码。只依赖 alacritty_terminal / vte。
 mullion-ssh      russh。不认识「pane」「窗口」这些概念，只认字节流。
 mullion-store    会话/凭据持久化。TOML + keyring 加密。零 UI、零 async、仅同步 IO。可纯单测。
+mullion-cloud    S3 兼容对象存储客户端。只认字节与键名,不认识 Pack/Session/UI。零 async。可纯单测。
 mullion-app      winit + wgpu + glyphon(终端自绘)+ egui(外壳:菜单/状态栏/会话弹窗)。唯一允许知道其余四者的地方。
 ```
 
-**依赖方向严格单向**：`app → {core, term, ssh, store}`，其余互不依赖。
+**依赖方向严格单向**：`app → {core, term, ssh, store, cloud}`，其余互不依赖。
 
 这条约束的全部价值在于：**布局 bug 和键码 bug 能在没有窗口的情况下写测试复现**。
 这两类是本项目最费时间的 bug。任何「为了方便」把 UI 类型漏进 core/term 的改动，

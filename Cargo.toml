@@ -6,6 +6,7 @@ members = [
     "crates/mullion-ssh",
     "crates/mullion-app",
     "crates/mullion-store",
+    "crates/mullion-cloud",
 ]
 
 [workspace.package]
@@ -82,6 +83,15 @@ syntect = { version = "5.3", default-features = false, features = [
     "default-syntaxes",
     "regex-fancy",
 ] }
+# F270:云端备份的 HTTP 客户端。**阻塞式**,所以 `mullion-cloud` 与 `mullion-store`
+# 同样是零 async 的纯 crate;app 侧用 spawn_blocking 挖出去(T3/T7:绝不在事件
+# 循环里同步跑网络)。features 见 crates/mullion-cloud/Cargo.toml 顶上的长注释 ——
+# `rustls` 这一条是**交叉编译能不能过**的开关,不是口味问题。
+ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy"] }
+# SigV4 的 HMAC-SHA256 与内容指纹。两者已在 Cargo.lock(russh 传递依赖),
+# 加直接依赖不引入新版本。
+sha2 = "0.10"
+hmac = "0.12"
 
 # N6(安装包 < 25MB)。在这之前 release 用的是 cargo 默认值,交叉编译出来的
 # exe 是 38.6 MiB —— 超标 54%,而且从来没有任何自动化盯着它。

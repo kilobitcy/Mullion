@@ -1,0 +1,25 @@
+[package]
+name = "mullion-cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# ⚠️ TLS provider 必须显式钉死(设计 D4)。ureq 3 今天默认 rustls+ring,但官方
+# README 原话是 "does not guarantee defaulting to it indefinitely" —— 哪天默认
+# 切到 aws-lc-rs,`x86_64-pc-windows-gnu` 的交叉编译会在 aws-lc-sys 的 C/NASM
+# 构建上当场炸(正是 ADR-005 当初把 russh 切到 ring 要躲开的那件事),而本机
+# `cargo test` 一切正常 —— 只有交叉编译时才暴露。
+#
+# 不开 `gzip`:它会再拉一条 `flate2` 的路径,而 RUSTSEC-2026-0153 对本项目
+# 是**真可达**的(见 cargo audit 可达性登记),不主动加第二条。
+# 不开 `cookies`/`json`/`charset`:对象存储一条都用不上(N6 exe 体积)。
+ureq = { workspace = true }
+# SigV4 要 HMAC-SHA256。两者本来就在 Cargo.lock 里(russh 拉的),加直接依赖
+# 不引入新版本 —— 同 `base64`/`argon2` 那两条的理由。
+sha2 = { workspace = true }
+hmac = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# 假 S3 server 只用 std::net,不需要 tokio。
