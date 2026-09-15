@@ -520,6 +520,48 @@ mod tests {
         );
     }
 
+    /// 「读不出来」的判据必须**一路推到 `prepare`**,不能只守到 `read_secrets`。
+    ///
+    /// `prepare` 才是真正走到「打包 → 加密 → 上传」的那条路;`fingerprint_now`
+    /// 只用来判「要不要推」。把 `prepare` 里那一行单独退回 `unwrap_or_default()`
+    /// (`read_secrets` 函数本身保持正确),14 条测试全绿 —— 那正是原缺陷最致命的
+    /// 那一半重新长回来,而且零报错。
+    ///
+    /// **两个目录不是啰嗦**:`Vault::open_with` 里是
+    /// `if secrets_path.exists() { Some(fs::read(&secrets_path)?) }`
+    /// (`vault.rs:170`),一个名叫 `secrets.enc` 的**目录**会让它自己先报错,
+    /// 根本轮不到 `prepare`。所以 vault 开在干净的 dir,读不出来的那份放另一个。
+    ///
+    /// 自证会变红:把 `prepare` 里 `read_secrets(dir)` 的 `Err` 分支换成
+    /// `.unwrap_or_default()`。
+    #[test]
+    fn prepare_refuses_when_secrets_cannot_be_read() {
+        let vault_dir = tempfile::tempdir().expect("vault 目录");
+        let mut v = mullion_store::Vault::open(
+            vault_dir.path().to_path_buf(),
+            &mullion_store::InMemoryKey([7u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+
+        let broken = tempfile::tempdir().expect("待备份目录");
+        std::fs::create_dir(broken.path().join("secrets.enc")).expect("建同名目录");
+
+        let cfg = mullion_store::CloudConfig::default();
+        match prepare(broken.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Failed(msg) => assert!(
+                msg.contains("secrets.enc"),
+                "拦是拦下了,但没说清是 secrets.enc 读不出来 —— \
+                 用户会去查网络和 AK/SK:{msg}"
+            ),
+            Prepared::Ready(_) => panic!(
+                "读不出 secrets.enc 却封出了载荷 —— 这一份的密文段是空的,\
+                 而它会被正常上传、正常推进游标,恢复那天才发现凭据全没了"
+            ),
+            Prepared::Unchanged => panic!("被当成「内容没变」跳过了 —— 真正的原因被吃掉"),
+        }
+    }
+
     /// 没设主密码时,`prepare` 必须**在送出去之前**就拦下来,并且说的是
     /// 「需要先设置主密码」而不是「加密失败」。
     ///
