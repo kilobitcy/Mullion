@@ -44,8 +44,16 @@ fn serve(replies: Vec<(u16, String)>) -> (u16, mpsc::Receiver<Seen>) {
             };
             let _ = tx.send(seen);
             let (code, body) = replies.next().unwrap_or((500, String::new()));
+            // 3xx 自动带 Location,因为跳转降级是这一族唯一要测的东西——
+            // 不给 `replies` 的元组加第三个字段,免得改动已有 5 条测试的
+            // 调用形态。
+            let location = if (300..400).contains(&code) {
+                "Location: https://elsewhere.invalid/moved\r\n"
+            } else {
+                ""
+            };
             let resp = format!(
-                "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {code} X\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = s.write_all(resp.as_bytes());
@@ -115,6 +123,7 @@ fn client(port: u16) -> S3Client {
         "cn-hangzhou".into(),
         None,
     )
+    .expect("建客户端")
 }
 
 #[test]
@@ -228,4 +237,66 @@ fn listing_follows_the_continuation_token_until_it_is_gone() {
         "第二页没带令牌:{}",
         second.path
     );
+}
+
+/// PUT 碰到 301 必须报错,**不能被 ureq 悄悄降级成的匿名 GET 骗过**。
+/// ureq 默认跟随重定向时,非 GET/HEAD 方法在 301/302/303 上会被改写成
+/// GET、丢弃 body、丢弃 Authorization——那次 GET 若恰好拿到 2xx,我们
+/// 只看状态码的话就会把它当成写入成功,而对象存储上其实什么都没多。
+/// 错误信息里必须带得上 Location,不然用户不知道该往哪改配置。
+#[test]
+fn a_put_that_gets_redirected_is_reported_not_silently_turned_into_a_get() {
+    let (port, _rx) = serve(vec![(301, String::new())]);
+    let e = client(port)
+        .put_no_overwrite("k", b"x", "20260915T101500Z")
+        .expect_err("301 应该报错,而不是被降级成的匿名 GET 骗成功");
+    match e {
+        CloudError::Config(msg) => assert!(
+            msg.contains("https://elsewhere.invalid/moved"),
+            "错误信息里没带 Location:{msg}"
+        ),
+        other => panic!("期望 Config,拿到 {other:?}"),
+    }
+}
+
+/// LIST 碰到 302 同样必须报错,不能返回半份 keys ——
+/// 半份列表会让「最大序号」算错,下一次上传撞上已存在的键。
+#[test]
+fn a_list_that_gets_redirected_is_reported_not_partially_returned() {
+    let (port, _rx) = serve(vec![(302, String::new())]);
+    let e = client(port)
+        .list_keys("mullion/", "20260915T101500Z")
+        .expect_err("302 应该报错");
+    assert!(
+        matches!(e, CloudError::Config(_)),
+        "302 没被认成 Config,拿到 {e:?}"
+    );
+}
+
+/// 代理串解析失败必须报出来,**不能悄悄退化成直连**。直连若恰好在内网
+/// 通(常见情况),后果是备份"成功"但完全绕开了用户明确要求的代理路由,
+/// 界面上还显示"代理已配置",零提示。
+#[test]
+fn a_bad_proxy_string_is_reported_instead_of_silently_falling_back_to_a_direct_connection() {
+    // `S3Client` 没有 `Debug`(agent 里的连接池等不值得为了测试去实现),
+    // 用 `match` 而不是 `expect_err`。
+    match S3Client::new(
+        Endpoint {
+            base: "http://127.0.0.1:1".into(),
+            bucket: "b".into(),
+            path_style: true,
+        },
+        Credentials {
+            access_key_id: "AK".into(),
+            secret_access_key: "SK".into(),
+        },
+        "cn-hangzhou".into(),
+        // 带空格的串解析不成 URI 的 authority —— `ureq::Proxy::new` 对它
+        // 可靠地返回 `Err`(已用一个独立的 scratch crate 核实过,不是
+        // 凭记忆猜的)。
+        Some("not a proxy"),
+    ) {
+        Ok(_) => panic!("代理串解析不了应该报错,不该悄悄退化成直连"),
+        Err(e) => assert!(matches!(e, CloudError::Config(_)), "拿到 {e:?}"),
+    }
 }

@@ -38,29 +38,44 @@ pub struct S3Client {
 
 impl S3Client {
     /// `socks5` = `Some("host:port")` 时全部请求走 SOCKS5 代理。
+    ///
+    /// `socks5` 解析不了时报错,**不静默退化成直连**——直连若恰好在内网通
+    /// (常见情况),后果是备份"成功"但完全绕开了用户明确要求的代理路由,
+    /// 界面上还显示"代理已配置",零提示。
     pub fn new(
         endpoint: Endpoint,
         creds: Credentials,
         region: String,
         socks5: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self, CloudError> {
         let mut b = ureq::Agent::config_builder()
             .timeout_global(Some(TIMEOUT))
             // **必须关掉**:409(ForbidOverwrite 命中)与 403(签名/权限)都要
             // 我们自己看状态码分类。留着默认的话它们全变成同一个
             // `Error::StatusCode`,`AlreadyExists` 就认不出来了。
-            .http_status_as_error(false);
+            .http_status_as_error(false)
+            // **必须关掉自动跳转**:ureq-proto 对 301/302/303 会把非
+            // GET/HEAD 方法悄悄降级成匿名 GET(丢 body、丢
+            // Authorization——`redirect_auth_headers` 默认就是
+            // `Never`)。PUT 到一个挂了强制 https 跳转的 endpoint 会变成
+            // 一次匿名 GET,我们只看状态码,2xx 就误判成写入成功,而对象
+            // 存储上其实什么都没多。`max_redirects(0)` 时 ureq 把原始
+            // 3xx 响应原样返回(不是 Err)——见 ureq 3.4.2
+            // `Config::max_redirects` 文档:"If max_redirects is 0, no
+            // redirects are followed and the response is always
+            // returned"。我们要的正是这个:能把 Location 报给用户。
+            .max_redirects(0);
         if let Some(p) = socks5 {
-            if let Ok(proxy) = ureq::Proxy::new(&format!("socks5://{p}")) {
-                b = b.proxy(Some(proxy));
-            }
+            let proxy = ureq::Proxy::new(&format!("socks5://{p}"))
+                .map_err(|e| CloudError::Config(format!("SOCKS5 代理地址解析失败:{p:?}:{e}")))?;
+            b = b.proxy(Some(proxy));
         }
-        Self {
+        Ok(Self {
             endpoint,
             creds,
             region,
             agent: b.build().into(),
-        }
+        })
     }
 
     /// 写一个对象,**要求服务端在对象已存在时拒绝**。
@@ -114,6 +129,12 @@ impl S3Client {
         if code == 409 || code == 412 {
             return Err(CloudError::AlreadyExists);
         }
+        // 3xx 单独归一档:根因是 endpoint 配置错了(host/scheme,或该换
+        // region),用户能自己修——报成一条普通 `Status` 会把唯一可操作的
+        // 信息(Location 指向哪)扔掉。
+        if (300..400).contains(&code) {
+            return Err(redirect_err(code, &resp));
+        }
         Err(status_err(code, resp))
     }
 
@@ -158,6 +179,9 @@ impl S3Client {
                 .call()
                 .map_err(transport)?;
             let code = resp.status().as_u16();
+            if (300..400).contains(&code) {
+                return Err(redirect_err(code, &resp));
+            }
             if !(200..300).contains(&code) {
                 return Err(status_err(code, resp));
             }
@@ -190,4 +214,23 @@ fn status_err(code: u16, resp: ureq::http::Response<ureq::Body>) -> CloudError {
         // 截断:错误正文会进日志,而对象存储偶尔会回几 KB 的 HTML 错误页。
         body: body.chars().take(400).collect(),
     }
+}
+
+/// 3xx 归一成 `Config`,带上状态码与 `Location`——这一族的根因是
+/// endpoint 填错了(host/scheme 或该换 region),是用户能自己修的配置
+/// 问题;只报状态码等于把唯一可操作的信息(该往哪儿改)扔掉。
+///
+/// **只读 header,不读 body**:调用方传的是 `&resp` 引用,body 留给别处
+/// (这里其实没有别处会再读,但保持「只消费一次 body」的形状,免得以后
+/// 有人在这之后又想读 body 却发现已经被吃掉)。
+fn redirect_err(code: u16, resp: &ureq::http::Response<ureq::Body>) -> CloudError {
+    let location = resp
+        .headers()
+        .get("location")
+        .map(|v| v.to_str().unwrap_or("(无法解析的 Location)").to_string())
+        .unwrap_or_else(|| "(没有 Location 头)".to_string());
+    CloudError::Config(format!(
+        "服务端返回 {code} 重定向到 {location} —— 多半是 endpoint 的 host/scheme 填错了,\
+         或者 bucket 在另一个 region;SigV4 签名不会跟着重定向自动生效,需要改配置"
+    ))
 }
