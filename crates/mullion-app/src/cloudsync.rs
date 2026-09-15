@@ -95,6 +95,27 @@ pub fn minutes_since_last_ok(last_ok_at: &str, now: time::OffsetDateTime) -> u64
     (secs as u64) / 60
 }
 
+/// 读 `secrets.enc`。**「不存在」与「读不出来」必须分开。**
+///
+/// 不存在是合法状态(这台机器从没存过密码),按空字节继续。
+///
+/// 读不出来(权限 / IO / 被杀软短暂锁住 —— Windows 上这几样都不罕见)
+/// **必须报错**。静默当成空字节的话:指纹算成「secrets 为空」那一版、
+/// 包里密文段是空的,而这一份会被正常加密、正常上传、正常推进游标 ——
+/// 全程零报错。指纹推进之后,除非内容再变一次,这个空洞不会被下一轮覆盖
+/// 修掉。等到真要拿它恢复的那天,`portable` 把空密文段解释成「源机没有
+/// 密码」(那是**合法**状态,见 `portable.rs:229`),恢复流程也不报错,
+/// 只是恢复完发现所有会话都要重新输凭据。
+///
+/// 一路都在报成功 —— 这是备份功能最致命的失败模式。
+fn read_secrets(dir: &Path) -> Result<Vec<u8>, String> {
+    match std::fs::read(dir.join("secrets.enc")) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("读不出 secrets.enc:{e}")),
+    }
+}
+
 /// 这一轮内容的指纹。[`prepare`] 里也要算一次 —— **这是有意的重复**。
 ///
 /// 定时那一路必须先拿到指纹才问得了 [`cloud::should_upload`](「内容变没变」
@@ -105,10 +126,10 @@ pub fn minutes_since_last_ok(last_ok_at: &str, now: time::OffsetDateTime) -> u64
 /// 把真正的原因吃掉。
 ///
 /// 成本:读四个几十 KB 的文件 + 一次 sha256,每个轮询 tick 一次。微秒级。
-pub fn fingerprint_now(dir: &Path) -> String {
+pub fn fingerprint_now(dir: &Path) -> Result<String, String> {
     let files = portable::collect_top_level(dir);
-    let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
-    cloud::fingerprint(&files, &secrets)
+    let secrets = read_secrets(dir)?;
+    Ok(cloud::fingerprint(&files, &secrets))
 }
 
 /// 一次上传的**主线程那一半**的产物。
@@ -157,8 +178,16 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
     // 都解不开,而症状是「每条会话都要重新输密码」且零报错(本项目在 F46-a
     // 上已经踩过一次)。`seal_with_master` 在钥匙串方案下会返回
     // `NoMasterPassword`,那是今天挡住这条路的东西,别把它绕过去。
+    //
+    // `read_secrets` 把「文件不存在」(合法,空字节继续)与「读不出来」
+    // (权限 / IO / 被杀软短暂锁住)分开报错 —— 后者若静默吞成空字节,
+    // 这一份就会带着一段空密文正常加密、正常上传、正常推进游标,
+    // 一路报成功,直到恢复那天才发现凭据全没了。
     let files = portable::collect_top_level(dir);
-    let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
+    let secrets = match read_secrets(dir) {
+        Ok(s) => s,
+        Err(e) => return Prepared::Failed(e),
+    };
     let fp = cloud::fingerprint(&files, &secrets);
     // 定时那一路已经在 `drive_cloud_backup` 里问过 `should_upload` 了(其中
     // 一道闸就是指纹)。这里**还要再判一次**,因为**手动**那一路是绕过
@@ -459,6 +488,136 @@ mod tests {
     /// 某些时刻偶发地红,而那种红没人查得动。
     fn some_time() -> time::OffsetDateTime {
         time::OffsetDateTime::from_unix_timestamp(1_789_000_000).expect("固定时刻")
+    }
+
+    /// 「读不出来」与「没有」**必须分得开**。
+    ///
+    /// 合并成空字节的话,一次瞬时 IO 失败就会让我们把一份**密文段是空的**
+    /// 备份正常加密、正常上传、正常推进游标 —— 全程零报错,直到恢复那天
+    /// 才发现所有凭据都没了(而恢复流程也不报错,因为空密文段是合法状态)。
+    ///
+    /// **判「读不出来」用的是一个同名的目录,不是 `chmod`。** 读目录在各平台
+    /// 都会失败、且 kind 都不是 `NotFound`,而 `chmod` 在 Windows 上没用 ——
+    /// 而 Windows 才是本项目唯一的一等公民,守护不该只在 Linux 上成立。
+    ///
+    /// 自证会变红:把 `read_secrets` 换回 `fs::read(..).unwrap_or_default()`。
+    #[test]
+    fn a_secrets_file_we_cannot_read_is_an_error_not_an_empty_one() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        assert_eq!(
+            read_secrets(dir.path()),
+            Ok(Vec::new()),
+            "文件不存在是合法状态,不该报错"
+        );
+        std::fs::create_dir(dir.path().join("secrets.enc")).expect("建同名目录");
+        assert!(
+            read_secrets(dir.path()).is_err(),
+            "读不出来被当成了「没有」—— 这一份备份的密文段会是空的,且一路报成功"
+        );
+        assert!(
+            fingerprint_now(dir.path()).is_err(),
+            "指纹把「读不出来」算成了「secrets 为空」那一版"
+        );
+    }
+
+    /// 没设主密码时,`prepare` 必须**在送出去之前**就拦下来,并且说的是
+    /// 「需要先设置主密码」而不是「加密失败」。
+    ///
+    /// 钥匙串里的那把钥匙只在这台机器上有效,用它封出来的备份换台电脑
+    /// 一个字也解不开 —— 而云备份的主场景正是「换新电脑」(设计 D6)。
+    /// 说成「加密失败」的话,用户会去查网络、查 AK/SK,查不到一个前置条件。
+    ///
+    /// 自证会变红:把 `NoMasterPassword` 那条专门分支并进通用的
+    /// `Err(e) => Failed(format!("加密失败:{e}"))`。
+    #[test]
+    fn a_vault_without_a_master_password_is_refused_with_the_real_reason() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let v = mullion_store::Vault::open(
+            dir.path().to_path_buf(),
+            &mullion_store::InMemoryKey([7u8; 32]),
+        )
+        .expect("开库");
+        let cfg = mullion_store::CloudConfig::default();
+        match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Failed(msg) => assert!(
+                msg.contains("主密码"),
+                "拦是拦下了,但没说清是缺主密码:{msg}"
+            ),
+            Prepared::Ready(_) => panic!("钥匙串方案下封出了一份换台机器解不开的备份"),
+            Prepared::Unchanged => panic!("被当成「内容没变」跳过了 —— 真正的原因被吃掉"),
+        }
+    }
+
+    /// 设了主密码、又从没推过,必须给出一份可上传的载荷。
+    ///
+    /// 这条是上一条的**阳性对照**:没有它,上一条可以靠「`prepare` 永远返回
+    /// `Failed`」通过,而那时候云备份整个是坏的。
+    #[test]
+    fn a_first_run_with_a_master_password_produces_something_to_upload() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = mullion_store::Vault::open(
+            dir.path().to_path_buf(),
+            &mullion_store::InMemoryKey([7u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+        let mut cfg = mullion_store::CloudConfig::default();
+        // `prepare` 里 SK 那道闸(③)跟主密码那道闸(②)是两回事:没填 SK
+        // 会报「还没填 Access Key Secret」,这条测试要验证的是**过了 SK 那道闸
+        // 之后**确实有东西可传,所以先把它填上。
+        cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+        match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Ready(p) => {
+                assert!(!p.sealed.is_empty(), "封出来的载荷是空的");
+                assert!(!p.fingerprint.is_empty(), "没算出指纹");
+            }
+            other => panic!(
+                "第一次就该有东西可传,拿到的却是 {}",
+                match other {
+                    Prepared::Unchanged => "Unchanged",
+                    Prepared::Failed(_) => "Failed",
+                    Prepared::Ready(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    /// 指纹对得上就**不推**,对不上就推。这一对方向必须钉死。
+    ///
+    /// 反过来的后果:手动点「立刻备份」时,真改了内容的被判成「没变」悄悄
+    /// 不推(用户以为备份了);没改内容的每次都重推,把 N 份历史窗口刷光。
+    ///
+    /// **判据走一次真正的往返** —— 拿第一次 `Ready` 里返回的那个指纹填回
+    /// `cfg`,而不是另外调一次 `fingerprint_now` 算一个「期望值」。后者会让
+    /// 这条测试依赖两处实现算得一样,而不是依赖这个分支的方向。
+    ///
+    /// 自证会变红:把 `if fp == cfg.last_fingerprint` 改成 `!=`
+    /// (两条断言会一起红)。
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
+    fn the_same_content_is_not_uploaded_twice() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = mullion_store::Vault::open(
+            dir.path().to_path_buf(),
+            &mullion_store::InMemoryKey([7u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+        let mut cfg = mullion_store::CloudConfig::default();
+        cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+
+        let fp = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Ready(p) => p.fingerprint,
+            _ => panic!("第一次就该有东西可传"),
+        };
+        cfg.last_fingerprint = fp;
+        assert!(
+            matches!(
+                prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:01Z"),
+                Prepared::Unchanged
+            ),
+            "内容一个字没变却又要推一遍 —— N 份历史窗口会被自己刷光"
+        );
     }
 
     /// `upload_blocking` **不许认识 `Vault`**。
