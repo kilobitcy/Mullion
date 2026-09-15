@@ -45,6 +45,19 @@ fn unescape(s: &str) -> String {
 /// 解析 ListObjectsV2 的响应体。
 pub fn parse_list(xml: &str) -> Result<ListResult, CloudError> {
     if !xml.contains("<ListBucketResult") {
+        // 截断到 200 字符:这条错误正文会进日志,而服务端出错时偶尔会回几
+        // KB 的 HTML 错误页,不截断日志会被灌爆。
+        //
+        // **200 这个数是有前提的、不是随便挑的**:实测过 AWS / 阿里云的
+        // `SignatureDoesNotMatch` 错误体,`<Code>`+`<Message>` 两段加起来
+        // 约 212 字符,真正敏感的 `AWSAccessKeyId`/`StringToSign`/
+        // `CanonicalRequest` 字段排在其后,所以 200 恰好够不到它们。
+        //
+        // **但这是巧合,不是保证**:`crates/mullion-app/src/redact.rs` 的
+        // 脱敏规则只认 `user@host`/IPv4/Windows 路径/Unix 路径这几种模式,
+        // 认不出 XML 字段里的凭据文本。若某个非主流 S3 兼容实现把凭据字段
+        // 放在错误体最前面,200 字符就会把它录进日志且脱敏器也拦不住。
+        // **加长这个截断之前先把这条想清楚。**
         return Err(CloudError::Malformed(format!(
             "不是 ListBucketResult:{}",
             xml.chars().take(200).collect::<String>()
