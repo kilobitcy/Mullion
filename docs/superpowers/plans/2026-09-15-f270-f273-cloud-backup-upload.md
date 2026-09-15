@@ -2625,10 +2625,54 @@ mod tests {
 
     /// 重试必须有上限。没有上限的话,一个总是回 409 的服务端会让这个
     /// 后台线程永远转下去,而用户只看得见「备份一直在转」。
+    ///
+    /// **判据是「真的只打了这么多次」,不是「常量落在某个区间」。**
+    /// 后者是对一个字面量做断言:循环写成 `loop {}` 忘了用这个常量,
+    /// 它照样绿。
     #[test]
     fn retries_are_bounded_so_a_always_409_server_cannot_spin_forever() {
-        assert!(MAX_PUT_ATTEMPTS >= 2, "至少要能重试一次");
-        assert!(MAX_PUT_ATTEMPTS <= 8, "上限太高,等于没有上限");
+        let mut calls = 0;
+        let r = put_with_retry("p/", 1, "20260915T101500Z", |_| {
+            calls += 1;
+            Err(CloudError::AlreadyExists)
+        });
+        assert!(r.is_err(), "全程 409 却报成功");
+        assert_eq!(
+            calls, MAX_PUT_ATTEMPTS as usize,
+            "实际打了 {calls} 次,与上限对不上 —— 循环没用这个常量"
+        );
+    }
+
+    /// 撞号之后返回的必须是**真正写成功的那个序号**,不是一开始那个。
+    ///
+    /// 返回错的话,游标会被推到一个并不存在的序号上,下一轮从那儿 +1,
+    /// 中间空出来的号永远不会被用 —— 而 `keep` 份的清理是按序号算的。
+    #[test]
+    fn the_sequence_that_comes_back_is_the_one_that_actually_landed() {
+        let mut left = 2;
+        let seq = put_with_retry("p/", 5, "20260915T101500Z", |_| {
+            if left > 0 {
+                left -= 1;
+                Err(CloudError::AlreadyExists)
+            } else {
+                Ok(())
+            }
+        })
+        .expect("第三次该成功");
+        assert_eq!(seq, 7, "撞了两次之后落在 7,返回的却是 {seq}");
+    }
+
+    /// 不是撞号的错误**立刻停**,不要拿它去消耗重试次数 —— 403(签名/权限)
+    /// 重试四次还是 403,只是把用户等待的时间乘以四。
+    #[test]
+    fn a_non_collision_error_stops_immediately() {
+        let mut calls = 0;
+        let r = put_with_retry("p/", 1, "20260915T101500Z", |_| {
+            calls += 1;
+            Err(CloudError::Status { code: 403, body: "SignatureDoesNotMatch".into() })
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 1, "非撞号的错误也在重试 —— 打了 {calls} 次");
     }
 
     /// 成功之后游标必须**同时**推进指纹与序号。
@@ -2724,12 +2768,29 @@ pub fn upload_blocking(
     socks5: Option<&str>,
 ) -> UploadOutcome {
     // ① 装:顶层三文件 + 密文。**不带 layouts**(设计 D7)。
+    //
+    // 这里把 `secrets.enc` **原样**放进包,而不是像 F46-a 的本地迁移包那样
+    // 用一次性口令重封(`portable::seal_secrets`)。成立的前提**只有一条**:
+    // 设计 D6 要求云备份必须先设主密码,于是 `secrets.enc` 的文件头一定是
+    // Argon2id、盐随文件走,另一台机器拿主密码就解得开。
+    //
+    // **这条前提一旦松动(比如哪天允许钥匙串方案也上传),这里必须同步改成
+    // 重封** —— 否则拉回来的密文用的是源机钥匙串里的密钥,换台机器一个字
+    // 都解不开,而症状是「每条会话都要重新输密码」且零报错(本项目在 F46-a
+    // 上已经踩过一次)。`seal_with_master` 在钥匙串方案下会返回
+    // `NoMasterPassword`,那是今天挡住这条路的东西,别把它绕过去。
     let files = portable::collect_top_level(dir);
     let secrets = std::fs::read(dir.join("secrets.enc")).unwrap_or_default();
     let fp = cloud::fingerprint(&files, &secrets);
     if fp == cfg.last_fingerprint {
         return UploadOutcome::Unchanged;
     }
+    // 注意 `secrets.enc` 的字节**不是内容的函数**:`crypto::encrypt` 每次换
+    // 一个随机 nonce,所以 vault 存一次盘、密文整个变一遍,哪怕里头一个字段
+    // 都没改。后果是「任何一次 vault save 都会触发一次上传」。今天可以接受
+    // (vault save 本来就对应一次真实改动),但若以后出现「定时重写 secrets.enc」
+    // 之类的路径,这一条会把 keep 份历史窗口刷光 —— 那时候要做的是把指纹的
+    // 密文分量换成对**明文载荷**取,不是去调大 interval。
 
     // ② 封:先拼成 F46-a 的包文本,再**整体**用 vault key 加密(设计 D5)。
     //    整体加密之后,sessions.toml 里的真机 IP / 用户名 / 跳板拓扑不落云端明文。
@@ -2754,7 +2815,9 @@ pub fn upload_blocking(
         Ok(_) => return UploadOutcome::Failed("还没填 Access Key Secret".into()),
         Err(e) => return UploadOutcome::Failed(format!("读不出 Access Key Secret:{e}")),
     };
-    let client = S3Client::new(
+    // `S3Client::new` 返回 `Result`(代理串解析不了时报 `Config`)——
+    // **不要写成 `.unwrap()`**:那条路上用户填错代理地址就是当场 panic。
+    let client = match S3Client::new(
         Endpoint {
             base: cfg.endpoint.clone(),
             bucket: cfg.bucket.clone(),
@@ -2766,32 +2829,53 @@ pub fn upload_blocking(
         },
         cfg.region.clone(),
         socks5,
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => return UploadOutcome::Failed(format!("云端客户端建不起来:{e}")),
+    };
 
-    let mut seq = match client.list_keys(&cfg.prefix, stamp_compact) {
+    let start = match client.list_keys(&cfg.prefix, stamp_compact) {
         Ok(keys) => cloud::next_seq(&cfg.prefix, &keys),
         Err(e) => return UploadOutcome::Failed(format!("列举云端对象失败:{e}")),
     };
+    match put_with_retry(&cfg.prefix, start, stamp_compact, |key| {
+        client.put_no_overwrite(key, &sealed, stamp_compact)
+    }) {
+        Ok(seq) => UploadOutcome::Ok {
+            fingerprint: fp,
+            seq,
+            at: stamp_rfc3339.to_string(),
+        },
+        Err(msg) => UploadOutcome::Failed(msg),
+    }
+}
+
+/// 撞号重试的循环本体。**把网络那一步收进闭包,是为了让这段逻辑测得到。**
+///
+/// 本项目登记过一种恒绿:「纯函数测得扎实、接线没人看着」。`upload_blocking`
+/// 整体要真网络才跑得起来,于是最容易出错的那一段(撞号往前挪、上限、
+/// 成功时返回的到底是哪个序号)就变成没人守。抽出来之后,假的 `put`
+/// 闭包就能把三种形状全测到。
+fn put_with_retry(
+    prefix: &str,
+    mut seq: u64,
+    stamp: &str,
+    mut put: impl FnMut(&str) -> Result<(), CloudError>,
+) -> Result<u64, String> {
     for _ in 0..MAX_PUT_ATTEMPTS {
-        let key = cloud::object_key(&cfg.prefix, seq, stamp_compact);
-        match client.put_no_overwrite(&key, &sealed, stamp_compact) {
-            Ok(()) => {
-                return UploadOutcome::Ok {
-                    fingerprint: fp,
-                    seq,
-                    at: stamp_rfc3339.to_string(),
-                }
-            }
+        let key = cloud::object_key(prefix, seq, stamp);
+        match put(&key) {
+            Ok(()) => return Ok(seq),
             // 别的机器抢先用掉了这个序号。**往前挪再试** —— 这是没有 CAS
             // 的服务端上唯一的并发保护(设计 D8)。
             Err(CloudError::AlreadyExists) => match plan_after_collision(seq) {
                 Some(next) => seq = next,
-                None => return UploadOutcome::Failed("序号用尽".into()),
+                None => return Err("序号用尽".into()),
             },
-            Err(e) => return UploadOutcome::Failed(format!("上传失败:{e}")),
+            Err(e) => return Err(format!("上传失败:{e}")),
         }
     }
-    UploadOutcome::Failed(format!(
+    Err(format!(
         "连试 {MAX_PUT_ATTEMPTS} 个序号都被占用 —— 可能有别的机器正在频繁上传"
     ))
 }
@@ -2804,7 +2888,7 @@ pub fn upload_blocking(
 - [ ] **Step 6: 跑测试确认通过**
 
 Run: `cargo test -p mullion-app cloudsync 2>&1 | grep -E "test result|FAILED"`
-Expected: 4 passed。
+Expected: 6 passed。
 
 - [ ] **Step 7: 提交并变异验证**
 
@@ -2822,7 +2906,10 @@ git commit -m "feat(app): 云端备份的上传编排 (F273)
 | `record_success` 里删掉 `cfg.last_seq = seq;` | `a_successful_upload_advances_both_the_fingerprint_and_the_sequence` |
 | `record_failure` 里加 `cfg.last_fingerprint = "x".into();` | `a_failed_upload_leaves_the_cursor_alone` |
 | `MAX_PUT_ATTEMPTS` 改成 `1` | `retries_are_bounded_so_a_always_409_server_cannot_spin_forever` |
-| `plan_after_collision` 改成 `Some(taken)` | `a_taken_sequence_number_is_retried_with_a_fresh_one` |
+| `plan_after_collision` 改成 `Some(taken)` | `a_taken_sequence_number_is_retried_with_a_fresh_one`；`the_sequence_that_comes_back_is_the_one_that_actually_landed` |
+| `put_with_retry` 成功时 `return Ok(seq)` 改成 `return Ok(0)` | `the_sequence_that_comes_back_is_the_one_that_actually_landed` |
+| `Err(e) => return Err(..)` 那条改成跟 `AlreadyExists` 一样往前挪 | `a_non_collision_error_stops_immediately` |
+| `for _ in 0..MAX_PUT_ATTEMPTS` 改成 `for _ in 0..8` | `retries_are_bounded_so_a_always_409_server_cannot_spin_forever`（次数断言） |
 
 ---
 
