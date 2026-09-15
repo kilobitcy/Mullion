@@ -3215,17 +3215,26 @@ git commit -m "feat(app): 云端备份的上传编排 (F273)
     #[test]
     fn the_secret_key_field_is_masked() {
         let src = include_str!("settings.rs");
-        let body = src
-            .split("fn cloud(")
-            .nth(1)
-            .expect("没有 cloud 分节函数");
+        // 先切掉测试模块:这条测试自己的正文里就字面写着 `fn cloud(`
+        // 与 `.password(true)`,不切的话锚点和判据都可能落在测试自己身上。
+        // (已核实:本文件只有 `settings.rs:573` 一处 `#[cfg(test)]`。)
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(prod.len() < src.len(), "没能切掉测试模块 —— 下面会考到测试自己");
+        let body = prod.split("fn cloud(").nth(1).expect("没有 cloud 分节函数");
+        // 分节函数都在顶格,下一个 `\nfn ` 就是本节的结束。
         let head = body.split("\nfn ").next().unwrap_or(body);
-        let idx = head
-            .find("cloud_secret")
-            .expect("cloud 分节里没有 SK 输入框");
+        let idx = head.find("cloud_secret").expect("cloud 分节里没有 SK 输入框");
+        // **按行取窗口,不要按字节切。** `head[idx..idx + 300]` 在这个满是中文
+        // 注释的文件里几乎必然切在 UTF-8 字符中间 —— 那是 panic,不是红,
+        // 报出来的信息跟「SK 没打码」毫无关系。`head[idx..]` 是安全的:
+        // `idx` 来自 `find`,一定在字符边界上,切到结尾永远合法。
+        let window: String = head[idx..].lines().take(12).collect::<Vec<_>>().join("\n");
         assert!(
-            head[idx..idx + 300].contains(".password(true)"),
-            "SK 输入框不是密码框 —— 截图发出去就跟着走了"
+            window.contains(".password(true)"),
+            "SK 输入框不是密码框 —— 截图发出去就跟着走了:{window}"
         );
     }
 ```
