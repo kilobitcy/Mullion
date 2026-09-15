@@ -110,8 +110,10 @@ impl SettingsDraft {
     /// 拿它起的草稿云端字段全是默认值,而「确定」是会把草稿写回
     /// `cloud.toml` 的:endpoint / bucket / AK 会被一次「打开设置再点确定」
     /// 悄悄清空(本项目登记过的「整份覆盖」缺陷族,已经踩过五处)。
-    /// 留着它只为那些跟云端毫无关系的单测能少写一个参数;
-    /// `app.rs` 里有一条守护钉着生产代码不许出现它。
+    /// 留着它只为那些跟云端毫无关系的单测能少写一个参数。**现在生产路径上
+    /// 还有一处在调它**(`app.rs` 的 `sync_settings_dialog`)——把那处切到
+    /// `from_settings_and_cloud`、并补一条「生产代码不许出现 `from_settings(`」
+    /// 的守护,是下一个任务(菜单与驱动接线)的事。在那之前这段风险是真的。
     pub fn from_settings(s: &mullion_store::Settings) -> Self {
         Self::from_settings_and_cloud(s, &mullion_store::CloudConfig::default())
     }
@@ -1574,36 +1576,156 @@ mod tests {
         assert_eq!(d.cloud_keep, 7);
     }
 
-    /// AK Secret 框必须是密码框。**不是洁癖**:这个弹窗会被截图发出来
-    /// (本项目的排查流程里「发个截图」是常规动作),明文摆在那儿就跟着走了。
-    #[test]
-    fn the_secret_key_field_is_masked() {
+    /// `cloud()` 分节的登记表:**(源码里那句标签怎么写的, 它该绑的草稿字段)**。
+    ///
+    /// 标签一列存的是「源码里的那串字符」而不是「显示出来的文案」——
+    /// 两个 checkbox 的标签是常量名(`CLOUD_ENABLED_LABEL`),不是字面串。
+    const CLOUD_ROWS: &[(&str, &str)] = &[
+        ("CLOUD_ENABLED_LABEL", "cloud_enabled"),
+        ("ui.label(\"Endpoint\")", "cloud_endpoint"),
+        ("ui.label(\"Region\")", "cloud_region"),
+        ("ui.label(\"Bucket\")", "cloud_bucket"),
+        ("ui.label(\"前缀\")", "cloud_prefix"),
+        ("ui.label(\"Access Key ID\")", "cloud_access_key_id"),
+        ("ui.label(\"Access Key Secret\")", "cloud_secret_new"),
+        ("CLOUD_PATH_STYLE_LABEL", "cloud_path_style"),
+        ("ui.label(\"保留份数\")", "cloud_keep"),
+        ("ui.label(\"检查间隔\")", "cloud_interval_min"),
+        ("ui.label(\"SOCKS5 代理\")", "cloud_socks5"),
+    ];
+
+    /// 剥掉行注释。**源码切片守护必须剥注释**:这个文件的注释里字面写着
+    /// 「前缀」「`socks5://`」这类词,不剥的话判据会命中注释而不是代码,
+    /// 造出假绿(以及改注释就假红)。本项目已把这条登记成独立欠账。
+    ///
+    /// 只剥 `//` 起的行尾。`cloud()` 体内没有含 `//` 的字符串字面量
+    /// (唯一提到 `socks5://` 的地方在注释里,正好被剥掉),所以这个
+    /// 朴素版够用;将来往里加带 `//` 的字面串要回来看这里。
+    fn strip_comments(s: &str) -> String {
+        s.lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 取 `cloud()` 的函数体,剥注释后按 `ui.end_row();` 切成一行一块。
+    fn cloud_rows() -> Vec<String> {
         let src = include_str!("settings.rs");
-        // 先切掉测试模块:这条测试自己的正文里就字面写着 `fn cloud(`
-        // 与 `.password(true)`,不切的话锚点和判据都可能落在测试自己身上。
-        // (已核实:本文件只有 `settings.rs:573` 一处 `#[cfg(test)]`。)
+        // 先切掉测试模块:这条测试自己的正文里就字面写着 `fn cloud(`、
+        // `.password(true)` 和上面那张登记表,不切的话判据会落在测试自己身上。
+        // (已核实:本文件只有 `settings.rs:818` 一处 `#[cfg(test)]`。)
         let prod = src
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
-            .expect("测试模块分界变了,这条测试的锚点失效了");
+            .expect("测试模块分界变了,这几条测试的锚点失效了");
         assert!(
             prod.len() < src.len(),
             "没能切掉测试模块 —— 下面会考到测试自己"
         );
         let body = prod.split("fn cloud(").nth(1).expect("没有 cloud 分节函数");
         // 分节函数都在顶格,下一个 `\nfn ` 就是本节的结束。
-        let head = body.split("\nfn ").next().unwrap_or(body);
-        let idx = head
-            .find("cloud_secret")
-            .expect("cloud 分节里没有 SK 输入框");
-        // **按行取窗口,不要按字节切。** `head[idx..idx + 300]` 在这个满是中文
-        // 注释的文件里几乎必然切在 UTF-8 字符中间 —— 那是 panic,不是红,
-        // 报出来的信息跟「SK 没打码」毫无关系。`head[idx..]` 是安全的:
-        // `idx` 来自 `find`,一定在字符边界上,切到结尾永远合法。
-        let window: String = head[idx..].lines().take(12).collect::<Vec<_>>().join("\n");
+        let body = body.split("\nfn ").next().unwrap_or(body);
+        let body = strip_comments(body);
+        let rows: Vec<String> = body.split("ui.end_row();").map(str::to_owned).collect();
         assert!(
-            window.contains(".password(true)"),
-            "SK 输入框不是密码框 —— 截图发出去就跟着走了:{window}"
+            rows.len() > CLOUD_ROWS.len(),
+            "切出来的行块比登记的控件还少({}) —— 多半是切错了,\
+             下面几条断言会变成考空气",
+            rows.len()
         );
+        rows
+    }
+
+    /// 每一格控件都必须绑在**自己那个**草稿字段上。
+    ///
+    /// **判据是「恰好一个行块同时含这句标签和这个字段」**,不是「整个分节里
+    /// 出现过这个字段」。后者是本项目恒绿清单里「判据放在看不出差别的那一层」:
+    /// 把 AK ID 与 AK Secret 的绑定互换,两个字段在分节里都还在,整段扫描
+    /// 全绿,而界面上真实的 Secret Key 明文显示。切到行块之后,互换会让
+    /// 「Access Key Secret」那一块里出现 `cloud_access_key_id`,当场变红。
+    ///
+    /// 第二半是**反列举**:分节里出现的每个 `&mut draft.cloud_*` 都必须在
+    /// 登记表里。没有这一半的话,将来加第 12 个字段谁也不会想起来补守护
+    /// ——「列举式门控在加档时必然漏」本项目已经踩中三次。
+    #[test]
+    fn each_cloud_control_is_bound_to_its_own_draft_field() {
+        let rows = cloud_rows();
+        for (label, field) in CLOUD_ROWS {
+            let needle = format!("&mut draft.{field}");
+            let hits = rows
+                .iter()
+                .filter(|r| r.contains(label) && r.contains(&needle))
+                .count();
+            assert_eq!(
+                hits, 1,
+                "「{label}」这一格没有正好绑在 `draft.{field}` 上(命中 {hits} 块)。\
+                 绑串了的话用户改 A 改的是 B,而编译、clippy、其余测试全干净。"
+            );
+        }
+
+        let registered: std::collections::BTreeSet<&str> =
+            CLOUD_ROWS.iter().map(|(_, f)| *f).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for r in &rows {
+            for part in r.split("&mut draft.").skip(1) {
+                let ident: String = part
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if ident.starts_with("cloud_") {
+                    seen.insert(ident);
+                }
+            }
+        }
+        let seen: std::collections::BTreeSet<&str> = seen.iter().map(String::as_str).collect();
+        assert_eq!(
+            seen, registered,
+            "cloud 分节里绑的草稿字段与登记表对不上。新加的字段要同时加进 \
+             `CLOUD_ROWS`,否则它天生没有守护。"
+        );
+    }
+
+    /// **只有** SK 那一格是密码框。
+    ///
+    /// 「SK 要打码」是因为这个弹窗经常被整屏截下来发出去
+    /// (本项目的排查流程里「发个截图」是常规动作),明文摆在那儿就跟着走了。
+    ///
+    /// 判据两头都钉死:SK 那块必须有 `.password(true)`,**其余每一块都必须
+    /// 没有**。只钉前半句的话,「把 `.password(true)` 留在 AK ID 那块、
+    /// 两个绑定互换」这种复制粘贴型 bug 逃得掉。
+    #[test]
+    fn only_the_secret_key_field_is_masked() {
+        let rows = cloud_rows();
+        for (label, field) in CLOUD_ROWS {
+            let needle = format!("&mut draft.{field}");
+            let row = rows
+                .iter()
+                .find(|r| r.contains(label) && r.contains(&needle))
+                .unwrap_or_else(|| panic!("找不到「{label}」那一块"));
+            assert_eq!(
+                row.contains(".password(true)"),
+                *field == "cloud_secret_new",
+                "「{label}」的打码状态不对:只有 AK Secret 该是密码框,\
+                 别的都不该是(把别人打上码等于让用户看不见自己填了什么)。"
+            );
+        }
+    }
+
+    /// 每一格改动都要报 `Preview`,否则「确定」按钮不亮 / 预览不刷新 ——
+    /// 用户填完一整页,点不动保存,而且没有任何报错。
+    #[test]
+    fn every_cloud_control_reports_a_preview() {
+        let rows = cloud_rows();
+        for (label, field) in CLOUD_ROWS {
+            let needle = format!("&mut draft.{field}");
+            let row = rows
+                .iter()
+                .find(|r| r.contains(label) && r.contains(&needle))
+                .unwrap_or_else(|| panic!("找不到「{label}」那一块"));
+            assert!(
+                row.contains("*out = SettingsOut::Preview;"),
+                "「{label}」改了不报 Preview —— 保存按钮不会亮,而且不报错:\n{row}"
+            );
+        }
     }
 }
