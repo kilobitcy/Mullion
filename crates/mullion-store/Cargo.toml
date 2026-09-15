@@ -14,6 +14,10 @@ argon2.workspace = true
 # F46-a:整机迁移包把各配置文件的正文 base64 内嵌进一份 TOML。
 # 0.22.1 本来就在 Cargo.lock 里(app 的图标内嵌),加进这里不引入新版本。
 base64.workspace = true
+# F270:云端载荷的内容指纹。**判据必须是内容指纹而不是列举式脏标记** ——
+# 「列举式门控在加档时必然漏」本项目已经踩过三次,漏一次的后果是
+# 「用户以为备份了其实没有」。0.10 已在 Cargo.lock(russh 拉的),不引新版本。
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

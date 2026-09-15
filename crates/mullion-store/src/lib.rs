@@ -2,6 +2,7 @@
 //! 依赖方向:app → store;store 不依赖 core/term/ssh。
 
 pub mod automation;
+pub mod cloud;
 pub mod credential;
 pub mod crypto;
 pub mod error;
@@ -31,6 +32,7 @@ pub use automation::{
     build_plan_without_tmux, tmux_session_name, AutomationCommand, AutomationPrefs, EnvVar,
     ResolvedAutomation, Step, TmuxChoice,
 };
+pub use cloud::{fingerprint as cloud_fingerprint, CLOUD_FILE};
 pub use credential::{display_user, Auth, CredentialId, CredentialRecord, InlineAuth};
 pub use error::StoreError;
 pub use group::GroupRecord;

@@ -56,6 +56,9 @@ pub const PACK_EXT: &str = "mullionpack";
 ///
 /// 日志不在表里:那是这台机器的运行痕迹,拿到新机器上没有意义,而且它是全
 /// 目录里唯一会长到几十 MB 的东西。
+///
+/// **`cloud.toml` 刻意不在这张表里**(F271):它是「本机对云的看法」,被云端
+/// 内容覆盖会造出「拉一次就拿到过期 AK、之后永远推不上去且只报 403」。
 pub const TOP_LEVEL_FILES: &[&str] = &[
     "sessions.toml",
     crate::settings::SETTINGS_FILE,
@@ -101,7 +104,12 @@ pub struct Pack {
 /// `layouts/` 只带 `.toml`,**不带 `.alive`**:心跳文件的含义是「这个实例此刻
 /// 正开着」。跟着包走到新电脑上,那几条现场会被判成「别人正在用」而永远不
 /// 出现在恢复列表里 —— 带着走反而等于没带。
-pub fn collect(dir: &Path) -> Vec<PackFile> {
+/// 只读顶层那三个文件。**云端载荷用的就是这个**(设计 D7:不带 `layouts/`)。
+///
+/// 抽出来而不是给 `collect` 加一个布尔参数:调用点读起来是
+/// `collect_top_level(dir)` 而不是 `collect(dir, false)` —— 后者在调用点
+/// 完全看不出那个 `false` 是什么意思。
+pub fn collect_top_level(dir: &Path) -> Vec<PackFile> {
     let mut out = Vec::new();
     for name in TOP_LEVEL_FILES {
         if let Ok(bytes) = std::fs::read(dir.join(name)) {
@@ -111,6 +119,11 @@ pub fn collect(dir: &Path) -> Vec<PackFile> {
             });
         }
     }
+    out
+}
+
+pub fn collect(dir: &Path) -> Vec<PackFile> {
+    let mut out = collect_top_level(dir);
     let mut records: Vec<PathBuf> = match std::fs::read_dir(crate::history::history_dir(dir)) {
         Ok(rd) => rd
             .flatten()
