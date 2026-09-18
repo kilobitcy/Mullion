@@ -238,9 +238,10 @@ pub fn is_dirty(d: &FilesDialog) -> bool {
 
 /// F203:「取消这个框」要发出的处置。`None` = 只关框就行。
 ///
-/// 抽成纯函数是因为它有**两个入口**:框里那颗「取消」按钮,和 F203 加在
-/// 标题栏上的 ✕。两处各写一遍的话,迟早有一处漏掉后两个变体那条
-/// 「不能只关框」的规矩 —— 而漏掉的症状是传输队列静静地永远走不动。
+/// 抽成纯函数是因为它有**两个入口**:框里那颗「取消」按钮,和 Esc/点遮罩
+/// (F203 的语义,F277 换壳后落在 `egui::Modal` 的 `should_close` 上)。
+/// 两处各写一遍的话,迟早有一处漏掉后两个变体那条「不能只关框」的规矩 ——
+/// 而漏掉的症状是传输队列静静地永远走不动。
 ///
 /// 前四个框没有在途状态,关掉就完了;后两个框各自代表一条**挂起的工作**
 /// (一条 job / 一条编辑),不给出处置它们就永远挂着。
@@ -311,10 +312,11 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
     let d = dialog.as_mut()?;
     let mut op = None;
     let mut close = false;
-    // F203:✕ 与各框那颗「取消」按钮共用同一条处置。**必须在进 `match`
-    // 之前算好** —— 各臂已经把 `d` 的字段借出去了,臂内再借整个 `d` 借不出来。
+    // F203:Esc/点遮罩与各框那颗「取消」按钮共用同一条处置。**必须在进
+    // `match` 之前算好** —— 各臂已经把 `d` 的字段借出去了,臂内再借整个
+    // `d` 借不出来。
     let on_cancel = cancel_op(d);
-    // 各臂共用的收口:点了 ✕ / 点了「取消」都走这里。
+    // 各臂共用的收口:按了 Esc/点了遮罩、点了「取消」都走这里。
     macro_rules! cancelled {
         () => {{
             op = on_cancel.clone();
@@ -438,7 +440,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                     // 「取消」= 保留远端,**不能只关框**:那条编辑会一直挂在
                     // `Conflict` 上,每次轮询都想回传、每次都撞冲突,而快照
                     // 永远不动 —— 界面上只看得出「这个文件一直红着」。
-                    // 处置本体在 `cancel_op`,与标题栏那颗 ✕ 共用一份。
+                    // 处置本体在 `cancel_op`,与 Esc/点遮罩共用一份。
                     if ui.button("取消").clicked() {
                         cancelled!();
                     }
@@ -497,7 +499,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                     // 「取消」也要发出一个处置(按跳过算),**不能只关框** ——
                     // 那条 job 会永远挂在 `Conflict` 上,整个队列再也走不动,
                     // 而界面上看起来只是「卡住了」。处置本体在 `cancel_op`,
-                    // 与标题栏那颗 ✕ 共用一份。
+                    // 与 Esc/点遮罩共用一份。
                     if ui.button("取消").clicked() {
                         cancelled!();
                     }
@@ -624,9 +626,9 @@ mod tests {
             .join("\n")
     }
 
-    /// F277:六个文件对话框必须走带遮罩的 `egui::Modal`,不是普通 `Window`。
+    /// F277:五个文件对话框必须走带遮罩的 `egui::Modal`,不是普通 `Window`。
     /// 普通 Window 不挡下层点击、没有变暗遮罩,「文件已存在」淹在终端画面里
-    /// 看不见 —— 这正是实报。守护扎在共享外壳 `modal()` 上:六个框只有这
+    /// 看不见 —— 这正是实报。守护扎在共享外壳 `modal()` 上:五个框只有这
     /// 一个出口。
     #[test]
     fn the_shared_dialog_shell_is_a_backdrop_modal_not_a_window() {
@@ -740,39 +742,28 @@ mod tests {
         }
     }
 
-    /// F203 的语义在 F277 换壳后落到了 Esc 上:六个框原来标题栏都有一个
+    /// F203 的语义在 F277 换壳后落到了 Esc 上:各框原来标题栏都有一个
     /// ✕,而且**它就是「取消」**——用户实报「确认框弹在近黑的终端上,右上角
     /// 有 ✕,是他找得到的第一个出口」。换成 `egui::Modal` 之后没有标题栏、
     /// 没有 ✕ 了,`egui::ModalResponse::should_close` 接住的是 Esc(以及点
     /// 遮罩,这里不好脱离真实指针几何去模拟,故只测 Esc 分支);语义仍是
     /// 「必须等价于取消」。
     ///
+    /// 遍历 `every_dialog_variant()`(F239 那批测试共用的穷尽式枚举)而不是
+    /// 手写字面量列表 —— 加第六个 `FilesDialog` 变体时,只要补进那个枚举,
+    /// 这里自动跟着罩上,不会像列举式门控那样静默漏测。标题用 `title_of()`
+    /// 取,保证与 `show()` 实际画出来的窗口 id 一致。
+    ///
     /// 自证会变红:把 `modal()` 里 `resp.should_close()` 改成 `false`。
     #[test]
     fn every_dialog_treats_escape_as_the_cancel_button() {
-        for (label, mut d) in [
-            (
-                "删除",
-                Some(FilesDialog::Delete {
-                    targets: vec![(rp("/srv/a"), false)],
-                }),
-            ),
-            (
-                "属性",
-                Some(FilesDialog::Chmod {
-                    path: rp("/srv/a"),
-                    mode: 0o644,
-                    mode0: 0o644,
-                }),
-            ),
-            ("编辑冲突", edit_conflict()),
-            ("传输冲突", conflict(true)),
-            ("粘贴冲突", paste_conflict()),
-        ] {
-            let want = cancel_op(d.as_ref().expect("前提:框是开着的"));
-            let op = press_escape(&mut d);
+        for d in every_dialog_variant() {
+            let label = title_of(&d);
+            let want = cancel_op(&d);
+            let mut opt = Some(d);
+            let op = press_escape(&mut opt);
             assert_eq!(op, want, "{label}框的 Esc 和「取消」不是同一件事");
-            assert!(d.is_none(), "{label}框按了 Esc 之后没关掉");
+            assert!(opt.is_none(), "{label}框按了 Esc 之后没关掉");
         }
     }
 
@@ -1256,7 +1247,7 @@ mod tests {
         );
     }
 
-    /// F220:取消 / ✕ = **整批不动**。粘贴还没发出去,没有挂起的工作要处置
+    /// F220:取消 / Esc/点遮罩 = **整批不动**。粘贴还没发出去,没有挂起的工作要处置
     /// (与 `Conflict`/`EditConflict` 那两个框正相反)。
     ///
     /// 自证会变红:把 `cancel_op` 里 `PasteConflict` 归到 `Some(..)` 那一组。
