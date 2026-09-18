@@ -294,7 +294,7 @@ pub fn title_of(d: &FilesDialog) -> &'static str {
 /// 借用结束,调用方再落处置。F203 时代这个 `true` 来自标题栏 ✕;语义不变,
 /// 来源换了。
 fn modal<R>(ctx: &egui::Context, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> bool {
-    let resp = egui::Modal::new(egui::Id::new(title)).show(ctx, |ui| {
+    let resp = egui::Modal::new(egui::Id::new(("files_dialog", title))).show(ctx, |ui| {
         crate::ui::annotate::mark(ui.ctx(), format!("{title}对话框"), ui.max_rect());
         ui.heading(title);
         ui.separator();
@@ -1371,7 +1371,8 @@ mod tests {
                     let _ = show(ctx, &t, &mut open);
                 });
             }
-            let id = egui::Id::new(title_of(&d));
+            // Id 带 files_dialog 命名空间(F277)
+            let id = egui::Id::new(("files_dialog", title_of(&d)));
             assert!(
                 ctx.memory(|m| m.area_rect(id)).is_some(),
                 "{d:?} 的标题报成了 {:?},但这一帧根本没有这个窗口",
