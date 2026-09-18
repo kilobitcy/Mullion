@@ -283,28 +283,24 @@ pub fn title_of(d: &FilesDialog) -> &'static str {
     }
 }
 
-/// 六个框共用的外壳。模态框的属性(不可折叠、不可缩放、居中、标题栏上有
-/// ✕)只写一处 —— 六份复制粘贴里总有一份会漏掉 `.collapsible(false)`。
+/// 六个框共用的外壳。F277 起换成 `egui::Modal`:带变暗遮罩、挡下层点击 ——
+/// 「文件已存在」这类框此前是普通居中 `Window`,不挡下层点击也没有遮罩,
+/// 淹在近黑的终端画面里(实报)。`Modal` 没有标题栏,标题自己画(同
+/// `paste.rs`/`host_key.rs`)。
 ///
-/// 返回 **`true` = 用户点了标题栏上那颗 ✕**(F203)。不在这里直接收口,是
-/// 因为「取消该干什么」按框而异(见 [`cancel_op`]),而 `body` 闭包这会儿
-/// 还借着调用方的 `op`;返回之后借用结束,调用方再落处置。
-///
-/// ✕ 走 `egui::Window::open()` 而不是自己在正文里画一颗:egui 把它画在
-/// **标题栏**上(正文里画只能低一行),而且那是两条直线不是字形,
-/// 没有 T9 的豆腐块风险。
+/// 返回 **`true` = 用户要取消**(Esc / 点遮罩,`egui::Modal` 的
+/// `should_close`)。不在这里直接收口,是因为「取消该干什么」按框而异
+/// (见 [`cancel_op`]),而 `body` 闭包这会儿还借着调用方的 `op`;返回之后
+/// 借用结束,调用方再落处置。F203 时代这个 `true` 来自标题栏 ✕;语义不变,
+/// 来源换了。
 fn modal<R>(ctx: &egui::Context, title: &str, body: impl FnOnce(&mut egui::Ui) -> R) -> bool {
-    let mut open = true;
-    egui::Window::new(title)
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            crate::ui::annotate::mark(ui.ctx(), format!("{title}对话框"), ui.max_rect());
-            body(ui)
-        });
-    !open
+    let resp = egui::Modal::new(egui::Id::new(title)).show(ctx, |ui| {
+        crate::ui::annotate::mark(ui.ctx(), format!("{title}对话框"), ui.max_rect());
+        ui.heading(title);
+        ui.separator();
+        body(ui)
+    });
+    resp.should_close()
 }
 
 /// 画当前开着的那个对话框。返回用户确认的写操作(没确认就是 `None`)。
@@ -619,6 +615,52 @@ mod tests {
     #[allow(dead_code)]
     const F203_GATE_MOVED_TO_DIALOG_CONTRAST_TEST: () = ();
 
+    /// 剥掉行注释。抄自 `settings.rs::tests::strip_comments`:源码切片守护
+    /// 必须剥注释,否则判据会命中注释文字而不是代码(改注释就假红/假绿)。
+    fn strip_comments(s: &str) -> String {
+        s.lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// F277:六个文件对话框必须走带遮罩的 `egui::Modal`,不是普通 `Window`。
+    /// 普通 Window 不挡下层点击、没有变暗遮罩,「文件已存在」淹在终端画面里
+    /// 看不见 —— 这正是实报。守护扎在共享外壳 `modal()` 上:六个框只有这
+    /// 一个出口。
+    #[test]
+    fn the_shared_dialog_shell_is_a_backdrop_modal_not_a_window() {
+        let src = include_str!("files_dialog.rs");
+        // 这条测试自己的正文里就字面写着 `egui::Window::new(`(下面的反向
+        // 断言)—— 不先切掉测试模块,判据会命中测试自己,造出恒红。
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面会考到测试自己"
+        );
+        let prod = strip_comments(prod);
+        let body = prod.split("fn modal<R>(").nth(1).expect("共享外壳没了?");
+        // `modal` 之后紧跟着 `pub fn show`,不是裸 `fn `——按实际签名切,
+        // 别用会漏掉 `pub` 前缀的通用模式。
+        let body = body.split("\npub fn show(").next().unwrap();
+        assert!(
+            body.contains("egui::Modal::new("),
+            "外壳不再是 Modal:\n{body}"
+        );
+        assert!(
+            !body.contains("egui::Window::new("),
+            "外壳里还留着 Window —— 遮罩没了:\n{body}"
+        );
+        assert!(
+            body.contains("should_close()"),
+            "Esc/点遮罩的取消出口(should_close)断了 —— F203 的「✕=取消」语义\
+             换壳后靠它接住:\n{body}"
+        );
+    }
+
     fn rp(s: &str) -> RemotePath {
         RemotePath::from_bytes(s.as_bytes().to_vec())
     }
@@ -698,19 +740,16 @@ mod tests {
         }
     }
 
-    /// F203:六个框的标题栏上都要有一个 ✕,而且**它就是「取消」**。
+    /// F203 的语义在 F277 换壳后落到了 Esc 上:六个框原来标题栏都有一个
+    /// ✕,而且**它就是「取消」**——用户实报「确认框弹在近黑的终端上,右上角
+    /// 有 ✕,是他找得到的第一个出口」。换成 `egui::Modal` 之后没有标题栏、
+    /// 没有 ✕ 了,`egui::ModalResponse::should_close` 接住的是 Esc(以及点
+    /// 遮罩,这里不好脱离真实指针几何去模拟,故只测 Esc 分支);语义仍是
+    /// 「必须等价于取消」。
     ///
-    /// 用户实报:确认框弹在近黑的终端上,「右上角有 ✕,表示关闭」是他找得到
-    /// 的第一个出口。走 `egui::Window::open()` 而不是自己在正文里画一颗 ——
-    /// 那样画出来的按钮低于标题栏一行,而且六份复制粘贴里总有一份会漏。
-    ///
-    /// 点击靠 accesskit 定位(egui 给这颗按钮登记的 label 是 "Close window",
-    /// `egui-0.30.0/src/containers/window.rs:1213`);它是**画出来的两条线**,
-    /// 不是字形,所以按 T9 的口径没有豆腐块风险,也没法用文本定位。
-    ///
-    /// 自证会变红:把 `modal()` 里的 `.open(&mut open)` 去掉。
+    /// 自证会变红:把 `modal()` 里 `resp.should_close()` 改成 `false`。
     #[test]
-    fn every_dialog_offers_a_close_cross_that_means_cancel() {
+    fn every_dialog_treats_escape_as_the_cancel_button() {
         for (label, mut d) in [
             (
                 "删除",
@@ -731,53 +770,43 @@ mod tests {
             ("粘贴冲突", paste_conflict()),
         ] {
             let want = cancel_op(d.as_ref().expect("前提:框是开着的"));
-            let op =
-                click_close_cross(&mut d).unwrap_or_else(|| panic!("{label}框的标题栏上找不到 ✕"));
-            assert_eq!(op, want, "{label}框的 ✕ 和「取消」不是同一件事");
-            assert!(d.is_none(), "{label}框按了 ✕ 之后没关掉");
+            let op = press_escape(&mut d);
+            assert_eq!(op, want, "{label}框的 Esc 和「取消」不是同一件事");
+            assert!(d.is_none(), "{label}框按了 Esc 之后没关掉");
         }
     }
 
-    /// 找到标题栏上那颗 ✕ 并点它。返回这一帧的 `FileOp`;找不到按钮就返回
-    /// `None`(与「点了但没有 op」区分不开,所以调用方先用 `cancel_op` 算好
-    /// 期望值,期望值为 `None` 的框另靠 `d.is_none()` 判定点没点着)。
-    fn click_close_cross(dialog: &mut Option<FilesDialog>) -> Option<Option<FileOp>> {
+    /// 模拟按一下 Esc,返回这一帧的 `FileOp`。
+    ///
+    /// 先跑一帧不带按键的:`egui::Modal` 的 `is_top_modal` 读的是**上一帧**
+    /// 登记的 `top_modal_layer`(`egui-0.30.0/src/memory/mod.rs:638`,在
+    /// `end_frame` 里才把当帧登记的值滚到下一帧),模态刚开出来那一帧这个
+    /// 值还是上一次的 `None`,`should_close` 的 Esc 分支恒假 —— 不是我们
+    /// 这边的逻辑问题,是 egui 自己这一帧的时序;先跑一帧把「这是当前最
+    /// 顶层模态」这件事登记上,第二帧 Esc 才会被 `consume_key` 吃到。
+    fn press_escape(dialog: &mut Option<FilesDialog>) -> Option<FileOp> {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        let mut update = None;
-        // 两帧:egui `Window` 首帧只记 `Shape::Noop`,几何也还没落定。
-        for _ in 0..2 {
-            update = ctx
-                .run(egui::RawInput::default(), |ctx| {
-                    show(ctx, &t, dialog);
-                })
-                .platform_output
-                .accesskit_update;
-        }
-        let b = update?
-            .nodes
-            .iter()
-            .find(|(_, n)| n.label() == Some("Close window"))
-            .and_then(|(_, n)| n.bounds())?;
-        let pos = egui::pos2(
-            (b.x0 as f32 + b.x1 as f32) / 2.0,
-            (b.y0 as f32 + b.y1 as f32) / 2.0,
-        );
-        let mut input = egui::RawInput::default();
-        for pressed in [true, false] {
-            input.events.push(egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: Default::default(),
-            });
-        }
-        let mut op = None;
-        let _ = ctx.run(input, |ctx| {
-            op = show(ctx, &t, dialog);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            show(ctx, &t, dialog);
         });
-        Some(op)
+        let mut op = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                op = show(ctx, &t, dialog);
+            },
+        );
+        op
     }
 
     fn conflict(apply_all: bool) -> Option<FilesDialog> {
@@ -1064,17 +1093,22 @@ mod tests {
     /// 用全等而不是 `contains`:删除框里「将删除 1 个文件」这句摘要也含
     /// 「删除」二字,`contains` 会先撞上它,点到一句 label 上去,而按钮
     /// 纹丝不动 —— 测试于是拿不到 `FileOp`,却看不出是查找写错了。
+    ///
+    /// 取**最后一处**匹配而不是第一处:F277 起 `modal()` 自己画了
+    /// `ui.heading(title)`,而「删除」框的标题字面就是「删除」,与危险色
+    /// 按钮同名——标题先画、按钮后画,取第一处会点中标题(纹丝不动)。
+    /// 别处没有标题与按钮同名的情况,取最后一处不影响它们。
     fn find_button_pos(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<egui::Pos2> {
         fn walk(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
             match shape {
-                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, label)),
+                egui::Shape::Vec(v) => v.iter().rev().find_map(|s| walk(s, label)),
                 egui::Shape::Text(ts) if ts.galley.text() == label => {
                     Some(ts.pos + ts.galley.size() / 2.0)
                 }
                 _ => None,
             }
         }
-        shapes.iter().find_map(|cs| walk(&cs.shape, label))
+        shapes.iter().rev().find_map(|cs| walk(&cs.shape, label))
     }
 
     /// 框里画出来的**全部文字**。用来断言「某个按钮/说明在不在」——
@@ -1239,8 +1273,8 @@ mod tests {
         assert_eq!(cancel_op(&d), None, "取消粘贴不该发出任何处置");
     }
 
-    /// F220:框里那颗「取消」按钮(不是标题栏的 ✕,那条走
-    /// `every_dialog_offers_a_close_cross_that_means_cancel`)也要关框、
+    /// F220:框里那颗「取消」按钮(不是 Esc,那条走
+    /// `every_dialog_treats_escape_as_the_cancel_button`)也要关框、
     /// 不发处置 —— 光测 `cancel_op` 这个纯函数测不出 `show()` 里的
     /// `cancelled!()` 是不是真的接在这颗按钮上。
     #[test]
