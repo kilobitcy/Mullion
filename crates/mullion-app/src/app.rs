@@ -13307,29 +13307,34 @@ impl ApplicationHandler<UserEvent> for App {
                             let tunnel_states = self.tunnels.snapshot();
                             let projects: &[mullion_store::ProjectRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.projects());
-                            // F224:每个项目一盏灯。**只在有人会看见时才算** ——
+                            // F224/F276:每个项目一盏灯。**只在有人会看见时才算** ——
                             // 项目管理器开着,或者处在 launcher 态(F225① 的
-                            // 列表)。两处都不在时算了也没人读,而这段每帧跑。
-                            let project_lamps =
-                                if self.ui.project_manager_open || self.tabs.is_empty() {
-                                    let panes = pane_reports_of(&self.tabs);
-                                    projects
-                                        .iter()
-                                        .map(|p| {
-                                            let name = mullion_store::project_tmux_name(p);
-                                            (
-                                                p.id,
-                                                crate::project::lamp(
-                                                    &name,
-                                                    &panes,
-                                                    &self.project_others,
-                                                ),
-                                            )
-                                        })
-                                        .collect()
-                                } else {
-                                    std::collections::BTreeMap::new()
-                                };
+                            // 列表),或者切项目弹窗开着(F276)。三处都不在时
+                            // 算了也没人读,而这段每帧跑。观众名单收在
+                            // `project_lamps_have_audience` 里,别再在这里裸列举。
+                            let project_lamps = if project_lamps_have_audience(
+                                self.ui.project_manager_open,
+                                self.tabs.is_empty(),
+                                self.ui.project_pick.is_some(),
+                            ) {
+                                let panes = pane_reports_of(&self.tabs);
+                                projects
+                                    .iter()
+                                    .map(|p| {
+                                        let name = mullion_store::project_tmux_name(p);
+                                        (
+                                            p.id,
+                                            crate::project::lamp(
+                                                &name,
+                                                &panes,
+                                                &self.project_others,
+                                            ),
+                                        )
+                                    })
+                                    .collect()
+                            } else {
+                                std::collections::BTreeMap::new()
+                            };
                             // F222:**只在项目管理器开着时才上锁**。这把锁 SSH
                             // 线程握手时也要拿,每帧无条件锁会让一次握手白等一帧,
                             // 而这个弹窗一天开不了几次。
@@ -15644,6 +15649,14 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
     }
 }
 
+/// F224/F276:项目灯的观众名单。灯表每帧算一遍不便宜(要遍历全部 pane 的
+/// 上报),所以只在**有人会看见**时才算 —— 而「观众」是个会长的名单:
+/// F224 时是项目管理器,F225 加了 launcher,F276 又漏了切项目弹窗。
+/// 收进一个纯函数,新观众只能从这里进,测试挨个点名。
+fn project_lamps_have_audience(manager_open: bool, launcher: bool, pick_open: bool) -> bool {
+    manager_open || launcher || pick_open
+}
+
 /// F273:`YYYY-MM-DD'T'HH:MM:SS'Z'`。写进 `cloud.toml` 的 `last_ok_at`,
 /// 也进包头 —— 与 `app.rs` 里另外两处 `now_utc().format(&Rfc3339)` 同形。
 fn now_rfc3339() -> String {
@@ -16402,13 +16415,13 @@ mod tests {
         font_px_for, has_real_action, history_rows_of, host_for_fresh, ime_cursor_area,
         ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
         next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
-        paste_seq_is_stale, place_dead_pane_of, reattach_pane, rehost_pane, resolved_scrollback,
-        session_manager_dirty, should_check_attach, should_pop_cloud_error, snapshot_tabs_of,
-        sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
-        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
-        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
-        DISMISS_ORDER,
+        paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience, reattach_pane,
+        rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
+        should_pop_cloud_error, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
+        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
+        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, Modal, OpFollow,
+        PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
+        UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -30067,5 +30080,78 @@ mod tests {
             mid > close,
             "mid_mark 落进了 terminal_draw 判空块内(块 {block}..{close},mid={mid})"
         );
+    }
+
+    /// F276:切项目弹窗**单独**就是观众 —— 它开着而管理器关着、又不在
+    /// launcher 态时,灯表必须照算。这正是实报的形状:弹窗里灯全灭。
+    #[test]
+    fn the_pick_popup_alone_is_an_audience_for_project_lamps() {
+        assert!(project_lamps_have_audience(false, false, true));
+        assert!(project_lamps_have_audience(true, false, false));
+        assert!(project_lamps_have_audience(false, true, false));
+        assert!(!project_lamps_have_audience(false, false, false));
+    }
+
+    /// F276 接线守护:门控必须读**真的**弹窗状态。纯函数对了但调用点传
+    /// `false` 的话,一切测试照绿而弹窗里灯照灭 ——「纯函数测得扎实、
+    /// 接线没人看着」是本项目登记过的恒绿模式。
+    #[test]
+    fn the_lamp_audience_check_reads_the_real_popup_state() {
+        let src = strip_comments(prod_src());
+        let name = "project_lamps_have_audience(";
+        let def_anchor = format!("fn {name}");
+        let def_at = src
+            .find(&def_anchor)
+            .expect("找不到 project_lamps_have_audience 的定义 —— 这条测试的锚点失效了");
+        // 定义里 "project_lamps_have_audience(" 紧跟在 "fn " 之后,偏移 3。
+        let def_call_pos = def_at + "fn ".len();
+        // 找**调用点**(排除定义那一处),从 '(' 起做括号配对截取实参段
+        // (调用可能被 rustfmt 折成多行,不能按单行找)。
+        let mut call_sites = Vec::new();
+        let mut search_from = 0usize;
+        while let Some(rel) = src[search_from..].find(name) {
+            let at = search_from + rel;
+            if at != def_call_pos {
+                call_sites.push(at);
+            }
+            search_from = at + name.len();
+        }
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "project_lamps_have_audience 的调用点应该只有一处,实际找到 {}:{call_sites:?}",
+            call_sites.len()
+        );
+        let call_at = call_sites[0];
+        let params_start = call_at + name.len();
+        let mut paren_depth = 0i32;
+        let mut params_end = None;
+        for (i, ch) in src[params_start..].char_indices() {
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => {
+                    if paren_depth == 0 {
+                        params_end = Some(params_start + i);
+                        break;
+                    }
+                    paren_depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let params_end = params_end.unwrap_or_else(|| {
+            panic!("project_lamps_have_audience 调用点的参数列表没找到收尾的右括号")
+        });
+        let params = &src[params_start..params_end];
+        for expected in [
+            "self.ui.project_manager_open",
+            "self.tabs.is_empty()",
+            "self.ui.project_pick.is_some()",
+        ] {
+            assert!(
+                params.contains(expected),
+                "project_lamps_have_audience 调用点缺了实参 {expected:?},实际参数段:{params:?}"
+            );
+        }
     }
 }
