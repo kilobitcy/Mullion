@@ -24816,16 +24816,70 @@ mod tests {
         );
     }
 
-    /// F279:上传分支必须「传前 stat、传后 stat、不一致判失败」。这段逻辑
-    /// 嵌在 async 传输体里没法纯单测,退而求其次锚定源码形状。
+    /// F279:上传分支必须「传前 stat、打开本地文件、上传收尾、传后 stat、
+    /// 不一致判失败」按这个先后顺序发生。这段逻辑嵌在 async 传输体里没法
+    /// 纯单测,退而求其次锚定源码形状 —— 但原先只在**全文件范围**里 grep
+    /// 三个子串,杀不掉「比对整段搬进 Download 分支」「after 采样提前到
+    /// finish 之前」这类变异:三个子串照样都在文件里,只是挪了地方或挪了
+    /// 顺序。改成先切出 `run_transfer` 里真正跑传输的那个 `match spec.dir`
+    /// (前面还有两处同名的 `match spec.dir`,分别管查重探测和改名去重,
+    /// 用 `rfind` 取最后一处才是跑传输的那个),再在 Upload 分支体内按
+    /// `find` 出的索引比较相对顺序。
     #[test]
     fn the_upload_branch_compares_the_source_file_before_and_after() {
         let src = strip_comments(prod_src());
-        assert!(src.contains("src_stat_before"), "传前 stat 没了");
-        assert!(src.contains("src_stat_after"), "传后 stat 没了");
+        let fn_body = body_of(&src, "async fn run_transfer(");
+
+        let match_at = fn_body
+            .rfind("match spec.dir {")
+            .expect("找不到跑传输的 match spec.dir —— 前面查重/改名那两处同名 match 也没了?");
+        let brace_at = match_at + fn_body[match_at..].find('{').expect("match spec.dir 没有块体");
+        let match_rest = &fn_body[brace_at..];
+        let match_block = brace_balanced_arm(match_rest);
         assert!(
-            src.contains("源文件在传输期间被改动过"),
-            "比对后的失败出口没了"
+            match_block.len() < match_rest.len(),
+            "match spec.dir 没截到闭合大括号,断言会退化成扫整个函数体"
+        );
+
+        let upload = arm_of(match_block, "Direction::Upload");
+        let download = arm_of(match_block, "Direction::Download");
+
+        assert!(
+            !download.contains("src_stat_"),
+            "F279 的比对被搬进了 Download 分支 —— 上传该做的事挪错了地方:{download}"
+        );
+
+        let before_at = upload
+            .find("src_stat_before")
+            .expect("Upload 分支里没有传前 stat");
+        let open_at = upload
+            .find("File::open(&spec.local)")
+            .expect("Upload 分支里没有打开本地文件");
+        let finish_at = upload
+            .find(".finish().await.map_err")
+            .expect("Upload 分支里没有上传收尾的 finish() —— 别跟取消路径里那句 `let _ = dst.finish().await;` 搞混");
+        let after_at = upload
+            .find("src_stat_after")
+            .expect("Upload 分支里没有传后 stat");
+        let verdict_at = upload
+            .find("源文件在传输期间被改动过")
+            .expect("Upload 分支里没有比对后的失败出口");
+
+        assert!(
+            before_at < open_at,
+            "传前 stat 必须在打开本地文件之前采样,否则读到的可能已经是改动后的内容"
+        );
+        assert!(
+            open_at < finish_at,
+            "打开本地文件应该早于上传收尾,顺序反了说明分支被改动过"
+        );
+        assert!(
+            finish_at < after_at,
+            "F279 的要点就是「传后」—— after 采样被提前到了上传收尾之前,等于没比对"
+        );
+        assert!(
+            after_at < verdict_at,
+            "必须先采样后判断,顺序反了这条失败出口就是摆设"
         );
     }
 
