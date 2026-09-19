@@ -35,6 +35,11 @@ pub enum JobError {
 /// 常量** —— 两边各写一遍字面量,改动其中一边就会静默退化成普通失败。
 pub const CONFLICT_MARKER: &str = "\u{1}mullion-conflict";
 
+/// 取消的哨兵文案。`run_transfer` 用它报「用户自己点了取消」,
+/// 弹错误卡的决策(`should_pop_transfer_error`)靠它识别 —— 写死两份
+/// 字符串的话,改一处另一处静默失守。
+pub const CANCEL_MARKER: &str = "已取消";
+
 impl From<JobError> for String {
     fn from(e: JobError) -> String {
         match e {

@@ -1632,7 +1632,7 @@ async fn run_transfer(
     proxy: &EventLoopProxy<UserEvent>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
-    use crate::files::queue::{Conflict, Direction, JobError};
+    use crate::files::queue::{Conflict, Direction, JobError, CANCEL_MARKER};
     use crate::files::transfer::{dedup_name, staging_name};
 
     let client = mullion_ssh::sftp::SftpClient::open(conn)
@@ -1729,7 +1729,7 @@ async fn run_transfer(
                 loop {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = std::fs::remove_file(&staging);
-                        return Err("已取消".into());
+                        return Err(CANCEL_MARKER.into());
                     }
                     let t_read = std::time::Instant::now();
                     let n = src.read_chunk(&mut buf).await.map_err(|e| e.to_string())?;
@@ -1770,6 +1770,12 @@ async fn run_transfer(
             let staging = dst_remote
                 .parent()
                 .join(staging_name(&final_name, overwriting).as_bytes());
+            // F279:传前记一笔源文件的 (mtime, len)。传完再看一眼 —— 变了说明
+            // 有程序在传输期间写它,远端拿到的多半是半截。探测「谁在占用」不做
+            // (做了也只是假安全感),只做事后比对。
+            let src_stat_before = std::fs::metadata(&spec.local)
+                .map_err(|e| format!("读不了本地文件:{e}"))
+                .map(|m| (m.modified().ok(), m.len()))?;
             let mut f =
                 std::fs::File::open(&spec.local).map_err(|e| format!("读不了本地文件:{e}"))?;
             let mut dst = client
@@ -1782,7 +1788,7 @@ async fn run_transfer(
                     // sshd 上会报「file still open」。
                     let _ = dst.finish().await;
                     let _ = client.remove_file(&staging).await;
-                    return Err("已取消".into());
+                    return Err(CANCEL_MARKER.into());
                 }
                 let n = f
                     .read(&mut buf)
@@ -1804,6 +1810,16 @@ async fn run_transfer(
                     .rename(&staging, &dst_remote)
                     .await
                     .map_err(|e| e.to_string())?;
+            }
+            // 拿不到 metadata(`None`)不算失败 —— 文件传完被删除是合法操作,
+            // 别把它报成半截。
+            let src_stat_after = std::fs::metadata(&spec.local)
+                .ok()
+                .map(|m| (m.modified().ok(), m.len()));
+            if src_stat_after.is_some_and(|a| a != src_stat_before) {
+                return Err(
+                    "已上传,但源文件在传输期间被改动过,远端内容可能不完整,请重传".to_string(),
+                );
             }
         }
     }
@@ -12156,6 +12172,12 @@ impl ApplicationHandler<UserEvent> for App {
                 // Progress —— 后者一个大文件几千条(见同 arm 的 T3 守护)。
                 diag::count_sftp_op();
                 self.transfer.cancels.remove(&job);
+                // F279:失败要看得见。冲突/取消除外(决策见 should_pop_transfer_error)。
+                if should_pop_transfer_error(&result) {
+                    if let Err(m) = &result {
+                        self.ui.set_error(format!("传输失败:{m}"));
+                    }
+                }
                 self.transfer.queue.finish(job, result);
                 // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
                 if let Some(spec) = self.transfer.specs.get(&job) {
@@ -15657,6 +15679,18 @@ fn project_lamps_have_audience(manager_open: bool, launcher: bool, pick_open: bo
     manager_open || launcher || pick_open
 }
 
+/// F279:一次传输收工,要不要弹错误卡。冲突不弹(有自己的弹窗),
+/// 取消不弹(用户自己点的);其余失败**必须**弹 —— 此前失败只落在
+/// 传输列表里,本地文件被 Excel 锁住时读失败等于静默(实报,选项 C+甲)。
+fn should_pop_transfer_error(result: &Result<(), String>) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(m) => {
+            m != crate::files::queue::CONFLICT_MARKER && m != crate::files::queue::CANCEL_MARKER
+        }
+    }
+}
+
 /// F273:`YYYY-MM-DD'T'HH:MM:SS'Z'`。写进 `cloud.toml` 的 `last_ok_at`,
 /// 也进包头 —— 与 `app.rs` 里另外两处 `now_utc().format(&Rfc3339)` 同形。
 fn now_rfc3339() -> String {
@@ -16417,11 +16451,12 @@ mod tests {
         next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
         paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience, reattach_pane,
         rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
-        should_pop_cloud_error, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
-        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
-        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, Modal, OpFollow,
-        PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
-        UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
+        should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of, sync_plan_of,
+        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
+        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
+        DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -16536,6 +16571,43 @@ mod tests {
             !progress.contains("count_sftp_op"),
             "进度事件被计成了 SFTP 操作 —— 一个大文件几千条,这一列就废了"
         );
+    }
+
+    /// F279:冲突有自己的弹窗、取消是用户自己点的,都不弹错误卡;其余失败
+    /// 必须弹 —— 此前失败只落在传输列表里,不开列表就永远看不见(实报)。
+    #[test]
+    fn a_conflict_or_a_cancel_does_not_pop_the_error_card_but_a_real_failure_does() {
+        use crate::files::queue::{CANCEL_MARKER, CONFLICT_MARKER};
+        assert!(!should_pop_transfer_error(&Ok(())));
+        assert!(!should_pop_transfer_error(&Err(CONFLICT_MARKER.into())));
+        assert!(!should_pop_transfer_error(&Err(CANCEL_MARKER.into())));
+        assert!(should_pop_transfer_error(&Err(
+            "读不了本地文件:拒绝访问".into()
+        )));
+    }
+
+    /// F279:接线守护。`TransferDone` 那条 arm 必须在 `queue.finish` **之前**
+    /// 调决策(`finish` 拿走 `result` 的所有权,排在后面的话决策读到的是被
+    /// move 出去的值,编译都过不了,更别提弹卡)。位置判据:两个调用都得在,
+    /// 且决策排在收队列前面。
+    ///
+    /// 这条 arm 的模式是单行(`TransferDone { job, result } => {`),同一个
+    /// 变体已有 `arm_of` 的用例(`both_kinds_of_sftp_operations_are_counted`),
+    /// 跟着用同一个辅助函数,不用 `multiline_arm_of`(那个是给 rustfmt 拆成
+    /// 多行的三字段以上变体用的)。
+    #[test]
+    fn a_failed_transfer_pops_the_card_before_the_queue_swallows_the_result() {
+        let src = strip_comments(prod_src());
+        let arm = arm_of(&src, "UserEvent::TransferDone { job, result }");
+        let pop = arm
+            .find("should_pop_transfer_error(")
+            .expect("arm 里没调决策");
+        let fin = arm.find(".finish(job, result)").expect("arm 里没收队列");
+        assert!(
+            pop < fin,
+            "决策排在 finish 之后 —— result 已被拿走,永远弹不出来"
+        );
+        assert!(arm.contains("set_error"), "决策了却没弹卡");
     }
 
     /// F252:传完之后要点亮的那一条,记在**收货那一栏的当前目录**下 ——
@@ -24741,6 +24813,19 @@ mod tests {
         assert!(
             body.contains("SftpClient::open(conn)"),
             "worker 没有自己开 channel —— 并发度会静默退化成 1(F56/设计 D8)"
+        );
+    }
+
+    /// F279:上传分支必须「传前 stat、传后 stat、不一致判失败」。这段逻辑
+    /// 嵌在 async 传输体里没法纯单测,退而求其次锚定源码形状。
+    #[test]
+    fn the_upload_branch_compares_the_source_file_before_and_after() {
+        let src = strip_comments(prod_src());
+        assert!(src.contains("src_stat_before"), "传前 stat 没了");
+        assert!(src.contains("src_stat_after"), "传后 stat 没了");
+        assert!(
+            src.contains("源文件在传输期间被改动过"),
+            "比对后的失败出口没了"
         );
     }
 
