@@ -1096,6 +1096,14 @@ mod tests {
             2,
             "seal_payload 里该有内外两层 seal_secrets 调用"
         );
+
+        // 上面三段钉的都是**字面调用名**,唯一逃得掉的写法是改名导入:
+        // `use ...::seal_secrets as ss;` 之后在 `prepare` 里调 `ss(..)` ——
+        // 三段断言全绿,而 Argon2id 又回到了事件循环线程上。堵掉那条路。
+        assert!(
+            !src.contains("seal_secrets as ") && !src.contains("seal_payload as "),
+            "给封装函数起了别名 —— 上面三段按名字判的断言会被整体绕过"
+        );
     }
 
     /// 搬家不许把 `Vault` 也搬过去。

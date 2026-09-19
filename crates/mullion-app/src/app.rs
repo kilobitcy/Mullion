@@ -25465,6 +25465,14 @@ mod tests {
             !prod_src().contains("fn disable_cloud_backup_after_clearing_master_password"),
             "接线函数应随设计 D12 一起删掉,留着迟早被接回去"
         );
+        // 上面两段钉的是「这条 arm 的字面文本」和「那个函数名」。复核构造出的
+        // 绕法是把联动搬进 `apply_password_change`:arm 一字不变,行为整个接
+        // 回来。它是这条 arm 唯一往下走的函数,一并钉住。
+        let shared = strip_comments(body_of(prod_src(), "fn apply_password_change("));
+        assert!(
+            !shared.contains("cloud"),
+            "联动搬进 apply_password_change 了 —— 清主密码照样会关掉云备份:{shared}"
+        );
     }
 
     /// F270:云端备份必须**每帧无条件驱动**,跟 `drive_automation` 那三位同族
