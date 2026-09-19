@@ -1174,6 +1174,48 @@ pub fn show(
         Load::Ready => {}
     }
 
+    // F278:搜索结果**取代**这一栏的文件列表。
+    //
+    // 取代而不是挤在下面:两个列表叠在一栏里,用户分不清「选中的这一条」
+    // 是哪个列表里的,而选中集本来就只有一份(`PaneState::selected`)。
+    // 关掉搜索条就回到原来那个目录,一个字节都没动过。
+    if let Some(w) = find.as_ref().and_then(|f| f.walk.as_ref()) {
+        let root = w.root().clone();
+        let hits: Vec<_> = w.hits().to_vec();
+        egui::ScrollArea::vertical()
+            .id_salt(("files-find-results", id))
+            .auto_shrink([false, false])
+            .show_rows(ui, ROW_H, hits.len(), |ui, range| {
+                for i in range {
+                    let h = &hits[i];
+                    let rel = crate::files::find::relative(&root, &h.path);
+                    let resp = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&rel).color(theme::c32(if h.is_dir {
+                                t.accent
+                            } else {
+                                t.fg_mid
+                            })),
+                        )
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                    );
+                    // 单击也算 —— 结果列表里没有「展开」这种二段动作,
+                    // 双击才跳的话用户会以为点不动。双击同样接住:
+                    // 习惯了文件列表的人会下意识双击。
+                    if resp.clicked() || resp.double_clicked() {
+                        action = Some(FileAction::FindPick {
+                            path: h.path.clone(),
+                            is_dir: h.is_dir,
+                        });
+                    }
+                    resp.on_hover_text(h.path.display());
+                }
+            });
+        annotate::mark(ui.ctx(), format!("文件面板/{id}/搜索结果"), ui.max_rect());
+        return action;
+    }
+
     // F136:先占住一条横带留给列头(在 `ScrollArea` 之前分配,行体才会从
     // 它下面开始排),实际的绘制挪到滚动区**之后**做,好让列头在 z 序上
     // 压在行体上面(与原设计一致)。真正决定列头位置的偏移量另外算——
@@ -9109,6 +9151,140 @@ mod tests {
         assert_eq!(
             find_query_to_start("  app.rs  "),
             Some("app.rs".to_string())
+        );
+    }
+
+    /// 生产源码切片:`include_str!` 之后切掉 `#[cfg(test)] mod tests` 起
+    /// 的部分。**必须切**——不切的话下面几条判据会命中测试自己文字里的
+    /// 字面串,读出一个恒真的结果(本仓库记录在案的恒绿模式之一)。
+    fn prod_src_panel() -> &'static str {
+        let src = include_str!("files_panel.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条切片的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面的判据会考到测试自己"
+        );
+        prod
+    }
+
+    /// 剥掉行注释。抄自 `files_dialog.rs::tests::strip_comments`:源码切片
+    /// 守护必须剥注释,否则判据会命中注释文字而不是代码(改注释就假红/
+    /// 假绿 —— 本仓库登记过的既有欠账「源码切片守护不剥注释」)。
+    fn strip_comments(s: &str) -> String {
+        s.lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// F278:结果行显示的是**相对路径**,不是绝对路径 —— 绝对路径每行都顶着
+    /// 同一段前缀,把唯一有信息量的后半截挤出可视区。
+    ///
+    /// 这条判据是纯字面串,承认它弱:改名导入、把调用搬进别的函数都绕得
+    /// 过去。下面 `the_relative_call_is_not_hidden_behind_a_renamed_import`
+    /// 堵改名那个口子;真正兜底的是
+    /// `the_results_list_actually_renders_the_relative_path_not_the_absolute_one`,
+    /// 它直接读渲染出来的画面,不管中间调用链长什么样。
+    ///
+    /// 自证会变红:把 `relative(&root, &h.path)` 换成 `h.path.display()`。
+    #[test]
+    fn the_results_list_shows_relative_paths() {
+        let src = strip_comments(prod_src_panel());
+        assert!(
+            src.contains("crate::files::find::relative(&root, &h.path)"),
+            "结果行没走 relative —— 会画成一整条绝对路径"
+        );
+    }
+
+    /// 堵「改名导入绕过上一条」这个口子。`use ... relative as 别名` 之后
+    /// 改调那个别名,上一条纯字面串判据看不见 `relative(&root, ..` 这串
+    /// 字面文本,却照样在运行时正确调用 —— 判据必须钉住这条已知绕过手法。
+    ///
+    /// 自证会变红:加一行 `use crate::files::find::relative as rel_of;`,
+    /// 把结果行改成调 `rel_of(&root, &h.path)`。
+    #[test]
+    fn the_relative_call_is_not_hidden_behind_a_renamed_import() {
+        let src = prod_src_panel();
+        assert!(
+            !src.contains("relative as "),
+            "找到改名导入 `relative as ...` —— 这是绕过上一条源码切片守护的已知手法"
+        );
+    }
+
+    /// 真正兜底的那条:构造一次跨子目录的真实命中(根 `/home/u/proj`,
+    /// 命中 `/home/u/proj/src/app.rs`),把结果栏渲染成真实的 egui 形状树,
+    /// 断言画面上出现的是**相对路径 `src/app.rs`**、且**不出现**完整绝对
+    /// 路径这整串文字。不管生产代码内部把调用链改名、内联到别的辅助函数、
+    /// 还是原样保留,只要最终画出来的是相对路径,这条测试就该绿;只要
+    /// 画错了(整段用绝对路径),或者结果列表根本没画出来,就该红 ——
+    /// 钉的是「接线」这条事实,不是某一行源码长什么样。
+    ///
+    /// 自证会变红:
+    /// - 把渲染那处换成 `h.path.display().to_string()`(第一条断言红,
+    ///   因为不再出现 `src/app.rs`;第二条也红,因为绝对路径整串出现了)。
+    /// - 把整个 `if let Some(w) = find.as_ref()...` 块删掉(结果列表连同
+    ///   `src/app.rs` 一起从渲染输出里消失,第一条断言红)。
+    #[test]
+    fn the_results_list_actually_renders_the_relative_path_not_the_absolute_one() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(rp("/home/u/proj"));
+        state.load = Load::Ready;
+
+        // 手工跑两轮 BFS 凑出一条跨子目录的命中,不直接往 `Walk` 私有字段
+        // 塞 `Hit` —— 状态机自身的一致性只在 `find.rs` 那边的测试里守,
+        // 这里只借它产出一条真实数据。
+        let mut w = crate::files::find::Walk::new(rp("/home/u/proj"), "app".into(), false);
+        let b0 = w.take_runnable();
+        assert_eq!(b0.len(), 1);
+        w.accept(&b0[0], Ok(vec![entry(b"src", EntryKind::Dir)]));
+        let b1 = w.take_runnable();
+        assert_eq!(b1.len(), 1);
+        w.accept(&b1[0], Ok(vec![entry(b"app.rs", EntryKind::File)]));
+        assert_eq!(w.hits().len(), 1, "应该命中 /home/u/proj/src/app.rs 一条");
+
+        let mut find_state = Some(Find {
+            buf: "app".to_string(),
+            focus_pending: false,
+            walk: Some(w),
+            seq: 0,
+        });
+
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for _ in 0..2 {
+            out = Some(ctx.run(raw(None), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        &mut state,
+                        false,
+                        BookmarkView::none(),
+                        0,
+                        &mut cols,
+                        None,
+                        None,
+                        Some(&mut find_state),
+                    );
+                });
+            }));
+        }
+        let out = out.expect("跑了两帧");
+
+        assert!(
+            find_text_pos(&out.shapes, "src/app.rs").is_some(),
+            "结果行里没找到相对路径 `src/app.rs`"
+        );
+        assert!(
+            find_text_pos(&out.shapes, "/home/u/proj/src/app.rs").is_none(),
+            "结果行画出了完整绝对路径,而不是相对路径"
         );
     }
 }
