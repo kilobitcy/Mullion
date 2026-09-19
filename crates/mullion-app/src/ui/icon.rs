@@ -48,6 +48,11 @@ pub enum Glyph {
     /// 自绘而不是找一个文件夹字符:同 [`Glyph::Maximize`] 的理由,字形缺失
     /// 只有人眼能发现,而 F21 允许用户换显示字体,换一次就可能再缺一次。
     Project,
+    /// F278:放大镜 —— 文件面板路径条上的「在这个目录下递归搜索」。
+    ///
+    /// 自绘而不是找一个放大镜字符:U+1F50D 与 U+2315 都在 GBK 外,
+    /// 两级字体链都画不出来,而这种缺失**只有人眼能发现**(T9)。
+    Search,
 }
 
 impl Glyph {
@@ -68,6 +73,7 @@ impl Glyph {
         Glyph::LampDark,
         Glyph::LampUnknown,
         Glyph::Project,
+        Glyph::Search,
     ];
 }
 
@@ -248,6 +254,24 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
             ],
             stroke,
         )],
+        // 圆环 + 一条向右下的柄。半径取 `h * 0.6`,柄从圆周 45° 处再伸
+        // `h * 0.45`,合计 0.6*0.707 + 0.45 ≈ 0.87h,仍在框内 ——
+        // `every_glyph_stays_inside_its_rect` 正是为此存在。
+        Glyph::Search => {
+            let r = h * 0.6;
+            // 圆心往左上挪一点,给柄腾地方,整体视觉重心才落在框中间。
+            let o = pos2(c.x - h * 0.15, c.y - h * 0.15);
+            let d = r * std::f32::consts::FRAC_1_SQRT_2;
+            let from = pos2(o.x + d, o.y + d);
+            let to = pos2(o.x + d + h * 0.45, o.y + d + h * 0.45);
+            vec![
+                Shape::circle_stroke(o, r, stroke),
+                Shape::LineSegment {
+                    points: [from, to],
+                    stroke: stroke.into(),
+                },
+            ]
+        }
     }
 }
 
