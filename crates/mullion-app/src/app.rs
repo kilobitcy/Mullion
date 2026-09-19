@@ -3482,17 +3482,10 @@ impl App {
                 self.apply_password_change(|s| s.set_master_password(&pw), "主密码已生效");
             }
             O::ClearPassword => {
-                // F271/D12:只在**清除成功**之后才碰云配置 —— 清除本身失败的话
-                // (`apply_password_change` 返回 `false`),云端那份配置和密文
-                // 都还是原来能用的状态,不该动,也不能让下面这一步的提示盖掉
-                // 上面那句失败原因。
-                let cleared = self.apply_password_change(
+                self.apply_password_change(
                     crate::shell::store::SessionStore::clear_master_password,
                     "主密码已取消,回到系统钥匙串",
                 );
-                if cleared {
-                    self.disable_cloud_backup_after_clearing_master_password();
-                }
             }
             // F155:设置里点了导出。置位交给每帧的 `drain_export_log_request`
             // 统一处理 —— 两个入口(菜单/设置)共用同一条路径,不复制一遍。
@@ -3575,48 +3568,6 @@ impl App {
         let msgs: Vec<String> = [sk_err, save_err].into_iter().flatten().collect();
         if !msgs.is_empty() {
             self.ui.set_error(msgs.join(" / "));
-        }
-    }
-
-    /// F271/D12:清掉主密码之后把云备份开关一起关掉,并明说。
-    ///
-    /// 退回钥匙串方案之后,云端那份包换台机器解不开 —— 云备份的主场景
-    /// 「换新电脑」当场失效,前提没了。不关的话会同时发生两件坏事:
-    /// 定时那条每 60 秒失败一次(状态栏常红),而用户**进设置也关不掉**
-    /// (那一节整节按 `has_master_password` 置灰,连复选框一起),唯一
-    /// 自救路径是把刚清掉的主密码再设回来 —— 一个没有出口的陷阱。
-    ///
-    /// 只在**本来就开着**的时候才动它并追加提示:没开过的用户不该看见
-    /// 一句莫名其妙的「云备份已关闭」。
-    ///
-    /// **只在清除主密码成功时才会被调用**(见调用点 `O::ClearPassword`)——
-    /// 清除失败时这个方法根本不会跑,不存在「盖掉失败提示」的问题。
-    fn disable_cloud_backup_after_clearing_master_password(&mut self) {
-        let Some(dir) = crate::shell::store::config_dir() else {
-            return;
-        };
-        // 读-改-写:盘上那份打底,决策部分剥进纯函数(见
-        // `cloud_config_after_clearing_master_password` 的文档,理由是
-        // 「留在这里零守护,而它是 D12 修复的核心」)。
-        let cfg = mullion_store::cloud::load(&dir);
-        let Some(cfg) = cloud_config_after_clearing_master_password(cfg) else {
-            return;
-        };
-        match mullion_store::cloud::save(&dir, &cfg) {
-            Ok(()) => self.ui.set_error(
-                "主密码已取消,回到系统钥匙串。云端备份已一并关闭 —— \
-                 钥匙串派生的密钥换台机器解不开,重新设主密码后可再开启"
-                    .into(),
-            ),
-            Err(e) => self.ui.set_error(format!(
-                "主密码已取消,但云端备份开关没关掉:{e} —— \
-                 它会持续尝试并失败,请重新设一次主密码后进设置关掉"
-            )),
-        }
-        // 草稿还开着的话也要跟着翻,否则用户接着点「确定」会把
-        // `enabled = true` 又写回去。
-        if let Some(d) = self.ui.settings_draft.as_mut() {
-            d.cloud_enabled = false;
         }
     }
 
@@ -3842,10 +3793,8 @@ impl App {
 
     /// F71:跑一次主密码改动,收尾交给 [`finish_password_change`]。
     ///
-    /// 返回值:这次改动**是否成功**。F271/D12 的 `O::ClearPassword` 要凭它
-    /// 判断该不该接着去关云备份开关 —— 清除失败时不能碰云配置,也不能让
-    /// 后续的提示盖掉这里已经设好的失败原因。`O::SetPassword` 那一路不看
-    /// 这个返回值,行为一个字没变。
+    /// 返回值:这次改动**是否成功**。F283 把云备份跟主密码解耦之后,
+    /// `O::SetPassword`/`O::ClearPassword` 都不再依据这个返回值分支。
     fn apply_password_change(
         &mut self,
         f: impl FnOnce(&mut crate::shell::store::SessionStore) -> Result<(), mullion_store::StoreError>,
@@ -15761,30 +15710,6 @@ fn cloud_backoff_ms(streak: u32) -> u64 {
     (CLOUD_POLL_MS << shift).min(CAP_MS)
 }
 
-/// 清掉主密码之后,盘上那份云配置要不要改、改成什么样。
-///
-/// `None` = 不用动(本来就没开)。`Some(cfg)` = 把这份写回去。
-///
-/// 剥成纯函数是为了**可测**:方法挂在 `App` 上,而 `App` 在无头环境建不出来
-/// (本项目已登记的结构性限制),留在方法里的话「把 `enabled` 翻成 false」
-/// 这一句删掉之后没有任何测试会红 —— 而那一句正是 D12 那条修复的核心,
-/// 删了就原样复现「用户被困在关不掉的云备份里」。
-///
-/// 只翻 `enabled` 一项,其余字段(游标、`secret_sealed`)原样带走 ——
-/// SK 刚被 `reseal_cloud_secrets` 用新方案重封过,覆盖掉就再也解不出来了
-/// (整份覆盖是 F247/F248 的缺陷族)。**不用 `..cfg` 结构更新语法**:
-/// `CloudConfig::corrupt` 是私有字段,跨 crate 写不出这个语法;取 `mut cfg`
-/// 进来翻一项、原样返回,在「只改一处、其余不动」这件事上也更直白。
-fn cloud_config_after_clearing_master_password(
-    mut cfg: mullion_store::CloudConfig,
-) -> Option<mullion_store::CloudConfig> {
-    if !cfg.enabled {
-        return None;
-    }
-    cfg.enabled = false;
-    Some(cfg)
-}
-
 /// F125:`App::blink_on` 的核心判据抽成自由函数——只吃「窗口有没有焦点」和
 /// 「距上次输入多少毫秒」,不碰 `&App`,理由同 `sync_timeout_wake_at`(`App`
 /// 在无 GPU/窗口的环境下构造不出来,这几条分支只能靠这条路径单测)。
@@ -16455,9 +16380,8 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
         autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
-        clip_still_matches_what_was_pasted, cloud_backoff_ms,
-        cloud_config_after_clearing_master_password, credential_delete_error, decide_paste,
-        dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
+        clip_still_matches_what_was_pasted, cloud_backoff_ms, credential_delete_error,
+        decide_paste, dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
         drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
         files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
         font_px_for, has_real_action, history_rows_of, host_for_fresh, ime_cursor_area,
@@ -25483,42 +25407,26 @@ mod tests {
         );
     }
 
-    /// 清掉主密码之后,开着的云备份必须被翻成关闭。
+    /// F283:主密码与云备份解耦之后,**清主密码不许再去碰云配置**。
     ///
-    /// 这是 D12 那条修复的核心判据。不翻的后果:定时那条每 60 秒失败一次,
-    /// 而用户进设置也关不掉(那一节按 `has_master_password` 置灰),
-    /// 唯一出路是把刚清掉的主密码再设回来 —— 一个没有出口的陷阱。
+    /// 旧行为(设计 D12)是"清主密码 → 自动把云备份开关翻成 false",
+    /// 理由是"钥匙串派生的密钥换台机器解不开"。F283 之后载荷根本不用
+    /// vault 密钥封,那条理由不成立了,而副作用很实:用户清一次主密码,
+    /// 云备份被悄悄关掉,下次想起来看的时候已经几周没有备份了。
     ///
-    /// 三种情形分开钉:开着的要翻;没开的**不能**返回 `Some`(否则每次
-    /// 取消主密码都白写一次盘,还会给没开过云备份的用户弹一句莫名其妙的
-    /// 「云备份已关闭」);翻的时候**别的字段一个都不许动** —— SK 刚被
-    /// `reseal_cloud_secrets` 重封过,覆盖掉就再也解不出来。
-    ///
-    /// 自证会变红:把 `cfg.enabled = false;` 那句删掉。
+    /// 自证会变红:把 `disable_cloud_backup_after_clearing_master_password`
+    /// 的调用加回 `O::ClearPassword` 那条分支。
     #[test]
-    fn clearing_the_master_password_turns_an_enabled_cloud_backup_off() {
-        let mut on = mullion_store::CloudConfig::default();
-        on.enabled = true;
-        on.bucket = "b".into();
-        on.secret_sealed = "重封过的密文".into();
-        on.last_seq = 7;
-
-        let off = cloud_config_after_clearing_master_password(on.clone())
-            .expect("开着的云备份没被翻成关闭 —— 用户会被困在一个关不掉的失败循环里");
-        assert!(!off.enabled, "`enabled` 没翻成 false");
-        // 其余字段原样:游标与重封过的 SK 必须带过去。
-        assert_eq!(
-            off.secret_sealed, on.secret_sealed,
-            "重封过的 SK 被覆盖了 —— 它再也解不出来"
-        );
-        assert_eq!(off.last_seq, on.last_seq, "游标被动了 —— 下次会撞号或重推");
-        assert_eq!(off.bucket, on.bucket, "bucket 被动了");
-
-        let mut offed = mullion_store::CloudConfig::default();
-        offed.enabled = false;
+    fn clearing_the_master_password_leaves_the_cloud_backup_alone() {
+        let production = body_of(prod_src(), "fn apply_settings_action(&mut self,");
+        let arm = strip_comments(arm_of(production, "O::ClearPassword"));
         assert!(
-            cloud_config_after_clearing_master_password(offed).is_none(),
-            "没开过云备份的用户也被写了一次盘、弹了一句「云备份已关闭」"
+            !arm.contains("cloud"),
+            "清主密码那条路又去碰云配置了 —— F283 已经把这两件事解耦:{arm}"
+        );
+        assert!(
+            !prod_src().contains("fn disable_cloud_backup_after_clearing_master_password"),
+            "接线函数应随设计 D12 一起删掉,留着迟早被接回去"
         );
     }
 
