@@ -122,6 +122,16 @@ fn cred_key(id: CredentialId) -> String {
     format!("cred:{}", id.0)
 }
 
+/// 换密钥**之前**从 `cloud.toml` 里取出来、换完再封回去的那几段。
+///
+/// 一个字段一个 `Option`:`None` = 没存过/解不开,那种情况下没东西要重封
+/// (解不开的那份**不要清空** —— 用户重填一次就能恢复,清了就真没了)。
+#[derive(Default)]
+struct CarriedCloudSecrets {
+    secret: Option<Vec<u8>>,
+    passphrase: Option<Vec<u8>>,
+}
+
 impl Vault {
     fn sessions_path(&self) -> PathBuf {
         self.dir.join("sessions.toml")
@@ -501,7 +511,7 @@ impl Vault {
         self.key = key;
         self.scheme = crate::secrets_file::Scheme::Argon2id { params, salt };
         self.save()?;
-        self.reseal_cloud_secret(carried)
+        self.reseal_cloud_secrets(carried)
     }
 
     /// 撤销主密码,回到钥匙串方案(F71)。
@@ -522,52 +532,66 @@ impl Vault {
         self.key = key;
         self.scheme = crate::secrets_file::Scheme::Keyring;
         self.save()?;
-        self.reseal_cloud_secret(carried)
+        self.reseal_cloud_secrets(carried)
     }
 
-    /// F271 / 设计 D12:密钥换了之后,把 `cloud.toml` 里的 SK 用新密钥重封。
+    /// F271/F283 / 设计 D12:密钥换了之后,把 `cloud.toml` 里的 SK 与备份口令
+    /// 都用新密钥重封。
     ///
     /// **两个改密码的入口共用这一份。** 各写一遍的话 `clear_master_password`
     /// 那条迟早被漏掉,而漏掉的症状是:用户取消主密码之后云备份静默失效,
     /// 报错要等几十分钟后的一次定时上传才冒出来。
     ///
     /// 失败只报 `Err` **不回滚主密码**:主密码已经换好并落盘了,回滚意味着
-    /// 再写一次文件,失败链条更长。云配置坏了是可修的(重填一次 AK/SK),
+    /// 再写一次文件,失败链条更长。云配置坏了是可修的(重填一次 AK/SK 或口令),
     /// 主密码写到一半不是。**错误一律包成 `CloudReseal`** —— 见那个变体上的
     /// 注释,调用方靠它把「密码没改成」和「密码改成了但云端密钥掉队」分开。
-    fn reseal_cloud_secret(&self, old_plain: Option<Vec<u8>>) -> Result<(), StoreError> {
-        let Some(plain) = old_plain else {
-            return Ok(());
-        };
-        let mut cfg = crate::cloud::load(&self.dir);
-        if cfg.secret_sealed.is_empty() {
+    fn reseal_cloud_secrets(&self, carried: CarriedCloudSecrets) -> Result<(), StoreError> {
+        if carried.secret.is_none() && carried.passphrase.is_none() {
             return Ok(());
         }
+        let mut cfg = crate::cloud::load(&self.dir);
         // **两条出口都要包成 `CloudReseal`**:到这一步主密码已经落盘了,
         // 往上抛一个裸的 `Io`/`CorruptSecrets` 会被调用方报成「主密码没能改成」,
         // 而那句话是错的 —— 密码改成了,掉队的是云端那把密钥。
-        cfg.secret_sealed = {
-            use base64::Engine as _;
+        use base64::Engine as _;
+        if let Some(plain) = carried.secret {
             let sealed = self
                 .seal_local(&plain)
                 .map_err(|e| StoreError::CloudReseal(e.to_string()))?;
-            base64::engine::general_purpose::STANDARD.encode(sealed)
-        };
+            cfg.secret_sealed = base64::engine::general_purpose::STANDARD.encode(sealed);
+        }
+        if let Some(plain) = carried.passphrase {
+            let sealed = self
+                .seal_local(&plain)
+                .map_err(|e| StoreError::CloudReseal(e.to_string()))?;
+            cfg.passphrase_sealed = base64::engine::general_purpose::STANDARD.encode(sealed);
+        }
         crate::cloud::save(&self.dir, &cfg).map_err(|e| StoreError::CloudReseal(e.to_string()))
     }
 
-    /// 换密钥**之前**把 SK 解出来。解不开(从没填过/文件坏了)一律 `None` ——
-    /// 那种情况下没有东西需要重封。
-    fn take_cloud_secret_plain(&self) -> Option<Vec<u8>> {
+    /// 换密钥**之前**把 SK 与备份口令解出来。解不开(从没填过/文件坏了)
+    /// 一律 `None` —— 那种情况下没有东西需要重封。
+    fn take_cloud_secret_plain(&self) -> CarriedCloudSecrets {
         let cfg = crate::cloud::load(&self.dir);
-        if cfg.secret_sealed.is_empty() {
-            return None;
-        }
         use base64::Engine as _;
-        let blob = base64::engine::general_purpose::STANDARD
-            .decode(&cfg.secret_sealed)
-            .ok()?;
-        self.open_local(&blob).ok()
+        let secret = (!cfg.secret_sealed.is_empty())
+            .then(|| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&cfg.secret_sealed)
+                    .ok()
+            })
+            .flatten()
+            .and_then(|blob| self.open_local(&blob).ok());
+        let passphrase = (!cfg.passphrase_sealed.is_empty())
+            .then(|| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&cfg.passphrase_sealed)
+                    .ok()
+            })
+            .flatten()
+            .and_then(|blob| self.open_local(&blob).ok());
+        CarriedCloudSecrets { secret, passphrase }
     }
 
     pub fn list(&self) -> &[SessionRecord] {

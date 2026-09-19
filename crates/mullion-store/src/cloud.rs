@@ -109,7 +109,7 @@ pub struct CloudConfig {
     /// F283:备份口令的密文(base64)。**与主密码无关**,也与 `secret_sealed`
     /// 不是一把钥匙的两用:前者封的是「解云端备份的那句口令」,后者封的是
     /// 「访问桶的那把 SK」。两者都走 `seal_local`(本机钥匙串/主密码当前那把),
-    /// 于是**主密码一变,两者都要重封** —— 见 `Vault::reseal_cloud_secret`。
+    /// 于是**主密码一变,两者都要重封** —— 见 `Vault::reseal_cloud_secrets`。
     ///
     /// 空串 = 没设过口令 = 云备份跑不起来(会在 `cloudsync::prepare` 那里
     /// 报出原因,不是静默不跑)。
@@ -787,6 +787,175 @@ mod tests {
 
         let after = load(dir.path());
         assert_eq!(secret_key(&after, &v).expect("仍应解得开"), "SK-VALUE");
+    }
+
+    /// F283:改主密码之后,备份口令**还要解得开**。
+    ///
+    /// 漏了重封的症状:用户设一次主密码 → 云备份从此每轮失败,
+    /// 而失败信息指向「口令解不开」,没人会把它跟改主密码联系起来。
+    #[test]
+    fn changing_the_master_password_also_reseals_the_backup_passphrase() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = crate::vault::Vault::open(
+            dir.path().to_path_buf(),
+            &crate::master_key::InMemoryKey([5u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("old").expect("设旧密码");
+
+        let mut c = cfg();
+        set_passphrase(&mut c, &v, "the-backup-pass").expect("封口令");
+        save(dir.path(), &c).expect("写");
+
+        v.set_master_password("new").expect("改密码");
+
+        let after = load(dir.path());
+        assert_eq!(
+            passphrase(&after, &v).expect("改完密码之后应该还解得开"),
+            "the-backup-pass",
+            "改主密码没有重封备份口令 —— 云备份从此每轮失败"
+        );
+    }
+
+    /// 撤销主密码那条路同样要重封 —— 两个入口共用一份实现,
+    /// 但「共用」这件事本身要有测试钉着(既有的 SK 两条就是这么钉的)。
+    #[test]
+    fn clearing_the_master_password_also_reseals_the_backup_passphrase() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let ks = crate::master_key::InMemoryKey([5u8; 32]);
+        let mut v = crate::vault::Vault::open(dir.path().to_path_buf(), &ks).expect("开库");
+        v.set_master_password("old").expect("设密码");
+        let mut c = cfg();
+        set_passphrase(&mut c, &v, "the-backup-pass").expect("封口令");
+        save(dir.path(), &c).expect("写");
+
+        v.clear_master_password(&ks).expect("取消主密码");
+
+        let after = load(dir.path());
+        assert_eq!(
+            passphrase(&after, &v).expect("仍应解得开"),
+            "the-backup-pass"
+        );
+    }
+
+    /// **SK 与口令必须同时活下来。** 只钉其中一个的话,
+    /// 「重封时把另一个字段写成空串」这种实现照样过。
+    #[test]
+    fn both_sealed_fields_survive_a_master_password_change() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = crate::vault::Vault::open(
+            dir.path().to_path_buf(),
+            &crate::master_key::InMemoryKey([5u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("old").expect("设旧密码");
+
+        let mut c = cfg();
+        set_secret_key(&mut c, &v, "SK-VALUE").expect("封 SK");
+        set_passphrase(&mut c, &v, "the-backup-pass").expect("封口令");
+        save(dir.path(), &c).expect("写");
+
+        v.set_master_password("new").expect("改密码");
+
+        let after = load(dir.path());
+        assert_eq!(
+            secret_key(&after, &v).expect("SK 应该还解得开"),
+            "SK-VALUE",
+            "重封漏掉了 SK"
+        );
+        assert_eq!(
+            passphrase(&after, &v).expect("口令应该还解得开"),
+            "the-backup-pass",
+            "重封漏掉了备份口令"
+        );
+    }
+
+    /// 从源码里摘出一个函数的函数体(含花括号),用花括号计数配平 ——
+    /// 不用字符串切分,避免切到别的同名前缀或切到文件尾(本项目已因为
+    /// 切分手法造过两次假绿)。
+    fn body_of<'a>(src: &'a str, fn_signature: &str) -> &'a str {
+        let start = src
+            .find(fn_signature)
+            .unwrap_or_else(|| panic!("找不到 {fn_signature} —— 这条测试的锚点失效了"));
+        let open = src[start..]
+            .find('{')
+            .map(|i| start + i)
+            .expect("函数没有函数体");
+        let bytes = src.as_bytes();
+        let mut depth = 0i32;
+        let mut end = open;
+        for (i, &b) in bytes[open..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "花括号没配平,{fn_signature} 的函数体没摘全");
+        &src[open..=end]
+    }
+
+    /// F283 的**机械守护**:`CloudConfig` 里每多一个 `*_sealed` 字段,
+    /// 就必须在重封的两个函数体里各露一次面。
+    ///
+    /// 这条是给**将来**写的:今天两个字段都在,但本项目已经三次栽在
+    /// 「列举式门控加档必然漏」上,而漏掉的症状是静默的。
+    ///
+    /// 自证会变红:把 `reseal_cloud_secrets` 里 `passphrase_sealed` 那几行删掉。
+    #[test]
+    fn every_sealed_field_in_the_cloud_config_gets_resealed() {
+        let cloud_src = include_str!("cloud.rs");
+        let (cloud_prod, _) = cloud_src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("cloud.rs 的测试模块分界变了,这条断言的锚点失效了");
+
+        // 只认 `pub xxx_sealed:` 这种字段声明形状 —— 不认注释、不认方法名。
+        let field_names: Vec<&str> = cloud_prod
+            .lines()
+            .map(|l| l.trim())
+            .filter_map(|l| {
+                let rest = l.strip_prefix("pub ")?;
+                if rest.starts_with("fn ") || rest.starts_with("struct ") {
+                    return None;
+                }
+                let name = rest.split(':').next()?.trim();
+                let is_ident =
+                    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if is_ident && name.ends_with("_sealed") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            field_names.len() >= 2,
+            "只扫到 {} 个 *_sealed 字段,判据本身失效了(至少该有 secret_sealed 与 \
+             passphrase_sealed):{field_names:?}",
+            field_names.len()
+        );
+
+        let vault_src = include_str!("vault.rs");
+        let reseal_body = body_of(vault_src, "fn reseal_cloud_secrets(");
+        let take_body = body_of(vault_src, "fn take_cloud_secret_plain(");
+
+        for name in &field_names {
+            assert!(
+                reseal_body.contains(name),
+                "字段 {name} 没有出现在 reseal_cloud_secrets 里 —— 改主密码时它不会被重封"
+            );
+            assert!(
+                take_body.contains(name),
+                "字段 {name} 没有出现在 take_cloud_secret_plain 里 —— 换密钥前不会先把它解出来"
+            );
+        }
     }
 
     /// 重封失败之后的**自愈路径**:重填一次 SK 就好。
