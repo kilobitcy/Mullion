@@ -547,3 +547,28 @@ buffer 总大小，3 槽（24 字节）合法。
 **守护**：`app::tests::the_gpu_mid_mark_sits_between_terminal_and_egui`（源码顺序，
 三个 needle 在生产段里各唯一；无头环境测不了「槽 1 是否真被写」，那部分只能靠
 人工验收：拿两种负载对比 `term:`/`egui:` 的升降方向）。
+
+## 猜 reserve/max_height 反推正文高度会长成棘轮（F217/F280）
+
+**症状**：弹窗每次打开后逐帧自己长高，停不下来；或者反过来，小屏幕上正文
+比窗口还高却没有任何滚动兜底，内容直接溢出到屏幕外，划都划不到——两种
+表现看着不像一回事，根子是同一处。
+
+**规则**：`egui::Window` 内部的 `Resize` 每帧 `desired_size =
+desired_size.max(last_content_size)`（0.30 `containers/resize.rs:258`）——
+只会涨、不会缩。任何「猜一个按钮行 / chrome 高度常量，拿窗口高度减去这个
+猜测值当正文的 `max_height`」的写法都会踩雷：猜小了，差额每帧累积，表现为
+窗口自己长高；不猜、不设上限，则正文在小屏上可能比窗口还高，没有滚动区
+接住就直接溢出。正解是 `bottom_up`：按钮先加、摆在最下面；正文套
+`ScrollArea` 吃掉剩下的全部空间（不给它 `max_height`，让 egui 自己
+`at_most(可用空间)`）；窗口整体的高度上界从**这一帧实测的剩余空间**
+（`screen_rect().bottom() - ui.cursor().top()`）来，不猜任何控件的高度。
+
+**已踩两次，两个独立文件**：F217（`editor_window.rs`）先摔了一次；F280
+（`settings.rs`）在完全不同的弹窗里又摔了一次同一个形状——说明这不是
+某个文件的偶然疏忽，是 `egui::Window`/`Resize` 这套 API 本身的通用陷阱。
+
+**守护**：`ui::settings::tests::the_settings_window_shrinks_to_the_screen_instead_of_overflowing`
+（F280）；`editor_window::tests::a_long_file_cannot_ratchet_the_window_past_the_screen_budget`
+与 `editor_window::tests::the_window_height_does_not_creep_upward_frame_after_frame`
+（F217）。
