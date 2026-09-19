@@ -625,9 +625,14 @@ fn path_edit_id(id: &str) -> egui::Id {
     egui::Id::new(("files-path-edit", id))
 }
 
-/// F278:搜索框自己的 id。同上。
-fn find_edit_id(id: &str) -> egui::Id {
-    egui::Id::new(("files-find-edit", id))
+/// F278:搜索框自己的 id。
+///
+/// **必须掺 `generation`**,理由与 `scroll_id_salt` 那段长注释一字不差:
+/// `id` 全仓库只有 `"远端"`/`"本地"` 两个字面值,不掺世代号的话两个标签的
+/// 搜索框共用同一个持久化 `Id`,egui 存在 `Id` 上的光标位置/选区会从上一个
+/// 标签漏到下一个标签(切回来时光标落在别处)。
+fn find_edit_id(id: &str, generation: u64) -> egui::Id {
+    egui::Id::new(("files-find-edit", id, generation))
 }
 
 /// F278:回车/「搜索」/「重新搜索」三处入口共用的防抖判据 —— 输入框里的
@@ -827,6 +832,12 @@ pub fn show(
     // 而不是在函数体里 `if column == Remote` —— 本地栏压根传不进来,
     // 漏判一处也不会静默出现一个点了没反应的放大镜。
     let mut find = find.and_then(|s| s.as_mut());
+    // F278:这一帧要不要用搜索结果**取代**文件列表。**算一次给两处用**
+    // (下面右键菜单的门 + 结果列表那条早退):两处各写一遍判据的话,改了
+    // 一处就会出现「列表已经被结果取代、右键菜单却还挂着」这个组合 ——
+    // 而那个组合会把用户送进一个画不出来却吃着全窗口键盘的就地编辑态
+    // (详见下面那道门上的注释)。
+    let showing_hits = find.as_ref().is_some_and(|f| f.walk.is_some());
     // F250:判据是「**这一栏的当前目录**在不在基准之下」,不是逐条比选中项。
     // 两者等价(选中项一律是 `cwd.join(单段名字)`,见 `delete_targets`),而
     // 这一份是 O(路径长度)、每帧算得起 —— 逐条比要遍历整个 `entries`,
@@ -870,17 +881,36 @@ pub fn show(
         ui.id().with(("files-bg-menu", id, generation)),
         egui::Sense::click(),
     );
-    bg.context_menu(|ui| {
-        menu_body(
-            ui,
-            id,
-            column,
-            bg_target,
-            clip_ready,
-            rel_ready,
-            &mut menu_hit,
-        )
-    });
+    // F278:**正在展示搜索结果时不挂右键菜单。**
+    //
+    // 结果列表把文件列表整个取代掉(下面那条 `return action;`),于是
+    // `rename_row`/`name_edit_row` 的渲染这一帧压根到不了;而
+    // `begin_rename`/`begin_new_file`/`begin_new_dir` 只看 `PaneState` 自己
+    // 的字段,对「这一帧在展示搜索结果」一无所知,照样会把 `rename_edit`/
+    // `new_edit` 置上。后果是 `Modal::FilesRename`/`FilesNewName` 判成真、
+    // `modal_open()` 把整窗口键盘交给 egui,而 egui 里根本没有那个 `TextEdit`
+    // 部件 —— 键全部掉地上,连终端都收不到,屏幕上却什么都没变化。
+    // T8 家族:无任何线索、无自愈路径。
+    //
+    // **挡整个菜单而不是挑那三项**:spec 的范围决策本来就是「不在搜索结果
+    // 里做写操作」,挑着挡等于又建一张列举表,加一档就漏一档(本项目已经
+    // 为这个形状付过三次代价)。
+    //
+    // **只跳过菜单,`bg` 本身照常 interact**:下面的拖拽描边要用它的
+    // `contains_pointer()`。
+    if !showing_hits {
+        bg.context_menu(|ui| {
+            menu_body(
+                ui,
+                id,
+                column,
+                bg_target,
+                clip_ready,
+                rel_ready,
+                &mut menu_hit,
+            )
+        });
+    }
     // F58:对面栏正拖着东西过来 —— 整栏描边,让「松手会传到这儿」在松手
     // **之前**就看得见。判据是「载荷来自另一栏」而不是「有载荷」:同栏内
     // 拖不成立(`drag::drop_target`),给它描边等于承诺一个不会发生的动作。
@@ -1103,7 +1133,7 @@ pub fn show(
         ui.horizontal(|ui| {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut f.buf)
-                    .id(find_edit_id(id))
+                    .id(find_edit_id(id, generation))
                     .hint_text("文件名(模糊匹配,回车开始)")
                     .desired_width(ui.available_width() * 0.5),
             );
@@ -1186,7 +1216,13 @@ pub fn show(
     // 取代而不是挤在下面:两个列表叠在一栏里,用户分不清「选中的这一条」
     // 是哪个列表里的,而选中集本来就只有一份(`PaneState::selected`)。
     // 关掉搜索条就回到原来那个目录,一个字节都没动过。
-    if let Some(w) = find.as_ref().and_then(|f| f.walk.as_ref()) {
+    if showing_hits {
+        // 判据就是函数开头算好的那一个,这里**不再重算一遍** —— 两处各判
+        // 一次正是「列表被取代了、右键菜单却还在」那个危险组合的来源。
+        let w = find
+            .as_ref()
+            .and_then(|f| f.walk.as_ref())
+            .expect("showing_hits 为真就是 walk 有值");
         let root = w.root().clone();
         let hits: Vec<_> = w.hits().to_vec();
         // 复核 Critical:漏 `generation` 会撞成同一个持久化 `Id` ——
@@ -9307,6 +9343,64 @@ mod tests {
             .map(|l| l.split("//").next().unwrap_or(l))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// F278:**搜索结果展示期间不挂背景右键菜单。**
+    ///
+    /// 结果列表把文件列表整个取代掉(`show` 里那条 `return action;`),于是
+    /// `rename_row`/`name_edit_row` 这一帧压根画不到;而 `begin_rename`/
+    /// `begin_new_file`/`begin_new_dir` 只看 `PaneState` 自己的字段,对
+    /// 「这一帧在展示搜索结果」一无所知,照样会把 `rename_edit`/`new_edit`
+    /// 置上 —— `Modal::FilesRename`/`FilesNewName` 于是判成真,`modal_open()`
+    /// 把整窗口键盘交给 egui,而 egui 里根本没有那个 `TextEdit` 部件。
+    /// 键全部掉地上,连终端都收不到,屏幕上却什么都没变(T8 家族:无线索、
+    /// 无自愈路径)。
+    ///
+    /// **两处必须共用同一个判据**(`showing_hits`):各判一次的话,改了一处
+    /// 就会出现「列表已被取代、菜单却还挂着」这个组合,而它正是上面那条
+    /// 路径的唯一入口。
+    ///
+    /// 自证会变红(逐条):
+    /// - 删掉 `if !showing_hits {` 这道门 —— 第一条红;
+    /// - 把结果列表那条早退改回自己重算 `find.as_ref().and_then(..)`
+    ///   —— 第二条红。
+    #[test]
+    fn the_background_menu_is_gone_while_the_search_results_are_showing() {
+        let src = strip_comments(prod_src_panel());
+        let at = src.find("bg.context_menu(").expect("背景右键菜单不见了?");
+        let last = src[..at]
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        assert_eq!(
+            last.trim(),
+            "if !showing_hits {",
+            "背景右键菜单没被「正在展示搜索结果」这道门挡住 —— 用户能在结果\
+             列表上右键进一个画不出来却吃着全窗口键盘的就地编辑态"
+        );
+        assert_eq!(
+            src.matches("if showing_hits {").count(),
+            1,
+            "结果列表那条早退没跟菜单那道门共用同一个判据"
+        );
+    }
+
+    /// F278:搜索框的 egui `Id` 必须掺 `generation`。
+    ///
+    /// `id` 全仓库只有 `"远端"`/`"本地"` 两个字面值(理由见 `scroll_id_salt`
+    /// 的长注释),不掺世代号的话两个标签的搜索框共用同一个持久化 `Id`,
+    /// egui 存在 `Id` 上的光标位置/选区会从上一个标签漏到下一个标签。
+    /// 结果列表的 `ScrollArea` 已经因为同一个理由补过一次,搜索框当时漏了。
+    ///
+    /// 自证会变红:把 `generation` 从 `find_edit_id` 的键里去掉。
+    #[test]
+    fn the_find_box_id_is_salted_with_the_generation_like_every_other_per_tab_id() {
+        let src = strip_comments(prod_src_panel());
+        assert!(
+            src.contains(r#"egui::Id::new(("files-find-edit", id, generation))"#),
+            "搜索框的 Id 没掺 generation —— 两个标签的搜索框会共用 egui 的光标状态"
+        );
     }
 
     /// F278:结果行显示的是**相对路径**,不是绝对路径 —— 绝对路径每行都顶着
