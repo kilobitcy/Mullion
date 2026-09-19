@@ -25066,10 +25066,7 @@ mod tests {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
-            if !name.is_empty()
-                && rest[name.len()..].starts_with('(')
-                && !out.contains(&name)
-            {
+            if !name.is_empty() && rest[name.len()..].starts_with('(') && !out.contains(&name) {
                 out.push(name);
             }
         }
@@ -29362,9 +29359,7 @@ mod tests {
             1,
             "`apply_remote_file_action` 不止调用一次:{body}"
         );
-        let close = body
-            .find("self.close_files_find(")
-            .expect("没有关掉搜索条");
+        let close = body.find("self.close_files_find(").expect("没有关掉搜索条");
         let goto = body
             .find("self.apply_remote_file_action(")
             .expect("没有派发 Goto");
