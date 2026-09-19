@@ -5728,6 +5728,14 @@ impl App {
                 // 到新连接」这一步(预检查在途 / 冲突框开着两条路都靠它),
                 // 但界面上剪贴板状态本身还是错的,必须在这里单独清掉。
                 files.clip = None;
+                // F278:换机器 = 搜索的根没了。`invalidate()` 只够得着
+                // `PaneState`,`find` 挂在更外层的 `PanelFrame` 上,结构上
+                // 天然摸不到 —— 不清的话,新机器上回来的目录会被塞进旧机器
+                // 那次遍历里,结果列表变成两台机器的文件混在一起,而相对
+                // 路径看上去完全正常。(F220 的 `clip` 在这里踩过同一个坑,
+                // 就在上面几行。)
+                files.find_seq += 1;
+                files.find = None;
             }
         }
         self.trigger_sftp_open(generation);
@@ -6548,6 +6556,20 @@ impl App {
                 return;
             }
         };
+        // F278:换目录 = 搜索的根变了。**只对真正换目录的那几个动作** ——
+        // `Refresh` 不算(根没变),`FindPick` 自己已经关过搜索条了。
+        //
+        // 不清的话:结果列表还挂着旧根,而 `relative()` 拿旧根去切新路径,
+        // 切不出来就原样吐绝对路径 —— 列表突然一半相对一半绝对,而没有
+        // 任何报错。
+        if matches!(
+            action,
+            FileAction::Goto(_) | FileAction::GotoInput(_) | FileAction::Up
+        ) && files.find.is_some()
+        {
+            files.find_seq += 1;
+            files.find = None;
+        }
         // F249:探测那一趟不动 `cwd`、不进 `Loading` —— 它还不知道要去哪儿。
         // 借 `files` 到此为止(下面几行只用 `self`),两条路各发各的请求。
         let seq = match probe {
@@ -25108,6 +25130,127 @@ mod tests {
     fn the_find_pump_actually_runs_every_frame() {
         let src = strip_comments(prod_src());
         assert!(src.contains("self.pump_find();"), "pump_find 没有被调用");
+    }
+
+    /// F278:`ui/files_panel.rs` 生产段(切掉 `#[cfg(test)] mod tests` 之后
+    /// 的那一半)。该文件同一时间有另一个 agent 在改(补 `id_salt` 与点击
+    /// 守护),**绝不能**编辑它 —— 这里只用 `include_str!` 在编译期读一份
+    /// 只读快照,不算改动。
+    fn panel_src() -> &'static str {
+        let src = include_str!("ui/files_panel.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("files_panel.rs 的测试模块分界变了,这条切片的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉 files_panel.rs 的测试模块 —— 下面的判据会考到测试自己"
+        );
+        prod
+    }
+
+    /// F278:搜索状态**挂在标签上**,标签没了它也没了 —— 不需要 T11 那种
+    /// 「按世代号兜底回收」。
+    ///
+    /// 这条钉的是结构事实:`find` 是 `PanelFrame` 的字段,而 `PanelFrame`
+    /// 是 `TabContent` 的一部分。哪天有人把它挪去 `App` 上(比如为了「全局
+    /// 搜索历史」),这条会变红,提醒他同时补上回收。
+    ///
+    /// 自证会变红:把 `find` 字段从 `PanelFrame` 搬到 `App` 上。
+    #[test]
+    fn the_find_state_lives_on_the_tab_so_closing_the_tab_reclaims_it() {
+        let panel_body = strip_comments(body_of(panel_src(), "pub struct PanelFrame {"));
+        assert!(
+            panel_body.contains("find:") && panel_body.contains("find_seq:"),
+            "`PanelFrame` 上找不到 `find`/`find_seq` 字段 —— 这条测试的锚点\
+             可能失效了,不是搜索状态真的搬走了:{panel_body}"
+        );
+        let app_body = strip_comments(body_of(prod_src(), "pub struct App {"));
+        assert!(
+            !app_body.contains("find:") && !app_body.contains("find_seq:"),
+            "`App` 结构体上出现了 `find`/`find_seq` 字段 —— 搜索状态被搬到了\
+             标签之外,标签关闭时不再自动回收,需要照 T11 补一条按世代号的\
+             兜底清理:{app_body}"
+        );
+    }
+
+    /// F278:换机器要清掉搜索。不清的话新机器回来的目录会塞进旧机器那次
+    /// 遍历里 —— 结果列表变成两台机器的文件混在一起,而相对路径看上去
+    /// 完全正常。(F220 的 `clip` 在同一个函数里踩过同一个坑。)
+    ///
+    /// 两头都要钉:只清了 `find` 而没递增 `find_seq` 的话,在途结果会被
+    /// 下一次搜索收下(旧机器的答案顶替新机器)。
+    ///
+    /// 自证会变红:把 `reopen_sftp_on_focused_host` 里那两行删掉;或者只删
+    /// `files.find_seq += 1;` 那一行(保留 `files.find = None;`)。
+    #[test]
+    fn switching_hosts_throws_away_the_running_search() {
+        let body = strip_comments(body_of(
+            prod_src(),
+            "fn reopen_sftp_on_focused_host(&mut self, generation: u64) {",
+        ));
+        assert!(
+            body.contains("files.find = None;"),
+            "换机器没有清掉 find —— 新机器的目录会被塞进旧机器那次遍历里:{body}"
+        );
+        assert!(
+            body.contains("files.find_seq += 1;"),
+            "换机器清了 find 但没递增 find_seq —— 在途结果会被下一次搜索收下:{body}"
+        );
+    }
+
+    /// F278:换目录(`Goto`/`GotoInput`/`Up`)要清掉搜索,但 `Refresh` **不算**
+    /// 换目录(根没变)。
+    ///
+    /// 一起清掉的话,搜索中按一下 F5 结果就没了,而用户只是想刷新。
+    ///
+    /// 两头都要钉:只清了 `find` 而没递增 `find_seq` 的话,在途结果会被
+    /// 下一次搜索收下。
+    ///
+    /// 自证会变红:把 `matches!` 里加上 `| FileAction::Refresh`;或者把
+    /// `files.find_seq += 1;` 那一行删掉(保留 `files.find = None;`)。
+    #[test]
+    fn changing_directory_drops_the_search_but_refreshing_does_not() {
+        let body = strip_comments(body_of(prod_src(), "fn apply_remote_file_action("));
+        // 唯一性先钉死:占坑攻击(塞一段 `if false { files.find = None; }`
+        // 之类的死代码占住靠前的文本位置)会让 count 变成 2,在下面的位置
+        // 判据被绕过之前先在这里就红。
+        assert_eq!(
+            body.matches("files.find = None;").count(),
+            1,
+            "`files.find = None;` 不止出现一次(在 apply_remote_file_action \
+             这一个函数体里)——多一处占位就能把下面的位置判据骗过去:{body}"
+        );
+        assert_eq!(
+            body.matches("files.find_seq += 1;").count(),
+            1,
+            "`files.find_seq += 1;` 不止出现一次:{body}"
+        );
+        // `FileAction::Refresh` 本来只在函数前半的 `target` 大 match 里
+        // 出现一次(`FileAction::Refresh => files.remote.cwd.clone(),`)。
+        // 把它也塞进换目录守卫的 `matches!` 模式串会让这里的计数变成 2 ——
+        // 这条判据不依赖具体格式/换行,rustfmt 怎么重排都躲不掉。
+        assert_eq!(
+            body.matches("FileAction::Refresh").count(),
+            1,
+            "`FileAction::Refresh` 不止出现一次 —— 像是被混进了换目录守卫,\
+             搜索中按一下刷新,结果就被清掉了:{body}"
+        );
+        let door = body
+            .find("FileAction::Goto(_) | FileAction::GotoInput(_) | FileAction::Up")
+            .expect("换目录守卫的三个变体不见了 —— 换目录时搜索不再作废");
+        let clear = body
+            .find("files.find = None;")
+            .expect("换目录守卫没有清掉 find");
+        let bump = body
+            .find("files.find_seq += 1;")
+            .expect("换目录时没有递增 find_seq —— 在途结果会被下一次搜索收下");
+        assert!(
+            door < bump && bump < clear,
+            "换目录守卫的匹配式 / 递增序号 / 清空 find 三者顺序不对,或者\
+             `files.find = None;`/`files.find_seq += 1;` 接到了别的分支上:\
+             {body}"
+        );
     }
 
     /// F247:换日志档之前先看**现在是不是已经这个档**。
