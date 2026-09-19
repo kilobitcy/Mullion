@@ -1854,13 +1854,32 @@ mod tests {
     #[test]
     fn the_settings_window_shrinks_to_the_screen_instead_of_overflowing() {
         let src = strip_comments(include_str!("settings.rs"));
-        let body = src
-            .split("pub fn show(")
-            .nth(1)
-            .expect("show 没了")
-            .split("\npub fn ")
-            .next()
-            .unwrap();
+        // 用花括号配平切出 `show()` 自己的函数体,**不用 `\npub fn ` 当右边界**:
+        // `show` 之后的分节函数(`appearance`/`shortcut_table`……)全是私有 `fn`,
+        // 不带 `pub`,`\npub fn ` 永远碰不到下一个边界,会把 `body` 一路撑到
+        // 文件末尾 —— `shortcut_table` 自己那个无关的 `ScrollArea::vertical()`
+        // 也被囊括进来,变异掉 `show()` 里刚加的 ScrollArea 时这条测试照样绿
+        // (已用变异验证过一次:只删 `show()` 里的 ScrollArea/`bottom_up`,
+        // 守护测试因为切到了 `shortcut_table` 的 ScrollArea 而假绿)。
+        let after_sig = src.split("pub fn show(").nth(1).expect("show 没了");
+        let brace_start = after_sig.find('{').expect("show 没有函数体");
+        let mut depth = 0i32;
+        let mut brace_end = brace_start;
+        for (i, c) in after_sig[brace_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        brace_end = brace_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(brace_end > brace_start, "`show` 花括号没配平");
+        let body = &after_sig[brace_start..=brace_end];
         assert!(
             body.contains("screen_rect().bottom() - ui.cursor().top()"),
             "高度上界不是实测剩余(F217:别用 Window::max_height 猜 chrome)"
