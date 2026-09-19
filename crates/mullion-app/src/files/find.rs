@@ -10,7 +10,7 @@
 //! 没有 exec 通道;有 exec 的也可能是 busybox,`-iname`/`-maxdepth` 参数
 //! 不齐;再加上文件名里的引号与空格转义,是一摊比逐目录遍历更难对的事。
 
-use mullion_ssh::sftp::RemotePath;
+use mullion_ssh::sftp::{Entry, EntryKind, RemotePath};
 
 /// 名字里出现的这几个字符按**子序列**匹配。大小写不敏感。
 ///
@@ -71,6 +71,208 @@ pub fn relative(root: &RemotePath, path: &RemotePath) -> String {
     RemotePath::from_bytes(p[cut..].to_vec())
         .display()
         .to_string()
+}
+
+/// 命中封顶。**500 条之后停**:再多用户也不会往下翻,而每多一条就多一次
+/// 无意义的往返。到顶时状态里写明「结果可能不全」,不装作搜完了。
+pub const MAX_HITS: usize = 500;
+
+/// 目录封顶。**2000 个之后停**:家目录下随便一个 `node_modules` 就是几万个
+/// 目录,而本项目的主场景是高延迟代理链路,一次往返几百毫秒。
+pub const MAX_DIRS: usize = 2000;
+
+/// 同时在飞的 `list_dir` 条数。
+///
+/// **不是 1**:串行的话 2000 个目录 × 300ms RTT ≈ 10 分钟,这个功能等于不存在。
+/// **也不是几十**:russh-sftp 在同一条 channel 上复用请求 id,开太多只会把
+/// 窗口撑满、把同一条连接上的交互式操作(列目录、编辑保存)挤到后面去。
+pub const CONCURRENCY: usize = 4;
+
+/// 停下来的原因。**四档分开**,因为界面上要说的话完全不同 ——
+/// 「搜完了,没找到」和「翻了 2000 个目录还没翻完」是两件事,混成一句
+/// 「没有结果」会让用户以为文件不存在,而它可能就在第 2001 个目录里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// 整棵树翻完了。
+    Exhausted,
+    /// 命中到 [`MAX_HITS`] 了。
+    HitCap,
+    /// 目录翻到 [`MAX_DIRS`] 了。
+    DirCap,
+    /// 用户按了取消。
+    Canceled,
+}
+
+/// 一条命中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    /// **绝对路径**。跳转要用它,显示时才现算相对路径(走 [`relative`])——
+    /// 只存相对路径的话,跳转那一步要把根拼回去,而根可能已经变了。
+    pub path: RemotePath,
+    /// 是目录还是文件。决定跳过去之后是「进去」还是「在父目录里亮出来」,
+    /// 也决定结果行画哪个图标。
+    pub is_dir: bool,
+}
+
+/// 一次递归搜索的遍历状态。BFS。
+///
+/// **BFS 不是 DFS**:用户要找的东西绝大多数就在浅层,深度优先会一头扎进
+/// 某个 `node_modules` 里,封顶用完了还没回到第二层。
+pub struct Walk {
+    root: RemotePath,
+    query: String,
+    show_hidden: bool,
+    /// 还没发出去的目录。
+    pending: std::collections::VecDeque<RemotePath>,
+    /// 已经发出去、还没回来的条数。**收工判据要用它**,见 `status`。
+    inflight: usize,
+    /// 已经**列过**的目录数(成功失败都算)。封顶判据。
+    visited: usize,
+    hits: Vec<Hit>,
+    stop: Option<Stop>,
+    /// 列不出来的目录数(多半是权限不足)。界面上顺带报一句 ——
+    /// 静默跳过的话,用户会以为那几棵子树里真的没有他要的东西。
+    skipped: usize,
+}
+
+impl Walk {
+    /// 起一次搜索。`query` 由调用方保证非空(空串会让 [`matches`] 恒不命中,
+    /// 白跑一整棵树)。
+    pub fn new(root: RemotePath, query: String, show_hidden: bool) -> Self {
+        let mut pending = std::collections::VecDeque::new();
+        pending.push_back(root.clone());
+        Self {
+            root,
+            query,
+            show_hidden,
+            pending,
+            inflight: 0,
+            visited: 0,
+            hits: Vec::new(),
+            stop: None,
+            skipped: 0,
+        }
+    }
+
+    /// 这一轮可以发出去几个目录。照 `queue::Queue::take_runnable` 的形状。
+    ///
+    /// **已经停了就一个都不吐**:到顶之后再发请求,结果只会被 `accept` 原样
+    /// 丢掉,白白占着链路。
+    pub fn take_runnable(&mut self) -> Vec<RemotePath> {
+        if self.stop.is_some() {
+            return Vec::new();
+        }
+        let room = CONCURRENCY.saturating_sub(self.inflight);
+        let mut out = Vec::new();
+        while out.len() < room {
+            // 封顶判在**发出去之前**:判在回来的时候的话,最后一轮会超发
+            // 到 2003 个,而且那三个的结果照样被收下。
+            if self.visited + self.inflight >= MAX_DIRS {
+                // pending 还有东西 = 真的被封顶截断了;空了 = 正好翻完,
+                // 那由 `status` 判成 `Exhausted`。
+                if !self.pending.is_empty() {
+                    self.stop = Some(Stop::DirCap);
+                }
+                break;
+            }
+            match self.pending.pop_front() {
+                Some(d) => {
+                    self.inflight += 1;
+                    out.push(d);
+                }
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// 一次列目录回来了。
+    ///
+    /// **无论成败都要调**:不调的话 `inflight` 永远减不回去,`status` 就
+    /// 永远判不出收工 —— 界面上是一个转到天荒地老的「正在搜索」。
+    ///
+    /// 单条失败**不中止整次搜索**:权限不足的目录在真实机器上遍地都是
+    /// (`/proc`、别人的家目录),一条就把整次搜索判死的话,这个功能在
+    /// 任何一台真机上都用不了。
+    pub fn accept(&mut self, dir: &RemotePath, result: Result<Vec<Entry>, String>) {
+        self.inflight = self.inflight.saturating_sub(1);
+        self.visited += 1;
+        if self.stop.is_some() {
+            return;
+        }
+        let entries = match result {
+            Ok(v) => v,
+            Err(_) => {
+                self.skipped += 1;
+                return;
+            }
+        };
+        for e in entries {
+            let name = e.name.as_bytes();
+            // 隐藏项随 `show_hidden`:**既不匹配也不递归**。只挡匹配不挡
+            // 递归的话,关着开关搜一次家目录照样要爬完整个 `.cache`。
+            if !self.show_hidden && name.starts_with(b".") {
+                continue;
+            }
+            let full = dir.join(name);
+            if matches(&self.query, &e.name.display()) {
+                self.hits.push(Hit {
+                    path: full.clone(),
+                    is_dir: e.kind == EntryKind::Dir,
+                });
+                if self.hits.len() >= MAX_HITS {
+                    self.stop = Some(Stop::HitCap);
+                    return;
+                }
+            }
+            // **只有 `EntryKind::Dir` 往下走**。`list_dir` 是 lstat 语义
+            // (见 `SftpClient::stat` 的文档),指向目录的软链接是
+            // `EntryKind::Symlink`,自然被挡在外面 —— 这正是 spec 要的
+            // 「不跟符号链接」。跟了的话 `a -> ..` 这种环会让遍历永不收敛,
+            // 只有 2000 的封顶兜着,而那 2000 次往返全是白跑的。
+            if e.kind == EntryKind::Dir {
+                self.pending.push_back(full);
+            }
+        }
+    }
+
+    /// 用户按了取消。
+    pub fn cancel(&mut self) {
+        if self.stop.is_none() {
+            self.stop = Some(Stop::Canceled);
+        }
+    }
+
+    /// 还在跑吗。`None` = 还在跑;`Some(stop)` = 停了,原因在里面。
+    ///
+    /// **收工判据是「待列空 **且** 在飞为零」**。只看 `pending.is_empty()`
+    /// 的话,最后一批还在路上的时候就会报「搜完了,0 个结果」,而半秒后
+    /// 结果才回来 —— 用户已经看过那句「没找到」并关掉了。
+    pub fn status(&self) -> Option<Stop> {
+        if let Some(s) = self.stop {
+            return Some(s);
+        }
+        if self.pending.is_empty() && self.inflight == 0 {
+            return Some(Stop::Exhausted);
+        }
+        None
+    }
+
+    pub fn hits(&self) -> &[Hit] {
+        &self.hits
+    }
+    pub fn visited(&self) -> usize {
+        self.visited
+    }
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
+    pub fn root(&self) -> &RemotePath {
+        &self.root
+    }
+    pub fn query(&self) -> &str {
+        &self.query
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +379,243 @@ mod tests {
     fn a_path_that_is_exactly_the_root_behaves_the_same_at_either_depth() {
         assert_eq!(relative(&rp("/"), &rp("/")), "/");
         assert_eq!(relative(&rp("/home/u"), &rp("/home/u")), "/home/u");
+    }
+
+    fn e(name: &str, kind: EntryKind) -> Entry {
+        Entry {
+            name: rp(name),
+            kind,
+            size: 0,
+            mtime: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            link_target: None,
+        }
+    }
+
+    /// 把一次搜索跑到底:反复 `take_runnable` → 从 `tree` 里取目录内容
+    /// → `accept`。返回命中的相对路径,按发现顺序。
+    fn run(
+        root: &str,
+        query: &str,
+        show_hidden: bool,
+        tree: &[(&str, Vec<Entry>)],
+    ) -> (Vec<String>, Stop, usize) {
+        let mut w = Walk::new(rp(root), query.to_string(), show_hidden);
+        // 上限兜底:状态机写错成不收敛时,让测试**失败**而不是挂死。
+        for _ in 0..100_000 {
+            let batch = w.take_runnable();
+            if batch.is_empty() {
+                break;
+            }
+            for d in batch {
+                let found = tree
+                    .iter()
+                    .find(|(p, _)| p.as_bytes() == d.as_bytes())
+                    .map(|(_, v)| v.clone());
+                w.accept(&d, found.ok_or_else(|| "没有权限".to_string()));
+            }
+        }
+        let stop = w.status().expect("跑到底之后必须有结论");
+        let rels = w
+            .hits()
+            .iter()
+            .map(|h| relative(w.root(), &h.path))
+            .collect();
+        (rels, stop, w.visited())
+    }
+
+    /// 递归真的往下走,而且结果是相对路径。
+    ///
+    /// 自证会变红:把 `accept` 里 `self.pending.push_back(full)` 那一句删掉
+    /// —— 只剩根目录那一层的命中。
+    #[test]
+    fn the_search_descends_into_subdirectories() {
+        let tree = vec![
+            (
+                "/r",
+                vec![e("src", EntryKind::Dir), e("a.txt", EntryKind::File)],
+            ),
+            ("/r/src", vec![e("app.rs", EntryKind::File)]),
+        ];
+        let (hits, stop, _) = run("/r", "ap", false, &tree);
+        assert_eq!(hits, vec!["src/app.rs"]);
+        assert_eq!(stop, Stop::Exhausted);
+    }
+
+    /// **不跟符号链接**:指向目录的软链接是 `EntryKind::Symlink`,不入队。
+    ///
+    /// 自证会变红:把 `if e.kind == EntryKind::Dir` 改成
+    /// `if matches!(e.kind, EntryKind::Dir | EntryKind::Symlink)` —— `/r/link`
+    /// 会被列,`visited` 从 1 变成 2。
+    #[test]
+    fn a_symlink_is_never_followed_even_when_it_points_at_a_directory() {
+        let tree = vec![
+            ("/r", vec![e("link", EntryKind::Symlink)]),
+            // 真去列它就会命中这一条 —— 不跟链接的话永远看不见。
+            ("/r/link", vec![e("inside.txt", EntryKind::File)]),
+        ];
+        let (hits, _, visited) = run("/r", "inside", false, &tree);
+        assert!(hits.is_empty(), "跟着软链接走了:{hits:?}");
+        assert_eq!(visited, 1, "只该列根目录一个");
+    }
+
+    /// 隐藏项随 `show_hidden`:关着的时候**既不匹配也不递归**。
+    ///
+    /// 自证会变红:把 `accept` 里 `if !self.show_hidden && ...` 那三行删掉
+    /// (第一组断言红);或只改成「过滤命中、照样入队」(`visited` 那条红)。
+    #[test]
+    fn hidden_entries_are_neither_matched_nor_descended_into() {
+        let tree = vec![
+            (
+                "/r",
+                vec![e(".git", EntryKind::Dir), e(".env", EntryKind::File)],
+            ),
+            ("/r/.git", vec![e("config", EntryKind::File)]),
+        ];
+        let (off, _, visited_off) = run("/r", "cfg", false, &tree);
+        assert!(off.is_empty());
+        assert_eq!(visited_off, 1, "关着开关时不该进 .git");
+
+        let (on, _, visited_on) = run("/r", "config", true, &tree);
+        assert_eq!(on, vec![".git/config"]);
+        assert_eq!(visited_on, 2);
+
+        let (dot, _, _) = run("/r", ".env", true, &tree);
+        assert_eq!(dot, vec![".env"], "开着开关时隐藏文件本身也该被匹配");
+    }
+
+    /// 命中封顶:到 500 就停,而且状态说得出是「封顶」不是「搜完了」。
+    /// 混成一句的话用户会以为结果就这些 —— 而它可能还差得远。
+    ///
+    /// 自证会变红:把 `if self.hits.len() >= MAX_HITS` 那一段删掉。
+    #[test]
+    fn hitting_the_result_cap_stops_and_says_so() {
+        let names: Vec<String> = (0..MAX_HITS + 50).map(|i| format!("f{i}.txt")).collect();
+        let many: Vec<Entry> = names.iter().map(|n| e(n, EntryKind::File)).collect();
+        let tree = vec![("/r", many)];
+        let (hits, stop, _) = run("/r", "f", false, &tree);
+        assert_eq!(hits.len(), MAX_HITS);
+        assert_eq!(stop, Stop::HitCap);
+    }
+
+    /// 目录封顶:判在**发出去之前**。判在回来时的话最后一轮会超发。
+    ///
+    /// 自证会变红:把 `take_runnable` 里 `self.visited + self.inflight >= MAX_DIRS`
+    /// 那一段删掉 —— `visited` 会冲到 2001 以上(或干脆不收敛被兜底循环截断)。
+    #[test]
+    fn the_directory_cap_is_enforced_before_the_requests_go_out() {
+        // 一棵永远生得出新目录的树:每个目录里再放一个目录。
+        let mut w = Walk::new(rp("/r"), "zzz".to_string(), false);
+        for _ in 0..100_000 {
+            let batch = w.take_runnable();
+            if batch.is_empty() {
+                break;
+            }
+            for d in batch {
+                w.accept(&d, Ok(vec![e("sub", EntryKind::Dir)]));
+            }
+        }
+        assert_eq!(w.status(), Some(Stop::DirCap));
+        assert!(
+            w.visited() <= MAX_DIRS,
+            "超发了:列了 {} 个目录,上限 {MAX_DIRS}",
+            w.visited()
+        );
+    }
+
+    /// 正好翻完不该被报成「封顶」—— 那两句话对用户的含义相反。
+    ///
+    /// 自证会变红:把 `take_runnable` 里 `if !self.pending.is_empty()` 那道
+    /// 门去掉,改成无条件 `self.stop = Some(Stop::DirCap)`。
+    #[test]
+    fn a_tree_that_ends_exactly_at_the_cap_is_exhausted_not_capped() {
+        let mut w = Walk::new(rp("/r"), "zzz".to_string(), false);
+        let mut left = MAX_DIRS;
+        for _ in 0..100_000 {
+            let batch = w.take_runnable();
+            if batch.is_empty() {
+                break;
+            }
+            for d in batch {
+                left -= 1;
+                // 最后一个目录不再生子目录 —— 树到此为止,正好 MAX_DIRS 个。
+                let kids = if left > 0 {
+                    vec![e("sub", EntryKind::Dir)]
+                } else {
+                    vec![]
+                };
+                w.accept(&d, Ok(kids));
+            }
+        }
+        assert_eq!(w.visited(), MAX_DIRS);
+        assert_eq!(w.status(), Some(Stop::Exhausted));
+    }
+
+    /// **收工判据是「待列空 且 在飞为零」**。只看 `pending` 的话,最后一批
+    /// 还在路上时就会报「搜完了、没找到」,而半秒后结果才回来。
+    ///
+    /// 自证会变红:把 `status` 里的 `&& self.inflight == 0` 删掉。
+    #[test]
+    fn a_search_with_requests_still_in_flight_is_not_finished() {
+        let mut w = Walk::new(rp("/r"), "a".to_string(), false);
+        let batch = w.take_runnable();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(w.status(), None, "发出去了还没回来,不算搜完");
+        w.accept(&batch[0], Ok(vec![e("a.txt", EntryKind::File)]));
+        assert_eq!(w.status(), Some(Stop::Exhausted));
+    }
+
+    /// 单条目录列不出来(权限不足)**不中止整次搜索**,但要留痕。
+    ///
+    /// 自证会变红:把 `accept` 里 `Err(_) => { self.skipped += 1; return; }`
+    /// 改成 `Err(_) => { self.stop = Some(Stop::Canceled); return; }`。
+    #[test]
+    fn a_directory_we_cannot_read_is_skipped_rather_than_killing_the_search() {
+        let tree = vec![
+            (
+                "/r",
+                vec![e("locked", EntryKind::Dir), e("ok", EntryKind::Dir)],
+            ),
+            // `/r/locked` 故意不在树里 —— `run` 会给它一个 Err。
+            ("/r/ok", vec![e("apple.txt", EntryKind::File)]),
+        ];
+        let (hits, stop, _) = run("/r", "apple", false, &tree);
+        assert_eq!(hits, vec!["ok/apple.txt"]);
+        assert_eq!(stop, Stop::Exhausted);
+    }
+
+    /// 取消之后不再吐任何请求 —— 吐了的话取消只是界面上的假象,链路还在跑。
+    ///
+    /// 自证会变红:把 `take_runnable` 开头 `if self.stop.is_some()` 那三行删掉。
+    #[test]
+    fn canceling_stops_new_requests_from_going_out() {
+        let mut w = Walk::new(rp("/r"), "a".to_string(), false);
+        let batch = w.take_runnable();
+        w.accept(
+            &batch[0],
+            Ok(vec![e("d1", EntryKind::Dir), e("d2", EntryKind::Dir)]),
+        );
+        w.cancel();
+        assert!(w.take_runnable().is_empty());
+        assert_eq!(w.status(), Some(Stop::Canceled));
+    }
+
+    /// BFS:浅的先出。深度优先会一头扎进某个 node_modules,封顶用完了还没
+    /// 回到第二层。
+    ///
+    /// 自证会变红:把 `pending` 换成 `Vec` + `pop()`(后进先出)。
+    #[test]
+    fn the_walk_goes_breadth_first_so_shallow_hits_come_out_first() {
+        let tree = vec![
+            (
+                "/r",
+                vec![e("deep", EntryKind::Dir), e("a-shallow", EntryKind::File)],
+            ),
+            ("/r/deep", vec![e("a-deep", EntryKind::File)]),
+        ];
+        let (hits, _, _) = run("/r", "a", false, &tree);
+        assert_eq!(hits, vec!["a-shallow", "deep/a-deep"]);
     }
 }
