@@ -605,7 +605,11 @@ mod tests {
     /// BFS:浅的先出。深度优先会一头扎进某个 node_modules,封顶用完了还没
     /// 回到第二层。
     ///
-    /// 自证会变红:把 `pending` 换成 `Vec` + `pop()`(后进先出)。
+    /// 自证会变红:把 `pending` 换成 `Vec` + `pop()`(后进先出)。**光靠上面
+    /// 那棵「一层只有一个目录」的树抓不住这条变异**——`pending` 里从来
+    /// 只有单个元素,先进先出还是后进先出看不出区别。第二棵树同一层放
+    /// 两个目录,`take_runnable` 会在**同一次调用**里把两个都取出来,
+    /// FIFO/LIFO 在“取出顺序”上才第一次出现分歧。
     #[test]
     fn the_walk_goes_breadth_first_so_shallow_hits_come_out_first() {
         let tree = vec![
@@ -617,5 +621,18 @@ mod tests {
         ];
         let (hits, _, _) = run("/r", "a", false, &tree);
         assert_eq!(hits, vec!["a-shallow", "deep/a-deep"]);
+
+        // 同一层两个目录:先列到的先出。
+        let siblings = vec![
+            ("/s", vec![e("d2", EntryKind::Dir), e("d1", EntryKind::Dir)]),
+            ("/s/d2", vec![e("x2", EntryKind::File)]),
+            ("/s/d1", vec![e("x1", EntryKind::File)]),
+        ];
+        let (hits, _, _) = run("/s", "x", false, &siblings);
+        assert_eq!(
+            hits,
+            vec!["d2/x2", "d1/x1"],
+            "`d2` 比 `d1` 先列到,该先出结果"
+        );
     }
 }
