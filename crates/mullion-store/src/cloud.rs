@@ -692,8 +692,11 @@ mod tests {
 
     /// F283:备份口令与 SK 一样,**明文一个字都不许落盘**。
     ///
-    /// 判据不是「字段名对不对」而是「文件字节里搜不到口令本身」——
-    /// 比照 `the_secret_key_never_hits_the_disk_in_the_clear` 的姿态。
+    /// 判据分两层。第一层「文件字节里搜不到口令本身」(比照
+    /// `the_secret_key_never_hits_the_disk_in_the_clear` 的姿态)**单独用是假绿**:
+    /// base64 之后的字节里本来就搜不到原文,于是一个「只 base64、根本没加密」
+    /// 的实现照样能过。所以第二层必须在:**换一把钥匙的库解不开它**。
+    /// 只有加密过的东西才有这个性质,base64 谁都解得开。
     #[test]
     fn the_backup_passphrase_never_hits_the_disk_in_the_clear() {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -718,6 +721,18 @@ mod tests {
         assert_eq!(
             passphrase(&back, &v).expect("解口令"),
             "correct horse battery staple"
+        );
+
+        // 第二层:另一台机器(另一把钥匙)的库解不开这段密文。
+        let other_dir = tempfile::tempdir().expect("临时目录");
+        let other = crate::vault::Vault::open(
+            other_dir.path().to_path_buf(),
+            &crate::master_key::InMemoryKey([9u8; 32]),
+        )
+        .expect("开库");
+        assert!(
+            passphrase(&back, &other).is_err(),
+            "换一把钥匙就解开了 —— 这段口令根本没被加密"
         );
     }
 
