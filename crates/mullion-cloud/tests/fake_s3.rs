@@ -130,7 +130,7 @@ fn client(port: u16) -> S3Client {
 fn a_put_sends_the_bytes_and_signs_the_request() {
     let (port, rx) = serve(vec![(200, String::new())]);
     client(port)
-        .put_no_overwrite("mullion/000001-x.mpk", b"hello", "20260915T101500Z")
+        .put_no_overwrite("mullion/000001-x.mpk", b"hello", "20260915T101500Z", false)
         .expect("PUT 应该成功");
     let seen = rx.recv().expect("服务端没收到请求");
     assert_eq!(seen.method, "PUT");
@@ -150,7 +150,7 @@ fn a_put_sends_the_bytes_and_signs_the_request() {
 #[test]
 fn a_put_always_asks_the_server_to_refuse_overwriting() {
     let (port, rx) = serve(vec![(200, String::new())]);
-    let _ = client(port).put_no_overwrite("k", b"x", "20260915T101500Z");
+    let _ = client(port).put_no_overwrite("k", b"x", "20260915T101500Z", false);
     let seen = rx.recv().expect("没收到请求");
     assert_eq!(
         seen.forbid_overwrite.as_deref(),
@@ -176,7 +176,7 @@ fn a_409_becomes_already_exists_not_a_generic_status_error() {
         "<Error><Code>FileAlreadyExists</Code></Error>".into(),
     )]);
     let e = client(port)
-        .put_no_overwrite("k", b"x", "20260915T101500Z")
+        .put_no_overwrite("k", b"x", "20260915T101500Z", false)
         .expect_err("409 应该报错");
     assert!(
         matches!(e, CloudError::AlreadyExists),
@@ -194,7 +194,7 @@ fn an_error_response_carries_the_server_message() {
         "<Error><Code>SignatureDoesNotMatch</Code></Error>".into(),
     )]);
     let e = client(port)
-        .put_no_overwrite("k", b"x", "20260915T101500Z")
+        .put_no_overwrite("k", b"x", "20260915T101500Z", false)
         .expect_err("403 应该报错");
     match e {
         CloudError::Status { code, body } => {
@@ -248,7 +248,7 @@ fn listing_follows_the_continuation_token_until_it_is_gone() {
 fn a_put_that_gets_redirected_is_reported_not_silently_turned_into_a_get() {
     let (port, _rx) = serve(vec![(301, String::new())]);
     let e = client(port)
-        .put_no_overwrite("k", b"x", "20260915T101500Z")
+        .put_no_overwrite("k", b"x", "20260915T101500Z", false)
         .expect_err("301 应该报错,而不是被降级成的匿名 GET 骗成功");
     match e {
         CloudError::Config(msg) => assert!(
@@ -270,6 +270,54 @@ fn a_list_that_gets_redirected_is_reported_not_partially_returned() {
     assert!(
         matches!(e, CloudError::Config(_)),
         "302 没被认成 Config,拿到 {e:?}"
+    );
+}
+
+/// F282:OSS 风格的 400 NotImplemented 必须被识别成专用错误,
+/// 混进 `Status` 的话 app 侧没法决定降级重试。
+#[test]
+fn an_oss_style_rejection_of_if_none_match_is_its_own_error() {
+    let (port, _rx) = serve(vec![(
+        400,
+        "<Error><Code>NotImplemented</Code>\
+         <Message>A header you provided implies functionality \
+         that is not implemented.</Message>\
+         <Header>If-None-Match</Header></Error>"
+            .into(),
+    )]);
+    let e = client(port)
+        .put_no_overwrite("k", b"x", "20260915T101500Z", false)
+        .expect_err("400 应该报错");
+    assert!(
+        matches!(e, CloudError::IfNoneMatchRejected),
+        "OSS 的 400 NotImplemented 没被认成 IfNoneMatchRejected,拿到的是 {e:?}"
+    );
+}
+
+/// F282:开关拧上之后,请求里不许再出现 `if-none-match` 头,SignedHeaders 里
+/// 也不许有它(头不发签名却签了,OSS 回 `SignatureDoesNotMatch`,比缺头还
+/// 隐蔽);`x-oss-forbid-overwrite` 必须还在 —— 防覆盖不缩水。
+#[test]
+fn the_skip_flag_drops_the_header_but_keeps_the_oss_one() {
+    let (port, rx) = serve(vec![(200, String::new())]);
+    client(port)
+        .put_no_overwrite("k", b"x", "20260915T101500Z", true)
+        .expect("PUT 应该成功");
+    let seen = rx.recv().expect("没收到请求");
+    assert_eq!(
+        seen.if_none_match, None,
+        "skip=true 之后不该再发 If-None-Match 头"
+    );
+    assert_eq!(
+        seen.forbid_overwrite.as_deref(),
+        Some("true"),
+        "skip=true 不该连 x-oss-forbid-overwrite 也丢掉 —— 防覆盖不能缩水"
+    );
+    assert!(
+        !seen.authorization.contains("if-none-match"),
+        "SignedHeaders 里还留着 if-none-match —— 头没发但签了名,OSS 会回 \
+         SignatureDoesNotMatch,比缺头还隐蔽:{}",
+        seen.authorization
     );
 }
 

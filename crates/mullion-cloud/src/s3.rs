@@ -87,13 +87,23 @@ impl S3Client {
         key: &str,
         body: &[u8],
         amz_date: &str,
+        skip_if_none_match: bool,
     ) -> Result<(), CloudError> {
         let t = self.endpoint.target(key);
         let payload = sha256_hex(body);
         // 阿里云 OSS 认 `x-oss-forbid-overwrite`;S3/R2/MinIO 认
-        // `If-None-Match: *`。**两个都发** —— 不认识的那个会被忽略,而漏发
-        // 任一个都意味着在对应的服务端上完全没有并发保护(且零报错)。
-        let extra = [("if-none-match", "*"), ("x-oss-forbid-overwrite", "true")];
+        // `If-None-Match: *`。**默认两个都发** —— 不认识的那个本应被忽略,
+        // 漏发任一个都意味着在对应的服务端上完全没有并发保护(且零报错)。
+        //
+        // F282:上面这条「不认识就忽略」的假设对 OSS 是事实错误 —— OSS 对
+        // PUT 上的 `If-None-Match` 回 400 NotImplemented,不是忽略。调用方
+        // 一旦从 `IfNoneMatchRejected` 学到这一点,就会把 `skip_if_none_match`
+        // 拧成 true,之后只发 `x-oss-forbid-overwrite`,防覆盖不缩水。
+        let extra: Vec<(&str, &str)> = if skip_if_none_match {
+            vec![("x-oss-forbid-overwrite", "true")]
+        } else {
+            vec![("if-none-match", "*"), ("x-oss-forbid-overwrite", "true")]
+        };
         let auth = sigv4::authorization(
             &sigv4::Request {
                 method: "PUT",
@@ -134,6 +144,21 @@ impl S3Client {
         // 信息(Location 指向哪)扔掉。
         if (300..400).contains(&code) {
             return Err(redirect_err(code, &resp));
+        }
+        // F282:OSS 对 PUT 上的 `If-None-Match` 回 400 NotImplemented,正文点名
+        // `<Header>If-None-Match</Header>`。**必须认出这个专用形状** ——
+        // 混进下面的 `Status` 里,调用方就没法决定「摘掉这个头重试」,只能
+        // 把整次上传报失败给用户。用两个子串而不是完整正文匹配:不同版本的
+        // OSS 错误 XML 措辞可能有出入,但 `Code` 与被点名的 `Header` 稳定。
+        if code == 400 {
+            let body = body_text(resp);
+            if body.contains("NotImplemented") && body.contains("If-None-Match") {
+                return Err(CloudError::IfNoneMatchRejected);
+            }
+            return Err(CloudError::Status {
+                code,
+                body: body.chars().take(400).collect(),
+            });
         }
         Err(status_err(code, resp))
     }

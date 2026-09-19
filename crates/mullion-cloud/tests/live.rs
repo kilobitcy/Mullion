@@ -62,7 +62,7 @@ fn a_real_bucket_accepts_our_signature_and_refuses_an_overwrite() {
     // 不要预设失败原因:`MULLION_CLOUD_STAMP` 一旦被 `export` 出去反复用,
     // 第二次跑的这一发就会因为 key 已存在而被拒,真实原因是 `AlreadyExists`,
     // 跟签名权限毫无关系。咬定「多半是签名或权限」会把人往错误方向带。
-    if let Err(e) = client.put_no_overwrite(&key, b"mullion live probe", &stamp) {
+    if let Err(e) = client.put_no_overwrite(&key, b"mullion live probe", &stamp, false) {
         panic!(
             "第一次 PUT 失败:{e:?} —— 若是 AlreadyExists,多半是 \
              MULLION_CLOUD_STAMP 被复用、撞上了已存在的 key(重新 \
@@ -72,7 +72,7 @@ fn a_real_bucket_accepts_our_signature_and_refuses_an_overwrite() {
 
     // 第二次必须被拒。**这一条是追加式布局全部并发保护的真机证明** ——
     // 若真实服务端忽略了那两个头,本地假 server 是测不出来的。
-    let again = client.put_no_overwrite(&key, b"x", &stamp);
+    let again = client.put_no_overwrite(&key, b"x", &stamp, false);
     assert!(
         matches!(again, Err(mullion_cloud::CloudError::AlreadyExists)),
         "服务端没有拒绝覆盖,拿到的是 {again:?} —— 并发保护在这台服务端上不成立"
