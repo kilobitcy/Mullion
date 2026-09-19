@@ -788,6 +788,13 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按「导入并替换」
     /// 会在 egui 的 discard 趟被静默吃掉。
     pub pack: Option<pack_dialog::PackOut>,
+    /// F281:状态栏错误格上按了「复制」。Ctrl+C 被键盘分流判给了终端(T8),
+    /// egui 收不到复制键,这颗按钮是用户唯一的带走通道 —— 剪贴板是 IO,
+    /// 由 `app.rs` 摸(同 `annotate_export` 的分层理由)。
+    ///
+    /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按钮按下去
+    /// 毫无反应。
+    pub copy_error: bool,
 }
 
 /// 指针此刻还在**文件面板**里没有(F59 / 设计 N1 的判据,2026-08-20 修正)。
@@ -989,6 +996,7 @@ pub fn build_ui(
         frame.selection_path,
         // F273:云端备份结论,住在 `UiState`(见 `cloud_status` 字段文档)。
         ui_state.cloud_status.as_ref(),
+        &mut actions.copy_error,
     );
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {

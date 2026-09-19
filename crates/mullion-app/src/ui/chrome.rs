@@ -524,6 +524,9 @@ pub fn status_bar(
     selection_path: Option<&crate::files::reveal::StatusPath>,
     // F273:云端备份结论。`None` = 没配置,不占格(同 `tunnel` 那条的理由)。
     cloud: Option<&CloudCell>,
+    // F281:「复制」按钮按下与否,写 intent 回去 —— 剪贴板是 IO,`ui/` 这层
+    // 只画不摸(同 `annotate_export` 的分层理由)。
+    copy_error: &mut bool,
 ) {
     let (left, right) = status_text(panes, connected);
     let bar = egui::TopBottomPanel::bottom("status")
@@ -566,7 +569,21 @@ pub fn status_bar(
                 // last_error 必须可见:右对齐区先画它,再画常规右栏。
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(err) = last_error {
+                        // F281:报错要能带走。划选复制走不通 —— Ctrl+C 被键盘
+                        // 分流判给了终端(T8),egui 根本收不到;所以给一颗明
+                        // 按钮,写 intent 由 app 层去摸剪贴板(ui 层不做 IO)。
+                        //
+                        // RTL 布局里先 add 的画在最右:文字先画,保持在
+                        // `last_error` 原来那个「最靠右、必然可见」的位置;
+                        // 按钮后画,落在文字左边紧挨着它。
                         ui.colored_label(theme::c32(t.danger_text), err);
+                        if ui
+                            .small_button("复制")
+                            .on_hover_text("复制这条报错")
+                            .clicked()
+                        {
+                            *copy_error = true;
+                        }
                         ui.separator();
                     }
                     // F40~F44:自动化状态排在错误之后、常规右栏之前。
@@ -736,6 +753,7 @@ mod tests {
                 session_color,
                 None,
                 None,
+                &mut false,
             );
         });
         let out = ctx.run(Default::default(), |ctx| {
@@ -750,6 +768,7 @@ mod tests {
                 session_color,
                 None,
                 None,
+                &mut false,
             );
         });
         count_shapes(&out.shapes)
@@ -779,6 +798,7 @@ mod tests {
                     None,
                     selection_path,
                     cloud,
+                    &mut false,
                 );
             });
             acc.clear();
@@ -979,6 +999,34 @@ mod tests {
         );
     }
 
+    /// F281:错误格必须带复制按钮,且按钮只写 intent(出参),不在 ui 层摸
+    /// 剪贴板 —— Ctrl+C 进不了 egui(T8),这颗按钮是用户唯一的带走通道。
+    ///
+    /// 自证会变红:把 `*copy_error = true` 删掉,或者在 `status_bar` 体内
+    /// 直接写一句摸剪贴板的代码。
+    #[test]
+    fn the_error_cell_writes_a_copy_intent_instead_of_touching_the_clipboard() {
+        let src = include_str!("chrome.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面会考到测试自己"
+        );
+        let body = prod
+            .split("pub fn status_bar(")
+            .nth(1)
+            .expect("没有 status_bar");
+        let body = body.split("\nfn ").next().unwrap_or(body);
+        assert!(body.contains("*copy_error = true"), "复制按钮没写 intent");
+        assert!(
+            !body.contains("clipboard"),
+            "chrome 里直接摸了剪贴板 —— 分层破了(IO 该在 app.rs 里做)"
+        );
+    }
+
     /// F100:菜单栏与状态栏也要登记 —— 走查里「状态栏那行字太靠边」这类反馈
     /// 很常见,标不到它就得回到「用嘴描述」。
     ///
@@ -1011,6 +1059,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &mut false,
                 );
                 paths = annotate::spot_paths(ctx);
             });
