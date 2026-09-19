@@ -2401,6 +2401,34 @@ impl PanelFrame {
             PanelColumn::Local => &mut self.local,
         }
     }
+
+    /// F278:无条件作废在途搜索。换机器/主动关闭这类「身份变了」的场合用。
+    ///
+    /// **两头都要动**:只清 `find` 而不递增 `find_seq`,在途的 `FindListed`
+    /// 回来时序号仍然对得上,会被**下一次**搜索当成自己的结果收下。
+    pub fn drop_find(&mut self) {
+        self.find_seq += 1;
+        self.find = None;
+    }
+
+    /// F278:远端栏要换到 `dir` 了 —— **根变了才**作废在途搜索。
+    ///
+    /// **判据是「目标目录 ≠ 当前 cwd」,不是「这个动作叫什么」。**
+    /// 按动作名列举的那一版漏掉了同机重连(`accept_sftp_opened` 压根不经过
+    /// `apply_remote_file_action`),而「列举式门控在加档时必然漏」是本项目
+    /// 反复踩中的形状。换成内容判据之后,凡是会换根的路径都只能从
+    /// `begin_load` 前面过,一处也漏不掉。
+    ///
+    /// 这个判据同时天然放过 `Refresh`:它的目标就是当前 cwd,搜索中按 F5
+    /// 结果不该消失。
+    ///
+    /// **换机器不能用这个**,要用 `drop_find`:新机器上的路径字符串完全可能
+    /// 与旧机器相同,那时"根没变"而列表里全是另一台机器上的文件。
+    pub fn drop_find_on_reroot(&mut self, dir: &mullion_ssh::sftp::RemotePath) {
+        if self.find.is_some() && *dir != self.remote.cwd {
+            self.drop_find();
+        }
+    }
 }
 
 /// 默认侧栏宽度(point)。见 `UiState::files_sidebar_w` 的文档注释 ——
@@ -8975,6 +9003,94 @@ mod tests {
             find_text_pos(&shapes, ELLIPSIS).is_some(),
             "标题被截断了却没画省略号"
         );
+    }
+
+    /// F278:`drop_find` 必须**递增 `find_seq`**,不能只清 `find`。
+    ///
+    /// 不递增的话,在途的那次 `FindListed` 回来时序号仍然对得上 —— 会被
+    /// **下一次**搜索(复用同一个旧序号)当成自己的结果收下,列表里混进
+    /// 上一次搜索的残留。
+    ///
+    /// 自证会变红:把 `drop_find` 里的 `self.find_seq += 1;` 删掉。
+    #[test]
+    fn dropping_the_find_bumps_the_sequence_so_late_results_cannot_be_adopted() {
+        let mut frame = PanelFrame {
+            find: Some(Find {
+                buf: "q".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before = frame.find_seq;
+        frame.drop_find();
+        assert!(frame.find.is_none(), "没清 find");
+        assert!(
+            frame.find_seq > before,
+            "没递增 find_seq({before} -> {}),在途结果会被下一次搜索收下",
+            frame.find_seq
+        );
+    }
+
+    /// F278:换到一个**不同**目录 = 根变了,在途搜索必须作废。
+    ///
+    /// 自证会变红:把 `drop_find_on_reroot` 的条件改成恒真/恒假。
+    #[test]
+    fn going_to_a_different_directory_throws_away_the_running_search() {
+        let mut frame = PanelFrame {
+            remote: PaneState::new(rp("/a")),
+            find: Some(Find {
+                buf: "q".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before = frame.find_seq;
+        frame.drop_find_on_reroot(&rp("/b"));
+        assert!(frame.find.is_none(), "换了目录,搜索条却还开着");
+        assert!(
+            frame.find_seq > before,
+            "换目录之后 find_seq 没变,没作废在途结果"
+        );
+    }
+
+    /// F278:刷新(目标 == 当前 cwd)**不能**打断正在跑的搜索 —— 按 F5 的
+    /// 用户没有换根的意图。
+    ///
+    /// 两头都断言:只看 `find` 还在的话,「白白递增 `find_seq`」这种会让
+    /// 在途结果全部报废的错就溜过去了。
+    ///
+    /// 自证会变红:把 `drop_find_on_reroot` 的判据改成恒真(不比较 cwd)。
+    #[test]
+    fn refreshing_the_same_directory_keeps_the_running_search() {
+        let mut frame = PanelFrame {
+            remote: PaneState::new(rp("/a")),
+            find: Some(Find {
+                buf: "q".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before_seq = frame.find_seq;
+        frame.drop_find_on_reroot(&rp("/a"));
+        assert!(frame.find.is_some(), "刷新当前目录把搜索条关掉了");
+        assert_eq!(
+            frame.find_seq, before_seq,
+            "刷新当前目录不该动 find_seq —— 在途结果不该被作废"
+        );
+    }
+
+    /// F278:没有搜索在跑的时候换根是纯粹的 no-op —— 不该平白递增 `find_seq`。
+    #[test]
+    fn a_reroot_with_no_search_running_is_a_no_op() {
+        let mut frame = PanelFrame {
+            remote: PaneState::new(rp("/a")),
+            find: None,
+            ..Default::default()
+        };
+        let before = frame.find_seq;
+        frame.drop_find_on_reroot(&rp("/b"));
+        assert!(frame.find.is_none());
+        assert_eq!(frame.find_seq, before, "没有搜索在跑,不该动 find_seq");
     }
 
     /// F278:四种收场 + 「Exhausted 但有命中」共五档,各说各的话。**「翻完了,

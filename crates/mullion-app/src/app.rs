@@ -5742,9 +5742,10 @@ impl App {
                 // 天然摸不到 —— 不清的话,新机器上回来的目录会被塞进旧机器
                 // 那次遍历里,结果列表变成两台机器的文件混在一起,而相对
                 // 路径看上去完全正常。(F220 的 `clip` 在这里踩过同一个坑,
-                // 就在上面几行。)
-                files.find_seq += 1;
-                files.find = None;
+                // 就在上面几行。)**必须无条件清**(`drop_find`,不是
+                // `drop_find_on_reroot`):新机器上的路径字符串完全可能与
+                // 旧机器相同,那时候"根没变"但列表里全是另一台机器的文件。
+                files.drop_find();
             }
         }
         self.trigger_sftp_open(generation);
@@ -6565,25 +6566,28 @@ impl App {
                 return;
             }
         };
-        // F278:换目录 = 搜索的根变了。**只对真正换目录的那几个动作** ——
-        // `Refresh` 不算(根没变),`FindPick` 自己已经关过搜索条了。
+        // F249:探测那一趟不动 `cwd`、不进 `Loading` —— 它还不知道要去哪儿。
+        // 借 `files` 到此为止(下面几行只用 `self`),两条路各发各的请求。
+        //
+        // F278:换根(`target` != 当前 cwd)= 搜索的根变了,作废在途搜索;
+        // 判据是**内容**而不是动作名(`drop_find_on_reroot` 的文档有完整
+        // 理由:按动作名列举的那版漏掉了 `accept_sftp_opened` 那条同机重连
+        // 路径)。**只放在 `begin_load` 分支里,不放在 `probe` 分支**——
+        // `probe` 只是问一句「这是文件还是目录」,`target` 在探测阶段可能是
+        // 当前目录下的一个文件(`target != cwd` 但并不换根),真正的换根
+        // (如果有)要等 `accept_path_probe` 解出答案后重新调这个函数、
+        // 落到这个分支才发生。放在 `match probe` 之前会在探测同目录下
+        // 的文件时误伤仍在跑的搜索。
         //
         // 不清的话:结果列表还挂着旧根,而 `relative()` 拿旧根去切新路径,
         // 切不出来就原样吐绝对路径 —— 列表突然一半相对一半绝对,而没有
         // 任何报错。
-        if matches!(
-            action,
-            FileAction::Goto(_) | FileAction::GotoInput(_) | FileAction::Up
-        ) && files.find.is_some()
-        {
-            files.find_seq += 1;
-            files.find = None;
-        }
-        // F249:探测那一趟不动 `cwd`、不进 `Loading` —— 它还不知道要去哪儿。
-        // 借 `files` 到此为止(下面几行只用 `self`),两条路各发各的请求。
         let seq = match probe {
             Some(seq) => seq,
-            None => files.remote.begin_load(target.clone()),
+            None => {
+                files.drop_find_on_reroot(&target);
+                files.remote.begin_load(target.clone())
+            }
         };
         let task = match probe {
             Some(_) => {
@@ -8465,6 +8469,13 @@ impl App {
                     // 两台机器上是两个人,不清就是把 A 机的名字画在 B 机的
                     // 文件上(换节点、断线重连都会走到这里)。
                     files.remote.owners.clear();
+                    // F278:这条正是「列举式门控在加档时必然漏」按动作名列举
+                    // 的那一版漏掉的换根路径——终端标签侧栏的 sftp channel
+                    // 能单独断开重连,完全不经过 `apply_remote_file_action`。
+                    // 重开的目标目录取自这次上报的 `dir`,与断线前侧栏浏览的
+                    // `files.remote.cwd` 完全可能不同,不清的话结果列表会
+                    // 一半相对一半绝对。
+                    files.drop_find_on_reroot(&dir);
                     files.remote.begin_load(dir.clone())
                 };
                 let task =
@@ -25183,111 +25194,113 @@ mod tests {
         );
     }
 
-    /// F278:换机器要清掉搜索。不清的话新机器回来的目录会塞进旧机器那次
-    /// 遍历里 —— 结果列表变成两台机器的文件混在一起,而相对路径看上去
-    /// 完全正常。(F220 的 `clip` 在同一个函数里踩过同一个坑。)
+    /// F278 复核闭环:换机器要**无条件**清掉搜索(`drop_find`)——新机器上
+    /// 的路径字符串完全可能与旧机器相同,不能拿内容判据(`drop_find_on_reroot`
+    /// 比较的是路径),那样会漏判。
     ///
-    /// 两头都要钉:只清了 `find` 而没递增 `find_seq` 的话,在途结果会被
-    /// 下一次搜索收下(旧机器的答案顶替新机器)。
+    /// 真正的行为(递增 `find_seq` 且清空 `find`)已经由 `files_panel.rs` 里
+    /// `dropping_the_find_bumps_the_sequence_so_late_results_cannot_be_adopted`
+    /// 钉死;这条测试收窄成只钉接线——`reopen_sftp_on_focused_host` 必须调
+    /// 的是 `drop_find()`,不是 `drop_find_on_reroot(..)`(后者在路径字符串
+    /// 撞车时会误判成"根没变"而放过一次该清的搜索)。
     ///
-    /// 自证会变红:把 `reopen_sftp_on_focused_host` 里那两行删掉;或者只删
-    /// `files.find_seq += 1;` 那一行(保留 `files.find = None;`)。
+    /// 自证会变红:把 `files.drop_find();` 换成
+    /// `files.drop_find_on_reroot(&files.remote.cwd);`(或者删掉整行)。
     #[test]
     fn switching_hosts_throws_away_the_running_search() {
         let body = strip_comments(body_of(
             prod_src(),
             "fn reopen_sftp_on_focused_host(&mut self, generation: u64) {",
         ));
-        // 唯一性先钉死:占坑攻击(在别处再塞一份 `files.find = None;`)会让
-        // count 偏离 1,在下面单纯的 `contains` 判据被绕过之前先在这里就红。
-        assert_eq!(
-            body.matches("files.find = None;").count(),
-            1,
-            "`files.find = None;` 不止出现一次:{body}"
-        );
-        assert_eq!(
-            body.matches("files.find_seq += 1;").count(),
-            1,
-            "`files.find_seq += 1;` 不止出现一次:{body}"
-        );
-        // 单纯计数堵不住「原地套一层 `if false { .. }` 把真代码变成死代码」
-        // 这种攻击 —— 字面串原样还在、count 仍是 1,但已经永远不会执行,
-        // clippy `-D warnings` 对这个也不报警(复核实测过)。生产代码没有
-        // 正当理由写 `if false`,直接钉「不存在」堵死这条路。
         assert!(
-            !body.contains("if false"),
-            "函数体里出现了 `if false` —— 像是把清空搜索的代码原地做成了\
-             永远不会执行的死代码:{body}"
+            body.contains("files.drop_find();"),
+            "换机器没有调用 `drop_find()` —— 新机器的目录可能被塞进旧机器\
+             那次遍历里,或者路径字符串撞车时被内容判据误判成没换根:{body}"
         );
         assert!(
-            body.contains("files.find = None;"),
-            "换机器没有清掉 find —— 新机器的目录会被塞进旧机器那次遍历里:{body}"
-        );
-        assert!(
-            body.contains("files.find_seq += 1;"),
-            "换机器清了 find 但没递增 find_seq —— 在途结果会被下一次搜索收下:{body}"
+            !body.contains("drop_find_on_reroot"),
+            "换机器不能走内容判据(`drop_find_on_reroot`)—— 新机器上的路径\
+             字符串完全可能与旧机器相同,那时候「根没变」但列表里全是另一台\
+             机器的文件:{body}"
         );
     }
 
-    /// F278:换目录(`Goto`/`GotoInput`/`Up`)要清掉搜索,但 `Refresh` **不算**
-    /// 换目录(根没变)。
+    /// F278 复核闭环:凡是会让远端栏换到一个新目录的路径,都必须先过
+    /// `drop_find_on_reroot`(内容判据:目标 != 当前 cwd 才清),不能再按
+    /// 动作名列举。
     ///
-    /// 一起清掉的话,搜索中按一下 F5 结果就没了,而用户只是想刷新。
+    /// 按动作名列举的那一版(`matches!(action, Goto | GotoInput | Up)`)
+    /// 复核实测漏了一条:终端标签侧栏的 sftp channel 能单独断开重连
+    /// (`FileAction::Reconnect` → `trigger_sftp_open` → `accept_sftp_opened`),
+    /// 那条 Ok 分支直接 `begin_load`,完全不经过 `apply_remote_file_action`。
+    /// 换成「目标目录是不是当前 cwd」这个内容判据之后,只要还会调
+    /// `begin_load`,就一定会先过这道判据——`accept_sftp_opened` 与
+    /// `apply_remote_file_action` 两处各接一遍,一处也漏不掉。
     ///
-    /// 两头都要钉:只清了 `find` 而没递增 `find_seq` 的话,在途结果会被
-    /// 下一次搜索收下。
-    ///
-    /// 自证会变红:把 `matches!` 里加上 `| FileAction::Refresh`;或者把
-    /// `files.find_seq += 1;` 那一行删掉(保留 `files.find = None;`)。
+    /// 自证会变红:
+    /// - 删掉 `accept_sftp_opened` 里的 `drop_find_on_reroot(&dir);`;
+    /// - 或者把 `apply_remote_file_action` 里的调用挪到 `begin_load(` 之后。
     #[test]
-    fn changing_directory_drops_the_search_but_refreshing_does_not() {
-        let body = strip_comments(body_of(prod_src(), "fn apply_remote_file_action("));
-        // 唯一性先钉死:占坑攻击(塞一段 `if false { files.find = None; }`
-        // 之类的死代码占住靠前的文本位置)会让 count 变成 2,在下面的位置
-        // 判据被绕过之前先在这里就红。
+    fn every_remote_reroot_goes_through_the_content_based_drop() {
+        let apply_body = strip_comments(body_of(prod_src(), "fn apply_remote_file_action("));
         assert_eq!(
-            body.matches("files.find = None;").count(),
+            apply_body.matches("drop_find_on_reroot(").count(),
             1,
-            "`files.find = None;` 不止出现一次(在 apply_remote_file_action \
-             这一个函数体里)——多一处占位就能把下面的位置判据骗过去:{body}"
+            "`apply_remote_file_action` 里 `drop_find_on_reroot(` 不止出现\
+             一次——多一处占位就能把下面的位置判据骗过去:{apply_body}"
         );
-        assert_eq!(
-            body.matches("files.find_seq += 1;").count(),
-            1,
-            "`files.find_seq += 1;` 不止出现一次:{body}"
+        let reroot_at = apply_body.find("drop_find_on_reroot(").expect(
+            "`apply_remote_file_action` 没有调用 `drop_find_on_reroot` \
+                 —— 换目录不再作废在途搜索了",
         );
-        // `FileAction::Refresh` 本来只在函数前半的 `target` 大 match 里
-        // 出现一次(`FileAction::Refresh => files.remote.cwd.clone(),`)。
-        // 把它也塞进换目录守卫的 `matches!` 模式串会让这里的计数变成 2 ——
-        // 这条判据不依赖具体格式/换行,rustfmt 怎么重排都躲不掉。
-        assert_eq!(
-            body.matches("FileAction::Refresh").count(),
-            1,
-            "`FileAction::Refresh` 不止出现一次 —— 像是被混进了换目录守卫,\
-             搜索中按一下刷新,结果就被清掉了:{body}"
-        );
-        // 同 `switching_hosts_throws_away_the_running_search`:单纯计数堵不住
-        // 「原地套一层 `if false { .. }` 把真代码变成死代码」——字面串与顺序
-        // 都对,但永远不会执行。生产代码没有正当理由写 `if false`。
+        let begin_load_at = apply_body
+            .find("begin_load(")
+            .expect("`apply_remote_file_action` 里 `begin_load` 不见了 —— 锚点可能失效");
         assert!(
-            !body.contains("if false"),
-            "函数体里出现了 `if false` —— 像是把换目录清空搜索的代码原地做成了\
-             永远不会执行的死代码:{body}"
+            reroot_at < begin_load_at,
+            "`drop_find_on_reroot` 必须排在 `begin_load` 之前,否则换根之后\
+             再清,新目录的搜索状态已经被污染了一帧:{apply_body}"
         );
-        let door = body
-            .find("FileAction::Goto(_) | FileAction::GotoInput(_) | FileAction::Up")
-            .expect("换目录守卫的三个变体不见了 —— 换目录时搜索不再作废");
-        let clear = body
-            .find("files.find = None;")
-            .expect("换目录守卫没有清掉 find");
-        let bump = body
-            .find("files.find_seq += 1;")
-            .expect("换目录时没有递增 find_seq —— 在途结果会被下一次搜索收下");
+
+        let opened_body = strip_comments(body_of(prod_src(), "fn accept_sftp_opened("));
+        assert_eq!(
+            opened_body.matches("drop_find_on_reroot(").count(),
+            1,
+            "`accept_sftp_opened` 里 `drop_find_on_reroot(` 不止出现一次:\
+             {opened_body}"
+        );
         assert!(
-            door < bump && bump < clear,
-            "换目录守卫的匹配式 / 递增序号 / 清空 find 三者顺序不对,或者\
-             `files.find = None;`/`files.find_seq += 1;` 接到了别的分支上:\
-             {body}"
+            opened_body.contains("drop_find_on_reroot(&dir)"),
+            "`accept_sftp_opened` 没有在 `begin_load` 之前调用\
+             `drop_find_on_reroot` —— 这正是按动作名列举时漏掉的那条同机\
+             重连路径(终端标签侧栏的 sftp channel 单独断开重连,不经过\
+             `apply_remote_file_action`):{opened_body}"
+        );
+    }
+
+    /// F278 复核闭环:换根判据不能靠列举动作名重新长回来 —— `app.rs` 的
+    /// 生产代码里,`find_seq += 1` 只应该出现在 F278 搜索状态机自己的四个
+    /// 方法里(`toggle_files_find`/`start_files_find`/`cancel_files_find`/
+    /// `close_files_find`),不该再出现在任何"换根"路径上(那些一律走
+    /// `PanelFrame::drop_find`/`drop_find_on_reroot`,递增逻辑收在
+    /// `files_panel.rs` 里,不在 `app.rs` 里重复)。
+    ///
+    /// 这是一条全局不变量,不针对某一个函数——加一处新的 `find_seq += 1`
+    /// 就必须回来想清楚:这是搜索状态机本身在动,还是又一条该走
+    /// `drop_find`/`drop_find_on_reroot` 的换根路径被人手写了递增。
+    ///
+    /// 自证会变红:在 `app.rs` 的生产代码里(哪怕是无关函数里)新加一句
+    /// `files.find_seq += 1;`。
+    #[test]
+    fn find_seq_is_only_bumped_by_the_search_state_machine_itself() {
+        let body = strip_comments(prod_src());
+        assert_eq!(
+            body.matches("find_seq += 1").count(),
+            4,
+            "`app.rs` 生产代码里 `find_seq += 1` 的出现次数变了(现在应恰好\
+             是 4:toggle/start/cancel/close 四个搜索状态机方法各一处)——\
+             如果是新加的一处,大概率是又一条换根路径被手写了递增,该改成\
+             调 `PanelFrame::drop_find`/`drop_find_on_reroot`:{body}"
         );
     }
 
