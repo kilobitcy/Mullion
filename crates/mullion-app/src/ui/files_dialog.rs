@@ -284,7 +284,7 @@ pub fn title_of(d: &FilesDialog) -> &'static str {
     }
 }
 
-/// 六个框共用的外壳。F277 起换成 `egui::Modal`:带变暗遮罩、挡下层点击 ——
+/// 五个框共用的外壳。F277 起换成 `egui::Modal`:带变暗遮罩、挡下层点击 ——
 /// 「文件已存在」这类框此前是普通居中 `Window`,不挡下层点击也没有遮罩,
 /// 淹在近黑的终端画面里(实报)。`Modal` 没有标题栏,标题自己画(同
 /// `paste.rs`/`host_key.rs`)。
