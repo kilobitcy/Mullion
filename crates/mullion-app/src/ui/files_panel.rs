@@ -1109,7 +1109,14 @@ pub fn show(
             );
             // **只在刚打开那一刻请求一次焦点**。无条件每帧 `request_focus()`
             // 会让它跟路径条的输入框互抢,先进去的那个永远退不出来。
-            if f.focus_pending {
+            //
+            // 第二个条件是**自愈**,不是便利:`Modal::FilesFind` 开着的时候
+            // 整个窗口的键盘都路由给 egui(`route_focused` 先判 `modal_open`),
+            // 所以「搜索条开着而 egui 谁都没焦点」等于**键全部掉地上**,终端
+            // 也收不到。这种状态真会出现 —— 用户切到别的标签再切回来,这一
+            // 路上搜索条没被画过,egui 会把焦点丢掉。`focused().is_none()`
+            // 这道门保证它只在没人要键的时候才抢,跟路径框互抢的老问题不会回来。
+            if f.focus_pending || ui.ctx().memory(|m| m.focused()).is_none() {
                 resp.request_focus();
                 f.focus_pending = false;
             }

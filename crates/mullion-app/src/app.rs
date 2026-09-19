@@ -1358,14 +1358,23 @@ fn files_new_file_editing_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> boo
         .is_some_and(|f| f.remote.new_edit.is_some())
 }
 
-/// F278:有没有任何一个标签的文件面板开着搜索条。
+/// F278:**此刻可见的**那个文件面板开不开着搜索条。
 ///
-/// **遍历全部标签**,不只活动那个:搜索条开着的时候用户完全可能切到别的
-/// 标签 —— 按活动标签判的话,切回来时那个框又收不到键了,而且没有任何提示。
-fn files_finding_of(tabs: &Tabs<TabContent>) -> bool {
-    tabs.iter()
-        .filter_map(|t| t.content.files_panel())
-        .any(|f| f.find.is_some())
+/// **必须经 `files_owner_generation_of` 收窄到活动标签**,与另外三个内联
+/// 输入框(`files_path_editing_of` / `files_renaming_of` /
+/// `files_new_file_editing_of`)同一条链。这里曾经写成 `tabs.iter()` 遍历
+/// 全部标签,理由是「切走再切回来别丢焦点」—— 那个便利的真实代价是:
+/// `Modal::FilesFind` 一旦为真,`modal_open()` 是**窗口级单值**,
+/// `route_focused` 又把 `modal_open` 排在 `focus == FilesPanel` 之前,于是
+/// 后台标签上一条没人看见的搜索条会把**所有**标签的键盘全部路由给 egui,
+/// 终端一个键都收不到(T8 家族:画面完全正常、无任何线索、无自愈路径)。
+/// 「切回来不丢焦点」改由 `files_panel.rs` 里那句「搜索条开着而 egui 谁都
+/// 没焦点 → 自己要回来」兜底,不拿全局键盘路由去换。
+fn files_finding_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> bool {
+    files_owner_generation_of(tabs, sidebar_open)
+        .and_then(|g| tabs.by_generation(g))
+        .and_then(|t| t.content.files_panel())
+        .is_some_and(|f| f.find.is_some())
 }
 
 /// `App::effective_focus` 的纯逻辑核心,理由同上。三条分支里前两条(活动标签
@@ -4883,13 +4892,13 @@ impl App {
         files_new_file_editing_of(&self.tabs, self.ui.files_sidebar_open)
     }
 
-    /// F278:哪个标签的文件面板此刻开着搜索条。
+    /// F278:此刻可见的那个文件面板开不开着搜索条。
     ///
     /// 拆成自由函数的理由同 `files_path_editing_of`:`app.rs` 的测试从来
     /// 构造不出一个 `App`(要窗口/GPU),挂成 `&self` 方法的话这条判据根本
     /// 没法单测,而它正是 `Modal::FilesFind` 唯一读的东西。
     fn files_finding(&self) -> bool {
-        files_finding_of(&self.tabs)
+        files_finding_of(&self.tabs, self.ui.files_sidebar_open)
     }
 
     /// 这一帧真正生效的键盘焦点(协调者修订 2)。裸的 `self.focus` 只是用户
@@ -29419,18 +29428,60 @@ mod tests {
         );
     }
 
-    /// F278:搜索条开着的时候用户完全可能切到别的标签 —— 按活动标签判的话,
-    /// 切走再切回来,搜索框又收不到键了,而且没有任何提示。
+    /// F278:**后台标签上的搜索条不许吃掉前台标签的键盘**。
     ///
-    /// 自证会变红:把 `files_finding_of` 里的 `tabs.iter()` 换成只看活动标签。
+    /// `modal_open()` 是窗口级单值,而 `route_focused` 把 `modal_open` 排在
+    /// `focus == FilesPanel` 之前 —— `Modal::FilesFind` 判成真的那一刻,
+    /// 窗口里**所有**标签的键盘都归 egui,终端一个键都收不到。所以这条判据
+    /// 必须跟另外三个内联输入框走同一条链(`files_owner_generation_of`,
+    /// 结构上只可能指向活动标签 + 侧栏归属),不能自己去遍历全部标签。
+    ///
+    /// 这条测试的前身断言的恰好**相反**(「遍历全部标签才对」),把那个缺陷
+    /// 锁在了库里:当时只看见「切回来别丢焦点」这一个诉求,没人把它和
+    /// 「窗口级键盘路由」连起来。丢焦点的问题另有解(见 `files_panel.rs` 里
+    /// 那句 `focused().is_none()` 自愈),不必拿全局路由去换。
+    ///
+    /// 自证会变红:把 `files_finding_of` 的体换回
+    /// `tabs.iter().filter_map(..).any(..)`。
     #[test]
-    fn a_find_bar_on_a_background_tab_still_counts_as_open() {
+    fn a_find_bar_on_a_background_tab_does_not_swallow_the_foreground_keyboard() {
         let body = strip_comments(body_of(prod_src(), "fn files_finding_of("));
         assert!(
-            body.contains("tabs.iter()"),
-            "没有遍历全部标签 —— 切走再切回来,搜索框就收不到键了:{body}"
+            body.contains("files_owner_generation_of("),
+            "没走「可见的那个面板」这条链 —— 后台标签的搜索条会把整窗口的键盘\
+             全部路由给 egui,终端永久收不到键(T8 家族):{body}"
         );
-        assert!(!body.contains("active"), "按活动标签判了:{body}");
+        assert!(!body.contains("tabs.iter()"), "又在遍历全部标签了:{body}");
+
+        // 光看 `files_finding_of` 不够:`files_owner_generation_of` 自己
+        // 要是哪天改成遍历全部标签,上面两条照样绿,而缺陷原样回来。
+        let owner = strip_comments(body_of(prod_src(), "fn files_owner_generation_of("));
+        assert!(
+            !owner.contains("tabs.iter()"),
+            "收窄链的源头自己遍历了全部标签 —— 四个内联输入框一起失守:{owner}"
+        );
+    }
+
+    /// F278:搜索条开着而 egui 谁都没焦点 = 键全部掉地上(`modal_open()` 已经
+    /// 把整窗口的键盘交给 egui 了,终端也收不到)。切走再切回来这一路上搜索条
+    /// 没被画过,egui 会丢焦点 —— 必须有人把它要回来。
+    ///
+    /// 自证会变红:把 `|| ui.ctx().memory(|m| m.focused()).is_none()` 删掉。
+    #[test]
+    fn an_open_find_bar_takes_focus_back_when_nobody_else_wants_the_keys() {
+        let panel = strip_comments(panel_src());
+        let at = panel
+            .find("if f.focus_pending")
+            .expect("F278:搜索框那句焦点请求不见了");
+        let line_end = panel[at..]
+            .find('\n')
+            .map(|n| at + n)
+            .unwrap_or(panel.len());
+        let line = &panel[at..line_end];
+        assert!(
+            line.contains("m.focused()).is_none()"),
+            "只在刚打开那一帧要焦点 —— 切走再切回来,键就全掉地上了:{line}"
+        );
     }
 
     /// F278:落地三步与另外两个入口(`accept_reveal_stat`/`accept_path_probe`)
