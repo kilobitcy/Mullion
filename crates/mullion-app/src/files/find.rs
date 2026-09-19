@@ -395,13 +395,13 @@ mod tests {
     }
 
     /// 把一次搜索跑到底:反复 `take_runnable` → 从 `tree` 里取目录内容
-    /// → `accept`。返回命中的相对路径,按发现顺序。
+    /// → `accept`。返回命中的相对路径,按发现顺序,以及 `visited`/`skipped`。
     fn run(
         root: &str,
         query: &str,
         show_hidden: bool,
         tree: &[(&str, Vec<Entry>)],
-    ) -> (Vec<String>, Stop, usize) {
+    ) -> (Vec<String>, Stop, usize, usize) {
         let mut w = Walk::new(rp(root), query.to_string(), show_hidden);
         // 上限兜底:状态机写错成不收敛时,让测试**失败**而不是挂死。
         for _ in 0..100_000 {
@@ -423,7 +423,7 @@ mod tests {
             .iter()
             .map(|h| relative(w.root(), &h.path))
             .collect();
-        (rels, stop, w.visited())
+        (rels, stop, w.visited(), w.skipped())
     }
 
     /// 递归真的往下走,而且结果是相对路径。
@@ -439,7 +439,7 @@ mod tests {
             ),
             ("/r/src", vec![e("app.rs", EntryKind::File)]),
         ];
-        let (hits, stop, _) = run("/r", "ap", false, &tree);
+        let (hits, stop, _, _) = run("/r", "ap", false, &tree);
         assert_eq!(hits, vec!["src/app.rs"]);
         assert_eq!(stop, Stop::Exhausted);
     }
@@ -456,7 +456,7 @@ mod tests {
             // 真去列它就会命中这一条 —— 不跟链接的话永远看不见。
             ("/r/link", vec![e("inside.txt", EntryKind::File)]),
         ];
-        let (hits, _, visited) = run("/r", "inside", false, &tree);
+        let (hits, _, visited, _) = run("/r", "inside", false, &tree);
         assert!(hits.is_empty(), "跟着软链接走了:{hits:?}");
         assert_eq!(visited, 1, "只该列根目录一个");
     }
@@ -474,15 +474,15 @@ mod tests {
             ),
             ("/r/.git", vec![e("config", EntryKind::File)]),
         ];
-        let (off, _, visited_off) = run("/r", "cfg", false, &tree);
+        let (off, _, visited_off, _) = run("/r", "cfg", false, &tree);
         assert!(off.is_empty());
         assert_eq!(visited_off, 1, "关着开关时不该进 .git");
 
-        let (on, _, visited_on) = run("/r", "config", true, &tree);
+        let (on, _, visited_on, _) = run("/r", "config", true, &tree);
         assert_eq!(on, vec![".git/config"]);
         assert_eq!(visited_on, 2);
 
-        let (dot, _, _) = run("/r", ".env", true, &tree);
+        let (dot, _, _, _) = run("/r", ".env", true, &tree);
         assert_eq!(dot, vec![".env"], "开着开关时隐藏文件本身也该被匹配");
     }
 
@@ -495,7 +495,7 @@ mod tests {
         let names: Vec<String> = (0..MAX_HITS + 50).map(|i| format!("f{i}.txt")).collect();
         let many: Vec<Entry> = names.iter().map(|n| e(n, EntryKind::File)).collect();
         let tree = vec![("/r", many)];
-        let (hits, stop, _) = run("/r", "f", false, &tree);
+        let (hits, stop, _, _) = run("/r", "f", false, &tree);
         assert_eq!(hits.len(), MAX_HITS);
         assert_eq!(stop, Stop::HitCap);
     }
@@ -503,10 +503,13 @@ mod tests {
     /// 目录封顶:判在**发出去之前**。判在回来时的话最后一轮会超发。
     ///
     /// 自证会变红:把 `take_runnable` 里 `self.visited + self.inflight >= MAX_DIRS`
-    /// 那一段删掉 —— `visited` 会冲到 2001 以上(或干脆不收敛被兜底循环截断)。
+    /// 改成 `self.visited >= MAX_DIRS`(单链树场景一在这个变异下仍然全绿 ——
+    /// `pending` 里从头到尾只有 1 个元素、`inflight` 每轮归零,「预占名额」
+    /// 这道防线在这棵树上根本没有起作用的机会;分支因子 ≥2 的场景二会把
+    /// `visited` 冲到 2000 以上,实测冲到 2003)。
     #[test]
     fn the_directory_cap_is_enforced_before_the_requests_go_out() {
-        // 一棵永远生得出新目录的树:每个目录里再放一个目录。
+        // 场景一:单链树,每个目录只生一个子目录。
         let mut w = Walk::new(rp("/r"), "zzz".to_string(), false);
         for _ in 0..100_000 {
             let batch = w.take_runnable();
@@ -522,6 +525,28 @@ mod tests {
             w.visited() <= MAX_DIRS,
             "超发了:列了 {} 个目录,上限 {MAX_DIRS}",
             w.visited()
+        );
+
+        // 场景二:分支因子 2 的树。单链树里 `pending` 在临界点附近永远只剩
+        // 1 个元素,`self.visited + self.inflight` 里的 `+ self.inflight`
+        // 在这棵树上从来没有被真正踩到过;分支因子 ≥2 之后 `pending` 会
+        // 攒出不止一个待发目录,批次边界才会跟 `MAX_DIRS` 错开,让「发出去
+        // 之前预占名额」这道防线真正生效。
+        let mut w2 = Walk::new(rp("/r2"), "zzz".to_string(), false);
+        for _ in 0..100_000 {
+            let batch = w2.take_runnable();
+            if batch.is_empty() {
+                break;
+            }
+            for d in batch {
+                w2.accept(&d, Ok(vec![e("a", EntryKind::Dir), e("b", EntryKind::Dir)]));
+            }
+        }
+        assert_eq!(w2.status(), Some(Stop::DirCap));
+        assert!(
+            w2.visited() <= MAX_DIRS,
+            "分支树超发了:列了 {} 个目录,上限 {MAX_DIRS}",
+            w2.visited()
         );
     }
 
@@ -567,10 +592,11 @@ mod tests {
         assert_eq!(w.status(), Some(Stop::Exhausted));
     }
 
-    /// 单条目录列不出来(权限不足)**不中止整次搜索**,但要留痕。
+    /// 单条目录列不出来(权限不足)**不中止整次搜索**,但要留痕 —— `skipped()`
+    /// 已经接进 `files_panel.rs` 的「N 个目录没权限读」文案,不能只测「没死」。
     ///
-    /// 自证会变红:把 `accept` 里 `Err(_) => { self.skipped += 1; return; }`
-    /// 改成 `Err(_) => { self.stop = Some(Stop::Canceled); return; }`。
+    /// 自证会变红:把 `accept` 里 `self.skipped += 1;` 删掉(`skipped` 那条
+    /// 断言红,`hits`/`stop` 两条看不出区别 —— 这正是要补的覆盖缺口)。
     #[test]
     fn a_directory_we_cannot_read_is_skipped_rather_than_killing_the_search() {
         let tree = vec![
@@ -581,9 +607,10 @@ mod tests {
             // `/r/locked` 故意不在树里 —— `run` 会给它一个 Err。
             ("/r/ok", vec![e("apple.txt", EntryKind::File)]),
         ];
-        let (hits, stop, _) = run("/r", "apple", false, &tree);
+        let (hits, stop, _, skipped) = run("/r", "apple", false, &tree);
         assert_eq!(hits, vec!["ok/apple.txt"]);
         assert_eq!(stop, Stop::Exhausted);
+        assert_eq!(skipped, 1, "只有 /r/locked 一个目录读失败");
     }
 
     /// 取消之后不再吐任何请求 —— 吐了的话取消只是界面上的假象,链路还在跑。
@@ -619,7 +646,7 @@ mod tests {
             ),
             ("/r/deep", vec![e("a-deep", EntryKind::File)]),
         ];
-        let (hits, _, _) = run("/r", "a", false, &tree);
+        let (hits, _, _, _) = run("/r", "a", false, &tree);
         assert_eq!(hits, vec!["a-shallow", "deep/a-deep"]);
 
         // 同一层两个目录:先列到的先出。
@@ -628,7 +655,7 @@ mod tests {
             ("/s/d2", vec![e("x2", EntryKind::File)]),
             ("/s/d1", vec![e("x1", EntryKind::File)]),
         ];
-        let (hits, _, _) = run("/s", "x", false, &siblings);
+        let (hits, _, _, _) = run("/s", "x", false, &siblings);
         assert_eq!(
             hits,
             vec!["d2/x2", "d1/x1"],
