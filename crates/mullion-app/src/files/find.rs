@@ -53,7 +53,16 @@ pub fn relative(root: &RemotePath, path: &RemotePath) -> String {
     let p = path.as_bytes();
     // 根是 `/` 时没有「前缀 + 分隔符」可言,直接剥掉那一个字节。
     let cut = if r == b"/" {
-        1
+        // 根是 `/` 时前缀本身就是那个分隔符,只剥一个字节 —— 但仍要确认
+        // `path` 真的以它开头且不止这一个字节。空路径会让 `p[1..]` 直接
+        // 越界 panic(GUI 里就是整个窗口崩掉),不带前导 `/` 的相对路径
+        // 则会被静默吃掉首字符(`foo` 切成 `oo`)。两种都落进下面那条
+        // 「不在根下」的出口:原样把绝对路径摆出来,看得见、查得着。
+        if p.starts_with(b"/") && p.len() > 1 {
+            1
+        } else {
+            return path.display().to_string();
+        }
     } else if p.starts_with(r) && p.get(r.len()) == Some(&b'/') {
         r.len() + 1
     } else {
@@ -144,5 +153,29 @@ mod tests {
             relative(&rp("/home/u/proj"), &rp("/home/u/project/x")),
             "/home/u/project/x"
         );
+    }
+
+    /// 根是 `/` 那条快路径同样要验前缀。不验的话:空路径让 `p[1..]` **越界
+    /// panic**(GUI 里是整个窗口崩掉),不带前导 `/` 的路径被静默吃掉首字符
+    /// (`foo` 切成 `oo`)—— 而这两种都不会有任何报错。
+    ///
+    /// 自证会变红:把根分支里的 `if p.starts_with(b"/") && p.len() > 1` 那道门
+    /// 去掉、改回无条件 `1`(第一条断言当场 panic)。
+    #[test]
+    fn the_root_shortcut_still_checks_the_prefix_instead_of_blindly_cutting() {
+        assert_eq!(relative(&rp("/"), &rp("")), "");
+        assert_eq!(relative(&rp("/"), &rp("foo")), "foo");
+        assert_eq!(relative(&rp("/"), &rp("/")), "/");
+    }
+
+    /// `path` 恰好等于 `root` 时两条分支**给同一种结果**(原样绝对路径)。
+    /// 不对称的话,同一种「搜到目录自己」的情形在根目录下显示成空行、
+    /// 在别处显示成完整路径,而列表里空行看着像渲染坏了。
+    ///
+    /// 自证会变红:把根分支的 `p.len() > 1` 删掉(第一条会变成 `""`)。
+    #[test]
+    fn a_path_that_is_exactly_the_root_behaves_the_same_at_either_depth() {
+        assert_eq!(relative(&rp("/"), &rp("/")), "/");
+        assert_eq!(relative(&rp("/home/u"), &rp("/home/u")), "/home/u");
     }
 }
