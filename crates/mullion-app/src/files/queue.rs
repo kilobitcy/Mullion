@@ -35,10 +35,12 @@ pub enum JobError {
 /// 常量** —— 两边各写一遍字面量,改动其中一边就会静默退化成普通失败。
 pub const CONFLICT_MARKER: &str = "\u{1}mullion-conflict";
 
-/// 取消的哨兵文案。`run_transfer` 用它报「用户自己点了取消」,
-/// 弹错误卡的决策(`should_pop_transfer_error`)靠它识别 —— 写死两份
-/// 字符串的话,改一处另一处静默失守。
-pub const CANCEL_MARKER: &str = "已取消";
+/// 取消在 `Result<(), String>` 里的哨兵串。跟 `CONFLICT_MARKER` 一个道理:
+/// 带控制字符前缀防止跟真实失败文案撞车 —— 裸「已取消」万一将来哪条合法
+/// 错误文案恰好长这样,会被 `should_pop_transfer_error` 静默吞掉那张卡。
+/// `run_transfer` 用它报「用户自己点了取消」,`finish` 靠它把收工落成
+/// `Canceled` 而不是 `Failed(哨兵)`;worker 与队列**必须共用这一个常量**。
+pub const CANCEL_MARKER: &str = "\u{1}mullion-cancel";
 
 impl From<JobError> for String {
     fn from(e: JobError) -> String {
@@ -199,7 +201,9 @@ impl Queue {
     }
 
     /// worker 收工。`Err(CONFLICT_MARKER)` 会落到 `JobState::Conflict` 等用户;
-    /// 已经选过「全部应用」的话直接按那个处置走,不再打扰。
+    /// `Err(CANCEL_MARKER)` 落成 `JobState::Canceled`(不是 `Failed(哨兵)`——
+    /// `cancel()` 可能已经把它标成 Canceled 了,worker 事后报的结果不该覆写
+    /// 成失败);已经选过「全部应用」的话直接按那个处置走,不再打扰。
     pub fn finish(&mut self, id: u64, result: Result<(), String>) {
         let blanket = self.blanket;
         let Some(j) = self.get_mut(id) else { return };
@@ -209,6 +213,7 @@ impl Queue {
                 j.state = JobState::Done;
             }
             Err(msg) if msg == CONFLICT_MARKER => j.state = JobState::Conflict,
+            Err(msg) if msg == CANCEL_MARKER => j.state = JobState::Canceled,
             Err(msg) => j.state = JobState::Failed(msg),
         }
         if j.state == JobState::Conflict {
@@ -518,6 +523,25 @@ mod tests {
         q.cancel(b);
         q.finish(a, Ok(()));
         assert!(q.take_runnable().is_empty(), "取消掉的不该被调度");
+    }
+
+    /// worker 收工时报的取消哨兵,不该把 `cancel()` 已经打好的 `Canceled`
+    /// 盖写成 `Failed(哨兵)` —— 全靠面板对 `Canceled` 的显示文案恰好也是
+    /// 「已取消」才没人看出来这条缺陷。
+    ///
+    /// 自证会变红:把 `finish` 里 `Err(msg) if msg == CANCEL_MARKER` 那条
+    /// arm 删掉。
+    #[test]
+    fn a_cancel_sentinel_lands_in_canceled_not_failed() {
+        let mut q = q();
+        let a = q.push(job(Direction::Upload));
+        q.take_runnable();
+        q.finish(a, Err(CANCEL_MARKER.into()));
+        assert_eq!(
+            q.get(a).unwrap().state,
+            JobState::Canceled,
+            "取消哨兵不该落成 Failed"
+        );
     }
 
     #[test]
