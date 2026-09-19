@@ -237,7 +237,9 @@ pub fn show(
             let room = ctx.screen_rect().bottom() - ui.cursor().top() - SP_M;
             ui.set_max_height(room.max(160.0));
             // 宽度同理:小屏或大字号下表单可能比屏幕宽,横向也要能滚到。
-            ui.set_max_width((ctx.screen_rect().width() - 2.0 * SP_M).max(320.0));
+            // 地板取 `FIELD_W_M`(320)—— 本表单里常规输入框就是按这一档给宽的,
+            // 窗口比它还窄的话,连一个字段都摆不下,不如死死保住这一档。
+            ui.set_max_width((ctx.screen_rect().width() - 2.0 * SP_M).max(FIELD_W_M));
             // **不猜按钮行高度去反推正文高度** —— `egui::Window` 内部走的是
             // `Resize`,每帧 `desired_size = desired_size.max(last_content_size)`
             // (0.30 `containers/resize.rs:258`,F217 已踩过),猜小了的差额会
@@ -1843,6 +1845,28 @@ mod tests {
         }
     }
 
+    /// 从 `src[from]`(必须是 `{`)起配平花括号,返回含首尾大括号的子串。
+    /// `panic_msg` 只用于配平失败时的提示,方便区分是哪一次切片炸的。
+    fn brace_balanced<'a>(src: &'a str, from: usize, panic_msg: &str) -> &'a str {
+        let mut depth = 0i32;
+        let mut end = from;
+        for (i, c) in src[from..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = from + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > from, "{panic_msg}");
+        &src[from..=end]
+    }
+
     /// F280:设置窗要按可视区收缩。三件事缺一不可,分开断言 ——
     /// ① 高度上界从「离屏幕底实测剩余」来(F217:不许用 Window::max_height
     ///    再猜 chrome 常量);② 正文套 ScrollArea(小屏时靠滚动够到全部内容);
@@ -1863,23 +1887,7 @@ mod tests {
         // 守护测试因为切到了 `shortcut_table` 的 ScrollArea 而假绿)。
         let after_sig = src.split("pub fn show(").nth(1).expect("show 没了");
         let brace_start = after_sig.find('{').expect("show 没有函数体");
-        let mut depth = 0i32;
-        let mut brace_end = brace_start;
-        for (i, c) in after_sig[brace_start..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        brace_end = brace_start + i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert!(brace_end > brace_start, "`show` 花括号没配平");
-        let body = &after_sig[brace_start..=brace_end];
+        let body = brace_balanced(after_sig, brace_start, "`show` 花括号没配平");
         assert!(
             body.contains("screen_rect().bottom() - ui.cursor().top()"),
             "高度上界不是实测剩余(F217:别用 Window::max_height 猜 chrome)"
@@ -1899,23 +1907,7 @@ mod tests {
             .find('{')
             .map(|i| i + scroll_at)
             .expect("ScrollArea::show 没有闭包体");
-        let mut depth = 0i32;
-        let mut brace_end = brace_start;
-        for (i, c) in body[brace_start..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        brace_end = brace_start + i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert!(brace_end > brace_start, "花括号没配平,切不出闭包体");
-        let scroll_body = &body[brace_start..=brace_end];
+        let scroll_body = brace_balanced(body, brace_start, "花括号没配平,切不出闭包体");
         assert!(
             !scroll_body.contains("\"确定\""),
             "确定按钮被卷进了滚动区 —— 小屏上要滚到底才看得见"
