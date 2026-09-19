@@ -24833,7 +24833,10 @@ mod tests {
         let match_at = fn_body
             .rfind("match spec.dir {")
             .expect("找不到跑传输的 match spec.dir —— 前面查重/改名那两处同名 match 也没了?");
-        let brace_at = match_at + fn_body[match_at..].find('{').expect("match spec.dir 没有块体");
+        let brace_at = match_at
+            + fn_body[match_at..]
+                .find('{')
+                .expect("match spec.dir 没有块体");
         let match_rest = &fn_body[brace_at..];
         let match_block = brace_balanced_arm(match_rest);
         assert!(
