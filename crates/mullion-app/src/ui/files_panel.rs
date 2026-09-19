@@ -2030,6 +2030,23 @@ fn truncate_to_width<'a>(s: &'a str, budget: f32, measure: &impl Fn(&str) -> f32
 /// 拿它当参数),这里重导出让老的引用路径继续可用。
 pub use crate::files::PanelColumn;
 
+/// F278:一次递归搜索的界面状态。
+#[derive(Default)]
+pub struct Find {
+    /// 搜索框缓冲。
+    pub buf: String,
+    /// 刚打开搜索条、**还没把键盘焦点要过来**。渲染那侧要一次就清掉。
+    ///
+    /// 用一次性标志而不是「每帧发现没焦点就抢回来」:无条件每帧
+    /// `request_focus()` 会让两个输入框互抢,先进去的那个永远
+    /// `lost_focus()` 不了、退不出来。
+    pub focus_pending: bool,
+    /// 正在跑(或刚跑完)的那次遍历。`None` = 搜索条开着、还没按过 Enter。
+    pub walk: Option<crate::files::find::Walk>,
+    /// `walk` 那一次的序号,对齐 `PanelFrame::find_seq`。
+    pub seq: u64,
+}
+
 /// 一帧要画的两栏 + 列选项(F50)。
 pub struct PanelFrame {
     pub remote: PaneState,
@@ -2059,6 +2076,22 @@ pub struct PanelFrame {
     /// 清楚」的约束(它同时当新标签初值和借用过桥的占位):过桥期间被
     /// `mem::take` 换成 `None` 又原样放回,窗口极短、期间没人读它。
     pub clip: Option<RemoteClip>,
+    /// F278:这一栏此刻开着的递归搜索。`None` = 没开(默认)。
+    ///
+    /// **是纯数据,符合 `impl Default for PanelFrame` 上方那条警告** ——
+    /// `None` 是真实可用的初值,不是编出来的假值。搜索任务的句柄**不在这里**,
+    /// 走 `track_sftp_task` 进 `TerminalTab::sftp_tasks`(那条警告点名禁止的
+    /// 正是「后台任务句柄进 PanelFrame」)。
+    ///
+    /// 只有远端栏用得上(本切片范围),所以挂在 `PanelFrame` 上而不是
+    /// `PaneState` 上 —— 挂进 `PaneState` 的话本地栏也会平白多出一个
+    /// 永远是 `None` 的字段。
+    pub find: Option<Find>,
+    /// F278:起搜计数器。每起一次搜索 +1,发出去的 `list_dir` 带着它,回来
+    /// 对不上就丢 —— 取消/换目录/换机器一律靠递增它作废在途的结果,
+    /// **绝不 abort**(`sftp_tasks` 是混合池,见 `reopen_sftp_on_focused_host`
+    /// 上方那段长注释)。
+    pub find_seq: u64,
 }
 
 impl Default for PanelFrame {
@@ -2084,6 +2117,8 @@ impl Default for PanelFrame {
             session_bound: false,
             active_column: PanelColumn::default(),
             clip: None,
+            find: None,
+            find_seq: 0,
         }
     }
 }
@@ -3000,6 +3035,8 @@ mod tests {
             session_bound: false,
             active_column: PanelColumn::Remote,
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         let seq = frame.remote.request_seq;
         frame.remote.accept(
@@ -4243,6 +4280,8 @@ mod tests {
             session_bound: false,
             active_column: PanelColumn::default(),
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         frame.remote.entries = vec![entry(b"remote-only.txt", EntryKind::File)];
         frame.remote.load = Load::Ready;
@@ -5087,6 +5126,8 @@ mod tests {
             session_bound: false,
             active_column: PanelColumn::Remote,
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         assert_eq!(frame.active_state().0, PanelColumn::Remote);
         assert_eq!(
@@ -5318,6 +5359,8 @@ mod tests {
             session_bound: true,
             active_column: PanelColumn::default(),
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;
@@ -5363,6 +5406,8 @@ mod tests {
             session_bound: false,
             active_column: PanelColumn::default(),
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;
@@ -7026,6 +7071,8 @@ mod tests {
             session_bound: true,
             active_column: PanelColumn::default(),
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;
@@ -7139,6 +7186,8 @@ mod tests {
                 session_bound: false,
                 active_column: active,
                 clip: None,
+                find: None,
+                find_seq: 0,
             };
             frame.local.entries = vec![entry(b"local-a.txt", EntryKind::File)];
             frame.local.load = Load::Ready;
@@ -7196,6 +7245,8 @@ mod tests {
             session_bound: false,
             active_column: PanelColumn::Local,
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         frame.local.entries = (0..200)
             .map(|i| entry(format!("local-{i}.txt").as_bytes(), EntryKind::File))
@@ -7816,6 +7867,8 @@ mod tests {
             session_bound: false,
             active_column: PanelColumn::default(),
             clip: None,
+            find: None,
+            find_seq: 0,
         };
         frame.remote.load = Load::Ready;
         frame.local.load = Load::Ready;

@@ -1342,6 +1342,16 @@ fn files_new_file_editing_of(tabs: &Tabs<TabContent>, sidebar_open: bool) -> boo
         .is_some_and(|f| f.remote.new_edit.is_some())
 }
 
+/// F278:有没有任何一个标签的文件面板开着搜索条。
+///
+/// **遍历全部标签**,不只活动那个:搜索条开着的时候用户完全可能切到别的
+/// 标签 —— 按活动标签判的话,切回来时那个框又收不到键了,而且没有任何提示。
+fn files_finding_of(tabs: &Tabs<TabContent>) -> bool {
+    tabs.iter()
+        .filter_map(|t| t.content.files_panel())
+        .any(|f| f.find.is_some())
+}
+
 /// `App::effective_focus` 的纯逻辑核心,理由同上。三条分支里前两条(活动标签
 /// 是 Terminal、侧栏开/关)能用真实构造的 `TerminalTab` 单测;第三条(活动
 /// 标签是 Files)测不到——`FilesTab::conn` 是 `Arc<SshConnection>`,
@@ -2737,6 +2747,12 @@ enum Modal {
     ///
     /// **不进 `touched_store`**:它一行 store 都不写(同 `FilesPathEdit`)。
     FilesNewName,
+    /// F278:文件面板的**递归搜索条**正开着。理由与 `FilesPathEdit` 逐字
+    /// 相同 —— 那个输入框收不到任何键(T8),而 Backspace 还会被
+    /// `handle_panel_key` 解释成「回上级目录」,一按就跳走。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写(同 `FilesPathEdit`)。
+    FilesFind,
     /// F148:「恢复上次的现场」弹窗。里面没有输入框,但有一颗一按就摆回
     /// 整个标签栏的「恢复」按钮,而空格/回车在 egui 里是按钮的激活键 ——
     /// 同 `Modal::Import` 的理由(T8)。
@@ -2772,6 +2788,7 @@ impl Modal {
         Modal::FilesPathEdit,
         Modal::FilesRename,
         Modal::FilesNewName,
+        Modal::FilesFind,
         Modal::History,
         Modal::Pack,
     ];
@@ -2806,14 +2823,14 @@ const DISMISS_ORDER: &[Modal] = &[
 /// - `Unlock`:关掉 = 回到无库状态,而用户没有别的路把它叫回来。
 /// - `HostKey`:TOFU 是一次必须**显式**回答的安全判断,不能被误点逃掉。
 /// - `Editor`:里面是还没传回远端的文件正文。
-/// - `FilesPathEdit`/`FilesRename`/`FilesNewName`:就地输入框,不是窗口,
-///   没有「外面」可言(它们的 area 就是文件面板本身)。
+/// - `FilesPathEdit`/`FilesRename`/`FilesNewName`/`FilesFind`:就地输入框,
+///   不是窗口,没有「外面」可言(它们的 area 就是文件面板本身)。
 /// - `Paste`:走 `egui::Modal` 自带的遮罩点击,在这里再接一遍等于同一个
 ///   行为两条路。
 ///
 /// **这张表只作文档与完备性对照**(见下面
 /// `every_dialog_is_either_in_the_dismiss_order_or_explicitly_exempt`),
-/// 豁免的实际生效点是 `dismiss_areas` 里这七个变体各自的 `None` 那一臂——
+/// 豁免的实际生效点是 `dismiss_areas` 里这八个变体各自的 `None` 那一臂——
 /// `dismiss_verdict` 只读 `DISMISS_ORDER`,一个弹窗没在 `DISMISS_ORDER`
 /// 里就永远问不到它,豁不豁免全看 `dismiss_areas` 答不答得出 area。
 #[allow(dead_code)]
@@ -2824,6 +2841,7 @@ const DISMISS_EXEMPT: &[Modal] = &[
     Modal::FilesPathEdit,
     Modal::FilesRename,
     Modal::FilesNewName,
+    Modal::FilesFind,
     Modal::Paste,
 ];
 
@@ -2903,6 +2921,7 @@ fn draft_baseline_is_in_vault(m: Modal) -> bool {
         | Modal::FilesPathEdit
         | Modal::FilesRename
         | Modal::FilesNewName
+        | Modal::FilesFind
         | Modal::About
         | Modal::Unlock
         | Modal::HostKey
@@ -2940,6 +2959,7 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
         | Modal::FilesPathEdit
         | Modal::FilesRename
         | Modal::FilesNewName
+        | Modal::FilesFind
         | Modal::Paste => None,
         Modal::About => ui
             .about_open
@@ -4622,6 +4642,8 @@ impl App {
             Modal::FilesRename => self.files_renaming(),
             // F219:见 `Modal::FilesNewName` 的说明。
             Modal::FilesNewName => self.files_new_file_editing(),
+            // F278:见 `Modal::FilesFind` 的说明。
+            Modal::FilesFind => self.files_finding(),
             // F148:见 `Modal::History` 的说明(T8)。
             Modal::History => self.ui.history.is_some(),
         })
@@ -4709,7 +4731,9 @@ impl App {
             // 文件面板里的三个**就地**输入框不走「点外面关」这条路(它们
             // 不在 `DISMISS_ORDER` 里,这个函数永远不会为它们被问到),
             // 但穷尽 match 仍要求表态:它们各自的取消路径是按 Esc。
-            Modal::FilesPathEdit | Modal::FilesRename | Modal::FilesNewName => false,
+            Modal::FilesPathEdit | Modal::FilesRename | Modal::FilesNewName | Modal::FilesFind => {
+                false
+            }
         }
     }
 
@@ -4801,6 +4825,7 @@ impl App {
             | Modal::FilesPathEdit
             | Modal::FilesRename
             | Modal::FilesNewName
+            | Modal::FilesFind
             | Modal::Paste => {}
         }
         mark_ui_dirty!(self.ui_dirty);
@@ -4840,6 +4865,15 @@ impl App {
     /// F219:文件面板里有没有一行正在就地新建(`Modal::FilesNewName` 的判据)。
     fn files_new_file_editing(&self) -> bool {
         files_new_file_editing_of(&self.tabs, self.ui.files_sidebar_open)
+    }
+
+    /// F278:哪个标签的文件面板此刻开着搜索条。
+    ///
+    /// 拆成自由函数的理由同 `files_path_editing_of`:`app.rs` 的测试从来
+    /// 构造不出一个 `App`(要窗口/GPU),挂成 `&self` 方法的话这条判据根本
+    /// 没法单测,而它正是 `Modal::FilesFind` 唯一读的东西。
+    fn files_finding(&self) -> bool {
+        files_finding_of(&self.tabs)
     }
 
     /// 这一帧真正生效的键盘焦点(协调者修订 2)。裸的 `self.focus` 只是用户
@@ -19126,6 +19160,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::FilesNewName),
                     "FilesNewName 没登记进 Modal::ALL(T8/F219)"
                 ),
+                Modal::FilesFind => assert!(
+                    Modal::ALL.contains(&Modal::FilesFind),
+                    "FilesFind 没登记进 Modal::ALL(T8/F278)"
+                ),
                 Modal::History => assert!(
                     Modal::ALL.contains(&Modal::History),
                     "History 没登记进 Modal::ALL(T8/F148)"
@@ -19153,6 +19191,7 @@ mod tests {
             Modal::FilesPathEdit,
             Modal::FilesRename,
             Modal::FilesNewName,
+            Modal::FilesFind,
             Modal::History,
         ] {
             check(m);
@@ -19248,13 +19287,14 @@ mod tests {
                 Modal::ProjectPick => "project_pick::show(",
                 Modal::ExitConfirm => "if ui_state.exit_pending {",
                 Modal::Pack => "pack_dialog::show(",
-                // 豁免的七类不参与「点外面即关」,也就不需要排序。
+                // 豁免的八类不参与「点外面即关」,也就不需要排序。
                 Modal::Unlock
                 | Modal::HostKey
                 | Modal::Editor
                 | Modal::FilesPathEdit
                 | Modal::FilesRename
                 | Modal::FilesNewName
+                | Modal::FilesFind
                 | Modal::Paste => "",
             }
         }
@@ -19285,17 +19325,17 @@ mod tests {
         }
     }
 
-    /// F239:豁免的是哪七类,写死在这里。
+    /// F239:豁免的是哪八类,写死在这里。
     ///
-    /// **不是**「实现是什么就断言什么」——这七类各有各的理由,任何一个被
+    /// **不是**「实现是什么就断言什么」——这八类各有各的理由,任何一个被
     /// 顺手挪出豁免表都会造成真实损失:主密码框关掉 = 回到无库状态;
     /// TOFU 框关掉 = 一次必须显式回答的安全判断被逃掉;编辑器关掉 =
-    /// 未回传的远端文件正文没了;三个就地输入框根本不是窗口,没有「外面」;
+    /// 未回传的远端文件正文没了;四个就地输入框根本不是窗口,没有「外面」;
     /// 粘贴确认框走 `egui::Modal` 自带的遮罩点击,不在这里重复接。
     ///
     /// 自证会变红:把任意一个变体从 `DISMISS_EXEMPT` 里挪走。
     #[test]
-    fn the_exemptions_are_exactly_the_seven_that_would_lose_something() {
+    fn the_exemptions_are_exactly_the_eight_that_would_lose_something() {
         let want = [
             Modal::Unlock,
             Modal::HostKey,
@@ -19303,6 +19343,7 @@ mod tests {
             Modal::FilesPathEdit,
             Modal::FilesRename,
             Modal::FilesNewName,
+            Modal::FilesFind,
             Modal::Paste,
         ];
         for m in want {
@@ -28664,6 +28705,45 @@ mod tests {
             prod.contains("            Modal::FilesPathEdit => self.files_path_editing(),"),
             "modal_open 没有认 FilesPathEdit"
         );
+    }
+
+    /// F278:`Modal::FilesFind` 的三处登记一处都不许少。
+    ///
+    /// 漏 `ALL` 的症状:`modal_open` 照 `ALL` 遍历,漏了就等于这个弹窗
+    /// 「开着也不算开着」—— 搜索框一个键都收不到(T8),而且 Backspace 被
+    /// `handle_panel_key` 解释成回上级目录,一按就跳走。
+    ///
+    /// 自证会变红:把 `Modal::FilesFind` 从 `Modal::ALL` 里删掉(第二条红);
+    /// 把那条分派臂删掉(第三条红)。
+    #[test]
+    fn the_files_find_bar_is_registered_everywhere_a_modal_has_to_be() {
+        let prod = prod_src();
+        assert!(
+            prod.contains("    FilesFind,"),
+            "Modal 枚举里没有 FilesFind"
+        );
+        assert!(
+            prod.contains("        Modal::FilesFind,"),
+            "Modal::ALL 里漏了 FilesFind —— modal_open 照 ALL 遍历,漏了就永远算「没开」"
+        );
+        assert!(
+            prod.contains("            Modal::FilesFind => self.files_finding(),"),
+            "开关判据没分派 —— FilesFind 永远判成关着"
+        );
+    }
+
+    /// F278:搜索条开着的时候用户完全可能切到别的标签 —— 按活动标签判的话,
+    /// 切走再切回来,搜索框又收不到键了,而且没有任何提示。
+    ///
+    /// 自证会变红:把 `files_finding_of` 里的 `tabs.iter()` 换成只看活动标签。
+    #[test]
+    fn a_find_bar_on_a_background_tab_still_counts_as_open() {
+        let body = strip_comments(body_of(prod_src(), "fn files_finding_of("));
+        assert!(
+            body.contains("tabs.iter()"),
+            "没有遍历全部标签 —— 切走再切回来,搜索框就收不到键了:{body}"
+        );
+        assert!(!body.contains("active"), "按活动标签判了:{body}");
     }
 
     /// 取某个函数的函数体源码。**`marker` 必须带行首缩进**——不带的话
