@@ -93,8 +93,9 @@ impl fmt::Display for StoreError {
             StoreError::CorruptSecrets(e) => write!(f, "secrets.enc 的文件头读不懂:{e}"),
             StoreError::CloudReseal(e) => write!(
                 f,
-                "主密码已经改好了,但云端备份的 Access Key Secret 没能用新密钥重封:{e} —— \
-                 不要重试改密码,去设置里的「云端备份」一节把 Access Key Secret 重填一遍即可"
+                "主密码已经改好了,但云端备份存着的密文没能用新密钥重封:{e} —— \
+                 不要重试改密码,去设置里的「云端备份」一节把 Access Key Secret \
+                 与备份口令各重填一遍即可"
             ),
             StoreError::PasswordRequired => {
                 write!(f, "secrets.enc 由主密码加密 —— 需要先输入主密码")

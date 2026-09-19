@@ -3582,6 +3582,17 @@ impl App {
                             mullion_store::cloud::set_passphrase(&mut cfg, s.vault(), &pass_new)
                         {
                             pass_err = Some(format!("保存备份口令失败:{e}"));
+                        } else {
+                            // 换了口令,云上那份是用**旧**口令封的,已经作废 ——
+                            // 必须重推一份。清掉指纹游标就是在说「内容算变了」。
+                            //
+                            // 不清的后果在升级的老用户身上最毒:他升级前云备份
+                            // 一直正常跑(`last_fingerprint` 非空),升级后照提示
+                            // 设上口令,而本地内容一个字节没变 —— `prepare` 于是
+                            // 永远判 `Unchanged`,手动点「立刻备份到云」还会回
+                            // 一句「内容没变」,读起来像成功。云端那份旧格式的包
+                            // 就这么一直留着,而它只有源机的旧主密码解得开。
+                            cfg.last_fingerprint.clear();
                         }
                     }
                     None => pass_err = Some("会话库还没打开,备份口令没能保存".into()),
@@ -25661,8 +25672,39 @@ mod tests {
         }
         let matched = body_of(&body, "if pass_new == pass_confirm {");
         assert!(
-            !matched.contains(".clear()"),
+            !matched.contains("cloud_pass_new.clear()"),
             "清空挂在「两次一致」那一支里 —— 输错两次之后明文会留在草稿里:{matched}"
+        );
+    }
+
+    /// F283:设上新口令**必须**把指纹游标一起清掉,否则这一份永远推不上去。
+    ///
+    /// 换口令等于云上那份作废(它是用旧口令封的),必须重推一份。而
+    /// `prepare` 判「要不要推」只看指纹,指纹只对**本地内容**取(C4)——
+    /// 换口令这件事它看不见。
+    ///
+    /// 症状最毒的是升级的老用户:升级前云备份一直正常跑(游标非空),
+    /// 升级后照提示设上口令、本地内容一个字节没变,于是每一轮都判
+    /// `Unchanged`,手动点「立刻备份到云」回的是「内容没变」——读起来
+    /// 像成功。云上那份旧格式的包就一直留着,只有源机的旧主密码解得开。
+    /// **全程零报错**,这是备份功能最致命的失效形状。
+    ///
+    /// 钉在「写成功那一支里面」:清早了(挪到 `if !pass_new.is_empty()` 外层)
+    /// 会让每次点确定都白推一份,打的是用户的付费桶。
+    ///
+    /// 自证会变红:把 `cfg.last_fingerprint.clear()` 那一句删掉。
+    #[test]
+    fn setting_a_new_passphrase_forces_the_next_upload() {
+        let body = strip_comments(body_of(prod_src(), "fn save_cloud_draft("));
+        assert_eq!(
+            body.matches("cfg.last_fingerprint.clear()").count(),
+            1,
+            "游标清理不是恰好一处 —— 漏了这一份永远推不上去,多了会每次点确定都白推"
+        );
+        let matched = body_of(&body, "if pass_new == pass_confirm {");
+        assert!(
+            matched.contains("cfg.last_fingerprint.clear()"),
+            "清游标没挂在「口令写成功」那一支里 —— 写砸了也清等于白推一份:{matched}"
         );
     }
 

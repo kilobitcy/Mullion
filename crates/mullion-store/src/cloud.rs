@@ -1025,6 +1025,36 @@ mod tests {
         );
     }
 
+    /// F283:同一条文案的**另一半**——备份口令也得能靠重填救回来。
+    ///
+    /// `CloudReseal` 这个错误变体现在是 SK 与备份口令**共用**的,文案里让用户
+    /// 做的两件事都得真的有效。只钉 SK 那一半的话,「口令重填不管用」这种
+    /// 退化改不出任何红 —— 而它的后果是用户照着文案做完仍然解不开,
+    /// 从此没有自愈路径。
+    ///
+    /// 自证会变红:让 `set_passphrase` 用一把跟 `passphrase` 不同的密钥。
+    #[test]
+    fn refilling_the_passphrase_recovers_from_a_reseal_that_never_happened() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let ks = crate::master_key::InMemoryKey([6u8; 32]);
+        let mut v = crate::vault::Vault::open(dir.path().to_path_buf(), &ks).expect("开库");
+        let mut c = cfg();
+        set_passphrase(&mut c, &v, "BACKUP-PASS").expect("封");
+
+        v.set_master_password("new").expect("改密码");
+        assert!(
+            matches!(passphrase(&c, &v), Err(StoreError::Crypto)),
+            "构造失败:这份密文本该已经解不开了,否则下面测的是个假场景"
+        );
+
+        set_passphrase(&mut c, &v, "BACKUP-PASS").expect("重填");
+        assert_eq!(
+            passphrase(&c, &v).expect("重填之后必须解得开"),
+            "BACKUP-PASS",
+            "重填备份口令也救不回来 —— 那条错误文案是在骗用户"
+        );
+    }
+
     /// 序号必须**零填充定宽**。不填充的话字典序是 `1, 10, 2` ——
     /// 而「最新那份」= List 结果里序号最大的那条,靠的正是字典序。
     #[test]
