@@ -106,6 +106,15 @@ pub struct CloudConfig {
     /// SK **用 vault key 封过再 base64**(F271)。空 = 还没填。
     #[serde(default)]
     pub secret_sealed: String,
+    /// F283:备份口令的密文(base64)。**与主密码无关**,也与 `secret_sealed`
+    /// 不是一把钥匙的两用:前者封的是「解云端备份的那句口令」,后者封的是
+    /// 「访问桶的那把 SK」。两者都走 `seal_local`(本机钥匙串/主密码当前那把),
+    /// 于是**主密码一变,两者都要重封** —— 见 `Vault::reseal_cloud_secret`。
+    ///
+    /// 空串 = 没设过口令 = 云备份跑不起来(会在 `cloudsync::prepare` 那里
+    /// 报出原因,不是静默不跑)。
+    #[serde(default)]
+    pub passphrase_sealed: String,
     /// 上次成功推上去的那一份的内容指纹。
     #[serde(default)]
     pub last_fingerprint: String,
@@ -161,6 +170,7 @@ impl Default for CloudConfig {
             socks5: String::new(),
             access_key_id: String::new(),
             secret_sealed: String::new(),
+            passphrase_sealed: String::new(),
             last_fingerprint: String::new(),
             last_seq: 0,
             last_ok_at: String::new(),
@@ -214,6 +224,40 @@ pub fn secret_key(cfg: &CloudConfig, vault: &crate::vault::Vault) -> Result<Stri
         .map_err(|e| StoreError::CorruptSecrets(format!("cloud.toml 的密文不是合法 base64:{e}")))?;
     let plain = vault.open_local(&blob)?;
     String::from_utf8(plain).map_err(StoreError::from)
+}
+
+/// F283:把备份口令用**本机当前密钥**封进配置(不落盘,调用方负责 `save`)。
+///
+/// 空口令不算口令:那会让「已设置」这个状态对应一段人人都能解开的密文。
+pub fn set_passphrase(
+    cfg: &mut CloudConfig,
+    vault: &crate::vault::Vault,
+    pass: &str,
+) -> Result<(), StoreError> {
+    if pass.is_empty() {
+        return Err(StoreError::Kdf("备份口令不能为空".into()));
+    }
+    cfg.passphrase_sealed = b64().encode(vault.seal_local(pass.as_bytes())?);
+    Ok(())
+}
+
+/// [`set_passphrase`] 的逆。没设过时返回空串(不是错误)——
+/// 「没设过」和「解不开」是两件事,调用方要分开报。
+pub fn passphrase(cfg: &CloudConfig, vault: &crate::vault::Vault) -> Result<String, StoreError> {
+    if cfg.passphrase_sealed.is_empty() {
+        return Ok(String::new());
+    }
+    let blob = b64().decode(&cfg.passphrase_sealed).map_err(|e| {
+        StoreError::CorruptSecrets(format!("cloud.toml 的口令密文不是合法 base64:{e}"))
+    })?;
+    let plain = vault.open_local(&blob)?;
+    String::from_utf8(plain).map_err(StoreError::from)
+}
+
+/// 设置页要显示「已设置 / 未设置」,而那句话**不该为了显示去解一次密文**
+/// (解不开的时候显示「未设置」是错的,会引导用户去覆盖一份其实存在的口令)。
+pub fn has_passphrase(cfg: &CloudConfig) -> bool {
+    !cfg.passphrase_sealed.is_empty()
 }
 
 /// 写 `cloud.toml`。
@@ -470,6 +514,7 @@ mod tests {
             socks5: String::new(),
             access_key_id: String::new(),
             secret_sealed: String::new(),
+            passphrase_sealed: String::new(),
             last_fingerprint: String::new(),
             last_seq: 0,
             last_ok_at: String::new(),
@@ -643,6 +688,58 @@ mod tests {
             "SK 明文落到了 cloud.toml 里"
         );
         assert_eq!(secret_key(&c, &v).expect("解 SK"), "TOP-SECRET-SK-VALUE");
+    }
+
+    /// F283:备份口令与 SK 一样,**明文一个字都不许落盘**。
+    ///
+    /// 判据不是「字段名对不对」而是「文件字节里搜不到口令本身」——
+    /// 比照 `the_secret_key_never_hits_the_disk_in_the_clear` 的姿态。
+    #[test]
+    fn the_backup_passphrase_never_hits_the_disk_in_the_clear() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut v = crate::vault::Vault::open(
+            dir.path().to_path_buf(),
+            &crate::master_key::InMemoryKey([5u8; 32]),
+        )
+        .expect("开库");
+        v.set_master_password("hunter2").expect("设主密码");
+
+        let mut c = cfg();
+        set_passphrase(&mut c, &v, "correct horse battery staple").expect("封口令");
+        save(dir.path(), &c).expect("写");
+
+        let bytes = std::fs::read(dir.path().join(CLOUD_FILE)).expect("读");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("correct horse battery staple"),
+            "备份口令明文落到了 cloud.toml 里"
+        );
+
+        let back = load(dir.path());
+        assert_eq!(
+            passphrase(&back, &v).expect("解口令"),
+            "correct horse battery staple"
+        );
+    }
+
+    /// 老文件没有这个键 —— 按「没设过口令」读,**不判损坏**。
+    #[test]
+    fn an_old_cloud_toml_without_the_passphrase_reads_as_not_set() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        std::fs::write(
+            dir.path().join(CLOUD_FILE),
+            "enabled = true\nbucket = \"b\"\n",
+        )
+        .expect("写老文件(没有 passphrase_sealed 这个键)");
+        let c = load(dir.path());
+        // 用 `save` 能不能成功来判「没判损坏」——`corrupt` 是私有字段,
+        // 这是本文件既有测试(`a_corrupt_file_is_not_silently_replaced_by_defaults`)
+        // 一路沿用的手法。
+        save(dir.path(), &c).expect("没有 passphrase_sealed 这个键的老文件被判成了损坏,拒绝回写");
+        assert!(
+            !has_passphrase(&c),
+            "没有这个键的老文件被读成了「已设过口令」"
+        );
+        assert!(c.enabled, "缺字段影响到了别的字段");
     }
 
     /// **改主密码必须连带重封 `cloud.toml`**(设计 D12)。
