@@ -630,6 +630,25 @@ fn find_edit_id(id: &str) -> egui::Id {
     egui::Id::new(("files-find-edit", id))
 }
 
+/// F278:回车/「搜索」/「重新搜索」三处入口共用的防抖判据 —— 输入框里的
+/// 原始文本收拢成「要不要发 `FindStart`,发的话发哪个词」。
+///
+/// **必须抽出来给三处共用,不能各自写一遍 `trim().is_empty()`**:三份文本
+/// 相同不代表逻辑联动,改判据时漏改一处、或者哪次重构删错了一处的判断,
+/// 编译照样过、其余两处的测试照样绿 —— 唯一测得出来的办法是三处入口都调
+/// 同一个函数,对这一个函数下断言。
+///
+/// 空串(或全是空白)不起搜:`find::matches` 对空查询恒不命中,发出去就是
+/// 白爬一整棵树(最多 2000 次网络往返)。
+fn find_query_to_start(buf: &str) -> Option<String> {
+    let q = buf.trim().to_string();
+    if q.is_empty() {
+        None
+    } else {
+        Some(q)
+    }
+}
+
 /// F278:搜索条上那句进度/结论。
 ///
 /// **四种收场各说各的话**(`find::Stop` 的四档):「翻完了,没找到」和
@@ -1095,18 +1114,14 @@ pub fn show(
                 f.focus_pending = false;
             }
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                let q = f.buf.trim().to_string();
-                // 空串不起搜:`find::matches` 对空查询恒不命中,发出去就是
-                // 白爬一整棵树。
-                if !q.is_empty() {
+                if let Some(q) = find_query_to_start(&f.buf) {
                     action = Some(FileAction::FindStart(q));
                 }
             }
             match f.walk.as_ref() {
                 None => {
                     if ui.button("搜索").clicked() {
-                        let q = f.buf.trim().to_string();
-                        if !q.is_empty() {
+                        if let Some(q) = find_query_to_start(&f.buf) {
                             action = Some(FileAction::FindStart(q));
                         }
                     }
@@ -1118,8 +1133,7 @@ pub fn show(
                         action = Some(FileAction::FindCancel);
                     }
                     if done.is_some() && ui.button("重新搜索").clicked() {
-                        let q = f.buf.trim().to_string();
-                        if !q.is_empty() {
+                        if let Some(q) = find_query_to_start(&f.buf) {
                             action = Some(FileAction::FindStart(q));
                         }
                     }
@@ -8908,14 +8922,31 @@ mod tests {
         );
     }
 
-    /// F278:四种收场各说各的话。**「翻完了,没找到」和「翻了 2000 个目录
-    /// 还没翻完」对用户的含义相反** —— 混成一句会让他以为文件不存在。
+    /// F278:四种收场 + 「Exhausted 但有命中」共五档,各说各的话。**「翻完了,
+    /// 没找到」和「翻了 2000 个目录还没翻完」对用户的含义相反** —— 混成一句
+    /// 会让他以为文件不存在。
     ///
-    /// 自证会变红:把 `Some(Stop::DirCap)` 那一臂并进 `Exhausted`。
+    /// 复核实测出的四个恒绿(见 `slice-f283` 系列复核记录):
+    /// - 原测试从没构造过 `HitCap` 场景,把它并进 `DirCap` 全绿(两句都含
+    ///   「不全」,靠 `assert_ne!` 也比不出来 —— 只比了 `s_cap` 与 `s_done`)。
+    /// - 原测试查询串固定命中 0 个,从没构造过 `Exhausted` 且 `n>0` 的场景,
+    ///   把它并进 `n==0` 分支全绿。
+    /// - `skipped` 那段文案零覆盖,`w.skipped() > 0` 改成 `> 999` 全绿。
+    ///
+    /// 断言方式改成**五句话两两互不相同**(而不是零散 `assert_ne!` 挑几对
+    /// 比):这样「把任意两臂并成一句」这类变异一律杀得掉。`HitCap` 与
+    /// `DirCap` 都含「不全」,分不开的地方靠各自的上限数值
+    /// (`MAX_HITS`=500 vs `MAX_DIRS`=2000,数值不同,这是唯一分得开的判据)。
+    ///
+    /// 自证会变红:
+    /// - 把 `Some(Stop::HitCap)` 那一臂并进 `Some(Stop::DirCap)`。
+    /// - 把 `Some(Stop::Exhausted)`(n>0)那一臂并进 `n == 0` 那一臂。
+    /// - 把 `w.skipped() > 0` 改成 `w.skipped() > 999`。
     #[test]
     fn each_way_a_search_can_end_says_a_different_thing() {
-        use crate::files::find::{Stop, Walk, MAX_DIRS};
+        use crate::files::find::{Stop, Walk, MAX_DIRS, MAX_HITS};
 
+        // 档一:Exhausted,n == 0——翻完了,什么都没找到。
         let mut done = Walk::new(rp("/r"), "zz".into(), false);
         let b = done.take_runnable();
         done.accept(&b[0], Ok(vec![]));
@@ -8923,40 +8954,161 @@ mod tests {
         let s_done = find_progress_text(&done);
         assert!(s_done.contains("没有找到"), "{s_done}");
 
+        // 档二:Exhausted,n > 0——翻完了,找到了几个。跟档一是同一个
+        // `Stop` 变体,唯一的分支判据是 `n == 0` 那道门。
+        let mut found = Walk::new(rp("/r"), "f".into(), false);
+        let b = found.take_runnable();
+        found.accept(
+            &b[0],
+            Ok(vec![
+                entry(b"f1.txt", EntryKind::File),
+                entry(b"f2.txt", EntryKind::File),
+            ]),
+        );
+        assert_eq!(found.status(), Some(Stop::Exhausted));
+        assert_eq!(found.hits().len(), 2);
+        let s_found = find_progress_text(&found);
+        assert!(
+            s_found.contains("找到") && s_found.contains(&2.to_string()),
+            "翻完且有命中,必须报出命中数:{s_found}"
+        );
+
+        // 档三:Canceled。
         let mut canceled = Walk::new(rp("/r"), "zz".into(), false);
         canceled.cancel();
         let s_cancel = find_progress_text(&canceled);
         assert!(s_cancel.contains("已取消"), "{s_cancel}");
-        assert_ne!(s_cancel, s_done);
 
-        // 跑到目录封顶(树永远生得出新目录)。
-        let mut capped = Walk::new(rp("/r"), "zz".into(), false);
+        // 档四:HitCap——命中数封顶(树只有一层,不会牵连 DirCap)。
+        let hit_names: Vec<Entry> = (0..MAX_HITS + 50)
+            .map(|i| entry(format!("f{i}.txt").as_bytes(), EntryKind::File))
+            .collect();
+        let mut capped_hits = Walk::new(rp("/r"), "f".into(), false);
+        let b = capped_hits.take_runnable();
+        capped_hits.accept(&b[0], Ok(hit_names));
+        assert_eq!(capped_hits.status(), Some(Stop::HitCap));
+        let s_hitcap = find_progress_text(&capped_hits);
+        assert!(
+            s_hitcap.contains(&MAX_HITS.to_string()) && s_hitcap.contains("不全"),
+            "命中封顶必须说「可能不全」并报出命中上限 {MAX_HITS}:{s_hitcap}"
+        );
+
+        // 档五:DirCap——目录数封顶(树永远生得出新目录,查询串命中 0 个,
+        // 不牵连 HitCap)。
+        let mut capped_dirs = Walk::new(rp("/r"), "zz".into(), false);
         for _ in 0..100_000 {
-            let batch = capped.take_runnable();
+            let batch = capped_dirs.take_runnable();
             if batch.is_empty() {
                 break;
             }
             for d in batch {
-                capped.accept(&d, Ok(vec![entry(b"sub", EntryKind::Dir)]));
+                capped_dirs.accept(&d, Ok(vec![entry(b"sub", EntryKind::Dir)]));
             }
         }
-        let s_cap = find_progress_text(&capped);
+        assert_eq!(capped_dirs.status(), Some(Stop::DirCap));
+        let s_dircap = find_progress_text(&capped_dirs);
         assert!(
-            s_cap.contains(&MAX_DIRS.to_string()) && s_cap.contains("不全"),
-            "目录封顶必须说「可能不全」并报出上限:{s_cap}"
+            s_dircap.contains(&MAX_DIRS.to_string()) && s_dircap.contains("不全"),
+            "目录封顶必须说「可能不全」并报出目录上限 {MAX_DIRS}:{s_dircap}"
         );
-        assert_ne!(s_cap, s_done, "封顶和搜完不能说同一句话");
+
+        // 五句话两两互不相同 —— 逐对比,撞车了直接把撞车的那两句打出来。
+        let all = [
+            ("Exhausted(n=0)", s_done.clone()),
+            ("Exhausted(n>0)", s_found.clone()),
+            ("Canceled", s_cancel.clone()),
+            ("HitCap", s_hitcap.clone()),
+            ("DirCap", s_dircap.clone()),
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(
+                    all[i].1, all[j].1,
+                    "{} 与 {} 说了同一句话:{}",
+                    all[i].0, all[j].0, all[i].1
+                );
+            }
+        }
+
+        // `skipped` 独立于收场那四档:同一档里「有目录读失败」与「没有」
+        // 必须两头都钉住,否则「恒定拼一段上去」也能全绿。
+        let mut with_skip = Walk::new(rp("/r"), "apple".into(), false);
+        let b = with_skip.take_runnable();
+        // 根目录本身列不出来——直接借用 `run` 同款手法,喂一个 `Err`。
+        with_skip.accept(&b[0], Err("没有权限".into()));
+        assert_eq!(with_skip.skipped(), 1);
+        let s_skip = find_progress_text(&with_skip);
+        assert!(
+            s_skip.contains(&format!("{} 个目录没权限读", with_skip.skipped())),
+            "有目录读失败,文案里必须报出「没权限读」和精确计数:{s_skip}"
+        );
+        assert!(
+            !s_done.contains("没权限读"),
+            "没有目录读失败时不该出现「没权限读」:{s_done}"
+        );
     }
 
-    /// F278:还在跑的时候那句话里有「正在」,不能长得像结论。
+    /// F278:还在跑的时候那句话里有「正在」,不能长得像结论,而且已找到数
+    /// 与已翻目录数都要在那句话里——只查「正在搜索」四个字的话,砍掉两个
+    /// 计数照样全绿。
     ///
-    /// 自证会变红:把 `None =>` 那一臂的文案改成不含「正在搜索」的串。
+    /// `n` 与 `d` 特意取不同的值:相等的话一个数字能同时喂饱两条断言,
+    /// 分不清到底测的是哪一个。
+    ///
+    /// 自证会变红:
+    /// - 把 `None =>` 那一臂的文案改成不含「正在搜索」的串。
+    /// - 把文案里的 `已找到 {n} 个,已翻 {d} 个目录` 砍成只剩 `"正在搜索"`。
     #[test]
     fn a_running_search_does_not_read_like_a_conclusion() {
         use crate::files::find::Walk;
-        let mut w = Walk::new(rp("/r"), "zz".into(), false);
-        let _ = w.take_runnable(); // 发出去了,还没回来
+        let mut w = Walk::new(rp("/r"), "f".into(), false);
+        // 第一批目录先列出几个命中(n = 2),再喂一个还生子目录的项让搜索
+        // 继续跑(status() 仍是 None),使 d(已翻目录数)与 n 不相等。
+        let b = w.take_runnable();
+        w.accept(
+            &b[0],
+            Ok(vec![
+                entry(b"f1.txt", EntryKind::File),
+                entry(b"f2.txt", EntryKind::File),
+                // 目录名故意不含 `f`——只用来让搜索继续跑,不该被当成命中。
+                entry(b"sub", EntryKind::Dir),
+            ]),
+        );
+        let b2 = w.take_runnable();
+        assert_eq!(b2.len(), 1, "子目录该被继续入队");
+        assert_eq!(w.status(), None, "发出去了还没回来,不算搜完");
+        assert_eq!(w.hits().len(), 2);
+        assert_eq!(w.visited(), 1);
         let s = find_progress_text(&w);
         assert!(s.contains("正在搜索"), "{s}");
+        assert!(s.contains(&2.to_string()), "已找到数没进文案:{s}");
+        assert!(s.contains(&1.to_string()), "已翻目录数没进文案:{s}");
+    }
+
+    /// F278:三处入口(回车 / 「搜索」按钮 / 「重新搜索」按钮)共用同一份
+    /// 空串防抖判据。抽成纯函数单测,理由见 `find_query_to_start` 的文档:
+    /// 三处各写一遍 `trim().is_empty()`,漏改一处编译照样过、其余两处的
+    /// 测试照样绿。
+    ///
+    /// 自证会变红:把 `find_query_to_start` 里的 `if q.is_empty()` 改成
+    /// `if false`(空串/纯空白也会被当成合法查询发出去)。
+    #[test]
+    fn an_empty_or_whitespace_query_does_not_start_a_search() {
+        assert_eq!(find_query_to_start(""), None);
+        assert_eq!(find_query_to_start("   "), None);
+        assert_eq!(find_query_to_start("\t\n"), None);
+    }
+
+    /// 非空查询要发出去,而且**两侧空白被剥掉**——用户在框里敲之前/之后
+    /// 顺手带出来的空格不该原样进 `FindStart`。
+    ///
+    /// 自证会变红:把 `buf.trim()` 改成 `buf.to_string()`(第二条断言红)。
+    #[test]
+    fn a_non_empty_query_is_trimmed_and_kept() {
+        assert_eq!(find_query_to_start("app"), Some("app".to_string()));
+        assert_eq!(
+            find_query_to_start("  app.rs  "),
+            Some("app.rs".to_string())
+        );
     }
 }
