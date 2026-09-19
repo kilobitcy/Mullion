@@ -4966,6 +4966,61 @@ impl App {
         true
     }
 
+    /// F278:搜索条开着时,Esc 直接关掉它。
+    ///
+    /// **不能挂在 `handle_panel_key` 里**——那是最初的设计,实测是死路:
+    /// `Modal::FilesFind` 让 `modal_open()` 恒真,而 `route_focused` 一见
+    /// `modal_open` 就把键盘短路成 `Route::Egui`(在 `modal_open` 之后才轮到
+    /// `focus == FilesPanel` 那一支),`panel_key_pending`/`handle_panel_key`
+    /// 这条路径在搜索条开着的时候根本到不了(反证见
+    /// `the_files_find_bar_is_registered_everywhere_a_modal_has_to_be` 自己
+    /// 的注释:「Backspace 被 `handle_panel_key` 解释成回上级目录」写的是
+    /// **登记漏掉时**才会出现的症状,登记对了这条键盘路径压根走不到)。
+    ///
+    /// egui 自己会在 `Escape` 上清掉焦点(`egui::Memory::begin_pass`——事件
+    /// 没进 `TextEdit` 的 `EventFilter` 就被吞,全局清空 `focused_widget`),
+    /// 但那只是让搜索框**失焦**,不关闭搜索条:用户按第一下只看到光标消失,
+    /// 还得再点一次 ✕ 或再按别的键才能真正退出,够不上验收清单第 6 条。
+    ///
+    /// 所以照 `files_hotkey_event` 那一套「分流之前先截」的姿势单独截一次:
+    /// 命中就直接派发 `FindClose` 并把这一下吃掉,不再喂给 egui。同
+    /// `tab_hotkey_event`/`files_hotkey_event`:必须在 `window_event` 里输入
+    /// 分流**之前**调用(T8 纪律)。
+    ///
+    /// **不看 `modal_open()`**,这点与 `files_hotkey_event` 相反:
+    /// `files_finding()`(=`Modal::FilesFind` 的判据)本身就是 `modal_open()`
+    /// 恒真的原因之一,拿 `modal_open()` 当门反而会让这个键永远进不来。
+    fn files_find_escape_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
+            return false;
+        };
+        if ke.state != ElementState::Pressed {
+            return false;
+        }
+        let Some((key, _mods)) = input::translate_key(ke, self.mods) else {
+            return false;
+        };
+        if !matches!(key, Key::Escape) {
+            return false;
+        }
+        // F278:只关**当前看得见**这个标签的搜索条——同 `handle_panel_key`
+        // 既有的路由约定(`files_owner_generation`),不是随便挑一个后台标签。
+        let Some(generation) = self.files_owner_generation() else {
+            return false;
+        };
+        let is_finding = self
+            .tabs
+            .by_generation(generation)
+            .and_then(|t| t.content.files_panel())
+            .is_some_and(|f| f.find.is_some());
+        if !is_finding {
+            return false;
+        }
+        self.close_files_find(generation);
+        self.request_ui_redraw();
+        true
+    }
+
     /// F218:`Ctrl+Shift+B` 按下之后到底做什么。
     ///
     /// 判定全在 `files::reveal::plan` 那张表里 —— 这里只负责取数据、按结果
@@ -5461,6 +5516,46 @@ impl App {
             crate::files::PanelColumn::Remote => files.remote.reveal_pick = Some(pick),
             crate::files::PanelColumn::Local => files.local.reveal_pick = Some(pick),
         }
+    }
+
+    /// F278:点中了一条搜索结果 —— 跳到它所在的目录并把它亮出来。
+    ///
+    /// **落地三步与 `accept_reveal_stat`/`accept_path_probe` 共用同一套**
+    /// (`reveal_destination` + `Goto` + `set_reveal_pick`):三处不同源的话,
+    /// 同一条路径从「划选跳过去」「路径条敲过去」「搜索点过去」会落在三个
+    /// 不同的地方,而这种错只有人按下去才知道。
+    ///
+    /// **不发 `stat`**,这是与那两处唯一的不同:`is_dir` 是遍历时
+    /// `list_dir` 一起带回来的,已经知道了。再问一遍等于在高延迟链路上白加
+    /// 一次往返,而这个功能的全部价值就是省往返。
+    ///
+    /// **命中就在当前目录时天然退化成定位模式**(spec F278 最后一句):
+    /// `reveal_destination` 对文件给的是「父目录 + 末段」,父目录正好等于
+    /// 当前目录 —— `Goto` 过去不换目录,`set_reveal_pick` 把那一条选中。
+    ///
+    /// **先关搜索条再派发 `Goto`**:`Goto` 会走 `begin_load` 把这一栏置成
+    /// 加载中,而结果列表是画在 `Load` 分支**之后**的 —— 顺序反了的话,
+    /// 那一帧仍然画结果列表,用户看不到自己已经跳过去了。
+    fn pick_find_hit(
+        &mut self,
+        generation: u64,
+        path: mullion_ssh::sftp::RemotePath,
+        is_dir: bool,
+    ) {
+        let target = RevealTarget {
+            generation,
+            column: crate::files::PanelColumn::Remote,
+            // 搜索就长在这个标签这条 channel 上,不存在「发起时在另一台」
+            // 的情形(那是 F218 划选跳转独有的)。同 `accept_path_probe`。
+            host_ix: None,
+            path,
+            arrived: false,
+        };
+        let (goto, pick) = self.reveal_destination(&target, is_dir);
+        self.close_files_find(generation);
+        self.apply_remote_file_action(generation, crate::ui::files_panel::FileAction::Goto(goto));
+        self.set_reveal_pick(&target, pick);
+        self.request_ui_redraw();
     }
 
     /// F218:某个标签那份「在途跳转意图」的槽位。终端标签之外恒 `None`
@@ -6163,9 +6258,8 @@ impl App {
                 self.close_files_find(generation);
                 return;
             }
-            FileAction::FindPick { .. } => {
-                // Task 8 接。这里先什么都不做会**静默**——老实记一条。
-                log::warn!("F278:FindPick 还没接线");
+            FileAction::FindPick { path, is_dir } => {
+                self.pick_find_hit(generation, path.clone(), *is_dir);
                 return;
             }
             // F52:下载。同 `Ask`,在借出 `files` 之前分流。
@@ -12594,6 +12688,12 @@ impl ApplicationHandler<UserEvent> for App {
         // F240/T8:从终端区建项目同样必须在分流之前截 —— `N` 走到下面会被
         // 编码进 PTY,给远端 shell 写一个字母。
         if self.project_hotkey_event(&event) {
+            return;
+        }
+        // F278:搜索条开着时 Esc 同样必须在分流之前截——理由见
+        // `files_find_escape_event` 的文档(T8 纪律,以及 `FilesFind` 的
+        // `modal_open` 短路会让这个键永远走不到 `handle_panel_key`)。
+        if self.files_find_escape_event(&event) {
             return;
         }
         // F239:点在最上层弹窗外面 → 走它自己的取消出口关掉,并把这一下
@@ -24857,10 +24957,25 @@ mod tests {
     /// 回来时序号还对得上,`visited` 会在「已取消」之后继续往上跳 ——
     /// 界面上就是「已取消,当时已找到 3 个」后面那个目录数还在动。
     ///
-    /// 自证会变红:把 `cancel_files_find` 里的 `files.find_seq += 1;` 删掉。
+    /// **`find` 只取首次出现不够**:复核实测过留一段
+    /// `if false { files.find_seq += 1; }` 死代码占住靠前的文本位置、
+    /// 真正的递增挪到 `w.cancel()` 之后——字面串仍在,`body.find` 比的是
+    /// 那段死代码的位置,判据照样绿,而这是真实 bug(在途结果照样被收下)。
+    /// clippy `-D warnings` 对这段死代码也不报警,不能指望它兜底。
+    /// 所以先钉「只出现一次」,占坑连编译体积都不用改就能被这一条截住。
+    ///
+    /// 自证会变红:把 `cancel_files_find` 里的 `files.find_seq += 1;` 删掉;
+    /// 或者塞一段 `if false { files.find_seq += 1; }` 占位、把真正的递增挪到
+    /// `w.cancel()` 之后。
     #[test]
     fn canceling_a_search_invalidates_the_requests_already_out() {
         let body = strip_comments(body_of(prod_src(), "fn cancel_files_find("));
+        assert_eq!(
+            body.matches("find_seq += 1").count(),
+            1,
+            "`find_seq += 1` 不止出现一次——多一处占位就能把下面的位置判据\
+             骗过去:{body}"
+        );
         let bump = body.find("find_seq += 1").expect("取消时必须递增序号");
         let cancel = body.find("w.cancel()").expect("取消时必须标 Walk");
         assert!(
@@ -24873,34 +24988,118 @@ mod tests {
     /// abort 会腰斩传输并把 `load` 永久卡在 `Loading`
     /// (见 `reopen_sftp_on_focused_host` 上方那段长注释)。
     ///
-    /// 自证会变红:在 `cancel_files_find` 里加一句
-    /// `if let Some(t) = self.tabs...sftp_tasks_mut() { for h in t.drain(..) { h.abort(); } }`。
+    /// **不是子串黑名单**:复核实测过把 abort 逻辑搬进一个新命名的私有方法
+    /// (比如 `fn drop_find_tasks(&mut self)`),再让 `cancel_files_find` 调
+    /// 它——四个函数各自的正文里确实一次 `abort()`/`sftp_tasks` 都不出现,
+    /// 原来只查这四个函数自身正文的写法会全绿。这里额外把「这四个函数调用
+    /// 的每一个 `self.` 方法」也纳入检查(递归最多 3 层,`seen` 防环),
+    /// 堵死这条「搬去一个新地方」的路。
+    ///
+    /// 自证会变红:把 abort 逻辑挪进一个新的私有方法(例如
+    /// `fn drop_find_tasks(&mut self) { .. }`,里面才真正 `abort()`),
+    /// 在 `cancel_files_find` 里改成调用它。
     #[test]
     fn canceling_a_search_never_aborts_the_shared_task_pool() {
+        let prod = prod_src();
         for name in [
             "fn cancel_files_find(",
             "fn close_files_find(",
             "fn toggle_files_find(",
             "fn start_files_find(",
         ] {
-            let body = strip_comments(body_of(prod_src(), name));
+            let mut seen = std::collections::HashSet::new();
             assert!(
-                !body.contains("abort()") && !body.contains("sftp_tasks"),
-                "{name} 动了共享任务池 —— 会腰斩在跑的传输:{body}"
+                !touches_sftp_task_abort(prod, name, &mut seen, 3),
+                "{name} 的调用链(直接或间接)摸到了 sftp_tasks 的 abort —— \
+                 会腰斩在跑的传输"
             );
         }
+    }
+
+    /// [`canceling_a_search_never_aborts_the_shared_task_pool`] 的递归核心:
+    /// 判「某个函数体自身、或者它调用的 `self.` 方法(递归 `depth` 层)」
+    /// 有没有摸到 `sftp_tasks` 上的 `abort()`。
+    ///
+    /// **不是真的 Rust 解析器**——`called_self_methods` 只是粗糙地摘
+    /// `self.xxx(` 里的方法名,足够堵住「搬进一个新私有方法」这类绕过,
+    /// 堵不住更刁钻的间接调用(比如经 trait 对象、闭包),但那已经超出了
+    /// 这条守护测试要挡的范围。
+    fn touches_sftp_task_abort(
+        prod: &str,
+        sig: &str,
+        seen: &mut std::collections::HashSet<String>,
+        depth: u32,
+    ) -> bool {
+        if !seen.insert(sig.to_string()) {
+            return false;
+        }
+        let Some(at) = prod.find(sig) else {
+            return false;
+        };
+        let brace = match prod[at..].find('{') {
+            Some(i) => i,
+            None => return false,
+        };
+        let body = strip_comments(brace_balanced_arm(&prod[at + brace..]));
+        if body.contains("abort()") && body.contains("sftp_tasks") {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        for callee in called_self_methods(&body) {
+            let callee_sig = format!("fn {callee}(");
+            if touches_sftp_task_abort(prod, &callee_sig, seen, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 从一段函数体源码里摘出所有 `self.xxx(` 调用的方法名(去重)。
+    fn called_self_methods(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find("self.") {
+            rest = &rest[at + "self.".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty()
+                && rest[name.len()..].starts_with('(')
+                && !out.contains(&name)
+            {
+                out.push(name);
+            }
+        }
+        out
     }
 
     /// F278:`pump_find` 遍历全部标签。只推活动标签的话,搜索中切走再切回来
     /// 会发现它停在半路,而且完全静默。
     ///
-    /// 自证会变红:把 `pump_find` 里的 `self.tabs.iter_mut()` 换成只取活动标签。
+    /// **只查有没有 `iter_mut()` 不够**:复核实测过在它后面接一个
+    /// `.filter(|t| Some(t.content.generation()) == cur)` 之类的收窄——
+    /// 字面串 `self.tabs.iter_mut()` 原样还在,行为却已经缩成只推一个标签。
+    /// 所以再钉一条「不含收窄」的反向断言。
+    ///
+    /// 自证会变红:把 `pump_find` 里的 `self.tabs.iter_mut()` 换成只取活动
+    /// 标签(直接换掉,或者在后面接 `.filter(..)` 之类的收窄)。
     #[test]
     fn the_find_pump_walks_every_tab_not_just_the_active_one() {
         let body = strip_comments(body_of(prod_src(), "fn pump_find("));
         assert!(
             body.contains("self.tabs.iter_mut()"),
             "没遍历全部标签:{body}"
+        );
+        assert!(
+            !body.contains(".filter("),
+            "遍历结果被 `.filter(..)` 收窄过,可能只推了一部分标签:{body}"
+        );
+        assert!(
+            !body.contains("active"),
+            "函数体里出现了 `active`,像是收窄成了只推活动标签:{body}"
         );
     }
 
@@ -29063,6 +29262,172 @@ mod tests {
             "没有遍历全部标签 —— 切走再切回来,搜索框就收不到键了:{body}"
         );
         assert!(!body.contains("active"), "按活动标签判了:{body}");
+    }
+
+    /// F278:落地三步与另外两个入口(`accept_reveal_stat`/`accept_path_probe`)
+    /// 共用同一套(`reveal_destination` + `Goto` + `set_reveal_pick`)。
+    /// 各写一份的话,同一条路径从三个入口过去会落在三个不同的地方,而这种
+    /// 错只有人按下去才知道。
+    ///
+    /// 自证会变红:把 `pick_find_hit` 里的 `reveal_destination` 换成手写的
+    /// 「取父目录 + 取末段」。
+    #[test]
+    fn a_search_hit_lands_through_the_same_three_steps_as_the_other_two_entries() {
+        let body = strip_comments(body_of(prod_src(), "fn pick_find_hit("));
+        assert!(
+            body.contains("self.reveal_destination("),
+            "没有调用 `reveal_destination` —— 落地逻辑八成是另起了一份:{body}"
+        );
+        assert!(
+            body.contains("FileAction::Goto(goto)"),
+            "没有把算出来的目的地派发成 `Goto`:{body}"
+        );
+        assert!(
+            body.contains("self.set_reveal_pick("),
+            "没有写下要亮哪一条:{body}"
+        );
+    }
+
+    /// F278:`set_reveal_pick` **必须排在 `Goto` 之后**。`PaneState::begin_load`
+    /// 会 `clear_selection`,写在它前面的话这一条会被自己清掉——症状是
+    /// 「跳过去了但什么都没选中」,看着像没生效,查起来却查不到任何错误。
+    ///
+    /// **两处都先钉「只出现一次」**:复核在别处实测过留一段
+    /// `if false { self.set_reveal_pick(..); }` 死代码占住靠前位置、真正的
+    /// 调用挪到 `Goto` 之前的绕过手法——字面串仍在,`body.find` 比的是那段
+    /// 死代码的位置,判据照样绿。
+    ///
+    /// 自证会变红:把那两行调用对调;或者塞一段
+    /// `if false { self.set_reveal_pick(..); }` 占位、把真正的调用挪到
+    /// `Goto` 之前。
+    #[test]
+    fn the_pick_is_written_after_the_goto_or_it_clears_itself() {
+        let body = strip_comments(body_of(prod_src(), "fn pick_find_hit("));
+        assert_eq!(
+            body.matches("self.apply_remote_file_action(").count(),
+            1,
+            "`apply_remote_file_action` 不止调用一次——多一处占位会把下面\
+             的位置判据骗过去:{body}"
+        );
+        assert_eq!(
+            body.matches("self.set_reveal_pick(").count(),
+            1,
+            "`set_reveal_pick` 不止调用一次——多一处占位会把下面的位置判据\
+             骗过去:{body}"
+        );
+        let goto = body
+            .find("self.apply_remote_file_action(")
+            .expect("没有派发 Goto");
+        let pick = body
+            .find("self.set_reveal_pick(")
+            .expect("没有写下要亮哪一条");
+        assert!(
+            goto < pick,
+            "`set_reveal_pick` 写在了 `Goto` 之前——`begin_load` 的\
+             `clear_selection` 会把它清掉,症状是「跳过去了但什么都没选中」\
+             且完全静默:{body}"
+        );
+    }
+
+    /// F278:**不再问一次 `stat`**——`is_dir` 遍历时已经带回来了,再问等于
+    /// 在高延迟链路上白加一次往返,而这个功能的全部价值就是省往返。
+    ///
+    /// 自证会变红:在 `pick_find_hit` 里加一句 `spawn_sftp_stat(..)`。
+    #[test]
+    fn picking_a_hit_costs_no_extra_round_trip() {
+        let body = strip_comments(body_of(prod_src(), "fn pick_find_hit("));
+        assert!(
+            !body.contains("spawn_sftp_stat"),
+            "又发了一次 stat——`is_dir` 遍历时已经带回来了,再问是白加一次\
+             往返:{body}"
+        );
+    }
+
+    /// F278:跳之前先关搜索条。顺序反了的话,`Goto` 把这一栏置成加载中,
+    /// 而结果列表画在 `Load` 分支**之后**——那一帧仍然画结果列表,用户看
+    /// 不到自己已经跳过去了。
+    ///
+    /// 自证会变红:把 `close_files_find` 挪到 `apply_remote_file_action` 之后。
+    #[test]
+    fn the_find_bar_closes_before_the_jump_so_the_user_sees_where_he_landed() {
+        let body = strip_comments(body_of(prod_src(), "fn pick_find_hit("));
+        assert_eq!(
+            body.matches("self.close_files_find(").count(),
+            1,
+            "`close_files_find` 不止调用一次——多一处占位会把下面的位置判据\
+             骗过去:{body}"
+        );
+        assert_eq!(
+            body.matches("self.apply_remote_file_action(").count(),
+            1,
+            "`apply_remote_file_action` 不止调用一次:{body}"
+        );
+        let close = body
+            .find("self.close_files_find(")
+            .expect("没有关掉搜索条");
+        let goto = body
+            .find("self.apply_remote_file_action(")
+            .expect("没有派发 Goto");
+        assert!(
+            close < goto,
+            "`close_files_find` 写在了 `Goto` 之后——那一帧仍然会画结果列表,\
+             用户看不到自己已经跳过去了:{body}"
+        );
+    }
+
+    /// F278:Esc 关搜索条。
+    ///
+    /// **这条本该按最初设计挂在 `handle_panel_key` 里,但实测那是死路**:
+    /// `Modal::FilesFind` 让 `modal_open()` 恒真,`shell::input_route::route_focused`
+    /// 一见 `modal_open` 就把键盘短路成 `Route::Egui`——`panel_key_pending`/
+    /// `handle_panel_key` 这条路径在搜索条开着的时候根本到不了(反证见
+    /// `the_files_find_bar_is_registered_everywhere_a_modal_has_to_be` 自己
+    /// 的注释)。真正落地在 `files_find_escape_event`,同 `tab_hotkey_event`/
+    /// `files_hotkey_event` 那一套「分流之前先截」的姿势,必须在
+    /// `window_event` 里排在输入分流(`dismiss_on_outside_press` 起)**之前**
+    /// 调用。
+    ///
+    /// **不能拿 `modal_open()` 当门**:`files_hotkey_event` 的 `Ctrl+Shift+B`
+    /// 是反过来的语义(`modal_open()` 时不生效),照抄它的写法在这里刚好
+    /// 相反——`files_finding()` 本身就是 `modal_open()` 恒真的原因之一,
+    /// 拿它当门这个键就永远进不来。
+    ///
+    /// 自证会变红:
+    /// - 把 `self.files_find_escape_event(&event)` 那次调用挪到
+    ///   `dismiss_on_outside_press` 之后(第一条位置断言红);
+    /// - 在 `files_find_escape_event` 里加一句
+    ///   `if self.modal_open() { return false; }`(第二条断言红)。
+    #[test]
+    fn escape_closes_the_find_bar_before_the_general_input_routing_swallows_it() {
+        let prod = prod_src();
+        let window_event_body = strip_comments(body_of(prod, "fn window_event("));
+        assert_eq!(
+            window_event_body
+                .matches("self.files_find_escape_event(&event)")
+                .count(),
+            1,
+            "调用不止一次——多一处占位会把下面的位置判据骗过去:\
+             {window_event_body}"
+        );
+        let escape_at = window_event_body
+            .find("self.files_find_escape_event(&event)")
+            .expect("Esc 关搜索条没有接线");
+        let dismiss_at = window_event_body
+            .find("self.dismiss_on_outside_press(&event)")
+            .expect("找不到 dismiss_on_outside_press 的调用");
+        assert!(
+            escape_at < dismiss_at,
+            "`files_find_escape_event` 排在了输入分流判定之后——按下 Esc \
+             那一下会先被别的分支收走:{window_event_body}"
+        );
+
+        let fn_body = strip_comments(body_of(prod, "fn files_find_escape_event("));
+        assert!(
+            !fn_body.contains("self.modal_open()"),
+            "`files_find_escape_event` 拿 `modal_open()` 当门——`FilesFind` \
+             本身就是 `modal_open()` 恒真的原因之一,这样写会让这个键永远\
+             进不来:{fn_body}"
+        );
     }
 
     /// 取某个函数的函数体源码。**`marker` 必须带行首缩进**——不带的话
