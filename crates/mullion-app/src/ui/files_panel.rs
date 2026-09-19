@@ -9356,8 +9356,8 @@ mod tests {
         let ctx = egui::Context::default();
 
         let mut render = |input: egui::RawInput,
-                           state: &mut PaneState,
-                           find_state: &mut Option<Find>|
+                          state: &mut PaneState,
+                          find_state: &mut Option<Find>|
          -> (Option<FileAction>, Vec<egui::epaint::ClippedShape>) {
             let mut action = None;
             let out = ctx.run(input, |ctx| {
