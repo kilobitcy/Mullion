@@ -29565,13 +29565,19 @@ mod tests {
     /// F278:**不再问一次 `stat`**——`is_dir` 遍历时已经带回来了,再问等于
     /// 在高延迟链路上白加一次往返,而这个功能的全部价值就是省往返。
     ///
-    /// 自证会变红:在 `pick_find_hit` 里加一句 `spawn_sftp_stat(..)`。
+    /// **两种往返都要挡**:`spawn_sftp_stat` 是直接问一句 stat,
+    /// `spawn_sftp_path_probe` 是路径条那条「问一句是文件还是目录」的路 ——
+    /// 复核实测过在 `pick_find_hit` 里塞后者,原来只挡 `spawn_sftp_stat` 的
+    /// 版本照样绿。
+    ///
+    /// 自证会变红:在 `pick_find_hit` 里加一句 `spawn_sftp_stat(..)` 或
+    /// `spawn_sftp_path_probe(..)`。
     #[test]
     fn picking_a_hit_costs_no_extra_round_trip() {
         let body = strip_comments(body_of(prod_src(), "fn pick_find_hit("));
         assert!(
-            !body.contains("spawn_sftp_stat"),
-            "又发了一次 stat——`is_dir` 遍历时已经带回来了,再问是白加一次\
+            !body.contains("spawn_sftp_stat") && !body.contains("spawn_sftp_path_probe"),
+            "又发了一次探测——`is_dir` 遍历时已经带回来了,再问是白加一次\
              往返:{body}"
         );
     }
@@ -29659,6 +29665,26 @@ mod tests {
              本身就是 `modal_open()` 恒真的原因之一,这样写会让这个键永远\
              进不来:{fn_body}"
         );
+    }
+
+    /// F278:Esc 拦截器**只许作用于此刻可见的那个面板**。
+    ///
+    /// 它前置于路由、不受 `modal_open()` 门控,等于拿到了全窗口键盘事件的
+    /// 第一手 —— 一旦它去遍历全部标签,后台标签上一条没人看见的搜索条就会
+    /// 吃掉前台的 Esc,而 `window_event` 里 `if is_kbd { return; }` 让这个键
+    /// 再也到不了终端。这是 `files_finding_of` 刚付过代价的同一个形状
+    /// (见 `a_find_bar_on_a_background_tab_does_not_swallow_the_foreground_keyboard`)。
+    ///
+    /// 自证会变红:把 `files_owner_generation()` 换成 `self.tabs.iter()`。
+    #[test]
+    fn the_escape_interceptor_only_reaches_the_panel_the_user_can_see() {
+        let body = strip_comments(body_of(prod_src(), "fn files_find_escape_event("));
+        assert!(
+            body.contains("files_owner_generation("),
+            "没走「可见的那个面板」这条链 —— 后台标签的搜索条会吃掉前台的 \
+             Esc,而这个键再也到不了终端:{body}"
+        );
+        assert!(!body.contains("tabs.iter()"), "又在遍历全部标签了:{body}");
     }
 
     /// 取某个函数的函数体源码。**`marker` 必须带行首缩进**——不带的话
