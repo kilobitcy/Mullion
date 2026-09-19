@@ -958,19 +958,37 @@ mod tests {
         );
 
         let vault_src = include_str!("vault.rs");
-        let reseal_body = body_of(vault_src, "fn reseal_cloud_secrets(");
-        let take_body = body_of(vault_src, "fn take_cloud_secret_plain(");
+        // **必须剥注释**:`body_of` 只管花括号配平,摘出来的函数体连注释一起带。
+        // 不剥的话,将来加字段的人只要在两个函数里各留一行
+        // `// TODO: qux_sealed 还没接进来`,这条守护就照绿 —— 用一句「还没做」
+        // 的自白骗过一条专门防「没做」的测试。本项目已把「源码切片守护不剥注释」
+        // 登记成独立欠账,这里是它的第 N 次现身。
+        let reseal_body = strip_line_comments(body_of(vault_src, "fn reseal_cloud_secrets("));
+        let take_body = strip_line_comments(body_of(vault_src, "fn take_cloud_secret_plain("));
 
         for name in &field_names {
+            // 判据是**真实赋值语句**而不是「字段名出现过」:后者被
+            // `if cfg.qux_sealed.is_empty() { }` 这种「读了但没写回」的空壳骗得过,
+            // 而那正是漏重封的典型长相。
             assert!(
-                reseal_body.contains(name),
-                "字段 {name} 没有出现在 reseal_cloud_secrets 里 —— 改主密码时它不会被重封"
+                reseal_body.contains(&format!("cfg.{name} =")),
+                "reseal_cloud_secrets 里没有给 {name} 赋值 —— 改主密码时它不会被重封,\
+                 症状是那段密文永久解不开且报错指向别处"
             );
             assert!(
-                take_body.contains(name),
-                "字段 {name} 没有出现在 take_cloud_secret_plain 里 —— 换密钥前不会先把它解出来"
+                take_body.contains(&format!("cfg.{name}")),
+                "take_cloud_secret_plain 里没读 {name} —— 换密钥前不会先把它解出来"
             );
         }
+    }
+
+    /// 剥掉行注释。块注释不管:本项目的源码里没有,加了也会被下面的判据
+    /// (要求真实赋值语句)挡住。
+    fn strip_line_comments(s: &str) -> String {
+        s.lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// 重封失败之后的**自愈路径**:重填一次 SK 就好。
