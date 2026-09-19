@@ -3623,8 +3623,9 @@ impl App {
     /// F273:起一次云端备份。
     ///
     /// **主线程只做纯 CPU 的那一半**(`cloudsync::prepare`:读四个文件、
-    /// 一次 sha256、一次 XChaCha20,微秒级),网络那一半挖进 `spawn_blocking`。
-    /// 拆两半的根由是 `Vault` 搬不进线程 —— 见 `cloudsync` 的模块文档。
+    /// 一次 sha256,微秒级),封装(两次 Argon2id,60~120 ms,F283)与网络
+    /// 都挖进 `spawn_blocking`。拆两半的根由是 `Vault` 搬不进线程 ——
+    /// 见 `cloudsync` 的模块文档。
     ///
     /// 已有在途的就**直接回**(不排队:排队等于把「已经过时的那一份」推上去,
     /// 而下一轮会立刻再推一份新的)。
@@ -3652,7 +3653,7 @@ impl App {
         };
         let stamp_rfc3339 = now_rfc3339();
         let stamp_compact = now_compact();
-        let payload = match crate::cloudsync::prepare(&dir, store.vault(), &cfg, &stamp_rfc3339) {
+        let payload = match crate::cloudsync::prepare(&dir, store.vault(), &cfg) {
             crate::cloudsync::Prepared::Unchanged => {
                 if manual {
                     self.ui

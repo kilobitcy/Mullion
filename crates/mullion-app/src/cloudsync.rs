@@ -11,10 +11,13 @@
 //! 拆的理由是 **`Vault` 搬不进线程**:它住在 `App.store` 里、没有 `Clone`,
 //! 而给它加 `Clone` 等于允许「两份 Vault 各自 `save()` 互相覆盖」——
 //! 正是 F247/F248 刚修完的「整份覆盖」缺陷族。于是凡是要 vault 的活
-//! (封载荷、解 SK)留在事件循环线程上,搬进线程的只有字节。
+//! (取备份口令、取凭据明文、解 SK)留在事件循环线程上,搬进线程的只有字节
+//! (与两段明文,见 [`Payload`])。
 //!
-//! 主线程那一半全是纯 CPU(读几十 KB、一次 sha256、一次 XChaCha20),微秒级。
-//! 内容没变时它直接回 `Unchanged`,连 `spawn_blocking` 都不起。
+//! 主线程那一半全是纯 CPU(读几十 KB、一次 sha256),微秒级。内容没变时
+//! 它直接回 `Unchanged`,连 `spawn_blocking` 都不起。**F283 之后,两次
+//! Argon2id 派生(重封凭据 + 重封整包,合计 60~120 ms)挪进了阻塞那一半**
+//! ——放在事件循环线程上就是每次内容变更卡一帧(C3)。
 //!
 //! # 阻塞
 //!
@@ -31,7 +34,7 @@ use std::path::Path;
 use mullion_cloud::error::CloudError;
 use mullion_cloud::s3::{Credentials, S3Client};
 use mullion_cloud::url::Endpoint;
-use mullion_store::{cloud, portable, CloudConfig, Vault};
+use mullion_store::{cloud, portable, CloudConfig, PackFile, Vault};
 
 /// 撞号之后最多再试几次。**必须有限**,见上面那条测试的理由。
 pub const MAX_PUT_ATTEMPTS: u32 = 4;
@@ -141,12 +144,22 @@ pub fn fingerprint_now(dir: &Path) -> Result<String, String> {
     Ok(cloud::fingerprint(&files, &secrets))
 }
 
-/// 一次上传的**主线程那一半**的产物。
+/// 交给阻塞半的全部输入。**一个 `Vault` 都不带**(见 [`prepare`])。
+///
+/// 这里躺着两段明文(凭据正文与备份口令),和已经在这儿躺着的 SK 一样:
+/// 同一个进程内的内存传递,不落盘、不进日志。**封装本身放在阻塞半**,
+/// 因为 Argon2id 一次 30~60 ms,两层就是 60~120 ms —— 放在事件循环
+/// 线程上就是每次内容变更卡一帧(C3)。
 pub struct Payload {
-    /// 这一份的内容指纹。上传成功后由 `app.rs` 写回游标。
+    /// 这一份的内容指纹。上传成功后由 `app.rs` 写回游标。**对盘上原始
+    /// `secrets.enc` 字节取**,不受下面重封时的随机盐影响(C4)。
     pub fingerprint: String,
-    /// 已经用备份口令(F283)整体封好的字节。**云上那份就是它。**
-    pub sealed: Vec<u8>,
+    /// 顶层三文件(不带 `layouts/`,设计 D7)。
+    pub files: Vec<PackFile>,
+    /// `secrets.enc` 解出来的明文。没存过密码时是空串。
+    pub secrets_plain: String,
+    /// 备份口令(F283,与主密码无关)。
+    pub passphrase: String,
     /// 解出来的 Access Key Secret。
     pub secret_access_key: String,
 }
@@ -160,21 +173,24 @@ pub enum Prepared {
     Failed(String),
 }
 
-/// 上传的**主线程那一半**:装 + 封 + 解 SK。
+/// 上传的**主线程那一半**:算指纹、取备份口令、取凭据明文、解 SK。
+/// **不封装、不打包**——那两次 Argon2id(60~120 ms)挪进了阻塞半的
+/// [`seal_payload`](C3)。
 ///
 /// # 为什么拆成两半
 ///
 /// `Vault` **搬不进 `spawn_blocking`**:它住在 `App.store` 里、没有 `Clone`,
 /// 而给它加一个 `Clone` 等于允许「两份 Vault 各自 `save()` 互相覆盖」——
 /// 那正是 F247/F248 刚修完的「整份覆盖」缺陷族。于是凡是要 vault 的活
-/// (封载荷、解 SK)全留在事件循环线程上,搬进线程的只有**字节**。
+/// (取备份口令、取凭据明文、解 SK)全留在事件循环线程上,搬进线程的只有
+/// **字节与两段明文**(见 [`Payload`])。
 ///
-/// 这一半**全是纯 CPU**:读四个几十 KB 的文件、一次 sha256、一次
-/// XChaCha20 —— 微秒级,不会卡帧。真正会卡的是网络,那一半在
+/// 这一半**全是纯 CPU**:读四个几十 KB 的文件、一次 sha256 —— 微秒级,
+/// 不会卡帧。真正会卡的是封装(两次 Argon2id)与网络,都在
 /// [`upload_blocking`] 里。
 ///
 /// 顺带的好处:指纹比对也在这儿做,内容没变时连 `spawn_blocking` 都不起。
-pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str) -> Prepared {
+pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig) -> Prepared {
     // ① 装:顶层三文件 + 密文。**不带 layouts**(设计 D7)。
     //
     // `secrets.enc` 不能原样放进包 —— 那只在「必须先设主密码」(旧设计 D6)
@@ -184,10 +200,10 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
     // 拷到云上、再拉到新电脑,解密钥匙根本不在场 —— 症状是「会话都在,
     // 每条都要重新输密码」,且全链路零报错(F46-a 上踩过一次,见下面)。
     //
-    // 于是这里改成用**备份口令**(F283,与主密码无关、专供云备份用)把
+    // 于是要用**备份口令**(F283,与主密码无关、专供云备份用)把
     // `secrets.enc` 的明文重封一遍,再整体打进包、包本身也用同一句口令
-    // 封一层。重封之后的载荷与 F46-a 的 `.mullionpack` **同形**——将来做
-    // 「从云端恢复」可以直接复用 `install_pack` 那条读取路径。
+    // 封一层 —— 但**这两次封装本身挪进了 `upload_blocking`**(见 [`seal_payload`]),
+    // 这里只负责把料备齐。
     //
     // `read_secrets` 把「文件不存在」(合法,空字节继续)与「读不出来」
     // (权限 / IO / 被杀软短暂锁住)分开报错 —— 后者若静默吞成空字节,
@@ -198,7 +214,7 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
         Ok(s) => s,
         Err(e) => return Prepared::Failed(e),
     };
-    // 指纹**必须**对盘上这份原始字节取,不能对下面重封出来的结果取:
+    // 指纹**必须**对盘上这份原始字节取,不能对重封出来的结果取(C4):
     // 重封每次换随机盐 + 随机 nonce,同一份内容连算两次都不相等,那样会让
     // 每个 interval 都判定成「变了」而重新上传一次 —— 打的是用户的付费桶,
     // 还会把 `keep` 份历史窗口刷光。
@@ -211,7 +227,7 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
         return Prepared::Unchanged;
     }
 
-    // ② 取备份口令。**最先取**:没口令就没必要打包,而且这句话要说得出口
+    // ② 取备份口令。**最先取**:没口令就没必要往下走,而且这句话要说得出口
     // (C5)——不去动 `cloud::should_upload` 那道定时器闸,落点就是这里的
     // `Failed`,与今天 `NoMasterPassword` 那条完全同形。
     let pass = match cloud::passphrase(cfg, vault) {
@@ -226,37 +242,15 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
         Err(e) => return Prepared::Failed(format!("读不出备份口令:{e}")),
     };
 
-    // ③ 内层:`secrets.enc` 的明文用备份口令重封一遍(理由见①)。
-    // 一条密码都没存过时 `plain` 是空串 —— 不封空密文,否则包里会有一段
-    // 解得开却什么都没有的字节,恢复那头会照着它管用户要口令
-    // (同 F46-a 导出路径的姿态,见 `app.rs` 的 `write_pack_to`)。
+    // ③ 取 `secrets.enc` 的明文。**这里不重封**——重封是两次 Argon2id
+    // (60~120 ms),留给 `upload_blocking`(C3)。一条密码都没存过时是空串,
+    // `seal_payload` 里会把空串继续当「不封空密文」处理(理由见那边)。
     let plain = match vault.secrets_plaintext() {
         Ok(p) => p,
         Err(e) => return Prepared::Failed(format!("读不出凭据:{e}")),
     };
-    let inner = if plain.is_empty() {
-        Vec::new()
-    } else {
-        match portable::seal_secrets(plain.as_bytes(), &pass) {
-            Ok(b) => b,
-            Err(e) => return Prepared::Failed(format!("重封凭据失败:{e}")),
-        }
-    };
 
-    // ④ 打包 + 外层整体用**同一句备份口令**加密(两层用同一个函数
-    // `seal_secrets`——它的本质是「用口令封一段字节」,不是「只封凭据」,
-    // 这里借它给整份包再封一层,省得为外层另起一个同构的函数)。
-    // 整体加密之后,sessions.toml 里的真机 IP / 用户名 / 跳板拓扑不落云端明文。
-    let text = match portable::write_pack(files, &inner, env!("CARGO_PKG_VERSION"), stamp_rfc3339) {
-        Ok(t) => t,
-        Err(e) => return Prepared::Failed(format!("打包失败:{e}")),
-    };
-    let sealed = match portable::seal_secrets(text.as_bytes(), &pass) {
-        Ok(b) => b,
-        Err(e) => return Prepared::Failed(format!("加密失败:{e}")),
-    };
-
-    // ⑤ 解 SK。**这是最后一件需要 vault 的事**,做完之后线程那一半就只剩字节了。
+    // ④ 解 SK。**这是最后一件需要 vault 的事**,做完之后线程那一半就只剩字节了。
     let sk = match cloud::secret_key(cfg, vault) {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => return Prepared::Failed("还没填 Access Key Secret".into()),
@@ -265,13 +259,51 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
 
     Prepared::Ready(Payload {
         fingerprint: fp,
-        sealed,
+        files,
+        secrets_plain: plain,
+        passphrase: pass,
         secret_access_key: sk,
     })
 }
 
-/// 上传的**阻塞那一半**:只碰网络。**必须挖进 `spawn_blocking` 调用**
-/// (走 `Runtime` 句柄,见模块文档)。
+/// 把 [`Payload`] 里还没封的料封成最终要传的字节:内层用备份口令重封
+/// `secrets.enc` 的明文,打包,外层再用同一句口令整体封一次(两层用同一个
+/// 函数 `seal_secrets`——它的本质是「用口令封一段字节」,不是「只封凭据」)。
+/// 整体加密之后,`sessions.toml` 里的真机 IP / 用户名 / 跳板拓扑不落云端明文。
+///
+/// 重封之后的载荷与 F46-a 的 `.mullionpack` **同形**——将来做「从云端恢复」
+/// 可以直接复用 `install_pack` 那条读取路径。
+///
+/// 抽成纯函数是为了让两次 Argon2id 派生**能被单独测到**而不必依赖网络
+/// —— 本项目登记过「纯函数测得扎实、接线没人看着」这种恒绿,这里配合
+/// [`upload_blocking`] 顶上那条源码切片守护,纯函数与接线两头都有人守。
+///
+/// **只许从 `upload_blocking` 调用,不许挪回 `prepare`**:两次 Argon2id
+/// 一共 60~120 ms,搬到事件循环线程上就是每次内容变更卡一帧(C3)。
+fn seal_payload(
+    payload: &Payload,
+    app_version: &str,
+    stamp_rfc3339: &str,
+) -> Result<Vec<u8>, String> {
+    // 内层:一条密码都没存过时 `secrets_plain` 是空串 —— 不封空密文,否则
+    // 包里会有一段解得开却什么都没有的字节,恢复那头会照着它管用户要口令
+    // (同 F46-a 导出路径的姿态,见 `app.rs` 的 `write_pack_to`)。
+    let inner = if payload.secrets_plain.is_empty() {
+        Vec::new()
+    } else {
+        portable::seal_secrets(payload.secrets_plain.as_bytes(), &payload.passphrase)
+            .map_err(|e| format!("重封凭据失败:{e}"))?
+    };
+
+    let text = portable::write_pack(payload.files.clone(), &inner, app_version, stamp_rfc3339)
+        .map_err(|e| format!("打包失败:{e}"))?;
+
+    portable::seal_secrets(text.as_bytes(), &payload.passphrase)
+        .map_err(|e| format!("加密失败:{e}"))
+}
+
+/// 上传的**阻塞那一半**:封装(两次 Argon2id,见 [`seal_payload`])+ 网络。
+/// **必须挖进 `spawn_blocking` 调用**(走 `Runtime` 句柄,见模块文档)。
 ///
 /// **签名里不许出现 `Vault`**,见 [`prepare`] 的那段理由(有守护测试钉着)。
 ///
@@ -283,6 +315,13 @@ pub fn upload_blocking(
     stamp_compact: &str,
     stamp_rfc3339: &str,
 ) -> UploadOutcome {
+    // 两次 Argon2id(内层重封凭据 + 外层整体加密),合计 60~120 ms —— 必须
+    // 在这里做,不许挪回 `prepare`(C3,见 `seal_payload` 文档)。
+    let sealed = match seal_payload(&payload, env!("CARGO_PKG_VERSION"), stamp_rfc3339) {
+        Ok(b) => b,
+        Err(e) => return UploadOutcome::Failed(e),
+    };
+
     // `S3Client::new` 返回 `Result`(代理串解析不了时报 `Config`)——
     // **不要写成 `.unwrap()`**:那条路上用户填错代理地址就是当场 panic。
     let socks5 = (!cfg.socks5.is_empty()).then_some(cfg.socks5.as_str());
@@ -315,7 +354,7 @@ pub fn upload_blocking(
         start,
         stamp_compact,
         initial_skip,
-        |key, skip| client.put_no_overwrite(key, &payload.sealed, stamp_compact, skip),
+        |key, skip| client.put_no_overwrite(key, &sealed, stamp_compact, skip),
     ) {
         Ok((seq, final_skip)) => UploadOutcome::Ok {
             fingerprint: payload.fingerprint,
@@ -668,7 +707,7 @@ mod tests {
         std::fs::create_dir(broken.path().join("secrets.enc")).expect("建同名目录");
 
         let cfg = mullion_store::CloudConfig::default();
-        match prepare(broken.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+        match prepare(broken.path(), &v, &cfg) {
             Prepared::Failed(msg) => assert!(
                 msg.contains("secrets.enc"),
                 "拦是拦下了,但没说清是 secrets.enc 读不出来 —— \
@@ -697,10 +736,11 @@ mod tests {
         let mut cfg = mullion_store::CloudConfig::default();
         cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
         cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
-        match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+        match prepare(dir.path(), &v, &cfg) {
             Prepared::Ready(p) => {
-                assert!(!p.sealed.is_empty(), "封出来的载荷是空的");
                 assert!(!p.fingerprint.is_empty(), "没算出指纹");
+                let sealed = seal_payload(&p, "test", "2026-09-15T10:15:00Z").expect("封装失败");
+                assert!(!sealed.is_empty(), "封出来的载荷是空的");
             }
             Prepared::Failed(msg) => panic!("钥匙串方案 + 备份口令应该能备份,却失败了:{msg}"),
             Prepared::Unchanged => panic!("被当成「内容没变」跳过了"),
@@ -718,7 +758,7 @@ mod tests {
         )
         .expect("开库");
         let cfg = mullion_store::CloudConfig::default();
-        match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+        match prepare(dir.path(), &v, &cfg) {
             Prepared::Failed(msg) => {
                 assert!(
                     msg.contains("备份口令"),
@@ -764,11 +804,12 @@ mod tests {
         cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
         cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
 
-        let payload = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+        let payload = match prepare(dir.path(), &v, &cfg) {
             Prepared::Ready(p) => p,
             other => panic!("该有东西可传,却是 {}", debug_label(&other)),
         };
-        let text = portable::open_secrets(&payload.sealed, "backup-pass").expect("外层解不开");
+        let sealed = seal_payload(&payload, "test", "2026-09-15T10:15:00Z").expect("封装失败");
+        let text = portable::open_secrets(&sealed, "backup-pass").expect("外层解不开");
         let text = String::from_utf8(text).expect("外层解出来不是 UTF-8");
         let pack = portable::read_pack(&text).expect("包解析失败");
         let inner = portable::secrets_blob(&pack).expect("内层密文段不是合法 base64");
@@ -796,11 +837,12 @@ mod tests {
         cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
         cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
 
-        let payload = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+        let payload = match prepare(dir.path(), &v, &cfg) {
             Prepared::Ready(p) => p,
             other => panic!("该有东西可传,却是 {}", debug_label(&other)),
         };
-        let text = portable::open_secrets(&payload.sealed, "backup-pass").expect("外层解不开");
+        let sealed = seal_payload(&payload, "test", "2026-09-15T10:15:00Z").expect("封装失败");
+        let text = portable::open_secrets(&sealed, "backup-pass").expect("外层解不开");
         let text = String::from_utf8(text).expect("外层解出来不是 UTF-8");
         let pack = portable::read_pack(&text).expect("包解析失败");
         let inner = portable::secrets_blob(&pack).expect("内层密文段不是合法 base64");
@@ -815,8 +857,15 @@ mod tests {
 
     /// C4:指纹仍对**盘上 secrets.enc 的原始字节**取,不受重封的随机盐影响。
     ///
-    /// 反例会红:若改成对重封结果取,同一份内容连算两次都不相等 ——
-    /// 后果是每个 interval 都上传一次,打的是用户的付费桶。
+    /// `prepare` 现在跟重封完全不相干(F283 之后重封挪进了 `seal_payload`),
+    /// 所以这里**额外**对两份 `Payload` 各自跑一次 `seal_payload`,拿
+    /// `sealed1 != sealed2`(证明确实用了随机盐/nonce,不是没重封)去
+    /// 反衬 `fp1 == fp2`(指纹压根不看这份随机性)—— 只比对 `fp1 == fp2`
+    /// 本身在新结构下是恒真的(指纹在 `prepare` 里就已经定死,`seal_payload`
+    /// 根本碰不到它),不足以证明这条不变量。
+    ///
+    /// 反例会红:若把 `prepare` 里的 `fp` 改成对重封结果取,同一份内容连算
+    /// 两次都不相等 —— 后果是每个 interval 都上传一次,打的是用户的付费桶。
     #[test]
     fn the_fingerprint_does_not_change_just_because_we_resealed() {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -826,17 +875,25 @@ mod tests {
         cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
         // `cfg.last_fingerprint` 全程留空,两次调用都不能走 `Unchanged` 早退。
 
-        let fp1 = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
-            Prepared::Ready(p) => p.fingerprint,
+        let p1 = match prepare(dir.path(), &v, &cfg) {
+            Prepared::Ready(p) => p,
             other => panic!("第一次该有东西可传,却是 {}", debug_label(&other)),
         };
-        let fp2 = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:01Z") {
-            Prepared::Ready(p) => p.fingerprint,
+        let p2 = match prepare(dir.path(), &v, &cfg) {
+            Prepared::Ready(p) => p,
             other => panic!("第二次该有东西可传,却是 {}", debug_label(&other)),
         };
         assert_eq!(
-            fp1, fp2,
+            p1.fingerprint, p2.fingerprint,
             "同一份内容重封了两次,指纹却变了 —— 每个 interval 都会重新上传一次"
+        );
+
+        let sealed1 = seal_payload(&p1, "test", "2026-09-15T10:15:00Z").expect("第一次封装失败");
+        let sealed2 = seal_payload(&p2, "test", "2026-09-15T10:15:01Z").expect("第二次封装失败");
+        assert_ne!(
+            sealed1, sealed2,
+            "两次封装的字节完全相同 —— 说明这条测试没有真的重封,\
+             证明不了「指纹不受重封影响」这件事"
         );
     }
 
@@ -868,10 +925,11 @@ mod tests {
         // 前置条件(与主密码无关),这里也要设一个。
         cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
         cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
-        match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+        match prepare(dir.path(), &v, &cfg) {
             Prepared::Ready(p) => {
-                assert!(!p.sealed.is_empty(), "封出来的载荷是空的");
                 assert!(!p.fingerprint.is_empty(), "没算出指纹");
+                let sealed = seal_payload(&p, "test", "2026-09-15T10:15:00Z").expect("封装失败");
+                assert!(!sealed.is_empty(), "封出来的载荷是空的");
             }
             other => panic!(
                 "第一次就该有东西可传,拿到的却是 {}",
@@ -909,16 +967,13 @@ mod tests {
         cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
         cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
 
-        let fp = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+        let fp = match prepare(dir.path(), &v, &cfg) {
             Prepared::Ready(p) => p.fingerprint,
             _ => panic!("第一次就该有东西可传"),
         };
         cfg.last_fingerprint = fp;
         assert!(
-            matches!(
-                prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:01Z"),
-                Prepared::Unchanged
-            ),
+            matches!(prepare(dir.path(), &v, &cfg), Prepared::Unchanged),
             "内容一个字没变却又要推一遍 —— N 份历史窗口会被自己刷光"
         );
     }
@@ -955,5 +1010,99 @@ mod tests {
             !sig.contains("Vault"),
             "upload_blocking 的签名里出现了 Vault —— 它跑在别的线程上:{sig}"
         );
+    }
+
+    /// 从源码里摘出一个函数/结构体的块体(含花括号),用花括号计数配平 ——
+    /// 不用字符串切分,避免切到别的同名前缀或切到文件尾(本项目已因为
+    /// 切分手法造过两次假绿,`cloud.rs`/`app.rs` 都登记了同一手法,这里照抄)。
+    fn body_of<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("找不到 {sig} —— 这条测试的锚点失效了"));
+        let open = src[start..].find('{').map(|i| start + i).expect("没有块体");
+        let bytes = src.as_bytes();
+        let mut depth = 0i32;
+        let mut end = open;
+        for (i, &b) in bytes[open..].iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "花括号没配平,{sig} 的块体没摘全");
+        &src[open..=end]
+    }
+
+    /// 剥掉整行注释。注释里常常正好写着断言要找的关键词(比如
+    /// `seal_secrets`),不剥的话测试是在考自己的注释。只剥**整行**注释,
+    /// 理由同 `app.rs`/`cloud.rs` 里的同名 helper。
+    fn strip_comments(body: &str) -> String {
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `cloudsync.rs` 去掉测试模块之后的那一半。源码切片断言必须先切掉
+    /// 测试模块,否则测试自己写的字面量能把断言喂饱,恒绿。
+    fn prod_src() -> &'static str {
+        let src = include_str!("cloudsync.rs");
+        let (prod, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("cloudsync.rs 的测试模块分界变了,所有源码切片断言的锚点都失效了");
+        prod
+    }
+
+    /// C3:派生密钥是 60~120 ms 的活,**不许在事件循环线程上做**。
+    ///
+    /// 三段分开看,纯函数与接线两头都有人守:
+    /// - `prepare` 体内不许出现 `seal_secrets(`/`seal_payload(`——封装
+    ///   一步都不该在事件循环线程上跑。
+    /// - `upload_blocking` 体内必须调用 `seal_payload(`——这是接线的守护。
+    /// - `seal_payload` 体内必须恰好两次 `seal_secrets(`(内层 + 外层)——
+    ///   这是纯函数本身的守护。
+    ///
+    /// 自证会变红:把 `seal_payload(..)` 的调用从 `upload_blocking` 挪回
+    /// `prepare`。
+    #[test]
+    fn the_key_derivation_happens_off_the_event_loop_thread() {
+        let src = prod_src();
+        let prep = strip_comments(body_of(src, "pub fn prepare("));
+        assert!(
+            !prep.contains("seal_secrets("),
+            "封装留在 prepare 里 = 每次内容变更卡一帧(两次 Argon2id,60~120ms)"
+        );
+        assert!(
+            !prep.contains("seal_payload("),
+            "prepare 里直接调用了 seal_payload —— 封装还是跑在事件循环线程上"
+        );
+
+        let up = strip_comments(body_of(src, "pub fn upload_blocking("));
+        assert!(
+            up.contains("seal_payload("),
+            "upload_blocking 里没有调用 seal_payload —— 封装挪去哪儿了?"
+        );
+
+        let seal = strip_comments(body_of(src, "fn seal_payload("));
+        assert_eq!(
+            seal.matches("seal_secrets(").count(),
+            2,
+            "seal_payload 里该有内外两层 seal_secrets 调用"
+        );
+    }
+
+    /// 搬家不许把 `Vault` 也搬过去。
+    #[test]
+    fn the_payload_carries_bytes_and_strings_only() {
+        let src = prod_src();
+        let decl = body_of(src, "pub struct Payload");
+        assert!(!decl.contains("Vault"), "Payload 不许带 Vault");
     }
 }
