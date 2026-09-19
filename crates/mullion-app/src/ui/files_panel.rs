@@ -1182,8 +1182,14 @@ pub fn show(
     if let Some(w) = find.as_ref().and_then(|f| f.walk.as_ref()) {
         let root = w.root().clone();
         let hits: Vec<_> = w.hits().to_vec();
+        // 复核 Critical:漏 `generation` 会撞成同一个持久化 `Id` ——
+        // `id` 全仓库只有 `"远端"`/`"本地"` 两个字面值(见 `scroll_id_salt`
+        // 那段长注释),同一 `egui::Context` 内两个都开着搜索的远端标签会
+        // 共享滚动偏移;分屏(F30/F31)下两个同为远端栏的搜索结果甚至会
+        // 在同一帧里撞成完全相同的 `Id`。复用既有的 `scroll_id_salt`,不
+        // 另起一套 salt 规则。
         egui::ScrollArea::vertical()
-            .id_salt(("files-find-results", id))
+            .id_salt(scroll_id_salt(id, generation))
             .auto_shrink([false, false])
             .show_rows(ui, ROW_H, hits.len(), |ui, range| {
                 for i in range {
@@ -9286,5 +9292,111 @@ mod tests {
             find_text_pos(&out.shapes, "/home/u/proj/src/app.rs").is_none(),
             "结果行画出了完整绝对路径,而不是相对路径"
         );
+    }
+
+    /// 复核 Critical:搜索结果 `ScrollArea` 的 `id_salt` 必须掺 `generation`,
+    /// 不能只靠 `id`(`"远端"`/`"本地"` 两个字面值全仓库只有这两种,同一
+    /// `egui::Context` 内跨标签、跨分屏都会撞)。源码切片守护:以
+    /// `w.hits().to_vec()`(搜索结果这一块唯一、稳定的锚点字面串)定位,
+    /// 往后找紧邻的 `id_salt` 调用,判据是里面出现 `generation`
+    /// (或 `scroll_id_salt`)——照抄本文件里已有的
+    /// `the_results_list_shows_relative_paths` 写法。
+    ///
+    /// 自证会变红:把 `.id_salt(scroll_id_salt(id, generation))` 改回
+    /// `.id_salt(("files-find-results", id))`。
+    #[test]
+    fn the_find_results_scroll_area_salts_its_id_with_generation() {
+        let src = strip_comments(prod_src_panel());
+        let anchor = src
+            .find("w.hits().to_vec()")
+            .expect("没找到搜索结果块的锚点 w.hits().to_vec()");
+        let block = &src[anchor..(anchor + 200).min(src.len())];
+        assert!(
+            block.contains("id_salt"),
+            "锚点附近没找到 id_salt 调用,锚点可能挪动了:{block:?}"
+        );
+        assert!(
+            block.contains("generation") || block.contains("scroll_id_salt"),
+            "搜索结果 ScrollArea 的 id_salt 附近没出现 generation/scroll_id_salt —— \
+             同一 egui::Context 内不同标签(甚至同屏分屏)的远端搜索结果会撞成同一个 \
+             持久化 Id,互相吃掉滚动/交互状态。实际片段:{block:?}"
+        );
+    }
+
+    /// 复核 Important:计划原文明写「单击也算」——结果列表没有「展开」这种
+    /// 二段动作,只接双击的话用户会以为点不动。但既有 120 条测试里没有一条
+    /// 真正模拟过鼠标点击(端到端那两条只断言渲染出的文字),把
+    /// `resp.clicked() ||` 这半句删掉照样全绿。这里补一次真实的
+    /// press+release 模拟,钉住单击这条路径。
+    ///
+    /// 自证会变红:把判据从 `resp.clicked() || resp.double_clicked()`
+    /// 改成只剩 `resp.double_clicked()`。
+    #[test]
+    fn a_single_click_on_a_result_row_picks_it() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(rp("/home/u/proj"));
+        state.load = Load::Ready;
+
+        // 命中直接摆在根目录下,免去跨子目录相对路径换算,坐标只认
+        // "app.rs" 这一处文字即可。
+        let mut w = crate::files::find::Walk::new(rp("/home/u/proj"), "app".into(), false);
+        let b0 = w.take_runnable();
+        assert_eq!(b0.len(), 1);
+        w.accept(&b0[0], Ok(vec![entry(b"app.rs", EntryKind::File)]));
+        assert_eq!(w.hits().len(), 1, "应该命中 /home/u/proj/app.rs 一条");
+
+        let mut find_state = Some(Find {
+            buf: "app".to_string(),
+            focus_pending: false,
+            walk: Some(w),
+            seq: 0,
+        });
+
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+
+        let mut render = |input: egui::RawInput,
+                           state: &mut PaneState,
+                           find_state: &mut Option<Find>|
+         -> (Option<FileAction>, Vec<egui::epaint::ClippedShape>) {
+            let mut action = None;
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        BookmarkView::none(),
+                        0,
+                        &mut cols,
+                        None,
+                        None,
+                        Some(find_state),
+                    );
+                });
+            });
+            (action, out.shapes)
+        };
+
+        // 先跑两帧稳定布局(egui Panel 首帧是 sizing pass),拿命中行坐标。
+        let _ = render(raw(None), &mut state, &mut find_state);
+        let (_, shapes) = render(raw(None), &mut state, &mut find_state);
+        let pos = find_text_pos(&shapes, "app.rs").expect("结果行该画出 app.rs");
+
+        // 单击:press 与 release 落在同一位置、同一控件上。
+        let _ = render(press(pos, 1.0, true), &mut state, &mut find_state);
+        let (action, _) = render(press(pos, 1.1, false), &mut state, &mut find_state);
+
+        match action {
+            Some(FileAction::FindPick { path, is_dir }) => {
+                assert_eq!(path, rp("/home/u/proj/app.rs"));
+                assert!(!is_dir);
+            }
+            other => panic!("单击结果行该产出 FindPick,实际是 {other:?}"),
+        }
     }
 }
