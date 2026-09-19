@@ -227,30 +227,57 @@ pub fn show(
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             annotate::mark(ui.ctx(), "设置弹窗", ui.max_rect());
-            let mut first = true;
-            form::section(ui, t, "设置", "外观", &mut first);
-            appearance(ui, t, draft, env, &mut out);
-            form::section(ui, t, "设置", "远端", &mut first);
-            remote(ui, t, draft, &mut out);
-            form::section(ui, t, "设置", "文件面板", &mut first);
-            files(ui, t, draft, &mut out);
-            form::section(ui, t, "设置", "诊断", &mut first);
-            diagnostics(ui, t, draft, &mut out);
-            form::section(ui, t, "设置", "安全", &mut first);
-            security(ui, t, draft, env, &mut out);
-            form::section(ui, t, "设置", "云端备份", &mut first);
-            cloud(ui, t, draft, env, &mut out);
-            form::section(ui, t, "设置", "快捷键", &mut first);
-            shortcut_table(ui, t);
-            ui.add_space(SP_L);
-            ui.horizontal(|ui| {
-                if ui.button("确定").clicked() {
-                    out = SettingsOut::Commit;
-                }
-                ui.add_space(SP_S);
-                if ui.button("取消").clicked() {
-                    out = SettingsOut::Cancel;
-                }
+            // F280:小屏幕上这个弹窗内容比屏幕还高,而 egui 的窗口 constrain
+            // 只**平移**窗口不压缩内容 —— 不设上限的话大约 1/7 的内容画到了
+            // 屏幕外面,划都划不到。
+            //
+            // 高度上界从**这一行离屏幕底还剩多少**实测,不走 `Window::max_height`:
+            // 那个限的是内容区,得再自己减一个「标题栏 + 边框 + 内外边距」的
+            // 常量(照 `project_manager.rs` 已验证过的写法)。
+            let room = ctx.screen_rect().bottom() - ui.cursor().top() - SP_M;
+            ui.set_max_height(room.max(160.0));
+            // 宽度同理:小屏或大字号下表单可能比屏幕宽,横向也要能滚到。
+            ui.set_max_width((ctx.screen_rect().width() - 2.0 * SP_M).max(320.0));
+            // **不猜按钮行高度去反推正文高度** —— `egui::Window` 内部走的是
+            // `Resize`,每帧 `desired_size = desired_size.max(last_content_size)`
+            // (0.30 `containers/resize.rs:258`,F217 已踩过),猜小了的差额会
+            // 每帧累积,表现为打开弹窗时窗口自己长高一段时间。
+            //
+            // 治法照 `editor_window.rs`(F217)已验证的结构:`bottom_up` 里
+            // **按钮先加、摆在最下面**,正文的 `ScrollArea` 用剩下的全部空间
+            // (不给 `max_height`,egui 自己 `at_most(可用空间)`)。`ScrollArea`
+            // 的内容 `Ui` 会继承外层 `bottom_up` 的方向,所以正文必须再套一层
+            // `top_down` 把方向拨回来,否则各分节会整段倒着画。
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        out = SettingsOut::Commit;
+                    }
+                    ui.add_space(SP_S);
+                    if ui.button("取消").clicked() {
+                        out = SettingsOut::Cancel;
+                    }
+                });
+                ui.add_space(SP_L);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut first = true;
+                        form::section(ui, t, "设置", "外观", &mut first);
+                        appearance(ui, t, draft, env, &mut out);
+                        form::section(ui, t, "设置", "远端", &mut first);
+                        remote(ui, t, draft, &mut out);
+                        form::section(ui, t, "设置", "文件面板", &mut first);
+                        files(ui, t, draft, &mut out);
+                        form::section(ui, t, "设置", "诊断", &mut first);
+                        diagnostics(ui, t, draft, &mut out);
+                        form::section(ui, t, "设置", "安全", &mut first);
+                        security(ui, t, draft, env, &mut out);
+                        form::section(ui, t, "设置", "云端备份", &mut first);
+                        cloud(ui, t, draft, env, &mut out);
+                        form::section(ui, t, "设置", "快捷键", &mut first);
+                        shortcut_table(ui, t);
+                    });
+                });
             });
         });
     out
@@ -861,12 +888,22 @@ mod tests {
     /// 弹窗里嵌了 `ScrollArea` + 两层 `Grid`,宽度是逐帧往外撑的:内层网格
     /// 这一帧量出来的宽度,下一帧才会把窗口撑开,窗口撑开后 `available_width`
     /// 又变了……**收敛需要好几帧**,不是两帧。加安全分节之后实测第 7 帧才稳
-    /// (逐帧量「取消」按钮的位置得出),这里取 8 留余量。
+    /// (逐帧量「取消」按钮的位置得出)。
+    ///
+    /// F280 套 `ScrollArea` 之后多嵌了一层(`bottom_up` + 里面再 `top_down`),
+    /// 实测第 10 帧才稳,这里取 12 留余量。**这里不能靠猜大一点的常数糊过去**
+    /// ——先试过给正文 `ScrollArea::max_height` 塞一个「离屏幕底减去按钮行
+    /// 猜出来的高度」,`egui::Window` 内部走 `Resize`,`desired_size` 每帧
+    /// 只涨不缩(F217),猜小了的差额会一直累积,实测要连续跑 30 帧才收敛
+    /// (意味着真机上打开弹窗时窗口会自己长高近半秒,是真 bug 不是测试假象)。
+    /// 改成 F217 已验证的 `bottom_up` 结构(按钮先摆到底,正文吃剩下的全部,
+    /// 不猜任何一个控件的高度)之后收敛帧数就掉回个位数尾巴,10~12 帧这个
+    /// 量级才是「多一层容器多一帧」的正常收敛,不是又踩中一次棘轮。
     ///
     /// 帧数不够有两种症状,都不报错:少太多是画面从中间某一行起整段消失;
     /// 差一两帧是位置还差几个像素 —— 于是点击落在按钮外面,`click` 返回
     /// `None`,看着像「按钮不响应」。
-    const FRAMES: usize = 8;
+    const FRAMES: usize = 12;
 
     fn draft() -> SettingsDraft {
         // 只覆盖这一组测试真正在意的那几项,其余从构造器起手。
@@ -1804,5 +1841,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// F280:设置窗要按可视区收缩。三件事缺一不可,分开断言 ——
+    /// ① 高度上界从「离屏幕底实测剩余」来(F217:不许用 Window::max_height
+    ///    再猜 chrome 常量);② 正文套 ScrollArea(小屏时靠滚动够到全部内容);
+    /// ③ 确定/取消在 `ScrollArea::show` 闭包体**之外**(卷进去的话,小屏上
+    ///    按钮要滚到底才看得见)—— 判据是花括号配平切出闭包体后看「确定」
+    ///    在不在里面,不是比较两个子串谁在源码里先出现:本项目按 F217 的
+    ///    `bottom_up` 结构实现,按钮在源码里先加、视觉上却在最下面,源码
+    ///    顺序与视觉顺序刻意相反,朴素的下标判据会认反。
+    #[test]
+    fn the_settings_window_shrinks_to_the_screen_instead_of_overflowing() {
+        let src = strip_comments(include_str!("settings.rs"));
+        let body = src
+            .split("pub fn show(")
+            .nth(1)
+            .expect("show 没了")
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("screen_rect().bottom() - ui.cursor().top()"),
+            "高度上界不是实测剩余(F217:别用 Window::max_height 猜 chrome)"
+        );
+        assert!(body.contains("ScrollArea"), "正文没套滚动区");
+        // 确定/取消必须在 `ScrollArea::show` 那个闭包体**之外** —— 卷进去的话
+        // 小屏上要滚到底才够得着。
+        //
+        // **不比较两个子串谁先出现**:F217 已验证的正确结构是 `bottom_up`
+        // (按钮在源码里先加、摆到视觉上的最下面,`ScrollArea` 在源码里后写
+        // 却是视觉上方的正文),源码顺序与视觉顺序相反是**有意的**——朴素的
+        // “谁的下标大”判据在这个结构下会认反。改成花括号配平,精确切出
+        // `ScrollArea::show` 闭包体的真实范围,判据落在“确定是否被包进那个
+        // 范围”上,跟外层用 `bottom_up` 还是顺着写没有关系。
+        let scroll_at = body.find("ScrollArea").unwrap();
+        let brace_start = body[scroll_at..]
+            .find('{')
+            .map(|i| i + scroll_at)
+            .expect("ScrollArea::show 没有闭包体");
+        let mut depth = 0i32;
+        let mut brace_end = brace_start;
+        for (i, c) in body[brace_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        brace_end = brace_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(brace_end > brace_start, "花括号没配平,切不出闭包体");
+        let scroll_body = &body[brace_start..=brace_end];
+        assert!(
+            !scroll_body.contains("\"确定\""),
+            "确定按钮被卷进了滚动区 —— 小屏上要滚到底才看得见"
+        );
     }
 }
