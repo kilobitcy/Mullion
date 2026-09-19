@@ -100,6 +100,13 @@ pub struct SettingsDraft {
     /// 新填的 SK。**空 = 不改**(不是「清空」):每次打开设置都要用户重打一遍
     /// 一串 30 位的密钥,是在逼人把它记在别处。
     pub cloud_secret_new: String,
+    /// F283:新填的备份口令。**空 = 不改**,理由同 `cloud_secret_new`。
+    ///
+    /// **不进 `Settings`、不落盘**,与 `new_password` 同理:它是一次性动作
+    /// 的输入,写回成功后由 `app.rs` 当场清空,不跨次打开留着明文。
+    pub cloud_pass_new: String,
+    /// F283:「确认口令」框。
+    pub cloud_pass_confirm: String,
 }
 
 impl SettingsDraft {
@@ -151,6 +158,8 @@ impl SettingsDraft {
             cloud_access_key_id: c.access_key_id.clone(),
             // **空 = 不改**,不是「清空」。见字段上那段理由。
             cloud_secret_new: String::new(),
+            cloud_pass_new: String::new(),
+            cloud_pass_confirm: String::new(),
         }
     }
 
@@ -169,6 +178,11 @@ impl SettingsDraft {
     pub fn password_mismatch(&self) -> bool {
         !self.confirm_password.is_empty() && self.new_password != self.confirm_password
     }
+
+    /// F283:两次输入的备份口令是否不一致(空着 = 不改,不算不一致)。
+    pub fn cloud_pass_mismatch(&self) -> bool {
+        !self.cloud_pass_new.is_empty() && self.cloud_pass_new != self.cloud_pass_confirm
+    }
 }
 
 /// 画这一帧要用的、弹窗自己算不出来的东西。
@@ -185,6 +199,11 @@ pub struct SettingsEnv<'a> {
     /// F71:会话库这一刻可用没有。不可用时整个安全分节置灰 —— 库都没打开,
     /// 「设主密码」是设给谁的。
     pub store_available: bool,
+    /// F283:云端配置里当前有没有设过备份口令(不解密,只判有没有)。
+    /// 只用来画「当前:已设置/还没设置」这一句状态,**不做门控** ——
+    /// 拿它去罩「填口令」那一格,会让唯一能设上口令的入口自己被灰掉
+    /// (F270 踩过的「没有出口的陷阱」)。
+    pub cloud_has_passphrase: bool,
 }
 
 /// 这一帧用户干了什么。
@@ -252,7 +271,16 @@ pub fn show(
             // `top_down` 把方向拨回来,否则各分节会整段倒着画。
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("确定").clicked() {
+                    // F283:两次输入的备份口令不一致时按不动 —— 只给一行红字
+                    // 不够,弹窗一关红字就没了,用户会以为口令设上了,而实际
+                    // 没写进去(忘记口令 = 云端已有的备份全部报废,这个误会
+                    // 代价太大)。
+                    let can_ok = !draft.cloud_pass_mismatch();
+                    if ui
+                        .add_enabled(can_ok, egui::Button::new("确定"))
+                        .on_disabled_hover_text("两次输入的备份口令不一致,改成一样或都留空")
+                        .clicked()
+                    {
                         out = SettingsOut::Commit;
                     }
                     ui.add_space(SP_S);
@@ -631,9 +659,11 @@ fn security(
 
 /// 云端备份分节(F271)。
 ///
-/// **未设主密码时整节置灰**(设计 D6):钥匙串方案下封出来的包换台机器解不开,
-/// 而云备份的主场景正是「换新电脑」。让用户填完一整屏 AK/SK、开了开关、
-/// 等半小时才在状态栏看见「需要主密码」,是最糟的那条路径。
+/// F283:门控从「有没有主密码」改成「库有没有打开」(`env.store_available`)——
+/// 备份加密已经跟主密码解耦成独立的备份口令,继续拿主密码当闸门会把
+/// 「填口令」那一格也一起罩住,而那格恰好是唯一能设上口令的入口
+/// (F270 踩过的「没有出口的陷阱」的同形)。**「有没有设过口令」本身
+/// 不做门控**,只用来画状态文字。
 fn cloud(
     ui: &mut egui::Ui,
     t: &Theme,
@@ -641,34 +671,21 @@ fn cloud(
     env: SettingsEnv<'_>,
     out: &mut SettingsOut,
 ) {
-    let ready = env.store_available && env.has_master_password;
+    // F283:门控从「有没有主密码」改成「库有没有打开」——原来那句
+    // 「云端备份需要先设置主密码…」已经不成立(备份口令已跟主密码解耦),
+    // 整段删掉。
+    let ready = env.store_available;
     let avail = ui.available_width();
     let w = field_w(avail, FIELD_W_M, 0.0);
 
-    if !ready {
-        ui.label(
-            egui::RichText::new(
-                "云端备份需要先设置主密码 —— 钥匙串里的那把钥匙只在这台机器上有效，\
-                 用它封出来的备份换台电脑一个字也解不开。请先在上面的「安全」里设一个。\
-                 已经开着的备份仍可在这里关闭。",
-            )
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
-        );
-        ui.add_space(SP_S);
-    }
-
     // F271/D12:门控是**逐控件**的,不是整节一起罩,而且「开启云端备份」
-    // 那颗复选框**故意不受 `ready` 门控**。原因:门控要挡的是「没有主密码
-    // 却填出一份注定失败的配置」,不是「已经开着的备份想关掉」——清掉
-    // 主密码之后云端那份密文换台机器解不开,前提没了,这时用户第一反应
-    // 是回来关掉开关,而这颗复选框要是也灰着,就成了一个没有出口的陷阱
-    // (进设置关不掉,唯一自救路径是把刚清掉的主密码再设回来)。
+    // 那颗复选框**故意不受 `ready` 门控**。原因:门控要挡的是「库没打开
+    // 却填出一份注定失败的配置」,不是「已经开着的备份想关掉」—— 这颗
+    // 复选框要是也灰着,就成了一个没有出口的陷阱。
     //
-    // 十个受控字段(除开关外全部)各自套 `ui.add_enabled(ready, ..)`;
-    // `ui.end_row()` 全部留在这一层 grid 里,行结构不变 ——
-    // Task 12 的三条守护(逐行绑定/仅 SK 掩码/逐控件带预览)按行数和
-    // 顺序判,换成"两层 grid"会把它们全部拆穿。
+    // 受控字段各自套 `ui.add_enabled(ready, ..)`;`ui.end_row()` 全部留在
+    // 这一层 grid 里,行结构不变 —— Task 12 的三条守护(逐行绑定/仅 SK
+    // 掩码/逐控件带预览)按行数和顺序判,换成"两层 grid"会把它们全部拆穿。
     form::grid(ui, "settings_cloud", |ui| {
         ui.label("");
         if ui
@@ -752,6 +769,66 @@ fn cloud(
         {
             *out = SettingsOut::Preview;
         }
+        ui.end_row();
+
+        // F283:备份口令,两遍确认。与主密码彻底分开(设计 D7:不提供
+        // 「用主密码当备份口令」的快捷项,加了等于把耦合请回来一半)。
+        ui.label("备份口令");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_pass_new)
+                    .password(true)
+                    .desired_width(w)
+                    .hint_text("留空 = 不改"),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
+
+        ui.label("确认口令");
+        if ui
+            .add_enabled(
+                ready,
+                egui::TextEdit::singleline(&mut draft.cloud_pass_confirm)
+                    .password(true)
+                    .desired_width(w),
+            )
+            .changed()
+        {
+            *out = SettingsOut::Preview;
+        }
+        ui.end_row();
+
+        form::field_error(
+            ui,
+            t,
+            draft.cloud_pass_mismatch(),
+            "两次输入的备份口令不一致",
+        );
+
+        ui.label("");
+        ui.label(
+            egui::RichText::new(if env.cloud_has_passphrase {
+                "当前:已设置备份口令"
+            } else {
+                "当前:还没设置备份口令,云端备份不会运行"
+            })
+            .size(11.0)
+            .color(theme::c32(t.fg_muted)),
+        );
+        ui.end_row();
+
+        ui.label("");
+        ui.label(
+            egui::RichText::new(
+                "备份口令与主密码无关。忘了没有找回途径,云端已有的备份将无法恢复。",
+            )
+            .size(11.0)
+            .color(theme::c32(t.fg_muted)),
+        );
         ui.end_row();
 
         ui.label("");
@@ -954,6 +1031,7 @@ mod tests {
                         not_monospace,
                         has_master_password,
                         store_available: true,
+                        cloud_has_passphrase: false,
                     },
                 );
             });
@@ -1018,6 +1096,7 @@ mod tests {
                         not_monospace: false,
                         has_master_password,
                         store_available,
+                        cloud_has_passphrase: false,
                     },
                 );
             });
@@ -1060,6 +1139,7 @@ mod tests {
                     not_monospace: false,
                     has_master_password,
                     store_available,
+                    cloud_has_passphrase: false,
                 },
             );
         });
@@ -1582,28 +1662,34 @@ mod tests {
 
     // ---- F271 云端备份分节 ----
 
-    /// 未设主密码时,整节必须**灰掉并说明原因**(设计 D6)。
+    /// F283:门控从「有没有主密码」改成「库有没有打开」——没有主密码时
+    /// 云端分节**不该**再置灰、也不该再说「需要先设置主密码」(那句话
+    /// 现在是错的:备份加密已经解耦成独立口令)。
     ///
-    /// 钥匙串方案下封出来的包换台机器解不开 —— 让用户填完一整屏 AK/SK、
-    /// 开了开关、等了半小时,才在状态栏看见一句「需要主密码」,是最糟的路径。
+    /// 继续拿主密码当闸门会把「填口令」那一格也一起罩住,那格恰好是
+    /// 唯一能设上口令的入口(F270 踩过的「没有出口的陷阱」的同形)。
     #[test]
-    fn the_cloud_section_is_disabled_and_explains_itself_without_a_master_password() {
+    fn the_cloud_section_is_no_longer_gated_by_the_master_password() {
         let mut d = draft();
-        let (texts, _) = run_env(&mut d, false, /* has_master_password */ false);
-        // **判据是精确相等,不是 `contains`。** 下面那句提示文案里也带着
-        // 「云端备份」四个字,用 `contains` 的话把 `form::section(.., "云端备份", ..)`
-        // 整行删掉这条照样绿 —— 而那时候云端那一堆字段会挂在「安全」分节底下,
-        // 看起来像是主密码设置的一部分。
-        // (已核实:`form::section` 把 title 原样画成一个独立的 `Shape::Text`,
-        // 而 `run_env` 收的是每个 `Shape::Text` 的 `galley.text()` 全文,
-        // 所以标题那一条就是「云端备份」这四个字本身。)
-        assert!(
-            texts.iter().any(|t| t == "云端备份"),
-            "没有「云端备份」分节标题 —— 那些字段会挂在「安全」底下:{texts:?}"
+        let out = interact_env(
+            &mut d,
+            CLOUD_ENABLED_LABEL,
+            egui::Vec2::ZERO,
+            true,
+            /* store_available */ true,
+            /* has_master_password */ false,
         );
+        assert_eq!(
+            out,
+            SettingsOut::Preview,
+            "没有主密码、但库开着时,开关应该还能点"
+        );
+        assert!(d.cloud_enabled, "开关没被点开");
+
+        let (texts, _) = run_env(&mut d, false, /* has_master_password */ false);
         assert!(
-            texts.iter().any(|t| t.contains("需要先设置主密码")),
-            "没说清楚为什么用不了:{texts:?}"
+            !texts.iter().any(|t| t.contains("需要先设置主密码")),
+            "云端分节不该再拿主密码当门槛:{texts:?}"
         );
     }
 
@@ -1661,6 +1747,8 @@ mod tests {
         ("ui.label(\"前缀\")", "cloud_prefix"),
         ("ui.label(\"Access Key ID\")", "cloud_access_key_id"),
         ("ui.label(\"Access Key Secret\")", "cloud_secret_new"),
+        ("ui.label(\"备份口令\")", "cloud_pass_new"),
+        ("ui.label(\"确认口令\")", "cloud_pass_confirm"),
         ("CLOUD_PATH_STYLE_LABEL", "cloud_path_style"),
         ("ui.label(\"保留份数\")", "cloud_keep"),
         ("ui.label(\"检查间隔\")", "cloud_interval_min"),
@@ -1780,26 +1868,82 @@ mod tests {
         );
     }
 
-    /// **只有** SK 那一格是密码框。
+    /// F283:口令与确认两格都必须打码,别的格一格都不许。
     ///
-    /// 「SK 要打码」是因为这个弹窗经常被整屏截下来发出去
-    /// (本项目的排查流程里「发个截图」是常规动作),明文摆在那儿就跟着走了。
-    ///
-    /// 判据两头都钉死:SK 那块必须有 `.password(true)`,**其余每一块都必须
-    /// 没有**。只钉前半句的话,「把 `.password(true)` 留在 AK ID 那块、
-    /// 两个绑定互换」这种复制粘贴型 bug 逃得掉。
+    /// 这条取代 `only_the_secret_key_field_is_masked`(判据从"只有 SK"
+    /// 扩成"SK 与两个口令格"),**两头都钉**:漏钉后半句的话,
+    /// "把 password(true) 挂到 Endpoint 上"这种复制粘贴 bug 逃得掉。
     #[test]
-    fn only_the_secret_key_field_is_masked() {
+    fn only_the_secret_fields_are_masked() {
         let rows = cloud_rows();
         for (label, field) in CLOUD_ROWS {
             let row = row_of(&rows, label, field);
             assert_eq!(
                 row.contains(".password(true)"),
-                *field == "cloud_secret_new",
-                "「{label}」的打码状态不对:只有 AK Secret 该是密码框,\
-                 别的都不该是(把别人打上码等于让用户看不见自己填了什么)。"
+                matches!(
+                    *field,
+                    "cloud_secret_new" | "cloud_pass_new" | "cloud_pass_confirm"
+                ),
+                "「{label}」的打码状态不对"
             );
         }
+    }
+
+    /// F283:两次输入不一致时,**「确定」必须按不动**。
+    ///
+    /// 只给一行红字是不够的:用户点了确定、对话框关掉、红字消失,
+    /// 他会以为口令设好了 —— 而实际上没写进去。忘记口令 = 云端备份作废,
+    /// 这个误会的代价太大。
+    ///
+    /// **真跑一遍 egui**(`interact` 驱动 `ctx.run` 找到写着「确定」的部件
+    /// 并合成鼠标点击),不是读源码切片 —— 单读源码只能证明"写了
+    /// `add_enabled` 这几个字",证不了"传进去的条件真的挡住了点击"。
+    #[test]
+    fn a_mismatched_passphrase_blocks_the_ok_button() {
+        let mut d = draft();
+        d.cloud_pass_new = "abc123".into();
+        d.cloud_pass_confirm = "xyz789".into();
+        let out = click(&mut d, "确定");
+        assert_ne!(
+            out,
+            SettingsOut::Commit,
+            "两次输入的备份口令不一致时,「确定」不该生效"
+        );
+    }
+
+    /// 两次输入一致(或都留空 = 不改)时,「确定」必须能按下去 ——
+    /// 否则上一条测试的判据只是恰好卡住了所有输入,不是精确地只卡不一致。
+    #[test]
+    fn a_matching_or_empty_passphrase_lets_the_ok_button_through() {
+        let mut d = draft();
+        d.cloud_pass_new = "abc123".into();
+        d.cloud_pass_confirm = "abc123".into();
+        let out = click(&mut d, "确定");
+        assert_eq!(out, SettingsOut::Commit, "两次输入一致时,「确定」应该生效");
+
+        let mut d2 = draft();
+        let out2 = click(&mut d2, "确定");
+        assert_eq!(out2, SettingsOut::Commit, "两格都留空时,「确定」应该生效");
+    }
+
+    /// 设置页必须写明"忘了没有找回途径"(设计 D7 的硬要求)。
+    #[test]
+    fn the_cloud_section_says_a_forgotten_passphrase_cannot_be_recovered() {
+        let src = include_str!("settings.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("测试模块分界变了,这条测试的锚点失效了");
+        assert!(
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面会考到测试自己"
+        );
+        let body = prod.split("fn cloud(").nth(1).expect("没有 cloud 分节函数");
+        let body = body.split("\nfn ").next().unwrap_or(body);
+        assert!(
+            body.contains("忘") && body.contains("找回"),
+            "云端备份分节里没有「忘了没有找回途径」这层警示"
+        );
     }
 
     /// 每一格改动都要报 `Preview`,否则「确定」按钮不亮 / 预览不刷新 ——

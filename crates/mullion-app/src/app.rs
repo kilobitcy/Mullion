@@ -2362,6 +2362,9 @@ pub struct App {
     /// F21:当前字体量出来不是等宽。同 `settings_families`,只在开弹窗和换
     /// 字体之后重算。
     settings_not_mono: bool,
+    /// F283:云配置里当前有没有设过备份口令。同 `settings_families`,
+    /// 弹窗打开时算一次(读 `cloud.toml`),不进每帧路径。
+    settings_cloud_has_passphrase: bool,
     /// F71 + F148:解锁框开着时,那份还没能用上的历史列表。
     ///
     /// 「这条会话还在不在库里」是丢弃规则之一(D16),而解锁框开着的时候库
@@ -3088,6 +3091,7 @@ impl App {
             settings_families: Vec::new(),
             pending_history: None,
             settings_not_mono: false,
+            settings_cloud_has_passphrase: false,
             pending_restore: None,
             auto_dial: None,
             dragging: false,
@@ -3350,6 +3354,9 @@ impl App {
                 let cloud = crate::shell::store::config_dir()
                     .map(|d| mullion_store::cloud::load(&d))
                     .unwrap_or_default();
+                // F283:只判有没有设过口令,不解密 —— 弹窗要显示的只是
+                // 「已设置/未设置」这句状态。
+                self.settings_cloud_has_passphrase = mullion_store::cloud::has_passphrase(&cloud);
                 self.ui.settings_draft =
                     Some(crate::ui::settings::SettingsDraft::from_settings_and_cloud(
                         &self.settings,
@@ -3520,6 +3527,8 @@ impl App {
         let socks5 = d.cloud_socks5.clone();
         let access_key_id = d.cloud_access_key_id.clone();
         let secret_new = d.cloud_secret_new.clone();
+        let pass_new = d.cloud_pass_new.clone();
+        let pass_confirm = d.cloud_pass_confirm.clone();
 
         let Some(dir) = crate::shell::store::config_dir() else {
             return;
@@ -3561,11 +3570,38 @@ impl App {
             }
         }
 
+        // F283:备份口令空 = 不改,理由同 SK。**两次不一致时绝不写**——
+        // 设置弹窗里「确定」已经拿 `cloud_pass_mismatch()` 挡过一道,这里是
+        // 第二道防线,不能只信 UI 那一层。
+        let mut pass_err = None;
+        if !pass_new.is_empty() {
+            if pass_new == pass_confirm {
+                match self.store.as_ref() {
+                    Some(s) => {
+                        if let Err(e) =
+                            mullion_store::cloud::set_passphrase(&mut cfg, s.vault(), &pass_new)
+                        {
+                            pass_err = Some(format!("保存备份口令失败:{e}"));
+                        }
+                    }
+                    None => pass_err = Some("会话库还没打开,备份口令没能保存".into()),
+                }
+            } else {
+                pass_err = Some("两次输入的备份口令不一致,备份口令没能保存".into());
+            }
+            // **不管成没成都清掉**,理由同 SK 那段:留着的话下次点确定会拿
+            // 同一段明文再试一遍,而且它会一直躺在草稿里等着被截图。
+            if let Some(d) = self.ui.settings_draft.as_mut() {
+                d.cloud_pass_new.clear();
+                d.cloud_pass_confirm.clear();
+            }
+        }
+
         let save_err = mullion_store::cloud::save(&dir, &cfg)
             .err()
             .map(|e| format!("保存云端备份配置失败:{e}"));
         // `set_error` 只留最后一条 —— 两条分别发的话第一条会被静默吃掉。
-        let msgs: Vec<String> = [sk_err, save_err].into_iter().flatten().collect();
+        let msgs: Vec<String> = [sk_err, pass_err, save_err].into_iter().flatten().collect();
         if !msgs.is_empty() {
             self.ui.set_error(msgs.join(" / "));
         }
@@ -13413,6 +13449,7 @@ impl ApplicationHandler<UserEvent> for App {
                                             .as_ref()
                                             .is_some_and(|s| s.has_master_password()),
                                         store_available: self.store.is_some(),
+                                        cloud_has_passphrase: self.settings_cloud_has_passphrase,
                                     },
                                 ),
                                 files_focused: self.effective_focus()
