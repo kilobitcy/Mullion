@@ -247,6 +247,22 @@ pub enum UserEvent {
         path: mullion_ssh::sftp::RemotePath,
         result: Result<bool, String>,
     },
+    /// F278:递归搜索里的一次列目录回来了。
+    ///
+    /// **不蹭 `SftpListed`**,理由与 `PathProbed` 不蹭 `RevealStat` 逐字相同:
+    /// 收方的序号空间不同。`SftpListed` 对齐 `PaneState::request_seq`(每栏
+    /// 一份,「用户点得比网络快」的后发先至判据),这一条对齐
+    /// `PanelFrame::find_seq`(每面板一份,起搜一次 +1)。共用一个事件就会
+    /// 撞号,撞上就是「一次普通列目录被搜索结果顶掉」,面板跳到一个用户
+    /// 没去过的目录,而且完全静默。
+    ///
+    /// `dir` 原样带回来:`Walk::accept` 要拿它拼子项的绝对路径。
+    FindListed {
+        generation: u64,
+        seq: u64,
+        dir: mullion_ssh::sftp::RemotePath,
+        result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
+    },
     /// F142:一次 `getent` 查完了(属主列要显示的用户名/组名)。
     ///
     /// **失败也要送回来**(`stdout: None`):发出去那一刻这批 id 已经记进了
@@ -5288,6 +5304,116 @@ impl App {
         self.request_ui_redraw();
     }
 
+    /// F278:搜索里的一次列目录回来了。
+    ///
+    /// `seq` 对不上就**整条丢掉**:取消、换关键词、换目录、换机器都靠递增
+    /// `find_seq` 作废在途结果(绝不 abort,见 `spawn_sftp_find_list` 的文档)。
+    /// 不校验的话,取消之后半秒里回来的结果会往一个已经不存在的搜索里塞,
+    /// 或者更糟 —— 塞进用户刚起的**新**那一次。
+    fn accept_find_listed(
+        &mut self,
+        generation: u64,
+        seq: u64,
+        dir: mullion_ssh::sftp::RemotePath,
+        result: Result<Vec<mullion_ssh::sftp::Entry>, String>,
+    ) {
+        let Some(files) = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.files_panel_mut())
+        else {
+            return;
+        };
+        let Some(f) = files.find.as_mut() else {
+            return;
+        };
+        if f.seq != seq {
+            return;
+        }
+        let Some(walk) = f.walk.as_mut() else {
+            return;
+        };
+        walk.accept(&dir, result);
+        self.request_ui_redraw();
+    }
+
+    /// F278:开/关搜索条。
+    fn toggle_files_find(&mut self, generation: u64) {
+        let Some(files) = self.files_panel_mut(generation) else {
+            return;
+        };
+        if files.find.is_some() {
+            // 关掉时也要**作废在途结果**:不作废的话,半秒后回来的那批会
+            // 往一个已经没有 `find` 的面板里塞(`accept` 会早退,无害),
+            // 但用户紧接着又点开搜索条的话,`seq` 还是老的 —— 那批旧结果
+            // 会被当成新这次的收下。
+            files.find_seq += 1;
+            files.find = None;
+        } else {
+            files.find = Some(crate::ui::files_panel::Find {
+                focus_pending: true,
+                ..Default::default()
+            });
+        }
+        mark_ui_dirty!(self.ui_dirty);
+    }
+
+    /// F278:起一次搜索。根是**远端栏此刻的当前目录**。
+    fn start_files_find(&mut self, generation: u64, query: String) {
+        let Some(files) = self.files_panel_mut(generation) else {
+            return;
+        };
+        let root = files.remote.cwd.clone();
+        let show_hidden = files.remote.show_hidden;
+        files.find_seq += 1;
+        let seq = files.find_seq;
+        let Some(f) = files.find.as_mut() else {
+            return;
+        };
+        f.walk = Some(crate::files::find::Walk::new(root, query, show_hidden));
+        f.seq = seq;
+        mark_ui_dirty!(self.ui_dirty);
+    }
+
+    /// F278:用户按了取消 —— 停在原地,**已经找到的结果留着**。
+    ///
+    /// 留着而不是清空:用户按取消多半是因为「要的那条已经出来了」,
+    /// 清掉等于把他刚等来的东西没收。
+    fn cancel_files_find(&mut self, generation: u64) {
+        let Some(files) = self.files_panel_mut(generation) else {
+            return;
+        };
+        // 序号先递增:在途那几条回来时 `accept_find_listed` 会整条丢掉,
+        // 不会让 `visited` 在「已取消」之后还继续往上跳。
+        files.find_seq += 1;
+        if let Some(w) = files.find.as_mut().and_then(|f| f.walk.as_mut()) {
+            w.cancel();
+        }
+        mark_ui_dirty!(self.ui_dirty);
+    }
+
+    /// F278:关掉搜索条,回普通列表。
+    fn close_files_find(&mut self, generation: u64) {
+        let Some(files) = self.files_panel_mut(generation) else {
+            return;
+        };
+        files.find_seq += 1;
+        files.find = None;
+        mark_ui_dirty!(self.ui_dirty);
+    }
+
+    /// F278:某个标签的文件面板。四个搜索方法共用 —— 各写一遍
+    /// `by_generation_mut(..).and_then(..)` 的话,漏掉其中一处的 `None` 早退
+    /// 会变成一次 panic。
+    fn files_panel_mut(
+        &mut self,
+        generation: u64,
+    ) -> Option<&mut crate::ui::files_panel::PanelFrame> {
+        self.tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.files_panel_mut())
+    }
+
     /// F218:目标是目录就进它本身、不亮任何一条;是文件就进父目录、亮它。
     fn reveal_destination(
         &self,
@@ -5949,6 +6075,16 @@ impl App {
                 log::warn!("本地栏收到了剪贴板操作,已忽略(只在远端)");
                 return;
             }
+            // F278:搜索是远端栏专属(见 `PanelFrame::find` 的文档),路径条上
+            // 的放大镜按钮也只在远端栏画。到这儿说明接线被改坏了,不静默吞。
+            FileAction::FindToggle
+            | FileAction::FindStart(_)
+            | FileAction::FindCancel
+            | FileAction::FindClose
+            | FileAction::FindPick { .. } => {
+                log::warn!("本地栏收到了搜索请求,已忽略(F278 只在远端栏)");
+                return;
+            }
             // F253:前面那个 match 已经把它分流走了(写穿落盘要 `&mut self`)。
             // 走到这儿说明分流被改坏了 —— 症状会是「按 Ctrl+H 没反应」,不静默吞。
             FileAction::ToggleHidden => {
@@ -6006,6 +6142,30 @@ impl App {
                     crate::files::PanelColumn::Remote,
                     *relative,
                 );
+                return;
+            }
+            // F278:搜索的五个动作都只改这个标签自己的面板状态,不需要
+            // `&mut self` 以外的东西;`FindStart` 要发请求,但发的那一步交给
+            // 下一帧的 `pump_find` —— 这里只把状态机摆好。
+            FileAction::FindToggle => {
+                self.toggle_files_find(generation);
+                return;
+            }
+            FileAction::FindStart(q) => {
+                self.start_files_find(generation, q.clone());
+                return;
+            }
+            FileAction::FindCancel => {
+                self.cancel_files_find(generation);
+                return;
+            }
+            FileAction::FindClose => {
+                self.close_files_find(generation);
+                return;
+            }
+            FileAction::FindPick { .. } => {
+                // Task 8 接。这里先什么都不做会**静默**——老实记一条。
+                log::warn!("F278:FindPick 还没接线");
                 return;
             }
             // F52:下载。同 `Ask`,在借出 `files` 之前分流。
@@ -6282,7 +6442,12 @@ impl App {
             | FileAction::ClipCopy
             | FileAction::ClipCut
             | FileAction::ClipPaste
-            | FileAction::CopyPath { .. } => return,
+            | FileAction::CopyPath { .. }
+            | FileAction::FindToggle
+            | FileAction::FindStart(_)
+            | FileAction::FindCancel
+            | FileAction::FindClose
+            | FileAction::FindPick { .. } => return,
             // F253:同本地栏那条 —— 前置分流已经处理掉了,落到这儿是接线坏了。
             FileAction::ToggleHidden => {
                 log::warn!("ToggleHidden 落到了导航分支,F253 的前置分流被改坏了");
@@ -7962,6 +8127,56 @@ impl App {
                 let _ = proxy.send_event(UserEvent::TransferDone { job: id, result });
             });
             self.track_sftp_task(generation, task);
+        }
+    }
+
+    /// F278:每帧调一次 —— 每个标签的搜索状态机放行几个目录就发几条 `list_dir`。
+    ///
+    /// **遍历全部标签,不只活动那个**(那条「`drive_*` 每帧驱动函数必须遍历
+    /// 全部标签」的纪律):搜索要跑好几秒,期间用户完全可能切到别的标签去 ——
+    /// 只推活动标签的话,切回来会发现它停在半路,而且完全静默。
+    /// (`pump_transfers` 不用遍历是因为它的队列是全局一份;`find` 每标签一份。)
+    fn pump_find(&mut self) {
+        // 先把「哪个标签要发哪几个目录」收集出来,再统一 spawn ——
+        // `track_sftp_task` 要 `&mut self`,借着 `self.tabs` 是调不了的。
+        let mut work: Vec<(
+            u64,
+            Arc<mullion_ssh::sftp::SftpClient>,
+            u64,
+            Vec<mullion_ssh::sftp::RemotePath>,
+        )> = Vec::new();
+        for tab in self.tabs.iter_mut() {
+            let generation = tab.content.generation();
+            let Some(client) = tab.content.sftp_client() else {
+                continue;
+            };
+            let Some(files) = tab.content.files_panel_mut() else {
+                continue;
+            };
+            let Some(f) = files.find.as_mut() else {
+                continue;
+            };
+            let seq = f.seq;
+            let Some(walk) = f.walk.as_mut() else {
+                continue;
+            };
+            let batch = walk.take_runnable();
+            if !batch.is_empty() {
+                work.push((generation, client, seq, batch));
+            }
+        }
+        for (generation, client, seq, batch) in work {
+            for dir in batch {
+                let task = spawn_sftp_find_list(
+                    &self._runtime,
+                    &self.proxy,
+                    generation,
+                    client.clone(),
+                    dir,
+                    seq,
+                );
+                self.track_sftp_task(generation, task);
+            }
         }
     }
 
@@ -12059,6 +12274,12 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_path_probe(generation, seq, path, result);
             }
+            UserEvent::FindListed {
+                generation,
+                seq,
+                dir,
+                result,
+            } => self.accept_find_listed(generation, seq, dir, result),
             UserEvent::OwnerNames {
                 generation,
                 query,
@@ -12933,6 +13154,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // 驱动重绘就是风扇起飞;这里只把「队列在跑」当成脏,重绘频率
                 // 因此由下面那段排期(~5Hz)决定,与事件频率无关。
                 self.pump_transfers();
+                // F278:递归搜索每帧放行几个目录。
+                self.pump_find();
                 // F169:存一份 summary 给下面 gauge 段复用,同一帧里不用再问队列
                 // 第二遍——队列状态在这之后到 gauge 段之间不会再变。
                 let xs = self.transfer.queue.summary();
@@ -15448,6 +15671,40 @@ fn spawn_sftp_path_probe(
     })
 }
 
+/// F278:递归搜索里的一次列目录。结果经 `UserEvent::FindListed` 回送
+/// (`App::accept_find_listed` 接)。
+///
+/// 跟 `spawn_sftp_list_dir` 发的是同一句 `list_dir`,**分成两个函数只为了发
+/// 不同的事件** —— 收方的序号空间不同,理由见 `UserEvent::FindListed` 的文档。
+///
+/// 同样**返回 `JoinHandle`,调用方必须存进 `sftp_tasks`** —— 理由同
+/// `spawn_sftp_list_dir`。注意收口**只靠 `wind_down`**:取消搜索走的是
+/// 「递增 `find_seq` 让迟到的结果对不上号」,**绝不 abort**
+/// (`sftp_tasks` 是混合池,无差别 abort 会腰斩传输 —— 见
+/// `reopen_sftp_on_focused_host` 上方那段长注释)。
+fn spawn_sftp_find_list(
+    runtime: &Runtime,
+    proxy: &EventLoopProxy<UserEvent>,
+    generation: u64,
+    client: Arc<mullion_ssh::sftp::SftpClient>,
+    dir: mullion_ssh::sftp::RemotePath,
+    seq: u64,
+) -> tokio::task::JoinHandle<()> {
+    let proxy = proxy.clone();
+    runtime.spawn(async move {
+        let result = client
+            .list_dir(&dir)
+            .await
+            .map_err(|e| format!("读取目录失败:{e}"));
+        let _ = proxy.send_event(UserEvent::FindListed {
+            generation,
+            seq,
+            dir,
+            result,
+        });
+    })
+}
+
 /// F220:剪切粘贴成功后要不要清空这个标签的远端剪贴板。复制粘贴不清——
 /// 连着粘几个目录是常见用法。**按值吃掉 `clip`**:`Cut` 时把它整个搬进
 /// `OpFollow::ClearClip` 带到完成事件里,完成时拿它跟*那时候*的
@@ -15701,6 +15958,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | SftpListed { .. }
         | RevealStat { .. }
         | PathProbed { .. }
+        | FindListed { .. }
         | OwnerNames { .. }
         | ProjectClientsChecked { .. }
         | SftpOpDone { .. }
@@ -24593,6 +24851,67 @@ mod tests {
             body.contains("self.apply_log_level()"),
             "写完设置没施加日志档位"
         );
+    }
+
+    /// F278:取消一次搜索**先递增序号再标取消**。反过来的话,在途那几条
+    /// 回来时序号还对得上,`visited` 会在「已取消」之后继续往上跳 ——
+    /// 界面上就是「已取消,当时已找到 3 个」后面那个目录数还在动。
+    ///
+    /// 自证会变红:把 `cancel_files_find` 里的 `files.find_seq += 1;` 删掉。
+    #[test]
+    fn canceling_a_search_invalidates_the_requests_already_out() {
+        let body = strip_comments(body_of(prod_src(), "fn cancel_files_find("));
+        let bump = body.find("find_seq += 1").expect("取消时必须递增序号");
+        let cancel = body.find("w.cancel()").expect("取消时必须标 Walk");
+        assert!(
+            bump < cancel,
+            "递增序号必须排在标取消之前,否则在途结果照样收下:{body}"
+        );
+    }
+
+    /// F278:搜索结果**绝不 abort** `sftp_tasks` —— 那是个混合池,无差别
+    /// abort 会腰斩传输并把 `load` 永久卡在 `Loading`
+    /// (见 `reopen_sftp_on_focused_host` 上方那段长注释)。
+    ///
+    /// 自证会变红:在 `cancel_files_find` 里加一句
+    /// `if let Some(t) = self.tabs...sftp_tasks_mut() { for h in t.drain(..) { h.abort(); } }`。
+    #[test]
+    fn canceling_a_search_never_aborts_the_shared_task_pool() {
+        for name in [
+            "fn cancel_files_find(",
+            "fn close_files_find(",
+            "fn toggle_files_find(",
+            "fn start_files_find(",
+        ] {
+            let body = strip_comments(body_of(prod_src(), name));
+            assert!(
+                !body.contains("abort()") && !body.contains("sftp_tasks"),
+                "{name} 动了共享任务池 —— 会腰斩在跑的传输:{body}"
+            );
+        }
+    }
+
+    /// F278:`pump_find` 遍历全部标签。只推活动标签的话,搜索中切走再切回来
+    /// 会发现它停在半路,而且完全静默。
+    ///
+    /// 自证会变红:把 `pump_find` 里的 `self.tabs.iter_mut()` 换成只取活动标签。
+    #[test]
+    fn the_find_pump_walks_every_tab_not_just_the_active_one() {
+        let body = strip_comments(body_of(prod_src(), "fn pump_find("));
+        assert!(
+            body.contains("self.tabs.iter_mut()"),
+            "没遍历全部标签:{body}"
+        );
+    }
+
+    /// F278:`pump_find` 真的每帧被调 —— 不调的话状态机摆好了也永远发不出
+    /// 第一条请求,界面卡在「正在搜索…已找到 0 个」。
+    ///
+    /// 自证会变红:把那一行调用删掉。
+    #[test]
+    fn the_find_pump_actually_runs_every_frame() {
+        let src = strip_comments(prod_src());
+        assert!(src.contains("self.pump_find();"), "pump_find 没有被调用");
     }
 
     /// F247:换日志档之前先看**现在是不是已经这个档**。
