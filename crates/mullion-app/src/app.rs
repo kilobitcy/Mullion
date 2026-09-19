@@ -13835,10 +13835,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 );
                                 mark_ui_dirty!(self.ui_dirty);
                             }
-                            // F281:状态栏错误格上按了「复制」。Ctrl+C 走不通
-                            // (T8),这是用户唯一的带走通道 —— 写剪贴板是 IO,
-                            // 只在这里做(同上面 F100 的复制路径)。
-                            if actions.copy_error {
+                            // F281:分层理由见 `UiActions::copy_last_error`。
+                            if actions.copy_last_error {
                                 if let Some(e) = self.ui.last_error.clone() {
                                     self.clipboard.set(&e);
                                 }
@@ -16110,7 +16108,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.pick_project_pane.is_some()
         || a.history.is_some()
         || a.pack.is_some()
-        || a.copy_error
+        || a.copy_last_error
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -16880,7 +16878,7 @@ mod tests {
     /// F281 接线:chrome 只举手,真正 `clipboard.set` 在 app 侧 —— 只测上一半
     /// 是「纯函数测得扎实、接线没人看着」恒绿模式。
     ///
-    /// 自证会变红:删掉 `if actions.copy_error {` 那段消费分支,
+    /// 自证会变红:删掉 `if actions.copy_last_error {` 那段消费分支,
     /// 或删掉 `has_real_action` 里对应那一行。
     #[test]
     fn the_copy_error_intent_lands_in_the_clipboard() {
@@ -16894,7 +16892,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let at = code
-            .find("if actions.copy_error {")
+            .find("if actions.copy_last_error {")
             .expect("状态栏的复制按钮没人收 —— 按下去毫无反应");
         let window = &code[at..(at + 200).min(code.len())];
         assert!(
@@ -16911,7 +16909,7 @@ mod tests {
             .expect("找不到 has_real_action");
         let body = &after[..after.find("\n}\n").expect("找不到 has_real_action 的结尾")];
         assert!(
-            body.contains("a.copy_error"),
+            body.contains("a.copy_last_error"),
             "复制按钮会在 egui 的 discard 趟被静默吃掉"
         );
     }
