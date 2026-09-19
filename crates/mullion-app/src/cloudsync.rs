@@ -145,7 +145,7 @@ pub fn fingerprint_now(dir: &Path) -> Result<String, String> {
 pub struct Payload {
     /// 这一份的内容指纹。上传成功后由 `app.rs` 写回游标。
     pub fingerprint: String,
-    /// 已经用 vault key 整体封好的字节。**云上那份就是它。**
+    /// 已经用备份口令(F283)整体封好的字节。**云上那份就是它。**
     pub sealed: Vec<u8>,
     /// 解出来的 Access Key Secret。
     pub secret_access_key: String,
@@ -156,7 +156,7 @@ pub enum Prepared {
     /// 内容没变。**连线程都不用起** —— 更不用建 TCP。
     Unchanged,
     Ready(Payload),
-    /// 还没送出去就失败了(没设主密码、SK 读不出、打包失败)。
+    /// 还没送出去就失败了(没设备份口令、SK 读不出、打包失败)。
     Failed(String),
 }
 
@@ -177,16 +177,17 @@ pub enum Prepared {
 pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str) -> Prepared {
     // ① 装:顶层三文件 + 密文。**不带 layouts**(设计 D7)。
     //
-    // 这里把 `secrets.enc` **原样**放进包,而不是像 F46-a 的本地迁移包那样
-    // 用一次性口令重封(`portable::seal_secrets`)。成立的前提**只有一条**:
-    // 设计 D6 要求云备份必须先设主密码,于是 `secrets.enc` 的文件头一定是
-    // Argon2id、盐随文件走,另一台机器拿主密码就解得开。
+    // `secrets.enc` 不能原样放进包 —— 那只在「必须先设主密码」(旧设计 D6)
+    // 成立时才安全:那样文件头一定是 Argon2id、盐随文件走,另一台机器拿
+    // 主密码就解得开。F283 把这条前提拆掉了(钥匙串方案也能开云备份),
+    // 钥匙串方案下 `secrets.enc` 的密钥来自**这台机器的** OS 钥匙串,原样
+    // 拷到云上、再拉到新电脑,解密钥匙根本不在场 —— 症状是「会话都在,
+    // 每条都要重新输密码」,且全链路零报错(F46-a 上踩过一次,见下面)。
     //
-    // **这条前提一旦松动(比如哪天允许钥匙串方案也上传),这里必须同步改成
-    // 重封** —— 否则拉回来的密文用的是源机钥匙串里的密钥,换台机器一个字
-    // 都解不开,而症状是「每条会话都要重新输密码」且零报错(本项目在 F46-a
-    // 上已经踩过一次)。`seal_with_master` 在钥匙串方案下会返回
-    // `NoMasterPassword`,那是今天挡住这条路的东西,别把它绕过去。
+    // 于是这里改成用**备份口令**(F283,与主密码无关、专供云备份用)把
+    // `secrets.enc` 的明文重封一遍,再整体打进包、包本身也用同一句口令
+    // 封一层。重封之后的载荷与 F46-a 的 `.mullionpack` **同形**——将来做
+    // 「从云端恢复」可以直接复用 `install_pack` 那条读取路径。
     //
     // `read_secrets` 把「文件不存在」(合法,空字节继续)与「读不出来」
     // (权限 / IO / 被杀软短暂锁住)分开报错 —— 后者若静默吞成空字节,
@@ -197,6 +198,10 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
         Ok(s) => s,
         Err(e) => return Prepared::Failed(e),
     };
+    // 指纹**必须**对盘上这份原始字节取,不能对下面重封出来的结果取:
+    // 重封每次换随机盐 + 随机 nonce,同一份内容连算两次都不相等,那样会让
+    // 每个 interval 都判定成「变了」而重新上传一次 —— 打的是用户的付费桶,
+    // 还会把 `keep` 份历史窗口刷光。
     let fp = cloud::fingerprint(&files, &secrets);
     // 定时那一路已经在 `drive_cloud_backup` 里问过 `should_upload` 了(其中
     // 一道闸就是指纹)。这里**还要再判一次**,因为**手动**那一路是绕过
@@ -205,31 +210,53 @@ pub fn prepare(dir: &Path, vault: &Vault, cfg: &CloudConfig, stamp_rfc3339: &str
     if fp == cfg.last_fingerprint {
         return Prepared::Unchanged;
     }
-    // 注意 `secrets.enc` 的字节**不是内容的函数**:`crypto::encrypt` 每次换
-    // 一个随机 nonce,所以 vault 存一次盘、密文整个变一遍,哪怕里头一个字段
-    // 都没改。后果是「任何一次 vault save 都会触发一次上传」。今天可以接受
-    // (vault save 本来就对应一次真实改动),但若以后出现「定时重写 secrets.enc」
-    // 之类的路径,这一条会把 keep 份历史窗口刷光 —— 那时候要做的是把指纹的
-    // 密文分量换成对**明文载荷**取,不是去调大 interval。
 
-    // ② 封:先拼成 F46-a 的包文本,再**整体**用 vault key 加密(设计 D5)。
-    //    整体加密之后,sessions.toml 里的真机 IP / 用户名 / 跳板拓扑不落云端明文。
-    let text = match portable::write_pack(files, &secrets, env!("CARGO_PKG_VERSION"), stamp_rfc3339)
-    {
+    // ② 取备份口令。**最先取**:没口令就没必要打包,而且这句话要说得出口
+    // (C5)——不去动 `cloud::should_upload` 那道定时器闸,落点就是这里的
+    // `Failed`,与今天 `NoMasterPassword` 那条完全同形。
+    let pass = match cloud::passphrase(cfg, vault) {
+        Ok(p) if !p.is_empty() => p,
+        Ok(_) => {
+            return Prepared::Failed(
+                "云端备份还没设置备份口令 —— 请在设置的「云端备份」里设一个。\
+                 它与主密码无关,忘了则云端已有的备份无法恢复。"
+                    .into(),
+            )
+        }
+        Err(e) => return Prepared::Failed(format!("读不出备份口令:{e}")),
+    };
+
+    // ③ 内层:`secrets.enc` 的明文用备份口令重封一遍(理由见①)。
+    // 一条密码都没存过时 `plain` 是空串 —— 不封空密文,否则包里会有一段
+    // 解得开却什么都没有的字节,恢复那头会照着它管用户要口令
+    // (同 F46-a 导出路径的姿态,见 `app.rs` 的 `write_pack_to`)。
+    let plain = match vault.secrets_plaintext() {
+        Ok(p) => p,
+        Err(e) => return Prepared::Failed(format!("读不出凭据:{e}")),
+    };
+    let inner = if plain.is_empty() {
+        Vec::new()
+    } else {
+        match portable::seal_secrets(plain.as_bytes(), &pass) {
+            Ok(b) => b,
+            Err(e) => return Prepared::Failed(format!("重封凭据失败:{e}")),
+        }
+    };
+
+    // ④ 打包 + 外层整体用**同一句备份口令**加密(两层用同一个函数
+    // `seal_secrets`——它的本质是「用口令封一段字节」,不是「只封凭据」,
+    // 这里借它给整份包再封一层,省得为外层另起一个同构的函数)。
+    // 整体加密之后,sessions.toml 里的真机 IP / 用户名 / 跳板拓扑不落云端明文。
+    let text = match portable::write_pack(files, &inner, env!("CARGO_PKG_VERSION"), stamp_rfc3339) {
         Ok(t) => t,
         Err(e) => return Prepared::Failed(format!("打包失败:{e}")),
     };
-    let sealed = match vault.seal_with_master(text.as_bytes()) {
+    let sealed = match portable::seal_secrets(text.as_bytes(), &pass) {
         Ok(b) => b,
-        Err(mullion_store::StoreError::NoMasterPassword) => {
-            return Prepared::Failed(
-                "云端备份需要先设置主密码 —— 钥匙串里的密钥换台机器解不开".into(),
-            )
-        }
         Err(e) => return Prepared::Failed(format!("加密失败:{e}")),
     };
 
-    // ③ 解 SK。**这是最后一件需要 vault 的事**,做完之后线程那一半就只剩字节了。
+    // ⑤ 解 SK。**这是最后一件需要 vault 的事**,做完之后线程那一半就只剩字节了。
     let sk = match cloud::secret_key(cfg, vault) {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => return Prepared::Failed("还没填 Access Key Secret".into()),
@@ -655,23 +682,35 @@ mod tests {
         }
     }
 
-    /// 没设主密码时,`prepare` 必须**在送出去之前**就拦下来,并且说的是
-    /// 「需要先设置主密码」而不是「加密失败」。
+    /// F283:**没有主密码也能备份**了 —— 这正是本切片的目的。
     ///
-    /// 钥匙串里的那把钥匙只在这台机器上有效,用它封出来的备份换台电脑
-    /// 一个字也解不开 —— 而云备份的主场景正是「换新电脑」(设计 D6)。
-    /// 说成「加密失败」的话,用户会去查网络、查 AK/SK,查不到一个前置条件。
-    ///
-    /// 自证会变红:把 `NoMasterPassword` 那条专门分支并进通用的
-    /// `Err(e) => Failed(format!("加密失败:{e}"))`。
-    ///
-    /// **`msg.contains("主密码")` 不够**:`StoreError::NoMasterPassword` 自己的
-    /// `Display` 就是「这个操作需要先设置主密码」,并进通用分支后消息变成
-    /// 「加密失败:这个操作需要先设置主密码」—— 仍然 `contains("主密码")`,
-    /// 这条断言照绿。真正要拦的是「听起来像 bug 的『加密失败』前缀」,
-    /// 所以还要断言消息**不是**以它开头。
+    /// 这条取代旧的 `a_vault_without_a_master_password_is_refused_with_the_real_reason`
+    /// (那条钉的是已经拆掉的设计 D6)。
     #[test]
-    fn a_vault_without_a_master_password_is_refused_with_the_real_reason() {
+    fn a_keyring_vault_with_a_passphrase_can_back_up() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let v = mullion_store::Vault::open(
+            dir.path().to_path_buf(),
+            &mullion_store::InMemoryKey([7u8; 32]),
+        )
+        .expect("开库(不设主密码,即钥匙串方案)");
+        let mut cfg = mullion_store::CloudConfig::default();
+        cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+        cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
+        match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Ready(p) => {
+                assert!(!p.sealed.is_empty(), "封出来的载荷是空的");
+                assert!(!p.fingerprint.is_empty(), "没算出指纹");
+            }
+            Prepared::Failed(msg) => panic!("钥匙串方案 + 备份口令应该能备份,却失败了:{msg}"),
+            Prepared::Unchanged => panic!("被当成「内容没变」跳过了"),
+        }
+    }
+
+    /// 没设口令 → **说出原因**(C5)。不去动 `should_upload` 那道闸,
+    /// 落点必须是 `prepare` 返回 `Failed`,与今天 `NoMasterPassword` 那条同形。
+    #[test]
+    fn a_config_without_a_passphrase_is_refused_with_the_real_reason() {
         let dir = tempfile::tempdir().expect("临时目录");
         let v = mullion_store::Vault::open(
             dir.path().to_path_buf(),
@@ -682,17 +721,130 @@ mod tests {
         match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
             Prepared::Failed(msg) => {
                 assert!(
-                    msg.contains("主密码"),
-                    "拦是拦下了,但没说清是缺主密码:{msg}"
-                );
-                assert!(
-                    !msg.starts_with("加密失败"),
-                    "专门分支被并进了通用的「加密失败」—— 用户会去查网络 / 查 AK-SK,\
-                     查不到一个前置条件:{msg}"
+                    msg.contains("备份口令"),
+                    "拦是拦下了,但没说清是缺备份口令:{msg}"
                 );
             }
-            Prepared::Ready(_) => panic!("钥匙串方案下封出了一份换台机器解不开的备份"),
+            Prepared::Ready(_) => panic!("没设备份口令却封出了载荷"),
             Prepared::Unchanged => panic!("被当成「内容没变」跳过了 —— 真正的原因被吃掉"),
+        }
+    }
+
+    /// 建一个存了真实凭据的钥匙串方案 vault,并把它的 `secrets.enc` 落盘。
+    /// 供 C1 的两条守护测试共用。
+    fn vault_with_a_real_credential(dir: &std::path::Path) -> mullion_store::Vault {
+        let mut v =
+            mullion_store::Vault::open(dir.to_path_buf(), &mullion_store::InMemoryKey([7u8; 32]))
+                .expect("开库");
+        v.add_credential(mullion_store::CredentialDraft {
+            name: "运维".into(),
+            user: "ops".into(),
+            kind: mullion_store::AuthKind::Password,
+            secret: Some(mullion_store::SecretEntry {
+                password: Some("hunter2".into()),
+                passphrase: None,
+                proxy_password: None,
+                private_key: None,
+            }),
+        });
+        v.save().expect("落盘,写出 secrets.enc");
+        v
+    }
+
+    /// C1:包里的 `secrets.enc` 必须是**用备份口令重封过**的,不是盘上那份原样。
+    ///
+    /// 判据两头都要:①拿口令 `open_secrets` 解得开 ②那段字节 != 盘上原文。
+    /// 只断言「不等于」是不够的(随机 nonce 让任何一次重新加密都不等于),
+    /// 只断言「解得开」也不够(原样塞的那份在**有主密码**的库上也解得开)。
+    #[test]
+    fn the_secrets_inside_the_payload_are_resealed_with_the_backup_passphrase() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let v = vault_with_a_real_credential(dir.path());
+        let mut cfg = mullion_store::CloudConfig::default();
+        cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+        cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
+
+        let payload = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Ready(p) => p,
+            other => panic!("该有东西可传,却是 {}", debug_label(&other)),
+        };
+        let text = portable::open_secrets(&payload.sealed, "backup-pass").expect("外层解不开");
+        let text = String::from_utf8(text).expect("外层解出来不是 UTF-8");
+        let pack = portable::read_pack(&text).expect("包解析失败");
+        let inner = portable::secrets_blob(&pack).expect("内层密文段不是合法 base64");
+
+        assert!(!inner.is_empty(), "库里明明存了一条凭据,内层密文段却是空的");
+        assert!(
+            portable::open_secrets(&inner, "backup-pass").is_ok(),
+            "内层密文段拿备份口令解不开 —— 没有用备份口令重封"
+        );
+        let on_disk = std::fs::read(dir.path().join("secrets.enc")).expect("读盘上原文");
+        assert_ne!(
+            inner, on_disk,
+            "内层密文段与盘上 secrets.enc 原样相同 —— 换台机器一个字都解不开"
+        );
+    }
+
+    /// C1 的另一半:**钥匙串方案**(没主密码)的库,重封之后恢复那头也解得开。
+    /// 这条才是 F283 真正要保证的东西 —— 原样塞的实现在这里会死。
+    #[test]
+    fn a_keyring_vaults_secrets_survive_the_trip() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let v = vault_with_a_real_credential(dir.path());
+        let plain_before = v.secrets_plaintext().expect("读明文");
+        let mut cfg = mullion_store::CloudConfig::default();
+        cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+        cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
+
+        let payload = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Ready(p) => p,
+            other => panic!("该有东西可传,却是 {}", debug_label(&other)),
+        };
+        let text = portable::open_secrets(&payload.sealed, "backup-pass").expect("外层解不开");
+        let text = String::from_utf8(text).expect("外层解出来不是 UTF-8");
+        let pack = portable::read_pack(&text).expect("包解析失败");
+        let inner = portable::secrets_blob(&pack).expect("内层密文段不是合法 base64");
+        let plain_after = portable::open_secrets(&inner, "backup-pass").expect("内层解不开");
+        let plain_after = String::from_utf8(plain_after).expect("内层解出来不是 UTF-8");
+
+        assert_eq!(
+            plain_after, plain_before,
+            "钥匙串方案的凭据经过一趟打包/重封/解开之后内容变了"
+        );
+    }
+
+    /// C4:指纹仍对**盘上 secrets.enc 的原始字节**取,不受重封的随机盐影响。
+    ///
+    /// 反例会红:若改成对重封结果取,同一份内容连算两次都不相等 ——
+    /// 后果是每个 interval 都上传一次,打的是用户的付费桶。
+    #[test]
+    fn the_fingerprint_does_not_change_just_because_we_resealed() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let v = vault_with_a_real_credential(dir.path());
+        let mut cfg = mullion_store::CloudConfig::default();
+        cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+        cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
+        // `cfg.last_fingerprint` 全程留空,两次调用都不能走 `Unchanged` 早退。
+
+        let fp1 = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
+            Prepared::Ready(p) => p.fingerprint,
+            other => panic!("第一次该有东西可传,却是 {}", debug_label(&other)),
+        };
+        let fp2 = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:01Z") {
+            Prepared::Ready(p) => p.fingerprint,
+            other => panic!("第二次该有东西可传,却是 {}", debug_label(&other)),
+        };
+        assert_eq!(
+            fp1, fp2,
+            "同一份内容重封了两次,指纹却变了 —— 每个 interval 都会重新上传一次"
+        );
+    }
+
+    fn debug_label(p: &Prepared) -> &'static str {
+        match p {
+            Prepared::Unchanged => "Unchanged",
+            Prepared::Failed(_) => "Failed",
+            Prepared::Ready(_) => "Ready",
         }
     }
 
@@ -710,10 +862,12 @@ mod tests {
         .expect("开库");
         v.set_master_password("hunter2").expect("设主密码");
         let mut cfg = mullion_store::CloudConfig::default();
-        // `prepare` 里 SK 那道闸(③)跟主密码那道闸(②)是两回事:没填 SK
+        // `prepare` 里 SK 那道闸跟主密码 / 备份口令那几道闸是分开的:没填 SK
         // 会报「还没填 Access Key Secret」,这条测试要验证的是**过了 SK 那道闸
-        // 之后**确实有东西可传,所以先把它填上。
+        // 之后**确实有东西可传,所以先把它填上。F283 之后备份口令是独立的
+        // 前置条件(与主密码无关),这里也要设一个。
         cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+        cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
         match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
             Prepared::Ready(p) => {
                 assert!(!p.sealed.is_empty(), "封出来的载荷是空的");
@@ -753,6 +907,7 @@ mod tests {
         v.set_master_password("hunter2").expect("设主密码");
         let mut cfg = mullion_store::CloudConfig::default();
         cloud::set_secret_key(&mut cfg, &v, "sk-secret").expect("填 SK");
+        cloud::set_passphrase(&mut cfg, &v, "backup-pass").expect("设备份口令");
 
         let fp = match prepare(dir.path(), &v, &cfg, "2026-09-15T10:15:00Z") {
             Prepared::Ready(p) => p.fingerprint,
