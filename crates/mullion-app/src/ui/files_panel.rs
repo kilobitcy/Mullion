@@ -807,8 +807,7 @@ pub fn show(
     // F278:本地栏恒 `None`(范围决策:本切片只做远端栏)。用 `Option<&mut _>`
     // 而不是在函数体里 `if column == Remote` —— 本地栏压根传不进来,
     // 漏判一处也不会静默出现一个点了没反应的放大镜。
-    let mut find_slot = find;
-    let mut find = find_slot.as_deref_mut().and_then(|s| s.as_mut());
+    let mut find = find.and_then(|s| s.as_mut());
     // F250:判据是「**这一栏的当前目录**在不在基准之下」,不是逐条比选中项。
     // 两者等价(选中项一律是 `cwd.join(单段名字)`,见 `delete_targets`),而
     // 这一份是 O(路径长度)、每帧算得起 —— 逐条比要遍历整个 `entries`,
