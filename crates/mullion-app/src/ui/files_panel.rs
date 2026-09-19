@@ -121,6 +121,22 @@ pub enum FileAction {
     CopyPath {
         relative: bool,
     },
+    /// F278:点了路径条上的放大镜。开搜索条;已经开着就关掉(同一颗按钮
+    /// 两用,与侧栏开关同一种心智)。
+    FindToggle,
+    /// F278:在搜索框里按了回车。串是**原文**,匹配判据在 `files::find` 里,
+    /// 起搜要拿当前目录当根 —— 而当前目录 app 侧本来就知道。
+    FindStart(String),
+    /// F278:用户按了取消(或 Esc)—— 停在原地,已经找到的结果留着。
+    FindCancel,
+    /// F278:关掉搜索条,回到普通列表。
+    FindClose,
+    /// F278:点中了一条搜索结果。**绝对路径**,由面板从 `Hit` 里直接取 ——
+    /// 与 `Rename`/`NewFile` 同一条约定(路径在面板侧拼好),理由见那两条。
+    FindPick {
+        path: mullion_ssh::sftp::RemotePath,
+        is_dir: bool,
+    },
 }
 
 /// F139:画书签相关控件要的两样东西。
@@ -609,6 +625,44 @@ fn path_edit_id(id: &str) -> egui::Id {
     egui::Id::new(("files-path-edit", id))
 }
 
+/// F278:搜索框自己的 id。同上。
+fn find_edit_id(id: &str) -> egui::Id {
+    egui::Id::new(("files-find-edit", id))
+}
+
+/// F278:搜索条上那句进度/结论。
+///
+/// **四种收场各说各的话**(`find::Stop` 的四档):「翻完了,没找到」和
+/// 「翻了 2000 个目录还没翻完」对用户的含义相反 —— 混成一句「没有结果」
+/// 会让他以为文件不存在,而它可能就在第 2001 个目录里。
+///
+/// 写成收 `&Walk` 的自由函数:这条判据是纯文本,挂在渲染函数里的话就再也
+/// 没法单测了,而「哪种收场说哪句话」正是最容易写反的地方。
+pub fn find_progress_text(w: &crate::files::find::Walk) -> String {
+    use crate::files::find::Stop;
+    let n = w.hits().len();
+    let d = w.visited();
+    let skipped = if w.skipped() > 0 {
+        format!(",{} 个目录没权限读", w.skipped())
+    } else {
+        String::new()
+    };
+    match w.status() {
+        None => format!("正在搜索…已找到 {n} 个,已翻 {d} 个目录{skipped}"),
+        Some(Stop::Exhausted) if n == 0 => format!("没有找到(翻了 {d} 个目录{skipped})"),
+        Some(Stop::Exhausted) => format!("找到 {n} 个(翻了 {d} 个目录{skipped})"),
+        Some(Stop::HitCap) => format!(
+            "已达 {} 个结果上限,结果可能不全 —— 换个更长的关键词试试{skipped}",
+            crate::files::find::MAX_HITS
+        ),
+        Some(Stop::DirCap) => format!(
+            "已翻 {} 个目录到上限,结果可能不全 —— 换个更深的目录再搜{skipped}",
+            crate::files::find::MAX_DIRS
+        ),
+        Some(Stop::Canceled) => format!("已取消,当时已找到 {n} 个{skipped}"),
+    }
+}
+
 /// F200:就地改名那个输入框的 id。**每栏一个固定 id,不掺行名**:
 /// 同一时刻一栏里最多只有一行在改名,而掺了行名的话 egui 会把它当成
 /// 另一个部件 —— 改名途中列表重排(点了列头 / 自动刷新)会让输入框
@@ -746,9 +800,15 @@ pub fn show(
     cols: &mut ColWidths,
     clip: Option<&RemoteClip>,
     rel_base: Option<&[u8]>,
+    find: Option<&mut Option<Find>>,
 ) -> Option<FileAction> {
     let mut action = None;
     let clip_ready = clip.is_some();
+    // F278:本地栏恒 `None`(范围决策:本切片只做远端栏)。用 `Option<&mut _>`
+    // 而不是在函数体里 `if column == Remote` —— 本地栏压根传不进来,
+    // 漏判一处也不会静默出现一个点了没反应的放大镜。
+    let mut find_slot = find;
+    let mut find = find_slot.as_deref_mut().and_then(|s| s.as_mut());
     // F250:判据是「**这一栏的当前目录**在不在基准之下」,不是逐条比选中项。
     // 两者等价(选中项一律是 `cwd.join(单段名字)`,见 `delete_targets`),而
     // 这一份是 O(路径长度)、每帧算得起 —— 逐条比要遍历整个 `entries`,
@@ -938,6 +998,28 @@ pub fn show(
             resp.on_hover_text("收藏的路径")
                 .on_disabled_hover_text("还没有收藏任何路径");
         });
+        // F278:递归搜索。**必须画在路径标签之前** —— 理由与上面书签那两颗
+        // 逐字相同:下面那个 `Label` 用 `available_width` 吃掉整行剩余宽度,
+        // 排在它后面的按钮会被挤出可视区。
+        //
+        // **只有远端栏有**(本切片范围):本地栏递归要另配一条
+        // `spawn_blocking` 通路 —— 本地列目录目前同步跑在事件循环线程上,
+        // 递归 2000 个目录会把整个窗口连同终端一起卡住。
+        if column == PanelColumn::Remote {
+            let on = find.is_some();
+            if crate::ui::icon::icon_button(
+                ui,
+                crate::ui::icon::Glyph::Search,
+                true,
+                if on {
+                    "关闭搜索"
+                } else {
+                    "在这个目录下递归搜索"
+                },
+            ) {
+                action = Some(FileAction::FindToggle);
+            }
+        }
         annotate::mark(ui.ctx(), format!("文件面板/{id}/路径"), ui.max_rect());
         match state.path_edit.as_mut() {
             // 编辑态。**注意它能收到键盘全靠 `Modal::FilesPathEdit`**(下一个
@@ -997,6 +1079,64 @@ pub fn show(
     // F139:原来这里有一条横排书签栏(`if !bookmarks.is_empty()` + 一排
     // `small_button`)。已去掉 —— 它只在该会话已经配过书签时才出现,用户
     // 根本不知道它存在,还白占一整行高度。书签改走路径条上的 ▾ 下拉。
+
+    // F278:搜索条。画在路径条下面一行,`None` 时一点高度都不占。
+    if let Some(f) = find.as_mut() {
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut f.buf)
+                    .id(find_edit_id(id))
+                    .hint_text("文件名(模糊匹配,回车开始)")
+                    .desired_width(ui.available_width() * 0.5),
+            );
+            // **只在刚打开那一刻请求一次焦点**。无条件每帧 `request_focus()`
+            // 会让它跟路径条的输入框互抢,先进去的那个永远退不出来。
+            if f.focus_pending {
+                resp.request_focus();
+                f.focus_pending = false;
+            }
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let q = f.buf.trim().to_string();
+                // 空串不起搜:`find::matches` 对空查询恒不命中,发出去就是
+                // 白爬一整棵树。
+                if !q.is_empty() {
+                    action = Some(FileAction::FindStart(q));
+                }
+            }
+            match f.walk.as_ref() {
+                None => {
+                    if ui.button("搜索").clicked() {
+                        let q = f.buf.trim().to_string();
+                        if !q.is_empty() {
+                            action = Some(FileAction::FindStart(q));
+                        }
+                    }
+                }
+                Some(w) => {
+                    let done = w.status();
+                    ui.colored_label(theme::c32(t.fg_dim), find_progress_text(w));
+                    if done.is_none() && ui.button("取消").clicked() {
+                        action = Some(FileAction::FindCancel);
+                    }
+                    if done.is_some() && ui.button("重新搜索").clicked() {
+                        let q = f.buf.trim().to_string();
+                        if !q.is_empty() {
+                            action = Some(FileAction::FindStart(q));
+                        }
+                    }
+                }
+            }
+            if crate::ui::icon::icon_button(
+                ui,
+                crate::ui::icon::Glyph::Cross,
+                true,
+                "关闭搜索(Esc)",
+            ) {
+                action = Some(FileAction::FindClose);
+            }
+        });
+        annotate::mark(ui.ctx(), format!("文件面板/{id}/搜索"), ui.max_rect());
+    }
 
     match &state.load {
         Load::Idle => {
@@ -2414,6 +2554,8 @@ pub fn sidebar(
                         frame.clip.as_ref(),
                         // F250:本地栏不给相对路径 —— 基准是远端分屏报的目录(L1)。
                         None,
+                        // F278:本地栏没有搜索(本切片范围)。
+                        None,
                     );
                 });
             });
@@ -2456,6 +2598,7 @@ pub fn sidebar(
                         &mut ui_state.files_cols,
                         frame.clip.as_ref(),
                         rel_base,
+                        Some(&mut frame.find),
                     );
                 });
             });
@@ -2600,6 +2743,8 @@ pub fn content(
                     frame.clip.as_ref(),
                     // F250:本地栏不给相对路径 —— 基准是远端分屏报的目录(L1)。
                     None,
+                    // F278:本地栏没有搜索(本切片范围)。
+                    None,
                 );
             });
             ui.painter()
@@ -2623,6 +2768,7 @@ pub fn content(
                     cols,
                     frame.clip.as_ref(),
                     rel_base,
+                    Some(&mut frame.find),
                 );
             });
         });
@@ -2787,6 +2933,11 @@ mod tests {
             gid: 1000,
             link_target: None,
         }
+    }
+
+    /// F278:测试专用的 `RemotePath` 构造,同 `find.rs` 那份 `rp`。
+    fn rp(s: &str) -> RemotePath {
+        RemotePath::from_bytes(s.as_bytes().to_vec())
     }
 
     /// 测宽桩:ASCII 7pt / 非 ASCII 14pt(CJK 一个字顶两个 ASCII,省略号
@@ -2981,6 +3132,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                         None,
                     );
@@ -3281,6 +3433,7 @@ mod tests {
                         &mut cols,
                         None,
                         None,
+                        None,
                     );
                 });
             }));
@@ -3390,6 +3543,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                         None,
                     );
@@ -3595,6 +3749,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                         None,
                     );
@@ -4187,6 +4342,7 @@ mod tests {
                         cols,
                         None,
                         None,
+                        None,
                     );
                 });
             });
@@ -4472,6 +4628,7 @@ mod tests {
                             &mut cols,
                             None,
                             None,
+                            None,
                         );
                     });
                 });
@@ -4521,6 +4678,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                         None,
                     );
@@ -4588,6 +4746,7 @@ mod tests {
                             BookmarkView::none(),
                             0,
                             &mut cols,
+                            None,
                             None,
                             None,
                         );
@@ -4931,6 +5090,7 @@ mod tests {
                         cols,
                         None,
                         None,
+                        None,
                     );
                 });
             })
@@ -5031,6 +5191,7 @@ mod tests {
                     &mut cols,
                     None,
                     None,
+                    None,
                 );
             });
         });
@@ -5062,6 +5223,7 @@ mod tests {
                     &mut cols,
                     None,
                     None,
+                    None,
                 );
             });
         });
@@ -5078,6 +5240,7 @@ mod tests {
                     BookmarkView::none(),
                     0,
                     &mut cols,
+                    None,
                     None,
                     None,
                 );
@@ -5183,6 +5346,7 @@ mod tests {
                     cols,
                     None,
                     None,
+                    None,
                 );
             });
         });
@@ -5216,6 +5380,7 @@ mod tests {
                     },
                     0,
                     cols,
+                    None,
                     None,
                     None,
                 );
@@ -6390,6 +6555,7 @@ mod tests {
                         &mut cols,
                         None,
                         None,
+                        None,
                     );
                 });
             });
@@ -6550,6 +6716,7 @@ mod tests {
                         &mut cols,
                         None,
                         None,
+                        None,
                     );
                 });
             });
@@ -6620,6 +6787,7 @@ mod tests {
                             BookmarkView::none(),
                             0,
                             &mut cols,
+                            None,
                             None,
                             None,
                         );
@@ -6714,6 +6882,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                         None,
                     );
@@ -7443,6 +7612,7 @@ mod tests {
                         &mut cols,
                         None,
                         None,
+                        None,
                     );
                 });
             }));
@@ -7654,6 +7824,7 @@ mod tests {
                         &mut cols,
                         None,
                         None,
+                        None,
                     );
                 });
             });
@@ -7741,6 +7912,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                         None,
                     );
@@ -8032,6 +8204,7 @@ mod tests {
                         &mut cols,
                         None,
                         None,
+                        None,
                     );
                 });
             });
@@ -8113,6 +8286,7 @@ mod tests {
                             cols,
                             None,
                             None,
+                            None,
                         );
                     });
                 }));
@@ -8175,6 +8349,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                         None,
                         None,
                     );
@@ -8273,6 +8448,7 @@ mod tests {
                         cols,
                         None,
                         None,
+                        None,
                     );
                 });
             })
@@ -8357,6 +8533,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                         None,
                         None,
                     );
@@ -8445,6 +8622,7 @@ mod tests {
                         cols,
                         None,
                         None,
+                        None,
                     );
                 });
             })
@@ -8505,6 +8683,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         cols,
+                        None,
                         None,
                         None,
                     );
@@ -8591,6 +8770,7 @@ mod tests {
                                 c,
                                 None,
                                 None,
+                                None,
                             );
                         });
                     })
@@ -8650,6 +8830,7 @@ mod tests {
                         BookmarkView::none(),
                         0,
                         &mut cols,
+                        None,
                         None,
                         None,
                     );
@@ -8726,5 +8907,57 @@ mod tests {
             find_text_pos(&shapes, ELLIPSIS).is_some(),
             "标题被截断了却没画省略号"
         );
+    }
+
+    /// F278:四种收场各说各的话。**「翻完了,没找到」和「翻了 2000 个目录
+    /// 还没翻完」对用户的含义相反** —— 混成一句会让他以为文件不存在。
+    ///
+    /// 自证会变红:把 `Some(Stop::DirCap)` 那一臂并进 `Exhausted`。
+    #[test]
+    fn each_way_a_search_can_end_says_a_different_thing() {
+        use crate::files::find::{Stop, Walk, MAX_DIRS};
+
+        let mut done = Walk::new(rp("/r"), "zz".into(), false);
+        let b = done.take_runnable();
+        done.accept(&b[0], Ok(vec![]));
+        assert_eq!(done.status(), Some(Stop::Exhausted));
+        let s_done = find_progress_text(&done);
+        assert!(s_done.contains("没有找到"), "{s_done}");
+
+        let mut canceled = Walk::new(rp("/r"), "zz".into(), false);
+        canceled.cancel();
+        let s_cancel = find_progress_text(&canceled);
+        assert!(s_cancel.contains("已取消"), "{s_cancel}");
+        assert_ne!(s_cancel, s_done);
+
+        // 跑到目录封顶(树永远生得出新目录)。
+        let mut capped = Walk::new(rp("/r"), "zz".into(), false);
+        for _ in 0..100_000 {
+            let batch = capped.take_runnable();
+            if batch.is_empty() {
+                break;
+            }
+            for d in batch {
+                capped.accept(&d, Ok(vec![entry(b"sub", EntryKind::Dir)]));
+            }
+        }
+        let s_cap = find_progress_text(&capped);
+        assert!(
+            s_cap.contains(&MAX_DIRS.to_string()) && s_cap.contains("不全"),
+            "目录封顶必须说「可能不全」并报出上限:{s_cap}"
+        );
+        assert_ne!(s_cap, s_done, "封顶和搜完不能说同一句话");
+    }
+
+    /// F278:还在跑的时候那句话里有「正在」,不能长得像结论。
+    ///
+    /// 自证会变红:把 `None =>` 那一臂的文案改成不含「正在搜索」的串。
+    #[test]
+    fn a_running_search_does_not_read_like_a_conclusion() {
+        use crate::files::find::Walk;
+        let mut w = Walk::new(rp("/r"), "zz".into(), false);
+        let _ = w.take_runnable(); // 发出去了,还没回来
+        let s = find_progress_text(&w);
+        assert!(s.contains("正在搜索"), "{s}");
     }
 }
