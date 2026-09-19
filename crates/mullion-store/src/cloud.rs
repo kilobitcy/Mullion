@@ -115,6 +115,11 @@ pub struct CloudConfig {
     /// 上次成功的时刻(RFC3339)。只给状态栏看。
     #[serde(default)]
     pub last_ok_at: String,
+    /// F282:此服务端已实测拒收 PUT 上的 `If-None-Match`(OSS)。true 之后
+    /// 每次上传直接跳过该头,不再先撞一下。serde 缺省 false —— 旧 cloud.toml
+    /// 没这个键,读出来就是「还没学过」,天然兼容,不升 schema 版本。
+    #[serde(default)]
+    pub no_if_none_match: bool,
     /// 这份是从**读不懂的文件**上来的。`save` 见到它就拒绝写。
     ///
     /// **不落盘**(`serde(skip)`),**私有**(只有 [`load`] 能置位)。
@@ -159,6 +164,7 @@ impl Default for CloudConfig {
             last_fingerprint: String::new(),
             last_seq: 0,
             last_ok_at: String::new(),
+            no_if_none_match: false,
             corrupt: false,
         }
     }
@@ -467,6 +473,7 @@ mod tests {
             last_fingerprint: String::new(),
             last_seq: 0,
             last_ok_at: String::new(),
+            no_if_none_match: false,
             corrupt: false,
         }
     }
@@ -583,6 +590,34 @@ mod tests {
         assert_eq!(
             c.interval_min, DEFAULT_INTERVAL_MIN,
             "interval_min 的 serde 默认没接上 —— 定时器周期会变成一个谁也没写过的值"
+        );
+    }
+
+    /// F282:没有 `no_if_none_match` 这个键的老 `cloud.toml`(升级前写的)
+    /// 必须读成 `false`(「还没学过」),而不是判损坏 —— 这是 F282 加的新字段,
+    /// 版本兼容合约与 `a_file_written_by_an_older_version_still_loads_with_defaults`
+    /// 那条一致。save 之后重读要保真(往返)。
+    #[test]
+    fn an_old_cloud_toml_without_the_flag_reads_as_not_learned_yet() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        std::fs::write(
+            dir.path().join(CLOUD_FILE),
+            "enabled = true\nbucket = \"b\"\n",
+        )
+        .expect("写老文件(没有 no_if_none_match 这个键)");
+        let c = load(dir.path());
+        assert!(
+            !c.no_if_none_match,
+            "没有这个键的老文件被读成了「已经学过」——升级用户会莫名其妙跳过 If-None-Match"
+        );
+
+        // 往返保真:学到了之后存盘、重读,必须还是 true。
+        let mut learned = cfg();
+        learned.no_if_none_match = true;
+        save(dir.path(), &learned).expect("写");
+        assert!(
+            load(dir.path()).no_if_none_match,
+            "no_if_none_match 没有往返保真"
         );
     }
 
