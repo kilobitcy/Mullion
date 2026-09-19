@@ -9,6 +9,7 @@ pub mod clip;
 pub mod copy_path;
 pub mod drag;
 pub mod fail;
+pub mod find;
 pub mod local;
 pub mod owners;
 pub mod path_input;
