@@ -25189,6 +25189,27 @@ mod tests {
             prod_src(),
             "fn reopen_sftp_on_focused_host(&mut self, generation: u64) {",
         ));
+        // 唯一性先钉死:占坑攻击(在别处再塞一份 `files.find = None;`)会让
+        // count 偏离 1,在下面单纯的 `contains` 判据被绕过之前先在这里就红。
+        assert_eq!(
+            body.matches("files.find = None;").count(),
+            1,
+            "`files.find = None;` 不止出现一次:{body}"
+        );
+        assert_eq!(
+            body.matches("files.find_seq += 1;").count(),
+            1,
+            "`files.find_seq += 1;` 不止出现一次:{body}"
+        );
+        // 单纯计数堵不住「原地套一层 `if false { .. }` 把真代码变成死代码」
+        // 这种攻击 —— 字面串原样还在、count 仍是 1,但已经永远不会执行,
+        // clippy `-D warnings` 对这个也不报警(复核实测过)。生产代码没有
+        // 正当理由写 `if false`,直接钉「不存在」堵死这条路。
+        assert!(
+            !body.contains("if false"),
+            "函数体里出现了 `if false` —— 像是把清空搜索的代码原地做成了\
+             永远不会执行的死代码:{body}"
+        );
         assert!(
             body.contains("files.find = None;"),
             "换机器没有清掉 find —— 新机器的目录会被塞进旧机器那次遍历里:{body}"
@@ -25235,6 +25256,14 @@ mod tests {
             1,
             "`FileAction::Refresh` 不止出现一次 —— 像是被混进了换目录守卫,\
              搜索中按一下刷新,结果就被清掉了:{body}"
+        );
+        // 同 `switching_hosts_throws_away_the_running_search`:单纯计数堵不住
+        // 「原地套一层 `if false { .. }` 把真代码变成死代码」——字面串与顺序
+        // 都对,但永远不会执行。生产代码没有正当理由写 `if false`。
+        assert!(
+            !body.contains("if false"),
+            "函数体里出现了 `if false` —— 像是把换目录清空搜索的代码原地做成了\
+             永远不会执行的死代码:{body}"
         );
         let door = body
             .find("FileAction::Goto(_) | FileAction::GotoInput(_) | FileAction::Up")
