@@ -44,6 +44,11 @@ pub enum UploadOutcome {
         fingerprint: String,
         seq: u64,
         at: String,
+        /// F282:这一轮才第一次学到「这个服务端拒收 If-None-Match」
+        /// (`put_with_retry` 中途摘掉了头才成功,且 `cfg.no_if_none_match`
+        /// 当时还是 false)。`app.rs` 见到 true 就把这条学习写进 `cloud.toml`,
+        /// 下次直接跳过那一头,不用再撞一次。
+        learned_no_if_none_match: bool,
     },
     /// 内容没变,什么都没做。**不是失败** —— 状态栏不该因此报红。
     Unchanged,
@@ -275,13 +280,23 @@ pub fn upload_blocking(
         Ok(keys) => cloud::next_seq(&cfg.prefix, &keys),
         Err(e) => return UploadOutcome::Failed(format!("列举云端对象失败:{e}")),
     };
-    match put_with_retry(&cfg.prefix, start, stamp_compact, |key| {
-        client.put_no_overwrite(key, &payload.sealed, stamp_compact)
-    }) {
-        Ok(seq) => UploadOutcome::Ok {
+    // F282:`cfg.no_if_none_match` 是「上次已经学到的」——已经学过就直接从
+    // 跳头开始,不用每次都先撞一次 400 才降级。
+    let initial_skip = cfg.no_if_none_match;
+    match put_with_retry(
+        &cfg.prefix,
+        start,
+        stamp_compact,
+        initial_skip,
+        |key, skip| client.put_no_overwrite(key, &payload.sealed, stamp_compact, skip),
+    ) {
+        Ok((seq, final_skip)) => UploadOutcome::Ok {
             fingerprint: payload.fingerprint,
             seq,
             at: stamp_rfc3339.to_string(),
+            // 只有「这一轮中途才学会」才算新学到 —— 配置本来就已经是
+            // true 的话,这次成功不该被误报成一次新发现。
+            learned_no_if_none_match: final_skip && !cfg.no_if_none_match,
         },
         Err(msg) => UploadOutcome::Failed(msg),
     }
@@ -293,22 +308,44 @@ pub fn upload_blocking(
 /// 整体要真网络才跑得起来,于是最容易出错的那一段(撞号往前挪、上限、
 /// 成功时返回的到底是哪个序号)就变成没人守。抽出来之后,假的 `put`
 /// 闭包就能把三种形状全测到。
+///
+/// `initial_skip` = 这次上传要不要一开始就跳过 `If-None-Match` 头
+/// (`cfg.no_if_none_match`,已经学过就不用再撞一次)。返回值第二项是
+/// **最终**用的是不是跳头那一路 —— `upload_blocking` 拿它跟 `initial_skip`
+/// 比,判断这一轮是不是「刚学会」。
+///
+/// F282:`IfNoneMatchRejected` 只在**还没跳头**时摘掉头重试**同一个序号**
+/// (这次 PUT 压根没落东西,号没被这次请求占用,往前挪反而会白白跳过一个
+/// 本来可用的序号)。已经在跳了还被拒,那是别的毛病(比如权限),照普通
+/// 错误如实报,不再原地打转。
+///
+/// **这次「摘头重试」复用了外层的 `MAX_PUT_ATTEMPTS` 计数,不是另起一个
+/// 无限重试**:循环的上限存在的唯一理由就是「网络请求次数不能失控」
+/// (见下面测试的理由),给摘头单独开一个不计数的重试口子会绕开这条不变量。
+/// 代价只是「同一份上传里,首次摘头会少一次真正的撞号重试预算」——
+/// `MAX_PUT_ATTEMPTS` 默认 4,可接受。
 fn put_with_retry(
     prefix: &str,
     mut seq: u64,
     stamp: &str,
-    mut put: impl FnMut(&str) -> Result<(), CloudError>,
-) -> Result<u64, String> {
+    initial_skip: bool,
+    mut put: impl FnMut(&str, bool) -> Result<(), CloudError>,
+) -> Result<(u64, bool), String> {
+    let mut skip = initial_skip;
     for _ in 0..MAX_PUT_ATTEMPTS {
         let key = cloud::object_key(prefix, seq, stamp);
-        match put(&key) {
-            Ok(()) => return Ok(seq),
+        match put(&key, skip) {
+            Ok(()) => return Ok((seq, skip)),
             // 别的机器抢先用掉了这个序号。**往前挪再试** —— 这是没有 CAS
             // 的服务端上唯一的并发保护(设计 D8)。
             Err(CloudError::AlreadyExists) => match plan_after_collision(seq) {
                 Some(next) => seq = next,
                 None => return Err("序号用尽".into()),
             },
+            // F282:服务端(OSS)不认 PUT 上的 If-None-Match —— 摘掉头,
+            // 同一个序号原地重试。已经在跳头的话就不是这个原因了,落进
+            // 下面的通用分支照实报错。
+            Err(CloudError::IfNoneMatchRejected) if !skip => skip = true,
             Err(e) => return Err(format!("上传失败:{e}")),
         }
     }
@@ -352,7 +389,7 @@ mod tests {
              高于 8 会在高延迟链路上把上传线程堵上几分钟"
         );
         let mut calls = 0;
-        let r = put_with_retry("p/", 1, "20260915T101500Z", |_| {
+        let r = put_with_retry("p/", 1, "20260915T101500Z", false, |_, _skip| {
             calls += 1;
             Err(CloudError::AlreadyExists)
         });
@@ -370,7 +407,7 @@ mod tests {
     #[test]
     fn the_sequence_that_comes_back_is_the_one_that_actually_landed() {
         let mut left = 2;
-        let seq = put_with_retry("p/", 5, "20260915T101500Z", |_| {
+        let (seq, _skip) = put_with_retry("p/", 5, "20260915T101500Z", false, |_, _skip| {
             if left > 0 {
                 left -= 1;
                 Err(CloudError::AlreadyExists)
@@ -387,7 +424,7 @@ mod tests {
     #[test]
     fn a_non_collision_error_stops_immediately() {
         let mut calls = 0;
-        let r = put_with_retry("p/", 1, "20260915T101500Z", |_| {
+        let r = put_with_retry("p/", 1, "20260915T101500Z", false, |_, _skip| {
             calls += 1;
             Err(CloudError::Status {
                 code: 403,
@@ -396,6 +433,58 @@ mod tests {
         });
         assert!(r.is_err());
         assert_eq!(calls, 1, "非撞号的错误也在重试 —— 打了 {calls} 次");
+    }
+
+    /// F282:第一次被拒(还没学过)之后必须**摘掉头、原地重试同一个序号**,
+    /// 而不是当成撞号往前挪 —— 那次 PUT 压根没有落地,号根本没被占用。
+    /// 返回值第二项(最终是不是在跳头)必须是 `true`,`upload_blocking`
+    /// 靠它判断「这一轮学到了新东西」。
+    ///
+    /// 自证会变红:把 `Err(CloudError::IfNoneMatchRejected) if !skip => skip = true`
+    /// 那条分支删掉(会落进下面的通用 `Err(e) => return Err(..)`,整个函数
+    /// 直接报失败,`calls` 停在 1)。
+    #[test]
+    fn a_rejected_if_none_match_is_retried_bare_on_the_same_seq_and_reported() {
+        let mut calls = Vec::new();
+        let (seq, final_skip) = put_with_retry("p/", 5, "20260915T101500Z", false, |key, skip| {
+            calls.push((key.to_string(), skip));
+            if calls.len() == 1 {
+                Err(CloudError::IfNoneMatchRejected)
+            } else {
+                Ok(())
+            }
+        })
+        .expect("第二次摘头之后该成功");
+        assert_eq!(seq, 5, "序号被当成撞号往前挪了 —— 这次 PUT 根本没有落地");
+        assert!(final_skip, "最终没有落在跳头上");
+        assert_eq!(calls.len(), 2, "没有重试,或者重试次数不对");
+        assert_eq!(
+            calls[0],
+            ("p/000005-20260915T101500Z.mpk".to_string(), false)
+        );
+        assert_eq!(
+            calls[1],
+            ("p/000005-20260915T101500Z.mpk".to_string(), true),
+            "第二次没有摘掉 If-None-Match 头,或者换了序号"
+        );
+    }
+
+    /// F282:配置已经学过(`initial_skip = true`)时,闭包**第一次**收到的
+    /// `skip` 就该是 `true` —— 不该先按老办法撞一次 400 才降级。
+    #[test]
+    fn a_config_that_already_learned_skips_the_header_from_the_first_shot() {
+        let mut first_skip = None;
+        let (_seq, final_skip) = put_with_retry("p/", 1, "20260915T101500Z", true, |_key, skip| {
+            first_skip.get_or_insert(skip);
+            Ok(())
+        })
+        .expect("应该一次成功");
+        assert_eq!(
+            first_skip,
+            Some(true),
+            "已经学过的配置,第一次 PUT 却没有跳头"
+        );
+        assert!(final_skip, "跳头之后成功,最终结果却不是跳头");
     }
 
     /// 成功之后游标必须**同时**推进指纹与序号。

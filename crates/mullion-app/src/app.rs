@@ -12273,10 +12273,16 @@ impl ApplicationHandler<UserEvent> for App {
                         fingerprint,
                         seq,
                         at,
+                        learned_no_if_none_match,
                     } => {
                         if let Some(d) = dir {
                             let mut cfg = mullion_store::cloud::load(&d);
                             crate::cloudsync::record_success(&mut cfg, &fingerprint, seq, &at);
+                            // F282:这一轮才第一次摘头成功 —— 记住,下次直接跳过
+                            // If-None-Match,不用再撞一次 400。
+                            if learned_no_if_none_match {
+                                cfg.no_if_none_match = true;
+                            }
                             if let Err(e) = mullion_store::cloud::save(&d, &cfg) {
                                 log::warn!("云端备份游标写回失败:{e}");
                             }
@@ -25380,6 +25386,13 @@ mod tests {
         assert!(
             arm.contains("self.cloud_last_err = None;"),
             "成功那条路没清掉失败去重记忆 —— 下一次同样的失败会被静默咽掉:{arm}"
+        );
+        // F282:学习标志必须在 Ok 分支里落盘 —— 漏了的话,已经学到「服务端
+        // 拒收 If-None-Match」这件事永远进不了 cloud.toml,每一轮上传都要
+        // 重新撞一次 400 才降级。
+        assert!(
+            arm.contains("no_if_none_match"),
+            "Ok 分支里没有处理 no_if_none_match —— 学到的东西没有落盘:{arm}"
         );
     }
 
