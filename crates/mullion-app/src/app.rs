@@ -25641,6 +25641,31 @@ mod tests {
         );
     }
 
+    /// F283:两个口令框的清空同样要**存成存砸都执行**,理由同上面那条 SK。
+    ///
+    /// 判据比 SK 那条紧一格:口令这段比 SK 多套一层
+    /// `if pass_new == pass_confirm { .. } else { .. }`,最容易写错的形状是
+    /// 「只在写成功那一支里清」—— 那样两次输错之后明文一直留在草稿里,
+    /// 下次打开设置弹窗它还在,而用户以为自己早就改过了。
+    ///
+    /// 自证会变红:把两句 `.clear()` 搬进 `if pass_new == pass_confirm` 里面。
+    #[test]
+    fn the_passphrase_boxes_are_cleared_whether_or_not_they_saved() {
+        let body = strip_comments(body_of(prod_src(), "fn save_cloud_draft("));
+        for field in ["cloud_pass_new", "cloud_pass_confirm"] {
+            assert_eq!(
+                body.matches(&format!(".{field}.clear()")).count(),
+                1,
+                "{field} 的清空不是恰好一处 —— 漏了会让明文留在草稿里,多了说明有分支在兜底"
+            );
+        }
+        let matched = body_of(&body, "if pass_new == pass_confirm {");
+        assert!(
+            !matched.contains(".clear()"),
+            "清空挂在「两次一致」那一支里 —— 输错两次之后明文会留在草稿里:{matched}"
+        );
+    }
+
     /// **接线守护**:每块新开的 pane 都要起自己那一份自动化。
     ///
     /// 用户报的问题就是这条边不存在:菜单栏点分屏,新 pane 是干净 shell,
