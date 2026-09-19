@@ -25389,10 +25389,12 @@ mod tests {
         );
         // F282:学习标志必须在 Ok 分支里落盘 —— 漏了的话,已经学到「服务端
         // 拒收 If-None-Match」这件事永远进不了 cloud.toml,每一轮上传都要
-        // 重新撞一次 400 才降级。
+        // 重新撞一次 400 才降级。判据必须是**完整的落盘语句**:只查字段名
+        // 子串的话,match 模式里的绑定名 `learned_no_if_none_match` 天然
+        // 含着它,「绑定了但忘记用」照样绿(复核实测过的假绿)。
         assert!(
-            arm.contains("no_if_none_match"),
-            "Ok 分支里没有处理 no_if_none_match —— 学到的东西没有落盘:{arm}"
+            arm.contains("cfg.no_if_none_match = true"),
+            "Ok 分支里没有 `cfg.no_if_none_match = true` —— 学到的东西没有落盘:{arm}"
         );
     }
 
