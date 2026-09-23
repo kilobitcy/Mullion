@@ -1995,6 +1995,54 @@ fn snapshot_tabs_of(tabs: &Tabs<TabContent>) -> (Vec<mullion_store::SavedTab>, u
 /// 于是三处「静默丢掉一整条记录」的 `continue` 一个守护都没有,同时
 /// `note_text` / `row_height` 那几条纯函数测试全绿。这正是本仓库反复出现的
 /// 「纯函数测得扎实、接线没人看着」那一族。
+/// F288:交给 `UiFrame` 的第三列数据。
+///
+/// 非 launcher 态时 `sync_launcher_history` 已经把它置 `None`,这里自然回落
+/// 成空切片。
+///
+/// **必须是自由函数,不能是 `&self` 的方法**:方法会借走整个 `self`,而这个
+/// 调用点正嵌在 `UiFrame` 字面量里,同一个语句还要 `&mut self.ui` /
+/// `&mut self.edit` —— 字段级的不相交借用只有直接点字段才有。
+///
+/// 也不直接在字面量里写三行链式调用:那一串嵌在四十几个字段中间,守护只能
+/// 靠「相邻行」去钉,而 rustfmt 换一次折行就失效。
+fn launcher_history_rows(
+    cache: &Option<Vec<crate::ui::history::HistoryRow>>,
+) -> &[crate::ui::history::HistoryRow] {
+    cache.as_deref().unwrap_or_default()
+}
+
+/// F288:这一帧拿启动页第三列那份现场行怎么办。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistorySync {
+    /// 不在 launcher 态 —— 扔掉,下次进来是新读的。
+    Drop,
+    /// 在 launcher 态、已经有了 —— 一个字节都不读。
+    Keep,
+    /// 在 launcher 态、还没有 —— 现读一次盘。
+    Reload,
+}
+
+/// F288:每帧那一下的决策。**纯函数** —— 两个 `bool` 进、一个决定出。
+///
+/// 抽出来的理由同 `history_rows_of`:它原来长在 `App` 的方法里,而 `App` 在
+/// 单测里造不出来。这一族(「纯函数测得扎实、接线没人看着」)在本仓库已经
+/// 出过好几次事,而这里要钉的三条里有一条是 **T3 红线**(已经有了就一个字节
+/// 都不许读 —— 每帧 `read_dir` 整个现场目录正是空闲期 CPU 那八个切片在治的
+/// 东西),它在画面上完全看不出来。
+fn history_sync(launcher: bool, have: bool) -> HistorySync {
+    if !launcher {
+        // 判据是「此刻是不是 launcher 态」,**不是**「谁关了标签」—— 后者是
+        // 列举式门控,关标签的路径不止一条(`Ctrl+W` / 标签 × / 退出确认 /
+        // `wind_down`),加一条就漏一条。
+        HistorySync::Drop
+    } else if have {
+        HistorySync::Keep
+    } else {
+        HistorySync::Reload
+    }
+}
+
 fn history_rows_of(
     entries: &[mullion_store::HistoryEntry],
     known: Option<&[SessionId]>,
@@ -2486,6 +2534,19 @@ pub struct App {
     /// 缓存下来、跟着心跳那一下才重读:每帧去 `read_dir` 整个目录是标准的
     /// T3 违规,而在场文件本来就 15 秒才写一次,读得再勤也不会更新。
     project_others: Vec<String>,
+    /// F288:启动页第三列那份现场行。`None` = 还没算过。
+    ///
+    /// **自清的缓存,不是影子状态**:由 [`Self::sync_launcher_history`] 在每帧
+    /// 开头按「此刻是不是 launcher 态」维护 —— 进 launcher 态时(且只在这时)
+    /// 读一次盘,离开 launcher 态立刻置 `None`。下次再进来是新读的。
+    ///
+    /// 为什么不做成「关标签时刷新」:那是列举式门控,关标签的路径不止一条
+    /// (`Ctrl+W` / 标签 ×  / 退出确认 / `wind_down`),加一条就漏一条 ——
+    /// 本项目已经在这个形状上栽过四次。按「是不是 launcher 态」判就没有
+    /// 名单可漏。
+    ///
+    /// 也不做成每帧读盘:那是 T3 红线(空闲期 CPU 为它花了八个切片)。
+    launcher_history: Option<Vec<crate::ui::history::HistoryRow>>,
     /// F111/F114:已启动的隧道。**必须挂在 `App` 上** —— `TunnelHandle` 一
     /// Drop 就停隧道,放进临时变量等于隧道刚起来就被停掉。
     tunnels: crate::tunnels::TunnelRuntime,
@@ -3157,6 +3218,7 @@ impl App {
             reconnecting: Vec::new(),
             project_hits: std::collections::BTreeSet::new(),
             project_others: Vec::new(),
+            launcher_history: None,
             tunnels: Default::default(),
             focus: shell::input_route::Focus::default(),
             // F56:默认 4 条并发。可配 UI 是 D2-c 的欠账,先按设计定的默认值走。
@@ -3241,15 +3303,39 @@ impl App {
             self.spawn_connect(cfg, false, None, false, None, true);
             return;
         }
-        // F148 D9:无参启动 → 有历史就先给恢复列表,没有就照旧弹会话管理器。
+        // F288 D1:**启动不再自动弹任何窗**。原来这里是个 `if/else` ——
+        // 有历史就弹恢复列表、没有就弹会话管理器。F288 把那两样都摊成了
+        // 启动页上的列(会话是第二列、现场是第三列),弹窗于是只剩下遮挡:
+        // 用户得先关掉一个窗才看得见刚做好的页面。两个常驻入口都还在
+        // (菜单「会话 → 恢复上次的现场 / 会话管理器」),功能一个没少。
+        //
+        // 这里顺手把第三列那份行**先算好**:`history` 是 `resumed` 已经读过
+        // 的那一份,不用再读一次盘。之后的维护交给 `sync_launcher_history`。
+        //
         // **必须在这里而不是 `resumed` 里**:「这条会话还在不在库里」要查
         // 会话库,而库到这一刻才刚打开。
-        let rows = self.history_rows(&history);
-        if rows.is_empty() {
-            // 首次运行 / 全被清空 —— 弹一个空列表等于让用户点一下才能开始干活。
-            self.ui.session_manager_open = true;
-        } else {
-            self.ui.history = Some(crate::ui::history::HistoryDraft::new(rows));
+        self.launcher_history = Some(self.history_rows(&history));
+    }
+
+    /// F288:维护启动页第三列那份现场行。**每帧开头调一次。**
+    ///
+    /// 语义是「进 launcher 态时读一次,离开就扔」:
+    /// - 不在 launcher 态 → 置 `None`(下次进来是新读的)
+    /// - 在 launcher 态且已有 → 什么都不做(**每帧读盘是 T3 红线**)
+    /// - 在 launcher 态但没有 → 现读一次盘
+    ///
+    /// 现读而不是复用启动时那份,理由同 `open_history_dialog`:这中间可能
+    /// 又有别的窗口关掉了,拿旧列表会让用户看不到刚关的那个现场。
+    fn sync_launcher_history(&mut self) {
+        match history_sync(self.tabs.is_empty(), self.launcher_history.is_some()) {
+            HistorySync::Drop => self.launcher_history = None,
+            HistorySync::Keep => {}
+            HistorySync::Reload => {
+                let entries = crate::shell::store::config_dir()
+                    .map(|d| mullion_store::list_records(&d, mullion_store::now_secs()))
+                    .unwrap_or_default();
+                self.launcher_history = Some(self.history_rows(&entries));
+            }
         }
     }
 
@@ -13302,6 +13388,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pump_transfers();
                 // F278:递归搜索每帧放行几个目录。
                 self.pump_find();
+                // F288:启动页第三列那份现场行。**只在进/出 launcher 态那一
+                // 帧真干活**,其余帧是一次 `is_empty()` + 一次 `is_some()`
+                // (读盘每帧跑一次就是 T3 红线)。
+                self.sync_launcher_history();
                 // F169:存一份 summary 给下面 gauge 段复用,同一帧里不用再问队列
                 // 第二遍——队列状态在这之后到 gauge 段之间不会再变。
                 let xs = self.transfer.queue.summary();
@@ -13795,6 +13885,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // F225①:一个标签都没有 = launcher 态,中央区
                                 // 画项目列表。判据与上面算灯的那一半同源。
                                 launcher: self.tabs.is_empty(),
+                                history: launcher_history_rows(&self.launcher_history),
                                 known_hosts: known_hosts_guard.as_deref(),
                                 tunnels,
                                 tunnel_states: &tunnel_states,
@@ -16889,17 +16980,17 @@ mod tests {
         decide_paste, dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
         drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
         files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
-        font_px_for, has_real_action, history_rows_of, host_for_fresh, ime_cursor_area,
-        ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
-        next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
-        paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience, reattach_pane,
-        rehost_pane, resolved_scrollback, session_manager_dirty, should_check_attach,
-        should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of, sync_plan_of,
-        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        font_px_for, has_real_action, history_rows_of, history_sync, host_for_fresh,
+        ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator,
+        next_auto_dial, next_panel_selection_index, opt_buf_dirty, pane_reports_of,
+        pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
+        reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
+        should_check_attach, should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of,
+        sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
         tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
-        AttachVerdict, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
-        DISMISS_ORDER,
+        AttachVerdict, HistorySync, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab,
+        SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS,
+        DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -23409,6 +23500,101 @@ mod tests {
         assert!(
             after.contains("layout_snapshot::clamp_to_monitors("),
             "启动时没夹紧窗口几何 —— 副屏拔掉后窗口会开在看不见的地方"
+        );
+    }
+
+    /// **接线守护 / F288 D1**:启动**不再自动弹任何窗**。
+    ///
+    /// F288 之前这里是个 `if/else`:有历史就弹恢复列表、没有就弹会话管理器。
+    /// 那两样现在都摊成了启动页上的列,弹窗于是只剩下遮挡 —— 用户得先关掉
+    /// 一个窗才看得见刚做好的页面。两个常驻入口都还在(菜单「会话」下)。
+    ///
+    /// 判据是**接线**而不是纯函数:`history_sync` 那条测的是「第三列的数据
+    /// 从哪来」,答不出「谁在启动时把窗打开了」——本仓库那一族
+    /// 「纯函数测得扎实、接线没人看着」的缺陷正长在这个缝里。
+    ///
+    /// 自证会变红:把那两句 `self.ui.session_manager_open = true;` /
+    /// `self.ui.history = Some(..)` 中任意一句加回 `finish_store_open`。
+    #[test]
+    fn startup_no_longer_pops_a_dialog_over_the_launcher() {
+        let body = body_of(prod_src(), "fn finish_store_open(");
+        assert!(
+            !body.contains("session_manager_open = true"),
+            "启动仍在自动弹会话管理器 —— 它挡着刚做好的启动页(D1)"
+        );
+        assert!(
+            !body.contains("ui.history = Some("),
+            "启动仍在自动弹恢复列表 —— 现场已经是启动页第三列了(D1)"
+        );
+        assert!(
+            body.contains("self.launcher_history = Some("),
+            "启动没把第三列那份行算好 —— 第一帧的启动页会少一列"
+        );
+    }
+
+    /// **接线守护 / F288**:`sync_launcher_history` 必须每帧真的被调到。
+    ///
+    /// 漏了的话 `launcher_history` 就永远停在启动时算的那一份:关掉标签回到
+    /// 启动页,第三列列的是开机那一刻的现场,刚关的那个不在里面。**画面上
+    /// 完全看不出来**(它照样是一列有内容的列表)。
+    ///
+    /// 自证会变红:把 `RedrawRequested` 那一支里的
+    /// `self.sync_launcher_history();` 删掉。
+    #[test]
+    fn every_frame_syncs_the_launcher_history() {
+        assert!(
+            prod_src().contains("self.sync_launcher_history();"),
+            "没人每帧调 sync_launcher_history —— 第三列会永远停在开机那一份"
+        );
+    }
+
+    /// **接线守护 / F288**:启动页第三列的数据必须真的接到 `launcher_history`
+    /// 上。
+    ///
+    /// 这是本切片最容易静默的一处:`UiFrame` 那个字面量有四十几个字段,
+    /// `history` 填成 `&[]` 编译照过、clippy 不报,`launcher::show` 那边
+    /// 十七条测试也全绿(它们直接喂 `Lists`,压根不经过 `UiFrame`)——
+    /// 用户看到的是「第三列永远说『没有可恢复的现场』」。
+    ///
+    /// 自证会变红:把那个字段改回 `history: &[]`。
+    #[test]
+    fn the_third_column_is_actually_wired_to_the_launcher_history() {
+        assert!(
+            prod_src().contains("history: launcher_history_rows(&self.launcher_history),"),
+            "UiFrame 的第三列没接上 launcher_history —— 启动页会恒显示「没有可恢复的现场」"
+        );
+    }
+
+    /// F288:启动页第三列那份现场行只在**进 launcher 态那一帧**读盘。
+    ///
+    /// 三条语义各一个组合,缺一条都有静默后果:
+    /// - 已经有了还读 → 每帧 `read_dir` 整个现场目录,**T3 红线**,画面上
+    ///   完全看不出来(空闲期 CPU 为这类事花过八个切片)。
+    /// - 离开 launcher 态不扔 → 下次回到启动页,第三列列的是上次那一份,
+    ///   刚关掉的那个现场不在里面。
+    ///
+    /// 自证会变红:把 `history_sync` 的函数体改成恒返回 `Reload`。
+    #[test]
+    fn the_launcher_history_is_read_once_on_the_way_in_and_dropped_on_the_way_out() {
+        assert_eq!(
+            history_sync(true, false),
+            HistorySync::Reload,
+            "刚进 launcher 态、手上还没有 —— 该读一次"
+        );
+        assert_eq!(
+            history_sync(true, true),
+            HistorySync::Keep,
+            "已经有了还去读盘就是每帧 IO(T3 红线)"
+        );
+        assert_eq!(
+            history_sync(false, true),
+            HistorySync::Drop,
+            "离开 launcher 态没扔,下次回来列的是陈旧的那一份"
+        );
+        assert_eq!(
+            history_sync(false, false),
+            HistorySync::Drop,
+            "不在 launcher 态时一律不该去读盘"
         );
     }
 

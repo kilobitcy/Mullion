@@ -591,6 +591,13 @@ pub struct UiFrame<'a> {
     /// [`crate::project::Lamp::Unknown`] 显示 —— 不是「灭」,见那个枚举。
     pub project_lamps:
         &'a std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
+    /// F288:启动页第三列要列的现场记录。**由 `app.rs` 读盘算好传进来**
+    /// (`ui/` 这一层零 IO),非 launcher 态传 `&[]`。
+    ///
+    /// 与恢复弹窗的 `ui_state.history` 是两份东西:那个是「弹窗开着、正在
+    /// 选哪一条」的草稿,这个是「启动页上常驻的那一列」。合成一份的话,
+    /// 关掉弹窗就等于把第三列一起清空了。
+    pub history: &'a [history::HistoryRow],
     /// F225①:中央区画不画项目列表 —— 一个标签都没有(launcher 态)时为真。
     /// 与 [`Self::restored`] 和文件面板**互斥**:那两个各自也是 `CentralPanel`,
     /// 而 launcher 态压根不存在标签,谈不上占位标签或文件标签。
@@ -1192,17 +1199,24 @@ pub fn build_ui(
     if let Some(v) = frame.restored {
         actions.reconnect_tab = restored::show(ctx, t, v);
     }
-    // F225①:launcher 态的项目列表。同样是 `CentralPanel`,与上面两支互斥
-    // ——「一个标签都没有」和「当前标签是占位/文件标签」不可能同时成立。
+    // F225①/F288:launcher 态的三列(项目 / 会话 / 历史现场)。同样是
+    // `CentralPanel`,与上面两支互斥 ——「一个标签都没有」和「当前标签是
+    // 占位/文件标签」不可能同时成立。
     if frame.launcher {
         launcher::show(
             ctx,
             t,
             ui_state,
-            frame.projects,
-            frame.project_lamps,
-            frame.sessions,
-            frame.appearance,
+            &launcher::Lists {
+                projects: frame.projects,
+                lamps: frame.project_lamps,
+                sessions: frame.sessions,
+                groups: frame.groups,
+                credentials: frame.credentials,
+                history: frame.history,
+                appearance: frame.appearance,
+            },
+            &mut actions,
         );
     } else {
         // F258:同上。离开启动页(第一个标签立起来)就扔掉。
@@ -1519,6 +1533,7 @@ mod tests {
                 EMPTY.get_or_init(Default::default)
             },
             launcher: false,
+            history: &[],
             known_hosts: None,
             tunnels: &[],
             tunnel_states: &[],

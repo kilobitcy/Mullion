@@ -165,6 +165,91 @@ pub fn head_text(when: &str, tabs: usize, panes: usize) -> String {
 /// 同一个常量算 egui area id,否则标题漂移后「点外面关」会静默失效。
 pub(crate) const WINDOW_TITLE: &str = "恢复上次的现场";
 
+/// `row` 的 `list` 实参:恢复弹窗这一份。
+pub const DIALOG_LIST: &str = "dialog";
+/// `row` 的 `list` 实参:F288 启动页第三列那一份。
+pub const LAUNCHER_LIST: &str = "launcher";
+
+/// 一行的 egui id。`list` 区分调用方([`DIALOG_LIST`] / [`LAUNCHER_LIST`])。
+///
+/// **必须区分**:F288 之后同一条记录会同时出现在恢复弹窗和启动页第三列里,
+/// 两处算出同一个 id 的话交互互相打架(同 `project_row::row_id` 的理由)。
+pub fn row_id(list: &str, instance_id: &str) -> egui::Id {
+    egui::Id::new(("mullion_history_row", list, instance_id))
+}
+
+/// 手绘一行现场记录,返回整行的点击判定。
+///
+/// **两处共用**:F148 的恢复弹窗和 F288 启动页的第三列。各写一份的话,
+/// 同一条记录在两个地方的行高、标注颜色、命中区域都会各自漂移 ——
+/// `project_row` 那边为完全相同的理由抽过一次。
+///
+/// 整行可点:只让文字可点的话,行末的空白点不中,而用户会去点行的任何
+/// 地方(J 片「标签宿主一行都点不中」的同一个教训)。
+pub fn row(
+    ui: &mut egui::Ui,
+    t: &Theme,
+    list: &str,
+    r: &HistoryRow,
+    selected: bool,
+) -> egui::Response {
+    // 占位只占位(`hover`),点击判定交给下面挂了显式 id 的 `interact` ——
+    // `allocate_exact_size` 自动生成的 id 跟控件在父容器里的位置绑定,
+    // 换一个调用方就变了,两处共用时测试拿不住它。
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height(!r.note.is_empty())),
+        egui::Sense::hover(),
+    );
+    let resp = ui.interact(rect, row_id(list, &r.id), egui::Sense::click());
+    // 选中 / 悬停的底色与会话列表同源:那边是
+    // `session_manager::list::row_bg(selected, hovered, None, t)`
+    // 的两条常量臂。**照抄取值而不是调那个函数** ——
+    // 它是 `pub(crate)` 且第三个参数是节点色(本列表没有
+    // 节点概念),为两个常量拉一条跨模块依赖不划算。
+    // 色板已冻结,**不许**往 `Theme` 里加新字段。
+    if selected {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(4.0), theme::c32(t.sunken_bg));
+    } else if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(4.0), theme::c32(t.panel_head));
+    }
+    let mut p = rect.min + egui::vec2(SP_S, SP_XS);
+    ui.painter().text(
+        p,
+        egui::Align2::LEFT_TOP,
+        &r.head,
+        egui::FontId::proportional(14.0),
+        theme::c32(t.fg_strong),
+    );
+    p.y += 20.0;
+    ui.painter().text(
+        p,
+        egui::Align2::LEFT_TOP,
+        &r.summary,
+        egui::FontId::proportional(12.0),
+        theme::c32(t.fg_muted),
+    );
+    // F256:第三行的标注。**用 `warn` 而不是 `fg_muted`** ——
+    // 跟摘要同色的话它读起来像摘要的续行,而这句话说的是
+    // 「点下去会发生什么不一样的事」(克隆一份 vs 接管槽位)。
+    // 色板已冻结,`warn` 是既有字段,不新增。
+    //
+    // 文案里除了 `·` 没有非 ASCII 符号 —— `·` 已在
+    // `ui::glyphs::VERIFIED` 里(摘要那一行本来就用它分隔)。
+    if !r.note.is_empty() {
+        p.y += 18.0;
+        ui.painter().text(
+            p,
+            egui::Align2::LEFT_TOP,
+            &r.note,
+            egui::FontId::proportional(12.0),
+            theme::c32(t.warn),
+        );
+    }
+    resp
+}
+
 /// 画弹窗。返回 `Some` = 这一帧有结论(由 `app.rs` 负责把 `draft` 置 `None`)。
 ///
 /// `draft` 为 `None` = 弹窗关着,什么都不画。
@@ -200,66 +285,7 @@ pub fn show(
                 .show(ui, |ui| {
                     for i in 0..d.rows.len() {
                         let selected = i == d.selected;
-                        let row = &d.rows[i];
-                        // 整行可点:只让文字可点的话,行末的空白点不中,而用户
-                        // 会去点行的任何地方(J 片「标签宿主一行都点不中」的
-                        // 同一个教训)。
-                        let resp = ui.allocate_response(
-                            egui::vec2(ui.available_width(), row_height(!row.note.is_empty())),
-                            egui::Sense::click(),
-                        );
-                        // 选中 / 悬停的底色与会话列表同源:那边是
-                        // `session_manager::list::row_bg(selected, hovered, None, t)`
-                        // 的两条常量臂。**照抄取值而不是调那个函数** ——
-                        // 它是 `pub(crate)` 且第三个参数是节点色(本列表没有
-                        // 节点概念),为两个常量拉一条跨模块依赖不划算。
-                        // 色板已冻结,**不许**往 `Theme` 里加新字段。
-                        if selected {
-                            ui.painter().rect_filled(
-                                resp.rect,
-                                egui::Rounding::same(4.0),
-                                theme::c32(t.sunken_bg),
-                            );
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(
-                                resp.rect,
-                                egui::Rounding::same(4.0),
-                                theme::c32(t.panel_head),
-                            );
-                        }
-                        let mut p = resp.rect.min + egui::vec2(SP_S, SP_XS);
-                        ui.painter().text(
-                            p,
-                            egui::Align2::LEFT_TOP,
-                            &row.head,
-                            egui::FontId::proportional(14.0),
-                            theme::c32(t.fg_strong),
-                        );
-                        p.y += 20.0;
-                        ui.painter().text(
-                            p,
-                            egui::Align2::LEFT_TOP,
-                            &row.summary,
-                            egui::FontId::proportional(12.0),
-                            theme::c32(t.fg_muted),
-                        );
-                        // F256:第三行的标注。**用 `warn` 而不是 `fg_muted`** ——
-                        // 跟摘要同色的话它读起来像摘要的续行,而这句话说的是
-                        // 「点下去会发生什么不一样的事」(克隆一份 vs 接管槽位)。
-                        // 色板已冻结,`warn` 是既有字段,不新增。
-                        //
-                        // 文案里除了 `·` 没有非 ASCII 符号 —— `·` 已在
-                        // `ui::glyphs::VERIFIED` 里(摘要那一行本来就用它分隔)。
-                        if !row.note.is_empty() {
-                            p.y += 18.0;
-                            ui.painter().text(
-                                p,
-                                egui::Align2::LEFT_TOP,
-                                &row.note,
-                                egui::FontId::proportional(12.0),
-                                theme::c32(t.warn),
-                            );
-                        }
+                        let resp = row(ui, t, DIALOG_LIST, &d.rows[i], selected);
                         // F153-b:**单击即恢复**。原来是「单击选中 + 双击恢复」,
                         // 用户报的是「点了没反应」—— 双击在高延迟远程桌面/触控板
                         // 上本来就不好按,而这个弹窗只有一件事可做。
@@ -270,7 +296,7 @@ pub fn show(
                         // 置过 `clicked()`,那条是死代码。
                         if resp.clicked() {
                             d.selected = i;
-                            out = Some(HistoryOut::Restore(row.id.clone()));
+                            out = Some(HistoryOut::Restore(d.rows[i].id.clone()));
                         }
                     }
                 });
@@ -305,6 +331,27 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F288:同一条现场记录会**同时**出现在恢复弹窗和启动页第三列里
+    /// (弹窗在 launcher 态照样能开,菜单里有常驻入口)。两处算出同一个
+    /// egui id 的话就是一帧里两个部件抢同一个 id —— egui 的处置是后一个
+    /// 覆盖前一个,症状是弹窗那行点了没反应,而**日志里只有一条 id clash
+    /// 警告,界面上什么都看不出来**。
+    ///
+    /// 自证会变红:把 `row_id` 里的元组去掉 `list` 那一项。
+    #[test]
+    fn the_same_record_gets_different_ids_in_the_dialog_and_on_the_launcher() {
+        assert_ne!(
+            row_id(DIALOG_LIST, "inst-a"),
+            row_id(LAUNCHER_LIST, "inst-a"),
+            "两处用了同一个 id,同一帧里会互相盖掉"
+        );
+        assert_ne!(
+            row_id(DIALOG_LIST, "inst-a"),
+            row_id(DIALOG_LIST, "inst-b"),
+            "同一列里两条记录也必须分得开"
+        );
+    }
 
     #[test]
     fn a_fresh_record_says_just_now() {
