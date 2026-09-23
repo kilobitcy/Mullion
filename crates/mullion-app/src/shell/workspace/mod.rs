@@ -233,6 +233,32 @@ pub struct PaneState {
     pub notice: Option<String>,
 }
 
+/// F290:抽屉的高度比例 —— 父 pane 占 4/5,抽屉占 1/5。开的时候用一次;
+/// 之后用户拖分隔条改掉的比例**不追回**(重排挂回去时重置为这个值)。
+pub const DRAWER_RATIO: f32 = 0.8;
+
+/// F290:「这块叶子是谁的抽屉」。抽屉在布局树里就是普通叶子,`Workspace`
+/// 只多记这一张表;凡是按「树形状」做事的路径(F241 关后重排、预设重建、
+/// F37 存盘)都要把它摘出去算,理由见各处注释。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drawer {
+    pub id: PaneId,
+    pub parent: PaneId,
+    /// 开抽屉那一帧快照下来的目标目录(`cd` 的参数)。`None` = 没定位到,
+    /// 不发 `cd`。**快照**而不是每次现读父 pane —— 父 pane 里 Claude Code
+    /// `cd` 来 `cd` 去时抽屉不该被动跳目录。
+    pub cwd: Option<Vec<u8>>,
+}
+
+/// F290:热键按下去该做什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawerToggle {
+    /// 焦点 pane 没有抽屉 → 给它开一个。
+    Open,
+    /// 焦点在抽屉上、或焦点 pane 已有抽屉 → 关掉这个抽屉。
+    Close(PaneId),
+}
+
 /// 多 pane 工作区:布局树 + 每 pane 状态 + 主机连接池。
 pub struct Workspace {
     tree: Node,
@@ -251,6 +277,9 @@ pub struct Workspace {
     generation: u64,
     /// F128:判据见 `default_link_alive`。测试里可替换。
     pub link_alive: fn(&[HostConn], usize) -> bool,
+    /// F290:抽屉标记表。抽屉本身是 `panes`/`tree` 里的普通成员,这张表只多记
+    /// 「谁是抽屉、挂在谁底下」。
+    drawers: Vec<Drawer>,
 }
 
 impl Workspace {
@@ -270,6 +299,7 @@ impl Workspace {
             title_bars: true,
             generation,
             link_alive: default_link_alive,
+            drawers: Vec::new(),
         }
     }
 
@@ -338,9 +368,16 @@ impl Workspace {
     /// id 发起 `open_pty`,完成后调 [`Workspace::attach_pane`]。这段空窗期里
     /// 渲染层照常按几何画一块空 pane + "连接中"标题 —— 布局不会先塌一下再撑开。
     pub fn apply_preset(&mut self, preset: Preset) -> Vec<PaneId> {
-        let plan = plan_preset(preset, &self.statuses());
+        // F290:预设的 keep/spawn/close 计数只看用户自己的格子,抽屉不算数
+        // (单屏 + 抽屉点「两栏」该新开 1 块,不是把抽屉当现成的第二块)。
+        let plan = plan_preset(preset, &self.statuses_without_drawers());
         for id in &plan.close {
-            self.panes.retain(|p| p.id != *id);
+            // 父 pane 被这次预设关掉了,它的抽屉跟着一起走。
+            if let Some(d) = self.drawer_of(*id) {
+                self.drawers.retain(|x| x.id != d);
+                self.drop_pane_state(d);
+            }
+            self.drop_pane_state(*id);
         }
         let mut ids = plan.keep;
         let mut fresh = Vec::new();
@@ -350,6 +387,8 @@ impl Workspace {
             fresh.push(id);
         }
         self.tree = preset_tree(preset, &ids);
+        // F290:重建完把幸存的抽屉挂回各自父 pane 底下。
+        self.reattach_drawers();
         self.focus = next_focus(self.focus, &ids);
         // F286:新开了格子就把焦点交给**前序第一块新格子**。点布局按钮是用户
         // 亲手指定的动作,与 F156-b 里 `RehostKind::UserPicked` 同类 —— 那条
@@ -442,19 +481,160 @@ impl Workspace {
     /// (`preset_tree_fills_leaves_in_geometric_order` 钉着),所以重排前后
     /// `leaves` 一致,下面那句 `next_focus` 放在重排之后或之前都一样。
     pub fn close_pane(&mut self, id: PaneId) -> bool {
+        // F290:关的是抽屉 → 走抽屉自己那条(不重排,见 `close_drawer` 的文档)。
+        if self.is_drawer(id) {
+            return self.close_drawer(id);
+        }
+        // F290:父 pane 走了,抽屉是附属物,跟着一起走 —— 先关它,树上少一层,
+        // 下面的兄弟顶替才顶得对。
+        if let Some(d) = self.drawer_of(id) {
+            self.close_drawer(d);
+        }
         if !close_pane(&mut self.tree, id) {
             return false;
         }
+        self.drop_pane_state(id);
+        // F241 重排的计数**不含抽屉**;`ids` 只给幸存的普通 pane,重排完
+        // 再把抽屉挂回去(`reattach_drawers`)。
+        let mut ids = leaves(&self.tree);
+        ids.retain(|id| !self.is_drawer(*id));
+        if let Some(preset) = preset::layout_after_close(ids.len()) {
+            self.tree = preset_tree(preset, &ids);
+            self.reattach_drawers();
+        }
+        self.focus = next_focus(self.focus, &leaves(&self.tree));
+        true
+    }
+
+    // ---- F290 命令抽屉 ----
+
+    pub fn drawers(&self) -> &[Drawer] {
+        &self.drawers
+    }
+    pub fn drawer(&self, id: PaneId) -> Option<&Drawer> {
+        self.drawers.iter().find(|d| d.id == id)
+    }
+    pub fn is_drawer(&self, id: PaneId) -> bool {
+        self.drawer(id).is_some()
+    }
+    /// `parent` 底下挂着的抽屉。
+    pub fn drawer_of(&self, parent: PaneId) -> Option<PaneId> {
+        self.drawers
+            .iter()
+            .find(|d| d.parent == parent)
+            .map(|d| d.id)
+    }
+
+    /// 热键的判定。纯查询,不改任何状态。
+    pub fn drawer_toggle(&self) -> DrawerToggle {
+        let f = self.focus;
+        if self.is_drawer(f) {
+            return DrawerToggle::Close(f);
+        }
+        match self.drawer_of(f) {
+            Some(d) => DrawerToggle::Close(d),
+            None => DrawerToggle::Open,
+        }
+    }
+
+    /// 给焦点 pane 开抽屉:上下分屏、抽屉在下占 1/5、焦点当场给抽屉
+    /// (开了就是要敲命令)。返回抽屉的 id(还没有 `PaneState`,同
+    /// `apply_preset` 的空窗期约定)。
+    ///
+    /// `None` = 焦点本身是抽屉,或焦点 pane 已经有抽屉(一块 pane 至多一个)。
+    pub fn open_drawer(&mut self, cwd: Option<Vec<u8>>) -> Option<PaneId> {
+        let parent = self.focus;
+        if self.is_drawer(parent) || self.drawer_of(parent).is_some() {
+            return None;
+        }
+        let id = self.alloc_id();
+        if !split_pane(&mut self.tree, parent, id, Dir::Vertical, DRAWER_RATIO) {
+            self.next_id -= 1;
+            return None;
+        }
+        self.drawers.push(Drawer { id, parent, cwd });
+        // 开了就是要敲命令 —— 与 F286「用户亲手开的格子焦点跟过去」同一条规矩。
+        self.focus = id;
+        Some(id)
+    }
+
+    /// 关抽屉:兄弟顶替、channel 显式关(F140)、标记清除、焦点回父 pane。
+    ///
+    /// **刻意不走 F241 重排**:抽屉不是用户布局的一部分,关它不该动别的格子。
+    pub fn close_drawer(&mut self, id: PaneId) -> bool {
+        let Some(pos) = self.drawers.iter().position(|d| d.id == id) else {
+            return false;
+        };
+        if !close_pane(&mut self.tree, id) {
+            return false;
+        }
+        let parent = self.drawers.remove(pos).parent;
+        self.drop_pane_state(id);
+        let alive = leaves(&self.tree);
+        if !alive.contains(&self.focus) {
+            self.focus = if alive.contains(&parent) {
+                parent
+            } else {
+                next_focus(self.focus, &alive)
+            };
+        }
+        true
+    }
+
+    /// 丢一块 pane 的 `PaneState`,并显式关它的 channel(F140)。
+    fn drop_pane_state(&mut self, id: PaneId) {
         if let Some(p) = self.panes.iter().find(|p| p.id == id) {
             p.pty.close();
         }
         self.panes.retain(|p| p.id != id);
-        let ids = leaves(&self.tree);
-        if let Some(preset) = preset::layout_after_close(ids.len()) {
-            self.tree = preset_tree(preset, &ids);
+    }
+
+    /// 重排之后把抽屉挂回各自父 pane 底下;父 pane 已经不在树上的抽屉
+    /// (它自己也被这次重排/预设关掉了)一并关掉。
+    fn reattach_drawers(&mut self) {
+        let alive = leaves(&self.tree);
+        let drawers = self.drawers.clone();
+        for d in drawers {
+            if alive.contains(&d.id) {
+                continue;
+            }
+            if alive.contains(&d.parent)
+                && split_pane(&mut self.tree, d.parent, d.id, Dir::Vertical, DRAWER_RATIO)
+            {
+                continue;
+            }
+            self.drawers.retain(|x| x.id != d.id);
+            self.drop_pane_state(d.id);
         }
-        self.focus = next_focus(self.focus, &leaves(&self.tree));
-        true
+    }
+
+    /// `statuses()` 去掉抽屉:预设与 F241 的计数只看用户自己的格子。
+    fn statuses_without_drawers(&self) -> Vec<(PaneId, PaneStatus)> {
+        self.statuses()
+            .into_iter()
+            .filter(|(id, _)| !self.is_drawer(*id))
+            .collect()
+    }
+
+    /// F37:存盘用的树 —— 抽屉全部剪掉,焦点若在抽屉上则落回父 pane。
+    /// 返回 `(树, 焦点)`;不改自身。
+    ///
+    /// `alive[0]` 不会越界:树上至少有一块非抽屉的普通叶子(抽屉本身必然
+    /// 挂在某个父 pane 底下,剪掉抽屉之后父 pane 还在),`leaves` 不可能为空。
+    pub fn tree_without_drawers(&self) -> (Node, PaneId) {
+        let mut tree = self.tree.clone();
+        let mut focus = self.focus;
+        for d in &self.drawers {
+            close_pane(&mut tree, d.id);
+            if focus == d.id {
+                focus = d.parent;
+            }
+        }
+        let alive = leaves(&tree);
+        if !alive.contains(&focus) {
+            focus = alive[0];
+        }
+        (tree, focus)
     }
 
     /// F140:关掉**所有** pane 的 channel。关标签时用(见 `app.rs::wind_down`)
@@ -643,6 +823,16 @@ impl Workspace {
         let target = self.focus;
         split_pane(&mut self.tree, target, PaneId(new_id), Dir::Horizontal, 0.5);
         self.next_id = self.next_id.max(new_id + 1);
+    }
+
+    /// 测试脚手架:整棵树手搭成任意形状(F290 抽屉测试要摆出「非预设」的
+    /// 竖排三块之类的既有布局)。
+    #[cfg(test)]
+    pub(crate) fn set_tree_for_test(&mut self, tree: Node) {
+        self.next_id = self
+            .next_id
+            .max(leaves(&tree).iter().map(|id| id.0 + 1).max().unwrap_or(0));
+        self.tree = tree;
     }
 }
 
@@ -1657,6 +1847,234 @@ mod tests {
             ws.pane(PaneId(1)).unwrap().status,
             PaneStatus::Disconnected,
             "已经断开的 pane 被拉回重连中 —— 用户退不出登录"
+        );
+    }
+
+    // ---- F290 命令抽屉 ----
+
+    /// F290:开抽屉 = 对焦点 pane 做一次上下分屏,抽屉在下、占 1/5,焦点当场
+    /// 给抽屉(开了就是要敲命令)。
+    ///
+    /// 自证会变红:把 `open_drawer` 里的 `Dir::Vertical` 改成 `Horizontal`,
+    /// 或 `DRAWER_RATIO` 改成 0.5,或删掉最后那句 `self.focus = id`。
+    #[test]
+    fn opening_a_drawer_splits_the_focused_pane_vertically_at_one_fifth() {
+        let (mut ws, _) = ws_with(1);
+        let id = ws
+            .open_drawer(Some(b"/srv/app".to_vec()))
+            .expect("单屏上必能开");
+        assert_eq!(ws.focus(), id, "焦点要当场给抽屉");
+        assert_eq!(ws.drawer_of(PaneId(1)), Some(id));
+        assert!(ws.is_drawer(id));
+        assert_eq!(
+            ws.drawer(id).and_then(|d| d.cwd.clone()),
+            Some(b"/srv/app".to_vec())
+        );
+        match ws.tree() {
+            Node::Split { dir, ratio, a, b } => {
+                assert_eq!(*dir, Dir::Vertical, "抽屉在父 pane **底下**");
+                assert!((ratio - DRAWER_RATIO).abs() < 1e-6, "父占 4/5");
+                assert_eq!(**a, Node::Leaf(PaneId(1)));
+                assert_eq!(**b, Node::Leaf(id));
+            }
+            other => panic!("开完不是一个 Split:{other:?}"),
+        }
+    }
+
+    /// 一块 pane 至多一个抽屉;抽屉自己不能再开抽屉。两种情形都返回 `None`
+    /// 且树不动。
+    ///
+    /// 自证会变红:删掉 `open_drawer` 开头那两句拒绝判据。
+    #[test]
+    fn a_pane_gets_at_most_one_drawer_and_a_drawer_cannot_nest() {
+        let (mut ws, _) = ws_with(1);
+        let d = ws.open_drawer(None).unwrap();
+        let before = ws.tree().clone();
+        assert!(
+            ws.open_drawer(None).is_none(),
+            "焦点在抽屉上再按 = 关,不是再开"
+        );
+        ws.set_focus(PaneId(1));
+        assert!(ws.open_drawer(None).is_none(), "父 pane 已经有抽屉了");
+        assert_eq!(*ws.tree(), before);
+        assert_eq!(ws.drawer_of(PaneId(1)), Some(d));
+    }
+
+    /// 关抽屉:树上兄弟顶替、channel 显式关掉(F140)、标记清除、焦点回父 pane。
+    /// **不走 F241 重排** —— 三块竖排 pane 关掉其中一块的抽屉,三块还是竖排。
+    ///
+    /// 自证会变红:把 `close_drawer` 改成直接调 `close_pane`(重排会把下面
+    /// 那棵手搭的竖排树拍成 `ThreeColumns`);或删掉 `p.pty.close()`。
+    #[test]
+    fn closing_a_drawer_restores_the_parent_and_never_rearranges_the_rest() {
+        let (mut ws, probes) = ws_with(1);
+        let (p2, _) = fake_pane(2);
+        let (p3, _) = fake_pane(3);
+        ws.attach_pane(p2);
+        ws.attach_pane(p3);
+        // 手搭一棵竖排三块:1 在上,2 中,3 下。
+        ws.set_tree_for_test(Node::Split {
+            dir: Dir::Vertical,
+            ratio: 0.33,
+            a: Box::new(Node::Leaf(PaneId(1))),
+            b: Box::new(Node::Split {
+                dir: Dir::Vertical,
+                ratio: 0.5,
+                a: Box::new(Node::Leaf(PaneId(2))),
+                b: Box::new(Node::Leaf(PaneId(3))),
+            }),
+        });
+        ws.set_focus(PaneId(2));
+        let before = ws.tree().clone();
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, dprobe) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        assert!(ws.close_drawer(d));
+        assert_eq!(*ws.tree(), before, "关抽屉之后树必须**原样**回到开之前");
+        assert_eq!(ws.focus(), PaneId(2), "焦点回父 pane");
+        assert!(ws.drawer_of(PaneId(2)).is_none());
+        assert!(ws.pane(d).is_none());
+        assert_eq!(
+            *dprobe.closes.lock().unwrap(),
+            1,
+            "抽屉的 channel 要显式关(F140)"
+        );
+        assert_eq!(
+            *probes[0].closes.lock().unwrap(),
+            0,
+            "别人的 channel 不许动"
+        );
+    }
+
+    /// `close_pane` 收到抽屉的 id(用户点了抽屉标题条上的 ×)→ 转 `close_drawer`,
+    /// 同样不重排。
+    ///
+    /// 自证会变红:删掉 `close_pane` 开头 `if self.is_drawer(id)` 那一句。
+    #[test]
+    fn closing_a_drawer_through_the_generic_path_takes_the_drawer_route() {
+        let (mut ws, _) = ws_with(2); // 1 | 2 左右
+        ws.set_focus(PaneId(2));
+        let before = ws.tree().clone();
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, _) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        assert!(ws.close_pane(d));
+        assert_eq!(*ws.tree(), before);
+        assert!(ws.drawer_of(PaneId(2)).is_none());
+    }
+
+    /// 父 pane 被关 → 抽屉一起关(它是附属物)。之后 F241 重排照旧,但重排的
+    /// 计数**不含抽屉**。
+    ///
+    /// 自证会变红:删掉 `close_pane` 里级联关抽屉那一段 —— 抽屉会被兄弟顶替
+    /// 成一块孤儿 pane,`pane_count` 是 2 不是 1。
+    #[test]
+    fn closing_the_parent_takes_its_drawer_with_it() {
+        let (mut ws, _) = ws_with(2);
+        ws.set_focus(PaneId(2));
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, dprobe) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        assert!(ws.close_pane(PaneId(2)));
+        assert_eq!(ws.pane_count(), 1);
+        assert_eq!(*ws.tree(), Node::Leaf(PaneId(1)));
+        assert!(ws.pane(d).is_none(), "抽屉的 PaneState 也要丢");
+        assert_eq!(*dprobe.closes.lock().unwrap(), 1);
+        assert!(ws.drawers().is_empty());
+    }
+
+    /// 关掉**别的** pane 触发 F241 重排时,抽屉先摘出去、重排完再挂回父 pane
+    /// 底下。三块横排 + 1 号有抽屉,关掉 3 号 → 两块横排,抽屉仍在 1 号底下。
+    ///
+    /// 自证会变红:把 `close_pane` 里 `ids.retain(|id| !self.is_drawer(*id))`
+    /// 删掉(抽屉会被当成第三块 pane 排成 `ThreeColumns`);或删掉重排后那句
+    /// `self.reattach_drawers()`(抽屉从树上消失、`PaneState` 却还在)。
+    #[test]
+    fn rearranging_after_a_close_keeps_the_drawer_under_its_parent() {
+        let (mut ws, _) = ws_with(3);
+        ws.set_focus(PaneId(1));
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, _) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        assert!(ws.close_pane(PaneId(3)));
+        let expect = Node::Split {
+            dir: Dir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(Node::Split {
+                dir: Dir::Vertical,
+                ratio: DRAWER_RATIO,
+                a: Box::new(Node::Leaf(PaneId(1))),
+                b: Box::new(Node::Leaf(d)),
+            }),
+            b: Box::new(Node::Leaf(PaneId(2))),
+        };
+        assert_eq!(*ws.tree(), expect);
+        assert_eq!(ws.drawer_of(PaneId(1)), Some(d));
+    }
+
+    /// 点预设按钮(`apply_preset`)同理:抽屉不参与 keep/close/spawn 的计数,
+    /// 重建完挂回去。单屏 + 抽屉 → 点「两栏」:新开 **1** 块(不是 0 块,
+    /// 也不是把抽屉当第二块),抽屉仍在 1 号底下。
+    ///
+    /// 自证会变红:把 `apply_preset` 里的 `statuses_without_drawers()` 换回
+    /// `statuses()`(`fresh` 变成空);或删掉末尾 `reattach_drawers()`。
+    #[test]
+    fn presets_count_panes_without_the_drawers_and_reattach_them_afterwards() {
+        let (mut ws, _) = ws_with(1);
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, _) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        let fresh = ws.apply_preset(Preset::TwoLeftRight);
+        assert_eq!(fresh.len(), 1, "抽屉不算一块 pane");
+        let new = fresh[0];
+        let expect = Node::Split {
+            dir: Dir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(Node::Split {
+                dir: Dir::Vertical,
+                ratio: DRAWER_RATIO,
+                a: Box::new(Node::Leaf(PaneId(1))),
+                b: Box::new(Node::Leaf(d)),
+            }),
+            b: Box::new(Node::Leaf(new)),
+        };
+        assert_eq!(*ws.tree(), expect);
+        assert_eq!(ws.focus(), new, "F286:新格子拿焦点,与没有抽屉时一致");
+    }
+
+    /// 预设把抽屉的父 pane 关掉了(三块 → 单屏,3 号有抽屉)→ 抽屉随父一起关。
+    ///
+    /// 自证会变红:删掉 `apply_preset` 里对 `plan.close` 级联关抽屉那一段。
+    #[test]
+    fn a_preset_that_closes_the_parent_closes_its_drawer_too() {
+        let (mut ws, _) = ws_with(3);
+        ws.set_focus(PaneId(3));
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, dprobe) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        let fresh = ws.apply_preset(Preset::Single);
+        assert!(fresh.is_empty());
+        assert_eq!(*ws.tree(), Node::Leaf(PaneId(1)));
+        assert!(ws.pane(d).is_none());
+        assert!(ws.drawers().is_empty());
+        assert_eq!(*dprobe.closes.lock().unwrap(), 1);
+    }
+
+    /// `drawer_toggle`:热键按下去做什么,三种情形。
+    ///
+    /// 自证会变红:把 `drawer_toggle` 里 `is_drawer(focus)` 那一臂删掉
+    /// (焦点在抽屉上会判成 `Open`)。
+    #[test]
+    fn the_toggle_decides_open_or_close_from_where_the_focus_sits() {
+        let (mut ws, _) = ws_with(1);
+        assert_eq!(ws.drawer_toggle(), DrawerToggle::Open);
+        let d = ws.open_drawer(None).unwrap();
+        assert_eq!(ws.drawer_toggle(), DrawerToggle::Close(d), "焦点在抽屉上");
+        ws.set_focus(PaneId(1));
+        assert_eq!(
+            ws.drawer_toggle(),
+            DrawerToggle::Close(d),
+            "焦点在有抽屉的父 pane 上"
         );
     }
 }
