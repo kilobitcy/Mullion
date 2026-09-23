@@ -338,9 +338,23 @@ impl Workspace {
         let f = self.focus;
         self.pane_mut(f)
     }
-    /// 树上的叶子数。状态栏的"N 屏"用这个,不是 `panes.len()` ——
-    /// 正在连接中的 pane 已经占了叶子位但还没有 `PaneState`。
+    /// 用户布局的屏数。状态栏的"N 屏"、F129 判「是不是最后一块」都用这个,
+    /// 不是 `panes.len()` —— 正在连接中的 pane 已经占了叶子位但还没有
+    /// `PaneState`。F290:抽屉不是用户布局的一部分(它是附属的命令行,
+    /// F241 重排/`apply_preset` 早就用 `statuses_without_drawers()` 把它
+    /// 排除在外了),这里跟着排除,否则「一块 pane + 一个抽屉」会被状态栏
+    /// 报成 2 屏,也会让 Ctrl+D 误判成「不是最后一块」而去关分屏。
     pub fn pane_count(&self) -> usize {
+        leaves(&self.tree)
+            .into_iter()
+            .filter(|id| !self.is_drawer(*id))
+            .count()
+    }
+
+    /// 树上的原始叶子数,**含抽屉**。只给诊断规模(`diag::set_scale`)用 ——
+    /// 抽屉是真实渲染、真实占 GPU/内存的 pane,诊断要看的是「屏上真有几块」,
+    /// 不是「用户布局几块」。
+    pub fn leaf_count(&self) -> usize {
         leaves(&self.tree).len()
     }
 
@@ -480,6 +494,15 @@ impl Workspace {
         // F290:关的是抽屉 → 走抽屉自己那条(不重排,见 `close_drawer` 的文档)。
         if self.is_drawer(id) {
             return self.close_drawer(id);
+        }
+        // F290:最后一块真 pane 拒关,且抽屉要留着。判定必须放在下面的级联
+        // **之前** —— core 的 `close_pane` 会拒绝移除树上最后一片叶子,但
+        // 级联会先把抽屉杀掉,等轮到 core 判定时树上已经只剩父 pane 这一片
+        // 叶子,`is_last` 的真值从「关这块前」偷偷挪到了「关完抽屉后」,于是
+        // 抽屉被静默清掉、父 pane 却没关成,`close_pane` 还照样返回 `false`
+        // 骗调用方「什么都没发生」。
+        if self.pane_count() <= 1 {
+            return false;
         }
         // F290:父 pane 走了,抽屉是附属物,跟着一起走 —— 先关它,树上少一层,
         // 下面的兄弟顶替才顶得对。
@@ -2175,5 +2198,48 @@ mod tests {
         ws.pump(0);
         assert_eq!(ws.pane(d).unwrap().status, PaneStatus::Disconnected);
         assert_eq!(ws.drawer_of(PaneId(1)), Some(d));
+    }
+
+    /// `pane_count` 是「用户布局的屏数」,抽屉不算在内 —— 状态栏的"N 屏"、
+    /// F129 判「是不是最后一块」都靠它把抽屉排除掉。`leaf_count` 才是树上
+    /// 原始叶子数,含抽屉,只给诊断规模用。
+    ///
+    /// 自证会变红:把 `pane_count` 改回 `leaves(&self.tree).len()`(等于
+    /// `leaf_count`),这条会在开完抽屉后从 `1` 变成 `2`。
+    #[test]
+    fn pane_count_is_the_user_layout_and_leaves_the_drawer_out() {
+        let (mut ws, _) = ws_with(1);
+        assert_eq!(ws.pane_count(), 1);
+        assert_eq!(ws.leaf_count(), 1);
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, _) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        assert_eq!(ws.pane_count(), 1, "抽屉不算用户布局里的一块");
+        assert_eq!(ws.leaf_count(), 2, "但树上确实有两片叶子");
+    }
+
+    /// 最后一块真 pane 拒关(core 的 `close_pane` 本来就该拦住)时,树、抽屉、
+    /// 焦点都不许动 —— 尤其不能先把抽屉级联关掉再发现关不成父 pane。
+    ///
+    /// 自证会变红:删掉 `close_pane` 里 `if self.pane_count() <= 1` 那道新
+    /// 守卫,级联会先跑掉,抽屉被杀、`close_pane` 却仍返回 `false`。
+    #[test]
+    fn the_last_real_pane_refuses_to_close_and_keeps_its_drawer() {
+        let (mut ws, _) = ws_with(1);
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, dprobe) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        let before = ws.tree().clone();
+        let focus_before = ws.focus();
+        assert!(!ws.close_pane(PaneId(1)), "唯一一块真 pane 不可关");
+        assert_eq!(*ws.tree(), before, "树不许动");
+        assert!(ws.pane(d).is_some(), "抽屉的 PaneState 不许丢");
+        assert_eq!(ws.drawers().len(), 1, "抽屉标记不许清");
+        assert_eq!(
+            *dprobe.closes.lock().unwrap(),
+            0,
+            "抽屉的 channel 不许被级联关掉"
+        );
+        assert_eq!(ws.focus(), focus_before, "焦点不许动");
     }
 }

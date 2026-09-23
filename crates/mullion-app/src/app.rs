@@ -13598,7 +13598,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // F155:此刻的规模。三条 relaxed 原子存,可忽略。
                 diag::set_scale(
                     self.tabs.len(),
-                    self.active_ws().map_or(0, |ws| ws.pane_count()),
+                    self.active_ws().map_or(0, |ws| ws.leaf_count()),
                     self.active_ws().map_or(0, |ws| ws.hosts.len()),
                 );
                 // F169:内存记账 gauge。遍历全部标签(不是只有活动 ws):
