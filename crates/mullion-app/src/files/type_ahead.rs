@@ -51,13 +51,10 @@ pub fn next_index(
         }
         _ => ch.to_string(),
     };
-    let first = prefix.chars().next().unwrap_or(ch);
-    let cycling = prefix.chars().count() > 1 && prefix.chars().all(|c| c == first);
-    let needle: String = if cycling {
-        first.to_lowercase().collect()
-    } else {
-        prefix.chars().flat_map(char::to_lowercase).collect()
-    };
+    let lower: String = prefix.chars().flat_map(char::to_lowercase).collect();
+    let first = lower.chars().next().unwrap_or(ch);
+    let cycling = lower.chars().count() > 1 && lower.chars().all(|c| c == first);
+    let needle: String = if cycling { first.to_string() } else { lower };
     let state = TypeAhead { prefix, at: now };
     if rows.is_empty() {
         return (None, state);
@@ -180,9 +177,9 @@ mod tests {
             Some(&rows[0].name),
             Some(&st),
             t0 + Duration::from_millis(200),
-            'd',
+            'D',
         );
-        assert_eq!(hit, Some(1));
+        assert_eq!(hit, Some(1), "大小写混按也算循环");
         let (hit, st) = next_index(
             &rows,
             Some(&rows[1].name),

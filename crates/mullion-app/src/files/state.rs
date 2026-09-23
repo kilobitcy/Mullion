@@ -179,6 +179,9 @@ pub struct PaneState {
     /// 完全可以切走再切回来)。清空的两个时机:队列里再没有指向这一栏的活
     /// (`app.rs` 每次收下目录列表时现算),以及 [`PaneState::invalidate`]。
     pub arrival_marks: std::collections::BTreeSet<(RemotePath, RemotePath)>,
+    /// F292:按字母定位的上一键状态(前缀 + 时刻)。`None` = 没按过;超时判据
+    /// 在 `type_ahead::next_index` 里比时间,这里不清。
+    pub type_ahead: Option<super::type_ahead::TypeAhead>,
 }
 
 impl PaneState {
@@ -210,6 +213,7 @@ impl PaneState {
             paste_seq: 0,
             probe_seq: 0,
             arrival_marks: std::collections::BTreeSet::new(),
+            type_ahead: None,
         }
     }
 
@@ -614,6 +618,31 @@ impl PaneState {
         self.selected.insert(name.clone());
         self.cursor = Some(name.clone());
         self.anchor = Some(name.clone());
+    }
+
+    /// F292:按下一个可打印字符。返回有没有跳到某一行。
+    ///
+    /// 走 `rows()` 不走 `entries`:隐藏项过滤和排序都在那一层,遍历原始
+    /// `entries` 会跳到一条**画不出来**的行上。命中后与 F218 同款:单选 +
+    /// `scroll_to`(虚拟滚动下不置这个,跨大距离跳转用户看不见)。
+    pub fn type_ahead(&mut self, ch: char, now: std::time::Instant) -> bool {
+        let rows = self.rows();
+        let (hit, st) = super::type_ahead::next_index(
+            &rows,
+            self.cursor.as_ref(),
+            self.type_ahead.as_ref(),
+            now,
+            ch,
+        );
+        let name = hit.map(|ix| rows[ix].name.clone());
+        drop(rows);
+        self.type_ahead = Some(st);
+        let Some(name) = name else {
+            return false;
+        };
+        self.select_only(&name);
+        self.scroll_to = Some(name);
+        true
     }
 
     /// F150:栏底状态行的文案。
@@ -1633,5 +1662,62 @@ mod tests {
             s.accept(list, Ok(Vec::new())),
             "探测序号动了列目录那一条的序号 —— 这一份目录列表被当成过期丢掉了"
         );
+    }
+
+    /// F292:`type_ahead` 命中 → 单选到那一条 + 置 `scroll_to`(F218 同款,
+    /// 渲染侧下一帧居中);状态记下来给下一键累积。没命中 → 选中不动,但
+    /// 状态照记。
+    ///
+    /// 自证会变红:删掉 `self.scroll_to = Some(..)`(选中了却滚不到,虚拟
+    /// 滚动下用户看不见);或删掉 `self.type_ahead = Some(st)`(第二键
+    /// 永远累积不起来)。
+    #[test]
+    fn type_ahead_selects_the_hit_and_asks_the_view_to_scroll_there() {
+        let mut st = PaneState::new(rp("/"));
+        st.entries = vec![
+            e("apple", EntryKind::File),
+            e("banana", EntryKind::File),
+            e("bean", EntryKind::File),
+        ];
+        st.load = Load::Ready;
+        let t0 = std::time::Instant::now();
+        assert!(st.type_ahead('b', t0));
+        assert_eq!(
+            st.cursor.as_ref().map(|c| c.as_bytes()),
+            Some(&b"banana"[..])
+        );
+        assert_eq!(
+            st.scroll_to.as_ref().map(|c| c.as_bytes()),
+            Some(&b"banana"[..])
+        );
+        assert_eq!(st.selected.len(), 1);
+        assert!(st.type_ahead('e', t0 + std::time::Duration::from_millis(200)));
+        assert_eq!(
+            st.cursor.as_ref().map(|c| c.as_bytes()),
+            Some(&b"bean"[..]),
+            "`be` 累积"
+        );
+        assert!(!st.type_ahead('z', t0 + std::time::Duration::from_millis(400)));
+        assert_eq!(
+            st.cursor.as_ref().map(|c| c.as_bytes()),
+            Some(&b"bean"[..]),
+            "没命中不动"
+        );
+    }
+
+    /// 隐藏项关着时,`.` 开头的条目不参与定位(它们根本没画出来)。
+    ///
+    /// 自证会变红:把 `type_ahead` 里的 `self.rows()` 换成遍历 `self.entries`。
+    #[test]
+    fn type_ahead_only_walks_the_rows_that_are_actually_shown() {
+        let mut st = PaneState::new(rp("/"));
+        st.show_hidden = false;
+        st.entries = vec![e(".bashrc", EntryKind::File), e("bin", EntryKind::File)];
+        st.load = Load::Ready;
+        let t0 = std::time::Instant::now();
+        assert!(!st.type_ahead('.', t0));
+        // 超过累积窗口,不然第二键会接在「.」后面变成找 `.b` 开头。
+        assert!(st.type_ahead('b', t0 + std::time::Duration::from_millis(2000)));
+        assert_eq!(st.cursor.as_ref().map(|c| c.as_bytes()), Some(&b"bin"[..]));
     }
 }

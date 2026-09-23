@@ -7466,6 +7466,26 @@ impl App {
             }
             WinitKey::Named(NamedKey::ArrowUp) => self.move_panel_selection(generation, -1),
             WinitKey::Named(NamedKey::ArrowDown) => self.move_panel_selection(generation, 1),
+            // F292:裸字符键 = 按字母定位。**排除**带 Ctrl/Alt/Super 的组合 ——
+            // 上面 `if mods.control_key()` 那段只 return 了 h/n/c/x/v 五个,
+            // 别的 Ctrl+字母会落到这里。Shift 允许(大写字母)。
+            WinitKey::Character(s)
+                if !mods.control_key() && !mods.alt_key() && !mods.super_key() =>
+            {
+                let Some(ch) = crate::files::type_ahead::key_char(s.as_str()) else {
+                    return;
+                };
+                if let Some(state) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|t| t.content.files_panel_mut())
+                    .map(|f| f.active_state_mut())
+                {
+                    if state.type_ahead(ch, std::time::Instant::now()) {
+                        mark_ui_dirty!(self.ui_dirty);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -17925,6 +17945,26 @@ mod tests {
             "Ctrl+Shift+N 没接上"
         );
         assert!(arm.contains("FileAction::BeginNewFile"), "Ctrl+N 被改坏了");
+    }
+
+    /// **接线守护 / F292**:`handle_panel_key` 把裸字符键交给
+    /// `PaneState::type_ahead`,且**排除** Ctrl/Alt/Super 组合 —— 否则
+    /// `Ctrl+H`(切隐藏)这类没被上面 `if mods.control_key()` 段 return 掉的
+    /// 组合键会顺手在列表里跳一下。
+    ///
+    /// 自证会变红:把那条臂的 `!mods.control_key()` 删掉;或把 `type_ahead(`
+    /// 换成 `select_only(`。
+    #[test]
+    fn printable_keys_in_the_files_panel_drive_the_type_ahead_without_modifiers() {
+        let body = body_of(prod_src(), "fn handle_panel_key(");
+        let arm = body
+            .find(concat!("type_ahead::", "key_char("))
+            .expect("handle_panel_key 没接 key_char");
+        let guard = &body[arm.saturating_sub(400)..arm];
+        assert!(guard.contains("!mods.control_key()"), "没排除 Ctrl");
+        assert!(guard.contains("!mods.alt_key()"), "没排除 Alt");
+        assert!(guard.contains("!mods.super_key()"), "没排除 Super");
+        assert!(body.contains(".type_ahead("), "没调 PaneState::type_ahead");
     }
 
     /// F240 × F226:`Ctrl+Shift+N` 有**两个**主人,分辨它俩的唯一判据是焦点。
