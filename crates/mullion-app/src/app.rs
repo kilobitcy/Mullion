@@ -13756,6 +13756,8 @@ impl ApplicationHandler<UserEvent> for App {
                                                     notice: ws
                                                         .pane(g.id)
                                                         .and_then(|p| p.notice.as_deref()),
+                                                    // F290:命令抽屉 pane 的标题条要多写「抽屉」二字。
+                                                    drawer: ws.is_drawer(g.id),
                                                 }
                                             })
                                             .collect()

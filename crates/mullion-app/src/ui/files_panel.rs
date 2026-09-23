@@ -4942,6 +4942,7 @@ mod tests {
             project: None,
             project_icon: None,
             notice: None,
+            drawer: false,
         }
     }
 

@@ -2028,6 +2028,7 @@ mod tests {
             cwd_leaf: None,
             tmux: None,
             notice: None,
+            drawer: false,
         }
     }
 

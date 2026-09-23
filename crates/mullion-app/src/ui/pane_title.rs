@@ -48,6 +48,10 @@ pub struct TitleView<'a> {
     /// F163/D4:挂在这块 pane 上的一句说明(attach 失败 / 会话已删 / 连不上)。
     /// 来自 `PaneState::notice`。**不弹窗** —— 多块 pane 同时失败会连弹好几次。
     pub notice: Option<&'a str>,
+    /// F290:这块是抽屉(命令抽屉 pane)。构造点按 `ws.is_drawer` 现查,
+    /// 不另记一份 —— 理由与 `project` 字段同形(F160~F163「意图表换节点
+    /// 没人清」)。
+    pub drawer: bool,
 }
 
 /// ④:焦点分屏标题条上那层 accent 的不透明度。0.14 —— 够看出「这块亮一点」,
@@ -88,6 +92,11 @@ pub fn icon_of<'a>(
 /// `notice`(F163/D4):挂在这块 pane 上的一句说明,拼在最后。**所有分支都要
 /// 拼**——包括 `host` 为 `None` 那条 early return:占位 pane(D3 的会话已删 /
 /// D6 的拨号降级)恰恰没有自己的 `host`,而那句说明是它唯一能显示的信息。
+///
+/// `drawer`(F290):这块是抽屉(命令抽屉 pane),紧跟在序号后面加一段「抽屉」,
+/// 其余段(主机/目录/tmux/断开态)照旧拼 —— 用户要一眼分得清它和普通分屏,
+/// 断开态也要带这个字样。
+#[allow(clippy::too_many_arguments)] // F290 加了 drawer,已到 8 参;同 `session_manager` 那批表单函数一样的豁免
 pub fn title_text(
     index: usize,
     host: Option<&str>,
@@ -96,6 +105,7 @@ pub fn title_text(
     project: Option<&str>,
     status: PaneStatus,
     notice: Option<&str>,
+    drawer: bool,
 ) -> String {
     let tail = |mut s: String| {
         if let Some(n) = notice {
@@ -104,17 +114,22 @@ pub fn title_text(
         }
         s
     };
+    let tag = if drawer { " · 抽屉" } else { "" };
     let Some(h) = host else {
         // `(None, ..)` 现在可达:占位 pane(`App::place_dead_pane`)的
         // `host_pending == true`,构造点据此不把 `hosts[host_ix]`(别人那台
         // 机器)当成自己的名字传进来,`host` 就是 `None`。这类 pane 没有
         // 自己的主机名,`notice` 是标题条上唯一有用的信息,必须拼上。
-        return tail(format!("{index} · 连接中…"));
+        return tail(format!("{index}{tag} · 连接中…"));
     };
     if status == PaneStatus::Disconnected {
-        return tail(format!("{index} · {h} (已断开)"));
+        return tail(format!("{index}{tag} · {h} (已断开)"));
     }
-    let mut parts = vec![index.to_string(), h.to_string()];
+    let mut parts = vec![index.to_string()];
+    if drawer {
+        parts.push("抽屉".to_string());
+    }
+    parts.push(h.to_string());
     // F225③:认出项目就用 `项目名 · 目录名`,**顶掉 tmux 名**。项目的 tmux
     // 名按 P5 是从项目名推导的,两个一起显示是同一个信息说两遍。
     //
@@ -461,6 +476,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                     v.project,
                                     v.status,
                                     v.notice,
+                                    v.drawer,
                                 ))
                                 .color(theme::c32(if v.focused {
                                     t.fg_strong
@@ -496,9 +512,44 @@ mod tests {
                 Some("main"),
                 None,
                 PaneStatus::Live,
-                None
+                None,
+                false
             ),
             "2 · build-01 · Mullion · main"
+        );
+    }
+
+    /// F290:抽屉的标题条在序号后面写「抽屉」,其余段照旧 —— 用户要一眼分得清
+    /// 它和普通分屏。断开态也带。
+    ///
+    /// 自证会变红:`title_text` 里 `drawer` 那句 `parts.push("抽屉"…)` 删掉。
+    #[test]
+    fn a_drawer_title_says_so_right_after_the_index() {
+        assert_eq!(
+            title_text(
+                3,
+                Some("build-01"),
+                Some("app"),
+                None,
+                None,
+                PaneStatus::Live,
+                None,
+                true
+            ),
+            "3 · 抽屉 · build-01 · app"
+        );
+        assert_eq!(
+            title_text(
+                3,
+                Some("build-01"),
+                None,
+                None,
+                None,
+                PaneStatus::Disconnected,
+                None,
+                true
+            ),
+            "3 · 抽屉 · build-01 (已断开)"
         );
     }
 
@@ -518,7 +569,8 @@ mod tests {
                 Some("mullion-我的项目"),
                 Some("我的项目"),
                 PaneStatus::Live,
-                None
+                None,
+                false
             ),
             "2 · build-01 · 我的项目 · api"
         );
@@ -538,7 +590,8 @@ mod tests {
                 None,
                 None,
                 PaneStatus::Live,
-                None
+                None,
+                false
             ),
             "3 · build-01 · Mullion"
         );
@@ -550,7 +603,8 @@ mod tests {
                 Some("main"),
                 None,
                 PaneStatus::Live,
-                None
+                None,
+                false
             ),
             "4 · build-01 · main"
         );
@@ -562,7 +616,8 @@ mod tests {
                 None,
                 None,
                 PaneStatus::Live,
-                None
+                None,
+                false
             ),
             "5 · build-01"
         );
@@ -585,6 +640,7 @@ mod tests {
             None,
             PaneStatus::Disconnected,
             None,
+            false,
         );
         assert_eq!(s, "1 · build-01 (已断开)");
     }
@@ -600,7 +656,8 @@ mod tests {
                 Some("main"),
                 None,
                 PaneStatus::Live,
-                None
+                None,
+                false
             ),
             "3 · 连接中…"
         );
@@ -620,6 +677,7 @@ mod tests {
             None,
             PaneStatus::Live,
             Some("当初的会话 web01 已不存在"),
+            false,
         );
         assert!(got.contains("web01 已不存在"), "{got}");
         assert!(got.contains("prod"), "说明不该把原来那串顶掉:{got}");
@@ -637,6 +695,7 @@ mod tests {
             None,
             PaneStatus::Disconnected,
             Some("会话已被删除,无法自动恢复"),
+            false,
         );
         assert!(got.contains("会话已被删除"), "{got}");
     }
@@ -657,6 +716,7 @@ mod tests {
             None,
             PaneStatus::Disconnected,
             Some("会话已被删除,无法自动恢复"),
+            false,
         );
         assert!(got.contains("会话已被删除"), "{got}");
         assert!(!got.contains("prod"), "{got}");
@@ -716,6 +776,7 @@ mod tests {
                 cwd_leaf: None,
                 tmux: None,
                 notice: None,
+                drawer: false,
             };
             view.geom.title_px.h = title_h;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -773,6 +834,7 @@ mod tests {
                 cwd_leaf: None,
                 tmux: None,
                 notice: None,
+                drawer: false,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -836,6 +898,7 @@ mod tests {
             cwd_leaf: None,
             tmux: None,
             notice: None,
+            drawer: false,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -892,6 +955,7 @@ mod tests {
             cwd_leaf: None,
             tmux: None,
             notice: None,
+            drawer: false,
         }];
         // **必须显式把时间推过 `Area` 的 fade_in**。默认 `RawInput` 的
         // `time` 是 `None`,egui 会拿墙钟凑,两帧之间可能只过了几微秒 ——
@@ -1061,6 +1125,7 @@ mod tests {
             cwd_leaf: None,
             tmux: None,
             notice: None,
+            drawer: false,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1107,6 +1172,7 @@ mod tests {
             cwd_leaf: None,
             tmux: None,
             notice: None,
+            drawer: false,
         }];
         // 跑两帧:`Area` 默认 `fade_in`,第一帧 opacity 是 0,画的图形会被
         // painter 记成 `Shape::Noop`(egui-0.30 `painter.rs::Painter::add`),
@@ -1193,6 +1259,7 @@ mod tests {
                 cwd_leaf: None,
                 tmux: None,
                 notice: None,
+                drawer: false,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1260,6 +1327,7 @@ mod tests {
                 cwd_leaf: None,
                 tmux: None,
                 notice: None,
+                drawer: false,
             }];
             // 显式推进时间,而不是像 `run_title` 那样跑两帧靠墙钟走时间:
             // 这条测试要比较**颜色**,`fade_in` 半路上的不透明度会把 RGB
@@ -1359,6 +1427,7 @@ mod tests {
                 cwd_leaf: None,
                 tmux: None,
                 notice: None,
+                drawer: false,
             }];
 
             let ctx = egui::Context::default();
@@ -1427,6 +1496,7 @@ mod tests {
             cwd_leaf: Some("a-directory-name-that-is-also-absurdly-long".to_string()),
             tmux: Some("a-tmux-session-name-that-is-long-too"),
             notice: None,
+            drawer: false,
         }];
 
         let ctx = egui::Context::default();
@@ -1543,6 +1613,7 @@ mod tests {
                 cwd_leaf: None,
                 tmux: None,
                 notice: None,
+                drawer: false,
             }];
             let ctx = egui::Context::default();
             let t = crate::theme::MULLION_DARK;
@@ -1675,6 +1746,7 @@ mod tests {
                 cwd_leaf: Some("a-directory-name-that-is-also-absurdly-long".to_string()),
                 tmux: Some("a-tmux-session-name-that-is-long-too"),
                 notice: None,
+                drawer: false,
             }];
 
             let ctx = egui::Context::default();
