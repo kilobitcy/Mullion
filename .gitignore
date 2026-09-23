@@ -17,3 +17,6 @@
 # 本地权限缓存,每台机器不同、只增不减;`.claude/skills/` 反而必须入库
 # (发版流程的权威细节都在里面,CLAUDE.md 只留骨架 + 指针)
 /.claude/settings.local.json
+
+# 子 agent 的临时 git worktree,一次性、每台机器不同
+/.claude/worktrees/

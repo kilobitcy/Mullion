@@ -10385,8 +10385,12 @@ impl App {
             .tabs
             .active()
             .and_then(|t| t.content.focused_pane_host_ix());
+        // F286:`egui::Context` 是 `Arc` 包的,clone 是廉价的引用计数 —— 必须在
+        // `active_term_mut()` 借走 `self` **之前**取出来。`None` = 窗口还没建
+        // 起来,那时候不存在「键盘在谁手里」这个问题。
+        let egui_ctx = self.active.as_ref().map(|a| a.egui_ctx.clone());
         if let Some(t) = self.active_term_mut() {
-            if let Some(fresh) = apply_layout_actions(&mut t.ws, actions) {
+            if let Some(fresh) = apply_layout_actions(&mut t.ws, egui_ctx.as_ref(), actions) {
                 mark_ui_dirty!(self.ui_dirty);
                 self.spawn_fresh_panes(fresh, focus_host_ix);
             }
@@ -15061,7 +15065,11 @@ fn decide_paste(
 /// F232:不再返回"新的 current_preset"。工具栏高亮改由 `preset_of(ws.tree())`
 /// 每帧现算 —— 影子状态唯一的更新规则("关了 pane 就清空")本身就是那个 bug:
 /// 两屏关掉一块之后剩下的形状其实**就是**单屏,单屏按钮却不亮。
-fn apply_layout_actions(ws: &mut Workspace, actions: &crate::ui::UiActions) -> Option<Vec<PaneId>> {
+fn apply_layout_actions(
+    ws: &mut Workspace,
+    egui_ctx: Option<&egui::Context>,
+    actions: &crate::ui::UiActions,
+) -> Option<Vec<PaneId>> {
     if actions.preset.is_none() && actions.close_pane.is_none() {
         return None;
     }
@@ -15076,6 +15084,21 @@ fn apply_layout_actions(ws: &mut Workspace, actions: &crate::ui::UiActions) -> O
         // 那一帧就是纯粹的 noop,不该标脏(白标一次脏 = 一次无意义重绘,T3)。
         if ws.close_pane(id) {
             changed = true;
+        }
+    }
+    // F286:真分出了新格子,才把 egui 的键盘焦点交出来。
+    //
+    // `apply_preset` 已经把 `ws.focus` 给了前序第一块新格子,但那只是「分屏
+    // 焦点」;用户点按钮之前十有八九正在某个 egui 输入框里打字,那个部件还
+    // 握着 egui 的键盘焦点,`input_route::route` 会继续把每个按键判给 egui ——
+    // 新 pane 高亮着、字却落进搜索框,没有任何报错(T8 同族)。
+    //
+    // **条件严格挂在 `fresh` 非空上**:4→1、纯重排什么都没开出来,弹掉用户
+    // 手里的焦点纯属倒退。也只挂在这条「这一帧点了布局按钮」的路径上,不碰
+    // `reattach_pane`(F128)和 `RestoreFirstMount`(F156-b)那两条后台路径。
+    if !fresh.is_empty() {
+        if let Some(ctx) = egui_ctx {
+            ctx.memory_mut(|m| m.stop_text_input());
         }
     }
     changed.then_some(fresh)
@@ -20812,6 +20835,88 @@ mod tests {
         );
     }
 
+    /// **F286**:点布局按钮分出新格子,键盘必须当场回到终端。
+    ///
+    /// 光把 `Workspace::focus` 挪到新格子是不够的 —— 用户点按钮之前多半正在
+    /// 某个 egui 输入框里打字(搜索框、路径条、重命名框),那个部件还握着
+    /// egui 的键盘焦点。`input_route::route` 看到 `wants_keyboard_input()`
+    /// 为真就把每个按键都判给 egui,于是「新 pane 拿到了分屏焦点、用户一打字
+    /// 字却跑进那个输入框」—— 分屏焦点给对了,画面上也高亮对了,只有键落错
+    /// 地方(T8 那条陷阱的同族症状,而且没有任何报错)。
+    ///
+    /// 所以判据落在 `wants_keyboard_input()` 上,不落在 `ws.focus()` 上:
+    /// 后者已经被 workspace 那两条测试守着了,这条守的是**另一半**。
+    #[test]
+    fn opening_a_split_hands_the_keyboard_back_to_the_terminal() {
+        let ctx = egui::Context::default();
+        // 模拟「用户正在某个 egui 输入框里打字」。直接压 memory 比真画一个
+        // TextEdit 更硬:不依赖任何具体部件还在不在。
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("用户正在打字的那个框")));
+        assert!(
+            ctx.wants_keyboard_input(),
+            "前提没造出来 —— 这条守护量不到任何东西"
+        );
+
+        let mut ws = Workspace::new(test_pane(1), 0);
+        let fresh = apply_layout_actions(
+            &mut ws,
+            Some(&ctx),
+            &crate::ui::UiActions {
+                preset: Some(Preset::TwoLeftRight),
+                ..Default::default()
+            },
+        )
+        .expect("点了预设,动作不该是 None");
+        assert!(!fresh.is_empty(), "1→2 必须真的多出一块,否则前提不成立");
+
+        assert!(
+            !ctx.wants_keyboard_input(),
+            "分出了新格子,egui 还攥着键盘焦点 —— 用户接着打的字会落进\
+             刚才那个输入框,而不是新 pane(T8 同族)"
+        );
+    }
+
+    /// 反向守护 / F286:布局收窄(4→1)没开出任何新格子,就**不能**动用户
+    /// 手里的键盘焦点。
+    ///
+    /// 无条件 `stop_text_input()` 会让「在搜索框里打字时顺手点一下单屏」
+    /// 把输入焦点弹掉,用户得回去重新点一次框 —— 这是纯粹的倒退,而且
+    /// 正向那条测试完全看不见它。
+    #[test]
+    fn a_layout_change_that_opens_nothing_leaves_the_keyboard_alone() {
+        let ctx = egui::Context::default();
+        let typing = egui::Id::new("用户正在打字的那个框");
+        ctx.memory_mut(|m| m.request_focus(typing));
+
+        let mut ws = Workspace::new(test_pane(1), 0);
+        apply_layout_actions(
+            &mut ws,
+            Some(&ctx),
+            &crate::ui::UiActions {
+                preset: Some(Preset::FourGrid),
+                ..Default::default()
+            },
+        );
+        // 开完四宫格再收回单屏:这一步只关格子,`fresh` 为空。
+        ctx.memory_mut(|m| m.request_focus(typing));
+        let fresh = apply_layout_actions(
+            &mut ws,
+            Some(&ctx),
+            &crate::ui::UiActions {
+                preset: Some(Preset::Single),
+                ..Default::default()
+            },
+        )
+        .expect("切预设不该是 None");
+        assert!(fresh.is_empty(), "4→1 不该开出新格子,否则前提不成立");
+
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(typing),
+            "什么都没开出来,却把用户手里的键盘焦点弹掉了"
+        );
+    }
+
     /// 点工具栏上的预设按钮 X,树必须真的变成 X 对应的形状,不是停在原地、
     /// 也不是无条件切到某个写死的预设。两次切不同的预设,确认路由跟着点击
     /// 的值走(如果实现里硬编码了一个预设,第二个断言必挂)。
@@ -20820,6 +20925,7 @@ mod tests {
         let mut ws = Workspace::new(test_pane(1), 0);
         let fresh = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
                 close_pane: None,
@@ -20851,6 +20957,7 @@ mod tests {
         // 再点一个不同的预设,确认不是写死指向 ThreeColumns。
         apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoTopBottom),
                 close_pane: None,
@@ -20873,6 +20980,7 @@ mod tests {
         let mut ws = Workspace::new(test_pane(1), 0);
         let fresh = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
                 close_pane: None,
@@ -20894,6 +21002,7 @@ mod tests {
 
         let fresh2 = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: None,
                 close_pane: Some(target),
@@ -20926,7 +21035,7 @@ mod tests {
     #[test]
     fn no_ui_action_means_no_layout_change() {
         let mut ws = Workspace::new(test_pane(1), 0);
-        let result = apply_layout_actions(&mut ws, &crate::ui::UiActions::default());
+        let result = apply_layout_actions(&mut ws, None, &crate::ui::UiActions::default());
         assert!(result.is_none(), "什么都没点,不该有布局动作");
         assert_eq!(mullion_core::layout::leaves(ws.tree()).len(), 1);
     }
@@ -20943,6 +21052,7 @@ mod tests {
         // SSH channel 还在网络上跑,尚未收到 PaneOpened。
         let fresh = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::ThreeColumns),
                 close_pane: None,
@@ -20955,6 +21065,7 @@ mod tests {
         // 在那 2 个 channel 回来之前,用户又切回 Single——把刚才的叶子从树上摘掉。
         let fresh2 = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::Single),
                 close_pane: None,
@@ -21000,6 +21111,7 @@ mod tests {
         let mut ws = Workspace::new(test_pane(1), 0);
         apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::Single),
                 close_pane: None,
@@ -21011,6 +21123,7 @@ mod tests {
         let only_id = mullion_core::layout::leaves(ws.tree())[0];
         let result = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: None,
                 close_pane: Some(only_id),
@@ -21361,6 +21474,7 @@ mod tests {
         let mut ws = Workspace::new(test_pane(1), 1);
         let fresh = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoLeftRight),
                 close_pane: None,
@@ -23742,6 +23856,7 @@ mod tests {
         // 已经被用户删了(D3)/ 拨号还没回来(D6)。
         let fresh = apply_layout_actions(
             &mut ws,
+            None,
             &crate::ui::UiActions {
                 preset: Some(Preset::TwoLeftRight),
                 close_pane: None,

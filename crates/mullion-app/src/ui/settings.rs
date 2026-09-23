@@ -424,6 +424,29 @@ fn appearance(
     });
 }
 
+/// 画一段**会换行**的灰字说明(F285)。
+///
+/// **不能直接 `ui.label(..)`**:`form::grid` 的单元格是 horizontal layout,而
+/// egui 在 horizontal 下推断出来的默认 `wrap_mode` 是 `Extend` —— 整段排成一行,
+/// **与可用宽多少完全无关**。`show()` 里那句 `ui.set_max_width(..)` 因此对它
+/// 一点约束力都没有(F280 以为宽度那一半也修好了,其实从来没生效)。
+///
+/// 后果:自动定尺的 `egui::Window` 被这一行顶到 2243 逻辑点宽,再被
+/// `CENTER_CENTER` 锚定**左右对称**切掉 —— 1366 宽的窗口上两边各约 439 点
+/// 内容在窗外,划都划不到。而它**在大屏上完全正常**,所以开发机上永远看不见。
+///
+/// 守护在 `tests/dialog_bounds.rs`(三档窗口尺寸真渲染量矩形)。
+fn wrapped_hint(ui: &mut egui::Ui, t: &Theme, text: &str) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(11.0)
+                .color(theme::c32(t.fg_muted)),
+        )
+        .wrap(),
+    );
+}
+
 /// 远端分节:自动配置 tmux 状态上报(F124)+ 让远端 shell 报出当前目录(F156-c)。
 ///
 /// **两个独立开关**,不是一个。副作用完全不同:F124 改的是远端 tmux 服务器
@@ -445,15 +468,13 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
         ui.end_row();
 
         ui.label("");
-        ui.label(
-            egui::RichText::new(
-                "连上后开一条旁路命令通道,打开远端 tmux 的 set-titles 并让它报出当前目录。\
-                 分屏标题条上的目录名、以及文件面板继承终端所在目录都靠它。\
-                 改的是 tmux 服务器内存里的全局选项(不写任何文件,server 退出即失效),\
-                 那台机器上 attach 同一个 tmux 的其它终端,窗口标题也会跟着变成这个格式。",
-            )
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
+        wrapped_hint(
+            ui,
+            t,
+            "连上后开一条旁路命令通道,打开远端 tmux 的 set-titles 并让它报出当前目录。\
+             分屏标题条上的目录名、以及文件面板继承终端所在目录都靠它。\
+             改的是 tmux 服务器内存里的全局选项(不写任何文件,server 退出即失效),\
+             那台机器上 attach 同一个 tmux 的其它终端,窗口标题也会跟着变成这个格式。",
         );
         ui.end_row();
 
@@ -467,19 +488,17 @@ fn remote(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Set
         ui.end_row();
 
         ui.label("");
-        ui.label(
-            egui::RichText::new(
-                "分屏刚连上时往远端 shell 发一行命令,让它此后每个提示符都报一次当前目录。\
-                 上面那条只在远端开着 tmux 时管用,这条管的是不经过 tmux 的场景 ——\
-                 文件面板继承终端所在目录靠它。\
-                 只改这条 shell 内存里的提示符钩子(bash 是 PROMPT_COMMAND,zsh 是 precmd_functions;\
-                 不写远端任何文件,断开即消失),\
-                 发完会清一次屏,所以登录横幅会被一起清掉。\
-                 远端 shell 不是 bash / zsh(比如 fish)时,屏幕上会打出一行报错,\
-                 那种情况请关掉这个开关。",
-            )
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
+        wrapped_hint(
+            ui,
+            t,
+            "分屏刚连上时往远端 shell 发一行命令,让它此后每个提示符都报一次当前目录。\
+             上面那条只在远端开着 tmux 时管用,这条管的是不经过 tmux 的场景 ——\
+             文件面板继承终端所在目录靠它。\
+             只改这条 shell 内存里的提示符钩子(bash 是 PROMPT_COMMAND,zsh 是 precmd_functions;\
+             不写远端任何文件,断开即消失),\
+             发完会清一次屏,所以登录横幅会被一起清掉。\
+             远端 shell 不是 bash / zsh(比如 fish)时,屏幕上会打出一行报错,\
+             那种情况请关掉这个开关。",
         );
         ui.end_row();
     });
@@ -506,14 +525,12 @@ fn files(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mut Sett
         ui.end_row();
 
         ui.label("");
-        ui.label(
-            egui::RichText::new(
-                "点「确定」后连已经开着的面板也会跟着变(远端栏和本地栏都变)。\
-                 面板里按 Ctrl+H 也能切,那一下同样存下来 —— 两个入口是同一个开关。\
-                 默认开着:远端工作目录里最要紧的东西多半就是 .claude/、.git/ 这些。",
-            )
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
+        wrapped_hint(
+            ui,
+            t,
+            "点「确定」后连已经开着的面板也会跟着变(远端栏和本地栏都变)。\
+             面板里按 Ctrl+H 也能切,那一下同样存下来 —— 两个入口是同一个开关。\
+             默认开着:远端工作目录里最要紧的东西多半就是 .claude/、.git/ 这些。",
         );
         ui.end_row();
     });
@@ -549,14 +566,12 @@ fn diagnostics(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft, out: &mu
         ui.end_row();
 
         ui.label("");
-        ui.label(
-            egui::RichText::new(
-                "常规档每 5 秒记一行性能剖面（帧耗时、吞吐、各阶段占用、回显往返），\
-                 排查卡顿靠它。详细档还会逐事件记录，日志会大很多。\
-                 环境变量 MULLION_LOG 若设了，会盖过这里的选择。",
-            )
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
+        wrapped_hint(
+            ui,
+            t,
+            "常规档每 5 秒记一行性能剖面（帧耗时、吞吐、各阶段占用、回显往返），\
+             排查卡顿靠它。详细档还会逐事件记录，日志会大很多。\
+             环境变量 MULLION_LOG 若设了，会盖过这里的选择。",
         );
         ui.end_row();
     });
@@ -615,10 +630,16 @@ fn security(
         // **恒显示**,不是打了字才出现:这句话要在用户决定设不设之前就看到。
         // 没有第二把钥匙是这个设计的属性,不是缺陷(设计 §4),但属性也得说。
         ui.label("");
-        ui.label(
-            egui::RichText::new("忘记主密码没有找回途径 —— 已保存的密码与私钥将永久无法解开")
-                .size(11.0)
-                .color(theme::c32(t.danger_text)),
+        // F285:同 `wrapped_hint`,Grid 单元格里不显式 `.wrap()` 就不换行。
+        // 这条不走 `wrapped_hint` 只因为它是 `danger_text` 而不是 `fg_muted`
+        // —— 危险色是这句话的要点,不该被一个通用 helper 淹掉。
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("忘记主密码没有找回途径 —— 已保存的密码与私钥将永久无法解开")
+                    .size(11.0)
+                    .color(theme::c32(t.danger_text)),
+            )
+            .wrap(),
         );
         ui.end_row();
     });
@@ -810,24 +831,22 @@ fn cloud(
         );
 
         ui.label("");
-        ui.label(
-            egui::RichText::new(if env.cloud_has_passphrase {
+        wrapped_hint(
+            ui,
+            t,
+            if env.cloud_has_passphrase {
                 "当前:已设置备份口令"
             } else {
                 "当前:还没设置备份口令,云端备份不会运行"
-            })
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
+            },
         );
         ui.end_row();
 
         ui.label("");
-        ui.label(
-            egui::RichText::new(
-                "备份口令与主密码无关。忘了没有找回途径,云端已有的备份将无法恢复。",
-            )
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
+        wrapped_hint(
+            ui,
+            t,
+            "备份口令与主密码无关。忘了没有找回途径,云端已有的备份将无法恢复。",
         );
         ui.end_row();
 
@@ -869,11 +888,7 @@ fn cloud(
         // 写法确实并存(6 处 vs 2 处),新写的一律跟多数那套走,
         // 至少别在同一个分节里混用。
         ui.label("");
-        ui.label(
-            egui::RichText::new("下一个版本生效：当前版本只往上传，不清理旧份")
-                .size(11.0)
-                .color(theme::c32(t.fg_muted)),
-        );
+        wrapped_hint(ui, t, "下一个版本生效：当前版本只往上传，不清理旧份");
         ui.end_row();
 
         ui.label("检查间隔");
@@ -913,14 +928,12 @@ fn cloud(
         ui.end_row();
 
         ui.label("");
-        ui.label(
-            egui::RichText::new(
-                "整份配置会用主密码派生的密钥加密之后再上传，云上那份是不可读的二进制；\
-                     内容没变就不上传。窗口布局与现场记录不上云（它们是这台机器的属性）。\
-                     建议用 RAM 子账号、只授权这一个 bucket 的这一个前缀。",
-            )
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
+        wrapped_hint(
+            ui,
+            t,
+            "整份配置会用主密码派生的密钥加密之后再上传，云上那份是不可读的二进制；\
+             内容没变就不上传。窗口布局与现场记录不上云（它们是这台机器的属性）。\
+             建议用 RAM 子账号、只授权这一个 bucket 的这一个前缀。",
         );
         ui.end_row();
     });

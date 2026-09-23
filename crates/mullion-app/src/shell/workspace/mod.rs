@@ -351,6 +351,19 @@ impl Workspace {
         }
         self.tree = preset_tree(preset, &ids);
         self.focus = next_focus(self.focus, &ids);
+        // F286:新开了格子就把焦点交给**前序第一块新格子**。点布局按钮是用户
+        // 亲手指定的动作,与 F156-b 里 `RehostKind::UserPicked` 同类 —— 那条
+        // 立的规矩是「用户亲手指定的,焦点该跟过去」。老行为(只调 `next_focus`)
+        // 让旧焦点原地不动,用户点完按钮还得再点一下新格子才能打字。
+        //
+        // `fresh` 为空(减少分屏、纯重排)时**一律不动**:那时候没有任何用户
+        // 意图支撑「把焦点挪走」,挪了只会让人正在看的那块无缘无故失焦。
+        //
+        // **当场给,不等 `open_pty` 回来**:高延迟代理链路上那要好几秒,延后
+        // 给等于在用户可能已经在旧 pane 上敲字时突然抢焦点。
+        if let Some(&first) = fresh.first() {
+            self.focus = first;
+        }
         fresh
     }
 
@@ -1063,6 +1076,55 @@ mod tests {
             "树上必须先有 4 个叶子,新 pane 还在连的时候画占位"
         );
         assert!(!fresh.contains(&PaneId(1)), "已有 pane 不该被重开");
+    }
+
+    /// F286:点布局按钮分出来的新 pane **当场**拿到分屏焦点。
+    ///
+    /// 老行为是 `next_focus(self.focus, &ids)` —— 旧焦点只要还活着就原地不动,
+    /// 于是新开的那块永远拿不到焦点:用户点完布局按钮还得再点一下新格子才能
+    /// 打字。这与 F156-b 立的规矩正相反 —— 那条说「用户亲手指定的,焦点该跟
+    /// 过去」,而点布局按钮同样是用户亲手指定的。
+    ///
+    /// 给 `fresh[0]`(前序第一块新格子)而不是最后一块:`ids` 的顺序就是
+    /// `preset_tree` 的前序叶子顺序,所以它几何上紧挨着原来那块,视线位移最短。
+    ///
+    /// **当场给,不等 `open_pty` 回来**:高延迟代理链路上那要好几秒,延后给
+    /// 等于在用户可能已经在旧 pane 上敲字的时候突然抢焦点 —— 比不给更坏。
+    ///
+    /// 自证会变红:把 `apply_preset` 里那句 `if let Some(&first) = fresh.first()`
+    /// 删掉(退回只调 `next_focus`)。
+    #[test]
+    fn a_pane_born_from_a_preset_click_takes_the_focus_right_away() {
+        let (mut ws, _p) = ws_with(1);
+        let fresh = ws.apply_preset(Preset::TwoLeftRight);
+        assert_eq!(
+            ws.focus(),
+            fresh[0],
+            "新开的 pane 没拿到焦点 —— 用户点完布局按钮还得再点一下才能打字"
+        );
+    }
+
+    /// F286 的另一半:**没有新 pane 就别动焦点**。
+    ///
+    /// 减少分屏(4 屏 → 2 屏)时一块都不新开。这时候把焦点挪走没有任何用户
+    /// 意图支撑,只会让人正在看的那块 pane 莫名其妙失焦。
+    ///
+    /// 自证会变红:把 `apply_preset` 的焦点那句改成无条件
+    /// `self.focus = *ids.first().unwrap()`(不再判 `fresh` 空不空)。
+    #[test]
+    fn shrinking_the_layout_opens_nothing_so_the_focus_stays_put() {
+        let (mut ws, _p) = ws_with(4);
+        // 焦点放在**几何第二块**上:放第一块的话「焦点没动」和「焦点被重置
+        // 到第一块」这两种行为给出同一个结果,这条测试会恒绿。
+        let second = mullion_core::layout::leaves(ws.tree())[1];
+        ws.set_focus(second);
+        let fresh = ws.apply_preset(Preset::TwoLeftRight);
+        assert!(fresh.is_empty(), "4 屏 → 2 屏不该新开 pane,夹具前提变了");
+        assert_eq!(
+            ws.focus(),
+            second,
+            "没新开 pane 却把焦点挪了 —— 用户正在看的那块无缘无故失焦"
+        );
     }
 
     /// F37/E10:刚连上的工作区只有 1 个 pane,按存下来的树恢复出 3 屏。
