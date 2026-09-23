@@ -1135,7 +1135,7 @@ pub fn show(
                 ui,
                 &mut f.buf,
                 find_edit_id(id, generation),
-                "文件名(模糊匹配,回车开始)",
+                "文件名(模糊匹配,支持 * ?,回车开始)",
                 ui.available_width() * 0.5,
             );
             // **只在刚打开那一刻请求一次焦点**。无条件每帧 `request_focus()`

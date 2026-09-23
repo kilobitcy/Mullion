@@ -40,6 +40,52 @@ pub fn matches(query: &str, name: &str) -> bool {
     want.peek().is_none()
 }
 
+/// F291:查询串里有没有通配符。有 → [`glob_matches`],没有 → [`matches`]。
+pub fn is_glob(query: &str) -> bool {
+    query.contains(['*', '?'])
+}
+
+/// F291:按查询串的形状分派。**这是 `Walk` 唯一该调的入口。**
+pub fn query_matches(query: &str, name: &str) -> bool {
+    if is_glob(query) {
+        glob_matches(query, name)
+    } else {
+        matches(query, name)
+    }
+}
+
+/// F291:glob 整名匹配。`*` 任意段(含空串、含 `.`),`?` 恰一个字符,其余
+/// 字面量;大小写不敏感;**整名锚定**(`*.docx` 不命中 `a.docx.bak`)。
+/// 不支持 `[...]`,方括号是字面量。
+///
+/// 手写而不引 `globset`:判据就这两个元字符,一个依赖换 30 行不值。
+/// 经典双指针 + 单回溯点:遇到 `*` 记下位置,失配时回到上一个 `*` 多吃一个字符。
+pub fn glob_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().flat_map(char::to_lowercase).collect();
+    let n: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None; // (pattern 里 `*` 之后的位置, 当时的 name 位置)
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp;
+            ni = sn + 1;
+            star = Some((sp, ni));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// 结果行显示的那一串:`root` 下的相对路径。
 ///
 /// **显示相对路径而不是绝对路径**(spec F278 已定):搜索的心智是「在**这个
@@ -215,7 +261,7 @@ impl Walk {
                 continue;
             }
             let full = dir.join(name);
-            if matches(&self.query, &e.name.display()) {
+            if query_matches(&self.query, &e.name.display()) {
                 self.hits.push(Hit {
                     path: full.clone(),
                     is_dir: e.kind == EntryKind::Dir,
@@ -661,5 +707,71 @@ mod tests {
             vec!["d2/x2", "d1/x1"],
             "`d2` 比 `d1` 先列到,该先出结果"
         );
+    }
+
+    // ---- F291 通配 ----
+
+    /// `*` 任意段(含 `.` 与空串)、`?` 恰一个字符、整名锚定、大小写不敏感。
+    ///
+    /// 自证会变红:把 `glob_matches` 的整名锚定去掉(`*.docx` 会命中
+    /// `a.docx.bak`);或把小写化去掉(`*.DOCX` 那条红)。
+    #[test]
+    fn a_glob_matches_the_whole_name_case_insensitively() {
+        assert!(glob_matches("*.docx", "报告.docx"));
+        assert!(glob_matches("*.docx", "a.DOCX"));
+        assert!(glob_matches("*.DOCX", "a.docx"));
+        assert!(!glob_matches("*.docx", "a.docx.bak"), "整名锚定");
+        assert!(glob_matches("a?c", "abc"));
+        assert!(!glob_matches("a?c", "abbc"));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("*", ""));
+        assert!(glob_matches("a*b*c", "aXXbYYc"));
+        assert!(!glob_matches("a*b*c", "aXXcYYb"));
+        assert!(glob_matches("*.docx", ".docx"), "`*` 可以是空串");
+        assert!(glob_matches("[a]", "[a]"), "方括号是字面量");
+        assert!(!glob_matches("[a]", "a"));
+    }
+
+    /// 分派:查询串里**有** `*`/`?` 才走 glob,否则维持 F278 子序列。
+    /// `.docx`(不带星)仍是子序列 —— 用户分得清哪种在生效的唯一办法。
+    ///
+    /// 自证会变红:把 `query_matches` 改成恒走 `matches`(`*.docx` 全灭);
+    /// 或恒走 glob(`.docx` 命中 `x.docx-notes` 那条红)。
+    #[test]
+    fn a_query_with_a_wildcard_is_a_glob_and_without_one_stays_a_subsequence() {
+        assert!(query_matches("*.docx", "a.docx"));
+        assert!(!query_matches("*.docx", "a.docx.bak"));
+        assert!(
+            !query_matches("*.docx", "docx"),
+            "glob 下 `.` 是字面量,必须出现"
+        );
+        assert!(
+            query_matches(".docx", "x.docx-notes"),
+            "无通配 = 子序列,行为不变"
+        );
+        assert!(query_matches("appr", "app.rs"));
+    }
+
+    /// `Walk` 用的是分派函数,不是裸 `matches` —— 否则上面两条纯函数测试
+    /// 全绿、真搜索照旧不认 `*`。
+    ///
+    /// 自证会变红:把 `accept` 里的 `query_matches(` 改回 `matches(`。
+    #[test]
+    fn the_walk_dispatches_through_query_matches() {
+        let mut w = Walk::new(rp("/root"), "*.docx".to_string(), true);
+        let dir = w.take_runnable().pop().unwrap();
+        w.accept(
+            &dir,
+            Ok(vec![
+                e("a.docx", EntryKind::File),
+                e("a.docx.bak", EntryKind::File),
+            ]),
+        );
+        let hits: Vec<String> = w
+            .hits()
+            .iter()
+            .map(|h| h.path.display().to_string())
+            .collect();
+        assert_eq!(hits, vec!["/root/a.docx".to_string()]);
     }
 }
