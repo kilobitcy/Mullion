@@ -307,11 +307,61 @@ mod tests {
         );
     }
 
-    /// 长搜索词不许延伸到叉底下。
+    /// 输入框自己画的那个背景框 —— 它的矩形就是 `TextEdit` 的**外框**
+    /// (`outer_rect`,含内边距)。
     ///
-    /// 唯一的机制是把 `TextEdit` 的右内边距撑开一个叉那么宽;少撑这一下,
-    /// 字与叉互相叠印(两者都还在、谁也不遮住谁),看上去就是一团糊 ——
-    /// 而这种糊**只有人眼能发现**。
+    /// 取「包含内容区中心、面积最小」的那个:`CentralPanel` 的底也是一个
+    /// `RectShape`、也包含这个点,但大得多。
+    fn frame_rect(shapes: &[egui::epaint::ClippedShape], inner: egui::Rect) -> egui::Rect {
+        fn walk(s: &egui::Shape, inner: egui::Rect, best: &mut Option<egui::Rect>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, inner, best)),
+                egui::Shape::Rect(r)
+                    if r.rect.contains(inner.center())
+                        && best.is_none_or(|b| r.rect.area() < b.area()) =>
+                {
+                    *best = Some(r.rect);
+                }
+                _ => {}
+            }
+        }
+        let mut best = None;
+        shapes.iter().for_each(|c| walk(&c.shape, inner, &mut best));
+        best.expect("输入框连背景框都没画,这条守护量不到东西")
+    }
+
+    /// 叉必须整个待在输入框**自己的边框里**。
+    ///
+    /// 这条盯的是「右内边距撑开了没有」。少撑这一下,叉会被挤到框外去 ——
+    /// 盖住同一行紧挨着的下一个控件(文件面板远端栏那个框右边就紧跟着
+    /// 「搜索」按钮),那个控件从此点不中,而画面上只看得出「有点挤」。
+    ///
+    /// **不能拿「文字有没有跑到叉底下」代替**:叉的位置是从内容区右边界推
+    /// 出来的,内边距一变两者同步平移,那条判据恒成立 —— 实测过:去掉
+    /// `right: M_X + CLEAR_W` 的 `+ CLEAR_W`,下面那条长词守护照样全绿。
+    ///
+    /// 自证会变红:把 `.margin()` 里的 `M_X + CLEAR_W` 改回 `M_X`(实测)。
+    #[test]
+    fn the_cross_stays_inside_the_boxs_own_frame() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        type_text(&ctx, &mut text, "日志");
+        let (inner, _, shapes) = frame(&ctx, &mut text, egui::RawInput::default());
+
+        let outer = frame_rect(&shapes, inner);
+        let cross = cross_rect(inner);
+        assert!(
+            outer.contains_rect(cross),
+            "叉 {cross:?} 越出了输入框的边框 {outer:?} —— 右内边距没撑开,\
+             它会盖住同一行紧挨着的下一个控件"
+        );
+    }
+
+    /// 长搜索词不许延伸到叉底下 —— 字与叉互相叠印(两者都还在、谁也不遮住
+    /// 谁),看上去就是一团糊,而这种糊**只有人眼能发现**。
+    ///
+    /// 自证会变红:把 `cross_rect` 里的 `+ CLEAR_W / 2.0` 改成 `- CLEAR_W / 2.0`
+    /// (把叉画回内容区里,实测)。
     #[test]
     fn a_long_query_never_runs_under_the_cross() {
         let ctx = egui::Context::default();
