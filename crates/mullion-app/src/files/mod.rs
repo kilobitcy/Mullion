@@ -17,6 +17,7 @@ pub mod queue;
 pub mod reveal;
 pub mod state;
 pub mod transfer;
+pub mod type_ahead;
 
 /// 面板里的两栏之一(F50)。**判据类型,不是显示用的标签** —— 「哪些操作
 /// 可用」(D5:写操作只在远端栏)、「拖过来是上传还是下载」(F58)都按它分流。
