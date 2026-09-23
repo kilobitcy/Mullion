@@ -293,8 +293,9 @@ pub const DEFAULT_FONT_FAMILY: &str = "Google Sans Code";
 ///
 /// 与 [`GLYPH_EST_BYTES`] 一起构成两项模型 `固定 + 边际 × 字形数`。这两个数
 /// 是实测拟合出来的(四个点:1→2371、20→7580、60→16900、200→55920 字节,
-/// 最小二乘,误差 ≤16%),标定测试见
-/// `the_shaped_buffer_price_model_matches_what_it_actually_costs`。
+/// 最小二乘,误差 ≤16%),标定测试见 `tests/heap_price_model.rs`
+/// —— 它量的是进程全局的堆账,**必须独占一个测试进程**,不能搬回本文件的
+/// `#[cfg(test)]` 里(理由写在那个文件的模块文档)。
 ///
 /// **为什么不能用单常数。** F169 当初写的是一个 4096。但单字 run 值 2.4KB、
 /// 200 格的 ASCII 行值 56KB —— 24 倍跨度,单常数在其中一端必错一个数量级。
@@ -2441,77 +2442,6 @@ mod tests {
             bytes_estimate_of(&empty, &[], &thin),
             BUFFER_FIXED_BYTES + GLYPH_EST_BYTES
         );
-    }
-
-    /// F192:两项定价模型的实测标定。**在长短两端各量一次。**
-    ///
-    /// 为什么必须两端都量:一开始只量了单字 run(2371 字节),照它标一个单常数
-    /// 看着挺准 —— 直到把 run 拉长才发现 200 格的 ASCII 行值 55920 字节。
-    /// 24 倍跨度,单常数在另一端必错一个数量级。两项模型是从这四个实测点
-    /// (1→2371、20→7580、60→16900、200→55920)最小二乘拟出来的。
-    ///
-    /// **不能照抄 F190 那套私有计数器的手法** —— 那对分配器不可见,而这里要量
-    /// 的正是「一个已整形 `Buffer` 实际吃掉多少堆」,只能读进程全局的
-    /// `heapgauge::GLOBAL`。而 F190 自己记着的教训是:1600+ 条测试并行跑,
-    /// 全局计数上的绝对增量测不准。
-    ///
-    /// 三条对策一起上,让这条既测得准又不 flaky:
-    ///
-    /// 1. **信号做大到噪声之上**:一次整形并**持有** N 个 buffer(`held` 必须
-    ///    活到第二次读数之后,否则量到的是 0)。两端各自把 N 调到总量 ~25MB。
-    /// 2. **多轮取中位数**:第一轮含 `FontSystem` 的一次性增长(字体数据、
-    ///    shape cache),是必然的离群值,中位数把它削掉。
-    /// 3. **只断言量级**(`[预测/4, 预测×4]`):精度要求是量级正确。要打红一个
-    ///    4 倍带宽的中位数断言,邻居测试得在同一个窗口里**净**漂几十 MB。
-    ///
-    /// 两端合起来才钉得住两个常数:短端主要约束 [`BUFFER_FIXED_BYTES`],
-    /// 长端主要约束 [`GLYPH_EST_BYTES`]。**少任何一端,另一个常数就自由了。**
-    ///
-    /// 平台漂是明知的:Linux 开发机的回退字体与 Windows 不同,实测值会差。
-    /// 断言只钉量级正是为此 —— 常数漂出一个量级时逼人回来重标,日常波动不红。
-    ///
-    /// 自证会变红:把 `GLYPH_EST_BYTES` 改成 1(长端立刻红,短端仍绿 ——
-    /// 这正是"少一端就钉不住"的现场)。
-    #[test]
-    fn the_shaped_buffer_price_model_matches_what_it_actually_costs() {
-        // (一个 run 里的字形数, 持有多少个 run)。乘积按总量 ~25MB 选。
-        const POINTS: [(usize, usize); 2] = [(1, 10_000), (200, 500)];
-        let mut fs = FontSystem::new();
-        let metrics = grid_metrics(16.0, 20.0);
-
-        for (glyphs, n) in POINTS {
-            let text = "x".repeat(glyphs);
-            let mut rounds = [0usize; 3];
-            for slot in &mut rounds {
-                let before = crate::heapgauge::GLOBAL.live();
-                let mut held: Vec<Buffer> = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let mut b = Buffer::new(&mut fs, metrics);
-                    b.set_text(
-                        &mut fs,
-                        &text,
-                        Attrs::new().family(Family::Name(DEFAULT_FONT_FAMILY)),
-                        Shaping::Advanced,
-                    );
-                    b.shape_until_scroll(&mut fs, false);
-                    held.push(b);
-                }
-                let after = crate::heapgauge::GLOBAL.live();
-                *slot = after.saturating_sub(before) as usize / n;
-                drop(held);
-            }
-            rounds.sort_unstable();
-            let measured = rounds[1];
-            let predicted = BUFFER_FIXED_BYTES + glyphs * GLYPH_EST_BYTES;
-            println!(
-                "{glyphs} 字形/run:实测中位数 {measured} 字节,模型 {predicted}(三轮 {rounds:?})"
-            );
-            assert!(
-                measured >= predicted / 4 && measured <= predicted * 4,
-                "{glyphs} 字形的 run:模型报 {predicted}、实测 {measured},差了一个量级\
-                 以上,该重新标定 BUFFER_FIXED_BYTES/GLYPH_EST_BYTES 了(三轮 {rounds:?})"
-            );
-        }
     }
 
     fn bench_row(text: &str, cols: u16) -> Vec<SnapCell> {

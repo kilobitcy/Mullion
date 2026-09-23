@@ -954,26 +954,46 @@ mod tests {
     /// `/proc/self/stat` 尤其容易,comm 里带空格会把 split 打乱)会让
     /// 数字变成一个看起来正常的错值。
     ///
+    /// **判据是「涨不涨」,不是「涨多少」。** 原先写的是「烧 150ms 墙钟,
+    /// 主线程口径该报 >5000bp(半个核)」—— 那句话隐含假设本线程在这段墙钟里
+    /// 分得到半个核,而本用例和另外两千多条测试并发跑,分到多少完全由调度器
+    /// 说了算:2026-09-23 实测,把机器压满后 3/3 必红,而代码一个字没错。
+    /// 下标错位那种缺陷靠「涨不涨」就杀得掉 —— cminflt 烧到天荒地老也不动,
+    /// 所以这里改成「一直烧,直到真的涨了」,兜底时限一到才判失败。
+    ///
     /// 自证会变红:把 Linux 分支的 `f.get(11)` 改成 `f.get(10)`
     /// (那是 cminflt,只会在 fork 时变,烧 CPU 也不涨)。
     #[test]
     #[cfg(any(windows, target_os = "linux"))]
     fn this_platform_reports_cpu_time_that_actually_grows_when_we_burn_cpu() {
+        use std::time::{Duration, Instant};
         let mut p = CpuProbe::new_on_main_thread();
         assert_eq!(p.sample(1_000_000_000), None, "首次采样没有基线,该是 None");
-        // 在主线程上烧掉一小段真实 CPU。
-        let start = std::time::Instant::now();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut x = 0u64;
-        while start.elapsed() < std::time::Duration::from_millis(150) {
-            x = x.wrapping_add(1);
-        }
+        let grew = loop {
+            // 在**本线程**上烧一小段真实 CPU(`CpuProbe` 记的是造它的那个
+            // 线程,见 `linux_current_tid` 的文档)。
+            let slice = Instant::now();
+            while slice.elapsed() < Duration::from_millis(50) {
+                x = x.wrapping_add(1);
+            }
+            let s = p
+                .sample(slice.elapsed().as_nanos() as u64)
+                .expect("有基线之后采样该有值");
+            if s.main_thread_bp > 0 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+        };
         std::hint::black_box(x);
-        let window_ns = start.elapsed().as_nanos() as u64;
-        let s = p.sample(window_ns).expect("第二次采样该有值");
         assert!(
-            s.main_thread_bp > 5_000,
-            "刚把主线程跑满 150ms,主线程口径只报了 {}bp",
-            s.main_thread_bp
+            grew,
+            "连烧 10 秒,本线程的 CPU 口径一次都没涨过 —— 多半是 read_cpu_ns \
+             的字段下标错位,读到了一个烧 CPU 也不动的字段"
         );
     }
 
