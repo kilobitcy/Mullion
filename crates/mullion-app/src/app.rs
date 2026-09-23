@@ -1931,23 +1931,28 @@ fn snapshot_tabs_of(tabs: &Tabs<TabContent>) -> (Vec<mullion_store::SavedTab>, u
     let mut active_tab = 0usize;
     for (ix, tab) in tabs.iter().enumerate() {
         let saved = match (&tab.content, tab.session_id) {
-            (TabContent::Terminal(t), Some(session_id)) => SavedTab {
-                kind: SavedTabKind::Terminal,
-                session_id,
-                title: tab.title.clone(),
-                focus_leaf: snap::focus_leaf_index(t.ws.tree(), t.ws.focus()),
-                // F160:每个叶子写它**自己**那块 pane 的身份 —— 换过节点之后
-                // `ws.hosts` 里有两台机器,只写标签级那一个会让恢复时所有 pane
-                // 一起拨向第一台(spec §1.1 症状②)。
-                tree: snap::to_entries(t.ws.tree(), &|id| {
-                    leaf_identity_of(
-                        &|ix| t.ws.hosts.get(ix).and_then(|h| h.session_id),
-                        t.ws.pane(id),
-                        &t.leaf_wanted,
-                        id,
-                    )
-                }),
-            },
+            (TabContent::Terminal(t), Some(session_id)) => {
+                // F290:抽屉不进现场 —— 树和焦点必须取**同一份**剪过的,不许
+                // 一处剪、另一处读原值(那样焦点会指到一个已经不在树里的叶子)。
+                let (tree, focus) = t.ws.tree_without_drawers();
+                SavedTab {
+                    kind: SavedTabKind::Terminal,
+                    session_id,
+                    title: tab.title.clone(),
+                    focus_leaf: snap::focus_leaf_index(&tree, focus),
+                    // F160:每个叶子写它**自己**那块 pane 的身份 —— 换过节点之后
+                    // `ws.hosts` 里有两台机器,只写标签级那一个会让恢复时所有 pane
+                    // 一起拨向第一台(spec §1.1 症状②)。
+                    tree: snap::to_entries(&tree, &|id| {
+                        leaf_identity_of(
+                            &|ix| t.ws.hosts.get(ix).and_then(|h| h.session_id),
+                            t.ws.pane(id),
+                            &t.leaf_wanted,
+                            id,
+                        )
+                    }),
+                }
+            }
             // D1:SFTP 节点标签没有分屏树 —— 恒一个叶子。它没有 tmux,身份就是
             // 标签自己那条会话。
             (TabContent::Files(_), Some(session_id)) => SavedTab {
@@ -5059,6 +5064,106 @@ impl App {
         self.apply_files_hotkey();
         self.request_ui_redraw();
         true
+    }
+
+    /// F290:`` Ctrl+` `` 开/关命令抽屉。选反引号是 VS Code「切换终端」的
+    /// 肌肉记忆,而且它在终端里没有含义、不和 tmux 前缀撞。`'~'` 一起收:
+    /// 某些布局按住 Shift 时 winit 给的是 `~`,但 Shift 本身被下面排除了,
+    /// 这里只是防 `logical_key` 口径漂移。
+    ///
+    /// 同 `files_hotkey_event`:必须在 `window_event` 里输入分流**之前**调用
+    /// (T8)—— 走到下面 `` Ctrl+` `` 会被 `encode_char` 编成控制字符写给远端。
+    fn drawer_hotkey_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
+            return false;
+        };
+        if ke.state != ElementState::Pressed {
+            return false;
+        }
+        let Some((key, mods)) = input::translate_key(ke, self.mods) else {
+            return false;
+        };
+        if self.modal_open() || !mods.ctrl || mods.shift || mods.alt || mods.sup {
+            return false;
+        }
+        if !matches!(key, Key::Char('`' | '~')) {
+            return false;
+        }
+        self.apply_drawer_hotkey();
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F290:热键按下之后做什么。判定在 `Workspace::drawer_toggle`,目录回退
+    /// 在 `shell::drawer::drawer_cwd`,这里只取现场、按结果落地。
+    fn apply_drawer_hotkey(&mut self) {
+        // F255:在改树**之前**取(`open_drawer` 会把焦点挪到抽屉上)。
+        let focus_host_ix = self
+            .tabs
+            .active()
+            .and_then(|t| t.content.focused_pane_host_ix());
+        // F286:同 `land_layout_actions` ——`egui::Context` 是 `Arc` 包的,克隆
+        // 廉价,但必须在下面借出 `self.tabs` 之前先取出来。
+        let egui_ctx = self.active.as_ref().map(|a| a.egui_ctx.clone());
+        // 项目目录(回退②)要读 `self.store`,同样得在借出 `t.ws` 之前算完。
+        let project_dir: Option<String> = {
+            let projects = self.store.as_ref().map_or(&[][..], |s| s.projects());
+            self.active_term()
+                .and_then(|t| t.ws.focused())
+                .and_then(|p| crate::project::project_of(p.tmux.as_deref(), projects))
+                .map(|pj| pj.dir.clone())
+        };
+        // 局部枚举收住这一步的结果 ——`t` 的借用在这个块结束时就还回去,下面
+        // `self.ui`/`self.spawn_fresh_panes` 都要 `&mut self`,不能跟它同时活着。
+        enum Outcome {
+            Noop,
+            Closed,
+            Opened { id: PaneId, missing_cwd: bool },
+        }
+        let outcome = {
+            let Some(t) = self.active_term_mut() else {
+                return;
+            };
+            match t.ws.drawer_toggle() {
+                crate::shell::workspace::DrawerToggle::Close(id) => {
+                    if t.ws.close_drawer(id) {
+                        Outcome::Closed
+                    } else {
+                        Outcome::Noop
+                    }
+                }
+                crate::shell::workspace::DrawerToggle::Open => {
+                    let pane_cwd = t.ws.focused().and_then(|p| p.cwd.clone());
+                    let cwd = crate::shell::drawer::drawer_cwd(
+                        pane_cwd.as_deref(),
+                        project_dir.as_deref(),
+                    );
+                    let missing_cwd = cwd.is_none();
+                    match t.ws.open_drawer(cwd) {
+                        Some(id) => Outcome::Opened { id, missing_cwd },
+                        None => Outcome::Noop,
+                    }
+                }
+            }
+        };
+        match outcome {
+            Outcome::Noop => {}
+            Outcome::Closed => {
+                mark_ui_dirty!(self.ui_dirty);
+            }
+            Outcome::Opened { id, missing_cwd } => {
+                mark_ui_dirty!(self.ui_dirty);
+                // F286:真开出了格子才交出 egui 的键盘焦点。
+                if let Some(ctx) = &egui_ctx {
+                    ctx.memory_mut(|m| m.stop_text_input());
+                }
+                if missing_cwd {
+                    self.ui
+                        .set_error("抽屉未能定位到父分屏的目录,停在登录目录".to_string());
+                }
+                self.spawn_fresh_panes(vec![id], focus_host_ix);
+            }
+        }
     }
 
     /// F278:搜索条开着时,Esc 直接关掉它。
@@ -12206,12 +12311,18 @@ impl ApplicationHandler<UserEvent> for App {
                 // `automation::pending_for_extra_pane`)。模板是连接那一刻存下的,
                 // 这里不回头查库 —— 连上之后用户可能已经改了配置。
                 if let Some(sink) = attached {
-                    let plan = self
+                    let tab = self
                         .tabs
                         .by_generation(generation)
-                        .and_then(|tab| tab.content.as_terminal())
-                        .and_then(|t| t.automation_template.as_ref())
-                        .and_then(crate::automation::pending_for_extra_pane);
+                        .and_then(|tab| tab.content.as_terminal());
+                    let tpl = tab.and_then(|t| t.automation_template.as_ref());
+                    // F290:抽屉只发一句 `cd`,不跑登录后命令(`pending_for_drawer`
+                    // 的文档)。判据是 `ws.drawer(id)`——抽屉标记在 `open_drawer`
+                    // 那一帧就写好了,不会后发先至。
+                    let plan = match tab.and_then(|t| t.ws.drawer(id)) {
+                        Some(d) => crate::automation::pending_for_drawer(d.cwd.as_deref(), tpl),
+                        None => tpl.and_then(crate::automation::pending_for_extra_pane),
+                    };
                     self.on_pane_ready(generation, id, sink, plan, true);
                 }
                 mark_ui_dirty!(self.ui_dirty);
@@ -12820,6 +12931,11 @@ impl ApplicationHandler<UserEvent> for App {
         // F240/T8:从终端区建项目同样必须在分流之前截 —— `N` 走到下面会被
         // 编码进 PTY,给远端 shell 写一个字母。
         if self.project_hotkey_event(&event) {
+            return;
+        }
+        // F290/T8:命令抽屉热键同样必须在分流之前截 —— `` Ctrl+` `` 走到下面
+        // 会被编成控制字符写给远端。
+        if self.drawer_hotkey_event(&event) {
             return;
         }
         // F278:搜索条开着时 Esc 同样必须在分流之前截——理由见
@@ -31738,5 +31854,134 @@ mod tests {
                 "project_lamps_have_audience 调用点缺了实参 {expected:?},实际参数段:{params:?}"
             );
         }
+    }
+
+    // ---- F290 命令抽屉 ----
+
+    /// **接线守护 / T8**:`` Ctrl+` `` 必须在输入分流**之前**被截走 —— 走到
+    /// 下面会被 `encode_char` 编成控制字符写给远端。与 files/focus/project
+    /// 三条同构。
+    ///
+    /// 自证会变红:把 `window_event` 里那句 `if self.drawer_hotkey_event(&event)`
+    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
+    #[test]
+    fn drawer_shortcut_is_swallowed_before_the_input_routing() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("fn window_event(")
+            .nth(1)
+            .expect("找不到 window_event 的定义");
+        let hotkey = after
+            .find("self.drawer_hotkey_event(&event)")
+            .expect("window_event 里没调 drawer_hotkey_event —— Ctrl+` 会被编码进 PTY 写给远端");
+        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
+        assert!(hotkey < routing, "drawer_hotkey_event 排在了输入分流之后");
+    }
+
+    /// F290:热键判定只认 `Ctrl` + 反引号(`~` 是同一个键按了 Shift 的布局),
+    /// 弹窗开着不响应。
+    ///
+    /// 自证会变红:把 `drawer_hotkey_event` 里 `'`'` 改成别的字符,或删掉
+    /// `self.modal_open()` 那一项。
+    #[test]
+    fn the_drawer_hotkey_is_ctrl_backtick_and_yields_to_modals() {
+        let body = strip_comments(body_of(prod_src(), "fn drawer_hotkey_event("));
+        assert!(
+            body.contains(concat!("Key::Char('`'", " | '~')")),
+            "键不是反引号"
+        );
+        assert!(
+            body.contains("self.modal_open()"),
+            "弹窗开着也响应 —— 会在输入框里打字时突然分屏"
+        );
+        assert!(body.contains("!mods.ctrl"), "没要求 Ctrl");
+        assert!(body.contains("mods.shift"), "没排除 Shift");
+    }
+
+    /// F290:开抽屉这一路必须做全四件事,少一件都是静默坏:
+    /// ① `focus_host_ix` 在 `open_drawer` **之前**取(F255:改树会挪焦点);
+    /// ② `drawer_cwd` 算目录(回退判据在纯函数里);
+    /// ③ 真开出来才 `stop_text_input()`(F286);
+    /// ④ 走 `spawn_fresh_panes` 开 channel(唯一的分屏开口)。
+    ///
+    /// 自证会变红:把 `apply_drawer_hotkey` 里 `focused_pane_host_ix()` 那句挪到
+    /// `open_drawer(` 之后;或把 `spawn_fresh_panes(` 换成别的。
+    #[test]
+    fn opening_a_drawer_captures_the_host_first_then_spawns_through_the_split_path() {
+        let body = strip_comments(body_of(prod_src(), "fn apply_drawer_hotkey("));
+        let host_at = body
+            .find("focused_pane_host_ix()")
+            .expect("没取 focus_host_ix");
+        let open_at = body.find("open_drawer(").expect("没调 open_drawer");
+        assert!(host_at < open_at, "F255:host_ix 要在改树之前取");
+        assert!(
+            body.contains(concat!("drawer::", "drawer_cwd(")),
+            "目录回退没走纯函数"
+        );
+        assert!(
+            body.contains("stop_text_input()"),
+            "F286:没交出 egui 键盘焦点"
+        );
+        assert!(body.contains("spawn_fresh_panes("), "没走唯一的分屏开口");
+        assert!(body.contains("close_drawer("), "关那一路没接");
+    }
+
+    /// F290:`PaneOpened` 里抽屉拿的是 `cd` 计划,不是登录后命令。
+    ///
+    /// 自证会变红:把 `PaneOpened` 臂里 `pending_for_drawer(` 那句删掉。
+    ///
+    /// `PaneOpened` 是三个以上字段的变体,rustfmt 强制拆成多行,`arm_of` 假设
+    /// 的单行 `"模式 => {"` 找不到 —— 这里改用 `multiline_arm_of`(F219 就是
+    /// 为这类变体开的口子)。
+    #[test]
+    fn a_freshly_opened_drawer_gets_the_cd_plan_not_the_login_commands() {
+        let body = strip_comments(multiline_arm_of(
+            prod_src(),
+            concat!("UserEvent::", "PaneOpened {"),
+        ));
+        assert!(
+            body.contains(concat!("pending_for_", "drawer(")),
+            "抽屉没拿 cd 计划"
+        );
+        assert!(
+            body.contains(concat!("pending_for_", "extra_pane")),
+            "普通分屏那条被弄丢了"
+        );
+    }
+
+    /// F290/F37:存现场时抽屉要剪掉 —— 树和焦点都取 `tree_without_drawers()`,
+    /// 不许一处取剪过的、另一处取原树(焦点下标会指到一个不存在的叶子)。
+    ///
+    /// 自证会变红:把 `snapshot_tabs_of` 里 `tree_without_drawers()` 换回
+    /// `t.ws.tree()` / `t.ws.focus()`。
+    #[test]
+    fn the_layout_snapshot_is_taken_from_the_tree_without_drawers() {
+        let body = strip_comments(body_of(prod_src(), "fn snapshot_tabs_of("));
+        assert!(body.contains("tree_without_drawers()"), "存盘没剪抽屉");
+        assert!(!body.contains("t.ws.tree()"), "还有地方直接读原树");
+        assert!(!body.contains("t.ws.focus()"), "焦点还在读原值");
+    }
+
+    /// F290:标题条的「抽屉」段接的是 `ws.is_drawer`,不是写死的 `false`
+    /// (`title_text` 的纯函数测试对这一处接线是盲的)。
+    ///
+    /// 自证会变红:把 `TitleView {` 构造点的 `drawer: ws.is_drawer(g.id)` 改成
+    /// `drawer: false`。
+    #[test]
+    fn the_title_bar_asks_the_workspace_whether_the_pane_is_a_drawer() {
+        let src = prod_src();
+        let at = src
+            .find(concat!("TitleView", " {"))
+            .expect("找不到 TitleView 构造点");
+        // `brace_balanced_arm` 的深度计数要从**含左花括号**的位置起算(同
+        // `body_of` 的用法)——从左花括号**之后**起算的话,深度在第一个内层
+        // 闭包(`host: ws.pane(g.id).and_then(|p| { .. })`)收尾时就提前归零,
+        // 截不到 `drawer` 字段所在的结构体收尾处。
+        let brace_at = at + src[at..].find('{').expect("TitleView 构造点没有花括号");
+        let lit = brace_balanced_arm(&src[brace_at..]);
+        assert!(
+            lit.contains(concat!("drawer: ws.", "is_drawer(")),
+            "标题条的 drawer 没接到 Workspace"
+        );
     }
 }
