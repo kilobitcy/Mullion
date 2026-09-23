@@ -143,6 +143,34 @@ pub fn pending_for_extra_pane(tpl: &ResolvedAutomation) -> Option<PendingAutomat
     })
 }
 
+/// F290:抽屉 pane 该跑什么 —— **只有一句 `cd`**,不跑登录后命令、不 export。
+/// 抽屉是用户临时敲系统命令的地方,登录后命令那套(启动服务、attach)全不该
+/// 在这儿再来一遍。`None` = 没定位到目录,什么都不发。
+///
+/// 延时与超时取模板(与分屏那条同源);标签没有模板时用内置默认。
+pub fn pending_for_drawer(
+    cwd: Option<&[u8]>,
+    tpl: Option<&ResolvedAutomation>,
+) -> Option<PendingAutomation> {
+    let cwd = cwd?;
+    let mut bytes = b"cd ".to_vec();
+    bytes.extend(mullion_ssh::exec::shell_quote(cwd));
+    bytes.push(b'\n');
+    let delay_ms = tpl.map_or(mullion_store::DEFAULT_INITIAL_DELAY_MS, |t| {
+        t.initial_delay_ms
+    });
+    Some(PendingAutomation {
+        steps: vec![Step {
+            delay: Duration::from_millis(u64::from(delay_ms)),
+            bytes,
+        }],
+        ready_timeout_ms: tpl.map_or(mullion_store::DEFAULT_READY_TIMEOUT_MS, |t| {
+            t.ready_timeout_ms
+        }),
+        gate: None,
+    })
+}
+
 /// F223:**打开项目**时那块 pane 该跑什么。`None` = 项目算不出可用的 tmux 名。
 ///
 /// 与 [`pending_for_extra_pane`] 只差一件事,但那件事是整个 F223 的命根子:
@@ -453,9 +481,9 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    // 注意路径:四个 `DEFAULT_*` 常量**没有**在 `mullion_store` 顶层 re-export
-    // （lib.rs:17-19 只导出了 build_plan / AutomationCommand / AutomationPrefs /
-    // EnvVar / ResolvedAutomation / Step / TmuxChoice），必须走 `automation::`。
+    // 注意路径:`DEFAULT_INTER_DELAY_MS` 没有在 `mullion_store` 顶层 re-export,
+    // 仍要走 `automation::`;另两个(`DEFAULT_INITIAL_DELAY_MS` /
+    // `DEFAULT_READY_TIMEOUT_MS`)F290 为抽屉测试加了顶层 re-export,两条路径都能用。
     use mullion_store::automation::{
         DEFAULT_INITIAL_DELAY_MS, DEFAULT_INTER_DELAY_MS, DEFAULT_READY_TIMEOUT_MS,
     };
@@ -1356,6 +1384,45 @@ mod tests {
             start.elapsed(),
             Duration::from_millis(300),
             "ready 之后只该等计划自己的 300ms,多等一次就是延时翻倍"
+        );
+    }
+
+    // ---- F290 命令抽屉 ---------------------------------------------------
+
+    /// F290:抽屉只发一句 `cd '<目录>'\n`,目录走单引号转义(`exec::shell_quote`,
+    /// 字节级),延时取模板的 `initial_delay_ms`(与分屏同款:等 MOTD 打完)。
+    ///
+    /// 自证会变红:把 `shell_quote` 拿掉直接拼路径(带单引号的目录那条红);
+    /// 或把 `\n` 删掉。
+    #[test]
+    fn a_drawer_plan_is_a_single_quoted_cd() {
+        let tpl = ResolvedAutomation {
+            initial_delay_ms: 450,
+            ready_timeout_ms: 9_000,
+            ..bare()
+        };
+        let plan = pending_for_drawer(Some(b"/srv/it's"), Some(&tpl)).expect("有目录就有计划");
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].bytes, b"cd '/srv/it'\\''s'\n".to_vec());
+        assert_eq!(plan.steps[0].delay, Duration::from_millis(450));
+        assert_eq!(plan.ready_timeout_ms, 9_000);
+        assert!(plan.gate.is_none());
+    }
+
+    /// 没定位到目录 → 没有计划(连 oneshot 都不建);没有模板 → 用内置默认延时。
+    ///
+    /// 自证会变红:`cwd` 为 `None` 时返回一句空 `cd`。
+    #[test]
+    fn a_drawer_without_a_directory_has_no_plan_and_no_template_means_defaults() {
+        assert!(pending_for_drawer(None, None).is_none());
+        let plan = pending_for_drawer(Some(b"/tmp"), None).unwrap();
+        assert_eq!(
+            plan.steps[0].delay,
+            Duration::from_millis(u64::from(mullion_store::DEFAULT_INITIAL_DELAY_MS))
+        );
+        assert_eq!(
+            plan.ready_timeout_ms,
+            mullion_store::DEFAULT_READY_TIMEOUT_MS
         );
     }
 }

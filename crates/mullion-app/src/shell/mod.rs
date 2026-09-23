@@ -3,6 +3,7 @@
 
 pub mod dial_ledger;
 pub mod dial_plan;
+pub mod drawer;
 pub mod input_route;
 pub mod layout_snapshot;
 pub mod restore_plan;

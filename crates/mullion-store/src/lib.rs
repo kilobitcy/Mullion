@@ -30,7 +30,7 @@ pub mod vault;
 pub use automation::{
     attach_only_command, build_plan, build_plan_attach_measured, build_plan_reattach,
     build_plan_without_tmux, tmux_session_name, AutomationCommand, AutomationPrefs, EnvVar,
-    ResolvedAutomation, Step, TmuxChoice,
+    ResolvedAutomation, Step, TmuxChoice, DEFAULT_INITIAL_DELAY_MS, DEFAULT_READY_TIMEOUT_MS,
 };
 pub use cloud::{
     fingerprint as cloud_fingerprint, load as load_cloud_config, save as save_cloud_config,
