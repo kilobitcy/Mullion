@@ -21204,19 +21204,16 @@ mod tests {
         );
     }
 
-    /// `apply_files_hotkey` 的函数体(不含它上面的文档注释)。
+    /// `apply_files_hotkey` 的函数体。下面两条 F243 守护共用。
     ///
-    /// 下面两条 F243 守护共用。切到**下一个 `/// ` 开头的行**为止 ——
-    /// 不切的话「Close 那条臂里有没有撤销」会被后面几百行里别处的
-    /// `cancel_pending_reveal` 蹭绿。
+    /// **必须真的截在函数末尾**:不截的话「Close 那条臂里有没有撤销」会被后面
+    /// 几百行里别处的 `cancel_pending_reveal` 蹭绿。
+    ///
+    /// F289 之前这里是「切到下一个 `/// ` 开头的行」—— 拿**注释的存在**当边界,
+    /// 而 `prod_src` 现在会把注释剥掉,边界就没了(实测直接 panic)。改用
+    /// `body_of` 的花括号配平:既不依赖注释,截得也更准。
     fn files_hotkey_body() -> &'static str {
-        let src = prod_src();
-        let at = src
-            .find("fn apply_files_hotkey(&mut self) {")
-            .expect("apply_files_hotkey 不见了,这两条测试的锚点失效了");
-        let rest = &src[at..];
-        let end = rest.find("\n    /// ").expect("函数体后面没有下一项?");
-        &rest[..end]
+        body_of(prod_src(), "fn apply_files_hotkey(")
     }
 
     /// F243 **接线守护**:两道前置门必须真的接在 `Ctrl+Shift+B` 上,而且喂
@@ -25058,6 +25055,11 @@ mod tests {
     ///
     /// 只剥**整行**注释:行尾注释剥掉需要认字符串字面量,得不偿失,而把判据
     /// 写成整行注释里不会出现的形状是更省事的做法。
+    ///
+    /// F289 之后 [`prod_src`] 自己就剥过了,所以包在它的切片外面的那几十处
+    /// 调用现在是冗余的 —— 幂等、零成本,留着还能在有人把 `prod_src` 改回去
+    /// 时兜一层底。这个函数仍然是**别的源**(`session_pump.rs` /
+    /// `shell/workspace/mod.rs` 等自己 `include_str!` 的那些)唯一的剥法。
     fn strip_comments(body: &str) -> String {
         body.lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -25065,14 +25067,31 @@ mod tests {
             .join("\n")
     }
 
-    /// `app.rs` 去掉测试模块之后的那一半。源码切片断言**必须**先切掉测试模块,
-    /// 否则测试自己写的那句字面量就能把断言喂饱,恒绿。
+    /// `app.rs` 去掉测试模块、**并且剥掉整行注释**之后的那一半。
+    ///
+    /// 切测试模块的理由:否则测试自己写的那句字面量就能把断言喂饱,恒绿。
+    ///
+    /// **剥注释的理由**(F289):本文件一百多条源码切片断言全部从这里切,而被扫
+    /// 的那段代码上方的文档注释里,往往正好写着断言要找的那几个词 —— 它们本来
+    /// 就是在解释这件事。2026-09-23 实证:把 `mutate_settings` 里的
+    /// `self.apply_font();` 删掉、只在注释里留下这串字,
+    /// `writing_settings_always_applies_the_merged_result` **照绿**,
+    /// 而真实后果是设置弹窗点确定后字体不生效。
+    ///
+    /// 剥在**切片之前**,所以 `body_of` / `arm_of` / `multiline_arm_of` 的每一个
+    /// 调用点都自动受益,不存在「这条忘了剥」。顺带还治了一个更隐蔽的:
+    /// `brace_balanced_arm` 按花括号配平,而注释里的花括号原本会把配平带偏。
+    ///
+    /// 自证会变红:把 `strip_comments` 那一层去掉,上面那条实证立刻复现。
     fn prod_src() -> &'static str {
-        let src = include_str!("app.rs");
-        let (prod, _) = src
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .expect("app.rs 的测试模块分界变了,所有源码切片断言的锚点都失效了");
-        prod
+        static PROD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PROD.get_or_init(|| {
+            let src = include_str!("app.rs");
+            let (prod, _) = src
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("app.rs 的测试模块分界变了,所有源码切片断言的锚点都失效了");
+            strip_comments(prod)
+        })
     }
 
     /// F247:写完设置**一定**会把它施加出去,而且换进来的是**合并后**那份。
