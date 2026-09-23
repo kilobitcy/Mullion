@@ -51,10 +51,12 @@ pub fn show(
             // 没有终端跟它抢键盘。
             ui.vertical_centered(|ui| {
                 let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut ui_state.launcher_search)
-                        .hint_text(crate::theme::hint_text(t, "搜索项目名 / 目录 / 节点"))
-                        .desired_width(w),
+                let r = crate::ui::search_box::search_box(
+                    ui,
+                    &mut ui_state.launcher_search,
+                    egui::Id::new("launcher_search"),
+                    crate::theme::hint_text(t, "搜索项目名 / 目录 / 节点"),
+                    w,
                 );
                 crate::ui::annotate::mark(ui.ctx(), "启动页/搜索框", r.rect);
             });

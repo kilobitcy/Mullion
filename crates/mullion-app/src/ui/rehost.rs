@@ -246,10 +246,12 @@ pub fn show(
                         egui::RichText::new("这块分屏要换到哪个节点").color(theme::c32(t.fg_muted)),
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut d.filter)
-                            .hint_text("搜索名称或地址")
-                            .desired_width(field_w),
+                    crate::ui::search_box::search_box(
+                        ui,
+                        &mut d.filter,
+                        egui::Id::new("rehost_search"),
+                        "搜索名称或地址",
+                        field_w,
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
                     let recents = recent(sessions, &d.filter);

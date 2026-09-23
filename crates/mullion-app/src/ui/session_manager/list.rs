@@ -543,10 +543,12 @@ pub(super) fn show(
         .pending_delete
         .and_then(|id| super::tunnel_list::running_note(id, tunnels, tunnel_states));
     // 搜索框
-    let search_resp = ui.add(
-        egui::TextEdit::singleline(&mut ui_state.search)
-            .hint_text(theme::hint_text(t, "搜索名称 / 主机 / 标签"))
-            .desired_width(f32::INFINITY),
+    let search_resp = crate::ui::search_box::search_box(
+        ui,
+        &mut ui_state.search,
+        egui::Id::new("session_manager_search"),
+        theme::hint_text(t, "搜索名称 / 主机 / 标签"),
+        f32::INFINITY,
     );
     annotate::mark(ui.ctx(), "会话管理器/左栏/搜索框", search_resp.rect);
     ui.add_space(crate::ui::metrics::SP_S);

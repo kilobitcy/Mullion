@@ -1131,11 +1131,12 @@ pub fn show(
     // F278:搜索条。画在路径条下面一行,`None` 时一点高度都不占。
     if let Some(f) = find.as_mut() {
         ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut f.buf)
-                    .id(find_edit_id(id, generation))
-                    .hint_text("文件名(模糊匹配,回车开始)")
-                    .desired_width(ui.available_width() * 0.5),
+            let resp = crate::ui::search_box::search_box(
+                ui,
+                &mut f.buf,
+                find_edit_id(id, generation),
+                "文件名(模糊匹配,回车开始)",
+                ui.available_width() * 0.5,
             );
             // **只在刚打开那一刻请求一次焦点**。无条件每帧 `request_focus()`
             // 会让它跟路径条的输入框互抢,先进去的那个永远退不出来。

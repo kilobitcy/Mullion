@@ -183,10 +183,12 @@ fn list_column(
         // 搜索框独占一整行:原来它旁边挂着「添加」按钮,只剩 96px,一个路径
         // 片段都打不下。
         let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
-        let search = ui.add(
-            egui::TextEdit::singleline(&mut ui_state.project_search)
-                .hint_text(crate::theme::hint_text(t, "搜索项目名 / 目录 / 节点"))
-                .desired_width(w),
+        let search = crate::ui::search_box::search_box(
+            ui,
+            &mut ui_state.project_search,
+            egui::Id::new("project_manager_search"),
+            crate::theme::hint_text(t, "搜索项目名 / 目录 / 节点"),
+            w,
         );
         crate::ui::annotate::mark(ui.ctx(), "项目管理器/左栏/搜索框", search.rect);
         ui.add_space(SP_S);

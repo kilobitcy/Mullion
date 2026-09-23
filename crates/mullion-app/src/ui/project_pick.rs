@@ -133,10 +133,12 @@ pub fn show(
                         egui::RichText::new("这块分屏要切到哪个项目").color(theme::c32(t.fg_muted)),
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut d.filter)
-                            .hint_text("搜索项目名 / 目录 / 节点")
-                            .desired_width(field_w),
+                    crate::ui::search_box::search_box(
+                        ui,
+                        &mut d.filter,
+                        egui::Id::new("project_pick_search"),
+                        "搜索项目名 / 目录 / 节点",
+                        field_w,
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
                     // F257:同 launcher —— 恒 `Tab::Active`,搜索穿透归档。

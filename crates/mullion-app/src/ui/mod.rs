@@ -28,6 +28,7 @@ pub mod project_pick;
 pub mod project_row;
 pub mod rehost;
 pub mod restored;
+pub mod search_box;
 pub mod session_manager;
 pub mod settings;
 pub mod shortcuts;
