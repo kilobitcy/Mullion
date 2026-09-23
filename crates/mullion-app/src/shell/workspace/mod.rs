@@ -372,11 +372,6 @@ impl Workspace {
         // (单屏 + 抽屉点「两栏」该新开 1 块,不是把抽屉当现成的第二块)。
         let plan = plan_preset(preset, &self.statuses_without_drawers());
         for id in &plan.close {
-            // 父 pane 被这次预设关掉了,它的抽屉跟着一起走。
-            if let Some(d) = self.drawer_of(*id) {
-                self.drawers.retain(|x| x.id != d);
-                self.drop_pane_state(d);
-            }
             self.drop_pane_state(*id);
         }
         let mut ids = plan.keep;
@@ -387,7 +382,8 @@ impl Workspace {
             fresh.push(id);
         }
         self.tree = preset_tree(preset, &ids);
-        // F290:重建完把幸存的抽屉挂回各自父 pane 底下。
+        // F290:重建完把幸存的抽屉挂回各自父 pane 底下;被关掉的父 pane 的
+        // 抽屉也在这里一并收掉(父不在 → 移标记 + 关 channel),不另写级联。
         self.reattach_drawers();
         self.focus = next_focus(self.focus, &ids);
         // F286:新开了格子就把焦点交给**前序第一块新格子**。点布局按钮是用户
@@ -1966,8 +1962,17 @@ mod tests {
     /// 父 pane 被关 → 抽屉一起关(它是附属物)。之后 F241 重排照旧,但重排的
     /// 计数**不含抽屉**。
     ///
-    /// 自证会变红:删掉 `close_pane` 里级联关抽屉那一段 —— 抽屉会被兄弟顶替
-    /// 成一块孤儿 pane,`pane_count` 是 2 不是 1。
+    /// **这条落在 ≤3 块的重排窗口内**:`close_pane` 自己的级联和
+    /// `reattach_drawers` 父 pane 不在时的清理分支两道防线都在场,单删任一道
+    /// 都有另一道兜底(已各自验证过,不是空话)。级联单独失效由
+    /// `outside_the_rearrange_window_the_cascade_is_the_only_thing_that_closes_the_drawer`
+    /// 钉住(窗口外没有重排、没有第二道防线);`reattach_drawers` 清理分支单独
+    /// 失效由 `a_preset_that_closes_the_parent_closes_its_drawer_too` 钉住
+    /// (`apply_preset` 路径压根没写级联)。
+    ///
+    /// 自证会变红:同时删掉 `close_pane` 里级联关抽屉那一段**和**
+    /// `reattach_drawers` 里父 pane 不在时的清理分支 —— 单删其中一处,这条
+    /// 测试仍绿(另一道防线兜住了)。
     #[test]
     fn closing_the_parent_takes_its_drawer_with_it() {
         let (mut ws, _) = ws_with(2);
@@ -1981,6 +1986,33 @@ mod tests {
         assert!(ws.pane(d).is_none(), "抽屉的 PaneState 也要丢");
         assert_eq!(*dprobe.closes.lock().unwrap(), 1);
         assert!(ws.drawers().is_empty());
+    }
+
+    /// 父 pane 被关而**剩余数量在 F241 重排窗口之外**(≥4 块,不重排)时,级联
+    /// 关抽屉是唯一一条清理路径 —— `reattach_drawers` 根本不会跑。五块横排,
+    /// 5 号有抽屉,关掉 5 号:抽屉必须随父一起没(树上没、`PaneState` 没、
+    /// channel 关过、标记表空)。
+    ///
+    /// 自证会变红:删掉 `close_pane` 里 `if let Some(d) = self.drawer_of(id)`
+    /// 那段级联 —— 抽屉会被兄弟顶替成一块孤儿 pane,`pane_count` 是 5 不是 4,
+    /// 且它的 channel 永远关不上(F140)。
+    #[test]
+    fn outside_the_rearrange_window_the_cascade_is_the_only_thing_that_closes_the_drawer() {
+        let (mut ws, _) = ws_with(5);
+        ws.set_focus(PaneId(5));
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, dprobe) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        assert!(ws.close_pane(PaneId(5)));
+        assert_eq!(ws.pane_count(), 4);
+        assert!(!leaves(ws.tree()).contains(&d), "抽屉还挂在树上");
+        assert!(ws.pane(d).is_none());
+        assert!(ws.drawers().is_empty());
+        assert_eq!(
+            *dprobe.closes.lock().unwrap(),
+            1,
+            "F140:抽屉的 channel 要关"
+        );
     }
 
     /// 关掉**别的** pane 触发 F241 重排时,抽屉先摘出去、重排完再挂回父 pane
@@ -2044,7 +2076,12 @@ mod tests {
 
     /// 预设把抽屉的父 pane 关掉了(三块 → 单屏,3 号有抽屉)→ 抽屉随父一起关。
     ///
-    /// 自证会变红:删掉 `apply_preset` 里对 `plan.close` 级联关抽屉那一段。
+    /// `apply_preset` 自己不写级联:`reattach_drawers()` 在 `preset_tree` 重建之后
+    /// 无条件跑一遍,父 pane 不在树上的抽屉走它的清理分支(移标记 + 关 channel),
+    /// 这条测试钉的正是那个分支。
+    ///
+    /// 自证会变红:把 `reattach_drawers` 里父 pane 不在时的清理分支删掉
+    /// (抽屉留在 `panes` 里、标记不清、channel 不关)。
     #[test]
     fn a_preset_that_closes_the_parent_closes_its_drawer_too() {
         let (mut ws, _) = ws_with(3);
