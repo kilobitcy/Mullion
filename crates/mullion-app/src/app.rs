@@ -25087,9 +25087,27 @@ mod tests {
         static PROD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         PROD.get_or_init(|| {
             let src = include_str!("app.rs");
-            let (prod, _) = src
+            let (prod, rest) = src
                 .split_once("\n#[cfg(test)]\nmod tests {")
                 .expect("app.rs 的测试模块分界变了,所有源码切片断言的锚点都失效了");
+            // **剥多了也是静默假绿**,而且比剥少了更毒:取的是测试模块**前面**
+            // 那一段,谁要是把新代码加在测试模块后面,这一百多条切片守护会同时
+            // 对它失明 —— 编译不报、clippy 不报、跑起来全绿。同形状在 F287 的
+            // `tests/` 那边实证过(末尾加一个裸搜索框,两条对账守护全绿)。
+            //
+            // 判据按**行首缩进**,不按花括号配平:测试模块里的字面量带着
+            // `=> {{` 这种不配对的花括号(实测会让配平永不归零,断言静默失效)。
+            // 顶层 item 一律顶格,所以模块后面顶格的东西只该有它自己那个 `}`。
+            let after: Vec<&str> = rest
+                .lines()
+                .filter(|l| !l.is_empty() && !l.starts_with(char::is_whitespace))
+                .collect();
+            assert_eq!(
+                after,
+                ["}"],
+                "app.rs 的测试模块必须是文件的最后一项,否则排在它后面的代码\
+                 对全部源码切片守护都是隐形的"
+            );
             strip_comments(prod)
         })
     }
