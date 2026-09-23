@@ -16,6 +16,9 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+use common::prod_lines;
+
 /// 全库六个筛选输入框 → (文件, 它筛的是什么)。
 ///
 /// 第二栏写「这个框筛什么」而不是「它在哪」:路径本身已经说了在哪,
@@ -59,22 +62,6 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// 只留生产代码 —— 测试夹具里有大量裸 `TextEdit`,算进来这条对账从第一天
-/// 起就对不上。
-fn prod(src: &str) -> &str {
-    src.split("#[cfg(test)]").next().expect("源码切歪了")
-}
-
-/// 去掉行注释。**这一步不能省**:本仓库的注释密度很高,判据关键词
-/// (`search_box`、「搜索」)在注释里出现几十次,不剥掉的话这两条对账
-/// 一边假绿(注释顶替了真调用)一边假红(注释里的「搜索」被当成违规)。
-fn strip_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(i) => &line[..i],
-        None => line,
-    }
-}
-
 fn rel(p: &Path) -> String {
     p.strip_prefix(src_dir())
         .expect("路径不在 src 下")
@@ -91,10 +78,7 @@ fn callers() -> Vec<String> {
         .filter(|p| !p.ends_with("ui/search_box.rs"))
         .filter(|p| {
             let src = std::fs::read_to_string(p).expect("读源码失败");
-            prod(&src)
-                .lines()
-                .map(strip_comment)
-                .any(|l| l.contains("search_box("))
+            prod_lines(&src).iter().any(|l| l.contains("search_box("))
         })
         .map(|p| rel(p))
         .collect();
@@ -139,8 +123,7 @@ fn nobody_hand_rolls_a_second_search_box() {
     let mut bad = Vec::new();
     for p in &files {
         let src = std::fs::read_to_string(p).expect("读源码失败");
-        for (i, line) in prod(&src).lines().enumerate() {
-            let line = strip_comment(line);
+        for (i, line) in prod_lines(&src).iter().enumerate() {
             let Some(rest) = line.split_once(".hint_text(").map(|(_, r)| r) else {
                 continue;
             };

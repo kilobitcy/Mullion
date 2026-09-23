@@ -27,6 +27,9 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+use common::prod_lines;
+
 /// 量哪几档窗口尺寸。
 ///
 /// 1024×600 是上网本/远程桌面小窗的常见下限;1366×768 是笔记本主流;
@@ -260,21 +263,6 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// 只留生产代码 —— `#[cfg(test)]` 里也有一堆 `egui::Window::new(`
-/// (`dismiss.rs` 的夹具就开了六个),算进来这条对账从第一天起就对不上。
-fn prod(src: &str) -> &str {
-    src.split("#[cfg(test)]").next().expect("源码切歪了")
-}
-
-/// 去掉行注释:本仓库注释里提 `egui::Window::new(` 的地方有十几处
-/// (F239 那条约定每个弹窗文件都抄了一遍),不去掉就会把注释当成真弹窗。
-fn strip_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(i) => &line[..i],
-        None => line,
-    }
-}
-
 /// F285 ③:名单必须罩住全库每一个 `egui::Window`。
 ///
 /// 自证会变红:把 `LEDGER` 里 `ui/unlock.rs` 那条删掉(第一段红);
@@ -288,9 +276,8 @@ fn every_dialog_in_the_tree_is_either_guarded_or_exempt_with_a_reason() {
     let mut found: Vec<(String, usize)> = Vec::new();
     for p in &files {
         let src = std::fs::read_to_string(p).expect("读源码失败");
-        let n = prod(&src)
-            .lines()
-            .map(strip_comment)
+        let n = prod_lines(&src)
+            .iter()
             .map(|l| l.matches("egui::Window::new(").count())
             .sum::<usize>();
         if n > 0 {
