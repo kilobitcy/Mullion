@@ -728,6 +728,25 @@ impl Workspace {
                 let _ = p.pty.write(out);
             }
         }
+        self.reap_dead_drawers();
+    }
+
+    /// F290:链路死了的抽屉直接关掉,不排队重连(设计决策:裸 shell、用完即扔)。
+    /// 判据**只认 `Reconnecting`**:`Disconnected` 是用户自己敲的 `exit`,
+    /// 那块留给用户处置。
+    fn reap_dead_drawers(&mut self) {
+        let dead: Vec<PaneId> = self
+            .drawers
+            .iter()
+            .filter(|d| {
+                self.pane(d.id)
+                    .is_some_and(|p| p.status == PaneStatus::Reconnecting)
+            })
+            .map(|d| d.id)
+            .collect();
+        for id in dead {
+            self.close_drawer(id);
+        }
     }
 
     /// 所有 pane 里最早的那个同步块超时点(T2)。app 拿它排一次 `WaitUntil`。
@@ -2113,5 +2132,48 @@ mod tests {
             DrawerToggle::Close(d),
             "焦点在有抽屉的父 pane 上"
         );
+    }
+
+    /// F290:抽屉是裸 shell,不参与 F128 接回 —— 链路一断(状态刚变成
+    /// `Reconnecting`)就直接关掉。同一帧里父 pane 照常进入 `Reconnecting`
+    /// 等重连。
+    ///
+    /// 自证会变红:删掉 `pump` 末尾 `reap_dead_drawers()` 那一句。
+    #[test]
+    fn a_drawer_whose_link_died_is_closed_instead_of_queued_for_reconnect() {
+        let (mut ws, probes) = ws_with(1);
+        ws.link_alive = |_, _| false;
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, dprobe) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        drop(dprobe.tx); // 抽屉的 rx 关掉 = 链路死了
+        drop(probes.into_iter().next().unwrap().tx);
+        ws.pump(0);
+        assert!(ws.pane(d).is_none(), "抽屉该被关掉");
+        assert!(ws.drawers().is_empty());
+        assert_eq!(*ws.tree(), Node::Leaf(PaneId(1)));
+        assert_eq!(
+            ws.pane(PaneId(1)).unwrap().status,
+            PaneStatus::Reconnecting,
+            "父 pane 照常等重连"
+        );
+    }
+
+    /// 用户在抽屉里敲 `exit`(链路活着,`Disconnected`)→ 抽屉**留着**,
+    /// 由用户按热键或 × 关。
+    ///
+    /// 自证会变红:把 `reap_dead_drawers` 的判据从 `Reconnecting` 放宽成
+    /// `!= Live`。
+    #[test]
+    fn a_drawer_the_user_exited_stays_until_they_close_it() {
+        let (mut ws, _) = ws_with(1);
+        ws.link_alive = |_, _| true;
+        let d = ws.open_drawer(None).unwrap();
+        let (dp, dprobe) = fake_pane(d.0);
+        ws.attach_pane(dp);
+        drop(dprobe.tx);
+        ws.pump(0);
+        assert_eq!(ws.pane(d).unwrap().status, PaneStatus::Disconnected);
+        assert_eq!(ws.drawer_of(PaneId(1)), Some(d));
     }
 }
