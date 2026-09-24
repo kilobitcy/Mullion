@@ -427,6 +427,16 @@
   控件压根不产生 Shape,扫 `FullOutput::shapes` 找最右边界的测量对它失明(对**部分**
   越界、只被削掉半个字的仍有效)。撑大 clip_rect 只是为了让测量拿到「控件本该画在哪」,
   不代表生产代码的裁剪被关掉。
+- **测试 harness 的假屏与生产的裁剪是两个方向相反的坑,同一条渲染断言两边都会静默失效**
+  (F295,`3abaa34` 就是被它咬过的真恒绿)。`RawInput::default()` 不设 `screen_rect` 时
+  egui 退到 10000pt 假屏、**不裁**——「错误提示画到一千点开外」这种位置错误在测试里全绿,
+  只有人眼看得见;反方向,生产代码里的 `ScrollArea::max_height` 会裁,**被裁掉的控件连
+  `Shape::Text` 都不生成**,于是「某段文字出现了」这类断言恒绿:`the_shortcut_table_is_grouped_into_sections`
+  第一版因内层 220pt ScrollArea 把第 6 节裁掉,自证变异「往标注模式加一条 Esc」照样全绿。
+  **规则**:写「文字出现/不出现」断言前先确认目标在视口内(或干脆别在生产里放内层滚动);
+  写「位置」断言用相对几何(错误行 y 小于第一行按钮 y),别信绝对坐标——假屏上什么都画得下。
+  **守护**:`ui::settings::tests::the_rejection_message_is_painted_above_the_table`、
+  `entering_capture_does_not_shift_the_description_column`。
 - **`TextEdit` 的内容和 hint 都会画到框外,`desired_width`/`clip_text` 拦不住。**
   singleline 走 `LayoutJob::simple_singleline`(`widgets/text_edit/builder.rs:514-521`),
   **忽略 `wrap_width`**,galley 永远按完整文本宽排版;再由 `builder.rs:726-734` 的
