@@ -29,15 +29,15 @@ pub const ROW_H: f32 = 48.0;
 /// 灯的槽位中心距行左边缘(逻辑点)。
 const LAMP_X: f32 = 14.0;
 /// 图标槽左边缘距行左边缘。紧挨着灯槽右沿。
-///
-/// F293:启动页会话列**复用**这一组常量对齐文字左沿(三列并排,会话列
-/// 与项目列的名字左沿错开 10 点比缺图难看),所以开成 `pub(crate)`。
-pub(crate) const ICON_X: f32 = 24.0;
+const ICON_X: f32 = 24.0;
 /// 图标边长。走 F61 那套 32px 纹理档(`paint_icon` 按 `side <= 32` 选档),
 /// 比 32 略小一点是为了在 48 点行高里上下留出呼吸。
-pub(crate) const ICON_SIDE: f32 = 28.0;
+const ICON_SIDE: f32 = 28.0;
 /// 文字左边界 = 图标槽右沿 + 一点呼吸。**恒定**:图标是「有就画、没有就
 /// 留空」的,有图标没图标的行文字左边界必须对齐(同灯槽那条理由)。
+///
+/// F293:启动页会话列**复用**它对齐文字左沿(三列并排,会话列与项目列的
+/// 名字左沿错开 10 点比缺图难看),所以开成 `pub(crate)`。
 pub(crate) const TEXT_X: f32 = ICON_X + ICON_SIDE + 6.0;
 /// 文字区距行右边缘的留白。
 pub(crate) const TEXT_RIGHT_PAD: f32 = 8.0;
@@ -62,6 +62,17 @@ pub const RUNNING_LABEL: &str = "正在跑";
 const RUNNING_SIZE: f32 = 11.0;
 /// 标签文字四周的内边距(左右各一份,上下各一份)。
 const RUNNING_PAD: egui::Vec2 = egui::vec2(6.0, 2.0);
+
+/// 一行的图标槽:左边缘 `ICON_X`、边长 `ICON_SIDE`、纵向居中。
+///
+/// **项目列(本文件)和启动页会话列(`launcher::sessions_column`)共用这一个
+/// 函数**:三列并排时两边的图标和名字左沿必须对齐,各写一份几何迟早漂。
+pub(crate) fn icon_slot(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(row.left() + ICON_X + ICON_SIDE / 2.0, row.center().y),
+        egui::vec2(ICON_SIDE, ICON_SIDE),
+    )
+}
 
 /// F266:亮灯行的底色。`t.ok` 压到极低不透明度 —— 再深就会跟选中态抢眼,
 /// 而「右栏正在编辑的是哪一条」是项目管理器左栏的主信道。
@@ -303,11 +314,7 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
 
     // 图标(F238)。**画在灯之后、文字之前**:槽位固定,有就画、没有就空着。
     if let Some(icon) = row.icon {
-        let slot = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + ICON_X + ICON_SIDE / 2.0, rect.center().y),
-            egui::vec2(ICON_SIDE, ICON_SIDE),
-        );
-        crate::ui::badge::paint_icon(p, slot, icon, row.icon_bg);
+        crate::ui::badge::paint_icon(p, icon_slot(rect), icon, row.icon_bg);
     }
 
     let text_left = rect.left() + TEXT_X;

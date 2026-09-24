@@ -360,21 +360,16 @@ fn sessions_column(
                     .rect_filled(rect, egui::Rounding::same(4.0), bg);
             }
             let p = ui.painter();
-            // F293:图标槽。几何与同屏的项目列**同源**(`project_row::ICON_X /
-            // ICON_SIDE / TEXT_X`)—— 三列并排,名字左沿必须对齐。槽位**恒定**:
+            // F293:图标槽。几何与同屏的项目列**同源**(`project_row::icon_slot`
+            // / `TEXT_X`)—— 三列并排,名字左沿必须对齐。槽位**恒定**:
             // 有图标画、没有留空,不画任何占位。图标来源与会话管理器左栏一样
             // 走 `AppearanceCache`(已含会话→分组继承),底色同 `should_paint`。
             let appearance = cx.lists.appearance.get(r.id);
             if let Some(icon) = appearance.and_then(|a| a.icon.as_ref()) {
-                use crate::ui::project_row::{ICON_SIDE, ICON_X};
-                let slot = egui::Rect::from_center_size(
-                    egui::pos2(rect.left() + ICON_X + ICON_SIDE / 2.0, rect.center().y),
-                    egui::vec2(ICON_SIDE, ICON_SIDE),
-                );
                 let bg = appearance.and_then(|a| {
                     crate::ui::badge::should_paint(a, mullion_store::ColorTarget::ListItem)
                 });
-                crate::ui::badge::paint_icon(p, slot, icon, bg);
+                crate::ui::badge::paint_icon(p, crate::ui::project_row::icon_slot(rect), icon, bg);
             }
             let left = rect.left() + crate::ui::project_row::TEXT_X;
             let avail = (rect.width()
@@ -1338,6 +1333,19 @@ mod tests {
         r
     }
 
+    /// 给会话挂一个节点色,并指定它画在哪几个落点。
+    fn with_color(
+        mut r: SessionRecord,
+        hex: &str,
+        targets: &[mullion_store::ColorTarget],
+    ) -> SessionRecord {
+        r.appearance.color = Some(mullion_store::ColorSpec {
+            hex: hex.to_string(),
+            apply_to: targets.to_vec(),
+        });
+        r
+    }
+
     /// 第一张「带真纹理且有面积」的 Mesh 的包围盒。判据照抄
     /// `project_row::tests::contains_image`:退化矩形也会发 Mesh,只判纹理
     /// 杀不掉「边长改 0」这条变异。
@@ -1384,6 +1392,71 @@ mod tests {
             image_bounds(&session_shapes(&[sess(7, "web01")])).is_none(),
             "会话没图标却凭空画了一张图"
         );
+    }
+
+    /// F293:图标底板取的是会话的**节点色**,而且过了 `apply_to` 那道闸。
+    ///
+    /// 这条扎的是**接线**:`badge::should_paint` 那几条纯函数测试测得再扎实,
+    /// `sessions_column` 里把 `bg` 传成 `None` 也一个字都不会变红,而症状是
+    /// 深色 .ico 糊在深色面板上等于没有(底板存在的全部理由)。本仓记过的
+    /// 「纯函数测得扎实、接线没人看着」。
+    ///
+    /// 判据:图标槽**内**恰好有一块填成节点色的矩形。只数「画面上有这个色的
+    /// 矩形」不行 —— 行底色、药丸之类都可能撞色,限定在图标包围盒里才咬得住。
+    /// 对照组(只勾了 pane 标题条的会话)钉死闸门真的在过滤,而不是见色就画。
+    ///
+    /// 自证会变红:把 `sessions_column` 里那句 `let bg = appearance.and_then(..)`
+    /// 换成 `let bg = None;`(第二段红);把 `should_paint` 的落点改成
+    /// `ColorTarget::PaneTitle`(两段都红)。
+    #[test]
+    fn the_icon_backing_plate_takes_the_session_node_color() {
+        const HEX: &str = "#e06767";
+        let color = egui::Color32::from_rgb(0xe0, 0x67, 0x67);
+        let count = |r: SessionRecord| {
+            let shapes = session_shapes(&[r]);
+            let slot = image_bounds(&shapes).expect("这一行没画图标,底板判据无从谈起");
+            plates_in(&shapes, slot, color)
+        };
+        assert_eq!(
+            count(with_color(
+                with_icon(sess(7, "web01")),
+                HEX,
+                &[mullion_store::ColorTarget::PaneTitle],
+            )),
+            0,
+            "只勾了「pane 标题条」的会话,不该在启动页的图标下垫底板"
+        );
+        assert_eq!(
+            count(with_color(
+                with_icon(sess(7, "web01")),
+                HEX,
+                &[mullion_store::ColorTarget::ListItem],
+            )),
+            1,
+            "勾了「会话列表」的会话,图标下应该恰好垫一块节点色的底板"
+        );
+    }
+
+    /// 落在 `slot` 里、填成 `color` 的矩形有几块。
+    fn plates_in(
+        shapes: &[egui::epaint::ClippedShape],
+        slot: egui::Rect,
+        color: egui::Color32,
+    ) -> usize {
+        fn walk(s: &egui::Shape, slot: egui::Rect, color: egui::Color32) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(|s| walk(s, slot, color)).sum(),
+                // `expand(0.5)`:底板与图标包围盒是同一个矩形,浮点上差一丝
+                // 就会被 `contains_rect` 判在外面。
+                egui::Shape::Rect(r)
+                    if r.fill == color && slot.expand(0.5).contains_rect(r.rect) =>
+                {
+                    1
+                }
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape, slot, color)).sum()
     }
 
     /// F293:有 / 无图标两种行的**名字左边界一样**,而且名字不压在图标上。
