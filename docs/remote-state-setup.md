@@ -193,5 +193,5 @@ shell 从此每个提示符发一次 OSC 7。命令串与逐处理由见
   `side_text` 已随该改动删除)
 - 继承:`crates/mullion-app/src/app.rs` 的 `files_start_dir`(首次打开走
   `trigger_sftp_open`)/ `sync_files_to_focused_pane`(已开着时的关→开跃迁同步)/
-  `files_hotkey_event`(`Ctrl+Shift+B`)
+  `bound_hotkey_event`(`Ctrl+Shift+B`)
 - `~` 展开:`crates/mullion-app/src/app.rs` 的 `expand_tilde` / `files_start_dir`

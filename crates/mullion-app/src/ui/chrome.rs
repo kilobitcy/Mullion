@@ -113,7 +113,7 @@ pub fn top_menu(
                         ui.close_menu();
                     }
                     // F50:开关文件侧栏。快捷键 `Ctrl+Shift+B` 的接线在
-                    // `app.rs::files_hotkey_event`,这里只是菜单入口。
+                    // `app.rs::bound_hotkey_event`,这里只是菜单入口。
                     if ui.button("文件面板\tCtrl+Shift+B").clicked() {
                         ui_state.files_sidebar_open = !ui_state.files_sidebar_open;
                         ui.close_menu();
@@ -240,7 +240,7 @@ pub enum TabAction {
 }
 
 /// ⑦:标签栏总开关。当前隐藏 —— 用户嫌它占地方,而多标签今天还能靠
-/// `Ctrl+Tab`(D0 的 `shell::tabs::hotkey`)和菜单切换,不缺入口。
+/// `Ctrl+Tab`(D0 的 `crate::hotkeys::Action::NextTab`)和菜单切换,不缺入口。
 ///
 /// **留常量而不是删代码**:F36 的行为约定(一个标签也出条、恒定高度、
 /// annotate 注册)全都还有测试守着 —— 那些测试走 `tab_bar_inner(.., true)`,

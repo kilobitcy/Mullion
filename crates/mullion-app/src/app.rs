@@ -2380,7 +2380,7 @@ pub struct App {
     /// **不能是 `render_frame` 调用前的帧内局部变量**:侧栏开关有两条路——
     /// 菜单(`chrome.rs`)在 `render_frame` **内部**改
     /// `self.ui.files_sidebar_open`,帧内局部变量能测出跃迁;但热键
-    /// (`files_hotkey_event`,由 `window_event` 在**另一次事件回调**里调用)
+    /// (`bound_hotkey_event`,由 `window_event` 在**另一次事件回调**里调用)
     /// 在 `render_frame` 之外改这个标志——等下一次重绘跑到帧内局部变量赋值
     /// 那一行时,标志早就已经是 `true` 了,`open && !was_open` 恒假,
     /// Ctrl+Shift+B 开侧栏就永远同步不到焦点 pane 的目录。跨帧字段 + 判据
@@ -4007,6 +4007,10 @@ impl App {
             self.settings.log_level = d.log_level;
             self.settings.shell_osc7_bootstrap = d.shell_osc7_bootstrap;
             self.settings.show_hidden_files = d.show_hidden_files;
+            // F294:只写与默认不同的(稀疏),改回默认的那条随之从文件里消失;
+            // **不整表替换** —— 用户手写在 `[hotkeys]` 里的别的键名要留着
+            // (判据与理由都在 `hotkeys::write_back`)。
+            crate::hotkeys::write_back(&mut self.settings.hotkeys, &d.hotkeys);
             let on = d.show_hidden_files;
             // 遍历**全部**标签,不只活动那个:F125 记过的「`drive_*` 每帧驱动
             // 函数必须遍历全部标签」是同一个形状 —— 只刷活动标签的话,用户
@@ -5004,10 +5008,11 @@ impl App {
         effective_focus_of(&self.tabs, self.ui.files_sidebar_open, self.focus)
     }
 
-    /// F36/S4:标签快捷键的事件前置处理。返回 `true` = 这个键已被吃掉,
+    /// F36/S4:`Ctrl+1…9` 切标签的事件前置处理。返回 `true` = 这个键已被吃掉,
     /// 调用方不要再往下分流(既不喂 egui,也不编码进 PTY)。
     ///
-    /// 判定(含模态闸门)全在 `shell::tabs::hotkey` 那个纯函数里,这里只接线。
+    /// F294 起只剩数字这一路:Ctrl+Tab / Ctrl+W 走 `bound_hotkey_event`。
+    /// 判定(含模态闸门)全在 `shell::tabs::digit_hotkey` 那个纯函数里,这里只接线。
     fn tab_hotkey_event(&mut self, event: &WindowEvent) -> bool {
         let WindowEvent::KeyboardInput { event: ke, .. } = event else {
             return false;
@@ -5018,78 +5023,112 @@ impl App {
         let Some((key, mods)) = input::translate_key(ke, self.mods) else {
             return false;
         };
-        let Some(intent) = shell::tabs::hotkey(key, mods, self.modal_open()) else {
+        let Some(n) = shell::tabs::digit_hotkey(key, mods, self.modal_open()) else {
             return false;
         };
-        match intent {
-            shell::tabs::Intent::Next => self.tabs.switch_next(),
-            shell::tabs::Intent::Prev => self.tabs.switch_prev(),
-            shell::tabs::Intent::CloseActive => self.close_active_tab(),
-            shell::tabs::Intent::Nth(n) => self.tabs.switch_to_nth(n),
+        self.tabs.switch_to_nth(n);
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F294:7 条可配本地热键的事件前置处理。返回 `true` = 这个键已被吃掉。
+    ///
+    /// 算一次 chord(`hotkeys::chord_of_event`,口径 `key_without_modifiers`),
+    /// 从 `self.settings` 查一次表(`hotkeys::resolve`,**没有影子状态**),
+    /// 再按动作落地。原来的 `files/focus/project/drawer_hotkey_event` 四个函数
+    /// 各写一遍「取键 → 判修饰 → 判字符」,这里合成一处;**逐动作的门原样保留**:
+    ///
+    /// - 全体:`modal_open()` 让位(T8,弹窗开着时键盘归 egui);
+    /// - ToggleFocus:面板不在场**不吃这个键**(协调者修订 1)—— F6 是纯终端
+    ///   场景里远端 TUI 也会用的功能键,截走了用户查不出原因;判据与 `Present`
+    ///   分支共用 `files_owner_generation`;
+    /// - NewProject:焦点在文件面板时让位 —— F226 把同一个键给了远端栏的
+    ///   「就地新建文件夹」(`handle_panel_key`),那段跑在分流**里面**,位置比
+    ///   这里晚,只能这边主动让;判据只看焦点不看是哪一栏(本地栏 F226 是
+    ///   静默不动,那这个键在面板上就该一律不做事)。
+    ///
+    /// 必须在 `window_event` 里输入分流**之前**调用(T8)—— 走到下面字母会被
+    /// 编码进 PTY 写给远端,`` ` `` 会被编成控制字符。
+    fn bound_hotkey_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
+            return false;
+        };
+        if ke.state != ElementState::Pressed || self.modal_open() {
+            return false;
+        }
+        let Some(chord) = crate::hotkeys::chord_of_event(ke, self.mods) else {
+            return false;
+        };
+        let Some(action) = crate::hotkeys::resolve(&self.settings, &chord) else {
+            return false;
+        };
+        use crate::hotkeys::Action;
+        match action {
+            Action::NextTab => self.tabs.switch_next(),
+            Action::PrevTab => self.tabs.switch_prev(),
+            Action::CloseTab => self.close_active_tab(),
+            Action::ToggleFiles => self.apply_files_hotkey(),
+            Action::ToggleFocus => {
+                if self.files_owner_generation().is_none() {
+                    return false;
+                }
+                self.focus = self.focus.toggled();
+            }
+            Action::NewProject => {
+                if self.effective_focus() == shell::input_route::Focus::FilesPanel {
+                    return false;
+                }
+                self.apply_project_hotkey();
+            }
+            Action::ToggleDrawer => self.apply_drawer_hotkey(),
         }
         self.request_ui_redraw();
         true
     }
 
-    /// F50 / 设计 D23:`Ctrl+Shift+B` 开关文件侧栏。**独立于** `tab_hotkey_event`
-    /// ——一个函数一件事,而且 tab 那个已经有守护测试钉着它的行为,不该把不
-    /// 相关的快捷键塞进同一个函数改变它的判定表面。
+    /// F294:设置弹窗里某一行正在等新组合键。**`window_event` 的第一道检查**
+    /// (排在 `annotate_event` 之前):不然 `Ctrl+Shift+F` 之类会先被别的拦截
+    /// 截走,用户看到的是「按了没反应」而不是「已被占用」。捕获期间每一个
+    /// `KeyboardInput` 一律吞掉(弹窗本来就是模态,键盘不会去别处)。
     ///
-    /// 选 `Ctrl+Shift+*` 系是因为它在终端里不产生控制字符,不和远端
-    /// tmux / Claude Code 抢键(T5/T6 类冲突)。**不能用 `Ctrl+Shift+F`**
-    /// —— 它已被 F100 标注模式占用,先到先得。
-    ///
-    /// 同 `tab_hotkey_event`:必须在 `window_event` 里输入分流**之前**调用
-    /// (T8 纪律)——不然 `Ctrl+Shift+B` 会先被喂给 egui 的焦点系统,`B` 也会
-    /// 被编码进 PTY 写给远端。
-    ///
-    /// F218 起这个键**叠加**了「跳到选区里那条路径去」。判定表在
-    /// `files::reveal::plan`,这里只接线。
-    fn files_hotkey_event(&mut self, event: &WindowEvent) -> bool {
+    /// 键口径走 `hotkeys::chord_of_event`,与 `bound_hotkey_event` 匹配的那一侧
+    /// **同源** —— 各写一份的话 `` Ctrl+Shift+` `` 会绑成 `~`、绑完按不出来。
+    fn hotkey_capture_event(&mut self, event: &WindowEvent) -> bool {
         let WindowEvent::KeyboardInput { event: ke, .. } = event else {
             return false;
         };
+        if !self.ui.settings_open {
+            return false;
+        }
+        let mods = self.mods;
+        let Some(draft) = self.ui.settings_draft.as_mut() else {
+            return false;
+        };
+        if draft.capturing.is_none() {
+            return false;
+        }
         if ke.state != ElementState::Pressed {
-            return false;
+            return true;
         }
-        let Some((key, mods)) = input::translate_key(ke, self.mods) else {
-            return false;
-        };
-        if self.modal_open() || !mods.ctrl || !mods.shift || mods.alt || mods.sup {
-            return false;
+        // 四路判定在 `hotkeys::capture_step`(纯函数,有行为测试);这里只接线。
+        use crate::hotkeys::CaptureStep;
+        match crate::hotkeys::capture_step(
+            &ke.logical_key,
+            crate::hotkeys::chord_of_event(ke, mods),
+        ) {
+            CaptureStep::Cancel => {
+                draft.capturing = None;
+                draft.hotkey_error = None;
+            }
+            // 用户还在按组合(先按下了 Ctrl),等下一个键。
+            CaptureStep::Ignore => {}
+            CaptureStep::Take(chord) => {
+                draft.capture(chord);
+            }
+            CaptureStep::Unbindable => {
+                draft.hotkey_error = Some(crate::ui::settings::UNBINDABLE_MSG.to_string());
+            }
         }
-        if !matches!(key, Key::Char('b' | 'B')) {
-            return false;
-        }
-        self.apply_files_hotkey();
-        self.request_ui_redraw();
-        true
-    }
-
-    /// F290:`` Ctrl+` `` 开/关命令抽屉。选反引号是 VS Code「切换终端」的
-    /// 肌肉记忆,而且它在终端里没有含义、不和 tmux 前缀撞。`'~'` 一起收:
-    /// 某些布局按住 Shift 时 winit 给的是 `~`,但 Shift 本身被下面排除了,
-    /// 这里只是防 `logical_key` 口径漂移。
-    ///
-    /// 同 `files_hotkey_event`:必须在 `window_event` 里输入分流**之前**调用
-    /// (T8)—— 走到下面 `` Ctrl+` `` 会被 `encode_char` 编成控制字符写给远端。
-    fn drawer_hotkey_event(&mut self, event: &WindowEvent) -> bool {
-        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
-            return false;
-        };
-        if ke.state != ElementState::Pressed {
-            return false;
-        }
-        let Some((key, mods)) = input::translate_key(ke, self.mods) else {
-            return false;
-        };
-        if self.modal_open() || !mods.ctrl || mods.shift || mods.alt || mods.sup {
-            return false;
-        }
-        if !matches!(key, Key::Char('`' | '~')) {
-            return false;
-        }
-        self.apply_drawer_hotkey();
         self.request_ui_redraw();
         true
     }
@@ -5182,12 +5221,12 @@ impl App {
     /// 但那只是让搜索框**失焦**,不关闭搜索条:用户按第一下只看到光标消失,
     /// 还得再点一次 ✕ 或再按别的键才能真正退出,够不上验收清单第 6 条。
     ///
-    /// 所以照 `files_hotkey_event` 那一套「分流之前先截」的姿势单独截一次:
+    /// 所以照 `bound_hotkey_event` 那一套「分流之前先截」的姿势单独截一次:
     /// 命中就直接派发 `FindClose` 并把这一下吃掉,不再喂给 egui。同
-    /// `tab_hotkey_event`/`files_hotkey_event`:必须在 `window_event` 里输入
+    /// `tab_hotkey_event`/`bound_hotkey_event`:必须在 `window_event` 里输入
     /// 分流**之前**调用(T8 纪律)。
     ///
-    /// **不看 `modal_open()`**,这点与 `files_hotkey_event` 相反:
+    /// **不看 `modal_open()`**,这点与 `bound_hotkey_event` 相反:
     /// `files_finding()`(=`Modal::FilesFind` 的判据)本身就是 `modal_open()`
     /// 恒真的原因之一,拿 `modal_open()` 当门反而会让这个键永远进不来。
     fn files_find_escape_event(&mut self, event: &WindowEvent) -> bool {
@@ -5940,90 +5979,6 @@ impl App {
             }
         }
         self.trigger_sftp_open(generation);
-    }
-
-    /// F6/设计 D23:在终端与文件面板之间切换键盘焦点。**独立于**
-    /// `files_hotkey_event`——同一个理由,一个函数一件事。
-    ///
-    /// **不用 `Ctrl+Tab`**——D0 已经把它给了标签切换(`shell::tabs::hotkey`);
-    /// `F6` 不是 `mullion_term::keymap::Key` 认识的键(那是发给远端的编码
-    /// 词表,F 键不在其中),今天本就到不了终端,截在这里只是让语义显式。
-    ///
-    /// 同 `tab_hotkey_event`/`files_hotkey_event`:必须在 `window_event` 里
-    /// 输入分流**之前**调用(T8 纪律)。
-    ///
-    /// 协调者修订 1:**不吃**面板不在场时按下的 F6——见函数体内
-    /// `files_owner_generation` 那句判断的说明。理由:F6 是纯终端场景里
-    /// 也可能被远端 TUI/工具用到的普通功能键,面板不在场时若仍无条件截走,
-    /// 会静默偷走这个键(用户按了没反应,还查不出原因)。
-    fn focus_hotkey_event(&mut self, event: &WindowEvent) -> bool {
-        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
-            return false;
-        };
-        if ke.state != ElementState::Pressed {
-            return false;
-        }
-        if self.modal_open() {
-            return false;
-        }
-        if !matches!(
-            ke.logical_key,
-            winit::keyboard::Key::Named(winit::keyboard::NamedKey::F6)
-        ) {
-            return false;
-        }
-        // 协调者修订 1:F6 的生效条件是"面板此刻在场"——与 `Present` 分支
-        // 判断要不要画侧栏共用同一份 `files_owner_generation` 判据(不重复写
-        // 一遍逻辑)。面板不在场时**不吃这个键**:直接返回 `false` 让它照旧
-        // 走终端编码,否则用户在纯终端场景按 F6(某些远端 TUI/tmux 配置会用
-        // 到)会被无声吞掉,表现为"这个键突然没用了"。
-        if self.files_owner_generation().is_none() {
-            return false;
-        }
-        self.focus = self.focus.toggled();
-        self.request_ui_redraw();
-        true
-    }
-
-    /// F240:`Ctrl+Shift+N` —— 从焦点分屏的现场建项目。
-    ///
-    /// 与另外几个快捷键同形状:判在 `input::translate_key`,闸门是
-    /// `modal_open()`,位置在输入分流**之前**(T8)—— 走到下面 `N` 会被
-    /// 编码进 PTY,给远端 shell 写一个字母。
-    ///
-    /// 判定全在 `project::hotkey_plan` 那张表里,这里只接线。
-    ///
-    /// **焦点在文件面板时整个让位**:F226 早就把 `Ctrl+Shift+N` 给了远端栏的
-    /// 「就地新建文件夹」(`handle_panel_key`),而那一段跑在通用分流**里面**,
-    /// 位置比这里晚。不让位的话,面板上按这个键再也建不出文件夹了 —— 而且
-    /// 完全静默:在带终端的标签里是弹出建项目表单,在纯文件标签里
-    /// (`effective_focus` 恒 `FilesPanel`、`focused_pane_cwd` 恒 `None`)是
-    /// 出一条驴唇不对马嘴的「这块分屏还没有当前目录」。
-    ///
-    /// 让位判据只看焦点、不看是哪一栏:本地栏 F226 是静默不动,那这个键在
-    /// 面板上就该一律不做事,而不是「按栏切换成两种完全不同的功能」。
-    fn project_hotkey_event(&mut self, event: &WindowEvent) -> bool {
-        let WindowEvent::KeyboardInput { event: ke, .. } = event else {
-            return false;
-        };
-        if ke.state != ElementState::Pressed {
-            return false;
-        }
-        let Some((key, mods)) = input::translate_key(ke, self.mods) else {
-            return false;
-        };
-        if self.modal_open() || !mods.ctrl || !mods.shift || mods.alt || mods.sup {
-            return false;
-        }
-        if !matches!(key, Key::Char('n' | 'N')) {
-            return false;
-        }
-        if self.effective_focus() == shell::input_route::Focus::FilesPanel {
-            return false;
-        }
-        self.apply_project_hotkey();
-        self.request_ui_redraw();
-        true
     }
 
     /// F240:`Ctrl+Shift+N` 按下之后到底做什么。判定全在
@@ -12925,6 +12880,11 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         diag::mark(diag::Stage::WindowEvent);
+        // F294:设置弹窗正在捕获新组合键时,这一下归它 —— 必须排在**所有**
+        // 拦截之前(理由见 `hotkey_capture_event` 的文档)。
+        if self.hotkey_capture_event(&event) {
+            return;
+        }
         // F100:标注模式的快捷键必须在下面那段输入分流**之前**截。会话管理器
         // 开着时 `modal` 为真,键盘整段判给 egui 并直接 `return`,走不到
         // `KeyboardInput` 分支里 `Ctrl+Shift+C/V` 那个位置 —— 而标注模式最主要的
@@ -12935,27 +12895,14 @@ impl ApplicationHandler<UserEvent> for App {
         // F36/S4:标签快捷键同样必须在分流**之前**截,理由同上面的标注模式:
         // 走到下面的 `KeyboardInput` 分支就已经晚了(那里会把键编码进 PTY,
         // `Ctrl+W` 会在切标签的同时把远端 shell 的前一个词删掉)。
-        // 判定在 `shell::tabs::hotkey`(纯函数),这里只做接线。
+        // 判定在 `shell::tabs::digit_hotkey`(纯函数),这里只做接线。
         if self.tab_hotkey_event(&event) {
             return;
         }
-        // F50/T8:文件侧栏快捷键同样必须在分流之前截,理由同标签快捷键 ——
-        // `Ctrl+Shift+B` 里的 `B` 走到下面会被编码进 PTY,写给远端一个字母。
-        if self.files_hotkey_event(&event) {
-            return;
-        }
-        // F6/T8:换焦点同样必须在分流之前截,理由同上。
-        if self.focus_hotkey_event(&event) {
-            return;
-        }
-        // F240/T8:从终端区建项目同样必须在分流之前截 —— `N` 走到下面会被
-        // 编码进 PTY,给远端 shell 写一个字母。
-        if self.project_hotkey_event(&event) {
-            return;
-        }
-        // F290/T8:命令抽屉热键同样必须在分流之前截 —— `` Ctrl+` `` 走到下面
-        // 会被编成控制字符写给远端。
-        if self.drawer_hotkey_event(&event) {
+        // F294/T8:7 条可配热键(文件侧栏 / 换焦点 / 建项目 / 抽屉 / Ctrl+Tab /
+        // Ctrl+W)同样必须在分流之前截 —— 字母走到下面会被编码进 PTY 写给
+        // 远端,`` ` `` 会被编成控制字符。判定在 `crate::hotkeys`,这里只接线。
+        if self.bound_hotkey_event(&event) {
             return;
         }
         // F278:搜索条开着时 Esc 同样必须在分流之前截——理由见
@@ -17969,7 +17916,7 @@ mod tests {
 
     /// F240 × F226:`Ctrl+Shift+N` 有**两个**主人,分辨它俩的唯一判据是焦点。
     ///
-    /// 建项目那条(`project_hotkey_event`)按 T8 必须拦在通用分流**之前**,
+    /// 建项目那条(`bound_hotkey_event` 的 `NewProject` 分支)按 T8 必须拦在通用分流**之前**,
     /// 而新建文件夹那条(`handle_panel_key`)跑在分流**里面** —— 位置天生
     /// 分不出胜负,只能靠前者主动让位。少了那道让位,面板上再也建不出
     /// 文件夹,且完全静默:带终端的标签里是弹出建项目表单,纯文件标签里
@@ -17982,9 +17929,9 @@ mod tests {
     /// 注释先剥掉再搜:本仓已经吃过「判据关键词写在注释里让源码切片假绿」
     /// 的亏,而上面这段注释里正好有 `Focus::FilesPanel` 要找的字样。
     ///
-    /// 自证会变红:(a) 把 `project_hotkey_event` 里那句
+    /// 自证会变红:(a) 把 `bound_hotkey_event` 里 `NewProject` 分支那句
     /// `effective_focus() == ...FilesPanel` 去掉;(b) 把 `window_event` 里
-    /// `project_hotkey_event` 的调用挪到 `handle_panel_key` 之后。
+    /// `bound_hotkey_event` 的调用挪到 `handle_panel_key` 之后。
     #[test]
     fn the_project_hotkey_yields_ctrl_shift_n_back_to_the_files_panel() {
         let src = include_str!("app.rs");
@@ -17997,13 +17944,13 @@ mod tests {
 
         // (a) 让位:焦点在文件面板时不拦这个键。
         let after = src
-            .split("fn project_hotkey_event(")
+            .split("fn bound_hotkey_event(")
             .nth(1)
-            .expect("找不到 project_hotkey_event");
+            .expect("找不到 bound_hotkey_event");
         let body = strip(&after[..after.find("\n    }\n").expect("找不到函数结尾")]);
         assert!(
             body.contains("Focus::FilesPanel"),
-            "project_hotkey_event 没给文件面板让位 —— F226 的新建文件夹被静默劫持"
+            "bound_hotkey_event 没给文件面板让位 —— F226 的新建文件夹被静默劫持"
         );
         assert!(
             body.contains("self.effective_focus()"),
@@ -18017,14 +17964,14 @@ mod tests {
                 .expect("找不到 window_event"),
         );
         let hotkey = wev
-            .find("self.project_hotkey_event(&event)")
-            .expect("window_event 里没接 project_hotkey_event");
+            .find("self.bound_hotkey_event(&event)")
+            .expect("window_event 里没接 bound_hotkey_event");
         let panel = wev
             .find("self.handle_panel_key(gen")
             .expect("window_event 里没接 handle_panel_key");
         assert!(
             hotkey < panel,
-            "project_hotkey_event 已经排到 handle_panel_key 之后 —— \
+            "bound_hotkey_event 已经排到 handle_panel_key 之后 —— \
              让位那行变成死判据了,请连同它一起重新想清楚"
         );
     }
@@ -23556,6 +23503,39 @@ mod tests {
         );
     }
 
+    /// F294:设置弹窗「确定」时,改过的热键要搬进 `self.settings` —— 不搬的话
+    /// 用户在设置里改了键、点了确定,这一次运行照旧按老键走,而且落盘的也是
+    /// 老值,他不会知道要重启(重启也没用)。
+    ///
+    /// **还要扎住「怎么搬」**:必须走 `hotkeys::write_back`(先按 7 个动作名
+    /// `retain` 掉、再 `extend` 稀疏覆盖),不能是 `self.settings.hotkeys = ..`
+    /// 整表替换 —— 后者会把用户手写在 `[hotkeys]` 里的别的键名(打错的、将来
+    /// 版本才认识的)在「打开设置点一次确定」之后永久抹掉,零报错(本仓登记
+    /// 过的「整份覆盖」缺陷族)。搬的动作本身是纯函数,有
+    /// `hotkeys::tests::writing_back_replaces_the_known_actions_and_keeps_the_unknown_ones`
+    /// 钉着行为;这里扎的是「有没有人调它、是不是被换成了整表替换」。
+    ///
+    /// **验证边界**:第二条是黑名单式的,绕得过去 —— 在 `write_back` 之前插一句
+    /// `self.settings.hotkeys.clear();` 就是整表替换的等价物,而这条照绿。真正
+    /// 兜底的是行为测试
+    /// `hotkeys::tests::writing_back_replaces_the_known_actions_and_keeps_the_unknown_ones`,
+    /// 这里只负责「有没有人调它、是不是被换成了一句裸赋值」。
+    ///
+    /// 自证会变红:把那句换成 `self.settings.hotkeys = crate::hotkeys::overrides(&d.hotkeys);`
+    /// (两条断言同时红)。
+    #[test]
+    fn committing_the_settings_carries_the_rebound_hotkeys() {
+        let body = strip_comments(body_of(prod_src(), "fn take_settings_draft("));
+        assert!(
+            body.contains("crate::hotkeys::write_back(&mut self.settings.hotkeys, &d.hotkeys);"),
+            "「确定」没把改过的热键搬进 settings:{body}"
+        );
+        assert!(
+            !body.contains("self.settings.hotkeys ="),
+            "热键是整表替换的 —— 用户手写的未知键名会被一次「确定」抹掉:{body}"
+        );
+    }
+
     /// **接线守护 / F124**:tick 的三件事都得在——判据走
     /// `remote_bootstrap::should_attempt`、发的是 `bootstrap_command()`、
     /// 结论按退出码写回 `finish(..)`。
@@ -27306,7 +27286,7 @@ mod tests {
     /// 2. **别编码进 PTY**:下面那个 `KeyboardInput` 分支会 `encode_key` 往
     ///    channel 写,`Ctrl+W` 就会在切标签的同时把远端 shell 的前一个词删掉。
     ///
-    /// 判定本身(含模态闸门)在 `shell::tabs::hotkey`,有真行为测试;这里扎的是
+    /// 判定本身(含模态闸门)在 `shell::tabs::digit_hotkey`,有真行为测试;这里扎的是
     /// **调用位置**,只有源码结构能表达 —— `App` 要 `EventLoopProxy` 才能构造。
     /// 验证边界:只挡得住「调用点跑到分流之后 / 整个没调」,挡不住有人在
     /// `tab_hotkey_event` 里返回恒 false。
@@ -27331,95 +27311,110 @@ mod tests {
         );
     }
 
-    /// **接线守护 / T8**:文件侧栏快捷键(`Ctrl+Shift+B`)必须同样在输入分流
-    /// **之前**被截走。与 `tab_shortcuts_are_swallowed_before_the_input_routing`
-    /// 同构,理由同上:不截的话,`Ctrl+Shift+B` 里的 `B` 会先被喂给 egui 的
-    /// 焦点系统,也会被 `KeyboardInput` 分支编码进 PTY,写给远端一个字母。
+    /// **接线守护 / T8**:F294 的 7 条可配热键必须在输入分流**之前**被截走
+    /// (原来 files/focus/project/drawer 四条各一条守护,合成一处)。不截的话,
+    /// `Ctrl+Shift+B` 里的 `B` 会先被喂给 egui 的焦点系统,也会被 `KeyboardInput`
+    /// 分支编码进 PTY 写给远端;`` Ctrl+Shift+` `` 会被编成控制字符。
     ///
-    /// 验证边界同 `tab_hotkey_event` 那条:只挡得住「调用点跑到分流之后 /
-    /// 整个没调」,挡不住有人在 `files_hotkey_event` 里返回恒 false。
+    /// 用 `body_of` + `strip_comments`(本仓记过的坑「源码切片守护不剥注释」)。
+    /// 验证边界:只挡得住「调用点跑到分流之后 / 整个没调 / 调了两次」。
     ///
-    /// 自证会变红:把 `window_event` 里那句 `if self.files_hotkey_event(&event)`
+    /// 自证会变红:把 `window_event` 里 `if self.bound_hotkey_event(&event)`
     /// 整段删掉,或挪到 `egui_should_see` 那段之后。
     #[test]
-    fn files_shortcut_is_swallowed_before_the_input_routing() {
-        let src = include_str!("app.rs");
-        let after = src
-            .split("fn window_event(")
-            .nth(1)
-            .expect("找不到 window_event 的定义");
-        let hotkey = after
-            .find("self.files_hotkey_event(&event)")
-            .expect("window_event 里没调 files_hotkey_event —— Ctrl+Shift+B 会被喂给 egui(T8),还会被编码进 PTY 写给远端");
-        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
-        assert!(
-            hotkey < routing,
-            "files_hotkey_event 排在了输入分流之后 —— 排在后面等于没截:\
-             Ctrl+Shift+B 里的 B 已经被喂给 egui 的焦点系统了"
+    fn bound_hotkeys_are_swallowed_before_the_input_routing() {
+        let body = strip_comments(body_of(prod_src(), "fn window_event("));
+        assert_eq!(
+            body.matches("self.bound_hotkey_event(&event)").count(),
+            1,
+            "调用不止一次 —— 多一处占位会把位置判据骗过去"
         );
-    }
-
-    /// **接线守护 / T8**:F6 换焦点同样必须在输入分流**之前**被截走。与前两条
-    /// 同构——不截的话,F6 会先被喂给 egui 的焦点系统(虽然 F6 本身不是 Tab,
-    /// 但一旦这套判定被误挪到分流之后,连带一起挪错的风险跟前两条一样大)。
-    ///
-    /// 验证边界同前两条:只挡得住「调用点跑到分流之后 / 整个没调」,挡不住
-    /// 有人在 `focus_hotkey_event` 里返回恒 false。
-    ///
-    /// 自证会变红:把 `window_event` 里那句 `if self.focus_hotkey_event(&event)`
-    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
-    #[test]
-    fn focus_shortcut_is_swallowed_before_the_input_routing() {
-        let src = include_str!("app.rs");
-        let after = src
-            .split("fn window_event(")
-            .nth(1)
-            .expect("找不到 window_event 的定义");
-        let hotkey = after
-            .find("self.focus_hotkey_event(&event)")
-            .expect("window_event 里没调 focus_hotkey_event —— F6 会被喂给 egui(T8),还会被编码进 PTY 写给远端");
-        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
-        assert!(
-            hotkey < routing,
-            "focus_hotkey_event 排在了输入分流之后 —— 排在后面等于没截"
-        );
-    }
-
-    /// **接线守护 / T8**:F240 建项目快捷键(`Ctrl+Shift+N`)必须同样在输入
-    /// 分流**之前**被截走。与前三条同构:不截的话,`N` 会先被喂给 egui 的
-    /// 焦点系统,也会被下面的 `KeyboardInput` 分支编码进 PTY,写给远端一个
-    /// 字母。
-    ///
-    /// 用 `body_of`(先切出 `window_event` 的块体,再剥掉 `//` 行注释)而不是
-    /// 前三条用的裸 `include_str!` 子串查找 ——本仓库记过的坑「源码切片守护
-    /// 不剥注释」:本条判据说明文字里就带着 `self.project_hotkey_event` 这个
-    /// 名字,不剥注释的话文档注释自己就能把断言喂饱,恒绿。
-    ///
-    /// 验证边界同前三条:只挡得住「调用点跑到分流之后 / 整个没调」,挡不住
-    /// 有人在 `project_hotkey_event` 里返回恒 false。
-    ///
-    /// 自证会变红:把 `window_event` 里那句 `if self.project_hotkey_event(&event)`
-    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
-    #[test]
-    fn project_shortcut_is_swallowed_before_the_input_routing() {
-        let strip = |s: &str| {
-            s.lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<String>()
-        };
-        let body = strip(body_of(
-            prod_src(),
-            "fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {",
-        ));
-        let hotkey = body.find("self.project_hotkey_event(&event)").expect(
-            "window_event 里没调 project_hotkey_event —— Ctrl+Shift+N 会被喂给 egui(T8),\
-             还会被编码进 PTY 写给远端",
-        );
+        let hotkey = body.find("self.bound_hotkey_event(&event)").unwrap();
         let routing = body.find("egui_should_see").expect("找不到输入分流那一段");
         assert!(
             hotkey < routing,
-            "project_hotkey_event 排在了输入分流之后 —— 排在后面等于没截:\
-             Ctrl+Shift+N 里的 N 已经被喂给 egui 的焦点系统了"
+            "bound_hotkey_event 排在了输入分流之后 —— 排在后面等于没截"
+        );
+        for gone in [
+            "files_hotkey_event",
+            "focus_hotkey_event",
+            "project_hotkey_event",
+            "drawer_hotkey_event",
+        ] {
+            assert!(
+                !body.contains(gone),
+                "{gone} 还在 —— 旧的写死热键没拆干净,用户改了键它照样生效"
+            );
+        }
+    }
+
+    /// F294:捕获态拦截必须是 `window_event` 的**第一道**检查 —— 排在
+    /// `annotate_event` 之前。不然用户想绑 `Ctrl+Shift+F`,按下去先被标注模式
+    /// 截走,看到的是「按了没反应」而不是「已被占用」。
+    ///
+    /// **扎的是源码结构**(`window_event` 要真 `App` + `EventLoopProxy`)。
+    /// 验证边界:只挡得住「调用点跑到别的拦截之后 / 整个没调」。
+    ///
+    /// 自证会变红:把 `self.hotkey_capture_event(&event)` 挪到 `annotate_event` 之后。
+    #[test]
+    fn hotkey_capture_is_the_first_thing_window_event_checks() {
+        let body = strip_comments(body_of(prod_src(), "fn window_event("));
+        let capture = body
+            .find("self.hotkey_capture_event(&event)")
+            .expect("window_event 里没接 hotkey_capture_event");
+        let annotate = body
+            .find("self.annotate_event(&event)")
+            .expect("找不到 annotate_event");
+        assert!(
+            capture < annotate,
+            "捕获拦截排在标注模式之后 —— Ctrl+Shift+F 永远捕获不到"
+        );
+    }
+
+    /// F294:捕获态的接线 —— 四路判定归 `hotkeys::capture_step`(纯函数,行为
+    /// 测试在 `hotkeys::tests::capture_step_routes_escape_modifiers_and_dead_keys_apart`),
+    /// 这里扎的是**每一路接到了该接的动作**。
+    ///
+    /// 逐条各挡一种静默坏:`Cancel` 不清 `capturing` = 点进捕获态退不出来;
+    /// `Cancel` 不清 `hotkey_error` = 上一条拒绝原因挂在表上不走(用户以为
+    /// 现在这一下也被拒了);`Take` 不调 `draft.capture` = 按了没反应;
+    /// `Unbindable` 不写提示 = 按 Enter 毫无动静;不走 `chord_of_event` =
+    /// 捕获的键口径与 `bound_hotkey_event` 匹配那一侧漂开(`` Ctrl+Shift+` ``
+    /// 的 `logical_key` 是 `~`),表面上绑成功了,按下去不生效。
+    ///
+    /// **扎的是源码结构**(`App` 要 `EventLoopProxy` 才能构造)。验证边界:
+    /// 挡得住「某一路被掏空 / 接到别人的动作」,挡不住 `capture_step` 自己
+    /// 判错 —— 那一侧由上面那条行为测试守。
+    ///
+    /// 自证会变红:删掉 `Cancel` 臂里的 `hotkey_error = None;`;把 `Take` 臂
+    /// 里的 `draft.capture(chord);` 删掉。
+    #[test]
+    fn hotkey_capture_wires_every_step_to_its_own_action() {
+        let body = strip_comments(body_of(prod_src(), "fn hotkey_capture_event("));
+        assert_eq!(
+            body.matches("capture_step(").count(),
+            1,
+            "判定不是唯一一处 —— 有人在接线层又抄了一份判据"
+        );
+        assert!(body.contains("chord_of_event("), "捕获的键口径与匹配不同源");
+        let cancel = arm_of(&body, "CaptureStep::Cancel");
+        assert!(
+            cancel.contains("capturing = None"),
+            "Esc 不能退出捕获:{cancel}"
+        );
+        assert!(
+            cancel.contains("hotkey_error = None"),
+            "退出捕获没把上一条拒绝原因清掉:{cancel}"
+        );
+        let take = arm_of(&body, "CaptureStep::Take(chord)");
+        assert!(
+            take.contains("draft.capture("),
+            "没把 chord 交给草稿裁决:{take}"
+        );
+        let unbindable = arm_of(&body, "CaptureStep::Unbindable");
+        assert!(
+            unbindable.contains("UNBINDABLE_MSG"),
+            "按到键域外的键没有任何提示:{unbindable}"
         );
     }
 
@@ -27429,26 +27424,26 @@ mod tests {
     /// 用户在纯终端场景按 F6(某些远端 TUI/工具会用到功能键)会被无声吃掉,
     /// 表现为「这个键突然没反应」——恰是本项目最忌的静默失效。
     ///
-    /// **扎的是源码结构**——`focus_hotkey_event` 是 `App` 的私有方法,`App`
+    /// **扎的是源码结构**——`bound_hotkey_event` 是 `App` 的私有方法,`App`
     /// 单测里造不出来(`EventLoopProxy`)。验证边界:只挡得住「函数体里压根
     /// 没调 `files_owner_generation()`」这一种退化,挡不住换个不共用判据的
     /// 等价写法(比如自己重新拼一遍 `active_is_files_tab() || files_sidebar_open`)。
     ///
-    /// 自证会变红:把 `focus_hotkey_event` 里
-    /// `if self.files_owner_generation().is_none() { return false; }` 那两行删掉。
+    /// 自证会变红:把 `bound_hotkey_event` 里 `ToggleFocus` 分支那句
+    /// `if self.files_owner_generation().is_none() { return false; }` 删掉。
     #[test]
     fn f6_is_gated_on_the_panel_actually_being_visible() {
         let src = include_str!("app.rs");
         let after = src
-            .split("fn focus_hotkey_event(")
+            .split("fn bound_hotkey_event(")
             .nth(1)
-            .expect("找不到 focus_hotkey_event 的定义");
+            .expect("找不到 bound_hotkey_event 的定义");
         let body = &after[..after
             .find("\n    }\n")
-            .expect("找不到 focus_hotkey_event 的函数结尾")];
+            .expect("找不到 bound_hotkey_event 的函数结尾")];
         assert!(
             body.contains("self.files_owner_generation().is_none()"),
-            "focus_hotkey_event 没有拿 files_owner_generation 判断面板在不在场 \
+            "bound_hotkey_event 没有拿 files_owner_generation 判断面板在不在场 \
              —— F6 会在没有面板的纯终端场景里被无声吞掉"
         );
     }
@@ -27490,35 +27485,6 @@ mod tests {
         assert!(
             !before_routing.contains("let focus = self.focus;"),
             "分流拿的是裸 self.focus,没经过 effective_focus 的上下文夹紧"
-        );
-    }
-
-    /// 文件侧栏的快捷键必须**带 Shift**。
-    ///
-    /// 少了 Shift 就成了 `Ctrl+B`,而那是 tmux 出厂默认的 prefix 键 ——
-    /// 本项目的核心场景恰恰是「操作跑在远端 tmux 里的 Claude Code」,
-    /// 抢掉 `Ctrl+B` 等于让用户在自己的 tmux 里寸步难行,而且症状极隐蔽:
-    /// 按 `Ctrl+B` 弹出个文件面板,用户只会以为 tmux 坏了。
-    /// `Ctrl+Shift+*` 系在终端里不产生控制字符,才是安全的取键区间。
-    ///
-    /// **扎的是源码结构而非运行时行为**(`App` 要 `EventLoopProxy` 才能构造)。
-    /// 验证边界:只挡得住「`mods.shift` 那个判断被删掉」这一种写法。
-    ///
-    /// 自证会变红:把 `files_hotkey_event` 里的 `!mods.shift` 去掉。
-    #[test]
-    fn the_files_shortcut_requires_shift_so_it_cannot_steal_tmux_prefix() {
-        let src = include_str!("app.rs");
-        let body = src
-            .split("fn files_hotkey_event")
-            .nth(1)
-            .expect("找不到 files_hotkey_event");
-        let body = &body[..body
-            .find("\n    }\n")
-            .expect("找不到 files_hotkey_event 的函数结尾")];
-        assert!(
-            body.contains("!mods.shift"),
-            "files_hotkey_event 不再要求 Shift —— Ctrl+B 是 tmux 的 prefix 键,\
-             抢了它用户在远端 tmux 里寸步难行"
         );
     }
 
@@ -27716,8 +27682,8 @@ mod tests {
     /// **扎的是源码结构而非运行时行为**:`App` 要 `EventLoopProxy` 才能构造。
     /// 验证边界:只挡得住「切换分支里出现 `spawn_connect`」这一种写法。
     ///
-    /// 自证会变红:在 `TabAction::Switch` 或 `tab_hotkey_event` 的
-    /// `Intent::Next` 分支里加一句 `self.spawn_connect(...)`。
+    /// 自证会变红:在 `TabAction::Switch` 或 `bound_hotkey_event` 的
+    /// `Action::NextTab` 分支里加一句 `self.spawn_connect(...)`。
     #[test]
     fn tab_switching_never_reconnects() {
         let src = include_str!("app.rs");
@@ -27732,6 +27698,19 @@ mod tests {
         assert!(
             !hot_body.contains("spawn_connect"),
             "标签快捷键路径里出现了建连调用 —— 切一下标签就重连一次"
+        );
+        // F294:Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+W 搬到了 `bound_hotkey_event`,
+        // 同样一句建连都不许有。
+        let bound = src
+            .split("fn bound_hotkey_event")
+            .nth(1)
+            .expect("找不到 bound_hotkey_event");
+        let bound_body = &bound[..bound
+            .find("\n    }\n")
+            .expect("找不到 bound_hotkey_event 的函数结尾")];
+        assert!(
+            !bound_body.contains("spawn_connect"),
+            "bound_hotkey_event(Ctrl+Tab / Ctrl+Shift+Tab)里出现了 spawn_connect"
         );
         // 鼠标那条路:`actions.tab` 那个 match。
         let click = src
@@ -29708,7 +29687,7 @@ mod tests {
     /// 判据存在 `App::files_sidebar_was_open` 这个跨帧字段里,而不是
     /// `render_frame` 调用前的帧内局部变量:侧栏开关有两条路——菜单
     /// (`chrome.rs`)在 `render_frame` **内部**改 `self.ui.files_sidebar_open`,
-    /// 帧内局部变量能测出跃迁;但热键(`files_hotkey_event`,由
+    /// 帧内局部变量能测出跃迁;但热键(`bound_hotkey_event`,由
     /// `window_event` 在另一次事件回调里调用)在 `render_frame` **之外**改
     /// 这个标志——等下一帧的重绘块跑到帧内局部变量赋值那一行时,标志早就
     /// 已经是 `true` 了,`open && !was_open` 恒假,Ctrl+Shift+B 开侧栏永远
@@ -30116,11 +30095,11 @@ mod tests {
     /// `handle_panel_key` 这条路径在搜索条开着的时候根本到不了(反证见
     /// `the_files_find_bar_is_registered_everywhere_a_modal_has_to_be` 自己
     /// 的注释)。真正落地在 `files_find_escape_event`,同 `tab_hotkey_event`/
-    /// `files_hotkey_event` 那一套「分流之前先截」的姿势,必须在
+    /// `bound_hotkey_event` 那一套「分流之前先截」的姿势,必须在
     /// `window_event` 里排在输入分流(`dismiss_on_outside_press` 起)**之前**
     /// 调用。
     ///
-    /// **不能拿 `modal_open()` 当门**:`files_hotkey_event` 的 `Ctrl+Shift+B`
+    /// **不能拿 `modal_open()` 当门**:`bound_hotkey_event` 的 `Ctrl+Shift+B`
     /// 是反过来的语义(`modal_open()` 时不生效),照抄它的写法在这里刚好
     /// 相反——`files_finding()` 本身就是 `modal_open()` 恒真的原因之一,
     /// 拿它当门这个键就永远进不来。
@@ -31898,44 +31877,90 @@ mod tests {
 
     // ---- F290 命令抽屉 ----
 
-    /// **接线守护 / T8**:`` Ctrl+` `` 必须在输入分流**之前**被截走 —— 走到
-    /// 下面会被 `encode_char` 编成控制字符写给远端。与 files/focus/project
-    /// 三条同构。
+    /// F294:可配热键整组在弹窗开着时让位(T8),并且真的从 settings 查表。
     ///
-    /// 自证会变红:把 `window_event` 里那句 `if self.drawer_hotkey_event(&event)`
-    /// 整段删掉,或挪到 `egui_should_see` 那段之后。
-    #[test]
-    fn drawer_shortcut_is_swallowed_before_the_input_routing() {
-        let src = include_str!("app.rs");
-        let after = src
-            .split("fn window_event(")
-            .nth(1)
-            .expect("找不到 window_event 的定义");
-        let hotkey = after
-            .find("self.drawer_hotkey_event(&event)")
-            .expect("window_event 里没调 drawer_hotkey_event —— Ctrl+` 会被编码进 PTY 写给远端");
-        let routing = after.find("egui_should_see").expect("找不到输入分流那一段");
-        assert!(hotkey < routing, "drawer_hotkey_event 排在了输入分流之后");
-    }
-
-    /// F290:热键判定只认 `Ctrl` + 反引号(`~` 是同一个键按了 Shift 的布局),
-    /// 弹窗开着不响应。
+    /// 默认键本身的守护在
+    /// `hotkeys::tests::the_drawer_default_is_ctrl_shift_backtick_and_the_old_key_is_free`;
+    /// 接线位置的守护在 `bound_hotkeys_are_swallowed_before_the_input_routing`。
     ///
-    /// 自证会变红:把 `drawer_hotkey_event` 里 `'`'` 改成别的字符,或删掉
-    /// `self.modal_open()` 那一项。
+    /// 自证会变红:把 `bound_hotkey_event` 里 `self.modal_open()` 那一项删掉,
+    /// 或把 `hotkeys::resolve(&self.settings` 换成按默认值判。
     #[test]
-    fn the_drawer_hotkey_is_ctrl_backtick_and_yields_to_modals() {
-        let body = strip_comments(body_of(prod_src(), "fn drawer_hotkey_event("));
-        assert!(
-            body.contains(concat!("Key::Char('`'", " | '~')")),
-            "键不是反引号"
-        );
+    fn bound_hotkeys_yield_to_modals() {
+        let body = strip_comments(body_of(prod_src(), "fn bound_hotkey_event("));
         assert!(
             body.contains("self.modal_open()"),
             "弹窗开着也响应 —— 会在输入框里打字时突然分屏"
         );
-        assert!(body.contains("!mods.ctrl"), "没要求 Ctrl");
-        assert!(body.contains("mods.shift"), "没排除 Shift");
+        assert!(
+            body.contains("hotkeys::resolve(&self.settings"),
+            "没从 settings 查表 —— 改了键不生效"
+        );
+        // 只出现一次 —— 否则「留一句 `let _probe = resolve(&self.settings, ..)`
+        // 喂饱字面量、真查表用 `Settings::default()`」这种绕过法测不出来。
+        assert_eq!(
+            body.matches("hotkeys::resolve(").count(),
+            1,
+            "查了不止一次表 —— 多一处占位会把上面那条字面量判据骗过去"
+        );
+    }
+
+    /// **接线守护 / C1**:`bound_hotkey_event` 的 7 条 match 臂**各落各的动词**。
+    ///
+    /// 这一条补的是「纯函数测得扎实、接线没人看着」那个缺陷形状:改动之前
+    /// Next/Prev 的区分长在 `shell::tabs::hotkey` 的行为测试里,搬进接线层之后
+    /// 就没人看了 —— 实测把 7 条臂全改成 no-op、把 `NextTab => switch_prev()`、
+    /// 把 `ToggleDrawer => apply_files_hotkey()`,2480 条测试一条都不红。
+    ///
+    /// **必须切段做邻近判据**:整个函数体 `contains` 杀不掉「Next/Prev 对调」
+    /// —— 两个动词都还在,只是挂错了臂。这里按 `Action::X =>` 切到下一条
+    /// `Action::` 为止,只在那一段里找它专属的动词。
+    ///
+    /// 切段之前**先把 `match action` 那个块单独切出来**:不切的话最后一条臂
+    /// (`ToggleDrawer`,后面没有下一个 `Action::` 了)的切片一路延到函数体尾,
+    /// 于是「把那条臂掏空 + 把 `self.apply_drawer_hotkey()` 提到 `match` 之后
+    /// 无条件调」这种变异照样绿 —— 第一段复核实测过。
+    ///
+    /// 缺分支直接 panic,所以加第 8 个动作时会被强制回来更新这张表。
+    ///
+    /// **扎的是源码结构**(`App` 要 `EventLoopProxy` 才能构造)。验证边界:
+    /// 挡得住「动词挂错臂 / 臂被掏空 / 漏一条臂」,挡不住有人把动词换成一个
+    /// 同名但内部被掏空的方法。
+    ///
+    /// 自证会变红:把 `NextTab` 那臂改成 `self.tabs.switch_prev()`;把
+    /// `ToggleDrawer` 那臂改成 `self.apply_files_hotkey()`;把任意一臂掏成 no-op;
+    /// 把 `ToggleDrawer` 那臂掏空、`self.apply_drawer_hotkey()` 挪到 `match` 之后。
+    #[test]
+    fn every_bound_action_lands_on_its_own_verb() {
+        let body = strip_comments(body_of(prod_src(), "fn bound_hotkey_event("));
+        // 只认 `match action` 块**里面**的代码(理由见上面那段)。
+        let arms = body_of(&body, "match action {");
+        let verb = |a: crate::hotkeys::Action| -> &'static str {
+            use crate::hotkeys::Action;
+            match a {
+                Action::NextTab => "self.tabs.switch_next()",
+                Action::PrevTab => "self.tabs.switch_prev()",
+                Action::CloseTab => "self.close_active_tab()",
+                Action::ToggleFiles => "self.apply_files_hotkey()",
+                Action::ToggleFocus => "self.focus.toggled()",
+                Action::NewProject => "self.apply_project_hotkey()",
+                Action::ToggleDrawer => "self.apply_drawer_hotkey()",
+            }
+        };
+        for a in crate::hotkeys::Action::ALL {
+            let head = format!("Action::{a:?} =>");
+            let at = arms
+                .find(&head)
+                .unwrap_or_else(|| panic!("{head} 这条臂不在 bound_hotkey_event 的 match 里了"));
+            let rest = &arms[at + head.len()..];
+            // 切到下一条臂为止 —— 只在自己这一段里找动词,才杀得掉「对调」。
+            let arm = &rest[..rest.find("Action::").unwrap_or(rest.len())];
+            assert!(
+                arm.contains(verb(a)),
+                "{a:?} 这条臂里没有 {} —— 要么被掏空了,要么动词挂到了别人臂上",
+                verb(a)
+            );
+        }
     }
 
     /// F290:开抽屉这一路必须做全四件事,少一件都是静默坏:

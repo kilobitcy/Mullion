@@ -246,51 +246,30 @@ impl<C: TabPayload> Tabs<C> {
     }
 }
 
-/// 一次标签快捷键要做的事(S4)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Intent {
-    Next,
-    Prev,
-    CloseActive,
-    /// `Ctrl+1..9`,1-based。语义同 [`Tabs::switch_to_nth`](9 = 最后一个)。
-    Nth(usize),
-}
-
-/// 把一次按键翻译成标签意图。**纯函数** —— 与 `annotate::hotkey` 同一个套路:
-/// 「哪些组合键属于标签栏」这件事必须能脱离 winit/egui 单测,否则只能靠人按。
+/// 把一次按键翻译成「切到第 N 个标签」。**纯函数**,`Ctrl+1..9`,1-based,
+/// 语义同 [`Tabs::switch_to_nth`](9 = 最后一个)。
+///
+/// F294 起**只剩数字这一路**:Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+W 已经是可配
+/// 热键(`crate::hotkeys`),真值在 settings 里 —— 留在这里的话用户改掉
+/// Ctrl+W 之后它照样关标签。
 ///
 /// 返回 `Some` 就意味着调用方要把这个键**吞掉**:既不喂 egui(T8),也不编码
-/// 进 PTY —— 否则 `Ctrl+W` 会在切标签的同时把远端 shell 的前一个词删掉。
+/// 进 PTY。只认 `ctrl` 这一路:`Alt+数字` 在 tmux 里有约定用法,`Super` 归
+/// Windows;**不接受 shift**:`Ctrl+Shift+2` 之类在很多终端里是别的东西。
 ///
-/// 只认 `ctrl` 这一路:`Alt+数字` 在 tmux 里有约定用法,`Super` 归 Windows。
-/// **`Ctrl+Tab` 必须显式排除 alt/sup**,否则 `Ctrl+Alt+Tab`(Windows 的系统
-/// 切换器)会被我们吃掉一半。
-///
-/// `modal_open` 为真时整段不生效:此时键盘归 egui(T8),表单里按 `Ctrl+W`
-/// 该是「删前一个词」,不是「把背后的标签关了」。**这个闸门放在纯函数里而不是
-/// 调用点**,是为了让它能被真正测出来 —— `App` 要 `EventLoopProxy` 才能构造,
-/// 留在 `app.rs` 里就只剩源码结构守护那种弱断言。
-pub fn hotkey(
+/// `modal_open` 为真时不生效:此时键盘归 egui(T8)。闸门放在纯函数里是为了
+/// 让它能被真正测出来(`App` 要 `EventLoopProxy` 才能构造)。
+pub fn digit_hotkey(
     key: mullion_term::keymap::Key,
     mods: mullion_term::keymap::Mods,
     modal_open: bool,
-) -> Option<Intent> {
+) -> Option<usize> {
     use mullion_term::keymap::Key;
-    if modal_open || !mods.ctrl || mods.alt || mods.sup {
+    if modal_open || !mods.ctrl || mods.shift || mods.alt || mods.sup {
         return None;
     }
     match key {
-        Key::Tab if mods.shift => Some(Intent::Prev),
-        Key::Tab => Some(Intent::Next),
-        // `Ctrl+W` 抢的是 bash 的 `^W`(删前一个词)。这是刻意的取舍:关标签
-        // 是所有标签式客户端的通用肌肉记忆,而 `^W` 在 Claude Code 的 TUI 里
-        // 本就不常用。**留待实机验收**——若确实碍事就改 `Ctrl+Shift+W`。
-        Key::Char('w' | 'W') if !mods.shift => Some(Intent::CloseActive),
-        // 数字键**不接受 shift**:`Ctrl+Shift+2` 之类在很多终端里是别的东西,
-        // 而且用户按出它多半是想打字符不是切标签。
-        Key::Char(c) if !mods.shift && c.is_ascii_digit() && c != '0' => {
-            Some(Intent::Nth(c as usize - '0' as usize))
-        }
+        Key::Char(c) if c.is_ascii_digit() && c != '0' => Some(c as usize - '0' as usize),
         _ => None,
     }
 }
@@ -650,74 +629,47 @@ mod tests {
         }
     }
 
+    /// Ctrl+1…9 → 1-based;`Ctrl+0`、带 Shift/Alt/Super、裸键、Tab/W 一律放行。
+    ///
+    /// **裸键必须放行**是这组唯一的致命失效模式:判宽了就会吞掉本该进 PTY
+    /// 的键,现象是「远端某些键莫名其妙没反应」。Ctrl+Tab / Ctrl+W 也必须
+    /// 放行 —— 它们归 `crate::hotkeys`,这里再认一遍等于用户改不掉。
     #[test]
-    fn ctrl_tab_cycles_and_shift_reverses() {
-        use mullion_term::keymap::Key;
-        assert_eq!(
-            hotkey(Key::Tab, mods(true, false), false),
-            Some(Intent::Next)
-        );
-        assert_eq!(
-            hotkey(Key::Tab, mods(true, true), false),
-            Some(Intent::Prev)
-        );
-    }
-
-    #[test]
-    fn ctrl_w_closes_and_ctrl_digits_jump() {
-        use mullion_term::keymap::Key;
-        assert_eq!(
-            hotkey(Key::Char('w'), mods(true, false), false),
-            Some(Intent::CloseActive)
-        );
-        assert_eq!(
-            hotkey(Key::Char('W'), mods(true, false), false),
-            Some(Intent::CloseActive),
-            "大小写都要认 —— 用户按 Ctrl+Shift 之外的方式也可能送上大写"
-        );
-        assert_eq!(
-            hotkey(Key::Char('1'), mods(true, false), false),
-            Some(Intent::Nth(1))
-        );
-        assert_eq!(
-            hotkey(Key::Char('9'), mods(true, false), false),
-            Some(Intent::Nth(9))
-        );
-    }
-
-    /// **裸键必须放行**。这是这组快捷键唯一的致命失效模式:`hotkey` 判宽了就会
-    /// 吞掉本该进 PTY 的键,而现象是「远端某些键莫名其妙没反应」,极难定位。
-    /// 裸 Tab 尤其要紧 —— 它是 Claude Code 里的补全键(T8 的邻居)。
-    #[test]
-    fn plain_keys_and_other_modifiers_are_left_alone() {
-        use mullion_term::keymap::Key;
-        assert_eq!(
-            hotkey(Key::Tab, mods(false, false), false),
-            None,
-            "裸 Tab 是补全键"
-        );
-        assert_eq!(hotkey(Key::Tab, mods(false, true), false), None);
-        assert_eq!(hotkey(Key::Char('w'), mods(false, false), false), None);
-        assert_eq!(hotkey(Key::Char('1'), mods(false, false), false), None);
-        assert_eq!(
-            hotkey(Key::Char('0'), mods(true, false), false),
-            None,
-            "Ctrl+0 在浏览器里是「重置缩放」,不是切标签"
-        );
-        assert_eq!(
-            hotkey(Key::Char('w'), mods(true, true), false),
-            None,
-            "Ctrl+Shift+W 留白 —— 若实机验收判定 Ctrl+W 抢了 bash 的 ^W 太碍事,\
-             这就是备用位"
-        );
-        assert_eq!(hotkey(Key::Enter, mods(true, false), false), None);
-    }
-
-    /// `Ctrl+Alt+Tab` 是 Windows 的系统切换器,`Super` 归系统。吃掉它们一半,
-    /// 现象是系统快捷键时灵时不灵。
-    #[test]
-    fn alt_and_super_combinations_are_left_to_the_system() {
+    fn ctrl_digits_jump_and_everything_else_is_left_alone() {
         use mullion_term::keymap::{Key, Mods};
+        assert_eq!(
+            digit_hotkey(Key::Char('1'), mods(true, false), false),
+            Some(1)
+        );
+        assert_eq!(
+            digit_hotkey(Key::Char('9'), mods(true, false), false),
+            Some(9)
+        );
+        assert_eq!(
+            digit_hotkey(Key::Char('0'), mods(true, false), false),
+            None,
+            "Ctrl+0 是浏览器的重置缩放"
+        );
+        assert_eq!(
+            digit_hotkey(Key::Char('1'), mods(false, false), false),
+            None,
+            "裸数字是打字"
+        );
+        assert_eq!(
+            digit_hotkey(Key::Char('1'), mods(true, true), false),
+            None,
+            "Ctrl+Shift+数字在很多终端里是别的东西"
+        );
+        assert_eq!(
+            digit_hotkey(Key::Tab, mods(true, false), false),
+            None,
+            "Ctrl+Tab 归 hotkeys"
+        );
+        assert_eq!(
+            digit_hotkey(Key::Char('w'), mods(true, false), false),
+            None,
+            "Ctrl+W 归 hotkeys"
+        );
         let ctrl_alt = Mods {
             ctrl: true,
             shift: false,
@@ -730,34 +682,28 @@ mod tests {
             alt: false,
             sup: true,
         };
-        assert_eq!(hotkey(Key::Tab, ctrl_alt, false), None);
-        assert_eq!(hotkey(Key::Char('1'), ctrl_sup, false), None);
+        assert_eq!(
+            digit_hotkey(Key::Char('1'), ctrl_alt, false),
+            None,
+            "Alt+数字在 tmux 里有约定用法"
+        );
+        assert_eq!(
+            digit_hotkey(Key::Char('1'), ctrl_sup, false),
+            None,
+            "Super 归系统"
+        );
     }
 
-    /// 模态开着(会话管理器 / 关于 / 主机密钥 / 粘贴确认)时整组失效。
-    ///
-    /// 此时键盘归 egui(T8)。会话管理器的表单里按 `Ctrl+W` 该是「删前一个词」,
-    /// 按 `Ctrl+1` 该是输入或什么都不做 —— 绝不该把背后的标签关了 / 切了,
-    /// 而用户在弹窗里根本看不见背后发生了什么。
+    /// 模态开着时不生效(T8:此时键盘归 egui)。
     #[test]
-    fn tab_shortcuts_are_inert_while_a_modal_is_open() {
+    fn digit_shortcuts_are_inert_while_a_modal_is_open() {
         use mullion_term::keymap::Key;
-        for (key, m) in [
-            (Key::Tab, mods(true, false)),
-            (Key::Tab, mods(true, true)),
-            (Key::Char('w'), mods(true, false)),
-            (Key::Char('3'), mods(true, false)),
-        ] {
-            assert_eq!(
-                hotkey(key, m, true),
-                None,
-                "模态开着时 {key:?} 不该被标签栏吃掉"
-            );
-            assert!(
-                hotkey(key, m, false).is_some(),
-                "{key:?} 在无模态时本该命中,否则上面那条断言是空跑"
-            );
-        }
+        assert_eq!(digit_hotkey(Key::Char('3'), mods(true, false), true), None);
+        assert_eq!(
+            digit_hotkey(Key::Char('3'), mods(true, false), false),
+            Some(3),
+            "无模态时本该命中,否则上一条是空跑"
+        );
     }
 
     /// F122:没设覆盖时显示名 = 连接时拼的 `title`。

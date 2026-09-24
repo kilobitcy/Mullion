@@ -22,6 +22,7 @@ pub mod gpu;
 pub mod grid;
 pub mod heapgauge;
 pub mod host_key;
+pub mod hotkeys;
 pub mod icon_res;
 pub mod input;
 pub mod localtime;

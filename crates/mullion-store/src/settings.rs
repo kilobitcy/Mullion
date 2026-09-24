@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::StoreError;
 
@@ -134,6 +134,22 @@ pub struct Settings {
     /// 的收藏,而且看不出原因。
     #[serde(default)]
     pub local_bookmarks_migrated: bool,
+    /// F294:本地热键覆盖。**稀疏**:键是 app 侧的动作名(`next_tab` / `prev_tab` /
+    /// `close_tab` / `toggle_files` / `toggle_focus` / `new_project` / `toggle_drawer`),
+    /// 只放与默认不同的条目;默认值归 app,store 不认识动作。
+    ///
+    /// 空表不写进文件(`skip_serializing_if`),老文件没这一节照常读。
+    ///
+    /// **逐条容错**([`de_hotkeys`]):这一节是**设计给人手改的**,而 serde 的
+    /// 默认行为是「一条读不出来整份 `Settings` 反序列化失败」—— 那会让
+    /// `load` 整份退回默认值,用户的字号、本地收藏在下一次写盘时被永久抹掉,
+    /// 而症状与「热键写错了」毫无关系。所以坏的那一条丢掉、其余照收。
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty",
+        deserialize_with = "de_hotkeys"
+    )]
+    pub hotkeys: std::collections::BTreeMap<String, crate::hotkeys::Chord>,
 }
 
 impl Settings {
@@ -172,6 +188,32 @@ impl Settings {
     }
 }
 
+/// F294:`[hotkeys]` 的逐条容错反序列化 —— 先按 [`toml::Value`] 收下,再逐条
+/// 取字符串 + [`Chord::parse`](crate::hotkeys::Chord::parse),不认的**只丢那一条**。
+///
+/// **收成 `toml::Value` 而不是 `String`**:后者在「值不是字符串」时
+/// (`close_tab = 123`、`[hotkeys.close_tab]`)是**整节**反序列化失败,
+/// 后果与下面那段说的一样 —— 与写错键名同一种坏法,却牵连全份。整节本身
+/// 类型就错(`hotkeys = "oops"`)仍然整份报错,那时已经不是「一条写坏」了。
+///
+/// **不报错、也不记日志**:store 是零 UI 的持久化层,而且本 crate 不依赖任何
+/// 日志门面(加一个只为了这一句,不值)。被丢掉的那一条在下次写盘时从文件里
+/// 消失 —— 这是刻意的:留着它每次启动都要再解析一次、再丢一次,而用户看不到
+/// 任何解释;消失之后那个动作退回默认键,与「没配过」同形。
+fn de_hotkeys<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, crate::hotkeys::Chord>, D::Error> {
+    let raw = std::collections::BTreeMap::<String, toml::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(k, v)| {
+            v.as_str()
+                .and_then(|s| crate::hotkeys::Chord::parse(s).ok())
+                .map(|c| (k, c))
+        })
+        .collect())
+}
+
 fn default_font_pt() -> f32 {
     DEFAULT_FONT_PT
 }
@@ -202,6 +244,7 @@ impl Default for Settings {
             // 全新用户没有老数据要并,但标记仍从 `false` 起 —— 让首次启动
             // 走一遍(空)迁移再置上,两条路(有老库/没老库)不分叉。
             local_bookmarks_migrated: false,
+            hotkeys: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -664,6 +707,97 @@ mod tests {
             name: name.into(),
             path: path.into(),
         }
+    }
+
+    /// F294:热键覆盖**稀疏**落盘 —— 只写与默认不同的条目(默认值归 app,
+    /// store 不认识动作,所以「等于默认就删掉」这件事在 app 侧写回时做;
+    /// 这里守的是「空表不写、非空表原样读回」)。
+    ///
+    /// 自证会变红:去掉 `hotkeys` 上的 `skip_serializing_if`(第一条红)。
+    #[test]
+    fn hotkey_overrides_survive_a_round_trip_and_stay_sparse() {
+        let dir = tmp();
+        save(dir.path(), &Settings::default()).expect("写盘");
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(
+            !text.contains("hotkeys"),
+            "没改过热键却写了 [hotkeys]:{text}"
+        );
+
+        let mut s = Settings::default();
+        s.hotkeys.insert(
+            "toggle_drawer".into(),
+            crate::hotkeys::Chord::parse("ctrl+alt+d").unwrap(),
+        );
+        save(dir.path(), &s).expect("写盘");
+        let text = std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap();
+        assert!(
+            text.contains("toggle_drawer = \"ctrl+alt+d\""),
+            "不是一行字符串:{text}"
+        );
+        let back = load(dir.path());
+        assert!(back.note.is_none(), "{:?}", back.note);
+        assert_eq!(back.settings, s);
+    }
+
+    /// F294:`[hotkeys]` 是**设计给人手改**的一节,里面一条写错**不能**把整份
+    /// 设置拖下水。serde 的默认行为是整份反序列化失败 → `load` 退回默认值 →
+    /// 用户的字号、本地收藏在下一次写盘时被永久抹掉,而且症状与「热键写错」
+    /// 毫无关系,零报错。
+    ///
+    /// 自证会变红:去掉 `hotkeys` 上的 `deserialize_with = "de_hotkeys"`。
+    ///
+    /// **值不是字符串**(`next_tab = 123`)也只丢那一条:手改 TOML 的人漏写
+    /// 引号是常事,而 `BTreeMap<String, String>` 会在这一条上整份失败 ——
+    /// 与写错键名同样的后果,同样零报错。这一条与下面那条坏串的**一起**放在
+    /// 同一个文件里,才能证明两种坏法都不会牵连好的那条。
+    #[test]
+    fn a_typo_in_one_hotkey_does_not_take_the_whole_settings_file_down() {
+        let dir = tmp();
+        std::fs::write(
+            dir.path().join(SETTINGS_FILE),
+            format!(
+                "schema_version = {CURRENT_SETTINGS_SCHEMA}\n\
+                 font_pt = 13.5\n\
+                 [hotkeys]\n\
+                 toggle_drawer = \"ctrl+shift+bakctick\"\n\
+                 next_tab = 123\n\
+                 close_tab = \"ctrl+shift+w\"\n"
+            ),
+        )
+        .expect("写文件");
+        let back = load(dir.path());
+        assert!(back.note.is_none(), "整份读坏了:{:?}", back.note);
+        assert_eq!(back.settings.font_pt, 13.5, "别的字段被一条坏热键拖没了");
+        assert_eq!(
+            back.settings.hotkeys.get("close_tab").copied(),
+            Some(crate::hotkeys::Chord::parse("ctrl+shift+w").unwrap()),
+            "好的那条也被丢了"
+        );
+        assert!(
+            !back.settings.hotkeys.contains_key("toggle_drawer"),
+            "坏的那条被收下了 —— 它根本解析不出 Chord"
+        );
+        assert!(
+            !back.settings.hotkeys.contains_key("next_tab"),
+            "值不是字符串的那条被收下了"
+        );
+    }
+
+    /// F294 × F247:改热键只带走 `hotkeys` 这一个顶层键,别的实例改的字号不被抹掉。
+    #[test]
+    fn a_rebound_hotkey_is_grafted_without_touching_the_rest() {
+        let base = Settings::default();
+        let mut mine = base.clone();
+        mine.hotkeys.insert(
+            "close_tab".into(),
+            crate::hotkeys::Chord::parse("ctrl+shift+w").unwrap(),
+        );
+        let mut theirs = base.clone();
+        theirs.font_pt = 13.0;
+        graft_changed(&base, &mine, &mut theirs);
+        assert_eq!(theirs.font_pt, 13.0, "别人改的字号被抹掉了");
+        assert_eq!(theirs.hotkeys, mine.hotkeys, "热键没合进去");
     }
 
     /// F187:本地收藏夹存在**全局**设置里,写盘再读回还在。

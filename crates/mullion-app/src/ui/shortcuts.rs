@@ -5,7 +5,8 @@
 //! 快捷键的实现散在几处,没有统一注册中心:
 //!
 //! - `mullion_term::keymap` —— 编码给远端的键(T5/T6)
-//! - `app.rs` 的 `KeyboardInput` 分支 / 各 `*_hotkey_event` / `handle_panel_key`
+//! - `app.rs` 的 `KeyboardInput` 分支 / `bound_hotkey_event`(F294 起走
+//!   `crate::hotkeys`)/ `handle_panel_key`
 //!   + `shell::tabs` + `ui::annotate::hotkey` + `ui::session_manager::keys::scan`
 //!     —— 本地动作
 //!
@@ -33,14 +34,21 @@ pub enum Keys {
     /// `Ctrl+1 … Ctrl+N`。**n ≤ 9** —— `chords()` 是拿 `b'0' + d` 算键名的,
     /// 10 会算成 `:`(由 `every_row_is_filled_in` 守着)。
     CtrlDigits(u8),
+    /// F294:可配动作,真值在 settings 里 —— 显示用 [`Keys::display`] 传进来的
+    /// 当前值,撞键不看这里(可配动作之间的撞在 `hotkeys::vet` 里比)。
+    Bound(crate::hotkeys::Action),
     /// 不在 [`KeyName`] 键域里的键(Esc / Enter / Backspace …)或鼠标手势。
     /// **不参与撞键**:它们本来就绑不了。
     Text(&'static str),
 }
 
 impl Keys {
-    /// 显示文本。
-    pub fn display(&self) -> String {
+    /// 显示文本。`bound` 是可配动作的**当前**绑定(设置弹窗传草稿,别处传
+    /// `hotkeys::all_chords(&settings)`)—— 表里那 7 行的键不在表里,在 settings 里。
+    pub fn display(
+        &self,
+        bound: &std::collections::BTreeMap<crate::hotkeys::Action, Chord>,
+    ) -> String {
         match self {
             Self::Chord(c) => c.display(),
             Self::Chords(cs) => cs
@@ -49,6 +57,11 @@ impl Keys {
                 .collect::<Vec<_>>()
                 .join(" / "),
             Self::CtrlDigits(n) => format!("Ctrl+1 … Ctrl+{n}"),
+            Self::Bound(a) => bound
+                .get(a)
+                .copied()
+                .unwrap_or_else(|| a.default_chord())
+                .display(),
             Self::Text(s) => (*s).to_string(),
         }
     }
@@ -64,7 +77,7 @@ impl Keys {
             Self::CtrlDigits(n) => (1..=(*n).min(9))
                 .map(|d| ctrl(KeyName::Char(char::from(b'0' + d))))
                 .collect(),
-            Self::Text(_) => Vec::new(),
+            Self::Bound(_) | Self::Text(_) => Vec::new(),
         }
     }
 
@@ -78,16 +91,21 @@ impl Keys {
 #[derive(Debug, Clone, Copy)]
 pub struct Shortcut {
     pub keys: Keys,
-    /// 小节名。**撞键只在同一节内才算撞**(见 `no_two_rows_claim_the_same_chord`);
-    /// 「会话管理器」一节在 F294 的改键撞键判定里整体排除 —— 弹窗开着时本地
-    /// 热键整体让位(`modal_open`),不会真撞。
+    /// 小节名。
+    ///
+    /// **两套撞键判据,别混**:F295 的 `no_two_rows_claim_the_same_chord` 是
+    /// **按节**的(同一个键在不同焦点下是不同功能,跨节重名合法);F294 的
+    /// [`occupant`] 是**全局带豁免**的 —— 排除「会话管理器」一节(弹窗开着时
+    /// 本地热键整体让位 `modal_open`,不会真撞)、排除 [`Keys::Bound`] 行
+    /// (它们之间的撞在 `hotkeys::vet` 里比)、放行 [`Shortcut::shared_with`]
+    /// 配对的那一行。
     pub section: &'static str,
     /// 干什么。
     pub what: &'static str,
-    /// F294 撞键判定的**唯一白名单**:这一行与「项目」的建项目热键共享同一个
-    /// 组合键,靠焦点分辨(焦点在文件面板时建项目那条让位)。只有文件面板的
-    /// 「新建文件夹」那一行是 `true`。
-    pub shared_with_new_project: bool,
+    /// F294 撞键判定的**唯一白名单**:这一行与哪个可配动作共享同一个组合键,
+    /// 靠焦点分辨(焦点在文件面板时建项目那条让位)。只有文件面板的
+    /// 「新建文件夹」那一行是 `Some(Action::NewProject)`。
+    pub shared_with: Option<crate::hotkeys::Action>,
 }
 
 pub const fn plain(k: KeyName) -> Chord {
@@ -129,7 +147,7 @@ const fn row(keys: Keys, section: &'static str, what: &'static str) -> Shortcut 
         keys,
         section,
         what,
-        shared_with_new_project: false,
+        shared_with: None,
     }
 }
 
@@ -153,19 +171,19 @@ pub const SHORTCUTS: &[Shortcut] = &[
         SECTION_GENERAL,
         "退出标注模式;关掉会话管理器 / 恢复现场 / 换节点 / 选项目 / 文件对话框 / 粘贴确认 / 远端栏搜索条;放弃就地重命名",
     ),
-    // —— 标签(app.rs tab_hotkey_event / shell::tabs)——
+    // —— 标签(app.rs bound_hotkey_event / tab_hotkey_event + shell::tabs)——
     row(
-        Keys::Chord(ctrl(KeyName::Tab)),
+        Keys::Bound(crate::hotkeys::Action::NextTab),
         SECTION_TABS,
         "切到下一个标签",
     ),
     row(
-        Keys::Chord(ctrl_shift(KeyName::Tab)),
+        Keys::Bound(crate::hotkeys::Action::PrevTab),
         SECTION_TABS,
         "切到上一个标签",
     ),
     row(
-        Keys::Chord(ctrl(KeyName::Char('w'))),
+        Keys::Bound(crate::hotkeys::Action::CloseTab),
         SECTION_TABS,
         "关闭当前标签(抢了 bash 的 ^W 删词)",
     ),
@@ -196,15 +214,15 @@ pub const SHORTCUTS: &[Shortcut] = &[
         SECTION_TERMINAL,
         "插入换行而不提交",
     ),
-    // —— 文件面板(app.rs files/focus_hotkey_event + handle_panel_key)——
+    // —— 文件面板(app.rs bound_hotkey_event + handle_panel_key)——
     // 侧栏开关与换焦点全局生效;其余只在**焦点落在文件面板**时生效,且多数只认远端栏。
     row(
-        Keys::Chord(ctrl_shift(KeyName::Char('b'))),
+        Keys::Bound(crate::hotkeys::Action::ToggleFiles),
         SECTION_FILES,
         "开关文件侧栏(有选区时先跳到选区里那条路径)",
     ),
     row(
-        Keys::Chord(plain(KeyName::F(6))),
+        Keys::Bound(crate::hotkeys::Action::ToggleFocus),
         SECTION_FILES,
         "终端与文件面板之间换焦点(面板不在场时这个键照旧发给远端)",
     ),
@@ -222,7 +240,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
         keys: Keys::Chord(ctrl_shift(KeyName::Char('n'))),
         section: SECTION_FILES,
         what: "在远端栏就地新建文件夹(焦点在面板时压过「项目」那条)",
-        shared_with_new_project: true,
+        shared_with: Some(crate::hotkeys::Action::NewProject),
     },
     row(
         Keys::Chords(&[
@@ -302,15 +320,15 @@ pub const SHORTCUTS: &[Shortcut] = &[
         SECTION_ANNOTATE,
         "在紧凑 / 标准 / 详细三档间循环",
     ),
-    // —— 项目(app.rs project_hotkey_event)——
+    // —— 项目(app.rs bound_hotkey_event)——
     row(
-        Keys::Chord(ctrl_shift(KeyName::Char('n'))),
+        Keys::Bound(crate::hotkeys::Action::NewProject),
         SECTION_PROJECT,
         "把当前分屏的目录和 tmux 会话收成一个新项目(焦点在文件面板时让位)",
     ),
-    // —— 命令抽屉(app.rs drawer_hotkey_event)——
+    // —— 命令抽屉(app.rs bound_hotkey_event)——
     row(
-        Keys::Chord(ctrl(KeyName::Char('`'))),
+        Keys::Bound(crate::hotkeys::Action::ToggleDrawer),
         SECTION_DRAWER,
         "在焦点分屏底下开 / 关命令抽屉",
     ),
@@ -328,9 +346,32 @@ pub fn sections() -> Vec<(&'static str, Vec<&'static Shortcut>)> {
     out
 }
 
+/// F294 撞键:硬名单里谁占了 `c`。排除「会话管理器」一节(弹窗开着时本地
+/// 热键整体让位)、排除可配行(它们之间的撞在 `hotkeys::vet` 里比)、放行
+/// 唯一的白名单对([`Shortcut::shared_with`] × 那个动作)。
+pub fn occupant(c: &Chord, for_action: crate::hotkeys::Action) -> Option<&'static Shortcut> {
+    SHORTCUTS.iter().find(|s| {
+        s.section != SECTION_SESSION_MANAGER
+            && s.shared_with != Some(for_action)
+            && s.keys.covers(c)
+    })
+}
+
+/// 某个可配动作在表里的「干什么」,撞键报错用。
+pub fn what_of(a: crate::hotkeys::Action) -> &'static str {
+    SHORTCUTS
+        .iter()
+        .find(|s| s.keys == Keys::Bound(a))
+        .map_or("(未登记的动作)", |s| s.what)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn defaults() -> std::collections::BTreeMap<crate::hotkeys::Action, Chord> {
+        crate::hotkeys::all_chords(&mullion_store::Settings::default())
+    }
 
     /// **同一节里一个组合键只能有一个含义。**
     ///
@@ -344,7 +385,13 @@ mod tests {
         let mut seen_chords: Vec<(&str, Chord)> = Vec::new();
         let mut seen_text: Vec<(&str, &str)> = Vec::new();
         for s in SHORTCUTS {
-            for c in s.keys.chords() {
+            // 可配行的 `chords()` 为空(真值在 settings 里),但**默认值**仍要在
+            // 同节内不撞 —— 否则新装的客户端开箱就有两条行争同一个键。
+            let chords = match s.keys {
+                Keys::Bound(a) => vec![a.default_chord()],
+                other => other.chords(),
+            };
+            for c in chords {
                 assert!(
                     !seen_chords.contains(&(s.section, c)),
                     "「{}」在「{}」里出现了两次 —— 同一个组合键不能有两个含义",
@@ -381,16 +428,17 @@ mod tests {
     #[test]
     fn every_row_is_filled_in() {
         for s in SHORTCUTS {
-            assert!(!s.keys.display().trim().is_empty(), "有一行没写组合键");
+            let b = defaults();
+            assert!(!s.keys.display(&b).trim().is_empty(), "有一行没写组合键");
             assert!(
                 !s.section.trim().is_empty(),
                 "「{}」没写小节",
-                s.keys.display()
+                s.keys.display(&b)
             );
             assert!(
                 !s.what.trim().is_empty(),
                 "「{}」没写作用",
-                s.keys.display()
+                s.keys.display(&b)
             );
             if let Keys::CtrlDigits(n) = s.keys {
                 assert!(n <= 9, "CtrlDigits({n}) 越界 —— 10 会被算成 `Ctrl+:`");
@@ -427,11 +475,12 @@ mod tests {
         // 绑成 `const` 而不是写成临时数组:`Keys::Chords` 要 `&'static [Chord]`,
         // 而函数体里的 `&[shift(..)]` 不走常量提升(带 const fn 调用),借用活不到 'static。
         const PAGES: [Chord; 2] = [shift(KeyName::PageUp), shift(KeyName::PageDown)];
+        let b = defaults();
         assert_eq!(
-            Keys::Chords(&PAGES).display(),
+            Keys::Chords(&PAGES).display(&b),
             "Shift+PageUp / Shift+PageDown"
         );
-        assert_eq!(Keys::CtrlDigits(9).display(), "Ctrl+1 … Ctrl+9");
+        assert_eq!(Keys::CtrlDigits(9).display(&b), "Ctrl+1 … Ctrl+9");
         assert!(Keys::CtrlDigits(9).covers(&ctrl(KeyName::Char('5'))));
         assert!(!Keys::CtrlDigits(4).covers(&ctrl(KeyName::Char('5'))));
         assert!(!Keys::CtrlDigits(9).covers(&ctrl_shift(KeyName::Char('5'))));
@@ -439,16 +488,50 @@ mod tests {
 
     /// 白名单只有一对。
     ///
-    /// 自证会变红:给「项目」那一行也标上 `shared_with_new_project: true`。
+    /// 自证会变红:给「文件面板」的「新建文件」那一行也标上
+    /// `shared_with: Some(Action::NewProject)`。
     #[test]
     fn the_only_shared_chord_is_the_files_panel_new_folder() {
         let shared: Vec<&Shortcut> = SHORTCUTS
             .iter()
-            .filter(|s| s.shared_with_new_project)
+            .filter(|s| s.shared_with.is_some())
             .collect();
-        assert_eq!(shared.len(), 1);
-        assert_eq!(shared[0].section, SECTION_FILES);
+        assert_eq!(shared.len(), 1, "白名单不止一对");
+        assert_eq!(
+            shared[0].shared_with,
+            Some(crate::hotkeys::Action::NewProject)
+        );
         assert_eq!(shared[0].keys, Keys::Chord(ctrl_shift(KeyName::Char('n'))));
+        assert_eq!(shared[0].section, SECTION_FILES);
+    }
+
+    /// 7 条可配动作在表里各有且只有一行;每一行都登记了 `what`。
+    ///
+    /// 自证会变红:把命令抽屉那行改回 `Keys::Chord(..)`。
+    #[test]
+    fn every_configurable_action_has_exactly_one_row() {
+        for a in crate::hotkeys::Action::ALL {
+            let n = SHORTCUTS
+                .iter()
+                .filter(|s| s.keys == Keys::Bound(a))
+                .count();
+            assert_eq!(n, 1, "{a:?} 在表里出现了 {n} 次");
+            assert_ne!(what_of(a), "(未登记的动作)");
+        }
+    }
+
+    /// 可配行的显示跟着传入的当前值走,不是默认值。
+    #[test]
+    fn a_bound_row_displays_the_current_chord() {
+        let mut b = defaults();
+        b.insert(
+            crate::hotkeys::Action::ToggleDrawer,
+            Chord::parse("ctrl+alt+d").unwrap(),
+        );
+        assert_eq!(
+            Keys::Bound(crate::hotkeys::Action::ToggleDrawer).display(&b),
+            "Ctrl+Alt+D"
+        );
     }
 
     /// 表里每个 chord 都是「能写进 TOML 也能读回来」的:裸 `KeyName::Char(..)`
@@ -458,7 +541,11 @@ mod tests {
     #[test]
     fn every_table_chord_round_trips() {
         for s in SHORTCUTS {
-            for c in s.keys.chords() {
+            let chords = match s.keys {
+                Keys::Bound(a) => vec![a.default_chord()],
+                other => other.chords(),
+            };
+            for c in chords {
                 assert_eq!(
                     Chord::parse(&c.canonical()),
                     Ok(c),

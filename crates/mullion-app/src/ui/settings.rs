@@ -29,6 +29,17 @@ const OSC7_LABEL: &str = "让远端 shell 报出当前目录(非 tmux 场景)";
 /// 内置 + 微软雅黑两级,链外字形静默画成豆腐块)。
 const HIDDEN_FILES_LABEL: &str = "文件面板显示以 . 开头的项";
 
+/// F294:可配行进入捕获态时按钮上的字。实现与测试**共用这一份**(同上)。
+///
+/// 括号里那句是**唯一**告诉用户怎么退出捕获的地方(另一条出口是点弹窗里
+/// 别处,那个无从提示)。括号用 ASCII —— 全角括号不在已登记字形里(T9)。
+pub(crate) const CAPTURE_LABEL: &str = "请按下新组合键(Esc 取消)…";
+/// F294:改过的行后面那个按钮。
+pub(crate) const RESTORE_LABEL: &str = "恢复默认";
+/// F294:按到不在键域里的键(Enter / Space / 死键…)时的提示。
+/// `app.rs::hotkey_capture_event` 在写这条提示,所以是 `pub(crate)`。
+pub(crate) const UNBINDABLE_MSG: &str = "这个键不能用作快捷键";
+
 /// 三档的中文标签。**实现与测试共用同一份** —— 各写一遍的话,改文案时
 /// 测试会静默地点不中,`interact` 里那句 panic 才是唯一的提示。
 const LEVEL_ERROR_LABEL: &str = "只记错误";
@@ -106,6 +117,13 @@ pub struct SettingsDraft {
     pub cloud_pass_new: String,
     /// F283:「确认口令」框。
     pub cloud_pass_confirm: String,
+    /// F294:7 条可配热键的当前值(**全量**,默认已填上);点「确定」时只把
+    /// 与默认不同的写回 `Settings.hotkeys`(`hotkeys::write_back`)。
+    pub hotkeys: std::collections::BTreeMap<crate::hotkeys::Action, mullion_store::Chord>,
+    /// F294:正在等用户按新组合键的那一行。
+    pub capturing: Option<crate::hotkeys::Action>,
+    /// F294:上一次捕获被拒的原因,画在表底下;成功捕获 / 再次点开 / Esc 时清掉。
+    pub hotkey_error: Option<String>,
 }
 
 impl SettingsDraft {
@@ -159,6 +177,25 @@ impl SettingsDraft {
             cloud_secret_new: String::new(),
             cloud_pass_new: String::new(),
             cloud_pass_confirm: String::new(),
+            hotkeys: crate::hotkeys::all_chords(s),
+            capturing: None,
+            hotkey_error: None,
+        }
+    }
+
+    /// F294:捕获到一个组合键。**先裁决再写**:`vet` 不过就一个字都不动草稿,
+    /// 留在捕获态等用户再按(Esc 退出在 `app.rs::hotkey_capture_event`)。
+    pub fn capture(&mut self, chord: mullion_store::Chord) {
+        let Some(action) = self.capturing else {
+            return;
+        };
+        match crate::hotkeys::vet(&self.hotkeys, action, chord) {
+            Ok(()) => {
+                self.hotkeys.insert(action, chord);
+                self.capturing = None;
+                self.hotkey_error = None;
+            }
+            Err(msg) => self.hotkey_error = Some(msg),
         }
     }
 
@@ -304,7 +341,7 @@ pub fn show(
                         form::section(ui, t, "设置", "云端备份", &mut first);
                         cloud(ui, t, draft, env, &mut out);
                         form::section(ui, t, "设置", "快捷键", &mut first);
-                        shortcut_table(ui, t);
+                        shortcut_table(ui, t, draft);
                     });
                 });
             });
@@ -962,7 +999,33 @@ fn cloud(
 /// 也**不再自带 `ScrollArea`**:设置正文外层已经是一个不设 max_height 的
 /// `ScrollArea`(F217 的形状),内层再套一个 220pt 的只会露出两节,还把守护
 /// 测试逼成只查得了前三节。
-fn shortcut_table(ui: &mut egui::Ui, t: &Theme) {
+fn shortcut_table(ui: &mut egui::Ui, t: &Theme, draft: &mut SettingsDraft) {
+    use crate::ui::shortcuts::Keys;
+    // 拒绝原因画在表**上面**(「快捷键」小节标题的正下方)。画在表底下的话
+    // 它离屏幕一千点开外 —— 用户正在改的多半是前面几节,提示在视野外等于
+    // 没有;而测试用的假屏不裁,两种画法在测试里都「找得到这段文字」。
+    // 画进被拒的那一行也不行:会把整张表的行高顶乱,一格里也放不下
+    // 「已被「复制选区」(终端)占用」这种句子。
+    if let Some(msg) = &draft.hotkey_error {
+        ui.label(
+            egui::RichText::new(msg)
+                .size(11.0)
+                .color(theme::c32(t.danger_text)),
+        );
+    }
+    // F294:捕获态的第二个出口 —— 这一帧的指针按下没落在正在捕获那一行的
+    // 按钮上,就当用户改主意了。**必须有这个出口**:捕获期间
+    // `app.rs::hotkey_capture_event` 吞掉整个弹窗的键盘,用户改主意去点字号
+    // 输入框会一个字都打不进去,按 `Ctrl+A` / `Ctrl+S` 还会被静默绑走。
+    //
+    // 判据取的是**本帧开头**的捕获行:`clicked()` 在松键那帧才为真,而
+    // `any_pressed()` 在按下那帧 —— 「按下时清、松开时 clicked 再设」天然
+    // 自洽,点同一按钮也等价。`draft.capturing == was_capturing` 那一道是给
+    // 「按下与松开落在同一帧」的场合兜底:这一帧已经点出新的捕获行时,不能
+    // 反手把它清掉。
+    let was_capturing = draft.capturing;
+    let pressed = ui.input(|i| i.pointer.any_pressed());
+    let mut pressed_on_capturing = false;
     egui::Grid::new("settings_shortcuts")
         .num_columns(2)
         .spacing([SP_M, SP_S])
@@ -978,12 +1041,62 @@ fn shortcut_table(ui: &mut egui::Ui, t: &Theme) {
                 ui.label("");
                 ui.end_row();
                 for s in rows {
-                    ui.label(egui::RichText::new(s.keys.display()).color(theme::c32(t.fg)));
+                    match s.keys {
+                        // F294:可配行 —— 键那一格是按钮,点下去进捕获态。
+                        Keys::Bound(a) => {
+                            ui.horizontal(|ui| {
+                                let chord = draft
+                                    .hotkeys
+                                    .get(&a)
+                                    .copied()
+                                    .unwrap_or_else(|| a.default_chord());
+                                let label = if draft.capturing == Some(a) {
+                                    CAPTURE_LABEL.to_string()
+                                } else {
+                                    chord.display()
+                                };
+                                let resp =
+                                    ui.button(egui::RichText::new(label).color(theme::c32(t.fg)));
+                                if was_capturing == Some(a) && resp.interact_pointer_pos().is_some()
+                                {
+                                    pressed_on_capturing = true;
+                                }
+                                if resp.clicked() {
+                                    draft.capturing = Some(a);
+                                    draft.hotkey_error = None;
+                                }
+                                // 改过的行才给「恢复默认」:每行都挂一个的话,
+                                // 这一列全是按钮,反而看不出哪几行被改过。
+                                if chord != a.default_chord()
+                                    && ui.small_button(RESTORE_LABEL).clicked()
+                                {
+                                    draft.hotkeys.insert(a, a.default_chord());
+                                    draft.hotkey_error = None;
+                                }
+                            });
+                        }
+                        // 不可配的行照旧是一段文字。可配行的当前值由草稿供给,
+                        // 所以这里传的也是草稿 —— 两边同源。
+                        _ => {
+                            ui.label(
+                                egui::RichText::new(s.keys.display(&draft.hotkeys))
+                                    .color(theme::c32(t.fg)),
+                            );
+                        }
+                    }
                     ui.label(s.what);
                     ui.end_row();
                 }
             }
         });
+    if was_capturing.is_some()
+        && pressed
+        && !pressed_on_capturing
+        && draft.capturing == was_capturing
+    {
+        draft.capturing = None;
+        draft.hotkey_error = None;
+    }
 }
 
 #[cfg(test)]
@@ -1044,6 +1157,19 @@ mod tests {
         not_monospace: bool,
         has_master_password: bool,
     ) -> (Vec<String>, SettingsOut) {
+        let (texts, out) = run_texts_with_pos(d, not_monospace, has_master_password);
+        (texts.into_iter().map(|(s, _)| s).collect(), out)
+    }
+
+    /// 同 `run_env`,但连每段文字画在哪儿一起收。**位置判据要它**:
+    /// 「拒绝原因画在表上面还是表底下」只比文字在不在是看不出来的(假屏
+    /// 10000pt 不裁,画在一千点开外也照样收得到);「进捕获态会不会把描述
+    /// 那一列挤走」更是只有 x 看得见。
+    fn run_texts_with_pos(
+        d: &mut SettingsDraft,
+        not_monospace: bool,
+        has_master_password: bool,
+    ) -> (Vec<(String, egui::Pos2)>, SettingsOut) {
         let fams = known();
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
@@ -1067,10 +1193,10 @@ mod tests {
             shapes = full.shapes;
         }
         let mut texts = Vec::new();
-        fn walk(shape: &egui::Shape, acc: &mut Vec<String>) {
+        fn walk(shape: &egui::Shape, acc: &mut Vec<(String, egui::Pos2)>) {
             match shape {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
-                egui::Shape::Text(ts) => acc.push(ts.galley.text().to_string()),
+                egui::Shape::Text(ts) => acc.push((ts.galley.text().to_string(), ts.pos)),
                 _ => {}
             }
         }
@@ -1580,6 +1706,11 @@ mod tests {
     /// F295:表按小节画,Esc 只出现一次。
     ///
     /// 内层 `ScrollArea` 去掉之后全部八节都画得出来,所以查得到后面的节。
+    /// **这一条还依赖 harness 的一个前提**:`run_env` 喂的是
+    /// `RawInput::default()`,没设 `screen_rect`,egui 退到 10000pt 的假屏,
+    /// 外层那个 `ScrollArea` 一行都不裁。日后要是给 harness 设了一个真实
+    /// 大小的小屏,这条会因为后面几节被裁掉而红 —— 那时该改的是判据
+    /// (滚到那一节再查),不是把节名删掉。
     /// **故意不查「文件面板」**——设置弹窗自己有一节就叫这个名字,拿它当
     /// 判据的话,哪怕分节整个没画出来也照样绿(判据被同名的无关文本接住
     /// = 恒绿)。
@@ -1612,6 +1743,220 @@ mod tests {
             texts.iter().filter(|s| s.as_str() == "Esc").count(),
             1,
             "Esc 不是恰好一次:{texts:?}"
+        );
+    }
+
+    // ---- F294:改键 ----
+
+    /// 点可配行的键 → 进入捕获态,按钮文字换成提示。
+    ///
+    /// 自证会变红:把 `shortcut_table` 里 `draft.capturing = Some(a)` 删掉。
+    #[test]
+    fn clicking_a_bound_chord_enters_capture() {
+        let mut d = draft();
+        let _ = click(&mut d, "Ctrl+Shift+`");
+        assert_eq!(d.capturing, Some(crate::hotkeys::Action::ToggleDrawer));
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s == CAPTURE_LABEL),
+            "没显示捕获提示:{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|s| s == "Ctrl+Shift+`"),
+            "捕获态下还画着旧键"
+        );
+    }
+
+    /// 「恢复默认」只在改过的行出现;点了回到默认并消失。
+    ///
+    /// 自证会变红:把 `chord != a.default_chord()` 那个判断改成 `true`(第一条红)。
+    #[test]
+    fn restore_default_only_shows_for_changed_rows() {
+        let mut d = draft();
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            !texts.iter().any(|s| s == RESTORE_LABEL),
+            "没改过键就出了恢复按钮"
+        );
+        d.hotkeys.insert(
+            crate::hotkeys::Action::ToggleDrawer,
+            mullion_store::Chord::parse("ctrl+alt+d").unwrap(),
+        );
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s == "Ctrl+Alt+D"),
+            "没画出改过的键:{texts:?}"
+        );
+        assert_eq!(
+            texts.iter().filter(|s| s.as_str() == RESTORE_LABEL).count(),
+            1
+        );
+        let _ = click(&mut d, RESTORE_LABEL);
+        assert_eq!(
+            d.hotkeys[&crate::hotkeys::Action::ToggleDrawer],
+            crate::hotkeys::Action::ToggleDrawer.default_chord()
+        );
+    }
+
+    /// 捕获:合法且不撞 → 写进草稿、退出捕获;撞了 → 不写、留在捕获态、错误上屏。
+    ///
+    /// 自证会变红:`capture` 里把 `Err` 分支也 `insert`。
+    #[test]
+    fn capture_writes_only_a_vetted_chord() {
+        let mut d = draft();
+        d.capturing = Some(crate::hotkeys::Action::ToggleDrawer);
+        d.capture(crate::ui::shortcuts::ctrl_shift(
+            mullion_store::KeyName::Char('c'),
+        ));
+        assert_eq!(
+            d.hotkeys[&crate::hotkeys::Action::ToggleDrawer],
+            crate::hotkeys::Action::ToggleDrawer.default_chord(),
+            "撞键的绑定写进草稿了"
+        );
+        assert_eq!(
+            d.capturing,
+            Some(crate::hotkeys::Action::ToggleDrawer),
+            "拒绝后应留在捕获态"
+        );
+        let (texts, _) = run(&mut d, false);
+        assert!(
+            texts.iter().any(|s| s.contains("复制选区")),
+            "没报出占用者:{texts:?}"
+        );
+
+        d.capture(mullion_store::Chord::parse("ctrl+alt+d").unwrap());
+        assert_eq!(
+            d.hotkeys[&crate::hotkeys::Action::ToggleDrawer].canonical(),
+            "ctrl+alt+d"
+        );
+        assert_eq!(d.capturing, None);
+        assert_eq!(d.hotkey_error, None);
+    }
+
+    /// F294 复核:捕获态的第二个出口 —— 点弹窗里别处就退出捕获。
+    ///
+    /// 没有这个出口的话:捕获态吞掉整个弹窗的键盘(`app.rs::hotkey_capture_event`),
+    /// 用户改主意去点字号输入框,打字一个字都进不去;要是按了 `Ctrl+A` /
+    /// `Ctrl+S`,还会被**静默**绑到刚才点开的那一行上(`vet` 对它们放行)。
+    ///
+    /// 自证会变红:把 `shortcut_table` 末尾那句 `draft.capturing = None;` 删掉。
+    #[test]
+    fn clicking_elsewhere_leaves_capture() {
+        let mut d = draft();
+        d.capturing = Some(crate::hotkeys::Action::ToggleDrawer);
+        d.hotkey_error = Some("已被「复制选区」(终端)占用".into());
+        // 点一行普通描述文字(不是任何按钮)。
+        let _ = click(&mut d, "切到下一个标签");
+        assert_eq!(d.capturing, None, "点了别处还留在捕获态");
+        assert_eq!(d.hotkey_error, None, "退出捕获没把拒绝原因清掉");
+    }
+
+    /// F294 复核:点**另一条**可配行的键 → 捕获挪过去,不是被「点了别处」
+    /// 那条出口顺手清掉。
+    ///
+    /// 这一条扎的是出口判据里 `draft.capturing == was_capturing` 那一道:
+    /// 测试 harness(以及真机上的快速点击)把按下与松开放在同一帧,先
+    /// `clicked()` 设出新的捕获行、再走到出口那句 —— 少了这一道,用户改主意
+    /// 点另一行的键,看到的是「闪一下什么也没发生」。
+    ///
+    /// 自证会变红:把出口那句里的 `&& draft.capturing == was_capturing` 删掉。
+    #[test]
+    fn clicking_another_bound_row_moves_the_capture() {
+        let mut d = draft();
+        d.capturing = Some(crate::hotkeys::Action::ToggleDrawer);
+        let _ = click(&mut d, "Ctrl+Tab");
+        assert_eq!(
+            d.capturing,
+            Some(crate::hotkeys::Action::NextTab),
+            "点另一条可配行没把捕获挪过去"
+        );
+    }
+
+    /// F294 复核:再点一次**正在捕获**那一行的按钮 → 留在捕获态。
+    ///
+    /// 扎的是 `was_capturing == Some(a) && resp.interact_pointer_pos().is_some()`
+    /// 那一道:少了它,这一下会被当成「点在别处」,用户点了自己那颗按钮反而
+    /// 退出捕获。
+    ///
+    /// 自证会变红:把 `was_capturing == Some(a)` 改成 `false`。
+    #[test]
+    fn clicking_the_capturing_button_again_stays_in_capture() {
+        let mut d = draft();
+        d.capturing = Some(crate::hotkeys::Action::ToggleDrawer);
+        let _ = click(&mut d, CAPTURE_LABEL);
+        assert_eq!(
+            d.capturing,
+            Some(crate::hotkeys::Action::ToggleDrawer),
+            "点自己这颗按钮把捕获退掉了"
+        );
+    }
+
+    /// F294 复核:进捕获态不许把「作用」那一列挤走。
+    ///
+    /// `CAPTURE_LABEL` 比任何一个组合键都长,而八节共用一个 `Grid`:它一旦
+    /// 超过键列现有的宽度,整张表的第二列会当场右移 —— 用户点一下键,半张
+    /// 表跳一下。余量只有十几点,改文案很容易吃掉它,而**画面之外没有任何
+    /// 报错**。
+    ///
+    /// 判据取的是不相干的第三方参照物:「切到下一个标签」那条**描述**文字的
+    /// x(它在第二列,既不是被改的那颗按钮,也不是捕获提示自己)。
+    ///
+    /// 自证会变红:把 `CAPTURE_LABEL` 临时改成二十个汉字。
+    #[test]
+    fn entering_capture_does_not_shift_the_description_column() {
+        const PROBE: &str = "切到下一个标签";
+        let x_of = |d: &mut SettingsDraft| {
+            let (texts, _) = run_texts_with_pos(d, false, false);
+            texts
+                .iter()
+                .find(|(s, _)| s == PROBE)
+                .unwrap_or_else(|| panic!("画面上没有「{PROBE}」:{texts:?}"))
+                .1
+                .x
+        };
+        let mut d = draft();
+        let before = x_of(&mut d);
+        d.capturing = Some(crate::hotkeys::Action::ToggleDrawer);
+        let after = x_of(&mut d);
+        assert!(
+            (after - before).abs() < 0.5,
+            "进捕获态把描述列从 x={before} 挤到了 x={after} —— 捕获提示比键列还宽"
+        );
+    }
+
+    /// F294 复核:拒绝原因画在表**上面**。
+    ///
+    /// 表实测一千点高,画在表底下的话,用户改「标签」节那几行时提示在一千点
+    /// 开外 —— 而这套 harness 的假屏(`RawInput::default()` 不设 `screen_rect`,
+    /// egui 退到 10000pt)不裁,光比「文字出现没有」两种画法都绿。
+    ///
+    /// 判据引**第三方参照物**:第一条可配行那个按钮(「Ctrl+Tab」)的 y。
+    /// 它跟错误标签不同源,谁挪了位置都会动这条判据。
+    ///
+    /// 自证会变红:把那段 `if let Some(msg)` 挪回 `Grid::show(..)` 之后。
+    #[test]
+    fn the_rejection_message_is_painted_above_the_table() {
+        let mut d = draft();
+        d.capturing = Some(crate::hotkeys::Action::ToggleDrawer);
+        d.capture(crate::ui::shortcuts::ctrl_shift(
+            mullion_store::KeyName::Char('c'),
+        ));
+        let msg = d.hotkey_error.clone().expect("撞键没报出原因");
+        let (texts, _) = run_texts_with_pos(&mut d, false, false);
+        let y_of = |want: &str| {
+            texts
+                .iter()
+                .find(|(s, _)| s == want)
+                .unwrap_or_else(|| panic!("画面上没有「{want}」:{texts:?}"))
+                .1
+                .y
+        };
+        let msg_y = y_of(&msg);
+        let first_row_y = y_of("Ctrl+Tab");
+        assert!(
+            msg_y < first_row_y,
+            "拒绝原因画在表里/表底下(y={msg_y},第一条可配行 y={first_row_y})\
+             —— 用户改后面几节的键时看不见它"
         );
     }
 
