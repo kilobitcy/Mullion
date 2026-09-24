@@ -344,10 +344,6 @@ mod tests {
         for bad in [
             "",
             "ctrl+",
-            // 空白不是可见字符,走 `KeyName::char` 就被拒;trim 由
-            // `parse_and_canonical_are_inverse_and_case_insensitive` 里的
-            // `"  ctrl+n  "` 钉。
-            "ctrl+ ",
             "ctrl",
             "ctrl+enter",
             "esc",

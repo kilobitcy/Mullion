@@ -1577,7 +1577,9 @@ mod tests {
     /// Esc 那条查得住是因为它在第一节,一定可见。
     ///
     /// 自证会变红:把 `shortcut_table` 里 `ui.label(theme::hint_text(t, name))`
-    /// 删掉(第一条红);往 `SHORTCUTS` 的「标注模式」加回一行 Esc(第二条红)。
+    /// 删掉(第一条红);往 `SHORTCUTS` 的**「标签」**节加一行 `Keys::Text("Esc")`
+    /// (第二条红)。加到「标注模式」节**不会红** —— 那一节在 220pt 视口外,
+    /// 被裁掉了根本不生成 `Shape::Text`。
     #[test]
     fn the_shortcut_table_is_grouped_into_sections() {
         let mut d = draft();

@@ -30,7 +30,8 @@ pub enum Keys {
     Chord(Chord),
     /// 同一功能的几个键,显示用「 / 」连。
     Chords(&'static [Chord]),
-    /// `Ctrl+1 … Ctrl+N`。
+    /// `Ctrl+1 … Ctrl+N`。**n ≤ 9** —— `chords()` 是拿 `b'0' + d` 算键名的,
+    /// 10 会算成 `:`(由 `every_row_is_filled_in` 守着)。
     CtrlDigits(u8),
     /// 不在 [`KeyName`] 键域里的键(Esc / Enter / Backspace …)或鼠标手势。
     /// **不参与撞键**:它们本来就绑不了。
@@ -147,7 +148,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     row(
         Keys::Text("Esc"),
         SECTION_GENERAL,
-        "退出标注模式;关掉会话管理器 / 恢复现场 / 换节点 / 选项目 / 文件对话框 / 远端栏搜索条",
+        "退出标注模式;关掉会话管理器 / 恢复现场 / 换节点 / 选项目 / 文件对话框 / 粘贴确认 / 远端栏搜索条;放弃就地重命名",
     ),
     // —— 标签(app.rs tab_hotkey_event / shell::tabs)——
     row(
@@ -388,6 +389,9 @@ mod tests {
                 "「{}」没写作用",
                 s.keys.display()
             );
+            if let Keys::CtrlDigits(n) = s.keys {
+                assert!(n <= 9, "CtrlDigits({n}) 越界 —— 10 会被算成 `Ctrl+:`");
+            }
         }
     }
 
