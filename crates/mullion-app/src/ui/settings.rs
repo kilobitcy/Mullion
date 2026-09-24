@@ -14,7 +14,6 @@ use crate::theme::{self, Theme};
 use crate::ui::annotate;
 use crate::ui::metrics::{field_w, FIELD_W_M, FIELD_W_S, SP_L, SP_M, SP_S};
 use crate::ui::session_manager::form;
-use crate::ui::shortcuts::SHORTCUTS;
 
 /// 自举开关的标签。测试要靠它在画出来的 `Shape::Text` 里找到这个部件,
 /// 所以实现与测试必须共用同一份 —— 各写一遍的话改文案时测试会静默地
@@ -950,23 +949,29 @@ fn cloud(
 ///
 /// 显式 `.color(..)` 之后 `.strong()` 就只剩噪音了(`RichText::get_text_color`
 /// 里 `text_color` 排在 `strong` 前面,给了色 strong 一点效果都没有),所以
-/// 直接去掉;这一列的「更醒目」靠 `fg`(9.4:1)与另两列的 `fg_muted`(4.77:1)
+/// 直接去掉;这一列的「更醒目」靠 `fg`(9.4:1)与另一列的 `fg_muted`(4.77:1)
 /// 分层。全库级的守护在 `tests/strong_text_color.rs`。
+///
+/// F295:按小节分组 —— 每节一个小标题 + 一张两列网格(原来是不分节的三列,
+/// 中间那列是「在哪儿生效」,每行都重复一遍)。
 fn shortcut_table(ui: &mut egui::Ui, t: &Theme) {
     egui::ScrollArea::vertical()
         .max_height(220.0)
         .show(ui, |ui| {
-            egui::Grid::new("settings_shortcuts")
-                .num_columns(3)
-                .spacing([SP_M, SP_S])
-                .show(ui, |ui| {
-                    for s in SHORTCUTS {
-                        ui.label(egui::RichText::new(s.chord).color(theme::c32(t.fg)));
-                        ui.label(theme::hint_text(t, s.scope));
-                        ui.label(s.what);
-                        ui.end_row();
-                    }
-                });
+            for (name, rows) in crate::ui::shortcuts::sections() {
+                ui.add_space(SP_S);
+                ui.label(theme::hint_text(t, name));
+                egui::Grid::new(("settings_shortcuts", name))
+                    .num_columns(2)
+                    .spacing([SP_M, SP_S])
+                    .show(ui, |ui| {
+                        for s in rows {
+                            ui.label(egui::RichText::new(s.keys.display()).color(theme::c32(t.fg)));
+                            ui.label(s.what);
+                            ui.end_row();
+                        }
+                    });
+            }
         });
 }
 
@@ -1558,6 +1563,35 @@ mod tests {
         assert!(
             texts.iter().any(|s| s == "Ctrl+Shift+C"),
             "快捷键一览是空的:{texts:?}"
+        );
+    }
+
+    /// F295:表按小节画,Esc 只出现一次。
+    ///
+    /// **只查前三节**:一览表裹在 `max_height(220.0)` 的 `ScrollArea` 里,
+    /// 滚出视口的行**连 `Shape::Text` 都不生成**(实测:画到「终端」第二行
+    /// 就截断了),查后面的节会恒红。也**故意不查「文件面板」**——设置弹窗
+    /// 自己有一节就叫这个名字,拿它当判据的话,哪怕分节整个没画出来也照样
+    /// 绿(判据被同名的无关文本接住 = 恒绿)。
+    ///
+    /// Esc 那条查得住是因为它在第一节,一定可见。
+    ///
+    /// 自证会变红:把 `shortcut_table` 里 `ui.label(theme::hint_text(t, name))`
+    /// 删掉(第一条红);往 `SHORTCUTS` 的「标注模式」加回一行 Esc(第二条红)。
+    #[test]
+    fn the_shortcut_table_is_grouped_into_sections() {
+        let mut d = draft();
+        let (texts, _) = run(&mut d, false);
+        for want in ["通用", "标签", "终端"] {
+            assert!(
+                texts.iter().any(|s| s == want),
+                "没画小节「{want}」:{texts:?}"
+            );
+        }
+        assert_eq!(
+            texts.iter().filter(|s| s.as_str() == "Esc").count(),
+            1,
+            "Esc 不是恰好一次:{texts:?}"
         );
     }
 

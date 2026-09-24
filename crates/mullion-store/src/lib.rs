@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod error;
 pub mod group;
 pub mod history;
+pub mod hotkeys;
 pub mod inherit;
 pub mod jump;
 pub mod kdf;
@@ -45,6 +46,7 @@ pub use history::{
     save_record, touch_alive, HistoryEntry, ALIVE_GRACE_SECS, HEARTBEAT_INTERVAL_SECS, HISTORY_DIR,
     MAX_RECORDS,
 };
+pub use hotkeys::{Chord, ChordParseError, KeyName};
 pub use inherit::{resolve, PrefsLayer, ResolvedConfig, DEFAULT_SCROLLBACK};
 pub use kdf::{derive_key, KdfParams, SALT_LEN};
 pub use known_hosts::{HostKeyEntry, KnownHostsFile};

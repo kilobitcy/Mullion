@@ -31,6 +31,7 @@ pub const VERIFIED: &[char] = &[
     '→', // U+2192 右箭头：符号链接目标、跳板链
     '↑', // U+2191 上箭头：上传方向、上一级
     '↓', // U+2193 下箭头：下载方向
+    '←', // U+2190 左箭头：快捷键一览里的方向键（F294 Chord::display）
     '×', // U+00D7 乘号：关闭、尺寸的 80×24
     '●', // U+25CF 实心圆：脏标记 / 状态点
     '≥', // U+2265 大于等于：设置里的数值说明
@@ -85,13 +86,45 @@ mod tests {
     /// 改成 `true`，第二组断言立刻红。
     #[test]
     fn only_registered_symbols_pass_and_the_known_tofu_does_not() {
-        for c in ['—', '…', '·', '→', '↑', '↓', '×', '●', '★', '☆', '▲', '▼']
-        {
+        for c in [
+            '—', '…', '·', '→', '↑', '↓', '←', '×', '●', '★', '☆', '▲', '▼',
+        ] {
             assert!(is_allowed(c), "已登记的 {c:?} 应当放行");
         }
         // 这六个在 GBK 里没有 —— 微软雅黑与 egui 内置字体两边都画不出来。
         for c in ['▾', '▸', '⟳', '↻', '✕', '⚠'] {
             assert!(!is_allowed(c), "{c:?} 在 GBK 外，必须被拦下");
+        }
+    }
+
+    /// F294:热键的显示文本里有 `↑↓←→`,但那几个字面量长在 `mullion-store`
+    /// 的 `hotkeys.rs` 里 —— `tests/glyph_whitelist.rs` 只扫 app 的 `src/**`,
+    /// **扫不到它**。这条把那块闸门盲区补上:凡是 `Chord::display()` 生成得
+    /// 出来的字符,都必须在白名单内。
+    ///
+    /// 自证会变红：把 `VERIFIED` 里的 `'←'` 去掉。
+    #[test]
+    fn every_key_name_label_only_uses_verified_glyphs() {
+        use mullion_store::{Chord, KeyName};
+        let mut keys = vec![
+            KeyName::Tab,
+            KeyName::PageUp,
+            KeyName::PageDown,
+            KeyName::Home,
+            KeyName::End,
+            KeyName::Up,
+            KeyName::Down,
+            KeyName::Left,
+            KeyName::Right,
+        ];
+        keys.push(KeyName::f(6).expect("F6 在 1..=12 内"));
+        keys.push(KeyName::char('a').expect("'a' 是 ASCII 可见字符"));
+        keys.push(KeyName::char('`').expect("'`' 是 ASCII 可见字符"));
+        for key in keys {
+            let text = Chord::plain(key).display();
+            for c in text.chars() {
+                assert!(is_allowed(c), "热键文本 {text:?} 里的 {c:?} 不在白名单里");
+            }
         }
     }
 
