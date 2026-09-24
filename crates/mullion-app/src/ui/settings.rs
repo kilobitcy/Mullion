@@ -952,25 +952,36 @@ fn cloud(
 /// 直接去掉;这一列的「更醒目」靠 `fg`(9.4:1)与另一列的 `fg_muted`(4.77:1)
 /// 分层。全库级的守护在 `tests/strong_text_color.rs`。
 ///
-/// F295:按小节分组 —— 每节一个小标题 + 一张两列网格(原来是不分节的三列,
-/// 中间那列是「在哪儿生效」,每行都重复一遍)。
+/// F295:按小节分组 —— 每节一行小标题 + 两列(原来是不分节的三列,中间那列
+/// 是「在哪儿生效」,每行都重复一遍)。
+///
+/// 表头**不用 `theme::hint_text`**:那个是 `fg_dimmer`,在 modal_bg 上只有
+/// 3.33:1(低于 AA),比它领着的正文行还暗。改成与 `form::section` 同一套
+/// (11pt + `fg_muted`),让「这是个标题」靠字号而不是靠更淡。
+///
+/// 也**不再自带 `ScrollArea`**:设置正文外层已经是一个不设 max_height 的
+/// `ScrollArea`(F217 的形状),内层再套一个 220pt 的只会露出两节,还把守护
+/// 测试逼成只查得了前三节。
 fn shortcut_table(ui: &mut egui::Ui, t: &Theme) {
-    egui::ScrollArea::vertical()
-        .max_height(220.0)
+    egui::Grid::new("settings_shortcuts")
+        .num_columns(2)
+        .spacing([SP_M, SP_S])
         .show(ui, |ui| {
             for (name, rows) in crate::ui::shortcuts::sections() {
-                ui.add_space(SP_S);
-                ui.label(theme::hint_text(t, name));
-                egui::Grid::new(("settings_shortcuts", name))
-                    .num_columns(2)
-                    .spacing([SP_M, SP_S])
-                    .show(ui, |ui| {
-                        for s in rows {
-                            ui.label(egui::RichText::new(s.keys.display()).color(theme::c32(t.fg)));
-                            ui.label(s.what);
-                            ui.end_row();
-                        }
-                    });
+                // 小节表头占一整行。**八节共用这一个 Grid**:每节各起一个的话
+                // 列宽各算各的,「作用」那一列的左沿会节节参差。
+                ui.label(
+                    egui::RichText::new(name)
+                        .size(11.0)
+                        .color(theme::c32(t.fg_muted)),
+                );
+                ui.label("");
+                ui.end_row();
+                for s in rows {
+                    ui.label(egui::RichText::new(s.keys.display()).color(theme::c32(t.fg)));
+                    ui.label(s.what);
+                    ui.end_row();
+                }
             }
         });
 }
@@ -1568,23 +1579,30 @@ mod tests {
 
     /// F295:表按小节画,Esc 只出现一次。
     ///
-    /// **只查前三节**:一览表裹在 `max_height(220.0)` 的 `ScrollArea` 里,
-    /// 滚出视口的行**连 `Shape::Text` 都不生成**(实测:画到「终端」第二行
-    /// 就截断了),查后面的节会恒红。也**故意不查「文件面板」**——设置弹窗
-    /// 自己有一节就叫这个名字,拿它当判据的话,哪怕分节整个没画出来也照样
-    /// 绿(判据被同名的无关文本接住 = 恒绿)。
+    /// 内层 `ScrollArea` 去掉之后全部八节都画得出来,所以查得到后面的节。
+    /// **故意不查「文件面板」**——设置弹窗自己有一节就叫这个名字,拿它当
+    /// 判据的话,哪怕分节整个没画出来也照样绿(判据被同名的无关文本接住
+    /// = 恒绿)。
     ///
-    /// Esc 那条查得住是因为它在第一节,一定可见。
+    /// 「整表 Esc 唯一」在这里是**画面层**的判据;结构层由
+    /// `shortcuts::tests::escape_is_listed_exactly_once` 守,两条都要在。
     ///
-    /// 自证会变红:把 `shortcut_table` 里 `ui.label(theme::hint_text(t, name))`
-    /// 删掉(第一条红);往 `SHORTCUTS` 的**「标签」**节加一行 `Keys::Text("Esc")`
-    /// (第二条红)。加到「标注模式」节**不会红** —— 那一节在 220pt 视口外,
-    /// 被裁掉了根本不生成 `Shape::Text`。
+    /// 自证会变红:把 `shortcut_table` 里那行小节表头 `ui.label(RichText::new(name)…)`
+    /// 删掉(第一条红);往 `SHORTCUTS` 的任意一节(含「标注模式」)加一行
+    /// `Keys::Text("Esc")`(第二条红)。
     #[test]
     fn the_shortcut_table_is_grouped_into_sections() {
         let mut d = draft();
         let (texts, _) = run(&mut d, false);
-        for want in ["通用", "标签", "终端"] {
+        for want in [
+            "通用",
+            "标签",
+            "终端",
+            "会话管理器",
+            "标注模式",
+            "项目",
+            "命令抽屉",
+        ] {
             assert!(
                 texts.iter().any(|s| s == want),
                 "没画小节「{want}」:{texts:?}"

@@ -58,7 +58,10 @@ impl Keys {
         match self {
             Self::Chord(c) => vec![*c],
             Self::Chords(cs) => cs.to_vec(),
-            Self::CtrlDigits(n) => (1..=*n)
+            // `min(9)`:`b'0' + d` 只在 1..=9 里算得出数字键,10 会算成 `:`。
+            // 表里有 `every_row_is_filled_in` 守着 n ≤ 9,这里再夹一道 ——
+            // 撞键判定宁可少认一个键,也不能凭空认出一个根本按不出来的键。
+            Self::CtrlDigits(n) => (1..=(*n).min(9))
                 .map(|d| ctrl(KeyName::Char(char::from(b'0' + d))))
                 .collect(),
             Self::Text(_) => Vec::new(),
@@ -368,7 +371,7 @@ mod tests {
     fn escape_is_listed_exactly_once() {
         let esc: Vec<&Shortcut> = SHORTCUTS
             .iter()
-            .filter(|s| s.keys.display() == "Esc")
+            .filter(|s| matches!(s.keys, Keys::Text(t) if t.starts_with("Esc")))
             .collect();
         assert_eq!(esc.len(), 1, "Esc 出现了 {} 次", esc.len());
         assert_eq!(esc[0].section, SECTION_GENERAL);
