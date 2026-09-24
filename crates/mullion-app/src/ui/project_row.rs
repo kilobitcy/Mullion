@@ -29,15 +29,18 @@ pub const ROW_H: f32 = 48.0;
 /// 灯的槽位中心距行左边缘(逻辑点)。
 const LAMP_X: f32 = 14.0;
 /// 图标槽左边缘距行左边缘。紧挨着灯槽右沿。
-const ICON_X: f32 = 24.0;
+///
+/// F293:启动页会话列**复用**这一组常量对齐文字左沿(三列并排,会话列
+/// 与项目列的名字左沿错开 10 点比缺图难看),所以开成 `pub(crate)`。
+pub(crate) const ICON_X: f32 = 24.0;
 /// 图标边长。走 F61 那套 32px 纹理档(`paint_icon` 按 `side <= 32` 选档),
 /// 比 32 略小一点是为了在 48 点行高里上下留出呼吸。
-const ICON_SIDE: f32 = 28.0;
+pub(crate) const ICON_SIDE: f32 = 28.0;
 /// 文字左边界 = 图标槽右沿 + 一点呼吸。**恒定**:图标是「有就画、没有就
 /// 留空」的,有图标没图标的行文字左边界必须对齐(同灯槽那条理由)。
-const TEXT_X: f32 = ICON_X + ICON_SIDE + 6.0;
+pub(crate) const TEXT_X: f32 = ICON_X + ICON_SIDE + 6.0;
 /// 文字区距行右边缘的留白。
-const TEXT_RIGHT_PAD: f32 = 8.0;
+pub(crate) const TEXT_RIGHT_PAD: f32 = 8.0;
 /// 名称行顶距行顶。
 const NAME_TOP: f32 = 6.0;
 /// 副标题行顶距行顶。

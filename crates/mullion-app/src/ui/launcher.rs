@@ -360,8 +360,27 @@ fn sessions_column(
                     .rect_filled(rect, egui::Rounding::same(4.0), bg);
             }
             let p = ui.painter();
-            let left = rect.left() + SP_S;
-            let avail = (rect.width() - SP_S * 2.0).max(0.0);
+            // F293:图标槽。几何与同屏的项目列**同源**(`project_row::ICON_X /
+            // ICON_SIDE / TEXT_X`)—— 三列并排,名字左沿必须对齐。槽位**恒定**:
+            // 有图标画、没有留空,不画任何占位。图标来源与会话管理器左栏一样
+            // 走 `AppearanceCache`(已含会话→分组继承),底色同 `should_paint`。
+            let appearance = cx.lists.appearance.get(r.id);
+            if let Some(icon) = appearance.and_then(|a| a.icon.as_ref()) {
+                use crate::ui::project_row::{ICON_SIDE, ICON_X};
+                let slot = egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + ICON_X + ICON_SIDE / 2.0, rect.center().y),
+                    egui::vec2(ICON_SIDE, ICON_SIDE),
+                );
+                let bg = appearance.and_then(|a| {
+                    crate::ui::badge::should_paint(a, mullion_store::ColorTarget::ListItem)
+                });
+                crate::ui::badge::paint_icon(p, slot, icon, bg);
+            }
+            let left = rect.left() + crate::ui::project_row::TEXT_X;
+            let avail = (rect.width()
+                - crate::ui::project_row::TEXT_X
+                - crate::ui::project_row::TEXT_RIGHT_PAD)
+                .max(0.0);
             // 名称走命中高亮 —— 一个框过滤三列(D4),用户要看得出为什么
             // 这一行留下来了。与会话管理器左栏同一个函数。
             crate::ui::session_manager::list::paint_highlighted(
@@ -1264,5 +1283,132 @@ mod tests {
         ui_state.launcher_frozen_lamps = None;
         let frame3 = order(&ctx, &mut ui_state, &live);
         assert_eq!(frame3, vec![1, 2], "重新冻结后,亮着灯的项目该置顶");
+    }
+
+    // ---- F293:会话列图标 ---------------------------------------------------
+
+    /// 只画会话列要用的那几张表,返回两帧后的全部 shape。
+    ///
+    /// 项目 / 历史两列都给空表:这两列里没有任何图片,于是「画面上出现了一张
+    /// 图」这个判据只可能来自会话列。
+    fn session_shapes(sessions: &[SessionRecord]) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState::default();
+        let lamps = std::collections::BTreeMap::new();
+        let mut actions = crate::ui::UiActions::default();
+        let mut cache = crate::ui::badge::AppearanceCache::default();
+        cache.rebuild(sessions, &[]);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            out = ctx
+                .run(wide(), |ctx| {
+                    show(
+                        ctx,
+                        &crate::theme::MULLION_DARK,
+                        &mut ui_state,
+                        &Lists {
+                            projects: &[],
+                            lamps: &lamps,
+                            sessions,
+                            groups: &[],
+                            credentials: &[],
+                            history: &[],
+                            appearance: &cache,
+                        },
+                        &mut actions,
+                    );
+                })
+                .shapes;
+        }
+        out
+    }
+
+    /// 给会话挂一张**真** ico:`paint_icon` 会先解码,解不开就整段不画,
+    /// 拿假 base64 的话测试会因为「解码失败」而假红。
+    fn with_icon(mut r: SessionRecord) -> SessionRecord {
+        r.appearance.icon = Some(mullion_store::IconSpec {
+            kind: mullion_store::IconKind::Ico,
+            value: crate::ui::ico::import(&crate::ui::ico::tests_support::solid_ico(
+                32,
+                [255, 0, 0, 255],
+            ))
+            .expect("测试用 ico 应能导入"),
+            bg: None,
+        });
+        r
+    }
+
+    /// 第一张「带真纹理且有面积」的 Mesh 的包围盒。判据照抄
+    /// `project_row::tests::contains_image`:退化矩形也会发 Mesh,只判纹理
+    /// 杀不掉「边长改 0」这条变异。
+    fn image_bounds(shapes: &[egui::epaint::ClippedShape]) -> Option<egui::Rect> {
+        fn walk(s: &egui::Shape) -> Option<egui::Rect> {
+            match s {
+                egui::Shape::Vec(v) => v.iter().find_map(walk),
+                egui::Shape::Mesh(m) => {
+                    let b = m.calc_bounds();
+                    (m.texture_id != egui::TextureId::default()
+                        && b.width() > 0.0
+                        && b.height() > 0.0)
+                        .then_some(b)
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape))
+    }
+
+    /// 正文恰好等于 `needle` 的那段文字的左边界 x。`paint_highlighted` 一整段
+    /// 名字排成一个 galley,所以按全等找得到。
+    fn text_x_of(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<f32> {
+        fn walk(s: &egui::Shape, needle: &str) -> Option<f32> {
+            match s {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text() == needle => Some(ts.pos.x),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    /// F293:会话行真的画出了它的图标;没图标的行不凭空画。
+    ///
+    /// 自证会变红:把 `sessions_column` 里 `paint_icon` 那段删掉。
+    #[test]
+    fn a_session_row_paints_the_icon_of_its_session() {
+        assert!(
+            image_bounds(&session_shapes(&[with_icon(sess(7, "web01"))])).is_some(),
+            "会话有图标,启动页会话列却一张图都没画"
+        );
+        assert!(
+            image_bounds(&session_shapes(&[sess(7, "web01")])).is_none(),
+            "会话没图标却凭空画了一张图"
+        );
+    }
+
+    /// F293:有 / 无图标两种行的**名字左边界一样**,而且名字不压在图标上。
+    ///
+    /// 两条断言缺一不可:只比「一样」的话,把文字左沿改回 `SP_S`(两种行
+    /// 都压在图标上)照样绿 —— 「文字不压图标」引入了图标自己的包围盒这个
+    /// 第三方参照物(本仓记过的「判据与被测量同源平移 = 恒绿」)。
+    ///
+    /// 自证会变红:把 `sessions_column` 里 `left` 改回 `rect.left() + SP_S`
+    /// (第二条红);改成 `if icon.is_some() { TEXT_X } else { SP_S }`(第一条红)。
+    #[test]
+    fn the_session_name_starts_at_the_same_x_with_or_without_an_icon() {
+        let with = session_shapes(&[with_icon(sess(7, "web01"))]);
+        let without = session_shapes(&[sess(7, "web01")]);
+        let x_with = text_x_of(&with, "web01").expect("有图标的行没画名字");
+        let x_without = text_x_of(&without, "web01").expect("没图标的行没画名字");
+        assert!(
+            (x_with - x_without).abs() < 0.5,
+            "有图标 / 没图标两种行的名字左边界不一样:{x_with} vs {x_without}"
+        );
+        let icon = image_bounds(&with).expect("有图标的行没画图");
+        assert!(
+            x_with >= icon.right(),
+            "名字({x_with})压在图标({:?})上",
+            icon
+        );
     }
 }
