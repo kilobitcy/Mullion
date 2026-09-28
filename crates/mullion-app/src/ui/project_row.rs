@@ -292,7 +292,8 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
     let id = row_id(row.list, row.project.id);
     let resp = ui.interact(rect, id, egui::Sense::click());
-    if resp.hovered() {
+    // F297:在拨的行点了不理,不给「可点」手型。
+    if resp.hovered() && !row.dialing {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     // 自绘的行在 accesskit 树里是个没名字的空节点 —— 补一个名字,给屏幕阅读器
