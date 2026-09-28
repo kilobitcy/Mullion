@@ -144,6 +144,11 @@ pub struct Probe {
     /// 记 `String` 的话,一条含非 UTF-8 字节的路径会被有损转换,
     /// 「发出去的到底是哪串字节」就永远查不清了。
     pub execs: Vec<Vec<u8>>,
+    /// F298 复核:服务端收到 `SSH_MSG_CHANNEL_CLOSE` 的次数。用来证明
+    /// `exec_with_timeout` 真的在超时分支里发了关闭,而不是把整个 future
+    /// 一丢了事(那样服务端永远不会调用 `channel_close` 这个 handler 钩子,
+    /// 这条计数会停在 0)。
+    pub channel_closes: usize,
 }
 
 impl Probe {

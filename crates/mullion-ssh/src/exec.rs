@@ -7,6 +7,7 @@
 //! 起一个伪终端、`who` 里多一行幽灵会话,而且 `PermitTTY no` 的账号会直接被拒。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::session::SshConnection;
 
@@ -34,6 +35,11 @@ pub enum ExecError {
     /// 对端**拒绝**执行命令。sftp-only 账号(`ForceCommand internal-sftp` +
     /// `ChrootDirectory`)就是这一类 —— F57 靠它决定回退到逐文件递归删除。
     Rejected,
+    /// F298:`exec_with_timeout` 的预算到点、命令还没跑完。**channel 已经在
+    /// 这个分支里显式关掉了**(见 `exec_with_timeout` 内部),不是「调用方
+    /// 自己把 future 一丢了事」——那样做会因为 `Channel<Msg>` 没有会发
+    /// CHANNEL_CLOSE 的 `Drop` 而永久泄漏一个 sshd `MaxSessions` 槽位。
+    Timeout,
 }
 
 impl std::fmt::Display for ExecError {
@@ -41,6 +47,7 @@ impl std::fmt::Display for ExecError {
         match self {
             ExecError::Channel => write!(f, "无法开启命令通道,连接可能已断开"),
             ExecError::Rejected => write!(f, "远端拒绝执行命令(sftp-only 账号会这样)"),
+            ExecError::Timeout => write!(f, "命令执行超时"),
         }
     }
 }
@@ -73,8 +80,40 @@ pub fn shell_quote(bytes: &[u8]) -> Vec<u8> {
 
 /// 在已建立的连接上跑一条命令,读完 stdout/stderr 与退出码再返回。
 ///
-/// **只用于短命令**(`rm -rf` 这类):全部输出攒在内存里,不做流式。
+/// **只用于短命令**(`rm -rf` 这类):全部输出攒在内存里,不做流式。**没有
+/// 超时**——想要超时用 [`exec_with_timeout`],**不要**在调用点外面自己套
+/// `tokio::time::timeout(d, exec(..))`:那样命令一超时,`timeout` 就把整个
+/// `exec()` 的 future(连同它手里已经开好的 `channel`)一起丢弃,而
+/// `Channel<Msg>` 没有会发 CHANNEL_CLOSE 的 `Drop`——sshd 那边的
+/// `MaxSessions` 槽位永久占着不还,客户端账本(`ledger`)却认为已经释放了
+/// (F298 复核踩中的真 bug:`_slot` guard 确实会被 drop、计数会减,但那只是
+/// **我们自己的**账本,不代表 sshd 收到了 CHANNEL_CLOSE)。
 pub async fn exec(conn: &Arc<SshConnection>, command: Vec<u8>) -> Result<ExecOutcome, ExecError> {
+    exec_impl(conn, command, None).await
+}
+
+/// 同 [`exec`],但接收循环有一个**从发完命令起算的总预算**——超时时**在这个
+/// 函数内部**显式 `channel.close().await` 再返回 `Err(ExecError::Timeout)`,
+/// 不依赖调用方外层的 `Drop`(见 [`exec`] 的文档,那条路会泄漏 channel)。
+///
+/// 预算是「总量」不是「相邻两条消息的间隔」:每轮用「距 deadline 还剩多少」
+/// 去限时下一次 `channel.wait()`,慢慢吐数据的命令不会靠每条消息都落在
+/// 预算内就无限续命。
+pub async fn exec_with_timeout(
+    conn: &Arc<SshConnection>,
+    command: Vec<u8>,
+    timeout: Duration,
+) -> Result<ExecOutcome, ExecError> {
+    exec_impl(conn, command, Some(timeout)).await
+}
+
+/// 两个公开入口共用的实现,唯一活的循环——防止「加超时」和「不加超时」
+/// 变成两份要同步维护的消息处理逻辑。
+async fn exec_impl(
+    conn: &Arc<SshConnection>,
+    command: Vec<u8>,
+    timeout: Option<Duration>,
+) -> Result<ExecOutcome, ExecError> {
     use russh::ChannelMsg;
 
     let mut channel = conn
@@ -87,7 +126,9 @@ pub async fn exec(conn: &Arc<SshConnection>, command: Vec<u8>) -> Result<ExecOut
     // 之类的命令时会偏小,而那正是分屏开不出来的时刻。
     //
     // guard 就放在栈上:这个函数是「跑完一条命令再返回」,下面每个 `return`
-    // 与函数正常结束都会 drop 它,不会漏。
+    // 与函数正常结束都会 drop 它,不会漏。**它只管我们自己的账本**——真正
+    // 让 sshd 那边的槽位归还的是 `channel.close().await`,两者是两回事
+    // (见 `exec` 的文档)。
     let _slot = conn.ledger().check_out();
     // `want_reply = true` 是必须的:回执才是 F57 判定「该回退了」的信号。
     // 设 false 的话拒绝是静默的,我们会误以为命令跑了而且成功了。
@@ -97,7 +138,8 @@ pub async fn exec(conn: &Arc<SshConnection>, command: Vec<u8>) -> Result<ExecOut
     // 「连 send 都失败了」= 连接已断,而**对端的拒绝是下面循环里的
     // `ChannelMsg::Failure`**。把拒绝当成 `exec()` 的返回值来判,会在
     // sftp-only 账号上死等到天荒地老 —— 服务端回了 failure 就不再说话,
-    // 而 `wait()` 要等到 channel 关闭才结束。
+    // 而 `wait()` 要等到 channel 关闭才结束。这一步本身近乎瞬时(不等回执),
+    // 不纳入下面的超时预算。
     if channel.exec(true, command).await.is_err() {
         // `Channel<Msg>` 没有自动发 CHANNEL_CLOSE 的 Drop,不显式关就是
         // 泄漏一个 channel slot(同 `SftpClient::open` 那条注释)。
@@ -105,12 +147,35 @@ pub async fn exec(conn: &Arc<SshConnection>, command: Vec<u8>) -> Result<ExecOut
         return Err(ExecError::Channel);
     }
 
+    // 预算从这里、命令已经发出去之后起算——deadline 是「发完命令到收完结果」
+    // 这一段的总时长,不包含上面开 channel / 发 exec 请求那点近乎瞬时的开销。
+    let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+
     let mut out = ExecOutcome {
         exit_status: None,
         stdout: Vec::new(),
         stderr: Vec::new(),
     };
-    while let Some(msg) = channel.wait().await {
+    loop {
+        let msg = match deadline {
+            None => channel.wait().await,
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(remaining, channel.wait()).await {
+                    Ok(m) => m,
+                    Err(_) => {
+                        // 预算到点、命令还没跑完。**channel 此刻还活着**——
+                        // 上面 `tokio::time::timeout` 只是放弃了这一次
+                        // `channel.wait()` 的 future,`channel` 本身没被
+                        // drop,在这里显式关掉才是让 sshd 收到 CHANNEL_CLOSE
+                        // 的唯一办法(同上面两处「泄漏 channel slot」的注释)。
+                        let _ = channel.close().await;
+                        return Err(ExecError::Timeout);
+                    }
+                }
+            }
+        };
+        let Some(msg) = msg else { break };
         match msg {
             // 对端拒绝执行命令。**立刻关掉 channel 再返回** —— 服务端此后
             // 不会再说一个字,不主动关就永远卡在 `wait()` 上。

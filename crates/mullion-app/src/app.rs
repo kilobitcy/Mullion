@@ -4293,24 +4293,31 @@ impl App {
                     let proxy = self.proxy.clone();
                     self._runtime.spawn(async move {
                         let cmd = crate::node_stats::sample_command();
-                        let r = tokio::time::timeout(
+                        // **不许**在这里外套 tokio 的 timeout 包住 `exec(..)`——
+                        // 那样超时时整个 `exec()` future(连同它手里已经开好的
+                        // channel)被一起丢弃,`Channel<Msg>` 没有会发
+                        // CHANNEL_CLOSE 的 `Drop`,sshd 的 `MaxSessions` 槽位
+                        // 永久泄漏。超时预算必须走 `exec_with_timeout`——
+                        // 它在**自己内部**显式关 channel 再返回,见该函数文档。
+                        let r = mullion_ssh::exec::exec_with_timeout(
+                            &conn,
+                            cmd,
                             crate::node_stats::EXEC_TIMEOUT,
-                            mullion_ssh::exec::exec(&conn, cmd),
                         )
                         .await;
                         let (mem, disk) = match r {
-                            Ok(Ok(out)) => crate::node_stats::parse_sample(
-                                &String::from_utf8_lossy(&out.stdout),
-                            ),
-                            Ok(Err(e)) => {
-                                let why = format!("采样失败:{e}");
+                            Ok(out) => crate::node_stats::parse_sample(&String::from_utf8_lossy(
+                                &out.stdout,
+                            )),
+                            Err(mullion_ssh::exec::ExecError::Timeout) => {
+                                let why = "采样超时".to_string();
                                 (
                                     crate::node_stats::Reading::Failed(why.clone()),
                                     crate::node_stats::Reading::Failed(why),
                                 )
                             }
-                            Err(_) => {
-                                let why = "采样超时".to_string();
+                            Err(e) => {
+                                let why = format!("采样失败:{e}");
                                 (
                                     crate::node_stats::Reading::Failed(why.clone()),
                                     crate::node_stats::Reading::Failed(why),
@@ -4327,20 +4334,22 @@ impl App {
                     let proxy = self.proxy.clone();
                     self._runtime.spawn(async move {
                         let cmd = crate::node_stats::country_command();
-                        let r = tokio::time::timeout(
+                        // 同上:走 `exec_with_timeout`,不许外套 timeout。
+                        let r = mullion_ssh::exec::exec_with_timeout(
+                            &conn,
+                            cmd,
                             crate::node_stats::EXEC_TIMEOUT,
-                            mullion_ssh::exec::exec(&conn, cmd),
                         )
                         .await;
                         let c = match r {
-                            Ok(Ok(out)) => crate::node_stats::parse_country(
+                            Ok(out) => crate::node_stats::parse_country(
                                 out.exit_status,
                                 &String::from_utf8_lossy(&out.stdout),
                             ),
-                            Ok(Err(e)) => {
-                                crate::node_stats::Reading::Failed(format!("取国家失败:{e}"))
+                            Err(mullion_ssh::exec::ExecError::Timeout) => {
+                                crate::node_stats::Reading::Failed("取国家超时".into())
                             }
-                            Err(_) => crate::node_stats::Reading::Failed("取国家超时".into()),
+                            Err(e) => crate::node_stats::Reading::Failed(format!("取国家失败:{e}")),
                         };
                         cell.finish_country(c);
                         let _ = proxy.send_event(UserEvent::NodeStatsUpdated);
@@ -21853,6 +21862,39 @@ mod tests {
         assert!(
             body.contains("self.tabs.iter_mut()"),
             "tick_node_stats 不再遍历全部标签 —— 后台标签的节点状态会停住不动"
+        );
+    }
+
+    /// **接线守护 / F298 复核(Critical)**:`tick_node_stats` 里两处 exec
+    /// 调用都必须走 `mullion_ssh::exec::exec_with_timeout`,不许在外面自己
+    /// 套 `tokio::time::timeout(d, exec(..))`——那样超时时整个 future(连同
+    /// 已经开好的 channel)被一起丢弃,`Channel<Msg>` 没有会发 CHANNEL_CLOSE
+    /// 的 `Drop`,sshd 的 `MaxSessions` 槽位永久泄漏,客户端账本却显示已经
+    /// 释放。见 `crates/mullion-ssh/src/exec.rs` 的 `exec_with_timeout` 与
+    /// `crates/mullion-ssh/tests/exec_timeout.rs`。
+    ///
+    /// 自证会变红:把某一处 `exec_with_timeout(&conn, cmd, ..)` 换回
+    /// `tokio::time::timeout(.., mullion_ssh::exec::exec(&conn, cmd))`。
+    #[test]
+    fn tick_node_stats_uses_the_timeout_aware_exec_so_a_timeout_still_closes_the_channel() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n    fn tick_node_stats(&mut self) {")
+            .nth(1)
+            .expect("找不到 tick_node_stats 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        let timeout_aware = body
+            .matches("mullion_ssh::exec::exec_with_timeout(")
+            .count();
+        assert_eq!(
+            timeout_aware, 2,
+            "tick_node_stats 应该有两处(采样 + 取国家)调用 exec_with_timeout,\
+             实际找到 {timeout_aware} 处"
+        );
+        assert!(
+            !body.contains("tokio::time::timeout"),
+            "tick_node_stats 里不许再出现外套的 tokio::time::timeout —— \
+             超时清理必须发生在 exec_with_timeout 内部,而不是靠外层 drop 整个 future"
         );
     }
 

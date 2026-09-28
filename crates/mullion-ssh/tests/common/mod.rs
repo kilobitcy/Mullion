@@ -135,10 +135,29 @@ pub struct SftpSshHandler {
     /// F220/B3 缺口 2:没有这个开关,`copy_tree.rs` 里「rename 失败 →
     /// 拷贝+删源」那条分支在测试里永远走不到(假服务端的 rename 从不失败)。
     reject_rename: bool,
+    /// F298 复核:`true` = `exec_request` 回一次 `channel_success`(模拟
+    /// 「命令确实起来了」)之后**永远不再吭声**——不发数据、不发退出码、
+    /// 不主动关 channel。用来在客户端一侧逼出 `exec_with_timeout` 的超时
+    /// 分支:没有这个开关,假服务端总是秒回,永远走不到「client 等到
+    /// 天荒地老」这条路径。
+    hang_exec: bool,
 }
 
 impl Handler for SftpSshHandler {
     type Error = russh::Error;
+
+    /// F298 复核:数一数客户端真的发了几次 `SSH_MSG_CHANNEL_CLOSE`。
+    /// 只有这个钩子被调用,才证明「关闭」是货真价实地上了线,而不是
+    /// 客户端把 future 一丢、服务端这边那个 channel/session slot
+    /// 永远占着不还。
+    async fn channel_close(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.probe.lock().unwrap().channel_closes += 1;
+        Ok(())
+    }
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         if user == TEST_USER && password == TEST_PASSWORD {
@@ -225,6 +244,11 @@ impl Handler for SftpSshHandler {
             return Ok(());
         }
         session.channel_success(channel)?;
+        if self.hang_exec {
+            // 命令「起来了」,但从此再也不回话——不发数据、不发退出码、
+            // 不主动关 channel。客户端只能靠自己的超时收口。
+            return Ok(());
+        }
         let code = match parse_rm_rf(data) {
             Some(paths) => {
                 let mut tree = self.tree.lock().unwrap();
@@ -520,7 +544,7 @@ pub async fn spawn_sftp_server(
     Arc<std::sync::Mutex<sftp_server::Probe>>,
     Arc<std::sync::Mutex<sftp_server::Tree>>,
 ) {
-    spawn_sftp_server_with(tree, true, false).await
+    spawn_sftp_server_with(tree, true, false, false).await
 }
 
 /// 像 sftp-only 账号那样**拒绝 exec** 的变体(F57 回退分支的测试用)。
@@ -532,7 +556,7 @@ pub async fn spawn_sftp_server_without_exec(
     Arc<std::sync::Mutex<sftp_server::Probe>>,
     Arc<std::sync::Mutex<sftp_server::Tree>>,
 ) {
-    spawn_sftp_server_with(tree, false, false).await
+    spawn_sftp_server_with(tree, false, false, false).await
 }
 
 /// **拒绝 exec 且 `rename` 一律失败**(模拟 EXDEV)的变体。F220/B3 缺口 2:
@@ -547,7 +571,20 @@ pub async fn spawn_sftp_server_without_exec_and_rename(
     Arc<std::sync::Mutex<sftp_server::Probe>>,
     Arc<std::sync::Mutex<sftp_server::Tree>>,
 ) {
-    spawn_sftp_server_with(tree, false, true).await
+    spawn_sftp_server_with(tree, false, true, false).await
+}
+
+/// **exec 起了但永远不回话**的变体(F298 复核):专给 `exec_with_timeout`
+/// 的超时分支用,模拟远端命令挂住不返回。
+#[allow(dead_code)]
+pub async fn spawn_sftp_server_with_hanging_exec(
+    tree: sftp_server::Tree,
+) -> (
+    std::net::SocketAddr,
+    Arc<std::sync::Mutex<sftp_server::Probe>>,
+    Arc<std::sync::Mutex<sftp_server::Tree>>,
+) {
+    spawn_sftp_server_with(tree, true, false, true).await
 }
 
 #[allow(dead_code)]
@@ -555,6 +592,7 @@ async fn spawn_sftp_server_with(
     tree: sftp_server::Tree,
     allow_exec: bool,
     reject_rename: bool,
+    hang_exec: bool,
 ) -> (
     std::net::SocketAddr,
     Arc<std::sync::Mutex<sftp_server::Probe>>,
@@ -585,6 +623,7 @@ async fn spawn_sftp_server_with(
                 probe: p.clone(),
                 allow_exec,
                 reject_rename,
+                hang_exec,
             };
             tokio::spawn(async move {
                 let _ = russh::server::run_stream(config, stream, handler).await;
