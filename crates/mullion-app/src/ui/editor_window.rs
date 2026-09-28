@@ -806,6 +806,33 @@ mod tests {
         assert_eq!(st.as_ref().unwrap().find.as_ref().unwrap().cur, Some(2));
     }
 
+    /// F299 复核 [Important]:查找框里按 Shift+Enter 也反向步进(F3/Shift+F3
+    /// 的另一条腿——`resp.lost_focus() && key_pressed(Enter)` 那一支自己读
+    /// `modifiers.shift` 判方向,原计划的 4 条测试没人走过这条反向分支)。
+    ///
+    /// 自证会变红:把 `let back = ui.input(|i| i.modifiers.shift);` 改成
+    /// 恒 `false`(Shift+Enter 与普通 Enter 会变得没有区别)。
+    #[test]
+    fn shift_enter_in_the_find_box_also_steps_backwards() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("a x a x a");
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, typed("a"));
+        assert_eq!(
+            st.as_ref().unwrap().find.as_ref().unwrap().cur,
+            Some(0),
+            "前提:命中第一处"
+        );
+        run_editor(&ctx, &mut st, key(egui::Key::Enter, egui::Modifiers::SHIFT));
+        assert_eq!(
+            st.as_ref().unwrap().find.as_ref().unwrap().cur,
+            Some(2),
+            "Shift+Enter 该往回走并回绕到最后一处"
+        );
+    }
+
     /// F299:Ctrl+F 预填当前正文选区(单行时)。
     ///
     /// 不靠真实拖拽制造选区(与被测代码无关的额外复杂度),直接把正文的
