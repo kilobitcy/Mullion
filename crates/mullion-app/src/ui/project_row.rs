@@ -121,6 +121,41 @@ pub struct Row<'a> {
     pub icon: Option<&'a mullion_store::IconSpec>,
     /// 图标底色。走 [`crate::project::icon_bg`],同源回落首选节点的节点色。
     pub icon_bg: Option<egui::Color32>,
+    /// F297:这个项目正在拨号。右侧时间列换成 spinner +「连接中…」,
+    /// 不画「正在跑」标签(避免抢地方)、也不接归档 hover。
+    pub dialing: bool,
+}
+
+/// F297:「转圈 + 连接中…」,贴着行右边画。返回它占用的宽度(从行右边缘
+/// 算起,含右侧留白 [`TEXT_RIGHT_PAD`])—— 调用方拿它当「时间列」宽度传给
+/// [`name_avail`],不然长项目名会把它顶到行外。
+///
+/// **两处共用**(本文件的项目行、`launcher::sessions_column` 手绘的会话
+/// 行):各写一份的话字号/spinner 半径/间距迟早漂移出两种转圈样式。
+///
+/// **不用 `ui.add(Spinner)`**:那会新分配一块占位矩形,跟本文件「先量整行
+/// 矩形再手绘」的姿态冲突;`paint_at` 直接画在算好的矩形里,且它自己会在
+/// `is_rect_visible` 时 `request_repaint`(T3:只在拨号在途时存在,不在拨
+/// 时零额外重绘)。
+pub(crate) fn paint_dialing(ui: &egui::Ui, rect: egui::Rect, t: &Theme) -> f32 {
+    let label = "连接中…";
+    let font = egui::FontId::proportional(SUB_SIZE);
+    let g = ui
+        .painter()
+        .layout_no_wrap(label.into(), font, theme::c32(t.fg_muted));
+    let right = rect.right() - TEXT_RIGHT_PAD;
+    let text_pos = egui::pos2(right - g.size().x, rect.center().y - g.size().y / 2.0);
+    let s = g.size().y;
+    let spin = egui::Rect::from_min_size(
+        egui::pos2(text_pos.x - s - 4.0, rect.center().y - s / 2.0),
+        egui::vec2(s, s),
+    );
+    egui::Spinner::new().size(s).paint_at(ui, spin);
+    ui.painter().galley(text_pos, g, theme::c32(t.fg_muted));
+    // 与 `time_w`(时间文字自身宽度,不含 `TEXT_RIGHT_PAD`)同一基准,
+    // 好直接喂给 `name_avail` —— 那边的 `text_avail` 已经先扣过一次
+    // `TEXT_RIGHT_PAD`,两处都扣的话名字预算会凭空少一份。
+    right - spin.left()
 }
 
 /// 一行的副标题:`目录 · 节点名`。
@@ -320,62 +355,69 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     let text_left = rect.left() + TEXT_X;
     let text_avail = (rect.right() - TEXT_RIGHT_PAD - text_left).max(0.0);
 
-    // 时间先量宽度:名称的可用宽度要**先**扣掉它。不扣的话长项目名会一路截断
-    // 到右边缘,把时间整列挤出行外 —— 整条看不见,而且没有任何报错。
-    let time = time_text(row.project, row.now);
-    let time_galley = p.layout_no_wrap(
-        time,
-        egui::FontId::proportional(SUB_SIZE),
-        theme::c32(t.fg_muted),
-    );
-    let time_w = time_galley.size().x;
-    let time_pos = egui::pos2(
-        rect.right() - TEXT_RIGHT_PAD - time_w,
-        rect.top() + NAME_TOP + (NAME_SIZE - SUB_SIZE) / 2.0,
-    );
-    let time_rect = egui::Rect::from_min_size(time_pos, time_galley.size());
-    p.galley(time_pos, time_galley, theme::c32(t.fg_muted));
-
-    // F266:「正在跑」标签。**右对齐贴着时间列**,不跟在名字后面 ——
-    // 名字是截断过的,画完拿不回它的实际宽度,跟在后面就只能猜位置。
-    let badge = (row.lamp == crate::project::Lamp::Lit).then(|| {
-        p.layout_no_wrap(
-            RUNNING_LABEL.to_string(),
-            egui::FontId::proportional(RUNNING_SIZE),
-            theme::c32(t.ok),
-        )
-    });
-    let badge_w = badge
-        .as_ref()
-        .map_or(0.0, |g| g.size().x + 2.0 * RUNNING_PAD.x);
-    if let Some(g) = badge {
-        let size = g.size() + 2.0 * RUNNING_PAD;
-        let pill = egui::Rect::from_min_size(
-            egui::pos2(
-                rect.right() - TEXT_RIGHT_PAD - time_w - NAME_TIME_GAP - size.x,
-                rect.top() + NAME_TOP + (NAME_SIZE - g.size().y) / 2.0 - RUNNING_PAD.y,
-            ),
-            size,
+    // F297:在拨的行,时间列整块换成「转圈 + 连接中…」——不画时间、
+    // 不画「正在跑」标签(避免跟转圈抢地方)、也不接归档 hover。
+    let (time_w, badge_w) = if row.dialing {
+        (paint_dialing(ui, rect, t), 0.0)
+    } else {
+        // 时间先量宽度:名称的可用宽度要**先**扣掉它。不扣的话长项目名会一路
+        // 截断到右边缘,把时间整列挤出行外 —— 整条看不见,而且没有任何报错。
+        let time = time_text(row.project, row.now);
+        let time_galley = p.layout_no_wrap(
+            time,
+            egui::FontId::proportional(SUB_SIZE),
+            theme::c32(t.fg_muted),
         );
-        p.rect_filled(pill, 3.0, lit_tint(t));
-        p.galley(pill.min + RUNNING_PAD, g, theme::c32(t.ok));
-    }
+        let time_w = time_galley.size().x;
+        let time_pos = egui::pos2(
+            rect.right() - TEXT_RIGHT_PAD - time_w,
+            rect.top() + NAME_TOP + (NAME_SIZE - SUB_SIZE) / 2.0,
+        );
+        let time_rect = egui::Rect::from_min_size(time_pos, time_galley.size());
+        p.galley(time_pos, time_galley, theme::c32(t.fg_muted));
 
-    // 归档行的完整时间信息(归档于何时 + 最后打开于何时)挂在时间列这一小块
-    // 上,不挂整行:整行的 hover 已经被灯占了(见上面 `resp.hovered()` 那处
-    // `lamp` tooltip),两个 tooltip 抢同一块热区会互相打架。挂载点只在
-    // `time_rect` 而不是整行,判定精确到用户视线真正落的那几个字上。
-    if row.project.archived_at.is_some()
-        && resp.hovered()
-        && ui
-            .ctx()
-            .pointer_latest_pos()
-            .is_some_and(|q| time_rect.expand(4.0).contains(q))
-    {
-        egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), id.with("time"), |ui| {
-            ui.label(archived_hover_text(row.project, row.now));
+        // F266:「正在跑」标签。**右对齐贴着时间列**,不跟在名字后面 ——
+        // 名字是截断过的,画完拿不回它的实际宽度,跟在后面就只能猜位置。
+        let badge = (row.lamp == crate::project::Lamp::Lit).then(|| {
+            p.layout_no_wrap(
+                RUNNING_LABEL.to_string(),
+                egui::FontId::proportional(RUNNING_SIZE),
+                theme::c32(t.ok),
+            )
         });
-    }
+        let badge_w = badge
+            .as_ref()
+            .map_or(0.0, |g| g.size().x + 2.0 * RUNNING_PAD.x);
+        if let Some(g) = badge {
+            let size = g.size() + 2.0 * RUNNING_PAD;
+            let pill = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.right() - TEXT_RIGHT_PAD - time_w - NAME_TIME_GAP - size.x,
+                    rect.top() + NAME_TOP + (NAME_SIZE - g.size().y) / 2.0 - RUNNING_PAD.y,
+                ),
+                size,
+            );
+            p.rect_filled(pill, 3.0, lit_tint(t));
+            p.galley(pill.min + RUNNING_PAD, g, theme::c32(t.ok));
+        }
+
+        // 归档行的完整时间信息(归档于何时 + 最后打开于何时)挂在时间列这一
+        // 小块上,不挂整行:整行的 hover 已经被灯占了(见上面 `resp.hovered()`
+        // 那处 `lamp` tooltip),两个 tooltip 抢同一块热区会互相打架。挂载点
+        // 只在 `time_rect` 而不是整行,判定精确到用户视线真正落的那几个字上。
+        if row.project.archived_at.is_some()
+            && resp.hovered()
+            && ui
+                .ctx()
+                .pointer_latest_pos()
+                .is_some_and(|q| time_rect.expand(4.0).contains(q))
+        {
+            egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), id.with("time"), |ui| {
+                ui.label(archived_hover_text(row.project, row.now));
+            });
+        }
+        (time_w, badge_w)
+    };
 
     // 名称和副标题都过命中着色。副标题里就是目录和节点名 —— 搜「web01」命中的
     // 正是那里,不标出来的话用户完全不知道这一行为什么会出现。
@@ -600,6 +642,7 @@ mod tests {
             list: "test",
             icon: None,
             icon_bg: None,
+            dialing: false,
         };
         // 这一行**应该**占住的地方:光标位置 + 整条可用宽 + `ROW_H`。
         let mut slot = egui::Rect::NOTHING;
@@ -673,6 +716,7 @@ mod tests {
                                     list: "test",
                                     icon: None,
                                     icon_bg: None,
+                                    dialing: false,
                                 },
                             );
                         });
@@ -774,6 +818,7 @@ mod tests {
                                     list: "test",
                                     icon: None,
                                     icon_bg: None,
+                                    dialing: false,
                                 },
                             );
                         });
@@ -902,6 +947,7 @@ mod tests {
                                     list: "test",
                                     icon,
                                     icon_bg: None,
+                                    dialing: false,
                                 },
                             );
                         });
@@ -1135,6 +1181,7 @@ mod tests {
                                         list: "test",
                                         icon: None,
                                         icon_bg: None,
+                                        dialing: false,
                                     },
                                 );
                             });

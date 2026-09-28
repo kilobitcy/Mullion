@@ -193,6 +193,9 @@ pub fn show(
                                             appearance,
                                             mullion_store::ColorTarget::ListItem,
                                         ),
+                                        // F297:转圈只在启动页画,这个弹窗没有
+                                        // 「哪些在拨」的表。
+                                        dialing: false,
                                     },
                                 );
                                 if r.clicked() {

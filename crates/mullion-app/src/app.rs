@@ -2677,6 +2677,28 @@ struct DialTicket {
     ///
     /// F128 断线自愈不经过这里(它走 `spawn_reconnect`,不发票),天然不记。
     user_initiated: bool,
+    /// F297:这次拨号是「从启动页打开项目」时,那个项目的 id。启动页据此
+    /// 在项目行上转圈;`project_dir` 只有目录,认不出是哪个项目。
+    project_id: Option<mullion_store::ProjectId>,
+}
+
+/// F297:哪些会话 / 项目**正由用户点击发起**的拨号在途。启动页每帧现算。
+///
+/// 只数 `user_initiated`:启动批量重连(`advance_auto_dial`)不是用户在
+/// 这一页点的,给它转圈会让一整列同时转起来,用户以为自己点了什么。
+fn dialing_from<'a>(
+    tickets: impl Iterator<Item = &'a DialTicket>,
+) -> (Vec<SessionId>, Vec<mullion_store::ProjectId>) {
+    let mut sessions = Vec::new();
+    let mut projects = Vec::new();
+    for t in tickets.filter(|t| t.user_initiated) {
+        if let Some(p) = t.project_id {
+            projects.push(p);
+        } else if let Some(s) = t.session_id {
+            sessions.push(s);
+        }
+    }
+    (sessions, projects)
 }
 
 /// F40~F44/F141:一次「点连接」在**那一帧**算好、等 `ConnectOk` 抵达时
@@ -10090,6 +10112,7 @@ impl App {
             },
             project_dir: project.map(|p| p.dir.clone()),
             user_initiated,
+            project_id: project.map(|p| p.id),
         });
         let proxy = self.proxy.clone();
         let wake_proxy = self.proxy.clone();
@@ -13973,12 +13996,17 @@ impl ApplicationHandler<UserEvent> for App {
                             // 不会自己变的影子状态。
                             let remote_home =
                                 self.tabs.active().and_then(|t| t.content.sftp_home());
+                            // F297:启动页转圈的依据 —— 票据台账现算,不存。
+                            let (dialing_sessions, dialing_projects) =
+                                dialing_from(self.dials.iter());
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
                                 credentials,
                                 projects,
                                 project_lamps: &project_lamps,
+                                dialing_sessions: &dialing_sessions,
+                                dialing_projects: &dialing_projects,
                                 // F225①:一个标签都没有 = launcher 态,中央区
                                 // 画项目列表。判据与上面算灯的那一半同源。
                                 launcher: self.tabs.is_empty(),
@@ -17075,20 +17103,21 @@ mod tests {
         arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
         autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
         clip_still_matches_what_was_pasted, cloud_backoff_ms, credential_delete_error,
-        decide_paste, dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
-        drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
-        files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
-        font_px_for, has_real_action, history_rows_of, history_sync, host_for_fresh,
-        ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator,
-        next_auto_dial, next_panel_selection_index, opt_buf_dirty, pane_reports_of,
-        pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
-        reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
-        should_check_attach, should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of,
-        sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
-        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
-        AttachVerdict, HistorySync, Modal, OpFollow, PasteDecision, RehostKind, RestoredTab,
-        SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS,
-        DISMISS_EXEMPT, DISMISS_ORDER,
+        decide_paste, dialing_from, dismiss_areas, dismiss_verdict, download_job,
+        draft_baseline_is_in_vault, drive_attach_checks_of, effective_focus_of, expand_tilde,
+        files_owner_generation_of, files_path_editing_of, files_start_dir, finish_password_change,
+        follow_for_clip_mode, font_px_for, has_real_action, history_rows_of, history_sync,
+        host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
+        new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
+        pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
+        project_lamps_have_audience, reattach_pane, rehost_pane, resolved_scrollback,
+        session_manager_dirty, should_check_attach, should_pop_cloud_error,
+        should_pop_transfer_error, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
+        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
+        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, DialTicket, HistorySync,
+        Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SshConfig, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
+        DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -27860,6 +27889,74 @@ mod tests {
         assert!(
             err_body.contains("self.dials.claim(dial);"),
             "拨号失败没认票 —— 台账只涨不落,SshConfig 和自动化计划一直不释放"
+        );
+    }
+
+    /// F297:一次拨号带的这份随行数据,拿来造票的辅助函数。只有 `cfg` 是
+    /// 真结构体,别的字段测试不关心,用默认值/最简值填。
+    fn test_cfg() -> SshConfig {
+        SshConfig {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: mullion_ssh::config::AuthMethod::Password("x".into()),
+            cols: 80,
+            rows: 24,
+            term: "xterm-256color".into(),
+            hops: Vec::new(),
+        }
+    }
+
+    /// F297:项目拨号只进项目表(不让它背后那条会话也在会话列转圈),
+    /// 非用户发起的一律不算。
+    ///
+    /// 自证会变红:删掉 `.filter(|t| t.user_initiated)`;或把 `else if`
+    /// 改成独立的 `if`(项目拨号的会话也进会话表)。
+    #[test]
+    fn dialing_tables_count_user_clicks_only_and_projects_do_not_leak_into_sessions() {
+        let t = |s: u64, p: Option<u64>, user: bool| DialTicket {
+            session_id: Some(SessionId(s)),
+            cfg: test_cfg(),
+            automation: Default::default(),
+            project_dir: None,
+            user_initiated: user,
+            project_id: p.map(mullion_store::ProjectId),
+        };
+        let v = [t(1, None, true), t(2, Some(7), true), t(3, None, false)];
+        let (s, p) = dialing_from(v.iter());
+        assert_eq!(
+            s,
+            vec![SessionId(1)],
+            "会话表混进了项目拨号,或漏了纯会话拨号"
+        );
+        assert_eq!(p, vec![mullion_store::ProjectId(7)], "项目表没收到项目拨号");
+    }
+
+    /// F297 接线:在拨表必须来自票据台账并流进 `UiFrame`。纯函数、launcher
+    /// 两层都测得扎实,这里一句 `&[]` 就让转圈永远不出现,零报错
+    /// (「纯函数测得扎实、接线没人看着」,F226~F232 记的恒绿模式)。
+    ///
+    /// 自证会变红:把 `dialing_from(self.dials.iter())` 换成 `(Vec::new(), Vec::new())`;
+    /// 或把 `spawn_connect` 里 `project_id: project.map(|p| p.id)` 换成 `None`。
+    #[test]
+    fn the_dialing_tables_come_from_the_ledger_and_reach_the_frame() {
+        let src = include_str!("app.rs");
+        assert!(
+            src.contains("dialing_from(self.dials.iter())"),
+            "在拨表没有从票据台账现算"
+        );
+        assert!(
+            src.contains("dialing_sessions: &dialing_sessions"),
+            "在拨会话表没有流进 UiFrame"
+        );
+        assert!(
+            src.contains("dialing_projects: &dialing_projects"),
+            "在拨项目表没有流进 UiFrame"
+        );
+        assert!(
+            src.contains("project_id: project.map(|p| p.id)"),
+            "spawn_connect 装票时没有把项目 id 一起装进去 —— 项目拨号永远不会\
+             出现在在拨项目表里"
         );
     }
 

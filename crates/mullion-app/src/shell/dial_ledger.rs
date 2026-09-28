@@ -72,6 +72,12 @@ impl<T> DialLedger<T> {
     pub fn is_empty(&self) -> bool {
         self.open.is_empty()
     }
+
+    /// F297:在途票据的只读视图。启动页据此现算「哪几行在拨」——
+    /// 票的生命周期就是转圈的生命周期,不另存一张会漏清的表。
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.open.iter().map(|(_, t)| t)
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +114,19 @@ mod tests {
         let a = led.issue(7);
         assert_eq!(led.claim(a), Some(7));
         assert_eq!(led.claim(a), None, "同一张票认了第二次还给东西");
+    }
+
+    /// F297:`iter` 只看得见还在台账上的票,认领之后就该从视图里消失。
+    ///
+    /// 自证会变红:让 `iter` 返回 `std::iter::empty()`。
+    #[test]
+    fn iter_sees_open_tickets_and_forgets_claimed_ones() {
+        let mut l: DialLedger<&str> = DialLedger::default();
+        let a = l.issue("a");
+        let _b = l.issue("b");
+        assert_eq!(l.iter().copied().collect::<Vec<_>>(), vec!["a", "b"]);
+        l.claim(a);
+        assert_eq!(l.iter().copied().collect::<Vec<_>>(), vec!["b"]);
     }
 
     /// 认一张不存在的票不许 panic —— 事件是从 tokio task 发回来的,标签早被

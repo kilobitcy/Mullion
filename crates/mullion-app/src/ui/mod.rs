@@ -592,6 +592,10 @@ pub struct UiFrame<'a> {
     /// [`crate::project::Lamp::Unknown`] 显示 —— 不是「灭」,见那个枚举。
     pub project_lamps:
         &'a std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>,
+    /// F297:正由用户点击发起、还没有结果的拨号(会话 / 项目)。启动页在这些
+    /// 行上转圈并忽略重复点击。每帧从票据台账现算,不落任何持久状态。
+    pub dialing_sessions: &'a [mullion_store::SessionId],
+    pub dialing_projects: &'a [mullion_store::ProjectId],
     /// F288:启动页第三列要列的现场记录。**由 `app.rs` 读盘算好传进来**
     /// (`ui/` 这一层零 IO),非 launcher 态传 `&[]`。
     ///
@@ -1220,6 +1224,8 @@ pub fn build_ui(
                 credentials: frame.credentials,
                 history: frame.history,
                 appearance: frame.appearance,
+                dialing_sessions: frame.dialing_sessions,
+                dialing_projects: frame.dialing_projects,
             },
             &mut actions,
         );
@@ -1538,6 +1544,8 @@ mod tests {
                 > = std::sync::OnceLock::new();
                 EMPTY.get_or_init(Default::default)
             },
+            dialing_sessions: &[],
+            dialing_projects: &[],
             launcher: false,
             history: &[],
             known_hosts: None,

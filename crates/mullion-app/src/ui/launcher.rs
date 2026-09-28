@@ -59,6 +59,11 @@ pub struct Lists<'a> {
     /// `ui/` 这一层零 IO。
     pub history: &'a [crate::ui::history::HistoryRow],
     pub appearance: &'a crate::ui::badge::AppearanceCache,
+    /// F297:正由用户点击发起、还没有结果的拨号。每帧从 F205 票据台账现算,
+    /// 不是另存一张状态表 —— 票的生命周期(`issue` → `ConnectOk`/`ConnectErr`
+    /// 里 `claim`)就是转圈的生命周期。
+    pub dialing_sessions: &'a [mullion_store::SessionId],
+    pub dialing_projects: &'a [ProjectId],
 }
 
 /// 画 launcher 中央区的三列(F288):项目 / 会话 / 历史现场。
@@ -246,6 +251,8 @@ fn projects_column(
                 .get(&p.id)
                 .copied()
                 .unwrap_or(crate::project::Lamp::Unknown);
+            // F297:这个项目正由用户点击发起的拨号在途 —— 现算,不另存状态。
+            let dialing = cx.lists.dialing_projects.contains(&p.id);
             let r = crate::ui::project_row::show(
                 ui,
                 t,
@@ -264,9 +271,11 @@ fn projects_column(
                         cx.lists.appearance,
                         mullion_store::ColorTarget::ListItem,
                     ),
+                    dialing,
                 },
             );
-            if r.clicked() {
+            // F297:在拨的行再点不发第二次打开请求。
+            if r.clicked() && !dialing {
                 ui_state.project_open_request = Some((p.id, None));
             }
             ui.add_space(SP_S);
@@ -376,10 +385,18 @@ fn sessions_column(
                 crate::ui::badge::paint_icon(p, crate::ui::project_row::icon_slot(rect), icon, bg);
             }
             let left = rect.left() + crate::ui::project_row::TEXT_X;
-            let avail = (rect.width()
+            let mut avail = (rect.width()
                 - crate::ui::project_row::TEXT_X
                 - crate::ui::project_row::TEXT_RIGHT_PAD)
                 .max(0.0);
+            // F297:这条会话正由用户点击发起的拨号在途 —— 右侧画「转圈 +
+            // 连接中…」,并从名字预算里扣掉它占的宽度(同项目行 `name_avail`
+            // 的理由:不扣的话长名字会一路铺到右边缘,把它顶出行外)。
+            let dialing = cx.lists.dialing_sessions.contains(&r.id);
+            if dialing {
+                let occupied = crate::ui::project_row::paint_dialing(ui, rect, t);
+                avail = (avail - occupied - SP_S).max(0.0);
+            }
             // 名称走命中高亮 —— 一个框过滤三列(D4),用户要看得出为什么
             // 这一行留下来了。与会话管理器左栏同一个函数。
             crate::ui::session_manager::list::paint_highlighted(
@@ -402,7 +419,8 @@ fn sessions_column(
                 t,
                 avail,
             );
-            if resp.clicked() {
+            // F297:在拨的行再点不发第二次连接请求。
+            if resp.clicked() && !dialing {
                 // D2:点一行就连。与会话管理器双击行**同一条通道** ——
                 // 另开一条的话「连接」这件事就有两套处置了。
                 ui_state.connect_request = Some(r.id);
@@ -528,6 +546,9 @@ mod tests {
     ///
     /// 不让每条测试自己拼 `Lists`:往里加一个字段就要改十几处,而那十几处
     /// 里只要有一处填错(比如把 `history` 填成空表)就是**静默**的少画一列。
+    ///
+    /// 薄壳:在拨表恒传空,既有测试(没有任何在拨)不用跟着改。F297 需要
+    /// 在拨表的测试走 [`draw_dialing`]。
     fn draw(
         ctx: &egui::Context,
         ui_state: &mut crate::ui::UiState,
@@ -535,6 +556,30 @@ mod tests {
         lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
         sessions: &[SessionRecord],
         history: &[crate::ui::history::HistoryRow],
+        actions: &mut crate::ui::UiActions,
+    ) {
+        draw_dialing(
+            ctx,
+            ui_state,
+            projects,
+            lamps,
+            sessions,
+            history,
+            (&[], &[]),
+            actions,
+        );
+    }
+
+    /// 同 [`draw`],但能指定「哪些行在拨」(F297)。
+    #[allow(clippy::too_many_arguments)]
+    fn draw_dialing(
+        ctx: &egui::Context,
+        ui_state: &mut crate::ui::UiState,
+        projects: &[ProjectRecord],
+        lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
+        sessions: &[SessionRecord],
+        history: &[crate::ui::history::HistoryRow],
+        dialing: (&[SessionId], &[ProjectId]),
         actions: &mut crate::ui::UiActions,
     ) {
         show(
@@ -549,6 +594,8 @@ mod tests {
                 credentials: &[],
                 history,
                 appearance: &crate::ui::badge::AppearanceCache::default(),
+                dialing_sessions: dialing.0,
+                dialing_projects: dialing.1,
             },
             actions,
         );
@@ -1174,12 +1221,24 @@ mod tests {
         texts_full(projects, &[sess(7, "web01")], &[], query)
     }
 
-    /// 三张表都自己给。跑两帧收全部画出来的文字。
+    /// 三张表都自己给。跑两帧收全部画出来的文字。薄壳:在拨表恒空,
+    /// F297 需要在拨表的测试走 [`texts_full_dialing`]。
     fn texts_full(
         projects: &[ProjectRecord],
         sessions: &[SessionRecord],
         history: &[crate::ui::history::HistoryRow],
         query: &str,
+    ) -> Vec<String> {
+        texts_full_dialing(projects, sessions, history, query, (&[], &[]))
+    }
+
+    /// 同 [`texts_full`],但能指定「哪些行在拨」(F297)。
+    fn texts_full_dialing(
+        projects: &[ProjectRecord],
+        sessions: &[SessionRecord],
+        history: &[crate::ui::history::HistoryRow],
+        query: &str,
+        dialing: (&[SessionId], &[ProjectId]),
     ) -> Vec<String> {
         fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
             match shape {
@@ -1199,13 +1258,14 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
-                    draw(
+                    draw_dialing(
                         ctx,
                         &mut ui_state,
                         projects,
                         &lamps,
                         sessions,
                         history,
+                        dialing,
                         &mut actions,
                     );
                 })
@@ -1313,6 +1373,8 @@ mod tests {
                             credentials: &[],
                             history: &[],
                             appearance: &cache,
+                            dialing_sessions: &[],
+                            dialing_projects: &[],
                         },
                         &mut actions,
                     );
@@ -1524,6 +1586,149 @@ mod tests {
         assert!(
             !texts.iter().any(|s| s == "没有匹配的会话"),
             "没在搜索却说没匹配:{texts:?}"
+        );
+    }
+
+    // ---- F297:点击后立刻显示「连接中…」 -----------------------------------
+
+    /// F297:在拨的会话行再点不发第二次连接请求,别的行照常可点。
+    ///
+    /// 自证会变红:删掉 `sessions_column` 里 `if resp.clicked() && !dialing`
+    /// 的 `!dialing`。
+    #[test]
+    fn a_session_row_being_dialed_ignores_clicks_but_its_neighbours_do_not() {
+        let ss = vec![sess(9, "独立机"), sess(10, "另一台")];
+        let busy = [SessionId(9)];
+        let hit = |target: SessionId| -> Option<SessionId> {
+            let ctx = egui::Context::default();
+            let mut ui_state = crate::ui::UiState::default();
+            let lamps = std::collections::BTreeMap::new();
+            let mut rect = None;
+            for _ in 0..2 {
+                let mut a = crate::ui::UiActions::default();
+                let _ = ctx.run(wide(), |ctx| {
+                    draw_dialing(
+                        ctx,
+                        &mut ui_state,
+                        &[],
+                        &lamps,
+                        &ss,
+                        &[],
+                        (&busy, &[]),
+                        &mut a,
+                    );
+                    rect = ctx.read_response(session_row_id(target)).map(|r| r.rect);
+                });
+            }
+            let pos = rect.expect("这一行根本没画出来").center();
+            let mut input = wide();
+            input.events.push(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            let mut a = crate::ui::UiActions::default();
+            let _ = ctx.run(input, |ctx| {
+                draw_dialing(
+                    ctx,
+                    &mut ui_state,
+                    &[],
+                    &lamps,
+                    &ss,
+                    &[],
+                    (&busy, &[]),
+                    &mut a,
+                );
+            });
+            ui_state.connect_request
+        };
+        assert_eq!(hit(SessionId(9)), None, "在拨的行又发了一次连接");
+        assert_eq!(
+            hit(SessionId(10)),
+            Some(SessionId(10)),
+            "别的行被连带锁住了"
+        );
+    }
+
+    /// F297:在拨的行画出「连接中…」;不在拨的行不画。
+    ///
+    /// 自证会变红:删掉 `sessions_column` 里画「连接中…」那一句
+    /// (即 `paint_dialing` 里 `ui.painter().galley(text_pos, g, ..)` 那句)。
+    #[test]
+    fn a_session_row_being_dialed_says_so() {
+        let ss = vec![sess(9, "独立机"), sess(10, "另一台")];
+        let texts = texts_full_dialing(&[], &ss, &[], "", (&[SessionId(9)], &[]));
+        assert_eq!(
+            texts.iter().filter(|s| *s == "连接中…").count(),
+            1,
+            "{texts:?}"
+        );
+    }
+
+    /// F297:项目行同理(走 `project_row::Row.dialing`):画「连接中…」,
+    /// 且在拨时再点不发第二次打开请求。
+    ///
+    /// 自证会变红:`launcher.rs` 构造 `Row` 时 `dialing` 恒传 `false`;
+    /// 或项目列 `if r.clicked()` 去掉 `&& !dialing`。
+    #[test]
+    fn a_project_row_being_dialed_says_so_and_ignores_clicks() {
+        let ps = vec![proj(1, "接口", "/srv/api", None)];
+        let texts = texts_full_dialing(&ps, &[], &[], "", (&[], &[ProjectId(1)]));
+        assert!(texts.iter().any(|s| s == "连接中…"), "{texts:?}");
+
+        let id = crate::ui::project_row::row_id("launcher", ProjectId(1));
+        let ctx = egui::Context::default();
+        let mut ui_state = crate::ui::UiState::default();
+        let lamps = std::collections::BTreeMap::new();
+        let ss: Vec<SessionRecord> = vec![];
+        let mut rect = None;
+        for _ in 0..2 {
+            let mut a = crate::ui::UiActions::default();
+            let _ = ctx.run(wide(), |ctx| {
+                draw_dialing(
+                    ctx,
+                    &mut ui_state,
+                    &ps,
+                    &lamps,
+                    &ss,
+                    &[],
+                    (&[], &[ProjectId(1)]),
+                    &mut a,
+                );
+                rect = ctx.read_response(id).map(|r| r.rect);
+            });
+        }
+        let pos = rect.expect("项目行根本没画出来").center();
+        let mut input = wide();
+        input.events.push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let mut a = crate::ui::UiActions::default();
+        let _ = ctx.run(input, |ctx| {
+            draw_dialing(
+                ctx,
+                &mut ui_state,
+                &ps,
+                &lamps,
+                &ss,
+                &[],
+                (&[], &[ProjectId(1)]),
+                &mut a,
+            );
+        });
+        assert_eq!(
+            ui_state.project_open_request, None,
+            "在拨的项目行又发了一次打开请求"
         );
     }
 }

@@ -287,6 +287,8 @@ fn list_column(
                                 appearance,
                                 mullion_store::ColorTarget::ListItem,
                             ),
+                            // F297:转圈只在启动页画,这里没有那份「哪些在拨」的表。
+                            dialing: false,
                         },
                     );
                     if r.clicked() {
