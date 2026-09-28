@@ -4291,6 +4291,7 @@ impl App {
                     let conn = host.handle.clone();
                     let cell = host.stats.clone();
                     let proxy = self.proxy.clone();
+                    let generation = plan.generation;
                     self._runtime.spawn(async move {
                         let cmd = crate::node_stats::sample_command();
                         // **不许**在这里外套 tokio 的 timeout 包住 `exec(..)`——
@@ -4324,7 +4325,7 @@ impl App {
                                 )
                             }
                         };
-                        cell.finish_sample(mem, disk);
+                        cell.finish_sample(generation, mem, disk);
                         let _ = proxy.send_event(UserEvent::NodeStatsUpdated);
                     });
                 }
@@ -4332,6 +4333,7 @@ impl App {
                     let conn = host.handle.clone();
                     let cell = host.stats.clone();
                     let proxy = self.proxy.clone();
+                    let generation = plan.generation;
                     self._runtime.spawn(async move {
                         let cmd = crate::node_stats::country_command();
                         // 同上:走 `exec_with_timeout`,不许外套 timeout。
@@ -4351,7 +4353,7 @@ impl App {
                             }
                             Err(e) => crate::node_stats::Reading::Failed(format!("取国家失败:{e}")),
                         };
-                        cell.finish_country(c);
+                        cell.finish_country(generation, c);
                         let _ = proxy.send_event(UserEvent::NodeStatsUpdated);
                     });
                 }

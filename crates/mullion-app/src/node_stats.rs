@@ -145,6 +145,12 @@ struct Inner {
     sample_busy: bool,
     country_at: Option<Instant>,
     country_busy: bool,
+    /// F298 复核:`reset_schedule` 每次都递增。换连接(重连/换节点)之后,
+    /// 挂在旧连接上、迟迟才回来的探针带的是**旧世代号**——`finish_sample`/
+    /// `finish_country` 拿它跟当前世代比,对不上就整条丢弃(不写快照、不清
+    /// busy),不然旧连接的结果会盖掉新连接刚置上的 busy 或者写进一份过期
+    /// 数据。
+    generation: u64,
 }
 
 /// 一条连接的状态格子。`Clone` = 同一份(`Arc`)。
@@ -156,6 +162,9 @@ pub struct StatsCell(Arc<Mutex<Inner>>);
 pub struct Plan {
     pub sample: bool,
     pub country: bool,
+    /// 发起这一轮时的世代号。task 把它原样带回 `finish_sample`/
+    /// `finish_country`,用来分辨「这条结果是不是已经作废的上一轮」。
+    pub generation: u64,
 }
 
 impl StatsCell {
@@ -173,6 +182,7 @@ impl StatsCell {
         let p = Plan {
             sample: due(g.sample_at, g.sample_busy, SAMPLE_EVERY, now),
             country: due(g.country_at, g.country_busy, COUNTRY_EVERY, now),
+            generation: g.generation,
         };
         if p.sample {
             g.sample_busy = true;
@@ -194,14 +204,25 @@ impl StatsCell {
         .flatten()
         .min()
     }
-    pub fn finish_sample(&self, mem: Reading<Usage>, disk: Reading<Usage>) {
+    /// `generation` 必须是发起这次采样时 [`Plan::generation`] 给的那个值。
+    /// 对不上当前世代(其间 `reset_schedule` 被调过)就整条丢弃——**既不
+    /// 写快照,也不清 busy**:busy 是新世代自己置的,旧世代的结果没资格
+    /// 清它,清了会让新一轮误以为「已经有结果回来了」而提前放行下一次 due。
+    pub fn finish_sample(&self, generation: u64, mem: Reading<Usage>, disk: Reading<Usage>) {
         let mut g = self.lock();
+        if generation != g.generation {
+            return;
+        }
         g.snap.mem = mem;
         g.snap.disk = disk;
         g.sample_busy = false;
     }
-    pub fn finish_country(&self, c: Reading<String>) {
+    /// 同 [`Self::finish_sample`] 的世代校验。
+    pub fn finish_country(&self, generation: u64, c: Reading<String>) {
         let mut g = self.lock();
+        if generation != g.generation {
+            return;
+        }
         g.snap.country = c;
         g.country_busy = false;
     }
@@ -209,13 +230,15 @@ impl StatsCell {
     pub fn refresh_country_now(&self) {
         self.lock().country_at = None;
     }
-    /// 断线重连换了 handle:两项都立刻重取,旧值留着(不闪空)。
+    /// 断线重连换了 handle:两项都立刻重取,旧值留着(不闪空)。世代号
+    /// 递增——挂在旧连接上还在途的探针,回来时会因为世代对不上被丢弃。
     pub fn reset_schedule(&self) {
         let mut g = self.lock();
         g.sample_at = None;
         g.country_at = None;
         g.sample_busy = false;
         g.country_busy = false;
+        g.generation = g.generation.wrapping_add(1);
     }
 }
 
@@ -383,7 +406,8 @@ mod tests {
             c.plan(now),
             Plan {
                 sample: true,
-                country: true
+                country: true,
+                generation: 0,
             }
         );
         assert_eq!(c.plan(now), Plan::default());
@@ -394,11 +418,104 @@ mod tests {
             !c.plan(still_busy_but_overdue).sample,
             "上一次探针还没回来,不该在它还在途时重发"
         );
-        c.finish_sample(Reading::Absent, Reading::Absent);
+        c.finish_sample(0, Reading::Absent, Reading::Absent);
         assert!(!c.plan(now).sample, "刚采过,10 秒内不该再采");
         c.refresh_country_now();
-        c.finish_country(Reading::Unknown);
+        c.finish_country(0, Reading::Unknown);
         assert!(c.plan(now).country, "点了刷新,下一次 tick 该立刻取");
+    }
+
+    /// F298 复核(Important):`reset_schedule`(换连接/换节点)之后,挂在
+    /// 旧连接上迟迟才回来的采样结果,既不能覆盖快照,也不能清掉新一轮的
+    /// busy——不然旧连接的过期数据会显示成「当前」,或者让新一轮误以为
+    /// 已经有结果回来而提前放行下一次 due。
+    ///
+    /// 自证会变红:把 `finish_sample` 里的世代校验删掉(`if generation !=
+    /// g.generation { return; }`)。
+    #[test]
+    fn a_late_result_from_before_a_reset_neither_overwrites_the_snapshot_nor_clears_the_new_busy() {
+        let c = StatsCell::default();
+        let now = Instant::now();
+
+        // 第一轮:发起采样,拿到世代号(此时是 0),但探针还没回来。
+        let old_gen = c.plan(now).generation;
+
+        // 换连接:调度重置,世代号往前走一格;新一轮立刻发起(sample_at
+        // 被清空、busy 也被清空,due() 会重新判定到点),busy 再次置起。
+        c.reset_schedule();
+        let new_gen = c.plan(now).generation;
+        assert_ne!(old_gen, new_gen, "reset_schedule 必须递增世代号");
+
+        // 旧世代的探针这时候才姗姗来迟。
+        c.finish_sample(
+            old_gen,
+            Reading::Ok(Usage {
+                used_kb: 999,
+                total_kb: 1000,
+            }),
+            Reading::Ok(Usage {
+                used_kb: 999,
+                total_kb: 1000,
+            }),
+        );
+
+        // 快照没被这份过期数据污染——还是初始的 Unknown。
+        assert_eq!(
+            c.snapshot().mem,
+            Reading::Unknown,
+            "旧世代的结果不该写进快照"
+        );
+        assert_eq!(
+            c.snapshot().disk,
+            Reading::Unknown,
+            "旧世代的结果不该写进快照"
+        );
+        // busy 也没被清掉——新一轮的探针还在途,due() 该继续判「未到点」。
+        assert!(
+            !c.plan(now).sample,
+            "旧世代的结果不该清掉新一轮的 busy,不然会误判成已经有结果回来了"
+        );
+
+        // 对照:带上正确的当前世代号,结果才应该生效。
+        c.finish_sample(
+            new_gen,
+            Reading::Ok(Usage {
+                used_kb: 1,
+                total_kb: 1000,
+            }),
+            Reading::Ok(Usage {
+                used_kb: 1,
+                total_kb: 1000,
+            }),
+        );
+        assert_eq!(
+            c.snapshot().mem,
+            Reading::Ok(Usage {
+                used_kb: 1,
+                total_kb: 1000
+            })
+        );
+    }
+
+    /// 同上,`finish_country` 那一路。
+    #[test]
+    fn a_late_country_result_from_before_a_reset_is_dropped_too() {
+        let c = StatsCell::default();
+        let now = Instant::now();
+        let old_gen = c.plan(now).generation;
+        c.reset_schedule();
+        let new_gen = c.plan(now).generation;
+
+        c.finish_country(old_gen, Reading::Ok("JP".into()));
+        assert_eq!(
+            c.snapshot().country,
+            Reading::Unknown,
+            "旧世代的国家结果不该写进快照"
+        );
+        assert!(!c.plan(now).country, "旧世代的结果不该清掉新一轮的 busy");
+
+        c.finish_country(new_gen, Reading::Ok("JP".into()));
+        assert_eq!(c.snapshot().country, Reading::Ok("JP".into()));
     }
 
     /// ≥90% 标 warn,89% 不标。自证会变红:`>=` 改 `>`(90% 不标)。
