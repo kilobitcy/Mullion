@@ -801,6 +801,35 @@ mod tests {
         assert_eq!(st.as_ref().unwrap().find.as_ref().unwrap().cur, Some(2));
     }
 
+    /// F299:Ctrl+F 预填当前正文选区(单行时)。
+    ///
+    /// 不靠真实拖拽制造选区(与被测代码无关的额外复杂度),直接把正文的
+    /// `TextEditState` 钉成一段选区,模拟「用户已经选好这段」。
+    ///
+    /// 自证会变红:删掉 `if let Some(q) = seed { f.query = q; }` 那一句
+    /// (预填形同虚设,查找框永远从空字符串开始)。
+    #[test]
+    fn ctrl_f_prefills_the_query_from_a_single_line_selection() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("xx needle yy");
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        let ekey = st.as_ref().unwrap().key;
+        let mut ts = egui::TextEdit::load_state(&ctx, body_id(&ekey)).unwrap_or_default();
+        ts.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(3),
+            egui::text::CCursor::new(9),
+        )));
+        egui::TextEdit::store_state(&ctx, body_id(&ekey), ts);
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        let f = st
+            .as_ref()
+            .unwrap()
+            .find
+            .as_ref()
+            .expect("Ctrl+F 没开出查找条");
+        assert_eq!(f.query, "needle", "没有用当前选区预填查找框");
+    }
+
     /// F299:Esc 关条,并把正文选区落在当前匹配上(关条后用户直接接着改)。
     /// 自证会变红:删掉关条时写 `TextEditState` 选区那一段。
     #[test]
