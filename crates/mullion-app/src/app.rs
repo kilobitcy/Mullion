@@ -13981,6 +13981,18 @@ impl ApplicationHandler<UserEvent> for App {
                                                         .and_then(|p| p.notice.as_deref()),
                                                     // F290:命令抽屉 pane 的标题条要多写「抽屉」二字。
                                                     drawer: ws.is_drawer(g.id),
+                                                    // F298:与 `host` 同一条判据 ——
+                                                    // `host_pending` 时不借主叶子那台的数字。
+                                                    stats: ws
+                                                        .pane(g.id)
+                                                        .filter(|p| !p.host_pending)
+                                                        .and_then(|p| ws.hosts.get(p.host_ix))
+                                                        .map(|h| {
+                                                            crate::node_stats::pieces(
+                                                                &h.stats.snapshot(),
+                                                            )
+                                                        })
+                                                        .unwrap_or_default(),
                                                 }
                                             })
                                             .collect()
@@ -14354,6 +14366,18 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.ui.project_pick =
                                     Some(crate::ui::project_pick::ProjectPickDraft::new(pane));
                                 mark_ui_dirty!(self.ui_dirty);
+                            }
+                            // F298:点了状态段里的国家那格 —— 这块 pane 所在
+                            // 连接下一次 `tick_node_stats` 立刻重取,不等
+                            // `COUNTRY_EVERY`(5 分钟)。
+                            if let Some(pane) = actions.refresh_node_pane {
+                                if let Some(ws) = active_ws_of(&self.tabs) {
+                                    if let Some(h) =
+                                        ws.pane(pane).and_then(|p| ws.hosts.get(p.host_ix))
+                                    {
+                                        h.stats.refresh_country_now();
+                                    }
+                                }
                             }
                             // 切项目弹窗的结论。**汇进 F223 那条既有链路**
                             // (`project_open_request`),不另开一条:确认框、
@@ -16876,6 +16900,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.rehost_pane.is_some()
         || a.project_pick.is_some()
         || a.pick_project_pane.is_some()
+        || a.refresh_node_pane.is_some()
         || a.history.is_some()
         || a.pack.is_some()
         || a.copy_last_error
@@ -21828,6 +21853,45 @@ mod tests {
         assert!(
             body.contains("self.tabs.iter_mut()"),
             "tick_node_stats 不再遍历全部标签 —— 后台标签的节点状态会停住不动"
+        );
+    }
+
+    /// **接线守护 / F298**:`has_real_action` 必须登记 `refresh_node_pane`
+    /// (列举式门控,第 N 次踩:漏了 = 点国家那格「有时候没反应」,egui 的
+    /// discard 趟静默吃掉这次点击);`TitleView` 的 `stats` 必须从
+    /// `HostConn.stats` 取,且与 `host` 同守 `host_pending`(占位 pane 不能
+    /// 借主叶子那台机器的数字)。
+    ///
+    /// 自证会变红:删 `|| a.refresh_node_pane.is_some()`;或把
+    /// `.filter(|p| !p.host_pending)` 从 `stats:` 那段删掉。
+    #[test]
+    fn the_node_stats_reach_the_title_bar_and_the_refresh_click_is_a_real_action() {
+        let src = include_str!("app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
+
+        let after = production
+            .split("fn has_real_action(")
+            .nth(1)
+            .expect("找不到 has_real_action");
+        let body = &after[..after.find("\n}\n").expect("找不到 has_real_action 的结尾")];
+        assert!(
+            body.contains("a.refresh_node_pane"),
+            "点国家那格的刷新请求会在 discard 趟被静默吃掉"
+        );
+
+        let at = production
+            .find("stats: ws")
+            .expect("找不到 TitleView 构造点的 stats 字段");
+        let window = &production[at..(at + 450).min(production.len())];
+        assert!(
+            window.contains(".filter(|p| !p.host_pending)"),
+            "stats 没有守 host_pending —— 占位 pane 会借主叶子那台机器的数字:{window}"
+        );
+        assert!(
+            window.contains("crate::node_stats::pieces("),
+            "stats 没有走 node_stats::pieces 排版:{window}"
         );
     }
 

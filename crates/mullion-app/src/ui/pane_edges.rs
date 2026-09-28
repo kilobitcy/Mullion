@@ -222,6 +222,7 @@ mod tests {
             tmux: None,
             notice: None,
             drawer: false,
+            stats: Vec::new(),
         }
     }
 

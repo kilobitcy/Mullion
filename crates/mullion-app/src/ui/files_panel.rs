@@ -5074,6 +5074,7 @@ mod tests {
             project_icon: None,
             notice: None,
             drawer: false,
+            stats: Vec::new(),
         }
     }
 

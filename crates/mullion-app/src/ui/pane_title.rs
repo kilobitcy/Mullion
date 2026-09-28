@@ -52,6 +52,10 @@ pub struct TitleView<'a> {
     /// 不另记一份 —— 理由与 `project` 字段同形(F160~F163「意图表换节点
     /// 没人清」)。
     pub drawer: bool,
+    /// F298:这块 pane 所在连接的节点状态,已由 `node_stats::pieces` 排好。
+    /// 空 = 不显示(还没取到 / `host_pending` / 没连上)。**拿 owned**:源头是
+    /// `Mutex` 里的快照,借不出活到本帧结束的引用;每 pane 每帧三个短串。
+    pub stats: Vec<crate::node_stats::Piece>,
 }
 
 /// ④:焦点分屏标题条上那层 accent 的不透明度。0.14 —— 够看出「这块亮一点」,
@@ -222,6 +226,10 @@ fn rehost_id(id: PaneId) -> egui::Id {
 fn project_id(id: PaneId) -> egui::Id {
     egui::Id::new(("pane_title_project", id.0))
 }
+/// F298:状态段里「国家」那一格的 id,点它触发重取。
+fn country_id(id: PaneId) -> egui::Id {
+    egui::Id::new(("pane_title_country", id.0))
+}
 
 /// 标题条小按钮的字号,也是自绘图标的边长。
 const BUTTON_SIZE: f32 = 13.0;
@@ -296,6 +304,23 @@ fn small_action_button(ui: &mut egui::Ui, id: egui::Id, mark: Mark, t: &Theme) -
     resp
 }
 
+/// F298:状态段里「国家」那一格 —— 唯一可点的一格。手动 `allocate` + `interact`
+/// 给固定 id,理由同 `small_action_button`:测试要 `ctx.read_response(id)`
+/// 精确取到它,自动 id 靠布局顺序生成,测不到。
+fn country_cell(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    ui.painter().galley(rect.min, galley, color);
+    resp
+}
+
 /// 画「⇆」:上排箭头指右,下排箭头指左。纯线段,零字体依赖。
 ///
 /// 尺寸全部由 `rect` 推,不写死像素 —— DPI 变了(`ScaleFactorChanged`)按钮矩形
@@ -329,6 +354,8 @@ pub struct TitleAction {
     /// **和 `rehost` 分开两个字段、两个按钮**:底层机制共享,用户心智是两件
     /// 事,合并成一个带 tab 的弹窗会让每次普通换节点都先撞见一个不相干的 tab。
     pub pick_project: Option<PaneId>,
+    /// F298:点了国家那格 —— 请求立刻重取出口国家。
+    pub refresh_node: Option<PaneId>,
 }
 
 pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAction {
@@ -426,6 +453,70 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     .clicked()
                     {
                         action.pick_project = Some(v.geom.id);
+                    }
+                    // F298:节点状态段,摆在项目按钮左边(right_to_left,先加的
+                    // 在右,所以是「按钮组左边、标题右边」)。`.rev()`——`pieces()`
+                    // 给的是内存/磁盘/国家从左到右的阅读顺序,right_to_left 布局
+                    // 里要反过来加才能保持同样的阅读顺序。放不下时整段不画,
+                    // 状态段先于标题让位(`node_stats::stats_fit`,用户确认的
+                    // 取舍:认 pane 靠标题)。
+                    if !v.stats.is_empty() {
+                        let font = egui::FontId::proportional(12.0);
+                        let sep = " · ";
+                        let measure = |ui: &egui::Ui, s: &str| -> f32 {
+                            ui.painter()
+                                .layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE)
+                                .size()
+                                .x
+                        };
+                        let stats_w: f32 =
+                            v.stats.iter().map(|p| measure(ui, &p.text)).sum::<f32>()
+                                + measure(ui, sep) * v.stats.len().saturating_sub(1) as f32
+                                + ui.spacing().item_spacing.x * (2 * v.stats.len()) as f32;
+                        let title_w = measure(
+                            ui,
+                            &title_text(
+                                v.index,
+                                v.host,
+                                v.cwd_leaf.as_deref(),
+                                v.tmux,
+                                v.project,
+                                v.status,
+                                v.notice,
+                                v.drawer,
+                            ),
+                        );
+                        if crate::node_stats::stats_fit(ui.available_width(), stats_w, title_w) {
+                            for (i, p) in v.stats.iter().rev().enumerate() {
+                                if i > 0 {
+                                    ui.label(
+                                        egui::RichText::new(sep.trim())
+                                            .font(font.clone())
+                                            .color(theme::c32(t.fg_dim)),
+                                    );
+                                }
+                                let color = theme::c32(if p.warn { t.warn } else { t.fg_muted });
+                                if p.is_country {
+                                    let r = country_cell(
+                                        ui,
+                                        country_id(v.geom.id),
+                                        &p.text,
+                                        font.clone(),
+                                        color,
+                                    );
+                                    if r.on_hover_text(&p.hover).clicked() {
+                                        action.refresh_node = Some(v.geom.id);
+                                    }
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(p.text.clone())
+                                            .font(font.clone())
+                                            .color(color),
+                                    )
+                                    .on_hover_text(&p.hover);
+                                }
+                            }
+                        }
                     }
                     // 剩下的空间(已扣掉 × / 换节点按钮)左对齐摆状态点 + 一整串标题文字;
                     // 排版用的 available_width 到这里已经是扣掉 × 之后的余量。
@@ -777,6 +868,7 @@ mod tests {
                 tmux: None,
                 notice: None,
                 drawer: false,
+                stats: Vec::new(),
             };
             view.geom.title_px.h = title_h;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -835,6 +927,7 @@ mod tests {
                 tmux: None,
                 notice: None,
                 drawer: false,
+                stats: Vec::new(),
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -899,6 +992,7 @@ mod tests {
             tmux: None,
             notice: None,
             drawer: false,
+            stats: Vec::new(),
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -941,8 +1035,6 @@ mod tests {
 
     /// 跑一帧拿按钮位置、再跑一帧点它,返回 `show` 的动作。
     fn click_button(which: egui::Id) -> TitleAction {
-        let ctx = egui::Context::default();
-        ctx.set_pixels_per_point(1.0);
         let views = [TitleView {
             geom: geom_800x600_title32(1, 1.0),
             index: 1,
@@ -956,7 +1048,16 @@ mod tests {
             tmux: None,
             notice: None,
             drawer: false,
+            stats: Vec::new(),
         }];
+        click_button_with(&views, which)
+    }
+
+    /// 同 `click_button`,视图由调用方给 —— 需要自定义 `stats` / 标题条
+    /// 宽度等字段时用这个变体,别再复制一份点击流程。
+    fn click_button_with(views: &[TitleView<'_>], which: egui::Id) -> TitleAction {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
         // **必须显式把时间推过 `Area` 的 fade_in**。默认 `RawInput` 的
         // `time` 是 `None`,egui 会拿墙钟凑,两帧之间可能只过了几微秒 ——
         // 淡入没走完时 `Area` 的内容不可交互,点下去毫无反应,而现象是
@@ -969,7 +1070,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    show(ctx, &crate::theme::MULLION_DARK, &views);
+                    show(ctx, &crate::theme::MULLION_DARK, views);
                 },
             )
         };
@@ -987,7 +1088,7 @@ mod tests {
                 ..click_at(rect.center())
             },
             |ctx| {
-                out = show(ctx, &crate::theme::MULLION_DARK, &views);
+                out = show(ctx, &crate::theme::MULLION_DARK, views);
             },
         );
         out
@@ -1025,6 +1126,187 @@ mod tests {
         let a = click_button(close_id(PaneId(1)));
         assert_eq!(a.close, Some(PaneId(1)));
         assert_eq!(a.pick_project, None, "点 × 不该弹项目选择");
+    }
+
+    /// F298:内存 43%、磁盘 95%(≥ `WARN_PCT`)、出口国家 JP —— 三格里
+    /// `pieces()` 已经排好。
+    fn wide_stats() -> Vec<crate::node_stats::Piece> {
+        crate::node_stats::pieces(&crate::node_stats::Snapshot {
+            mem: crate::node_stats::Reading::Ok(crate::node_stats::Usage {
+                used_kb: 43,
+                total_kb: 100,
+            }),
+            disk: crate::node_stats::Reading::Ok(crate::node_stats::Usage {
+                used_kb: 95,
+                total_kb: 100,
+            }),
+            country: crate::node_stats::Reading::Ok("JP".into()),
+        })
+    }
+
+    /// 一块指定像素宽的标题条几何,ppp 恒 1.0(测宽度让位,DPI 不是本条的
+    /// 变量)。
+    fn geom_with_title_width(id: u32, title_w: u32) -> PaneGeom {
+        use crate::shell::workspace::{title_bar_px, PxRect};
+        PaneGeom {
+            id: PaneId(id),
+            px: PxRect {
+                x: 0,
+                y: 0,
+                w: title_w,
+                h: 600,
+            },
+            title_px: PxRect {
+                x: 0,
+                y: 0,
+                w: title_w,
+                h: title_bar_px(1.0),
+            },
+            term_px: PxRect {
+                x: 0,
+                y: title_bar_px(1.0),
+                w: title_w,
+                h: 600 - title_bar_px(1.0),
+            },
+            grid: (80, 28),
+        }
+    }
+
+    /// 递归找命中 `needle` 的 `Shape::Text`,取它第一个 section 的颜色 ——
+    /// 同 `editor_window.rs::the_body_is_coloured_by_syntax_...` 的技法:
+    /// 颜色分段挂在 `galley.job.sections`,不是 `TextShape` 顶层。
+    fn text_color_of(shapes: &[egui::Shape], needle: &str) -> Option<egui::Color32> {
+        fn walk(s: &egui::Shape, needle: &str) -> Option<egui::Color32> {
+            match s {
+                egui::Shape::Vec(v) => v.iter().find_map(|x| walk(x, needle)),
+                egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                    ts.galley.job.sections.first().map(|s| s.format.color)
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|s| walk(s, needle))
+    }
+
+    /// F298:宽条上画出三格,磁盘 95% 用 warn 色。
+    ///
+    /// 自证会变红:删掉 `show()` 里画状态段的那整段;或把 `p.warn` 那支的
+    /// 颜色换成 `t.fg_muted`。
+    #[test]
+    fn a_wide_title_bar_shows_node_stats_with_the_warning_color_over_ninety() {
+        let views = [TitleView {
+            geom: geom_with_title_width(1, 1200),
+            index: 1,
+            project: None,
+            project_icon: None,
+            host: Some("dev@build-01"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+            cwd_leaf: None,
+            tmux: None,
+            notice: None,
+            drawer: false,
+            stats: wide_stats(),
+        }];
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(Default::default(), |ctx| {
+                show(ctx, &t, &views);
+            });
+            shapes = out.shapes.into_iter().map(|cs| cs.shape).collect();
+        }
+        assert!(
+            text_color_of(&shapes, "内存 43%").is_some(),
+            "宽条上没画出内存这一格:{shapes:?}"
+        );
+        assert!(
+            text_color_of(&shapes, "JP").is_some(),
+            "宽条上没画出国家这一格:{shapes:?}"
+        );
+        assert_eq!(
+            text_color_of(&shapes, "磁盘 95%"),
+            Some(theme::c32(t.warn)),
+            "磁盘 95% ≥ WARN_PCT,该用 warn 色"
+        );
+    }
+
+    /// F298:窄条上状态段让位,标题文字仍在。
+    ///
+    /// 自证会变红:删掉 `stats_fit` 那道判断(恒画状态段)。
+    #[test]
+    fn a_narrow_title_bar_drops_the_stats_before_the_title() {
+        let views = [TitleView {
+            geom: geom_with_title_width(1, 260),
+            index: 1,
+            project: None,
+            project_icon: None,
+            host: Some("h"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+            cwd_leaf: None,
+            tmux: None,
+            notice: None,
+            drawer: false,
+            stats: wide_stats(),
+        }];
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(Default::default(), |ctx| {
+                show(ctx, &t, &views);
+            });
+            shapes = out.shapes.into_iter().map(|cs| cs.shape).collect();
+        }
+        assert!(
+            text_color_of(&shapes, "内存").is_none(),
+            "窄条上不该再画状态段:{shapes:?}"
+        );
+        let want_title = title_text(
+            1,
+            Some("h"),
+            None,
+            None,
+            None,
+            PaneStatus::Live,
+            None,
+            false,
+        );
+        assert!(
+            text_color_of(&shapes, &want_title).is_some(),
+            "标题让位给状态段之后自己反而不见了:{shapes:?}"
+        );
+    }
+
+    /// F298:点国家那格报 `refresh_node`,不串到 × / 换节点。
+    ///
+    /// 自证会变红:国家那格不 `Sense::click()`,或报成 `rehost`。
+    #[test]
+    fn clicking_the_country_asks_for_a_refresh_of_this_pane() {
+        let views = [TitleView {
+            geom: geom_with_title_width(1, 1200),
+            index: 1,
+            project: None,
+            project_icon: None,
+            host: Some("dev@build-01"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+            cwd_leaf: None,
+            tmux: None,
+            notice: None,
+            drawer: false,
+            stats: wide_stats(),
+        }];
+        let a = click_button_with(&views, country_id(PaneId(1)));
+        assert_eq!(a.refresh_node, Some(PaneId(1)));
+        assert_eq!(a.close, None);
+        assert_eq!(a.rehost, None);
+        assert_eq!(a.pick_project, None);
     }
 
     /// 标题条上的按钮**不许**用超出 Latin-1 的字符画。
@@ -1126,6 +1408,7 @@ mod tests {
             tmux: None,
             notice: None,
             drawer: false,
+            stats: Vec::new(),
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1173,6 +1456,7 @@ mod tests {
             tmux: None,
             notice: None,
             drawer: false,
+            stats: Vec::new(),
         }];
         // 跑两帧:`Area` 默认 `fade_in`,第一帧 opacity 是 0,画的图形会被
         // painter 记成 `Shape::Noop`(egui-0.30 `painter.rs::Painter::add`),
@@ -1260,6 +1544,7 @@ mod tests {
                 tmux: None,
                 notice: None,
                 drawer: false,
+                stats: Vec::new(),
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1328,6 +1613,7 @@ mod tests {
                 tmux: None,
                 notice: None,
                 drawer: false,
+                stats: Vec::new(),
             }];
             // 显式推进时间,而不是像 `run_title` 那样跑两帧靠墙钟走时间:
             // 这条测试要比较**颜色**,`fade_in` 半路上的不透明度会把 RGB
@@ -1428,6 +1714,7 @@ mod tests {
                 tmux: None,
                 notice: None,
                 drawer: false,
+                stats: Vec::new(),
             }];
 
             let ctx = egui::Context::default();
@@ -1497,6 +1784,7 @@ mod tests {
             tmux: Some("a-tmux-session-name-that-is-long-too"),
             notice: None,
             drawer: false,
+            stats: Vec::new(),
         }];
 
         let ctx = egui::Context::default();
@@ -1614,6 +1902,7 @@ mod tests {
                 tmux: None,
                 notice: None,
                 drawer: false,
+                stats: Vec::new(),
             }];
             let ctx = egui::Context::default();
             let t = crate::theme::MULLION_DARK;
@@ -1747,6 +2036,7 @@ mod tests {
                 tmux: Some("a-tmux-session-name-that-is-long-too"),
                 notice: None,
                 drawer: false,
+                stats: Vec::new(),
             }];
 
             let ctx = egui::Context::default();
