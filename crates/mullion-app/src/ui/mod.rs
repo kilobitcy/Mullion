@@ -4,6 +4,7 @@ pub mod badge;
 pub mod chrome;
 pub mod dismiss;
 pub mod edit_panel;
+pub mod editor_find;
 pub mod editor_window;
 pub mod file_icon;
 pub mod files_dialog;
