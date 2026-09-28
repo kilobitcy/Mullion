@@ -280,8 +280,7 @@ fn projects_column(
 /// 自己另写一套排序的话,同一批会话在启动页和会话管理器里是两个顺序,而这
 /// 两个列表用户几分钟内就会都看到一遍(`project_row` 文件头记的同一个教训)。
 ///
-/// 与会话管理器唯一的差别是**不按协议分页** —— 启动页只有一列,分页的是那个
-/// 弹窗自己的事。
+/// 与会话管理器的差别:不按协议分页,且不含 SFTP 会话(F296)。
 pub fn session_order<'a>(
     sessions: &'a [SessionRecord],
     groups: &[mullion_store::GroupRecord],
@@ -290,6 +289,8 @@ pub fn session_order<'a>(
     crate::ui::group_manager::group_sessions(groups, sessions)
         .into_iter()
         .flat_map(|(_, bucket)| bucket)
+        // F296:SFTP 节点连上去没有终端,不属于「挑一台机器开终端」这一列。
+        .filter(|r| r.connection.protocol != mullion_store::Protocol::Sftp)
         .filter(|r| crate::ui::session_manager::list::matches(r, query))
         .collect()
 }
@@ -333,9 +334,12 @@ fn sessions_column(
     );
     column(ui, t, "会话", scroll, |ui| {
         if rows.is_empty() {
+            // F296:判据看「去掉 SFTP 之后」—— 全是 SFTP 时用户没在搜索,
+            // 说「没有匹配」是假的。
+            let none_at_all = session_order(cx.lists.sessions, cx.lists.groups, "").is_empty();
             ui.label(crate::theme::hint_text(
                 t,
-                if cx.lists.sessions.is_empty() {
+                if none_at_all {
                     "还没有会话"
                 } else {
                     "没有匹配的会话"
@@ -1482,6 +1486,44 @@ mod tests {
             x_with >= icon.right(),
             "名字({x_with})压在图标({:?})上",
             icon
+        );
+    }
+
+    /// F296:启动页第二列不显示 SFTP 会话 —— 这一列是「挑一台机器连上去开终端」,
+    /// SFTP 节点连上去没有终端,点了只会开一个文件浏览标签,跟用户的预期不符。
+    ///
+    /// 同时钉住终端会话**照常出现**:只断言 SFTP 不在的话,把整列清空也是绿的。
+    ///
+    /// 自证会变红:删掉 `session_order` 里 `protocol != Protocol::Sftp` 那一行过滤。
+    #[test]
+    fn the_launcher_session_column_leaves_sftp_sessions_out() {
+        let mut sftp = sess(5, "文件机");
+        sftp.connection.protocol = mullion_store::Protocol::Sftp;
+        let ss = vec![sess(9, "独立机"), sftp];
+        let (_, shown, _) = columns_drawn(&[], &ss, &[], "");
+        assert_eq!(
+            shown,
+            vec![9],
+            "SFTP 会话漏进了启动页,或终端会话被一起过滤掉了"
+        );
+    }
+
+    /// F296:会话全是 SFTP 时,第二列的空态说「还没有会话」,不说「没有匹配的
+    /// 会话」—— 用户根本没在搜索,后一句是假的。
+    ///
+    /// 自证会变红:把空态判据改回 `cx.lists.sessions.is_empty()`。
+    #[test]
+    fn only_sftp_sessions_reads_as_no_sessions_not_as_no_match() {
+        let mut sftp = sess(5, "文件机");
+        sftp.connection.protocol = mullion_store::Protocol::Sftp;
+        let texts = texts_full(&[], &[sftp], &[], "");
+        assert!(
+            texts.iter().any(|s| s == "还没有会话"),
+            "空态文案不对:{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|s| s == "没有匹配的会话"),
+            "没在搜索却说没匹配:{texts:?}"
         );
     }
 }
