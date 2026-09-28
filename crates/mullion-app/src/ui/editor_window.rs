@@ -1513,6 +1513,67 @@ mod tests {
         assert!(early > 700.0, "窗口压根没铺开(高 {early})");
     }
 
+    /// 同 `key()`,但带上 `frame_input` 那份屏幕几何——`Window` 的约束框
+    /// 取的是 viewport 的 `inner_rect`,光发按键事件不给屏幕的话窗口会被
+    /// 夹在默认尺寸里,量不出「涨了多少」。
+    fn key_in_screen(screen: egui::Rect, k: egui::Key, mods: egui::Modifiers) -> egui::RawInput {
+        let mut i = frame_input(screen);
+        for pressed in [true, false] {
+            i.events.push(egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: mods,
+            });
+        }
+        i.modifiers = mods;
+        i
+    }
+
+    /// F299 复核 [Important]:开查找条再关掉,编辑窗的高度要回到开之前——
+    /// 与 `the_window_height_does_not_creep_upward_frame_after_frame` 同一个
+    /// 不变量(F217:内容高度不再驱动窗口尺寸,那句 `max()` 恒 no-op),换成
+    /// 查找条这个具体触发点单独钉一遍,防止有人在查找条上叠一份自己的
+    /// 「猜 reserve」逻辑,把这个具体路径的免疫力又拆掉。
+    ///
+    /// 自证会变红(**实测**):把 F217 之前的旧写法接回来 —— 正文用
+    /// `egui::ScrollArea::vertical().max_height(h)`,其中
+    /// `h = (ui.available_height() - reserve).max(80.0)`、`reserve` 是查找条
+    /// **打开之前**就量好的一个常数(不随查找条开关变化)。查找条打开时
+    /// 内容比这个猜出来的高度多一整行,窗口被顶高;关掉之后猜出来的高度
+    /// 没变,窗口就卡在顶高之后回不去。
+    #[test]
+    fn closing_the_find_bar_gives_back_the_row_it_took() {
+        let mut s = editable();
+        s.as_mut().unwrap().text = "x\n".repeat(2000);
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let before = settle(&ctx, &mut s, 10).height();
+        let _ = ctx.run(
+            key_in_screen(SCREEN, egui::Key::F, egui::Modifiers::COMMAND),
+            |c| {
+                let _ = show(c, &t, &mut s);
+            },
+        );
+        let _ = settle(&ctx, &mut s, 10);
+        let _ = ctx.run(
+            key_in_screen(SCREEN, egui::Key::Escape, egui::Modifiers::NONE),
+            |c| {
+                let _ = show(c, &t, &mut s);
+            },
+        );
+        assert!(
+            s.as_ref().unwrap().find.is_none(),
+            "前提:Esc 真的关掉了查找条"
+        );
+        let after = settle(&ctx, &mut s, 10).height();
+        assert!(
+            (after - before).abs() < 1.0,
+            "查找条关掉之后窗口高度没有回落:开前 {before},关后 {after}"
+        );
+    }
+
     /// F217:底边拖得动,而且拖完不弹回去。
     ///
     /// 用户实报「无法手动调节高度」。根因同上:拖矮了下一帧就被
