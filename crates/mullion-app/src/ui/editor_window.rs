@@ -494,16 +494,6 @@ pub fn show(
                         .color(theme::c32(t.fg_muted)),
                 );
             });
-            // 命中表刷新:查询、大小写、正文版本任一变了就重算(T3 —— 不缓存
-            // 的话每帧全文扫一遍)。
-            let k = (f.query.clone(), f.case, s.text_rev);
-            if f.key.as_ref() != Some(&k) {
-                let caret = f.cur.and_then(|i| f.hits.get(i)).map_or(0, |h| h.0);
-                f.hits = crate::ui::editor_find::find_all(&s.text, &f.query, f.case);
-                f.cur = crate::ui::editor_find::first_at_or_after(&f.hits, caret);
-                f.key = Some(k);
-                f.scroll = true;
-            }
         }
         if close_find {
             let f = s
@@ -639,6 +629,21 @@ pub fn show(
                         // F299:命中表的缓存键之一 —— 正文动过之后旧的
                         // 高亮位置就可能对不上新文本了。
                         s.text_rev = s.text_rev.wrapping_add(1);
+                    }
+                    // F299 复核 [Minor]:命中表刷新挪到这里 —— 正文
+                    // `.show()` 已经跑完、`s.text`/`s.text_rev` 都是这一帧的
+                    // 最新值。原先这段在 `.show()` 之前,查找条开着时在
+                    // 正文里直接打字,这一帧算出来的命中位置还是打字之前的,
+                    // overlay 会画在上一帧的旧位置上,肉眼看是「慢半拍」。
+                    if let Some(f) = s.find.as_mut() {
+                        let k = (f.query.clone(), f.case, s.text_rev);
+                        if f.key.as_ref() != Some(&k) {
+                            let caret = f.cur.and_then(|i| f.hits.get(i)).map_or(0, |h| h.0);
+                            f.hits = crate::ui::editor_find::find_all(&s.text, &f.query, f.case);
+                            f.cur = crate::ui::editor_find::first_at_or_after(&f.hits, caret);
+                            f.key = Some(k);
+                            f.scroll = true;
+                        }
                     }
                     // F299:当前匹配的高亮 overlay。查找框持焦点时
                     // `TextEdit` 不画正文选区,不另画的话用户看不见跳到
@@ -854,6 +859,51 @@ mod tests {
                 r.primary.index.max(r.secondary.index)
             ),
             (3, 9)
+        );
+    }
+
+    /// F299 复核 [Minor]:命中表刷新要用「这一帧刚敲完的正文」,不是
+    /// 上一帧的。
+    ///
+    /// 刷新块原先在正文 `.show()` **之前**——那一步读到的还是上一帧的
+    /// `s.text`/`text_rev`,这一帧在正文里刚打的字要等下一帧命中表才追上。
+    /// 查找条开着时直接在正文里打字,当前匹配挪了位置,overlay 会画在
+    /// 上一帧的旧位置上,肉眼看是「慢半拍」。
+    ///
+    /// 自证会变红:把刷新块(`let k = (f.query.clone(), ...)` 那一段)搬回
+    /// 正文 `.show()` 之前(本次修复前的位置)。
+    #[test]
+    fn hit_positions_follow_body_edits_within_the_same_frame() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("hello world");
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, typed("world"));
+        {
+            let f = st.as_ref().unwrap().find.as_ref().unwrap();
+            assert_eq!(f.hits, vec![(6, 11)], "前提:world 在原文里的位置");
+        }
+        let ekey = st.as_ref().unwrap().key;
+        // 把光标钉到正文最前面、把焦点要给正文——不走真实点击,避免像素
+        // 定位的额外不确定性(同 `ctrl_f_prefills_the_query_from_a_single_line_selection`
+        // 的手法)。
+        let mut ts = egui::TextEdit::load_state(&ctx, body_id(&ekey)).unwrap_or_default();
+        ts.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(0),
+        )));
+        egui::TextEdit::store_state(&ctx, body_id(&ekey), ts);
+        ctx.memory_mut(|m| m.request_focus(body_id(&ekey)));
+        run_editor(&ctx, &mut st, typed("X"));
+        let s = st.as_ref().unwrap();
+        assert_eq!(s.text, "Xhello world", "前提:字没打进正文最前面");
+        let f = s.find.as_ref().unwrap();
+        assert_eq!(
+            f.hits,
+            vec![(7, 12)],
+            "命中表用的还是敲字之前的正文——「world」挪了一格,命中表没跟上:\
+             {:?}",
+            f.hits
         );
     }
 
