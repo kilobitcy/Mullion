@@ -833,6 +833,22 @@ mod tests {
         );
     }
 
+    /// F299 复核 [Important]:标题栏查找图标按钮真的能打开查找条,不止
+    /// Ctrl+F 一条路。`click_icon` 靠 accesskit 的自述文字定位,同 F204
+    /// 两颗既有图标按钮的测试手法。
+    ///
+    /// 自证会变红:把图标点击处理(`f.focus = true;` 那一段)删掉。
+    #[test]
+    fn clicking_the_title_bar_search_icon_opens_the_find_bar() {
+        let mut st = editor_with("hello world");
+        let act = click_icon(&mut st, "查找 (Ctrl+F)");
+        assert_eq!(act, None, "点查找图标不该顺带产生保存/关闭这类动作");
+        assert!(
+            st.as_ref().unwrap().find.is_some(),
+            "点了标题栏的查找图标,查找条却没开出来"
+        );
+    }
+
     /// F299:Ctrl+F 预填当前正文选区(单行时)。
     ///
     /// 不靠真实拖拽制造选区(与被测代码无关的额外复杂度),直接把正文的
