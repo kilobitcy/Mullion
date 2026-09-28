@@ -70,6 +70,83 @@ pub struct EditorState {
     /// 的高度和 `DEFAULT_SIZE` 不一样),只能先按默认尺寸估着摆;第二帧拿
     /// 上一帧量到的真实尺寸重摆一次才准。
     pub centre_frames: u8,
+    /// F299:查找条。`None` = 没开。
+    pub find: Option<Find>,
+    /// F299:正文每改一次 +1。`Find` 的命中表缓存键之一 —— 不比这个的话,
+    /// 命中表只在 `query`/`case` 变了才重算,用户在正文里敲字之后旧的高亮
+    /// 位置就对不上新文本了。
+    text_rev: u64,
+    /// F299:关查找条那一帧记下当前匹配,正文画完之后再写进正文的
+    /// `TextEditState` 并要回焦点。不能当场就地写:查找条关掉时正文那个
+    /// `TextEdit` 这一帧还没画,`TextEditState` 也还没产出来。
+    pending_select: Option<(usize, usize)>,
+}
+
+/// F299:查找条状态。命中表是缓存 —— 键是 (查询, 大小写, 正文版本),
+/// 任何一样变了就重算;不缓存的话 368 KiB 的文件每帧全文扫一遍(T3)。
+#[derive(Default)]
+pub struct Find {
+    pub query: String,
+    pub case: bool,
+    /// 当前是第几处(`hits` 的下标)。
+    pub cur: Option<usize>,
+    hits: Vec<(usize, usize)>,
+    /// 算 `hits` 时的 (query, case, text_rev)。
+    key: Option<(String, bool, u64)>,
+    /// 这一帧要把当前匹配滚进视野(当前匹配变了才滚,不然用户没法手动滚走)。
+    scroll: bool,
+    /// 首帧把焦点给查找框。
+    focus: bool,
+}
+
+impl Find {
+    /// 下一处 / 上一处,首尾回绕。没有命中时按兵不动。
+    fn go(&mut self, forward: bool) {
+        if let Some(c) = self.cur {
+            self.cur = Some(crate::ui::editor_find::step(self.hits.len(), c, forward));
+            self.scroll = true;
+        }
+    }
+}
+
+/// 正文这个 `TextEdit` 的显式 id —— 查找条要靠它读写正文的
+/// `TextEditState`(选区、焦点),不给显式 id 的话每次 `show()` 都是新
+/// 身份,`TextEdit::load_state` 拿不到上一帧的状态。
+fn body_id(key: &EditKey) -> egui::Id {
+    egui::Id::new("mullion_editor_body").with(key)
+}
+
+/// 查找框的显式 id,同上的理由。
+fn find_box_id(key: &EditKey) -> egui::Id {
+    egui::Id::new("mullion_editor_find_box").with(key)
+}
+
+/// 当前正文选区(单行时)的文本,给 Ctrl+F 预填查找框用。跨行选区不预填 ——
+/// 查找是单行语义,喂一段带换行的文本进去只会一处也搜不到。
+fn selected_single_line(ctx: &egui::Context, s: &EditorState) -> Option<String> {
+    let ts = egui::TextEdit::load_state(ctx, body_id(&s.key))?;
+    let range = ts.cursor.char_range()?;
+    let (min, max) = (
+        range.primary.index.min(range.secondary.index),
+        range.primary.index.max(range.secondary.index),
+    );
+    if min == max {
+        return None;
+    }
+    let seg: String = s.text.chars().skip(min).take(max - min).collect();
+    if seg.is_empty() || seg.contains('\n') {
+        None
+    } else {
+        Some(seg)
+    }
+}
+
+/// F299:当前匹配的高亮底色。查找框持焦点时 `TextEdit` 不画正文选区,
+/// 所以当前匹配要另画一块 overlay,否则用户看不见跳到了哪。
+/// 不新增主题色 —— 沿用选中行同一份 `accent` alpha(见
+/// `theme.rs::MULLION_DARK` 的 `selection.bg_fill`)。
+pub(crate) fn find_hit_color(t: &Theme) -> egui::Color32 {
+    theme::c32(t.accent).gamma_multiply(0.35)
 }
 
 impl EditorState {
@@ -100,6 +177,9 @@ impl EditorState {
             chrome: egui::Vec2::ZERO,
             hl: None,
             centre_frames: 2,
+            find: None,
+            text_rev: 0,
+            pending_select: None,
         }
     }
 
@@ -248,6 +328,36 @@ pub fn show(
         // 剩下两种(没改过 / 正在回传)是按早了或按重了,静默 —— 弹话只会吵。
     }
 
+    // F299:查找。`consume_key` 同 Ctrl+S 的理由 —— 不取走的话 F 会被打进正文。
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+        let seed = selected_single_line(ctx, s);
+        let f = s.find.get_or_insert_with(Find::default);
+        if let Some(q) = seed {
+            f.query = q;
+        }
+        f.focus = true;
+    }
+    if let Some(f) = s.find.as_mut() {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3)) {
+            f.go(false);
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F3)) {
+            f.go(true);
+        }
+    }
+    // F299:Esc 关条。不靠 `Response::has_focus()` 判 —— egui 在
+    // `begin_pass` 里对 `Escape` 事件本身就会清空焦点(`Memory` 的
+    // `focused_widget` 全局清,不看 `EventFilter`),同一帧里再读
+    // `has_focus()` 可能已经为假,条就关不掉了(同 F278
+    // `files_find_escape_event` 文档里记的那个坑)。在这里 `consume_key`
+    // 才是唯一可靠的判据,而且只在 `s.find.is_some()` 时才取走这个键 ——
+    // 没开查找条时 Esc 不该被这里吃掉(它现在也没有别的归宿,但别抢)。
+    let mut close_find = false;
+    if s.find.is_some()
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        close_find = true;
+    }
+
     let screen = ctx.screen_rect();
     // F204:开窗头两帧把窗口摆到屏幕正中。见 `EditorState::centre_frames` 里
     // 为什么不能只靠 `default_pos`、以及为什么要两帧。
@@ -330,6 +440,12 @@ pub fn show(
                         s.maximized = true;
                     }
                 }
+                // F299:查找入口。right_to_left 里先加的在更右边,这颗排在
+                // 最大化左边、离关闭按钮最远。
+                if icon_button(ui, Glyph::Search, true, "查找 (Ctrl+F)") {
+                    let f = s.find.get_or_insert_with(Find::default);
+                    f.focus = true;
+                }
             });
         });
 
@@ -345,6 +461,56 @@ pub fn show(
         }
         if let Some(n) = &s.notice {
             ui.colored_label(theme::c32(t.fg_muted), n);
+        }
+
+        // F299:查找条。放在正文之前、独占一行。
+        if let Some(f) = s.find.as_mut() {
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut f.query)
+                        .id(find_box_id(&s.key))
+                        .hint_text("查找")
+                        .desired_width(240.0),
+                );
+                if std::mem::take(&mut f.focus) {
+                    resp.request_focus();
+                }
+                // Enter 让单行框失焦(egui 的既有行为)—— 用「失焦 + Enter」
+                // 判,再把焦点要回来,用户可以一直按 Enter 往下找。
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let back = ui.input(|i| i.modifiers.shift);
+                    f.go(!back);
+                    resp.request_focus();
+                }
+                if ui
+                    .selectable_label(f.case, "Aa")
+                    .on_hover_text("区分大小写")
+                    .clicked()
+                {
+                    f.case = !f.case;
+                }
+                ui.label(
+                    egui::RichText::new(crate::ui::editor_find::counter(f.cur, f.hits.len()))
+                        .color(theme::c32(t.fg_muted)),
+                );
+            });
+            // 命中表刷新:查询、大小写、正文版本任一变了就重算(T3 —— 不缓存
+            // 的话每帧全文扫一遍)。
+            let k = (f.query.clone(), f.case, s.text_rev);
+            if f.key.as_ref() != Some(&k) {
+                let caret = f.cur.and_then(|i| f.hits.get(i)).map_or(0, |h| h.0);
+                f.hits = crate::ui::editor_find::find_all(&s.text, &f.query, f.case);
+                f.cur = crate::ui::editor_find::first_at_or_after(&f.hits, caret);
+                f.key = Some(k);
+                f.scroll = true;
+            }
+        }
+        if close_find {
+            let f = s
+                .find
+                .take()
+                .expect("close_find 只在 find.is_some() 时置真");
+            s.pending_select = f.cur.and_then(|i| f.hits.get(i).copied());
         }
 
         ui.separator();
@@ -438,32 +604,69 @@ pub fn show(
                 // 缩不缩外框一个像素都不差(实测两组矩形逐位相同)。加了只是让
                 // 后来人以为它在守什么。
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut s.text)
-                            .code_editor()
-                            // F215:语法高亮。`layouter` 每帧都跑,增量与
-                            // 缓存全在 `highlight::Cache` 里 —— 见那个
-                            // 模块的头注释。
-                            .layouter(&mut layouter)
-                            // F207:正文区底色 = 终端底色 `term_bg`。用户
-                            // 看的是远端文件,底色跟终端一致才连得上「这
-                            // 就是那台机器上的东西」;而窗口壳仍是
-                            // `modal_bg`(#3f3f3f),两层色差本身就是
-                            // 「哪块能打字」的边界。
-                            //
-                            // 走 `background_color` 而不是改
-                            // `Visuals::extreme_bg_color` —— 后者是全局量,
-                            // 一改所有 `TextEdit`(会话表单、路径条、改名
-                            // 框)跟着变,而那些贴在 `panel_bg` 上、本来
-                            // 就配好了。
-                            .background_color(theme::c32(t.term_bg))
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(20)
-                            // 只读一律靠这一条落地。靠「保存按钮置灰」是
-                            // 不够的:用户改了半天才发现存不了,那些改动
-                            // 全白费。
-                            .interactive(s.read_only.is_none()),
-                    );
+                    // F299:改成 `.show()` 而不是 `ui.add()` —— 查找条要用
+                    // 到 `TextEditOutput` 里的 `galley`/`galley_pos`(画当前
+                    // 匹配的 overlay)与 `state`(关条时把选区写回正文)。
+                    // `.id(body_id(..))` 给一个跨帧稳定的显式 id,不给的话
+                    // 查找条读不到正文这一帧存下的 `TextEditState`。
+                    let out = egui::TextEdit::multiline(&mut s.text)
+                        .id(body_id(&s.key))
+                        .code_editor()
+                        // F215:语法高亮。`layouter` 每帧都跑,增量与
+                        // 缓存全在 `highlight::Cache` 里 —— 见那个
+                        // 模块的头注释。
+                        .layouter(&mut layouter)
+                        // F207:正文区底色 = 终端底色 `term_bg`。用户
+                        // 看的是远端文件,底色跟终端一致才连得上「这
+                        // 就是那台机器上的东西」;而窗口壳仍是
+                        // `modal_bg`(#3f3f3f),两层色差本身就是
+                        // 「哪块能打字」的边界。
+                        //
+                        // 走 `background_color` 而不是改
+                        // `Visuals::extreme_bg_color` —— 后者是全局量,
+                        // 一改所有 `TextEdit`(会话表单、路径条、改名
+                        // 框)跟着变,而那些贴在 `panel_bg` 上、本来
+                        // 就配好了。
+                        .background_color(theme::c32(t.term_bg))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(20)
+                        // 只读一律靠这一条落地。靠「保存按钮置灰」是
+                        // 不够的:用户改了半天才发现存不了,那些改动
+                        // 全白费。
+                        .interactive(s.read_only.is_none())
+                        .show(ui);
+                    if out.response.changed() {
+                        // F299:命中表的缓存键之一 —— 正文动过之后旧的
+                        // 高亮位置就可能对不上新文本了。
+                        s.text_rev = s.text_rev.wrapping_add(1);
+                    }
+                    // F299:当前匹配的高亮 overlay。查找框持焦点时
+                    // `TextEdit` 不画正文选区,不另画的话用户看不见跳到
+                    // 了哪。
+                    if let Some(f) = s.find.as_mut() {
+                        if let Some(&(a, b)) = f.cur.and_then(|i| f.hits.get(i)) {
+                            let r0 = out.galley.pos_from_ccursor(egui::text::CCursor::new(a));
+                            let r1 = out.galley.pos_from_ccursor(egui::text::CCursor::new(b));
+                            let off = out.galley_pos.to_vec2();
+                            let rect = egui::Rect::from_min_max(r0.min, r1.max).translate(off);
+                            ui.painter().rect_filled(rect, 2.0, find_hit_color(t));
+                            if std::mem::take(&mut f.scroll) {
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                            }
+                        }
+                    }
+                    // F299:关查找条那一帧留下的「把这处匹配设成正文选区」
+                    // 信号,在这里落地(正文这一帧已经画完,`TextEditState`
+                    // 也已经产出来了)。
+                    if let Some((a, b)) = s.pending_select.take() {
+                        let mut ts = out.state;
+                        ts.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(a),
+                            egui::text::CCursor::new(b),
+                        )));
+                        ts.store(ui.ctx(), out.response.id);
+                        out.response.request_focus();
+                    }
                 });
             });
         });
@@ -493,6 +696,162 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn editor_with(text: &str) -> Option<EditorState> {
+        Some(EditorState::new(
+            1,
+            "/tmp/find.txt".into(),
+            text.into(),
+            None,
+            Eol::Lf,
+            false,
+        ))
+    }
+
+    fn key(k: egui::Key, mods: egui::Modifiers) -> egui::RawInput {
+        let mut i = egui::RawInput::default();
+        for pressed in [true, false] {
+            i.events.push(egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: mods,
+            });
+        }
+        i.modifiers = mods;
+        i
+    }
+
+    fn typed(s: &str) -> egui::RawInput {
+        let mut i = egui::RawInput::default();
+        i.events.push(egui::Event::Text(s.into()));
+        i
+    }
+
+    /// F299:跑一帧,顺带把这一帧的动作与形状交回来给测试断言用。
+    fn run_editor(
+        ctx: &egui::Context,
+        state: &mut Option<EditorState>,
+        input: egui::RawInput,
+    ) -> (Option<EditorAction>, Vec<egui::epaint::ClippedShape>) {
+        let t = crate::theme::MULLION_DARK;
+        let mut act = None;
+        let out = ctx.run(input, |ctx| {
+            act = show(ctx, &t, state);
+        });
+        (act, out.shapes)
+    }
+
+    fn shapes_contain_fill(shapes: &[egui::epaint::ClippedShape], want: egui::Color32) -> bool {
+        fn walk(shape: &egui::Shape, want: egui::Color32) -> bool {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().any(|s| walk(s, want)),
+                egui::Shape::Rect(r) => r.fill == want,
+                _ => false,
+            }
+        }
+        shapes.iter().any(|cs| walk(&cs.shape, want))
+    }
+
+    /// F299:Ctrl+F 开条、打字即跳到第一处、Enter 到下一处、首尾回绕。
+    ///
+    /// 自证会变红:删掉 `consume_key(COMMAND, F)` 那一段(条开不出来);
+    /// 或删掉 Enter → `step(.., true)` 那一句(停在第一处)。
+    #[test]
+    fn ctrl_f_opens_the_bar_typing_jumps_and_enter_steps_with_wraparound() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("foo\nbar foo\nFOO");
+        for _ in 0..2 {
+            run_editor(&ctx, &mut st, egui::RawInput::default());
+        }
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        run_editor(&ctx, &mut st, egui::RawInput::default()); // 焦点落到查找框
+        run_editor(&ctx, &mut st, typed("foo"));
+        let f = st
+            .as_ref()
+            .unwrap()
+            .find
+            .as_ref()
+            .expect("Ctrl+F 没开出查找条");
+        assert_eq!(f.cur, Some(0));
+        assert_eq!(
+            crate::ui::editor_find::counter(f.cur, 3),
+            "1/3",
+            "默认不区分大小写应是 3 处"
+        );
+        for want in [1, 2, 0] {
+            run_editor(&ctx, &mut st, key(egui::Key::Enter, egui::Modifiers::NONE));
+            run_editor(&ctx, &mut st, egui::RawInput::default());
+            assert_eq!(st.as_ref().unwrap().find.as_ref().unwrap().cur, Some(want));
+        }
+    }
+
+    /// F299:Shift+F3 上一处(从第一处回绕到最后一处)。
+    /// 自证会变红:把 Shift+F3 的方向写反。
+    #[test]
+    fn shift_f3_goes_backwards_and_wraps() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("a x a x a");
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, typed("a"));
+        run_editor(&ctx, &mut st, key(egui::Key::F3, egui::Modifiers::SHIFT));
+        assert_eq!(st.as_ref().unwrap().find.as_ref().unwrap().cur, Some(2));
+    }
+
+    /// F299:Esc 关条,并把正文选区落在当前匹配上(关条后用户直接接着改)。
+    /// 自证会变红:删掉关条时写 `TextEditState` 选区那一段。
+    #[test]
+    fn escape_closes_the_bar_and_leaves_the_match_selected_in_the_body() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("xx needle yy");
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, typed("needle"));
+        run_editor(&ctx, &mut st, key(egui::Key::Escape, egui::Modifiers::NONE));
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        assert!(st.as_ref().unwrap().find.is_none(), "Esc 没关掉查找条");
+        let ts = egui::TextEdit::load_state(&ctx, body_id(&st.as_ref().unwrap().key))
+            .expect("正文没有 TextEditState");
+        let r = ts.cursor.char_range().expect("正文没有选区");
+        assert_eq!(
+            (
+                r.primary.index.min(r.secondary.index),
+                r.primary.index.max(r.secondary.index)
+            ),
+            (3, 9)
+        );
+    }
+
+    /// F299:当前匹配画一块高亮底(overlay)—— 查找框拿着焦点时 `TextEdit`
+    /// 不画正文选区,不另画的话用户看不见跳到了哪。
+    ///
+    /// 判据是精确颜色匹配(`find_hit_color` 的返回值逐位相等),所以要先把
+    /// `egui::Window` 的淡入动画跑完:未跑够帧数时 `Area::fade_in` 会用
+    /// `ui.multiply_opacity` 把这一帧全部形状(包括这块 overlay)按不到 1.0
+    /// 的系数整体调暗一两个色阶,精确匹配会假红。多跑的这十帧不是随便凑的
+    /// 数 —— 默认 `animation_time` 是 1/12 秒、默认帧长 1/60 秒,跑够
+    /// 5 帧动画就该收敛到 1.0,这里翻倍取整数留余量。
+    ///
+    /// 自证会变红:删掉 overlay 的 `rect_filled`。
+    #[test]
+    fn the_current_match_is_painted_while_the_find_box_has_focus() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("xx needle yy");
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, typed("needle"));
+        for _ in 0..10 {
+            run_editor(&ctx, &mut st, egui::RawInput::default());
+        }
+        let (_, shapes) = run_editor(&ctx, &mut st, egui::RawInput::default());
+        let want = super::find_hit_color(&crate::theme::MULLION_DARK);
+        assert!(shapes_contain_fill(&shapes, want), "没画当前匹配的高亮底");
+    }
 
     /// C 组:编辑器窗口不许锚死、不许写死编辑区高度。
     ///
