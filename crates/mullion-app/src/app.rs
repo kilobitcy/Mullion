@@ -27940,21 +27940,32 @@ mod tests {
     /// 或把 `spawn_connect` 里 `project_id: project.map(|p| p.id)` 换成 `None`。
     #[test]
     fn the_dialing_tables_come_from_the_ledger_and_reach_the_frame() {
+        // **只搜 `mod tests` 之前的那一段**:下面几个 needle 原样写在本条
+        // 测试自己的源码里(`assert!` 的字符串实参、上面那条注释),整份
+        // 文件搜的话每一条都恒真,这条测试就成了摆设。
         let src = include_str!("app.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了");
         assert!(
-            src.contains("dialing_from(self.dials.iter())"),
+            prod.len() < src.len(),
+            "没能切掉测试模块 —— 下面每条断言都会恒真"
+        );
+        assert!(
+            prod.contains(concat!("dialing_from(self.dials", ".iter())")),
             "在拨表没有从票据台账现算"
         );
         assert!(
-            src.contains("dialing_sessions: &dialing_sessions"),
+            prod.contains("dialing_sessions: &dialing_sessions"),
             "在拨会话表没有流进 UiFrame"
         );
         assert!(
-            src.contains("dialing_projects: &dialing_projects"),
+            prod.contains("dialing_projects: &dialing_projects"),
             "在拨项目表没有流进 UiFrame"
         );
         assert!(
-            src.contains("project_id: project.map(|p| p.id)"),
+            prod.contains(concat!("project_id: project.map", "(|p| p.id)")),
             "spawn_connect 装票时没有把项目 id 一起装进去 —— 项目拨号永远不会\
              出现在在拨项目表里"
         );
