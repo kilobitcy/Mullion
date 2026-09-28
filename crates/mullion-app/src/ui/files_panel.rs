@@ -6058,6 +6058,60 @@ mod tests {
         assert_eq!(a, Some(FileAction::GotoInput("~/src".into())));
     }
 
+    /// F301:上面四条全走远端栏 —— 本地栏的 `~` 走另一条通路
+    /// (`bookmark_target`/`column_home` 的 `PanelColumn::Local` 分支问
+    /// `local::home_dir_cached()`,不经 `BookmarkView::home`,`run_local`
+    /// 恒传 `home: None` 也不影响它),需要单独覆盖。
+    ///
+    /// 用进程里**真实**的本地 home,取不到就跳过并注明(无头容器里
+    /// `dirs`/`BaseDirs::new()` 有可能拿不到 `$HOME`)。
+    ///
+    /// 自证会变红:把 `bookmark_target`/`column_home` 里 `PanelColumn::Local`
+    /// 分支的 `crate::files::local::home_dir_cached()` 换成 `None`。
+    #[test]
+    fn a_tilde_bookmark_on_the_local_column_lights_the_star_and_saves_as_tilde() {
+        let Some(home) = crate::files::local::home_dir_cached() else {
+            eprintln!(
+                "跳过 a_tilde_bookmark_on_the_local_column_lights_the_star_and_saves_as_tilde:\
+                 当前环境取不到本地 home"
+            );
+            return;
+        };
+        let home_bytes = home.as_bytes().to_vec();
+        let ctx = egui::Context::default();
+        let mut state = ready_at(&home_bytes);
+        let mut cols = ColWidths::default();
+        let marks = vec![bm("~")];
+
+        let (_, shapes) = run_local(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &marks,
+            true,
+            egui::RawInput::default(),
+        );
+        assert!(
+            find_text_pos(&shapes, "★").is_some(),
+            "本地 home 目录下 `~` 书签没点亮 ★"
+        );
+
+        let (_, shapes) = run_local(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &[],
+            true,
+            egui::RawInput::default(),
+        );
+        let hollow = find_text_pos(&shapes, "☆").expect("没收藏时该画空心星");
+        let (a, _) = run_local(&ctx, &mut state, &mut cols, &[], true, click_at(hollow));
+        match a {
+            Some(FileAction::BookmarkAdd { path, .. }) => assert_eq!(path, "~"),
+            other => panic!("本地栏在 home 目录点 ☆ 没存成 `~`:{other:?}"),
+        }
+    }
+
     /// F139:当前目录没被收藏时路径条给的是空心 ☆,点它发出 `BookmarkAdd`,
     /// 默认名取路径末段(不是整条路径 —— 下拉里一长串没法认)。
     #[test]

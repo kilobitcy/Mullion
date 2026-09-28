@@ -25638,8 +25638,13 @@ mod tests {
     /// 再扎实,这里传 `None` 的话 `~` 书签在远端栏永远解析不出来,★ 永远不亮,
     /// 画面上只是「一个不起作用的书签」,零报错。
     ///
-    /// 自证会变红:把 `remote_home: remote_home.as_deref(),` 改成
-    /// `remote_home: None,`。
+    /// 断言钉在 `window_event`(`UiFrame` 构造所在的函数体)内,不对整个文件
+    /// 做 `contains`——`t.content.sftp_home()` 这个子串在文件别处(取标签栏
+    /// 状态、SFTP 面板等)本来就出现,对全文件找就是恒真,测不出「`let
+    /// remote_home` 没接上真值」这种改法。
+    ///
+    /// 自证会变红:把 `let remote_home = self.tabs.active().and_then(|t|
+    /// t.content.sftp_home());` 改成 `let remote_home = None;`。
     #[test]
     fn the_remote_home_reaches_the_ui_frame() {
         let src = prod_src();
@@ -25647,8 +25652,12 @@ mod tests {
             src.contains("remote_home: remote_home.as_deref(),"),
             "UiFrame 没收到 remote_home 的真值"
         );
+        let body = body_of(
+            src,
+            "fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {",
+        );
         assert!(
-            src.contains("t.content.sftp_home()"),
+            body.contains("let remote_home =") && body.contains("t.content.sftp_home()"),
             "remote_home 没从活动标签的 sftp_home 取"
         );
     }
