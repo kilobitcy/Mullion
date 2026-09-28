@@ -150,6 +150,10 @@ pub struct BookmarkView<'a> {
     pub list: &'a [mullion_store::Bookmark],
     /// 这个标签绑着一条会话记录(有 `SessionId`),收藏才有地方落盘。
     pub can_edit: bool,
+    /// F301:这一栏连接用户的主目录(远端 = SFTP 登录目录;本地 = 本机
+    /// home),点 `~` 书签时解析要用。本任务(F300)只加字段占位,恒 `None`;
+    /// Task 3(F301)再接真值。
+    pub home: Option<&'a str>,
 }
 
 impl BookmarkView<'_> {
@@ -163,6 +167,7 @@ impl BookmarkView<'_> {
         Self {
             list: &[],
             can_edit: false,
+            home: None,
         }
     }
 }
@@ -1008,6 +1013,16 @@ pub fn show(
             let btn =
                 egui::Button::new("").min_size(egui::Vec2::splat(ui.spacing().interact_size.y));
             let menu = egui::menu::menu_custom_button(ui, btn, |ui| {
+                // F300:菜单宽度按内容走、封顶 60% 屏宽。**这一句是切断 Area
+                // 尺寸棘轮的地方**(F259/F263 同形):egui 把菜单 Area 上一帧的
+                // 内容宽记成这一帧的预算,上一帧是一条 `/`,下一帧的长路径就被
+                // 压成 11 点宽的竖条。`set_max_width` 直接改 `max_rect.max`,
+                // 能把预算改大。守护:`a_long_bookmark_after_a_short_one_still_
+                // fits_on_one_line`(必须是先短后长两帧)。
+                let cap = ui.ctx().screen_rect().width() * 0.6;
+                ui.set_max_width(cap);
+                let font = egui::TextStyle::Button.resolve(ui.style());
+                let pad = ui.spacing().button_padding.x * 2.0;
                 for b in bookmarks.list {
                     // F145:主文本恒是**完整绝对路径**。用户点开这个下拉
                     // 就是为了确认「这条书签指哪儿」,只给个 `nginx` 等于
@@ -1016,9 +1031,27 @@ pub fn show(
                     // 用户自己起的名字不丢:非空且与路径不同时挂到 hover 上。
                     // (空名是 store 明确允许的合法状态,见 `Bookmark::name`
                     // 的文档 —— 现在这个分支不再影响主文本,只影响 hover。)
-                    let mut item = ui.button(b.path.as_str());
-                    if !b.name.is_empty() && b.name != b.path {
-                        item = item.on_hover_text(&b.name);
+                    //
+                    // F300:放不下时按像素中段省略,完整路径挪到 hover。
+                    let shown = fit_middle(&b.path, cap - pad, |s| {
+                        ui.fonts(|f| {
+                            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                                .size()
+                                .x
+                        })
+                    });
+                    let elided = shown != b.path;
+                    let mut item =
+                        ui.add(egui::Button::new(shown).wrap_mode(egui::TextWrapMode::Extend));
+                    let named = !b.name.is_empty() && b.name != b.path;
+                    let hover = match (elided, named) {
+                        (true, true) => Some(format!("{}\n{}", b.path, b.name)),
+                        (true, false) => Some(b.path.clone()),
+                        (false, true) => Some(b.name.clone()),
+                        (false, false) => None,
+                    };
+                    if let Some(h) = hover {
+                        item = item.on_hover_text(h);
                     }
                     if item.clicked() {
                         action = Some(FileAction::Goto(mullion_ssh::sftp::RemotePath::from_bytes(
@@ -2271,6 +2304,31 @@ fn truncate_to_width<'a>(s: &'a str, budget: f32, measure: &impl Fn(&str) -> f32
     &s[..bounds[lo]]
 }
 
+/// F300:按**像素**把 `s` 中段省略到 `max_w` 以内。放得下原样返回。
+///
+/// 省略本身交给 `reveal::elide_middle`(按字符预算,保头、尾留约 2/3 ——
+/// 路径的尾部是认路径的关键);这里只二分出「多少个字符恰好放得下」。
+/// 度量由调用方给(`measure`),纯函数、可脱离 egui 单测。
+pub(crate) fn fit_middle(s: &str, max_w: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(s) <= max_w {
+        return s.to_owned();
+    }
+    let n = s.chars().count();
+    let (mut lo, mut hi) = (1usize, n);
+    let mut best = crate::files::reveal::elide_middle(s, 1);
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let cand = crate::files::reveal::elide_middle(s, mid);
+        if measure(&cand) <= max_w {
+            best = cand;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best
+}
+
 /// 两栏之一。定义搬去了 `crate::files`(纯逻辑层,`drag.rs` 的落点判据要
 /// 拿它当参数),这里重导出让老的引用路径继续可用。
 pub use crate::files::PanelColumn;
@@ -2681,6 +2739,8 @@ pub fn sidebar(
                             // F187:同 `content()` 里本地栏那处 —— 全局收藏夹,
                             // 没有 `SessionId` 也能收。两处必须一起改。
                             can_edit: true,
+                            // F301 占位,本任务(F300)恒 `None`。
+                            home: None,
                         },
                         0,
                         &mut ui_state.files_cols,
@@ -2726,6 +2786,7 @@ pub fn sidebar(
                         BookmarkView {
                             list: &frame.bookmarks,
                             can_edit: frame.session_bound,
+                            home: None,
                         },
                         drop_in,
                         &mut ui_state.files_cols,
@@ -2870,6 +2931,7 @@ pub fn content(
                         // 不挂会话 —— 所以没有 `SessionId` 也照样能收。
                         // 快速连接开的标签、SFTP 独立标签都该能用 ☆。
                         can_edit: true,
+                        home: None,
                     },
                     0,
                     cols,
@@ -2896,6 +2958,7 @@ pub fn content(
                     BookmarkView {
                         list: &frame.bookmarks,
                         can_edit: frame.session_bound,
+                        home: None,
                     },
                     drop_in,
                     cols,
@@ -5475,6 +5538,7 @@ mod tests {
                     BookmarkView {
                         list: bookmarks,
                         can_edit,
+                        home: None,
                     },
                     0,
                     cols,
@@ -5511,6 +5575,7 @@ mod tests {
                     BookmarkView {
                         list: bookmarks,
                         can_edit,
+                        home: None,
                     },
                     0,
                     cols,
@@ -5561,6 +5626,192 @@ mod tests {
             }
         }
         None
+    }
+
+    /// 侧栏形态跑一帧远端栏:2560×1365 屏,远端栏装在 `SidePanel` 里 ——
+    /// 与用户实报的现场同一个宿主。`CentralPanel` 上首帧预算是整块屏宽,
+    /// 棘轮复现不出来。
+    fn run_remote_sidebar(
+        ctx: &egui::Context,
+        state: &mut PaneState,
+        cols: &mut ColWidths,
+        bookmarks: &[mullion_store::Bookmark],
+        mut input: egui::RawInput,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(2560.0, 1365.0),
+        ));
+        let t = crate::theme::MULLION_DARK;
+        ctx.run(input, |ctx| {
+            egui::SidePanel::right("f300_side")
+                .exact_width(420.0)
+                .show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        BookmarkView {
+                            list: bookmarks,
+                            can_edit: true,
+                            home: None,
+                        },
+                        0,
+                        cols,
+                        None,
+                        None,
+                        None,
+                    );
+                });
+        })
+        .shapes
+    }
+
+    fn galley_of(
+        shapes: &[egui::epaint::ClippedShape],
+        needle: &str,
+    ) -> Option<std::sync::Arc<egui::Galley>> {
+        fn walk(s: &egui::Shape, needle: &str) -> Option<std::sync::Arc<egui::Galley>> {
+            match s {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, needle)),
+                egui::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                    Some(ts.galley.clone())
+                }
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    fn bm(path: &str) -> mullion_store::Bookmark {
+        mullion_store::Bookmark {
+            name: String::new(),
+            path: path.into(),
+        }
+    }
+
+    /// F300:书签下拉的每一项**一行**画完。
+    ///
+    /// 根因是 egui `Area` 的尺寸棘轮(F259/F263 同形):菜单记住上一帧内容宽,
+    /// 上一帧只有一条 `/` 时,下一帧换成长路径,按钮被压成 11 点宽、19 行的
+    /// 竖条(v0.1.118 无头复现)。所以判据**必须**是「先短后长」:单画一条长的,
+    /// 首帧预算够宽,永远是绿的。
+    ///
+    /// 自证会变红:删掉菜单闭包里的 `ui.set_max_width(..)`。
+    #[test]
+    fn a_long_bookmark_after_a_short_one_still_fits_on_one_line() {
+        let ctx = egui::Context::default();
+        annotate::toggle(&ctx);
+        let mut state = ready_at(b"/");
+        let mut cols = ColWidths::default();
+        let short = vec![bm("/")];
+        let long_path = "/home/brain/.claude/projects/-data-Mullion";
+        let long = vec![bm(long_path)];
+        run_remote_sidebar(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &short,
+            egui::RawInput::default(),
+        );
+        let arrow = annotate::spot_rect(&ctx, "文件面板/远端/路径/书签")
+            .expect("有书签时该画下拉按钮")
+            .center();
+        run_remote_sidebar(&ctx, &mut state, &mut cols, &short, click_at(arrow));
+        // 菜单开着、画了一帧短的,棘轮记下了窄宽度。
+        run_remote_sidebar(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &short,
+            egui::RawInput::default(),
+        );
+        let mut g = None;
+        for _ in 0..3 {
+            let shapes = run_remote_sidebar(
+                &ctx,
+                &mut state,
+                &mut cols,
+                &long,
+                egui::RawInput::default(),
+            );
+            if let Some(found) = galley_of(&shapes, long_path) {
+                g = Some(found);
+            }
+        }
+        let g = g.expect("长书签没画出来(菜单关了?)");
+        assert_eq!(g.rows.len(), 1, "长路径被折成 {} 行", g.rows.len());
+    }
+
+    /// F300:比 60% 屏宽还长的路径**中段省略**且仍是一行,而不是被硬裁或折行。
+    ///
+    /// 自证会变红:把 `fit_middle` 的调用换成原样 `b.path.as_str()`
+    /// (galley 里出现完整路径、宽度超过上限)。
+    #[test]
+    fn a_path_longer_than_the_cap_is_middle_elided_on_one_line() {
+        let ctx = egui::Context::default();
+        annotate::toggle(&ctx);
+        let mut state = ready_at(b"/");
+        let mut cols = ColWidths::default();
+        let seg = "abcdefghij".repeat(40); // 400 字符,远超 2560×0.6
+        let huge = format!("/head/{seg}/tail.txt");
+        let list = vec![bm(&huge)];
+        run_remote_sidebar(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &list,
+            egui::RawInput::default(),
+        );
+        let arrow = annotate::spot_rect(&ctx, "文件面板/远端/路径/书签")
+            .unwrap()
+            .center();
+        run_remote_sidebar(&ctx, &mut state, &mut cols, &list, click_at(arrow));
+        let mut g = None;
+        for _ in 0..3 {
+            let shapes = run_remote_sidebar(
+                &ctx,
+                &mut state,
+                &mut cols,
+                &list,
+                egui::RawInput::default(),
+            );
+            if let Some(found) = galley_of(&shapes, "/head/") {
+                g = Some(found);
+            }
+        }
+        let g = g.expect("超长书签没画出来");
+        assert_eq!(g.rows.len(), 1, "超长路径折行了");
+        assert!(g.text().contains('…'), "超长路径没省略:{}", g.text());
+        assert!(
+            g.text().ends_with("tail.txt"),
+            "省略把尾部吃掉了:{}",
+            g.text()
+        );
+        assert!(
+            g.size().x <= 2560.0 * 0.6,
+            "宽度 {} 超过 60% 屏宽",
+            g.size().x
+        );
+    }
+
+    /// F300:`fit_middle` 放得下就原样,放不下就中段省略且不超预算。
+    ///
+    /// 自证会变红:让 `fit_middle` 恒返回原串。
+    #[test]
+    fn fit_middle_keeps_short_text_and_elides_long_text_within_budget() {
+        let w = |s: &str| s.chars().count() as f32 * 7.0; // 等宽假度量
+        assert_eq!(fit_middle("/srv/api", 100.0, w), "/srv/api");
+        let long = "/home/brain/projects/very/deep/tree/file.rs";
+        let out = fit_middle(long, 140.0, w);
+        assert!(out.contains('…'), "{out}");
+        assert!(w(&out) <= 140.0, "{out} 超预算");
+        assert!(out.starts_with("/home"), "{out}");
+        assert!(out.ends_with("file.rs"), "{out}");
     }
 
     /// 一次完整的左键点击(按下 + 抬起)。`PointerMoved` 不能省:egui 的
