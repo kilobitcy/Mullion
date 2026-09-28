@@ -5230,6 +5230,13 @@ impl App {
     /// `files_finding()`(=`Modal::FilesFind` 的判据)本身就是 `modal_open()`
     /// 恒真的原因之一,拿 `modal_open()` 当门反而会让这个键永远进不来。
     fn files_find_escape_event(&mut self, event: &WindowEvent) -> bool {
+        // F299 复核:内置编辑器开着时让路,不抢它自己的 Esc(编辑器的查找条
+        // 也拿 Esc 当关条键)。**不能拿 `modal_open()` 当门**——见上面的类注释,
+        // `FilesFind` 本身就是 `modal_open()` 恒真的原因之一;`Modal::Editor`
+        // 才是唯一要拦的对象,直接查 `self.edit.editor.is_some()`。
+        if self.edit.editor.is_some() {
+            return false;
+        }
         let WindowEvent::KeyboardInput { event: ke, .. } = event else {
             return false;
         };
@@ -30194,6 +30201,55 @@ mod tests {
              Esc,而这个键再也到不了终端:{body}"
         );
         assert!(!body.contains("tabs.iter()"), "又在遍历全部标签了:{body}");
+    }
+
+    /// F299 复核 [Critical]:编辑器开着的时候,`files_find_escape_event`
+    /// 必须放行(返回 `false`),把 Esc 留给编辑器自己的查找条
+    /// (`ui::editor_window::show` 里那一份)去关。不放行的话,面板搜索条
+    /// 会抢在编辑器前面把这一下吃掉——编辑器的查找条永远关不掉,除非
+    /// FilesPanel 的搜索条恰好没开着。
+    ///
+    /// **不能拿 `modal_open()` 当门**——上面
+    /// `escape_closes_the_find_bar_before_the_general_input_routing_swallows_it`
+    /// 已经在断言反过来的事(`FilesFind` 本身就是 `modal_open()` 恒真的
+    /// 原因之一),这条改用具体字段 `self.edit.editor.is_some()`,与那条
+    /// 互不冲突。
+    ///
+    /// 门必须排在真正关面板搜索条(`self.close_files_find(`)**之前**——
+    /// 挪到后面等于先关了面板的条、再假装放行,用户看到的还是面板的条被
+    /// 关掉。
+    ///
+    /// 自证会变红:
+    /// - 删掉 `if self.edit.editor.is_some() { return false; }` 这一句
+    ///   (第一条计数断言红);
+    /// - 取反成 `if !self.edit.editor.is_some()`(计数断言仍然过,但顺序/
+    ///   数量语义已经反了——用一条否定式的关键字符串断言单独钉住,防止
+    ///   只靠计数漏判);
+    /// - 把这句挪到 `self.close_files_find(` 之后(顺序断言红)。
+    #[test]
+    fn the_escape_interceptor_yields_to_the_editors_own_find_bar() {
+        let body = strip_comments(body_of(prod_src(), "fn files_find_escape_event("));
+        assert_eq!(
+            body.matches("self.edit.editor.is_some()").count(),
+            1,
+            "没看到编辑器开关门,或者门被复制了不止一份:{body}"
+        );
+        assert!(
+            !body.contains("!self.edit.editor.is_some()")
+                && !body.contains("self.edit.editor.is_none()"),
+            "门被取反了——这样编辑器一开,面板搜索条反而抢先关闭:{body}"
+        );
+        let gate_at = body
+            .find("self.edit.editor.is_some()")
+            .expect("上面已经断言过存在,这里不会落空");
+        let close_at = body
+            .find("self.close_files_find(")
+            .expect("找不到关面板搜索条的调用");
+        assert!(
+            gate_at < close_at,
+            "编辑器开关门排在了 `close_files_find` 之后——等于先关了面板的\
+             搜索条才想起来让路,已经晚了:{body}"
+        );
     }
 
     /// 取某个函数的函数体源码。**`marker` 必须带行首缩进**——不带的话
