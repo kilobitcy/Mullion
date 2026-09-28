@@ -1013,12 +1013,14 @@ pub fn show(
             let btn =
                 egui::Button::new("").min_size(egui::Vec2::splat(ui.spacing().interact_size.y));
             let menu = egui::menu::menu_custom_button(ui, btn, |ui| {
-                // F300:菜单宽度按内容走、封顶 60% 屏宽。**这一句是切断 Area
-                // 尺寸棘轮的地方**(F259/F263 同形):egui 把菜单 Area 上一帧的
-                // 内容宽记成这一帧的预算,上一帧是一条 `/`,下一帧的长路径就被
-                // 压成 11 点宽的竖条。`set_max_width` 直接改 `max_rect.max`,
-                // 能把预算改大。守护:`a_long_bookmark_after_a_short_one_still_
-                // fits_on_one_line`(必须是先短后长两帧)。
+                // F300:菜单宽度按内容走、封顶 60% 屏宽。切断 Area 尺寸棘轮
+                // (F259/F263 同形):egui 把菜单 Area 上一帧的内容宽记成这一帧
+                // 的预算,上一帧是一条 `/`,下一帧的长路径就被压成 11 点宽的竖条。
+                // `set_max_width` 直接改 `max_rect.max` 把预算改大;下面按钮的
+                // `TextWrapMode::Extend` 也能独立撑开当帧尺寸 —— 两道互为兜底,
+                // 只删一道测不红(已实测),同时删掉才红。`cap` 另作省略上限。
+                // 守护:`a_long_bookmark_after_a_short_one_still_fits_on_one_line`
+                // (必须是先短后长两帧)。
                 let cap = ui.ctx().screen_rect().width() * 0.6;
                 ui.set_max_width(cap);
                 let font = egui::TextStyle::Button.resolve(ui.style());
