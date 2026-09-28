@@ -1537,12 +1537,13 @@ mod tests {
     /// 查找条这个具体触发点单独钉一遍,防止有人在查找条上叠一份自己的
     /// 「猜 reserve」逻辑,把这个具体路径的免疫力又拆掉。
     ///
-    /// 自证会变红(**实测**):把 F217 之前的旧写法接回来 —— 正文用
-    /// `egui::ScrollArea::vertical().max_height(h)`,其中
-    /// `h = (ui.available_height() - reserve).max(80.0)`、`reserve` 是查找条
-    /// **打开之前**就量好的一个常数(不随查找条开关变化)。查找条打开时
-    /// 内容比这个猜出来的高度多一整行,窗口被顶高;关掉之后猜出来的高度
-    /// 没变,窗口就卡在顶高之后回不去。
+    /// 自证会变红(**实测**,864.682 → 918,顶到天花板回不来):把外层
+    /// `bottom_up`/`top_down` 那两层拆掉,改回 F217 之前的旧写法 —— 正文
+    /// 先用 `let h = (ui.available_height() - reserve).max(80.0)` 猜一个
+    /// 高度、`ScrollArea::vertical().max_height(h)`,按钮行挪到正文**之后**
+    /// (34b3900 之前的原始结构)。查找条打开后 `Resize` 记住的内容高度
+    /// 比关闭时更高,`desired_size.max(last_content_size)` 只涨不缩,关掉
+    /// 查找条也降不回来。
     #[test]
     fn closing_the_find_bar_gives_back_the_row_it_took() {
         let mut s = editable();
