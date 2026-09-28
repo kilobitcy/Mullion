@@ -369,6 +369,12 @@ mod tests {
 
     /// plan 同时置 busy:连续两次 plan,第二次不会再发。
     /// 自证会变红:删掉 `plan` 里 `g.sample_busy = true;`。
+    ///
+    /// 注意:仅靠「同一个 `now` 连打两次 plan」抓不住这处删除 —— `sample_at`
+    /// 已经写成 `Some(now)`,`due()` 光靠这一条就会判「未到点」,busy 与否不
+    /// 影响结果。真正需要 busy 的场景是「探针还没回来、但已经过了一个采样
+    /// 周期」,所以下面额外把时钟拨过 `SAMPLE_EVERY`、且**不**调用
+    /// `finish_sample`(探针仍在途)再 plan 一次。
     #[test]
     fn planning_marks_busy_so_a_second_tick_does_not_double_fire() {
         let c = StatsCell::default();
@@ -381,6 +387,13 @@ mod tests {
             }
         );
         assert_eq!(c.plan(now), Plan::default());
+        // 探针仍未返回(没调 finish_sample),但时钟已经过了一个采样周期:
+        // 没有 busy 挡着的话,due() 会因为 sample_at 过期而重新判定到点。
+        let still_busy_but_overdue = now + SAMPLE_EVERY + Duration::from_secs(1);
+        assert!(
+            !c.plan(still_busy_but_overdue).sample,
+            "上一次探针还没回来,不该在它还在途时重发"
+        );
         c.finish_sample(Reading::Absent, Reading::Absent);
         assert!(!c.plan(now).sample, "刚采过,10 秒内不该再采");
         c.refresh_country_now();
