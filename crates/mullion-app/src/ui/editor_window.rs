@@ -840,7 +840,9 @@ mod tests {
         run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
         run_editor(&ctx, &mut st, egui::RawInput::default());
         run_editor(&ctx, &mut st, typed("needle"));
-        run_editor(&ctx, &mut st, key(egui::Key::Escape, egui::Modifiers::NONE));
+        let (act, _) = run_editor(&ctx, &mut st, key(egui::Key::Escape, egui::Modifiers::NONE));
+        assert_eq!(act, None, "Esc 只该关查找条,不该顺带产生保存/关窗动作");
+        assert!(st.is_some(), "Esc 关的是查找条,不该把整个编辑器关掉");
         run_editor(&ctx, &mut st, egui::RawInput::default());
         assert!(st.as_ref().unwrap().find.is_none(), "Esc 没关掉查找条");
         let ts = egui::TextEdit::load_state(&ctx, body_id(&st.as_ref().unwrap().key))
