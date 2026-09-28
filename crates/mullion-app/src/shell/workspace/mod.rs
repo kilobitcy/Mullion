@@ -335,6 +335,17 @@ impl Workspace {
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut PaneState> {
         self.panes.iter_mut().find(|p| p.id == id)
     }
+    /// F298 复核(Important):`hosts` 只增不减——换节点(F132)之后,旧
+    /// host 没有任何 pane 的 `host_ix` 再指着它,却仍然是 `hosts` 数组里
+    /// 活生生的一员。判「这个 host 还要不要采样 / 还要不要等它醒」必须看
+    /// 这个,而不是看它在不在 `hosts` 里——不然孤儿 host 会被永久周期采样。
+    ///
+    /// `tick_node_stats` 和 `node_stats_wake` 两处判据都必须调这一个函数
+    /// (同源),否则「采不采」和「等不等它醒」可能对上不同批次的孤儿,
+    /// 出现「永远不采但仍旧等它醒」或反过来的错配。
+    pub fn host_is_referenced(&self, host_ix: usize) -> bool {
+        self.panes.iter().any(|p| p.host_ix == host_ix)
+    }
     pub fn focused(&self) -> Option<&PaneState> {
         self.pane(self.focus)
     }
@@ -2245,5 +2256,35 @@ mod tests {
             "抽屉的 channel 不许被级联关掉"
         );
         assert_eq!(ws.focus(), focus_before, "焦点不许动");
+    }
+
+    /// F298 复核(Important):判「这个 host 还要不要采样」必须看还有没有
+    /// pane 的 `host_ix` 指着它,不是看它在不在 `hosts` 数组里(那个数组
+    /// 只增不减)。换节点(F132)之后旧 host 没有任何 pane 再指着它,就该
+    /// 判定为孤儿。
+    ///
+    /// 自证会变红:把 `host_is_referenced` 的实现换成 `true`(或者换成
+    /// `host_ix < self.hosts.len()` 这种只看数组长度的假判据)。
+    #[test]
+    fn host_is_referenced_tracks_panes_not_the_hosts_array_length() {
+        let (mut ws, _probes) = ws_with(2);
+        // 两块 pane 默认都指着 host 0(fake_pane 的初值)。
+        assert!(ws.host_is_referenced(0));
+        // host 1 在 hosts 数组里根本不存在,但判据只看 panes,不看数组长度
+        // 或者数组里有没有这一项——没有 pane 指着它就是「没被引用」。
+        assert!(!ws.host_is_referenced(1));
+
+        // 模拟「换节点」:2 号 pane 的 host_ix 改指向新 host 1。
+        ws.pane_mut(PaneId(2)).unwrap().host_ix = 1;
+        assert!(ws.host_is_referenced(0), "1 号 pane 仍然指着 host 0");
+        assert!(ws.host_is_referenced(1), "2 号 pane 现在指着 host 1");
+
+        // 1 号 pane 也换过去了:host 0 从此没有任何 pane 指着它,是孤儿。
+        ws.pane_mut(PaneId(1)).unwrap().host_ix = 1;
+        assert!(
+            !ws.host_is_referenced(0),
+            "换节点后没有 pane 再指着 host 0,它该被判成孤儿"
+        );
+        assert!(ws.host_is_referenced(1));
     }
 }

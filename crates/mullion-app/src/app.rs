@@ -4285,7 +4285,12 @@ impl App {
                 // SFTP 节点标签没有标题条,占位标签没有连接。
                 continue;
             };
-            for host in &t.ws.hosts {
+            for (host_ix, host) in t.ws.hosts.iter().enumerate() {
+                if !t.ws.host_is_referenced(host_ix) {
+                    // 孤儿 host(换节点后没有任何 pane 再指着它):不采样,
+                    // 不然它会被永久周期采样却永远不会被显示。
+                    continue;
+                }
                 let plan = host.stats.plan(now);
                 if plan.sample {
                     let conn = host.handle.clone();
@@ -4844,8 +4849,17 @@ impl App {
         self.tabs
             .iter()
             .filter_map(|t| t.content.as_terminal())
-            .flat_map(|t| t.ws.hosts.iter())
-            .filter_map(|h| h.stats.next_wake(now))
+            .flat_map(|t| {
+                // 孤儿 host(同 tick_node_stats,判据必须同源)不等它醒——
+                // 它不会再被采样,报一个它的唤醒时刻只会白白多醒一次。
+                t.ws.hosts.iter().enumerate().filter_map(move |(ix, h)| {
+                    if t.ws.host_is_referenced(ix) {
+                        h.stats.next_wake(now)
+                    } else {
+                        None
+                    }
+                })
+            })
             .min()
     }
 
@@ -21845,6 +21859,38 @@ mod tests {
         assert!(
             body.contains("self.node_stats_wake("),
             "定时唤醒没并进节点状态采样 —— 空闲时采样只能靠别的事件顺带唤醒"
+        );
+    }
+
+    /// **接线守护 / F298 复核(Important)**:`tick_node_stats` 和
+    /// `node_stats_wake` 判「孤儿 host」的判据必须同源(都调
+    /// `host_is_referenced`),不能各写一份——两处判据一旦分叉,可能出现
+    /// 「永远不采样但仍旧等它醒」或者反过来的错配。孤儿 host 本身的行为
+    /// 见 `shell::workspace::tests::host_is_referenced_tracks_panes_not_the_hosts_array_length`。
+    ///
+    /// 自证会变红:把其中一处的 `host_is_referenced` 判断删掉。
+    #[test]
+    fn orphan_host_pruning_uses_the_same_predicate_in_both_call_sites() {
+        let src = include_str!("app.rs");
+
+        let tick_after = src
+            .split("\n    fn tick_node_stats(&mut self) {")
+            .nth(1)
+            .expect("找不到 tick_node_stats 的定义");
+        let tick_body = &tick_after[..tick_after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            tick_body.contains("host_is_referenced("),
+            "tick_node_stats 没有跳过孤儿 host —— 换节点后旧连接会被永久周期采样"
+        );
+
+        let wake_after = src
+            .split("\n    fn node_stats_wake(&self, now: Instant) -> Option<Instant> {")
+            .nth(1)
+            .expect("找不到 node_stats_wake 的定义");
+        let wake_body = &wake_after[..wake_after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            wake_body.contains("host_is_referenced("),
+            "node_stats_wake 没有跳过孤儿 host —— 永远等它醒但它永远不会被采样"
         );
     }
 
