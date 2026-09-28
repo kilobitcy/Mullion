@@ -402,6 +402,10 @@ pub enum UserEvent {
     /// 就变成三处各归还一次 —— 而「漏一条出口」是本项目的常客形状,
     /// 漏掉之后**永远**不再备份且零报错。
     CloudBackupDone(crate::cloudsync::UploadOutcome),
+    /// F298:某条连接的节点状态格子更新了。**不带负载**:数据已写进那条
+    /// 连接的 `HostConn.stats`,这条事件只负责标脏重绘。不带世代路由 ——
+    /// 连接没了格子跟着没,没有「送错标签」这回事。
+    NodeStatsUpdated,
 }
 
 /// F219:一次远端写操作**成功之后**还要做的事。
@@ -4268,6 +4272,84 @@ impl App {
         }
     }
 
+    /// F298:到点的连接采一次节点状态。结构同 `tick_tmux_bootstrap`:每次空闲
+    /// 都跑,真正的活只有每条连接一次加锁判到点(`StatsCell::plan`)。
+    ///
+    /// **有超时**(`node_stats::EXEC_TIMEOUT`),与 F124 那条刻意不包超时不同:
+    /// 这里是周期任务,挂住一次就永远不再更新,用户看到的是一个停住不动、
+    /// 却看起来正常的数字 —— 比显示 `--` 更糟。
+    fn tick_node_stats(&mut self) {
+        let now = Instant::now();
+        for tab in self.tabs.iter_mut() {
+            let Some(t) = tab.content.as_terminal_mut() else {
+                // SFTP 节点标签没有标题条,占位标签没有连接。
+                continue;
+            };
+            for host in &t.ws.hosts {
+                let plan = host.stats.plan(now);
+                if plan.sample {
+                    let conn = host.handle.clone();
+                    let cell = host.stats.clone();
+                    let proxy = self.proxy.clone();
+                    self._runtime.spawn(async move {
+                        let cmd = crate::node_stats::sample_command();
+                        let r = tokio::time::timeout(
+                            crate::node_stats::EXEC_TIMEOUT,
+                            mullion_ssh::exec::exec(&conn, cmd),
+                        )
+                        .await;
+                        let (mem, disk) = match r {
+                            Ok(Ok(out)) => crate::node_stats::parse_sample(
+                                &String::from_utf8_lossy(&out.stdout),
+                            ),
+                            Ok(Err(e)) => {
+                                let why = format!("采样失败:{e}");
+                                (
+                                    crate::node_stats::Reading::Failed(why.clone()),
+                                    crate::node_stats::Reading::Failed(why),
+                                )
+                            }
+                            Err(_) => {
+                                let why = "采样超时".to_string();
+                                (
+                                    crate::node_stats::Reading::Failed(why.clone()),
+                                    crate::node_stats::Reading::Failed(why),
+                                )
+                            }
+                        };
+                        cell.finish_sample(mem, disk);
+                        let _ = proxy.send_event(UserEvent::NodeStatsUpdated);
+                    });
+                }
+                if plan.country {
+                    let conn = host.handle.clone();
+                    let cell = host.stats.clone();
+                    let proxy = self.proxy.clone();
+                    self._runtime.spawn(async move {
+                        let cmd = crate::node_stats::country_command();
+                        let r = tokio::time::timeout(
+                            crate::node_stats::EXEC_TIMEOUT,
+                            mullion_ssh::exec::exec(&conn, cmd),
+                        )
+                        .await;
+                        let c = match r {
+                            Ok(Ok(out)) => crate::node_stats::parse_country(
+                                out.exit_status,
+                                &String::from_utf8_lossy(&out.stdout),
+                            ),
+                            Ok(Err(e)) => {
+                                crate::node_stats::Reading::Failed(format!("取国家失败:{e}"))
+                            }
+                            Err(_) => crate::node_stats::Reading::Failed("取国家超时".into()),
+                        };
+                        cell.finish_country(c);
+                        let _ = proxy.send_event(UserEvent::NodeStatsUpdated);
+                    });
+                }
+            }
+        }
+    }
+
     /// F37:把刚连上的内容摆进标签栏。
     ///
     /// `pending` 命中(且那个占位标签还在)→ **就地**替换它,标签在栏里
@@ -4734,9 +4816,25 @@ impl App {
     /// Duration::from_millis(now)` 换算回去——与 `now_ms()` 互为逆运算,不引入漂移。
     fn next_timer_wake(&self, now: u64) -> Option<Instant> {
         let blink_now = self.start + std::time::Duration::from_millis(now);
-        [self.sync_timeout_wake(now), self.blink_wake(blink_now)]
-            .into_iter()
-            .flatten()
+        [
+            self.sync_timeout_wake(now),
+            self.blink_wake(blink_now),
+            self.node_stats_wake(blink_now),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// F298:所有终端标签上所有连接里,最早到点的那次采样。**遍历全部标签**
+    /// (同 `tick_node_stats`)——只看活动标签的话,后台标签的数字会在切换
+    /// 回来之前一直停在旧值上,直到别的事件顺带把循环唤醒才补上。
+    fn node_stats_wake(&self, now: Instant) -> Option<Instant> {
+        self.tabs
+            .iter()
+            .filter_map(|t| t.content.as_terminal())
+            .flat_map(|t| t.ws.hosts.iter())
+            .filter_map(|h| h.stats.next_wake(now))
             .min()
     }
 
@@ -10345,6 +10443,8 @@ impl App {
             // **标签级**的(标题条读 user/host/port),换过节点之后
             // 就不再代表"每一条连接"——见 `HostConn::cfg` 的文档。
             cfg: cfg.clone(),
+            // F298:新连接,从没采过 —— 下一次 tick 立刻采样+取国家。
+            stats: Default::default(),
         });
         // F36:每次连接**开一个新标签**,已有的标签原样留着 —— 它们各自
         // 的 SSH 连接一根都不动(spec F36 验收:「切换标签不重连」;守护
@@ -10998,6 +11098,8 @@ impl App {
                 // F128:拨这台新机器的参数跟着它自己走。落回
                 // `last_cfg` 的话,这条连接断线时会拨回最初那台机器。
                 cfg: Some(pending.cfg),
+                // F298:换节点等于新连接,从没采过 —— 下一次 tick 立刻采样+取国家。
+                stats: Default::default(),
             });
             let host_ix = ws.hosts.len() - 1;
             if rehost_pane(
@@ -11156,6 +11258,11 @@ impl App {
                 // (`tmux set -g` 幂等,重发无副作用)。
                 h.tmux_bootstrap = Default::default();
                 h.tmux_last_try = None;
+                // F298:换了 handle,旧连接上任何还在途的采样 task 攥着的是
+                // 死连接 —— 结果回来也只是写一次旧值,随即被下面这次重置
+                // 触发的新采样覆盖。清零调度让下一次 tick 立刻在新连接上
+                // 重采(不清 `snap` 本身:断线期间旧值继续显示,不闪空)。
+                h.stats.reset_schedule();
             }
             // 这次拨号没赶上的 pane 补一次(判据见
             // `reconnect::strays_after_reconnect`):同一条连接上各 pane
@@ -12905,6 +13012,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            // F298:标脏已在函数开头做了,见 `user_event_marks_dirty`。数据
+            // 已经写进那条连接的 `HostConn.stats`,这里无事可做。
+            UserEvent::NodeStatsUpdated => {}
         }
     }
 
@@ -15181,6 +15291,11 @@ impl ApplicationHandler<UserEvent> for App {
         // 这里 —— 它跟渲染无关,而 `about_to_wait` 是「已经闲下来了」这个
         // 语义唯一准确的位置。
         self.tick_tmux_bootstrap();
+        // F298:到点就采一次节点状态。同上,放在「已经闲下来了」这个位置;
+        // 必须排在 `next_timer_wake` 判定之前(T7 自查见 `node_stats_wake`)——
+        // 这里先把新连接的 `busy` 置上,`next_timer_wake` 才不会算出过去的
+        // 唤醒时刻造成忙转。
+        self.tick_node_stats();
         // 即将阻塞等事件 = 正常空闲。看门狗据此不误报(等事件本来就可以等很久)。
         diag::mark(diag::Stage::Idle);
     }
@@ -16351,7 +16466,8 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | EditOpened { .. }
         | EditSaved { .. }
         | PasteChecked { .. }
-        | CloudBackupDone(_) => true,
+        | CloudBackupDone(_)
+        | NodeStatsUpdated => true,
     }
 }
 
@@ -21677,6 +21793,44 @@ mod tests {
         );
     }
 
+    /// **接线守护 / F298**:节点状态的下一次采样时刻必须并进同一个「定时
+    /// 唤醒」汇合点 —— 否则空闲时 10 秒一次的采样要等到别的事件把循环
+    /// 唤醒才发生,数字「时灵时不灵」。
+    ///
+    /// 自证会变红:从 `next_timer_wake` 的数组里删掉 `self.node_stats_wake(..)`。
+    #[test]
+    fn node_stats_wakeups_join_the_single_timer_aggregation_point() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("    fn next_timer_wake(")
+            .nth(1)
+            .expect("找不到 next_timer_wake 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            body.contains("self.node_stats_wake("),
+            "定时唤醒没并进节点状态采样 —— 空闲时采样只能靠别的事件顺带唤醒"
+        );
+    }
+
+    /// **接线守护 / F298**:`tick_node_stats` 必须遍历**全部**标签(F128 那条
+    /// 「drive_* 每帧驱动函数必须遍历全部标签」同一形状)—— 只看活动标签的话,
+    /// 后台标签上那台机器的数字会永远停在初次连上的那个值。
+    ///
+    /// 自证会变红:把 `self.tabs.iter_mut()` 换成只取活动标签。
+    #[test]
+    fn the_node_stats_tick_walks_every_tab() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n    fn tick_node_stats(&mut self) {")
+            .nth(1)
+            .expect("找不到 tick_node_stats 的定义");
+        let body = &after[..after.find("\n    }\n").expect("找不到函数结尾")];
+        assert!(
+            body.contains("self.tabs.iter_mut()"),
+            "tick_node_stats 不再遍历全部标签 —— 后台标签的节点状态会停住不动"
+        );
+    }
+
     /// **接线守护 / F125**:闪烁只许排 `WaitUntil`,不许 `request_redraw`。
     /// 后者绕开帧闸,是 T3(GPU 空转)/T7(100% CPU 忙转)的直接触发方式。
     ///
@@ -23246,6 +23400,27 @@ mod tests {
         assert!(
             body.contains("self.tick_tmux_bootstrap();"),
             "about_to_wait 不再跑自举 tick —— F124 一次都不会发起"
+        );
+    }
+
+    /// **接线守护 / F298**:节点状态采样 tick 必须挂在 `about_to_wait` 上,
+    /// 理由同上一条(`about_to_wait_ticks_the_tmux_bootstrap`)——挂在别处
+    /// 的话被节流掉的帧就不采,或者整个功能一次都不发起。
+    ///
+    /// 自证会变红:把 `self.tick_node_stats();` 从 `about_to_wait` 里删掉。
+    #[test]
+    fn about_to_wait_drives_the_node_stats_probe() {
+        let src = include_str!("app.rs");
+        let after = src
+            .split("\n    fn about_to_wait(")
+            .nth(1)
+            .expect("找不到 about_to_wait 的定义");
+        let body = &after[..after
+            .find("\n    }\n")
+            .expect("找不到 about_to_wait 的函数结尾")];
+        assert!(
+            body.contains("self.tick_node_stats();"),
+            "about_to_wait 不再跑节点状态 tick —— F298 一次都不会发起"
         );
     }
 

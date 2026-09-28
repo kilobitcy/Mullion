@@ -175,6 +175,10 @@ pub struct HostConn {
     /// 此时不重连(`spawn_reconnect` 直接放弃并记日志)——宁可让用户手动重连,
     /// 也不猜一份配置拨出去。
     pub cfg: Option<mullion_ssh::config::SshConfig>,
+    /// F298:这台机器的节点状态(内存/磁盘/出口国家)。**按连接存**,同连接的
+    /// pane 共享一份 —— 同一台机器开三块 pane 不该采三遍。后台 task 写、
+    /// 事件循环读,见 `node_stats::StatsCell`。
+    pub stats: crate::node_stats::StatsCell,
 }
 
 /// 一个分屏的全部运行时状态。
