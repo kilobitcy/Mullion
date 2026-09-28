@@ -630,6 +630,9 @@ pub struct UiFrame<'a> {
     /// 每帧现算的派生值,**不落任何持久状态**:存一份下来就是影子状态,
     /// pane 换目录之后那一份不会自己变。
     pub pane_cwd: Option<&'a [u8]>,
+    /// F301:活动标签 sftp 的登录目录。远端栏书签 `~` 靠它解析。每帧现取,
+    /// 不存 —— 理由同 `pane_cwd`。
+    pub remote_home: Option<&'a [u8]>,
     /// 每个 pane 的标题条(F83)。空 = 标题条关闭或 launcher 态。
     pub titles: &'a [pane_title::TitleView<'a>],
     pub host_key: Option<host_key::HostKeyView<'a>>,
@@ -972,6 +975,7 @@ pub fn build_ui(
             hovering,
             &mut actions.files_focus_click,
             frame.pane_cwd,
+            frame.remote_home,
             // F262:归属分屏**每帧从 `titles` 现查**(见 `owner_tag`)——
             // 查不到就不写,不存一份会过期的映射。
             files_panel::owner_tag(frame.titles, frame.files_owner_pane).as_ref(),
@@ -1234,6 +1238,7 @@ pub fn build_ui(
             &mut ui_state.files_panel_rect,
             &mut actions.files_focus_click,
             frame.pane_cwd,
+            frame.remote_home,
         );
         actions.files_remote = r;
         actions.files_local = l;
@@ -1543,6 +1548,7 @@ mod tests {
             preset: None,
             selection_path: None,
             pane_cwd: None,
+            remote_home: None,
             titles: &[],
             tabs: &[],
             host_key: None,

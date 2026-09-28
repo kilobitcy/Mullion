@@ -13961,6 +13961,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 .tabs
                                 .active()
                                 .and_then(|t| t.content.focused_pane_cwd());
+                            // F301:远端书签 `~` 的解析基准。同 `pane_cwd`,
+                            // 每帧现取、不存 —— 存下来就是一份换标签之后
+                            // 不会自己变的影子状态。
+                            let remote_home =
+                                self.tabs.active().and_then(|t| t.content.sftp_home());
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
@@ -13993,6 +13998,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 之前就返回(陷阱 T3)。
                                 selection_path: selection_path.as_ref(),
                                 pane_cwd: pane_cwd.as_deref(),
+                                remote_home: remote_home.as_deref(),
                                 titles: &titles,
                                 tabs: &tab_views,
                                 host_key: host_key_view,
@@ -25626,6 +25632,25 @@ mod tests {
     fn the_find_pump_actually_runs_every_frame() {
         let src = strip_comments(prod_src());
         assert!(src.contains("self.pump_find();"), "pump_find 没有被调用");
+    }
+
+    /// F301 接线:远端书签 `~` 的主目录必须真的流进 `UiFrame` —— 纯函数测得
+    /// 再扎实,这里传 `None` 的话 `~` 书签在远端栏永远解析不出来,★ 永远不亮,
+    /// 画面上只是「一个不起作用的书签」,零报错。
+    ///
+    /// 自证会变红:把 `remote_home: remote_home.as_deref(),` 改成
+    /// `remote_home: None,`。
+    #[test]
+    fn the_remote_home_reaches_the_ui_frame() {
+        let src = prod_src();
+        assert!(
+            src.contains("remote_home: remote_home.as_deref(),"),
+            "UiFrame 没收到 remote_home 的真值"
+        );
+        assert!(
+            src.contains("t.content.sftp_home()"),
+            "remote_home 没从活动标签的 sftp_home 取"
+        );
     }
 
     /// F278:`ui/files_panel.rs` 生产段(切掉 `#[cfg(test)] mod tests` 之后

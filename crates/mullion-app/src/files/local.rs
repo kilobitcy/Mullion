@@ -159,6 +159,15 @@ pub fn home_dir() -> Option<RemotePath> {
     directories::BaseDirs::new().map(|b| RemotePath::from_bytes(path_bytes(b.home_dir())))
 }
 
+/// [`home_dir`] 的缓存版,进程内只查一次。
+///
+/// F301:书签路径条每帧都要问一次(★ 判定按 `~` 解析),`home_dir()` 每次都
+/// 是一次 `BaseDirs::new()` —— 每帧一次系统调用正是 T3 那类陷阱。
+pub fn home_dir_cached() -> Option<&'static RemotePath> {
+    static HOME: std::sync::OnceLock<Option<RemotePath>> = std::sync::OnceLock::new();
+    HOME.get_or_init(home_dir).as_ref()
+}
+
 /// 默认本地目录该开在哪 —— **纯选择逻辑**,零 IO,四个候选全由调用方给进来。
 ///
 /// 优先级:会话配置 > 本地收藏首条 > 用户主目录 > 当前工作目录。任何一步都不
@@ -171,6 +180,18 @@ pub fn home_dir() -> Option<RemotePath> {
 /// `bookmark_exists`:收藏首条指向的目录当下是否真的存在(调用方查)。不存在
 /// 时**直接回退主目录**,不试第二条 —— 试下去的话用户会开在一个自己完全没
 /// 预期的目录里,而且没有任何提示解释为什么(F231 与用户确认的取舍)。
+/// F301:配置 / 收藏里写的 `~`、`~/…` 展开成真实本地路径;非 `~` 开头原样
+/// 返回 —— `resolve_local_input` 对普通相对路径会拼 cwd,与这里「原样当
+/// 绝对/相对路径」的既有语义不同,不能对所有输入都过一遍。
+fn expand_tilde(s: &str, cwd: &RemotePath, home: Option<&RemotePath>) -> RemotePath {
+    if s.trim_start().starts_with('~') {
+        if let Some(p) = crate::files::path_input::resolve_local_input(s, cwd, home) {
+            return p;
+        }
+    }
+    RemotePath::from_bytes(s.as_bytes().to_vec())
+}
+
 pub fn pick_default_local(
     configured: Option<&str>,
     bookmark: Option<&str>,
@@ -181,10 +202,10 @@ pub fn pick_default_local(
     // 只有空白等于没填:面板不能开在一个名叫「   」的目录上。
     let usable = |s: &&str| !s.trim().is_empty();
     if let Some(s) = configured.filter(usable) {
-        return RemotePath::from_bytes(s.as_bytes().to_vec());
+        return expand_tilde(s, &cwd, home.as_ref());
     }
     if let Some(s) = bookmark.filter(usable).filter(|_| bookmark_exists) {
-        return RemotePath::from_bytes(s.as_bytes().to_vec());
+        return expand_tilde(s, &cwd, home.as_ref());
     }
     home.unwrap_or(cwd)
 }
@@ -193,17 +214,16 @@ pub fn pick_default_local(
 /// 存不存在。`bookmark` 是**本地收藏的第一条**(F231),由调用方从
 /// `Settings::local_bookmarks` 取。
 pub fn default_local(configured: Option<&str>, bookmark: Option<&str>) -> RemotePath {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = RemotePath::from_bytes(path_bytes(&cwd));
+    let home = home_dir_cached().cloned();
+    // F301:收藏首条若是 `~`,存在性检查也要用展开后的路径 —— 直接查字面量
+    // `~` 是不是目录恒为 false(进程 cwd 下几乎不会真有一个叫 `~` 的目录),
+    // 会把「主目录本来是有效收藏」误判成「收藏已失效」而回退。
     let bookmark_exists = bookmark
         .filter(|s| !s.trim().is_empty())
-        .is_some_and(|s| to_path(&RemotePath::from_bytes(s.as_bytes().to_vec())).is_dir());
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    pick_default_local(
-        configured,
-        bookmark,
-        bookmark_exists,
-        home_dir(),
-        RemotePath::from_bytes(path_bytes(&cwd)),
-    )
+        .is_some_and(|s| to_path(&expand_tilde(s, &cwd, home.as_ref())).is_dir());
+    pick_default_local(configured, bookmark, bookmark_exists, home, cwd)
 }
 
 /// 用系统文件管理器打开一个本地目录(设计 D5:本地文件管理外包出去)。
@@ -503,6 +523,25 @@ mod tests {
             RemotePath::from_bytes(b"/tmp".to_vec()),
         );
         assert_eq!(d.as_bytes(), b"/home/me");
+    }
+
+    /// F301:默认本地目录配成 `~` / `~/x` 时展开到主目录。原样返回的话,
+    /// 面板会去开一个名叫 `~` 的相对目录。
+    ///
+    /// 自证会变红:删掉 `pick_default_local` 里对 `configured` 的 `~` 展开
+    /// (把 `expand_tilde(s, &cwd, home.as_ref())` 换成
+    /// `RemotePath::from_bytes(s.as_bytes().to_vec())`)。
+    #[test]
+    fn a_configured_tilde_expands_to_home() {
+        let home = RemotePath::from_bytes(b"/home/u".to_vec());
+        let cwd = RemotePath::from_bytes(b"/tmp".to_vec());
+        assert_eq!(
+            pick_default_local(Some("~"), None, false, Some(home.clone()), cwd.clone()),
+            home
+        );
+        let sub = pick_default_local(Some("~/work"), None, false, Some(home.clone()), cwd);
+        assert!(sub.display().ends_with("work"), "{}", sub.display());
+        assert!(sub.display().starts_with("/home/u"), "{}", sub.display());
     }
 
     /// F231:主目录都拿不到时(`directories` 在某些精简环境返回 None)落到 cwd。

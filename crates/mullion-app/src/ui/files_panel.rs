@@ -150,10 +150,11 @@ pub struct BookmarkView<'a> {
     pub list: &'a [mullion_store::Bookmark],
     /// 这个标签绑着一条会话记录(有 `SessionId`),收藏才有地方落盘。
     pub can_edit: bool,
-    /// F301:这一栏连接用户的主目录(远端 = SFTP 登录目录;本地 = 本机
-    /// home),点 `~` 书签时解析要用。本任务(F300)只加字段占位,恒 `None`;
-    /// Task 3(F301)再接真值。
-    pub home: Option<&'a str>,
+    /// F301:**远端栏**的登录目录(SFTP `canonicalize(".")` 的结果,见
+    /// `TabContent::sftp_home`)。书签 `~` / `~/…` 靠它解析,★ 判定与
+    /// 「在主目录收藏存成 `~`」都要它。`None` = 还不知道(sftp 没开好)或
+    /// 这是本地栏 —— 本地栏的主目录走 `local::home_dir_cached()`,不经这里。
+    pub home: Option<&'a [u8]>,
 }
 
 impl BookmarkView<'_> {
@@ -742,6 +743,41 @@ fn bookmark_default_name(path: &str) -> String {
     }
 }
 
+/// F301:这条书签此刻指向哪里。只对 `~` 开头的解析;其余原样 —— 字面比较
+/// 是既有行为,解析普通路径会把 `/a/../b` 这类写法悄悄规整掉,改变 ★ 语义。
+/// 解析不出来(`~` 但主目录未知)= `None`,★ 判定当作不匹配。
+fn bookmark_target(
+    column: PanelColumn,
+    raw: &str,
+    cwd: &mullion_ssh::sftp::RemotePath,
+    remote_home: Option<&[u8]>,
+) -> Option<String> {
+    if !raw.starts_with('~') {
+        return Some(raw.to_owned());
+    }
+    let p = match column {
+        PanelColumn::Remote => {
+            crate::files::path_input::resolve_remote_input(raw, cwd, remote_home)
+        }
+        PanelColumn::Local => crate::files::path_input::resolve_local_input(
+            raw,
+            cwd,
+            crate::files::local::home_dir_cached(),
+        ),
+    }?;
+    Some(p.display().to_string())
+}
+
+/// F301:这一栏的主目录(显示形),用于「在主目录收藏存成 `~`」。
+fn column_home(column: PanelColumn, remote_home: Option<&[u8]>) -> Option<String> {
+    match column {
+        PanelColumn::Remote => remote_home.map(|h| String::from_utf8_lossy(h).into_owned()),
+        PanelColumn::Local => {
+            crate::files::local::home_dir_cached().map(|h| h.display().to_string())
+        }
+    }
+}
+
 /// `ScrollArea` 持久化 id 的拼装,抽成纯函数只为了能脱离 egui 单测
 /// (见 `tests::scroll_id_salt_differs_by_generation`)。
 ///
@@ -983,7 +1019,14 @@ pub fn show(
         //
         // ★/☆ 由「当前 cwd 在不在书签列表里」现算:列表就是唯一真值,
         // 不另存一个会跟它不同步的标志位。
-        let starred = bookmarks.list.iter().any(|b| b.path == path);
+        //
+        // F301:先解析再比 —— `~` 书签在主目录下要亮。命中的那条留着,
+        // 取消收藏要按它的**原始路径**删(传 cwd 的话 store 里找不到 `~`)。
+        let hit_mark = bookmarks.list.iter().find(|b| {
+            bookmark_target(column, &b.path, &state.cwd, bookmarks.home).as_deref()
+                == Some(path.as_str())
+        });
+        let starred = hit_mark.is_some();
         ui.add_enabled_ui(bookmarks.can_edit, |ui| {
             let hit = ui
                 .small_button(if starred { "★" } else { "☆" })
@@ -996,12 +1039,24 @@ pub fn show(
                 // 又不说为什么的按钮比没有更糟。
                 .on_disabled_hover_text("这个标签不来自已保存的会话,书签无处存放");
             if hit.clicked() {
-                action = Some(if starred {
-                    FileAction::BookmarkRemove { path: path.clone() }
-                } else {
-                    FileAction::BookmarkAdd {
-                        name: bookmark_default_name(&path),
-                        path: path.clone(),
+                action = Some(match hit_mark {
+                    Some(b) => FileAction::BookmarkRemove {
+                        path: b.path.clone(),
+                    },
+                    None => {
+                        // F301:正在主目录 → 存 `~`,换机器/换用户也指得对;
+                        // 子目录照旧存绝对路径(用户确认的取舍)。
+                        let at_home =
+                            column_home(column, bookmarks.home).as_deref() == Some(path.as_str());
+                        let saved = if at_home {
+                            "~".to_owned()
+                        } else {
+                            path.clone()
+                        };
+                        FileAction::BookmarkAdd {
+                            name: bookmark_default_name(&path),
+                            path: saved,
+                        }
                     }
                 });
             }
@@ -1056,9 +1111,15 @@ pub fn show(
                         item = item.on_hover_text(h);
                     }
                     if item.clicked() {
-                        action = Some(FileAction::Goto(mullion_ssh::sftp::RemotePath::from_bytes(
-                            b.path.as_bytes().to_vec(),
-                        )));
+                        // F301:`~` 书签交给 App 侧按这一栏的主目录解析
+                        // (`GotoInput` 两栏各有一条既有通路)。
+                        action = Some(if b.path.starts_with('~') {
+                            FileAction::GotoInput(b.path.clone())
+                        } else {
+                            FileAction::Goto(mullion_ssh::sftp::RemotePath::from_bytes(
+                                b.path.as_bytes().to_vec(),
+                            ))
+                        });
                         ui.close_menu();
                     }
                 }
@@ -2684,6 +2745,8 @@ pub fn sidebar(
     drop_in: usize,
     focus_click: &mut bool,
     rel_base: Option<&[u8]>,
+    // F301:远端栏的登录目录,原样转给远端栏的 `BookmarkView::home`。
+    remote_home: Option<&[u8]>,
     owner: Option<&OwnerTag>,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
@@ -2741,7 +2804,8 @@ pub fn sidebar(
                             // F187:同 `content()` 里本地栏那处 —— 全局收藏夹,
                             // 没有 `SessionId` 也能收。两处必须一起改。
                             can_edit: true,
-                            // F301 占位,本任务(F300)恒 `None`。
+                            // 本地栏的主目录走 `local::home_dir_cached()`,
+                            // 不经 `BookmarkView::home`(那个字段专给远端栏)。
                             home: None,
                         },
                         0,
@@ -2788,7 +2852,7 @@ pub fn sidebar(
                         BookmarkView {
                             list: &frame.bookmarks,
                             can_edit: frame.session_bound,
-                            home: None,
+                            home: remote_home,
                         },
                         drop_in,
                         &mut ui_state.files_cols,
@@ -2858,6 +2922,8 @@ pub fn content(
     panel_rect: &mut Option<egui::Rect>,
     focus_click: &mut bool,
     rel_base: Option<&[u8]>,
+    // F301:同 `sidebar` 的同名参数。
+    remote_home: Option<&[u8]>,
 ) -> (Option<FileAction>, Option<FileAction>) {
     let mut out = (None, None);
     let mut hit: Option<PanelColumn> = None;
@@ -2960,7 +3026,7 @@ pub fn content(
                     BookmarkView {
                         list: &frame.bookmarks,
                         can_edit: frame.session_bound,
-                        home: None,
+                        home: remote_home,
                     },
                     drop_in,
                     cols,
@@ -3418,7 +3484,7 @@ mod tests {
                 },
                 |ctx| {
                     out = content(
-                        ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                        ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                     )
                     .0;
                 },
@@ -4649,7 +4715,7 @@ mod tests {
             texts.clear();
             let out = ctx.run(egui::RawInput::default(), |ctx| {
                 content(
-                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
             for shape in out.shapes.iter() {
@@ -4758,7 +4824,7 @@ mod tests {
             let mut out = None;
             let o = ctx.run(raw(None), |ctx| {
                 out = Some(content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 ));
             });
             let _ = out;
@@ -5114,6 +5180,7 @@ mod tests {
                                 &mut frame,
                                 0,
                                 &mut false,
+                                None,
                                 None,
                                 owner,
                             );
@@ -5553,6 +5620,44 @@ mod tests {
         (action, out.shapes)
     }
 
+    /// 跑一帧远端栏,带 `home` 真值。与 `run_remote` 的唯一差别就是这个 ——
+    /// F301 的 ★ 判定/收藏/点击解析都要靠它,`run_remote` 恒传 `None` 测不出来。
+    fn run_remote_home(
+        ctx: &egui::Context,
+        state: &mut PaneState,
+        cols: &mut ColWidths,
+        bookmarks: &[mullion_store::Bookmark],
+        home: Option<&[u8]>,
+        input: egui::RawInput,
+    ) -> (Option<FileAction>, Vec<egui::epaint::ClippedShape>) {
+        let t = crate::theme::MULLION_DARK;
+        let mut action = None;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = show(
+                    ui,
+                    &t,
+                    "远端",
+                    1,
+                    PanelColumn::Remote,
+                    state,
+                    false,
+                    BookmarkView {
+                        list: bookmarks,
+                        can_edit: true,
+                        home,
+                    },
+                    0,
+                    cols,
+                    None,
+                    None,
+                    None,
+                );
+            });
+        });
+        (action, out.shapes)
+    }
+
     /// 跑一帧**本地**栏。与 `run_remote` 对称,只差栏别和标题。
     fn run_local(
         ctx: &egui::Context,
@@ -5838,6 +5943,121 @@ mod tests {
         state
     }
 
+    /// F301:书签路径 `~` 在主目录下亮实心 ★ —— 判定先解析再比。
+    ///
+    /// 自证会变红:把 ★ 判定改回 `b.path == path` 字面比较。
+    #[test]
+    fn a_tilde_bookmark_lights_the_star_when_we_are_at_home() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/home/brain");
+        let marks = vec![bm("~")];
+        let (_, shapes) = run_remote_home(
+            &ctx,
+            &mut state,
+            &mut ColWidths::default(),
+            &marks,
+            Some(b"/home/brain"),
+            egui::RawInput::default(),
+        );
+        assert!(
+            find_text_pos(&shapes, "★").is_some(),
+            "在主目录下 `~` 书签没点亮 ★"
+        );
+        // 反例:不在主目录时不亮 —— 否则「恒亮」也是绿的。
+        let mut elsewhere = ready_at(b"/var/log");
+        let (_, shapes) = run_remote_home(
+            &ctx,
+            &mut elsewhere,
+            &mut ColWidths::default(),
+            &marks,
+            Some(b"/home/brain"),
+            egui::RawInput::default(),
+        );
+        assert!(find_text_pos(&shapes, "☆").is_some(), "不在主目录也亮了 ★");
+    }
+
+    /// F301:在主目录点 ☆ 存成 `~`,子目录仍存绝对路径。
+    ///
+    /// 自证会变红:删掉「cwd == home → 存 `~`」那个分支。
+    #[test]
+    fn starring_home_saves_a_tilde_and_a_subdirectory_saves_an_absolute_path() {
+        for (cwd, want) in [
+            (&b"/home/brain"[..], "~"),
+            (&b"/home/brain/src"[..], "/home/brain/src"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut state = ready_at(cwd);
+            let (_, shapes) = run_remote_home(
+                &ctx,
+                &mut state,
+                &mut ColWidths::default(),
+                &[],
+                Some(b"/home/brain"),
+                egui::RawInput::default(),
+            );
+            let star = find_text_pos(&shapes, "☆").expect("该画 ☆");
+            let (a, _) = run_remote_home(
+                &ctx,
+                &mut state,
+                &mut ColWidths::default(),
+                &[],
+                Some(b"/home/brain"),
+                click_at(star),
+            );
+            match a {
+                Some(FileAction::BookmarkAdd { path, .. }) => assert_eq!(path, want),
+                other => panic!("点 ☆ 没发 BookmarkAdd:{other:?}"),
+            }
+        }
+    }
+
+    /// F301:取消收藏时传**那条书签的原始路径** `~`,不是解析后的绝对路径 ——
+    /// 否则 store 里按路径找不到,★ 永远取消不掉。
+    ///
+    /// 自证会变红:`BookmarkRemove { path: path.clone() }`(传 cwd)。
+    #[test]
+    fn unstarring_a_tilde_bookmark_removes_it_by_its_raw_path() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/home/brain");
+        let marks = vec![bm("~")];
+        let mut cols = ColWidths::default();
+        let (_, shapes) = run_remote_home(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &marks,
+            Some(b"/home/brain"),
+            egui::RawInput::default(),
+        );
+        let star = find_text_pos(&shapes, "★").expect("该画 ★");
+        let (a, _) = run_remote_home(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &marks,
+            Some(b"/home/brain"),
+            click_at(star),
+        );
+        assert_eq!(a, Some(FileAction::BookmarkRemove { path: "~".into() }));
+    }
+
+    /// F301:点下拉里的 `~` 书签发 `GotoInput("~")`,交给 App 侧按这一栏
+    /// 的主目录解析(两栏各一条既有通路);发 `Goto("~")` 的话会去列一个
+    /// 名叫 `~` 的相对目录。
+    ///
+    /// 自证会变红:把书签点击改回无条件 `FileAction::Goto(..)`。
+    #[test]
+    fn clicking_a_tilde_bookmark_goes_through_the_input_resolver() {
+        let ctx = egui::Context::default();
+        let mut state = ready_at(b"/var");
+        let mut cols = ColWidths::default();
+        let marks = vec![bm("~/src")];
+        let pos = open_bookmark_menu_and_find(&ctx, &mut state, &mut cols, &marks, "~/src")
+            .expect("下拉里该有 ~/src");
+        let (a, _) = run_remote(&ctx, &mut state, &mut cols, &marks, true, click_at(pos));
+        assert_eq!(a, Some(FileAction::GotoInput("~/src".into())));
+    }
+
     /// F139:当前目录没被收藏时路径条给的是空心 ☆,点它发出 `BookmarkAdd`,
     /// 默认名取路径末段(不是整条路径 —— 下拉里一长串没法认)。
     #[test]
@@ -5925,6 +6145,7 @@ mod tests {
                 .run(egui::RawInput::default(), |ctx| {
                     content(
                         ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                        None,
                     );
                 })
                 .shapes;
@@ -5971,6 +6192,7 @@ mod tests {
                 .run(egui::RawInput::default(), |ctx| {
                     content(
                         ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                        None,
                     );
                 })
                 .shapes;
@@ -5986,7 +6208,7 @@ mod tests {
         let mut out = (None, None);
         let _ = ctx.run(click_at(star), |ctx| {
             out = content(
-                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None, None,
             );
         });
         let (_remote_out, local_out) = out;
@@ -6289,13 +6511,13 @@ mod tests {
         // 「↑」的位置**必须取自同一帧**,否则比的是两套布局。
         let mut out = ctx.run(raw(None), |ctx| {
             content(
-                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None, None,
             );
         });
         for _ in 0..2 {
             out = ctx.run(raw(None), |ctx| {
                 content(
-                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
         }
@@ -6358,13 +6580,13 @@ mod tests {
         // 三帧,理由同上面那条:首帧是 sizing pass。
         let mut out = ctx.run(raw(None), |ctx| {
             content(
-                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None, None,
             );
         });
         for _ in 0..2 {
             out = ctx.run(raw(None), |ctx| {
                 content(
-                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, false, &mut frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
         }
@@ -6482,7 +6704,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
                 content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             })
         };
@@ -6536,7 +6758,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
                 content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             })
         };
@@ -6579,7 +6801,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
                 content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             })
         };
@@ -6626,7 +6848,7 @@ mod tests {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
                 acts = content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
             (acts, out)
@@ -6667,7 +6889,7 @@ mod tests {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
                 acts = content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
             (acts, out)
@@ -6708,7 +6930,7 @@ mod tests {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
                 acts = content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
             (acts, out)
@@ -6758,7 +6980,7 @@ mod tests {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
                 acts = content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
             (acts, out)
@@ -6810,7 +7032,7 @@ mod tests {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
                 acts = content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
             (acts, out)
@@ -6854,7 +7076,7 @@ mod tests {
         let mut render = |input: egui::RawInput, frame: &mut PanelFrame| {
             ctx.run(input, |ctx| {
                 content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             })
         };
@@ -6892,7 +7114,7 @@ mod tests {
             let mut acts = (None, None);
             let out = ctx.run(input, |ctx| {
                 acts = content(
-                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
             (acts, out)
@@ -7323,7 +7545,9 @@ mod tests {
                 }
                 let mut took = false;
                 let _ = ctx.run(input, |ctx| {
-                    content(ctx, &t, 7, true, frame, 0, cols, &mut None, &mut took, None);
+                    content(
+                        ctx, &t, 7, true, frame, 0, cols, &mut None, &mut took, None, None,
+                    );
                 });
                 took
             };
@@ -7394,7 +7618,9 @@ mod tests {
             }
             let mut took = false;
             let _ = ctx.run(input, |ctx| {
-                sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut took, None, None);
+                sidebar(
+                    ctx, &t, ui_state, 7, true, frame, 0, &mut took, None, None, None,
+                );
             });
             took
         };
@@ -7449,6 +7675,7 @@ mod tests {
                 |ctx| {
                     content(
                         ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                        None,
                     );
                 },
             );
@@ -7484,6 +7711,7 @@ mod tests {
                         &mut frame2,
                         0,
                         &mut false,
+                        None,
                         None,
                         None,
                     );
@@ -7567,7 +7795,9 @@ mod tests {
             |input: egui::RawInput, frame: &mut PanelFrame, ui_state: &mut crate::ui::UiState| {
                 let mut acts = (None, None);
                 let out = ctx.run(input, |ctx| {
-                    acts = sidebar(ctx, &t, ui_state, 7, true, frame, 0, &mut false, None, None);
+                    acts = sidebar(
+                        ctx, &t, ui_state, 7, true, frame, 0, &mut false, None, None, None,
+                    );
                 });
                 (acts, out)
             };
@@ -7652,6 +7882,7 @@ mod tests {
                             &mut frame,
                             0,
                             &mut false,
+                            None,
                             None,
                             None,
                         );
@@ -7760,7 +7991,8 @@ mod tests {
                     },
                     |ctx| {
                         content(
-                            ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                            ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false,
+                            None, None,
                         );
                     },
                 ));
@@ -7831,6 +8063,7 @@ mod tests {
                 |ctx| {
                     content(
                         ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                        None,
                     );
                 },
             ));
@@ -7854,7 +8087,7 @@ mod tests {
         };
         let mut out = Some(ctx.run(scroll_input, |ctx| {
             content(
-                ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None, None,
             );
         }));
         // 再跑两帧,让滚动状态稳定下来(smooth scroll 有插值)。
@@ -7867,6 +8100,7 @@ mod tests {
                 |ctx| {
                     content(
                         ctx, &t, 7, true, &mut frame, 0, &mut cols, &mut None, &mut false, None,
+                        None,
                     );
                 },
             ));
@@ -8445,7 +8679,7 @@ mod tests {
         let mut run = |input: egui::RawInput, frame: &mut PanelFrame| {
             let _ = ctx.run(input, |ctx| {
                 content(
-                    ctx, &t, 1, false, frame, 0, &mut cols, &mut None, &mut false, None,
+                    ctx, &t, 1, false, frame, 0, &mut cols, &mut None, &mut false, None, None,
                 );
             });
         };
