@@ -27,6 +27,7 @@ pub mod icon_res;
 pub mod input;
 pub mod localtime;
 pub mod logx;
+pub mod node_stats;
 pub mod pane;
 pub mod profile;
 pub mod project;
