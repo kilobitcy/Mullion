@@ -857,6 +857,39 @@ mod tests {
         );
     }
 
+    /// F299:「Aa」按钮切换大小写敏感,命中数跟着变。
+    ///
+    /// 自证会变红:把点击处理改成空操作(不翻转 `f.case`)——命中数会一直
+    /// 停在「不区分大小写」的 3 处,`f.case` 也永远是假。
+    #[test]
+    fn the_case_toggle_button_flips_case_sensitivity_and_the_hit_count_follows() {
+        let ctx = egui::Context::default();
+        let mut st = editor_with("Foo foo FOO");
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        run_editor(&ctx, &mut st, key(egui::Key::F, egui::Modifiers::COMMAND));
+        run_editor(&ctx, &mut st, egui::RawInput::default());
+        let (_, shapes) = run_editor(&ctx, &mut st, typed("foo"));
+        {
+            let f = st.as_ref().unwrap().find.as_ref().unwrap();
+            assert!(!f.case, "前提:默认不区分大小写");
+            assert_eq!(f.hits.len(), 3, "前提:不区分大小写应命中 3 处");
+        }
+        let pos = find_button_pos(&shapes, "Aa").expect("找不到「Aa」按钮");
+        let mut click = egui::RawInput::default();
+        for pressed in [true, false] {
+            click.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        run_editor(&ctx, &mut st, click);
+        let f = st.as_ref().unwrap().find.as_ref().unwrap();
+        assert!(f.case, "点了「Aa」,大小写敏感该打开");
+        assert_eq!(f.hits.len(), 1, "区分大小写之后只该命中同形的那一处");
+    }
+
     /// F299:当前匹配画一块高亮底(overlay)—— 查找框拿着焦点时 `TextEdit`
     /// 不画正文选区,不另画的话用户看不见跳到了哪。
     ///
