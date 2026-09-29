@@ -1,4 +1,4 @@
-//! F298:节点状态(内存 / 磁盘 / 出口国家)。命令、解析、调度、显示,全是纯函数;
+//! F298:节点状态(内存 / 磁盘 / 出口国家;F307 加 CPU)。命令、解析、调度、显示,全是纯函数;
 //! 唯一有状态的是 [`StatsCell`] —— 后台 task 写、事件循环读的共享格子,
 //! 同 `remote_bootstrap::BootstrapFlags` 的跨线程模式。
 
@@ -14,8 +14,13 @@ pub const WARN_PCT: u8 = 90;
 /// 内存 + 磁盘一次取完。输出两行:`mem <total_kb> <avail_kb>` / `disk <used_kb> <avail_kb>`。
 /// 没有 `/proc/meminfo`(非 Linux)时第一行不出现 → 内存那格省掉。
 /// `LC_ALL=C`:df 的表头/数字格式跟着 locale 走。
+///
+/// F307:再带一行 `/proc/stat` 的 `cpu` 累计计数。占用率要两次采样做差
+/// ([`cpu_pct`]),差分放在本地做 —— 在命令里 `sleep 1` 读两次的话,每次
+/// exec 都多占 1 秒 channel,高延迟链路上更久。
 pub fn sample_command() -> Vec<u8> {
     b"LC_ALL=C; export LC_ALL; \
+awk '/^cpu /{print \"cpu\",$2,$3,$4,$5,$6,$7,$8,$9; exit}' /proc/stat 2>/dev/null; \
 awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if(t>0&&a!=\"\")print \"mem\",t,a}' /proc/meminfo 2>/dev/null; \
 df -Pk / 2>/dev/null | awk 'NR==2{print \"disk\",$3,$4}'"
         .to_vec()
@@ -73,8 +78,53 @@ impl Usage {
     }
 }
 
+/// F307:`/proc/stat` 首行 `cpu` 的累计计数(jiffies),只留做差要的两个量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuTimes {
+    /// idle + iowait。iowait 是 CPU 在等盘,不是在算。
+    pub idle: u64,
+    /// user..steal 八项之和。guest 已含在 user 里,不重复加。
+    pub total: u64,
+}
+
+/// 两次累计计数之间的整机占用率(全部核合计,0~100)。计数没动或倒退
+/// (远端重启)时给不出数。
+pub fn cpu_pct(prev: CpuTimes, now: CpuTimes) -> Option<u8> {
+    let dt = now.total.checked_sub(prev.total)?;
+    let di = now.idle.checked_sub(prev.idle)?;
+    if dt == 0 {
+        return None;
+    }
+    let busy = dt.saturating_sub(di);
+    Some(((busy as f64 * 100.0 / dt as f64).round() as u64).min(100) as u8)
+}
+
+/// 从 [`sample_command`] 的输出里取 `cpu` 行。没有这行(非 Linux)= Absent。
+pub fn parse_cpu(stdout: &str) -> Reading<CpuTimes> {
+    let Some(line) = stdout.lines().find(|l| l.starts_with("cpu ")) else {
+        return Reading::Absent;
+    };
+    let f: Vec<Option<u64>> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|s| s.parse::<u64>().ok())
+        .collect();
+    // 前四项(user nice system idle)必须有;老内核没有的后几项按 0 算。
+    if f.len() < 4 || f.iter().any(Option::is_none) {
+        return Reading::Failed(format!("看不懂 /proc/stat:{line}"));
+    }
+    let f: Vec<u64> = f.into_iter().flatten().collect();
+    let at = |i: usize| f.get(i).copied().unwrap_or(0);
+    Reading::Ok(CpuTimes {
+        idle: at(3) + at(4),
+        total: f.iter().take(8).sum(),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Snapshot {
+    /// F307:占用率(%)。首个样本只当基准,`Unknown` 不出格。
+    pub cpu: Reading<u8>,
     pub mem: Reading<Usage>,
     pub disk: Reading<Usage>,
     pub country: Reading<String>,
@@ -161,6 +211,9 @@ struct Inner {
     sample_busy: bool,
     country_at: Option<Instant>,
     country_busy: bool,
+    /// F307:上一次采样的 CPU 累计计数,下一次拿它做差。`reset_schedule`
+    /// 清掉 —— 重连后的第一个样本不许跟断线前的计数做差。
+    cpu_base: Option<CpuTimes>,
     /// F298 复核:`reset_schedule` 每次都递增。换连接(重连/换节点)之后,
     /// 挂在旧连接上、迟迟才回来的探针带的是**旧世代号**——`finish_sample`/
     /// `finish_country` 拿它跟当前世代比,对不上就整条丢弃(不写快照、不清
@@ -233,6 +286,35 @@ impl StatsCell {
         g.snap.disk = disk;
         g.sample_busy = false;
     }
+    /// F307:这一轮采样里的 CPU 计数。世代校验同 [`Self::finish_sample`],
+    /// 旧世代的样本也不许当基准。**不碰 busy** —— 那归 `finish_sample`。
+    ///
+    /// 有基准就做差出数;没有(首样本 / 刚重置 / 刚失败过)只记基准、显示
+    /// 不动。失败与 Absent 都清基准:跨过失败间隔做差得出的不是「最近一个
+    /// 周期」的平均。
+    pub fn finish_cpu(&self, generation: u64, r: Reading<CpuTimes>) {
+        let mut g = self.lock();
+        if generation != g.generation {
+            return;
+        }
+        match r {
+            Reading::Ok(now) => {
+                if let Some(p) = g.cpu_base.and_then(|b| cpu_pct(b, now)) {
+                    g.snap.cpu = Reading::Ok(p);
+                }
+                g.cpu_base = Some(now);
+            }
+            Reading::Failed(why) => {
+                g.snap.cpu = Reading::Failed(why);
+                g.cpu_base = None;
+            }
+            Reading::Absent => {
+                g.snap.cpu = Reading::Absent;
+                g.cpu_base = None;
+            }
+            Reading::Unknown => {}
+        }
+    }
     /// 同 [`Self::finish_sample`] 的世代校验。
     pub fn finish_country(&self, generation: u64, c: Reading<String>) {
         let mut g = self.lock();
@@ -254,6 +336,7 @@ impl StatsCell {
         g.country_at = None;
         g.sample_busy = false;
         g.country_busy = false;
+        g.cpu_base = None;
         g.generation = g.generation.wrapping_add(1);
     }
 }
@@ -272,9 +355,24 @@ fn gib(kb: u64) -> String {
     format!("{:.1} GiB", kb as f64 / 1024.0 / 1024.0)
 }
 
-/// 快照 → 标题条上的几格(从左到右:内存、磁盘、国家)。`Unknown`/`Absent` 不出格。
+/// 快照 → 标题条上的几格(从左到右:CPU、内存、磁盘、国家)。`Unknown`/`Absent` 不出格。
 pub fn pieces(s: &Snapshot) -> Vec<Piece> {
     let mut out = Vec::new();
+    match &s.cpu {
+        Reading::Ok(p) => out.push(Piece {
+            text: format!("CPU {p}%"),
+            hover: "CPU 占用(最近一个采样周期的平均,全部核合计)".into(),
+            warn: *p >= WARN_PCT,
+            is_country: false,
+        }),
+        Reading::Failed(why) => out.push(Piece {
+            text: "CPU --".into(),
+            hover: why.clone(),
+            warn: false,
+            is_country: false,
+        }),
+        Reading::Unknown | Reading::Absent => {}
+    }
     let usage = |label: &str, r: &Reading<Usage>, out: &mut Vec<Piece>| match r {
         Reading::Ok(u) => out.push(Piece {
             text: format!("{label} {}%", u.pct()),
@@ -357,6 +455,7 @@ mod tests {
         assert_eq!(m, Reading::Absent);
         assert!(matches!(d, Reading::Ok(_)));
         assert!(pieces(&Snapshot {
+            cpu: Reading::Unknown,
             mem: m,
             disk: d,
             country: Reading::Unknown
@@ -643,5 +742,140 @@ mod tests {
             Reading::Ok("CN".into()),
             "stdout={out:?}"
         );
+    }
+
+    // ---- F307:CPU ----
+
+    fn cpu(idle: u64, total: u64) -> CpuTimes {
+        CpuTimes { idle, total }
+    }
+
+    /// `/proc/stat` 首行:user nice system idle iowait irq softirq steal。
+    /// iowait 算空闲(CPU 在等盘,不是在算);guest 已含在 user 里,不重复加。
+    /// 自证会变红:把 iowait 从 idle 里拿掉。
+    #[test]
+    fn the_cpu_line_counts_iowait_as_idle() {
+        let out = "cpu 10 20 30 400 40 5 5 0 7 0\nmem 8 4\ndisk 1 1\n";
+        assert_eq!(parse_cpu(out), Reading::Ok(cpu(440, 510)));
+    }
+
+    /// 没有 `/proc/stat`(非 Linux)→ Absent,不出格;有行但看不懂 → Failed。
+    /// 自证会变红:把缺行时的返回改成 `Failed`。
+    #[test]
+    fn no_proc_stat_means_cpu_is_absent_and_garbage_is_a_failure() {
+        assert_eq!(parse_cpu("disk 1 1\n"), Reading::Absent);
+        assert!(matches!(parse_cpu("cpu x y z w\n"), Reading::Failed(_)));
+    }
+
+    /// 占用率 = 1 − Δidle/Δtotal。计数没动 / 倒退(远端重启)给不出数。
+    /// 自证会变红:两处 `checked_sub` 都换成 `wrapping_sub`(倒退那条给出荒唐值)。
+    #[test]
+    fn usage_is_the_busy_share_of_the_interval_and_a_stalled_or_rewound_counter_gives_none() {
+        assert_eq!(cpu_pct(cpu(100, 200), cpu(170, 300)), Some(30));
+        assert_eq!(cpu_pct(cpu(100, 200), cpu(100, 300)), Some(100));
+        assert_eq!(cpu_pct(cpu(100, 200), cpu(100, 200)), None);
+        assert_eq!(cpu_pct(cpu(100, 200), cpu(10, 20)), None);
+    }
+
+    /// 首个样本没有基准 → 不出格(不闪 `--`);第二个样本起才有数。
+    /// 自证会变红:首样本时把 `snap.cpu` 写成 `Ok(0)`。
+    #[test]
+    fn the_first_sample_shows_no_cpu_and_the_second_one_does() {
+        let c = StatsCell::default();
+        let g = c.plan(Instant::now()).generation;
+        c.finish_cpu(g, Reading::Ok(cpu(100, 200)));
+        assert_eq!(c.snapshot().cpu, Reading::Unknown);
+        assert!(pieces(&c.snapshot())
+            .iter()
+            .all(|p| !p.text.starts_with("CPU")));
+        c.finish_cpu(g, Reading::Ok(cpu(170, 300)));
+        assert_eq!(c.snapshot().cpu, Reading::Ok(30));
+    }
+
+    /// 换连接(`reset_schedule`)之后基准作废:重连回来的第一个样本不能跟
+    /// 断线前那台机器的计数做差,旧数留着(不闪空),再下一个样本才更新。
+    /// 自证会变红:删掉 `reset_schedule` 里清基准那一句。
+    #[test]
+    fn a_reset_drops_the_cpu_baseline_so_two_machines_are_never_diffed() {
+        let c = StatsCell::default();
+        let g = c.plan(Instant::now()).generation;
+        c.finish_cpu(g, Reading::Ok(cpu(100, 200)));
+        c.finish_cpu(g, Reading::Ok(cpu(170, 300)));
+        c.reset_schedule();
+        let g = c.plan(Instant::now()).generation;
+        // 另一台机器的计数:与旧基准做差会得出 90%。
+        c.finish_cpu(g, Reading::Ok(cpu(180, 400)));
+        assert_eq!(c.snapshot().cpu, Reading::Ok(30), "旧数留着,不跟旧基准做差");
+        c.finish_cpu(g, Reading::Ok(cpu(270, 500)));
+        assert_eq!(c.snapshot().cpu, Reading::Ok(10));
+    }
+
+    /// 旧世代的 CPU 结果同 `finish_sample` 一样整条丢弃(也不许当基准)。
+    /// 自证会变红:删掉 `finish_cpu` 里的世代校验。
+    #[test]
+    fn a_late_cpu_result_from_before_a_reset_is_dropped() {
+        let c = StatsCell::default();
+        let old = c.plan(Instant::now()).generation;
+        c.reset_schedule();
+        let new = c.plan(Instant::now()).generation;
+        c.finish_cpu(old, Reading::Ok(cpu(100, 200)));
+        c.finish_cpu(new, Reading::Ok(cpu(170, 300)));
+        assert_eq!(
+            c.snapshot().cpu,
+            Reading::Unknown,
+            "旧世代的样本被当成了基准"
+        );
+    }
+
+    /// 采样失败 → 显示 `CPU --` 且基准作废(失败间隔里的差分不是 10 秒平均)。
+    /// 自证会变红:失败时不清基准。
+    #[test]
+    fn a_failed_sample_shows_dashes_and_restarts_the_baseline() {
+        let c = StatsCell::default();
+        let g = c.plan(Instant::now()).generation;
+        c.finish_cpu(g, Reading::Ok(cpu(100, 200)));
+        c.finish_cpu(g, Reading::Failed("采样超时".into()));
+        assert_eq!(pieces(&c.snapshot())[0].text, "CPU --");
+        c.finish_cpu(g, Reading::Ok(cpu(170, 300)));
+        assert!(
+            matches!(c.snapshot().cpu, Reading::Failed(_)),
+            "失败后首个样本只当基准"
+        );
+    }
+
+    /// CPU 排在最左,≥90% 标 warn。自证会变红:把 CPU 挪到内存之后。
+    #[test]
+    fn cpu_leads_the_segment_and_ninety_percent_warns() {
+        let s = Snapshot {
+            cpu: Reading::Ok(90),
+            mem: Reading::Ok(Usage {
+                used_kb: 43,
+                total_kb: 100,
+            }),
+            ..Default::default()
+        };
+        let p = pieces(&s);
+        assert_eq!(p[0].text, "CPU 90%");
+        assert!(p[0].warn);
+        assert_eq!(p[1].text, "内存 43%");
+        let s = Snapshot {
+            cpu: Reading::Ok(89),
+            ..Default::default()
+        };
+        assert!(!pieces(&s)[0].warn);
+    }
+
+    /// 采样命令真的带出 `cpu` 行,且解析得通(本机 `sh`,Linux 才有 /proc/stat)。
+    /// 自证会变红:从 `sample_command` 里删掉 /proc/stat 那段。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sample_command_emits_a_cpu_line_that_parses() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(String::from_utf8(sample_command()).unwrap())
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert!(matches!(parse_cpu(&out), Reading::Ok(_)), "stdout={out:?}");
     }
 }

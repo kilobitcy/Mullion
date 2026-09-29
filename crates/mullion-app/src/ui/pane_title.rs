@@ -1132,6 +1132,7 @@ mod tests {
     /// `pieces()` 已经排好。
     fn wide_stats() -> Vec<crate::node_stats::Piece> {
         crate::node_stats::pieces(&crate::node_stats::Snapshot {
+            cpu: crate::node_stats::Reading::Unknown,
             mem: crate::node_stats::Reading::Ok(crate::node_stats::Usage {
                 used_kb: 43,
                 total_kb: 100,

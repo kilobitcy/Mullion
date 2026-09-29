@@ -4338,25 +4338,38 @@ impl App {
                             crate::node_stats::EXEC_TIMEOUT,
                         )
                         .await;
-                        let (mem, disk) = match r {
-                            Ok(out) => crate::node_stats::parse_sample(&String::from_utf8_lossy(
-                                &out.stdout,
-                            )),
+                        let (cpu, (mem, disk)) = match r {
+                            Ok(out) => {
+                                let out = String::from_utf8_lossy(&out.stdout);
+                                (
+                                    crate::node_stats::parse_cpu(&out),
+                                    crate::node_stats::parse_sample(&out),
+                                )
+                            }
                             Err(mullion_ssh::exec::ExecError::Timeout) => {
                                 let why = "采样超时".to_string();
                                 (
                                     crate::node_stats::Reading::Failed(why.clone()),
-                                    crate::node_stats::Reading::Failed(why),
+                                    (
+                                        crate::node_stats::Reading::Failed(why.clone()),
+                                        crate::node_stats::Reading::Failed(why),
+                                    ),
                                 )
                             }
                             Err(e) => {
                                 let why = format!("采样失败:{e}");
                                 (
                                     crate::node_stats::Reading::Failed(why.clone()),
-                                    crate::node_stats::Reading::Failed(why),
+                                    (
+                                        crate::node_stats::Reading::Failed(why.clone()),
+                                        crate::node_stats::Reading::Failed(why),
+                                    ),
                                 )
                             }
                         };
+                        // F307:先 CPU 后 sample —— `finish_sample` 清 busy,
+                        // 反过来的话下一轮可能在 CPU 还没落账时就被放行。
+                        cell.finish_cpu(generation, cpu);
                         cell.finish_sample(generation, mem, disk);
                         let _ = proxy.send_event(UserEvent::NodeStatsUpdated);
                     });
@@ -22137,6 +22150,28 @@ mod tests {
         assert!(
             body.contains("self.node_stats_wake("),
             "定时唤醒没并进节点状态采样 —— 空闲时采样只能靠别的事件顺带唤醒"
+        );
+    }
+
+    /// **接线守护 / F307**:采样结果里的 CPU 计数必须真的落进格子,且排在
+    /// `finish_sample`(清 busy)之前。`node_stats` 的单测全是直接喂
+    /// `finish_cpu`,漏接这一句它们照样全绿,而标题条上 CPU 永远不出现。
+    ///
+    /// 自证会变红:删掉 `cell.finish_cpu(generation, cpu);`,或挪到
+    /// `finish_sample` 之后。
+    #[test]
+    fn the_sampled_cpu_counters_reach_the_cell_before_busy_is_cleared() {
+        let body = body_of(prod_src(), "fn tick_node_stats(");
+        let cpu = body
+            .find("cell.finish_cpu(generation, cpu);")
+            .expect("采样结果里的 CPU 没落进格子(F307)");
+        let sample = body
+            .find("cell.finish_sample(generation, mem, disk);")
+            .expect("finish_sample 的锚点失效了");
+        assert!(cpu < sample, "finish_cpu 必须在清 busy 之前");
+        assert!(
+            body.contains("crate::node_stats::parse_cpu(&out)"),
+            "CPU 计数没从采样输出里解析(F307)"
         );
     }
 
