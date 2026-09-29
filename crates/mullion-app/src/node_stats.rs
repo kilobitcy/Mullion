@@ -23,10 +23,26 @@ df -Pk / 2>/dev/null | awk 'NR==2{print \"disk\",$3,$4}'"
 
 /// 出口国家。curl 优先、没有就 wget、都没有退出 127。
 /// `-f`:HTTP 错误(限流 429)给非零退出码,不把错误页当国家码。
+///
+/// F302:先在**交互** bash(`bash -ic`)里跑,取「用户自己在终端里跑」的那个
+/// 结果。exec 起的是非交互 shell,而代理变量常写在 `.bashrc` 非交互
+/// `return` 之后 —— 直接跑的话 curl 不走代理,报的是节点本机出口(实报:
+/// 标题条 `CN`、用户 bash 里 `JP`)。不用 `-l`:登录 shell 只读 profile 系,
+/// `.bash_profile` 没转发 `.bashrc` 时照样漏。
+/// - 只取 stdout 最后一个非空行、且必须是两位大写字母:`.bashrc` 里的
+///   `echo` 会混进 stdout。
+/// - 交互路径拿不到合法国家码(没 bash、`.bashrc` 里 `exec tmux` 把 shell
+///   换掉、代理不通)时退回非交互直跑,退出码语义不变。
+/// - `unset HISTFILE`:不往用户的 `~/.bash_history` 里写东西。
 pub fn country_command() -> Vec<u8> {
-    b"if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 https://ipinfo.io/country; \
+    b"q='if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 5 https://ipinfo.io/country; \
 elif command -v wget >/dev/null 2>&1; then wget -qO- -T 5 https://ipinfo.io/country; \
-else exit 127; fi"
+else exit 127; fi'; \
+if command -v bash >/dev/null 2>&1; then \
+c=$(bash -ic \"unset HISTFILE; $q\" </dev/null 2>/dev/null | awk 'NF{l=$0} END{print l}'); \
+case $c in [A-Z][A-Z]) printf '%s' \"$c\"; exit 0;; esac; \
+fi; \
+eval \"$q\""
         .to_vec()
 }
 
@@ -556,6 +572,76 @@ mod tests {
         assert!(
             stats_fit(300.0, 200.0, 100.0),
             "标题本身短于保底时按标题宽算"
+        );
+    }
+
+    /// 在本机 `sh` 里真跑一遍 `country_command()`:假 HOME 放一份 `.bashrc`,
+    /// 假 `curl` 按有没有 `https_proxy` 回答 `JP` / `CN` —— 复刻 v0.1.119 实报
+    /// 「标题条 CN、自己 bash 里 JP」(代理写在 `.bashrc` 非交互 `return` 之后)。
+    #[cfg(unix)]
+    fn run_country(bashrc: &str) -> (Option<i32>, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let curl = bin.join("curl");
+        std::fs::write(
+            &curl,
+            "#!/bin/sh\nif [ -n \"$https_proxy\" ]; then printf JP; else printf CN; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(home.path().join(".bashrc"), bashrc).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(String::from_utf8(country_command()).unwrap())
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    }
+
+    /// F302:代理写在 `.bashrc` 的非交互 `return` 之后,取到的是**走代理**的
+    /// 国家 —— 与用户在自己 bash 里跑的一致。
+    ///
+    /// 自证会变红:把 `country_command` 改回直接跑 curl(不经 `bash -ic`)。
+    #[cfg(unix)]
+    #[test]
+    fn the_country_sees_the_proxy_exported_after_the_non_interactive_return_in_bashrc() {
+        let (code, out) = run_country(
+            "case $- in *i*) ;; *) return;; esac\n\
+             echo 欢迎回来\n\
+             export https_proxy=http://127.0.0.1:7890\n",
+        );
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            parse_country(Some(0), &out),
+            Reading::Ok("JP".into()),
+            "stdout={out:?}"
+        );
+    }
+
+    /// F302:`.bashrc` 里 `exec tmux` 一类把交互 shell 整个换掉(没 tty 时
+    /// tmux 立刻报错退出),curl 根本没跑 —— 必须退回非交互再取一次,而不是
+    /// 每 5 分钟都 `--`。
+    ///
+    /// 自证会变红:删掉命令里交互路径失败后的回退那一段。
+    #[cfg(unix)]
+    #[test]
+    fn a_bashrc_that_replaces_the_shell_falls_back_to_the_plain_command() {
+        let (code, out) = run_country("exec false\n");
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            parse_country(Some(0), &out),
+            Reading::Ok("CN".into()),
+            "stdout={out:?}"
         );
     }
 }
