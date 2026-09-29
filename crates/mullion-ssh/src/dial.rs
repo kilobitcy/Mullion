@@ -125,6 +125,34 @@ async fn resolve_one(host: &str, port: u16) -> Result<std::net::SocketAddr, Conn
         .ok_or_else(|| ConnectError::DnsResolution(format!("{host} 无解析结果")))
 }
 
+/// F304:只探**本机第一条 TCP** 在 `within` 内连不连得通(解析 + 建连合算),
+/// 通了立刻断开。不握手、不认证 —— 调用方拿它区分「这条路线此刻根本够不着」
+/// (换下一条)和「够得着但后面出错」(报错,不换):后者交给正式拨号去炸。
+///
+/// 有跳时量的是第一跳(代理 / 跳板机),与 [`dial`] 同一个 [`first_tcp_target`]。
+/// 失败同样经 `blame_first_hop` 点名是代理还是跳板。
+pub async fn probe_first_hop(
+    hops: &[Hop],
+    host: &str,
+    port: u16,
+    within: std::time::Duration,
+) -> Result<(), ConnectError> {
+    let (first_host, first_port) = first_tcp_target(hops, host, port);
+    let reach = async {
+        let addr = resolve_one(&first_host, first_port).await?;
+        TcpStream::connect(addr).await.map_err(classify_tcp)?;
+        Ok(())
+    };
+    let r = match tokio::time::timeout(within, reach).await {
+        Ok(r) => r,
+        Err(_) => Err(ConnectError::Io(format!(
+            "{first_host}:{first_port} 在 {} 秒内没有连通",
+            within.as_secs_f32()
+        ))),
+    };
+    r.map_err(|e| blame_first_hop(hops, e))
+}
+
 /// 在当前流上跨过一跳,返回通向 `next_host:next_port` 的新流。
 async fn advance(
     stream: DialStream,
@@ -354,5 +382,55 @@ mod tests {
             msg,
             "连不上代理 127.0.0.1:1080:Connection refused (os error 111) —— 检查代理是否在跑/地址端口是否写对"
         );
+    }
+
+    /// F304:有人在听 → 通;没人在听 → 立刻失败(拒绝),不等满预算。
+    #[tokio::test]
+    async fn probing_a_listening_port_succeeds_and_a_closed_one_fails_fast() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = l.local_addr().unwrap().port();
+        let within = std::time::Duration::from_secs(3);
+        assert!(probe_first_hop(&[], "127.0.0.1", open, within)
+            .await
+            .is_ok());
+        drop(l);
+        let t0 = std::time::Instant::now();
+        let e = probe_first_hop(&[], "127.0.0.1", open, within)
+            .await
+            .expect_err("端口已关,不该探通");
+        assert!(matches!(e, ConnectError::ConnectionRefused(_)), "{e:?}");
+        assert!(t0.elapsed() < within, "拒绝应当立刻返回");
+    }
+
+    /// F304:够不着的地址在预算内返回失败,**不等系统级 TCP 超时**(几十秒)。
+    /// 用 TEST-NET-1(RFC 5737,保证不可路由):有的环境丢包(走超时分支),
+    /// 有的立刻回不可达 —— 两种都必须在预算附近返回。
+    ///
+    /// 自证会变红:去掉 `tokio::time::timeout` 那层(黑洞环境下挂几十秒)。
+    #[tokio::test]
+    async fn an_unreachable_first_hop_gives_up_within_the_budget() {
+        let within = std::time::Duration::from_millis(500);
+        let t0 = std::time::Instant::now();
+        let r = probe_first_hop(&[], "192.0.2.1", 22, within).await;
+        assert!(r.is_err());
+        assert!(t0.elapsed() < within + std::time::Duration::from_secs(1));
+    }
+
+    /// F304:有跳时探的是**第一跳**,失败点名那一跳,不点名目标。
+    #[tokio::test]
+    async fn with_a_jump_the_probe_targets_and_blames_the_first_hop() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let hops = vec![Hop::SshJump {
+            host: "127.0.0.1".into(),
+            port,
+            user: "ops".into(),
+            auth: AuthMethod::Agent,
+        }];
+        let e = probe_first_hop(&hops, "10.9.9.9", 22, std::time::Duration::from_secs(3))
+            .await
+            .expect_err("跳板端口已关");
+        assert!(matches!(e, ConnectError::JumpFailed { .. }), "{e:?}");
     }
 }

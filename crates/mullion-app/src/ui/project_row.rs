@@ -124,6 +124,9 @@ pub struct Row<'a> {
     /// F297:这个项目正在拨号。右侧时间列换成 spinner +「连接中…」,
     /// 不画「正在跑」标签(避免抢地方)、也不接归档 hover。
     pub dialing: bool,
+    /// F304:打开时按什么顺序试节点,由调用方用 [`crate::project::candidates`]
+    /// 算好传进来。副标题写第一条的名字;不止一条时,悬停副标题列出全序。
+    pub candidates: &'a [mullion_store::SessionId],
 }
 
 /// F297:「转圈 + 连接中…」,贴着行右边画。返回它占用的宽度(从行右边缘
@@ -164,11 +167,16 @@ pub(crate) fn paint_dialing(ui: &egui::Ui, rect: egui::Rect, t: &Theme) -> f32 {
 /// 不写「(未知)」一类占位:那句话对用户没有任何可操作性,而目录本身已经足以
 /// 认出这是哪个活。
 ///
-/// 选节点走 [`crate::project::node_for`] —— 和 `plan_open` 真拨号时用的是**同一
-/// 个函数**。各写一份的话,列表上写着 A、点下去连的是 B。
-pub fn subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
-    let name = crate::project::node_for(p)
-        .and_then(|id| sessions.iter().find(|s| s.id == id))
+/// `candidates` 由调用方走 [`crate::project::candidates`] 算 —— 和 `plan_open`
+/// 真拨号时用的是**同一个函数**。各写一份的话,列表上写着 A、点下去连的是 B。
+pub fn subtitle(
+    p: &ProjectRecord,
+    sessions: &[SessionRecord],
+    candidates: &[mullion_store::SessionId],
+) -> String {
+    let name = candidates
+        .first()
+        .and_then(|id| sessions.iter().find(|s| s.id == *id))
         .map(|s| s.identity.name.as_str());
     match name {
         Some(n) => format!("{} · {}", p.dir, n),
@@ -187,8 +195,35 @@ pub fn subtitle(p: &ProjectRecord, sessions: &[SessionRecord]) -> String {
 ///
 /// **只在「只有隐藏字段命中」时换**:普通搜索(打项目名)的行不该平白变样,
 /// 目录和节点名比一段说明更能认出这是哪个活。
-pub fn subtitle_for_query(p: &ProjectRecord, sessions: &[SessionRecord], query: &str) -> String {
-    crate::project::hidden_hit_snippet(p, sessions, query).unwrap_or_else(|| subtitle(p, sessions))
+pub fn subtitle_for_query(
+    p: &ProjectRecord,
+    sessions: &[SessionRecord],
+    candidates: &[mullion_store::SessionId],
+    query: &str,
+) -> String {
+    crate::project::hidden_hit_snippet(p, sessions, query)
+        .unwrap_or_else(|| subtitle(p, sessions, candidates))
+}
+
+/// F304:副标题悬停时的提示 —— 不止一条节点时才有,写明试的先后。
+///
+/// 解析不出名字的节点(被别的实例删了)跳过,不写占位。
+pub fn candidates_hover_text(
+    sessions: &[SessionRecord],
+    candidates: &[mullion_store::SessionId],
+) -> Option<String> {
+    if candidates.len() < 2 {
+        return None;
+    }
+    let names: Vec<&str> = candidates
+        .iter()
+        .filter_map(|id| sessions.iter().find(|s| s.id == *id))
+        .map(|s| s.identity.name.as_str())
+        .collect();
+    Some(format!(
+        "依次尝试:{}\n直连优先;前一条 3 秒连不上才换下一条",
+        names.join(" → ")
+    ))
 }
 
 /// 行尾那一列时间。
@@ -435,13 +470,31 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     crate::ui::session_manager::list::paint_highlighted(
         p,
         egui::pos2(text_left, rect.top() + SUB_TOP),
-        &subtitle_for_query(row.project, row.sessions, row.query),
+        &subtitle_for_query(row.project, row.sessions, row.candidates, row.query),
         row.query,
         egui::FontId::proportional(SUB_SIZE),
         theme::c32(t.fg_muted),
         t,
         text_avail,
     );
+    // F304:节点先后挂在副标题这一条上 —— 整行 hover 已经给了灯、时间列给了
+    // 归档提示,同一个理由:热区只圈用户视线真正落的那几个字。
+    let sub_rect = egui::Rect::from_min_size(
+        egui::pos2(text_left, rect.top() + SUB_TOP),
+        egui::vec2(text_avail, SUB_SIZE + 4.0),
+    );
+    if resp.hovered()
+        && ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|q| sub_rect.contains(q))
+    {
+        if let Some(tip) = candidates_hover_text(row.sessions, row.candidates) {
+            egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), id.with("nodes"), |ui| {
+                ui.label(tip);
+            });
+        }
+    }
 
     resp
 }
@@ -508,7 +561,7 @@ mod tests {
     fn a_row_names_both_the_directory_and_the_node_it_will_dial() {
         let s = vec![sess(7, "web01")];
         assert_eq!(
-            subtitle(&proj(1, "接口", "/srv/api", None), &s),
+            subtitle(&proj(1, "接口", "/srv/api", None), &s, &[SessionId(7)]),
             "/srv/api · web01"
         );
     }
@@ -517,7 +570,7 @@ mod tests {
     #[test]
     fn a_row_whose_node_is_gone_still_says_which_directory_it_is() {
         assert_eq!(
-            subtitle(&proj(1, "接口", "/srv/api", None), &[]),
+            subtitle(&proj(1, "接口", "/srv/api", None), &[], &[SessionId(7)]),
             "/srv/api"
         );
     }
@@ -644,6 +697,7 @@ mod tests {
             icon: None,
             icon_bg: None,
             dialing: false,
+            candidates: &[SessionId(7)],
         };
         // 这一行**应该**占住的地方:光标位置 + 整条可用宽 + `ROW_H`。
         let mut slot = egui::Rect::NOTHING;
@@ -718,6 +772,7 @@ mod tests {
                                     icon: None,
                                     icon_bg: None,
                                     dialing: false,
+                                    candidates: &[SessionId(7)],
                                 },
                             );
                         });
@@ -756,16 +811,16 @@ mod tests {
         let mut p = proj(1, "proj-7", "/srv/api", None);
         p.note = "每天凌晨跑爬虫".into();
         assert!(
-            subtitle_for_query(&p, &ss, "爬虫").contains("爬虫"),
+            subtitle_for_query(&p, &ss, &[SessionId(7)], "爬虫").contains("爬虫"),
             "只命中说明,副标题该换成说明片段"
         );
         assert_eq!(
-            subtitle_for_query(&p, &ss, "web01"),
+            subtitle_for_query(&p, &ss, &[SessionId(7)], "web01"),
             "/srv/api · web01",
             "命中的是节点名,副标题不该变样"
         );
         assert_eq!(
-            subtitle_for_query(&p, &ss, ""),
+            subtitle_for_query(&p, &ss, &[SessionId(7)], ""),
             "/srv/api · web01",
             "没在搜索时副标题不该变样"
         );
@@ -820,6 +875,7 @@ mod tests {
                                     icon: None,
                                     icon_bg: None,
                                     dialing: false,
+                                    candidates: &[SessionId(7)],
                                 },
                             );
                         });
@@ -949,6 +1005,7 @@ mod tests {
                                     icon,
                                     icon_bg: None,
                                     dialing: false,
+                                    candidates: &[SessionId(7)],
                                 },
                             );
                         });
@@ -1183,6 +1240,7 @@ mod tests {
                                         icon: None,
                                         icon_bg: None,
                                         dialing: false,
+                                        candidates: &[SessionId(7)],
                                     },
                                 );
                             });
@@ -1214,5 +1272,24 @@ mod tests {
             })
             .expect("没找到名称那段文字");
         name_ts.galley.rows.iter().map(|r| r.glyphs.len()).sum()
+    }
+    /// F304:副标题写的是**头一个候选**,不是首选 —— 首选是跳板那条时,直连
+    /// 那条排第一,副标题跟着它。
+    ///
+    /// 自证会变红:`subtitle` 里改回 `crate::project::node_for` 按首选取名。
+    #[test]
+    fn the_subtitle_names_the_first_candidate_and_the_hover_lists_the_whole_order() {
+        let ss = vec![sess(7, "web01-跳板"), sess(9, "web01")];
+        let mut p = proj(1, "接口", "/srv/api", None);
+        p.nodes = vec![SessionId(7), SessionId(9)];
+        p.preferred = Some(SessionId(7));
+        let order = [SessionId(9), SessionId(7)];
+        assert_eq!(subtitle(&p, &ss, &order), "/srv/api · web01");
+        let tip = candidates_hover_text(&ss, &order).expect("两条节点该有悬停提示");
+        assert!(tip.contains("web01 → web01-跳板"), "{tip}");
+        assert!(
+            candidates_hover_text(&ss, &order[..1]).is_none(),
+            "只有一条节点时没有先后可说"
+        );
     }
 }

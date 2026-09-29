@@ -187,6 +187,9 @@ pub fn show(
                                         selected: false,
                                         now,
                                         list: "pick",
+                                        candidates: &crate::project::candidates(p, |id| {
+                                            appearance.is_routed(id)
+                                        }),
                                         icon: crate::project::icon_for(p, appearance),
                                         icon_bg: crate::project::icon_bg(
                                             p,

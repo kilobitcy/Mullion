@@ -68,6 +68,10 @@ pub fn should_paint(a: &Appearance, target: ColorTarget) -> Option<egui::Color32
 #[derive(Debug, Default)]
 pub struct AppearanceCache {
     map: HashMap<SessionId, Appearance>,
+    /// F304:解析后**走跳板或代理**的会话。不进 `Appearance`(绘制层不该看见
+    /// 网络配置);挂在这张表上只因为这里是每条会话跑一遍继承解析、按配置
+    /// 变更重建的唯一缓存 —— 启动页每帧给项目排节点要读它,不能每帧现解析。
+    routed: std::collections::HashSet<SessionId>,
 }
 
 impl AppearanceCache {
@@ -84,6 +88,7 @@ impl AppearanceCache {
     /// 重复了一遍——上面那两条测试就是防这份重复漂移的。
     pub fn rebuild(&mut self, sessions: &[SessionRecord], groups: &[GroupRecord]) {
         self.map.clear();
+        self.routed.clear();
         for rec in sessions {
             // 分组不存在(悬空 group_id)时只用会话自己这一层,跟
             // `group_manager` 把这类会话归进「未分组」是同一个姿态:一条坏
@@ -96,6 +101,10 @@ impl AppearanceCache {
                 Some(g) => mullion_store::resolve(&[rec as &dyn PrefsLayer, g as &dyn PrefsLayer]),
                 None => mullion_store::resolve(&[rec as &dyn PrefsLayer]),
             };
+            let proxied = !matches!(cfg.proxy, None | Some(mullion_store::ProxyChoice::Direct));
+            if proxied || !cfg.jump.is_empty() {
+                self.routed.insert(rec.id);
+            }
             self.map.insert(
                 rec.id,
                 Appearance {
@@ -104,6 +113,11 @@ impl AppearanceCache {
                 },
             );
         }
+    }
+
+    /// F304:这条会话是不是经跳板或代理才到得了。缓存里没有 → `false`。
+    pub fn is_routed(&self, id: SessionId) -> bool {
+        self.routed.contains(&id)
     }
 
     /// 取一条会话的已解析外观。缓存里没有 → `None`(调用方按「没设外观」处理)。
@@ -500,6 +514,37 @@ mod tests {
                 apply_to: vec![ColorTarget::ListItem],
             }),
         }
+    }
+
+    /// F304:跳板、代理都按**继承解析后**的结果算;显式 `Direct` / 显式空链
+    /// 盖掉分组的设置,算直连。
+    ///
+    /// 自证会变红:`rebuild` 里改成只看 `rec.network`(不走继承)。
+    #[test]
+    fn routed_follows_the_resolved_jump_and_proxy_including_group_inheritance() {
+        use mullion_store::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
+        let gid = GroupId(7);
+        let socks = ProxyChoice::Socks5(ProxyEndpoint {
+            host: "127.0.0.1".into(),
+            port: 7891,
+            user: None,
+        });
+        let mut direct = rec(1, None, AppearancePrefs::default());
+        direct.network = NetworkPrefs::default();
+        let mut jumped = rec(2, None, AppearancePrefs::default());
+        jumped.network.jump = Some(vec![JumpRef(SessionId(1))]);
+        let inherits = rec(3, Some(gid), AppearancePrefs::default());
+        let mut opts_out = rec(4, Some(gid), AppearancePrefs::default());
+        opts_out.network.proxy = Some(ProxyChoice::Direct);
+        let mut group = group_with(gid, AppearancePrefs::default());
+        group.network.proxy = Some(socks);
+        let mut c = AppearanceCache::default();
+        c.rebuild(&[direct, jumped, inherits, opts_out], &[group]);
+        assert!(!c.is_routed(SessionId(1)), "什么都没设 = 直连");
+        assert!(c.is_routed(SessionId(2)), "自己配了跳板");
+        assert!(c.is_routed(SessionId(3)), "从分组继承了代理");
+        assert!(!c.is_routed(SessionId(4)), "显式 Direct 盖掉分组代理");
+        assert!(!c.is_routed(SessionId(99)), "缓存里没有的按直连");
     }
 
     /// 会话自己设了色就用自己的。

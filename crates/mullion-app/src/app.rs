@@ -145,6 +145,14 @@ pub enum UserEvent {
         pane: PaneId,
         msg: String,
     },
+    /// F304:打开项目前的节点探测结束。`node` 是要拨的那条;`skipped` 是排在
+    /// 它前面、第一跳没探通的节点(「名字(原因)」),空 = 头一条就通。
+    ProjectNodePicked {
+        project: mullion_store::ProjectId,
+        target: ProjectTarget,
+        node: mullion_store::SessionId,
+        skipped: Vec<String>,
+    },
     /// F128:一次断线重连拨通了。**跟 `PaneRehosted` 分开**:那条的语义是
     /// 「把 pane 改挂到另一台机器」(要重建 emulator),这条是「同一台机器
     /// 换一条 channel」(必须保留 emulator)。挤在一起只能靠运行时标志判别,
@@ -720,6 +728,20 @@ fn finish_attach_check(
     // D4:挂在这块 pane 上,**不弹窗** —— 多块 pane 都失败时会连弹好几次。
     p.notice = Some(format!("当初的会话 {name} 已不存在"));
     true
+}
+
+/// F304:打开项目的节点探测预算 —— 第一跳 TCP 这么久还没通,就换下一条。
+/// 用户拍板的数:在家连公司局域网 IP 的失败形态就是建连没回音,3 秒足以分辨;
+/// 跳板链路慢慢在后面的握手上,不在这一跳。
+const PROJECT_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// F304:打开项目的落点,在探测**之前**定死(理由见 `App::dial_project`)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProjectTarget {
+    /// 活动标签不是终端 —— 开新标签(F225①,launcher 恒走这一支)。
+    NewTab,
+    /// 把这个标签里的这块 pane 换挂过去。
+    Pane { generation: u64, pane: PaneId },
 }
 
 /// F188:这次拨号是「用户点标题条换节点」还是「F162 恢复现场的首次挂载」。
@@ -2521,6 +2543,10 @@ pub struct App {
     /// 用 `Option` 的话后发的会把先发的元信息顶掉 —— 现象是换好之后标题条
     /// 上写着另一台机器的名字。按 `(generation, pane)` 取走。
     pending_rehost: Vec<PendingRehost>,
+    /// F304:正在探节点的项目。启动页据此转圈(探测期间还没发票,
+    /// `dialing_from` 看不见它)。`ProjectNodePicked` 抵达时摘掉 —— 探测
+    /// 任务必发且只发一次那个事件(见 `spawn_project_probe`)。
+    probing_projects: Vec<mullion_store::ProjectId>,
     /// F162:恢复途中还要拨向**别的机器**的那些叶子。一条接一条,不并发
     /// (D10:并发会同时弹好几个密码框 / 主机指纹确认)。
     /// 三元组 =(标签世代, 那块 pane, 目标会话)。
@@ -3244,6 +3270,7 @@ impl App {
             probe_epoch: 0,
             probe_task: None,
             pending_rehost: Vec::new(),
+            probing_projects: Vec::new(),
             restore_dial: std::collections::VecDeque::new(),
             restore_dial_busy: false,
             reconnecting: Vec::new(),
@@ -10842,17 +10869,19 @@ impl App {
         };
         let ask = crate::ui::project_manager::OpenAsk {
             project: id,
-            node: mullion_store::SessionId(0),
+            nodes: Vec::new(),
             pane,
             reasons: Vec::new(),
         };
-        match crate::project::plan_open(&p, risk) {
-            crate::project::OpenStep::Go(node) => {
-                self.ui.project_open_go = Some(crate::ui::project_manager::OpenAsk { node, ..ask });
+        let appearance = &self.appearance;
+        match crate::project::plan_open(&p, risk, |n| appearance.is_routed(n)) {
+            crate::project::OpenStep::Go(nodes) => {
+                self.ui.project_open_go =
+                    Some(crate::ui::project_manager::OpenAsk { nodes, ..ask });
             }
-            crate::project::OpenStep::Ask(node, reasons) => {
+            crate::project::OpenStep::Ask(nodes, reasons) => {
                 self.ui.project_open_confirm = Some(crate::ui::project_manager::OpenAsk {
-                    node,
+                    nodes,
                     reasons,
                     ..ask
                 });
@@ -10865,9 +10894,14 @@ impl App {
 
     /// F223 第二段:真正把目标 pane 挂到项目节点上。
     ///
-    /// `ask.node` 是**第一段就定死的**,这里不重新算 —— 确认框开着的那段时间
+    /// `ask.nodes` 是**第一段就定死的**,这里不重新算 —— 确认框开着的那段时间
     /// 里配置完全可能变了(F189 别的实例、或用户自己),重算等于用户确认的是
     /// A、实际连的是 B。
+    ///
+    /// F304:不止一条候选时先探(`spawn_project_probe`),探完经
+    /// `UserEvent::ProjectNodePicked` 回到 `dial_project_on`。**落点(新标签
+    /// 还是哪块 pane)在这里、探之前定死** —— 探测最长 3 秒一条,这期间用户
+    /// 完全可能切到别的标签,事后再取活动标签会挂错地方。
     fn dial_project(&mut self, ask: &crate::ui::project_manager::OpenAsk) {
         let Some(p) = self
             .store
@@ -10877,8 +10911,8 @@ impl App {
             self.ui.set_error("这个项目已经不在了".to_string());
             return;
         };
-        // F235:记一笔访问时间。**在这里、在任何分支之前** —— 下面那条开新
-        // 标签的支线是 early return,记在它后面的话从 launcher 点开的项目一条
+        // F235:记一笔访问时间。**在这里、在任何分支之前** —— 下面开新标签
+        // 那条支线是 early return,记在它后面的话从 launcher 点开的项目一条
         // 都不会记,而 launcher 正是主入口。
         //
         // 为什么不只靠 F224 的上报跃迁:那条链路是「pane 上报远端 tmux 名 →
@@ -10903,14 +10937,147 @@ impl App {
                 log::debug!(target: "mullion", "项目访问时间落盘失败: {e}");
             }
         }
-        let Some((g, focus)) = self.active_ws().map(|ws| (ws.generation(), ws.focus())) else {
-            // F225①:活动标签不是终端(launcher 态一块 pane 都没有,或当前是
-            // 文件标签)—— **开一个新标签**,而不是报错。launcher 上那份项目
-            // 列表正是本功能的主入口,那里恒走这一支。
-            self.open_project_in_new_tab(&p, ask.node);
+        // F225①:活动标签不是终端(launcher 态一块 pane 都没有,或当前是
+        // 文件标签)—— **开一个新标签**,而不是报错。launcher 上那份项目
+        // 列表正是本功能的主入口,那里恒走这一支。
+        let target = match self.active_ws().map(|ws| (ws.generation(), ws.focus())) {
+            None => ProjectTarget::NewTab,
+            Some((generation, focus)) => ProjectTarget::Pane {
+                generation,
+                pane: ask.pane.unwrap_or(focus),
+            },
+        };
+        match ask.nodes.as_slice() {
+            [] => self
+                .ui
+                .set_error("这个项目还没有节点,先在项目管理器里勾一条。".to_string()),
+            [only] => self.dial_project_on(p, target, *only),
+            _ => self.spawn_project_probe(p.id, target, &ask.nodes),
+        }
+    }
+
+    /// F304:按序探候选节点的第一跳(先后与记账见 `crate::project::pick_node`),
+    /// 每条预算 [`PROJECT_PROBE_BUDGET`]。
+    ///
+    /// 只探第一跳 TCP:TCP 通了之后的一切失败(握手、认证、主机密钥)都留给
+    /// 正式拨号**报错**,不换节点 —— 否则认证失败会被静默吞成「换一套凭据
+    /// 去连」,主机密钥不符(F3)也会被吞掉。
+    ///
+    /// 任务**必发且只发一次** `ProjectNodePicked`(`pick_node` 总会返回,之后
+    /// 无分支),`probing_projects` 的这一条就靠它摘掉;任务不存 `JoinHandle`,
+    /// 没人能 abort 它。
+    fn spawn_project_probe(
+        &mut self,
+        project: mullion_store::ProjectId,
+        target: ProjectTarget,
+        nodes: &[SessionId],
+    ) {
+        let Some(store) = self.store.as_ref() else {
+            self.ui.set_error("配置库不可用,无法打开项目".to_string());
             return;
         };
-        let pane = ask.pane.unwrap_or(focus);
+        let Some((&last, head)) = nodes.split_last() else {
+            return;
+        };
+        let label = |id: SessionId| {
+            store
+                .list()
+                .iter()
+                .find(|r| r.id == id)
+                .map_or_else(|| format!("#{}", id.0), |r| r.identity.name.clone())
+        };
+        // 拨号参数在这一帧解析好再带进任务(`store` 不跨线程)。解析失败的
+        // (跳板悬空、凭据悬空)不探、直接记为不可用 —— 正式拨号照样会在
+        // 同一处失败。
+        let probes: Vec<_> = head
+            .iter()
+            .map(|&id| {
+                let plan = store
+                    .dial_plan_for(id)
+                    .map(|(cfg, _)| (cfg.hops, cfg.host, cfg.port))
+                    .map_err(|e| e.to_string());
+                (id, label(id), plan)
+            })
+            .collect();
+        self.probing_projects.push(project);
+        let proxy = self.proxy.clone();
+        self._runtime.spawn(async move {
+            let (node, skipped) =
+                crate::project::pick_node(probes, last, |(hops, host, port)| async move {
+                    mullion_ssh::dial::probe_first_hop(&hops, &host, port, PROJECT_PROBE_BUDGET)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            let _ = proxy.send_event(UserEvent::ProjectNodePicked {
+                project,
+                target,
+                node,
+                skipped,
+            });
+        });
+        mark_ui_dirty!(self.ui_dirty);
+        self.request_ui_redraw();
+    }
+
+    /// F304:探测回来了 —— 按探出来的节点拨,前面跳过了的飘一条提示。
+    fn on_project_node_picked(
+        &mut self,
+        project: mullion_store::ProjectId,
+        target: ProjectTarget,
+        node: SessionId,
+        skipped: Vec<String>,
+    ) {
+        self.probing_projects.retain(|p| *p != project);
+        mark_ui_dirty!(self.ui_dirty);
+        self.request_ui_redraw();
+        let Some(p) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.projects().iter().find(|p| p.id == project).cloned())
+        else {
+            self.ui.set_error("这个项目已经不在了".to_string());
+            return;
+        };
+        // 探测那几秒里目标标签被关了:不拨。拨了也只会在 `PaneRehosted`
+        // 那头因为世代对不上被丢掉,白占一条连接。
+        if let ProjectTarget::Pane { generation, .. } = target {
+            if self.tabs.by_generation(generation).is_none() {
+                log::info!(target: "mullion", "打开项目:探测期间目标标签已关,不拨");
+                return;
+            }
+        }
+        let name = self
+            .store
+            .as_ref()
+            .and_then(|s| s.list().iter().find(|r| r.id == node))
+            .map_or_else(|| format!("#{}", node.0), |r| r.identity.name.clone());
+        self.dial_project_on(p, target, node);
+        // 提示放在拨号**之后**:`spawn_rehost_on` 自己也可能飘一条(tmux 被
+        // 项目强行打开),toast 是单槽,后写的赢 —— 「为什么连的不是平常那条」
+        // 比那条更要紧。
+        if !skipped.is_empty() {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("{} 连不上,改连 {name}", skipped.join(";")),
+            );
+        }
+    }
+
+    /// F223/F304:把定好的节点真正拨出去 —— 新标签,或把那块 pane 换挂过去。
+    fn dial_project_on(
+        &mut self,
+        p: mullion_store::ProjectRecord,
+        target: ProjectTarget,
+        node: SessionId,
+    ) {
+        let (g, pane) = match target {
+            ProjectTarget::NewTab => {
+                self.open_project_in_new_tab(&p, node);
+                return;
+            }
+            ProjectTarget::Pane { generation, pane } => (generation, pane),
+        };
         // F223:文件面板的**兜底**落脚点改成项目目录 —— 项目是更具体的上下文,
         // 盖掉会话那份更泛的 `SftpPrefs.default_remote`。运行期覆盖,不写回
         // 配置(同 F122 的姿态)。
@@ -10925,7 +11092,7 @@ impl App {
         {
             t.sftp_default_remote = Some(p.dir.clone());
         }
-        let _ = self.spawn_rehost_on(g, pane, ask.node, RehostKind::UserPicked, Some(p));
+        let _ = self.spawn_rehost_on(g, pane, node, RehostKind::UserPicked, Some(p));
     }
 
     /// F225①:launcher(或文件标签)上点项目 —— 拨一条**新**连接、开新标签。
@@ -12492,6 +12659,12 @@ impl ApplicationHandler<UserEvent> for App {
                 pane,
                 msg,
             } => self.on_pane_rehost_err(generation, pane, msg),
+            UserEvent::ProjectNodePicked {
+                project,
+                target,
+                node,
+                skipped,
+            } => self.on_project_node_picked(project, target, node, skipped),
             UserEvent::PaneReconnected {
                 generation,
                 host_ix,
@@ -14144,8 +14317,10 @@ impl ApplicationHandler<UserEvent> for App {
                             let remote_home =
                                 self.tabs.active().and_then(|t| t.content.sftp_home());
                             // F297:启动页转圈的依据 —— 票据台账现算,不存。
-                            let (dialing_sessions, dialing_projects) =
+                            let (dialing_sessions, mut dialing_projects) =
                                 dialing_from(self.dials.iter());
+                            // F304:探节点那几秒还没发票,一样算「连接中」。
+                            dialing_projects.extend(self.probing_projects.iter().copied());
                             let frame = crate::ui::UiFrame {
                                 sessions,
                                 groups,
@@ -16494,6 +16669,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | PaneOpenErr { .. }
         | PaneRehosted { .. }
         | PaneRehostErr { .. }
+        | ProjectNodePicked { .. }
         | PaneReconnected { .. }
         | PaneReconnectErr { .. }
         | ProbeOk(_)
@@ -17856,7 +18032,8 @@ mod tests {
     /// 源码切片:`dial_project` 要真 `App` + 真连接才跑得起来。**先剥注释行**
     /// (上面这段说明本身就含 `Some(p)` 这几个字)。
     ///
-    /// 自证会变红:把 `dial_project` 里那个 `Some(p)` 改成 `None`。
+    /// 自证会变红:把 `dial_project_on` 里那个 `Some(p)` 改成 `None`。
+    /// (F304 起真正拨出去的是 `dial_project_on`,`dial_project` 只定落点与候选。)
     #[test]
     fn opening_a_project_hands_the_project_down_to_the_dialer() {
         let src = include_str!("app.rs");
@@ -17865,10 +18042,12 @@ mod tests {
             .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了")
             .0;
         let body = production
-            .split_once("fn dial_project(")
-            .expect("找不到 dial_project")
+            .split_once("fn dial_project_on(")
+            .expect("找不到 dial_project_on")
             .1;
-        let body = &body[..body.find("\n    }\n").expect("找不到 dial_project 的结尾")];
+        let body = &body[..body
+            .find("\n    }\n")
+            .expect("找不到 dial_project_on 的结尾")];
         let code = body
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -17876,7 +18055,7 @@ mod tests {
             .join("\n");
         assert!(
             code.contains("RehostKind::UserPicked, Some(p))"),
-            "dial_project 没把项目传给 spawn_rehost_on —— 打开项目不会 attach tmux"
+            "dial_project_on 没把项目传给 spawn_rehost_on —— 打开项目不会 attach tmux"
         );
     }
 
@@ -17894,8 +18073,8 @@ mod tests {
     /// 源码切片:`dial_project` 要真 `App` + 真连接才跑得起来。**先剥注释行**
     /// (实现里那段说明本身就含这两个函数名)。
     ///
-    /// 自证会变红:把那句记账删掉;或把它整段挪到 `active_ws()` 那个 `else`
-    /// 之后(第二条断言红)。
+    /// 自证会变红:把那句记账删掉;或把它整段挪到拨号 / 探测那两条分支之后
+    /// (第二条断言红)。
     #[test]
     fn opening_a_project_records_the_visit_right_away_not_only_when_the_report_lands() {
         let src = include_str!("app.rs");
@@ -17916,15 +18095,62 @@ mod tests {
         let touch = code
             .find("touch_project_accessed(")
             .expect("dial_project 没记访问时间 —— 上报链路断掉时列表会永远显示「从未」");
-        // 必须排在两条分支**之前**:`open_project_in_new_tab` 那一支是 early
-        // return,记在它后面的话从 launcher 点开的项目一条都不记 —— 而
-        // launcher 正是这个功能的主入口。
-        let branch = code
-            .find("open_project_in_new_tab(")
-            .expect("找不到开新标签那一支");
+        // 必须排在分支**之前**:任一支在它前面 return,从那一支打开的项目就
+        // 一条都不记 —— 而 launcher 正是这个功能的主入口。F304 起分支是
+        // 「单节点直接拨」和「多节点先探」两条。
+        for branch in ["dial_project_on(", "spawn_project_probe("] {
+            let at = code
+                .find(branch)
+                .unwrap_or_else(|| panic!("dial_project 里找不到 {branch}"));
+            assert!(
+                touch < at,
+                "记账排在 {branch} 之后 —— 从那一支打开的项目不会记"
+            );
+        }
+    }
+
+    /// F304:探节点那几秒(还没发票)启动页也要转圈,且探完一定摘掉。
+    ///
+    /// 不转的话,在家点开项目后头 3 秒这一行毫无反应,用户会再点一次 ——
+    /// 于是同一个项目探两遍、开两个标签。
+    ///
+    /// 源码切片:要真 `App` + 事件循环。**先剥注释行**。
+    ///
+    /// 自证会变红:删掉帧构建处那句 `extend`;或删掉 `on_project_node_picked`
+    /// 里的 `retain`(第二条断言红 —— 转圈永远停不下来)。
+    #[test]
+    fn a_project_being_probed_spins_on_the_launcher_until_the_pick_lands() {
+        let src = include_str!("app.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了,这条测试的锚点失效了")
+            .0;
+        let code = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let frame = code
+            .split_once("dialing_from(self.dials.iter());")
+            .expect("找不到帧构建处的 dialing_from")
+            .1;
+        let frame = &frame[..frame.find("crate::ui::UiFrame {").expect("找不到 UiFrame")];
         assert!(
-            touch < branch,
-            "记账排在 open_project_in_new_tab 之后 —— 从 launcher 点开的项目一条都不会记"
+            frame.contains("dialing_projects.extend(self.probing_projects"),
+            "探测中的项目没并进转圈表"
+        );
+        let picked = code
+            .split_once("fn on_project_node_picked(")
+            .expect("找不到 on_project_node_picked")
+            .1;
+        let picked = &picked[..picked.find("\n    }\n").unwrap()];
+        let retain = picked
+            .find("self.probing_projects.retain(")
+            .expect("探完没从 probing_projects 里摘掉 —— 转圈永远停不下来");
+        let first_return = picked.find("return;").unwrap_or(usize::MAX);
+        assert!(
+            retain < first_return,
+            "摘除排在某个 return 之后 —— 走那一支时转圈停不下来"
         );
     }
 

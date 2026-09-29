@@ -49,33 +49,87 @@ pub fn bare_shell(title_ever_seen: bool, tmux: Option<&str>) -> bool {
 /// F223:点「打开项目」之后下一步做什么。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenStep {
-    /// 直接开:把当前 pane 挂到这条会话上。
-    Go(mullion_store::SessionId),
-    /// 先问。`Vec` 是逐条理由(见 [`confirm_reasons`]),问完再走 [`OpenStep::Go`]。
-    Ask(mullion_store::SessionId, Vec<&'static str>),
+    /// 直接开:按 [`candidates`] 的顺序试节点,非空。
+    Go(Vec<mullion_store::SessionId>),
+    /// 先问。第二个 `Vec` 是逐条理由(见 [`confirm_reasons`]),问完再走 [`OpenStep::Go`]。
+    Ask(Vec<mullion_store::SessionId>, Vec<&'static str>),
     /// 开不了,把话说清楚。
     Refuse(&'static str),
 }
 
-/// 这个项目会往哪台机器上拨。
+/// F304:打开这个项目时按什么顺序试节点。
 ///
-/// `preferred` 优先,**但必须真在 `nodes` 里** —— 用户把首选那条从列表里去掉、
+/// 直连的在前、经跳板或代理的在后(`is_routed`,取自
+/// `AppearanceCache::is_routed`);同一组内首选排第一,其余按 `nodes` 的顺序。
+/// 典型场景:同一台机器配了「局域网直连」和「公网跳板」两条路线 —— 在公司
+/// 直连能通就走直连,在家直连 3 秒不通再退到跳板。首选只决定**组内**先后,
+/// 压不过「直连优先」:用户拍板的规则,跳板那条再首选也比直连慢。
+///
+/// `preferred` **必须真在 `nodes` 里**才算数 —— 用户把首选那条从列表里去掉、
 /// `preferred` 却没跟着清的话(F189 下别的实例改了配置就会发生),拿它去拨号会
 /// 连到一台已经不属于这个项目的机器上。`validate_project` 那道闸只管保存路径,
 /// 读回来的旧数据不受它管。
+pub fn candidates(
+    p: &mullion_store::ProjectRecord,
+    is_routed: impl Fn(mullion_store::SessionId) -> bool,
+) -> Vec<mullion_store::SessionId> {
+    let preferred = p.preferred.filter(|id| p.nodes.contains(id));
+    let mut out: Vec<_> = preferred
+        .into_iter()
+        .chain(p.nodes.iter().copied().filter(|id| Some(*id) != preferred))
+        .collect();
+    // 稳定排序:组内保持上面排好的「首选 → nodes 顺序」。
+    out.sort_by_key(|id| is_routed(*id));
+    out
+}
+
+/// F304:按序探候选节点,返回要拨的那条和被跳过的那些(「名字(原因)」)。
 ///
-/// 单独摘出来是因为**列表上写着的节点名必须和点下去真连的那台是同一条判据**
+/// - 头一个探通的就是它,后面的不再探;
+/// - 前面全不通就用 `last`,**且 `last` 不探** —— 没有退路了,再掐 3 秒只会
+///   让它必败,交给正式拨号按正常超时去等;
+/// - `plan` 是 `Err` 的(拨号参数解析失败)不探,直接记为跳过。
+///
+/// 探测本身由调用方注入(生产里是 `mullion_ssh::dial::probe_first_hop`),
+/// 这里只有先后与记账 —— 能脱离网络单测。
+pub async fn pick_node<P, F, Fut>(
+    probes: Vec<(mullion_store::SessionId, String, Result<P, String>)>,
+    last: mullion_store::SessionId,
+    mut probe: F,
+) -> (mullion_store::SessionId, Vec<String>)
+where
+    F: FnMut(P) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut skipped = Vec::new();
+    for (id, name, plan) in probes {
+        let r = match plan {
+            Ok(p) => probe(p).await,
+            Err(why) => Err(why),
+        };
+        match r {
+            Ok(()) => return (id, skipped),
+            Err(why) => skipped.push(format!("{name}({why})")),
+        }
+    }
+    (last, skipped)
+}
+
+/// 这个项目**头一个**试哪台机器 = [`candidates`] 的第一条。
+///
+/// 单独摘出来是因为**列表上写着的节点名必须和点下去先连的那台是同一条判据**
 /// (F225① launcher 每行都写着节点名)。各写一份的话,「显示 A、连上 B」是这类
 /// 界面里最难查的一种错。
-pub fn node_for(p: &mullion_store::ProjectRecord) -> Option<mullion_store::SessionId> {
-    p.preferred
-        .filter(|id| p.nodes.contains(id))
-        .or_else(|| p.nodes.first().copied())
+pub fn node_for(
+    p: &mullion_store::ProjectRecord,
+    is_routed: impl Fn(mullion_store::SessionId) -> bool,
+) -> Option<mullion_store::SessionId> {
+    candidates(p, is_routed).first().copied()
 }
 
 /// F238:这个项目该画哪张图标。
 ///
-/// 项目自设的优先;没设就回落**首选节点**的已解析外观 —— 走
+/// 项目自设的优先;没设就回落**头一个候选节点**的已解析外观 —— 走
 /// [`node_for`],和 `plan_open` 真拨号、和列表副标题写的节点名是**同一个
 /// 函数**。各写一份的话,行上画着 A 的图标、副标题写着 B 的名字。
 ///
@@ -86,7 +140,7 @@ pub fn icon_for<'a>(
     appearance: &'a crate::ui::badge::AppearanceCache,
 ) -> Option<&'a mullion_store::IconSpec> {
     p.icon.as_ref().or_else(|| {
-        node_for(p)
+        node_for(p, |id| appearance.is_routed(id))
             .and_then(|id| appearance.get(id))
             .and_then(|a| a.icon.as_ref())
     })
@@ -100,7 +154,7 @@ pub fn icon_bg(
     appearance: &crate::ui::badge::AppearanceCache,
     target: mullion_store::ColorTarget,
 ) -> Option<egui::Color32> {
-    node_for(p)
+    node_for(p, |id| appearance.is_routed(id))
         .and_then(|id| appearance.get(id))
         .and_then(|a| crate::ui::badge::should_paint(a, target))
 }
@@ -261,17 +315,25 @@ pub fn fresh_project_name(existing: &[mullion_store::ProjectRecord]) -> String {
 /// 打开项目的决策。零 IO 纯函数 —— 把「选哪条路线」和「要不要先问」这两件
 /// 各自会出错的事从事件循环里摘出来。
 ///
-/// **没有自动故障转移**(设计拍板):首选连不上就报错,由用户自己决定换哪条。
-/// 悄悄换一条的话,用户以为自己在 A 机器上干活,其实在 B 机器上。
-pub fn plan_open(p: &mullion_store::ProjectRecord, risk: AtRisk) -> OpenStep {
-    let Some(node) = node_for(p) else {
+/// F304 推翻了原先的「没有自动故障转移」(P6/F223④):给出的是**按序的候选
+/// 表**([`candidates`]),拨号前逐个探第一跳、3 秒不通换下一个。原先的两条
+/// 顾虑各有了答案 ——「连不上」的判据定死为「第一跳 TCP 3 秒内没通」;TCP 通了
+/// 之后的一切失败(认证、主机密钥)照旧报错、**不换节点**,不会静默换一套
+/// 凭据去连。项目各节点经 F222 核对是同一台机器,换了路线也还是那台。
+pub fn plan_open(
+    p: &mullion_store::ProjectRecord,
+    risk: AtRisk,
+    is_routed: impl Fn(mullion_store::SessionId) -> bool,
+) -> OpenStep {
+    let nodes = candidates(p, is_routed);
+    if nodes.is_empty() {
         return OpenStep::Refuse("这个项目还没有节点,先在项目管理器里勾一条。");
-    };
+    }
     let reasons = confirm_reasons(risk);
     if reasons.is_empty() {
-        OpenStep::Go(node)
+        OpenStep::Go(nodes)
     } else {
-        OpenStep::Ask(node, reasons)
+        OpenStep::Ask(nodes, reasons)
     }
 }
 
@@ -663,8 +725,11 @@ mod tests {
     #[test]
     fn the_preferred_node_is_the_one_we_dial() {
         assert_eq!(
-            plan_open(&proj(&[7, 9], Some(9)), AtRisk::default()),
-            OpenStep::Go(mullion_store::SessionId(9))
+            plan_open(&proj(&[7, 9], Some(9)), AtRisk::default(), |_| false),
+            OpenStep::Go(vec![
+                mullion_store::SessionId(9),
+                mullion_store::SessionId(7)
+            ])
         );
     }
 
@@ -673,8 +738,11 @@ mod tests {
     #[test]
     fn a_project_without_a_preferred_node_just_uses_the_first_one() {
         assert_eq!(
-            plan_open(&proj(&[7, 9], None), AtRisk::default()),
-            OpenStep::Go(mullion_store::SessionId(7))
+            plan_open(&proj(&[7, 9], None), AtRisk::default(), |_| false),
+            OpenStep::Go(vec![
+                mullion_store::SessionId(7),
+                mullion_store::SessionId(9)
+            ])
         );
     }
 
@@ -689,15 +757,15 @@ mod tests {
     #[test]
     fn a_preferred_node_that_is_no_longer_in_the_list_is_ignored_not_dialed() {
         assert_eq!(
-            plan_open(&proj(&[7], Some(9)), AtRisk::default()),
-            OpenStep::Go(mullion_store::SessionId(7))
+            plan_open(&proj(&[7], Some(9)), AtRisk::default(), |_| false),
+            OpenStep::Go(vec![mullion_store::SessionId(7)])
         );
     }
 
     #[test]
     fn a_project_with_no_nodes_at_all_is_refused_with_a_reason() {
         assert!(matches!(
-            plan_open(&proj(&[], None), AtRisk::default()),
+            plan_open(&proj(&[], None), AtRisk::default(), |_| false),
             OpenStep::Refuse(_)
         ));
     }
@@ -712,17 +780,128 @@ mod tests {
                 bare_shell: true,
                 ..AtRisk::default()
             },
+            |_| false,
         );
         assert_eq!(
             step,
             OpenStep::Ask(
-                mullion_store::SessionId(9),
+                vec![mullion_store::SessionId(9), mullion_store::SessionId(7)],
                 confirm_reasons(AtRisk {
                     bare_shell: true,
                     ..AtRisk::default()
                 })
             )
         );
+    }
+
+    /// F304:直连压过首选 —— 首选是跳板那条,直连那条照样排第一。
+    ///
+    /// 自证会变红:删掉 `candidates` 里的 `sort_by_key`。
+    #[test]
+    fn a_direct_node_is_tried_before_a_routed_preferred_one() {
+        let routed = |id: mullion_store::SessionId| id.0 == 7;
+        assert_eq!(
+            candidates(&proj(&[7, 9], Some(7)), routed),
+            vec![mullion_store::SessionId(9), mullion_store::SessionId(7)]
+        );
+    }
+
+    /// F304:同一组内首选排第一、其余按 `nodes` 的顺序;两组各自如此。
+    ///
+    /// 自证会变红:删掉把首选提到最前的那一步(直接用 `p.nodes` 排序)。
+    #[test]
+    fn within_each_group_the_preferred_node_leads_and_the_rest_keep_their_order() {
+        let routed = |id: mullion_store::SessionId| id.0 >= 20;
+        assert_eq!(
+            candidates(&proj(&[20, 11, 21, 12, 22, 13], Some(21)), routed),
+            [11, 12, 13, 21, 20, 22]
+                .map(mullion_store::SessionId)
+                .to_vec()
+        );
+        assert_eq!(
+            candidates(&proj(&[11, 12, 13], Some(13)), |_| false),
+            vec![
+                mullion_store::SessionId(13),
+                mullion_store::SessionId(11),
+                mullion_store::SessionId(12)
+            ]
+        );
+    }
+
+    /// F304:列表上画的图标跟**头一个候选**走,不跟首选走 —— 否则在「首选是
+    /// 跳板」的项目上,行上画着跳板那条的图标、副标题写着直连那条的名字。
+    ///
+    /// 自证会变红:`icon_for` 里改回只看 `p.preferred`。
+    #[test]
+    fn the_fallback_icon_follows_the_first_candidate_not_the_preferred_node() {
+        let mut routed = sess_with_icon(7, "JUMP");
+        routed.network.jump = Some(vec![mullion_store::JumpRef(mullion_store::SessionId(1))]);
+        let mut cache = crate::ui::badge::AppearanceCache::default();
+        cache.rebuild(&[routed, sess_with_icon(9, "LAN")], &[]);
+        let p = proj(&[7, 9], Some(7));
+        assert_eq!(icon_for(&p, &cache).map(|i| i.value.as_str()), Some("LAN"));
+    }
+
+    /// F304:头一个探通的胜出,后面的不探;跳过的带着原因。
+    ///
+    /// 自证会变红:把 `Ok(()) => return (id, skipped)` 改成不 return(继续探)。
+    #[tokio::test]
+    async fn the_first_node_whose_first_hop_answers_wins_and_later_ones_are_not_probed() {
+        let probed = std::cell::RefCell::new(Vec::new());
+        let (node, skipped) = pick_node(
+            vec![
+                (mullion_store::SessionId(1), "A".into(), Ok(1)),
+                (mullion_store::SessionId(2), "B".into(), Ok(2)),
+                (mullion_store::SessionId(3), "C".into(), Ok(3)),
+            ],
+            mullion_store::SessionId(4),
+            |n: i32| {
+                probed.borrow_mut().push(n);
+                async move {
+                    if n == 1 {
+                        Err("3 秒内没有连通".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(node, mullion_store::SessionId(2));
+        assert_eq!(skipped, vec!["A(3 秒内没有连通)".to_string()]);
+        assert_eq!(*probed.borrow(), vec![1, 2], "B 通了之后 C 不该再探");
+    }
+
+    /// F304:前面全不通就用最后一条,**最后一条不探**;拨号参数都解析不出来的
+    /// 不探、照样记为跳过。
+    ///
+    /// 自证会变红:把 `last` 也塞进 `probes` 一起探(调用方 `split_last` 改成
+    /// 整表)—— 这里的「探过谁」就多出一条。
+    #[tokio::test]
+    async fn when_nothing_answers_the_last_node_is_used_without_being_probed() {
+        let probed = std::cell::RefCell::new(0);
+        let (node, skipped) = pick_node(
+            vec![
+                (mullion_store::SessionId(1), "A".into(), Ok(())),
+                (
+                    mullion_store::SessionId(2),
+                    "B".into(),
+                    Err("跳板悬空".to_string()),
+                ),
+            ],
+            mullion_store::SessionId(9),
+            |()| {
+                *probed.borrow_mut() += 1;
+                async { Err("连接被拒绝".to_string()) }
+            },
+        )
+        .await;
+        assert_eq!(node, mullion_store::SessionId(9));
+        assert_eq!(
+            skipped,
+            vec!["A(连接被拒绝)".to_string(), "B(跳板悬空)".to_string()]
+        );
+        assert_eq!(*probed.borrow(), 1, "解析失败的 B 不该探,最后一条也不该探");
     }
 
     // ---- F224 灯与访问时间 ----------------------------------------------
@@ -860,7 +1039,8 @@ mod tests {
                 AtRisk {
                     unsaved_edits: true,
                     ..AtRisk::default()
-                }
+                },
+                |_| false,
             ),
             OpenStep::Refuse(_)
         ));

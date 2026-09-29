@@ -281,6 +281,9 @@ fn list_column(
                             selected: ui_state.project_selected == Some(p.id),
                             now,
                             list: "manager",
+                            candidates: &crate::project::candidates(p, |id| {
+                                appearance.is_routed(id)
+                            }),
                             icon: crate::project::icon_for(p, appearance),
                             icon_bg: crate::project::icon_bg(
                                 p,
@@ -705,7 +708,8 @@ fn appearance_section(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAsk {
     pub project: ProjectId,
-    pub node: SessionId,
+    /// F304:按序的候选节点(`crate::project::candidates`),非空。
+    pub nodes: Vec<SessionId>,
     pub pane: Option<mullion_core::layout::PaneId>,
     /// 逐条理由,来自 `crate::project::confirm_reasons`。
     pub reasons: Vec<&'static str>,

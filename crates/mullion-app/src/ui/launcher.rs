@@ -265,6 +265,9 @@ fn projects_column(
                     selected: false,
                     now: cx.now,
                     list: "launcher",
+                    candidates: &crate::project::candidates(p, |id| {
+                        cx.lists.appearance.is_routed(id)
+                    }),
                     icon: crate::project::icon_for(p, cx.lists.appearance),
                     icon_bg: crate::project::icon_bg(
                         p,
