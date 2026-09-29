@@ -6047,6 +6047,19 @@ impl App {
         self.track_sftp_task(generation, task);
     }
 
+    /// F305:侧栏首次打开时本地栏的自动首载。
+    ///
+    /// 复用 `apply_local_file_action(Refresh)`,但**不许撤掉在途跳转**:那条
+    /// 撤销是给「用户自己动了面板」的,而这里是系统自发的首载。首次开栏
+    /// 恰好就是 Ctrl+Shift+B 挂上意图的那一帧,撤了就等于「第一次按永远不跳」。
+    fn load_local_panel_initially(&mut self, generation: u64) {
+        let held = self.pending_reveal_mut(generation).and_then(|s| s.take());
+        self.apply_local_file_action(generation, crate::ui::files_panel::FileAction::Refresh);
+        if let Some(slot) = self.pending_reveal_mut(generation) {
+            *slot = held;
+        }
+    }
+
     /// F218:这个标签此刻正等着一次跳转吗。
     ///
     /// 「侧栏关→开」那一帧的 `sync_files_to_focused_pane` 要看它:同一帧里
@@ -13979,10 +13992,7 @@ impl ApplicationHandler<UserEvent> for App {
                                         matches!(f.local.load, crate::files::state::Load::Idle)
                                     })
                                 }) {
-                                    self.apply_local_file_action(
-                                        gen,
-                                        crate::ui::files_panel::FileAction::Refresh,
-                                    );
+                                    self.load_local_panel_initially(gen);
                                 }
                                 // F50/D6:远端栏同理,但走异步的 sftp 打开链路
                                 // (`trigger_sftp_open` → `UserEvent::SftpOpened` →
@@ -21893,6 +21903,48 @@ mod tests {
             arm[..end].contains("cancel_pending_reveal"),
             "关栏没撤掉在途跳转(F243):{}",
             &arm[..end]
+        );
+    }
+
+    /// F305 **接线守护**:侧栏首次打开那一帧,本地栏 `Idle` 的自动首载**不是
+    /// 用户动了面板**,不许撤掉在途跳转。
+    ///
+    /// 实报症状:没开过侧栏时划中路径(状态栏那格已显示)按 Ctrl+Shift+B,侧栏
+    /// 开了但停在 pane 的 cwd。根因:按键把意图挂上 → 同一帧重绘时本地栏还是
+    /// `Idle` → 走 `apply_local_file_action(Refresh)` → 开头那句
+    /// `cancel_pending_reveal` 把意图冲掉 → `stat` 回来对不上号被丢弃。
+    /// 第二次开侧栏(本地栏已不是 `Idle`)就正常,所以只有「第一次」坏。
+    ///
+    /// 自证会变红:把自动首载改回 `self.apply_local_file_action(gen, …Refresh)`;
+    /// 或把 `load_local_panel_initially` 里「先取走、后归还」任一步删掉。
+    #[test]
+    fn the_first_local_load_when_the_sidebar_opens_does_not_call_off_the_reveal() {
+        let src = prod_src();
+        let at = src
+            .find("matches!(f.local.load, crate::files::state::Load::Idle)")
+            .expect("本地栏自动首载的判据不见了,这条测试的锚点失效了");
+        let tail = &src[at..];
+        let end = tail
+            .find("self.trigger_sftp_open(gen)")
+            .expect("本地栏首载之后不再紧跟远端首开?锚点失效了");
+        let block = &tail[..end];
+        assert!(
+            block.contains("self.load_local_panel_initially(gen)"),
+            "本地栏自动首载必须走不撤跳转的那条路(F305):{block}"
+        );
+        assert!(
+            !block.contains("apply_local_file_action"),
+            "本地栏自动首载又直连 apply_local_file_action 了,首次开栏的跳转会被冲掉(F305):{block}"
+        );
+        let body = body_of(src, "fn load_local_panel_initially(");
+        let take = body.find(".take()").expect("没先把在途意图取走");
+        let apply = body
+            .find("self.apply_local_file_action(")
+            .expect("首载不再复用 apply_local_file_action?");
+        let give = body.find("*slot = held").expect("没把在途意图归还");
+        assert!(
+            take < apply && apply < give,
+            "必须「取走 → 首载 → 归还」这个顺序:{body}"
         );
     }
 
