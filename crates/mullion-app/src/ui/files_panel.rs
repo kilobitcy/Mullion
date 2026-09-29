@@ -1077,10 +1077,29 @@ pub fn show(
                 // 守护:`a_long_bookmark_after_a_short_one_still_fits_on_one_line`
                 // (必须是先短后长两帧)。
                 let cap = ui.ctx().screen_rect().width() * 0.6;
-                ui.set_max_width(cap);
                 let font = egui::TextStyle::Button.resolve(ui.style());
                 let pad = ui.spacing().button_padding.x * 2.0;
-                for b in bookmarks.list {
+                let width_of = |s: &str| {
+                    ui.fonts(|f| {
+                        f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                    })
+                };
+                // F300:放不下时按像素中段省略,完整路径挪到 hover。
+                let shown: Vec<String> = bookmarks
+                    .list
+                    .iter()
+                    .map(|b| fit_middle(&b.path, cap - pad, width_of))
+                    .collect();
+                // F303:预算取「最长一条」与上限的较小者,而不是直接取上限 ——
+                // 菜单是 `top_down_justified`,按钮撑满预算;Area 又记着上一次
+                // 的尺寸,开过一次长书签之后短书签也铺满上限(v0.1.119 实报)。
+                // 每帧按当帧内容重设,宽度能涨也能缩。
+                // 守护:`a_menu_of_short_bookmarks_is_only_as_wide_as_the_longest_one`。
+                let widest = shown.iter().map(|s| width_of(s)).fold(0.0, f32::max);
+                ui.set_max_width((widest + pad).min(cap));
+                for (b, shown) in bookmarks.list.iter().zip(shown) {
                     // F145:主文本恒是**完整绝对路径**。用户点开这个下拉
                     // 就是为了确认「这条书签指哪儿」,只给个 `nginx` 等于
                     // 没回答 —— 同名目录在不同机器、不同层级下遍地都是。
@@ -1088,15 +1107,6 @@ pub fn show(
                     // 用户自己起的名字不丢:非空且与路径不同时挂到 hover 上。
                     // (空名是 store 明确允许的合法状态,见 `Bookmark::name`
                     // 的文档 —— 现在这个分支不再影响主文本,只影响 hover。)
-                    //
-                    // F300:放不下时按像素中段省略,完整路径挪到 hover。
-                    let shown = fit_middle(&b.path, cap - pad, |s| {
-                        ui.fonts(|f| {
-                            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
-                                .size()
-                                .x
-                        })
-                    });
                     let elided = shown != b.path;
                     let mut item =
                         ui.add(egui::Button::new(shown).wrap_mode(egui::TextWrapMode::Extend));
@@ -1123,6 +1133,11 @@ pub fn show(
                         ui.close_menu();
                     }
                 }
+                annotate::mark(
+                    ui.ctx(),
+                    format!("文件面板/{id}/路径/书签/菜单"),
+                    ui.min_rect(),
+                );
             });
             let resp = menu.response;
             // 按钮体是空的,三角自己画上去。颜色走 `interact()` 取当前交互
@@ -5853,6 +5868,84 @@ mod tests {
         }
         let g = g.expect("长书签没画出来(菜单关了?)");
         assert_eq!(g.rows.len(), 1, "长路径被折成 {} 行", g.rows.len());
+    }
+
+    /// F303:菜单宽度跟着**最长那一条**走,不铺满 60% 屏宽上限。
+    ///
+    /// 根因:egui 菜单是 `top_down_justified` 布局,按钮撑满 `set_max_width`
+    /// 给的预算 —— 预算直接取上限,两条短书签也拉出 1100+ 像素的空白条
+    /// (v0.1.119 实报截图)。判据必须是「先开过一次长的、再换短的」:Area
+    /// 记着上一次的尺寸,从没宽过的菜单首帧 sizing pass 就收窄了,恒绿。
+    ///
+    /// 自证会变红:把 `set_max_width` 的参数改回 `cap`。
+    #[test]
+    fn a_menu_of_short_bookmarks_is_only_as_wide_as_the_longest_one() {
+        let ctx = egui::Context::default();
+        annotate::toggle(&ctx);
+        let mut state = ready_at(b"/");
+        let mut cols = ColWidths::default();
+        let longest = "/home/brain/.claude";
+        let list = vec![bm("/tmp"), bm(longest)];
+        let wide = vec![bm(&format!("/wide/{}", "abcdefghij".repeat(20)))];
+        run_remote_sidebar(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &wide,
+            egui::RawInput::default(),
+        );
+        let arrow = annotate::spot_rect(&ctx, "文件面板/远端/路径/书签")
+            .unwrap()
+            .center();
+        // 先开着一条很长的画几帧 —— Area 记住宽尺寸。
+        run_remote_sidebar(&ctx, &mut state, &mut cols, &wide, click_at(arrow));
+        for _ in 0..2 {
+            run_remote_sidebar(
+                &ctx,
+                &mut state,
+                &mut cols,
+                &wide,
+                egui::RawInput::default(),
+            );
+        }
+        let mut g = None;
+        for _ in 0..3 {
+            let shapes = run_remote_sidebar(
+                &ctx,
+                &mut state,
+                &mut cols,
+                &list,
+                egui::RawInput::default(),
+            );
+            if let Some(found) = galley_of(&shapes, longest) {
+                g = Some(found);
+            }
+        }
+        let text_w = g.expect("菜单没画出来").rect.width();
+        // 测试里没跑覆盖层那一趟,`spots` 不逐帧清 —— 关开一次清掉旧帧,
+        // 再画一帧,读到的才是当帧的菜单矩形。
+        annotate::toggle(&ctx);
+        annotate::toggle(&ctx);
+        run_remote_sidebar(
+            &ctx,
+            &mut state,
+            &mut cols,
+            &list,
+            egui::RawInput::default(),
+        );
+        let menu = annotate::spot_rect(&ctx, "文件面板/远端/路径/书签/菜单")
+            .expect("菜单内容区该登记为候选");
+        // 余量 = 按钮左右内边距 + 取整,远小于上限 2560×0.6 = 1536。
+        assert!(
+            menu.width() <= text_w + 40.0,
+            "菜单宽 {} 远超最长一条的文字宽 {text_w}",
+            menu.width()
+        );
+        assert!(
+            menu.width() >= text_w,
+            "菜单比最长一条还窄:{}",
+            menu.width()
+        );
     }
 
     /// F300:比 60% 屏宽还长的路径**中段省略**且仍是一行,而不是被硬裁或折行。
