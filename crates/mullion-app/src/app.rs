@@ -2641,6 +2641,8 @@ struct TransferState {
     /// 每条 job 的完整参数(见 `TransferSpec`)。job 真正走完(不是挂在冲突上)
     /// 之后删掉,不然队列清空了它还在涨。
     specs: std::collections::HashMap<u64, TransferSpec>,
+    /// F308:全部顺利收尾后满 60 秒自动清的计时。
+    auto_clear: crate::files::queue::AutoClear,
 }
 
 /// 三个文件对话框各自的「线程在跑吗」标志。防止连点「选择…」开出多个
@@ -2758,6 +2760,7 @@ impl TransferState {
             queue: crate::files::queue::Queue::new(DEFAULT_TRANSFER_CONCURRENCY),
             cancels: std::collections::HashMap::new(),
             specs: std::collections::HashMap::new(),
+            auto_clear: crate::files::queue::AutoClear::default(),
         }
     }
 }
@@ -4876,10 +4879,36 @@ impl App {
             self.sync_timeout_wake(now),
             self.blink_wake(blink_now),
             self.node_stats_wake(blink_now),
+            self.transfer_auto_clear_wake(blink_now),
         ]
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// F308:用户正看着传输栏吗(展开 / 指针悬停)。自动收起的计时与唤醒
+    /// 共用这一个判据。
+    fn transfer_held(&self) -> bool {
+        self.ui.transfer_expanded || self.ui.transfer_hovered
+    }
+
+    /// F308:传输栏全部顺利收尾满 60 秒就自动清(同「清除已完成」)。
+    fn tick_transfer_auto_clear(&mut self) {
+        let clean = self.transfer.queue.settled_clean();
+        let held = self.transfer_held();
+        if self.transfer.auto_clear.tick(clean, held, Instant::now()) {
+            self.transfer.queue.clear_finished();
+            self.request_ui_redraw();
+        }
+    }
+
+    /// F308:自动收起到点的时刻。不计时就不醒;绝不报过去的时刻(见
+    /// `AutoClear::deadline`)。
+    fn transfer_auto_clear_wake(&self, now: Instant) -> Option<Instant> {
+        let clean = self.transfer.queue.settled_clean();
+        self.transfer
+            .auto_clear
+            .deadline(clean, self.transfer_held(), now)
     }
 
     /// F298:所有终端标签上所有连接里,最早到点的那次采样。**遍历全部标签**
@@ -15543,6 +15572,9 @@ impl ApplicationHandler<UserEvent> for App {
         // 这里先把新连接的 `busy` 置上,`next_timer_wake` 才不会算出过去的
         // 唤醒时刻造成忙转。
         self.tick_node_stats();
+        // F308:传输栏顺利收尾满 60 秒就自动清。到点那次唤醒由
+        // `transfer_auto_clear_wake` 排进 `next_timer_wake`。
+        self.tick_transfer_auto_clear();
         // 即将阻塞等事件 = 正常空闲。看门狗据此不误报(等事件本来就可以等很久)。
         diag::mark(diag::Stage::Idle);
     }
@@ -22150,6 +22182,44 @@ mod tests {
         assert!(
             body.contains("self.node_stats_wake("),
             "定时唤醒没并进节点状态采样 —— 空闲时采样只能靠别的事件顺带唤醒"
+        );
+    }
+
+    /// **接线守护 / F308**:传输栏自动收起的三处接线 ——
+    /// ① `about_to_wait` 里推进计时(到点就清),② 唤醒时刻并进
+    /// `next_timer_wake`(否则空闲时到点没人叫醒,栏永远不消失),③ 计时与
+    /// 唤醒问的是**同一个** `transfer_held()`(两处各写一份判据,分叉时就是
+    /// 「按住了还在等醒」或者「醒了又不清」的错配,后者在 T7 意义下就是空转)。
+    ///
+    /// 自证会变红:删掉 `about_to_wait` 里的 `self.tick_transfer_auto_clear();`;
+    /// 或从 `next_timer_wake` 的数组里删掉 `self.transfer_auto_clear_wake(..)`;
+    /// 或把任一处的 `self.transfer_held()` 换成只看 `transfer_expanded`。
+    #[test]
+    fn transfer_auto_clear_is_ticked_woken_and_held_from_one_source() {
+        let idle = body_of(prod_src(), "fn about_to_wait(");
+        assert!(
+            idle.contains("self.tick_transfer_auto_clear();"),
+            "about_to_wait 没推进传输栏自动收起(F308)"
+        );
+        let wake = body_of(prod_src(), "fn next_timer_wake(");
+        assert!(
+            wake.contains("self.transfer_auto_clear_wake(blink_now)"),
+            "定时唤醒没并进传输栏自动收起 —— 空闲时到点没人叫醒(F308)"
+        );
+        for f in [
+            "fn tick_transfer_auto_clear(",
+            "fn transfer_auto_clear_wake(",
+        ] {
+            let body = body_of(prod_src(), f);
+            assert!(
+                body.contains("self.transfer_held()") && body.contains("settled_clean()"),
+                "{f} 的判据没走同源的 transfer_held / settled_clean:{body}"
+            );
+        }
+        let held = body_of(prod_src(), "fn transfer_held(");
+        assert!(
+            held.contains("self.ui.transfer_expanded") && held.contains("self.ui.transfer_hovered"),
+            "展开和悬停都要暂停计时:{held}"
         );
     }
 

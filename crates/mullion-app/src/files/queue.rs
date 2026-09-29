@@ -6,6 +6,8 @@
 //! 各起一条 sftp channel 跑;worker 只回报结果,**不碰队列** ——
 //! 队列的所有权留在 UI 线程,于是这里一把锁都不需要。
 
+use std::time::{Duration, Instant};
+
 /// 传输方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -295,6 +297,19 @@ impl Queue {
         self.jobs.retain(|j| !j.state.is_finished());
     }
 
+    /// F308:全部顺利收尾 —— 非空,且每条都是 Done/Skipped/Canceled。
+    /// 有 `Failed` 就不算(那一栏存在的意义就是让用户看见失败);
+    /// `Conflict` 还在等用户拿主意,也不算。
+    pub fn settled_clean(&self) -> bool {
+        !self.jobs.is_empty()
+            && self.jobs.iter().all(|j| {
+                matches!(
+                    j.state,
+                    JobState::Done | JobState::Skipped | JobState::Canceled
+                )
+            })
+    }
+
     pub fn summary(&self) -> Summary {
         let mut s = Summary::default();
         for j in &self.jobs {
@@ -329,6 +344,46 @@ impl Queue {
 
     pub fn rate_bps(&self) -> f64 {
         self.rate.bps()
+    }
+}
+
+/// F308:传输栏全部顺利收尾后,多久自动清掉。
+pub const AUTO_CLEAR_AFTER: Duration = Duration::from_secs(60);
+
+/// F308:「顺利收尾满 60 秒就自动清」的计时。
+///
+/// `held` = 用户正看着这一栏(展开 / 指针悬停)。被按住时计时作废,松开后
+/// **重新计满**,而不是接着剩余时间算 —— 刚移开指针两秒就消失,跟正看着
+/// 时消失一样突兀。
+#[derive(Debug, Default)]
+pub struct AutoClear {
+    /// 这一轮「顺利且没被按住」从什么时候开始。
+    since: Option<Instant>,
+}
+
+impl AutoClear {
+    /// 推进一次。返回 `true` = 到点了,调用方该清;清完计时自己复位。
+    pub fn tick(&mut self, clean: bool, held: bool, now: Instant) -> bool {
+        if !clean || held {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since) >= AUTO_CLEAR_AFTER {
+            self.since = None;
+            return true;
+        }
+        false
+    }
+
+    /// 下一次该醒的时刻(并入 `next_timer_wake`)。还没开始计时(本轮
+    /// `tick` 尚未跑到)时按 `now` 起算 —— **绝不给过去的时刻**,那会让
+    /// `WaitUntil` 忙转(T7)。
+    pub fn deadline(&self, clean: bool, held: bool, now: Instant) -> Option<Instant> {
+        if !clean || held {
+            return None;
+        }
+        Some(self.since.unwrap_or(now) + AUTO_CLEAR_AFTER)
     }
 }
 
@@ -654,5 +709,76 @@ mod tests {
         q.progress(a, 100);
         q.finish(a, Ok(()));
         assert_eq!(q.summary().active, 1, "收尾的不算");
+    }
+
+    // ---- F308:全部顺利收尾 1 分钟后自动清 ----
+
+    /// 「顺利收尾」= 非空、每条都是 Done/Skipped/Canceled。有一条 Failed、
+    /// 或还有 Pending/Running/Conflict,都不算。
+    /// 自证会变红:判据里漏掉 `Failed` 的排除(有失败也自动清)。
+    #[test]
+    fn only_a_queue_that_all_ended_without_failure_counts_as_settled_clean() {
+        let mut q = q();
+        assert!(!q.settled_clean(), "空队列没有栏,谈不上收起");
+        let a = q.push(job(Direction::Upload));
+        let b = q.push(job(Direction::Upload));
+        let c = q.push(job(Direction::Download));
+        assert!(!q.settled_clean(), "还在排队");
+        q.take_runnable();
+        q.finish(a, Ok(()));
+        assert!(!q.settled_clean(), "还有在跑的");
+        q.finish(b, Err(CANCEL_MARKER.into()));
+        q.finish(c, conflict());
+        assert!(!q.settled_clean(), "停在冲突对话框上的不算收尾");
+        q.resolve_conflict(c, Conflict::Skip, false);
+        assert!(q.settled_clean(), "完成 + 取消 + 跳过 = 顺利");
+        let d = q.push(job(Direction::Upload));
+        q.take_runnable();
+        q.finish(d, Err("磁盘满".into()));
+        assert!(!q.settled_clean(), "有一条失败就永不自动清");
+    }
+
+    /// 满 60 秒才清,清完复位;不顺利 / 被按住(展开或悬停)时计时作废,
+    /// 松开后**重新计满** 60 秒。
+    /// 自证会变红:`held` 时不清 `since`(松开后接着剩余时间算)。
+    #[test]
+    fn the_countdown_needs_a_full_minute_of_clean_unheld_time() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut ac = AutoClear::default();
+        assert!(!ac.tick(true, false, s(0)));
+        assert!(!ac.tick(true, false, s(59)));
+        assert!(ac.tick(true, false, s(60)), "满 60 秒该清");
+        assert!(!ac.tick(true, false, s(61)), "清完复位,不连发");
+
+        let mut ac = AutoClear::default();
+        ac.tick(true, false, s(0));
+        ac.tick(true, true, s(50));
+        assert!(!ac.tick(true, false, s(70)), "松开那一刻重新起算");
+        assert!(!ac.tick(true, false, s(129)));
+        assert!(ac.tick(true, false, s(130)));
+
+        let mut ac = AutoClear::default();
+        ac.tick(true, false, s(0));
+        ac.tick(false, false, s(30));
+        assert!(!ac.tick(true, false, s(61)), "中途有新任务入队,重新计时");
+        assert!(ac.tick(true, false, s(121)));
+    }
+
+    /// 唤醒时刻(并入 `next_timer_wake`):不顺利或被按住时 `None`;计时中给
+    /// 起点 + 60 秒;还没开始计时(本轮 tick 尚未跑)给 `now + 60` ——
+    /// **绝不给过去的时刻**(T7:WaitUntil 一个过去的时刻 = 忙转)。
+    /// 自证会变红:`since` 为空时回 `Some(now)`。
+    #[test]
+    fn the_wakeup_is_never_in_the_past_and_absent_when_nothing_is_counting() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut ac = AutoClear::default();
+        assert_eq!(ac.deadline(false, false, s(0)), None);
+        assert_eq!(ac.deadline(true, true, s(0)), None);
+        assert_eq!(ac.deadline(true, false, s(5)), Some(s(65)));
+        ac.tick(true, false, s(10));
+        assert_eq!(ac.deadline(true, false, s(40)), Some(s(70)));
+        assert_eq!(ac.deadline(true, true, s(40)), None);
     }
 }

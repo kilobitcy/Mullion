@@ -462,6 +462,9 @@ pub struct UiState {
     /// `#[derive(Default)]` 只会给 `false`,而默认状态应当是折叠(一行摘要)——
     /// 传输是后台事,不该一入队就把终端挤掉六行。
     pub transfer_expanded: bool,
+    /// F308:指针此刻停在传输栏上吗(每帧由 `transfer_panel::show` 写回)。
+    /// 和 `transfer_expanded` 一起决定自动收起的计时要不要暂停。
+    pub transfer_hovered: bool,
     /// F53:「编辑中」面板是不是展开着。语义取反的理由同 `transfer_expanded`。
     pub edit_expanded: bool,
     /// F53/D3-12:用户点了关闭,但有编辑没传上去 —— 拦下来问一句。
@@ -1196,7 +1199,13 @@ pub fn build_ui(
     // F55:传输队列面板。**排在状态栏之后 show** —— `TopBottomPanel` 按 show
     // 的先后从窗口边缘往里堆,于是它落在状态栏**上方**(设计要的位置);
     // 又排在下面的 `CentralPanel` 之前,不然它拿不到空间分配。
-    actions.transfer = transfer_panel::show(ctx, t, queue, &mut ui_state.transfer_expanded);
+    actions.transfer = transfer_panel::show(
+        ctx,
+        t,
+        queue,
+        &mut ui_state.transfer_expanded,
+        &mut ui_state.transfer_hovered,
+    );
     // F53:「编辑中」列表。排在传输面板之后 show,于是落在它**上方**
     // (`TopBottomPanel` 从窗口边缘往里堆)——编辑是用户正在做的事,
     // 比后台传输更该靠近视线。

@@ -18,18 +18,23 @@ pub enum TransferUiAction {
 /// 画面板。`expanded` 由调用方持有(`UiState`),跨帧记住折叠状态。
 /// 用「展开」而不是「折叠」表述,是为了 `Default`(`false`)正好等于
 /// 默认折叠 —— 见 `UiState::transfer_expanded` 的说明。
+///
+/// F308:`hovered` 写回指针此刻是否停在栏上 —— 用户正看着时,自动收起的
+/// 计时要暂停。
 pub fn show(
     ctx: &egui::Context,
     t: &Theme,
     queue: &Queue,
     expanded: &mut bool,
+    hovered: &mut bool,
 ) -> Option<TransferUiAction> {
     if queue.jobs().is_empty() {
+        *hovered = false;
         return None;
     }
     let s = queue.summary();
     let mut action = None;
-    egui::TopBottomPanel::bottom("transfer-queue")
+    let panel = egui::TopBottomPanel::bottom("transfer-queue")
         .frame(
             egui::Frame::none()
                 .fill(theme::c32(t.panel_bg))
@@ -96,6 +101,7 @@ pub fn show(
                     }
                 });
         });
+    *hovered = panel.response.contains_pointer();
     action
 }
 
@@ -173,7 +179,7 @@ mod tests {
         for _ in 0..2 {
             shapes = ctx
                 .run(egui::RawInput::default(), |ctx| {
-                    show(ctx, &t, q, expanded);
+                    show(ctx, &t, q, expanded, &mut false);
                 })
                 .shapes;
         }
@@ -182,6 +188,40 @@ mod tests {
             walk(&cs.shape, &mut out);
         }
         out
+    }
+
+    /// F308:指针在栏上时报 `hovered`(自动收起的计时要暂停),移开就不报;
+    /// 队列空时恒不报(没有栏)。
+    /// 自证会变红:删掉 `*hovered = ...contains_pointer()` 那句。
+    #[test]
+    fn the_panel_reports_when_the_pointer_rests_on_it() {
+        let hovered_at = |q: &Queue, y: f32| {
+            let t = crate::theme::MULLION_DARK;
+            let ctx = egui::Context::default();
+            let mut hovered = true;
+            for i in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(i as f64),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 600.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(egui::pos2(400.0, y))],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        show(ctx, &t, q, &mut false, &mut hovered);
+                    },
+                );
+            }
+            hovered
+        };
+        let mut q = Queue::new(4);
+        push(&mut q, Direction::Upload, "a.txt");
+        assert!(hovered_at(&q, 595.0), "指针在底部传输栏上");
+        assert!(!hovered_at(&q, 100.0), "指针在终端区");
+        assert!(!hovered_at(&Queue::new(4), 595.0), "队列空时没有栏");
     }
 
     #[test]
