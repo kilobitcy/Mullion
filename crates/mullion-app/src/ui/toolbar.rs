@@ -30,14 +30,14 @@ const CELL_GAP: f32 = 2.0;
 const BTN_PAD: f32 = 3.0;
 /// 相邻按钮之间的间隙。
 const BTN_GAP: f32 = 4.0;
-/// 按钮到凹槽容器边缘的内边距。
-const GROUP_PAD: f32 = 3.0;
+/// 按钮到凹槽容器边缘的内边距。F306 分屏标题条的按钮组也用它。
+pub(crate) const GROUP_PAD: f32 = 3.0;
 /// 按钮组左边至少要离菜单项这么远 —— 窗口窄到居中位置会压上菜单项时的兜底。
 const MIN_GAP: f32 = 12.0;
 
 const CELL_ROUNDING: f32 = 1.5;
 const BTN_ROUNDING: f32 = 6.0;
-const GROUP_ROUNDING: f32 = 8.0;
+pub(crate) const GROUP_ROUNDING: f32 = 8.0;
 
 fn button_w() -> f32 {
     ICON_W + BTN_PAD * 2.0

@@ -426,34 +426,55 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                 );
                 content.set_clip_rect(inner);
                 content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if small_action_button(ui, close_id(v.geom.id), Mark::Glyph("×"), t)
-                        .on_hover_text("关闭此分屏")
-                        .clicked()
-                    {
+                    // F306:三个按钮坐进一块凹槽(同菜单栏布局按钮组),与左边
+                    // 的状态段分开。先占一个形状位、按钮画完知道范围后回填 ——
+                    // 凹槽必须在按钮**之下**,后画会盖住图标。painter 直接画,
+                    // 不引入 `Frame`(顶部越界坑 1)。
+                    let group_slot = ui.painter().add(egui::Shape::Noop);
+                    ui.add_space(crate::ui::toolbar::GROUP_PAD);
+                    let close = small_action_button(ui, close_id(v.geom.id), Mark::Glyph("×"), t)
+                        .on_hover_text("关闭此分屏");
+                    if close.clicked() {
                         action.close = Some(v.geom.id);
                     }
                     // 用户要的入口:分屏之后在这里把这块 pane 换到别的节点。
                     // 放在 × 左边而不是做成"点主机名":主机名会被 `.truncate()`
                     // 截断,长主机名时点击靶子会缩到几个像素宽。
-                    if small_action_button(ui, rehost_id(v.geom.id), Mark::SwapArrows, t)
-                        .on_hover_text("把这块分屏换到别的节点")
-                        .clicked()
-                    {
+                    let rehost = small_action_button(ui, rehost_id(v.geom.id), Mark::SwapArrows, t)
+                        .on_hover_text("把这块分屏换到别的节点");
+                    if rehost.clicked() {
                         action.rehost = Some(v.geom.id);
                     }
                     // F225③:第三个按钮 —— 切到另一个活。摆在换节点左边,
                     // 危险程度从右往左递减(× 最右)。
-                    if small_action_button(
+                    let project = small_action_button(
                         ui,
                         project_id(v.geom.id),
                         Mark::Icon(crate::ui::icon::Glyph::Project),
                         t,
                     )
-                    .on_hover_text("把这块分屏切到另一个项目")
-                    .clicked()
-                    {
+                    .on_hover_text("把这块分屏切到另一个项目");
+                    if project.clicked() {
                         action.pick_project = Some(v.geom.id);
                     }
+                    ui.add_space(crate::ui::toolbar::GROUP_PAD);
+                    // 横向留 GROUP_PAD,纵向只多 1 点;夹进 `full`,高度不够时
+                    // 凹槽贴着标题条上下沿,不越界、不加高标题条。
+                    let group = close
+                        .rect
+                        .union(rehost.rect)
+                        .union(project.rect)
+                        .expand2(egui::vec2(crate::ui::toolbar::GROUP_PAD, 1.0))
+                        .intersect(full);
+                    ui.painter().set(
+                        group_slot,
+                        egui::epaint::RectShape::new(
+                            group,
+                            crate::ui::toolbar::GROUP_ROUNDING,
+                            theme::c32(t.sunken_bg),
+                            theme::stroke(t),
+                        ),
+                    );
                     // F298:节点状态段,摆在项目按钮左边(right_to_left,先加的
                     // 在右,所以是「按钮组左边、标题右边」)。`.rev()`——`pieces()`
                     // 给的是内存/磁盘/国家从左到右的阅读顺序,right_to_left 布局
@@ -1187,6 +1208,92 @@ mod tests {
             }
         }
         shapes.iter().find_map(|s| walk(s, needle))
+    }
+
+    /// F306:`[项目][⇄][×]` 三个按钮坐在同一块凹槽里(`sunken_bg` 底,同菜单栏
+    /// 布局按钮组),凹槽不罩住左边的状态段、不越出标题条,且画在按钮**之下**。
+    ///
+    /// 自证会变红:删掉凹槽那一笔(找不到);凹槽只包 × 一个(不含另外两个);
+    /// 改成按钮画完后再 `painter().rect` 追加(盖住图标,顺序断言红)。
+    #[test]
+    fn the_three_buttons_sit_in_one_sunken_group_apart_from_the_stats() {
+        let views = [TitleView {
+            geom: geom_with_title_width(1, 1200),
+            index: 1,
+            project: None,
+            project_icon: None,
+            host: Some("dev@build-01"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+            cwd_leaf: None,
+            tmux: None,
+            notice: None,
+            drawer: false,
+            stats: wide_stats(),
+        }];
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let t = crate::theme::MULLION_DARK;
+        let mut shapes = Vec::new();
+        // 三帧:`read_response` 读的是**上一帧**登记的矩形,而第一帧的行高
+        // 还没撑开(按钮贴顶),拿它跟最后一帧的凹槽比会错位。
+        for i in 0..3 {
+            let out = ctx.run(
+                egui::RawInput {
+                    time: Some(i as f64),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &t, &views);
+                },
+            );
+            shapes = out.shapes.into_iter().map(|cs| cs.shape).collect();
+        }
+        fn flat(s: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|x| flat(x, out)),
+                other => out.push(other.clone()),
+            }
+        }
+        let mut all = Vec::new();
+        shapes.iter().for_each(|s| flat(s, &mut all));
+        let groups: Vec<(usize, egui::Rect)> = all
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                egui::Shape::Rect(r) if r.fill == theme::c32(t.sunken_bg) => Some((i, r.rect)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups.len(), 1, "标题条上该有且只有一块凹槽:{groups:?}");
+        let (at, group) = groups[0];
+        let rect_of = |id| ctx.read_response(id).expect("按钮不见了").rect;
+        for id in [
+            close_id(PaneId(1)),
+            rehost_id(PaneId(1)),
+            project_id(PaneId(1)),
+        ] {
+            assert!(
+                group.contains_rect(rect_of(id)),
+                "凹槽没罩住按钮 {id:?}:{group:?} vs {:?}",
+                rect_of(id)
+            );
+        }
+        assert!(
+            !group.intersects(rect_of(country_id(PaneId(1)))),
+            "凹槽罩到状态段上了"
+        );
+        let bar = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200.0, crate::shell::workspace::title_bar_px(1.0) as f32),
+        );
+        assert!(bar.contains_rect(group), "凹槽越出标题条:{group:?}");
+        let cross = all
+            .iter()
+            .position(|s| matches!(s, egui::Shape::Text(ts) if ts.galley.text() == "×"))
+            .expect("× 不见了");
+        assert!(at < cross, "凹槽画在按钮之上,会盖住图标");
     }
 
     /// F298:宽条上画出三格,磁盘 95% 用 warn 色。
