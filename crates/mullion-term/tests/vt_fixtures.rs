@@ -220,3 +220,103 @@ fn once_the_button_is_up_an_erase_clears_the_selection_again() {
     emu.feed(&after);
     assert_eq!(emu.selection_text(), None, "松手后不该再兜底");
 }
+
+/// Claude Code 跑工具时计时器每秒一跳的重绘流。用来钉 F309。
+///
+/// **录自 tmux 客户端流**(`script` 包住 `tmux attach`,外层登记了
+/// `xterm-256color:sync`),不是 pipe-pane —— 内层流里没有这批 `CSI K`,
+/// 是 tmux 往外层重画整个 pane 时每行都补一个。4 个同步块 = 计时器 4 跳。
+const TICK: &str = "claude-code-timer-tick-repaint";
+const TICK_COLS: u16 = 120;
+const TICK_ROWS: u16 = 30;
+/// 流里用户那句提问所在的行,中间有一段路径。
+const PATH_ROW: u16 = 6;
+const PATH: &str = "~/.config/demo/env.mullion.bak";
+/// 转圈 + 计时器那一行:每跳内容都变。
+const SPINNER_ROW: u16 = 22;
+
+/// 把 fixture 切成「第一帧 / 其余各帧」。
+fn tick_split() -> (Vec<u8>, Vec<u8>) {
+    let bytes = fixture_bytes(TICK);
+    let esu = b"\x1b[?2026l";
+    let end = bytes
+        .windows(esu.len())
+        .position(|w| w == esu)
+        .expect("fixture 里应当有同步块")
+        + esu.len();
+    (bytes[..end].to_vec(), bytes[end..].to_vec())
+}
+
+fn row_text(emu: &Emulator, row: u16) -> String {
+    emu.snapshot().row(row).iter().map(|c| c.ch).collect()
+}
+
+/// 模拟一次完整的「按下 → 拖 → 松手」,返回选中的文本。
+fn drag_and_release(emu: &mut Emulator, row: u16, from: u16, to: u16) -> String {
+    emu.selection_start(from, row, SelectionKind::Simple, CellSide::Left);
+    emu.hold_selection(true);
+    emu.selection_update(to, row, CellSide::Right);
+    emu.hold_selection(false);
+    emu.selection_text().expect("这一行上应当有可选的文本")
+}
+
+/// F309:**松手之后,TUI 原样重绘一遍就把选区冲掉。**
+///
+/// 用户实报:Claude Code 跑工具期间,在它那行提问里划中一段路径、松手、按
+/// Ctrl+Shift+B —— 侧栏时而跳过去、时而只是开/关。逐帧看录像:选区高亮在
+/// 计时器跳秒那一刻消失。原因是 tmux 往外层重画整个 pane 时,凡不满宽的行都补
+/// `CSI K`,alacritty 的 `clear_line` 沾边就整段丢选区(T13)—— **哪怕这一行
+/// 重画出来的字一个没变**。F212 只在按住期间兜底,松手后照丢。
+///
+/// 补偿的判据是**内容守恒**:同坐标上的文字没变,就是同一段文本,远端只是
+/// 原样重画了它。
+///
+/// 自证会变红:把 `Emulator::feed` 里松手后那段补回逻辑删掉。
+#[test]
+fn a_verbatim_repaint_after_release_must_not_wipe_the_selection() {
+    let (first, rest) = tick_split();
+
+    // 钉住上游行为:不补偿时,这段流确实会把松手后的选区冲掉。
+    let mut loose = Emulator::new(TICK_COLS, TICK_ROWS);
+    loose.feed(&first);
+    let line = row_text(&loose, PATH_ROW);
+    // 一格一个 char;`find` 给的是字节下标,行首的 `❯` 占 3 字节,得换算成格。
+    let byte_at = line.find(PATH).expect("第 6 行应当有那段路径");
+    let at = line[..byte_at].chars().count() as u16;
+    loose.selection_start(at, PATH_ROW, SelectionKind::Simple, CellSide::Left);
+    loose.selection_update(at + PATH.len() as u16 - 1, PATH_ROW, CellSide::Right);
+    loose.feed(&rest);
+    assert_eq!(
+        loose.selection_text(),
+        None,
+        "上游 alacritty 不再因原样重绘丢选区了,F309 的补偿要重新评估"
+    );
+
+    let mut emu = Emulator::new(TICK_COLS, TICK_ROWS);
+    emu.feed(&first);
+    let got = drag_and_release(&mut emu, PATH_ROW, at, at + PATH.len() as u16 - 1);
+    assert_eq!(got, PATH, "起点就选错了,下面比的不是同一件事");
+    emu.feed(&rest);
+    assert_eq!(
+        emu.selection_text().as_deref(),
+        Some(PATH),
+        "同一行原样重画,松手后的选区不该被冲掉"
+    );
+}
+
+/// F309 的边界:重绘后**内容变了**,那就不是同一段文本了,选区该正常消失。
+/// 否则高亮会盖在一段用户从没选过的字上,复制/跳转拿到的是错的东西。
+#[test]
+fn a_repaint_that_changes_the_text_still_clears_the_released_selection() {
+    let (first, rest) = tick_split();
+    let mut emu = Emulator::new(TICK_COLS, TICK_ROWS);
+    emu.feed(&first);
+    let line = row_text(&emu, SPINNER_ROW);
+    assert!(line.contains("s ·"), "第 22 行应当是计时器行,实得 {line:?}");
+    drag_and_release(&mut emu, SPINNER_ROW, 0, 40);
+    // 只喂一跳:计时器 8s → 9s,这一行必变。
+    let esu = b"\x1b[?2026l";
+    let end = rest.windows(esu.len()).position(|w| w == esu).unwrap() + esu.len();
+    emu.feed(&rest[..end]);
+    assert_eq!(emu.selection_text(), None, "内容变了还补回去,就是张冠李戴");
+}

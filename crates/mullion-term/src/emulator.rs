@@ -131,6 +131,8 @@ pub struct Emulator {
     requested_history: usize,
     /// F212:用户此刻正按着左键划选。见 [`Emulator::hold_selection`]。
     selection_held: bool,
+    /// F309:松手那一刻的选区与其文本。见 [`Emulator::hold_selection`]。
+    kept: Option<(Selection, String)>,
 }
 
 impl Emulator {
@@ -187,6 +189,7 @@ impl Emulator {
             cwd: None,
             requested_history: history,
             selection_held: false,
+            kept: None,
         }
     }
 
@@ -276,6 +279,33 @@ impl Emulator {
         if saved.is_some() && self.term.selection.is_none() {
             self.term.selection = saved;
         }
+        self.restore_kept_selection();
+    }
+
+    /// F309:松手后的选区被远端**原样**重绘丢掉时补回。
+    ///
+    /// tmux 往外层重画 pane 时每个不满宽的行都补 `CSI K`,全屏 TUI 每跳一次
+    /// 计时器就整屏重画一遍 —— 字一个没变,选区却被 alacritty 沾边就丢(T13)。
+    /// 判据是**内容守恒**:留底坐标上的文字与松手时逐字相同才补;变了就先不补,
+    /// 候选留着(分几块画完的重绘,中途那一刻可能对不上)。
+    ///
+    /// 选区还在时让候选跟着它走:滚动路径上 alacritty 会 `rotate` 它,拿旧坐标
+    /// 去比就错位了。
+    fn restore_kept_selection(&mut self) {
+        if self.selection_held {
+            return;
+        }
+        let Some((sel, text)) = self.kept.as_mut() else {
+            return;
+        };
+        if let Some(now) = &self.term.selection {
+            *sel = now.clone();
+            return;
+        }
+        self.term.selection = Some(sel.clone());
+        if self.term.selection_to_string().as_deref() != Some(text.as_str()) {
+            self.term.selection = None;
+        }
     }
 
     /// 告诉仿真器「用户此刻正按着左键划选」。
@@ -291,9 +321,27 @@ impl Emulator {
     /// 已知取舍:同一次 `feed` 里**既滚屏又擦行**时,补回去的是没跟着滚的旧
     /// 坐标,会错位一行。接受它 —— 这类全屏 TUI 用绝对定位重绘、不滚屏;而
     /// 漏掉这个补偿的代价(整段划选在重绘期间不可用)大得多。
+    ///
+    /// **F309:** 由按住转为松开的那一下,把此刻的选区连同文本留作候选 ——
+    /// 松手后远端原样重绘同样会丢选区,见 [`Emulator::restore_kept_selection`]。
+    /// 挂在这里而不是单开一个「松手」入口,是因为 app 侧每条结束拖拽的出口
+    /// (松键、失焦…)都已经保证会调一次 `hold_selection(false)`。
     pub fn hold_selection(&mut self, held: bool) {
+        if self.selection_held && !held {
+            self.kept = self
+                .term
+                .selection
+                .clone()
+                .zip(self.selection_text())
+                .filter(|(_, t)| t.len() <= Self::KEPT_TEXT_MAX);
+        }
         self.selection_held = held;
     }
+
+    /// F309 留底文本的上限(字节)。每次选区被丢都要按留底坐标重新取一遍文本
+    /// 来比对;划中几百行回溯再松手的话,这笔钱会跟着每一帧重绘付。超过就不
+    /// 留底,退回旧行为 —— 大段选区松手时已经进了剪贴板。
+    const KEPT_TEXT_MAX: usize = 16 * 1024;
 
     /// 当前同步块(DEC 2026)的超时时刻。`None` = 没有在进行中的同步块。
     ///
@@ -515,6 +563,9 @@ impl Emulator {
 
     /// 改变网格尺寸(F34:分屏 reflow / 窗口 resize 时调用)。
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        // F309:列数一变 alacritty 会主动清掉选区(换行重排后旧坐标没意义),
+        // 留底也跟着作废,否则下一次 feed 会把它按旧坐标补回来。
+        self.kept = None;
         self.term.resize(GridSize { cols, rows });
         // 列数变了,同样的行数占的内存就跟着变 —— 必须按新列数把预算重夹
         // 一次,否则夹紧在最主要的那条路径上完全失效:pane 是按 80×24 的
@@ -569,6 +620,7 @@ impl Emulator {
             SelectionKind::Lines => SelectionType::Lines,
         };
         self.term.selection = Some(Selection::new(ty, point, side_of(side)));
+        self.kept = None;
     }
 
     /// 更新选区终点(拖拽中)。没有活跃选区时静默忽略。
@@ -583,6 +635,7 @@ impl Emulator {
     pub fn selection_clear(&mut self) {
         self.term.selection = None;
         self.selection_held = false;
+        self.kept = None;
     }
 
     /// 当前选区文本。宽字符、行尾空格裁剪、跨 scrollback 拼接都由上游
@@ -1158,6 +1211,90 @@ mod tests {
         assert_eq!(emu.selection_text().as_deref(), Some("alpha\nbravo"));
         emu.feed(b"\x1b[2;1H\x1b[K");
         assert_eq!(emu.selection_text(), None, "hold 没被 clear 撤掉");
+    }
+
+    /// F309 用的「原样重画第 1 行」:擦掉再写回同样的字 —— tmux 往外层重画
+    /// 不满宽的行就是这个形状。
+    const REPAINT_ROW0_VERBATIM: &[u8] = b"\x1b[1;1H\x1b[Kalpha";
+
+    /// 按下 → 拖到 alpha 末尾 → 松手。
+    fn select_alpha_and_release(emu: &mut Emulator) {
+        emu.feed(b"alpha\r\nbravo");
+        emu.selection_start(0, 0, SelectionKind::Simple, CellSide::Left);
+        emu.hold_selection(true);
+        emu.selection_update(4, 0, CellSide::Right);
+        emu.hold_selection(false);
+        assert_eq!(emu.selection_text().as_deref(), Some("alpha"));
+    }
+
+    /// F309:松手后原样重画,选区补回;这是下面几条「作废」断言的对照组 ——
+    /// 没有它,那几条在补偿整个没生效时也是绿的。
+    #[test]
+    fn a_released_selection_survives_a_verbatim_repaint() {
+        let mut emu = Emulator::new(20, 2);
+        select_alpha_and_release(&mut emu);
+        emu.feed(REPAINT_ROW0_VERBATIM);
+        assert_eq!(emu.selection_text().as_deref(), Some("alpha"));
+    }
+
+    /// F309:用户按键(`selection_clear`)后,留底必须作废 —— 否则远端下一次
+    /// 原样重画会把用户刚取消的高亮又画回来。
+    #[test]
+    fn clearing_the_selection_drops_the_kept_one() {
+        let mut emu = Emulator::new(20, 2);
+        select_alpha_and_release(&mut emu);
+        emu.selection_clear();
+        emu.feed(REPAINT_ROW0_VERBATIM);
+        assert_eq!(emu.selection_text(), None, "取消过的选区被补回来了");
+    }
+
+    /// F309:新按下一次就是新的意图,旧留底作废。新选区不按住、被擦掉之后,
+    /// 不该冒出上一段选区。
+    #[test]
+    fn a_new_press_drops_the_kept_one() {
+        let mut emu = Emulator::new(20, 2);
+        select_alpha_and_release(&mut emu);
+        emu.selection_start(0, 1, SelectionKind::Simple, CellSide::Left);
+        emu.selection_update(4, 1, CellSide::Right);
+        // 按下后的**第一次** feed 就擦掉新选区:此刻留底若还是旧的 alpha,
+        // 它在第 1 行原样还在,会被补回来。中间多喂一次别的,留底就会先跟着
+        // 新选区走,测不出来。
+        emu.feed(b"\x1b[2;1H\x1b[K");
+        assert_eq!(emu.selection_text(), None, "旧留底在新按下之后复活了");
+    }
+
+    /// F309:改尺寸后旧坐标没意义(换行重排),留底作废。判据只改行数:列数
+    /// 一变 alacritty 本身就会清选区,那样测不出留底有没有撤。
+    #[test]
+    fn a_resize_drops_the_kept_one() {
+        let mut emu = Emulator::new(20, 2);
+        select_alpha_and_release(&mut emu);
+        emu.resize(20, 3);
+        emu.feed(REPAINT_ROW0_VERBATIM);
+        assert_eq!(emu.selection_text(), None, "resize 之后旧留底还在");
+    }
+
+    /// F309:松手后内容滚上去,留底要跟着选区走。
+    ///
+    /// 选 bravo(第 2 行)松手,再滚一行 → bravo 到了第 1 行。此时原样重画第 1
+    /// 行:跟着走的留底在第 1 行比对,bravo == bravo,补回;没跟着走的留底还在
+    /// 第 2 行,那里现在是 charlie,对不上,选区就丢了。
+    #[test]
+    fn the_kept_selection_follows_scrolling() {
+        let mut emu = Emulator::new(20, 3);
+        emu.feed(b"alpha\r\nbravo");
+        emu.selection_start(0, 1, SelectionKind::Simple, CellSide::Left);
+        emu.hold_selection(true);
+        emu.selection_update(4, 1, CellSide::Right);
+        emu.hold_selection(false);
+        emu.feed(b"\r\ncharlie\r\ndelta");
+        assert_eq!(emu.selection_text().as_deref(), Some("bravo"));
+        emu.feed(b"\x1b[1;1H\x1b[Kbravo");
+        assert_eq!(
+            emu.selection_text().as_deref(),
+            Some("bravo"),
+            "留底没跟着滚动走,拿旧坐标比对失败"
+        );
     }
 
     #[test]
