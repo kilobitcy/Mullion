@@ -8,7 +8,7 @@ use crate::theme::Theme;
 use crate::ui::metrics::{
     button_reserve, field_w, FIELD_W_L, FIELD_W_M, FIELD_W_S, TEXT_EDIT_MARGIN_X,
 };
-use crate::ui::session_manager::form::{field_error, grid, required, section};
+use crate::ui::session_manager::form::{self, field_error, grid, required, section};
 use crate::ui::session_manager::inherit_row::{self, Source};
 use crate::ui::session_manager::{
     AuthKindUi, CredSourceUi, EditorBuffer, JumpModeUi, ProxyModeUi, SecretPresence,
@@ -162,6 +162,11 @@ fn resolve_u32<'a>(
         // 「未分组,没有上游可继承」会让用户反问「那 300ms 哪来的」。
         None => (builtin, Source::Builtin),
     }
+}
+
+/// 会话「备注」多行框的 id。测试要量它画出来的框高(F311),自动 id 定位不到。
+pub(crate) fn note_field_id() -> egui::Id {
+    egui::Id::new("mullion_session_note_field")
 }
 
 /// `focus_name`:走查 21 的一次性聚焦标志,由调用方 `take()` 后传进来 ——
@@ -348,10 +353,15 @@ pub(super) fn basic(
         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
             ui.label("备注");
         });
-        ui.add(
-            egui::TextEdit::multiline(&mut buf.note)
-                .desired_rows(3)
-                .desired_width(field_w(ui.available_width(), FIELD_W_L, 0.0)),
+        // F311:固定 3 行,写多了框内滚动,不再把下面的分节往下推。
+        form::note_box(
+            ui,
+            note_field_id(),
+            egui::TextEdit::multiline(&mut buf.note).desired_width(field_w(
+                ui.available_width(),
+                FIELD_W_L,
+                0.0,
+            )),
         );
         ui.end_row();
     });

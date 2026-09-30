@@ -484,11 +484,11 @@ fn form_column(
                     ui.label("说明");
                 });
                 let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut draft.note)
-                        .id(note_field_id())
-                        .desired_rows(3)
-                        .desired_width(w),
+                // F311:固定 3 行,写多了框内滚动。
+                crate::ui::session_manager::form::note_box(
+                    ui,
+                    note_field_id(),
+                    egui::TextEdit::multiline(&mut draft.note).desired_width(w),
                 );
                 ui.end_row();
                 ui.label("目录");
@@ -1335,9 +1335,16 @@ mod tests {
     /// 量的不是 galley —— 那是文字的高度,一行内容的多行框跟单行框一样高,
     /// 分不出来。走 [`note_field_id`] 拿控件矩形才问得着「这个框有几行」。
     fn note_field_height() -> f32 {
+        note_field_heights("").0
+    }
+
+    /// 同上,但能喂说明内容,返回 (控件外框高, 可见部分高)。可见部分是被外层
+    /// `ScrollArea` 裁过的 `interact_rect` —— 「框不长高」只能在它上面判(F311)。
+    fn note_field_heights(note: &str) -> (f32, f32) {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
-        let p = proj(1, "接口", None);
+        let mut p = proj(1, "接口", None);
+        p.note = note.to_string();
         let mut ui_state = crate::ui::UiState {
             project_manager_open: true,
             project_selected: Some(p.id),
@@ -1361,10 +1368,10 @@ mod tests {
                 );
             });
         }
-        ctx.read_response(note_field_id())
-            .expect("「说明」框没被登记 —— id 变了还是根本没画?")
-            .rect
-            .height()
+        let r = ctx
+            .read_response(note_field_id())
+            .expect("「说明」框没被登记 —— id 变了还是根本没画?");
+        (r.rect.height(), r.interact_rect.height())
     }
 
     /// F237:「说明」是多行框。
@@ -1378,6 +1385,36 @@ mod tests {
     fn the_note_field_is_tall_enough_to_hold_more_than_one_line() {
         let h = note_field_height();
         assert!(h > 40.0, "「说明」框只有 {h} 高 —— 还是单行的");
+    }
+
+    /// F311:「说明」写满 10 行后框的**可见高度**不变 —— 在框内滚动,不把
+    /// 下面的「目录」等行往下推。空说明时框必须整块可见,否则判据恒绿。
+    ///
+    /// 自证会变红:把 `form::note_box(..)` 换回裸 `ui.add(TextEdit::multiline(..))`。
+    #[test]
+    fn a_long_note_scrolls_inside_the_box_instead_of_growing_it() {
+        let (full, seen) = note_field_heights("");
+        assert!(
+            (full - seen).abs() < 0.5,
+            "前提不成立:空说明框就已经被裁掉一截({full} vs {seen})"
+        );
+        let long = (1..=10)
+            .map(|i| format!("第 {i} 行"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (full_long, seen_long) = note_field_heights(&long);
+        assert!(
+            full_long > full + 1.0,
+            "前提不成立:10 行内容没把说明框撑高({full_long}),判据测不出封顶"
+        );
+        // 容差是 egui 滚动区的裁剪外扩(`visuals.clip_rect_margin`,默认 3):
+        // `ScrollArea` 把内容的裁剪框四周各放宽这么多,`interact_rect` 跟着宽
+        // 出来,但占的布局高度仍是封顶值。没封顶时差的是整整 7 行,分得开。
+        let slack = egui::Visuals::dark().clip_rect_margin + 0.5;
+        assert!(
+            seen_long - seen <= slack,
+            "说明框写满 10 行后可见高度从 {seen} 变成 {seen_long} —— 没封顶"
+        );
     }
 
     /// 屏幕矮到装不下右栏全部内容时,「删除项目」那一行**仍然落在屏幕里**。

@@ -98,3 +98,30 @@ pub(crate) fn field_error(ui: &mut Ui, t: &Theme, show: bool, msg: &str) {
     );
     ui.end_row();
 }
+
+/// 备注类多行框固定显示几行(F311)。
+pub(crate) const NOTE_ROWS: usize = 3;
+
+/// F311:备注类多行框。**固定 [`NOTE_ROWS`] 行高**,写多了在框内竖向滚动。
+///
+/// 裸 `TextEdit::multiline` 会随内容一直长高,把下面的分节和「保存」按钮
+/// 往下推;隧道备注、会话备注、项目说明三处都走这里,行为才统一。
+///
+/// 外面包一层 `ScrollArea` 封顶:`TextEdit` 自己没有「最多几行」的开关。
+/// `min_scrolled_height` 必须同时钉住 —— egui 默认 64,溢出时框会被撑到 64
+/// 而不是停在 3 行。光标跟随不用管:`TextEdit` 打字时自己会 `scroll_to_rect`。
+///
+/// `edit` 由调用方配好宽度与占位文字,这里补 `id` 与行数。
+pub(crate) fn note_box(ui: &mut Ui, id: egui::Id, edit: egui::TextEdit<'_>) -> egui::Response {
+    // 与 `TextEdit` 内部同一口径:行高取正文字体,外加上下内边距各 2
+    // (egui 0.30 `TextEdit` 默认 `margin: Margin::symmetric(4.0, 2.0)`)。
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let row = ui.fonts(|f| f.row_height(&font));
+    let h = row * NOTE_ROWS as f32 + 4.0;
+    egui::ScrollArea::vertical()
+        .id_salt(id.with("note_box_scroll"))
+        .max_height(h)
+        .min_scrolled_height(h)
+        .show(ui, |ui| ui.add(edit.id(id).desired_rows(NOTE_ROWS)))
+        .inner
+}

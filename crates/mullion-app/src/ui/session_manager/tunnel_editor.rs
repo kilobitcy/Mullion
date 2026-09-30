@@ -331,6 +331,11 @@ pub(crate) fn ssh_candidates(sessions: &[SessionRecord]) -> Vec<&SessionRecord> 
         .collect()
 }
 
+/// 隧道「备注」多行框的 id。测试要量它画出来的框高(F311),自动 id 定位不到。
+pub(crate) fn note_field_id() -> egui::Id {
+    egui::Id::new("mullion_tunnel_note_field")
+}
+
 /// 右栏在隧道模式下的渲染。
 pub(super) fn show(
     ui: &mut egui::Ui,
@@ -478,9 +483,14 @@ pub(super) fn show(
         );
         ui.end_row();
 
-        ui.label("备注");
-        ui.add(
-            egui::TextEdit::singleline(&mut buf.note)
+        // F311:备注改多行,标签顶对齐(理由同会话备注,见 `fields.rs`)。
+        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.label("备注");
+        });
+        form::note_box(
+            ui,
+            note_field_id(),
+            egui::TextEdit::multiline(&mut buf.note)
                 .desired_width(field_w(ui.available_width(), FIELD_W_L, 0.0))
                 .hint_text(theme::hint_text(t, "这条转发是干什么的(可选)")),
         );

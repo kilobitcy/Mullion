@@ -1601,6 +1601,84 @@ mod tunnel_ui_tests {
         assert!(!has(&texts, "本地 3306"), "会话页不该画隧道行: {texts:?}");
     }
 
+    // ---- F311:备注框固定 3 行,超出框内滚动 ------------------------------
+
+    /// 量一个备注框:(控件外框高, 可见部分高)。
+    ///
+    /// 两个量缺一不可:`rect` 是 `TextEdit` 整个的大小,内容一多它照样长高;
+    /// `interact_rect` 是它被外层 `ScrollArea` 裁过之后**用户真正看到的那块**。
+    /// 「框不长高」只能在后者上判。
+    fn note_box_heights(ctx: &egui::Context, id: egui::Id) -> (f32, f32) {
+        let r = ctx
+            .read_response(id)
+            .expect("备注框没被登记 —— id 变了还是根本没画?");
+        (r.rect.height(), r.interact_rect.height())
+    }
+
+    /// 断言:空备注时框已经是多行高、且整块可见;写满 10 行后可见高度不变。
+    ///
+    /// 「整块可见」是前提,不是凑数:空备注的框若本身就被右栏裁掉一截,
+    /// 两次可见高度都等于裁剪后的高度,判据会恒绿。
+    fn assert_note_box_is_fixed(what: &str, measure: impl Fn(&str) -> (f32, f32)) {
+        let (full, seen) = measure("");
+        assert!(full > 40.0, "{what}备注框只有 {full} 高 —— 还是单行的");
+        assert!(
+            (full - seen).abs() < 0.5,
+            "前提不成立:{what}空备注框就已经被裁掉一截({full} vs {seen})"
+        );
+        let long = (1..=10)
+            .map(|i| format!("第 {i} 行"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (full_long, seen_long) = measure(&long);
+        assert!(
+            full_long > full + 1.0,
+            "前提不成立:10 行内容没把{what}备注框撑高({full_long}),判据测不出封顶"
+        );
+        // 容差是 egui 滚动区的裁剪外扩(`visuals.clip_rect_margin`,默认 3):
+        // `ScrollArea` 把内容的裁剪框四周各放宽这么多,`interact_rect` 跟着宽
+        // 出来,但占的布局高度仍是封顶值。没封顶时差的是整整 7 行,分得开。
+        let slack = egui::Visuals::dark().clip_rect_margin + 0.5;
+        assert!(
+            seen_long - seen <= slack,
+            "{what}备注框写满 10 行后可见高度从 {seen} 变成 {seen_long} —— 没封顶,会把下面的内容往下推"
+        );
+    }
+
+    /// F311:隧道备注是多行框,写多了在框内滚动而不是长高。
+    ///
+    /// 自证会变红:把 `tunnel_editor.rs` 里的 `form::note_box(..)` 换回裸
+    /// `ui.add(TextEdit::multiline(..))`(可见高度跟着长)或 `singleline`(不够高)。
+    #[test]
+    fn the_tunnel_note_is_three_rows_tall_and_scrolls_instead_of_growing() {
+        let sessions = vec![sess(1, "生产主控")];
+        assert_note_box_is_fixed("隧道", |note| {
+            let mut st = open(ManagerMode::Tunnels);
+            st.tunnel_editor = Some(TunnelEditorBuffer {
+                note: note.to_string(),
+                ..Default::default()
+            });
+            let (ctx, _) = run(&mut st, &sessions, &[]);
+            note_box_heights(&ctx, tunnel_editor::note_field_id())
+        });
+    }
+
+    /// F311:会话备注同一口径 —— 三处备注框行为统一。
+    ///
+    /// 自证会变红:把 `fields.rs` 里的 `form::note_box(..)` 换回裸 `ui.add(..)`。
+    #[test]
+    fn the_session_note_is_three_rows_tall_and_scrolls_instead_of_growing() {
+        assert_note_box_is_fixed("会话", |note| {
+            let mut st = open(ManagerMode::Sessions);
+            st.editor = Some(EditorBuffer {
+                note: note.to_string(),
+                ..Default::default()
+            });
+            let (ctx, _) = run(&mut st, &[], &[]);
+            note_box_heights(&ctx, fields::note_field_id())
+        });
+    }
+
     fn cred(id: u64, name: &str, user: &str) -> mullion_store::CredentialRecord {
         mullion_store::CredentialRecord {
             id: mullion_store::CredentialId(id),
