@@ -5,8 +5,9 @@ use super::UiState;
 use crate::shell::workspace::Preset;
 use crate::theme::{self, Theme};
 
-/// 菜单栏上下内边距。
-const MENU_MARGIN_Y: f32 = 3.0;
+/// 菜单栏上下内边距。F313 由 3 加到 6:按钮组凹槽外框离栏的上下边缘只有
+/// 3 点时看着像顶满整条栏。菜单栏随之 34 → 38(凹槽同时缩 2,见 `toolbar::BTN_PAD`)。
+const MENU_MARGIN_Y: f32 = 6.0;
 
 /// 菜单栏高度(逻辑点)。
 ///
@@ -42,7 +43,15 @@ pub fn top_menu(
                 .stroke(theme::stroke(t)),
         )
         .show(ctx, |ui| {
+            // F313:「会话/配置/关于」要在整条栏里垂直居中。`menu::bar` 内部走
+            // `ui.horizontal`,那一行的高度取的是**进门时**的 `interact_size.y`
+            // (约 20),行又贴着内容区顶部 —— 菜单项于是居中在上半截里,栏越高
+            // 越往上飘。进门前把它临时撑到整个内容区高,行就铺满、按 `Align::Center`
+            // 居中;进门后立刻还原,否则每颗菜单按钮都会被撑成整栏高。
+            let row_h = ui.spacing().interact_size.y;
+            ui.spacing_mut().interact_size.y = ui.available_height();
             egui::menu::bar(ui, |ui| {
+                ui.spacing_mut().interact_size.y = row_h;
                 ui.menu_button("会话", |ui| {
                     if ui.button("会话管理器").clicked() {
                         ui_state.session_manager_open = true;
@@ -1122,6 +1131,87 @@ mod tests {
             texts.iter().any(|(s, _)| s == "UTF-8"),
             "收起报错把常规右栏也带没了:{texts:?}"
         );
+    }
+
+    /// 画两帧已连接态的菜单栏,返回 (「会话」二字的中心 y, 第 0 颗布局按钮的矩形)。
+    fn menu_geometry() -> (f32, egui::Rect) {
+        fn find(s: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match s {
+                egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, needle)),
+                egui::Shape::Text(t) if t.galley.text() == needle => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                _ => None,
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::default();
+        let mut shapes = Vec::new();
+        // 面板首帧 `fade_in`,形状全是 Noop —— 跑两帧(同 `run_status`)。
+        for _ in 0..2 {
+            shapes = ctx
+                .run(Default::default(), |ctx| {
+                    top_menu(
+                        ctx,
+                        &crate::theme::MULLION_DARK,
+                        &mut ui_state,
+                        true,
+                        None,
+                        0,
+                    );
+                })
+                .shapes;
+        }
+        let menu = shapes
+            .iter()
+            .find_map(|cs| find(&cs.shape, "会话"))
+            .expect("菜单栏上没画出「会话」");
+        let btn = ctx
+            .read_response(toolbar::button_id(0))
+            .expect("已连接态没画出布局按钮组")
+            .rect;
+        (menu.y, btn)
+    }
+
+    /// F313:「会话/配置/关于」在菜单栏里垂直居中。
+    ///
+    /// 判据是**画出来的文字中心**对栏的中线,不是源码里有没有那两句
+    /// `interact_size`。菜单栏从 0 开始(顶层面板),中线就是 `menu_px() / 2`。
+    ///
+    /// 自证会变红:删掉 `menu::bar` 前那句 `interact_size.y = ui.available_height()`
+    /// —— 菜单行退回约 20 高、贴着内容区顶部,文字中心上移约 3 点。
+    #[test]
+    fn the_menu_titles_sit_on_the_bars_center_line() {
+        let (y, _) = menu_geometry();
+        let mid = menu_px() / 2.0;
+        assert!(
+            (y - mid).abs() <= 1.0,
+            "「会话」中心 y={y},菜单栏中线 {mid} —— 没有垂直居中"
+        );
+    }
+
+    /// F313:布局按钮组的凹槽上下都离菜单栏边缘留白 `MENU_MARGIN_Y`,且凹槽
+    /// 自身也居中 —— 菜单项和按钮组得在同一条中线上,否则一高一低。
+    ///
+    /// 自证会变红:把 `MENU_MARGIN_Y` 改回 3(留白不够),或把 `BTN_PAD` 改回 3
+    /// 而不动菜单栏(凹槽顶出去)。
+    #[test]
+    fn the_preset_group_leaves_a_margin_above_and_below_and_is_centered() {
+        let (_, btn) = menu_geometry();
+        let top = btn.top() - toolbar::GROUP_PAD;
+        let bottom = btn.bottom() + toolbar::GROUP_PAD;
+        assert!(
+            top >= 6.0 - 0.5 && menu_px() - bottom >= 6.0 - 0.5,
+            "凹槽 y={top}..{bottom},菜单栏高 {} —— 上下留白不足 6",
+            menu_px()
+        );
+        let mid = menu_px() / 2.0;
+        assert!(
+            (btn.center().y - mid).abs() <= 1.0,
+            "按钮组中心 y={},菜单栏中线 {mid} —— 与菜单项不在同一条线上",
+            btn.center().y
+        );
+        assert_eq!(menu_px(), 38.0, "F313 定的菜单栏高是 38");
     }
 
     /// F100:菜单栏与状态栏也要登记 —— 走查里「状态栏那行字太靠边」这类反馈
