@@ -526,6 +526,8 @@ pub fn status_bar(
     cloud: Option<&CloudCell>,
     // F281:分层理由见 `UiActions::copy_last_error`。
     copy_last_error: &mut bool,
+    // F312:状态栏这条报错被用户点「×」收掉了。见 `UiState::status_error_dismissed`。
+    error_dismissed: &mut bool,
 ) {
     let (left, right) = status_text(panes, connected);
     let bar = egui::TopBottomPanel::bottom("status")
@@ -567,11 +569,18 @@ pub fn status_bar(
                 }
                 // last_error 必须可见:右对齐区先画它,再画常规右栏。
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(err) = last_error {
+                    if let (Some(err), false) = (last_error, *error_dismissed) {
                         // F281:RTL 布局里先 add 的画在最右 —— 按钮先 add,
                         // 占住最右侧,报错再长也不会被挤出屏幕;文字后 add,
                         // 按剩余宽度截断,悬停给回全文。分层理由见
                         // `UiActions::copy_last_error`。
+                        //
+                        // F312:「×」在最右。`last_error` 从不被清成 `None`,
+                        // 没有这颗按钮红字就挂到重启。只收状态栏这一处,
+                        // 内容不清(「复制」和编辑器卡片还要读它)。
+                        if ui.small_button("×").on_hover_text("收起这条报错").clicked() {
+                            *error_dismissed = true;
+                        }
                         if ui
                             .small_button("复制")
                             .on_hover_text("复制这条报错")
@@ -753,6 +762,7 @@ mod tests {
                 None,
                 None,
                 &mut false,
+                &mut false,
             );
         });
         let out = ctx.run(Default::default(), |ctx| {
@@ -767,6 +777,7 @@ mod tests {
                 session_color,
                 None,
                 None,
+                &mut false,
                 &mut false,
             );
         });
@@ -797,6 +808,7 @@ mod tests {
                     None,
                     selection_path,
                     cloud,
+                    &mut false,
                     &mut false,
                 );
             });
@@ -1029,6 +1041,89 @@ mod tests {
         );
     }
 
+    /// 画一帧带报错的状态栏,`input` 为这一帧的输入;返回画出来的全部文字
+    /// 及其中心点。`dismissed` 是 `status_bar` 的 F312 出参。
+    fn error_bar_frame(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        dismissed: &mut bool,
+    ) -> Vec<(String, egui::Pos2)> {
+        fn walk(s: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.pos + t.galley.size() / 2.0))
+                }
+                _ => {}
+            }
+        }
+        let out = ctx.run(input, |ctx| {
+            status_bar(
+                ctx,
+                &crate::theme::MULLION_DARK,
+                1,
+                true,
+                Some("写入 sessions.toml 失败"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &mut false,
+                dismissed,
+            );
+        });
+        let mut acc = Vec::new();
+        out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        acc
+    }
+
+    /// F312:状态栏上的报错能被「×」收掉。`last_error` 全程序没有任何地方清成
+    /// `None`,不给这颗按钮的话红字从出现起挂到重启。
+    ///
+    /// 判据是**真点一下**之后下一帧报错不再画出来,不是源码里有没有「×」。
+    /// 自证会变红:删掉 `*error_dismissed = true;`,或把 `if let` 里的
+    /// `*error_dismissed` 判断拿掉。
+    #[test]
+    fn clicking_the_cross_takes_the_error_off_the_status_bar() {
+        let ctx = egui::Context::default();
+        let mut dismissed = false;
+        let mut texts = Vec::new();
+        // 面板首帧 `fade_in`,形状全是 Noop —— 跑两帧(同 `run_status`)。
+        for _ in 0..2 {
+            texts = error_bar_frame(&ctx, Default::default(), &mut dismissed);
+        }
+        assert!(
+            texts.iter().any(|(s, _)| s.contains("sessions.toml")),
+            "前提不成立:报错根本没画出来 {texts:?}"
+        );
+        let pos = texts
+            .iter()
+            .find(|(s, _)| s == "×")
+            .map(|(_, p)| *p)
+            .unwrap_or_else(|| panic!("状态栏报错旁边没有「×」:{texts:?}"));
+        let mut input = egui::RawInput::default();
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        let _ = error_bar_frame(&ctx, input, &mut dismissed);
+        assert!(dismissed, "点了「×」没有写出参");
+        let texts = error_bar_frame(&ctx, Default::default(), &mut dismissed);
+        assert!(
+            !texts.iter().any(|(s, _)| s.contains("sessions.toml")),
+            "收起之后报错还挂在状态栏上:{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(s, _)| s == "UTF-8"),
+            "收起报错把常规右栏也带没了:{texts:?}"
+        );
+    }
+
     /// F100:菜单栏与状态栏也要登记 —— 走查里「状态栏那行字太靠边」这类反馈
     /// 很常见,标不到它就得回到「用嘴描述」。
     ///
@@ -1061,6 +1156,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    &mut false,
                     &mut false,
                 );
                 paths = annotate::spot_paths(ctx);

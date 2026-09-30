@@ -146,6 +146,11 @@ pub struct UiState {
     /// 用户是否关掉了当前这条错误卡片。**只该由 `set_error` 复位** ——
     /// 各处直接写 `last_error` 会绕过复位,导致关掉一次后再也看不到错误。
     pub error_dismissed: bool,
+    /// F312:用户在**状态栏**上点「×」收掉了当前这条错误。与 `error_dismissed`
+    /// 各管各的:编辑器卡片关了,状态栏的兜底展示还在;状态栏收了,重新打开
+    /// 会话管理器时卡片照样能看见。同样**只该由 `set_error` 复位** —— 新错
+    /// 必须重新露出来。
+    pub status_error_dismissed: bool,
     /// 走查 13:错误卡片的「详情」是不是展开着。同 `error_dismissed`,
     /// **只该由 `set_error` 复位** —— 上一条错误展开着,不代表下一条也要
     /// 劈头甩一屏堆栈。
@@ -530,6 +535,7 @@ impl UiState {
     pub fn set_error(&mut self, msg: String) {
         self.last_error = Some(msg);
         self.error_dismissed = false;
+        self.status_error_dismissed = false;
         self.error_expanded = false;
     }
 
@@ -1022,6 +1028,7 @@ pub fn build_ui(
         // F273:云端备份结论,住在 `UiState`(见 `cloud_status` 字段文档)。
         ui_state.cloud_status.as_ref(),
         &mut actions.copy_last_error,
+        &mut ui_state.status_error_dismissed,
     );
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
@@ -1333,6 +1340,24 @@ mod tests {
     use super::*;
     use crate::shell::workspace::{title_bar_px, PaneStatus, PxRect};
     use mullion_core::layout::PaneId;
+
+    /// F312:状态栏上收掉一条报错后,**下一条**必须重新露出来;且状态栏的
+    /// 收起与编辑器卡片的关闭各管各的,互不带动。
+    ///
+    /// 自证会变红:删掉 `set_error` 里的 `self.status_error_dismissed = false;`。
+    #[test]
+    fn set_error_brings_a_dismissed_status_bar_error_back() {
+        let mut st = UiState::default();
+        st.set_error("第一个错误".into());
+        st.status_error_dismissed = true; // 用户在状态栏点了 ×
+        assert!(!st.error_dismissed, "状态栏收起不该带着把编辑器卡片也关了");
+
+        st.set_error("第二个错误".into());
+        assert!(
+            !st.status_error_dismissed,
+            "新错误必须重新出现在状态栏上,否则收过一次就再也看不到任何错误"
+        );
+    }
 
     /// 用户关掉错误卡片后,**下一个**错误必须重新弹出来。
     /// 自证会变红:删掉 `set_error` 里的 `self.error_dismissed = false;`
