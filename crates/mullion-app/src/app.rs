@@ -2517,6 +2517,8 @@ pub struct App {
     /// 输入法组字状态。组字期间 winit 照样发 `KeyboardInput`(logical_key 是
     /// 拼音字母),不靠它吞掉的话打「你好」会先往远端送一串 `nihao`。
     ime: input::ImeState,
+    /// F314:egui 文本框的组字回车闸(见 [`input::EguiImeGuard`])。
+    egui_ime_guard: input::EguiImeGuard,
     /// 上次告诉系统输入法的候选框位置(物理像素 `(x, y, w, h)`)。
     ///
     /// 记着是为了**只在变化时**调 `set_ime_cursor_area`:那是一次跨进程的
@@ -3266,6 +3268,7 @@ impl App {
             press_anchor: None,
             autoscroll: 0,
             ime: Default::default(),
+            egui_ime_guard: Default::default(),
             ime_cursor_area: None,
             pending_paste: None,
             shot_seq: 0,
@@ -13363,6 +13366,22 @@ impl ApplicationHandler<UserEvent> for App {
                 // egui —— egui-winit 对它恒返回 `repaint: true`,而下面那三句
                 // 里的 `request_redraw()` 立刻又生成一个 `RedrawRequested`,
                 // 闭环自激。判据与理由见 `egui_should_see_window_event`。
+                // F314:确认组字的那个 Enter 不能到 egui —— 它会把选中的拼音换成
+                // 换行/让框失焦,随后的 Commit 被丢。事件序列落日志,供实机核对
+                // `Commit` 与 Enter 的先后(本机验证不了)。
+                if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+                    if matches!(
+                        ke.logical_key,
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter)
+                    ) && ke.state == ElementState::Pressed
+                    {
+                        let swallow = self.egui_ime_guard.swallows_enter(Instant::now());
+                        log::debug!(target: "mullion", "ime: Enter 按下 -> egui, swallow={swallow}");
+                        if swallow {
+                            return;
+                        }
+                    }
+                }
                 if shell::input_route::egui_should_see_window_event(&event) {
                     // F175:只包住这一次调用。窗口事件在 v0.1.75 的实机剖面里是
                     // `937x/p95=1.0ms`,但那段含路由判定与标脏,拆不开就没法判断
@@ -13669,6 +13688,15 @@ impl ApplicationHandler<UserEvent> for App {
                     // 候选框位置要等下一次别的事件才更新,组字时肉眼可见地滞后一拍。
                     self.apply_ime_cursor_area();
                 } else {
+                    match &ime {
+                        winit::event::Ime::Preedit(text, _) => self.egui_ime_guard.on_preedit(text),
+                        winit::event::Ime::Commit(_) => {
+                            self.egui_ime_guard.on_commit(Instant::now())
+                        }
+                        winit::event::Ime::Disabled => self.egui_ime_guard.on_disabled(),
+                        winit::event::Ime::Enabled => {}
+                    }
+                    log::debug!(target: "mullion", "ime(egui): {ime:?}");
                     // 这串拼音是打给 egui 的。终端侧的组字状态**必须清掉**:
                     // 留着的话 F126 会把它内联画在终端光标处(用户在会话名框里
                     // 打字,终端上跟着显示拼音),而且 `swallows_key()` 恒 true

@@ -172,6 +172,51 @@ impl ImeState {
     }
 }
 
+/// 提交之后多久内到达的回车仍算「确认组字的那一下」。
+///
+/// Windows 上按回车确认拼音,`Commit` 与那个 Enter 的相对次序本机验证不了,
+/// 两种都可能,所以组字中与提交后一小段**都**要拦。取值只需盖住同一次按键
+/// 派生出的两个事件之间的间隔,又远短于人连按两次回车。
+pub const IME_ENTER_GRACE: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// F314:egui 文本框的「组字回车」闸。
+///
+/// egui 0.30 在组字期间把拼音当选中文本插进框里,却只过滤退格/方向键,
+/// **不过滤 Enter**:这个 Enter 把选中的拼音换成 `\n`(单行框则失焦),随后
+/// 到达的 `Commit` 发现光标位置对不上,整串丢掉 —— 用户看到的是内容全消失。
+/// 所以宿主要在把事件喂给 egui 之前,把确认组字的那个 Enter 吞掉。
+///
+/// 只管 egui 一侧;终端侧另有 [`ImeState::swallows_key`]。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EguiImeGuard {
+    composing: bool,
+    last_commit: Option<Instant>,
+}
+
+impl EguiImeGuard {
+    /// 非空 `Preedit` = 组字中;空 `Preedit`(取消)与 `Disabled` 结束组字。
+    pub fn on_preedit(&mut self, text: &str) {
+        self.composing = !text.is_empty();
+    }
+
+    pub fn on_commit(&mut self, now: Instant) {
+        self.composing = false;
+        self.last_commit = Some(now);
+    }
+
+    pub fn on_disabled(&mut self) {
+        self.composing = false;
+    }
+
+    /// 这个 Enter 的按下事件该不该被吞掉。
+    pub fn swallows_enter(&self, now: Instant) -> bool {
+        self.composing
+            || self
+                .last_commit
+                .is_some_and(|t| now.saturating_duration_since(t) <= IME_ENTER_GRACE)
+    }
+}
+
 /// IME 提交的文本 → 发给远端的字节。
 ///
 /// 换行归一成 `\r`,与 `mullion_term::keymap::encode_paste` 同一套规则:
@@ -390,6 +435,38 @@ mod tests {
     #[test]
     fn the_ime_ledger_is_left_alone_while_egui_is_composing() {
         assert_eq!(ime_ledger_clamp(true), None);
+    }
+
+    /// F314 守护。自证会变红:把 `swallows_enter` 里的 `self.composing ||` 删掉。
+    #[test]
+    fn enter_is_swallowed_while_egui_is_composing() {
+        let now = Instant::now();
+        let mut g = EguiImeGuard::default();
+        assert!(!g.swallows_enter(now), "没在组字时回车照常");
+        g.on_preedit("ni");
+        assert!(g.swallows_enter(now));
+        g.on_preedit("");
+        assert!(!g.swallows_enter(now), "空 Preedit = 取消,回车恢复");
+    }
+
+    /// 自证会变红:把 `on_commit` 里的 `self.last_commit = Some(now)` 删掉。
+    #[test]
+    fn enter_right_after_a_commit_is_swallowed_but_a_later_one_is_not() {
+        let t0 = Instant::now();
+        let mut g = EguiImeGuard::default();
+        g.on_preedit("ni");
+        g.on_commit(t0);
+        assert!(g.swallows_enter(t0 + Duration::from_millis(10)));
+        assert!(!g.swallows_enter(t0 + IME_ENTER_GRACE + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn disabled_ends_composing_so_enter_is_never_stuck_off() {
+        let now = Instant::now();
+        let mut g = EguiImeGuard::default();
+        g.on_preedit("ni");
+        g.on_disabled();
+        assert!(!g.swallows_enter(now));
     }
 
     #[test]
