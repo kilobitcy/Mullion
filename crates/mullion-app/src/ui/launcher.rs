@@ -498,7 +498,12 @@ fn history_column(
 pub fn history_matches(r: &crate::ui::history::HistoryRow, query: &str) -> bool {
     crate::search::matches_all(
         query,
-        &[r.head.as_str(), r.summary.as_str(), r.note.as_str()],
+        &[
+            r.head.as_str(),
+            r.projects.as_str(),
+            r.summary.as_str(),
+            r.note.as_str(),
+        ],
     )
 }
 
@@ -635,6 +640,8 @@ mod tests {
             id: id.into(),
             head: head.into(),
             summary: summary.into(),
+            projects: String::new(),
+            detail: String::new(),
             note: String::new(),
         }
     }

@@ -25,6 +25,12 @@ pub struct HistoryRow {
     pub head: String,
     /// 第二行:`prod-web-01 · nas · db-01 · +1`。
     pub summary: String,
+    /// F315:第二行前半段的项目名(`Mullion · blog`),画成 `fg_strong`。
+    /// 空串 = 这条现场里没有 pane 能对上项目。
+    pub projects: String,
+    /// F315:悬停明细,逐标签列出各 pane 的项目/tmux 名。**不进搜索**
+    /// (搜到了但行上看不见匹配词,比搜不到更糟)。空串 = 不弹。
+    pub detail: String,
     /// F256:第三行的标注(`note_text` 算的)。**空串 = 这一行不画第三行**,
     /// 行高也不加(见 `row_height`)—— 绝大多数记录都是这一种,不该为了少数
     /// 几条把每一行都撑高。
@@ -95,22 +101,67 @@ pub fn when_text(now: i64, updated_at: i64) -> String {
     }
 }
 
-/// 会话名摘要。超过 `SUMMARY_MAX` 个折成 `+N`。
+/// F315:一个标签在现场里的样子,喂给 [`summary_parts`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabBrief {
+    pub title: String,
+    /// 每块 pane 一项:`(对上的项目名, 当时所在的 tmux 会话名)`。
+    pub panes: Vec<(Option<String>, Option<String>)>,
+}
+
+/// F315:第二行的三段 `(项目名, 其余摘要, 悬停明细)`。
 ///
-/// 空列表给一句话而不是空字符串:第二行空着的话,那一行的高度还在,看着像
-/// 渲染出了 bug。
-pub fn summary_text(titles: &[String]) -> String {
-    if titles.is_empty() {
-        return "(没有可恢复的标签)".into();
+/// 每块 pane 取一个标签:对上项目的取**项目名**,否则在 tmux 里的取 **tmux 名**,
+/// 都不是的取**所在标签的标题**(机器名)。去重后项目在前、tmux 居中、机器名
+/// 最后,合计超过 `SUMMARY_MAX` 的折成 `+N`。已被项目/tmux 覆盖的 pane 不会再
+/// 贡献机器名;项目被删或改名后 tmux 名对不上,就显示 tmux 名 —— 不去猜。
+pub fn summary_parts(tabs: &[TabBrief]) -> (String, String, String) {
+    let (mut projects, mut tmuxes, mut titles) = (Vec::new(), Vec::new(), Vec::new());
+    fn push(v: &mut Vec<String>, s: &str) {
+        if !v.iter().any(|x| x == s) {
+            v.push(s.to_string());
+        }
     }
-    if titles.len() <= SUMMARY_MAX {
-        return titles.join(" · ");
+    let mut detail = Vec::new();
+    for t in tabs {
+        let mut labels = Vec::new();
+        for (proj, tmux) in &t.panes {
+            match (proj, tmux) {
+                (Some(p), _) => {
+                    push(&mut projects, p);
+                    labels.push(p.clone());
+                }
+                (None, Some(m)) => {
+                    push(&mut tmuxes, m);
+                    labels.push(format!("tmux {m}"));
+                }
+                (None, None) => {
+                    push(&mut titles, &t.title);
+                    labels.push("(无 tmux)".to_string());
+                }
+            }
+        }
+        detail.push(format!("{}: {}", t.title, labels.join(" | ")));
     }
-    format!(
-        "{} · +{}",
-        titles[..SUMMARY_MAX].join(" · "),
-        titles.len() - SUMMARY_MAX
-    )
+    let total = projects.len() + tmuxes.len() + titles.len();
+    if total == 0 {
+        return (String::new(), "(没有可恢复的标签)".into(), String::new());
+    }
+    let cut = |v: &mut Vec<String>, room: &mut usize| {
+        let keep = v.len().min(*room);
+        v.truncate(keep);
+        *room -= keep;
+    };
+    let mut room = SUMMARY_MAX;
+    cut(&mut projects, &mut room);
+    cut(&mut tmuxes, &mut room);
+    cut(&mut titles, &mut room);
+    let shown = projects.len() + tmuxes.len() + titles.len();
+    let mut rest: Vec<String> = tmuxes.into_iter().chain(titles).collect();
+    if total > shown {
+        rest.push(format!("+{}", total - shown));
+    }
+    (projects.join(" · "), rest.join(" · "), detail.join("\n"))
 }
 
 /// F256:一条记录旁边那句标注。空串 = 没什么要说的(绝大多数行都是这一种)。
@@ -223,13 +274,19 @@ pub fn row(
         theme::c32(t.fg_strong),
     );
     p.y += 20.0;
-    ui.painter().text(
-        p,
-        egui::Align2::LEFT_TOP,
-        &r.summary,
-        egui::FontId::proportional(12.0),
-        theme::c32(t.fg_muted),
-    );
+    // F315:项目名 `fg_strong`、其余 `fg_muted`,一段 LayoutJob 排成一行。
+    let fid = egui::FontId::proportional(12.0);
+    let mut job = egui::text::LayoutJob::default();
+    let fmt = |c: egui::Color32| egui::TextFormat::simple(fid.clone(), c);
+    if !r.projects.is_empty() {
+        job.append(&r.projects, 0.0, fmt(theme::c32(t.fg_strong)));
+        if !r.summary.is_empty() {
+            job.append(" · ", 0.0, fmt(theme::c32(t.fg_muted)));
+        }
+    }
+    job.append(&r.summary, 0.0, fmt(theme::c32(t.fg_muted)));
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(p, galley, theme::c32(t.fg_muted));
     // F256:第三行的标注。**用 `warn` 而不是 `fg_muted`** ——
     // 跟摘要同色的话它读起来像摘要的续行,而这句话说的是
     // 「点下去会发生什么不一样的事」(克隆一份 vs 接管槽位)。
@@ -247,7 +304,11 @@ pub fn row(
             theme::c32(t.warn),
         );
     }
-    resp
+    if r.detail.is_empty() {
+        resp
+    } else {
+        resp.on_hover_text(&r.detail)
+    }
 }
 
 /// 画弹窗。返回 `Some` = 这一帧有结论(由 `app.rs` 负责把 `draft` 置 `None`)。
@@ -444,23 +505,73 @@ mod tests {
         );
     }
 
+    fn tab(title: &str, panes: &[(Option<&str>, Option<&str>)]) -> TabBrief {
+        TabBrief {
+            title: title.into(),
+            panes: panes
+                .iter()
+                .map(|(p, m)| (p.map(String::from), m.map(String::from)))
+                .collect(),
+        }
+    }
+
+    /// F315:项目名优先,其次 tmux 名,最后才是机器名;被覆盖的 pane 不再贡献机器名。
+    /// 自证会变红:把 `summary_parts` 里 `(Some(p), _)` 与 `(None, Some(m))` 两臂的
+    /// 分类换位,或让 `(None, None)` 之外的臂也 push 标题。
     #[test]
-    fn a_short_summary_lists_every_session() {
-        let t = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(summary_text(&t), "a · b");
+    fn projects_come_first_then_tmux_then_machine_names() {
+        let (p, rest, _) = summary_parts(&[
+            tab(
+                "web-01",
+                &[(Some("Mullion"), Some("mullion")), (None, Some("ops"))],
+            ),
+            tab("nas", &[(None, None)]),
+        ]);
+        assert_eq!(p, "Mullion");
+        assert_eq!(
+            rest, "ops · nas",
+            "web-01 的 pane 都被覆盖了,不该再列机器名"
+        );
     }
 
     /// 长摘要折成 `+N` —— 不折的话第二行会把弹窗撑得比屏幕还宽。
     #[test]
     fn a_long_summary_is_folded() {
-        let t: Vec<String> = (1..=6).map(|i| format!("s{i}")).collect();
-        assert_eq!(summary_text(&t), "s1 · s2 · s3 · +3");
+        let tabs: Vec<TabBrief> = (1..=6)
+            .map(|i| tab(&format!("s{i}"), &[(None, None)]))
+            .collect();
+        let (p, rest, _) = summary_parts(&tabs);
+        assert_eq!((p.as_str(), rest.as_str()), ("", "s1 · s2 · s3 · +3"));
+    }
+
+    /// 同一项目开在几块 pane 里只列一次。
+    #[test]
+    fn the_same_project_is_listed_once() {
+        let (p, _, _) =
+            summary_parts(&[tab("a", &[(Some("X"), Some("x")), (Some("X"), Some("x"))])]);
+        assert_eq!(p, "X");
+    }
+
+    /// 项目被删/改名后 tmux 名对不上项目:显示 tmux 名,不猜。
+    #[test]
+    fn an_unmatched_tmux_name_is_shown_as_is() {
+        let (p, rest, _) = summary_parts(&[tab("a", &[(None, Some("old-proj"))])]);
+        assert_eq!((p.as_str(), rest.as_str()), ("", "old-proj"));
     }
 
     /// 空摘要给一句话,不是空字符串:那一行的高度还在,空着看着像渲染坏了。
     #[test]
     fn an_empty_summary_says_so_instead_of_going_blank() {
-        assert_eq!(summary_text(&[]), "(没有可恢复的标签)");
+        assert_eq!(summary_parts(&[]).1, "(没有可恢复的标签)");
+    }
+
+    /// 悬停明细逐标签列出各 pane,且不受 `+N` 折叠限制。
+    #[test]
+    fn the_hover_detail_lists_every_tab_even_when_the_row_folds() {
+        let tabs: Vec<TabBrief> = (1..=5)
+            .map(|i| tab(&format!("s{i}"), &[(None, None)]))
+            .collect();
+        assert_eq!(summary_parts(&tabs).2.lines().count(), 5);
     }
 
     /// 单标签单分屏不啰嗦 —— 「1 个标签 · 1 块分屏」没有信息量。
@@ -489,12 +600,16 @@ mod tests {
                 id: "a".into(),
                 head: "刚刚 · 2 个标签".into(),
                 summary: "prod · nas".into(),
+                projects: String::new(),
+                detail: String::new(),
                 note: String::new(),
             },
             HistoryRow {
                 id: "b".into(),
                 head: "3 小时前".into(),
                 summary: "db-01".into(),
+                projects: String::new(),
+                detail: String::new(),
                 note: String::new(),
             },
         ]

@@ -2077,6 +2077,7 @@ fn history_sync(launcher: bool, have: bool) -> HistorySync {
 fn history_rows_of(
     entries: &[mullion_store::HistoryEntry],
     known: Option<&[SessionId]>,
+    projects: &[mullion_store::ProjectRecord],
     now: i64,
 ) -> Vec<crate::ui::history::HistoryRow> {
     let mut out = Vec::new();
@@ -2090,7 +2091,29 @@ fn history_rows_of(
         // 丢了几个标签。**取差值而不是「有没有丢」**:用户要知道的是
         // 「四个里没了一个」还是「四个全没了」,那是两个不同的决定。
         let dropped = e.layout.tabs.len().saturating_sub(usable.tabs.len());
-        let titles: Vec<String> = usable.tabs.iter().map(|t| t.title.clone()).collect();
+        // F315:pane 的 tmux 名反查项目(同 `project_tmux_name` 的推导口径)。
+        let briefs: Vec<crate::ui::history::TabBrief> = usable
+            .tabs
+            .iter()
+            .map(|t| crate::ui::history::TabBrief {
+                title: t.title.clone(),
+                panes: t
+                    .tree
+                    .iter()
+                    .filter(|n| n.is_leaf())
+                    .map(|n| {
+                        let proj = n.tmux.as_deref().and_then(|m| {
+                            projects
+                                .iter()
+                                .find(|p| mullion_store::project_tmux_name(p) == m)
+                                .map(|p| p.name.clone())
+                        });
+                        (proj, n.tmux.clone())
+                    })
+                    .collect(),
+            })
+            .collect();
+        let (proj_text, summary, detail) = crate::ui::history::summary_parts(&briefs);
         let panes: usize = usable
             .tabs
             .iter()
@@ -2100,7 +2123,9 @@ fn history_rows_of(
         out.push(crate::ui::history::HistoryRow {
             id: e.id.clone(),
             head: crate::ui::history::head_text(&when, usable.tabs.len(), panes),
-            summary: crate::ui::history::summary_text(&titles),
+            summary,
+            projects: proj_text,
+            detail,
             note: crate::ui::history::note_text(e.alive, dropped),
         });
     }
@@ -4725,7 +4750,13 @@ impl App {
             .store
             .as_ref()
             .map(|s| s.list().iter().map(|r| r.id).collect());
-        history_rows_of(entries, known.as_deref(), mullion_store::now_secs())
+        let projects = self.store.as_ref().map_or(&[][..], |s| s.projects());
+        history_rows_of(
+            entries,
+            known.as_deref(),
+            projects,
+            mullion_store::now_secs(),
+        )
     }
 
     /// F148:菜单里点了「恢复上次的现场…」—— 现读一次盘、建草稿。
@@ -25595,6 +25626,7 @@ mod tests {
             ],
             // 只有 9 号会话还在库里 —— 另两条的标签都会被 E6 丢掉。
             Some(&[SessionId(9)]),
+            &[],
             1_000_000,
         );
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
@@ -25620,7 +25652,7 @@ mod tests {
     /// 记录的**每一个**标签都被判成「会话已删」,整个列表空掉。
     #[test]
     fn with_no_store_open_records_are_not_filtered_by_session_existence() {
-        let rows = history_rows_of(&[history_entry("x", 7, false)], None, 1_000_000);
+        let rows = history_rows_of(&[history_entry("x", 7, false)], None, &[], 1_000_000);
         assert_eq!(rows.len(), 1, "store 没打开就把记录整条丢了");
         assert!(
             rows[0].note.is_empty(),
@@ -25674,6 +25706,36 @@ mod tests {
             },
             alive,
         }
+    }
+
+    /// **接线守护 / F315**:pane 记下的 tmux 名要真的反查到项目名,落在行的
+    /// `projects` 上并能被搜到;对不上(项目已删)的退回 tmux 名。
+    /// 自证会变红:把 `history_rows_of` 里传给 `summary_parts` 的 proj 恒写成 `None`。
+    #[test]
+    fn a_panes_tmux_name_is_resolved_to_its_project_on_the_row() {
+        let mut e = history_entry("x", 7, false);
+        e.layout.tabs[0].tree = vec![
+            mullion_store::SavedNodeEntry::split(mullion_store::SavedDir::Horizontal, 0.5),
+            mullion_store::SavedNodeEntry::leaf_with(None, Some("mullion".into())),
+            mullion_store::SavedNodeEntry::leaf_with(None, Some("gone".into())),
+        ];
+        let p = mullion_store::ProjectRecord {
+            id: mullion_store::ProjectId(1),
+            name: "Mullion".into(),
+            note: String::new(),
+            nodes: Vec::new(),
+            preferred: None,
+            dir: "/x".into(),
+            tmux_name: Some("mullion".into()),
+            created_at: "2026-09-01T00:00:00Z".into(),
+            last_accessed_at: None,
+            archived_at: None,
+            icon: None,
+        };
+        let rows = history_rows_of(&[e], None, &[p], 1_000_000);
+        assert_eq!(rows[0].projects, "Mullion");
+        assert_eq!(rows[0].summary, "gone");
+        assert!(crate::ui::launcher::history_matches(&rows[0], "mullion"));
     }
 
     /// **接线守护 / F256**:点了一条「另一个窗口正在使用」的现场,是把它的
