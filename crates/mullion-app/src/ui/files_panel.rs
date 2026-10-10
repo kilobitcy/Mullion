@@ -1258,11 +1258,16 @@ pub fn show(
             // 也收不到。这种状态真会出现 —— 用户切到别的标签再切回来,这一
             // 路上搜索条没被画过,egui 会把焦点丢掉。`focused().is_none()`
             // 这道门保证它只在没人要键的时候才抢,跟路径框互抢的老问题不会回来。
+            //
+            // F318:「是否提交」**必须在自愈之前求值**。单行框按回车会交出焦点,
+            // 自愈随即把它抢回来,而 `lost_focus()` 是实时查询 —— 抢回之后再问
+            // 恒为假,回车就永远起不了搜。
+            let submitted = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if f.focus_pending || ui.ctx().memory(|m| m.focused()).is_none() {
                 resp.request_focus();
                 f.focus_pending = false;
             }
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if submitted {
                 if let Some(q) = find_query_to_start(&f.buf) {
                     action = Some(FileAction::FindStart(q));
                 }
@@ -3507,6 +3512,43 @@ mod tests {
             out
         };
         (ctx, frame, run)
+    }
+
+    /// F318:搜索框里敲完词按回车必须起搜。
+    ///
+    /// 单行输入框按回车会交出焦点,而「谁都没焦点就把焦点要回来」的自愈
+    /// 分支排在 `lost_focus()` 判据**之前**:回车那一帧先被抢回焦点,egui 的
+    /// `lost_focus()` 是实时查询,于是随后的 `lost_focus() && Enter` 恒不成立
+    /// (点「搜索」按钮不走这条判据,所以一直是好的)。
+    ///
+    /// 自证会变红:把 `submitted` 的求值挪到自愈分支之后。
+    #[test]
+    fn enter_in_the_find_box_starts_the_search_despite_the_focus_self_heal() {
+        let (ctx, mut frame, mut run) = rename_harness();
+        frame.find = Some(Find {
+            focus_pending: true,
+            buf: "abc".into(),
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            assert_eq!(run(&ctx, &mut frame, vec![]), None, "光渲染不该发动作");
+        }
+        let act = run(
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(
+            act,
+            Some(FileAction::FindStart("abc".into())),
+            "回车没起搜 —— 自愈抢回焦点后 lost_focus() 判据落空"
+        );
     }
 
     /// F200:F2 就地改名 —— 那一行画的是**输入框**,回车发出的是一对

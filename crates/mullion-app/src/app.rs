@@ -5987,6 +5987,9 @@ impl App {
         f.walk = Some(crate::files::find::Walk::new(root, query, show_hidden));
         f.seq = seq;
         mark_ui_dirty!(self.ui_dirty);
+        // F318:真正发目录请求的 `pump_find` 在下一帧才跑,不请求重绘的话
+        // 无人唤醒窗口,搜索会停在原地直到别的事件到来。
+        self.request_ui_redraw();
     }
 
     /// F278:用户按了取消 —— 停在原地,**已经找到的结果留着**。
