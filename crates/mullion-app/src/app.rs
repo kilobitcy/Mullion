@@ -2549,6 +2549,9 @@ pub struct App {
     auto_dial: Option<AutoDial>,
     /// 左键是否按住(划选进行中)。松开即结束,不跨 focus 保留。
     dragging: bool,
+    /// F320:正在拖的抽屉分隔线 `(命中到的那条, 指针 y)`。与 `dragging`(划选)
+    /// 互斥:按下时命中分隔线就不进划选。
+    divider_drag: Option<(crate::shell::workspace::divider::DrawerDivider, f32)>,
     /// F246:这次划选开始之前,egui 的键盘焦点在谁身上。
     ///
     /// 只在**编辑器开着**时记、也只在那时还(见
@@ -3321,6 +3324,7 @@ impl App {
             pending_restore: None,
             auto_dial: None,
             dragging: false,
+            divider_drag: None,
             egui_focus_before_drag: None,
             prev_click: None,
             press_anchor: None,
@@ -9246,6 +9250,100 @@ impl App {
         }
     }
 
+    /// 中央区的像素矩形。布局几何与 F320 的抽屉比例换算读同一份。
+    fn central_area(&self) -> crate::shell::workspace::PxRect {
+        let origin = self.ui.central_origin_px;
+        crate::shell::workspace::PxRect {
+            x: origin.0.max(0.0) as u32,
+            y: origin.1.max(0.0) as u32,
+            w: self.ui.central_px.0,
+            h: self.ui.central_px.1,
+        }
+    }
+
+    /// F320:指针此刻压着的抽屉分隔线。命中判据在 `workspace::divider`(纯函数)。
+    fn divider_under_cursor(&self) -> Option<crate::shell::workspace::divider::DrawerDivider> {
+        let a = self.active.as_ref()?;
+        let ws = self.active_ws()?;
+        crate::shell::workspace::divider::drawer_divider_at(
+            ws.drawers(),
+            &a.geoms,
+            self.cursor_px,
+            a.window.scale_factor() as f32,
+        )
+    }
+
+    /// F320:每个鼠标移动调一次 —— 拖动中更新预览线,否则只维护悬停光标。
+    /// 悬停状态变了才请求重绘(光标图标是在 egui 帧里设的)。
+    fn divider_pointer_moved(&mut self) {
+        let hover = if let Some((div, _)) = self.divider_drag {
+            let (ppp, cell_h) = match self.active.as_ref() {
+                Some(a) => (a.window.scale_factor() as f32, a.text.cell_h),
+                None => return,
+            };
+            let y = crate::shell::workspace::divider::clamp_y(
+                &div,
+                self.cursor_px.1,
+                crate::shell::workspace::divider::min_side_px(ppp, cell_h),
+            );
+            self.divider_drag = Some((div, self.cursor_px.1));
+            self.ui.divider_ghost = Some((div.span.x, div.span.w, y));
+            self.request_ui_redraw();
+            true
+        } else {
+            self.divider_under_cursor().is_some()
+        };
+        if self.ui.divider_hover != hover {
+            self.ui.divider_hover = hover;
+            self.request_ui_redraw();
+        }
+    }
+
+    /// F320:左键按下。命中抽屉分隔线就开始拖并返回 `true`(调用方不再进划选 /
+    /// 切焦点);没命中返回 `false`。
+    fn divider_press(&mut self) -> bool {
+        let Some(div) = self.divider_under_cursor() else {
+            return false;
+        };
+        self.divider_drag = Some((div, self.cursor_px.1));
+        self.divider_pointer_moved();
+        true
+    }
+
+    /// F320:左键松开。在拖就**落地**(这才是唯一一次改树,随后每帧的
+    /// `apply_geometry` 发一次 `window_change`,T4);返回是否消费了这次松开。
+    fn divider_release(&mut self) -> bool {
+        let Some((div, y)) = self.divider_drag.take() else {
+            return false;
+        };
+        self.ui.divider_ghost = None;
+        let (ppp, cell_h) = match self.active.as_ref() {
+            Some(a) => (a.window.scale_factor() as f32, a.text.cell_h),
+            None => (1.0, 0.0),
+        };
+        let ratio = crate::shell::workspace::divider::ratio_for(
+            &div,
+            y,
+            crate::shell::workspace::divider::min_side_px(ppp, cell_h),
+        );
+        let area = self.central_area();
+        if let Some(ws) = self.active_ws_mut() {
+            ws.set_drawer_ratio(div.drawer, area, ratio);
+        }
+        self.divider_pointer_moved();
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F320:放弃拖动(失焦等没有「松开」的出口)。不改树。
+    fn divider_cancel(&mut self) {
+        if self.divider_drag.take().is_some() {
+            self.ui.divider_ghost = None;
+            self.ui.divider_hover = false;
+            self.request_ui_redraw();
+        }
+    }
+
     /// 本帧的 pane 几何。中央区 = egui 布局后剩下的矩形(`central_origin_px` +
     /// `central_px`),布局树按像素切分它。渲染、鼠标命中、window_change 三条
     /// 路径都读这一份结果——各算各的是这类布局 bug 的经典成因。
@@ -9253,13 +9351,7 @@ impl App {
         let (Some(a), Some(ws)) = (self.active.as_ref(), self.active_ws()) else {
             return Vec::new();
         };
-        let origin = self.ui.central_origin_px;
-        let area = crate::shell::workspace::PxRect {
-            x: origin.0.max(0.0) as u32,
-            y: origin.1.max(0.0) as u32,
-            w: self.ui.central_px.0,
-            h: self.ui.central_px.1,
-        };
+        let area = self.central_area();
         crate::shell::workspace::layout_geometry(
             ws.tree(),
             area,
@@ -13607,7 +13699,9 @@ impl ApplicationHandler<UserEvent> for App {
         let focus = self.effective_focus();
         // F246:指针分流多两个输入,同样得在借出 `self.active` 之前取好。
         let editor_open = self.edit.editor.is_some();
-        let dragging = self.dragging;
+        // F320:拖抽屉分隔线同样算「指针被终端捕获」—— 拖出中央区、在 egui 的
+        // 栏上松手时,`Released` 不能被 egui 截走,否则拖动状态卡死。
+        let dragging = self.dragging || self.divider_drag.is_some();
         // Route::FilesPanel 判给面板的键记在这里,借用 `active` 的作用域结束
         // 之后再处理(`handle_panel_key` 要 `&mut self`,不能跟 `&mut self.active`
         // 同时活着)。
@@ -13780,6 +13874,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // 跳出来),winit 不会补发 `MouseInput{Released}`,`dragging`
                     // 会永久卡住、自动滚动停不下来。失焦就当拖拽结束。
                     self.dragging = false;
+                    self.divider_cancel();
                     self.autoscroll = 0;
                     self.release_selection_hold();
                     // F246:这一路没有「松开」,记下的焦点也得跟着丢掉 ——
@@ -13807,6 +13902,7 @@ impl ApplicationHandler<UserEvent> for App {
             // 指针坐标只在这里更新;滚轮上报要用(F17),划选要用(F18)。
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x as f32, position.y as f32);
+                self.divider_pointer_moved();
                 if self.dragging {
                     self.update_selection_endpoint();
                     self.request_ui_redraw();
@@ -13887,6 +13983,9 @@ impl ApplicationHandler<UserEvent> for App {
             // T5 的 Shift 逃生门分流;将来加按键上报时,分流点就在这里
             // (与上面 MouseWheel 的 `wheel_action` 同构)。
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+                // F320:命中抽屉分隔线就拖它,不切焦点、不进划选。
+                (MouseButton::Left, ElementState::Pressed) if self.divider_press() => {}
+                (MouseButton::Left, ElementState::Released) if self.divider_release() => {}
                 (MouseButton::Left, ElementState::Pressed) => {
                     // 点哪块就切到哪块(F33)。必须在 selection_press 之前:
                     // 划选的锚点要落在新焦点 pane 的坐标系里。
@@ -20957,6 +21056,48 @@ mod tests {
         assert!(
             at < body.find("refresh_from_disk").expect("重读根本没调"),
             "闸门排在重读**后面**等于没有(F244)"
+        );
+    }
+
+    /// F320:抽屉分隔线拖拽的接线(纯接线,`divider` 模块的行为测试够不着)。
+    ///
+    /// ① 左键按下:`divider_press()` 必须排在 `focus_pane_under_cursor()` 之前,
+    ///    否则按在分隔线上先切了焦点又进了划选;
+    /// ② 松开:`divider_release()` 必须排在 `selection_release()` 之前;
+    /// ③ 拖动中算「指针被终端捕获」(`dragging` 掺上 `divider_drag`),否则在
+    ///    egui 的栏上松手会被截胡、拖动状态卡死;
+    /// ④ 失焦要 `divider_cancel()`(没有「松开」的出口)。
+    ///
+    /// 自证会变红:把 ① 那条臂挪到 `focus_pane_under_cursor` 那条之后;
+    /// 或删掉 `dragging` 那行里的 `|| self.divider_drag.is_some()`。
+    #[test]
+    fn the_drawer_divider_drag_is_wired_ahead_of_selection_and_captures_the_pointer() {
+        let src = without_comments(prod_src());
+        let press = src
+            .find("(MouseButton::Left, ElementState::Pressed) if self.divider_press()")
+            .expect("按下没接 divider_press");
+        let plain = src
+            .find("(MouseButton::Left, ElementState::Pressed) => {")
+            .expect("找不到原来的左键按下臂");
+        assert!(press < plain, "divider_press 排在普通按下之后 = 永远轮不到");
+        let rel = src
+            .find("(MouseButton::Left, ElementState::Released) if self.divider_release()")
+            .expect("松开没接 divider_release");
+        let plain_rel = src
+            .find("(MouseButton::Left, ElementState::Released) => self.selection_release()")
+            .expect("找不到原来的左键松开臂");
+        assert!(
+            rel < plain_rel,
+            "divider_release 排在普通松开之后 = 永远轮不到"
+        );
+        assert!(
+            src.contains("self.dragging || self.divider_drag.is_some()"),
+            "拖分隔线没算指针捕获 —— 在 egui 栏上松手会卡死拖动"
+        );
+        assert!(src.contains("self.divider_cancel();"), "失焦没取消拖动");
+        assert!(
+            src.contains("self.divider_pointer_moved();"),
+            "CursorMoved 没驱动预览线/悬停光标"
         );
     }
 

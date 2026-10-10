@@ -97,6 +97,21 @@ pub fn paint(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) {
     }
 }
 
+/// F320:抽屉分隔线拖动中的预览线。`x`/`w`/`y` 是物理像素;画 2 个逻辑点粗、
+/// 用焦点环同色,让它在任何底色上都看得见。
+pub fn paint_ghost(ctx: &egui::Context, t: &Theme, x: u32, w: u32, y: f32) {
+    let ppp = ctx.pixels_per_point();
+    let p = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("divider_ghost"),
+    ));
+    let r = egui::Rect::from_center_size(
+        egui::pos2((x as f32 + w as f32 / 2.0) / ppp, y / ppp),
+        egui::vec2(w as f32 / ppp, 2.0),
+    );
+    p.rect_filled(r, 0.0, theme::c32(t.accent));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

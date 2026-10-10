@@ -3,6 +3,7 @@
 //! 零 winit/wgpu/egui —— 状态机部分可纯单测,这是本切片能在无头容器里验证
 //! 布局与 window_change 行为的前提。
 
+pub mod divider;
 pub mod geom;
 pub mod preset;
 
@@ -61,7 +62,9 @@ pub fn default_link_alive(hosts: &[HostConn], ix: usize) -> bool {
 use std::sync::Arc;
 use std::time::Instant;
 
-use mullion_core::layout::{close_pane, leaves, split_pane, Dir, Node, PaneId};
+use mullion_core::layout::{
+    close_pane, leaves, resize_for_pane, split_pane, Dir, Node, PaneId, Rect,
+};
 use mullion_ssh::session::{SshConnection, SshSession, TrySendErr};
 use mullion_term::emulator::Emulator;
 use tokio::sync::mpsc::{error::TryRecvError, Receiver};
@@ -590,6 +593,26 @@ impl Workspace {
         // 开了就是要敲命令 —— 与 F286「用户亲手开的格子焦点跟过去」同一条规矩。
         self.focus = id;
         Some(id)
+    }
+
+    /// F320:把抽屉与父 pane 之间那条 Split 的比例设成 `ratio`(父 pane 占的份额)。
+    ///
+    /// `area` 是整个终端区(与 `layout_geometry` 同一份)。走 core 的
+    /// `resize_for_pane`,夹紧逻辑不在这里另写一份;只改树,不碰 PTY ——
+    /// 之后每帧的 `apply_geometry` 发现网格变了自会发一次 `window_change`(T4)。
+    /// 比例**不持久化**:重排挂回抽屉时仍用 `DRAWER_RATIO`。
+    pub fn set_drawer_ratio(&mut self, id: PaneId, area: PxRect, ratio: f32) -> bool {
+        if !self.is_drawer(id) {
+            return false;
+        }
+        let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+        let root = Rect {
+            col: clamp(area.x),
+            row: clamp(area.y),
+            cols: clamp(area.w),
+            rows: clamp(area.h),
+        };
+        resize_for_pane(&mut self.tree, root, id, ratio).is_some()
     }
 
     /// 关抽屉:兄弟顶替、channel 显式关(F140)、标记清除、焦点回父 pane。
@@ -1932,6 +1955,40 @@ mod tests {
             }
             other => panic!("开完不是一个 Split:{other:?}"),
         }
+    }
+
+    /// F320:拖抽屉分隔线 = 改那一条 Split 的比例;只对抽屉生效,关掉重开
+    /// 后比例回到 `DRAWER_RATIO`(拖完不记)。
+    ///
+    /// 自证会变红:删掉 `set_drawer_ratio` 开头的 `is_drawer` 判据(第二条红);
+    /// 把 `set_drawer_ratio` 的函数体掏空(第一条红)。
+    #[test]
+    fn dragging_the_drawer_divider_sets_the_ratio_and_is_not_remembered() {
+        let (mut ws, _) = ws_with(1);
+        let d = ws.open_drawer(None).unwrap();
+        let area = PxRect {
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        };
+        assert!(ws.set_drawer_ratio(d, area, 0.5));
+        match ws.tree() {
+            Node::Split { ratio, .. } => assert!((ratio - 0.5).abs() < 1e-6),
+            other => panic!("不是 Split:{other:?}"),
+        }
+        assert!(
+            !ws.set_drawer_ratio(PaneId(1), area, 0.3),
+            "普通 pane 不是抽屉,不许被这条路改比例"
+        );
+        // 重排(关/开预设)把抽屉挂回去时比例重置。
+        ws.close_drawer(d);
+        let d2 = ws.open_drawer(None).unwrap();
+        match ws.tree() {
+            Node::Split { ratio, .. } => assert!((ratio - DRAWER_RATIO).abs() < 1e-6),
+            other => panic!("不是 Split:{other:?}"),
+        }
+        let _ = d2;
     }
 
     /// 一块 pane 至多一个抽屉;抽屉自己不能再开抽屉。两种情形都返回 `None`

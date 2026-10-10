@@ -162,6 +162,11 @@ pub struct UiState {
     /// 否则第 0 行画在窗口顶端、被顶部菜单栏盖住(用户看不到首行输出)。
     /// 鼠标坐标换算要用同一个原点,见 `App::cursor_in_grid`。
     pub central_origin_px: (f32, f32),
+    /// F320:指针压在抽屉分隔线的命中条带上(或正在拖它)—— 光标要变成上下箭头。
+    pub divider_hover: bool,
+    /// F320:拖动中的预览线 `(x, w, y)`,物理像素。拖动期间布局树不动(PTY 不收
+    /// `window_change`),只画这条线跟手;松手才真正改比例。
+    pub divider_ghost: Option<(u32, u32, f32)>,
     pub request_disconnect: bool,
     pub request_quit: bool,
 
@@ -1286,6 +1291,12 @@ pub fn build_ui(
     // (`Order::Middle`),分界线是 `Order::Background` 的 layer_painter,
     // 层序由 Order 决定而不是调用顺序,但把「底衬」放前面读起来才顺。
     pane_edges::paint(ctx, t, frame.titles);
+    if let Some((x, w, y)) = ui_state.divider_ghost {
+        pane_edges::paint_ghost(ctx, t, x, w, y);
+    }
+    if ui_state.divider_hover {
+        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
     let title_action = pane_title::show(ctx, t, frame.titles);
     actions.close_pane = title_action.close;
     actions.rehost_pane = title_action.rehost;
