@@ -208,6 +208,15 @@ impl EguiImeGuard {
         self.composing = false;
     }
 
+    /// F316 取证用:组字中或提交后 3 秒内。窗口里这段时间的**所有**按键都落日志,
+    /// 用来核对确认组字的那个回车到底有没有、以什么形态到达(日志里曾完全没有它)。
+    pub fn near_ime(&self, now: Instant) -> bool {
+        self.composing
+            || self.last_commit.is_some_and(|t| {
+                now.saturating_duration_since(t) <= std::time::Duration::from_secs(3)
+            })
+    }
+
     /// 这个 Enter 的按下事件该不该被吞掉。
     pub fn swallows_enter(&self, now: Instant) -> bool {
         self.composing
@@ -403,6 +412,19 @@ pub fn autoscroll_lines(px_y: f32, win_h: f32, cell_h: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// F316 取证闸:组字中与提交后 3 秒内算「输入法活动附近」,更早不算(日志不被平时的按键淹没)。
+    #[test]
+    fn near_ime_covers_composing_and_three_seconds_after_commit() {
+        let t0 = Instant::now();
+        let mut g = EguiImeGuard::default();
+        assert!(!g.near_ime(t0));
+        g.on_preedit("a");
+        assert!(g.near_ime(t0));
+        g.on_commit(t0);
+        assert!(g.near_ime(t0 + Duration::from_secs(2)));
+        assert!(!g.near_ime(t0 + Duration::from_secs(4)));
+    }
     use super::*;
 
     /// F210 组字锚点测试用的 pane 号。取哪个值不重要,前后一致即可。

@@ -13539,6 +13539,22 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Occluded(occluded) => {
                 crate::logx::line(&format!("Occluded({occluded})"));
+        // F316 取证:输入法活动前后的每个按键(含释放、`Process`、`Dead`)都落日志。
+        // 多行框里「组字回车后文字没了、光标落到第二行」在日志里看不到任何 Enter,
+        // 要先弄清回车到底以什么形态到达,再谈修。
+        if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+            if self.egui_ime_guard.near_ime(Instant::now()) {
+                log::debug!(
+                    target: "mullion",
+                    "ime-key: {:?} logical={:?} physical={:?} text={:?} repeat={}",
+                    ke.state,
+                    ke.logical_key,
+                    ke.physical_key,
+                    ke.text,
+                    ke.repeat
+                );
+            }
+        }
                 if !occluded {
                     self.recheck_visibility();
                     self.request_ui_redraw();
@@ -13727,7 +13743,22 @@ impl ApplicationHandler<UserEvent> for App {
                         winit::event::Ime::Disabled => self.egui_ime_guard.on_disabled(),
                         winit::event::Ime::Enabled => {}
                     }
-                    log::debug!(target: "mullion", "ime(egui): {ime:?}");
+                    // F316 取证:顺带记下此刻 egui 的焦点控件与它的光标/选区,
+                    // 用来核对 `Commit` 到达时框里是什么状态。
+                    let (focused, cursor) = self.active.as_ref().map_or((None, None), |a| {
+                        let id = a.egui_ctx.memory(|m| m.focused());
+                        let cur = id.and_then(|id| {
+                            egui::widgets::text_edit::TextEditState::load(&a.egui_ctx, id)
+                                .and_then(|st| st.cursor.char_range())
+                                .map(|r| (r.primary.index, r.secondary.index))
+                        });
+                        (id, cur)
+                    });
+                    log::debug!(
+                        target: "mullion",
+                        "ime(egui): {ime:?} focused={focused:?} cursor={cursor:?} modal={}",
+                        self.modal_open()
+                    );
                     // 这串拼音是打给 egui 的。终端侧的组字状态**必须清掉**:
                     // 留着的话 F126 会把它内联画在终端光标处(用户在会话名框里
                     // 打字,终端上跟着显示拼音),而且 `swallows_key()` 恒 true
