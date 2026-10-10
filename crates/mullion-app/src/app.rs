@@ -13649,10 +13649,10 @@ impl ApplicationHandler<UserEvent> for App {
                 // 换行/让框失焦,随后的 Commit 被丢。事件序列落日志,供实机核对
                 // `Commit` 与 Enter 的先后(本机验证不了)。
                 if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
-                    if matches!(
-                        ke.logical_key,
-                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter)
-                    ) && ke.state == ElementState::Pressed
+                    // 逻辑键与物理键都看:输入法确认组字的回车逻辑键是 `Process`
+                    // (v0.1.125 实机日志),只认 `Named(Enter)` 永远拦不住。
+                    if input::is_enter_press(&ke.logical_key, &ke.physical_key)
+                        && ke.state == ElementState::Pressed
                     {
                         let swallow = self.egui_ime_guard.swallows_enter(Instant::now());
                         log::debug!(target: "mullion", "ime: Enter 按下 -> egui, swallow={swallow}");
@@ -32451,6 +32451,29 @@ mod tests {
             clamp < hpo,
             "ime_ledger_clamp 必须排在 handle_platform_output 之前,否则账本改了也没人读,\
              中文输入照样会被 egui 关掉"
+        );
+    }
+
+    /// F314 真根因的接线守护:egui 一侧的组字回车闸必须经 `is_enter_press`
+    /// (逻辑键 + 物理键)判回车,而不是只认 `Named(Enter)` —— 输入法确认组字的
+    /// 回车到达时逻辑键是 `Process`(v0.1.125 实机日志)。
+    /// 自证会变红:把那处判据换回 `matches!(ke.logical_key, ...Named(...Enter))`。
+    /// 锚点带行首换行 + 缩进,避开本测试自己的字面量。
+    #[test]
+    fn the_egui_enter_gate_judges_enter_by_logical_and_physical_key() {
+        let src = include_str!("app.rs");
+        let gate = src
+            .find(
+                "\n                    if input::is_enter_press(&ke.logical_key, &ke.physical_key)",
+            )
+            .expect("egui 组字回车闸没有走 input::is_enter_press");
+        let tail = &src[gate..];
+        let swallow = tail
+            .find("self.egui_ime_guard.swallows_enter(")
+            .expect("闸里没有 swallows_enter");
+        assert!(
+            swallow < 600,
+            "is_enter_press 与 swallows_enter 不在同一个闸里"
         );
     }
 

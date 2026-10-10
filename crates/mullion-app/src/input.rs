@@ -179,6 +179,17 @@ impl ImeState {
 /// 派生出的两个事件之间的间隔,又远短于人连按两次回车。
 pub const IME_ENTER_GRACE: std::time::Duration = std::time::Duration::from_millis(60);
 
+/// F314:这个按键是不是回车。**逻辑键与物理键都要看**:输入法接管后,确认组字的
+/// 回车逻辑键是 `Named(Process)`,只有物理键还是 Enter(见测试里的实机日志)。
+pub fn is_enter_press(logical: &WKey, physical: &winit::keyboard::PhysicalKey) -> bool {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    matches!(logical, WKey::Named(NamedKey::Enter))
+        || matches!(
+            physical,
+            PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter)
+        )
+}
+
 /// F314:egui 文本框的「组字回车」闸。
 ///
 /// egui 0.30 在组字期间把拼音当选中文本插进框里,却只过滤退格/方向键,
@@ -412,6 +423,32 @@ pub fn autoscroll_lines(px_y: f32, win_h: f32, cell_h: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// F314 的真根因(v0.1.125 实机日志):微信输入法确认组字的回车到达时是
+    /// `logical=Named(Process) physical=Code(Enter)`,**不是** `Named(Enter)`。
+    /// egui-winit 取 `logical.or(physical)`,`Process` 翻不出键,就落到物理键 Enter,
+    /// 多行框于是把选中的拼音换成 `\n`、随后的 `Commit` 因光标对不上被丢。
+    /// 闸若只看逻辑键,这一下永远拦不住。自证会变红:删掉 `is_enter_press` 里的物理键分支。
+    #[test]
+    fn the_composition_confirming_enter_arrives_as_process_with_a_physical_enter() {
+        use winit::keyboard::{KeyCode, NamedKey, PhysicalKey};
+        let process = WKey::Named(NamedKey::Process);
+        assert!(is_enter_press(&process, &PhysicalKey::Code(KeyCode::Enter)));
+        assert!(is_enter_press(
+            &process,
+            &PhysicalKey::Code(KeyCode::NumpadEnter)
+        ));
+        assert!(is_enter_press(
+            &WKey::Named(NamedKey::Enter),
+            &PhysicalKey::Code(KeyCode::Enter)
+        ));
+        // 组字中的字母键(`Process` + 物理 S)不是回车,不能误吞。
+        assert!(!is_enter_press(&process, &PhysicalKey::Code(KeyCode::KeyS)));
+        assert!(!is_enter_press(
+            &WKey::Character("a".into()),
+            &PhysicalKey::Code(KeyCode::KeyA)
+        ));
+    }
 
     /// F316 取证闸:组字中与提交后 3 秒内算「输入法活动附近」,更早不算(日志不被平时的按键淹没)。
     #[test]
