@@ -78,6 +78,12 @@ pub struct SavedNodeEntry {
     /// `None` = 当初不在 tmux 里 / 远端没开 `set-titles`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux: Option<String>,
+    /// F317:关 exe 那一刻这块 pane 属于哪个项目(由上报的 tmux 名反查得出)。
+    /// 恢复时据此在项目候选节点里挑首跳能通的,而不是死拨布局里记的那条会话。
+    /// `None` = 不属于项目 / 旧版 exe 写的(恢复时按 tmux 名兜底匹配)。
+    /// **不升 `CURRENT_LAYOUT_SCHEMA`**:缺省即旧语义,旧文件照读。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<crate::project::ProjectId>,
 }
 
 impl SavedNodeEntry {
@@ -93,7 +99,15 @@ impl SavedNodeEntry {
             ratio: None,
             session_id,
             tmux,
+            project: None,
         }
+    }
+
+    /// F317:给叶子挂上所属项目(链式,免得改 `leaf_with` 的全部调用点)。
+    #[must_use]
+    pub fn with_project(mut self, project: Option<crate::project::ProjectId>) -> Self {
+        self.project = project;
+        self
     }
 
     /// 一个二分节点。
@@ -103,6 +117,7 @@ impl SavedNodeEntry {
             ratio: Some(ratio),
             session_id: None,
             tmux: None,
+            project: None,
         }
     }
 
@@ -407,6 +422,46 @@ mod tests {
         assert_eq!(l.tmux.as_deref(), Some("web01"));
         assert_eq!(l.dir, None);
         assert_eq!(l.ratio, None);
+    }
+
+    /// F317:没有 `project` 字段的旧现场文件照读(`None`),且仍是叶子;
+    /// 带 `project` 的经真实文件一个来回不变形;没有项目的叶子不写出该键。
+    ///
+    /// 自证会变红:去掉 `project` 上的 `#[serde(default)]`(旧文件读不回)
+    /// 或让 `is_leaf` 把 `project` 也算进去。
+    #[test]
+    fn a_leaf_may_carry_a_project_and_old_files_without_one_still_load_f317() {
+        let old = r#"
+schema_version = 1
+active_tab = 0
+updated_at = 0
+
+[[tab]]
+kind = "terminal"
+session_id = 3
+title = "t"
+focus_leaf = 0
+
+[[tab.tree]]
+session_id = 3
+tmux = "web01"
+"#;
+        let l: SavedLayout = toml::from_str(old).expect("旧文件(无 project)必须能读");
+        let e = &l.tabs[0].tree[0];
+        assert_eq!(e.project, None);
+        assert!(e.is_leaf());
+
+        let with = SavedNodeEntry::leaf_with(Some(SessionId(3)), Some("p".into()))
+            .with_project(Some(crate::project::ProjectId(9)));
+        assert!(with.is_leaf(), "带项目的叶子被当成了分割节点");
+        let mut l2 = l.clone();
+        l2.tabs[0].tree = vec![with.clone()];
+        let text = toml::to_string_pretty(&l2).unwrap();
+        assert!(text.contains("project = 9"), "{text}");
+        let back: SavedLayout = toml::from_str(&text).unwrap();
+        assert_eq!(back.tabs[0].tree[0], with);
+        l2.tabs[0].tree = vec![SavedNodeEntry::leaf_with(Some(SessionId(3)), None)];
+        assert!(!toml::to_string_pretty(&l2).unwrap().contains("project"));
     }
 
     /// F160:没有身份的叶子编出来必须还是**空表**,与今天的文件逐字节一致。

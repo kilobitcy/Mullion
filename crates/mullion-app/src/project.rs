@@ -410,6 +410,165 @@ pub fn project_of<'a>(
     })
 }
 
+// ---- F317 恢复现场时按首跳连通性给项目叶子选节点 ------------------------
+
+/// F317:恢复时这个叶子属于哪个项目。
+///
+/// 叶子记了项目 id 就只认 id(项目已被删 = 不属于任何项目,**不**再按 tmux
+/// 名去撞别的项目);旧现场没有 id 才按 tmux 名兜底(同 [`project_of`])。
+pub fn restore_project<'a>(
+    leaf: &crate::shell::layout_snapshot::LeafIdentity,
+    projects: &'a [mullion_store::ProjectRecord],
+) -> Option<&'a mullion_store::ProjectRecord> {
+    match leaf.project {
+        Some(id) => projects.iter().find(|p| p.id == id),
+        None => project_of(leaf.tmux.as_deref(), projects),
+    }
+}
+
+/// F317:这个叶子**可以被改连**吗?是则给出它的项目。
+///
+/// 三条都要满足:①属于某个项目;②布局记的会话还在库里(被删的叶子沿用
+/// `main_leaf` 的 known 判据,本切片先不动,见 spec F317「待定」);③布局记的
+/// 会话**确属该项目的 nodes**。③是安全闸:tmux 名反查只认名字,用户可能在
+/// 另一台机器上开过同名会话,不在项目节点里的会话不能被悄悄改连到项目的机器上。
+fn restorable_project<'a>(
+    leaf: &crate::shell::layout_snapshot::LeafIdentity,
+    projects: &'a [mullion_store::ProjectRecord],
+    known: &dyn Fn(mullion_store::SessionId) -> bool,
+) -> Option<&'a mullion_store::ProjectRecord> {
+    let s = leaf.session_id.filter(|s| known(*s))?;
+    restore_project(leaf, projects).filter(|p| p.nodes.contains(&s))
+}
+
+/// F317:这次恢复需要探测的项目及其候选节点(已按 [`candidates`] 排好序、
+/// 滤掉了库里已不存在的会话)。**候选不足两条的不探**(没得选)。
+/// 按叶子前序出现的先后、每个项目只出现一次。
+pub fn restore_probe_groups(
+    leaves: &[crate::shell::layout_snapshot::LeafIdentity],
+    projects: &[mullion_store::ProjectRecord],
+    known: &dyn Fn(mullion_store::SessionId) -> bool,
+    is_routed: &dyn Fn(mullion_store::SessionId) -> bool,
+) -> Vec<(mullion_store::ProjectId, Vec<mullion_store::SessionId>)> {
+    let mut out: Vec<(mullion_store::ProjectId, Vec<mullion_store::SessionId>)> = Vec::new();
+    for leaf in leaves {
+        let Some(p) = restorable_project(leaf, projects, known) else {
+            continue;
+        };
+        if out.iter().any(|(id, _)| *id == p.id) {
+            continue;
+        }
+        let cands: Vec<_> = candidates(p, is_routed)
+            .into_iter()
+            .filter(|s| known(*s))
+            .collect();
+        if cands.len() >= 2 {
+            out.push((p.id, cands));
+        }
+    }
+    out
+}
+
+/// F317:一个叶子被改连了:(叶子前序序号, 原会话, 新会话)。
+pub type Rehomed = (usize, mullion_store::SessionId, mullion_store::SessionId);
+
+/// F317:把探测结果落到叶子身份上 —— 可改连的项目叶子的 `session_id` 换成
+/// 选中的节点,同时补上 `project`(旧现场按 tmux 名兜底认出来的也记下来)。
+/// 其余字段(尤其 `tmux`)原样不动:attach 仍按 tmux 名走 `take_attach_intent`。
+///
+/// 返回改写后的身份,以及真正换了节点的那些(选中的恰是原会话则不算)。
+pub fn apply_restore_picks(
+    leaves: &[crate::shell::layout_snapshot::LeafIdentity],
+    projects: &[mullion_store::ProjectRecord],
+    known: &dyn Fn(mullion_store::SessionId) -> bool,
+    picks: &[(mullion_store::ProjectId, mullion_store::SessionId)],
+) -> (
+    Vec<crate::shell::layout_snapshot::LeafIdentity>,
+    Vec<Rehomed>,
+) {
+    let mut changed = Vec::new();
+    let out = leaves
+        .iter()
+        .enumerate()
+        .map(|(ix, leaf)| {
+            let mut leaf = leaf.clone();
+            let Some(p) = restorable_project(&leaf, projects, known) else {
+                return leaf;
+            };
+            leaf.project = Some(p.id);
+            let from = leaf.session_id.expect("restorable_project 保证有会话");
+            if let Some((_, to)) = picks.iter().find(|(id, _)| *id == p.id) {
+                if *to != from {
+                    leaf.session_id = Some(*to);
+                    changed.push((ix, from, *to));
+                }
+            }
+            leaf
+        })
+        .collect();
+    (out, changed)
+}
+
+/// F317:一个候选节点的探测输入。`plan` = `(首跳键, 探测参数)`,解析失败的是 `Err`。
+pub struct RestoreCand<Q> {
+    pub id: mullion_store::SessionId,
+    pub label: String,
+    pub plan: Result<(String, Q), String>,
+}
+
+/// F317:一个项目的探测结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePick {
+    pub project: mullion_store::ProjectId,
+    pub node: mullion_store::SessionId,
+    pub skipped: Vec<String>,
+}
+
+/// F317:对每个项目逐个 [`pick_node`](直连优先的顺序、末位不探都沿用 F304),
+/// 但**同一个首跳键本次只探一次** —— 两个项目的候选共用一个跳板/一台机器时,
+/// 不重复掐 3 秒。缓存只活在这一次调用里:不跨恢复、不落盘(换了网络的第二次
+/// 恢复必须重探)。
+pub async fn pick_for_restore<Q, F, Fut>(
+    groups: Vec<(mullion_store::ProjectId, Vec<RestoreCand<Q>>)>,
+    probe: F,
+) -> Vec<RestorePick>
+where
+    F: Fn(Q) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let cache: Arc<Mutex<HashMap<String, Result<(), String>>>> = Arc::default();
+    let probe = Arc::new(probe);
+    let mut out = Vec::new();
+    for (project, mut cands) in groups {
+        let Some(last) = cands.pop() else {
+            continue;
+        };
+        let probes = cands.into_iter().map(|c| (c.id, c.label, c.plan)).collect();
+        let (node, skipped) = pick_node(probes, last.id, |(key, q)| {
+            let cache = Arc::clone(&cache);
+            let probe = Arc::clone(&probe);
+            async move {
+                let hit = cache.lock().expect("探测缓存").get(&key).cloned();
+                if let Some(r) = hit {
+                    return r;
+                }
+                let r = probe(q).await;
+                cache.lock().expect("探测缓存").insert(key, r.clone());
+                r
+            }
+        })
+        .await;
+        out.push(RestorePick {
+            project,
+            node,
+            skipped,
+        });
+    }
+    out
+}
+
 /// F224:该给哪些项目记一笔访问时间。
 ///
 /// **跃迁触发,不是电平触发。** 上报是持续的(每几秒一批),照字面「命中就
@@ -1585,5 +1744,184 @@ mod tests {
         assert_eq!(draft.name, "web");
         assert_eq!(draft.tmux_name.as_deref(), Some("claude-web"));
         assert_eq!(draft.nodes, vec![mullion_store::SessionId(7)]);
+    }
+
+    // ---- F317 ----
+
+    fn leaf(
+        session: u64,
+        tmux: Option<&str>,
+        project: Option<u64>,
+    ) -> crate::shell::layout_snapshot::LeafIdentity {
+        crate::shell::layout_snapshot::LeafIdentity {
+            session_id: Some(mullion_store::SessionId(session)),
+            tmux: tmux.map(str::to_string),
+            project: project.map(mullion_store::ProjectId),
+        }
+    }
+
+    fn pnamed(id: u64, name: &str, nodes: &[u64]) -> mullion_store::ProjectRecord {
+        let mut p = named(id, name);
+        p.nodes = nodes.iter().map(|n| mullion_store::SessionId(*n)).collect();
+        p
+    }
+
+    fn sid(n: u64) -> mullion_store::SessionId {
+        mullion_store::SessionId(n)
+    }
+
+    /// F317:记了项目 id 的只认 id(项目被删了不去撞别的项目),旧现场没 id 才按 tmux 名兜底。
+    ///
+    /// 自证会变红:把 `restore_project` 改成总是先按 tmux 名找。
+    #[test]
+    fn a_leaf_with_a_project_id_is_matched_by_id_and_only_a_legacy_one_by_tmux_name_f317() {
+        let ps = [pnamed(1, "api", &[1, 2]), pnamed(2, "web", &[3])];
+        let api_tmux = mullion_store::project_tmux_name(&ps[0]);
+        let by_id = leaf(1, Some("随便"), Some(2));
+        assert_eq!(restore_project(&by_id, &ps).map(|p| p.id.0), Some(2));
+        let deleted = leaf(1, Some(&api_tmux), Some(99));
+        assert!(
+            restore_project(&deleted, &ps).is_none(),
+            "项目已删,不该再按 tmux 名撞上别的项目"
+        );
+        let legacy = leaf(1, Some(&api_tmux), None);
+        assert_eq!(restore_project(&legacy, &ps).map(|p| p.id.0), Some(1));
+    }
+
+    /// F317:只有「属于项目、会话在库、会话确属项目 nodes、候选>=2」的才探;
+    /// 每个项目只出现一次;候选里库中已不存在的被滤掉,直连的排前面。
+    ///
+    /// 自证会变红:删掉 `restorable_project` 里的 `p.nodes.contains` 过滤,
+    /// 「别的机器上同名会话」那个叶子就会让 p1 以外再多出一个组。
+    #[test]
+    fn only_project_leaves_on_a_project_node_with_a_real_choice_are_probed_f317() {
+        let p1 = pnamed(1, "api", &[1, 2, 5]);
+        let p2 = pnamed(2, "web", &[3]); // 只有一条候选:没得选
+        let p3 = pnamed(3, "other", &[7, 8]);
+        let t1 = mullion_store::project_tmux_name(&p1);
+        let t3 = mullion_store::project_tmux_name(&p3);
+        let leaves = vec![
+            leaf(2, Some(&t1), Some(1)),
+            leaf(1, Some(&t1), None), // 同一项目第二个叶子:只出现一次
+            leaf(3, None, Some(2)),
+            leaf(9, Some(&t3), None), // 会话 9 不在 p3 的 nodes 里:不动
+            leaf(1, Some("plain"), None),
+        ];
+        let known = |s: mullion_store::SessionId| s.0 != 5; // 5 已被删
+        let routed = |s: mullion_store::SessionId| s.0 == 1; // 1 是跳板线路
+        let got = restore_probe_groups(&leaves, &[p1, p2, p3], &known, &routed);
+        assert_eq!(
+            got,
+            vec![(mullion_store::ProjectId(1), vec![sid(2), sid(1)])]
+        );
+    }
+
+    /// F317:改写只动「可改连」的叶子的 session_id;tmux 名原样保留(attach 仍按名走);
+    /// 旧现场按 tmux 名认出的叶子补上 project;选中的恰是原会话不算换节点;
+    /// 会话已被删的叶子不改写。
+    ///
+    /// 自证会变红:去掉 `leaf.project = Some(p.id)`,或让改写也作用于不满足
+    /// `restorable_project` 的叶子。
+    #[test]
+    fn picks_rewrite_only_restorable_leaves_and_keep_the_tmux_name_f317() {
+        let p1 = pnamed(1, "api", &[1, 2]);
+        let t1 = mullion_store::project_tmux_name(&p1);
+        let leaves = vec![
+            leaf(1, Some(&t1), None),     // 旧现场,按名认出,改连 2
+            leaf(1, Some("plain"), None), // 非项目:不动
+            leaf(9, Some(&t1), Some(1)),  // 会话不在 nodes:不动
+            leaf(2, Some(&t1), Some(1)),  // 选中的就是 2:不算换
+        ];
+        let (out, changed) = apply_restore_picks(
+            &leaves,
+            std::slice::from_ref(&p1),
+            &|_| true,
+            &[(mullion_store::ProjectId(1), sid(2))],
+        );
+        assert_eq!(out[0].session_id, Some(sid(2)));
+        assert_eq!(out[0].tmux.as_deref(), Some(t1.as_str()), "tmux 名被动了");
+        assert_eq!(out[0].project, Some(mullion_store::ProjectId(1)));
+        assert_eq!(out[1], leaves[1]);
+        assert_eq!(out[2], leaves[2]);
+        assert_eq!(out[3].session_id, Some(sid(2)));
+        assert_eq!(changed, vec![(0, sid(1), sid(2))]);
+
+        // 会话已被删(known 判否):不改写,保持 Orphan 行为不变。
+        let (out, changed) = apply_restore_picks(
+            &leaves[..1],
+            std::slice::from_ref(&p1),
+            &|s| s != sid(1),
+            &[(mullion_store::ProjectId(1), sid(2))],
+        );
+        assert_eq!(out[0], leaves[0]);
+        assert!(changed.is_empty());
+    }
+
+    /// F317:两个项目共用同一个首跳(同一台跳板)时,本次恢复只探一次;
+    /// 探通/探不通的结果都共用;每个项目各自末位不探。
+    ///
+    /// 自证会变红:把缓存命中那段(`if let Some(r) = hit`)去掉 —— 探测次数变 2。
+    #[tokio::test]
+    async fn two_projects_sharing_a_first_hop_probe_it_only_once_f317() {
+        let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+        let cand = |id: u64, key: &str, q: i32| RestoreCand {
+            id: sid(id),
+            label: format!("N{id}"),
+            plan: Ok((key.to_string(), q)),
+        };
+        let groups = vec![
+            (
+                mullion_store::ProjectId(1),
+                vec![cand(1, "office:22", 1), cand(2, "jump:1080", 2)],
+            ),
+            (
+                mullion_store::ProjectId(2),
+                vec![cand(3, "office:22", 3), cand(4, "jump:1080", 4)],
+            ),
+        ];
+        let seen = probed.clone();
+        let got = pick_for_restore(groups, move |q: i32| {
+            seen.lock().unwrap().push(q);
+            async move { Err::<(), _>("3 秒内没有连通".to_string()) }
+        })
+        .await;
+        assert_eq!(*probed.lock().unwrap(), vec![1], "同一个首跳被探了两次");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].node, sid(2), "家里直连不通:退到末位");
+        assert_eq!(got[1].node, sid(4), "第二个项目共用缓存结果,也退到末位");
+        assert_eq!(got[1].skipped, vec!["N3(3 秒内没有连通)".to_string()]);
+    }
+
+    /// F317:探通的首跳让该项目选中它,且后面的不再探;不同首跳各探各的。
+    #[tokio::test]
+    async fn a_reachable_first_hop_is_picked_and_distinct_hops_are_probed_separately_f317() {
+        let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+        let cand = |id: u64, key: &str, q: i32| RestoreCand {
+            id: sid(id),
+            label: format!("N{id}"),
+            plan: Ok((key.to_string(), q)),
+        };
+        let groups = vec![(
+            mullion_store::ProjectId(1),
+            vec![
+                cand(1, "office:22", 1),
+                cand(2, "home-gw:22", 2),
+                cand(3, "jump:1080", 3),
+            ],
+        )];
+        let seen = probed.clone();
+        let got = pick_for_restore(groups, move |q: i32| {
+            seen.lock().unwrap().push(q);
+            async move {
+                if q == 1 {
+                    Err("连不上".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(got[0].node, sid(2));
+        assert_eq!(*probed.lock().unwrap(), vec![1, 2]);
     }
 }

@@ -14,7 +14,7 @@ use crate::known_hosts::HostKeyPolicy;
 use crate::session::ClientHandler;
 
 /// 本机第一条 TCP 该连哪：有跳则连第一跳，没跳则直连目标。
-pub(crate) fn first_tcp_target(hops: &[Hop], host: &str, port: u16) -> (String, u16) {
+pub fn first_tcp_target(hops: &[Hop], host: &str, port: u16) -> (String, u16) {
     match hops.first() {
         Some(Hop::Socks5 { host, port, .. })
         | Some(Hop::HttpConnect { host, port, .. })

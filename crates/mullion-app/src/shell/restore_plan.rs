@@ -103,6 +103,7 @@ mod tests {
         LeafIdentity {
             session_id: Some(SessionId(session)),
             tmux: tmux.map(str::to_string),
+            project: None,
         }
     }
 

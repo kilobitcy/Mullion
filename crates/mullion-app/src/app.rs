@@ -153,6 +153,12 @@ pub enum UserEvent {
         node: mullion_store::SessionId,
         skipped: Vec<String>,
     },
+    /// F317:恢复现场前的项目节点探测结束(`spawn_restore_probe`)。**成败都必发**:
+    /// 不发的话 `restore_probing` 闸永久关闭,所有占位标签的「重连」静默失效。
+    RestoreNodesPicked {
+        tab_id: shell::tabs::TabId,
+        picks: Vec<crate::project::RestorePick>,
+    },
     /// F128:一次断线重连拨通了。**跟 `PaneRehosted` 分开**:那条的语义是
     /// 「把 pane 改挂到另一台机器」(要重建 emulator),这条是「同一台机器
     /// 换一条 channel」(必须保留 emulator)。挤在一起只能靠运行时标志判别,
@@ -1084,6 +1090,18 @@ struct PendingRestore {
     identities: Vec<crate::shell::layout_snapshot::LeafIdentity>,
 }
 
+/// F317:恢复现场前正在探测项目节点的那个占位标签。探测期间 `reconnect_tab`
+/// 的闸由它占住(与 `pending_restore` 并列,**不复用后者**:`ConnectOk` /
+/// `ConnectErr` 会无差别 `take()` 掉 `pending_restore`,探测的那几秒里
+/// 别的连接一成败,闸就被它们顺手拆了)。
+struct ProbingRestore {
+    tab_id: shell::tabs::TabId,
+    /// 探完后回到 `reconnect_tab` 重走一遍时沿用的发起者语义(F258)。
+    user_initiated: bool,
+    /// 探测前的叶子身份;探完用它 + 探测结果算改写后的身份。
+    identities: Vec<crate::shell::layout_snapshot::LeafIdentity>,
+}
+
 /// F153:恢复现场之后正在自动串行拨号。`None` = 没在自动拨。
 ///
 /// **一条接一条,不并发**:F37 §1 否掉自动重连的理由是「别让高延迟代理链路上
@@ -1927,6 +1945,7 @@ fn leaf_identity_of(
     pane: Option<&crate::shell::workspace::PaneState>,
     wanted: &[(PaneId, crate::shell::layout_snapshot::LeafIdentity)],
     id: PaneId,
+    projects: &[mullion_store::ProjectRecord],
 ) -> crate::shell::layout_snapshot::LeafIdentity {
     use crate::shell::layout_snapshot::LeafIdentity;
     if let Some(p) = pane {
@@ -1934,6 +1953,8 @@ fn leaf_identity_of(
             return LeafIdentity {
                 session_id: host_session(p.host_ix),
                 tmux: p.tmux.clone(),
+                // F317:已连上的 pane,项目由上报的 tmux 名现算(同 F225③)。
+                project: crate::project::project_of(p.tmux.as_deref(), projects).map(|x| x.id),
             };
         }
     }
@@ -1950,7 +1971,10 @@ fn leaf_identity_of(
 /// 写成自由函数的理由同 `active_ws_of` 那几个:`App` 要一个 `EventLoopProxy`
 /// 才能构造,留在方法里的话「哪些标签该跳过」「跳过之后 active 该指哪儿」
 /// 这两条真正的判据就只能靠源码结构那种弱断言守着。
-fn snapshot_tabs_of(tabs: &Tabs<TabContent>) -> (Vec<mullion_store::SavedTab>, usize) {
+fn snapshot_tabs_of(
+    tabs: &Tabs<TabContent>,
+    projects: &[mullion_store::ProjectRecord],
+) -> (Vec<mullion_store::SavedTab>, usize) {
     use crate::shell::layout_snapshot as snap;
     use mullion_store::{SavedNodeEntry, SavedTab, SavedTabKind};
     let mut out = Vec::new();
@@ -1975,6 +1999,7 @@ fn snapshot_tabs_of(tabs: &Tabs<TabContent>) -> (Vec<mullion_store::SavedTab>, u
                             t.ws.pane(id),
                             &t.leaf_wanted,
                             id,
+                            projects,
                         )
                     }),
                 }
@@ -2574,6 +2599,14 @@ pub struct App {
     /// `dialing_from` 看不见它)。`ProjectNodePicked` 抵达时摘掉 —— 探测
     /// 任务必发且只发一次那个事件(见 `spawn_project_probe`)。
     probing_projects: Vec<mullion_store::ProjectId>,
+    /// F317:恢复现场前的项目节点探测在途(`None` = 没有)。见 [`ProbingRestore`]。
+    restore_probing: Option<ProbingRestore>,
+    /// F317:探完、改写好身份的叶子,交给紧接着重入的 `reconnect_tab` 取走。
+    /// 同一帧内写入并消费,不会跨帧残留。
+    restore_resolved: Option<(
+        shell::tabs::TabId,
+        Vec<crate::shell::layout_snapshot::LeafIdentity>,
+    )>,
     /// F162:恢复途中还要拨向**别的机器**的那些叶子。一条接一条,不并发
     /// (D10:并发会同时弹好几个密码框 / 主机指纹确认)。
     /// 三元组 =(标签世代, 那块 pane, 目标会话)。
@@ -3302,6 +3335,8 @@ impl App {
             probe_task: None,
             pending_rehost: Vec::new(),
             probing_projects: Vec::new(),
+            restore_probing: None,
+            restore_resolved: None,
             restore_dial: std::collections::VecDeque::new(),
             restore_dial_busy: false,
             reconnecting: Vec::new(),
@@ -4127,7 +4162,8 @@ impl App {
     /// 占位标签(`Restored`)**按原样写回去**:用户这次没重连它,不代表他
     /// 想把它丢掉 —— 悄悄丢掉的话,关一次窗口就永久少一个标签。
     fn snapshot_layout(&self) -> mullion_store::SavedLayout {
-        let (tabs, active_tab) = snapshot_tabs_of(&self.tabs);
+        let projects = self.store.as_ref().map_or(&[][..], |s| s.projects());
+        let (tabs, active_tab) = snapshot_tabs_of(&self.tabs, projects);
         mullion_store::SavedLayout {
             schema_version: mullion_store::CURRENT_LAYOUT_SCHEMA,
             active_tab,
@@ -4489,7 +4525,7 @@ impl App {
     /// 不猜「谁在调我」。`advance_auto_dial` 驱动的启动批量重连传 `false`,
     /// 其余(手点「重连」)传 `true`。
     fn reconnect_tab(&mut self, tab_id: shell::tabs::TabId, user_initiated: bool) -> bool {
-        if self.pending_restore.is_some() {
+        if self.pending_restore.is_some() || self.restore_probing.is_some() {
             return false;
         }
         let Some((saved_session, tree, focus_leaf)) =
@@ -4514,6 +4550,35 @@ impl App {
         else {
             log::warn!(target: "mullion", "恢复:标签的树编码坏了,不拨号");
             return false;
+        };
+        // F317:项目叶子先在候选节点里挑首跳能通的(回家换了网络,布局里记的
+        // 那条未必还通)。探测是 async:这里只占住闸、发任务就返回 `true`,
+        // 探完经 `RestoreNodesPicked` 回来,把改写好的身份放进 `restore_resolved`
+        // 再重入本函数 —— 一条拨号路径,下面的主叶子/计划/串行队列全部照改写后
+        // 的身份走。
+        let identities = match self.restore_resolved.take().filter(|(id, _)| *id == tab_id) {
+            Some((_, resolved)) => resolved,
+            None => {
+                let groups = {
+                    let projects = self.store.as_ref().map_or(&[][..], |s| s.projects());
+                    let appearance = &self.appearance;
+                    crate::project::restore_probe_groups(
+                        &identities,
+                        projects,
+                        &|s| known.contains(&s),
+                        &|s| appearance.is_routed(s),
+                    )
+                };
+                if !groups.is_empty() {
+                    let probing = ProbingRestore {
+                        tab_id,
+                        user_initiated,
+                        identities,
+                    };
+                    return self.spawn_restore_probe(probing, groups);
+                }
+                identities
+            }
         };
         let Some((main_leaf, session_id)) =
             crate::shell::restore_plan::main_leaf(&identities, &|s| known.contains(&s))
@@ -11109,6 +11174,167 @@ impl App {
         self.request_ui_redraw();
     }
 
+    /// F317:恢复现场前探测各项目的候选节点(先后、记账、缓存见
+    /// `crate::project::pick_for_restore`)。返回 `true` = 任务已发出、闸已占住。
+    ///
+    /// 任务**必发且只发一次** `RestoreNodesPicked`(`pick_for_restore` 总会返回,
+    /// 之后无分支、无 `?`),收到之后 `restore_probing` 才摘。拨号参数在这一帧
+    /// 解析好带进任务(`store` 不跨线程);解析失败的候选记为不可用、不探。
+    fn spawn_restore_probe(
+        &mut self,
+        probing: ProbingRestore,
+        groups: Vec<(mullion_store::ProjectId, Vec<SessionId>)>,
+    ) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        let label = |id: SessionId| {
+            store
+                .list()
+                .iter()
+                .find(|r| r.id == id)
+                .map_or_else(|| format!("#{}", id.0), |r| r.identity.name.clone())
+        };
+        let groups: Vec<_> = groups
+            .into_iter()
+            .map(|(project, nodes)| {
+                let cands: Vec<_> = nodes
+                    .into_iter()
+                    .map(|id| crate::project::RestoreCand {
+                        id,
+                        label: label(id),
+                        plan: store
+                            .dial_plan_for(id)
+                            .map(|(cfg, _)| {
+                                let (h, p) = mullion_ssh::dial::first_tcp_target(
+                                    &cfg.hops, &cfg.host, cfg.port,
+                                );
+                                (format!("{h}:{p}"), (cfg.hops, cfg.host, cfg.port))
+                            })
+                            .map_err(|e| e.to_string()),
+                    })
+                    .collect();
+                (project, cands)
+            })
+            .collect();
+        let tab_id = probing.tab_id;
+        // 按钮禁用靠它(见 `ui::restored`)。
+        if let Some(TabContent::Restored(r)) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab_id)
+            .map(|t| &mut t.content)
+        {
+            r.dialing = true;
+        }
+        self.restore_probing = Some(probing);
+        let proxy = self.proxy.clone();
+        self._runtime.spawn(async move {
+            let picks = crate::project::pick_for_restore(groups, |(hops, host, port)| async move {
+                mullion_ssh::dial::probe_first_hop(&hops, &host, port, PROJECT_PROBE_BUDGET)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            let _ = proxy.send_event(UserEvent::RestoreNodesPicked { tab_id, picks });
+        });
+        mark_ui_dirty!(self.ui_dirty);
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F317:探测回来了 —— 改写项目叶子的会话,重入 `reconnect_tab` 照常拨号,
+    /// 改连了节点的汇成**一条** toast(toast 单槽,逐叶子发会互相顶掉),
+    /// 明细进日志。
+    ///
+    /// 闸(`restore_probing`)在重入**之前**摘:重入的 `reconnect_tab` 开头就查它。
+    /// 之后无论标签已关、重入没发起拨号,都要把 `dialing` 复位并推进自动串行队列
+    /// —— 同 `ConnectErr` 的收口,否则队列永久卡在这个标签上。
+    fn on_restore_nodes_picked(
+        &mut self,
+        tab_id: shell::tabs::TabId,
+        picks: Vec<crate::project::RestorePick>,
+    ) {
+        mark_ui_dirty!(self.ui_dirty);
+        self.request_ui_redraw();
+        let Some(probing) = self.restore_probing.take() else {
+            return;
+        };
+        let alive = self
+            .tabs
+            .iter()
+            .any(|t| t.id == probing.tab_id && matches!(t.content, TabContent::Restored(_)));
+        if !alive || probing.tab_id != tab_id {
+            log::info!(target: "mullion", "恢复:探测期间标签已关,不拨");
+            self.advance_auto_dial(Some(false));
+            return;
+        }
+        let known: Vec<SessionId> = self
+            .store
+            .as_ref()
+            .map_or(Vec::new(), |s| s.list().iter().map(|r| r.id).collect());
+        let (resolved, changed) = {
+            let projects = self.store.as_ref().map_or(&[][..], |s| s.projects());
+            let pairs: Vec<_> = picks.iter().map(|p| (p.project, p.node)).collect();
+            crate::project::apply_restore_picks(
+                &probing.identities,
+                projects,
+                &|s| known.contains(&s),
+                &pairs,
+            )
+        };
+        if let Some(store) = self.store.as_ref() {
+            let name = |id: SessionId| {
+                store
+                    .list()
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map_or_else(|| format!("#{}", id.0), |r| r.identity.name.clone())
+            };
+            for p in &picks {
+                let pname = store
+                    .projects()
+                    .iter()
+                    .find(|x| x.id == p.project)
+                    .map_or("?", |x| x.name.as_str());
+                log::info!(
+                    target: "mullion",
+                    "恢复:项目 {pname} 选节点 {}(跳过:{})",
+                    name(p.node),
+                    if p.skipped.is_empty() { "无".to_string() } else { p.skipped.join(";") }
+                );
+            }
+            for (ix, from, to) in &changed {
+                log::info!(
+                    target: "mullion",
+                    "恢复:第 {ix} 个叶子由 {} 改连 {}",
+                    name(*from),
+                    name(*to)
+                );
+            }
+        }
+        self.restore_resolved = Some((tab_id, resolved));
+        if !self.reconnect_tab(tab_id, probing.user_initiated) {
+            self.restore_resolved = None;
+            if let Some(TabContent::Restored(r)) = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.id == tab_id)
+                .map(|t| &mut t.content)
+            {
+                r.dialing = false;
+            }
+            self.advance_auto_dial(Some(false));
+            return;
+        }
+        if !changed.is_empty() {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("{} 个项目分屏已改连其他节点", changed.len()),
+            );
+        }
+    }
+
     /// F304:探测回来了 —— 按探出来的节点拨,前面跳过了的飘一条提示。
     fn on_project_node_picked(
         &mut self,
@@ -11602,6 +11828,9 @@ impl App {
                             .filter(|x| x.matches(*id, host_ix))
                             .map(|x| x.session_name.clone())
                     }),
+                    // F317:断线重连不改节点,项目归属在这里不用(只给 detach_flags
+                    // 与 leaf_wanted 的类型凑齐)。
+                    project: None,
                 })
                 .collect();
             // D5:同一台机器上的同一个会话名,只有第一块带 `-d`。
@@ -12754,6 +12983,9 @@ impl ApplicationHandler<UserEvent> for App {
                 node,
                 skipped,
             } => self.on_project_node_picked(project, target, node, skipped),
+            UserEvent::RestoreNodesPicked { tab_id, picks } => {
+                self.on_restore_nodes_picked(tab_id, picks)
+            }
             UserEvent::PaneReconnected {
                 generation,
                 host_ix,
@@ -13307,6 +13539,22 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         diag::mark(diag::Stage::WindowEvent);
+        // F316 取证:输入法活动前后的每个按键(含释放、`Process`、`Dead`)都落日志。
+        // 多行框里「组字回车后文字没了、光标落到第二行」在日志里看不到任何 Enter,
+        // 要先弄清回车到底以什么形态到达,再谈修。
+        if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+            if self.egui_ime_guard.near_ime(Instant::now()) {
+                log::debug!(
+                    target: "mullion",
+                    "ime-key: {:?} logical={:?} physical={:?} text={:?} repeat={}",
+                    ke.state,
+                    ke.logical_key,
+                    ke.physical_key,
+                    ke.text,
+                    ke.repeat
+                );
+            }
+        }
         // F294:设置弹窗正在捕获新组合键时,这一下归它 —— 必须排在**所有**
         // 拦截之前(理由见 `hotkey_capture_event` 的文档)。
         if self.hotkey_capture_event(&event) {
@@ -13539,22 +13787,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Occluded(occluded) => {
                 crate::logx::line(&format!("Occluded({occluded})"));
-        // F316 取证:输入法活动前后的每个按键(含释放、`Process`、`Dead`)都落日志。
-        // 多行框里「组字回车后文字没了、光标落到第二行」在日志里看不到任何 Enter,
-        // 要先弄清回车到底以什么形态到达,再谈修。
-        if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
-            if self.egui_ime_guard.near_ime(Instant::now()) {
-                log::debug!(
-                    target: "mullion",
-                    "ime-key: {:?} logical={:?} physical={:?} text={:?} repeat={}",
-                    ke.state,
-                    ke.logical_key,
-                    ke.physical_key,
-                    ke.text,
-                    ke.repeat
-                );
-            }
-        }
                 if !occluded {
                     self.recheck_visibility();
                     self.request_ui_redraw();
@@ -16815,6 +17047,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | PaneRehosted { .. }
         | PaneRehostErr { .. }
         | ProjectNodePicked { .. }
+        | RestoreNodesPicked { .. }
         | PaneReconnected { .. }
         | PaneReconnectErr { .. }
         | ProbeOk(_)
@@ -24794,7 +25027,7 @@ mod tests {
     #[test]
     fn a_quick_connect_tab_is_not_written_to_the_layout_file() {
         let tabs = tabs_with_one_terminal_tab(); // session_id: None
-        let (saved, _) = snapshot_tabs_of(&tabs);
+        let (saved, _) = snapshot_tabs_of(&tabs, &[]);
         assert!(saved.is_empty(), "快速连接标签被写进了布局:{saved:?}");
     }
 
@@ -24809,7 +25042,7 @@ mod tests {
         let mut tabs = tabs_with_one_terminal_tab(); // 下标 0,不会被存
         tabs.open("留下的".into(), Some(SessionId(9)), restored_tab(9, 1));
         assert_eq!(tabs.active_index(), 1, "脚手架前提:活动的是第二个标签");
-        let (saved, active) = snapshot_tabs_of(&tabs);
+        let (saved, active) = snapshot_tabs_of(&tabs, &[]);
         assert_eq!(saved.len(), 1);
         assert_eq!(
             active, 0,
@@ -24826,7 +25059,7 @@ mod tests {
     fn an_untouched_placeholder_tab_survives_another_round_trip() {
         let mut tabs: Tabs<TabContent> = Tabs::default();
         tabs.open("生产机".into(), Some(SessionId(4)), restored_tab(4, 3));
-        let (saved, _) = snapshot_tabs_of(&tabs);
+        let (saved, _) = snapshot_tabs_of(&tabs, &[]);
         assert_eq!(saved.len(), 1, "占位标签被丢掉了");
         assert_eq!(saved[0].session_id, SessionId(4));
         assert_eq!(
@@ -25082,10 +25315,17 @@ mod tests {
             LeafIdentity {
                 session_id: Some(SessionId(7)),
                 tmux: Some("web01".into()),
+                project: None,
             },
         )];
 
-        let got = leaf_identity_of(&|_| Some(SessionId(3)), Some(&queued), &wanted, PaneId(2));
+        let got = leaf_identity_of(
+            &|_| Some(SessionId(3)),
+            Some(&queued),
+            &wanted,
+            PaneId(2),
+            &[],
+        );
         assert_eq!(
             got.session_id,
             Some(SessionId(7)),
@@ -25114,6 +25354,7 @@ mod tests {
             LeafIdentity {
                 session_id: Some(SessionId(7)),
                 tmux: Some("stale".into()),
+                project: None,
             },
         )];
         let got = leaf_identity_of(
@@ -25121,9 +25362,72 @@ mod tests {
             Some(&live),
             &wanted,
             PaneId(1),
+            &[],
         );
         assert_eq!(got.session_id, Some(SessionId(3)), "该现量的没量");
         assert_eq!(got.tmux, None, "陈旧的 tmux 名被写回盘上了");
+    }
+
+    /// F317:已连上的 pane 的项目 id 由**上报的 tmux 名**现算(`project_of`),
+    /// 没连上(排队)的沿用 `leaf_wanted` 带回的值;tmux 名对不上任何项目 = `None`。
+    ///
+    /// 自证会变红:把 `leaf_identity_of` 里已连上分支的 `project:` 改成 `None`,
+    /// 或把排队分支改成不带 `project`(`unwrap_or_default` 之前清掉它)。
+    #[test]
+    fn a_leaf_remembers_its_project_measured_when_connected_and_carried_when_queued_f317() {
+        use crate::shell::layout_snapshot::LeafIdentity;
+        use mullion_store::{ProjectId, SessionId};
+
+        let proj = mullion_store::ProjectRecord {
+            id: ProjectId(4),
+            name: "api".into(),
+            note: String::new(),
+            nodes: vec![SessionId(1)],
+            preferred: None,
+            dir: "/srv/api".into(),
+            tmux_name: None,
+            created_at: "t".into(),
+            last_accessed_at: None,
+            archived_at: None,
+            icon: None,
+        };
+        let name = mullion_store::project_tmux_name(&proj);
+        let projects = [proj];
+
+        let mut live = test_pane(1);
+        live.host_pending = false;
+        live.tmux = Some(name.clone());
+        let got = leaf_identity_of(
+            &|_| Some(SessionId(1)),
+            Some(&live),
+            &[],
+            PaneId(1),
+            &projects,
+        );
+        assert_eq!(got.project, Some(ProjectId(4)), "已连上的 pane 没认出项目");
+
+        live.tmux = Some("随手开的别的会话".into());
+        let got = leaf_identity_of(
+            &|_| Some(SessionId(1)),
+            Some(&live),
+            &[],
+            PaneId(1),
+            &projects,
+        );
+        assert_eq!(got.project, None, "tmux 名对不上却被记成了项目");
+
+        let mut queued = test_pane(2);
+        queued.host_pending = true;
+        let wanted = vec![(
+            PaneId(2),
+            LeafIdentity {
+                session_id: Some(SessionId(1)),
+                tmux: Some(name),
+                project: Some(ProjectId(4)),
+            },
+        )];
+        let got = leaf_identity_of(&|_| None, Some(&queued), &wanted, PaneId(2), &[]);
+        assert_eq!(got.project, Some(ProjectId(4)), "排队中的叶子丢了项目 id");
     }
 
     /// 接线守护:`snapshot_tabs_of` 真的把身份传给了 `to_entries`,不是传了个
@@ -25171,6 +25475,119 @@ mod tests {
         assert!(
             body.contains("p.main_leaf)"),
             "恢复分支没把主叶子传给 apply_saved_tree —— 已连的 pane 会落回第 0 个叶子位:\n{body}"
+        );
+    }
+
+    /// F317 接线①:`reconnect_tab` 在选主叶子**之前**先探项目节点,且探测在途时
+    /// 闸是关的。顺序反了的现象:主叶子仍按布局里记的(回家后连不通的)那条拨。
+    ///
+    /// 自证会变红:把 `restore_probe_groups(` 那段挪到 `restore_plan::main_leaf(`
+    /// 之后,或删掉 `restore_probing.is_some()` 闸。
+    #[test]
+    fn reconnect_tab_probes_project_nodes_before_picking_the_main_leaf_f317() {
+        let body = body_of(prod_src(), "fn reconnect_tab(");
+        let probe = body
+            .find("restore_probe_groups(")
+            .expect("reconnect_tab 没有在拨号前探项目节点");
+        let main = body.find("restore_plan::main_leaf(").unwrap();
+        assert!(probe < main, "探测排在选主叶子之后,改写不会生效");
+        assert!(
+            body.contains("self.restore_probing.is_some()"),
+            "探测在途时 reconnect_tab 没有被闸住,会并发起第二条恢复"
+        );
+        assert!(
+            body.contains("self.restore_resolved"),
+            "探完的身份没有被重入的 reconnect_tab 取走"
+        );
+    }
+
+    /// F317 接线⓪:落盘快照把**项目表**传给了 `snapshot_tabs_of`,不是传空表 ——
+    /// 传空则每个叶子都写成「不属于任何项目」,恢复时静默失去选节点能力。
+    ///
+    /// 自证会变红:把 `snapshot_layout` 里的 `projects` 换成 `&[]`。
+    #[test]
+    fn the_layout_snapshot_is_given_the_real_project_table_f317() {
+        let body = body_of(prod_src(), "fn snapshot_layout(");
+        assert!(
+            body.contains(".projects()") && body.contains("snapshot_tabs_of(&self.tabs, projects)"),
+            "快照没带项目表:\n{body}"
+        );
+    }
+
+    /// F317 取舍(第 5 点):恢复路径**不发项目 plan**,attach 只走
+    /// `take_attach_intent`(按 `leaf_wanted` 的 tmux 名)。两条恢复拨号入口都把
+    /// `project` 传 `None`;一旦传 `Some`,`plan_for_rehost` 会再发一份项目 attach,
+    /// 与 `take_attach_intent` 重复(同一 pane 两次 attach)。
+    ///
+    /// 自证会变红:把 `drive_restore_dial` 里 `spawn_rehost_on` 的最后一个参数改成
+    /// `Some(项目)`,或让 `reconnect_tab` 的 `spawn_connect` 倒数第二个参数非 `None`。
+    #[test]
+    fn restore_dials_never_carry_a_project_plan_so_attach_stays_with_the_tmux_name_f317() {
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let d = squash(body_of(prod_src(), "fn drive_restore_dial("));
+        assert!(
+            d.contains("RehostKind::RestoreFirstMount,None,"),
+            "恢复队列的拨号带了项目:{d}"
+        );
+        let r = squash(body_of(prod_src(), "fn reconnect_tab("));
+        assert!(
+            r.contains("Some(session_id),false,None,user_initiated,"),
+            "恢复主叶子的拨号带了项目:{r}"
+        );
+    }
+
+    /// F317 接线②:探测任务**成败都发回事件**(T11 同族:卡住的闸没有自愈路径)。
+    /// 判据:`pick_for_restore` 之后紧接着 `send_event(RestoreNodesPicked`,
+    /// 且任务体里没有 `return` / `?` 这类能绕过它的早退。
+    ///
+    /// 自证会变红:在 async 块里 `pick_for_restore` 之前加一句 `return;`。
+    #[test]
+    fn the_restore_probe_task_always_reports_back_f317() {
+        let body = body_of(prod_src(), "fn spawn_restore_probe(");
+        let task = &body[body.find("_runtime.spawn(").expect("没有 spawn 探测任务")..];
+        let pick = task.find("pick_for_restore(").unwrap();
+        let send = task
+            .find("send_event(UserEvent::RestoreNodesPicked")
+            .expect("探测任务不发 RestoreNodesPicked,闸永久关闭");
+        assert!(pick < send);
+        let async_body = &task[..task.find("mark_ui_dirty!").unwrap()];
+        assert!(
+            !async_body.contains("return"),
+            "探测任务里有早退:{async_body}"
+        );
+        assert!(
+            !async_body.contains(")?"),
+            "探测任务里有 `?` 早退:{async_body}"
+        );
+        assert_eq!(task.matches("send_event(").count(), 1, "该只发一次");
+    }
+
+    /// F317 接线③:事件抵达后先摘闸再重入;标签已关 / 重入没发起拨号两条出口都
+    /// 要推进自动串行队列;toast 只发一条(单槽)。
+    ///
+    /// 自证会变红:把 `restore_probing.take()` 挪到 `reconnect_tab(` 之后(重入时
+    /// 闸还关着,恢复静默不动);或删掉任一处 `advance_auto_dial(Some(false))`。
+    #[test]
+    fn the_picked_event_releases_the_gate_then_redials_and_never_strands_the_queue_f317() {
+        let prod = prod_src();
+        let arm = arm_of(prod, "UserEvent::RestoreNodesPicked { tab_id, picks }");
+        assert!(arm.contains("on_restore_nodes_picked("));
+        let body = body_of(prod, "fn on_restore_nodes_picked(");
+        let take = body.find("self.restore_probing.take()").unwrap();
+        let resolved = body.find("self.restore_resolved = Some(").unwrap();
+        let redial = body.find("self.reconnect_tab(").unwrap();
+        assert!(
+            take < resolved && resolved < redial,
+            "闸/改写/重入的次序错了"
+        );
+        assert!(
+            body.matches("self.advance_auto_dial(Some(false))").count() >= 2,
+            "标签已关 / 重入失败的出口没推进队列,自动恢复会永久卡住"
+        );
+        assert_eq!(
+            body.matches("set_toast(").count(),
+            1,
+            "toast 是单槽,只能发一条"
         );
     }
 
@@ -27950,6 +28367,7 @@ mod tests {
                     LeafIdentity {
                         session_id: Some(SessionId(7)),
                         tmux: Some("旧机器上的会话".into()),
+                        project: None,
                     },
                 ),
                 (
@@ -27957,6 +28375,7 @@ mod tests {
                     LeafIdentity {
                         session_id: Some(SessionId(9)),
                         tmux: Some("别的 pane 的会话".into()),
+                        project: None,
                     },
                 ),
             ],
@@ -30026,7 +30445,7 @@ mod tests {
         let mut tabs: Tabs<TabContent> = Default::default();
         tabs.open("u@h".into(), Some(SessionId(1)), restored_tab(1, 1));
         tabs.iter_mut().next().unwrap().title_override = Some("日志".into());
-        let (saved, _) = snapshot_tabs_of(&tabs);
+        let (saved, _) = snapshot_tabs_of(&tabs, &[]);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].title, "u@h", "覆盖被写进了布局快照");
     }

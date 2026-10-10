@@ -11,7 +11,7 @@
 
 use mullion_core::layout::{Dir, Node, PaneId};
 use mullion_store::layout::{SavedDir, SavedLayout, SavedNodeEntry, SavedWindow};
-use mullion_store::SessionId;
+use mullion_store::{ProjectId, SessionId};
 
 // ---------------------------------------------------------------- 树互转(E5)
 
@@ -37,6 +37,8 @@ fn from_saved_dir(d: SavedDir) -> Dir {
 pub struct LeafIdentity {
     pub session_id: Option<SessionId>,
     pub tmux: Option<String>,
+    /// F317:这块 pane 属于哪个项目。恢复时据此重新选节点。
+    pub project: Option<ProjectId>,
 }
 
 /// 运行时树 → 磁盘格式(前序遍历)。**丢掉 `PaneId`**,只留结构、比例与身份(E5/F160)。
@@ -59,7 +61,7 @@ fn push_entries(
     match node {
         Node::Leaf(id) => {
             let i = identity(*id);
-            out.push(SavedNodeEntry::leaf_with(i.session_id, i.tmux));
+            out.push(SavedNodeEntry::leaf_with(i.session_id, i.tmux).with_project(i.project));
         }
         Node::Split { dir, ratio, a, b } => {
             out.push(SavedNodeEntry::split(to_saved_dir(*dir), *ratio));
@@ -93,6 +95,7 @@ pub fn leaf_identities(
             .map(|e| LeafIdentity {
                 session_id: e.session_id.or(Some(tab_session)),
                 tmux: e.tmux.clone(),
+                project: e.project,
             })
             .collect(),
     )
@@ -438,6 +441,7 @@ mod tests {
         let entries = to_entries(&tree, &|id: PaneId| LeafIdentity {
             session_id: Some(SessionId(u64::from(id.0) * 10)),
             tmux: Some(format!("s{}", id.0)),
+            project: None,
         });
         let leaves: Vec<&SavedNodeEntry> = entries.iter().filter(|e| e.is_leaf()).collect();
         assert_eq!(leaves.len(), 3);
@@ -454,10 +458,12 @@ mod tests {
         let entries = to_entries(&sample_tree(), &|_| LeafIdentity {
             session_id: Some(SessionId(9)),
             tmux: Some("x".into()),
+            project: Some(ProjectId(5)),
         });
         for e in entries.iter().filter(|e| !e.is_leaf()) {
             assert_eq!(e.session_id, None, "分割节点带上了身份:{e:?}");
             assert_eq!(e.tmux, None, "分割节点带上了身份:{e:?}");
+            assert_eq!(e.project, None, "分割节点带上了项目:{e:?}");
         }
     }
 
@@ -470,6 +476,7 @@ mod tests {
         let entries = to_entries(&sample_tree(), &|id: PaneId| LeafIdentity {
             session_id: Some(SessionId(u64::from(id.0))),
             tmux: Some(format!("s{}", id.0)),
+            project: Some(ProjectId(u64::from(id.0) + 100)),
         });
         let got = leaf_identities(&entries, SessionId(99)).expect("结构完整");
         assert_eq!(
@@ -479,6 +486,16 @@ mod tests {
                 Some("s2".to_string()),
                 Some("s3".to_string())
             ]
+        );
+        // F317:项目 id 随叶子走、同样按前序读回(写进去再读回,不变形)。
+        assert_eq!(
+            got.iter().map(|i| i.project).collect::<Vec<_>>(),
+            vec![
+                Some(ProjectId(101)),
+                Some(ProjectId(102)),
+                Some(ProjectId(103))
+            ],
+            "F317:项目 id 没有跟着叶子经 to_entries/leaf_identities 一个来回"
         );
     }
 
