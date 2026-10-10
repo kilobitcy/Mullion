@@ -1446,7 +1446,11 @@ pub fn show(
     // `show_rows` 实际画出来的位置。
     let scroll_offset = scroll_to.and_then(|name| {
         let ix = rows.iter().position(|e| e.name == name)?;
-        Some(((ix + new_row) as f32 * ROW_H - body_h / 2.0).max(0.0))
+        // F319:行距是 `ROW_H + item_spacing.y`(`show_rows` 的实际步长),不是
+        // `ROW_H`。按后者乘,每行少一个 spacing,第 150 行就差几百像素,
+        // 目标落在视口之外。
+        let pitch = ROW_H + ui.spacing().item_spacing.y;
+        Some(((ix + new_row) as f32 * pitch - body_h / 2.0).max(0.0))
     });
     // `rows` 借着 `&state.entries` 不放(它是 `Vec<&Entry>`),闭包里不能再
     // 借一次 `&mut state`——新选中的那条先记局部变量,出了闭包再落回 `state`。
@@ -3548,6 +3552,110 @@ mod tests {
             act,
             Some(FileAction::FindStart("abc".into())),
             "回车没起搜 —— 自愈抢回焦点后 lost_focus() 判据落空"
+        );
+    }
+
+    /// F319:点中搜索结果后,目标行必须被滚进可视区。
+    ///
+    /// 根因:偏移按 `ix * ROW_H` 算,而 `show_rows` 的行距是
+    /// `ROW_H + item_spacing.y`,每行少一个 spacing,靠后的行落在视口之外
+    /// (300 项的目录里第 150 行差约 450px)。顺序:结果列表先滚深,再点命中
+    /// → 关搜索条 → 文件列表把 `scroll_to` 那一条摆进视口。
+    ///
+    /// 自证会变红:把 `pitch` 改回 `ROW_H`。
+    #[test]
+    fn picking_a_hit_after_scrolling_the_hit_list_deep_scrolls_the_target_into_view() {
+        let t = crate::theme::MULLION_DARK;
+        let mut frame = PanelFrame {
+            remote: PaneState::new(RemotePath::from_bytes(b"/r".to_vec())),
+            local: PaneState::new(RemotePath::from_bytes(b"/home/u".to_vec())),
+            bookmarks: Vec::new(),
+            local_bookmarks: Vec::new(),
+            session_bound: false,
+            active_column: PanelColumn::Remote,
+            clip: None,
+            find: None,
+            find_seq: 0,
+        };
+        let names: Vec<String> = (0..300).map(|i| format!("file{i:03}.txt")).collect();
+        let seq = frame.remote.request_seq;
+        frame.remote.accept(
+            seq,
+            Ok(names
+                .iter()
+                .map(|n| entry(n.as_bytes(), EntryKind::File))
+                .collect()),
+        );
+        frame.local.load = Load::Ready;
+
+        let mut w = crate::files::find::Walk::new(
+            RemotePath::from_bytes(b"/r".to_vec()),
+            "file".into(),
+            false,
+        );
+        let b0 = w.take_runnable();
+        w.accept(
+            &b0[0],
+            Ok(names
+                .iter()
+                .map(|n| entry(n.as_bytes(), EntryKind::File))
+                .collect()),
+        );
+        frame.find = Some(Find {
+            buf: "file".into(),
+            walk: Some(w),
+            ..Default::default()
+        });
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut cols = ColWidths::default();
+        let mut clock = 0.0_f64;
+        let mut run = |frame: &mut PanelFrame, events: Vec<egui::Event>| {
+            clock += 1.0;
+            ctx.run(
+                egui::RawInput {
+                    time: Some(clock),
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = content(
+                        ctx, &t, 1, true, frame, 0, &mut cols, &mut None, &mut false, None, None,
+                    );
+                },
+            )
+        };
+        run(
+            &mut frame,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 300.0))],
+        );
+        for _ in 0..8 {
+            run(
+                &mut frame,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -2000.0),
+                    modifiers: egui::Modifiers::default(),
+                }],
+            );
+        }
+        // 点中 file150:关搜索条,面板里挂上待滚动。
+        frame.find = None;
+        frame.remote.scroll_to = Some(RemotePath::from_bytes(b"file150.txt".to_vec()));
+        let mut out = None;
+        for _ in 0..4 {
+            out = Some(run(&mut frame, vec![]));
+        }
+        let out = out.unwrap();
+        let pos = find_text_pos(&out.shapes, "file150.txt");
+        assert!(
+            pos.is_some_and(|p| p.y > 0.0 && p.y < 600.0),
+            "file150.txt 没被滚进可视区:{pos:?}"
         );
     }
 
