@@ -50,19 +50,59 @@ pub fn encode_key(key: Key, mods: Mods, kitty: bool) -> Vec<u8> {
     match key {
         Key::Enter => encode_enter(mods, kitty),
         Key::Char(c) => encode_char(c, mods),
-        Key::Space => vec![b' '],
+        Key::Space if mods.ctrl => vec![0x00], // Ctrl+Space = NUL
+        Key::Space => alt_prefixed(mods, vec![b' ']),
+        // Shift+Tab = backtab(CSI Z)。Claude Code 切换模式、各类 TUI 反向切焦点都靠它;
+        // 发成裸 `\t` 就是「按了没反应」。kitty 与否都是 CSI Z(终端通用约定)。
+        Key::Tab if mods.shift => b"\x1b[Z".to_vec(),
         Key::Tab => vec![b'\t'],
-        Key::Backspace => vec![0x7f],
+        Key::Backspace => alt_prefixed(mods, vec![0x7f]),
         Key::Escape => vec![0x1b],
-        // 方向键/Delete 用普通光标键序列(CSI)。应用光标键模式(DECCKM,
+        // 方向键/Delete/翻页用普通光标键序列(CSI)。应用光标键模式(DECCKM,
         // 部分全屏 TUI 会开)下应发 ESC O A 等;当前不追踪该模式,后续补。
-        Key::Delete => b"\x1b[3~".to_vec(),
-        Key::Up => b"\x1b[A".to_vec(),
-        Key::Down => b"\x1b[B".to_vec(),
-        Key::Right => b"\x1b[C".to_vec(),
-        Key::Left => b"\x1b[D".to_vec(),
-        Key::PageUp => b"\x1b[5~".to_vec(),
-        Key::PageDown => b"\x1b[6~".to_vec(),
+        // 带修饰键时按 xterm 约定插 `1;m` / `3;m` 参数(Ctrl+←/→ 按词跳转等)。
+        Key::Delete => csi_with_mods(3, b'~', mods),
+        Key::Up => csi_with_mods(1, b'A', mods),
+        Key::Down => csi_with_mods(1, b'B', mods),
+        Key::Right => csi_with_mods(1, b'C', mods),
+        Key::Left => csi_with_mods(1, b'D', mods),
+        Key::PageUp => csi_with_mods(5, b'~', mods),
+        Key::PageDown => csi_with_mods(6, b'~', mods),
+    }
+}
+
+/// xterm 修饰键参数:`1 + shift(1) + alt(2) + ctrl(4)`。无修饰键 = 1。
+fn xterm_mod_param(mods: Mods) -> u8 {
+    1 + u8::from(mods.shift) + 2 * u8::from(mods.alt) + 4 * u8::from(mods.ctrl)
+}
+
+/// 光标/编辑类键的 CSI 序列。无修饰键发 `ESC [ <n?> <final>`(`n==1` 的方向键省略 1),
+/// 有修饰键发 `ESC [ <n> ; <m> <final>`。
+fn csi_with_mods(n: u8, final_byte: u8, mods: Mods) -> Vec<u8> {
+    let m = xterm_mod_param(mods);
+    let mut out = b"\x1b[".to_vec();
+    if m == 1 {
+        if n != 1 {
+            out.extend_from_slice(n.to_string().as_bytes());
+        }
+    } else {
+        out.extend_from_slice(format!("{n};{m}").as_bytes());
+    }
+    out.push(final_byte);
+    out
+}
+
+/// Alt 前缀 `ESC`(meta-sends-escape,readline 的 Alt+b/f/Backspace 靠它)。
+///
+/// **Ctrl+Alt 同时按下不加**:Windows 上 AltGr 会被合成成 Ctrl+Alt,
+/// 欧式布局的 `@`、`€` 等都走这条,加了前缀就变成乱序。
+fn alt_prefixed(mods: Mods, bytes: Vec<u8>) -> Vec<u8> {
+    if mods.alt && !mods.ctrl {
+        let mut out = vec![0x1b];
+        out.extend(bytes);
+        out
+    } else {
+        bytes
     }
 }
 
@@ -122,7 +162,10 @@ pub fn paste_line_count(text: &str) -> usize {
 }
 
 fn encode_enter(mods: Mods, kitty: bool) -> Vec<u8> {
-    if mods.shift {
+    if mods.alt && !mods.ctrl && !mods.shift {
+        // Alt+Enter = ESC CR(与 Shift+Enter 非 kitty 同形)。
+        vec![0x1b, b'\r']
+    } else if mods.shift {
         if kitty {
             // CSI 13 ; 2 u —— Enter 键码 13 + Shift 修饰(1 + 1)。
             b"\x1b[13;2u".to_vec()
@@ -141,9 +184,9 @@ fn encode_char(c: char, mods: Mods) -> Vec<u8> {
             return vec![b];
         }
     }
-    // 骨架:普通可打印字符按 UTF-8 发出(alt/super 前缀等后续再补)。
+    // 普通可打印字符按 UTF-8 发出;Alt 加 ESC 前缀(super 暂不处理)。
     let mut buf = [0u8; 4];
-    c.encode_utf8(&mut buf).as_bytes().to_vec()
+    alt_prefixed(mods, c.encode_utf8(&mut buf).as_bytes().to_vec())
 }
 
 /// Ctrl+字母 → C0 控制码(A→0x01 … Z→0x1a),其中 Ctrl+J = 0x0a(`\n`)。
@@ -152,7 +195,16 @@ fn ctrl_byte(c: char) -> Option<u8> {
     if up.is_ascii_uppercase() {
         Some((up as u8) & 0x1f)
     } else {
-        None
+        // 符号控制码:@=NUL  [=ESC  \=FS  ]=GS  ^=RS  _=US,Ctrl+/ 同 Ctrl+_。
+        match c {
+            '@' => Some(0x00),
+            '[' => Some(0x1b),
+            '\\' => Some(0x1c),
+            ']' => Some(0x1d),
+            '^' => Some(0x1e),
+            '_' | '/' => Some(0x1f),
+            _ => None,
+        }
     }
 }
 
@@ -348,6 +400,66 @@ mod tests {
             encode_key(Key::Char('a'), Mods::default(), false),
             vec![b'a']
         );
+    }
+
+    #[test]
+    fn shift_tab_is_csi_z_backtab() {
+        // 回归:Shift+Tab 曾被当成裸 Tab 发 0x09,Claude Code 里切模式无反应。
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        assert_eq!(encode_key(Key::Tab, shift, false), b"\x1b[Z".to_vec());
+        assert_eq!(encode_key(Key::Tab, shift, true), b"\x1b[Z".to_vec());
+    }
+
+    fn m(shift: bool, ctrl: bool, alt: bool) -> Mods {
+        Mods {
+            shift,
+            ctrl,
+            alt,
+            sup: false,
+        }
+    }
+
+    #[test]
+    fn modified_cursor_keys_carry_xterm_modifier_param() {
+        // Ctrl+←/→ 按词跳转;Shift=2 Alt=3 Ctrl=5 Ctrl+Shift=6。
+        let k = |key, mods| encode_key(key, mods, false);
+        assert_eq!(k(Key::Left, m(false, true, false)), b"\x1b[1;5D".to_vec());
+        assert_eq!(k(Key::Right, m(false, true, false)), b"\x1b[1;5C".to_vec());
+        assert_eq!(k(Key::Up, m(true, false, false)), b"\x1b[1;2A".to_vec());
+        assert_eq!(k(Key::Down, m(false, false, true)), b"\x1b[1;3B".to_vec());
+        assert_eq!(k(Key::Left, m(true, true, false)), b"\x1b[1;6D".to_vec());
+        assert_eq!(k(Key::Delete, m(false, true, false)), b"\x1b[3;5~".to_vec());
+        assert_eq!(k(Key::PageUp, m(false, true, false)), b"\x1b[5;5~".to_vec());
+        // 无修饰键保持原样。
+        assert_eq!(k(Key::Left, Mods::default()), b"\x1b[D".to_vec());
+        assert_eq!(k(Key::Delete, Mods::default()), b"\x1b[3~".to_vec());
+    }
+
+    #[test]
+    fn alt_prefixes_esc_but_altgr_does_not() {
+        let k = |key, mods| encode_key(key, mods, false);
+        assert_eq!(k(Key::Char('b'), m(false, false, true)), b"\x1bb".to_vec());
+        assert_eq!(k(Key::Backspace, m(false, false, true)), vec![0x1b, 0x7f]);
+        assert_eq!(k(Key::Enter, m(false, false, true)), vec![0x1b, b'\r']);
+        // AltGr = Ctrl+Alt:`@` 必须原样发出,不能带 ESC。
+        assert_eq!(k(Key::Char('@'), m(false, true, true)), vec![0x00]);
+        assert_eq!(
+            k(Key::Char('€'), m(false, true, true)),
+            "€".as_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn ctrl_symbol_keys_encode_c0() {
+        let c = m(false, true, false);
+        assert_eq!(encode_key(Key::Space, c, false), vec![0x00]);
+        assert_eq!(encode_key(Key::Char('['), c, false), vec![0x1b]);
+        assert_eq!(encode_key(Key::Char('\\'), c, false), vec![0x1c]);
+        assert_eq!(encode_key(Key::Char(']'), c, false), vec![0x1d]);
+        assert_eq!(encode_key(Key::Char('/'), c, false), vec![0x1f]);
     }
 
     #[test]
