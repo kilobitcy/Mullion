@@ -244,9 +244,90 @@ pub fn egui_should_see_focused(
     }
 }
 
+/// F324:键盘事件该不该喂 egui —— [`egui_should_see_focused`] 外加一条例外:
+/// **egui 正在拖东西时(`egui_dragging`)按下的 Esc 归 egui**。
+///
+/// 拖标题条换位的规格是「Esc 取消」,而 egui 0.30 正是靠收到 Esc 中止拖动
+/// (`interaction.rs`「Abort dragging on escape」)、当帧触发 `drag_stopped`。
+/// 没有 egui 文本框焦点时,Esc 原本判给终端:egui 收不到它,拖动继续、松手
+/// 照样换位;而且这个 Esc 会作为 `\x1b` 写进焦点 pane(tmux 里的 Claude Code
+/// 里 Esc = 中断生成)。判给 egui 的键调用方不再落终端,即「放行并吞掉」。
+///
+/// 只对 Esc、只在拖动中:其它键照原路由走(T8 —— 无条件喂 egui 会让 Tab
+/// 偷走焦点,终端永久收不到键)。
+pub fn keyboard_to_egui(
+    focus: Focus,
+    modal_open: bool,
+    egui_wants_keyboard: bool,
+    egui_dragging: bool,
+    is_escape: bool,
+) -> bool {
+    (egui_dragging && is_escape)
+        || egui_should_see_focused(focus, InputKind::Keyboard, modal_open, egui_wants_keyboard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F324:egui 拖动中按 Esc → 归 egui(调用方因此不再写终端),即使焦点
+    /// 在终端/面板、egui 并不想要键盘。
+    ///
+    /// 自证会变红:`keyboard_to_egui` 去掉 `egui_dragging && is_escape` 那一支。
+    #[test]
+    fn escape_during_an_egui_drag_goes_to_egui_not_the_terminal() {
+        for focus in [Focus::Terminal, Focus::FilesPanel] {
+            assert!(
+                keyboard_to_egui(focus, false, false, true, true),
+                "{focus:?}"
+            );
+        }
+    }
+
+    /// F324:拖动中**其它键**照原路由 —— 判给终端的键仍不喂 egui(T8:Tab
+    /// 进了 egui 会偷走焦点,终端永久收不到键)。
+    ///
+    /// 自证会变红:把那一支写成只看 `egui_dragging`(漏了 `&& is_escape`)。
+    #[test]
+    fn other_keys_during_an_egui_drag_keep_their_usual_route() {
+        assert!(!keyboard_to_egui(
+            Focus::Terminal,
+            false,
+            false,
+            true,
+            false
+        ));
+        assert!(!keyboard_to_egui(
+            Focus::FilesPanel,
+            false,
+            true,
+            true,
+            false
+        ));
+        assert!(keyboard_to_egui(Focus::Terminal, false, true, true, false));
+    }
+
+    /// F324:不在拖动时 Esc 照旧不喂 egui、走原路(终端 / 面板)—— tmux 里的
+    /// Claude Code 靠它中断生成。
+    ///
+    /// 自证会变红:把那一支写成只看 `is_escape`(漏了 `egui_dragging &&`)。
+    #[test]
+    fn escape_without_an_egui_drag_still_reaches_the_terminal() {
+        assert!(!keyboard_to_egui(
+            Focus::Terminal,
+            false,
+            false,
+            false,
+            true
+        ));
+        assert!(!keyboard_to_egui(
+            Focus::FilesPanel,
+            false,
+            false,
+            false,
+            true
+        ));
+    }
 
     #[test]
     fn modal_captures_everything() {

@@ -13702,6 +13702,12 @@ impl ApplicationHandler<UserEvent> for App {
         // F320:拖抽屉分隔线同样算「指针被终端捕获」—— 拖出中央区、在 egui 的
         // 栏上松手时,`Released` 不能被 egui 截走,否则拖动状态卡死。
         let dragging = self.dragging || self.divider_drag.is_some();
+        // F324:Esc 的判别(按下/抬起都算),拖动中归 egui 用。
+        let is_escape = matches!(
+            &event,
+            WindowEvent::KeyboardInput { event: ke, .. }
+                if ke.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+        );
         // Route::FilesPanel 判给面板的键记在这里,借用 `active` 的作用域结束
         // 之后再处理(`handle_panel_key` 要 `&mut self`,不能跟 `&mut self.active`
         // 同时活着)。
@@ -13715,13 +13721,18 @@ impl ApplicationHandler<UserEvent> for App {
                     | WindowEvent::CursorMoved { .. }
             );
             let wants_kbd = active.egui_ctx.wants_keyboard_input();
+            // F324:egui 正在拖东西(拖标题条换位等)时按下的 Esc 归 egui —— 它靠
+            // 这个键中止拖动;判给 egui 的键下面 `if is_kbd { return; }` 不再落终端。
+            // `dragged_id` 是过了拖动阈值才有的「真在拖」,不是按下即置的候选。
+            let egui_dragging = active.egui_ctx.dragged_id().is_some();
             // 键盘归终端/面板时整段跳过 egui;其余事件(含指针与 resize/focus 等)照旧喂。
             if is_kbd
-                && !shell::input_route::egui_should_see_focused(
+                && !shell::input_route::keyboard_to_egui(
                     focus,
-                    shell::input_route::InputKind::Keyboard,
                     modal,
                     wants_kbd,
+                    egui_dragging,
+                    is_escape,
                 )
             {
                 // Route::Terminal → 直落下面 UNCHANGED 的 KeyboardInput 分支(守 T5/T6)。
@@ -22865,6 +22876,36 @@ mod tests {
         assert!(
             apply.contains("ws.swap_panes("),
             "apply_layout_actions 没把换位请求交给 Workspace"
+        );
+    }
+
+    /// **接线守护 / F324 C1**:键盘分流处必须把「egui 正在拖」与「这是 Esc」
+    /// 传给 `input_route::keyboard_to_egui`。漏了的话,拖标题条时按 Esc 判给
+    /// 终端:egui 收不到、拖动继续、松手照样换位,而且 `\x1b` 被写进焦点 pane
+    /// (tmux 里的 Claude Code 里 Esc = 中断生成)。纯函数那一半由
+    /// `input_route::tests::escape_during_an_egui_drag_goes_to_egui_not_the_terminal` 守。
+    ///
+    /// 切片走 `prod_src()`(已剥注释),注释里写着同一串喂不饱判据。
+    ///
+    /// 自证会变红:把调用点改回 `egui_should_see_focused(focus, Keyboard, modal,
+    /// wants_kbd)`(第一、三条红);给 `egui_dragging` 传 `false`(第二条红);
+    /// 把 `egui_dragging` 的来源换成别的(第四条红)。
+    #[test]
+    fn the_keyboard_split_hands_the_egui_drag_state_to_the_router() {
+        let prod = prod_src();
+        let at = prod
+            .find("shell::input_route::keyboard_to_egui(")
+            .expect("键盘分流处没有调用 keyboard_to_egui —— 拖动中的 Esc 会落进终端");
+        let call = &prod[at..at + prod[at..].find(')').expect("调用没有闭合")];
+        assert!(call.contains("egui_dragging"), "没传拖动状态:{call}");
+        assert!(call.contains("is_escape"), "没传 Esc 判别:{call}");
+        assert!(
+            !prod.contains("input_route::egui_should_see_focused("),
+            "键盘分流又直接调 egui_should_see_focused 了,绕过了 F324 的 Esc 例外"
+        );
+        assert!(
+            prod.contains("let egui_dragging = active.egui_ctx.dragged_id().is_some();"),
+            "egui_dragging 不是取自 egui 的 dragged_id(过了阈值才有的「真在拖」)"
         );
     }
 
