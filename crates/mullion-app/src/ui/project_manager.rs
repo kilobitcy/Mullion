@@ -411,6 +411,7 @@ fn form_column(
                 );
                 ui.add_space(SP_XS);
             }
+            let emphasise_archive = archive_button_emphasis(is_archived);
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(issue.is_none() && !blank, egui::Button::new("保存"))
@@ -420,6 +421,19 @@ fn form_column(
                         Some(ProjectIntent::Save(id, Box::new(save_draft.clone())));
                 }
                 ui.add_space(SP_S);
+                // F322:已归档时「取消归档」强调并排到最左(「打开」之前)。
+                if emphasise_archive {
+                    let accent = crate::theme::c32(t.accent);
+                    let unarchive = egui::Button::new(
+                        egui::RichText::new(archive_button_label(is_archived)).color(accent),
+                    )
+                    .stroke(egui::Stroke::new(1.0, accent));
+                    if ui.add(unarchive).clicked() {
+                        ui_state.project_intent =
+                            Some(ProjectIntent::SetArchived(id, !is_archived));
+                    }
+                    ui.add_space(SP_S);
+                }
                 if ui
                     .add_enabled(openable, egui::Button::new("打开"))
                     .clicked()
@@ -432,10 +446,12 @@ fn form_column(
                 // 撤销就在同一个按钮上,而「高频路径上的无谓确认会被用户练成
                 // 闭眼点确定,那时它对真正危险的几种也失效」(`show_open_confirm`
                 // 的原话)。
-                if ui.button(archive_button_label(is_archived)).clicked() {
+                if !emphasise_archive && ui.button(archive_button_label(is_archived)).clicked() {
                     ui_state.project_intent = Some(ProjectIntent::SetArchived(id, !is_archived));
                 }
-                ui.add_space(SP_S);
+                if !emphasise_archive {
+                    ui.add_space(SP_S);
+                }
                 if ui.button("删除项目").clicked() {
                     ui_state.project_intent = Some(ProjectIntent::Delete(id));
                 }
@@ -771,6 +787,13 @@ pub fn show_takeover_confirm(
             });
         });
     out
+}
+
+/// F322:归档按钮是否强调。只有已归档时强调 —— 那时它是撤销归档的唯一入口,
+/// 要让人一眼找到;只用 accent 文字 + 描边的空心按钮,不用实心底(全场唯一的
+/// accent 实心按钮是会话编辑器的「保存并连接」)。
+pub(crate) fn archive_button_emphasis(archived: bool) -> bool {
+    archived
 }
 
 /// F257:归档按钮上的字。抽成函数只为了能单测 —— 写死「归档」的话,已归档的
@@ -1807,6 +1830,14 @@ mod tests {
     fn the_button_says_undo_when_the_project_is_already_archived() {
         assert_eq!(archive_button_label(false), "归档");
         assert_eq!(archive_button_label(true), "取消归档");
+    }
+
+    /// F322:只有「取消归档」强调。自证会变红:把函数改成恒 true 或恒 false,
+    /// 两条断言必有一条失败。
+    #[test]
+    fn only_the_unarchive_button_is_emphasised() {
+        assert!(archive_button_emphasis(true));
+        assert!(!archive_button_emphasis(false));
     }
 
     /// D13 接线判据(复核 Critical):`list_column` 传给 `project_list::rows`
