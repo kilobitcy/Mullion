@@ -313,12 +313,42 @@ fn country_cell(
     text: &str,
     font: egui::FontId,
     color: egui::Color32,
+    t: &Theme,
 ) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
-    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), color);
+    let size = galley.size() + COUNTRY_PAD;
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let resp = ui.interact(rect, id, egui::Sense::click());
-    ui.painter().galley(rect.min, galley, color);
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, 3.0, theme::c32(t.panel_head));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // 悬停变色要换颜色,galley 的颜色已烘进去,所以重新排一次版。
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        font,
+        country_text_color(t, color, hovered),
+    );
+    let at = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(at, galley, color);
     resp
+}
+
+/// 国家格内边距(横向合计、纵向合计),让悬停底色不贴字。
+/// `show` 里的 `stats_w` 要把横向这一份计入,否则 `stats_fit` 会低估。
+const COUNTRY_PAD: egui::Vec2 = egui::vec2(6.0, 2.0);
+
+/// F323:国家格文字色 —— 常态是状态色(warn/fg_muted),悬停提亮到 `fg_strong`。
+fn country_text_color(t: &Theme, base: egui::Color32, hovered: bool) -> egui::Color32 {
+    if hovered {
+        theme::c32(t.fg_strong)
+    } else {
+        base
+    }
 }
 
 /// 画「⇆」:上排箭头指右,下排箭头指左。纯线段,零字体依赖。
@@ -490,10 +520,15 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                 .size()
                                 .x
                         };
-                        let stats_w: f32 =
-                            v.stats.iter().map(|p| measure(ui, &p.text)).sum::<f32>()
+                        let stats_w: f32 = v.stats.iter().map(|p| measure(ui, &p.text)).sum::<f32>()
                                 + measure(ui, sep) * v.stats.len().saturating_sub(1) as f32
-                                + ui.spacing().item_spacing.x * (2 * v.stats.len()) as f32;
+                                + ui.spacing().item_spacing.x * (2 * v.stats.len()) as f32
+                                // 国家格比文字多出内边距(F323),计入以免低估占宽。
+                                + if v.stats.iter().any(|p| p.is_country) {
+                                    COUNTRY_PAD.x
+                                } else {
+                                    0.0
+                                };
                         let title_w = measure(
                             ui,
                             &title_text(
@@ -524,6 +559,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                         &p.text,
                                         font.clone(),
                                         color,
+                                        t,
                                     );
                                     if r.on_hover_text(&p.hover).clicked() {
                                         action.refresh_node = Some(v.geom.id);
@@ -1392,6 +1428,16 @@ mod tests {
 
     /// F298:点国家那格报 `refresh_node`,不串到 × / 换节点。
     ///
+    /// F323:国家格悬停时文字提亮到 `fg_strong`,常态保持传入的状态色。
+    /// 自证会变红:`country_text_color` 悬停时仍返回 `base`,或常态误返回 `fg_strong`。
+    #[test]
+    fn the_country_cell_brightens_on_hover() {
+        let t = crate::theme::MULLION_DARK;
+        let base = theme::c32(t.warn);
+        assert_eq!(country_text_color(&t, base, false), base);
+        assert_eq!(country_text_color(&t, base, true), theme::c32(t.fg_strong));
+    }
+
     /// 自证会变红:国家那格不 `Sense::click()`,或报成 `rehost`。
     #[test]
     fn clicking_the_country_asks_for_a_refresh_of_this_pane() {
