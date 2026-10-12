@@ -1092,6 +1092,30 @@ impl Vault {
         self.secrets.get(&cred_key(id))
     }
 
+    /// 找一条与 (user, kind, secret) 全等的已有凭据,供「由会话生成凭据」去重(F325)。
+    /// 比较 `password`/`passphrase`/`private_key` 三项,**不比 `proxy_password`**
+    /// (它是会话的东西,不是身份的东西,设计 D4;`credential_secret` 的文档同一条)。
+    /// 多条命中取 id 最小的,结果稳定。
+    pub fn find_credential_matching(
+        &self,
+        user: &str,
+        kind: &crate::model::AuthKind,
+        secret: &SecretEntry,
+    ) -> Option<CredentialId> {
+        let empty = SecretEntry::default();
+        self.credentials
+            .iter()
+            .filter(|c| c.user == user && &c.kind == kind)
+            .filter(|c| {
+                let s = self.credential_secret(c.id).unwrap_or(&empty);
+                s.password == secret.password
+                    && s.passphrase == secret.passphrase
+                    && s.private_key == secret.private_key
+            })
+            .map(|c| c.id)
+            .min()
+    }
+
     /// 新增凭据。id 取现有 max+1(空库从 1 起),**与会话/隧道号池互不影响**。
     pub fn add_credential(&mut self, draft: CredentialDraft) -> CredentialId {
         self.sync_from_disk_if_untouched();
@@ -1954,6 +1978,140 @@ mod tests {
                 private_key: None,
             }),
         }
+    }
+
+    fn secret(pw: Option<&str>, pass: Option<&str>, key: Option<&str>) -> SecretEntry {
+        SecretEntry {
+            password: pw.map(Into::into),
+            passphrase: pass.map(Into::into),
+            proxy_password: None,
+            private_key: key.map(Into::into),
+        }
+    }
+
+    fn key_draft(user: &str, s: SecretEntry, has_passphrase: bool) -> CredentialDraft {
+        CredentialDraft {
+            name: "k".into(),
+            user: user.into(),
+            kind: AuthKind::PublicKey { has_passphrase },
+            secret: Some(s),
+        }
+    }
+
+    /// F325:用户、类型、密文三者全等才算同一条凭据。
+    ///
+    /// 自证会变红:把 `find_credential_matching` 里 `user` 或 `kind` 的比较去掉,
+    /// 对应的 None 断言立刻变 Some。
+    #[test]
+    fn a_credential_with_the_same_user_kind_and_secret_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_credential(cred_draft("a", "alice", Some("pw1")));
+        let pw1 = secret(Some("pw1"), None, None);
+        assert_eq!(
+            v.find_credential_matching("alice", &AuthKind::Password, &pw1),
+            Some(id)
+        );
+        assert_eq!(
+            v.find_credential_matching("bob", &AuthKind::Password, &pw1),
+            None
+        );
+        assert_eq!(
+            v.find_credential_matching(
+                "alice",
+                &AuthKind::Password,
+                &secret(Some("pw2"), None, None)
+            ),
+            None
+        );
+        assert_eq!(
+            v.find_credential_matching(
+                "alice",
+                &AuthKind::PublicKey {
+                    has_passphrase: false
+                },
+                &pw1
+            ),
+            None
+        );
+    }
+
+    /// 自证会变红:去掉 `private_key` 或 `passphrase` 的比较,或把 `kind` 的 `==`
+    /// 换成只比变体,对应断言变 Some。
+    #[test]
+    fn key_credentials_must_match_on_key_body_and_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_credential(key_draft("u", secret(None, Some("pp"), Some("KEY")), true));
+        let kind = AuthKind::PublicKey {
+            has_passphrase: true,
+        };
+        assert_eq!(
+            v.find_credential_matching("u", &kind, &secret(None, Some("pp"), Some("KEY"))),
+            Some(id)
+        );
+        assert_eq!(
+            v.find_credential_matching("u", &kind, &secret(None, Some("pp"), Some("OTHER"))),
+            None,
+            "私钥正文不同"
+        );
+        assert_eq!(
+            v.find_credential_matching("u", &kind, &secret(None, Some("p2"), Some("KEY"))),
+            None,
+            "口令不同"
+        );
+        assert_eq!(
+            v.find_credential_matching("u", &kind, &secret(None, None, Some("KEY"))),
+            None,
+            "一方有口令一方无"
+        );
+        assert_eq!(
+            v.find_credential_matching(
+                "u",
+                &AuthKind::PublicKey {
+                    has_passphrase: false
+                },
+                &secret(None, Some("pp"), Some("KEY"))
+            ),
+            None,
+            "has_passphrase 不同"
+        );
+    }
+
+    /// 代理口令是会话的东西,不参与身份比较(设计 D4)。
+    ///
+    /// 自证会变红:在比较里加上 `proxy_password` 一项(或直接比整个 `SecretEntry`)。
+    #[test]
+    fn proxy_password_is_ignored_when_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_credential(cred_draft("a", "alice", Some("pw1")));
+        let mut q = secret(Some("pw1"), None, None);
+        q.proxy_password = Some("x".into());
+        assert_eq!(
+            v.find_credential_matching("alice", &AuthKind::Password, &q),
+            Some(id)
+        );
+    }
+
+    /// 多条命中取 id 最小,结果稳定。
+    ///
+    /// 自证会变红:改成取最后一条命中(`.last()` / `max`)。
+    #[test]
+    fn the_lowest_id_wins_when_several_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let first = v.add_credential(cred_draft("a", "alice", Some("pw1")));
+        let second = v.add_credential(cred_draft("b", "alice", Some("pw1")));
+        assert!(first < second);
+        assert_eq!(
+            v.find_credential_matching(
+                "alice",
+                &AuthKind::Password,
+                &secret(Some("pw1"), None, None)
+            ),
+            Some(first)
+        );
     }
 
     /// 凭据号池独立于会话/隧道:挤在一个号池里会让「凭据 7」和「会话 7」
