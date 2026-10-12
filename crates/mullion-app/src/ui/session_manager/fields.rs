@@ -1018,6 +1018,26 @@ pub(super) fn auth(
         }
     });
 
+    // F325-b:把这份内联身份一键转成共享凭据。放在密码/私钥之后:它用的
+    // 正是上面这几格的当前内容(含未保存)。
+    ui.add_space(crate::ui::metrics::SP_S);
+    let block = create_credential_block(buf, presence);
+    if super::labeled_button(
+        ui,
+        create_credential_button_id(),
+        "创建凭据",
+        block.is_none(),
+        block,
+    ) {
+        buf.create_credential_clicked = true;
+    }
+    ui.add_space(crate::ui::metrics::SP_XS);
+    ui.label(
+        egui::RichText::new(CREATE_CREDENTIAL_NOTE)
+            .size(11.0)
+            .color(crate::theme::c32(t.fg_muted)),
+    );
+
     // 走查 20:说清楚这些东西存哪儿、怎么护着。用户手里是一台随时可能被
     // 别人碰到的 Windows 机器,「这密码到底存哪了」是个合理且必须回答的问题
     // —— 不回答,谨慎的人就干脆不用这个功能,每次连都手敲。
@@ -1031,6 +1051,39 @@ pub(super) fn auth(
             .size(11.0)
             .color(crate::theme::c32(t.fg_muted)),
     );
+}
+
+/// F325-b「创建凭据」按钮的显式 id:测试要读回它的 `enabled()`,
+/// 自动 id 外部算不出来(理由同 `save_button_id()`)。
+pub(crate) fn create_credential_button_id() -> egui::Id {
+    egui::Id::new("sm_create_credential")
+}
+
+/// F325-b「创建凭据」按钮下面那行灰字。
+pub(super) const CREATE_CREDENTIAL_NOTE: &str =
+    "把这份用户名与密码/私钥存为共享凭据并改为引用;内容相同的会复用已有凭据";
+
+/// F325-b:「创建凭据」此刻为什么不能点(`None` = 可以点)。返回值即禁用时的
+/// tooltip(规范第 9 条)。
+///
+/// 私钥的有无按**合成后**的语义判(与 `merged_identity_secret` 同一套三态):
+/// 这一轮碰过就看缓冲,没碰过才看库里有没有 —— 点过「清除」的钥匙不算数。
+pub(super) fn create_credential_block(
+    buf: &EditorBuffer,
+    presence: SecretPresence,
+) -> Option<&'static str> {
+    if buf.user.trim().is_empty() {
+        return Some("先填用户名");
+    }
+    let has_key = if buf.key_touched {
+        !buf.key_data.is_empty()
+    } else {
+        presence.private_key
+    };
+    if buf.auth_kind == AuthKindUi::PublicKey && !has_key {
+        return Some("先导入私钥");
+    }
+    None
 }
 
 /// 凭据存储的说明文案。抽成常量是为了让守护测试能直接钉住它 —— 尤其是
@@ -4722,6 +4775,123 @@ mod tests {
             buf.credential_id,
             Some(mullion_store::CredentialId(2)),
             "点中的是「备用号」"
+        );
+    }
+
+    // ---- F325-b:「创建凭据」按钮 ----
+
+    /// 跑两帧「认证」页,在帧内读回「创建凭据」按钮的 `enabled()`
+    /// (`read_response` 必须在 `ctx.run` 里面读,见恒绿模式 ⑬)。
+    fn create_credential_enabled(buf: &mut EditorBuffer, presence: SecretPresence) -> Option<bool> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut enabled = None;
+        for _ in 0..2 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    auth(ui, &t, buf, presence, &[], &[], &mut Default::default());
+                });
+                enabled = ctx
+                    .read_response(super::create_credential_button_id())
+                    .map(|r| r.enabled());
+            });
+        }
+        enabled
+    }
+
+    /// 用户名(trim 后)为空 → 按钮禁用;填上就可点。
+    ///
+    /// 自证会变红:把 `create_credential_block` 里用户名那条判断删掉。
+    #[test]
+    fn create_credential_is_disabled_until_there_is_a_user_name() {
+        let mut buf = EditorBuffer {
+            user: "  ".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            create_credential_enabled(&mut buf, SecretPresence::default()),
+            Some(false)
+        );
+        buf.user = "root".into();
+        assert_eq!(
+            create_credential_enabled(&mut buf, SecretPresence::default()),
+            Some(true)
+        );
+    }
+
+    /// 公钥档一把钥匙都没有(库里没有、也没导入)→ 禁用;库里有就可点。
+    #[test]
+    fn create_credential_in_public_key_mode_needs_a_key() {
+        let mut buf = EditorBuffer {
+            user: "root".into(),
+            auth_kind: AuthKindUi::PublicKey,
+            ..Default::default()
+        };
+        assert_eq!(
+            create_credential_enabled(&mut buf, SecretPresence::default()),
+            Some(false),
+            "没有任何私钥时应禁用"
+        );
+        let stored_key = SecretPresence {
+            private_key: true,
+            ..Default::default()
+        };
+        assert_eq!(create_credential_enabled(&mut buf, stored_key), Some(true));
+    }
+
+    /// 禁用原因的判据本身(tooltip 文案随之而定)。
+    #[test]
+    fn create_credential_block_reasons() {
+        let none = SecretPresence::default();
+        let mut buf = EditorBuffer::default();
+        assert_eq!(
+            super::create_credential_block(&buf, none),
+            Some("先填用户名")
+        );
+        buf.user = "root".into();
+        assert_eq!(super::create_credential_block(&buf, none), None);
+        buf.auth_kind = AuthKindUi::PublicKey;
+        assert_eq!(
+            super::create_credential_block(&buf, none),
+            Some("先导入私钥")
+        );
+        buf.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----".into();
+        buf.key_touched = true;
+        assert_eq!(super::create_credential_block(&buf, none), None);
+        // 库里有钥匙但这一轮点过「清除」→ 合成后没有钥匙,同样挡住。
+        buf.key_data.clear();
+        let stored_key = SecretPresence {
+            private_key: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::create_credential_block(&buf, stored_key),
+            Some("先导入私钥")
+        );
+    }
+
+    /// 点击只置瞬态标志(由 `mod.rs` 抽走转成请求)。
+    #[test]
+    fn clicking_create_credential_sets_the_transient_flag() {
+        let mut buf = EditorBuffer {
+            user: "root".into(),
+            ..Default::default()
+        };
+        click_through_auth(&mut buf, &[], &["创建凭据"]);
+        assert!(buf.create_credential_clicked);
+    }
+
+    /// 共享档不画这个按钮(没有可转的「本会话独有」身份)。
+    #[test]
+    fn create_credential_is_not_drawn_in_the_shared_source() {
+        let mut buf = EditorBuffer {
+            user: "root".into(),
+            cred_source: CredSourceUi::Shared,
+            ..Default::default()
+        };
+        assert_eq!(
+            create_credential_enabled(&mut buf, SecretPresence::default()),
+            None
         );
     }
 }

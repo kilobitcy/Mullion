@@ -15698,6 +15698,41 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                // F325-b:会话编辑器「创建凭据」的施加点。凭据表的写入与落盘在
+                // `convert_inline_to_credential`(与 `apply_credential_save` 同一个
+                // `store.save()`);会话本身**不**在这里存 —— 只把编辑缓冲改成引用,
+                // 仍等用户点「保存」。原缓冲里的用户名/密码不清空(切回独有档还在,D9)。
+                if let Some(req) = self.ui.credential_from_session_request.take() {
+                    if let Some(store) = self.store.as_mut() {
+                        match convert_inline_to_credential(store, req.editing_id, &req.buffer) {
+                            Ok((id, reused)) => {
+                                // 这一帧之间用户不可能切走编辑对象,但仍按 id 对一下:
+                                // 改错一张表单比不改更糟。
+                                if self.ui.editor_id == req.editing_id {
+                                    if let Some(buf) = self.ui.editor.as_mut() {
+                                        buf.cred_source =
+                                            crate::ui::session_manager::CredSourceUi::Shared;
+                                        buf.credential_id = Some(id);
+                                    }
+                                }
+                                let name = store
+                                    .credentials()
+                                    .iter()
+                                    .find(|c| c.id == id)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_default();
+                                let msg = if reused {
+                                    format!("已复用凭据「{name}」(内容相同,未新建)")
+                                } else {
+                                    format!("已创建凭据「{name}」,并改为引用")
+                                };
+                                self.ui.set_toast(crate::ui::toast::Kind::Ok, msg);
+                                mark_ui_dirty!(self.ui_dirty);
+                            }
+                            Err(msg) => self.ui.set_error(msg),
+                        }
+                    }
+                }
                 // F2:ssh config 导入的施加点。与会话保存同构 —— 弹窗只交出
                 // 勾好的行,落库(含跳板两阶段回填)在 `apply_import`。
                 if let Some(rows) = self.ui.import_request.take() {
@@ -17438,6 +17473,54 @@ fn apply_credential_save(
         .map(|_| id)
 }
 
+/// F325-b:把会话编辑器里「本会话独有」的那份身份转成共享凭据。
+/// 返回 `(凭据 id, 是否复用了已有的)`。
+///
+/// 内容 = 库里该会话已存密文上叠加缓冲里碰过的字段(`merged_identity_secret`),
+/// 代理口令不带。用户名(trim)+ 认证方式 + 密文全等的凭据已存在就直接复用,
+/// 不新建;没有才新建,名字 `用户@主机`(撞名加序号),并与凭据页保存走同一个
+/// `store.save()` 落盘 —— 只进内存的话,会话保存后引用的是重启就消失的 id。
+///
+/// 只动凭据表,不动会话:改引用后会话仍要用户点「保存」才落盘。
+/// **错误文案不得含密文。**
+fn convert_inline_to_credential(
+    store: &mut crate::shell::store::SessionStore,
+    editing_id: Option<mullion_store::SessionId>,
+    buf: &crate::ui::session_manager::EditorBuffer,
+) -> Result<(mullion_store::CredentialId, bool), String> {
+    use crate::ui::session_manager::{default_credential_name, merged_identity_secret, AuthKindUi};
+
+    let user = buf.user.trim();
+    if user.is_empty() {
+        return Err("用户名不能为空".to_string());
+    }
+    let stored = editing_id.and_then(|id| store.secret(id));
+    let secret = merged_identity_secret(buf, stored);
+    let kind = match buf.auth_kind {
+        AuthKindUi::Password => mullion_store::AuthKind::Password,
+        AuthKindUi::PublicKey => mullion_store::AuthKind::PublicKey {
+            has_passphrase: secret.passphrase.is_some(),
+        },
+    };
+    if let Some(id) = store.vault().find_credential_matching(user, &kind, &secret) {
+        return Ok((id, true));
+    }
+    let name = default_credential_name(user, &buf.host, store.credentials());
+    // 全空不留壳(同 `merge_secret`)。
+    let empty =
+        secret.password.is_none() && secret.passphrase.is_none() && secret.private_key.is_none();
+    let id = store.add_credential(mullion_store::CredentialDraft {
+        name,
+        user: user.to_string(),
+        kind,
+        secret: (!empty).then_some(secret),
+    });
+    store
+        .save()
+        .map_err(|e| format!("创建凭据失败:{e}"))
+        .map(|_| (id, false))
+}
+
 /// 施加一次 `~/.ssh/config` 导入(F2)。返回真正建出来的会话数。
 ///
 /// **两阶段**(设计 D4):`ProxyJump` 在 config 里写的是主机别名,而本项目的
@@ -17943,14 +18026,14 @@ mod tests {
         apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
         arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
         autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
-        clip_still_matches_what_was_pasted, cloud_backoff_ms, credential_delete_error,
-        decide_paste, dialing_from, dismiss_areas, dismiss_verdict, download_job,
-        draft_baseline_is_in_vault, drive_attach_checks_of, effective_focus_of, expand_tilde,
-        files_owner_generation_of, files_path_editing_of, files_start_dir, finish_password_change,
-        follow_for_clip_mode, font_px_for, has_real_action, history_rows_of, history_sync,
-        host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of,
-        new_pane_emulator, next_auto_dial, next_panel_selection_index, opt_buf_dirty,
-        pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
+        clip_still_matches_what_was_pasted, cloud_backoff_ms, convert_inline_to_credential,
+        credential_delete_error, decide_paste, dialing_from, dismiss_areas, dismiss_verdict,
+        download_job, draft_baseline_is_in_vault, drive_attach_checks_of, effective_focus_of,
+        expand_tilde, files_owner_generation_of, files_path_editing_of, files_start_dir,
+        finish_password_change, follow_for_clip_mode, font_px_for, has_real_action,
+        history_rows_of, history_sync, host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of,
+        leaf_identity_of, new_pane_emulator, next_auto_dial, next_panel_selection_index,
+        opt_buf_dirty, pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
         project_lamps_have_audience, reattach_pane, rehost_pane, resolved_scrollback,
         session_manager_dirty, should_check_attach, should_pop_cloud_error,
         should_pop_transfer_error, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
@@ -30411,6 +30494,172 @@ mod tests {
             }),
             "has_passphrase 必须跟合成后的密文走,不跟空着的表单走"
         );
+    }
+
+    /// F325-b 接线守护:事件循环里确实 take 了 `credential_from_session_request`,
+    /// 拿它调了转换核心,并把会话编辑缓冲改成引用返回的那份凭据。
+    ///
+    /// 只有 UI 置请求、没人消费的话:按钮点了毫无反应,测试与编译全绿。
+    /// `prod_src()` 已剥整行注释(见其文档),注释里写着同名串喂不饱断言。
+    ///
+    /// 自证会变红:删掉施加分支里的 `convert_inline_to_credential(...)` 调用,
+    /// 或删掉 `buf.credential_id = Some(id);`。
+    #[test]
+    fn the_create_credential_request_is_consumed_and_rewires_the_editor() {
+        let prod = prod_src();
+        let anchor = "if let Some(req) = self.ui.credential_from_session_request.take() {";
+        let at = prod
+            .find(anchor)
+            .expect("事件循环里没有消费 credential_from_session_request");
+        let rest = &prod[at + anchor.len() - 1..];
+        let body = brace_balanced_arm(rest);
+        assert!(body.len() < rest.len(), "没截到闭合大括号");
+        for needle in [
+            "convert_inline_to_credential(store, req.editing_id, &req.buffer)",
+            "CredSourceUi::Shared;",
+            "buf.credential_id = Some(id);",
+        ] {
+            assert!(body.contains(needle), "施加分支里缺 `{needle}`");
+        }
+    }
+
+    // ---- F325-b:会话编辑器「创建凭据」的转换核心 ----
+
+    fn inline_buf(user: &str, pw: &str) -> crate::ui::session_manager::EditorBuffer {
+        let mut b = crate::ui::session_manager::EditorBuffer {
+            name: "dev".into(),
+            host: "10.0.0.5".into(),
+            user: user.into(),
+            ..Default::default()
+        };
+        b.password = pw.into();
+        b.password_touched = true;
+        b
+    }
+
+    /// 没有可复用的 → 新建一条:名字 `用户@主机`、用户名 trim 过、密文是缓冲里那份,
+    /// 且**已落盘**(重开库还在)—— 只进内存的话,会话保存后引用的是一个重启就
+    /// 没了的 id。
+    ///
+    /// 自证会变红:删掉 `convert_inline_to_credential` 里的 `store.save()`。
+    #[test]
+    fn converting_inline_auth_creates_a_persisted_credential() {
+        let (dir, mut store) = tmp_store();
+        let (id, reused) =
+            convert_inline_to_credential(&mut store, None, &inline_buf(" root ", "pw-1"))
+                .expect("应成功");
+        assert!(!reused);
+        let rec = store
+            .credentials()
+            .iter()
+            .find(|c| c.id == id)
+            .expect("返回的 id 应在库里")
+            .clone();
+        assert_eq!(rec.name, "root@10.0.0.5");
+        assert_eq!(rec.user, "root");
+        assert_eq!(rec.kind, mullion_store::AuthKind::Password);
+        assert_eq!(
+            store
+                .credential_secret(id)
+                .and_then(|s| s.password.clone())
+                .as_deref(),
+            Some("pw-1")
+        );
+        drop(store);
+        let reopened = crate::shell::store::SessionStore::open(dir.path().to_path_buf(), &FixedKey)
+            .expect("reopen");
+        assert!(
+            reopened.credentials().iter().any(|c| c.id == id),
+            "新建的凭据必须落盘"
+        );
+    }
+
+    /// 同用户名 + 同方式 + 同密文 → 复用,不再新建。
+    #[test]
+    fn converting_identical_inline_auth_twice_reuses_the_first_credential() {
+        let (_dir, mut store) = tmp_store();
+        let (first, _) =
+            convert_inline_to_credential(&mut store, None, &inline_buf("root", "pw-1"))
+                .expect("首次");
+        let (second, reused) =
+            convert_inline_to_credential(&mut store, None, &inline_buf("root", "pw-1"))
+                .expect("二次");
+        assert!(reused, "内容相同应复用");
+        assert_eq!(second, first);
+        assert_eq!(store.credentials().len(), 1, "凭据条数不该增加");
+    }
+
+    /// 用户名不同 → 不是同一个身份,新建;重名的默认名后缀不受影响。
+    #[test]
+    fn converting_with_a_different_user_creates_a_new_credential() {
+        let (_dir, mut store) = tmp_store();
+        convert_inline_to_credential(&mut store, None, &inline_buf("root", "pw-1")).expect("一");
+        let (_, reused) =
+            convert_inline_to_credential(&mut store, None, &inline_buf("ops", "pw-1")).expect("二");
+        assert!(!reused);
+        assert_eq!(store.credentials().len(), 2);
+    }
+
+    /// 已存会话、密码框没碰(编辑时恒为空)→ 用库里那份密文去建/查,
+    /// 而不是建出一条没有密码的凭据。
+    ///
+    /// 自证会变红:把 `convert_inline_to_credential` 里 `store.secret(id)` 换成 `None`。
+    #[test]
+    fn converting_an_untouched_saved_session_uses_its_stored_password() {
+        let (_dir, mut store) = tmp_store();
+        let saved = inline_buf("root", "pw-stored");
+        let sid = store.add(
+            crate::ui::session_manager::build_draft(&saved).expect("build"),
+            "2026-10-12T00:00:00Z",
+        );
+        let mut reopened = saved.clone();
+        reopened.password = String::new();
+        reopened.password_touched = false;
+        let (id, _) =
+            convert_inline_to_credential(&mut store, Some(sid), &reopened).expect("应成功");
+        assert_eq!(
+            store
+                .credential_secret(id)
+                .and_then(|s| s.password.clone())
+                .as_deref(),
+            Some("pw-stored")
+        );
+    }
+
+    /// 公钥带口令:kind 的 `has_passphrase` 跟合成后的密文走,私钥与口令都进凭据。
+    #[test]
+    fn converting_public_key_auth_carries_key_and_passphrase() {
+        let (_dir, mut store) = tmp_store();
+        let mut b = inline_buf("root", "");
+        b.password_touched = false;
+        b.auth_kind = crate::ui::session_manager::AuthKindUi::PublicKey;
+        b.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n".into();
+        b.key_touched = true;
+        b.passphrase = "pp".into();
+        b.passphrase_touched = true;
+        let (id, _) = convert_inline_to_credential(&mut store, None, &b).expect("应成功");
+        let rec = store.credentials().iter().find(|c| c.id == id).cloned();
+        assert_eq!(
+            rec.map(|c| c.kind),
+            Some(mullion_store::AuthKind::PublicKey {
+                has_passphrase: true
+            })
+        );
+        let sec = store.credential_secret(id).expect("密文应在");
+        assert!(sec.private_key.is_some(), "私钥应进凭据");
+        assert_eq!(sec.passphrase.as_deref(), Some("pp"));
+        assert_eq!(sec.proxy_password, None, "代理口令不属于身份");
+    }
+
+    /// 用户名为空(含纯空白)→ 报错且什么都不建。
+    #[test]
+    fn converting_without_a_user_name_is_refused() {
+        let (_dir, mut store) = tmp_store();
+        match convert_inline_to_credential(&mut store, None, &inline_buf("  ", "pw-1")) {
+            Err(msg) => assert_eq!(msg, "用户名不能为空"),
+            Ok(_) => panic!("用户名为空不该建出凭据"),
+        }
+        assert!(store.credentials().is_empty());
     }
 
     /// F74/D7:删被引用的凭据被拒时,状态栏那句话里要有**引用者的会话名**。

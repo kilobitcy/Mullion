@@ -275,6 +275,9 @@ pub struct UiState {
     pub credential_editor_baseline: Option<session_manager::CredentialEditorBuffer>,
     /// 凭据表单点「保存」→ app 事后据此调 `store.add_credential`/`update_credential`。
     pub credential_save_request: Option<session_manager::CredentialSaveIntent>,
+    /// F325-b:会话编辑器点了「创建凭据」→ app 事后据此把内联身份转成
+    /// (去重的)共享凭据,并把会话编辑缓冲改为引用它。
+    pub credential_from_session_request: Option<session_manager::CredentialFromSession>,
     /// 二次确认后的删除意图 → app 事后据此调 `store.delete_credential`。
     pub credential_delete_request: Option<mullion_store::CredentialId>,
     /// 点了删凭据但还没二次确认;确认后转成 `credential_delete_request`。

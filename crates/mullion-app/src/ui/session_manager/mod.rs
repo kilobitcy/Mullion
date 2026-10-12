@@ -35,12 +35,14 @@ pub(crate) mod tunnel_list;
 pub(crate) mod validate;
 
 pub(crate) use buffer::{
-    bookmark_table_touched, build_draft, clear_key, connect_string, import_icon_file,
-    import_key_file, is_dirty, merge_secret, secret_fields, set_color_target, sync_has_passphrase,
+    bookmark_table_touched, build_draft, clear_key, connect_string, default_credential_name,
+    import_icon_file, import_key_file, is_dirty, merge_secret, merged_identity_secret,
+    secret_fields, set_color_target, sync_has_passphrase,
 };
 pub(crate) use buffer::{AuthKindUi, JumpModeUi, ProxyModeUi};
 pub use buffer::{
-    CredSourceUi, EditorBuffer, SaveIntent, SecretField, SecretPresence, SwitchTarget,
+    CredSourceUi, CredentialFromSession, EditorBuffer, SaveIntent, SecretField, SecretPresence,
+    SwitchTarget,
 };
 pub use credential_editor::{
     build_credential_draft, credential_secret_fields, import_credential_key_file, in_use_message,
@@ -885,6 +887,16 @@ pub fn show(
         if std::mem::take(&mut buf.pick_icon_clicked) {
             ui_state.icon_target = crate::ui::IconTarget::Session;
             ui_state.pick_icon_request = true;
+        }
+    }
+    // F325-b:「创建凭据」同理 —— `fields::auth` 只置标志,这里借用释放后
+    // 带上整份缓冲(当前内容含未保存)转成请求,由 app 去碰 store。
+    if let Some(buf) = ui_state.editor.as_mut() {
+        if std::mem::take(&mut buf.create_credential_clicked) {
+            ui_state.credential_from_session_request = Some(CredentialFromSession {
+                editing_id: ui_state.editor_id,
+                buffer: buf.clone(),
+            });
         }
     }
 
@@ -3484,5 +3496,81 @@ mod tests {
                 .any(|p| p.starts_with("会话管理器/右栏/分节「")),
             "「连接」页一节都没登记,`fields::section` 的插桩掉了\n{paths:#?}"
         );
+    }
+
+    /// F325-b:编辑缓冲里的「创建凭据」标志在同一帧内被抽走,转成带着
+    /// 当前编辑会话 id 与整份缓冲的请求;抽走之后表单不该因此显脏。
+    ///
+    /// 自证会变红:删掉 `show` 里 `take(&mut buf.create_credential_clicked)` 那段。
+    #[test]
+    fn create_credential_click_becomes_a_request_and_leaves_the_form_clean() {
+        let t = crate::theme::MULLION_DARK;
+        let mut buf = EditorBuffer {
+            name: "web01".into(),
+            host: "10.0.0.5".into(),
+            user: "root".into(),
+            ..Default::default()
+        };
+        let baseline = buf.clone();
+        buf.create_credential_clicked = true;
+        let mut ui_state = UiState {
+            session_manager_open: true,
+            editor_id: Some(SessionId(9)),
+            editor: Some(buf),
+            editor_baseline: Some(baseline),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            show(
+                ctx,
+                &t,
+                &mut ui_state,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                true,
+                SecretPresence::default(),
+                SecretPresence::default(),
+                &crate::ui::badge::AppearanceCache::default(),
+            );
+        });
+        let req = ui_state
+            .credential_from_session_request
+            .take()
+            .expect("应转成请求");
+        assert_eq!(req.editing_id, Some(SessionId(9)));
+        assert_eq!(req.buffer.user, "root");
+        assert!(
+            !req.buffer.create_credential_clicked,
+            "请求里带的缓冲不该还挂着点击标志"
+        );
+        let editor = ui_state.editor.as_ref().expect("editor");
+        assert!(!editor.create_credential_clicked, "标志应已复位");
+        assert!(
+            !is_dirty(editor, ui_state.editor_baseline.as_ref().expect("baseline")),
+            "点「创建凭据」本身不该让表单显脏"
+        );
+    }
+
+    /// 打码红线:请求里的缓冲带明文,`{:?}` 不许把它打出来。
+    #[test]
+    fn credential_from_session_debug_never_leaks_plaintext() {
+        let buf = EditorBuffer {
+            password: "hunter2-pw".into(),
+            key_data: "KEYBODY-xyz".into(),
+            passphrase: "pp-secret".into(),
+            ..Default::default()
+        };
+        let req = CredentialFromSession {
+            editing_id: None,
+            buffer: buf,
+        };
+        let s = format!("{req:?}");
+        for leak in ["hunter2-pw", "KEYBODY-xyz", "pp-secret"] {
+            assert!(!s.contains(leak), "Debug 泄漏了明文");
+        }
     }
 }

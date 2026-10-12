@@ -143,6 +143,10 @@ pub struct EditorBuffer {
     /// `is_dirty` 比对,一条错误提示会让「什么都没改成」的表单显示成脏的、
     /// 切走时白弹一次确认(触碰位当初也是为了这个搬去 `UiState` 的)。
     pub pick_icon_clicked: bool,
+    /// F325-b:身份页的「创建凭据」本帧被点了。同 `pick_key_clicked`:
+    /// `mod.rs` 在借用释放后转成 `UiState::credential_from_session_request`,
+    /// 随即复位 —— 留在缓冲里会参与 `is_dirty` 比对,把表单判成脏。
+    pub create_credential_clicked: bool,
 
     /// F120:SFTP 默认远端目录。空 = 用登录目录。
     pub sftp_default_remote: String,
@@ -190,6 +194,7 @@ impl Default for EditorBuffer {
             preserved_local_bookmarks: Vec::new(),
             pick_key_clicked: false,
             pick_icon_clicked: false,
+            create_credential_clicked: false,
             sftp_default_remote: String::new(),
             sftp_default_local: String::new(),
             sftp_bookmarks: Vec::new(),
@@ -493,15 +498,6 @@ pub(crate) fn sync_has_passphrase(draft: &mut SessionDraft, merged: Option<&Secr
 pub(crate) fn secret_fields(
     buf: &EditorBuffer,
 ) -> (SecretField, SecretField, SecretField, SecretField) {
-    fn field(touched: bool, v: &str) -> SecretField {
-        if !touched {
-            SecretField::Keep
-        } else if v.is_empty() {
-            SecretField::Clear
-        } else {
-            SecretField::Set(v.to_string())
-        }
-    }
     // 引用共享凭据时,身份三件套全在凭据的侧车里(设计 D4)。会话自己那三格
     // 一律 `Clear`:留着就是 secrets.enc 里三条谁也不会去读的孤儿明文。
     // **代理口令不在此列** —— 它归会话,不归凭据。
@@ -513,7 +509,34 @@ pub(crate) fn secret_fields(
             SecretField::Clear,
         );
     }
-    let (password, passphrase, private_key) = match buf.auth_kind {
+    let (password, passphrase, private_key) = own_identity_fields(buf);
+    (
+        password,
+        passphrase,
+        field(buf.proxy_password_touched, &buf.proxy_password),
+        private_key,
+    )
+}
+
+/// 一个密码框的「碰没碰 + 内容」→ 三态意图。
+fn field(touched: bool, v: &str) -> SecretField {
+    if !touched {
+        SecretField::Keep
+    } else if v.is_empty() {
+        SecretField::Clear
+    } else {
+        SecretField::Set(v.to_string())
+    }
+}
+
+/// 「本会话独有」档的身份三格 `(密码, 口令, 私钥)` 的三态意图。
+///
+/// 当前认证方式用不到的那一支走 `Clear`(见 `secret_fields` 的说明)。
+/// 保存会话(`secret_fields`)与「转成共享凭据」(F325-b
+/// `merged_identity_secret`)共用这一份判断 —— 各写一遍的话,两边对
+/// 「碰过但清空」的理解迟早分叉。
+fn own_identity_fields(buf: &EditorBuffer) -> (SecretField, SecretField, SecretField) {
+    match buf.auth_kind {
         AuthKindUi::Password => (
             field(buf.password_touched, &buf.password),
             SecretField::Clear,
@@ -524,13 +547,49 @@ pub(crate) fn secret_fields(
             field(buf.passphrase_touched, &buf.passphrase),
             field(buf.key_touched, &buf.key_data),
         ),
-    };
-    (
-        password,
-        passphrase,
-        field(buf.proxy_password_touched, &buf.proxy_password),
-        private_key,
+    }
+}
+
+/// F325-b:编辑缓冲**当前内容**(含未保存)所代表的那份身份密文。
+///
+/// 编辑已有会话时 store 不回吐明文,缓冲里的密码框恒为空 —— 所以「当前
+/// 内容」= 库里该会话已存的密文(`stored`)上叠加缓冲里碰过的字段,三态
+/// 语义与保存会话完全相同(`own_identity_fields` + `merge_secret`)。
+///
+/// 不看 `cred_source`:按「本会话独有」档算,那正是要被转走的那份。
+/// **代理口令恒不带**:它归会话、不归身份(设计 D4)。
+pub(crate) fn merged_identity_secret(
+    buf: &EditorBuffer,
+    stored: Option<&SecretEntry>,
+) -> SecretEntry {
+    let (password, passphrase, private_key) = own_identity_fields(buf);
+    merge_secret(
+        stored,
+        &password,
+        &passphrase,
+        &SecretField::Clear,
+        &private_key,
     )
+    .unwrap_or_default()
+}
+
+/// F325-b:新凭据的默认名 `用户@主机`;被占用就依次加 ` (2)`、` (3)`…
+///
+/// 凭据名不要求唯一(主键是 id),去重只是为了在下拉里好认。
+pub(crate) fn default_credential_name(
+    user: &str,
+    host: &str,
+    taken: &[mullion_store::CredentialRecord],
+) -> String {
+    let base = format!("{}@{}", user.trim(), host.trim());
+    let is_taken = |n: &str| taken.iter().any(|c| c.name == n);
+    if !is_taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|i| format!("{base} ({i})"))
+        .find(|n| !is_taken(n))
+        .expect("名字空间无限,总能找到一个没被占的")
 }
 
 /// 导入一个私钥文件:读正文填进缓冲,并留一行提示给用户看。
@@ -656,6 +715,28 @@ pub struct SaveIntent {
     /// 收藏的目录,点一下「保存」就被旧快照顶掉了,且没有任何提示
     /// (见 `Vault::update` / `Vault::set_bookmarks`)。
     pub bookmarks: Option<Vec<mullion_store::Bookmark>>,
+}
+
+/// F325-b:一次「把内联身份转成共享凭据」的请求。app 事后据此调
+/// `convert_inline_to_credential`,成功后把编辑缓冲改成引用那份凭据。
+///
+/// 带整份缓冲而不是只带几个字段:「当前内容」的合成(库里已存密文 + 碰过的
+/// 字段)要看全部 `*_touched` 位,在 app 侧统一做。
+///
+/// **不 derive Debug**:`buffer` 里有明文口令/私钥。手写的实现只转交给
+/// `EditorBuffer` 那份已打码的 Debug。
+pub struct CredentialFromSession {
+    pub editing_id: Option<SessionId>,
+    pub buffer: EditorBuffer,
+}
+
+impl std::fmt::Debug for CredentialFromSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialFromSession")
+            .field("editing_id", &self.editing_id)
+            .field("buffer", &self.buffer)
+            .finish()
+    }
 }
 
 /// 表单缓冲 → `SessionDraft`。纯函数,不碰 egui,可脱离 GUI 单测。
@@ -2025,5 +2106,131 @@ mod tests {
             Err(msg) => assert!(!msg.is_empty(), "失败必须给一句能看懂的话"),
             Ok(_) => panic!("没挑凭据就不该存得下去"),
         }
+    }
+
+    // ---- F325-b:内联认证一键转共享凭据 ----
+
+    fn stored(pw: Option<&str>, pp: Option<&str>, key: Option<&str>) -> SecretEntry {
+        SecretEntry {
+            password: pw.map(str::to_string),
+            passphrase: pp.map(str::to_string),
+            proxy_password: Some("proxy-secret".into()),
+            private_key: key.map(str::to_string),
+        }
+    }
+
+    /// 新建会话(库里什么都没有)填了密码 → 凭据带这份密码。
+    #[test]
+    fn identity_secret_of_a_new_session_carries_the_typed_password() {
+        let b = EditorBuffer {
+            password: "pw-new".into(),
+            password_touched: true,
+            ..EditorBuffer::default()
+        };
+        let s = merged_identity_secret(&b, None);
+        assert_eq!(s.password.as_deref(), Some("pw-new"));
+    }
+
+    /// 已存密码、密码框没碰 → 沿用库里那份(编辑时框恒为空,不能当成清空)。
+    #[test]
+    fn identity_secret_keeps_the_stored_password_when_untouched() {
+        let b = EditorBuffer::default();
+        let st = stored(Some("pw-old"), None, None);
+        let s = merged_identity_secret(&b, Some(&st));
+        assert_eq!(s.password.as_deref(), Some("pw-old"));
+    }
+
+    /// 碰过且改了值 → 用新值。
+    #[test]
+    fn identity_secret_takes_the_new_password_when_touched() {
+        let b = EditorBuffer {
+            password: "pw-new".into(),
+            password_touched: true,
+            ..EditorBuffer::default()
+        };
+        let st = stored(Some("pw-old"), None, None);
+        let s = merged_identity_secret(&b, Some(&st));
+        assert_eq!(s.password.as_deref(), Some("pw-new"));
+    }
+
+    /// 碰过且清空 → 不带密码。
+    #[test]
+    fn identity_secret_drops_the_password_when_cleared() {
+        let b = EditorBuffer {
+            password_touched: true,
+            ..EditorBuffer::default()
+        };
+        let st = stored(Some("pw-old"), None, None);
+        let s = merged_identity_secret(&b, Some(&st));
+        assert_eq!(s.password, None);
+    }
+
+    /// 公钥档:私钥/口令同一套三态;密码那一支不属于当前方式,不带。
+    #[test]
+    fn identity_secret_in_public_key_mode_follows_the_same_three_states() {
+        let mut b = EditorBuffer {
+            auth_kind: AuthKindUi::PublicKey,
+            ..EditorBuffer::default()
+        };
+        let st = stored(Some("pw-old"), Some("pp-old"), Some("KEY-OLD"));
+        // 都没碰 → 私钥与口令沿用库里的。
+        let s = merged_identity_secret(&b, Some(&st));
+        assert_eq!(s.private_key.as_deref(), Some("KEY-OLD"));
+        assert_eq!(s.passphrase.as_deref(), Some("pp-old"));
+        assert_eq!(s.password, None, "公钥档不该带上密码");
+        // 换了私钥、清了口令。
+        b.key_data = "KEY-NEW".into();
+        b.key_touched = true;
+        b.passphrase_touched = true;
+        let s = merged_identity_secret(&b, Some(&st));
+        assert_eq!(s.private_key.as_deref(), Some("KEY-NEW"));
+        assert_eq!(s.passphrase, None);
+    }
+
+    /// 代理口令归会话不归身份(设计 D4):库里有、缓冲里碰过,都不许带进凭据。
+    #[test]
+    fn identity_secret_never_carries_the_proxy_password() {
+        let b = EditorBuffer {
+            proxy_password: "typed-proxy".into(),
+            proxy_password_touched: true,
+            ..EditorBuffer::default()
+        };
+        let st = stored(Some("pw-old"), None, None);
+        assert_eq!(merged_identity_secret(&b, Some(&st)).proxy_password, None);
+        assert_eq!(merged_identity_secret(&b, None).proxy_password, None);
+    }
+
+    fn cred(id: u64, name: &str) -> mullion_store::CredentialRecord {
+        mullion_store::CredentialRecord {
+            id: CredentialId(id),
+            name: name.into(),
+            user: "root".into(),
+            kind: AuthKind::Password,
+        }
+    }
+
+    #[test]
+    fn default_credential_name_is_user_at_host() {
+        assert_eq!(
+            default_credential_name(" root ", " 10.0.0.5 ", &[cred(1, "ops@x")]),
+            "root@10.0.0.5"
+        );
+    }
+
+    #[test]
+    fn default_credential_name_appends_2_when_taken() {
+        assert_eq!(
+            default_credential_name("root", "10.0.0.5", &[cred(1, "root@10.0.0.5")]),
+            "root@10.0.0.5 (2)"
+        );
+    }
+
+    #[test]
+    fn default_credential_name_skips_to_3_when_2_is_taken_too() {
+        let taken = [cred(1, "root@10.0.0.5 (2)"), cred(2, "root@10.0.0.5")];
+        assert_eq!(
+            default_credential_name("root", "10.0.0.5", &taken),
+            "root@10.0.0.5 (3)"
+        );
     }
 }
