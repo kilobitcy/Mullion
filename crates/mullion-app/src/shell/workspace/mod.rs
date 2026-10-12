@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use mullion_core::layout::{
-    close_pane, leaves, resize_for_pane, split_pane, Dir, Node, PaneId, Rect,
+    close_pane, leaves, resize_for_pane, split_pane, swap_units, Dir, Node, PaneId, Rect,
 };
 use mullion_ssh::session::{SshConnection, SshSession, TrySendErr};
 use mullion_term::emulator::Emulator;
@@ -593,6 +593,33 @@ impl Workspace {
         // 开了就是要敲命令 —— 与 F286「用户亲手开的格子焦点跟过去」同一条规矩。
         self.focus = id;
         Some(id)
+    }
+
+    /// F324:拖标题条换位。把 `from` 与 `to` 两块 pane 在树里的位置对调。
+    ///
+    /// 两者必须是互不相同、都在 `panes` 里的**非抽屉**真 pane(抽屉不可拖、
+    /// 不可作落点),否则返回 `false` 且什么都不变。带抽屉的 pane 连抽屉
+    /// 整棵子树一起走(单元 = `[pane] + drawer_of(pane)`),所以 `drawers`
+    /// 表不用改:抽屉的 `parent` 仍是同一个 pane id。成功后焦点给 `from`。
+    ///
+    /// 只改树,不碰 PTY/emulator:几何变了,下一帧 `apply_geometry` 比对
+    /// `last_grid` 自会给网格变了的 pane 各发一次 `window_change`(T4)。
+    pub fn swap_panes(&mut self, from: PaneId, to: PaneId) -> bool {
+        let real = |ws: &Self, id: PaneId| !ws.is_drawer(id) && ws.panes.iter().any(|p| p.id == id);
+        if from == to || !real(self, from) || !real(self, to) {
+            return false;
+        }
+        let unit = |ws: &Self, id: PaneId| {
+            let mut u = vec![id];
+            u.extend(ws.drawer_of(id));
+            u
+        };
+        let (x, y) = (unit(self, from), unit(self, to));
+        if !swap_units(&mut self.tree, &x, &y) {
+            return false;
+        }
+        self.focus = from;
+        true
     }
 
     /// F320:把抽屉与父 pane 之间那条 Split 的比例设成 `ratio`(父 pane 占的份额)。
@@ -1924,6 +1951,117 @@ mod tests {
             PaneStatus::Disconnected,
             "已经断开的 pane 被拉回重连中 —— 用户退不出登录"
         );
+    }
+
+    // ---- F324 pane 换位 ----
+
+    /// F324:换位 = 树上两块 pane 对调,焦点给被拖的那块。
+    ///
+    /// 自证会变红:删掉 `swap_panes` 里的 `self.focus = from`(焦点断言红),
+    /// 或把 `swap_units` 调用换成空操作(`leaves` 断言红)。
+    #[test]
+    fn swap_panes_exchanges_positions_and_focuses_the_dragged_one() {
+        let (mut ws, _) = ws_with(2);
+        let (a, b) = (PaneId(1), PaneId(2));
+        ws.focus = b;
+        assert_eq!(leaves(ws.tree()), vec![a, b]);
+        assert!(ws.swap_panes(a, b));
+        assert_eq!(leaves(ws.tree()), vec![b, a]);
+        assert_eq!(ws.focus(), a, "焦点要跟着被拖的那块");
+    }
+
+    /// F324:抽屉随父 pane 整棵子树一起走,`drawers` 表不变。
+    ///
+    /// 自证会变红:把 `swap_panes` 里 `unit` 闭包的 `u.extend(..)` 删掉
+    /// (抽屉被留在原地,子树断开,`Split(a,d)` 结构断言红)。
+    #[test]
+    fn a_drawer_travels_with_its_parent_when_swapped() {
+        let (mut ws, _) = ws_with(2);
+        let (a, b) = (PaneId(1), PaneId(2));
+        ws.focus = a;
+        let d = ws.open_drawer(None).unwrap();
+        let is_unit = |n: &Node| {
+            matches!(n, Node::Split { a: x, b: y, .. }
+                if **x == Node::Leaf(a) && **y == Node::Leaf(d))
+        };
+        let (left, right) = match ws.tree() {
+            Node::Split { a, b, .. } => ((**a).clone(), (**b).clone()),
+            other => panic!("根不是 Split:{other:?}"),
+        };
+        assert!(is_unit(&left) && right == Node::Leaf(b), "前置:[a,d] 在左");
+
+        assert!(ws.swap_panes(a, b));
+        match ws.tree() {
+            Node::Split { a: l, b: r, .. } => {
+                assert_eq!(**l, Node::Leaf(b), "b 应在原 a 的位置");
+                assert!(is_unit(r), "[a,d] 子树应在原 b 的位置:{r:?}");
+            }
+            other => panic!("根不是 Split:{other:?}"),
+        }
+        assert_eq!(ws.drawer_of(a), Some(d));
+        assert_eq!(leaves(ws.tree()), vec![b, a, d]);
+
+        // 反过来:b 拖回去,又回到最初的布局。
+        assert!(ws.swap_panes(b, a));
+        assert_eq!(leaves(ws.tree()), vec![a, d, b]);
+        assert_eq!(ws.drawer_of(a), Some(d));
+        assert_eq!(ws.focus(), b);
+    }
+
+    /// F324:抽屉不可拖、不可作落点;自己换自己、不存在的 id 都拒绝,树与焦点不动。
+    ///
+    /// 自证会变红:删掉 `swap_panes` 开头的 `is_drawer` 判据(抽屉两条红),
+    /// 或 `from == to` 判据(自换那条红,因 `swap_units` 对重叠单元的行为不保证),
+    /// 或 `panes.iter().any` 判据(99 那条红)。
+    #[test]
+    fn drawers_unknown_ids_and_self_are_refused() {
+        let (mut ws, _) = ws_with(2);
+        let (a, b) = (PaneId(1), PaneId(2));
+        ws.focus = a;
+        let d = ws.open_drawer(None).unwrap();
+        ws.focus = b;
+        let before = ws.tree().clone();
+        assert!(!ws.swap_panes(d, b), "抽屉不可拖");
+        assert!(!ws.swap_panes(b, d), "抽屉不可作落点");
+        assert!(!ws.swap_panes(a, a), "自己换自己");
+        assert!(!ws.swap_panes(a, PaneId(99)), "落点不存在");
+        assert!(!ws.swap_panes(PaneId(99), a), "起点不存在");
+        assert_eq!(*ws.tree(), before, "拒绝后树必须原封不动");
+        assert_eq!(ws.focus(), b, "拒绝后焦点不动");
+    }
+
+    /// T4 守护:换位会让比例不对称的两格宽度互换,a 的矩形必变 ——
+    /// 下一帧 `apply_geometry` 比对 `last_grid` 才会各发 `window_change`。
+    /// 若换位后几何没变,TUI 会按旧列数排版而错行。
+    ///
+    /// 自证会变红:把 `swap_panes` 的函数体改成直接 `true`(树没动,矩形相同)。
+    #[test]
+    fn swapping_panes_changes_geometry_so_apply_geometry_will_resize() {
+        let (mut ws, _) = ws_with(2);
+        let (a, b) = (PaneId(1), PaneId(2));
+        let area = Rect {
+            col: 0,
+            row: 0,
+            cols: 100,
+            rows: 40,
+        };
+        assert!(resize_for_pane(&mut ws.tree, area, a, 0.3).is_some());
+        let rect_of = |ws: &Workspace, id: PaneId| {
+            mullion_core::layout::compute_rects(ws.tree(), area)
+                .into_iter()
+                .find(|(p, _)| *p == id)
+                .map(|(_, r)| r)
+                .unwrap()
+        };
+        let (ra, rb) = (rect_of(&ws, a), rect_of(&ws, b));
+        assert_ne!(ra.cols, rb.cols, "前置:比例必须不对称");
+        assert!(ws.swap_panes(a, b));
+        let (ra2, rb2) = (rect_of(&ws, a), rect_of(&ws, b));
+        assert_ne!(
+            ra2, ra,
+            "a 的矩形必须变,apply_geometry 才会重发 window_change"
+        );
+        assert_eq!((ra2.cols, rb2.cols), (rb.cols, ra.cols), "宽度互换");
     }
 
     // ---- F290 命令抽屉 ----
