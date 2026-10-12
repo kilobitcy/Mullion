@@ -380,6 +380,9 @@ pub fn focus_ring(t: &Theme) -> egui::Stroke {
     egui::Stroke::new(FOCUS_RING_W, c32(t.accent))
 }
 
+/// F327:常态控件描边的白色 alpha(约 18%)。
+const INACTIVE_EDGE_ALPHA: u8 = 45;
+
 /// 主题描边(白 + 低 alpha)。
 pub fn stroke(t: &Theme) -> egui::Stroke {
     egui::Stroke::new(1.0, egui::Color32::from_white_alpha(t.stroke_alpha))
@@ -428,7 +431,10 @@ pub fn apply_egui(ctx: &egui::Context, t: &Theme) {
 
     v.widgets.inactive.bg_fill = c32(t.sunken_bg);
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = stroke(t);
+    // F327:常态按钮(与输入框)的边缘。不能用 `stroke(t)`:那是分隔线 / 卡片边框的
+    // 6% 白,按钮又是透明底,整个按钮于是只剩一圈肉眼几乎看不见的线。
+    v.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(INACTIVE_EDGE_ALPHA));
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, c32(t.fg_muted));
     v.widgets.inactive.rounding = round;
 
@@ -509,6 +515,19 @@ fn scroll_style() -> egui::style::ScrollStyle {
 
 #[cfg(test)]
 mod tests {
+
+    /// F327:常态按钮的描边要看得见,且比分隔线 / 卡片边框(`stroke_alpha`)亮。
+    /// 自证会变红:把 `inactive.bg_stroke` 改回 `stroke(t)`。
+    #[test]
+    fn an_idle_button_edge_is_brighter_than_a_divider() {
+        let ctx = egui::Context::default();
+        apply_egui(&ctx, &MULLION_DARK);
+        let edge = ctx.style().visuals.widgets.inactive.bg_stroke.color.a();
+        assert!(
+            edge >= 40 && edge > stroke(&MULLION_DARK).color.a(),
+            "常态按钮描边 alpha={edge},看不见"
+        );
+    }
     use super::*;
 
     /// §3.2 三处同源之一:clear 色必须由 term_bg 推出,不能是另写的常量。
