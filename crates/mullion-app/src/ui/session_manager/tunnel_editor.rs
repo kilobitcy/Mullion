@@ -344,173 +344,251 @@ pub(super) fn show(
     sessions: &[SessionRecord],
     credentials: &[mullion_store::CredentialRecord],
 ) {
-    let Some(buf) = ui_state.tunnel_editor.as_mut() else {
+    if ui_state.tunnel_editor.is_none() {
         ui.colored_label(
             theme::c32(t.fg_dimmer),
             "从左边选一条隧道,或点「+ 新建隧道」。",
         );
         return;
+    }
+
+    // F326:按钮条钉在右栏底部(同项目管理器 / 会话编辑器),不跟着表单内容走。
+    // 面板先于正文占位,正文的 `ScrollArea` 才吃得到真实剩余高度;也得赶在借出
+    // `buf` 之前画 —— 按钮要写 `ui_state` 上的意图标志。
+    egui::TopBottomPanel::bottom(ui.id().with("tunnel_editor_bottom"))
+        .frame(egui::Frame::none())
+        .show_separator_line(false)
+        .show_inside(ui, |ui| {
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("保存").clicked() {
+                    ui_state.tunnel_save_click = true;
+                }
+                if ui_state.tunnel_editor_id.is_some() && ui.button("删除").clicked() {
+                    ui_state.pending_tunnel_delete = ui_state.tunnel_editor_id;
+                }
+            });
+        });
+
+    let Some(buf) = ui_state.tunnel_editor.as_mut() else {
+        return;
     };
 
-    // 页面级游标:整张表单共用一个,`section()` 靠它决定「首个分区不画线」。
-    // 见 form.rs 里 `section` 的文档注释——**不许**在子块里另起 `let mut first = true`。
-    let mut first = true;
-    let w = wording(buf.kind);
+    egui::ScrollArea::vertical()
+        .id_salt("tunnel_editor_body")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // 页面级游标:整张表单共用一个,`section()` 靠它决定「首个分区不画线」。
+            // 见 form.rs 里 `section` 的文档注释——**不许**在子块里另起 `let mut first = true`。
+            let mut first = true;
+            let w = wording(buf.kind);
 
-    form::section(ui, t, "会话管理器/右栏", "转发", &mut first);
-    form::grid(ui, "tunnel_forward", |ui| {
-        form::required(ui, t, "类型");
-        egui::ComboBox::from_id_salt("tunnel_kind")
-            .selected_text(buf.kind.label())
-            .show_ui(ui, |ui| {
-                for k in [
-                    TunnelKindUi::Local,
-                    TunnelKindUi::Remote,
-                    TunnelKindUi::Dynamic,
-                ] {
-                    // 切类型**不清空** `listen_port`/`note`:那两个字段三种类型
-                    // 都有,切一下就把用户填的端口抹掉是无谓的返工。
-                    ui.selectable_value(&mut buf.kind, k, k.label());
-                }
-            });
-        ui.end_row();
-
-        form::required(ui, t, "经由会话");
-        let (selected, err) = session_ref_label(buf.session_id, sessions, credentials);
-        egui::ComboBox::from_id_salt("tunnel_session")
-            .selected_text(selected)
-            .show_ui(ui, |ui| {
-                for s in ssh_candidates(sessions) {
-                    let label = format!(
-                        "{} ({}@{})",
-                        s.identity.name,
-                        mullion_store::display_user(&s.auth, credentials),
-                        s.connection.host
-                    );
-                    ui.selectable_value(&mut buf.session_id, Some(s.id), label);
-                }
-            });
-        ui.end_row();
-        form::field_error(ui, t, err.is_some(), err.unwrap_or_default());
-    });
-
-    form::section(ui, t, "会话管理器/右栏", "侦听", &mut first);
-    form::grid(ui, "tunnel_listen", |ui| {
-        form::required(ui, t, w.listen);
-        ui.add(
-            egui::TextEdit::singleline(&mut buf.listen_port).desired_width(field_w(
-                ui.available_width(),
-                FIELD_W_S,
-                0.0,
-            )),
-        );
-        ui.end_row();
-        form::field_error(
-            ui,
-            t,
-            port_field_error(&buf.listen_port),
-            "侦听端口要填 1~65535 之间的数字",
-        );
-
-        // 灰字说明占一整行,左格留空让它跟输入框左对齐(同 `field_error` 的理由:
-        // 挂在标签列会被读成「这一行的标签」)。
-        ui.label("");
-        ui.colored_label(theme::c32(t.fg_dimmer), w.listen_hint);
-        ui.end_row();
-
-        // F117 绑定安全。`Dynamic` 这一段整块不画 —— 它在类型上就没有
-        // `expose` 字段(见 `TunnelKind::Dynamic`),画一个写不进数据的勾选框
-        // 只会让人以为动态转发也能对外开放。
-        if buf.kind != TunnelKindUi::Dynamic {
-            ui.label("");
-            ui.checkbox(&mut buf.expose, w.expose);
-            ui.end_row();
-            // 警告里带**具体目标/端口**,不是泛泛一句「有风险」:用户要判断的是
-            // 「把这台机器暴露出去要不要紧」,没有目标就没法判断。
-            // 措辞与语气见纯函数 `expose_warning`(它自己有穷举测试)。
-            if let Some((tone, text)) = expose_warning(buf) {
-                let color = match tone {
-                    ExposeTone::Danger => t.danger_text,
-                    ExposeTone::Unverifiable => t.warn,
-                };
-                ui.label("");
-                ui.colored_label(theme::c32(color), text);
+            form::section(ui, t, "会话管理器/右栏", "转发", &mut first);
+            form::grid(ui, "tunnel_forward", |ui| {
+                form::required(ui, t, "类型");
+                egui::ComboBox::from_id_salt("tunnel_kind")
+                    .selected_text(buf.kind.label())
+                    .show_ui(ui, |ui| {
+                        for k in [
+                            TunnelKindUi::Local,
+                            TunnelKindUi::Remote,
+                            TunnelKindUi::Dynamic,
+                        ] {
+                            // 切类型**不清空** `listen_port`/`note`:那两个字段三种类型
+                            // 都有,切一下就把用户填的端口抹掉是无谓的返工。
+                            ui.selectable_value(&mut buf.kind, k, k.label());
+                        }
+                    });
                 ui.end_row();
-            }
-        }
-    });
 
-    if buf.kind != TunnelKindUi::Dynamic {
-        form::section(ui, t, "会话管理器/右栏", "目标", &mut first);
-        form::grid(ui, "tunnel_target", |ui| {
-            form::required(ui, t, w.target);
-            ui.horizontal(|ui| {
+                form::required(ui, t, "经由会话");
+                let (selected, err) = session_ref_label(buf.session_id, sessions, credentials);
+                egui::ComboBox::from_id_salt("tunnel_session")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for s in ssh_candidates(sessions) {
+                            let label = format!(
+                                "{} ({}@{})",
+                                s.identity.name,
+                                mullion_store::display_user(&s.auth, credentials),
+                                s.connection.host
+                            );
+                            ui.selectable_value(&mut buf.session_id, Some(s.id), label);
+                        }
+                    });
+                ui.end_row();
+                form::field_error(ui, t, err.is_some(), err.unwrap_or_default());
+            });
+
+            form::section(ui, t, "会话管理器/右栏", "侦听", &mut first);
+            form::grid(ui, "tunnel_listen", |ui| {
+                form::required(ui, t, w.listen);
                 ui.add(
-                    egui::TextEdit::singleline(&mut buf.target_host)
-                        .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
-                        .hint_text(theme::hint_text(t, "主机名或 IP")),
-                );
-                ui.label(":");
-                ui.add(
-                    egui::TextEdit::singleline(&mut buf.target_port).desired_width(field_w(
+                    egui::TextEdit::singleline(&mut buf.listen_port).desired_width(field_w(
                         ui.available_width(),
                         FIELD_W_S,
                         0.0,
                     )),
                 );
+                ui.end_row();
+                form::field_error(
+                    ui,
+                    t,
+                    port_field_error(&buf.listen_port),
+                    "侦听端口要填 1~65535 之间的数字",
+                );
+
+                // 灰字说明占一整行,左格留空让它跟输入框左对齐(同 `field_error` 的理由:
+                // 挂在标签列会被读成「这一行的标签」)。
+                ui.label("");
+                ui.colored_label(theme::c32(t.fg_dimmer), w.listen_hint);
+                ui.end_row();
+
+                // F117 绑定安全。`Dynamic` 这一段整块不画 —— 它在类型上就没有
+                // `expose` 字段(见 `TunnelKind::Dynamic`),画一个写不进数据的勾选框
+                // 只会让人以为动态转发也能对外开放。
+                if buf.kind != TunnelKindUi::Dynamic {
+                    ui.label("");
+                    ui.checkbox(&mut buf.expose, w.expose);
+                    ui.end_row();
+                    // 警告里带**具体目标/端口**,不是泛泛一句「有风险」:用户要判断的是
+                    // 「把这台机器暴露出去要不要紧」,没有目标就没法判断。
+                    // 措辞与语气见纯函数 `expose_warning`(它自己有穷举测试)。
+                    if let Some((tone, text)) = expose_warning(buf) {
+                        let color = match tone {
+                            ExposeTone::Danger => t.danger_text,
+                            ExposeTone::Unverifiable => t.warn,
+                        };
+                        ui.label("");
+                        ui.colored_label(theme::c32(color), text);
+                        ui.end_row();
+                    }
+                }
             });
-            ui.end_row();
-            form::field_error(
-                ui,
-                t,
-                port_field_error(&buf.target_port),
-                "目标端口要填 1~65535 之间的数字",
-            );
 
-            ui.label("");
-            ui.colored_label(theme::c32(t.fg_dimmer), w.resolver);
-            ui.end_row();
+            if buf.kind != TunnelKindUi::Dynamic {
+                form::section(ui, t, "会话管理器/右栏", "目标", &mut first);
+                form::grid(ui, "tunnel_target", |ui| {
+                    form::required(ui, t, w.target);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut buf.target_host)
+                                .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
+                                .hint_text(theme::hint_text(t, "主机名或 IP")),
+                        );
+                        ui.label(":");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut buf.target_port)
+                                .desired_width(field_w(ui.available_width(), FIELD_W_S, 0.0)),
+                        );
+                    });
+                    ui.end_row();
+                    form::field_error(
+                        ui,
+                        t,
+                        port_field_error(&buf.target_port),
+                        "目标端口要填 1~65535 之间的数字",
+                    );
+
+                    ui.label("");
+                    ui.colored_label(theme::c32(t.fg_dimmer), w.resolver);
+                    ui.end_row();
+                });
+            }
+
+            form::section(ui, t, "会话管理器/右栏", "标识", &mut first);
+            form::grid(ui, "tunnel_misc", |ui| {
+                ui.label("名称");
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf.name)
+                        .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
+                        .hint_text(theme::hint_text(t, "这条隧道叫什么(可选)")),
+                );
+                ui.end_row();
+
+                // F311:备注改多行,标签顶对齐(理由同会话备注,见 `fields.rs`)。
+                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                    ui.label("备注");
+                });
+                form::note_box(
+                    ui,
+                    note_field_id(),
+                    egui::TextEdit::multiline(&mut buf.note)
+                        .desired_width(field_w(ui.available_width(), FIELD_W_L, 0.0))
+                        .hint_text(theme::hint_text(t, "这条转发是干什么的(可选)")),
+                );
+                ui.end_row();
+            });
         });
-    }
-
-    form::section(ui, t, "会话管理器/右栏", "标识", &mut first);
-    form::grid(ui, "tunnel_misc", |ui| {
-        ui.label("名称");
-        ui.add(
-            egui::TextEdit::singleline(&mut buf.name)
-                .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
-                .hint_text(theme::hint_text(t, "这条隧道叫什么(可选)")),
-        );
-        ui.end_row();
-
-        // F311:备注改多行,标签顶对齐(理由同会话备注,见 `fields.rs`)。
-        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-            ui.label("备注");
-        });
-        form::note_box(
-            ui,
-            note_field_id(),
-            egui::TextEdit::multiline(&mut buf.note)
-                .desired_width(field_w(ui.available_width(), FIELD_W_L, 0.0))
-                .hint_text(theme::hint_text(t, "这条转发是干什么的(可选)")),
-        );
-        ui.end_row();
-    });
-
-    ui.add_space(crate::ui::metrics::SP_M);
-    ui.horizontal(|ui| {
-        if ui.button("保存").clicked() {
-            ui_state.tunnel_save_click = true;
-        }
-        if ui_state.tunnel_editor_id.is_some() && ui.button("删除").clicked() {
-            ui_state.pending_tunnel_delete = ui_state.tunnel_editor_id;
-        }
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 在 200 高的矮屏幕上画两帧右栏表单,收全部文字和位置。
+    fn texts_on_a_short_screen(
+        draw: impl Fn(&mut egui::Ui, &mut crate::ui::UiState),
+        mut ui_state: crate::ui::UiState,
+    ) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push((
+                    ts.galley.text().to_string(),
+                    egui::Rect::from_min_size(ts.pos, ts.galley.size()),
+                )),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, SHORT_H),
+                )),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw(ui, &mut ui_state));
+                })
+                .shapes;
+        }
+        let mut out = Vec::new();
+        for cs in &shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    const SHORT_H: f32 = 200.0;
+
+    /// F326:隧道编辑器的「保存 / 删除」钉在右栏底部,不跟着表单内容走。
+    /// 自证会变红:把 `TopBottomPanel::bottom` 拆掉,改回表单末尾的 `ui.horizontal`。
+    #[test]
+    fn tunnel_buttons_stay_on_screen_when_the_form_is_taller_than_it() {
+        let t = crate::theme::MULLION_DARK;
+        let st = crate::ui::UiState {
+            tunnel_editor: Some(TunnelEditorBuffer::default()),
+            tunnel_editor_id: Some(mullion_store::TunnelId(1)),
+            ..Default::default()
+        };
+        let texts = texts_on_a_short_screen(|ui, s| show(ui, &t, s, &[], &[]), st);
+        for label in ["保存", "删除"] {
+            let r = texts
+                .iter()
+                .find(|(s, _)| s == label)
+                .unwrap_or_else(|| panic!("「{label}」没画出来"));
+            assert!(
+                r.1.bottom() <= SHORT_H,
+                "「{label}」画在 y={} —— 屏幕只有 {SHORT_H} 高,够不着",
+                r.1.bottom()
+            );
+        }
+    }
 
     fn filled(kind: TunnelKindUi) -> TunnelEditorBuffer {
         TunnelEditorBuffer {

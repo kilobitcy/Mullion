@@ -181,146 +181,226 @@ pub(super) fn show(
     presence: SecretPresence,
 ) {
     let editing_id = ui_state.credential_editor_id;
-    let Some(buf) = ui_state.credential_editor.as_mut() else {
+    if ui_state.credential_editor.is_none() {
         ui.colored_label(
             theme::c32(t.fg_dimmer),
             "从左边选一份凭据,或点「+ 新建凭据」。",
         );
         return;
-    };
+    }
 
-    let mut first = true;
-    form::section(ui, t, "会话管理器/右栏", "身份", &mut first);
-    form::grid(ui, "cred_identity", |ui| {
-        form::required(ui, t, "名称");
-        ui.add(
-            egui::TextEdit::singleline(&mut buf.name)
-                .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
-                .hint_text(theme::hint_text(t, "这份凭据叫什么(如「运维号」)")),
-        );
-        ui.end_row();
-        form::field_error(ui, t, buf.name.trim().is_empty(), "凭据名称不能为空");
-
-        form::required(ui, t, "用户名");
-        ui.add(
-            egui::TextEdit::singleline(&mut buf.user).desired_width(field_w(
-                ui.available_width(),
-                FIELD_W_M,
-                0.0,
-            )),
-        );
-        ui.end_row();
-        form::field_error(ui, t, buf.user.trim().is_empty(), "用户名不能为空");
-
-        ui.label("认证方式");
-        ui.horizontal(|ui| {
-            let vis = &mut ui.visuals_mut().selection;
-            vis.bg_fill = theme::c32(t.accent).linear_multiply(0.35);
-            ui.selectable_value(&mut buf.auth_kind, AuthKindUi::Password, "密码");
-            ui.selectable_value(&mut buf.auth_kind, AuthKindUi::PublicKey, "公钥");
-        });
-        ui.end_row();
-    });
-
-    form::section(ui, t, "会话管理器/右栏", "凭据", &mut first);
-    form::grid(ui, "cred_secret", |ui| match buf.auth_kind {
-        AuthKindUi::Password => {
-            ui.label("密码");
-            super::secret_edit(
-                ui,
-                t,
-                "cred_password",
-                &mut buf.password,
-                &mut buf.password_touched,
-                presence.password,
-                "未设置",
-            );
-            ui.end_row();
-        }
-        AuthKindUi::PublicKey => {
-            ui.label("私钥");
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("导入…").clicked() {
-                        buf.pick_key_clicked = true;
-                    }
-                    let has_key =
-                        presence.private_key || (buf.key_touched && !buf.key_data.is_empty());
-                    if has_key && ui.button("清除").clicked() {
-                        buf.key_data.clear();
-                        buf.key_touched = true;
-                        buf.key_note = Some("已清除私钥(保存后生效)".into());
-                    }
-                    // 只报状态,不显示正文。判据与会话侧那段同构。
-                    let (text, color) = if buf.key_touched && !buf.key_data.is_empty() {
-                        ("已导入(未保存)", t.fg)
-                    } else if buf.key_touched {
-                        ("已清除(未保存)", t.danger_text)
-                    } else if presence.private_key {
-                        ("已导入", t.fg)
-                    } else {
-                        ("未设置 —— 请导入私钥文件", t.danger_text)
-                    };
-                    ui.colored_label(theme::c32(color), text);
-                });
-            });
-            ui.end_row();
-
-            ui.label("私钥口令");
-            super::secret_edit(
-                ui,
-                t,
-                "cred_passphrase",
-                &mut buf.passphrase,
-                &mut buf.passphrase_touched,
-                presence.passphrase,
-                "留空表示无口令",
-            );
-            ui.end_row();
-        }
-    });
-
-    ui.add_space(crate::ui::metrics::SP_XS);
-    ui.label(
-        egui::RichText::new(super::fields::SECRET_STORAGE_NOTE)
-            .size(11.0)
-            .color(theme::c32(t.fg_muted)),
-    );
-
-    // 引用者。**编辑已有凭据时才有意义** —— 新建的还没人能引用。
+    // F326:按钮条钉在右栏底部(同项目管理器 / 会话编辑器),不跟着表单内容走。
+    // 面板必须**先于**正文占位,正文的 `ScrollArea` 才吃得到真实剩余高度;
+    // 它也得赶在借出 `buf` 之前画 —— 按钮要写 `ui_state` 上的意图标志。
+    // 引用者:编辑已有凭据时才有意义,新建的还没人能引用。
     let in_use = editing_id
         .map(|id| users_of(id, sessions))
         .unwrap_or_default();
     let blocked = in_use_message(&in_use);
-
-    ui.add_space(crate::ui::metrics::SP_M);
-    ui.horizontal(|ui| {
-        if ui.button("保存").clicked() {
-            ui_state.credential_save_click = true;
-        }
-        if editing_id.is_some() {
-            // 被引用时**真禁用**,不是画成灰的:「看着灰」和「点不动」必须是
-            // 同一件事(同隧道那条启动按钮)。
-            let resp = ui
-                .add_enabled(blocked.is_none(), egui::Button::new("删除"))
-                .on_disabled_hover_text("这份凭据还有会话在用");
-            if resp.clicked() {
-                ui_state.pending_credential_delete = editing_id;
+    egui::TopBottomPanel::bottom(ui.id().with("credential_editor_bottom"))
+        .frame(egui::Frame::none())
+        .show_separator_line(false)
+        .show_inside(ui, |ui| {
+            ui.separator();
+            // 红字列在按钮上方而不是 tooltip 里:tooltip 要悬停才看得到,而「谁在用」
+            // 正是用户接下来要去改的清单;放上方则不会被钉底顶出可视区。
+            if let Some(msg) = &blocked {
+                ui.colored_label(theme::c32(t.danger_text), msg);
             }
-        }
-    });
+            ui.horizontal(|ui| {
+                if ui.button("保存").clicked() {
+                    ui_state.credential_save_click = true;
+                }
+                if editing_id.is_some() {
+                    // 被引用时**真禁用**,不是画成灰的:「看着灰」和「点不动」必须是
+                    // 同一件事(同隧道那条启动按钮)。
+                    let resp = ui
+                        .add_enabled(blocked.is_none(), egui::Button::new("删除"))
+                        .on_disabled_hover_text("这份凭据还有会话在用");
+                    if resp.clicked() {
+                        ui_state.pending_credential_delete = editing_id;
+                    }
+                }
+            });
+        });
 
-    // 红字列在按钮下面而不是 tooltip 里:tooltip 要悬停才看得到,而「谁在用」
-    // 正是用户接下来要去改的清单。
-    if let Some(msg) = blocked {
-        ui.colored_label(theme::c32(t.danger_text), msg);
-    }
+    let Some(buf) = ui_state.credential_editor.as_mut() else {
+        return;
+    };
+
+    egui::ScrollArea::vertical()
+        .id_salt("credential_editor_body")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let mut first = true;
+            form::section(ui, t, "会话管理器/右栏", "身份", &mut first);
+            form::grid(ui, "cred_identity", |ui| {
+                form::required(ui, t, "名称");
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf.name)
+                        .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
+                        .hint_text(theme::hint_text(t, "这份凭据叫什么(如「运维号」)")),
+                );
+                ui.end_row();
+                form::field_error(ui, t, buf.name.trim().is_empty(), "凭据名称不能为空");
+
+                form::required(ui, t, "用户名");
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf.user).desired_width(field_w(
+                        ui.available_width(),
+                        FIELD_W_M,
+                        0.0,
+                    )),
+                );
+                ui.end_row();
+                form::field_error(ui, t, buf.user.trim().is_empty(), "用户名不能为空");
+
+                ui.label("认证方式");
+                ui.horizontal(|ui| {
+                    let vis = &mut ui.visuals_mut().selection;
+                    vis.bg_fill = theme::c32(t.accent).linear_multiply(0.35);
+                    ui.selectable_value(&mut buf.auth_kind, AuthKindUi::Password, "密码");
+                    ui.selectable_value(&mut buf.auth_kind, AuthKindUi::PublicKey, "公钥");
+                });
+                ui.end_row();
+            });
+
+            form::section(ui, t, "会话管理器/右栏", "凭据", &mut first);
+            form::grid(ui, "cred_secret", |ui| match buf.auth_kind {
+                AuthKindUi::Password => {
+                    ui.label("密码");
+                    super::secret_edit(
+                        ui,
+                        t,
+                        "cred_password",
+                        &mut buf.password,
+                        &mut buf.password_touched,
+                        presence.password,
+                        "未设置",
+                    );
+                    ui.end_row();
+                }
+                AuthKindUi::PublicKey => {
+                    ui.label("私钥");
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("导入…").clicked() {
+                                buf.pick_key_clicked = true;
+                            }
+                            let has_key = presence.private_key
+                                || (buf.key_touched && !buf.key_data.is_empty());
+                            if has_key && ui.button("清除").clicked() {
+                                buf.key_data.clear();
+                                buf.key_touched = true;
+                                buf.key_note = Some("已清除私钥(保存后生效)".into());
+                            }
+                            // 只报状态,不显示正文。判据与会话侧那段同构。
+                            let (text, color) = if buf.key_touched && !buf.key_data.is_empty() {
+                                ("已导入(未保存)", t.fg)
+                            } else if buf.key_touched {
+                                ("已清除(未保存)", t.danger_text)
+                            } else if presence.private_key {
+                                ("已导入", t.fg)
+                            } else {
+                                ("未设置 —— 请导入私钥文件", t.danger_text)
+                            };
+                            ui.colored_label(theme::c32(color), text);
+                        });
+                    });
+                    ui.end_row();
+
+                    ui.label("私钥口令");
+                    super::secret_edit(
+                        ui,
+                        t,
+                        "cred_passphrase",
+                        &mut buf.passphrase,
+                        &mut buf.passphrase_touched,
+                        presence.passphrase,
+                        "留空表示无口令",
+                    );
+                    ui.end_row();
+                }
+            });
+
+            ui.add_space(crate::ui::metrics::SP_XS);
+            ui.label(
+                egui::RichText::new(super::fields::SECRET_STORAGE_NOTE)
+                    .size(11.0)
+                    .color(theme::c32(t.fg_muted)),
+            );
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mullion_store::{Auth, Connection, Identity, NetworkPrefs, Protocol, SessionId};
+
+    /// 在 200 高的矮屏幕上画两帧右栏表单,收全部文字和位置。
+    fn texts_on_a_short_screen(
+        draw: impl Fn(&mut egui::Ui, &mut crate::ui::UiState),
+        mut ui_state: crate::ui::UiState,
+    ) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Text(ts) => out.push((
+                    ts.galley.text().to_string(),
+                    egui::Rect::from_min_size(ts.pos, ts.galley.size()),
+                )),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, SHORT_H),
+                )),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| draw(ui, &mut ui_state));
+                })
+                .shapes;
+        }
+        let mut out = Vec::new();
+        for cs in &shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    const SHORT_H: f32 = 200.0;
+
+    /// F326:凭据编辑器的「保存 / 删除」钉在右栏底部,**不跟着表单内容走**。
+    /// 屏幕矮到装不下整张表单时,按钮仍须落在屏幕里 —— 它们是这页唯一的出口。
+    /// 自证会变红:把 `TopBottomPanel::bottom` 拆掉,改回表单末尾的 `ui.horizontal`。
+    #[test]
+    fn credential_buttons_stay_on_screen_when_the_form_is_taller_than_it() {
+        let t = crate::theme::MULLION_DARK;
+        let st = crate::ui::UiState {
+            credential_editor: Some(CredentialEditorBuffer::default()),
+            credential_editor_id: Some(mullion_store::CredentialId(1)),
+            ..Default::default()
+        };
+        let texts = texts_on_a_short_screen(|ui, s| show(ui, &t, s, &[], Default::default()), st);
+        for label in ["保存", "删除"] {
+            let r = texts
+                .iter()
+                .find(|(s, _)| s == label)
+                .unwrap_or_else(|| panic!("「{label}」没画出来"));
+            assert!(
+                r.1.bottom() <= SHORT_H,
+                "「{label}」画在 y={} —— 屏幕只有 {SHORT_H} 高,够不着",
+                r.1.bottom()
+            );
+        }
+    }
 
     fn session(id: u64, name: &str, auth: Auth) -> SessionRecord {
         SessionRecord {
