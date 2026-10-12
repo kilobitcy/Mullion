@@ -386,6 +386,129 @@ pub struct TitleAction {
     pub pick_project: Option<PaneId>,
     /// F298:点了国家那格 —— 请求立刻重取出口国家。
     pub refresh_node: Option<PaneId>,
+    /// F324:把 `.0` 那块拖到 `.1` 那块上松手 —— 请求两块换位。
+    pub swap: Option<(PaneId, PaneId)>,
+}
+
+/// F324:标题条整条的拖动感知 id。同 `close_id` 显式给,测试靠它认人。
+fn drag_id(id: PaneId) -> egui::Id {
+    egui::Id::new(("pane_title_drag", id.0))
+}
+
+/// F324:拖动期间落点 pane 上那层遮罩的 accent 不透明度。
+const DROP_TINT: f32 = 0.18;
+
+/// F324:指针 `pos`(逻辑点)此刻落在哪块 pane 上 —— 能接住 `from` 的那块。
+///
+/// 判的是 pane **整块**(`geom.px`,标题条 + 终端区),物理像素除 `ppp` 换成
+/// 点。抽屉不当落点(抽屉随父走,单独换位没有意义);`from` 自己不当落点
+/// (松在自己身上 = 什么都不做)。
+pub(crate) fn drop_target(
+    views: &[TitleView<'_>],
+    ppp: f32,
+    pos: egui::Pos2,
+    from: PaneId,
+) -> Option<PaneId> {
+    views
+        .iter()
+        .filter(|v| !v.drawer && v.geom.id != from)
+        .find(|v| {
+            let r = v.geom.px;
+            egui::Rect::from_min_size(
+                egui::pos2(r.x as f32 / ppp, r.y as f32 / ppp),
+                egui::vec2(r.w as f32 / ppp, r.h as f32 / ppp),
+            )
+            .contains(pos)
+        })
+        .map(|v| v.geom.id)
+}
+
+/// F324:一次标题条拖动松手时的结局。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DragEnd {
+    Swap(PaneId, PaneId),
+    Cancelled,
+}
+
+/// F324:松手时决定换不换。Esc 优先取消;没落点、落在自己身上都取消。
+pub(crate) fn drag_end(from: PaneId, target: Option<PaneId>, esc_pressed: bool) -> DragEnd {
+    match target {
+        _ if esc_pressed => DragEnd::Cancelled,
+        Some(to) if to != from => DragEnd::Swap(from, to),
+        _ => DragEnd::Cancelled,
+    }
+}
+
+/// F324:`from` 那块标题条的拖动反馈与松手结局。
+///
+/// - 起点落在按钮/国家格上(`click_rects`)→ 作废:egui 命中测试会把「上层
+///   按钮 + 下层 drag」同时报出,不挡的话按住 × 一挪就成了换位。
+/// - 拖动中:Grabbing 光标 + 落点整块叠 accent 遮罩(画在**落点**上,不是
+///   被拖那块)。`request_repaint` **只**在拖动中调(T3)。
+/// - 松手:`drag_end` 定结局,`Swap` 写进 `action.swap`。
+/// - Esc:egui 0.30 自己在按 Esc 那帧中止拖动(`interaction.rs`「Abort dragging
+///   on escape」),`drag_stopped` 就在**那一帧**触发、指针还停在落点上 —— 所以
+///   Esc 必须在松手判定里算作取消(`void || esc`),漏了就是「按 Esc 反而当场换位」。
+///
+/// 「作废」记在 `ctx.data` 的 temp 里(按 pane 区分 key),松手时取出并清掉。
+#[allow(clippy::too_many_arguments)] // 全是 `show` 循环里的局部量,拆结构体只为凑参数数
+fn drag_feedback(
+    ctx: &egui::Context,
+    t: &Theme,
+    views: &[TitleView<'_>],
+    ppp: f32,
+    from: PaneId,
+    drag: &egui::Response,
+    click_rects: &[egui::Rect],
+    action: &mut TitleAction,
+) {
+    let void_key = drag_id(from).with("void");
+    if drag.drag_started() {
+        let on_button = ctx
+            .input(|i| i.pointer.press_origin())
+            .is_some_and(|o| click_rects.iter().any(|r| r.contains(o)));
+        ctx.data_mut(|d| d.insert_temp(void_key, on_button));
+    }
+    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let target = || {
+        ctx.pointer_interact_pos()
+            .and_then(|p| drop_target(views, ppp, p, from))
+    };
+    if drag.dragged() {
+        ctx.request_repaint();
+        let void = ctx.data(|d| d.get_temp::<bool>(void_key)).unwrap_or(false);
+        if !void {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(to) = target() {
+                if let Some(tv) = views.iter().find(|v| v.geom.id == to) {
+                    let r = tv.geom.px;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(r.x as f32 / ppp, r.y as f32 / ppp),
+                        egui::vec2(r.w as f32 / ppp, r.h as f32 / ppp),
+                    );
+                    let accent = theme::c32(t.accent);
+                    ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("pane_swap_drop"),
+                    ))
+                    .rect(
+                        rect,
+                        0.0,
+                        accent.gamma_multiply(DROP_TINT),
+                        egui::Stroke::new(1.0, accent),
+                    );
+                }
+            }
+        }
+    }
+    if drag.drag_stopped() {
+        let void = ctx
+            .data_mut(|d| d.remove_temp::<bool>(void_key))
+            .unwrap_or(false);
+        if let DragEnd::Swap(f, to) = drag_end(from, target(), void || esc) {
+            action.swap = Some((f, to));
+        }
+    }
 }
 
 pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAction {
@@ -448,6 +571,13 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                         c,
                     );
                 }
+                // F324:整条标题条的拖动感知。**必须早于**下面按钮/国家格的
+                // `interact` 登记 —— egui 里后登记的在上层先吃指针,按钮才仍是
+                // 点击。抽屉不登记(不可拖)。
+                let drag =
+                    (!v.drawer).then(|| ui.interact(full, drag_id(v.geom.id), egui::Sense::drag()));
+                // 按钮/国家格的矩形,拖动起点落在其中时作废这次拖动(见下)。
+                let mut click_rects: Vec<egui::Rect> = Vec::new();
                 let inner = full.shrink2(egui::vec2(8.0, 4.0));
                 let mut content = ui.new_child(
                     egui::UiBuilder::new()
@@ -455,6 +585,9 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 content.set_clip_rect(inner);
+                // F324:标题文字占了标题条大半。egui 0.30 默认可选中的 Label 会
+                // sense click_and_drag 叠在整条的 drag 之上,一拖就变成选字。
+                content.style_mut().interaction.selectable_labels = false;
                 content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // F306:三个按钮坐进一块凹槽(同菜单栏布局按钮组),与左边
                     // 的状态段分开。先占一个形状位、按钮画完知道范围后回填 ——
@@ -487,6 +620,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     if project.clicked() {
                         action.pick_project = Some(v.geom.id);
                     }
+                    click_rects.extend([close.rect, rehost.rect, project.rect]);
                     ui.add_space(crate::ui::toolbar::GROUP_PAD);
                     // 横向留 GROUP_PAD,纵向只多 1 点;夹进 `full`,高度不够时
                     // 凹槽贴着标题条上下沿,不越界、不加高标题条。
@@ -561,6 +695,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                         color,
                                         t,
                                     );
+                                    click_rects.push(r.rect);
                                     if r.on_hover_text(&p.hover).clicked() {
                                         action.refresh_node = Some(v.geom.id);
                                     }
@@ -636,6 +771,18 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                         );
                     });
                 });
+                if let Some(drag) = drag {
+                    drag_feedback(
+                        ctx,
+                        t,
+                        views,
+                        ppp,
+                        v.geom.id,
+                        &drag,
+                        &click_rects,
+                        &mut action,
+                    );
+                }
                 // 不把 content 的占用尺寸折回 ui——见函数文档注释第 1 条。
                 ui.allocate_rect(full, egui::Sense::hover());
             });
@@ -2248,5 +2395,406 @@ mod tests {
             value: v.into(),
             bg: None,
         }
+    }
+
+    // ---------------- F324:拖标题条换位 ----------------
+
+    /// 一块从 `x` 起、宽 `w` 物理像素、高 600 的 pane(ppp 恒按 1.0 算标题条高)。
+    fn geom_at(id: u32, x: u32, w: u32) -> PaneGeom {
+        use crate::shell::workspace::{title_bar_px, PxRect};
+        let th = title_bar_px(1.0);
+        PaneGeom {
+            id: PaneId(id),
+            px: PxRect { x, y: 0, w, h: 600 },
+            title_px: PxRect { x, y: 0, w, h: th },
+            term_px: PxRect {
+                x,
+                y: th,
+                w,
+                h: 600 - th,
+            },
+            grid: (40, 28),
+        }
+    }
+
+    fn plain_view(geom: PaneGeom, index: usize, drawer: bool) -> TitleView<'static> {
+        TitleView {
+            geom,
+            index,
+            project: None,
+            project_icon: None,
+            host: Some("dev@build-01"),
+            status: PaneStatus::Live,
+            focused: index == 1,
+            appearance: None,
+            cwd_leaf: None,
+            tmux: None,
+            notice: None,
+            drawer,
+            stats: Vec::new(),
+        }
+    }
+
+    /// A(0..400)、B(400..800) 两块普通 pane,C(800..1200)是抽屉。
+    fn three_views() -> [TitleView<'static>; 3] {
+        [
+            plain_view(geom_at(1, 0, 400), 1, false),
+            plain_view(geom_at(2, 400, 400), 2, false),
+            plain_view(geom_at(3, 800, 400), 3, true),
+        ]
+    }
+
+    /// 自证会变红:`drop_target` 不按 `geom.px` 判(比如只判标题条,终端区那点
+    /// 落空),或忘了除 `ppp`(第二段 ppp=2 时 (300,150) 物理上在 A 里)。
+    #[test]
+    fn a_drop_on_another_plain_pane_targets_it() {
+        let v = three_views();
+        assert_eq!(
+            drop_target(&v, 1.0, egui::pos2(600.0, 300.0), PaneId(1)),
+            Some(PaneId(2))
+        );
+        // ppp=2:B 的点坐标是 x∈[200,400)。
+        assert_eq!(
+            drop_target(&v, 2.0, egui::pos2(300.0, 150.0), PaneId(1)),
+            Some(PaneId(2))
+        );
+    }
+
+    /// 自证会变红:`drop_target` 不排除 `from` 自己。
+    #[test]
+    fn a_drop_on_the_pane_being_dragged_targets_nothing() {
+        let v = three_views();
+        assert_eq!(
+            drop_target(&v, 1.0, egui::pos2(200.0, 300.0), PaneId(1)),
+            None
+        );
+    }
+
+    /// 自证会变红:`drop_target` 不排除抽屉。
+    #[test]
+    fn a_drawer_is_never_a_drop_target() {
+        let v = three_views();
+        assert_eq!(
+            drop_target(&v, 1.0, egui::pos2(1000.0, 300.0), PaneId(1)),
+            None
+        );
+    }
+
+    /// 自证会变红:`drop_target` 找不到时回落成「最近的那块」或任意一块。
+    #[test]
+    fn a_drop_outside_every_pane_targets_nothing() {
+        let v = three_views();
+        assert_eq!(
+            drop_target(&v, 1.0, egui::pos2(2000.0, 300.0), PaneId(1)),
+            None
+        );
+        assert_eq!(
+            drop_target(&v, 1.0, egui::pos2(600.0, 900.0), PaneId(1)),
+            None
+        );
+    }
+
+    /// 自证会变红:`drag_end` 不把 (from, to) 原样交出,或顺序写反。
+    #[test]
+    fn releasing_over_another_pane_swaps_them() {
+        assert_eq!(
+            drag_end(PaneId(1), Some(PaneId(2)), false),
+            DragEnd::Swap(PaneId(1), PaneId(2))
+        );
+    }
+
+    /// 自证会变红:`drag_end` 先看落点后看 Esc(有落点时 Esc 被无视)。
+    #[test]
+    fn esc_cancels_even_with_a_valid_target() {
+        assert_eq!(
+            drag_end(PaneId(1), Some(PaneId(2)), true),
+            DragEnd::Cancelled
+        );
+    }
+
+    /// 自证会变红:`drag_end` 在 `None` 落点上不返回 Cancelled。
+    #[test]
+    fn releasing_with_no_target_cancels() {
+        assert_eq!(drag_end(PaneId(1), None, false), DragEnd::Cancelled);
+    }
+
+    /// 自证会变红:`drag_end` 不判 `to == from`(纯函数要自己挡,不靠
+    /// `drop_target` 先过滤 —— 两者解耦后谁都可能单独被调)。
+    #[test]
+    fn releasing_on_itself_cancels() {
+        assert_eq!(
+            drag_end(PaneId(1), Some(PaneId(1)), false),
+            DragEnd::Cancelled
+        );
+    }
+
+    /// 一次完整拖动跑下来留下的东西。
+    struct DragRun {
+        /// 指针停在落点上、尚未松手那一帧的输出。
+        mid: egui::FullOutput,
+        /// 那一帧之后 `wants_pointer_input()` —— app.rs 拿它判指针归谁(T5/T8)。
+        mid_wants_pointer: bool,
+        /// 拖动中按住不动(无输入事件)那一帧的输出。
+        held: egui::FullOutput,
+        /// 那一帧之后的 `wants_pointer_input()`。
+        held_wants_pointer: bool,
+        /// 静止一帧(还没按下)的输出,量「不拖时零额外重绘」(T3)。
+        idle: egui::FullOutput,
+        /// 每一帧 `show` 的返回,最后一项是松手那帧。
+        actions: Vec<TitleAction>,
+    }
+
+    /// 在 `press` 按下 → 移动过拖动阈值 → 停到 `over` →(可选按 Esc)→ 松手。
+    ///
+    /// 时间显式推进:默认 `time: None` 会让 `Area` 淡入没走完、点下去没反应
+    /// (同 `click_button_with` 的坑)。
+    fn drag_run(
+        views: &[TitleView<'_>],
+        press: egui::Pos2,
+        over: egui::Pos2,
+        esc: bool,
+    ) -> DragRun {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut actions = Vec::new();
+        let frame = |t: f64, events: Vec<egui::Event>, actions: &mut Vec<TitleAction>| {
+            ctx.run(
+                egui::RawInput {
+                    time: Some(t),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| actions.push(show(ctx, &crate::theme::MULLION_DARK, views)),
+            )
+        };
+        let m = egui::Modifiers::default();
+        let btn = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: m,
+        };
+        let _ = frame(0.0, vec![], &mut actions);
+        let _ = frame(1.0, vec![], &mut actions);
+        let _ = frame(1.5, vec![egui::Event::PointerMoved(press)], &mut actions);
+        // 悬停后再静置几帧:有输入事件的那帧 egui 自己会要一次重绘,不算数。
+        let mut idle = frame(1.6, vec![], &mut actions);
+        for t in [1.7, 1.8, 1.9] {
+            idle = frame(t, vec![], &mut actions);
+        }
+        let _ = frame(2.0, vec![btn(press, true)], &mut actions);
+        let _ = frame(
+            2.05,
+            vec![egui::Event::PointerMoved(press + egui::vec2(20.0, 20.0))],
+            &mut actions,
+        );
+        let mut ev = vec![egui::Event::PointerMoved(over)];
+        if esc {
+            ev.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: m,
+            });
+        }
+        let mid = frame(2.1, ev, &mut actions);
+        let mid_wants_pointer = ctx.wants_pointer_input();
+        // 按住不动的一帧:没有输入事件,egui 不会自己要重绘。
+        let held = frame(2.12, vec![], &mut actions);
+        let held_wants_pointer = ctx.wants_pointer_input();
+        let _ = frame(2.15, vec![btn(over, false)], &mut actions);
+        DragRun {
+            mid,
+            mid_wants_pointer,
+            held,
+            held_wants_pointer,
+            idle,
+            actions,
+        }
+    }
+
+    /// 输出里有没有一块「accent 半透明填充」正好盖在 `want` 上的矩形。
+    fn has_drop_cover(out: &egui::FullOutput, want: egui::Rect) -> bool {
+        let fill = theme::c32(crate::theme::MULLION_DARK.accent).gamma_multiply(DROP_TINT);
+        fn walk(s: &egui::Shape, fill: egui::Color32, want: egui::Rect) -> bool {
+            match s {
+                egui::Shape::Vec(v) => v.iter().any(|x| walk(x, fill, want)),
+                egui::Shape::Rect(r) => {
+                    r.fill == fill
+                        && (r.rect.min - want.min).length() < 0.5
+                        && (r.rect.max - want.max).length() < 0.5
+                }
+                _ => false,
+            }
+        }
+        out.shapes.iter().any(|c| walk(&c.shape, fill, want))
+    }
+
+    fn rect_of(g: &PaneGeom) -> egui::Rect {
+        egui::Rect::from_min_size(
+            egui::pos2(g.px.x as f32, g.px.y as f32),
+            egui::vec2(g.px.w as f32, g.px.h as f32),
+        )
+    }
+
+    /// 主路径:从 A 标题条空白处按住,拖到 B 的**终端区**上松手 → 请求 (A,B)。
+    /// 拖动中遮罩画在 B 上而不是 A 上;指针在终端区上方时 egui 仍要指针
+    /// (`wants_pointer_input`),app.rs 的 `pointer_route` 因此判给 egui,
+    /// 不会漏给终端划选/鼠标上报(T5/T8)。
+    ///
+    /// 自证会变红:`show` 里不登记 drag 感知 / 不在 `drag_stopped` 写
+    /// `action.swap`;遮罩画在被拖那块上;把 drag 的 `interact` 挪到按钮之后
+    /// 也无妨此条,但删掉它此条必红。
+    #[test]
+    fn dragging_a_title_bar_onto_another_pane_asks_to_swap_them() {
+        let v = three_views();
+        let r = drag_run(&v, egui::pos2(250.0, 10.0), egui::pos2(600.0, 300.0), false);
+        let last = r.actions.last().unwrap();
+        assert_eq!(last.swap, Some((PaneId(1), PaneId(2))));
+        assert_eq!(last.close, None);
+        assert!(
+            r.actions[..r.actions.len() - 1]
+                .iter()
+                .all(|a| a.swap.is_none()),
+            "松手之前就报了换位"
+        );
+        assert!(
+            has_drop_cover(&r.mid, rect_of(&v[1].geom)),
+            "落点 B 上没画遮罩"
+        );
+        assert!(
+            !has_drop_cover(&r.mid, rect_of(&v[0].geom)),
+            "遮罩画到被拖的 A 上了"
+        );
+        assert!(
+            r.mid_wants_pointer && r.held_wants_pointer,
+            "拖动中指针在终端区上方时 egui 不要指针 —— 指针会漏给终端(T5/T8)"
+        );
+    }
+
+    /// 标题**文字**那一片也能拖(它占了标题条大半)。egui 0.30 默认
+    /// `selectable_labels = true`,可选中的 Label sense 了 click_and_drag,
+    /// 叠在整条的 drag 感知之上 —— 一拖变成选字,换位静默不发生。
+    ///
+    /// 自证会变红:删掉 `show` 里 `selectable_labels = false` 那一行。
+    #[test]
+    fn dragging_from_the_title_text_also_swaps() {
+        let v = three_views();
+        // 先跑两帧找标题字形的位置(`Area` 首帧不出形状)。
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for t in [0.0, 1.0] {
+            out = Some(ctx.run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &crate::theme::MULLION_DARK, &v);
+                },
+            ));
+        }
+        let out = out.unwrap();
+        fn find(s: &egui::Shape) -> Option<egui::Rect> {
+            match s {
+                egui::Shape::Vec(v) => v.iter().find_map(find),
+                egui::Shape::Text(t) if t.galley.text().starts_with("1 · dev@") => {
+                    Some(s.visual_bounding_rect())
+                }
+                _ => None,
+            }
+        }
+        let text = out
+            .shapes
+            .iter()
+            .find_map(|c| find(&c.shape))
+            .expect("A 的标题文字没画出来");
+        let r = drag_run(&v, text.center(), egui::pos2(600.0, 300.0), false);
+        assert_eq!(r.actions.last().unwrap().swap, Some((PaneId(1), PaneId(2))));
+    }
+
+    /// 拖到一半按 Esc,松在 B 上也不换。egui 在按 Esc 那帧自己中止拖动、
+    /// `drag_stopped` 当帧触发,指针此刻正停在 B 上。
+    ///
+    /// 自证会变红:`drag_feedback` 松手判定里的 `void || esc` 去掉 `|| esc`
+    /// (实测:按 Esc 当场换位)。
+    #[test]
+    fn esc_during_a_drag_cancels_the_swap() {
+        let v = three_views();
+        let r = drag_run(&v, egui::pos2(250.0, 10.0), egui::pos2(600.0, 300.0), true);
+        assert!(r.actions.iter().all(|a| a.swap.is_none()));
+    }
+
+    /// 从 × 上按下再拖过去:按钮仍只是点击,不触发换位,也不关 pane。
+    /// (egui 的命中测试会把「上层按钮 + 下层 drag」同时报出,所以拖动起点在
+    /// 按钮上时要由 `show` 自己作废这次拖动。)
+    ///
+    /// 自证会变红:删掉 `drag_started` 时按 `press_origin` 判按钮的那段。
+    #[test]
+    fn a_drag_that_starts_on_a_button_does_not_swap() {
+        let v = three_views();
+        // 先跑两帧拿 × 的矩形(淡入走完)。
+        let ctx = egui::Context::default();
+        for t in [0.0, 1.0] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &crate::theme::MULLION_DARK, &v);
+                },
+            );
+        }
+        let close = ctx.read_response(close_id(PaneId(1))).unwrap().rect;
+        let r = drag_run(&v, close.center(), egui::pos2(600.0, 300.0), false);
+        assert!(r
+            .actions
+            .iter()
+            .all(|a| a.swap.is_none() && a.close.is_none()));
+        assert!(
+            !has_drop_cover(&r.mid, rect_of(&v[1].geom)),
+            "作废的拖动不该画遮罩"
+        );
+    }
+
+    /// 抽屉的标题条拖不动。
+    ///
+    /// 自证会变红:`show` 里给抽屉也登记 drag 感知(去掉 `!v.drawer`)。
+    #[test]
+    fn a_drawer_title_bar_cannot_be_dragged() {
+        let v = three_views();
+        let r = drag_run(
+            &v,
+            egui::pos2(1050.0, 10.0),
+            egui::pos2(200.0, 300.0),
+            false,
+        );
+        assert!(r.actions.iter().all(|a| a.swap.is_none()));
+    }
+
+    /// T3:不拖时零额外重绘;拖动中要持续出帧(遮罩跟指针)。
+    ///
+    /// 自证会变红:`request_repaint()` 改成无条件调用(idle 那条红)。
+    ///
+    /// held 那条**只是行为记录、不是守护**:egui 0.30 在拖动中(含按住不动、
+    /// 无输入事件的帧)自己就要重绘,删掉 `drag_feedback` 里那句照绿(实测)。
+    /// 那句保留作兜底,不靠这条测试守。
+    #[test]
+    fn repaint_is_requested_only_while_dragging() {
+        let v = three_views();
+        let r = drag_run(&v, egui::pos2(250.0, 10.0), egui::pos2(600.0, 300.0), false);
+        let delay = |o: &egui::FullOutput| o.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert_eq!(
+            delay(&r.idle),
+            std::time::Duration::MAX,
+            "不拖时也在要重绘(T3)"
+        );
+        assert_eq!(
+            delay(&r.held),
+            std::time::Duration::ZERO,
+            "拖动中按住不动时没要重绘"
+        );
     }
 }

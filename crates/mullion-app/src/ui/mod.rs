@@ -737,6 +737,8 @@ pub struct UiActions {
     pub pick_project_pane: Option<mullion_core::layout::PaneId>,
     /// F298:点了 pane 标题条状态段里的国家那格 —— 请求立刻重取出口国家。
     pub refresh_node_pane: Option<mullion_core::layout::PaneId>,
+    /// F324:把 `.0` 那块 pane 拖到 `.1` 那块上松手 —— 请求两块换位。
+    pub swap_panes: Option<(mullion_core::layout::PaneId, mullion_core::layout::PaneId)>,
     /// F36:点了标签栏(切换 / 关闭 / `+`)。
     pub tab: Option<chrome::TabAction>,
     /// F100:标注模式导出的 Markdown,等着送剪贴板。
@@ -1302,6 +1304,7 @@ pub fn build_ui(
     actions.rehost_pane = title_action.rehost;
     actions.pick_project_pane = title_action.pick_project;
     actions.refresh_node_pane = title_action.refresh_node;
+    actions.swap_panes = title_action.swap;
 
     // F100 标注模式:**必须是最后一步**。它要读的是本帧所有 `annotate::mark()`
     // 登记完之后的候选表,而且铺的那层「吃指针」Area 得盖在包括 toast 在内的

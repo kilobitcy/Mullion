@@ -16105,7 +16105,7 @@ fn apply_layout_actions(
     egui_ctx: Option<&egui::Context>,
     actions: &crate::ui::UiActions,
 ) -> Option<Vec<PaneId>> {
-    if actions.preset.is_none() && actions.close_pane.is_none() {
+    if actions.preset.is_none() && actions.close_pane.is_none() && actions.swap_panes.is_none() {
         return None;
     }
     let mut fresh = Vec::new();
@@ -16118,6 +16118,13 @@ fn apply_layout_actions(
         // close_pane 在「只剩最后一个 pane」时会拒绝并返回 false、树不变——
         // 那一帧就是纯粹的 noop,不该标脏(白标一次脏 = 一次无意义重绘,T3)。
         if ws.close_pane(id) {
+            changed = true;
+        }
+    }
+    if let Some((from, to)) = actions.swap_panes {
+        // F324:被拒绝(抽屉/自己/未知 id)时树不变,那一帧是纯 noop,不标脏(T3)。
+        // 换位后网格尺寸变了的 pane 由下一帧 `apply_geometry` 发 window_change(T4)。
+        if ws.swap_panes(from, to) {
             changed = true;
         }
     }
@@ -17582,6 +17589,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.project_pick.is_some()
         || a.pick_project_pane.is_some()
         || a.refresh_node_pane.is_some()
+        || a.swap_panes.is_some()
         || a.history.is_some()
         || a.pack.is_some()
         || a.copy_last_error
@@ -22833,6 +22841,73 @@ mod tests {
             window.contains("crate::node_stats::pieces("),
             "stats 没有走 node_stats::pieces 排版:{window}"
         );
+    }
+
+    /// **接线守护 / F324**:拖标题条换位的请求要真落地 ——
+    /// (a) `has_real_action` 登记 `swap_panes`(列举式门控:漏了 = egui 的
+    /// discard 趟静默吃掉这次松手,「拖过去有时候没反应」);
+    /// (b) `apply_layout_actions` 真调 `ws.swap_panes(`(早退条件没放行它的话,
+    /// 函数体里写了也走不到 —— 那一半由下面的行为测试守)。
+    ///
+    /// 切片走 `prod_src()`(已剥注释、已钉「测试模块在最后」),注释里提到这两个
+    /// 词不会喂饱判据。
+    ///
+    /// 自证会变红:删 `|| a.swap_panes.is_some()`;或删 `ws.swap_panes(from, to)`
+    /// 那段(只在注释里留着同一串也照红)。
+    #[test]
+    fn a_title_bar_drag_swap_is_a_real_action_and_reaches_the_workspace() {
+        let real = body_of(prod_src(), "fn has_real_action(");
+        assert!(
+            real.contains("a.swap_panes"),
+            "换位请求会在 discard 趟被静默吃掉"
+        );
+        let apply = body_of(prod_src(), "fn apply_layout_actions(");
+        assert!(
+            apply.contains("ws.swap_panes("),
+            "apply_layout_actions 没把换位请求交给 Workspace"
+        );
+    }
+
+    /// F324 行为:`apply_layout_actions` 收到换位请求要放行(不被早退条件挡掉)、
+    /// 真换、并返回 `Some`(调用方据此标脏);被拒绝的请求返回 `None`(不标脏,T3)。
+    ///
+    /// 自证会变红:早退条件里漏掉 `actions.swap_panes.is_none()`(第一段返回
+    /// `None`);或被拒绝时也 `changed = true`(第二段返回 `Some`)。
+    #[test]
+    fn a_swap_request_lands_in_the_tree_and_a_refused_one_is_a_noop() {
+        let mut ws = Workspace::new(test_pane(1), 0);
+        let fresh = apply_layout_actions(
+            &mut ws,
+            None,
+            &crate::ui::UiActions {
+                preset: Some(Preset::TwoLeftRight),
+                ..Default::default()
+            },
+        )
+        .expect("1→2 必须开出新格子");
+        assert_eq!(fresh.len(), 1);
+        ws.attach_pane(test_pane(fresh[0].0));
+        let before = mullion_core::layout::leaves(ws.tree());
+        let (a, b) = (before[0], before[1]);
+        let got = apply_layout_actions(
+            &mut ws,
+            None,
+            &crate::ui::UiActions {
+                swap_panes: Some((a, b)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(got, Some(Vec::new()), "换位请求被早退条件挡掉了");
+        assert_eq!(mullion_core::layout::leaves(ws.tree()), vec![b, a]);
+        let refused = apply_layout_actions(
+            &mut ws,
+            None,
+            &crate::ui::UiActions {
+                swap_panes: Some((a, a)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(refused, None, "被拒绝的换位不该标脏(T3)");
     }
 
     /// **接线守护 / F125**:闪烁只许排 `WaitUntil`,不许 `request_redraw`。
