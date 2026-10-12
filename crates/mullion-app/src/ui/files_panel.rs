@@ -540,7 +540,14 @@ pub struct ColWidths {
     pub mtime: f32,
     pub perm: f32,
     pub owner: f32,
+    /// 名称列右边那几列的从左到右顺序(用户可拖列头换位)。名称列恒在最左
+    /// (图标格 / 改名框 / 选中色条都以行左边界为锚),不参与换位。
+    /// 本地栏没有属主列,`col_lefts` 会把它滤掉。
+    pub order: [SortKey; 4],
 }
+
+/// 可换位的四列的默认顺序。
+const DEFAULT_ORDER: [SortKey; 4] = [SortKey::Size, SortKey::Mtime, SortKey::Perm, SortKey::Owner];
 
 impl Default for ColWidths {
     /// 名称列 220:比旧模型在默认侧栏(360px)下算出来的 130 宽不少,
@@ -553,8 +560,49 @@ impl Default for ColWidths {
             mtime: W_MTIME,
             perm: W_PERM,
             owner: W_OWNER,
+            order: DEFAULT_ORDER,
         }
     }
+}
+
+/// 列 → 宽度字段序号(`col_min` / `col_w_mut` 认的是这个固定序号,与当前
+/// 显示顺序无关)。
+fn canon_index(k: SortKey) -> usize {
+    match k {
+        SortKey::Name => 0,
+        SortKey::Size => 1,
+        SortKey::Mtime => 2,
+        SortKey::Perm => 3,
+        SortKey::Owner => 4,
+    }
+}
+
+/// 把 `from` 列挪到 `to` 列当前的位置(其余列顺势让位)。
+fn move_column(order: &mut [SortKey; 4], from: SortKey, to: SortKey) {
+    let (Some(f), Some(t)) = (
+        order.iter().position(|k| *k == from),
+        order.iter().position(|k| *k == to),
+    ) else {
+        return;
+    };
+    let k = order[f];
+    if f < t {
+        order.copy_within(f + 1..=t, f);
+    } else {
+        order.copy_within(t..f, t + 1);
+    }
+    order[t] = k;
+}
+
+/// 指针横坐标(相对行左边界)落在哪一列上 —— 换位的落点。落在名称列或
+/// 最左之外取第一个可换位列,超出最右取最后一个。
+fn drop_target(lay: &[(&'static str, SortKey, f32, f32)], x: f32) -> Option<SortKey> {
+    let movable: Vec<_> = lay.iter().filter(|c| c.1 != SortKey::Name).collect();
+    movable
+        .iter()
+        .find(|(_, _, left, w)| x < left + w)
+        .or(movable.last())
+        .map(|c| c.1)
 }
 
 /// 列序号 → 最小宽度。名称列要放得下图标格 + 几个字;其余列至少要能
@@ -594,14 +642,15 @@ fn col_w_mut(c: &mut ColWidths, i: usize) -> &mut f32 {
 /// 就不存在。判据按栏静态、不按数据 —— 理由见
 /// `tests::the_local_column_has_no_owner_column_but_the_remote_one_does`。
 fn col_lefts(c: &ColWidths, column: PanelColumn) -> Vec<(&'static str, SortKey, f32, f32)> {
-    let mut specs: Vec<(&'static str, SortKey, f32)> = vec![
-        ("名称", SortKey::Name, c.name),
-        ("大小", SortKey::Size, c.size),
-        ("修改时间", SortKey::Mtime, c.mtime),
-        ("权限", SortKey::Perm, c.perm),
-    ];
-    if column == PanelColumn::Remote {
-        specs.push(("属主", SortKey::Owner, c.owner));
+    let mut specs: Vec<(&'static str, SortKey, f32)> = vec![("名称", SortKey::Name, c.name)];
+    for k in c.order {
+        match k {
+            SortKey::Size => specs.push(("大小", k, c.size)),
+            SortKey::Mtime => specs.push(("修改时间", k, c.mtime)),
+            SortKey::Perm => specs.push(("权限", k, c.perm)),
+            SortKey::Owner if column == PanelColumn::Remote => specs.push(("属主", k, c.owner)),
+            _ => {}
+        }
     }
     let mut out = Vec::with_capacity(specs.len());
     let mut x = 0.0;
@@ -775,6 +824,26 @@ fn column_home(column: PanelColumn, remote_home: Option<&[u8]>) -> Option<String
         PanelColumn::Local => {
             crate::files::local::home_dir_cached().map(|h| h.display().to_string())
         }
+    }
+}
+
+/// 把主目录前缀折叠成 `~`:`home` → `~`,`home/sub` → `~/sub`,其余原样。
+/// 只按路径分量边界匹配(`/home/ab` 不算在 `/home/a` 之下);主目录未知 / 是 `/`
+/// 时不折叠。显示、收藏保存、路径条编辑初值共用这一个口径,解析仍走既有
+/// `resolve_*_input`。
+fn tilde_form(path: &str, home: Option<&str>) -> String {
+    let Some(h) = home
+        .map(|h| h.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+    else {
+        return path.to_owned();
+    };
+    if path == h {
+        return "~".to_owned();
+    }
+    match path.strip_prefix(h) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_owned(),
     }
 }
 
@@ -1013,6 +1082,9 @@ pub fn show(
             action = Some(FileAction::Refresh);
         }
         let path = state.cwd.display().to_string();
+        // 主目录内一律折叠成 `~` 显示 / 保存 / 作为编辑初值。
+        let home_str = column_home(column, bookmarks.home);
+        let path_shown = tilde_form(&path, home_str.as_deref());
         // F139:收藏当前目录 + 书签下拉。**必须画在路径标签之前** —— 下面
         // 那个 `Label` 用 `available_width` 吃掉整行剩余宽度,排在它后面的
         // 按钮会被挤出可视区。
@@ -1044,15 +1116,8 @@ pub fn show(
                         path: b.path.clone(),
                     },
                     None => {
-                        // F301:正在主目录 → 存 `~`,换机器/换用户也指得对;
-                        // 子目录照旧存绝对路径(用户确认的取舍)。
-                        let at_home =
-                            column_home(column, bookmarks.home).as_deref() == Some(path.as_str());
-                        let saved = if at_home {
-                            "~".to_owned()
-                        } else {
-                            path.clone()
-                        };
+                        // F301:主目录内 → 存 `~` / `~/子路径`,换机器/换用户也指得对。
+                        let saved = tilde_form(&path, home_str.as_deref());
                         FileAction::BookmarkAdd {
                             name: bookmark_default_name(&path),
                             path: saved,
@@ -1090,7 +1155,13 @@ pub fn show(
                 let shown: Vec<String> = bookmarks
                     .list
                     .iter()
-                    .map(|b| fit_middle(&b.path, cap - pad, width_of))
+                    .map(|b| {
+                        fit_middle(
+                            &tilde_form(&b.path, home_str.as_deref()),
+                            cap - pad,
+                            width_of,
+                        )
+                    })
                     .collect();
                 // F303:预算取「最长一条」与上限的较小者,而不是直接取上限 ——
                 // 菜单是 `top_down_justified`,按钮撑满预算;Area 又记着上一次
@@ -1219,16 +1290,18 @@ pub fn show(
                 // `.truncate()` 视觉效果不受影响。
                 let row_rect = ui.available_rect_before_wrap();
                 ui.add(
-                    egui::Label::new(egui::RichText::new(path.clone()).color(theme::c32(t.fg_mid)))
-                        .truncate(),
+                    egui::Label::new(
+                        egui::RichText::new(path_shown.clone()).color(theme::c32(t.fg_mid)),
+                    )
+                    .truncate(),
                 );
                 let hit = ui.interact(row_rect, path_label_id(id), egui::Sense::click());
                 if hit.clicked() {
                     // F201:进编辑态就整条选中,敲第一个字直接换掉。
                     // 长度按**字符**数,不是字节 —— 路径里有中文时按字节
                     // 算出来的选区末端会落到某个字的中间。
-                    select_all(ui.ctx(), path_edit_id(id), path.chars().count());
-                    state.path_edit = Some(path);
+                    select_all(ui.ctx(), path_edit_id(id), path_shown.chars().count());
+                    state.path_edit = Some(path_shown);
                     ui.ctx().memory_mut(|m| m.request_focus(path_edit_id(id)));
                 }
             }
@@ -1820,8 +1893,33 @@ fn header_at(
     // 热区认的是**每一列的右边界**(i = 0..5),拖动只改第 i 列的宽度,
     // 右边的列整体平移(不做此消彼长的「借宽度」—— 总宽有横向滚动兜着,
     // 没有守恒的必要)。
+    // 换位用的纯拖动部件,垫在列宽热区与列头单元**下面**(名称列恒在最左,
+    // 不参与,但仍占位保持下标对齐)。egui 的拖动归最上层的拖动部件、点击归
+    // 最上层的点击部件:边界处拖动归列宽热区、其余处归它,点击仍归列头单元
+    // (排序)。若把列头单元自己改成 click_and_drag,它在热区之上会吃掉列宽拖动。
+    let lay0 = col_lefts(cols, column);
+    let reorder: Vec<egui::Response> = lay0
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, key, left, w))| {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(band.left() + left - offset_x, band.top()),
+                egui::vec2(w, ROW_H),
+            );
+            ui.interact(
+                rect,
+                ui.id().with(("files-col-reorder", id, i)),
+                if key == SortKey::Name {
+                    egui::Sense::hover()
+                } else {
+                    egui::Sense::drag()
+                },
+            )
+        })
+        .collect();
     const HANDLE_W: f32 = 6.0;
-    for (i, (_, _, left, w)) in col_lefts(cols, column).into_iter().enumerate() {
+    for (i, (_, key, left, w)) in col_lefts(cols, column).into_iter().enumerate() {
+        let ci = canon_index(key);
         let x = band.left() + left + w - offset_x;
         let handle = egui::Rect::from_min_max(
             egui::pos2(x - HANDLE_W * 0.5, band.top()),
@@ -1836,8 +1934,8 @@ fn header_at(
             .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
         if resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            let target = col_w_mut(cols, i);
-            *target = (*target + resp.drag_delta().x).clamp(col_min(i), COL_MAX);
+            let target = col_w_mut(cols, ci);
+            *target = (*target + resp.drag_delta().x).clamp(col_min(ci), COL_MAX);
         }
         if resp.hovered() || resp.dragged() {
             // 抓住的是哪条线,要看得见。
@@ -1849,7 +1947,9 @@ fn header_at(
         }
     }
     let mut hit = None;
-    for (i, (label, key, left, w)) in col_lefts(cols, column).into_iter().enumerate() {
+    let mut moved = None;
+    let lay = lay0;
+    for (i, (label, key, left, w)) in lay.clone().into_iter().enumerate() {
         let rect = egui::Rect::from_min_size(
             egui::pos2(band.left() + left - offset_x, band.top()),
             egui::vec2(w, ROW_H),
@@ -1875,6 +1975,26 @@ fn header_at(
             ui.id().with(("files-col-head", id, i)),
             egui::Sense::click(),
         );
+        let rr = &reorder[i];
+        if key != SortKey::Name && (rr.dragged() || rr.drag_stopped()) {
+            let to = rr
+                .interact_pointer_pos()
+                .or_else(|| ui.input(|i| i.pointer.latest_pos()))
+                .and_then(|p| drop_target(&lay, p.x - band.left() + offset_x));
+            if rr.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                // 落点列的左缘画一条强调线,看得见会插到哪。
+                if let Some((_, _, tl, _)) = to.and_then(|t| lay.iter().find(|c| c.1 == t)) {
+                    ui.painter().with_clip_rect(band).vline(
+                        band.left() + tl - offset_x,
+                        band.y_range(),
+                        egui::Stroke::new(2.0, theme::c32(t.accent)),
+                    );
+                }
+            } else if let Some(to) = to {
+                moved = Some((key, to));
+            }
+        }
         let mark = if state.sort_key == key {
             match state.sort_dir {
                 crate::files::SortDir::Asc => "▲",
@@ -1927,6 +2047,9 @@ fn header_at(
     }
     if let Some(k) = hit {
         state.click_header(k);
+    }
+    if let Some((from, to)) = moved {
+        move_column(&mut cols.order, from, to);
     }
 }
 
@@ -2186,7 +2309,8 @@ fn row(
     // 注释),不许在这里另起一份累加。
     let lay = col_lefts(cols, column);
     // 大小(右对齐)
-    let (_, _, size_left, size_w) = lay[1];
+    let at = |k: SortKey| lay.iter().find(|c| c.1 == k).map(|&(_, _, l, w)| (l, w));
+    let (size_left, size_w) = at(SortKey::Size).expect("大小列恒在");
     let size_text = if e.kind == EntryKind::Dir {
         String::new()
     } else {
@@ -2208,7 +2332,7 @@ fn row(
         theme::c32(t.fg_mid),
     );
     // 修改时间(左对齐)
-    let (_, _, mtime_left, mtime_w) = lay[2];
+    let (mtime_left, mtime_w) = at(SortKey::Mtime).expect("修改时间列恒在");
     p.text(
         egui::pos2(
             rect.left() + mtime_left + crate::ui::metrics::SP_S,
@@ -2225,7 +2349,7 @@ fn row(
         theme::c32(t.fg_mid),
     );
     // 权限(右对齐,不再把 uid:gid 拼在后面 —— 属主拆成了独立列)。
-    let (_, _, perm_left, perm_w) = lay[3];
+    let (perm_left, perm_w) = at(SortKey::Perm).expect("权限列恒在");
     p.text(
         egui::pos2(
             rect.left() + perm_left + perm_w - crate::ui::metrics::SP_XS,
@@ -2243,7 +2367,7 @@ fn row(
     );
     // 属主(右对齐)。F146:本地栏没有这一列 —— `col_lefts` 已经不返回它,
     // 这里跟着按「下标存不存在」判,不再各写一份栏别判断。
-    if let Some(&(_, _, owner_left, owner_w)) = lay.get(4) {
+    if let Some((owner_left, owner_w)) = at(SortKey::Owner) {
         p.text(
             egui::pos2(
                 rect.left() + owner_left + owner_w - crate::ui::metrics::SP_XS,
@@ -6220,14 +6344,28 @@ mod tests {
         assert!(find_text_pos(&shapes, "☆").is_some(), "不在主目录也亮了 ★");
     }
 
-    /// F301:在主目录点 ☆ 存成 `~`,子目录仍存绝对路径。
-    ///
-    /// 自证会变红:删掉「cwd == home → 存 `~`」那个分支。
+    /// 主目录折叠:只按分量边界匹配,主目录外原样。
     #[test]
-    fn starring_home_saves_a_tilde_and_a_subdirectory_saves_an_absolute_path() {
+    fn tilde_form_collapses_only_at_component_boundaries() {
+        let h = Some("/home/a");
+        assert_eq!(tilde_form("/home/a", h), "~");
+        assert_eq!(tilde_form("/home/a/", h), "~/");
+        assert_eq!(tilde_form("/home/a/.claude", h), "~/.claude");
+        assert_eq!(tilde_form("/home/ab", h), "/home/ab");
+        assert_eq!(tilde_form("/etc", h), "/etc");
+        assert_eq!(tilde_form("/home/a", None), "/home/a");
+        assert_eq!(tilde_form("/x", Some("/")), "/x");
+    }
+
+    /// F301:在主目录点 ☆ 存成 `~`,主目录内子目录存 `~/子路径`,主目录外存绝对路径。
+    ///
+    /// 自证会变红:把 `saved` 换回 `path.clone()`。
+    #[test]
+    fn starring_home_saves_a_tilde_and_a_subdirectory_saves_a_tilde_path() {
         for (cwd, want) in [
             (&b"/home/brain"[..], "~"),
-            (&b"/home/brain/src"[..], "/home/brain/src"),
+            (&b"/home/brain/src"[..], "~/src"),
+            (&b"/etc"[..], "/etc"),
         ] {
             let ctx = egui::Context::default();
             let mut state = ready_at(cwd);
@@ -8461,6 +8599,7 @@ mod tests {
             mtime: 33.0,
             perm: 44.0,
             owner: 55.0,
+            order: DEFAULT_ORDER,
         };
         let lay = col_lefts(&cols, PanelColumn::Remote);
         assert_eq!(lay[0].2, 0.0, "第一列必须从 0 起算(相对行左边界)");
@@ -9226,6 +9365,111 @@ mod tests {
             (x_wide - x_narrow - 120.0).abs() < 1.0,
             "名称列加宽 120 之后,大小数值应该右移 120(实际 {x_narrow} → {x_wide})\
              —— 列宽没有从调用方读进来"
+        );
+    }
+
+    /// 列头换位的纯逻辑:挪到目标列的位置,其余顺势让位;落点按横坐标判。
+    #[test]
+    fn move_column_inserts_at_the_target_and_drop_target_follows_x() {
+        let mut o = DEFAULT_ORDER;
+        move_column(&mut o, SortKey::Owner, SortKey::Size);
+        assert_eq!(
+            o,
+            [SortKey::Owner, SortKey::Size, SortKey::Mtime, SortKey::Perm]
+        );
+        move_column(&mut o, SortKey::Owner, SortKey::Perm);
+        assert_eq!(
+            o,
+            [SortKey::Size, SortKey::Mtime, SortKey::Perm, SortKey::Owner]
+        );
+        let cols = ColWidths::default();
+        let lay = col_lefts(&cols, PanelColumn::Remote);
+        assert_eq!(
+            drop_target(&lay, 1.0),
+            Some(SortKey::Size),
+            "名称列上取首个可换位列"
+        );
+        assert_eq!(
+            drop_target(&lay, 1e6),
+            Some(SortKey::Owner),
+            "超出最右取末列"
+        );
+        let mut c2 = cols;
+        c2.order = [SortKey::Perm, SortKey::Size, SortKey::Mtime, SortKey::Owner];
+        let keys: Vec<_> = col_lefts(&c2, PanelColumn::Remote)
+            .iter()
+            .map(|c| c.1)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                SortKey::Name,
+                SortKey::Perm,
+                SortKey::Size,
+                SortKey::Mtime,
+                SortKey::Owner
+            ]
+        );
+        let local: Vec<_> = col_lefts(&c2, PanelColumn::Local)
+            .iter()
+            .map(|c| c.1)
+            .collect();
+        assert!(!local.contains(&SortKey::Owner), "本地栏仍无属主列");
+    }
+
+    /// 按住列头不动拖到另一列上松手 → 两列换位;名称列拖不动。
+    ///
+    /// 自证会变红:去掉 `header_at` 末尾的 `move_column`,或把列头改回
+    /// `Sense::click()`。
+    #[test]
+    fn dragging_a_header_onto_another_column_reorders_them() {
+        let t = crate::theme::MULLION_DARK;
+        let mut state = PaneState::new(RemotePath::from_bytes(b"/x".to_vec()));
+        state.entries = vec![entry(b"a.txt", EntryKind::File)];
+        state.load = Load::Ready;
+        let mut cols = ColWidths::default();
+        let ctx = egui::Context::default();
+        let render = |input: egui::RawInput, state: &mut PaneState, cols: &mut ColWidths| {
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui,
+                        &t,
+                        "远端",
+                        1,
+                        PanelColumn::Remote,
+                        state,
+                        false,
+                        BookmarkView::none(),
+                        0,
+                        cols,
+                        None,
+                        None,
+                        None,
+                    );
+                });
+            })
+        };
+        annotate::toggle(&ctx);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let _ = render(raw(None), &mut state, &mut cols);
+        let perm = annotate::spot_rect(&ctx, "文件面板/远端/列头/权限").expect("权限列头");
+        let size = annotate::spot_rect(&ctx, "文件面板/远端/列头/大小").expect("大小列头");
+        let y = perm.center().y;
+        let from = perm.center();
+        let to = egui::pos2(size.center().x, y);
+        let _ = render(press(from, 1.0, true), &mut state, &mut cols);
+        let _ = render(
+            moved(egui::pos2((from.x + to.x) * 0.5, y), 1.1),
+            &mut state,
+            &mut cols,
+        );
+        let _ = render(moved(to, 1.2), &mut state, &mut cols);
+        let _ = render(press(to, 1.3, false), &mut state, &mut cols);
+        assert_eq!(
+            cols.order,
+            [SortKey::Perm, SortKey::Size, SortKey::Mtime, SortKey::Owner],
+            "权限列头拖到大小列上,该换到大小前面"
         );
     }
 
