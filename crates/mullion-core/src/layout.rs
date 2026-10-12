@@ -215,6 +215,110 @@ fn promote_sibling(node: &mut Node, keep: Sibling) {
     }
 }
 
+/// 交换两个「单元」的位置。单元 = 叶子 id 集合恰好覆盖的最小子树
+/// (普通 pane = 单叶子;带抽屉的 pane = 父 + 抽屉两片叶子)。
+///
+/// 返回是否交换成功。以下情况返回 `false` 且树**完全不变**:
+/// - 任一集合为空或含重复 id;
+/// - 两集合有交集;
+/// - 任一集合找不到「叶子集合(无序)恰好等于它」的子树。
+///
+/// 成功时两棵子树整体互换位置:各自内部结构与 ratio 原样搬走,外层各 Split 的
+/// `dir`/`ratio` 不动。
+///
+/// 为什么不直接对调叶子 id:抽屉是挂在父 pane 下的一个 Split,只对调父叶子会让
+/// 抽屉留在原地。core 不认识「抽屉」,只认「这组叶子凑成哪棵子树」。
+///
+/// 内部用 `PaneId(u32::MAX)` 与 `PaneId(u32::MAX - 1)` 做临时占位,真实 pane id
+/// 从小到大分配,不会取到这两个值。
+pub fn swap_units(root: &mut Node, x: &[PaneId], y: &[PaneId]) -> bool {
+    if !valid_unit(x) || !valid_unit(y) || x.iter().any(|id| y.contains(id)) {
+        return false;
+    }
+    // 先只读校验两组都存在,保证后面的取出/写回不会半途失败而改坏树。
+    if !covers(root, x) || !covers(root, y) {
+        return false;
+    }
+    let (mark_x, mark_y) = (PaneId(u32::MAX), PaneId(u32::MAX - 1));
+    let (Some(sub_x), Some(sub_y)) = (take_subtree(root, x, mark_x), take_subtree(root, y, mark_y))
+    else {
+        return false; // covers 已校验过,理论不可达
+    };
+    // y 的子树写进 x 的占位,x 的子树写进 y 的占位。
+    put_back(root, mark_x, sub_y);
+    put_back(root, mark_y, sub_x);
+    true
+}
+
+/// 非空且无重复。
+fn valid_unit(ids: &[PaneId]) -> bool {
+    !ids.is_empty() && ids.iter().enumerate().all(|(i, id)| !ids[..i].contains(id))
+}
+
+/// `node` 的叶子集合(无序)是否恰好等于 `ids`(`ids` 已保证无重复)。
+fn leaf_set_is(node: &Node, ids: &[PaneId]) -> bool {
+    let mut got = Vec::new();
+    collect_leaves(node, &mut got);
+    got.len() == ids.len() && got.iter().all(|id| ids.contains(id))
+}
+
+/// 树中是否存在叶子集合恰好等于 `ids` 的子树。
+fn covers(node: &Node, ids: &[PaneId]) -> bool {
+    if leaf_set_is(node, ids) {
+        return true;
+    }
+    match node {
+        Node::Split { a, b, .. } => covers(a, ids) || covers(b, ids),
+        Node::Leaf(_) => false,
+    }
+}
+
+/// 自顶向下找到叶子集合等于 `ids` 的子树,换成占位叶子 `mark` 并返回原子树。
+/// 先判子节点再判自身,取到的是最小子树。
+fn take_subtree(node: &mut Node, ids: &[PaneId], mark: PaneId) -> Option<Node> {
+    if let Node::Split { a, b, .. } = node {
+        if let Some(sub) = take_subtree(a, ids, mark) {
+            return Some(sub);
+        }
+        if let Some(sub) = take_subtree(b, ids, mark) {
+            return Some(sub);
+        }
+    }
+    if leaf_set_is(node, ids) {
+        return Some(std::mem::replace(node, Node::Leaf(mark)));
+    }
+    None
+}
+
+/// 把占位叶子 `mark` 替换成 `sub`;找到返回 `true`。
+fn put_back(node: &mut Node, mark: PaneId, sub: Node) -> bool {
+    match node {
+        Node::Leaf(id) if *id == mark => {
+            *node = sub;
+            true
+        }
+        Node::Leaf(_) => false,
+        Node::Split { a, b, .. } => {
+            // sub 只会被消费一次:先试 a,失败时 sub 需要还回来,故用 Option 搬运。
+            let mut slot = Some(sub);
+            put_back_opt(a, mark, &mut slot) || put_back_opt(b, mark, &mut slot)
+        }
+    }
+}
+
+fn put_back_opt(node: &mut Node, mark: PaneId, slot: &mut Option<Node>) -> bool {
+    match node {
+        Node::Leaf(id) if *id == mark => {
+            if let Some(sub) = slot.take() {
+                *node = sub;
+            }
+            true
+        }
+        Node::Leaf(_) => false,
+        Node::Split { a, b, .. } => put_back_opt(a, mark, slot) || put_back_opt(b, mark, slot),
+    }
+}
+
 /// 夹紧期望比例,使 `area` 沿 `dir` 切分后两侧都 >= 最小尺寸(F32)。
 pub fn clamp_ratio(dir: Dir, area: Rect, desired: f32) -> f32 {
     let (total, min) = match dir {
@@ -524,5 +628,61 @@ mod tests {
             leaves(&tree),
             vec![PaneId(1), PaneId(2), PaneId(3), PaneId(4)]
         );
+    }
+
+    fn ids(v: &[u32]) -> Vec<PaneId> {
+        v.iter().map(|&i| PaneId(i)).collect()
+    }
+
+    /// 自证会变红:若实现只对调叶子 id 的位置而不保留 ratio,或把外层 ratio 一并搬走,
+    /// 期望树里的 0.3 / 0.6 就对不上。
+    #[test]
+    fn swapping_two_leaves_keeps_shape_and_ratios() {
+        let mut t = hsplit(0.3, leaf(1), vsplit(0.6, leaf(2), leaf(3)));
+        assert!(swap_units(&mut t, &ids(&[1]), &ids(&[3])));
+        assert_eq!(t, hsplit(0.3, leaf(3), vsplit(0.6, leaf(2), leaf(1))));
+    }
+
+    /// 自证会变红:若实现退化成「只对调父叶子 id」,抽屉叶子 9 会留在原地,
+    /// 得到 hsplit(.5, leaf(2), vsplit(.8, leaf(1), leaf(9))),与期望不等。
+    #[test]
+    fn a_unit_with_a_drawer_moves_as_one_subtree() {
+        let mut t = hsplit(0.5, leaf(1), vsplit(0.8, leaf(2), leaf(9)));
+        assert!(swap_units(&mut t, &ids(&[1]), &ids(&[2, 9])));
+        assert_eq!(t, hsplit(0.5, vsplit(0.8, leaf(2), leaf(9)), leaf(1)));
+    }
+
+    /// 自证会变红:若任一非法输入(空集/相交/凑不成子树/不存在)没有在改树之前
+    /// 校验就返回,树会被改动或返回 true。
+    #[test]
+    fn an_unmatched_or_overlapping_unit_leaves_the_tree_untouched() {
+        let orig = hsplit(0.5, leaf(1), vsplit(0.5, leaf(2), leaf(3)));
+        let cases: [(&[u32], &[u32]); 5] = [
+            (&[1], &[1]),
+            (&[1], &[1, 2]),
+            (&[1, 3], &[2]),
+            (&[], &[2]),
+            (&[7], &[2]),
+        ];
+        for (x, y) in cases {
+            let mut t = orig.clone();
+            assert!(!swap_units(&mut t, &ids(x), &ids(y)), "{x:?} {y:?}");
+            assert_eq!(t, orig, "{x:?} {y:?}");
+        }
+    }
+
+    /// 自证会变红:若交换时改动了外层 Split 的 dir/ratio,矩形集合就会变;
+    /// 若没有真正换属主(空操作),属主 id 不会对调。
+    #[test]
+    fn swap_keeps_the_rect_set_and_only_relabels_owners() {
+        let mut t = hsplit(0.25, leaf(1), leaf(2));
+        let before = compute_rects(&t, AREA);
+        assert!(swap_units(&mut t, &ids(&[1]), &ids(&[2])));
+        let after = compute_rects(&t, AREA);
+        let rects = |v: &[(PaneId, Rect)]| v.iter().map(|(_, r)| *r).collect::<Vec<_>>();
+        assert_eq!(rects(&before), rects(&after));
+        assert_eq!(before[0].0, PaneId(1));
+        assert_eq!(after[0].0, PaneId(2));
+        assert_eq!(after[1].0, PaneId(1));
     }
 }
