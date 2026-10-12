@@ -1061,13 +1061,15 @@ pub(crate) fn create_credential_button_id() -> egui::Id {
 
 /// F325-b「创建凭据」按钮下面那行灰字。
 pub(super) const CREATE_CREDENTIAL_NOTE: &str =
-    "把这份用户名与密码/私钥存为共享凭据并改为引用;内容相同的会复用已有凭据";
+    "把这份用户名与密码/私钥存为共享凭据并改为引用;内容相同的会复用已有凭据(会话本身仍需点「保存」)";
 
 /// F325-b:「创建凭据」此刻为什么不能点(`None` = 可以点)。返回值即禁用时的
 /// tooltip(规范第 9 条)。
 ///
-/// 私钥的有无按**合成后**的语义判(与 `merged_identity_secret` 同一套三态):
-/// 这一轮碰过就看缓冲,没碰过才看库里有没有 —— 点过「清除」的钥匙不算数。
+/// 密码/私钥的有无按**合成后**的语义判(与 `merged_identity_secret` 同一套三态):
+/// 这一轮碰过就看缓冲,没碰过才看库里有没有 —— 点过「清除」的不算数。
+/// 两档都要有密文:没有密文的凭据什么都证明不了,而且同用户名的空凭据会
+/// 在查重时互相命中。
 pub(super) fn create_credential_block(
     buf: &EditorBuffer,
     presence: SecretPresence,
@@ -1075,15 +1077,22 @@ pub(super) fn create_credential_block(
     if buf.user.trim().is_empty() {
         return Some("先填用户名");
     }
-    let has_key = if buf.key_touched {
-        !buf.key_data.is_empty()
-    } else {
-        presence.private_key
+    let has = |touched: bool, typed: &str, stored: bool| {
+        if touched {
+            !typed.is_empty()
+        } else {
+            stored
+        }
     };
-    if buf.auth_kind == AuthKindUi::PublicKey && !has_key {
-        return Some("先导入私钥");
+    match buf.auth_kind {
+        AuthKindUi::Password if !has(buf.password_touched, &buf.password, presence.password) => {
+            Some("先填密码")
+        }
+        AuthKindUi::PublicKey if !has(buf.key_touched, &buf.key_data, presence.private_key) => {
+            Some("先导入私钥")
+        }
+        _ => None,
     }
-    None
 }
 
 /// 凭据存储的说明文案。抽成常量是为了让守护测试能直接钉住它 —— 尤其是
@@ -4804,8 +4813,11 @@ mod tests {
     /// 自证会变红:把 `create_credential_block` 里用户名那条判断删掉。
     #[test]
     fn create_credential_is_disabled_until_there_is_a_user_name() {
+        // 密码先填好:只让用户名这一个条件挡住按钮。
         let mut buf = EditorBuffer {
             user: "  ".into(),
+            password: "pw".into(),
+            password_touched: true,
             ..Default::default()
         };
         assert_eq!(
@@ -4817,6 +4829,37 @@ mod tests {
             create_credential_enabled(&mut buf, SecretPresence::default()),
             Some(true)
         );
+    }
+
+    /// 密码档同样要有密文:库里没有、也没填 → 禁用;已存会话没碰密码框
+    /// (编辑时恒为空)→ 可点;碰过且清空 → 禁用。
+    ///
+    /// 自证会变红:把 `create_credential_block` 里 Password 那一支删掉。
+    #[test]
+    fn create_credential_in_password_mode_needs_a_password() {
+        let none = SecretPresence::default();
+        let stored_pw = SecretPresence {
+            password: true,
+            ..Default::default()
+        };
+        let mut buf = EditorBuffer {
+            user: "root".into(),
+            ..Default::default()
+        };
+        assert_eq!(create_credential_enabled(&mut buf, none), Some(false));
+        assert_eq!(super::create_credential_block(&buf, none), Some("先填密码"));
+        assert_eq!(
+            create_credential_enabled(&mut buf, stored_pw),
+            Some(true),
+            "已存密码、没碰密码框 → 应可点"
+        );
+        buf.password_touched = true;
+        assert_eq!(
+            super::create_credential_block(&buf, stored_pw),
+            Some("先填密码"),
+            "碰过且清空 → 合并后没有密码"
+        );
+        assert_eq!(create_credential_enabled(&mut buf, stored_pw), Some(false));
     }
 
     /// 公钥档一把钥匙都没有(库里没有、也没导入)→ 禁用;库里有就可点。
@@ -4849,6 +4892,9 @@ mod tests {
             Some("先填用户名")
         );
         buf.user = "root".into();
+        assert_eq!(super::create_credential_block(&buf, none), Some("先填密码"));
+        buf.password = "pw".into();
+        buf.password_touched = true;
         assert_eq!(super::create_credential_block(&buf, none), None);
         buf.auth_kind = AuthKindUi::PublicKey;
         assert_eq!(
@@ -4875,6 +4921,8 @@ mod tests {
     fn clicking_create_credential_sets_the_transient_flag() {
         let mut buf = EditorBuffer {
             user: "root".into(),
+            password: "pw".into(),
+            password_touched: true,
             ..Default::default()
         };
         click_through_auth(&mut buf, &[], &["创建凭据"]);

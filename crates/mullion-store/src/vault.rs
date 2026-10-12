@@ -1096,6 +1096,10 @@ impl Vault {
     /// 比较 `password`/`passphrase`/`private_key` 三项,**不比 `proxy_password`**
     /// (它是会话的东西,不是身份的东西,设计 D4;`credential_secret` 的文档同一条)。
     /// 多条命中取 id 最小的,结果稳定。
+    ///
+    /// **不重读盘**(`&self`):扫的是内存里那份表,多开时可能是陈旧的。
+    /// 要「查重后再新建」请用 [`Vault::add_credential_dedup`] —— 它在同一次
+    /// 重读之后做查找与写入。
     pub fn find_credential_matching(
         &self,
         user: &str,
@@ -1114,6 +1118,23 @@ impl Vault {
             })
             .map(|c| c.id)
             .min()
+    }
+
+    /// F325:查重后新增。返回 `(凭据 id, 是否复用了已有的)`。
+    ///
+    /// 先按 F189 的规矩重读盘,**再**按 `draft` 的用户名 + 认证方式 + 密文找
+    /// 全等的已有凭据(同 [`Vault::find_credential_matching`]),命中就直接返回
+    /// 它的 id、什么都不写;没命中才新增。查找必须跑在重读之后:多开时另一个
+    /// 实例刚存下的同一份凭据只在盘上,对着内存里的陈旧表查会判「没有」,
+    /// 随后 `add_credential` 内部重读再追加一条 —— 一模一样的两条。
+    pub fn add_credential_dedup(&mut self, draft: CredentialDraft) -> (CredentialId, bool) {
+        self.sync_from_disk_if_untouched();
+        let empty = SecretEntry::default();
+        let secret = draft.secret.as_ref().unwrap_or(&empty);
+        if let Some(id) = self.find_credential_matching(&draft.user, &draft.kind, secret) {
+            return (id, true);
+        }
+        (self.add_credential(draft), false)
     }
 
     /// 新增凭据。id 取现有 max+1(空库从 1 起),**与会话/隧道号池互不影响**。
@@ -2092,6 +2113,39 @@ mod tests {
             v.find_credential_matching("alice", &AuthKind::Password, &q),
             Some(id)
         );
+    }
+
+    /// F325:多开时,另一个实例刚存下的全等凭据也要被认出来 —— 查重必须跑在
+    /// 重读之后。
+    ///
+    /// 自证会变红:删掉 `add_credential_dedup` 里的 `sync_from_disk_if_untouched()`
+    /// —— 查重对着陈旧表判「没有」,随后 `add_credential` 内部重读再追加一条。
+    #[test]
+    fn dedup_add_sees_a_credential_another_instance_just_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let b_id = {
+            let mut b = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+            let id = b.add_credential(cred_draft("root@h", "root", Some("pw1")));
+            b.save().unwrap();
+            id
+        };
+        let (id, reused) = a.add_credential_dedup(cred_draft("root@h", "root", Some("pw1")));
+        assert_eq!(id, b_id);
+        assert!(reused, "盘上已有全等凭据,应复用");
+        assert_eq!(a.credentials().len(), 1, "不该追加重复的一条");
+    }
+
+    /// 没有全等的才新增,并报 `reused = false`。
+    #[test]
+    fn dedup_add_creates_when_nothing_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        v.add_credential(cred_draft("a", "root", Some("pw1")));
+        let (id, reused) = v.add_credential_dedup(cred_draft("b", "root", Some("pw2")));
+        assert!(!reused);
+        assert_eq!(v.credentials().len(), 2);
+        assert!(v.credentials().iter().any(|c| c.id == id && c.name == "b"));
     }
 
     /// 多条命中取 id 最小,结果稳定。

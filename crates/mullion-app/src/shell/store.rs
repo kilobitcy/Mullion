@@ -274,6 +274,15 @@ impl SessionStore {
         self.vault.add_credential(draft)
     }
 
+    /// F325:重读后查重再新增,见 `Vault::add_credential_dedup`。写完由调用方
+    /// `save()` 落盘(复用时没写任何东西)。
+    pub fn add_credential_dedup(
+        &mut self,
+        draft: mullion_store::CredentialDraft,
+    ) -> (CredentialId, bool) {
+        self.vault.add_credential_dedup(draft)
+    }
+
     pub fn update_credential(
         &mut self,
         id: CredentialId,

@@ -15708,11 +15708,13 @@ impl ApplicationHandler<UserEvent> for App {
                             Ok((id, reused)) => {
                                 // 这一帧之间用户不可能切走编辑对象,但仍按 id 对一下:
                                 // 改错一张表单比不改更糟。
+                                let mut rewired = false;
                                 if self.ui.editor_id == req.editing_id {
                                     if let Some(buf) = self.ui.editor.as_mut() {
                                         buf.cred_source =
                                             crate::ui::session_manager::CredSourceUi::Shared;
                                         buf.credential_id = Some(id);
+                                        rewired = true;
                                     }
                                 }
                                 let name = store
@@ -15721,11 +15723,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     .find(|c| c.id == id)
                                     .map(|c| c.name.clone())
                                     .unwrap_or_default();
-                                let msg = if reused {
-                                    format!("已复用凭据「{name}」(内容相同,未新建)")
-                                } else {
-                                    format!("已创建凭据「{name}」,并改为引用")
-                                };
+                                let msg = credential_from_session_toast(&name, reused, rewired);
                                 self.ui.set_toast(crate::ui::toast::Kind::Ok, msg);
                                 mark_ui_dirty!(self.ui_dirty);
                             }
@@ -17494,6 +17492,9 @@ fn convert_inline_to_credential(
     if user.is_empty() {
         return Err("用户名不能为空".to_string());
     }
+    // 多开:先重读,下面读会话密文、算凭据名用的都是盘上最新那份
+    // (F189「写之前先重读」;查重本身在 `add_credential_dedup` 里再重读一次)。
+    store.refresh_from_disk();
     let stored = editing_id.and_then(|id| store.secret(id));
     let secret = merged_identity_secret(buf, stored);
     let kind = match buf.auth_kind {
@@ -17502,23 +17503,34 @@ fn convert_inline_to_credential(
             has_passphrase: secret.passphrase.is_some(),
         },
     };
-    if let Some(id) = store.vault().find_credential_matching(user, &kind, &secret) {
-        return Ok((id, true));
-    }
     let name = default_credential_name(user, &buf.host, store.credentials());
     // 全空不留壳(同 `merge_secret`)。
     let empty =
         secret.password.is_none() && secret.passphrase.is_none() && secret.private_key.is_none();
-    let id = store.add_credential(mullion_store::CredentialDraft {
+    let (id, reused) = store.add_credential_dedup(mullion_store::CredentialDraft {
         name,
         user: user.to_string(),
         kind,
         secret: (!empty).then_some(secret),
     });
+    if reused {
+        return Ok((id, true));
+    }
     store
         .save()
         .map_err(|e| format!("创建凭据失败:{e}"))
         .map(|_| (id, false))
+}
+
+/// F325-b 的成功提示。「并改为引用」只在编辑缓冲**真的**被改成引用时才说 ——
+/// 说了却没改,用户会以为会话已经换成凭据了。
+fn credential_from_session_toast(name: &str, reused: bool, rewired: bool) -> String {
+    let tail = if rewired { ",并改为引用" } else { "" };
+    if reused {
+        format!("已复用凭据「{name}」(内容相同,未新建){tail}")
+    } else {
+        format!("已创建凭据「{name}」{tail}")
+    }
 }
 
 /// 施加一次 `~/.ssh/config` 导入(F2)。返回真正建出来的会话数。
@@ -18027,21 +18039,21 @@ mod tests {
         arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
         autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
         clip_still_matches_what_was_pasted, cloud_backoff_ms, convert_inline_to_credential,
-        credential_delete_error, decide_paste, dialing_from, dismiss_areas, dismiss_verdict,
-        download_job, draft_baseline_is_in_vault, drive_attach_checks_of, effective_focus_of,
-        expand_tilde, files_owner_generation_of, files_path_editing_of, files_start_dir,
-        finish_password_change, follow_for_clip_mode, font_px_for, has_real_action,
-        history_rows_of, history_sync, host_for_fresh, ime_cursor_area, ime_goes_to_terminal_of,
-        leaf_identity_of, new_pane_emulator, next_auto_dial, next_panel_selection_index,
-        opt_buf_dirty, pane_reports_of, pane_still_wanted, paste_seq_is_stale, place_dead_pane_of,
-        project_lamps_have_audience, reattach_pane, rehost_pane, resolved_scrollback,
-        session_manager_dirty, should_check_attach, should_pop_cloud_error,
-        should_pop_transfer_error, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
-        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
-        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, DialTicket, HistorySync,
-        Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SshConfig, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
-        DISMISS_ORDER,
+        credential_delete_error, credential_from_session_toast, decide_paste, dialing_from,
+        dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
+        drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
+        files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
+        font_px_for, has_real_action, history_rows_of, history_sync, host_for_fresh,
+        ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator,
+        next_auto_dial, next_panel_selection_index, opt_buf_dirty, pane_reports_of,
+        pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
+        reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
+        should_check_attach, should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of,
+        sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
+        AttachVerdict, DialTicket, HistorySync, Modal, OpFollow, PasteDecision, RehostKind,
+        RestoredTab, SshConfig, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
+        CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -30518,6 +30530,8 @@ mod tests {
             "convert_inline_to_credential(store, req.editing_id, &req.buffer)",
             "CredSourceUi::Shared;",
             "buf.credential_id = Some(id);",
+            "rewired = true;",
+            "credential_from_session_toast(&name, reused, rewired)",
         ] {
             assert!(body.contains(needle), "施加分支里缺 `{needle}`");
         }
@@ -30660,6 +30674,106 @@ mod tests {
             Ok(_) => panic!("用户名为空不该建出凭据"),
         }
         assert!(store.credentials().is_empty());
+    }
+
+    /// 多开:另一个实例刚存下的凭据只在盘上。转换必须先重读 —— 否则查重、
+    /// 起名都对着陈旧表:全等的会被重复新建,撞名的不加序号。
+    ///
+    /// 自证会变红:删掉 `convert_inline_to_credential` 里的 `store.refresh_from_disk()`
+    /// (起名对陈旧表算,得到不带 ` (2)` 的名字)。
+    #[test]
+    fn converting_sees_credentials_another_instance_just_saved() {
+        let (dir, mut a) = tmp_store();
+        let b_id = {
+            let mut b =
+                crate::shell::store::SessionStore::open(dir.path().to_path_buf(), &FixedKey)
+                    .expect("open b");
+            let (id, _) = convert_inline_to_credential(&mut b, None, &inline_buf("root", "pw-1"))
+                .expect("b 建");
+            id
+        };
+        // **先**转一份不同密码的:这是 A 在 B 写盘之后第一次碰库,起名必须
+        // 对着重读后的表避让(查重入口里那次重读来得太晚,救不了名字)。
+        let (id2, reused2) =
+            convert_inline_to_credential(&mut a, None, &inline_buf("root", "pw-2")).expect("a 一");
+        assert!(!reused2);
+        let name = a
+            .credentials()
+            .iter()
+            .find(|c| c.id == id2)
+            .map(|c| c.name.clone());
+        assert_eq!(name.as_deref(), Some("root@10.0.0.5 (2)"));
+        // 同内容 → 复用 B 那条。
+        let (id, reused) =
+            convert_inline_to_credential(&mut a, None, &inline_buf("root", "pw-1")).expect("a 二");
+        assert_eq!((id, reused), (b_id, true));
+        assert_eq!(a.credentials().len(), 2);
+    }
+
+    /// 已存公钥会话带口令、编辑时口令框没碰(恒为空)→ 生成的凭据
+    /// `has_passphrase` 仍为 true(跟合并后的密文走,不跟空着的缓冲走)。
+    ///
+    /// 自证会变红:把 kind 的 `has_passphrase` 改成
+    /// `buf.passphrase_touched && !buf.passphrase.is_empty()`。
+    #[test]
+    fn converting_an_untouched_saved_key_session_keeps_has_passphrase() {
+        let (_dir, mut store) = tmp_store();
+        let mut saved = inline_buf("root", "");
+        saved.password_touched = false;
+        saved.auth_kind = crate::ui::session_manager::AuthKindUi::PublicKey;
+        saved.key_data = "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n".into();
+        saved.key_touched = true;
+        saved.passphrase = "pp".into();
+        saved.passphrase_touched = true;
+        let sid = store.add(
+            crate::ui::session_manager::build_draft(&saved).expect("build"),
+            "2026-10-12T00:00:00Z",
+        );
+        let mut reopened = saved.clone();
+        reopened.key_data = String::new();
+        reopened.key_touched = false;
+        reopened.passphrase = String::new();
+        reopened.passphrase_touched = false;
+        let (id, _) =
+            convert_inline_to_credential(&mut store, Some(sid), &reopened).expect("应成功");
+        assert_eq!(
+            store
+                .credentials()
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.kind.clone()),
+            Some(mullion_store::AuthKind::PublicKey {
+                has_passphrase: true
+            })
+        );
+        assert_eq!(
+            store
+                .credential_secret(id)
+                .and_then(|s| s.passphrase.clone())
+                .as_deref(),
+            Some("pp")
+        );
+    }
+
+    /// 「并改为引用」只在缓冲真的改成引用时才说。
+    #[test]
+    fn the_toast_mentions_rewiring_only_when_it_happened() {
+        assert_eq!(
+            credential_from_session_toast("r@h", false, true),
+            "已创建凭据「r@h」,并改为引用"
+        );
+        assert_eq!(
+            credential_from_session_toast("r@h", false, false),
+            "已创建凭据「r@h」"
+        );
+        assert_eq!(
+            credential_from_session_toast("r@h", true, true),
+            "已复用凭据「r@h」(内容相同,未新建),并改为引用"
+        );
+        assert_eq!(
+            credential_from_session_toast("r@h", true, false),
+            "已复用凭据「r@h」(内容相同,未新建)"
+        );
     }
 
     /// F74/D7:删被引用的凭据被拒时,状态栏那句话里要有**引用者的会话名**。

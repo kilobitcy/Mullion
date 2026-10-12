@@ -576,6 +576,8 @@ impl UiState {
         // `probe_form` 揣着三个明文凭据字段的表单副本(见字段文档注释),
         // 窗口一关,编辑这件事就结束了,不该让它继续留在内存里。
         self.probe_form = None;
+        // F325-b:「创建凭据」请求里同样揣着整份表单(含明文),同一理由。
+        self.credential_from_session_request = None;
         self.probe_cancel = true;
         self.key_candidates_ready = false;
         // F93:上一次打开时留下的拖拽提示(如「已取第一个文件,忽略其余
@@ -1501,6 +1503,24 @@ mod tests {
             st.probe_form.is_none(),
             "关闭会话管理器必须清空 probe_form,否则含明文凭据的表单副本会滞留内存"
         );
+    }
+
+    /// F325-b:关窗时「创建凭据」请求(含明文表单克隆)也要清掉。
+    ///
+    /// 自证会变红:删掉 `close_session_manager` 里
+    /// `self.credential_from_session_request = None;`。
+    #[test]
+    fn close_session_manager_clears_the_create_credential_request() {
+        let mut st = UiState {
+            session_manager_open: true,
+            credential_from_session_request: Some(session_manager::CredentialFromSession {
+                editing_id: None,
+                buffer: session_manager::EditorBuffer::default(),
+            }),
+            ..Default::default()
+        };
+        st.close_session_manager();
+        assert!(st.credential_from_session_request.is_none());
     }
 
     /// F228:拨测结果卡片与 `last_error` 卡片互斥,而 `last_error` 是**粘性**的
