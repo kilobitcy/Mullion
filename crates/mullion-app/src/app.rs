@@ -2414,6 +2414,10 @@ pub struct App {
     /// F125:最后一次**键盘输入**的时刻,光标闪烁相位从它起算(打字重置相位)。
     /// 用 `Instant` 而不是 `u64`:与 `next_frame_at`/`sync_timeout_wake` 同一套时钟。
     last_input_at: Instant,
+    /// F334:最近一次出帧时光标相位。闪烁到点的唤醒本身不脏任何东西(终端没字节、
+    /// egui 没请求),不拿它和当前相位比的话,那一帧被判 Idle,翻转要等别的
+    /// 事件顺带弄脏才被画出来 —— 空闲时间隔忽长忽短。
+    presented_blink_on: bool,
     /// F125:窗口有没有焦点。失焦时不闪(也就不需要周期唤醒),与 Windows 上
     /// 其它终端的惯例一致。
     window_focused: bool,
@@ -3302,6 +3306,7 @@ impl App {
             limiter: FrameLimiter::new(16), // ~60fps(T3)
             next_frame_at: None,
             last_input_at: Instant::now(),
+            presented_blink_on: true,
             window_focused: true,
             proxy,
             known_hosts,
@@ -14745,7 +14750,11 @@ impl ApplicationHandler<UserEvent> for App {
                     (xs.up + xs.down) as u64,
                     xs.bytes_total.saturating_sub(xs.bytes_done),
                 );
-                let dirty = crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty);
+                // F334:相位翻转算脏(过帧闸,不绕 T3/T7)。
+                let blink_flipped = self.active_ws().is_some()
+                    && self.blink_on(Instant::now()) != self.presented_blink_on;
+                let ui_or_blink = self.ui_dirty || blink_flipped;
+                let dirty = crate::frame::frame_is_dirty(terminal_dirty, ui_or_blink);
                 let action = self.limiter.plan(dirty, now);
                 // F18 自动滚动只在**真正出帧**的那一轮施加,见 match 之后的说明。
                 let presented = matches!(action, RedrawAction::Present);
@@ -15254,6 +15263,7 @@ impl ApplicationHandler<UserEvent> for App {
                             // `self.active_ws()`,这几个都是 `&self` 方法,借用会跟下面
                             // `self.active.as_mut()` 冲突。
                             let blink_on = self.blink_on(Instant::now());
+                            self.presented_blink_on = blink_on;
                             let a = self.active.as_mut().expect("上面刚判过 is_some");
                             // D1:两种宿主互斥(见上面 `files_owner_generation`
                             // 的说明),`taken_files` 只会有其中一份非空数据 ——
@@ -34294,7 +34304,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             binding.trim(),
-            "crate::frame::frame_is_dirty(terminal_dirty, self.ui_dirty)",
+            "crate::frame::frame_is_dirty(terminal_dirty, ui_or_blink)",
             "launcher 态又开了一条兜底判据:{binding}"
         );
     }
