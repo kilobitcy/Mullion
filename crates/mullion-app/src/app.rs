@@ -9983,6 +9983,11 @@ impl App {
     /// 覆盖」时框里列的那些名字(只有它们预设覆盖,见 `paste_files::enqueue`)。批次登记在 `paste_batches`,回填只在 `TransferDone` 里
     /// 等整批落地之后做(T11:判定不从这里——调用点——起算)。
     fn enqueue_paste_files(&mut self, plan: crate::paste_files::PastePlan, confirmed: &[String]) {
+        // 属主标签已经关了:冲突框开着时用户关掉标签再点「全部覆盖」,入队的话
+        // job 挂在一个死世代上,传完也没有输入行可回填。
+        if self.tabs.by_generation(plan.generation).is_none() {
+            return;
+        }
         let jobs = crate::paste_files::enqueue(&mut self.transfer.queue, &plan, confirmed);
         let mut batch_jobs = Vec::with_capacity(jobs.len());
         for (id, f, remote) in jobs {
@@ -10052,7 +10057,7 @@ impl App {
     fn toast_paste_abandoned(&mut self, failed: usize) {
         self.ui.set_toast(
             crate::ui::toast::Kind::Warn,
-            format!("有 {failed} 个文件没传成(失败/取消/跳过),这一批没有回填路径"),
+            crate::paste_files::abandoned_toast(failed),
         );
         self.request_ui_redraw();
     }
@@ -33240,6 +33245,33 @@ mod tests {
                 "paste_files 在预检回来之前就入队了({banned})—— 冲突框形同虚设"
             );
         }
+    }
+
+    /// **F330:入队前确认属主标签还在。**
+    ///
+    /// 冲突框开着时用户可以把发起的那个标签关掉,再点「全部覆盖」——入队的话
+    /// job 挂在死世代上照传,传完没有输入行可回填,批次也没人收。
+    ///
+    /// 自证会变红:删掉 `enqueue_paste_files` 开头的 `by_generation` 检查,或挪到
+    /// `paste_files::enqueue(` 之后。
+    #[test]
+    fn enqueue_paste_files_drops_a_plan_whose_tab_is_gone() {
+        let body = body_of(prod_src(), concat!("fn enqueue_", "paste_files(&mut self"));
+        let check = body
+            .find(concat!(
+                "if self.tabs.by_generation(plan.generation)",
+                ".is_none() {"
+            ))
+            .expect("enqueue_paste_files 没有检查属主标签还在不在");
+        assert!(
+            brace_balanced_arm(&body[check + body[check..].find('{').unwrap()..])
+                .contains("return"),
+            "标签不在了却没有 return"
+        );
+        let push = body
+            .find(concat!("paste_files::", "enqueue("))
+            .expect("enqueue_paste_files 不再调 paste_files::enqueue —— 锚点失效");
+        assert!(check < push, "属主检查落在入队之后");
     }
 
     /// **F330:同一批里的同名文件在预检之前就拒掉。**

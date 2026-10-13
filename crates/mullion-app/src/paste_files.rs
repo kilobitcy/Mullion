@@ -183,13 +183,23 @@ pub fn enqueue(
 /// F332：一条 job 收工后，对批次来说算不算「按计划落地」。
 ///
 /// `None` = 还没收尾（挂在冲突上等用户拿主意），这次不报给批次。只有 `Done`
-/// **且没走「重命名」**才算成：改名之后文件不在我们要回填的那个路径上，
-/// 回填就是一个指向别的文件（或不存在）的 `@` 引用。
+/// **且没走「重命名」/「跳过」**才算成：改名之后文件不在我们要回填的那个路径上，
+/// 回填就是一个指向别的文件（或不存在）的 `@` 引用；`run_transfer` 见
+/// `Some(Skip)` 且目标已存在时直接 `Ok(())` 收工 —— 状态是 `Done`，字节却没传。
 pub fn landed_as_planned(state: &JobState, resolved: Option<Conflict>) -> Option<bool> {
     if !state.is_finished() {
         return None;
     }
-    Some(*state == JobState::Done && resolved != Some(Conflict::Rename))
+    Some(
+        *state == JobState::Done
+            && !matches!(resolved, Some(Conflict::Rename) | Some(Conflict::Skip)),
+    )
+}
+
+/// F332：一批里有没按计划落地的 —— 一个路径都不回填时的提示。**不说「没传成」**：
+/// 走了「重命名」的那条其实已经以新名字传上去了，只是不在要回填的路径上。
+pub fn abandoned_toast(failed: usize) -> String {
+    format!("有 {failed} 个文件没有按原名传到位(失败/取消/跳过/改名),这一批没有回填路径")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -568,7 +578,8 @@ mod tests {
 
     /// F332：只有 `Done` 且没改名才算落地；没收尾（挂在冲突上）不报。
     ///
-    /// 自证会变红：去掉 `resolved != Some(Conflict::Rename)`，或让未收尾的也返回 `Some`。
+    /// 自证会变红：从 `matches!` 里去掉 `Some(Conflict::Rename)` 或 `Some(Conflict::Skip)`，
+    /// 或让未收尾的也返回 `Some`。
     #[test]
     fn only_a_done_job_that_kept_its_name_counts_as_landed() {
         assert_eq!(landed_as_planned(&JobState::Conflict, None), None);
@@ -583,6 +594,11 @@ mod tests {
             Some(false),
             "改了名的文件不在要回填的路径上"
         );
+        assert_eq!(
+            landed_as_planned(&JobState::Done, Some(Conflict::Skip)),
+            Some(false),
+            "预设跳过的 job 撞上已存在的目标是 Ok(()) 收工 —— Done 了但没传"
+        );
         for s in [
             JobState::Skipped,
             JobState::Canceled,
@@ -590,6 +606,18 @@ mod tests {
         ] {
             assert_eq!(landed_as_planned(&s, None), Some(false), "{s:?}");
         }
+    }
+
+    /// F332：放弃回填的提示不夸大 —— 改了名的那条其实已经传上去了，说「没传成」
+    /// 会让用户以为节点上没有这个文件、再传一遍。
+    ///
+    /// 自证会变红：把 `abandoned_toast` 的措辞改回「有 N 个文件没传成…」。
+    #[test]
+    fn the_abandoned_toast_does_not_claim_nothing_was_uploaded() {
+        let s = abandoned_toast(2);
+        assert!(s.contains("2 个文件"), "{s}");
+        assert!(s.contains("没有回填路径"), "{s}");
+        assert!(!s.contains("没传成"), "改了名的文件已经传上去了:{s}");
     }
 
     /// F332：不经 `TransferDone` 收尾的 job（排队中被取消 / 跳过）要能结算成
