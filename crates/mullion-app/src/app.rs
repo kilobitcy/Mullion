@@ -9823,10 +9823,12 @@ impl App {
             .and_then(|t| t.content.as_terminal_mut())
             .and_then(|t| t.ws.pane_mut(pane))
             .map(|p| {
-                // 绝对路径 + 一个空格,不带回车:用户接着打字就是自然的下一
-                // 句话,要不要发是他自己的事。
-                let mut out = path.clone().into_bytes();
-                out.push(b' ');
+                // `@绝对路径` + 一个空格,不带回车:`@` 是 Claude Code 的文件
+                // 引用语法,末尾空格含在 `at_refs_line` 里;用户接着打字就是
+                // 自然的下一句话,要不要发是他自己的事。截图文件名是我们生成
+                // 的、不含空白,`bare` 恒空,忽略即可。
+                let (line, _bare) = crate::paste_files::at_refs_line(std::slice::from_ref(&path));
+                let out = line.into_bytes();
                 // 与粘贴同理(F17):先回底部,否则「贴了但看不到」。
                 p.emulator.scroll_to_bottom();
                 let _ = p.pty.write(out);
@@ -32749,6 +32751,27 @@ mod tests {
                 && !body.contains("active_ws")
                 && !body.contains("focused_mut"),
             "回填走了「当前活动标签/焦点分屏」—— 用户切走之后路径会打进别的 shell"
+        );
+    }
+
+    /// **F331:截图回填的路径必须走 `at_refs_line`(带 `@` 前缀)。**
+    ///
+    /// 裸路径在 Claude Code 里只是一串字符,`@` 才是文件引用;回填绕开
+    /// `at_refs_line` 的话,纯函数单测全绿而截图那条路悄悄退回裸路径。
+    ///
+    /// 自证会变红:把回填那两行换回直接 `path` 转字节再补一个空格。
+    #[test]
+    fn shot_backfill_goes_through_at_refs_line() {
+        let src = include_str!("app.rs");
+        let body = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
+        assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
+        assert!(
+            body.contains(concat!("at_refs", "_line(")),
+            "截图回填没有走 at_refs_line,路径不带 @"
+        );
+        assert!(
+            !body.contains(concat!("path.clone().into", "_bytes()")),
+            "截图回填又退回了裸路径字节"
         );
     }
 
