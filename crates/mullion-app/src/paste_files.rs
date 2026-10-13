@@ -82,8 +82,11 @@ pub struct PastePlan {
     pub host_ix: Option<usize>,
     /// 目标目录（用户配置原样；空 = `shot::DEFAULT_DIR`，由 `remote_join` 落回）。
     pub dir: String,
-    /// 只有文件，文件夹在发起时已经剔掉并报过名了。
+    /// 只有文件，文件夹在发起时已经剔掉了。
     pub files: Vec<Picked>,
+    /// 被跳过的文件夹名。随计划带到入队那一刻的提示里 —— 提示框只有一格，
+    /// 发起时报一次的话，几百毫秒后就被「正在上传」盖掉，用户看不见。
+    pub skipped_dirs: Vec<String>,
 }
 
 impl PastePlan {
@@ -431,6 +434,7 @@ mod tests {
             host_ix: Some(1),
             dir: dir.into(),
             files: names.iter().map(|n| file(n, 10)).collect(),
+            skipped_dirs: Vec::new(),
         }
     }
 

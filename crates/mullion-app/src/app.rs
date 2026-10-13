@@ -334,6 +334,15 @@ pub enum UserEvent {
         pane: PaneId,
         result: Result<String, String>,
     },
+    /// F330:终端粘贴文件的目标预检回来了。`Ok` 是落点目录里**已存在**的那些
+    /// 文件名;`Err` 是预检本身失败(开不了通道 / `exists` 出错)。
+    ///
+    /// 属主世代、回填 pane、机器、目录都冻在 `plan` 里随事件带回(同
+    /// `ShotUploaded` 的理由),不在回来时取「当前活动标签的焦点分屏」。
+    PasteFilesChecked {
+        plan: crate::paste_files::PastePlan,
+        result: Result<Vec<String>, String>,
+    },
     /// F52:一批传输展开完了(目录已经递归成一条条文件级 job),可以入队。
     /// **展开在后台做**:远端目录要走网络列目录,本地目录要走磁盘遍历,
     /// 都不能压在窗口线程上。`Err` = 展开阶段就失败(目录读不了 / 落点名在
@@ -511,6 +520,11 @@ struct TransferSpec {
     /// F252:传完点亮哪一条。**计划那一刻就冻在这里**,收工时只照抄 ——
     /// 传输可以跑很久,那时用户早换目录了(T11)。
     arrival: (mullion_ssh::sftp::RemotePath, mullion_ssh::sftp::RemotePath),
+    /// F330:钉死开在哪台机器上。`None` = 跟侧栏 sftp 那台(`sftp_host_ix`,
+    /// 文件面板发起的传输一律如此);终端粘贴文件填**发起时焦点分屏那台** ——
+    /// 预检开在那台上、回填的 `@路径` 也打进那台的 shell,传到侧栏那台的话
+    /// 路径看起来完全正常,文件却在另一台机器上(F132 同形)。
+    pin_host: Option<usize>,
 }
 
 /// 一次在途自动化的把手。三条通道都是 `Option`,因为每一条都是**一次性边**:
@@ -2584,6 +2598,10 @@ pub struct App {
     /// **不用时间戳兜底撞名**:`/tmp` 是所有用户共用的,同一秒里连贴两张
     /// (完全正常的操作)会静默互相覆盖 —— 用户看到的是「第一张图不见了」。
     shot_seq: u64,
+    /// F332:终端粘贴文件的批次汇合。整批全部落地才回填 `@路径`。
+    paste_batches: crate::paste_files::BatchTracker,
+    /// F332:批次号。只增不回收,只用来区分批次。
+    paste_batch_seq: u64,
     /// F61/F62:会话外观的解析缓存。**只在会话/分组变更后 rebuild**,
     /// 绝不在渲染里现算(陷阱 T3,见 `ui::badge::AppearanceCache`)。
     appearance: crate::ui::badge::AppearanceCache,
@@ -3334,6 +3352,8 @@ impl App {
             ime_cursor_area: None,
             pending_paste: None,
             shot_seq: 0,
+            paste_batches: Default::default(),
+            paste_batch_seq: 0,
             appearance: Default::default(),
             probe_epoch: 0,
             probe_task: None,
@@ -3386,6 +3406,8 @@ impl App {
         if let Some(tab) = self.tabs.close_active() {
             // F55:同 `TabAction::Close` —— 标签的传输随标签一起作废。
             self.cancel_transfers_of(tab.content.generation());
+            // F332:它的粘贴批次也作废(输入行没了,不回填也不该再报「没回填」)。
+            self.paste_batches.drop_generation(tab.content.generation());
             wind_down(tab);
         }
     }
@@ -7881,6 +7903,12 @@ impl App {
             mark_ui_dirty!(self.ui_dirty);
             return;
         }
+        // F330:终端粘贴文件的冲突框点了「全部覆盖」—— 只是入队,不发远端
+        // 写请求。计划里冻着自己的世代,`generation` 参数不参与。
+        if let FileOp::PasteFiles { plan } = op {
+            self.enqueue_paste_files(plan, true);
+            return;
+        }
         // F53:编辑冲突的处置。同上,不走远端写操作那条通用路径 ——
         // 三条出路里有两条根本不发请求。
         if let FileOp::ResolveEdit { key, choice } = op {
@@ -7949,6 +7977,7 @@ impl App {
                 FileOp::Resolve { .. } | FileOp::ResolveEdit { .. } | FileOp::Paste { .. } => {
                     Err("内部错误:冲突处置/粘贴不该走到这里".to_string())
                 }
+                FileOp::PasteFiles { .. } => Err("内部错误:终端粘贴文件不该走到这里".to_string()),
             };
             let _ = proxy.send_event(UserEvent::SftpOpDone {
                 generation,
@@ -8747,7 +8776,8 @@ impl App {
                 self.transfer.queue.cancel(id);
                 continue;
             };
-            let Some(conn) = tab.content.sftp_connection_for(tab.content.sftp_host_ix()) else {
+            let host = spec.pin_host.or(tab.content.sftp_host_ix());
+            let Some(conn) = tab.content.sftp_connection_for(host) else {
                 self.transfer.queue.finish(id, Err("连接已断开".into()));
                 continue;
             };
@@ -9798,12 +9828,289 @@ impl App {
         );
     }
 
+    /// F330:终端里裸 `Ctrl+V`,剪贴板里是一批文件(资源管理器里复制的)——
+    /// 预检落点有没有同名 → 进全局传输队列 → **整批全部落地**之后才把
+    /// `@路径` 打进这块 pane 的输入行(F332)。
+    ///
+    /// 这里**只发起预检,一条都不入队**:有同名要先问用户,问之前开传就是
+    /// 静默覆盖(F55)。入队在 `accept_paste_files_checked`(没同名)或冲突框
+    /// 点了「全部覆盖」之后。
+    ///
+    /// 预检**另开一条 sftp channel**,不蹭侧栏那条,理由同 `paste_screenshot`
+    /// (F132):侧栏那条未必开在焦点分屏这台机器上。
+    fn paste_files(&mut self, files: Vec<std::path::PathBuf>) {
+        let Some(tab) = self.tabs.active() else {
+            return;
+        };
+        let generation = tab.content.generation();
+        // 只有终端标签有输入行可以回填(同 `paste_screenshot`)。
+        let Some(pane) = tab.content.as_terminal().map(|t| t.ws.focus()) else {
+            return;
+        };
+        let host_ix = tab.content.focused_pane_host_ix();
+        let Some(conn) = tab.content.sftp_connection_for(host_ix) else {
+            return;
+        };
+        let dir = tab
+            .content
+            .as_terminal()
+            .and_then(|t| t.sftp_screenshot_dir.clone())
+            .unwrap_or_default();
+
+        // 本地 stat。读不到的(复制之后被删/挪走了)整批不传:回填是「全有
+        // 或全无」(F332),缺一个就不该开始。
+        let mut picked = Vec::new();
+        for local in files {
+            let name = local
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match std::fs::metadata(&local) {
+                Ok(m) => picked.push(crate::paste_files::Picked {
+                    local,
+                    name,
+                    is_dir: m.is_dir(),
+                    size: m.len(),
+                }),
+                Err(e) => {
+                    self.ui.set_error(format!(
+                        "读不到本地文件 {}:{e},这一批没有上传",
+                        local.display()
+                    ));
+                    return;
+                }
+            }
+        }
+        let (files, skipped_dirs) = crate::paste_files::split_picked(picked);
+        if files.is_empty() {
+            // 全是文件夹(或剪贴板里什么都没有):不静默,说清楚为什么没动。
+            let msg = if skipped_dirs.is_empty() {
+                "剪贴板里没有可上传的文件".to_string()
+            } else {
+                format!("暂不支持上传文件夹,已跳过:{}", skipped_dirs.join("、"))
+            };
+            self.ui.set_toast(crate::ui::toast::Kind::Warn, msg);
+            return;
+        }
+        let plan = crate::paste_files::PastePlan {
+            generation,
+            pane,
+            host_ix,
+            dir,
+            files,
+            skipped_dirs,
+        };
+        let targets: Vec<(String, String)> = plan
+            .files
+            .iter()
+            .map(|f| (f.name.clone(), plan.remote_of(&f.name)))
+            .collect();
+
+        let proxy = self.proxy.clone();
+        let task = self._runtime.spawn(async move {
+            let result = async {
+                let client = mullion_ssh::sftp::SftpClient::open(conn)
+                    .await
+                    .map_err(|e| format!("开 SFTP 通道失败:{e}"))?;
+                let mut existing = Vec::new();
+                for (name, remote) in targets {
+                    let rp = mullion_ssh::sftp::RemotePath::from_bytes(remote.clone().into_bytes());
+                    // 出错就整批报错,**不当成「不存在」**:那样等于没问过
+                    // 用户就开传(`AfterCheck::Fail` 的理由)。
+                    if client
+                        .exists(&rp)
+                        .await
+                        .map_err(|e| format!("检查 {remote} 是否已存在时出错:{e}"))?
+                    {
+                        existing.push(name);
+                    }
+                }
+                Ok(existing)
+            }
+            .await;
+            let _ = proxy.send_event(UserEvent::PasteFilesChecked { plan, result });
+        });
+        self.track_sftp_task(generation, task);
+        // 用户按了键就是接管(同 `paste_screenshot`):在按键这一刻掐,不在
+        // 结果回来时掐(T11 同族)。
+        self.user_took_over();
+        self.ui.set_toast(
+            crate::ui::toast::Kind::Busy,
+            "正在检查节点上有没有同名文件…",
+        );
+    }
+
+    /// F330:预检回来了。按计划里冻结的世代路由 —— 标签没了就丢(它的
+    /// 输入行也没了,传上去没有地方回填)。
+    fn accept_paste_files_checked(
+        &mut self,
+        plan: crate::paste_files::PastePlan,
+        result: Result<Vec<String>, String>,
+    ) {
+        if self.tabs.by_generation(plan.generation).is_none() {
+            return;
+        }
+        match crate::paste_files::after_check(&plan.names(), result) {
+            crate::paste_files::AfterCheck::Enqueue => self.enqueue_paste_files(plan, false),
+            crate::paste_files::AfterCheck::Ask(names) => {
+                // 已经有别的文件框开着(一次只开一个):不能盖掉它 —— 那个框
+                // 可能挂着一条等处置的 job。让用户重贴一次,好过静默丢掉
+                // 或者把别人的框挤掉。
+                if self.ui.files_dialog.is_some() {
+                    self.ui.set_error(
+                        "另一个确认框还开着,这批文件没有上传;处理完那个框后请重新粘贴".to_string(),
+                    );
+                    return;
+                }
+                self.ui.files_dialog =
+                    Some(crate::ui::files_dialog::FilesDialog::PasteFilesConflict { names, plan });
+                mark_ui_dirty!(self.ui_dirty);
+            }
+            crate::paste_files::AfterCheck::Fail(e) => {
+                self.ui
+                    .set_error(format!("上传前检查目标失败,这批文件没有上传:{e}"));
+            }
+        }
+    }
+
+    /// F330/F332:整批进全局传输队列。`overwrite` = 用户在冲突框里点了
+    /// 「全部覆盖」。批次登记在 `paste_batches`,回填只在 `TransferDone` 里
+    /// 等整批落地之后做(T11:判定不从这里——调用点——起算)。
+    fn enqueue_paste_files(&mut self, plan: crate::paste_files::PastePlan, overwrite: bool) {
+        let jobs = crate::paste_files::enqueue(&mut self.transfer.queue, &plan, overwrite);
+        let mut batch_jobs = Vec::with_capacity(jobs.len());
+        for (id, f, remote) in jobs {
+            let remote_path =
+                mullion_ssh::sftp::RemotePath::from_bytes(remote.clone().into_bytes());
+            // F252 的落点标记:终端标签没有面板可点亮时照抄也无害;开着侧栏
+            // 且正停在这个目录上时,传完那几条会亮起来。
+            let arrival = (
+                remote_path.parent(),
+                mullion_ssh::sftp::RemotePath::from_bytes(f.name.clone().into_bytes()),
+            );
+            self.transfer.specs.insert(
+                id,
+                TransferSpec {
+                    dir: crate::files::queue::Direction::Upload,
+                    generation: plan.generation,
+                    local: f.local,
+                    remote: remote_path,
+                    arrival,
+                    pin_host: plan.host_ix,
+                },
+            );
+            batch_jobs.push((id, remote));
+        }
+        let n = batch_jobs.len();
+        self.paste_batch_seq += 1;
+        self.paste_batches
+            .open(self.paste_batch_seq, plan.generation, plan.pane, batch_jobs);
+        if plan.skipped_dirs.is_empty() {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Busy,
+                format!("正在上传 {n} 个文件,进度见下方传输队列"),
+            );
+        } else {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!(
+                    "正在上传 {n} 个文件,进度见下方传输队列;暂不支持文件夹,已跳过:{}",
+                    plan.skipped_dirs.join("、")
+                ),
+            );
+        }
+        self.request_ui_redraw();
+    }
+
+    /// F332:不经 `TransferDone` 就收了尾的 job(排队中被取消、冲突框里点了
+    /// 跳过、worker 没起来、整栏被清掉)。每帧跟在 `pump_transfers` 后面跑一次
+    /// —— 后者自己就会不发事件地把 job 收掉。没有在途批次时是一次空表遍历。
+    ///
+    /// 这里只可能结算出 `Abandoned`(`BatchTracker::sweep` 只报失败);
+    /// 回填只在 `TransferDone` 里(T11)。
+    fn sweep_paste_batches(&mut self) {
+        let queue = &self.transfer.queue;
+        let done = self.paste_batches.sweep(|job| {
+            queue.get(job).is_none_or(|j| {
+                crate::paste_files::landed_as_planned(&j.state, j.resolved) == Some(false)
+            })
+        });
+        for d in done {
+            if let crate::paste_files::BatchDone::Abandoned { failed } = d {
+                self.toast_paste_abandoned(failed);
+            }
+        }
+    }
+
+    /// F332:一批里有没落地的 —— 一个路径都不回填,并说出来(不静默)。
+    fn toast_paste_abandoned(&mut self, failed: usize) {
+        self.ui.set_toast(
+            crate::ui::toast::Kind::Warn,
+            format!("有 {failed} 个文件没传成(失败/取消/跳过),这一批没有回填路径"),
+        );
+        self.request_ui_redraw();
+    }
+
+    /// F332:整批落地之后,把 `@路径` 打进发起时那块 pane。
+    fn finish_paste_files(&mut self, generation: u64, pane: PaneId, paths: Vec<String>) {
+        let (landed, bare) = self.backfill_refs(generation, pane, &paths);
+        if !landed {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("文件已传到 {}(原来那块分屏不在了)", paths.join(" ")),
+            );
+        } else if !bare.is_empty() {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!(
+                    "路径含空格,Claude Code 的 @ 引用会在空格处断开,已按普通路径填入:{}",
+                    bare.join(" ")
+                ),
+            );
+        } else {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Ok,
+                format!("{} 个文件已上传,路径已填入", paths.len()),
+            );
+        }
+        self.request_ui_redraw();
+    }
+
+    /// F209/F331:把一批远端路径以 `@路径` 的形式打进某块 pane 的输入行。
+    /// 截图与文件粘贴共用这一份(两份迟早分叉)。
+    ///
+    /// 返回 `(落进去了没有, 没能带 @ 的路径)`;提示由调用方各自出 —— 两边的
+    /// 文案不一样。这里**不** `user_took_over()`:那一下在按键当时就做过了
+    /// (而且这块 pane 未必还是焦点,在这里掐会掐错人)。
+    fn backfill_refs(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        paths: &[String],
+    ) -> (bool, Vec<String>) {
+        // F125:光标相位复位——这一下之后输入行会动,光标该是亮的。
+        self.last_input_at = Instant::now();
+        // `@绝对路径` 空格分隔 + 末尾一个空格,不带回车:`@` 是 Claude Code
+        // 的文件引用语法;用户接着打字就是自然的下一句话,要不要发是他自己
+        // 的事。含空白的路径不带 `@`(会在空格处断开),由 `bare` 报回去。
+        let (line, bare) = crate::paste_files::at_refs_line(paths);
+        let landed = self
+            .tabs
+            .by_generation_mut(generation)
+            .and_then(|t| t.content.as_terminal_mut())
+            .and_then(|t| t.ws.pane_mut(pane))
+            .map(|p| {
+                // 与粘贴同理(F17):先回底部,否则「贴了但看不到」。
+                p.emulator.scroll_to_bottom();
+                let _ = p.pty.write(line.into_bytes());
+            })
+            .is_some();
+        (landed, bare)
+    }
+
     /// F209:截图传完了。成功才往终端里打路径,失败只提示 —— **绝不把半截
     /// 路径发下去**,那会在用户的输入行里留下一段他没打过、又必须手动删掉的
     /// 垃圾。
-    /// F330:终端里粘贴剪贴板中的文件。空壳,后续任务填充(上传 + 回填 `@路径`)。
-    fn paste_files(&mut self, _files: Vec<std::path::PathBuf>) {}
-
     fn accept_shot_uploaded(
         &mut self,
         generation: u64,
@@ -9818,27 +10125,8 @@ impl App {
                 return;
             }
         };
-        // F125:光标相位复位——这一下之后输入行会动,光标该是亮的。
-        self.last_input_at = Instant::now();
-        let landed = self
-            .tabs
-            .by_generation_mut(generation)
-            .and_then(|t| t.content.as_terminal_mut())
-            .and_then(|t| t.ws.pane_mut(pane))
-            .map(|p| {
-                // `@绝对路径` + 一个空格,不带回车:`@` 是 Claude Code 的文件
-                // 引用语法,末尾空格含在 `at_refs_line` 里;用户接着打字就是
-                // 自然的下一句话,要不要发是他自己的事。截图文件名是我们生成
-                // 的、不含空白,`bare` 恒空,忽略即可。
-                let (line, _bare) = crate::paste_files::at_refs_line(std::slice::from_ref(&path));
-                let out = line.into_bytes();
-                // 与粘贴同理(F17):先回底部,否则「贴了但看不到」。
-                p.emulator.scroll_to_bottom();
-                let _ = p.pty.write(out);
-            })
-            .is_some();
-        // 这里**不再** `user_took_over()`:那一下在 `paste_screenshot` 按键
-        // 当时就做过了(而且这块 pane 未必还是焦点,在这里掐会掐错人)。
+        // 截图文件名是我们生成的、不含空白,`bare` 恒空,忽略即可。
+        let (landed, _bare) = self.backfill_refs(generation, pane, std::slice::from_ref(&path));
         if landed {
             self.ui
                 .set_toast(crate::ui::toast::Kind::Ok, format!("截图已传到 {path}"));
@@ -13433,6 +13721,10 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 self.accept_shot_uploaded(generation, pane, result);
             }
+            UserEvent::PasteFilesChecked { plan, result } => {
+                self.accept_paste_files_checked(plan, result);
+                self.request_ui_redraw();
+            }
             UserEvent::ClipboardFetched {
                 generation,
                 dst,
@@ -13471,6 +13763,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     local: p.local,
                                     remote: p.remote,
                                     arrival: p.arrival,
+                                    pin_host: None,
                                 },
                             );
                         }
@@ -13499,6 +13792,28 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 self.transfer.queue.finish(job, result);
+                // F332:终端粘贴文件的批次汇合。**唯一的回填点**(T11):判定
+                // 跟着收工事件走,不从发起/入队那一刻起算。按 `finish` 之后的
+                // 队列状态判,不按 `result`:冲突/取消哨兵都是 `Err`,但挂在
+                // 冲突上的还没收尾(`None`,这次不报)。
+                if let Some(ok) = self
+                    .transfer
+                    .queue
+                    .get(job)
+                    .and_then(|j| crate::paste_files::landed_as_planned(&j.state, j.resolved))
+                {
+                    match self.paste_batches.job_finished(job, ok) {
+                        Some(crate::paste_files::BatchDone::Fill {
+                            generation,
+                            pane,
+                            paths,
+                        }) => self.finish_paste_files(generation, pane, paths),
+                        Some(crate::paste_files::BatchDone::Abandoned { failed }) => {
+                            self.toast_paste_abandoned(failed)
+                        }
+                        None => {}
+                    }
+                }
                 // 传完刷新**目标那一栏** —— 不刷的话新文件不出现,用户以为没成。
                 if let Some(spec) = self.transfer.specs.get(&job) {
                     let (generation, dir) = (spec.generation, spec.dir);
@@ -14315,6 +14630,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // 驱动重绘就是风扇起飞;这里只把「队列在跑」当成脏,重绘频率
                 // 因此由下面那段排期(~5Hz)决定,与事件频率无关。
                 self.pump_transfers();
+                // F332:不经 `TransferDone` 收尾的粘贴批次 job(`pump_transfers`
+                // 自己就会不发事件地收掉一些)。无在途批次时零成本。
+                self.sweep_paste_batches();
                 // F278:递归搜索每帧放行几个目录。
                 self.pump_find();
                 // F288:启动页第三列那份现场行。**只在进/出 launcher 态那一
@@ -15115,6 +15433,9 @@ impl ApplicationHandler<UserEvent> for App {
                                         // F55:标签没了,它的传输也就没有落点/
                                         // 连接了 —— 先作废再收口。
                                         self.cancel_transfers_of(tab.content.generation());
+                                        // F332:同 `close_active_tab`。
+                                        self.paste_batches
+                                            .drop_generation(tab.content.generation());
                                         wind_down(tab);
                                     }
                                     mark_ui_dirty!(self.ui_dirty);
@@ -15182,6 +15503,18 @@ impl ApplicationHandler<UserEvent> for App {
                             // `apply_remote_file_action` 的文档注释)。两者都按
                             // `files_owner_generation` 路由,不是「当前活动
                             // 标签」——理由同上面 `taken_files` 那段。
+                            // F330:终端粘贴文件的冲突框不依附文件面板(侧栏关着
+                            // 照样弹),属主世代冻在计划里 —— 不走下面那道
+                            // `files_owner_generation` 闸,否则侧栏关着时点了
+                            // 「全部覆盖」会被静默丢掉。
+                            if let Some(op) = actions.files_op.take_if(|op| {
+                                matches!(op, crate::ui::files_dialog::FileOp::PasteFiles { .. })
+                            }) {
+                                if let crate::ui::files_dialog::FileOp::PasteFiles { plan } = &op {
+                                    let gen = plan.generation;
+                                    self.apply_file_op(gen, op);
+                                }
+                            }
                             if let Some(gen) = files_owner_generation {
                                 if let Some(action) = actions.files_local {
                                     self.apply_local_file_action(gen, action);
@@ -17234,6 +17567,7 @@ fn user_event_marks_dirty(e: &UserEvent) -> bool {
         | ProjectClientsChecked { .. }
         | SftpOpDone { .. }
         | ShotUploaded { .. }
+        | PasteFilesChecked { .. }
         | TransferPlanned { .. }
         | ClipboardFetched { .. }
         | TransferDone { .. }
@@ -28803,9 +29137,9 @@ mod tests {
             .expect("split 至少有一段");
         let calls = prod.matches("self.user_took_over();").count();
         assert_eq!(
-            calls, 6,
-            "用户意图写入点的取消调用应为 6 处(粘贴/滚轮/键盘/输入法提交/\
-             合成文本/截图直传,滚轮两个分支共用一次),实际 {calls} 处 —— 少了\
+            calls, 7,
+            "用户意图写入点的取消调用应为 7 处(粘贴/滚轮/键盘/输入法提交/\
+             合成文本/截图直传/文件粘贴 F330,滚轮两个分支共用一次),实际 {calls} 处 —— 少了\
              会让自动化在用户打字时继续发命令,多了说明新增了输入路径但没复核\
              这条不变量。F209 那一处在 `paste_screenshot` 里、按键当时就掐,\
              **不在** `accept_shot_uploaded`:那时字节早发出去了,而且那块 pane\
@@ -32731,6 +33065,10 @@ mod tests {
     /// 之后提示照弹,而用户的输入行里会多出一段他没打过的半截路径,还得
     /// 自己删掉。
     ///
+    /// 自 F330 起写终端那一步抽进了与文件粘贴共用的 `backfill_refs`,
+    /// 这里的「写」锚在对它的调用上(它的函数体由
+    /// `shot_backfill_goes_through_at_refs_line` 另行把守)。
+    ///
     /// 自证会变红:把 `accept_shot_uploaded` 里 `Err` 分支的 `return;` 删掉。
     #[test]
     fn a_failed_screenshot_upload_never_writes_to_the_terminal() {
@@ -32738,7 +33076,9 @@ mod tests {
         let body = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
         assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
         let err_at = body.find("Err(msg) => {").expect("失败分支不见了");
-        let write_at = body.find("p.pty.write(out)").expect("成功分支不写终端了?");
+        let write_at = body
+            .find(concat!("self.backfill", "_refs("))
+            .expect("成功分支不写终端了?");
         assert!(err_at < write_at, "锚点顺序反了,这条测试的前提不成立");
         assert!(
             body[err_at..write_at].contains("return;"),
@@ -32752,12 +33092,22 @@ mod tests {
     /// 当前焦点接的话,那串路径会凭空出现在**另一台机器**的 shell 里 ——
     /// 而且没有任何报错(T11 同族:判据跟着字节走,不跟着「谁在焦点」走)。
     ///
-    /// 自证会变红:把 `by_generation_mut(generation)` 换成 `active_term_mut()`
-    /// 、把 `ws.pane_mut(pane)` 换成 `ws.focused_mut()`。
+    /// F330 起路由在截图与文件粘贴共用的 `backfill_refs` 里;截图这边必须
+    /// 把事件带回来的 `generation`/`pane` 原样交给它。
+    ///
+    /// 自证会变红:把 `backfill_refs` 里 `by_generation_mut(generation)` 换成
+    /// `active_term_mut()`、把 `ws.pane_mut(pane)` 换成 `ws.focused_mut()`;
+    /// 或 `accept_shot_uploaded` 不再按 `(generation, pane, ..)` 调它。
     #[test]
     fn the_screenshot_path_goes_back_to_the_pane_that_asked_for_it() {
         let src = include_str!("app.rs");
-        let body = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
+        let shot = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
+        assert!(
+            shot.contains(concat!("self.backfill", "_refs(generation, pane,")),
+            "截图回填没有把事件带回来的 generation/pane 交给 backfill_refs"
+        );
+        let body = fn_body(src, concat!("    fn ", "backfill_refs("));
+        assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
         assert!(
             body.contains("by_generation_mut(generation)") && body.contains("ws.pane_mut(pane)"),
             "回填不是按 generation + PaneId 路由的"
@@ -32813,19 +33163,190 @@ mod tests {
     /// 裸路径在 Claude Code 里只是一串字符,`@` 才是文件引用;回填绕开
     /// `at_refs_line` 的话,纯函数单测全绿而截图那条路悄悄退回裸路径。
     ///
-    /// 自证会变红:把回填那两行换回直接 `path` 转字节再补一个空格。
+    /// F330 起回填抽成截图与文件粘贴共用的 `backfill_refs`:截图这边必须
+    /// 经它写终端、自己不另写一份;它写下去的字节必须是 `at_refs_line` 的
+    /// 产物,不是裸路径。
+    ///
+    /// 自证会变红:在 `accept_shot_uploaded` 里绕开 `backfill_refs` 直接
+    /// `pty.write` 路径字节;或把 `backfill_refs` 里写下去的
+    /// `line.into_bytes()` 换成 `paths.join(" ").into_bytes()`。
     #[test]
     fn shot_backfill_goes_through_at_refs_line() {
         let src = include_str!("app.rs");
-        let body = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
-        assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
+        let shot = fn_body(src, concat!("    fn ", "accept_shot_uploaded("));
+        assert!(shot.len() > 400, "函数体切歪了({} 字节)", shot.len());
         assert!(
-            body.contains(concat!("at_refs", "_line(")),
-            "截图回填没有走 at_refs_line,路径不带 @"
+            shot.contains(concat!("self.backfill", "_refs(")),
+            "截图回填没有走共用的 backfill_refs"
         );
         assert!(
-            !body.contains(concat!("path.clone().into", "_bytes()")),
-            "截图回填又退回了裸路径字节"
+            !shot.contains(concat!("pty", ".write(")),
+            "截图回填绕开 backfill_refs 自己写终端了"
+        );
+        let body = fn_body(src, concat!("    fn ", "backfill_refs("));
+        assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
+        assert!(
+            body.contains(concat!("at_refs", "_line(paths)")),
+            "回填没有走 at_refs_line,路径不带 @"
+        );
+        assert!(
+            body.contains(concat!("pty.write(line", ".into_bytes())")),
+            "写进终端的不是 at_refs_line 的产物 —— 又退回了裸路径字节"
+        );
+    }
+
+    /// **F330:发起时只预检,一条都不入队。**
+    ///
+    /// 有同名要先问「全部覆盖 / 取消」;在 `paste_files` 里就入队的话,冲突框
+    /// 弹出来之前 worker 可能已经起跑 —— 问了等于没问。入队只许发生在预检
+    /// 回来之后(`accept_paste_files_checked` / 冲突框确认)。
+    ///
+    /// 自证会变红:在 `paste_files` 里 `let proxy` 之前插一句
+    /// `self.enqueue_paste_files(plan.clone(), false);`。
+    #[test]
+    fn paste_files_never_enqueues_before_the_conflict_check_returns() {
+        let body = body_of(prod_src(), concat!("fn paste_", "files(&mut self"));
+        assert!(body.len() > 400, "函数体切歪了({} 字节)", body.len());
+        assert!(
+            body.contains(concat!("PasteFiles", "Checked {")),
+            "paste_files 不再发预检事件了 —— 锚点失效或预检被删"
+        );
+        for banned in [
+            concat!("queue", ".push("),
+            concat!("enqueue", "_paste_files("),
+            concat!("paste_files::", "enqueue("),
+        ] {
+            assert!(
+                !body.contains(banned),
+                "paste_files 在预检回来之前就入队了({banned})—— 冲突框形同虚设"
+            );
+        }
+    }
+
+    /// **F332 / T11:回填只能来自 `TransferDone`。**
+    ///
+    /// 「整批传完才回填」的判定必须跟着收工事件走;在入队/发起那一刻、或在
+    /// 每帧扫尾里消费 `Fill`,都是从调用点起算 —— 字节还没落地路径就进了
+    /// 输入行,用户回车后 Claude Code 读到的是一个不存在的文件。
+    ///
+    /// 自证会变红:在 `sweep_paste_batches` 的循环里加一支
+    /// `if let BatchDone::Fill { generation, pane, paths } = d { self.finish_paste_files(..) }`。
+    #[test]
+    fn backfill_happens_only_from_the_transfer_done_arm() {
+        let production = prod_src();
+        let arm = arm_of(production, "UserEvent::TransferDone { job, result }");
+        for needle in [
+            concat!("BatchDone::", "Fill"),
+            concat!("self.finish_paste", "_files("),
+        ] {
+            assert_eq!(
+                production.matches(needle).count(),
+                1,
+                "{needle} 在产品代码里不止一处 —— 回填有了 TransferDone 以外的入口"
+            );
+            assert!(
+                arm.contains(needle),
+                "{needle} 不在 TransferDone 那条分支里 —— 回填脱离了收工事件(T11)"
+            );
+        }
+        // 共用回填只有两个调用方:截图收工、文件批次收工。
+        let callers = production
+            .matches(concat!("self.backfill", "_refs("))
+            .count();
+        assert_eq!(callers, 2, "backfill_refs 多出了调用方({callers} 处)");
+    }
+
+    /// **F332:关标签时它的粘贴批次一起作废。**
+    ///
+    /// `wind_down` 直接 abort 在途任务,`TransferDone` 可能永远不来;不回收的话
+    /// 批次一直堆着,扫尾还会对一个已经不存在的标签报「没回填」。判据扎在
+    /// 「作废这个标签的传输」那句上 —— 每个关标签的出口都有它(重连那处用的是
+    /// `cancel_transfers_of(generation)`,标签还在,刻意不在此列:那里的批次由
+    /// 扫尾结算成「没回填」并提示)。
+    ///
+    /// 自证会变红:删掉 `close_active_tab` 或 `TabAction::Close` 臂里的
+    /// `drop_generation` 那句。
+    #[test]
+    fn a_closed_tab_drops_its_paste_batches() {
+        let production = prod_src();
+        let cancel = concat!("self.cancel_transfers_of(", "tab.content.generation());");
+        let sites: Vec<&str> = production
+            .match_indices(cancel)
+            .map(|(at, _)| {
+                let rest = &production[at..];
+                &rest[..rest
+                    .find("wind_down(tab)")
+                    .expect("作废传输之后没有 wind_down")]
+            })
+            .collect();
+        assert!(
+            sites.len() >= 2,
+            "关标签出口少于两处,锚点失效:{}",
+            sites.len()
+        );
+        for site in sites {
+            assert!(
+                site.contains(concat!("drop_generation(", "tab.content.generation())")),
+                "这个关标签出口没作废粘贴批次:{site}"
+            );
+        }
+    }
+
+    /// **F332:不经 `TransferDone` 收尾的 job 每帧扫一次。**
+    ///
+    /// `pump_transfers` 自己就会不发事件地收掉 job(标签没了 / 连接断了),
+    /// 排队中被取消、冲突框里点跳过也一样;不扫的话那一批永远不结算,用户
+    /// 等不到「没回填」的提示。
+    ///
+    /// 自证会变红:删掉帧里 `self.sweep_paste_batches();` 那句。
+    #[test]
+    fn abandoned_paste_batches_are_swept_every_frame_after_pump_transfers() {
+        let production = prod_src();
+        let pump = production
+            .find(concat!("self.pump_", "transfers();"))
+            .expect("帧里找不到 pump_transfers");
+        let rest = &production[pump..];
+        let next_stmt_end = rest
+            .find(concat!("self.pump_", "find();"))
+            .expect("pump_transfers 之后找不到 pump_find,锚点失效");
+        assert!(
+            rest[..next_stmt_end].contains(concat!("self.sweep_paste", "_batches();")),
+            "pump_transfers 之后没有扫粘贴批次"
+        );
+    }
+
+    /// **F330:冲突框里点「全部覆盖」不受文件面板可见与否的闸。**
+    ///
+    /// 文件框的确认操作原本只在 `files_owner_generation` 为 `Some`(侧栏开着
+    /// 或文件标签)时才施加;终端粘贴文件的冲突框侧栏关着也照样弹,走那道闸
+    /// 的话点了「全部覆盖」框关了、什么都不发生,零报错。
+    ///
+    /// 自证会变红:把 `take_if(..PasteFiles..)` 那段挪进
+    /// `if let Some(gen) = files_owner_generation {` 块内。
+    #[test]
+    fn paste_files_overwrite_is_dispatched_outside_the_files_panel_gate() {
+        let production = prod_src();
+        let take = production
+            .find(concat!("files_op.take_if(", "|op| {"))
+            .expect("找不到 PasteFiles 的分流");
+        assert!(
+            production[take..take + 200].contains(concat!("FileOp::", "PasteFiles")),
+            "take_if 分流的不是 PasteFiles"
+        );
+        // 消费文件框确认操作的那道闸:块体里有 `apply_file_op(gen, op)` 的那一个。
+        let gate_pat = concat!("if let Some(gen) = ", "files_owner_generation {");
+        let (gate, gate_body) = production
+            .match_indices(gate_pat)
+            .map(|(at, _)| {
+                let open = at + production[at..].find('{').unwrap();
+                (at, brace_balanced_arm(&production[open..]))
+            })
+            .find(|(_, b)| b.contains(concat!("self.apply_file_op(", "gen, op)")))
+            .expect("找不到消费 files_op 的那道 files_owner_generation 闸");
+        assert!(take < gate, "PasteFiles 的分流落进了文件面板的闸后面");
+        assert!(
+            !gate_body.contains(concat!("FileOp::", "PasteFiles")),
+            "PasteFiles 又进了文件面板的闸"
         );
     }
 

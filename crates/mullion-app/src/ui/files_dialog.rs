@@ -81,6 +81,17 @@ pub enum FilesDialog {
         seq: u64,
         existing: std::collections::BTreeSet<Vec<u8>>,
     },
+    /// F330:终端里 Ctrl+V 粘贴文件,预检发现节点上的落点目录里已有同名文件。
+    /// **整批问一次**「全部覆盖 / 取消」,确认前一条都不入队。
+    ///
+    /// `plan` 是发起那一刻冻结的那一份(属主、回填 pane、机器、目录、文件),
+    /// 原样带回 `FileOp::PasteFiles`,不在选完时回读当下状态(T11 同族)。
+    /// 这个框**不依附文件面板**:侧栏关着照样弹。
+    PasteFilesConflict {
+        /// 撞了名的那些文件名(给用户看,不参与拼路径)。
+        names: Vec<String>,
+        plan: crate::paste_files::PastePlan,
+    },
 }
 
 /// 用户在对话框里**确认**之后要执行的写操作。到这一步就没有回头路了 ——
@@ -131,6 +142,11 @@ pub enum FileOp {
         seq: u64,
         policy: crate::files::clip::Policy,
         existing: std::collections::BTreeSet<Vec<u8>>,
+    },
+    /// F330:终端粘贴文件的冲突框里点了「全部覆盖」。只有这一条出路会产出
+    /// 它 —— 「取消」就是整批不传,没有处置要发。
+    PasteFiles {
+        plan: crate::paste_files::PastePlan,
     },
 }
 
@@ -232,7 +248,8 @@ pub fn is_dirty(d: &FilesDialog) -> bool {
         FilesDialog::Delete { .. }
         | FilesDialog::EditConflict { .. }
         | FilesDialog::Conflict { .. }
-        | FilesDialog::PasteConflict { .. } => false,
+        | FilesDialog::PasteConflict { .. }
+        | FilesDialog::PasteFilesConflict { .. } => false,
     }
 }
 
@@ -251,7 +268,9 @@ pub fn cancel_op(d: &FilesDialog) -> Option<FileOp> {
         | FilesDialog::Chmod { .. }
         // F220:预检查回来之后才开这个框,这一步还没有发出任何写请求 ——
         // 取消就是只关框,没有需要收口的在途工作。
-        | FilesDialog::PasteConflict { .. } => None,
+        | FilesDialog::PasteConflict { .. }
+        // F330:同上,还一条都没入队 —— 取消就是整批不传,只关框。
+        | FilesDialog::PasteFilesConflict { .. } => None,
         // 取消 = 保留远端。**不能只关框**:那条编辑会一直挂在 `Conflict` 上,
         // 每次轮询都想回传、每次都撞冲突,而快照永远不动 —— 界面上只看得出
         // 「这个文件一直红着」。
@@ -281,6 +300,7 @@ pub fn title_of(d: &FilesDialog) -> &'static str {
         FilesDialog::EditConflict { .. } => "远端文件已被改动",
         FilesDialog::Conflict { .. } => "文件已存在",
         FilesDialog::PasteConflict { .. } => "目标目录里已有同名项",
+        FilesDialog::PasteFilesConflict { .. } => "节点上已有同名文件",
     }
 }
 
@@ -589,6 +609,45 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 cancelled!();
             }
         }
+        FilesDialog::PasteFilesConflict { names, plan } => {
+            let n = names.len();
+            let x = modal(ctx, "节点上已有同名文件", |ui| {
+                ui.colored_label(
+                    theme::c32(t.danger_text),
+                    format!("要上传的文件里有 {n} 个与节点上的同名"),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "选「全部覆盖」会用本机的文件盖掉节点上原有的内容,不可逆;\
+                         选「取消」则这一批一个都不传。",
+                    )
+                    .color(theme::c32(t.fg_muted)),
+                );
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for line in crate::paste_files::conflict_lines(names) {
+                            ui.label(line);
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    // 「全部覆盖」标危险色(F119):两条出路里唯一会毁数据的。
+                    if ui
+                        .button(egui::RichText::new("全部覆盖").color(theme::c32(t.danger_text)))
+                        .clicked()
+                    {
+                        op = Some(FileOp::PasteFiles { plan: plan.clone() });
+                        close = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancelled!();
+                    }
+                });
+            });
+            if x {
+                cancelled!();
+            }
+        }
     }
 
     if close {
@@ -719,13 +778,19 @@ mod tests {
                 seq: 1,
                 existing: sample_existing(),
             },
+            // F330:同上,冲突框选完之前一条都没入队。
+            FilesDialog::PasteFilesConflict {
+                names: vec!["a.png".into()],
+                plan: sample_paste_plan(),
+            },
         ];
         for d in &all {
             let got = cancel_op(d);
             let want = match d {
                 FilesDialog::Delete { .. }
                 | FilesDialog::Chmod { .. }
-                | FilesDialog::PasteConflict { .. } => None,
+                | FilesDialog::PasteConflict { .. }
+                | FilesDialog::PasteFilesConflict { .. } => None,
                 FilesDialog::EditConflict { .. } => Some(FileOp::ResolveEdit {
                     key: 9,
                     choice: EditResolve::KeepRemote,
@@ -1341,7 +1406,77 @@ mod tests {
                 seq: 1,
                 existing: sample_existing(),
             },
+            FilesDialog::PasteFilesConflict {
+                names: vec!["a.png".into()],
+                plan: sample_paste_plan(),
+            },
         ]
+    }
+
+    /// F330:测试用的一份冻结计划。
+    fn sample_paste_plan() -> crate::paste_files::PastePlan {
+        crate::paste_files::PastePlan {
+            generation: 7,
+            pane: mullion_core::layout::PaneId(2),
+            host_ix: Some(1),
+            dir: "/tmp".into(),
+            files: vec![crate::paste_files::Picked {
+                local: "C:/x/a.png".into(),
+                name: "a.png".into(),
+                is_dir: false,
+                size: 10,
+            }],
+            skipped_dirs: Vec::new(),
+        }
+    }
+
+    /// F330:「全部覆盖」原样送回冻结的计划并关框;「取消」关框、不发任何
+    /// 处置(整批不入队)。光测 `cancel_op` 测不出 `show()` 里那颗按钮接没接上。
+    ///
+    /// 自证会变红:把「全部覆盖」那臂的 `op = Some(..)` 删掉,或把「取消」
+    /// 改成也发 `PasteFiles`。
+    #[test]
+    fn the_paste_files_conflict_overwrites_only_on_the_explicit_button() {
+        let mut d = Some(FilesDialog::PasteFilesConflict {
+            names: vec!["a.png".into()],
+            plan: sample_paste_plan(),
+        });
+        assert_eq!(
+            click_button(&mut d, "全部覆盖"),
+            Some(FileOp::PasteFiles {
+                plan: sample_paste_plan()
+            })
+        );
+        assert!(d.is_none(), "点完「全部覆盖」框没关");
+
+        let mut d = Some(FilesDialog::PasteFilesConflict {
+            names: vec!["a.png".into()],
+            plan: sample_paste_plan(),
+        });
+        assert_eq!(click_button(&mut d, "取消"), None, "取消不该入队");
+        assert!(d.is_none(), "点「取消」之后框必须关掉");
+    }
+
+    /// F330:框里要列出撞了哪几个,多了折成「等另外 N 个」—— 只说「有冲突」
+    /// 用户没法判断要不要覆盖。
+    #[test]
+    fn the_paste_files_conflict_names_the_collisions() {
+        let names: Vec<String> = (0..10).map(|i| format!("f{i}.txt")).collect();
+        let mut d = Some(FilesDialog::PasteFilesConflict {
+            names,
+            plan: sample_paste_plan(),
+        });
+        let texts = dialog_texts(&mut d);
+        for want in ["全部覆盖", "取消", "f0.txt", "f7.txt", "等另外 2 个"] {
+            assert!(
+                texts.iter().any(|s| s.contains(want)),
+                "冲突框里没有「{want}」,实际:{texts:?}"
+            );
+        }
+        assert!(
+            !texts.iter().any(|s| s.contains("f8.txt")),
+            "超出上限的名字不该列出来"
+        );
     }
 
     /// F239:`title_of` 报的标题必须真的是这一帧画出来的那个窗口的 id。
