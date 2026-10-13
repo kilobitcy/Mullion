@@ -157,6 +157,14 @@ impl Queue {
         id
     }
 
+    /// F330:入队时就预先定好冲突处置(终端粘贴文件在入队前已问过用户
+    /// 「全部覆盖」)。只写 `resolved`、不动状态 —— worker 起跑时读它。
+    pub fn set_resolved(&mut self, id: u64, c: Conflict) {
+        if let Some(j) = self.get_mut(id) {
+            j.resolved = Some(c);
+        }
+    }
+
     /// 放行一批可以起跑的 job,并把它们就地置成 `Running`。
     /// **同一个 id 不会被放行两次** —— 状态已经改掉了。
     /// F252:这个标签的这个方向上,还有没收尾的活吗。
@@ -481,6 +489,18 @@ mod tests {
             !q.still_busy(7, Direction::Upload),
             "别处的活把这一栏也算成忙的了"
         );
+    }
+
+    /// F330:入队前已确认「全部覆盖」的 job,worker 起跑时必须看到 Overwrite,
+    /// 否则撞上已存在的目标会落成 `Conflict`、再弹一次框。
+    /// 自证会变红:把 `set_resolved` 函数体清空。
+    #[test]
+    fn a_preset_overwrite_is_visible_to_the_worker_and_keeps_the_job_pending() {
+        let mut q = q();
+        let id = q.push(job(Direction::Upload));
+        q.set_resolved(id, Conflict::Overwrite);
+        assert_eq!(q.get(id).unwrap().resolved, Some(Conflict::Overwrite));
+        assert_eq!(q.get(id).unwrap().state, JobState::Pending, "不该改状态");
     }
 
     #[test]
