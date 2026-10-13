@@ -242,6 +242,8 @@ pub fn remote_join(dir: &str, name: &str) -> String {
 /// 终端里裸 `Ctrl+V` 这一下该干什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipPaste {
+    /// 剪贴板里有文件(`CF_HDROP`)—— 上传并把 `@路径` 打进输入行。
+    Files,
     /// 照旧走 F18 那条文本粘贴(多行仍然弹确认)。
     Text,
     /// 剪贴板里只有位图 —— 编码上传,把远端路径打进输入行。
@@ -251,17 +253,22 @@ pub enum ClipPaste {
     Neither,
 }
 
-/// 文本优先。
+/// 文件优先,其次文本,最后图。
 ///
+/// 文件排第一:Explorer 复制文件时,剪贴板可能同时带文本(文件名)或缩略图
+/// 位图,不让文件赢的话用户拿到的是文件名字符串或一次截图上传。
+///
+/// 文本优先于图:
 /// 顺序不是随手定的:从浏览器/IDE 复制**图片**时,很多程序会同时往剪贴板里
 /// 放一份文本(图片 URL、HTML 片段)。若图优先,用户复制一段代码后按
 /// `Ctrl+V`,得到的会是一次莫名其妙的截图上传。反过来,Win+Shift+S 截屏
 /// **只放位图不放文本**,文本优先不会挡住截图这条路。
-pub fn clip_paste(has_text: bool, has_image: bool) -> ClipPaste {
-    match (has_text, has_image) {
-        (true, _) => ClipPaste::Text,
-        (false, true) => ClipPaste::Image,
-        (false, false) => ClipPaste::Neither,
+pub fn clip_paste(has_text: bool, has_image: bool, has_files: bool) -> ClipPaste {
+    match (has_text, has_image, has_files) {
+        (_, _, true) => ClipPaste::Files,
+        (true, _, _) => ClipPaste::Text,
+        (false, true, _) => ClipPaste::Image,
+        (false, false, _) => ClipPaste::Neither,
     }
 }
 
@@ -475,11 +482,21 @@ mod tests {
     /// `(_, true) => ClipPaste::Image`。
     #[test]
     fn text_wins_when_the_clipboard_holds_both() {
-        assert_eq!(clip_paste(true, true), ClipPaste::Text);
-        assert_eq!(clip_paste(true, false), ClipPaste::Text);
-        assert_eq!(clip_paste(false, true), ClipPaste::Image);
+        assert_eq!(clip_paste(true, true, false), ClipPaste::Text);
+        assert_eq!(clip_paste(true, false, false), ClipPaste::Text);
+        assert_eq!(clip_paste(false, true, false), ClipPaste::Image);
         // 两样都没有时**不能**当成「处理过了」——那会吞掉 `^V`。
-        assert_eq!(clip_paste(false, false), ClipPaste::Neither);
+        assert_eq!(clip_paste(false, false, false), ClipPaste::Neither);
+    }
+
+    /// **文件优先**:Explorer 里复制文件时,剪贴板常同时带文本(文件名)或
+    /// 缩略图位图,不让文件赢的话用户拿到的是文件名字符串或一次截图上传。
+    ///
+    /// 自证会变红:把 `clip_paste` 的 `(_, _, true)` 臂挪到最后或删掉。
+    #[test]
+    fn files_beat_image_and_text() {
+        assert_eq!(clip_paste(true, true, true), ClipPaste::Files);
+        assert_eq!(clip_paste(false, false, true), ClipPaste::Files);
     }
 
     /// 文件名带序号 —— `/tmp` 是共用目录,同一秒贴两张不能撞名。

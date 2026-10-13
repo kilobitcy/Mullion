@@ -9801,6 +9801,9 @@ impl App {
     /// F209:截图传完了。成功才往终端里打路径,失败只提示 —— **绝不把半截
     /// 路径发下去**,那会在用户的输入行里留下一段他没打过、又必须手动删掉的
     /// 垃圾。
+    /// F330:终端里粘贴剪贴板中的文件。空壳,后续任务填充(上传 + 回填 `@路径`)。
+    fn paste_files(&mut self, _files: Vec<std::path::PathBuf>) {}
+
     fn accept_shot_uploaded(
         &mut self,
         generation: u64,
@@ -14164,7 +14167,20 @@ impl ApplicationHandler<UserEvent> for App {
                         {
                             let text = self.clipboard.get();
                             let dib = crate::shot::clipboard_dib();
-                            match crate::shot::clip_paste(text.is_some(), dib.is_some()) {
+                            // F330:文件(CF_HDROP)也读,三样都读完再判。
+                            // `read()` 最长阻塞 3 秒,是已知代价。
+                            #[cfg(windows)]
+                            let files = crate::dragout::win::read().hdrop;
+                            #[cfg(not(windows))]
+                            let files: Vec<std::path::PathBuf> = Vec::new();
+                            let has_files = !files.is_empty();
+                            match crate::shot::clip_paste(text.is_some(), dib.is_some(), has_files)
+                            {
+                                crate::shot::ClipPaste::Files => {
+                                    self.paste_files(files);
+                                    self.request_ui_redraw();
+                                    return;
+                                }
                                 crate::shot::ClipPaste::Text => {
                                     // 走 F18 原路(多行仍然弹确认),它自己会
                                     // 再读一次剪贴板。
@@ -32751,6 +32767,44 @@ mod tests {
                 && !body.contains("active_ws")
                 && !body.contains("focused_mut"),
             "回填走了「当前活动标签/焦点分屏」—— 用户切走之后路径会打进别的 shell"
+        );
+    }
+
+    /// **F330:裸 Ctrl+V 必须文本、位图、文件三样都读完再交给 `clip_paste`。**
+    ///
+    /// 「有文件就提前 return」会让 `clip_paste` 的优先级分支在产品代码里
+    /// 永远走不到,守住它的纯函数单测就成了摆设(F209 同一类静默)。
+    ///
+    /// 自证会变红:在读文件那句之后、`clip_paste` 之前插一个
+    /// `if !files.is_empty() { return; }`;或删掉 `clipboard_dib()` 的读取。
+    #[test]
+    fn ctrl_v_reads_text_image_and_files_before_deciding() {
+        let src = include_str!("app.rs");
+        let start = concat!("WindowEvent::Keyboard", "Input { event, .. } => {");
+        let after = src.split(start).nth(1).expect("找不到 KeyboardInput 分支");
+        let body = &after[..after
+            .find(concat!("WindowEvent::Redraw", "Requested"))
+            .expect("找不到 KeyboardInput 分支的结尾")];
+        let text_at = body
+            .find(concat!("self.clipboard.", "get()"))
+            .expect("没读文本");
+        let dib_at = body
+            .find(concat!("shot::clipboard", "_dib()"))
+            .expect("没读位图");
+        let files_at = body
+            .find(concat!("win::read()", ".hdrop"))
+            .expect("没读文件");
+        let decide_at = body
+            .find(concat!("shot::clip_", "paste("))
+            .expect("找不到 clip_paste 调用");
+        assert!(
+            text_at < decide_at && dib_at < decide_at && files_at < decide_at,
+            "三个读取没有全部排在 clip_paste 之前"
+        );
+        let between = &body[text_at..decide_at];
+        assert!(
+            !between.contains("return;"),
+            "读取与判定之间出现了提前 return —— clip_paste 的优先级分支走不到"
         );
     }
 
