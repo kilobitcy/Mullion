@@ -29,6 +29,7 @@ pub mod localtime;
 pub mod logx;
 pub mod node_stats;
 pub mod pane;
+pub mod paste_files;
 pub mod profile;
 pub mod project;
 pub mod reconnect;
