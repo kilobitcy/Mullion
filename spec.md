@@ -281,6 +281,10 @@ Mullion 的赌注是：**这个交集市场没人做，而它正在快速变大*
 | F94 | 会话管理器横向拖 resize：窗口外框（边框 / 标题栏 / 关闭按钮 / resize 手柄）必须跟着变宽，内容不许画到外框之外 | P1 | 用真实指针事件拖右边缘，断言外框右边缘逐步跟手 + 右栏内容右边缘不超出外框（`dragging_the_resize_handle_widens_the_window_frame_not_just_its_contents`）；实际观感人工验收 |
 | F326 | **会话管理器「凭据」「隧道」两档右栏的按钮条钉底**：「保存 / 删除」改走 `TopBottomPanel::bottom`（同项目管理器、会话编辑器），表单正文套 `ScrollArea`；凭据「被引用」红字挪到按钮条**上方**。范围只限会话管理器各 Tab，其余小弹窗不动 | P2 | `credential_buttons_stay_on_screen_when_the_form_is_taller_than_it`、`tunnel_buttons_stay_on_screen_when_the_form_is_taller_than_it`（矮屏幕下按钮仍在屏内）；按钮实际位置是否顺眼未验证，需人工确认 |
 | F327 | **常态按钮描边可见**：`widgets.inactive.bg_stroke` 不再用 `stroke`（6% 白，分隔线专用），改 alpha 45（约 18% 白）。按钮是透明底，描边是它唯一的边缘；输入框同走 `inactive`，一并变亮。`stroke`（0.06）本身不变，视觉基线 §token 表照旧 | P2 | `theme::tests::an_idle_button_edge_is_brighter_than_a_divider`；亮度是否合适未验证，需人工确认 |
+| F330 | **终端 Ctrl+V 粘贴资源管理器复制的文件**：剪贴板里是文件（`CF_HDROP`）时，裸 Ctrl+V 把它们上传到该节点的 `sftp_screenshot_dir`（空则 `/tmp`，与截图共用）。支持多文件；文件夹本期跳过并提示「已跳过文件夹 X」；目标已有同名文件时先弹确认「全部覆盖 / 取消」，确认前整批不开传 | P2 | `paste_files::tests::directories_are_skipped_and_named`、`conflicting_keep_order_and_only_name_existing_targets`；Ctrl+V 分流与冲突弹窗待实现；真机粘贴行为未验证，需人工确认 |
+| F331 | **截图与文件回填路径加 `@` 前缀**：回填到输入行的是 `@绝对路径`，多个以空格分隔、末尾留一个空格、不带回车。路径含空白时**不加 `@`**、回填裸绝对路径并弹 Warn 提示（Claude Code 的 `@` 在首个空格处中止，引号与反斜杠转义均不支持） | P2 | `paste_files::tests::a_path_with_spaces_gets_no_at_because_claude_code_would_cut_it`、`refs_line_is_space_separated_with_one_trailing_space_and_reports_bare_paths`；截图路径接线待实现 |
+| F332 | **文件粘贴走全局传输队列**：每个文件一条队列任务（可取消、无大小上限），底栏传输面板可见进度；**整批全部成功后**才一次性回填路径，任一失败或取消则一个都不回填；标签关闭时该批次作废。截图仍维持 20 MiB 上限、不加进度 | P2 | `paste_files::tests::a_batch_fills_back_only_when_every_job_succeeded`、`one_failed_job_means_no_path_is_filled_in`、`dropping_a_generation_discards_its_batches`；队列接线待实现 |
+| F333 | **焦点 pane 假光标闪烁**：Claude Code 隐藏真光标（`?25l`）并自绘一格反显假光标时，若该 pane 获焦，这一格按光标闪烁相位在反显与普通格之间切换；非焦点 pane 保持静止 | P2 | 待实现；是否肉眼可见地闪未验证，需人工确认 |
 
 **F82 修订**（2026-07-30，v0.1.12 实机验收后）：原定一条 48px 独立工具栏，承载
 「新建连接 / 分屏操作 / 布局预设 / SFTP 开关 / 设置」。取消那一栏——它为「更好找」
