@@ -15710,7 +15710,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 排期的那一帧必须同时标脏,否则到点重绘时
                                 // `frame_is_dirty` 判 Idle,动画/交互反馈直接丢帧。
                                 mark_ui_dirty!(self.ui_dirty);
-                                let at = Instant::now() + repaint_delay;
+                                // 定时唤醒(光标翻转等)与这一支取最早:egui 周期性
+                                // 要重绘时,若只排它自己的时刻,闪烁的翻转要等到下一次
+                                // egui 重绘才被顺带画出 —— 间隔忽长忽短。
+                                let mut at = Instant::now() + repaint_delay;
+                                if let Some(t) = self.next_timer_wake(now) {
+                                    at = at.min(t);
+                                }
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                             } else if self.transfer.queue.summary().busy {
@@ -15719,8 +15725,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 // 请求重绘,没有别的东西会唤醒事件循环。
                                 // T7:这一支同样显式复位 control_flow。
                                 mark_ui_dirty!(self.ui_dirty);
-                                let at = Instant::now()
+                                let mut at = Instant::now()
                                     + std::time::Duration::from_millis(TRANSFER_UI_INTERVAL_MS);
+                                if let Some(t) = self.next_timer_wake(now) {
+                                    at = at.min(t);
+                                }
                                 self.next_frame_at = Some(at);
                                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
                             } else if let Some(at) = self.next_timer_wake(now) {
