@@ -15507,13 +15507,23 @@ impl ApplicationHandler<UserEvent> for App {
                             // 照样弹),属主世代冻在计划里 —— 不走下面那道
                             // `files_owner_generation` 闸,否则侧栏关着时点了
                             // 「全部覆盖」会被静默丢掉。
+                            // 传输队列的冲突框(`Resolve`)同理:它每帧只看
+                            // `queue.first_conflict()` 就弹,侧栏关着也弹;处置被
+                            // 闸吞掉的话框关了、job 仍挂在冲突上,下一帧又弹,
+                            // 那一批永远悬着。`apply_file_op` 对 `Resolve` 在开头
+                            // 就分流、只改队列,不读 `generation`。
                             if let Some(op) = actions.files_op.take_if(|op| {
-                                matches!(op, crate::ui::files_dialog::FileOp::PasteFiles { .. })
+                                use crate::ui::files_dialog::FileOp;
+                                matches!(op, FileOp::PasteFiles { .. } | FileOp::Resolve { .. })
                             }) {
-                                if let crate::ui::files_dialog::FileOp::PasteFiles { plan } = &op {
-                                    let gen = plan.generation;
-                                    self.apply_file_op(gen, op);
-                                }
+                                let gen = match &op {
+                                    crate::ui::files_dialog::FileOp::PasteFiles { plan } => {
+                                        plan.generation
+                                    }
+                                    // `Resolve` 不用世代(见上),给个占位。
+                                    _ => 0,
+                                };
+                                self.apply_file_op(gen, op);
                             }
                             if let Some(gen) = files_owner_generation {
                                 if let Some(action) = actions.files_local {
@@ -33324,17 +33334,31 @@ mod tests {
     /// 或文件标签)时才施加;终端粘贴文件的冲突框侧栏关着也照样弹,走那道闸
     /// 的话点了「全部覆盖」框关了、什么都不发生,零报错。
     ///
+    /// 传输队列的冲突框(`FileOp::Resolve`)同理:它不看侧栏、每帧见冲突就弹,
+    /// 处置被闸吞掉的话 job 永远停在冲突上,框关了又弹,批次悬挂。
+    ///
     /// 自证会变红:把 `take_if(..PasteFiles..)` 那段挪进
-    /// `if let Some(gen) = files_owner_generation {` 块内。
+    /// `if let Some(gen) = files_owner_generation {` 块内;或从 `matches!`
+    /// 里删掉 `| FileOp::Resolve { .. }`。
     #[test]
     fn paste_files_overwrite_is_dispatched_outside_the_files_panel_gate() {
         let production = prod_src();
         let take = production
             .find(concat!("files_op.take_if(", "|op| {"))
             .expect("找不到 PasteFiles 的分流");
+        // 闭包体:到 `}) {` 为止(take_if 的谓词结束、分支体开始)。
+        let pred_end = take
+            + production[take..]
+                .find("}) {")
+                .expect("take_if 谓词找不到结尾");
+        let pred = &production[take..pred_end];
         assert!(
-            production[take..take + 200].contains(concat!("FileOp::", "PasteFiles")),
+            pred.contains(concat!("FileOp::", "PasteFiles")),
             "take_if 分流的不是 PasteFiles"
+        );
+        assert!(
+            pred.contains(concat!("FileOp::", "Resolve { .. }")),
+            "传输冲突框的处置 Resolve 没有绕开文件面板的闸 —— 侧栏关着时点了也白点"
         );
         // 消费文件框确认操作的那道闸:块体里有 `apply_file_op(gen, op)` 的那一个。
         let gate_pat = concat!("if let Some(gen) = ", "files_owner_generation {");
