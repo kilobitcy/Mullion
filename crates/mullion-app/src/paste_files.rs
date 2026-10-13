@@ -3,12 +3,17 @@
 //! 不碰 UI、网络、窗口 —— 冲突判定、`@` 引用格式化、批次汇合都能无头单测。
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use mullion_core::layout::PaneId;
+
+use crate::files::queue::{Conflict, Direction, JobState, NewJob, Queue};
 
 /// 剪贴板里一个本地条目（调用处已 stat 过）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picked {
+    /// 本地完整路径（上传的源）。
+    pub local: PathBuf,
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
@@ -62,6 +67,110 @@ pub fn conflicting(names: &[String], existing: &HashSet<String>) -> Vec<String> 
         .filter(|n| existing.contains(*n))
         .cloned()
         .collect()
+}
+
+/// F330：发起那一刻冻结的一次粘贴。预检、冲突框、入队全程只认这一份 ——
+/// 不在结果回来时回读「此刻的焦点 pane / 落点目录」（T11 同族：高延迟链路上
+/// 预检要好几百毫秒，用户完全可能已经切了标签、切了分屏）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastePlan {
+    pub generation: u64,
+    /// 回填路径的那块 pane。
+    pub pane: PaneId,
+    /// 焦点分屏所在的那台机器（F132）。预检与上传都开在它上面 —— 蹭侧栏那条
+    /// 的话文件传到了另一台机器上，而打进输入行的路径看起来完全正常。
+    pub host_ix: Option<usize>,
+    /// 目标目录（用户配置原样；空 = `shot::DEFAULT_DIR`，由 `remote_join` 落回）。
+    pub dir: String,
+    /// 只有文件，文件夹在发起时已经剔掉并报过名了。
+    pub files: Vec<Picked>,
+}
+
+impl PastePlan {
+    /// 这个名字落到远端的绝对路径。
+    pub fn remote_of(&self, name: &str) -> String {
+        crate::shot::remote_join(&self.dir, name)
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.files.iter().map(|f| f.name.clone()).collect()
+    }
+}
+
+/// F330：预检回来之后怎么办。
+#[derive(Debug, PartialEq, Eq)]
+pub enum AfterCheck {
+    /// 没有同名，直接入队（不预设覆盖）。
+    Enqueue,
+    /// 有同名（按 `names` 的顺序），先问「全部覆盖 / 取消」；确认前整批不入队。
+    Ask(Vec<String>),
+    /// 预检本身失败 —— 报错、不入队。**不能当成「没冲突」**：那样等于用户
+    /// 没被问过就开传，撞上已存在的文件时再一条条弹框，整批的「先问再传」落空。
+    Fail(String),
+}
+
+/// `existing` 是预检读回来的「目标处已存在的名字」。
+pub fn after_check(names: &[String], existing: Result<Vec<String>, String>) -> AfterCheck {
+    match existing {
+        Err(e) => AfterCheck::Fail(e),
+        Ok(found) => {
+            let found: HashSet<String> = found.into_iter().collect();
+            let hit = conflicting(names, &found);
+            if hit.is_empty() {
+                AfterCheck::Enqueue
+            } else {
+                AfterCheck::Ask(hit)
+            }
+        }
+    }
+}
+
+/// 冲突框最多列几个名字。多出来的折成一行「等另外 N 个」，框不会被几百个
+/// 名字撑出屏幕。
+pub const CONFLICT_LIST_MAX: usize = 8;
+
+/// 冲突框里列出的那几行。
+pub fn conflict_lines(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = names.iter().take(CONFLICT_LIST_MAX).cloned().collect();
+    if names.len() > CONFLICT_LIST_MAX {
+        out.push(format!("等另外 {} 个", names.len() - CONFLICT_LIST_MAX));
+    }
+    out
+}
+
+/// F330：整批入队。`overwrite` = 用户已在冲突框里点了「全部覆盖」，每条预设
+/// `Overwrite` —— 不预设的话 worker 撞上已存在的目标会落成 `Conflict`，
+/// 同一件事再问一遍。
+///
+/// 返回 `(job id, 文件, 远端绝对路径)`，顺序同 `plan.files`（回填顺序 = 剪贴板顺序）。
+pub fn enqueue(queue: &mut Queue, plan: &PastePlan, overwrite: bool) -> Vec<(u64, Picked, String)> {
+    plan.files
+        .iter()
+        .map(|f| {
+            let id = queue.push(NewJob {
+                dir: Direction::Upload,
+                generation: plan.generation,
+                label: f.name.clone(),
+                total: f.size,
+            });
+            if overwrite {
+                queue.set_resolved(id, Conflict::Overwrite);
+            }
+            (id, f.clone(), plan.remote_of(&f.name))
+        })
+        .collect()
+}
+
+/// F332：一条 job 收工后，对批次来说算不算「按计划落地」。
+///
+/// `None` = 还没收尾（挂在冲突上等用户拿主意），这次不报给批次。只有 `Done`
+/// **且没走「重命名」**才算成：改名之后文件不在我们要回填的那个路径上，
+/// 回填就是一个指向别的文件（或不存在）的 `@` 引用。
+pub fn landed_as_planned(state: &JobState, resolved: Option<Conflict>) -> Option<bool> {
+    if !state.is_finished() {
+        return None;
+    }
+    Some(*state == JobState::Done && resolved != Some(Conflict::Rename))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,6 +246,29 @@ impl BatchTracker {
         })
     }
 
+    /// 不经 `TransferDone` 就收了尾的 job（排队中被取消、冲突框里点了跳过、
+    /// worker 没起来、整栏被清掉）。它们永远等不到收工事件，不在这里结算的话
+    /// 批次一直挂着，用户等不到「没回填」的提示。
+    ///
+    /// `failed(job)` = 队列说这条已经没成。**这里只报失败**，所以永远产出
+    /// 不了 `Fill` —— 回填只可能来自 `TransferDone`（T11）。
+    pub fn sweep(&mut self, failed: impl Fn(u64) -> bool) -> Vec<BatchDone> {
+        let gone: Vec<u64> = self
+            .batches
+            .values()
+            .flat_map(|b| {
+                b.jobs
+                    .iter()
+                    .map(|(j, _)| *j)
+                    .filter(|j| !b.finished.contains(j))
+            })
+            .filter(|j| failed(*j))
+            .collect();
+        gone.into_iter()
+            .filter_map(|j| self.job_finished(j, false))
+            .collect()
+    }
+
     /// 标签关闭：该世代的批次整体作废（`wind_down` 直接 abort task，
     /// `TransferDone` 可能永远不来，不回收就一直堆着）。
     pub fn drop_generation(&mut self, generation: u64) {
@@ -189,11 +321,13 @@ mod tests {
     fn directories_are_skipped_and_named() {
         let picked = vec![
             Picked {
+                local: "C:/x/a.txt".into(),
                 name: "a.txt".into(),
                 is_dir: false,
                 size: 3,
             },
             Picked {
+                local: "C:/x/d".into(),
                 name: "d".into(),
                 is_dir: true,
                 size: 0,
@@ -279,5 +413,137 @@ mod tests {
                 paths: vec!["/tmp/b".into()]
             })
         );
+    }
+
+    fn file(name: &str, size: u64) -> Picked {
+        Picked {
+            local: format!("C:/x/{name}").into(),
+            name: name.into(),
+            is_dir: false,
+            size,
+        }
+    }
+
+    fn plan(dir: &str, names: &[&str]) -> PastePlan {
+        PastePlan {
+            generation: 3,
+            pane: PaneId(2),
+            host_ix: Some(1),
+            dir: dir.into(),
+            files: names.iter().map(|n| file(n, 10)).collect(),
+        }
+    }
+
+    /// F330：预检出错**不得**当成「没冲突」—— 那样用户没被问过就开传。
+    ///
+    /// 自证会变红：把 `after_check` 的 `Err` 臂改成 `AfterCheck::Enqueue`。
+    #[test]
+    fn a_failed_check_is_an_error_not_a_green_light() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            after_check(&names, Err("断了".into())),
+            AfterCheck::Fail("断了".into())
+        );
+        assert_eq!(after_check(&names, Ok(vec![])), AfterCheck::Enqueue);
+        assert_eq!(
+            after_check(&names, Ok(vec!["b".into(), "zzz".into()])),
+            AfterCheck::Ask(vec!["b".into()])
+        );
+    }
+
+    /// F330：冲突框最多列 8 个名字，多的折成一行并报出还剩几个。
+    ///
+    /// 自证会变红：去掉 `take(CONFLICT_LIST_MAX)`，或不追加「等另外 N 个」。
+    #[test]
+    fn the_conflict_list_is_capped_and_says_how_many_more() {
+        let few: Vec<String> = (0..3).map(|i| format!("f{i}")).collect();
+        assert_eq!(conflict_lines(&few), few);
+        let many: Vec<String> = (0..11).map(|i| format!("f{i}")).collect();
+        let lines = conflict_lines(&many);
+        assert_eq!(lines.len(), CONFLICT_LIST_MAX + 1);
+        assert_eq!(lines[..CONFLICT_LIST_MAX], many[..CONFLICT_LIST_MAX]);
+        assert_eq!(lines.last().unwrap(), "等另外 3 个");
+    }
+
+    /// F330：点了「全部覆盖」才入队，且每条都带 `Overwrite` —— 否则 worker
+    /// 撞上已存在的目标会落成 `Conflict`，同一件事再问一遍；没冲突时入队
+    /// **不得**预设覆盖（绝不静默覆盖，F55）。
+    ///
+    /// 自证会变红：把 `enqueue` 里的 `if overwrite` 去掉（恒设），或删掉 `set_resolved`。
+    #[test]
+    fn overwrite_is_preset_only_when_the_user_chose_it() {
+        let p = plan("/tmp/", &["a.png", "b.txt"]);
+        let mut q = Queue::new(4);
+        let got = enqueue(&mut q, &p, true);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].2, "/tmp/a.png");
+        assert_eq!(got[1].2, "/tmp/b.txt");
+        for (id, f, _) in &got {
+            let j = q.get(*id).unwrap();
+            assert_eq!(j.resolved, Some(Conflict::Overwrite));
+            assert_eq!(j.dir, Direction::Upload);
+            assert_eq!(j.generation, 3);
+            assert_eq!(j.label, f.name);
+        }
+
+        let mut q = Queue::new(4);
+        for (id, _, _) in enqueue(&mut q, &p, false) {
+            assert_eq!(q.get(id).unwrap().resolved, None, "没问过用户就预设了覆盖");
+        }
+    }
+
+    /// F330：落点目录为空时落回 `/tmp`（与截图共用 `remote_join`）。
+    #[test]
+    fn an_empty_dir_lands_in_the_default() {
+        assert_eq!(plan("", &["a"]).remote_of("a"), "/tmp/a");
+    }
+
+    /// F332：只有 `Done` 且没改名才算落地；没收尾（挂在冲突上）不报。
+    ///
+    /// 自证会变红：去掉 `resolved != Some(Conflict::Rename)`，或让未收尾的也返回 `Some`。
+    #[test]
+    fn only_a_done_job_that_kept_its_name_counts_as_landed() {
+        assert_eq!(landed_as_planned(&JobState::Conflict, None), None);
+        assert_eq!(landed_as_planned(&JobState::Running, None), None);
+        assert_eq!(landed_as_planned(&JobState::Done, None), Some(true));
+        assert_eq!(
+            landed_as_planned(&JobState::Done, Some(Conflict::Overwrite)),
+            Some(true)
+        );
+        assert_eq!(
+            landed_as_planned(&JobState::Done, Some(Conflict::Rename)),
+            Some(false),
+            "改了名的文件不在要回填的路径上"
+        );
+        for s in [
+            JobState::Skipped,
+            JobState::Canceled,
+            JobState::Failed("x".into()),
+        ] {
+            assert_eq!(landed_as_planned(&s, None), Some(false), "{s:?}");
+        }
+    }
+
+    /// F332：不经 `TransferDone` 收尾的 job（排队中被取消 / 跳过）要能结算成
+    /// `Abandoned`，否则批次永远挂着、用户等不到提示；且 sweep 永远产不出 `Fill`。
+    ///
+    /// 自证会变红：让 `sweep` 返回空 `Vec`，或把 `job_finished(j, false)` 改成 `true`。
+    #[test]
+    fn a_job_that_ends_without_transfer_done_still_settles_the_batch_as_abandoned() {
+        let mut t = BatchTracker::default();
+        t.open(
+            7,
+            1,
+            PaneId(10),
+            vec![(100, "/tmp/a".into()), (101, "/tmp/b".into())],
+        );
+        assert_eq!(t.job_finished(100, true), None);
+        assert!(t.sweep(|_| false).is_empty(), "没人失败不该结算");
+        assert_eq!(
+            t.sweep(|j| j == 101),
+            vec![BatchDone::Abandoned { failed: 1 }]
+        );
+        assert!(t.sweep(|_| true).is_empty(), "已结算的批次不重复报");
+        assert_eq!(t.job_finished(101, true), None);
     }
 }
