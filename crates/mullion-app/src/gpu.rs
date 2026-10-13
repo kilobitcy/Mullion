@@ -1,7 +1,7 @@
 //! GPU 层:背景/光标色块生成(纯,可测)+ wgpu 表面与色块管线(GPU 胶水,见 Task 8)。
 
 use mullion_term::palette::DefaultColors;
-use mullion_term::snapshot::GridSnapshot;
+use mullion_term::snapshot::{GridSnapshot, Rgb};
 
 /// 一个实心色块(背景 / 光标),像素坐标(左上原点)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +72,43 @@ pub fn style_for(
     }
 }
 
+/// F333:Claude Code 隐掉真光标(`?25l`)、用一格 SGR 7 反显自绘输入位置(见
+/// fixture `claude-code-input-cursor`)。反显在 emulator 里已解析成对调后的
+/// 颜色(快照没有 INVERSE 标志),所以判据是「光标格的底色 == 默认前景色」。
+/// 返回该格 `(行, 列)`;不是这种画面时 `None`。
+///
+/// - 只认焦点 pane:非焦点 pane 的假光标保持静态(与 `style_for` 非焦点恒
+///   空心框同一取向)。
+/// - 只认 `shape == Hidden`:真光标可见时由 `style_for` 那一路闪,这里再管
+///   就是双重处理。
+/// - 选中格不认:选区反色(F18)压过假光标,灭相位改颜色会把选区高亮吃掉。
+///
+/// 只吃默认**前景**色而非整组 `DefaultColors`:判据和灭相位的字色都只用到
+/// 它,而文字层/带指纹/整帧指纹手里只有前景色(`TextLayer::default_fg`、
+/// `StyleKey::default_fg`),四处必须问同一个函数。
+pub fn fake_cursor_cell(snap: &GridSnapshot, focused: bool, default_fg: Rgb) -> Option<(u16, u16)> {
+    use mullion_term::snapshot::CursorShape as S;
+    let c = &snap.cursor;
+    // `row()` 越界会 panic(切片),渲染路径不许 panic:行号不一致时直接不认。
+    if !focused || c.shape != S::Hidden || !c.visible || c.row >= snap.rows {
+        return None;
+    }
+    let cell = snap.row(c.row).get(usize::from(c.col))?;
+    (!cell.spacer && !cell.selected && cell.bg == default_fg).then_some((c.row, c.col))
+}
+
+/// F333:这一帧该不该把假光标画成「灭」——闪烁灭相位且命中
+/// [`fake_cursor_cell`]。**唯一判据源**:色块(`quads_for_panes`)、文字色
+/// (`text::TextLayer::prepare_panes`)、行带指纹(`bands::plan_bands`)、整帧
+/// 指纹(`frame_fp::hash_pane`)四处都走它,不许各写一份 —— 任何一处判法
+/// 不同,症状都是「闪一下就停」或「字色与底色错相位」,编译/测试全静默。
+pub fn fake_cursor_off(p: &PaneRender<'_>, default_fg: Rgb, blink_on: bool) -> Option<(u16, u16)> {
+    if blink_on {
+        return None;
+    }
+    fake_cursor_cell(p.snap, p.focused, default_fg)
+}
+
 /// 一个 pane 的渲染输入。
 pub struct PaneRender<'a> {
     pub geom: PaneGeom,
@@ -100,6 +137,10 @@ const HOLLOW_PX: f32 = 1.0;
 ///
 /// `cursor_col_override`:F126 组字期间光标要画在拼音串末尾而不是原始列号,
 /// 传 `Some` 覆盖 `snap.cursor.col`;`None` 时用快照自带的列(绝大多数调用)。
+///
+/// `plain_cell`:F333 假光标灭相位的那一格 `(行, 列)`,该格背景色块不画、落回
+/// 默认底(由 [`fake_cursor_off`] 给出,`None` = 没有)。
+#[allow(clippy::too_many_arguments)] // F333 加了 plain_cell,已到 8 参;同 `text::shape_run` 一样的豁免
 pub fn quads_for(
     snap: &GridSnapshot,
     origin: (f32, f32),
@@ -108,11 +149,17 @@ pub fn quads_for(
     defaults: DefaultColors,
     cursor: CursorStyle,
     cursor_col_override: Option<u16>,
+    plain_cell: Option<(u16, u16)>,
 ) -> Vec<Quad> {
     let mut quads = Vec::new();
     for row in 0..snap.rows {
         for (col, cell) in snap.row(row).iter().enumerate() {
             if cell.spacer {
+                continue;
+            }
+            // F333:灭相位的假光标格当普通格画 —— 不出底色块。`fake_cursor_cell`
+            // 已排除选中格,这里排在选区分支前面不会吃掉选区高亮。
+            if plain_cell == Some((row, col as u16)) {
                 continue;
             }
             // F18:选中格画反色底——用前景色当底,文字那趟同步改用 bg 色
@@ -254,6 +301,7 @@ pub fn quads_for_panes(
                 defaults,
                 style,
                 cursor_col_override,
+                fake_cursor_off(p, defaults.fg, blink_on),
             )
             .into_iter()
             .filter_map(|q| clamp_quad_to_bounds(q, bounds)),
@@ -899,6 +947,7 @@ mod tests {
             DefaultColors::default(),
             CursorStyle::Block,
             None,
+            None,
         );
         assert_eq!(quads.len(), 2, "一个背景块 + 一个光标块");
         for q in &quads {
@@ -919,6 +968,7 @@ mod tests {
             DefaultColors::default(),
             CursorStyle::Block,
             None,
+            None,
         );
         assert!(quads.is_empty(), "默认背景不该产生色块(省 GPU)");
     }
@@ -933,6 +983,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
             None,
         );
         assert_eq!(quads.len(), 1);
@@ -959,6 +1010,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
             None,
         );
         assert_eq!(quads.len(), 1, "仅光标块(默认背景无块)");
@@ -1000,6 +1052,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Block,
+            None,
             None,
         );
         assert_eq!(quads.len(), 1, "选中格必须画底色块");
@@ -1044,6 +1097,7 @@ mod tests {
             DefaultColors { fg, bg },
             CursorStyle::Block,
             None,
+            None,
         );
         let cursor = quads.last().expect("光标可见时应有一个 quad");
         assert_eq!(cursor.color, [0xe4, 0xe6, 0xf0], "光标色应取注入的默认前景");
@@ -1065,6 +1119,7 @@ mod tests {
             },
             CursorStyle::Block,
             None,
+            None,
         );
         assert!(
             quads.is_empty(),
@@ -1085,6 +1140,7 @@ mod tests {
             20.0,
             DefaultColors::default(),
             CursorStyle::Hollow,
+            None,
             None,
         );
         assert_eq!(quads.len(), 4, "空心光标 = 上下左右四条边");
@@ -1130,6 +1186,7 @@ mod tests {
                 20.0,
                 DefaultColors::default(),
                 style,
+                None,
                 None,
             );
             assert!(quads.is_empty(), "光标不可见时不该画: {style:?}");
@@ -1280,6 +1337,7 @@ mod tests {
                 bg: Rgb::new(0x10, 0x10, 0x10),
             },
             style,
+            None,
             None,
         )
     }
@@ -1893,5 +1951,172 @@ mod tests {
              每帧照旧新建,而画面完全正确、测试全绿",
             body.get(at.wrapping_sub(1)).copied().unwrap_or("<无>")
         );
+    }
+
+    // ---- F333:焦点 pane 里 Claude Code 的自绘假光标闪烁 ----
+
+    /// 一行 3 格,光标停在第 1 格,真光标被隐藏;第 1 格是反显
+    /// (底 = 默认前景、字 = 默认底)—— Claude Code 输入框的样子。
+    fn fake_cursor_snap() -> GridSnapshot {
+        let d = DefaultColors::default();
+        let plain = SnapCell {
+            ch: 'h',
+            fg: d.fg,
+            bg: d.bg,
+            width: 1,
+            spacer: false,
+            selected: false,
+        };
+        let inverse = SnapCell {
+            ch: 'i',
+            fg: d.bg,
+            bg: d.fg,
+            ..plain
+        };
+        GridSnapshot::new(
+            3,
+            1,
+            vec![plain, inverse, plain],
+            Cursor {
+                row: 0,
+                col: 1,
+                visible: true,
+                shape: CursorShape::Hidden,
+                blinking: true,
+            },
+        )
+    }
+
+    /// 焦点 + 真光标隐藏 + 光标格反显 → 认出那一格。
+    ///
+    /// 自证会变红:把 `fake_cursor_cell` 末尾的 `cell.bg == default_fg` 改成
+    /// `cell.fg == default_fg`(判反了)。
+    #[test]
+    fn the_inverse_cell_under_a_hidden_cursor_is_the_fake_cursor() {
+        let s = fake_cursor_snap();
+        assert_eq!(
+            fake_cursor_cell(&s, true, DefaultColors::default().fg),
+            Some((0, 1))
+        );
+    }
+
+    /// 非焦点 pane 的假光标保持静态 —— 认都不认,后面四处自然都不动。
+    ///
+    /// 自证会变红:删掉 `fake_cursor_cell` 里的 `!focused ||`。
+    #[test]
+    fn an_unfocused_pane_has_no_blinking_fake_cursor() {
+        let s = fake_cursor_snap();
+        assert_eq!(
+            fake_cursor_cell(&s, false, DefaultColors::default().fg),
+            None
+        );
+    }
+
+    /// 真光标可见(shape 不是 `Hidden`)时由 `style_for` 那一路闪,这里不能
+    /// 再认一次 —— 否则一格反显文字恰好在光标下就会被双重处理。
+    ///
+    /// 自证会变红:删掉 `fake_cursor_cell` 里的 `c.shape != S::Hidden ||`。
+    #[test]
+    fn a_visible_real_cursor_is_not_a_fake_one() {
+        let mut s = fake_cursor_snap();
+        s.cursor.shape = CursorShape::Block;
+        assert_eq!(
+            fake_cursor_cell(&s, true, DefaultColors::default().fg),
+            None
+        );
+    }
+
+    /// 光标格不是反显(普通格)→ 不是假光标。选中格也不认:选区反色(F18)
+    /// 压过假光标,灭相位改色会把选区高亮吃掉。
+    ///
+    /// 自证会变红:把 `fake_cursor_cell` 末尾的判据整句换成 `true`。
+    #[test]
+    fn a_plain_or_selected_cell_under_the_cursor_is_not_a_fake_cursor() {
+        let fg = DefaultColors::default().fg;
+        let mut s = fake_cursor_snap();
+        s.cursor.col = 0;
+        assert_eq!(fake_cursor_cell(&s, true, fg), None, "普通格");
+
+        let base = fake_cursor_snap();
+        let mut cells = base.cells.clone();
+        cells[1].selected = true;
+        let s = GridSnapshot::new(3, 1, cells, base.cursor);
+        assert_eq!(fake_cursor_cell(&s, true, fg), None, "选中格");
+    }
+
+    /// **真字节流**:把录下来的 Claude Code 输入框喂给 `Emulator`,判据必须
+    /// 恰好落在 `.snap` 头两行写的那一格上(`cursor row=25 col=4`、
+    /// `inverse cells: [25,4]`)。尺寸与录制一致(fixtures/README.md:
+    /// `tmux new-session -x 100 -y 30`)。
+    ///
+    /// 只拿手搓快照测的话,「反显在 emulator 里到底被解析成什么颜色」这件事
+    /// 没人钉 —— 判据写成 `fg == default_bg` 或去比 INVERSE 标志,手搓测试
+    /// 照样绿,真机上一格都认不出。
+    #[test]
+    fn the_recorded_claude_code_input_box_yields_its_fake_cursor_cell() {
+        let mut emu = mullion_term::emulator::Emulator::new(100, 30);
+        emu.feed(include_bytes!(
+            "../../mullion-term/tests/fixtures/claude-code-input-cursor.bin"
+        ));
+        let snap = emu.snapshot();
+        assert_eq!(
+            fake_cursor_cell(&snap, true, DefaultColors::default().fg),
+            Some((25, 4))
+        );
+    }
+
+    fn one_pane(snap: &GridSnapshot, focused: bool) -> [PaneRender<'_>; 1] {
+        let r = PxRect {
+            x: 0,
+            y: 0,
+            w: 30,
+            h: 20,
+        };
+        [PaneRender {
+            geom: PaneGeom {
+                id: mullion_core::layout::PaneId(1),
+                px: r,
+                title_px: PxRect {
+                    x: 0,
+                    y: 0,
+                    w: 30,
+                    h: 0,
+                },
+                term_px: r,
+                grid: (3, 1),
+            },
+            snap,
+            focused,
+            preedit: "",
+        }]
+    }
+
+    /// 灭相位:假光标那一格的底色块不画(落回默认底);亮相位照画。非焦点
+    /// pane 两个相位一模一样(静态)。
+    ///
+    /// 自证会变红:把 `quads_for_panes` 里传给 `quads_for` 的
+    /// `fake_cursor_off(p, defaults.fg, blink_on)` 换成 `None`。
+    #[test]
+    fn the_fake_cursor_cell_loses_its_block_only_in_the_off_phase_of_the_focused_pane() {
+        let s = fake_cursor_snap();
+        let d = DefaultColors::default();
+        let block = Quad {
+            x: 10.0,
+            y: 0.0,
+            w: 10.0,
+            h: 20.0,
+            color: [d.fg.r, d.fg.g, d.fg.b],
+        };
+        let on = quads_for_panes(&one_pane(&s, true), 10.0, 20.0, d, true);
+        assert_eq!(on, vec![block], "亮相位:反显块照画");
+        let off = quads_for_panes(&one_pane(&s, true), 10.0, 20.0, d, false);
+        assert!(off.is_empty(), "灭相位:那一格落回默认底,实得 {off:?}");
+        for blink in [true, false] {
+            assert_eq!(
+                quads_for_panes(&one_pane(&s, false), 10.0, 20.0, d, blink),
+                vec![block],
+                "非焦点 pane 的假光标保持静态"
+            );
+        }
     }
 }

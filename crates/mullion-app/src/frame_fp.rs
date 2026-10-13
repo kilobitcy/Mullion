@@ -129,7 +129,7 @@ pub fn frame_fingerprint(
     }
     h.u64(panes.len() as u64);
     for p in panes {
-        hash_pane(&mut h, p, blink_on);
+        hash_pane(&mut h, p, blink_on, style.default_fg);
     }
     FrameFp::Hash(h.0)
 }
@@ -216,7 +216,9 @@ fn hash_paint_jobs(h: &mut Fnv, jobs: &[egui::ClippedPrimitive]) -> bool {
     true
 }
 
-fn hash_pane(h: &mut Fnv, pane: &PaneRender<'_>, blink_on: bool) {
+/// `default_fg`:F333 假光标判据要的默认前景色,取 `StyleKey::default_fg`
+/// (即 `TextLayer::default_fg`,与文字层/带指纹同源)。
+fn hash_pane(h: &mut Fnv, pane: &PaneRender<'_>, blink_on: bool, default_fg: Rgb) {
     // 穷尽解构 —— 给 `PaneRender` 加字段时编译报错。
     let PaneRender {
         geom,
@@ -249,6 +251,12 @@ fn hash_pane(h: &mut Fnv, pane: &PaneRender<'_>, blink_on: bool) {
     // 指纹(白出 2 帧),而非焦点 pane 恒画空心光标、根本不跟着闪,也会
     // 被算成「变了」。判在结果上,这两件事自动对。
     h.byte(style_for(shape, *focused, blink_on) as u8);
+    // F333 假光标(Claude Code 隐掉真光标、用一格反显自绘)的闪烁相位。
+    // 它只在渲染层改一格的底色/字色,快照不变、行指纹不变,而真光标是
+    // `Hidden`、上面那句 `style_for` 恒为 `None` —— 漏掉这一位,整帧在灭
+    // 相位被判「没变」跳过,假光标永远不闪,编译/测试/日志全静默。
+    // 同样判在结果上:非焦点 pane 的假光标不闪,这一位恒 false,不白出帧(T3)。
+    h.bool(crate::gpu::fake_cursor_off(pane, default_fg, blink_on).is_some());
     // F12 的行指纹。`SnapCell.selected` 在内,划选反色自动覆盖;主题换色
     // 也已经烘进快照的 fg/bg。
     for r in 0..snap.rows {
@@ -534,6 +542,58 @@ mod tests {
         assert!(
             fp(false, true).same_as(&fp(false, false)),
             "非焦点 pane 恒画空心光标,却跟着相位白出帧"
+        );
+    }
+
+    /// F333:Claude Code 隐掉真光标、用一格反显自绘输入位置。焦点 pane 上
+    /// **同一帧只翻 `blink_on`**,指纹必须不同 —— 否则灭相位那帧被判「没变」
+    /// 跳过,假光标永远不闪(真光标是 `Hidden`,`style_for` 那一位恒 `None`,
+    /// 救不了它)。非焦点 pane 的假光标保持静态,翻相位指纹不能变(T3)。
+    ///
+    /// 自证会变红:删掉 `hash_pane` 里那句 `h.bool(crate::gpu::fake_cursor_off(..)..)`。
+    #[test]
+    fn the_fake_cursor_blink_phase_changes_the_fingerprint() {
+        let fg = style().default_fg;
+        let plain = cell('h');
+        let inverse = SnapCell {
+            fg: Rgb { r: 0, g: 0, b: 0 },
+            bg: fg,
+            ..cell('i')
+        };
+        let s = GridSnapshot::new(
+            2,
+            1,
+            vec![plain, inverse],
+            Cursor {
+                row: 0,
+                col: 1,
+                visible: true,
+                shape: CursorShape::Hidden,
+                blinking: true,
+            },
+        );
+        let jobs = [mesh_job(1.0)];
+        let fp = |focused: bool, blink: bool| {
+            frame_fingerprint(
+                &jobs,
+                &[PaneRender {
+                    geom: geom(),
+                    snap: &s,
+                    focused,
+                    preedit: "",
+                }],
+                blink,
+                style(),
+                (800, 600),
+            )
+        };
+        assert!(
+            !fp(true, true).same_as(&fp(true, false)),
+            "焦点 pane 假光标翻相位没改变指纹 —— 灭相位整帧被跳过,假光标不会闪"
+        );
+        assert!(
+            fp(false, true).same_as(&fp(false, false)),
+            "非焦点 pane 的假光标是静态的,却跟着相位白出帧"
         );
     }
 

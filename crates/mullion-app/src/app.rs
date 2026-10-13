@@ -18253,6 +18253,9 @@ fn render_frame(
             panes,
             res,
             theme::term_default_colors(&MULLION_DARK).fg,
+            // F333:假光标灭相位要改那一格的字色,与上面 `quads_for_panes`
+            // 撤底色必须是同一个相位。
+            blink_on,
         ) {
             log::warn!(target: "mullion", "glyphon prepare 失败,跳过本帧: {e:?}");
             diag::count_skipped();

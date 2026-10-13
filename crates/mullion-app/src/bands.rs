@@ -85,6 +85,11 @@ pub struct BandInput<'a> {
     /// 组字串的文字色。与 [`Self::default_fg`] 是两个量(`prepare_panes` 收
     /// 两个独立参数),换主题时可以分别变。
     pub preedit_fg: Rgb,
+    /// F333:落在本带、此刻处于闪烁灭相位的假光标格 `(行, 列)`。**不落在本带
+    /// 时必须是 `None`**(理由同 [`Self::preedit`])。灭相位只改那一格的字色,
+    /// 快照不变、行指纹看不见它 —— 不进带指纹的话这一带判干净、顶点停在
+    /// 亮相位上,闪烁只会偶尔生效。
+    pub fake_cursor_off: Option<(u16, u16)>,
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -143,6 +148,7 @@ pub fn fingerprint(i: &BandInput<'_>) -> u64 {
         preedit,
         preedit_col,
         preedit_fg,
+        fake_cursor_off,
     } = i;
     let mut h = Fnv::new();
     // 先吃行数:不吃的话「末带 3 行」与「末带 4 行、最后一行指纹恰好补上」
@@ -162,6 +168,14 @@ pub fn fingerprint(i: &BandInput<'_>) -> u64 {
     h.bytes(preedit.as_bytes());
     h.u32(u32::from(*preedit_col));
     h.rgb(*preedit_fg);
+    match fake_cursor_off {
+        Some((r, c)) => {
+            h.byte(1);
+            h.u32(u32::from(*r));
+            h.u32(u32::from(*c));
+        }
+        None => h.byte(0),
+    }
     h.0
 }
 
@@ -216,11 +230,15 @@ pub fn plan_bands(
     style: u64,
     default_fg: Rgb,
     preedit_fg: Rgb,
+    blink_on: bool,
     force_full: bool,
 ) -> Vec<BandPlan> {
     let mut out = Vec::new();
     for p in panes {
         let pane_id = p.geom.id.0;
+        // F333:与 `text::prepare_panes` 改字色、`gpu::quads_for_panes` 撤底色
+        // 问的是同一个判据,前景色也是同一个(`TextLayer::default_fg`)。
+        let fake_off = crate::gpu::fake_cursor_off(p, default_fg, blink_on);
         for b in 0..band_count(p.snap.rows) {
             let lo = b * BAND_ROWS;
             let hi = (lo + BAND_ROWS).min(p.snap.rows);
@@ -241,6 +259,7 @@ pub fn plan_bands(
                 preedit: if here { p.preedit } else { "" },
                 preedit_col: if here { p.snap.cursor.col } else { 0 },
                 preedit_fg,
+                fake_cursor_off: fake_off.filter(|&(r, _)| (lo..hi).contains(&r)),
             });
             let key = (pane_id, b);
             out.push(BandPlan {
@@ -291,6 +310,7 @@ mod tests {
             preedit,
             preedit_col: 7,
             preedit_fg: Rgb { r: 4, g: 5, b: 6 },
+            fake_cursor_off: None,
         }
     }
 
@@ -353,6 +373,13 @@ mod tests {
         let mut i = base(&rows, "ni");
         i.preedit_col = 8;
         assert_ne!(f0, fingerprint(&i), "组字串挪了一列");
+
+        let mut i = base(&rows, "ni");
+        i.fake_cursor_off = Some((1, 4));
+        let off = fingerprint(&i);
+        assert_ne!(f0, off, "假光标进入灭相位(F333)");
+        i.fake_cursor_off = Some((1, 5));
+        assert_ne!(off, fingerprint(&i), "灭相位的假光标挪了一列(F333)");
     }
 
     /// 同样的输入必须得到同样的指纹 —— 否则每一带每一帧都脏,改动纯亏。
@@ -516,7 +543,7 @@ mod tests {
         };
 
         fn plan(p: &[PaneRender<'_>], prev: &dyn Fn((u32, u16)) -> Option<u64>) -> Vec<BandPlan> {
-            plan_bands(p, prev, 0xabcd, FG, PRE_FG, false)
+            plan_bands(p, prev, 0xabcd, FG, PRE_FG, true, false)
         }
 
         fn render<'a>(s: &'a GridSnapshot, g: PaneGeom, preedit: &'a str) -> PaneRender<'a> {
@@ -592,12 +619,20 @@ mod tests {
         fn changing_the_theme_dirties_every_band() {
             let s = snap(None, 0);
             let p = [render(&s, geom(0), "")];
-            let base = plan_bands(&p, &|_| None, 0xabcd, FG, PRE_FG, false);
+            let base = plan_bands(&p, &|_| None, 0xabcd, FG, PRE_FG, true, false);
             let prev: std::collections::BTreeMap<_, _> =
                 base.iter().map(|b| (b.key, b.fp)).collect();
 
             let other = Rgb { r: 9, g: 9, b: 9 };
-            let got = plan_bands(&p, &|k| prev.get(&k).copied(), 0xabcd, other, PRE_FG, false);
+            let got = plan_bands(
+                &p,
+                &|k| prev.get(&k).copied(),
+                0xabcd,
+                other,
+                PRE_FG,
+                true,
+                false,
+            );
             assert!(got.iter().all(|b| b.dirty), "换了兜底文字色,全部带都得重建");
         }
 
@@ -622,6 +657,56 @@ mod tests {
             assert_eq!(dirty, vec![1], "组字只该弄脏光标所在的那一带");
         }
 
+        /// F333:假光标闪到灭相位只改一格字色,快照与行指纹纹丝不动 —— 带指纹
+        /// 不吃它的话,这一带判干净、`prepare` 不跑,顶点停在亮相位,闪烁
+        /// 根本不生效。同时钉住:**只弄脏光标那一带**,非焦点 pane 一带都不脏
+        /// (假光标在那里保持静态,翻相位不该白重建顶点,T3)。
+        ///
+        /// 自证会变红:把 `plan_bands` 里的 `fake_cursor_off: fake_off.filter(..)`
+        /// 改成恒 `None`(焦点那条红),或去掉 `.filter(..)` 直接传 `fake_off`
+        /// (只脏一带那条红)。
+        #[test]
+        fn the_fake_cursor_blink_dirties_only_its_band_and_only_when_focused() {
+            // 光标在第 20 行 → 第 1 带;真光标被隐藏,光标格是反显(底 = 默认前景)。
+            let mut s = snap(None, 20);
+            s.cursor.shape = CursorShape::Hidden;
+            let mut cells: Vec<SnapCell> = (0..ROWS).flat_map(|r| s.row(r).to_vec()).collect();
+            let ix = 20 * COLS as usize + 2;
+            cells[ix].bg = FG;
+            cells[ix].fg = Rgb { r: 0, g: 0, b: 0 };
+            let s = GridSnapshot::new(COLS, ROWS, cells, s.cursor);
+            let g = geom(0);
+            for focused in [true, false] {
+                let p = [PaneRender {
+                    geom: g,
+                    snap: &s,
+                    focused,
+                    preedit: "",
+                }];
+                let on = plan_bands(&p, &|_| None, 0xabcd, FG, PRE_FG, true, false);
+                let prev: std::collections::BTreeMap<_, _> =
+                    on.iter().map(|b| (b.key, b.fp)).collect();
+                let off = plan_bands(
+                    &p,
+                    &|k| prev.get(&k).copied(),
+                    0xabcd,
+                    FG,
+                    PRE_FG,
+                    false,
+                    false,
+                );
+                let dirty: Vec<u16> = off.iter().filter(|b| b.dirty).map(|b| b.key.1).collect();
+                if focused {
+                    assert_eq!(dirty, vec![1], "灭相位只该弄脏假光标所在的那一带");
+                } else {
+                    assert!(
+                        dirty.is_empty(),
+                        "非焦点 pane 的假光标不闪,翻相位不该重建顶点"
+                    );
+                }
+            }
+        }
+
         /// 静止的一帧必须全带命中 —— 这是心跳态省下 8~16ms 的前提。
         /// 它红了说明指纹里混进了每帧都变的东西。
         #[test]
@@ -643,7 +728,15 @@ mod tests {
             let base = plan(&p, &|_| None);
             let prev: std::collections::BTreeMap<_, _> =
                 base.iter().map(|b| (b.key, b.fp)).collect();
-            let got = plan_bands(&p, &|k| prev.get(&k).copied(), 0xabcd, FG, PRE_FG, true);
+            let got = plan_bands(
+                &p,
+                &|k| prev.get(&k).copied(),
+                0xabcd,
+                FG,
+                PRE_FG,
+                true,
+                true,
+            );
             assert!(got.iter().all(|b| b.dirty));
         }
     }

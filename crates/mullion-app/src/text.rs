@@ -2,7 +2,7 @@
 //! 以及 glyphon 资源封装(GPU 胶水,见 Task 8)。
 
 use glyphon::Color;
-use mullion_term::snapshot::{Rgb, SnapCell};
+use mullion_term::snapshot::{GridSnapshot, Rgb, SnapCell};
 
 /// term 的 Rgb → glyphon 颜色。
 pub fn to_color(c: Rgb) -> Color {
@@ -281,6 +281,29 @@ pub fn hidden_span_for_row(p: &PaneRender<'_>, row: u16) -> Option<(u16, u16)> {
     }
     let cells = preedit_layout(p.snap.cols, p.snap.cursor.col, p.preedit);
     preedit_span(&cells)
+}
+
+/// F333:灭相位的假光标格落回默认底(`gpu::quads_for` 不画它的底色块),
+/// 字色也得改回默认前景,否则有字符时是深字落在深底上读不出。
+///
+/// 返回 `Some(改过色的这一行)` = 这一行要用它排版、且**不许进整形缓存**
+/// (调用方据此走 `RowPlan::Temporary`,理由见 `prepare_panes` 里的注释);
+/// `None` = 这一行与假光标无关,照常用快照里的原行。只拷这一行。
+///
+/// `fake_off` 取自 [`crate::gpu::fake_cursor_off`],不在这里另判。抽成自由
+/// 函数是为了无 GPU 可测(`prepare_panes` 要真实 wgpu 设备)。
+pub fn fake_cursor_plain_row(
+    snap: &GridSnapshot,
+    row: u16,
+    fake_off: Option<(u16, u16)>,
+    default_fg: Rgb,
+) -> Option<Vec<SnapCell>> {
+    let (_, col) = fake_off.filter(|&(r, _)| r == row && r < snap.rows)?;
+    let mut cells = snap.row(row).to_vec();
+    if let Some(c) = cells.get_mut(usize::from(col)) {
+        c.fg = default_fg;
+    }
+    Some(cells)
 }
 
 /// 内置默认字体族名。须在系统里已安装;未装则 cosmic-text 回退到默认字体
@@ -640,6 +663,7 @@ impl TextLayer {
         panes: &[PaneRender<'_>],
         res: Resolution,
         preedit_fg: Rgb,
+        blink_on: bool,
     ) -> Result<(), glyphon::PrepareError> {
         use crate::shaped_cache::{CachedRun, RowPlan};
 
@@ -660,6 +684,7 @@ impl TextLayer {
         let advance_memo = &mut self.advance_memo;
         let (cell_w, cell_h) = (self.cell_w, self.cell_h);
         let font_px = self.font_px;
+        let default_fg = self.default_fg;
 
         cache.begin_frame();
         row_fp.begin_frame();
@@ -682,12 +707,24 @@ impl TextLayer {
             // pane 会让它挪位 —— 拿它当键会张冠李戴。
             let pane_id = p.geom.id;
             let term_w = p.geom.term_px.w;
+            // F333 假光标灭相位。**为什么要在这里单独处理**(spike 结论):
+            // 灭相位只改一格的字色,快照一个字节没动 —— 行指纹 `row_hash`
+            // 不变,整形缓存(内容寻址,键 = 行指纹 + term_w)会原样命中亮相位
+            // 的整形结果(深字),颜色根本换不过来。所以这一行改走临时槽
+            // (`RowPlan::Temporary`,与组字行同一条路),**不进整形缓存**:
+            // 写进去的话亮相位回来时同键命中的是灭相位的颜色,缓存被污染。
+            // 行带那一层同理,`bands::plan_bands` 另把这一格吃进带指纹,
+            // 否则带判干净、`prepare` 不跑,顶点停在亮相位上 —— 闪烁只在
+            // 「恰好有别的东西把这一带弄脏」时才偶尔生效。
+            let fake_off = crate::gpu::fake_cursor_off(p, default_fg, blink_on);
             for row in 0..p.snap.rows {
                 // F126:组字中的拼音串占的列区间只在光标行生效——正文 run 要
                 // 在这个区间让路(见 `row_to_runs` 的 `hidden` 参数文档),
                 // 不然背景 quad 盖不住排在它后面的文字层,拼音会和原字符的
                 // 字形叠在一起。
                 let hidden = hidden_span_for_row(p, row);
+                let plain_row = fake_cursor_plain_row(p.snap, row, fake_off, default_fg);
+                let cells: &[SnapCell] = plain_row.as_deref().unwrap_or(p.snap.row(row));
                 let hash = p.snap.row_hash(row);
                 // 内容寻址的整形缓存键:整形结果只取决于(内容, term_w, 字体),
                 // 字体那一维走 `set_font` 里的显式 clear。
@@ -697,7 +734,10 @@ impl TextLayer {
                 if row_fp.note((pane_id, row), hash) {
                     changed_rows.push(row);
                 }
-                match crate::shaped_cache::plan_row(cache.get(key), hidden.is_some()) {
+                match crate::shaped_cache::plan_row(
+                    cache.get(key),
+                    hidden.is_some() || plain_row.is_some(),
+                ) {
                     RowPlan::Reuse => {
                         hits += 1;
                         cache.touch(key);
@@ -772,7 +812,7 @@ impl TextLayer {
                                     c,
                                 )
                             };
-                            row_to_runs(p.snap.row(row), hidden, &mut fits)
+                            row_to_runs(cells, hidden, &mut fits)
                         };
                         for run in row_runs {
                             if temp_n == temp.len() {
@@ -860,6 +900,7 @@ impl TextLayer {
             style,
             self.default_fg,
             preedit_fg,
+            blink_on,
             force_full,
         );
         let dirty_n = plans.iter().filter(|b| b.dirty).count();
@@ -2636,5 +2677,54 @@ mod tests {
             }
         }
         println!("(60Hz 一帧预算 16.667ms。以上是**单 pane**,8 pane 分屏乘 8)");
+    }
+
+    /// F333:灭相位的假光标格要换回默认前景色 —— 那一格的底色块已经撤掉、
+    /// 落回深色默认底,原来的深色字(反显后的前景)落在上面读不出。只动
+    /// 那一格、只在那一行;别的行返回 `None` 照常走整形缓存。
+    ///
+    /// 自证会变红:把 `fake_cursor_plain_row` 里的 `c.fg = default_fg;` 删掉
+    /// (颜色那条红),或把 `r == row &&` 删掉(别的行那条红)。
+    #[test]
+    fn the_off_phase_fake_cursor_cell_is_drawn_in_the_default_foreground() {
+        let dark = Rgb::new(0x14, 0x16, 0x1f);
+        let light = Rgb::new(0xe4, 0xe6, 0xf0);
+        let mut inverse = cell('i', dark, false);
+        inverse.bg = light;
+        let row0 = [cell('h', light, false), inverse];
+        let row1 = [cell('x', light, false), cell('y', light, false)];
+        let snap = GridSnapshot::new(
+            2,
+            2,
+            row0.iter().chain(row1.iter()).copied().collect(),
+            mullion_term::snapshot::Cursor {
+                row: 0,
+                col: 1,
+                visible: true,
+                shape: mullion_term::snapshot::CursorShape::Hidden,
+                blinking: true,
+            },
+        );
+        let off = Some((0, 1));
+
+        let plain = fake_cursor_plain_row(&snap, 0, off, light).expect("光标行该被改色");
+        assert_eq!(plain[1].fg, light, "灭相位那格的字色要换回默认前景");
+        assert_eq!(plain[0], row0[0], "同一行别的格不许动");
+        // 走到 run 这一层也确实是浅色字(颜色是 `row_to_spans` 从 `fg` 取的)。
+        let runs = row_to_runs(&plain, None, &mut |_| true);
+        let colors: Vec<Color> = runs
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.1))
+            .collect();
+        assert_eq!(colors, vec![to_color(light)], "整行该是一段浅色字");
+
+        assert!(
+            fake_cursor_plain_row(&snap, 1, off, light).is_none(),
+            "别的行不该被拷出来走临时槽"
+        );
+        assert!(
+            fake_cursor_plain_row(&snap, 0, None, light).is_none(),
+            "亮相位(`fake_cursor_off` 给 None)照常走整形缓存"
+        );
     }
 }
