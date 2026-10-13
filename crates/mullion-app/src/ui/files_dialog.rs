@@ -147,6 +147,9 @@ pub enum FileOp {
     /// 它 —— 「取消」就是整批不传,没有处置要发。
     PasteFiles {
         plan: crate::paste_files::PastePlan,
+        /// 框里列给用户看过的冲突名。只有它们预设覆盖 —— 预检之后才冒出来的
+        /// 同名用户没确认过，照常走传输冲突框（F55）。
+        confirmed: Vec<String>,
     },
 }
 
@@ -636,7 +639,10 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                         .button(egui::RichText::new("全部覆盖").color(theme::c32(t.danger_text)))
                         .clicked()
                     {
-                        op = Some(FileOp::PasteFiles { plan: plan.clone() });
+                        op = Some(FileOp::PasteFiles {
+                            plan: plan.clone(),
+                            confirmed: names.clone(),
+                        });
                         close = true;
                     }
                     if ui.button("取消").clicked() {
@@ -1444,7 +1450,8 @@ mod tests {
         assert_eq!(
             click_button(&mut d, "全部覆盖"),
             Some(FileOp::PasteFiles {
-                plan: sample_paste_plan()
+                plan: sample_paste_plan(),
+                confirmed: vec!["a.png".into()],
             })
         );
         assert!(d.is_none(), "点完「全部覆盖」框没关");

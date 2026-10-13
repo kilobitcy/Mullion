@@ -7905,8 +7905,8 @@ impl App {
         }
         // F330:终端粘贴文件的冲突框点了「全部覆盖」—— 只是入队,不发远端
         // 写请求。计划里冻着自己的世代,`generation` 参数不参与。
-        if let FileOp::PasteFiles { plan } = op {
-            self.enqueue_paste_files(plan, true);
+        if let FileOp::PasteFiles { plan, confirmed } = op {
+            self.enqueue_paste_files(plan, &confirmed);
             return;
         }
         // F53:编辑冲突的处置。同上,不走远端写操作那条通用路径 ——
@@ -9957,7 +9957,7 @@ impl App {
             return;
         }
         match crate::paste_files::after_check(&plan.names(), result) {
-            crate::paste_files::AfterCheck::Enqueue => self.enqueue_paste_files(plan, false),
+            crate::paste_files::AfterCheck::Enqueue => self.enqueue_paste_files(plan, &[]),
             crate::paste_files::AfterCheck::Ask(names) => {
                 // 已经有别的文件框开着(一次只开一个):不能盖掉它 —— 那个框
                 // 可能挂着一条等处置的 job。让用户重贴一次,好过静默丢掉
@@ -9979,11 +9979,11 @@ impl App {
         }
     }
 
-    /// F330/F332:整批进全局传输队列。`overwrite` = 用户在冲突框里点了
-    /// 「全部覆盖」。批次登记在 `paste_batches`,回填只在 `TransferDone` 里
+    /// F330/F332:整批进全局传输队列。`confirmed` = 用户在冲突框里点「全部
+    /// 覆盖」时框里列的那些名字(只有它们预设覆盖,见 `paste_files::enqueue`)。批次登记在 `paste_batches`,回填只在 `TransferDone` 里
     /// 等整批落地之后做(T11:判定不从这里——调用点——起算)。
-    fn enqueue_paste_files(&mut self, plan: crate::paste_files::PastePlan, overwrite: bool) {
-        let jobs = crate::paste_files::enqueue(&mut self.transfer.queue, &plan, overwrite);
+    fn enqueue_paste_files(&mut self, plan: crate::paste_files::PastePlan, confirmed: &[String]) {
+        let jobs = crate::paste_files::enqueue(&mut self.transfer.queue, &plan, confirmed);
         let mut batch_jobs = Vec::with_capacity(jobs.len());
         for (id, f, remote) in jobs {
             let remote_path =
@@ -15523,9 +15523,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 matches!(op, FileOp::PasteFiles { .. } | FileOp::Resolve { .. })
                             }) {
                                 let gen = match &op {
-                                    crate::ui::files_dialog::FileOp::PasteFiles { plan } => {
-                                        plan.generation
-                                    }
+                                    crate::ui::files_dialog::FileOp::PasteFiles {
+                                        plan, ..
+                                    } => plan.generation,
                                     // `Resolve` 不用世代(见上),给个占位。
                                     _ => 0,
                                 };
@@ -33221,7 +33221,7 @@ mod tests {
     /// 回来之后(`accept_paste_files_checked` / 冲突框确认)。
     ///
     /// 自证会变红:在 `paste_files` 里 `let proxy` 之前插一句
-    /// `self.enqueue_paste_files(plan.clone(), false);`。
+    /// `self.enqueue_paste_files(plan.clone(), &[]);`。
     #[test]
     fn paste_files_never_enqueues_before_the_conflict_check_returns() {
         let body = body_of(prod_src(), concat!("fn paste_", "files(&mut self"));

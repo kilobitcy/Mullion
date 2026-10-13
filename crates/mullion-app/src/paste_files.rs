@@ -152,12 +152,17 @@ pub fn conflict_lines(names: &[String]) -> Vec<String> {
     out
 }
 
-/// F330：整批入队。`overwrite` = 用户已在冲突框里点了「全部覆盖」，每条预设
-/// `Overwrite` —— 不预设的话 worker 撞上已存在的目标会落成 `Conflict`，
-/// 同一件事再问一遍。
+/// F330：整批入队。`confirmed` = 用户在冲突框里点「全部覆盖」时**框里列的那些
+/// 名字**，只有它们预设 `Overwrite` —— 不预设的话 worker 撞上已存在的目标会落成
+/// `Conflict`，同一件事再问一遍。其余保持 `None`：预检之后才在远端冒出来的同名
+/// （竞态）用户没确认过，照常走传输冲突框，绝不静默覆盖（F55）。没冲突时传空。
 ///
 /// 返回 `(job id, 文件, 远端绝对路径)`，顺序同 `plan.files`（回填顺序 = 剪贴板顺序）。
-pub fn enqueue(queue: &mut Queue, plan: &PastePlan, overwrite: bool) -> Vec<(u64, Picked, String)> {
+pub fn enqueue(
+    queue: &mut Queue,
+    plan: &PastePlan,
+    confirmed: &[String],
+) -> Vec<(u64, Picked, String)> {
     plan.files
         .iter()
         .map(|f| {
@@ -167,7 +172,7 @@ pub fn enqueue(queue: &mut Queue, plan: &PastePlan, overwrite: bool) -> Vec<(u64
                 label: f.name.clone(),
                 total: f.size,
             });
-            if overwrite {
+            if confirmed.contains(&f.name) {
                 queue.set_resolved(id, Conflict::Overwrite);
             }
             (id, f.clone(), plan.remote_of(&f.name))
@@ -507,12 +512,13 @@ mod tests {
     /// 撞上已存在的目标会落成 `Conflict`，同一件事再问一遍；没冲突时入队
     /// **不得**预设覆盖（绝不静默覆盖，F55）。
     ///
-    /// 自证会变红：把 `enqueue` 里的 `if overwrite` 去掉（恒设），或删掉 `set_resolved`。
+    /// 自证会变红：把 `enqueue` 里的 `if confirmed.contains(..)` 去掉（恒设），
+    /// 或删掉 `set_resolved`。
     #[test]
     fn overwrite_is_preset_only_when_the_user_chose_it() {
         let p = plan("/tmp/", &["a.png", "b.txt"]);
         let mut q = Queue::new(4);
-        let got = enqueue(&mut q, &p, true);
+        let got = enqueue(&mut q, &p, &["a.png".into(), "b.txt".into()]);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].2, "/tmp/a.png");
         assert_eq!(got[1].2, "/tmp/b.txt");
@@ -525,9 +531,33 @@ mod tests {
         }
 
         let mut q = Queue::new(4);
-        for (id, _, _) in enqueue(&mut q, &p, false) {
+        for (id, _, _) in enqueue(&mut q, &p, &[]) {
             assert_eq!(q.get(id).unwrap().resolved, None, "没问过用户就预设了覆盖");
         }
+    }
+
+    /// F330：「全部覆盖」只覆盖冲突框里**列给用户看过**的名字。预检之后才在远端
+    /// 冒出来的同名（竞态）用户没确认过，保持 `None` 走传输冲突框（F55）。
+    ///
+    /// 自证会变红：把 `enqueue` 里的 `confirmed.contains(&f.name)` 换成
+    /// `!confirmed.is_empty()`（「确认过一个就全部覆盖」）。
+    #[test]
+    fn overwrite_covers_only_the_names_the_user_confirmed() {
+        let p = plan("/tmp/", &["a.png", "b.txt", "c.md"]);
+        let mut q = Queue::new(4);
+        let got = enqueue(&mut q, &p, &["b.txt".into()]);
+        let resolved: Vec<_> = got
+            .iter()
+            .map(|(id, f, _)| (f.name.clone(), q.get(*id).unwrap().resolved))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("a.png".to_string(), None),
+                ("b.txt".to_string(), Some(Conflict::Overwrite)),
+                ("c.md".to_string(), None),
+            ]
+        );
     }
 
     /// F330：落点目录为空时落回 `/tmp`（与截图共用 `remote_join`）。
