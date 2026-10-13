@@ -9892,6 +9892,12 @@ impl App {
             self.ui.set_toast(crate::ui::toast::Kind::Warn, msg);
             return;
         }
+        // 同名文件会落到远端同一路径上互相覆盖,回填的引用也指向同一个文件。
+        if let Some(dup) = crate::paste_files::first_duplicate_name(&files) {
+            self.ui
+                .set_error(format!("同一批里有同名文件 {dup}(来自不同文件夹),没有上传"));
+            return;
+        }
         let plan = crate::paste_files::PastePlan {
             generation,
             pane,
@@ -33234,6 +33240,26 @@ mod tests {
                 "paste_files 在预检回来之前就入队了({banned})—— 冲突框形同虚设"
             );
         }
+    }
+
+    /// **F330:同一批里的同名文件在预检之前就拒掉。**
+    ///
+    /// 来自不同文件夹的同名文件落到远端同一路径上,后传的盖掉先传的,回填的两个
+    /// 引用指向同一个文件。判定本身见 `paste_files::first_duplicate_name` 的单测;
+    /// 这里只守「真的接上了、且在发预检之前」。
+    ///
+    /// 自证会变红:把 `paste_files` 里那段 `first_duplicate_name` 判断删掉,
+    /// 或挪到 `PasteFilesChecked` 那次 `send_event` 之后。
+    #[test]
+    fn duplicate_names_are_rejected_before_the_conflict_check_goes_out() {
+        let body = body_of(prod_src(), concat!("fn paste_", "files(&mut self"));
+        let dup = body
+            .find(concat!("paste_files::", "first_duplicate_name(&files)"))
+            .expect("paste_files 没有查同一批里的同名文件");
+        let check = body
+            .find(concat!("PasteFiles", "Checked {"))
+            .expect("paste_files 不再发预检事件了 —— 锚点失效");
+        assert!(dup < check, "同名检查落在了预检之后");
     }
 
     /// **F332 / T11:回填只能来自 `TransferDone`。**

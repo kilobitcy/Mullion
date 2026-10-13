@@ -60,6 +60,17 @@ pub fn split_picked(all: Vec<Picked>) -> (Vec<Picked>, Vec<String>) {
     (files, skipped)
 }
 
+/// 同一批里第一个重名的文件名（来自不同文件夹的同名文件）。它们会落到远端同一个
+/// 路径上，后传的盖掉先传的，回填的两个 `@` 指向同一个文件 —— 整批拒绝，不预检
+/// 不入队。远端按字节比较名字，这里也按原样比较（不折大小写）。
+pub fn first_duplicate_name(files: &[Picked]) -> Option<String> {
+    let mut seen = HashSet::new();
+    files
+        .iter()
+        .find(|f| !seen.insert(f.name.as_str()))
+        .map(|f| f.name.clone())
+}
+
 /// 目标目录里已存在的同名项，顺序按 `names`。
 pub fn conflicting(names: &[String], existing: &HashSet<String>) -> Vec<String> {
     names
@@ -339,6 +350,29 @@ mod tests {
         let (files, skipped) = split_picked(picked);
         assert_eq!(files.len(), 1);
         assert_eq!(skipped, vec!["d".to_string()]);
+    }
+
+    /// F330：同一批里来自不同文件夹的同名文件会落到远端同一路径上，后者盖掉前者，
+    /// 回填的两个引用指向同一个文件 —— 必须在预检前认出来。
+    ///
+    /// 自证会变红：让 `first_duplicate_name` 恒返回 `None`，或改成比较 `local`。
+    #[test]
+    fn two_files_with_the_same_name_in_one_batch_are_caught() {
+        let mut a2 = file("a.txt", 1);
+        a2.local = "D:/y/a.txt".into();
+        assert_eq!(
+            first_duplicate_name(&[file("a.txt", 1), file("b.txt", 1), a2]),
+            Some("a.txt".to_string())
+        );
+        assert_eq!(
+            first_duplicate_name(&[file("a.txt", 1), file("b.txt", 1)]),
+            None
+        );
+        assert_eq!(
+            first_duplicate_name(&[file("A.txt", 1), file("a.txt", 1)]),
+            None,
+            "远端区分大小写，不该当成重名"
+        );
     }
 
     /// F330：只报**确实存在**的目标名，顺序保持（按传入名单的顺序，而非集合的）。
