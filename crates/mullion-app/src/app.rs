@@ -2567,6 +2567,12 @@ pub struct App {
     auto_dial: Option<AutoDial>,
     /// 左键是否按住(划选进行中)。松开即结束,不跨 focus 保留。
     dragging: bool,
+    /// F15:已经向远端上报了「按下」、还没上报「松开」的鼠标键。有值期间指针被
+    /// 终端捕获(见 `dragging` 那行的说明),松开必须配对发出去,否则对端
+    /// 认为键一直按着。与 `dragging`(本地划选)互斥:上报了就不进划选。
+    mouse_held: Option<mullion_term::keymap::MouseBtn>,
+    /// F15:最近一次上报的单元格。指针在同一格内移动不重复发。
+    mouse_last_cell: Option<(u16, u16)>,
     /// F320:正在拖的抽屉分隔线 `(命中到的那条, 指针 y)`。与 `dragging`(划选)
     /// 互斥:按下时命中分隔线就不进划选。
     divider_drag: Option<(crate::shell::workspace::divider::DrawerDivider, f32)>,
@@ -3347,6 +3353,8 @@ impl App {
             pending_restore: None,
             auto_dial: None,
             dragging: false,
+            mouse_held: None,
+            mouse_last_cell: None,
             divider_drag: None,
             egui_focus_before_drag: None,
             prev_click: None,
@@ -9482,6 +9490,102 @@ impl App {
         Some((col1.saturating_sub(1), row1.saturating_sub(1), side))
     }
 
+    /// F15:把一次指针事件按焦点 pane 的鼠标模式编码并写给远端。发出去了返回 `true`。
+    ///
+    /// 模式/Shift 的判定全在 `mullion_term::keymap::mouse_report`(纯函数,已单测),
+    /// 这里只做「像素 → 1-based 单元格」和写 PTY。
+    fn report_pointer(&mut self, event: mullion_term::keymap::MouseEvent, shift: bool) -> bool {
+        let Some(g) = self.focused_geom() else {
+            return false;
+        };
+        let Some(a) = self.active.as_ref() else {
+            return false;
+        };
+        let cell = input::cell_at(
+            self.cursor_in_grid(),
+            (a.text.cell_w, a.text.cell_h),
+            g.grid,
+        );
+        let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) else {
+            return false;
+        };
+        let Some(bytes) =
+            mullion_term::keymap::mouse_report(pane.emulator.mode(), shift, event, cell)
+        else {
+            return false;
+        };
+        let _ = pane.pty.write(bytes);
+        self.mouse_last_cell = Some(cell);
+        true
+    }
+
+    /// F15:鼠标键按下。上报成功 = 这一下归远端,不进本地划选。
+    fn mouse_press_report(&mut self, btn: mullion_term::keymap::MouseBtn) -> bool {
+        let shift = self.mods.shift_key();
+        if !self.report_pointer(mullion_term::keymap::MouseEvent::Press(btn), shift) {
+            return false;
+        }
+        self.mouse_held = Some(btn);
+        // 点击是发给远端的字节 = 用户意图,自动化让位(同滚轮上报)。
+        self.user_took_over();
+        self.request_ui_redraw();
+        true
+    }
+
+    /// F15:鼠标键松开。**只看「按下时是不是上报过」**,不再看当前 Shift/模式:
+    /// 按下已经发过了,松开不配对对端就以为键一直按着。返回 `true` = 这一下松开
+    /// 已被消费(调用方不要再走本地划选的松开)。
+    fn mouse_release_report(&mut self, btn: mullion_term::keymap::MouseBtn) -> bool {
+        if self.mouse_held != Some(btn) {
+            return false;
+        }
+        self.mouse_held = None;
+        self.report_pointer(mullion_term::keymap::MouseEvent::Release(btn), false);
+        self.mouse_last_cell = None;
+        true
+    }
+
+    /// F15:失焦 / 拨号断开之类没有「松开」事件的路径,补发松开。
+    fn mouse_release_report_any(&mut self) {
+        if let Some(btn) = self.mouse_held {
+            self.mouse_release_report(btn);
+        }
+    }
+
+    /// F15:指针移动。按着上报过的键 = 拖动(1002/1003),没按键 = 移动(仅 1003)。
+    /// 同一格内不重复发;没按键时只在指针正压在**焦点** pane 上才报(坐标是
+    /// 相对焦点 pane 算的,压在别的 pane 上报出去是错位的坐标)。
+    fn mouse_pointer_moved(&mut self) {
+        let event = match self.mouse_held {
+            Some(btn) => mullion_term::keymap::MouseEvent::Drag(btn),
+            None => {
+                let Some(ws) = self.active_ws() else {
+                    return;
+                };
+                if self.pane_at(self.cursor_px) != Some(ws.focus()) {
+                    return;
+                }
+                mullion_term::keymap::MouseEvent::Move
+            }
+        };
+        let Some(g) = self.focused_geom() else {
+            return;
+        };
+        let Some(a) = self.active.as_ref() else {
+            return;
+        };
+        let cell = input::cell_at(
+            self.cursor_in_grid(),
+            (a.text.cell_w, a.text.cell_h),
+            g.grid,
+        );
+        if self.mouse_last_cell == Some(cell) {
+            return;
+        }
+        let shift = self.mods.shift_key();
+        self.report_pointer(event, shift);
+    }
+
     /// 左键按下:判连击类型 → 开新选区(旧选区被覆盖)。
     fn selection_press(&mut self) {
         // 没有连接就没有终端可选,别让 `dragging` 在 launcher 态被置起来——
@@ -14065,7 +14169,9 @@ impl ApplicationHandler<UserEvent> for App {
         let editor_open = self.edit.editor.is_some();
         // F320:拖抽屉分隔线同样算「指针被终端捕获」—— 拖出中央区、在 egui 的
         // 栏上松手时,`Released` 不能被 egui 截走,否则拖动状态卡死。
-        let dragging = self.dragging || self.divider_drag.is_some();
+        // F15:向远端上报了按下的鼠标键同理 —— 拖出终端区在 egui 的栏上松手时,
+        // 松开那一下不能被 egui 截走,否则对端的「按住」永远不结束。
+        let dragging = self.dragging || self.divider_drag.is_some() || self.mouse_held.is_some();
         // F324:Esc 的判别(按下/抬起都算),拖动中归 egui 用。
         let is_escape = matches!(
             &event,
@@ -14256,6 +14362,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // 留着的话下一次真的松开左键时,焦点会被甩给一个上一轮
                     // 划选期间的部件。
                     self.restore_egui_focus_after_drag();
+                    // F15:同理,失焦就当上报中的按键松开了(补发松开,别让对端卡在按住)。
+                    self.mouse_release_report_any();
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -14282,6 +14390,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_selection_endpoint();
                     self.request_ui_redraw();
                 }
+                self.mouse_pointer_moved();
             }
             // F17 滚轮三档分流。决策在 `mullion_term::keymap::wheel_action`(纯函数,
             // 已单测),这里只做 winit 增量→行数、像素→单元格的换算与发送。
@@ -14354,9 +14463,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             // F18 划选 / 右键粘贴。
             //
-            // 鼠标**按键**上报(F15)本片不做,所以左键无条件走本地划选,不需要
-            // T5 的 Shift 逃生门分流;将来加按键上报时,分流点就在这里
-            // (与上面 MouseWheel 的 `wheel_action` 同构)。
+            // 鼠标**按键**上报(F15):对端开了鼠标模式、且没按 Shift 时,左/中键
+            // 的按下、松开、拖动都发给远端(`mouse_press_report` 等,判定在
+            // `keymap::mouse_report`);否则左键走本地划选,T5 的 Shift 逃生门
+            // 就在那个纯函数里。右键恒为本地粘贴,不上报。
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 // F320:命中抽屉分隔线就拖它,不切焦点、不进划选。
                 (MouseButton::Left, ElementState::Pressed) if self.divider_press() => {}
@@ -14365,9 +14475,25 @@ impl ApplicationHandler<UserEvent> for App {
                     // 点哪块就切到哪块(F33)。必须在 selection_press 之前:
                     // 划选的锚点要落在新焦点 pane 的坐标系里。
                     self.focus_pane_under_cursor();
-                    self.selection_press();
+                    // F15:对端开了鼠标模式就把点击发过去(没按 Shift 时),
+                    // 否则才进本地划选。必须在切焦点**之后**:点击要落到新焦点 pane。
+                    if !self.mouse_press_report(mullion_term::keymap::MouseBtn::Left) {
+                        self.selection_press();
+                    }
                 }
-                (MouseButton::Left, ElementState::Released) => self.selection_release(),
+                (MouseButton::Left, ElementState::Released) => {
+                    if !self.mouse_release_report(mullion_term::keymap::MouseBtn::Left) {
+                        self.selection_release();
+                    }
+                }
+                // F15:中键只有上报一个用途(本地没有中键粘贴),对端没开鼠标模式就忽略。
+                (MouseButton::Middle, ElementState::Pressed) => {
+                    self.focus_pane_under_cursor();
+                    self.mouse_press_report(mullion_term::keymap::MouseBtn::Middle);
+                }
+                (MouseButton::Middle, ElementState::Released) => {
+                    self.mouse_release_report(mullion_term::keymap::MouseBtn::Middle);
+                }
                 // 右键直接贴,不弹菜单(Windows 终端习惯,F18 交互口径)。
                 (MouseButton::Right, ElementState::Pressed) => {
                     // F185:切焦点必须在 `request_paste` **之前** —— 粘贴的落点是
@@ -18796,6 +18922,76 @@ mod tests {
         );
     }
 
+    /// F15:左键点击要先切焦点、再尝试上报、上报不了才进本地划选;松开先问
+    /// 「按下时上报过吗」。顺序反了:点击落在上一块 pane 的坐标系里,或
+    /// 上报了按下却又启动了划选(两边同时吃这一下)。
+    ///
+    /// 症状是 Claude Code diff 界面右上角的 `×` 点了没反应:左键从没发给过终端。
+    ///
+    /// 先剥注释行。自证会变红:删掉 `mouse_press_report` 那一句,或把它挪到
+    /// `selection_press` 之后。
+    #[test]
+    fn a_left_press_is_offered_to_the_remote_before_it_starts_a_local_selection() {
+        let (production, _) = include_str!("app.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了");
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let press = strip(arm_of(
+            production,
+            "(MouseButton::Left, ElementState::Pressed)",
+        ));
+        let focus = press
+            .find("self.focus_pane_under_cursor();")
+            .expect("没切焦点");
+        let report = press
+            .find("self.mouse_press_report(")
+            .expect("左键按下不上报了 —— 全屏 TUI 里的 × / 按钮点不动(F15)");
+        let local = press.find("self.selection_press();").expect("没有本地划选");
+        assert!(focus < report && report < local, "顺序错了:{press}");
+        let release = strip(arm_of(
+            production,
+            "(MouseButton::Left, ElementState::Released)",
+        ));
+        let r = release
+            .find("self.mouse_release_report(")
+            .expect("松开不配对 —— 对端认为键一直按着");
+        let l = release
+            .find("self.selection_release()")
+            .expect("没有本地松开");
+        assert!(r < l, "松开顺序错了:{release}");
+    }
+
+    /// F15:上报中的按键必须让指针被终端捕获,失焦要补发松开 —— 否则拖出终端区
+    /// 在 egui 的栏上松手(或 Alt-Tab)后,对端永远在「按住」。
+    ///
+    /// 自证会变红:删掉 `|| self.mouse_held.is_some()`,或删掉失焦分支里的补发。
+    #[test]
+    fn a_reported_press_captures_the_pointer_and_focus_loss_releases_it() {
+        let (production, _) = include_str!("app.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("app.rs 的测试模块分界变了");
+        assert!(
+            production.contains(
+                "self.dragging || self.divider_drag.is_some() || self.mouse_held.is_some()"
+            ),
+            "上报中的按键没算进指针捕获"
+        );
+        let after = production
+            .split("WindowEvent::Focused(focused)")
+            .nth(1)
+            .expect("找不到 Focused 分支");
+        let arm = &after[..after.find("WindowEvent::Occluded").expect("下界")];
+        assert!(
+            arm.contains("self.mouse_release_report_any();"),
+            "失焦不补发松开"
+        );
+    }
+
     /// F185:右键粘贴前必须先把焦点切到指针底下那块 pane,**且顺序不能反**。
     ///
     /// 改这条之前右键那一支压根没切焦点:分屏下在 pane 2 上右键,内容贴进
@@ -21633,7 +21829,7 @@ mod tests {
             .find("(MouseButton::Left, ElementState::Released) if self.divider_release()")
             .expect("松开没接 divider_release");
         let plain_rel = src
-            .find("(MouseButton::Left, ElementState::Released) => self.selection_release()")
+            .find("(MouseButton::Left, ElementState::Released) => {")
             .expect("找不到原来的左键松开臂");
         assert!(
             rel < plain_rel,
@@ -29255,9 +29451,9 @@ mod tests {
             .expect("split 至少有一段");
         let calls = prod.matches("self.user_took_over();").count();
         assert_eq!(
-            calls, 7,
-            "用户意图写入点的取消调用应为 7 处(粘贴/滚轮/键盘/输入法提交/\
-             合成文本/截图直传/文件粘贴 F330,滚轮两个分支共用一次),实际 {calls} 处 —— 少了\
+            calls, 8,
+            "用户意图写入点的取消调用应为 8 处(粘贴/滚轮/键盘/输入法提交/\
+             合成文本/截图直传/文件粘贴 F330/鼠标按键上报 F15,滚轮两个分支共用一次),实际 {calls} 处 —— 少了\
              会让自动化在用户打字时继续发命令,多了说明新增了输入路径但没复核\
              这条不变量。F209 那一处在 `paste_screenshot` 里、按键当时就掐,\
              **不在** `accept_shot_uploaded`:那时字节早发出去了,而且那块 pane\

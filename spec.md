@@ -90,7 +90,7 @@ Mullion 的赌注是：**这个交集市场没人做，而它正在快速变大*
 | F12 | 差分整形：按行内容指纹跳过未变行的文本整形（不用 `Term::damage()`，理由见 [adr-011](docs/adr-011-row-fingerprint-vs-term-damage.md)） | P0 | 单测：只改一行后，脏行集合只含那一行 |
 | F13 | Kitty 键盘协议；不支持时优雅退化 | P0 | 见 F14 |
 | F14 | **Shift+Enter 正确编码**（Kitty → CSI-u；否则 → `ESC CR`），Ctrl+J 恒为 `\n` | P0 | `keymap` 单测已覆盖 |
-| F15 | SGR 鼠标上报；**按住 Shift 强制走本地划选** | P0 | `keymap` 单测已覆盖 |
+| F15 | SGR 鼠标上报；**按住 Shift 强制走本地划选** | P0 | `keymap::mouse_report` 单测 + `app.rs` 接线守护;按远端声明的 1000/1002/1003 逐档放行,左/中键按下/松开/拖动/移动上报,右键恒为本地粘贴;真机点击(如 Claude Code diff 的 ×)待人工验 |
 | F16 | CJK 宽字符占两格，字体回退不缺字 | P0 | 快照测试断言宽字符列宽；缺字需人工目视确认 |
 | F17 | 滚动回溯，默认 10000 行，可配置 | P0 | 单测断言 scrollback 行数 |
 | F18 | 划选复制 / 粘贴，粘贴走 bracketed paste | P1 | 单测：开启 bracketed paste 时粘贴内容被 `ESC[200~` 包裹 |

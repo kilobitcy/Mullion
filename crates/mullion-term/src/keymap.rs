@@ -219,6 +219,73 @@ pub fn mouse_should_report(mods: Mods, capture_on: bool) -> bool {
     capture_on
 }
 
+/// 按键上报的鼠标键。右键不在其列:右键恒为本地粘贴(F18/F185),不上报。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseBtn {
+    Left,
+    Middle,
+}
+
+/// 一次要上报的指针事件(F15)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseEvent {
+    Press(MouseBtn),
+    Release(MouseBtn),
+    /// 按住某键时换了单元格。
+    Drag(MouseBtn),
+    /// 没按键时换了单元格。
+    Move,
+}
+
+/// 把一次指针事件编码成字节;对端没开对应的鼠标模式时 `None`(调用方走本地划选)。
+///
+/// 按对端声明的模式逐档放行,不是「开了任何一档就全发」:
+/// - 按下/松开:1000 / 1002 / 1003 任一档;
+/// - 拖动(按着键换格):1002 或 1003;
+/// - 移动(没按键换格):只有 1003。
+///
+/// `shift` 是 T5 的逃生门:按住 Shift 恒 `None`,让用户在对端开着鼠标捕获时
+/// 仍能本地划选。**松开事件的调用方应传 `shift = false`**:按下时已经上报过,
+/// 松开不配对的话对端会认为键一直按着(拖动卡死)。
+///
+/// 编码:SGR(1006)`CSI < b ; col ; row M|m`(松开用 `m`,保留键号);
+/// 传统 X10 松开键号固定为 3、不区分哪个键。拖动 +32,无键移动 = 35。
+/// 修饰键位(Ctrl/Alt)不透传,与 `wheel_action` 同一个有意简化。
+/// `cell` 是 1-based `(col, row)`。
+pub fn mouse_report(
+    mode: TermMode,
+    shift: bool,
+    event: MouseEvent,
+    cell: (u16, u16),
+) -> Option<Vec<u8>> {
+    if shift {
+        return None;
+    }
+    let allowed = match event {
+        MouseEvent::Press(_) | MouseEvent::Release(_) => mode.intersects(TermMode::MOUSE_MODE),
+        MouseEvent::Drag(_) => mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+        MouseEvent::Move => mode.contains(TermMode::MOUSE_MOTION),
+    };
+    if !allowed {
+        return None;
+    }
+    let sgr = mode.contains(TermMode::SGR_MOUSE);
+    let key = |b: MouseBtn| match b {
+        MouseBtn::Left => 0u8,
+        MouseBtn::Middle => 1u8,
+    };
+    let (button, release) = match event {
+        MouseEvent::Press(b) => (key(b), false),
+        MouseEvent::Release(b) => (if sgr { key(b) } else { 3 }, true),
+        MouseEvent::Drag(b) => (key(b) + 32, false),
+        MouseEvent::Move => (35, false),
+    };
+    if sgr && release {
+        return Some(format!("\x1b[<{button};{};{}m", cell.0, cell.1).into_bytes());
+    }
+    Some(encode_wheel_report(button, cell.0, cell.1, sgr))
+}
+
 /// 一次滚轮滚动的处置(F17 §3.2 三档分流)。
 ///
 /// 之所以要分档:alt screen(tmux/vim)在 alacritty 里恒 0 行本地历史,
@@ -759,6 +826,105 @@ mod tests {
                 up: false,
                 count: 2
             }
+        );
+    }
+
+    // ---- F15 鼠标按键上报 ----
+
+    fn sgr(extra: TermMode) -> TermMode {
+        TermMode::SGR_MOUSE | extra
+    }
+
+    /// Claude Code diff 界面右上角 `×` 点不动的根因:左键从未发给终端。
+    #[test]
+    fn a_left_click_is_reported_in_sgr_when_the_remote_asked_for_the_mouse() {
+        let m = sgr(TermMode::MOUSE_REPORT_CLICK);
+        assert_eq!(
+            mouse_report(m, false, MouseEvent::Press(MouseBtn::Left), (12, 3)),
+            Some(b"\x1b[<0;12;3M".to_vec())
+        );
+        assert_eq!(
+            mouse_report(m, false, MouseEvent::Press(MouseBtn::Middle), (1, 1)),
+            Some(b"\x1b[<1;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_unless_the_remote_turned_a_mouse_mode_on() {
+        for ev in [
+            MouseEvent::Press(MouseBtn::Left),
+            MouseEvent::Release(MouseBtn::Left),
+            MouseEvent::Drag(MouseBtn::Left),
+            MouseEvent::Move,
+        ] {
+            assert_eq!(mouse_report(TermMode::SGR_MOUSE, false, ev, (5, 5)), None);
+        }
+    }
+
+    /// T5:按住 Shift 恒走本地划选,优先于任何鼠标模式。
+    #[test]
+    fn shift_blocks_every_pointer_report_in_every_mode() {
+        let m = sgr(TermMode::MOUSE_MODE);
+        for ev in [
+            MouseEvent::Press(MouseBtn::Left),
+            MouseEvent::Release(MouseBtn::Left),
+            MouseEvent::Drag(MouseBtn::Left),
+            MouseEvent::Move,
+        ] {
+            assert_eq!(mouse_report(m, true, ev, (5, 5)), None, "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn release_keeps_the_button_in_sgr_but_is_button_3_in_legacy_x10() {
+        let m = sgr(TermMode::MOUSE_REPORT_CLICK);
+        assert_eq!(
+            mouse_report(m, false, MouseEvent::Release(MouseBtn::Left), (7, 9)),
+            Some(b"\x1b[<0;7;9m".to_vec())
+        );
+        assert_eq!(
+            mouse_report(
+                TermMode::MOUSE_REPORT_CLICK,
+                false,
+                MouseEvent::Release(MouseBtn::Middle),
+                (7, 9)
+            ),
+            Some(vec![0x1b, b'[', b'M', 3 + 32, 7 + 32, 9 + 32])
+        );
+    }
+
+    #[test]
+    fn x10_press_clamps_coordinates_instead_of_overflowing() {
+        assert_eq!(
+            mouse_report(
+                TermMode::MOUSE_REPORT_CLICK,
+                false,
+                MouseEvent::Press(MouseBtn::Left),
+                (500, 1)
+            ),
+            Some(vec![0x1b, b'[', b'M', 32, 223 + 32, 1 + 32])
+        );
+    }
+
+    /// 1000 只要点击;拖动要 1002;无键移动只有 1003。逐档放行,
+    /// 不然 1000 的程序会被满屏的移动事件淹掉。
+    #[test]
+    fn drag_and_move_are_gated_by_the_mode_the_remote_actually_declared() {
+        let click = sgr(TermMode::MOUSE_REPORT_CLICK);
+        let drag = sgr(TermMode::MOUSE_DRAG);
+        let motion = sgr(TermMode::MOUSE_MOTION);
+        let d = MouseEvent::Drag(MouseBtn::Left);
+        assert_eq!(mouse_report(click, false, d, (2, 2)), None);
+        assert_eq!(
+            mouse_report(drag, false, d, (2, 2)),
+            Some(b"\x1b[<32;2;2M".to_vec())
+        );
+        assert!(mouse_report(motion, false, d, (2, 2)).is_some());
+        assert_eq!(mouse_report(click, false, MouseEvent::Move, (2, 2)), None);
+        assert_eq!(mouse_report(drag, false, MouseEvent::Move, (2, 2)), None);
+        assert_eq!(
+            mouse_report(motion, false, MouseEvent::Move, (2, 2)),
+            Some(b"\x1b[<35;2;2M".to_vec())
         );
     }
 }
