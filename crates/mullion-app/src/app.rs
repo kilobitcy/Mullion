@@ -10552,19 +10552,42 @@ impl App {
             .by_generation_mut(generation)
             .and_then(|tab| tab.content.as_terminal_mut())?;
         let ix = t.leaf_wanted.iter().position(|(id, _)| *id == pane)?;
-        let name = t.leaf_wanted[ix].1.tmux.clone()?;
+        // 下面三处早退都是静默的:现象是「只进 shell、不接 tmux」,没有日志的话
+        // 分不出是哪一处。各留一行,下次复现时直接对号入座。
+        let Some(name) = t.leaf_wanted[ix].1.tmux.clone() else {
+            log::info!(
+                target: "mullion",
+                "pane {} 不接 tmux:恢复记录里没有实测的会话名",
+                pane.0
+            );
+            return None;
+        };
         // F161/修复2:按**这块叶子自己那条会话**的自动化设置来,不是标签级
         // `automation_template`(那是主叶子那次连接写下的 —— 恢复出来的 Dial
         // 叶子连的是另一台机器,见 `automation_for_leaf` 文档)。
         let session_id = t.leaf_wanted[ix].1.session_id;
-        let tpl = automation_for_leaf(
+        let Some(tpl) = automation_for_leaf(
             self.store.as_ref(),
             session_id,
             t.automation_template.clone(),
-        )?;
+        ) else {
+            log::info!(
+                target: "mullion",
+                "pane {} 不接 tmux({name}):取不到这台机器的自动化设置",
+                pane.0
+            );
+            return None;
+        };
         let detach_ix = t.leaf_detach.iter().position(|(id, _)| *id == pane);
         let detach = detach_ix.is_some_and(|i| t.leaf_detach[i].1);
-        let plan = crate::automation::pending_for_measured_attach(&tpl, &name, detach)?;
+        let Some(plan) = crate::automation::pending_for_measured_attach(&tpl, &name, detach) else {
+            log::info!(
+                target: "mullion",
+                "pane {} 不接 tmux({name}):这台机器的自动化设置里没有 attach 步骤(自动化关闭?)",
+                pane.0
+            );
+            return None;
+        };
         // 到这里才动表:上面任何一条早退都不该把记录吃掉。
         t.leaf_wanted.remove(ix);
         if let Some(i) = detach_ix {
@@ -12045,12 +12068,17 @@ impl App {
             // `on_pane_ready` 之前调用,否则 `take_attach_intent` 会拿旧机器
             // 的会话名顶掉这里刚为新机器算好的 `pending.plan`(见
             // `clear_leaf_attach_intent` 文档)。
-            if let Some(t) = self
-                .tabs
-                .by_generation_mut(generation)
-                .and_then(|tab| tab.content.as_terminal_mut())
-            {
-                clear_leaf_attach_intent(t, pane);
+            // 恢复现场的首次挂载(`RestoreFirstMount`)例外:那条记录正是这台机器
+            // 自己的上次实测名,清掉就等于这块 pane 永远只进 shell(见
+            // `rehost_voids_attach_intent`)。
+            if rehost_voids_attach_intent(pending.kind) {
+                if let Some(t) = self
+                    .tabs
+                    .by_generation_mut(generation)
+                    .and_then(|tab| tab.content.as_terminal_mut())
+                {
+                    clear_leaf_attach_intent(t, pane);
+                }
             }
             // 用户拍板:换过节点的 pane 要跑**新节点**的登录后命令,
             // 规则同分屏新开的那些 —— 跳过 tmux,其余照跑。
@@ -16819,6 +16847,17 @@ fn focus_after_rehost(ws: &mut Workspace, id: PaneId, kind: RehostKind) {
     }
 }
 
+/// 一次换挂成功后,这块 pane 原来的 attach 记录该不该作废。
+///
+/// - `UserPicked`:作废。用户把 pane 换到了另一台机器,记录里是旧机器的会话名。
+/// - `RestoreFirstMount`:**不作废**。F162 串行恢复拨的是记录里写的那台机器,
+///   `leaf_wanted` 里的名字恰恰是要在它上面接回的那个会话;清掉的话这块
+///   pane 拨通后既没有记录也没有计划(恢复拨号传 `None`),静默只进 shell。
+///   同节点叶子不走这条路,所以症状表现为「多屏恢复时跨节点的那块不接 tmux」。
+fn rehost_voids_attach_intent(kind: RehostKind) -> bool {
+    kind == RehostKind::UserPicked
+}
+
 /// F160/F161:换节点作废这块 pane 原来的「该接回哪个 tmux 会话」记录。
 ///
 /// `leaf_wanted`/`leaf_detach` 是恢复现场时**给全部叶子**一次性写的
@@ -18442,13 +18481,14 @@ mod tests {
         ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator,
         next_auto_dial, next_panel_selection_index, opt_buf_dirty, pane_reports_of,
         pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
-        reattach_pane, rehost_pane, resolved_scrollback, session_manager_dirty,
-        should_check_attach, should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of,
-        sync_plan_of, sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
-        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
-        AttachVerdict, DialTicket, HistorySync, Modal, OpFollow, PasteDecision, RehostKind,
-        RestoredTab, SshConfig, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
-        CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
+        reattach_pane, rehost_pane, rehost_voids_attach_intent, resolved_scrollback,
+        session_manager_dirty, should_check_attach, should_pop_cloud_error,
+        should_pop_transfer_error, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
+        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
+        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, DialTicket, HistorySync,
+        Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SshConfig, SyncPlan, Tab,
+        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
+        DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -29079,6 +29119,41 @@ mod tests {
             "换节点没挂成时没把刚 push 的 HostConn 撤掉 —— 一条谁也不指向的 SSH \
              连接会一直开到标签关闭,而且完全静默"
         );
+    }
+
+    /// 跨节点恢复的叶子(`RestoreFirstMount`)拨通后必须保留它的 attach 记录;
+    /// 用户手动换节点(`UserPicked`)才作废。
+    ///
+    /// 症状:多屏现场恢复后,连的是别的节点的那块 pane 只进 shell、不接 tmux
+    /// (`on_pane_rehosted` 无条件清记录,而恢复拨号又不带计划)。
+    ///
+    /// 自证会变红:把 `rehost_voids_attach_intent` 改回恒 `true`。
+    #[test]
+    fn a_restore_dial_keeps_its_attach_intent_but_a_user_swap_voids_it() {
+        assert!(!rehost_voids_attach_intent(RehostKind::RestoreFirstMount));
+        assert!(rehost_voids_attach_intent(RehostKind::UserPicked));
+    }
+
+    /// 上一条只守判据本身;这条守「`on_pane_rehosted` 真的过了这道判据」。
+    /// 先剥注释行,否则注释里写着函数名,把调用删掉也照样绿。
+    ///
+    /// 自证会变红:删掉 `on_pane_rehosted` 里的 `if rehost_voids_attach_intent(..)`,
+    /// 让 `clear_leaf_attach_intent` 无条件调用。
+    #[test]
+    fn on_pane_rehosted_only_clears_the_intent_through_the_kind_check() {
+        let body = body_of(prod_src(), "fn on_pane_rehosted(");
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gate = code
+            .find("if rehost_voids_attach_intent(pending.kind)")
+            .expect("on_pane_rehosted 没按 kind 判是否清记录");
+        let clear = code
+            .find("clear_leaf_attach_intent(")
+            .expect("on_pane_rehosted 不清记录了?");
+        assert!(gate < clear, "清记录排在 kind 判据之前 —— 判据形同虚设");
     }
 
     /// F160/F161:换节点 = 这块 pane 换了一台机器,任何关于原会话的意图都作废。
