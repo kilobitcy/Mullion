@@ -1196,6 +1196,27 @@ impl TabContent {
         }
     }
 
+    /// F334:这个标签的远端书签归哪条会话。`tab_session` 是 `Tab::session_id`
+    /// (开标签时那条)。
+    ///
+    /// 终端标签按 **sftp channel 实际所在那台**(`sftp_host_ix`,没开过 = 主连接)
+    /// 的 `HostConn::session_id` 取 —— 换节点之后侧栏显示的是第二台的文件,
+    /// 书签却还挂在开标签那条会话上,就是用户实报的「配了 4 个只看到 1 个」。
+    /// 判据本体见 [`remote_bookmark_owner`]。
+    fn remote_bookmark_owner(
+        &self,
+        tab_session: Option<mullion_store::SessionId>,
+    ) -> Option<mullion_store::SessionId> {
+        match self {
+            TabContent::Terminal(t) => {
+                let hosts: Vec<_> = t.ws.hosts.iter().map(|h| h.session_id).collect();
+                remote_bookmark_owner(&hosts, t.sftp_host_ix, tab_session)
+            }
+            // `Files` 独占自己那条连接(ADR-010),身份就是开标签那条会话。
+            TabContent::Files(_) | TabContent::Restored(_) => tab_session,
+        }
+    }
+
     /// 两个变体都有一份 sftp client 槽位;读时克隆(`Arc`,廉价)。
     fn sftp_client(&self) -> Option<Arc<mullion_ssh::sftp::SftpClient>> {
         match self {
@@ -3581,6 +3602,16 @@ impl App {
                 files.local_bookmarks = list.clone();
             }
         }
+    }
+
+    /// F334:远端书签的同一件事。判据与遍历见 [`sync_remote_bookmarks_of`]。
+    fn sync_remote_bookmarks_to_tabs(&mut self) {
+        let store = self.store.as_ref();
+        sync_remote_bookmarks_of(&mut self.tabs, |id| {
+            store
+                .and_then(|s| s.list().iter().find(|r| r.id == id))
+                .map(|r| r.sftp.bookmarks.clone())
+        });
     }
 
     /// 施加解锁框这一帧的结论。返回 `true` = 用户要退出程序。
@@ -7550,10 +7581,11 @@ impl App {
             mark_ui_dirty!(self.ui_dirty);
             return;
         }
+        // F334:存到 sftp channel 实际所在那台机器的会话名下,不是开标签那条。
         let Some(sid) = self
             .tabs
             .by_generation(generation)
-            .and_then(|t| t.session_id)
+            .and_then(|t| t.content.remote_bookmark_owner(t.session_id))
         else {
             // UI 已经按 `BookmarkView::can_edit` 把远端栏的 ☆ 置灰了,走到
             // 这儿说明接线被改坏了 —— 不静默吞。
@@ -7561,24 +7593,14 @@ impl App {
             return;
         };
         if let Some(store) = self.store.as_mut() {
-            if let Err(e) = store
-                .add_bookmark(sid, mark.clone())
-                .and_then(|_| store.save())
-            {
+            if let Err(e) = store.add_bookmark(sid, mark).and_then(|_| store.save()) {
                 self.ui.set_error(e.to_string());
                 return;
             }
         }
-        if let Some(files) = self
-            .tabs
-            .by_generation_mut(generation)
-            .and_then(|t| t.content.files_panel_mut())
-        {
-            // 去重判据与 store 侧同一条(按路径),两边不许分叉。
-            if !files.bookmarks.iter().any(|b| b.path == mark.path) {
-                files.bookmarks.push(mark);
-            }
-        }
+        // F334:从会话库重推,不在本标签内存副本上 push —— 同一台机器可能
+        // 开着好几个标签/侧栏,只改这一份的话别的标签要重开才看得见。
+        self.sync_remote_bookmarks_to_tabs();
         mark_ui_dirty!(self.ui_dirty);
     }
 
@@ -7600,10 +7622,11 @@ impl App {
             mark_ui_dirty!(self.ui_dirty);
             return;
         }
+        // F334:同 `add_bookmark` —— 按 sftp 实际所在那台的会话删。
         let Some(sid) = self
             .tabs
             .by_generation(generation)
-            .and_then(|t| t.session_id)
+            .and_then(|t| t.content.remote_bookmark_owner(t.session_id))
         else {
             log::warn!("收到远端 BookmarkRemove 但标签没有 SessionId,已忽略");
             return;
@@ -7614,13 +7637,7 @@ impl App {
                 return;
             }
         }
-        if let Some(files) = self
-            .tabs
-            .by_generation_mut(generation)
-            .and_then(|t| t.content.files_panel_mut())
-        {
-            files.bookmarks.retain(|b| b.path != path);
-        }
+        self.sync_remote_bookmarks_to_tabs();
         mark_ui_dirty!(self.ui_dirty);
     }
 
@@ -9030,6 +9047,8 @@ impl App {
                 let task =
                     spawn_sftp_list_dir(&self._runtime, &self.proxy, generation, client, dir, seq);
                 self.track_sftp_task(generation, task);
+                // F334:`sftp_host_ix` 刚落定,书签换成这台机器那条会话的。
+                self.sync_remote_bookmarks_to_tabs();
                 // F218:有等着这条 channel 的跳转意图就在这儿接上。
                 self.resume_pending_reveal(generation, host_ix);
             }
@@ -16071,6 +16090,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let then_connect = save.then_connect;
                         match apply_save(store, save, &now) {
                             Ok(id) => {
+                                // F334:书签表可能刚被改过,已开的面板别留旧快照。
+                                self.sync_remote_bookmarks_to_tabs();
                                 // 「保存并连接」下一秒就开始拨号,状态栏自己会说话,
                                 // 再飘一条「已保存」是噪音。
                                 if then_connect {
@@ -17951,6 +17972,42 @@ fn apply_save(
     }
 }
 
+/// F334:远端书签归哪条会话。`hosts` 是 `ws.hosts` 各台的 `session_id`。
+///
+/// `sftp_host_ix` 为 `None`(还没开过 channel)按主连接 `hosts[0]` 算 ——
+/// 与 `sftp_connection_for` 的回落同一口径。`hosts` 为空(还没 push 进去)
+/// 或越界时回落 `tab_session`。命中的那台是快速连接(`None`)就返回 `None`:
+/// 没有会话记录就没地方存书签,☆ 该置灰,不能借开标签那条会话的名义存。
+fn remote_bookmark_owner(
+    hosts: &[Option<mullion_store::SessionId>],
+    sftp_host_ix: Option<usize>,
+    tab_session: Option<mullion_store::SessionId>,
+) -> Option<mullion_store::SessionId> {
+    match hosts.get(sftp_host_ix.unwrap_or(0)) {
+        Some(owner) => *owner,
+        None => tab_session,
+    }
+}
+
+/// F334:把会话库里的远端书签推给**每一个**已开标签的面板副本(含 ☆ 可写性)。
+///
+/// 原先面板那份是建标签时拷的一次性快照,会话管理器保存、侧栏换主机都不回推。
+/// `lookup` 按会话取书签表,查不到(会话已删 / store 不可用)= 空表。
+/// 自由函数而不是 `&mut self` 方法:`App::new` 在测试里造不出来(同
+/// `drive_attach_checks_of`)。
+fn sync_remote_bookmarks_of(
+    tabs: &mut Tabs<TabContent>,
+    lookup: impl Fn(mullion_store::SessionId) -> Option<Vec<mullion_store::Bookmark>>,
+) {
+    for tab in tabs.iter_mut() {
+        let owner = tab.content.remote_bookmark_owner(tab.session_id);
+        if let Some(files) = tab.content.files_panel_mut() {
+            files.bookmarks = owner.and_then(&lookup).unwrap_or_default();
+            files.session_bound = owner.is_some();
+        }
+    }
+}
+
 /// F122:把弹窗里改的名字/颜色写到那个标签上。
 ///
 /// 空名字(或只有空白)= 清除覆盖,退回连接时拼的 `title` —— 存一个空标签名
@@ -18607,14 +18664,14 @@ mod tests {
         ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator,
         next_auto_dial, next_panel_selection_index, opt_buf_dirty, pane_reports_of,
         pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
-        reattach_pane, rehost_pane, rehost_voids_attach_intent, resolved_scrollback,
-        session_manager_dirty, should_check_attach, should_pop_cloud_error,
-        should_pop_transfer_error, snapshot_tabs_of, sync_plan_of, sync_timeout_wake_at,
-        tab_keeps_template, tab_title, take_next_restore_dial, tmux_attach_for_connect, upload_job,
-        user_event_marks_dirty, wind_down, AttachCheck, AttachVerdict, DialTicket, HistorySync,
-        Modal, OpFollow, PasteDecision, RehostKind, RestoredTab, SshConfig, SyncPlan, Tab,
-        TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT,
-        DISMISS_ORDER,
+        reattach_pane, rehost_pane, rehost_voids_attach_intent, remote_bookmark_owner,
+        resolved_scrollback, session_manager_dirty, should_check_attach, should_pop_cloud_error,
+        should_pop_transfer_error, snapshot_tabs_of, sync_plan_of, sync_remote_bookmarks_of,
+        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
+        AttachVerdict, DialTicket, HistorySync, Modal, OpFollow, PasteDecision, RehostKind,
+        RestoredTab, SshConfig, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
+        CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -22354,6 +22411,100 @@ mod tests {
                 body.contains("self.sync_local_bookmarks_to_tabs()"),
                 "{f} 没把全局收藏夹推给其余标签 —— 在标签 1 收的目录,\
                  标签 2 要重开才看得见(F187)"
+            );
+        }
+    }
+
+    /// F334:书签归 sftp channel 实际所在那台机器的会话。用户实报的现场:
+    /// 标签从会话 A 开、换节点到 B(`hosts = [A, B]`,`sftp_host_ix = 1`),
+    /// 侧栏显示 B 的文件、▾ 里却是 A 的书签。
+    ///
+    /// 自证会变红:把 `remote_bookmark_owner` 的函数体换成 `tab_session`。
+    #[test]
+    fn remote_bookmarks_follow_the_host_the_sftp_channel_is_on() {
+        let (a, b) = (Some(SessionId(1)), Some(SessionId(2)));
+        assert_eq!(
+            remote_bookmark_owner(&[a, b], Some(1), a),
+            b,
+            "换节点后该跟到 B"
+        );
+        assert_eq!(remote_bookmark_owner(&[a, b], Some(0), a), a);
+        assert_eq!(
+            remote_bookmark_owner(&[a, b], None, a),
+            a,
+            "channel 还没开过 = 主连接(与 sftp_connection_for 同口径)"
+        );
+        assert_eq!(
+            remote_bookmark_owner(&[a, None], Some(1), a),
+            None,
+            "B 是快速连接:没地方存,☆ 该置灰,不能借 A 的名义存"
+        );
+        assert_eq!(
+            remote_bookmark_owner(&[], None, a),
+            a,
+            "hosts 还没 push 进去"
+        );
+    }
+
+    /// F334:会话管理器保存之后,**已开**的面板要换成会话库里的新表,☆ 可写性
+    /// 跟着归属走。原先是建标签时拷一次的快照,改完要关标签重连才看得见。
+    ///
+    /// 自证会变红:把 `sync_remote_bookmarks_of` 里给 `files.bookmarks` 赋值
+    /// 那句删掉。
+    #[test]
+    fn saving_a_session_refreshes_bookmarks_in_panels_already_open() {
+        let mark = |p: &str| mullion_store::Bookmark {
+            name: String::new(),
+            path: p.into(),
+        };
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("lly".into(), Some(SessionId(4)), second_terminal_tab(1));
+        tabs.open("quick".into(), None, second_terminal_tab(2));
+        for tab in tabs.iter_mut() {
+            let files = tab.content.files_panel_mut().expect("终端标签有面板");
+            files.bookmarks = vec![mark("/tmp")];
+            files.session_bound = true;
+        }
+        sync_remote_bookmarks_of(&mut tabs, |id| {
+            (id == SessionId(4)).then(|| vec![mark("/home/ubuntu/.claude"), mark("/tmp")])
+        });
+        let lly = tabs
+            .by_generation_mut(1)
+            .unwrap()
+            .content
+            .files_panel_mut()
+            .unwrap();
+        let paths: Vec<_> = lly.bookmarks.iter().map(|b| b.path.as_str()).collect();
+        assert_eq!(paths, ["/home/ubuntu/.claude", "/tmp"]);
+        assert!(lly.session_bound);
+        let quick = tabs
+            .by_generation_mut(2)
+            .unwrap()
+            .content
+            .files_panel_mut()
+            .unwrap();
+        assert!(quick.bookmarks.is_empty(), "没有会话就没有远端书签");
+        assert!(!quick.session_bound, "没有会话 ☆ 该置灰");
+    }
+
+    /// F334 **接线守护**:上面两条只证明函数对,证明不了有人在该调的地方调它。
+    /// 漏掉任何一处的症状都是「书签不对」,零报错。
+    ///
+    /// 自证会变红:删掉任一处 `self.sync_remote_bookmarks_to_tabs()`;或把
+    /// `add_bookmark` 里的 `remote_bookmark_owner(t.session_id)` 换回 `t.session_id`。
+    #[test]
+    fn every_path_that_changes_remote_bookmarks_resyncs_the_open_panels() {
+        let call = "self.sync_remote_bookmarks_to_tabs()";
+        let saved = body_of(prod_src(), "match apply_save(store, save, &now)");
+        assert!(saved.contains(call), "会话管理器保存后没回推:{saved}");
+        let opened = body_of(prod_src(), "fn accept_sftp_opened(");
+        assert!(opened.contains(call), "sftp 换主机后书签没跟着换");
+        for f in ["fn add_bookmark(", "fn remove_bookmark("] {
+            let body = body_of(prod_src(), f);
+            assert!(body.contains(call), "{f} 没回推给其余标签");
+            assert!(
+                body.contains("remote_bookmark_owner(t.session_id)"),
+                "{f} 还在按开标签那条会话存书签"
             );
         }
     }
