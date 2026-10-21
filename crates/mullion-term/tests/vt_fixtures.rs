@@ -320,3 +320,56 @@ fn a_repaint_that_changes_the_text_still_clears_the_released_selection() {
     emu.feed(&rest[..end]);
     assert_eq!(emu.selection_text(), None, "内容变了还补回去,就是张冠李戴");
 }
+
+/// F335 的 fixture:60 列 tmux 里的 Claude Code 回了一条单行长命令,被 Ink
+/// 折成四行(词边界断行 + 一处在 `$(hostname)/` 后硬切开的长 token)。
+const WRAPPED_CMD: &str = "claude-code-wrapped-command";
+
+/// F335:**Alt+拖选把 Claude Code 折开的命令还原成能直接执行的一行。**
+///
+/// 普通复制拿到的是四行(粘贴即断成四条命令执行失败,用户实报);拼成一行
+/// 时词边界断行补空格,写满到右缘那一行(`…/$(hostname)/` 接 `$(date…`)
+/// 不补 —— 那是同一个 token 被硬切开。
+///
+/// 自证会变红:把 `join_as_one_line` 里的 `p.reaches_right_edge` 删掉(变成
+/// `$(hostname)/ $(date`);或改用「选区里最宽那一行」作参照(词边界断行
+/// 被误判成硬切)。
+#[test]
+fn alt_drag_turns_a_command_claude_code_wrapped_back_into_one_line() {
+    let mut emu = Emulator::new(60, 40);
+    emu.feed(&fixture_bytes(WRAPPED_CMD));
+    let first = (0..40u16)
+        .find(|&r| row_text(&emu, r).starts_with("● find"))
+        .expect("fixture 里应当有 Claude Code 回的那条命令");
+    // 从 `find` 的 f(第 2 列,跳过 `● `)拖到第四行行尾。
+    emu.selection_start(2, first, SelectionKind::Simple, CellSide::Left);
+    emu.selection_update(59, first + 3, CellSide::Right);
+
+    let plain = emu.selection_text().expect("应当选中了文本");
+    assert_eq!(plain.lines().count(), 4, "前提:普通复制是四行\n{plain}");
+
+    let (one, merged) = emu.selection_text_one_line().expect("应当选中了文本");
+    assert!(merged);
+    assert_eq!(
+        one,
+        "find /var/log/nginx -type f -name \"*.log\" -mtime +7 -exec gzip -9 {} \\; \
+         && rsync -avz --delete /var/log/nginx/ \
+         backup@archive.example.com:/srv/backups/nginx/$(hostname)/$(date +%Y%m%d)/ \
+         && echo done"
+    );
+}
+
+/// F335:单行选区不算「合并」(app 据此不飘 toast),文本与普通复制一致。
+#[test]
+fn a_single_row_alt_drag_is_not_reported_as_merged() {
+    let mut emu = Emulator::new(60, 40);
+    emu.feed(&fixture_bytes(WRAPPED_CMD));
+    let first = (0..40u16)
+        .find(|&r| row_text(&emu, r).starts_with("● find"))
+        .expect("fixture 里应当有那条命令");
+    emu.selection_start(2, first, SelectionKind::Simple, CellSide::Left);
+    emu.selection_update(19, first, CellSide::Right);
+    let (one, merged) = emu.selection_text_one_line().expect("应当选中了文本");
+    assert!(!merged);
+    assert_eq!(one, emu.selection_text().unwrap());
+}

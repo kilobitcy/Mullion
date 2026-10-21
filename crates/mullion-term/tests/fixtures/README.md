@@ -37,6 +37,7 @@
 | `claude-code-input-cursor` | `tmux new-session -x 100 -y 30 claude`,输入 `hi` 后停在输入框 | Claude Code 全程 `?25l`(`?25h` 只在启动出现一次),输入位置**全靠一格 SGR 7 反显块**自绘(F197 / F198) |
 | `claude-code-compact-repaint` | `tmux -x 120 -y 30` 里跑 Claude Code 执行 `/compact` | 重绘流里那一处 `CSI K`(擦转圈行)会把**整段跨行选区**丢掉,连没被碰过的行一起 —— 按住左键时必须补回(F212) |
 | `claude-code-timer-tick-repaint` | **tmux 客户端流**:`script -q -f -c 'tmux -L snap attach -t p' out.raw`(外层 `TERM=xterm-256color`,snap 服务器登记 `terminal-features[99] xterm-256color:sync`),120×30 里 Claude Code 跑 `sleep` 工具;截计时器 4 跳(4 个同步块),等长脱敏 | tmux 往外层重画 pane 时凡不满宽的行都补 `CSI K`,计时器一跳整屏**原样**重画也会把松手后的选区丢掉 —— 同坐标文字未变就补回,变了不补(F309)。**pipe-pane 录的内层流里没有这批 `CSI K`,复现不出来** |
+| `claude-code-wrapped-command` | `tmux -L snap new-session -x 60 -y 40 claude`(pipe-pane 内层流),让它原样回一条单行长命令;等长脱敏(会话名) | Ink 在词边界插**硬换行**、续行缩进两格,超宽 token 在**网格右缘**硬切(`…/$(hostname)/` 写满第 60 列接 `$(date…`);全程无 `WRAPLINE`。Alt+拖选拼成一行时据「写没写到最后一列」决定补不补空格(F335) |
 
 ## 规则
 

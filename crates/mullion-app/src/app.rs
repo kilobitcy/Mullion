@@ -2609,6 +2609,9 @@ pub struct App {
     /// 左键按下时的 0-based 锚点格与选区类型(F18)。松开时用来识别
     /// 「只是点了一下、指针从未离开这一格」——那种情况不该复制。
     press_anchor: Option<((u16, u16), mullion_term::selection::SelectionKind)>,
+    /// F335:左键按下时按着 Alt —— 这次划选松手后复制成一行。按下时记、松开时
+    /// `take`,不在松开那一刻现读:用户常常先松 Alt 再松左键。
+    drag_one_line: bool,
     /// 拖拽出界时每帧要滚的行数;0 = 不自动滚。**只在真正 present 的那一帧施加**
     /// (见 `RedrawRequested` 里的说明),否则重演 T3/T7。
     autoscroll: i32,
@@ -3380,6 +3383,7 @@ impl App {
             egui_focus_before_drag: None,
             prev_click: None,
             press_anchor: None,
+            drag_one_line: false,
             autoscroll: 0,
             ime: Default::default(),
             egui_ime_guard: Default::default(),
@@ -9622,6 +9626,7 @@ impl App {
         let pos1 = input::cell_at(self.cursor_in_grid(), cell_px, g.grid);
         let (kind, prev) = input::click_kind(self.prev_click, Instant::now(), pos1);
         self.prev_click = Some(prev);
+        self.drag_one_line = self.mods.alt_key();
         if let Some((col, row, side)) = self.selection_cursor() {
             self.press_anchor = Some(((col, row), kind));
             if let Some(pane) = self.active_ws_mut().and_then(Workspace::focused_mut) {
@@ -9712,6 +9717,7 @@ impl App {
         self.release_selection_hold();
         self.restore_egui_focus_after_drag();
         let anchor = self.press_anchor.take();
+        let one_line = std::mem::take(&mut self.drag_one_line);
         if !was_dragging {
             return;
         }
@@ -9727,7 +9733,11 @@ impl App {
                 return;
             }
         }
-        self.copy_selection();
+        if one_line {
+            self.copy_selection_one_line();
+        } else {
+            self.copy_selection();
+        }
     }
 
     /// 告诉系统输入法候选框该贴在哪(焦点 pane 的光标格)。
@@ -9786,6 +9796,24 @@ impl App {
             return;
         };
         self.clipboard.set(&text);
+    }
+
+    /// F335:Alt+拖选松手 —— 把选区拼成一行再写剪贴板(拼接规则在
+    /// `mullion_term::selection::join_as_one_line`)。真的合并了多行才飘 toast:
+    /// 普通复制是静默的,不提示的话手势生没生效要等粘贴出错才知道。
+    fn copy_selection_one_line(&mut self) {
+        let Some((text, merged)) = self
+            .active_ws()
+            .and_then(Workspace::focused)
+            .and_then(|p| p.emulator.selection_text_one_line())
+        else {
+            return;
+        };
+        self.clipboard.set(&text);
+        if merged {
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Ok, "已复制为单行");
+        }
     }
 
     /// 右键 / `Ctrl+Shift+V`:读剪贴板 → 判断要不要先确认 → 发送。
@@ -18977,6 +19005,37 @@ mod tests {
             press.contains("hold_selection(true)"),
             "按下没进入 hold 态 —— 远端一擦行,拖到一半的高亮就没了(F212 的实报症状)"
         );
+    }
+
+    /// F335 **接线守护**:拼接规则在 `mullion-term` 有 fixture 守着,这里钉
+    /// 「Alt 按下时记、松手时取、取了就清」这条链。
+    ///
+    /// - 松开时现读 Alt 不行:用户常常先松 Alt 再松左键,手势就静默失效;
+    /// - `take` 必须排在 `!was_dragging` 早退之前:否则一次没走完的划选留下的
+    ///   `true` 会让下一次普通拖选也被拼成一行。
+    ///
+    /// 自证会变红:把 `selection_press` 里那句记 Alt 删掉;或把 `take` 挪到
+    /// 早退之后;或让 `copy_selection_one_line` 无条件飘 toast。
+    #[test]
+    fn alt_is_read_at_press_and_handed_back_on_every_release() {
+        let press = body_of(prod_src(), "fn selection_press(&mut self) {");
+        assert!(
+            press.contains("self.drag_one_line = self.mods.alt_key()"),
+            "{press}"
+        );
+        let release = body_of(prod_src(), "fn selection_release(&mut self) {");
+        let took = release
+            .find("std::mem::take(&mut self.drag_one_line)")
+            .expect("松开没取走 Alt 标记");
+        let early = release.find("if !was_dragging").expect("早退判据变了");
+        assert!(took < early, "take 排在早退之后:标记会漏到下一次拖选");
+        assert!(
+            release.contains("self.copy_selection_one_line()"),
+            "{release}"
+        );
+        let copy = body_of(prod_src(), "fn copy_selection_one_line(&mut self) {");
+        assert!(copy.contains("selection_text_one_line()"), "{copy}");
+        assert!(copy.contains("if merged"), "单行选区也飘 toast 了:{copy}");
     }
 
     /// F15:左键点击要先切焦点、再尝试上报、上报不了才进本地划选;松开先问

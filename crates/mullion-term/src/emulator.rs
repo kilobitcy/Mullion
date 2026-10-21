@@ -18,7 +18,7 @@ use vte::ansi::Processor;
 
 use crate::palette;
 use crate::remote_state::{parse_title, Osc7Sniffer, RemoteState};
-use crate::selection::{CellSide, SelectionKind};
+use crate::selection::{join_as_one_line, CellSide, SelRow, SelectionKind};
 use crate::snapshot::{Cursor, CursorShape, GridSnapshot, Rgb, SnapCell};
 
 /// 收集 `Term` 发出的事件。共享缓冲,`Term` 持一份克隆。
@@ -649,6 +649,46 @@ impl Emulator {
     /// 选一段空白不值得覆盖用户剪贴板里的内容。
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
+    /// F335:当前选区拼成一行的文本(Alt+拖选)。第二项 = 真的合并了多行
+    /// (非空行多于一行),app 据此决定飘不飘 toast。空选区同
+    /// [`Self::selection_text`] 返回 `None`,不覆盖用户剪贴板。
+    ///
+    /// 拼接规则见 [`crate::selection::join_as_one_line`];这里只按屏幕行取文字
+    /// 和网格位置。逐行走上游 `bounds_to_string`,宽字符与 spacer 的处理不重造。
+    pub fn selection_text_one_line(&self) -> Option<(String, bool)> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let grid = self.term.grid();
+        let last = Column(grid.columns().saturating_sub(1));
+        let rows: Vec<SelRow> = (range.start.line.0..=range.end.line.0)
+            .map(Line)
+            .map(|line| {
+                let from = if line == range.start.line {
+                    range.start.column
+                } else {
+                    Column(0)
+                };
+                let to = if line == range.end.line {
+                    range.end.column
+                } else {
+                    last
+                };
+                let edge = &grid[line][last];
+                SelRow {
+                    text: self
+                        .term
+                        .bounds_to_string(Point::new(line, from), Point::new(line, to)),
+                    // 宽字符落在最后两列时,最后一列是它的右半 spacer(`c == ' '`)。
+                    reaches_right_edge: (edge.c != ' ' && edge.c != '\0')
+                        || edge.flags.contains(Flags::WIDE_CHAR_SPACER),
+                    soft_wrapped: edge.flags.contains(Flags::WRAPLINE),
+                }
+            })
+            .collect();
+        let merged = rows.iter().filter(|r| !r.text.trim().is_empty()).count() > 1;
+        let text = join_as_one_line(&rows);
+        (!text.is_empty()).then_some((text, merged))
     }
 
     /// 当前选区是不是**只占一行**。没有选区时返回 `false`。
