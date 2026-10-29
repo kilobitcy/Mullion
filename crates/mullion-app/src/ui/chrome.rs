@@ -216,6 +216,8 @@ pub struct TabView<'a> {
     /// 闸门)。在 `app.rs` 构造时算好 —— 一个落点一份判定,`one_tab` 里
     /// 不许再自己调一次 `should_paint`,两处迟早分叉。
     pub color: Option<egui::Color32>,
+    /// F337:这个标签里有 pane 响过铃而你还没看过。画成 `warn` 色实心点。
+    pub attention: bool,
 }
 
 /// F122/D5:标签的**有效色** = 标签覆盖 > 会话色 > 无。
@@ -416,6 +418,16 @@ fn one_tab(ui: &mut egui::Ui, t: &Theme, ix: usize, v: &TabView<'_>) -> Option<T
         annotate::mark(ui.ctx(), format!("标签栏/标签 {}/关闭", ix + 1), x.rect);
         x.on_hover_text("关闭此标签");
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            // F337:待办圆点。有底色时用前景色(满色底上 `warn` 可能看不见),
+            // 无底色用 `warn`。标签宽度固定、标题 truncate,圆点不会挤坏布局。
+            if v.attention {
+                let r = crate::ui::icon::icon_inline_rect(
+                    ui,
+                    crate::ui::icon::Glyph::LampLit,
+                    if colored { fg } else { theme::c32(t.warn) },
+                );
+                annotate::mark(ui.ctx(), format!("标签栏/标签 {}/待办", ix + 1), r);
+            }
             if let Some(icon) = v.appearance.and_then(|a| a.icon.as_ref()) {
                 let (r, _) =
                     ui.allocate_exact_size(egui::vec2(TAB_ICON, TAB_ICON), egui::Sense::hover());
@@ -1302,6 +1314,7 @@ mod tests {
             session_id: None,
             appearance: None,
             color: None,
+            attention: false,
         }];
         let texts = tab_titles(&views);
         assert!(
@@ -1365,6 +1378,7 @@ mod tests {
             session_id: None,
             appearance: None,
             color: None,
+            attention: false,
         }];
         assert_eq!(
             fills_of(&none, color),
@@ -1378,6 +1392,7 @@ mod tests {
             session_id: None,
             appearance: None,
             color: Some(color),
+            attention: false,
         }];
         assert_eq!(
             fills_of(&colored, color),
@@ -1433,6 +1448,7 @@ mod tests {
                 session_id: None,
                 appearance: None,
                 color: None,
+                attention: false,
             })
             .collect();
         let ctx = egui::Context::default();
@@ -1481,6 +1497,64 @@ mod tests {
         }
     }
 
+    /// F337:标签上的待办圆点画出来且过 F100 登记(矩形非空、落在该标签内;
+    /// 有底色的标签同样);没有待办就不登记。
+    ///
+    /// 自证会变红:删掉 `one_tab` 里 `if v.attention { .. }` 那一段。
+    #[test]
+    fn a_tab_with_attention_shows_and_registers_its_dot() {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        annotate::toggle(&ctx);
+        let views = [
+            TabView {
+                title: "build-01",
+                active: true,
+                session_id: None,
+                appearance: None,
+                color: None,
+                attention: false,
+            },
+            TabView {
+                title: "build-02",
+                active: false,
+                session_id: None,
+                appearance: None,
+                color: None,
+                attention: true,
+            },
+            TabView {
+                title: "build-03",
+                active: false,
+                session_id: None,
+                appearance: None,
+                color: Some(egui::Color32::from_rgb(200, 60, 60)),
+                attention: true,
+            },
+        ];
+        let mut paths = Vec::new();
+        // 同 `annotate_mode_registers_the_tab_bar_and_each_tab`:面板首帧 fade_in,跑两帧再取。
+        for _ in 0..2 {
+            let _ = ctx.run(Default::default(), |ctx| {
+                tab_bar_inner(ctx, &crate::theme::MULLION_DARK, &views, true);
+                paths = annotate::spot_paths(ctx);
+            });
+        }
+        assert!(
+            !paths.iter().any(|p| p == "标签栏/标签 1/待办"),
+            "{paths:?}"
+        );
+        for n in [2, 3] {
+            let dot_path = format!("标签栏/标签 {n}/待办");
+            assert!(paths.contains(&dot_path), "{paths:?}");
+            let dot = annotate::spot_rect(&ctx, &dot_path).unwrap();
+            let tab = annotate::spot_rect(&ctx, &format!("标签栏/标签 {n}")).unwrap();
+            assert!(dot.is_positive(), "{dot:?}");
+            assert!(tab.contains_rect(dot), "圆点 {dot:?} 不在标签 {tab:?} 内");
+            assert!(dot.width() < tab.width() / 4.0, "圆点 {dot:?} 不该是整块宽");
+        }
+    }
+
     /// F100:标签栏、每个标签、每个关闭按钮、`+` 都要登记 —— 走查里
     /// 「第 2 个标签的 × 太小」这类反馈标不到就只能用嘴描述。
     ///
@@ -1500,6 +1574,7 @@ mod tests {
                 session_id: None,
                 appearance: None,
                 color: None,
+                attention: false,
             },
             TabView {
                 title: "build-02",
@@ -1507,6 +1582,7 @@ mod tests {
                 session_id: None,
                 appearance: None,
                 color: None,
+                attention: false,
             },
         ];
         let mut paths = Vec::new();
@@ -1587,6 +1663,7 @@ mod tests {
                 session_id: None,
                 appearance: None,
                 color: None,
+                attention: false,
             },
             TabView {
                 title: "第二个",
@@ -1594,6 +1671,7 @@ mod tests {
                 session_id: None,
                 appearance: None,
                 color: None,
+                attention: false,
             },
         ];
         let ctx = egui::Context::default();
@@ -1653,6 +1731,7 @@ mod tests {
                 session_id: None,
                 appearance: None,
                 color: None,
+                attention: false,
             },
             TabView {
                 title: "第二个",
@@ -1660,6 +1739,7 @@ mod tests {
                 session_id: Some(mullion_store::SessionId(1)),
                 appearance: None,
                 color: None,
+                attention: false,
             },
         ];
         let ctx = egui::Context::default();
@@ -1794,6 +1874,7 @@ mod tests {
             session_id: None,
             appearance: None,
             color: None,
+            attention: false,
         }];
         assert_eq!(
             click_context_menu_item(&t, &quick_connect, "快速连接", "重命名…"),
@@ -1824,6 +1905,7 @@ mod tests {
             session_id: None,
             appearance: None,
             color: None,
+            attention: false,
         }];
 
         let ctx = egui::Context::default();

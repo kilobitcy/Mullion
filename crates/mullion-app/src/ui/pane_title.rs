@@ -56,6 +56,8 @@ pub struct TitleView<'a> {
     /// 空 = 不显示(还没取到 / `host_pending` / 没连上)。**拿 owned**:源头是
     /// `Mutex` 里的快照,借不出活到本帧结束的引用;每 pane 每帧三个短串。
     pub stats: Vec<crate::node_stats::Piece>,
+    /// F337:这块 pane 响过铃而你还没看过。画成序号前的 `warn` 色实心点。
+    pub attention: bool,
 }
 
 /// ④:焦点分屏标题条上那层 accent 的不透明度。0.14 —— 够看出「这块亮一点」,
@@ -738,6 +740,20 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         // F61:图标画在状态点之前。`content` 是个 `new_child` +
                         // `set_clip_rect`,画多了只会被裁掉,不会把 `Area` 撑大。
+                        // F337:待办圆点排最前 —— 它是这一条上唯一「要你做点什么」的
+                        // 信号。走 `ui::icon` 自绘,不用字符(T9)。
+                        if v.attention {
+                            let r = crate::ui::icon::icon_inline_rect(
+                                ui,
+                                crate::ui::icon::Glyph::LampLit,
+                                theme::c32(t.warn),
+                            );
+                            crate::ui::annotate::mark(
+                                ui.ctx(),
+                                format!("分屏 {}/待办", v.index),
+                                r,
+                            );
+                        }
                         if let Some(icon) = icon_of(v.appearance, v.project_icon) {
                             // ⑤:边长按内容区高度算,不写死 —— 见 `icon_side`。
                             let side = icon_side(inner.height());
@@ -1068,6 +1084,54 @@ mod tests {
         }
     }
 
+    /// F337:待办圆点画出来且过 F100 登记(矩形非空、落在标题条内);
+    /// 没有待办就不登记。
+    ///
+    /// 自证会变红:删掉 `show` 里 `if v.attention { .. }` 那一段。
+    #[test]
+    fn a_pane_with_attention_shows_and_registers_its_dot() {
+        for attention in [false, true] {
+            let ctx = egui::Context::default();
+            crate::ui::annotate::toggle(&ctx);
+            let view = TitleView {
+                geom: geom_800x600_title32(1, 1.0),
+                index: 1,
+                project: None,
+                project_icon: None,
+                host: Some("dev@build-01"),
+                status: PaneStatus::Live,
+                focused: false,
+                appearance: None,
+                cwd_leaf: None,
+                tmux: None,
+                notice: None,
+                drawer: false,
+                stats: Vec::new(),
+                attention,
+            };
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(
+                    ctx,
+                    &crate::theme::MULLION_DARK,
+                    std::slice::from_ref(&view),
+                );
+            });
+            let paths = crate::ui::annotate::spot_paths(&ctx);
+            assert_eq!(
+                paths.contains(&"分屏 1/待办".to_string()),
+                attention,
+                "attention={attention}: {paths:?}"
+            );
+            if attention {
+                let dot = crate::ui::annotate::spot_rect(&ctx, "分屏 1/待办").unwrap();
+                let bar = crate::ui::annotate::spot_rect(&ctx, "分屏 1/标题条").unwrap();
+                assert!(dot.is_positive(), "{dot:?}");
+                assert!(bar.contains_rect(dot), "圆点 {dot:?} 不在标题条 {bar:?} 内");
+                assert!(dot.width() < bar.width() / 4.0, "圆点 {dot:?} 不该是整条宽");
+            }
+        }
+    }
+
     /// pane 整块 / 标题条 / 终端区都要能在标注模式(F100)里选中。终端网格是
     /// GPU 自绘的,不是 egui widget,accesskit 那条腿覆盖不到它 —— 只能手工插桩。
     ///
@@ -1094,6 +1158,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                attention: false,
             };
             view.geom.title_px.h = title_h;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1153,6 +1218,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                attention: false,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1218,6 +1284,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            attention: false,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1274,6 +1341,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            attention: false,
         }];
         click_button_with(&views, which)
     }
@@ -1435,6 +1503,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            attention: false,
         }];
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(1.0);
@@ -1520,6 +1589,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            attention: false,
         }];
         let ctx = egui::Context::default();
         let t = crate::theme::MULLION_DARK;
@@ -1564,6 +1634,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            attention: false,
         }];
         let ctx = egui::Context::default();
         let t = crate::theme::MULLION_DARK;
@@ -1623,6 +1694,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            attention: false,
         }];
         let a = click_button_with(&views, country_id(PaneId(1)));
         assert_eq!(a.refresh_node, Some(PaneId(1)));
@@ -1731,6 +1803,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            attention: false,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
             show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1779,6 +1852,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            attention: false,
         }];
         // 跑两帧:`Area` 默认 `fade_in`,第一帧 opacity 是 0,画的图形会被
         // painter 记成 `Shape::Noop`(egui-0.30 `painter.rs::Painter::add`),
@@ -1867,6 +1941,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                attention: false,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
                 show(ctx, &crate::theme::MULLION_DARK, &views);
@@ -1936,6 +2011,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                attention: false,
             }];
             // 显式推进时间,而不是像 `run_title` 那样跑两帧靠墙钟走时间:
             // 这条测试要比较**颜色**,`fade_in` 半路上的不透明度会把 RGB
@@ -2037,6 +2113,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                attention: false,
             }];
 
             let ctx = egui::Context::default();
@@ -2107,6 +2184,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            attention: false,
         }];
 
         let ctx = egui::Context::default();
@@ -2225,6 +2303,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                attention: false,
             }];
             let ctx = egui::Context::default();
             let t = crate::theme::MULLION_DARK;
@@ -2359,6 +2438,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                attention: false,
             }];
 
             let ctx = egui::Context::default();
@@ -2453,6 +2533,7 @@ mod tests {
             notice: None,
             drawer,
             stats: Vec::new(),
+            attention: false,
         }
     }
 

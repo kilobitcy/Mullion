@@ -21,7 +21,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{UserAttentionType, Window, WindowId};
 
 use crate::frame::{FrameLimiter, RedrawAction};
 use crate::gpu::{quads_for_panes, Gpu};
@@ -2442,6 +2442,8 @@ pub struct App {
     /// F125:窗口有没有焦点。失焦时不闪(也就不需要周期唤醒),与 Windows 上
     /// 其它终端的惯例一致。
     window_focused: bool,
+    /// F337:这一轮失焦里是否已经闪过任务栏(重新获得焦点时复位)。
+    flashed_since_blur: bool,
     /// 唤醒/连接结果回送通道(注入 `session::connect` 的 wake,以及本身发 UserEvent)。
     proxy: EventLoopProxy<UserEvent>,
     /// 已知主机指纹表(F3),对应磁盘 `known_hosts.toml`。SSH 线程只读它做判断;
@@ -2548,6 +2550,8 @@ pub struct App {
     /// 会被别的实例判成死的,于是它正用着的现场出现在别人的恢复列表里
     /// (设计 D4 的实现约束)。
     heartbeat_at: Instant,
+    /// F336:上一次交给 `set_title` 的窗口标题。只在变了才调(T3 同族)。
+    last_title: String,
     last_saved_layout: Option<mullion_store::SavedLayout>,
     /// F37:上一次比对快照的时刻。节流窗口见 `layout_snapshot::should_flush`。
     layout_checked_at: Instant,
@@ -3338,6 +3342,7 @@ impl App {
             last_input_at: Instant::now(),
             presented_blink_on: true,
             window_focused: true,
+            flashed_since_blur: false,
             proxy,
             known_hosts,
             pending_host_key: None,
@@ -3364,6 +3369,7 @@ impl App {
             // 等 15 秒 —— 那 15 秒里别的实例会把本进程判成死的。
             heartbeat_at: Instant::now()
                 - Duration::from_secs(mullion_store::HEARTBEAT_INTERVAL_SECS),
+            last_title: String::from("mullion"),
             last_saved_layout: None,
             layout_checked_at: Instant::now(),
             // F84:真正的值在 `resumed` 里从 `settings.toml` 读(要先有窗口才
@@ -5009,7 +5015,8 @@ impl App {
     /// holding(正常出帧),要么仍在 holding 但 `sync_since_ms` 不变、
     /// `holding_deadline_ms` 天然不再返回同一个过去的时刻,不会重复排期。
     fn sync_timeout_wake(&self, now_ms: u64) -> Option<Instant> {
-        sync_timeout_wake_at(self.start, self.active_ws(), now_ms)
+        // F337-a:后台标签不出帧,但同步块到点也得有人来收口。
+        sync_timeout_wake_of(self.start, &self.tabs, now_ms)
     }
 
     /// F125:这一帧光标该不该画出来。失焦时恒 `true`(不闪,常显)——
@@ -10362,20 +10369,29 @@ impl App {
         }
     }
 
-    /// 排空每个 pane 的 rx → feed 各自的 emulator → 回写各自的 `PtyWrite`(T1 红线)。
+    /// 排空**全部标签**每个 pane 的 rx → feed 各自的 emulator → 回写各自的 `PtyWrite`(T1 红线)。
+    /// 后台标签也泵(F337-a),见 `pump_all_tabs`。
     ///
     /// 从 `RedrawRequested` 和(最小化时)`UserEvent::Wake` 两处调:最小化期间窗口
     /// 未必还会被重绘,不能把这条通路挂在重绘上,否则有界 rx(256)灌满堵住 io_task,
     /// 远端的同步输出探测/光标查询永久等不到应答。
     fn pump_io(&mut self) {
         let now = self.now_ms();
-        let mut flushed = false;
-        if let Some(ws) = self.active_ws_mut() {
-            ws.pump(now);
-            // T2:超时的同步块要就地收口 —— 字节还压在 vte 的 `Processor` 里,
-            // `Term` 根本没见过,再怎么出帧也只是旧画面。
-            // 见 `Emulator::flush_expired_sync`。
-            flushed = ws.flush_expired_vt_sync(Instant::now());
+        // F337-a:全部标签都泵,只有活动标签的收口决定要不要出帧。
+        let flushed = pump_all_tabs(&mut self.tabs, now, Instant::now());
+        // F337:结算待办。**必须在泵(含同步块收口)之后** —— 同步块里的铃
+        // 收口时才进 `Term`(复核 C2)。最小化态这里是唯一会跑的地方(`Wake`)。
+        let settled = settle_attention_of(&mut self.tabs, self.window_focused);
+        if should_flash(settled.fresh, self.window_focused, self.flashed_since_blur) {
+            if let Some(a) = &self.active {
+                a.window
+                    .request_user_attention(Some(UserAttentionType::Informational));
+            }
+            self.flashed_since_blur = true;
+        }
+        if settled.changed {
+            // 圆点与标题要跟着变;不标脏的话这一帧被判 Idle。
+            mark_ui_dirty!(self.ui_dirty);
         }
         if flushed {
             // 收口出来的字节没经过 `pacer.feed`,`panes_ready_to_present` 判不出
@@ -11207,6 +11223,7 @@ impl App {
                 tmux: None,
                 title_ever_seen: false,
                 history_reported: 0,
+                attention: false,
                 host_pending: false,
                 notice: None,
             },
@@ -13356,6 +13373,9 @@ impl ApplicationHandler<UserEvent> for App {
             egui_renderer,
             last_frame_fp: None,
         });
+        // F337 / 复核 R3:`window_focused` 初值写死 `true`,而多实例恢复时从未拿到
+        // 焦点的窗口 winit 不补发 `Focused(false)` —— 那个实例会一直以为自己被看着。
+        self.window_focused = self.active.as_ref().is_some_and(|a| a.window.has_focus());
 
         // 打开会话保险库(Task 6)。失败(keyring 不可用/无法定位配置目录等)不
         // panic/exit——记 ui.last_error,会话管理功能优雅禁用,菜单/关于仍能用
@@ -13498,6 +13518,7 @@ impl ApplicationHandler<UserEvent> for App {
                             tmux: None,
                             title_ever_seen: false,
                             history_reported: 0,
+                            attention: false,
                             host_pending: false,
                             notice: None,
                         });
@@ -14394,6 +14415,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // F125:失焦不闪,省掉后台窗口的周期唤醒。
                 self.window_focused = focused;
                 if focused {
+                    // F337:新的一轮失焦可以再闪一次。
+                    self.flashed_since_blur = false;
                     self.refresh_vault_on_focus();
                     self.recheck_visibility();
                     self.request_ui_redraw();
@@ -15235,6 +15258,9 @@ impl ApplicationHandler<UserEvent> for App {
                                                             )
                                                         })
                                                         .unwrap_or_default(),
+                                                    attention: ws
+                                                        .pane(g.id)
+                                                        .is_some_and(|p| p.attention),
                                                 }
                                             })
                                             .collect()
@@ -15266,6 +15292,7 @@ impl ApplicationHandler<UserEvent> for App {
                                                 )
                                             }),
                                         ),
+                                        attention: tab_has_attention(tab),
                                     }
                                 })
                                 .collect();
@@ -16625,6 +16652,19 @@ impl ApplicationHandler<UserEvent> for App {
         // 布局没变时不落盘,心跳却必须照写,否则开着不动的窗口会被别的实例
         // 判成死的。
         self.tick_heartbeat();
+        // F336:窗口标题。**放这里不放 `RedrawRequested`**:最小化态不出帧,
+        // 而标题恰在那时最需要更新(复核 R8)。算与 `set_title` 分开、不同才调 ——
+        // `set_title` 每调一次都是一次跨线程窗口消息,每次唤醒都调是 T3 那一类白烧。
+        let title = window_title_of(
+            &self.tabs,
+            self.store.as_ref().map_or(&[], |s| s.projects()),
+        );
+        if title != self.last_title {
+            if let Some(a) = &self.active {
+                a.window.set_title(&title);
+            }
+            self.last_title = title;
+        }
         // F124:到点就配一遍远端 tmux 的状态上报。跟布局落盘同一个理由放在
         // 这里 —— 它跟渲染无关,而 `about_to_wait` 是「已经闲下来了」这个
         // 语义唯一准确的位置。
@@ -16888,6 +16928,7 @@ fn place_dead_pane_of(
         tmux: None,
         title_ever_seen: false,
         history_reported: 0,
+        attention: false,
         // 它从来没连上过自己那台机器 —— 身份要照抄盘上那份。
         host_pending: true,
         notice: Some(msg.to_string()),
@@ -16970,6 +17011,7 @@ fn rehost_pane(
             tmux: None,
             title_ever_seen: false,
             history_reported: 0,
+            attention: false,
             // 这条 channel 就是它自己那台机器的,身份不再是「照抄盘上那份」。
             host_pending: false,
             notice: None,
@@ -17717,6 +17759,169 @@ pub(crate) fn cancel_probe(epoch: &mut u64, state: &mut crate::ui::session_manag
     *state = crate::ui::session_manager::ProbeState::Idle;
 }
 
+/// F337-a:排空**全部**标签的 rx、喂 emulator、回写 PtyWrite(T1),并收口到点的
+/// 同步块(T2)。返回**活动标签**有没有收口 —— 只有它要出帧。
+///
+/// 原先只泵活动标签:后台标签的 TUI 查询永远等不到应答、有界 rx 灌满堵住
+/// io_task,BEL 也永远到不了 `Term`(切回去那一刻才喂进去,那时它恰好正被
+/// 看着,待办直接蒸发)。后台标签的字节切回时本来也要解析,总工作量不变。
+///
+/// 副作用:后台 pane 的 rx 关闭现在会立刻翻成 Reconnecting/Disconnected,
+/// 不再等切回标签(预期行为,`drive_reconnects` 本就遍历全标签)。
+///
+/// 自由函数而不是 `&mut self` 方法:`App` 在测试容器里构造不出来。
+fn pump_all_tabs(tabs: &mut Tabs<TabContent>, now_ms: u64, now: Instant) -> bool {
+    let active = tabs.active_index();
+    let mut active_flushed = false;
+    for (ix, tab) in tabs.iter_mut().enumerate() {
+        let Some(t) = tab.content.as_terminal_mut() else {
+            continue;
+        };
+        t.ws.pump(now_ms);
+        // T2:超时的同步块要就地收口 —— 字节还压在 vte 的 `Processor` 里,
+        // `Term` 根本没见过。见 `Emulator::flush_expired_sync`。
+        let flushed = t.ws.flush_expired_vt_sync(now);
+        if ix == active {
+            active_flushed = flushed;
+        }
+    }
+    active_flushed
+}
+
+/// F337:逐标签结算待办。`viewer` = 窗口有焦点 **且** 是活动标签 → 该标签的焦点 pane。
+/// 返回各标签结论的并。
+fn settle_attention_of(
+    tabs: &mut Tabs<TabContent>,
+    window_focused: bool,
+) -> crate::shell::workspace::Settled {
+    let active = tabs.active_index();
+    let mut out = crate::shell::workspace::Settled::default();
+    for (ix, tab) in tabs.iter_mut().enumerate() {
+        let Some(t) = tab.content.as_terminal_mut() else {
+            continue;
+        };
+        let viewer = (window_focused && ix == active).then(|| t.ws.focus());
+        let s = t.ws.settle_attention(viewer);
+        out.fresh |= s.fresh;
+        out.changed |= s.changed;
+    }
+    out
+}
+
+/// F337 决策 6:标签上的待办圆点是**推导**的(标签内任一 pane 待办),不另存。
+fn tab_has_attention(tab: &Tab<TabContent>) -> bool {
+    tab.content
+        .as_terminal()
+        .is_some_and(|t| t.ws.panes().iter().any(|p| p.attention))
+}
+
+/// F337 / 复核 R1:闪烁判据是**事件**(这轮有没被看着的铃)+ 每次失焦至多一次。
+/// winit 的 `Informational` = `FLASHW_TRAY | FLASHW_TIMERNOFG`,橙色持续到激活,
+/// 重复调没有意义。
+fn should_flash(fresh: bool, window_focused: bool, flashed_since_blur: bool) -> bool {
+    fresh && !window_focused && !flashed_since_blur
+}
+
+/// F336:标题条那一套推导的窗口级版本 —— 项目名优先,否则 host 标签。
+/// `host_pending` 时 `host_ix` 指着别人那台机器,不能借名字(同 `TitleView.host`)。
+fn pane_label<'a>(
+    ws: &'a Workspace,
+    id: PaneId,
+    projects: &'a [mullion_store::ProjectRecord],
+) -> Option<&'a str> {
+    let p = ws.pane(id)?;
+    if let Some(proj) = crate::project::project_of(p.tmux.as_deref(), projects) {
+        return Some(proj.name.as_str());
+    }
+    if p.host_pending {
+        return None;
+    }
+    ws.hosts.get(p.host_ix).map(|h| h.label.as_str())
+}
+
+/// F336:窗口标题。`attention` = `None` 没有待办;`Some(None)` 首个待办就是主体
+/// (复核 R4:不重复名字);`Some(Some(name))` 首个待办是另一块。
+///
+/// 只拼字符串,不碰 `App` —— 形态全在这里测。
+fn compose_window_title(
+    main: Option<&str>,
+    others: usize,
+    attention: Option<Option<&str>>,
+) -> String {
+    let mut s = String::new();
+    match attention {
+        None => {}
+        Some(None) => s.push_str("[!] "),
+        Some(Some(name)) => {
+            s.push_str("[!] ");
+            s.push_str(name);
+            s.push_str(" · ");
+        }
+    }
+    if let Some(m) = main {
+        s.push_str(m);
+        if others > 0 {
+            s.push(' ');
+        }
+    }
+    if others > 0 {
+        s.push_str(&format!("(+{others})"));
+    }
+    if s.is_empty() {
+        return "mullion".into();
+    }
+    s.push_str(" — mullion");
+    s
+}
+
+/// F336:从标签表现算窗口标题。主体 = 活动标签焦点 pane;`+N` = 整窗其余真 pane
+/// (抽屉不计,口径同 `Workspace::pane_count`);待办「首个」= 标签顺序 → 树叶子顺序
+/// (抽屉也在树叶子里,挂在抽屉上的待办不会漏)。
+fn window_title_of(tabs: &Tabs<TabContent>, projects: &[mullion_store::ProjectRecord]) -> String {
+    let active = tabs.active().and_then(|t| t.content.as_terminal());
+    let main_id = active.map(|t| t.ws.focus());
+    let main = active.and_then(|t| pane_label(&t.ws, t.ws.focus(), projects));
+    let total: usize = tabs
+        .iter()
+        .filter_map(|t| t.content.as_terminal())
+        .map(|t| t.ws.pane_count())
+        .sum();
+    // 主体被 `pane_count` 计入才减;焦点在抽屉上时它本就不在 `total` 里,
+    // 再减就少算一块。判据与 `pane_count` 同为 `is_drawer`。
+    let main_counted = active.is_some_and(|t| !t.ws.is_drawer(t.ws.focus()));
+    let others = total.saturating_sub(usize::from(main_counted));
+    let first = tabs.iter().enumerate().find_map(|(ix, tab)| {
+        let t = tab.content.as_terminal()?;
+        mullion_core::layout::leaves(t.ws.tree())
+            .into_iter()
+            .find(|id| t.ws.pane(*id).is_some_and(|p| p.attention))
+            .map(|id| (ix, id, t))
+    });
+    let attention = first.map(|(ix, id, t)| {
+        if ix == tabs.active_index() && Some(id) == main_id {
+            None
+        } else {
+            pane_label(&t.ws, id, projects)
+        }
+    });
+    // 另一块待办 pane 没名字可报时(`pane_label` 为 None)是 `Some(None)`,
+    // 恰好落到「只加 `[!] `」那一支 —— 不编一个名字出来。
+    compose_window_title(main, others, attention)
+}
+
+/// F337-a:**非活动**标签里最早的 vte 同步块超时点。活动标签那份(连同
+/// `SyncFramePacer` 的超时)由 `sync_timeout_wake_at` 管;后台不出帧,只需要
+/// 到点来收口一次,否则它同步块里的 BEL 要等下一个不相关事件才出来。
+fn background_vt_deadline(tabs: &Tabs<TabContent>) -> Option<Instant> {
+    let active = tabs.active_index();
+    tabs.iter()
+        .enumerate()
+        .filter(|(ix, _)| *ix != active)
+        .filter_map(|(_, tab)| tab.content.as_terminal())
+        .filter_map(|t| t.ws.vt_sync_deadline())
+        .min()
+}
+
 /// Important #2:`App::sync_timeout_wake` 的核心决策抽成自由函数——只吃
 /// `start`(`App::now_ms` 的同一时钟基准)/`Option<&Workspace>`/`now_ms`,
 /// 不碰 `&App` 本身,因此不需要能构造 `EventLoopProxy`(本容器里构造不出来,
@@ -17733,10 +17938,22 @@ fn sync_timeout_wake_at(start: Instant, ws: Option<&Workspace>, now_ms: u64) -> 
     // 有人到点来问一次(`Emulator::flush_expired_sync`)。两个取最早的:只排
     // 其中一个,另一个就只能等下一个不相关事件顺带救回来,而「下一个事件」
     // 在用户打字的场景里就是**下一次按键**,画面于是永远慢一拍。
-    match (pacer, ws.vt_sync_deadline()) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
+    earliest(pacer, ws.vt_sync_deadline())
+}
+
+/// 两个可选时刻取较早者(`None` 视为「没有」而不是「无穷早」)。
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    [a, b].into_iter().flatten().min()
+}
+
+/// F337-a:活动标签的同步超时点(`sync_timeout_wake_at`)与后台标签的
+/// vte 同步块超时点(`background_vt_deadline`)取最早。抽成自由函数是为了
+/// 脱离 `App` 单测这条合并。
+fn sync_timeout_wake_of(start: Instant, tabs: &Tabs<TabContent>, now_ms: u64) -> Option<Instant> {
+    earliest(
+        sync_timeout_wake_at(start, active_ws_of(tabs), now_ms),
+        background_vt_deadline(tabs),
+    )
 }
 
 /// F158:这个后台事件该不该把 egui 侧标脏。
@@ -18680,26 +18897,28 @@ fn render_frame(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_credential_save, apply_import, apply_layout_actions, apply_save, apply_tab_props,
-        arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
-        autoscroll_for_pane, blink_on_at, blink_wake_at, clear_leaf_attach_intent,
-        clip_still_matches_what_was_pasted, cloud_backoff_ms, convert_inline_to_credential,
-        credential_delete_error, credential_from_session_toast, decide_paste, dialing_from,
-        dismiss_areas, dismiss_verdict, download_job, draft_baseline_is_in_vault,
-        drive_attach_checks_of, effective_focus_of, expand_tilde, files_owner_generation_of,
-        files_path_editing_of, files_start_dir, finish_password_change, follow_for_clip_mode,
-        font_px_for, has_real_action, history_rows_of, history_sync, host_for_fresh,
-        ime_cursor_area, ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator,
-        next_auto_dial, next_panel_selection_index, opt_buf_dirty, pane_reports_of,
-        pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
+        active_ws_of, apply_credential_save, apply_import, apply_layout_actions, apply_save,
+        apply_tab_props, arrival_of, attach_check_verdict, auto_dial_summary, automation_for_leaf,
+        autoscroll_for_pane, background_vt_deadline, blink_on_at, blink_wake_at,
+        clear_leaf_attach_intent, clip_still_matches_what_was_pasted, cloud_backoff_ms,
+        compose_window_title, convert_inline_to_credential, credential_delete_error,
+        credential_from_session_toast, decide_paste, dialing_from, dismiss_areas, dismiss_verdict,
+        download_job, draft_baseline_is_in_vault, drive_attach_checks_of, earliest,
+        effective_focus_of, expand_tilde, files_owner_generation_of, files_path_editing_of,
+        files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
+        has_real_action, history_rows_of, history_sync, host_for_fresh, ime_cursor_area,
+        ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
+        next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
+        paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience, pump_all_tabs,
         reattach_pane, rehost_pane, rehost_voids_attach_intent, remote_bookmark_owner,
-        resolved_scrollback, session_manager_dirty, should_check_attach, should_pop_cloud_error,
-        should_pop_transfer_error, snapshot_tabs_of, sync_plan_of, sync_remote_bookmarks_of,
-        sync_timeout_wake_at, tab_keeps_template, tab_title, take_next_restore_dial,
-        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, AttachCheck,
-        AttachVerdict, DialTicket, HistorySync, Modal, OpFollow, PasteDecision, RehostKind,
-        RestoredTab, SshConfig, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent,
-        CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
+        resolved_scrollback, session_manager_dirty, settle_attention_of, should_check_attach,
+        should_flash, should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of,
+        sync_plan_of, sync_remote_bookmarks_of, sync_timeout_wake_at, sync_timeout_wake_of,
+        tab_has_attention, tab_keeps_template, tab_title, take_next_restore_dial,
+        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, window_title_of,
+        AttachCheck, AttachVerdict, DialTicket, HistorySync, Modal, OpFollow, PasteDecision,
+        RehostKind, RestoredTab, SshConfig, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
+        UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -18708,6 +18927,7 @@ mod tests {
     use mullion_core::layout::{Dir, Node, PaneId, Rect};
     use mullion_store::SessionId;
     use std::sync::Arc;
+    use std::time::Instant;
 
     // ------------------------------------------------ F155 剖面接线
 
@@ -22802,6 +23022,7 @@ mod tests {
             tmux: None,
             title_ever_seen: false,
             history_reported: 0,
+            attention: false,
             host_pending: false,
             notice: None,
         }
@@ -27041,6 +27262,408 @@ mod tests {
         }))
     }
 
+    /// 同 `second_terminal_tab`,但用调用方给的 `Workspace` —— 要拿
+    /// `tests_support::ws_with` 的 `Probe` 观测 PtyWrite 有没有回写。
+    fn terminal_tab_of(ws: Workspace) -> TabContent {
+        TabContent::Terminal(Box::new(TerminalTab {
+            ws,
+            last_cfg: None,
+            automation: Vec::new(),
+            automation_template: None,
+            tmux_attach: None,
+            automation_status: None,
+            files: Default::default(),
+            sftp: None,
+            sftp_host_ix: None,
+            sftp_tasks: Vec::new(),
+            sftp_default_remote: None,
+            sftp_screenshot_dir: None,
+            sftp_home: None,
+            reconnect_tasks: Vec::new(),
+            leaf_wanted: Vec::new(),
+            leaf_detach: Vec::new(),
+            pending_reveal: None,
+        }))
+    }
+
+    /// **F337-a / T1**:后台标签的 pane 也要排空 rx、回写 PtyWrite。
+    ///
+    /// 原先 `pump_io` 只泵活动标签:后台标签里 TUI 发的光标位置查询
+    /// (`CSI 6n`)永远等不到应答,BEL 也永远到不了 `Term`。
+    ///
+    /// 自证会变红:把 `pump_all_tabs` 的循环改回只处理 `tabs.active_mut()`。
+    #[test]
+    fn a_background_tab_is_pumped_and_answers_its_pty_queries() {
+        use crate::shell::workspace::tests_support::ws_with;
+        let (bg_ws, probes) = ws_with(1);
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("bg".into(), None, terminal_tab_of(bg_ws));
+        tabs.open("fg".into(), None, second_terminal_tab(2));
+        assert_eq!(tabs.active_index(), 1, "前提:后台标签不是活动标签");
+        probes[0].tx.try_send(b"\x1b[6n".to_vec()).unwrap();
+
+        pump_all_tabs(&mut tabs, 0, Instant::now());
+
+        let writes = probes[0].writes.lock().unwrap();
+        assert!(
+            writes
+                .iter()
+                .any(|w| w.starts_with(b"\x1b[") && w.ends_with(b"R")),
+            "后台标签的光标查询没有被应答:{writes:?}"
+        );
+    }
+
+    /// **F337-a / T3**:后台标签的同步块收口**不**让本帧标脏 —— 后台不出帧,
+    /// 标脏等于为一块看不见的画面白画一帧。
+    #[test]
+    fn a_background_sync_flush_does_not_ask_for_a_frame() {
+        use crate::shell::workspace::tests_support::ws_with;
+        let (mut bg_ws, _p) = ws_with(1);
+        bg_ws
+            .pane_mut(PaneId(1))
+            .unwrap()
+            .emulator
+            .feed(b"\x1b[?2026hX");
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("bg".into(), None, terminal_tab_of(bg_ws));
+        tabs.open("fg".into(), None, second_terminal_tab(2));
+
+        let later = Instant::now() + std::time::Duration::from_secs(5);
+        assert!(!pump_all_tabs(&mut tabs, 0, later));
+        // 但它确实收口了(否则 C2:同步块里的 BEL 永远出不来)。
+        let bg = tabs.get(0).unwrap().content.as_terminal().unwrap();
+        assert!(bg.ws.vt_sync_deadline().is_none(), "后台同步块没有被收口");
+    }
+
+    /// **F337-a / T2**:后台标签卡在同步块里时,`WaitUntil` 也要排到它的超时点,
+    /// 否则「没有下一个入站字节」时它的 BEL 永远出不来。
+    #[test]
+    fn the_background_vt_deadline_is_scheduled_but_the_active_one_is_not_counted_twice() {
+        use crate::shell::workspace::tests_support::ws_with;
+        let (mut bg_ws, _p) = ws_with(1);
+        bg_ws
+            .pane_mut(PaneId(1))
+            .unwrap()
+            .emulator
+            .feed(b"\x1b[?2026h");
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("bg".into(), None, terminal_tab_of(bg_ws));
+        tabs.open("fg".into(), None, second_terminal_tab(2));
+        assert!(background_vt_deadline(&tabs).is_some());
+
+        // 只有活动标签在同步块里:那份由 `sync_timeout_wake_at` 管,这里不重复算。
+        let mut only_fg: Tabs<TabContent> = Tabs::default();
+        let (mut fg_ws, _p2) = ws_with(1);
+        fg_ws
+            .pane_mut(PaneId(1))
+            .unwrap()
+            .emulator
+            .feed(b"\x1b[?2026h");
+        only_fg.open("fg".into(), None, terminal_tab_of(fg_ws));
+        assert!(background_vt_deadline(&only_fg).is_none());
+    }
+
+    /// 造一个已在 BSU 里的标签。
+    fn tab_in_bsu() -> TabContent {
+        use crate::shell::workspace::tests_support::ws_with;
+        let (mut ws, probes) = ws_with(1);
+        ws.pane_mut(PaneId(1))
+            .unwrap()
+            .emulator
+            .feed(b"\x1b[?2026h");
+        drop(probes);
+        terminal_tab_of(ws)
+    }
+
+    /// **F337-a / T2**:活动与后台截止的合并 —— 只有后台时取后台,
+    /// 两边都有时取较早者(两个方向都测,防 min 写成 max)。
+    #[test]
+    fn sync_wake_merges_active_and_background_deadlines() {
+        let start = Instant::now();
+        // `Tabs::open` 让后开的成为活动标签;先造的先进 BSU,截止更早。
+        let build = |active_is_earlier: bool| {
+            let first = tab_in_bsu();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let second = tab_in_bsu();
+            let (bg, fg) = if active_is_earlier {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            let mut tabs: Tabs<TabContent> = Tabs::default();
+            tabs.open("bg".into(), None, bg);
+            tabs.open("fg".into(), None, fg);
+            tabs
+        };
+        let tabs = build(true);
+        let active = active_ws_of(&tabs).unwrap().vt_sync_deadline().unwrap();
+        let bg = background_vt_deadline(&tabs).unwrap();
+        assert!(active < bg, "前提:活动较早");
+        assert_eq!(sync_timeout_wake_of(start, &tabs, 0), Some(active));
+
+        let tabs = build(false);
+        let active = active_ws_of(&tabs).unwrap().vt_sync_deadline().unwrap();
+        let bg = background_vt_deadline(&tabs).unwrap();
+        assert!(bg < active, "前提:后台较早");
+        assert_eq!(sync_timeout_wake_of(start, &tabs, 0), Some(bg));
+
+        // 只有后台在 BSU,活动标签没有。
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("bg".into(), None, tab_in_bsu());
+        tabs.open("fg".into(), None, second_terminal_tab(2));
+        let bg = background_vt_deadline(&tabs).unwrap();
+        assert_eq!(sync_timeout_wake_of(start, &tabs, 0), Some(bg));
+    }
+
+    /// **F337-a / T2**:`earliest` 把 `None` 当「没有」。
+    #[test]
+    fn earliest_treats_none_as_absent() {
+        let a = Instant::now();
+        let b = a + std::time::Duration::from_secs(1);
+        assert_eq!(earliest(None, None), None);
+        assert_eq!(earliest(Some(b), None), Some(b));
+        assert_eq!(earliest(None, Some(b)), Some(b));
+        assert_eq!(earliest(Some(b), Some(a)), Some(a));
+        assert_eq!(earliest(Some(a), Some(b)), Some(a));
+    }
+
+    /// **接线守护(F337-a)**:`App::sync_timeout_wake` 走合并函数(剥注释后匹配)。
+    #[test]
+    fn sync_timeout_wake_goes_through_the_merge() {
+        let body = strip_comments(body_of(prod_src(), "fn sync_timeout_wake("));
+        assert!(
+            body.contains("sync_timeout_wake_of(self.start, &self.tabs"),
+            "{body}"
+        );
+    }
+
+    /// F337:只在「窗口失焦 + 这轮有没被看着的铃 + 失焦后还没闪过」时闪。
+    #[test]
+    fn the_taskbar_flashes_once_per_blur_for_an_unseen_bell() {
+        assert!(should_flash(true, false, false));
+        assert!(!should_flash(true, true, false), "前台不闪");
+        assert!(!should_flash(true, false, true), "这次失焦已经闪过了");
+        assert!(!should_flash(false, false, false), "没有新铃");
+    }
+
+    /// F337 决策 6:后台标签的 pane 响铃 → 置待办,即使窗口有焦点。
+    /// 活动标签的焦点 pane 响铃且窗口有焦点 → 不算。
+    #[test]
+    fn a_bell_in_a_background_tab_is_marked_even_while_the_window_is_focused() {
+        use crate::shell::workspace::tests_support::ws_with;
+        let (mut bg, _p) = ws_with(1);
+        bg.pane_mut(PaneId(1)).unwrap().emulator.feed(b"\x07");
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("bg".into(), None, terminal_tab_of(bg));
+        tabs.open("fg".into(), None, second_terminal_tab(2));
+        let fg = tabs
+            .iter_mut()
+            .nth(1)
+            .unwrap()
+            .content
+            .as_terminal_mut()
+            .unwrap();
+        let focus = fg.ws.focus();
+        fg.ws.pane_mut(focus).unwrap().emulator.feed(b"\x07");
+
+        let s = settle_attention_of(&mut tabs, true);
+        assert!(s.fresh);
+        assert!(tab_has_attention(tabs.get(0).unwrap()), "后台标签的铃丢了");
+        assert!(
+            !tab_has_attention(tabs.get(1).unwrap()),
+            "正看着的 pane 被标了"
+        );
+    }
+
+    /// F337 / C2 / R9 行为式:最小化态只有 `Wake → pump_io`。同步块里的铃要在
+    /// 「pump → 收口 → 结算」这一趟里出来,且窗口失焦时活动标签的焦点 pane 也算没被看着。
+    #[test]
+    fn a_bell_inside_an_expired_sync_block_is_settled_in_the_same_pump() {
+        use crate::shell::workspace::tests_support::ws_with;
+        let (mut ws, _p) = ws_with(1);
+        ws.pane_mut(PaneId(1))
+            .unwrap()
+            .emulator
+            .feed(b"\x1b[?2026h\x07");
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("only".into(), None, terminal_tab_of(ws));
+
+        let later = Instant::now() + std::time::Duration::from_secs(5);
+        pump_all_tabs(&mut tabs, 0, later);
+        let s = settle_attention_of(&mut tabs, false);
+        assert!(s.fresh, "同步块收口后的铃没被结算");
+        assert!(should_flash(s.fresh, false, false));
+    }
+
+    /// **接线守护(F337)**:`pump_io` 里结算排在 `pump_all_tabs` 之后(C2);
+    /// 闪烁走 `should_flash`;`Focused` 臂复位 `flashed_since_blur`。
+    #[test]
+    fn attention_is_settled_after_the_pump_and_the_blur_flag_is_reset_on_focus() {
+        let body = strip_comments(body_of(prod_src(), "fn pump_io("));
+        let pump = body
+            .find("pump_all_tabs(")
+            .expect("pump_io 不再调 pump_all_tabs");
+        let settle = body
+            .find("settle_attention_of(")
+            .expect("pump_io 没结算待办");
+        assert!(pump < settle, "结算必须在泵(含同步块收口)之后");
+        assert!(body.contains("should_flash("), "{body}");
+        let src = prod_src();
+        let from = src
+            .find("WindowEvent::Focused(focused) => {")
+            .expect("找不到 Focused 臂");
+        let arm = &src[from..];
+        let arm = &arm[..arm.find("WindowEvent::Occluded").expect("Focused 臂下界")];
+        assert!(
+            strip_comments(arm).contains("self.flashed_since_blur = false;"),
+            "{arm}"
+        );
+    }
+
+    #[test]
+    fn the_window_title_names_the_focused_pane_and_counts_the_rest() {
+        assert_eq!(compose_window_title(None, 0, None), "mullion");
+        assert_eq!(
+            compose_window_title(Some("项目A"), 0, None),
+            "项目A — mullion"
+        );
+        assert_eq!(
+            compose_window_title(Some("项目A"), 2, None),
+            "项目A (+2) — mullion"
+        );
+    }
+
+    /// 复核 R4:首个待办就是主体那块时只加 `[!] `,不重复名字。
+    #[test]
+    fn the_attention_prefix_names_the_pane_unless_it_is_the_main_one() {
+        assert_eq!(
+            compose_window_title(Some("项目A"), 2, Some(Some("项目B"))),
+            "[!] 项目B · 项目A (+2) — mullion"
+        );
+        assert_eq!(
+            compose_window_title(Some("项目A"), 2, Some(None)),
+            "[!] 项目A (+2) — mullion"
+        );
+    }
+
+    /// 主体 = 活动标签焦点 pane;`+N` 数整个窗口其余**真** pane(抽屉不计);
+    /// 待办「首个」按标签顺序 → 树叶子顺序。
+    #[test]
+    fn window_title_of_reads_the_active_focus_and_the_first_marked_pane() {
+        use crate::shell::workspace::tests_support::ws_with;
+        let (mut bg, _p) = ws_with(2);
+        bg.pane_mut(PaneId(2)).unwrap().attention = true;
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("bg".into(), None, terminal_tab_of(bg));
+        tabs.open("fg".into(), None, second_terminal_tab(2));
+        // 测试 pane 的 `ws.hosts` 为空、没有项目 → 主体与待办名都是 None;
+        // 3 块真 pane、活动标签占 1 → (+2);待办在后台 → 只剩 `[!] `。
+        assert_eq!(window_title_of(&tabs, &[]), "[!] (+2) — mullion");
+    }
+
+    fn title_project(id: u64, name: &str) -> mullion_store::ProjectRecord {
+        mullion_store::ProjectRecord {
+            id: mullion_store::ProjectId(id),
+            name: name.into(),
+            note: String::new(),
+            nodes: Vec::new(),
+            preferred: None,
+            dir: "/x".into(),
+            tmux_name: Some(name.to_lowercase()),
+            created_at: "2026-09-01T00:00:00Z".into(),
+            last_accessed_at: None,
+            archived_at: None,
+            icon: None,
+        }
+    }
+
+    /// 有名字的行为:pane 的 `tmux` 名匹配项目时,主体名与待办名都出现。
+    /// 后台标签 2 块(B 在 pane 2 上有待办)+ 前台标签 2 块(A 是焦点)→ (+3)。
+    #[test]
+    fn window_title_of_names_the_main_pane_and_the_pane_that_wants_attention() {
+        use crate::shell::workspace::tests_support::ws_with;
+        let projects = [title_project(1, "A"), title_project(2, "B")];
+        let (mut bg, _p) = ws_with(2);
+        {
+            let p = bg.pane_mut(PaneId(2)).unwrap();
+            p.tmux = Some("b".into());
+            p.attention = true;
+        }
+        let (mut fg, _q) = ws_with(2);
+        fg.pane_mut(fg.focus()).unwrap().tmux = Some("a".into());
+        let focus = fg.focus();
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("bg".into(), None, terminal_tab_of(bg));
+        tabs.open("fg".into(), None, terminal_tab_of(fg));
+        assert_eq!(
+            window_title_of(&tabs, &projects),
+            "[!] B · A (+3) — mullion"
+        );
+        // 待办落在主体自己身上:不重复名字。
+        if let Some(TabContent::Terminal(t)) = tabs.active_mut().map(|t| &mut t.content) {
+            t.ws.pane_mut(focus).unwrap().attention = true;
+        }
+        // 标签顺序优先:后台那块仍是「首个」。
+        assert_eq!(
+            window_title_of(&tabs, &projects),
+            "[!] B · A (+3) — mullion"
+        );
+        if let Some(TabContent::Terminal(t)) = tabs.iter_mut().next().map(|t| &mut t.content) {
+            t.ws.pane_mut(PaneId(2)).unwrap().attention = false;
+        }
+        assert_eq!(window_title_of(&tabs, &projects), "[!] A (+3) — mullion");
+    }
+
+    /// 焦点在抽屉上:抽屉不计入 `total`,所以不能再减一。主体名取抽屉**自己**
+    /// (与标题条同口径:`TitleView` 按每块 pane 自己的 tmux 名/host 推导,
+    /// 不借父 pane 的名字)。2 块真 pane + 1 个抽屉,焦点在抽屉 → 其余 2 块。
+    #[test]
+    fn window_title_counts_every_real_pane_when_a_drawer_has_focus() {
+        use crate::shell::workspace::tests_support::{fake_pane, ws_with};
+        let projects = [title_project(1, "A"), title_project(2, "D")];
+        let (mut ws, _p) = ws_with(2);
+        ws.pane_mut(PaneId(1)).unwrap().tmux = Some("a".into());
+        let drawer = ws.open_drawer(None).expect("焦点在真 pane 上必能开");
+        assert_eq!(ws.focus(), drawer);
+        let (mut dp, _probe) = fake_pane(drawer.0);
+        dp.tmux = Some("d".into());
+        ws.attach_pane(dp);
+        assert_eq!(ws.pane_count(), 2, "抽屉不计");
+        let mut tabs: Tabs<TabContent> = Tabs::default();
+        tabs.open("fg".into(), None, terminal_tab_of(ws));
+        assert_eq!(window_title_of(&tabs, &projects), "D (+2) — mullion");
+    }
+
+    /// **接线守护(F336)**:`about_to_wait` 里有 `window_title_of`,`set_title` 前有不等比较。
+    #[test]
+    fn the_window_title_is_synced_in_about_to_wait_only_when_it_changes() {
+        let body = strip_comments(body_of(prod_src(), "fn about_to_wait("));
+        assert!(body.contains("window_title_of("), "{body}");
+        let guard = body
+            .find("if title != self.last_title")
+            .expect("缺不等比较");
+        let set = body.find(".set_title(").expect("缺 set_title");
+        assert!(guard < set);
+    }
+
+    /// **接线守护(F337-a)**:`pump_io` 走 `pump_all_tabs`,不再只泵活动标签。
+    #[test]
+    fn pump_io_pumps_every_tab() {
+        let src = include_str!("app.rs");
+        let body = src
+            .split("    fn pump_io(&mut self) {")
+            .nth(1)
+            .expect("找不到 pump_io")
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("pump_all_tabs(&mut self.tabs"), "{body}");
+        assert!(
+            !body.contains("ws.pump(now)"),
+            "pump_io 又只泵活动标签了:{body}"
+        );
+    }
+
     /// **接线守护(F163)**:这是「push 进队列 → 驱动 → notice 落到
     /// `PaneState` 上」这条链唯一真的跑通的测试 —— 纯函数全对、胶水代码错,
     /// 恰恰是这条切片(修复 1/修复 2)已经踩过两次的形状。
@@ -30088,6 +30711,7 @@ mod tests {
                 tmux: None,
                 title_ever_seen: false,
                 history_reported: 0,
+                attention: false,
                 host_pending: false,
                 notice: None,
             },
@@ -30177,6 +30801,7 @@ mod tests {
                 tmux: None,
                 title_ever_seen: false,
                 history_reported: 0,
+                attention: false,
                 host_pending: false,
                 notice: None,
             },

@@ -5364,6 +5364,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            attention: false,
         }
     }
 

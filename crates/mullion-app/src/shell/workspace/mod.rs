@@ -33,6 +33,20 @@ pub enum RxClosed {
     UserExited,
 }
 
+/// F337:[`Workspace::settle_attention`] 的结论。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Settled {
+    /// 本轮有落在「没被看着」的 pane 上的铃(**事件**,不是待办状态的跃迁 —— 复核 R1)。
+    pub fresh: bool,
+    /// 有 pane 的待办状态变了(要重画标题条/标签栏)。
+    pub changed: bool,
+}
+
+/// F337 决策 5/7:`id` 此刻是不是被看着。`viewer_parent` = viewer 若是抽屉,它的父 pane。
+pub fn pane_is_seen(id: PaneId, viewer: Option<PaneId>, viewer_parent: Option<PaneId>) -> bool {
+    viewer == Some(id) || viewer_parent == Some(id)
+}
+
 /// F128:判据只有一条 —— SSH **连接**(不是 channel)还在不在。
 /// channel 关了而连接还在 = 远端进程退了;连接也没了 = 链路死了。
 pub fn rx_closed_action(transport_alive: bool) -> RxClosed {
@@ -238,6 +252,9 @@ pub struct PaneState {
     ///
     /// **不弹窗**:多块 pane 同时失败时会连弹好几次(D4)。
     pub notice: Option<String>,
+    /// F337:这块 pane 响过铃、而你还没看过它。瞬态:不进 F37/F148 快照;
+    /// 由 [`Workspace::settle_attention`] 置位与清除,别处不许写。
+    pub attention: bool,
 }
 
 /// F290:抽屉的高度比例 —— 父 pane 占 4/5,抽屉占 1/5。开的时候用一次;
@@ -859,6 +876,28 @@ impl Workspace {
         flushed
     }
 
+    /// F337:收各 pane 的 BEL 并结算待办。
+    ///
+    /// `viewer` 由 App 决定(窗口有焦点 **且** 这是活动标签 → `Some(焦点)`,否则 `None`)——
+    /// `Workspace` 不知道窗口焦点,也不知道自己是不是活动标签(复核 R2)。
+    ///
+    /// **必须排在 `flush_expired_vt_sync` 之后调**:同步块里的 BEL 收口时才进 `Term`(C2)。
+    /// 清除是不变量式的(每次调都按 `viewer` 重算),不挂在切焦点 / 切标签 /
+    /// `Focused(true)` 三个入口上 —— 列举式门控在加入口时必然漏。
+    pub fn settle_attention(&mut self, viewer: Option<PaneId>) -> Settled {
+        let viewer_parent = viewer.and_then(|v| self.drawer(v)).map(|d| d.parent);
+        let mut out = Settled::default();
+        for p in &mut self.panes {
+            let bell = p.emulator.take_bell();
+            let seen = pane_is_seen(p.id, viewer, viewer_parent);
+            let next = if seen { false } else { p.attention || bell };
+            out.fresh |= bell && !seen;
+            out.changed |= next != p.attention;
+            p.attention = next;
+        }
+        out
+    }
+
     /// 施加几何(F34/T4)。**四条触发路径**(套预设 / 关 pane / 窗口 resize /
     /// 标题条开关)全走这一个函数,只有这一份代码 —— 分散写迟早漏掉一条,
     /// 而漏掉的那条会表现成"某种操作之后远端排版就错了",极难定位。
@@ -1017,6 +1056,7 @@ pub mod tests_support {
                 history_reported: 0,
                 host_pending: false,
                 notice: None,
+                attention: false,
             },
             Probe {
                 writes: probe_writes,
@@ -1066,6 +1106,70 @@ pub mod tests_support {
 
 #[cfg(test)]
 mod tests {
+
+    /// F337 决策 5/7:「被看着」= 就是 viewer,或 viewer 是它的抽屉。
+    #[test]
+    fn a_pane_is_seen_when_it_or_its_drawer_has_the_view() {
+        use super::pane_is_seen;
+        let (a, b) = (PaneId(1), PaneId(2));
+        assert!(pane_is_seen(a, Some(a), None));
+        assert!(!pane_is_seen(b, Some(a), None));
+        assert!(
+            pane_is_seen(a, Some(b), Some(a)),
+            "焦点在抽屉上,父 pane 上下贴着同屏"
+        );
+        assert!(
+            !pane_is_seen(a, None, None),
+            "没有 viewer(窗口失焦/后台标签)谁都没被看着"
+        );
+    }
+
+    /// F337:没被看着的 pane 响铃 → 置待办、报 fresh;被看着的响铃 → 丢弃;
+    /// 被看着时既有待办被清(不变量式清除,不挂在切焦点的入口上)。
+    #[test]
+    fn settle_marks_unseen_bells_drops_seen_ones_and_clears_on_view() {
+        let (mut ws, _p) = ws_with(2);
+        ws.pane_mut(PaneId(2)).unwrap().emulator.feed(b"\x07");
+        let s = ws.settle_attention(Some(PaneId(1)));
+        assert!(s.fresh && s.changed);
+        assert!(ws.pane(PaneId(2)).unwrap().attention);
+
+        ws.pane_mut(PaneId(1)).unwrap().emulator.feed(b"\x07");
+        let s = ws.settle_attention(Some(PaneId(1)));
+        assert!(!s.fresh && !s.changed, "正看着的 pane 响铃不算待办");
+        assert!(!ws.pane(PaneId(1)).unwrap().attention);
+
+        let s = ws.settle_attention(Some(PaneId(2)));
+        assert!(!s.fresh && s.changed);
+        assert!(!ws.pane(PaneId(2)).unwrap().attention, "看过去了还挂着");
+    }
+
+    /// F337 / R1:已经挂着待办的 pane 再响 → 仍报 fresh(闪烁判据是事件不是跃迁)。
+    #[test]
+    fn a_second_bell_on_an_already_marked_pane_is_still_fresh() {
+        let (mut ws, _p) = ws_with(1);
+        ws.pane_mut(PaneId(1)).unwrap().emulator.feed(b"\x07");
+        assert!(ws.settle_attention(None).fresh);
+        ws.pane_mut(PaneId(1)).unwrap().emulator.feed(b"\x07");
+        let s = ws.settle_attention(None);
+        assert!(s.fresh, "第二声铃被吞了 —— 失焦后再响就不会闪");
+        assert!(!s.changed);
+    }
+
+    /// F337 决策 5/7:viewer 是抽屉时,父 pane 的铃不算待办、既有待办被清。
+    #[test]
+    fn a_drawer_viewer_keeps_its_parent_seen() {
+        let (mut ws, _p) = ws_with(1);
+        let a = PaneId(1);
+        ws.focus = a;
+        let d = ws.open_drawer(None).unwrap();
+        ws.pane_mut(a).unwrap().attention = true;
+        ws.pane_mut(a).unwrap().emulator.feed(b"\x07");
+        let s = ws.settle_attention(Some(d));
+        assert!(!s.fresh, "父 pane 与抽屉同屏,铃不算待办");
+        assert!(s.changed);
+        assert!(!ws.pane(a).unwrap().attention);
+    }
     use super::*;
     use tests_support::{fake_pane, ws_with};
 

@@ -373,3 +373,35 @@ fn a_single_row_alt_drag_is_not_reported_as_merged() {
     assert!(!merged);
     assert_eq!(one, emu.selection_text().unwrap());
 }
+
+/// 第一个**不是** OSC 终止符的 `\x07` 的位置 —— 即流里真正的那声铃。
+fn first_bare_bel(bytes: &[u8]) -> usize {
+    let mut in_osc = false;
+    for (i, w) in bytes.windows(2).enumerate() {
+        match (w[0], w[1]) {
+            (0x1b, b']') => in_osc = true,
+            (0x07, _) if in_osc => in_osc = false,
+            (0x1b, b'\\') if in_osc => in_osc = false,
+            (0x07, _) => return i,
+            _ => {}
+        }
+    }
+    panic!("fixture 里没有裸 BEL")
+}
+
+/// F337:tmux 把**后台 window** 的 BEL 转给客户端(`bell-action any` 默认值)。
+/// 录的是 tmux **客户端**流(`script` 包 attach),不是 pipe-pane —— 后者只有应用
+/// 写进 pty 的字节,看不到 tmux 自己往外发的那声铃。
+///
+/// 同一段流里还有 tmux 设标题的 OSC 0(`set-titles on`,终止符同为 `\x07`,
+/// 铃前后各一条),这条同时钉住「OSC 终止符不算铃」在真实字节流上成立。
+#[test]
+fn tmux_forwards_a_background_window_bell_to_the_client() {
+    let bytes = fixture_bytes("tmux-client-bell");
+    let at = first_bare_bel(&bytes);
+    let mut emu = Emulator::new(80, 24);
+    emu.feed(&bytes[..at]);
+    assert!(!emu.take_bell(), "铃之前只有 OSC 终止符,不该已经响了");
+    emu.feed(&bytes[at..]);
+    assert!(emu.take_bell(), "tmux 客户端流里的 BEL 没被认出来");
+}

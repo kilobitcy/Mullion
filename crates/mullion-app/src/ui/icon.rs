@@ -279,6 +279,12 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
 ///
 /// 不走 `icon_button`:那会画出按钮底色和 hover 高亮,等于告诉用户这里能点。
 pub fn icon_inline(ui: &mut Ui, glyph: Glyph, color: egui::Color32) {
+    icon_inline_rect(ui, glyph, color);
+}
+
+/// 同 `icon_inline`,并返回刚画的那一格的矩形(F337:登记 F100 标注要用,
+/// 不能拿 `ui.min_rect()` 凑 —— 那是整个 ui 已占的区域)。
+pub fn icon_inline_rect(ui: &mut Ui, glyph: Glyph, color: egui::Color32) -> egui::Rect {
     // 比按钮小一圈 —— 它跟的是正文字号的灰字,不是一个控件。
     let size = Vec2::splat(ui.spacing().interact_size.y * 0.75);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -286,6 +292,7 @@ pub fn icon_inline(ui: &mut Ui, glyph: Glyph, color: egui::Color32) {
         ui.painter()
             .extend(shapes(rect, glyph, Stroke::new(1.2, color)));
     }
+    rect
 }
 
 /// 图标按钮。返回是否被点击。

@@ -6,6 +6,7 @@
 //! → 全屏 TUI 退回逐帧刷新而闪、鼠标上报全废、光标位置查询永久卡死。
 //! 本模块把这些字节攒进出站缓冲,由上层取走回写。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -23,7 +24,7 @@ use crate::snapshot::{Cursor, CursorShape, GridSnapshot, Rgb, SnapCell};
 
 /// 收集 `Term` 发出的事件。共享缓冲,`Term` 持一份克隆。
 ///
-/// 三件事:
+/// 四件事:
 /// - `Event::PtyWrite` —— 需要回写对端的字节(**T1 红线**,漏了就是同步输出
 ///   探测无应答、全屏 TUI 闪、鼠标全废)。
 /// - `Event::Title` —— OSC 0/2 的窗口标题(⑥ 认 tmux 会话名那条腿)。
@@ -31,11 +32,16 @@ use crate::snapshot::{Cursor, CursorShape, GridSnapshot, Rgb, SnapCell};
 ///   是压栈时(`CSI 22 t`)记的旧值,vim 之类会用这对操作在启动/退出时
 ///   切标题)。**不能落进 `_ => {}`**:漏了这条,`sink.title` 会一直留着
 ///   上一条旧值,标题条上永久挂一个已经不存在的 tmux 会话名。
+/// - `Event::Bell` —— BEL(F337 待办)。**只认这个事件,不扫字节**:OSC 的
+///   终止符也是 `\x07`,扫字节的话每次 cd / 改标题都算一声铃。
 #[derive(Clone, Default)]
 struct EventSink {
     buf: Arc<Mutex<Vec<u8>>>,
     /// **只留最后一条**:标题是「当前值」,不是流水。
     title: Arc<Mutex<Option<String>>>,
+    /// F337:自上次 `take_bell` 以来响过铃没有。布尔而不是计数:一串铃和一声铃
+    /// 对「这块 pane 有事找你」是同一个结论。
+    bell: Arc<AtomicBool>,
 }
 
 impl EventListener for EventSink {
@@ -50,7 +56,8 @@ impl EventListener for EventSink {
             Event::ResetTitle => {
                 *self.title.lock().expect("title slot poisoned") = Some(String::new())
             }
-            // 其余事件(响铃、剪贴板……)本项目还不用。
+            Event::Bell => self.bell.store(true, Ordering::Relaxed),
+            // 其余事件(剪贴板……)本项目还不用。
             _ => {}
         }
     }
@@ -377,6 +384,12 @@ impl Emulator {
     /// 取走并清空出站缓冲——这些字节必须回写 SSH channel(T1 红线)。
     pub fn take_pty_writes(&mut self) -> Vec<u8> {
         std::mem::take(&mut *self.sink.buf.lock().expect("pty-write buffer poisoned"))
+    }
+
+    /// F337:自上次调用以来响过铃没有,读即清。调用方必须排在
+    /// `flush_expired_sync` **之后**:同步块里的 BEL 收口时才进 `Term`。
+    pub fn take_bell(&mut self) -> bool {
+        self.sink.bell.swap(false, Ordering::Relaxed)
     }
 
     /// ⑥:自上次调用以来远端报出的状态。`None` = 什么新东西都没有。
@@ -1842,5 +1855,39 @@ mod tests {
             "L249",
             "调小没有立刻收缩 —— 用户会以为'配了没反应'"
         );
+    }
+
+    /// F337:BEL 被记下,读一次即清。
+    #[test]
+    fn a_bell_is_taken_once() {
+        let mut emu = Emulator::new(80, 24);
+        assert!(!emu.take_bell());
+        emu.feed(b"done\x07");
+        assert!(emu.take_bell());
+        assert!(!emu.take_bell(), "读完没清,同一声铃会被结算两次");
+    }
+
+    /// F337:OSC 0/2/7 的终止符也是 `\x07`,但那不是响铃 —— 每次 cd、
+    /// 每次 tmux 改标题都会发一串。判据必须是 `Event::Bell`,不是扫字节。
+    #[test]
+    fn a_bel_that_terminates_an_osc_is_not_a_bell() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"\x1b]2;web01:~/src\x07\x1b]7;file://h/tmp\x07");
+        assert!(!emu.take_bell());
+    }
+
+    /// F337 / C2:同步块(DEC 2026)里的 BEL 被 vte 攒着,`Term` 没见过 ——
+    /// 收口之前不能报,收口之后必须报。最小化态下收口是唯一能把它放出来的路。
+    #[test]
+    fn a_bell_inside_a_sync_block_surfaces_only_after_the_block_is_flushed() {
+        let mut emu = Emulator::new(80, 24);
+        emu.feed(b"\x1b[?2026h\x07");
+        assert!(
+            !emu.take_bell(),
+            "BSU 之后的字节还在 vte 肚子里,不该已经响了"
+        );
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(emu.flush_expired_sync(later));
+        assert!(emu.take_bell(), "同步块收口后 BEL 丢了");
     }
 }

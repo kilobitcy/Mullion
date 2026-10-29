@@ -1,0 +1,50 @@
+Script started on 2026-10-29 16:27:09+08:00 [COMMAND="tmux -L bellrec1425069 attach -t t" <not executed on terminal>]
+[?1049h[?1h=[H[J[34h[?25h[?1000l[?1002l[?1003l[?1006l[?1005l[?2004h[?2031h[?996n[m[34h[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;24r[c[>c[>q]10;?\]11;?\[1;1H]0;t:0:tmux - "xxxxxxxxxxxxxx" [?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[t] 0:tmux* 1:tmux                              "xxxxxxxxxxxxxx" 16:27 29-Oct-26[m[34h[?25h[1;1H[18t[14t[m[34h[?25h[?1006l[?1000l[?1002l[?1003l[1;1H[1;24r[?25l[1;1H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[30m[42m
+[t] 0:tmux* 1:tmux                              "xxxxxxxxxxxxxx" 16:27 29-Oct-26[m[34h[?25h[1;1H]0;t:0:tmux - "xxxxxxxxxxxxxx" 1![?25l[30m[42m[24d[t] 0:tmux* [7m1:sleep![m[30m[42m                            "xxxxxxxxxxxxxx" 16:27 29-Oct-26[m[34h[?25h[1;1H[1;0r[m[?1l>[H[J[34h[?25h[?1000l[?1002l[?1003l[?1006l[?1005l[?2004l[?7727l[?1004l[?1049l[?2031l[server exited]
+
+Script done on 2026-10-29 16:27:12+08:00 [COMMAND_EXIT_CODE="1"]

@@ -147,6 +147,8 @@
 - 高延迟链路上,焦点 pane 里按 Tab/退格引出的 readline BEL 若在你 Alt+Tab 走开**之后**才到达,会闪一次(R6)。
 - tmux `bell-action any` 会把**同会话其它 window** 的 BEL 也转发进这块 pane,切过去可能看到内容没变(R7)。
 - 原生文件对话框(`rfd`)开着时主窗口失焦,此时 BEL 会让任务栏闪自己(R10)。
+- 最小化态只靠入站字节(`Wake`)驱动泵:同步块若既无 ESU、之后也再无字节,超时收口要等窗口恢复,块里的 BEL 随之延后(PumpOnly 分支本就 `Wait`、不排 `next_timer_wake`,切片前已如此;Claude Code 的块都正常 ESU,风险低,改它要动 T7 排期,不值)。
+- 标题条关掉(F83,`title_px.h == 0`)时 pane 级圆点不画;窗口标题 `[!]` 与标签圆点照常。
 
 ## 明确不做
 
