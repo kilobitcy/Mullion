@@ -272,8 +272,8 @@ pub fn pane_remote_ports(
 pub fn port_badge(ports: &[RemotePort]) -> Option<(String, String)> {
     let first = ports.first()?;
     let text = match ports.len() {
-        1 => format!(":{}", first.port),
-        n => format!(":{} +{}", first.port, n - 1),
+        1 => format!("CDP:{}", first.port),
+        n => format!("CDP:{} +{}", first.port, n - 1),
     };
     let hover = ports
         .iter()
@@ -348,9 +348,9 @@ mod tests {
             hover: format!("h{port}"),
         };
         assert_eq!(port_badge(&[]), None);
-        assert_eq!(port_badge(&[p(9222)]).unwrap().0, ":9222");
+        assert_eq!(port_badge(&[p(9222)]).unwrap().0, "CDP:9222");
         let (t, h) = port_badge(&[p(9222), p(9322)]).unwrap();
-        assert_eq!(t, ":9222 +1");
+        assert_eq!(t, "CDP:9222 +1");
         assert_eq!(h, "h9222\nh9322");
     }
 

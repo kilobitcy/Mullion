@@ -652,7 +652,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                             theme::stroke(t),
                         ),
                     );
-                    // F339:远端端口格(`:9222 +1`),先于状态段加入,所以夹在按钮组
+                    // F339:远端端口格(`CDP:9222 +1`),先于状态段加入,所以夹在按钮组
                     // 与状态段之间。放不下标题时整格不画(与状态段同一取舍)。
                     if let Some((text, hover)) = &v.ports {
                         let font = egui::FontId::proportional(12.0);
@@ -690,6 +690,17 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                 .selectable(false),
                             )
                             .on_hover_text(hover);
+                            // 与状态段之间的竖线(状态段为空时不画)。
+                            if !v.stats.is_empty() {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("|")
+                                            .font(egui::FontId::proportional(12.0))
+                                            .color(theme::c32(t.fg_dim)),
+                                    )
+                                    .selectable(false),
+                                );
+                            }
                         }
                     }
                     // F298:节点状态段,摆在项目按钮左边(right_to_left,先加的
@@ -1699,13 +1710,13 @@ mod tests {
             }
             shapes
         };
-        let with = run(Some((":9222 +1".into(), "h".into())));
+        let with = run(Some(("CDP:9222 +1".into(), "h".into())));
         assert!(
-            text_color_of(&with, ":9222 +1").is_some(),
+            text_color_of(&with, "CDP:9222 +1").is_some(),
             "宽条上没画出端口格:{with:?}"
         );
         let without = run(None);
-        assert!(text_color_of(&without, ":9222 +1").is_none());
+        assert!(text_color_of(&without, "CDP:9222 +1").is_none());
     }
 
     /// F339:窄条上端口格让位,标题文字仍在。
@@ -1727,7 +1738,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
-            ports: Some((":9222".into(), "h".into())),
+            ports: Some(("CDP:9222".into(), "h".into())),
             attention: false,
         }];
         let ctx = egui::Context::default();
@@ -1740,7 +1751,7 @@ mod tests {
             shapes = out.shapes.into_iter().map(|cs| cs.shape).collect();
         }
         assert!(
-            text_color_of(&shapes, ":9222").is_none(),
+            text_color_of(&shapes, "CDP:9222").is_none(),
             "窄条应让位:{shapes:?}"
         );
     }
