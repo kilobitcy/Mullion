@@ -56,6 +56,9 @@ pub struct TitleView<'a> {
     /// 空 = 不显示(还没取到 / `host_pending` / 没连上)。**拿 owned**:源头是
     /// `Mutex` 里的快照,借不出活到本帧结束的引用;每 pane 每帧三个短串。
     pub stats: Vec<crate::node_stats::Piece>,
+    /// F339:这块 pane 的会话在远端开着的端口(`tunnels::port_badge`),
+    /// 文字与悬停。`None` = 没有,不占位。
+    pub ports: Option<(String, String)>,
     /// F337:这块 pane 响过铃而你还没看过。画成序号前的 `warn` 色实心点。
     pub attention: bool,
 }
@@ -649,6 +652,46 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                             theme::stroke(t),
                         ),
                     );
+                    // F339:远端端口格(`:9222 +1`),先于状态段加入,所以夹在按钮组
+                    // 与状态段之间。放不下标题时整格不画(与状态段同一取舍)。
+                    if let Some((text, hover)) = &v.ports {
+                        let font = egui::FontId::proportional(12.0);
+                        let w = ui
+                            .painter()
+                            .layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                            + ui.spacing().item_spacing.x * 2.0;
+                        let title_w = ui
+                            .painter()
+                            .layout_no_wrap(
+                                title_text(
+                                    v.index,
+                                    v.host,
+                                    v.cwd_leaf.as_deref(),
+                                    v.tmux,
+                                    v.project,
+                                    v.status,
+                                    v.notice,
+                                    v.drawer,
+                                ),
+                                font.clone(),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x;
+                        if crate::node_stats::stats_fit(ui.available_width(), w, title_w) {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(text.clone())
+                                        .font(font)
+                                        .color(theme::c32(t.fg_muted)),
+                                )
+                                .selectable(false),
+                            )
+                            .on_hover_text(hover);
+                        }
+                    }
                     // F298:节点状态段,摆在项目按钮左边(right_to_left,先加的
                     // 在右,所以是「按钮组左边、标题右边」)。`.rev()`——`pieces()`
                     // 给的是内存/磁盘/国家从左到右的阅读顺序,right_to_left 布局
@@ -1107,6 +1150,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention,
             };
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1158,6 +1202,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention: false,
             };
             view.geom.title_px.h = title_h;
@@ -1218,6 +1263,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention: false,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
@@ -1284,6 +1330,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            ports: None,
             attention: false,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
@@ -1341,6 +1388,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            ports: None,
             attention: false,
         }];
         click_button_with(&views, which)
@@ -1503,6 +1551,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            ports: None,
             attention: false,
         }];
         let ctx = egui::Context::default();
@@ -1589,6 +1638,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            ports: None,
             attention: false,
         }];
         let ctx = egui::Context::default();
@@ -1615,6 +1665,86 @@ mod tests {
         );
     }
 
+    /// F339:宽条画出远端端口格;没有端口时什么都不画。
+    ///
+    /// 自证会变红:删掉 `show()` 里画端口格的那段。
+    #[test]
+    fn a_wide_title_bar_shows_the_open_remote_ports() {
+        let run = |ports: Option<(String, String)>| {
+            let views = [TitleView {
+                geom: geom_with_title_width(1, 1200),
+                index: 1,
+                project: None,
+                project_icon: None,
+                host: Some("h"),
+                status: PaneStatus::Live,
+                focused: true,
+                appearance: None,
+                cwd_leaf: None,
+                tmux: None,
+                notice: None,
+                drawer: false,
+                stats: Vec::new(),
+                ports,
+                attention: false,
+            }];
+            let ctx = egui::Context::default();
+            let t = crate::theme::MULLION_DARK;
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                let out = ctx.run(Default::default(), |ctx| {
+                    show(ctx, &t, &views);
+                });
+                shapes = out.shapes.into_iter().map(|cs| cs.shape).collect();
+            }
+            shapes
+        };
+        let with = run(Some((":9222 +1".into(), "h".into())));
+        assert!(
+            text_color_of(&with, ":9222 +1").is_some(),
+            "宽条上没画出端口格:{with:?}"
+        );
+        let without = run(None);
+        assert!(text_color_of(&without, ":9222 +1").is_none());
+    }
+
+    /// F339:窄条上端口格让位,标题文字仍在。
+    ///
+    /// 自证会变红:删掉端口格前的宽度判断(恒画)。
+    #[test]
+    fn a_narrow_title_bar_drops_the_ports_before_the_title() {
+        let views = [TitleView {
+            geom: geom_with_title_width(1, 150),
+            index: 1,
+            project: None,
+            project_icon: None,
+            host: Some("h"),
+            status: PaneStatus::Live,
+            focused: true,
+            appearance: None,
+            cwd_leaf: None,
+            tmux: None,
+            notice: None,
+            drawer: false,
+            stats: Vec::new(),
+            ports: Some((":9222".into(), "h".into())),
+            attention: false,
+        }];
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run(Default::default(), |ctx| {
+                show(ctx, &t, &views);
+            });
+            shapes = out.shapes.into_iter().map(|cs| cs.shape).collect();
+        }
+        assert!(
+            text_color_of(&shapes, ":9222").is_none(),
+            "窄条应让位:{shapes:?}"
+        );
+    }
+
     /// F298:窄条上状态段让位,标题文字仍在。
     ///
     /// 自证会变红:删掉 `stats_fit` 那道判断(恒画状态段)。
@@ -1634,6 +1764,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            ports: None,
             attention: false,
         }];
         let ctx = egui::Context::default();
@@ -1694,6 +1825,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: wide_stats(),
+            ports: None,
             attention: false,
         }];
         let a = click_button_with(&views, country_id(PaneId(1)));
@@ -1803,6 +1935,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            ports: None,
             attention: false,
         }];
         let _ = ctx.run(Default::default(), |ctx| {
@@ -1852,6 +1985,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            ports: None,
             attention: false,
         }];
         // 跑两帧:`Area` 默认 `fade_in`,第一帧 opacity 是 0,画的图形会被
@@ -1941,6 +2075,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention: false,
             }];
             let _ = ctx.run(Default::default(), |ctx| {
@@ -2011,6 +2146,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention: false,
             }];
             // 显式推进时间,而不是像 `run_title` 那样跑两帧靠墙钟走时间:
@@ -2113,6 +2249,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention: false,
             }];
 
@@ -2184,6 +2321,7 @@ mod tests {
             notice: None,
             drawer: false,
             stats: Vec::new(),
+            ports: None,
             attention: false,
         }];
 
@@ -2303,6 +2441,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention: false,
             }];
             let ctx = egui::Context::default();
@@ -2438,6 +2577,7 @@ mod tests {
                 notice: None,
                 drawer: false,
                 stats: Vec::new(),
+                ports: None,
                 attention: false,
             }];
 
@@ -2533,6 +2673,7 @@ mod tests {
             notice: None,
             drawer,
             stats: Vec::new(),
+            ports: None,
             attention: false,
         }
     }

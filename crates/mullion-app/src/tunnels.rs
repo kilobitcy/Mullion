@@ -210,8 +210,149 @@ pub fn indicator(states: &[TunnelState], configured: usize) -> Option<Indicator>
     })
 }
 
+/// F339:标题条上「这块 pane 的会话在远端开着哪些端口」的一格。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePort {
+    pub port: u16,
+    pub hover: String,
+}
+
+/// 属于 `session` 的、**正在运行**的远程转发(-R),按远端端口升序。
+/// 本窗口的状态优先于别的窗口的上报(同 F338 列表行);同一条隧道只出一次。
+pub fn pane_remote_ports(
+    session: SessionId,
+    records: &[TunnelRecord],
+    local: &[(TunnelId, TunnelState)],
+    others: &[mullion_store::OtherTunnel],
+) -> Vec<RemotePort> {
+    use mullion_store::{RemoteTunnelState, TunnelKind};
+    let mut out: Vec<RemotePort> = Vec::new();
+    for r in records.iter().filter(|r| r.session_id == session) {
+        let TunnelKind::Remote {
+            target_host,
+            target_port,
+            ..
+        } = &r.kind
+        else {
+            continue;
+        };
+        let owner = if let Some((_, st)) = local.iter().find(|(id, _)| *id == r.id) {
+            // 本窗口有这条:以本窗口为准,别的窗口的上报不再参与。
+            if !matches!(st, TunnelState::Running) {
+                continue;
+            }
+            "本窗口".to_string()
+        } else if let Some(o) = others
+            .iter()
+            .find(|o| o.tunnel == r.id && o.state == RemoteTunnelState::Running)
+        {
+            format!("另一窗口 PID {}", o.pid)
+        } else {
+            continue;
+        };
+        let name = if r.name.is_empty() {
+            format!("远程 {}", r.listen_port)
+        } else {
+            r.name.clone()
+        };
+        out.push(RemotePort {
+            port: r.listen_port,
+            hover: format!(
+                "{name}:远端 {} → {target_host}:{target_port}({owner})",
+                r.listen_port
+            ),
+        });
+    }
+    out.sort_by_key(|p| p.port);
+    out
+}
+
+/// 标题条上那一格的文字与悬停。没有端口就是 `None`(不占位)。
+/// 多个折成 `:9222 +1`,悬停列全部。
+pub fn port_badge(ports: &[RemotePort]) -> Option<(String, String)> {
+    let first = ports.first()?;
+    let text = match ports.len() {
+        1 => format!(":{}", first.port),
+        n => format!(":{} +{}", first.port, n - 1),
+    };
+    let hover = ports
+        .iter()
+        .map(|p| p.hover.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((text, hover))
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// F339:只认本会话、-R、Running;本窗口优先;别窗口的 Running 也算。
+    #[test]
+    fn pane_ports_collect_running_remote_forwards_of_this_session() {
+        use mullion_store::{OtherTunnel, RemoteTunnelState as R, TunnelKind};
+        let remote = |id: u64, sess: u64, port: u16| TunnelRecord {
+            id: TunnelId(id),
+            session_id: SessionId(sess),
+            listen_port: port,
+            name: String::new(),
+            note: String::new(),
+            autostart: false,
+            kind: TunnelKind::Remote {
+                target_host: "127.0.0.1".into(),
+                target_port: 9222,
+                expose: false,
+            },
+        };
+        let mut local_fwd = remote(5, 1, 7000);
+        local_fwd.kind = TunnelKind::Dynamic;
+        let recs = vec![
+            remote(1, 1, 9322),
+            remote(2, 1, 9222),
+            remote(3, 2, 9111), // 别的会话
+            remote(4, 1, 9400), // 本窗口里是 Connecting
+            local_fwd,          // 非 -R
+            remote(6, 1, 9500), // 只有别的窗口在跑
+            remote(7, 1, 9600), // 别的窗口里是 Failed
+        ];
+        let local = vec![
+            (TunnelId(1), TunnelState::Running),
+            (TunnelId(2), TunnelState::Running),
+            (TunnelId(3), TunnelState::Running),
+            (TunnelId(4), TunnelState::Connecting),
+            (TunnelId(5), TunnelState::Running),
+        ];
+        let other = |id: u64, state| OtherTunnel {
+            tunnel: TunnelId(id),
+            state,
+            pid: 42,
+            started_at: 0,
+            instance: "x".into(),
+        };
+        let others = vec![
+            other(4, R::Running), // 本窗口有记录,不能被别窗口翻盘
+            other(6, R::Running),
+            other(7, R::Failed),
+        ];
+        let got = pane_remote_ports(SessionId(1), &recs, &local, &others);
+        let ports: Vec<u16> = got.iter().map(|p| p.port).collect();
+        assert_eq!(ports, vec![9222, 9322, 9500]);
+        assert!(got[2].hover.contains("另一窗口 PID 42"));
+        assert!(got[0].hover.contains("本窗口"));
+    }
+
+    /// F339:徽标文字——无/单个/多个。
+    #[test]
+    fn port_badge_folds_extra_ports() {
+        let p = |port: u16| RemotePort {
+            port,
+            hover: format!("h{port}"),
+        };
+        assert_eq!(port_badge(&[]), None);
+        assert_eq!(port_badge(&[p(9222)]).unwrap().0, ":9222");
+        let (t, h) = port_badge(&[p(9222), p(9322)]).unwrap();
+        assert_eq!(t, ":9222 +1");
+        assert_eq!(h, "h9222\nh9322");
+    }
 
     /// F338:已停止的不发布;其余四态各映射一档;顺序稳定。
     #[test]

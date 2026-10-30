@@ -15242,6 +15242,11 @@ impl ApplicationHandler<UserEvent> for App {
                             // 借出 `titles` 之前先取好。
                             let projects_now: &[mullion_store::ProjectRecord] =
                                 self.store.as_ref().map_or(&[], |s| s.projects());
+                            // F339:标题条的远端端口格。本窗口 + 别的窗口(F338)两路
+                            // 合并,每帧只在这里算一次快照。
+                            let tunnel_records: &[mullion_store::TunnelRecord] =
+                                self.store.as_ref().map_or(&[], |s| s.tunnels());
+                            let tunnel_snap = self.tunnels.snapshot();
                             let titles: Vec<crate::ui::pane_title::TitleView<'_>> =
                                 active_ws_of(&self.tabs)
                                     .map(|ws| {
@@ -15335,6 +15340,23 @@ impl ApplicationHandler<UserEvent> for App {
                                                             )
                                                         })
                                                         .unwrap_or_default(),
+                                                    // F339:与 `stats` 同一条判据 ——
+                                                    // `host_pending` 时不借主叶子那台的会话。
+                                                    ports: ws
+                                                        .pane(g.id)
+                                                        .filter(|p| !p.host_pending)
+                                                        .and_then(|p| ws.hosts.get(p.host_ix))
+                                                        .and_then(|h| h.session_id)
+                                                        .and_then(|sid| {
+                                                            crate::tunnels::port_badge(
+                                                                &crate::tunnels::pane_remote_ports(
+                                                                    sid,
+                                                                    tunnel_records,
+                                                                    &tunnel_snap,
+                                                                    &self.tunnel_others,
+                                                                ),
+                                                            )
+                                                        }),
                                                     attention: ws
                                                         .pane(g.id)
                                                         .is_some_and(|p| p.attention),
@@ -25844,6 +25866,24 @@ mod tests {
         assert!(
             checked >= 4,
             "只找到 {checked} 处改隧道表的调用,锚点可能失效了"
+        );
+    }
+
+    /// F339:标题条的端口格要同时吃本窗口(`tunnel_snap`)和别的窗口
+    /// (`tunnel_others`)两路 —— 漏掉后者,实例 2 的 pane 看不到实例 1 开的端口。
+    ///
+    /// 自证会变红:把 `&self.tunnel_others` 换成 `&[]`。
+    #[test]
+    fn the_title_bar_ports_see_other_windows_tunnels_too() {
+        let prod = prod_src();
+        let at = prod
+            .find("crate::tunnels::pane_remote_ports(")
+            .expect("标题条没接端口格");
+        let call = &prod[at..at + 400];
+        assert!(call.contains("&tunnel_snap"), "没吃本窗口的隧道状态");
+        assert!(
+            call.contains("&self.tunnel_others"),
+            "没吃别的窗口的隧道状态"
         );
     }
 
