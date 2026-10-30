@@ -449,6 +449,7 @@ pub fn show(
     credentials: &[mullion_store::CredentialRecord],
     tunnels: &[TunnelRecord],
     tunnel_states: &[(TunnelId, mullion_ssh::tunnel::TunnelState)],
+    tunnel_others: &[mullion_store::OtherTunnel],
     store_available: bool,
     presence: SecretPresence,
     // `credential_presence`:当前选中**凭据**的密文存在情况(F74)。与
@@ -697,6 +698,7 @@ pub fn show(
                         ui_state,
                         tunnels,
                         tunnel_states,
+                        tunnel_others,
                         sessions,
                         credentials,
                     ),
@@ -1161,6 +1163,7 @@ mod tunnel_ui_tests {
                     credentials,
                     tunnels,
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -1374,6 +1377,7 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -1497,6 +1501,7 @@ mod tunnel_ui_tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 SecretPresence::default(),
@@ -1552,6 +1557,7 @@ mod tunnel_ui_tests {
                 &t,
                 &mut st,
                 &sessions,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -1807,6 +1813,7 @@ mod tunnel_ui_tests {
                             &[],
                             &[],
                             &[],
+                            &[],
                             true,
                             SecretPresence::default(),
                             SecretPresence::default(),
@@ -1865,6 +1872,7 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -1913,6 +1921,67 @@ mod tunnel_ui_tests {
         );
     }
 
+    /// F338:另一个窗口正跑着(或正在建链/重连)的隧道,本实例的「启动」**真禁用**;
+    /// 对方「已停止」的不挡,否则用户在本实例里无法重试。
+    ///
+    /// 必须在 `ctx.run` 闭包内部读 response(理由见下一条测试)。
+    /// 自证会变红:把 `row` 里 `button_spec(.., other.is_some_and(..))` 的第三个实参改成 `false`。
+    #[test]
+    fn a_tunnel_running_in_another_window_cannot_be_started_here() {
+        use mullion_store::{OtherTunnel, RemoteTunnelState as R};
+        fn enabled_with(others: &[OtherTunnel]) -> bool {
+            let t = crate::theme::MULLION_DARK;
+            let sessions = vec![sess(1, "a")];
+            let tunnels = vec![tun(5, 1, local())];
+            let mut st = open(ManagerMode::Tunnels);
+            let ctx = egui::Context::default();
+            let mut seen: Option<egui::Response> = None;
+            for _ in 0..3 {
+                let _ = ctx.run(Default::default(), |c| {
+                    show(
+                        c,
+                        &t,
+                        &mut st,
+                        &sessions,
+                        &[],
+                        &[],
+                        &tunnels,
+                        &[],
+                        others,
+                        true,
+                        SecretPresence::default(),
+                        SecretPresence::default(),
+                        &crate::ui::badge::AppearanceCache::default(),
+                    );
+                    seen = c.read_response(tunnel_list::start_button_id(TunnelId(5)));
+                });
+            }
+            seen.expect("启动按钮该被渲染出来").enabled
+        }
+        let other = |state| OtherTunnel {
+            tunnel: TunnelId(5),
+            state,
+            pid: 1,
+            started_at: 0,
+            instance: "x".into(),
+        };
+        assert!(enabled_with(&[]), "没人在别处跑,按钮可点");
+        for s in [R::Running, R::Connecting, R::Reconnecting] {
+            assert!(
+                !enabled_with(&[other(s)]),
+                "别的窗口里 {s:?},本窗口的启动必须真禁用"
+            );
+        }
+        assert!(
+            enabled_with(&[other(R::Failed)]),
+            "别的窗口里已停止,本窗口必须还能重试"
+        );
+        // 别的隧道在别处跑,不该连坐这一条。
+        let mut elsewhere = other(R::Running);
+        elsewhere.tunnel = TunnelId(6);
+        assert!(enabled_with(&[elsewhere]));
+    }
+
     /// 「能不能点」必须**真的**体现在 `Response::enabled` 上,不能只是画成灰的。
     /// 这条同时钉两头:三种转发都实现了 → 都能点;引用悬垂 → 真禁用。
     ///
@@ -1945,6 +2014,7 @@ mod tunnel_ui_tests {
                         &[],
                         &[],
                         tunnels,
+                        &[],
                         &[],
                         true,
                         SecretPresence::default(),
@@ -2148,6 +2218,7 @@ mod tunnel_ui_tests {
                     &[],
                     &tunnels,
                     &states,
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -2204,6 +2275,7 @@ mod tunnel_ui_tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -2233,6 +2305,7 @@ mod tunnel_ui_tests {
                     &t,
                     &mut st2,
                     &sessions,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -2286,6 +2359,7 @@ mod tunnel_ui_tests {
                     &t,
                     &mut st,
                     &sessions,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -2418,6 +2492,7 @@ mod tests {
                             &t,
                             ui_state,
                             &sessions,
+                            &[],
                             &[],
                             &[],
                             &[],
@@ -2611,6 +2686,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 SecretPresence::default(),
@@ -2625,6 +2701,7 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -2679,6 +2756,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 SecretPresence::default(),
@@ -2693,6 +2771,7 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -2785,6 +2864,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 true,
                 SecretPresence::default(),
                 SecretPresence::default(),
@@ -2799,6 +2879,7 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -2870,6 +2951,7 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -3076,6 +3158,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -3217,6 +3300,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -3232,6 +3316,7 @@ mod tests {
                 &mut ui_state,
                 &sessions,
                 &groups,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -3288,6 +3373,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -3313,6 +3399,7 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -3371,6 +3458,7 @@ mod tests {
                     &mut ui_state,
                     &sessions,
                     &groups,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -3464,6 +3552,7 @@ mod tests {
                     &[],
                     &[],
                     &[],
+                    &[],
                     true,
                     SecretPresence::default(),
                     SecretPresence::default(),
@@ -3526,6 +3615,7 @@ mod tests {
                 ctx,
                 &t,
                 &mut ui_state,
+                &[],
                 &[],
                 &[],
                 &[],

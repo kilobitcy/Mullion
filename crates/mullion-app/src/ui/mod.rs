@@ -636,6 +636,8 @@ pub struct UiFrame<'a> {
     /// F111/F114:**已启动**的隧道各自的运行态。没启动的不在这里 ——
     /// 「不在表里」就是「没跑」,不额外造一个 `NotStarted` 变体。
     pub tunnel_states: &'a [(TunnelId, mullion_ssh::tunnel::TunnelState)],
+    /// F338:**别的实例**里正在跑的隧道(只读,来自 `tunnel-state/` 目录)。
+    pub tunnel_others: &'a [mullion_store::OtherTunnel],
     pub store_available: bool,
     pub connected: bool,
     /// 状态栏左栏的屏数。必须来自 `Workspace::pane_count()`。
@@ -1089,6 +1091,7 @@ pub fn build_ui(
             frame.credentials,
             frame.tunnels,
             frame.tunnel_states,
+            frame.tunnel_others,
             frame.store_available,
             frame.secret_presence,
             frame.credential_presence,
@@ -1625,6 +1628,7 @@ mod tests {
             known_hosts: None,
             tunnels: &[],
             tunnel_states: &[],
+            tunnel_others: &[],
             store_available: false,
             connected: true,
             panes: 1,

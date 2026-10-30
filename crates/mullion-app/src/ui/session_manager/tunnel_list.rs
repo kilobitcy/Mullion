@@ -110,7 +110,11 @@ pub(crate) struct ButtonSpec {
 /// **不看转发类型**:三种都实现了(F111/F112/F113)。T-b 时这里有一档
 /// 「`-R`/`-D` 还没做」的禁用,T-c 落地后删掉了 —— 留着就成了一个永远
 /// 说着谎的禁用理由。
-pub(crate) fn button_spec(dangling: bool, live: bool) -> ButtonSpec {
+///
+/// F338:`elsewhere` = 另一个窗口(实例)里正跑着(或正在建链)这条隧道。本实例
+/// 再启动会去抢同一个端口,所以禁用并说明原因。**排在 `live` 之后**:本实例自己
+/// 跑着的,永远停得掉。
+pub(crate) fn button_spec(dangling: bool, live: bool, elsewhere: bool) -> ButtonSpec {
     if live {
         return ButtonSpec {
             label: "停止",
@@ -125,11 +129,52 @@ pub(crate) fn button_spec(dangling: bool, live: bool) -> ButtonSpec {
             disabled_hint: Some("引用的会话已删除 —— 先把这条隧道改到一个还在的会话上"),
         };
     }
+    if elsewhere {
+        return ButtonSpec {
+            label: "启动",
+            enabled: false,
+            disabled_hint: Some("这条隧道正在另一个窗口运行,请到那个窗口停止"),
+        };
+    }
     ButtonSpec {
         label: "启动",
         enabled: true,
         disabled_hint: None,
     }
+}
+
+/// F338:这条隧道在别的实例里的状态。多个实例都报了时,**优先取会挡启动的那条**
+/// (否则「一个实例里已失败、另一个实例里正跑着」会被显示成已停止,按钮却被挡)。
+pub(crate) fn other_for(
+    id: TunnelId,
+    others: &[mullion_store::OtherTunnel],
+) -> Option<&mullion_store::OtherTunnel> {
+    let mut hits = others.iter().filter(|o| o.tunnel == id);
+    let first = hits.next()?;
+    if first.state.blocks_start() {
+        return Some(first);
+    }
+    hits.find(|o| o.state.blocks_start()).or(Some(first))
+}
+
+/// F338:别的实例里这条隧道的一行状态文字。
+pub(crate) fn other_label(o: &mullion_store::OtherTunnel) -> &'static str {
+    use mullion_store::RemoteTunnelState as R;
+    match o.state {
+        R::Running => "在另一个窗口运行中",
+        R::Connecting => "在另一个窗口连接中…",
+        R::Reconnecting => "在另一个窗口重连中",
+        R::Failed => "在另一个窗口已停止",
+    }
+}
+
+/// F338:悬停提示。实例 id 对用户没意义,给 pid(任务管理器里对得上号)和启动时间。
+pub(crate) fn other_hover(o: &mullion_store::OtherTunnel, now: i64) -> String {
+    format!(
+        "PID {},{}启动",
+        o.pid,
+        crate::ui::history::when_text(now, o.started_at)
+    )
 }
 
 /// 一行右侧的状态文字。`None` = 没启动,那一行什么都不写 ——
@@ -147,12 +192,16 @@ pub(crate) fn state_label(state: Option<&TunnelState>) -> Option<String> {
     })
 }
 
+// F338 把参数从 7 顶到 8。同 `session_manager::show` 的取舍:这是内部叶子函数,
+// 为压参数数引入一个专用结构体没有实际收益。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn show(
     ui: &mut Ui,
     t: &Theme,
     ui_state: &mut UiState,
     tunnels: &[TunnelRecord],
     states: &[(TunnelId, TunnelState)],
+    others: &[mullion_store::OtherTunnel],
     sessions: &[SessionRecord],
     credentials: &[mullion_store::CredentialRecord],
 ) {
@@ -196,23 +245,34 @@ pub(super) fn show(
                     continue;
                 };
                 let state = states.iter().find(|(tid, _)| *tid == id).map(|(_, s)| s);
-                row(ui, t, ui_state, rec, state, sessions, credentials);
+                let other = other_for(id, others);
+                row(ui, t, ui_state, rec, state, other, sessions, credentials);
             }
         });
 }
 
+// F338 把参数从 7 顶到 8。同 `session_manager::show` 的取舍:这是内部叶子函数,
+// 为压参数数引入一个专用结构体没有实际收益。
+#[allow(clippy::too_many_arguments)]
 fn row(
     ui: &mut Ui,
     t: &Theme,
     ui_state: &mut UiState,
     rec: &TunnelRecord,
     state: Option<&TunnelState>,
+    other: Option<&mullion_store::OtherTunnel>,
     sessions: &[SessionRecord],
     credentials: &[mullion_store::CredentialRecord],
 ) {
     let selected = ui_state.tunnel_editor_id == Some(rec.id);
     let (sub, dangling) = row_subtitle(rec, sessions, credentials);
-    let spec = button_spec(dangling, state.is_some());
+    // F338:本实例自己有运行态就以它为准;没有才看别的实例。
+    let other = other.filter(|_| state.is_none());
+    let spec = button_spec(
+        dangling,
+        state.is_some(),
+        other.is_some_and(|o| o.state.blocks_start()),
+    );
 
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
@@ -250,6 +310,14 @@ fn row(
                     _ => theme::c32(t.warn),
                 };
                 ui.colored_label(color, text);
+            } else if let Some(o) = other {
+                let color = if o.state.blocks_start() {
+                    theme::c32(t.warn)
+                } else {
+                    theme::c32(t.danger_text)
+                };
+                ui.colored_label(color, other_label(o))
+                    .on_hover_text(other_hover(o, mullion_store::now_secs()));
             }
         });
 
@@ -445,22 +513,22 @@ mod tests {
     /// 功能没做,于是不去改那条引用。
     #[test]
     fn button_spec_only_blocks_dangling_references_and_flips_to_stop_when_running() {
-        let live = button_spec(false, true);
+        let live = button_spec(false, true, false);
         assert_eq!(live.label, "停止");
         assert!(live.enabled, "跑着的隧道必须随时停得掉");
 
-        let ok = button_spec(false, false);
+        let ok = button_spec(false, false, false);
         assert_eq!(ok.label, "启动");
         assert!(ok.enabled);
         assert!(ok.disabled_hint.is_none());
 
-        let dangling = button_spec(true, false);
+        let dangling = button_spec(true, false, false);
         assert!(!dangling.enabled, "引用的会话都没了,起不来");
         assert!(dangling.disabled_hint.is_some_and(|h| h.contains("已删除")));
 
         // 跑着的隧道即使引用悬垂也得能停 —— 端口还占着,不给停就成了
         // 「只能重启客户端才能关掉的通路」。
-        assert!(button_spec(true, true).enabled);
+        assert!(button_spec(true, true, false).enabled);
     }
 
     /// 重连中必须同时说清**第几次**和**还有多久**。少任何一半,用户都判断
@@ -512,6 +580,58 @@ mod tests {
     fn affected_lines_is_empty_when_nothing_references_the_session() {
         let list = vec![rec(1, local())];
         assert!(affected_lines(SessionId(99), &list).is_empty());
+    }
+
+    fn other(
+        id: u64,
+        state: mullion_store::RemoteTunnelState,
+        pid: u32,
+    ) -> mullion_store::OtherTunnel {
+        mullion_store::OtherTunnel {
+            tunnel: TunnelId(id),
+            state,
+            pid,
+            started_at: 0,
+            instance: format!("i{pid}"),
+        }
+    }
+
+    /// F338:自己跑着的永远停得掉;别处在跑才禁用,且说明原因。
+    #[test]
+    fn elsewhere_disables_start_with_a_reason_but_never_blocks_our_own_stop() {
+        let s = button_spec(false, false, true);
+        assert!(!s.enabled);
+        assert!(s.disabled_hint.is_some_and(|h| h.contains("另一个窗口")));
+        assert!(
+            button_spec(false, true, true).enabled,
+            "本实例自己跑着的必须停得掉"
+        );
+        assert_eq!(button_spec(false, true, true).label, "停止");
+    }
+
+    /// 两个实例报了同一条:一个已失败、一个正跑 —— 显示和挡启动都得跟着**正跑**的。
+    /// 自证会变红:把 `other_for` 改成只取第一条。
+    #[test]
+    fn a_blocking_report_wins_over_a_failed_one_for_the_same_tunnel() {
+        use mullion_store::RemoteTunnelState as R;
+        let both = [other(1, R::Failed, 10), other(1, R::Running, 20)];
+        assert_eq!(other_for(TunnelId(1), &both).unwrap().pid, 20);
+        let only_failed = [other(1, R::Failed, 10)];
+        assert_eq!(other_for(TunnelId(1), &only_failed).unwrap().pid, 10);
+        assert!(other_for(TunnelId(2), &both).is_none());
+    }
+
+    #[test]
+    fn the_other_window_label_names_the_state_and_the_hover_names_the_pid() {
+        use mullion_store::RemoteTunnelState as R;
+        assert!(other_label(&other(1, R::Running, 1)).contains("运行中"));
+        assert!(other_label(&other(1, R::Failed, 1)).contains("已停止"));
+        assert_ne!(
+            other_label(&other(1, R::Connecting, 1)),
+            other_label(&other(1, R::Reconnecting, 1))
+        );
+        let h = other_hover(&other(1, R::Running, 4242), 3600);
+        assert!(h.contains("4242") && h.contains("小时前"), "实际: {h}");
     }
 
     fn named(id: u64, name: &str) -> TunnelRecord {
@@ -600,7 +720,7 @@ mod tests {
         let run = |ctx: &egui::Context, ui_state: &mut UiState, input: egui::RawInput| {
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, ui_state, &tunnels, &[], &[], &[]);
+                    show(ui, &t, ui_state, &tunnels, &[], &[], &[], &[]);
                 });
             })
         };

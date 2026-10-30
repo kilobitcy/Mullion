@@ -2550,6 +2550,15 @@ pub struct App {
     /// 会被别的实例判成死的,于是它正用着的现场出现在别人的恢复列表里
     /// (设计 D4 的实现约束)。
     heartbeat_at: Instant,
+    /// F338:**别的实例**里正在跑的隧道(只读快照,来自 `tunnel-state/` 目录)。
+    tunnel_others: Vec<mullion_store::OtherTunnel>,
+    /// F338:上一次发布出去的本实例隧道表。「没变就不重写」的比较基准;
+    /// `None` = 还没发布过。
+    tunnel_published: Option<Vec<(mullion_store::TunnelId, mullion_store::RemoteTunnelState)>>,
+    /// F338:上一次读别的实例隧道状态的时刻。
+    tunnel_others_read_at: Instant,
+    /// F338:本实例启动时刻(Unix 秒),随隧道状态文件发布,供别的窗口悬停提示用。
+    started_at_secs: i64,
     /// F336:上一次交给 `set_title` 的窗口标题。只在变了才调(T3 同族)。
     last_title: String,
     last_saved_layout: Option<mullion_store::SavedLayout>,
@@ -3369,6 +3378,10 @@ impl App {
             // 等 15 秒 —— 那 15 秒里别的实例会把本进程判成死的。
             heartbeat_at: Instant::now()
                 - Duration::from_secs(mullion_store::HEARTBEAT_INTERVAL_SECS),
+            tunnel_others: Vec::new(),
+            tunnel_published: None,
+            tunnel_others_read_at: Instant::now(),
+            started_at_secs: mullion_store::now_secs(),
             last_title: String::from("mullion"),
             last_saved_layout: None,
             layout_checked_at: Instant::now(),
@@ -4334,6 +4347,8 @@ impl App {
             return;
         };
         mullion_store::remove_alive(&dir, &self.instance_id);
+        // F338:隧道随进程一起死,状态文件也一并撤掉,别的窗口不必再等宽限期。
+        mullion_store::remove_tunnel_state(&dir, &self.instance_id);
     }
 
     /// F256:离开事件循环前的收口。**每一处 `event_loop.exit()` 之前都要走**
@@ -4382,9 +4397,67 @@ impl App {
         if let Err(e) = mullion_store::publish_presence(&dir, &self.instance_id, now, &names) {
             log::debug!(target: "mullion", "项目在场文件写入失败: {e}");
         }
+        // F338:顺带给隧道状态文件续命(没变也写,理由见 `publish_tunnel_state`)。
+        self.publish_tunnel_state(true);
         // 同一下把别人的读回来。每帧 `read_dir` 一次整个目录是标准的 T3
         // 违规,而这些文件本来就 15 秒才写一次。
         self.project_others = mullion_store::read_other_presence(&dir, &self.instance_id, now);
+    }
+
+    /// F338:把本实例的隧道表发布给别的实例。`force = false` 时只在表**变了**才写
+    /// (状态上报 2 秒一次,每次都写盘是白烧);`force = true` 是心跳续命,
+    /// 否则「开着不动、隧道一直在跑」的窗口会在 45 秒后被别人判成死的。
+    fn publish_tunnel_state(&mut self, force: bool) {
+        let items = crate::tunnels::publishable(&self.tunnels.snapshot());
+        if !force && self.tunnel_published.as_ref() == Some(&items) {
+            return;
+        }
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        let now = mullion_store::now_secs();
+        match mullion_store::publish_tunnel_state(
+            &dir,
+            &self.instance_id,
+            now,
+            std::process::id(),
+            self.started_at_secs,
+            &items,
+        ) {
+            Ok(()) => self.tunnel_published = Some(items),
+            Err(e) => log::debug!(target: "mullion", "隧道状态文件写入失败: {e}"),
+        }
+    }
+
+    /// F338:会话管理器开着且停在「隧道」页 —— 才有人会看见别的实例的隧道。
+    fn tunnel_page_visible(&self) -> bool {
+        self.ui.session_manager_open
+            && self.ui.manager_mode == crate::ui::session_manager::ManagerMode::Tunnels
+    }
+
+    /// F338:读别的实例的隧道状态。平时 15 秒一次,隧道页看得见时 2 秒一次;
+    /// **不是每帧**(每帧 `read_dir` 是 T3 违规)。结果变了才请求重绘。
+    fn tick_tunnel_others(&mut self) {
+        let visible = self.tunnel_page_visible();
+        if self.tunnel_others_read_at.elapsed() < crate::tunnels::others_poll_interval(visible) {
+            return;
+        }
+        self.tunnel_others_read_at = Instant::now();
+        let Some(dir) = crate::shell::store::config_dir() else {
+            return;
+        };
+        let others =
+            mullion_store::read_other_tunnels(&dir, &self.instance_id, mullion_store::now_secs());
+        if others != self.tunnel_others {
+            self.tunnel_others = others;
+            mark_ui_dirty!(self.ui_dirty);
+            self.request_ui_redraw();
+        }
+    }
+
+    /// F338:隧道页看得见时,下一次读别的实例状态的时刻。
+    fn tunnel_others_wake(&self) -> Option<Instant> {
+        crate::tunnels::others_wake(self.tunnel_page_visible(), self.tunnel_others_read_at)
     }
 
     /// F124:该配的连接配一遍 tmux 状态上报。
@@ -5060,6 +5133,7 @@ impl App {
             self.blink_wake(blink_now),
             self.node_stats_wake(blink_now),
             self.transfer_auto_clear_wake(blink_now),
+            self.tunnel_others_wake(),
         ]
         .into_iter()
         .flatten()
@@ -13182,6 +13256,7 @@ impl App {
             )
         };
         self.tunnels.insert(id, handle);
+        self.publish_tunnel_state(false);
         self.ui
             .set_toast(crate::ui::toast::Kind::Busy, "隧道启动中…");
     }
@@ -13201,6 +13276,7 @@ impl App {
             // 已经被停掉/删掉了,这是一条在途旧消息。
             return;
         };
+        self.publish_tunnel_state(false);
         // 播不播由纯函数定(它有自己的守护测试),这里只负责组文案。
         if let Some(cause) = crate::tunnels::failure_announcement(&prev, &state) {
             let title = self
@@ -13249,6 +13325,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // F224:同一条纪律 —— 过期的在场文件也只在启动时清一次
                 // (每帧去删别人的文件,会与那个实例自己的写入撞上)。
                 mullion_store::sweep_presence(&d, &self.instance_id, now);
+                mullion_store::sweep_tunnel_state(&d, &self.instance_id, now);
                 mullion_store::list_records(&d, now)
             })
             .unwrap_or_default();
@@ -15407,6 +15484,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 known_hosts: known_hosts_guard.as_deref(),
                                 tunnels,
                                 tunnel_states: &tunnel_states,
+                                tunnel_others: &self.tunnel_others,
                                 store_available,
                                 // F37:占位标签**不算已连接** —— 它一条连接都
                                 // 没建。判据从「有没有标签」收紧成「活动标签
@@ -16077,6 +16155,7 @@ impl ApplicationHandler<UserEvent> for App {
                     for tid in stop {
                         self.tunnels.stop(tid);
                     }
+                    self.publish_tunnel_state(false);
                     if let Some(store) = self.store.as_mut() {
                         match store.delete(id).and_then(|_| store.save()) {
                             // 走查 13:落盘成功要有一句反馈。删除尤其需要 ——
@@ -16226,6 +16305,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // tokio runtime、要 bind 端口,三样在闭包里都够不着。
                 if let Some(id) = self.ui.tunnel_stop_request.take() {
                     self.tunnels.stop(id);
+                    self.publish_tunnel_state(false);
                     self.ui.set_toast(crate::ui::toast::Kind::Ok, "已停止隧道");
                 }
                 if let Some(id) = self.ui.tunnel_start_request.take() {
@@ -16652,6 +16732,8 @@ impl ApplicationHandler<UserEvent> for App {
         // 布局没变时不落盘,心跳却必须照写,否则开着不动的窗口会被别的实例
         // 判成死的。
         self.tick_heartbeat();
+        // F338:别的实例的隧道状态。
+        self.tick_tunnel_others();
         // F336:窗口标题。**放这里不放 `RedrawRequested`**:最小化态不出帧,
         // 而标题恰在那时最需要更新(复核 R8)。算与 `set_title` 分开、不同才调 ——
         // `set_title` 每调一次都是一次跨线程窗口消息,每次唤醒都调是 T3 那一类白烧。
@@ -25726,6 +25808,79 @@ mod tests {
         assert!(
             body.contains("self.tick_heartbeat();"),
             "about_to_wait 不写心跳 —— 开着不动的窗口会被别人判死,现场被克隆走"
+        );
+    }
+
+    /// **接线守护 / F338**:凡是改本实例隧道表的地方(起 / 收状态 / 停 / 随会话删除而停),
+    /// 紧跟着都要重发状态文件 —— 否则别的窗口看到的是一份过期的表,而本机一切正常、
+    /// 零报错。
+    ///
+    /// 扎的是源码结构:改表那几处散在事件循环的大分支里,造不出完整 `App`。
+    /// 验证边界:挡得住「某处调用后面没了重发」,挡不住「重发的函数体被掏空」
+    /// (那条由 `publishable` 与 store 层测试守)。
+    ///
+    /// 自证会变红:删掉 `accept_tunnel_state` 里 `set_state` 后面那句 `publish_tunnel_state(false)`。
+    #[test]
+    fn every_change_to_our_tunnel_table_republishes_the_state_file() {
+        let lines: Vec<&str> = prod_src().lines().collect();
+        let mut checked = 0;
+        for (i, l) in lines.iter().enumerate() {
+            let t = l.trim();
+            let mutates = t.contains("self.tunnels.insert(")
+                || t.contains("self.tunnels.stop(")
+                || t.contains("self.tunnels.set_state(");
+            if !mutates {
+                continue;
+            }
+            checked += 1;
+            let near = lines[i + 1..].iter().take(8);
+            assert!(
+                near.clone()
+                    .any(|n| n.contains("self.publish_tunnel_state(false);")),
+                "第 {} 行改了隧道表,后面 8 行内没有重发状态文件: {t}",
+                i + 1
+            );
+        }
+        assert!(
+            checked >= 4,
+            "只找到 {checked} 处改隧道表的调用,锚点可能失效了"
+        );
+    }
+
+    /// **接线守护 / F338**:心跳续命 + 事件循环读别人 + 唤醒源 + 启动清扫 + 退出撤文件 + 交给 UI,
+    /// 六条线缺一条都是「功能在、看不见」。
+    ///
+    /// 自证会变红:删掉其中任意一句。
+    #[test]
+    fn the_tunnel_state_file_is_wired_end_to_end() {
+        let prod = prod_src();
+        assert!(
+            body_of(prod, "fn tick_heartbeat(").contains("self.publish_tunnel_state(true);"),
+            "心跳不给隧道状态文件续命 —— 隧道一直在跑的窗口 45 秒后会被别人判死"
+        );
+        assert!(
+            body_of(prod, "fn about_to_wait(").contains("self.tick_tunnel_others();"),
+            "事件循环不读别的实例的隧道状态"
+        );
+        assert!(
+            body_of(prod, "fn next_timer_wake(").contains("self.tunnel_others_wake()"),
+            "隧道页看着不动时没有唤醒源,别的窗口里的状态变化要等下一次无关事件才显示"
+        );
+        assert!(
+            body_of(prod, "fn release_alive(").contains("remove_tunnel_state("),
+            "退出不撤状态文件,别的窗口还要把已经死掉的隧道显示 45 秒"
+        );
+        assert!(
+            prod.contains("sweep_tunnel_state("),
+            "启动不清过期的隧道状态文件"
+        );
+        assert!(
+            prod.contains("tunnel_others: &self.tunnel_others,"),
+            "读到的别的实例隧道没有交给 UI"
+        );
+        assert!(
+            body_of(prod, "fn tick_tunnel_others(").contains("others_poll_interval("),
+            "读取没有按隧道页是否可见分档,会退化成固定间隔"
         );
     }
 

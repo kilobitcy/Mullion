@@ -97,6 +97,48 @@ pub fn tunnels_to_stop_on_session_delete(
         .collect()
 }
 
+/// F338:把本实例的运行表转成要对外发布的形状。`Stopped` 不发布 —— 它表示
+/// 已经不占端口。按 id 升序,保证「没变就不重写」的比较稳定。
+pub fn publishable(
+    snapshot: &[(TunnelId, TunnelState)],
+) -> Vec<(TunnelId, mullion_store::RemoteTunnelState)> {
+    use mullion_store::RemoteTunnelState as R;
+    let mut out: Vec<_> = snapshot
+        .iter()
+        .filter_map(|(id, s)| {
+            let r = match s {
+                TunnelState::Connecting => R::Connecting,
+                TunnelState::Running => R::Running,
+                TunnelState::Reconnecting { .. } => R::Reconnecting,
+                TunnelState::Failed(_) => R::Failed,
+                TunnelState::Stopped => return None,
+            };
+            Some((*id, r))
+        })
+        .collect();
+    out.sort_by_key(|(id, _)| *id);
+    out
+}
+
+/// F338:读别的实例隧道状态的间隔。隧道页看得见时 2 秒(用户正盯着它),
+/// 否则跟心跳 15 秒。**不是每帧读** —— 每帧 `read_dir` 是 T3 违规。
+pub fn others_poll_interval(page_visible: bool) -> std::time::Duration {
+    if page_visible {
+        std::time::Duration::from_secs(2)
+    } else {
+        std::time::Duration::from_secs(mullion_store::HEARTBEAT_INTERVAL_SECS)
+    }
+}
+
+/// F338:下一次该读的时刻。只在隧道页看得见时才主动唤醒事件循环
+/// (其余时候搭心跳的车,不新增忙转的唤醒路径,T3/T7)。
+pub fn others_wake(
+    page_visible: bool,
+    last_read: std::time::Instant,
+) -> Option<std::time::Instant> {
+    page_visible.then(|| last_read + others_poll_interval(true))
+}
+
 /// 这次状态变化该不该播报。返回 `Some(根因)` = 播一条。
 ///
 /// 判据是**跃迁**,不是当前状态:健康探测 2 秒一次,每次都会走一遍状态上报,
@@ -170,6 +212,54 @@ pub fn indicator(states: &[TunnelState], configured: usize) -> Option<Indicator>
 
 #[cfg(test)]
 mod tests {
+
+    /// F338:已停止的不发布;其余四态各映射一档;顺序稳定。
+    #[test]
+    fn publishable_skips_stopped_and_orders_by_id() {
+        use mullion_store::RemoteTunnelState as R;
+        let snap = vec![
+            (TunnelId(9), TunnelState::Running),
+            (TunnelId(2), TunnelState::Stopped),
+            (
+                TunnelId(4),
+                TunnelState::Reconnecting {
+                    attempt: 1,
+                    retry_in: std::time::Duration::from_secs(1),
+                },
+            ),
+            (TunnelId(1), TunnelState::Failed("x".into())),
+            (TunnelId(3), TunnelState::Connecting),
+        ];
+        assert_eq!(
+            publishable(&snap),
+            vec![
+                (TunnelId(1), R::Failed),
+                (TunnelId(3), R::Connecting),
+                (TunnelId(4), R::Reconnecting),
+                (TunnelId(9), R::Running),
+            ]
+        );
+    }
+
+    /// F338:隧道页看得见才 2 秒一读并主动唤醒;看不见时不排唤醒、间隔回到心跳。
+    /// 自证会变红:把 `others_wake` 改成恒 `Some`(空闲窗口 2 秒醒一次,T3)。
+    #[test]
+    fn the_fast_poll_and_its_wakeup_exist_only_while_the_tunnel_page_is_visible() {
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            others_poll_interval(true),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            others_poll_interval(false),
+            std::time::Duration::from_secs(mullion_store::HEARTBEAT_INTERVAL_SECS)
+        );
+        assert_eq!(
+            others_wake(true, t0),
+            Some(t0 + std::time::Duration::from_secs(2))
+        );
+        assert_eq!(others_wake(false, t0), None);
+    }
     use super::*;
     use std::time::Duration;
 

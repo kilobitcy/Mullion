@@ -183,6 +183,7 @@ fn shoot(opts: &Opts) -> Result<String, String> {
                 &[],
                 &tunnels,
                 &[],
+                &[],
                 store_available,
                 presence,
                 Default::default(),
