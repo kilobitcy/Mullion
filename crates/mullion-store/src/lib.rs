@@ -26,6 +26,7 @@ pub mod settings;
 pub mod sftp;
 pub mod ssh_config;
 pub mod tunnel;
+pub mod tunnel_presence;
 pub mod vault;
 
 pub use automation::{
@@ -79,4 +80,8 @@ pub use settings::{LogLevel, Settings, CURRENT_SETTINGS_SCHEMA, MAX_FONT_PT, MIN
 pub use sftp::{Bookmark, SftpPrefs};
 pub use ssh_config::{parse as parse_ssh_config, HostEntry, ParsedConfig, SkipNote};
 pub use tunnel::{TunnelId, TunnelKind, TunnelRecord};
+pub use tunnel_presence::{
+    publish as publish_tunnel_state, read_others as read_other_tunnels,
+    remove_own as remove_tunnel_state, sweep as sweep_tunnel_state, OtherTunnel, RemoteTunnelState,
+};
 pub use vault::{CredentialDraft, ResolvedAuth, SessionDraft, TunnelDraft, Unlock, Vault};
