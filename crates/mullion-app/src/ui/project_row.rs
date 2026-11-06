@@ -96,6 +96,37 @@ fn name_avail(text_avail: f32, time_w: f32, badge_w: f32) -> f32 {
     left.max(0.0)
 }
 
+/// F340:备忘标记的图标边长。
+const MEMO_SIDE: f32 = 12.0;
+/// F340:备忘图标与条数数字之间的间隙。
+const MEMO_GAP: f32 = 2.0;
+
+/// F340:备忘标记的悬停文字,**新的在上**。没有备忘 = `None`(不画标记,
+/// 也不出提示)。每条带相对创建时间,让「这条是什么时候写的」不用点进右栏。
+pub fn memo_hover_text(p: &ProjectRecord, now: time::OffsetDateTime) -> Option<String> {
+    if p.memos.is_empty() {
+        return None;
+    }
+    let off = crate::localtime::offset();
+    let lines: Vec<String> = p
+        .memos
+        .iter()
+        .rev()
+        .map(|m| {
+            if m.created_at.is_empty() {
+                m.text.clone()
+            } else {
+                format!(
+                    "{}({})",
+                    m.text,
+                    crate::localtime::relative(&m.created_at, now, off)
+                )
+            }
+        })
+        .collect();
+    Some(lines.join("\n"))
+}
+
 /// 画一行要的全部输入。
 pub struct Row<'a> {
     pub project: &'a ProjectRecord,
@@ -455,6 +486,68 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
         (time_w, badge_w)
     };
 
+    // F340:备忘标记。贴在「正在跑」标签(没有则时间列)的左边;宽度要一并从
+    // 名字预算里扣掉,否则长项目名会把它盖住(同标签那条的教训)。没有备忘的
+    // 行零变化 —— 这是「有/无备忘一眼能分」的全部前提。
+    let memo_w = if row.project.memos.is_empty() {
+        0.0
+    } else {
+        let count = row.project.memos.len();
+        let num = (count >= 2).then(|| {
+            p.layout_no_wrap(
+                count.to_string(),
+                egui::FontId::proportional(SUB_SIZE),
+                theme::c32(t.fg_muted),
+            )
+        });
+        let w = MEMO_SIDE + num.as_ref().map_or(0.0, |g| MEMO_GAP + g.size().x);
+        let right = rect.right()
+            - TEXT_RIGHT_PAD
+            - time_w
+            - NAME_TIME_GAP
+            - if badge_w > 0.0 {
+                badge_w + NAME_TIME_GAP
+            } else {
+                0.0
+            };
+        let cy = rect.top() + NAME_TOP + NAME_SIZE / 2.0;
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(right - w, cy - MEMO_SIDE / 2.0),
+            egui::vec2(MEMO_SIDE, MEMO_SIDE),
+        );
+        p.extend(crate::ui::icon::shapes(
+            icon_rect,
+            crate::ui::icon::Glyph::Memo,
+            egui::Stroke::new(1.2, theme::c32(t.fg_muted)),
+        ));
+        if let Some(g) = num {
+            let pos = egui::pos2(icon_rect.right() + MEMO_GAP, cy - g.size().y / 2.0);
+            p.galley(pos, g, theme::c32(t.fg_muted));
+        }
+        // 悬停只圈图标 + 数字这一小块,同灯/时间列的理由:整行 hover 已被占。
+        let hot =
+            egui::Rect::from_min_max(icon_rect.min, egui::pos2(right, icon_rect.max.y)).expand(4.0);
+        if resp.hovered()
+            && ui
+                .ctx()
+                .pointer_latest_pos()
+                .is_some_and(|q| hot.contains(q))
+        {
+            if let Some(tip) = memo_hover_text(row.project, row.now) {
+                egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), id.with("memo"), |ui| {
+                    ui.label(tip);
+                });
+            }
+        }
+        w
+    };
+    let badge_w = if memo_w > 0.0 {
+        // 标记与标签并排时,两者之间也要一份间隙。
+        badge_w + memo_w + if badge_w > 0.0 { NAME_TIME_GAP } else { 0.0 }
+    } else {
+        badge_w
+    };
+
     // 名称和副标题都过命中着色。副标题里就是目录和节点名 —— 搜「web01」命中的
     // 正是那里,不标出来的话用户完全不知道这一行为什么会出现。
     crate::ui::session_manager::list::paint_highlighted(
@@ -516,6 +609,7 @@ mod tests {
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: accessed.map(str::to_string),
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         }
     }
@@ -1201,12 +1295,21 @@ mod tests {
         name: &str,
         lamp: crate::project::Lamp,
     ) -> usize {
-        let t = crate::theme::MULLION_DARK;
-        let ctx = egui::Context::default();
         let mut p = proj(9, name, "/srv/x", Some("2026-09-01T00:00:00Z"));
         if archived {
             p.archived_at = Some("2026-09-05T00:00:00Z".into());
         }
+        name_glyph_count_of(row_w, &p, lamp)
+    }
+
+    /// 渲一帧(两遍,让布局稳定)并返回形状。
+    fn render_row(
+        row_w: f32,
+        p: &ProjectRecord,
+        lamp: crate::project::Lamp,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
         let ss = vec![sess(7, "web01")];
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0));
         let mut shapes = Vec::new();
@@ -1230,7 +1333,7 @@ mod tests {
                                     ui,
                                     &t,
                                     &Row {
-                                        project: &p,
+                                        project: p,
                                         lamp,
                                         sessions: &ss,
                                         query: "",
@@ -1249,6 +1352,11 @@ mod tests {
                 )
                 .shapes;
         }
+        shapes
+    }
+
+    fn name_glyph_count_of(row_w: f32, p: &ProjectRecord, lamp: crate::project::Lamp) -> usize {
+        let shapes = render_row(row_w, p, lamp);
         fn walk<'a>(s: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::TextShape>) {
             match s {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
@@ -1273,6 +1381,64 @@ mod tests {
             .expect("没找到名称那段文字");
         name_ts.galley.rows.iter().map(|r| r.glyphs.len()).sum()
     }
+    fn memo(text: &str, at: &str) -> mullion_store::Memo {
+        mullion_store::Memo {
+            text: text.into(),
+            created_at: at.into(),
+        }
+    }
+
+    fn count_line_segments(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                egui::Shape::LineSegment { .. } => 1,
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    /// F340:有备忘的行画出标记,没有的行**一笔都不多**。
+    ///
+    /// 用 `Lamp::Dark`(空心圈,不含线段)当底,所以线段只可能来自便签图标
+    /// (两道横线)。自证会变红:把 `show` 里 `memo_w` 那段整个删掉(有备忘
+    /// 的行数出 0 条)或让无备忘也画(无备忘数出 2 条)。
+    #[test]
+    fn only_a_project_with_memos_gets_the_marker() {
+        let mut p = proj(9, "接口", "/srv/x", Some("2026-09-01T00:00:00Z"));
+        let plain = render_row(400.0, &p, crate::project::Lamp::Dark);
+        assert_eq!(count_line_segments(&plain), 0, "没有备忘的行多画了东西");
+        p.memos = vec![memo("查状态", "2026-11-06T10:00:00Z")];
+        let marked = render_row(400.0, &p, crate::project::Lamp::Dark);
+        assert_eq!(count_line_segments(&marked), 2, "有备忘的行没画标记");
+    }
+
+    /// F340:窄行里标记要从名字预算里扣掉,**名字只能变短、不能变长**,
+    /// 且有备忘时名字不许把标记压在底下(预算守护同 F266 标签那条)。
+    #[test]
+    fn the_marker_takes_its_width_out_of_the_name_budget() {
+        let mut p = proj(
+            9,
+            "接口服务测试项目",
+            "/srv/x",
+            Some("2026-09-01T00:00:00Z"),
+        );
+        let without = name_glyph_count_of(200.0, &p, crate::project::Lamp::Dark);
+        p.memos = vec![memo("a", ""), memo("b", "")];
+        let with = name_glyph_count_of(200.0, &p, crate::project::Lamp::Dark);
+        assert!(with < without, "标记没占名字的预算:{with} vs {without}");
+    }
+
+    /// F340:悬停文字新的在上;没有备忘时不出提示。
+    #[test]
+    fn the_memo_hover_lists_newest_first_and_is_absent_without_memos() {
+        let mut p = proj(9, "接口", "/srv/x", None);
+        assert_eq!(memo_hover_text(&p, now()), None);
+        p.memos = vec![memo("旧的", ""), memo("新的", "")];
+        assert_eq!(memo_hover_text(&p, now()).as_deref(), Some("新的\n旧的"));
+    }
+
     /// F304:副标题写的是**头一个候选**,不是首选 —— 首选是跳板那条时,直连
     /// 那条排第一,副标题跟着它。
     ///

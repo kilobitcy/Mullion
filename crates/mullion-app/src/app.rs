@@ -16524,9 +16524,18 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.ui.project_focus_name = true;
                             }
                             crate::ui::project_manager::ProjectIntent::Save(id, draft) => {
-                                if let Err(e) = store.update_project(id, *draft) {
+                                // F340:空白备忘不入库,草稿里的也同步丢掉,
+                                // 否则保存后仍显示「有未保存的改动」。
+                                let mut draft = *draft;
+                                crate::ui::project_manager::prune_blank_memos(&mut draft);
+                                let pruned = draft.memos.clone();
+                                if let Err(e) = store.update_project(id, draft) {
                                     ok = false;
                                     self.ui.set_error(format!("项目保存失败:{e:?}"));
+                                } else if let Some(d) = self.ui.project_draft.as_mut() {
+                                    if d.id == id {
+                                        d.memos = pruned;
+                                    }
                                 }
                             }
                             crate::ui::project_manager::ProjectIntent::Delete(id) => {
@@ -27001,6 +27010,7 @@ mod tests {
             created_at: "t".into(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         };
         let name = mullion_store::project_tmux_name(&proj);
@@ -27768,6 +27778,7 @@ mod tests {
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         }
     }
@@ -28192,6 +28203,7 @@ mod tests {
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         };
         let rows = history_rows_of(&[e], None, &[p], 1_000_000);

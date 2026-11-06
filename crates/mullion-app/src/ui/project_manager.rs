@@ -547,6 +547,8 @@ fn form_column(
                 .color(crate::theme::c32(t.fg_muted)),
             );
 
+            memo_section(ui, t, draft, &mut first);
+
             appearance_section(
                 ui,
                 t,
@@ -634,6 +636,77 @@ fn form_column(
                 .color(crate::theme::c32(t.fg_muted)),
             );
         });
+}
+
+/// F340:草稿里追加一条空备忘。创建时间由调用方注入(store 不持有时钟)。
+pub(crate) fn add_blank_memo(p: &mut ProjectRecord, now_rfc3339: &str) {
+    p.memos.push(mullion_store::Memo {
+        text: String::new(),
+        created_at: now_rfc3339.to_string(),
+    });
+}
+
+/// F340:保存前丢掉空白备忘 —— 「添加」是先给一个空框再让用户填,填完又清空
+/// 等于删除,不该在库里留一条看不见字的备忘(行上却照样亮着标记)。
+pub(crate) fn prune_blank_memos(p: &mut ProjectRecord) {
+    p.memos.retain(|m| !m.text.trim().is_empty());
+}
+
+/// F340:「备忘」分节。一条一行(文本框 + 删除叉),底部「添加备忘」。
+/// 全部改的是草稿,点「保存」才落盘。
+fn memo_section(
+    ui: &mut egui::Ui,
+    t: &crate::theme::Theme,
+    draft: &mut ProjectRecord,
+    first: &mut bool,
+) {
+    use crate::ui::metrics::{field_w, FIELD_W_L, SP_XS};
+    crate::ui::session_manager::form::section(ui, t, "项目管理器", "备忘", first);
+    // 新建的那条要拿到焦点:「添加」之后唯一要做的事就是打字。
+    let focus_id = egui::Id::new("mullion_pm_memo_focus");
+    let want_focus: Option<usize> = ui.ctx().data_mut(|d| d.remove_temp(focus_id));
+    let mut remove = None;
+    for (i, m) in draft.memos.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            let w = field_w(ui.available_width(), FIELD_W_L, 28.0);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut m.text)
+                    .id(memo_field_id(i))
+                    .hint_text("例如:11-07 23:00 前查一次状态")
+                    .desired_width(w),
+            );
+            if want_focus == Some(i) {
+                r.request_focus();
+            }
+            if crate::ui::icon::icon_button(ui, crate::ui::icon::Glyph::Cross, true, "删除这条备忘")
+            {
+                remove = Some(i);
+            }
+        });
+        ui.add_space(SP_XS);
+    }
+    if let Some(i) = remove {
+        draft.memos.remove(i);
+    }
+    if draft.memos.is_empty() {
+        ui.label(
+            egui::RichText::new("没有备忘。临时要记的事写在这里,做完就删。")
+                .color(crate::theme::c32(t.fg_muted)),
+        );
+    }
+    if ui.button("添加备忘").clicked() {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        add_blank_memo(draft, &now);
+        let idx = draft.memos.len() - 1;
+        ui.ctx().data_mut(|d| d.insert_temp(focus_id, idx));
+    }
+}
+
+/// F340:第 `i` 条备忘的输入框 id(测试靠它读回控件)。
+pub(crate) fn memo_field_id(i: usize) -> egui::Id {
+    egui::Id::new(("mullion_pm_memo_field", i))
 }
 
 /// F238:把选中的那份 `.ico` 正文装进项目草稿。返回错误文案(`None` = 成功)。
@@ -899,6 +972,7 @@ mod tests {
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: accessed.map(str::to_string),
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         }
     }
@@ -1138,6 +1212,78 @@ mod tests {
             intent_after_clicking_add(&[]),
             Some(ProjectIntent::Add("新项目".into()))
         );
+    }
+
+    /// F340:空白备忘保存前被丢掉,有字的原样保留且顺序不变。
+    ///
+    /// 自证会变红:把 `prune_blank_memos` 改成恒不删(空备忘入库、行上亮标记
+    /// 却没有字),或把 `trim()` 去掉(纯空格的备忘漏过)。
+    #[test]
+    fn blank_memos_are_pruned_before_saving_and_the_rest_keep_their_order() {
+        let mut p = proj(1, "接口", None);
+        add_blank_memo(&mut p, "2026-11-06T10:00:00Z");
+        p.memos[0].text = "先看日志".into();
+        add_blank_memo(&mut p, "2026-11-06T10:01:00Z");
+        add_blank_memo(&mut p, "2026-11-06T10:02:00Z");
+        p.memos[2].text = "   ".into();
+        add_blank_memo(&mut p, "2026-11-06T10:03:00Z");
+        p.memos[3].text = "23:00 前查状态".into();
+        prune_blank_memos(&mut p);
+        let texts: Vec<&str> = p.memos.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["先看日志", "23:00 前查状态"]);
+    }
+
+    /// F340:右栏为每条已有备忘画一个可编辑的框(修改),删除叉去掉对应那条,
+    /// 「添加备忘」追加一条。三个动作都改草稿、不落盘。
+    ///
+    /// 自证会变红:把 `memo_section` 从 `form_column` 里去掉 —— 读不到框。
+    #[test]
+    fn the_right_column_shows_one_editable_box_per_memo() {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut p = proj(1, "接口", None);
+        p.memos = vec![
+            mullion_store::Memo {
+                text: "甲".into(),
+                created_at: String::new(),
+            },
+            mullion_store::Memo {
+                text: "乙".into(),
+                created_at: String::new(),
+            },
+        ];
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(p.id),
+            project_draft: Some(p.clone()),
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![p];
+        let sessions: Vec<SessionRecord> = Vec::new();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &ps,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
+            });
+        }
+        assert!(
+            ctx.read_response(memo_field_id(0)).is_some(),
+            "第 1 条备忘没有输入框"
+        );
+        assert!(
+            ctx.read_response(memo_field_id(1)).is_some(),
+            "第 2 条备忘没有输入框"
+        );
+        assert!(ctx.read_response(memo_field_id(2)).is_none(), "多出一个框");
     }
 
     /// 连点两次不会撞名 —— 第二次给的是下一个空号。

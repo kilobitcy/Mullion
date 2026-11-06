@@ -194,7 +194,10 @@ fn visible_fields<'a>(
 /// 上完全搜不到,而用户不知道自己搜的名字是显式设的还是推导出来的 —— 表现为
 /// 「有时搜得到有时搜不到」。
 fn hidden_fields(p: &mullion_store::ProjectRecord) -> Vec<String> {
-    vec![p.note.clone(), mullion_store::project_tmux_name(p)]
+    let mut out = vec![p.note.clone(), mullion_store::project_tmux_name(p)];
+    // F340:备忘同样是行里看不见的字段,并进来后 `hidden_hit_snippet` 自动覆盖。
+    out.extend(p.memos.iter().map(|m| m.text.clone()));
+    out
 }
 
 /// F233/F245:一个项目是否命中搜索词。空查询放行全部。
@@ -659,6 +662,7 @@ pub fn prefill_from_pane(
         created_at: String::new(),
         last_accessed_at: None,
         archived_at: None,
+        memos: Vec::new(),
         icon: None,
     })
 }
@@ -718,6 +722,7 @@ mod tests {
             created_at: "t".into(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         }
     }
@@ -877,6 +882,7 @@ mod tests {
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         }
     }
@@ -1244,6 +1250,7 @@ mod tests {
             created_at: "2026-09-01T00:00:00Z".into(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         }
     }
@@ -1345,6 +1352,29 @@ mod tests {
         p.note = "每天凌晨跑爬虫,产出丢到 oss".into();
         let got = hidden_hit_snippet(&p, &[], "爬虫").expect("只命中说明,该给片段");
         assert!(got.contains("爬虫"), "片段里没有命中词本身:{got}");
+    }
+
+    /// F340:备忘参与搜索,且只命中备忘时行要给出片段(多条备忘都要搜得到,
+    /// 不止第一条)。
+    ///
+    /// 自证会变红:把 `hidden_fields` 里那句 `out.extend(..memos..)` 删掉。
+    #[test]
+    fn memos_are_searchable_and_explain_themselves_in_the_snippet() {
+        let mut p = pr("proj-7", "/srv/api", &[]);
+        p.memos = vec![
+            mullion_store::Memo {
+                text: "先看日志".into(),
+                created_at: String::new(),
+            },
+            mullion_store::Memo {
+                text: "11-07 23:00 前查一次状态".into(),
+                created_at: String::new(),
+            },
+        ];
+        assert!(matches(&p, "23:00", &[]), "第二条备忘搜不到");
+        assert!(!matches(&p, "不存在的词", &[]));
+        let got = hidden_hit_snippet(&p, &[], "23:00").expect("只命中备忘,该给片段");
+        assert!(got.contains("23:00"), "片段里没有命中词:{got}");
     }
 
     /// **只有**隐藏字段命中才换副标题。普通搜索(打项目名 / 目录 / 节点名)的
@@ -1608,6 +1638,7 @@ mod tests {
             created_at: "t".into(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         };
         let d = prefill_from_pane(

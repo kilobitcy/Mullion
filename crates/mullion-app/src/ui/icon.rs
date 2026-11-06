@@ -53,6 +53,10 @@ pub enum Glyph {
     /// 自绘而不是找一个放大镜字符:U+1F50D 与 U+2315 都在 GBK 外,
     /// 两级字体链都画不出来,而这种缺失**只有人眼能发现**(T9)。
     Search,
+    /// F340:便签 —— 项目行上「这个项目有备忘」的标记。
+    ///
+    /// 自绘理由同 [`Glyph::Search`]:任何便签/笔记字符都在 GBK 外(T9)。
+    Memo,
 }
 
 impl Glyph {
@@ -74,6 +78,7 @@ impl Glyph {
         Glyph::LampUnknown,
         Glyph::Project,
         Glyph::Search,
+        Glyph::Memo,
     ];
 }
 
@@ -257,6 +262,33 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
         // 圆环 + 一条向右下的柄。半径取 `h * 0.6`,柄从圆周 45° 处再伸
         // `h * 0.45`,合计 0.6*0.707 + 0.45 ≈ 0.87h,仍在框内 ——
         // `every_glyph_stays_inside_its_rect` 正是为此存在。
+        // 一张纸:外框(首尾同点的 `Shape::line`,理由同 `Project`)+ 两道横线。
+        Glyph::Memo => vec![
+            Shape::line(
+                vec![
+                    pos2(c.x - h, c.y - h),
+                    pos2(c.x + h, c.y - h),
+                    pos2(c.x + h, c.y + h),
+                    pos2(c.x - h, c.y + h),
+                    pos2(c.x - h, c.y - h),
+                ],
+                stroke,
+            ),
+            Shape::LineSegment {
+                points: [
+                    pos2(c.x - h * 0.5, c.y - h * 0.3),
+                    pos2(c.x + h * 0.5, c.y - h * 0.3),
+                ],
+                stroke: stroke.into(),
+            },
+            Shape::LineSegment {
+                points: [
+                    pos2(c.x - h * 0.5, c.y + h * 0.3),
+                    pos2(c.x + h * 0.5, c.y + h * 0.3),
+                ],
+                stroke: stroke.into(),
+            },
+        ],
         Glyph::Search => {
             let r = h * 0.6;
             // 圆心往左上挪一点,给柄腾地方,整体视觉重心才落在框中间。

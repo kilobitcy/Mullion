@@ -973,6 +973,7 @@ impl Vault {
             created_at: now_rfc3339.to_string(),
             last_accessed_at: None,
             archived_at: None,
+            memos: Vec::new(),
             icon: None,
         });
         id
@@ -3771,6 +3772,7 @@ path = "/var/log"
         assert_eq!(
             crate::project::ProjectRecord {
                 archived_at: None,
+                memos: Vec::new(),
                 ..after.clone()
             },
             before,

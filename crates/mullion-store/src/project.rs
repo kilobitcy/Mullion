@@ -57,6 +57,21 @@ pub struct ProjectRecord {
     /// 等于把那两条路径各复制一遍。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<crate::model::IconSpec>,
+    /// F340:项目备忘。与 `note`(长期说明)分开:备忘是临时的待办,做完就删。
+    ///
+    /// 没有「完成」状态、没有结构化时间 —— 时间只是写在文字里的内容。
+    /// **升了 schema v14**:这是用户手写的数据,旧客户端当未知字段丢掉再写回会
+    /// 静默清空,理由同 `archived_at`。顺序即添加顺序,新的在后;展示时由调用方倒序。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memos: Vec<Memo>,
+}
+
+/// F340:一条备忘。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Memo {
+    pub text: String,
+    /// RFC3339;由调用方(app)注入,store 不持有时钟。
+    pub created_at: String,
 }
 
 /// 这个项目最终会 attach 的 tmux 会话名。
@@ -516,7 +531,28 @@ mod tests {
     /// 图标 / 归档判断 / 隧道名字静默消失**。拒绝比装作能用好。
     #[test]
     fn the_schema_version_is_bumped_so_old_clients_refuse_instead_of_dropping_projects() {
-        assert_eq!(crate::model::CURRENT_SCHEMA, 13);
+        assert_eq!(crate::model::CURRENT_SCHEMA, 14);
+    }
+
+    /// F340:备忘要能原样往返;没有备忘时不写出 `memos` 键(老文件与新文件
+    /// 对不碰备忘的用户逐字节一致);老文件缺键读成空。
+    ///
+    /// 自证会变红:去掉 `#[serde(default)]`(老文件读不进来)或
+    /// `skip_serializing_if`(空备忘也写出键)。
+    #[test]
+    fn memos_round_trip_and_an_empty_list_is_not_written() {
+        let mut p = super::tests::helpers::with_id(1, "web", None);
+        assert!(!toml::to_string_pretty(&p).unwrap().contains("memos"));
+        p.memos = vec![crate::project::Memo {
+            text: "11-07 23:00 前查一次状态".into(),
+            created_at: "2026-11-06T10:00:00+08:00".into(),
+        }];
+        let s = toml::to_string_pretty(&p).unwrap();
+        let back: crate::project::ProjectRecord = toml::from_str(&s).unwrap();
+        assert_eq!(back.memos, p.memos, "备忘没往返回来:{s}");
+        let bare = toml::to_string_pretty(&super::tests::helpers::with_id(2, "api", None)).unwrap();
+        let old: crate::project::ProjectRecord = toml::from_str(&bare).unwrap();
+        assert!(old.memos.is_empty(), "缺键该读成空备忘");
     }
 
     /// F238:项目自设的图标要能原样往返。**跟着 `[[project]]` 存在一起**,
@@ -784,6 +820,7 @@ created_at = "2026-09-01T00:00:00Z"
                 created_at: "2026-09-08T00:00:00Z".into(),
                 last_accessed_at: None,
                 archived_at: None,
+                memos: Vec::new(),
                 icon: None,
             }
         }

@@ -72,7 +72,7 @@ pub use presence::{
     sweep as sweep_presence, PRESENCE_DIR,
 };
 pub use project::{
-    can_join, overlay_project, project_tmux_name, validate as validate_project, ProjectId,
+    can_join, overlay_project, project_tmux_name, validate as validate_project, Memo, ProjectId,
     ProjectIssue, ProjectRecord, SameMachine, TmuxNameOwner,
 };
 pub use secrets_file::Scheme;
