@@ -668,7 +668,15 @@ fn memo_section(
     let mut remove = None;
     for (i, m) in draft.memos.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            let w = field_w(ui.available_width(), FIELD_W_L, 28.0);
+            // 预留 = 删除叉(边长 `interact_size.y`,见 `icon_button`)+ 一份间隙。
+            // **不能写死常量**:`FIELD_W_L` 是无穷大 = 铺满剩余宽度,预留差一点点,
+            // 这一行就比可用宽度宽一点点,弹窗按内容自动撑宽,下一帧可用宽度更大,
+            // 框又铺满 —— 一路长到屏幕边缘(实机报告)。
+            // 还要补 `TEXT_EDIT_MARGIN_X`:`desired_width` 只圈内容区,外框再宽 8px。
+            let reserve = ui.spacing().interact_size.y
+                + ui.spacing().item_spacing.x
+                + crate::ui::metrics::TEXT_EDIT_MARGIN_X;
+            let w = field_w(ui.available_width(), FIELD_W_L, reserve);
             let r = ui.add(
                 egui::TextEdit::singleline(&mut m.text)
                     .id(memo_field_id(i))
@@ -1284,6 +1292,56 @@ mod tests {
             "第 2 条备忘没有输入框"
         );
         assert!(ctx.read_response(memo_field_id(2)).is_none(), "多出一个框");
+    }
+
+    /// F340 实机 BUG:备忘输入框不能一帧比一帧宽。
+    ///
+    /// 复现:右栏里一行是「铺满剩余宽度的输入框 + 删除叉」,预留宽度写死成
+    /// 常量、与真实按钮宽度不符时,整行略宽于可用宽度,自动撑宽的弹窗每帧
+    /// 多长一点。判据:多画几帧后,框宽不再变化。
+    ///
+    /// 自证会变红:把 `memo_section` 的 `reserve` 改回 `0.0`(或去掉 `TEXT_EDIT_MARGIN_X` 那一项)。
+    #[test]
+    fn the_memo_box_does_not_keep_growing_frame_after_frame() {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let mut p = proj(1, "接口", None);
+        p.memos = vec![mullion_store::Memo {
+            text: "查状态".into(),
+            created_at: String::new(),
+        }];
+        let mut ui_state = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(p.id),
+            project_draft: Some(p.clone()),
+            ..Default::default()
+        };
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![p];
+        let sessions: Vec<SessionRecord> = Vec::new();
+        let mut widths = Vec::new();
+        for _ in 0..12 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                show(
+                    ctx,
+                    &t,
+                    &mut ui_state,
+                    &ps,
+                    &lamps,
+                    &sessions,
+                    &crate::ui::badge::AppearanceCache::default(),
+                    None,
+                );
+            });
+            if let Some(r) = ctx.read_response(memo_field_id(0)) {
+                widths.push(r.rect.width());
+            }
+        }
+        let last = *widths.last().expect("没读到备忘框");
+        assert!(
+            (widths[widths.len() - 2] - last).abs() < 0.5,
+            "框宽还在变:{widths:?}"
+        );
     }
 
     /// 连点两次不会撞名 —— 第二次给的是下一个空号。
