@@ -48,6 +48,8 @@ pub struct ProjectPickDraft {
     /// F258:这一次打开期间冻结的灯。**挂在 draft 上**:弹窗关掉 = draft 置
     /// `None`,冻结的灯跟着没了,不需要任何额外的失效点。
     pub frozen_lamps: Option<std::collections::BTreeMap<ProjectId, crate::project::Lamp>>,
+    /// F343:搜索框里 ↑↓ 挪到的行(`None` = 没按过方向键)。搜索词一变就清。
+    pub sel: Option<usize>,
 }
 
 impl ProjectPickDraft {
@@ -56,6 +58,7 @@ impl ProjectPickDraft {
             pane,
             filter: String::new(),
             frozen_lamps: None,
+            sel: None,
         }
     }
 }
@@ -133,17 +136,9 @@ pub fn show(
                         egui::RichText::new("这块分屏要切到哪个项目").color(theme::c32(t.fg_muted)),
                     );
                     ui.add_space(crate::ui::metrics::SP_S);
-                    crate::ui::search_box::search_box(
-                        ui,
-                        &mut d.filter,
-                        egui::Id::new("project_pick_search"),
-                        "搜索项目名 / 目录 / 节点",
-                        field_w,
-                    );
-                    ui.add_space(crate::ui::metrics::SP_S);
                     // F257:同 launcher —— 恒 `Tab::Active`,搜索穿透归档。
-                    // F258:排序读的是这次打开期间冻结的灯,不是 `lamps` 实时表 ——
-                    // 取在闭包外面,闭包里还要再借 `d.filter`。
+                    // F343:行要在画搜索框**之前**算出来 —— 键盘导航得在单行
+                    // TextEdit 吃掉 ↑↓/Enter 之前扫,而它要知道有几行。
                     let rows = crate::ui::project_list::rows(
                         projects,
                         crate::ui::project_list::Tab::Active,
@@ -151,6 +146,33 @@ pub fn show(
                         sessions,
                         frozen,
                     );
+                    let search_id = egui::Id::new("project_pick_search");
+                    let nav = crate::ui::project_nav::scan(
+                        ctx,
+                        search_id,
+                        &mut d.sel,
+                        rows.len(),
+                        !d.filter.trim().is_empty(),
+                    );
+                    if let Some(p) = nav.open.and_then(|i| rows.get(i)) {
+                        action = Some(PickAction::Pick {
+                            pane,
+                            project: p.id,
+                        });
+                    }
+                    let r = crate::ui::search_box::search_box(
+                        ui,
+                        &mut d.filter,
+                        search_id,
+                        "搜索项目名 / 目录 / 节点",
+                        field_w,
+                    );
+                    if r.changed() {
+                        d.sel = None;
+                    }
+                    ui.add_space(crate::ui::metrics::SP_S);
+                    // F258:排序读的是这次打开期间冻结的灯,不是 `lamps` 实时表 ——
+                    // 取在闭包外面,闭包里还要再借 `d.filter`。
                     if let Some(reason) = crate::ui::project_list::empty_reason(
                         projects,
                         crate::ui::project_list::Tab::Active,
@@ -170,7 +192,7 @@ pub fn show(
                         .max_height(list_h)
                         .show(ui, |ui| {
                             ui.set_min_width(field_w);
-                            for p in rows {
+                            for (i, p) in rows.into_iter().enumerate() {
                                 let lamp = lamps
                                     .get(&p.id)
                                     .copied()
@@ -183,8 +205,8 @@ pub fn show(
                                         lamp,
                                         sessions,
                                         query: &d.filter,
-                                        // 这个弹窗没有「正在编辑哪一个」的概念。
-                                        selected: false,
+                                        // F343:选中 = 搜索框里 ↑↓ 挪到的那一行。
+                                        selected: d.sel == Some(i),
                                         now,
                                         list: "pick",
                                         candidates: &crate::project::candidates(p, |id| {
@@ -201,6 +223,9 @@ pub fn show(
                                         dialing: false,
                                     },
                                 );
+                                if nav.moved && d.sel == Some(i) {
+                                    r.scroll_to_me(None);
+                                }
                                 if r.clicked() {
                                     action = Some(PickAction::Pick {
                                         pane,
@@ -343,6 +368,7 @@ mod tests {
             pane: PaneId(7),
             filter: query.to_string(),
             frozen_lamps: None,
+            sel: None,
         });
         let mut drawn = Vec::new();
         for time in [0.0_f64, 1.0] {
@@ -393,6 +419,7 @@ mod tests {
             pane: PaneId(7),
             filter: query.to_string(),
             frozen_lamps: None,
+            sel: None,
         });
         let mut shapes = Vec::new();
         for time in [0.0_f64, 1.0] {
@@ -808,5 +835,79 @@ mod tests {
             "分屏高了 300 点,弹窗只长了 {:.0} 点 —— 列表被封顶了",
             tall - short
         );
+    }
+
+    /// F343:搜索后 ↓ 选中、回车切换到高亮的项目。接线守护(判定本身在
+    /// `project_nav::tests`)。
+    ///
+    /// 自证会变红:删掉 `show` 里 `project_nav::scan` 那段。
+    #[test]
+    fn arrow_down_then_enter_picks_the_highlighted_project() {
+        let ps = vec![
+            proj(1, "alpha", "/a", None),
+            proj(2, "alphabet", "/b", None),
+        ];
+        let run = |keys: &[egui::Key]| -> Option<PickAction> {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(1.0);
+            let lamps = std::collections::BTreeMap::new();
+            let sessions = vec![node_session()];
+            let mut draft = Some(ProjectPickDraft::new(PaneId(7)));
+            draft.as_mut().unwrap().filter = "alph".to_string();
+            let mut got = None;
+            let mut step = |ctx: &egui::Context, time: f64, events: Vec<egui::Event>| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        ..base_input()
+                    },
+                    |ctx| {
+                        if let Some(a) = show(
+                            ctx,
+                            &MULLION_DARK,
+                            &mut draft,
+                            &ps,
+                            &lamps,
+                            &sessions,
+                            &crate::ui::badge::AppearanceCache::default(),
+                            Some(pane()),
+                        ) {
+                            got = Some(a);
+                        }
+                    },
+                );
+            };
+            step(&ctx, 0.0, vec![]);
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("project_pick_search")));
+            step(&ctx, 1.0, vec![]);
+            for (n, k) in keys.iter().enumerate() {
+                step(
+                    &ctx,
+                    2.0 + n as f64,
+                    vec![egui::Event::Key {
+                        key: *k,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            got
+        };
+        let pick = |n| {
+            Some(PickAction::Pick {
+                pane: PaneId(7),
+                project: ProjectId(n),
+            })
+        };
+        assert_eq!(run(&[egui::Key::Enter]), pick(1), "没按方向键:回车选第一行");
+        assert_eq!(
+            run(&[egui::Key::ArrowDown, egui::Key::ArrowDown, egui::Key::Enter]),
+            pick(2),
+            "↓↓ 之后回车选第二行"
+        );
+        assert_eq!(run(&[egui::Key::ArrowDown]), None);
     }
 }

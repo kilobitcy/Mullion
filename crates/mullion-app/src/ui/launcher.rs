@@ -134,15 +134,34 @@ pub fn show(
             //
             // T8:这个框在 `CentralPanel` 里,**不需要**新增 `Modal` 项 ——
             // launcher 态一块 pane 都没有,没有终端跟它抢键盘。
+            // F343:键盘导航必须在画搜索框**之前**扫(单行 TextEdit 自己也吃
+            // ↑↓/Enter)。只管项目列;会话/现场两列仍是单击。
+            let search_id = egui::Id::new("launcher_search");
+            let nav = crate::ui::project_nav::scan(
+                ctx,
+                search_id,
+                &mut ui_state.launcher_sel,
+                project_rows.len(),
+                !ui_state.launcher_search.trim().is_empty(),
+            );
+            if let Some(p) = nav.open.and_then(|i| project_rows.get(i)) {
+                // F297:在拨的行再按回车不发第二次打开请求(同点击)。
+                if !lists.dialing_projects.contains(&p.id) {
+                    ui_state.project_open_request = Some((p.id, None));
+                }
+            }
             ui.vertical_centered(|ui| {
                 let w = field_w(ui.available_width(), FIELD_W_M, 0.0);
                 let r = crate::ui::search_box::search_box(
                     ui,
                     &mut ui_state.launcher_search,
-                    egui::Id::new("launcher_search"),
+                    search_id,
                     crate::theme::hint_text(t, "搜索项目 / 会话 / 现场"),
                     w,
                 );
+                if r.changed() {
+                    ui_state.launcher_sel = None;
+                }
                 crate::ui::annotate::mark(ui.ctx(), "启动页/搜索框", r.rect);
             });
             ui.add_space(SP_M);
@@ -152,6 +171,8 @@ pub fn show(
                 lists,
                 project_rows: &project_rows,
                 project_empty,
+                sel: ui_state.launcher_sel,
+                scroll_to_sel: nav.moved,
             };
             match arrangement(ui.available_width()) {
                 // 横排:三栏等宽,**每栏各自一根滚动条** —— 共用一根的话
@@ -187,6 +208,9 @@ struct ColumnCtx<'a> {
     /// 已经排好序、过滤好的项目行(在 `show` 的闭包外算,见那里的注释)。
     project_rows: &'a [&'a ProjectRecord],
     project_empty: Option<crate::ui::project_list::EmptyReason>,
+    /// F343:键盘高亮的项目行,以及这一帧是否刚被方向键挪动(要滚进视野)。
+    sel: Option<usize>,
+    scroll_to_sel: bool,
 }
 
 /// 一列的壳:小标题 + (横排时)自己的滚动条。
@@ -244,7 +268,7 @@ fn projects_column(
             }
             return;
         }
-        for p in cx.project_rows {
+        for (i, p) in cx.project_rows.iter().enumerate() {
             let lamp = cx
                 .lists
                 .lamps
@@ -261,8 +285,8 @@ fn projects_column(
                     lamp,
                     sessions: cx.lists.sessions,
                     query: &ui_state.launcher_search,
-                    // 启动页没有「正在编辑哪一个」的概念。
-                    selected: false,
+                    // F343:启动页的「选中」就是搜索框里 ↑↓ 挪到的那一行。
+                    selected: cx.sel == Some(i),
                     now: cx.now,
                     list: "launcher",
                     candidates: &crate::project::candidates(p, |id| {
@@ -277,6 +301,9 @@ fn projects_column(
                     dialing,
                 },
             );
+            if cx.scroll_to_sel && cx.sel == Some(i) {
+                r.scroll_to_me(None);
+            }
             // F297:在拨的行再点不发第二次打开请求。
             if r.clicked() && !dialing {
                 ui_state.project_open_request = Some((p.id, None));
@@ -1741,5 +1768,67 @@ mod tests {
             ui_state.project_open_request, None,
             "在拨的项目行又发了一次打开请求"
         );
+    }
+
+    /// F343:搜索后 ↓ 选中第 N 行、回车打开它;没按方向键直接回车 = 第一行。
+    ///
+    /// 自证会变红:删掉 `draw` 里 `project_nav::scan` 那段 —— 回车不再产生
+    /// 打开请求;或把 `selected: cx.sel == Some(i)` 改回 `false` —— 不影响
+    /// 本条,但 `scan` 的 `sel` 不接线则第二个断言红(落在第一行)。
+    #[test]
+    fn arrow_down_then_enter_opens_the_highlighted_project() {
+        let ps = vec![
+            proj(1, "alpha", "/a", None),
+            proj(2, "alphabet", "/b", None),
+        ];
+        let run = |keys: &[egui::Key]| -> Option<(
+            mullion_store::ProjectId,
+            Option<mullion_core::layout::PaneId>,
+        )> {
+            let ctx = egui::Context::default();
+            let mut ui_state = crate::ui::UiState {
+                launcher_search: "alph".to_string(),
+                ..Default::default()
+            };
+            let lamps = std::collections::BTreeMap::new();
+            let sessions = vec![sess(7, "web01")];
+            let mut actions = crate::ui::UiActions::default();
+            let mut frame = |ctx: &egui::Context,
+                             ui_state: &mut crate::ui::UiState,
+                             events: Vec<egui::Event>| {
+                let _ = ctx.run(egui::RawInput { events, ..wide() }, |ctx| {
+                    draw(ctx, ui_state, &ps, &lamps, &sessions, &[], &mut actions)
+                });
+            };
+            frame(&ctx, &mut ui_state, vec![]);
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("launcher_search")));
+            frame(&ctx, &mut ui_state, vec![]);
+            for k in keys {
+                frame(
+                    &ctx,
+                    &mut ui_state,
+                    vec![egui::Event::Key {
+                        key: *k,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            ui_state.project_open_request
+        };
+        let id = |n| mullion_store::ProjectId(n);
+        assert_eq!(
+            run(&[egui::Key::Enter]),
+            Some((id(1), None)),
+            "没按方向键:回车开第一行"
+        );
+        assert_eq!(
+            run(&[egui::Key::ArrowDown, egui::Key::ArrowDown, egui::Key::Enter]),
+            Some((id(2), None)),
+            "↓↓ 之后回车开的是第二行"
+        );
+        assert_eq!(run(&[egui::Key::ArrowDown]), None, "光是挪高亮不该打开");
     }
 }

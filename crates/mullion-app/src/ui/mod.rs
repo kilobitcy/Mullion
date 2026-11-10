@@ -25,6 +25,7 @@ pub mod pane_title;
 pub mod paste;
 pub mod project_list;
 pub mod project_manager;
+pub mod project_nav;
 pub mod project_pick;
 pub mod project_row;
 pub mod rehost;
@@ -344,6 +345,9 @@ pub struct UiState {
     /// F258:启动页这一次显示期间冻结的灯。同上。
     pub launcher_frozen_lamps:
         Option<std::collections::BTreeMap<mullion_store::ProjectId, crate::project::Lamp>>,
+    /// F343:启动页项目列表里键盘高亮的是第几行(`None` = 没按过方向键)。
+    /// 搜索词一变就清;行数变少时 `project_nav::scan` 会夹回去。
+    pub launcher_sel: Option<usize>,
     /// F236:下一帧要把焦点打到右栏「名称」框上(刚新建完)。
     ///
     /// 用一位标志而不是在 app 侧直接 `request_focus`:那个 `Response` 只在
@@ -1265,6 +1269,7 @@ pub fn build_ui(
     } else {
         // F258:同上。离开启动页(第一个标签立起来)就扔掉。
         ui_state.launcher_frozen_lamps = None;
+        ui_state.launcher_sel = None;
     }
     if let Some(files) = files_content {
         let (r, l) = files_panel::content(
