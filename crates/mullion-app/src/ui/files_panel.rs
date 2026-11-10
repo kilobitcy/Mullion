@@ -431,6 +431,11 @@ fn menu_body(
     let pad = ui.spacing().button_padding;
     let cell = ui.spacing().interact_size.y * 0.75;
     ui.spacing_mut().button_padding.x = pad.x * 2.0 + cell;
+    // F342:标签一律不折行,菜单宽度跟着最长那条走。默认的 `Wrap` 在菜单首帧
+    // 按「当时能用的宽度」排字 —— 左内边距被撑大一格图标之后,侧栏又窄,
+    // 「用默认程序编辑」「在 Mullion 里编辑」偶发被折成两行(时有时无,
+    // 取决于首帧可用宽度)。
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     for (e, &line) in items.iter().zip(&lines) {
         if line {
             ui.separator();
@@ -4588,6 +4593,10 @@ mod tests {
             .nth(1)
             .expect("找不到 menu_body");
         let body = &body[..body.find("\n}\n").expect("找不到 menu_body 的结尾")];
+        assert!(
+            body.contains("wrap_mode = Some(egui::TextWrapMode::Extend)"),
+            "菜单没有关掉折行(F342):窄侧栏里长标签会偶发折成两行"
+        );
         let measured = body
             .find("let pad = ui.spacing().button_padding;")
             .expect("menu_body 里没有量原始内边距 —— 图标不知道该画在哪");
