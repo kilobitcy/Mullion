@@ -12325,6 +12325,22 @@ impl App {
             // 用户拍板:换过节点的 pane 要跑**新节点**的登录后命令,
             // 规则同分屏新开的那些 —— 跳过 tmux,其余照跑。
             self.on_pane_ready(generation, pane, sink, pending.plan, true);
+            // F341:侧栏归属的就是这块 pane 时,SFTP 要跟过去 —— 栏头的节点名
+            // 按 pane 每帧现取,会立刻变成新节点,channel 却还连着旧机器。
+            let focused = self
+                .tabs
+                .by_generation(generation)
+                .and_then(|t| t.content.as_terminal())
+                .map(|t| t.ws.focus());
+            if rehost_resyncs_sidebar(
+                self.files_owner_pane,
+                self.files_owner_generation(),
+                generation,
+                pane,
+                focused,
+            ) {
+                self.sync_files_to_focused_pane();
+            }
             self.ui.set_toast(crate::ui::toast::Kind::Ok, "已换节点");
             mark_ui_dirty!(self.ui_dirty);
             self.request_ui_redraw();
@@ -17186,6 +17202,27 @@ fn focus_after_rehost(ws: &mut Workspace, id: PaneId, kind: RehostKind) {
 ///   同节点叶子不走这条路,所以症状表现为「多屏恢复时跨节点的那块不接 tmux」。
 fn rehost_voids_attach_intent(kind: RehostKind) -> bool {
     kind == RehostKind::UserPicked
+}
+
+/// F341:一次换节点成功之后,侧栏的 SFTP 要不要跟着重新同步。
+///
+/// 三个条件缺一不可:
+/// - 侧栏归属的正是这块 pane(`owner` 带世代号,理由见 `files_owner_pane`);
+/// - 此刻侧栏就开在这个标签上(`owner_generation` 是 `files_owner_generation()`,
+///   侧栏关着或开在别的标签上都是 `None`/别的号);
+/// - 这块 pane 是焦点分屏 —— 重开走的是 `sync_files_to_focused_pane`,它取的是
+///   焦点 pane 所在的机器,换的不是焦点就会连到不相干的机器上。
+///   用户在弹窗里选节点那条路会把焦点给到这块 pane(`focus_after_rehost`)。
+fn rehost_resyncs_sidebar(
+    owner: Option<(u64, PaneId)>,
+    owner_generation: Option<u64>,
+    generation: u64,
+    pane: PaneId,
+    focused: Option<PaneId>,
+) -> bool {
+    owner == Some((generation, pane))
+        && owner_generation == Some(generation)
+        && focused == Some(pane)
 }
 
 /// F160/F161:换节点作废这块 pane 原来的「该接回哪个 tmux 会话」记录。
@@ -36165,5 +36202,84 @@ mod tests {
             lit.contains(concat!("drawer: ws.", "is_drawer(")),
             "标题条的 drawer 没接到 Workspace"
         );
+    }
+
+    /// F341:侧栏归属的 pane 换节点后,SFTP 必须跟过去;其余情形一律不动。
+    ///
+    /// 自证会变红:把 `rehost_resyncs_sidebar` 里任何一个 `&&` 条件删掉,
+    /// 对应的 `false` 断言就红。
+    #[test]
+    fn rehosting_the_sidebar_owner_pane_resyncs_the_sftp_channel() {
+        let p = |n| PaneId(n);
+        assert!(super::rehost_resyncs_sidebar(
+            Some((7, p(2))),
+            Some(7),
+            7,
+            p(2),
+            Some(p(2))
+        ));
+        // 换的不是归属 pane
+        assert!(!super::rehost_resyncs_sidebar(
+            Some((7, p(1))),
+            Some(7),
+            7,
+            p(2),
+            Some(p(2))
+        ));
+        // 同一个 PaneId 但在另一个标签(世代不同)
+        assert!(!super::rehost_resyncs_sidebar(
+            Some((6, p(2))),
+            Some(7),
+            7,
+            p(2),
+            Some(p(2))
+        ));
+        // 侧栏关着 / 开在别的标签
+        assert!(!super::rehost_resyncs_sidebar(
+            Some((7, p(2))),
+            None,
+            7,
+            p(2),
+            Some(p(2))
+        ));
+        assert!(!super::rehost_resyncs_sidebar(
+            Some((7, p(2))),
+            Some(8),
+            7,
+            p(2),
+            Some(p(2))
+        ));
+        // 没有归属记录
+        assert!(!super::rehost_resyncs_sidebar(
+            None,
+            Some(7),
+            7,
+            p(2),
+            Some(p(2))
+        ));
+        // 不是焦点分屏:同步取的是焦点 pane 所在机器,会连错
+        assert!(!super::rehost_resyncs_sidebar(
+            Some((7, p(2))),
+            Some(7),
+            7,
+            p(2),
+            Some(p(1))
+        ));
+    }
+
+    /// F341 接线:`on_pane_rehosted` 成功分支必须真的调用同步,且判据来自
+    /// `rehost_resyncs_sidebar`(纯函数测得再好,没人调用等于没做)。
+    ///
+    /// 自证会变红:删掉 `on_pane_rehosted` 里的 `sync_files_to_focused_pane()`。
+    #[test]
+    fn on_pane_rehosted_resyncs_the_sidebar_through_the_decision_function() {
+        let body = strip_comments(body_of(prod_src(), "fn on_pane_rehosted("));
+        let gate = body
+            .find("rehost_resyncs_sidebar(")
+            .expect("on_pane_rehosted 不再询问 rehost_resyncs_sidebar —— 换节点后 SFTP 留在旧机器");
+        let sync = body
+            .find("self.sync_files_to_focused_pane();")
+            .expect("on_pane_rehosted 没有调用 sync_files_to_focused_pane");
+        assert!(gate < sync, "同步写在了判据之前,等于无条件同步");
     }
 }
