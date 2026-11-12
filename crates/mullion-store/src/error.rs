@@ -173,6 +173,7 @@ impl From<std::string::FromUtf8Error> for StoreError {
         StoreError::Utf8
     }
 }
+#[cfg(not(target_os = "android"))]
 impl From<keyring::Error> for StoreError {
     fn from(e: keyring::Error) -> Self {
         StoreError::Keyring(e.to_string())

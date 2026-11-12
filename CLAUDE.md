@@ -14,7 +14,7 @@
 **边界**（超出范围的需求先问，别自己开工）：
 - 不做终端复用器。会话保活是远端 tmux 的事，我们只做客户端。
 - 不做 AI 侧栏、不做数据库客户端、不做 RDP/VNC。
-- macOS/Linux 能编过就行，**Windows 11 是唯一的一等公民**。
+- macOS/Linux 能编过就行；**Windows 11 与 Android（arm64，minSdk 30）是一等公民**（ADR-013）。手机端永不做分屏、内置编辑器、端口隧道、F100。
 
 ---
 
@@ -28,10 +28,11 @@ mullion-term     VT 仿真封装 + 输入编码。只依赖 alacritty_terminal /
 mullion-ssh      russh。不认识「pane」「窗口」这些概念，只认字节流。
 mullion-store    会话/凭据持久化。TOML + keyring 加密。零 UI、零 async、仅同步 IO。可纯单测。
 mullion-cloud    S3 兼容对象存储客户端。只认字节与键名,不认识 Pack/Session/UI。零 async。可纯单测。
-mullion-app      winit + wgpu + glyphon(终端自绘)+ egui(外壳:菜单/状态栏/会话弹窗)。唯一允许知道其余四者的地方。
+mullion-app      winit + wgpu + glyphon(终端自绘)+ egui(外壳:菜单/状态栏/会话弹窗)。组装端之一(桌面)。
+mullion-ffi      uniffi 导出给 Android(Kotlin)。组装端之二,与 app 平级;tokio 编排在这里,判据不在这里(判据在 store)。
 ```
 
-**依赖方向严格单向**：`app → {core, term, ssh, store, cloud}`，其余互不依赖。
+**依赖方向严格单向**：两个组装端 `app`、`ffi` 各自可依赖 `{core, term, ssh, store, cloud}`；**app 与 ffi 互不依赖**，其余互不依赖（守护:`mullion-ffi/tests/dependency_direction.rs`）。
 
 这条约束的全部价值在于：**布局 bug 和键码 bug 能在没有窗口的情况下写测试复现**。
 这两类是本项目最费时间的 bug。任何「为了方便」把 UI 类型漏进 core/term 的改动，
@@ -88,6 +89,14 @@ cargo build --release --target x86_64-pc-windows-gnu -p mullion-app
 MULLION_LIVE=1 MULLION_LIVE_HOST=<真机> MULLION_LIVE_USER=<用户> MULLION_LIVE_KEY=<私钥> \
   cargo test -p mullion-ssh --test live -- --ignored
 ```
+
+Android(F345 起,工具链与网络坑见 `docs/android-build.md`):
+```bash
+android/scripts/emulator.sh start             # 无头 KVM 模拟器
+android/scripts/e2e.sh                        # 宿主机 echo sshd + connectedDebugAndroidTest
+cd android && ./gradlew assembleDebug         # preBuild 会先 cargo ndk + 生成 uniffi 绑定
+```
+**Android 绿**:上面的「绿」**加上** `android/scripts/e2e.sh` 全过。只改桌面的切片不要求跑它。
 
 **「绿」的定义**：`cargo test --workspace` 全过 **且** `clippy -D warnings` 无输出。
 只跑了单个 crate 的测试不叫绿，不许据此说「测试通过」。
@@ -188,6 +197,7 @@ ADR 放 `docs/adr-NNN-*.md`，一个决策一个文件；brainstorm/writing-plan
   静置 A/B、Debug 档目视表、N1/N5 判据、日志各段怎么读）
 - `ui-form-guidelines.md` —— 表单布局规范（分节/宽度三档/间距五档/危险措辞/空态文案），
   写任何 egui 表单前先扫一眼；机械守护在 `crates/mullion-app/tests/form_guidelines.rs`
+- `android-build.md` —— Android 工具链/镜像源/模拟器/构建与插桩测试运行手册
 - ADR 全在 `docs/adr-NNN-*.md`，按需读原文；碰架构决策前先查有没有对应 ADR。
 
 架构级决策（换 GUI 框架、换 SSH 库、改依赖方向）写进 `docs/adr-NNN-*.md`，

@@ -1,8 +1,5 @@
 //! 主密钥来源。真实实现走 OS keyring;测试用内存实现,让加密逻辑在无头 CI 可测。
 
-use chacha20poly1305::aead::{KeyInit, OsRng};
-use chacha20poly1305::XChaCha20Poly1305;
-
 use crate::error::StoreError;
 
 /// 取 32 字节主密钥;不存在则生成并持久化。
@@ -11,11 +8,14 @@ pub trait MasterKeySource {
 }
 
 /// 生产实现:主密钥存 OS keyring(Windows DPAPI / macOS Keychain / Linux Secret Service)。
+/// Android 上不存在(F345):那里 keyring 会静默回落到内存库。
+#[cfg(not(target_os = "android"))]
 pub struct KeyringSource {
     pub service: String,
     pub account: String,
 }
 
+#[cfg(not(target_os = "android"))]
 impl KeyringSource {
     /// 默认 service=`mullion`、account=`vault-master-key`。
     pub fn new() -> Self {
@@ -26,14 +26,19 @@ impl KeyringSource {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl Default for KeyringSource {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl MasterKeySource for KeyringSource {
     fn load_or_create(&self) -> Result<[u8; 32], StoreError> {
+        use chacha20poly1305::aead::{KeyInit, OsRng};
+        use chacha20poly1305::XChaCha20Poly1305;
+
         let entry = keyring::Entry::new(&self.service, &self.account)?;
         match entry.get_secret() {
             Ok(bytes) => {

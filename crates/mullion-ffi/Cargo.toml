@@ -1,0 +1,32 @@
+[package]
+name = "mullion-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 架构不变量(ADR-013):ffi 是与 app 平级的第二个组装端。可依赖
+# {core, term, ssh, store, cloud};**永不依赖 mullion-app**,app 也永不依赖它。
+[lib]
+name = "mullion_ffi"
+# cdylib 给 Android 加载;lib 让本 crate 的集成测试能直接调 Rust API。
+crate-type = ["cdylib", "lib"]
+
+[features]
+# 只给绑定生成器 bin 打开,免得常规 `cargo test --workspace` 把 uniffi 的
+# CLI 依赖(clap 等)也编进来。
+bindgen = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+uniffi.workspace = true
+mullion-term = { path = "../mullion-term" }
+mullion-ssh = { path = "../mullion-ssh" }
+tokio.workspace = true
+
+[dev-dependencies]
+russh.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

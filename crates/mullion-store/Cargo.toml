@@ -9,7 +9,6 @@ license.workspace = true
 serde.workspace = true
 toml.workspace = true
 chacha20poly1305.workspace = true
-keyring.workspace = true
 argon2.workspace = true
 # F46-a:整机迁移包把各配置文件的正文 base64 内嵌进一份 TOML。
 # 0.22.1 本来就在 Cargo.lock 里(app 的图标内嵌),加进这里不引入新版本。
@@ -21,6 +20,12 @@ sha2.workspace = true
 # F344:项目列表「最后打开」相对时间(`localtime::relative`)下沉到这里,
 # 桌面与 Android 共用。0.3 已在 Cargo.lock(app 直接依赖),不引新版本。
 time.workspace = true
+
+# F345:Android 上**不要** keyring。它在那里没有后端,会静默回落到进程内存
+# 的 mock 库 —— 主密钥每次重启都丢、零报错。Android 的主密钥走 Keystore
+# (F346/F347);`KeyringSource` 在 Android 上按同一 cfg 整个不存在。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

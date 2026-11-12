@@ -58,7 +58,9 @@ pub use layout::{
     SavedDir, SavedLayout, SavedNodeEntry, SavedTab, SavedTabKind, SavedWindow,
     CURRENT_LAYOUT_SCHEMA,
 };
-pub use master_key::{InMemoryKey, KeyringSource, MasterKeySource};
+#[cfg(not(target_os = "android"))]
+pub use master_key::KeyringSource;
+pub use master_key::{InMemoryKey, MasterKeySource};
 pub use migrate::{migrate_v1, SchemaProbe};
 pub use model::{
     AppearancePrefs, AuthKind, ColorSpec, ColorTarget, Connection, GroupId, IconKind, IconSpec,

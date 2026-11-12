@@ -20,3 +20,10 @@
 
 # 子 agent 的临时 git worktree,一次性、每台机器不同
 /.claude/worktrees/
+
+# Android(F345):Gradle 产物、本机 SDK 路径、cargo-ndk 编出的 .so(构建时生成)
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/jniLibs/

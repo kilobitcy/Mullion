@@ -7,6 +7,7 @@ members = [
     "crates/mullion-app",
     "crates/mullion-store",
     "crates/mullion-cloud",
+    "crates/mullion-ffi",
 ]
 
 [workspace.package]
@@ -92,6 +93,9 @@ ureq = { version = "3", default-features = false, features = ["rustls", "socks-p
 # 加直接依赖不引入新版本。
 sha2 = "0.10"
 hmac = "0.12"
+# F345(ADR-013):Android 端的 FFI。只用 proc-macro 模式(不写 UDL);
+# `cli` 特性只给 `mullion-ffi` 的绑定生成器 bin 用,见该 crate 的 `bindgen` feature。
+uniffi = "0.32"
 
 # N6(安装包 < 25MB)。在这之前 release 用的是 cargo 默认值,交叉编译出来的
 # exe 是 38.6 MiB —— 超标 54%,而且从来没有任何自动化盯着它。
