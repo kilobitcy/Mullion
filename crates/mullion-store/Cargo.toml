@@ -18,6 +18,9 @@ base64.workspace = true
 # 「列举式门控在加档时必然漏」本项目已经踩过三次,漏一次的后果是
 # 「用户以为备份了其实没有」。0.10 已在 Cargo.lock(russh 拉的),不引新版本。
 sha2.workspace = true
+# F344:项目列表「最后打开」相对时间(`localtime::relative`)下沉到这里,
+# 桌面与 Android 共用。0.3 已在 Cargo.lock(app 直接依赖),不引新版本。
+time.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
