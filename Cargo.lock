@@ -2829,10 +2829,14 @@ version = "0.1.142"
 name = "mullion-ffi"
 version = "0.1.142"
 dependencies = [
+ "base64 0.22.1",
  "mullion-ssh",
+ "mullion-store",
  "mullion-term",
  "russh",
+ "tempfile",
  "tokio",
+ "toml 0.8.23",
  "uniffi",
 ]
 

@@ -80,6 +80,10 @@ pub enum StoreError {
     /// 机器。把它跟 `Crypto` 混成一条的话,UI 只能说「加密失败」,而用户需要
     /// 知道的是「去设一个主密码」。
     NoMasterPassword,
+    /// F346-a:手机导入的包里 `sessions.toml` 的 schema 低于手机端能接的下限。
+    /// v<5 的迁移会按文件里记的**本机路径**去读私钥,那些路径指向桌面文件,
+    /// 在手机上既没意义又是一条任意读文件的口子,所以直接拒收,让用户重新导出。
+    PackTooOld(u32),
 }
 
 impl fmt::Display for StoreError {
@@ -147,6 +151,10 @@ impl fmt::Display for StoreError {
                 "会话引用的凭据 {id:?} 不存在 —— 它可能已被删除,请重新指定认证方式"
             ),
             StoreError::NoMasterPassword => write!(f, "这个操作需要先设置主密码"),
+            StoreError::PackTooOld(v) => write!(
+                f,
+                "这份包的格式太旧(schema v{v}),请用新版桌面端重新导出"
+            ),
         }
     }
 }

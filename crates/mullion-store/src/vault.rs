@@ -118,7 +118,7 @@ pub struct ResolvedAuth {
 /// `BTreeMap<String, SecretEntry>`,另开表要改文件格式(又一次不兼容);
 /// 前缀是纯加法,旧文件天然没有这类键,且与 `SessionId` 的十进制表示
 /// 不可能撞车(有测试钉着)。
-fn cred_key(id: CredentialId) -> String {
+pub(crate) fn cred_key(id: CredentialId) -> String {
     format!("cred:{}", id.0)
 }
 

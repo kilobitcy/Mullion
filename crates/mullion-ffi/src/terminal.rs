@@ -15,6 +15,7 @@ use mullion_ssh::session::{connect, SshSession, TrySendErr};
 use mullion_term::emulator::Emulator;
 use tokio::sync::mpsc;
 
+use crate::error::FfiError;
 use crate::runtime::runtime;
 use crate::screen::{project, ScreenText};
 
@@ -34,30 +35,6 @@ pub struct ConnectParams {
     pub cols: u16,
     pub rows: u16,
 }
-
-/// Kotlin 侧会收到 `FfiException`。
-#[derive(Debug, uniffi::Error)]
-#[uniffi(flat_error)]
-pub enum FfiError {
-    /// 握手 / 认证 / 开 PTY 失败。
-    Connect(String),
-    /// 出站队列满(大段粘贴 + 慢链路)。
-    Busy,
-    /// channel 已关。
-    Closed,
-}
-
-impl std::fmt::Display for FfiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Connect(e) => write!(f, "连接失败:{e}"),
-            Self::Busy => write!(f, "发送队列已满,稍后再试"),
-            Self::Closed => write!(f, "连接已关闭"),
-        }
-    }
-}
-
-impl std::error::Error for FfiError {}
 
 impl From<TrySendErr> for FfiError {
     fn from(e: TrySendErr) -> Self {

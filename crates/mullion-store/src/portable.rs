@@ -368,7 +368,7 @@ pub fn backup(dir: &Path, stamp: &str) -> Result<PathBuf, StoreError> {
     Ok(out)
 }
 
-fn b64() -> base64::engine::general_purpose::GeneralPurpose {
+pub(crate) fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
 }
 

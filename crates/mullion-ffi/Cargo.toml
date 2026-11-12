@@ -26,7 +26,13 @@ uniffi.workspace = true
 mullion-term = { path = "../mullion-term" }
 mullion-ssh = { path = "../mullion-ssh" }
 tokio.workspace = true
+# F346-a:导入判据在 store。**不得依赖 mullion-cloud** —— 那是「不回写」的
+# 结构性判据(设计 D5,守护在 tests/dependency_direction.rs)。
+mullion-store = { path = "../mullion-store" }
 
 [dev-dependencies]
 russh.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+toml.workspace = true
+base64.workspace = true
+tempfile = "3"

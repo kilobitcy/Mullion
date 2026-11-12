@@ -22,6 +22,9 @@
 - Gradle 控制台不打逐条用例结果。要看哪条红/一共跑了几条:先 `installDebug installDebugAndroidTest`,
   再 `adb shell am instrument -w -r io.github.kilobitcy.mullion.test/androidx.test.runner.AndroidJUnitRunner`
   (echo sshd 要自己先起),末尾是 `OK (N tests)` 或 `FAILURES!!!`
+- 导入测试资产:`android/app/src/androidTest/assets/test.mullionpack` 由
+  `cargo run -p mullion-ffi --example make_test_pack -- android/app/src/androidTest/assets/test.mullionpack`
+  生成(假数据,内容见 `crates/mullion-ffi/tests/common/demo_pack.rs`);演示包内容变了才重生成
 
 ## 已知坑
 - keyring 在 Android 上会静默回落到内存 mock 库 → store 在 Android 上不编 keyring,`KeyringSource` 不存在(守护:`mullion-store/tests/android_has_no_keyring.rs`)
@@ -30,3 +33,7 @@
 - uniffi 生成的 Kotlin 类自带 `AutoCloseable.close()`:Rust 侧导出方法**不能叫 `close`**(会生成两个同签名方法),所以叫 `disconnect`
 - Compose 测试里 `SemanticsConfiguration.getOrNull` 是扩展函数,要显式 `import androidx.compose.ui.semantics.getOrNull`
 - 主机密钥目前是进程内 TOFU(首见即收、不落盘),F350 换成真 TOFU;F355 之前不发 APK
+- 本地数据:`filesDir/vault/`(与桌面同格式的 `sessions.toml` / `known_hosts.toml` / `secrets.enc`);
+  数据密钥由 Keystore 包装钥 `mullion-vault-wrap-v1` 包在 `filesDir/vault-key.bin`(首字节版本号)。
+  解不开即清空 `vault/` 重新生成 —— 重导即恢复(F346-a)
+- 备份与设备迁移都关了(`allowBackup=false` + `data_extraction_rules.xml`):Keystore 钥带不走

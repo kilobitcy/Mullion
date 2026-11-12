@@ -19,6 +19,7 @@ pub mod master_key;
 pub mod migrate;
 pub mod model;
 pub mod network;
+pub mod phone_import;
 pub mod portable;
 pub mod presence;
 pub mod project;
@@ -67,6 +68,9 @@ pub use model::{
     Identity, Protocol, SecretEntry, SessionId, SessionRecord, TerminalPrefs,
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
+pub use phone_import::{
+    install_projects_only, project_reachable_secret_keys, PhoneImport, Reachable, STAGING_DIR,
+};
 pub use portable::{
     collect as collect_portable, install as install_pack, open_secrets, read_pack,
     reseal_for_target, seal_secrets, write_pack, Installed, Pack, PackFile, CURRENT_PACK_FORMAT,

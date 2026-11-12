@@ -6,12 +6,16 @@
 
 uniffi::setup_scaffolding!();
 
+mod error;
+mod import;
 mod runtime;
 mod screen;
 mod terminal;
 
+pub use error::FfiError;
+pub use import::{import_pack, inspect_pack, ImportSummary, PackInfo};
 pub use screen::ScreenText;
-pub use terminal::{ConnectParams, FfiError, ScreenListener, Terminal};
+pub use terminal::{ConnectParams, ScreenListener, Terminal};
 
 /// 内核版本号,Kotlin 侧用来确认加载的 `.so` 是不是这一版。
 #[uniffi::export]

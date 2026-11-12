@@ -57,7 +57,8 @@ impl MasterKeySource for KeyringSource {
     }
 }
 
-/// 测试用:返回固定密钥,不碰 keyring。
+/// 固定密钥,不碰 keyring。**测试与 Android 生产路径共用**(F346-a):Android 的
+/// 数据密钥由 Keystore 信封解出后经 ffi 传进来。不要把它当测试辅助 `#[cfg(test)]` 掉。
 pub struct InMemoryKey(pub [u8; 32]);
 
 impl MasterKeySource for InMemoryKey {
