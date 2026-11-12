@@ -23,10 +23,30 @@ const MAX_KEYS: &str = "1000";
 /// 用户只看得见「备份一直在转」。
 const MAX_PAGES: usize = 64;
 
-#[derive(Debug, Clone)]
+/// LIST 单页响应正文上限。恶意/出错的服务端可以回任意大的页,不设上限就是
+/// 内存炸弹(ureq 默认 10MB 也不是调用方的决定)。
+const MAX_LIST_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 跨页累计键数上限。同样防失控:每页都在上限内也能靠页数堆出大内存。
+const MAX_LIST_KEYS: usize = 100_000;
+
+/// 错误响应正文最多读这么多(只用于诊断,随后还会被截成 400 字符)。
+const MAX_ERR_BODY_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone)]
 pub struct Credentials {
     pub access_key_id: String,
     pub secret_access_key: String,
+}
+
+// 手写 Debug:SK 绝不进日志/panic 信息。
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
 }
 
 pub struct S3Client {
@@ -67,7 +87,7 @@ impl S3Client {
             .max_redirects(0);
         if let Some(p) = socks5 {
             let proxy = ureq::Proxy::new(&format!("socks5://{p}"))
-                .map_err(|e| CloudError::Config(format!("SOCKS5 代理地址解析失败:{p:?}:{e}")))?;
+                .map_err(|_| CloudError::Config("SOCKS5 代理地址解析失败".into()))?;
             b = b.proxy(Some(proxy));
         }
         Ok(Self {
@@ -82,6 +102,7 @@ impl S3Client {
     ///
     /// `amz_date` 由调用方注入(本 crate 不持时钟,同 `mullion-store` 的姿态:
     /// 持了时钟就没法写确定性测试)。
+    #[cfg(feature = "write")]
     pub fn put_no_overwrite(
         &self,
         key: &str,
@@ -163,6 +184,65 @@ impl S3Client {
         Err(status_err(code, resp))
     }
 
+    /// F346-b:取一个对象的全部字节。**只读**,不在 `write` feature 后面。
+    ///
+    /// `max_bytes` 是硬上限:超过即 `TooLarge`,不会把整份读进内存。ureq 的
+    /// `read_to_vec()` 不带 `.limit()` 时默认 10 MB 上限 —— 必须显式给,否则
+    /// 上限由库的默认值决定,而不是调用方。
+    pub fn get(&self, key: &str, amz_date: &str, max_bytes: u64) -> Result<Vec<u8>, CloudError> {
+        let t = self.endpoint.target(key);
+        let payload = sha256_hex(b"");
+        let auth = sigv4::authorization(
+            &sigv4::Request {
+                method: "GET",
+                host: &t.host,
+                path: &t.path,
+                query: "",
+                payload_sha256: &payload,
+                amz_date,
+                extra_headers: &[],
+            },
+            &self.creds.access_key_id,
+            &self.creds.secret_access_key,
+            &self.region,
+            "s3",
+        );
+        let mut resp = self
+            .agent
+            .get(&t.url)
+            .header("authorization", &auth)
+            .header("x-amz-date", amz_date)
+            .header("x-amz-content-sha256", &payload)
+            .call()
+            .map_err(transport)?;
+        let code = resp.status().as_u16();
+        if (300..400).contains(&code) {
+            return Err(redirect_err(code, &resp));
+        }
+        if !(200..300).contains(&code) {
+            return Err(status_err(code, resp));
+        }
+        // ureq 的 LimitReader 在额度用尽后**再被读一次**就报超限(哪怕下一次读到的
+        // 是 EOF),所以 `.limit(max_bytes)` 会把「恰好等于上限」的对象也拒掉。
+        // 多放 1 字节额度,读完再自己比长度:内存上界仍是 max_bytes + 1。
+        let v = match resp
+            .body_mut()
+            .with_config()
+            .limit(max_bytes.saturating_add(1))
+            .read_to_vec()
+        {
+            Ok(v) => v,
+            Err(ureq::Error::BodyExceedsLimit(_)) => {
+                return Err(CloudError::TooLarge { limit: max_bytes });
+            }
+            Err(e) => return Err(transport(e)),
+        };
+        if v.len() as u64 > max_bytes {
+            return Err(CloudError::TooLarge { limit: max_bytes });
+        }
+        Ok(v)
+    }
+
     /// 列出 `prefix` 下的全部键(跟完续页令牌)。
     pub fn list_keys(&self, prefix: &str, amz_date: &str) -> Result<Vec<String>, CloudError> {
         let mut out = Vec::new();
@@ -210,8 +290,13 @@ impl S3Client {
             if !(200..300).contains(&code) {
                 return Err(status_err(code, resp));
             }
-            let text = body_text(resp);
+            let text = read_limited(resp, MAX_LIST_PAGE_BYTES)?;
             let page = xml::parse_list(&text)?;
+            if out.len().saturating_add(page.keys.len()) > MAX_LIST_KEYS {
+                return Err(CloudError::TooManyKeys {
+                    limit: MAX_LIST_KEYS,
+                });
+            }
             out.extend(page.keys);
             match page.next_token {
                 Some(t) => token = Some(t),
@@ -228,8 +313,31 @@ fn transport(e: ureq::Error) -> CloudError {
     CloudError::Transport(e.to_string())
 }
 
-fn body_text(mut resp: ureq::http::Response<ureq::Body>) -> String {
-    resp.body_mut().read_to_string().unwrap_or_default()
+/// 读正文,最多 `max` 字节,超限报 `TooLarge`。做法同 `get`:多放 1 字节额度
+/// 再比长度(ureq 的 LimitReader 恰好用尽后再读一次会报 BodyExceedsLimit)。
+fn read_limited(
+    mut resp: ureq::http::Response<ureq::Body>,
+    max: u64,
+) -> Result<String, CloudError> {
+    let v = match resp
+        .body_mut()
+        .with_config()
+        .limit(max.saturating_add(1))
+        .read_to_vec()
+    {
+        Ok(v) => v,
+        Err(ureq::Error::BodyExceedsLimit(_)) => return Err(CloudError::TooLarge { limit: max }),
+        Err(e) => return Err(transport(e)),
+    };
+    if v.len() as u64 > max {
+        return Err(CloudError::TooLarge { limit: max });
+    }
+    Ok(String::from_utf8_lossy(&v).into_owned())
+}
+
+/// 错误页正文:仅供诊断,超限/读失败都当空串(不让错误路径再出新错误)。
+fn body_text(resp: ureq::http::Response<ureq::Body>) -> String {
+    read_limited(resp, MAX_ERR_BODY_BYTES).unwrap_or_default()
 }
 
 fn status_err(code: u16, resp: ureq::http::Response<ureq::Body>) -> CloudError {

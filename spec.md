@@ -576,7 +576,7 @@ UI 不出——每条隧道启动都是一次完整建链，可能要 TOFU/密�
 | F344 | 项目判据下沉 `mullion-store`(搜索匹配、列表筛选排序、候选节点顺序、相对时间等),**只搬不改** | 零期 | 原测试随函数搬家且全绿;桌面单独发补丁版实机确认项目列表/搜索/打开无回归。**已实现(v0.1.142)**:`search` / `localtime::relative` / `project_view` 三模块下沉,app 原路径 `pub use` 转出;测试名多重集合(3667 条)与搬前逐字相同 |
 | F345 | `mullion-ffi` 骨架 + Android 工具链 + 模拟器跑通最小终端;同提交改 `CLAUDE.md` 架构不变量 | 零期 | 模拟器上连真机 shell 能看到提示符 **已实现(F345 切片)**:mullion-ffi(uniffi 0.32)骨架;store 在 Android 上去掉 keyring;模拟器端到端(绑定层 + UI 层插桩测试,对宿主机 echo sshd)通过;连真机 shell 待人工确认 |
 | F346-a | 导入 `.mullionpack`:只裁密文(项目节点 + 跳板链 + 引用的 `cred:`),元数据整份;Keystore 信封重封;ffi 不导出任何写出能力 | 一期 | 「只导项目可达凭据」「不回写」各有单测;设计见 `docs/superpowers/specs/2026-11-12-f346a-pack-import-design.md`。 **已实现(F346-a 切片)**:store `phone_import` 内存裁剪 + 暂存整份替换;ffi 导出 `inspect_pack`/`import_pack`,结构性守护不依赖 cloud;Keystore 信封;模拟器端到端导入演示包通过。真机 SAF 选文件 + 真实桌面包导入待人工确认 |
-| F346-b | 云端拉包:cloud crate 补 GET、手机录云配置、备份口令解外层;手机只读不回写 | 一期 | 「不回写」单测 |
+| F346-b | 云端拉包:cloud crate 补 GET、手机录云配置、备份口令解外层;手机只读不回写 | 一期 | 「不回写」单测;设计见 `docs/superpowers/specs/2026-11-12-f346b-cloud-pull-design.md`。 **已实现(F346-b 切片)**:cloud `write` feature 门(ffi 以 `default-features = false` 依赖,写路径不编进手机,守护 `dependency_direction.rs`);GET 带 16MiB 上限;手机手填云配置(Endpoint/Region/Bucket/AK/SK/备份口令必填),SK 与口令用 Keystore 数据密钥封存、不回显;手动「从云端更新」取最新对象 → 解外层 → 走 F346-a 导入;服务端正文不透传,只认 `<Code>`;Keystore 重置一并清云配置;模拟器对宿主机假 S3 端到端通过;LIST 单页 2MiB、累计 10 万键上限;http 明文给警告;回滚检测(只暴露旧序号)未做,成功文案显示对象名供人工核对。真实 bucket、手机时钟偏差、SOCKS5 链路、慢链路 60s 超时待人工确认 |
 | F347 | 凭据门控:生物识别/锁屏凭据,冷启动或空闲 ≥5 分钟后重验 | 一期 | 超时计时纯逻辑单测;真机人工验 |
 | F348 | 项目列表:搜索 / 最后打开时间 / 在用 + 搜索穿透归档 / 备忘只读;无指示灯 | 一期 | 与桌面调用同一份 store 函数(源码守护) |
 | F349 | 打开项目:F304 直连优先 + 强制 tmux + 目录;attach **不带 `-d`**;一次只开一个 | 一期 | T11/F304 守护测试在 ffi 侧照搬 |

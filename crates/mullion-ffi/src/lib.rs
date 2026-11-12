@@ -6,12 +6,16 @@
 
 uniffi::setup_scaffolding!();
 
+mod cloud;
 mod error;
 mod import;
 mod runtime;
 mod screen;
 mod terminal;
 
+pub use cloud::{
+    load_cloud_form, pull_latest, reset_cloud_config, save_cloud_form, CloudForm, PullSummary,
+};
 pub use error::FfiError;
 pub use import::{import_pack, inspect_pack, ImportSummary, PackInfo};
 pub use screen::ScreenText;

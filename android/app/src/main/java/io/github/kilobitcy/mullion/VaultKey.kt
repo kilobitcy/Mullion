@@ -27,6 +27,7 @@ object VaultKey {
     const val ALIAS = "mullion-vault-wrap-v1"
     const val KEY_FILE = "vault-key.bin"
     const val VAULT_DIR = "vault"
+    const val CLOUD_DIR = "cloud"
     private const val VERSION: Byte = 1
     private const val IV_LEN = 12
     private const val TAG_BITS = 128
@@ -35,6 +36,9 @@ object VaultKey {
     class Loaded(val dataKey: ByteArray, val reset: Boolean)
 
     fun vaultDir(ctx: Context) = File(ctx.filesDir, VAULT_DIR)
+
+    /** F346-b:云配置在 vault/ 之外(设计 D5),但 SK/口令用同一把数据密钥封,钥没了一起清。 */
+    fun cloudDir(ctx: Context) = File(ctx.filesDir, CLOUD_DIR)
 
     /** 确认永久失效(密钥再也解不开这份数据):alias 不在、文件版本/长度不对、解出长度不对。 */
     class PermanentLoss(msg: String) : Exception(msg)
@@ -63,6 +67,7 @@ object VaultKey {
         val reset = file.exists()
         file.delete()
         vaultDir(ctx).deleteRecursively()
+        cloudDir(ctx).deleteRecursively() // 云配置的密文也解不开了,一起清
         if (reset) keyStore().deleteEntry(ALIAS)
 
         val key = ByteArray(32).also { SecureRandom().nextBytes(it) }

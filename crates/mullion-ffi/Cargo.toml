@@ -26,9 +26,12 @@ uniffi.workspace = true
 mullion-term = { path = "../mullion-term" }
 mullion-ssh = { path = "../mullion-ssh" }
 tokio.workspace = true
-# F346-a:导入判据在 store。**不得依赖 mullion-cloud** —— 那是「不回写」的
-# 结构性判据(设计 D5,守护在 tests/dependency_direction.rs)。
+# F346-a:导入判据在 store。
 mullion-store = { path = "../mullion-store" }
+# F346-b:只读依赖云。**必须 `default-features = false`**:写能力(PUT)在
+# mullion-cloud 的 `write` feature 后面,不开它手机产物里就没有写云端代码 ——
+# 「不回写」的结构性判据(设计 D4,守护在 tests/dependency_direction.rs)。
+mullion-cloud = { path = "../mullion-cloud", default-features = false }
 
 [dev-dependencies]
 russh.workspace = true

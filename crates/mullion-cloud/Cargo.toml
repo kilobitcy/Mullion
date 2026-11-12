@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# F346-b:写能力(PUT)关在 `write` 后面。桌面默认带上;手机端(mullion-ffi)以
+# `default-features = false` 依赖,手机产物里就没有任何写云端的代码 ——「不回写」
+# 的结构性判据(设计 D4)。注意 resolver 2 下 `--workspace` 会被 app 统一成开着,
+# 所以守护在 `mullion-ffi/tests/dependency_direction.rs` 按 `-p mullion-ffi` 单独解析。
+# `CloudError` 里只在写路径产生的变体(AlreadyExists / IfNoneMatchRejected)**不门**,
+# 保持 enum 两种配置下同形,下游 match 不必写 cfg。
+[features]
+default = ["write"]
+write = []
+
 # 架构不变量:cloud 只认字节与键名,不认识 Pack/Session/UI,零 async。不得引 mullion-*。
 [dependencies]
 # ⚠️ TLS provider 必须显式钉死(设计 D4)。ureq 3 今天默认 rustls+ring,但官方

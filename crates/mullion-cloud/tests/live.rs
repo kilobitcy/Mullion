@@ -20,6 +20,8 @@
 //! 它同时是 SigV4 的签名时间和对象 key 的一部分,复用同一个 stamp 重跑会
 //! 让第一个 PUT 因为 key 已存在而被拒。
 
+#![cfg(feature = "write")]
+
 use mullion_cloud::s3::{Credentials, S3Client};
 use mullion_cloud::url::Endpoint;
 

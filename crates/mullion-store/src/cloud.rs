@@ -57,6 +57,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
+use crate::master_key::MasterKeySource;
 
 /// 对象键的默认前缀。
 pub const DEFAULT_PREFIX: &str = "mullion/";
@@ -328,6 +329,98 @@ pub fn next_seq(prefix: &str, keys: &[String]) -> u64 {
         .filter_map(|k| parse_seq(prefix, k))
         .max()
         .map_or(1, |m| m + 1)
+}
+
+/// F346-b:「最新那份」的键 = 认得出的键里序号最大的那条(与 [`next_seq`] 同口径)。
+/// 一条都认不出 → `None`(空桶,或前缀填错,由调用方按列表是否为空分开报)。
+pub fn latest_key(prefix: &str, keys: &[String]) -> Option<String> {
+    keys.iter()
+        .filter_map(|k| parse_seq(prefix, k).map(|s| (s, k)))
+        .max_by_key(|(s, _)| *s)
+        .map(|(_, k)| k.clone())
+}
+
+/// F346-b:`cloud.toml` 存在但读不懂(非 UTF-8 / toml 解析失败)。缺文件不算。
+///
+/// [`load`] 对这两种情况都给默认值、把标记藏在私有字段里 —— 桌面靠 `save`
+/// 拒写就够了,但手机界面要**事先**区分「损坏」与「没填」(设计 R1)。
+pub fn is_corrupt(dir: &Path) -> bool {
+    let path = dir.join(CLOUD_FILE);
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str::<CloudConfig>(&text).is_err(),
+        Err(_) => true,
+    }
+}
+
+/// F346-b:用 `key_source` 的密钥封一段本机字节,**不需要打开 `Vault`**。
+///
+/// 与 [`crate::vault::Vault::seal_local`] 在 Keyring 方案下字节同构(有测试钉住)。
+/// 手机端要用它:`vault/` 坏了时拉取是唯一的自愈手段,解 SK 不能先要求库是好的(设计 D3)。
+/// 同 `seal_local` 的红线:产出**不许**进任何离开本机的东西。
+fn seal_with(key_source: &dyn MasterKeySource, plain: &[u8]) -> Result<Vec<u8>, StoreError> {
+    let payload = crate::crypto::encrypt(&key_source.load_or_create()?, plain)?;
+    Ok(crate::secrets_file::encode(
+        &crate::secrets_file::Scheme::Keyring,
+        &payload,
+    ))
+}
+
+fn open_with(
+    key_source: &dyn MasterKeySource,
+    sealed_b64: &str,
+    what: &str,
+) -> Result<String, StoreError> {
+    if sealed_b64.is_empty() {
+        return Ok(String::new());
+    }
+    let blob = b64().decode(sealed_b64).map_err(|e| {
+        StoreError::CorruptSecrets(format!("cloud.toml 的{what}密文不是合法 base64:{e}"))
+    })?;
+    let (_, payload) = crate::secrets_file::parse(&blob)?;
+    let plain = crate::crypto::decrypt(&key_source.load_or_create()?, payload)?;
+    String::from_utf8(plain).map_err(StoreError::from)
+}
+
+/// [`set_secret_key`] 的免 `Vault` 版(F346-b)。
+pub fn set_secret_key_with(
+    cfg: &mut CloudConfig,
+    key_source: &dyn MasterKeySource,
+    sk: &str,
+) -> Result<(), StoreError> {
+    cfg.secret_sealed = b64().encode(seal_with(key_source, sk.as_bytes())?);
+    Ok(())
+}
+
+/// [`secret_key`] 的免 `Vault` 版(F346-b)。空 = 没填过。
+pub fn secret_key_with(
+    cfg: &CloudConfig,
+    key_source: &dyn MasterKeySource,
+) -> Result<String, StoreError> {
+    open_with(key_source, &cfg.secret_sealed, "")
+}
+
+/// [`set_passphrase`] 的免 `Vault` 版(F346-b)。空口令拒绝,理由同原版。
+pub fn set_passphrase_with(
+    cfg: &mut CloudConfig,
+    key_source: &dyn MasterKeySource,
+    pass: &str,
+) -> Result<(), StoreError> {
+    if pass.is_empty() {
+        return Err(StoreError::Kdf("备份口令不能为空".into()));
+    }
+    cfg.passphrase_sealed = b64().encode(seal_with(key_source, pass.as_bytes())?);
+    Ok(())
+}
+
+/// [`passphrase`] 的免 `Vault` 版(F346-b)。空 = 没设过。
+pub fn passphrase_with(
+    cfg: &CloudConfig,
+    key_source: &dyn MasterKeySource,
+) -> Result<String, StoreError> {
+    open_with(key_source, &cfg.passphrase_sealed, "口令")
 }
 
 /// 这一轮该不该推。**纯函数** —— 时钟由调用方折算成
@@ -1243,5 +1336,84 @@ mod tests {
             }
             assert!(!should_upload(&c, "fp", 999), "{spoil} 为空时不该推");
         }
+    }
+
+    #[test]
+    fn latest_key_is_the_highest_sequence_not_the_last_listed() {
+        let keys: Vec<String> = [
+            "mullion/000002-b.mpk",
+            "mullion/000010-c.mpk",
+            "mullion/000009-z.mpk",
+            "mullion/notes.txt",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            latest_key("mullion/", &keys).as_deref(),
+            Some("mullion/000010-c.mpk")
+        );
+    }
+
+    #[test]
+    fn latest_key_ignores_foreign_keys_and_is_none_when_nothing_matches() {
+        assert_eq!(latest_key("mullion/", &[]), None);
+        let foreign = vec![
+            "mullion/readme.md".to_string(),
+            "other/000001-a.mpk".to_string(),
+        ];
+        assert_eq!(latest_key("mullion/", &foreign), None);
+        // 前缀少了结尾斜杠:剩下的那截带 `/`,一个都认不出(设计 §5 的「检查前缀」那条)
+        assert_eq!(
+            latest_key("mullion", &["mullion/000001-a.mpk".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn is_corrupt_only_for_a_file_that_exists_and_does_not_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_corrupt(tmp.path()), "缺文件不算损坏");
+        std::fs::write(tmp.path().join(CLOUD_FILE), "endpoint = \"https://x\"\n").unwrap();
+        assert!(!is_corrupt(tmp.path()));
+        std::fs::write(tmp.path().join(CLOUD_FILE), "endpoint = [不是 toml").unwrap();
+        assert!(is_corrupt(tmp.path()));
+        std::fs::write(tmp.path().join(CLOUD_FILE), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(is_corrupt(tmp.path()), "读不成 UTF-8 也算损坏");
+    }
+
+    #[test]
+    fn sealing_with_a_key_source_round_trips_without_a_vault() {
+        let key = crate::master_key::InMemoryKey([9; 32]);
+        let mut cfg = CloudConfig::default();
+        set_secret_key_with(&mut cfg, &key, "SK-123").unwrap();
+        set_passphrase_with(&mut cfg, &key, "pass-456").unwrap();
+        assert_eq!(secret_key_with(&cfg, &key).unwrap(), "SK-123");
+        assert_eq!(passphrase_with(&cfg, &key).unwrap(), "pass-456");
+        assert!(
+            set_passphrase_with(&mut cfg, &key, "").is_err(),
+            "空口令不算口令"
+        );
+        let empty = CloudConfig::default();
+        assert_eq!(secret_key_with(&empty, &key).unwrap(), "");
+        assert_eq!(passphrase_with(&empty, &key).unwrap(), "");
+        let other = crate::master_key::InMemoryKey([1; 32]);
+        assert!(secret_key_with(&cfg, &other).is_err());
+    }
+
+    /// `*_with` 与 `Vault::seal_local` 必须互通(同一把钥,两个方向):
+    /// 手机今天只用前者,但两者字节同构是设计 D3 的前提,漂了就是两套格式。
+    #[test]
+    fn sealing_with_a_key_source_interoperates_with_vault_seal_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = crate::master_key::InMemoryKey([9; 32]);
+        let vault = crate::vault::Vault::open(tmp.path().to_path_buf(), &key).unwrap();
+
+        let mut a = CloudConfig::default();
+        set_secret_key(&mut a, &vault, "via-vault").unwrap();
+        assert_eq!(secret_key_with(&a, &key).unwrap(), "via-vault");
+
+        let mut b = CloudConfig::default();
+        set_secret_key_with(&mut b, &key, "via-key").unwrap();
+        assert_eq!(secret_key(&b, &vault).unwrap(), "via-key");
     }
 }

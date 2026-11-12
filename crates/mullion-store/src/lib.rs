@@ -69,7 +69,8 @@ pub use model::{
 };
 pub use network::{JumpRef, NetworkPrefs, ProxyChoice, ProxyEndpoint};
 pub use phone_import::{
-    install_projects_only, project_reachable_secret_keys, PhoneImport, Reachable, STAGING_DIR,
+    install_projects_only, open_cloud_object, project_reachable_secret_keys, PhoneImport,
+    Reachable, STAGING_DIR,
 };
 pub use portable::{
     collect as collect_portable, install as install_pack, open_secrets, read_pack,

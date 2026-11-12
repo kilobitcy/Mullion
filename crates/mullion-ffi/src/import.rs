@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use mullion_store::{install_projects_only, read_pack, InMemoryKey};
+use mullion_store::{install_projects_only, read_pack, InMemoryKey, PhoneImport};
 
 use crate::error::FfiError;
 
@@ -22,6 +22,18 @@ pub struct ImportSummary {
     pub dropped: u32,
     pub broken_nodes: u32,
     pub unrecognized: u32,
+}
+
+impl From<PhoneImport> for ImportSummary {
+    fn from(r: PhoneImport) -> Self {
+        Self {
+            projects: r.projects,
+            kept: r.kept,
+            dropped: r.dropped,
+            broken_nodes: r.broken_nodes,
+            unrecognized: r.unrecognized,
+        }
+    }
 }
 
 /// 只读:解析包头,不碰任何文件。
@@ -47,11 +59,5 @@ pub fn import_pack(
         .try_into()
         .map_err(|_| FfiError::Internal(format!("数据密钥应为 32 字节,实为 {}", data_key.len())))?;
     let r = install_projects_only(Path::new(&dir), &pack_text, &password, &InMemoryKey(key))?;
-    Ok(ImportSummary {
-        projects: r.projects,
-        kept: r.kept,
-        dropped: r.dropped,
-        broken_nodes: r.broken_nodes,
-        unrecognized: r.unrecognized,
-    })
+    Ok(r.into())
 }

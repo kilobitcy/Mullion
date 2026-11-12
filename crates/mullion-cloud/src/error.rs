@@ -34,6 +34,11 @@ pub enum CloudError {
     Malformed(String),
     /// 配置本身不合法(endpoint 为空、bucket 名非法…),还没发请求就停住。
     Config(String),
+    /// F346-b:GET 的响应正文超过调用方给的上限。**单独一档**:手机端要据此报
+    /// 「云端对象过大」,而不是一条看不懂的网络错误。
+    TooLarge { limit: u64 },
+    /// LIST 跨页累计键数超过上限(防失控的服务端把内存撑爆)。
+    TooManyKeys { limit: usize },
 }
 
 impl fmt::Display for CloudError {
@@ -45,6 +50,8 @@ impl fmt::Display for CloudError {
             CloudError::Transport(e) => write!(f, "网络错误:{e}"),
             CloudError::Malformed(e) => write!(f, "响应解析失败:{e}"),
             CloudError::Config(e) => write!(f, "配置不合法:{e}"),
+            CloudError::TooLarge { limit } => write!(f, "对象超过 {limit} 字节上限"),
+            CloudError::TooManyKeys { limit } => write!(f, "对象数量超过 {limit} 个上限"),
         }
     }
 }

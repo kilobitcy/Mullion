@@ -19,7 +19,8 @@ object PackImport {
         return head + summaryText(summary)
     }
 
-    private const val RESET_NOTE = "本机密钥已失效,旧数据已清空。\n"
+    /** 导入与云拉取两条路径共用:VaultKey.load 重置会清 vault 与 cloud 两处。 */
+    const val RESET_NOTE = "本机密钥已失效,旧数据与云配置已清空,请重新导入或重新填写云配置。\n"
 
     /** 密钥重建(旧数据已清)之后导入又失败。[cause] 是真正的失败原因。 */
     class FailedAfterReset(cause: Exception) : Exception(cause.message, cause)

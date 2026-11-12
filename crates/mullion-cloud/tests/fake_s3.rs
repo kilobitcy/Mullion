@@ -22,8 +22,11 @@ struct Seen {
     method: String,
     path: String,
     authorization: String,
+    #[cfg(feature = "write")]
     body: Vec<u8>,
+    #[cfg(feature = "write")]
     forbid_overwrite: Option<String>,
+    #[cfg(feature = "write")]
     if_none_match: Option<String>,
 }
 
@@ -71,7 +74,9 @@ fn read_request(s: &mut TcpStream) -> Option<Seen> {
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let mut authorization = String::new();
+    #[cfg(feature = "write")]
     let mut forbid_overwrite = None;
+    #[cfg(feature = "write")]
     let mut if_none_match = None;
     let mut len = 0usize;
     loop {
@@ -83,9 +88,11 @@ fn read_request(s: &mut TcpStream) -> Option<Seen> {
         if let Some(v) = lower.strip_prefix("authorization:") {
             authorization = v.trim().to_string();
         }
+        #[cfg(feature = "write")]
         if let Some(v) = lower.strip_prefix("x-oss-forbid-overwrite:") {
             forbid_overwrite = Some(v.trim().to_string());
         }
+        #[cfg(feature = "write")]
         if let Some(v) = lower.strip_prefix("if-none-match:") {
             if_none_match = Some(v.trim().to_string());
         }
@@ -101,8 +108,11 @@ fn read_request(s: &mut TcpStream) -> Option<Seen> {
         method,
         path,
         authorization,
+        #[cfg(feature = "write")]
         body,
+        #[cfg(feature = "write")]
         forbid_overwrite,
+        #[cfg(feature = "write")]
         if_none_match,
     })
 }
@@ -126,6 +136,7 @@ fn client(port: u16) -> S3Client {
     .expect("建客户端")
 }
 
+#[cfg(feature = "write")]
 #[test]
 fn a_put_sends_the_bytes_and_signs_the_request() {
     let (port, rx) = serve(vec![(200, String::new())]);
@@ -147,6 +158,7 @@ fn a_put_sends_the_bytes_and_signs_the_request() {
 /// **不带 ForbidOverwrite 的 PUT 会静默覆盖别的机器刚推上去的那一份。**
 /// 而追加式序号布局的全部安全性就建立在这个头上(设计 D8:OSS 没有
 /// PUT If-Match,这是唯一能用的并发保护)。
+#[cfg(feature = "write")]
 #[test]
 fn a_put_always_asks_the_server_to_refuse_overwriting() {
     let (port, rx) = serve(vec![(200, String::new())]);
@@ -169,6 +181,7 @@ fn a_put_always_asks_the_server_to_refuse_overwriting() {
 
 /// 409 必须被认成 `AlreadyExists`,而不是一条普通的 `Status`。
 /// 调用方要靠这个分辨「换个序号重试」和「报失败给用户」。
+#[cfg(feature = "write")]
 #[test]
 fn a_409_becomes_already_exists_not_a_generic_status_error() {
     let (port, _rx) = serve(vec![(
@@ -187,6 +200,7 @@ fn a_409_becomes_already_exists_not_a_generic_status_error() {
 /// 非 2xx 的响应正文必须带进错误里:对象存储的真实原因全在正文的
 /// `<Code>` 里(SignatureDoesNotMatch / AccessDenied / NoSuchBucket),
 /// 只报状态码等于把唯一有用的信息扔了。
+#[cfg(feature = "write")]
 #[test]
 fn an_error_response_carries_the_server_message() {
     let (port, _rx) = serve(vec![(
@@ -239,11 +253,81 @@ fn listing_follows_the_continuation_token_until_it_is_gone() {
     );
 }
 
+/// 安全 M1:单页正文超过 2MiB 被拒,不会整份读进内存。
+#[test]
+fn a_list_page_over_two_mib_is_refused() {
+    let page = format!(
+        "<ListBucketResult>{}</ListBucketResult>",
+        " ".repeat(2 * 1024 * 1024 + 1)
+    );
+    let (port, _rx) = serve(vec![(200, page)]);
+    let r = client(port).list_keys("mullion/", "20260915T101500Z");
+    assert!(
+        matches!(r, Err(CloudError::TooLarge { limit }) if limit == 2 * 1024 * 1024),
+        "{r:?}"
+    );
+}
+
+/// 安全 M1:每页都在 2MiB 内,但跨页累计超过 10 万键也被拒。
+/// 两页各 6 万键(每个 `<Contents>` 34 字节,约 2.04MB < 2MiB),共 12 万 > 10 万。
+#[test]
+fn a_list_over_one_hundred_thousand_keys_is_refused() {
+    let contents = "<Contents><Key>k</Key></Contents>".repeat(60_000);
+    let page1 = format!(
+        "<ListBucketResult><IsTruncated>true</IsTruncated>\
+         <NextContinuationToken>t2</NextContinuationToken>{contents}</ListBucketResult>"
+    );
+    let page2 =
+        format!("<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>");
+    let (port, _rx) = serve(vec![(200, page1), (200, page2)]);
+    let r = client(port).list_keys("mullion/", "20260915T101500Z");
+    assert!(
+        matches!(r, Err(CloudError::TooManyKeys { limit: 100_000 })),
+        "{r:?}"
+    );
+}
+
+/// 安全 L3:Credentials 的 Debug 不含 AK/SK。
+#[test]
+fn credentials_debug_hides_the_keys() {
+    let c = Credentials {
+        access_key_id: "AK-MARK".into(),
+        secret_access_key: "SK-MARK".into(),
+    };
+    let shown = format!("{c:?}");
+    assert!(
+        !shown.contains("AK-MARK") && !shown.contains("SK-MARK"),
+        "{shown}"
+    );
+}
+
+/// 代理串解析失败的报错不回显原串(可能带凭据)。
+#[test]
+fn a_bad_proxy_error_does_not_echo_the_proxy_string() {
+    match S3Client::new(
+        Endpoint {
+            base: "http://127.0.0.1:1".into(),
+            bucket: "b".into(),
+            path_style: true,
+        },
+        Credentials {
+            access_key_id: "AK".into(),
+            secret_access_key: "SK".into(),
+        },
+        "r".into(),
+        Some("pw-MARK not a proxy"),
+    ) {
+        Ok(_) => panic!("应报错"),
+        Err(e) => assert!(!e.to_string().contains("pw-MARK"), "{e}"),
+    }
+}
+
 /// PUT 碰到 301 必须报错,**不能被 ureq 悄悄降级成的匿名 GET 骗过**。
 /// ureq 默认跟随重定向时,非 GET/HEAD 方法在 301/302/303 上会被改写成
 /// GET、丢弃 body、丢弃 Authorization——那次 GET 若恰好拿到 2xx,我们
 /// 只看状态码的话就会把它当成写入成功,而对象存储上其实什么都没多。
 /// 错误信息里必须带得上 Location,不然用户不知道该往哪改配置。
+#[cfg(feature = "write")]
 #[test]
 fn a_put_that_gets_redirected_is_reported_not_silently_turned_into_a_get() {
     let (port, _rx) = serve(vec![(301, String::new())]);
@@ -275,6 +359,7 @@ fn a_list_that_gets_redirected_is_reported_not_partially_returned() {
 
 /// F282:OSS 风格的 400 NotImplemented 必须被识别成专用错误,
 /// 混进 `Status` 的话 app 侧没法决定降级重试。
+#[cfg(feature = "write")]
 #[test]
 fn an_oss_style_rejection_of_if_none_match_is_its_own_error() {
     let (port, _rx) = serve(vec![(
@@ -297,6 +382,7 @@ fn an_oss_style_rejection_of_if_none_match_is_its_own_error() {
 /// F282:开关拧上之后,请求里不许再出现 `if-none-match` 头,SignedHeaders 里
 /// 也不许有它(头不发签名却签了,OSS 回 `SignatureDoesNotMatch`,比缺头还
 /// 隐蔽);`x-oss-forbid-overwrite` 必须还在 —— 防覆盖不缩水。
+#[cfg(feature = "write")]
 #[test]
 fn the_skip_flag_drops_the_header_but_keeps_the_oss_one() {
     let (port, rx) = serve(vec![(200, String::new())]);
@@ -347,4 +433,86 @@ fn a_bad_proxy_string_is_reported_instead_of_silently_falling_back_to_a_direct_c
         Ok(_) => panic!("代理串解析不了应该报错,不该悄悄退化成直连"),
         Err(e) => assert!(matches!(e, CloudError::Config(_)), "拿到 {e:?}"),
     }
+}
+
+/// F346-b:GET 原样取回对象字节,签名与路径同 PUT 一套。
+#[test]
+fn a_get_returns_the_object_bytes_and_signs_the_request() {
+    let (port, rx) = serve(vec![(200, "payload-bytes".into())]);
+    let got = client(port)
+        .get("mullion/000001-x.mpk", "20260915T101500Z", 1024)
+        .expect("GET 应该成功");
+    assert_eq!(got, b"payload-bytes");
+    let seen = rx.recv().expect("服务端没收到请求");
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.path, "/b/mullion/000001-x.mpk");
+    assert!(
+        seen.authorization
+            .starts_with("aws4-hmac-sha256 credential=ak/20260915/cn-hangzhou/s3/"),
+        "Authorization 头不对:{}",
+        seen.authorization
+    );
+}
+
+/// 上限是硬的:恶意/错配的桶回一个巨大对象,不许整个读进手机内存。
+#[test]
+fn a_get_larger_than_the_limit_is_refused() {
+    let (port, _rx) = serve(vec![(200, "x".repeat(11))]);
+    let e = client(port)
+        .get("k", "20260915T101500Z", 10)
+        .expect_err("超过上限应该报错");
+    assert!(
+        matches!(e, CloudError::TooLarge { limit: 10 }),
+        "拿到 {e:?}"
+    );
+}
+
+/// 恰好等于上限的不算超。
+#[test]
+fn a_get_exactly_at_the_limit_is_accepted() {
+    let (port, _rx) = serve(vec![(200, "x".repeat(10))]);
+    let got = client(port)
+        .get("k", "20260915T101500Z", 10)
+        .expect("等于上限应成功");
+    assert_eq!(got.len(), 10);
+}
+
+/// 404/403 落到 `Status`,正文带着 `<Code>` —— ffi 靠它分「被清理了」与「AK/SK 不对」。
+#[test]
+fn a_get_error_carries_the_status_and_the_server_code() {
+    for (code, body) in [
+        (404, "<Error><Code>NoSuchKey</Code></Error>"),
+        (403, "<Error><Code>SignatureDoesNotMatch</Code></Error>"),
+    ] {
+        let (port, _rx) = serve(vec![(code, body.into())]);
+        match client(port).get("k", "20260915T101500Z", 1024) {
+            Err(CloudError::Status { code: c, body: b }) => {
+                assert_eq!(c, code);
+                assert!(b.contains("<Code>"), "正文丢了:{b}");
+            }
+            other => panic!("{code}:期望 Status,拿到 {other:?}"),
+        }
+    }
+}
+
+/// GET 碰到 3xx 同样报出 Location,不跟随(签名不会随跳转生效)。
+#[test]
+fn a_get_that_gets_redirected_is_reported() {
+    let (port, _rx) = serve(vec![(301, String::new())]);
+    let e = client(port)
+        .get("k", "20260915T101500Z", 1024)
+        .expect_err("301 应该报错");
+    assert!(matches!(e, CloudError::Config(_)), "拿到 {e:?}");
+}
+
+/// 上限由调用方决定,不是 ureq 的默认值:ureq 不带 `.limit()` 时默认 10 MB 上限,
+/// 手机端实际给 16 MB。10 MB + 1 字节的对象必须能取回 —— 删掉 `.limit(..)` 必红。
+#[test]
+fn a_get_limit_comes_from_the_caller_not_the_ureq_default() {
+    let size = 10 * 1024 * 1024 + 1;
+    let (port, _rx) = serve(vec![(200, "x".repeat(size))]);
+    let got = client(port)
+        .get("k", "20260915T101500Z", 16 * 1024 * 1024)
+        .expect("16 MB 上限下 10 MB + 1 字节应成功");
+    assert_eq!(got.len(), size);
 }

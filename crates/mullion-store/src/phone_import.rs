@@ -111,6 +111,17 @@ pub fn install_projects_only(
     result
 }
 
+/// F346-b:解开云端对象的外层(备份口令),得到 `.mullionpack` 文本,交给
+/// [`install_projects_only`](内层再用同一口令解)。
+///
+/// 云端对象与 SAF 选来的文件同等不可信(设计 D6):外层头里的 Argon2 参数先夹紧再派生。
+pub fn open_cloud_object(blob: &[u8], passphrase: &str) -> Result<String, StoreError> {
+    check_kdf_params(blob)?;
+    let plain = crate::portable::open_secrets(blob, passphrase)?;
+    // 不回显内容:解出来的若是别的东西,里面可能是任何明文。
+    String::from_utf8(plain).map_err(|_| StoreError::CorruptPack("云端对象解开后不是文本".into()))
+}
+
 /// 包头里 Argon2 代价参数的上限。参数由**包自己声明**,恶意包可以写个 4 TiB
 /// 让手机 OOM / 卡死,所以派生之前先夹紧。
 ///
@@ -891,5 +902,39 @@ mod tests {
             return;
         }
         assert!(matches!(r, Err(StoreError::Io(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_cloud_object_opens_back_to_the_pack_text() {
+        let blob = crate::portable::seal_secrets("pack-text-中文".as_bytes(), "pw").unwrap();
+        assert_eq!(open_cloud_object(&blob, "pw").unwrap(), "pack-text-中文");
+    }
+
+    #[test]
+    fn a_cloud_object_with_the_wrong_passphrase_is_wrong_password() {
+        let blob = crate::portable::seal_secrets(b"x", "pw").unwrap();
+        assert!(matches!(
+            open_cloud_object(&blob, "nope"),
+            Err(StoreError::WrongPassword)
+        ));
+    }
+
+    /// 外层头里的 Argon2 参数同样由不可信方声明,派生之前就要拒(同 F346-a 的内层)。
+    #[test]
+    fn a_cloud_object_with_absurd_kdf_params_is_refused_before_deriving() {
+        let blob = blob_with_kdf(MAX_KDF_M_COST_KIB + 1, 1, 1);
+        assert!(matches!(
+            open_cloud_object(&blob, "pw"),
+            Err(StoreError::CorruptPack(_))
+        ));
+    }
+
+    #[test]
+    fn a_cloud_object_that_is_not_text_is_a_corrupt_pack_without_echoing_it() {
+        let blob = crate::portable::seal_secrets(&[0xff, 0xfe, 0xfd], "pw").unwrap();
+        match open_cloud_object(&blob, "pw") {
+            Err(StoreError::CorruptPack(msg)) => assert!(!msg.contains('\u{fffd}'), "{msg}"),
+            other => panic!("期望 CorruptPack,拿到 {other:?}"),
+        }
     }
 }

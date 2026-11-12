@@ -55,17 +55,75 @@ fn app_never_depends_on_ffi() {
     );
 }
 
-/// F346-a 设计 D5:「不回写」的**结构性**判据 —— 不依赖 cloud 就推不了云。
-/// F346-b 引入云拉包时要换判据(只允许 GET),届时改这里。
-#[test]
-fn ffi_never_depends_on_cloud() {
-    let t = tree("mullion-ffi");
+/// `-e features` 下按**单个包**解析 feature。`--workspace` 会把 app 的 `write`
+/// 统一进来,所以这里一定要 `-p`(设计 D4)。
+fn feature_tree(pkg: &str) -> String {
+    let out = Command::new(env!("CARGO"))
+        .args([
+            "tree",
+            "-p",
+            pkg,
+            "-e",
+            "features,normal",
+            "--target",
+            "all",
+            "--prefix",
+            "none",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("cargo tree 应能执行");
     assert!(
-        has(&t, "mullion-store"),
-        "解析失效:ffi 树里找不到 mullion-store\n{t}"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+const CLOUD_WRITE: &str = "mullion-cloud feature \"write\"";
+
+/// F346-b 设计 D4:「不回写」的结构性判据 —— ffi 拿得到 cloud,但拿不到 `write`。
+#[test]
+fn ffi_gets_cloud_without_its_write_feature() {
+    let t = feature_tree("mullion-ffi");
+    assert!(
+        has(&t, "mullion-cloud"),
+        "解析失效:ffi 树里找不到 mullion-cloud\n{t}"
     );
     assert!(
-        !has(&t, "mullion-cloud"),
-        "mullion-ffi 依赖了 mullion-cloud\n{t}"
+        !t.lines().any(|l| l.trim() == CLOUD_WRITE),
+        "mullion-ffi 打开了 mullion-cloud 的 write feature —— 手机端能推云了\n{t}"
+    );
+}
+
+/// 阳性对照:同一个解析在 app 树里**必须**看得见 `write`。否则上一条恒绿。
+#[test]
+fn the_write_feature_is_visible_in_the_app_tree() {
+    let t = feature_tree("mullion-app");
+    assert!(
+        t.lines().any(|l| l.trim() == CLOUD_WRITE),
+        "解析失效:app 树里看不见 {CLOUD_WRITE}\n{t}"
+    );
+}
+
+/// 声明层:ffi 的 cloud 依赖必须写明 `default-features = false`。只靠上面的树判据的话,
+/// 哪天 cloud 的 `default` 不再含 `write`,有人把这行删了也不会红,而再加回来就开了。
+#[test]
+fn ffi_declares_cloud_without_default_features() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let doc: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let dep = doc
+        .get("dependencies")
+        .and_then(|d| d.get("mullion-cloud"))
+        .expect("mullion-ffi 的 Cargo.toml 没有依赖 mullion-cloud");
+    assert_eq!(
+        dep.get("default-features").and_then(|v| v.as_bool()),
+        Some(false),
+        "mullion-ffi 对 mullion-cloud 的依赖没写 default-features = false:{dep:?}"
+    );
+    assert!(
+        dep.get("features").is_none(),
+        "mullion-ffi 对 mullion-cloud 显式开了 features:{dep:?}"
     );
 }

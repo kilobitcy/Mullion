@@ -1,5 +1,6 @@
-//! F346-a 设计 D5:手机端只读,不回写。主判据是结构性的(`dependency_direction.rs`
-//! 里「ffi 不依赖 mullion-cloud」);这里是辅助的源码守护。
+//! F346-a 设计 D5:手机端只读,不回写。主判据是结构性的(ffi 以
+//! `default-features = false` 依赖 mullion-cloud,写路径由 `write` feature 门挡在
+//! 编译期,守护见 `dependency_direction.rs` 三条);这里是辅助的源码守护。
 //!
 //! 注释只剥**整行**的:剥行尾注释会连同一行的代码一起剥掉(剥多 → 假绿)。
 //! 测试模块形如 `#[cfg(test)]\nmod tests { ... }`:只按花括号配平切掉这一块,

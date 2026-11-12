@@ -31,6 +31,7 @@ class PackImportTest {
     fun clean() {
         File(ctx.filesDir, VaultKey.KEY_FILE).delete()
         VaultKey.vaultDir(ctx).deleteRecursively()
+        VaultKey.cloudDir(ctx).deleteRecursively()
     }
 
     @Test
@@ -65,6 +66,8 @@ class PackImportTest {
     @Test
     fun aWrongPasswordAfterAResetStillTellsTheUserTheOldDataIsGone() {
         PackImport.run(ctx, pack, "demo-pack-password")
+        VaultKey.cloudDir(ctx).mkdirs()
+        File(VaultKey.cloudDir(ctx), "marker").writeText("x")
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(VaultKey.ALIAS)
 
         val e = assertThrows(PackImport.FailedAfterReset::class.java) {
@@ -72,9 +75,11 @@ class PackImportTest {
         }
         assertTrue(e.cause is FfiException.WrongPassword)
         val t = PackImport.failureText(e)
-        assertTrue(t, t.contains("旧数据已清空"))
+        assertTrue(t, t.contains("旧数据与云配置已清空"))
+        // 重置同时清掉云配置目录(R5:VaultKey.load 的行为)
+        assertTrue(!VaultKey.cloudDir(ctx).exists())
         // 没 reset 的口令错:提示不带清空说明
-        assertTrue(!PackImport.failureText(FfiException.WrongPassword("口令不对,再输一次")).contains("旧数据已清空"))
+        assertTrue(!PackImport.failureText(FfiException.WrongPassword("口令不对,再输一次")).contains("已清空"))
     }
 
     @Test

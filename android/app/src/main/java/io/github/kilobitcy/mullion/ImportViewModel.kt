@@ -13,6 +13,7 @@ import io.github.kilobitcy.mullion.ffi.inspectPack
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /** F346-a:选文件 →(需要时)口令 → 摘要。项目列表界面是 F348。 */
@@ -25,6 +26,10 @@ class ImportViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     var busy by mutableStateOf(false)
+        private set
+
+    /** 每完成一次导入(成功或失败)加一:MainActivity 据此刷新云表单。 */
+    var finishedCount by mutableStateOf(0)
         private set
 
     fun picked(uri: Uri) = launchBusy {
@@ -58,7 +63,9 @@ class ImportViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun finish(text: String, password: String) {
-        message = withContext(Dispatchers.IO) { PackImport.run(getApplication(), text, password) }
+        message = withContext(Dispatchers.IO) {
+            VaultLock.mutex.withLock { PackImport.run(getApplication(), text, password) }
+        }
         pending = null
     }
 
@@ -77,6 +84,7 @@ class ImportViewModel(app: Application) : AndroidViewModel(app) {
                 message = PackImport.failureText(e)
             } finally {
                 busy = false
+                finishedCount++
             }
         }
     }
