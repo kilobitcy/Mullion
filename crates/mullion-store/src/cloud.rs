@@ -89,13 +89,13 @@ pub struct CloudConfig {
     /// SOCKS5 代理,形如 `127.0.0.1:1080`。空 = 直连。
     ///
     /// **不带 `socks5://` 前缀**:`S3Client::new` 收到的是 `host:port`,
-    /// 自己 `format!("socks5://{p}")` 补前缀(已核实 `mullion-cloud/src/s3.rs:69`)。
-    /// 带着前缀传进去会拼成 `socks5://socks5://…`,`ureq::Proxy::new` 直接报
+    /// 自己补 `socks5h://` 前缀(见 `mullion-cloud/src/s3.rs` 的 `new_with_timeout`)。
+    /// 带着前缀传进去会拼成 `socks5h://socks5://…`,`ureq::Proxy::new` 直接报
     /// `Config` 错。那条错误文案是清楚的,所以不在这里做容错剥前缀 ——
     /// 加一段没有守护测试的容错,比让用户看见一条准确的报错更糟。
     ///
-    /// **这个字段不补的话 `socks5` 参数就是条死线**:`mullion-cloud` 为它
-    /// 开了 ureq 的 `socks-proxy` 特性、`S3Client::new` 专门收了这个参数,
+    /// **这个字段不补的话 `socks5` 参数就是条死线**:`S3Client::new`
+    /// 专门收了这个参数(握手由 `mullion-cloud` 自带的 SOCKS5 连接器完成,F363),
     /// 而设计 D15 把「SOCKS 代理链路通不通」列进了片一的真机验收项 ——
     /// 没有配置入口的话那条永远传 `None`,验收项验的是一条从没走过的路
     /// (本项目登记过同一形状:「量具存在≠接在那条路上」)。

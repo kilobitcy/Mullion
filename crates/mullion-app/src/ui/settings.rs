@@ -942,8 +942,8 @@ fn cloud(
         ui.end_row();
 
         // SOCKS5 代理。**不补这一格的话 `socks5` 参数就是条死线** ——
-        // `mullion-cloud` 为它开了 ureq 的 `socks-proxy` 特性、
-        // `S3Client::new` 专门收了这个参数,而设计 D15 把「SOCKS 代理
+        // `S3Client::new` 专门收了这个参数
+        // (握手由 `mullion-cloud` 自带的 SOCKS5 连接器完成,F363),而设计 D15 把「SOCKS 代理
         // 链路通不通」列进了片一的真机验收项。没有入口就永远传 `None`,
         // 那条验收项验的是一条从没走过的路。
         ui.label("SOCKS5 代理");
@@ -954,7 +954,7 @@ fn cloud(
                     .desired_width(w)
                     // **hint 里写清不带 `socks5://`**:`S3Client::new` 自己
                     // 补前缀,用户照直觉填全 URL 的话会拼成
-                    // `socks5://socks5://…` 而当场报「配置不合法」。
+                    // `socks5h://socks5://…` 而当场报「配置不合法」。
                     .hint_text("127.0.0.1:1080,留空 = 直连"),
             )
             .changed()

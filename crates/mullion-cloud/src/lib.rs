@@ -15,6 +15,7 @@
 pub mod error;
 pub mod s3;
 pub mod sigv4;
+mod socks;
 pub mod url;
 pub mod xml;
 

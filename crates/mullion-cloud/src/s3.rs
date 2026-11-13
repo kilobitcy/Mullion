@@ -7,8 +7,13 @@ use std::time::Duration;
 
 use crate::error::CloudError;
 use crate::sigv4::{self, sha256_hex};
+use crate::socks::Socks5Connector;
 use crate::url::{query_string, Endpoint};
 use crate::xml;
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{
+    ConnectProxyConnector, Connector, RustlsConnector, TcpConnector,
+};
 
 /// 单次请求的超时。高延迟代理链路是本项目的主场景,给得比"感觉够用"宽一档;
 /// 但必须有限 —— 没有超时的话一次卡住的上传会把 `spawn_blocking` 的线程
@@ -68,8 +73,22 @@ impl S3Client {
         region: String,
         socks5: Option<&str>,
     ) -> Result<Self, CloudError> {
+        Self::new_with_timeout(endpoint, creds, region, socks5, TIMEOUT)
+    }
+
+    /// 同 [`new`](Self::new),但超时可调。**仅供测试**(黑洞代理测试要在秒级内
+    /// 看到超时,而不是等 60 秒)。`timeout` 同时是整次请求的全局超时与 SOCKS5
+    /// 握手的预算上限。
+    #[doc(hidden)]
+    pub fn new_with_timeout(
+        endpoint: Endpoint,
+        creds: Credentials,
+        region: String,
+        socks5: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Self, CloudError> {
         let mut b = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
+            .timeout_global(Some(timeout))
             // **必须关掉**:409(ForbidOverwrite 命中)与 403(签名/权限)都要
             // 我们自己看状态码分类。留着默认的话它们全变成同一个
             // `Error::StatusCode`,`AlreadyExists` 就认不出来了。
@@ -86,15 +105,28 @@ impl S3Client {
             // returned"。我们要的正是这个:能把 Location 报给用户。
             .max_redirects(0);
         if let Some(p) = socks5 {
-            let proxy = ureq::Proxy::new(&format!("socks5://{p}"))
+            // `socks5h`:目标域名交给代理解析(自带连接器按此发 ATYP 0x03)。
+            let proxy = ureq::Proxy::new(&format!("socks5h://{p}"))
                 .map_err(|_| CloudError::Config("SOCKS5 代理地址解析失败".into()))?;
             b = b.proxy(Some(proxy));
         }
+        // 连接器链照抄 ureq `DefaultConnector`,只把 `SocksConnector` 换成自带的
+        // (F363):SOCKS5 → HTTP CONNECT → TCP → rustls。
+        // `ConnectProxyConnector` 必须留着:未显式配 SOCKS5 时,ureq 的 Config 默认
+        // 读 ALL_PROXY/HTTPS_PROXY/HTTP_PROXY/NO_PROXY,去掉它环境变量里的 HTTP
+        // 代理就会被静默忽略(变成直连)。NO_PROXY 由两个代理连接器各自照 ureq 原样处理。
+        let connector = ()
+            .chain(Socks5Connector {
+                handshake_timeout: timeout,
+            })
+            .chain(ConnectProxyConnector::default())
+            .chain(TcpConnector::default())
+            .chain(RustlsConnector::default());
         Ok(Self {
             endpoint,
             creds,
             region,
-            agent: b.build().into(),
+            agent: ureq::Agent::with_parts(b.build(), connector, DefaultResolver::default()),
         })
     }
 

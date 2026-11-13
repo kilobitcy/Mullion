@@ -42,3 +42,25 @@ F270 要把配置推到用户自己的 S3 兼容对象存储。工作区原本�
   `x86_64-pc-windows-gnu` 交叉编译会在 aws-lc-sys 的 C/NASM 构建上炸——正是
   ADR-005 把 russh 切到 ring 要躲开的那件事,而且**只有交叉编译时才暴露**,
   本机 `cargo test` 全绿。
+
+## F363 修订:SOCKS5 改为 mullion-cloud 自带连接器(2026-11)
+
+决策第 2 条里的 `socks-proxy` 特性已去掉(原文保留不改)。
+
+**起因**:ureq 3.4.2 的 `SocksConnector` 把握手丢进 `thread::scope`,用
+`recv_timeout` 限时,但超时后 scope 退出仍要 join 那个卡在 `socks` crate
+**无超时读**上的子线程。代理接受 TCP 却不应答时,整次请求无限挂起
+(华为 P50 真机 13 分钟以上),`timeout_global` 形同虚设。桌面端云备份同样受影响。
+
+**当时的备选**:
+- **继续用 ureq `socks-proxy`、等上游修**:否。挂起会把 `spawn_blocking` 线程永久占住,
+  而定时器还在往里塞新任务;上游无修复时间表,我们没有可依赖的节点。
+- **在外层再包一层线程 + 超时**:否。放弃的线程仍卡在读上,泄漏线程与套接字,
+  只是把挂起藏起来。
+- **自带 SOCKS5 连接器(采纳)**:`mullion-cloud/src/socks.rs`,只做 RFC 1928
+  无认证 + CONNECT,每步 IO 设读写超时、受同一截止时刻约束,不开线程;通过
+  `Agent::with_parts` 接入,连接器链 SOCKS5 → HTTP CONNECT → TCP → rustls
+  (HTTP CONNECT 留着,为保持环境变量代理与 NO_PROXY 的原行为)。
+
+**行为差异**:目标域名改由代理解析(ATYP 0x03,`socks5h` 语义),不再本机先解析发 IP。
+环境变量里的 SOCKS4 代理不再支持,会报错而不是静默直连。
