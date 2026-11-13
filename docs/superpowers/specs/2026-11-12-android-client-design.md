@@ -29,7 +29,7 @@ mullion-app ──→ { core, term, ssh, store, cloud }
 | 编号 | 内容 | 关键约束 |
 |---|---|---|
 | F346 | 导入:云端拉包 / 手动导入 `.mullionpack` | 只读,不回写云端;只导入项目节点及其跳板链引用到的凭据;密文用 Keystore 重封 |
-| F347 | 凭据门控 | Keystore `setUserAuthenticationRequired` + `setUserAuthenticationParameters`,冷启动或空闲 ≥5 分钟后要生物识别/锁屏凭据 |
+| F347 | 凭据门控 | Keystore per-use key(`setUserAuthenticationParameters(0, …)`)+ App 侧计时:冷启动或后台 ≥5 分钟后要生物识别/锁屏凭据;无安全锁屏则拒绝。详见 `2026-11-13-f347-credential-gate-design.md` |
 | F348 | 项目列表 | 搜索(F233 同一份 `matches`)、最后打开时间(F234 同一份 `relative`)、只列在用但搜索穿透归档(F257)、备忘只读(F340)。**无运行指示灯** |
 | F349 | 打开项目 | F304 直连优先 + 失败换下一条;强制 attach 项目 tmux 并 `-c` 目录(F223);**attach 不带 `-d`**,与桌面共挂;一次只开一个项目 |
 | F350 | TOFU | 包里带来的指纹沿用,不一致硬拒;没见过的在手机上弹窗确认,只存手机本地 |
