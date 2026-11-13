@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -28,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -55,40 +58,45 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun Screen(vm: TerminalViewModel, importVm: ImportViewModel, cloudVm: CloudViewModel) {
-    var host by remember { mutableStateOf("") }
-    var port by remember { mutableStateOf("22") }
-    var user by remember { mutableStateOf("") }
+    // host/port/user 旋转不丢;密码类故意只用 remember,不进 saved-state Bundle
+    var host by rememberSaveable { mutableStateOf("") }
+    var port by rememberSaveable { mutableStateOf("22") }
+    var user by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var input by remember { mutableStateOf("") }
     // 导入完成后(尤其重置了本机密钥)云表单要重读磁盘,否则仍显示已被清掉的旧值
     LaunchedEffect(importVm.finishedCount) { if (importVm.finishedCount > 0) cloudVm.refresh() }
 
     Column(Modifier.fillMaxSize().safeDrawingPadding().imePadding().padding(8.dp)) {
-        if (vm.status != "已连接") {
-            OutlinedTextField(host, { host = it }, Modifier.fillMaxWidth().testTag("host"), label = { Text("主机") })
-            OutlinedTextField(port, { port = it }, Modifier.fillMaxWidth().testTag("port"), label = { Text("端口") })
-            OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth().testTag("user"), label = { Text("用户") })
-            OutlinedTextField(
-                password, { password = it }, Modifier.fillMaxWidth().testTag("password"),
-                label = { Text("密码") }, visualTransformation = PasswordVisualTransformation(),
-            )
-            Button({ vm.connect(host, port, user, password) }, Modifier.testTag("connect")) { Text("连接") }
-            Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+        val connected = vm.status == "已连接"
+        if (!connected) {
+            // 表单与两个分节同处一个滚动区并占满剩余高度:软键盘/横屏下任何控件都能滚到;
+            // 状态行留在滚动区外(单行,不会被挤没),结果提示另由各分节自行滚入视野
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).testTag("form-scroll")) {
+                OutlinedTextField(host, { host = it }, Modifier.fillMaxWidth().testTag("host"), label = { Text("主机") })
+                OutlinedTextField(port, { port = it }, Modifier.fillMaxWidth().testTag("port"), label = { Text("端口") })
+                OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth().testTag("user"), label = { Text("用户") })
+                OutlinedTextField(
+                    password, { password = it }, Modifier.fillMaxWidth().testTag("password"),
+                    label = { Text("密码") }, visualTransformation = PasswordVisualTransformation(),
+                )
+                Button({ vm.connect(host, port, user, password) }, Modifier.testTag("connect")) { Text("连接") }
                 ImportSection(importVm, otherBusy = cloudVm.busy)
                 CloudSection(cloudVm, otherBusy = importVm.busy)
             }
         }
         Text(vm.status, Modifier.testTag("status"))
-        // 未连接时终端区为空,不能与滚动区平分高度
-        val termMod = if (vm.status == "已连接") Modifier.weight(1f) else Modifier
-        Column(termMod.horizontalScroll(rememberScrollState())) {
-            vm.rows.forEachIndexed { i, line ->
-                Text(line, Modifier.testTag("row-$i"), fontFamily = FontFamily.Monospace, fontSize = 11.sp, softWrap = false)
+        // 终端区与发送框只在已连接时存在:断线后 rows 仍有内容,若未连接也渲染会把滚动区挤没
+        if (connected) {
+            Column(Modifier.weight(1f).horizontalScroll(rememberScrollState())) {
+                vm.rows.forEachIndexed { i, line ->
+                    Text(line, Modifier.testTag("row-$i"), fontFamily = FontFamily.Monospace, fontSize = 11.sp, softWrap = false)
+                }
             }
-        }
-        Row {
-            OutlinedTextField(input, { input = it }, Modifier.weight(1f).testTag("input"))
-            Button({ vm.send(input); input = "" }, Modifier.testTag("send")) { Text("发送") }
+            Row {
+                OutlinedTextField(input, { input = it }, Modifier.weight(1f).testTag("input"))
+                Button({ vm.send(input); input = "" }, Modifier.testTag("send")) { Text("发送") }
+            }
         }
     }
 }
@@ -114,7 +122,12 @@ private fun ImportSection(vm: ImportViewModel, otherBusy: Boolean) {
             Text("导入")
         }
     }
-    if (vm.message.isNotEmpty()) Text(vm.message, Modifier.testTag("import-status"))
+    if (vm.message.isNotEmpty()) {
+        val req = remember { BringIntoViewRequester() }
+        Text(vm.message, Modifier.bringIntoViewRequester(req).testTag("import-status"))
+        // 结果出现(或同文案再次出现:结果世代号递增)时滚入视野;不能用 busy 做 key,无关的 busy 翻转(如 refresh)会把视口拉走
+        LaunchedEffect(vm.message, vm.finishedCount) { req.bringIntoView() }
+    }
 }
 
 @Composable
@@ -159,5 +172,9 @@ private fun CloudSection(vm: CloudViewModel, otherBusy: Boolean) {
         Button(vm::pull, Modifier.testTag("cloud-pull"), enabled = idle && !f.isCorrupt) { Text("从云端更新") }
         if (f.isCorrupt) Button(vm::reset, Modifier.testTag("cloud-reset"), enabled = idle) { Text("重置云配置") }
     }
-    if (vm.message.isNotEmpty()) Text(vm.message, Modifier.testTag("cloud-status"))
+    if (vm.message.isNotEmpty()) {
+        val req = remember { BringIntoViewRequester() }
+        Text(vm.message, Modifier.bringIntoViewRequester(req).testTag("cloud-status"))
+        LaunchedEffect(vm.message, vm.resultCount) { req.bringIntoView() }
+    }
 }

@@ -24,6 +24,10 @@ class CloudViewModel(app: Application) : AndroidViewModel(app) {
     var busy by mutableStateOf(false)
         private set
 
+    /** 结果世代号:只在 save/pull/reset 结束时递增,refresh 不动;UI 据此决定是否把结果滚入视野。 */
+    var resultCount by mutableStateOf(0)
+        private set
+
     // busy 时忽略:persist 之后的 reload 会把期间敲的字盖掉
     fun edit(f: CloudForm) { if (!busy) form = f }
 
@@ -46,7 +50,7 @@ class CloudViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 导入(尤其导入时发生了 Keystore 重置)之后重读磁盘:保留当前 message。 */
-    fun refresh() = launchBusy {
+    fun refresh() = launchBusy(announces = false) {
         val keep = message
         reload(keep)
     }
@@ -71,7 +75,7 @@ class CloudViewModel(app: Application) : AndroidViewModel(app) {
         message = msg
     }
 
-    private fun launchBusy(block: suspend () -> Unit) {
+    private fun launchBusy(announces: Boolean = true, block: suspend () -> Unit) {
         if (busy) return
         busy = true
         viewModelScope.launch {
@@ -82,6 +86,7 @@ class CloudViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 message = CloudPull.failureText(e)
             } finally {
+                if (announces) resultCount++
                 busy = false
             }
         }
