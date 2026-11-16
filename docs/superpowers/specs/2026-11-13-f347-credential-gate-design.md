@@ -130,6 +130,20 @@ fun interface Authenticator {
 - `docs/superpowers/specs/2026-11-12-android-client-design.md` F347 行:改为 per-use key + App 侧 5 分钟计时。
 - `spec.md` F347 行验收列:补 per-use key 与插桩自动输 PIN。
 
+## 六、第二轮复核修订(2026-11-16,优先于上文)
+
+- **第 0 步 P50 spike**:动手前在 P50 上验证 v2 参数 key + `BiometricPrompt`(PIN)→ `doFinal` 成功。失败则退路:`setUserAuthenticationParameters(10, …)` 短时效 key,Gate 仍强制弹框。
+- **测试设备安全态集中在 `e2e.sh`**(`emulator.sh` 只管起停):`locksettings verify --old <PIN>` 不通才 `set-pin`;`svc power stayon true`;keyguard 在则唤醒 + 输 PIN。否则第二次冷启动停在锁屏、CE 存储未解锁,全套红。
+- **`VaultSession.lockAndForget()`**:只能降权的测试缝(回 Locked、清钥)。凡删 key 文件的 `@Before` 先调它;`unlockWithPin()` 已解锁时直接返回。
+- **debug 判定**用 `applicationInfo.flags and FLAG_DEBUGGABLE`(工程未开 `buildConfig`)。
+- **钥匙交出去一律 `copyOf()`**:锁定时原地清零不能波及在途任务;配测试。
+- **沿信号**:`Unlocking → Locked`(取消/失败)**不**置位;`Unlocking` 下「解锁」按钮可点(先 cancel 旧 `CancellationSignal`);验证协程挂 Application 级 scope,`finally` 归位。自动弹框在 `onResume` 触发。
+- **API 30+ 设备凭据页由 SystemUI 渲染**,宿主 Activity 一般不 onStop;`GateTest` 改守「失败/取消不重弹」。UiAutomator 按 SystemUI 控件找输入框。
+- **解锁时的重置**(v1 失效 / 凭据失效 / AEADBadTag)进共享 `VaultLock`,完成后 `CloudViewModel.refresh()`。v1 清理文案单列:「数据格式已升级,请重新导入」。AEADBadTag 路径如实为**两次**验证。
+- **S1**:`PackImport.run`、`CloudPull.save/pull` 改为调用方传入 `dataKey`;语义测试注入随机 32 字节,不碰 Keystore。`Loaded.reset` / `FailedAfterReset` / `RESET_NOTE` 链路随之删改。只有 `VaultKeyTest`、`CredentialGateTest` 与 Compose UI 测试需要真 PIN。
+- **`testDebugUnitTest` 与 `connectedDebugAndroidTest` 同一次 gradlew 调用**。
+- 同步修改补 `docs/android-build.md:40`(v1 alias)。
+
 ## 不做
 
 - 自定义 PIN / App 独立密码
