@@ -122,3 +122,48 @@ pub fn demo_pack() -> String {
         &blob,
     )
 }
+
+/// F349:演示项目改成「节点依次指向 `addrs`」,全用 echo sshd 的测试账号直连,
+/// known_hosts 为空(首连走 TOFU 确认)。`tests/open_project.rs` 与 Android 插桩
+/// 资产 `open.mullionpack`(节点 `10.0.2.2:2223`)共用。
+pub fn open_pack(addrs: &[(String, u16)]) -> String {
+    let mut f = sessions_file();
+    let template = f.session[0].clone();
+    f.session = addrs
+        .iter()
+        .enumerate()
+        .map(|(i, (host, port))| {
+            let mut s = template.clone();
+            s.id = SessionId(i as u64 + 1);
+            s.identity.name = format!("节点{}", i + 1);
+            s.connection.host = host.clone();
+            s.connection.port = *port;
+            s.auth = Auth::inline("testuser", AuthKind::Password);
+            s.network.jump = None;
+            s
+        })
+        .collect();
+    f.credential.clear();
+    f.project[0].nodes = (1..=addrs.len() as u64).map(SessionId).collect();
+    let secrets: BTreeMap<String, SecretEntry> = (1..=addrs.len())
+        .map(|i| {
+            let e = SecretEntry {
+                password: Some("test-password".into()),
+                ..Default::default()
+            };
+            (i.to_string(), e)
+        })
+        .collect();
+    let plain = toml::to_string_pretty(&secrets).unwrap();
+    let blob = mullion_store::seal_secrets(plain.as_bytes(), DEMO_PASSWORD).unwrap();
+    pack_text(
+        vec![
+            (
+                "sessions.toml",
+                toml::to_string_pretty(&f).unwrap().into_bytes(),
+            ),
+            ("known_hosts.toml", Vec::new()),
+        ],
+        &blob,
+    )
+}

@@ -6,7 +6,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -19,12 +21,15 @@ import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -34,7 +39,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -45,19 +52,20 @@ class MainActivity : ComponentActivity() {
     private val vm: TerminalViewModel by viewModels()
     private val importVm: ImportViewModel by viewModels()
     private val cloudVm: CloudViewModel by viewModels()
+    private val projectsVm: ProjectsViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
-                Surface(Modifier.fillMaxSize()) { Screen(vm, importVm, cloudVm) }
+                Surface(Modifier.fillMaxSize()) { Screen(vm, importVm, cloudVm, projectsVm) }
             }
         }
     }
 }
 
 @Composable
-private fun Screen(vm: TerminalViewModel, importVm: ImportViewModel, cloudVm: CloudViewModel) {
+private fun Screen(vm: TerminalViewModel, importVm: ImportViewModel, cloudVm: CloudViewModel, projectsVm: ProjectsViewModel) {
     // host/port/user 旋转不丢;密码类故意只用 remember,不进 saved-state Bundle
     var host by rememberSaveable { mutableStateOf("") }
     var port by rememberSaveable { mutableStateOf("22") }
@@ -66,13 +74,17 @@ private fun Screen(vm: TerminalViewModel, importVm: ImportViewModel, cloudVm: Cl
     var input by remember { mutableStateOf("") }
     // 导入完成后(尤其重置了本机密钥)云表单要重读磁盘,否则仍显示已被清掉的旧值
     LaunchedEffect(importVm.finishedCount) { if (importVm.finishedCount > 0) cloudVm.refresh() }
+    // 导入 / 云端拉取改了 vault:项目列表重读
+    LaunchedEffect(importVm.finishedCount, cloudVm.resultCount) { projectsVm.refresh() }
+    vm.pendingKey?.let { HostKeyDialog(it, vm::trustPending, vm::rejectPending) }
 
     Column(Modifier.fillMaxSize().safeDrawingPadding().imePadding().padding(8.dp)) {
-        val connected = vm.status == "已连接"
+        val connected = vm.connected
         if (!connected) {
             // 表单与两个分节同处一个滚动区并占满剩余高度:软键盘/横屏下任何控件都能滚到;
             // 状态行留在滚动区外(单行,不会被挤没),结果提示另由各分节自行滚入视野
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).testTag("form-scroll")) {
+                ProjectSection(projectsVm, vm::openProject)
                 OutlinedTextField(host, { host = it }, Modifier.fillMaxWidth().testTag("host"), label = { Text("主机") })
                 OutlinedTextField(port, { port = it }, Modifier.fillMaxWidth().testTag("port"), label = { Text("端口") })
                 OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth().testTag("user"), label = { Text("用户") })
@@ -85,20 +97,90 @@ private fun Screen(vm: TerminalViewModel, importVm: ImportViewModel, cloudVm: Cl
                 CloudSection(cloudVm, otherBusy = importVm.busy)
             }
         }
-        Text(vm.status, Modifier.testTag("status"))
+        Row {
+            Text(if (vm.node.isEmpty()) vm.status else "${vm.status} · ${vm.node}", Modifier.weight(1f).testTag("status"))
+            if (connected) TextButton(vm::disconnect, Modifier.testTag("disconnect")) { Text("断开") }
+        }
         // 终端区与发送框只在已连接时存在:断线后 rows 仍有内容,若未连接也渲染会把滚动区挤没
         if (connected) {
-            Column(Modifier.weight(1f).horizontalScroll(rememberScrollState())) {
-                vm.rows.forEachIndexed { i, line ->
-                    Text(line, Modifier.testTag("row-$i"), fontFamily = FontFamily.Monospace, fontSize = 11.sp, softWrap = false)
-                }
-            }
+            TerminalRows(vm, Modifier.weight(1f))
+            KeyBar(vm::sendRaw)
             Row {
                 OutlinedTextField(input, { input = it }, Modifier.weight(1f).testTag("input"))
                 Button({ vm.send(input); input = "" }, Modifier.testTag("send")) { Text("发送") }
             }
         }
     }
+}
+
+private val TERM_STYLE = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+
+/** 纯文本行视图(正式渲染是 F351)。按可用宽高与等宽字宽算行列,变了即 resize(T4)。 */
+@Composable
+private fun TerminalRows(vm: TerminalViewModel, modifier: Modifier) {
+    val measurer = rememberTextMeasurer()
+    val cell = remember(measurer) { measurer.measure("M".repeat(10), TERM_STYLE).size }
+    BoxWithConstraints(modifier.fillMaxWidth()) {
+        val cols = (constraints.maxWidth * 10 / cell.width.coerceAtLeast(1))
+        val lines = constraints.maxHeight / cell.height.coerceAtLeast(1)
+        LaunchedEffect(cols, lines) { vm.gridChanged(cols, lines) }
+        Column(Modifier.horizontalScroll(rememberScrollState())) {
+            vm.rows.forEachIndexed { i, line ->
+                Text(line, Modifier.testTag("row-$i"), style = TERM_STYLE, softWrap = false, maxLines = 1)
+            }
+        }
+    }
+}
+
+/** 软键盘上没有的键。↑↓ 发普通模式序列;应用光标模式(DECCKM)留给 F352。 */
+@Composable
+private fun KeyBar(send: (ByteArray) -> Unit) {
+    val keys = listOf(
+        "Esc" to "\u001b", "Tab" to "\t", "↑" to "\u001b[A", "↓" to "\u001b[B", "Enter" to "\r", "Ctrl+C" to "\u0003",
+    )
+    Row(Modifier.horizontalScroll(rememberScrollState())) {
+        keys.forEach { (label, seq) ->
+            TextButton({ send(seq.toByteArray()) }, Modifier.testTag("key-$label")) { Text(label) }
+        }
+    }
+}
+
+/** F348:有项目才出现。点一行 = 打开(F349)。 */
+@Composable
+private fun ProjectSection(vm: ProjectsViewModel, open: (ULong) -> Unit) {
+    if (vm.rows.isEmpty() && vm.query.isEmpty() && vm.message.isEmpty()) return
+    OutlinedTextField(
+        vm.query, vm::search, Modifier.fillMaxWidth().testTag("project-search"),
+        label = { Text("搜索项目") }, singleLine = true,
+    )
+    if (vm.message.isNotEmpty()) Text(vm.message, Modifier.testTag("projects-status"))
+    if (vm.rows.isEmpty() && vm.query.isNotEmpty()) Text("没有匹配的项目")
+    vm.rows.forEach { p ->
+        Column(Modifier.fillMaxWidth().clickable { open(p.id) }.padding(vertical = 8.dp).testTag("project-${p.id}")) {
+            Text(if (p.archived) "${p.name}(已归档)" else p.name, style = MaterialTheme.typography.titleMedium)
+            Text("${p.dir} · ${p.nodes} 个节点 · ${p.lastOpened}", style = MaterialTheme.typography.bodySmall)
+        }
+        HorizontalDivider()
+    }
+    Text("手动连接", Modifier.padding(top = 16.dp), style = MaterialTheme.typography.titleSmall)
+}
+
+/** F350:首次见到的主机。只有「没见过」才问;指纹变了在 Rust 里直接硬拒,不会走到这里。 */
+@Composable
+private fun HostKeyDialog(key: io.github.kilobitcy.mullion.ffi.PendingHostKey, trust: () -> Unit, reject: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = reject,
+        title = { Text("首次连接这台主机") },
+        text = {
+            Text(
+                "主机:${key.host}\n算法:${key.algo}\n指纹:${key.fingerprint}\n\n" +
+                    "请与服务器上 ssh-keygen -lf 的输出核对;一致再信任。",
+                Modifier.testTag("hostkey-text"),
+            )
+        },
+        confirmButton = { TextButton(trust, Modifier.testTag("hostkey-trust")) { Text("信任并连接") } },
+        dismissButton = { TextButton(reject, Modifier.testTag("hostkey-reject")) { Text("取消") } },
+    )
 }
 
 @Composable

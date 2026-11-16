@@ -15,8 +15,8 @@ android {
         minSdk = 30
         targetSdk = 36
         // 版本号独立于桌面(ADR-013 / F355):android-v0.x.y。
-        versionCode = 1
-        versionName = "0.0.1"
+        versionCode = 2
+        versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             // x86_64 只为模拟器测试;发布包(F355)只留 arm64-v8a。

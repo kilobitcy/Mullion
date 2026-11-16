@@ -63,7 +63,7 @@ pub struct PullSummary {
     pub import: ImportSummary,
 }
 
-fn data_key(v: &[u8]) -> Result<InMemoryKey, FfiError> {
+pub(crate) fn data_key(v: &[u8]) -> Result<InMemoryKey, FfiError> {
     let k: [u8; 32] = v
         .try_into()
         .map_err(|_| FfiError::Internal(format!("数据密钥应为 32 字节,实为 {}", v.len())))?;

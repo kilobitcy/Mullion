@@ -6,9 +6,13 @@
 
 uniffi::setup_scaffolding!();
 
+mod automation;
 mod cloud;
+mod dial;
 mod error;
+mod hostkey;
 mod import;
+mod projects;
 mod runtime;
 mod screen;
 mod terminal;
@@ -17,7 +21,9 @@ pub use cloud::{
     load_cloud_form, pull_latest, reset_cloud_config, save_cloud_form, CloudForm, PullSummary,
 };
 pub use error::FfiError;
+pub use hostkey::{trust_host_key, PendingHostKey};
 pub use import::{import_pack, inspect_pack, ImportSummary, PackInfo};
+pub use projects::{list_projects, open_project, OpenOutcome, ProjectRow};
 pub use screen::ScreenText;
 pub use terminal::{ConnectParams, ScreenListener, Terminal};
 

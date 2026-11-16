@@ -72,6 +72,25 @@ fn ffi_production_code_never_calls_a_write_back_api() {
         src.contains("install_projects_only"),
         "解析失效:没扫到导入入口"
     );
+    // F350 唯一豁免:用户确认未知主机后写手机本地 `known_hosts.toml`(不回写包/云端)。
+    // 只在 `hostkey.rs` 里剔一处;别的文件出现 `known.save(` 照样算回写。
+    const TOFU_SAVE: &str = "known.save(";
+    let hostkey = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hostkey.rs"),
+    )
+    .unwrap();
+    let hostkey = strip_tests_mod(&hostkey, std::path::Path::new("src/hostkey.rs"));
+    assert_eq!(
+        hostkey.matches(TOFU_SAVE).count(),
+        1,
+        "F350 的本地 TOFU 落盘应恰好一处,且在 hostkey.rs"
+    );
+    assert_eq!(
+        src.matches(TOFU_SAVE).count(),
+        1,
+        "别的文件也出现了 `{TOFU_SAVE}`"
+    );
+    let src = src.replacen(TOFU_SAVE, "", 1);
     for f in FORBIDDEN {
         assert!(!src.contains(f), "ffi 生产代码出现了回写调用 `{f}`");
     }

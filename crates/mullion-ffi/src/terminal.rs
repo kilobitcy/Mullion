@@ -13,7 +13,7 @@ use mullion_ssh::config::{AuthMethod, SshConfig};
 use mullion_ssh::known_hosts::{KnownHosts, TofuAccept};
 use mullion_ssh::session::{connect, SshSession, TrySendErr};
 use mullion_term::emulator::Emulator;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::FfiError;
 use crate::runtime::runtime;
@@ -58,6 +58,15 @@ pub struct Terminal {
     session: Arc<SshSession>,
     emu: Arc<Mutex<Emulator>>,
     pump: tokio::task::JoinHandle<()>,
+    /// F349:attach 计划在途时的「用户接管」开关。第一次 `write` 拿走并触发。
+    takeover: Mutex<Option<oneshot::Sender<()>>>,
+    automation: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// 打开项目要发的 attach 计划(见 `crate::automation`)。
+pub(crate) struct Plan {
+    pub steps: Vec<mullion_store::Step>,
+    pub ready_timeout_ms: u32,
 }
 
 #[uniffi::export]
@@ -88,14 +97,14 @@ impl Terminal {
         let (session, rx) = rt
             .block_on(connect(&cfg, policy, Arc::new(|| {})))
             .map_err(|e| FfiError::Connect(e.to_string()))?;
-        let session = Arc::new(session);
-        let emu = Arc::new(Mutex::new(Emulator::new(cfg.cols, cfg.rows)));
-        let pump = rt.spawn(pump(rx, emu.clone(), session.clone(), listener));
-        Ok(Arc::new(Self { session, emu, pump }))
+        Ok(Self::start(session, rx, &cfg, listener, None))
     }
 
-    /// 把键盘 / 输入框的字节发给远端。非阻塞。
+    /// 把键盘 / 输入框的字节发给远端。非阻塞。在途的 attach 计划就此作废(用户接管)。
     pub fn write(&self, bytes: Vec<u8>) -> Result<(), FfiError> {
+        if let Some(tx) = self.takeover.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
         Ok(self.session.write(bytes)?)
     }
 
@@ -118,6 +127,57 @@ impl Terminal {
     pub fn disconnect(&self) {
         self.session.close();
         self.pump.abort();
+        if let Some(a) = &self.automation {
+            a.abort();
+        }
+    }
+}
+
+impl Terminal {
+    /// 连好之后的公共尾巴:起泵;有计划就挂上「首字节 → 发计划」(T11)。
+    pub(crate) fn start(
+        session: SshSession,
+        rx: mpsc::Receiver<Vec<u8>>,
+        cfg: &SshConfig,
+        listener: Arc<dyn ScreenListener>,
+        plan: Option<Plan>,
+    ) -> Arc<Self> {
+        let rt = runtime();
+        let session = Arc::new(session);
+        let emu = Arc::new(Mutex::new(Emulator::new(cfg.cols, cfg.rows)));
+        let (first_tx, first_rx) = oneshot::channel();
+        let pump = rt.spawn(pump(
+            rx,
+            emu.clone(),
+            session.clone(),
+            listener,
+            Some(first_tx),
+        ));
+        let (takeover, automation) = match plan {
+            Some(plan) => {
+                let (tx, cancel) = oneshot::channel();
+                let sink: Arc<dyn mullion_ssh::schedule::ByteSink> = session.clone();
+                let task = rt.spawn(async move {
+                    let _ = crate::automation::run(
+                        sink,
+                        plan.steps,
+                        first_rx,
+                        cancel,
+                        plan.ready_timeout_ms,
+                    )
+                    .await;
+                });
+                (Some(tx), Some(task))
+            }
+            None => (None, None),
+        };
+        Arc::new(Self {
+            session,
+            emu,
+            pump,
+            takeover: Mutex::new(takeover),
+            automation,
+        })
     }
 }
 
@@ -132,6 +192,7 @@ async fn pump(
     emu: Arc<Mutex<Emulator>>,
     session: Arc<SshSession>,
     listener: Arc<dyn ScreenListener>,
+    mut first: Option<oneshot::Sender<()>>,
 ) {
     loop {
         // 锁只在这一句里持有,不跨 await。
@@ -153,6 +214,10 @@ async fn pump(
             listener.on_closed();
             return;
         };
+        // T11:远端出声了,attach 计划才开始计时发。
+        if let Some(tx) = first.take() {
+            let _ = tx.send(());
+        }
         let reply = absorb(&mut emu.lock().unwrap(), &bytes);
         if !reply.is_empty() {
             // T1。队列满就丢:应答晚到比卡住泵更糟,远端会重发查询。

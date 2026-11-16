@@ -13,6 +13,6 @@ SSHD=$!
 target/debug/examples/fake_s3_pack 9000 > /tmp/mullion-fake-s3.log 2>&1 &
 S3=$!
 trap 'kill $SSHD $S3 2>/dev/null || true' EXIT
-for _ in $(seq 50); do ss -ltn | grep -q '127.0.0.1:2222 ' && ss -ltn | grep -q '127.0.0.1:9000 ' && break; sleep 0.1; done
+for _ in $(seq 50); do ss -ltn | grep -q '127.0.0.1:2222 ' && ss -ltn | grep -q '127.0.0.1:2223 ' && ss -ltn | grep -q '127.0.0.1:9000 ' && break; sleep 0.1; done
 android/scripts/emulator.sh start
 cd android && ./gradlew --no-daemon connectedDebugAndroidTest "$@"

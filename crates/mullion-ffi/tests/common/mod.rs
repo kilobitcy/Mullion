@@ -15,6 +15,9 @@ pub type Received = Arc<Mutex<Vec<u8>>>;
 
 pub struct RecordingEcho {
     pub received: Received,
+    /// 开 shell 后先说的话(像登录 shell 的提示符)。F349 的 attach 计划要等远端
+    /// 首字节才发(T11),纯 echo 不先出声,计划永远不会走。
+    pub banner: Vec<u8>,
 }
 
 impl Handler for RecordingEcho {
@@ -61,6 +64,9 @@ impl Handler for RecordingEcho {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
+        if !self.banner.is_empty() {
+            session.data(channel, CryptoVec::from(self.banner.clone()))?;
+        }
         Ok(())
     }
 
@@ -86,6 +92,11 @@ pub fn host_key_path() -> String {
 
 /// 在 `bind` 上起 echo sshd,返回实际地址和「收到的字节」记录。
 pub async fn spawn_recording_echo(bind: &str) -> (std::net::SocketAddr, Received) {
+    spawn_echo_with_banner(bind, b"").await
+}
+
+/// 同上,但开 shell 后先吐 `banner`。
+pub async fn spawn_echo_with_banner(bind: &str, banner: &[u8]) -> (std::net::SocketAddr, Received) {
     let host_key = russh::keys::load_secret_key(host_key_path(), None).expect("load hostkey");
     let mut config = russh::server::Config::default();
     config.keys.push(host_key);
@@ -97,11 +108,13 @@ pub async fn spawn_recording_echo(bind: &str) -> (std::net::SocketAddr, Received
         .expect("bind echo sshd");
     let addr = listener.local_addr().unwrap();
     let rec = received.clone();
+    let banner = banner.to_vec();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let config = config.clone();
             let handler = RecordingEcho {
                 received: rec.clone(),
+                banner: banner.clone(),
             };
             tokio::spawn(async move {
                 let _ = russh::server::run_stream(config, stream, handler).await;
