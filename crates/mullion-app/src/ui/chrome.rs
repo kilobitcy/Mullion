@@ -535,8 +535,9 @@ pub fn status_bar(
     connected: bool,
     last_error: Option<&str>,
     automation: Option<&str>,
-    // F115:隧道指示器。`None` = 一条都没启动,那就**不占格** ——
+    // F115:隧道指示器。`None` = 一条都没配置,那就**不占格** ——
     // 状态栏每多常驻一格,别的信息就少一分被看见的机会。
+    // (F369 起配了就常驻:它是启停浮层的入口。)
     tunnel: Option<&crate::tunnels::Indicator>,
     // F62:当前聚焦 pane 所属会话的语义色。**只有勾了「状态栏」落点才是
     // `Some`**(过滤在 `badge::should_paint` 里做,这里只负责画)。
@@ -868,14 +869,14 @@ mod tests {
         assert!(pos("隧道") < pos("UTF-8"), "隧道要排在编码之前:{texts:?}");
     }
 
-    /// 一条都没启动时**不占格**。状态栏每多常驻一格,别的信息就少一分被
-    /// 看见的机会;而「你配了但没开」这件事在会话管理器里看就够了。
+    /// 一条都没**配置**时不占格(F369 起配了就常驻,`None` 只剩这一种来源,
+    /// 见 `tunnels::indicator_is_always_shown_once_something_is_configured`)。
     #[test]
     fn status_bar_has_no_tunnel_indicator_when_none_configured() {
         let texts = status_texts(None, None, None, None);
         assert!(
             !texts.iter().any(|s| s.contains("隧道")),
-            "没有在跑的隧道时不该占一格:{texts:?}"
+            "一条隧道都没配置时不该占一格:{texts:?}"
         );
     }
 

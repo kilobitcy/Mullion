@@ -15703,6 +15703,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 tunnels,
                                 tunnel_states: &tunnel_states,
                                 tunnel_others: &self.tunnel_others,
+                                tunnel_auto_failed: 0,
                                 store_available,
                                 // F37:占位标签**不算已连接** —— 它一条连接都
                                 // 没建。判据从「有没有标签」收紧成「活动标签

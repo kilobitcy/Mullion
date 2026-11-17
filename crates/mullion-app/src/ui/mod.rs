@@ -656,6 +656,8 @@ pub struct UiFrame<'a> {
     pub tunnel_states: &'a [(TunnelId, mullion_ssh::tunnel::TunnelState)],
     /// F338:**别的实例**里正在跑的隧道(只读,来自 `tunnel-state/` 目录)。
     pub tunnel_others: &'a [mullion_store::OtherTunnel],
+    /// F368:自动拉起后被静默停掉的条数(状态栏标红并说出条数)。
+    pub tunnel_auto_failed: usize,
     pub store_available: bool,
     pub connected: bool,
     /// 状态栏左栏的屏数。必须来自 `Workspace::pane_count()`。
@@ -1057,10 +1059,20 @@ pub fn build_ui(
     // F115:分母是**配置了多少条**,不是启动了多少条 —— 见
     // `tunnels::indicator`。这里现算而不是再往 `UiFrame` 加一个字段:
     // 输入就在手边、纯函数、隧道条数是个位数,不构成陷阱 T3 那类每帧重算。
+    // F369:分子补上别的窗口在跑的;F368:带上自动拉起没起来的条数。
     let tunnel_indicator = {
         let states: Vec<mullion_ssh::tunnel::TunnelState> =
             frame.tunnel_states.iter().map(|(_, s)| s.clone()).collect();
-        crate::tunnels::indicator(&states, frame.tunnels.len())
+        crate::tunnels::indicator(
+            &states,
+            frame.tunnels.len(),
+            crate::tunnels::elsewhere_running(
+                frame.tunnels,
+                frame.tunnel_states,
+                frame.tunnel_others,
+            ),
+            frame.tunnel_auto_failed,
+        )
     };
     chrome::status_bar(
         ctx,
@@ -1677,6 +1689,7 @@ mod tests {
             tunnels: &[],
             tunnel_states: &[],
             tunnel_others: &[],
+            tunnel_auto_failed: 0,
             store_available: false,
             connected: true,
             panes: 1,

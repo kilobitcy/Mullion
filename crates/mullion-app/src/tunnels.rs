@@ -67,14 +67,6 @@ impl TunnelRuntime {
             .collect()
     }
 
-    fn states(&self) -> Vec<TunnelState> {
-        self.live.values().map(|l| l.state.clone()).collect()
-    }
-
-    /// 状态栏那一格(F115)。
-    pub fn indicator(&self, configured: usize) -> Option<Indicator> {
-        indicator(&self.states(), configured)
-    }
 }
 
 /// 删掉某条会话时要顺手停掉的隧道。
@@ -168,22 +160,32 @@ pub struct Indicator {
     pub severity: Severity,
 }
 
-/// `states` 是**已启动**的那些隧道的状态,`configured` 是库里配了多少条。
+/// `states` 是本窗口**已启动**的那些隧道的状态,`configured` 是库里配了多少条,
+/// `elsewhere` 是别的窗口里在跑、本窗口没有的条数(`elsewhere_running`),
+/// `auto_failed` 是自动拉起后被静默停掉的条数(F368)。
 ///
-/// 一条都没启动时返回 `None` —— 状态栏不该为「你配了但没开」的东西常驻占一格。
-pub fn indicator(states: &[TunnelState], configured: usize) -> Option<Indicator> {
-    if configured == 0 || states.is_empty() {
+/// F369:配了就常驻(它是启停浮层的入口),一条都没配才 `None`。
+/// (推翻 F115「没有在跑的就不占格」—— 那时这一格只是个读数。)
+pub fn indicator(
+    states: &[TunnelState],
+    configured: usize,
+    elsewhere: usize,
+    auto_failed: usize,
+) -> Option<Indicator> {
+    if configured == 0 {
         return None;
     }
     let running = states
         .iter()
         .filter(|s| matches!(s, TunnelState::Running))
-        .count();
+        .count()
+        + elsewhere;
     // 取最坏:一条挂了、九条好着,用户需要知道的是那一条。
     // 写成「取第一条」的话,同一组状态换个顺序会给出不同答案。
-    let severity = if states
-        .iter()
-        .any(|s| matches!(s, TunnelState::Failed(_) | TunnelState::Stopped))
+    let severity = if auto_failed > 0
+        || states
+            .iter()
+            .any(|s| matches!(s, TunnelState::Failed(_) | TunnelState::Stopped))
     {
         Severity::Danger
     } else if states.iter().any(|s| {
@@ -204,10 +206,34 @@ pub fn indicator(states: &[TunnelState], configured: usize) -> Option<Indicator>
         Severity::Warn => "…",
         Severity::Danger => " ×",
     };
+    // F368:自动拉起没起来的,在这一格里说出条数(不弹窗、不 toast)。
+    let auto = if auto_failed > 0 {
+        format!(" · {auto_failed} 条未自动启动")
+    } else {
+        String::new()
+    };
     Some(Indicator {
-        text: format!("隧道 {running}/{configured}{mark}"),
+        text: format!("隧道 {running}/{configured}{mark}{auto}"),
         severity,
     })
+}
+
+/// F369:别的窗口里**在跑**、而本窗口没有的已配置隧道条数(指示器的分子补项)。
+/// 本窗口有这条就以本窗口为准(同 F338 列表行);库里没有的(残留上报)不算。
+pub fn elsewhere_running(
+    records: &[TunnelRecord],
+    local: &[(TunnelId, TunnelState)],
+    others: &[mullion_store::OtherTunnel],
+) -> usize {
+    records
+        .iter()
+        .filter(|r| !local.iter().any(|(id, _)| *id == r.id))
+        .filter(|r| {
+            others
+                .iter()
+                .any(|o| o.tunnel == r.id && o.state == mullion_store::RemoteTunnelState::Running)
+        })
+        .count()
 }
 
 /// F339:标题条上「这块 pane 的会话在远端开着哪些端口」的一格。
@@ -416,22 +442,22 @@ mod tests {
     /// 挂了一条,状态栏照样是安静的灰色,用户永远不知道。
     #[test]
     fn indicator_takes_the_worst_state_not_the_first() {
-        let a = indicator(&[TunnelState::Running, TunnelState::Failed("x".into())], 2).unwrap();
-        let b = indicator(&[TunnelState::Failed("x".into()), TunnelState::Running], 2).unwrap();
+        let a = indicator(&[TunnelState::Running, TunnelState::Failed("x".into())], 2, 0, 0).unwrap();
+        let b = indicator(&[TunnelState::Failed("x".into()), TunnelState::Running], 2, 0, 0).unwrap();
         assert_eq!(a, b, "顺序不该影响结论");
         assert_eq!(a.severity, Severity::Danger);
 
         // 重连中比正常坏、比失败好。
-        let w = indicator(&[TunnelState::Running, reconnecting()], 2).unwrap();
+        let w = indicator(&[TunnelState::Running, reconnecting()], 2, 0, 0).unwrap();
         assert_eq!(w.severity, Severity::Warn);
         assert_eq!(
-            indicator(&[TunnelState::Running], 1).unwrap().severity,
+            indicator(&[TunnelState::Running], 1, 0, 0).unwrap().severity,
             Severity::Calm
         );
         // 表里还留着但已经 `Stopped` 的,也算需要注意 —— 正常停止是
         // 「从表里摘掉」,还挂在表里说明是意外停的。
         assert_eq!(
-            indicator(&[TunnelState::Running, TunnelState::Stopped], 2)
+            indicator(&[TunnelState::Running, TunnelState::Stopped], 2, 0, 0)
                 .unwrap()
                 .severity,
             Severity::Danger
@@ -440,21 +466,71 @@ mod tests {
 
     #[test]
     fn indicator_counts_running_over_total() {
-        let i = indicator(&[TunnelState::Running, reconnecting()], 2).unwrap();
+        let i = indicator(&[TunnelState::Running, reconnecting()], 2, 0, 0).unwrap();
         assert!(i.text.contains("1/2"), "实际: {}", i.text);
         // 配了 5 条只起了 2 条时,分母是**配置数**不是已起数 ——
         // 否则「隧道 2/2」会让人以为全都在跑。
-        let i = indicator(&[TunnelState::Running, TunnelState::Running], 5).unwrap();
+        let i = indicator(&[TunnelState::Running, TunnelState::Running], 5, 0, 0).unwrap();
         assert!(i.text.contains("2/5"), "实际: {}", i.text);
     }
 
+    /// F369 推翻 F115「没有在跑的就不占格」:配了就常驻(它现在是浮层的入口),
+    /// 一条都没跑是安静的灰色 `0/N`;一条都没配才不占格。
     #[test]
-    fn indicator_is_none_when_nothing_is_configured() {
-        assert!(indicator(&[], 0).is_none());
-        assert!(
-            indicator(&[], 3).is_none(),
-            "配了但一条都没启动时,状态栏不该常驻占一格"
-        );
+    fn indicator_is_always_shown_once_something_is_configured() {
+        assert!(indicator(&[], 0, 0, 0).is_none(), "一条都没配,不占格");
+        let i = indicator(&[], 3, 0, 0).expect("配了就该常驻");
+        assert_eq!(i.text, "隧道 0/3");
+        assert_eq!(i.severity, Severity::Calm, "没跑不是出事,不该上色");
+    }
+
+    /// F369:分子含别的窗口里在跑的 —— 否则多开时这边显示「0/3」,
+    /// 列表里却写着「在另一个窗口运行中」,自相矛盾。
+    #[test]
+    fn indicator_counts_what_runs_in_other_windows() {
+        let i = indicator(&[TunnelState::Running], 3, 1, 0).unwrap();
+        assert!(i.text.contains("2/3"), "实际: {}", i.text);
+    }
+
+    /// F368:自动拉起失败只在状态栏标红,并说出条数。
+    #[test]
+    fn autostart_failures_turn_the_indicator_red_and_say_how_many() {
+        let i = indicator(&[], 3, 0, 2).unwrap();
+        assert_eq!(i.severity, Severity::Danger);
+        assert!(i.text.contains("2 条未自动启动"), "实际: {}", i.text);
+        assert!(!indicator(&[], 3, 0, 0).unwrap().text.contains("未自动启动"));
+    }
+
+    /// F369:别处在跑的条数。本窗口表里有的不算(以本窗口为准,同 F338 列表行);
+    /// 别处非 Running 的不算;没配置的(别的库残留)不算。
+    #[test]
+    fn elsewhere_running_counts_only_configured_tunnels_not_held_here() {
+        use mullion_store::{OtherTunnel, RemoteTunnelState as R};
+        let rec = |id: u64| TunnelRecord {
+            id: TunnelId(id),
+            session_id: SessionId(1),
+            listen_port: 3306,
+            name: String::new(),
+            note: String::new(),
+            autostart: false,
+            kind: mullion_store::TunnelKind::Dynamic,
+        };
+        let other = |id: u64, state: R| OtherTunnel {
+            tunnel: TunnelId(id),
+            state,
+            pid: 1,
+            started_at: 0,
+            instance: String::new(),
+        };
+        let records = [rec(1), rec(2), rec(3)];
+        let local = [(TunnelId(1), TunnelState::Failed("x".into()))];
+        let others = [
+            other(1, R::Running),
+            other(2, R::Running),
+            other(3, R::Connecting),
+            other(9, R::Running),
+        ];
+        assert_eq!(elsewhere_running(&records, &local, &others), 1);
     }
 
     /// 跌进失败态播一次,之后连报三次都不再播。
@@ -534,6 +610,6 @@ mod tests {
             "已停止/已删除的隧道,在途状态必须丢弃而不是凭空建一条"
         );
         assert!(rt.state(TunnelId(1)).is_none());
-        assert!(rt.indicator(1).is_none());
+        assert!(rt.snapshot().is_empty());
     }
 }
