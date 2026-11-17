@@ -50,6 +50,9 @@ pub struct ProjectPickDraft {
     pub frozen_lamps: Option<std::collections::BTreeMap<ProjectId, crate::project::Lamp>>,
     /// F343:搜索框里 ↑↓ 挪到的行(`None` = 没按过方向键)。搜索词一变就清。
     pub sel: Option<usize>,
+    /// F364:还欠一次「把焦点给搜索框」。打开时为真,第一次画完搜索框就清 ——
+    /// 只抢一次,用户点到别处后不再拽回来。
+    pub focus_pending: bool,
 }
 
 impl ProjectPickDraft {
@@ -59,6 +62,7 @@ impl ProjectPickDraft {
             filter: String::new(),
             frozen_lamps: None,
             sel: None,
+            focus_pending: true,
         }
     }
 }
@@ -169,6 +173,9 @@ pub fn show(
                     );
                     if r.changed() {
                         d.sel = None;
+                    }
+                    if std::mem::take(&mut d.focus_pending) {
+                        r.request_focus();
                     }
                     ui.add_space(crate::ui::metrics::SP_S);
                     // F258:排序读的是这次打开期间冻结的灯,不是 `lamps` 实时表 ——
@@ -369,6 +376,7 @@ mod tests {
             filter: query.to_string(),
             frozen_lamps: None,
             sel: None,
+            focus_pending: true,
         });
         let mut drawn = Vec::new();
         for time in [0.0_f64, 1.0] {
@@ -420,6 +428,7 @@ mod tests {
             filter: query.to_string(),
             frozen_lamps: None,
             sel: None,
+            focus_pending: true,
         });
         let mut shapes = Vec::new();
         for time in [0.0_f64, 1.0] {
@@ -909,5 +918,101 @@ mod tests {
             "↓↓ 之后回车选第二行"
         );
         assert_eq!(run(&[egui::Key::ArrowDown]), None);
+    }
+
+    /// F364:弹窗打开那一帧就把焦点给搜索框 —— 原先要先点一下框,↑↓/Enter
+    /// 整条才生效(F343 的测试里是手动 `request_focus` 的,所以一直没发现)。
+    /// 而且**只抢一次**:用户点到别处之后不再把焦点拽回来。
+    ///
+    /// 自证会变红:删掉 `show` 里 `focus_pending` 那一句 `request_focus`。
+    #[test]
+    fn the_search_box_has_focus_the_moment_the_dialog_opens_and_only_once() {
+        let ps = vec![proj(1, "alpha", "/a", None)];
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let lamps = std::collections::BTreeMap::new();
+        let sessions = vec![node_session()];
+        let mut draft = Some(ProjectPickDraft::new(PaneId(7)));
+        let search = egui::Id::new("project_pick_search");
+        let mut got = None;
+        let mut step = |time: f64, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..base_input()
+                },
+                |ctx| {
+                    if let Some(a) = show(
+                        ctx,
+                        &MULLION_DARK,
+                        &mut draft,
+                        &ps,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                        Some(pane()),
+                    ) {
+                        got = Some(a);
+                    }
+                },
+            );
+        };
+        step(0.0, vec![]);
+        step(1.0, vec![]);
+        assert!(
+            ctx.memory(|m| m.has_focus(search)),
+            "弹窗开了,搜索框却没焦点"
+        );
+        let key = |k| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step(2.0, vec![key(egui::Key::ArrowDown)]);
+        step(3.0, vec![key(egui::Key::Enter)]);
+        assert_eq!(
+            got,
+            Some(PickAction::Pick {
+                pane: PaneId(7),
+                project: ProjectId(1),
+            }),
+            "不点搜索框,↓+回车就该能选"
+        );
+
+        // 只抢一次:焦点交出去之后,后面的帧不再拽回来。
+        let mut draft2 = Some(ProjectPickDraft::new(PaneId(8)));
+        let ctx2 = egui::Context::default();
+        let mut run2 = |time: f64| {
+            let _ = ctx2.run(
+                egui::RawInput {
+                    time: Some(time),
+                    ..base_input()
+                },
+                |ctx| {
+                    let _ = show(
+                        ctx,
+                        &MULLION_DARK,
+                        &mut draft2,
+                        &ps,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                        Some(pane()),
+                    );
+                },
+            );
+        };
+        run2(0.0);
+        run2(1.0);
+        ctx2.memory_mut(|m| m.surrender_focus(search));
+        run2(2.0);
+        run2(3.0);
+        assert!(
+            !ctx2.memory(|m| m.has_focus(search)),
+            "焦点交出去之后又被抢回来了"
+        );
     }
 }
