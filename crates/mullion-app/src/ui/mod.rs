@@ -18,6 +18,7 @@ pub mod ico;
 pub mod icon;
 pub mod import_dialog;
 pub mod launcher;
+pub mod memo_popup;
 pub mod metrics;
 pub mod overwrite_alert;
 pub mod pack_dialog;
