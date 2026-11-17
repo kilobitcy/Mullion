@@ -259,6 +259,23 @@ impl SessionStore {
         self.vault.set_project_archived(id, archived, now_rfc3339);
     }
 
+    /// F367:备忘浮层的三个字段级写入。调用点见 `app::apply_memo_out`。
+    pub fn add_project_memo(&mut self, id: mullion_store::ProjectId, text: String, now: &str) {
+        self.vault.add_project_memo(id, text, now);
+    }
+
+    pub fn remove_project_memo(
+        &mut self,
+        id: mullion_store::ProjectId,
+        memo: &mullion_store::Memo,
+    ) {
+        self.vault.remove_project_memo(id, memo);
+    }
+
+    pub fn set_project_note(&mut self, id: mullion_store::ProjectId, note: String) {
+        self.vault.set_project_note(id, note);
+    }
+
     /// F258:记一笔「这条会话连上了」。调用点见 `app::accept_connect_ok`。
     pub fn touch_session_connected(&mut self, id: mullion_store::SessionId, now_rfc3339: &str) {
         self.vault.touch_session_connected(id, now_rfc3339);

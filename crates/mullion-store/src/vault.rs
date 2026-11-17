@@ -1070,6 +1070,40 @@ impl Vault {
         }
     }
 
+    /// F367:追加一条备忘。字段级写入,同 `set_project_archived` 不过整份校验。
+    pub fn add_project_memo(&mut self, id: crate::project::ProjectId, text: String, now: &str) {
+        self.sync_from_disk_if_untouched();
+        if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
+            slot.memos.push(crate::project::Memo {
+                text,
+                created_at: now.to_string(),
+            });
+        }
+    }
+
+    /// F367:删一条备忘。按 `text + created_at` 全等匹配、只删第一条 —— 下标
+    /// 靠不住(浮层拿的是快照,磁盘那份可能刚被另一个实例改过)。
+    pub fn remove_project_memo(
+        &mut self,
+        id: crate::project::ProjectId,
+        memo: &crate::project::Memo,
+    ) {
+        self.sync_from_disk_if_untouched();
+        if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
+            if let Some(i) = slot.memos.iter().position(|m| m == memo) {
+                slot.memos.remove(i);
+            }
+        }
+    }
+
+    /// F367:整段替换项目备注(note)。
+    pub fn set_project_note(&mut self, id: crate::project::ProjectId, note: String) {
+        self.sync_from_disk_if_untouched();
+        if let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) {
+            slot.note = note;
+        }
+    }
+
     pub fn delete_project(&mut self, id: crate::project::ProjectId) -> Result<(), StoreError> {
         self.sync_from_disk_if_untouched();
         self.projects.retain(|p| p.id != id);
@@ -3759,6 +3793,37 @@ path = "/var/log"
     /// F257:归档 / 取消归档只改这一个字段,**不跑 validate** —— 理由同
     /// `touch_project_accessed`:收起一个项目不该因为库里别处有个撞名的老项目
     /// 就失败。真要拦,拦在保存那一刻。
+    /// F367:pane 里的备忘浮层只动 memos / note 两个字段,且不过整份校验 ——
+    /// 走 `update_project` 的话,项目里任何一处历史遗留的不合法值都会让
+    /// 「加一条备忘」失败,而用户根本没碰那些字段。
+    #[test]
+    fn memo_mutators_touch_only_their_own_field_and_skip_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_project("web".into(), "/srv/web".into(), "2026-11-01T00:00:00Z");
+        let before = v.projects().iter().find(|p| p.id == id).unwrap().clone();
+        v.add_project_memo(id, "上线前清缓存".into(), "2026-11-17T08:00:00Z");
+        v.add_project_memo(id, "周五备份".into(), "2026-11-17T09:00:00Z");
+        let p = v.projects().iter().find(|p| p.id == id).unwrap().clone();
+        assert_eq!(p.memos.len(), 2);
+        v.remove_project_memo(id, &p.memos[0]);
+        let p = v.projects().iter().find(|p| p.id == id).unwrap().clone();
+        assert_eq!(p.memos.len(), 1);
+        assert_eq!(p.memos[0].text, "周五备份");
+        v.set_project_note(id, "长期说明".into());
+        let after = v.projects().iter().find(|p| p.id == id).unwrap().clone();
+        assert_eq!(after.note, "长期说明");
+        assert_eq!(
+            crate::project::ProjectRecord {
+                memos: Vec::new(),
+                note: String::new(),
+                ..after
+            },
+            before,
+            "只许动 memos / note"
+        );
+    }
+
     #[test]
     fn archiving_flips_only_the_archive_field_and_can_be_undone() {
         let dir = tempfile::tempdir().unwrap();
