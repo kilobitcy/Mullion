@@ -19,6 +19,7 @@ pub mod icon;
 pub mod import_dialog;
 pub mod launcher;
 pub mod metrics;
+pub mod overwrite_alert;
 pub mod pack_dialog;
 pub mod pane_edges;
 pub mod pane_title;
@@ -478,6 +479,9 @@ pub struct UiState {
     /// 只该有一个,而 `PanelFrame` 每个标签一份。放进 `PanelFrame` 的话,
     /// 切个标签就会冒出另一个删除确认框。
     pub files_dialog: Option<files_dialog::FilesDialog>,
+    /// F366:下载覆盖失败的告警框。**独立一个槽,不占 `files_dialog`**:那条槽
+    /// 「已有框开着就等」,批量下载时会与后续冲突框互相排队。
+    pub overwrite_alert: Option<overwrite_alert::OverwriteAlert>,
     /// F55:传输队列面板是不是折叠着。
     ///
     /// **语义取反成「展开」**,为的是 `Default` 能给出想要的默认值:
@@ -850,6 +854,9 @@ pub struct UiActions {
     /// 加字段时记得同步 `app.rs::has_real_action` —— 漏了的话按钮按下去
     /// 毫无反应。
     pub copy_last_error: bool,
+    /// F366:覆盖失败告警框上按的东西(重试 / 关闭)。施加要按 job 取回
+    /// app 侧另存的传输输入,所以只能在 `app.rs` 做。同步 `has_real_action`。
+    pub overwrite_alert: Option<overwrite_alert::AlertOut>,
 }
 
 /// 指针此刻还在**文件面板**里没有(F59 / 设计 N1 的判据,2026-08-20 修正)。
@@ -1163,6 +1170,8 @@ pub fn build_ui(
     // 面板发起的模态,该盖在别的窗口上;排在 toast 之前 —— 操作反馈永远
     // 在最上面(走查 13)。
     actions.files_op = files_dialog::show(ctx, t, &mut ui_state.files_dialog);
+    // F366:覆盖失败告警。同为一次性小模态,跟着文件写操作确认框走。
+    actions.overwrite_alert = overwrite_alert::show(ctx, t, &ui_state.overwrite_alert);
     // E2/E3:标签属性弹窗。排在文件写操作确认框之后 —— 同为「从别处发起的
     // 一次性小模态」,不需要跟文件面板抢前后顺序,跟着它的位置走就够了。
     actions.tab_props = tab_props::show(ctx, t, &mut ui_state.tab_props);

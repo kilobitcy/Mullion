@@ -242,6 +242,11 @@ const LEDGER: &[(&str, usize, &str)] = &[
     ("ui/edit_panel.rs", 1, "列表在 ScrollArea 里,行内截断"),
     ("ui/group_manager.rs", 1, "列表在 ScrollArea 里,行内截断"),
     (
+        "ui/overwrite_alert.rs",
+        1,
+        "正文 `set_max_width` 夹死、标签自动折行;条目超过 8 条折成「等另外 N 个」,高度有界",
+    ),
+    (
         "ui/pack_dialog.rs",
         1,
         "两个输入框 + 一行按钮,路径走行内截断",

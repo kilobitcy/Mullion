@@ -2771,6 +2771,10 @@ struct TransferState {
     specs: std::collections::HashMap<u64, TransferSpec>,
     /// F308:全部顺利收尾后满 60 秒自动清的计时。
     auto_clear: crate::files::queue::AutoClear,
+    /// F366:覆盖失败告警框里每一条的传输输入,按旧 job id 存。`specs` 在
+    /// job 收尾时就回收了,不另存一份的话点「重试」时路径已经丢了。告警框
+    /// 关掉(重试 / 关闭)时整张表清空。
+    retry_specs: std::collections::HashMap<u64, TransferSpec>,
 }
 
 /// 三个文件对话框各自的「线程在跑吗」标志。防止连点「选择…」开出多个
@@ -2889,6 +2893,7 @@ impl TransferState {
             cancels: std::collections::HashMap::new(),
             specs: std::collections::HashMap::new(),
             auto_clear: crate::files::queue::AutoClear::default(),
+            retry_specs: std::collections::HashMap::new(),
         }
     }
 }
@@ -3038,6 +3043,12 @@ enum Modal {
     /// 重载**(见 `ui::pack_dialog` 的「请重启」那一页)—— 内存里的 store
     /// 一个字节都没变,让 F61/F62 的外观缓存去重算是假的。
     Pack,
+    /// F366:下载覆盖失败的告警框。里面没有输入框,但有一颗一按就重跑一批
+    /// 下载的「重试」按钮,而空格/回车在 egui 里是按钮的激活键 —— 同
+    /// `Modal::Import` 的理由(T8)。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写。
+    OverwriteAlert,
 }
 
 impl Modal {
@@ -3065,6 +3076,7 @@ impl Modal {
         Modal::FilesFind,
         Modal::History,
         Modal::Pack,
+        Modal::OverwriteAlert,
     ];
 }
 
@@ -3101,10 +3113,12 @@ const DISMISS_ORDER: &[Modal] = &[
 ///   不是窗口,没有「外面」可言(它们的 area 就是文件面板本身)。
 /// - `Paste`:走 `egui::Modal` 自带的遮罩点击,在这里再接一遍等于同一个
 ///   行为两条路。
+/// - `OverwriteAlert`(F366):点外面关掉 = 静默丢掉重试机会,而失败的文件
+///   此刻在传输面板里可能已经看不见了。
 ///
 /// **这张表只作文档与完备性对照**(见下面
 /// `every_dialog_is_either_in_the_dismiss_order_or_explicitly_exempt`),
-/// 豁免的实际生效点是 `dismiss_areas` 里这八个变体各自的 `None` 那一臂——
+/// 豁免的实际生效点是 `dismiss_areas` 里这九个变体各自的 `None` 那一臂——
 /// `dismiss_verdict` 只读 `DISMISS_ORDER`,一个弹窗没在 `DISMISS_ORDER`
 /// 里就永远问不到它,豁不豁免全看 `dismiss_areas` 答不答得出 area。
 #[allow(dead_code)]
@@ -3117,6 +3131,7 @@ const DISMISS_EXEMPT: &[Modal] = &[
     Modal::FilesNewName,
     Modal::FilesFind,
     Modal::Paste,
+    Modal::OverwriteAlert,
 ];
 
 /// 单个跨帧编辑缓冲相对基线是否「脏」。
@@ -3205,6 +3220,7 @@ fn draft_baseline_is_in_vault(m: Modal) -> bool {
         | Modal::ExitConfirm
         | Modal::Rehost
         | Modal::ProjectPick
+        | Modal::OverwriteAlert
         | Modal::History => false,
     }
 }
@@ -3234,7 +3250,8 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
         | Modal::FilesRename
         | Modal::FilesNewName
         | Modal::FilesFind
-        | Modal::Paste => None,
+        | Modal::Paste
+        | Modal::OverwriteAlert => None,
         Modal::About => ui
             .about_open
             .then(|| vec![w(crate::ui::ABOUT_WINDOW_TITLE)]),
@@ -5234,6 +5251,8 @@ impl App {
             Modal::FilesFind => self.files_finding(),
             // F148:见 `Modal::History` 的说明(T8)。
             Modal::History => self.ui.history.is_some(),
+            // F366:见 `Modal::OverwriteAlert` 的说明(T8)。
+            Modal::OverwriteAlert => self.ui.overwrite_alert.is_some(),
         })
     }
 
@@ -5315,6 +5334,7 @@ impl App {
             | Modal::ExitConfirm
             | Modal::Rehost
             | Modal::ProjectPick
+            | Modal::OverwriteAlert
             | Modal::History => false,
             // 文件面板里的三个**就地**输入框不走「点外面关」这条路(它们
             // 不在 `DISMISS_ORDER` 里,这个函数永远不会为它们被问到),
@@ -5414,7 +5434,8 @@ impl App {
             | Modal::FilesRename
             | Modal::FilesNewName
             | Modal::FilesFind
-            | Modal::Paste => {}
+            | Modal::Paste
+            | Modal::OverwriteAlert => {}
         }
         mark_ui_dirty!(self.ui_dirty);
     }
@@ -10224,6 +10245,41 @@ impl App {
         }
     }
 
+    /// F366:施加覆盖失败告警框的出口,并关框。
+    ///
+    /// 「重试」= 只把框里那几条按**原输入、仍按覆盖**重新入队,并从队列里摘掉
+    /// 旧的那条失败行(不然面板上同名两行,一红一跑)。属主标签已经关了的
+    /// 跳过 —— 挂在死世代上的 job 只会被 `pump_transfers` 当场取消。
+    fn apply_overwrite_alert(&mut self, out: crate::ui::overwrite_alert::AlertOut) {
+        let Some(alert) = self.ui.overwrite_alert.take() else {
+            return;
+        };
+        let retry_specs = std::mem::take(&mut self.transfer.retry_specs);
+        if out != crate::ui::overwrite_alert::AlertOut::Retry {
+            return;
+        }
+        for item in alert.items {
+            let Some(spec) = retry_specs.get(&item.job) else {
+                continue;
+            };
+            if self.tabs.by_generation(spec.generation).is_none() {
+                continue;
+            }
+            self.transfer.queue.remove(item.job);
+            let id = self.transfer.queue.push(crate::files::queue::NewJob {
+                dir: spec.dir,
+                generation: spec.generation,
+                label: item.label,
+                total: item.total,
+            });
+            self.transfer
+                .queue
+                .set_resolved(id, crate::files::queue::Conflict::Overwrite);
+            self.transfer.specs.insert(id, spec.clone());
+        }
+        self.request_ui_redraw();
+    }
+
     /// F330/F332:整批进全局传输队列。`confirmed` = 用户在冲突框里点「全部
     /// 覆盖」时框里列的那些名字(只有它们预设覆盖,见 `paste_files::enqueue`)。批次登记在 `paste_batches`,回填只在 `TransferDone` 里
     /// 等整批落地之后做(T11:判定不从这里——调用点——起算)。
@@ -14102,11 +14158,30 @@ impl ApplicationHandler<UserEvent> for App {
                 // Progress —— 后者一个大文件几千条(见同 arm 的 T3 守护)。
                 diag::count_sftp_op();
                 self.transfer.cancels.remove(&job);
+                // F366:用户明确选了「覆盖」的下载失败了 —— 走告警框(带重试),
+                // 不再另弹 F279 的顶栏错误卡(同一件事两处报)。判据要在
+                // `finish` 之前取:`resolved` 之后还在,但这样读更直白。
+                let overwrite_failed = self.transfer.queue.get(job).and_then(|j| {
+                    overwrite_alert_applies(j.dir, j.resolved, &result)
+                        .then(|| (j.label.clone(), j.total))
+                });
                 // F279:失败要看得见。冲突/取消除外(决策见 should_pop_transfer_error)。
-                if should_pop_transfer_error(&result) {
+                if should_pop_transfer_error(&result) && overwrite_failed.is_none() {
                     if let Err(m) = &result {
                         self.ui.set_error(format!("传输失败:{m}"));
                     }
+                }
+                if let (Some((label, total)), Err(m), Some(spec)) =
+                    (overwrite_failed, &result, self.transfer.specs.get(&job))
+                {
+                    self.transfer.retry_specs.insert(job, spec.clone());
+                    crate::ui::overwrite_alert::push_failure(
+                        &mut self.ui.overwrite_alert,
+                        label,
+                        m,
+                        job,
+                        total,
+                    );
                 }
                 self.transfer.queue.finish(job, result);
                 // F332:终端粘贴文件的批次汇合。**唯一的回填点**(T11):判定
@@ -16014,6 +16089,11 @@ impl ApplicationHandler<UserEvent> for App {
                                     crate::ui::toast::Kind::Ok,
                                     "标注已复制,粘进 Claude Code",
                                 );
+                                mark_ui_dirty!(self.ui_dirty);
+                            }
+                            // F366:覆盖失败告警框的出口。
+                            if let Some(out) = actions.overwrite_alert {
+                                self.apply_overwrite_alert(out);
                                 mark_ui_dirty!(self.ui_dirty);
                             }
                             // F281:分层理由见 `UiActions::copy_last_error`。
@@ -18221,6 +18301,19 @@ fn project_lamps_have_audience(manager_open: bool, launcher: bool, pick_open: bo
 /// F279:一次传输收工,要不要弹错误卡。冲突不弹(有自己的弹窗),
 /// 取消不弹(用户自己点的);其余失败**必须**弹 —— 此前失败只落在
 /// 传输列表里,本地文件被 Excel 锁住时读失败等于静默(实报,选项 C+甲)。
+/// F366:这次收工要不要进「覆盖失败」告警框。只管**用户明确选了覆盖的下载**
+/// (远端 → 本机,目标被 Excel 等占用是主场景);上传失败、没选覆盖的下载失败
+/// 维持传输面板红字 + F279 错误卡。冲突/取消哨兵不是失败。
+fn overwrite_alert_applies(
+    dir: crate::files::queue::Direction,
+    resolved: Option<crate::files::queue::Conflict>,
+    result: &Result<(), String>,
+) -> bool {
+    dir == crate::files::queue::Direction::Download
+        && resolved == Some(crate::files::queue::Conflict::Overwrite)
+        && should_pop_transfer_error(result)
+}
+
 fn should_pop_transfer_error(result: &Result<(), String>) -> bool {
     match result {
         Ok(()) => false,
@@ -18718,6 +18811,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.history.is_some()
         || a.pack.is_some()
         || a.copy_last_error
+        || a.overwrite_alert.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -19068,17 +19162,17 @@ mod tests {
         files_start_dir, finish_password_change, follow_for_clip_mode, font_px_for,
         has_real_action, history_rows_of, history_sync, host_for_fresh, ime_cursor_area,
         ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
-        next_panel_selection_index, opt_buf_dirty, pane_reports_of, pane_still_wanted,
-        paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience, pump_all_tabs,
-        reattach_pane, rehost_pane, rehost_voids_attach_intent, remote_bookmark_owner,
-        resolved_scrollback, session_manager_dirty, settle_attention_of, should_check_attach,
-        should_flash, should_pop_cloud_error, should_pop_transfer_error, snapshot_tabs_of,
-        sync_plan_of, sync_remote_bookmarks_of, sync_timeout_wake_at, sync_timeout_wake_of,
-        tab_has_attention, tab_keeps_template, tab_title, take_next_restore_dial,
-        tmux_attach_for_connect, upload_job, user_event_marks_dirty, wind_down, window_title_of,
-        AttachCheck, AttachVerdict, DialTicket, HistorySync, Modal, OpFollow, PasteDecision,
-        RehostKind, RestoredTab, SshConfig, SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach,
-        UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
+        next_panel_selection_index, opt_buf_dirty, overwrite_alert_applies, pane_reports_of,
+        pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
+        pump_all_tabs, reattach_pane, rehost_pane, rehost_voids_attach_intent,
+        remote_bookmark_owner, resolved_scrollback, session_manager_dirty, settle_attention_of,
+        should_check_attach, should_flash, should_pop_cloud_error, should_pop_transfer_error,
+        snapshot_tabs_of, sync_plan_of, sync_remote_bookmarks_of, sync_timeout_wake_at,
+        sync_timeout_wake_of, tab_has_attention, tab_keeps_template, tab_title,
+        take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
+        wind_down, window_title_of, AttachCheck, AttachVerdict, DialTicket, HistorySync, Modal,
+        OpFollow, PasteDecision, RehostKind, RestoredTab, SshConfig, SyncPlan, Tab, TabContent,
+        TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -19231,6 +19325,77 @@ mod tests {
             "决策排在 finish 之后 —— result 已被拿走,永远弹不出来"
         );
         assert!(arm.contains("set_error"), "决策了却没弹卡");
+    }
+
+    /// F366:只有「选了覆盖的下载」失败才进告警框;上传、没选覆盖、冲突/取消
+    /// 哨兵都不进(维持面板红字 + F279 错误卡)。
+    #[test]
+    fn only_a_failed_download_the_user_chose_to_overwrite_raises_the_alert() {
+        use crate::files::queue::{Conflict, Direction, CANCEL_MARKER, CONFLICT_MARKER};
+        let busy: Result<(), String> = Err("x (os error 32)".into());
+        let ow = Some(Conflict::Overwrite);
+        assert!(overwrite_alert_applies(Direction::Download, ow, &busy));
+        assert!(!overwrite_alert_applies(Direction::Upload, ow, &busy));
+        assert!(!overwrite_alert_applies(Direction::Download, None, &busy));
+        assert!(!overwrite_alert_applies(Direction::Download, ow, &Ok(())));
+        assert!(!overwrite_alert_applies(
+            Direction::Download,
+            ow,
+            &Err(CANCEL_MARKER.into())
+        ));
+        assert!(!overwrite_alert_applies(
+            Direction::Download,
+            ow,
+            &Err(CONFLICT_MARKER.into())
+        ));
+    }
+
+    /// F366:接线守护。告警判据必须在 `finish` 之前取、错误卡要让位(同一件事
+    /// 不两处报)、真的推进告警框,并且把 spec 另存给重试 —— `specs` 收尾即回收。
+    ///
+    /// 自证会变红:删掉 arm 里的 `push_failure(` 调用,或把 F279 判断里的
+    /// `&& overwrite_failed.is_none()` 去掉。
+    #[test]
+    fn a_failed_overwrite_download_goes_to_the_alert_instead_of_the_error_card() {
+        let src = strip_comments(prod_src());
+        let arm = arm_of(&src, "UserEvent::TransferDone { job, result }");
+        let judge = arm
+            .find("overwrite_alert_applies(")
+            .expect("arm 里没取告警判据");
+        let fin = arm.find(".finish(job, result)").expect("arm 里没收队列");
+        assert!(judge < fin, "判据排在 finish 之后");
+        assert!(
+            arm.contains("should_pop_transfer_error(&result) && overwrite_failed.is_none()"),
+            "错误卡没给告警框让位 —— 同一次失败两处报"
+        );
+        let push = arm.find("push_failure(").expect("没推进告警框");
+        assert!(push < fin, "推进告警框排在 finish 之后");
+        assert!(arm.contains("retry_specs.insert("), "没另存重试用的 spec");
+        let hra = body_of(&src, "fn has_real_action(");
+        assert!(
+            hra.contains("a.overwrite_alert"),
+            "告警框按钮会在 egui 的 discard 趟被静默吃掉"
+        );
+        assert!(
+            src.contains("if let Some(out) = actions.overwrite_alert {"),
+            "告警框的出口没人收"
+        );
+    }
+
+    /// F366:重试只重跑失败的那几条、仍按覆盖、摘掉旧行;框关掉时另存表清空。
+    ///
+    /// 自证会变红:删掉 `set_resolved(` 那行(重跑会再撞冲突框),或删掉
+    /// `queue.remove(item.job)`(面板上同名两行)。
+    #[test]
+    fn retrying_requeues_with_overwrite_and_drops_the_stale_row() {
+        let src = strip_comments(prod_src());
+        let body = body_of(&src, "fn apply_overwrite_alert(");
+        assert!(body.contains("std::mem::take(&mut self.transfer.retry_specs)"));
+        let rm = body.find("queue.remove(item.job)").expect("没摘旧行");
+        let push = body.find("queue.push(").expect("没重新入队");
+        assert!(rm < push);
+        assert!(body.contains("Conflict::Overwrite"), "重跑没预设覆盖");
+        assert!(body.contains("specs.insert(id"), "新 job 没登记 spec");
     }
 
     /// F252:传完之后要点亮的那一条,记在**收货那一栏的当前目录**下 ——
@@ -21866,6 +22031,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::Pack),
                     "Pack 没登记进 Modal::ALL(T8)"
                 ),
+                Modal::OverwriteAlert => assert!(
+                    Modal::ALL.contains(&Modal::OverwriteAlert),
+                    "OverwriteAlert 没登记进 Modal::ALL(T8/F366)"
+                ),
                 Modal::Settings => assert!(
                     Modal::ALL.contains(&Modal::Settings),
                     "Settings 没登记进 Modal::ALL(T8)"
@@ -21971,6 +22140,7 @@ mod tests {
             Modal::FilesNewName,
             Modal::FilesFind,
             Modal::History,
+            Modal::OverwriteAlert,
         ] {
             check(m);
         }
@@ -22104,7 +22274,7 @@ mod tests {
                 Modal::ProjectPick => "project_pick::show(",
                 Modal::ExitConfirm => "if ui_state.exit_pending {",
                 Modal::Pack => "pack_dialog::show(",
-                // 豁免的八类不参与「点外面即关」,也就不需要排序。
+                // 豁免的九类不参与「点外面即关」,也就不需要排序。
                 Modal::Unlock
                 | Modal::HostKey
                 | Modal::Editor
@@ -22112,7 +22282,8 @@ mod tests {
                 | Modal::FilesRename
                 | Modal::FilesNewName
                 | Modal::FilesFind
-                | Modal::Paste => "",
+                | Modal::Paste
+                | Modal::OverwriteAlert => "",
             }
         }
 
@@ -22142,17 +22313,19 @@ mod tests {
         }
     }
 
-    /// F239:豁免的是哪八类,写死在这里。
+    /// F239:豁免的是哪九类,写死在这里。
     ///
-    /// **不是**「实现是什么就断言什么」——这八类各有各的理由,任何一个被
+    /// **不是**「实现是什么就断言什么」——这九类各有各的理由,任何一个被
     /// 顺手挪出豁免表都会造成真实损失:主密码框关掉 = 回到无库状态;
     /// TOFU 框关掉 = 一次必须显式回答的安全判断被逃掉;编辑器关掉 =
     /// 未回传的远端文件正文没了;四个就地输入框根本不是窗口,没有「外面」;
-    /// 粘贴确认框走 `egui::Modal` 自带的遮罩点击,不在这里重复接。
+    /// 粘贴确认框走 `egui::Modal` 自带的遮罩点击,不在这里重复接;
+    /// F366 覆盖失败告警框关掉 = 重试入口(另存的传输输入)一并丢掉,
+    /// 而用户多半是去关 Excel 时顺手点到了窗口外面。
     ///
     /// 自证会变红:把任意一个变体从 `DISMISS_EXEMPT` 里挪走。
     #[test]
-    fn the_exemptions_are_exactly_the_eight_that_would_lose_something() {
+    fn the_exemptions_are_exactly_the_nine_that_would_lose_something() {
         let want = [
             Modal::Unlock,
             Modal::HostKey,
@@ -22162,6 +22335,7 @@ mod tests {
             Modal::FilesNewName,
             Modal::FilesFind,
             Modal::Paste,
+            Modal::OverwriteAlert,
         ];
         for m in want {
             assert!(DISMISS_EXEMPT.contains(&m), "{m:?} 应该豁免");
