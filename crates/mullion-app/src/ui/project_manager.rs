@@ -182,11 +182,26 @@ fn list_column(
         ui.set_width(crate::ui::session_manager::LIST_W);
         // 搜索框独占一整行:原来它旁边挂着「添加」按钮,只剩 96px,一个路径
         // 片段都打不下。
+        // F364:键盘导航要在画搜索框**之前**扫(单行 TextEdit 自己也吃
+        // ↑↓/Enter),所以这里按上一帧的 tab 先算一份行;画列表用的那份仍在
+        // tab 栏之后算 —— 点 tab 要当帧换行(`clicking_the_archived_tab_..`)。
+        let search_id = egui::Id::new("project_manager_search");
+        let moved = {
+            let frozen = crate::ui::freeze_lamps(&mut ui_state.pm_frozen_lamps, lamps);
+            let nav_rows = crate::ui::project_list::rows(
+                projects,
+                ui_state.project_tab,
+                &ui_state.project_search,
+                sessions,
+                frozen,
+            );
+            nav_keys(ui.ctx(), search_id, ui_state, projects, &nav_rows)
+        };
         let w = field_w(ui.available_width(), FIELD_W_L, 0.0);
         let search = crate::ui::search_box::search_box(
             ui,
             &mut ui_state.project_search,
-            egui::Id::new("project_manager_search"),
+            search_id,
             crate::theme::hint_text(t, "搜索项目名 / 目录 / 节点"),
             w,
         );
@@ -294,6 +309,9 @@ fn list_column(
                             dialing: false,
                         },
                     );
+                    if moved && ui_state.project_selected == Some(p.id) {
+                        r.scroll_to_me(None);
+                    }
                     if r.clicked() {
                         ui_state.project_selected = Some(p.id);
                         ui_state.project_draft = Some(p.clone());
@@ -301,6 +319,69 @@ fn list_column(
                 }
             });
     });
+}
+
+/// F364:右栏草稿「脏不脏 / 能不能开」。左栏键盘导航与右栏「打开」按钮共用
+/// 这一份 —— 两边各算一遍的话迟早分叉(按钮灰着、回车却开了)。
+///
+/// 「打开」拿的是**库里那份**,不是草稿:草稿改了没保存就打开,连过去的是
+/// 草稿里的目录/tmux 名,而配置库里根本没这回事(F223)。所以脏了就不让开。
+fn draft_state(stored: Option<&ProjectRecord>, draft: &ProjectRecord) -> (bool, bool) {
+    let dirty = stored != Some(draft);
+    let openable = stored.is_some_and(|p| !p.nodes.is_empty()) && !dirty;
+    (dirty, openable)
+}
+
+/// F364:左栏搜索框里的 ↑↓/Enter。返回「选中这一帧被方向键挪过」(调用方据此
+/// 把那一行滚进视野)。
+///
+/// - ↑↓:右栏草稿脏时**原地不动**,置 `pm_nav_blocked` 让提示变醒目 ——
+///   连按 ↓ 冲过头静默丢草稿的代价不对称。鼠标点击的静默替换是既有行为,
+///   不在这里改。
+/// - Enter:等于点「打开」—— 同一条 `project_open_request`。草稿脏 / 无节点
+///   时无动作,与按钮置灰一致;「已归档」档照样能开(`openable` 不看归档)。
+fn nav_keys(
+    ctx: &egui::Context,
+    search_id: egui::Id,
+    ui_state: &mut crate::ui::UiState,
+    projects: &[ProjectRecord],
+    rows: &[&ProjectRecord],
+) -> bool {
+    let mut sel = rows
+        .iter()
+        .position(|p| Some(p.id) == ui_state.project_selected);
+    let before = sel;
+    let nav = crate::ui::project_nav::scan(
+        ctx,
+        search_id,
+        &mut sel,
+        rows.len(),
+        !ui_state.project_search.trim().is_empty(),
+    );
+    let draft_dirty = ui_state
+        .project_draft
+        .as_ref()
+        .is_some_and(|d| draft_state(projects.iter().find(|p| p.id == d.id), d).0);
+    let mut moved = false;
+    if nav.moved && sel != before {
+        if draft_dirty {
+            ui_state.pm_nav_blocked = true;
+        } else if let Some(p) = sel.and_then(|i| rows.get(i)) {
+            ui_state.project_selected = Some(p.id);
+            ui_state.project_draft = Some((*p).clone());
+            moved = true;
+        }
+    }
+    if let Some(p) = nav.open.and_then(|i| rows.get(i)) {
+        if draft_dirty {
+            ui_state.pm_nav_blocked = true;
+        } else if draft_state(Some(p), p).1 {
+            ui_state.project_selected = Some(p.id);
+            ui_state.project_draft = Some((*p).clone());
+            ui_state.project_open_request = Some((p.id, None));
+        }
+    }
+    moved
 }
 
 /// 「说明」多行框的 id。
@@ -389,8 +470,11 @@ fn form_column(
     // 就打开的话,连过去的是草稿里的目录/tmux 名,而配置库里根本没这回事,
     // 下次再打开又变回去。所以草稿脏了就先不让开。
     let stored = projects.iter().find(|p| p.id == id);
-    let dirty = stored != Some(&*draft);
-    let openable = stored.is_some_and(|p| !p.nodes.is_empty()) && !dirty;
+    let (dirty, openable) = draft_state(stored, draft);
+    if !dirty {
+        ui_state.pm_nav_blocked = false;
+    }
+    let nav_blocked = ui_state.pm_nav_blocked;
     let save_draft = draft.clone();
     // F257:按钮上的字取**库里那份**的归档态,不是草稿 —— 草稿里的
     // `archived_at` 永远不会被右栏任何一个控件改到(设计:只由这个按钮写),
@@ -458,9 +542,12 @@ fn form_column(
             });
             if dirty {
                 ui.add_space(SP_XS);
+                // F364:左栏 ↑↓/回车被这份脏草稿挡住时提示改 warn 色 —— 灰字
+                // 时用户只会觉得「按键没反应」。
+                let c = if nav_blocked { t.warn } else { t.fg_muted };
                 ui.label(
                     egui::RichText::new("有未保存的改动,先保存再打开。")
-                        .color(crate::theme::c32(t.fg_muted)),
+                        .color(crate::theme::c32(c)),
                 );
             }
         });
@@ -983,6 +1070,179 @@ mod tests {
             memos: Vec::new(),
             icon: None,
         }
+    }
+
+    /// F364:左栏键盘导航的 harness。`keys` 逐帧按下;第 0 帧后把焦点给搜索框。
+    /// `edit` 在聚焦之后、按键之前改一下草稿(模拟「右栏有未保存改动」)。
+    fn pm_keys(
+        ps: &[ProjectRecord],
+        ui_state: &mut crate::ui::UiState,
+        edit: impl FnOnce(&mut crate::ui::UiState),
+        keys: &[egui::Key],
+    ) {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let lamps = std::collections::BTreeMap::new();
+        let sessions = vec![sess(7, "web01", Protocol::Ssh)];
+        let frame = |ui_state: &mut crate::ui::UiState, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(
+                        ctx,
+                        &t,
+                        ui_state,
+                        ps,
+                        &lamps,
+                        &sessions,
+                        &crate::ui::badge::AppearanceCache::default(),
+                        None,
+                    );
+                },
+            );
+        };
+        frame(ui_state, vec![]);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("project_manager_search")));
+        frame(ui_state, vec![]);
+        edit(ui_state);
+        for k in keys {
+            frame(
+                ui_state,
+                vec![egui::Event::Key {
+                    key: *k,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+    }
+
+    /// 两个项目,都挂了节点 7(可打开);按最近访问排,`a` 在前。
+    fn two_openable() -> Vec<ProjectRecord> {
+        let mut a = proj(1, "a", Some("2026-09-02T00:00:00Z"));
+        let mut b = proj(2, "b", Some("2026-09-01T00:00:00Z"));
+        a.nodes = vec![SessionId(7)];
+        b.nodes = vec![SessionId(7)];
+        vec![a, b]
+    }
+
+    /// F364:左栏搜索框有焦点时 ↓ 挪选中,右栏草稿跟着切(同点击)。
+    ///
+    /// 自证会变红:删掉 `list_column` 里 `project_nav::scan` 那段。
+    #[test]
+    fn arrow_down_in_the_search_box_moves_the_selection_and_the_form() {
+        let ps = two_openable();
+        let mut st = crate::ui::UiState {
+            project_manager_open: true,
+            ..Default::default()
+        };
+        pm_keys(
+            &ps,
+            &mut st,
+            |_| {},
+            &[egui::Key::ArrowDown, egui::Key::ArrowDown],
+        );
+        assert_eq!(st.project_selected, Some(ProjectId(2)));
+        assert_eq!(st.project_draft.as_ref().map(|d| d.id), Some(ProjectId(2)));
+        assert_eq!(st.project_open_request, None, "↑↓ 不该打开");
+    }
+
+    /// F364:右栏有未保存改动时 ↑↓ 原地不动、草稿保留,并让提示变醒目 ——
+    /// 连按 ↓ 冲过头静默丢草稿的代价不对称。
+    ///
+    /// 自证会变红:去掉 `moved` 那一支的 `draft_dirty` 判断。
+    #[test]
+    fn arrow_keys_do_not_switch_away_from_a_dirty_draft() {
+        let ps = two_openable();
+        let mut st = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(ProjectId(1)),
+            project_draft: Some(ps[0].clone()),
+            ..Default::default()
+        };
+        pm_keys(
+            &ps,
+            &mut st,
+            |st| st.project_draft.as_mut().unwrap().name = "改了没存".into(),
+            &[egui::Key::ArrowDown],
+        );
+        assert_eq!(st.project_selected, Some(ProjectId(1)), "脏草稿被 ↓ 切走了");
+        assert_eq!(
+            st.project_draft.as_ref().map(|d| d.name.as_str()),
+            Some("改了没存"),
+            "草稿被丢了"
+        );
+        assert!(st.pm_nav_blocked, "挡住了却没让提示变醒目");
+    }
+
+    /// F364:Enter = 点「打开」。高亮行可打开且无脏草稿时发同一条
+    /// `project_open_request`。
+    ///
+    /// 自证会变红:删掉 `nav.open` 那一支。
+    #[test]
+    fn enter_opens_the_highlighted_project_like_the_open_button() {
+        let ps = two_openable();
+        let mut st = crate::ui::UiState {
+            project_manager_open: true,
+            ..Default::default()
+        };
+        pm_keys(
+            &ps,
+            &mut st,
+            |_| {},
+            &[egui::Key::ArrowDown, egui::Key::ArrowDown, egui::Key::Enter],
+        );
+        assert_eq!(st.project_open_request, Some((ProjectId(2), None)));
+    }
+
+    /// F364:不可打开(无节点 / 草稿脏)时 Enter 无动作,与按钮置灰一致。
+    #[test]
+    fn enter_does_nothing_when_the_project_cannot_be_opened() {
+        let ps = vec![proj(1, "a", None)];
+        let mut st = crate::ui::UiState {
+            project_manager_open: true,
+            ..Default::default()
+        };
+        pm_keys(
+            &ps,
+            &mut st,
+            |_| {},
+            &[egui::Key::ArrowDown, egui::Key::Enter],
+        );
+        assert_eq!(st.project_open_request, None, "无节点的项目被回车打开了");
+
+        let ps = two_openable();
+        let mut st = crate::ui::UiState {
+            project_manager_open: true,
+            project_selected: Some(ProjectId(1)),
+            project_draft: Some(ps[0].clone()),
+            ..Default::default()
+        };
+        pm_keys(
+            &ps,
+            &mut st,
+            |st| st.project_draft.as_mut().unwrap().dir = "/改了".into(),
+            &[egui::Key::Enter],
+        );
+        assert_eq!(st.project_open_request, None, "脏草稿被回车打开了");
+    }
+
+    /// F364:「能不能开」左栏键盘与右栏按钮共用同一份判据。
+    #[test]
+    fn draft_state_is_dirty_when_the_draft_differs_and_openable_only_when_clean_with_nodes() {
+        let ps = two_openable();
+        assert_eq!(draft_state(Some(&ps[0]), &ps[0]), (false, true));
+        let mut d = ps[0].clone();
+        d.name = "x".into();
+        assert_eq!(draft_state(Some(&ps[0]), &d), (true, false));
+        let bare = proj(3, "c", None);
+        assert_eq!(draft_state(Some(&bare), &bare), (false, false));
+        assert_eq!(draft_state(None, &bare), (true, false), "库里没有 = 脏");
     }
 
     fn sess(id: u64, name: &str, proto: Protocol) -> SessionRecord {

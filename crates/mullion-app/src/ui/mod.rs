@@ -360,6 +360,9 @@ pub struct UiState {
     /// 右栏那份编辑草稿。**改动只活在这里**,点保存才变成意图 ——
     /// 直接改 store 里那份的话,用户按 Esc 关窗等于「没保存也生效了」。
     pub project_draft: Option<mullion_store::ProjectRecord>,
+    /// F364:左栏 ↑↓/回车这一次被右栏的脏草稿挡住了 —— 右栏「有未保存的改动」
+    /// 提示据此改醒目色。草稿变干净(保存/撤回)即复位。
+    pub pm_nav_blocked: bool,
     /// 项目管理弹窗里点了新建/保存/删除 → app 事后据此调 `store`。
     pub project_intent: Option<crate::ui::project_manager::ProjectIntent>,
 
