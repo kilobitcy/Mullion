@@ -326,6 +326,11 @@ pub const SHORTCUTS: &[Shortcut] = &[
         SECTION_PROJECT,
         "把当前分屏的目录和 tmux 会话收成一个新项目(焦点在文件面板时让位)",
     ),
+    row(
+        Keys::Bound(crate::hotkeys::Action::ProjectMemo),
+        SECTION_PROJECT,
+        "打开当前分屏所属项目的备忘(焦点在文件面板时让位)",
+    ),
     // —— 命令抽屉(app.rs bound_hotkey_event)——
     row(
         Keys::Bound(crate::hotkeys::Action::ToggleDrawer),
@@ -505,7 +510,7 @@ mod tests {
         assert_eq!(shared[0].section, SECTION_FILES);
     }
 
-    /// 7 条可配动作在表里各有且只有一行;每一行都登记了 `what`。
+    /// 8 条可配动作在表里各有且只有一行;每一行都登记了 `what`。
     ///
     /// 自证会变红:把命令抽屉那行改回 `Keys::Chord(..)`。
     #[test]

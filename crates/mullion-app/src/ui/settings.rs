@@ -117,7 +117,7 @@ pub struct SettingsDraft {
     pub cloud_pass_new: String,
     /// F283:「确认口令」框。
     pub cloud_pass_confirm: String,
-    /// F294:7 条可配热键的当前值(**全量**,默认已填上);点「确定」时只把
+    /// F294:8 条可配热键的当前值(**全量**,默认已填上);点「确定」时只把
     /// 与默认不同的写回 `Settings.hotkeys`(`hotkeys::write_back`)。
     pub hotkeys: std::collections::BTreeMap<crate::hotkeys::Action, mullion_store::Chord>,
     /// F294:正在等用户按新组合键的那一行。

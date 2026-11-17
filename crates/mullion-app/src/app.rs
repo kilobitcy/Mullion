@@ -5570,6 +5570,12 @@ impl App {
                 self.apply_project_hotkey();
             }
             Action::ToggleDrawer => self.apply_drawer_hotkey(),
+            Action::ProjectMemo => {
+                if self.effective_focus() == shell::input_route::Focus::FilesPanel {
+                    return false;
+                }
+                self.apply_memo_hotkey();
+            }
         }
         self.request_ui_redraw();
         true
@@ -10244,6 +10250,9 @@ impl App {
             }
         }
     }
+
+    /// F367:Ctrl+Shift+M —— 在焦点分屏上开所属项目的备忘浮层。
+    fn apply_memo_hotkey(&mut self) {}
 
     /// F366:施加覆盖失败告警框的出口,并关框。
     ///
@@ -36326,6 +36335,7 @@ mod tests {
                 Action::ToggleFocus => "self.focus.toggled()",
                 Action::NewProject => "self.apply_project_hotkey()",
                 Action::ToggleDrawer => "self.apply_drawer_hotkey()",
+                Action::ProjectMemo => "self.apply_memo_hotkey()",
             }
         };
         for a in crate::hotkeys::Action::ALL {

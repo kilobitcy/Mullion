@@ -46,6 +46,16 @@ pub struct Nav {
     pub open: Option<usize>,
 }
 
+/// 消费这一帧的裸回车。组字提交与回车同帧到达时,这个回车是「确认候选」
+/// 的那一下,不是「打开 / 提交」—— 不消费、返回 `false`。F367 备忘浮层同用。
+pub fn take_enter(i: &mut egui::InputState) -> bool {
+    let committing = i
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::Ime(egui::ImeEvent::Commit(_))));
+    !committing && i.consume_key(Modifiers::NONE, Key::Enter)
+}
+
 /// 扫这一帧的键盘。**必须在画搜索框之前调用**:单行 `TextEdit` 自己也吃
 /// ↑↓/Enter(挪光标、失焦),先消费掉它才拿不到。
 ///
@@ -66,16 +76,10 @@ pub fn scan(
     }
     let mut nav = Nav::default();
     let (down, up, enter) = ctx.input_mut(|i| {
-        // 组字提交与回车同帧到达时,这个回车是「确认候选」的那一下,
-        // 不是「打开项目」—— 不消费、不响应。
-        let committing = i
-            .events
-            .iter()
-            .any(|e| matches!(e, Event::Ime(egui::ImeEvent::Commit(_))));
         (
             i.consume_key(Modifiers::NONE, Key::ArrowDown),
             i.consume_key(Modifiers::NONE, Key::ArrowUp),
-            !committing && i.consume_key(Modifiers::NONE, Key::Enter),
+            take_enter(i),
         )
     });
     if down || up {
@@ -92,6 +96,39 @@ pub fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F367:同帧有组字提交时回车不被拿走(也不被消费,留给输入框自己)。
+    #[test]
+    fn enter_in_the_same_frame_as_an_ime_commit_is_not_taken() {
+        let key = |pressed| Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .events
+            .push(Event::Ime(egui::ImeEvent::Commit("我".into())));
+        input.events.push(key(true));
+        let mut got = None;
+        let _ = ctx.run(input, |ctx| {
+            got = Some(ctx.input_mut(|i| {
+                let taken = take_enter(i);
+                (taken, i.key_pressed(Key::Enter))
+            }));
+        });
+        assert_eq!(got, Some((false, true)), "组字回车被拿走了");
+
+        let mut input = egui::RawInput::default();
+        input.events.push(key(true));
+        let _ = ctx.run(input, |ctx| {
+            got = Some(ctx.input_mut(|i| (take_enter(i), i.key_pressed(Key::Enter))));
+        });
+        assert_eq!(got, Some((true, false)), "裸回车没拿走或没消费");
+    }
 
     #[test]
     fn stepping_stops_at_both_ends_instead_of_wrapping() {

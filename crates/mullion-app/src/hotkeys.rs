@@ -3,7 +3,7 @@
 //! # 没有「Bindings」影子状态
 //!
 //! 真值只有一份:`Settings.hotkeys`(稀疏覆盖)+ [`Action::default_chord`]。
-//! 每次按键 [`resolve`] 直接从 settings 算,7 条比对、零分配。「先拷一份
+//! 每次按键 [`resolve`] 直接从 settings 算,8 条比对、零分配。「先拷一份
 //! 到 App 字段、改设置时记得同步」这种影子状态本项目踩过 N 次。
 //!
 //! # 键口径
@@ -16,7 +16,7 @@ use mullion_store::{Chord, KeyName, Settings};
 use std::collections::BTreeMap;
 use winit::keyboard::{Key as WKey, ModifiersState, NamedKey};
 
-/// 可配的 7 条动作。**Ctrl+1…9 不在这里**(`shell::tabs::digit_hotkey`)。
+/// 可配的 8 条动作。**Ctrl+1…9 不在这里**(`shell::tabs::digit_hotkey`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Action {
     NextTab,
@@ -26,10 +26,12 @@ pub enum Action {
     ToggleFocus,
     NewProject,
     ToggleDrawer,
+    /// F367:在焦点分屏上开项目备忘浮层。
+    ProjectMemo,
 }
 
 impl Action {
-    pub const ALL: [Action; 7] = [
+    pub const ALL: [Action; 8] = [
         Action::NextTab,
         Action::PrevTab,
         Action::CloseTab,
@@ -37,6 +39,7 @@ impl Action {
         Action::ToggleFocus,
         Action::NewProject,
         Action::ToggleDrawer,
+        Action::ProjectMemo,
     ];
 
     /// `settings.toml` 里 `[hotkeys]` 下的键名。**改了就是 schema 变更**。
@@ -49,6 +52,7 @@ impl Action {
             Action::ToggleFocus => "toggle_focus",
             Action::NewProject => "new_project",
             Action::ToggleDrawer => "toggle_drawer",
+            Action::ProjectMemo => "project_memo",
         }
     }
 
@@ -71,6 +75,7 @@ impl Action {
             Action::ToggleFocus => Chord::plain(KeyName::F(6)),
             Action::NewProject => ctrl(true, KeyName::Char('n')),
             Action::ToggleDrawer => ctrl(true, KeyName::Char('`')),
+            Action::ProjectMemo => ctrl(true, KeyName::Char('m')),
         }
     }
 }
@@ -92,7 +97,7 @@ pub fn resolve(settings: &Settings, chord: &Chord) -> Option<Action> {
         .find(|a| chord_for(settings, *a) == *chord)
 }
 
-/// 7 条全量(设置弹窗的草稿用)。
+/// 8 条全量(设置弹窗的草稿用)。
 pub fn all_chords(settings: &Settings) -> BTreeMap<Action, Chord> {
     Action::ALL
         .into_iter()
@@ -109,7 +114,7 @@ pub fn overrides(bound: &BTreeMap<Action, Chord>) -> BTreeMap<String, Chord> {
         .collect()
 }
 
-/// 把草稿里的 7 条写回落盘用的稀疏表。**不是整表替换**:先按动作名把这 7 个
+/// 把草稿里的 8 条写回落盘用的稀疏表。**不是整表替换**:先按动作名把这 8 个
 /// 键清掉,再把非默认的那几条放回去 —— `settings.toml` 是明文、用户会手改,
 /// 里面可能有打错的键名或将来版本才认识的行,整表替换会让「打开设置点一次
 /// 确定」把它们永久抹掉,而且零报错(本仓登记过的「整份覆盖」缺陷族)。
@@ -267,6 +272,15 @@ mod tests {
         all_chords(&Settings::default())
     }
 
+    /// F367:备忘浮层默认 Ctrl+Shift+M(Ctrl+M 是回车的控制码,不能抢)。
+    #[test]
+    fn project_memo_defaults_to_ctrl_shift_m() {
+        let c = Action::ProjectMemo.default_chord();
+        assert!(c.ctrl && c.shift && !c.alt && !c.sup);
+        assert_eq!(c.key, KeyName::Char('m'));
+        assert_eq!(Action::ProjectMemo.name(), "project_memo");
+    }
+
     /// F294 实报:抽屉默认 `` Ctrl+Shift+` ``,旧的 `` Ctrl+` `` **彻底**不再是抽屉键。
     ///
     /// 自证会变红:把 `default_chord` 里 ToggleDrawer 的 `true` 改回 `false`。
@@ -332,7 +346,7 @@ mod tests {
         assert!(overrides(&b).is_empty(), "改回默认之后应当删掉那一条");
     }
 
-    /// 写回**只动这 7 个键名**:用户手写在 `[hotkeys]` 里的别的键名(打错的、
+    /// 写回**只动这 8 个键名**:用户手写在 `[hotkeys]` 里的别的键名(打错的、
     /// 将来版本的)留着不动。整表替换的话,用新版客户端打开一次设置点确定,
     /// 老版本 / 新版本才认识的那些行就永久没了,零报错。
     ///
