@@ -146,10 +146,7 @@ fn row(
         ui.label(egui::RichText::new(tunnel_list::row_title(rec)).color(theme::c32(t.fg_strong)));
         // 起了名的,转发串跟在后面;没起名的标题本身就是转发串,不重复。
         if !rec.name.trim().is_empty() {
-            ui.colored_label(
-                theme::c32(t.fg_dimmer),
-                tunnel_list::forward_summary(rec),
-            );
+            ui.colored_label(theme::c32(t.fg_dimmer), tunnel_list::forward_summary(rec));
         }
         if rec.autostart {
             ui.colored_label(theme::c32(t.fg_dimmer), "[自动]")
@@ -262,9 +259,10 @@ mod tests {
         fn walk(s: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
             match s {
                 egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-                egui::Shape::Text(ts) => {
-                    out.push((ts.galley.text().to_string(), ts.pos + ts.galley.size() / 2.0))
-                }
+                egui::Shape::Text(ts) => out.push((
+                    ts.galley.text().to_string(),
+                    ts.pos + ts.galley.size() / 2.0,
+                )),
                 _ => {}
             }
         }
@@ -329,9 +327,18 @@ mod tests {
     #[test]
     fn the_buttons_report_start_stop_edit_and_manage() {
         let mut f = Fixture::new();
-        assert_eq!(run(&f, &popup(), Some("启动"), vec![]).1, Some(TunnelOut::Start(TunnelId(1))));
-        assert_eq!(run(&f, &popup(), Some("编辑"), vec![]).1, Some(TunnelOut::Edit(TunnelId(1))));
-        assert_eq!(run(&f, &popup(), Some("管理隧道…"), vec![]).1, Some(TunnelOut::Manage));
+        assert_eq!(
+            run(&f, &popup(), Some("启动"), vec![]).1,
+            Some(TunnelOut::Start(TunnelId(1)))
+        );
+        assert_eq!(
+            run(&f, &popup(), Some("编辑"), vec![]).1,
+            Some(TunnelOut::Edit(TunnelId(1)))
+        );
+        assert_eq!(
+            run(&f, &popup(), Some("管理隧道…"), vec![]).1,
+            Some(TunnelOut::Manage)
+        );
         f.states.push((TunnelId(1), TunnelState::Running));
         let (drawn, out) = run(&f, &popup(), Some("停止"), vec![]);
         assert_eq!(out, Some(TunnelOut::Stop(TunnelId(1))));

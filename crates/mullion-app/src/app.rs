@@ -3056,6 +3056,12 @@ enum Modal {
     /// 不碰会话/分组 —— 外观继承链与 scrollback 都与它无关,那条门控触发的
     /// 两次重算对它是纯开销。
     MemoPopup,
+    /// F369:状态栏隧道启停浮层。没有输入框,但有启动/停止按钮,空格/回车是
+    /// 按钮激活键 —— 不算模态的话按键既漏给远端 shell、又可能误触启停(T8)。
+    ///
+    /// **不进 `touched_store`**:它一行 store 都不写(启停只动运行表,
+    /// 编辑跳转交给会话管理器)。
+    TunnelPopup,
 }
 
 impl Modal {
@@ -3085,6 +3091,7 @@ impl Modal {
         Modal::Pack,
         Modal::OverwriteAlert,
         Modal::MemoPopup,
+        Modal::TunnelPopup,
     ];
 }
 
@@ -3097,6 +3104,8 @@ const DISMISS_ORDER: &[Modal] = &[
     // F46-a:排在退出确认之后 —— 绘制顺序上它画在退出确认**之前**,
     // 而这张表与绘制顺序严格互逆(后画的盖在上面、先被问到)。
     Modal::Pack,
+    // F369:画在备忘浮层之后,所以排在它前面。
+    Modal::TunnelPopup,
     // F367:画在切项目弹窗之后,所以排在它前面。
     Modal::MemoPopup,
     Modal::ProjectPick,
@@ -3209,6 +3218,8 @@ fn draft_baseline_is_in_vault(m: Modal) -> bool {
         Modal::Import => true,
         // F367:备注的基线就是库里那个项目的 note。
         Modal::MemoPopup => true,
+        // F369:浮层里没有任何草稿,启停只动运行表。
+        Modal::TunnelPopup => false,
         // F46-a:迁移包弹窗里只有一串口令,库里的表跟它没有任何对应关系
         // (导入那一刻是整份替换磁盘文件,内存里的库根本不参与)。
         Modal::Pack => false,
@@ -3328,6 +3339,10 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
             .memo_popup
             .as_ref()
             .map(|d| vec![crate::ui::memo_popup::area_id(d.pane)]),
+        Modal::TunnelPopup => ui
+            .tunnel_popup
+            .as_ref()
+            .map(|_| vec![crate::ui::tunnel_popup::area_id()]),
     }
 }
 
@@ -4463,9 +4478,11 @@ impl App {
     }
 
     /// F338:会话管理器开着且停在「隧道」页 —— 才有人会看见别的实例的隧道。
+    /// F369:状态栏隧道浮层开着也算。
     fn tunnel_page_visible(&self) -> bool {
-        self.ui.session_manager_open
-            && self.ui.manager_mode == crate::ui::session_manager::ManagerMode::Tunnels
+        self.ui.tunnel_popup.is_some()
+            || (self.ui.session_manager_open
+                && self.ui.manager_mode == crate::ui::session_manager::ManagerMode::Tunnels)
     }
 
     /// F338:读别的实例的隧道状态。平时 15 秒一次,隧道页看得见时 2 秒一次;
@@ -5271,6 +5288,8 @@ impl App {
             Modal::OverwriteAlert => self.ui.overwrite_alert.is_some(),
             // F367:见 `Modal::MemoPopup` 的说明(T8)。
             Modal::MemoPopup => self.ui.memo_popup.is_some(),
+            // F369:见 `Modal::TunnelPopup` 的说明(T8)。
+            Modal::TunnelPopup => self.ui.tunnel_popup.is_some(),
         })
     }
 
@@ -5316,6 +5335,8 @@ impl App {
             }
             // F367:备注改了没存。判据复用浮层自己的(Esc 闸用的同一个)。
             Modal::MemoPopup => self.ui.memo_popup.as_ref().is_some_and(|d| d.note_dirty()),
+            // F369:浮层没有草稿,点外面直接关。
+            Modal::TunnelPopup => false,
             // 分组管理器唯一的草稿就是那个「新建分组」输入框。
             Modal::GroupManager => !self.ui.group_name_buf.trim().is_empty(),
             Modal::TabProps => self.ui.tab_props.as_ref().is_some_and(|d| {
@@ -5448,6 +5469,7 @@ impl App {
             Modal::Rehost => self.ui.rehost = None,
             Modal::ProjectPick => self.ui.project_pick = None,
             Modal::MemoPopup => self.ui.memo_popup = None,
+            Modal::TunnelPopup => self.ui.tunnel_popup = None,
             Modal::Unlock
             | Modal::HostKey
             | Modal::Editor
@@ -13339,23 +13361,22 @@ impl App {
     ///
     /// `-R` 占的是**远端**的端口,S1 在那类上无从谈起 —— 冲突只能等服务端
     /// 拒绝(`RemoteForwardDenied`,同样是致命错误,不进退避)。
-    fn start_tunnel(&mut self, id: mullion_store::TunnelId) {
+    ///
+    /// 当场失败(悬垂引用 / 端口被占)返回 `Err`,**不自己报** —— 管理器报
+    /// 顶栏,浮层顶栏 + 行内(F369)。
+    fn start_tunnel(&mut self, id: mullion_store::TunnelId) -> Result<(), String> {
         use mullion_store::TunnelKind;
         let Some(store) = self.store.as_ref() else {
-            return;
+            return Ok(());
         };
         let Some(rec) = store.tunnels().iter().find(|t| t.id == id).cloned() else {
-            return;
+            return Ok(());
         };
         // 隧道**独占**自己的 SSH 连接(ADR-010),所以这里跟点「连接」走的是
         // 同一个 `ssh_config_for` —— 代理、跳板链一并解析,悬垂引用直接报错。
-        let cfg = match store.ssh_config_for(rec.session_id) {
-            Ok(c) => c,
-            Err(e) => {
-                self.ui.set_error(e.to_string());
-                return;
-            }
-        };
+        let cfg = store
+            .ssh_config_for(rec.session_id)
+            .map_err(|e| e.to_string())?;
         // 本机 listener 只有 `-L`/`-D` 要。`block_on` 一次 bind:目标是
         // `SocketAddr`,没有 DNS 往返,微秒级返回,换来的是「端口占用」这条
         // 错误能当场落进 `last_error`,而不是变成一条需要用户回头去状态栏
@@ -13375,20 +13396,14 @@ impl App {
                     listener,
                     target: (target_host, target_port),
                 },
-                Err(e) => {
-                    self.ui.set_error(e.to_string());
-                    return;
-                }
+                Err(e) => return Err(e.to_string()),
             },
             // `-D` **恒绑回环**(设计 D5):开放的无认证 SOCKS5 代理与
             // 「暴露一个已知目标」是两类风险,`TunnelKind::Dynamic` 在类型上
             // 就没有 `expose` 字段。
             TunnelKind::Dynamic => match bind_local(false) {
                 Ok(listener) => mullion_ssh::tunnel::Forward::Dynamic { listener },
-                Err(e) => {
-                    self.ui.set_error(e.to_string());
-                    return;
-                }
+                Err(e) => return Err(e.to_string()),
             },
             TunnelKind::Remote {
                 target_host,
@@ -13434,6 +13449,77 @@ impl App {
         self.publish_tunnel_state(false);
         self.ui
             .set_toast(crate::ui::toast::Kind::Busy, "隧道启动中…");
+        Ok(())
+    }
+
+    /// F369:状态栏隧道浮层的出口。启停不关浮层(用户多半要连点几条);
+    /// 编辑/管理跳会话管理器,浮层随之关掉。
+    fn apply_tunnel_popup(&mut self, out: crate::ui::tunnel_popup::TunnelOut) {
+        use crate::ui::session_manager::ManagerMode;
+        use crate::ui::tunnel_popup::TunnelOut;
+        match out {
+            TunnelOut::Start(id) => {
+                let r = self.start_tunnel(id);
+                if let Some(p) = self.ui.tunnel_popup.as_mut() {
+                    match &r {
+                        Ok(()) => {
+                            p.errors.remove(&id);
+                        }
+                        Err(e) => {
+                            p.errors.insert(id, e.clone());
+                        }
+                    }
+                }
+                if let Err(e) = r {
+                    self.ui.set_error(e);
+                }
+            }
+            TunnelOut::Stop(id) => {
+                self.tunnels.stop(id);
+                self.publish_tunnel_state(false);
+                if let Some(p) = self.ui.tunnel_popup.as_mut() {
+                    p.errors.remove(&id);
+                }
+                self.ui.set_toast(crate::ui::toast::Kind::Ok, "已停止隧道");
+            }
+            TunnelOut::Edit(id) => {
+                self.ui.tunnel_popup = None;
+                self.ui.session_manager_open = true;
+                self.ui.manager_mode = ManagerMode::Tunnels;
+                if self.ui.tunnel_editor_id == Some(id) {
+                    return;
+                }
+                // 右栏隧道表单有没存的改动就不换缓冲 —— 静默丢草稿比多点一下贵。
+                let unsaved = opt_buf_dirty(
+                    self.ui.tunnel_editor.as_ref(),
+                    self.ui.tunnel_editor_baseline.as_ref(),
+                    crate::ui::session_manager::tunnel_editor::is_dirty,
+                );
+                if unsaved {
+                    self.ui.set_toast(
+                        crate::ui::toast::Kind::Warn,
+                        "右栏隧道有未保存的改动,先保存或放弃再切换",
+                    );
+                    return;
+                }
+                let rec = self
+                    .store
+                    .as_ref()
+                    .and_then(|s| s.tunnels().iter().find(|t| t.id == id));
+                if let Some(rec) = rec {
+                    let buf = crate::ui::session_manager::TunnelEditorBuffer::from_record(rec);
+                    self.ui.tunnel_editor_id = Some(id);
+                    self.ui.tunnel_editor_baseline = Some(buf.clone());
+                    self.ui.tunnel_editor = Some(buf);
+                }
+            }
+            TunnelOut::Manage => {
+                self.ui.tunnel_popup = None;
+                self.ui.session_manager_open = true;
+                self.ui.manager_mode = ManagerMode::Tunnels;
+            }
+            TunnelOut::Close => self.ui.tunnel_popup = None,
+        }
     }
 
     /// F114/F115:收下一次隧道状态上报。
@@ -16192,6 +16278,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.apply_memo_out(out);
                                 mark_ui_dirty!(self.ui_dirty);
                             }
+                            // F369:隧道浮层的出口。
+                            if let Some(out) = actions.tunnel_popup.take() {
+                                self.apply_tunnel_popup(out);
+                                mark_ui_dirty!(self.ui_dirty);
+                            }
                             // F366:覆盖失败告警框的出口。
                             if let Some(out) = actions.overwrite_alert {
                                 self.apply_overwrite_alert(out);
@@ -16538,7 +16629,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.ui.set_toast(crate::ui::toast::Kind::Ok, "已停止隧道");
                 }
                 if let Some(id) = self.ui.tunnel_start_request.take() {
-                    self.start_tunnel(id);
+                    if let Err(e) = self.start_tunnel(id) {
+                        self.ui.set_error(e);
+                    }
                 }
                 // F268:右键「克隆」。深拷贝在 store 层(`Vault::clone_tunnel`),
                 // 这里只落盘、报结果、把新那条选中并把缓冲换成它 —— 克隆出来
@@ -18914,6 +19007,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.copy_last_error
         || a.overwrite_alert.is_some()
         || a.memo_popup.is_some()
+        || a.tunnel_popup.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -19436,6 +19530,40 @@ mod tests {
     ///
     /// 自证会变红:删掉 `apply_memo_out` 里的 `store.save()`;或删掉
     /// `has_real_action` 里的 `a.memo_popup`。
+    /// F369:隧道浮层的接线。出口要过 `has_real_action`、要有人收;启动当场
+    /// 失败要同时落顶栏与行内;编辑跳转要开隧道页、表单脏时不换缓冲;
+    /// 浮层开着时别处的状态按隧道页的节奏读。
+    ///
+    /// 自证会变红:删掉 `has_real_action` 里的 `a.tunnel_popup`;或删掉
+    /// `apply_tunnel_popup` 里的 `p.errors.insert(`。
+    #[test]
+    fn the_tunnel_popup_is_wired_to_start_stop_and_edit() {
+        let src = strip_comments(prod_src());
+        assert!(
+            body_of(&src, "fn has_real_action(").contains("a.tunnel_popup"),
+            "隧道浮层的出口会在 egui 的 discard 趟被静默吃掉"
+        );
+        assert!(
+            src.contains("if let Some(out) = actions.tunnel_popup.take() {"),
+            "隧道浮层的出口没人收"
+        );
+        let ap = body_of(&src, "fn apply_tunnel_popup(");
+        assert!(ap.contains("self.start_tunnel(id)"));
+        assert!(ap.contains("p.errors.insert("), "启动失败没写进行内");
+        assert!(ap.contains("self.ui.set_error(e)"), "启动失败没落顶栏");
+        assert!(ap.contains("self.tunnels.stop(id)"));
+        assert!(ap.contains("self.publish_tunnel_state(false)"));
+        assert!(ap.contains("ManagerMode::Tunnels"));
+        assert!(
+            ap.contains("tunnel_editor::is_dirty"),
+            "编辑跳转会静默覆盖右栏没存的隧道草稿"
+        );
+        assert!(
+            body_of(&src, "fn tunnel_page_visible(").contains("self.ui.tunnel_popup.is_some()"),
+            "浮层开着时别的窗口的隧道状态 15 秒才刷一次"
+        );
+    }
+
     #[test]
     fn the_memo_popup_is_wired_from_hotkey_to_disk() {
         let src = strip_comments(prod_src());
@@ -22177,6 +22305,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::MemoPopup),
                     "MemoPopup 没登记进 Modal::ALL(T8/F367)"
                 ),
+                Modal::TunnelPopup => assert!(
+                    Modal::ALL.contains(&Modal::TunnelPopup),
+                    "TunnelPopup 没登记进 Modal::ALL(T8/F369)"
+                ),
                 Modal::Settings => assert!(
                     Modal::ALL.contains(&Modal::Settings),
                     "Settings 没登记进 Modal::ALL(T8)"
@@ -22284,6 +22416,7 @@ mod tests {
             Modal::History,
             Modal::OverwriteAlert,
             Modal::MemoPopup,
+            Modal::TunnelPopup,
         ] {
             check(m);
         }
@@ -22416,6 +22549,7 @@ mod tests {
                 Modal::Rehost => "rehost::show(",
                 Modal::ProjectPick => "project_pick::show(",
                 Modal::MemoPopup => "memo_popup::show(",
+                Modal::TunnelPopup => "tunnel_popup::show(",
                 Modal::ExitConfirm => "if ui_state.exit_pending {",
                 Modal::Pack => "pack_dialog::show(",
                 // 豁免的九类不参与「点外面即关」,也就不需要排序。

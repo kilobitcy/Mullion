@@ -66,7 +66,6 @@ impl TunnelRuntime {
             .map(|(id, l)| (*id, l.state.clone()))
             .collect()
     }
-
 }
 
 /// 删掉某条会话时要顺手停掉的隧道。
@@ -442,8 +441,20 @@ mod tests {
     /// 挂了一条,状态栏照样是安静的灰色,用户永远不知道。
     #[test]
     fn indicator_takes_the_worst_state_not_the_first() {
-        let a = indicator(&[TunnelState::Running, TunnelState::Failed("x".into())], 2, 0, 0).unwrap();
-        let b = indicator(&[TunnelState::Failed("x".into()), TunnelState::Running], 2, 0, 0).unwrap();
+        let a = indicator(
+            &[TunnelState::Running, TunnelState::Failed("x".into())],
+            2,
+            0,
+            0,
+        )
+        .unwrap();
+        let b = indicator(
+            &[TunnelState::Failed("x".into()), TunnelState::Running],
+            2,
+            0,
+            0,
+        )
+        .unwrap();
         assert_eq!(a, b, "顺序不该影响结论");
         assert_eq!(a.severity, Severity::Danger);
 
@@ -451,7 +462,9 @@ mod tests {
         let w = indicator(&[TunnelState::Running, reconnecting()], 2, 0, 0).unwrap();
         assert_eq!(w.severity, Severity::Warn);
         assert_eq!(
-            indicator(&[TunnelState::Running], 1, 0, 0).unwrap().severity,
+            indicator(&[TunnelState::Running], 1, 0, 0)
+                .unwrap()
+                .severity,
             Severity::Calm
         );
         // 表里还留着但已经 `Stopped` 的,也算需要注意 —— 正常停止是
