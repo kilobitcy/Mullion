@@ -735,7 +735,7 @@ pub fn show(
                             credential_editor::show(ui, t, ui_state, sessions, credential_presence)
                         }
                         ManagerMode::Tunnels => {
-                            tunnel_editor::show(ui, t, ui_state, sessions, credentials)
+                            tunnel_editor::show(ui, t, ui_state, sessions, credentials, tunnels)
                         }
                     }
                 });
@@ -758,13 +758,9 @@ pub fn show(
     // 那里只置一个标志,`build_tunnel_draft` 要整体读缓冲,所以挪到这里。
     if std::mem::take(&mut ui_state.tunnel_save_click) {
         if let Some(buf) = ui_state.tunnel_editor.as_ref() {
-            match tunnel_editor::build_tunnel_draft(buf) {
-                Ok(draft) => {
-                    ui_state.tunnel_save_request = Some(TunnelSaveIntent {
-                        editing_id: ui_state.tunnel_editor_id,
-                        draft,
-                    });
-                }
+            // F370:「两条自动启动同端口」在这里拦,与表单内联提示同源。
+            match tunnel_editor::save_intent(buf, ui_state.tunnel_editor_id, tunnels) {
+                Ok(intent) => ui_state.tunnel_save_request = Some(intent),
                 Err(msg) => ui_state.set_error(msg),
             }
         }

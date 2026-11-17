@@ -187,6 +187,73 @@ pub(crate) fn port_field_error(text: &str) -> bool {
     !text.trim().is_empty() && parse_port(text, "端口").is_err()
 }
 
+/// F370:本地侦听端口撞上了另一条隧道。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PortClash {
+    /// 撞上的那条的标题(`tunnel_list::row_title`)。
+    pub other: String,
+    /// 两条都勾了自动启动 —— 开机会抢同一端口,不许存。
+    pub blocking: bool,
+}
+
+/// 侦听在本机的才参与查重:`-L`(含对外开放)与 `-D`(恒回环)。`-R` 侦听在远端。
+fn listens_locally(kind: TunnelKindUi) -> bool {
+    kind != TunnelKindUi::Remote
+}
+
+/// F370:表单当前的侦听端口是否撞上了**另一条**本地侦听的隧道。
+///
+/// Windows 默认允许 `0.0.0.0:P` 与 `127.0.0.1:P` 同时 bind 成功,流量被更具体
+/// 的那个抢走 —— **静默错路**,所以连「一条开放、一条回环」也算撞。
+/// 只警告不拦:「测试库 / 生产库都映本地 3306、只开一条」是正当用法;
+/// 只有两条都自动启动时(开机两条一起拉)才拦。
+pub(crate) fn port_clash(
+    buf: &TunnelEditorBuffer,
+    editing_id: Option<TunnelId>,
+    tunnels: &[mullion_store::TunnelRecord],
+) -> Option<PortClash> {
+    if !listens_locally(buf.kind) {
+        return None;
+    }
+    let port = parse_port(&buf.listen_port, "").ok()?;
+    let mut hits: Vec<&mullion_store::TunnelRecord> = tunnels
+        .iter()
+        .filter(|t| Some(t.id) != editing_id && t.listen_port == port)
+        .filter(|t| !matches!(t.kind, TunnelKind::Remote { .. }))
+        .collect();
+    hits.sort_by_key(|t| t.id);
+    // 多条撞上时优先报会拦的那条,否则用户改掉一处警告又冒出一处拦截。
+    let other = hits
+        .iter()
+        .find(|t| buf.autostart && t.autostart)
+        .or(hits.first())?;
+    Some(PortClash {
+        other: super::tunnel_list::row_title(other),
+        blocking: buf.autostart && other.autostart,
+    })
+}
+
+/// F370:拦截那档的文案。保存失败的顶栏红字与表单内联红字共用。
+fn blocking_text(port: &str, other: &str) -> String {
+    format!(
+        "本地端口 {} 已被「{other}」占用,且两条都勾了自动启动,开机会抢同一端口 —— 取消其中一条的自动启动",
+        port.trim()
+    )
+}
+
+/// 保存:组 draft,并按 F370 拦下「两条自动启动同端口」。纯函数,与内联提示同源。
+pub(crate) fn save_intent(
+    buf: &TunnelEditorBuffer,
+    editing_id: Option<TunnelId>,
+    tunnels: &[mullion_store::TunnelRecord],
+) -> Result<TunnelSaveIntent, String> {
+    let draft = build_tunnel_draft(buf)?;
+    if let Some(c) = port_clash(buf, editing_id, tunnels).filter(|c| c.blocking) {
+        return Err(blocking_text(&buf.listen_port, &c.other));
+    }
+    Ok(TunnelSaveIntent { editing_id, draft })
+}
+
 /// 各类型的字段措辞(设计 D12)。
 ///
 /// **标签必须随类型翻转**,不能一套文案套三种转发:`-L` 的「侦听」在本机、
@@ -343,6 +410,8 @@ pub(super) fn show(
     ui_state: &mut UiState,
     sessions: &[SessionRecord],
     credentials: &[mullion_store::CredentialRecord],
+    // F370:查重要看其它全部隧道。
+    tunnels: &[mullion_store::TunnelRecord],
 ) {
     if ui_state.tunnel_editor.is_none() {
         ui.colored_label(
@@ -370,6 +439,7 @@ pub(super) fn show(
             });
         });
 
+    let editing_id = ui_state.tunnel_editor_id;
     let Some(buf) = ui_state.tunnel_editor.as_mut() else {
         return;
     };
@@ -444,6 +514,25 @@ pub(super) fn show(
                 ui.colored_label(theme::c32(t.fg_dimmer), w.listen_hint);
                 ui.end_row();
 
+                // F370:编辑时实时查重,不是保存后一闪。拦截档红字,警告档黄字。
+                if let Some(c) = port_clash(buf, editing_id, tunnels) {
+                    let (color, text) = if c.blocking {
+                        (t.danger_text, blocking_text(&buf.listen_port, &c.other))
+                    } else {
+                        (
+                            t.warn,
+                            format!(
+                                "本地端口 {} 已被「{}」占用:两条不能同时运行",
+                                buf.listen_port.trim(),
+                                c.other
+                            ),
+                        )
+                    };
+                    ui.label("");
+                    ui.colored_label(theme::c32(color), text);
+                    ui.end_row();
+                }
+
                 // F117 绑定安全。`Dynamic` 这一段整块不画 —— 它在类型上就没有
                 // `expose` 字段(见 `TunnelKind::Dynamic`),画一个写不进数据的勾选框
                 // 只会让人以为动态转发也能对外开放。
@@ -503,6 +592,17 @@ pub(super) fn show(
                     egui::TextEdit::singleline(&mut buf.name)
                         .desired_width(field_w(ui.available_width(), FIELD_W_M, 0.0))
                         .hint_text(theme::hint_text(t, "这条隧道叫什么(可选)")),
+                );
+                ui.end_row();
+
+                // F368:库打开后自动拉起。只走不交互的路,说明里先讲清楚。
+                ui.label("");
+                ui.checkbox(&mut buf.autostart, "自动启动");
+                ui.end_row();
+                ui.label("");
+                ui.colored_label(
+                    theme::c32(t.fg_dimmer),
+                    "打开 Mullion 后自动拉起;需要确认主机密钥或输入密码的不会自动拉起",
                 );
                 ui.end_row();
 
@@ -576,7 +676,7 @@ mod tests {
             tunnel_editor_id: Some(mullion_store::TunnelId(1)),
             ..Default::default()
         };
-        let texts = texts_on_a_short_screen(|ui, s| show(ui, &t, s, &[], &[]), st);
+        let texts = texts_on_a_short_screen(|ui, s| show(ui, &t, s, &[], &[], &[]), st);
         for label in ["保存", "删除"] {
             let r = texts
                 .iter()
@@ -602,6 +702,100 @@ mod tests {
             note: String::new(),
             autostart: false,
         }
+    }
+
+    fn rec(id: u64, port: u16, kind: TunnelKind, autostart: bool) -> mullion_store::TunnelRecord {
+        mullion_store::TunnelRecord {
+            id: TunnelId(id),
+            session_id: SessionId(7),
+            listen_port: port,
+            name: format!("t{id}"),
+            note: String::new(),
+            autostart,
+            kind,
+        }
+    }
+
+    fn local() -> TunnelKind {
+        TunnelKind::Local {
+            target_host: "db".into(),
+            target_port: 1,
+            expose: false,
+        }
+    }
+
+    fn remote() -> TunnelKind {
+        TunnelKind::Remote {
+            target_host: "db".into(),
+            target_port: 1,
+            expose: false,
+        }
+    }
+
+    /// F370:同一本地侦听端口 = 警告不拦;两条都自动启动才拦。
+    /// 别的隧道勾没勾、自己勾没勾,四种组合只有「都勾」拦。
+    #[test]
+    fn a_shared_local_port_warns_and_blocks_only_when_both_autostart() {
+        let mut buf = filled(TunnelKindUi::Local);
+        for (mine, theirs, blocking) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            buf.autostart = mine;
+            let all = [rec(2, 3306, local(), theirs)];
+            let c = port_clash(&buf, None, &all).expect("同端口必须提示");
+            assert_eq!(c.blocking, blocking, "mine={mine} theirs={theirs}");
+            assert_eq!(c.other, "t2");
+        }
+    }
+
+    /// F370:`-D` 恒绑本机,与 `-L` 同端口一样算;`-R` 侦听在远端,两个方向都不算。
+    #[test]
+    fn dynamic_counts_and_remote_does_not() {
+        let buf = filled(TunnelKindUi::Local);
+        assert!(port_clash(&buf, None, &[rec(2, 3306, TunnelKind::Dynamic, false)]).is_some());
+        assert!(port_clash(&buf, None, &[rec(2, 3306, remote(), false)]).is_none());
+        let rbuf = filled(TunnelKindUi::Remote);
+        assert!(port_clash(&rbuf, None, &[rec(2, 3306, local(), false)]).is_none());
+    }
+
+    /// F370:编辑的就是那一条,不算撞自己;端口没填好不提示;端口不同不提示。
+    #[test]
+    fn itself_unparsed_ports_and_other_ports_do_not_clash() {
+        let buf = filled(TunnelKindUi::Local);
+        assert!(port_clash(&buf, Some(TunnelId(2)), &[rec(2, 3306, local(), true)]).is_none());
+        assert!(port_clash(&buf, None, &[rec(2, 3307, local(), true)]).is_none());
+        let mut bad = filled(TunnelKindUi::Local);
+        bad.listen_port = "abc".into();
+        assert!(port_clash(&bad, None, &[rec(2, 3306, local(), true)]).is_none());
+    }
+
+    /// F370:保存的拦截与提示同源 —— 拦的那档出不了保存意图,警告那档照存。
+    #[test]
+    fn saving_is_refused_only_for_a_blocking_clash() {
+        let mut buf = filled(TunnelKindUi::Local);
+        let all = [rec(2, 3306, local(), true)];
+        assert!(save_intent(&buf, None, &all).is_ok(), "只自己没勾,应照存");
+        buf.autostart = true;
+        let err = save_intent(&buf, None, &all).err().expect("都勾了必须拦");
+        assert!(err.contains("自动启动"), "拦截要说清原因:{err}");
+        let ok = save_intent(&buf, Some(TunnelId(9)), &[]).unwrap();
+        assert_eq!(ok.editing_id, Some(TunnelId(9)));
+        assert!(ok.draft.autostart);
+    }
+
+    /// F370 接线:内联提示真的画在表单里(纯函数测得再扎实也证不了这一条)。
+    /// F368:「自动启动」复选框也在表单里。
+    ///
+    /// 自证会变红:删掉 `show` 里画 `port_clash` 的那段 / 自动启动复选框。
+    #[test]
+    fn the_form_shows_the_port_clash_inline_and_the_autostart_box() {
+        let all = [rec(2, 3306, local(), false)];
+        let texts = rendered_texts_with(filled(TunnelKindUi::Local), &[], &all);
+        assert!(has(&texts, "已被「t2」占用"), "{texts:?}");
+        assert!(has_exact(&texts, "自动启动"), "{texts:?}");
     }
 
     /// 端口框什么时候该出红字。空着**不报**——必填星号已经说明了它必须填,
@@ -846,6 +1040,14 @@ mod tests {
 
     /// 跑两帧(第一帧让布局稳定),把第二帧画出的所有文字收集起来。
     fn rendered_texts(buf: TunnelEditorBuffer, sessions: &[SessionRecord]) -> Vec<String> {
+        rendered_texts_with(buf, sessions, &[])
+    }
+
+    fn rendered_texts_with(
+        buf: TunnelEditorBuffer,
+        sessions: &[SessionRecord],
+        tunnels: &[mullion_store::TunnelRecord],
+    ) -> Vec<String> {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let mut st = crate::ui::UiState {
@@ -856,7 +1058,7 @@ mod tests {
         for _ in 0..2 {
             let out = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    show(ui, &t, &mut st, sessions, &[]);
+                    show(ui, &t, &mut st, sessions, &[], tunnels);
                 });
             });
             texts = collect_text(&out.shapes);
