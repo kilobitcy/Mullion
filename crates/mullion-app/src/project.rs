@@ -233,6 +233,27 @@ pub fn project_of<'a>(
     })
 }
 
+/// F367:Ctrl+Shift+M 要开哪个项目的备忘。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoTarget {
+    Open(mullion_store::ProjectId),
+    /// pane 还没报过 tmux 会话名(刚连上 / 不在 tmux 里)—— [`project_of`]
+    /// 返回 `None` 的两义之一,提示要跟「无归属」分开。
+    NotReported,
+    /// 报了,但没有哪个项目的 tmux 会话是它。
+    NoProject,
+}
+
+/// F367:判据同 [`project_of`],只是把它的 `None` 拆成两义。
+pub fn memo_target(report: Option<&str>, projects: &[mullion_store::ProjectRecord]) -> MemoTarget {
+    match report {
+        None => MemoTarget::NotReported,
+        Some(_) => {
+            project_of(report, projects).map_or(MemoTarget::NoProject, |p| MemoTarget::Open(p.id))
+        }
+    }
+}
+
 // ---- F317 恢复现场时按首跳连通性给项目叶子选节点 ------------------------
 
 /// F317:恢复时这个叶子属于哪个项目。
@@ -555,6 +576,20 @@ mod tests {
         let ps = [named(1, "我的项目"), named(2, "别的活")];
         let name = mullion_store::project_tmux_name(&ps[1]);
         assert_eq!(project_of(Some(&name), &ps).map(|p| p.id.0), Some(2));
+    }
+
+    /// F367:备忘热键把 `project_of` 的 `None` 拆成两义 —— 「还没识别到」
+    /// 与「不属于任何项目」给用户的提示不同。
+    #[test]
+    fn the_memo_hotkey_tells_not_reported_apart_from_no_project() {
+        let ps = [named(1, "我的项目")];
+        let name = mullion_store::project_tmux_name(&ps[0]);
+        assert_eq!(
+            memo_target(Some(&name), &ps),
+            MemoTarget::Open(mullion_store::ProjectId(1))
+        );
+        assert_eq!(memo_target(None, &ps), MemoTarget::NotReported);
+        assert_eq!(memo_target(Some("别的会话"), &ps), MemoTarget::NoProject);
     }
 
     /// 还没上报(刚连上)/ 报的是别的会话 —— 都**不属于**任何项目。

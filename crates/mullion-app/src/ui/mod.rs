@@ -483,6 +483,8 @@ pub struct UiState {
     /// F366:下载覆盖失败的告警框。**独立一个槽,不占 `files_dialog`**:那条槽
     /// 「已有框开着就等」,批量下载时会与后续冲突框互相排队。
     pub overwrite_alert: Option<overwrite_alert::OverwriteAlert>,
+    /// F367:pane 里的项目备忘浮层。`None` = 关着。
+    pub memo_popup: Option<memo_popup::MemoDraft>,
     /// F55:传输队列面板是不是折叠着。
     ///
     /// **语义取反成「展开」**,为的是 `Default` 能给出想要的默认值:
@@ -858,6 +860,9 @@ pub struct UiActions {
     /// F366:覆盖失败告警框上按的东西(重试 / 关闭)。施加要按 job 取回
     /// app 侧另存的传输输入,所以只能在 `app.rs` 做。同步 `has_real_action`。
     pub overwrite_alert: Option<overwrite_alert::AlertOut>,
+    /// F367:备忘浮层的出口(加 / 删 / 存备注 / 关)。落盘在 `app.rs`。
+    /// 同步 `has_real_action`。
+    pub memo_popup: Option<memo_popup::MemoOut>,
 }
 
 /// 指针此刻还在**文件面板**里没有(F59 / 设计 N1 的判据,2026-08-20 修正)。
@@ -886,6 +891,23 @@ fn pointer_inside_panel(ctx: &egui::Context, rect: Option<egui::Rect>) -> bool {
     let Some(rect) = rect else { return true };
     ctx.input(|i| i.pointer.latest_pos())
         .is_some_and(|p| rect.contains(p))
+}
+
+/// F225③/F367:某块 pane 的矩形(逻辑点)。切项目弹窗与备忘浮层都钉在发起它
+/// 的那块 pane 里 —— 飘在窗口正中的框看不出是哪一块。
+fn pane_rect_of(
+    ctx: &egui::Context,
+    titles: &[pane_title::TitleView<'_>],
+    pane: mullion_core::layout::PaneId,
+) -> Option<egui::Rect> {
+    let ppp = ctx.pixels_per_point();
+    titles.iter().find(|v| v.geom.id == pane).map(|v| {
+        let p = v.geom.px;
+        egui::Rect::from_min_size(
+            egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp),
+            egui::vec2(p.w as f32 / ppp, p.h as f32 / ppp),
+        )
+    })
 }
 
 /// 每帧构建 UI:菜单栏(顶,布局按钮 F82 画在同一行居中)、状态栏(底)、
@@ -1202,16 +1224,10 @@ pub fn build_ui(
     // F225③:切项目弹窗。与换节点弹窗同形态、同定位方式(钉在发起它的那块
     // pane 里),但**是两个弹窗**:两件事的用户心智不同,见 `project_pick`
     // 的模块文档。
-    let pick_rect = ui_state.project_pick.as_ref().and_then(|d| {
-        let ppp = ctx.pixels_per_point();
-        frame.titles.iter().find(|v| v.geom.id == d.pane).map(|v| {
-            let p = v.geom.px;
-            egui::Rect::from_min_size(
-                egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp),
-                egui::vec2(p.w as f32 / ppp, p.h as f32 / ppp),
-            )
-        })
-    });
+    let pick_rect = ui_state
+        .project_pick
+        .as_ref()
+        .and_then(|d| pane_rect_of(ctx, frame.titles, d.pane));
     actions.project_pick = project_pick::show(
         ctx,
         t,
@@ -1222,6 +1238,13 @@ pub fn build_ui(
         frame.appearance,
         pick_rect,
     );
+    // F367:项目备忘浮层。同切项目弹窗的定位方式(钉在焦点 pane 里),画在它
+    // 之后 —— 两者不会同开(都是模态,热键在模态开着时整组让位)。
+    let memo_rect = ui_state
+        .memo_popup
+        .as_ref()
+        .and_then(|d| pane_rect_of(ctx, frame.titles, d.pane));
+    actions.memo_popup = memo_popup::show(ctx, t, &mut ui_state.memo_popup, memo_rect);
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
     actions.editor = editor_window::show(ctx, t, editor);
     // F46-a:迁移包弹窗。排在编辑器之后 —— 它是从菜单发起的模态,该盖在
@@ -2376,6 +2399,62 @@ mod tests {
         assert!(
             pane.contains_rect(got),
             "切项目弹窗没落在那块 pane 里:pane={pane:?} 弹窗={got:?}"
+        );
+    }
+
+    /// F367:备忘浮层同理,钉在发起它的那块 pane 里。
+    ///
+    /// 破坏性验证:把 `build_ui` 里传给 `memo_popup::show` 的 `memo_rect`
+    /// 改成硬编码 `None`,浮层退回整窗左上角,本测试红。
+    #[test]
+    fn build_ui_puts_the_memo_popup_inside_that_panes_geometry() {
+        let mut view = title_view("h");
+        view.geom.px = PxRect {
+            x: 300,
+            y: 200,
+            w: 460,
+            h: 360,
+        };
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(1.0);
+        let mut ui_state = UiState {
+            memo_popup: Some(crate::ui::memo_popup::MemoDraft {
+                pane: PaneId(1),
+                project: mullion_store::ProjectId(1),
+                title: "web · 备忘".into(),
+                memos: Vec::new(),
+                input: String::new(),
+                note: String::new(),
+                note_baseline: String::new(),
+                note_open: false,
+                focus_pending: true,
+                error: None,
+                dirty_hint: false,
+            }),
+            ..Default::default()
+        };
+        for time in [0.0_f64, 1.0] {
+            let _ = run_frame(
+                &ctx,
+                &mut ui_state,
+                UiFrame {
+                    titles: std::slice::from_ref(&view),
+                    ..base_frame()
+                },
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+        let got = ctx
+            .memory(|m| m.area_rect(crate::ui::memo_popup::area_id(PaneId(1))))
+            .expect("备忘浮层开着却没有 Area");
+        let pane = egui::Rect::from_min_size(egui::pos2(300.0, 200.0), egui::vec2(460.0, 360.0));
+        assert!(
+            pane.contains_rect(got),
+            "备忘浮层没落在那块 pane 里:pane={pane:?} 弹窗={got:?}"
         );
     }
 

@@ -3049,6 +3049,13 @@ enum Modal {
     ///
     /// **不进 `touched_store`**:它一行 store 都不写。
     OverwriteAlert,
+    /// F367:pane 里的项目备忘浮层。里面有输入框 —— 不算模态的话打的字
+    /// 同时漏给远端 shell(T8)。
+    ///
+    /// **不进 `touched_store`**:它只写项目的 memos / note(字段级 mutator),
+    /// 不碰会话/分组 —— 外观继承链与 scrollback 都与它无关,那条门控触发的
+    /// 两次重算对它是纯开销。
+    MemoPopup,
 }
 
 impl Modal {
@@ -3077,6 +3084,7 @@ impl Modal {
         Modal::History,
         Modal::Pack,
         Modal::OverwriteAlert,
+        Modal::MemoPopup,
     ];
 }
 
@@ -3089,6 +3097,8 @@ const DISMISS_ORDER: &[Modal] = &[
     // F46-a:排在退出确认之后 —— 绘制顺序上它画在退出确认**之前**,
     // 而这张表与绘制顺序严格互逆(后画的盖在上面、先被问到)。
     Modal::Pack,
+    // F367:画在切项目弹窗之后,所以排在它前面。
+    Modal::MemoPopup,
     Modal::ProjectPick,
     Modal::Rehost,
     Modal::TabProps,
@@ -3197,6 +3207,8 @@ fn draft_baseline_is_in_vault(m: Modal) -> bool {
         Modal::GroupManager => true,
         // 导入预览的每一行勾选,针对的都是「库里有没有这一条」。
         Modal::Import => true,
+        // F367:备注的基线就是库里那个项目的 note。
+        Modal::MemoPopup => true,
         // F46-a:迁移包弹窗里只有一串口令,库里的表跟它没有任何对应关系
         // (导入那一刻是整份替换磁盘文件,内存里的库根本不参与)。
         Modal::Pack => false,
@@ -3312,6 +3324,10 @@ fn dismiss_areas(ui: &crate::ui::UiState, m: Modal) -> Option<Vec<egui::Id>> {
             .project_pick
             .as_ref()
             .map(|d| vec![crate::ui::project_pick::area_id(d.pane)]),
+        Modal::MemoPopup => ui
+            .memo_popup
+            .as_ref()
+            .map(|d| vec![crate::ui::memo_popup::area_id(d.pane)]),
     }
 }
 
@@ -5253,6 +5269,8 @@ impl App {
             Modal::History => self.ui.history.is_some(),
             // F366:见 `Modal::OverwriteAlert` 的说明(T8)。
             Modal::OverwriteAlert => self.ui.overwrite_alert.is_some(),
+            // F367:见 `Modal::MemoPopup` 的说明(T8)。
+            Modal::MemoPopup => self.ui.memo_popup.is_some(),
         })
     }
 
@@ -5296,6 +5314,8 @@ impl App {
                     _ => false,
                 }
             }
+            // F367:备注改了没存。判据复用浮层自己的(Esc 闸用的同一个)。
+            Modal::MemoPopup => self.ui.memo_popup.as_ref().is_some_and(|d| d.note_dirty()),
             // 分组管理器唯一的草稿就是那个「新建分组」输入框。
             Modal::GroupManager => !self.ui.group_name_buf.trim().is_empty(),
             Modal::TabProps => self.ui.tab_props.as_ref().is_some_and(|d| {
@@ -5427,6 +5447,7 @@ impl App {
             Modal::ExitConfirm => self.ui.exit_pending = false,
             Modal::Rehost => self.ui.rehost = None,
             Modal::ProjectPick => self.ui.project_pick = None,
+            Modal::MemoPopup => self.ui.memo_popup = None,
             Modal::Unlock
             | Modal::HostKey
             | Modal::Editor
@@ -10252,7 +10273,72 @@ impl App {
     }
 
     /// F367:Ctrl+Shift+M —— 在焦点分屏上开所属项目的备忘浮层。
-    fn apply_memo_hotkey(&mut self) {}
+    ///
+    /// 归属按**上报的 tmux 会话名**现推(同项目灯与标题条,`project::project_of`)。
+    /// 焦点不在任何终端 pane(SFTP 标签 / 没有标签)时无动作。
+    fn apply_memo_hotkey(&mut self) {
+        let Some((pane, tmux)) = self
+            .active_ws()
+            .and_then(|ws| ws.focused().map(|p| (p.id, p.tmux.clone())))
+        else {
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Warn, "还没有打开会话库,读不到项目");
+            return;
+        };
+        match crate::project::memo_target(tmux.as_deref(), store.projects()) {
+            crate::project::MemoTarget::Open(id) => {
+                if let Some(p) = store.projects().iter().find(|p| p.id == id) {
+                    self.ui.memo_popup = Some(crate::ui::memo_popup::MemoDraft::new(pane, p));
+                }
+            }
+            crate::project::MemoTarget::NotReported => self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                "这块分屏还没识别到 tmux 会话,稍后再试",
+            ),
+            crate::project::MemoTarget::NoProject => self
+                .ui
+                .set_toast(crate::ui::toast::Kind::Warn, "这块分屏不属于任何项目"),
+        }
+    }
+
+    /// F367:施加备忘浮层的出口。加/删/存备注走字段级 mutator 并**立即落盘**;
+    /// 成功后按库里的新值刷新浮层快照,失败则浮层内联红字(不静默丢)。
+    fn apply_memo_out(&mut self, out: crate::ui::memo_popup::MemoOut) {
+        use crate::ui::memo_popup::MemoOut;
+        let Some(id) = self.ui.memo_popup.as_ref().map(|d| d.project) else {
+            return;
+        };
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        match out {
+            MemoOut::Close => {
+                self.ui.memo_popup = None;
+                return;
+            }
+            MemoOut::Add(text) => {
+                let now = time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                store.add_project_memo(id, text, &now);
+            }
+            MemoOut::Remove(m) => store.remove_project_memo(id, &m),
+            MemoOut::SaveNote(note) => store.set_project_note(id, note),
+        }
+        let saved = store.save();
+        let fresh = store.projects().iter().find(|p| p.id == id).cloned();
+        let Some(d) = self.ui.memo_popup.as_mut() else {
+            return;
+        };
+        match (saved, fresh) {
+            (Ok(()), Some(p)) => d.refresh(&p),
+            (Ok(()), None) => d.error = Some("这个项目已经被删掉了".into()),
+            (Err(e), _) => d.error = Some(format!("没能存下来:{e}")),
+        }
+    }
 
     /// F366:施加覆盖失败告警框的出口,并关框。
     ///
@@ -16100,6 +16186,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 );
                                 mark_ui_dirty!(self.ui_dirty);
                             }
+                            // F367:备忘浮层的出口。
+                            if let Some(out) = actions.memo_popup.take() {
+                                self.apply_memo_out(out);
+                                mark_ui_dirty!(self.ui_dirty);
+                            }
                             // F366:覆盖失败告警框的出口。
                             if let Some(out) = actions.overwrite_alert {
                                 self.apply_overwrite_alert(out);
@@ -18821,6 +18912,7 @@ fn has_real_action(a: &crate::ui::UiActions) -> bool {
         || a.pack.is_some()
         || a.copy_last_error
         || a.overwrite_alert.is_some()
+        || a.memo_popup.is_some()
 }
 
 /// 参数多的理由同 `crate::ui::build_ui` —— 这个函数基本上就是它的调用壳。
@@ -19334,6 +19426,42 @@ mod tests {
             "决策排在 finish 之后 —— result 已被拿走,永远弹不出来"
         );
         assert!(arm.contains("set_error"), "决策了却没弹卡");
+    }
+
+    /// F367:备忘浮层的接线。出口要过 `has_real_action`(否则在 egui 的
+    /// discard 趟被静默吃掉)、要有人收;热键按 `memo_target` 三分支施加,
+    /// 「还没识别到」与「不属于任何项目」各有提示;出口施加必须落盘并在
+    /// 成功后刷新快照、失败时内联报错。
+    ///
+    /// 自证会变红:删掉 `apply_memo_out` 里的 `store.save()`;或删掉
+    /// `has_real_action` 里的 `a.memo_popup`。
+    #[test]
+    fn the_memo_popup_is_wired_from_hotkey_to_disk() {
+        let src = strip_comments(prod_src());
+        assert!(
+            body_of(&src, "fn has_real_action(").contains("a.memo_popup"),
+            "备忘浮层的出口会在 egui 的 discard 趟被静默吃掉"
+        );
+        assert!(
+            src.contains("if let Some(out) = actions.memo_popup.take() {"),
+            "备忘浮层的出口没人收"
+        );
+        let hk = body_of(&src, "fn apply_memo_hotkey(");
+        assert!(hk.contains("crate::project::memo_target("));
+        assert!(hk.contains("还没识别到 tmux 会话"), "没区分「还没识别到」");
+        assert!(hk.contains("不属于任何项目"));
+        assert!(hk.contains("MemoDraft::new(pane"));
+        let out = body_of(&src, "fn apply_memo_out(");
+        for want in [
+            "store.add_project_memo(",
+            "store.remove_project_memo(",
+            "store.set_project_note(",
+            "store.save()",
+            "d.refresh(&p)",
+            "d.error = Some(",
+        ] {
+            assert!(out.contains(want), "apply_memo_out 里缺 `{want}`");
+        }
     }
 
     /// F366:只有「选了覆盖的下载」失败才进告警框;上传、没选覆盖、冲突/取消
@@ -22044,6 +22172,10 @@ mod tests {
                     Modal::ALL.contains(&Modal::OverwriteAlert),
                     "OverwriteAlert 没登记进 Modal::ALL(T8/F366)"
                 ),
+                Modal::MemoPopup => assert!(
+                    Modal::ALL.contains(&Modal::MemoPopup),
+                    "MemoPopup 没登记进 Modal::ALL(T8/F367)"
+                ),
                 Modal::Settings => assert!(
                     Modal::ALL.contains(&Modal::Settings),
                     "Settings 没登记进 Modal::ALL(T8)"
@@ -22150,6 +22282,7 @@ mod tests {
             Modal::FilesFind,
             Modal::History,
             Modal::OverwriteAlert,
+            Modal::MemoPopup,
         ] {
             check(m);
         }
@@ -22281,6 +22414,7 @@ mod tests {
                 Modal::TabProps => "tab_props::show(",
                 Modal::Rehost => "rehost::show(",
                 Modal::ProjectPick => "project_pick::show(",
+                Modal::MemoPopup => "memo_popup::show(",
                 Modal::ExitConfirm => "if ui_state.exit_pending {",
                 Modal::Pack => "pack_dialog::show(",
                 // 豁免的九类不参与「点外面即关」,也就不需要排序。
