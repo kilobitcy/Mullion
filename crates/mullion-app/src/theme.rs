@@ -397,6 +397,22 @@ pub fn selection_fill(t: &Theme) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(t.accent.r, t.accent.g, t.accent.b, t.sel_alpha)
 }
 
+/// F150:选中行左侧色条的宽度(逻辑点)。F364 起文件面板与三处项目列表共用。
+pub const SEL_BAR_W: f32 = 2.0;
+
+/// F150/F364:键盘/多选选中行 = accent 半透明铺满整行 + 行首一条实色。
+///
+/// 色条不是装饰:底色再淡也可能被行内容夺走注意力,一条实色边给出「这一段
+/// 是选中的」的轮廓。文件面板与项目列表共用这一份,别各画各的。
+pub fn paint_selected_row(painter: &egui::Painter, rect: egui::Rect, t: &Theme) {
+    painter.rect_filled(rect, 2.0, selection_fill(t));
+    painter.rect_filled(
+        egui::Rect::from_min_size(rect.left_top(), egui::vec2(SEL_BAR_W, rect.height())),
+        0.0,
+        c32(t.accent),
+    );
+}
+
 /// 把主题写进 egui 的 `Visuals`(外加一处 `Spacing::scroll`,见下)。启动时对
 /// egui ctx 调一次。
 ///

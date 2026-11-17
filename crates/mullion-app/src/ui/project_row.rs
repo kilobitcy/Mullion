@@ -376,10 +376,14 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, row: &Row) -> egui::Response {
     if row.lamp == crate::project::Lamp::Lit {
         ui.painter().rect_filled(rect, 4.0, lit_tint(t));
     }
-    // 底色走会话侧同一份 `row_bg`:选中/悬停两态的透明度在那里定死,两个列表
-    // 各调一次的话同一种状态会有两种深浅。
-    if let Some(bg) =
-        crate::ui::session_manager::list::row_bg(row.selected, resp.hovered(), None, t)
+    // F364:选中态走 F150 那份 accent 底 + 竖条(原先的 `sunken_bg` 与面板底、
+    // 悬停灰太近,用户实报「高亮不明显」)。**不改 `row_bg` 本身**:会话管理器
+    // 列表共用它,且有「选中 = sunken_bg」的断言。悬停仍走 `row_bg` 的灰,
+    // 与键盘高亮分得开。
+    if row.selected {
+        theme::paint_selected_row(ui.painter(), rect, t);
+    } else if let Some(bg) =
+        crate::ui::session_manager::list::row_bg(false, resp.hovered(), None, t)
     {
         ui.painter().rect_filled(rect, 4.0, bg);
     }
@@ -1070,6 +1074,15 @@ mod tests {
         icon: Option<&mullion_store::IconSpec>,
         lamp: crate::project::Lamp,
     ) -> Vec<egui::epaint::ClippedShape> {
+        row_shapes_sel(icon, lamp, false)
+    }
+
+    /// 同 `row_shapes_with`,但指定是否选中(F364)。
+    fn row_shapes_sel(
+        icon: Option<&mullion_store::IconSpec>,
+        lamp: crate::project::Lamp,
+        selected: bool,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let t = crate::theme::MULLION_DARK;
         let ctx = egui::Context::default();
         let p = proj(3, "接口", "/srv/api", None);
@@ -1093,7 +1106,7 @@ mod tests {
                                     lamp,
                                     sessions: &ss,
                                     query: "",
-                                    selected: false,
+                                    selected,
                                     now: now(),
                                     list: "test",
                                     icon,
@@ -1240,6 +1253,50 @@ mod tests {
                 "{lamp:?} 的行也垫了「正在跑」的底色"
             );
         }
+    }
+
+    /// 这一行画出来的全部填充矩形:(颜色, 宽度)。
+    fn filled_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<(egui::Color32, f32)> {
+        fn walk(s: &egui::Shape, out: &mut Vec<(egui::Color32, f32)>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                egui::Shape::Rect(r) => out.push((r.fill, r.rect.width())),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|cs| walk(&cs.shape, &mut out));
+        out
+    }
+
+    /// F364:选中行 = accent 薄底铺满 + 行首 accent 竖条(复用 F150 的画法)。
+    /// 原来走 `row_bg` 的 `sunken_bg`,与面板底、悬停灰太近,用户实报「高亮不明显」。
+    ///
+    /// 自证会变红:把 `show` 里 `selected` 那一支改回 `row_bg(row.selected, ..)`。
+    #[test]
+    fn a_selected_row_paints_an_accent_fill_and_an_accent_bar() {
+        use crate::project::Lamp;
+        let t = crate::theme::MULLION_DARK;
+        let accent = theme::c32(t.accent);
+        let fill = theme::selection_fill(&t);
+        for lamp in [Lamp::Lit, Lamp::Unknown] {
+            let rects = filled_rects(&row_shapes_sel(None, lamp, true));
+            assert!(
+                rects
+                    .iter()
+                    .any(|(c, w)| *c == accent && *w <= theme::SEL_BAR_W + 0.01),
+                "{lamp:?}:选中行没有 accent 竖条"
+            );
+            assert!(
+                rects.iter().any(|(c, w)| *c == fill && *w > 200.0),
+                "{lamp:?}:选中行没有铺满整行的 accent 薄底"
+            );
+        }
+        let plain = filled_rects(&row_shapes_sel(None, Lamp::Unknown, false));
+        assert!(
+            !plain.iter().any(|(c, _)| *c == fill || *c == accent),
+            "没选中的行也画了选中态"
+        );
     }
 
     /// 这一行画出来的全部文字。

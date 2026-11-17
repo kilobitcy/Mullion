@@ -501,8 +501,6 @@ const W_PERM: f32 = 86.0;
 /// (F135)。
 const W_OWNER: f32 = 120.0;
 const ROW_H: f32 = 22.0;
-/// F150:选中行左侧色条的宽度(逻辑点)。
-const SEL_BAR_W: f32 = 2.0;
 /// D1:图标格子的边长 + 它和名称之间的空隙。
 const W_ICON: f32 = 16.0;
 const ICON_GAP: f32 = 4.0;
@@ -2236,13 +2234,7 @@ fn row(
         // 文件面板根本没有多选(`click_row` 的 Ctrl/Shift 语义一直都在)。
         // 色条不是装饰:底色再淡也可能被行内容夺走注意力,一条实色边给出
         // 「这一段是选中的」的轮廓,连选多行时一眼能看出范围。
-        ui.painter()
-            .rect_filled(rect, 2.0, theme::selection_fill(t));
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(SEL_BAR_W, rect.height())),
-            0.0,
-            theme::c32(t.accent),
-        );
+        theme::paint_selected_row(ui.painter(), rect, t);
     }
     let p = ui.painter();
     let font = egui::FontId::proportional(12.0);
