@@ -550,6 +550,8 @@ pub fn status_bar(
     copy_last_error: &mut bool,
     // F312:状态栏这条报错被用户点「×」收掉了。见 `UiState::status_error_dismissed`。
     error_dismissed: &mut bool,
+    // F369:点了隧道指示器 → 写回那一格的矩形(浮层贴着它弹)。
+    tunnel_click: &mut Option<egui::Rect>,
 ) {
     let (left, right) = status_text(panes, connected);
     let bar = egui::TopBottomPanel::bottom("status")
@@ -626,9 +628,22 @@ pub fn status_bar(
                     // F115:隧道排在自动化之后。颜色跟着**最坏**那条走
                     // (见 `tunnels::indicator`)—— 一律画成灰的,等于把
                     // 「有一条挂了」这条唯一需要被看见的信息藏起来。
+                    // F369:可点,点开启停浮层。
                     if let Some(ind) = tunnel {
-                        let r = ui.colored_label(severity_color(t, ind.severity), &ind.text);
+                        let r = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(&ind.text)
+                                        .color(severity_color(t, ind.severity)),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("点开启停隧道");
                         annotate::mark(ui.ctx(), "状态栏/隧道指示器", r.rect);
+                        if r.clicked() {
+                            *tunnel_click = Some(r.rect);
+                        }
                         ui.separator();
                     }
                     // F273:云端备份排在隧道之后。**失败必须看得见** ——
@@ -785,6 +800,7 @@ mod tests {
                 None,
                 &mut false,
                 &mut false,
+                &mut None,
             );
         });
         let out = ctx.run(Default::default(), |ctx| {
@@ -801,6 +817,7 @@ mod tests {
                 None,
                 &mut false,
                 &mut false,
+                &mut None,
             );
         });
         count_shapes(&out.shapes)
@@ -832,6 +849,7 @@ mod tests {
                     cloud,
                     &mut false,
                     &mut false,
+                    &mut None,
                 );
             });
             acc.clear();
@@ -867,6 +885,68 @@ mod tests {
             "隧道要排在自动化之后:{texts:?}"
         );
         assert!(pos("隧道") < pos("UTF-8"), "隧道要排在编码之前:{texts:?}");
+    }
+
+    /// F369:点隧道指示器,写回那一格的矩形(浮层贴着它弹)。
+    ///
+    /// 自证会变红:删掉 `*tunnel_click = Some(r.rect);`。
+    #[test]
+    fn clicking_the_tunnel_indicator_reports_its_rect() {
+        let ind = crate::tunnels::Indicator {
+            text: "隧道 0/3".to_string(),
+            severity: crate::tunnels::Severity::Calm,
+        };
+        let ctx = egui::Context::default();
+        let frame = |input: egui::RawInput, click: &mut Option<egui::Rect>| {
+            let out = ctx.run(input, |ctx| {
+                status_bar(
+                    ctx,
+                    &crate::theme::MULLION_DARK,
+                    1,
+                    true,
+                    None,
+                    None,
+                    Some(&ind),
+                    None,
+                    None,
+                    None,
+                    &mut false,
+                    &mut false,
+                    click,
+                );
+            });
+            let mut pos = None;
+            fn walk(s: &egui::Shape, pos: &mut Option<egui::Pos2>) {
+                match s {
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, pos)),
+                    egui::Shape::Text(t) if t.galley.text() == "隧道 0/3" => {
+                        *pos = Some(t.pos + t.galley.size() / 2.0)
+                    }
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut pos));
+            pos
+        };
+        let mut click = None;
+        let mut pos = None;
+        for _ in 0..2 {
+            pos = frame(Default::default(), &mut click);
+        }
+        let pos = pos.expect("指示器没画出来");
+        assert!(click.is_none(), "没点就不该有回报");
+        let mut input = egui::RawInput::default();
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        frame(input, &mut click);
+        let r = click.expect("点了指示器没有回报");
+        assert!(r.contains(pos), "回报的矩形不是那一格:{r:?} vs {pos:?}");
     }
 
     /// 一条都没**配置**时不占格(F369 起配了就常驻,`None` 只剩这一种来源,
@@ -1093,6 +1173,7 @@ mod tests {
                 None,
                 &mut false,
                 dismissed,
+                &mut None,
             );
         });
         let mut acc = Vec::new();
@@ -1261,6 +1342,7 @@ mod tests {
                     None,
                     &mut false,
                     &mut false,
+                    &mut None,
                 );
                 paths = annotate::spot_paths(ctx);
             });

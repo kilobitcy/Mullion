@@ -143,6 +143,24 @@ pub(crate) fn button_spec(dangling: bool, live: bool, elsewhere: bool) -> Button
     }
 }
 
+/// F369:一行的按钮,以及要显示的「别的窗口」状态。列表行与状态栏浮层**同源**,
+/// 否则两处对「能不能点启动」各说各话。
+///
+/// 本窗口自己有运行态就以它为准(别的窗口的上报不再显示);没有才看别的窗口(F338)。
+pub(crate) fn row_spec<'a>(
+    dangling: bool,
+    state: Option<&TunnelState>,
+    other: Option<&'a mullion_store::OtherTunnel>,
+) -> (ButtonSpec, Option<&'a mullion_store::OtherTunnel>) {
+    let other = other.filter(|_| state.is_none());
+    let spec = button_spec(
+        dangling,
+        state.is_some(),
+        other.is_some_and(|o| o.state.blocks_start()),
+    );
+    (spec, other)
+}
+
 /// F338:这条隧道在别的实例里的状态。多个实例都报了时,**优先取会挡启动的那条**
 /// (否则「一个实例里已失败、另一个实例里正跑着」会被显示成已停止,按钮却被挡)。
 pub(crate) fn other_for(
@@ -267,12 +285,7 @@ fn row(
     let selected = ui_state.tunnel_editor_id == Some(rec.id);
     let (sub, dangling) = row_subtitle(rec, sessions, credentials);
     // F338:本实例自己有运行态就以它为准;没有才看别的实例。
-    let other = other.filter(|_| state.is_none());
-    let spec = button_spec(
-        dangling,
-        state.is_some(),
-        other.is_some_and(|o| o.state.blocks_start()),
-    );
+    let (spec, other) = row_spec(dangling, state, other);
 
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
@@ -529,6 +542,25 @@ mod tests {
         // 跑着的隧道即使引用悬垂也得能停 —— 端口还占着,不给停就成了
         // 「只能重启客户端才能关掉的通路」。
         assert!(button_spec(true, true, false).enabled);
+    }
+
+    /// F369:`row_spec` 是列表行与浮层共用的判据。本窗口有运行态就压过别的窗口
+    /// 的上报(按钮是「停止」、不显示别处状态);没有才由别处的阻挡态禁用「启动」。
+    #[test]
+    fn row_spec_prefers_the_local_state_over_other_windows() {
+        let o = mullion_store::OtherTunnel {
+            tunnel: TunnelId(1),
+            state: mullion_store::RemoteTunnelState::Running,
+            pid: 1,
+            started_at: 0,
+            instance: String::new(),
+        };
+        let (spec, shown) = row_spec(false, Some(&TunnelState::Running), Some(&o));
+        assert_eq!(spec.label, "停止");
+        assert!(shown.is_none(), "本窗口有运行态就不该再显示别处状态");
+        let (spec, shown) = row_spec(false, None, Some(&o));
+        assert!(!spec.enabled, "别处在跑,本窗口不该能启动");
+        assert!(shown.is_some());
     }
 
     /// 重连中必须同时说清**第几次**和**还有多久**。少任何一半,用户都判断

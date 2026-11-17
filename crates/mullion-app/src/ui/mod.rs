@@ -40,6 +40,7 @@ pub mod tab_props;
 pub mod toast;
 pub mod toolbar;
 pub mod transfer_panel;
+pub mod tunnel_popup;
 pub mod unlock;
 
 use std::sync::Arc;
@@ -485,6 +486,8 @@ pub struct UiState {
     pub overwrite_alert: Option<overwrite_alert::OverwriteAlert>,
     /// F367:pane 里的项目备忘浮层。`None` = 关着。
     pub memo_popup: Option<memo_popup::MemoDraft>,
+    /// F369:状态栏隧道指示器点开的启停浮层。`None` = 关着。
+    pub tunnel_popup: Option<tunnel_popup::TunnelPopup>,
     /// F55:传输队列面板是不是折叠着。
     ///
     /// **语义取反成「展开」**,为的是 `Default` 能给出想要的默认值:
@@ -865,6 +868,9 @@ pub struct UiActions {
     /// F367:备忘浮层的出口(加 / 删 / 存备注 / 关)。落盘在 `app.rs`。
     /// 同步 `has_real_action`。
     pub memo_popup: Option<memo_popup::MemoOut>,
+    /// F369:隧道浮层的出口(启动 / 停止 / 编辑 / 管理 / 关)。起隧道要 store 与
+    /// tokio runtime,施加在 `app.rs`。同步 `has_real_action`。
+    pub tunnel_popup: Option<tunnel_popup::TunnelOut>,
 }
 
 /// 指针此刻还在**文件面板**里没有(F59 / 设计 N1 的判据,2026-08-20 修正)。
@@ -1074,6 +1080,7 @@ pub fn build_ui(
             frame.tunnel_auto_failed,
         )
     };
+    let mut tunnel_click = None;
     chrome::status_bar(
         ctx,
         t,
@@ -1096,7 +1103,13 @@ pub fn build_ui(
         ui_state.cloud_status.as_ref(),
         &mut actions.copy_last_error,
         &mut ui_state.status_error_dismissed,
+        &mut tunnel_click,
     );
+    // F369:点指示器只**打开**,不做切换 —— 状态栏是面板,按下那一刻 F239 已按
+    // 「点外面」把开着的浮层关了,松手这里再开,做切换反而闪一下又开回来。
+    if let Some(r) = tunnel_click {
+        ui_state.tunnel_popup = Some(tunnel_popup::TunnelPopup::new(r));
+    }
     // 关于弹窗(§2:名称/版本/定位/仓库)。
     if ui_state.about_open {
         let mut open = ui_state.about_open;
@@ -1257,6 +1270,19 @@ pub fn build_ui(
         .as_ref()
         .and_then(|d| pane_rect_of(ctx, frame.titles, d.pane));
     actions.memo_popup = memo_popup::show(ctx, t, &mut ui_state.memo_popup, memo_rect);
+    // F369:隧道启停浮层。贴着状态栏指示器往上弹;与备忘浮层同为 pane 之上的
+    // 浮层,画在它之后(不会同开:都是模态)。
+    actions.tunnel_popup = tunnel_popup::show(
+        ctx,
+        t,
+        &ui_state.tunnel_popup,
+        tunnel_popup::View {
+            tunnels: frame.tunnels,
+            states: frame.tunnel_states,
+            others: frame.tunnel_others,
+            sessions: frame.sessions,
+        },
+    );
     // F53:内置编辑器。排在确认框之后 —— 确认框是模态,该盖在编辑器上面。
     actions.editor = editor_window::show(ctx, t, editor);
     // F46-a:迁移包弹窗。排在编辑器之后 —— 它是从菜单发起的模态,该盖在
