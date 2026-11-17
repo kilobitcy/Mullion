@@ -328,8 +328,10 @@ pub enum AutoVerdict {
 
 /// F368:库打开后自动拉起的队列。
 ///
-/// **逐条串行**:每条等到首次状态上报(或当场失败、或已不在运行表)才放行
-/// 下一条 —— 不等 `Running`,免得一条在退避里的拖住全队。
+/// **逐条串行**:每条等到建链有了结果(`Running` / `Reconnecting` / `Failed` /
+/// `Stopped`,或当场失败、或已不在运行表)才放行下一条。`Connecting` 不算 ——
+/// `spawn_tunnel` 一起来第一句就报它,算的话等于 N 条同时拨。也不必等
+/// `Running`:一条进了退避(`Reconnecting`)就放行,免得它拖住全队。
 ///
 /// 「自动集合」= 本次自动拉起、还没到过 `Running` 的。在集合里收到 `Failed`
 /// → 静默停掉并计数;到过 `Running` 就离开集合,此后出事是真事,走普通 toast。
@@ -380,7 +382,7 @@ impl Autostart {
 
     /// 收到一次状态上报。
     pub fn on_state(&mut self, id: TunnelId, state: &TunnelState) -> AutoVerdict {
-        if self.waiting == Some(id) {
+        if self.waiting == Some(id) && *state != TunnelState::Connecting {
             self.waiting = None;
         }
         if !self.auto.contains(&id) {
@@ -463,9 +465,23 @@ mod tests {
             a.on_state(TunnelId(1), &TunnelState::Connecting),
             AutoVerdict::Normal
         );
-        assert_eq!(a.next(is_live), Some(TunnelId(3)));
+        assert_eq!(
+            a.next(is_live),
+            None,
+            "只报了 Connecting 就放行 —— 等于 N 条同时拨"
+        );
+        let backoff = TunnelState::Reconnecting {
+            attempt: 1,
+            retry_in: std::time::Duration::from_secs(2),
+        };
+        assert_eq!(a.on_state(TunnelId(1), &backoff), AutoVerdict::Normal);
+        assert_eq!(
+            a.next(is_live),
+            Some(TunnelId(3)),
+            "进了退避的那条拖住了全队"
+        );
         live.borrow_mut().insert(TunnelId(3));
-        a.on_state(TunnelId(3), &TunnelState::Connecting);
+        a.on_state(TunnelId(3), &TunnelState::Running);
         assert_eq!(a.next(is_live), None, "队列应已空");
     }
 

@@ -13492,6 +13492,15 @@ impl App {
             let Some(id) = auto.next(|id| tunnels.state(id).is_some()) else {
                 return;
             };
+            // 排队期间用户可能已经取消勾选(或删掉了这条):以库里此刻为准。
+            let still = self
+                .store
+                .as_ref()
+                .is_some_and(|s| s.tunnels().iter().any(|t| t.id == id && t.autostart));
+            if !still {
+                auto.forget(id);
+                continue;
+            }
             if self.tunnel_autostart_lock.is_none() {
                 let lock = crate::shell::store::config_dir()
                     .and_then(|d| crate::tunnels::claim_autostart_lock(&d));
@@ -16712,6 +16721,10 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.ui.tunnel_editor = None;
                                     self.ui.tunnel_editor_baseline = None;
                                 }
+                                // F368:删掉的那条不再算「未自动启动」,也不再排队。
+                                if let Some(a) = self.tunnel_autostart.as_mut() {
+                                    a.forget(id);
+                                }
                                 self.ui.set_toast(crate::ui::toast::Kind::Ok, "已删除隧道");
                             }
                             Err(e) => self.ui.set_error(format!("删除隧道失败:{e}")),
@@ -19729,6 +19742,18 @@ mod tests {
             "当场失败没计数也没放行"
         );
         assert!(!pump.contains("set_error"), "自动路径出了顶栏红字");
+        assert!(
+            pump.contains("t.id == id && t.autostart"),
+            "排队期间取消勾选的那条照样被拉起"
+        );
+        let del = &src[src
+            .find("if let Some(id) = self.ui.tunnel_delete_request.take() {")
+            .expect("找不到删除隧道分支")..];
+        let del = &del[..del.find("tunnel_stop_request").unwrap()];
+        assert!(
+            del.contains("a.forget(id);"),
+            "删掉的那条还算「未自动启动」"
+        );
         assert!(
             src.matches("self.forget_tunnel_autostart(id);").count() >= 4,
             "手动启停(管理器两处 + 浮层两处)没全部 forget"
