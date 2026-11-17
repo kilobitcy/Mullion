@@ -348,6 +348,8 @@ pub struct UiState {
     /// F343:启动页项目列表里键盘高亮的是第几行(`None` = 没按过方向键)。
     /// 搜索词一变就清;行数变少时 `project_nav::scan` 会夹回去。
     pub launcher_sel: Option<usize>,
+    /// F364:这一次进入启动页已经把焦点给过搜索框了。离开启动页时复位。
+    pub launcher_focused_once: bool,
     /// F236:下一帧要把焦点打到右栏「名称」框上(刚新建完)。
     ///
     /// 用一位标志而不是在 app 侧直接 `request_focus`:那个 `Response` 只在
@@ -630,6 +632,8 @@ pub struct UiFrame<'a> {
     /// 与 [`Self::restored`] 和文件面板**互斥**:那两个各自也是 `CentralPanel`,
     /// 而 launcher 态压根不存在标签,谈不上占位标签或文件标签。
     pub launcher: bool,
+    /// F364:这一帧有模态开着(`App::modal_open`)。启动页据此不抢搜索框焦点。
+    pub modal_open: bool,
     /// F222:`known_hosts` 指纹表。**只在项目管理器开着时才是 `Some`** ——
     /// 它在 `App` 里是 `Arc<Mutex<_>>`,SSH 线程握手时也要拿;每帧无条件锁
     /// 会让一次握手白等一帧。`None` 时项目节点一律标「待核」,不会误判同机。
@@ -1263,6 +1267,7 @@ pub fn build_ui(
                 appearance: frame.appearance,
                 dialing_sessions: frame.dialing_sessions,
                 dialing_projects: frame.dialing_projects,
+                focus_blocked: frame.modal_open || ui_state.unlock.is_some(),
             },
             &mut actions,
         );
@@ -1270,6 +1275,7 @@ pub fn build_ui(
         // F258:同上。离开启动页(第一个标签立起来)就扔掉。
         ui_state.launcher_frozen_lamps = None;
         ui_state.launcher_sel = None;
+        ui_state.launcher_focused_once = false;
     }
     if let Some(files) = files_content {
         let (r, l) = files_panel::content(
@@ -1629,6 +1635,7 @@ mod tests {
             dialing_sessions: &[],
             dialing_projects: &[],
             launcher: false,
+            modal_open: false,
             history: &[],
             known_hosts: None,
             tunnels: &[],

@@ -64,6 +64,16 @@ pub struct Lists<'a> {
     /// 里 `claim`)就是转圈的生命周期。
     pub dialing_sessions: &'a [mullion_store::SessionId],
     pub dialing_projects: &'a [ProjectId],
+    /// F364:这一帧有解锁框或别的模态开着 —— 启动页不抢搜索框焦点。
+    pub focus_blocked: bool,
+}
+
+/// F364:进入启动页时要不要把焦点给搜索框。判据同 `unlock.rs`:
+/// 已聚焦过 / 解锁框或模态开着 / 这一帧已有别的部件持焦点,一律让位 ——
+/// launcher 画在解锁框之后,同帧后到的 `request_focus` 胜出,主密码明文会
+/// 打进搜索框(复核二)。
+pub fn should_focus_launcher(done: bool, blocked: bool, someone_focused: bool) -> bool {
+    !done && !blocked && !someone_focused
 }
 
 /// 画 launcher 中央区的三列(F288):项目 / 会话 / 历史现场。
@@ -161,6 +171,15 @@ pub fn show(
                 );
                 if r.changed() {
                     ui_state.launcher_sel = None;
+                }
+                // F364:进入启动页聚焦一次,不先点框 ↑↓/Enter 也能用。
+                if should_focus_launcher(
+                    ui_state.launcher_focused_once,
+                    lists.focus_blocked,
+                    ui.ctx().memory(|m| m.focused().is_some()),
+                ) {
+                    r.request_focus();
+                    ui_state.launcher_focused_once = true;
                 }
                 crate::ui::annotate::mark(ui.ctx(), "启动页/搜索框", r.rect);
             });
@@ -617,6 +636,24 @@ mod tests {
         dialing: (&[SessionId], &[ProjectId]),
         actions: &mut crate::ui::UiActions,
     ) {
+        draw_full(
+            ctx, ui_state, projects, lamps, sessions, history, dialing, false, actions,
+        );
+    }
+
+    /// 同 [`draw_dialing`],但能指定「这一帧有没有模态/解锁框开着」(F364)。
+    #[allow(clippy::too_many_arguments)]
+    fn draw_full(
+        ctx: &egui::Context,
+        ui_state: &mut crate::ui::UiState,
+        projects: &[ProjectRecord],
+        lamps: &std::collections::BTreeMap<ProjectId, crate::project::Lamp>,
+        sessions: &[SessionRecord],
+        history: &[crate::ui::history::HistoryRow],
+        dialing: (&[SessionId], &[ProjectId]),
+        focus_blocked: bool,
+        actions: &mut crate::ui::UiActions,
+    ) {
         show(
             ctx,
             &crate::theme::MULLION_DARK,
@@ -631,8 +668,75 @@ mod tests {
                 appearance: &crate::ui::badge::AppearanceCache::default(),
                 dialing_sessions: dialing.0,
                 dialing_projects: dialing.1,
+                focus_blocked,
             },
             actions,
+        );
+    }
+
+    /// F364:启动页聚焦的判据。解锁框/模态开着、或这一帧已有人持焦点,一律
+    /// 让位;聚焦过一次就不再抢。
+    #[test]
+    fn launcher_focus_yields_to_the_unlock_box_and_modals_and_fires_once() {
+        assert!(should_focus_launcher(false, false, false));
+        assert!(!should_focus_launcher(true, false, false), "已聚焦过");
+        assert!(
+            !should_focus_launcher(false, true, false),
+            "解锁框/模态开着:主密码会打进搜索框"
+        );
+        assert!(
+            !should_focus_launcher(false, false, true),
+            "这一帧已有别的部件持焦点"
+        );
+    }
+
+    /// F364:进入启动页时搜索框拿到焦点 —— 但**解锁框开着时不抢**(复核二:
+    /// launcher 画在解锁框之后,同帧后到的 request_focus 胜出,主密码明文会
+    /// 打进搜索框),且只抢一次。
+    ///
+    /// 自证会变红:删掉 `show` 里 `should_focus_launcher` 那段(第二个断言红);
+    /// 或把判据里的 `focus_blocked` 去掉(第一个断言红)。
+    #[test]
+    fn the_launcher_search_takes_focus_once_on_entry_but_never_while_blocked() {
+        let ctx = egui::Context::default();
+        let lamps = std::collections::BTreeMap::new();
+        let ps = vec![proj(1, "alpha", "/a", None)];
+        let mut ui_state = crate::ui::UiState::default();
+        let mut actions = crate::ui::UiActions::default();
+        let search = egui::Id::new("launcher_search");
+        let mut frame = |ui_state: &mut crate::ui::UiState, blocked: bool| {
+            let _ = ctx.run(wide(), |ctx| {
+                draw_full(
+                    ctx,
+                    ui_state,
+                    &ps,
+                    &lamps,
+                    &[],
+                    &[],
+                    (&[], &[]),
+                    blocked,
+                    &mut actions,
+                )
+            });
+        };
+        frame(&mut ui_state, true);
+        frame(&mut ui_state, true);
+        assert!(
+            !ctx.memory(|m| m.has_focus(search)),
+            "解锁框开着,搜索框却抢了焦点"
+        );
+        frame(&mut ui_state, false);
+        frame(&mut ui_state, false);
+        assert!(
+            ctx.memory(|m| m.has_focus(search)),
+            "进入启动页没聚焦搜索框"
+        );
+        ctx.memory_mut(|m| m.surrender_focus(search));
+        frame(&mut ui_state, false);
+        frame(&mut ui_state, false);
+        assert!(
+            !ctx.memory(|m| m.has_focus(search)),
+            "焦点交出去之后又被抢回来了"
         );
     }
 
@@ -1413,6 +1517,7 @@ mod tests {
                             appearance: &cache,
                             dialing_sessions: &[],
                             dialing_projects: &[],
+                            focus_blocked: false,
                         },
                         &mut actions,
                     );

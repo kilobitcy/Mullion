@@ -15526,6 +15526,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 // F225①:一个标签都没有 = launcher 态,中央区
                                 // 画项目列表。判据与上面算灯的那一半同源。
                                 launcher: self.tabs.is_empty(),
+                                // F364:启动页据此不抢搜索框焦点。
+                                modal_open: self.modal_open(),
                                 history: launcher_history_rows(&self.launcher_history),
                                 known_hosts: known_hosts_guard.as_deref(),
                                 tunnels,
@@ -22043,6 +22045,45 @@ mod tests {
     ///
     /// 自证会变红:把 `build_ui` 里 `group_manager::show(..)` 那段挪到
     /// `session_manager::show(..)` 之前。
+    /// F364:启动页聚焦的闸门要真的接上「解锁框 / 模态开着」两路,离开启动页
+    /// 时要复位「已聚焦过」—— 否则下一次回到启动页(关掉最后一个标签)不再聚焦。
+    ///
+    /// 自证会变红:把 `build_ui` 里 `focus_blocked:` 那一行的
+    /// `ui_state.unlock.is_some()` 删掉;或删掉 `else` 分支里的复位;或把 app 侧
+    /// 构造 `UiFrame` 时的 `modal_open: self.modal_open()` 换成 `false`。
+    #[test]
+    fn the_launcher_focus_gate_sees_the_unlock_box_and_modals_and_resets_on_leave() {
+        let body: String = body_of(include_str!("ui/mod.rs"), "pub fn build_ui(")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gate = body
+            .lines()
+            .find(|l| l.contains("focus_blocked:"))
+            .expect("build_ui 没给 launcher 传 focus_blocked");
+        assert!(gate.contains("ui_state.unlock.is_some()"), "{gate}");
+        assert!(gate.contains("frame.modal_open"), "{gate}");
+        let leave = &body[body
+            .find("if frame.launcher {")
+            .expect("找不到 launcher 分支")..];
+        let leave = &leave[leave.find("} else {").expect("找不到离开启动页的 else")..];
+        assert!(
+            leave[..leave.find("\n    }").unwrap_or(leave.len())]
+                .contains("ui_state.launcher_focused_once = false"),
+            "离开启动页时没复位 launcher_focused_once"
+        );
+        let prod: String = prod_src()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prod.contains("modal_open: self.modal_open()"),
+            "UiFrame.modal_open 没按 self.modal_open() 填"
+        );
+    }
+
     #[test]
     fn the_dismiss_order_is_the_exact_reverse_of_the_paint_order() {
         /// 这个弹窗在 `build_ui` 里的绘制调用点。
