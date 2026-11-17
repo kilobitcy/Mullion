@@ -9890,8 +9890,16 @@ impl App {
         else {
             return;
         };
+        // F365:Alt 复制一律把你/您改成我(复制回去当自己的答复)。改了就飘
+        // Warn —— 命令行里的「你」也会被改,醒目提示是唯一的兜底。
+        let (text, swapped) = crate::clipboard::to_first_person(&text);
         self.clipboard.set(&text);
-        if merged {
+        if swapped > 0 {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                format!("已将 {swapped} 处你/您改为我"),
+            );
+        } else if merged {
             self.ui
                 .set_toast(crate::ui::toast::Kind::Ok, "已复制为单行");
         }
@@ -19406,6 +19414,10 @@ mod tests {
         let copy = body_of(prod_src(), "fn copy_selection_one_line(&mut self) {");
         assert!(copy.contains("selection_text_one_line()"), "{copy}");
         assert!(copy.contains("if merged"), "单行选区也飘 toast 了:{copy}");
+        // F365:人称替换必须落在写剪贴板之前,否则剪贴板里还是「你」。
+        let swap = copy.find("to_first_person(").expect("F365 人称替换没接上");
+        let set = copy.find("self.clipboard.set(").expect("找不到写剪贴板");
+        assert!(swap < set, "人称替换排在写剪贴板之后:{copy}");
     }
 
     /// F15:左键点击要先切焦点、再尝试上报、上报不了才进本地划选;松开先问

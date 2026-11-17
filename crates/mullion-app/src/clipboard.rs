@@ -59,3 +59,46 @@ impl Default for Clipboard {
         Self::new()
     }
 }
+
+/// F365:Alt+拖选复制时把「你」「您」逐字换成「我」,其余一字不动。返回替换次数。
+///
+/// 放在 app 层而不是 `mullion-term`:单行拼接是终端语义(有 fixture 守着),
+/// 人称替换是产品策略。不做反向「我→你」、不做语义判断(「迷你」也会被改,
+/// 用户 2026-11-17 复议后维持一律替换,由调用方飘 Warn toast 兜底)。
+pub fn to_first_person(s: &str) -> (String, usize) {
+    let mut n = 0;
+    let out = s
+        .chars()
+        .map(|c| match c {
+            '你' | '您' => {
+                n += 1;
+                '我'
+            }
+            c => c,
+        })
+        .collect();
+    (out, n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_first_person;
+
+    /// F365:你/您逐字换成我,别的字一个不动;次数如实返回(调用方据此飘 toast)。
+    #[test]
+    fn every_ni_and_nin_becomes_wo_and_nothing_else_moves() {
+        assert_eq!(
+            to_first_person("需要你拍板的"),
+            ("需要我拍板的".to_string(), 1)
+        );
+        assert_eq!(
+            to_first_person("请您确认,你们呢"),
+            ("请我确认,我们呢".to_string(), 2)
+        );
+        assert_eq!(
+            to_first_person("git commit -m x"),
+            ("git commit -m x".to_string(), 0)
+        );
+        assert_eq!(to_first_person(""), (String::new(), 0));
+    }
+}
