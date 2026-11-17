@@ -1340,10 +1340,10 @@ impl Vault {
         Ok(())
     }
 
-    /// F268:克隆一条隧道。整条深拷贝,只换 id 与名字。
+    /// F268:克隆一条隧道。整条深拷贝,只换 id 与名字,并关掉自动启动(F370)。
     ///
-    /// **端口原样带过去**,不自动 +1:两条隧道撞端口这件事本来就没有校验
-    /// (谁先起谁占上),而「克隆一条再改端口」恰恰是用户要走的路 ——
+    /// **端口原样带过去**,不自动 +1:同端口只在两条都自动启动时才拦(F370),
+    /// 而「克隆一条再改端口」恰恰是用户要走的路 ——
     /// 悄悄替他挑一个端口,他反而要先发现被改了才能改回来。
     ///
     /// 没起名的隧道,副本**也没名字**:给它塞一个「 的副本」既难看又凭空
@@ -1356,6 +1356,8 @@ impl Vault {
             .find(|t| t.id == id)
             .ok_or(StoreError::TunnelNotFound(id))?;
         let mut rec = src.clone();
+        // F370:副本不自动启动 —— 否则两条自动启动同端口,开机查重被绕过。
+        rec.autostart = false;
         rec.id = TunnelId(
             self.tunnels
                 .iter()
@@ -1904,6 +1906,22 @@ mod tests {
                 expose: false,
             },
         }
+    }
+
+    /// F370:克隆出来的副本**一律不自动启动**,源条不动。否则克隆一条自动启动的
+    /// 隧道 = 两条自动启动同端口,开机查重拦截整个被绕过(F368 要防的静默错路)。
+    #[test]
+    fn clone_tunnel_never_carries_autostart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let sid = vault.add(draft_pw("a", "p1"), "t");
+        let src = vault.add_tunnel(TunnelDraft {
+            autostart: true,
+            ..tunnel_draft(sid, 3306)
+        });
+        let copy = vault.clone_tunnel(src).unwrap();
+        assert!(!vault.tunnel(copy).unwrap().autostart, "副本带上了自动启动");
+        assert!(vault.tunnel(src).unwrap().autostart, "源条被改了");
     }
 
     /// 隧道 id 与会话 id **各自独立编号**。挤在一个号池里会让「隧道 7」和
