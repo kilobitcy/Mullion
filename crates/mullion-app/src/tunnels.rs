@@ -4,7 +4,7 @@
 //! 记住每条隧道最后一次上报的状态,并把「N 条里有几条在跑、最坏的那条什么样」
 //! 算成纯函数(设计 D13)。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use mullion_ssh::tunnel::{TunnelHandle, TunnelState};
 use mullion_store::{SessionId, TunnelId, TunnelRecord};
@@ -308,8 +308,233 @@ pub fn port_badge(ports: &[RemotePort]) -> Option<(String, String)> {
     Some((text, hover))
 }
 
+/// F368:这次启动是谁发起的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartMode {
+    /// 人在屏幕前点的:首连可弹 TOFU,出「隧道启动中…」。
+    Manual,
+    /// 库打开后自动拉起:**不做任何交互** —— 首连只信已知主机,不出 toast。
+    Auto,
+}
+
+/// F368:自动拉起的那条收到一次状态上报之后该怎么办。
+#[derive(Debug, PartialEq, Eq)]
+pub enum AutoVerdict {
+    /// 照普通隧道处理(含 F115 失败 toast)。
+    Normal,
+    /// 停掉、重新发布、**不出声** —— 计进「N 条未自动启动」。
+    StopSilently,
+}
+
+/// F368:库打开后自动拉起的队列。
+///
+/// **逐条串行**:每条等到首次状态上报(或当场失败、或已不在运行表)才放行
+/// 下一条 —— 不等 `Running`,免得一条在退避里的拖住全队。
+///
+/// 「自动集合」= 本次自动拉起、还没到过 `Running` 的。在集合里收到 `Failed`
+/// → 静默停掉并计数;到过 `Running` 就离开集合,此后出事是真事,走普通 toast。
+/// 用户手动启停某条 → `forget`,从此与自动拉起无关。
+#[derive(Debug, Default)]
+pub struct Autostart {
+    queue: VecDeque<TunnelId>,
+    waiting: Option<TunnelId>,
+    auto: BTreeSet<TunnelId>,
+    failed: BTreeSet<TunnelId>,
+}
+
+impl Autostart {
+    /// 勾了自动启动的那些,按 id 升序。
+    pub fn new(records: &[TunnelRecord]) -> Self {
+        let mut ids: Vec<TunnelId> = records
+            .iter()
+            .filter(|r| r.autostart)
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        Self {
+            queue: ids.into(),
+            ..Self::default()
+        }
+    }
+
+    /// 下一条该拉的。闸:上一条还在运行表里且没上报过 → `None`;
+    /// 它已经不在运行表里(被停了 / 根本没起来)→ 放行。已经在跑的(用户
+    /// 抢先手动启动了)跳过。
+    pub fn next(&mut self, is_live: impl Fn(TunnelId) -> bool) -> Option<TunnelId> {
+        if let Some(w) = self.waiting {
+            if is_live(w) {
+                return None;
+            }
+            self.waiting = None;
+        }
+        while let Some(id) = self.queue.pop_front() {
+            if is_live(id) {
+                continue;
+            }
+            self.waiting = Some(id);
+            self.auto.insert(id);
+            return Some(id);
+        }
+        None
+    }
+
+    /// 收到一次状态上报。
+    pub fn on_state(&mut self, id: TunnelId, state: &TunnelState) -> AutoVerdict {
+        if self.waiting == Some(id) {
+            self.waiting = None;
+        }
+        if !self.auto.contains(&id) {
+            return AutoVerdict::Normal;
+        }
+        match state {
+            TunnelState::Running => {
+                self.auto.remove(&id);
+                AutoVerdict::Normal
+            }
+            TunnelState::Failed(_) => {
+                self.auto.remove(&id);
+                self.failed.insert(id);
+                AutoVerdict::StopSilently
+            }
+            _ => AutoVerdict::Normal,
+        }
+    }
+
+    /// `start_tunnel` 当场失败(缺密码 / 端口被占 / 悬垂引用)。
+    pub fn on_start_error(&mut self, id: TunnelId) {
+        if self.waiting == Some(id) {
+            self.waiting = None;
+        }
+        self.auto.remove(&id);
+        self.failed.insert(id);
+    }
+
+    /// 用户手动启停了这条:从此不归自动拉起管,也不再算「未自动启动」。
+    pub fn forget(&mut self, id: TunnelId) {
+        self.queue.retain(|q| *q != id);
+        self.auto.remove(&id);
+        self.failed.remove(&id);
+    }
+
+    /// 状态栏「N 条未自动启动」的 N。
+    pub fn failed_count(&self) -> usize {
+        self.failed.len()
+    }
+}
+
+/// F368:多开定主。抢 `<dir>/tunnel-autostart.lock` 的独占锁;抢到返回句柄
+/// (持有到进程退出,退出/崩溃由 OS 释放),别的实例已持有 → `None`。
+pub fn claim_autostart_lock(dir: &std::path::Path) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("tunnel-autostart.lock"))
+        .ok()?;
+    f.try_lock().ok()?;
+    Some(f)
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn auto_rec(id: u64, autostart: bool) -> TunnelRecord {
+        TunnelRecord {
+            id: TunnelId(id),
+            session_id: SessionId(1),
+            listen_port: 1000 + id as u16,
+            name: String::new(),
+            note: String::new(),
+            autostart,
+            kind: mullion_store::TunnelKind::Dynamic,
+        }
+    }
+
+    /// F368:只排勾了自动启动的,按 id 升序;逐条串行,上一条没上报前不放行。
+    #[test]
+    fn autostart_queues_only_flagged_tunnels_one_at_a_time() {
+        let mut a = Autostart::new(&[auto_rec(3, true), auto_rec(2, false), auto_rec(1, true)]);
+        let live = std::cell::RefCell::new(BTreeSet::new());
+        let is_live = |id| live.borrow().contains(&id);
+        assert_eq!(a.next(is_live), Some(TunnelId(1)));
+        live.borrow_mut().insert(TunnelId(1));
+        assert_eq!(a.next(is_live), None, "第一条还没上报就放行了下一条");
+        assert_eq!(
+            a.on_state(TunnelId(1), &TunnelState::Connecting),
+            AutoVerdict::Normal
+        );
+        assert_eq!(a.next(is_live), Some(TunnelId(3)));
+        live.borrow_mut().insert(TunnelId(3));
+        a.on_state(TunnelId(3), &TunnelState::Connecting);
+        assert_eq!(a.next(is_live), None, "队列应已空");
+    }
+
+    /// F368:等着的那条被停掉 / 根本没进运行表 → 放行;已在跑的跳过。
+    #[test]
+    fn autostart_gate_releases_when_the_waiting_one_is_gone_and_skips_live_ones() {
+        let mut a = Autostart::new(&[auto_rec(1, true), auto_rec(2, true), auto_rec(3, true)]);
+        assert_eq!(a.next(|_| false), Some(TunnelId(1)));
+        // 1 没进运行表(没上报也放行);2 已被用户手动启动 → 跳过。
+        assert_eq!(a.next(|id| id == TunnelId(2)), Some(TunnelId(3)));
+    }
+
+    /// F368:自动集合里 Failed → 静默停并计数;到过 Running 之后再 Failed 走普通路。
+    #[test]
+    fn autostart_failure_is_silent_only_before_it_ever_ran() {
+        let mut a = Autostart::new(&[auto_rec(1, true), auto_rec(2, true)]);
+        a.next(|_| false);
+        assert_eq!(
+            a.on_state(TunnelId(1), &TunnelState::Failed("x".into())),
+            AutoVerdict::StopSilently
+        );
+        assert_eq!(a.failed_count(), 1);
+        a.next(|_| false);
+        assert_eq!(
+            a.on_state(TunnelId(2), &TunnelState::Running),
+            AutoVerdict::Normal
+        );
+        assert_eq!(
+            a.on_state(TunnelId(2), &TunnelState::Failed("y".into())),
+            AutoVerdict::Normal,
+            "跑起来之后出事是真事,该播"
+        );
+        assert_eq!(a.failed_count(), 1);
+        // 不是自动拉起的那条永远 Normal。
+        assert_eq!(
+            a.on_state(TunnelId(9), &TunnelState::Failed("z".into())),
+            AutoVerdict::Normal
+        );
+    }
+
+    /// F368:当场失败放行并计数;手动启停 forget 去计数、出队。
+    #[test]
+    fn autostart_start_error_counts_and_forget_clears() {
+        let mut a2 = Autostart::new(&[auto_rec(1, true), auto_rec(2, true), auto_rec(3, true)]);
+        assert_eq!(a2.next(|_| false), Some(TunnelId(1)));
+        a2.on_start_error(TunnelId(1));
+        assert_eq!(a2.failed_count(), 1);
+        // 1 仍「不在运行表」也无所谓:已放行。
+        a2.forget(TunnelId(2));
+        assert_eq!(
+            a2.next(|id| id == TunnelId(1)),
+            Some(TunnelId(3)),
+            "forget 的那条应已出队"
+        );
+        a2.forget(TunnelId(1));
+        assert_eq!(a2.failed_count(), 0);
+    }
+
+    /// F368:同一把锁第二次抢不到(另开文件描述即模拟另一个实例);放手后能抢到。
+    #[test]
+    fn the_autostart_lock_admits_only_one_holder() {
+        let dir = std::env::temp_dir().join(format!("mullion-autolock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = claim_autostart_lock(&dir).expect("第一次应能抢到");
+        assert!(claim_autostart_lock(&dir).is_none(), "第二个实例也抢到了锁");
+        drop(first);
+        assert!(claim_autostart_lock(&dir).is_some(), "持有者退出后锁没释放");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// F339:只认本会话、-R、Running;本窗口优先;别窗口的 Running 也算。
     #[test]

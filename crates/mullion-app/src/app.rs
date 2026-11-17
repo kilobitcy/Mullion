@@ -2557,6 +2557,11 @@ pub struct App {
     tunnel_published: Option<Vec<(mullion_store::TunnelId, mullion_store::RemoteTunnelState)>>,
     /// F338:上一次读别的实例隧道状态的时刻。
     tunnel_others_read_at: Instant,
+    /// F368:库打开后自动拉起的队列。`None` = 没打开过库 / CLI 直连 /
+    /// 多开时锁被别的实例抢走。
+    tunnel_autostart: Option<crate::tunnels::Autostart>,
+    /// F368:多开定主的锁。抢到就持有到进程退出。
+    tunnel_autostart_lock: Option<std::fs::File>,
     /// F338:本实例启动时刻(Unix 秒),随隧道状态文件发布,供别的窗口悬停提示用。
     started_at_secs: i64,
     /// F336:上一次交给 `set_title` 的窗口标题。只在变了才调(T3 同族)。
@@ -3429,6 +3434,8 @@ impl App {
             tunnel_others: Vec::new(),
             tunnel_published: None,
             tunnel_others_read_at: Instant::now(),
+            tunnel_autostart: None,
+            tunnel_autostart_lock: None,
             started_at_secs: mullion_store::now_secs(),
             last_title: String::from("mullion"),
             last_saved_layout: None,
@@ -3557,6 +3564,12 @@ impl App {
             // F258:CLI 直连是命令行这一次调用发起的,算用户动作。
             self.spawn_connect(cfg, false, None, false, None, true);
             return;
+        }
+        // F368:库打开后自动拉起隧道。**放在 CLI 直连的 `return` 之后**:CLI 是
+        // 一次性临时连接,开机工作站语义不适用。打开失败的路径也会走到这里,
+        // 没有库就什么都不排。真正的拉起在 `pump_tunnel_autostart`(逐条串行)。
+        if let Some(store) = self.store.as_ref() {
+            self.tunnel_autostart = Some(crate::tunnels::Autostart::new(store.tunnels()));
         }
         // F288 D1:**启动不再自动弹任何窗**。原来这里是个 `if/else` ——
         // 有历史就弹恢复列表、没有就弹会话管理器。F288 把那两样都摊成了
@@ -13364,7 +13377,11 @@ impl App {
     ///
     /// 当场失败(悬垂引用 / 端口被占)返回 `Err`,**不自己报** —— 管理器报
     /// 顶栏,浮层顶栏 + 行内(F369)。
-    fn start_tunnel(&mut self, id: mullion_store::TunnelId) -> Result<(), String> {
+    fn start_tunnel(
+        &mut self,
+        id: mullion_store::TunnelId,
+        mode: crate::tunnels::StartMode,
+    ) -> Result<(), String> {
         use mullion_store::TunnelKind;
         let Some(store) = self.store.as_ref() else {
             return Ok(());
@@ -13418,12 +13435,19 @@ impl App {
         // 首连允许弹 TOFU 窗;重连只信已知主机(设计 S3)。后者用的
         // `TrustedOnlyPolicy` **在类型上**就没有 `EventLoopProxy`,不可能弹窗
         // —— 半夜自动重连时弹一个没人看的模态框,等于隧道静默死掉。
-        let first: Arc<dyn mullion_ssh::known_hosts::HostKeyPolicy> =
+        // F368:自动拉起时首连也只信已知主机 —— 开机 N 条并发弹 N 个 TOFU 框。
+        let auto = mode == crate::tunnels::StartMode::Auto;
+        let first: Arc<dyn mullion_ssh::known_hosts::HostKeyPolicy> = if auto {
+            Arc::new(crate::host_key::TrustedOnlyPolicy::new(
+                self.known_hosts.clone(),
+            ))
+        } else {
             Arc::new(crate::host_key::PromptingPolicy::new(
                 self.known_hosts.clone(),
                 self.proxy.clone(),
                 true,
-            ));
+            ))
+        };
         let retry: Arc<dyn mullion_ssh::known_hosts::HostKeyPolicy> = Arc::new(
             crate::host_key::TrustedOnlyPolicy::new(self.known_hosts.clone()),
         );
@@ -13447,9 +13471,59 @@ impl App {
         };
         self.tunnels.insert(id, handle);
         self.publish_tunnel_state(false);
-        self.ui
-            .set_toast(crate::ui::toast::Kind::Busy, "隧道启动中…");
+        if !auto {
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Busy, "隧道启动中…");
+        }
         Ok(())
+    }
+
+    /// F368:推进自动拉起队列。`about_to_wait` 里每次唤醒调一次;闸在
+    /// `Autostart::next` 里,没轮到时零开销。
+    ///
+    /// 锁在**真正要拉第一条**时才抢(而不是库一打开就抢):没勾自动启动的
+    /// 实例不该占着锁,让后开的、勾了的那个抢不到。
+    fn pump_tunnel_autostart(&mut self) {
+        loop {
+            let Some(auto) = self.tunnel_autostart.as_mut() else {
+                return;
+            };
+            let tunnels = &self.tunnels;
+            let Some(id) = auto.next(|id| tunnels.state(id).is_some()) else {
+                return;
+            };
+            if self.tunnel_autostart_lock.is_none() {
+                let lock = crate::shell::store::config_dir()
+                    .and_then(|d| crate::tunnels::claim_autostart_lock(&d));
+                let Some(lock) = lock else {
+                    log::info!(target: "mullion", "隧道自动拉起:锁在别的窗口手里,本窗口不拉");
+                    self.tunnel_autostart = None;
+                    return;
+                };
+                self.tunnel_autostart_lock = Some(lock);
+            }
+            // 自动路径**不走 `set_error`**:N 条缺密码就是 N 次顶栏红字。
+            // 计进「N 条未自动启动」,只记日志。
+            if let Err(e) = self.start_tunnel(id, crate::tunnels::StartMode::Auto) {
+                log::info!(target: "mullion", "隧道 {} 未自动启动: {e}", id.0);
+                if let Some(a) = self.tunnel_autostart.as_mut() {
+                    a.on_start_error(id);
+                }
+            }
+            mark_ui_dirty!(self.ui_dirty);
+            self.request_ui_redraw();
+            // 起来了就等它首次上报;没进运行表(当场失败)接着拉下一条。
+            if self.tunnels.state(id).is_some() {
+                return;
+            }
+        }
+    }
+
+    /// F368:用户手动启停了这条 —— 从此与自动拉起无关。
+    fn forget_tunnel_autostart(&mut self, id: mullion_store::TunnelId) {
+        if let Some(a) = self.tunnel_autostart.as_mut() {
+            a.forget(id);
+        }
     }
 
     /// F369:状态栏隧道浮层的出口。启停不关浮层(用户多半要连点几条);
@@ -13459,7 +13533,8 @@ impl App {
         use crate::ui::tunnel_popup::TunnelOut;
         match out {
             TunnelOut::Start(id) => {
-                let r = self.start_tunnel(id);
+                self.forget_tunnel_autostart(id);
+                let r = self.start_tunnel(id, crate::tunnels::StartMode::Manual);
                 if let Some(p) = self.ui.tunnel_popup.as_mut() {
                     match &r {
                         Ok(()) => {
@@ -13475,6 +13550,7 @@ impl App {
                 }
             }
             TunnelOut::Stop(id) => {
+                self.forget_tunnel_autostart(id);
                 self.tunnels.stop(id);
                 self.publish_tunnel_state(false);
                 if let Some(p) = self.ui.tunnel_popup.as_mut() {
@@ -13538,6 +13614,23 @@ impl App {
             return;
         };
         self.publish_tunnel_state(false);
+        // F368:自动拉起的那条还没跑起来就挂了 → 停掉、重新发布(否则别的
+        // 窗口一直显示「在另一个窗口连接中…」)、**不播** F115 toast(N 条
+        // 就是 N 个 toast),计进状态栏「N 条未自动启动」。
+        let verdict = self
+            .tunnel_autostart
+            .as_mut()
+            .map_or(crate::tunnels::AutoVerdict::Normal, |a| {
+                a.on_state(id, &state)
+            });
+        if verdict == crate::tunnels::AutoVerdict::StopSilently {
+            log::info!(target: "mullion", "隧道 {} 未自动启动: {state:?}", id.0);
+            self.tunnels.stop(id);
+            self.publish_tunnel_state(false);
+            mark_ui_dirty!(self.ui_dirty);
+            self.request_ui_redraw();
+            return;
+        }
         // 播不播由纯函数定(它有自己的守护测试),这里只负责组文案。
         if let Some(cause) = crate::tunnels::failure_announcement(&prev, &state) {
             let title = self
@@ -15789,7 +15882,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 tunnels,
                                 tunnel_states: &tunnel_states,
                                 tunnel_others: &self.tunnel_others,
-                                tunnel_auto_failed: 0,
+                                // F368:状态栏「N 条未自动启动」。
+                                tunnel_auto_failed: self
+                                    .tunnel_autostart
+                                    .as_ref()
+                                    .map_or(0, |a| a.failed_count()),
                                 store_available,
                                 // F37:占位标签**不算已连接** —— 它一条连接都
                                 // 没建。判据从「有没有标签」收紧成「活动标签
@@ -16624,12 +16721,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // F111 启停。**必须在这里、不能在 egui 闭包里**:要 store、要
                 // tokio runtime、要 bind 端口,三样在闭包里都够不着。
                 if let Some(id) = self.ui.tunnel_stop_request.take() {
+                    self.forget_tunnel_autostart(id);
                     self.tunnels.stop(id);
                     self.publish_tunnel_state(false);
                     self.ui.set_toast(crate::ui::toast::Kind::Ok, "已停止隧道");
                 }
                 if let Some(id) = self.ui.tunnel_start_request.take() {
-                    if let Err(e) = self.start_tunnel(id) {
+                    self.forget_tunnel_autostart(id);
+                    if let Err(e) = self.start_tunnel(id, crate::tunnels::StartMode::Manual) {
                         self.ui.set_error(e);
                     }
                 }
@@ -17065,6 +17164,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.tick_heartbeat();
         // F338:别的实例的隧道状态。
         self.tick_tunnel_others();
+        // F368:库打开后的隧道自动拉起。
+        self.pump_tunnel_autostart();
         // F336:窗口标题。**放这里不放 `RedrawRequested`**:最小化态不出帧,
         // 而标题恰在那时最需要更新(复核 R8)。算与 `set_title` 分开、不同才调 ——
         // `set_title` 每调一次都是一次跨线程窗口消息,每次唤醒都调是 T3 那一类白烧。
@@ -19536,6 +19637,104 @@ mod tests {
     ///
     /// 自证会变红:删掉 `has_real_action` 里的 `a.tunnel_popup`;或删掉
     /// `apply_tunnel_popup` 里的 `p.errors.insert(`。
+    /// F368:自动拉起的挂钩在 CLI 直连的 `return` 之后、且只在有库时建队列;
+    /// 泵在 `about_to_wait` 里每次唤醒都推一下。
+    ///
+    /// 自证会变红:把建队列那段挪到 `if let Some(cfg) = self.initial.take()`
+    /// 之前;或去掉 `if let Some(store) = self.store.as_ref()`。
+    #[test]
+    fn the_autostart_hook_runs_after_the_cli_return_and_only_with_a_store() {
+        let src = strip_comments(prod_src());
+        let body = body_of(&src, "fn finish_store_open(");
+        let cli = body
+            .find("self.initial.take()")
+            .expect("找不到 CLI 直连分支");
+        let hook = body
+            .find("crate::tunnels::Autostart::new(")
+            .expect("finish_store_open 没建自动拉起队列");
+        assert!(
+            cli < hook,
+            "挂钩在 CLI 直连之前 —— 临时连接也会拉起整机隧道"
+        );
+        assert!(
+            body[cli..hook].contains("return;"),
+            "CLI 分支没在挂钩前 return"
+        );
+        let guard = body[..hook]
+            .rfind("if let Some(store) = self.store.as_ref()")
+            .expect("没判库是否打开");
+        assert!(guard > cli, "判库那一行不是挂钩自己的");
+        assert!(
+            body_of(&src, "fn about_to_wait(").contains("self.pump_tunnel_autostart();"),
+            "自动拉起队列没人推"
+        );
+    }
+
+    /// F368:自动拉起的那条没跑起来就挂了 → 停掉 + 重新发布 + 不播 F115 toast。
+    /// 判据先于 toast 判据问。
+    ///
+    /// 自证会变红:删掉 StopSilently 分支里的 `self.publish_tunnel_state(false);`
+    /// 或 `return;`。
+    #[test]
+    fn an_autostart_failure_stops_silently_and_republishes() {
+        let src = strip_comments(prod_src());
+        let body = body_of(&src, "fn accept_tunnel_state(");
+        let ask = body
+            .find("a.on_state(id, &state)")
+            .expect("没问自动拉起队列");
+        let toast = body
+            .find("crate::tunnels::failure_announcement(")
+            .expect("找不到 F115 toast 判据");
+        assert!(ask < toast, "先播了 toast 才问自动拉起");
+        let branch = &body[body
+            .find("AutoVerdict::StopSilently")
+            .expect("没有静默停分支")..toast];
+        assert!(
+            branch.contains("self.tunnels.stop(id);"),
+            "失败的那条没停掉"
+        );
+        assert!(
+            branch.contains("self.publish_tunnel_state(false);"),
+            "没重新发布 —— 别的窗口一直显示「在另一个窗口连接中…」"
+        );
+        assert!(branch.contains("return;"), "静默停之后还会往下播 toast");
+        assert!(!branch.contains("set_toast"), "静默停分支出声了");
+    }
+
+    /// F368:自动路径首连只信已知主机、不出「隧道启动中…」;泵不走 `set_error`、
+    /// 当场失败计数、首次真要拉时才抢锁;手动启停四处都 `forget`。
+    ///
+    /// 自证会变红:把 `if auto {` 那一臂换成 `PromptingPolicy`;或在泵里加
+    /// `self.ui.set_error(`。
+    #[test]
+    fn the_auto_path_dials_with_trusted_only_first_policy() {
+        let src = strip_comments(prod_src());
+        let st = body_of(&src, "fn start_tunnel(");
+        let auto_arm = &st[st.find("if auto {").expect("首连策略没按模式分")..];
+        let trusted = auto_arm.find("TrustedOnlyPolicy::new(").unwrap();
+        let prompting = auto_arm.find("PromptingPolicy::new(").unwrap();
+        assert!(trusted < prompting, "自动路径首连用了会弹窗的策略");
+        assert!(
+            st.contains("if !auto {\n            self.ui\n                .set_toast(crate::ui::toast::Kind::Busy, \"隧道启动中…\")"),
+            "自动路径也弹「隧道启动中…」"
+        );
+        let pump = body_of(&src, "fn pump_tunnel_autostart(");
+        assert!(
+            pump.contains("crate::tunnels::claim_autostart_lock("),
+            "多开没定主"
+        );
+        assert!(pump.contains("crate::tunnels::StartMode::Auto"));
+        assert!(
+            pump.contains("a.on_start_error(id)"),
+            "当场失败没计数也没放行"
+        );
+        assert!(!pump.contains("set_error"), "自动路径出了顶栏红字");
+        assert!(
+            src.matches("self.forget_tunnel_autostart(id);").count() >= 4,
+            "手动启停(管理器两处 + 浮层两处)没全部 forget"
+        );
+    }
+
     #[test]
     fn the_tunnel_popup_is_wired_to_start_stop_and_edit() {
         let src = strip_comments(prod_src());
@@ -19548,7 +19747,7 @@ mod tests {
             "隧道浮层的出口没人收"
         );
         let ap = body_of(&src, "fn apply_tunnel_popup(");
-        assert!(ap.contains("self.start_tunnel(id)"));
+        assert!(ap.contains("self.start_tunnel(id, crate::tunnels::StartMode::Manual)"));
         assert!(ap.contains("p.errors.insert("), "启动失败没写进行内");
         assert!(ap.contains("self.ui.set_error(e)"), "启动失败没落顶栏");
         assert!(ap.contains("self.tunnels.stop(id)"));
