@@ -301,6 +301,13 @@ impl Queue {
         ids
     }
 
+    /// F366:摘掉**一条已收尾**的 job(重试时把旧的 Failed 换下来,否则 F308
+    /// 「有 Failed 永不自动收」使传输栏永不收起)。没收尾的不动 —— 摘掉在跑
+    /// 的,worker 的收工事件就落空了。
+    pub fn remove(&mut self, id: u64) {
+        self.jobs.retain(|j| j.id != id || !j.state.is_finished());
+    }
+
     pub fn clear_finished(&mut self) {
         self.jobs.retain(|j| !j.state.is_finished());
     }
@@ -447,6 +454,24 @@ mod tests {
 
     fn conflict() -> Result<(), String> {
         Err(JobError::Conflict.into())
+    }
+
+    /// F366:重试时摘掉旧的 Failed 条目 —— 否则 F308「有 Failed 永不自动收」
+    /// 使传输栏永不收起。只摘已收尾的:在跑的被摘掉,worker 的收工事件就
+    /// 落空了。
+    ///
+    /// 自证会变红:把 `remove` 里的 `is_finished` 条件去掉(第二个断言红)。
+    #[test]
+    fn remove_only_takes_finished_jobs_out() {
+        let mut q = q();
+        let a = q.push(job(Direction::Download));
+        let b = q.push(job(Direction::Download));
+        q.take_runnable();
+        q.finish(a, Err("boom".into()));
+        q.remove(a);
+        q.remove(b);
+        assert!(q.get(a).is_none(), "收尾的那条没摘掉");
+        assert!(q.get(b).is_some(), "在跑的被摘掉了");
     }
 
     /// F252:「这一栏还有活没干完吗」—— 判据是**没收尾的** job,不是「有没有

@@ -73,9 +73,54 @@ pub fn classify(msg: &str) -> FailKind {
     }
 }
 
+/// F366:从已格式化的 `io::Error` 文案里取 OS 错误码。std 的 `Display` 固定以
+/// `(os error N)` 结尾 —— 不改 worker 签名(它把错误压成了 `String`),在这里
+/// 解析;格式假设由 `the_os_error_suffix_std_prints_is_what_we_parse` 钉住。
+pub fn os_code(msg: &str) -> Option<i32> {
+    const MARK: &str = "(os error ";
+    let start = msg.rfind(MARK)? + MARK.len();
+    let end = start + msg[start..].find(')')?;
+    msg[start..end].trim().parse().ok()
+}
+
+/// F366:覆盖失败给人看的原因。32/33 = Windows 共享/锁定冲突(Excel/WPS 独占
+/// 打开时在 open 那一步就被拒,原文件完好),5 = 拒绝访问;其它原样 ——
+/// Windows 上那段文本来自 `FormatMessageW`,zh-CN 系统本来就是中文。
+pub fn overwrite_reason(msg: &str) -> String {
+    match os_code(msg) {
+        Some(32 | 33) => "文件正被其他程序占用(例如 Excel),关掉它后重试".into(),
+        Some(5) => "没有写入权限(文件可能是只读的)".into(),
+        _ => msg.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F366:钉住 std 的固定格式 —— `io::Error` 的 `Display` 以 `(os error N)`
+    /// 结尾。worker 已把错误压成 `String`,我们不改它的签名,只在这里解析;
+    /// 哪天 std 改了格式,这条先红,而不是告警框静默退回原文。
+    #[test]
+    fn the_os_error_suffix_std_prints_is_what_we_parse() {
+        let e = std::io::Error::from_raw_os_error(32);
+        assert_eq!(os_code(&format!("写不了本地文件:{e}")), Some(32));
+        assert_eq!(os_code("No such file: No such file"), None);
+        assert_eq!(os_code("(os error x)"), None);
+    }
+
+    /// F366:Windows 上 32/33(共享/锁定冲突,Excel/WPS 独占打开)与 5(拒绝
+    /// 访问)翻译成人话,其它原样(Windows 上已是本地化的系统文本)。
+    #[test]
+    fn sharing_violation_and_access_denied_are_translated_others_kept_verbatim() {
+        assert!(overwrite_reason("x (os error 32)").contains("被其他程序占用"));
+        assert!(overwrite_reason("x (os error 33)").contains("被其他程序占用"));
+        assert!(overwrite_reason("x (os error 5)").contains("没有写入权限"));
+        assert_eq!(
+            overwrite_reason("磁盘满了 (os error 112)"),
+            "磁盘满了 (os error 112)"
+        );
+    }
 
     /// 连接级失败必须判成 `Session` —— 否则用户在一条死链路上点目录,
     /// 只会看见一串底层错误,没有任何回到可用状态的入口。
