@@ -72,6 +72,66 @@ pub fn join_as_one_line(rows: &[SelRow]) -> String {
     out.trim().to_string()
 }
 
+/// F371:算不算路径里的字符。只认 ASCII —— 中文文件名的路径会在中文处截断
+/// (设计已认下,退回拖选);换来的是 `见docs/x.md`、`设计文档：docs/…` 这种
+/// 中文紧贴路径的写法能切干净。
+pub fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "._-/~+@%=".contains(c)
+}
+
+/// F371:双击落在 `(row, col)` 上,若那里是一条路径,返回它的起止格(含两端,
+/// `(行, 列)`,可跨行);不是路径返回 `None`,交回 alacritty 语义选择。
+///
+/// - 向两侧扩到路径字符的最大连续段,该段**含 `/`** 才算路径;段尾的 `.` 不剥
+///   (与 app 侧 `files::reveal::TRAILING_PUNCT` 对齐)。
+/// - 跨行用 F335 同一条「写满右缘」判据(见 [`join_as_one_line`]):tmux 绝对
+///   定位重画,断行不带 `WRAPLINE`。段写到最后一列、下一行第 0 列也是路径字符
+///   → 同一个 token 被硬切开了,续上;向上同理。恰好写满又恰好下一行以路径
+///   字符开头而两者无关时会多选一截,已认下。
+///
+/// `rows` 每行按**列**排(宽字 spacer 由调用方换成非路径字符),行宽一致。
+pub fn path_span(
+    rows: &[Vec<char>],
+    row: usize,
+    col: usize,
+) -> Option<((usize, usize), (usize, usize))> {
+    let at = |r: usize, c: usize| rows.get(r).and_then(|l| l.get(c)).copied();
+    if !at(row, col).is_some_and(is_path_char) {
+        return None;
+    }
+    let last = |r: usize| rows[r].len().saturating_sub(1);
+    let (mut sr, mut sc) = (row, col);
+    loop {
+        while sc > 0 && at(sr, sc - 1).is_some_and(is_path_char) {
+            sc -= 1;
+        }
+        if sc == 0 && sr > 0 && at(sr - 1, last(sr - 1)).is_some_and(is_path_char) {
+            sr -= 1;
+            sc = last(sr);
+            continue;
+        }
+        break;
+    }
+    let (mut er, mut ec) = (row, col);
+    loop {
+        while ec < last(er) && at(er, ec + 1).is_some_and(is_path_char) {
+            ec += 1;
+        }
+        if ec == last(er) && at(er + 1, 0).is_some_and(is_path_char) {
+            er += 1;
+            ec = 0;
+            continue;
+        }
+        break;
+    }
+    let has_slash = rows[sr..=er].iter().enumerate().any(|(i, line)| {
+        let from = if i == 0 { sc } else { 0 };
+        let to = if sr + i == er { ec } else { line.len() - 1 };
+        line[from..=to].contains(&'/')
+    });
+    has_slash.then_some(((sr, sc), (er, ec)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +189,83 @@ mod tests {
         ];
         assert_eq!(join_as_one_line(&rows), "ls -la");
         assert_eq!(join_as_one_line(&[]), "");
+    }
+
+    /// 网格:每行补空格到 `width` 列。中文按一格算 —— 宽字的 spacer 由
+    /// `Emulator` 换成空格,对路径判据而言两者都只是「非路径字符」。
+    fn grid(width: usize, lines: &[&str]) -> Vec<Vec<char>> {
+        lines
+            .iter()
+            .map(|l| {
+                let mut v: Vec<char> = l.chars().collect();
+                v.resize(width, ' ');
+                v
+            })
+            .collect()
+    }
+
+    /// F371:中文冒号后紧跟的路径,点在路径里任意一格都选出整段,且只有那一段。
+    #[test]
+    fn a_double_click_anywhere_in_a_path_takes_the_whole_path() {
+        let g = grid(60, &["设计文档：docs/superpowers/specs/x-design.md 之后"]);
+        // `设计文档：` 占 5 个字符格,路径从第 5 列起。
+        let len = "docs/superpowers/specs/x-design.md".len();
+        for col in [5, 9, 20, 5 + len - 1] {
+            assert_eq!(
+                path_span(&g, 0, col),
+                Some(((0, 5), (0, 5 + len - 1))),
+                "点在第 {col} 列"
+            );
+        }
+    }
+
+    /// 不含 `/` 的词不算路径,交回语义选择。
+    #[test]
+    fn a_word_without_a_slash_is_not_a_path() {
+        let g = grid(40, &["hello world.txt"]);
+        assert_eq!(path_span(&g, 0, 2), None);
+        assert_eq!(path_span(&g, 0, 8), None);
+    }
+
+    /// 点在非路径字符上(空格、中文、全角冒号)不走路径判据。
+    #[test]
+    fn a_click_off_the_path_is_not_a_path() {
+        let g = grid(40, &["见：docs/a.md"]);
+        assert_eq!(path_span(&g, 0, 0), None);
+        assert_eq!(path_span(&g, 0, 1), None);
+    }
+
+    /// 段尾的 `.` 不剥(与 `files::reveal::TRAILING_PUNCT` 对齐);`,` `:`
+    /// 本就不是路径字符。
+    #[test]
+    fn a_trailing_dot_is_kept_and_a_comma_ends_the_path() {
+        let g = grid(40, &["at ../x/y. and a/b, c"]);
+        assert_eq!(path_span(&g, 0, 4), Some(((0, 3), (0, 9))));
+        assert_eq!(path_span(&g, 0, 16), Some(((0, 15), (0, 17))));
+    }
+
+    /// 写满右缘、下一行行首紧接路径字符 → 被硬切开的同一条路径,跨行续上。
+    /// 两头都点一次:从上半截往下续、从下半截往上续,结果相同。
+    #[test]
+    fn a_path_cut_at_the_right_edge_continues_on_the_next_row() {
+        let g = grid(10, &["see a/bcde", "f/gh.rs ok"]);
+        let want = Some(((0, 4), (1, 6)));
+        assert_eq!(path_span(&g, 0, 6), want);
+        assert_eq!(path_span(&g, 1, 2), want);
+    }
+
+    /// 没写满就不续:那是词边界断行,下一行是另一段文字。
+    #[test]
+    fn a_path_that_stops_short_of_the_edge_does_not_continue() {
+        let g = grid(12, &["see a/bcde", "fgh/x.rs"]);
+        assert_eq!(path_span(&g, 0, 6), Some(((0, 4), (0, 9))));
+        assert_eq!(path_span(&g, 1, 1), Some(((1, 0), (1, 7))));
+    }
+
+    /// 写满了但下一行行首是空格(Ink 续行缩进)→ 不续。
+    #[test]
+    fn a_full_row_followed_by_an_indented_row_does_not_continue() {
+        let g = grid(10, &["see a/bcde", "  fgh"]);
+        assert_eq!(path_span(&g, 0, 6), Some(((0, 4), (0, 9))));
     }
 }

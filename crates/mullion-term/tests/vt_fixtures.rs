@@ -405,3 +405,32 @@ fn tmux_forwards_a_background_window_bell_to_the_client() {
     emu.feed(&bytes[at..]);
     assert!(emu.take_bell(), "tmux 客户端流里的 BEL 没被认出来");
 }
+
+/// F371 的 fixture:40 列 tmux 客户端流,`设计文档：` 后跟一条写满右缘、折到
+/// 下一行的长路径。
+const WRAPPED_PATH: &str = "tmux-client-wrapped-path";
+
+/// F371:**双击折开的路径任一半,选出整条路径,不带中文冒号与后面的中文。**
+///
+/// 自证会变红:把 `path_span` 里向下/向上续行的那两个 `continue` 分支删掉
+/// (只选出半截);或把 `Emulator::selection_start` 的路径分支删掉(连
+/// `设计文档：` 一起选,alacritty 的语义分隔符表不认全角冒号以外的边界时
+/// 还会带上后面的中文)。
+#[test]
+fn double_clicking_either_half_of_a_wrapped_path_selects_the_whole_path() {
+    let mut emu = Emulator::new(40, 10);
+    emu.feed(&fixture_bytes(WRAPPED_PATH));
+    let first = (0..10u16)
+        .find(|&r| row_text(&emu, r).contains("docs/superpowers"))
+        .expect("fixture 里应当有那条路径");
+    let want = "docs/superpowers/specs/2026-11-17-f371-path-design.md";
+    for (col, row) in [(15, first), (5, first + 1)] {
+        emu.selection_start(col, row, SelectionKind::Semantic, CellSide::Left);
+        let got = emu.selection_text().expect("应当选中了文本");
+        assert_eq!(
+            got.replace('\n', ""),
+            want,
+            "双击第 {row} 行第 {col} 列选出的是 {got:?}"
+        );
+    }
+}

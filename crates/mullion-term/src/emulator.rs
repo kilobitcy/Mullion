@@ -19,7 +19,7 @@ use vte::ansi::Processor;
 
 use crate::palette;
 use crate::remote_state::{parse_title, Osc7Sniffer, RemoteState};
-use crate::selection::{join_as_one_line, CellSide, SelRow, SelectionKind};
+use crate::selection::{join_as_one_line, path_span, CellSide, SelRow, SelectionKind};
 use crate::snapshot::{Cursor, CursorShape, GridSnapshot, Rgb, SnapCell};
 
 /// 收集 `Term` 发出的事件。共享缓冲,`Term` 持一份克隆。
@@ -184,6 +184,12 @@ impl Emulator {
                 shape: alacritty_terminal::vte::ansi::CursorShape::Beam,
                 blinking: true,
             },
+            // F371:默认分隔符表一个全角标点都没有,`说明：hello` 双击会连中文
+            // 一起选。追加在默认表之后,半角那批原样保留。
+            semantic_escape_chars: format!(
+                "{}：，。、；！？（）「」『』《》【】“”‘’",
+                alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS
+            ),
             ..Config::default()
         };
         let term = Term::new(config, &dims, sink.clone());
@@ -624,9 +630,50 @@ impl Emulator {
         Point::new(Line(row - offset), Column((col as usize).min(max_col)))
     }
 
+    /// F371:视口里每一行的字符,按列排。宽字的 spacer 格记成空格(只给
+    /// `path_span` 用,它只关心「是不是路径字符」)。
+    fn viewport_chars(&self) -> Vec<Vec<char>> {
+        let grid = self.term.grid();
+        let offset = grid.display_offset() as i32;
+        (0..grid.screen_lines() as i32)
+            .map(|r| {
+                let line = &grid[Line(r - offset)];
+                (0..grid.columns())
+                    .map(|c| {
+                        let cell = &line[Column(c)];
+                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                            ' '
+                        } else {
+                            cell.c
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// 开始一段选区(左键按下)。`kind` 由 app 侧的连击判定给出。
     pub fn selection_start(&mut self, col: u16, row: u16, kind: SelectionKind, side: CellSide) {
         let point = self.point_at(col, row);
+        // F371:双击先看是不是落在一条路径上 —— 是就只选路径本身(可跨硬切
+        // 的行)。落成 `Simple` 是因为 alacritty 的 `Semantic` 只认分隔符表,
+        // 表达不了「路径字符的最大连续段」。app 侧仍记 `Semantic`:它对
+        // `Simple` 的同格松手会清选区,而双击必然同格松手。
+        if kind == SelectionKind::Semantic {
+            if let Some(((sr, sc), (er, ec))) =
+                path_span(&self.viewport_chars(), row as usize, col as usize)
+            {
+                let mut sel = Selection::new(
+                    SelectionType::Simple,
+                    self.point_at(sc as u16, sr as u16),
+                    Side::Left,
+                );
+                sel.update(self.point_at(ec as u16, er as u16), Side::Right);
+                self.term.selection = Some(sel);
+                self.kept = None;
+                return;
+            }
+        }
         let ty = match kind {
             SelectionKind::Simple => SelectionType::Simple,
             SelectionKind::Semantic => SelectionType::Semantic,
@@ -1381,6 +1428,43 @@ mod tests {
         emu.feed(b"hello world");
         emu.selection_start(8, 0, SelectionKind::Semantic, CellSide::Left);
         assert_eq!(emu.selection_text().as_deref(), Some("world"));
+    }
+
+    /// F371:中文冒号后紧贴的路径,双击路径里任意一格只选路径本身(宽字两格:
+    /// `设计文档：` 占 0..10 列)。回溯过的视口里同样成立(`point_at` 减
+    /// `display_offset` 的那条腿)。
+    #[test]
+    fn double_clicking_a_path_selects_just_the_path() {
+        let mut emu = Emulator::new(40, 3);
+        emu.feed("设计文档：docs/a/b-design.md 看看".as_bytes());
+        for col in [10, 15, 26] {
+            emu.selection_start(col, 0, SelectionKind::Semantic, CellSide::Left);
+            assert_eq!(
+                emu.selection_text().as_deref(),
+                Some("docs/a/b-design.md"),
+                "点在第 {col} 列"
+            );
+        }
+        emu.feed(
+            b"
+1
+2
+3
+4",
+        );
+        emu.scroll(Scroll::Top);
+        emu.selection_start(12, 0, SelectionKind::Semantic, CellSide::Left);
+        assert_eq!(emu.selection_text().as_deref(), Some("docs/a/b-design.md"));
+    }
+
+    /// F371:不是路径时退回语义选择,而全角标点算词边界(alacritty 默认表里
+    /// 一个全角标点都没有,原先会把 `说明：hello` 整段连中文一起选)。
+    #[test]
+    fn full_width_punctuation_bounds_a_double_clicked_word() {
+        let mut emu = Emulator::new(40, 2);
+        emu.feed("说明：hello，世界".as_bytes());
+        emu.selection_start(7, 0, SelectionKind::Semantic, CellSide::Left);
+        assert_eq!(emu.selection_text().as_deref(), Some("hello"));
     }
 
     #[test]
