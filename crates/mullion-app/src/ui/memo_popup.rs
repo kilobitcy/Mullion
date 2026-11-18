@@ -1,7 +1,7 @@
 //! F367:pane 里的项目备忘浮层(Ctrl+Shift+M)。
 //!
 //! 原先改备忘要走「会话 → 项目 → 选项目 → 备忘分节」,而备忘恰恰是边干活边
-//! 随手记的东西。浮层**锚定焦点 pane**(同 `project_pick` 的定位):上半部
+//! 随手记的东西。浮层**锚定焦点 pane**、在 pane 内居中(F373):上半部
 //! 「新增备忘」输入框打开即聚焦、回车即加一条并立即落盘,下面倒序列出已有
 //! 备忘、每条可删;下半部长期备注(`note`)默认折叠,点开可编辑、点「保存」落盘。
 //!
@@ -137,7 +137,10 @@ pub fn show(
     let list_h = (avail.height() - CHROME_H).max(48.0);
     egui::Area::new(area_id(d.pane))
         .order(egui::Order::Foreground)
-        .fixed_pos(avail.min)
+        // F373:pane 中心对齐,内容变高向上下两头长。`pivot` 用上一帧的尺寸,
+        // 首帧没有尺寸时 egui 自己走一遍不可见的 sizing pass,不会先在左上闪一下。
+        .pivot(egui::Align2::CENTER_CENTER)
+        .fixed_pos(host.center())
         .constrain_to(host)
         .show(ctx, |ui| {
             ui.set_max_width(field_w + 2.0 * crate::ui::metrics::SP_M);
@@ -292,6 +295,39 @@ mod tests {
             out = show(ctx, &t, d, None);
         });
         out
+    }
+
+    /// F373:浮层在 pane 内水平垂直居中(pane 不在屏幕中央,两种中心才分得开)。
+    ///
+    /// 自证会变红:把 `.pivot(..).fixed_pos(host.center())` 换回 `fixed_pos(avail.min)`。
+    #[test]
+    fn the_popup_is_centered_in_its_pane() {
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let pane = egui::Rect::from_min_size(egui::pos2(600.0, 300.0), egui::vec2(600.0, 500.0));
+        let mut d = Some(MemoDraft::new(PaneId(1), &project()));
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                show(ctx, &t, &mut d, Some(pane));
+            });
+        }
+        let r = ctx
+            .memory(|m| m.area_rect(area_id(PaneId(1))))
+            .expect("浮层没画出来");
+        let c = pane.center();
+        assert!(
+            (r.center().x - c.x).abs() <= 1.0 && (r.center().y - c.y).abs() <= 1.0,
+            "浮层中心 {:?} 不在 pane 中心 {c:?}(浮层 {r:?})",
+            r.center()
+        );
+        assert!(pane.contains_rect(r), "浮层出了 pane:{r:?}");
     }
 
     /// F367:打开即聚焦输入框;打字 + 回车 = 加一条,输入框清空、浮层不关。
