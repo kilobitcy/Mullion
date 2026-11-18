@@ -406,6 +406,34 @@ fn tmux_forwards_a_background_window_bell_to_the_client() {
     assert!(emu.take_bell(), "tmux 客户端流里的 BEL 没被认出来");
 }
 
+/// F375 的 fixture:40 列 tmux 客户端流,`发布：` 后跟一条写满右缘、折到下一行
+/// 的长 URL,句末全角句号。
+const WRAPPED_URL: &str = "tmux-client-wrapped-url";
+
+/// F375:**双击折开的 URL 任一半(含协议头那格),选出整条 `https://…`,不带
+/// 前面的中文与句末句号。** 用户实报原先得 `//github.com/…`。
+///
+/// 自证会变红:`Emulator::selection_start` 里去掉 `url_span(..).or_else(..)`
+/// 只留 `path_span`(丢 `https:`)。
+#[test]
+fn double_clicking_either_half_of_a_wrapped_url_selects_the_whole_url() {
+    let mut emu = Emulator::new(40, 10);
+    emu.feed(&fixture_bytes(WRAPPED_URL));
+    let first = (0..10u16)
+        .find(|&r| row_text(&emu, r).contains("https://"))
+        .expect("fixture 里应当有那条 URL");
+    let want = "https://github.com/kilobitcy/Mullion/releases/tag/v0.1.146";
+    for (col, row) in [(7, first), (20, first), (5, first + 1)] {
+        emu.selection_start(col, row, SelectionKind::Semantic, CellSide::Left);
+        let got = emu.selection_text().expect("应当选中了文本");
+        assert_eq!(
+            got.replace('\n', ""),
+            want,
+            "双击第 {row} 行第 {col} 列选出的是 {got:?}"
+        );
+    }
+}
+
 /// F371 的 fixture:40 列 tmux 客户端流,`设计文档：` 后跟一条写满右缘、折到
 /// 下一行的长路径。
 const WRAPPED_PATH: &str = "tmux-client-wrapped-path";

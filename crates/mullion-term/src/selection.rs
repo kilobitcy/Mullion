@@ -95,17 +95,101 @@ pub fn path_span(
     row: usize,
     col: usize,
 ) -> Option<((usize, usize), (usize, usize))> {
+    let ((sr, sc), (er, ec)) = run_span(rows, row, col, is_path_char)?;
+    let has_slash = rows[sr..=er].iter().enumerate().any(|(i, line)| {
+        let from = if i == 0 { sc } else { 0 };
+        let to = if sr + i == er { ec } else { line.len() - 1 };
+        line[from..=to].contains(&'/')
+    });
+    has_slash.then_some(((sr, sc), (er, ec)))
+}
+
+/// F375:URL 里除路径字符外还会出现的(端口、查询串、锚点、子分隔符)。
+/// `()[]`、引号不算 —— Markdown 链接 `[t](https://…)` 要切干净。
+fn is_url_char(c: char) -> bool {
+    is_path_char(c) || ":?&#!$*,;".contains(c)
+}
+
+/// URL 尾部要剥的标点:句末/逗号后接 URL 是常态,它们几乎不会是 URL 的最后一个字。
+const URL_TRAILING: &[char] = &['.', ',', ';', ':', '!', '?'];
+
+/// F375:双击落在 `(row, col)` 上,若那里在一条 `scheme://…` URL 里,返回它的
+/// 起止格(含两端,可跨行);否则 `None`,交回 [`path_span`]。
+///
+/// 按 URL 字符扩最大连续段(跨行判据同 [`path_span`]),段里每个 `://` 前紧挨的
+/// scheme(字母开头、字母数字 `+.-`)起一条 URL,止于段尾或下一条 URL 的 scheme
+/// 之前,再剥尾部标点。点击须落在这个范围里 —— `foo,https://…` 点在 `foo` 上
+/// 不算。无 scheme 的 `host:8080/x` 不在这里管。
+pub fn url_span(
+    rows: &[Vec<char>],
+    row: usize,
+    col: usize,
+) -> Option<((usize, usize), (usize, usize))> {
+    let ((sr, sc), (er, ec)) = run_span(rows, row, col, is_url_char)?;
+    // 扁平化成 (行, 列, 字),跨行的段按阅读顺序接起来。
+    let mut cells = Vec::new();
+    for (r, line) in rows.iter().enumerate().take(er + 1).skip(sr) {
+        let from = if r == sr { sc } else { 0 };
+        let to = if r == er { ec } else { line.len() - 1 };
+        for (c, &ch) in line.iter().enumerate().take(to + 1).skip(from) {
+            cells.push((r, c, ch));
+        }
+    }
+    let chars: Vec<char> = cells.iter().map(|&(_, _, ch)| ch).collect();
+    let is_scheme_char = |c: char| c.is_ascii_alphanumeric() || "+.-".contains(c);
+    // 每条 URL 的 scheme 起点(`://` 前往回走,再前移到第一个字母)。
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= chars.len() {
+        if chars[i..i + 3] == [':', '/', '/'] {
+            let mut s = i;
+            while s > 0 && is_scheme_char(chars[s - 1]) {
+                s -= 1;
+            }
+            while s < i && !chars[s].is_ascii_alphabetic() {
+                s += 1;
+            }
+            if s < i {
+                starts.push(s);
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let at = cells.iter().position(|&(r, c, _)| (r, c) == (row, col))?;
+    for (k, &s) in starts.iter().enumerate() {
+        let mut e = starts.get(k + 1).map_or(chars.len(), |&next| next) - 1;
+        while e > s && URL_TRAILING.contains(&chars[e]) {
+            e -= 1;
+        }
+        if (s..=e).contains(&at) {
+            let (a, b) = (cells[s], cells[e]);
+            return Some(((a.0, a.1), (b.0, b.1)));
+        }
+    }
+    None
+}
+
+/// 从 `(row, col)` 起按 `pred` 向两侧扩最大连续段,跨行判据见 [`path_span`]。
+/// 起点本身不满足 `pred` → `None`。
+fn run_span(
+    rows: &[Vec<char>],
+    row: usize,
+    col: usize,
+    pred: fn(char) -> bool,
+) -> Option<((usize, usize), (usize, usize))> {
     let at = |r: usize, c: usize| rows.get(r).and_then(|l| l.get(c)).copied();
-    if !at(row, col).is_some_and(is_path_char) {
+    if !at(row, col).is_some_and(pred) {
         return None;
     }
     let last = |r: usize| rows[r].len().saturating_sub(1);
     let (mut sr, mut sc) = (row, col);
     loop {
-        while sc > 0 && at(sr, sc - 1).is_some_and(is_path_char) {
+        while sc > 0 && at(sr, sc - 1).is_some_and(pred) {
             sc -= 1;
         }
-        if sc == 0 && sr > 0 && at(sr - 1, last(sr - 1)).is_some_and(is_path_char) {
+        if sc == 0 && sr > 0 && at(sr - 1, last(sr - 1)).is_some_and(pred) {
             sr -= 1;
             sc = last(sr);
             continue;
@@ -114,22 +198,17 @@ pub fn path_span(
     }
     let (mut er, mut ec) = (row, col);
     loop {
-        while ec < last(er) && at(er, ec + 1).is_some_and(is_path_char) {
+        while ec < last(er) && at(er, ec + 1).is_some_and(pred) {
             ec += 1;
         }
-        if ec == last(er) && at(er + 1, 0).is_some_and(is_path_char) {
+        if ec == last(er) && at(er + 1, 0).is_some_and(pred) {
             er += 1;
             ec = 0;
             continue;
         }
         break;
     }
-    let has_slash = rows[sr..=er].iter().enumerate().any(|(i, line)| {
-        let from = if i == 0 { sc } else { 0 };
-        let to = if sr + i == er { ec } else { line.len() - 1 };
-        line[from..=to].contains(&'/')
-    });
-    has_slash.then_some(((sr, sc), (er, ec)))
+    Some(((sr, sc), (er, ec)))
 }
 
 #[cfg(test)]
@@ -267,5 +346,64 @@ mod tests {
     fn a_full_row_followed_by_an_indented_row_does_not_continue() {
         let g = grid(10, &["see a/bcde", "  fgh"]);
         assert_eq!(path_span(&g, 0, 6), Some(((0, 4), (0, 9))));
+    }
+
+    /// F375:用户实报 —— 双击 `github` 得 `//github.com/…`,丢了 `https:`。
+    /// 点在 scheme、主机、路径、版本号上都给整条。
+    #[test]
+    fn a_double_click_anywhere_in_a_url_takes_the_scheme_too() {
+        let url = "https://github.com/kilobitcy/Mullion/releases/tag/v0.1.146";
+        let g = grid(80, &[url]);
+        let want = Some(((0, 0), (0, url.len() - 1)));
+        for col in [0, 3, 10, 30, url.len() - 1] {
+            assert_eq!(url_span(&g, 0, col), want, "点在第 {col} 列");
+        }
+    }
+
+    /// 端口、查询串、锚点都在 URL 里;中文与句尾全角句号不在。
+    #[test]
+    fn a_url_keeps_port_query_and_fragment_but_not_the_chinese_around_it() {
+        let url = "https://a.com:8080/x?a=1&b=2#f";
+        let g = grid(60, &[&format!("见：{url}。")]);
+        assert_eq!(url_span(&g, 0, 10), Some(((0, 2), (0, 2 + url.len() - 1))));
+    }
+
+    /// Markdown 链接的括号不进 URL;句末的 `.` `,` 剥掉。
+    #[test]
+    fn brackets_and_trailing_punctuation_stay_out_of_the_url() {
+        let g = grid(40, &["[t](https://a.com/x) see https://b.io/y."]);
+        assert_eq!(url_span(&g, 0, 8), Some(((0, 4), (0, 18))));
+        assert_eq!(url_span(&g, 0, 30), Some(((0, 25), (0, 38))));
+        let g = grid(40, &["https://a.com/x, then"]);
+        assert_eq!(url_span(&g, 0, 2), Some(((0, 0), (0, 14))));
+    }
+
+    /// 点在 scheme 前面粘着的前缀上(`foo,https://…` 的 `foo`)不是 URL;
+    /// 没有 `://` 的也不是。两者都交回路径判据。
+    #[test]
+    fn a_click_outside_the_url_or_without_a_scheme_is_not_a_url() {
+        let g = grid(40, &["foo,https://a.com/x"]);
+        assert_eq!(url_span(&g, 0, 1), None);
+        assert_eq!(url_span(&g, 0, 6), Some(((0, 4), (0, 18))));
+        let g = grid(40, &["host:8080/x a/b"]);
+        assert_eq!(url_span(&g, 0, 2), None);
+        assert_eq!(url_span(&g, 0, 12), None);
+    }
+
+    /// 同一段里挨着两条 URL:各选各的。
+    #[test]
+    fn two_urls_glued_together_are_taken_one_at_a_time() {
+        let g = grid(40, &["https://a.io/x,https://b.io/y"]);
+        assert_eq!(url_span(&g, 0, 9), Some(((0, 0), (0, 13))));
+        assert_eq!(url_span(&g, 0, 20), Some(((0, 15), (0, 28))));
+    }
+
+    /// 写满右缘被硬切的 URL 跨行续上,两半都点一次。
+    #[test]
+    fn a_url_cut_at_the_right_edge_continues_on_the_next_row() {
+        let g = grid(12, &["go https://a", ".com/x?q=1 z"]);
+        let want = Some(((0, 3), (1, 9)));
+        assert_eq!(url_span(&g, 0, 5), want);
+        assert_eq!(url_span(&g, 1, 7), want);
     }
 }

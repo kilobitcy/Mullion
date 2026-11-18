@@ -52,6 +52,7 @@
 | `claude-code-timer-tick-repaint` | **tmux 客户端流**:`script -q -f -c 'tmux -L snap attach -t p' out.raw`(外层 `TERM=xterm-256color`,snap 服务器登记 `terminal-features[99] xterm-256color:sync`),120×30 里 Claude Code 跑 `sleep` 工具;截计时器 4 跳(4 个同步块),等长脱敏 | tmux 往外层重画 pane 时凡不满宽的行都补 `CSI K`,计时器一跳整屏**原样**重画也会把松手后的选区丢掉 —— 同坐标文字未变就补回,变了不补(F309)。**pipe-pane 录的内层流里没有这批 `CSI K`,复现不出来** |
 | `claude-code-wrapped-command` | `tmux -L snap new-session -x 60 -y 40 claude`(pipe-pane 内层流),让它原样回一条单行长命令;等长脱敏(会话名) | Ink 在词边界插**硬换行**、续行缩进两格,超宽 token 在**网格右缘**硬切(`…/$(hostname)/` 写满第 60 列接 `$(date…`);全程无 `WRAPLINE`。Alt+拖选拼成一行时据「写没写到最后一列」决定补不补空格(F335) |
 | `tmux-client-wrapped-path` | **tmux 客户端流**:`script -q -c 'stty cols 40 rows 10; tmux -L f371 attach -t p'`(外层 `TERM=xterm-256color`),pane 里 `printf` 一行「中文冒号 + 长路径 + 中文」;去掉 `script` 首尾行,等长脱敏(主机名) | 40 列下 `设计文档：` 占 10 列,路径写满第 40 列后折到下一行行首;双击两半中的任一半都选出整条路径、不带中文冒号(F371) |
+| `tmux-client-wrapped-url` | **tmux 客户端流**:同 `tmux-client-wrapped-path` 的录法(`tmux -L f375`,`status off` 前的状态行也在流里),pane 里 `printf` 一行「`发布：` + 长 URL + `。`」;截在 detach 前(否则退出备用屏、内容没了),等长脱敏(主机名) | 40 列下 `发布：` 占 6 列,URL 写满第 40 列后折到下一行行首;双击两半任一半(含 `https` 那格)都选出整条带协议头的 URL,不带中文与句号(F375) |
 | `tmux-client-bell` | **tmux 客户端流**:`-f /dev/null` + `set-titles on`,80×24,两个 window 都跑 `sleep`,往后台 window 的 pane tty 写一个 `\a`;等长脱敏(主机名) | tmux 把后台 window 的 BEL 原样转给客户端(`bell-action any`);流里铃前后各有一条以 `\x07` 结尾的 OSC 0,不能算铃(F337) |
 
 ## 规则

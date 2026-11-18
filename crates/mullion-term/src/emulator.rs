@@ -19,7 +19,7 @@ use vte::ansi::Processor;
 
 use crate::palette;
 use crate::remote_state::{parse_title, Osc7Sniffer, RemoteState};
-use crate::selection::{join_as_one_line, path_span, CellSide, SelRow, SelectionKind};
+use crate::selection::{join_as_one_line, path_span, url_span, CellSide, SelRow, SelectionKind};
 use crate::snapshot::{Cursor, CursorShape, GridSnapshot, Rgb, SnapCell};
 
 /// 收集 `Term` 发出的事件。共享缓冲,`Term` 持一份克隆。
@@ -659,9 +659,12 @@ impl Emulator {
         // 的行)。落成 `Simple` 是因为 alacritty 的 `Semantic` 只认分隔符表,
         // 表达不了「路径字符的最大连续段」。app 侧仍记 `Semantic`:它对
         // `Simple` 的同格松手会清选区,而双击必然同格松手。
+        // F375:URL 先于路径 —— 路径字符集不含 `:`,`https://…` 会被切成 `//…`。
         if kind == SelectionKind::Semantic {
+            let rows = self.viewport_chars();
+            let (r, c) = (row as usize, col as usize);
             if let Some(((sr, sc), (er, ec))) =
-                path_span(&self.viewport_chars(), row as usize, col as usize)
+                url_span(&rows, r, c).or_else(|| path_span(&rows, r, c))
             {
                 let mut sel = Selection::new(
                     SelectionType::Simple,
@@ -1455,6 +1458,22 @@ mod tests {
         emu.scroll(Scroll::Top);
         emu.selection_start(12, 0, SelectionKind::Semantic, CellSide::Left);
         assert_eq!(emu.selection_text().as_deref(), Some("docs/a/b-design.md"));
+    }
+
+    /// F375:双击 URL 选整条含协议头(用户实报:原先得 `//github.com/…`)。
+    /// 自证会变红:去掉 `url_span(..).or_else(..)`,只留 `path_span`。
+    #[test]
+    fn double_clicking_a_url_selects_it_with_its_scheme() {
+        let mut emu = Emulator::new(80, 2);
+        emu.feed("发布：https://github.com/k/M/releases/tag/v0.1.146。".as_bytes());
+        for col in [7, 15, 40] {
+            emu.selection_start(col, 0, SelectionKind::Semantic, CellSide::Left);
+            assert_eq!(
+                emu.selection_text().as_deref(),
+                Some("https://github.com/k/M/releases/tag/v0.1.146"),
+                "点在第 {col} 列"
+            );
+        }
     }
 
     /// F371:不是路径时退回语义选择,而全角标点算词边界(alacritty 默认表里
