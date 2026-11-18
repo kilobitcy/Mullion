@@ -2554,6 +2554,8 @@ pub struct App {
     /// F374:最近一次终端复制(写剪贴板那两处记)。只在剪贴板里**还是这份**时
     /// 才被 Ctrl+Shift+B 采用(`files::reveal::recall`)。
     last_terminal_copy: Option<TerminalCopy>,
+    /// F372:对账已经尝试过的键(`reconcile_plan_of` 的「尝试过」闸)。
+    sftp_reconcile_tried: Option<ReconcileKey>,
     /// F218:跳转意图的发号器。每按一次 `Ctrl+Shift+B`(且认出了路径)+1,
     /// `stat` 结果回来时对账 —— 用户按得比网络快时会有后发先至。
     ///
@@ -3460,6 +3462,7 @@ impl App {
             files_sidebar_was_open: false,
             files_owner_pane: None,
             last_terminal_copy: None,
+            sftp_reconcile_tried: None,
             reveal_seq: 0,
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
@@ -6606,6 +6609,51 @@ impl App {
                 );
             }
             SyncPlan::Reopen => self.reopen_sftp_on_focused_host(gen),
+        }
+    }
+
+    /// F372:侧栏 SFTP 跟栏头对账 —— 判定见 [`reconcile_plan_of`]。目标是
+    /// **归属 pane** 那台与它报的目录,不是焦点 pane(它们在多分屏时常常不同)。
+    fn reconcile_sidebar_sftp(&mut self) {
+        let owner_generation = self.files_owner_generation();
+        let tab = owner_generation.and_then(|g| self.tabs.by_generation(g));
+        let owner_pane = self.files_owner_pane.and_then(|(_, p)| {
+            tab.and_then(|t| t.content.as_terminal())
+                .and_then(|t| t.ws.pane(p))
+                .filter(|p| !p.host_pending)
+        });
+        let view = ReconcileView {
+            owner: self.files_owner_pane,
+            owner_generation,
+            owner_host_ix: owner_pane.map(|p| p.host_ix),
+            has_client: tab.is_some_and(|t| t.content.sftp_client().is_some()),
+            loading: tab
+                .and_then(|t| t.content.files_panel())
+                .is_some_and(|f| matches!(f.remote.load, crate::files::state::Load::Loading)),
+            sftp_host_ix: tab.and_then(|t| t.content.sftp_host_ix()),
+        };
+        let cwd = owner_pane.and_then(|p| p.cwd.clone());
+        match reconcile_plan_of(&view, self.sftp_reconcile_tried) {
+            Reconcile::Idle => {}
+            Reconcile::Settled => self.sftp_reconcile_tried = None,
+            Reconcile::Reopen(key) => {
+                let (gen, pane, host_ix) = key;
+                log::info!(
+                    target: "mullion",
+                    "F372:侧栏 SFTP 在 {:?} 上、归属 pane {} 在 {host_ix} 上,重开",
+                    view.sftp_host_ix,
+                    pane.0
+                );
+                self.sftp_reconcile_tried = Some(key);
+                self.reopen_sftp_on(
+                    gen,
+                    Some(SftpAt {
+                        host_ix: Some(host_ix),
+                        cwd,
+                    }),
+                );
+                self.request_ui_redraw();
+            }
         }
     }
 
@@ -17315,6 +17363,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.tick_tunnel_others();
         // F368:库打开后的隧道自动拉起。
         self.pump_tunnel_autostart();
+        // F372:侧栏 SFTP 与栏头(归属 pane 的节点)对账。两个整数比一比。
+        self.reconcile_sidebar_sftp();
         // F336:窗口标题。**放这里不放 `RedrawRequested`**:最小化态不出帧,
         // 而标题恰在那时最需要更新(复核 R8)。算与 `set_title` 分开、不同才调 ——
         // `set_title` 每调一次都是一次跨线程窗口消息,每次唤醒都调是 T3 那一类白烧。
@@ -17897,6 +17947,67 @@ fn files_start_dir(
         })
     });
     from_pane.or_else(|| default_remote.map(str::to_string))
+}
+
+/// F372:对账要看的那几个量。抽成结构是为了让纯函数的签名不至于七个裸参数。
+#[derive(Debug, Clone)]
+struct ReconcileView {
+    /// 侧栏归属 pane(带世代,见 `files_owner_pane`)。
+    owner: Option<(u64, PaneId)>,
+    /// 侧栏此刻开在哪个标签上(`files_owner_generation()`)。
+    owner_generation: Option<u64>,
+    /// 归属 pane 挂在 `ws.hosts` 的哪一台。pane 不在了 / 还没挂上自己的连接
+    /// (`host_pending`)给 `None`。
+    owner_host_ix: Option<usize>,
+    has_client: bool,
+    /// 远端栏在 `Loading`(channel 开到一半)。
+    loading: bool,
+    sftp_host_ix: Option<usize>,
+}
+
+/// F372 尝试键:(世代, 归属 pane, 目标 host_ix)。
+type ReconcileKey = (u64, PaneId, usize);
+
+/// F372:这一次唤醒对账的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reconcile {
+    /// 门没全开,或这个键已经试过 —— 什么都不做。
+    Idle,
+    /// 一致了 —— 清掉尝试记录。
+    Settled,
+    /// 不一致且没试过 —— 在归属 pane 那台重开。
+    Reopen(ReconcileKey),
+}
+
+/// F372:栏头(按归属 pane 每帧现取)与 SFTP channel 实际所在机器的对账。
+///
+/// 补的是「事件补偿漏掉的路径」:F341 只在换节点成功、归属 pane 恰是焦点、
+/// sftp 已经开好时同步;sftp 开到一半(`has_client=false` → `SyncPlan::Nothing`,
+/// 开完连的还是旧机器)、多 pane 时归属 pane 不是焦点,都不同步。对账不关心
+/// 是哪条路径弄歪的,只看两个整数,零 IO。
+///
+/// 四道门全开才比:侧栏开在归属标签上、归属 pane 在且有自己的连接、sftp
+/// 已开、远端栏不在加载中。「尝试过」闸挡住一切不收敛(重开失败、开回来
+/// 又被别处拽歪)造成的空转;一致时清掉,之后再歪还能再对一次。
+fn reconcile_plan_of(v: &ReconcileView, tried: Option<ReconcileKey>) -> Reconcile {
+    let Some((gen, pane)) = v.owner else {
+        return Reconcile::Idle;
+    };
+    if v.owner_generation != Some(gen) || !v.has_client || v.loading {
+        return Reconcile::Idle;
+    }
+    let Some(host) = v.owner_host_ix else {
+        return Reconcile::Idle;
+    };
+    if v.sftp_host_ix == Some(host) {
+        return Reconcile::Settled;
+    }
+    let key = (gen, pane, host);
+    if tried == Some(key) {
+        Reconcile::Idle
+    } else {
+        Reconcile::Reopen(key)
+    }
 }
 
 /// F132:「文件侧栏关→开」那一帧该做什么。
@@ -19610,15 +19721,16 @@ mod tests {
         ime_goes_to_terminal_of, leaf_identity_of, new_pane_emulator, next_auto_dial,
         next_panel_selection_index, opt_buf_dirty, overwrite_alert_applies, pane_reports_of,
         pane_still_wanted, paste_seq_is_stale, place_dead_pane_of, project_lamps_have_audience,
-        pump_all_tabs, reattach_pane, rehost_pane, rehost_voids_attach_intent,
+        pump_all_tabs, reattach_pane, reconcile_plan_of, rehost_pane, rehost_voids_attach_intent,
         remote_bookmark_owner, resolved_scrollback, session_manager_dirty, settle_attention_of,
         should_check_attach, should_flash, should_pop_cloud_error, should_pop_transfer_error,
         snapshot_tabs_of, sync_plan_of, sync_remote_bookmarks_of, sync_timeout_wake_at,
         sync_timeout_wake_of, tab_has_attention, tab_keeps_template, tab_title,
         take_next_restore_dial, tmux_attach_for_connect, upload_job, user_event_marks_dirty,
         wind_down, window_title_of, AttachCheck, AttachVerdict, DialTicket, HistorySync, Modal,
-        OpFollow, PasteDecision, RehostKind, RestoredTab, SshConfig, SyncPlan, Tab, TabContent,
-        TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS, DISMISS_EXEMPT, DISMISS_ORDER,
+        OpFollow, PasteDecision, Reconcile, ReconcileView, RehostKind, RestoredTab, SshConfig,
+        SyncPlan, Tab, TabContent, TerminalTab, TmuxAttach, UserEvent, CLOUD_POLL_MS,
+        DISMISS_EXEMPT, DISMISS_ORDER,
     };
     use crate::frame::FrameLimiter;
     use crate::reflow::{reflow, ResizeSink};
@@ -34308,6 +34420,117 @@ mod tests {
             body[..end].contains("sftp_host_ix = host_ix"),
             "accept_sftp_opened 里没记 sftp_host_ix —— 换节点后的比对会永远错位"
         );
+    }
+
+    /// F372:对账的四道门 + 「尝试过」闸。
+    ///
+    /// 自证会变红:删掉任一道门(对应那条断言从 `Idle` 变 `Reopen`);删掉
+    /// `tried` 比对(最后一组变成反复 `Reopen`,失败时每次唤醒都重开)。
+    #[test]
+    fn the_sidebar_reconciles_to_the_owner_pane_host_behind_four_gates() {
+        let p = PaneId(2);
+        let owner = Some((7, p));
+        let ok = ReconcileView {
+            owner,
+            owner_generation: Some(7),
+            owner_host_ix: Some(1),
+            has_client: true,
+            loading: false,
+            sftp_host_ix: Some(0),
+        };
+        assert_eq!(reconcile_plan_of(&ok, None), Reconcile::Reopen((7, p, 1)));
+        // 门 1:侧栏没开在归属标签上(关着 / 切走 / `Files` 标签)。
+        for g in [None, Some(8)] {
+            let v = ReconcileView {
+                owner_generation: g,
+                ..ok.clone()
+            };
+            assert_eq!(
+                reconcile_plan_of(&v, None),
+                Reconcile::Idle,
+                "侧栏世代 {g:?}"
+            );
+        }
+        assert_eq!(
+            reconcile_plan_of(
+                &ReconcileView {
+                    owner: None,
+                    ..ok.clone()
+                },
+                None
+            ),
+            Reconcile::Idle,
+            "没记归属"
+        );
+        // 门 2:归属 pane 不在了(或还没挂上自己的连接)。
+        let gone = ReconcileView {
+            owner_host_ix: None,
+            ..ok.clone()
+        };
+        assert_eq!(reconcile_plan_of(&gone, None), Reconcile::Idle);
+        // 门 3:sftp 还没开 / 开失败 —— 起步是 `trigger_sftp_open` 的事。
+        let none = ReconcileView {
+            has_client: false,
+            ..ok.clone()
+        };
+        assert_eq!(reconcile_plan_of(&none, None), Reconcile::Idle);
+        // 门 4:远端栏在加载 —— 开到一半,等它落定再比。
+        let busy = ReconcileView {
+            loading: true,
+            ..ok.clone()
+        };
+        assert_eq!(reconcile_plan_of(&busy, None), Reconcile::Idle);
+        // 一致:清掉尝试记录(之后别的路径把它拽歪时还能再对一次)。
+        let same = ReconcileView {
+            sftp_host_ix: Some(1),
+            ..ok.clone()
+        };
+        assert_eq!(
+            reconcile_plan_of(&same, Some((7, p, 1))),
+            Reconcile::Settled
+        );
+        // 同一个键尝试过就不再自动重开;归属 pane 换到别的节点 = 新键。
+        assert_eq!(reconcile_plan_of(&ok, Some((7, p, 1))), Reconcile::Idle);
+        let moved = ReconcileView {
+            owner_host_ix: Some(2),
+            ..ok.clone()
+        };
+        assert_eq!(
+            reconcile_plan_of(&moved, Some((7, p, 1))),
+            Reconcile::Reopen((7, p, 2))
+        );
+    }
+
+    /// F372 **接线守护**:`about_to_wait` 每次唤醒都对账,对账走纯函数、
+    /// 记尝试键、开到归属 pane 那台。
+    ///
+    /// 自证会变红:删掉 `about_to_wait` 里的 `self.reconcile_sidebar_sftp();`;
+    /// 或把对账里的 `reopen_sftp_on(gen, Some(..))` 换成 `reopen_sftp_on_focused_host`;
+    /// 或删掉记 `sftp_reconcile_tried` 那句(失败时每次唤醒都重开)。
+    #[test]
+    fn about_to_wait_reconciles_the_sidebar_sftp_with_its_owner_pane() {
+        assert!(
+            body_of(prod_src(), "fn about_to_wait(").contains("self.reconcile_sidebar_sftp();"),
+            "about_to_wait 没对账 —— 栏头与 SFTP 不一致没人收敛(F372)"
+        );
+        let body = body_of(prod_src(), "fn reconcile_sidebar_sftp(&mut self) {");
+        assert!(
+            body.contains("reconcile_plan_of("),
+            "对账没走判定函数:{body}"
+        );
+        let tried = body
+            .find("self.sftp_reconcile_tried = Some(key);")
+            .unwrap_or_else(|| panic!("对账没记尝试键:{body}"));
+        let reopen = body
+            .find("self.reopen_sftp_on(")
+            .unwrap_or_else(|| panic!("对账没重开:{body}"));
+        let call: String = body[reopen..].split_whitespace().collect();
+        assert!(
+            call.starts_with("self.reopen_sftp_on(gen,Some(SftpAt{host_ix:Some(host_ix),"),
+            "对账没开到归属 pane 那台:{body}"
+        );
+        assert!(tried < reopen, "先重开后记键:{body}");
+        assert!(!body.contains("focused"), "对账不能看焦点 pane:{body}");
     }
 
     /// F132:「侧栏关→开」那一帧该做什么,三选一。这是这条改动里唯一测得动
