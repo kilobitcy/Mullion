@@ -70,14 +70,15 @@ const MAX_LINE_SUFFIXES: usize = 2;
 /// 判据全是**语法**的,不发任何请求 —— 按下去要立刻有反应,而这个键在
 /// 高延迟代理链路上(本项目主场景)最忌讳「按了半秒才知道白按」。
 ///
-/// 四道门,顺序不能换:
+/// 五道门,顺序不能换:
 /// 1. **多行直接拒**。多行选区是 `ls`/`git status` 的一片输出,里面有 N 条
 ///    路径,挑哪条都是猜。
 /// 2. trim 之后**整体**必须是一条路径 —— 不从句子里挖。挖的话
 ///    `error: xx in a/b.rs` 这种要靠启发式切词,切错就是跳到你没想去的地方,
 ///    而且静默。
 /// 3. 剥壳:引号 →(标点 / 行列号)反复剥。
-/// 4. **必须带路径分隔符或以 `~` 开头**。少了这道,划一个普通单词
+/// 4. **不是 URL**(F376):`scheme://…` 含 `/`,会被下一道门当成相对路径。
+/// 5. **必须带路径分隔符或以 `~` 开头**。少了这道,划一个普通单词
 ///    (`cargo`、`error`)按下去就会解析成 `<cwd>/cargo` 然后弹一条「不存在」
 ///    —— 用户想要的只是开关侧栏。
 pub fn parse(sel: &str) -> Option<Target> {
@@ -106,7 +107,7 @@ pub fn parse(sel: &str) -> Option<Target> {
     if s.is_empty() {
         return None;
     }
-    if !looks_like_path(s) {
+    if has_scheme(s) || !looks_like_path(s) {
         return None;
     }
     Some(Target {
@@ -145,6 +146,18 @@ fn strip_line_suffix(s: &str) -> Option<&str> {
 /// 像不像一条路径:带分隔符,或以 `~` 开头(`~`、`~/x`)。
 ///
 /// 光秃秃一个文件名(`app.rs`)**不算** —— 见 [`parse`] 第 4 道门。
+/// F376:以 `scheme://` 开头(scheme 字母开头、字母数字 `+.-`,至少两个字 ——
+/// 一个字的是盘符)。
+fn has_scheme(s: &str) -> bool {
+    s.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.len() >= 2
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    })
+}
+
 fn looks_like_path(s: &str) -> bool {
     s.contains('/') || s.contains('\\') || s == "~" || s.starts_with("~/") || s.starts_with("~\\")
 }
@@ -483,6 +496,20 @@ mod tests {
         assert!(parse("app.rs").is_none());
         assert!(parse("~").is_some());
         assert!(parse("~/Mullion").is_some());
+    }
+
+    /// F376:URL 不是路径 —— 原先 `https://…` 过了「含 `/`」那道门,被当成
+    /// `<cwd>/https:/…` 去跳,弹「不存在」。盘符路径不能被误判成 scheme。
+    ///
+    /// 自证会变红:删掉 `parse` 里的 `has_scheme` 那道门。
+    #[test]
+    fn a_url_is_not_a_path() {
+        assert!(parse("https://github.com/k/M/releases").is_none());
+        assert!(parse("file:///etc/hosts").is_none());
+        assert!(parse("`ssh://git@host/x.git`").is_none());
+        assert!(parse("(https://a.io/x).").is_none());
+        assert!(parse("C:/Users/x").is_some());
+        assert!(parse("src/app.rs:12").is_some());
     }
 
     /// 盘符与 UNC → 本地栏;其余(含一切相对路径)→ 远端栏。
