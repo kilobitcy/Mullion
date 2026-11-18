@@ -117,9 +117,10 @@ const URL_TRAILING: &[char] = &['.', ',', ';', ':', '!', '?'];
 /// 起止格(含两端,可跨行);否则 `None`,交回 [`path_span`]。
 ///
 /// 按 URL 字符扩最大连续段(跨行判据同 [`path_span`]),段里每个 `://` 前紧挨的
-/// scheme(字母开头、字母数字 `+.-`)起一条 URL,止于段尾或下一条 URL 的 scheme
-/// 之前,再剥尾部标点。点击须落在这个范围里 —— `foo,https://…` 点在 `foo` 上
-/// 不算。无 scheme 的 `host:8080/x` 不在这里管。
+/// scheme(字母开头、字母数字 `+.-`)起一条 URL —— 仅当它在段首或紧跟 `,` `;`、
+/// 且 `://` 后还有字;嵌在别的 URL 里的不另起。止于段尾或下一条 URL 的 scheme
+/// 之前,再剥尾部标点。点击须落在这个范围里(含剥掉的标点)—— `foo,https://…`
+/// 点在 `foo` 上不算。无 scheme 的 `host:8080/x` 不在这里管。
 pub fn url_span(
     rows: &[Vec<char>],
     row: usize,
@@ -149,7 +150,11 @@ pub fn url_span(
             while s < i && !chars[s].is_ascii_alphabetic() {
                 s += 1;
             }
-            if s < i {
+            // 另起一条 URL:scheme 在段首或紧跟 `,` `;`(并列的两条),且 `://`
+            // 后还有字。嵌在路径/查询串里的(`/web/2020/https://…`、
+            // `?u=https://…`)是外层 URL 的一部分(复核)。
+            let fresh = s == 0 || matches!(chars[s - 1], ',' | ';');
+            if s < i && fresh && i + 3 < chars.len() {
                 starts.push(s);
             }
             i += 3;
@@ -159,11 +164,13 @@ pub fn url_span(
     }
     let at = cells.iter().position(|&(r, c, _)| (r, c) == (row, col))?;
     for (k, &s) in starts.iter().enumerate() {
-        let mut e = starts.get(k + 1).map_or(chars.len(), |&next| next) - 1;
+        let raw_end = starts.get(k + 1).map_or(chars.len(), |&next| next) - 1;
+        let mut e = raw_end;
         while e > s && URL_TRAILING.contains(&chars[e]) {
             e -= 1;
         }
-        if (s..=e).contains(&at) {
+        // 点在剥掉的尾部标点上也算这条 URL —— 交回路径判据会得到 `//…`(复核)。
+        if (s..=raw_end).contains(&at) {
             let (a, b) = (cells[s], cells[e]);
             return Some(((a.0, a.1), (b.0, b.1)));
         }
@@ -396,6 +403,31 @@ mod tests {
         let g = grid(40, &["https://a.io/x,https://b.io/y"]);
         assert_eq!(url_span(&g, 0, 9), Some(((0, 0), (0, 13))));
         assert_eq!(url_span(&g, 0, 20), Some(((0, 15), (0, 28))));
+    }
+
+    /// 复核:嵌在路径/查询串里的 URL 是外层 URL 的一部分(archive 链接、重定向
+    /// 参数),不另起一条。只有段首或 `,` `;` 之后的 `scheme://` 才另起。
+    ///
+    /// 自证会变红:把「另起」判据放宽成每个 `://` 都另起。
+    #[test]
+    fn a_url_nested_in_another_url_belongs_to_the_outer_one() {
+        let a = "https://web.archive.org/web/2020/https://example.com/a";
+        let g = grid(80, &[a]);
+        assert_eq!(url_span(&g, 0, 10), Some(((0, 0), (0, a.len() - 1))));
+        assert_eq!(url_span(&g, 0, 40), Some(((0, 0), (0, a.len() - 1))));
+        let q = "https://a.com/?u=https://b.com/x";
+        let g = grid(80, &[q]);
+        assert_eq!(url_span(&g, 0, 3), Some(((0, 0), (0, q.len() - 1))));
+    }
+
+    /// 复核:点在被剥掉的句末标点上也给 URL(不剥的话退回路径判据,得到的正是
+    /// `//a.com/x.` 这个原症状);只有 `https://` 没有下文的不算 URL。
+    #[test]
+    fn a_click_on_stripped_punctuation_still_takes_the_url_but_a_bare_scheme_is_not_one() {
+        let g = grid(40, &["see https://a.com/x."]);
+        assert_eq!(url_span(&g, 0, 19), Some(((0, 4), (0, 18))));
+        let g = grid(40, &["https:// x"]);
+        assert_eq!(url_span(&g, 0, 2), None);
     }
 
     /// 写满右缘被硬切的 URL 跨行续上,两半都点一次。
