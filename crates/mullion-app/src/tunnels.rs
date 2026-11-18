@@ -163,7 +163,8 @@ pub struct Indicator {
 /// `elsewhere` 是别的窗口里在跑、本窗口没有的条数(`elsewhere_running`),
 /// `auto_failed` 是自动拉起后被静默停掉的条数(F368)。
 ///
-/// F369:配了就常驻(它是启停浮层的入口),一条都没配才 `None`。
+/// F369:配了就常驻(它是启停浮层的入口)。F378:一条没配也常驻成灰色
+/// 「隧道 0」—— 浮层里能新建,它是隧道最浅的入口。返回 `Option` 留给调用方。
 /// (推翻 F115「没有在跑的就不占格」—— 那时这一格只是个读数。)
 pub fn indicator(
     states: &[TunnelState],
@@ -172,7 +173,10 @@ pub fn indicator(
     auto_failed: usize,
 ) -> Option<Indicator> {
     if configured == 0 {
-        return None;
+        return Some(Indicator {
+            text: "隧道 0".to_string(),
+            severity: Severity::Calm,
+        });
     }
     let running = states
         .iter()
@@ -729,10 +733,15 @@ mod tests {
     }
 
     /// F369 推翻 F115「没有在跑的就不占格」:配了就常驻(它现在是浮层的入口),
-    /// 一条都没跑是安静的灰色 `0/N`;一条都没配才不占格。
+    /// 一条都没跑是安静的灰色 `0/N`。F378 再推翻「一条都没配才不占格」:没配
+    /// 也常驻成灰色「隧道 0」—— 浮层里能新建,这一格是最浅的入口。
+    ///
+    /// 自证会变红:恢复 `configured == 0` 时返回 `None`。
     #[test]
     fn indicator_is_always_shown_once_something_is_configured() {
-        assert!(indicator(&[], 0, 0, 0).is_none(), "一条都没配,不占格");
+        let none = indicator(&[], 0, 0, 0).expect("F378:一条都没配也常驻");
+        assert_eq!(none.text, "隧道 0");
+        assert_eq!(none.severity, Severity::Calm);
         let i = indicator(&[], 3, 0, 0).expect("配了就该常驻");
         assert_eq!(i.text, "隧道 0/3");
         assert_eq!(i.severity, Severity::Calm, "没跑不是出事,不该上色");

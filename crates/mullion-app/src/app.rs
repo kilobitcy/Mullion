@@ -13783,17 +13783,7 @@ impl App {
                 if self.ui.tunnel_editor_id == Some(id) {
                     return;
                 }
-                // 右栏隧道表单有没存的改动就不换缓冲 —— 静默丢草稿比多点一下贵。
-                let unsaved = opt_buf_dirty(
-                    self.ui.tunnel_editor.as_ref(),
-                    self.ui.tunnel_editor_baseline.as_ref(),
-                    crate::ui::session_manager::tunnel_editor::is_dirty,
-                );
-                if unsaved {
-                    self.ui.set_toast(
-                        crate::ui::toast::Kind::Warn,
-                        "右栏隧道有未保存的改动,先保存或放弃再切换",
-                    );
+                if self.tunnel_draft_blocks_switch() {
                     return;
                 }
                 let rec = self
@@ -13812,8 +13802,39 @@ impl App {
                 self.ui.session_manager_open = true;
                 self.ui.manager_mode = ManagerMode::Tunnels;
             }
+            // F378:同列表「+ 新建隧道」—— 清 id、给空缓冲,基线同步设(否则新
+            // 表单一打开就判脏)。草稿守卫同「编辑」。
+            TunnelOut::New => {
+                self.ui.tunnel_popup = None;
+                self.ui.session_manager_open = true;
+                self.ui.manager_mode = ManagerMode::Tunnels;
+                if self.tunnel_draft_blocks_switch() {
+                    return;
+                }
+                let fresh = crate::ui::session_manager::TunnelEditorBuffer::default();
+                self.ui.tunnel_editor_id = None;
+                self.ui.tunnel_editor_baseline = Some(fresh.clone());
+                self.ui.tunnel_editor = Some(fresh);
+            }
             TunnelOut::Close => self.ui.tunnel_popup = None,
         }
+    }
+
+    /// 右栏隧道表单有没存的改动就不换缓冲 —— 静默丢草稿比多点一下贵。
+    /// 拦下时飘 toast 并返回 `true`。
+    fn tunnel_draft_blocks_switch(&mut self) -> bool {
+        let unsaved = opt_buf_dirty(
+            self.ui.tunnel_editor.as_ref(),
+            self.ui.tunnel_editor_baseline.as_ref(),
+            crate::ui::session_manager::tunnel_editor::is_dirty,
+        );
+        if unsaved {
+            self.ui.set_toast(
+                crate::ui::toast::Kind::Warn,
+                "右栏隧道有未保存的改动,先保存或放弃再切换",
+            );
+        }
+        unsaved
     }
 
     /// F114/F115:收下一次隧道状态上报。
@@ -20062,9 +20083,16 @@ mod tests {
         assert!(ap.contains("self.tunnels.stop(id)"));
         assert!(ap.contains("self.publish_tunnel_state(false)"));
         assert!(ap.contains("ManagerMode::Tunnels"));
+        // F378:「编辑」「+ 新建隧道」两条跳转都要过草稿守卫。
         assert!(
-            ap.contains("tunnel_editor::is_dirty"),
-            "编辑跳转会静默覆盖右栏没存的隧道草稿"
+            ap.matches("if self.tunnel_draft_blocks_switch() {").count() == 2
+                && body_of(&src, "fn tunnel_draft_blocks_switch(")
+                    .contains("tunnel_editor::is_dirty"),
+            "编辑/新建跳转会静默覆盖右栏没存的隧道草稿"
+        );
+        assert!(
+            ap.contains("TunnelOut::New =>") && ap.contains("TunnelEditorBuffer::default()"),
+            "浮层「+ 新建隧道」没给空表单"
         );
         assert!(
             body_of(&src, "fn tunnel_page_visible(").contains("self.ui.tunnel_popup.is_some()"),

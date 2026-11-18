@@ -2,7 +2,7 @@
 //!
 //! 原先启停隧道要走 菜单「会话」→ 会话管理器 → 隧道页 → 选一条 → 启动/停止,
 //! 而这是天天要做的事。浮层每条一行:名字 · 转发串 · 状态 · [启动/停止] [编辑];
-//! 底部「管理隧道…」。按钮判据与会话管理器列表行**同源**(`tunnel_list::row_spec`)。
+//! 底部「+ 新建隧道」「管理隧道…」(F378)。按钮判据与会话管理器列表行**同源**(`tunnel_list::row_spec`)。
 //!
 //! 「启动」走手动路径(人在屏幕前,首连可弹 TOFU)。浮层开着时顶栏红字容易被
 //! 忽略,所以启动当场失败的原因**行内**再写一遍(`errors`)。
@@ -43,6 +43,8 @@ pub enum TunnelOut {
     Edit(TunnelId),
     /// 跳会话管理器隧道页。
     Manage,
+    /// F378:跳会话管理器隧道页,右栏开一份空的新建表单。
+    New,
     Close,
 }
 
@@ -115,12 +117,21 @@ pub fn show(
                             out = Some(o);
                         }
                     }
+                    if v.tunnels.is_empty() {
+                        ui.colored_label(theme::c32(t.fg_dimmer), "还没有隧道");
+                    }
                     // 不用 `separator`:它在自适应宽度的 Area 里按可用宽度铺,
                     // 第二帧把浮层撑到无穷宽(左上角算成 -inf → NaN 断言)。
                     ui.add_space(crate::ui::metrics::SP_S);
-                    if ui.button("管理隧道…").clicked() {
-                        out = Some(TunnelOut::Manage);
-                    }
+                    ui.horizontal(|ui| {
+                        // F378:新建也从这里走,不必再钻 会话 → 会话管理器 → 隧道。
+                        if ui.button("+ 新建隧道").clicked() {
+                            out = Some(TunnelOut::New);
+                        }
+                        if ui.button("管理隧道…").clicked() {
+                            out = Some(TunnelOut::Manage);
+                        }
+                    });
                 });
         });
     out
@@ -343,6 +354,22 @@ mod tests {
         let (drawn, out) = run(&f, &popup(), Some("停止"), vec![]);
         assert_eq!(out, Some(TunnelOut::Stop(TunnelId(1))));
         assert!(drawn.iter().any(|s| s == "运行中"), "{drawn:?}");
+    }
+
+    /// F378:底部「+ 新建隧道」带出 `New`;一条隧道都没有时浮层照样能开、能新建。
+    ///
+    /// 自证会变红:删掉「+ 新建隧道」按钮。
+    #[test]
+    fn the_popup_can_create_a_tunnel_even_when_there_is_none() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            run(&f, &popup(), Some("+ 新建隧道"), vec![]).1,
+            Some(TunnelOut::New)
+        );
+        f.tunnels.clear();
+        let (drawn, out) = run(&f, &popup(), Some("+ 新建隧道"), vec![]);
+        assert_eq!(out, Some(TunnelOut::New));
+        assert!(drawn.iter().any(|s| s == "还没有隧道"), "{drawn:?}");
     }
 
     /// 别的窗口在跑的那条:写明在别处,「启动」真禁用(点了没有出口)。

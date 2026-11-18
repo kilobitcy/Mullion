@@ -1,5 +1,6 @@
 //! 菜单栏(含居中的布局预设按钮组)+ 标签栏(F36)+ 状态栏。
 use super::annotate;
+use super::session_manager::ManagerMode;
 use super::toolbar;
 use super::UiState;
 use crate::shell::workspace::Preset;
@@ -66,6 +67,12 @@ pub fn top_menu(
                     // 的边界糊掉。
                     if ui.button("项目管理器").clicked() {
                         ui_state.project_manager_open = true;
+                        ui.close_menu();
+                    }
+                    // F378:直达隧道页,原先要 会话管理器 → 隧道 再点一层。
+                    if ui.button("隧道管理器…").clicked() {
+                        ui_state.session_manager_open = true;
+                        ui_state.manager_mode = ManagerMode::Tunnels;
                         ui.close_menu();
                     }
                     // F2:导入是一次性动作,不做开机自动发现(设计 D7)。
@@ -678,6 +685,26 @@ mod tests {
         assert!(
             src.contains("\n                    if ui.button(\"恢复上次的现场…\").clicked() {"),
             "「会话」菜单里没有恢复现场的常驻入口 —— 点过一次「不恢复」就再也回不去了"
+        );
+    }
+
+    /// F378:「会话」菜单直达隧道页 —— 原先要 会话 → 会话管理器 → 隧道 三层。
+    /// 扎源码结构(理由同上一条);先切掉测试模块,免得 needle 命中自己。
+    ///
+    /// 自证会变红:删掉「隧道管理器…」菜单项,或漏设 `ManagerMode::Tunnels`。
+    #[test]
+    fn the_session_menu_opens_the_tunnel_page_directly() {
+        let src = include_str!("chrome.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(prod.len() < src.len(), "测试模块分界变了");
+        let at = prod
+            .find("ui.button(\"隧道管理器…\").clicked()")
+            .expect("「会话」菜单里没有隧道管理器入口");
+        let body = &prod[at..at + 400];
+        assert!(
+            body.contains("ui_state.session_manager_open = true;")
+                && body.contains("ui_state.manager_mode = ManagerMode::Tunnels;"),
+            "隧道管理器入口没落到隧道页:{body}"
         );
     }
 
