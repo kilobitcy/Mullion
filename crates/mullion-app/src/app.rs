@@ -1025,6 +1025,10 @@ struct TerminalCopy {
     /// 会认错 pane。
     generation: u64,
     pane: PaneId,
+    /// 上一次按键时剪贴板读不到,已经宽限过一次。`Clipboard::get` 分不清
+    /// 「被占用」与「不是文本/空」,后两种再按多少次都读不到 —— 只宽限一次,
+    /// 第二次按当作没有记忆(关栏),否则侧栏永远关不掉(复核)。
+    clipboard_missed: bool,
 }
 
 /// F372/F374:sftp channel 开到哪台机器、从哪个目录起步。传 `None` 的版本
@@ -5949,7 +5953,16 @@ impl App {
             clipboard.get()
         }) {
             Recall::Forget => Ok(None),
-            Recall::Unknown => Err(()),
+            Recall::Unknown => match self.last_terminal_copy.as_mut() {
+                Some(m) if !m.clipboard_missed => {
+                    m.clipboard_missed = true;
+                    Err(())
+                }
+                _ => {
+                    self.last_terminal_copy = None;
+                    Ok(None)
+                }
+            },
             Recall::Use => Ok(memo.and_then(|m| {
                 // 同 `parse_single_line` 的闸:多行的不认。
                 let parsed = reveal::parse_single_line(!m.text.contains('\n'), || Some(m.text))?;
@@ -6615,7 +6628,12 @@ impl App {
     /// F372:侧栏 SFTP 跟栏头对账 —— 判定见 [`reconcile_plan_of`]。目标是
     /// **归属 pane** 那台与它报的目录,不是焦点 pane(它们在多分屏时常常不同)。
     fn reconcile_sidebar_sftp(&mut self) {
-        let owner_generation = self.files_owner_generation();
+        // 侧栏「关→开」那一帧的重绘才记下新归属(`files_owner_pane` 的写点);
+        // 那之前按的键/点的按钮已经把侧栏置开,这时读到的是上一次开栏的归属
+        // —— 当作侧栏还没开(复核)。
+        let owner_generation = self
+            .files_owner_generation()
+            .filter(|_| self.files_sidebar_was_open);
         let tab = owner_generation.and_then(|g| self.tabs.by_generation(g));
         let owner_pane = self.files_owner_pane.and_then(|(_, p)| {
             tab.and_then(|t| t.content.as_terminal())
@@ -6630,6 +6648,12 @@ impl App {
             loading: tab
                 .and_then(|t| t.content.files_panel())
                 .is_some_and(|f| matches!(f.remote.load, crate::files::state::Load::Loading)),
+            failed: tab.and_then(|t| t.content.files_panel()).is_some_and(|f| {
+                matches!(
+                    f.remote.load,
+                    crate::files::state::Load::Failed(_) | crate::files::state::Load::Disconnected
+                )
+            }),
             sftp_host_ix: tab.and_then(|t| t.content.sftp_host_ix()),
         };
         let cwd = owner_pane.and_then(|p| p.cwd.clone());
@@ -10142,6 +10166,7 @@ impl App {
             text,
             generation: ws.generation(),
             pane: ws.focus(),
+            clipboard_missed: false,
         });
     }
 
@@ -17962,6 +17987,8 @@ struct ReconcileView {
     has_client: bool,
     /// 远端栏在 `Loading`(channel 开到一半)。
     loading: bool,
+    /// 没有 client 且远端栏停在失败/断开 —— 上一次开(含对账那次)没成。
+    failed: bool,
     sftp_host_ix: Option<usize>,
 }
 
@@ -17973,7 +18000,10 @@ type ReconcileKey = (u64, PaneId, usize);
 enum Reconcile {
     /// 门没全开,或这个键已经试过 —— 什么都不做。
     Idle,
-    /// 一致了 —— 清掉尝试记录。
+    /// 清掉尝试记录:一致了;或归属失效(侧栏关了/切走);或上一次开失败了
+    /// —— 失败后没有 client,不会立刻再开,等用户「重连」开回来(可能开到焦点
+    /// 那台)时还能再对一次。只在**没有 client** 时因失败清,开成了却落在别处
+    /// 的那种不收敛照样被闸住。
     Settled,
     /// 不一致且没试过 —— 在归属 pane 那台重开。
     Reopen(ReconcileKey),
@@ -17991,9 +18021,15 @@ enum Reconcile {
 /// 又被别处拽歪)造成的空转;一致时清掉,之后再歪还能再对一次。
 fn reconcile_plan_of(v: &ReconcileView, tried: Option<ReconcileKey>) -> Reconcile {
     let Some((gen, pane)) = v.owner else {
-        return Reconcile::Idle;
+        return Reconcile::Settled;
     };
-    if v.owner_generation != Some(gen) || !v.has_client || v.loading {
+    if v.owner_generation != Some(gen) {
+        return Reconcile::Settled;
+    }
+    if !v.has_client && v.failed {
+        return Reconcile::Settled;
+    }
+    if !v.has_client || v.loading {
         return Reconcile::Idle;
     }
     let Some(host) = v.owner_host_ix else {
@@ -24752,6 +24788,11 @@ mod tests {
         let from_copy = body_of(
             prod_src(),
             "fn reveal_target_from_copy(&mut self) -> Result<Option<RevealTarget>, ()> {",
+        );
+        assert!(
+            from_copy.contains("m.clipboard_missed = true;")
+                && from_copy.contains("self.last_terminal_copy = None;"),
+            "剪贴板读不到没有只宽限一次 —— 剪贴板是图片时侧栏永远关不掉:{from_copy}"
         );
         assert!(
             from_copy.contains("reveal::recall(")
@@ -34436,18 +34477,20 @@ mod tests {
             owner_host_ix: Some(1),
             has_client: true,
             loading: false,
+            failed: false,
             sftp_host_ix: Some(0),
         };
         assert_eq!(reconcile_plan_of(&ok, None), Reconcile::Reopen((7, p, 1)));
-        // 门 1:侧栏没开在归属标签上(关着 / 切走 / `Files` 标签)。
+        // 门 1:侧栏没开在归属标签上(关着 / 切走 / `Files` 标签)—— 不重开,
+        // 并清掉尝试记录(残留的话下次开栏同键会被闸住,复核)。
         for g in [None, Some(8)] {
             let v = ReconcileView {
                 owner_generation: g,
                 ..ok.clone()
             };
             assert_eq!(
-                reconcile_plan_of(&v, None),
-                Reconcile::Idle,
+                reconcile_plan_of(&v, Some((7, p, 1))),
+                Reconcile::Settled,
                 "侧栏世代 {g:?}"
             );
         }
@@ -34459,7 +34502,7 @@ mod tests {
                 },
                 None
             ),
-            Reconcile::Idle,
+            Reconcile::Settled,
             "没记归属"
         );
         // 门 2:归属 pane 不在了(或还没挂上自己的连接)。
@@ -34474,6 +34517,17 @@ mod tests {
             ..ok.clone()
         };
         assert_eq!(reconcile_plan_of(&none, None), Reconcile::Idle);
+        // 开失败了:清记录。之后用户点「重连」开到焦点那台,还能再对一次
+        // (复核:不清的话同键被闸住,栏头与 SFTP 永久不一致)。
+        let failed = ReconcileView {
+            has_client: false,
+            failed: true,
+            ..ok.clone()
+        };
+        assert_eq!(
+            reconcile_plan_of(&failed, Some((7, p, 1))),
+            Reconcile::Settled
+        );
         // 门 4:远端栏在加载 —— 开到一半,等它落定再比。
         let busy = ReconcileView {
             loading: true,
@@ -34531,6 +34585,15 @@ mod tests {
         );
         assert!(tried < reopen, "先重开后记键:{body}");
         assert!(!body.contains("focused"), "对账不能看焦点 pane:{body}");
+        let compact: String = body.split_whitespace().collect();
+        assert!(
+            compact.contains(".filter(|_|self.files_sidebar_was_open)"),
+            "开栏帧重绘前读到的是上一次的归属,会把 SFTP 拽去旧 pane 那台(复核):{body}"
+        );
+        assert!(
+            compact.contains("Load::Failed(_)|crate::files::state::Load::Disconnected"),
+            "没把开失败报给判定 —— 失败后尝试键残留,重连到焦点那台就再也对不回来:{body}"
+        );
     }
 
     /// F132:「侧栏关→开」那一帧该做什么,三选一。这是这条改动里唯一测得动
