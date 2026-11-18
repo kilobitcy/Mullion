@@ -60,12 +60,14 @@ impl Default for Clipboard {
     }
 }
 
-/// F365:Alt+拖选复制时把「你」「您」逐字换成「我」,其余一字不动。返回替换次数。
+/// F377(推翻 F365 的「不做反向」):Alt+拖选复制时你我**互换** —— 你/您 → 我,
+/// 我 → 你,其余一字不动。返回替换次数(两方向合计)。一遍逐字映射,不会把刚换出来
+/// 的字再换回去。复制 Claude 的原话喂回去时,人称正好对上。
 ///
 /// 放在 app 层而不是 `mullion-term`:单行拼接是终端语义(有 fixture 守着),
-/// 人称替换是产品策略。不做反向「我→你」、不做语义判断(「迷你」也会被改,
-/// 用户 2026-11-17 复议后维持一律替换,由调用方飘 Warn toast 兜底)。
-pub fn to_first_person(s: &str) -> (String, usize) {
+/// 人称替换是产品策略。不做语义判断(「迷你」「自我」也会被改,用户 2026-11-17
+/// 复议后维持一律替换,由调用方飘 Warn toast 兜底)。
+pub fn swap_persona(s: &str) -> (String, usize) {
     let mut n = 0;
     let out = s
         .chars()
@@ -73,6 +75,10 @@ pub fn to_first_person(s: &str) -> (String, usize) {
             '你' | '您' => {
                 n += 1;
                 '我'
+            }
+            '我' => {
+                n += 1;
+                '你'
             }
             c => c,
         })
@@ -82,23 +88,25 @@ pub fn to_first_person(s: &str) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::to_first_person;
+    use super::swap_persona;
 
-    /// F365:你/您逐字换成我,别的字一个不动;次数如实返回(调用方据此飘 toast)。
+    /// F377:你/您 → 我、我 → 你,一遍映射不回绕;别的字一个不动;次数是两方向合计。
+    ///
+    /// 自证会变红:删掉 `'我' => …` 那一支(第一条断言红)。
     #[test]
-    fn every_ni_and_nin_becomes_wo_and_nothing_else_moves() {
+    fn ni_and_wo_trade_places_and_nothing_else_moves() {
         assert_eq!(
-            to_first_person("需要你拍板的"),
-            ("需要我拍板的".to_string(), 1)
+            swap_persona("我建议先改 A,需要你拍板"),
+            ("你建议先改 A,需要我拍板".to_string(), 2)
         );
         assert_eq!(
-            to_first_person("请您确认,你们呢"),
-            ("请我确认,我们呢".to_string(), 2)
+            swap_persona("请您确认,你们和我们"),
+            ("请我确认,我们和你们".to_string(), 3)
         );
         assert_eq!(
-            to_first_person("git commit -m x"),
+            swap_persona("git commit -m x"),
             ("git commit -m x".to_string(), 0)
         );
-        assert_eq!(to_first_person(""), (String::new(), 0));
+        assert_eq!(swap_persona(""), (String::new(), 0));
     }
 }

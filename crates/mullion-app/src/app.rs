@@ -10181,15 +10181,15 @@ impl App {
         else {
             return;
         };
-        // F365:Alt 复制一律把你/您改成我(复制回去当自己的答复)。改了就飘
-        // Warn —— 命令行里的「你」也会被改,醒目提示是唯一的兜底。
-        let (text, swapped) = crate::clipboard::to_first_person(&text);
+        // F365/F377:Alt 复制一律你我互换(复制回去当自己的答复)。改了就飘
+        // Warn —— 命令行里的「你」「我」也会被改,醒目提示是唯一的兜底。
+        let (text, swapped) = crate::clipboard::swap_persona(&text);
         self.clipboard.set(&text);
         self.remember_terminal_copy(text);
         if swapped > 0 {
             self.ui.set_toast(
                 crate::ui::toast::Kind::Warn,
-                format!("已将 {swapped} 处你/您改为我"),
+                format!("已互换 {swapped} 处你/我"),
             );
         } else if merged {
             self.ui
@@ -20356,7 +20356,9 @@ mod tests {
         assert!(copy.contains("selection_text_one_line()"), "{copy}");
         assert!(copy.contains("if merged"), "单行选区也飘 toast 了:{copy}");
         // F365:人称替换必须落在写剪贴板之前,否则剪贴板里还是「你」。
-        let swap = copy.find("to_first_person(").expect("F365 人称替换没接上");
+        let swap = copy
+            .find("swap_persona(")
+            .expect("F365/F377 人称替换没接上");
         let set = copy.find("self.clipboard.set(").expect("找不到写剪贴板");
         assert!(swap < set, "人称替换排在写剪贴板之后:{copy}");
     }
@@ -24738,7 +24740,7 @@ mod tests {
     /// 于记忆,F374 整条静默失效。
     ///
     /// 自证会变红:删掉任一处 `self.remember_terminal_copy(text);`,或把它挪到
-    /// `to_first_person` 之前。
+    /// `swap_persona` 之前。
     #[test]
     fn both_terminal_copies_remember_what_actually_went_to_the_clipboard() {
         for sig in [
@@ -24756,8 +24758,7 @@ mod tests {
         }
         let one = body_of(prod_src(), "fn copy_selection_one_line(&mut self) {");
         assert!(
-            one.find("to_first_person(").unwrap()
-                < one.find("self.remember_terminal_copy(").unwrap(),
+            one.find("swap_persona(").unwrap() < one.find("self.remember_terminal_copy(").unwrap(),
             "Alt 复制记的是改人称之前的那份 —— 与剪贴板永远不相等:{one}"
         );
     }
