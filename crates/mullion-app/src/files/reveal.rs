@@ -297,6 +297,42 @@ pub fn parse_single_line(
     parse(&text()?)
 }
 
+/// F374:焦点选区认不出路径时,最近一次终端复制还能不能拿来用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recall {
+    /// 剪贴板里还是那份复制 → 按来源 pane 解析。
+    Use,
+    /// 剪贴板这一刻读不到(Windows 上被别的进程短暂占着是常态)。不当成「不
+    /// 相等」:那会关栏,用户再按一次就成了「开栏」,两下全错。
+    Unknown,
+    /// 没有记忆 / 来源在别的标签 / 剪贴板已被别处覆盖 → 按原规则走。
+    Forget,
+}
+
+/// F374:最近一次终端复制的判定。
+///
+/// - `same_tab`:来源 pane 的世代 == 侧栏属主标签的世代。`host_ix` 是各
+///   `ws.hosts` 自己的下标,拿别的标签的下标去查会静默连错机器 —— 跨标签
+///   一律当没有记忆。
+/// - `clipboard` **是惰性的**:没有可用记忆时不去碰系统剪贴板。
+pub fn recall(
+    memo: Option<&str>,
+    same_tab: bool,
+    clipboard: impl FnOnce() -> Option<String>,
+) -> Recall {
+    let Some(memo) = memo else {
+        return Recall::Forget;
+    };
+    if !same_tab {
+        return Recall::Forget;
+    }
+    match clipboard() {
+        None => Recall::Unknown,
+        Some(now) if now == memo => Recall::Use,
+        Some(_) => Recall::Forget,
+    }
+}
+
 /// F242:跨节点时那一格要写的**起点**。
 ///
 /// 同机(`from == to`)给 `None`:写成 `a → a` 是纯噪音,而这一格的宽度要跟
@@ -695,5 +731,22 @@ mod tests {
             "中间那档确实跟着宽度走:{mid}"
         );
         assert!(char_budget(2000.0) > mid, "更宽就更长");
+    }
+
+    /// F374:四种出口,且没有可用记忆时不读剪贴板。
+    #[test]
+    fn recall_uses_the_copy_only_while_the_clipboard_still_holds_it() {
+        let never = || -> Option<String> { panic!("没有可用记忆时不该读剪贴板") };
+        assert_eq!(recall(None, true, never), Recall::Forget);
+        assert_eq!(recall(Some("docs/a.md"), false, never), Recall::Forget);
+        assert_eq!(recall(Some("docs/a.md"), true, || None), Recall::Unknown);
+        assert_eq!(
+            recall(Some("docs/a.md"), true, || Some("docs/a.md".into())),
+            Recall::Use
+        );
+        assert_eq!(
+            recall(Some("docs/a.md"), true, || Some("别处复制的".into())),
+            Recall::Forget
+        );
     }
 }

@@ -1010,6 +1010,29 @@ struct RevealTarget {
     path: mullion_ssh::sftp::RemotePath,
     /// 面板已经停在这儿了吗(判据见 `files::reveal::arrived`)。
     arrived: bool,
+    /// F374:发起这次跳转的 pane(焦点选区 = 焦点 pane,最近复制 = 来源
+    /// pane)。远端跳转时侧栏归属改成它,否则 F372 对账会把刚搬过去的
+    /// channel 拽回原归属那台。路径条/搜索那几条腿没有发起 pane,`None`。
+    pane: Option<PaneId>,
+}
+
+/// F374:最近一次终端复制。
+#[derive(Debug, Clone)]
+struct TerminalCopy {
+    /// 真正写进剪贴板的那份(Alt 复制是改过人称的)。
+    text: String,
+    /// 来源 pane 所在标签的世代号。`PaneId` 各标签各自从 1 起编,不带世代
+    /// 会认错 pane。
+    generation: u64,
+    pane: PaneId,
+}
+
+/// F372/F374:sftp channel 开到哪台机器、从哪个目录起步。传 `None` 的版本
+/// 取焦点 pane 的(F132 原有语义)。
+#[derive(Debug, Clone)]
+struct SftpAt {
+    host_ix: Option<usize>,
+    cwd: Option<Vec<u8>>,
 }
 
 /// F218:一次在途的「跳到那条路径去」。
@@ -1286,6 +1309,18 @@ impl TabContent {
         self.as_terminal()
             .and_then(|t| t.ws.focused())
             .map(|p| p.host_ix)
+    }
+
+    /// F372/F374:指定 pane 的 sftp 落点(所在机器 + 报出来的目录)。pane
+    /// 不在了(或不是终端标签)给 `None` —— 调用方据此放弃,不退回焦点 pane:
+    /// 那会静默开到另一台机器上。
+    fn pane_sftp_at(&self, pane: PaneId) -> Option<SftpAt> {
+        self.as_terminal()
+            .and_then(|t| t.ws.pane(pane))
+            .map(|p| SftpAt {
+                host_ix: Some(p.host_ix),
+                cwd: p.cwd.clone(),
+            })
     }
 
     /// F132:这条 sftp channel **记录在案**开在哪台机器上(`accept_sftp_opened`
@@ -2516,6 +2551,9 @@ pub struct App {
     /// 消费端(`ui::mod` → `files_panel::owner_tag`)还要再拿这一帧的标题条
     /// 核一次,pane 关掉了就自动不写。
     files_owner_pane: Option<(u64, mullion_core::layout::PaneId)>,
+    /// F374:最近一次终端复制(写剪贴板那两处记)。只在剪贴板里**还是这份**时
+    /// 才被 Ctrl+Shift+B 采用(`files::reveal::recall`)。
+    last_terminal_copy: Option<TerminalCopy>,
     /// F218:跳转意图的发号器。每按一次 `Ctrl+Shift+B`(且认出了路径)+1,
     /// `stat` 结果回来时对账 —— 用户按得比网络快时会有后发先至。
     ///
@@ -3421,6 +3459,7 @@ impl App {
             ui_dirty: true, // 首帧必须画出来
             files_sidebar_was_open: false,
             files_owner_pane: None,
+            last_terminal_copy: None,
             reveal_seq: 0,
             cursor_px: (0.0, 0.0),
             clipboard: crate::clipboard::Clipboard::new(),
@@ -5829,16 +5868,31 @@ impl App {
     fn apply_files_hotkey(&mut self) {
         use crate::shell::input_route::Focus;
         let mut target = None;
+        let mut clipboard_unknown = false;
+        let open = self.ui.files_sidebar_open;
         let plan = crate::files::reveal::step(
             active_is_files_tab_of(&self.tabs),
             self.effective_focus() == Focus::FilesPanel,
-            self.ui.files_sidebar_open,
+            open,
             || {
                 target = self.reveal_target();
+                // F374:侧栏开着、焦点选区认不出路径(TUI 重画把选区冲掉是
+                // 常态,T13)—— 先查最近一次终端复制,没有才照旧关栏。
+                if target.is_none() && open {
+                    match self.reveal_target_from_copy() {
+                        Ok(t) => target = t,
+                        Err(()) => clipboard_unknown = true,
+                    }
+                }
                 target.as_ref().map(|t| t.arrived)
             },
         );
         let Some(plan) = plan else { return };
+        if clipboard_unknown && plan == crate::files::reveal::Plan::Close {
+            self.ui
+                .set_toast(crate::ui::toast::Kind::Warn, "剪贴板暂时读不到,再按一次");
+            return;
+        }
         match plan {
             crate::files::reveal::Plan::Open => self.ui.files_sidebar_open = true,
             crate::files::reveal::Plan::Close => {
@@ -5877,7 +5931,28 @@ impl App {
     /// 并原地不动,不会静默跳到别处。
     fn reveal_target(&self) -> Option<RevealTarget> {
         let parsed = self.selection_as_path()?;
-        self.reveal_target_of(&parsed)
+        self.reveal_target_of(&parsed, None)
+    }
+
+    /// F374:最近一次终端复制还在剪贴板里、且是一条路径 → 按**来源 pane**
+    /// 解析。`Err` = 剪贴板这一刻读不到(判定见 `files::reveal::recall`)。
+    fn reveal_target_from_copy(&mut self) -> Result<Option<RevealTarget>, ()> {
+        use crate::files::reveal::{self, Recall};
+        let owner = files_owner_generation_of(&self.tabs, true);
+        let memo = self.last_terminal_copy.clone();
+        let same_tab = memo.as_ref().is_some_and(|m| Some(m.generation) == owner);
+        let clipboard = &mut self.clipboard;
+        match reveal::recall(memo.as_ref().map(|m| m.text.as_str()), same_tab, || {
+            clipboard.get()
+        }) {
+            Recall::Forget => Ok(None),
+            Recall::Unknown => Err(()),
+            Recall::Use => Ok(memo.and_then(|m| {
+                // 同 `parse_single_line` 的闸:多行的不认。
+                let parsed = reveal::parse_single_line(!m.text.contains('\n'), || Some(m.text))?;
+                self.reveal_target_of(&parsed, Some(m.pane))
+            })),
+        }
     }
 
     /// F242:焦点 pane 的选区**语法上**是不是一条路径。零 IO,不看面板状态。
@@ -5891,19 +5966,32 @@ impl App {
     }
 
     /// F218:把认出来的那条路径解析成绝对路径,再看面板是不是已经在那儿了。
-    fn reveal_target_of(&self, parsed: &crate::files::reveal::Target) -> Option<RevealTarget> {
+    ///
+    /// F374:`source` 是发起 pane(最近复制的来源 pane),`None` = 焦点 pane。
+    /// 基准目录与目的机器都取它的;它已经不在了就给 `None`,不退回焦点 pane
+    /// —— 那会把路径解析到另一台机器上。
+    fn reveal_target_of(
+        &self,
+        parsed: &crate::files::reveal::Target,
+        source: Option<PaneId>,
+    ) -> Option<RevealTarget> {
         use crate::files::{reveal, PanelColumn};
         let generation = files_owner_generation_of(&self.tabs, true)?;
         let tab = self.tabs.by_generation(generation)?;
         let files = tab.content.files_panel()?;
+        let source_pane = source.or_else(|| tab.content.as_terminal().map(|t| t.ws.focus()));
+        let at = match source {
+            Some(id) => Some(tab.content.pane_sftp_at(id)?),
+            None => source_pane.and_then(|id| tab.content.pane_sftp_at(id)),
+        };
         let path = match parsed.column {
             PanelColumn::Remote => {
                 let home = tab.content.sftp_home();
                 // 基准优先用 pane 报的 cwd,退回面板当前目录。`files_start_dir`
                 // 只认绝对路径(以及能展开的 `~`),给不出就是给不出。
-                let base = tab
-                    .content
-                    .focused_pane_cwd()
+                let base = at
+                    .as_ref()
+                    .and_then(|a| a.cwd.clone())
                     .and_then(|c| files_start_dir(Some(&c), None, home.as_deref()))
                     .map(|s| mullion_ssh::sftp::RemotePath::from_bytes(s.into_bytes()))
                     .unwrap_or_else(|| files.remote.cwd.clone());
@@ -5942,9 +6030,10 @@ impl App {
         Some(RevealTarget {
             generation,
             column: parsed.column,
-            host_ix: tab.content.focused_pane_host_ix(),
+            host_ix: at.and_then(|a| a.host_ix),
             path,
             arrived,
+            pane: source_pane,
         })
     }
 
@@ -5956,7 +6045,7 @@ impl App {
     fn selection_status(&self) -> Option<crate::files::reveal::StatusPath> {
         use crate::files::{reveal, PanelColumn};
         let parsed = self.selection_as_path()?;
-        let Some(t) = self.reveal_target_of(&parsed) else {
+        let Some(t) = self.reveal_target_of(&parsed, None) else {
             // 认出了路径、但落不到具体位置(面板属主还没有、拿不到基准
             // 目录…)。**仍然占格**:用户至少能确认「我划中的是这一串」,
             // 这正是这一格存在的理由;不占格的话他会以为自己划歪了。
@@ -6054,6 +6143,22 @@ impl App {
             log::warn!("F218:世代 {generation} 存不下跳转意图,已放弃");
             return;
         }
+        // F374/F372:远端跳转把侧栏归属改成发起 pane —— 栏头随之写成它的
+        // 节点;不改的话 F372 对账会把刚搬过去的 channel 拽回原归属那台,
+        // 「路径对了、机器错了」。
+        if let Some(pane) = target.pane {
+            self.files_owner_pane = Some((generation, pane));
+        }
+        // 开到**发起 pane** 那台(它不一定是焦点:最近复制的来源 pane)。
+        let at = SftpAt {
+            host_ix: target.host_ix,
+            cwd: target.pane.and_then(|p| {
+                self.tabs
+                    .by_generation(generation)
+                    .and_then(|t| t.content.pane_sftp_at(p))
+                    .and_then(|a| a.cwd)
+            }),
+        };
         match (client, same_host) {
             (Some(client), true) => {
                 let task = spawn_sftp_stat(
@@ -6066,8 +6171,8 @@ impl App {
                 );
                 self.track_sftp_task(generation, task);
             }
-            (Some(_), false) => self.reopen_sftp_on_focused_host(generation),
-            (None, _) => self.trigger_sftp_open(generation),
+            (Some(_), false) => self.reopen_sftp_on(generation, Some(at)),
+            (None, _) => self.trigger_sftp_open_at(generation, Some(at)),
         }
     }
 
@@ -6106,6 +6211,7 @@ impl App {
             host_ix,
             path,
             arrived: false,
+            pane: None,
         };
         let (goto, pick) = self.reveal_destination(&target, is_dir);
         self.apply_remote_file_action(generation, crate::ui::files_panel::FileAction::Goto(goto));
@@ -6149,6 +6255,7 @@ impl App {
             host_ix: None,
             path,
             arrived: false,
+            pane: None,
         };
         let (goto, pick) = self.reveal_destination(&target, is_dir);
         self.apply_remote_file_action(generation, crate::ui::files_panel::FileAction::Goto(goto));
@@ -6350,6 +6457,7 @@ impl App {
             host_ix: None,
             path,
             arrived: false,
+            pane: None,
         };
         let (goto, pick) = self.reveal_destination(&target, is_dir);
         self.close_files_find(generation);
@@ -6524,6 +6632,11 @@ impl App {
     /// 引用拿走,谁都不会因此失效。用户是对着旧那台机器发起的,让它跑完才是
     /// 对的。迟到的列目录结果由 `invalidate` 递增的 `request_seq` 挡掉。
     fn reopen_sftp_on_focused_host(&mut self, generation: u64) {
+        self.reopen_sftp_on(generation, None);
+    }
+
+    /// `reopen_sftp_on_focused_host` 的本体;`at` 同 `trigger_sftp_open_at`。
+    fn reopen_sftp_on(&mut self, generation: u64, at: Option<SftpAt>) {
         if let Some(tab) = self.tabs.by_generation_mut(generation) {
             if let Some(slot) = tab.content.sftp_mut() {
                 *slot = None;
@@ -6552,7 +6665,7 @@ impl App {
                 files.drop_find();
             }
         }
-        self.trigger_sftp_open(generation);
+        self.trigger_sftp_open_at(generation, at);
     }
 
     /// F240:`Ctrl+Shift+N` 按下之后到底做什么。判定全在
@@ -9119,6 +9232,13 @@ impl App {
     /// - `Files`(D1 标签宿主):独占的连接(`establish` 单独建的那条,
     ///   ADR-010 同款理由),`sftp_connection_for` 不看 `host_ix`,恒 `Some`。
     fn trigger_sftp_open(&mut self, generation: u64) {
+        self.trigger_sftp_open_at(generation, None);
+    }
+
+    /// `trigger_sftp_open` 的本体。`at` 为 `None` 取焦点 pane 的机器与目录
+    /// (F132);F372 对账 / F374 跳转给的是归属 pane / 来源 pane 的,那块
+    /// pane 不一定是焦点。
+    fn trigger_sftp_open_at(&mut self, generation: u64, at: Option<SftpAt>) {
         let Some(tab) = self.tabs.by_generation_mut(generation) else {
             return;
         };
@@ -9131,7 +9251,13 @@ impl App {
             // 已经开好了,或者已经在开的路上——别在下一帧/下一次点击重复触发。
             return;
         }
-        let host_ix = tab.content.focused_pane_host_ix();
+        let (host_ix, pane_cwd) = match at {
+            Some(at) => (at.host_ix, at.cwd),
+            None => (
+                tab.content.focused_pane_host_ix(),
+                tab.content.focused_pane_cwd(),
+            ),
+        };
         let Some(conn) = tab.content.sftp_connection_for(host_ix) else {
             return;
         };
@@ -9139,8 +9265,7 @@ impl App {
         // ②:优先开在这个标签焦点 pane 报出来的目录。起始目录的计算
         // (`files_start_dir`)挪进了 `spawn_sftp_open`——`~` 展开要用远端的
         // 真登录目录,而那个值只有 `canonicalize(".")` 回来之后才知道,这里
-        // 算不了(F123)。
-        let pane_cwd = tab.content.focused_pane_cwd();
+        // 算不了(F123)。`pane_cwd` 在上面跟 `host_ix` 一起取。
         if let Some(files) = tab.content.files_panel_mut() {
             files.remote.load = crate::files::state::Load::Loading;
         }
@@ -9960,6 +10085,16 @@ impl App {
             return;
         };
         self.clipboard.set(&text);
+        self.remember_terminal_copy(text);
+    }
+
+    /// F374:记下刚写进剪贴板的那份终端复制,连同来源 pane(焦点 pane)。
+    fn remember_terminal_copy(&mut self, text: String) {
+        self.last_terminal_copy = self.active_ws().map(|ws| TerminalCopy {
+            text,
+            generation: ws.generation(),
+            pane: ws.focus(),
+        });
     }
 
     /// F335:Alt+拖选松手 —— 把选区拼成一行再写剪贴板(拼接规则在
@@ -9977,6 +10112,7 @@ impl App {
         // Warn —— 命令行里的「你」也会被改,醒目提示是唯一的兜底。
         let (text, swapped) = crate::clipboard::to_first_person(&text);
         self.clipboard.set(&text);
+        self.remember_terminal_copy(text);
         if swapped > 0 {
             self.ui.set_toast(
                 crate::ui::toast::Kind::Warn,
@@ -24449,6 +24585,98 @@ mod tests {
         );
     }
 
+    /// F374 **接线守护**:两处终端复制都在写完剪贴板**之后**记下真正写进去的
+    /// 那份(Alt 复制是改过人称的)。记早了 / 记改人称之前的 → 剪贴板永远不等
+    /// 于记忆,F374 整条静默失效。
+    ///
+    /// 自证会变红:删掉任一处 `self.remember_terminal_copy(text);`,或把它挪到
+    /// `to_first_person` 之前。
+    #[test]
+    fn both_terminal_copies_remember_what_actually_went_to_the_clipboard() {
+        for sig in [
+            "fn copy_selection(&mut self) {",
+            "fn copy_selection_one_line(&mut self) {",
+        ] {
+            let body = body_of(prod_src(), sig);
+            let set = body
+                .find("self.clipboard.set(&text);")
+                .unwrap_or_else(|| panic!("{sig} 不写剪贴板了:{body}"));
+            let remember = body
+                .find("self.remember_terminal_copy(text);")
+                .unwrap_or_else(|| panic!("{sig} 没记最近一次复制:{body}"));
+            assert!(set < remember, "{sig} 先记后写:{body}");
+        }
+        let one = body_of(prod_src(), "fn copy_selection_one_line(&mut self) {");
+        assert!(
+            one.find("to_first_person(").unwrap()
+                < one.find("self.remember_terminal_copy(").unwrap(),
+            "Alt 复制记的是改人称之前的那份 —— 与剪贴板永远不相等:{one}"
+        );
+    }
+
+    /// F374 **接线守护**:Ctrl+Shift+B 的「认不出路径」那一支先查记忆。
+    ///
+    /// - 只在侧栏**开着**时查(关着按 = 开栏,原语义不变);
+    /// - 剪贴板读不到 → toast 且**不关栏**,检查必须在 `match plan` 之前;
+    /// - 记忆按**来源 pane** 解析(`Some(m.pane)`),不是焦点 pane。
+    ///
+    /// 自证会变红:删掉 `&& open`;把 `clipboard_unknown` 那段挪到 `match`
+    /// 之后;把 `Some(m.pane)` 换成 `None`。
+    #[test]
+    fn the_hotkey_falls_back_to_the_last_copy_from_its_source_pane() {
+        let body = body_of(prod_src(), "fn apply_files_hotkey(&mut self) {");
+        assert!(
+            body.contains("if target.is_none() && open {")
+                && body.contains("self.reveal_target_from_copy()"),
+            "认不出路径时没查最近一次复制(或侧栏关着也查):{body}"
+        );
+        let unknown = body
+            .find("if clipboard_unknown && plan == crate::files::reveal::Plan::Close {")
+            .unwrap_or_else(|| panic!("剪贴板读不到时会照常关栏:{body}"));
+        assert!(
+            unknown < body.find("match plan {").unwrap(),
+            "读不到剪贴板的拦截在派发之后,栏已经关了:{body}"
+        );
+        let from_copy = body_of(
+            prod_src(),
+            "fn reveal_target_from_copy(&mut self) -> Result<Option<RevealTarget>, ()> {",
+        );
+        assert!(
+            from_copy.contains("reveal::recall(")
+                && from_copy.contains("self.reveal_target_of(&parsed, Some(m.pane))"),
+            "最近复制没走 recall 判定,或没按来源 pane 解析:{from_copy}"
+        );
+    }
+
+    /// F374/F372 **接线守护**:远端跳转把侧栏归属改成发起 pane,并把 channel
+    /// 开到**它**那台(不是焦点那台)。
+    ///
+    /// 自证会变红:删掉 `self.files_owner_pane = Some((generation, pane));`;
+    /// 或把 `reopen_sftp_on(generation, Some(at))` 换回
+    /// `reopen_sftp_on_focused_host(generation)`。
+    #[test]
+    fn a_remote_reveal_hands_the_sidebar_to_the_pane_that_started_it() {
+        let body = body_of(
+            prod_src(),
+            "fn reveal_remote(&mut self, target: RevealTarget) {",
+        );
+        let owner = body
+            .find("self.files_owner_pane = Some((generation, pane));")
+            .unwrap_or_else(|| panic!("跳转没改侧栏归属 —— 对账会把 channel 拽回去:{body}"));
+        let reopen = body
+            .find("self.reopen_sftp_on(generation, Some(at))")
+            .unwrap_or_else(|| panic!("跨机跳转没开到发起 pane 那台:{body}"));
+        assert!(owner < reopen, "先重开后改归属:{body}");
+        assert!(
+            body.contains("self.trigger_sftp_open_at(generation, Some(at))"),
+            "channel 未开时没开到发起 pane 那台:{body}"
+        );
+        assert!(
+            !body.contains("reopen_sftp_on_focused_host"),
+            "跨机跳转又走回了「焦点那台」:{body}"
+        );
+    }
+
     /// F243 **接线守护**:关栏要顺手撤掉在途的那次跳转。
     ///
     /// 不撤的话,`stat` 半秒后回来会把**已经关起来的**面板的当前目录改掉 ——
@@ -25604,7 +25832,7 @@ mod tests {
             "fn apply_local_file_action",
             "fn apply_remote_file_action",
             "fn track_sftp_task",
-            "fn trigger_sftp_open",
+            "fn trigger_sftp_open_at",
             "fn accept_sftp_opened",
             "fn accept_sftp_listed",
         ] {
@@ -26256,7 +26484,7 @@ mod tests {
         // 守卫读的必须还是同一个 sftp_client() —— 防止上面那条断言被
         // 「守卫改了个说法,清槽位这行成了摆设」这种退化绕过去。
         let trigger_after = src
-            .split("fn trigger_sftp_open(")
+            .split("fn trigger_sftp_open_at(")
             .nth(1)
             .expect("找不到 trigger_sftp_open 的定义");
         assert!(
@@ -29796,9 +30024,10 @@ mod tests {
     /// `files.drop_find_on_reroot(&files.remote.cwd);`(或者删掉整行)。
     #[test]
     fn switching_hosts_throws_away_the_running_search() {
+        // F372/F374 起本体在 `reopen_sftp_on`,`_focused_host` 只是包一层。
         let body = strip_comments(body_of(
             prod_src(),
-            "fn reopen_sftp_on_focused_host(&mut self, generation: u64) {",
+            "fn reopen_sftp_on(&mut self, generation: u64, at: Option<SftpAt>) {",
         ));
         assert!(
             body.contains("files.drop_find();"),
@@ -33818,9 +34047,10 @@ mod tests {
         // 不带的话,测试自己 `.split("fn trigger_sftp_open(…")` 这行字面量也会
         // 被 `include_str!` 匹配上,函数一旦改名/被删,切分不会走到 `expect`,
         // 而是切到测试自己身上,报出一条方向完全跑偏的错误。
+        // F372/F374 起本体在 `trigger_sftp_open_at`,`trigger_sftp_open` 只是包一层。
         let at = src
-            .find("\n    fn trigger_sftp_open(&mut self, generation: u64) {")
-            .expect("找不到 trigger_sftp_open 的定义");
+            .find("\n    fn trigger_sftp_open_at(&mut self, generation: u64, at: Option<SftpAt>) {")
+            .expect("找不到 trigger_sftp_open_at 的定义");
         let after = &src[at + 1..];
         let body = &after[..after
             .find("\n    }\n")
@@ -35604,16 +35834,17 @@ mod tests {
             .next()
             .expect("split 至少给一段");
         assert!(prod.len() < src.len(), "范围没切到 mod tests 之前");
+        // F372/F374 起本体在 `reopen_sftp_on`,`_focused_host` 只是包一层。
         let at = prod
-            .find("    fn reopen_sftp_on_focused_host(")
-            .expect("缺 reopen_sftp_on_focused_host —— 换节点后侧栏不会跟过去");
+            .find("    fn reopen_sftp_on(")
+            .expect("缺 reopen_sftp_on —— 换节点后侧栏不会跟过去");
         let body = &prod[at..];
         let end = body.find("\n    }\n").expect("找不到函数结尾");
         let body = &body[..end];
         let drop_at = body.find("*slot = None;").expect("没摘掉旧 client");
         let call_at = body
-            .find("self.trigger_sftp_open(generation);")
-            .expect("没调 trigger_sftp_open");
+            .find("self.trigger_sftp_open_at(generation, at);")
+            .expect("没调 trigger_sftp_open_at");
         assert!(
             drop_at < call_at,
             "先调了 trigger_sftp_open 才摘旧 client —— 它会在开头早退,静默失败"
@@ -35656,7 +35887,8 @@ mod tests {
     /// +1,不再跟 invalidate 同层),或者整句删掉(锚点直接找不到)。
     #[test]
     fn reopening_sftp_also_clears_the_clipboard_so_it_never_points_at_the_wrong_host() {
-        let body = body_of(prod_src(), "fn reopen_sftp_on_focused_host(");
+        // F372/F374 起本体在 `reopen_sftp_on`,`_focused_host` 只是包一层。
+        let body = body_of(prod_src(), "fn reopen_sftp_on(");
         let depth_of = |at: usize| -> i32 {
             body[..at].chars().fold(0i32, |d, ch| match ch {
                 '{' => d + 1,
