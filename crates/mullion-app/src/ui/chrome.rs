@@ -1,5 +1,6 @@
 //! 菜单栏(含居中的布局预设按钮组)+ 标签栏(F36)+ 状态栏。
 use super::annotate;
+use super::icon::{self, Glyph};
 use super::session_manager::ManagerMode;
 use super::toolbar;
 use super::UiState;
@@ -54,46 +55,43 @@ pub fn top_menu(
             egui::menu::bar(ui, |ui| {
                 ui.spacing_mut().interact_size.y = row_h;
                 ui.menu_button("会话", |ui| {
-                    if ui.button("会话管理器").clicked() {
+                    if icon::menu_item(ui, Glyph::Terminal, "会话管理器", true).clicked() {
                         ui_state.session_manager_open = true;
                         ui.close_menu();
                     }
-                    if ui.button("分组管理器").clicked() {
+                    if icon::menu_item(ui, Glyph::Layers, "分组管理器", true).clicked() {
                         ui_state.group_manager_open = true;
                         ui.close_menu();
                     }
                     // F225②:与上面两个并列 —— 三者都是「配置库里的持久实体」。
                     // 不放「配置」菜单:那里装的是本机偏好,混进去会把两类东西
                     // 的边界糊掉。
-                    if ui.button("项目管理器").clicked() {
+                    if icon::menu_item(ui, Glyph::Project, "项目管理器", true).clicked() {
                         ui_state.project_manager_open = true;
                         ui.close_menu();
                     }
                     // F378:直达隧道页,原先要 会话管理器 → 隧道 再点一层。
-                    if ui.button("隧道管理器…").clicked() {
+                    if icon::menu_item(ui, Glyph::Tunnel, "隧道管理器…", true).clicked() {
                         ui_state.session_manager_open = true;
                         ui_state.manager_mode = ManagerMode::Tunnels;
                         ui.close_menu();
                     }
                     // F2:导入是一次性动作,不做开机自动发现(设计 D7)。
-                    if ui.button("导入 ssh config…").clicked() {
+                    if icon::menu_item(ui, Glyph::Import, "导入 ssh config…", true).clicked() {
                         ui_state.import_pick_request = true;
                         ui.close_menu();
                     }
                     // F46-a:整机迁移。两项挨着放 —— 它们是同一件事的两头,
                     // 而用户在「换新电脑」这个语境下会一次用到两边。
-                    if ui.button("导出全部配置…").clicked() {
+                    if icon::menu_item(ui, Glyph::Export, "导出全部配置…", true).clicked() {
                         ui_state.pack = Some(crate::ui::pack_dialog::PackDialog::export());
                         ui.close_menu();
                     }
-                    if ui.button("导入配置…").clicked() {
+                    if icon::menu_item(ui, Glyph::Import, "导入配置…", true).clicked() {
                         ui_state.pack_pick_request = true;
                         ui.close_menu();
                     }
-                    if ui
-                        .add_enabled(connected, egui::Button::new("断开"))
-                        .clicked()
-                    {
+                    if icon::menu_item(ui, Glyph::Unplug, "断开", connected).clicked() {
                         ui_state.request_disconnect = true;
                         ui.close_menu();
                     }
@@ -101,20 +99,18 @@ pub fn top_menu(
                     // 否掉了启动即自动重连)。这条是给「确实想把上次那摊全捡
                     // 回来」的用户的批量入口 —— 由用户主动按下,不是开机就跑,
                     // 所以不违背那三条理由。
-                    if ui
-                        .add_enabled(restored > 0, egui::Button::new("全部重连"))
-                        .clicked()
-                    {
+                    if icon::menu_item(ui, Glyph::Refresh, "全部重连", restored > 0).clicked() {
                         ui_state.reconnect_all_request = true;
                         ui.close_menu();
                     }
                     // F148 D9:常驻入口。只有启动弹窗的话,用户手滑点了
                     // 「不恢复」就再也回不去,而那 10 条记录还在磁盘上躺着。
-                    if ui.button("恢复上次的现场…").clicked() {
+                    if icon::menu_item(ui, Glyph::History, "恢复上次的现场…", true).clicked()
+                    {
                         ui_state.history_request = true;
                         ui.close_menu();
                     }
-                    if ui.button("退出").clicked() {
+                    if icon::menu_item(ui, Glyph::Power, "退出", true).clicked() {
                         ui_state.request_quit = true;
                         ui.close_menu();
                     }
@@ -124,19 +120,24 @@ pub fn top_menu(
                     // 必须走 apply_geometry 发 window_change(T4),故只置意图。
                     // 原先挂在「分屏」菜单下,该菜单已撤(布局改由同一行的按钮组
                     // 控制),这项是它下面唯一的真功能,挪到「配置」。
-                    if ui.button("显示 / 隐藏 pane 标题条").clicked() {
+                    if icon::menu_item(ui, Glyph::PanelTop, "显示 / 隐藏 pane 标题条", true)
+                        .clicked()
+                    {
                         ui_state.toggle_title_bars = true;
                         ui.close_menu();
                     }
                     // F50:开关文件侧栏。快捷键 `Ctrl+Shift+B` 的接线在
                     // `app.rs::bound_hotkey_event`,这里只是菜单入口。
-                    if ui.button("文件面板\tCtrl+Shift+B").clicked() {
+                    if icon::menu_item(ui, Glyph::PanelLeft, "文件面板\tCtrl+Shift+B", true)
+                        .clicked()
+                    {
                         ui_state.files_sidebar_open = !ui_state.files_sidebar_open;
                         ui.close_menu();
                     }
                     // F155:导出脱敏日志。常驻在这里 —— 用户在「把日志发我
                     // 看看」这个语境下会先想到菜单,不会先想到去翻设置弹窗。
-                    if ui.button("导出脱敏日志…").clicked() {
+                    if icon::menu_item(ui, Glyph::Document, "导出脱敏日志…", true).clicked()
+                    {
                         ui_state.export_log_request = true;
                         ui.close_menu();
                     }
@@ -150,20 +151,20 @@ pub fn top_menu(
                     // 一路传进这个菜单构建函数,为一个几十秒的瞬态多加一条
                     // 跨层参数不划算;给出文案已经解决了「用户不知道发生了
                     // 什么」这个真问题。这是有意的取舍,不是漏做。
-                    if ui.button("立刻备份到云").clicked() {
+                    if icon::menu_item(ui, Glyph::CloudUp, "立刻备份到云", true).clicked() {
                         ui_state.cloud_backup_request = true;
                         ui.close_menu();
                     }
                     // F84:设置弹窗(外观 + 快捷键一览)。原先这里挂着两条
                     // 置灰占位,「快捷键」那条不再单独出现 —— 一览表就在设置
                     // 弹窗里,再给它一个入口只会让人以为是两个不同的东西。
-                    if ui.button("设置…").clicked() {
+                    if icon::menu_item(ui, Glyph::Gear, "设置…", true).clicked() {
                         ui_state.settings_open = true;
                         ui.close_menu();
                     }
                 });
                 ui.menu_button("关于", |ui| {
-                    if ui.button("关于 Mullion").clicked() {
+                    if icon::menu_item(ui, Glyph::Info, "关于 Mullion", true).clicked() {
                         ui_state.about_open = true;
                         ui.close_menu();
                     }
@@ -681,10 +682,16 @@ mod tests {
     /// 判据串带上行首缩进,避免匹配到这条测试自己(第五类恒绿模式)。
     #[test]
     fn the_session_menu_has_a_permanent_entry_to_the_history_dialog() {
+        // F383 起改为先切测试模块(同下面几条),不再靠行首缩进躲开自己。
         let src = include_str!("chrome.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(prod.len() < src.len(), "测试模块分界变了");
+        let at = prod
+            .find("icon::menu_item(ui, Glyph::History, \"恢复上次的现场…\", true).clicked()")
+            .expect("「会话」菜单里没有恢复现场的常驻入口 —— 点过一次「不恢复」就再也回不去了");
         assert!(
-            src.contains("\n                    if ui.button(\"恢复上次的现场…\").clicked() {"),
-            "「会话」菜单里没有恢复现场的常驻入口 —— 点过一次「不恢复」就再也回不去了"
+            prod[at..at + 200].contains("ui_state.history_request = true;"),
+            "恢复现场入口没落到 history_request"
         );
     }
 
@@ -698,7 +705,7 @@ mod tests {
         let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
         assert!(prod.len() < src.len(), "测试模块分界变了");
         let at = prod
-            .find("ui.button(\"隧道管理器…\").clicked()")
+            .find("icon::menu_item(ui, Glyph::Tunnel, \"隧道管理器…\", true).clicked()")
             .expect("「会话」菜单里没有隧道管理器入口");
         let body = &prod[at..at + 400];
         assert!(
@@ -730,7 +737,9 @@ mod tests {
             "没能切掉测试模块 —— 下面这条断言会恒真"
         );
         assert!(
-            prod.contains("if ui.button(\"导出脱敏日志…\").clicked() {"),
+            prod.contains(
+                "icon::menu_item(ui, Glyph::Document, \"导出脱敏日志…\", true).clicked()"
+            ),
             "「配置」菜单里没有导出脱敏日志的常驻入口"
         );
     }
@@ -763,8 +772,44 @@ mod tests {
             "没能切掉测试模块 —— 下面这条断言会恒真"
         );
         assert!(
-            prod.contains("if ui.button(\"立刻备份到云\").clicked() {"),
+            prod.contains(
+                "if icon::menu_item(ui, Glyph::CloudUp, \"立刻备份到云\", true).clicked() {"
+            ),
             "「配置」菜单里没有手动备份入口"
+        );
+    }
+
+    /// F383:菜单栏三个菜单里每一项都走 `icon::menu_item` —— 新加一项忘了配
+    /// 图标的话,文字会比别的项靠左一截,只有人眼看得出来。
+    ///
+    /// 扎源码结构(菜单要展开才画得出来)。先切测试模块、再**剥掉注释行**:
+    /// 注释里提到 `ui.button(` 不该算违规,注释里的字面量也不该让它假绿。
+    ///
+    /// 自证会变红:把任一菜单项改回 `ui.button("…")`。
+    #[test]
+    fn every_menu_item_in_the_menu_bar_has_an_icon() {
+        let src = include_str!("chrome.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(prod.len() < src.len(), "测试模块分界变了");
+        let body = prod
+            .split("egui::menu::bar(ui, |ui| {")
+            .nth(1)
+            .expect("找不到菜单栏");
+        let body = body
+            .split("toolbar::show_in(")
+            .next()
+            .expect("找不到菜单栏的结尾");
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for bare in ["ui.button(", "Button::new("] {
+            assert!(!code.contains(bare), "菜单栏里还有没配图标的菜单项:{bare}");
+        }
+        assert!(
+            code.matches("icon::menu_item(").count() >= 17,
+            "菜单项数对不上,切片可能切错了地方"
         );
     }
 

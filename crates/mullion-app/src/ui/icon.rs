@@ -57,6 +57,32 @@ pub enum Glyph {
     ///
     /// 自绘理由同 [`Glyph::Search`]:任何便签/笔记字符都在 GBK 外(T9)。
     Memo,
+    /// F383 起一批菜单图标(自绘理由同上,T9)。终端框 + `>_`:会话管理器。
+    Terminal,
+    /// 三层叠放:分组管理器。
+    Layers,
+    /// 上右下左两支箭头:隧道管理器。
+    Tunnel,
+    /// 箭头落进托盘:导入。
+    Import,
+    /// 箭头从托盘出来:导出。
+    Export,
+    /// 折角的纸:导出脱敏日志。与 [`Glyph::Memo`] 靠折角区分。
+    Document,
+    /// 带逆时针箭头的钟:恢复上次的现场。
+    History,
+    /// 电源:退出。
+    Power,
+    /// 顶部加粗的窗口:显示 / 隐藏 pane 标题条。
+    PanelTop,
+    /// 左侧加粗的窗口:文件面板。
+    PanelLeft,
+    /// 云 + 上箭头:立刻备份到云。
+    CloudUp,
+    /// 齿轮:设置。
+    Gear,
+    /// 两个分开的插头:断开。
+    Unplug,
 }
 
 impl Glyph {
@@ -79,6 +105,19 @@ impl Glyph {
         Glyph::Project,
         Glyph::Search,
         Glyph::Memo,
+        Glyph::Terminal,
+        Glyph::Layers,
+        Glyph::Tunnel,
+        Glyph::Import,
+        Glyph::Export,
+        Glyph::Document,
+        Glyph::History,
+        Glyph::Power,
+        Glyph::PanelTop,
+        Glyph::PanelLeft,
+        Glyph::CloudUp,
+        Glyph::Gear,
+        Glyph::Unplug,
     ];
 }
 
@@ -307,6 +346,19 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
                 stroke: stroke.into(),
             },
         ],
+        Glyph::Terminal
+        | Glyph::Layers
+        | Glyph::Tunnel
+        | Glyph::Import
+        | Glyph::Export
+        | Glyph::Document
+        | Glyph::History
+        | Glyph::Power
+        | Glyph::PanelTop
+        | Glyph::PanelLeft
+        | Glyph::CloudUp
+        | Glyph::Gear
+        | Glyph::Unplug => menu_shapes(c, h, glyph, stroke),
         Glyph::Search => {
             let r = h * 0.6;
             // 圆心往左上挪一点,给柄腾地方,整体视觉重心才落在框中间。
@@ -323,6 +375,193 @@ pub fn shapes(rect: Rect, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
             ]
         }
     }
+}
+
+/// F383 菜单图标。坐标一律写成以 `c` 为心、`h` 为半边长的单位坐标 ——
+/// 全部落在 `[-1, 1]` 内,`every_glyph_stays_inside_its_rect` 兜底。
+fn menu_shapes(c: egui::Pos2, h: f32, glyph: Glyph, stroke: Stroke) -> Vec<Shape> {
+    let p = |x: f32, y: f32| pos2(c.x + h * x, c.y + h * y);
+    let seg = |a: egui::Pos2, b: egui::Pos2| Shape::LineSegment {
+        points: [a, b],
+        stroke: stroke.into(),
+    };
+    let line = |pts: Vec<egui::Pos2>| Shape::line(pts, stroke);
+    // 角度单位是度、屏幕坐标(y 向下,角度增大 = 顺时针)。epaint 没有弧图元,折线近似。
+    let arc = |cx: f32, cy: f32, r: f32, from: f32, sweep: f32| -> Vec<egui::Pos2> {
+        const N: usize = 16;
+        (0..=N)
+            .map(|i| {
+                let a = (from + sweep * i as f32 / N as f32).to_radians();
+                p(cx + r * a.cos(), cy + r * a.sin())
+            })
+            .collect()
+    };
+    let frame = || {
+        line(vec![
+            p(-1.0, -0.85),
+            p(1.0, -0.85),
+            p(1.0, 0.85),
+            p(-1.0, 0.85),
+            p(-1.0, -0.85),
+        ])
+    };
+    let fill = |pts: Vec<egui::Pos2>| Shape::convex_polygon(pts, stroke.color, Stroke::NONE);
+    let tray = || line(vec![p(-1.0, 0.2), p(-1.0, 1.0), p(1.0, 1.0), p(1.0, 0.2)]);
+    match glyph {
+        Glyph::Terminal => vec![
+            frame(),
+            line(vec![p(-0.6, -0.35), p(-0.2, 0.0), p(-0.6, 0.35)]),
+            seg(p(0.0, 0.4), p(0.55, 0.4)),
+        ],
+        Glyph::Layers => vec![
+            line(vec![
+                p(0.0, -0.95),
+                p(1.0, -0.45),
+                p(0.0, 0.05),
+                p(-1.0, -0.45),
+                p(0.0, -0.95),
+            ]),
+            line(vec![p(-1.0, 0.05), p(0.0, 0.55), p(1.0, 0.05)]),
+            line(vec![p(-1.0, 0.45), p(0.0, 0.95), p(1.0, 0.45)]),
+        ],
+        Glyph::Tunnel => vec![
+            seg(p(-1.0, -0.4), p(1.0, -0.4)),
+            line(vec![p(0.55, -0.8), p(1.0, -0.4), p(0.55, 0.0)]),
+            seg(p(1.0, 0.4), p(-1.0, 0.4)),
+            line(vec![p(-0.55, 0.0), p(-1.0, 0.4), p(-0.55, 0.8)]),
+        ],
+        Glyph::Import => vec![
+            tray(),
+            seg(p(0.0, -1.0), p(0.0, 0.5)),
+            line(vec![p(-0.45, 0.05), p(0.0, 0.5), p(0.45, 0.05)]),
+        ],
+        Glyph::Export => vec![
+            tray(),
+            seg(p(0.0, 0.5), p(0.0, -1.0)),
+            line(vec![p(-0.45, -0.55), p(0.0, -1.0), p(0.45, -0.55)]),
+        ],
+        Glyph::Document => vec![
+            line(vec![
+                p(-0.75, -1.0),
+                p(0.3, -1.0),
+                p(0.75, -0.55),
+                p(0.75, 1.0),
+                p(-0.75, 1.0),
+                p(-0.75, -1.0),
+            ]),
+            line(vec![p(0.3, -1.0), p(0.3, -0.55), p(0.75, -0.55)]),
+            seg(p(-0.4, 0.0), p(0.4, 0.0)),
+            seg(p(-0.4, 0.45), p(0.4, 0.45)),
+        ],
+        Glyph::History => {
+            // 圆弧从 210°(左上)顺时针扫 300°。逆时针读的话 210° 是终点,
+            // 到达时的走向是左下;两翼朝反方向(-60°,右上)各偏 ±40°。
+            let pts = arc(0.0, 0.0, 0.8, 210.0, 300.0);
+            let tip = pts[0];
+            let wing = |da: f32| {
+                let a = (-60.0 + da).to_radians();
+                pos2(tip.x + h * 0.35 * a.cos(), tip.y + h * 0.35 * a.sin())
+            };
+            vec![
+                line(pts),
+                line(vec![wing(40.0), tip, wing(-40.0)]),
+                line(vec![p(0.0, -0.45), p(0.0, 0.0), p(0.35, 0.25)]),
+            ]
+        }
+        Glyph::Power => vec![
+            line(arc(0.0, 0.1, 0.8, -60.0, 300.0)),
+            seg(p(0.0, -1.0), p(0.0, -0.1)),
+        ],
+        Glyph::PanelTop => vec![
+            frame(),
+            fill(vec![
+                p(-1.0, -0.85),
+                p(1.0, -0.85),
+                p(1.0, -0.4),
+                p(-1.0, -0.4),
+            ]),
+        ],
+        Glyph::PanelLeft => vec![
+            frame(),
+            fill(vec![
+                p(-1.0, -0.85),
+                p(-0.45, -0.85),
+                p(-0.45, 0.85),
+                p(-1.0, 0.85),
+            ]),
+        ],
+        Glyph::CloudUp => {
+            let mut pts = arc(-0.5, 0.25, 0.35, 90.0, 180.0);
+            pts.extend(arc(0.05, -0.1, 0.5, 200.0, 140.0));
+            pts.extend(arc(0.55, 0.25, 0.35, -90.0, 180.0));
+            pts.push(p(-0.5, 0.6));
+            vec![
+                line(pts),
+                seg(p(0.0, 0.45), p(0.0, -0.05)),
+                line(vec![p(-0.25, 0.2), p(0.0, -0.05), p(0.25, 0.2)]),
+            ]
+        }
+        Glyph::Gear => {
+            let mut v = vec![
+                Shape::circle_stroke(c, h * 0.3, stroke),
+                Shape::circle_stroke(c, h * 0.62, stroke),
+            ];
+            for k in 0..8 {
+                let a = (k as f32 * 45.0).to_radians();
+                v.push(seg(
+                    p(0.62 * a.cos(), 0.62 * a.sin()),
+                    p(0.95 * a.cos(), 0.95 * a.sin()),
+                ));
+            }
+            v
+        }
+        Glyph::Unplug => vec![
+            seg(p(-1.0, 0.0), p(-0.3, 0.0)),
+            seg(p(-0.3, -0.5), p(-0.3, 0.5)),
+            seg(p(-0.3, -0.25), p(-0.05, -0.25)),
+            seg(p(-0.3, 0.25), p(-0.05, 0.25)),
+            seg(p(1.0, 0.0), p(0.3, 0.0)),
+            seg(p(0.3, -0.5), p(0.3, 0.5)),
+        ],
+        _ => unreachable!("menu_shapes 只画 F383 那批"),
+    }
+}
+
+/// F383:带图标的菜单项。图标槽固定在文字左边,文字用 `leading_space` 让开 ——
+/// 走的仍是 egui 自己的 `Button`(menu 的整行宽、hover 底色、禁用灰、点击后
+/// 收菜单的行为一样不少)。文字色用 `PLACEHOLDER`,由 `Button` 按交互态填。
+pub fn menu_item(ui: &mut Ui, glyph: Glyph, text: &str, enabled: bool) -> Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let side = font.size;
+    let gap = ui.spacing().icon_spacing.max(4.0);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        side + gap,
+        egui::TextFormat {
+            font_id: font,
+            color: egui::Color32::PLACEHOLDER,
+            ..Default::default()
+        },
+    );
+    let resp = ui.add_enabled(enabled, egui::Button::new(job));
+    if ui.is_rect_visible(resp.rect) {
+        let pad = ui.spacing().button_padding.x;
+        let r = Rect::from_center_size(
+            pos2(resp.rect.left() + pad + side / 2.0, resp.rect.center().y),
+            Vec2::splat(side),
+        );
+        // 禁用态同 `icon_button`:`inactive` 那档再 `gray_out`。
+        let color = if enabled {
+            ui.style().interact(&resp).text_color()
+        } else {
+            ui.visuals()
+                .gray_out(ui.visuals().widgets.inactive.text_color())
+        };
+        ui.painter()
+            .extend(shapes(r, glyph, Stroke::new(1.2, color)));
+    }
+    resp
 }
 
 /// 纯装饰图标,不可交互。给一行说明性灰字挂个 ⓘ 用。
@@ -711,6 +950,49 @@ mod tests {
     }
 
     /// 从形状里抠出所有端点,给上面几个测试用。
+    /// F383:菜单项的文字让出图标槽,图标画在槽里、不压字;文字色交给
+    /// `Button` 按交互态填(不是写死的灰)。
+    ///
+    /// 自证会变红:`leading_space` 传 0(第一条红);或 `TextFormat` 不设
+    /// `PLACEHOLDER`(文字成了默认灰,第三条红)。
+    #[test]
+    fn a_menu_item_leaves_room_for_its_icon_left_of_the_text() {
+        let ctx = egui::Context::default();
+        let mut btn = Rect::NOTHING;
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                btn = menu_item(ui, Glyph::Gear, "设置…", true).rect;
+            });
+        });
+        let text = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "设置…" => Some(t.clone()),
+                _ => None,
+            })
+            .expect("没画出菜单文字");
+        let glyph_left = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Circle(cs) => Some(cs.center.x + cs.radius),
+                _ => None,
+            })
+            .fold(f32::MIN, f32::max);
+        let first_char_x = text.pos.x + text.galley.rows[0].glyphs[0].pos.x;
+        assert!(
+            first_char_x > glyph_left,
+            "文字压在图标上:{first_char_x} <= {glyph_left}"
+        );
+        assert!(glyph_left > btn.left(), "图标不在按钮里");
+        assert_ne!(
+            text.galley.job.sections[0].format.color,
+            egui::Color32::GRAY,
+            "文字色写死成默认灰,hover/禁用不会变"
+        );
+    }
+
     fn points_of(shapes: &[egui::Shape]) -> Vec<egui::Pos2> {
         let mut out = Vec::new();
         for s in shapes {
