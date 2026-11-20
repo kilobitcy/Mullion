@@ -532,7 +532,10 @@ fn menu_shapes(c: egui::Pos2, h: f32, glyph: Glyph, stroke: Stroke) -> Vec<Shape
 /// 收菜单的行为一样不少)。文字色用 `PLACEHOLDER`,由 `Button` 按交互态填。
 pub fn menu_item(ui: &mut Ui, glyph: Glyph, text: &str, enabled: bool) -> Response {
     let font = egui::TextStyle::Button.resolve(ui.style());
+    // 可见笔画跨度 ≈ 字号。`shapes` 按 `INSET` 收边、只画中间 `1 - 2·INSET`,
+    // 直接拿字号当 rect 边长会缩成 6px 左右的小点 —— 反推 rect,留位只按可见宽。
     let side = font.size;
+    let rect_side = side / (1.0 - 2.0 * INSET);
     let gap = ui.spacing().icon_spacing.max(4.0);
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -549,7 +552,7 @@ pub fn menu_item(ui: &mut Ui, glyph: Glyph, text: &str, enabled: bool) -> Respon
         let pad = ui.spacing().button_padding.x;
         let r = Rect::from_center_size(
             pos2(resp.rect.left() + pad + side / 2.0, resp.rect.center().y),
-            Vec2::splat(side),
+            Vec2::splat(rect_side),
         );
         // 禁用态同 `icon_button`:`inactive` 那档再 `gray_out`。
         let color = if enabled {
@@ -559,7 +562,7 @@ pub fn menu_item(ui: &mut Ui, glyph: Glyph, text: &str, enabled: bool) -> Respon
                 .gray_out(ui.visuals().widgets.inactive.text_color())
         };
         ui.painter()
-            .extend(shapes(r, glyph, Stroke::new(1.2, color)));
+            .extend(shapes(r, glyph, Stroke::new(1.4, color)));
     }
     resp
 }
@@ -990,6 +993,43 @@ mod tests {
             text.galley.job.sections[0].format.color,
             egui::Color32::GRAY,
             "文字色写死成默认灰,hover/禁用不会变"
+        );
+    }
+
+    /// 菜单图标的可见跨度要与字号相当。实报:按字号当 rect 边长传进 `shapes`,
+    /// 收边之后只剩 6px 上下,菜单里看着像个小点。
+    ///
+    /// 自证会变红:把 `menu_item` 里的 `rect_side` 改回 `side`。
+    #[test]
+    fn a_menu_icon_is_about_as_big_as_the_text_next_to_it() {
+        let ctx = egui::Context::default();
+        let mut size = 0.0;
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                size = egui::TextStyle::Button.resolve(ui.style()).size;
+                menu_item(ui, Glyph::Gear, "设置…", true);
+            });
+        });
+        let shapes: Vec<egui::Shape> = out
+            .shapes
+            .iter()
+            .map(|c| c.shape.clone())
+            .filter(|s| {
+                !matches!(
+                    s,
+                    egui::Shape::Text(_) | egui::Shape::Rect(_) | egui::Shape::Noop
+                )
+            })
+            .collect();
+        let pts = points_of(&shapes);
+        assert!(!pts.is_empty(), "没画出图标");
+        let (lo, hi) = pts.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+            (lo.min(p.x), hi.max(p.x))
+        });
+        assert!(
+            hi - lo >= size * 0.8,
+            "图标横向只有 {} px,字号 {size}",
+            hi - lo
         );
     }
 
