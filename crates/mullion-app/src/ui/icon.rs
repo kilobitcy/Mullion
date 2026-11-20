@@ -85,6 +85,24 @@ impl Glyph {
 /// 图标笔画占 rect 的比例。留边是为了让图标在按钮里不顶着边框。
 const INSET: f32 = 0.28;
 
+/// F382:转圈 —— 一段 270° 的弧,`phase`(秒)每秒转一圈。按时间算角度而
+/// 不是按帧数:帧率随负载变,按帧转会忽快忽慢。纯折线,零字体依赖(T9)。
+pub fn spinner(rect: Rect, phase: f64, stroke: Stroke) -> Shape {
+    let side = rect.width().min(rect.height());
+    let c = rect.center();
+    let r = side * (0.5 - INSET);
+    let start = (phase.fract() * std::f64::consts::TAU) as f32;
+    const N: usize = 18;
+    let span = std::f32::consts::TAU * 0.75;
+    let points = (0..=N)
+        .map(|i| {
+            let a = start + span * i as f32 / N as f32;
+            pos2(c.x + r * a.cos(), c.y + r * a.sin())
+        })
+        .collect();
+    Shape::line(points, stroke)
+}
+
 /// 把一个图标摊成 epaint 形状。纯函数,不碰 `Ui`。
 ///
 /// `rect` 是图标的**外框**(通常是按钮内容区的正方形部分),所有端点保证

@@ -15947,8 +15947,14 @@ impl ApplicationHandler<UserEvent> for App {
                                                         .filter(|p| !p.host_pending)
                                                         .and_then(|p| ws.hosts.get(p.host_ix))
                                                         .map(|h| {
-                                                            crate::node_stats::pieces(
-                                                                &h.stats.snapshot(),
+                                                            // F382:手动刷新期间国家格转圈。
+                                                            crate::node_stats::with_spinner(
+                                                                crate::node_stats::pieces(
+                                                                    &h.stats.snapshot(),
+                                                                ),
+                                                                h.stats.country_spinning(
+                                                                    std::time::Instant::now(),
+                                                                ),
                                                             )
                                                         })
                                                         .unwrap_or_default(),
@@ -16366,7 +16372,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     if let Some(h) =
                                         ws.pane(pane).and_then(|p| ws.hosts.get(p.host_ix))
                                     {
-                                        h.stats.refresh_country_now();
+                                        h.stats.refresh_country_now(std::time::Instant::now());
                                     }
                                 }
                             }
@@ -25289,7 +25295,8 @@ mod tests {
         let at = production
             .find("stats: ws")
             .expect("找不到 TitleView 构造点的 stats 字段");
-        let window = &production[at..(at + 450).min(production.len())];
+        // F382 往这段里插了 `with_spinner` 一层,窗口从 450 放到 900。
+        let window = &production[at..(at + 900).min(production.len())];
         assert!(
             window.contains(".filter(|p| !p.host_pending)"),
             "stats 没有守 host_pending —— 占位 pane 会借主叶子那台机器的数字:{window}"
@@ -25297,6 +25304,11 @@ mod tests {
         assert!(
             window.contains("crate::node_stats::pieces("),
             "stats 没有走 node_stats::pieces 排版:{window}"
+        );
+        // F382:手动刷新的转圈要从同一台机器的 `StatsCell` 读,接不上就永远不转。
+        assert!(
+            window.contains("h.stats.country_spinning("),
+            "国家格转圈没接上 StatsCell:{window}"
         );
     }
 

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(10);
 pub const COUNTRY_EVERY: Duration = Duration::from_secs(300);
+/// F382:手动刷新转圈的硬上限。
+pub const SPIN_CAP: Duration = Duration::from_secs(30);
 /// exec 整体超时。挂住的 exec 不超时的话 `busy` 永远置着,这条连接从此不再采样。
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 pub const WARN_PCT: u8 = 90;
@@ -214,6 +216,9 @@ struct Inner {
     /// F307:上一次采样的 CPU 累计计数,下一次拿它做差。`reset_schedule`
     /// 清掉 —— 重连后的第一个样本不许跟断线前的计数做差。
     cpu_base: Option<CpuTimes>,
+    /// F382:用户点国家格的时刻。结果回来(Ok/Failed 都算)、`reset_schedule`
+    /// 清;在这期间国家格转圈。5 分钟一次的自动刷新不置它 —— 不转。
+    country_manual_since: Option<Instant>,
     /// F298 复核:`reset_schedule` 每次都递增。换连接(重连/换节点)之后,
     /// 挂在旧连接上、迟迟才回来的探针带的是**旧世代号**——`finish_sample`/
     /// `finish_country` 拿它跟当前世代比,对不上就整条丢弃(不写快照、不清
@@ -323,10 +328,20 @@ impl StatsCell {
         }
         g.snap.country = c;
         g.country_busy = false;
+        g.country_manual_since = None;
     }
-    /// 用户点了国家那格:下一次 tick 立刻取(在途时不叠发)。
-    pub fn refresh_country_now(&self) {
-        self.lock().country_at = None;
+    /// 用户点了国家那格:下一次 tick 立刻取(在途时不叠发),并开始转圈(F382)。
+    pub fn refresh_country_now(&self, now: Instant) {
+        let mut g = self.lock();
+        g.country_at = None;
+        g.country_manual_since = Some(now);
+    }
+    /// F382:国家格此刻该不该转圈。硬上限 [`SPIN_CAP`] —— 标志万一漏清,
+    /// 也不许永远转下去(转圈期间每 100ms 一帧,永远转 = 永远不空闲)。
+    pub fn country_spinning(&self, now: Instant) -> bool {
+        self.lock()
+            .country_manual_since
+            .is_some_and(|at| now.saturating_duration_since(at) < SPIN_CAP)
     }
     /// 断线重连换了 handle:两项都立刻重取,旧值留着(不闪空)。世代号
     /// 递增——挂在旧连接上还在途的探针,回来时会因为世代对不上被丢弃。
@@ -337,6 +352,7 @@ impl StatsCell {
         g.sample_busy = false;
         g.country_busy = false;
         g.cpu_base = None;
+        g.country_manual_since = None;
         g.generation = g.generation.wrapping_add(1);
     }
 }
@@ -349,6 +365,20 @@ pub struct Piece {
     pub warn: bool,
     /// 点它刷新国家。
     pub is_country: bool,
+    /// F382:国家格正在等手动刷新的结果 —— 画转圈不画字。`pieces` 恒给
+    /// `false`,由调用方按 [`StatsCell::country_spinning`] 用 [`with_spinner`] 置。
+    pub spinning: bool,
+}
+
+/// F382:把「正在手动刷新」盖到国家格上。没有国家格(还没取到过)时不动。
+pub fn with_spinner(mut ps: Vec<Piece>, spinning: bool) -> Vec<Piece> {
+    for p in ps.iter_mut().filter(|p| p.is_country) {
+        p.spinning = spinning;
+        if spinning {
+            p.hover = "正在查询出口国家…".into();
+        }
+    }
+    ps
 }
 
 fn gib(kb: u64) -> String {
@@ -364,12 +394,14 @@ pub fn pieces(s: &Snapshot) -> Vec<Piece> {
             hover: "CPU 占用(最近一个采样周期的平均,全部核合计)".into(),
             warn: *p >= WARN_PCT,
             is_country: false,
+            spinning: false,
         }),
         Reading::Failed(why) => out.push(Piece {
             text: "CPU --".into(),
             hover: why.clone(),
             warn: false,
             is_country: false,
+            spinning: false,
         }),
         Reading::Unknown | Reading::Absent => {}
     }
@@ -379,12 +411,14 @@ pub fn pieces(s: &Snapshot) -> Vec<Piece> {
             hover: format!("{label}已用 {} / {}", gib(u.used_kb), gib(u.total_kb)),
             warn: u.pct() >= WARN_PCT,
             is_country: false,
+            spinning: false,
         }),
         Reading::Failed(why) => out.push(Piece {
             text: format!("{label} --"),
             hover: why.clone(),
             warn: false,
             is_country: false,
+            spinning: false,
         }),
         Reading::Unknown | Reading::Absent => {}
     };
@@ -396,12 +430,14 @@ pub fn pieces(s: &Snapshot) -> Vec<Piece> {
             hover: "远端出口国家(ipinfo.io),点击刷新".into(),
             warn: false,
             is_country: true,
+            spinning: false,
         }),
         Reading::Failed(why) => out.push(Piece {
             text: "--".into(),
             hover: format!("{why}\n点击重试"),
             warn: false,
             is_country: true,
+            spinning: false,
         }),
         Reading::Unknown | Reading::Absent => {}
     }
@@ -535,7 +571,7 @@ mod tests {
         );
         c.finish_sample(0, Reading::Absent, Reading::Absent);
         assert!(!c.plan(now).sample, "刚采过,10 秒内不该再采");
-        c.refresh_country_now();
+        c.refresh_country_now(now);
         c.finish_country(0, Reading::Unknown);
         assert!(c.plan(now).country, "点了刷新,下一次 tick 该立刻取");
     }
@@ -877,5 +913,53 @@ mod tests {
             .unwrap();
         let out = String::from_utf8_lossy(&out.stdout);
         assert!(matches!(parse_cpu(&out), Reading::Ok(_)), "stdout={out:?}");
+    }
+
+    /// F382:手动刷新从点击转到结果回来(Ok/Failed 都算);自动刷新不转;
+    /// 换连接清掉;漏清也最多转 `SPIN_CAP`。
+    ///
+    /// 自证会变红:`finish_country` 不清标志(第二段红);`reset_schedule` 不清
+    /// (第三段红);`country_spinning` 去掉上限(最后一条红)。
+    #[test]
+    fn the_country_spins_from_a_manual_click_until_any_result_comes_back() {
+        let c = StatsCell::default();
+        let now = Instant::now();
+        let g = c.plan(now).generation;
+        assert!(!c.country_spinning(now), "自动刷新不该转");
+        c.finish_country(g, Reading::Ok("JP".into()));
+
+        c.refresh_country_now(now);
+        assert!(c.country_spinning(now));
+        let g = c.plan(now).generation;
+        assert!(c.country_spinning(now), "发出去之后、结果回来之前还在转");
+        c.finish_country(g, Reading::Failed("超时".into()));
+        assert!(!c.country_spinning(now), "失败也是新结果,该停");
+
+        c.refresh_country_now(now);
+        c.reset_schedule();
+        assert!(!c.country_spinning(now), "换连接后旧的点击不该接着转");
+
+        c.refresh_country_now(now);
+        assert!(!c.country_spinning(now + SPIN_CAP), "到上限还在转");
+    }
+
+    /// F382:只有国家格转,别的格不受影响;转时 hover 说在查。
+    #[test]
+    fn only_the_country_piece_spins() {
+        let s = Snapshot {
+            cpu: Reading::Unknown,
+            mem: Reading::Ok(Usage {
+                used_kb: 1,
+                total_kb: 2,
+            }),
+            disk: Reading::Unknown,
+            country: Reading::Ok("JP".into()),
+        };
+        let ps = with_spinner(pieces(&s), true);
+        assert!(ps.iter().all(|p| p.spinning == p.is_country));
+        assert!(ps
+            .iter()
+            .any(|p| p.is_country && p.hover.contains("正在查询")));
+        assert!(with_spinner(pieces(&s), false).iter().all(|p| !p.spinning));
     }
 }

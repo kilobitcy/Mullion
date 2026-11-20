@@ -318,6 +318,7 @@ fn country_cell(
     text: &str,
     font: egui::FontId,
     color: egui::Color32,
+    spinning: bool,
     t: &Theme,
 ) -> egui::Response {
     let galley = ui
@@ -338,8 +339,23 @@ fn country_cell(
         font,
         country_text_color(t, color, hovered),
     );
-    let at = rect.center() - galley.size() / 2.0;
-    ui.painter().galley(at, galley, color);
+    if spinning {
+        // F382:等手动刷新的结果。占原来文字的位置(宽度不变,标题条不跳),
+        // 每 100ms 要一帧 —— 只在转的时候要,不转零帧(T3/T7)。
+        let side = galley.size().y;
+        let r = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+        let phase = ui.input(|i| i.time);
+        ui.painter().add(crate::ui::icon::spinner(
+            r,
+            phase,
+            egui::Stroke::new(1.5, country_text_color(t, color, hovered)),
+        ));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+    } else {
+        let at = rect.center() - galley.size() / 2.0;
+        ui.painter().galley(at, galley, color);
+    }
     resp
 }
 
@@ -760,6 +776,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, views: &[TitleView<'_>]) -> TitleAct
                                         &p.text,
                                         font.clone(),
                                         color,
+                                        p.spinning,
                                         t,
                                     );
                                     click_rects.push(r.rect);
@@ -1817,6 +1834,62 @@ mod tests {
         let base = theme::c32(t.warn);
         assert_eq!(country_text_color(&t, base, false), base);
         assert_eq!(country_text_color(&t, base, true), theme::c32(t.fg_strong));
+    }
+
+    /// F382:国家格在等手动刷新时画转圈、不画国家字,并每 100ms 要一帧;
+    /// 不转时零额外重绘(T3)。
+    ///
+    /// 自证会变红:删掉 `country_cell` 里的 `request_repaint_after`(第一段红);
+    /// 改成无条件调用(第二段红);转圈时仍画字(「JP」那条红)。
+    #[test]
+    fn a_refreshing_country_spins_and_asks_for_frames_only_while_it_spins() {
+        let run = |spinning: bool| {
+            let views = [TitleView {
+                geom: geom_with_title_width(1, 1200),
+                index: 1,
+                project: None,
+                project_icon: None,
+                host: Some("dev@build-01"),
+                status: PaneStatus::Live,
+                focused: true,
+                appearance: None,
+                cwd_leaf: None,
+                tmux: None,
+                notice: None,
+                drawer: false,
+                stats: crate::node_stats::with_spinner(wide_stats(), spinning),
+                ports: None,
+                attention: false,
+            }];
+            let t = crate::theme::MULLION_DARK;
+            let ctx = egui::Context::default();
+            let mut last = None;
+            for i in 0..3 {
+                let input = egui::RawInput {
+                    time: Some(i as f64),
+                    ..Default::default()
+                };
+                last = Some(ctx.run(input, |ctx| {
+                    show(ctx, &t, &views);
+                }));
+            }
+            last.unwrap()
+        };
+        let draws_jp = |o: &egui::FullOutput| {
+            o.shapes.iter().any(|c| match &c.shape {
+                egui::epaint::Shape::Text(tx) => tx.galley.text() == "JP",
+                _ => false,
+            })
+        };
+        let spin = run(true);
+        assert!(
+            delay(&spin) <= std::time::Duration::from_millis(100),
+            "转圈时没要帧,圈不会动"
+        );
+        assert!(!draws_jp(&spin), "转圈时还在画国家字");
+        let idle = run(false);
+        assert_eq!(delay(&idle), std::time::Duration::MAX, "不转时也在要帧(T3)");
+        assert!(draws_jp(&idle));
     }
 
     /// 自证会变红:国家那格不 `Sense::click()`,或报成 `rehost`。
