@@ -99,6 +99,15 @@ pub enum MemoOut {
     Close,
 }
 
+/// F381:备忘添加时间,按 `off` 换成本地 `YYYY-MM-DD HH:MM`。解析不了(含空串、
+/// 早于 1970 / 超出 u32 秒)给 `None` —— 那一行不画,不放一个 `—` 占位。
+pub(crate) fn added_at(created_at: &str, off: time::UtcOffset) -> Option<String> {
+    let t = time::OffsetDateTime::parse(created_at, &time::format_description::well_known::Rfc3339)
+        .ok()?;
+    let secs = u32::try_from(t.unix_timestamp()).ok()?;
+    Some(crate::localtime::format_unix(secs, off))
+}
+
 /// 列表顺序:新的在上。按 `created_at`(RFC3339,同时区可按字典序比)倒序,
 /// 同一时刻的按原顺序倒着来。
 pub fn ordered(memos: &[Memo]) -> Vec<&Memo> {
@@ -196,7 +205,18 @@ pub fn show(
                                     ) {
                                         out = Some(MemoOut::Remove(m.clone()));
                                     }
-                                    ui.add(egui::Label::new(&m.text).wrap());
+                                    ui.vertical(|ui| {
+                                        ui.add(egui::Label::new(&m.text).wrap());
+                                        if let Some(at) =
+                                            added_at(&m.created_at, crate::localtime::offset())
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(at)
+                                                    .small()
+                                                    .color(theme::c32(t.fg_muted)),
+                                            );
+                                        }
+                                    });
                                 });
                             }
                         });
@@ -377,6 +397,46 @@ mod tests {
         frame(&ctx, &mut d, vec![]);
         frame(&ctx, &mut d, vec![egui::Event::Text("   ".into())]);
         assert_eq!(frame(&ctx, &mut d, vec![key(egui::Key::Enter)]), None);
+    }
+
+    /// F381:添加时间按给定时区换算、只到分钟;解析不了不给。
+    ///
+    /// 自证会变红:去掉 `added_at` 里的时区参数改用 UTC(东八那条红)。
+    #[test]
+    fn the_added_time_is_local_to_the_minute_and_absent_when_unparsable() {
+        let east8 = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+        assert_eq!(
+            added_at("2026-11-20T06:05:59Z", east8).as_deref(),
+            Some("2026-11-20 14:05")
+        );
+        assert_eq!(
+            added_at("2026-11-20T06:05:59Z", time::UtcOffset::UTC).as_deref(),
+            Some("2026-11-20 06:05")
+        );
+        assert_eq!(added_at("", east8), None);
+        assert_eq!(added_at("昨天", east8), None);
+    }
+
+    /// F381:浮层里每条备忘下面画出它的添加时间。
+    ///
+    /// 自证会变红:删掉 `show` 里画 `added_at` 的那个 `ui.label`。
+    #[test]
+    fn each_memo_shows_when_it_was_added() {
+        let ctx = egui::Context::default();
+        let t = crate::theme::MULLION_DARK;
+        let mut d = Some(MemoDraft::new(PaneId(1), &project()));
+        let want = added_at("2026-11-17T00:00:00Z", crate::localtime::offset()).unwrap();
+        let mut seen = false;
+        for _ in 0..2 {
+            let out = ctx.run(egui::RawInput::default(), |ctx| {
+                show(ctx, &t, &mut d, None);
+            });
+            seen = out.shapes.iter().any(|c| match &c.shape {
+                egui::epaint::Shape::Text(tx) => tx.galley.text() == want,
+                _ => false,
+            });
+        }
+        assert!(seen, "没画出 {want}");
     }
 
     /// F367:新的在上。
