@@ -922,7 +922,10 @@ pub fn show_takeover_confirm(
     ask: &TakeoverAsk,
 ) -> Option<bool> {
     use crate::ui::metrics::{SP_M, SP_S};
-    let mut out = None;
+    // F379:只接 Esc = 取消。**不接回车** —— 后果落在别人身上,留一次真点击。
+    let mut out = ctx
+        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        .then_some(false);
     egui::Window::new(TAKEOVER_WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
@@ -985,7 +988,17 @@ pub fn show_open_confirm(
     name: &str,
 ) -> Option<bool> {
     use crate::ui::metrics::{SP_M, SP_S};
-    let mut out = None;
+    // F379:回车 = 继续、Esc = 取消。键在画按钮**之前**消费:组字确认那一下
+    // 回车不算(F314/F316),Esc 消费掉免得再落到别的窗口上。
+    let mut out = ctx.input_mut(|i| {
+        if crate::ui::project_nav::take_enter(i) {
+            Some(true)
+        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+            Some(false)
+        } else {
+            None
+        }
+    });
     egui::Window::new(OPEN_CONFIRM_WINDOW_TITLE)
         .collapsible(false)
         .resizable(false)
@@ -1001,7 +1014,11 @@ pub fn show_open_confirm(
             }
             ui.add_space(SP_M);
             ui.horizontal(|ui| {
-                if ui.button("继续打开").clicked() {
+                // F379:回车落在这颗上 —— 画成强调样式让人看得出来(同 F322 取消归档)。
+                let accent = crate::theme::c32(t.accent);
+                let go = egui::Button::new(egui::RichText::new("继续打开").color(accent))
+                    .stroke(egui::Stroke::new(1.0, accent));
+                if ui.add(go).clicked() {
                     out = Some(true);
                 }
                 ui.add_space(SP_S);
@@ -2386,5 +2403,87 @@ mod tests {
         ui_state.pm_frozen_lamps = None;
         let frame3 = order(&ctx, &mut ui_state, &live);
         assert_eq!(frame3, vec![1, 2], "重新冻结后,亮着灯的项目该置顶");
+    }
+
+    fn key_ev(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn open_confirm_with(events: Vec<egui::Event>) -> Option<bool> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let ask = OpenAsk {
+            project: ProjectId(1),
+            nodes: vec![SessionId(7)],
+            pane: None,
+            reasons: vec!["当前 pane 上有正在跑的程序"],
+        };
+        let mut out = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| out = show_open_confirm(ctx, &t, &ask, "app"),
+        );
+        out
+    }
+
+    fn takeover_with(events: Vec<egui::Event>) -> Option<bool> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let ask = TakeoverAsk {
+            project: "app".into(),
+            clients: 1,
+        };
+        let mut out = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| out = show_takeover_confirm(ctx, &t, &ask),
+        );
+        out
+    }
+
+    /// F379:打开确认框回车 = 继续、Esc = 取消、组字确认那一下回车不算。
+    ///
+    /// 自证会变红:删掉 `show_open_confirm` 开头的键盘分支;或把 `take_enter`
+    /// 换成裸 `key_pressed(Enter)`(第三条红)。
+    #[test]
+    fn enter_continues_and_escape_cancels_the_open_confirm() {
+        assert_eq!(open_confirm_with(vec![]), None);
+        assert_eq!(
+            open_confirm_with(vec![key_ev(egui::Key::Enter)]),
+            Some(true)
+        );
+        assert_eq!(
+            open_confirm_with(vec![key_ev(egui::Key::Escape)]),
+            Some(false)
+        );
+        assert_eq!(
+            open_confirm_with(vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("中".into())),
+                key_ev(egui::Key::Enter),
+            ]),
+            None,
+            "组字确认那一下回车不该打开项目"
+        );
+    }
+
+    /// F379:踢人框只接 Esc,**回车不踢人**。
+    ///
+    /// 自证会变红:给 `show_takeover_confirm` 也接上 `take_enter`。
+    #[test]
+    fn the_takeover_confirm_cancels_on_escape_but_ignores_enter() {
+        assert_eq!(takeover_with(vec![key_ev(egui::Key::Enter)]), None);
+        assert_eq!(takeover_with(vec![key_ev(egui::Key::Escape)]), Some(false));
     }
 }
