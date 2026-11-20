@@ -415,7 +415,7 @@ impl RateMeter {
             None => self.last = Some((now_secs, total_done)),
             Some((t0, b0)) => {
                 let dt = now_secs - t0;
-                // 同一时刻两次采样会算出 inf,ETA 随之变成 NaN 显示成空白。
+                // 同一时刻两次采样会算出 inf,速率随之变成 NaN 显示成空白。
                 if dt > 0.0 {
                     let inst = total_done.saturating_sub(b0) as f64 / dt;
                     self.bps = if self.bps == 0.0 {

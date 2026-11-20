@@ -110,17 +110,28 @@ fn summary_line(s: &Summary, bps: f64) -> String {
         return "全部完成".into();
     }
     let rate = crate::files::human_size(bps as u64);
-    format!("↑{} ↓{} · {rate}/s · {}", s.up, s.down, eta(s, bps))
+    format!(
+        "↑{} ↓{} · {rate}/s · {}",
+        s.up,
+        s.down,
+        percent(s.bytes_done, s.bytes_total)
+    )
 }
 
-/// `剩余 00:41`。速率还没估出来时**不瞎猜** —— 一个跳来跳去的 ETA
-/// 比没有 ETA 更糟,用户会照着它安排事情。
-fn eta(s: &Summary, bps: f64) -> String {
-    if bps <= 1.0 || s.bytes_total <= s.bytes_done {
-        return "剩余 --:--".into();
-    }
-    let secs = ((s.bytes_total - s.bytes_done) as f64 / bps) as u64;
-    format!("剩余 {:02}:{:02}", secs / 60, secs % 60)
+/// F380:进度百分比 `37.42%`,**向下取整**到 0.01,且没传完(`done < total`)
+/// 时封顶 `99.99%` —— 四舍五入出来的「100.00% 但还在传」会让人以为卡住了。
+/// 分母为 0(还没量到大小)给 `0.00%`。只给还在跑的那些用:跑完的行
+/// 有自己的「完成」字样,汇总行在 `!busy` 时也不走这里。
+fn percent(done: u64, total: u64) -> String {
+    let bp = if total == 0 {
+        0
+    } else if done >= total {
+        10_000
+    } else {
+        // u128:几十 GB 的文件乘 10000 会溢出 u64。
+        ((done as u128 * 10_000 / total as u128) as u64).min(9_999)
+    };
+    format!("{}.{:02}%", bp / 100, bp % 100)
 }
 
 /// 每一条右侧那一格文字。**失败要写原因**,不是一个红点 —— 传输失败的
@@ -128,10 +139,7 @@ fn eta(s: &Summary, bps: f64) -> String {
 fn state_text(j: &Job) -> String {
     match &j.state {
         JobState::Pending => "排队中".into(),
-        JobState::Running => {
-            let pct = (j.done * 100).checked_div(j.total).unwrap_or(0).min(100);
-            format!("{pct}%")
-        }
+        JobState::Running => percent(j.done, j.total),
         JobState::Conflict => "等待处置".into(),
         JobState::Done => "完成".into(),
         JobState::Skipped => "已跳过".into(),
@@ -278,18 +286,34 @@ mod tests {
         assert!(ts.contains("没权限"), "失败原因得写出来:{ts}");
     }
 
-    /// 速率没估出来时不给一个瞎猜的 ETA。
+    /// F380:两位小数、向下取整、没传完不到 100、分母 0 给 0。
+    ///
+    /// 自证会变红:改成四舍五入(第三条红);去掉 `done >= total` 前的封顶(第二条红)。
     #[test]
-    fn the_eta_stays_blank_until_the_rate_is_known() {
+    fn progress_is_a_floored_two_decimal_percentage_that_never_claims_done_early() {
+        assert_eq!(percent(0, 0), "0.00%");
+        assert_eq!(percent(9_999_999, 10_000_000), "99.99%");
+        assert_eq!(percent(37_429, 100_000), "37.42%");
+        assert_eq!(percent(1_000, 1_000), "100.00%");
+        assert_eq!(percent(1, 3), "33.33%");
+        // 40 GB 文件:乘 10000 要走 u128,不能溢出成乱数。
+        assert_eq!(percent(20 << 30, 40 << 30), "50.00%");
+    }
+
+    /// F380:汇总行不再给剩余时间,给总进度;速率留着。
+    #[test]
+    fn the_summary_shows_overall_percentage_instead_of_time_left() {
         let s = Summary {
             up: 1,
             down: 0,
-            bytes_done: 0,
+            bytes_done: 250,
             bytes_total: 1000,
             busy: true,
             active: 1,
         };
-        assert!(eta(&s, 0.0).contains("--:--"), "速率未知时不该给数字");
-        assert_eq!(eta(&s, 100.0), "剩余 00:10");
+        let line = summary_line(&s, 100.0);
+        assert!(line.contains("25.00%"), "{line}");
+        assert!(line.contains("/s"), "速率要留着:{line}");
+        assert!(!line.contains("剩余"), "{line}");
     }
 }
