@@ -2469,6 +2469,7 @@ mod tests {
                 focus_pending: true,
                 error: None,
                 dirty_hint: false,
+                editing: None,
             }),
             ..Default::default()
         };

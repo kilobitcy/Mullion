@@ -5527,7 +5527,17 @@ impl App {
             Modal::ExitConfirm => self.ui.exit_pending = false,
             Modal::Rehost => self.ui.rehost = None,
             Modal::ProjectPick => self.ui.project_pick = None,
-            Modal::MemoPopup => self.ui.memo_popup = None,
+            // F384:点外关浮层时,正在改的那条备忘自动存(设计定的「点外 = 存」)。
+            // 存失败的话浮层已经关了、内联红字没处显示 —— 改飘 toast。
+            Modal::MemoPopup => {
+                if let Some(out) = self.ui.memo_popup.as_mut().and_then(|d| d.commit_edit()) {
+                    self.apply_memo_out(out);
+                    if let Some(e) = self.ui.memo_popup.as_ref().and_then(|d| d.error.clone()) {
+                        self.ui.set_toast(crate::ui::toast::Kind::Warn, e);
+                    }
+                }
+                self.ui.memo_popup = None;
+            }
             Modal::TunnelPopup => self.ui.tunnel_popup = None,
             Modal::Unlock
             | Modal::HostKey
@@ -10570,6 +10580,20 @@ impl App {
                 store.add_project_memo(id, text, &now);
             }
             MemoOut::Remove(m) => store.remove_project_memo(id, &m),
+            // F384:原条已不在(别的实例删了/改了)—— 不写盘、不复活,
+            // 按库里的现状刷新并内联报错。
+            MemoOut::Edit { old, new } => {
+                if !store.edit_project_memo(id, &old, new) {
+                    let fresh = store.projects().iter().find(|p| p.id == id).cloned();
+                    if let Some(d) = self.ui.memo_popup.as_mut() {
+                        if let Some(p) = fresh {
+                            d.refresh(&p);
+                        }
+                        d.error = Some("这条备忘已在别处被改过或删掉,没有保存".into());
+                    }
+                    return;
+                }
+            }
             MemoOut::SaveNote(note) => store.set_project_note(id, note),
         }
         let saved = store.save();
@@ -20130,9 +20154,31 @@ mod tests {
             "store.save()",
             "d.refresh(&p)",
             "d.error = Some(",
+            // F384:改正文走全等匹配的 mutator,找不到不写盘。
+            "if !store.edit_project_memo(id, &old, new) {",
         ] {
             assert!(out.contains(want), "apply_memo_out 里缺 `{want}`");
         }
+    }
+
+    /// F384:点外关备忘浮层时,正在改的那条要先存(设计定「点外 = 存」),
+    /// 存失败改飘 toast —— 浮层已关,内联红字没处显示。
+    ///
+    /// 自证会变红:把 `dismiss` 里 MemoPopup 分支换回裸 `self.ui.memo_popup = None,`。
+    #[test]
+    fn dismissing_the_memo_popup_saves_the_memo_being_edited() {
+        let src = strip_comments(prod_src());
+        let body = body_of(&src, "fn dismiss(");
+        let at = body
+            .find("Modal::MemoPopup => {")
+            .expect("dismiss(MemoPopup) 还是裸清空 —— 改到一半的备忘点外就丢");
+        let arm = &body[at..at + 500];
+        assert!(arm.contains("d.commit_edit()") && arm.contains("self.apply_memo_out(out)"));
+        assert!(arm.contains("self.ui.set_toast("), "存失败没地方报");
+        assert!(
+            arm.find("self.apply_memo_out(out)") < arm.find("self.ui.memo_popup = None"),
+            "先关了浮层再存,apply_memo_out 拿不到项目 id"
+        );
     }
 
     /// F366:只有「选了覆盖的下载」失败才进告警框;上传、没选覆盖、冲突/取消

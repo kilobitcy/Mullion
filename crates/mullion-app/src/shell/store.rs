@@ -272,6 +272,16 @@ impl SessionStore {
         self.vault.remove_project_memo(id, memo);
     }
 
+    /// F384:见 `Vault::edit_project_memo`。`false` = 原条已不在。
+    pub fn edit_project_memo(
+        &mut self,
+        id: mullion_store::ProjectId,
+        old: &mullion_store::Memo,
+        text: String,
+    ) -> bool {
+        self.vault.edit_project_memo(id, old, text)
+    }
+
     pub fn set_project_note(&mut self, id: mullion_store::ProjectId, note: String) {
         self.vault.set_project_note(id, note);
     }

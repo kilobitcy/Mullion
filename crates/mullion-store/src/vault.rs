@@ -1096,6 +1096,29 @@ impl Vault {
         }
     }
 
+    /// F384:改一条备忘的正文。匹配规则同 [`Self::remove_project_memo`]
+    /// (`text + created_at` 全等、第一条);`created_at` 不动,排序随之不变。
+    /// 找不到原条(别的实例刚删了 / 刚改了)返回 `false` 且什么都不写 ——
+    /// 调用方报错,**不许**退化成新增一条把它复活。
+    pub fn edit_project_memo(
+        &mut self,
+        id: crate::project::ProjectId,
+        old: &crate::project::Memo,
+        text: String,
+    ) -> bool {
+        self.sync_from_disk_if_untouched();
+        let Some(slot) = self.projects.iter_mut().find(|p| p.id == id) else {
+            return false;
+        };
+        match slot.memos.iter_mut().find(|m| *m == old) {
+            Some(m) => {
+                m.text = text;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// F367:整段替换项目备注(note)。
     pub fn set_project_note(&mut self, id: crate::project::ProjectId, note: String) {
         self.sync_from_disk_if_untouched();
@@ -3840,6 +3863,33 @@ path = "/var/log"
             before,
             "只许动 memos / note"
         );
+    }
+
+    /// F384:改一条备忘只换正文、时间不动;原条已不在时什么都不写、报 `false`。
+    ///
+    /// 自证会变红:找不到时改成 push 一条新的(第二段红);或把 `created_at`
+    /// 一并刷成新值(第一段红)。
+    #[test]
+    fn editing_a_memo_keeps_its_time_and_never_resurrects_a_deleted_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut v = Vault::open(dir.path().to_path_buf(), &key()).unwrap();
+        let id = v.add_project("web".into(), "/srv/web".into(), "2026-11-01T00:00:00Z");
+        v.add_project_memo(id, "旧字".into(), "2026-11-17T08:00:00Z");
+        v.add_project_memo(id, "另一条".into(), "2026-11-17T09:00:00Z");
+        let old = v.projects()[0].memos[0].clone();
+        assert!(v.edit_project_memo(id, &old, "新字".into()));
+        let p = v.projects().iter().find(|p| p.id == id).unwrap();
+        assert_eq!(p.memos[0].text, "新字");
+        assert_eq!(p.memos[0].created_at, "2026-11-17T08:00:00Z");
+        assert_eq!(p.memos[1].text, "另一条");
+
+        let before = p.memos.clone();
+        assert!(
+            !v.edit_project_memo(id, &old, "再改".into()),
+            "原条已经不在了"
+        );
+        let p = v.projects().iter().find(|p| p.id == id).unwrap();
+        assert_eq!(p.memos, before, "找不到原条时不该写任何东西");
     }
 
     #[test]
