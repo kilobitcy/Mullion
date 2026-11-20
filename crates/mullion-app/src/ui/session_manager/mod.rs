@@ -1602,7 +1602,7 @@ mod tunnel_ui_tests {
 
         let (_c, out) = run(&mut open(ManagerMode::Tunnels), &sessions, &tunnels);
         let texts = all_text(&out.shapes);
-        assert!(has(&texts, "本地 3306"), "隧道行没画出来: {texts:?}");
+        assert!(has(&texts, "本地 :3306"), "隧道行没画出来: {texts:?}");
         assert!(
             !has(&texts, "生产主控") || has(&texts, "经 生产主控"),
             "隧道页不该画会话列表行(只允许作为「经由」出现): {texts:?}"
@@ -1612,7 +1612,7 @@ mod tunnel_ui_tests {
         let (_c, out) = run(&mut open(ManagerMode::Sessions), &sessions, &tunnels);
         let texts = all_text(&out.shapes);
         assert!(has(&texts, "生产主控"), "会话行没画出来: {texts:?}");
-        assert!(!has(&texts, "本地 3306"), "会话页不该画隧道行: {texts:?}");
+        assert!(!has(&texts, "本地 :3306"), "会话页不该画隧道行: {texts:?}");
     }
 
     // ---- F311:备注框固定 3 行,超出框内滚动 ------------------------------

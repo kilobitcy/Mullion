@@ -58,16 +58,57 @@ pub(crate) fn row_title(rec: &TunnelRecord) -> String {
     }
 }
 
-/// 一行的副标题:引用的会话。悬垂时说清楚是**引用**坏了,不是隧道配错了。
+/// F385:列表里的转发串。与 `forward_summary` 同序,只是**本机监听端口前加 `:`**——
+/// 名称占了第一行之后,第二行一眼要抓的是端口,`:3306` 比裸 `3306` 更像端口。
 ///
-/// F268:起了名的行,转发串**降级到这里** —— 名字占了主标题,转发串仍然是
-/// 判断「这条是不是我要找的那条」的关键信息,不能因为起了名就看不见了。
-fn row_subtitle(
+/// 只用在列表里;状态栏浮层、删除确认框等仍走 `forward_summary`(不扩大改动面)。
+pub(crate) fn forward_line(rec: &TunnelRecord) -> String {
+    match &rec.kind {
+        TunnelKind::Local {
+            target_host,
+            target_port,
+            ..
+        } => format!(
+            "本地 :{} → {}:{}",
+            rec.listen_port, target_host, target_port
+        ),
+        TunnelKind::Remote {
+            target_host,
+            target_port,
+            ..
+        } => format!(
+            "远端 :{} → {}:{}",
+            rec.listen_port, target_host, target_port
+        ),
+        TunnelKind::Dynamic => format!("动态 :{} (SOCKS5)", rec.listen_port),
+    }
+}
+
+/// F385:列表第一行的标题。起了名用名字,没起名退回(带 `:` 的)转发串 ——
+/// 理由同 `row_title`。
+fn list_title(rec: &TunnelRecord) -> String {
+    if rec.name.trim().is_empty() {
+        forward_line(rec)
+    } else {
+        rec.name.trim().to_string()
+    }
+}
+
+/// F385:列表第二行。只有起了名的才有 —— 没起名时标题本身就是转发串,
+/// 再画一遍等于同一句话占两行。
+///
+/// F268:转发串是判断「这条是不是我要找的那条」的关键信息,不能因为起了名就看不见。
+fn forward_row(rec: &TunnelRecord) -> Option<String> {
+    (!rec.name.trim().is_empty()).then(|| forward_line(rec))
+}
+
+/// 列表第三行:引用的会话。悬垂时说清楚是**引用**坏了,不是隧道配错了。
+fn via_line(
     rec: &TunnelRecord,
     sessions: &[SessionRecord],
     credentials: &[mullion_store::CredentialRecord],
 ) -> (String, bool) {
-    let (via, dangling) = match sessions.iter().find(|s| s.id == rec.session_id) {
+    match sessions.iter().find(|s| s.id == rec.session_id) {
         Some(s) => (
             format!(
                 "经 {} ({}@{})",
@@ -78,11 +119,6 @@ fn row_subtitle(
             false,
         ),
         None => ("引用的会话已删除".to_string(), true),
-    };
-    if rec.name.trim().is_empty() {
-        (via, dangling)
-    } else {
-        (format!("{} · {via}", forward_summary(rec)), dangling)
     }
 }
 
@@ -195,8 +231,8 @@ pub(crate) fn other_hover(o: &mullion_store::OtherTunnel, now: i64) -> String {
     )
 }
 
-/// 一行右侧的状态文字。`None` = 没启动,那一行什么都不写 ——
-/// 给没启动的隧道常驻一句「未启动」只是噪音。
+/// 本窗口运行态的状态文字。`None` = 没启动;列表里常驻的「未启动」由
+/// `row_status` 兜底(F385),状态栏浮层仍只在有运行态时写一句。
 pub(crate) fn state_label(state: Option<&TunnelState>) -> Option<String> {
     Some(match state? {
         TunnelState::Connecting => "连接中…".to_string(),
@@ -208,6 +244,53 @@ pub(crate) fn state_label(state: Option<&TunnelState>) -> Option<String> {
         TunnelState::Failed(msg) => format!("已停止:{msg}"),
         TunnelState::Stopped => "已停止".to_string(),
     })
+}
+
+/// F385:状态的语义档。圆点和文字共用这一档,颜色只在渲染处映射到主题。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    /// 没启动:灰色空心点。
+    Idle,
+    Ok,
+    Warn,
+    Danger,
+}
+
+/// F385:一行的状态(常驻)。本窗口有运行态以它为准,没有才看别的窗口(F338),
+/// 都没有 = 「未启动」。
+///
+/// 颜色语义沿用 F114:「重连中」和「已停止」不能同色,否则需要人管的那条被藏起来。
+pub(crate) fn row_status(
+    state: Option<&TunnelState>,
+    other: Option<&mullion_store::OtherTunnel>,
+) -> (String, Tone) {
+    if let Some(text) = state_label(state) {
+        let tone = match state {
+            Some(TunnelState::Running) => Tone::Ok,
+            Some(TunnelState::Failed(_)) | Some(TunnelState::Stopped) => Tone::Danger,
+            _ => Tone::Warn,
+        };
+        return (text, tone);
+    }
+    if let Some(o) = other {
+        let tone = if o.state.blocks_start() {
+            Tone::Warn
+        } else {
+            Tone::Danger
+        };
+        return (other_label(o).to_string(), tone);
+    }
+    ("未启动".to_string(), Tone::Idle)
+}
+
+/// 名称至少留这么宽才让状态文字留在第一行。名字本身更短就按名字实宽算。
+const NAME_MIN_W: f32 = 64.0;
+
+/// F385:状态文字能不能和名称、按钮挤在第一行。`fixed` = 圆点之后除名称和状态外
+/// 必占的宽(按钮 + 间距)。放不下就挪到第三行末尾,第一行只剩圆点 —— **宁可挪
+/// 状态,也不让名称被挤到看不出是哪条**。
+pub(crate) fn status_fits_first_row(avail: f32, fixed: f32, status_w: f32, name_w: f32) -> bool {
+    avail - fixed - status_w >= name_w.min(NAME_MIN_W)
 }
 
 // F338 把参数从 7 顶到 8。同 `session_manager::show` 的取舍:这是内部叶子函数,
@@ -258,17 +341,28 @@ pub(super) fn show(
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let mut first = true;
             for id in order {
                 let Some(rec) = tunnels.iter().find(|x| x.id == id) else {
                     continue;
                 };
                 let state = states.iter().find(|(tid, _)| *tid == id).map(|(_, s)| s);
                 let other = other_for(id, others);
+                // F385:条目之间画分割线,否则三行一条的列表分不清哪行归哪条。
+                if !first {
+                    ui.separator();
+                }
+                first = false;
                 row(ui, t, ui_state, rec, state, other, sessions, credentials);
             }
         });
 }
 
+/// F385:一条隧道 = 一块整体可点的区域,三行:
+/// ① 状态圆点 + 名称 …… 状态文字 + 启停按钮;② 转发串(仅起了名的);③ 经哪个会话。
+///
+/// 整块用 `UiBuilder::sense` 收点击:它登记在块内控件**之下**,点到启停按钮仍归按钮。
+/// 块内文字一律 `selectable(false)` —— 可划选的 `Label` 会吞掉点击,点在字上就选不中。
 // F338 把参数从 7 顶到 8。同 `session_manager::show` 的取舍:这是内部叶子函数,
 // 为压参数数引入一个专用结构体没有实际收益。
 #[allow(clippy::too_many_arguments)]
@@ -283,105 +377,215 @@ fn row(
     credentials: &[mullion_store::CredentialRecord],
 ) {
     let selected = ui_state.tunnel_editor_id == Some(rec.id);
-    let (sub, dangling) = row_subtitle(rec, sessions, credentials);
+    let (via, dangling) = via_line(rec, sessions, credentials);
     // F338:本实例自己有运行态就以它为准;没有才看别的实例。
     let (spec, other) = row_spec(dangling, state, other);
+    let (status, tone) = row_status(state, other);
+    let tone_color = match tone {
+        Tone::Idle => theme::c32(t.fg_dimmer),
+        Tone::Ok => theme::c32(t.ok),
+        Tone::Warn => theme::c32(t.warn),
+        Tone::Danger => theme::c32(t.danger_text),
+    };
+    let status_label = |ui: &mut Ui| {
+        let r = ui.add(
+            egui::Label::new(egui::RichText::new(&status).color(tone_color)).selectable(false),
+        );
+        if let Some(o) = other {
+            r.on_hover_text(other_hover(o, mullion_store::now_secs()));
+        }
+    };
 
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            let title = row_title(rec);
-            let resp = ui.add(egui::SelectableLabel::new(selected, title));
-            // F268:克隆。整条复制成新的一条 —— 同一台机器上再开一条转发
-            // (换个端口、换个目标)是最常见的动作,手工重填一遍类型/会话/
-            // 目标又慢又容易把方向填反。**端口不自动挪**,见 `Vault::clone_tunnel`。
-            resp.context_menu(|ui| {
-                if ui.button("克隆").clicked() {
-                    ui_state.tunnel_clone_request = Some(rec.id);
-                    ui.close_menu();
+    // 背景先占位,等整块画完、知道矩形和悬停态再填。
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let block = ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("mullion_tunnel_row", rec.id.0))
+            .sense(egui::Sense::click()),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let gap = ui.spacing().item_spacing.x;
+            let line_h = ui.text_style_height(&egui::TextStyle::Body);
+            let mut status_below = false;
+            ui.horizontal(|ui| {
+                let (dot, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, line_h), egui::Sense::hover());
+                let c = dot.center();
+                if tone == Tone::Idle {
+                    ui.painter()
+                        .circle_stroke(c, 3.5, egui::Stroke::new(1.2, tone_color));
+                } else {
+                    ui.painter().circle_filled(c, 4.0, tone_color);
+                }
+
+                let name_size = ui
+                    .style()
+                    .text_styles
+                    .get(&egui::TextStyle::Body)
+                    .map_or(14.0, |f| f.size)
+                    + 1.0;
+                let title = egui::RichText::new(list_title(rec))
+                    .size(name_size)
+                    .color(theme::c32(t.fg_strong));
+                let width_of = |ui: &Ui, text: egui::WidgetText| {
+                    text.into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::TextStyle::Body,
+                    )
+                    .size()
+                    .x
+                };
+                let name_w = width_of(ui, title.clone().into());
+                let status_w = width_of(ui, status.as_str().into());
+                let btn_w = width_of(ui, spec.label.into()) + ui.spacing().button_padding.x * 2.0;
+                let fixed = btn_w + gap * 2.0;
+                let fits =
+                    status_fits_first_row(ui.available_width(), fixed, status_w + gap, name_w);
+                status_below = !fits;
+                let name_room =
+                    (ui.available_width() - fixed - if fits { status_w + gap } else { 0.0 })
+                        .max(0.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(name_room, line_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(name_room);
+                        ui.add(egui::Label::new(title).truncate().selectable(false));
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    start_button(ui, ui_state, rec, spec, state);
+                    if fits {
+                        status_label(ui);
+                    }
+                });
+            });
+            if let Some(fwd) = forward_row(rec) {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(fwd).color(theme::c32(t.fg)))
+                        .truncate()
+                        .selectable(false),
+                );
+            }
+            ui.horizontal(|ui| {
+                let via_color = if dangling {
+                    theme::c32(t.danger_text)
+                } else {
+                    theme::c32(t.fg_dimmer)
+                };
+                let via_w = if status_below {
+                    (ui.available_width() * 0.5).max(0.0)
+                } else {
+                    ui.available_width()
+                };
+                ui.allocate_ui_with_layout(
+                    egui::vec2(via_w, line_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_max_width(via_w);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&via).small().color(via_color))
+                                .truncate()
+                                .selectable(false),
+                        );
+                    },
+                );
+                if status_below {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        status_label(ui);
+                    });
                 }
             });
-            if resp.clicked() {
-                ui_state.tunnel_editor_id = Some(rec.id);
-                let buf = super::TunnelEditorBuffer::from_record(rec);
-                ui_state.tunnel_editor_baseline = Some(buf.clone());
-                ui_state.tunnel_editor = Some(buf);
-            }
-            let sub_color = if dangling {
-                theme::c32(t.danger_text)
-            } else {
-                theme::c32(t.fg_dimmer)
-            };
-            ui.colored_label(sub_color, sub);
-            // F114:跑起来之后这一行才有状态可写。颜色跟着语义走 ——
-            // 「重连中」和「已停止」用同一个灰,等于把需要人管的那条藏起来。
-            if let Some(text) = state_label(state) {
-                let color = match state {
-                    Some(TunnelState::Running) => theme::c32(t.ok),
-                    Some(TunnelState::Failed(_)) | Some(TunnelState::Stopped) => {
-                        theme::c32(t.danger_text)
-                    }
-                    _ => theme::c32(t.warn),
-                };
-                ui.colored_label(color, text);
-            } else if let Some(o) = other {
-                let color = if o.state.blocks_start() {
-                    theme::c32(t.warn)
-                } else {
-                    theme::c32(t.danger_text)
-                };
-                ui.colored_label(color, other_label(o))
-                    .on_hover_text(other_hover(o, mullion_store::now_secs()));
-            }
-        });
-
-        // 启动/停止:禁用必须是**真禁用**,不是画成灰的。`ui.disable()` 让
-        // `interact` 返回 `enabled=false` 且 `clicked()` 恒假 —— 「看着灰」和
-        // 「点不动」必须是同一件事,否则用户点了没反应会以为是隧道配错了。
-        // 什么时候该禁用见纯函数 `button_spec`(它自己有穷举测试)。
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if !spec.enabled {
-                ui.disable();
-            }
-            let galley = egui::WidgetText::from(spec.label).into_galley(
-                ui,
-                None,
-                ui.available_width(),
-                egui::TextStyle::Button,
-            );
-            let padding = ui.spacing().button_padding;
-            let size = galley.size() + padding * 2.0;
-            let (_auto, rect) = ui.allocate_space(size);
-            let mut resp = ui.interact(rect, start_button_id(rec.id), egui::Sense::click());
-            if let Some(hint) = spec.disabled_hint {
-                resp = resp.on_disabled_hover_text(hint);
-            }
-            if resp.clicked() {
-                // 只写意图:组 `SshConfig`、bind 端口、起监管任务都要 store /
-                // tokio runtime,egui 闭包里一样都够不着(与 `connect_request`
-                // 同构,见 `UiState` 上那两个字段的文档)。
-                if state.is_some() {
-                    ui_state.tunnel_stop_request = Some(rec.id);
-                } else {
-                    ui_state.tunnel_start_request = Some(rec.id);
-                }
-            }
-            if ui.is_rect_visible(rect) {
-                let visuals = ui.style().interact(&resp);
-                ui.painter().rect(
-                    rect,
-                    visuals.rounding,
-                    visuals.weak_bg_fill,
-                    visuals.bg_stroke,
-                );
-                let text_pos = ui
-                    .layout()
-                    .align_size_within_rect(galley.size(), rect.shrink2(padding))
-                    .min;
-                ui.painter().galley(text_pos, galley, visuals.text_color());
-            }
-        });
+        },
+    );
+    let resp = block.response;
+    // F268:克隆。整条复制成新的一条 —— 同一台机器上再开一条转发
+    // (换个端口、换个目标)是最常见的动作,手工重填一遍类型/会话/
+    // 目标又慢又容易把方向填反。**端口不自动挪**,见 `Vault::clone_tunnel`。
+    resp.context_menu(|ui| {
+        if ui.button("克隆").clicked() {
+            ui_state.tunnel_clone_request = Some(rec.id);
+            ui.close_menu();
+        }
     });
-    ui.add_space(2.0);
+    if resp.clicked() {
+        ui_state.tunnel_editor_id = Some(rec.id);
+        let buf = super::TunnelEditorBuffer::from_record(rec);
+        ui_state.tunnel_editor_baseline = Some(buf.clone());
+        ui_state.tunnel_editor = Some(buf);
+    }
+    let fill = if selected {
+        Some(ui.visuals().selection.bg_fill)
+    } else if resp.hovered() {
+        Some(ui.visuals().widgets.hovered.weak_bg_fill)
+    } else {
+        None
+    };
+    if let Some(fill) = fill {
+        ui.painter().set(
+            bg,
+            egui::Shape::rect_filled(resp.rect.expand(2.0), 3.0, fill),
+        );
+    }
+}
+
+/// 启动/停止:禁用必须是**真禁用**,不是画成灰的。`ui.disable()` 让
+/// `interact` 返回 `enabled=false` 且 `clicked()` 恒假 —— 「看着灰」和
+/// 「点不动」必须是同一件事,否则用户点了没反应会以为是隧道配错了。
+/// 什么时候该禁用见纯函数 `button_spec`(它自己有穷举测试)。
+///
+/// 包一层 `scope`:`disable()` 只作用到按钮,别把同排的状态文字也画灰。
+fn start_button(
+    ui: &mut Ui,
+    ui_state: &mut UiState,
+    rec: &TunnelRecord,
+    spec: ButtonSpec,
+    state: Option<&TunnelState>,
+) {
+    ui.scope(|ui| {
+        if !spec.enabled {
+            ui.disable();
+        }
+        let galley = egui::WidgetText::from(spec.label).into_galley(
+            ui,
+            None,
+            ui.available_width(),
+            egui::TextStyle::Button,
+        );
+        let padding = ui.spacing().button_padding;
+        let size = galley.size() + padding * 2.0;
+        let (_auto, rect) = ui.allocate_space(size);
+        let mut resp = ui.interact(rect, start_button_id(rec.id), egui::Sense::click());
+        if let Some(hint) = spec.disabled_hint {
+            resp = resp.on_disabled_hover_text(hint);
+        }
+        if resp.clicked() {
+            // 只写意图:组 `SshConfig`、bind 端口、起监管任务都要 store /
+            // tokio runtime,egui 闭包里一样都够不着(与 `connect_request`
+            // 同构,见 `UiState` 上那两个字段的文档)。
+            if state.is_some() {
+                ui_state.tunnel_stop_request = Some(rec.id);
+            } else {
+                ui_state.tunnel_start_request = Some(rec.id);
+            }
+        }
+        if ui.is_rect_visible(rect) {
+            let visuals = ui.style().interact(&resp);
+            ui.painter().rect(
+                rect,
+                visuals.rounding,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+            );
+            let text_pos = ui
+                .layout()
+                .align_size_within_rect(galley.size(), rect.shrink2(padding))
+                .min;
+            ui.painter().galley(text_pos, galley, visuals.text_color());
+        }
+    });
 }
 
 /// 手绘「+ 新建」,挂显式 id。做法照抄 `list::new_button`(为什么不能用
@@ -567,7 +771,11 @@ mod tests {
     /// 不出「是在退避还是已经卡死」,而这正是重连唯一需要被看见的信息。
     #[test]
     fn reconnecting_label_says_which_attempt_and_how_long() {
-        assert_eq!(state_label(None), None, "没启动的隧道不该常驻一句状态");
+        assert_eq!(
+            state_label(None),
+            None,
+            "没启动的「未启动」由 row_status 兜底,浮层不写"
+        );
         let s = state_label(Some(&TunnelState::Reconnecting {
             attempt: 3,
             retry_in: std::time::Duration::from_secs(4),
@@ -672,38 +880,38 @@ mod tests {
         r
     }
 
-    /// F268:起了名的行,名字当主标题,**转发串降到副标题**而不是消失。
+    /// F268:起了名的行,名字当主标题,**转发串降到第二行**而不是消失。
     ///
     /// 转发串是判断「这条是不是我要找的那条」的关键信息:名字可以撞、可以
     /// 过期(改了端口忘了改名),而「本地 3306 → db:3306」是从配置现算出来的。
     ///
-    /// 自证会变红:把 `row_title` 里的 `if name.is_empty()` 分支反过来
-    /// (第一条断言拿到转发串),或把 `row_subtitle` 末尾拼转发串那一段删掉
-    /// (第二条断言里副标题只剩「经 …」)。
+    /// 自证会变红:把 `row_title`/`list_title` 里的空名判断反过来,或让
+    /// `forward_row` 对起了名的返回 `None`。
     #[test]
     fn a_named_tunnel_shows_its_name_up_top_and_keeps_the_forward_string_below() {
         let r = named(1, "生产库");
         assert_eq!(row_title(&r), "生产库");
-        let (sub, dangling) = row_subtitle(&r, &[], &[]);
-        assert!(
-            sub.starts_with("本地 3306 → db.internal:3306"),
-            "实际: {sub}"
+        assert_eq!(list_title(&r), "生产库");
+        assert_eq!(
+            forward_row(&r).as_deref(),
+            Some("本地 :3306 → db.internal:3306")
         );
+        let (via, dangling) = via_line(&r, &[], &[]);
         assert!(dangling, "引用的会话不在表里,仍然要判成悬垂");
-        assert!(sub.contains("引用的会话已删除"), "实际: {sub}");
+        assert_eq!(via, "引用的会话已删除");
     }
 
-    /// 没起名的行**完全回到原来的样子** —— 不塞「未命名隧道」之类的占位,
-    /// 也不在副标题里把转发串再写一遍(那会变成同一句话画两行)。
+    /// 没起名的行:标题就是转发串,不塞「未命名隧道」之类的占位,也**不再画
+    /// 第二行**(那会变成同一句话画两行)。
     ///
     /// 自证会变红:把 `row_title` 的兜底改成 `"未命名隧道"`,或把
-    /// `row_subtitle` 里的 `if rec.name.trim().is_empty()` 判断去掉。
+    /// `forward_row` 里的空名判断去掉。
     #[test]
     fn an_unnamed_tunnel_renders_exactly_as_before() {
         let r = rec(1, local());
         assert_eq!(row_title(&r), "本地 3306 → db.internal:3306");
-        let (sub, _) = row_subtitle(&r, &[], &[]);
-        assert_eq!(sub, "引用的会话已删除", "没起名就别在副标题里多拼一段");
+        assert_eq!(list_title(&r), "本地 :3306 → db.internal:3306");
+        assert_eq!(forward_row(&r), None, "没起名就别再画一行转发串");
     }
 
     /// 名字只有空白 = 没起名。`build_tunnel_draft` 那边是 `trim()` 后落盘的,
@@ -804,5 +1012,147 @@ mod tests {
             ui_state.pending_tunnel_delete.is_none(),
             "克隆不该顺带把这一行推进删除确认"
         );
+    }
+
+    /// F385:端口前加 `:`,三种转发都一样;目标端的 `host:port` 原样不动。
+    #[test]
+    fn the_list_forward_line_marks_the_listen_port_with_a_colon() {
+        assert_eq!(
+            forward_line(&rec(1, local())),
+            "本地 :3306 → db.internal:3306"
+        );
+        let r = forward_line(&rec(
+            2,
+            TunnelKind::Remote {
+                target_host: "127.0.0.1".into(),
+                target_port: 3000,
+                expose: false,
+            },
+        ));
+        assert_eq!(r, "远端 :3306 → 127.0.0.1:3000");
+        assert_eq!(
+            forward_line(&rec(3, TunnelKind::Dynamic)),
+            "动态 :3306 (SOCKS5)"
+        );
+    }
+
+    /// F385:状态常驻。没启动 = 「未启动」灰档;本窗口运行态压过别的窗口;
+    /// 重连是黄、停止是红,两者不能同档(F114)。
+    ///
+    /// 自证会变红:把兜底改回不显示(返回空串),或把 `Reconnecting` 归进 `Danger`。
+    #[test]
+    fn the_status_is_always_shown_and_toned_by_meaning() {
+        use mullion_store::RemoteTunnelState as R;
+        assert_eq!(row_status(None, None), ("未启动".to_string(), Tone::Idle));
+        assert_eq!(row_status(Some(&TunnelState::Running), None).1, Tone::Ok);
+        let recon = TunnelState::Reconnecting {
+            attempt: 1,
+            retry_in: std::time::Duration::from_secs(2),
+        };
+        assert_eq!(row_status(Some(&recon), None).1, Tone::Warn);
+        assert_eq!(
+            row_status(Some(&TunnelState::Stopped), None).1,
+            Tone::Danger
+        );
+        let o = other(1, R::Running, 9);
+        let (text, tone) = row_status(None, Some(&o));
+        assert!(text.contains("另一个窗口"), "实际: {text}");
+        assert_eq!(tone, Tone::Warn);
+        assert_eq!(
+            row_status(None, Some(&other(1, R::Failed, 9))).1,
+            Tone::Danger
+        );
+    }
+
+    /// F385:状态放不下就挪走,名称至少留 `NAME_MIN_W`(名字更短按实宽)。
+    #[test]
+    fn the_status_moves_off_the_first_row_before_the_name_gets_squeezed() {
+        assert!(status_fits_first_row(300.0, 60.0, 50.0, 100.0));
+        assert!(
+            !status_fits_first_row(150.0, 60.0, 50.0, 100.0),
+            "名称只剩 40 了"
+        );
+        assert!(
+            status_fits_first_row(150.0, 60.0, 50.0, 30.0),
+            "名字本身只有 30 宽,够放就别挪"
+        );
+    }
+
+    fn render(
+        ctx: &egui::Context,
+        ui_state: &mut UiState,
+        tunnels: &[TunnelRecord],
+        input: egui::RawInput,
+    ) -> egui::FullOutput {
+        let t = crate::theme::MULLION_DARK;
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &t, ui_state, tunnels, &[], &[], &[], &[]);
+            });
+        })
+    }
+
+    fn count_hlines(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn walk(s: &egui::Shape) -> usize {
+            match s {
+                egui::Shape::Vec(v) => v.iter().map(walk).sum(),
+                egui::Shape::LineSegment { points, .. } if points[0].y == points[1].y => 1,
+                _ => 0,
+            }
+        }
+        shapes.iter().map(|cs| walk(&cs.shape)).sum()
+    }
+
+    /// F385:条目之间有分割线 —— N 条隧道比 1 条多出 N-1 根横线。
+    ///
+    /// 自证会变红:删掉 `show` 里循环中的 `ui.separator()`。
+    #[test]
+    fn entries_are_separated_by_a_line_between_each_pair() {
+        let one = vec![named(1, "a")];
+        let three = vec![named(1, "a"), named(2, "b"), named(3, "c")];
+        let lines = |list: &[TunnelRecord]| {
+            let ctx = egui::Context::default();
+            let mut s = UiState::default();
+            let _ = render(&ctx, &mut s, list, egui::RawInput::default());
+            count_hlines(&render(&ctx, &mut s, list, egui::RawInput::default()).shapes)
+        };
+        assert_eq!(lines(&three), lines(&one) + 2);
+    }
+
+    /// F385:点在整条的任意位置都选中 —— 这里点第三行「经 …」那句,它不是
+    /// 标题,改版前点它没反应。也顺带证「未启动」是常驻画出来的。
+    ///
+    /// 自证会变红:把 `UiBuilder` 上的 `.sense(egui::Sense::click())` 去掉,或把第三行
+    /// 的 `selectable(false)` 去掉(可划选的 Label 吞点击)。
+    #[test]
+    fn clicking_anywhere_on_the_row_selects_the_tunnel() {
+        let tunnels = vec![named(4, "row-click-target")];
+        let ctx = egui::Context::default();
+        let mut s = UiState::default();
+        let _ = render(&ctx, &mut s, &tunnels, egui::RawInput::default());
+        let out = render(&ctx, &mut s, &tunnels, egui::RawInput::default());
+        assert!(
+            find_text_pos(&out.shapes, "未启动").is_some(),
+            "没启动的也要常驻状态"
+        );
+        let p = find_text_pos(&out.shapes, "引用的会话已删除").expect("第三行应该画出来了");
+        let p = egui::pos2(p.x + 4.0, p.y + 4.0);
+        let click = |pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let _ = render(
+            &ctx,
+            &mut s,
+            &tunnels,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(p), click(true), click(false)],
+                ..Default::default()
+            },
+        );
+        assert_eq!(s.tunnel_editor_id, Some(TunnelId(4)));
+        assert!(s.tunnel_editor.is_some());
     }
 }
