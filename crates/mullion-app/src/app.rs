@@ -8296,10 +8296,15 @@ impl App {
             mark_ui_dirty!(self.ui_dirty);
             return;
         }
-        // F330:终端粘贴文件的冲突框点了「全部覆盖」—— 只是入队,不发远端
-        // 写请求。计划里冻着自己的世代,`generation` 参数不参与。
-        if let FileOp::PasteFiles { plan, confirmed } = op {
-            self.enqueue_paste_files(plan, &confirmed);
+        // F330:终端粘贴文件的冲突框点了「全部覆盖」/(F386)「沿用已有」——
+        // 只是入队,不发远端写请求。计划里冻着自己的世代,`generation` 参数不参与。
+        if let FileOp::PasteFiles {
+            plan,
+            confirmed,
+            reuse,
+        } = op
+        {
+            self.enqueue_paste_files(plan, &confirmed, &reuse);
             return;
         }
         // F53:编辑冲突的处置。同上,不走远端写操作那条通用路径 ——
@@ -10504,7 +10509,7 @@ impl App {
             return;
         }
         match crate::paste_files::after_check(&plan.names(), result) {
-            crate::paste_files::AfterCheck::Enqueue => self.enqueue_paste_files(plan, &[]),
+            crate::paste_files::AfterCheck::Enqueue => self.enqueue_paste_files(plan, &[], &[]),
             crate::paste_files::AfterCheck::Ask(names) => {
                 // 已经有别的文件框开着(一次只开一个):不能盖掉它 —— 那个框
                 // 可能挂着一条等处置的 job。让用户重贴一次,好过静默丢掉
@@ -10646,15 +10651,34 @@ impl App {
     /// F330/F332:整批进全局传输队列。`confirmed` = 用户在冲突框里点「全部
     /// 覆盖」时框里列的那些名字(只有它们预设覆盖,见 `paste_files::enqueue`)。批次登记在 `paste_batches`,回填只在 `TransferDone` 里
     /// 等整批落地之后做(T11:判定不从这里——调用点——起算)。
-    fn enqueue_paste_files(&mut self, plan: crate::paste_files::PastePlan, confirmed: &[String]) {
+    fn enqueue_paste_files(
+        &mut self,
+        plan: crate::paste_files::PastePlan,
+        confirmed: &[String],
+        reuse: &[String],
+    ) {
         // 属主标签已经关了:冲突框开着时用户关掉标签再点「全部覆盖」,入队的话
         // job 挂在一个死世代上,传完也没有输入行可回填。
         if self.tabs.by_generation(plan.generation).is_none() {
             return;
         }
-        let jobs = crate::paste_files::enqueue(&mut self.transfer.queue, &plan, confirmed);
+        let jobs = crate::paste_files::enqueue(&mut self.transfer.queue, &plan, confirmed, reuse);
+        // F386:全部沿用节点上已有的 —— 没有字节要落地,不会有 `TransferDone`,
+        // 只有这一种情况可以当场回填(T11 的例外,守护见
+        // `backfill_happens_only_from_the_transfer_done_arm`)。
+        if crate::paste_files::nothing_to_upload(&jobs) {
+            let paths: Vec<String> = jobs.into_iter().map(|(_, _, r)| r).collect();
+            let n = paths.len();
+            self.finish_paste_files(plan.generation, plan.pane, paths, n);
+            return;
+        }
         let mut batch_jobs = Vec::with_capacity(jobs.len());
         for (id, f, remote) in jobs {
+            let Some(id) = id else {
+                // F386:沿用的那份不入队,只占回填顺序里的位置。
+                batch_jobs.push((None, remote));
+                continue;
+            };
             let remote_path =
                 mullion_ssh::sftp::RemotePath::from_bytes(remote.clone().into_bytes());
             // F252 的落点标记:终端标签没有面板可点亮时照抄也无害;开着侧栏
@@ -10674,9 +10698,9 @@ impl App {
                     pin_host: plan.host_ix,
                 },
             );
-            batch_jobs.push((id, remote));
+            batch_jobs.push((Some(id), remote));
         }
-        let n = batch_jobs.len();
+        let n = batch_jobs.iter().filter(|(id, _)| id.is_some()).count();
         self.paste_batch_seq += 1;
         self.paste_batches
             .open(self.paste_batch_seq, plan.generation, plan.pane, batch_jobs);
@@ -10727,7 +10751,13 @@ impl App {
     }
 
     /// F332:整批落地之后,把 `@路径` 打进发起时那块 pane。
-    fn finish_paste_files(&mut self, generation: u64, pane: PaneId, paths: Vec<String>) {
+    fn finish_paste_files(
+        &mut self,
+        generation: u64,
+        pane: PaneId,
+        paths: Vec<String>,
+        reused: usize,
+    ) {
         let (landed, bare) = self.backfill_refs(generation, pane, &paths);
         if !landed {
             self.ui.set_toast(
@@ -10745,7 +10775,7 @@ impl App {
         } else {
             self.ui.set_toast(
                 crate::ui::toast::Kind::Ok,
-                format!("{} 个文件已上传,路径已填入", paths.len()),
+                crate::paste_files::filled_toast(paths.len(), reused),
             );
         }
         self.request_ui_redraw();
@@ -14736,7 +14766,8 @@ impl ApplicationHandler<UserEvent> for App {
                             generation,
                             pane,
                             paths,
-                        }) => self.finish_paste_files(generation, pane, paths),
+                            reused,
+                        }) => self.finish_paste_files(generation, pane, paths, reused),
                         Some(crate::paste_files::BatchDone::Abandoned { failed }) => {
                             self.toast_paste_abandoned(failed)
                         }
@@ -35957,7 +35988,7 @@ mod tests {
     /// `paste_files::enqueue(` 之后。
     #[test]
     fn enqueue_paste_files_drops_a_plan_whose_tab_is_gone() {
-        let body = body_of(prod_src(), concat!("fn enqueue_", "paste_files(&mut self"));
+        let body = body_of(prod_src(), concat!("fn enqueue_", "paste_files("));
         let check = body
             .find(concat!(
                 "if self.tabs.by_generation(plan.generation)",
@@ -36007,20 +36038,43 @@ mod tests {
     fn backfill_happens_only_from_the_transfer_done_arm() {
         let production = prod_src();
         let arm = arm_of(production, "UserEvent::TransferDone { job, result }");
-        for needle in [
-            concat!("BatchDone::", "Fill"),
-            concat!("self.finish_paste", "_files("),
-        ] {
-            assert_eq!(
-                production.matches(needle).count(),
-                1,
-                "{needle} 在产品代码里不止一处 —— 回填有了 TransferDone 以外的入口"
-            );
-            assert!(
-                arm.contains(needle),
-                "{needle} 不在 TransferDone 那条分支里 —— 回填脱离了收工事件(T11)"
-            );
-        }
+        let fill = concat!("BatchDone::", "Fill");
+        assert_eq!(
+            production.matches(fill).count(),
+            1,
+            "{fill} 在产品代码里不止一处 —— 回填有了 TransferDone 以外的入口"
+        );
+        assert!(
+            arm.contains(fill),
+            "{fill} 不在 TransferDone 那条分支里 —— 回填脱离了收工事件(T11)"
+        );
+        // F386:唯一的例外是「全部沿用节点上已有的、一条都不传」—— 没有字节要
+        // 落地,也就不会有收工事件。这一处必须**整个**落在 `nothing_to_upload`
+        // 判定的那个块里;落在块外就是「有上传也当场回填」。
+        let finish = concat!("self.finish_paste", "_files(");
+        assert_eq!(
+            production.matches(finish).count(),
+            2,
+            "{finish} 的调用处数变了 —— 回填多了(或少了)入口"
+        );
+        assert!(
+            arm.contains(finish),
+            "{finish} 不在 TransferDone 那条分支里"
+        );
+        let enqueue = body_of(production, concat!("fn enqueue_", "paste_files("));
+        let gate = enqueue
+            .find(concat!("if crate::paste_files::", "nothing_to_upload("))
+            .expect("enqueue_paste_files 里没有「一条都不传」的判定");
+        let gated = brace_balanced_arm(&enqueue[gate + enqueue[gate..].find('{').unwrap()..]);
+        assert!(
+            gated.contains(finish) && gated.contains("return"),
+            "当场回填不在「一条都不传」的块里,或回填后没有 return"
+        );
+        assert_eq!(
+            enqueue.matches(finish).count(),
+            1,
+            "enqueue_paste_files 在判定块外还有回填"
+        );
         // 共用回填只有两个调用方:截图收工、文件批次收工。
         let callers = production
             .matches(concat!("self.backfill", "_refs("))

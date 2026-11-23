@@ -157,15 +157,22 @@ pub fn conflict_lines(names: &[String]) -> Vec<String> {
 /// `Conflict`，同一件事再问一遍。其余保持 `None`：预检之后才在远端冒出来的同名
 /// （竞态）用户没确认过，照常走传输冲突框，绝不静默覆盖（F55）。没冲突时传空。
 ///
+/// F386：`reuse` = 用户在冲突框里选「沿用已有」时框里列的那些名字。它们**不入队**，
+/// 直接引用节点上原有的那份（`job id` 为 `None`），与上传的那些一起按剪贴板顺序回填。
+///
 /// 返回 `(job id, 文件, 远端绝对路径)`，顺序同 `plan.files`（回填顺序 = 剪贴板顺序）。
 pub fn enqueue(
     queue: &mut Queue,
     plan: &PastePlan,
     confirmed: &[String],
-) -> Vec<(u64, Picked, String)> {
+    reuse: &[String],
+) -> Vec<(Option<u64>, Picked, String)> {
     plan.files
         .iter()
         .map(|f| {
+            if reuse.contains(&f.name) {
+                return (None, f.clone(), plan.remote_of(&f.name));
+            }
             let id = queue.push(NewJob {
                 dir: Direction::Upload,
                 generation: plan.generation,
@@ -175,9 +182,30 @@ pub fn enqueue(
             if confirmed.contains(&f.name) {
                 queue.set_resolved(id, Conflict::Overwrite);
             }
-            (id, f.clone(), plan.remote_of(&f.name))
+            (Some(id), f.clone(), plan.remote_of(&f.name))
         })
         .collect()
+}
+
+/// F386：这一批一条都不用传（全部沿用节点上已有的）。只有这时才允许不等
+/// `TransferDone` 就回填 —— 没有字节要落地，等也等不来收工事件。
+pub fn nothing_to_upload(slots: &[(Option<u64>, Picked, String)]) -> bool {
+    slots.iter().all(|(id, _, _)| id.is_none())
+}
+
+/// F332/F386：回填成功后的提示。说清哪些是新传的、哪些是沿用节点上原有的 ——
+/// 沿用的那份内容可能与本机不同，用户得知道这一批里有它们。
+pub fn filled_toast(total: usize, reused: usize) -> String {
+    if reused == 0 {
+        format!("{total} 个文件已上传,路径已填入")
+    } else if reused >= total {
+        format!("沿用节点上已有的 {total} 个文件,路径已填入")
+    } else {
+        format!(
+            "已上传 {} 个、沿用节点上已有的 {reused} 个,路径已填入",
+            total - reused
+        )
+    }
 }
 
 /// F332：一条 job 收工后，对批次来说算不算「按计划落地」。
@@ -208,6 +236,8 @@ pub enum BatchDone {
         generation: u64,
         pane: PaneId,
         paths: Vec<String>,
+        /// F386：其中有几个是沿用节点上已有的（没传）。
+        reused: usize,
     },
     Abandoned {
         failed: usize,
@@ -217,8 +247,9 @@ pub enum BatchDone {
 struct Batch {
     generation: u64,
     pane: PaneId,
-    /// (job id, 远端绝对路径)，保持剪贴板顺序。
-    jobs: Vec<(u64, String)>,
+    /// (job id, 远端绝对路径)，保持剪贴板顺序。`None` = 沿用节点上已有的（F386），
+    /// 不等收工事件、不计入「完成了几条」。
+    jobs: Vec<(Option<u64>, String)>,
     finished: HashSet<u64>,
     failed: usize,
 }
@@ -232,9 +263,17 @@ pub struct BatchTracker {
 }
 
 impl BatchTracker {
-    pub fn open(&mut self, batch: u64, generation: u64, pane: PaneId, jobs: Vec<(u64, String)>) {
+    pub fn open(
+        &mut self,
+        batch: u64,
+        generation: u64,
+        pane: PaneId,
+        jobs: Vec<(Option<u64>, String)>,
+    ) {
         for (j, _) in &jobs {
-            self.by_job.insert(*j, batch);
+            if let Some(j) = j {
+                self.by_job.insert(*j, batch);
+            }
         }
         self.batches.insert(
             batch,
@@ -257,17 +296,20 @@ impl BatchTracker {
         if !ok {
             b.failed += 1;
         }
-        if b.finished.len() < b.jobs.len() {
+        if b.finished.len() < b.jobs.iter().filter(|(j, _)| j.is_some()).count() {
             return None;
         }
         let b = self.batches.remove(&bid)?;
         for (j, _) in &b.jobs {
-            self.by_job.remove(j);
+            if let Some(j) = j {
+                self.by_job.remove(j);
+            }
         }
         Some(if b.failed == 0 {
             BatchDone::Fill {
                 generation: b.generation,
                 pane: b.pane,
+                reused: b.jobs.iter().filter(|(j, _)| j.is_none()).count(),
                 paths: b.jobs.into_iter().map(|(_, p)| p).collect(),
             }
         } else {
@@ -288,7 +330,7 @@ impl BatchTracker {
             .flat_map(|b| {
                 b.jobs
                     .iter()
-                    .map(|(j, _)| *j)
+                    .filter_map(|(j, _)| *j)
                     .filter(|j| !b.finished.contains(j))
             })
             .filter(|j| failed(*j))
@@ -309,7 +351,7 @@ impl BatchTracker {
             .collect();
         for k in dead {
             if let Some(b) = self.batches.remove(&k) {
-                for (j, _) in b.jobs {
+                for (j, _) in b.jobs.into_iter().filter_map(|(j, p)| j.map(|j| (j, p))) {
                     self.by_job.remove(&j);
                 }
             }
@@ -413,7 +455,7 @@ mod tests {
             7,
             1,
             PaneId(10),
-            vec![(100, "/tmp/a".into()), (101, "/tmp/b".into())],
+            vec![(Some(100), "/tmp/a".into()), (Some(101), "/tmp/b".into())],
         );
         assert_eq!(t.job_finished(100, true), None);
         assert_eq!(
@@ -421,7 +463,8 @@ mod tests {
             Some(BatchDone::Fill {
                 generation: 1,
                 pane: PaneId(10),
-                paths: vec!["/tmp/a".into(), "/tmp/b".into()]
+                paths: vec!["/tmp/a".into(), "/tmp/b".into()],
+                reused: 0,
             })
         );
     }
@@ -436,7 +479,7 @@ mod tests {
             7,
             1,
             PaneId(10),
-            vec![(100, "/tmp/a".into()), (101, "/tmp/b".into())],
+            vec![(Some(100), "/tmp/a".into()), (Some(101), "/tmp/b".into())],
         );
         assert_eq!(t.job_finished(100, false), None);
         assert_eq!(
@@ -453,8 +496,8 @@ mod tests {
     #[test]
     fn dropping_a_generation_discards_its_batches() {
         let mut t = BatchTracker::default();
-        t.open(7, 1, PaneId(10), vec![(100, "/tmp/a".into())]);
-        t.open(8, 2, PaneId(11), vec![(200, "/tmp/b".into())]);
+        t.open(7, 1, PaneId(10), vec![(Some(100), "/tmp/a".into())]);
+        t.open(8, 2, PaneId(11), vec![(Some(200), "/tmp/b".into())]);
         t.drop_generation(1);
         assert_eq!(t.job_finished(100, true), None);
         assert_eq!(
@@ -462,7 +505,8 @@ mod tests {
             Some(BatchDone::Fill {
                 generation: 2,
                 pane: PaneId(11),
-                paths: vec!["/tmp/b".into()]
+                paths: vec!["/tmp/b".into()],
+                reused: 0,
             })
         );
     }
@@ -528,12 +572,12 @@ mod tests {
     fn overwrite_is_preset_only_when_the_user_chose_it() {
         let p = plan("/tmp/", &["a.png", "b.txt"]);
         let mut q = Queue::new(4);
-        let got = enqueue(&mut q, &p, &["a.png".into(), "b.txt".into()]);
+        let got = enqueue(&mut q, &p, &["a.png".into(), "b.txt".into()], &[]);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].2, "/tmp/a.png");
         assert_eq!(got[1].2, "/tmp/b.txt");
         for (id, f, _) in &got {
-            let j = q.get(*id).unwrap();
+            let j = q.get(id.unwrap()).unwrap();
             assert_eq!(j.resolved, Some(Conflict::Overwrite));
             assert_eq!(j.dir, Direction::Upload);
             assert_eq!(j.generation, 3);
@@ -541,8 +585,12 @@ mod tests {
         }
 
         let mut q = Queue::new(4);
-        for (id, _, _) in enqueue(&mut q, &p, &[]) {
-            assert_eq!(q.get(id).unwrap().resolved, None, "没问过用户就预设了覆盖");
+        for (id, _, _) in enqueue(&mut q, &p, &[], &[]) {
+            assert_eq!(
+                q.get(id.unwrap()).unwrap().resolved,
+                None,
+                "没问过用户就预设了覆盖"
+            );
         }
     }
 
@@ -555,10 +603,10 @@ mod tests {
     fn overwrite_covers_only_the_names_the_user_confirmed() {
         let p = plan("/tmp/", &["a.png", "b.txt", "c.md"]);
         let mut q = Queue::new(4);
-        let got = enqueue(&mut q, &p, &["b.txt".into()]);
+        let got = enqueue(&mut q, &p, &["b.txt".into()], &[]);
         let resolved: Vec<_> = got
             .iter()
-            .map(|(id, f, _)| (f.name.clone(), q.get(*id).unwrap().resolved))
+            .map(|(id, f, _)| (f.name.clone(), q.get(id.unwrap()).unwrap().resolved))
             .collect();
         assert_eq!(
             resolved,
@@ -631,7 +679,7 @@ mod tests {
             7,
             1,
             PaneId(10),
-            vec![(100, "/tmp/a".into()), (101, "/tmp/b".into())],
+            vec![(Some(100), "/tmp/a".into()), (Some(101), "/tmp/b".into())],
         );
         assert_eq!(t.job_finished(100, true), None);
         assert!(t.sweep(|_| false).is_empty(), "没人失败不该结算");
@@ -641,5 +689,88 @@ mod tests {
         );
         assert!(t.sweep(|_| true).is_empty(), "已结算的批次不重复报");
         assert_eq!(t.job_finished(101, true), None);
+    }
+
+    /// F386：「沿用已有」的那几个不入队、job id 为 `None`，其余照常入队且**不**预设
+    /// 覆盖；顺序仍是剪贴板顺序（回填顺序靠它）。
+    ///
+    /// 自证会变红：把 `enqueue` 里 `reuse.contains` 那支删掉（沿用的也入了队）。
+    #[test]
+    fn reused_names_are_not_enqueued_and_keep_their_place_in_line() {
+        let p = plan("/tmp/", &["a.png", "b.txt", "c.md"]);
+        let mut q = Queue::new(4);
+        let got = enqueue(&mut q, &p, &[], &["b.txt".into()]);
+        let shape: Vec<_> = got
+            .iter()
+            .map(|(id, f, r)| (id.is_some(), f.name.as_str(), r.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (true, "a.png", "/tmp/a.png"),
+                (false, "b.txt", "/tmp/b.txt"),
+                (true, "c.md", "/tmp/c.md"),
+            ]
+        );
+        for (id, _, _) in got.iter().filter(|(id, _, _)| id.is_some()) {
+            assert_eq!(q.get(id.unwrap()).unwrap().resolved, None);
+        }
+        assert!(!nothing_to_upload(&got));
+        let all = enqueue(&mut q, &p, &[], &p.names());
+        assert!(nothing_to_upload(&all), "全部沿用时一条都不该入队");
+    }
+
+    /// F386：混合批次 —— 沿用的那条不等收工事件，上传的全部成功才回填，回填按原顺序、
+    /// 带上沿用的路径；上传的有一条失败则整批不回填（同 F332）。
+    ///
+    /// 自证会变红：把 `job_finished` 里按 `is_some()` 计数改回 `b.jobs.len()`
+    /// （永远等不齐，不回填）。
+    #[test]
+    fn a_mixed_batch_fills_reused_and_uploaded_paths_in_order_once_uploads_land() {
+        let mut t = BatchTracker::default();
+        t.open(
+            7,
+            1,
+            PaneId(10),
+            vec![
+                (Some(100), "/tmp/a".into()),
+                (None, "/tmp/b".into()),
+                (Some(101), "/tmp/c".into()),
+            ],
+        );
+        assert_eq!(t.job_finished(100, true), None);
+        assert_eq!(
+            t.job_finished(101, true),
+            Some(BatchDone::Fill {
+                generation: 1,
+                pane: PaneId(10),
+                paths: vec!["/tmp/a".into(), "/tmp/b".into(), "/tmp/c".into()],
+                reused: 1,
+            })
+        );
+
+        let mut t = BatchTracker::default();
+        t.open(
+            8,
+            1,
+            PaneId(10),
+            vec![(None, "/tmp/b".into()), (Some(200), "/tmp/c".into())],
+        );
+        assert_eq!(
+            t.job_finished(200, false),
+            Some(BatchDone::Abandoned { failed: 1 }),
+            "上传的那条失败,沿用的也不能单独回填"
+        );
+    }
+
+    #[test]
+    fn the_fill_toast_says_which_files_were_reused() {
+        assert_eq!(filled_toast(2, 0), "2 个文件已上传,路径已填入");
+        assert!(filled_toast(2, 2).contains("沿用节点上已有的 2 个"));
+        let mixed = filled_toast(3, 1);
+        assert!(
+            mixed.contains("已上传 2 个") && mixed.contains("沿用节点上已有的 1 个"),
+            "实际: {mixed}"
+        );
     }
 }

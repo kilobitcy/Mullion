@@ -143,13 +143,16 @@ pub enum FileOp {
         policy: crate::files::clip::Policy,
         existing: std::collections::BTreeSet<Vec<u8>>,
     },
-    /// F330:终端粘贴文件的冲突框里点了「全部覆盖」。只有这一条出路会产出
-    /// 它 —— 「取消」就是整批不传,没有处置要发。
+    /// F330:终端粘贴文件的冲突框里点了「全部覆盖」或(F386)「沿用已有」。
+    /// 只有这两条出路会产出它 —— 「取消」就是整批不传,没有处置要发。
     PasteFiles {
         plan: crate::paste_files::PastePlan,
         /// 框里列给用户看过的冲突名。只有它们预设覆盖 —— 预检之后才冒出来的
         /// 同名用户没确认过，照常走传输冲突框（F55）。
         confirmed: Vec<String>,
+        /// F386:「沿用已有」时框里列的冲突名 —— 不传,直接回填节点上原有那份的路径。
+        /// 与 `confirmed` 互斥(一次只选一条出路)。
+        reuse: Vec<String>,
     },
 }
 
@@ -614,6 +617,16 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
         }
         FilesDialog::PasteFilesConflict { names, plan } => {
             let n = names.len();
+            // F386:回车 = 「沿用已有」。组字确认那一下回车不算(F314/F316)。
+            // 「全部覆盖」会毁数据,只认鼠标点。
+            if ctx.input_mut(crate::ui::project_nav::take_enter) {
+                op = Some(FileOp::PasteFiles {
+                    plan: plan.clone(),
+                    confirmed: Vec::new(),
+                    reuse: names.clone(),
+                });
+                close = true;
+            }
             let x = modal(ctx, "节点上已有同名文件", |ui| {
                 ui.colored_label(
                     theme::c32(t.danger_text),
@@ -621,7 +634,9 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                 );
                 ui.label(
                     egui::RichText::new(
-                        "选「全部覆盖」会用本机的文件盖掉节点上原有的内容,不可逆;\
+                        "选「沿用已有」不传这些同名文件,直接引用节点上原有的那份 \
+                         —— 内容可能与本机这份不同;\
+                         选「全部覆盖」会用本机的文件盖掉节点上原有的内容,不可逆;\
                          选「取消」则这一批一个都不传。",
                     )
                     .color(theme::c32(t.fg_muted)),
@@ -634,7 +649,20 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                         }
                     });
                 ui.horizontal(|ui| {
-                    // 「全部覆盖」标危险色(F119):两条出路里唯一会毁数据的。
+                    // F386:回车落在这颗上 —— 画成强调样式让人看得出来(同 F379)。
+                    let accent = theme::c32(t.accent);
+                    let reuse =
+                        egui::Button::new(egui::RichText::new("沿用已有(回车)").color(accent))
+                            .stroke(egui::Stroke::new(1.0, accent));
+                    if ui.add(reuse).clicked() {
+                        op = Some(FileOp::PasteFiles {
+                            plan: plan.clone(),
+                            confirmed: Vec::new(),
+                            reuse: names.clone(),
+                        });
+                        close = true;
+                    }
+                    // 「全部覆盖」标危险色(F119):几条出路里唯一会毁数据的。
                     if ui
                         .button(egui::RichText::new("全部覆盖").color(theme::c32(t.danger_text)))
                         .clicked()
@@ -642,6 +670,7 @@ pub fn show(ctx: &egui::Context, t: &Theme, dialog: &mut Option<FilesDialog>) ->
                         op = Some(FileOp::PasteFiles {
                             plan: plan.clone(),
                             confirmed: names.clone(),
+                            reuse: Vec::new(),
                         });
                         close = true;
                     }
@@ -1452,6 +1481,7 @@ mod tests {
             Some(FileOp::PasteFiles {
                 plan: sample_paste_plan(),
                 confirmed: vec!["a.png".into()],
+                reuse: Vec::new(),
             })
         );
         assert!(d.is_none(), "点完「全部覆盖」框没关");
@@ -1462,6 +1492,81 @@ mod tests {
         });
         assert_eq!(click_button(&mut d, "取消"), None, "取消不该入队");
         assert!(d.is_none(), "点「取消」之后框必须关掉");
+    }
+
+    /// 先空跑一帧(模态登记,见 `press_escape`),再送 `events`,返回这一帧的 `FileOp`。
+    fn send_events(dialog: &mut Option<FilesDialog>, events: Vec<egui::Event>) -> Option<FileOp> {
+        let t = crate::theme::MULLION_DARK;
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            show(ctx, &t, dialog);
+        });
+        let mut op = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                op = show(ctx, &t, dialog);
+            },
+        );
+        op
+    }
+
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn paste_files_conflict() -> Option<FilesDialog> {
+        Some(FilesDialog::PasteFilesConflict {
+            names: vec!["a.png".into()],
+            plan: sample_paste_plan(),
+        })
+    }
+
+    /// F386:回车 = 「沿用已有」—— 冲突名进 `reuse`、**不**进 `confirmed`
+    /// (回车绝不能落到「全部覆盖」上),并关框;点那颗按钮与回车同一结果。
+    ///
+    /// 自证会变红:把 `take_enter` 那段删掉,或让它产出 `confirmed: names`。
+    #[test]
+    fn enter_reuses_what_is_already_on_the_node_and_never_overwrites() {
+        let want = Some(FileOp::PasteFiles {
+            plan: sample_paste_plan(),
+            confirmed: Vec::new(),
+            reuse: vec!["a.png".into()],
+        });
+        let mut d = paste_files_conflict();
+        assert_eq!(send_events(&mut d, vec![enter()]), want);
+        assert!(d.is_none(), "回车之后框没关");
+
+        let mut d = paste_files_conflict();
+        assert_eq!(click_button(&mut d, "沿用已有(回车)"), want);
+        assert!(d.is_none());
+    }
+
+    /// F386:组字确认那一下回车(同帧带 `Ime::Commit`)不算 —— 框刚弹出来时
+    /// 手多半还在输入法里(F314/F316)。
+    ///
+    /// 自证会变红:把 `take_enter` 换成裸 `consume_key(Modifiers::NONE, Key::Enter)`。
+    #[test]
+    fn the_enter_that_commits_a_composition_does_not_pick_reuse() {
+        let mut d = paste_files_conflict();
+        let op = send_events(
+            &mut d,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Commit("好".into())),
+                enter(),
+            ],
+        );
+        assert_eq!(op, None);
+        assert!(d.is_some(), "组字回车不该关框");
     }
 
     /// F330:框里要列出撞了哪几个,多了折成「等另外 N 个」—— 只说「有冲突」

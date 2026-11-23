@@ -314,6 +314,7 @@ Mullion 的赌注是：**这个交集市场没人做，而它正在快速变大*
 | F383 | **菜单加图标**:会话/配置/关于菜单每项左侧自绘线条图标(T9) | P2 | 观感需人工确认 |
 | F384 | **编辑已有备忘**:双击正文原地编辑,回车存、Shift+回车换行、Esc 放弃、点外/换条自动存、存空即取消;读-改-写,原条已删则报错不复活 | P2 | 组字回车需人工确认 |
 | F385 | **隧道列表重排**:名称/端口/状态突出、会话信息弱化,状态常驻(含「未启动」),条目间分割线,整条可选 | P2 | 观感需人工确认 |
+| F386 | **终端粘贴文件冲突框加「沿用已有」**:F330「节点上已有同名文件」框新增「沿用已有(回车)」(强调样式,回车即执行,组字回车走 `take_enter` 闸不算;「全部覆盖」只认鼠标点;Esc/× = 取消)。同名文件不再上传,直接回填节点上原有那份的 `@绝对路径`;混合批次中不同名的照常上传,**整批上传成功后**按剪贴板顺序一并回填(任一失败/取消则都不回填,同 F332);全部沿用时不入队、当场回填。不复查远端是否仍在(只回填文本,Claude Code 读不到会明说) | P2 | `files_dialog::tests::enter_reuses_what_is_already_on_the_node_and_never_overwrites`、`the_enter_that_commits_a_composition_does_not_pick_reuse`;`paste_files::tests::reused_names_are_not_enqueued_and_keep_their_place_in_line`、`a_mixed_batch_fills_reused_and_uploaded_paths_in_order_once_uploads_land`;`app::tests::backfill_happens_only_from_the_transfer_done_arm`(T11 例外只许在 `nothing_to_upload` 块内);真机回车手感与输入法未验证,需人工确认 |
 
 **F82 修订**（2026-07-30，v0.1.12 实机验收后）：原定一条 48px 独立工具栏，承载
 「新建连接 / 分屏操作 / 布局预设 / SFTP 开关 / 设置」。取消那一栏——它为「更好找」
